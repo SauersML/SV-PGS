@@ -15,39 +15,56 @@ class Preprocessor:
     scales: np.ndarray
 
     def transform(self, genotypes: np.ndarray) -> np.ndarray:
-        x = np.asarray(genotypes, dtype=np.float32)
-        missing = np.isnan(x)
-        if missing.any():
-            x = x.copy()
-            x[missing] = np.take(self.means, np.where(missing)[1])
-        return (x - self.means) / self.scales
+        genotype_matrix = np.asarray(genotypes, dtype=np.float32)
+        genotype_matrix = _impute_missing_values(genotype_matrix, self.means)
+        return (genotype_matrix - self.means) / self.scales
 
 
-def fit_preprocessor(genotypes: np.ndarray, covariates: np.ndarray, targets: np.ndarray, config: ModelConfig) -> PreparedArrays:
-    x = np.asarray(genotypes, dtype=np.float32)
-    c = np.asarray(covariates, dtype=np.float32)
-    y = np.asarray(targets, dtype=np.float32).reshape(-1)
-    if x.ndim != 2:
+def fit_preprocessor(
+    genotypes: np.ndarray,
+    covariates: np.ndarray,
+    targets: np.ndarray,
+    config: ModelConfig,
+) -> PreparedArrays:
+    genotype_matrix = np.asarray(genotypes, dtype=np.float32)
+    covariate_matrix = np.asarray(covariates, dtype=np.float32)
+    target_array = np.asarray(targets, dtype=np.float32).reshape(-1)
+    if genotype_matrix.ndim != 2:
         raise ValueError("genotypes must be 2D.")
-    if c.ndim != 2:
+    if covariate_matrix.ndim != 2:
         raise ValueError("covariates must be 2D.")
-    if x.shape[0] != c.shape[0] or x.shape[0] != y.shape[0]:
+    if (
+        genotype_matrix.shape[0] != covariate_matrix.shape[0]
+        or genotype_matrix.shape[0] != target_array.shape[0]
+    ):
         raise ValueError("genotypes, covariates, and targets must share sample dimension.")
 
-    means = np.nanmean(x, axis=0, dtype=np.float64).astype(np.float32)
+    means = np.nanmean(genotype_matrix, axis=0, dtype=np.float64).astype(np.float32)
     means = np.where(np.isnan(means), 0.0, means)
 
-    x_filled = x.copy()
-    missing = np.isnan(x_filled)
-    if missing.any():
-        x_filled[missing] = np.take(means, np.where(missing)[1])
+    filled_genotypes = _impute_missing_values(genotype_matrix, means)
 
-    centered = x_filled - means
-    scales = np.sqrt(np.mean(centered * centered, axis=0, dtype=np.float64)).astype(np.float32)
+    centered_genotypes = filled_genotypes - means
+    scales = np.sqrt(np.mean(centered_genotypes * centered_genotypes, axis=0, dtype=np.float64)).astype(np.float32)
     scales = np.where(scales < config.min_scale, 1.0, scales)
-    standardized = centered / scales
+    standardized_genotypes = centered_genotypes / scales
 
-    return PreparedArrays(genotypes=standardized, covariates=c, targets=y, means=means, scales=scales)
+    return PreparedArrays(
+        genotypes=standardized_genotypes,
+        covariates=covariate_matrix,
+        targets=target_array,
+        means=means,
+        scales=scales,
+    )
+
+
+def _impute_missing_values(genotype_matrix: np.ndarray, means: np.ndarray) -> np.ndarray:
+    missing_mask = np.isnan(genotype_matrix)
+    if not missing_mask.any():
+        return genotype_matrix
+    imputed = genotype_matrix.copy()
+    imputed[missing_mask] = np.take(means, np.where(missing_mask)[1])
+    return imputed
 
 
 def build_tie_map(genotypes: np.ndarray, records: Sequence[VariantRecord]) -> TieMap:
@@ -56,49 +73,52 @@ def build_tie_map(genotypes: np.ndarray, records: Sequence[VariantRecord]) -> Ti
     if genotypes.shape[1] != len(records):
         raise ValueError("genotypes and records length mismatch.")
 
-    signatures: dict[tuple[VariantClass, tuple[int, ...]], int] = {}
-    anti_signatures: dict[tuple[VariantClass, tuple[int, ...]], int] = {}
-    groups: list[TieGroup] = []
-    kept: list[int] = []
+    exact_signature_to_group: dict[tuple[VariantClass, tuple[int, ...]], int] = {}
+    sign_flipped_signature_to_group: dict[tuple[VariantClass, tuple[int, ...]], int] = {}
+    tie_groups: list[TieGroup] = []
+    kept_variant_indices: list[int] = []
     original_to_reduced = np.full(genotypes.shape[1], -1, dtype=np.int32)
 
-    rounded = np.rint(genotypes * 1_000_000.0).astype(np.int64, copy=False)
-    for variant_index, record in enumerate(records):
-        signature = tuple(rounded[:, variant_index].tolist())
-        key = (record.variant_class, signature)
-        anti_key = (record.variant_class, tuple((-rounded[:, variant_index]).tolist()))
+    rounded_genotypes = np.rint(genotypes * 1_000_000.0).astype(np.int64, copy=False)
+    for variant_index, variant_record in enumerate(records):
+        signature = tuple(rounded_genotypes[:, variant_index].tolist())
+        exact_key = (variant_record.variant_class, signature)
+        sign_flipped_key = (
+            variant_record.variant_class,
+            tuple((-rounded_genotypes[:, variant_index]).tolist()),
+        )
 
-        if key in signatures:
-            reduced_index = signatures[key]
-            group = groups[reduced_index]
-            group.member_indices = np.append(group.member_indices, variant_index)
-            group.signs = np.append(group.signs, 1.0)
+        if exact_key in exact_signature_to_group:
+            reduced_index = exact_signature_to_group[exact_key]
+            tie_group = tie_groups[reduced_index]
+            tie_group.member_indices = np.append(tie_group.member_indices, variant_index)
+            tie_group.signs = np.append(tie_group.signs, 1.0)
             original_to_reduced[variant_index] = reduced_index
             continue
 
-        if key in anti_signatures:
-            reduced_index = anti_signatures[key]
-            group = groups[reduced_index]
-            group.member_indices = np.append(group.member_indices, variant_index)
-            group.signs = np.append(group.signs, -1.0)
+        if exact_key in sign_flipped_signature_to_group:
+            reduced_index = sign_flipped_signature_to_group[exact_key]
+            tie_group = tie_groups[reduced_index]
+            tie_group.member_indices = np.append(tie_group.member_indices, variant_index)
+            tie_group.signs = np.append(tie_group.signs, -1.0)
             original_to_reduced[variant_index] = reduced_index
             continue
 
-        reduced_index = len(groups)
-        groups.append(
+        reduced_index = len(tie_groups)
+        tie_groups.append(
             TieGroup(
                 representative_index=variant_index,
                 member_indices=np.asarray([variant_index], dtype=np.int32),
                 signs=np.asarray([1.0], dtype=np.float32),
             )
         )
-        kept.append(variant_index)
-        signatures[key] = reduced_index
-        anti_signatures[anti_key] = reduced_index
+        kept_variant_indices.append(variant_index)
+        exact_signature_to_group[exact_key] = reduced_index
+        sign_flipped_signature_to_group[sign_flipped_key] = reduced_index
         original_to_reduced[variant_index] = reduced_index
 
     return TieMap(
-        kept_indices=np.asarray(kept, dtype=np.int32),
+        kept_indices=np.asarray(kept_variant_indices, dtype=np.int32),
         original_to_reduced=original_to_reduced,
-        reduced_to_group=groups,
+        reduced_to_group=tie_groups,
     )

@@ -1,12 +1,12 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, fields
 from typing import Sequence
 
 import numpy as np
+from scipy.optimize import minimize
 from scipy.special import expit
 from scipy.stats import norm
-from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import (
     average_precision_score,
     log_loss,
@@ -14,7 +14,7 @@ from sklearn.metrics import (
     roc_auc_score,
 )
 
-from sv_pgs.config import BenchmarkConfig, ModelConfig, TraitType, VariantClass
+from sv_pgs.config import BenchmarkConfig, ModelConfig, TraitType
 from sv_pgs.data import VariantRecord, normalize_variant_records
 from sv_pgs.model import BayesianPGS
 
@@ -56,50 +56,40 @@ def run_benchmark_suite(
     snv_only_config = _copy_config(shared)
     joint_config = _copy_config(shared)
 
-    models = {
-        "current_snv_score": _fit_model(
-            baseline_config,
-            train_genotypes[:, snv_mask],
-            train_covariates,
-            train_targets,
-            [record for record, keep in zip(normalized_records, snv_mask, strict=True) if keep],
-        ),
-        "snv_only_bayesr": _fit_model(
-            snv_only_config,
-            train_genotypes[:, snv_mask],
-            train_covariates,
-            train_targets,
-            [record for record, keep in zip(normalized_records, snv_mask, strict=True) if keep],
-        ),
-        "joint_snv_sv_bayesr": _fit_model(
-            joint_config,
-            train_genotypes,
-            train_covariates,
-            train_targets,
-            normalized_records,
-        ),
-    }
+    snv_records = [record for record, is_snv in zip(normalized_records, snv_mask, strict=True) if is_snv]
 
-    metrics: dict[str, BenchmarkMetrics] = {}
-    for name, model in models.items():
-        if name == "joint_snv_sv_bayesr":
-            x_test = test_genotypes
-        else:
-            x_test = test_genotypes[:, snv_mask]
-        metrics[name] = _compute_metrics(
+    model_specs: list[tuple[str, BayesianPGS, np.ndarray]] = [
+        (
+            "current_snv_score",
+            _fit_model(baseline_config, train_genotypes[:, snv_mask], train_covariates, train_targets, snv_records),
+            test_genotypes[:, snv_mask],
+        ),
+        (
+            "snv_only_bayesr",
+            _fit_model(snv_only_config, train_genotypes[:, snv_mask], train_covariates, train_targets, snv_records),
+            test_genotypes[:, snv_mask],
+        ),
+        (
+            "joint_snv_sv_bayesr",
+            _fit_model(joint_config, train_genotypes, train_covariates, train_targets, normalized_records),
+            test_genotypes,
+        ),
+    ]
+
+    return {
+        name: _compute_metrics(
             model=model,
-            genotypes=x_test,
+            genotypes=model_test_genotypes,
             covariates=test_covariates,
             targets=test_targets,
             benchmark_config=benchmark_config,
         )
-    return metrics
+        for name, model, model_test_genotypes in model_specs
+    }
 
 
 def _copy_config(config: ModelConfig, **overrides) -> ModelConfig:
-    from dataclasses import fields
-
-    payload = {f.name: getattr(config, f.name) for f in fields(config)}
+    payload = {config_field.name: getattr(config, config_field.name) for config_field in fields(config)}
     payload.update(overrides)
     return ModelConfig(**payload)
 
@@ -145,7 +135,6 @@ def _compute_metrics(
             top_tail_enrichment=_top_tail_enrichment(probabilities, targets, benchmark_config.top_tail_fraction),
         )
 
-    predictions = scores
     return BenchmarkMetrics(
         auc=None,
         log_loss=None,
@@ -153,16 +142,26 @@ def _compute_metrics(
         calibration_intercept=None,
         calibration_slope=None,
         liability_r2=None,
-        r2=float(r2_score(targets, predictions)),
-        top_tail_enrichment=_top_tail_enrichment(predictions, targets, benchmark_config.top_tail_fraction),
+        r2=float(r2_score(targets, scores)),
+        top_tail_enrichment=_top_tail_enrichment(scores, targets, benchmark_config.top_tail_fraction),
     )
 
 
 def _calibration(probabilities: np.ndarray, targets: np.ndarray) -> tuple[float, float]:
     logits = np.log(np.clip(probabilities, 1e-6, 1.0 - 1e-6) / np.clip(1.0 - probabilities, 1e-6, 1.0))
-    calibrator = LogisticRegression(C=1e12, solver="lbfgs", max_iter=1000)
-    calibrator.fit(logits.reshape(-1, 1), targets)
-    return float(calibrator.intercept_[0]), float(calibrator.coef_[0, 0])
+
+    def objective(parameters: np.ndarray) -> float:
+        intercept, slope = parameters
+        calibrated_probabilities = expit(intercept + slope * logits)
+        return -float(
+            np.mean(
+                targets * np.log(calibrated_probabilities + 1e-8)
+                + (1.0 - targets) * np.log(1.0 - calibrated_probabilities + 1e-8)
+            )
+        )
+
+    optimization = minimize(objective, x0=np.array([0.0, 1.0], dtype=np.float64), method="BFGS")
+    return float(optimization.x[0]), float(optimization.x[1])
 
 
 def _liability_r2(probabilities: np.ndarray, targets: np.ndarray, prevalence: float) -> float:

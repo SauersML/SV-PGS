@@ -1,11 +1,14 @@
+"""Structured variational EM inference with JAX hot loops."""
+
 from __future__ import annotations
 
 from dataclasses import dataclass
 from typing import Sequence
 
+import jax
 import jax.numpy as jnp
 import numpy as np
-from scipy.special import expit, logsumexp
+from jax import lax
 
 from sv_pgs.config import ModelConfig, TraitType, VariantClass
 from sv_pgs.data import GraphEdges, TieMap, VariantRecord
@@ -45,253 +48,439 @@ def fit_variational_em(
     config: ModelConfig,
     validation_data: tuple[np.ndarray, np.ndarray, np.ndarray] | None = None,
 ) -> VariationalFitResult:
-    reduced_x = np.asarray(genotypes[:, tie_map.kept_indices], dtype=np.float32)
-    reduced_records = [records[index] for index in tie_map.kept_indices]
-    class_to_index = {variant_class: idx for idx, variant_class in enumerate(sorted({record.variant_class for record in reduced_records}, key=lambda value: value.value))}
-    index_to_class = {idx: variant_class for variant_class, idx in class_to_index.items()}
-    class_index = np.asarray([class_to_index[record.variant_class] for record in reduced_records], dtype=np.int32)
-    quality = np.clip(np.asarray([record.quality for record in reduced_records], dtype=np.float32), 1e-4, 1.0)
-    base_variances = config.base_component_variances().astype(np.float32)
-    class_priors = config.class_prior_weights()
+    reduced_genotypes = np.asarray(genotypes[:, tie_map.kept_indices], dtype=np.float32)
+    reduced_records = [records[int(variant_index)] for variant_index in tie_map.kept_indices]
+    class_index_lookup, inverse_class_lookup = _class_mappings(reduced_records)
+    class_indices_host = np.asarray(
+        [class_index_lookup[variant_record.variant_class] for variant_record in reduced_records],
+        dtype=np.int32,
+    )
+    quality_host = np.clip(
+        np.asarray([variant_record.quality for variant_record in reduced_records], dtype=np.float32),
+        1e-4,
+        1.0,
+    )
+    base_component_variances = config.base_component_variances().astype(np.float32)
+    class_prior_lookup = config.class_prior_weights()
 
-    class_pi = np.vstack([class_priors[index_to_class[idx]] for idx in range(len(class_to_index))]).astype(np.float32)
-    class_variances = np.vstack([base_variances.copy() for _ in range(len(class_to_index))]).astype(np.float32)
-
-    responsibilities = np.tile(base_variances[None, :], (reduced_x.shape[1], 1)).astype(np.float32)
-    responsibilities = responsibilities / responsibilities.sum(axis=1, keepdims=True)
-    beta_mean = np.zeros(reduced_x.shape[1], dtype=np.float32)
-    beta_var = np.full(reduced_x.shape[1], base_variances[0], dtype=np.float32)
-    alpha = np.zeros(covariates.shape[1], dtype=np.float32)
-    sigma_e2 = 1.0
-
-    operator = GenotypeOperator.from_numpy(reduced_x, graph, config)
+    genotype_operator = GenotypeOperator.from_numpy(reduced_genotypes, graph, config)
     blocks = correlation_blocks(graph)
+
+    target_vector = jnp.asarray(targets, dtype=jnp.float32)
+    covariate_matrix = jnp.asarray(covariates, dtype=jnp.float32)
+    class_indices = jnp.asarray(class_indices_host, dtype=jnp.int32)
+    quality_vector = jnp.asarray(quality_host, dtype=jnp.float32)
+
+    class_count = len(class_index_lookup)
+    class_mixture_weights = jnp.asarray(
+        np.vstack([class_prior_lookup[inverse_class_lookup[class_index]] for class_index in range(class_count)]),
+        dtype=jnp.float32,
+    )
+    class_variances = jnp.asarray(
+        np.tile(base_component_variances, (class_count, 1)),
+        dtype=jnp.float32,
+    )
+
+    initial_component_weights = np.tile(base_component_variances[None, :], (reduced_genotypes.shape[1], 1))
+    responsibilities = jnp.asarray(
+        initial_component_weights / initial_component_weights.sum(axis=1, keepdims=True),
+        dtype=jnp.float32,
+    )
+    coefficient_mean = jnp.zeros(reduced_genotypes.shape[1], dtype=jnp.float32)
+    coefficient_variance = jnp.full(reduced_genotypes.shape[1], base_component_variances[0], dtype=jnp.float32)
+    covariate_coefficients = jnp.zeros(covariate_matrix.shape[1], dtype=jnp.float32)
+    residual_variance = 1.0
+
+    graph_diagonal = _laplacian_diagonal(
+        source_indices=jnp.asarray(graph.src, dtype=jnp.int32),
+        destination_indices=jnp.asarray(graph.dst, dtype=jnp.int32),
+        edge_weights=jnp.asarray(graph.weight, dtype=jnp.float32),
+        variant_count=reduced_genotypes.shape[1],
+    )
+
+    prepared_validation = None
+    if validation_data is not None:
+        validation_genotypes, validation_covariates, validation_targets = validation_data
+        prepared_validation = (
+            jnp.asarray(validation_genotypes, dtype=jnp.float32),
+            jnp.asarray(validation_covariates, dtype=jnp.float32),
+            jnp.asarray(validation_targets, dtype=jnp.float32),
+        )
+
     objective_history: list[float] = []
     validation_history: list[float] = []
     block_posteriors: list[BlockPosterior] = []
 
-    y = np.asarray(targets, dtype=np.float32)
-    c = np.asarray(covariates, dtype=np.float32)
-    v_x = reduced_x
+    outer_iteration = 0
+    while outer_iteration < config.max_outer_iters:
+        linear_predictor = matvec(genotype_operator, coefficient_mean) + covariate_matrix @ covariate_coefficients
+        sample_weights, response_vector, residual_variance = _likelihood_update(
+            trait_type=config.trait_type,
+            targets=target_vector,
+            linear_predictor=linear_predictor,
+            covariate_matrix=covariate_matrix,
+            genotype_prediction=matvec(genotype_operator, coefficient_mean),
+            sigma_e_prior=config.sigma_e_prior,
+            minimum_pg_weight=config.pg_min_weight,
+        )
+        covariate_coefficients = _solve_covariates(
+            covariate_matrix=covariate_matrix,
+            response_vector=response_vector,
+            sample_weights=sample_weights,
+        )
 
-    for _ in range(config.max_outer_iters):
-        eta = np.asarray(matvec(operator, jnp.asarray(beta_mean))) + c @ alpha
-        if config.trait_type == TraitType.BINARY:
-            weights = _polya_gamma_expectation(eta, config.pg_min_weight)
-            kappa = y - 0.5
-            alpha = _solve_covariates_binary(c, kappa, weights, eta - c @ alpha)
-            rhs_sample = kappa - weights * (c @ alpha)
-            sigma_e2 = 1.0
-        else:
-            residual = y - eta
-            sigma_e2 = float(np.mean(residual * residual) + config.sigma_e_prior)
-            weights = np.full_like(y, 1.0 / sigma_e2)
-            alpha = _solve_covariates_gaussian(c, y, weights, eta - c @ alpha)
-            rhs_sample = weights * (y - c @ alpha)
-
-        prior_precision = _effective_prior_precision(responsibilities, class_variances, class_index, quality)
-        rhs = np.asarray(rmatvec(operator, jnp.asarray(rhs_sample, dtype=jnp.float32)))
-        diag = np.asarray(weighted_column_norms(operator, jnp.asarray(weights, dtype=jnp.float32))) + prior_precision
-        diag = diag + _laplacian_diagonal(graph, reduced_x.shape[1])
-        beta_mean = np.asarray(
-            pcg_solve(
-                operator,
-                jnp.asarray(rhs, dtype=jnp.float32),
-                jnp.asarray(weights, dtype=jnp.float32),
-                jnp.asarray(prior_precision, dtype=jnp.float32),
-                jnp.asarray(np.maximum(diag, 1e-4), dtype=jnp.float32),
-                jnp.asarray(beta_mean, dtype=jnp.float32),
-                config.pcg_tolerance,
-                config.max_inner_pcg_iters,
-            )
+        coefficient_right_hand_side = _coefficient_right_hand_side(
+            trait_type=config.trait_type,
+            target_vector=target_vector,
+            sample_weights=sample_weights,
+            covariate_matrix=covariate_matrix,
+            covariate_coefficients=covariate_coefficients,
+        )
+        prior_precision = _effective_prior_precision(
+            responsibilities=responsibilities,
+            class_variances=class_variances,
+            class_indices=class_indices,
+            quality_vector=quality_vector,
+        )
+        projected_right_hand_side = rmatvec(genotype_operator, coefficient_right_hand_side)
+        preconditioner_diagonal = (
+            weighted_column_norms(genotype_operator, sample_weights)
+            + prior_precision
+            + graph_diagonal
+        )
+        coefficient_mean = pcg_solve(
+            operator=genotype_operator,
+            right_hand_side=projected_right_hand_side,
+            sample_weights=sample_weights,
+            prior_precision=prior_precision,
+            preconditioner_diagonal=jnp.maximum(preconditioner_diagonal, 1e-4),
+            initial_coefficients=coefficient_mean,
+            tolerance=config.pcg_tolerance,
+            maximum_iterations=config.max_inner_pcg_iters,
         )
 
         block_posteriors = _refresh_block_posteriors(
             blocks=blocks,
             graph=graph,
-            genotypes=v_x,
-            sample_weights=weights,
-            prior_precision=prior_precision,
+            genotypes=reduced_genotypes,
+            sample_weights=np.asarray(sample_weights),
+            prior_precision=np.asarray(prior_precision),
             config=config,
         )
-        beta_var = np.full(reduced_x.shape[1], base_variances[0], dtype=np.float32)
-        for block in block_posteriors:
-            beta_var[block.indices] = block.covariance_diag
+        coefficient_variance_host = np.full(reduced_genotypes.shape[1], base_component_variances[0], dtype=np.float32)
+        for block_posterior in block_posteriors:
+            coefficient_variance_host[block_posterior.indices] = block_posterior.covariance_diag
+        coefficient_variance = jnp.asarray(coefficient_variance_host, dtype=jnp.float32)
 
         responsibilities = _update_responsibilities(
-            beta_mean=beta_mean,
-            beta_var=beta_var,
-            class_index=class_index,
-            quality=quality,
-            class_pi=class_pi,
+            coefficient_mean=coefficient_mean,
+            coefficient_variance=coefficient_variance,
+            class_indices=class_indices,
+            quality_vector=quality_vector,
+            class_mixture_weights=class_mixture_weights,
             class_variances=class_variances,
         )
-        class_pi = _update_class_mixtures(class_index, responsibilities, class_pi, config)
-        class_variances = _update_class_variances(
-            class_index=class_index,
+        class_mixture_weights = _update_class_mixture_weights(
+            class_indices=class_indices,
             responsibilities=responsibilities,
-            beta_mean=beta_mean,
-            beta_var=beta_var,
-            quality=quality,
-            class_variances=class_variances,
-            config=config,
+            current_mixture_weights=class_mixture_weights,
+            class_count=class_count,
+            dirichlet_strength=config.dirichlet_strength,
+        )
+        class_variances = _update_class_variances(
+            class_indices=class_indices,
+            responsibilities=responsibilities,
+            coefficient_mean=coefficient_mean,
+            coefficient_variance=coefficient_variance,
+            quality_vector=quality_vector,
+            class_count=class_count,
+            shrinkage=config.variance_shrinkage,
+            floor_variance=config.prior_floor_variance,
+            minimum_log_gap=config.variance_min_gap_log,
         )
 
-        objective = _surrogate_objective(
-            trait_type=config.trait_type,
-            y=y,
-            eta=np.asarray(matvec(operator, jnp.asarray(beta_mean))) + c @ alpha,
-            weights=weights,
-            beta_mean=beta_mean,
-            prior_precision=prior_precision,
-            graph=graph,
+        updated_linear_predictor = matvec(genotype_operator, coefficient_mean) + covariate_matrix @ covariate_coefficients
+        objective_history.append(
+            float(
+                _surrogate_objective(
+                    trait_type=config.trait_type,
+                    targets=target_vector,
+                    linear_predictor=updated_linear_predictor,
+                    sample_weights=sample_weights,
+                    coefficient_mean=coefficient_mean,
+                    prior_precision=prior_precision,
+                    graph=graph,
+                )
+            )
         )
-        objective_history.append(float(objective))
-        if validation_data is not None:
-            val_x, val_c, val_y = validation_data
+
+        if prepared_validation is not None:
+            validation_genotypes, validation_covariates, validation_targets = prepared_validation
+            validation_linear_predictor = validation_genotypes @ coefficient_mean + validation_covariates @ covariate_coefficients
             validation_history.append(
                 float(
                     _validation_metric(
                         trait_type=config.trait_type,
-                        genotypes=val_x,
-                        covariates=val_c,
-                        beta=beta_mean,
-                        alpha=alpha,
-                        targets=val_y,
+                        targets=validation_targets,
+                        linear_predictor=validation_linear_predictor,
                     )
                 )
             )
-        if len(objective_history) >= 2 and abs(objective_history[-1] - objective_history[-2]) < config.convergence_tolerance:
-            break
 
+        outer_iteration += 1
+        if len(objective_history) >= 2:
+            objective_delta = abs(objective_history[-1] - objective_history[-2])
+            if objective_delta < config.convergence_tolerance:
+                break
+
+    class_mixture_weights_host = np.asarray(class_mixture_weights)
+    class_variances_host = np.asarray(class_variances)
     return VariationalFitResult(
-        alpha=alpha,
-        beta_reduced=beta_mean,
-        beta_variance=beta_var,
-        responsibilities=responsibilities,
-        class_mixture_weights={index_to_class[idx]: class_pi[idx] for idx in range(class_pi.shape[0])},
-        class_variances={index_to_class[idx]: class_variances[idx] for idx in range(class_variances.shape[0])},
-        sigma_e2=sigma_e2,
+        alpha=np.asarray(covariate_coefficients),
+        beta_reduced=np.asarray(coefficient_mean),
+        beta_variance=np.asarray(coefficient_variance),
+        responsibilities=np.asarray(responsibilities),
+        class_mixture_weights={
+            inverse_class_lookup[class_index]: class_mixture_weights_host[class_index]
+            for class_index in range(class_count)
+        },
+        class_variances={
+            inverse_class_lookup[class_index]: class_variances_host[class_index]
+            for class_index in range(class_count)
+        },
+        sigma_e2=float(residual_variance),
         objective_history=objective_history,
         validation_history=validation_history,
         block_posteriors=block_posteriors,
     )
 
 
-def _polya_gamma_expectation(eta: np.ndarray, min_weight: float) -> np.ndarray:
-    abs_eta = np.abs(eta)
-    small = abs_eta < 1e-4
-    safe = np.where(small, 1.0, abs_eta)
-    weights = 0.5 * np.tanh(safe / 2.0) / safe
-    weights = np.where(small, 0.25, weights)
-    return np.maximum(weights.astype(np.float32), min_weight)
+def _class_mappings(
+    records: Sequence[VariantRecord],
+) -> tuple[dict[VariantClass, int], dict[int, VariantClass]]:
+    unique_classes = sorted({record.variant_class for record in records}, key=lambda variant_class: variant_class.value)
+    class_index_lookup = {
+        variant_class: class_index for class_index, variant_class in enumerate(unique_classes)
+    }
+    inverse_lookup = {
+        class_index: variant_class for variant_class, class_index in class_index_lookup.items()
+    }
+    return class_index_lookup, inverse_lookup
 
 
-def _solve_covariates_binary(covariates: np.ndarray, kappa: np.ndarray, weights: np.ndarray, xb: np.ndarray) -> np.ndarray:
-    lhs = covariates.T @ (weights[:, None] * covariates)
-    rhs = covariates.T @ (kappa - weights * xb)
-    jitter = np.eye(lhs.shape[0], dtype=np.float32) * 1e-6
-    return np.linalg.solve(lhs + jitter, rhs).astype(np.float32)
+def _likelihood_update(
+    trait_type: TraitType,
+    targets: jnp.ndarray,
+    linear_predictor: jnp.ndarray,
+    covariate_matrix: jnp.ndarray,
+    genotype_prediction: jnp.ndarray,
+    sigma_e_prior: float,
+    minimum_pg_weight: float,
+) -> tuple[jnp.ndarray, jnp.ndarray, float]:
+    if trait_type == TraitType.BINARY:
+        sample_weights = _polya_gamma_expectation(linear_predictor, minimum_pg_weight)
+        response_vector = targets - 0.5 - sample_weights * genotype_prediction
+        return sample_weights, response_vector, 1.0
+
+    residual_vector = targets - linear_predictor
+    residual_variance = float(jnp.mean(residual_vector * residual_vector) + sigma_e_prior)
+    sample_weights = jnp.full(targets.shape[0], 1.0 / residual_variance, dtype=jnp.float32)
+    response_vector = sample_weights * (targets - genotype_prediction)
+    return sample_weights, response_vector, residual_variance
 
 
-def _solve_covariates_gaussian(covariates: np.ndarray, y: np.ndarray, weights: np.ndarray, xb: np.ndarray) -> np.ndarray:
-    lhs = covariates.T @ (weights[:, None] * covariates)
-    rhs = covariates.T @ (weights * (y - xb))
-    jitter = np.eye(lhs.shape[0], dtype=np.float32) * 1e-6
-    return np.linalg.solve(lhs + jitter, rhs).astype(np.float32)
+def _solve_covariates(
+    covariate_matrix: jnp.ndarray,
+    response_vector: jnp.ndarray,
+    sample_weights: jnp.ndarray,
+) -> jnp.ndarray:
+    weighted_covariates = jnp.transpose(covariate_matrix) * sample_weights[None, :]
+    normal_matrix = weighted_covariates @ covariate_matrix
+    right_hand_side = jnp.transpose(covariate_matrix) @ response_vector
+    ridge_jitter = 1e-6 * jnp.eye(covariate_matrix.shape[1], dtype=jnp.float32)
+    return jnp.linalg.solve(normal_matrix + ridge_jitter, right_hand_side)
+
+
+def _coefficient_right_hand_side(
+    trait_type: TraitType,
+    target_vector: jnp.ndarray,
+    sample_weights: jnp.ndarray,
+    covariate_matrix: jnp.ndarray,
+    covariate_coefficients: jnp.ndarray,
+) -> jnp.ndarray:
+    if trait_type == TraitType.BINARY:
+        return target_vector - 0.5 - sample_weights * (covariate_matrix @ covariate_coefficients)
+    return sample_weights * (target_vector - covariate_matrix @ covariate_coefficients)
+
+
+def _polya_gamma_expectation(
+    linear_predictor: jnp.ndarray,
+    minimum_weight: float,
+) -> jnp.ndarray:
+    absolute_linear_predictor = jnp.abs(linear_predictor)
+    small_mask = absolute_linear_predictor < 1e-4
+    safe_linear_predictor = jnp.where(small_mask, 1.0, absolute_linear_predictor)
+    weights = 0.5 * jnp.tanh(safe_linear_predictor / 2.0) / safe_linear_predictor
+    weights = jnp.where(small_mask, 0.25, weights)
+    return jnp.maximum(weights, minimum_weight)
 
 
 def _effective_prior_precision(
-    responsibilities: np.ndarray,
-    class_variances: np.ndarray,
-    class_index: np.ndarray,
-    quality: np.ndarray,
-) -> np.ndarray:
-    precisions = 1.0 / (quality[:, None] * class_variances[class_index])
-    return np.sum(responsibilities * precisions, axis=1).astype(np.float32)
+    responsibilities: jnp.ndarray,
+    class_variances: jnp.ndarray,
+    class_indices: jnp.ndarray,
+    quality_vector: jnp.ndarray,
+) -> jnp.ndarray:
+    local_variances = class_variances[class_indices]
+    component_precisions = 1.0 / (quality_vector[:, None] * local_variances + 1e-30)
+    return jnp.sum(responsibilities * component_precisions, axis=1)
 
 
 def _update_responsibilities(
-    beta_mean: np.ndarray,
-    beta_var: np.ndarray,
-    class_index: np.ndarray,
-    quality: np.ndarray,
-    class_pi: np.ndarray,
-    class_variances: np.ndarray,
-) -> np.ndarray:
-    expected_sq = (beta_mean * beta_mean + beta_var)[:, None]
-    local_variances = class_variances[class_index]
-    logits = (
-        np.log(class_pi[class_index] + 1e-12)
-        - 0.5 * np.log(local_variances + 1e-12)
-        - 0.5 * expected_sq / (quality[:, None] * local_variances + 1e-12)
+    coefficient_mean: jnp.ndarray,
+    coefficient_variance: jnp.ndarray,
+    class_indices: jnp.ndarray,
+    quality_vector: jnp.ndarray,
+    class_mixture_weights: jnp.ndarray,
+    class_variances: jnp.ndarray,
+) -> jnp.ndarray:
+    expected_squared_effect = (coefficient_mean * coefficient_mean + coefficient_variance)[:, None]
+    local_variances = class_variances[class_indices]
+    local_mixture_weights = class_mixture_weights[class_indices]
+    unnormalized_log_weights = (
+        jnp.log(local_mixture_weights + 1e-12)
+        - 0.5 * jnp.log(local_variances + 1e-12)
+        - 0.5 * expected_squared_effect / (quality_vector[:, None] * local_variances + 1e-12)
     )
-    logits = logits - logsumexp(logits, axis=1, keepdims=True)
-    return np.exp(logits).astype(np.float32)
+    normalized_log_weights = unnormalized_log_weights - jax.nn.logsumexp(
+        unnormalized_log_weights,
+        axis=1,
+        keepdims=True,
+    )
+    return jnp.exp(normalized_log_weights)
 
 
-def _update_class_mixtures(
-    class_index: np.ndarray,
-    responsibilities: np.ndarray,
-    current_pi: np.ndarray,
-    config: ModelConfig,
-) -> np.ndarray:
-    updated = np.zeros_like(current_pi)
-    for class_id in range(current_pi.shape[0]):
-        mask = class_index == class_id
-        prior = config.dirichlet_strength * current_pi[class_id]
-        updated[class_id] = responsibilities[mask].sum(axis=0) + prior
-        updated[class_id] /= updated[class_id].sum()
-    return updated.astype(np.float32)
+def _update_class_mixture_weights(
+    class_indices: jnp.ndarray,
+    responsibilities: jnp.ndarray,
+    current_mixture_weights: jnp.ndarray,
+    class_count: int,
+    dirichlet_strength: float,
+) -> jnp.ndarray:
+    one_hot_classes = jax.nn.one_hot(class_indices, class_count)
+    responsibility_sums = jnp.transpose(one_hot_classes) @ responsibilities
+    posterior_weights = responsibility_sums + dirichlet_strength * current_mixture_weights
+    return posterior_weights / posterior_weights.sum(axis=1, keepdims=True)
 
 
 def _update_class_variances(
-    class_index: np.ndarray,
-    responsibilities: np.ndarray,
-    beta_mean: np.ndarray,
-    beta_var: np.ndarray,
-    quality: np.ndarray,
-    class_variances: np.ndarray,
-    config: ModelConfig,
-) -> np.ndarray:
-    updated = np.zeros_like(class_variances)
-    expected_sq = beta_mean * beta_mean + beta_var
-    global_log = np.zeros(class_variances.shape[1], dtype=np.float32)
-    global_weight = np.zeros(class_variances.shape[1], dtype=np.float32)
-
-    for class_id in range(class_variances.shape[0]):
-        mask = class_index == class_id
-        weight = responsibilities[mask]
-        numerator = (weight * (expected_sq[mask, None] / quality[mask, None])).sum(axis=0) + 1e-6
-        denominator = weight.sum(axis=0) + 1e-6
-        local = numerator / denominator
-        global_log += weight.sum(axis=0) * np.log(local)
-        global_weight += weight.sum(axis=0)
-        updated[class_id] = local
-
-    global_mean = np.exp(global_log / np.maximum(global_weight, 1e-6))
-    for class_id in range(updated.shape[0]):
-        local_log = np.log(np.maximum(updated[class_id], 1e-8))
-        shrunk = (1.0 - config.variance_shrinkage) * local_log + config.variance_shrinkage * np.log(global_mean)
-        updated[class_id] = _enforce_ordered_variances(np.exp(shrunk), config)
-    return updated.astype(np.float32)
-
-
-def _enforce_ordered_variances(variances: np.ndarray, config: ModelConfig) -> np.ndarray:
-    log_var = np.log(np.maximum(variances, config.prior_floor_variance))
-    ordered = np.empty_like(log_var)
-    ordered[0] = max(log_var[0], np.log(config.prior_floor_variance))
-    for index in range(1, log_var.shape[0]):
-        ordered[index] = max(log_var[index], ordered[index - 1] + config.variance_min_gap_log)
-    return np.exp(ordered).astype(np.float32)
+    class_indices: jnp.ndarray,
+    responsibilities: jnp.ndarray,
+    coefficient_mean: jnp.ndarray,
+    coefficient_variance: jnp.ndarray,
+    quality_vector: jnp.ndarray,
+    class_count: int,
+    shrinkage: float,
+    floor_variance: float,
+    minimum_log_gap: float,
+) -> jnp.ndarray:
+    expected_squared_effect = coefficient_mean * coefficient_mean + coefficient_variance
+    weighted_squared_effect = responsibilities * (expected_squared_effect / quality_vector)[:, None]
+    one_hot_classes = jax.nn.one_hot(class_indices, class_count)
+    per_class_expected_effect = jnp.transpose(one_hot_classes) @ weighted_squared_effect
+    per_class_responsibility = jnp.transpose(one_hot_classes) @ responsibilities
+    local_variances = per_class_expected_effect / jnp.maximum(per_class_responsibility, 1e-6)
+    global_log_variances = (
+        jnp.sum(per_class_responsibility * jnp.log(jnp.maximum(local_variances, 1e-20)), axis=0)
+        / jnp.maximum(per_class_responsibility.sum(axis=0), 1e-6)
+    )
+    global_variances = jnp.exp(global_log_variances)
+    shrunk_log_variances = (
+        (1.0 - shrinkage) * jnp.log(jnp.maximum(local_variances, 1e-20))
+        + shrinkage * jnp.log(global_variances + 1e-20)[None, :]
+    )
+    return jax.vmap(
+        lambda variance_row: _enforce_ordered_variances(
+            jnp.exp(shrunk_log_variances[variance_row]),
+            floor_variance,
+            minimum_log_gap,
+        )
+    )(jnp.arange(local_variances.shape[0]))
 
 
-def _laplacian_diagonal(graph: GraphEdges, variant_count: int) -> np.ndarray:
-    diagonal = np.zeros(variant_count, dtype=np.float32)
-    for src, dst, weight in zip(graph.src, graph.dst, graph.weight, strict=True):
-        diagonal[src] += weight
-        diagonal[dst] += weight
+def _enforce_ordered_variances(
+    variance_row: jnp.ndarray,
+    floor_variance: float,
+    minimum_log_gap: float,
+) -> jnp.ndarray:
+    bounded_row = jnp.maximum(variance_row, floor_variance)
+    initial_log_variance = jnp.log(bounded_row[0])
+
+    def scan_step(previous_log_variance: jnp.ndarray, current_variance: jnp.ndarray):
+        current_log_variance = jnp.log(jnp.maximum(current_variance, floor_variance))
+        updated_log_variance = jnp.maximum(current_log_variance, previous_log_variance + minimum_log_gap)
+        return updated_log_variance, updated_log_variance
+
+    remaining_log_variances = lax.scan(scan_step, initial_log_variance, bounded_row[1:])[1]
+    return jnp.exp(jnp.concatenate([initial_log_variance[None], remaining_log_variances]))
+
+
+def _laplacian_diagonal(
+    source_indices: jnp.ndarray,
+    destination_indices: jnp.ndarray,
+    edge_weights: jnp.ndarray,
+    variant_count: int,
+) -> jnp.ndarray:
+    diagonal = jnp.zeros(variant_count, dtype=jnp.float32)
+    diagonal = diagonal.at[source_indices].add(edge_weights)
+    diagonal = diagonal.at[destination_indices].add(edge_weights)
     return diagonal
+
+
+def _binary_log_likelihood(
+    targets: jnp.ndarray,
+    linear_predictor: jnp.ndarray,
+) -> jnp.ndarray:
+    probabilities = jax.nn.sigmoid(linear_predictor)
+    return (
+        targets * jnp.log(probabilities + 1e-8)
+        + (1.0 - targets) * jnp.log(1.0 - probabilities + 1e-8)
+    )
+
+
+def _surrogate_objective(
+    trait_type: TraitType,
+    targets: jnp.ndarray,
+    linear_predictor: jnp.ndarray,
+    sample_weights: jnp.ndarray,
+    coefficient_mean: jnp.ndarray,
+    prior_precision: jnp.ndarray,
+    graph: GraphEdges,
+) -> jnp.ndarray:
+    if trait_type == TraitType.BINARY:
+        likelihood = jnp.sum(_binary_log_likelihood(targets, linear_predictor))
+    else:
+        residual_vector = targets - linear_predictor
+        likelihood = -0.5 * jnp.sum(sample_weights * residual_vector * residual_vector)
+
+    prior_term = -0.5 * jnp.sum(prior_precision * coefficient_mean * coefficient_mean)
+    if graph.src.shape[0] == 0:
+        graph_term = 0.0
+    else:
+        coefficient_difference = coefficient_mean[graph.src] - graph.sign * coefficient_mean[graph.dst]
+        graph_term = -0.5 * jnp.sum(jnp.asarray(graph.weight) * coefficient_difference * coefficient_difference)
+    return likelihood + prior_term + graph_term
+
+
+def _validation_metric(
+    trait_type: TraitType,
+    targets: jnp.ndarray,
+    linear_predictor: jnp.ndarray,
+) -> jnp.ndarray:
+    if trait_type == TraitType.BINARY:
+        return -jnp.mean(_binary_log_likelihood(targets, linear_predictor))
+    residual_vector = targets - linear_predictor
+    return jnp.mean(residual_vector * residual_vector)
 
 
 def _refresh_block_posteriors(
@@ -302,53 +491,59 @@ def _refresh_block_posteriors(
     prior_precision: np.ndarray,
     config: ModelConfig,
 ) -> list[BlockPosterior]:
-    posteriors: list[BlockPosterior] = []
-    for block in blocks:
-        local_hessian = _build_local_hessian(block.indices, graph, genotypes, sample_weights, prior_precision)
-        if block.indices.shape[0] <= config.covariance_max_block_exact:
-            covariance = np.linalg.inv(local_hessian).astype(np.float32)
-            posteriors.append(
+    block_posteriors: list[BlockPosterior] = []
+    for correlation_block in blocks:
+        local_hessian = _build_local_hessian(
+            block_indices=correlation_block.indices,
+            graph=graph,
+            genotypes=genotypes,
+            sample_weights=sample_weights,
+            prior_precision=prior_precision,
+        )
+        block_size = correlation_block.indices.shape[0]
+        if block_size <= config.covariance_max_block_exact:
+            covariance_matrix = np.linalg.inv(local_hessian).astype(np.float32)
+            block_posteriors.append(
                 BlockPosterior(
-                    indices=block.indices,
-                    covariance_diag=np.diag(covariance).astype(np.float32),
+                    indices=correlation_block.indices,
+                    covariance_diag=np.diag(covariance_matrix).astype(np.float32),
                     low_rank=None,
-                    covariance_dense=covariance,
+                    covariance_dense=covariance_matrix,
                 )
             )
             continue
 
-        if block.indices.shape[0] <= config.covariance_max_block_dense:
-            covariance = np.linalg.inv(local_hessian).astype(np.float32)
-            diag = np.diag(covariance).astype(np.float32)
-            centered = covariance - np.diag(diag)
-            eigvals, eigvecs = np.linalg.eigh(centered)
-            keep = eigvals > 1e-8
-            eigvals = eigvals[keep]
-            eigvecs = eigvecs[:, keep]
-            if eigvals.shape[0] > config.covariance_low_rank:
-                eigvals = eigvals[-config.covariance_low_rank :]
-                eigvecs = eigvecs[:, -config.covariance_low_rank :]
-            low_rank = eigvecs * np.sqrt(eigvals)
-            posteriors.append(
+        if block_size <= config.covariance_max_block_dense:
+            covariance_matrix = np.linalg.inv(local_hessian).astype(np.float32)
+            covariance_diagonal = np.diag(covariance_matrix).astype(np.float32)
+            centered_covariance = covariance_matrix - np.diag(covariance_diagonal)
+            eigenvalues, eigenvectors = np.linalg.eigh(centered_covariance)
+            positive_mask = eigenvalues > 1e-8
+            eigenvalues = eigenvalues[positive_mask]
+            eigenvectors = eigenvectors[:, positive_mask]
+            if eigenvalues.shape[0] > config.covariance_low_rank:
+                eigenvalues = eigenvalues[-config.covariance_low_rank :]
+                eigenvectors = eigenvectors[:, -config.covariance_low_rank :]
+            block_posteriors.append(
                 BlockPosterior(
-                    indices=block.indices,
-                    covariance_diag=diag,
-                    low_rank=low_rank.astype(np.float32),
+                    indices=correlation_block.indices,
+                    covariance_diag=covariance_diagonal,
+                    low_rank=(eigenvectors * np.sqrt(eigenvalues)).astype(np.float32),
                     covariance_dense=None,
                 )
             )
             continue
 
-        diag_precision = np.diag(local_hessian).astype(np.float32)
-        posteriors.append(
+        local_precision_diagonal = np.diag(local_hessian).astype(np.float32)
+        block_posteriors.append(
             BlockPosterior(
-                indices=block.indices,
-                covariance_diag=(1.0 / np.maximum(diag_precision, 1e-6)).astype(np.float32),
+                indices=correlation_block.indices,
+                covariance_diag=(1.0 / np.maximum(local_precision_diagonal, 1e-6)).astype(np.float32),
                 low_rank=None,
                 covariance_dense=None,
             )
         )
-    return posteriors
+    return block_posteriors
 
 
 def _build_local_hessian(
@@ -358,56 +553,27 @@ def _build_local_hessian(
     sample_weights: np.ndarray,
     prior_precision: np.ndarray,
 ) -> np.ndarray:
-    local_x = genotypes[:, block_indices]
-    hessian = local_x.T @ (sample_weights[:, None] * local_x)
-    hessian += np.diag(prior_precision[block_indices])
-    local_lookup = {global_idx: local_idx for local_idx, global_idx in enumerate(block_indices.tolist())}
-    for src, dst, sign, weight in zip(graph.src, graph.dst, graph.sign, graph.weight, strict=True):
-        if src not in local_lookup or dst not in local_lookup:
+    local_genotypes = genotypes[:, block_indices]
+    local_hessian = np.transpose(local_genotypes) @ (sample_weights[:, None] * local_genotypes)
+    local_hessian += np.diag(prior_precision[block_indices])
+    local_index_lookup = {
+        int(global_variant_index): local_variant_index
+        for local_variant_index, global_variant_index in enumerate(block_indices.tolist())
+    }
+    for source_index, destination_index, edge_sign, edge_weight in zip(
+        graph.src,
+        graph.dst,
+        graph.sign,
+        graph.weight,
+        strict=True,
+    ):
+        if source_index not in local_index_lookup or destination_index not in local_index_lookup:
             continue
-        left = local_lookup[src]
-        right = local_lookup[dst]
-        hessian[left, left] += weight
-        hessian[right, right] += weight
-        hessian[left, right] -= sign * weight
-        hessian[right, left] -= sign * weight
-    hessian += np.eye(hessian.shape[0], dtype=np.float32) * 1e-6
-    return hessian.astype(np.float32)
-
-
-def _surrogate_objective(
-    trait_type: TraitType,
-    y: np.ndarray,
-    eta: np.ndarray,
-    weights: np.ndarray,
-    beta_mean: np.ndarray,
-    prior_precision: np.ndarray,
-    graph: GraphEdges,
-) -> float:
-    if trait_type == TraitType.BINARY:
-        likelihood = float(np.sum(y * np.log(expit(eta) + 1e-8) + (1.0 - y) * np.log(1.0 - expit(eta) + 1e-8)))
-    else:
-        residual = y - eta
-        likelihood = float(-0.5 * np.sum(weights * residual * residual))
-    prior = float(-0.5 * np.sum(prior_precision * beta_mean * beta_mean))
-    graph_penalty = 0.0
-    for src, dst, sign, weight in zip(graph.src, graph.dst, graph.sign, graph.weight, strict=True):
-        diff = beta_mean[src] - sign * beta_mean[dst]
-        graph_penalty -= 0.5 * float(weight * diff * diff)
-    return likelihood + prior + graph_penalty
-
-
-def _validation_metric(
-    trait_type: TraitType,
-    genotypes: np.ndarray,
-    covariates: np.ndarray,
-    beta: np.ndarray,
-    alpha: np.ndarray,
-    targets: np.ndarray,
-) -> float:
-    eta = genotypes @ beta + covariates @ alpha
-    if trait_type == TraitType.BINARY:
-        prob = expit(eta)
-        return -float(np.mean(targets * np.log(prob + 1e-8) + (1.0 - targets) * np.log(1.0 - prob + 1e-8)))
-    residual = targets - eta
-    return float(np.mean(residual * residual))
+        local_source = local_index_lookup[int(source_index)]
+        local_destination = local_index_lookup[int(destination_index)]
+        local_hessian[local_source, local_source] += edge_weight
+        local_hessian[local_destination, local_destination] += edge_weight
+        local_hessian[local_source, local_destination] -= edge_sign * edge_weight
+        local_hessian[local_destination, local_source] -= edge_sign * edge_weight
+    local_hessian += np.eye(local_hessian.shape[0], dtype=np.float32) * 1e-6
+    return local_hessian.astype(np.float32)

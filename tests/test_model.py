@@ -1,72 +1,92 @@
+from __future__ import annotations
+
 import numpy as np
 from sklearn.metrics import roc_auc_score
 
 from sv_pgs import BayesianPGS, BenchmarkConfig, ModelConfig, TraitType, VariantClass, VariantRecord, run_benchmark_suite
 
 
-def _synthetic_binary_data():
-    rng = np.random.default_rng(7)
-    n = 160
-    covariates = rng.normal(size=(n, 2)).astype(np.float32)
-    x0 = rng.normal(size=n).astype(np.float32)
-    x1 = x0.copy()
-    x2 = (x0 + rng.normal(scale=0.05, size=n)).astype(np.float32)
-    x3 = rng.normal(size=n).astype(np.float32)
-    x4 = rng.normal(size=n).astype(np.float32)
-    genotypes = np.column_stack([x0, x1, x2, x3, x4]).astype(np.float32)
-    genotypes[rng.choice(n, size=12, replace=False), 4] = np.nan
-    logits = 1.4 * x0 - 1.0 * x4 + 0.6 * covariates[:, 0] - 0.4 * covariates[:, 1]
-    probabilities = 1.0 / (1.0 + np.exp(-logits))
-    targets = rng.binomial(1, probabilities).astype(np.float32)
-    records = [
-        VariantRecord("v0", VariantClass.SNV, "na", "1", 100),
-        VariantRecord("v1", VariantClass.SNV, "na", "1", 101),
-        VariantRecord("v2", VariantClass.DELETION_SHORT, "short", "1", 105, cluster_id="c1"),
-        VariantRecord("v3", VariantClass.SNV, "na", "1", 2000000),
-        VariantRecord("v4", VariantClass.DUPLICATION_SHORT, "short", "1", 110, cluster_id="c1"),
-    ]
-    return genotypes, covariates, targets, records
-
-
-def test_binary_fit_graph_ties_and_roundtrip(tmp_path):
-    genotypes, covariates, targets, records = _synthetic_binary_data()
-    config = ModelConfig(
-        trait_type=TraitType.BINARY,
-        max_outer_iters=12,
-        max_inner_pcg_iters=80,
-        correlation_threshold=0.95,
-        tile_size=8,
+def _synthetic_binary_dataset() -> tuple[np.ndarray, np.ndarray, np.ndarray, list[VariantRecord]]:
+    random_generator = np.random.default_rng(7)
+    sample_count = 160
+    covariate_matrix = random_generator.normal(size=(sample_count, 2)).astype(np.float32)
+    signal_variant = random_generator.normal(size=sample_count).astype(np.float32)
+    duplicate_variant = signal_variant.copy()
+    correlated_structural_variant = (
+        signal_variant + random_generator.normal(scale=0.05, size=sample_count)
+    ).astype(np.float32)
+    nuisance_variant = random_generator.normal(size=sample_count).astype(np.float32)
+    structural_signal_variant = random_generator.normal(size=sample_count).astype(np.float32)
+    genotype_matrix = np.column_stack(
+        [
+            signal_variant,
+            duplicate_variant,
+            correlated_structural_variant,
+            nuisance_variant,
+            structural_signal_variant,
+        ]
+    ).astype(np.float32)
+    genotype_matrix[random_generator.choice(sample_count, size=12, replace=False), 4] = np.nan
+    linear_predictor = (
+        1.4 * signal_variant
+        - 1.0 * structural_signal_variant
+        + 0.6 * covariate_matrix[:, 0]
+        - 0.4 * covariate_matrix[:, 1]
     )
-    model = BayesianPGS(config).fit(genotypes, covariates, targets, records)
+    target_probabilities = 1.0 / (1.0 + np.exp(-linear_predictor))
+    target_vector = random_generator.binomial(1, target_probabilities).astype(np.float32)
+    variant_records = [
+        VariantRecord("variant_0", VariantClass.SNV, "na", "1", 100),
+        VariantRecord("variant_1", VariantClass.SNV, "na", "1", 101),
+        VariantRecord("variant_2", VariantClass.DELETION_SHORT, "short", "1", 105, cluster_id="cluster_a"),
+        VariantRecord("variant_3", VariantClass.SNV, "na", "1", 2_000_000),
+        VariantRecord("variant_4", VariantClass.DUPLICATION_SHORT, "short", "1", 110, cluster_id="cluster_a"),
+    ]
+    return genotype_matrix, covariate_matrix, target_vector, variant_records
 
-    state = model.state
-    assert state is not None
-    assert state.tie_map.kept_indices.tolist() == [0, 2, 3, 4]
-    assert state.graph.src.shape[0] >= 1
-    probabilities = model.predict_proba(genotypes, covariates)[:, 1]
-    assert roc_auc_score(targets, probabilities) > 0.75
 
-    export_path = tmp_path / "artifact"
-    model.export(export_path)
-    loaded = BayesianPGS.load(export_path)
+def test_binary_model_fit_roundtrip_and_rare_sv_filter(tmp_path):
+    genotype_matrix, covariate_matrix, target_vector, variant_records = _synthetic_binary_dataset()
+    genotype_matrix[:159, 4] = 0.0
+    genotype_matrix[159, 4] = 1.0
+    model = BayesianPGS(
+        ModelConfig(
+            trait_type=TraitType.BINARY,
+            max_outer_iters=12,
+            max_inner_pcg_iters=80,
+            correlation_threshold=0.95,
+            tile_size=8,
+            minimum_structural_variant_carriers=2,
+        )
+    ).fit(genotype_matrix, covariate_matrix, target_vector, variant_records)
+
+    assert model.state is not None
+    assert 4 not in model.state.active_variant_indices.tolist()
+    assert model.state.tie_map.kept_indices.tolist() == [0, 2, 3]
+    predicted_probabilities = model.predict_proba(genotype_matrix, covariate_matrix)[:, 1]
+    assert roc_auc_score(target_vector, predicted_probabilities) > 0.75
+
+    artifact_directory = tmp_path / "artifact"
+    model.export(artifact_directory)
+    loaded_model = BayesianPGS.load(artifact_directory)
     np.testing.assert_allclose(
-        loaded.decision_function(genotypes, covariates),
-        model.decision_function(genotypes, covariates),
+        loaded_model.decision_function(genotype_matrix, covariate_matrix),
+        model.decision_function(genotype_matrix, covariate_matrix),
         atol=1e-5,
     )
 
 
-def test_benchmark_suite_runs_same_code_path():
-    genotypes, covariates, targets, records = _synthetic_binary_data()
-    split = 120
-    metrics = run_benchmark_suite(
-        train_genotypes=genotypes[:split],
-        train_covariates=covariates[:split],
-        train_targets=targets[:split],
-        test_genotypes=genotypes[split:],
-        test_covariates=covariates[split:],
-        test_targets=targets[split:],
-        records=records,
+def test_benchmark_suite_runs_from_shared_trainer():
+    genotype_matrix, covariate_matrix, target_vector, variant_records = _synthetic_binary_dataset()
+    train_stop = 120
+    benchmark_metrics = run_benchmark_suite(
+        train_genotypes=genotype_matrix[:train_stop],
+        train_covariates=covariate_matrix[:train_stop],
+        train_targets=target_vector[:train_stop],
+        test_genotypes=genotype_matrix[train_stop:],
+        test_covariates=covariate_matrix[train_stop:],
+        test_targets=target_vector[train_stop:],
+        records=variant_records,
         benchmark_config=BenchmarkConfig(
             shared_config=ModelConfig(
                 trait_type=TraitType.BINARY,
@@ -78,6 +98,6 @@ def test_benchmark_suite_runs_same_code_path():
         ),
     )
 
-    assert set(metrics) == {"current_snv_score", "snv_only_bayesr", "joint_snv_sv_bayesr"}
-    assert metrics["joint_snv_sv_bayesr"].auc is not None
-    assert metrics["joint_snv_sv_bayesr"].log_loss is not None
+    assert set(benchmark_metrics) == {"current_snv_score", "snv_only_bayesr", "joint_snv_sv_bayesr"}
+    assert benchmark_metrics["joint_snv_sv_bayesr"].auc is not None
+    assert benchmark_metrics["joint_snv_sv_bayesr"].log_loss is not None

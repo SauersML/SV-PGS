@@ -1,116 +1,97 @@
-"""Tests for variational EM inference."""
-
 from __future__ import annotations
 
 import numpy as np
 
-from sv_pgs.config import ModelConfig, TraitType, VariantClass
-from sv_pgs.data import GraphEdges, TieMap, TieGroup, VariantRecord
+from sv_pgs.config import ModelConfig, TraitType
+from sv_pgs.data import TieGroup, TieMap
 from sv_pgs.inference import fit_variational_em
 
+from tests.conftest import empty_graph, make_variant_records
 
-def _identity_tie_map(p: int) -> TieMap:
-    """No ties: every variant maps to itself."""
-    groups = [
+
+def _identity_tie_map(variant_count: int) -> TieMap:
+    tie_groups = [
         TieGroup(
-            representative_index=i,
-            member_indices=np.array([i], dtype=np.int32),
+            representative_index=variant_index,
+            member_indices=np.array([variant_index], dtype=np.int32),
             signs=np.array([1.0], dtype=np.float32),
         )
-        for i in range(p)
+        for variant_index in range(variant_count)
     ]
     return TieMap(
-        kept_indices=np.arange(p, dtype=np.int32),
-        original_to_reduced=np.arange(p, dtype=np.int32),
-        reduced_to_group=groups,
+        kept_indices=np.arange(variant_count, dtype=np.int32),
+        original_to_reduced=np.arange(variant_count, dtype=np.int32),
+        reduced_to_group=tie_groups,
     )
 
 
-def _empty_graph(p: int) -> GraphEdges:
-    return GraphEdges(
-        src=np.array([], dtype=np.int32),
-        dst=np.array([], dtype=np.int32),
-        sign=np.array([], dtype=np.float32),
-        weight=np.array([], dtype=np.float32),
-        block_ids=np.arange(p, dtype=np.int32),
+def test_quantitative_inference_runs(random_generator):
+    sample_count, variant_count, covariate_count = 80, 10, 2
+    genotype_matrix = random_generator.standard_normal((sample_count, variant_count)).astype(np.float32)
+    covariate_matrix = np.column_stack(
+        [np.ones(sample_count), random_generator.standard_normal((sample_count, covariate_count))]
+    ).astype(np.float32)
+    true_coefficients = np.zeros(variant_count, dtype=np.float32)
+    true_coefficients[0] = 1.0
+    target_vector = genotype_matrix @ true_coefficients + random_generator.standard_normal(sample_count).astype(np.float32) * 0.3
+
+    fit_result = fit_variational_em(
+        genotypes=genotype_matrix,
+        covariates=covariate_matrix,
+        targets=target_vector,
+        records=make_variant_records(variant_count),
+        tie_map=_identity_tie_map(variant_count),
+        graph=empty_graph(variant_count),
+        config=ModelConfig(trait_type=TraitType.QUANTITATIVE, max_outer_iters=5, tile_size=16),
     )
 
-
-def _make_records(p: int) -> list[VariantRecord]:
-    return [
-        VariantRecord(f"v{i}", VariantClass.SNV, "short", "chr1", i * 1000)
-        for i in range(p)
-    ]
+    assert fit_result.beta_reduced.shape == (variant_count,)
+    assert fit_result.alpha.shape == (covariate_matrix.shape[1],)
+    assert fit_result.objective_history
 
 
-class TestFitVariationalEM:
-    def test_quantitative_runs(self):
-        rng = np.random.default_rng(200)
-        n, p, d = 80, 10, 2
-        X = rng.standard_normal((n, p)).astype(np.float32)
-        C = np.column_stack([np.ones(n), rng.standard_normal((n, d))]).astype(np.float32)
-        beta_true = np.zeros(p, dtype=np.float32)
-        beta_true[0] = 1.0
-        y = X @ beta_true + rng.standard_normal(n).astype(np.float32) * 0.3
+def test_binary_inference_runs(random_generator):
+    sample_count, variant_count = 100, 8
+    genotype_matrix = random_generator.standard_normal((sample_count, variant_count)).astype(np.float32)
+    covariate_matrix = np.ones((sample_count, 1), dtype=np.float32)
+    true_coefficients = np.zeros(variant_count, dtype=np.float32)
+    true_coefficients[0] = 1.5
+    linear_predictor = genotype_matrix @ true_coefficients
+    target_vector = (
+        random_generator.random(sample_count) < 1.0 / (1.0 + np.exp(-linear_predictor))
+    ).astype(np.float32)
 
-        config = ModelConfig(trait_type=TraitType.QUANTITATIVE, max_outer_iters=5, tile_size=16)
-        records = _make_records(p)
-        tie_map = _identity_tie_map(p)
-        graph = _empty_graph(p)
+    fit_result = fit_variational_em(
+        genotypes=genotype_matrix,
+        covariates=covariate_matrix,
+        targets=target_vector,
+        records=make_variant_records(variant_count),
+        tie_map=_identity_tie_map(variant_count),
+        graph=empty_graph(variant_count),
+        config=ModelConfig(trait_type=TraitType.BINARY, max_outer_iters=5, tile_size=16),
+    )
 
-        result = fit_variational_em(
-            genotypes=X, covariates=C, targets=y,
-            records=records, tie_map=tie_map, graph=graph, config=config,
-        )
+    assert fit_result.beta_reduced.shape == (variant_count,)
+    assert fit_result.sigma_e2 == 1.0
 
-        assert result.beta_reduced.shape == (p,)
-        assert result.alpha.shape == (C.shape[1],)
-        assert len(result.objective_history) > 0
 
-    def test_binary_runs(self):
-        rng = np.random.default_rng(201)
-        n, p = 100, 8
-        X = rng.standard_normal((n, p)).astype(np.float32)
-        C = np.ones((n, 1), dtype=np.float32)
-        beta_true = np.zeros(p, dtype=np.float32)
-        beta_true[0] = 1.5
-        eta = X @ beta_true
-        y = (rng.random(n) < 1.0 / (1.0 + np.exp(-eta))).astype(np.float32)
+def test_signal_variant_receives_largest_effect(random_generator):
+    sample_count, variant_count = 200, 10
+    genotype_matrix = random_generator.standard_normal((sample_count, variant_count)).astype(np.float32)
+    genotype_matrix = (genotype_matrix - genotype_matrix.mean(axis=0)) / (genotype_matrix.std(axis=0) + 1e-6)
+    covariate_matrix = np.ones((sample_count, 1), dtype=np.float32)
+    true_coefficients = np.zeros(variant_count, dtype=np.float32)
+    true_coefficients[3] = 2.0
+    target_vector = genotype_matrix @ true_coefficients + random_generator.standard_normal(sample_count).astype(np.float32) * 0.5
 
-        config = ModelConfig(trait_type=TraitType.BINARY, max_outer_iters=5, tile_size=16)
-        records = _make_records(p)
-        tie_map = _identity_tie_map(p)
-        graph = _empty_graph(p)
+    fit_result = fit_variational_em(
+        genotypes=genotype_matrix,
+        covariates=covariate_matrix,
+        targets=target_vector,
+        records=make_variant_records(variant_count),
+        tie_map=_identity_tie_map(variant_count),
+        graph=empty_graph(variant_count),
+        config=ModelConfig(trait_type=TraitType.QUANTITATIVE, max_outer_iters=15, tile_size=16),
+    )
 
-        result = fit_variational_em(
-            genotypes=X, covariates=C, targets=y,
-            records=records, tie_map=tie_map, graph=graph, config=config,
-        )
-
-        assert result.beta_reduced.shape == (p,)
-        assert result.sigma_e2 == 1.0  # Binary trait always 1.0
-
-    def test_signal_recovery(self):
-        """The largest coefficient should correspond to the true signal variant."""
-        rng = np.random.default_rng(202)
-        n, p = 200, 10
-        X = rng.standard_normal((n, p)).astype(np.float32)
-        # Standardize.
-        X = (X - X.mean(0)) / (X.std(0) + 1e-6)
-        C = np.ones((n, 1), dtype=np.float32)
-        beta_true = np.zeros(p, dtype=np.float32)
-        beta_true[3] = 2.0
-        y = X @ beta_true + rng.standard_normal(n).astype(np.float32) * 0.5
-
-        config = ModelConfig(trait_type=TraitType.QUANTITATIVE, max_outer_iters=15, tile_size=16)
-        records = _make_records(p)
-        tie_map = _identity_tie_map(p)
-        graph = _empty_graph(p)
-
-        result = fit_variational_em(
-            genotypes=X, covariates=C, targets=y,
-            records=records, tie_map=tie_map, graph=graph, config=config,
-        )
-
-        # Variant 3 should have the largest absolute coefficient.
-        assert np.argmax(np.abs(result.beta_reduced)) == 3
+    assert np.argmax(np.abs(fit_result.beta_reduced)) == 3

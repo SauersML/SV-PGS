@@ -60,10 +60,10 @@ class ModelConfig:
     cross_class_edge_strength: float = 0.25
     correlation_threshold: float = 0.98
     graph_window_bp: int = 2_000_000
-    max_cluster_span: int = 512
     min_scale: float = 1e-6
     pg_min_weight: float = 1e-4
     sigma_e_prior: float = 1e-3
+    minimum_structural_variant_carriers: int = 2
     graph_metadata_version: str = "v1"
     transform_version: str = "numeric-impute-standardize-v1"
     random_seed: int = 0
@@ -91,11 +91,23 @@ class ModelConfig:
             priors[variant_class] = weights / weights.sum()
         return priors
 
+    @staticmethod
+    def structural_variant_classes() -> tuple[VariantClass, ...]:
+        return (
+            VariantClass.DELETION_SHORT,
+            VariantClass.DELETION_LONG,
+            VariantClass.DUPLICATION_SHORT,
+            VariantClass.DUPLICATION_LONG,
+            VariantClass.INSERTION_MEI,
+            VariantClass.INVERSION_BND_COMPLEX,
+            VariantClass.STR_VNTR_REPEAT,
+            VariantClass.OTHER_COMPLEX_SV,
+        )
+
 
 @dataclass(slots=True)
 class BenchmarkConfig:
     snv_classes: tuple[VariantClass, ...] = (VariantClass.SNV,)
     top_tail_fraction: float = 0.05
     prevalence: float | None = None
-    metric_eps: float = 1e-8
     shared_config: ModelConfig = field(default_factory=ModelConfig)
