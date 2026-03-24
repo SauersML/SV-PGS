@@ -11,6 +11,7 @@ from sklearn.metrics import average_precision_score, log_loss, r2_score, roc_auc
 from sv_pgs.config import BenchmarkConfig, ModelConfig, TraitType
 from sv_pgs.data import VariantRecord, normalize_variant_records
 from sv_pgs.model import BayesianPGS
+from sv_pgs.numeric import stable_sigmoid
 
 
 @dataclass(slots=True)
@@ -53,7 +54,7 @@ def run_benchmark_suite(
 
     model_specs: list[tuple[str, BayesianPGS, np.ndarray]] = [
         (
-            "snv_baseline_no_hyperlearning",
+            "snv_only_frozen_hyperparameters",
             _fit_model(current_snv_config, train_genotypes[:, snv_mask], train_covariates, train_targets, snv_records),
             test_genotypes[:, snv_mask],
         ),
@@ -109,7 +110,7 @@ def _compute_metrics(
     scores = model.decision_function(genotypes, covariates)
     trait_type = model.config.trait_type
     if trait_type == TraitType.BINARY:
-        probabilities = _sigmoid(scores)
+        probabilities = stable_sigmoid(scores)
         auc = float(roc_auc_score(targets, probabilities))
         pr_auc = float(average_precision_score(targets, probabilities))
         loss = float(log_loss(targets, probabilities))
@@ -176,14 +177,3 @@ def _top_tail_enrichment(scores: np.ndarray, targets: np.ndarray, fraction: floa
     if abs(baseline) < 1e-8:
         return 0.0
     return float(np.mean(targets[top_indices]) / baseline)
-
-
-def _sigmoid(values: np.ndarray) -> np.ndarray:
-    clipped_values = np.asarray(np.clip(values, -80.0, 80.0), dtype=np.float64)
-    positive_mask = clipped_values >= 0.0
-    negative_mask = ~positive_mask
-    output = np.empty_like(clipped_values, dtype=np.float64)
-    output[positive_mask] = 1.0 / (1.0 + np.exp(-clipped_values[positive_mask]))
-    exp_values = np.exp(clipped_values[negative_mask])
-    output[negative_mask] = exp_values / (1.0 + exp_values)
-    return output.astype(np.float64)

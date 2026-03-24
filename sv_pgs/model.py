@@ -10,7 +10,8 @@ from sv_pgs.artifact import ModelArtifact, load_artifact, save_artifact
 from sv_pgs.config import ModelConfig, TraitType
 from sv_pgs.data import TieGroup, TieMap, VariantRecord, normalize_variant_records
 from sv_pgs.inference import VariationalFitResult, compute_export_baseline_variances, fit_variational_em
-from sv_pgs.preprocessing import Preprocessor, build_tie_map, collapse_tie_groups, fit_preprocessor, select_active_variant_indices
+from sv_pgs.numeric import stable_sigmoid
+from sv_pgs.preprocessing import Preprocessor, build_tie_map, fit_preprocessor, select_active_variant_indices
 
 
 @dataclass(slots=True)
@@ -50,7 +51,6 @@ class BayesianPGS:
         active_records = [normalized_records[int(variant_index)] for variant_index in active_variant_indices]
 
         reduced_tie_map = build_tie_map(active_genotypes, active_records, self.config)
-        latent_records = collapse_tie_groups(active_records, reduced_tie_map)
         original_space_tie_map = _project_tie_map_to_original_space(
             reduced_tie_map=reduced_tie_map,
             active_variant_indices=active_variant_indices,
@@ -72,7 +72,8 @@ class BayesianPGS:
             genotypes=reduced_genotypes,
             covariates=prepared_arrays.covariates,
             targets=prepared_arrays.targets,
-            records=latent_records,
+            records=active_records,
+            tie_map=reduced_tie_map,
             config=self.config,
             validation_data=reduced_validation,
         )
@@ -109,13 +110,13 @@ class BayesianPGS:
         if self.config.trait_type != TraitType.BINARY:
             raise ValueError("predict_proba is only available for binary traits.")
         linear_predictor = self.decision_function(genotypes, covariates)
-        positive_probability = _sigmoid(linear_predictor)
+        positive_probability = stable_sigmoid(linear_predictor)
         return np.column_stack([1.0 - positive_probability, positive_probability])
 
     def predict(self, genotypes: np.ndarray, covariates: np.ndarray) -> np.ndarray:
         linear_predictor = self.decision_function(genotypes, covariates)
         if self.config.trait_type == TraitType.BINARY:
-            return (_sigmoid(linear_predictor) >= 0.5).astype(np.int32)
+            return (stable_sigmoid(linear_predictor) >= 0.5).astype(np.int32)
         return linear_predictor
 
     def export(self, path: str | Path) -> None:
@@ -238,26 +239,18 @@ def _tie_group_export_weights(
     fit_result: VariationalFitResult,
     config: ModelConfig,
 ) -> list[np.ndarray]:
-    baseline_prior_variances = compute_export_baseline_variances(
-        records=records,
-        scale_model_coefficients=fit_result.scale_model_coefficients,
-        global_scale=fit_result.global_scale,
-        config=config,
-    )
+    if fit_result.member_prior_variances is None:
+        baseline_prior_variances = compute_export_baseline_variances(
+            records=records,
+            scale_model_coefficients=fit_result.scale_model_coefficients,
+            global_scale=fit_result.global_scale,
+            config=config,
+        )
+    else:
+        baseline_prior_variances = np.asarray(fit_result.member_prior_variances, dtype=np.float32)
     group_weights: list[np.ndarray] = []
     for tie_group in tie_map.reduced_to_group:
         member_variances = baseline_prior_variances[tie_group.member_indices]
         normalized_weights = member_variances / np.maximum(np.sum(member_variances), 1e-12)
         group_weights.append(normalized_weights.astype(np.float32))
     return group_weights
-
-
-def _sigmoid(linear_predictor: np.ndarray) -> np.ndarray:
-    clipped_predictor = np.asarray(np.clip(linear_predictor, -80.0, 80.0), dtype=np.float64)
-    positive_mask = clipped_predictor >= 0.0
-    negative_mask = ~positive_mask
-    output = np.empty_like(clipped_predictor, dtype=np.float64)
-    output[positive_mask] = 1.0 / (1.0 + np.exp(-clipped_predictor[positive_mask]))
-    exp_values = np.exp(clipped_predictor[negative_mask])
-    output[negative_mask] = exp_values / (1.0 + exp_values)
-    return output.astype(np.float64)
