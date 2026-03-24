@@ -62,6 +62,8 @@ def build_block_decomposition(
     genotypes: np.ndarray,
     records: Sequence[VariantRecord],
     config: ModelConfig,
+    sample_weights: np.ndarray | None = None,
+    device: jax.Device | None = None,
 ) -> BlockDecomposition:
     variant_count = genotypes.shape[1]
     sample_count = genotypes.shape[0]
@@ -83,6 +85,7 @@ def build_block_decomposition(
                 partition_indices,
                 sample_count,
                 config,
+                sample_weights=sample_weights,
             )
             variant_to_block[partition_indices] = len(all_blocks)
             all_blocks.append(ld_block)
@@ -94,10 +97,65 @@ def build_block_decomposition(
         block_eigenvectors,
         block_jitter,
     ) = _pack_block_arrays(tuple(all_blocks))
+    if device is not None:
+        block_variant_indices = jax.device_put(block_variant_indices, device=device)
+        block_variant_mask = jax.device_put(block_variant_mask, device=device)
+        block_eigenvalues = jax.device_put(block_eigenvalues, device=device)
+        block_eigenvectors = jax.device_put(block_eigenvectors, device=device)
+        block_jitter = jax.device_put(block_jitter, device=device)
 
     return BlockDecomposition(
         blocks=tuple(all_blocks),
-        variant_to_block=jnp.asarray(variant_to_block, dtype=jnp.int32),
+        variant_to_block=jax.device_put(jnp.asarray(variant_to_block, dtype=jnp.int32), device=device),
+        block_variant_indices=block_variant_indices,
+        block_variant_mask=block_variant_mask,
+        block_eigenvalues=block_eigenvalues,
+        block_eigenvectors=block_eigenvectors,
+        block_jitter=block_jitter,
+    )
+
+
+def refresh_block_decomposition(
+    block_decomposition: BlockDecomposition,
+    genotypes: np.ndarray,
+    sample_weights: np.ndarray,
+    config: ModelConfig,
+    device: jax.Device | None = None,
+) -> BlockDecomposition:
+    if not block_decomposition.blocks:
+        return block_decomposition
+
+    sample_count = genotypes.shape[0]
+    refreshed_blocks: list[LDBlock] = []
+    for block in block_decomposition.blocks:
+        block_indices = np.asarray(block.variant_indices, dtype=np.int32)
+        refreshed_blocks.append(
+            _eigendecompose_block(
+                genotypes[:, block_indices],
+                block_indices,
+                sample_count,
+                config,
+                sample_weights=sample_weights,
+            )
+        )
+
+    (
+        block_variant_indices,
+        block_variant_mask,
+        block_eigenvalues,
+        block_eigenvectors,
+        block_jitter,
+    ) = _pack_block_arrays(tuple(refreshed_blocks))
+    if device is not None:
+        block_variant_indices = jax.device_put(block_variant_indices, device=device)
+        block_variant_mask = jax.device_put(block_variant_mask, device=device)
+        block_eigenvalues = jax.device_put(block_eigenvalues, device=device)
+        block_eigenvectors = jax.device_put(block_eigenvectors, device=device)
+        block_jitter = jax.device_put(block_jitter, device=device)
+
+    return BlockDecomposition(
+        blocks=tuple(refreshed_blocks),
+        variant_to_block=jax.device_put(block_decomposition.variant_to_block, device=device),
         block_variant_indices=block_variant_indices,
         block_variant_mask=block_variant_mask,
         block_eigenvalues=block_eigenvalues,
@@ -300,6 +358,7 @@ def _eigendecompose_block(
     block_indices: np.ndarray,
     sample_count: int,
     config: ModelConfig,
+    sample_weights: np.ndarray | None = None,
 ) -> LDBlock:
     block_size = block_genotypes.shape[1]
     if block_size == 1:
@@ -312,7 +371,16 @@ def _eigendecompose_block(
         )
 
     block_matrix = jnp.asarray(block_genotypes, dtype=jnp.float32)
-    correlation_matrix = (block_matrix.T @ block_matrix) / float(sample_count)
+    if sample_weights is None:
+        weighted_block_matrix = block_matrix
+        normalization = float(sample_count)
+    else:
+        sample_weight_array = jnp.asarray(sample_weights, dtype=jnp.float32)
+        sqrt_sample_weights = jnp.sqrt(jnp.maximum(sample_weight_array, 0.0))
+        weighted_block_matrix = block_matrix * sqrt_sample_weights[:, None]
+        normalization = max(float(np.sum(sample_weights)), 1e-12)
+
+    correlation_matrix = (weighted_block_matrix.T @ weighted_block_matrix) / normalization
     correlation_matrix = correlation_matrix + (
         jnp.eye(block_size, dtype=jnp.float32) * jnp.float32(config.block_jitter_floor)
     )

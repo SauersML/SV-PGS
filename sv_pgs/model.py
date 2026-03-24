@@ -250,7 +250,17 @@ def _tie_group_export_weights(
         baseline_prior_variances = np.asarray(fit_result.member_prior_variances, dtype=np.float32)
     group_weights: list[np.ndarray] = []
     for tie_group in tie_map.reduced_to_group:
-        member_variances = baseline_prior_variances[tie_group.member_indices]
+        member_variances = _regularize_tie_group_member_variances(
+            baseline_prior_variances[tie_group.member_indices]
+        )
         normalized_weights = member_variances / np.maximum(np.sum(member_variances), 1e-12)
         group_weights.append(normalized_weights.astype(np.float32))
     return group_weights
+
+
+def _regularize_tie_group_member_variances(member_variances: np.ndarray) -> np.ndarray:
+    member_variance_array = np.asarray(member_variances, dtype=np.float64)
+    if member_variance_array.shape[0] <= 1:
+        return member_variance_array.astype(np.float32)
+    group_mean_variance = float(np.mean(member_variance_array))
+    return np.sqrt(member_variance_array * max(group_mean_variance, 1e-12)).astype(np.float32)

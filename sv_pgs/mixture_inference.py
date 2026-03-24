@@ -18,9 +18,11 @@ from sv_pgs.blocks import (
     apply_block_preconditioner,
     build_block_decomposition,
     estimate_variance_from_blocks,
+    refresh_block_decomposition,
 )
 from sv_pgs.config import ModelConfig, TraitType, VariantClass
 from sv_pgs.data import TieGroup, TieMap, VariantRecord
+from sv_pgs.jax_backend import resolve_single_device
 from sv_pgs.numeric import stable_sigmoid
 from sv_pgs.operator import (
     GenotypeOperator,
@@ -83,290 +85,350 @@ def fit_variational_em(
     if len(member_records) != tie_map.original_to_reduced.shape[0]:
         raise ValueError("records must align with tie_map member space.")
 
-    genotype_operator = GenotypeOperator.from_numpy(
-        genotype_matrix,
-        tile_size=config.operator_tile_size,
-    )
-    covariate_matrix_device = jnp.asarray(covariate_matrix, dtype=jnp.float32)
-    target_vector_device = jnp.asarray(target_vector, dtype=jnp.float32)
-    reduced_records = collapse_tie_groups(member_records, tie_map)
-    block_decomposition = build_block_decomposition(genotype_matrix, reduced_records, config)
-    prior_design = _build_prior_design(member_records)
-    tie_layout = _build_tie_layout(tie_map)
-    validation_payload = _prepare_validation(validation_data)
-
-    global_scale, scale_model_coefficients = _initialize_scale_model(prior_design, config)
-    metadata_baseline_scales = _metadata_baseline_scales_from_coefficients(
-        scale_model_coefficients,
-        prior_design.design_matrix,
-        config,
-    )
-    baseline_member_prior_variances = (global_scale * metadata_baseline_scales) ** 2
-
-    tpb_shape_a_vector = _initialize_tpb_shape_a_vector(prior_design, config)
-    tpb_shape_b_vector = _initialize_tpb_shape_b_vector(prior_design, config)
-    local_shape_a = prior_design.class_membership_matrix @ tpb_shape_a_vector
-    local_shape_b = prior_design.class_membership_matrix @ tpb_shape_b_vector
-
-    reduced_variant_count = genotype_matrix.shape[1]
-    coefficient_mean = jnp.zeros(reduced_variant_count, dtype=jnp.float32)
-    covariate_coefficients = jnp.zeros(covariate_matrix.shape[1], dtype=jnp.float32)
-    local_scale = np.ones(len(member_records), dtype=np.float64)
-    auxiliary_delta = local_shape_b.copy()
-    current_member_prior_variances = _effective_prior_variances(
-        baseline_prior_variances=baseline_member_prior_variances,
-        local_scale=local_scale,
-        trait_type=config.trait_type,
-        config=config,
-    )
-    coefficient_variance = _reduce_member_values(current_member_prior_variances, tie_layout).astype(np.float32)
-    residual_variance = 1.0
-
-    objective_history: list[float] = []
-    validation_history: list[float] = []
-
-    previous_beta_reduced: np.ndarray | None = None
-    previous_alpha: np.ndarray | None = None
-    previous_local_scale: np.ndarray | None = None
-    previous_scale_model_coefficients: np.ndarray | None = None
-    previous_global_scale: float | None = None
-
-    outer_iteration = 0
-    while outer_iteration < config.max_outer_iterations:
-        current_genetic_prediction = matvec(genotype_operator, coefficient_mean)
-        linear_predictor = current_genetic_prediction + covariate_matrix_device @ covariate_coefficients
-
-        sample_weights, pseudo_response, residual_variance = _likelihood_update(
-            trait_type=config.trait_type,
-            targets=target_vector_device,
-            linear_predictor=linear_predictor,
-            sigma_error_floor=config.sigma_error_floor,
-            minimum_polya_gamma_weight=config.polya_gamma_minimum_weight,
+    device = resolve_single_device(config)
+    with jax.default_device(device):
+        genotype_operator = GenotypeOperator.from_numpy(
+            genotype_matrix,
+            tile_size=config.operator_tile_size,
+            device=device,
         )
-
-        covariate_coefficients = _solve_covariates(
-            covariate_matrix=covariate_matrix_device,
-            pseudo_response=pseudo_response,
-            current_genetic_prediction=current_genetic_prediction,
-            sample_weights=sample_weights,
+        covariate_matrix_device = jax.device_put(
+            jnp.asarray(covariate_matrix, dtype=jnp.float32),
+            device=device,
         )
+        target_vector_device = jax.device_put(
+            jnp.asarray(target_vector, dtype=jnp.float32),
+            device=device,
+        )
+        reduced_records = collapse_tie_groups(member_records, tie_map)
+        block_decomposition = build_block_decomposition(
+            genotype_matrix,
+            reduced_records,
+            config,
+            device=device,
+        )
+        prior_design = _build_prior_design(member_records)
+        tie_layout = _build_tie_layout(tie_map)
+        validation_payload = _prepare_validation(validation_data)
 
+        global_scale, scale_model_coefficients = _initialize_scale_model(prior_design, config)
+        metadata_baseline_scales = _metadata_baseline_scales_from_coefficients(
+            scale_model_coefficients,
+            prior_design.design_matrix,
+            config,
+        )
+        baseline_member_prior_variances = (global_scale * metadata_baseline_scales) ** 2
+
+        tpb_shape_a_vector = _initialize_tpb_shape_a_vector(prior_design, config)
+        tpb_shape_b_vector = _initialize_tpb_shape_b_vector(prior_design, config)
+        local_shape_a = prior_design.class_membership_matrix @ tpb_shape_a_vector
+        local_shape_b = prior_design.class_membership_matrix @ tpb_shape_b_vector
+
+        reduced_variant_count = genotype_matrix.shape[1]
+        coefficient_mean = jax.device_put(
+            jnp.zeros(reduced_variant_count, dtype=jnp.float32),
+            device=device,
+        )
+        covariate_coefficients = jax.device_put(
+            jnp.zeros(covariate_matrix.shape[1], dtype=jnp.float32),
+            device=device,
+        )
+        local_scale = np.ones(len(member_records), dtype=np.float64)
+        auxiliary_delta = local_shape_b.copy()
         current_member_prior_variances = _effective_prior_variances(
             baseline_prior_variances=baseline_member_prior_variances,
             local_scale=local_scale,
             trait_type=config.trait_type,
             config=config,
         )
-        reduced_prior_variances = _reduce_member_values(current_member_prior_variances, tie_layout)
-        prior_precision_device = jnp.asarray(
-            1.0 / np.maximum(reduced_prior_variances, 1e-12),
-            dtype=jnp.float32,
+        coefficient_variance = jax.device_put(
+            jnp.asarray(
+                _reduce_member_values(current_member_prior_variances, tie_layout).astype(np.float32),
+                dtype=jnp.float32,
+            ),
+            device=device,
         )
-        right_hand_side = _compute_right_hand_side(
-            genotype_operator=genotype_operator,
-            sample_weights=sample_weights,
-            pseudo_response=pseudo_response,
-            covariate_matrix=covariate_matrix_device,
-            covariate_coefficients=covariate_coefficients,
-        )
+        residual_variance = 1.0
 
-        coefficient_mean = _solve_global_posterior_mean(
-            genotype_operator=genotype_operator,
-            block_decomposition=block_decomposition,
-            sample_weights=sample_weights,
-            prior_precision=prior_precision_device,
-            right_hand_side=right_hand_side,
-            initial_mean=coefficient_mean,
-            config=config,
-        )
+        objective_history: list[float] = []
+        validation_history: list[float] = []
 
-        updated_genetic_prediction = matvec(genotype_operator, coefficient_mean)
-        covariate_coefficients = _solve_covariates(
-            covariate_matrix=covariate_matrix_device,
-            pseudo_response=pseudo_response,
-            current_genetic_prediction=updated_genetic_prediction,
-            sample_weights=sample_weights,
-        )
+        previous_beta_reduced: np.ndarray | None = None
+        previous_alpha: np.ndarray | None = None
+        previous_local_scale: np.ndarray | None = None
+        previous_scale_model_coefficients: np.ndarray | None = None
+        previous_global_scale: float | None = None
 
-        coefficient_variance = _estimate_block_variance(
-            block_decomposition=block_decomposition,
-            prior_precision=prior_precision_device,
-            sample_weights=sample_weights,
-        )
-        if outer_iteration % config.variance_probe_interval == 0:
-            coefficient_variance = _refine_variance_with_probes(
+        outer_iteration = 0
+        while outer_iteration < config.max_outer_iterations:
+            current_genetic_prediction = matvec(genotype_operator, coefficient_mean)
+            linear_predictor = current_genetic_prediction + covariate_matrix_device @ covariate_coefficients
+
+            sample_weights, pseudo_response, residual_variance = _likelihood_update(
+                trait_type=config.trait_type,
+                targets=target_vector_device,
+                linear_predictor=linear_predictor,
+                sigma_error_floor=config.sigma_error_floor,
+                minimum_polya_gamma_weight=config.polya_gamma_minimum_weight,
+            )
+
+            if _should_refresh_block_decomposition(
+                trait_type=config.trait_type,
+                outer_iteration=outer_iteration,
+                refresh_interval=config.block_weight_refresh_interval,
+            ):
+                sample_weights_host = np.asarray(jax.device_get(sample_weights), dtype=np.float32)
+                block_decomposition = refresh_block_decomposition(
+                    block_decomposition=block_decomposition,
+                    genotypes=genotype_matrix,
+                    sample_weights=sample_weights_host,
+                    config=config,
+                    device=device,
+                )
+
+            covariate_coefficients = _solve_covariates(
+                covariate_matrix=covariate_matrix_device,
+                pseudo_response=pseudo_response,
+                current_genetic_prediction=current_genetic_prediction,
+                sample_weights=sample_weights,
+            )
+
+            current_member_prior_variances = _effective_prior_variances(
+                baseline_prior_variances=baseline_member_prior_variances,
+                local_scale=local_scale,
+                trait_type=config.trait_type,
+                config=config,
+            )
+            reduced_prior_variances = _reduce_member_values(current_member_prior_variances, tie_layout)
+            prior_precision_device = jnp.asarray(
+                1.0 / np.maximum(reduced_prior_variances, 1e-12),
+                dtype=jnp.float32,
+            )
+            right_hand_side = _compute_right_hand_side(
+                genotype_operator=genotype_operator,
+                sample_weights=sample_weights,
+                pseudo_response=pseudo_response,
+                covariate_matrix=covariate_matrix_device,
+                covariate_coefficients=covariate_coefficients,
+            )
+
+            coefficient_mean = _solve_global_posterior_mean(
                 genotype_operator=genotype_operator,
                 block_decomposition=block_decomposition,
                 sample_weights=sample_weights,
                 prior_precision=prior_precision_device,
-                baseline_variance=coefficient_variance,
-                outer_iteration=outer_iteration,
+                right_hand_side=right_hand_side,
+                initial_mean=coefficient_mean,
                 config=config,
             )
 
-        (
-            coefficient_mean_host,
-            covariate_coefficients_host,
-            updated_linear_predictor_host,
-        ) = jax.device_get(
+            updated_genetic_prediction = matvec(genotype_operator, coefficient_mean)
+            covariate_coefficients = _solve_covariates(
+                covariate_matrix=covariate_matrix_device,
+                pseudo_response=pseudo_response,
+                current_genetic_prediction=updated_genetic_prediction,
+                sample_weights=sample_weights,
+            )
+
+            coefficient_variance = _estimate_block_variance(
+                block_decomposition=block_decomposition,
+                prior_precision=prior_precision_device,
+                sample_weights=sample_weights,
+            )
+            if outer_iteration % config.variance_probe_interval == 0:
+                coefficient_variance = _refine_variance_with_probes(
+                    genotype_operator=genotype_operator,
+                    block_decomposition=block_decomposition,
+                    sample_weights=sample_weights,
+                    prior_precision=prior_precision_device,
+                    baseline_variance=coefficient_variance,
+                    outer_iteration=outer_iteration,
+                    config=config,
+                )
+
+            reduced_second_moment = coefficient_mean * coefficient_mean + coefficient_variance
             (
-                coefficient_mean,
-                covariate_coefficients,
-                updated_genetic_prediction + covariate_matrix_device @ covariate_coefficients,
+                coefficient_mean_host,
+                covariate_coefficients_host,
+                updated_linear_predictor_host,
+                coefficient_variance_host,
+                reduced_second_moment_host,
+            ) = jax.device_get(
+                (
+                    coefficient_mean,
+                    covariate_coefficients,
+                    updated_genetic_prediction + covariate_matrix_device @ covariate_coefficients,
+                    coefficient_variance,
+                    reduced_second_moment,
+                )
             )
-        )
-        coefficient_mean_host = np.asarray(coefficient_mean_host, dtype=np.float32)
-        covariate_coefficients_host = np.asarray(covariate_coefficients_host, dtype=np.float32)
-        updated_linear_predictor_host = np.asarray(updated_linear_predictor_host, dtype=np.float32)
-        reduced_second_moment = (
-            coefficient_mean_host.astype(np.float64) ** 2
-            + coefficient_variance.astype(np.float64)
-        )
+            coefficient_mean_host = np.asarray(coefficient_mean_host, dtype=np.float32)
+            covariate_coefficients_host = np.asarray(covariate_coefficients_host, dtype=np.float32)
+            updated_linear_predictor_host = np.asarray(updated_linear_predictor_host, dtype=np.float32)
+            coefficient_variance_host = np.asarray(coefficient_variance_host, dtype=np.float32)
+            reduced_second_moment_host = np.asarray(reduced_second_moment_host, dtype=np.float64)
 
-        member_second_moment = _project_reduced_second_moment_to_members(
-            reduced_second_moment=reduced_second_moment,
-            member_prior_variances=current_member_prior_variances,
-            tie_layout=tie_layout,
-        )
-        local_scale, auxiliary_delta = _update_local_scales(
-            coefficient_second_moment=member_second_moment,
-            baseline_prior_variances=baseline_member_prior_variances,
-            local_shape_a=local_shape_a,
-            local_shape_b=local_shape_b,
-            auxiliary_delta=auxiliary_delta,
-            config=config,
-        )
-
-        if config.update_hyperparameters:
-            tpb_shape_a_vector, tpb_shape_b_vector = _update_tpb_shape_vectors(
-                prior_design=prior_design,
-                local_scale=local_scale,
+            member_second_moment = _project_reduced_second_moment_to_members(
+                reduced_second_moment=reduced_second_moment_host,
+                member_prior_variances=current_member_prior_variances,
+                tie_layout=tie_layout,
+            )
+            local_scale, auxiliary_delta = _update_local_scales(
+                coefficient_second_moment=member_second_moment,
+                baseline_prior_variances=baseline_member_prior_variances,
+                local_shape_a=local_shape_a,
+                local_shape_b=local_shape_b,
                 auxiliary_delta=auxiliary_delta,
-                current_tpb_shape_a_vector=tpb_shape_a_vector,
-                current_tpb_shape_b_vector=tpb_shape_b_vector,
                 config=config,
             )
-            local_shape_a = prior_design.class_membership_matrix @ tpb_shape_a_vector
-            local_shape_b = prior_design.class_membership_matrix @ tpb_shape_b_vector
+            local_scale = _share_local_scale_within_tie_groups(
+                local_scale=local_scale,
+                baseline_prior_variances=baseline_member_prior_variances,
+                tie_layout=tie_layout,
+            )
             auxiliary_delta = (local_shape_a + local_shape_b) / np.maximum(
                 1.0 + local_scale,
                 config.local_scale_floor,
             )
-            global_scale = _update_global_scale(
-                coefficient_second_moment=member_second_moment,
-                metadata_baseline_scales=metadata_baseline_scales,
-                local_scale=local_scale,
-                config=config,
-            )
-            scale_model_coefficients = _update_scale_model(
-                design_matrix=prior_design.design_matrix,
-                feature_names=prior_design.feature_names,
-                coefficient_second_moment=member_second_moment,
-                global_scale=global_scale,
-                local_scale=local_scale,
-                current_coefficients=scale_model_coefficients,
-                config=config,
-            )
-            metadata_baseline_scales = _metadata_baseline_scales_from_coefficients(
-                scale_model_coefficients,
-                prior_design.design_matrix,
-                config,
-            )
-            global_scale = _update_global_scale(
-                coefficient_second_moment=member_second_moment,
-                metadata_baseline_scales=metadata_baseline_scales,
-                local_scale=local_scale,
-                config=config,
-            )
 
-        baseline_member_prior_variances = (global_scale * metadata_baseline_scales) ** 2
-        current_member_prior_variances = _effective_prior_variances(
-            baseline_prior_variances=baseline_member_prior_variances,
-            local_scale=local_scale,
-            trait_type=config.trait_type,
-            config=config,
-        )
-        reduced_prior_variances = _reduce_member_values(current_member_prior_variances, tie_layout)
+            if config.update_hyperparameters:
+                tpb_shape_a_vector, tpb_shape_b_vector = _update_tpb_shape_vectors(
+                    prior_design=prior_design,
+                    local_scale=local_scale,
+                    auxiliary_delta=auxiliary_delta,
+                    current_tpb_shape_a_vector=tpb_shape_a_vector,
+                    current_tpb_shape_b_vector=tpb_shape_b_vector,
+                    config=config,
+                )
+                local_shape_a = prior_design.class_membership_matrix @ tpb_shape_a_vector
+                local_shape_b = prior_design.class_membership_matrix @ tpb_shape_b_vector
+                auxiliary_delta = (local_shape_a + local_shape_b) / np.maximum(
+                    1.0 + local_scale,
+                    config.local_scale_floor,
+                )
+                global_scale = _update_global_scale(
+                    coefficient_second_moment=member_second_moment,
+                    metadata_baseline_scales=metadata_baseline_scales,
+                    local_scale=local_scale,
+                    config=config,
+                )
+                scale_model_coefficients = _update_scale_model(
+                    design_matrix=prior_design.design_matrix,
+                    feature_names=prior_design.feature_names,
+                    coefficient_second_moment=member_second_moment,
+                    global_scale=global_scale,
+                    local_scale=local_scale,
+                    current_coefficients=scale_model_coefficients,
+                    config=config,
+                )
+                metadata_baseline_scales = _metadata_baseline_scales_from_coefficients(
+                    scale_model_coefficients,
+                    prior_design.design_matrix,
+                    config,
+                )
+                global_scale = _update_global_scale(
+                    coefficient_second_moment=member_second_moment,
+                    metadata_baseline_scales=metadata_baseline_scales,
+                    local_scale=local_scale,
+                    config=config,
+                )
 
-        objective_history.append(
-            _surrogate_objective(
+            baseline_member_prior_variances = (global_scale * metadata_baseline_scales) ** 2
+            current_member_prior_variances = _effective_prior_variances(
+                baseline_prior_variances=baseline_member_prior_variances,
+                local_scale=local_scale,
                 trait_type=config.trait_type,
-                targets=target_vector,
-                linear_predictor=updated_linear_predictor_host,
-                coefficient_variance=coefficient_variance.astype(np.float64),
-                coefficient_second_moment=reduced_second_moment,
-                current_prior_variances=reduced_prior_variances,
-                local_scale=local_scale,
-                auxiliary_delta=auxiliary_delta,
-                local_shape_a=local_shape_a,
-                local_shape_b=local_shape_b,
-                residual_variance=residual_variance,
+                config=config,
             )
-        )
+            reduced_prior_variances = _reduce_member_values(current_member_prior_variances, tie_layout)
 
-        if validation_payload is not None:
-            validation_genotypes, validation_covariates, validation_targets = validation_payload
-            validation_linear_predictor = (
-                validation_genotypes @ coefficient_mean_host
-                + validation_covariates @ covariate_coefficients_host
-            )
-            validation_history.append(
-                _validation_metric(
+            objective_history.append(
+                _surrogate_objective(
                     trait_type=config.trait_type,
-                    targets=validation_targets,
-                    linear_predictor=validation_linear_predictor,
+                    targets=target_vector,
+                    linear_predictor=updated_linear_predictor_host,
+                    coefficient_variance=coefficient_variance_host.astype(np.float64),
+                    coefficient_second_moment=reduced_second_moment_host,
+                    current_prior_variances=reduced_prior_variances,
+                    local_scale=local_scale,
+                    auxiliary_delta=auxiliary_delta,
+                    local_shape_a=local_shape_a,
+                    local_shape_b=local_shape_b,
+                    residual_variance=residual_variance,
                 )
             )
 
-        parameter_change = _relative_parameter_change(
-            current_beta=coefficient_mean_host,
-            previous_beta=previous_beta_reduced,
-            current_alpha=covariate_coefficients_host,
-            previous_alpha=previous_alpha,
-            current_local_scale=local_scale,
-            previous_local_scale=previous_local_scale,
-            current_scale_model_coefficients=scale_model_coefficients,
-            previous_scale_model_coefficients=previous_scale_model_coefficients,
-            current_global_scale=global_scale,
-            previous_global_scale=previous_global_scale,
+            if validation_payload is not None:
+                validation_genotypes, validation_covariates, validation_targets = validation_payload
+                validation_linear_predictor = (
+                    validation_genotypes @ coefficient_mean_host
+                    + validation_covariates @ covariate_coefficients_host
+                )
+                validation_history.append(
+                    _validation_metric(
+                        trait_type=config.trait_type,
+                        targets=validation_targets,
+                        linear_predictor=validation_linear_predictor,
+                    )
+                )
+
+            parameter_change = _relative_parameter_change(
+                current_beta=coefficient_mean_host,
+                previous_beta=previous_beta_reduced,
+                current_alpha=covariate_coefficients_host,
+                previous_alpha=previous_alpha,
+                current_local_scale=local_scale,
+                previous_local_scale=previous_local_scale,
+                current_scale_model_coefficients=scale_model_coefficients,
+                previous_scale_model_coefficients=previous_scale_model_coefficients,
+                current_global_scale=global_scale,
+                previous_global_scale=previous_global_scale,
+            )
+
+            previous_beta_reduced = coefficient_mean_host.copy()
+            previous_alpha = covariate_coefficients_host.copy()
+            previous_local_scale = local_scale.copy()
+            previous_scale_model_coefficients = scale_model_coefficients.copy()
+            previous_global_scale = float(global_scale)
+
+            outer_iteration += 1
+            if validation_history:
+                if len(validation_history) >= 2:
+                    validation_delta = abs(validation_history[-1] - validation_history[-2])
+                    if parameter_change < config.convergence_tolerance and validation_delta < config.convergence_tolerance:
+                        break
+            elif parameter_change < config.convergence_tolerance:
+                break
+
+        if config.trait_type == TraitType.BINARY:
+            intercept_shift = _calibrate_binary_intercept(
+                linear_predictor=updated_linear_predictor_host,
+                targets=target_vector,
+            )
+            covariate_coefficients_host = covariate_coefficients_host.copy()
+            covariate_coefficients_host[0] += np.float32(intercept_shift)
+
+        return VariationalFitResult(
+            alpha=np.asarray(covariate_coefficients_host, dtype=np.float32),
+            beta_reduced=np.asarray(coefficient_mean_host, dtype=np.float32),
+            beta_variance=coefficient_variance_host.astype(np.float32),
+            prior_scales=current_member_prior_variances.astype(np.float32),
+            global_scale=float(global_scale),
+            class_tpb_shape_a={
+                prior_design.inverse_class_lookup[class_index]: float(tpb_shape_a_vector[class_index])
+                for class_index in range(tpb_shape_a_vector.shape[0])
+            },
+            class_tpb_shape_b={
+                prior_design.inverse_class_lookup[class_index]: float(tpb_shape_b_vector[class_index])
+                for class_index in range(tpb_shape_b_vector.shape[0])
+            },
+            scale_model_coefficients=scale_model_coefficients.astype(np.float32),
+            scale_model_feature_names=list(prior_design.feature_names),
+            sigma_error2=float(residual_variance),
+            objective_history=objective_history,
+            validation_history=validation_history,
+            member_prior_variances=current_member_prior_variances.astype(np.float32),
         )
-
-        previous_beta_reduced = coefficient_mean_host.copy()
-        previous_alpha = covariate_coefficients_host.copy()
-        previous_local_scale = local_scale.copy()
-        previous_scale_model_coefficients = scale_model_coefficients.copy()
-        previous_global_scale = float(global_scale)
-
-        outer_iteration += 1
-        if validation_history:
-            if len(validation_history) >= 2:
-                validation_delta = abs(validation_history[-1] - validation_history[-2])
-                if parameter_change < config.convergence_tolerance and validation_delta < config.convergence_tolerance:
-                    break
-        elif parameter_change < config.convergence_tolerance:
-            break
-
-    return VariationalFitResult(
-        alpha=np.asarray(covariate_coefficients_host, dtype=np.float32),
-        beta_reduced=np.asarray(coefficient_mean_host, dtype=np.float32),
-        beta_variance=coefficient_variance.astype(np.float32),
-        prior_scales=current_member_prior_variances.astype(np.float32),
-        global_scale=float(global_scale),
-        class_tpb_shape_a={
-            prior_design.inverse_class_lookup[class_index]: float(tpb_shape_a_vector[class_index])
-            for class_index in range(tpb_shape_a_vector.shape[0])
-        },
-        class_tpb_shape_b={
-            prior_design.inverse_class_lookup[class_index]: float(tpb_shape_b_vector[class_index])
-            for class_index in range(tpb_shape_b_vector.shape[0])
-        },
-        scale_model_coefficients=scale_model_coefficients.astype(np.float32),
-        scale_model_feature_names=list(prior_design.feature_names),
-        sigma_error2=float(residual_variance),
-        objective_history=objective_history,
-        validation_history=validation_history,
-        member_prior_variances=current_member_prior_variances.astype(np.float32),
-    )
 
 
 def compute_export_baseline_variances(
@@ -788,13 +850,12 @@ def _estimate_block_variance(
     block_decomposition: BlockDecomposition,
     prior_precision: jnp.ndarray,
     sample_weights: jnp.ndarray,
-) -> np.ndarray:
-    variance_diagonal = estimate_variance_from_blocks(
+) -> jnp.ndarray:
+    return estimate_variance_from_blocks(
         block_decomposition=block_decomposition,
         prior_precision=prior_precision,
         sample_weight_sum=jnp.sum(sample_weights),
     )
-    return np.asarray(jax.device_get(variance_diagonal), dtype=np.float32)
 
 
 def _update_local_scales(
@@ -1097,8 +1158,8 @@ def _refine_variance_with_probes(
             dtype=np.float64,
         )
     probe_estimate /= float(config.variance_probe_count)
-    blended_estimate = 0.5 * baseline_variance.astype(np.float64) + 0.5 * probe_estimate
-    return np.maximum(blended_estimate, 1e-12).astype(np.float32)
+    blended_estimate = 0.5 * np.asarray(jax.device_get(baseline_variance), dtype=np.float64) + 0.5 * probe_estimate
+    return jnp.asarray(np.maximum(blended_estimate, 1e-12), dtype=jnp.float32)
 
 
 def _trigamma(value: float) -> float:
@@ -1121,6 +1182,30 @@ def _validation_metric(
 
     residual_vector = targets - linear_predictor
     return float(np.mean(residual_vector * residual_vector))
+
+
+def _calibrate_binary_intercept(
+    linear_predictor: np.ndarray,
+    targets: np.ndarray,
+) -> float:
+    target_array = np.asarray(targets, dtype=np.float64)
+    base_linear_predictor = np.asarray(linear_predictor, dtype=np.float64)
+    target_prevalence = float(np.clip(np.mean(target_array), 1e-6, 1.0 - 1e-6))
+    intercept_shift = float(
+        np.log(target_prevalence / (1.0 - target_prevalence)) - np.mean(base_linear_predictor)
+    )
+    for _iteration_index in range(25):
+        shifted_predictor = base_linear_predictor + intercept_shift
+        probabilities = np.asarray(stable_sigmoid(shifted_predictor), dtype=np.float64)
+        gradient = float(np.sum(probabilities - target_array))
+        hessian = float(np.sum(probabilities * (1.0 - probabilities)))
+        if hessian <= 1e-8:
+            break
+        step = gradient / hessian
+        intercept_shift -= step
+        if abs(step) < 1e-6:
+            break
+    return float(intercept_shift)
 
 
 def _identity_tie_map(variant_count: int) -> TieMap:
@@ -1180,8 +1265,44 @@ def _project_reduced_second_moment_to_members(
         _reduce_member_values(member_prior_variances, tie_layout),
         1e-12,
     )
-    member_weights = member_prior_variances / reduced_prior_variances[tie_layout.member_to_reduced]
-    return (member_weights * member_weights) * reduced_second_moment[tie_layout.member_to_reduced]
+    reduced_group_second_moment = reduced_second_moment[tie_layout.member_to_reduced]
+    conditional_mean_weight = member_prior_variances / reduced_prior_variances[tie_layout.member_to_reduced]
+    conditional_residual_variance = member_prior_variances * (
+        1.0 - conditional_mean_weight
+    )
+    return conditional_residual_variance + (
+        conditional_mean_weight * conditional_mean_weight
+    ) * reduced_group_second_moment
+
+
+def _share_local_scale_within_tie_groups(
+    local_scale: np.ndarray,
+    baseline_prior_variances: np.ndarray,
+    tie_layout: TieLayout,
+) -> np.ndarray:
+    if tie_layout.reduced_member_indices.size == 0:
+        return local_scale
+
+    shared_local_scale = np.asarray(local_scale, dtype=np.float64).copy()
+    for group_indices, group_mask in zip(
+        tie_layout.reduced_member_indices,
+        tie_layout.reduced_member_mask,
+        strict=True,
+    ):
+        active_indices = group_indices[group_mask.astype(bool)]
+        if active_indices.shape[0] <= 1:
+            continue
+        group_baseline_variances = np.asarray(
+            baseline_prior_variances[active_indices],
+            dtype=np.float64,
+        )
+        normalized_weights = group_baseline_variances / np.maximum(
+            np.sum(group_baseline_variances),
+            1e-12,
+        )
+        group_local_scale = float(np.sum(normalized_weights * shared_local_scale[active_indices]))
+        shared_local_scale[active_indices] = group_local_scale
+    return shared_local_scale
 
 
 def _relative_parameter_change(
@@ -1207,6 +1328,16 @@ def _relative_parameter_change(
         abs(current_global_scale - previous_global_scale) / max(abs(previous_global_scale), 1e-8),
     ]
     return float(max(changes))
+
+
+def _should_refresh_block_decomposition(
+    trait_type: TraitType,
+    outer_iteration: int,
+    refresh_interval: int,
+) -> bool:
+    if trait_type == TraitType.QUANTITATIVE:
+        return outer_iteration == 0
+    return outer_iteration % refresh_interval == 0
 
 
 def _relative_change(current_values: np.ndarray, previous_values: np.ndarray | None) -> float:

@@ -23,7 +23,12 @@ class GenotypeOperator:
     tile_size: int
 
     @classmethod
-    def from_numpy(cls, genotypes: np.ndarray, tile_size: int = 256) -> GenotypeOperator:
+    def from_numpy(
+        cls,
+        genotypes: np.ndarray,
+        tile_size: int = 256,
+        device: jax.Device | None = None,
+    ) -> GenotypeOperator:
         sample_count, variant_count = genotypes.shape
         tile_count = int(np.ceil(variant_count / tile_size))
         tiles = np.zeros((tile_count, tile_size, sample_count), dtype=np.float32)
@@ -37,8 +42,8 @@ class GenotypeOperator:
             mask[tile_index, :chunk_size] = 1.0
 
         return cls(
-            genotype_tiles=jnp.asarray(tiles),
-            tile_mask=jnp.asarray(mask),
+            genotype_tiles=jax.device_put(jnp.asarray(tiles), device=device),
+            tile_mask=jax.device_put(jnp.asarray(mask), device=device),
             variant_count=variant_count,
             tile_size=tile_size,
         )

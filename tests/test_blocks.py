@@ -44,6 +44,29 @@ def test_eigendecomposition_captures_target_variance(random_generator):
         assert omitted_total <= config.discarded_spectrum_tolerance * full_total * 1.05
 
 
+def test_weighted_eigendecomposition_captures_weighted_variance(random_generator):
+    variant_count = 12
+    sample_count = 80
+    genotypes = random_generator.standard_normal((sample_count, variant_count)).astype(np.float64)
+    sample_weights = random_generator.uniform(0.1, 2.0, size=sample_count).astype(np.float32)
+    records = [
+        VariantRecord("variant_" + str(variant_index), VariantClass.SNV, "chr1", variant_index * 100)
+        for variant_index in range(variant_count)
+    ]
+    config = ModelConfig(discarded_spectrum_tolerance=0.01)
+    decomposition = build_block_decomposition(genotypes, records, config, sample_weights=sample_weights)
+    normalization = float(np.sum(sample_weights))
+    sqrt_weights = np.sqrt(sample_weights)[:, None]
+    for ld_block in decomposition.blocks:
+        total_retained = float(np.sum(ld_block.eigenvalues))
+        block_geno = genotypes[:, ld_block.variant_indices]
+        weighted_block = block_geno * sqrt_weights
+        full_eigenvalues = np.linalg.eigvalsh((weighted_block.T @ weighted_block) / normalization)
+        full_total = float(np.sum(np.maximum(full_eigenvalues, 0.0)))
+        omitted_total = full_total - total_retained
+        assert omitted_total <= config.discarded_spectrum_tolerance * full_total * 1.05
+
+
 def test_block_posterior_matches_exact_for_small_block(random_generator):
     variant_count = 6
     sample_count = 40

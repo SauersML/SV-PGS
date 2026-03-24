@@ -1,13 +1,14 @@
 """SV-PGS: single-device joint empirical-Bayes GLM for polygenic scoring with structural variants."""
 
 from sv_pgs.benchmark import run_benchmark_suite
-from sv_pgs.config import BenchmarkConfig, ModelConfig, TraitType, VariantClass
+from sv_pgs.config import BenchmarkConfig, JaxDevicePreference, ModelConfig, TraitType, VariantClass
 from sv_pgs.data import VariantRecord
 from sv_pgs.model import BayesianPGS
 
 __all__ = [
     "BayesianPGS",
     "BenchmarkConfig",
+    "JaxDevicePreference",
     "ModelConfig",
     "TraitType",
     "VariantClass",

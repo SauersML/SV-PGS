@@ -15,6 +15,7 @@ from sv_pgs.config import (
     DEFAULT_CLASS_LOG_BASELINE_SCALE,
     DEFAULT_CLASS_TPB_SHAPE_A,
     DEFAULT_CLASS_TPB_SHAPE_B,
+    JaxDevicePreference,
     ModelConfig,
     TraitType,
     VariantClass,
@@ -179,6 +180,11 @@ class TestConfigValidation:
         with pytest.raises(ValueError):
             ModelConfig(variance_probe_count=0)
 
+    def test_block_refresh_interval_validated(self):
+        import pytest
+        with pytest.raises(ValueError):
+            ModelConfig(block_weight_refresh_interval=0)
+
     def test_hierarchical_variance_validated(self):
         import pytest
         with pytest.raises(ValueError):
@@ -188,3 +194,11 @@ class TestConfigValidation:
         import pytest
         with pytest.raises(ValueError):
             ModelConfig(regularized_horseshoe_slab_scale=0.0)
+
+    def test_jax_device_index_validated(self):
+        import pytest
+        with pytest.raises(ValueError):
+            ModelConfig(jax_device_index=-1)
+
+    def test_jax_device_preference_enum_available(self):
+        assert JaxDevicePreference.GPU.value == "gpu"

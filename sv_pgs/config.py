@@ -10,6 +10,13 @@ class TraitType(str, Enum):
     BINARY = "binary"
 
 
+class JaxDevicePreference(str, Enum):
+    DEFAULT = "default"
+    GPU = "gpu"
+    CPU = "cpu"
+    TPU = "tpu"
+
+
 class VariantClass(str, Enum):
     SNV = "snv"
     SMALL_INDEL = "small_indel"
@@ -77,6 +84,9 @@ STRUCTURAL_VARIANT_CLASSES = (
 @dataclass(slots=True)
 class ModelConfig:
     trait_type: TraitType = TraitType.BINARY
+    jax_device_preference: JaxDevicePreference = JaxDevicePreference.GPU
+    jax_device_index: int = 0
+    require_jax_device: bool = False
     max_outer_iterations: int = 30
     max_pcg_iterations: int = 200
     pcg_tolerance: float = 1e-5
@@ -88,6 +98,7 @@ class ModelConfig:
     minimum_structural_variant_carriers: int = 5
     ld_block_max_variants: int = 512
     ld_block_window_bp: int = 3_000_000
+    block_weight_refresh_interval: int = 2
     discarded_spectrum_tolerance: float = 0.005
     block_jitter_floor: float = 1e-6
     prior_scale_floor: float = 1e-6
@@ -124,6 +135,8 @@ class ModelConfig:
     def __post_init__(self) -> None:
         if self.max_outer_iterations < 1:
             raise ValueError("max_outer_iterations must be positive.")
+        if self.jax_device_index < 0:
+            raise ValueError("jax_device_index must be non-negative.")
         if self.max_pcg_iterations < 1:
             raise ValueError("max_pcg_iterations must be positive.")
         if self.pcg_tolerance <= 0.0:
@@ -136,6 +149,8 @@ class ModelConfig:
             raise ValueError("polya_gamma_minimum_weight must be positive.")
         if self.minimum_structural_variant_carriers < 1:
             raise ValueError("minimum_structural_variant_carriers must be positive.")
+        if self.block_weight_refresh_interval < 1:
+            raise ValueError("block_weight_refresh_interval must be positive.")
         if self.discarded_spectrum_tolerance <= 0.0:
             raise ValueError("discarded_spectrum_tolerance must be positive.")
         if self.discarded_spectrum_tolerance >= 1.0:
