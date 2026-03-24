@@ -113,7 +113,7 @@ class ModelConfig:
     enable_horseshoe_slab: bool = True
 
     # Probe-based variance refinement: corrects cross-block correlation errors
-    variance_probe_count: int = 16
+    variance_probe_count: int = 4
     variance_probe_interval: int = 3
     variance_probe_seed: int = 0
 

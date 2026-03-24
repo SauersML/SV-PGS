@@ -8,7 +8,7 @@ from typing import Sequence
 import jax
 import jax.numpy as jnp
 import numpy as np
-from jax.scipy.special import gammaln
+from jax.scipy.special import digamma, gammaln
 
 from sv_pgs.blocks import (
     BlockDecomposition,
@@ -90,8 +90,13 @@ def fit_variational_em(
     covariate_coefficients = jnp.zeros(covariate_matrix.shape[1], dtype=jnp.float32)
     local_scale = np.ones(genotype_matrix.shape[1], dtype=np.float64)
     auxiliary_delta = local_shape_b.copy()
-    expected_inverse_local_scale = 1.0 / np.maximum(local_scale, config.local_scale_floor)
-    coefficient_variance = baseline_prior_variances.astype(np.float32)
+    current_prior_variances = _effective_prior_variances(
+        baseline_prior_variances=baseline_prior_variances,
+        local_scale=local_scale,
+        trait_type=config.trait_type,
+        config=config,
+    )
+    coefficient_variance = current_prior_variances.astype(np.float32)
     residual_variance = 1.0
 
     objective_history: list[float] = []
@@ -117,7 +122,13 @@ def fit_variational_em(
             sample_weights=sample_weights,
         )
 
-        prior_precision = expected_inverse_local_scale / np.maximum(baseline_prior_variances, 1e-12)
+        current_prior_variances = _effective_prior_variances(
+            baseline_prior_variances=baseline_prior_variances,
+            local_scale=local_scale,
+            trait_type=config.trait_type,
+            config=config,
+        )
+        prior_precision = 1.0 / np.maximum(current_prior_variances, 1e-12)
         prior_precision_device = jnp.asarray(prior_precision, dtype=jnp.float32)
         right_hand_side = _compute_right_hand_side(
             genotype_operator=genotype_operator,
@@ -150,6 +161,16 @@ def fit_variational_em(
             prior_precision=prior_precision_device,
             sample_weights=sample_weights,
         )
+        if outer_iteration % config.variance_probe_interval == 0:
+            coefficient_variance = _refine_variance_with_probes(
+                genotype_operator=genotype_operator,
+                block_decomposition=block_decomposition,
+                sample_weights=sample_weights,
+                prior_precision=prior_precision_device,
+                baseline_variance=coefficient_variance,
+                outer_iteration=outer_iteration,
+                config=config,
+            )
 
         coefficient_mean_host = np.asarray(coefficient_mean, dtype=np.float32)
         covariate_coefficients_host = np.asarray(covariate_coefficients, dtype=np.float32)
@@ -164,7 +185,7 @@ def fit_variational_em(
 
         local_scale, auxiliary_delta, expected_inverse_local_scale = _update_local_scales(
             coefficient_second_moment=coefficient_second_moment,
-            baseline_prior_variances=baseline_prior_variances,
+            prior_variances=current_prior_variances,
             local_shape_a=local_shape_a,
             local_shape_b=local_shape_b,
             auxiliary_delta=auxiliary_delta,
@@ -172,6 +193,24 @@ def fit_variational_em(
         )
 
         if config.update_hyperparameters:
+            tpb_shape_a_vector, tpb_shape_b_vector = _update_tpb_shape_vectors(
+                prior_design=prior_design,
+                local_scale=local_scale,
+                auxiliary_delta=auxiliary_delta,
+                current_tpb_shape_a_vector=tpb_shape_a_vector,
+                current_tpb_shape_b_vector=tpb_shape_b_vector,
+                config=config,
+            )
+            local_shape_a = prior_design.class_membership_matrix @ tpb_shape_a_vector
+            local_shape_b = prior_design.class_membership_matrix @ tpb_shape_b_vector
+            auxiliary_delta = (local_shape_a + local_shape_b) / np.maximum(
+                1.0 + local_scale,
+                config.local_scale_floor,
+            )
+            expected_inverse_local_scale = 1.0 / np.maximum(
+                local_scale,
+                config.local_scale_floor,
+            )
             global_scale = _update_global_scale(
                 coefficient_second_moment=coefficient_second_moment,
                 metadata_baseline_scales=metadata_baseline_scales,
@@ -208,7 +247,7 @@ def fit_variational_em(
                 linear_predictor=updated_linear_predictor_host,
                 coefficient_variance=coefficient_variance.astype(np.float64),
                 coefficient_second_moment=coefficient_second_moment,
-                baseline_prior_variances=baseline_prior_variances,
+                current_prior_variances=current_prior_variances,
                 local_scale=local_scale,
                 auxiliary_delta=auxiliary_delta,
                 local_shape_a=local_shape_a,
@@ -621,14 +660,14 @@ def _estimate_block_variance(
 
 def _update_local_scales(
     coefficient_second_moment: np.ndarray,
-    baseline_prior_variances: np.ndarray,
+    prior_variances: np.ndarray,
     local_shape_a: np.ndarray,
     local_shape_b: np.ndarray,
     auxiliary_delta: np.ndarray,
     config: ModelConfig,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     normalized_second_moment = coefficient_second_moment / np.maximum(
-        baseline_prior_variances,
+        prior_variances,
         1e-12,
     )
     shape_offset = local_shape_a - 1.5
@@ -651,6 +690,26 @@ def _update_local_scales(
     return updated_local_scale, updated_auxiliary_delta, expected_inverse_local_scale
 
 
+def _effective_prior_variances(
+    baseline_prior_variances: np.ndarray,
+    local_scale: np.ndarray,
+    trait_type: TraitType,
+    config: ModelConfig,
+) -> np.ndarray:
+    total_prior_variances = baseline_prior_variances * np.maximum(
+        local_scale,
+        config.local_scale_floor,
+    )
+    if trait_type != TraitType.BINARY or not config.enable_horseshoe_slab:
+        return np.maximum(total_prior_variances, 1e-12)
+    slab_variance = config.regularized_horseshoe_slab_scale ** 2
+    regularized_variances = (
+        slab_variance * total_prior_variances
+        / np.maximum(slab_variance + total_prior_variances, 1e-12)
+    )
+    return np.maximum(regularized_variances, 1e-12)
+
+
 def _update_global_scale(
     coefficient_second_moment: np.ndarray,
     metadata_baseline_scales: np.ndarray,
@@ -666,7 +725,91 @@ def _update_global_scale(
         updated_global_scale,
         config.global_scale_floor,
         config.global_scale_ceiling,
-    ))
+    ))    
+
+
+def _update_tpb_shape_vectors(
+    prior_design: PriorDesign,
+    local_scale: np.ndarray,
+    auxiliary_delta: np.ndarray,
+    current_tpb_shape_a_vector: np.ndarray,
+    current_tpb_shape_b_vector: np.ndarray,
+    config: ModelConfig,
+) -> tuple[np.ndarray, np.ndarray]:
+    class_effective_counts = np.sum(prior_design.class_membership_matrix, axis=0)
+    precision_value = 1.0 / config.tpb_hierarchical_prior_variance
+    expected_log_scale = np.log(np.maximum(local_scale, config.local_scale_floor))
+    expected_log_delta = np.log(np.maximum(auxiliary_delta, config.local_scale_floor))
+
+    target_log_shape_a = np.log(np.maximum(current_tpb_shape_a_vector, config.minimum_tpb_shape))
+    target_log_shape_b = np.log(np.maximum(current_tpb_shape_b_vector, config.minimum_tpb_shape))
+    for class_index in range(class_effective_counts.shape[0]):
+        class_weights = prior_design.class_membership_matrix[:, class_index]
+        effective_count = float(class_effective_counts[class_index])
+        if effective_count <= 1e-8:
+            continue
+        mean_log_scale = float(np.sum(class_weights * expected_log_scale) / effective_count)
+        mean_log_delta = float(np.sum(class_weights * expected_log_delta) / effective_count)
+        target_log_shape_a[class_index] = np.log(
+            _inverse_digamma(mean_log_delta + mean_log_scale, config)
+        )
+        target_log_shape_b[class_index] = np.log(
+            _inverse_digamma(mean_log_delta, config)
+        )
+
+    pooled_mean_a = float(
+        np.sum(class_effective_counts * target_log_shape_a)
+        / np.maximum(np.sum(class_effective_counts), 1e-12)
+    )
+    pooled_mean_b = float(
+        np.sum(class_effective_counts * target_log_shape_b)
+        / np.maximum(np.sum(class_effective_counts), 1e-12)
+    )
+
+    updated_shape_a = current_tpb_shape_a_vector.copy()
+    updated_shape_b = current_tpb_shape_b_vector.copy()
+    for class_index in range(class_effective_counts.shape[0]):
+        effective_count = float(class_effective_counts[class_index])
+        if effective_count <= 1e-8:
+            continue
+        pooled_log_shape_a = (
+            effective_count * target_log_shape_a[class_index] + precision_value * pooled_mean_a
+        ) / (effective_count + precision_value)
+        pooled_log_shape_b = (
+            effective_count * target_log_shape_b[class_index] + precision_value * pooled_mean_b
+        ) / (effective_count + precision_value)
+        updated_shape_a[class_index] = np.clip(
+            updated_shape_a[class_index]
+            * np.exp(config.tpb_shape_learning_rate * (pooled_log_shape_a - np.log(updated_shape_a[class_index]))),
+            config.minimum_tpb_shape,
+            config.maximum_tpb_shape,
+        )
+        updated_shape_b[class_index] = np.clip(
+            updated_shape_b[class_index]
+            * np.exp(config.tpb_shape_learning_rate * (pooled_log_shape_b - np.log(updated_shape_b[class_index]))),
+            config.minimum_tpb_shape,
+            config.maximum_tpb_shape,
+        )
+    return updated_shape_a, updated_shape_b
+
+
+def _inverse_digamma(target_value: float, config: ModelConfig) -> float:
+    lower_bound = np.log(config.minimum_tpb_shape) - 10.0
+    if target_value >= -2.22:
+        value = np.exp(target_value) + 0.5
+    else:
+        value = -1.0 / max(target_value - float(digamma(jnp.asarray(1.0, dtype=jnp.float32))), -1e-6)
+    value = float(np.clip(value, config.minimum_tpb_shape, config.maximum_tpb_shape))
+    iteration_index = 0
+    while iteration_index < config.maximum_tpb_shape_iterations:
+        digamma_value = float(digamma(jnp.asarray(value, dtype=jnp.float32)))
+        trigamma_value = float(_trigamma(value))
+        step_value = (digamma_value - target_value) / max(trigamma_value, 1e-8)
+        value = float(np.clip(value - step_value, config.minimum_tpb_shape, config.maximum_tpb_shape))
+        if abs(step_value) < 1e-5 or value <= np.exp(lower_bound):
+            break
+        iteration_index += 1
+    return value
 
 
 def _update_scale_model(
@@ -736,7 +879,7 @@ def _surrogate_objective(
     linear_predictor: np.ndarray,
     coefficient_variance: np.ndarray,
     coefficient_second_moment: np.ndarray,
-    baseline_prior_variances: np.ndarray,
+    current_prior_variances: np.ndarray,
     local_scale: np.ndarray,
     auxiliary_delta: np.ndarray,
     local_shape_a: np.ndarray,
@@ -760,14 +903,10 @@ def _surrogate_objective(
             )
         )
 
-    total_prior_variances = np.maximum(
-        baseline_prior_variances * local_scale,
-        1e-12,
-    )
     beta_prior_term = float(
         np.sum(
-            -0.5 * np.log(2.0 * np.pi * total_prior_variances)
-            - 0.5 * coefficient_second_moment / total_prior_variances
+            -0.5 * np.log(2.0 * np.pi * np.maximum(current_prior_variances, 1e-12))
+            - 0.5 * coefficient_second_moment / np.maximum(current_prior_variances, 1e-12)
         )
     )
     local_scale_prior_term = float(
@@ -789,6 +928,53 @@ def _surrogate_objective(
         0.5 * np.sum(np.log(2.0 * np.pi * np.e * np.maximum(coefficient_variance, 1e-12)))
     )
     return log_likelihood + beta_prior_term + local_scale_prior_term + auxiliary_prior_term + beta_entropy
+
+
+def _refine_variance_with_probes(
+    genotype_operator: GenotypeOperator,
+    block_decomposition: BlockDecomposition,
+    sample_weights: jnp.ndarray,
+    prior_precision: jnp.ndarray,
+    baseline_variance: np.ndarray,
+    outer_iteration: int,
+    config: ModelConfig,
+) -> np.ndarray:
+    random_generator = np.random.default_rng(config.variance_probe_seed + outer_iteration)
+    probe_estimate = np.zeros_like(baseline_variance, dtype=np.float64)
+    for _probe_index in range(config.variance_probe_count):
+        probe_vector = random_generator.choice(
+            np.array([-1.0, 1.0], dtype=np.float32),
+            size=baseline_variance.shape[0],
+        ).astype(np.float32)
+        solved_probe = _solve_global_posterior_mean(
+            genotype_operator=genotype_operator,
+            block_decomposition=block_decomposition,
+            sample_weights=sample_weights,
+            prior_precision=prior_precision,
+            right_hand_side=jnp.asarray(probe_vector, dtype=jnp.float32),
+            initial_mean=jnp.zeros_like(prior_precision, dtype=jnp.float32),
+            config=config,
+        )
+        probe_estimate += probe_vector.astype(np.float64) * np.asarray(solved_probe, dtype=np.float64)
+    probe_estimate /= float(config.variance_probe_count)
+    blended_estimate = 0.5 * baseline_variance.astype(np.float64) + 0.5 * probe_estimate
+    return np.maximum(blended_estimate, 1e-12).astype(np.float32)
+
+
+def _trigamma(value: float) -> jnp.ndarray:
+    value_array = jnp.asarray(value, dtype=jnp.float32)
+    reciprocal = 1.0 / value_array
+    reciprocal_square = reciprocal * reciprocal
+    reciprocal_cubic = reciprocal_square * reciprocal
+    reciprocal_quintic = reciprocal_cubic * reciprocal_square
+    reciprocal_septic = reciprocal_quintic * reciprocal_square
+    return (
+        reciprocal
+        + 0.5 * reciprocal_square
+        + (1.0 / 6.0) * reciprocal_cubic
+        - (1.0 / 30.0) * reciprocal_quintic
+        + (1.0 / 42.0) * reciprocal_septic
+    )
 
 
 def _validation_metric(
