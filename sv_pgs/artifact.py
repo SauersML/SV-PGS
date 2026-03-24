@@ -1,0 +1,154 @@
+from __future__ import annotations
+
+import json
+from dataclasses import asdict, dataclass
+from pathlib import Path
+from typing import Any
+
+import numpy as np
+
+from sv_pgs.config import ModelConfig, TraitType, VariantClass
+from sv_pgs.data import GraphEdges, TieGroup, TieMap, VariantRecord
+
+
+@dataclass(slots=True)
+class ModelArtifact:
+    config: ModelConfig
+    records: list[VariantRecord]
+    means: np.ndarray
+    scales: np.ndarray
+    alpha: np.ndarray
+    beta_reduced: np.ndarray
+    beta_full: np.ndarray
+    tie_map: TieMap
+    graph: GraphEdges
+    sigma_e2: float
+    class_mixture_weights: dict[VariantClass, np.ndarray]
+    class_variances: dict[VariantClass, np.ndarray]
+    objective_history: list[float]
+    validation_history: list[float]
+
+
+def save_artifact(path: str | Path, artifact: ModelArtifact) -> None:
+    root = Path(path)
+    root.mkdir(parents=True, exist_ok=True)
+    np.savez_compressed(
+        root / "arrays.npz",
+        means=artifact.means,
+        scales=artifact.scales,
+        alpha=artifact.alpha,
+        beta_reduced=artifact.beta_reduced,
+        beta_full=artifact.beta_full,
+        tie_kept_indices=artifact.tie_map.kept_indices,
+        tie_original_to_reduced=artifact.tie_map.original_to_reduced,
+        graph_src=artifact.graph.src,
+        graph_dst=artifact.graph.dst,
+        graph_sign=artifact.graph.sign,
+        graph_weight=artifact.graph.weight,
+        graph_block_ids=artifact.graph.block_ids,
+    )
+
+    payload = {
+        "config": _config_to_json(artifact.config),
+        "records": [_record_to_json(record) for record in artifact.records],
+        "tie_groups": [
+            {
+                "representative_index": group.representative_index,
+                "member_indices": group.member_indices.tolist(),
+                "signs": group.signs.tolist(),
+            }
+            for group in artifact.tie_map.reduced_to_group
+        ],
+        "sigma_e2": artifact.sigma_e2,
+        "class_mixture_weights": {
+            variant_class.value: values.tolist() for variant_class, values in artifact.class_mixture_weights.items()
+        },
+        "class_variances": {
+            variant_class.value: values.tolist() for variant_class, values in artifact.class_variances.items()
+        },
+        "objective_history": artifact.objective_history,
+        "validation_history": artifact.validation_history,
+    }
+    (root / "metadata.json").write_text(json.dumps(payload, indent=2), encoding="utf-8")
+
+
+def load_artifact(path: str | Path) -> ModelArtifact:
+    root = Path(path)
+    arrays = np.load(root / "arrays.npz", allow_pickle=False)
+    payload = json.loads((root / "metadata.json").read_text(encoding="utf-8"))
+
+    tie_map = TieMap(
+        kept_indices=arrays["tie_kept_indices"].astype(np.int32),
+        original_to_reduced=arrays["tie_original_to_reduced"].astype(np.int32),
+        reduced_to_group=[
+            TieGroup(
+                representative_index=int(group["representative_index"]),
+                member_indices=np.asarray(group["member_indices"], dtype=np.int32),
+                signs=np.asarray(group["signs"], dtype=np.float32),
+            )
+            for group in payload["tie_groups"]
+        ],
+    )
+    graph = GraphEdges(
+        src=arrays["graph_src"].astype(np.int32),
+        dst=arrays["graph_dst"].astype(np.int32),
+        sign=arrays["graph_sign"].astype(np.float32),
+        weight=arrays["graph_weight"].astype(np.float32),
+        block_ids=arrays["graph_block_ids"].astype(np.int32),
+    )
+    return ModelArtifact(
+        config=_config_from_json(payload["config"]),
+        records=[_record_from_json(record) for record in payload["records"]],
+        means=arrays["means"].astype(np.float32),
+        scales=arrays["scales"].astype(np.float32),
+        alpha=arrays["alpha"].astype(np.float32),
+        beta_reduced=arrays["beta_reduced"].astype(np.float32),
+        beta_full=arrays["beta_full"].astype(np.float32),
+        tie_map=tie_map,
+        graph=graph,
+        sigma_e2=float(payload["sigma_e2"]),
+        class_mixture_weights={
+            VariantClass(key): np.asarray(values, dtype=np.float32)
+            for key, values in payload["class_mixture_weights"].items()
+        },
+        class_variances={
+            VariantClass(key): np.asarray(values, dtype=np.float32)
+            for key, values in payload["class_variances"].items()
+        },
+        objective_history=[float(value) for value in payload["objective_history"]],
+        validation_history=[float(value) for value in payload["validation_history"]],
+    )
+
+
+def _config_to_json(config: ModelConfig) -> dict[str, Any]:
+    payload = asdict(config)
+    payload["trait_type"] = config.trait_type.value
+    return payload
+
+
+def _config_from_json(payload: dict[str, Any]) -> ModelConfig:
+    return ModelConfig(**{**payload, "trait_type": TraitType(payload["trait_type"])})
+
+
+def _record_to_json(record: VariantRecord) -> dict[str, Any]:
+    return {
+        "variant_id": record.variant_id,
+        "variant_class": record.variant_class.value,
+        "length_bin": record.length_bin,
+        "chromosome": record.chromosome,
+        "position": record.position,
+        "quality": record.quality,
+        "cluster_id": record.cluster_id,
+    }
+
+
+def _record_from_json(payload: dict[str, Any]) -> VariantRecord:
+    return VariantRecord(
+        variant_id=payload["variant_id"],
+        variant_class=VariantClass(payload["variant_class"]),
+        length_bin=payload["length_bin"],
+        chromosome=payload["chromosome"],
+        position=int(payload["position"]),
+        quality=float(payload["quality"]),
+        cluster_id=payload["cluster_id"],
+    )

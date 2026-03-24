@@ -1,0 +1,27 @@
+[build-system]
+requires = ["setuptools>=68.0", "setuptools-scm>=8.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "sv-pgs"
+version = "0.1.0"
+description = "Class-adaptive, graph-coupled Bayesian GLM for polygenic scoring with structural variants"
+requires-python = ">=3.10"
+dependencies = [
+    "jax>=0.4.20,<0.5",
+    "jaxlib>=0.4.20,<0.5",
+    "numpy>=1.24,<2",
+    "scipy>=1.11",
+    "pandas>=2.0",
+    "scikit-learn>=1.3",
+]
+
+[project.optional-dependencies]
+gpu = ["jax[cuda12]>=0.4.20,<0.5"]
+dev = ["pytest>=7.4", "pytest-xdist>=3.5"]
+
+[tool.setuptools.packages.find]
+include = ["sv_pgs*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
