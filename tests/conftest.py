@@ -15,21 +15,17 @@ def random_generator() -> np.random.Generator:
 def make_variant_records(
     variant_count: int,
     variant_class: VariantClass = VariantClass.SNV,
+    chromosome: str = "chr1",
 ) -> list[VariantRecord]:
     return [
         VariantRecord(
             variant_id="variant_" + str(variant_index),
             variant_class=variant_class,
-            chromosome="chr1",
+            chromosome=chromosome,
             position=variant_index * 100,
-            length=50.0 + variant_index,
-            allele_frequency=min(0.45, 0.05 + 0.01 * variant_index),
-            quality=0.95,
-            is_repeat=False,
-            is_copy_number=variant_class in {
-                VariantClass.DUPLICATION_SHORT,
-                VariantClass.DUPLICATION_LONG,
-            },
+            length=1.0,
+            allele_frequency=0.1,
+            quality=1.0,
         )
         for variant_index in range(variant_count)
     ]

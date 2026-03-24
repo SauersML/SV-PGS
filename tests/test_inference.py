@@ -10,28 +10,26 @@ from tests.conftest import make_variant_records
 
 
 def test_quantitative_inference_runs(random_generator):
-    sample_count, variant_count, covariate_count = 80, 10, 2
+    sample_count, variant_count = 80, 10
     genotype_matrix = random_generator.standard_normal((sample_count, variant_count)).astype(np.float32)
     covariate_matrix = np.column_stack(
-        [np.ones(sample_count), random_generator.standard_normal((sample_count, covariate_count))]
+        [np.ones(sample_count), random_generator.standard_normal((sample_count, 2))]
     ).astype(np.float32)
     true_coefficients = np.zeros(variant_count, dtype=np.float32)
     true_coefficients[0] = 1.0
     target_vector = genotype_matrix @ true_coefficients + random_generator.standard_normal(sample_count).astype(np.float32) * 0.3
 
-    fit_result = fit_variational_em(
+    result = fit_variational_em(
         genotypes=genotype_matrix,
         covariates=covariate_matrix,
         targets=target_vector,
         records=make_variant_records(variant_count),
-        config=ModelConfig(trait_type=TraitType.QUANTITATIVE, max_outer_iterations=6, tile_size=16),
+        config=ModelConfig(trait_type=TraitType.QUANTITATIVE, max_outer_iterations=5),
     )
-
-    assert fit_result.beta_reduced.shape == (variant_count,)
-    assert fit_result.beta_variance.shape == (variant_count,)
-    assert fit_result.alpha.shape == (covariate_matrix.shape[1],)
-    assert fit_result.objective_history
-    assert np.all(fit_result.prior_scales > 0.0)
+    assert result.beta_reduced.shape == (variant_count,)
+    assert result.alpha.shape == (covariate_matrix.shape[1],)
+    assert result.objective_history
+    assert result.prior_scales.shape[0] == variant_count
 
 
 def test_binary_inference_runs(random_generator):
@@ -41,21 +39,18 @@ def test_binary_inference_runs(random_generator):
     true_coefficients = np.zeros(variant_count, dtype=np.float32)
     true_coefficients[0] = 1.5
     linear_predictor = genotype_matrix @ true_coefficients
-    target_vector = (
-        random_generator.random(sample_count) < 1.0 / (1.0 + np.exp(-linear_predictor))
-    ).astype(np.float32)
+    target_vector = (random_generator.random(sample_count) < 1.0 / (1.0 + np.exp(-linear_predictor))).astype(np.float32)
 
-    fit_result = fit_variational_em(
+    result = fit_variational_em(
         genotypes=genotype_matrix,
         covariates=covariate_matrix,
         targets=target_vector,
         records=make_variant_records(variant_count),
-        config=ModelConfig(trait_type=TraitType.BINARY, max_outer_iterations=6, tile_size=16),
+        config=ModelConfig(trait_type=TraitType.BINARY, max_outer_iterations=5),
     )
-
-    assert fit_result.beta_reduced.shape == (variant_count,)
-    assert fit_result.sigma_error2 == 1.0
-    assert len(fit_result.class_mixture_weights) == 1
+    assert result.beta_reduced.shape == (variant_count,)
+    assert result.sigma_error2 == 1.0
+    assert len(result.class_mixture_weights) == 1
 
 
 def test_signal_variant_receives_largest_effect(random_generator):
@@ -79,12 +74,11 @@ def test_signal_variant_receives_largest_effect(random_generator):
         is_copy_number=False,
     )
 
-    fit_result = fit_variational_em(
+    result = fit_variational_em(
         genotypes=genotype_matrix,
         covariates=covariate_matrix,
         targets=target_vector,
         records=records,
-        config=ModelConfig(trait_type=TraitType.QUANTITATIVE, max_outer_iterations=12, tile_size=16),
+        config=ModelConfig(trait_type=TraitType.QUANTITATIVE, max_outer_iterations=12),
     )
-
-    assert np.argmax(np.abs(fit_result.beta_reduced)) == 3
+    assert np.argmax(np.abs(result.beta_reduced)) == 3

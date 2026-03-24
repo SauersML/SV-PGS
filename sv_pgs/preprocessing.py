@@ -5,7 +5,7 @@ from typing import Sequence
 
 import numpy as np
 
-from sv_pgs.config import ModelConfig
+from sv_pgs.config import ModelConfig, VariantClass
 from sv_pgs.data import PreparedArrays, TieGroup, TieMap, VariantRecord
 
 
@@ -143,38 +143,40 @@ def build_tie_map(
 def collapse_tie_groups(
     records: Sequence[VariantRecord],
     tie_map: TieMap,
-    config: ModelConfig,
 ) -> list[VariantRecord]:
-    class_log_prior_scales = config.class_log_prior_scales()
     collapsed_records: list[VariantRecord] = []
     for tie_group in tie_map.reduced_to_group:
         member_records = [records[int(member_index)] for member_index in tie_group.member_indices]
-        representative_record = _broadest_member_record(member_records, class_log_prior_scales)
+        unique_variant_classes, class_membership = _class_membership(member_records)
+        latent_variant_class = (
+            unique_variant_classes[0] if len(unique_variant_classes) == 1 else VariantClass.OTHER_COMPLEX_SV
+        )
         collapsed_records.append(
             VariantRecord(
-                variant_id=representative_record.variant_id,
-                variant_class=representative_record.variant_class,
-                chromosome=representative_record.chromosome,
-                position=representative_record.position,
-                length=float(np.max([record.length for record in member_records])),
-                allele_frequency=float(np.mean([record.allele_frequency for record in member_records])),
-                quality=float(np.max([record.quality for record in member_records])),
-                is_repeat=any(record.is_repeat for record in member_records),
-                is_copy_number=any(record.is_copy_number for record in member_records),
+                variant_id=member_records[0].variant_id,
+                variant_class=latent_variant_class,
+                chromosome=member_records[0].chromosome,
+                position=int(np.min([member_record.position for member_record in member_records])),
+                length=float(np.mean([member_record.length for member_record in member_records])),
+                allele_frequency=float(np.mean([member_record.allele_frequency for member_record in member_records])),
+                quality=float(np.mean([member_record.quality for member_record in member_records])),
+                is_repeat=any(member_record.is_repeat for member_record in member_records),
+                is_copy_number=any(member_record.is_copy_number for member_record in member_records),
+                prior_class_members=tuple(unique_variant_classes),
+                prior_class_membership=tuple(class_membership.tolist()),
             )
         )
     return collapsed_records
 
 
-def _broadest_member_record(
-    member_records: Sequence[VariantRecord],
-    class_log_prior_scales: dict,
-) -> VariantRecord:
-    broadest_record = member_records[0]
-    broadest_scale = class_log_prior_scales[broadest_record.variant_class]
-    for member_record in member_records[1:]:
-        member_scale = class_log_prior_scales[member_record.variant_class]
-        if member_scale > broadest_scale:
-            broadest_record = member_record
-            broadest_scale = member_scale
-    return broadest_record
+def _class_membership(member_records: Sequence[VariantRecord]) -> tuple[list[VariantClass], np.ndarray]:
+    class_counts: dict[VariantClass, int] = {}
+    for member_record in member_records:
+        class_counts[member_record.variant_class] = class_counts.get(member_record.variant_class, 0) + 1
+    unique_variant_classes = sorted(class_counts, key=lambda variant_class: variant_class.value)
+    class_weights = np.asarray(
+        [class_counts[variant_class] for variant_class in unique_variant_classes],
+        dtype=np.float64,
+    )
+    class_weights /= np.sum(class_weights)
+    return unique_variant_classes, class_weights

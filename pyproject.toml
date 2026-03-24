@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "sv-pgs"
 version = "0.1.0"
-description = "Joint empirical-Bayes GLM for polygenic scoring with structural variants"
+description = "Single-device joint empirical-Bayes GLM for polygenic scoring with structural variants"
 requires-python = ">=3.10"
 dependencies = [
     "jax>=0.4.20,<0.5",

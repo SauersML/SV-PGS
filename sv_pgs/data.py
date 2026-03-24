@@ -19,6 +19,8 @@ class VariantRecord:
     quality: float = 1.0
     is_repeat: bool = False
     is_copy_number: bool = False
+    prior_class_members: tuple[VariantClass, ...] = ()
+    prior_class_membership: tuple[float, ...] = ()
 
 
 @dataclass(slots=True)
@@ -75,6 +77,10 @@ def normalize_variant_records(records: Sequence[VariantRecord | dict[str, Any]])
                 quality=float(record.get("quality", 1.0)),
                 is_repeat=bool(record.get("is_repeat", False)),
                 is_copy_number=bool(record.get("is_copy_number", False)),
+                prior_class_members=tuple(
+                    VariantClass(member_value) for member_value in record.get("prior_class_members", ())
+                ),
+                prior_class_membership=tuple(float(member_weight) for member_weight in record.get("prior_class_membership", ())),
             )
         )
     return normalized_records

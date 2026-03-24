@@ -51,7 +51,7 @@ class BayesianPGS:
         active_records = [normalized_records[int(variant_index)] for variant_index in active_variant_indices]
 
         reduced_tie_map = build_tie_map(active_genotypes, active_records, self.config)
-        latent_records = collapse_tie_groups(active_records, reduced_tie_map, self.config)
+        latent_records = collapse_tie_groups(active_records, reduced_tie_map)
         original_space_tie_map = _project_tie_map_to_original_space(
             reduced_tie_map=reduced_tie_map,
             active_variant_indices=active_variant_indices,

@@ -117,7 +117,11 @@ def _config_to_json(config: ModelConfig) -> dict[str, Any]:
 
 
 def _config_from_json(payload: dict[str, Any]) -> ModelConfig:
-    return ModelConfig(**{**payload, "trait_type": TraitType(payload["trait_type"])})
+    restored_payload = dict(payload)
+    restored_payload["trait_type"] = TraitType(payload["trait_type"])
+    if "mixture_variance_multipliers" in restored_payload:
+        restored_payload["mixture_variance_multipliers"] = tuple(restored_payload["mixture_variance_multipliers"])
+    return ModelConfig(**restored_payload)
 
 
 def _record_to_json(record: VariantRecord) -> dict[str, Any]:
@@ -131,6 +135,8 @@ def _record_to_json(record: VariantRecord) -> dict[str, Any]:
         "quality": record.quality,
         "is_repeat": record.is_repeat,
         "is_copy_number": record.is_copy_number,
+        "prior_class_members": [member.value for member in record.prior_class_members],
+        "prior_class_membership": list(record.prior_class_membership),
     }
 
 
@@ -145,4 +151,6 @@ def _record_from_json(payload: dict[str, Any]) -> VariantRecord:
         quality=float(payload["quality"]),
         is_repeat=bool(payload["is_repeat"]),
         is_copy_number=bool(payload["is_copy_number"]),
+        prior_class_members=tuple(VariantClass(member) for member in payload.get("prior_class_members", [])),
+        prior_class_membership=tuple(float(weight) for weight in payload.get("prior_class_membership", [])),
     )
