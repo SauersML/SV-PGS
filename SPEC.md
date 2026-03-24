@@ -8,3 +8,4 @@
 - Unnecessary conditionals should be avoided.
 - Conditional imports are never allowed.
 - Only use UV, never pip.
+- No multi-GPU support.
