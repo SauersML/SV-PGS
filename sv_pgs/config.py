@@ -127,8 +127,17 @@ class ModelConfig:
     variance_probe_interval: int = 3
     variance_probe_seed: int = 0
 
+    # Trust-region Newton for binary mode solve
+    max_inner_newton_iterations: int = 20
+    newton_gradient_tolerance: float = 1e-5
+    trust_region_initial_damping: float = 1.0
+    trust_region_damping_increase_factor: float = 10.0
+    trust_region_damping_decrease_factor: float = 0.1
+    trust_region_success_threshold: float = 0.25
+    trust_region_minimum_damping: float = 1e-8
+
     update_hyperparameters: bool = True
-    prior_version: str = "metadata-adaptive-tpb-gamma-gamma-v1"
+    prior_version: str = "collapsed-laplace-em-tpb-gamma-gamma-v1"
     transform_version: str = "numeric-impute-standardize-v2"
     random_seed: int = 0
 

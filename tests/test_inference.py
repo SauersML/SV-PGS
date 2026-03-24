@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import numpy as np
 from jax.scipy.special import polygamma
+from scipy.special import kve
 
 from sv_pgs.config import ModelConfig, TraitType
 from sv_pgs.data import VariantRecord
@@ -112,12 +113,11 @@ def test_local_scale_update_uses_unslabbed_baseline_variance():
         config=config,
     )
 
-    normalized_second_moment = coefficient_second_moment / baseline_prior_variances
-    shape_offset = local_shape_a - 1.5
-    expected_local_scale = (
-        shape_offset
-        + np.sqrt(shape_offset * shape_offset + 2.0 * auxiliary_delta * normalized_second_moment)
-    ) / (2.0 * auxiliary_delta)
+    p_parameter = local_shape_a - 0.5
+    chi = coefficient_second_moment / baseline_prior_variances
+    psi = 2.0 * auxiliary_delta
+    z_value = np.sqrt(chi * psi)
+    expected_local_scale = np.sqrt(chi / psi) * (kve(p_parameter + 1.0, z_value) / kve(p_parameter, z_value))
     expected_auxiliary_delta = (local_shape_a + local_shape_b) / (1.0 + expected_local_scale)
 
     np.testing.assert_allclose(updated_local_scale, expected_local_scale)
