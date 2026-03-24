@@ -7,12 +7,7 @@ import numpy as np
 from scipy.optimize import minimize
 from scipy.special import expit
 from scipy.stats import norm
-from sklearn.metrics import (
-    average_precision_score,
-    log_loss,
-    r2_score,
-    roc_auc_score,
-)
+from sklearn.metrics import average_precision_score, log_loss, r2_score, roc_auc_score
 
 from sv_pgs.config import BenchmarkConfig, ModelConfig, TraitType
 from sv_pgs.data import VariantRecord, normalize_variant_records
@@ -42,35 +37,34 @@ def run_benchmark_suite(
     benchmark_config: BenchmarkConfig | None = None,
 ) -> dict[str, BenchmarkMetrics]:
     benchmark_config = benchmark_config or BenchmarkConfig()
-    shared = benchmark_config.shared_config
+    shared_config = benchmark_config.shared_config
 
     normalized_records = normalize_variant_records(records)
-    snv_mask = np.asarray([record.variant_class in benchmark_config.snv_classes for record in normalized_records], dtype=bool)
-
-    baseline_config = _copy_config(
-        shared,
-        correlation_threshold=2.0,
-        same_class_edge_strength=0.0,
-        cross_class_edge_strength=0.0,
+    snv_mask = np.asarray(
+        [record.variant_class in benchmark_config.snv_classes for record in normalized_records],
+        dtype=bool,
     )
-    snv_only_config = _copy_config(shared)
-    joint_config = _copy_config(shared)
+    snv_records = [
+        record for record, is_snv in zip(normalized_records, snv_mask, strict=True) if is_snv
+    ]
 
-    snv_records = [record for record, is_snv in zip(normalized_records, snv_mask, strict=True) if is_snv]
+    current_snv_config = _copy_config(shared_config, update_hyperparameters=False)
+    snv_only_config = _copy_config(shared_config)
+    joint_config = _copy_config(shared_config)
 
     model_specs: list[tuple[str, BayesianPGS, np.ndarray]] = [
         (
             "current_snv_score",
-            _fit_model(baseline_config, train_genotypes[:, snv_mask], train_covariates, train_targets, snv_records),
+            _fit_model(current_snv_config, train_genotypes[:, snv_mask], train_covariates, train_targets, snv_records),
             test_genotypes[:, snv_mask],
         ),
         (
-            "snv_only_bayesr",
+            "snv_only_mixture",
             _fit_model(snv_only_config, train_genotypes[:, snv_mask], train_covariates, train_targets, snv_records),
             test_genotypes[:, snv_mask],
         ),
         (
-            "joint_snv_sv_bayesr",
+            "joint_snv_sv_mixture",
             _fit_model(joint_config, train_genotypes, train_covariates, train_targets, normalized_records),
             test_genotypes,
         ),
@@ -121,16 +115,16 @@ def _compute_metrics(
         pr_auc = float(average_precision_score(targets, probabilities))
         loss = float(log_loss(targets, probabilities))
         intercept, slope = _calibration(probabilities, targets)
-        liability = None
+        liability_value = None
         if benchmark_config.prevalence is not None:
-            liability = _liability_r2(probabilities, targets, benchmark_config.prevalence)
+            liability_value = _liability_r2(probabilities, targets, benchmark_config.prevalence)
         return BenchmarkMetrics(
             auc=auc,
             log_loss=loss,
             pr_auc=pr_auc,
             calibration_intercept=intercept,
             calibration_slope=slope,
-            liability_r2=liability,
+            liability_r2=liability_value,
             r2=None,
             top_tail_enrichment=_top_tail_enrichment(probabilities, targets, benchmark_config.top_tail_fraction),
         )
@@ -148,7 +142,9 @@ def _compute_metrics(
 
 
 def _calibration(probabilities: np.ndarray, targets: np.ndarray) -> tuple[float, float]:
-    logits = np.log(np.clip(probabilities, 1e-6, 1.0 - 1e-6) / np.clip(1.0 - probabilities, 1e-6, 1.0))
+    logits = np.log(
+        np.clip(probabilities, 1e-6, 1.0 - 1e-6) / np.clip(1.0 - probabilities, 1e-6, 1.0 - 1e-6)
+    )
 
     def objective(parameters: np.ndarray) -> float:
         intercept, slope = parameters
@@ -169,8 +165,11 @@ def _liability_r2(probabilities: np.ndarray, targets: np.ndarray, prevalence: fl
     sample_prevalence = float(np.mean(targets))
     threshold = norm.ppf(1.0 - prevalence)
     density = norm.pdf(threshold)
-    scale = ((prevalence * (1.0 - prevalence)) / density) ** 2 / max(sample_prevalence * (1.0 - sample_prevalence), 1e-8)
-    return observed_r2 * scale
+    scale_value = ((prevalence * (1.0 - prevalence)) / density) ** 2 / max(
+        sample_prevalence * (1.0 - sample_prevalence),
+        1e-8,
+    )
+    return observed_r2 * scale_value
 
 
 def _top_tail_enrichment(scores: np.ndarray, targets: np.ndarray, fraction: float) -> float:

@@ -12,11 +12,13 @@ from sv_pgs.config import VariantClass
 class VariantRecord:
     variant_id: str
     variant_class: VariantClass
-    length_bin: str
     chromosome: str
     position: int
+    length: float = 1.0
+    allele_frequency: float = 0.01
     quality: float = 1.0
-    cluster_id: str | None = None
+    is_repeat: bool = False
+    is_copy_number: bool = False
 
 
 @dataclass(slots=True)
@@ -42,19 +44,12 @@ class TieMap:
     reduced_to_group: list[TieGroup]
 
     def expand_coefficients(self, reduced_beta: np.ndarray) -> np.ndarray:
-        full = np.zeros(self.original_to_reduced.shape[0], dtype=np.float32)
-        for reduced_index, group in enumerate(self.reduced_to_group):
-            full[group.member_indices] = reduced_beta[reduced_index] * group.signs
-        return full
-
-
-@dataclass(slots=True)
-class GraphEdges:
-    src: np.ndarray
-    dst: np.ndarray
-    sign: np.ndarray
-    weight: np.ndarray
-    block_ids: np.ndarray
+        expanded_coefficients = np.zeros(self.original_to_reduced.shape[0], dtype=np.float32)
+        for reduced_index, tie_group in enumerate(self.reduced_to_group):
+            group_size = max(int(tie_group.member_indices.shape[0]), 1)
+            neutral_coefficient = reduced_beta[reduced_index] / float(group_size)
+            expanded_coefficients[tie_group.member_indices] = neutral_coefficient * tie_group.signs
+        return expanded_coefficients
 
 
 def _coerce_variant_class(value: Any) -> VariantClass:
@@ -64,20 +59,22 @@ def _coerce_variant_class(value: Any) -> VariantClass:
 
 
 def normalize_variant_records(records: Sequence[VariantRecord | dict[str, Any]]) -> list[VariantRecord]:
-    normalized: list[VariantRecord] = []
+    normalized_records: list[VariantRecord] = []
     for record in records:
         if isinstance(record, VariantRecord):
-            normalized.append(record)
+            normalized_records.append(record)
             continue
-        normalized.append(
+        normalized_records.append(
             VariantRecord(
                 variant_id=str(record["variant_id"]),
                 variant_class=_coerce_variant_class(record["variant_class"]),
-                length_bin=str(record.get("length_bin", "na")),
                 chromosome=str(record["chromosome"]),
                 position=int(record["position"]),
+                length=float(record.get("length", 1.0)),
+                allele_frequency=float(record.get("allele_frequency", 0.01)),
                 quality=float(record.get("quality", 1.0)),
-                cluster_id=None if record.get("cluster_id") in (None, "") else str(record["cluster_id"]),
+                is_repeat=bool(record.get("is_repeat", False)),
+                is_copy_number=bool(record.get("is_copy_number", False)),
             )
         )
-    return normalized
+    return normalized_records

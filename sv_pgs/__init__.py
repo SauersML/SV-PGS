@@ -1,4 +1,4 @@
-"""SV-PGS: Class-adaptive, graph-coupled Bayesian GLM for polygenic scoring."""
+"""SV-PGS: Joint empirical-Bayes GLM for polygenic scoring with structural variants."""
 
 from sv_pgs.benchmark import run_benchmark_suite
 from sv_pgs.config import BenchmarkConfig, ModelConfig, TraitType, VariantClass

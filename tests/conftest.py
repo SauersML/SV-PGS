@@ -4,7 +4,7 @@ import numpy as np
 import pytest
 
 from sv_pgs.config import VariantClass
-from sv_pgs.data import GraphEdges, VariantRecord
+from sv_pgs.data import VariantRecord
 
 
 @pytest.fixture
@@ -20,20 +20,16 @@ def make_variant_records(
         VariantRecord(
             variant_id="variant_" + str(variant_index),
             variant_class=variant_class,
-            length_bin="short",
             chromosome="chr1",
             position=variant_index * 100,
-            quality=1.0,
+            length=50.0 + variant_index,
+            allele_frequency=min(0.45, 0.05 + 0.01 * variant_index),
+            quality=0.95,
+            is_repeat=False,
+            is_copy_number=variant_class in {
+                VariantClass.DUPLICATION_SHORT,
+                VariantClass.DUPLICATION_LONG,
+            },
         )
         for variant_index in range(variant_count)
     ]
-
-
-def empty_graph(variant_count: int) -> GraphEdges:
-    return GraphEdges(
-        src=np.array([], dtype=np.int32),
-        dst=np.array([], dtype=np.int32),
-        sign=np.array([], dtype=np.float32),
-        weight=np.array([], dtype=np.float32),
-        block_ids=np.arange(variant_count, dtype=np.int32),
-    )

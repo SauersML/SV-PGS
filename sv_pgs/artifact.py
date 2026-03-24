@@ -8,7 +8,7 @@ from typing import Any
 import numpy as np
 
 from sv_pgs.config import ModelConfig, TraitType, VariantClass
-from sv_pgs.data import GraphEdges, TieGroup, TieMap, VariantRecord
+from sv_pgs.data import TieGroup, TieMap, VariantRecord
 
 
 @dataclass(slots=True)
@@ -20,11 +20,13 @@ class ModelArtifact:
     alpha: np.ndarray
     beta_reduced: np.ndarray
     beta_full: np.ndarray
+    beta_variance: np.ndarray
     tie_map: TieMap
-    graph: GraphEdges
     sigma_e2: float
+    prior_scales: np.ndarray
     class_mixture_weights: dict[VariantClass, np.ndarray]
-    class_variances: dict[VariantClass, np.ndarray]
+    scale_model_coefficients: np.ndarray
+    scale_model_feature_names: list[str]
     objective_history: list[float]
     validation_history: list[float]
 
@@ -39,13 +41,11 @@ def save_artifact(path: str | Path, artifact: ModelArtifact) -> None:
         alpha=artifact.alpha,
         beta_reduced=artifact.beta_reduced,
         beta_full=artifact.beta_full,
+        beta_variance=artifact.beta_variance,
         tie_kept_indices=artifact.tie_map.kept_indices,
         tie_original_to_reduced=artifact.tie_map.original_to_reduced,
-        graph_src=artifact.graph.src,
-        graph_dst=artifact.graph.dst,
-        graph_sign=artifact.graph.sign,
-        graph_weight=artifact.graph.weight,
-        graph_block_ids=artifact.graph.block_ids,
+        prior_scales=artifact.prior_scales,
+        scale_model_coefficients=artifact.scale_model_coefficients,
     )
 
     payload = {
@@ -63,9 +63,7 @@ def save_artifact(path: str | Path, artifact: ModelArtifact) -> None:
         "class_mixture_weights": {
             variant_class.value: values.tolist() for variant_class, values in artifact.class_mixture_weights.items()
         },
-        "class_variances": {
-            variant_class.value: values.tolist() for variant_class, values in artifact.class_variances.items()
-        },
+        "scale_model_feature_names": artifact.scale_model_feature_names,
         "objective_history": artifact.objective_history,
         "validation_history": artifact.validation_history,
     }
@@ -89,13 +87,6 @@ def load_artifact(path: str | Path) -> ModelArtifact:
             for group in payload["tie_groups"]
         ],
     )
-    graph = GraphEdges(
-        src=arrays["graph_src"].astype(np.int32),
-        dst=arrays["graph_dst"].astype(np.int32),
-        sign=arrays["graph_sign"].astype(np.float32),
-        weight=arrays["graph_weight"].astype(np.float32),
-        block_ids=arrays["graph_block_ids"].astype(np.int32),
-    )
     return ModelArtifact(
         config=_config_from_json(payload["config"]),
         records=[_record_from_json(record) for record in payload["records"]],
@@ -104,17 +95,16 @@ def load_artifact(path: str | Path) -> ModelArtifact:
         alpha=arrays["alpha"].astype(np.float32),
         beta_reduced=arrays["beta_reduced"].astype(np.float32),
         beta_full=arrays["beta_full"].astype(np.float32),
+        beta_variance=arrays["beta_variance"].astype(np.float32),
         tie_map=tie_map,
-        graph=graph,
         sigma_e2=float(payload["sigma_e2"]),
+        prior_scales=arrays["prior_scales"].astype(np.float32),
         class_mixture_weights={
             VariantClass(key): np.asarray(values, dtype=np.float32)
             for key, values in payload["class_mixture_weights"].items()
         },
-        class_variances={
-            VariantClass(key): np.asarray(values, dtype=np.float32)
-            for key, values in payload["class_variances"].items()
-        },
+        scale_model_coefficients=arrays["scale_model_coefficients"].astype(np.float32),
+        scale_model_feature_names=[str(feature_name) for feature_name in payload["scale_model_feature_names"]],
         objective_history=[float(value) for value in payload["objective_history"]],
         validation_history=[float(value) for value in payload["validation_history"]],
     )
@@ -134,11 +124,13 @@ def _record_to_json(record: VariantRecord) -> dict[str, Any]:
     return {
         "variant_id": record.variant_id,
         "variant_class": record.variant_class.value,
-        "length_bin": record.length_bin,
         "chromosome": record.chromosome,
         "position": record.position,
+        "length": record.length,
+        "allele_frequency": record.allele_frequency,
         "quality": record.quality,
-        "cluster_id": record.cluster_id,
+        "is_repeat": record.is_repeat,
+        "is_copy_number": record.is_copy_number,
     }
 
 
@@ -146,9 +138,11 @@ def _record_from_json(payload: dict[str, Any]) -> VariantRecord:
     return VariantRecord(
         variant_id=payload["variant_id"],
         variant_class=VariantClass(payload["variant_class"]),
-        length_bin=payload["length_bin"],
         chromosome=payload["chromosome"],
         position=int(payload["position"]),
+        length=float(payload["length"]),
+        allele_frequency=float(payload["allele_frequency"]),
         quality=float(payload["quality"]),
-        cluster_id=payload["cluster_id"],
+        is_repeat=bool(payload["is_repeat"]),
+        is_copy_number=bool(payload["is_copy_number"]),
     )

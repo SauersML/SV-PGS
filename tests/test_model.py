@@ -12,16 +12,14 @@ def _synthetic_binary_dataset() -> tuple[np.ndarray, np.ndarray, np.ndarray, lis
     covariate_matrix = random_generator.normal(size=(sample_count, 2)).astype(np.float32)
     signal_variant = random_generator.normal(size=sample_count).astype(np.float32)
     duplicate_variant = signal_variant.copy()
-    correlated_structural_variant = (
-        signal_variant + random_generator.normal(scale=0.05, size=sample_count)
-    ).astype(np.float32)
+    sign_flipped_duplicate = -signal_variant.copy()
     nuisance_variant = random_generator.normal(size=sample_count).astype(np.float32)
     structural_signal_variant = random_generator.normal(size=sample_count).astype(np.float32)
     genotype_matrix = np.column_stack(
         [
             signal_variant,
             duplicate_variant,
-            correlated_structural_variant,
+            sign_flipped_duplicate,
             nuisance_variant,
             structural_signal_variant,
         ]
@@ -36,11 +34,20 @@ def _synthetic_binary_dataset() -> tuple[np.ndarray, np.ndarray, np.ndarray, lis
     target_probabilities = 1.0 / (1.0 + np.exp(-linear_predictor))
     target_vector = random_generator.binomial(1, target_probabilities).astype(np.float32)
     variant_records = [
-        VariantRecord("variant_0", VariantClass.SNV, "na", "1", 100),
-        VariantRecord("variant_1", VariantClass.SNV, "na", "1", 101),
-        VariantRecord("variant_2", VariantClass.DELETION_SHORT, "short", "1", 105, cluster_id="cluster_a"),
-        VariantRecord("variant_3", VariantClass.SNV, "na", "1", 2_000_000),
-        VariantRecord("variant_4", VariantClass.DUPLICATION_SHORT, "short", "1", 110, cluster_id="cluster_a"),
+        VariantRecord("variant_0", VariantClass.SNV, "1", 100, length=1.0, allele_frequency=0.12, quality=1.0),
+        VariantRecord("variant_1", VariantClass.DELETION_SHORT, "1", 101, length=600.0, allele_frequency=0.02, quality=0.9),
+        VariantRecord("variant_2", VariantClass.DUPLICATION_SHORT, "1", 102, length=1_200.0, allele_frequency=0.02, quality=0.9),
+        VariantRecord("variant_3", VariantClass.SNV, "1", 2_000_000, length=1.0, allele_frequency=0.40, quality=1.0),
+        VariantRecord(
+            "variant_4",
+            VariantClass.DUPLICATION_SHORT,
+            "1",
+            110,
+            length=2_000.0,
+            allele_frequency=0.02,
+            quality=0.95,
+            is_copy_number=True,
+        ),
     ]
     return genotype_matrix, covariate_matrix, target_vector, variant_records
 
@@ -52,17 +59,17 @@ def test_binary_model_fit_roundtrip_and_rare_sv_filter(tmp_path):
     model = BayesianPGS(
         ModelConfig(
             trait_type=TraitType.BINARY,
-            max_outer_iters=12,
-            max_inner_pcg_iters=80,
-            correlation_threshold=0.95,
+            max_outer_iterations=10,
+            max_inner_iterations=80,
             tile_size=8,
             minimum_structural_variant_carriers=2,
+            variance_probe_count=8,
         )
     ).fit(genotype_matrix, covariate_matrix, target_vector, variant_records)
 
     assert model.state is not None
     assert 4 not in model.state.active_variant_indices.tolist()
-    assert model.state.tie_map.kept_indices.tolist() == [0, 2, 3]
+    assert model.state.tie_map.kept_indices.tolist() == [0, 3]
     predicted_probabilities = model.predict_proba(genotype_matrix, covariate_matrix)[:, 1]
     assert roc_auc_score(target_vector, predicted_probabilities) > 0.75
 
@@ -90,14 +97,18 @@ def test_benchmark_suite_runs_from_shared_trainer():
         benchmark_config=BenchmarkConfig(
             shared_config=ModelConfig(
                 trait_type=TraitType.BINARY,
-                max_outer_iters=8,
-                max_inner_pcg_iters=60,
-                correlation_threshold=0.95,
+                max_outer_iterations=8,
+                max_inner_iterations=60,
                 tile_size=8,
+                variance_probe_count=8,
             )
         ),
     )
 
-    assert set(benchmark_metrics) == {"current_snv_score", "snv_only_bayesr", "joint_snv_sv_bayesr"}
-    assert benchmark_metrics["joint_snv_sv_bayesr"].auc is not None
-    assert benchmark_metrics["joint_snv_sv_bayesr"].log_loss is not None
+    assert set(benchmark_metrics) == {
+        "current_snv_score",
+        "snv_only_mixture",
+        "joint_snv_sv_mixture",
+    }
+    assert benchmark_metrics["joint_snv_sv_mixture"].auc is not None
+    assert benchmark_metrics["joint_snv_sv_mixture"].log_loss is not None

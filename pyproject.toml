@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "sv-pgs"
 version = "0.1.0"
-description = "Class-adaptive, graph-coupled Bayesian GLM for polygenic scoring with structural variants"
+description = "Joint empirical-Bayes GLM for polygenic scoring with structural variants"
 requires-python = ">=3.10"
 dependencies = [
     "jax>=0.4.20,<0.5",
@@ -16,7 +16,6 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-gpu = ["jax[cuda12]>=0.4.20,<0.5"]
 dev = ["pytest>=7.4"]
 
 [tool.setuptools.packages.find]

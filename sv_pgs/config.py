@@ -25,84 +25,103 @@ class VariantClass(str, Enum):
     OTHER_COMPLEX_SV = "other_complex_sv"
 
 
-DEFAULT_CLASS_PRIOR = {
-    VariantClass.SNV: np.array([0.70, 0.20, 0.08, 0.02], dtype=np.float32),
-    VariantClass.SMALL_INDEL: np.array([0.68, 0.22, 0.08, 0.02], dtype=np.float32),
-    VariantClass.DELETION_SHORT: np.array([0.62, 0.24, 0.10, 0.04], dtype=np.float32),
-    VariantClass.DELETION_LONG: np.array([0.58, 0.25, 0.12, 0.05], dtype=np.float32),
-    VariantClass.DUPLICATION_SHORT: np.array([0.60, 0.24, 0.11, 0.05], dtype=np.float32),
-    VariantClass.DUPLICATION_LONG: np.array([0.56, 0.25, 0.13, 0.06], dtype=np.float32),
-    VariantClass.INSERTION_MEI: np.array([0.60, 0.24, 0.11, 0.05], dtype=np.float32),
-    VariantClass.INVERSION_BND_COMPLEX: np.array([0.55, 0.25, 0.14, 0.06], dtype=np.float32),
-    VariantClass.STR_VNTR_REPEAT: np.array([0.60, 0.24, 0.11, 0.05], dtype=np.float32),
-    VariantClass.OTHER_COMPLEX_SV: np.array([0.58, 0.25, 0.12, 0.05], dtype=np.float32),
+STRUCTURAL_VARIANT_CLASSES = (
+    VariantClass.DELETION_SHORT,
+    VariantClass.DELETION_LONG,
+    VariantClass.DUPLICATION_SHORT,
+    VariantClass.DUPLICATION_LONG,
+    VariantClass.INSERTION_MEI,
+    VariantClass.INVERSION_BND_COMPLEX,
+    VariantClass.STR_VNTR_REPEAT,
+    VariantClass.OTHER_COMPLEX_SV,
+)
+
+MIXTURE_COMPONENT_COUNT = 5
+
+DEFAULT_COMPONENT_VARIANCE_FRACTIONS: tuple[float, ...] = (
+    1e-6,
+    1e-4,
+    1e-3,
+    1e-2,
+    1e-1,
+)
+
+DEFAULT_CLASS_MIXTURE_WEIGHTS: dict[VariantClass, tuple[float, ...]] = {
+    VariantClass.SNV:                   (0.40, 0.30, 0.15, 0.10, 0.05),
+    VariantClass.SMALL_INDEL:           (0.38, 0.28, 0.17, 0.11, 0.06),
+    VariantClass.DELETION_SHORT:        (0.32, 0.26, 0.20, 0.14, 0.08),
+    VariantClass.DELETION_LONG:         (0.28, 0.24, 0.22, 0.16, 0.10),
+    VariantClass.DUPLICATION_SHORT:     (0.30, 0.25, 0.21, 0.15, 0.09),
+    VariantClass.DUPLICATION_LONG:      (0.28, 0.24, 0.22, 0.16, 0.10),
+    VariantClass.INSERTION_MEI:         (0.30, 0.25, 0.21, 0.15, 0.09),
+    VariantClass.INVERSION_BND_COMPLEX: (0.26, 0.23, 0.23, 0.17, 0.11),
+    VariantClass.STR_VNTR_REPEAT:       (0.30, 0.25, 0.21, 0.15, 0.09),
+    VariantClass.OTHER_COMPLEX_SV:      (0.28, 0.24, 0.22, 0.16, 0.10),
 }
 
 
 @dataclass(slots=True)
 class ModelConfig:
     trait_type: TraitType = TraitType.BINARY
-    mixture_components: int = 4
-    max_outer_iters: int = 30
-    max_inner_pcg_iters: int = 200
-    pcg_tolerance: float = 1e-5
+
+    # BayesR mixture prior
+    component_variance_fractions: tuple[float, ...] = DEFAULT_COMPONENT_VARIANCE_FRACTIONS
+    dirichlet_concentration: float = 10.0
+    base_genetic_variance: float = 0.01
+
+    # Smooth metadata prior adjustments
+    metadata_ridge_penalty: float = 1.0
+    update_hyperparameters: bool = True
+
+    # LD blocks
+    ld_block_max_variants: int = 512
+    ld_block_window_bp: int = 3_000_000
+    eigenvalue_tolerance: float = 0.005
+    block_jitter_floor: float = 1e-6
+
+    # Solver
+    max_outer_iterations: int = 30
     convergence_tolerance: float = 1e-4
-    covariance_max_block_exact: int = 32
-    covariance_max_block_dense: int = 96
-    covariance_low_rank: int = 8
     tile_size: int = 256
-    prior_floor_variance: float = 1e-4
-    prior_variance_growth: tuple[float, ...] = (1.0, 10.0, 100.0, 1000.0)
-    dirichlet_strength: float = 25.0
-    variance_shrinkage: float = 0.35
-    variance_min_gap_log: float = 0.4
-    same_class_edge_strength: float = 0.6
-    cross_class_edge_strength: float = 0.25
-    correlation_threshold: float = 0.98
-    graph_window_bp: int = 2_000_000
-    min_scale: float = 1e-6
-    pg_min_weight: float = 1e-4
-    sigma_e_prior: float = 1e-3
+
+    # Data processing
+    minimum_scale: float = 1e-6
     minimum_structural_variant_carriers: int = 2
-    graph_metadata_version: str = "v1"
-    transform_version: str = "numeric-impute-standardize-v1"
+    duplicate_signature_decimals: int = 6
+
+    # Likelihood
+    polya_gamma_minimum_weight: float = 1e-4
+    sigma_error_floor: float = 1e-3
+
+    # Misc
     random_seed: int = 0
+    transform_version: str = "blockwise-bayesr-v1"
 
     def __post_init__(self) -> None:
-        if self.mixture_components != 4:
-            raise ValueError("This implementation requires exactly 4 mixture components.")
-        if len(self.prior_variance_growth) != self.mixture_components:
-            raise ValueError("prior_variance_growth must match mixture_components.")
-        if self.covariance_low_rank < 0:
-            raise ValueError("covariance_low_rank must be non-negative.")
+        if len(self.component_variance_fractions) != MIXTURE_COMPONENT_COUNT:
+            raise ValueError(
+                "component_variance_fractions must have exactly "
+                + str(MIXTURE_COMPONENT_COUNT) + " entries."
+            )
+        if self.eigenvalue_tolerance <= 0.0 or self.eigenvalue_tolerance >= 1.0:
+            raise ValueError("eigenvalue_tolerance must be in (0, 1).")
+        if self.max_outer_iterations < 1:
+            raise ValueError("max_outer_iterations must be positive.")
 
-    def base_component_variances(self) -> np.ndarray:
-        growth = np.asarray(self.prior_variance_growth, dtype=np.float32)
-        return self.prior_floor_variance * growth
+    def component_variances(self) -> np.ndarray:
+        return self.base_genetic_variance * np.asarray(
+            self.component_variance_fractions, dtype=np.float64,
+        )
 
-    def class_prior_weights(self) -> Mapping[VariantClass, np.ndarray]:
-        priors: dict[VariantClass, np.ndarray] = {}
-        for variant_class, weights in DEFAULT_CLASS_PRIOR.items():
-            weights = np.asarray(weights, dtype=np.float32)
-            if weights.shape[0] != self.mixture_components:
-                raise ValueError(
-                    f"Class prior for {variant_class.value} does not match mixture components."
-                )
-            priors[variant_class] = weights / weights.sum()
-        return priors
+    def class_mixture_weights(self) -> Mapping[VariantClass, np.ndarray]:
+        return {
+            variant_class: np.asarray(weights, dtype=np.float64)
+            for variant_class, weights in DEFAULT_CLASS_MIXTURE_WEIGHTS.items()
+        }
 
     @staticmethod
     def structural_variant_classes() -> tuple[VariantClass, ...]:
-        return (
-            VariantClass.DELETION_SHORT,
-            VariantClass.DELETION_LONG,
-            VariantClass.DUPLICATION_SHORT,
-            VariantClass.DUPLICATION_LONG,
-            VariantClass.INSERTION_MEI,
-            VariantClass.INVERSION_BND_COMPLEX,
-            VariantClass.STR_VNTR_REPEAT,
-            VariantClass.OTHER_COMPLEX_SV,
-        )
+        return STRUCTURAL_VARIANT_CLASSES
 
 
 @dataclass(slots=True)
