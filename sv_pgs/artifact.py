@@ -24,7 +24,9 @@ class ModelArtifact:
     tie_map: TieMap
     sigma_e2: float
     prior_scales: np.ndarray
-    class_tail_shapes: dict[VariantClass, float]
+    global_scale: float
+    class_tpb_shape_a: dict[VariantClass, float]
+    class_tpb_shape_b: dict[VariantClass, float]
     scale_model_coefficients: np.ndarray
     scale_model_feature_names: list[str]
     objective_history: list[float]
@@ -60,8 +62,12 @@ def save_artifact(path: str | Path, artifact: ModelArtifact) -> None:
             for group in artifact.tie_map.reduced_to_group
         ],
         "sigma_e2": artifact.sigma_e2,
-        "class_tail_shapes": {
-            variant_class.value: float(value) for variant_class, value in artifact.class_tail_shapes.items()
+        "global_scale": float(artifact.global_scale),
+        "class_tpb_shape_a": {
+            variant_class.value: float(value) for variant_class, value in artifact.class_tpb_shape_a.items()
+        },
+        "class_tpb_shape_b": {
+            variant_class.value: float(value) for variant_class, value in artifact.class_tpb_shape_b.items()
         },
         "scale_model_feature_names": artifact.scale_model_feature_names,
         "objective_history": artifact.objective_history,
@@ -99,9 +105,14 @@ def load_artifact(path: str | Path) -> ModelArtifact:
         tie_map=tie_map,
         sigma_e2=float(payload["sigma_e2"]),
         prior_scales=arrays["prior_scales"].astype(np.float32),
-        class_tail_shapes={
+        global_scale=float(payload["global_scale"]),
+        class_tpb_shape_a={
             VariantClass(key): float(value)
-            for key, value in payload["class_tail_shapes"].items()
+            for key, value in payload["class_tpb_shape_a"].items()
+        },
+        class_tpb_shape_b={
+            VariantClass(key): float(value)
+            for key, value in payload["class_tpb_shape_b"].items()
         },
         scale_model_coefficients=arrays["scale_model_coefficients"].astype(np.float32),
         scale_model_feature_names=[str(feature_name) for feature_name in payload["scale_model_feature_names"]],

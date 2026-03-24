@@ -9,7 +9,7 @@ import numpy as np
 from sv_pgs.artifact import ModelArtifact, load_artifact, save_artifact
 from sv_pgs.config import ModelConfig, TraitType
 from sv_pgs.data import TieGroup, TieMap, VariantRecord, normalize_variant_records
-from sv_pgs.inference import VariationalFitResult, fit_variational_em
+from sv_pgs.inference import VariationalFitResult, compute_export_baseline_variances, fit_variational_em
 from sv_pgs.preprocessing import Preprocessor, build_tie_map, collapse_tie_groups, fit_preprocessor, select_active_variant_indices
 
 
@@ -76,7 +76,16 @@ class BayesianPGS:
             config=self.config,
             validation_data=reduced_validation,
         )
-        active_coefficients = reduced_tie_map.expand_coefficients(fit_result.beta_reduced)
+        tie_group_weights = _tie_group_export_weights(
+            records=active_records,
+            tie_map=reduced_tie_map,
+            fit_result=fit_result,
+            config=self.config,
+        )
+        active_coefficients = reduced_tie_map.expand_coefficients(
+            fit_result.beta_reduced,
+            group_weights=tie_group_weights,
+        )
         full_coefficients = np.zeros(len(normalized_records), dtype=np.float32)
         full_coefficients[active_variant_indices] = active_coefficients
 
@@ -123,7 +132,9 @@ class BayesianPGS:
             tie_map=fitted_state.tie_map,
             sigma_e2=fitted_state.fit_result.sigma_error2,
             prior_scales=fitted_state.fit_result.prior_scales,
-            class_tail_shapes=fitted_state.fit_result.class_tail_shapes,
+            global_scale=fitted_state.fit_result.global_scale,
+            class_tpb_shape_a=fitted_state.fit_result.class_tpb_shape_a,
+            class_tpb_shape_b=fitted_state.fit_result.class_tpb_shape_b,
             scale_model_coefficients=fitted_state.fit_result.scale_model_coefficients,
             scale_model_feature_names=fitted_state.fit_result.scale_model_feature_names,
             objective_history=fitted_state.fit_result.objective_history,
@@ -145,7 +156,9 @@ class BayesianPGS:
                 beta_reduced=artifact.beta_reduced,
                 beta_variance=artifact.beta_variance,
                 prior_scales=artifact.prior_scales,
-                class_tail_shapes=artifact.class_tail_shapes,
+                global_scale=artifact.global_scale,
+                class_tpb_shape_a=artifact.class_tpb_shape_a,
+                class_tpb_shape_b=artifact.class_tpb_shape_b,
                 scale_model_coefficients=artifact.scale_model_coefficients,
                 scale_model_feature_names=artifact.scale_model_feature_names,
                 sigma_error2=artifact.sigma_e2,
@@ -217,6 +230,26 @@ def _project_tie_map_to_original_space(
         original_to_reduced=original_to_reduced,
         reduced_to_group=original_groups,
     )
+
+
+def _tie_group_export_weights(
+    records: Sequence[VariantRecord],
+    tie_map: TieMap,
+    fit_result: VariationalFitResult,
+    config: ModelConfig,
+) -> list[np.ndarray]:
+    baseline_prior_variances = compute_export_baseline_variances(
+        records=records,
+        scale_model_coefficients=fit_result.scale_model_coefficients,
+        global_scale=fit_result.global_scale,
+        config=config,
+    )
+    group_weights: list[np.ndarray] = []
+    for tie_group in tie_map.reduced_to_group:
+        member_variances = baseline_prior_variances[tie_group.member_indices]
+        normalized_weights = member_variances / np.maximum(np.sum(member_variances), 1e-12)
+        group_weights.append(normalized_weights.astype(np.float32))
+    return group_weights
 
 
 def _sigmoid(linear_predictor: np.ndarray) -> np.ndarray:

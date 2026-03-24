@@ -45,12 +45,24 @@ class TieMap:
     original_to_reduced: np.ndarray
     reduced_to_group: list[TieGroup]
 
-    def expand_coefficients(self, reduced_beta: np.ndarray) -> np.ndarray:
+    def expand_coefficients(
+        self,
+        reduced_beta: np.ndarray,
+        group_weights: Sequence[np.ndarray] | None = None,
+    ) -> np.ndarray:
         expanded_coefficients = np.zeros(self.original_to_reduced.shape[0], dtype=np.float32)
         for reduced_index, tie_group in enumerate(self.reduced_to_group):
-            group_size = max(int(tie_group.member_indices.shape[0]), 1)
-            neutral_coefficient = reduced_beta[reduced_index] / float(group_size)
-            expanded_coefficients[tie_group.member_indices] = neutral_coefficient * tie_group.signs
+            if group_weights is None:
+                group_weight_vector = np.full(
+                    tie_group.member_indices.shape[0],
+                    1.0 / max(int(tie_group.member_indices.shape[0]), 1),
+                    dtype=np.float32,
+                )
+            else:
+                group_weight_vector = np.asarray(group_weights[reduced_index], dtype=np.float32)
+            expanded_coefficients[tie_group.member_indices] = (
+                reduced_beta[reduced_index] * group_weight_vector * tie_group.signs
+            )
         return expanded_coefficients
 
 

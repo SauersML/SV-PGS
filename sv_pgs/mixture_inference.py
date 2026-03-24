@@ -1,4 +1,4 @@
-"""Continuous metadata-conditioned shrinkage with a global JAX PCG solve."""
+"""Metadata-adaptive TPB / gamma-gamma shrinkage with a global JAX PCG solve."""
 
 from __future__ import annotations
 
@@ -8,7 +8,7 @@ from typing import Sequence
 import jax
 import jax.numpy as jnp
 import numpy as np
-from jax.scipy.special import digamma, gammaln
+from jax.scipy.special import gammaln
 
 from sv_pgs.blocks import (
     BlockDecomposition,
@@ -18,7 +18,12 @@ from sv_pgs.blocks import (
 )
 from sv_pgs.config import ModelConfig, TraitType, VariantClass
 from sv_pgs.data import VariantRecord
-from sv_pgs.operator import GenotypeOperator, apply_precision_matrix, matvec, weighted_rmatvec
+from sv_pgs.operator import (
+    GenotypeOperator,
+    apply_precision_matrix,
+    matvec,
+    weighted_rmatvec,
+)
 
 
 @dataclass(slots=True)
@@ -35,7 +40,9 @@ class VariationalFitResult:
     beta_reduced: np.ndarray
     beta_variance: np.ndarray
     prior_scales: np.ndarray
-    class_tail_shapes: dict[VariantClass, float]
+    global_scale: float
+    class_tpb_shape_a: dict[VariantClass, float]
+    class_tpb_shape_b: dict[VariantClass, float]
     scale_model_coefficients: np.ndarray
     scale_model_feature_names: list[str]
     sigma_error2: float
@@ -66,19 +73,25 @@ def fit_variational_em(
     validation_payload = _prepare_validation(validation_data)
 
     scale_model_coefficients = _initialize_scale_model_coefficients(prior_design, config)
-    prior_scales = _prior_scales_from_coefficients(
+    metadata_baseline_scales = _metadata_baseline_scales_from_coefficients(
         scale_model_coefficients,
         prior_design.design_matrix,
         config,
     )
-    class_tail_shape_vector = _initialize_class_tail_shape_vector(prior_design, config)
-    local_tail_shape = prior_design.class_membership_matrix @ class_tail_shape_vector
+    global_scale = 1.0
+    baseline_prior_variances = (global_scale * metadata_baseline_scales) ** 2
+
+    tpb_shape_a_vector = _initialize_tpb_shape_a_vector(prior_design, config)
+    tpb_shape_b_vector = _initialize_tpb_shape_b_vector(prior_design, config)
+    local_shape_a = prior_design.class_membership_matrix @ tpb_shape_a_vector
+    local_shape_b = prior_design.class_membership_matrix @ tpb_shape_b_vector
 
     coefficient_mean = jnp.zeros(genotype_matrix.shape[1], dtype=jnp.float32)
     covariate_coefficients = jnp.zeros(covariate_matrix.shape[1], dtype=jnp.float32)
-    coefficient_variance = prior_scales.astype(np.float32)
-    expected_local_precision = np.ones(genotype_matrix.shape[1], dtype=np.float64)
-    expected_log_local_precision = np.zeros(genotype_matrix.shape[1], dtype=np.float64)
+    local_scale = np.ones(genotype_matrix.shape[1], dtype=np.float64)
+    auxiliary_delta = local_shape_b.copy()
+    expected_inverse_local_scale = 1.0 / np.maximum(local_scale, config.local_scale_floor)
+    coefficient_variance = baseline_prior_variances.astype(np.float32)
     residual_variance = 1.0
 
     objective_history: list[float] = []
@@ -104,7 +117,7 @@ def fit_variational_em(
             sample_weights=sample_weights,
         )
 
-        prior_precision = expected_local_precision / np.maximum(prior_scales, 1e-12)
+        prior_precision = expected_inverse_local_scale / np.maximum(baseline_prior_variances, 1e-12)
         prior_precision_device = jnp.asarray(prior_precision, dtype=jnp.float32)
         right_hand_side = _compute_right_hand_side(
             genotype_operator=genotype_operator,
@@ -149,43 +162,44 @@ def fit_variational_em(
             + coefficient_variance.astype(np.float64)
         )
 
-        posterior_precision_shape = local_tail_shape + 0.5
-        posterior_precision_rate = (
-            local_tail_shape
-            + 0.5 * coefficient_second_moment / np.maximum(prior_scales, 1e-12)
-        )
-        expected_local_precision = posterior_precision_shape / np.maximum(
-            posterior_precision_rate,
-            1e-12,
-        )
-        expected_log_local_precision = np.asarray(
-            digamma(jnp.asarray(posterior_precision_shape, dtype=jnp.float32))
-            - jnp.log(jnp.asarray(np.maximum(posterior_precision_rate, 1e-12), dtype=jnp.float32)),
-            dtype=np.float64,
+        local_scale, auxiliary_delta, expected_inverse_local_scale = _update_local_scales(
+            coefficient_second_moment=coefficient_second_moment,
+            baseline_prior_variances=baseline_prior_variances,
+            local_shape_a=local_shape_a,
+            local_shape_b=local_shape_b,
+            auxiliary_delta=auxiliary_delta,
+            config=config,
         )
 
         if config.update_hyperparameters:
-            class_tail_shape_vector = _update_class_tail_shapes(
-                prior_design=prior_design,
-                expected_local_precision=expected_local_precision,
-                expected_log_local_precision=expected_log_local_precision,
-                current_class_tail_shape_vector=class_tail_shape_vector,
+            global_scale = _update_global_scale(
+                coefficient_second_moment=coefficient_second_moment,
+                metadata_baseline_scales=metadata_baseline_scales,
+                local_scale=local_scale,
                 config=config,
             )
-            local_tail_shape = prior_design.class_membership_matrix @ class_tail_shape_vector
             scale_model_coefficients = _update_scale_model(
                 design_matrix=prior_design.design_matrix,
                 feature_names=prior_design.feature_names,
                 coefficient_second_moment=coefficient_second_moment,
-                expected_local_precision=expected_local_precision,
+                global_scale=global_scale,
+                local_scale=local_scale,
                 current_coefficients=scale_model_coefficients,
                 config=config,
             )
-            prior_scales = _prior_scales_from_coefficients(
+            metadata_baseline_scales = _metadata_baseline_scales_from_coefficients(
                 scale_model_coefficients,
                 prior_design.design_matrix,
                 config,
             )
+            global_scale = _update_global_scale(
+                coefficient_second_moment=coefficient_second_moment,
+                metadata_baseline_scales=metadata_baseline_scales,
+                local_scale=local_scale,
+                config=config,
+            )
+
+        baseline_prior_variances = (global_scale * metadata_baseline_scales) ** 2
 
         objective_history.append(
             _surrogate_objective(
@@ -194,12 +208,11 @@ def fit_variational_em(
                 linear_predictor=updated_linear_predictor_host,
                 coefficient_variance=coefficient_variance.astype(np.float64),
                 coefficient_second_moment=coefficient_second_moment,
-                prior_scales=prior_scales,
-                local_tail_shape=local_tail_shape,
-                expected_local_precision=expected_local_precision,
-                expected_log_local_precision=expected_log_local_precision,
-                posterior_precision_shape=posterior_precision_shape,
-                posterior_precision_rate=posterior_precision_rate,
+                baseline_prior_variances=baseline_prior_variances,
+                local_scale=local_scale,
+                auxiliary_delta=auxiliary_delta,
+                local_shape_a=local_shape_a,
+                local_shape_b=local_shape_b,
                 residual_variance=residual_variance,
             )
         )
@@ -228,10 +241,15 @@ def fit_variational_em(
         alpha=np.asarray(covariate_coefficients, dtype=np.float32),
         beta_reduced=np.asarray(coefficient_mean, dtype=np.float32),
         beta_variance=coefficient_variance.astype(np.float32),
-        prior_scales=prior_scales.astype(np.float32),
-        class_tail_shapes={
-            prior_design.inverse_class_lookup[class_index]: float(class_tail_shape_vector[class_index])
-            for class_index in range(class_tail_shape_vector.shape[0])
+        prior_scales=baseline_prior_variances.astype(np.float32),
+        global_scale=float(global_scale),
+        class_tpb_shape_a={
+            prior_design.inverse_class_lookup[class_index]: float(tpb_shape_a_vector[class_index])
+            for class_index in range(tpb_shape_a_vector.shape[0])
+        },
+        class_tpb_shape_b={
+            prior_design.inverse_class_lookup[class_index]: float(tpb_shape_b_vector[class_index])
+            for class_index in range(tpb_shape_b_vector.shape[0])
         },
         scale_model_coefficients=scale_model_coefficients.astype(np.float32),
         scale_model_feature_names=list(prior_design.feature_names),
@@ -239,6 +257,21 @@ def fit_variational_em(
         objective_history=objective_history,
         validation_history=validation_history,
     )
+
+
+def compute_export_baseline_variances(
+    records: Sequence[VariantRecord],
+    scale_model_coefficients: np.ndarray,
+    global_scale: float,
+    config: ModelConfig,
+) -> np.ndarray:
+    prior_design = _build_prior_design(records)
+    metadata_baseline_scales = _metadata_baseline_scales_from_coefficients(
+        np.asarray(scale_model_coefficients, dtype=np.float64),
+        prior_design.design_matrix,
+        config,
+    )
+    return ((float(global_scale) * metadata_baseline_scales) ** 2).astype(np.float32)
 
 
 def _prepare_validation(
@@ -369,7 +402,7 @@ def _initialize_scale_model_coefficients(
     prior_design: PriorDesign,
     config: ModelConfig,
 ) -> np.ndarray:
-    default_log_scales = config.class_log_prior_scales()
+    default_log_scales = config.class_log_baseline_scales()
     class_baselines = np.asarray(
         [
             default_log_scales[prior_design.inverse_class_lookup[class_index]]
@@ -391,21 +424,35 @@ def _initialize_scale_model_coefficients(
     return initialized_coefficients
 
 
-def _initialize_class_tail_shape_vector(
+def _initialize_tpb_shape_a_vector(
     prior_design: PriorDesign,
     config: ModelConfig,
 ) -> np.ndarray:
-    default_tail_shapes = config.class_tail_shapes()
+    default_shape_a = config.class_tpb_shape_a()
     return np.asarray(
         [
-            default_tail_shapes[prior_design.inverse_class_lookup[class_index]]
+            default_shape_a[prior_design.inverse_class_lookup[class_index]]
             for class_index in range(len(prior_design.inverse_class_lookup))
         ],
         dtype=np.float64,
     )
 
 
-def _prior_scales_from_coefficients(
+def _initialize_tpb_shape_b_vector(
+    prior_design: PriorDesign,
+    config: ModelConfig,
+) -> np.ndarray:
+    default_shape_b = config.class_tpb_shape_b()
+    return np.asarray(
+        [
+            default_shape_b[prior_design.inverse_class_lookup[class_index]]
+            for class_index in range(len(prior_design.inverse_class_lookup))
+        ],
+        dtype=np.float64,
+    )
+
+
+def _metadata_baseline_scales_from_coefficients(
     scale_model_coefficients: np.ndarray,
     design_matrix: np.ndarray,
     config: ModelConfig,
@@ -572,94 +619,99 @@ def _estimate_block_variance(
     )
 
 
-def _update_class_tail_shapes(
-    prior_design: PriorDesign,
-    expected_local_precision: np.ndarray,
-    expected_log_local_precision: np.ndarray,
-    current_class_tail_shape_vector: np.ndarray,
+def _update_local_scales(
+    coefficient_second_moment: np.ndarray,
+    baseline_prior_variances: np.ndarray,
+    local_shape_a: np.ndarray,
+    local_shape_b: np.ndarray,
+    auxiliary_delta: np.ndarray,
     config: ModelConfig,
-) -> np.ndarray:
-    updated_class_tail_shape_vector = current_class_tail_shape_vector.copy()
-    for class_index in range(updated_class_tail_shape_vector.shape[0]):
-        class_weights = prior_design.class_membership_matrix[:, class_index]
-        effective_count = float(np.sum(class_weights))
-        if effective_count <= 1e-8:
-            continue
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    normalized_second_moment = coefficient_second_moment / np.maximum(
+        baseline_prior_variances,
+        1e-12,
+    )
+    shape_offset = local_shape_a - 1.5
+    discriminant = np.maximum(
+        shape_offset * shape_offset + 2.0 * auxiliary_delta * normalized_second_moment,
+        1e-12,
+    )
+    updated_local_scale = (
+        shape_offset + np.sqrt(discriminant)
+    ) / np.maximum(2.0 * auxiliary_delta, 1e-12)
+    updated_local_scale = np.maximum(updated_local_scale, config.local_scale_floor)
+    updated_auxiliary_delta = (local_shape_a + local_shape_b) / np.maximum(
+        1.0 + updated_local_scale,
+        config.local_scale_floor,
+    )
+    expected_inverse_local_scale = 1.0 / np.maximum(
+        updated_local_scale,
+        config.local_scale_floor,
+    )
+    return updated_local_scale, updated_auxiliary_delta, expected_inverse_local_scale
 
-        weighted_expected_precision = float(np.sum(class_weights * expected_local_precision))
-        weighted_expected_log_precision = float(np.sum(class_weights * expected_log_local_precision))
-        tail_shape_value = updated_class_tail_shape_vector[class_index]
 
-        iteration_index = 0
-        while iteration_index < config.maximum_tail_shape_iterations:
-            gradient_value = (
-                effective_count
-                * (
-                    np.log(tail_shape_value)
-                    + 1.0
-                    - float(digamma(jnp.asarray(tail_shape_value, dtype=jnp.float32)))
-                )
-                + weighted_expected_log_precision
-                - weighted_expected_precision
-            )
-            hessian_value = effective_count * (
-                (1.0 / tail_shape_value) - float(_trigamma(tail_shape_value))
-            )
-            if abs(hessian_value) < 1e-8:
-                break
-
-            tail_shape_step = gradient_value / hessian_value
-            tail_shape_value = np.clip(
-                tail_shape_value - tail_shape_step,
-                config.minimum_tail_shape,
-                config.maximum_tail_shape,
-            )
-            if abs(tail_shape_step) < 1e-5:
-                break
-            iteration_index += 1
-
-        updated_class_tail_shape_vector[class_index] = tail_shape_value
-
-    return updated_class_tail_shape_vector
+def _update_global_scale(
+    coefficient_second_moment: np.ndarray,
+    metadata_baseline_scales: np.ndarray,
+    local_scale: np.ndarray,
+    config: ModelConfig,
+) -> float:
+    denominator = np.maximum(
+        metadata_baseline_scales * metadata_baseline_scales * local_scale,
+        config.local_scale_floor,
+    )
+    updated_global_scale = float(np.sqrt(np.mean(coefficient_second_moment / denominator)))
+    return float(np.clip(
+        updated_global_scale,
+        config.global_scale_floor,
+        config.global_scale_ceiling,
+    ))
 
 
 def _update_scale_model(
     design_matrix: np.ndarray,
     feature_names: Sequence[str],
     coefficient_second_moment: np.ndarray,
-    expected_local_precision: np.ndarray,
+    global_scale: float,
+    local_scale: np.ndarray,
     current_coefficients: np.ndarray,
     config: ModelConfig,
 ) -> np.ndarray:
     penalty_diagonal = _scale_model_penalty(feature_names, config)
-    updated_coefficients = current_coefficients.copy()
-    sufficient_statistic = np.maximum(
-        coefficient_second_moment * expected_local_precision,
-        1e-12,
+    updated_coefficients = jnp.asarray(current_coefficients, dtype=jnp.float32)
+    design_matrix_device = jnp.asarray(design_matrix, dtype=jnp.float32)
+    target_scale_ratio = jnp.asarray(
+        coefficient_second_moment / np.maximum(global_scale * global_scale * local_scale, 1e-12),
+        dtype=jnp.float32,
     )
+    penalty_diagonal_device = jnp.asarray(penalty_diagonal, dtype=jnp.float32)
 
     iteration_index = 0
     while iteration_index < config.maximum_scale_model_iterations:
-        linear_prediction = design_matrix @ updated_coefficients
-        bounded_linear_prediction = np.clip(
+        linear_prediction = design_matrix_device @ updated_coefficients
+        bounded_linear_prediction = jnp.clip(
             linear_prediction,
-            np.log(config.prior_scale_floor),
-            np.log(config.prior_scale_ceiling),
+            jnp.log(config.prior_scale_floor),
+            jnp.log(config.prior_scale_ceiling),
         )
-        working_weight = 0.5 * sufficient_statistic * np.exp(-bounded_linear_prediction)
+        working_weight = jnp.maximum(
+            target_scale_ratio * jnp.exp(-2.0 * bounded_linear_prediction),
+            1e-8,
+        )
         gradient_vector = (
-            design_matrix.T @ (-0.5 + working_weight)
-            - penalty_diagonal * updated_coefficients
+            design_matrix_device.T @ (-1.0 + working_weight)
+            - penalty_diagonal_device * updated_coefficients
         )
-        weighted_design = design_matrix * working_weight[:, None]
-        hessian_matrix = -(design_matrix.T @ weighted_design) - np.diag(penalty_diagonal)
-        coefficient_step = np.linalg.solve(hessian_matrix, gradient_vector)
-        updated_coefficients -= coefficient_step
-        if float(np.max(np.abs(coefficient_step))) < 1e-5:
+        weighted_design = design_matrix_device * (2.0 * working_weight[:, None])
+        hessian_matrix = -(design_matrix_device.T @ weighted_design) - jnp.diag(penalty_diagonal_device)
+        coefficient_step = jnp.linalg.solve(hessian_matrix, gradient_vector)
+        updated_coefficients = updated_coefficients - coefficient_step
+        if float(jnp.max(jnp.abs(coefficient_step))) < 1e-5:
             break
         iteration_index += 1
 
-    return updated_coefficients
+    return np.asarray(updated_coefficients, dtype=np.float64)
 
 
 def _scale_model_penalty(
@@ -684,12 +736,11 @@ def _surrogate_objective(
     linear_predictor: np.ndarray,
     coefficient_variance: np.ndarray,
     coefficient_second_moment: np.ndarray,
-    prior_scales: np.ndarray,
-    local_tail_shape: np.ndarray,
-    expected_local_precision: np.ndarray,
-    expected_log_local_precision: np.ndarray,
-    posterior_precision_shape: np.ndarray,
-    posterior_precision_rate: np.ndarray,
+    baseline_prior_variances: np.ndarray,
+    local_scale: np.ndarray,
+    auxiliary_delta: np.ndarray,
+    local_shape_a: np.ndarray,
+    local_shape_b: np.ndarray,
     residual_variance: float,
 ) -> float:
     if trait_type == TraitType.BINARY:
@@ -709,59 +760,35 @@ def _surrogate_objective(
             )
         )
 
+    total_prior_variances = np.maximum(
+        baseline_prior_variances * local_scale,
+        1e-12,
+    )
     beta_prior_term = float(
         np.sum(
-            0.5 * expected_log_local_precision
-            - 0.5 * np.log(2.0 * np.pi * np.maximum(prior_scales, 1e-12))
-            - 0.5
-            * expected_local_precision
-            * coefficient_second_moment
-            / np.maximum(prior_scales, 1e-12)
+            -0.5 * np.log(2.0 * np.pi * total_prior_variances)
+            - 0.5 * coefficient_second_moment / total_prior_variances
         )
     )
-    precision_prior_term = float(
+    local_scale_prior_term = float(
         np.sum(
-            local_tail_shape * np.log(np.maximum(local_tail_shape, 1e-12))
-            - np.asarray(gammaln(jnp.asarray(local_tail_shape, dtype=jnp.float32)), dtype=np.float64)
-            + (local_tail_shape - 1.0) * expected_log_local_precision
-            - local_tail_shape * expected_local_precision
+            local_shape_a * np.log(np.maximum(auxiliary_delta, 1e-12))
+            - np.asarray(gammaln(jnp.asarray(local_shape_a, dtype=jnp.float32)), dtype=np.float64)
+            + (local_shape_a - 1.0) * np.log(np.maximum(local_scale, 1e-12))
+            - auxiliary_delta * local_scale
+        )
+    )
+    auxiliary_prior_term = float(
+        np.sum(
+            -np.asarray(gammaln(jnp.asarray(local_shape_b, dtype=jnp.float32)), dtype=np.float64)
+            + (local_shape_b - 1.0) * np.log(np.maximum(auxiliary_delta, 1e-12))
+            - auxiliary_delta
         )
     )
     beta_entropy = float(
         0.5 * np.sum(np.log(2.0 * np.pi * np.e * np.maximum(coefficient_variance, 1e-12)))
     )
-    precision_entropy = float(
-        np.sum(
-            posterior_precision_shape
-            - np.log(np.maximum(posterior_precision_rate, 1e-12))
-            + np.asarray(gammaln(jnp.asarray(posterior_precision_shape, dtype=jnp.float32)), dtype=np.float64)
-            + (1.0 - posterior_precision_shape)
-            * np.asarray(digamma(jnp.asarray(posterior_precision_shape, dtype=jnp.float32)), dtype=np.float64)
-        )
-    )
-    return (
-        log_likelihood
-        + beta_prior_term
-        + precision_prior_term
-        + beta_entropy
-        + precision_entropy
-    )
-
-
-def _trigamma(value: float) -> jnp.ndarray:
-    value_array = jnp.asarray(value, dtype=jnp.float32)
-    reciprocal = 1.0 / value_array
-    reciprocal_square = reciprocal * reciprocal
-    reciprocal_cubic = reciprocal_square * reciprocal
-    reciprocal_quintic = reciprocal_cubic * reciprocal_square
-    reciprocal_septic = reciprocal_quintic * reciprocal_square
-    return (
-        reciprocal
-        + 0.5 * reciprocal_square
-        + (1.0 / 6.0) * reciprocal_cubic
-        - (1.0 / 30.0) * reciprocal_quintic
-        + (1.0 / 42.0) * reciprocal_septic
-    )
+    return log_likelihood + beta_prior_term + local_scale_prior_term + auxiliary_prior_term + beta_entropy
 
 
 def _validation_metric(
@@ -770,9 +797,7 @@ def _validation_metric(
     linear_predictor: np.ndarray,
 ) -> float:
     if trait_type == TraitType.BINARY:
-        positive_probability = 1.0 / (
-            1.0 + np.exp(-np.clip(linear_predictor, -500.0, 500.0))
-        )
+        positive_probability = _sigmoid(linear_predictor)
         return float(
             -np.mean(
                 targets * np.log(positive_probability + 1e-8)
@@ -782,3 +807,14 @@ def _validation_metric(
 
     residual_vector = targets - linear_predictor
     return float(np.mean(residual_vector * residual_vector))
+
+
+def _sigmoid(values: np.ndarray) -> np.ndarray:
+    clipped_values = np.asarray(np.clip(values, -80.0, 80.0), dtype=np.float64)
+    positive_mask = clipped_values >= 0.0
+    negative_mask = ~positive_mask
+    output = np.empty_like(clipped_values, dtype=np.float64)
+    output[positive_mask] = 1.0 / (1.0 + np.exp(-clipped_values[positive_mask]))
+    exp_values = np.exp(clipped_values[negative_mask])
+    output[negative_mask] = exp_values / (1.0 + exp_values)
+    return output.astype(np.float64)
