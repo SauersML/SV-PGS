@@ -50,7 +50,7 @@ def test_binary_inference_runs(random_generator):
     )
     assert result.beta_reduced.shape == (variant_count,)
     assert result.sigma_error2 == 1.0
-    assert len(result.class_mixture_weights) == 1
+    assert len(result.class_tail_shapes) == 1
 
 
 def test_signal_variant_receives_largest_effect(random_generator):

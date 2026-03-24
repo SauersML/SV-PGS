@@ -60,7 +60,6 @@ def test_binary_model_fit_roundtrip_and_rare_sv_filter(tmp_path):
         ModelConfig(
             trait_type=TraitType.BINARY,
             max_outer_iterations=10,
-            tile_size=8,
             minimum_structural_variant_carriers=2,
         )
     ).fit(genotype_matrix, covariate_matrix, target_vector, variant_records)
@@ -96,15 +95,14 @@ def test_benchmark_suite_runs_from_shared_trainer():
             shared_config=ModelConfig(
                 trait_type=TraitType.BINARY,
                 max_outer_iterations=8,
-                tile_size=8,
             )
         ),
     )
 
     assert set(benchmark_metrics) == {
         "current_snv_score",
-        "snv_only_mixture",
-        "joint_snv_sv_mixture",
+        "snv_only_continuous",
+        "joint_snv_sv_continuous",
     }
-    assert benchmark_metrics["joint_snv_sv_mixture"].auc is not None
-    assert benchmark_metrics["joint_snv_sv_mixture"].log_loss is not None
+    assert benchmark_metrics["joint_snv_sv_continuous"].auc is not None
+    assert benchmark_metrics["joint_snv_sv_continuous"].log_loss is not None

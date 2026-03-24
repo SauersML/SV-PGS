@@ -59,12 +59,12 @@ def run_benchmark_suite(
             test_genotypes[:, snv_mask],
         ),
         (
-            "snv_only_mixture",
+            "snv_only_continuous",
             _fit_model(snv_only_config, train_genotypes[:, snv_mask], train_covariates, train_targets, snv_records),
             test_genotypes[:, snv_mask],
         ),
         (
-            "joint_snv_sv_mixture",
+            "joint_snv_sv_continuous",
             _fit_model(joint_config, train_genotypes, train_covariates, train_targets, normalized_records),
             test_genotypes,
         ),

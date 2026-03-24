@@ -1,17 +1,16 @@
-"""Blockwise low-rank variational EM for a metadata-conditioned BayesR-style mixture prior."""
+"""Continuous metadata-conditioned shrinkage with a global PCG mean solve."""
 
 from __future__ import annotations
 
 from dataclasses import dataclass
 from typing import Sequence
 
-import jax.numpy as jnp
 import numpy as np
+from scipy.special import digamma, gammaln, polygamma
 
-from sv_pgs.blocks import build_block_decomposition, compute_block_posterior
+from sv_pgs.blocks import BlockDecomposition, build_block_decomposition, compute_block_posterior
 from sv_pgs.config import ModelConfig, TraitType, VariantClass
 from sv_pgs.data import VariantRecord
-from sv_pgs.operator import GenotypeOperator, matvec
 
 
 @dataclass(slots=True)
@@ -28,12 +27,18 @@ class VariationalFitResult:
     beta_reduced: np.ndarray
     beta_variance: np.ndarray
     prior_scales: np.ndarray
-    class_mixture_weights: dict[VariantClass, np.ndarray]
+    class_tail_shapes: dict[VariantClass, float]
     scale_model_coefficients: np.ndarray
     scale_model_feature_names: list[str]
     sigma_error2: float
     objective_history: list[float]
     validation_history: list[float]
+
+
+@dataclass(slots=True)
+class BlockPreconditioner:
+    variant_indices: np.ndarray
+    cholesky_factor: np.ndarray
 
 
 def fit_variational_em(
@@ -45,23 +50,23 @@ def fit_variational_em(
     validation_data: tuple[np.ndarray, np.ndarray, np.ndarray] | None = None,
 ) -> VariationalFitResult:
     genotype_matrix = np.asarray(genotypes, dtype=np.float32)
-    covariate_host = np.asarray(covariates, dtype=np.float32)
-    target_host = np.asarray(targets, dtype=np.float32)
+    genotype_matrix_float64 = np.asarray(genotype_matrix, dtype=np.float64)
+    covariate_matrix = np.asarray(covariates, dtype=np.float32)
+    target_vector = np.asarray(targets, dtype=np.float32)
+    block_decomposition = build_block_decomposition(genotype_matrix_float64, records, config)
     prior_design = _build_prior_design(records)
-    genotype_operator = GenotypeOperator.from_numpy(genotype_matrix, tile_size=config.tile_size)
-    block_decomposition = build_block_decomposition(genotype_matrix.astype(np.float64), records, config)
     validation_payload = _prepare_validation(validation_data)
 
     scale_model_coefficients = _initialize_scale_model_coefficients(prior_design, config)
     prior_scales = _prior_scales_from_coefficients(scale_model_coefficients, prior_design.design_matrix, config)
-    component_variances = np.asarray(config.mixture_variance_multipliers, dtype=np.float64)
-    inverse_component_variances = 1.0 / component_variances
-    class_weight_matrix = _initialize_class_weight_matrix(prior_design, config)
-    responsibilities = _local_class_weights(prior_design.class_membership_matrix, class_weight_matrix)
+    class_tail_shape_vector = _initialize_class_tail_shape_vector(prior_design, config)
+    local_tail_shape = prior_design.class_membership_matrix @ class_tail_shape_vector
 
     coefficient_mean = np.zeros(genotype_matrix.shape[1], dtype=np.float32)
-    coefficient_variance = np.asarray(prior_scales * component_variances[0], dtype=np.float32)
-    covariate_coefficients = np.zeros(covariate_host.shape[1], dtype=np.float32)
+    coefficient_variance = prior_scales.astype(np.float32)
+    expected_local_precision = np.ones(genotype_matrix.shape[1], dtype=np.float64)
+    expected_log_local_precision = np.zeros(genotype_matrix.shape[1], dtype=np.float64)
+    covariate_coefficients = np.zeros(covariate_matrix.shape[1], dtype=np.float32)
     residual_variance = 1.0
 
     objective_history: list[float] = []
@@ -69,78 +74,105 @@ def fit_variational_em(
 
     outer_iteration = 0
     while outer_iteration < config.max_outer_iterations:
-        linear_predictor = np.asarray(matvec(genotype_operator, jnp.asarray(coefficient_mean))) + covariate_host @ covariate_coefficients
+        current_genetic_prediction = genotype_matrix @ coefficient_mean
+        linear_predictor = current_genetic_prediction + covariate_matrix @ covariate_coefficients
         sample_weights, pseudo_response, residual_variance = _likelihood_update(
             trait_type=config.trait_type,
-            targets=target_host,
+            targets=target_vector,
             linear_predictor=linear_predictor,
             sigma_error_floor=config.sigma_error_floor,
             minimum_polya_gamma_weight=config.polya_gamma_minimum_weight,
         )
-        current_genetic_prediction = np.asarray(matvec(genotype_operator, jnp.asarray(coefficient_mean)))
         covariate_coefficients = _solve_covariates(
-            covariate_matrix=covariate_host,
+            covariate_matrix=covariate_matrix,
             pseudo_response=pseudo_response,
             current_genetic_prediction=current_genetic_prediction,
             sample_weights=sample_weights,
         )
 
-        expected_inverse_mixture = responsibilities @ inverse_component_variances
-        prior_precision = expected_inverse_mixture / np.maximum(prior_scales, 1e-12)
-        block_weighted_residual = sample_weights * (pseudo_response - covariate_host @ covariate_coefficients - current_genetic_prediction)
-        coefficient_mean, coefficient_variance = _update_block_posterior(
-            genotype_matrix=genotype_matrix,
-            block_decomposition=block_decomposition,
+        prior_precision = expected_local_precision / np.maximum(prior_scales, 1e-12)
+        right_hand_side = _compute_right_hand_side(
+            genotype_matrix=genotype_matrix_float64,
             sample_weights=sample_weights,
-            weighted_residual=block_weighted_residual,
-            prior_precision=prior_precision,
-            previous_mean=coefficient_mean,
+            pseudo_response=pseudo_response,
+            covariate_matrix=covariate_matrix,
+            covariate_coefficients=covariate_coefficients,
         )
-        updated_genetic_prediction = np.asarray(matvec(genotype_operator, jnp.asarray(coefficient_mean)))
+        block_preconditioner = _build_block_preconditioner(
+            block_decomposition=block_decomposition,
+            genotype_matrix=genotype_matrix_float64,
+            sample_weights=sample_weights.astype(np.float64),
+            prior_precision=prior_precision.astype(np.float64),
+        )
+        coefficient_mean = _solve_global_posterior_mean(
+            genotype_matrix=genotype_matrix_float64,
+            sample_weights=sample_weights,
+            prior_precision=prior_precision.astype(np.float32),
+            right_hand_side=right_hand_side,
+            block_preconditioner=block_preconditioner,
+            initial_mean=coefficient_mean,
+            config=config,
+        )
+
+        updated_genetic_prediction = genotype_matrix @ coefficient_mean
         covariate_coefficients = _solve_covariates(
-            covariate_matrix=covariate_host,
+            covariate_matrix=covariate_matrix,
             pseudo_response=pseudo_response,
             current_genetic_prediction=updated_genetic_prediction,
             sample_weights=sample_weights,
         )
 
+        coefficient_variance = _estimate_block_variance(
+            genotype_matrix=genotype_matrix_float64,
+            block_decomposition=block_decomposition,
+            sample_weights=sample_weights.astype(np.float64),
+            pseudo_response=pseudo_response.astype(np.float64),
+            covariate_matrix=covariate_matrix.astype(np.float64),
+            covariate_coefficients=covariate_coefficients.astype(np.float64),
+            current_genetic_prediction=updated_genetic_prediction.astype(np.float64),
+            coefficient_mean=coefficient_mean.astype(np.float64),
+            prior_precision=prior_precision.astype(np.float64),
+        )
         coefficient_second_moment = coefficient_mean.astype(np.float64) ** 2 + coefficient_variance.astype(np.float64)
-        responsibilities = _update_responsibilities(
-            coefficient_second_moment=coefficient_second_moment,
-            prior_scales=prior_scales,
-            class_membership_matrix=prior_design.class_membership_matrix,
-            class_weight_matrix=class_weight_matrix,
-            component_variances=component_variances,
-        )
-        class_weight_matrix = _update_class_weight_matrix(
-            responsibilities=responsibilities,
-            class_membership_matrix=prior_design.class_membership_matrix,
-            prior_design=prior_design,
-            config=config,
-        )
+
+        posterior_precision_shape = local_tail_shape + 0.5
+        posterior_precision_rate = local_tail_shape + 0.5 * coefficient_second_moment / np.maximum(prior_scales, 1e-12)
+        expected_local_precision = posterior_precision_shape / np.maximum(posterior_precision_rate, 1e-12)
+        expected_log_local_precision = digamma(posterior_precision_shape) - np.log(np.maximum(posterior_precision_rate, 1e-12))
+
         if config.update_hyperparameters:
+            class_tail_shape_vector = _update_class_tail_shapes(
+                prior_design=prior_design,
+                expected_local_precision=expected_local_precision,
+                expected_log_local_precision=expected_log_local_precision,
+                current_class_tail_shape_vector=class_tail_shape_vector,
+                config=config,
+            )
+            local_tail_shape = prior_design.class_membership_matrix @ class_tail_shape_vector
             scale_model_coefficients = _update_scale_model(
                 design_matrix=prior_design.design_matrix,
                 feature_names=prior_design.feature_names,
                 coefficient_second_moment=coefficient_second_moment,
-                expected_inverse_mixture=responsibilities @ inverse_component_variances,
+                expected_local_precision=expected_local_precision,
                 current_coefficients=scale_model_coefficients,
                 config=config,
             )
             prior_scales = _prior_scales_from_coefficients(scale_model_coefficients, prior_design.design_matrix, config)
 
-        updated_linear_predictor = updated_genetic_prediction + covariate_host @ covariate_coefficients
+        updated_linear_predictor = updated_genetic_prediction + covariate_matrix @ covariate_coefficients
         objective_history.append(
             _surrogate_objective(
                 trait_type=config.trait_type,
-                targets=target_host,
+                targets=target_vector,
                 linear_predictor=updated_linear_predictor,
+                coefficient_variance=coefficient_variance.astype(np.float64),
                 coefficient_second_moment=coefficient_second_moment,
                 prior_scales=prior_scales,
-                class_membership_matrix=prior_design.class_membership_matrix,
-                class_weight_matrix=class_weight_matrix,
-                responsibilities=responsibilities,
-                component_variances=component_variances,
+                local_tail_shape=local_tail_shape,
+                expected_local_precision=expected_local_precision,
+                expected_log_local_precision=expected_log_local_precision,
+                posterior_precision_shape=posterior_precision_shape,
+                posterior_precision_rate=posterior_precision_rate,
                 residual_variance=residual_variance,
             )
         )
@@ -167,9 +199,9 @@ def fit_variational_em(
         beta_reduced=coefficient_mean.astype(np.float32),
         beta_variance=coefficient_variance.astype(np.float32),
         prior_scales=prior_scales.astype(np.float32),
-        class_mixture_weights={
-            prior_design.inverse_class_lookup[class_index]: class_weight_matrix[class_index].astype(np.float32)
-            for class_index in range(class_weight_matrix.shape[0])
+        class_tail_shapes={
+            prior_design.inverse_class_lookup[class_index]: float(class_tail_shape_vector[class_index])
+            for class_index in range(class_tail_shape_vector.shape[0])
         },
         scale_model_coefficients=scale_model_coefficients.astype(np.float32),
         scale_model_feature_names=list(prior_design.feature_names),
@@ -225,17 +257,17 @@ def _build_prior_design(records: Sequence[VariantRecord]) -> PriorDesign:
     design_columns: list[np.ndarray] = [np.ones(len(records), dtype=np.float64)]
     feature_names = ["intercept"]
     for class_index, variant_class in enumerate(unique_classes):
-        class_mask = class_membership_matrix[:, class_index]
-        design_columns.append(class_mask)
-        feature_names.append(f"type_offset::{variant_class.value}")
-        design_columns.append(class_mask * standardized_log_length)
-        feature_names.append(f"log_length_linear::{variant_class.value}")
-        design_columns.append(class_mask * standardized_log_length * standardized_log_length)
-        feature_names.append(f"log_length_quadratic::{variant_class.value}")
-        design_columns.append(class_mask * standardized_allele_frequency)
-        feature_names.append(f"allele_frequency_linear::{variant_class.value}")
-        design_columns.append(class_mask * standardized_allele_frequency * standardized_allele_frequency)
-        feature_names.append(f"allele_frequency_quadratic::{variant_class.value}")
+        class_membership = class_membership_matrix[:, class_index]
+        design_columns.append(class_membership)
+        feature_names.append("type_offset::" + variant_class.value)
+        design_columns.append(class_membership * standardized_log_length)
+        feature_names.append("log_length_linear::" + variant_class.value)
+        design_columns.append(class_membership * standardized_log_length * standardized_log_length)
+        feature_names.append("log_length_quadratic::" + variant_class.value)
+        design_columns.append(class_membership * standardized_allele_frequency)
+        feature_names.append("allele_frequency_linear::" + variant_class.value)
+        design_columns.append(class_membership * standardized_allele_frequency * standardized_allele_frequency)
+        feature_names.append("allele_frequency_quadratic::" + variant_class.value)
 
     design_columns.append(standardized_quality)
     feature_names.append("quality_linear")
@@ -277,7 +309,10 @@ def _standardize_metadata(values: np.ndarray) -> np.ndarray:
 def _initialize_scale_model_coefficients(prior_design: PriorDesign, config: ModelConfig) -> np.ndarray:
     default_log_scales = config.class_log_prior_scales()
     class_baselines = np.asarray(
-        [default_log_scales[prior_design.inverse_class_lookup[class_index]] for class_index in range(len(prior_design.inverse_class_lookup))],
+        [
+            default_log_scales[prior_design.inverse_class_lookup[class_index]]
+            for class_index in range(len(prior_design.inverse_class_lookup))
+        ],
         dtype=np.float64,
     )
     average_baseline = float(np.mean(class_baselines))
@@ -291,20 +326,15 @@ def _initialize_scale_model_coefficients(prior_design: PriorDesign, config: Mode
     return initialized_coefficients
 
 
-def _initialize_class_weight_matrix(prior_design: PriorDesign, config: ModelConfig) -> np.ndarray:
-    default_class_weights = config.class_mixture_weights()
-    return np.vstack(
-        [default_class_weights[prior_design.inverse_class_lookup[class_index]] for class_index in range(len(prior_design.inverse_class_lookup))]
-    ).astype(np.float64)
-
-
-def _local_class_weights(
-    class_membership_matrix: np.ndarray,
-    class_weight_matrix: np.ndarray,
-) -> np.ndarray:
-    local_class_weights = class_membership_matrix @ class_weight_matrix
-    local_class_weights = np.maximum(local_class_weights, 1e-12)
-    return local_class_weights / np.sum(local_class_weights, axis=1, keepdims=True)
+def _initialize_class_tail_shape_vector(prior_design: PriorDesign, config: ModelConfig) -> np.ndarray:
+    default_tail_shapes = config.class_tail_shapes()
+    return np.asarray(
+        [
+            default_tail_shapes[prior_design.inverse_class_lookup[class_index]]
+            for class_index in range(len(prior_design.inverse_class_lookup))
+        ],
+        dtype=np.float64,
+    )
 
 
 def _prior_scales_from_coefficients(
@@ -330,7 +360,7 @@ def _likelihood_update(
 ) -> tuple[np.ndarray, np.ndarray, float]:
     if trait_type == TraitType.BINARY:
         sample_weights = _polya_gamma_expectation(linear_predictor, minimum_polya_gamma_weight)
-        pseudo_response = (targets - 0.5) / sample_weights
+        pseudo_response = linear_predictor + (targets - 0.5) / sample_weights
         return sample_weights, pseudo_response, 1.0
 
     residual_vector = targets - linear_predictor
@@ -363,83 +393,194 @@ def _solve_covariates(
     return np.linalg.solve(normal_matrix + ridge_jitter, right_hand_side).astype(np.float32)
 
 
-def _update_block_posterior(
+def _compute_right_hand_side(
     genotype_matrix: np.ndarray,
-    block_decomposition,
     sample_weights: np.ndarray,
-    weighted_residual: np.ndarray,
-    prior_precision: np.ndarray,
-    previous_mean: np.ndarray,
-) -> tuple[np.ndarray, np.ndarray]:
-    updated_mean = previous_mean.astype(np.float32).copy()
-    updated_variance = np.zeros_like(updated_mean, dtype=np.float32)
-    current_weighted_residual = weighted_residual.astype(np.float64).copy()
-
-    for ld_block in block_decomposition.blocks:
-        block_indices = ld_block.variant_indices
-        block_genotypes = genotype_matrix[:, block_indices].astype(np.float64)
-        old_block_mean = updated_mean[block_indices].astype(np.float64)
-        current_weighted_residual += sample_weights.astype(np.float64) * (block_genotypes @ old_block_mean)
-        block_mean, block_variance = compute_block_posterior(
-            ld_block,
-            genotype_matrix.astype(np.float64),
-            sample_weights.astype(np.float64),
-            current_weighted_residual,
-            prior_precision.astype(np.float64),
-        )
-        updated_mean[block_indices] = block_mean
-        updated_variance[block_indices] = block_variance
-        current_weighted_residual -= sample_weights.astype(np.float64) * (block_genotypes @ block_mean.astype(np.float64))
-
-    return updated_mean, updated_variance
-
-
-def _update_responsibilities(
-    coefficient_second_moment: np.ndarray,
-    prior_scales: np.ndarray,
-    class_membership_matrix: np.ndarray,
-    class_weight_matrix: np.ndarray,
-    component_variances: np.ndarray,
+    pseudo_response: np.ndarray,
+    covariate_matrix: np.ndarray,
+    covariate_coefficients: np.ndarray,
 ) -> np.ndarray:
-    local_class_weights = _local_class_weights(class_membership_matrix, class_weight_matrix)
-    component_variance_matrix = prior_scales[:, None] * component_variances[None, :]
-    log_responsibilities = np.log(np.maximum(local_class_weights, 1e-12))
-    log_responsibilities -= 0.5 * np.log(component_variance_matrix)
-    log_responsibilities -= 0.5 * coefficient_second_moment[:, None] / np.maximum(component_variance_matrix, 1e-12)
-    log_responsibilities -= np.max(log_responsibilities, axis=1, keepdims=True)
-    unnormalized_weights = np.exp(log_responsibilities)
-    return unnormalized_weights / np.sum(unnormalized_weights, axis=1, keepdims=True)
+    weighted_response = sample_weights * (pseudo_response - covariate_matrix @ covariate_coefficients)
+    return genotype_matrix.T @ weighted_response
 
 
-def _update_class_weight_matrix(
-    responsibilities: np.ndarray,
-    class_membership_matrix: np.ndarray,
-    prior_design: PriorDesign,
+def _build_block_preconditioner(
+    block_decomposition: BlockDecomposition,
+    genotype_matrix: np.ndarray,
+    sample_weights: np.ndarray,
+    prior_precision: np.ndarray,
+) -> list[BlockPreconditioner]:
+    block_preconditioner: list[BlockPreconditioner] = []
+    for block in block_decomposition.blocks:
+        block_indices = block.variant_indices
+        block_genotypes = genotype_matrix[:, block_indices]
+        local_precision_matrix = block_genotypes.T @ (sample_weights[:, None] * block_genotypes)
+        local_precision_matrix += np.diag(prior_precision[block_indices])
+        local_precision_matrix += np.eye(block_indices.shape[0], dtype=np.float64) * block.jitter
+        cholesky_factor = np.linalg.cholesky(local_precision_matrix)
+        block_preconditioner.append(
+            BlockPreconditioner(
+                variant_indices=block_indices.astype(np.int32),
+                cholesky_factor=cholesky_factor.astype(np.float64),
+            )
+        )
+    return block_preconditioner
+
+
+def _apply_preconditioner(
+    block_preconditioner: Sequence[BlockPreconditioner],
+    vector: np.ndarray,
+) -> np.ndarray:
+    preconditioned_vector = np.zeros_like(vector, dtype=np.float64)
+    for block in block_preconditioner:
+        block_vector = vector[block.variant_indices]
+        block_solution = np.linalg.solve(
+            block.cholesky_factor.T,
+            np.linalg.solve(block.cholesky_factor, block_vector),
+        )
+        preconditioned_vector[block.variant_indices] = block_solution
+    return preconditioned_vector
+
+
+def _apply_global_precision(
+    genotype_matrix: np.ndarray,
+    sample_weights: np.ndarray,
+    prior_precision: np.ndarray,
+    vector: np.ndarray,
+) -> np.ndarray:
+    sample_projection = genotype_matrix @ vector
+    weighted_projection = sample_weights * sample_projection
+    transpose_projection = genotype_matrix.T @ weighted_projection
+    return transpose_projection + prior_precision.astype(np.float64) * vector.astype(np.float64)
+
+
+def _solve_global_posterior_mean(
+    genotype_matrix: np.ndarray,
+    sample_weights: np.ndarray,
+    prior_precision: np.ndarray,
+    right_hand_side: np.ndarray,
+    block_preconditioner: Sequence[BlockPreconditioner],
+    initial_mean: np.ndarray,
     config: ModelConfig,
 ) -> np.ndarray:
-    default_class_weights = config.class_mixture_weights()
-    component_count = responsibilities.shape[1]
-    updated_weight_matrix = np.zeros((len(prior_design.inverse_class_lookup), component_count), dtype=np.float64)
-    for class_index in range(updated_weight_matrix.shape[0]):
-        membership_weight = class_membership_matrix[:, class_index][:, None]
-        class_responsibility_sum = np.sum(membership_weight * responsibilities, axis=0)
-        default_weights = default_class_weights[prior_design.inverse_class_lookup[class_index]]
-        posterior_weights = class_responsibility_sum + config.dirichlet_strength * default_weights
-        updated_weight_matrix[class_index] = posterior_weights / np.sum(posterior_weights)
-    return updated_weight_matrix
+    coefficient_mean = initial_mean.astype(np.float64).copy()
+    residual_vector = right_hand_side.astype(np.float64) - _apply_global_precision(
+        genotype_matrix=genotype_matrix,
+        sample_weights=sample_weights,
+        prior_precision=prior_precision,
+        vector=coefficient_mean,
+    )
+    preconditioned_residual = _apply_preconditioner(block_preconditioner, residual_vector)
+    search_direction = preconditioned_residual.copy()
+    previous_inner_product = float(residual_vector @ preconditioned_residual)
+
+    iteration_index = 0
+    while iteration_index < config.max_pcg_iterations:
+        projected_direction = _apply_global_precision(
+            genotype_matrix=genotype_matrix,
+            sample_weights=sample_weights,
+            prior_precision=prior_precision,
+            vector=search_direction,
+        )
+        step_size = previous_inner_product / max(float(search_direction @ projected_direction), 1e-12)
+        coefficient_mean += step_size * search_direction
+        residual_vector -= step_size * projected_direction
+        residual_norm = float(np.linalg.norm(residual_vector))
+        if residual_norm <= config.pcg_tolerance:
+            break
+
+        preconditioned_residual = _apply_preconditioner(block_preconditioner, residual_vector)
+        current_inner_product = float(residual_vector @ preconditioned_residual)
+        conjugate_weight = current_inner_product / max(previous_inner_product, 1e-12)
+        search_direction = preconditioned_residual + conjugate_weight * search_direction
+        previous_inner_product = current_inner_product
+        iteration_index += 1
+
+    return coefficient_mean.astype(np.float32)
+
+
+def _estimate_block_variance(
+    genotype_matrix: np.ndarray,
+    block_decomposition: BlockDecomposition,
+    sample_weights: np.ndarray,
+    pseudo_response: np.ndarray,
+    covariate_matrix: np.ndarray,
+    covariate_coefficients: np.ndarray,
+    current_genetic_prediction: np.ndarray,
+    coefficient_mean: np.ndarray,
+    prior_precision: np.ndarray,
+) -> np.ndarray:
+    weighted_residual = sample_weights * (
+        pseudo_response - covariate_matrix @ covariate_coefficients - current_genetic_prediction
+    )
+    coefficient_variance = np.zeros(coefficient_mean.shape[0], dtype=np.float64)
+
+    for block in block_decomposition.blocks:
+        block_indices = block.variant_indices
+        block_genotypes = genotype_matrix[:, block_indices]
+        block_residual = weighted_residual + sample_weights * (block_genotypes @ coefficient_mean[block_indices])
+        _, block_variance = compute_block_posterior(
+            block,
+            genotype_matrix,
+            sample_weights,
+            block_residual,
+            prior_precision,
+        )
+        coefficient_variance[block_indices] = block_variance.astype(np.float64)
+
+    return np.maximum(coefficient_variance, 1e-8).astype(np.float32)
+
+
+def _update_class_tail_shapes(
+    prior_design: PriorDesign,
+    expected_local_precision: np.ndarray,
+    expected_log_local_precision: np.ndarray,
+    current_class_tail_shape_vector: np.ndarray,
+    config: ModelConfig,
+) -> np.ndarray:
+    updated_class_tail_shape_vector = current_class_tail_shape_vector.copy()
+    for class_index in range(updated_class_tail_shape_vector.shape[0]):
+        class_weights = prior_design.class_membership_matrix[:, class_index]
+        effective_count = float(np.sum(class_weights))
+        if effective_count <= 1e-8:
+            continue
+        weighted_expected_precision = float(np.sum(class_weights * expected_local_precision))
+        weighted_expected_log_precision = float(np.sum(class_weights * expected_log_local_precision))
+        tail_shape_value = updated_class_tail_shape_vector[class_index]
+        iteration_index = 0
+        while iteration_index < config.maximum_tail_shape_iterations:
+            gradient_value = (
+                effective_count * (np.log(tail_shape_value) + 1.0 - digamma(tail_shape_value))
+                + weighted_expected_log_precision
+                - weighted_expected_precision
+            )
+            hessian_value = effective_count * ((1.0 / tail_shape_value) - polygamma(1, tail_shape_value))
+            if abs(hessian_value) < 1e-8:
+                break
+            tail_shape_step = gradient_value / hessian_value
+            tail_shape_value = np.clip(
+                tail_shape_value - tail_shape_step,
+                config.minimum_tail_shape,
+                config.maximum_tail_shape,
+            )
+            if abs(tail_shape_step) < 1e-5:
+                break
+            iteration_index += 1
+        updated_class_tail_shape_vector[class_index] = tail_shape_value
+    return updated_class_tail_shape_vector
 
 
 def _update_scale_model(
     design_matrix: np.ndarray,
     feature_names: Sequence[str],
     coefficient_second_moment: np.ndarray,
-    expected_inverse_mixture: np.ndarray,
+    expected_local_precision: np.ndarray,
     current_coefficients: np.ndarray,
     config: ModelConfig,
 ) -> np.ndarray:
     penalty_diagonal = _scale_model_penalty(feature_names, config)
     updated_coefficients = current_coefficients.copy()
-    sufficient_statistic = np.maximum(coefficient_second_moment * expected_inverse_mixture, 1e-12)
+    sufficient_statistic = np.maximum(coefficient_second_moment * expected_local_precision, 1e-12)
 
     iteration_index = 0
     while iteration_index < config.maximum_scale_model_iterations:
@@ -475,12 +616,14 @@ def _surrogate_objective(
     trait_type: TraitType,
     targets: np.ndarray,
     linear_predictor: np.ndarray,
+    coefficient_variance: np.ndarray,
     coefficient_second_moment: np.ndarray,
     prior_scales: np.ndarray,
-    class_membership_matrix: np.ndarray,
-    class_weight_matrix: np.ndarray,
-    responsibilities: np.ndarray,
-    component_variances: np.ndarray,
+    local_tail_shape: np.ndarray,
+    expected_local_precision: np.ndarray,
+    expected_log_local_precision: np.ndarray,
+    posterior_precision_shape: np.ndarray,
+    posterior_precision_rate: np.ndarray,
     residual_variance: float,
 ) -> float:
     if trait_type == TraitType.BINARY:
@@ -500,20 +643,31 @@ def _surrogate_objective(
             )
         )
 
-    local_class_weights = _local_class_weights(class_membership_matrix, class_weight_matrix)
-    component_variance_matrix = prior_scales[:, None] * component_variances[None, :]
-    prior_term = float(
+    beta_prior_term = float(
         np.sum(
-            responsibilities
-            * (
-                np.log(np.maximum(local_class_weights, 1e-12))
-                - 0.5 * np.log(np.maximum(component_variance_matrix, 1e-12))
-                - 0.5 * coefficient_second_moment[:, None] / np.maximum(component_variance_matrix, 1e-12)
-            )
+            0.5 * expected_log_local_precision
+            - 0.5 * np.log(2.0 * np.pi * np.maximum(prior_scales, 1e-12))
+            - 0.5 * expected_local_precision * coefficient_second_moment / np.maximum(prior_scales, 1e-12)
         )
     )
-    entropy_term = float(-np.sum(responsibilities * np.log(np.maximum(responsibilities, 1e-12))))
-    return log_likelihood + prior_term + entropy_term
+    precision_prior_term = float(
+        np.sum(
+            local_tail_shape * np.log(np.maximum(local_tail_shape, 1e-12))
+            - gammaln(local_tail_shape)
+            + (local_tail_shape - 1.0) * expected_log_local_precision
+            - local_tail_shape * expected_local_precision
+        )
+    )
+    beta_entropy = float(0.5 * np.sum(np.log(2.0 * np.pi * np.e * np.maximum(coefficient_variance, 1e-12))))
+    precision_entropy = float(
+        np.sum(
+            posterior_precision_shape
+            - np.log(np.maximum(posterior_precision_rate, 1e-12))
+            + gammaln(posterior_precision_shape)
+            + (1.0 - posterior_precision_shape) * digamma(posterior_precision_shape)
+        )
+    )
+    return log_likelihood + beta_prior_term + precision_prior_term + beta_entropy + precision_entropy
 
 
 def _validation_metric(

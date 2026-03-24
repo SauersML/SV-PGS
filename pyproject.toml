@@ -8,8 +8,6 @@ version = "0.1.0"
 description = "Single-device joint empirical-Bayes GLM for polygenic scoring with structural variants"
 requires-python = ">=3.10"
 dependencies = [
-    "jax>=0.4.20,<0.5",
-    "jaxlib>=0.4.20,<0.5",
     "numpy>=1.24,<2",
     "scipy>=1.11",
     "scikit-learn>=1.3",

@@ -183,7 +183,6 @@ def test_large_scale_binary_end_to_end_roundtrip(tmp_path: Path):
         ModelConfig(
             trait_type=TraitType.BINARY,
             max_outer_iterations=12,
-            tile_size=32,
             minimum_structural_variant_carriers=2,
             ld_block_max_variants=32,
             ld_block_window_bp=250_000,
@@ -234,7 +233,6 @@ def test_large_scale_benchmark_and_quantitative_fit():
                 shared_config=ModelConfig(
                     trait_type=TraitType.BINARY,
                     max_outer_iterations=10,
-                    tile_size=32,
                     minimum_structural_variant_carriers=2,
                     ld_block_max_variants=32,
                 ld_block_window_bp=250_000,
@@ -242,10 +240,10 @@ def test_large_scale_benchmark_and_quantitative_fit():
         ),
     )
 
-    assert benchmark_metrics["joint_snv_sv_mixture"].auc is not None
-    assert benchmark_metrics["snv_only_mixture"].auc is not None
-    assert benchmark_metrics["joint_snv_sv_mixture"].log_loss is not None
-    assert benchmark_metrics["joint_snv_sv_mixture"].top_tail_enrichment > 0.9
+    assert benchmark_metrics["joint_snv_sv_continuous"].auc is not None
+    assert benchmark_metrics["snv_only_continuous"].auc is not None
+    assert benchmark_metrics["joint_snv_sv_continuous"].log_loss is not None
+    assert benchmark_metrics["joint_snv_sv_continuous"].top_tail_enrichment > 0.9
 
     quantitative_genotypes, quantitative_covariates, quantitative_targets, quantitative_records = _quantitative_dataset()
     quantitative_benchmark = run_benchmark_suite(
@@ -260,23 +258,21 @@ def test_large_scale_benchmark_and_quantitative_fit():
             shared_config=ModelConfig(
                 trait_type=TraitType.QUANTITATIVE,
                 max_outer_iterations=7,
-                tile_size=32,
                 minimum_structural_variant_carriers=2,
                 ld_block_max_variants=32,
                 ld_block_window_bp=250_000,
             )
         ),
     )
-    assert quantitative_benchmark["joint_snv_sv_mixture"].r2 is not None
-    assert quantitative_benchmark["snv_only_mixture"].r2 is not None
-    assert quantitative_benchmark["joint_snv_sv_mixture"].top_tail_enrichment > 5.0
-    assert quantitative_benchmark["joint_snv_sv_mixture"].r2 > 0.03
+    assert quantitative_benchmark["joint_snv_sv_continuous"].r2 is not None
+    assert quantitative_benchmark["snv_only_continuous"].r2 is not None
+    assert quantitative_benchmark["joint_snv_sv_continuous"].top_tail_enrichment > 5.0
+    assert quantitative_benchmark["joint_snv_sv_continuous"].r2 > 0.03
 
     quantitative_model = BayesianPGS(
         ModelConfig(
             trait_type=TraitType.QUANTITATIVE,
             max_outer_iterations=7,
-            tile_size=32,
             minimum_structural_variant_carriers=2,
             ld_block_max_variants=32,
             ld_block_window_bp=250_000,
@@ -335,7 +331,7 @@ def test_artifact_roundtrip_preserves_prior_membership_metadata(tmp_path: Path):
         ),
         sigma_e2=1.0,
         prior_scales=np.ones(1, dtype=np.float32),
-        class_mixture_weights={VariantClass.OTHER_COMPLEX_SV: np.array([0.5, 0.3, 0.1, 0.07, 0.03], dtype=np.float32)},
+        class_tail_shapes={VariantClass.OTHER_COMPLEX_SV: 3.0},
         scale_model_coefficients=np.zeros(3, dtype=np.float32),
         scale_model_feature_names=["intercept", "quality_linear", "copy_number_indicator"],
         objective_history=[-10.0, -9.0],

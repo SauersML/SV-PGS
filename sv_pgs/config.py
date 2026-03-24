@@ -38,17 +38,17 @@ DEFAULT_CLASS_LOG_PRIOR_SCALE = {
     VariantClass.OTHER_COMPLEX_SV: -3.3,
 }
 
-DEFAULT_CLASS_MIXTURE_WEIGHTS = {
-    VariantClass.SNV: np.array([0.68, 0.20, 0.08, 0.03, 0.01], dtype=np.float32),
-    VariantClass.SMALL_INDEL: np.array([0.64, 0.22, 0.09, 0.04, 0.01], dtype=np.float32),
-    VariantClass.DELETION_SHORT: np.array([0.56, 0.24, 0.12, 0.06, 0.02], dtype=np.float32),
-    VariantClass.DELETION_LONG: np.array([0.50, 0.25, 0.14, 0.08, 0.03], dtype=np.float32),
-    VariantClass.DUPLICATION_SHORT: np.array([0.54, 0.24, 0.12, 0.07, 0.03], dtype=np.float32),
-    VariantClass.DUPLICATION_LONG: np.array([0.48, 0.25, 0.15, 0.09, 0.03], dtype=np.float32),
-    VariantClass.INSERTION_MEI: np.array([0.53, 0.24, 0.13, 0.07, 0.03], dtype=np.float32),
-    VariantClass.INVERSION_BND_COMPLEX: np.array([0.45, 0.26, 0.16, 0.10, 0.03], dtype=np.float32),
-    VariantClass.STR_VNTR_REPEAT: np.array([0.50, 0.25, 0.14, 0.08, 0.03], dtype=np.float32),
-    VariantClass.OTHER_COMPLEX_SV: np.array([0.48, 0.25, 0.15, 0.09, 0.03], dtype=np.float32),
+DEFAULT_CLASS_TAIL_SHAPES = {
+    VariantClass.SNV: 6.0,
+    VariantClass.SMALL_INDEL: 5.0,
+    VariantClass.DELETION_SHORT: 3.8,
+    VariantClass.DELETION_LONG: 3.2,
+    VariantClass.DUPLICATION_SHORT: 3.6,
+    VariantClass.DUPLICATION_LONG: 3.0,
+    VariantClass.INSERTION_MEI: 3.4,
+    VariantClass.INVERSION_BND_COMPLEX: 2.8,
+    VariantClass.STR_VNTR_REPEAT: 3.1,
+    VariantClass.OTHER_COMPLEX_SV: 3.0,
 }
 
 STRUCTURAL_VARIANT_CLASSES = (
@@ -67,8 +67,9 @@ STRUCTURAL_VARIANT_CLASSES = (
 class ModelConfig:
     trait_type: TraitType = TraitType.BINARY
     max_outer_iterations: int = 30
+    max_pcg_iterations: int = 200
+    pcg_tolerance: float = 1e-5
     convergence_tolerance: float = 1e-4
-    tile_size: int = 256
     minimum_scale: float = 1e-6
     polya_gamma_minimum_weight: float = 1e-4
     sigma_error_floor: float = 1e-3
@@ -80,21 +81,24 @@ class ModelConfig:
     block_jitter_floor: float = 1e-6
     prior_scale_floor: float = 1e-6
     prior_scale_ceiling: float = 10.0
-    mixture_variance_multipliers: tuple[float, ...] = (1e-4, 1e-3, 1e-2, 1e-1, 1.0)
-    dirichlet_strength: float = 24.0
+    minimum_tail_shape: float = 0.25
+    maximum_tail_shape: float = 20.0
     scale_model_ridge_penalty: float = 1.0
     type_offset_penalty: float = 2.0
     maximum_scale_model_iterations: int = 8
+    maximum_tail_shape_iterations: int = 8
     update_hyperparameters: bool = True
-    prior_version: str = "metadata-conditioned-bayesr-mixture-v1"
+    prior_version: str = "metadata-conditioned-continuous-shrinkage-v1"
     transform_version: str = "numeric-impute-standardize-v2"
     random_seed: int = 0
 
     def __post_init__(self) -> None:
         if self.max_outer_iterations < 1:
             raise ValueError("max_outer_iterations must be positive.")
-        if self.tile_size < 1:
-            raise ValueError("tile_size must be positive.")
+        if self.max_pcg_iterations < 1:
+            raise ValueError("max_pcg_iterations must be positive.")
+        if self.pcg_tolerance <= 0.0:
+            raise ValueError("pcg_tolerance must be positive.")
         if self.minimum_scale <= 0.0:
             raise ValueError("minimum_scale must be positive.")
         if self.polya_gamma_minimum_weight <= 0.0:
@@ -107,28 +111,18 @@ class ModelConfig:
             raise ValueError("prior_scale_floor must be positive.")
         if self.prior_scale_ceiling <= self.prior_scale_floor:
             raise ValueError("prior_scale_ceiling must exceed prior_scale_floor.")
-        if len(self.mixture_variance_multipliers) < 2:
-            raise ValueError("mixture_variance_multipliers must have at least two components.")
-        if any(component <= 0.0 for component in self.mixture_variance_multipliers):
-            raise ValueError("mixture_variance_multipliers must be positive.")
-        if tuple(sorted(self.mixture_variance_multipliers)) != self.mixture_variance_multipliers:
-            raise ValueError("mixture_variance_multipliers must be sorted ascending.")
-        if self.dirichlet_strength <= 0.0:
-            raise ValueError("dirichlet_strength must be positive.")
+        if self.minimum_tail_shape <= 0.0:
+            raise ValueError("minimum_tail_shape must be positive.")
+        if self.maximum_tail_shape <= self.minimum_tail_shape:
+            raise ValueError("maximum_tail_shape must exceed minimum_tail_shape.")
+        if self.maximum_tail_shape_iterations < 1:
+            raise ValueError("maximum_tail_shape_iterations must be positive.")
 
     def class_log_prior_scales(self) -> Mapping[VariantClass, float]:
         return dict(DEFAULT_CLASS_LOG_PRIOR_SCALE)
 
-    def class_mixture_weights(self) -> Mapping[VariantClass, np.ndarray]:
-        normalized_weights: dict[VariantClass, np.ndarray] = {}
-        component_count = len(self.mixture_variance_multipliers)
-        for variant_class, mixture_weights in DEFAULT_CLASS_MIXTURE_WEIGHTS.items():
-            if mixture_weights.shape[0] != component_count:
-                raise ValueError(
-                    f"Class prior for {variant_class.value} does not match mixture component count."
-                )
-            normalized_weights[variant_class] = mixture_weights / np.sum(mixture_weights)
-        return normalized_weights
+    def class_tail_shapes(self) -> Mapping[VariantClass, float]:
+        return dict(DEFAULT_CLASS_TAIL_SHAPES)
 
     @staticmethod
     def structural_variant_classes() -> tuple[VariantClass, ...]:

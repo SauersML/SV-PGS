@@ -24,7 +24,7 @@ class ModelArtifact:
     tie_map: TieMap
     sigma_e2: float
     prior_scales: np.ndarray
-    class_mixture_weights: dict[VariantClass, np.ndarray]
+    class_tail_shapes: dict[VariantClass, float]
     scale_model_coefficients: np.ndarray
     scale_model_feature_names: list[str]
     objective_history: list[float]
@@ -60,8 +60,8 @@ def save_artifact(path: str | Path, artifact: ModelArtifact) -> None:
             for group in artifact.tie_map.reduced_to_group
         ],
         "sigma_e2": artifact.sigma_e2,
-        "class_mixture_weights": {
-            variant_class.value: values.tolist() for variant_class, values in artifact.class_mixture_weights.items()
+        "class_tail_shapes": {
+            variant_class.value: float(value) for variant_class, value in artifact.class_tail_shapes.items()
         },
         "scale_model_feature_names": artifact.scale_model_feature_names,
         "objective_history": artifact.objective_history,
@@ -99,9 +99,9 @@ def load_artifact(path: str | Path) -> ModelArtifact:
         tie_map=tie_map,
         sigma_e2=float(payload["sigma_e2"]),
         prior_scales=arrays["prior_scales"].astype(np.float32),
-        class_mixture_weights={
-            VariantClass(key): np.asarray(values, dtype=np.float32)
-            for key, values in payload["class_mixture_weights"].items()
+        class_tail_shapes={
+            VariantClass(key): float(value)
+            for key, value in payload["class_tail_shapes"].items()
         },
         scale_model_coefficients=arrays["scale_model_coefficients"].astype(np.float32),
         scale_model_feature_names=[str(feature_name) for feature_name in payload["scale_model_feature_names"]],
@@ -119,8 +119,6 @@ def _config_to_json(config: ModelConfig) -> dict[str, Any]:
 def _config_from_json(payload: dict[str, Any]) -> ModelConfig:
     restored_payload = dict(payload)
     restored_payload["trait_type"] = TraitType(payload["trait_type"])
-    if "mixture_variance_multipliers" in restored_payload:
-        restored_payload["mixture_variance_multipliers"] = tuple(restored_payload["mixture_variance_multipliers"])
     return ModelConfig(**restored_payload)
 
 

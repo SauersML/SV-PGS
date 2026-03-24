@@ -87,6 +87,64 @@ def compute_block_posterior(
     return block_mean.astype(np.float32), block_variance_diag.astype(np.float32)
 
 
+def apply_block_preconditioner(
+    block_decomposition: BlockDecomposition,
+    vector: np.ndarray,
+    prior_precision: np.ndarray,
+    sample_weight_sum: float,
+) -> np.ndarray:
+    """Apply M^{-1} v where M is the block-diagonal low-rank preconditioner.
+
+    For each block b with eigenvectors V_b, eigenvalues lam_b:
+      K_b = D_b^{-1/2} X_b^T W_0 X_b D_b^{-1/2} ≈ V_b Lambda_b V_b^T
+      M_b^{-1} = D_b^{-1/2} [I - V_b diag(lam/(1+lam)) V_b^T] D_b^{-1/2}
+    """
+    result = np.zeros_like(vector, dtype=np.float64)
+    for ld_block in block_decomposition.blocks:
+        block_indices = ld_block.variant_indices
+        block_vector = vector[block_indices].astype(np.float64)
+        block_prior_prec = np.maximum(prior_precision[block_indices], 1e-12)
+        inv_sqrt_prior = 1.0 / np.sqrt(block_prior_prec)
+
+        scaled_vector = inv_sqrt_prior * block_vector
+        eigenvalues_scaled = ld_block.eigenvalues * sample_weight_sum
+        correction_weights = eigenvalues_scaled / (1.0 + eigenvalues_scaled)
+        projected = ld_block.eigenvectors.T @ scaled_vector
+        corrected = scaled_vector - ld_block.eigenvectors @ (correction_weights * projected)
+        result[block_indices] = inv_sqrt_prior * corrected
+
+    return result.astype(np.float32)
+
+
+def estimate_variance_from_blocks(
+    block_decomposition: BlockDecomposition,
+    prior_precision: np.ndarray,
+    sample_weight_sum: float,
+    variant_count: int,
+) -> np.ndarray:
+    """Estimate posterior variance diag(Sigma) from block eigendecompositions.
+
+    Sigma_jj ≈ d_j^{-1} - d_j^{-2} * [X^T (X^T W X + D)^{-1} X]_jj
+    approximated via the block low-rank structure.
+    """
+    variance_diagonal = np.zeros(variant_count, dtype=np.float64)
+    for ld_block in block_decomposition.blocks:
+        block_indices = ld_block.variant_indices
+        block_prior_prec = np.maximum(prior_precision[block_indices], 1e-12)
+        inv_prior = 1.0 / block_prior_prec
+        inv_sqrt_prior = np.sqrt(inv_prior)
+
+        eigenvalues_scaled = ld_block.eigenvalues * sample_weight_sum
+        shrinkage_weights = eigenvalues_scaled / (1.0 + eigenvalues_scaled)
+        scaled_eigvecs = ld_block.eigenvectors * inv_sqrt_prior[:, None]
+        correction_diag = np.sum(
+            scaled_eigvecs * (scaled_eigvecs * shrinkage_weights[None, :]), axis=1,
+        )
+        variance_diagonal[block_indices] = inv_prior - correction_diag
+
+    return np.maximum(variance_diagonal, 1e-12).astype(np.float32)
+
+
 def _group_by_chromosome(records: Sequence[VariantRecord]) -> list[np.ndarray]:
     chromosome_to_indices: dict[str, list[int]] = {}
     for variant_index, record in enumerate(records):
