@@ -24,21 +24,20 @@ class GenotypeOperator:
 
     @classmethod
     def from_numpy(cls, genotypes: np.ndarray, tile_size: int = 256) -> GenotypeOperator:
-        variant_major = np.asarray(np.transpose(genotypes), dtype=np.float32)
-        variant_count, sample_count = variant_major.shape
+        sample_count, variant_count = genotypes.shape
         tile_count = int(np.ceil(variant_count / tile_size))
-        padded_count = tile_count * tile_size
-
-        padded = np.zeros((padded_count, sample_count), dtype=np.float32)
-        padded[:variant_count] = variant_major
-
+        tiles = np.zeros((tile_count, tile_size, sample_count), dtype=np.float32)
         mask = np.zeros((tile_count, tile_size), dtype=np.float32)
-        mask.reshape(-1)[:variant_count] = 1.0
+        for tile_index in range(tile_count):
+            start = tile_index * tile_size
+            stop = min(start + tile_size, variant_count)
+            chunk = np.asarray(genotypes[:, start:stop], dtype=np.float32).T
+            chunk_size = stop - start
+            tiles[tile_index, :chunk_size, :] = chunk
+            mask[tile_index, :chunk_size] = 1.0
 
         return cls(
-            genotype_tiles=jnp.asarray(
-                padded.reshape(tile_count, tile_size, sample_count),
-            ),
+            genotype_tiles=jnp.asarray(tiles),
             tile_mask=jnp.asarray(mask),
             variant_count=variant_count,
             tile_size=tile_size,

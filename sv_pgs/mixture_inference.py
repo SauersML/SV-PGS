@@ -8,7 +8,7 @@ from typing import Sequence
 import jax
 import jax.numpy as jnp
 import numpy as np
-from jax.scipy.special import digamma, gammaln
+from jax.scipy.special import digamma, gammaln, polygamma
 
 from sv_pgs.blocks import (
     BlockDecomposition,
@@ -185,7 +185,7 @@ def fit_variational_em(
 
         local_scale, auxiliary_delta, expected_inverse_local_scale = _update_local_scales(
             coefficient_second_moment=coefficient_second_moment,
-            prior_variances=current_prior_variances,
+            baseline_variances=baseline_prior_variances,
             local_shape_a=local_shape_a,
             local_shape_b=local_shape_b,
             auxiliary_delta=auxiliary_delta,
@@ -271,10 +271,15 @@ def fit_variational_em(
             )
 
         outer_iteration += 1
-        if len(objective_history) >= 2:
+        converged = False
+        if len(validation_history) >= 2:
+            validation_delta = abs(validation_history[-1] - validation_history[-2])
+            converged = validation_delta < config.convergence_tolerance
+        elif len(objective_history) >= 2:
             objective_delta = abs(objective_history[-1] - objective_history[-2])
-            if objective_delta < config.convergence_tolerance:
-                break
+            converged = objective_delta < config.convergence_tolerance
+        if converged:
+            break
 
     return VariationalFitResult(
         alpha=np.asarray(covariate_coefficients, dtype=np.float32),
@@ -660,14 +665,14 @@ def _estimate_block_variance(
 
 def _update_local_scales(
     coefficient_second_moment: np.ndarray,
-    prior_variances: np.ndarray,
+    baseline_variances: np.ndarray,
     local_shape_a: np.ndarray,
     local_shape_b: np.ndarray,
     auxiliary_delta: np.ndarray,
     config: ModelConfig,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     normalized_second_moment = coefficient_second_moment / np.maximum(
-        prior_variances,
+        baseline_variances,
         1e-12,
     )
     shape_offset = local_shape_a - 1.5
@@ -866,7 +871,7 @@ def _scale_model_penalty(
         config.scale_model_ridge_penalty,
         dtype=np.float64,
     )
-    penalty_values[0] = 1e-6
+    penalty_values[0] = 100.0
     for feature_index, feature_name in enumerate(feature_names):
         if feature_name.startswith("type_offset::"):
             penalty_values[feature_index] = config.type_offset_penalty
@@ -962,19 +967,7 @@ def _refine_variance_with_probes(
 
 
 def _trigamma(value: float) -> jnp.ndarray:
-    value_array = jnp.asarray(value, dtype=jnp.float32)
-    reciprocal = 1.0 / value_array
-    reciprocal_square = reciprocal * reciprocal
-    reciprocal_cubic = reciprocal_square * reciprocal
-    reciprocal_quintic = reciprocal_cubic * reciprocal_square
-    reciprocal_septic = reciprocal_quintic * reciprocal_square
-    return (
-        reciprocal
-        + 0.5 * reciprocal_square
-        + (1.0 / 6.0) * reciprocal_cubic
-        - (1.0 / 30.0) * reciprocal_quintic
-        + (1.0 / 42.0) * reciprocal_septic
-    )
+    return polygamma(1, jnp.asarray(value, dtype=jnp.float32))
 
 
 def _validation_metric(

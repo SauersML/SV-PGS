@@ -71,15 +71,47 @@ def select_active_variant_indices(
     for variant_index, variant_record in enumerate(variant_records):
         if variant_record.variant_class not in structural_variant_classes:
             continue
-        carrier_count = _carrier_count(genotype_matrix[:, variant_index])
-        if carrier_count < config.minimum_structural_variant_carriers:
+        support_count = _structural_variant_support(
+            raw_variant_values=genotype_matrix[:, variant_index],
+            variant_record=variant_record,
+        )
+        if support_count < config.minimum_structural_variant_carriers:
             active_flags[variant_index] = False
     return np.where(active_flags)[0].astype(np.int32)
 
 
-def _carrier_count(variant_values: np.ndarray) -> int:
-    non_missing_values = variant_values[~np.isnan(variant_values)]
-    return int(np.count_nonzero(np.abs(non_missing_values) > 0.0))
+def _structural_variant_support(
+    raw_variant_values: np.ndarray,
+    variant_record: VariantRecord,
+) -> int:
+    if variant_record.training_support is not None:
+        return int(variant_record.training_support)
+    return _infer_support_count_from_raw_genotypes(raw_variant_values, variant_record)
+
+
+def _infer_support_count_from_raw_genotypes(
+    raw_variant_values: np.ndarray,
+    variant_record: VariantRecord,
+) -> int:
+    non_missing_values = np.asarray(raw_variant_values[~np.isnan(raw_variant_values)], dtype=np.float64)
+    if non_missing_values.size == 0:
+        return 0
+    rounded_values = np.rint(non_missing_values)
+    if not np.allclose(non_missing_values, rounded_values, atol=1e-6):
+        raise ValueError(
+            "Structural variant support requires explicit training_support metadata when "
+            "genotypes are transformed numeric values for "
+            + variant_record.variant_id
+            + "."
+        )
+    if np.any(rounded_values < 0.0):
+        raise ValueError(
+            "Structural variant support requires explicit training_support metadata when "
+            "raw genotypes are not non-negative counts for "
+            + variant_record.variant_id
+            + "."
+        )
+    return int(np.count_nonzero(rounded_values > 0.0))
 
 
 def build_tie_map(
@@ -92,17 +124,17 @@ def build_tie_map(
     if genotypes.shape[1] != len(records):
         raise ValueError("genotypes and records length mismatch.")
 
-    exact_signature_to_group: dict[tuple[int, ...], int] = {}
-    sign_flipped_signature_to_group: dict[tuple[int, ...], int] = {}
+    exact_signature_to_group: dict[bytes, int] = {}
+    sign_flipped_signature_to_group: dict[bytes, int] = {}
     tie_groups: list[TieGroup] = []
     kept_variant_indices: list[int] = []
     original_to_reduced = np.full(genotypes.shape[1], -1, dtype=np.int32)
 
-    signature_scale = 10**config.duplicate_signature_decimals
-    rounded_genotypes = np.rint(genotypes * signature_scale).astype(np.int64, copy=False)
+    float32_genotypes = np.ascontiguousarray(genotypes.astype(np.float32))
     for variant_index in range(genotypes.shape[1]):
-        genotype_signature = tuple(rounded_genotypes[:, variant_index].tolist())
-        sign_flipped_signature = tuple((-rounded_genotypes[:, variant_index]).tolist())
+        standardized_column = np.where(float32_genotypes[:, variant_index] == 0.0, 0.0, float32_genotypes[:, variant_index])
+        genotype_signature = np.ascontiguousarray(standardized_column).tobytes()
+        sign_flipped_signature = np.ascontiguousarray(-standardized_column).tobytes()
 
         if genotype_signature in exact_signature_to_group:
             reduced_index = exact_signature_to_group[genotype_signature]

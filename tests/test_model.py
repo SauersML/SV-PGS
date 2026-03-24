@@ -100,7 +100,7 @@ def test_benchmark_suite_runs_from_shared_trainer():
     )
 
     assert set(benchmark_metrics) == {
-        "current_snv_score",
+        "snv_baseline_no_hyperlearning",
         "snv_only_continuous",
         "joint_snv_sv_continuous",
     }

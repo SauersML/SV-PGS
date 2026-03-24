@@ -142,6 +142,7 @@ def _record_to_json(record: VariantRecord) -> dict[str, Any]:
         "length": record.length,
         "allele_frequency": record.allele_frequency,
         "quality": record.quality,
+        "training_support": record.training_support,
         "is_repeat": record.is_repeat,
         "is_copy_number": record.is_copy_number,
         "prior_class_members": [member.value for member in record.prior_class_members],
@@ -158,6 +159,11 @@ def _record_from_json(payload: dict[str, Any]) -> VariantRecord:
         length=float(payload["length"]),
         allele_frequency=float(payload["allele_frequency"]),
         quality=float(payload["quality"]),
+        training_support=(
+            None
+            if payload.get("training_support") is None
+            else int(payload["training_support"])
+        ),
         is_repeat=bool(payload["is_repeat"]),
         is_copy_number=bool(payload["is_copy_number"]),
         prior_class_members=tuple(VariantClass(member) for member in payload.get("prior_class_members", [])),

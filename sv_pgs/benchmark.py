@@ -53,7 +53,7 @@ def run_benchmark_suite(
 
     model_specs: list[tuple[str, BayesianPGS, np.ndarray]] = [
         (
-            "current_snv_score",
+            "snv_baseline_no_hyperlearning",
             _fit_model(current_snv_config, train_genotypes[:, snv_mask], train_covariates, train_targets, snv_records),
             test_genotypes[:, snv_mask],
         ),

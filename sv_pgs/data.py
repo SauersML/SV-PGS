@@ -17,6 +17,7 @@ class VariantRecord:
     length: float = 1.0
     allele_frequency: float = 0.01
     quality: float = 1.0
+    training_support: int | None = None
     is_repeat: bool = False
     is_copy_number: bool = False
     prior_class_members: tuple[VariantClass, ...] = ()
@@ -87,6 +88,11 @@ def normalize_variant_records(records: Sequence[VariantRecord | dict[str, Any]])
                 length=float(record.get("length", 1.0)),
                 allele_frequency=float(record.get("allele_frequency", 0.01)),
                 quality=float(record.get("quality", 1.0)),
+                training_support=(
+                    None
+                    if record.get("training_support") is None
+                    else int(record["training_support"])
+                ),
                 is_repeat=bool(record.get("is_repeat", False)),
                 is_copy_number=bool(record.get("is_copy_number", False)),
                 prior_class_members=tuple(

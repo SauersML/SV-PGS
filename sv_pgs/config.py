@@ -85,8 +85,7 @@ class ModelConfig:
     minimum_scale: float = 1e-6
     polya_gamma_minimum_weight: float = 1e-4
     sigma_error_floor: float = 1e-3
-    minimum_structural_variant_carriers: int = 2
-    duplicate_signature_decimals: int = 6
+    minimum_structural_variant_carriers: int = 5
     ld_block_max_variants: int = 512
     ld_block_window_bp: int = 3_000_000
     discarded_spectrum_tolerance: float = 0.005
@@ -135,6 +134,8 @@ class ModelConfig:
             raise ValueError("minimum_scale must be positive.")
         if self.polya_gamma_minimum_weight <= 0.0:
             raise ValueError("polya_gamma_minimum_weight must be positive.")
+        if self.minimum_structural_variant_carriers < 1:
+            raise ValueError("minimum_structural_variant_carriers must be positive.")
         if self.discarded_spectrum_tolerance <= 0.0:
             raise ValueError("discarded_spectrum_tolerance must be positive.")
         if self.discarded_spectrum_tolerance >= 1.0:

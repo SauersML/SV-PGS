@@ -7,12 +7,12 @@ from typing import Sequence
 import jax
 import jax.numpy as jnp
 import numpy as np
+from jax import lax
 
 from sv_pgs.config import ModelConfig
 from sv_pgs.data import VariantRecord
 
 
-@jax.tree_util.register_pytree_node_class
 @dataclass(frozen=True, slots=True)
 class LDBlock:
     variant_indices: jnp.ndarray
@@ -21,40 +21,40 @@ class LDBlock:
     condition_number: float
     jitter: float
 
-    def tree_flatten(self):
-        children = (self.variant_indices, self.eigenvalues, self.eigenvectors)
-        auxiliary_data = (self.condition_number, self.jitter)
-        return children, auxiliary_data
-
-    @classmethod
-    def tree_unflatten(cls, auxiliary_data, children):
-        condition_number, jitter = auxiliary_data
-        return cls(
-            variant_indices=children[0],
-            eigenvalues=children[1],
-            eigenvectors=children[2],
-            condition_number=condition_number,
-            jitter=jitter,
-        )
-
 
 @jax.tree_util.register_pytree_node_class
 @dataclass(frozen=True, slots=True)
 class BlockDecomposition:
     blocks: tuple[LDBlock, ...]
     variant_to_block: jnp.ndarray
+    block_variant_indices: jnp.ndarray
+    block_variant_mask: jnp.ndarray
+    block_eigenvalues: jnp.ndarray
+    block_eigenvectors: jnp.ndarray
+    block_jitter: jnp.ndarray
 
     def tree_flatten(self):
-        children = (self.variant_to_block,) + self.blocks
-        auxiliary_data = len(self.blocks)
+        children = (
+            self.variant_to_block,
+            self.block_variant_indices,
+            self.block_variant_mask,
+            self.block_eigenvalues,
+            self.block_eigenvectors,
+            self.block_jitter,
+        )
+        auxiliary_data = self.blocks
         return children, auxiliary_data
 
     @classmethod
     def tree_unflatten(cls, auxiliary_data, children):
-        block_count = auxiliary_data
         return cls(
-            blocks=tuple(children[1 : block_count + 1]),
+            blocks=auxiliary_data,
             variant_to_block=children[0],
+            block_variant_indices=children[1],
+            block_variant_mask=children[2],
+            block_eigenvalues=children[3],
+            block_eigenvectors=children[4],
+            block_jitter=children[5],
         )
 
 
@@ -87,9 +87,22 @@ def build_block_decomposition(
             variant_to_block[partition_indices] = len(all_blocks)
             all_blocks.append(ld_block)
 
+    (
+        block_variant_indices,
+        block_variant_mask,
+        block_eigenvalues,
+        block_eigenvectors,
+        block_jitter,
+    ) = _pack_block_arrays(tuple(all_blocks))
+
     return BlockDecomposition(
         blocks=tuple(all_blocks),
         variant_to_block=jnp.asarray(variant_to_block, dtype=jnp.int32),
+        block_variant_indices=block_variant_indices,
+        block_variant_mask=block_variant_mask,
+        block_eigenvalues=block_eigenvalues,
+        block_eigenvectors=block_eigenvectors,
+        block_jitter=block_jitter,
     )
 
 
@@ -162,23 +175,42 @@ def apply_block_preconditioner(
     block_decomposition: BlockDecomposition,
     vector: jnp.ndarray,
     prior_precision: jnp.ndarray,
-    sample_weight_sum: float,
+    sample_weight_sum: jnp.ndarray,
 ) -> jnp.ndarray:
     """Apply the low-rank block preconditioner M^{-1} v."""
-    result = jnp.zeros_like(vector, dtype=jnp.float32)
-    for ld_block in block_decomposition.blocks:
-        block_indices = ld_block.variant_indices
-        block_vector = vector[block_indices]
+
+    def body(result: jnp.ndarray, scan_inputs: tuple[jnp.ndarray, ...]) -> tuple[jnp.ndarray, None]:
+        block_indices, block_mask, block_eigenvalues, block_eigenvectors, _block_jitter = scan_inputs
+        del _block_jitter
+        block_mask = block_mask.astype(jnp.float32)
+        block_vector = vector[block_indices] * block_mask
         block_prior_precision = jnp.maximum(prior_precision[block_indices], 1e-12)
         inverse_sqrt_prior = jnp.reciprocal(jnp.sqrt(block_prior_precision))
-        scaled_vector = inverse_sqrt_prior * block_vector
+        scaled_vector = inverse_sqrt_prior * block_vector * block_mask
 
-        scaled_eigenvalues = ld_block.eigenvalues * jnp.float32(sample_weight_sum)
-        correction_weights = scaled_eigenvalues / (1.0 + scaled_eigenvalues)
-        projected = ld_block.eigenvectors.T @ scaled_vector
-        corrected = scaled_vector - ld_block.eigenvectors @ (correction_weights * projected)
-        result = result.at[block_indices].set(inverse_sqrt_prior * corrected)
+        scaled_eigenvalues = block_eigenvalues * sample_weight_sum
+        correction_weights = jnp.where(
+            block_eigenvalues > 0.0,
+            scaled_eigenvalues / (1.0 + scaled_eigenvalues),
+            0.0,
+        )
+        projected = block_eigenvectors.T @ scaled_vector
+        corrected = scaled_vector - block_eigenvectors @ (correction_weights * projected)
+        block_result = inverse_sqrt_prior * corrected * block_mask
+        return result.at[block_indices].add(block_result), None
 
+    initial = jnp.zeros_like(vector, dtype=jnp.float32)
+    result, _ = lax.scan(
+        body,
+        initial,
+        (
+            block_decomposition.block_variant_indices,
+            block_decomposition.block_variant_mask,
+            block_decomposition.block_eigenvalues,
+            block_decomposition.block_eigenvectors,
+            block_decomposition.block_jitter,
+        ),
+    )
     return result
 
 
@@ -186,27 +218,44 @@ def apply_block_preconditioner(
 def estimate_variance_from_blocks(
     block_decomposition: BlockDecomposition,
     prior_precision: jnp.ndarray,
-    sample_weight_sum: float,
+    sample_weight_sum: jnp.ndarray,
 ) -> jnp.ndarray:
     """Estimate diag((X^T W X + D)^{-1}) from the block low-rank inverse."""
-    variance_diagonal = jnp.zeros(prior_precision.shape[0], dtype=jnp.float32)
-    for ld_block in block_decomposition.blocks:
-        block_indices = ld_block.variant_indices
+
+    def body(variance_diagonal: jnp.ndarray, scan_inputs: tuple[jnp.ndarray, ...]) -> tuple[jnp.ndarray, None]:
+        block_indices, block_mask, block_eigenvalues, block_eigenvectors, _block_jitter = scan_inputs
+        del _block_jitter
+        block_mask = block_mask.astype(jnp.float32)
         block_prior_precision = jnp.maximum(prior_precision[block_indices], 1e-12)
         inverse_prior_precision = jnp.reciprocal(block_prior_precision)
         inverse_sqrt_prior = jnp.sqrt(inverse_prior_precision)
 
-        scaled_eigenvalues = ld_block.eigenvalues * jnp.float32(sample_weight_sum)
-        shrinkage_weights = scaled_eigenvalues / (1.0 + scaled_eigenvalues)
-        scaled_eigenvectors = ld_block.eigenvectors * inverse_sqrt_prior[:, None]
+        scaled_eigenvalues = block_eigenvalues * sample_weight_sum
+        shrinkage_weights = jnp.where(
+            block_eigenvalues > 0.0,
+            scaled_eigenvalues / (1.0 + scaled_eigenvalues),
+            0.0,
+        )
+        scaled_eigenvectors = block_eigenvectors * inverse_sqrt_prior[:, None]
         correction_diagonal = jnp.sum(
             scaled_eigenvectors * (scaled_eigenvectors * shrinkage_weights[None, :]),
             axis=1,
         )
-        variance_diagonal = variance_diagonal.at[block_indices].set(
-            inverse_prior_precision - correction_diagonal
-        )
+        block_variance = (inverse_prior_precision - correction_diagonal) * block_mask
+        return variance_diagonal.at[block_indices].add(block_variance), None
 
+    initial = jnp.zeros(prior_precision.shape[0], dtype=jnp.float32)
+    variance_diagonal, _ = lax.scan(
+        body,
+        initial,
+        (
+            block_decomposition.block_variant_indices,
+            block_decomposition.block_variant_mask,
+            block_decomposition.block_eigenvalues,
+            block_decomposition.block_eigenvectors,
+            block_decomposition.block_jitter,
+        ),
+    )
     return jnp.maximum(variance_diagonal, 1e-12)
 
 
@@ -294,4 +343,41 @@ def _eigendecompose_block(
         eigenvectors=retained_eigenvectors.astype(jnp.float32),
         condition_number=condition_number,
         jitter=block_jitter,
+    )
+
+
+def _pack_block_arrays(
+    blocks: tuple[LDBlock, ...],
+) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray]:
+    if not blocks:
+        empty_int = jnp.zeros((0, 0), dtype=jnp.int32)
+        empty_float = jnp.zeros((0, 0), dtype=jnp.float32)
+        empty_eigenvectors = jnp.zeros((0, 0, 0), dtype=jnp.float32)
+        return empty_int, empty_float, empty_float, empty_eigenvectors, jnp.zeros(0, dtype=jnp.float32)
+
+    max_block_size = max(int(block.variant_indices.shape[0]) for block in blocks)
+    max_rank = max(int(block.eigenvalues.shape[0]) for block in blocks)
+    block_count = len(blocks)
+
+    block_variant_indices = np.zeros((block_count, max_block_size), dtype=np.int32)
+    block_variant_mask = np.zeros((block_count, max_block_size), dtype=np.float32)
+    block_eigenvalues = np.zeros((block_count, max_rank), dtype=np.float32)
+    block_eigenvectors = np.zeros((block_count, max_block_size, max_rank), dtype=np.float32)
+    block_jitter = np.zeros(block_count, dtype=np.float32)
+
+    for block_index, block in enumerate(blocks):
+        block_size = int(block.variant_indices.shape[0])
+        rank = int(block.eigenvalues.shape[0])
+        block_variant_indices[block_index, :block_size] = np.asarray(block.variant_indices, dtype=np.int32)
+        block_variant_mask[block_index, :block_size] = 1.0
+        block_eigenvalues[block_index, :rank] = np.asarray(block.eigenvalues, dtype=np.float32)
+        block_eigenvectors[block_index, :block_size, :rank] = np.asarray(block.eigenvectors, dtype=np.float32)
+        block_jitter[block_index] = np.float32(block.jitter)
+
+    return (
+        jnp.asarray(block_variant_indices, dtype=jnp.int32),
+        jnp.asarray(block_variant_mask, dtype=jnp.float32),
+        jnp.asarray(block_eigenvalues, dtype=jnp.float32),
+        jnp.asarray(block_eigenvectors, dtype=jnp.float32),
+        jnp.asarray(block_jitter, dtype=jnp.float32),
     )
