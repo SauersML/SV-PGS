@@ -69,6 +69,7 @@ class ModelConfig:
     max_outer_iterations: int = 30
     max_pcg_iterations: int = 200
     pcg_tolerance: float = 1e-5
+    operator_tile_size: int = 256
     convergence_tolerance: float = 1e-4
     minimum_scale: float = 1e-6
     polya_gamma_minimum_weight: float = 1e-4
@@ -99,6 +100,8 @@ class ModelConfig:
             raise ValueError("max_pcg_iterations must be positive.")
         if self.pcg_tolerance <= 0.0:
             raise ValueError("pcg_tolerance must be positive.")
+        if self.operator_tile_size < 1:
+            raise ValueError("operator_tile_size must be positive.")
         if self.minimum_scale <= 0.0:
             raise ValueError("minimum_scale must be positive.")
         if self.polya_gamma_minimum_weight <= 0.0:

@@ -9,3 +9,4 @@
 - Conditional imports are never allowed.
 - Only use UV, never pip.
 - No multi-GPU support.
+- Fully and unconditionally use JAX.

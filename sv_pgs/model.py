@@ -5,7 +5,6 @@ from pathlib import Path
 from typing import Sequence
 
 import numpy as np
-from scipy.special import expit
 
 from sv_pgs.artifact import ModelArtifact, load_artifact, save_artifact
 from sv_pgs.config import ModelConfig, TraitType
@@ -101,13 +100,13 @@ class BayesianPGS:
         if self.config.trait_type != TraitType.BINARY:
             raise ValueError("predict_proba is only available for binary traits.")
         linear_predictor = self.decision_function(genotypes, covariates)
-        positive_probability = expit(linear_predictor)
+        positive_probability = _sigmoid(linear_predictor)
         return np.column_stack([1.0 - positive_probability, positive_probability])
 
     def predict(self, genotypes: np.ndarray, covariates: np.ndarray) -> np.ndarray:
         linear_predictor = self.decision_function(genotypes, covariates)
         if self.config.trait_type == TraitType.BINARY:
-            return (expit(linear_predictor) >= 0.5).astype(np.int32)
+            return (_sigmoid(linear_predictor) >= 0.5).astype(np.int32)
         return linear_predictor
 
     def export(self, path: str | Path) -> None:
@@ -218,3 +217,14 @@ def _project_tie_map_to_original_space(
         original_to_reduced=original_to_reduced,
         reduced_to_group=original_groups,
     )
+
+
+def _sigmoid(linear_predictor: np.ndarray) -> np.ndarray:
+    clipped_predictor = np.asarray(np.clip(linear_predictor, -80.0, 80.0), dtype=np.float64)
+    positive_mask = clipped_predictor >= 0.0
+    negative_mask = ~positive_mask
+    output = np.empty_like(clipped_predictor, dtype=np.float64)
+    output[positive_mask] = 1.0 / (1.0 + np.exp(-clipped_predictor[positive_mask]))
+    exp_values = np.exp(clipped_predictor[negative_mask])
+    output[negative_mask] = exp_values / (1.0 + exp_values)
+    return output.astype(np.float64)

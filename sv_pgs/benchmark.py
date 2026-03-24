@@ -4,9 +4,8 @@ from dataclasses import dataclass, fields
 from typing import Sequence
 
 import numpy as np
-from scipy.optimize import minimize
-from scipy.special import expit
-from scipy.stats import norm
+from jax.scipy.special import ndtri
+from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import average_precision_score, log_loss, r2_score, roc_auc_score
 
 from sv_pgs.config import BenchmarkConfig, ModelConfig, TraitType
@@ -110,7 +109,7 @@ def _compute_metrics(
     scores = model.decision_function(genotypes, covariates)
     trait_type = model.config.trait_type
     if trait_type == TraitType.BINARY:
-        probabilities = expit(scores)
+        probabilities = _sigmoid(scores)
         auc = float(roc_auc_score(targets, probabilities))
         pr_auc = float(average_precision_score(targets, probabilities))
         loss = float(log_loss(targets, probabilities))
@@ -145,26 +144,24 @@ def _calibration(probabilities: np.ndarray, targets: np.ndarray) -> tuple[float,
     logits = np.log(
         np.clip(probabilities, 1e-6, 1.0 - 1e-6) / np.clip(1.0 - probabilities, 1e-6, 1.0 - 1e-6)
     )
-
-    def objective(parameters: np.ndarray) -> float:
-        intercept, slope = parameters
-        calibrated_probabilities = expit(intercept + slope * logits)
-        return -float(
-            np.mean(
-                targets * np.log(calibrated_probabilities + 1e-8)
-                + (1.0 - targets) * np.log(1.0 - calibrated_probabilities + 1e-8)
-            )
-        )
-
-    optimization = minimize(objective, x0=np.array([0.0, 1.0], dtype=np.float64), method="BFGS")
-    return float(optimization.x[0]), float(optimization.x[1])
+    calibration_model = LogisticRegression(
+        C=1e6,
+        solver="lbfgs",
+        fit_intercept=True,
+        max_iter=200,
+    )
+    calibration_model.fit(logits.reshape(-1, 1), targets)
+    return (
+        float(calibration_model.intercept_[0]),
+        float(calibration_model.coef_[0, 0]),
+    )
 
 
 def _liability_r2(probabilities: np.ndarray, targets: np.ndarray, prevalence: float) -> float:
     observed_r2 = max(0.0, float(r2_score(targets, probabilities)))
     sample_prevalence = float(np.mean(targets))
-    threshold = norm.ppf(1.0 - prevalence)
-    density = norm.pdf(threshold)
+    threshold = float(ndtri(1.0 - prevalence))
+    density = float(np.exp(-0.5 * threshold * threshold) / np.sqrt(2.0 * np.pi))
     scale_value = ((prevalence * (1.0 - prevalence)) / density) ** 2 / max(
         sample_prevalence * (1.0 - sample_prevalence),
         1e-8,
@@ -179,3 +176,14 @@ def _top_tail_enrichment(scores: np.ndarray, targets: np.ndarray, fraction: floa
     if abs(baseline) < 1e-8:
         return 0.0
     return float(np.mean(targets[top_indices]) / baseline)
+
+
+def _sigmoid(values: np.ndarray) -> np.ndarray:
+    clipped_values = np.asarray(np.clip(values, -80.0, 80.0), dtype=np.float64)
+    positive_mask = clipped_values >= 0.0
+    negative_mask = ~positive_mask
+    output = np.empty_like(clipped_values, dtype=np.float64)
+    output[positive_mask] = 1.0 / (1.0 + np.exp(-clipped_values[positive_mask]))
+    exp_values = np.exp(clipped_values[negative_mask])
+    output[negative_mask] = exp_values / (1.0 + exp_values)
+    return output.astype(np.float64)
