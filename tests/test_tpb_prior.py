@@ -19,6 +19,11 @@ from sv_pgs.config import (
     TraitType,
     VariantClass,
 )
+from sv_pgs.data import VariantRecord
+from sv_pgs.mixture_inference import (
+    _build_prior_design,
+    _metadata_baseline_scales_from_coefficients,
+)
 
 
 class TestClassSpecificTPBShapes:
@@ -141,9 +146,22 @@ class TestQualityCovariate:
         assert record.quality == 1.0
 
     def test_low_quality_sv_gets_different_prior_scale(self):
-        high_quality_scale = DEFAULT_CLASS_LOG_BASELINE_SCALE[VariantClass.DELETION_SHORT]
-        low_quality_scale = DEFAULT_CLASS_LOG_BASELINE_SCALE[VariantClass.DELETION_SHORT]
-        assert high_quality_scale == low_quality_scale
+        records = [
+            VariantRecord("high_q", VariantClass.DELETION_SHORT, "chr1", 100, quality=0.95),
+            VariantRecord("low_q", VariantClass.DELETION_SHORT, "chr1", 101, quality=0.50),
+        ]
+        prior_design = _build_prior_design(records)
+        coefficients = np.zeros(len(prior_design.feature_names), dtype=np.float64)
+        quality_feature_index = prior_design.feature_names.index("quality_linear")
+        coefficients[quality_feature_index] = -0.75
+
+        baseline_scales = _metadata_baseline_scales_from_coefficients(
+            coefficients,
+            prior_design.design_matrix,
+            ModelConfig(),
+        )
+
+        assert baseline_scales[0] != baseline_scales[1]
 
 
 class TestConfigValidation:

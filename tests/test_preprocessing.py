@@ -1,8 +1,9 @@
 import numpy as np
+import pytest
 
 from sv_pgs.config import ModelConfig, VariantClass
 from sv_pgs.data import VariantRecord
-from sv_pgs.preprocessing import build_tie_map, collapse_tie_groups, fit_preprocessor
+from sv_pgs.preprocessing import build_tie_map, collapse_tie_groups, fit_preprocessor, select_active_variant_indices
 
 
 def test_fold_preprocessing_and_exact_ties_ignore_variant_class():
@@ -62,3 +63,41 @@ def test_mixed_class_tie_group_uses_symmetric_latent_class():
         VariantClass.SNV,
     )
     np.testing.assert_allclose(collapsed_records[0].prior_class_membership, [0.5, 0.5])
+
+
+def test_exact_ties_require_exact_float32_equality():
+    base = np.array([0.0, 1.0, 2.0], dtype=np.float32)
+    almost_equal = base.copy()
+    almost_equal[1] = np.nextafter(np.float32(1.0), np.float32(2.0))
+    genotype_matrix = np.column_stack([base, almost_equal]).astype(np.float32)
+    variant_records = [
+        VariantRecord("variant_0", VariantClass.SNV, "1", 100),
+        VariantRecord("variant_1", VariantClass.SNV, "1", 101),
+    ]
+
+    tie_map = build_tie_map(genotype_matrix, variant_records, ModelConfig())
+
+    assert tie_map.kept_indices.tolist() == [0, 1]
+    assert tie_map.original_to_reduced.tolist() == [0, 1]
+
+
+def test_structural_variant_filter_requires_explicit_support_for_transformed_values():
+    genotype_matrix = np.array(
+        [
+            [0.1, 0.0],
+            [0.2, 1.0],
+            [0.3, 0.0],
+        ],
+        dtype=np.float32,
+    )
+    variant_records = [
+        VariantRecord("sv_0", VariantClass.DELETION_SHORT, "1", 100),
+        VariantRecord("snp_1", VariantClass.SNV, "1", 101),
+    ]
+
+    with pytest.raises(ValueError, match="training_support"):
+        select_active_variant_indices(
+            genotype_matrix=genotype_matrix,
+            variant_records=variant_records,
+            config=ModelConfig(minimum_structural_variant_carriers=2),
+        )

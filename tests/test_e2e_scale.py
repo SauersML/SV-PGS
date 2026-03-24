@@ -37,6 +37,7 @@ def _variant_metadata(variant_index: int, block_index: int) -> VariantRecord:
         length=length,
         allele_frequency=allele_frequency,
         quality=min(quality, 0.98),
+        training_support=64 if variant_class != VariantClass.SNV else None,
         is_repeat=variant_class == VariantClass.STR_VNTR_REPEAT,
         is_copy_number=variant_class in {VariantClass.DELETION_SHORT, VariantClass.DUPLICATION_SHORT},
     )
@@ -77,6 +78,7 @@ def _make_correlated_genotypes(
         length=600.0,
         allele_frequency=0.03,
         quality=0.82,
+        training_support=sample_count,
         is_repeat=False,
         is_copy_number=True,
     )
@@ -88,6 +90,7 @@ def _make_correlated_genotypes(
         length=900.0,
         allele_frequency=0.03,
         quality=0.84,
+        training_support=sample_count,
         is_repeat=False,
         is_copy_number=True,
     )
@@ -102,6 +105,7 @@ def _make_correlated_genotypes(
         length=2_000.0,
         allele_frequency=0.002,
         quality=0.9,
+        training_support=1,
         is_repeat=False,
         is_copy_number=True,
     )

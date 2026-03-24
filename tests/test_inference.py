@@ -6,7 +6,7 @@ from jax.scipy.special import polygamma
 from sv_pgs.config import ModelConfig, TraitType
 from sv_pgs.data import VariantRecord
 from sv_pgs.inference import fit_variational_em
-from sv_pgs.mixture_inference import _trigamma
+from sv_pgs.mixture_inference import _trigamma, _update_local_scales
 
 from tests.conftest import make_variant_records
 
@@ -93,3 +93,32 @@ def test_trigamma_matches_jax_polygamma_for_small_shapes():
         expected_value = float(polygamma(1, shape_value))
         actual_value = float(_trigamma(float(shape_value)))
         assert np.isclose(actual_value, expected_value, rtol=1e-6, atol=1e-6)
+
+
+def test_local_scale_update_uses_unslabbed_baseline_variance():
+    config = ModelConfig()
+    coefficient_second_moment = np.array([9.0], dtype=np.float64)
+    baseline_prior_variances = np.array([4.0], dtype=np.float64)
+    local_shape_a = np.array([2.0], dtype=np.float64)
+    local_shape_b = np.array([0.5], dtype=np.float64)
+    auxiliary_delta = np.array([0.75], dtype=np.float64)
+
+    updated_local_scale, updated_auxiliary_delta = _update_local_scales(
+        coefficient_second_moment=coefficient_second_moment,
+        baseline_prior_variances=baseline_prior_variances,
+        local_shape_a=local_shape_a,
+        local_shape_b=local_shape_b,
+        auxiliary_delta=auxiliary_delta,
+        config=config,
+    )
+
+    normalized_second_moment = coefficient_second_moment / baseline_prior_variances
+    shape_offset = local_shape_a - 1.5
+    expected_local_scale = (
+        shape_offset
+        + np.sqrt(shape_offset * shape_offset + 2.0 * auxiliary_delta * normalized_second_moment)
+    ) / (2.0 * auxiliary_delta)
+    expected_auxiliary_delta = (local_shape_a + local_shape_b) / (1.0 + expected_local_scale)
+
+    np.testing.assert_allclose(updated_local_scale, expected_local_scale)
+    np.testing.assert_allclose(updated_auxiliary_delta, expected_auxiliary_delta)

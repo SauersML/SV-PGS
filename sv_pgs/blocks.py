@@ -42,13 +42,13 @@ class BlockDecomposition:
             self.block_eigenvectors,
             self.block_jitter,
         )
-        auxiliary_data = self.blocks
+        auxiliary_data = None
         return children, auxiliary_data
 
     @classmethod
     def tree_unflatten(cls, auxiliary_data, children):
         return cls(
-            blocks=auxiliary_data,
+            blocks=(),
             variant_to_block=children[0],
             block_variant_indices=children[1],
             block_variant_mask=children[2],

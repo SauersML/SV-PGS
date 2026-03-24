@@ -85,6 +85,7 @@ def _build_sparse_dataset(
                 length=800.0 + 200.0 * random_gen.random(),
                 allele_frequency=0.05 + 0.1 * random_gen.random(),
                 quality=0.8 + 0.15 * random_gen.random(),
+                training_support=sample_count,
                 is_copy_number=True,
             ))
         else:
@@ -305,8 +306,8 @@ class TestExactCorrelationSetHandling:
 
         variant_records = [
             VariantRecord("snp_0", VariantClass.SNV, "chr1", 100),
-            VariantRecord("del_1", VariantClass.DELETION_SHORT, "chr1", 100, length=500.0),
-            VariantRecord("dup_2", VariantClass.DUPLICATION_SHORT, "chr1", 100, length=500.0),
+            VariantRecord("del_1", VariantClass.DELETION_SHORT, "chr1", 100, length=500.0, training_support=sample_count),
+            VariantRecord("dup_2", VariantClass.DUPLICATION_SHORT, "chr1", 100, length=500.0, training_support=sample_count),
             VariantRecord("snp_3", VariantClass.SNV, "chr1", 50_000),
             VariantRecord("snp_4", VariantClass.SNV, "chr1", 100_000),
         ]

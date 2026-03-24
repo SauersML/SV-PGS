@@ -134,7 +134,12 @@ def build_tie_map(
             float32_genotypes[:, variant_index],
         )
         genotype_signature = np.ascontiguousarray(standardized_column).tobytes()
-        sign_flipped_signature = np.ascontiguousarray(-standardized_column).tobytes()
+        sign_flipped_column = np.where(
+            standardized_column == 0.0,
+            np.float32(0.0),
+            -standardized_column,
+        )
+        sign_flipped_signature = np.ascontiguousarray(sign_flipped_column).tobytes()
 
         if genotype_signature in exact_signature_to_group:
             reduced_index = exact_signature_to_group[genotype_signature]

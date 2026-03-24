@@ -35,8 +35,8 @@ def _synthetic_binary_dataset() -> tuple[np.ndarray, np.ndarray, np.ndarray, lis
     target_vector = random_generator.binomial(1, target_probabilities).astype(np.float32)
     variant_records = [
         VariantRecord("variant_0", VariantClass.SNV, "1", 100, length=1.0, allele_frequency=0.12, quality=1.0),
-        VariantRecord("variant_1", VariantClass.DELETION_SHORT, "1", 101, length=600.0, allele_frequency=0.02, quality=0.9),
-        VariantRecord("variant_2", VariantClass.DUPLICATION_SHORT, "1", 102, length=1_200.0, allele_frequency=0.02, quality=0.9),
+        VariantRecord("variant_1", VariantClass.DELETION_SHORT, "1", 101, length=600.0, allele_frequency=0.02, quality=0.9, training_support=sample_count),
+        VariantRecord("variant_2", VariantClass.DUPLICATION_SHORT, "1", 102, length=1_200.0, allele_frequency=0.02, quality=0.9, training_support=sample_count),
         VariantRecord("variant_3", VariantClass.SNV, "1", 2_000_000, length=1.0, allele_frequency=0.40, quality=1.0),
         VariantRecord(
             "variant_4",
@@ -46,6 +46,7 @@ def _synthetic_binary_dataset() -> tuple[np.ndarray, np.ndarray, np.ndarray, lis
             length=2_000.0,
             allele_frequency=0.02,
             quality=0.95,
+            training_support=sample_count,
             is_copy_number=True,
         ),
     ]
@@ -56,6 +57,18 @@ def test_binary_model_fit_roundtrip_and_rare_sv_filter(tmp_path):
     genotype_matrix, covariate_matrix, target_vector, variant_records = _synthetic_binary_dataset()
     genotype_matrix[:159, 4] = 0.0
     genotype_matrix[159, 4] = 1.0
+    variant_records[4] = VariantRecord(
+        variant_id=variant_records[4].variant_id,
+        variant_class=variant_records[4].variant_class,
+        chromosome=variant_records[4].chromosome,
+        position=variant_records[4].position,
+        length=variant_records[4].length,
+        allele_frequency=variant_records[4].allele_frequency,
+        quality=variant_records[4].quality,
+        training_support=None,
+        is_repeat=variant_records[4].is_repeat,
+        is_copy_number=variant_records[4].is_copy_number,
+    )
     model = BayesianPGS(
         ModelConfig(
             trait_type=TraitType.BINARY,
@@ -100,7 +113,7 @@ def test_benchmark_suite_runs_from_shared_trainer():
     )
 
     assert set(benchmark_metrics) == {
-        "snv_baseline_no_hyperlearning",
+        "snv_only_frozen_hyperparameters",
         "snv_only_continuous",
         "joint_snv_sv_continuous",
     }
