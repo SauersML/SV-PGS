@@ -3,12 +3,15 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from functools import partial
 from typing import Sequence
 
 import jax
 import jax.numpy as jnp
 import numpy as np
-from jax.scipy.special import digamma, gammaln, polygamma
+from scipy.special import digamma as scipy_digamma
+from scipy.special import gammaln as scipy_gammaln
+from scipy.special import polygamma as scipy_polygamma
 
 from sv_pgs.blocks import (
     BlockDecomposition,
@@ -17,13 +20,15 @@ from sv_pgs.blocks import (
     estimate_variance_from_blocks,
 )
 from sv_pgs.config import ModelConfig, TraitType, VariantClass
-from sv_pgs.data import VariantRecord
+from sv_pgs.data import TieGroup, TieMap, VariantRecord
+from sv_pgs.numeric import stable_sigmoid
 from sv_pgs.operator import (
     GenotypeOperator,
     apply_precision_matrix,
     matvec,
     weighted_rmatvec,
 )
+from sv_pgs.preprocessing import collapse_tie_groups
 
 
 @dataclass(slots=True)
@@ -32,6 +37,13 @@ class PriorDesign:
     feature_names: list[str]
     class_membership_matrix: np.ndarray
     inverse_class_lookup: dict[int, VariantClass]
+
+
+@dataclass(slots=True)
+class TieLayout:
+    member_to_reduced: np.ndarray
+    reduced_member_indices: np.ndarray
+    reduced_member_mask: np.ndarray
 
 
 @dataclass(slots=True)
@@ -48,6 +60,7 @@ class VariationalFitResult:
     sigma_error2: float
     objective_history: list[float]
     validation_history: list[float]
+    member_prior_variances: np.ndarray | None = None
 
 
 def fit_variational_em(
@@ -56,11 +69,19 @@ def fit_variational_em(
     targets: np.ndarray,
     records: Sequence[VariantRecord],
     config: ModelConfig,
+    tie_map: TieMap | None = None,
     validation_data: tuple[np.ndarray, np.ndarray, np.ndarray] | None = None,
 ) -> VariationalFitResult:
     genotype_matrix = np.asarray(genotypes, dtype=np.float32)
     covariate_matrix = np.asarray(covariates, dtype=np.float32)
     target_vector = np.asarray(targets, dtype=np.float32)
+    member_records = list(records)
+    if tie_map is None:
+        tie_map = _identity_tie_map(len(member_records))
+    if genotype_matrix.shape[1] != len(tie_map.reduced_to_group):
+        raise ValueError("Reduced genotype columns must match tie-map group count.")
+    if len(member_records) != tie_map.original_to_reduced.shape[0]:
+        raise ValueError("records must align with tie_map member space.")
 
     genotype_operator = GenotypeOperator.from_numpy(
         genotype_matrix,
@@ -68,39 +89,47 @@ def fit_variational_em(
     )
     covariate_matrix_device = jnp.asarray(covariate_matrix, dtype=jnp.float32)
     target_vector_device = jnp.asarray(target_vector, dtype=jnp.float32)
-    block_decomposition = build_block_decomposition(genotype_matrix, records, config)
-    prior_design = _build_prior_design(records)
+    reduced_records = collapse_tie_groups(member_records, tie_map)
+    block_decomposition = build_block_decomposition(genotype_matrix, reduced_records, config)
+    prior_design = _build_prior_design(member_records)
+    tie_layout = _build_tie_layout(tie_map)
     validation_payload = _prepare_validation(validation_data)
 
-    scale_model_coefficients = _initialize_scale_model_coefficients(prior_design, config)
+    global_scale, scale_model_coefficients = _initialize_scale_model(prior_design, config)
     metadata_baseline_scales = _metadata_baseline_scales_from_coefficients(
         scale_model_coefficients,
         prior_design.design_matrix,
         config,
     )
-    global_scale = 1.0
-    baseline_prior_variances = (global_scale * metadata_baseline_scales) ** 2
+    baseline_member_prior_variances = (global_scale * metadata_baseline_scales) ** 2
 
     tpb_shape_a_vector = _initialize_tpb_shape_a_vector(prior_design, config)
     tpb_shape_b_vector = _initialize_tpb_shape_b_vector(prior_design, config)
     local_shape_a = prior_design.class_membership_matrix @ tpb_shape_a_vector
     local_shape_b = prior_design.class_membership_matrix @ tpb_shape_b_vector
 
-    coefficient_mean = jnp.zeros(genotype_matrix.shape[1], dtype=jnp.float32)
+    reduced_variant_count = genotype_matrix.shape[1]
+    coefficient_mean = jnp.zeros(reduced_variant_count, dtype=jnp.float32)
     covariate_coefficients = jnp.zeros(covariate_matrix.shape[1], dtype=jnp.float32)
-    local_scale = np.ones(genotype_matrix.shape[1], dtype=np.float64)
+    local_scale = np.ones(len(member_records), dtype=np.float64)
     auxiliary_delta = local_shape_b.copy()
-    current_prior_variances = _effective_prior_variances(
-        baseline_prior_variances=baseline_prior_variances,
+    current_member_prior_variances = _effective_prior_variances(
+        baseline_prior_variances=baseline_member_prior_variances,
         local_scale=local_scale,
         trait_type=config.trait_type,
         config=config,
     )
-    coefficient_variance = current_prior_variances.astype(np.float32)
+    coefficient_variance = _reduce_member_values(current_member_prior_variances, tie_layout).astype(np.float32)
     residual_variance = 1.0
 
     objective_history: list[float] = []
     validation_history: list[float] = []
+
+    previous_beta_reduced: np.ndarray | None = None
+    previous_alpha: np.ndarray | None = None
+    previous_local_scale: np.ndarray | None = None
+    previous_scale_model_coefficients: np.ndarray | None = None
+    previous_global_scale: float | None = None
 
     outer_iteration = 0
     while outer_iteration < config.max_outer_iterations:
@@ -122,14 +151,17 @@ def fit_variational_em(
             sample_weights=sample_weights,
         )
 
-        current_prior_variances = _effective_prior_variances(
-            baseline_prior_variances=baseline_prior_variances,
+        current_member_prior_variances = _effective_prior_variances(
+            baseline_prior_variances=baseline_member_prior_variances,
             local_scale=local_scale,
             trait_type=config.trait_type,
             config=config,
         )
-        prior_precision = 1.0 / np.maximum(current_prior_variances, 1e-12)
-        prior_precision_device = jnp.asarray(prior_precision, dtype=jnp.float32)
+        reduced_prior_variances = _reduce_member_values(current_member_prior_variances, tie_layout)
+        prior_precision_device = jnp.asarray(
+            1.0 / np.maximum(reduced_prior_variances, 1e-12),
+            dtype=jnp.float32,
+        )
         right_hand_side = _compute_right_hand_side(
             genotype_operator=genotype_operator,
             sample_weights=sample_weights,
@@ -172,20 +204,33 @@ def fit_variational_em(
                 config=config,
             )
 
-        coefficient_mean_host = np.asarray(coefficient_mean, dtype=np.float32)
-        covariate_coefficients_host = np.asarray(covariate_coefficients, dtype=np.float32)
-        updated_linear_predictor_host = np.asarray(
-            updated_genetic_prediction + covariate_matrix_device @ covariate_coefficients,
-            dtype=np.float32,
+        (
+            coefficient_mean_host,
+            covariate_coefficients_host,
+            updated_linear_predictor_host,
+        ) = jax.device_get(
+            (
+                coefficient_mean,
+                covariate_coefficients,
+                updated_genetic_prediction + covariate_matrix_device @ covariate_coefficients,
+            )
         )
-        coefficient_second_moment = (
+        coefficient_mean_host = np.asarray(coefficient_mean_host, dtype=np.float32)
+        covariate_coefficients_host = np.asarray(covariate_coefficients_host, dtype=np.float32)
+        updated_linear_predictor_host = np.asarray(updated_linear_predictor_host, dtype=np.float32)
+        reduced_second_moment = (
             coefficient_mean_host.astype(np.float64) ** 2
             + coefficient_variance.astype(np.float64)
         )
 
-        local_scale, auxiliary_delta, expected_inverse_local_scale = _update_local_scales(
-            coefficient_second_moment=coefficient_second_moment,
-            baseline_variances=baseline_prior_variances,
+        member_second_moment = _project_reduced_second_moment_to_members(
+            reduced_second_moment=reduced_second_moment,
+            member_prior_variances=current_member_prior_variances,
+            tie_layout=tie_layout,
+        )
+        local_scale, auxiliary_delta = _update_local_scales(
+            coefficient_second_moment=member_second_moment,
+            baseline_prior_variances=baseline_member_prior_variances,
             local_shape_a=local_shape_a,
             local_shape_b=local_shape_b,
             auxiliary_delta=auxiliary_delta,
@@ -207,12 +252,8 @@ def fit_variational_em(
                 1.0 + local_scale,
                 config.local_scale_floor,
             )
-            expected_inverse_local_scale = 1.0 / np.maximum(
-                local_scale,
-                config.local_scale_floor,
-            )
             global_scale = _update_global_scale(
-                coefficient_second_moment=coefficient_second_moment,
+                coefficient_second_moment=member_second_moment,
                 metadata_baseline_scales=metadata_baseline_scales,
                 local_scale=local_scale,
                 config=config,
@@ -220,7 +261,7 @@ def fit_variational_em(
             scale_model_coefficients = _update_scale_model(
                 design_matrix=prior_design.design_matrix,
                 feature_names=prior_design.feature_names,
-                coefficient_second_moment=coefficient_second_moment,
+                coefficient_second_moment=member_second_moment,
                 global_scale=global_scale,
                 local_scale=local_scale,
                 current_coefficients=scale_model_coefficients,
@@ -232,13 +273,20 @@ def fit_variational_em(
                 config,
             )
             global_scale = _update_global_scale(
-                coefficient_second_moment=coefficient_second_moment,
+                coefficient_second_moment=member_second_moment,
                 metadata_baseline_scales=metadata_baseline_scales,
                 local_scale=local_scale,
                 config=config,
             )
 
-        baseline_prior_variances = (global_scale * metadata_baseline_scales) ** 2
+        baseline_member_prior_variances = (global_scale * metadata_baseline_scales) ** 2
+        current_member_prior_variances = _effective_prior_variances(
+            baseline_prior_variances=baseline_member_prior_variances,
+            local_scale=local_scale,
+            trait_type=config.trait_type,
+            config=config,
+        )
+        reduced_prior_variances = _reduce_member_values(current_member_prior_variances, tie_layout)
 
         objective_history.append(
             _surrogate_objective(
@@ -246,8 +294,8 @@ def fit_variational_em(
                 targets=target_vector,
                 linear_predictor=updated_linear_predictor_host,
                 coefficient_variance=coefficient_variance.astype(np.float64),
-                coefficient_second_moment=coefficient_second_moment,
-                current_prior_variances=current_prior_variances,
+                coefficient_second_moment=reduced_second_moment,
+                current_prior_variances=reduced_prior_variances,
                 local_scale=local_scale,
                 auxiliary_delta=auxiliary_delta,
                 local_shape_a=local_shape_a,
@@ -270,22 +318,39 @@ def fit_variational_em(
                 )
             )
 
+        parameter_change = _relative_parameter_change(
+            current_beta=coefficient_mean_host,
+            previous_beta=previous_beta_reduced,
+            current_alpha=covariate_coefficients_host,
+            previous_alpha=previous_alpha,
+            current_local_scale=local_scale,
+            previous_local_scale=previous_local_scale,
+            current_scale_model_coefficients=scale_model_coefficients,
+            previous_scale_model_coefficients=previous_scale_model_coefficients,
+            current_global_scale=global_scale,
+            previous_global_scale=previous_global_scale,
+        )
+
+        previous_beta_reduced = coefficient_mean_host.copy()
+        previous_alpha = covariate_coefficients_host.copy()
+        previous_local_scale = local_scale.copy()
+        previous_scale_model_coefficients = scale_model_coefficients.copy()
+        previous_global_scale = float(global_scale)
+
         outer_iteration += 1
-        converged = False
-        if len(validation_history) >= 2:
-            validation_delta = abs(validation_history[-1] - validation_history[-2])
-            converged = validation_delta < config.convergence_tolerance
-        elif len(objective_history) >= 2:
-            objective_delta = abs(objective_history[-1] - objective_history[-2])
-            converged = objective_delta < config.convergence_tolerance
-        if converged:
+        if validation_history:
+            if len(validation_history) >= 2:
+                validation_delta = abs(validation_history[-1] - validation_history[-2])
+                if parameter_change < config.convergence_tolerance and validation_delta < config.convergence_tolerance:
+                    break
+        elif parameter_change < config.convergence_tolerance:
             break
 
     return VariationalFitResult(
-        alpha=np.asarray(covariate_coefficients, dtype=np.float32),
-        beta_reduced=np.asarray(coefficient_mean, dtype=np.float32),
+        alpha=np.asarray(covariate_coefficients_host, dtype=np.float32),
+        beta_reduced=np.asarray(coefficient_mean_host, dtype=np.float32),
         beta_variance=coefficient_variance.astype(np.float32),
-        prior_scales=baseline_prior_variances.astype(np.float32),
+        prior_scales=current_member_prior_variances.astype(np.float32),
         global_scale=float(global_scale),
         class_tpb_shape_a={
             prior_design.inverse_class_lookup[class_index]: float(tpb_shape_a_vector[class_index])
@@ -300,6 +365,7 @@ def fit_variational_em(
         sigma_error2=float(residual_variance),
         objective_history=objective_history,
         validation_history=validation_history,
+        member_prior_variances=current_member_prior_variances.astype(np.float32),
     )
 
 
@@ -383,35 +449,39 @@ def _build_prior_design(records: Sequence[VariantRecord]) -> PriorDesign:
     standardized_allele_frequency = _standardize_metadata(allele_frequency)
     standardized_quality = _standardize_metadata(quality)
 
-    design_columns: list[np.ndarray] = [np.ones(len(records), dtype=np.float64)]
-    feature_names = ["intercept"]
+    design_columns: list[np.ndarray] = []
+    feature_names: list[str] = []
 
     for class_index, variant_class in enumerate(unique_classes):
         class_membership = class_membership_matrix[:, class_index]
-        design_columns.append(class_membership)
+        design_columns.append(_center_design_column(class_membership))
         feature_names.append("type_offset::" + variant_class.value)
 
-        design_columns.append(class_membership * standardized_log_length)
+        design_columns.append(_center_design_column(class_membership * standardized_log_length))
         feature_names.append("log_length_linear::" + variant_class.value)
-        design_columns.append(class_membership * standardized_log_length * standardized_log_length)
+        design_columns.append(
+            _center_design_column(class_membership * standardized_log_length * standardized_log_length)
+        )
         feature_names.append("log_length_quadratic::" + variant_class.value)
 
-        design_columns.append(class_membership * standardized_allele_frequency)
+        design_columns.append(_center_design_column(class_membership * standardized_allele_frequency))
         feature_names.append("allele_frequency_linear::" + variant_class.value)
         design_columns.append(
-            class_membership
-            * standardized_allele_frequency
-            * standardized_allele_frequency
+            _center_design_column(
+                class_membership
+                * standardized_allele_frequency
+                * standardized_allele_frequency
+            )
         )
         feature_names.append("allele_frequency_quadratic::" + variant_class.value)
 
-    design_columns.append(standardized_quality)
+    design_columns.append(_center_design_column(standardized_quality))
     feature_names.append("quality_linear")
-    design_columns.append(standardized_quality * standardized_quality)
+    design_columns.append(_center_design_column(standardized_quality * standardized_quality))
     feature_names.append("quality_quadratic")
-    design_columns.append(repeat_indicator)
+    design_columns.append(_center_design_column(repeat_indicator))
     feature_names.append("repeat_indicator")
-    design_columns.append(copy_number_indicator)
+    design_columns.append(_center_design_column(copy_number_indicator))
     feature_names.append("copy_number_indicator")
 
     return PriorDesign(
@@ -442,30 +512,46 @@ def _standardize_metadata(values: np.ndarray) -> np.ndarray:
     return centered_values / scale_value
 
 
-def _initialize_scale_model_coefficients(
+def _center_design_column(values: np.ndarray) -> np.ndarray:
+    centered = np.asarray(values, dtype=np.float64) - float(np.mean(values))
+    if np.max(np.abs(centered)) < 1e-10:
+        return np.zeros_like(centered)
+    return centered
+
+
+def _initialize_scale_model(
     prior_design: PriorDesign,
     config: ModelConfig,
-) -> np.ndarray:
+) -> tuple[float, np.ndarray]:
     default_log_scales = config.class_log_baseline_scales()
-    class_baselines = np.asarray(
+    class_log_scale_vector = np.asarray(
         [
             default_log_scales[prior_design.inverse_class_lookup[class_index]]
             for class_index in range(len(prior_design.inverse_class_lookup))
         ],
         dtype=np.float64,
     )
-    average_baseline = float(np.mean(class_baselines))
-    initialized_coefficients = np.zeros(prior_design.design_matrix.shape[1], dtype=np.float64)
-    initialized_coefficients[0] = average_baseline
-
-    for feature_index, feature_name in enumerate(prior_design.feature_names):
-        if not feature_name.startswith("type_offset::"):
-            continue
-        variant_class = VariantClass(feature_name.split("::", maxsplit=1)[1])
-        initialized_coefficients[feature_index] = (
-            default_log_scales[variant_class] - average_baseline
+    default_log_scale_by_variant = prior_design.class_membership_matrix @ class_log_scale_vector
+    mean_log_scale = float(np.mean(default_log_scale_by_variant))
+    initialized_global_scale = float(
+        np.clip(
+            np.exp(mean_log_scale),
+            config.global_scale_floor,
+            config.global_scale_ceiling,
         )
-    return initialized_coefficients
+    )
+    if prior_design.design_matrix.shape[1] == 0:
+        return initialized_global_scale, np.zeros(0, dtype=np.float64)
+
+    target_offsets = default_log_scale_by_variant - mean_log_scale
+    penalty = _scale_model_penalty(prior_design.feature_names, config)
+    normal_matrix = (
+        prior_design.design_matrix.T @ prior_design.design_matrix
+        + np.diag(np.maximum(penalty, 1e-8))
+    )
+    right_hand_side = prior_design.design_matrix.T @ target_offsets
+    coefficients = np.linalg.solve(normal_matrix, right_hand_side)
+    return initialized_global_scale, coefficients.astype(np.float64)
 
 
 def _initialize_tpb_shape_a_vector(
@@ -501,6 +587,8 @@ def _metadata_baseline_scales_from_coefficients(
     design_matrix: np.ndarray,
     config: ModelConfig,
 ) -> np.ndarray:
+    if design_matrix.shape[1] == 0:
+        return np.ones(design_matrix.shape[0], dtype=np.float64)
     linear_prediction = design_matrix @ scale_model_coefficients
     bounded_log_scales = np.clip(
         linear_prediction,
@@ -598,54 +686,102 @@ def _solve_global_posterior_mean(
     initial_mean: jnp.ndarray,
     config: ModelConfig,
 ) -> jnp.ndarray:
-    coefficient_mean = jnp.asarray(initial_mean, dtype=jnp.float32)
+    return _pcg_solve(
+        genotype_operator=genotype_operator,
+        block_decomposition=block_decomposition,
+        sample_weights=sample_weights,
+        prior_precision=prior_precision,
+        right_hand_side=right_hand_side,
+        initial_mean=jnp.asarray(initial_mean, dtype=jnp.float32),
+        max_iterations=config.max_pcg_iterations,
+        tolerance=config.pcg_tolerance,
+    )
+
+
+@partial(jax.jit, static_argnames=("max_iterations",))
+def _pcg_solve(
+    genotype_operator: GenotypeOperator,
+    block_decomposition: BlockDecomposition,
+    sample_weights: jnp.ndarray,
+    prior_precision: jnp.ndarray,
+    right_hand_side: jnp.ndarray,
+    initial_mean: jnp.ndarray,
+    max_iterations: int,
+    tolerance: float,
+) -> jnp.ndarray:
     residual_vector = right_hand_side - _apply_global_precision(
         genotype_operator=genotype_operator,
         sample_weights=sample_weights,
         prior_precision=prior_precision,
-        vector=coefficient_mean,
+        vector=initial_mean,
     )
-    sample_weight_sum = float(jnp.sum(sample_weights))
+    sample_weight_sum = jnp.sum(sample_weights)
     preconditioned_residual = apply_block_preconditioner(
         block_decomposition=block_decomposition,
         vector=residual_vector,
         prior_precision=prior_precision,
         sample_weight_sum=sample_weight_sum,
     )
-    search_direction = preconditioned_residual
-    previous_inner_product = float(jnp.vdot(residual_vector, preconditioned_residual))
+    previous_inner_product = jnp.vdot(residual_vector, preconditioned_residual)
 
-    iteration_index = 0
-    while iteration_index < config.max_pcg_iterations:
+    initial_state = (
+        jnp.int32(0),
+        initial_mean,
+        residual_vector,
+        preconditioned_residual,
+        preconditioned_residual,
+        previous_inner_product,
+        jnp.linalg.norm(residual_vector),
+    )
+
+    def cond_fun(state: tuple[jnp.ndarray, ...]) -> jnp.ndarray:
+        iteration_index, _coefficient_mean, _residual_vector, _preconditioned_residual, _search_direction, _inner_product, residual_norm = state
+        return jnp.logical_and(iteration_index < max_iterations, residual_norm > tolerance)
+
+    def body_fun(state: tuple[jnp.ndarray, ...]) -> tuple[jnp.ndarray, ...]:
+        (
+            iteration_index,
+            coefficient_mean,
+            residual_vector,
+            _preconditioned_residual,
+            search_direction,
+            previous_inner_product,
+            _residual_norm,
+        ) = state
         projected_direction = _apply_global_precision(
             genotype_operator=genotype_operator,
             sample_weights=sample_weights,
             prior_precision=prior_precision,
             vector=search_direction,
         )
-        step_size = previous_inner_product / max(
-            float(jnp.vdot(search_direction, projected_direction)),
+        step_size = previous_inner_product / jnp.maximum(
+            jnp.vdot(search_direction, projected_direction),
             1e-12,
         )
-        coefficient_mean = coefficient_mean + step_size * search_direction
-        residual_vector = residual_vector - step_size * projected_direction
-        residual_norm = float(jnp.linalg.norm(residual_vector))
-        if residual_norm <= config.pcg_tolerance:
-            break
-
-        preconditioned_residual = apply_block_preconditioner(
+        updated_mean = coefficient_mean + step_size * search_direction
+        updated_residual = residual_vector - step_size * projected_direction
+        updated_preconditioned_residual = apply_block_preconditioner(
             block_decomposition=block_decomposition,
-            vector=residual_vector,
+            vector=updated_residual,
             prior_precision=prior_precision,
             sample_weight_sum=sample_weight_sum,
         )
-        current_inner_product = float(jnp.vdot(residual_vector, preconditioned_residual))
-        conjugate_weight = current_inner_product / max(previous_inner_product, 1e-12)
-        search_direction = preconditioned_residual + conjugate_weight * search_direction
-        previous_inner_product = current_inner_product
-        iteration_index += 1
+        current_inner_product = jnp.vdot(updated_residual, updated_preconditioned_residual)
+        conjugate_weight = current_inner_product / jnp.maximum(previous_inner_product, 1e-12)
+        updated_search_direction = updated_preconditioned_residual + conjugate_weight * search_direction
+        updated_residual_norm = jnp.linalg.norm(updated_residual)
+        return (
+            iteration_index + 1,
+            updated_mean,
+            updated_residual,
+            updated_preconditioned_residual,
+            updated_search_direction,
+            current_inner_product,
+            updated_residual_norm,
+        )
 
-    return coefficient_mean
+    final_state = jax.lax.while_loop(cond_fun, body_fun, initial_state)
+    return final_state[1]
 
 
 def _estimate_block_variance(
@@ -653,26 +789,24 @@ def _estimate_block_variance(
     prior_precision: jnp.ndarray,
     sample_weights: jnp.ndarray,
 ) -> np.ndarray:
-    return np.asarray(
-        estimate_variance_from_blocks(
-            block_decomposition=block_decomposition,
-            prior_precision=prior_precision,
-            sample_weight_sum=float(jnp.sum(sample_weights)),
-        ),
-        dtype=np.float32,
+    variance_diagonal = estimate_variance_from_blocks(
+        block_decomposition=block_decomposition,
+        prior_precision=prior_precision,
+        sample_weight_sum=jnp.sum(sample_weights),
     )
+    return np.asarray(jax.device_get(variance_diagonal), dtype=np.float32)
 
 
 def _update_local_scales(
     coefficient_second_moment: np.ndarray,
-    baseline_variances: np.ndarray,
+    baseline_prior_variances: np.ndarray,
     local_shape_a: np.ndarray,
     local_shape_b: np.ndarray,
     auxiliary_delta: np.ndarray,
     config: ModelConfig,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+) -> tuple[np.ndarray, np.ndarray]:
     normalized_second_moment = coefficient_second_moment / np.maximum(
-        baseline_variances,
+        baseline_prior_variances,
         1e-12,
     )
     shape_offset = local_shape_a - 1.5
@@ -688,11 +822,7 @@ def _update_local_scales(
         1.0 + updated_local_scale,
         config.local_scale_floor,
     )
-    expected_inverse_local_scale = 1.0 / np.maximum(
-        updated_local_scale,
-        config.local_scale_floor,
-    )
-    return updated_local_scale, updated_auxiliary_delta, expected_inverse_local_scale
+    return updated_local_scale, updated_auxiliary_delta
 
 
 def _effective_prior_variances(
@@ -730,7 +860,7 @@ def _update_global_scale(
         updated_global_scale,
         config.global_scale_floor,
         config.global_scale_ceiling,
-    ))    
+    ))
 
 
 def _update_tpb_shape_vectors(
@@ -803,12 +933,12 @@ def _inverse_digamma(target_value: float, config: ModelConfig) -> float:
     if target_value >= -2.22:
         value = np.exp(target_value) + 0.5
     else:
-        value = -1.0 / max(target_value - float(digamma(jnp.asarray(1.0, dtype=jnp.float32))), -1e-6)
+        value = -1.0 / max(target_value - float(scipy_digamma(1.0)), -1e-6)
     value = float(np.clip(value, config.minimum_tpb_shape, config.maximum_tpb_shape))
     iteration_index = 0
     while iteration_index < config.maximum_tpb_shape_iterations:
-        digamma_value = float(digamma(jnp.asarray(value, dtype=jnp.float32)))
-        trigamma_value = float(_trigamma(value))
+        digamma_value = float(scipy_digamma(value))
+        trigamma_value = _trigamma(value)
         step_value = (digamma_value - target_value) / max(trigamma_value, 1e-8)
         value = float(np.clip(value - step_value, config.minimum_tpb_shape, config.maximum_tpb_shape))
         if abs(step_value) < 1e-5 or value <= np.exp(lower_bound):
@@ -826,6 +956,9 @@ def _update_scale_model(
     current_coefficients: np.ndarray,
     config: ModelConfig,
 ) -> np.ndarray:
+    if design_matrix.shape[1] == 0:
+        return np.zeros(0, dtype=np.float64)
+
     penalty_diagonal = _scale_model_penalty(feature_names, config)
     updated_coefficients = jnp.asarray(current_coefficients, dtype=jnp.float32)
     design_matrix_device = jnp.asarray(design_matrix, dtype=jnp.float32)
@@ -871,7 +1004,6 @@ def _scale_model_penalty(
         config.scale_model_ridge_penalty,
         dtype=np.float64,
     )
-    penalty_values[0] = 100.0
     for feature_index, feature_name in enumerate(feature_names):
         if feature_name.startswith("type_offset::"):
             penalty_values[feature_index] = config.type_offset_penalty
@@ -917,14 +1049,14 @@ def _surrogate_objective(
     local_scale_prior_term = float(
         np.sum(
             local_shape_a * np.log(np.maximum(auxiliary_delta, 1e-12))
-            - np.asarray(gammaln(jnp.asarray(local_shape_a, dtype=jnp.float32)), dtype=np.float64)
+            - scipy_gammaln(local_shape_a)
             + (local_shape_a - 1.0) * np.log(np.maximum(local_scale, 1e-12))
             - auxiliary_delta * local_scale
         )
     )
     auxiliary_prior_term = float(
         np.sum(
-            -np.asarray(gammaln(jnp.asarray(local_shape_b, dtype=jnp.float32)), dtype=np.float64)
+            -scipy_gammaln(local_shape_b)
             + (local_shape_b - 1.0) * np.log(np.maximum(auxiliary_delta, 1e-12))
             - auxiliary_delta
         )
@@ -960,14 +1092,17 @@ def _refine_variance_with_probes(
             initial_mean=jnp.zeros_like(prior_precision, dtype=jnp.float32),
             config=config,
         )
-        probe_estimate += probe_vector.astype(np.float64) * np.asarray(solved_probe, dtype=np.float64)
+        probe_estimate += probe_vector.astype(np.float64) * np.asarray(
+            jax.device_get(solved_probe),
+            dtype=np.float64,
+        )
     probe_estimate /= float(config.variance_probe_count)
     blended_estimate = 0.5 * baseline_variance.astype(np.float64) + 0.5 * probe_estimate
     return np.maximum(blended_estimate, 1e-12).astype(np.float32)
 
 
-def _trigamma(value: float) -> jnp.ndarray:
-    return polygamma(1, jnp.asarray(value, dtype=jnp.float32))
+def _trigamma(value: float) -> float:
+    return float(scipy_polygamma(1, np.float64(value)))
 
 
 def _validation_metric(
@@ -976,7 +1111,7 @@ def _validation_metric(
     linear_predictor: np.ndarray,
 ) -> float:
     if trait_type == TraitType.BINARY:
-        positive_probability = _sigmoid(linear_predictor)
+        positive_probability = stable_sigmoid(linear_predictor)
         return float(
             -np.mean(
                 targets * np.log(positive_probability + 1e-8)
@@ -988,12 +1123,94 @@ def _validation_metric(
     return float(np.mean(residual_vector * residual_vector))
 
 
-def _sigmoid(values: np.ndarray) -> np.ndarray:
-    clipped_values = np.asarray(np.clip(values, -80.0, 80.0), dtype=np.float64)
-    positive_mask = clipped_values >= 0.0
-    negative_mask = ~positive_mask
-    output = np.empty_like(clipped_values, dtype=np.float64)
-    output[positive_mask] = 1.0 / (1.0 + np.exp(-clipped_values[positive_mask]))
-    exp_values = np.exp(clipped_values[negative_mask])
-    output[negative_mask] = exp_values / (1.0 + exp_values)
-    return output.astype(np.float64)
+def _identity_tie_map(variant_count: int) -> TieMap:
+    return TieMap(
+        kept_indices=np.arange(variant_count, dtype=np.int32),
+        original_to_reduced=np.arange(variant_count, dtype=np.int32),
+        reduced_to_group=[
+            TieGroup(
+                representative_index=variant_index,
+                member_indices=np.asarray([variant_index], dtype=np.int32),
+                signs=np.asarray([1.0], dtype=np.float32),
+            )
+            for variant_index in range(variant_count)
+        ],
+    )
+
+
+def _build_tie_layout(tie_map: TieMap) -> TieLayout:
+    member_to_reduced = np.asarray(tie_map.original_to_reduced, dtype=np.int32)
+    if np.any(member_to_reduced < 0):
+        raise ValueError("tie_map for inference cannot contain inactive members.")
+    if not tie_map.reduced_to_group:
+        return TieLayout(
+            member_to_reduced=member_to_reduced,
+            reduced_member_indices=np.zeros((0, 0), dtype=np.int32),
+            reduced_member_mask=np.zeros((0, 0), dtype=np.float64),
+        )
+    max_group_size = max(int(group.member_indices.shape[0]) for group in tie_map.reduced_to_group)
+    reduced_count = len(tie_map.reduced_to_group)
+    reduced_member_indices = np.zeros((reduced_count, max_group_size), dtype=np.int32)
+    reduced_member_mask = np.zeros((reduced_count, max_group_size), dtype=np.float64)
+    for reduced_index, tie_group in enumerate(tie_map.reduced_to_group):
+        group_size = int(tie_group.member_indices.shape[0])
+        reduced_member_indices[reduced_index, :group_size] = tie_group.member_indices.astype(np.int32)
+        reduced_member_mask[reduced_index, :group_size] = 1.0
+    return TieLayout(
+        member_to_reduced=member_to_reduced,
+        reduced_member_indices=reduced_member_indices,
+        reduced_member_mask=reduced_member_mask,
+    )
+
+
+def _reduce_member_values(
+    member_values: np.ndarray,
+    tie_layout: TieLayout,
+) -> np.ndarray:
+    gathered_values = member_values[tie_layout.reduced_member_indices]
+    return np.sum(gathered_values * tie_layout.reduced_member_mask, axis=1)
+
+
+def _project_reduced_second_moment_to_members(
+    reduced_second_moment: np.ndarray,
+    member_prior_variances: np.ndarray,
+    tie_layout: TieLayout,
+) -> np.ndarray:
+    reduced_prior_variances = np.maximum(
+        _reduce_member_values(member_prior_variances, tie_layout),
+        1e-12,
+    )
+    member_weights = member_prior_variances / reduced_prior_variances[tie_layout.member_to_reduced]
+    return (member_weights * member_weights) * reduced_second_moment[tie_layout.member_to_reduced]
+
+
+def _relative_parameter_change(
+    current_beta: np.ndarray,
+    previous_beta: np.ndarray | None,
+    current_alpha: np.ndarray,
+    previous_alpha: np.ndarray | None,
+    current_local_scale: np.ndarray,
+    previous_local_scale: np.ndarray | None,
+    current_scale_model_coefficients: np.ndarray,
+    previous_scale_model_coefficients: np.ndarray | None,
+    current_global_scale: float,
+    previous_global_scale: float | None,
+) -> float:
+    if previous_beta is None:
+        return float("inf")
+
+    changes = [
+        _relative_change(current_beta, previous_beta),
+        _relative_change(current_alpha, previous_alpha),
+        _relative_change(current_local_scale, previous_local_scale),
+        _relative_change(current_scale_model_coefficients, previous_scale_model_coefficients),
+        abs(current_global_scale - previous_global_scale) / max(abs(previous_global_scale), 1e-8),
+    ]
+    return float(max(changes))
+
+
+def _relative_change(current_values: np.ndarray, previous_values: np.ndarray | None) -> float:
+    if previous_values is None:
+        return 0.0
+    denominator = max(float(np.linalg.norm(previous_values)), 1e-8)
+    return float(np.linalg.norm(current_values - previous_values) / denominator)

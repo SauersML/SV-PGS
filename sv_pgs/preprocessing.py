@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Sequence
 
+import jax.numpy as jnp
 import numpy as np
 
 from sv_pgs.config import ModelConfig, VariantClass
@@ -15,9 +16,9 @@ class Preprocessor:
     scales: np.ndarray
 
     def transform(self, genotypes: np.ndarray) -> np.ndarray:
-        genotype_matrix = np.asarray(genotypes, dtype=np.float32)
-        imputed_genotypes = _impute_missing_values(genotype_matrix, self.means)
-        return (imputed_genotypes - self.means) / self.scales
+        genotype_matrix = jnp.asarray(genotypes, dtype=jnp.float32)
+        imputed_genotypes = _impute_missing_values(genotype_matrix, jnp.asarray(self.means))
+        return np.asarray((imputed_genotypes - self.means) / self.scales, dtype=np.float32)
 
 
 def fit_preprocessor(
@@ -26,9 +27,9 @@ def fit_preprocessor(
     targets: np.ndarray,
     config: ModelConfig,
 ) -> PreparedArrays:
-    genotype_matrix = np.asarray(genotypes, dtype=np.float32)
-    covariate_matrix = np.asarray(covariates, dtype=np.float32)
-    target_array = np.asarray(targets, dtype=np.float32).reshape(-1)
+    genotype_matrix = jnp.asarray(genotypes, dtype=jnp.float32)
+    covariate_matrix = jnp.asarray(covariates, dtype=jnp.float32)
+    target_array = jnp.asarray(targets, dtype=jnp.float32).reshape(-1)
     if genotype_matrix.ndim != 2:
         raise ValueError("genotypes must be 2D.")
     if covariate_matrix.ndim != 2:
@@ -36,29 +37,24 @@ def fit_preprocessor(
     if genotype_matrix.shape[0] != covariate_matrix.shape[0] or genotype_matrix.shape[0] != target_array.shape[0]:
         raise ValueError("genotypes, covariates, and targets must share sample dimension.")
 
-    means = np.nanmean(genotype_matrix, axis=0, dtype=np.float64).astype(np.float32)
-    means = np.where(np.isnan(means), 0.0, means)
+    means = jnp.nanmean(genotype_matrix, axis=0)
+    means = jnp.where(jnp.isnan(means), 0.0, means)
     imputed_genotypes = _impute_missing_values(genotype_matrix, means)
     centered_genotypes = imputed_genotypes - means
-    scales = np.sqrt(np.mean(centered_genotypes * centered_genotypes, axis=0, dtype=np.float64)).astype(np.float32)
-    scales = np.where(scales < config.minimum_scale, 1.0, scales)
+    scales = jnp.sqrt(jnp.mean(centered_genotypes * centered_genotypes, axis=0))
+    scales = jnp.where(scales < config.minimum_scale, 1.0, scales)
 
     return PreparedArrays(
-        genotypes=centered_genotypes / scales,
-        covariates=covariate_matrix,
-        targets=target_array,
-        means=means,
-        scales=scales,
+        genotypes=np.asarray(centered_genotypes / scales, dtype=np.float32),
+        covariates=np.asarray(covariate_matrix, dtype=np.float32),
+        targets=np.asarray(target_array, dtype=np.float32),
+        means=np.asarray(means, dtype=np.float32),
+        scales=np.asarray(scales, dtype=np.float32),
     )
 
 
-def _impute_missing_values(genotype_matrix: np.ndarray, means: np.ndarray) -> np.ndarray:
-    missing_mask = np.isnan(genotype_matrix)
-    if not missing_mask.any():
-        return genotype_matrix
-    imputed_genotypes = genotype_matrix.copy()
-    imputed_genotypes[missing_mask] = np.take(means, np.where(missing_mask)[1])
-    return imputed_genotypes
+def _impute_missing_values(genotype_matrix: jnp.ndarray, means: jnp.ndarray) -> jnp.ndarray:
+    return jnp.where(jnp.isnan(genotype_matrix), means[None, :], genotype_matrix)
 
 
 def select_active_variant_indices(
@@ -130,9 +126,13 @@ def build_tie_map(
     kept_variant_indices: list[int] = []
     original_to_reduced = np.full(genotypes.shape[1], -1, dtype=np.int32)
 
-    float32_genotypes = np.ascontiguousarray(genotypes.astype(np.float32))
+    float32_genotypes = np.ascontiguousarray(np.asarray(genotypes, dtype=np.float32))
     for variant_index in range(genotypes.shape[1]):
-        standardized_column = np.where(float32_genotypes[:, variant_index] == 0.0, 0.0, float32_genotypes[:, variant_index])
+        standardized_column = np.where(
+            float32_genotypes[:, variant_index] == 0.0,
+            np.float32(0.0),
+            float32_genotypes[:, variant_index],
+        )
         genotype_signature = np.ascontiguousarray(standardized_column).tobytes()
         sign_flipped_signature = np.ascontiguousarray(-standardized_column).tobytes()
 
