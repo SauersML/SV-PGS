@@ -575,7 +575,12 @@ def _quantitative_posterior_state(
 
     linear_predictor = covariate_matrix @ alpha + genotype_matrix @ beta
     residual_vector = targets - linear_predictor
-    sigma_error2_new = jnp.maximum(jnp.mean(residual_vector * residual_vector), sigma_error_floor)
+    residual_sum_squares = jnp.sum(residual_vector * residual_vector)
+    posterior_fit_uncertainty = sigma_error2 * jnp.sum(prior_variances * leverage_diagonal)
+    sigma_error2_new = jnp.maximum(
+        (residual_sum_squares + posterior_fit_uncertainty) / sample_count,
+        sigma_error_floor,
+    )
     collapsed_objective = -0.5 * (
         residual @ inverse_covariance_residual
         + 2.0 * jnp.sum(jnp.log(jnp.diag(cholesky_factor)))

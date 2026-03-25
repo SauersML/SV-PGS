@@ -7,7 +7,7 @@ from scipy.special import kve
 from sv_pgs.config import ModelConfig, TraitType
 from sv_pgs.data import VariantRecord
 from sv_pgs.inference import fit_variational_em
-from sv_pgs.mixture_inference import _trigamma, _update_local_scales
+from sv_pgs.mixture_inference import _quantitative_posterior_state, _trigamma, _update_local_scales
 
 from tests.conftest import make_variant_records
 
@@ -122,3 +122,45 @@ def test_local_scale_update_uses_unslabbed_baseline_variance():
 
     np.testing.assert_allclose(updated_local_scale, expected_local_scale)
     np.testing.assert_allclose(updated_auxiliary_delta, expected_auxiliary_delta)
+
+
+def test_quantitative_noise_update_includes_posterior_uncertainty(random_generator):
+    sample_count, variant_count = 30, 4
+    genotype_matrix = random_generator.standard_normal((sample_count, variant_count)).astype(np.float32)
+    covariate_matrix = np.ones((sample_count, 1), dtype=np.float32)
+    target_vector = random_generator.standard_normal(sample_count).astype(np.float32)
+    prior_variances = np.array([3.0, 2.0, 1.5, 0.5], dtype=np.float32)
+    sigma_error2 = 0.7
+
+    alpha, beta, _beta_variance, _linear_predictor, _objective, updated_sigma_error2 = _quantitative_posterior_state(
+        genotype_matrix=genotype_matrix,
+        covariate_matrix=covariate_matrix,
+        targets=target_vector,
+        prior_variances=prior_variances,
+        sigma_error2=sigma_error2,
+        sigma_error_floor=1e-6,
+    )
+
+    genotype_matrix64 = genotype_matrix.astype(np.float64)
+    covariate_matrix64 = covariate_matrix.astype(np.float64)
+    target_vector64 = target_vector.astype(np.float64)
+    prior_variances64 = prior_variances.astype(np.float64)
+    covariance_matrix = sigma_error2 * np.eye(sample_count, dtype=np.float64) + (
+        genotype_matrix64 * prior_variances64[None, :]
+    ) @ genotype_matrix64.T
+    covariance_inverse = np.linalg.inv(covariance_matrix)
+    gls_normal_matrix = covariate_matrix64.T @ covariance_inverse @ covariate_matrix64
+    alpha_exact = np.linalg.solve(
+        gls_normal_matrix,
+        covariate_matrix64.T @ covariance_inverse @ target_vector64,
+    )
+    beta_array = np.asarray(beta, dtype=np.float32).astype(np.float64)
+    residual_vector = target_vector64 - covariate_matrix64 @ alpha_exact - genotype_matrix64 @ beta_array
+    leverage_diagonal = np.sum(genotype_matrix64 * (covariance_inverse @ genotype_matrix64), axis=0)
+    expected_sigma_error2 = (
+        np.sum(residual_vector * residual_vector)
+        + sigma_error2 * np.sum(prior_variances64 * leverage_diagonal)
+    ) / sample_count
+
+    np.testing.assert_allclose(alpha, alpha_exact.astype(np.float32), rtol=1e-5, atol=1e-5)
+    assert np.isclose(float(updated_sigma_error2), expected_sigma_error2, rtol=1e-5, atol=1e-5)

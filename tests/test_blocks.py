@@ -110,3 +110,28 @@ def test_block_jitter_increases_with_condition_number(random_generator):
     easy_block = decomposition.blocks[0]
     hard_block = decomposition.blocks[1]
     assert hard_block.condition_number > easy_block.condition_number
+
+
+def test_single_variant_block_uses_actual_unweighted_second_moment():
+    genotypes = np.array([[0.0], [2.0], [4.0], [6.0]], dtype=np.float64)
+    records = [VariantRecord("variant_0", VariantClass.SNV, "chr1", 100)]
+    decomposition = build_block_decomposition(genotypes, records, ModelConfig())
+    expected_eigenvalue = float((genotypes[:, 0] @ genotypes[:, 0]) / genotypes.shape[0])
+    np.testing.assert_allclose(
+        decomposition.blocks[0].eigenvalues,
+        np.array([expected_eigenvalue], dtype=np.float32),
+    )
+
+
+def test_single_variant_block_uses_actual_weighted_second_moment():
+    genotypes = np.array([[0.0], [2.0], [4.0], [6.0]], dtype=np.float64)
+    sample_weights = np.array([1.0, 2.0, 3.0, 4.0], dtype=np.float32)
+    records = [VariantRecord("variant_0", VariantClass.SNV, "chr1", 100)]
+    decomposition = build_block_decomposition(genotypes, records, ModelConfig(), sample_weights=sample_weights)
+    expected_eigenvalue = float(
+        np.dot(sample_weights * genotypes[:, 0], genotypes[:, 0]) / np.sum(sample_weights)
+    )
+    np.testing.assert_allclose(
+        decomposition.blocks[0].eigenvalues,
+        np.array([expected_eigenvalue], dtype=np.float32),
+    )

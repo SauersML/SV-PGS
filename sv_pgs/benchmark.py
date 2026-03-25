@@ -126,7 +126,12 @@ def _compute_metrics(
             calibration_slope=slope,
             liability_r2=liability_value,
             r2=None,
-            top_tail_enrichment=_top_tail_enrichment(probabilities, targets, benchmark_config.top_tail_fraction),
+            top_tail_enrichment=_top_tail_enrichment(
+                probabilities,
+                targets,
+                benchmark_config.top_tail_fraction,
+                trait_type=trait_type,
+            ),
         )
 
     return BenchmarkMetrics(
@@ -137,7 +142,12 @@ def _compute_metrics(
         calibration_slope=None,
         liability_r2=None,
         r2=float(r2_score(targets, scores)),
-        top_tail_enrichment=_top_tail_enrichment(scores, targets, benchmark_config.top_tail_fraction),
+        top_tail_enrichment=_top_tail_enrichment(
+            scores,
+            targets,
+            benchmark_config.top_tail_fraction,
+            trait_type=trait_type,
+        ),
     )
 
 
@@ -170,10 +180,21 @@ def _liability_r2(probabilities: np.ndarray, targets: np.ndarray, prevalence: fl
     return observed_r2 * scale_value
 
 
-def _top_tail_enrichment(scores: np.ndarray, targets: np.ndarray, fraction: float) -> float:
+def _top_tail_enrichment(
+    scores: np.ndarray,
+    targets: np.ndarray,
+    fraction: float,
+    trait_type: TraitType,
+) -> float:
     cutoff = max(1, int(np.ceil(scores.shape[0] * fraction)))
     top_indices = np.argsort(scores)[-cutoff:]
-    baseline = float(np.mean(targets))
-    if abs(baseline) < 1e-8:
+    if trait_type == TraitType.BINARY:
+        baseline = float(np.mean(targets))
+        if abs(baseline) < 1e-8:
+            return 0.0
+        return float(np.mean(targets[top_indices]) / baseline)
+
+    target_scale = float(np.std(targets))
+    if target_scale < 1e-8:
         return 0.0
-    return float(np.mean(targets[top_indices]) / baseline)
+    return float((np.mean(targets[top_indices]) - np.mean(targets)) / target_scale)

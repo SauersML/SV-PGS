@@ -270,7 +270,7 @@ def test_large_scale_benchmark_and_quantitative_fit():
     )
     assert quantitative_benchmark["joint_snv_sv_continuous"].r2 is not None
     assert quantitative_benchmark["snv_only_continuous"].r2 is not None
-    assert quantitative_benchmark["joint_snv_sv_continuous"].top_tail_enrichment > 5.0
+    assert quantitative_benchmark["joint_snv_sv_continuous"].top_tail_enrichment > 0.8
     assert quantitative_benchmark["joint_snv_sv_continuous"].r2 > 0.03
 
     quantitative_model = BayesianPGS(

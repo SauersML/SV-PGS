@@ -4,6 +4,9 @@ import numpy as np
 from sklearn.metrics import roc_auc_score
 
 from sv_pgs import BayesianPGS, BenchmarkConfig, ModelConfig, TraitType, VariantClass, VariantRecord, run_benchmark_suite
+from sv_pgs.data import TieGroup, TieMap
+from sv_pgs.inference import VariationalFitResult
+from sv_pgs.model import _tie_group_export_weights
 
 
 def _synthetic_binary_dataset() -> tuple[np.ndarray, np.ndarray, np.ndarray, list[VariantRecord]]:
@@ -119,3 +122,87 @@ def test_benchmark_suite_runs_from_shared_trainer():
     }
     assert benchmark_metrics["joint_snv_sv_continuous"].auc is not None
     assert benchmark_metrics["joint_snv_sv_continuous"].log_loss is not None
+
+
+def test_tie_group_export_weights_are_proportional_to_member_variances():
+    records = [
+        VariantRecord("variant_0", VariantClass.SNV, "1", 100),
+        VariantRecord("variant_1", VariantClass.SNV, "1", 101),
+    ]
+    tie_map = TieMap(
+        kept_indices=np.array([0], dtype=np.int32),
+        original_to_reduced=np.array([0, 0], dtype=np.int32),
+        reduced_to_group=[
+            TieGroup(
+                representative_index=0,
+                member_indices=np.array([0, 1], dtype=np.int32),
+                signs=np.array([1.0, 1.0], dtype=np.float32),
+            )
+        ],
+    )
+    fit_result = VariationalFitResult(
+        alpha=np.zeros(1, dtype=np.float32),
+        beta_reduced=np.zeros(1, dtype=np.float32),
+        beta_variance=np.ones(1, dtype=np.float32),
+        prior_scales=np.array([9.0, 1.0], dtype=np.float32),
+        global_scale=1.0,
+        class_tpb_shape_a={VariantClass.SNV: 1.0},
+        class_tpb_shape_b={VariantClass.SNV: 0.5},
+        scale_model_coefficients=np.zeros(1, dtype=np.float32),
+        scale_model_feature_names=["quality_linear"],
+        sigma_error2=1.0,
+        objective_history=[],
+        validation_history=[],
+        member_prior_variances=np.array([9.0, 1.0], dtype=np.float32),
+    )
+
+    weights = _tie_group_export_weights(
+        records=records,
+        tie_map=tie_map,
+        fit_result=fit_result,
+        config=ModelConfig(),
+    )
+
+    np.testing.assert_allclose(weights[0], np.array([0.9, 0.1], dtype=np.float32))
+
+
+def test_tie_group_export_weights_use_stored_prior_scales_when_member_variances_absent():
+    records = [
+        VariantRecord("variant_0", VariantClass.SNV, "1", 100),
+        VariantRecord("variant_1", VariantClass.SNV, "1", 101),
+    ]
+    tie_map = TieMap(
+        kept_indices=np.array([0], dtype=np.int32),
+        original_to_reduced=np.array([0, 0], dtype=np.int32),
+        reduced_to_group=[
+            TieGroup(
+                representative_index=0,
+                member_indices=np.array([0, 1], dtype=np.int32),
+                signs=np.array([1.0, 1.0], dtype=np.float32),
+            )
+        ],
+    )
+    fit_result = VariationalFitResult(
+        alpha=np.zeros(1, dtype=np.float32),
+        beta_reduced=np.zeros(1, dtype=np.float32),
+        beta_variance=np.ones(1, dtype=np.float32),
+        prior_scales=np.array([9.0, 1.0], dtype=np.float32),
+        global_scale=1.0,
+        class_tpb_shape_a={VariantClass.SNV: 1.0},
+        class_tpb_shape_b={VariantClass.SNV: 0.5},
+        scale_model_coefficients=np.zeros(1, dtype=np.float32),
+        scale_model_feature_names=["quality_linear"],
+        sigma_error2=1.0,
+        objective_history=[],
+        validation_history=[],
+        member_prior_variances=None,
+    )
+
+    weights = _tie_group_export_weights(
+        records=records,
+        tie_map=tie_map,
+        fit_result=fit_result,
+        config=ModelConfig(),
+    )
+
+    np.testing.assert_allclose(weights[0], np.array([0.9, 0.1], dtype=np.float32))

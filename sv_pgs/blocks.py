@@ -362,9 +362,19 @@ def _eigendecompose_block(
 ) -> LDBlock:
     block_size = block_genotypes.shape[1]
     if block_size == 1:
+        single_variant_values = np.asarray(block_genotypes[:, 0], dtype=np.float32)
+        if sample_weights is None:
+            normalization = max(float(sample_count), 1e-12)
+            weighted_second_moment = float(np.dot(single_variant_values, single_variant_values) / normalization)
+        else:
+            sample_weight_array = np.asarray(sample_weights, dtype=np.float32)
+            normalization = max(float(np.sum(sample_weight_array)), 1e-12)
+            weighted_second_moment = float(
+                np.dot(sample_weight_array * single_variant_values, single_variant_values) / normalization
+            )
         return LDBlock(
             variant_indices=jnp.asarray(block_indices, dtype=jnp.int32),
-            eigenvalues=jnp.ones(1, dtype=jnp.float32),
+            eigenvalues=jnp.asarray([max(weighted_second_moment, 1e-12)], dtype=jnp.float32),
             eigenvectors=jnp.ones((1, 1), dtype=jnp.float32),
             condition_number=1.0,
             jitter=config.block_jitter_floor,
