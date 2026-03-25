@@ -1,11 +1,10 @@
-"""Tests for the TPB / gamma-gamma prior configuration and the six required features.
+"""Tests for the TPB / gamma-gamma prior configuration and active solver features.
 
 1. Class-specific (a_t, b_t) from day one
 2. Hierarchical pooling config exists
 3. Metadata scale model includes quality
 4. Regularized horseshoe slab config for binary traits
-5. Probe-based variance refinement config
-6. Quality covariate in metadata
+5. Quality covariate in metadata
 """
 from __future__ import annotations
 
@@ -114,27 +113,8 @@ class TestRegularizedHorseshoeSlab:
         assert config.enable_horseshoe_slab is False
 
 
-class TestProbeVarianceRefinement:
-    """Requirement 5: Probe-based correction for cross-block correlation errors."""
-
-    def test_probe_config_exists(self):
-        config = ModelConfig()
-        assert hasattr(config, "variance_probe_count")
-        assert hasattr(config, "variance_probe_interval")
-        assert hasattr(config, "variance_probe_seed")
-
-    def test_probes_run_periodically_not_just_at_end(self):
-        config = ModelConfig()
-        assert config.variance_probe_interval >= 1
-        assert config.variance_probe_interval <= config.max_outer_iterations
-
-    def test_probe_count_positive(self):
-        config = ModelConfig()
-        assert config.variance_probe_count >= 1
-
-
 class TestQualityCovariate:
-    """Requirement 6: Quality in the metadata function is mandatory."""
+    """Requirement 5: Quality in the metadata function is mandatory."""
 
     def test_quality_field_exists_on_variant_record(self):
         from sv_pgs.data import VariantRecord
@@ -175,25 +155,47 @@ class TestConfigValidation:
         with pytest.raises(ValueError):
             ModelConfig(maximum_tpb_shape=0.05, minimum_tpb_shape=0.1)
 
-    def test_probe_count_validated(self):
+    def test_scale_model_iteration_count_validated(self):
         import pytest
         with pytest.raises(ValueError):
-            ModelConfig(variance_probe_count=0)
+            ModelConfig(maximum_scale_model_iterations=0)
 
-    def test_block_refresh_interval_validated(self):
+    def test_tpb_shape_iteration_count_validated(self):
         import pytest
         with pytest.raises(ValueError):
-            ModelConfig(block_weight_refresh_interval=0)
+            ModelConfig(maximum_tpb_shape_iterations=0)
 
     def test_hierarchical_variance_validated(self):
         import pytest
         with pytest.raises(ValueError):
             ModelConfig(tpb_hierarchical_prior_variance=-1.0)
 
+    def test_tpb_shape_learning_rate_validated(self):
+        import pytest
+        with pytest.raises(ValueError):
+            ModelConfig(tpb_shape_learning_rate=0.0)
+
     def test_horseshoe_slab_scale_validated(self):
         import pytest
         with pytest.raises(ValueError):
             ModelConfig(regularized_horseshoe_slab_scale=0.0)
+
+    def test_binary_solver_config_validated(self):
+        import pytest
+        with pytest.raises(ValueError):
+            ModelConfig(max_inner_newton_iterations=0)
+        with pytest.raises(ValueError):
+            ModelConfig(newton_gradient_tolerance=0.0)
+        with pytest.raises(ValueError):
+            ModelConfig(trust_region_initial_damping=0.0)
+        with pytest.raises(ValueError):
+            ModelConfig(trust_region_damping_increase_factor=1.0)
+        with pytest.raises(ValueError):
+            ModelConfig(trust_region_damping_decrease_factor=1.0)
+        with pytest.raises(ValueError):
+            ModelConfig(trust_region_success_threshold=1.0)
+        with pytest.raises(ValueError):
+            ModelConfig(trust_region_minimum_damping=0.0)
 
     def test_jax_device_index_validated(self):
         import pytest

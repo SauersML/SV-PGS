@@ -29,13 +29,6 @@ class PriorDesign:
 
 
 @dataclass(slots=True)
-class TieLayout:
-    member_to_reduced: np.ndarray
-    reduced_member_indices: np.ndarray
-    reduced_member_mask: np.ndarray
-
-
-@dataclass(slots=True)
 class VariationalFitResult:
     alpha: np.ndarray
     beta_reduced: np.ndarray
@@ -91,10 +84,9 @@ def fit_variational_em(
         genotype_matrix_device = jax.device_put(jnp.asarray(genotype_matrix, dtype=jnp.float32), device=device)
         covariate_matrix_device = jax.device_put(jnp.asarray(covariate_matrix, dtype=jnp.float32), device=device)
         target_vector_device = jax.device_put(jnp.asarray(target_vector, dtype=jnp.float32), device=device)
-        validation_payload = _prepare_validation(validation_data, device)
+        validation_payload = _prepare_validation(validation_data)
 
-        prior_design = _build_prior_design(member_records)
-        tie_layout = _build_tie_layout(tie_map)
+        prior_design = _build_prior_design(reduced_records)
         scale_penalty = _scale_model_penalty(prior_design.feature_names, config)
 
         global_scale, scale_model_coefficients = _initialize_scale_model(prior_design, config)
@@ -103,7 +95,7 @@ def fit_variational_em(
         local_shape_a = prior_design.class_membership_matrix @ tpb_shape_a_vector
         local_shape_b = prior_design.class_membership_matrix @ tpb_shape_b_vector
 
-        local_scale = np.ones(len(member_records), dtype=np.float64)
+        local_scale = np.ones(len(reduced_records), dtype=np.float64)
         auxiliary_delta = np.asarray(local_shape_b, dtype=np.float64)
         sigma_error2 = 1.0
         alpha_state = np.zeros(covariate_matrix.shape[1], dtype=np.float32)
@@ -116,23 +108,31 @@ def fit_variational_em(
         previous_beta: np.ndarray | None = None
         previous_local_scale: np.ndarray | None = None
         previous_theta: np.ndarray | None = None
+        previous_tpb_shape_a_vector: np.ndarray | None = None
+        previous_tpb_shape_b_vector: np.ndarray | None = None
+        best_validation_metric: float | None = None
+        best_alpha: np.ndarray | None = None
+        best_beta: np.ndarray | None = None
+        best_local_scale: np.ndarray | None = None
+        best_theta: np.ndarray | None = None
+        best_sigma_error2: float | None = None
+        best_tpb_shape_a_vector: np.ndarray | None = None
+        best_tpb_shape_b_vector: np.ndarray | None = None
 
         outer_iteration = 0
         while outer_iteration < config.max_outer_iterations:
-            current_theta = _pack_theta(
-                global_scale=float(global_scale),
-                scale_model_coefficients=np.asarray(scale_model_coefficients, dtype=np.float64),
-            )
             if config.update_hyperparameters:
                 optimized_theta = _optimize_theta_laml(
-                    theta=current_theta,
+                    theta=_pack_theta(
+                        global_scale=float(global_scale),
+                        scale_model_coefficients=np.asarray(scale_model_coefficients, dtype=np.float64),
+                    ),
                     genotype_matrix=genotype_matrix_device,
                     covariate_matrix=covariate_matrix_device,
                     targets=target_vector_device,
                     design_matrix=prior_design.design_matrix,
                     scale_penalty=scale_penalty,
                     local_scale=local_scale,
-                    tie_layout=tie_layout,
                     sigma_error2=sigma_error2,
                     alpha_init=alpha_state,
                     beta_init=beta_state,
@@ -140,19 +140,25 @@ def fit_variational_em(
                     config=config,
                 )
                 global_scale, scale_model_coefficients = _unpack_theta(optimized_theta)
+            posterior_theta = _pack_theta(
+                global_scale=float(global_scale),
+                scale_model_coefficients=np.asarray(scale_model_coefficients, dtype=np.float64),
+            )
+            posterior_local_scale = local_scale.copy()
+            posterior_tpb_shape_a_vector = np.asarray(tpb_shape_a_vector, dtype=np.float64).copy()
+            posterior_tpb_shape_b_vector = np.asarray(tpb_shape_b_vector, dtype=np.float64).copy()
             metadata_baseline_scales = _metadata_baseline_scales_from_coefficients(
                 np.asarray(scale_model_coefficients, dtype=np.float64),
                 prior_design.design_matrix,
                 config,
             )
-            baseline_member_prior_variances = (float(global_scale) * metadata_baseline_scales) ** 2
-            member_prior_variances = _effective_prior_variances(
-                baseline_prior_variances=baseline_member_prior_variances,
+            baseline_reduced_prior_variances = (float(global_scale) * metadata_baseline_scales) ** 2
+            reduced_prior_variances = _effective_prior_variances(
+                baseline_prior_variances=baseline_reduced_prior_variances,
                 local_scale=local_scale,
                 trait_type=config.trait_type,
                 config=config,
             )
-            reduced_prior_variances = _reduce_member_values(member_prior_variances, tie_layout)
 
             posterior_state = _fit_collapsed_posterior(
                 genotype_matrix=genotype_matrix_device,
@@ -173,11 +179,6 @@ def fit_variational_em(
                 np.asarray(beta_state, dtype=np.float64) ** 2
                 + np.asarray(posterior_state.beta_variance, dtype=np.float64)
             )
-            member_second_moment = _project_reduced_second_moment_to_members(
-                reduced_second_moment=reduced_second_moment,
-                member_prior_variances=member_prior_variances,
-                tie_layout=tie_layout,
-            )
 
             full_objective = posterior_state.collapsed_objective + _local_scale_prior_objective(
                 local_scale=local_scale,
@@ -191,30 +192,45 @@ def fit_variational_em(
             objective_history.append(float(full_objective))
 
             if validation_payload is not None:
-                validation_history.append(
-                    _validation_metric(
-                        trait_type=config.trait_type,
-                        genotype_matrix=validation_payload[0],
-                        covariate_matrix=validation_payload[1],
-                        targets=validation_payload[2],
-                        alpha=alpha_state,
-                        beta=beta_state,
-                    )
+                validation_metric = _validation_metric(
+                    trait_type=config.trait_type,
+                    genotype_matrix=validation_payload[0],
+                    covariate_matrix=validation_payload[1],
+                    targets=validation_payload[2],
+                    alpha=alpha_state,
+                    beta=beta_state,
                 )
+                validation_history.append(validation_metric)
+                if best_validation_metric is None or validation_metric < best_validation_metric:
+                    best_validation_metric = validation_metric
+                    best_alpha = alpha_state.copy()
+                    best_beta = beta_state.copy()
+                    best_local_scale = posterior_local_scale.copy()
+                    best_theta = posterior_theta.copy()
+                    best_sigma_error2 = float(sigma_error2)
+                    best_tpb_shape_a_vector = posterior_tpb_shape_a_vector.copy()
+                    best_tpb_shape_b_vector = posterior_tpb_shape_b_vector.copy()
 
             updated_local_scale, updated_auxiliary_delta = _update_local_scales(
-                coefficient_second_moment=member_second_moment,
-                baseline_prior_variances=baseline_member_prior_variances,
+                coefficient_second_moment=reduced_second_moment,
+                baseline_prior_variances=baseline_reduced_prior_variances,
                 local_shape_a=local_shape_a,
                 local_shape_b=local_shape_b,
                 auxiliary_delta=auxiliary_delta,
                 config=config,
             )
-            local_scale = _share_local_scale_within_tie_groups(
-                local_scale=updated_local_scale,
-                baseline_prior_variances=baseline_member_prior_variances,
-                tie_layout=tie_layout,
-            )
+            local_scale = updated_local_scale
+            if config.update_hyperparameters:
+                tpb_shape_a_vector, tpb_shape_b_vector = _update_tpb_shape_vectors(
+                    class_membership_matrix=prior_design.class_membership_matrix,
+                    current_shape_a_vector=np.asarray(tpb_shape_a_vector, dtype=np.float64),
+                    current_shape_b_vector=np.asarray(tpb_shape_b_vector, dtype=np.float64),
+                    local_scale=local_scale,
+                    auxiliary_delta=updated_auxiliary_delta,
+                    config=config,
+                )
+                local_shape_a = prior_design.class_membership_matrix @ tpb_shape_a_vector
+                local_shape_b = prior_design.class_membership_matrix @ tpb_shape_b_vector
             auxiliary_delta = (local_shape_a + local_shape_b) / np.maximum(
                 1.0 + local_scale,
                 config.local_scale_floor,
@@ -227,19 +243,19 @@ def fit_variational_em(
                 previous_alpha=previous_alpha,
                 current_local_scale=local_scale,
                 previous_local_scale=previous_local_scale,
-                current_theta=_pack_theta(
-                    global_scale=float(global_scale),
-                    scale_model_coefficients=np.asarray(scale_model_coefficients, dtype=np.float64),
-                ),
+                current_theta=posterior_theta,
                 previous_theta=previous_theta,
+                current_tpb_shape_a_vector=np.asarray(tpb_shape_a_vector, dtype=np.float64),
+                previous_tpb_shape_a_vector=previous_tpb_shape_a_vector,
+                current_tpb_shape_b_vector=np.asarray(tpb_shape_b_vector, dtype=np.float64),
+                previous_tpb_shape_b_vector=previous_tpb_shape_b_vector,
             )
             previous_alpha = alpha_state.copy()
             previous_beta = beta_state.copy()
             previous_local_scale = local_scale.copy()
-            previous_theta = _pack_theta(
-                global_scale=float(global_scale),
-                scale_model_coefficients=np.asarray(scale_model_coefficients, dtype=np.float64),
-            )
+            previous_theta = posterior_theta.copy()
+            previous_tpb_shape_a_vector = np.asarray(tpb_shape_a_vector, dtype=np.float64).copy()
+            previous_tpb_shape_b_vector = np.asarray(tpb_shape_b_vector, dtype=np.float64).copy()
 
             outer_iteration += 1
             if validation_history:
@@ -250,19 +266,39 @@ def fit_variational_em(
             elif parameter_change < config.convergence_tolerance:
                 break
 
+        if best_validation_metric is not None:
+            if (
+                best_alpha is None
+                or best_beta is None
+                or best_local_scale is None
+                or best_theta is None
+                or best_sigma_error2 is None
+                or best_tpb_shape_a_vector is None
+                or best_tpb_shape_b_vector is None
+            ):
+                raise RuntimeError("best validation snapshot is incomplete")
+            alpha_state = best_alpha
+            beta_state = best_beta
+            local_scale = best_local_scale
+            sigma_error2 = best_sigma_error2
+            global_scale, scale_model_coefficients = _unpack_theta(best_theta)
+            tpb_shape_a_vector = best_tpb_shape_a_vector
+            tpb_shape_b_vector = best_tpb_shape_b_vector
+            local_shape_a = prior_design.class_membership_matrix @ tpb_shape_a_vector
+            local_shape_b = prior_design.class_membership_matrix @ tpb_shape_b_vector
+
         final_metadata_baseline_scales = _metadata_baseline_scales_from_coefficients(
             np.asarray(scale_model_coefficients, dtype=np.float64),
             prior_design.design_matrix,
             config,
         )
-        final_baseline_member_prior_variances = (float(global_scale) * final_metadata_baseline_scales) ** 2
-        final_member_prior_variances = _effective_prior_variances(
-            baseline_prior_variances=final_baseline_member_prior_variances,
+        final_baseline_reduced_prior_variances = (float(global_scale) * final_metadata_baseline_scales) ** 2
+        final_reduced_prior_variances = _effective_prior_variances(
+            baseline_prior_variances=final_baseline_reduced_prior_variances,
             local_scale=local_scale,
             trait_type=config.trait_type,
             config=config,
         )
-        final_reduced_prior_variances = _reduce_member_values(final_member_prior_variances, tie_layout)
         final_state = _fit_collapsed_posterior(
             genotype_matrix=genotype_matrix_device,
             covariate_matrix=covariate_matrix_device,
@@ -291,6 +327,11 @@ def fit_variational_em(
                 sigma_error2=final_state.sigma_error2,
             )
 
+        final_member_prior_variances = _expand_group_prior_variances_to_members(
+            reduced_prior_variances=final_reduced_prior_variances,
+            tie_map=tie_map,
+        )
+
         return VariationalFitResult(
             alpha=np.asarray(final_state.alpha, dtype=np.float32),
             beta_reduced=np.asarray(final_state.beta, dtype=np.float32),
@@ -314,24 +355,8 @@ def fit_variational_em(
         )
 
 
-def compute_export_baseline_variances(
-    records: Sequence[VariantRecord],
-    scale_model_coefficients: np.ndarray,
-    global_scale: float,
-    config: ModelConfig,
-) -> np.ndarray:
-    prior_design = _build_prior_design(records)
-    metadata_baseline_scales = _metadata_baseline_scales_from_coefficients(
-        np.asarray(scale_model_coefficients, dtype=np.float64),
-        prior_design.design_matrix,
-        config,
-    )
-    return ((float(global_scale) * metadata_baseline_scales) ** 2).astype(np.float32)
-
-
 def _prepare_validation(
     validation_data: tuple[np.ndarray, np.ndarray, np.ndarray] | None,
-    device: jax.Device,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray] | None:
     if validation_data is None:
         return None
@@ -373,7 +398,13 @@ def _fit_collapsed_posterior(
             alpha_init=jnp.asarray(alpha_init, dtype=jnp.float32),
             beta_init=jnp.asarray(beta_init, dtype=jnp.float32),
             minimum_weight=config.polya_gamma_minimum_weight,
-            max_iterations=max(12, min(config.max_outer_iterations * 3, 64)),
+            max_iterations=config.max_inner_newton_iterations,
+            gradient_tolerance=config.newton_gradient_tolerance,
+            initial_damping=config.trust_region_initial_damping,
+            damping_increase_factor=config.trust_region_damping_increase_factor,
+            damping_decrease_factor=config.trust_region_damping_decrease_factor,
+            success_threshold=config.trust_region_success_threshold,
+            minimum_damping=config.trust_region_minimum_damping,
         )
         sigma_error2_new = 1.0
     return PosteriorState(
@@ -394,7 +425,6 @@ def _optimize_theta_laml(
     design_matrix: np.ndarray,
     scale_penalty: np.ndarray,
     local_scale: np.ndarray,
-    tie_layout: TieLayout,
     sigma_error2: float,
     alpha_init: np.ndarray,
     beta_init: np.ndarray,
@@ -405,8 +435,6 @@ def _optimize_theta_laml(
     design_matrix_device = jnp.asarray(design_matrix, dtype=jnp.float32)
     scale_penalty_device = jnp.asarray(scale_penalty, dtype=jnp.float32)
     local_scale_device = jnp.asarray(local_scale, dtype=jnp.float32)
-    reduced_member_indices = jnp.asarray(tie_layout.reduced_member_indices, dtype=jnp.int32)
-    reduced_member_mask = jnp.asarray(tie_layout.reduced_member_mask, dtype=jnp.float32)
     alpha_init_device = jnp.asarray(alpha_init, dtype=jnp.float32)
     beta_init_device = jnp.asarray(beta_init, dtype=jnp.float32)
 
@@ -418,16 +446,11 @@ def _optimize_theta_laml(
             design_matrix=design_matrix_device,
             config=config,
         )
-        member_prior_variances = _effective_prior_variances_jax(
+        reduced_prior_variances = _effective_prior_variances_jax(
             baseline_prior_variances=(global_scale_value * metadata_baseline_scales) ** 2,
             local_scale=local_scale_device,
             trait_type=trait_type,
             config=config,
-        )
-        reduced_prior_variances = _reduce_member_values_jax(
-            member_values=member_prior_variances,
-            reduced_member_indices=reduced_member_indices,
-            reduced_member_mask=reduced_member_mask,
         )
         if trait_type == TraitType.QUANTITATIVE:
             _alpha, _beta, _beta_variance, _linear_predictor, collapsed_objective, _sigma_error2 = _quantitative_posterior_state(
@@ -447,7 +470,13 @@ def _optimize_theta_laml(
                 alpha_init=alpha_init_device,
                 beta_init=beta_init_device,
                 minimum_weight=config.polya_gamma_minimum_weight,
-                max_iterations=max(12, min(config.max_outer_iterations * 3, 64)),
+                max_iterations=config.max_inner_newton_iterations,
+                gradient_tolerance=config.newton_gradient_tolerance,
+                initial_damping=config.trust_region_initial_damping,
+                damping_increase_factor=config.trust_region_damping_increase_factor,
+                damping_decrease_factor=config.trust_region_damping_decrease_factor,
+                success_threshold=config.trust_region_success_threshold,
+                minimum_damping=config.trust_region_minimum_damping,
             )
         return collapsed_objective - 0.5 * jnp.sum(scale_penalty_device * scale_model_coefficients * scale_model_coefficients)
 
@@ -457,7 +486,7 @@ def _optimize_theta_laml(
     best_theta = np.asarray(theta, dtype=np.float64)
     best_objective = float(jax.device_get(objective_fn(jnp.asarray(best_theta, dtype=jnp.float32))))
     damping = 1.0
-    for _iteration_index in range(4):
+    for _iteration_index in range(config.maximum_scale_model_iterations):
         theta_eval = jnp.asarray(best_theta, dtype=jnp.float32)
         objective_value, gradient_value = value_and_grad(theta_eval)
         hessian_value = hessian_fn(theta_eval)
@@ -527,16 +556,6 @@ def _effective_prior_variances_jax(
     )
     return jnp.maximum(regularized_variances, 1e-8)
 
-
-@jax.jit
-def _reduce_member_values_jax(
-    member_values: jnp.ndarray,
-    reduced_member_indices: jnp.ndarray,
-    reduced_member_mask: jnp.ndarray,
-) -> jnp.ndarray:
-    return jnp.sum(member_values[reduced_member_indices] * reduced_member_mask, axis=1)
-
-
 @partial(jax.jit, static_argnames=("sigma_error_floor",))
 def _quantitative_posterior_state(
     genotype_matrix: jnp.ndarray,
@@ -599,6 +618,12 @@ def _binary_posterior_state(
     beta_init: jnp.ndarray,
     minimum_weight: float,
     max_iterations: int,
+    gradient_tolerance: float,
+    initial_damping: float,
+    damping_increase_factor: float,
+    damping_decrease_factor: float,
+    success_threshold: float,
+    minimum_damping: float,
 ) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray]:
     prior_precision = 1.0 / jnp.maximum(prior_variances, 1e-8)
     parameter_count = covariate_matrix.shape[1] + genotype_matrix.shape[1]
@@ -638,23 +663,40 @@ def _binary_posterior_state(
     def body_fun(_iteration_index: int, state: tuple[jnp.ndarray, jnp.ndarray]) -> tuple[jnp.ndarray, jnp.ndarray]:
         parameters, damping = state
         current_objective, gradient, precision_matrix, _linear_predictor = penalized_terms(parameters)
-        damping_metric = jnp.diag(jnp.maximum(jnp.diag(precision_matrix), 1e-3))
+        gradient_norm = jnp.linalg.norm(gradient)
+        damping_metric = jnp.diag(jnp.maximum(jnp.diag(precision_matrix), 1e-6))
         step = jnp.linalg.solve(
             precision_matrix + damping * damping_metric + 1e-4 * jnp.eye(parameter_count, dtype=jnp.float32),
             gradient,
         )
         candidate_parameters = parameters + step
         candidate_objective, _candidate_gradient, _candidate_precision, _candidate_linear_predictor = penalized_terms(candidate_parameters)
-        accept = candidate_objective > current_objective
+        actual_gain = candidate_objective - current_objective
+        predicted_gain = jnp.dot(gradient, step) - 0.5 * jnp.dot(step, precision_matrix @ step)
+        gain_ratio = actual_gain / jnp.maximum(predicted_gain, 1e-8)
+        accept = (
+            (gradient_norm > gradient_tolerance)
+            & jnp.isfinite(candidate_objective)
+            & (actual_gain > 0.0)
+            & (gain_ratio >= success_threshold)
+        )
         next_parameters = jnp.where(accept, candidate_parameters, parameters)
-        next_damping = jnp.where(accept, jnp.maximum(damping * 0.5, 1e-4), jnp.minimum(damping * 4.0, 1e6))
+        next_damping = jnp.where(
+            gradient_norm <= gradient_tolerance,
+            damping,
+            jnp.where(
+                accept,
+                jnp.maximum(damping * damping_decrease_factor, minimum_damping),
+                damping * damping_increase_factor,
+            ),
+        )
         return next_parameters, next_damping
 
     final_parameters, _final_damping = jax.lax.fori_loop(
         0,
         max_iterations,
         body_fun,
-        (initial_parameters, jnp.float32(1.0)),
+        (initial_parameters, jnp.asarray(initial_damping, dtype=jnp.float32)),
     )
     final_objective, _gradient, final_precision, linear_predictor = penalized_terms(final_parameters)
     final_precision = final_precision + 1e-4 * jnp.eye(parameter_count, dtype=jnp.float32)
@@ -702,6 +744,7 @@ def _build_prior_design(records: Sequence[VariantRecord]) -> PriorDesign:
         prior_membership = _prior_class_membership(record)
         for prior_class, prior_weight in zip(prior_classes, prior_membership, strict=True):
             class_membership_matrix[record_index, class_lookup[prior_class]] = prior_weight
+    class_membership_totals = np.sum(class_membership_matrix, axis=0)
 
     log_length = np.log(np.maximum(np.asarray([record.length for record in records], dtype=np.float64), 1.0))
     allele_frequency = np.clip(
@@ -727,6 +770,9 @@ def _build_prior_design(records: Sequence[VariantRecord]) -> PriorDesign:
         class_membership = class_membership_matrix[:, class_index]
         design_columns.append(_center_design_column(class_membership))
         feature_names.append("type_offset::" + variant_class.value)
+
+        if class_membership_totals[class_index] < 3.0:
+            continue
 
         design_columns.append(_center_design_column(class_membership * standardized_log_length))
         feature_names.append("log_length_linear::" + variant_class.value)
@@ -841,6 +887,89 @@ def _initialize_tpb_shape_b_vector(
             for class_index in range(len(prior_design.inverse_class_lookup))
         ],
         dtype=np.float64,
+    )
+
+
+def _update_tpb_shape_vectors(
+    class_membership_matrix: np.ndarray,
+    current_shape_a_vector: np.ndarray,
+    current_shape_b_vector: np.ndarray,
+    local_scale: np.ndarray,
+    auxiliary_delta: np.ndarray,
+    config: ModelConfig,
+) -> tuple[np.ndarray, np.ndarray]:
+    class_count = current_shape_a_vector.shape[0]
+    if class_count == 0:
+        return current_shape_a_vector, current_shape_b_vector
+
+    class_membership_device = jnp.asarray(class_membership_matrix, dtype=jnp.float32)
+    log_local_scale = jnp.log(
+        jnp.maximum(jnp.asarray(local_scale, dtype=jnp.float32), config.local_scale_floor)
+    )
+    log_auxiliary_delta = jnp.log(
+        jnp.maximum(jnp.asarray(auxiliary_delta, dtype=jnp.float32), config.local_scale_floor)
+    )
+
+    def objective_fn(log_shape_vector: jnp.ndarray) -> jnp.ndarray:
+        log_shape_a = log_shape_vector[:class_count]
+        log_shape_b = log_shape_vector[class_count:]
+        shape_a_vector = jnp.clip(
+            jnp.exp(log_shape_a),
+            config.minimum_tpb_shape,
+            config.maximum_tpb_shape,
+        )
+        shape_b_vector = jnp.clip(
+            jnp.exp(log_shape_b),
+            config.minimum_tpb_shape,
+            config.maximum_tpb_shape,
+        )
+        local_shape_a = class_membership_device @ shape_a_vector
+        local_shape_b = class_membership_device @ shape_b_vector
+        log_shape_a_mean = jnp.mean(log_shape_a)
+        log_shape_b_mean = jnp.mean(log_shape_b)
+        hierarchical_penalty = -0.5 * (
+            jnp.sum((log_shape_a - log_shape_a_mean) ** 2)
+            + jnp.sum((log_shape_b - log_shape_b_mean) ** 2)
+        ) / config.tpb_hierarchical_prior_variance
+        return (
+            jnp.sum(
+                local_shape_a * log_auxiliary_delta
+                - jax.scipy.special.gammaln(local_shape_a)
+                + (local_shape_a - 1.0) * log_local_scale
+            )
+            + jnp.sum(
+                (local_shape_b - 1.0) * log_auxiliary_delta
+                - jax.scipy.special.gammaln(local_shape_b)
+            )
+            + hierarchical_penalty
+        )
+
+    gradient_fn = jax.grad(objective_fn)
+    log_shape_vector = np.concatenate(
+        [
+            np.log(np.maximum(current_shape_a_vector, config.minimum_tpb_shape)),
+            np.log(np.maximum(current_shape_b_vector, config.minimum_tpb_shape)),
+        ]
+    ).astype(np.float64)
+    lower_bound = np.log(config.minimum_tpb_shape)
+    upper_bound = np.log(config.maximum_tpb_shape)
+    for _iteration_index in range(config.maximum_tpb_shape_iterations):
+        gradient = np.asarray(
+            jax.device_get(gradient_fn(jnp.asarray(log_shape_vector, dtype=jnp.float32))),
+            dtype=np.float64,
+        )
+        step = np.clip(config.tpb_shape_learning_rate * gradient, -0.25, 0.25)
+        updated_log_shape_vector = np.clip(log_shape_vector + step, lower_bound, upper_bound)
+        if np.linalg.norm(updated_log_shape_vector - log_shape_vector) / max(
+            np.linalg.norm(log_shape_vector),
+            1e-8,
+        ) < config.convergence_tolerance:
+            log_shape_vector = updated_log_shape_vector
+            break
+        log_shape_vector = updated_log_shape_vector
+    return (
+        np.exp(log_shape_vector[:class_count]).astype(np.float64),
+        np.exp(log_shape_vector[class_count:]).astype(np.float64),
     )
 
 
@@ -986,73 +1115,19 @@ def _identity_tie_map(variant_count: int) -> TieMap:
     )
 
 
-def _build_tie_layout(tie_map: TieMap) -> TieLayout:
-    member_to_reduced = np.asarray(tie_map.original_to_reduced, dtype=np.int32)
-    if np.any(member_to_reduced < 0):
-        raise ValueError("tie_map for inference cannot contain inactive members.")
-    if not tie_map.reduced_to_group:
-        return TieLayout(
-            member_to_reduced=member_to_reduced,
-            reduced_member_indices=np.zeros((0, 0), dtype=np.int32),
-            reduced_member_mask=np.zeros((0, 0), dtype=np.float64),
-        )
-    max_group_size = max(int(group.member_indices.shape[0]) for group in tie_map.reduced_to_group)
-    reduced_count = len(tie_map.reduced_to_group)
-    reduced_member_indices = np.zeros((reduced_count, max_group_size), dtype=np.int32)
-    reduced_member_mask = np.zeros((reduced_count, max_group_size), dtype=np.float64)
+def _expand_group_prior_variances_to_members(
+    reduced_prior_variances: np.ndarray,
+    tie_map: TieMap,
+) -> np.ndarray:
+    member_prior_variances = np.zeros(tie_map.original_to_reduced.shape[0], dtype=np.float64)
     for reduced_index, tie_group in enumerate(tie_map.reduced_to_group):
         group_size = int(tie_group.member_indices.shape[0])
-        reduced_member_indices[reduced_index, :group_size] = tie_group.member_indices.astype(np.int32)
-        reduced_member_mask[reduced_index, :group_size] = 1.0
-    return TieLayout(
-        member_to_reduced=member_to_reduced,
-        reduced_member_indices=reduced_member_indices,
-        reduced_member_mask=reduced_member_mask,
-    )
-
-
-def _reduce_member_values(
-    member_values: np.ndarray,
-    tie_layout: TieLayout,
-) -> np.ndarray:
-    gathered_values = member_values[tie_layout.reduced_member_indices]
-    return np.sum(gathered_values * tie_layout.reduced_member_mask, axis=1)
-
-
-def _project_reduced_second_moment_to_members(
-    reduced_second_moment: np.ndarray,
-    member_prior_variances: np.ndarray,
-    tie_layout: TieLayout,
-) -> np.ndarray:
-    reduced_prior_variances = np.maximum(_reduce_member_values(member_prior_variances, tie_layout), 1e-12)
-    reduced_group_second_moment = reduced_second_moment[tie_layout.member_to_reduced]
-    conditional_mean_weight = member_prior_variances / reduced_prior_variances[tie_layout.member_to_reduced]
-    conditional_residual_variance = member_prior_variances * (1.0 - conditional_mean_weight)
-    return conditional_residual_variance + (conditional_mean_weight * conditional_mean_weight) * reduced_group_second_moment
-
-
-def _share_local_scale_within_tie_groups(
-    local_scale: np.ndarray,
-    baseline_prior_variances: np.ndarray,
-    tie_layout: TieLayout,
-) -> np.ndarray:
-    if tie_layout.reduced_member_indices.size == 0:
-        return local_scale
-
-    shared_local_scale = np.asarray(local_scale, dtype=np.float64).copy()
-    for group_indices, group_mask in zip(
-        tie_layout.reduced_member_indices,
-        tie_layout.reduced_member_mask,
-        strict=True,
-    ):
-        active_indices = group_indices[group_mask.astype(bool)]
-        if active_indices.shape[0] <= 1:
-            continue
-        group_baseline_variances = np.asarray(baseline_prior_variances[active_indices], dtype=np.float64)
-        normalized_weights = group_baseline_variances / np.maximum(np.sum(group_baseline_variances), 1e-12)
-        group_local_scale = float(np.sum(normalized_weights * shared_local_scale[active_indices]))
-        shared_local_scale[active_indices] = group_local_scale
-    return shared_local_scale
+        if group_size <= 0:
+            raise ValueError("tie groups must contain at least one member.")
+        member_prior_variances[tie_group.member_indices] = (
+            float(reduced_prior_variances[reduced_index]) / group_size
+        )
+    return member_prior_variances
 
 
 def _relative_parameter_change(
@@ -1064,6 +1139,10 @@ def _relative_parameter_change(
     previous_local_scale: np.ndarray | None,
     current_theta: np.ndarray,
     previous_theta: np.ndarray | None,
+    current_tpb_shape_a_vector: np.ndarray,
+    previous_tpb_shape_a_vector: np.ndarray | None,
+    current_tpb_shape_b_vector: np.ndarray,
+    previous_tpb_shape_b_vector: np.ndarray | None,
 ) -> float:
     if previous_beta is None:
         return float("inf")
@@ -1072,6 +1151,8 @@ def _relative_parameter_change(
         _relative_change(current_alpha, previous_alpha),
         _relative_change(current_local_scale, previous_local_scale),
         _relative_change(current_theta, previous_theta),
+        _relative_change(current_tpb_shape_a_vector, previous_tpb_shape_a_vector),
+        _relative_change(current_tpb_shape_b_vector, previous_tpb_shape_b_vector),
     ]
     return float(max(changes))
 

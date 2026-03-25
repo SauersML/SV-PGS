@@ -78,10 +78,8 @@ class BayesianPGS:
             validation_data=reduced_validation,
         )
         tie_group_weights = _tie_group_export_weights(
-            records=active_records,
             tie_map=reduced_tie_map,
             fit_result=fit_result,
-            config=self.config,
         )
         active_coefficients = reduced_tie_map.expand_coefficients(
             fit_result.beta_reduced,
@@ -165,6 +163,7 @@ class BayesianPGS:
                 sigma_error2=artifact.sigma_e2,
                 objective_history=artifact.objective_history,
                 validation_history=artifact.validation_history,
+                member_prior_variances=artifact.prior_scales,
             ),
             full_coefficients=artifact.beta_full,
         )
@@ -234,15 +233,12 @@ def _project_tie_map_to_original_space(
 
 
 def _tie_group_export_weights(
-    records: Sequence[VariantRecord],
     tie_map: TieMap,
     fit_result: VariationalFitResult,
-    config: ModelConfig,
 ) -> list[np.ndarray]:
     if fit_result.member_prior_variances is None:
-        member_prior_variances = np.asarray(fit_result.prior_scales, dtype=np.float32)
-    else:
-        member_prior_variances = np.asarray(fit_result.member_prior_variances, dtype=np.float32)
+        raise ValueError("member_prior_variances must be populated for tie-group export.")
+    member_prior_variances = np.asarray(fit_result.member_prior_variances, dtype=np.float32)
     group_weights: list[np.ndarray] = []
     for tie_group in tie_map.reduced_to_group:
         member_variances = np.asarray(member_prior_variances[tie_group.member_indices], dtype=np.float32)

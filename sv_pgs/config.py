@@ -88,9 +88,6 @@ class ModelConfig:
     jax_device_index: int = 0
     require_jax_device: bool = False
     max_outer_iterations: int = 30
-    max_pcg_iterations: int = 200
-    pcg_tolerance: float = 1e-5
-    operator_tile_size: int = 256
     convergence_tolerance: float = 1e-4
     minimum_scale: float = 1e-6
     polya_gamma_minimum_weight: float = 1e-4
@@ -98,7 +95,6 @@ class ModelConfig:
     minimum_structural_variant_carriers: int = 5
     ld_block_max_variants: int = 512
     ld_block_window_bp: int = 3_000_000
-    block_weight_refresh_interval: int = 2
     discarded_spectrum_tolerance: float = 0.005
     block_jitter_floor: float = 1e-6
     prior_scale_floor: float = 1e-6
@@ -106,28 +102,19 @@ class ModelConfig:
     global_scale_floor: float = 1e-4
     global_scale_ceiling: float = 10.0
     local_scale_floor: float = 1e-8
-    # Metadata scale model: smooth quadratic splines over type, log_length, freq, quality
     scale_model_ridge_penalty: float = 1.0
     type_offset_penalty: float = 2.0
     maximum_scale_model_iterations: int = 8
 
-    # Hierarchical pooling on log(a_t), log(b_t): prevents rare SV classes from learning garbage
     tpb_hierarchical_prior_variance: float = 1.0
     maximum_tpb_shape_iterations: int = 8
     tpb_shape_learning_rate: float = 0.5
     minimum_tpb_shape: float = 0.1
     maximum_tpb_shape: float = 10.0
 
-    # Regularized horseshoe slab for binary traits: prevents logistic divergence
     regularized_horseshoe_slab_scale: float = 2.0
     enable_horseshoe_slab: bool = True
 
-    # Probe-based variance refinement: corrects cross-block correlation errors
-    variance_probe_count: int = 4
-    variance_probe_interval: int = 3
-    variance_probe_seed: int = 0
-
-    # Trust-region Newton for binary mode solve
     max_inner_newton_iterations: int = 20
     newton_gradient_tolerance: float = 1e-5
     trust_region_initial_damping: float = 1.0
@@ -146,20 +133,12 @@ class ModelConfig:
             raise ValueError("max_outer_iterations must be positive.")
         if self.jax_device_index < 0:
             raise ValueError("jax_device_index must be non-negative.")
-        if self.max_pcg_iterations < 1:
-            raise ValueError("max_pcg_iterations must be positive.")
-        if self.pcg_tolerance <= 0.0:
-            raise ValueError("pcg_tolerance must be positive.")
-        if self.operator_tile_size < 1:
-            raise ValueError("operator_tile_size must be positive.")
         if self.minimum_scale <= 0.0:
             raise ValueError("minimum_scale must be positive.")
         if self.polya_gamma_minimum_weight <= 0.0:
             raise ValueError("polya_gamma_minimum_weight must be positive.")
         if self.minimum_structural_variant_carriers < 1:
             raise ValueError("minimum_structural_variant_carriers must be positive.")
-        if self.block_weight_refresh_interval < 1:
-            raise ValueError("block_weight_refresh_interval must be positive.")
         if self.discarded_spectrum_tolerance <= 0.0:
             raise ValueError("discarded_spectrum_tolerance must be positive.")
         if self.discarded_spectrum_tolerance >= 1.0:
@@ -174,18 +153,34 @@ class ModelConfig:
             raise ValueError("global_scale_ceiling must exceed global_scale_floor.")
         if self.local_scale_floor <= 0.0:
             raise ValueError("local_scale_floor must be positive.")
+        if self.maximum_scale_model_iterations < 1:
+            raise ValueError("maximum_scale_model_iterations must be positive.")
         if self.minimum_tpb_shape <= 0.0:
             raise ValueError("minimum_tpb_shape must be positive.")
         if self.maximum_tpb_shape <= self.minimum_tpb_shape:
             raise ValueError("maximum_tpb_shape must exceed minimum_tpb_shape.")
         if self.tpb_hierarchical_prior_variance <= 0.0:
             raise ValueError("tpb_hierarchical_prior_variance must be positive.")
+        if self.maximum_tpb_shape_iterations < 1:
+            raise ValueError("maximum_tpb_shape_iterations must be positive.")
+        if self.tpb_shape_learning_rate <= 0.0:
+            raise ValueError("tpb_shape_learning_rate must be positive.")
         if self.regularized_horseshoe_slab_scale <= 0.0:
             raise ValueError("regularized_horseshoe_slab_scale must be positive.")
-        if self.variance_probe_count < 1:
-            raise ValueError("variance_probe_count must be positive.")
-        if self.variance_probe_interval < 1:
-            raise ValueError("variance_probe_interval must be positive.")
+        if self.max_inner_newton_iterations < 1:
+            raise ValueError("max_inner_newton_iterations must be positive.")
+        if self.newton_gradient_tolerance <= 0.0:
+            raise ValueError("newton_gradient_tolerance must be positive.")
+        if self.trust_region_initial_damping <= 0.0:
+            raise ValueError("trust_region_initial_damping must be positive.")
+        if self.trust_region_damping_increase_factor <= 1.0:
+            raise ValueError("trust_region_damping_increase_factor must exceed 1.")
+        if not 0.0 < self.trust_region_damping_decrease_factor < 1.0:
+            raise ValueError("trust_region_damping_decrease_factor must lie in (0, 1).")
+        if not 0.0 < self.trust_region_success_threshold < 1.0:
+            raise ValueError("trust_region_success_threshold must lie in (0, 1).")
+        if self.trust_region_minimum_damping <= 0.0:
+            raise ValueError("trust_region_minimum_damping must be positive.")
 
     def class_log_baseline_scales(self) -> Mapping[VariantClass, float]:
         return dict(DEFAULT_CLASS_LOG_BASELINE_SCALE)

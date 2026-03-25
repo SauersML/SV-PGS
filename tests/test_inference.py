@@ -1,13 +1,21 @@
 from __future__ import annotations
 
 import numpy as np
+import pytest
 from jax.scipy.special import polygamma
 from scipy.special import kve
 
-from sv_pgs.config import ModelConfig, TraitType
+from sv_pgs.config import ModelConfig, TraitType, VariantClass
 from sv_pgs.data import VariantRecord
 from sv_pgs.inference import fit_variational_em
-from sv_pgs.mixture_inference import _quantitative_posterior_state, _trigamma, _update_local_scales
+from sv_pgs.mixture_inference import (
+    PosteriorState,
+    _quantitative_posterior_state,
+    _trigamma,
+    _update_local_scales,
+    _update_tpb_shape_vectors,
+)
+import sv_pgs.mixture_inference as mixture_inference
 
 from tests.conftest import make_variant_records
 
@@ -164,3 +172,78 @@ def test_quantitative_noise_update_includes_posterior_uncertainty(random_generat
 
     np.testing.assert_allclose(alpha, alpha_exact.astype(np.float32), rtol=1e-5, atol=1e-5)
     assert np.isclose(float(updated_sigma_error2), expected_sigma_error2, rtol=1e-5, atol=1e-5)
+
+
+def test_validation_restores_best_iterate(monkeypatch: pytest.MonkeyPatch):
+    call_counter = {"count": 0}
+
+    def fake_fit_collapsed_posterior(
+        genotype_matrix,
+        covariate_matrix,
+        targets,
+        reduced_prior_variances,
+        sigma_error2,
+        alpha_init,
+        beta_init,
+        trait_type,
+        config,
+    ):
+        call_counter["count"] += 1
+        if call_counter["count"] <= config.max_outer_iterations:
+            parameter_value = np.float32(call_counter["count"])
+            return PosteriorState(
+                alpha=np.array([parameter_value], dtype=np.float32),
+                beta=np.array([parameter_value], dtype=np.float32),
+                beta_variance=np.ones(1, dtype=np.float32),
+                linear_predictor=np.zeros(targets.shape[0], dtype=np.float32),
+                collapsed_objective=0.0,
+                sigma_error2=1.0,
+            )
+        return PosteriorState(
+            alpha=np.asarray(alpha_init, dtype=np.float32),
+            beta=np.asarray(beta_init, dtype=np.float32),
+            beta_variance=np.ones(1, dtype=np.float32),
+            linear_predictor=np.zeros(targets.shape[0], dtype=np.float32),
+            collapsed_objective=0.0,
+            sigma_error2=1.0,
+        )
+
+    def fake_validation_metric(trait_type, genotype_matrix, covariate_matrix, targets, alpha, beta):
+        return float(beta[0])
+
+    monkeypatch.setattr(mixture_inference, "_fit_collapsed_posterior", fake_fit_collapsed_posterior)
+    monkeypatch.setattr(mixture_inference, "_validation_metric", fake_validation_metric)
+
+    result = fit_variational_em(
+        genotypes=np.zeros((8, 1), dtype=np.float32),
+        covariates=np.ones((8, 1), dtype=np.float32),
+        targets=np.zeros(8, dtype=np.float32),
+        records=[VariantRecord("variant_0", VariantClass.SNV, "1", 100)],
+        config=ModelConfig(
+            trait_type=TraitType.QUANTITATIVE,
+            max_outer_iterations=3,
+            update_hyperparameters=False,
+        ),
+        validation_data=(
+            np.zeros((4, 1), dtype=np.float32),
+            np.ones((4, 1), dtype=np.float32),
+            np.zeros(4, dtype=np.float32),
+        ),
+    )
+
+    assert np.isclose(float(result.beta_reduced[0]), 1.0)
+
+
+def test_tpb_shape_vectors_are_learned_from_local_scale_state():
+    updated_shape_a, updated_shape_b = _update_tpb_shape_vectors(
+        class_membership_matrix=np.array([[1.0, 0.0], [0.0, 1.0]], dtype=np.float64),
+        current_shape_a_vector=np.array([1.0, 1.0], dtype=np.float64),
+        current_shape_b_vector=np.array([0.5, 0.5], dtype=np.float64),
+        local_scale=np.array([0.1, 5.0], dtype=np.float64),
+        auxiliary_delta=np.array([2.0, 0.2], dtype=np.float64),
+        config=ModelConfig(maximum_tpb_shape_iterations=6, tpb_shape_learning_rate=0.1),
+    )
+
+    assert not np.allclose(updated_shape_a, [1.0, 1.0])
+    assert not np.allclose(updated_shape_b, [0.5, 0.5])
+    assert not np.isclose(updated_shape_a[0], updated_shape_a[1])
