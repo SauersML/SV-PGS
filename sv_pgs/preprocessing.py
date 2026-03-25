@@ -3,7 +3,6 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Sequence
 
-import jax.numpy as jnp
 import numpy as np
 
 from sv_pgs.config import ModelConfig, VariantClass
@@ -16,8 +15,8 @@ class Preprocessor:
     scales: np.ndarray
 
     def transform(self, genotypes: np.ndarray) -> np.ndarray:
-        genotype_matrix = jnp.asarray(genotypes, dtype=jnp.float32)
-        imputed_genotypes = _impute_missing_values(genotype_matrix, jnp.asarray(self.means))
+        genotype_matrix = np.asarray(genotypes, dtype=np.float32)
+        imputed_genotypes = _impute_missing_values(genotype_matrix, self.means)
         return np.asarray((imputed_genotypes - self.means) / self.scales, dtype=np.float32)
 
 
@@ -27,9 +26,9 @@ def fit_preprocessor(
     targets: np.ndarray,
     config: ModelConfig,
 ) -> PreparedArrays:
-    genotype_matrix = jnp.asarray(genotypes, dtype=jnp.float32)
-    covariate_matrix = jnp.asarray(covariates, dtype=jnp.float32)
-    target_array = jnp.asarray(targets, dtype=jnp.float32).reshape(-1)
+    genotype_matrix = np.asarray(genotypes, dtype=np.float32)
+    covariate_matrix = np.asarray(covariates, dtype=np.float32)
+    target_array = np.asarray(targets, dtype=np.float32).reshape(-1)
     if genotype_matrix.ndim != 2:
         raise ValueError("genotypes must be 2D.")
     if covariate_matrix.ndim != 2:
@@ -37,12 +36,12 @@ def fit_preprocessor(
     if genotype_matrix.shape[0] != covariate_matrix.shape[0] or genotype_matrix.shape[0] != target_array.shape[0]:
         raise ValueError("genotypes, covariates, and targets must share sample dimension.")
 
-    means = jnp.nanmean(genotype_matrix, axis=0)
-    means = jnp.where(jnp.isnan(means), 0.0, means)
+    means = np.nanmean(genotype_matrix, axis=0)
+    means = np.where(np.isnan(means), 0.0, means)
     imputed_genotypes = _impute_missing_values(genotype_matrix, means)
     centered_genotypes = imputed_genotypes - means
-    scales = jnp.sqrt(jnp.mean(centered_genotypes * centered_genotypes, axis=0))
-    scales = jnp.where(scales < config.minimum_scale, 1.0, scales)
+    scales = np.sqrt(np.mean(centered_genotypes * centered_genotypes, axis=0))
+    scales = np.where(scales < config.minimum_scale, 1.0, scales)
 
     return PreparedArrays(
         genotypes=np.asarray(centered_genotypes / scales, dtype=np.float32),
@@ -53,8 +52,8 @@ def fit_preprocessor(
     )
 
 
-def _impute_missing_values(genotype_matrix: jnp.ndarray, means: jnp.ndarray) -> jnp.ndarray:
-    return jnp.where(jnp.isnan(genotype_matrix), means[None, :], genotype_matrix)
+def _impute_missing_values(genotype_matrix: np.ndarray, means: np.ndarray) -> np.ndarray:
+    return np.where(np.isnan(genotype_matrix), means[None, :], genotype_matrix)
 
 
 def select_active_variant_indices(

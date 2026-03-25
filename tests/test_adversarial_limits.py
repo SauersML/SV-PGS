@@ -52,8 +52,6 @@ def test_rare_event_binary_signal_should_still_beat_chance():
         ModelConfig(
             trait_type=TraitType.BINARY,
             max_outer_iterations=10,
-            ld_block_max_variants=10,
-            ld_block_window_bp=200_000,
         )
     ).fit(
         genotype_matrix[:train_stop],

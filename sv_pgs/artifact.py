@@ -159,13 +159,9 @@ def _record_from_json(payload: dict[str, Any]) -> VariantRecord:
         length=float(payload["length"]),
         allele_frequency=float(payload["allele_frequency"]),
         quality=float(payload["quality"]),
-        training_support=(
-            None
-            if payload.get("training_support") is None
-            else int(payload["training_support"])
-        ),
+        training_support=None if payload["training_support"] is None else int(payload["training_support"]),
         is_repeat=bool(payload["is_repeat"]),
         is_copy_number=bool(payload["is_copy_number"]),
-        prior_class_members=tuple(VariantClass(member) for member in payload.get("prior_class_members", [])),
-        prior_class_membership=tuple(float(weight) for weight in payload.get("prior_class_membership", [])),
+        prior_class_members=tuple(VariantClass(member) for member in payload["prior_class_members"]),
+        prior_class_membership=tuple(float(weight) for weight in payload["prior_class_membership"]),
     )

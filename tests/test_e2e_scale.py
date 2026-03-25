@@ -188,8 +188,6 @@ def test_large_scale_binary_end_to_end_roundtrip(tmp_path: Path):
             trait_type=TraitType.BINARY,
             max_outer_iterations=12,
             minimum_structural_variant_carriers=2,
-            ld_block_max_variants=32,
-            ld_block_window_bp=250_000,
         )
     ).fit(
         genotype_matrix[:train_stop],
@@ -238,9 +236,7 @@ def test_large_scale_benchmark_and_quantitative_fit():
                     trait_type=TraitType.BINARY,
                     max_outer_iterations=10,
                     minimum_structural_variant_carriers=2,
-                    ld_block_max_variants=32,
-                ld_block_window_bp=250_000,
-            )
+                )
         ),
     )
 
@@ -263,8 +259,6 @@ def test_large_scale_benchmark_and_quantitative_fit():
                 trait_type=TraitType.QUANTITATIVE,
                 max_outer_iterations=7,
                 minimum_structural_variant_carriers=2,
-                ld_block_max_variants=32,
-                ld_block_window_bp=250_000,
             )
         ),
     )
@@ -278,8 +272,6 @@ def test_large_scale_benchmark_and_quantitative_fit():
             trait_type=TraitType.QUANTITATIVE,
             max_outer_iterations=7,
             minimum_structural_variant_carriers=2,
-            ld_block_max_variants=32,
-            ld_block_window_bp=250_000,
         )
     ).fit(
         quantitative_genotypes[:390],
@@ -339,7 +331,7 @@ def test_artifact_roundtrip_preserves_prior_membership_metadata(tmp_path: Path):
         class_tpb_shape_a={VariantClass.OTHER_COMPLEX_SV: 1.0},
         class_tpb_shape_b={VariantClass.OTHER_COMPLEX_SV: 0.5},
         scale_model_coefficients=np.zeros(3, dtype=np.float32),
-        scale_model_feature_names=["intercept", "quality_linear", "copy_number_indicator"],
+        scale_model_feature_names=["type_offset::snv", "repeat_indicator", "copy_number_indicator"],
         objective_history=[-10.0, -9.0],
         validation_history=[0.7],
     )

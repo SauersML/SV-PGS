@@ -4,8 +4,6 @@ from dataclasses import dataclass, fields
 from typing import Sequence
 
 import numpy as np
-from jax.scipy.special import ndtri
-from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import average_precision_score, log_loss, r2_score, roc_auc_score
 
 from sv_pgs.config import BenchmarkConfig, ModelConfig, TraitType
@@ -19,9 +17,6 @@ class BenchmarkMetrics:
     auc: float | None
     log_loss: float | None
     pr_auc: float | None
-    calibration_intercept: float | None
-    calibration_slope: float | None
-    liability_r2: float | None
     r2: float | None
     top_tail_enrichment: float
 
@@ -34,9 +29,8 @@ def run_benchmark_suite(
     test_covariates: np.ndarray,
     test_targets: np.ndarray,
     records: Sequence[VariantRecord | dict],
-    benchmark_config: BenchmarkConfig | None = None,
+    benchmark_config: BenchmarkConfig,
 ) -> dict[str, BenchmarkMetrics]:
-    benchmark_config = benchmark_config or BenchmarkConfig()
     shared_config = benchmark_config.shared_config
 
     normalized_records = normalize_variant_records(records)
@@ -54,7 +48,7 @@ def run_benchmark_suite(
 
     model_specs: list[tuple[str, BayesianPGS, np.ndarray]] = [
         (
-            "snv_only_frozen_hyperparameters",
+            "snv_only_without_hyperparameter_updates",
             _fit_model(current_snv_config, train_genotypes[:, snv_mask], train_covariates, train_targets, snv_records),
             test_genotypes[:, snv_mask],
         ),
@@ -114,17 +108,10 @@ def _compute_metrics(
         auc = float(roc_auc_score(targets, probabilities))
         pr_auc = float(average_precision_score(targets, probabilities))
         loss = float(log_loss(targets, probabilities))
-        intercept, slope = _calibration(probabilities, targets)
-        liability_value = None
-        if benchmark_config.prevalence is not None:
-            liability_value = _liability_r2(probabilities, targets, benchmark_config.prevalence)
         return BenchmarkMetrics(
             auc=auc,
             log_loss=loss,
             pr_auc=pr_auc,
-            calibration_intercept=intercept,
-            calibration_slope=slope,
-            liability_r2=liability_value,
             r2=None,
             top_tail_enrichment=_top_tail_enrichment(
                 probabilities,
@@ -138,9 +125,6 @@ def _compute_metrics(
         auc=None,
         log_loss=None,
         pr_auc=None,
-        calibration_intercept=None,
-        calibration_slope=None,
-        liability_r2=None,
         r2=float(r2_score(targets, scores)),
         top_tail_enrichment=_top_tail_enrichment(
             scores,
@@ -149,36 +133,6 @@ def _compute_metrics(
             trait_type=trait_type,
         ),
     )
-
-
-def _calibration(probabilities: np.ndarray, targets: np.ndarray) -> tuple[float, float]:
-    logits = np.log(
-        np.clip(probabilities, 1e-6, 1.0 - 1e-6) / np.clip(1.0 - probabilities, 1e-6, 1.0 - 1e-6)
-    )
-    calibration_model = LogisticRegression(
-        C=1e6,
-        solver="lbfgs",
-        fit_intercept=True,
-        max_iter=200,
-    )
-    calibration_model.fit(logits.reshape(-1, 1), targets)
-    return (
-        float(calibration_model.intercept_[0]),
-        float(calibration_model.coef_[0, 0]),
-    )
-
-
-def _liability_r2(probabilities: np.ndarray, targets: np.ndarray, prevalence: float) -> float:
-    observed_r2 = max(0.0, float(r2_score(targets, probabilities)))
-    sample_prevalence = float(np.mean(targets))
-    threshold = float(ndtri(1.0 - prevalence))
-    density = float(np.exp(-0.5 * threshold * threshold) / np.sqrt(2.0 * np.pi))
-    scale_value = ((prevalence * (1.0 - prevalence)) / density) ** 2 / max(
-        sample_prevalence * (1.0 - sample_prevalence),
-        1e-8,
-    )
-    return observed_r2 * scale_value
-
 
 def _top_tail_enrichment(
     scores: np.ndarray,

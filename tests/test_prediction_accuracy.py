@@ -126,8 +126,6 @@ class TestQuantitativePrediction:
         config = ModelConfig(
             trait_type=TraitType.QUANTITATIVE,
             max_outer_iterations=15,
-            ld_block_max_variants=20,
-            ld_block_window_bp=200_000,
         )
         model = BayesianPGS(config).fit(
             genotype_matrix[:train_stop],
@@ -161,8 +159,6 @@ class TestQuantitativePrediction:
         config = ModelConfig(
             trait_type=TraitType.QUANTITATIVE,
             max_outer_iterations=15,
-            ld_block_max_variants=12,
-            ld_block_window_bp=200_000,
         )
         model = BayesianPGS(config).fit(
             genotype_matrix, covariate_matrix, target_vector, variant_records,
@@ -203,8 +199,6 @@ class TestBinaryPrediction:
         config = ModelConfig(
             trait_type=TraitType.BINARY,
             max_outer_iterations=12,
-            ld_block_max_variants=20,
-            ld_block_window_bp=200_000,
         )
         model = BayesianPGS(config).fit(
             genotype_matrix[:train_stop],
@@ -252,8 +246,6 @@ class TestJointSNVSVBenefit:
         base_config = ModelConfig(
             trait_type=TraitType.QUANTITATIVE,
             max_outer_iterations=12,
-            ld_block_max_variants=20,
-            ld_block_window_bp=200_000,
         )
 
         snv_only_model = BayesianPGS(base_config).fit(

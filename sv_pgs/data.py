@@ -23,6 +23,16 @@ class VariantRecord:
     prior_class_members: tuple[VariantClass, ...] = ()
     prior_class_membership: tuple[float, ...] = ()
 
+    def __post_init__(self) -> None:
+        if not self.prior_class_members and not self.prior_class_membership:
+            self.prior_class_members = (self.variant_class,)
+            self.prior_class_membership = (1.0,)
+            return
+        if len(self.prior_class_members) != len(self.prior_class_membership):
+            raise ValueError("prior_class_members and prior_class_membership must have the same length.")
+        if not self.prior_class_members:
+            raise ValueError("prior_class_members cannot be empty when prior_class_membership is provided.")
+
 
 @dataclass(slots=True)
 class PreparedArrays:
@@ -49,18 +59,11 @@ class TieMap:
     def expand_coefficients(
         self,
         reduced_beta: np.ndarray,
-        group_weights: Sequence[np.ndarray] | None = None,
+        group_weights: Sequence[np.ndarray],
     ) -> np.ndarray:
         expanded_coefficients = np.zeros(self.original_to_reduced.shape[0], dtype=np.float32)
         for reduced_index, tie_group in enumerate(self.reduced_to_group):
-            if group_weights is None:
-                group_weight_vector = np.full(
-                    tie_group.member_indices.shape[0],
-                    1.0 / max(int(tie_group.member_indices.shape[0]), 1),
-                    dtype=np.float32,
-                )
-            else:
-                group_weight_vector = np.asarray(group_weights[reduced_index], dtype=np.float32)
+            group_weight_vector = np.asarray(group_weights[reduced_index], dtype=np.float32)
             expanded_coefficients[tie_group.member_indices] = (
                 reduced_beta[reduced_index] * group_weight_vector * tie_group.signs
             )
@@ -77,7 +80,22 @@ def normalize_variant_records(records: Sequence[VariantRecord | dict[str, Any]])
     normalized_records: list[VariantRecord] = []
     for record in records:
         if isinstance(record, VariantRecord):
-            normalized_records.append(record)
+            normalized_records.append(
+                VariantRecord(
+                    variant_id=record.variant_id,
+                    variant_class=record.variant_class,
+                    chromosome=record.chromosome,
+                    position=record.position,
+                    length=record.length,
+                    allele_frequency=record.allele_frequency,
+                    quality=record.quality,
+                    training_support=record.training_support,
+                    is_repeat=record.is_repeat,
+                    is_copy_number=record.is_copy_number,
+                    prior_class_members=record.prior_class_members,
+                    prior_class_membership=record.prior_class_membership,
+                )
+            )
             continue
         normalized_records.append(
             VariantRecord(

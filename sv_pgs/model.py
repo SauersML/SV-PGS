@@ -11,7 +11,15 @@ from sv_pgs.config import ModelConfig, TraitType
 from sv_pgs.data import TieGroup, TieMap, VariantRecord, normalize_variant_records
 from sv_pgs.inference import VariationalFitResult, fit_variational_em
 from sv_pgs.numeric import stable_sigmoid
-from sv_pgs.preprocessing import Preprocessor, build_tie_map, fit_preprocessor, select_active_variant_indices
+from sv_pgs.preprocessing import (
+    Preprocessor,
+    _infer_support_count_from_raw_genotypes,
+    build_tie_map,
+    fit_preprocessor,
+    select_active_variant_indices,
+)
+
+STRUCTURAL_VARIANT_CLASSES = set(ModelConfig.structural_variant_classes())
 
 
 @dataclass(slots=True)
@@ -25,8 +33,8 @@ class FittedState:
 
 
 class BayesianPGS:
-    def __init__(self, config: ModelConfig | None = None) -> None:
-        self.config = config or ModelConfig()
+    def __init__(self, config: ModelConfig) -> None:
+        self.config = config
         self.state: FittedState | None = None
 
     def fit(
@@ -37,13 +45,17 @@ class BayesianPGS:
         variant_records: Sequence[VariantRecord | dict],
         validation_data: tuple[np.ndarray, np.ndarray, np.ndarray] | None = None,
     ) -> "BayesianPGS":
-        normalized_records = normalize_variant_records(variant_records)
+        raw_genotype_matrix = np.asarray(genotypes, dtype=np.float32)
+        normalized_records = _training_records(
+            raw_genotype_matrix,
+            normalize_variant_records(variant_records),
+        )
         covariate_matrix = self._with_intercept(covariates)
-        prepared_arrays = fit_preprocessor(genotypes, covariate_matrix, targets, self.config)
+        prepared_arrays = fit_preprocessor(raw_genotype_matrix, covariate_matrix, targets, self.config)
         preprocessor = Preprocessor(means=prepared_arrays.means, scales=prepared_arrays.scales)
 
         active_variant_indices = select_active_variant_indices(
-            genotype_matrix=np.asarray(genotypes, dtype=np.float32),
+            genotype_matrix=raw_genotype_matrix,
             variant_records=normalized_records,
             config=self.config,
         )
@@ -184,16 +196,6 @@ class BayesianPGS:
             )
         ]
 
-    def artifact_metadata(self) -> dict[str, object]:
-        fitted_state = self._require_state()
-        return {
-            "prior_version": self.config.prior_version,
-            "transform_version": self.config.transform_version,
-            "variant_count": len(fitted_state.variant_records),
-            "active_variant_count": int(fitted_state.active_variant_indices.shape[0]),
-            "reduced_variant_count": int(fitted_state.fit_result.beta_reduced.shape[0]),
-        }
-
     def _require_state(self) -> FittedState:
         if self.state is None:
             raise ValueError("Model is not fitted.")
@@ -236,8 +238,6 @@ def _tie_group_export_weights(
     tie_map: TieMap,
     fit_result: VariationalFitResult,
 ) -> list[np.ndarray]:
-    if fit_result.member_prior_variances is None:
-        raise ValueError("member_prior_variances must be populated for tie-group export.")
     member_prior_variances = np.asarray(fit_result.member_prior_variances, dtype=np.float32)
     group_weights: list[np.ndarray] = []
     for tie_group in tie_map.reduced_to_group:
@@ -245,3 +245,38 @@ def _tie_group_export_weights(
         normalized_weights = member_variances / np.maximum(np.sum(member_variances), 1e-12)
         group_weights.append(normalized_weights.astype(np.float32))
     return group_weights
+
+
+def _training_records(
+    raw_genotypes: np.ndarray,
+    records: Sequence[VariantRecord],
+) -> list[VariantRecord]:
+    training_records: list[VariantRecord] = []
+    for variant_index, record in enumerate(records):
+        raw_variant_values = np.asarray(raw_genotypes[:, variant_index], dtype=np.float32)
+        training_support = _training_support(raw_variant_values, record)
+        training_records.append(
+            VariantRecord(
+                variant_id=record.variant_id,
+                variant_class=record.variant_class,
+                chromosome=record.chromosome,
+                position=record.position,
+                length=record.length,
+                allele_frequency=record.allele_frequency,
+                quality=record.quality,
+                training_support=training_support,
+                is_repeat=record.is_repeat,
+                is_copy_number=record.is_copy_number,
+                prior_class_members=record.prior_class_members,
+                prior_class_membership=record.prior_class_membership,
+            )
+        )
+    return training_records
+
+
+def _training_support(raw_variant_values: np.ndarray, record: VariantRecord) -> int | None:
+    if record.variant_class not in STRUCTURAL_VARIANT_CLASSES:
+        return record.training_support
+    if record.training_support is not None:
+        return record.training_support
+    return _infer_support_count_from_raw_genotypes(raw_variant_values, record)

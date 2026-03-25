@@ -2,8 +2,8 @@ from __future__ import annotations
 
 import numpy as np
 import pytest
-from jax.scipy.special import polygamma
 from scipy.special import kve
+from scipy.special import polygamma
 
 from sv_pgs.config import ModelConfig, TraitType, VariantClass
 from sv_pgs.data import VariantRecord
@@ -16,6 +16,7 @@ from sv_pgs.mixture_inference import (
     _update_tpb_shape_vectors,
 )
 import sv_pgs.mixture_inference as mixture_inference
+from sv_pgs.preprocessing import build_tie_map
 
 from tests.conftest import make_variant_records
 
@@ -29,13 +30,16 @@ def test_quantitative_inference_runs(random_generator):
     true_coefficients = np.zeros(variant_count, dtype=np.float32)
     true_coefficients[0] = 1.0
     target_vector = genotype_matrix @ true_coefficients + random_generator.standard_normal(sample_count).astype(np.float32) * 0.3
+    records = make_variant_records(variant_count)
+    config = ModelConfig(trait_type=TraitType.QUANTITATIVE, max_outer_iterations=5)
 
     result = fit_variational_em(
         genotypes=genotype_matrix,
         covariates=covariate_matrix,
         targets=target_vector,
-        records=make_variant_records(variant_count),
-        config=ModelConfig(trait_type=TraitType.QUANTITATIVE, max_outer_iterations=5),
+        records=records,
+        config=config,
+        tie_map=build_tie_map(genotype_matrix, records, config),
     )
     assert result.beta_reduced.shape == (variant_count,)
     assert result.alpha.shape == (covariate_matrix.shape[1],)
@@ -51,13 +55,16 @@ def test_binary_inference_runs(random_generator):
     true_coefficients[0] = 1.5
     linear_predictor = genotype_matrix @ true_coefficients
     target_vector = (random_generator.random(sample_count) < 1.0 / (1.0 + np.exp(-linear_predictor))).astype(np.float32)
+    records = make_variant_records(variant_count)
+    config = ModelConfig(trait_type=TraitType.BINARY, max_outer_iterations=5)
 
     result = fit_variational_em(
         genotypes=genotype_matrix,
         covariates=covariate_matrix,
         targets=target_vector,
-        records=make_variant_records(variant_count),
-        config=ModelConfig(trait_type=TraitType.BINARY, max_outer_iterations=5),
+        records=records,
+        config=config,
+        tie_map=build_tie_map(genotype_matrix, records, config),
     )
     assert result.beta_reduced.shape == (variant_count,)
     assert result.sigma_error2 == 1.0
@@ -85,18 +92,20 @@ def test_signal_variant_receives_largest_effect(random_generator):
         is_repeat=False,
         is_copy_number=False,
     )
+    config = ModelConfig(trait_type=TraitType.QUANTITATIVE, max_outer_iterations=12)
 
     result = fit_variational_em(
         genotypes=genotype_matrix,
         covariates=covariate_matrix,
         targets=target_vector,
         records=records,
-        config=ModelConfig(trait_type=TraitType.QUANTITATIVE, max_outer_iterations=12),
+        config=config,
+        tie_map=build_tie_map(genotype_matrix, records, config),
     )
     assert np.argmax(np.abs(result.beta_reduced)) == 3
 
 
-def test_trigamma_matches_jax_polygamma_for_small_shapes():
+def test_trigamma_matches_scipy_polygamma_for_small_shapes():
     shape_values = np.array([0.1, 0.2, 0.5, 1.0, 2.0], dtype=np.float32)
     for shape_value in shape_values:
         expected_value = float(polygamma(1, shape_value))
@@ -123,10 +132,13 @@ def test_local_scale_update_uses_unslabbed_baseline_variance():
 
     p_parameter = local_shape_a - 0.5
     chi = coefficient_second_moment / baseline_prior_variances
-    psi = 2.0 * auxiliary_delta
-    z_value = np.sqrt(chi * psi)
-    expected_local_scale = np.sqrt(chi / psi) * (kve(p_parameter + 1.0, z_value) / kve(p_parameter, z_value))
-    expected_auxiliary_delta = (local_shape_a + local_shape_b) / (1.0 + expected_local_scale)
+    expected_auxiliary_delta = auxiliary_delta.copy()
+    expected_local_scale = np.ones_like(expected_auxiliary_delta)
+    for _iteration_index in range(6):
+        psi = 2.0 * expected_auxiliary_delta
+        z_value = np.sqrt(chi * psi)
+        expected_local_scale = np.sqrt(chi / psi) * (kve(p_parameter + 1.0, z_value) / kve(p_parameter, z_value))
+        expected_auxiliary_delta = (local_shape_a + local_shape_b) / (1.0 + expected_local_scale)
 
     np.testing.assert_allclose(updated_local_scale, expected_local_scale)
     np.testing.assert_allclose(updated_auxiliary_delta, expected_auxiliary_delta)
@@ -164,7 +176,12 @@ def test_quantitative_noise_update_includes_posterior_uncertainty(random_generat
     )
     beta_array = np.asarray(beta, dtype=np.float32).astype(np.float64)
     residual_vector = target_vector64 - covariate_matrix64 @ alpha_exact - genotype_matrix64 @ beta_array
-    leverage_diagonal = np.sum(genotype_matrix64 * (covariance_inverse @ genotype_matrix64), axis=0)
+    inverse_covariance_genotypes = covariance_inverse @ genotype_matrix64
+    restricted_projected_genotypes = inverse_covariance_genotypes - (covariance_inverse @ covariate_matrix64) @ np.linalg.solve(
+        gls_normal_matrix,
+        covariate_matrix64.T @ inverse_covariance_genotypes,
+    )
+    leverage_diagonal = np.sum(genotype_matrix64 * restricted_projected_genotypes, axis=0)
     expected_sigma_error2 = (
         np.sum(residual_vector * residual_vector)
         + sigma_error2 * np.sum(prior_variances64 * leverage_diagonal)
@@ -214,15 +231,22 @@ def test_validation_restores_best_iterate(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setattr(mixture_inference, "_fit_collapsed_posterior", fake_fit_collapsed_posterior)
     monkeypatch.setattr(mixture_inference, "_validation_metric", fake_validation_metric)
 
+    config = ModelConfig(
+        trait_type=TraitType.QUANTITATIVE,
+        max_outer_iterations=3,
+        update_hyperparameters=False,
+    )
+
     result = fit_variational_em(
         genotypes=np.zeros((8, 1), dtype=np.float32),
         covariates=np.ones((8, 1), dtype=np.float32),
         targets=np.zeros(8, dtype=np.float32),
         records=[VariantRecord("variant_0", VariantClass.SNV, "1", 100)],
-        config=ModelConfig(
-            trait_type=TraitType.QUANTITATIVE,
-            max_outer_iterations=3,
-            update_hyperparameters=False,
+        config=config,
+        tie_map=build_tie_map(
+            np.zeros((8, 1), dtype=np.float32),
+            [VariantRecord("variant_0", VariantClass.SNV, "1", 100)],
+            config,
         ),
         validation_data=(
             np.zeros((4, 1), dtype=np.float32),

@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from enum import Enum
 from typing import Mapping
 
@@ -8,13 +8,6 @@ from typing import Mapping
 class TraitType(str, Enum):
     QUANTITATIVE = "quantitative"
     BINARY = "binary"
-
-
-class JaxDevicePreference(str, Enum):
-    DEFAULT = "default"
-    GPU = "gpu"
-    CPU = "cpu"
-    TPU = "tpu"
 
 
 class VariantClass(str, Enum):
@@ -84,19 +77,12 @@ STRUCTURAL_VARIANT_CLASSES = (
 @dataclass(slots=True)
 class ModelConfig:
     trait_type: TraitType = TraitType.BINARY
-    jax_device_preference: JaxDevicePreference = JaxDevicePreference.GPU
-    jax_device_index: int = 0
-    require_jax_device: bool = False
     max_outer_iterations: int = 30
     convergence_tolerance: float = 1e-4
     minimum_scale: float = 1e-6
     polya_gamma_minimum_weight: float = 1e-4
     sigma_error_floor: float = 1e-3
     minimum_structural_variant_carriers: int = 5
-    ld_block_max_variants: int = 512
-    ld_block_window_bp: int = 3_000_000
-    discarded_spectrum_tolerance: float = 0.005
-    block_jitter_floor: float = 1e-6
     prior_scale_floor: float = 1e-6
     prior_scale_ceiling: float = 10.0
     global_scale_floor: float = 1e-4
@@ -112,9 +98,6 @@ class ModelConfig:
     minimum_tpb_shape: float = 0.1
     maximum_tpb_shape: float = 10.0
 
-    regularized_horseshoe_slab_scale: float = 2.0
-    enable_horseshoe_slab: bool = True
-
     max_inner_newton_iterations: int = 20
     newton_gradient_tolerance: float = 1e-5
     trust_region_initial_damping: float = 1.0
@@ -123,26 +106,27 @@ class ModelConfig:
     trust_region_success_threshold: float = 0.25
     trust_region_minimum_damping: float = 1e-8
 
+    linear_solver_tolerance: float = 1e-6
+    maximum_linear_solver_iterations: int = 256
+    logdet_probe_count: int = 6
+    logdet_lanczos_steps: int = 12
+    exact_solver_matrix_limit: int = 512
+    posterior_variance_batch_size: int = 64
+    validation_interval: int = 2
+    binary_intercept_calibration: bool = False
+
     update_hyperparameters: bool = True
-    prior_version: str = "collapsed-laplace-em-tpb-gamma-gamma-v1"
-    transform_version: str = "numeric-impute-standardize-v2"
     random_seed: int = 0
 
     def __post_init__(self) -> None:
         if self.max_outer_iterations < 1:
             raise ValueError("max_outer_iterations must be positive.")
-        if self.jax_device_index < 0:
-            raise ValueError("jax_device_index must be non-negative.")
         if self.minimum_scale <= 0.0:
             raise ValueError("minimum_scale must be positive.")
         if self.polya_gamma_minimum_weight <= 0.0:
             raise ValueError("polya_gamma_minimum_weight must be positive.")
         if self.minimum_structural_variant_carriers < 1:
             raise ValueError("minimum_structural_variant_carriers must be positive.")
-        if self.discarded_spectrum_tolerance <= 0.0:
-            raise ValueError("discarded_spectrum_tolerance must be positive.")
-        if self.discarded_spectrum_tolerance >= 1.0:
-            raise ValueError("discarded_spectrum_tolerance must be less than 1.")
         if self.prior_scale_floor <= 0.0:
             raise ValueError("prior_scale_floor must be positive.")
         if self.prior_scale_ceiling <= self.prior_scale_floor:
@@ -165,8 +149,6 @@ class ModelConfig:
             raise ValueError("maximum_tpb_shape_iterations must be positive.")
         if self.tpb_shape_learning_rate <= 0.0:
             raise ValueError("tpb_shape_learning_rate must be positive.")
-        if self.regularized_horseshoe_slab_scale <= 0.0:
-            raise ValueError("regularized_horseshoe_slab_scale must be positive.")
         if self.max_inner_newton_iterations < 1:
             raise ValueError("max_inner_newton_iterations must be positive.")
         if self.newton_gradient_tolerance <= 0.0:
@@ -181,6 +163,20 @@ class ModelConfig:
             raise ValueError("trust_region_success_threshold must lie in (0, 1).")
         if self.trust_region_minimum_damping <= 0.0:
             raise ValueError("trust_region_minimum_damping must be positive.")
+        if self.linear_solver_tolerance <= 0.0:
+            raise ValueError("linear_solver_tolerance must be positive.")
+        if self.maximum_linear_solver_iterations < 1:
+            raise ValueError("maximum_linear_solver_iterations must be positive.")
+        if self.logdet_probe_count < 1:
+            raise ValueError("logdet_probe_count must be positive.")
+        if self.logdet_lanczos_steps < 2:
+            raise ValueError("logdet_lanczos_steps must be at least 2.")
+        if self.exact_solver_matrix_limit < 1:
+            raise ValueError("exact_solver_matrix_limit must be positive.")
+        if self.posterior_variance_batch_size < 1:
+            raise ValueError("posterior_variance_batch_size must be positive.")
+        if self.validation_interval < 1:
+            raise ValueError("validation_interval must be positive.")
 
     def class_log_baseline_scales(self) -> Mapping[VariantClass, float]:
         return dict(DEFAULT_CLASS_LOG_BASELINE_SCALE)
@@ -198,7 +194,6 @@ class ModelConfig:
 
 @dataclass(slots=True)
 class BenchmarkConfig:
+    shared_config: ModelConfig
     snv_classes: tuple[VariantClass, ...] = (VariantClass.SNV,)
     top_tail_fraction: float = 0.05
-    prevalence: float | None = None
-    shared_config: ModelConfig = field(default_factory=ModelConfig)

@@ -116,7 +116,7 @@ def test_benchmark_suite_runs_from_shared_trainer():
     )
 
     assert set(benchmark_metrics) == {
-        "snv_only_frozen_hyperparameters",
+        "snv_only_without_hyperparameter_updates",
         "snv_only_continuous",
         "joint_snv_sv_continuous",
     }
@@ -149,7 +149,7 @@ def test_tie_group_export_weights_are_proportional_to_member_variances():
         class_tpb_shape_a={VariantClass.SNV: 1.0},
         class_tpb_shape_b={VariantClass.SNV: 0.5},
         scale_model_coefficients=np.zeros(1, dtype=np.float32),
-        scale_model_feature_names=["quality_linear"],
+        scale_model_feature_names=["copy_number_indicator"],
         sigma_error2=1.0,
         objective_history=[],
         validation_history=[],
