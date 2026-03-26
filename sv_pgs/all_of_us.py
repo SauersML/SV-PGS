@@ -3,13 +3,19 @@ from __future__ import annotations
 import csv
 import json
 import os
+import re
 from dataclasses import dataclass
+from io import StringIO
 from pathlib import Path
 from typing import Any
 
-from google.cloud import bigquery
+from google.cloud import bigquery, storage
 
 MIN_DISEASE_OCCURRENCES = 2
+GENOMICS_MANIFEST_ENV_VARS = (
+    "MICROARRAY_IDAT_MANIFEST_PATH",
+    "WGS_CRAM_MANIFEST_PATH",
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -109,6 +115,27 @@ class AllOfUsPreparedPhenotype:
     sample_table_path: Path
     sql_path: Path
     metadata_path: Path
+
+
+@dataclass(frozen=True, slots=True)
+class _ManifestSource:
+    env_var: str
+    uri_columns: tuple[str, ...]
+    description: str
+
+
+_MANIFEST_SOURCES: tuple[_ManifestSource, ...] = (
+    _ManifestSource(
+        env_var="MICROARRAY_IDAT_MANIFEST_PATH",
+        uri_columns=("green_idat_uri", "red_idat_uri"),
+        description="microarray_idat",
+    ),
+    _ManifestSource(
+        env_var="WGS_CRAM_MANIFEST_PATH",
+        uri_columns=("cram_uri",),
+        description="wgs_cram",
+    ),
+)
 
 
 def available_disease_names() -> list[str]:
@@ -244,9 +271,12 @@ def prepare_all_of_us_disease_sample_table(
     output_path: str | Path,
     *,
     client: bigquery.Client | None = None,
+    storage_client: storage.Client | None = None,
 ) -> AllOfUsPreparedPhenotype:
     disease_definition = resolve_disease_definition(request.disease)
     rows = fetch_all_of_us_disease_rows(request=request, client=client)
+    research_ids_by_person_id, manifest_sources = _load_all_of_us_research_ids_by_person_id(storage_client)
+    mapped_rows = _attach_research_ids(rows, research_ids_by_person_id)
     sample_table_path = Path(output_path)
     sample_table_path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -267,7 +297,7 @@ def prepare_all_of_us_disease_sample_table(
     with sample_table_path.open("w", encoding="utf-8", newline="") as handle:
         writer = csv.writer(handle, delimiter="\t")
         writer.writerow(header)
-        for row in rows:
+        for row in mapped_rows:
             writer.writerow([_format_value(row.get(column_name)) for column_name in header])
 
     sql_path = sample_table_path.with_suffix(sample_table_path.suffix + ".sql")
@@ -284,9 +314,13 @@ def prepare_all_of_us_disease_sample_table(
                 "min_occurrences": MIN_DISEASE_OCCURRENCES,
                 "billing_project_env": "GOOGLE_PROJECT",
                 "cdr_dataset_env": "WORKSPACE_CDR",
+                "genomics_manifest_envs": list(GENOMICS_MANIFEST_ENV_VARS),
+                "genomics_manifest_sources": manifest_sources,
                 "billing_project": _resolve_billing_project(client),
                 "cdr_dataset": _require_env("WORKSPACE_CDR"),
-                "row_count": len(rows),
+                "input_row_count": len(rows),
+                "row_count": len(mapped_rows),
+                "unmapped_person_count": len(rows) - len(mapped_rows),
             },
             indent=2,
         ),
@@ -316,6 +350,165 @@ def _resolve_billing_project(client: bigquery.Client | None) -> str:
         if isinstance(client_project, str) and client_project.strip():
             return client_project.strip()
     return _require_env("GOOGLE_PROJECT")
+
+
+def _load_all_of_us_research_ids_by_person_id(
+    storage_client: storage.Client | None,
+) -> tuple[dict[str, str], list[str]]:
+    manifest_rows_by_source: list[tuple[_ManifestSource, list[dict[str, str]]]] = []
+    for manifest_source in _MANIFEST_SOURCES:
+        manifest_path = os.environ.get(manifest_source.env_var, "").strip()
+        if not manifest_path:
+            continue
+        manifest_rows_by_source.append(
+            (
+                manifest_source,
+                _read_gcs_csv_rows(
+                    manifest_path,
+                    storage_client=storage_client,
+                ),
+            )
+        )
+
+    if not manifest_rows_by_source:
+        raise ValueError(
+            "Missing required All of Us genomics manifest environment variable. Expected one of: "
+            + ", ".join(GENOMICS_MANIFEST_ENV_VARS)
+        )
+
+    merged_research_ids_by_person_id: dict[str, str] = {}
+    active_sources: list[str] = []
+    for manifest_source, manifest_rows in manifest_rows_by_source:
+        active_sources.append(manifest_source.description)
+        source_mapping = _extract_research_ids_from_manifest_rows(manifest_rows, manifest_source)
+        for person_id, research_id in source_mapping.items():
+            existing_research_id = merged_research_ids_by_person_id.get(person_id)
+            if existing_research_id is not None and existing_research_id != research_id:
+                raise ValueError(
+                    "Conflicting All of Us research_id mappings for person_id "
+                    + person_id
+                    + ": "
+                    + existing_research_id
+                    + " vs "
+                    + research_id
+                )
+            merged_research_ids_by_person_id[person_id] = research_id
+    return merged_research_ids_by_person_id, active_sources
+
+
+def _read_gcs_csv_rows(
+    manifest_path: str,
+    *,
+    storage_client: storage.Client | None,
+) -> list[dict[str, str]]:
+    bucket_name, blob_name = _parse_gcs_uri(manifest_path)
+    active_storage_client = storage_client if storage_client is not None else storage.Client(project=_require_env("GOOGLE_PROJECT"))
+    text = active_storage_client.bucket(bucket_name).blob(blob_name).download_as_text(encoding="utf-8")
+    reader = csv.DictReader(StringIO(text))
+    if reader.fieldnames is None:
+        raise ValueError("Manifest has no header row: " + manifest_path)
+    return [
+        {str(key): "" if value is None else str(value) for key, value in row.items()}
+        for row in reader
+    ]
+
+
+def _parse_gcs_uri(uri: str) -> tuple[str, str]:
+    normalized_uri = uri.strip()
+    if not normalized_uri.startswith("gs://"):
+        raise ValueError("Expected gs:// URI for All of Us manifest: " + normalized_uri)
+    bucket_and_path = normalized_uri[5:]
+    if "/" not in bucket_and_path:
+        raise ValueError("Expected object path in All of Us manifest URI: " + normalized_uri)
+    bucket_name, blob_name = bucket_and_path.split("/", 1)
+    if not bucket_name or not blob_name:
+        raise ValueError("Malformed All of Us manifest URI: " + normalized_uri)
+    return bucket_name, blob_name
+
+
+def _extract_research_ids_from_manifest_rows(
+    manifest_rows: list[dict[str, str]],
+    manifest_source: _ManifestSource,
+) -> dict[str, str]:
+    if not manifest_rows:
+        raise ValueError("All of Us manifest is empty for source: " + manifest_source.description)
+    required_columns = ("person_id", *manifest_source.uri_columns)
+    _require_manifest_columns(manifest_rows, required_columns, manifest_source.description)
+
+    research_ids_by_person_id: dict[str, str] = {}
+    for manifest_row in manifest_rows:
+        person_id = str(manifest_row["person_id"]).strip()
+        if not person_id:
+            raise ValueError("Encountered blank person_id in All of Us manifest: " + manifest_source.description)
+        extracted_research_ids = {
+            _extract_research_id_from_uri(manifest_row[uri_column])
+            for uri_column in manifest_source.uri_columns
+            if str(manifest_row[uri_column]).strip()
+        }
+        if not extracted_research_ids:
+            raise ValueError("No research_id-bearing URI found in All of Us manifest row for person_id " + person_id)
+        if len(extracted_research_ids) != 1:
+            raise ValueError(
+                "Conflicting research_id values within All of Us manifest row for person_id "
+                + person_id
+                + ": "
+                + ", ".join(sorted(extracted_research_ids))
+            )
+        research_id = next(iter(extracted_research_ids))
+        existing_research_id = research_ids_by_person_id.get(person_id)
+        if existing_research_id is not None and existing_research_id != research_id:
+            raise ValueError(
+                "Duplicate person_id with conflicting research_id values in All of Us manifest "
+                + manifest_source.description
+                + ": "
+                + person_id
+            )
+        research_ids_by_person_id[person_id] = research_id
+    return research_ids_by_person_id
+
+
+def _extract_research_id_from_uri(uri: str) -> str:
+    normalized_uri = uri.strip()
+    if not normalized_uri:
+        raise ValueError("Encountered blank All of Us URI while extracting research_id.")
+    file_name = normalized_uri.rsplit("/", 1)[-1]
+    match = re.match(r"(?P<research_id>\d{6,})", file_name)
+    if match is None:
+        raise ValueError("Could not extract research_id from All of Us URI: " + normalized_uri)
+    return match.group("research_id")
+
+
+def _attach_research_ids(
+    rows: list[dict[str, Any]],
+    research_ids_by_person_id: dict[str, str],
+) -> list[dict[str, Any]]:
+    mapped_rows: list[dict[str, Any]] = []
+    for row in rows:
+        person_id = str(row["person_id"]).strip()
+        research_id = research_ids_by_person_id.get(person_id)
+        if research_id is None:
+            continue
+        mapped_row = dict(row)
+        mapped_row["sample_id"] = research_id
+        mapped_rows.append(mapped_row)
+    if not mapped_rows:
+        raise ValueError("No All of Us disease rows matched any genomics research_id mapping.")
+    return mapped_rows
+
+
+def _require_manifest_columns(
+    rows: list[dict[str, str]],
+    required_columns: tuple[str, ...],
+    context: str,
+) -> None:
+    missing_columns = [column_name for column_name in required_columns if column_name not in rows[0]]
+    if missing_columns:
+        raise ValueError(
+            "All of Us manifest "
+            + context
+            + " is missing required columns: "
+            + ", ".join(missing_columns)
+        )
 
 
 def _format_value(value: Any) -> str:
