@@ -10,7 +10,6 @@ from typing import Any
 from google.cloud import bigquery
 
 MIN_DISEASE_OCCURRENCES = 2
-ALL_OF_US_CONTROLLED_TIER_MAINLINE_CDR = "fc-aou-cdr-prod.C2024Q3R3"
 
 
 @dataclass(frozen=True, slots=True)
@@ -131,7 +130,7 @@ def resolve_disease_definition(disease: str) -> DiseaseDefinition:
 
 
 def build_all_of_us_disease_sql(disease_definition: DiseaseDefinition) -> str:
-    dataset = ALL_OF_US_CONTROLLED_TIER_MAINLINE_CDR
+    dataset = _require_env("WORKSPACE_CDR")
     return f"""
 WITH primary_consent AS (
   SELECT
@@ -284,8 +283,9 @@ def prepare_all_of_us_disease_sample_table(
                 "icd10_prefixes": list(disease_definition.icd10_prefixes),
                 "min_occurrences": MIN_DISEASE_OCCURRENCES,
                 "billing_project_env": "GOOGLE_PROJECT",
+                "cdr_dataset_env": "WORKSPACE_CDR",
                 "billing_project": _resolve_billing_project(client),
-                "cdr_dataset": ALL_OF_US_CONTROLLED_TIER_MAINLINE_CDR,
+                "cdr_dataset": _require_env("WORKSPACE_CDR"),
                 "row_count": len(rows),
             },
             indent=2,

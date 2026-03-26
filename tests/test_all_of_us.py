@@ -7,7 +7,6 @@ from pathlib import Path
 import pytest
 
 from sv_pgs.all_of_us import (
-    ALL_OF_US_CONTROLLED_TIER_MAINLINE_CDR,
     AllOfUsDiseaseRequest,
     available_disease_names,
     build_all_of_us_disease_query_config,
@@ -47,14 +46,15 @@ class _FakeBigQueryClient:
         return _FakeQueryJob(self.rows)
 
 
-def test_build_all_of_us_disease_sql_uses_fixed_cdr_and_prefix_filters():
+def test_build_all_of_us_disease_sql_uses_workspace_cdr_and_prefix_filters(monkeypatch):
+    monkeypatch.setenv("WORKSPACE_CDR", "aou_workspace.cdr_dataset")
     disease_definition = resolve_disease_definition("heart_failure")
     sql = build_all_of_us_disease_sql(disease_definition)
     query_config = build_all_of_us_disease_query_config(disease_definition)
 
-    assert f"`{ALL_OF_US_CONTROLLED_TIER_MAINLINE_CDR}.condition_occurrence`" in sql
-    assert f"`{ALL_OF_US_CONTROLLED_TIER_MAINLINE_CDR}.observation_period`" in sql
-    assert f"`{ALL_OF_US_CONTROLLED_TIER_MAINLINE_CDR}.person`" in sql
+    assert "`aou_workspace.cdr_dataset.condition_occurrence`" in sql
+    assert "`aou_workspace.cdr_dataset.observation_period`" in sql
+    assert "`aou_workspace.cdr_dataset.person`" in sql
     assert "condition_source_concept_id" in sql
     assert "vocabulary_id = 'ICD10CM'" in sql
     assert "vocabulary_id = 'ICD9CM'" in sql
@@ -66,6 +66,7 @@ def test_build_all_of_us_disease_sql_uses_fixed_cdr_and_prefix_filters():
 
 def test_prepare_all_of_us_disease_sample_table_writes_outputs(tmp_path: Path, monkeypatch):
     monkeypatch.setenv("GOOGLE_PROJECT", "billing-project")
+    monkeypatch.setenv("WORKSPACE_CDR", "aou_workspace.cdr_dataset")
     fake_client = _FakeBigQueryClient(
         rows=[
             {
@@ -126,11 +127,12 @@ def test_prepare_all_of_us_disease_sample_table_writes_outputs(tmp_path: Path, m
     assert metadata_payload["disease"] == "heart_failure"
     assert metadata_payload["icd10_prefixes"] == ["I50"]
     assert metadata_payload["min_occurrences"] == 2
-    assert metadata_payload["cdr_dataset"] == ALL_OF_US_CONTROLLED_TIER_MAINLINE_CDR
+    assert metadata_payload["cdr_dataset"] == "aou_workspace.cdr_dataset"
 
 
 def test_prepare_all_of_us_disease_requires_all_of_us_env(monkeypatch, tmp_path: Path):
     monkeypatch.delenv("GOOGLE_PROJECT", raising=False)
+    monkeypatch.delenv("WORKSPACE_CDR", raising=False)
 
     with pytest.raises(ValueError, match="GOOGLE_PROJECT"):
         prepare_all_of_us_disease_sample_table(
@@ -139,7 +141,7 @@ def test_prepare_all_of_us_disease_requires_all_of_us_env(monkeypatch, tmp_path:
         )
 
 
-def test_prepare_all_of_us_disease_does_not_require_workspace_cdr_env(monkeypatch, tmp_path: Path):
+def test_prepare_all_of_us_disease_requires_workspace_cdr_env(monkeypatch, tmp_path: Path):
     monkeypatch.setenv("GOOGLE_PROJECT", "billing-project")
     monkeypatch.delenv("WORKSPACE_CDR", raising=False)
     fake_client = _FakeBigQueryClient(
@@ -161,19 +163,17 @@ def test_prepare_all_of_us_disease_does_not_require_workspace_cdr_env(monkeypatc
         ]
     )
 
-    outputs = prepare_all_of_us_disease_sample_table(
-        request=AllOfUsDiseaseRequest(disease="heart failure"),
-        output_path=tmp_path / "heart_failure.tsv",
-        client=fake_client,
-    )
-
-    assert outputs.sample_table_path.is_file()
-    assert fake_client.sql is not None
-    assert ALL_OF_US_CONTROLLED_TIER_MAINLINE_CDR in fake_client.sql
+    with pytest.raises(ValueError, match="WORKSPACE_CDR"):
+        prepare_all_of_us_disease_sample_table(
+            request=AllOfUsDiseaseRequest(disease="heart failure"),
+            output_path=tmp_path / "heart_failure.tsv",
+            client=fake_client,
+        )
 
 
 def test_prepare_all_of_us_disease_uses_client_project_without_google_project_env(monkeypatch, tmp_path: Path):
     monkeypatch.delenv("GOOGLE_PROJECT", raising=False)
+    monkeypatch.setenv("WORKSPACE_CDR", "aou_workspace.cdr_dataset")
     fake_client = _FakeBigQueryClient(
         rows=[
             {
@@ -202,6 +202,40 @@ def test_prepare_all_of_us_disease_uses_client_project_without_google_project_en
 
     metadata_payload = json.loads(outputs.metadata_path.read_text(encoding="utf-8"))
     assert metadata_payload["billing_project"] == "client-project"
+
+
+def test_prepare_all_of_us_disease_uses_workspace_cdr_from_env_in_query_and_metadata(monkeypatch, tmp_path: Path):
+    monkeypatch.setenv("GOOGLE_PROJECT", "billing-project")
+    monkeypatch.setenv("WORKSPACE_CDR", "fc-aou-cdr-prod-ct.C2024Q3R9")
+    fake_client = _FakeBigQueryClient(
+        rows=[
+            {
+                "person_id": "101",
+                "sample_id": "101",
+                "target": 1,
+                "phenotype_occurrence_count": 2,
+                "first_condition_date": "2020-01-01",
+                "observation_start_date": "2018-01-01",
+                "observation_end_date": "2024-01-01",
+                "primary_consent_date": "2017-01-01",
+                "age_at_observation_start": 42,
+                "gender_concept_id": 45880669,
+                "race_concept_id": 8527,
+                "ethnicity_concept_id": 38003564,
+            }
+        ]
+    )
+
+    outputs = prepare_all_of_us_disease_sample_table(
+        request=AllOfUsDiseaseRequest(disease="heart_failure"),
+        output_path=tmp_path / "heart_failure.tsv",
+        client=fake_client,
+    )
+
+    assert fake_client.sql is not None
+    assert "fc-aou-cdr-prod-ct.C2024Q3R9" in fake_client.sql
+    metadata_payload = json.loads(outputs.metadata_path.read_text(encoding="utf-8"))
+    assert metadata_payload["cdr_dataset"] == "fc-aou-cdr-prod-ct.C2024Q3R9"
 
 
 def test_cli_prepare_all_of_us_disease_wires_request_and_outputs(monkeypatch, tmp_path: Path):
