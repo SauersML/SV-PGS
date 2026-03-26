@@ -67,10 +67,13 @@ class _FakeStorageBucket:
 
 
 class _FakeStorageClient:
-    def __init__(self, payloads_by_bucket_and_blob: dict[tuple[str, str], str]) -> None:
+    def __init__(self, payloads_by_bucket_and_blob: dict[tuple[str, str], str], project: str | None = None) -> None:
         self.payloads_by_bucket_and_blob = payloads_by_bucket_and_blob
+        self.project = project
+        self.bucket_calls: list[tuple[str, str | None]] = []
 
-    def bucket(self, bucket_name: str) -> _FakeStorageBucket:
+    def bucket(self, bucket_name: str, user_project: str | None = None) -> _FakeStorageBucket:
+        self.bucket_calls.append((bucket_name, user_project))
         payloads_by_blob_name = {
             blob_name: payload
             for (candidate_bucket_name, blob_name), payload in self.payloads_by_bucket_and_blob.items()
@@ -179,6 +182,7 @@ def test_prepare_all_of_us_disease_sample_table_writes_outputs(tmp_path: Path, m
     assert metadata_payload["min_occurrences"] == 2
     assert metadata_payload["cdr_dataset"] == "aou_workspace.cdr_dataset"
     assert metadata_payload["genomics_manifest_sources"] == ["microarray_idat"]
+    assert fake_storage_client.bucket_calls == [("aou-bucket", "billing-project")]
 
 
 def test_prepare_all_of_us_disease_requires_all_of_us_env(monkeypatch, tmp_path: Path):
@@ -398,6 +402,48 @@ def test_extract_research_ids_from_manifest_rows_detects_conflicts():
                 description="microarray_idat",
             ),
         )
+
+
+def test_prepare_all_of_us_disease_uses_requester_pays_billing_project_for_manifests(monkeypatch, tmp_path: Path):
+    monkeypatch.setenv("GOOGLE_PROJECT", "billing-project")
+    monkeypatch.setenv("WORKSPACE_CDR", "aou_workspace.cdr_dataset")
+    monkeypatch.setenv("MICROARRAY_IDAT_MANIFEST_PATH", "gs://aou-bucket/microarray/idat/manifest.csv")
+    fake_client = _FakeBigQueryClient(
+        rows=[
+            {
+                "person_id": "101",
+                "sample_id": "101",
+                "target": 1,
+                "phenotype_occurrence_count": 3,
+                "first_condition_date": "2020-01-01",
+                "observation_start_date": "2018-01-01",
+                "observation_end_date": "2024-01-01",
+                "primary_consent_date": "2017-01-01",
+                "age_at_observation_start": 42,
+                "gender_concept_id": 45880669,
+                "race_concept_id": 8527,
+                "ethnicity_concept_id": 38003564,
+            }
+        ]
+    )
+    fake_storage_client = _FakeStorageClient(
+        {
+            (
+                "aou-bucket",
+                "microarray/idat/manifest.csv",
+            ): "person_id,green_idat_uri,red_idat_uri\n"
+            "101,gs://aou-bucket/idat/9000001_11111_R01C01_Grn.idat,gs://aou-bucket/idat/9000001_11111_R01C01_Red.idat\n"
+        }
+    )
+
+    prepare_all_of_us_disease_sample_table(
+        request=AllOfUsDiseaseRequest(disease="heart_failure"),
+        output_path=tmp_path / "heart_failure.tsv",
+        client=fake_client,
+        storage_client=fake_storage_client,
+    )
+
+    assert fake_storage_client.bucket_calls == [("aou-bucket", "billing-project")]
 
 
 def test_cli_prepare_all_of_us_disease_wires_request_and_outputs(monkeypatch, tmp_path: Path):

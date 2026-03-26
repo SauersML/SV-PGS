@@ -275,7 +275,11 @@ def prepare_all_of_us_disease_sample_table(
 ) -> AllOfUsPreparedPhenotype:
     disease_definition = resolve_disease_definition(request.disease)
     rows = fetch_all_of_us_disease_rows(request=request, client=client)
-    research_ids_by_person_id, manifest_sources = _load_all_of_us_research_ids_by_person_id(storage_client)
+    billing_project = _resolve_billing_project(client)
+    research_ids_by_person_id, manifest_sources = _load_all_of_us_research_ids_by_person_id(
+        storage_client,
+        billing_project=billing_project,
+    )
     mapped_rows = _attach_research_ids(rows, research_ids_by_person_id)
     sample_table_path = Path(output_path)
     sample_table_path.parent.mkdir(parents=True, exist_ok=True)
@@ -316,7 +320,7 @@ def prepare_all_of_us_disease_sample_table(
                 "cdr_dataset_env": "WORKSPACE_CDR",
                 "genomics_manifest_envs": list(GENOMICS_MANIFEST_ENV_VARS),
                 "genomics_manifest_sources": manifest_sources,
-                "billing_project": _resolve_billing_project(client),
+                "billing_project": billing_project,
                 "cdr_dataset": _require_env("WORKSPACE_CDR"),
                 "input_row_count": len(rows),
                 "row_count": len(mapped_rows),
@@ -352,8 +356,18 @@ def _resolve_billing_project(client: bigquery.Client | None) -> str:
     return _require_env("GOOGLE_PROJECT")
 
 
+def _resolve_storage_project(storage_client: storage.Client | None) -> str | None:
+    if storage_client is not None:
+        client_project = getattr(storage_client, "project", None)
+        if isinstance(client_project, str) and client_project.strip():
+            return client_project.strip()
+    return None
+
+
 def _load_all_of_us_research_ids_by_person_id(
     storage_client: storage.Client | None,
+    *,
+    billing_project: str,
 ) -> tuple[dict[str, str], list[str]]:
     manifest_rows_by_source: list[tuple[_ManifestSource, list[dict[str, str]]]] = []
     for manifest_source in _MANIFEST_SOURCES:
@@ -366,6 +380,7 @@ def _load_all_of_us_research_ids_by_person_id(
                 _read_gcs_csv_rows(
                     manifest_path,
                     storage_client=storage_client,
+                    billing_project=billing_project,
                 ),
             )
         )
@@ -400,10 +415,12 @@ def _read_gcs_csv_rows(
     manifest_path: str,
     *,
     storage_client: storage.Client | None,
+    billing_project: str,
 ) -> list[dict[str, str]]:
     bucket_name, blob_name = _parse_gcs_uri(manifest_path)
-    active_storage_client = storage_client if storage_client is not None else storage.Client(project=_require_env("GOOGLE_PROJECT"))
-    text = active_storage_client.bucket(bucket_name).blob(blob_name).download_as_text(encoding="utf-8")
+    resolved_storage_project = _resolve_storage_project(storage_client) or billing_project
+    active_storage_client = storage_client if storage_client is not None else storage.Client(project=resolved_storage_project)
+    text = active_storage_client.bucket(bucket_name, user_project=billing_project).blob(blob_name).download_as_text(encoding="utf-8")
     reader = csv.DictReader(StringIO(text))
     if reader.fieldnames is None:
         raise ValueError("Manifest has no header row: " + manifest_path)
