@@ -15,6 +15,8 @@ from sv_pgs.config import ModelConfig, TraitType, VariantClass
 from sv_pgs.data import VariantRecord
 from sv_pgs.model import BayesianPGS
 
+SV_LENGTH_THRESHOLD = 1_000.0
+
 
 @dataclass(slots=True)
 class LoadedDataset:
@@ -370,7 +372,7 @@ def _write_predictions_and_summary(
         training_auc = None if unique_targets.shape[0] < 2 else float(roc_auc_score(dataset.targets, probabilities))
         return {
             "training_auc": training_auc,
-            "training_log_loss": float(log_loss(dataset.targets, probabilities)),
+            "training_log_loss": float(log_loss(dataset.targets, probabilities, labels=[0.0, 1.0])),
             "training_accuracy": float(np.mean(predicted_labels == dataset.targets)),
         }
 
@@ -506,10 +508,18 @@ def _infer_vcf_variant_class(record: Any) -> VariantClass:
         return VariantClass.SNV
     if record.is_indel and not record.is_sv:
         return VariantClass.SMALL_INDEL
-    return VariantClass.OTHER_COMPLEX_SV
+    variant_token = _normalize_variant_token(record.INFO.get("SVTYPE"))
+    if variant_token is None:
+        variant_token = _normalize_variant_token(record.ALT[0])
+    if variant_token is None:
+        return VariantClass.OTHER_COMPLEX_SV
+    return _structural_variant_class_from_token(variant_token, _infer_vcf_length(record))
 
 
 def _infer_plink_variant_class(allele_1: str, allele_2: str) -> VariantClass:
+    structural_token = _symbolic_variant_token(allele_1, allele_2)
+    if structural_token is not None:
+        return _structural_variant_class_from_token(structural_token, length=1.0)
     if len(allele_1) == 1 and len(allele_2) == 1:
         return VariantClass.SNV
     return VariantClass.SMALL_INDEL
@@ -614,3 +624,38 @@ def _parse_float(value: str, column_name: str) -> float:
 
 def _format_float(value: float) -> str:
     return format(value, ".8g")
+
+
+def _normalize_variant_token(value: Any) -> str | None:
+    if value is None:
+        return None
+    normalized_value = str(value).strip().upper()
+    if not normalized_value:
+        return None
+    if normalized_value.startswith("<") and normalized_value.endswith(">"):
+        normalized_value = normalized_value[1:-1]
+    return normalized_value
+
+
+def _symbolic_variant_token(allele_1: str, allele_2: str) -> str | None:
+    for allele in (allele_1, allele_2):
+        normalized_allele = _normalize_variant_token(allele)
+        if normalized_allele is None:
+            continue
+        if any(token in normalized_allele for token in ("DEL", "DUP", "INS", "INV", "BND", "STR", "VNTR", "ME")):
+            return normalized_allele
+    return None
+
+
+def _structural_variant_class_from_token(token: str, length: float) -> VariantClass:
+    if "DEL" in token:
+        return VariantClass.DELETION_LONG if length >= SV_LENGTH_THRESHOLD else VariantClass.DELETION_SHORT
+    if "DUP" in token or "CNV" in token:
+        return VariantClass.DUPLICATION_LONG if length >= SV_LENGTH_THRESHOLD else VariantClass.DUPLICATION_SHORT
+    if "INS" in token or "ME" in token:
+        return VariantClass.INSERTION_MEI
+    if "INV" in token or "BND" in token:
+        return VariantClass.INVERSION_BND_COMPLEX
+    if "STR" in token or "VNTR" in token or "REPEAT" in token:
+        return VariantClass.STR_VNTR_REPEAT
+    return VariantClass.OTHER_COMPLEX_SV
