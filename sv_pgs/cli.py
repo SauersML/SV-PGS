@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 
+from sv_pgs.all_of_us import AllOfUsDiseaseRequest, available_disease_names, prepare_all_of_us_disease_sample_table
 from sv_pgs.config import ModelConfig, TraitType
 from sv_pgs.io import load_dataset_from_files, run_training_pipeline
 
@@ -10,6 +11,24 @@ from sv_pgs.io import load_dataset_from_files, run_training_pipeline
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="sv-pgs")
     subparsers = parser.add_subparsers(dest="command", required=True)
+
+    disease_list_parser = subparsers.add_parser(
+        "list-all-of-us-diseases",
+        help="List built-in All of Us disease presets.",
+    )
+    disease_list_parser.set_defaults(command="list-all-of-us-diseases")
+
+    aou_parser = subparsers.add_parser(
+        "prepare-all-of-us-disease",
+        help="Query All of Us EHR condition data for a built-in disease phenotype and write a pre-fit sample table.",
+    )
+    aou_parser.add_argument(
+        "--disease",
+        required=True,
+        metavar="DISEASE",
+        help="Built-in disease phenotype or alias. See list-all-of-us-diseases for canonical names.",
+    )
+    aou_parser.add_argument("--output", required=True, help="Output TSV path for the prepared sample table.")
 
     run_parser = subparsers.add_parser("run", help="Load genotype files, fit the model, and write outputs.")
     run_parser.add_argument("--genotypes", required=True, help="Path to a VCF/BCF file or PLINK 1 .bed file.")
@@ -42,6 +61,23 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
+
+    if args.command == "list-all-of-us-diseases":
+        for disease_name in available_disease_names():
+            print(disease_name)
+        return 0
+
+    if args.command == "prepare-all-of-us-disease":
+        outputs = prepare_all_of_us_disease_sample_table(
+            request=AllOfUsDiseaseRequest(
+                disease=args.disease,
+            ),
+            output_path=Path(args.output),
+        )
+        print("sample_table\t" + str(outputs.sample_table_path))
+        print("sql\t" + str(outputs.sql_path))
+        print("metadata\t" + str(outputs.metadata_path))
+        return 0
 
     if args.command != "run":
         raise ValueError("Unsupported command: " + str(args.command))
