@@ -33,12 +33,6 @@ def build_parser() -> argparse.ArgumentParser:
         help="Optional CSV or TSV keyed by variant_id with VariantRecord fields.",
     )
     run_parser.add_argument("--output-dir", required=True, help="Directory for artifact and result tables.")
-    run_parser.add_argument(
-        "--trait-type",
-        required=True,
-        choices=(TraitType.BINARY.value, TraitType.QUANTITATIVE.value),
-        help="Trait type for fitting.",
-    )
     run_parser.add_argument("--max-outer-iterations", type=int, default=30)
     run_parser.add_argument("--minimum-structural-variant-carriers", type=int, default=5)
     run_parser.add_argument("--random-seed", type=int, default=0)
@@ -64,7 +58,7 @@ def main(argv: list[str] | None = None) -> int:
     outputs = run_training_pipeline(
         dataset=dataset,
         config=ModelConfig(
-            trait_type=TraitType(args.trait_type),
+            trait_type=_infer_trait_type(dataset.targets),
             max_outer_iterations=args.max_outer_iterations,
             minimum_structural_variant_carriers=args.minimum_structural_variant_carriers,
             random_seed=args.random_seed,
@@ -77,6 +71,13 @@ def main(argv: list[str] | None = None) -> int:
     print("predictions\t" + str(outputs.predictions_path))
     print("coefficients\t" + str(outputs.coefficients_path))
     return 0
+
+
+def _infer_trait_type(targets) -> TraitType:
+    unique_targets = sorted({float(value) for value in targets})
+    if all(target_value in {0.0, 1.0} for target_value in unique_targets):
+        return TraitType.BINARY
+    return TraitType.QUANTITATIVE
 
 
 if __name__ == "__main__":

@@ -8,6 +8,7 @@ import numpy as np
 from bed_reader import to_bed
 
 from sv_pgs.config import ModelConfig, TraitType, VariantClass
+from sv_pgs.cli import main
 from sv_pgs.io import load_dataset_from_files, run_training_pipeline
 
 
@@ -158,6 +159,59 @@ def test_run_training_pipeline_from_plink_inputs_writes_outputs(tmp_path: Path):
     coefficient_lines = outputs.coefficients_path.read_text(encoding="utf-8").strip().splitlines()
     assert len(prediction_lines) == 7
     assert len(coefficient_lines) == 4
+
+
+def test_cli_infers_binary_trait_type(tmp_path: Path):
+    vcf_path = tmp_path / "cohort.vcf"
+    vcf_path.write_text(
+        "\n".join(
+            [
+                "##fileformat=VCFv4.2",
+                "##contig=<ID=1>",
+                "##INFO=<ID=AF,Number=A,Type=Float,Description=\"Allele frequency\">",
+                "##FORMAT=<ID=GT,Number=1,Type=String,Description=\"Genotype\">",
+                "#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\ts1\ts2\ts3\ts4",
+                "1\t100\trs1\tA\tC\t50\tPASS\tAF=0.25\tGT\t0/0\t0/1\t1/1\t0/1",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    sample_table_path = tmp_path / "samples.tsv"
+    _write_table(
+        sample_table_path,
+        header=("sample_id", "target"),
+        rows=(
+            ("s1", "0"),
+            ("s2", "1"),
+            ("s3", "1"),
+            ("s4", "0"),
+        ),
+    )
+
+    output_dir = tmp_path / "run"
+    exit_code = main(
+        [
+            "run",
+            "--genotypes",
+            str(vcf_path),
+            "--sample-table",
+            str(sample_table_path),
+            "--target-column",
+            "target",
+            "--output-dir",
+            str(output_dir),
+            "--max-outer-iterations",
+            "1",
+            "--minimum-structural-variant-carriers",
+            "1",
+        ]
+    )
+
+    assert exit_code == 0
+    summary_payload = json.loads((output_dir / "summary.json").read_text(encoding="utf-8"))
+    assert summary_payload["trait_type"] == "binary"
 
 
 def _write_table(path: Path, header: tuple[str, ...], rows: tuple[tuple[str, ...], ...]) -> None:
