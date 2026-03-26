@@ -16,6 +16,7 @@ from sv_pgs.data import VariantRecord
 from sv_pgs.model import BayesianPGS
 
 SV_LENGTH_THRESHOLD = 1_000.0
+DEFAULT_SAMPLE_ID_COLUMNS = ("sample_id", "research_id", "person_id")
 
 
 @dataclass(slots=True)
@@ -60,17 +61,14 @@ def load_dataset_from_files(
     covariate_columns: Sequence[str],
     *,
     genotype_format: str = "auto",
-    sample_id_column: str = "sample_id",
+    sample_id_column: str = "auto",
     variant_metadata_path: str | Path | None = None,
 ) -> LoadedDataset:
     source_path = Path(genotype_path)
     resolved_format = _resolve_genotype_format(source_path, genotype_format)
-    sample_table = _read_sample_table(
-        sample_table_path=sample_table_path,
-        sample_id_column=sample_id_column,
-        target_column=target_column,
-        covariate_columns=covariate_columns,
-    )
+    sample_table_rows = _read_delimited_rows(sample_table_path)
+    if not sample_table_rows:
+        raise ValueError("Sample table is empty: " + str(sample_table_path))
 
     if resolved_format == "vcf":
         source_sample_ids, genotype_matrix, default_variants = _load_vcf(source_path)
@@ -79,6 +77,17 @@ def load_dataset_from_files(
     else:
         raise ValueError("Unsupported genotype format: " + resolved_format)
 
+    resolved_sample_id_column = _resolve_sample_id_column(
+        rows=sample_table_rows,
+        requested_sample_id_column=sample_id_column,
+        available_sample_ids=source_sample_ids,
+    )
+    sample_table = _build_sample_table(
+        rows=sample_table_rows,
+        sample_id_column=resolved_sample_id_column,
+        target_column=target_column,
+        covariate_columns=covariate_columns,
+    )
     aligned_sample_indices = _align_sample_ids(
         expected_sample_ids=sample_table.sample_ids,
         available_sample_ids=source_sample_ids,
@@ -157,16 +166,12 @@ def run_training_pipeline(
     )
 
 
-def _read_sample_table(
-    sample_table_path: str | Path,
+def _build_sample_table(
+    rows: Sequence[dict[str, str]],
     sample_id_column: str,
     target_column: str,
     covariate_columns: Sequence[str],
 ) -> _SampleTable:
-    rows = _read_delimited_rows(sample_table_path)
-    if not rows:
-        raise ValueError("Sample table is empty: " + str(sample_table_path))
-
     _require_columns(
         rows=rows,
         required_columns=(sample_id_column, target_column, *covariate_columns),
@@ -200,6 +205,54 @@ def _read_sample_table(
         covariates=covariate_matrix,
         targets=np.asarray(targets, dtype=np.float32),
     )
+
+
+def _resolve_sample_id_column(
+    rows: Sequence[dict[str, str]],
+    requested_sample_id_column: str,
+    available_sample_ids: Sequence[str],
+) -> str:
+    available_columns = tuple(rows[0].keys())
+    if requested_sample_id_column != "auto":
+        if requested_sample_id_column not in rows[0]:
+            raise ValueError("Sample table is missing required columns: " + requested_sample_id_column)
+        return requested_sample_id_column
+
+    candidate_columns = [
+        column_name
+        for column_name in DEFAULT_SAMPLE_ID_COLUMNS
+        if column_name in rows[0]
+    ]
+    if not candidate_columns:
+        raise ValueError(
+            "Sample table must contain at least one identifier column: "
+            + ", ".join(DEFAULT_SAMPLE_ID_COLUMNS)
+            + ". Available columns: "
+            + ", ".join(available_columns)
+        )
+
+    available_sample_id_set = set(available_sample_ids)
+    match_counts = {
+        column_name: sum(
+            1
+            for row in rows
+            if str(row[column_name]).strip() in available_sample_id_set
+        )
+        for column_name in candidate_columns
+    }
+    best_match_count = max(match_counts.values())
+    best_columns = [column_name for column_name in candidate_columns if match_counts[column_name] == best_match_count]
+    if best_match_count == 0:
+        raise ValueError(
+            "Could not find a sample identifier column in the sample table that matches the genotype source. "
+            + "Tried "
+            + ", ".join(f"{column_name}({match_counts[column_name]})" for column_name in candidate_columns)
+        )
+    if len(best_columns) > 1:
+        for preferred_column in DEFAULT_SAMPLE_ID_COLUMNS:
+            if preferred_column in best_columns:
+                return preferred_column
+    return best_columns[0]
 
 
 def _load_vcf(vcf_path: Path) -> tuple[list[str], np.ndarray, list[_VariantDefaults]]:

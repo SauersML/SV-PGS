@@ -74,6 +74,123 @@ def test_load_dataset_from_vcf_uses_metadata_and_sample_alignment(tmp_path: Path
     assert dataset.variant_records[1].is_copy_number is True
 
 
+def test_load_dataset_from_vcf_auto_detects_research_id_column(tmp_path: Path):
+    vcf_path = tmp_path / "cohort.vcf"
+    vcf_path.write_text(
+        "\n".join(
+            [
+                "##fileformat=VCFv4.2",
+                "##contig=<ID=1>",
+                "##INFO=<ID=AF,Number=A,Type=Float,Description=\"Allele frequency\">",
+                "##FORMAT=<ID=GT,Number=1,Type=String,Description=\"Genotype\">",
+                "#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\trid2\trid1",
+                "1\t100\trs1\tA\tC\t50\tPASS\tAF=0.25\tGT\t0/1\t1/1",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    sample_table_path = tmp_path / "samples.tsv"
+    _write_table(
+        sample_table_path,
+        header=("research_id", "target", "age"),
+        rows=(
+            ("rid1", "1", "42"),
+            ("rid2", "0", "35"),
+        ),
+    )
+
+    dataset = load_dataset_from_files(
+        genotype_path=vcf_path,
+        genotype_format="vcf",
+        sample_table_path=sample_table_path,
+        target_column="target",
+        covariate_columns=("age",),
+    )
+
+    assert dataset.sample_ids == ["rid1", "rid2"]
+    np.testing.assert_allclose(dataset.genotypes, np.array([[2.0], [1.0]], dtype=np.float32))
+
+
+def test_load_dataset_from_plink_auto_detects_person_id_column(tmp_path: Path):
+    bed_path = tmp_path / "cohort.bed"
+    genotype_matrix = np.array(
+        [
+            [0.0, 1.0],
+            [2.0, 0.0],
+        ],
+        dtype=np.float32,
+    )
+    to_bed(
+        bed_path,
+        genotype_matrix,
+        properties={
+            "fid": ["f1", "f2"],
+            "iid": ["101", "102"],
+            "sid": ["rs1", "rs2"],
+            "chromosome": ["1", "1"],
+            "bp_position": [100, 200],
+            "allele_1": ["A", "G"],
+            "allele_2": ["C", "T"],
+        },
+    )
+
+    sample_table_path = tmp_path / "samples.tsv"
+    _write_table(
+        sample_table_path,
+        header=("person_id", "target", "age"),
+        rows=(
+            ("102", "1", "55"),
+            ("101", "0", "44"),
+        ),
+    )
+
+    dataset = load_dataset_from_files(
+        genotype_path=bed_path,
+        genotype_format="plink1",
+        sample_table_path=sample_table_path,
+        target_column="target",
+        covariate_columns=("age",),
+    )
+
+    assert dataset.sample_ids == ["102", "101"]
+    np.testing.assert_allclose(dataset.genotypes, np.array([[2.0, 0.0], [0.0, 1.0]], dtype=np.float32))
+
+
+def test_load_dataset_from_files_auto_detect_fails_when_no_identifier_column_matches(tmp_path: Path):
+    vcf_path = tmp_path / "cohort.vcf"
+    vcf_path.write_text(
+        "\n".join(
+            [
+                "##fileformat=VCFv4.2",
+                "##contig=<ID=1>",
+                "##FORMAT=<ID=GT,Number=1,Type=String,Description=\"Genotype\">",
+                "#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\ts1",
+                "1\t100\trs1\tA\tC\t50\tPASS\t.\tGT\t0/1",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    sample_table_path = tmp_path / "samples.tsv"
+    _write_table(
+        sample_table_path,
+        header=("person_id", "target"),
+        rows=(("101", "1"),),
+    )
+
+    with pytest.raises(ValueError, match="Could not find a sample identifier column"):
+        load_dataset_from_files(
+            genotype_path=vcf_path,
+            genotype_format="vcf",
+            sample_table_path=sample_table_path,
+            target_column="target",
+            covariate_columns=(),
+        )
+
+
 def test_run_training_pipeline_from_plink_inputs_writes_outputs(tmp_path: Path):
     bed_path = tmp_path / "cohort.bed"
     genotype_matrix = np.array(

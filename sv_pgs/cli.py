@@ -38,8 +38,16 @@ def build_parser() -> argparse.ArgumentParser:
         choices=("auto", "vcf", "plink1"),
         help="Input genotype format. Default infers from the path.",
     )
-    run_parser.add_argument("--sample-table", required=True, help="CSV or TSV with sample_id, target, and covariates.")
-    run_parser.add_argument("--sample-id-column", default="sample_id", help="Sample identifier column in the sample table.")
+    run_parser.add_argument(
+        "--sample-table",
+        required=True,
+        help="CSV or TSV with an identifier column plus target and covariates.",
+    )
+    run_parser.add_argument(
+        "--sample-id-column",
+        default="auto",
+        help="Sample identifier column in the sample table. Default auto-detects sample_id, research_id, or person_id.",
+    )
     run_parser.add_argument("--target-column", required=True, help="Target column in the sample table.")
     run_parser.add_argument(
         "--covariate-column",
