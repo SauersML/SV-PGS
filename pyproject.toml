@@ -13,10 +13,15 @@ dependencies = [
     "numpy>=1.24,<2",
     "scipy>=1.11",
     "scikit-learn>=1.3",
+    "cyvcf2>=0.31.4",
+    "bed-reader>=1.0.6",
 ]
 
 [project.optional-dependencies]
 dev = ["pytest>=7.4"]
+
+[project.scripts]
+sv-pgs = "sv_pgs.cli:main"
 
 [tool.setuptools.packages.find]
 include = ["sv_pgs*"]
