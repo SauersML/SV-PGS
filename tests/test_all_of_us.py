@@ -58,6 +58,9 @@ def test_build_all_of_us_disease_sql_uses_workspace_cdr_and_prefix_filters(monke
     assert "condition_source_concept_id" in sql
     assert "vocabulary_id = 'ICD10CM'" in sql
     assert "vocabulary_id = 'ICD9CM'" in sql
+    assert "FROM `aou_workspace.cdr_dataset.concept` AS concept" in sql
+    assert "JOIN `aou_workspace.cdr_dataset.concept_ancestor` AS concept_ancestor" in sql
+    assert "JOIN `aou_workspace.cdr_dataset.observation` AS observation" in sql
     assert "STARTS_WITH(concept_code, icd10_prefix)" in sql
     assert "primary_consent_date" in sql
     parameter_values = {parameter.name: parameter for parameter in query_config.query_parameters}

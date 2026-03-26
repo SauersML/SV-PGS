@@ -136,10 +136,10 @@ WITH primary_consent AS (
   SELECT
     observation.person_id,
     MIN(observation.observation_date) AS primary_consent_date
-  FROM `{dataset}.concept`
-  JOIN `{dataset}.concept_ancestor`
+  FROM `{dataset}.concept` AS concept
+  JOIN `{dataset}.concept_ancestor` AS concept_ancestor
     ON concept.concept_id = concept_ancestor.ancestor_concept_id
-  JOIN `{dataset}.observation`
+  JOIN `{dataset}.observation` AS observation
     ON concept_ancestor.descendant_concept_id = observation.observation_concept_id
   WHERE concept.concept_name = 'Consent PII'
     AND concept.concept_class_id = 'Module'
