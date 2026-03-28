@@ -19,6 +19,14 @@ SV_LENGTH_THRESHOLD = 1_000.0
 DEFAULT_SAMPLE_ID_COLUMNS = ("sample_id", "research_id", "person_id")
 
 
+def _file_size_mb(path: Path) -> str:
+    try:
+        size = path.stat().st_size
+        return f"{size / 1e6:.1f} MB"
+    except OSError:
+        return "N/A"
+
+
 @dataclass(slots=True)
 class LoadedDataset:
     sample_ids: list[str]
@@ -324,9 +332,18 @@ def _load_vcf(vcf_path: Path) -> tuple[list[str], np.ndarray, list[_VariantDefau
 
 
 def _load_plink1(bed_path: Path) -> tuple[list[str], np.ndarray, list[_VariantDefaults]]:
-    print(f"[plink] opening {bed_path}", flush=True)
+    import os
+    bed_file = Path(bed_path)
+    fam_file = bed_file.with_suffix(".fam")
+    bim_file = bed_file.with_suffix(".bim")
+    print(f"[plink] file sizes: .bed={_file_size_mb(bed_file)} .fam={_file_size_mb(fam_file)} .bim={_file_size_mb(bim_file)}", flush=True)
+    print(f"[plink] calling open_bed({bed_path})...", flush=True)
     reader = open_bed(bed_path)
+    print(f"[plink] open_bed returned", flush=True)
+    print(f"[plink] reading reader.iid...", flush=True)
     sample_ids = [str(sample_id) for sample_id in reader.iid]
+    print(f"[plink] got {len(sample_ids)} sample IDs", flush=True)
+    print(f"[plink] reading reader.sid...", flush=True)
     n_samples = len(sample_ids)
     n_variants = len(reader.sid)
     matrix_bytes = n_samples * n_variants * 4
