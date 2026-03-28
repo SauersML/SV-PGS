@@ -4,7 +4,7 @@ import csv
 import json
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Iterable, Sequence
+from typing import Any, Iterable, Iterator, Sequence
 
 import numpy as np
 from cyvcf2 import VCF
@@ -57,11 +57,14 @@ class _VariantDefaults:
 @dataclass(slots=True)
 class _PlinkMetadata:
     sample_ids: list[str]
-    variant_ids: list[str]
-    chromosomes: list[str]
-    positions: list[int]
-    allele_1: list[str]
-    allele_2: list[str]
+    variant_count: int
+
+
+@dataclass(slots=True)
+class _DelimitedTableSpec:
+    path: Path
+    delimiter: str
+    columns: tuple[str, ...]
 
 
 def load_dataset_from_files(
@@ -81,11 +84,9 @@ def load_dataset_from_files(
     resolved_format = _resolve_genotype_format(source_path, genotype_format)
     log(f"genotype format={resolved_format}  path={source_path}")
 
-    log(f"reading sample table: {sample_table_path}")
-    sample_table_rows = _read_delimited_rows(sample_table_path)
-    if not sample_table_rows:
-        raise ValueError("Sample table is empty: " + str(sample_table_path))
-    log(f"sample table: {len(sample_table_rows)} rows, columns={list(sample_table_rows[0].keys())}")
+    log(f"reading sample table header: {sample_table_path}")
+    sample_table_spec = _inspect_delimited_table(sample_table_path)
+    log(f"sample table columns={list(sample_table_spec.columns)}")
 
     if resolved_format == "vcf":
         log("loading VCF genotypes...")
@@ -96,9 +97,9 @@ def load_dataset_from_files(
         log("reading PLINK .fam/.bim metadata (no genotype data yet)...")
         plink_metadata = _load_plink1_metadata(source_path)
         source_sample_ids = plink_metadata.sample_ids
-        log(f"PLINK metadata: {len(source_sample_ids)} samples x {len(plink_metadata.variant_ids)} variants")
+        log(f"PLINK metadata: {len(source_sample_ids)} samples x {plink_metadata.variant_count} variants")
         bed_size = source_path.stat().st_size / 1e9
-        full_matrix_gb = len(source_sample_ids) * len(plink_metadata.variant_ids) * 4 / 1e9
+        full_matrix_gb = len(source_sample_ids) * plink_metadata.variant_count * 4 / 1e9
         log(f"  .bed file size: {bed_size:.2f} GB  |  full float32 matrix would be: {full_matrix_gb:.1f} GB")
         genotype_matrix = None
         default_variants = None
@@ -107,22 +108,27 @@ def load_dataset_from_files(
 
     log("resolving sample ID column...")
     resolved_sample_id_column = _resolve_sample_id_column(
-        rows=sample_table_rows,
+        table_spec=sample_table_spec,
         requested_sample_id_column=sample_id_column,
         available_sample_ids=source_sample_ids,
     )
     log(f"sample ID column: '{resolved_sample_id_column}'")
 
-    log("building sample table (parsing target + covariates)...")
-    sample_table = _build_sample_table(
-        rows=sample_table_rows,
+    log("building filtered sample table (parsing target + covariates for matched genotype IDs only)...")
+    sample_table, total_sample_rows, unmatched_sample_rows = _build_sample_table(
+        table_spec=sample_table_spec,
         sample_id_column=resolved_sample_id_column,
         target_column=target_column,
         covariate_columns=covariate_columns,
+        available_sample_ids=source_sample_ids,
     )
     n_cases = int(np.sum(np.asarray(sample_table.targets) == 1.0))
     n_controls = int(np.sum(np.asarray(sample_table.targets) == 0.0))
-    log(f"sample table: {len(sample_table.sample_ids)} samples, {sample_table.covariates.shape[1]} covariates")
+    log(
+        "sample table: "
+        + f"{len(sample_table.sample_ids)} matched rows kept from {total_sample_rows}, "
+        + f"{unmatched_sample_rows} dropped, {sample_table.covariates.shape[1]} covariates"
+    )
     log(f"  target distribution: {n_cases} cases, {n_controls} controls (of {len(sample_table.sample_ids)} total)")
 
     log("aligning sample IDs between sample table and genotype source...")
@@ -131,7 +137,7 @@ def load_dataset_from_files(
         available_sample_ids=source_sample_ids,
         context="genotype source",
     )
-    log(f"aligned {len(aligned_sample_indices)} / {len(source_sample_ids)} genotype samples")
+    log(f"aligned {len(aligned_sample_indices)} phenotype rows against {len(source_sample_ids)} genotype samples")
 
     if resolved_format == "vcf":
         log("subsetting VCF genotype matrix to aligned samples...")
@@ -145,17 +151,17 @@ def load_dataset_from_files(
         if plink_metadata is None:
             raise RuntimeError("PLINK metadata were not initialized.")
         total_fam_samples = len(plink_metadata.sample_ids)
-        log(f"creating lazy PLINK genotype reader ({len(aligned_sample_indices)} samples x {len(plink_metadata.variant_ids)} variants, {total_fam_samples} total in .fam)")
-        subset_gb = len(aligned_sample_indices) * len(plink_metadata.variant_ids) * 4 / 1e9
+        log(f"creating lazy PLINK genotype reader ({len(aligned_sample_indices)} samples x {plink_metadata.variant_count} variants, {total_fam_samples} total in .fam)")
+        subset_gb = len(aligned_sample_indices) * plink_metadata.variant_count * 4 / 1e9
         log(f"  subset float32 matrix would be: {subset_gb:.1f} GB (will stream in batches instead)")
         raw_genotypes = PlinkRawGenotypeMatrix(
             bed_path=source_path,
             sample_indices=aligned_sample_indices,
-            variant_count=len(plink_metadata.variant_ids),
+            variant_count=plink_metadata.variant_count,
             total_sample_count=total_fam_samples,
         )
-        log("computing streaming allele frequencies for PLINK variant defaults...")
-        default_variants = _build_plink_variant_defaults(plink_metadata, raw_genotypes)
+        log("computing streaming allele frequencies and parsing .bim for PLINK variant defaults...")
+        default_variants = _build_plink_variant_defaults(source_path, raw_genotypes)
         log(f"built {len(default_variants)} PLINK variant defaults  mem={mem()}")
 
     log("building variant records from defaults + optional metadata...")
@@ -248,13 +254,14 @@ def run_training_pipeline(
 
 
 def _build_sample_table(
-    rows: Sequence[dict[str, str]],
+    table_spec: _DelimitedTableSpec,
     sample_id_column: str,
     target_column: str,
     covariate_columns: Sequence[str],
-) -> _SampleTable:
+    available_sample_ids: Sequence[str],
+) -> tuple[_SampleTable, int, int]:
     _require_columns(
-        rows=rows,
+        available_columns=table_spec.columns,
         required_columns=(sample_id_column, target_column, *covariate_columns),
         context="sample table",
     )
@@ -263,11 +270,18 @@ def _build_sample_table(
     covariates: list[list[float]] = []
     targets: list[float] = []
     seen_sample_ids: set[str] = set()
+    available_sample_id_set = set(available_sample_ids)
+    total_rows = 0
+    unmatched_rows = 0
 
-    for row in rows:
+    for row in _iter_delimited_rows(table_spec):
+        total_rows += 1
         sample_id = str(row[sample_id_column]).strip()
         if not sample_id:
             raise ValueError("Encountered blank sample identifier in sample table.")
+        if sample_id not in available_sample_id_set:
+            unmatched_rows += 1
+            continue
         if sample_id in seen_sample_ids:
             raise ValueError("Duplicate sample identifier in sample table: " + sample_id)
         seen_sample_ids.add(sample_id)
@@ -281,28 +295,36 @@ def _build_sample_table(
     covariate_matrix = np.asarray(covariates, dtype=np.float32)
     if covariate_matrix.ndim != 2:
         covariate_matrix = covariate_matrix.reshape(len(sample_ids), len(covariate_columns))
-    return _SampleTable(
-        sample_ids=sample_ids,
-        covariates=covariate_matrix,
-        targets=np.asarray(targets, dtype=np.float32),
+    if not sample_ids:
+        raise ValueError(
+            "Sample table contains no rows that overlap the genotype source using column: " + sample_id_column
+        )
+    return (
+        _SampleTable(
+            sample_ids=sample_ids,
+            covariates=covariate_matrix,
+            targets=np.asarray(targets, dtype=np.float32),
+        ),
+        total_rows,
+        unmatched_rows,
     )
 
 
 def _resolve_sample_id_column(
-    rows: Sequence[dict[str, str]],
+    table_spec: _DelimitedTableSpec,
     requested_sample_id_column: str,
     available_sample_ids: Sequence[str],
 ) -> str:
-    available_columns = tuple(rows[0].keys())
+    available_columns = table_spec.columns
     if requested_sample_id_column != "auto":
-        if requested_sample_id_column not in rows[0]:
+        if requested_sample_id_column not in available_columns:
             raise ValueError("Sample table is missing required columns: " + requested_sample_id_column)
         return requested_sample_id_column
 
     candidate_columns = [
         column_name
         for column_name in DEFAULT_SAMPLE_ID_COLUMNS
-        if column_name in rows[0]
+        if column_name in available_columns
     ]
     if not candidate_columns:
         raise ValueError(
@@ -313,14 +335,11 @@ def _resolve_sample_id_column(
         )
 
     available_sample_id_set = set(available_sample_ids)
-    match_counts = {
-        column_name: sum(
-            1
-            for row in rows
-            if str(row[column_name]).strip() in available_sample_id_set
-        )
-        for column_name in candidate_columns
-    }
+    match_counts = {column_name: 0 for column_name in candidate_columns}
+    for row in _iter_delimited_rows(table_spec):
+        for column_name in candidate_columns:
+            if str(row[column_name]).strip() in available_sample_id_set:
+                match_counts[column_name] += 1
     best_match_count = max(match_counts.values())
     best_columns = [column_name for column_name in candidate_columns if match_counts[column_name] == best_match_count]
     if best_match_count == 0:
@@ -375,68 +394,45 @@ def _load_plink1_metadata(bed_path: Path) -> _PlinkMetadata:
     bim_path = bed_path.with_suffix(".bim")
 
     log(f"parsing .fam file: {fam_path}")
-    sample_ids: list[str] = []
-    with fam_path.open("r", encoding="utf-8") as fh:
-        for line in fh:
-            parts = line.split()
-            if len(parts) >= 2:
-                sample_ids.append(parts[1])  # IID is second column
+    sample_ids = _read_plink_sample_ids(fam_path)
     log(f"  .fam: {len(sample_ids)} samples  mem={mem()}")
 
     log(f"parsing .bim file: {bim_path}")
-    variant_ids: list[str] = []
-    chromosomes: list[str] = []
-    positions: list[int] = []
-    allele_1: list[str] = []
-    allele_2: list[str] = []
-    with bim_path.open("r", encoding="utf-8") as fh:
-        for line in fh:
-            parts = line.split()
-            if len(parts) >= 6:
-                chromosomes.append(parts[0])
-                variant_ids.append(parts[1])
-                positions.append(int(parts[3]))
-                allele_1.append(parts[4])
-                allele_2.append(parts[5])
-    log(f"  .bim: {len(variant_ids)} variants  mem={mem()}")
+    variant_count = _count_plink_variants(bim_path)
+    log(f"  .bim: {variant_count} variants  mem={mem()}")
 
-    if not variant_ids:
+    if variant_count == 0:
         raise ValueError("PLINK bed contains no variants: " + str(bed_path))
     return _PlinkMetadata(
         sample_ids=sample_ids,
-        variant_ids=variant_ids,
-        chromosomes=chromosomes,
-        positions=positions,
-        allele_1=allele_1,
-        allele_2=allele_2,
+        variant_count=variant_count,
     )
 
 
 def _build_plink_variant_defaults(
-    plink_metadata: _PlinkMetadata,
+    bed_path: Path,
     genotype_matrix: RawGenotypeMatrix,
 ) -> list[_VariantDefaults]:
     allele_frequencies = _infer_streaming_allele_frequencies(genotype_matrix)
-    return [
-        _VariantDefaults(
-            variant_id=variant_id,
-            variant_class=_infer_plink_variant_class(allele_1, allele_2),
-            chromosome=chromosome,
-            position=position,
-            length=1.0,
-            allele_frequency=float(allele_frequency),
-            quality=1.0,
+    variant_defaults: list[_VariantDefaults] = []
+    for variant_index, bim_record in enumerate(_iter_plink_bim_records(bed_path.with_suffix(".bim"))):
+        variant_defaults.append(
+            _VariantDefaults(
+                variant_id=bim_record.variant_id,
+                variant_class=_infer_plink_variant_class(bim_record.allele_1, bim_record.allele_2),
+                chromosome=bim_record.chromosome,
+                position=bim_record.position,
+                length=1.0,
+                allele_frequency=float(allele_frequencies[variant_index]),
+                quality=1.0,
+            )
         )
-        for variant_id, chromosome, position, allele_1, allele_2, allele_frequency in zip(
-            plink_metadata.variant_ids,
-            plink_metadata.chromosomes,
-            plink_metadata.positions,
-            plink_metadata.allele_1,
-            plink_metadata.allele_2,
-            allele_frequencies,
-            strict=True,
+    if len(variant_defaults) != genotype_matrix.shape[1]:
+        raise ValueError(
+            "PLINK .bim variant count does not match genotype matrix: "
+            + f"{len(variant_defaults)} vs {genotype_matrix.shape[1]}"
         )
-    ]
+    return variant_defaults
 
 
 def _build_variant_records(
@@ -448,7 +444,7 @@ def _build_variant_records(
         rows = _read_delimited_rows(variant_metadata_path)
         if not rows:
             raise ValueError("Variant metadata file is empty: " + str(variant_metadata_path))
-        _require_columns(rows=rows, required_columns=("variant_id",), context="variant metadata")
+        _require_columns(available_columns=tuple(rows[0].keys()), required_columns=("variant_id",), context="variant metadata")
         for row in rows:
             variant_id = str(row["variant_id"]).strip()
             if not variant_id:
@@ -517,9 +513,12 @@ def _write_predictions_and_summary(
     dataset: LoadedDataset,
     model: BayesianPGS,
 ) -> dict[str, Any]:
+    from sv_pgs.progress import log, mem
+    log(f"computing predictions for {len(dataset.sample_ids)} samples, trait={model.config.trait_type.value}  mem={mem()}")
     if model.config.trait_type == TraitType.BINARY:
         probabilities = model.predict_proba(dataset.genotypes, dataset.covariates)[:, 1]
         predicted_labels = (probabilities >= 0.5).astype(np.int32)
+        log(f"binary predictions: mean_prob={float(np.mean(probabilities)):.4f}  pred_positive={int(np.sum(predicted_labels))}  pred_negative={int(np.sum(1-predicted_labels))}")
         _write_delimited_rows(
             predictions_path,
             header=("sample_id", "target", "probability", "predicted_label"),
@@ -541,10 +540,13 @@ def _write_predictions_and_summary(
         )
         unique_targets = np.unique(dataset.targets)
         training_auc = None if unique_targets.shape[0] < 2 else float(roc_auc_score(dataset.targets, probabilities))
+        training_accuracy = float(np.mean(predicted_labels == dataset.targets))
+        training_log_loss_val = float(log_loss(dataset.targets, probabilities, labels=[0.0, 1.0]))
+        log(f"training metrics: AUC={training_auc}  log_loss={training_log_loss_val:.4f}  accuracy={training_accuracy:.4f}  mem={mem()}")
         return {
             "training_auc": training_auc,
-            "training_log_loss": float(log_loss(dataset.targets, probabilities, labels=[0.0, 1.0])),
-            "training_accuracy": float(np.mean(predicted_labels == dataset.targets)),
+            "training_log_loss": training_log_loss_val,
+            "training_accuracy": training_accuracy,
         }
 
     predictions = model.predict(dataset.genotypes, dataset.covariates)
@@ -584,6 +586,10 @@ def _write_delimited_rows(
 
 
 def _read_delimited_rows(path: str | Path) -> list[dict[str, str]]:
+    return list(_iter_delimited_rows(_inspect_delimited_table(path)))
+
+
+def _inspect_delimited_table(path: str | Path) -> _DelimitedTableSpec:
     resolved_path = Path(path)
     with resolved_path.open("r", encoding="utf-8", newline="") as handle:
         sample = handle.read(4096)
@@ -592,10 +598,22 @@ def _read_delimited_rows(path: str | Path) -> list[dict[str, str]]:
         reader = csv.DictReader(handle, delimiter=delimiter)
         if reader.fieldnames is None:
             raise ValueError("Table has no header row: " + str(resolved_path))
-        return [
-            {str(key): "" if value is None else str(value) for key, value in row.items()}
-            for row in reader
-        ]
+        columns = tuple(str(field_name) for field_name in reader.fieldnames)
+    return _DelimitedTableSpec(
+        path=resolved_path,
+        delimiter=delimiter,
+        columns=columns,
+    )
+
+
+def _iter_delimited_rows(table_spec: _DelimitedTableSpec) -> Iterator[dict[str, str]]:
+    with table_spec.path.open("r", encoding="utf-8", newline="") as handle:
+        reader = csv.DictReader(handle, delimiter=table_spec.delimiter)
+        for row in reader:
+            yield {
+                str(key): "" if value is None else str(value)
+                for key, value in row.items()
+            }
 
 
 def _infer_delimiter(sample: str) -> str:
@@ -607,12 +625,12 @@ def _infer_delimiter(sample: str) -> str:
 
 
 def _require_columns(
-    rows: Sequence[dict[str, str]],
+    available_columns: Sequence[str],
     required_columns: Sequence[str],
     context: str,
 ) -> None:
-    available_columns = set(rows[0])
-    missing_columns = [column_name for column_name in required_columns if column_name not in available_columns]
+    available_column_set = set(available_columns)
+    missing_columns = [column_name for column_name in required_columns if column_name not in available_column_set]
     if missing_columns:
         raise ValueError(
             context
@@ -746,6 +764,58 @@ def _infer_streaming_allele_frequencies(genotype_matrix: RawGenotypeMatrix) -> n
         where=observed_counts > 0,
     )
     return np.clip(allele_frequencies, 0.0, 1.0).astype(np.float32)
+
+
+@dataclass(slots=True)
+class _PlinkBimRecord:
+    chromosome: str
+    variant_id: str
+    position: int
+    allele_1: str
+    allele_2: str
+
+
+def _read_plink_sample_ids(fam_path: Path) -> list[str]:
+    sample_ids: list[str] = []
+    with fam_path.open("r", encoding="utf-8") as handle:
+        for line_number, raw_line in enumerate(handle, start=1):
+            stripped_line = raw_line.strip()
+            if not stripped_line:
+                continue
+            fields = stripped_line.split()
+            if len(fields) < 2:
+                raise ValueError(f"Malformed PLINK .fam row at line {line_number}: expected at least 2 columns.")
+            sample_ids.append(fields[1])
+    if not sample_ids:
+        raise ValueError("PLINK .fam contains no samples: " + str(fam_path))
+    return sample_ids
+
+
+def _count_plink_variants(bim_path: Path) -> int:
+    variant_count = 0
+    with bim_path.open("r", encoding="utf-8") as handle:
+        for raw_line in handle:
+            if raw_line.strip():
+                variant_count += 1
+    return variant_count
+
+
+def _iter_plink_bim_records(bim_path: Path) -> Iterator[_PlinkBimRecord]:
+    with bim_path.open("r", encoding="utf-8") as handle:
+        for line_number, raw_line in enumerate(handle, start=1):
+            stripped_line = raw_line.strip()
+            if not stripped_line:
+                continue
+            fields = stripped_line.split()
+            if len(fields) < 6:
+                raise ValueError(f"Malformed PLINK .bim row at line {line_number}: expected 6 columns.")
+            yield _PlinkBimRecord(
+                chromosome=fields[0],
+                variant_id=fields[1],
+                position=int(fields[3]),
+                allele_1=fields[4],
+                allele_2=fields[5],
+            )
 
 
 def _normalize_quality(value: Any) -> float:

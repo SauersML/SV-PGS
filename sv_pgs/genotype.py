@@ -151,6 +151,10 @@ class PlinkRawGenotypeMatrix(RawGenotypeMatrix):
         )
 
 
+_bed_read_count: int = 0
+_bed_read_variants_total: int = 0
+
+
 def _read_bed_variants(
     bed_path: Path,
     total_sample_count: int,
@@ -165,10 +169,17 @@ def _read_bed_variants(
       - Each byte encodes 4 samples (LSB first):
         00=hom_A1(0), 01=missing(NaN), 10=het(1), 11=hom_A2(2)
     """
+    global _bed_read_count, _bed_read_variants_total
+    _bed_read_count += 1
     n_selected = sample_indices.shape[0]
     n_variants = variant_indices.shape[0]
     bytes_per_variant = (total_sample_count + 3) // 4
+    read_bytes_total = bytes_per_variant * n_variants
     result = np.empty((n_selected, n_variants), dtype=np.float32)
+
+    if _bed_read_count <= 3:
+        from sv_pgs.progress import log
+        log(f"    .bed read #{_bed_read_count}: {n_variants} variants x {n_selected} samples, {bytes_per_variant} bytes/variant, reading {read_bytes_total/1e6:.1f} MB from disk")
 
     with open(bed_path, "rb") as fh:
         magic = fh.read(3)
@@ -186,11 +197,10 @@ def _read_bed_variants(
                     f"Unexpected EOF reading variant {variant_idx} from {bed_path}"
                 )
             byte_array = np.frombuffer(raw_bytes, dtype=np.uint8)
-            # Unpack 2-bit values for ALL samples in this variant
             all_genotypes = _decode_bed_bytes(byte_array, total_sample_count)
-            # Select only the samples we need
             result[:, col_idx] = all_genotypes[sample_indices]
 
+    _bed_read_variants_total += n_variants
     return result
 
 

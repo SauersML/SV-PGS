@@ -392,6 +392,8 @@ def _fit_collapsed_posterior(
     trait_type: TraitType,
     config: ModelConfig,
 ) -> PosteriorState:
+    from sv_pgs.progress import log, mem
+    log(f"    collapsed posterior: trait={trait_type.value}  n_variants={genotype_matrix.shape[1]}  n_samples={genotype_matrix.shape[0]}  sigma_e2={sigma_error2:.6f}  mem={mem()}")
     prior_variances = np.maximum(np.asarray(reduced_prior_variances, dtype=np.float64), 1e-8)
     if trait_type == TraitType.QUANTITATIVE:
         alpha, beta, beta_variance, linear_predictor, collapsed_objective, sigma_error2_new = _quantitative_posterior_state(
@@ -543,10 +545,13 @@ def _binary_posterior_state(
         )
         return penalized_log_posterior, gradient, weights, linear_predictor
 
+    from sv_pgs.progress import log, mem
+    log(f"      Newton trust-region: {standardized_genotypes.shape[1]} variants, max_iter={max_iterations}, damping={damping:.2e}  mem={mem()}")
     for _iteration_index in range(max_iterations):
         current_objective, gradient, weights, linear_predictor = penalized_terms(parameters)
         gradient_norm = float(np.linalg.norm(gradient))
         if gradient_norm <= gradient_tolerance:
+            log(f"      Newton converged at iter {_iteration_index+1}: grad_norm={gradient_norm:.2e} <= tol={gradient_tolerance:.2e}")
             break
         working_response = linear_predictor + (targets - np.asarray(stable_sigmoid(linear_predictor), dtype=np.float64)) / weights
         proposed_alpha, proposed_beta, _, _projected_targets, _fitted_response, _restricted_quadratic, _logdet_covariance, _logdet_gls = (
@@ -584,10 +589,13 @@ def _binary_posterior_state(
                 float(np.linalg.norm(parameters)),
                 1e-8,
             )
+            log(f"      Newton iter {_iteration_index+1}/{max_iterations}: ACCEPT  obj={candidate_objective:.4f}  gain={actual_gain:.2e}  ratio={gain_ratio:.3f}  grad={gradient_norm:.2e}  step={relative_step_size:.2e}  damping={damping:.2e}  mem={mem()}")
             if relative_step_size <= gradient_tolerance:
+                log(f"      Newton converged at iter {_iteration_index+1}: step_size={relative_step_size:.2e} <= tol={gradient_tolerance:.2e}")
                 break
         else:
             damping *= damping_increase_factor
+            log(f"      Newton iter {_iteration_index+1}/{max_iterations}: REJECT  obj={current_objective:.4f}  cand_obj={candidate_objective:.4f}  gain={actual_gain:.2e}  ratio={gain_ratio:.3f}  grad={gradient_norm:.2e}  damping={damping:.2e}  mem={mem()}")
 
     final_objective, _final_gradient, final_weights, linear_predictor = penalized_terms(parameters)
     final_working_response = linear_predictor + (targets - np.asarray(stable_sigmoid(linear_predictor), dtype=np.float64)) / final_weights
@@ -644,6 +652,7 @@ def _binary_posterior_state(
         + logdet_gls
     )
     laplace_objective = final_objective - 0.5 * logdet_hessian
+    log(f"      binary posterior done: laplace_obj={laplace_objective:.4f}  final_obj={final_objective:.4f}  logdet_hessian={logdet_hessian:.4f}  mem={mem()}")
     return (
         final_parameters[:covariate_count],
         final_parameters[covariate_count:],
@@ -765,7 +774,9 @@ def _restricted_posterior_state(
         prior_variances * np.asarray(genotype_matrix.transpose_matvec(projected_targets), dtype=np.float64),
         dtype=np.float64,
     )
+    log(f"    posterior beta computed: max|beta|={float(np.max(np.abs(beta))):.4f}  mean|beta|={float(np.mean(np.abs(beta))):.6f}  logdet_cov={float(logdet_covariance):.4f}  mem={mem()}")
     if compute_beta_variance:
+        log(f"    computing leverage diagonal for beta variance ({genotype_matrix.shape[1]} variants)...")
         leverage_diagonal = _restricted_cross_leverage_diagonal(
             genotype_matrix=genotype_matrix,
             covariate_matrix=covariate_matrix,
@@ -802,8 +813,10 @@ def _restricted_cross_leverage_diagonal(
     gls_cholesky: np.ndarray,
     batch_size: int,
 ) -> np.ndarray:
+    from sv_pgs.progress import log, mem
     variant_count = genotype_matrix.shape[1]
     leverage_diagonal = np.zeros(variant_count, dtype=np.float64)
+    variants_done = 0
     for batch in genotype_matrix.iter_column_batches(batch_size=batch_size):
         genotype_batch = np.asarray(batch.values, dtype=np.float64)
         inverse_covariance_genotype_batch = solve_rhs(genotype_batch)
@@ -812,6 +825,9 @@ def _restricted_cross_leverage_diagonal(
             covariate_matrix.T @ inverse_covariance_genotype_batch,
         )
         leverage_diagonal[batch.variant_indices] = np.einsum("ij,ij->j", genotype_batch, restricted_batch, optimize=True)
+        variants_done += len(batch.variant_indices)
+        if variants_done == len(batch.variant_indices) or variants_done % max(variant_count // 5, 1) < len(batch.variant_indices) or variants_done == variant_count:
+            log(f"      leverage diagonal: {variants_done}/{variant_count} ({100*variants_done//max(variant_count,1)}%)  mem={mem()}")
     return leverage_diagonal
 
 

@@ -93,10 +93,23 @@ def main(argv: list[str] | None = None) -> int:
     if args.command != "run":
         raise ValueError("Unsupported command: " + str(args.command))
 
-    from sv_pgs.progress import log
-    log(f"=== CLI RUN START === genotypes={args.genotypes} sample_table={args.sample_table} output_dir={args.output_dir}")
-    log(f"CLI options: genotype_format={args.genotype_format} sample_id_column={args.sample_id_column} target_column={args.target_column}")
-    log(f"CLI covariates: {list(args.covariate_column)}")
+    from sv_pgs.progress import log, mem, peak_mem
+    import os, platform
+    try:
+        with open("/proc/meminfo") as f:
+            for line in f:
+                if line.startswith("MemTotal:"):
+                    total_gb = int(line.split()[1]) / 1024 / 1024
+                    break
+            else:
+                total_gb = -1
+        mem_info = f"total_ram={total_gb:.1f} GB"
+    except OSError:
+        mem_info = "total_ram=unknown"
+    log(f"=== CLI RUN START ===  pid={os.getpid()}  {mem_info}  cpu_count={os.cpu_count()}  platform={platform.platform()}")
+    log(f"genotypes={args.genotypes} sample_table={args.sample_table} output_dir={args.output_dir}")
+    log(f"genotype_format={args.genotype_format} sample_id_column={args.sample_id_column} target_column={args.target_column}")
+    log(f"covariates={list(args.covariate_column)}  max_outer_iter={args.max_outer_iterations}  min_sv_carriers={args.minimum_structural_variant_carriers}  seed={args.random_seed}")
     dataset = load_dataset_from_files(
         genotype_path=args.genotypes,
         genotype_format=args.genotype_format,
