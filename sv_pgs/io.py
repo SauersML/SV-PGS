@@ -64,48 +64,77 @@ def load_dataset_from_files(
     sample_id_column: str = "auto",
     variant_metadata_path: str | Path | None = None,
 ) -> LoadedDataset:
+    import sys, os, resource
+    def _mem():
+        rss = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+        if sys.platform == "darwin":
+            rss //= 1024 * 1024
+        else:
+            rss //= 1024
+        return f"{rss} MB"
+    print(f"[load] START  mem={_mem()}", flush=True)
+
     source_path = Path(genotype_path)
     resolved_format = _resolve_genotype_format(source_path, genotype_format)
+    print(f"[load] format={resolved_format}  path={source_path}", flush=True)
+
     sample_table_rows = _read_delimited_rows(sample_table_path)
     if not sample_table_rows:
         raise ValueError("Sample table is empty: " + str(sample_table_path))
+    print(f"[load] sample_table rows={len(sample_table_rows)}  columns={list(sample_table_rows[0].keys())}", flush=True)
 
     if resolved_format == "vcf":
+        print("[load] loading VCF...", flush=True)
         source_sample_ids, genotype_matrix, default_variants = _load_vcf(source_path)
     elif resolved_format == "plink1":
+        print("[load] loading PLINK metadata (sample IDs + variant info)...", flush=True)
         source_sample_ids, genotype_matrix, default_variants = _load_plink1(source_path)
     else:
         raise ValueError("Unsupported genotype format: " + resolved_format)
+
+    print(f"[load] genotype source: {len(source_sample_ids)} samples, {len(default_variants)} variants", flush=True)
+    print(f"[load] genotype_matrix shape={genotype_matrix.shape}  dtype={genotype_matrix.dtype}  mem={_mem()}", flush=True)
 
     resolved_sample_id_column = _resolve_sample_id_column(
         rows=sample_table_rows,
         requested_sample_id_column=sample_id_column,
         available_sample_ids=source_sample_ids,
     )
+    print(f"[load] resolved sample_id_column={resolved_sample_id_column}", flush=True)
+
     sample_table = _build_sample_table(
         rows=sample_table_rows,
         sample_id_column=resolved_sample_id_column,
         target_column=target_column,
         covariate_columns=covariate_columns,
     )
+    print(f"[load] sample_table: {len(sample_table.sample_ids)} samples, covariates shape={sample_table.covariates.shape}", flush=True)
+
     aligned_sample_indices = _align_sample_ids(
         expected_sample_ids=sample_table.sample_ids,
         available_sample_ids=source_sample_ids,
         context="genotype source",
     )
+    print(f"[load] aligned {len(aligned_sample_indices)} samples", flush=True)
+
     aligned_genotypes = genotype_matrix[aligned_sample_indices, :]
+    print(f"[load] aligned_genotypes shape={aligned_genotypes.shape}  mem={_mem()}", flush=True)
+
     variant_records = _build_variant_records(
         default_variants=default_variants,
         variant_metadata_path=variant_metadata_path,
     )
+    print(f"[load] variant_records: {len(variant_records)}", flush=True)
 
-    return LoadedDataset(
+    result = LoadedDataset(
         sample_ids=list(sample_table.sample_ids),
         genotypes=np.asarray(aligned_genotypes, dtype=np.float32),
         covariates=np.asarray(sample_table.covariates, dtype=np.float32),
         targets=np.asarray(sample_table.targets, dtype=np.float32),
         variant_records=variant_records,
     )
+    print(f"[load] DONE  final genotypes shape={result.genotypes.shape}  mem={_mem()}", flush=True)
+    return result
 
 
 def run_training_pipeline(
@@ -113,9 +142,11 @@ def run_training_pipeline(
     config: ModelConfig,
     output_dir: str | Path,
 ) -> PipelineOutputs:
+    print(f"[pipeline] START  samples={len(dataset.sample_ids)}  genotypes={dataset.genotypes.shape}  trait={config.trait_type}", flush=True)
     destination = Path(output_dir)
     destination.mkdir(parents=True, exist_ok=True)
 
+    print(f"[pipeline] fitting model...", flush=True)
     model = BayesianPGS(config).fit(
         dataset.genotypes,
         dataset.covariates,
@@ -123,8 +154,10 @@ def run_training_pipeline(
         dataset.variant_records,
     )
 
+    print(f"[pipeline] model fitted, exporting artifacts...", flush=True)
     artifact_dir = destination / "artifact"
     model.export(artifact_dir)
+    print(f"[pipeline] artifacts exported to {artifact_dir}", flush=True)
 
     coefficients_path = destination / "coefficients.tsv"
     coefficient_rows = model.coefficient_table()
@@ -156,8 +189,10 @@ def run_training_pipeline(
         }
     )
 
+    print(f"[pipeline] writing summary...", flush=True)
     summary_path = destination / "summary.json"
     summary_path.write_text(json.dumps(summary_payload, indent=2), encoding="utf-8")
+    print(f"[pipeline] DONE", flush=True)
     return PipelineOutputs(
         artifact_dir=artifact_dir,
         summary_path=summary_path,
@@ -289,9 +324,17 @@ def _load_vcf(vcf_path: Path) -> tuple[list[str], np.ndarray, list[_VariantDefau
 
 
 def _load_plink1(bed_path: Path) -> tuple[list[str], np.ndarray, list[_VariantDefaults]]:
+    print(f"[plink] opening {bed_path}", flush=True)
     reader = open_bed(bed_path)
-    genotype_matrix = np.asarray(reader.read(dtype="float32"), dtype=np.float32)
     sample_ids = [str(sample_id) for sample_id in reader.iid]
+    n_samples = len(sample_ids)
+    n_variants = len(reader.sid)
+    matrix_bytes = n_samples * n_variants * 4
+    print(f"[plink] samples={n_samples}  variants={n_variants}  matrix_size={matrix_bytes / 1e9:.2f} GB (float32)", flush=True)
+    print(f"[plink] reading genotype matrix into memory...", flush=True)
+    genotype_matrix = np.asarray(reader.read(dtype="float32"), dtype=np.float32)
+    print(f"[plink] genotype_matrix loaded: shape={genotype_matrix.shape}  dtype={genotype_matrix.dtype}", flush=True)
+
     variants: list[_VariantDefaults] = []
 
     for variant_index, (variant_id, chromosome, position, allele_1, allele_2) in enumerate(
@@ -318,6 +361,7 @@ def _load_plink1(bed_path: Path) -> tuple[list[str], np.ndarray, list[_VariantDe
 
     if not variants:
         raise ValueError("PLINK bed contains no variants: " + str(bed_path))
+    print(f"[plink] built {len(variants)} variant records", flush=True)
     return sample_ids, genotype_matrix, variants
 
 

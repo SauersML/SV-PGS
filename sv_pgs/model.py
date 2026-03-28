@@ -45,23 +45,29 @@ class BayesianPGS:
         variant_records: Sequence[VariantRecord | dict],
         validation_data: tuple[np.ndarray, np.ndarray, np.ndarray] | None = None,
     ) -> "BayesianPGS":
+        print(f"[fit] START  genotypes={genotypes.shape}  covariates={covariates.shape}  targets={targets.shape}", flush=True)
         raw_genotype_matrix = np.asarray(genotypes, dtype=np.float32)
         normalized_records = _training_records(
             raw_genotype_matrix,
             normalize_variant_records(variant_records),
         )
+        print(f"[fit] normalized {len(normalized_records)} variant records", flush=True)
         covariate_matrix = self._with_intercept(covariates)
+        print(f"[fit] fitting preprocessor...", flush=True)
         prepared_arrays = fit_preprocessor(raw_genotype_matrix, covariate_matrix, targets, self.config)
         preprocessor = Preprocessor(means=prepared_arrays.means, scales=prepared_arrays.scales)
+        print(f"[fit] preprocessor done", flush=True)
 
         active_variant_indices = select_active_variant_indices(
             genotype_matrix=raw_genotype_matrix,
             variant_records=normalized_records,
             config=self.config,
         )
+        print(f"[fit] active variants: {len(active_variant_indices)} / {len(normalized_records)}", flush=True)
         active_genotypes = prepared_arrays.genotypes[:, active_variant_indices]
         active_records = [normalized_records[int(variant_index)] for variant_index in active_variant_indices]
 
+        print(f"[fit] building tie map...", flush=True)
         reduced_tie_map = build_tie_map(active_genotypes, active_records, self.config)
         original_space_tie_map = _project_tie_map_to_original_space(
             reduced_tie_map=reduced_tie_map,
@@ -69,6 +75,7 @@ class BayesianPGS:
             original_variant_count=len(normalized_records),
         )
         reduced_genotypes = active_genotypes[:, reduced_tie_map.kept_indices]
+        print(f"[fit] reduced genotypes shape={reduced_genotypes.shape}  kept={len(reduced_tie_map.kept_indices)} groups={len(reduced_tie_map.reduced_to_group)}", flush=True)
 
         reduced_validation = None
         if validation_data is not None:
@@ -80,6 +87,7 @@ class BayesianPGS:
                 np.asarray(validation_targets, dtype=np.float32),
             )
 
+        print(f"[fit] starting variational EM (max_iter={self.config.max_outer_iterations})...", flush=True)
         fit_result = fit_variational_em(
             genotypes=reduced_genotypes,
             covariates=prepared_arrays.covariates,
@@ -89,6 +97,7 @@ class BayesianPGS:
             config=self.config,
             validation_data=reduced_validation,
         )
+        print(f"[fit] variational EM done  iterations={len(fit_result.objective_history)}", flush=True)
         tie_group_weights = _tie_group_export_weights(
             tie_map=reduced_tie_map,
             fit_result=fit_result,
