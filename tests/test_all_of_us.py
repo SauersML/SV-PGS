@@ -7,10 +7,7 @@ from pathlib import Path
 import pytest
 
 from sv_pgs.all_of_us import (
-    _ManifestSource,
     AllOfUsDiseaseRequest,
-    _extract_research_id_from_uri,
-    _extract_research_ids_from_manifest_rows,
     available_disease_names,
     build_all_of_us_disease_query_config,
     build_all_of_us_disease_sql,
@@ -49,39 +46,6 @@ class _FakeBigQueryClient:
         return _FakeQueryJob(self.rows)
 
 
-class _FakeStorageBlob:
-    def __init__(self, payload: str) -> None:
-        self.payload = payload
-
-    def download_as_text(self, encoding: str = "utf-8") -> str:
-        assert encoding == "utf-8"
-        return self.payload
-
-
-class _FakeStorageBucket:
-    def __init__(self, payloads_by_blob_name: dict[str, str]) -> None:
-        self.payloads_by_blob_name = payloads_by_blob_name
-
-    def blob(self, blob_name: str) -> _FakeStorageBlob:
-        return _FakeStorageBlob(self.payloads_by_blob_name[blob_name])
-
-
-class _FakeStorageClient:
-    def __init__(self, payloads_by_bucket_and_blob: dict[tuple[str, str], str], project: str | None = None) -> None:
-        self.payloads_by_bucket_and_blob = payloads_by_bucket_and_blob
-        self.project = project
-        self.bucket_calls: list[tuple[str, str | None]] = []
-
-    def bucket(self, bucket_name: str, user_project: str | None = None) -> _FakeStorageBucket:
-        self.bucket_calls.append((bucket_name, user_project))
-        payloads_by_blob_name = {
-            blob_name: payload
-            for (candidate_bucket_name, blob_name), payload in self.payloads_by_bucket_and_blob.items()
-            if candidate_bucket_name == bucket_name
-        }
-        return _FakeStorageBucket(payloads_by_blob_name)
-
-
 def test_build_all_of_us_disease_sql_uses_workspace_cdr_and_prefix_filters(monkeypatch):
     monkeypatch.setenv("WORKSPACE_CDR", "aou_workspace.cdr_dataset")
     disease_definition = resolve_disease_definition("heart_failure")
@@ -106,7 +70,6 @@ def test_build_all_of_us_disease_sql_uses_workspace_cdr_and_prefix_filters(monke
 def test_prepare_all_of_us_disease_sample_table_writes_outputs(tmp_path: Path, monkeypatch):
     monkeypatch.setenv("GOOGLE_PROJECT", "billing-project")
     monkeypatch.setenv("WORKSPACE_CDR", "aou_workspace.cdr_dataset")
-    monkeypatch.setenv("MICROARRAY_IDAT_MANIFEST_PATH", "gs://aou-bucket/microarray/idat/manifest.csv")
     fake_client = _FakeBigQueryClient(
         rows=[
             {
@@ -138,16 +101,6 @@ def test_prepare_all_of_us_disease_sample_table_writes_outputs(tmp_path: Path, m
             },
         ]
     )
-    fake_storage_client = _FakeStorageClient(
-        {
-            (
-                "aou-bucket",
-                "microarray/idat/manifest.csv",
-            ): "person_id,green_idat_uri,red_idat_uri\n"
-            "101,gs://aou-bucket/idat/9000001_11111_R01C01_Grn.idat,gs://aou-bucket/idat/9000001_11111_R01C01_Red.idat\n"
-            "102,gs://aou-bucket/idat/9000002_22222_R01C01_Grn.idat,gs://aou-bucket/idat/9000002_22222_R01C01_Red.idat\n"
-        }
-    )
 
     output_path = tmp_path / "heart_failure.tsv"
     outputs = prepare_all_of_us_disease_sample_table(
@@ -156,7 +109,6 @@ def test_prepare_all_of_us_disease_sample_table_writes_outputs(tmp_path: Path, m
         ),
         output_path=output_path,
         client=fake_client,
-        storage_client=fake_storage_client,
     )
 
     assert outputs.sample_table_path.is_file()
@@ -169,27 +121,21 @@ def test_prepare_all_of_us_disease_sample_table_writes_outputs(tmp_path: Path, m
     assert parameter_values["icd10_prefixes"].values == ["I50"]
 
     rows = _read_tsv_rows(output_path)
-    assert rows[0]["sample_id"] == "9000001"
+    assert rows[0]["sample_id"] == "101"
     assert rows[0]["person_id"] == "101"
     assert rows[0]["target"] == "1"
-    assert rows[1]["sample_id"] == "9000002"
+    assert rows[1]["sample_id"] == "102"
     metadata_payload = json.loads(outputs.metadata_path.read_text(encoding="utf-8"))
     assert metadata_payload["row_count"] == 2
-    assert metadata_payload["input_row_count"] == 2
-    assert metadata_payload["unmapped_person_count"] == 0
     assert metadata_payload["disease"] == "heart_failure"
     assert metadata_payload["icd10_prefixes"] == ["I50"]
     assert metadata_payload["min_occurrences"] == 2
     assert metadata_payload["cdr_dataset"] == "aou_workspace.cdr_dataset"
-    assert metadata_payload["genomics_manifest_sources"] == ["microarray_idat"]
-    assert fake_storage_client.bucket_calls == [("aou-bucket", "billing-project")]
 
 
 def test_prepare_all_of_us_disease_requires_all_of_us_env(monkeypatch, tmp_path: Path):
     monkeypatch.delenv("GOOGLE_PROJECT", raising=False)
     monkeypatch.delenv("WORKSPACE_CDR", raising=False)
-    monkeypatch.delenv("MICROARRAY_IDAT_MANIFEST_PATH", raising=False)
-    monkeypatch.delenv("WGS_CRAM_MANIFEST_PATH", raising=False)
 
     with pytest.raises(ValueError, match="GOOGLE_PROJECT"):
         prepare_all_of_us_disease_sample_table(
@@ -201,7 +147,6 @@ def test_prepare_all_of_us_disease_requires_all_of_us_env(monkeypatch, tmp_path:
 def test_prepare_all_of_us_disease_requires_workspace_cdr_env(monkeypatch, tmp_path: Path):
     monkeypatch.setenv("GOOGLE_PROJECT", "billing-project")
     monkeypatch.delenv("WORKSPACE_CDR", raising=False)
-    monkeypatch.setenv("MICROARRAY_IDAT_MANIFEST_PATH", "gs://aou-bucket/microarray/idat/manifest.csv")
     fake_client = _FakeBigQueryClient(
         rows=[
             {
@@ -226,19 +171,12 @@ def test_prepare_all_of_us_disease_requires_workspace_cdr_env(monkeypatch, tmp_p
             request=AllOfUsDiseaseRequest(disease="heart failure"),
             output_path=tmp_path / "heart_failure.tsv",
             client=fake_client,
-            storage_client=_FakeStorageClient(
-                {
-                    ("aou-bucket", "microarray/idat/manifest.csv"): "person_id,green_idat_uri,red_idat_uri\n"
-                    "101,gs://aou-bucket/idat/9000001_11111_R01C01_Grn.idat,gs://aou-bucket/idat/9000001_11111_R01C01_Red.idat\n"
-                }
-            ),
         )
 
 
 def test_prepare_all_of_us_disease_uses_client_project_without_google_project_env(monkeypatch, tmp_path: Path):
     monkeypatch.delenv("GOOGLE_PROJECT", raising=False)
     monkeypatch.setenv("WORKSPACE_CDR", "aou_workspace.cdr_dataset")
-    monkeypatch.setenv("MICROARRAY_IDAT_MANIFEST_PATH", "gs://aou-bucket/microarray/idat/manifest.csv")
     fake_client = _FakeBigQueryClient(
         rows=[
             {
@@ -263,12 +201,6 @@ def test_prepare_all_of_us_disease_uses_client_project_without_google_project_en
         request=AllOfUsDiseaseRequest(disease="heart_failure"),
         output_path=tmp_path / "heart_failure.tsv",
         client=fake_client,
-        storage_client=_FakeStorageClient(
-            {
-                ("aou-bucket", "microarray/idat/manifest.csv"): "person_id,green_idat_uri,red_idat_uri\n"
-                "101,gs://aou-bucket/idat/9000001_11111_R01C01_Grn.idat,gs://aou-bucket/idat/9000001_11111_R01C01_Red.idat\n"
-            }
-        ),
     )
 
     metadata_payload = json.loads(outputs.metadata_path.read_text(encoding="utf-8"))
@@ -278,7 +210,6 @@ def test_prepare_all_of_us_disease_uses_client_project_without_google_project_en
 def test_prepare_all_of_us_disease_uses_workspace_cdr_from_env_in_query_and_metadata(monkeypatch, tmp_path: Path):
     monkeypatch.setenv("GOOGLE_PROJECT", "billing-project")
     monkeypatch.setenv("WORKSPACE_CDR", "fc-aou-cdr-prod-ct.C2024Q3R9")
-    monkeypatch.setenv("MICROARRAY_IDAT_MANIFEST_PATH", "gs://aou-bucket/microarray/idat/manifest.csv")
     fake_client = _FakeBigQueryClient(
         rows=[
             {
@@ -302,12 +233,6 @@ def test_prepare_all_of_us_disease_uses_workspace_cdr_from_env_in_query_and_meta
         request=AllOfUsDiseaseRequest(disease="heart_failure"),
         output_path=tmp_path / "heart_failure.tsv",
         client=fake_client,
-        storage_client=_FakeStorageClient(
-            {
-                ("aou-bucket", "microarray/idat/manifest.csv"): "person_id,green_idat_uri,red_idat_uri\n"
-                "101,gs://aou-bucket/idat/9000001_11111_R01C01_Grn.idat,gs://aou-bucket/idat/9000001_11111_R01C01_Red.idat\n"
-            }
-        ),
     )
 
     assert fake_client.sql is not None
@@ -315,135 +240,6 @@ def test_prepare_all_of_us_disease_uses_workspace_cdr_from_env_in_query_and_meta
     metadata_payload = json.loads(outputs.metadata_path.read_text(encoding="utf-8"))
     assert metadata_payload["cdr_dataset"] == "fc-aou-cdr-prod-ct.C2024Q3R9"
 
-
-def test_prepare_all_of_us_disease_filters_unmapped_participants(monkeypatch, tmp_path: Path):
-    monkeypatch.setenv("GOOGLE_PROJECT", "billing-project")
-    monkeypatch.setenv("WORKSPACE_CDR", "aou_workspace.cdr_dataset")
-    monkeypatch.setenv("MICROARRAY_IDAT_MANIFEST_PATH", "gs://aou-bucket/microarray/idat/manifest.csv")
-    fake_client = _FakeBigQueryClient(
-        rows=[
-            {
-                "person_id": "101",
-                "sample_id": "101",
-                "target": 1,
-                "phenotype_occurrence_count": 3,
-                "first_condition_date": "2020-01-01",
-                "observation_start_date": "2018-01-01",
-                "observation_end_date": "2024-01-01",
-                "primary_consent_date": "2017-01-01",
-                "age_at_observation_start": 42,
-                "gender_concept_id": 45880669,
-                "race_concept_id": 8527,
-                "ethnicity_concept_id": 38003564,
-            },
-            {
-                "person_id": "999",
-                "sample_id": "999",
-                "target": 0,
-                "phenotype_occurrence_count": 0,
-                "first_condition_date": None,
-                "observation_start_date": "2018-01-01",
-                "observation_end_date": "2024-01-01",
-                "primary_consent_date": "2017-01-01",
-                "age_at_observation_start": 52,
-                "gender_concept_id": 45878463,
-                "race_concept_id": 8516,
-                "ethnicity_concept_id": 38003563,
-            },
-        ]
-    )
-    fake_storage_client = _FakeStorageClient(
-        {
-            (
-                "aou-bucket",
-                "microarray/idat/manifest.csv",
-            ): "person_id,green_idat_uri,red_idat_uri\n"
-            "101,gs://aou-bucket/idat/9000001_11111_R01C01_Grn.idat,gs://aou-bucket/idat/9000001_11111_R01C01_Red.idat\n"
-        }
-    )
-
-    outputs = prepare_all_of_us_disease_sample_table(
-        request=AllOfUsDiseaseRequest(disease="heart_failure"),
-        output_path=tmp_path / "heart_failure.tsv",
-        client=fake_client,
-        storage_client=fake_storage_client,
-    )
-
-    rows = _read_tsv_rows(outputs.sample_table_path)
-    assert len(rows) == 1
-    assert rows[0]["sample_id"] == "9000001"
-    assert rows[0]["person_id"] == "101"
-    metadata_payload = json.loads(outputs.metadata_path.read_text(encoding="utf-8"))
-    assert metadata_payload["input_row_count"] == 2
-    assert metadata_payload["row_count"] == 1
-    assert metadata_payload["unmapped_person_count"] == 1
-
-
-def test_extract_research_id_from_uri_prefers_leading_research_id():
-    assert _extract_research_id_from_uri("gs://bucket/path/9000001_11111_R01C01_Grn.idat") == "9000001"
-    assert _extract_research_id_from_uri("gs://bucket/path/9000002.cram") == "9000002"
-
-
-def test_extract_research_ids_from_manifest_rows_detects_conflicts():
-    manifest_rows = [
-        {
-            "person_id": "101",
-            "green_idat_uri": "gs://bucket/path/9000001_11111_R01C01_Grn.idat",
-            "red_idat_uri": "gs://bucket/path/9000002_11111_R01C01_Red.idat",
-        }
-    ]
-
-    with pytest.raises(ValueError, match="Conflicting research_id values within All of Us manifest row"):
-        _extract_research_ids_from_manifest_rows(
-            manifest_rows,
-            _ManifestSource(
-                env_var="MICROARRAY_IDAT_MANIFEST_PATH",
-                uri_columns=("green_idat_uri", "red_idat_uri"),
-                description="microarray_idat",
-            ),
-        )
-
-
-def test_prepare_all_of_us_disease_uses_requester_pays_billing_project_for_manifests(monkeypatch, tmp_path: Path):
-    monkeypatch.setenv("GOOGLE_PROJECT", "billing-project")
-    monkeypatch.setenv("WORKSPACE_CDR", "aou_workspace.cdr_dataset")
-    monkeypatch.setenv("MICROARRAY_IDAT_MANIFEST_PATH", "gs://aou-bucket/microarray/idat/manifest.csv")
-    fake_client = _FakeBigQueryClient(
-        rows=[
-            {
-                "person_id": "101",
-                "sample_id": "101",
-                "target": 1,
-                "phenotype_occurrence_count": 3,
-                "first_condition_date": "2020-01-01",
-                "observation_start_date": "2018-01-01",
-                "observation_end_date": "2024-01-01",
-                "primary_consent_date": "2017-01-01",
-                "age_at_observation_start": 42,
-                "gender_concept_id": 45880669,
-                "race_concept_id": 8527,
-                "ethnicity_concept_id": 38003564,
-            }
-        ]
-    )
-    fake_storage_client = _FakeStorageClient(
-        {
-            (
-                "aou-bucket",
-                "microarray/idat/manifest.csv",
-            ): "person_id,green_idat_uri,red_idat_uri\n"
-            "101,gs://aou-bucket/idat/9000001_11111_R01C01_Grn.idat,gs://aou-bucket/idat/9000001_11111_R01C01_Red.idat\n"
-        }
-    )
-
-    prepare_all_of_us_disease_sample_table(
-        request=AllOfUsDiseaseRequest(disease="heart_failure"),
-        output_path=tmp_path / "heart_failure.tsv",
-        client=fake_client,
-        storage_client=fake_storage_client,
-    )
-
-    assert fake_storage_client.bucket_calls == [("aou-bucket", "billing-project")]
 
 
 def test_cli_prepare_all_of_us_disease_wires_request_and_outputs(monkeypatch, tmp_path: Path):
