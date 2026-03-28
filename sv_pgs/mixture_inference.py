@@ -711,7 +711,7 @@ def _restricted_posterior_state(
     compute_logdet: bool,
     compute_beta_variance: bool = True,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, float, float, float]:
-    from sv_pgs.progress import log
+    from sv_pgs.progress import log, mem
     sample_count = genotype_matrix.shape[0]
     diagonal_noise = np.asarray(diagonal_noise, dtype=np.float64)
     if diagonal_noise.shape != (sample_count,):

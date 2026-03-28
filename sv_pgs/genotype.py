@@ -128,7 +128,7 @@ class PlinkRawGenotypeMatrix(RawGenotypeMatrix):
             batch_indices = resolved_indices[start_index : start_index + safe_batch_size]
             col_index = np.ascontiguousarray(batch_indices, dtype=np.intp)
             values = np.asarray(
-                reader.read(index=(self.sample_indices, col_index), dtype="float32", num_threads=4),
+                reader.read(index=(self.sample_indices, col_index), dtype="float32", order="F", num_threads=None),
                 dtype=np.float32,
             )
             yield RawGenotypeBatch(
@@ -144,7 +144,7 @@ class PlinkRawGenotypeMatrix(RawGenotypeMatrix):
         reader = self._bed_reader()
         col_index = np.ascontiguousarray(resolved_indices, dtype=np.intp)
         return np.asarray(
-            reader.read(index=(self.sample_indices, col_index), dtype="float32", num_threads=4),
+            reader.read(index=(self.sample_indices, col_index), dtype="float32", order="F", num_threads=None),
             dtype=np.float32,
         )
 
@@ -158,7 +158,7 @@ class PlinkRawGenotypeMatrix(RawGenotypeMatrix):
                 sid_count=self.variant_count,
                 properties={},
                 skip_format_check=True,
-                num_threads=4,
+                num_threads=None,
             )
             log(f"    bed_reader opened  mem={mem()}")
         return self._reader

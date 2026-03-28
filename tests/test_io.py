@@ -14,7 +14,6 @@ from sv_pgs.config import ModelConfig, TraitType, VariantClass
 from sv_pgs.cli import main
 from sv_pgs.io import load_dataset_from_files, run_training_pipeline
 import sv_pgs.genotype as genotype_module
-import sv_pgs.io as io_module
 
 
 def test_load_dataset_from_vcf_uses_metadata_and_sample_alignment(tmp_path: Path):
@@ -194,25 +193,30 @@ def test_plink_loader_uses_indexed_bed_reads(tmp_path: Path, monkeypatch: pytest
         ),
     )
 
-    original_io_open_bed = io_module.open_bed
-    original_genotype_open_bed = genotype_module.open_bed
-    indexed_read_calls: list[object] = []
+    original_open_bed = genotype_module.open_bed
+    indexed_read_calls: list[tuple[np.ndarray, np.ndarray]] = []
 
-    class GuardedReader:
+    class RecordingBedReader:
         def __init__(self, delegate):
             self._delegate = delegate
 
         def read(self, *args, **kwargs):
-            if kwargs.get("index") is None:
+            index = kwargs.get("index")
+            if index is None:
                 raise AssertionError("PLINK path attempted an unindexed full-matrix BED read.")
-            indexed_read_calls.append(kwargs["index"])
+            sample_indices, variant_indices = index
+            indexed_read_calls.append(
+                (
+                    np.asarray(variant_indices, dtype=np.int32),
+                    np.asarray(sample_indices, dtype=np.int32),
+                )
+            )
             return self._delegate.read(*args, **kwargs)
 
         def __getattr__(self, name: str):
             return getattr(self._delegate, name)
 
-    monkeypatch.setattr(io_module, "open_bed", lambda path: GuardedReader(original_io_open_bed(path)))
-    monkeypatch.setattr(genotype_module, "open_bed", lambda path: GuardedReader(original_genotype_open_bed(path)))
+    monkeypatch.setattr(genotype_module, "open_bed", lambda *args, **kwargs: RecordingBedReader(original_open_bed(*args, **kwargs)))
 
     dataset = load_dataset_from_files(
         genotype_path=bed_path,
@@ -223,7 +227,58 @@ def test_plink_loader_uses_indexed_bed_reads(tmp_path: Path, monkeypatch: pytest
     )
 
     assert indexed_read_calls
+    assert all(call_sample_indices.shape == (3,) for _, call_sample_indices in indexed_read_calls)
+    assert sum(call_variant_indices.shape[0] for call_variant_indices, _ in indexed_read_calls) >= 3
     np.testing.assert_allclose(dataset.genotypes, np.array([[2.0, 0.0, 1.0], [0.0, 1.0, 0.0], [1.0, 2.0, 0.0]], dtype=np.float32))
+
+
+def test_load_dataset_from_plink_filters_non_genotyped_sample_rows(tmp_path: Path):
+    bed_path = tmp_path / "cohort.bed"
+    genotype_matrix = np.array(
+        [
+            [0.0, 1.0],
+            [2.0, 0.0],
+        ],
+        dtype=np.float32,
+    )
+    to_bed(
+        bed_path,
+        genotype_matrix,
+        properties={
+            "fid": ["f1", "f2"],
+            "iid": ["101", "102"],
+            "sid": ["rs1", "rs2"],
+            "chromosome": ["1", "1"],
+            "bp_position": [100, 200],
+            "allele_1": ["A", "G"],
+            "allele_2": ["C", "T"],
+        },
+    )
+
+    sample_table_path = tmp_path / "samples.tsv"
+    _write_table(
+        sample_table_path,
+        header=("person_id", "target", "age"),
+        rows=(
+            ("999", "0", "70"),
+            ("102", "1", "55"),
+            ("101", "0", "44"),
+            ("888", "1", "63"),
+        ),
+    )
+
+    dataset = load_dataset_from_files(
+        genotype_path=bed_path,
+        genotype_format="plink1",
+        sample_table_path=sample_table_path,
+        target_column="target",
+        covariate_columns=("age",),
+    )
+
+    assert dataset.sample_ids == ["102", "101"]
+    np.testing.assert_allclose(dataset.targets, np.array([1.0, 0.0], dtype=np.float32))
+    np.testing.assert_allclose(dataset.covariates, np.array([[55.0], [44.0]], dtype=np.float32))
+    np.testing.assert_allclose(dataset.genotypes, np.array([[2.0, 0.0], [0.0, 1.0]], dtype=np.float32))
 
 
 def test_load_dataset_from_files_auto_detect_fails_when_no_identifier_column_matches(tmp_path: Path):
