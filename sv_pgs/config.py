@@ -111,8 +111,8 @@ class ModelConfig:
     logdet_probe_count: int = 6
     logdet_lanczos_steps: int = 12
     exact_solver_matrix_limit: int = 2048
-    posterior_variance_batch_size: int = 64
-    genotype_batch_size: int = 64
+    posterior_variance_batch_size: int = 4096
+    genotype_batch_size: int = 4096
     validation_interval: int = 2
     binary_intercept_calibration: bool = False
 
