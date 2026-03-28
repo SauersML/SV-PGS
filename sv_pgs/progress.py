@@ -1,0 +1,34 @@
+"""Lightweight progress logging for pipeline diagnostics."""
+
+from __future__ import annotations
+
+import resource
+import sys
+import time
+
+_start_time: float = time.monotonic()
+
+
+def mem() -> str:
+    """Return current peak RSS in MB."""
+    rss = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+    if sys.platform == "darwin":
+        rss //= 1024 * 1024
+    else:
+        rss //= 1024
+    return f"{rss} MB"
+
+
+def elapsed() -> str:
+    """Return wall-clock seconds since module import."""
+    dt = time.monotonic() - _start_time
+    if dt < 60:
+        return f"{dt:.1f}s"
+    minutes = int(dt // 60)
+    seconds = dt % 60
+    return f"{minutes}m{seconds:.0f}s"
+
+
+def log(message: str) -> None:
+    """Print a timestamped progress message to stderr."""
+    print(f"[{elapsed()} | {mem()}] {message}", file=sys.stderr, flush=True)

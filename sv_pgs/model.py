@@ -46,21 +46,33 @@ class BayesianPGS:
         variant_records: Sequence[VariantRecord | dict],
         validation_data: tuple[np.ndarray, np.ndarray, np.ndarray] | None = None,
     ) -> BayesianPGS:
+        from sv_pgs.progress import log, mem
+        log(f"=== MODEL FIT START ===  genotypes={genotypes.shape}  covariates={covariates.shape}  targets={targets.shape}")
         raw_genotype_matrix = as_raw_genotype_matrix(genotypes)
+        log("normalizing variant records and computing training support...")
         normalized_records = _training_records(raw_genotype_matrix, normalize_variant_records(variant_records), self.config)
+        log(f"normalized {len(normalized_records)} variant records  mem={mem()}")
+
         covariate_matrix = self._with_intercept(covariates)
+        log(f"fitting preprocessor (streaming mean/scale over {raw_genotype_matrix.shape[1]} variants)...")
         prepared_arrays = fit_preprocessor(raw_genotype_matrix, covariate_matrix, targets, self.config)
         preprocessor = Preprocessor(means=prepared_arrays.means, scales=prepared_arrays.scales)
+        log(f"preprocessor fitted  mem={mem()}")
+
+        log("creating standardized genotype view...")
         standardized_genotypes = raw_genotype_matrix.standardized(prepared_arrays.means, prepared_arrays.scales)
 
+        log("selecting active variant indices (filtering low-carrier SVs)...")
         active_variant_indices = select_active_variant_indices(
             genotype_matrix=raw_genotype_matrix,
             variant_records=normalized_records,
             config=self.config,
         )
+        log(f"active variants: {len(active_variant_indices)} / {len(normalized_records)} ({100.0*len(active_variant_indices)/max(len(normalized_records),1):.1f}%)")
         active_records = [normalized_records[int(variant_index)] for variant_index in active_variant_indices]
         active_genotypes = standardized_genotypes.subset(active_variant_indices)
 
+        log(f"building tie map (detecting identical/negated genotype columns)...")
         reduced_tie_map = build_tie_map(active_genotypes, active_records, self.config)
         original_space_tie_map = _project_tie_map_to_original_space(
             reduced_tie_map=reduced_tie_map,
@@ -68,6 +80,7 @@ class BayesianPGS:
             original_variant_count=len(normalized_records),
         )
         reduced_genotypes = active_genotypes.subset(reduced_tie_map.kept_indices)
+        log(f"tie map: {len(active_variant_indices)} active -> {len(reduced_tie_map.kept_indices)} unique ({len(reduced_tie_map.reduced_to_group)} groups)  mem={mem()}")
 
         reduced_validation = None
         if validation_data is not None:
@@ -81,6 +94,7 @@ class BayesianPGS:
                 np.asarray(validation_targets, dtype=np.float32),
             )
 
+        log(f"starting variational EM  max_iterations={self.config.max_outer_iterations}  reduced_matrix={reduced_genotypes.shape}  mem={mem()}")
         fit_result = fit_variational_em(
             genotypes=reduced_genotypes,
             covariates=prepared_arrays.covariates,
@@ -90,6 +104,9 @@ class BayesianPGS:
             config=self.config,
             validation_data=reduced_validation,
         )
+        log(f"variational EM converged in {len(fit_result.objective_history)} iterations  final_obj={fit_result.objective_history[-1]:.4f}  mem={mem()}")
+
+        log("expanding coefficients from reduced to full space...")
         tie_group_weights = _tie_group_export_weights(
             tie_map=reduced_tie_map,
             fit_result=fit_result,
@@ -100,6 +117,8 @@ class BayesianPGS:
         )
         full_coefficients = np.zeros(len(normalized_records), dtype=np.float32)
         full_coefficients[active_variant_indices] = active_coefficients
+        nonzero_count = int(np.count_nonzero(full_coefficients))
+        log(f"coefficients: {nonzero_count} non-zero out of {len(normalized_records)} total")
 
         self.state = FittedState(
             variant_records=normalized_records,
@@ -109,6 +128,7 @@ class BayesianPGS:
             fit_result=fit_result,
             full_coefficients=full_coefficients,
         )
+        log(f"=== MODEL FIT DONE ===  mem={mem()}")
         return self
 
     def decision_function(self, genotypes: RawGenotypeMatrix | np.ndarray, covariates: np.ndarray) -> np.ndarray:
@@ -260,12 +280,14 @@ def _training_records(
     records: Sequence[VariantRecord],
     config: ModelConfig,
 ) -> list[VariantRecord]:
+    from sv_pgs.progress import log, mem
     training_supports = [record.training_support for record in records]
     unresolved_variant_indices = [
         variant_index
         for variant_index, record in enumerate(records)
         if record.variant_class in STRUCTURAL_VARIANT_CLASSES and record.training_support is None
     ]
+    log(f"  training records: {len(records)} total, {len(unresolved_variant_indices)} SVs need support counts  mem={mem()}")
     if unresolved_variant_indices:
         unresolved_lookup = {variant_index: offset for offset, variant_index in enumerate(unresolved_variant_indices)}
         unresolved_supports = [0] * len(unresolved_variant_indices)

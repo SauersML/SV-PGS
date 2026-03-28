@@ -75,64 +75,98 @@ def load_dataset_from_files(
     sample_id_column: str = "auto",
     variant_metadata_path: str | Path | None = None,
 ) -> LoadedDataset:
+    from sv_pgs.progress import log, mem
+    log(f"=== LOAD DATASET START === mem={mem()}")
+
     source_path = Path(genotype_path)
     resolved_format = _resolve_genotype_format(source_path, genotype_format)
+    log(f"genotype format={resolved_format}  path={source_path}")
 
+    log(f"reading sample table: {sample_table_path}")
     sample_table_rows = _read_delimited_rows(sample_table_path)
     if not sample_table_rows:
         raise ValueError("Sample table is empty: " + str(sample_table_path))
+    log(f"sample table: {len(sample_table_rows)} rows, columns={list(sample_table_rows[0].keys())}")
 
     if resolved_format == "vcf":
+        log("loading VCF genotypes...")
         source_sample_ids, genotype_matrix, default_variants = _load_vcf(source_path)
+        log(f"VCF loaded: {len(source_sample_ids)} samples x {len(default_variants)} variants  mem={mem()}")
         plink_metadata = None
     elif resolved_format == "plink1":
+        log("reading PLINK .fam/.bim metadata (no genotype data yet)...")
         plink_metadata = _load_plink1_metadata(source_path)
         source_sample_ids = plink_metadata.sample_ids
+        log(f"PLINK metadata: {len(source_sample_ids)} samples x {len(plink_metadata.variant_ids)} variants")
+        bed_size = source_path.stat().st_size / 1e9
+        full_matrix_gb = len(source_sample_ids) * len(plink_metadata.variant_ids) * 4 / 1e9
+        log(f"  .bed file size: {bed_size:.2f} GB  |  full float32 matrix would be: {full_matrix_gb:.1f} GB")
         genotype_matrix = None
         default_variants = None
     else:
         raise ValueError("Unsupported genotype format: " + resolved_format)
 
+    log("resolving sample ID column...")
     resolved_sample_id_column = _resolve_sample_id_column(
         rows=sample_table_rows,
         requested_sample_id_column=sample_id_column,
         available_sample_ids=source_sample_ids,
     )
+    log(f"sample ID column: '{resolved_sample_id_column}'")
 
+    log("building sample table (parsing target + covariates)...")
     sample_table = _build_sample_table(
         rows=sample_table_rows,
         sample_id_column=resolved_sample_id_column,
         target_column=target_column,
         covariate_columns=covariate_columns,
     )
+    n_cases = int(np.sum(np.asarray(sample_table.targets) == 1.0))
+    n_controls = int(np.sum(np.asarray(sample_table.targets) == 0.0))
+    log(f"sample table: {len(sample_table.sample_ids)} samples, {sample_table.covariates.shape[1]} covariates")
+    log(f"  target distribution: {n_cases} cases, {n_controls} controls (of {len(sample_table.sample_ids)} total)")
 
+    log("aligning sample IDs between sample table and genotype source...")
     aligned_sample_indices = _align_sample_ids(
         expected_sample_ids=sample_table.sample_ids,
         available_sample_ids=source_sample_ids,
         context="genotype source",
     )
+    log(f"aligned {len(aligned_sample_indices)} / {len(source_sample_ids)} genotype samples")
 
     if resolved_format == "vcf":
+        log("subsetting VCF genotype matrix to aligned samples...")
         raw_genotypes: RawGenotypeMatrix = DenseRawGenotypeMatrix(
             np.asarray(genotype_matrix[aligned_sample_indices, :], dtype=np.float32)
         )
         if default_variants is None:
             raise RuntimeError("VCF defaults were not initialized.")
+        log(f"VCF subset: {raw_genotypes.shape}  mem={mem()}")
     else:
         if plink_metadata is None:
             raise RuntimeError("PLINK metadata were not initialized.")
+        log(f"creating lazy PLINK genotype reader ({len(aligned_sample_indices)} samples x {len(plink_metadata.variant_ids)} variants)")
+        subset_gb = len(aligned_sample_indices) * len(plink_metadata.variant_ids) * 4 / 1e9
+        log(f"  subset float32 matrix would be: {subset_gb:.1f} GB (will stream in batches instead)")
         raw_genotypes = PlinkRawGenotypeMatrix(
             bed_path=source_path,
             sample_indices=aligned_sample_indices,
             variant_count=len(plink_metadata.variant_ids),
         )
+        log("computing streaming allele frequencies for PLINK variant defaults...")
         default_variants = _build_plink_variant_defaults(plink_metadata, raw_genotypes)
+        log(f"built {len(default_variants)} PLINK variant defaults  mem={mem()}")
 
+    log("building variant records from defaults + optional metadata...")
     variant_records = _build_variant_records(
         default_variants=default_variants,
         variant_metadata_path=variant_metadata_path,
     )
+    sv_count = sum(1 for vr in variant_records if vr.variant_class.value not in ("snv", "small_indel"))
+    snv_count = sum(1 for vr in variant_records if vr.variant_class.value == "snv")
+    log(f"variant records: {len(variant_records)} total ({snv_count} SNVs, {sv_count} structural variants)")
 
+    log(f"=== LOAD DATASET DONE === final shape={raw_genotypes.shape}  mem={mem()}")
     return LoadedDataset(
         sample_ids=list(sample_table.sample_ids),
         genotypes=raw_genotypes,
@@ -147,19 +181,26 @@ def run_training_pipeline(
     config: ModelConfig,
     output_dir: str | Path,
 ) -> PipelineOutputs:
+    from sv_pgs.progress import log, mem
+    log(f"=== TRAINING PIPELINE START ===  samples={len(dataset.sample_ids)}  variants={dataset.genotypes.shape[1]}  trait={config.trait_type.value}  mem={mem()}")
     destination = Path(output_dir)
     destination.mkdir(parents=True, exist_ok=True)
 
+    log("fitting Bayesian PGS model...")
     model = BayesianPGS(config).fit(
         dataset.genotypes,
         dataset.covariates,
         dataset.targets,
         dataset.variant_records,
     )
+    log(f"model fitted  mem={mem()}")
 
+    log("exporting model artifacts...")
     artifact_dir = destination / "artifact"
     model.export(artifact_dir)
+    log(f"artifacts written to {artifact_dir}")
 
+    log("writing coefficients table...")
     coefficients_path = destination / "coefficients.tsv"
     coefficient_rows = model.coefficient_table()
     _write_delimited_rows(
@@ -175,23 +216,28 @@ def run_training_pipeline(
         ),
     )
 
+    log("writing predictions...")
     predictions_path = destination / "predictions.tsv"
     summary_payload = _write_predictions_and_summary(
         predictions_path=predictions_path,
         dataset=dataset,
         model=model,
     )
+    active_count = int(model.state.active_variant_indices.shape[0]) if model.state is not None else 0
     summary_payload.update(
         {
             "sample_count": int(dataset.genotypes.shape[0]),
             "variant_count": int(dataset.genotypes.shape[1]),
-            "active_variant_count": int(model.state.active_variant_indices.shape[0]) if model.state is not None else 0,
+            "active_variant_count": active_count,
             "trait_type": config.trait_type.value,
         }
     )
+    log(f"predictions written: {active_count} active variants out of {dataset.genotypes.shape[1]}")
 
+    log("writing summary JSON...")
     summary_path = destination / "summary.json"
     summary_path.write_text(json.dumps(summary_payload, indent=2), encoding="utf-8")
+    log(f"=== TRAINING PIPELINE DONE ===  mem={mem()}")
     return PipelineOutputs(
         artifact_dir=artifact_dir,
         summary_path=summary_path,
@@ -650,12 +696,20 @@ def _infer_dosage_allele_frequency(dosage: np.ndarray) -> float:
 
 
 def _infer_streaming_allele_frequencies(genotype_matrix: RawGenotypeMatrix) -> np.ndarray:
-    dosage_sums = np.zeros(genotype_matrix.shape[1], dtype=np.float64)
-    observed_counts = np.zeros(genotype_matrix.shape[1], dtype=np.int64)
+    from sv_pgs.progress import log, mem
+    n_variants = genotype_matrix.shape[1]
+    log(f"  streaming allele frequencies: {n_variants} variants  mem={mem()}")
+    dosage_sums = np.zeros(n_variants, dtype=np.float64)
+    observed_counts = np.zeros(n_variants, dtype=np.int64)
+    variants_done = 0
     for batch in genotype_matrix.iter_column_batches():
         mask = ~np.isnan(batch.values)
         dosage_sums[batch.variant_indices] = np.sum(np.where(mask, batch.values, 0.0), axis=0, dtype=np.float64)
         observed_counts[batch.variant_indices] = np.sum(mask, axis=0, dtype=np.int64)
+        variants_done += len(batch.variant_indices)
+        pct = 100.0 * variants_done / max(n_variants, 1)
+        if variants_done == len(batch.variant_indices) or variants_done % max(n_variants // 10, 1) < len(batch.variant_indices) or variants_done == n_variants:
+            log(f"  allele freq: {variants_done}/{n_variants} variants ({pct:.0f}%)  mem={mem()}")
     allele_frequencies = np.divide(
         dosage_sums,
         np.maximum(2 * observed_counts, 1),

@@ -122,7 +122,8 @@ class PlinkRawGenotypeMatrix(RawGenotypeMatrix):
         resolved_indices = _resolve_variant_indices(self.variant_count, variant_indices)
         safe_batch_size = max(int(self.batch_size if batch_size is None else batch_size), 1)
         reader = self._bed_reader()
-        for start_index in range(0, resolved_indices.shape[0], safe_batch_size):
+        total = resolved_indices.shape[0]
+        for start_index in range(0, total, safe_batch_size):
             batch_indices = resolved_indices[start_index : start_index + safe_batch_size]
             yield RawGenotypeBatch(
                 variant_indices=batch_indices,

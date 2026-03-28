@@ -34,6 +34,7 @@ def fit_preprocessor(
     targets: np.ndarray,
     config: ModelConfig,
 ) -> PreparedArrays:
+    from sv_pgs.progress import log, mem
     raw_genotypes = as_raw_genotype_matrix(genotypes)
     covariate_matrix = np.asarray(covariates, dtype=np.float32)
     target_array = np.asarray(targets, dtype=np.float32).reshape(-1)
@@ -43,13 +44,18 @@ def fit_preprocessor(
         raise ValueError("genotypes, covariates, and targets must share sample dimension.")
 
     variant_count = raw_genotypes.shape[1]
+    log(f"  preprocessor pass 1/2: computing means over {variant_count} variants...")
     sums = np.zeros(variant_count, dtype=np.float64)
     non_missing_counts = np.zeros(variant_count, dtype=np.int64)
+    variants_done = 0
     for batch in raw_genotypes.iter_column_batches(batch_size=config.genotype_batch_size):
         mask = ~np.isnan(batch.values)
         observed = np.where(mask, batch.values, 0.0)
         sums[batch.variant_indices] = np.sum(observed, axis=0, dtype=np.float64)
         non_missing_counts[batch.variant_indices] = np.sum(mask, axis=0, dtype=np.int64)
+        variants_done += len(batch.variant_indices)
+        if variants_done == len(batch.variant_indices) or variants_done % max(variant_count // 10, 1) < len(batch.variant_indices) or variants_done == variant_count:
+            log(f"  preprocessor pass 1/2: {variants_done}/{variant_count} ({100*variants_done//variant_count}%)  mem={mem()}")
 
     means = np.divide(
         sums,
@@ -58,15 +64,21 @@ def fit_preprocessor(
         where=non_missing_counts > 0,
     )
 
+    log(f"  preprocessor pass 2/2: computing scales over {variant_count} variants...")
     centered_sum_squares = np.zeros(variant_count, dtype=np.float64)
+    variants_done = 0
     for batch in raw_genotypes.iter_column_batches(batch_size=config.genotype_batch_size):
         batch_means = means[batch.variant_indices]
         imputed = np.where(np.isnan(batch.values), batch_means[None, :], batch.values)
         centered = imputed - batch_means[None, :]
         centered_sum_squares[batch.variant_indices] = np.sum(centered * centered, axis=0, dtype=np.float64)
+        variants_done += len(batch.variant_indices)
+        if variants_done == len(batch.variant_indices) or variants_done % max(variant_count // 10, 1) < len(batch.variant_indices) or variants_done == variant_count:
+            log(f"  preprocessor pass 2/2: {variants_done}/{variant_count} ({100*variants_done//variant_count}%)  mem={mem()}")
 
     scales = np.sqrt(centered_sum_squares / max(raw_genotypes.shape[0], 1))
     scales = np.where(scales < config.minimum_scale, 1.0, scales)
+    log(f"  preprocessor done  mem={mem()}")
 
     return PreparedArrays(
         covariates=np.asarray(covariate_matrix, dtype=np.float32),
@@ -81,21 +93,34 @@ def select_active_variant_indices(
     variant_records: Sequence[VariantRecord],
     config: ModelConfig,
 ) -> np.ndarray:
+    from sv_pgs.progress import log, mem
     raw_genotypes = as_raw_genotype_matrix(genotype_matrix)
-    active_flags = np.ones(len(variant_records), dtype=bool)
+    n_total = len(variant_records)
+    log(f"  selecting active variants from {n_total} total (min_carriers={config.minimum_structural_variant_carriers})...")
+    active_flags = np.ones(n_total, dtype=bool)
     structural_variant_classes = set(config.structural_variant_classes())
+    variants_done = 0
+    sv_checked = 0
+    sv_filtered = 0
     for batch in raw_genotypes.iter_column_batches(batch_size=config.genotype_batch_size):
         for local_index, variant_index in enumerate(batch.variant_indices):
             variant_record = variant_records[int(variant_index)]
             if variant_record.variant_class not in structural_variant_classes:
                 continue
+            sv_checked += 1
             support_count = _structural_variant_support(
                 raw_variant_values=batch.values[:, local_index],
                 variant_record=variant_record,
             )
             if support_count < config.minimum_structural_variant_carriers:
                 active_flags[int(variant_index)] = False
-    return np.where(active_flags)[0].astype(np.int32)
+                sv_filtered += 1
+        variants_done += len(batch.variant_indices)
+        if variants_done == len(batch.variant_indices) or variants_done % max(n_total // 10, 1) < len(batch.variant_indices) or variants_done == n_total:
+            log(f"  active variant selection: {variants_done}/{n_total} ({100*variants_done//n_total}%)  SVs checked={sv_checked} filtered={sv_filtered}  mem={mem()}")
+    result = np.where(active_flags)[0].astype(np.int32)
+    log(f"  active variant selection done: {len(result)} / {n_total} kept ({n_total - len(result)} filtered)")
+    return result
 
 
 def _structural_variant_support(
@@ -137,16 +162,20 @@ def build_tie_map(
     records: Sequence[VariantRecord],
     config: ModelConfig,
 ) -> TieMap:
+    from sv_pgs.progress import log, mem
     standardized_genotypes = _as_standardized_genotypes(genotypes)
     if standardized_genotypes.shape[1] != len(records):
         raise ValueError("genotypes and records length mismatch.")
+    n_total = standardized_genotypes.shape[1]
+    log(f"  building tie map over {n_total} variants...")
 
     exact_signature_to_group: dict[bytes, int] = {}
     sign_flipped_signature_to_group: dict[bytes, int] = {}
     tie_groups: list[TieGroup] = []
     kept_variant_indices: list[int] = []
-    original_to_reduced = np.full(standardized_genotypes.shape[1], -1, dtype=np.int32)
+    original_to_reduced = np.full(n_total, -1, dtype=np.int32)
 
+    variants_done = 0
     for batch in standardized_genotypes.iter_column_batches(batch_size=config.genotype_batch_size):
         for local_batch_index, variant_index in enumerate(batch.variant_indices):
             standardized_column = np.where(
@@ -190,7 +219,11 @@ def build_tie_map(
             exact_signature_to_group[genotype_signature] = reduced_index
             sign_flipped_signature_to_group[sign_flipped_signature] = reduced_index
             original_to_reduced[int(variant_index)] = reduced_index
+        variants_done += len(batch.variant_indices)
+        if variants_done == len(batch.variant_indices) or variants_done % max(n_total // 10, 1) < len(batch.variant_indices) or variants_done == n_total:
+            log(f"  tie map: {variants_done}/{n_total} ({100*variants_done//n_total}%)  unique={len(kept_variant_indices)}  groups={len(tie_groups)}  mem={mem()}")
 
+    log(f"  tie map done: {n_total} -> {len(kept_variant_indices)} unique representatives  mem={mem()}")
     return TieMap(
         kept_indices=np.asarray(kept_variant_indices, dtype=np.int32),
         original_to_reduced=original_to_reduced,

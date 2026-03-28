@@ -65,6 +65,7 @@ def fit_variational_em(
     tie_map: TieMap,
     validation_data: tuple[np.ndarray, np.ndarray, np.ndarray] | None = None,
 ) -> VariationalFitResult:
+    from sv_pgs.progress import log, mem
     genotype_matrix = _as_standardized_genotype_matrix(genotypes)
     covariate_matrix = np.asarray(covariates, dtype=np.float64)
     target_vector = np.asarray(targets, dtype=np.float64)
@@ -112,7 +113,11 @@ def fit_variational_em(
     best_tpb_shape_a_vector: np.ndarray | None = None
     best_tpb_shape_b_vector: np.ndarray | None = None
 
+    from sv_pgs.progress import log, mem
+    log(f"  variational EM: {genotype_matrix.shape[1]} reduced variants, {covariate_matrix.shape[1]} covariates, {target_vector.shape[0]} samples, max_iter={config.max_outer_iterations}")
+
     for outer_iteration in range(config.max_outer_iterations):
+        log(f"  variational EM iteration {outer_iteration + 1}/{config.max_outer_iterations} start  sigma_e2={sigma_error2:.6f}  global_scale={global_scale:.6f}  mem={mem()}")
         posterior_theta = _pack_theta(
             global_scale=float(global_scale),
             scale_model_coefficients=scale_model_coefficients,
@@ -158,6 +163,7 @@ def fit_variational_em(
             scale_penalty=scale_penalty,
         )
         objective_history.append(float(full_objective))
+        log(f"  variational EM iteration {outer_iteration + 1}: objective={full_objective:.6f} sigma_e2={sigma_error2:.6f}")
 
         if validation_payload is not None:
             should_validate = (
@@ -184,6 +190,7 @@ def fit_variational_em(
                     best_sigma_error2 = float(sigma_error2)
                     best_tpb_shape_a_vector = posterior_tpb_shape_a_vector.copy()
                     best_tpb_shape_b_vector = posterior_tpb_shape_b_vector.copy()
+                log(f"  variational EM iteration {outer_iteration + 1}: validation_metric={validation_metric:.6f}")
 
         updated_local_scale, updated_auxiliary_delta = _update_local_scales(
             coefficient_second_moment=reduced_second_moment,
@@ -242,12 +249,21 @@ def fit_variational_em(
         previous_tpb_shape_a_vector = tpb_shape_a_vector.copy()
         previous_tpb_shape_b_vector = tpb_shape_b_vector.copy()
 
+        iter_num = outer_iteration + 1
+        obj_str = f"{objective_history[-1]:.6f}" if objective_history else "N/A"
+        val_str = f"  val={validation_history[-1]:.6f}" if validation_history else ""
+        hyper_str = "  [+hyper]" if should_update_hyperparameters else ""
+        nonzero_beta = int(np.count_nonzero(np.abs(beta_state) > 1e-8))
+        log(f"  EM iter {iter_num}/{config.max_outer_iterations}  obj={obj_str}  delta={parameter_change:.2e}  sigma_e2={sigma_error2:.4f}  g_scale={float(global_scale):.4f}  nz_beta={nonzero_beta}{val_str}{hyper_str}  mem={mem()}")
+
         if validation_history:
             if len(validation_history) >= 2:
                 validation_delta = abs(validation_history[-1] - validation_history[-2])
                 if parameter_change < config.convergence_tolerance and validation_delta < config.convergence_tolerance:
+                    log(f"  variational EM converged on iteration {outer_iteration + 1} with parameter_change={parameter_change:.3e} validation_delta={validation_delta:.3e}")
                     break
         elif parameter_change < config.convergence_tolerance:
+            log(f"  variational EM converged on iteration {outer_iteration + 1} with parameter_change={parameter_change:.3e}")
             break
 
     if best_validation_metric is not None:
@@ -269,6 +285,7 @@ def fit_variational_em(
         tpb_shape_a_vector = best_tpb_shape_a_vector
         tpb_shape_b_vector = best_tpb_shape_b_vector
 
+    log(f"  EM loop done after {len(objective_history)} iterations, computing final posterior...  mem={mem()}")
     final_metadata_baseline_scales = _metadata_baseline_scales_from_coefficients(
         scale_model_coefficients,
         prior_design.design_matrix,
@@ -308,12 +325,14 @@ def fit_variational_em(
             sigma_error2=final_state.sigma_error2,
         )
 
+    log(f"  final posterior computed  obj={final_state.collapsed_objective:.6f}  sigma_e2={final_state.sigma_error2:.4f}  mem={mem()}")
     final_member_prior_variances = _expand_group_prior_variances_to_members(
         reduced_prior_variances=final_reduced_prior_variances,
         tie_map=tie_map,
     )
     local_shape_a = prior_design.class_membership_matrix @ tpb_shape_a_vector
     local_shape_b = prior_design.class_membership_matrix @ tpb_shape_b_vector
+    log(f"  variational EM returning results  mem={mem()}")
     return VariationalFitResult(
         alpha=np.asarray(final_state.alpha, dtype=np.float32),
         beta_reduced=np.asarray(final_state.beta, dtype=np.float32),
@@ -683,12 +702,14 @@ def _restricted_posterior_state(
     compute_logdet: bool,
     compute_beta_variance: bool = True,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, float, float, float]:
+    from sv_pgs.progress import log
     sample_count = genotype_matrix.shape[0]
     diagonal_noise = np.asarray(diagonal_noise, dtype=np.float64)
     if diagonal_noise.shape != (sample_count,):
         raise ValueError("diagonal_noise must have one entry per sample.")
 
     if sample_count <= exact_solver_matrix_limit:
+        log(f"    restricted posterior: exact sample-space solve for n={sample_count}")
         covariance_matrix = np.diag(diagonal_noise)
         for batch in genotype_matrix.iter_column_batches(batch_size=posterior_variance_batch_size):
             genotype_batch = np.asarray(batch.values, dtype=np.float64)
@@ -704,6 +725,7 @@ def _restricted_posterior_state(
         inverse_covariance_covariates = solve_rhs(covariate_matrix)
         logdet_covariance = 2.0 * float(np.sum(np.log(np.diag(cholesky_factor)))) if compute_logdet else 0.0
     else:
+        log(f"    restricted posterior: conjugate-gradient sample-space solve for n={sample_count}")
         covariance_operator = _sample_space_operator(genotype_matrix, prior_variances, diagonal_noise)
 
         def solve_rhs(right_hand_side: np.ndarray) -> np.ndarray:

@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import argparse
+import faulthandler
+import sys
 from pathlib import Path
 
 from sv_pgs.all_of_us import AllOfUsDiseaseRequest, available_disease_names, prepare_all_of_us_disease_sample_table
@@ -67,6 +69,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: list[str] | None = None) -> int:
+    faulthandler.enable(file=sys.stderr, all_threads=True)
     parser = build_parser()
     args = parser.parse_args(argv)
 
@@ -90,6 +93,10 @@ def main(argv: list[str] | None = None) -> int:
     if args.command != "run":
         raise ValueError("Unsupported command: " + str(args.command))
 
+    from sv_pgs.progress import log
+    log(f"=== CLI RUN START === genotypes={args.genotypes} sample_table={args.sample_table} output_dir={args.output_dir}")
+    log(f"CLI options: genotype_format={args.genotype_format} sample_id_column={args.sample_id_column} target_column={args.target_column}")
+    log(f"CLI covariates: {list(args.covariate_column)}")
     dataset = load_dataset_from_files(
         genotype_path=args.genotypes,
         genotype_format=args.genotype_format,
@@ -99,10 +106,13 @@ def main(argv: list[str] | None = None) -> int:
         covariate_columns=args.covariate_column,
         variant_metadata_path=args.variant_metadata,
     )
+    log(f"dataset loaded: samples={len(dataset.sample_ids)} variants={dataset.genotypes.shape[1]}")
+    inferred_trait_type = _infer_trait_type(dataset.targets)
+    log(f"inferred trait type: {inferred_trait_type.value}")
     outputs = run_training_pipeline(
         dataset=dataset,
         config=ModelConfig(
-            trait_type=_infer_trait_type(dataset.targets),
+            trait_type=inferred_trait_type,
             max_outer_iterations=args.max_outer_iterations,
             minimum_structural_variant_carriers=args.minimum_structural_variant_carriers,
             random_seed=args.random_seed,
@@ -110,6 +120,7 @@ def main(argv: list[str] | None = None) -> int:
         output_dir=Path(args.output_dir),
     )
 
+    log("=== CLI RUN DONE ===")
     print("artifact_dir\t" + str(outputs.artifact_dir))
     print("summary\t" + str(outputs.summary_path))
     print("predictions\t" + str(outputs.predictions_path))
