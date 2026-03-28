@@ -7,7 +7,6 @@ from pathlib import Path
 from typing import Any, Iterable, Sequence
 
 import numpy as np
-from bed_reader import open_bed
 from cyvcf2 import VCF
 from sklearn.metrics import log_loss, r2_score, roc_auc_score
 
@@ -145,13 +144,15 @@ def load_dataset_from_files(
     else:
         if plink_metadata is None:
             raise RuntimeError("PLINK metadata were not initialized.")
-        log(f"creating lazy PLINK genotype reader ({len(aligned_sample_indices)} samples x {len(plink_metadata.variant_ids)} variants)")
+        total_fam_samples = len(plink_metadata.sample_ids)
+        log(f"creating lazy PLINK genotype reader ({len(aligned_sample_indices)} samples x {len(plink_metadata.variant_ids)} variants, {total_fam_samples} total in .fam)")
         subset_gb = len(aligned_sample_indices) * len(plink_metadata.variant_ids) * 4 / 1e9
         log(f"  subset float32 matrix would be: {subset_gb:.1f} GB (will stream in batches instead)")
         raw_genotypes = PlinkRawGenotypeMatrix(
             bed_path=source_path,
             sample_indices=aligned_sample_indices,
             variant_count=len(plink_metadata.variant_ids),
+            total_sample_count=total_fam_samples,
         )
         log("computing streaming allele frequencies for PLINK variant defaults...")
         default_variants = _build_plink_variant_defaults(plink_metadata, raw_genotypes)
@@ -369,17 +370,45 @@ def _load_vcf(vcf_path: Path) -> tuple[list[str], np.ndarray, list[_VariantDefau
 
 
 def _load_plink1_metadata(bed_path: Path) -> _PlinkMetadata:
-    reader = open_bed(bed_path)
-    variant_ids = [str(variant_id) for variant_id in reader.sid]
+    from sv_pgs.progress import log, mem
+    fam_path = bed_path.with_suffix(".fam")
+    bim_path = bed_path.with_suffix(".bim")
+
+    log(f"parsing .fam file: {fam_path}")
+    sample_ids: list[str] = []
+    with fam_path.open("r", encoding="utf-8") as fh:
+        for line in fh:
+            parts = line.split()
+            if len(parts) >= 2:
+                sample_ids.append(parts[1])  # IID is second column
+    log(f"  .fam: {len(sample_ids)} samples  mem={mem()}")
+
+    log(f"parsing .bim file: {bim_path}")
+    variant_ids: list[str] = []
+    chromosomes: list[str] = []
+    positions: list[int] = []
+    allele_1: list[str] = []
+    allele_2: list[str] = []
+    with bim_path.open("r", encoding="utf-8") as fh:
+        for line in fh:
+            parts = line.split()
+            if len(parts) >= 6:
+                chromosomes.append(parts[0])
+                variant_ids.append(parts[1])
+                positions.append(int(parts[3]))
+                allele_1.append(parts[4])
+                allele_2.append(parts[5])
+    log(f"  .bim: {len(variant_ids)} variants  mem={mem()}")
+
     if not variant_ids:
         raise ValueError("PLINK bed contains no variants: " + str(bed_path))
     return _PlinkMetadata(
-        sample_ids=[str(sample_id) for sample_id in reader.iid],
+        sample_ids=sample_ids,
         variant_ids=variant_ids,
-        chromosomes=[str(chromosome) for chromosome in reader.chromosome],
-        positions=[int(position) for position in reader.bp_position],
-        allele_1=[str(allele) for allele in reader.allele_1],
-        allele_2=[str(allele) for allele in reader.allele_2],
+        chromosomes=chromosomes,
+        positions=positions,
+        allele_1=allele_1,
+        allele_2=allele_2,
     )
 
 

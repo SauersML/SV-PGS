@@ -8,9 +8,12 @@ from typing import Iterator, Sequence
 import sv_pgs._jax  # noqa: F401
 import jax.numpy as jnp
 import numpy as np
-from bed_reader import open_bed
 
 DEFAULT_GENOTYPE_BATCH_SIZE = 64
+
+# PLINK .bed 2-bit encoding -> dosage lookup (SNP-major mode)
+# 00 -> 0 (hom A1), 01 -> NaN (missing), 10 -> 1 (het), 11 -> 2 (hom A2)
+_BED_GENOTYPE_TABLE = np.array([0.0, np.nan, 1.0, 2.0], dtype=np.float32)
 
 
 def as_raw_genotype_matrix(genotypes: RawGenotypeMatrix | np.ndarray) -> RawGenotypeMatrix:
@@ -102,8 +105,8 @@ class PlinkRawGenotypeMatrix(RawGenotypeMatrix):
     bed_path: Path
     sample_indices: np.ndarray
     variant_count: int
+    total_sample_count: int
     batch_size: int = DEFAULT_GENOTYPE_BATCH_SIZE
-    _reader: open_bed | None = field(init=False, default=None, repr=False)
 
     def __post_init__(self) -> None:
         self.sample_indices = np.asarray(self.sample_indices, dtype=np.int32)
@@ -121,16 +124,18 @@ class PlinkRawGenotypeMatrix(RawGenotypeMatrix):
     ) -> Iterator[RawGenotypeBatch]:
         resolved_indices = _resolve_variant_indices(self.variant_count, variant_indices)
         safe_batch_size = max(int(self.batch_size if batch_size is None else batch_size), 1)
-        reader = self._bed_reader()
         total = resolved_indices.shape[0]
         for start_index in range(0, total, safe_batch_size):
             batch_indices = resolved_indices[start_index : start_index + safe_batch_size]
+            values = _read_bed_variants(
+                self.bed_path,
+                self.total_sample_count,
+                batch_indices,
+                self.sample_indices,
+            )
             yield RawGenotypeBatch(
                 variant_indices=batch_indices,
-                values=np.asarray(
-                    reader.read(index=(self.sample_indices, batch_indices), dtype="float32", order="F"),
-                    dtype=np.float32,
-                ),
+                values=values,
             )
 
     def materialize(
@@ -138,16 +143,72 @@ class PlinkRawGenotypeMatrix(RawGenotypeMatrix):
         variant_indices: Sequence[int] | np.ndarray | None = None,
     ) -> np.ndarray:
         resolved_indices = _resolve_variant_indices(self.variant_count, variant_indices)
-        reader = self._bed_reader()
-        return np.asarray(
-            reader.read(index=(self.sample_indices, resolved_indices), dtype="float32", order="F"),
-            dtype=np.float32,
+        return _read_bed_variants(
+            self.bed_path,
+            self.total_sample_count,
+            resolved_indices,
+            self.sample_indices,
         )
 
-    def _bed_reader(self) -> open_bed:
-        if self._reader is None:
-            self._reader = open_bed(self.bed_path)
-        return self._reader
+
+def _read_bed_variants(
+    bed_path: Path,
+    total_sample_count: int,
+    variant_indices: np.ndarray,
+    sample_indices: np.ndarray,
+) -> np.ndarray:
+    """Read specific variants and samples from a PLINK .bed file.
+
+    PLINK .bed format (SNP-major):
+      - 3-byte header: 0x6c, 0x1b, 0x01
+      - For each variant: ceil(total_samples / 4) bytes of packed 2-bit genotypes
+      - Each byte encodes 4 samples (LSB first):
+        00=hom_A1(0), 01=missing(NaN), 10=het(1), 11=hom_A2(2)
+    """
+    n_selected = sample_indices.shape[0]
+    n_variants = variant_indices.shape[0]
+    bytes_per_variant = (total_sample_count + 3) // 4
+    result = np.empty((n_selected, n_variants), dtype=np.float32)
+
+    with open(bed_path, "rb") as fh:
+        magic = fh.read(3)
+        if len(magic) < 3 or magic[0] != 0x6C or magic[1] != 0x1B:
+            raise ValueError("Not a valid PLINK .bed file: " + str(bed_path))
+        if magic[2] != 0x01:
+            raise ValueError("Only SNP-major .bed files are supported: " + str(bed_path))
+
+        for col_idx, variant_idx in enumerate(variant_indices):
+            offset = 3 + int(variant_idx) * bytes_per_variant
+            fh.seek(offset)
+            raw_bytes = fh.read(bytes_per_variant)
+            if len(raw_bytes) < bytes_per_variant:
+                raise ValueError(
+                    f"Unexpected EOF reading variant {variant_idx} from {bed_path}"
+                )
+            byte_array = np.frombuffer(raw_bytes, dtype=np.uint8)
+            # Unpack 2-bit values for ALL samples in this variant
+            all_genotypes = _decode_bed_bytes(byte_array, total_sample_count)
+            # Select only the samples we need
+            result[:, col_idx] = all_genotypes[sample_indices]
+
+    return result
+
+
+def _decode_bed_bytes(byte_array: np.ndarray, n_samples: int) -> np.ndarray:
+    """Decode packed 2-bit PLINK genotypes to float32 dosages."""
+    # Each byte has 4 genotypes, 2 bits each, LSB first
+    g0 = byte_array & 0x03
+    g1 = (byte_array >> 2) & 0x03
+    g2 = (byte_array >> 4) & 0x03
+    g3 = (byte_array >> 6) & 0x03
+    # Interleave to get sample order
+    unpacked = np.empty(byte_array.shape[0] * 4, dtype=np.uint8)
+    unpacked[0::4] = g0
+    unpacked[1::4] = g1
+    unpacked[2::4] = g2
+    unpacked[3::4] = g3
+    # Trim to actual sample count and look up dosages
+    return _BED_GENOTYPE_TABLE[unpacked[:n_samples]]
 
 
 @dataclass(slots=True)
