@@ -3,7 +3,7 @@ import pytest
 
 from sv_pgs.config import ModelConfig, VariantClass
 from sv_pgs.data import VariantRecord
-from sv_pgs.preprocessing import build_tie_map, collapse_tie_groups, fit_preprocessor, select_active_variant_indices
+from sv_pgs.preprocessing import Preprocessor, build_tie_map, collapse_tie_groups, fit_preprocessor, select_active_variant_indices
 
 
 def test_fold_preprocessing_and_exact_ties_ignore_variant_class():
@@ -26,11 +26,12 @@ def test_fold_preprocessing_and_exact_ties_ignore_variant_class():
     ]
 
     prepared_arrays = fit_preprocessor(genotype_matrix, covariate_matrix, target_vector, ModelConfig())
-    tie_map = build_tie_map(prepared_arrays.genotypes, variant_records, ModelConfig())
+    standardized_genotypes = Preprocessor(means=prepared_arrays.means, scales=prepared_arrays.scales).transform(genotype_matrix)
+    tie_map = build_tie_map(standardized_genotypes, variant_records, ModelConfig())
 
-    assert prepared_arrays.genotypes.shape == genotype_matrix.shape
-    np.testing.assert_allclose(prepared_arrays.genotypes.mean(axis=0), 0.0, atol=1e-5)
-    np.testing.assert_allclose(np.mean(prepared_arrays.genotypes**2, axis=0), 1.0, atol=1e-5)
+    assert standardized_genotypes.shape == genotype_matrix.shape
+    np.testing.assert_allclose(standardized_genotypes.mean(axis=0), 0.0, atol=1e-5)
+    np.testing.assert_allclose(np.mean(standardized_genotypes**2, axis=0), 1.0, atol=1e-5)
     assert tie_map.kept_indices.tolist() == [0, 3]
     assert tie_map.original_to_reduced.tolist() == [0, 0, 0, 1]
     np.testing.assert_allclose(tie_map.reduced_to_group[0].signs, [1.0, 1.0, -1.0])

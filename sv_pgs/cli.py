@@ -90,10 +90,6 @@ def main(argv: list[str] | None = None) -> int:
     if args.command != "run":
         raise ValueError("Unsupported command: " + str(args.command))
 
-    print(f"[cli] run command starting", flush=True)
-    print(f"[cli] genotypes={args.genotypes}  sample_table={args.sample_table}", flush=True)
-    print(f"[cli] target={args.target_column}  covariates={args.covariate_column}", flush=True)
-
     dataset = load_dataset_from_files(
         genotype_path=args.genotypes,
         genotype_format=args.genotype_format,

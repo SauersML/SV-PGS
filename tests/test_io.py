@@ -13,6 +13,8 @@ from sv_pgs import BayesianPGS
 from sv_pgs.config import ModelConfig, TraitType, VariantClass
 from sv_pgs.cli import main
 from sv_pgs.io import load_dataset_from_files, run_training_pipeline
+import sv_pgs.genotype as genotype_module
+import sv_pgs.io as io_module
 
 
 def test_load_dataset_from_vcf_uses_metadata_and_sample_alignment(tmp_path: Path):
@@ -156,6 +158,72 @@ def test_load_dataset_from_plink_auto_detects_person_id_column(tmp_path: Path):
 
     assert dataset.sample_ids == ["102", "101"]
     np.testing.assert_allclose(dataset.genotypes, np.array([[2.0, 0.0], [0.0, 1.0]], dtype=np.float32))
+
+
+def test_plink_loader_uses_indexed_bed_reads(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    bed_path = tmp_path / "cohort.bed"
+    genotype_matrix = np.array(
+        [
+            [0.0, 1.0, 0.0],
+            [2.0, 0.0, 1.0],
+            [1.0, 2.0, 0.0],
+        ],
+        dtype=np.float32,
+    )
+    to_bed(
+        bed_path,
+        genotype_matrix,
+        properties={
+            "fid": ["f1", "f2", "f3"],
+            "iid": ["101", "102", "103"],
+            "sid": ["rs1", "rs2", "rs3"],
+            "chromosome": ["1", "1", "1"],
+            "bp_position": [100, 200, 300],
+            "allele_1": ["A", "G", "T"],
+            "allele_2": ["C", "T", "C"],
+        },
+    )
+    sample_table_path = tmp_path / "samples.tsv"
+    _write_table(
+        sample_table_path,
+        header=("person_id", "target"),
+        rows=(
+            ("102", "1"),
+            ("101", "0"),
+            ("103", "1"),
+        ),
+    )
+
+    original_io_open_bed = io_module.open_bed
+    original_genotype_open_bed = genotype_module.open_bed
+    indexed_read_calls: list[object] = []
+
+    class GuardedReader:
+        def __init__(self, delegate):
+            self._delegate = delegate
+
+        def read(self, *args, **kwargs):
+            if kwargs.get("index") is None:
+                raise AssertionError("PLINK path attempted an unindexed full-matrix BED read.")
+            indexed_read_calls.append(kwargs["index"])
+            return self._delegate.read(*args, **kwargs)
+
+        def __getattr__(self, name: str):
+            return getattr(self._delegate, name)
+
+    monkeypatch.setattr(io_module, "open_bed", lambda path: GuardedReader(original_io_open_bed(path)))
+    monkeypatch.setattr(genotype_module, "open_bed", lambda path: GuardedReader(original_genotype_open_bed(path)))
+
+    dataset = load_dataset_from_files(
+        genotype_path=bed_path,
+        genotype_format="plink1",
+        sample_table_path=sample_table_path,
+        target_column="target",
+        covariate_columns=(),
+    )
+
+    assert indexed_read_calls
+    np.testing.assert_allclose(dataset.genotypes, np.array([[2.0, 0.0, 1.0], [0.0, 1.0, 0.0], [1.0, 2.0, 0.0]], dtype=np.float32))
 
 
 def test_load_dataset_from_files_auto_detect_fails_when_no_identifier_column_matches(tmp_path: Path):

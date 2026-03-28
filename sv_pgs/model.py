@@ -9,6 +9,7 @@ import numpy as np
 from sv_pgs.artifact import ModelArtifact, load_artifact, save_artifact
 from sv_pgs.config import ModelConfig, TraitType
 from sv_pgs.data import TieGroup, TieMap, VariantRecord, normalize_variant_records
+from sv_pgs.genotype import RawGenotypeMatrix, StandardizedGenotypeMatrix, as_raw_genotype_matrix
 from sv_pgs.inference import VariationalFitResult, fit_variational_em
 from sv_pgs.numeric import stable_sigmoid
 from sv_pgs.preprocessing import (
@@ -39,55 +40,47 @@ class BayesianPGS:
 
     def fit(
         self,
-        genotypes: np.ndarray,
+        genotypes: RawGenotypeMatrix | np.ndarray,
         covariates: np.ndarray,
         targets: np.ndarray,
         variant_records: Sequence[VariantRecord | dict],
         validation_data: tuple[np.ndarray, np.ndarray, np.ndarray] | None = None,
-    ) -> "BayesianPGS":
-        print(f"[fit] START  genotypes={genotypes.shape}  covariates={covariates.shape}  targets={targets.shape}", flush=True)
-        raw_genotype_matrix = np.asarray(genotypes, dtype=np.float32)
-        normalized_records = _training_records(
-            raw_genotype_matrix,
-            normalize_variant_records(variant_records),
-        )
-        print(f"[fit] normalized {len(normalized_records)} variant records", flush=True)
+    ) -> BayesianPGS:
+        raw_genotype_matrix = as_raw_genotype_matrix(genotypes)
+        normalized_records = _training_records(raw_genotype_matrix, normalize_variant_records(variant_records), self.config)
         covariate_matrix = self._with_intercept(covariates)
-        print(f"[fit] fitting preprocessor...", flush=True)
         prepared_arrays = fit_preprocessor(raw_genotype_matrix, covariate_matrix, targets, self.config)
         preprocessor = Preprocessor(means=prepared_arrays.means, scales=prepared_arrays.scales)
-        print(f"[fit] preprocessor done", flush=True)
+        standardized_genotypes = raw_genotype_matrix.standardized(prepared_arrays.means, prepared_arrays.scales)
 
         active_variant_indices = select_active_variant_indices(
             genotype_matrix=raw_genotype_matrix,
             variant_records=normalized_records,
             config=self.config,
         )
-        print(f"[fit] active variants: {len(active_variant_indices)} / {len(normalized_records)}", flush=True)
-        active_genotypes = prepared_arrays.genotypes[:, active_variant_indices]
         active_records = [normalized_records[int(variant_index)] for variant_index in active_variant_indices]
+        active_genotypes = standardized_genotypes.subset(active_variant_indices)
 
-        print(f"[fit] building tie map...", flush=True)
         reduced_tie_map = build_tie_map(active_genotypes, active_records, self.config)
         original_space_tie_map = _project_tie_map_to_original_space(
             reduced_tie_map=reduced_tie_map,
             active_variant_indices=active_variant_indices,
             original_variant_count=len(normalized_records),
         )
-        reduced_genotypes = active_genotypes[:, reduced_tie_map.kept_indices]
-        print(f"[fit] reduced genotypes shape={reduced_genotypes.shape}  kept={len(reduced_tie_map.kept_indices)} groups={len(reduced_tie_map.reduced_to_group)}", flush=True)
+        reduced_genotypes = active_genotypes.subset(reduced_tie_map.kept_indices)
 
         reduced_validation = None
         if validation_data is not None:
             validation_genotypes, validation_covariates, validation_targets = validation_data
             standardized_validation = preprocessor.transform(np.asarray(validation_genotypes, dtype=np.float32))
+            if not isinstance(standardized_validation, np.ndarray):
+                raise RuntimeError("validation_data must produce an in-memory standardized matrix.")
             reduced_validation = (
                 standardized_validation[:, active_variant_indices][:, reduced_tie_map.kept_indices],
                 self._with_intercept(np.asarray(validation_covariates, dtype=np.float32)),
                 np.asarray(validation_targets, dtype=np.float32),
             )
 
-        print(f"[fit] starting variational EM (max_iter={self.config.max_outer_iterations})...", flush=True)
         fit_result = fit_variational_em(
             genotypes=reduced_genotypes,
             covariates=prepared_arrays.covariates,
@@ -97,7 +90,6 @@ class BayesianPGS:
             config=self.config,
             validation_data=reduced_validation,
         )
-        print(f"[fit] variational EM done  iterations={len(fit_result.objective_history)}", flush=True)
         tie_group_weights = _tie_group_export_weights(
             tie_map=reduced_tie_map,
             fit_result=fit_result,
@@ -119,23 +111,30 @@ class BayesianPGS:
         )
         return self
 
-    def decision_function(self, genotypes: np.ndarray, covariates: np.ndarray) -> np.ndarray:
+    def decision_function(self, genotypes: RawGenotypeMatrix | np.ndarray, covariates: np.ndarray) -> np.ndarray:
         fitted_state = self._require_state()
-        standardized_genotypes = fitted_state.preprocessor.transform(np.asarray(genotypes, dtype=np.float32))
+        standardized_genotypes = fitted_state.preprocessor.transform(genotypes)
         covariate_matrix = self._with_intercept(np.asarray(covariates, dtype=np.float32))
-        return standardized_genotypes @ fitted_state.full_coefficients + covariate_matrix @ fitted_state.fit_result.alpha
+        if isinstance(standardized_genotypes, StandardizedGenotypeMatrix):
+            genotype_component = np.asarray(
+                standardized_genotypes.matvec(fitted_state.full_coefficients, batch_size=self.config.genotype_batch_size),
+                dtype=np.float32,
+            )
+        else:
+            genotype_component = np.asarray(standardized_genotypes @ fitted_state.full_coefficients, dtype=np.float32)
+        return genotype_component + covariate_matrix @ fitted_state.fit_result.alpha
 
-    def predict_proba(self, genotypes: np.ndarray, covariates: np.ndarray) -> np.ndarray:
+    def predict_proba(self, genotypes: RawGenotypeMatrix | np.ndarray, covariates: np.ndarray) -> np.ndarray:
         if self.config.trait_type != TraitType.BINARY:
             raise ValueError("predict_proba is only available for binary traits.")
         linear_predictor = self.decision_function(genotypes, covariates)
-        positive_probability = stable_sigmoid(linear_predictor)
+        positive_probability = np.asarray(stable_sigmoid(linear_predictor), dtype=np.float32)
         return np.column_stack([1.0 - positive_probability, positive_probability])
 
-    def predict(self, genotypes: np.ndarray, covariates: np.ndarray) -> np.ndarray:
+    def predict(self, genotypes: RawGenotypeMatrix | np.ndarray, covariates: np.ndarray) -> np.ndarray:
         linear_predictor = self.decision_function(genotypes, covariates)
         if self.config.trait_type == TraitType.BINARY:
-            return (stable_sigmoid(linear_predictor) >= 0.5).astype(np.int32)
+            return (np.asarray(stable_sigmoid(linear_predictor), dtype=np.float32) >= 0.5).astype(np.int32)
         return linear_predictor
 
     def export(self, path: str | Path) -> None:
@@ -163,7 +162,7 @@ class BayesianPGS:
         save_artifact(path, artifact)
 
     @classmethod
-    def load(cls, path: str | Path) -> "BayesianPGS":
+    def load(cls, path: str | Path) -> BayesianPGS:
         artifact = load_artifact(path)
         loaded_model = cls(config=artifact.config)
         loaded_model.state = FittedState(
@@ -257,13 +256,30 @@ def _tie_group_export_weights(
 
 
 def _training_records(
-    raw_genotypes: np.ndarray,
+    raw_genotypes: RawGenotypeMatrix,
     records: Sequence[VariantRecord],
+    config: ModelConfig,
 ) -> list[VariantRecord]:
+    training_supports = [record.training_support for record in records]
+    unresolved_variant_indices = [
+        variant_index
+        for variant_index, record in enumerate(records)
+        if record.variant_class in STRUCTURAL_VARIANT_CLASSES and record.training_support is None
+    ]
+    if unresolved_variant_indices:
+        unresolved_lookup = {variant_index: offset for offset, variant_index in enumerate(unresolved_variant_indices)}
+        unresolved_supports = [0] * len(unresolved_variant_indices)
+        for batch in raw_genotypes.iter_column_batches(unresolved_variant_indices, batch_size=config.genotype_batch_size):
+            for local_index, variant_index in enumerate(batch.variant_indices):
+                unresolved_supports[unresolved_lookup[int(variant_index)]] = _infer_support_count_from_raw_genotypes(
+                    batch.values[:, local_index],
+                    records[int(variant_index)],
+                )
+        for variant_index, support in zip(unresolved_variant_indices, unresolved_supports, strict=True):
+            training_supports[variant_index] = support
+
     training_records: list[VariantRecord] = []
     for variant_index, record in enumerate(records):
-        raw_variant_values = np.asarray(raw_genotypes[:, variant_index], dtype=np.float32)
-        training_support = _training_support(raw_variant_values, record)
         training_records.append(
             VariantRecord(
                 variant_id=record.variant_id,
@@ -273,7 +289,7 @@ def _training_records(
                 length=record.length,
                 allele_frequency=record.allele_frequency,
                 quality=record.quality,
-                training_support=training_support,
+                training_support=training_supports[variant_index],
                 is_repeat=record.is_repeat,
                 is_copy_number=record.is_copy_number,
                 prior_class_members=record.prior_class_members,
@@ -281,11 +297,3 @@ def _training_records(
             )
         )
     return training_records
-
-
-def _training_support(raw_variant_values: np.ndarray, record: VariantRecord) -> int | None:
-    if record.variant_class not in STRUCTURAL_VARIANT_CLASSES:
-        return record.training_support
-    if record.training_support is not None:
-        return record.training_support
-    return _infer_support_count_from_raw_genotypes(raw_variant_values, record)

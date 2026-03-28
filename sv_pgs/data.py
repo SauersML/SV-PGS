@@ -36,7 +36,6 @@ class VariantRecord:
 
 @dataclass(slots=True)
 class PreparedArrays:
-    genotypes: np.ndarray
     covariates: np.ndarray
     targets: np.ndarray
     means: np.ndarray

@@ -110,8 +110,9 @@ class ModelConfig:
     maximum_linear_solver_iterations: int = 256
     logdet_probe_count: int = 6
     logdet_lanczos_steps: int = 12
-    exact_solver_matrix_limit: int = 512
+    exact_solver_matrix_limit: int = 2048
     posterior_variance_batch_size: int = 64
+    genotype_batch_size: int = 64
     validation_interval: int = 2
     binary_intercept_calibration: bool = False
 
@@ -175,6 +176,8 @@ class ModelConfig:
             raise ValueError("exact_solver_matrix_limit must be positive.")
         if self.posterior_variance_batch_size < 1:
             raise ValueError("posterior_variance_batch_size must be positive.")
+        if self.genotype_batch_size < 1:
+            raise ValueError("genotype_batch_size must be positive.")
         if self.validation_interval < 1:
             raise ValueError("validation_interval must be positive.")
 

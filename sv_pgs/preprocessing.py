@@ -7,6 +7,12 @@ import numpy as np
 
 from sv_pgs.config import ModelConfig, VariantClass
 from sv_pgs.data import PreparedArrays, TieGroup, TieMap, VariantRecord
+from sv_pgs.genotype import (
+    DenseRawGenotypeMatrix,
+    RawGenotypeMatrix,
+    StandardizedGenotypeMatrix,
+    as_raw_genotype_matrix,
+)
 
 
 @dataclass(slots=True)
@@ -14,37 +20,55 @@ class Preprocessor:
     means: np.ndarray
     scales: np.ndarray
 
-    def transform(self, genotypes: np.ndarray) -> np.ndarray:
-        genotype_matrix = np.asarray(genotypes, dtype=np.float32)
-        imputed_genotypes = _impute_missing_values(genotype_matrix, self.means)
-        return np.asarray((imputed_genotypes - self.means) / self.scales, dtype=np.float32)
+    def transform(self, genotypes: RawGenotypeMatrix | np.ndarray) -> StandardizedGenotypeMatrix | np.ndarray:
+        raw_genotypes = as_raw_genotype_matrix(genotypes)
+        standardized = raw_genotypes.standardized(self.means, self.scales)
+        if isinstance(genotypes, np.ndarray):
+            return standardized.materialize()
+        return standardized
 
 
 def fit_preprocessor(
-    genotypes: np.ndarray,
+    genotypes: RawGenotypeMatrix | np.ndarray,
     covariates: np.ndarray,
     targets: np.ndarray,
     config: ModelConfig,
 ) -> PreparedArrays:
-    genotype_matrix = np.asarray(genotypes, dtype=np.float32)
+    raw_genotypes = as_raw_genotype_matrix(genotypes)
     covariate_matrix = np.asarray(covariates, dtype=np.float32)
     target_array = np.asarray(targets, dtype=np.float32).reshape(-1)
-    if genotype_matrix.ndim != 2:
-        raise ValueError("genotypes must be 2D.")
     if covariate_matrix.ndim != 2:
         raise ValueError("covariates must be 2D.")
-    if genotype_matrix.shape[0] != covariate_matrix.shape[0] or genotype_matrix.shape[0] != target_array.shape[0]:
+    if raw_genotypes.shape[0] != covariate_matrix.shape[0] or raw_genotypes.shape[0] != target_array.shape[0]:
         raise ValueError("genotypes, covariates, and targets must share sample dimension.")
 
-    means = np.nanmean(genotype_matrix, axis=0)
-    means = np.where(np.isnan(means), 0.0, means)
-    imputed_genotypes = _impute_missing_values(genotype_matrix, means)
-    centered_genotypes = imputed_genotypes - means
-    scales = np.sqrt(np.mean(centered_genotypes * centered_genotypes, axis=0))
+    variant_count = raw_genotypes.shape[1]
+    sums = np.zeros(variant_count, dtype=np.float64)
+    non_missing_counts = np.zeros(variant_count, dtype=np.int64)
+    for batch in raw_genotypes.iter_column_batches(batch_size=config.genotype_batch_size):
+        mask = ~np.isnan(batch.values)
+        observed = np.where(mask, batch.values, 0.0)
+        sums[batch.variant_indices] = np.sum(observed, axis=0, dtype=np.float64)
+        non_missing_counts[batch.variant_indices] = np.sum(mask, axis=0, dtype=np.int64)
+
+    means = np.divide(
+        sums,
+        np.maximum(non_missing_counts, 1),
+        out=np.zeros_like(sums),
+        where=non_missing_counts > 0,
+    )
+
+    centered_sum_squares = np.zeros(variant_count, dtype=np.float64)
+    for batch in raw_genotypes.iter_column_batches(batch_size=config.genotype_batch_size):
+        batch_means = means[batch.variant_indices]
+        imputed = np.where(np.isnan(batch.values), batch_means[None, :], batch.values)
+        centered = imputed - batch_means[None, :]
+        centered_sum_squares[batch.variant_indices] = np.sum(centered * centered, axis=0, dtype=np.float64)
+
+    scales = np.sqrt(centered_sum_squares / max(raw_genotypes.shape[0], 1))
     scales = np.where(scales < config.minimum_scale, 1.0, scales)
 
     return PreparedArrays(
-        genotypes=np.asarray(centered_genotypes / scales, dtype=np.float32),
         covariates=np.asarray(covariate_matrix, dtype=np.float32),
         targets=np.asarray(target_array, dtype=np.float32),
         means=np.asarray(means, dtype=np.float32),
@@ -52,26 +76,25 @@ def fit_preprocessor(
     )
 
 
-def _impute_missing_values(genotype_matrix: np.ndarray, means: np.ndarray) -> np.ndarray:
-    return np.where(np.isnan(genotype_matrix), means[None, :], genotype_matrix)
-
-
 def select_active_variant_indices(
-    genotype_matrix: np.ndarray,
+    genotype_matrix: RawGenotypeMatrix | np.ndarray,
     variant_records: Sequence[VariantRecord],
     config: ModelConfig,
 ) -> np.ndarray:
+    raw_genotypes = as_raw_genotype_matrix(genotype_matrix)
     active_flags = np.ones(len(variant_records), dtype=bool)
     structural_variant_classes = set(config.structural_variant_classes())
-    for variant_index, variant_record in enumerate(variant_records):
-        if variant_record.variant_class not in structural_variant_classes:
-            continue
-        support_count = _structural_variant_support(
-            raw_variant_values=genotype_matrix[:, variant_index],
-            variant_record=variant_record,
-        )
-        if support_count < config.minimum_structural_variant_carriers:
-            active_flags[variant_index] = False
+    for batch in raw_genotypes.iter_column_batches(batch_size=config.genotype_batch_size):
+        for local_index, variant_index in enumerate(batch.variant_indices):
+            variant_record = variant_records[int(variant_index)]
+            if variant_record.variant_class not in structural_variant_classes:
+                continue
+            support_count = _structural_variant_support(
+                raw_variant_values=batch.values[:, local_index],
+                variant_record=variant_record,
+            )
+            if support_count < config.minimum_structural_variant_carriers:
+                active_flags[int(variant_index)] = False
     return np.where(active_flags)[0].astype(np.int32)
 
 
@@ -110,64 +133,63 @@ def _infer_support_count_from_raw_genotypes(
 
 
 def build_tie_map(
-    genotypes: np.ndarray,
+    genotypes: StandardizedGenotypeMatrix | np.ndarray,
     records: Sequence[VariantRecord],
     config: ModelConfig,
 ) -> TieMap:
-    if genotypes.ndim != 2:
-        raise ValueError("genotypes must be 2D.")
-    if genotypes.shape[1] != len(records):
+    standardized_genotypes = _as_standardized_genotypes(genotypes)
+    if standardized_genotypes.shape[1] != len(records):
         raise ValueError("genotypes and records length mismatch.")
 
     exact_signature_to_group: dict[bytes, int] = {}
     sign_flipped_signature_to_group: dict[bytes, int] = {}
     tie_groups: list[TieGroup] = []
     kept_variant_indices: list[int] = []
-    original_to_reduced = np.full(genotypes.shape[1], -1, dtype=np.int32)
+    original_to_reduced = np.full(standardized_genotypes.shape[1], -1, dtype=np.int32)
 
-    float32_genotypes = np.ascontiguousarray(np.asarray(genotypes, dtype=np.float32))
-    for variant_index in range(genotypes.shape[1]):
-        standardized_column = np.where(
-            float32_genotypes[:, variant_index] == 0.0,
-            np.float32(0.0),
-            float32_genotypes[:, variant_index],
-        )
-        genotype_signature = np.ascontiguousarray(standardized_column).tobytes()
-        sign_flipped_column = np.where(
-            standardized_column == 0.0,
-            np.float32(0.0),
-            -standardized_column,
-        )
-        sign_flipped_signature = np.ascontiguousarray(sign_flipped_column).tobytes()
-
-        if genotype_signature in exact_signature_to_group:
-            reduced_index = exact_signature_to_group[genotype_signature]
-            tie_group = tie_groups[reduced_index]
-            tie_group.member_indices = np.append(tie_group.member_indices, variant_index)
-            tie_group.signs = np.append(tie_group.signs, 1.0)
-            original_to_reduced[variant_index] = reduced_index
-            continue
-
-        if genotype_signature in sign_flipped_signature_to_group:
-            reduced_index = sign_flipped_signature_to_group[genotype_signature]
-            tie_group = tie_groups[reduced_index]
-            tie_group.member_indices = np.append(tie_group.member_indices, variant_index)
-            tie_group.signs = np.append(tie_group.signs, -1.0)
-            original_to_reduced[variant_index] = reduced_index
-            continue
-
-        reduced_index = len(tie_groups)
-        tie_groups.append(
-            TieGroup(
-                representative_index=variant_index,
-                member_indices=np.asarray([variant_index], dtype=np.int32),
-                signs=np.asarray([1.0], dtype=np.float32),
+    for batch in standardized_genotypes.iter_column_batches(batch_size=config.genotype_batch_size):
+        for local_batch_index, variant_index in enumerate(batch.variant_indices):
+            standardized_column = np.where(
+                batch.values[:, local_batch_index] == 0.0,
+                np.float32(0.0),
+                batch.values[:, local_batch_index],
+            ).astype(np.float32, copy=False)
+            genotype_signature = np.ascontiguousarray(standardized_column).tobytes()
+            sign_flipped_column = np.where(
+                standardized_column == 0.0,
+                np.float32(0.0),
+                -standardized_column,
             )
-        )
-        kept_variant_indices.append(variant_index)
-        exact_signature_to_group[genotype_signature] = reduced_index
-        sign_flipped_signature_to_group[sign_flipped_signature] = reduced_index
-        original_to_reduced[variant_index] = reduced_index
+            sign_flipped_signature = np.ascontiguousarray(sign_flipped_column).tobytes()
+
+            if genotype_signature in exact_signature_to_group:
+                reduced_index = exact_signature_to_group[genotype_signature]
+                tie_group = tie_groups[reduced_index]
+                tie_group.member_indices = np.append(tie_group.member_indices, variant_index)
+                tie_group.signs = np.append(tie_group.signs, 1.0)
+                original_to_reduced[int(variant_index)] = reduced_index
+                continue
+
+            if genotype_signature in sign_flipped_signature_to_group:
+                reduced_index = sign_flipped_signature_to_group[genotype_signature]
+                tie_group = tie_groups[reduced_index]
+                tie_group.member_indices = np.append(tie_group.member_indices, variant_index)
+                tie_group.signs = np.append(tie_group.signs, -1.0)
+                original_to_reduced[int(variant_index)] = reduced_index
+                continue
+
+            reduced_index = len(tie_groups)
+            tie_groups.append(
+                TieGroup(
+                    representative_index=int(variant_index),
+                    member_indices=np.asarray([variant_index], dtype=np.int32),
+                    signs=np.asarray([1.0], dtype=np.float32),
+                )
+            )
+            kept_variant_indices.append(int(variant_index))
+            exact_signature_to_group[genotype_signature] = reduced_index
+            sign_flipped_signature_to_group[sign_flipped_signature] = reduced_index
+            original_to_reduced[int(variant_index)] = reduced_index
 
     return TieMap(
         kept_indices=np.asarray(kept_variant_indices, dtype=np.int32),
@@ -216,3 +238,14 @@ def _class_membership(member_records: Sequence[VariantRecord]) -> tuple[list[Var
     )
     class_weights /= np.sum(class_weights)
     return unique_variant_classes, class_weights
+
+
+def _as_standardized_genotypes(
+    genotypes: StandardizedGenotypeMatrix | np.ndarray,
+) -> StandardizedGenotypeMatrix:
+    if isinstance(genotypes, StandardizedGenotypeMatrix):
+        return genotypes
+    dense_genotypes = DenseRawGenotypeMatrix(np.asarray(genotypes, dtype=np.float32))
+    zero_means = np.zeros(dense_genotypes.shape[1], dtype=np.float32)
+    unit_scales = np.ones(dense_genotypes.shape[1], dtype=np.float32)
+    return dense_genotypes.standardized(zero_means, unit_scales)
