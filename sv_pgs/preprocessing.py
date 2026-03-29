@@ -21,22 +21,19 @@ from sv_pgs.genotype import (
 
 @jax.jit
 def _batch_all_stats_i8(batch_i8: jnp.ndarray) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray]:
-    """Single-pass JIT operating on int8 genotypes (sentinel -127 = missing).
-
-    Avoids float32 intermediate entirely. 4x less memory per batch.
-    """
+    """Single-pass JIT on int8 genotypes. Float32 intermediates, float64 accumulators."""
     mask = batch_i8 != -127
-    values = jnp.where(mask, batch_i8.astype(jnp.float64), 0.0)
+    values_f32 = jnp.where(mask, batch_i8.astype(jnp.float32), 0.0)
 
-    sums = jnp.sum(values, axis=0)
+    sums = jnp.sum(values_f32, axis=0, dtype=jnp.float64)
     counts = jnp.sum(mask, axis=0, dtype=jnp.int32)
     support = jnp.sum(mask & (batch_i8 > 0), axis=0, dtype=jnp.int32)
 
-    safe_counts = jnp.maximum(counts, 1).astype(jnp.float64)
-    means = sums / safe_counts
-    imputed = jnp.where(mask, values, means[None, :])
-    centered = imputed - means[None, :]
-    css = jnp.sum(centered * centered, axis=0)
+    safe_counts = jnp.maximum(counts, 1).astype(jnp.float32)
+    means_f32 = (sums / safe_counts.astype(jnp.float64)).astype(jnp.float32)
+    imputed = jnp.where(mask, values_f32, means_f32[None, :])
+    centered = imputed - means_f32[None, :]
+    css = jnp.sum(centered * centered, axis=0, dtype=jnp.float64)
 
     return sums, counts, support, css
 
@@ -53,26 +50,26 @@ def _batch_all_stats_with_screening_i8(
     Halves memory bandwidth for the screening matmul.
     """
     mask = batch_i8 != -127
-    values = jnp.where(mask, batch_i8.astype(jnp.float64), 0.0)
+    # Work in float32 throughout to halve memory (3354 × 447k × 4 = 6 GB vs 12 GB)
+    # Genotypes are 0/1/2 so float32 precision is exact for sums up to 2^24 = 16M samples
+    values_f32 = jnp.where(mask, batch_i8.astype(jnp.float32), 0.0)
 
-    # Stats in float64 for precision
-    sums = jnp.sum(values, axis=0)
+    sums = jnp.sum(values_f32, axis=0, dtype=jnp.float64)  # accumulate in f64
     counts = jnp.sum(mask, axis=0, dtype=jnp.int32)
     support = jnp.sum(mask & (batch_i8 > 0), axis=0, dtype=jnp.int32)
 
-    safe_counts = jnp.maximum(counts, 1).astype(jnp.float64)
-    means = sums / safe_counts
-    imputed = jnp.where(mask, values, means[None, :])
-    centered = imputed - means[None, :]
-    css = jnp.sum(centered * centered, axis=0)
+    safe_counts = jnp.maximum(counts, 1).astype(jnp.float32)
+    means_f32 = (sums / safe_counts.astype(jnp.float64)).astype(jnp.float32)
+    imputed = jnp.where(mask, values_f32, means_f32[None, :])
+    centered = imputed - means_f32[None, :]
+    css = jnp.sum(centered * centered, axis=0, dtype=jnp.float64)  # accumulate in f64
 
-    # Screening in float32 (just ranking, doesn't need float64 precision)
+    # Screening score: |X_std^T @ residual| in float32
     n = batch_i8.shape[0]
-    scales_f32 = jnp.sqrt(css / jnp.maximum(n, 1)).astype(jnp.float32)
-    scales_f32 = jnp.where(scales_f32 < 1e-6, 1.0, scales_f32)
-    centered_f32 = centered.astype(jnp.float32)
-    standardized_f32 = centered_f32 / scales_f32[None, :]
-    scores = jnp.abs(standardized_f32.T @ residual.astype(jnp.float32)).astype(jnp.float64)
+    scales_f32 = jnp.sqrt((css / jnp.maximum(n, 1))).astype(jnp.float32)
+    scales_f32 = jnp.where(scales_f32 < 1e-6, jnp.float32(1.0), scales_f32)
+    standardized = centered / scales_f32[None, :]
+    scores = jnp.abs(standardized.T @ residual.astype(jnp.float32)).astype(jnp.float64)
 
     return sums, counts, support, css, scores
 
