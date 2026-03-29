@@ -304,12 +304,13 @@ class StandardizedGenotypeMatrix:
             raise ValueError("coefficient vector must match genotype column count.")
         if self._dense_cache is not None or isinstance(self.raw, DenseRawGenotypeMatrix):
             return jnp.asarray(self.materialize(), dtype=jnp.float64) @ coefficient_vector
-        result = jnp.zeros(self.shape[0], dtype=jnp.float64)
+        coefficient_array = np.asarray(coefficient_vector, dtype=np.float64)
+        result = np.zeros(self.shape[0], dtype=np.float64)
         for batch in self.iter_column_batches(batch_size=batch_size):
-            batch_values = jnp.asarray(batch.values, dtype=jnp.float64)
-            batch_coefficients = coefficient_vector[batch.variant_indices]
-            result = result + batch_values @ batch_coefficients
-        return result
+            batch_values = np.asarray(batch.values, dtype=np.float64)
+            batch_coefficients = coefficient_array[batch.variant_indices]
+            result += batch_values @ batch_coefficients
+        return jnp.asarray(result, dtype=jnp.float64)
 
     def transpose_matvec(self, vector: np.ndarray | jnp.ndarray, batch_size: int = DEFAULT_GENOTYPE_BATCH_SIZE) -> jnp.ndarray:
         sample_vector = jnp.asarray(vector, dtype=jnp.float64)
@@ -317,13 +318,12 @@ class StandardizedGenotypeMatrix:
             raise ValueError("sample vector must match genotype row count.")
         if self._dense_cache is not None or isinstance(self.raw, DenseRawGenotypeMatrix):
             return jnp.asarray(self.materialize(), dtype=jnp.float64).T @ sample_vector
-        outputs: list[jnp.ndarray] = []
+        sample_array = np.asarray(sample_vector, dtype=np.float64)
+        output = np.empty(self.shape[1], dtype=np.float64)
         for batch in self.iter_column_batches(batch_size=batch_size):
-            batch_values = jnp.asarray(batch.values, dtype=jnp.float64)
-            outputs.append(batch_values.T @ sample_vector)
-        if not outputs:
-            return jnp.zeros(self.shape[1], dtype=jnp.float64)
-        return jnp.concatenate(outputs, axis=0)
+            batch_values = np.asarray(batch.values, dtype=np.float64)
+            output[batch.variant_indices] = batch_values.T @ sample_array
+        return jnp.asarray(output, dtype=jnp.float64)
 
     def transpose_matmat(self, matrix: np.ndarray | jnp.ndarray, batch_size: int = DEFAULT_GENOTYPE_BATCH_SIZE) -> jnp.ndarray:
         sample_matrix = jnp.asarray(matrix, dtype=jnp.float64)
@@ -331,13 +331,12 @@ class StandardizedGenotypeMatrix:
             raise ValueError("sample matrix must match genotype row count.")
         if self._dense_cache is not None or isinstance(self.raw, DenseRawGenotypeMatrix):
             return jnp.asarray(self.materialize(), dtype=jnp.float64).T @ sample_matrix
-        outputs: list[jnp.ndarray] = []
+        sample_array = np.asarray(sample_matrix, dtype=np.float64)
+        output = np.empty((self.shape[1], sample_array.shape[1]), dtype=np.float64)
         for batch in self.iter_column_batches(batch_size=batch_size):
-            batch_values = jnp.asarray(batch.values, dtype=jnp.float64)
-            outputs.append(batch_values.T @ sample_matrix)
-        if not outputs:
-            return jnp.zeros((self.shape[1], sample_matrix.shape[1]), dtype=jnp.float64)
-        return jnp.concatenate(outputs, axis=0)
+            batch_values = np.asarray(batch.values, dtype=np.float64)
+            output[batch.variant_indices, :] = batch_values.T @ sample_array
+        return jnp.asarray(output, dtype=jnp.float64)
 
 
 def _resolve_variant_indices(
