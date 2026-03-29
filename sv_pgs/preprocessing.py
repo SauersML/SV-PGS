@@ -87,6 +87,31 @@ def _batch_all_stats(batch_values: jnp.ndarray) -> tuple[jnp.ndarray, jnp.ndarra
     return sums, counts, support, css
 
 
+@jax.jit
+def _batch_all_stats_with_screening(
+    batch_values: jnp.ndarray,
+    residual: jnp.ndarray,
+) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray]:
+    """Float32 path with screening for VCF/dense genotypes."""
+    mask = ~jnp.isnan(batch_values)
+    observed = jnp.where(mask, batch_values, 0.0)
+    sums = jnp.sum(observed, axis=0, dtype=jnp.float64)
+    counts = jnp.sum(mask, axis=0, dtype=jnp.int32)
+    support = jnp.sum(mask & (jnp.abs(observed) > 0.5), axis=0, dtype=jnp.int32)
+    safe_counts = jnp.maximum(counts, 1).astype(jnp.float64)
+    means = sums / safe_counts
+    means_f32 = means.astype(jnp.float32)
+    imputed = jnp.where(mask, batch_values, means_f32[None, :])
+    centered = imputed - means_f32[None, :]
+    css = jnp.sum(centered * centered, axis=0, dtype=jnp.float64)
+    n = batch_values.shape[0]
+    scales = jnp.sqrt(css / jnp.maximum(n, 1))
+    scales = jnp.where(scales < 1e-6, 1.0, scales)
+    standardized = centered / scales[None, :]
+    scores = jnp.abs(standardized.T @ residual.astype(jnp.float64))
+    return sums, counts, support, css, scores
+
+
 def compute_variant_statistics(
     raw_genotypes: RawGenotypeMatrix,
     config: ModelConfig,
