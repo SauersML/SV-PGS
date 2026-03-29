@@ -13,11 +13,11 @@ from bed_reader import open_bed
 
 DEFAULT_GENOTYPE_BATCH_SIZE = 1024
 
-# Memory cap per bed_reader batch: 1 GB raw float32 output.
-# For 447k samples: 1 GB / (447278 * 4) ≈ 558 variants/batch → ~3117 batches.
-# Working memory (JAX intermediates) ≈ 3-4x this, so ~4 GB total per batch cycle.
-# Safe on 14.6 GB with ~500 MB base usage.
-BED_READER_TARGET_BATCH_BYTES = 1_000_000_000
+# Memory cap per bed_reader batch: 1.5 GB raw float32 output.
+# For 447k samples: 1.5 GB / (447278 * 4) ≈ 838 variants/batch → ~2075 batches.
+# Working memory (JAX intermediates) ≈ 5x this ≈ 7.5 GB.
+# Fits on 14.6 GB with ~1 GB base and ~5 GB margin.
+BED_READER_TARGET_BATCH_BYTES = 1_500_000_000
 MIN_BED_READER_BATCH_SIZE = 32
 
 # Auto-materialize threshold: if the reduced EM genotype matrix fits in this
