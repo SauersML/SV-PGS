@@ -20,80 +20,75 @@ from sv_pgs.genotype import (
 
 
 @jax.jit
-def _batch_pass1_stats(batch_values: jnp.ndarray) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
-    """JIT-compiled pass-1 stats: sums, non-missing counts, support counts per column."""
+def _batch_all_stats(batch_values: jnp.ndarray) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray]:
+    """Single-pass JIT: means, counts, support, and centered sum-of-squares per column.
+
+    Each batch contains ALL samples for a subset of variants (complete columns),
+    so mean and variance can both be computed from one read — no second pass needed.
+    """
     mask = ~jnp.isnan(batch_values)
     observed = jnp.where(mask, batch_values, 0.0)
+
+    # Sums, counts, support
     sums = jnp.sum(observed, axis=0, dtype=jnp.float64)
     counts = jnp.sum(mask, axis=0, dtype=jnp.int32)
-    support = jnp.sum(jnp.where(mask, jnp.abs(observed) > 0.5, False), axis=0, dtype=jnp.int32)
-    return sums, counts, support
+    support = jnp.sum(mask & (jnp.abs(observed) > 0.5), axis=0, dtype=jnp.int32)
 
+    # Means → impute → centered sum of squares (all in one shot)
+    safe_counts = jnp.maximum(counts, 1).astype(jnp.float64)
+    means = sums / safe_counts
+    means_f32 = means.astype(jnp.float32)
+    imputed = jnp.where(mask, batch_values, means_f32[None, :])
+    centered = imputed - means_f32[None, :]
+    css = jnp.sum(centered * centered, axis=0, dtype=jnp.float64)
 
-@jax.jit
-def _batch_pass2_stats(batch_values: jnp.ndarray, batch_means: jnp.ndarray) -> jnp.ndarray:
-    """JIT-compiled pass-2 stats: centered sum of squares per column."""
-    imputed = jnp.where(jnp.isnan(batch_values), batch_means[None, :], batch_values)
-    centered = imputed - batch_means[None, :]
-    return jnp.sum(centered * centered, axis=0, dtype=jnp.float64)
+    return sums, counts, support, css
 
 
 def compute_variant_statistics(
     raw_genotypes: RawGenotypeMatrix,
     config: ModelConfig,
 ) -> VariantStatistics:
-    """Compute all per-variant statistics in exactly 2 passes over the genotype data.
+    """Compute all per-variant statistics in a SINGLE pass over the genotype data.
 
-    Pass 1: sums, non-missing counts, support counts (replaces allele_freq, preprocessor means, SV support)
-    Pass 2: centered sum of squares (replaces preprocessor scales)
+    Each batch gives complete columns (all samples for a subset of variants),
+    so mean and variance are computed together from the same read.
+    Replaces what was previously 5+ separate passes.
     """
     from sv_pgs.progress import log, mem
     variant_count = raw_genotypes.shape[1]
     sample_count = raw_genotypes.shape[0]
-    log(f"=== VARIANT STATISTICS (2-pass, JAX) ===  {sample_count} samples x {variant_count} variants  batch_size={config.genotype_batch_size}  mem={mem()}")
+    batch_size = config.genotype_batch_size
+    n_batches = (variant_count + batch_size - 1) // batch_size
+    log(f"=== VARIANT STATISTICS (1-pass, JAX) ===  {sample_count} samples x {variant_count} variants  batch_size={batch_size}  n_batches={n_batches}  mem={mem()}")
 
-    # Pass 1: sums, counts, support
-    log(f"  pass 1/2: computing sums, counts, support over {variant_count} variants...")
     sums = np.zeros(variant_count, dtype=np.float64)
     non_missing_counts = np.zeros(variant_count, dtype=np.int32)
     support_counts = np.zeros(variant_count, dtype=np.int32)
+    centered_sum_squares = np.zeros(variant_count, dtype=np.float64)
+
     variants_done = 0
-    for batch in raw_genotypes.iter_column_batches(batch_size=config.genotype_batch_size):
+    for batch in raw_genotypes.iter_column_batches(batch_size=batch_size):
         batch_jax = jnp.asarray(batch.values)
-        batch_sums, batch_counts, batch_support = _batch_pass1_stats(batch_jax)
+        batch_sums, batch_counts, batch_support, batch_css = _batch_all_stats(batch_jax)
         idx = batch.variant_indices
         sums[idx] = np.asarray(batch_sums, dtype=np.float64)
         non_missing_counts[idx] = np.asarray(batch_counts, dtype=np.int32)
         support_counts[idx] = np.asarray(batch_support, dtype=np.int32)
-        del batch_jax, batch_sums, batch_counts, batch_support
+        centered_sum_squares[idx] = np.asarray(batch_css, dtype=np.float64)
+        del batch_jax, batch_sums, batch_counts, batch_support, batch_css
         variants_done += len(idx)
         if variants_done == len(idx) or variants_done % max(variant_count // 10, 1) < len(idx) or variants_done == variant_count:
-            log(f"  pass 1/2: {variants_done}/{variant_count} ({100*variants_done//variant_count}%)  mem={mem()}")
+            log(f"  {variants_done}/{variant_count} ({100*variants_done//variant_count}%)  mem={mem()}")
 
     means = np.divide(
         sums, np.maximum(non_missing_counts, 1),
         out=np.zeros_like(sums), where=non_missing_counts > 0,
     ).astype(np.float32)
     allele_frequencies = np.clip(means / 2.0, 0.0, 1.0).astype(np.float32)
-    log(f"  pass 1/2 done: mean_af={float(np.mean(allele_frequencies)):.4f}  mean_support={float(np.mean(support_counts)):.0f}  mem={mem()}")
-
-    # Pass 2: centered sum of squares → scales
-    log(f"  pass 2/2: computing scales over {variant_count} variants...")
-    centered_sum_squares = np.zeros(variant_count, dtype=np.float64)
-    variants_done = 0
-    for batch in raw_genotypes.iter_column_batches(batch_size=config.genotype_batch_size):
-        batch_jax = jnp.asarray(batch.values)
-        batch_means_jax = jnp.asarray(means[batch.variant_indices])
-        batch_css = _batch_pass2_stats(batch_jax, batch_means_jax)
-        centered_sum_squares[batch.variant_indices] = np.asarray(batch_css, dtype=np.float64)
-        del batch_jax, batch_means_jax, batch_css
-        variants_done += len(batch.variant_indices)
-        if variants_done == len(batch.variant_indices) or variants_done % max(variant_count // 10, 1) < len(batch.variant_indices) or variants_done == variant_count:
-            log(f"  pass 2/2: {variants_done}/{variant_count} ({100*variants_done//variant_count}%)  mem={mem()}")
-
     scales = np.sqrt(centered_sum_squares / max(sample_count, 1)).astype(np.float32)
     scales = np.where(scales < config.minimum_scale, 1.0, scales).astype(np.float32)
-    log(f"=== VARIANT STATISTICS DONE ===  mean_scale={float(np.mean(scales)):.4f}  mem={mem()}")
+    log(f"=== VARIANT STATISTICS DONE ===  mean_af={float(np.mean(allele_frequencies)):.4f}  mean_scale={float(np.mean(scales)):.4f}  mean_support={float(np.mean(support_counts)):.0f}  mem={mem()}")
 
     return VariantStatistics(
         means=means,
@@ -219,15 +214,6 @@ def select_active_variant_indices(
     result = np.where(active_flags)[0].astype(np.int32)
     log(f"  active variants: {len(result)}/{n_total} kept (SVs checked={sv_checked} filtered={sv_filtered}) [NO DATA PASS]")
     return result
-
-
-def _structural_variant_support(
-    raw_variant_values: np.ndarray,
-    variant_record: VariantRecord,
-) -> int:
-    if variant_record.training_support is not None:
-        return int(variant_record.training_support)
-    return _infer_support_count_from_raw_genotypes(raw_variant_values, variant_record)
 
 
 def _infer_support_count_from_raw_genotypes(

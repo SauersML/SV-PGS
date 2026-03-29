@@ -27,16 +27,6 @@ def mem() -> str:
     return f"{rss} MB"
 
 
-def peak_mem() -> str:
-    """Return peak RSS in MB."""
-    rss = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
-    if sys.platform == "darwin":
-        rss //= 1024 * 1024
-    else:
-        rss //= 1024
-    return f"{rss} MB"
-
-
 def elapsed() -> str:
     """Return wall-clock time since module import."""
     dt = time.monotonic() - _start_time

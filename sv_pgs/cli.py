@@ -93,7 +93,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.command != "run":
         raise ValueError("Unsupported command: " + str(args.command))
 
-    from sv_pgs.progress import log, mem, peak_mem
+    from sv_pgs.progress import log, mem
     import os, platform
     try:
         with open("/proc/meminfo") as f:

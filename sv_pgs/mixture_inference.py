@@ -9,7 +9,6 @@ import sv_pgs._jax  # noqa: F401
 import jax.numpy as jnp
 from jax.scipy.special import digamma as jax_digamma
 from jax.scipy.special import gammaln as jax_gammaln
-from jax.scipy.special import polygamma as jax_polygamma
 import numpy as np
 from tensorflow_probability.substrates.jax.math import bessel_kve as tfp_bessel_kve
 
@@ -1349,7 +1348,3 @@ def _calibrate_binary_intercept(
         if abs(step) < 1e-6:
             break
     return float(intercept_shift)
-
-
-def _trigamma(value: float) -> float:
-    return float(jax_polygamma(1, jnp.asarray(value, dtype=jnp.float64)))
