@@ -113,7 +113,7 @@ class ModelConfig:
     exact_solver_matrix_limit: int = 2048
     posterior_variance_batch_size: int = 1024
     genotype_batch_size: int = 1024
-    maximum_active_variants: int = 10000
+    maximum_active_variants: int = 2000
     maximum_tie_map_variants: int = 5000
     validation_interval: int = 2
     binary_intercept_calibration: bool = False

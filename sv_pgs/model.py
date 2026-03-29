@@ -169,19 +169,27 @@ class BayesianPGS:
 
     def decision_function(self, genotypes: RawGenotypeMatrix | np.ndarray, covariates: np.ndarray) -> np.ndarray:
         from sv_pgs.progress import log, mem
-        log(f"decision_function: computing predictions for {genotypes.shape[0]} samples...  mem={mem()}")
         fitted_state = self._require_state()
-        standardized_genotypes = fitted_state.preprocessor.transform(genotypes)
         covariate_matrix = self._with_intercept(np.asarray(covariates, dtype=np.float32))
-        if isinstance(standardized_genotypes, StandardizedGenotypeMatrix):
-            log(f"  streaming matvec over {standardized_genotypes.shape[1]} standardized variants...")
-            genotype_component = np.asarray(
-                standardized_genotypes.matvec(fitted_state.full_coefficients, batch_size=self.config.genotype_batch_size),
-                dtype=np.float32,
-            )
-        else:
-            log(f"  dense matvec: {standardized_genotypes.shape}")
-            genotype_component = np.asarray(standardized_genotypes @ fitted_state.full_coefficients, dtype=np.float32)
+
+        # Only read variants with non-zero coefficients (skip 99%+ of the file)
+        nonzero_mask = np.abs(fitted_state.full_coefficients) > 0.0
+        nonzero_indices = np.where(nonzero_mask)[0].astype(np.int32)
+        nonzero_coefficients = fitted_state.full_coefficients[nonzero_indices]
+        log(f"decision_function: {genotypes.shape[0]} samples, {len(nonzero_indices)} non-zero coefficients (of {len(fitted_state.full_coefficients)} total)  mem={mem()}")
+
+        if len(nonzero_indices) == 0:
+            return np.asarray(covariate_matrix @ fitted_state.fit_result.alpha, dtype=np.float32)
+
+        raw_genotypes = as_raw_genotype_matrix(genotypes)
+        standardized_subset = raw_genotypes.standardized(
+            fitted_state.preprocessor.means, fitted_state.preprocessor.scales,
+        ).subset(nonzero_indices)
+
+        genotype_component = np.asarray(
+            standardized_subset.matvec(nonzero_coefficients, batch_size=self.config.genotype_batch_size),
+            dtype=np.float32,
+        )
         log(f"  decision_function done  mem={mem()}")
         return genotype_component + covariate_matrix @ fitted_state.fit_result.alpha
 
