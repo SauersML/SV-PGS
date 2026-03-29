@@ -808,15 +808,6 @@ def _read_plink_sample_ids(fam_path: Path) -> list[str]:
     return sample_ids
 
 
-def _count_plink_variants(bim_path: Path) -> int:
-    variant_count = 0
-    with bim_path.open("r", encoding="utf-8") as handle:
-        for raw_line in handle:
-            if raw_line.strip():
-                variant_count += 1
-    return variant_count
-
-
 def _iter_plink_bim_records(bim_path: Path) -> Iterator[_PlinkBimRecord]:
     with bim_path.open("r", encoding="utf-8") as handle:
         for line_number, raw_line in enumerate(handle, start=1):
