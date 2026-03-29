@@ -128,13 +128,17 @@ class PlinkRawGenotypeMatrix(RawGenotypeMatrix):
         return int(self.sample_indices.shape[0]), int(self.variant_count)
 
     def _read_batch(self, reader: open_bed, batch_indices: np.ndarray) -> np.ndarray:
-        """Read one batch from disk. Called from main thread or prefetch thread."""
+        """Read one batch from disk as int8, convert to float32 with NaN for missing.
+
+        int8 encoding: 0=hom_ref, 1=het, 2=hom_alt, -127=missing.
+        Reading as int8 is 4x less disk I/O and memory than float32.
+        """
         sample_index = _contiguous_index_or_slice(self.sample_indices)
         col_index = _contiguous_index_or_slice(batch_indices)
-        return np.asarray(
-            reader.read(index=(sample_index, col_index), dtype="float32", order="F", num_threads=None),
-            dtype=np.float32,
-        )
+        raw_i8 = reader.read(index=(sample_index, col_index), dtype="int8", order="F", num_threads=None)
+        result = np.asarray(raw_i8, dtype=np.float32)
+        result[raw_i8 == -127] = np.nan
+        return result
 
     def iter_column_batches(
         self,
