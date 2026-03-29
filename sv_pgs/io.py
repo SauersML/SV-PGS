@@ -416,32 +416,6 @@ def _load_plink1_metadata(bed_path: Path) -> _PlinkMetadata:
     )
 
 
-def _build_plink_variant_defaults(
-    bed_path: Path,
-    genotype_matrix: RawGenotypeMatrix,
-) -> list[_VariantDefaults]:
-    allele_frequencies = _infer_streaming_allele_frequencies(genotype_matrix)
-    variant_defaults: list[_VariantDefaults] = []
-    for variant_index, bim_record in enumerate(_iter_plink_bim_records(bed_path.with_suffix(".bim"))):
-        variant_defaults.append(
-            _VariantDefaults(
-                variant_id=bim_record.variant_id,
-                variant_class=_infer_plink_variant_class(bim_record.allele_1, bim_record.allele_2),
-                chromosome=bim_record.chromosome,
-                position=bim_record.position,
-                length=1.0,
-                allele_frequency=float(allele_frequencies[variant_index]),
-                quality=1.0,
-            )
-        )
-    if len(variant_defaults) != genotype_matrix.shape[1]:
-        raise ValueError(
-            "PLINK .bim variant count does not match genotype matrix: "
-            + f"{len(variant_defaults)} vs {genotype_matrix.shape[1]}"
-        )
-    return variant_defaults
-
-
 def _build_plink_variant_defaults_from_stats(
     bed_path: Path,
     variant_stats: VariantStatistics,
@@ -768,30 +742,6 @@ def _infer_dosage_allele_frequency(dosage: np.ndarray) -> float:
     if np.all(np.isnan(dosage)):
         return 0.0
     return float(np.nanmean(dosage) / 2.0)
-
-
-def _infer_streaming_allele_frequencies(genotype_matrix: RawGenotypeMatrix) -> np.ndarray:
-    from sv_pgs.progress import log, mem
-    n_variants = genotype_matrix.shape[1]
-    log(f"  streaming allele frequencies: {n_variants} variants  mem={mem()}")
-    dosage_sums = np.zeros(n_variants, dtype=np.float64)
-    observed_counts = np.zeros(n_variants, dtype=np.int64)
-    variants_done = 0
-    for batch in genotype_matrix.iter_column_batches():
-        mask = ~np.isnan(batch.values)
-        dosage_sums[batch.variant_indices] = np.sum(np.where(mask, batch.values, 0.0), axis=0, dtype=np.float64)
-        observed_counts[batch.variant_indices] = np.sum(mask, axis=0, dtype=np.int64)
-        variants_done += len(batch.variant_indices)
-        pct = 100.0 * variants_done / max(n_variants, 1)
-        if variants_done == len(batch.variant_indices) or variants_done % max(n_variants // 10, 1) < len(batch.variant_indices) or variants_done == n_variants:
-            log(f"  allele freq: {variants_done}/{n_variants} variants ({pct:.0f}%)  mem={mem()}")
-    allele_frequencies = np.divide(
-        dosage_sums,
-        np.maximum(2 * observed_counts, 1),
-        out=np.zeros_like(dosage_sums),
-        where=observed_counts > 0,
-    )
-    return np.clip(allele_frequencies, 0.0, 1.0).astype(np.float32)
 
 
 @dataclass(slots=True)

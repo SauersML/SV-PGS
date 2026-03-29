@@ -82,23 +82,21 @@ def test_exact_ties_require_exact_float32_equality():
     assert tie_map.original_to_reduced.tolist() == [0, 1]
 
 
-def test_structural_variant_filter_requires_explicit_support_for_transformed_values():
-    genotype_matrix = np.array(
-        [
-            [0.1, 0.0],
-            [0.2, 1.0],
-            [0.3, 0.0],
-        ],
-        dtype=np.float32,
-    )
+def test_select_active_variant_indices_filters_low_carrier_svs():
+    """SVs with support below threshold are filtered; SNVs always pass."""
     variant_records = [
-        VariantRecord("sv_0", VariantClass.DELETION_SHORT, "1", 100),
-        VariantRecord("snp_1", VariantClass.SNV, "1", 101),
+        VariantRecord("sv_0", VariantClass.DELETION_SHORT, "1", 100, training_support=1),
+        VariantRecord("sv_1", VariantClass.DELETION_SHORT, "1", 101, training_support=5),
+        VariantRecord("snp_2", VariantClass.SNV, "1", 102),
     ]
+    support_counts = np.array([1, 5, 100], dtype=np.int32)
 
-    with pytest.raises(ValueError, match="training_support"):
-        select_active_variant_indices(
-            genotype_matrix=genotype_matrix,
-            variant_records=variant_records,
-            config=ModelConfig(minimum_structural_variant_carriers=2),
-        )
+    result = select_active_variant_indices(
+        variant_records=variant_records,
+        support_counts=support_counts,
+        config=ModelConfig(minimum_structural_variant_carriers=2),
+    )
+    # sv_0 has support=1 < min_carriers=2 → filtered
+    # sv_1 has support=5 >= 2 → kept
+    # snp_2 is SNV → always kept
+    assert sorted(result.tolist()) == [1, 2]
