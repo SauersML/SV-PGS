@@ -716,8 +716,11 @@ def _restricted_posterior_state(
     if diagonal_noise.shape != (sample_count,):
         raise ValueError("diagonal_noise must have one entry per sample.")
 
+    variant_count = genotype_matrix.shape[1]
+    use_woodbury = sample_count > exact_solver_matrix_limit and variant_count <= exact_solver_matrix_limit
+
     if sample_count <= exact_solver_matrix_limit:
-        log(f"    restricted posterior: exact sample-space solve for n={sample_count}")
+        log(f"    restricted posterior: exact sample-space Cholesky for n={sample_count}")
         covariance_matrix = np.diag(diagonal_noise)
         for batch in genotype_matrix.iter_column_batches(batch_size=posterior_variance_batch_size):
             genotype_batch = np.asarray(batch.values, dtype=np.float64)
@@ -732,8 +735,40 @@ def _restricted_posterior_state(
         inverse_covariance_targets = solve_rhs(targets)
         inverse_covariance_covariates = solve_rhs(covariate_matrix)
         logdet_covariance = 2.0 * float(np.sum(np.log(np.diag(cholesky_factor)))) if compute_logdet else 0.0
+
+    elif use_woodbury:
+        # Woodbury identity: (D + X S X^T)^{-1} = D^{-1} - D^{-1} X (S^{-1} + X^T D^{-1} X)^{-1} X^T D^{-1}
+        # Solves via p×p Cholesky (p=variants ≤ 2048) instead of CG on n×n (n=447k).
+        log(f"    restricted posterior: Woodbury variant-space Cholesky (p={variant_count}, n={sample_count})  mem={mem()}")
+        inv_diag = 1.0 / np.maximum(diagonal_noise, 1e-12)
+        X = np.asarray(genotype_matrix.materialize(), dtype=np.float64)
+        S_diag = np.asarray(prior_variances, dtype=np.float64)
+        # Form p×p matrix: S^{-1} + X^T @ diag(1/D) @ X
+        XtDinvX = (X * inv_diag[:, None]).T @ X
+        woodbury_matrix = np.diag(1.0 / np.maximum(S_diag, 1e-12)) + XtDinvX + np.eye(variant_count) * 1e-8
+        woodbury_cholesky = np.linalg.cholesky(woodbury_matrix)
+
+        def solve_rhs(right_hand_side: np.ndarray) -> np.ndarray:
+            rhs = np.asarray(right_hand_side, dtype=np.float64)
+            Dinv_rhs = inv_diag[:, None] * rhs if rhs.ndim == 2 else inv_diag * rhs
+            Xt_Dinv_rhs = X.T @ Dinv_rhs
+            woodbury_solve = _cholesky_solve(woodbury_cholesky, Xt_Dinv_rhs)
+            return Dinv_rhs - (inv_diag[:, None] if rhs.ndim == 2 else inv_diag) * (X @ woodbury_solve)
+
+        inverse_covariance_targets = solve_rhs(targets)
+        inverse_covariance_covariates = solve_rhs(covariate_matrix)
+
+        if compute_logdet:
+            # log|D + X S X^T| = log|D| + log|S| + log|S^{-1} + X^T D^{-1} X|
+            logdet_D = float(np.sum(np.log(np.maximum(diagonal_noise, 1e-12))))
+            logdet_S = float(np.sum(np.log(np.maximum(S_diag, 1e-12))))
+            logdet_woodbury = 2.0 * float(np.sum(np.log(np.diag(woodbury_cholesky))))
+            logdet_covariance = logdet_D + logdet_S + logdet_woodbury
+        else:
+            logdet_covariance = 0.0
+
     else:
-        log(f"    restricted posterior: conjugate-gradient sample-space solve for n={sample_count}")
+        log(f"    restricted posterior: conjugate-gradient sample-space solve (p={variant_count}, n={sample_count})")
         covariance_operator = _sample_space_operator(genotype_matrix, prior_variances, diagonal_noise)
 
         def solve_rhs(right_hand_side: np.ndarray) -> np.ndarray:
