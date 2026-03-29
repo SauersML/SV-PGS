@@ -36,11 +36,12 @@ class VariantRecord:
 
 @dataclass(slots=True)
 class VariantStatistics:
-    """Pre-computed per-variant statistics from streaming over raw genotypes (2 passes)."""
+    """Pre-computed per-variant statistics from a single streaming pass."""
     means: np.ndarray
     scales: np.ndarray
     allele_frequencies: np.ndarray
     support_counts: np.ndarray  # int32, non-zero dosage count per variant
+    marginal_scores: np.ndarray | None = None  # float64, |X_std^T @ residual| for screening
 
 
 @dataclass(slots=True)

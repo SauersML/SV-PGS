@@ -139,6 +139,13 @@ def load_dataset_from_files(
         available_sample_ids=source_sample_ids,
         context="genotype source",
     )
+    if resolved_format == "plink1":
+        sample_table, aligned_sample_indices, reordered = _reorder_sample_table_by_source_index(
+            sample_table=sample_table,
+            source_indices=aligned_sample_indices,
+        )
+        if reordered:
+            log("reordered matched phenotype rows into genotype order for contiguous PLINK access")
     log(f"aligned {len(aligned_sample_indices)} phenotype rows against {len(source_sample_ids)} genotype samples")
 
     if resolved_format == "vcf":
@@ -163,8 +170,16 @@ def load_dataset_from_files(
             total_sample_count=total_fam_samples,
         )
         from sv_pgs.preprocessing import compute_variant_statistics
-        log("computing variant statistics (2-pass, JAX) for allele freq + means + scales + support...")
-        variant_stats = compute_variant_statistics(raw_genotypes, config=ModelConfig())
+        # Add intercept column to covariates for residual computation (same as model.fit)
+        cov_with_intercept = np.concatenate([
+            np.ones((sample_table.covariates.shape[0], 1), dtype=np.float32),
+            sample_table.covariates,
+        ], axis=1)
+        log("computing variant statistics + screening scores (single pass, JAX)...")
+        variant_stats = compute_variant_statistics(
+            raw_genotypes, config=ModelConfig(),
+            covariates=cov_with_intercept, targets=sample_table.targets,
+        )
         log("building PLINK variant defaults from pre-computed allele frequencies...")
         default_variants = _build_plink_variant_defaults_from_stats(source_path, variant_stats)
         log(f"built {len(default_variants)} PLINK variant defaults  mem={mem()}")
@@ -674,6 +689,22 @@ def _align_sample_ids(
             + ", ".join(missing_sample_ids[:10])
         )
     return np.asarray([sample_index_by_id[sample_id] for sample_id in expected_sample_ids], dtype=np.int32)
+
+
+def _reorder_sample_table_by_source_index(
+    sample_table: _SampleTable,
+    source_indices: np.ndarray,
+) -> tuple[_SampleTable, np.ndarray, bool]:
+    sort_order = np.argsort(source_indices, kind="stable")
+    if np.array_equal(sort_order, np.arange(sort_order.shape[0], dtype=sort_order.dtype)):
+        return sample_table, np.asarray(source_indices, dtype=np.int32), False
+    reordered_sample_table = _SampleTable(
+        sample_ids=[sample_table.sample_ids[int(sample_position)] for sample_position in sort_order],
+        covariates=np.asarray(sample_table.covariates[sort_order], dtype=np.float32),
+        targets=np.asarray(sample_table.targets[sort_order], dtype=np.float32),
+    )
+    reordered_source_indices = np.asarray(source_indices[sort_order], dtype=np.int32)
+    return reordered_sample_table, reordered_source_indices, True
 
 
 def _vcf_record_dosage(record: Any) -> np.ndarray:

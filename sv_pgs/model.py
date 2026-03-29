@@ -33,6 +33,8 @@ class FittedState:
     tie_map: TieMap
     fit_result: VariationalFitResult
     full_coefficients: np.ndarray
+    nonzero_coefficient_indices: np.ndarray
+    nonzero_coefficients: np.ndarray
 
 
 class BayesianPGS:
@@ -80,20 +82,29 @@ class BayesianPGS:
             config=self.config,
         )
         if active_variant_indices.shape[0] > self.config.maximum_active_variants:
-            log(
-                f"screening active variants down to top {self.config.maximum_active_variants} "
-                f"from {active_variant_indices.shape[0]} using marginal scores..."
-            )
-            active_variant_indices = _screen_active_variant_indices(
-                raw_genotypes=raw_genotype_matrix,
-                active_variant_indices=active_variant_indices,
-                covariates=prepared_arrays.covariates,
-                targets=prepared_arrays.targets,
-                means=prepared_arrays.means,
-                scales=prepared_arrays.scales,
-                maximum_active_variants=self.config.maximum_active_variants,
-                batch_size=self.config.genotype_batch_size,
-            )
+            if variant_stats is not None and variant_stats.marginal_scores is not None:
+                log(
+                    f"screening to top {self.config.maximum_active_variants} "
+                    f"from {active_variant_indices.shape[0]} using pre-computed scores [NO DATA PASS]"
+                )
+                local_scores = variant_stats.marginal_scores[active_variant_indices]
+                top_local = np.argpartition(local_scores, -self.config.maximum_active_variants)[-self.config.maximum_active_variants:]
+                active_variant_indices = np.sort(active_variant_indices[top_local]).astype(np.int32)
+            else:
+                log(
+                    f"screening to top {self.config.maximum_active_variants} "
+                    f"from {active_variant_indices.shape[0]} (streaming)..."
+                )
+                active_variant_indices = _screen_active_variant_indices(
+                    raw_genotypes=raw_genotype_matrix,
+                    active_variant_indices=active_variant_indices,
+                    covariates=prepared_arrays.covariates,
+                    targets=prepared_arrays.targets,
+                    means=prepared_arrays.means,
+                    scales=prepared_arrays.scales,
+                    maximum_active_variants=self.config.maximum_active_variants,
+                    batch_size=self.config.genotype_batch_size,
+                )
         log(f"active variants: {len(active_variant_indices)} / {len(normalized_records)} ({100.0*len(active_variant_indices)/max(len(normalized_records),1):.1f}%)")
         active_records = [normalized_records[int(variant_index)] for variant_index in active_variant_indices]
         active_genotypes = standardized_genotypes.subset(active_variant_indices)
@@ -153,6 +164,7 @@ class BayesianPGS:
         )
         full_coefficients = np.zeros(len(normalized_records), dtype=np.float32)
         full_coefficients[active_variant_indices] = active_coefficients
+        nonzero_coefficient_indices, nonzero_coefficients = _nonzero_coefficient_cache(full_coefficients)
         nonzero_count = int(np.count_nonzero(full_coefficients))
         log(f"coefficients: {nonzero_count} non-zero out of {len(normalized_records)} total")
 
@@ -163,6 +175,8 @@ class BayesianPGS:
             tie_map=original_space_tie_map,
             fit_result=fit_result,
             full_coefficients=full_coefficients,
+            nonzero_coefficient_indices=nonzero_coefficient_indices,
+            nonzero_coefficients=nonzero_coefficients,
         )
         log(f"=== MODEL FIT DONE ===  mem={mem()}")
         return self
@@ -173,9 +187,8 @@ class BayesianPGS:
         covariate_matrix = self._with_intercept(np.asarray(covariates, dtype=np.float32))
 
         # Only read variants with non-zero coefficients (skip 99%+ of the file)
-        nonzero_mask = np.abs(fitted_state.full_coefficients) > 0.0
-        nonzero_indices = np.where(nonzero_mask)[0].astype(np.int32)
-        nonzero_coefficients = fitted_state.full_coefficients[nonzero_indices]
+        nonzero_indices = fitted_state.nonzero_coefficient_indices
+        nonzero_coefficients = fitted_state.nonzero_coefficients
         log(f"decision_function: {genotypes.shape[0]} samples, {len(nonzero_indices)} non-zero coefficients (of {len(fitted_state.full_coefficients)} total)  mem={mem()}")
 
         if len(nonzero_indices) == 0:
@@ -234,6 +247,7 @@ class BayesianPGS:
     def load(cls, path: str | Path) -> BayesianPGS:
         artifact = load_artifact(path)
         loaded_model = cls(config=artifact.config)
+        nonzero_coefficient_indices, nonzero_coefficients = _nonzero_coefficient_cache(artifact.beta_full)
         loaded_model.state = FittedState(
             variant_records=artifact.records,
             active_variant_indices=np.where(artifact.tie_map.original_to_reduced >= 0)[0].astype(np.int32),
@@ -255,6 +269,8 @@ class BayesianPGS:
                 member_prior_variances=artifact.prior_scales,
             ),
             full_coefficients=artifact.beta_full,
+            nonzero_coefficient_indices=nonzero_coefficient_indices,
+            nonzero_coefficients=nonzero_coefficients,
         )
         return loaded_model
 
@@ -283,8 +299,16 @@ class BayesianPGS:
         covariate_matrix = np.asarray(covariates, dtype=np.float32)
         if covariate_matrix.ndim != 2:
             raise ValueError("covariates must be 2D.")
-        intercept_column = np.ones((covariate_matrix.shape[0], 1), dtype=np.float32)
-        return np.concatenate([intercept_column, covariate_matrix], axis=1)
+        output = np.empty((covariate_matrix.shape[0], covariate_matrix.shape[1] + 1), dtype=np.float32)
+        output[:, 0] = 1.0
+        output[:, 1:] = covariate_matrix
+        return output
+
+
+def _nonzero_coefficient_cache(coefficients: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    coefficient_array = np.asarray(coefficients, dtype=np.float32)
+    nonzero_indices = np.flatnonzero(np.abs(coefficient_array) > 0.0).astype(np.int32)
+    return nonzero_indices, np.asarray(coefficient_array[nonzero_indices], dtype=np.float32)
 
 
 def _project_tie_map_to_original_space(

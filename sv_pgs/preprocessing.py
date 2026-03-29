@@ -45,38 +45,92 @@ def _batch_all_stats(batch_values: jnp.ndarray) -> tuple[jnp.ndarray, jnp.ndarra
     return sums, counts, support, css
 
 
+@jax.jit
+def _batch_all_stats_with_screening(
+    batch_values: jnp.ndarray,
+    residual: jnp.ndarray,
+) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray]:
+    """Single-pass JIT: stats + marginal screening scores in one kernel.
+
+    Computes everything _batch_all_stats does, PLUS marginal association
+    scores (|X_standardized^T @ residual|) to avoid a separate screening pass.
+    """
+    mask = ~jnp.isnan(batch_values)
+    observed = jnp.where(mask, batch_values, 0.0)
+
+    sums = jnp.sum(observed, axis=0, dtype=jnp.float64)
+    counts = jnp.sum(mask, axis=0, dtype=jnp.int32)
+    support = jnp.sum(mask & (jnp.abs(observed) > 0.5), axis=0, dtype=jnp.int32)
+
+    safe_counts = jnp.maximum(counts, 1).astype(jnp.float64)
+    means = sums / safe_counts
+    means_f32 = means.astype(jnp.float32)
+    imputed = jnp.where(mask, batch_values, means_f32[None, :])
+    centered = imputed - means_f32[None, :]
+    css = jnp.sum(centered * centered, axis=0, dtype=jnp.float64)
+
+    # Standardize and compute marginal score: |X_std^T @ residual|
+    n = batch_values.shape[0]
+    scales = jnp.sqrt(css / jnp.maximum(n, 1))
+    scales = jnp.where(scales < 1e-6, 1.0, scales)
+    standardized = centered / scales[None, :]
+    scores = jnp.abs(standardized.T @ residual.astype(jnp.float64))
+
+    return sums, counts, support, css, scores
+
+
 def compute_variant_statistics(
     raw_genotypes: RawGenotypeMatrix,
     config: ModelConfig,
+    covariates: np.ndarray | None = None,
+    targets: np.ndarray | None = None,
 ) -> VariantStatistics:
     """Compute all per-variant statistics in a SINGLE pass over the genotype data.
 
-    Each batch gives complete columns (all samples for a subset of variants),
-    so mean and variance are computed together from the same read.
-    Replaces what was previously 5+ separate passes.
+    If covariates and targets are provided, also computes marginal screening
+    scores in the same pass (avoiding a separate screening pass later).
     """
     from sv_pgs.progress import log, mem
     variant_count = raw_genotypes.shape[1]
     sample_count = raw_genotypes.shape[0]
     batch_size = config.genotype_batch_size
     n_batches = (variant_count + batch_size - 1) // batch_size
-    log(f"=== VARIANT STATISTICS (1-pass, JAX) ===  {sample_count} samples x {variant_count} variants  batch_size={batch_size}  n_batches={n_batches}  mem={mem()}")
+
+    # Compute residual for screening if covariates/targets provided
+    compute_scores = covariates is not None and targets is not None
+    residual_jax: jnp.ndarray | None = None
+    if compute_scores:
+        cov = np.asarray(covariates, dtype=np.float64)
+        tgt = np.asarray(targets, dtype=np.float64).reshape(-1)
+        coef, *_ = np.linalg.lstsq(cov, tgt, rcond=None)
+        residual = tgt - cov @ coef
+        residual_jax = jnp.asarray(residual)
+        log(f"=== VARIANT STATISTICS + SCREENING (1-pass, JAX) ===  {sample_count} samples x {variant_count} variants  batch_size={batch_size}  n_batches={n_batches}  mem={mem()}")
+    else:
+        log(f"=== VARIANT STATISTICS (1-pass, JAX) ===  {sample_count} samples x {variant_count} variants  batch_size={batch_size}  n_batches={n_batches}  mem={mem()}")
 
     sums = np.zeros(variant_count, dtype=np.float64)
     non_missing_counts = np.zeros(variant_count, dtype=np.int32)
     support_counts = np.zeros(variant_count, dtype=np.int32)
     centered_sum_squares = np.zeros(variant_count, dtype=np.float64)
+    marginal_scores: np.ndarray | None = None
+    if compute_scores:
+        marginal_scores = np.zeros(variant_count, dtype=np.float64)
 
     variants_done = 0
     for batch in raw_genotypes.iter_column_batches(batch_size=batch_size):
         batch_jax = jnp.asarray(batch.values)
-        batch_sums, batch_counts, batch_support, batch_css = _batch_all_stats(batch_jax)
         idx = batch.variant_indices
+        if compute_scores:
+            batch_sums, batch_counts, batch_support, batch_css, batch_scores = _batch_all_stats_with_screening(batch_jax, residual_jax)
+            marginal_scores[idx] = np.asarray(batch_scores, dtype=np.float64)
+        else:
+            batch_sums, batch_counts, batch_support, batch_css = _batch_all_stats(batch_jax)
         sums[idx] = np.asarray(batch_sums, dtype=np.float64)
         non_missing_counts[idx] = np.asarray(batch_counts, dtype=np.int32)
         support_counts[idx] = np.asarray(batch_support, dtype=np.int32)
         centered_sum_squares[idx] = np.asarray(batch_css, dtype=np.float64)
-        del batch_jax, batch_sums, batch_counts, batch_support, batch_css
+        del batch_jax
         variants_done += len(idx)
         if variants_done == len(idx) or variants_done % max(variant_count // 10, 1) < len(idx) or variants_done == variant_count:
             log(f"  {variants_done}/{variant_count} ({100*variants_done//variant_count}%)  mem={mem()}")
@@ -95,6 +149,7 @@ def compute_variant_statistics(
         scales=scales,
         allele_frequencies=allele_frequencies,
         support_counts=support_counts.astype(np.int32),
+        marginal_scores=marginal_scores,
     )
 
 
