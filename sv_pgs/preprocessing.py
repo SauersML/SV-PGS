@@ -46,10 +46,16 @@ def _batch_all_stats_with_screening_i8(
     batch_i8: jnp.ndarray,
     residual: jnp.ndarray,
 ) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray]:
-    """Single-pass JIT: stats + screening on int8 genotypes."""
+    """Single-pass JIT: stats (float64) + screening (float32) on int8 genotypes.
+
+    Uses float64 for precise sums/means/css over 447k samples,
+    but float32 for screening scores (precision not critical for ranking).
+    Halves memory bandwidth for the screening matmul.
+    """
     mask = batch_i8 != -127
     values = jnp.where(mask, batch_i8.astype(jnp.float64), 0.0)
 
+    # Stats in float64 for precision
     sums = jnp.sum(values, axis=0)
     counts = jnp.sum(mask, axis=0, dtype=jnp.int32)
     support = jnp.sum(mask & (batch_i8 > 0), axis=0, dtype=jnp.int32)
@@ -60,11 +66,13 @@ def _batch_all_stats_with_screening_i8(
     centered = imputed - means[None, :]
     css = jnp.sum(centered * centered, axis=0)
 
+    # Screening in float32 (just ranking, doesn't need float64 precision)
     n = batch_i8.shape[0]
-    scales = jnp.sqrt(css / jnp.maximum(n, 1))
-    scales = jnp.where(scales < 1e-6, 1.0, scales)
-    standardized = centered / scales[None, :]
-    scores = jnp.abs(standardized.T @ residual.astype(jnp.float64))
+    scales_f32 = jnp.sqrt(css / jnp.maximum(n, 1)).astype(jnp.float32)
+    scales_f32 = jnp.where(scales_f32 < 1e-6, 1.0, scales_f32)
+    centered_f32 = centered.astype(jnp.float32)
+    standardized_f32 = centered_f32 / scales_f32[None, :]
+    scores = jnp.abs(standardized_f32.T @ residual.astype(jnp.float32)).astype(jnp.float64)
 
     return sums, counts, support, css, scores
 
