@@ -11,7 +11,7 @@ from cyvcf2 import VCF
 from sklearn.metrics import log_loss, r2_score, roc_auc_score
 
 from sv_pgs.config import ModelConfig, TraitType, VariantClass
-from sv_pgs.data import VariantRecord
+from sv_pgs.data import VariantRecord, VariantStatistics
 from sv_pgs.genotype import DenseRawGenotypeMatrix, PlinkRawGenotypeMatrix, RawGenotypeMatrix
 from sv_pgs.model import BayesianPGS
 
@@ -26,6 +26,7 @@ class LoadedDataset:
     covariates: np.ndarray
     targets: np.ndarray
     variant_records: list[VariantRecord]
+    variant_stats: VariantStatistics | None = None
 
 
 @dataclass(slots=True)
@@ -88,6 +89,7 @@ def load_dataset_from_files(
     sample_table_spec = _inspect_delimited_table(sample_table_path)
     log(f"sample table columns={list(sample_table_spec.columns)}")
 
+    variant_stats: VariantStatistics | None = None
     if resolved_format == "vcf":
         log("loading VCF genotypes...")
         source_sample_ids, genotype_matrix, default_variants = _load_vcf(source_path)
@@ -160,8 +162,11 @@ def load_dataset_from_files(
             variant_count=plink_metadata.variant_count,
             total_sample_count=total_fam_samples,
         )
-        log("computing streaming allele frequencies and parsing .bim for PLINK variant defaults...")
-        default_variants = _build_plink_variant_defaults(source_path, raw_genotypes)
+        from sv_pgs.preprocessing import compute_variant_statistics
+        log("computing variant statistics (2-pass, JAX) for allele freq + means + scales + support...")
+        variant_stats = compute_variant_statistics(raw_genotypes, config=ModelConfig())
+        log("building PLINK variant defaults from pre-computed allele frequencies...")
+        default_variants = _build_plink_variant_defaults_from_stats(source_path, variant_stats)
         log(f"built {len(default_variants)} PLINK variant defaults  mem={mem()}")
 
     log("building variant records from defaults + optional metadata...")
@@ -180,6 +185,7 @@ def load_dataset_from_files(
         covariates=np.asarray(sample_table.covariates, dtype=np.float32),
         targets=np.asarray(sample_table.targets, dtype=np.float32),
         variant_records=variant_records,
+        variant_stats=variant_stats,
     )
 
 
@@ -199,6 +205,7 @@ def run_training_pipeline(
         dataset.covariates,
         dataset.targets,
         dataset.variant_records,
+        variant_stats=dataset.variant_stats,
     )
     log(f"model fitted  mem={mem()}")
 
@@ -431,6 +438,27 @@ def _build_plink_variant_defaults(
         raise ValueError(
             "PLINK .bim variant count does not match genotype matrix: "
             + f"{len(variant_defaults)} vs {genotype_matrix.shape[1]}"
+        )
+    return variant_defaults
+
+
+def _build_plink_variant_defaults_from_stats(
+    bed_path: Path,
+    variant_stats: VariantStatistics,
+) -> list[_VariantDefaults]:
+    """Build variant defaults using pre-computed allele frequencies (no data pass)."""
+    variant_defaults: list[_VariantDefaults] = []
+    for variant_index, bim_record in enumerate(_iter_plink_bim_records(bed_path.with_suffix(".bim"))):
+        variant_defaults.append(
+            _VariantDefaults(
+                variant_id=bim_record.variant_id,
+                variant_class=_infer_plink_variant_class(bim_record.allele_1, bim_record.allele_2),
+                chromosome=bim_record.chromosome,
+                position=bim_record.position,
+                length=1.0,
+                allele_frequency=float(variant_stats.allele_frequencies[variant_index]),
+                quality=1.0,
+            )
         )
     return variant_defaults
 

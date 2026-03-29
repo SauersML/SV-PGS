@@ -10,8 +10,11 @@ import jax.numpy as jnp
 import numpy as np
 from bed_reader import open_bed
 
-DEFAULT_GENOTYPE_BATCH_SIZE = 4096
-BED_READER_TARGET_BATCH_BYTES = 256 * 1024 * 1024
+DEFAULT_GENOTYPE_BATCH_SIZE = 1024
+
+# Memory safety: cap each bed_reader batch to ~1.5 GB to avoid OOM.
+# For 447k samples: 1.5 GB / (447278 * 4) = ~838 variants → capped to ~838.
+BED_READER_TARGET_BATCH_BYTES = 1_500_000_000  # 1.5 GB
 MIN_BED_READER_BATCH_SIZE = 32
 
 

@@ -8,7 +8,7 @@ import numpy as np
 
 from sv_pgs.artifact import ModelArtifact, load_artifact, save_artifact
 from sv_pgs.config import ModelConfig, TraitType
-from sv_pgs.data import TieGroup, TieMap, VariantRecord, normalize_variant_records
+from sv_pgs.data import TieGroup, TieMap, VariantRecord, VariantStatistics, normalize_variant_records
 from sv_pgs.genotype import RawGenotypeMatrix, StandardizedGenotypeMatrix, as_raw_genotype_matrix
 from sv_pgs.inference import VariationalFitResult, fit_variational_em
 from sv_pgs.numeric import stable_sigmoid
@@ -16,7 +16,9 @@ from sv_pgs.preprocessing import (
     Preprocessor,
     _infer_support_count_from_raw_genotypes,
     build_tie_map,
+    compute_variant_statistics,
     fit_preprocessor,
+    fit_preprocessor_from_stats,
     select_active_variant_indices,
 )
 
@@ -45,27 +47,36 @@ class BayesianPGS:
         targets: np.ndarray,
         variant_records: Sequence[VariantRecord | dict],
         validation_data: tuple[np.ndarray, np.ndarray, np.ndarray] | None = None,
+        variant_stats: VariantStatistics | None = None,
     ) -> BayesianPGS:
         from sv_pgs.progress import log, mem
-        log(f"=== MODEL FIT START ===  genotypes={genotypes.shape}  covariates={covariates.shape}  targets={targets.shape}")
+        log(f"=== MODEL FIT START ===  genotypes={genotypes.shape}  covariates={covariates.shape}  targets={targets.shape}  pre_computed_stats={'YES' if variant_stats else 'NO'}")
         raw_genotype_matrix = as_raw_genotype_matrix(genotypes)
-        log("normalizing variant records and computing training support...")
-        normalized_records = _training_records(raw_genotype_matrix, normalize_variant_records(variant_records), self.config)
-        log(f"normalized {len(normalized_records)} variant records  mem={mem()}")
 
-        covariate_matrix = self._with_intercept(covariates)
-        log(f"fitting preprocessor (streaming mean/scale over {raw_genotype_matrix.shape[1]} variants)...")
-        prepared_arrays = fit_preprocessor(raw_genotype_matrix, covariate_matrix, targets, self.config)
+        # Use pre-computed stats if available (saves 3 full data passes)
+        if variant_stats is not None:
+            log("using pre-computed variant statistics (means, scales, support) [NO DATA PASSES]")
+            normalized_records = _training_records_from_stats(
+                normalize_variant_records(variant_records), variant_stats,
+            )
+            covariate_matrix = self._with_intercept(covariates)
+            prepared_arrays = fit_preprocessor_from_stats(variant_stats, covariate_matrix, targets)
+        else:
+            log("normalizing variant records and computing training support...")
+            normalized_records = _training_records(raw_genotype_matrix, normalize_variant_records(variant_records), self.config)
+            covariate_matrix = self._with_intercept(covariates)
+            log(f"fitting preprocessor (streaming mean/scale over {raw_genotype_matrix.shape[1]} variants)...")
+            prepared_arrays = fit_preprocessor(raw_genotype_matrix, covariate_matrix, targets, self.config)
         preprocessor = Preprocessor(means=prepared_arrays.means, scales=prepared_arrays.scales)
-        log(f"preprocessor fitted  mem={mem()}")
+        log(f"preprocessor ready  {len(normalized_records)} variant records  mem={mem()}")
 
         log("creating standardized genotype view...")
         standardized_genotypes = raw_genotype_matrix.standardized(prepared_arrays.means, prepared_arrays.scales)
 
         log("selecting active variant indices (filtering low-carrier SVs)...")
         active_variant_indices = select_active_variant_indices(
-            genotype_matrix=raw_genotype_matrix,
             variant_records=normalized_records,
+            support_counts=variant_stats.support_counts if variant_stats is not None else _compute_support_counts(raw_genotype_matrix, normalized_records, self.config),
             config=self.config,
         )
         log(f"active variants: {len(active_variant_indices)} / {len(normalized_records)} ({100.0*len(active_variant_indices)/max(len(normalized_records),1):.1f}%)")
@@ -324,3 +335,49 @@ def _training_records(
             )
         )
     return training_records
+
+
+def _training_records_from_stats(
+    records: Sequence[VariantRecord],
+    variant_stats: VariantStatistics,
+) -> list[VariantRecord]:
+    """Build training records using pre-computed support counts (no data pass)."""
+    from sv_pgs.progress import log
+    training_records: list[VariantRecord] = []
+    for variant_index, record in enumerate(records):
+        support = record.training_support
+        if support is None and record.variant_class in STRUCTURAL_VARIANT_CLASSES:
+            support = int(variant_stats.support_counts[variant_index])
+        training_records.append(
+            VariantRecord(
+                variant_id=record.variant_id,
+                variant_class=record.variant_class,
+                chromosome=record.chromosome,
+                position=record.position,
+                length=record.length,
+                allele_frequency=record.allele_frequency,
+                quality=record.quality,
+                training_support=support,
+                is_repeat=record.is_repeat,
+                is_copy_number=record.is_copy_number,
+                prior_class_members=record.prior_class_members,
+                prior_class_membership=record.prior_class_membership,
+            )
+        )
+    log(f"  training records from stats: {len(training_records)} records [NO DATA PASS]")
+    return training_records
+
+
+def _compute_support_counts(
+    raw_genotypes: RawGenotypeMatrix,
+    records: Sequence[VariantRecord],
+    config: ModelConfig,
+) -> np.ndarray:
+    """Compute support counts by streaming (fallback when no pre-computed stats)."""
+    support_counts = np.zeros(len(records), dtype=np.int32)
+    for batch in raw_genotypes.iter_column_batches(batch_size=config.genotype_batch_size):
+        for local_index, variant_index in enumerate(batch.variant_indices):
+            col = batch.values[:, local_index]
+            non_missing = col[~np.isnan(col)]
+            support_counts[int(variant_index)] = int(np.count_nonzero(np.abs(non_missing) > 0.5))
+    return support_counts
