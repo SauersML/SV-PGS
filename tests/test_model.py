@@ -5,8 +5,9 @@ from sklearn.metrics import roc_auc_score
 
 from sv_pgs import BayesianPGS, BenchmarkConfig, ModelConfig, TraitType, VariantClass, VariantRecord, run_benchmark_suite
 from sv_pgs.data import TieGroup, TieMap
+from sv_pgs.genotype import RawGenotypeBatch, RawGenotypeMatrix
 from sv_pgs.inference import VariationalFitResult
-from sv_pgs.model import _tie_group_export_weights
+from sv_pgs.model import _compute_support_counts, _raw_standardized_subset_matvec, _tie_group_export_weights
 
 
 def _synthetic_binary_dataset() -> tuple[np.ndarray, np.ndarray, np.ndarray, list[VariantRecord]]:
@@ -208,3 +209,112 @@ def test_model_skips_tie_map_when_active_variant_count_exceeds_limit():
         model.state.tie_map.original_to_reduced[model.state.active_variant_indices],
         np.arange(active_count, dtype=np.int32),
     )
+
+
+def test_compute_support_counts_only_reads_unresolved_structural_variants():
+    class SpyRawGenotypeMatrix(RawGenotypeMatrix):
+        def __init__(self, matrix: np.ndarray) -> None:
+            self.matrix = np.asarray(matrix, dtype=np.float32)
+            self.requested_variant_indices: list[list[int]] = []
+
+        @property
+        def shape(self) -> tuple[int, int]:
+            return self.matrix.shape
+
+        def iter_column_batches(
+            self,
+            variant_indices=None,
+            batch_size: int = 1024,
+        ):
+            resolved_indices = np.arange(self.matrix.shape[1], dtype=np.int32) if variant_indices is None else np.asarray(variant_indices, dtype=np.int32)
+            self.requested_variant_indices.append(resolved_indices.tolist())
+            yield RawGenotypeBatch(
+                variant_indices=resolved_indices,
+                values=np.asarray(self.matrix[:, resolved_indices], dtype=np.float32),
+            )
+
+        def materialize(self, variant_indices=None) -> np.ndarray:
+            resolved_indices = np.arange(self.matrix.shape[1], dtype=np.int32) if variant_indices is None else np.asarray(variant_indices, dtype=np.int32)
+            return np.asarray(self.matrix[:, resolved_indices], dtype=np.float32)
+
+    raw_genotypes = SpyRawGenotypeMatrix(
+        np.array(
+            [
+                [0.0, 0.0, 1.0, 0.0],
+                [1.0, 0.0, 0.0, 1.0],
+                [2.0, 1.0, 1.0, 0.0],
+            ],
+            dtype=np.float32,
+        )
+    )
+    records = [
+        VariantRecord("snv_0", VariantClass.SNV, "1", 100),
+        VariantRecord("sv_from_metadata", VariantClass.DELETION_SHORT, "1", 101, training_support=7),
+        VariantRecord("sv_needs_count", VariantClass.DUPLICATION_SHORT, "1", 102),
+        VariantRecord("snv_1", VariantClass.SNV, "1", 103),
+    ]
+
+    support_counts = _compute_support_counts(raw_genotypes, records, ModelConfig())
+
+    assert raw_genotypes.requested_variant_indices == [[2]]
+    np.testing.assert_array_equal(support_counts, np.array([0, 7, 2, 0], dtype=np.int32))
+
+
+def test_raw_standardized_subset_matvec_reads_only_requested_columns():
+    class SpyRawGenotypeMatrix(RawGenotypeMatrix):
+        def __init__(self, matrix: np.ndarray) -> None:
+            self.matrix = np.asarray(matrix, dtype=np.float32)
+            self.requested_variant_indices: list[list[int]] = []
+
+        @property
+        def shape(self) -> tuple[int, int]:
+            return self.matrix.shape
+
+        def iter_column_batches(
+            self,
+            variant_indices=None,
+            batch_size: int = 1024,
+        ):
+            resolved_indices = np.arange(self.matrix.shape[1], dtype=np.int32) if variant_indices is None else np.asarray(variant_indices, dtype=np.int32)
+            self.requested_variant_indices.append(resolved_indices.tolist())
+            safe_batch_size = max(int(batch_size), 1)
+            for start_index in range(0, resolved_indices.shape[0], safe_batch_size):
+                batch_indices = resolved_indices[start_index : start_index + safe_batch_size]
+                yield RawGenotypeBatch(
+                    variant_indices=batch_indices,
+                    values=np.asarray(self.matrix[:, batch_indices], dtype=np.float32),
+                )
+
+        def materialize(self, variant_indices=None) -> np.ndarray:
+            resolved_indices = np.arange(self.matrix.shape[1], dtype=np.int32) if variant_indices is None else np.asarray(variant_indices, dtype=np.int32)
+            return np.asarray(self.matrix[:, resolved_indices], dtype=np.float32)
+
+    raw_matrix = np.array(
+        [
+            [0.0, 1.0, 0.0, np.nan],
+            [1.0, 0.0, 2.0, 1.0],
+            [2.0, 1.0, 1.0, 0.0],
+        ],
+        dtype=np.float32,
+    )
+    raw_genotypes = SpyRawGenotypeMatrix(raw_matrix)
+    variant_indices = np.array([1, 3], dtype=np.int32)
+    means = np.array([2.0 / 3.0, 0.5], dtype=np.float32)
+    scales = np.array([0.47140452, 0.5], dtype=np.float32)
+    coefficients = np.array([0.25, -0.75], dtype=np.float32)
+
+    scores = _raw_standardized_subset_matvec(
+        raw_genotypes=raw_genotypes,
+        variant_indices=variant_indices,
+        means=means,
+        scales=scales,
+        coefficients=coefficients,
+        batch_size=1,
+    )
+
+    dense_subset = np.asarray(raw_matrix[:, variant_indices], dtype=np.float32)
+    imputed = np.where(np.isnan(dense_subset), means[None, :], dense_subset)
+    expected_scores = ((imputed - means[None, :]) / scales[None, :]) @ coefficients
+
+    assert raw_genotypes.requested_variant_indices == [[1, 3]]
+    np.testing.assert_allclose(scores, expected_scores.astype(np.float32))

@@ -141,7 +141,7 @@ def _top_tail_enrichment(
     trait_type: TraitType,
 ) -> float:
     cutoff = max(1, int(np.ceil(scores.shape[0] * fraction)))
-    top_indices = np.argsort(scores)[-cutoff:]
+    top_indices = np.argpartition(scores, -cutoff)[-cutoff:]
     if trait_type == TraitType.BINARY:
         baseline = float(np.mean(targets))
         if abs(baseline) < 1e-8:
