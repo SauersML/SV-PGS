@@ -110,7 +110,7 @@ class ModelConfig:
     maximum_linear_solver_iterations: int = 256
     logdet_probe_count: int = 6
     logdet_lanczos_steps: int = 12
-    exact_solver_matrix_limit: int = 2048
+    exact_solver_matrix_limit: int = 2048  # Woodbury used when variants ≤ this AND samples > this
     posterior_variance_batch_size: int = 1024
     genotype_batch_size: int = 1024
     maximum_active_variants: int = 2000

@@ -128,17 +128,56 @@ class PlinkRawGenotypeMatrix(RawGenotypeMatrix):
         return int(self.sample_indices.shape[0]), int(self.variant_count)
 
     def _read_batch(self, reader: open_bed, batch_indices: np.ndarray) -> np.ndarray:
-        """Read one batch from disk as int8, convert to float32 with NaN for missing.
-
-        int8 encoding: 0=hom_ref, 1=het, 2=hom_alt, -127=missing.
-        Reading as int8 is 4x less disk I/O and memory than float32.
-        """
-        sample_index = _contiguous_index_or_slice(self.sample_indices)
-        col_index = _contiguous_index_or_slice(batch_indices)
-        raw_i8 = reader.read(index=(sample_index, col_index), dtype="int8", order="F", num_threads=None)
+        """Read one batch as int8, convert to float32 with NaN for missing."""
+        raw_i8 = self._read_batch_i8(reader, batch_indices)
         result = np.asarray(raw_i8, dtype=np.float32)
         result[raw_i8 == -127] = np.nan
         return result
+
+    def _read_batch_i8(self, reader: open_bed, batch_indices: np.ndarray) -> np.ndarray:
+        """Read one batch as raw int8 (0/1/2/-127). No float conversion."""
+        sample_index = _contiguous_index_or_slice(self.sample_indices)
+        col_index = _contiguous_index_or_slice(batch_indices)
+        return np.asarray(
+            reader.read(index=(sample_index, col_index), dtype="int8", order="F", num_threads=None),
+            dtype=np.int8,
+        )
+
+    def iter_column_batches_i8(
+        self,
+        batch_size: int | None = None,
+    ) -> Iterator[RawGenotypeBatch]:
+        """Iterate as int8 batches (4x less memory, no float conversion).
+
+        Values are 0/1/2/-127(missing). Callers must handle -127 sentinel.
+        """
+        resolved_indices = _resolve_variant_indices(self.variant_count, None)
+        # int8 batches are 4x smaller, so allow 4x more variants per batch
+        requested = max(int(self.batch_size if batch_size is None else batch_size), 1)
+        bytes_per_variant = self.shape[0]  # 1 byte per sample for int8
+        max_variants = max(BED_READER_TARGET_BATCH_BYTES // max(bytes_per_variant, 1), MIN_BED_READER_BATCH_SIZE)
+        safe_batch_size = min(requested * 4, max_variants)  # 4x headroom vs float32
+        reader = self._bed_reader()
+        total = resolved_indices.shape[0]
+
+        if total <= safe_batch_size:
+            values = self._read_batch_i8(reader, resolved_indices)
+            yield RawGenotypeBatch(variant_indices=resolved_indices, values=values)
+            return
+
+        # Prefetch with background thread
+        from concurrent.futures import ThreadPoolExecutor
+        batch_index_list = [
+            resolved_indices[s : s + safe_batch_size]
+            for s in range(0, total, safe_batch_size)
+        ]
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            future = executor.submit(self._read_batch_i8, reader, batch_index_list[0])
+            for i in range(len(batch_index_list)):
+                values = future.result()
+                if i + 1 < len(batch_index_list):
+                    future = executor.submit(self._read_batch_i8, reader, batch_index_list[i + 1])
+                yield RawGenotypeBatch(variant_indices=batch_index_list[i], values=values)
 
     def iter_column_batches(
         self,
@@ -272,18 +311,19 @@ class StandardizedGenotypeMatrix:
                 )
             return
         safe_batch_size = max(int(batch_size), 1)
-        for start_index in range(0, self.variant_indices.shape[0], safe_batch_size):
-            local_indices = np.arange(
-                start_index,
-                min(start_index + safe_batch_size, self.variant_indices.shape[0]),
-                dtype=np.int32,
-            )
-            raw_indices = self.variant_indices[local_indices]
-            raw_batch = self.raw.materialize(raw_indices)
+        local_start = 0
+        for raw_batch in self.raw.iter_column_batches(self.variant_indices, batch_size=safe_batch_size):
+            local_stop = local_start + raw_batch.variant_indices.shape[0]
+            local_indices = np.arange(local_start, local_stop, dtype=np.int32)
             yield RawGenotypeBatch(
                 variant_indices=local_indices,
-                values=_standardize_batch(raw_batch, self.means[raw_indices], self.scales[raw_indices]),
+                values=_standardize_batch(
+                    raw_batch.values,
+                    self.means[raw_batch.variant_indices],
+                    self.scales[raw_batch.variant_indices],
+                ),
             )
+            local_start = local_stop
 
     def materialize(self, batch_size: int = DEFAULT_GENOTYPE_BATCH_SIZE) -> np.ndarray:
         if self._dense_cache is not None:

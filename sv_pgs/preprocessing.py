@@ -20,63 +20,71 @@ from sv_pgs.genotype import (
 
 
 @jax.jit
-def _batch_all_stats(batch_values: jnp.ndarray) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray]:
-    """Single-pass JIT: means, counts, support, and centered sum-of-squares per column.
+def _batch_all_stats_i8(batch_i8: jnp.ndarray) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray]:
+    """Single-pass JIT operating on int8 genotypes (sentinel -127 = missing).
 
-    Each batch contains ALL samples for a subset of variants (complete columns),
-    so mean and variance can both be computed from one read — no second pass needed.
+    Avoids float32 intermediate entirely. 4x less memory per batch.
     """
-    mask = ~jnp.isnan(batch_values)
-    observed = jnp.where(mask, batch_values, 0.0)
+    mask = batch_i8 != -127
+    values = jnp.where(mask, batch_i8.astype(jnp.float64), 0.0)
 
-    # Sums, counts, support
-    sums = jnp.sum(observed, axis=0, dtype=jnp.float64)
+    sums = jnp.sum(values, axis=0)
     counts = jnp.sum(mask, axis=0, dtype=jnp.int32)
-    support = jnp.sum(mask & (jnp.abs(observed) > 0.5), axis=0, dtype=jnp.int32)
+    support = jnp.sum(mask & (batch_i8 > 0), axis=0, dtype=jnp.int32)
 
-    # Means → impute → centered sum of squares (all in one shot)
     safe_counts = jnp.maximum(counts, 1).astype(jnp.float64)
     means = sums / safe_counts
-    means_f32 = means.astype(jnp.float32)
-    imputed = jnp.where(mask, batch_values, means_f32[None, :])
-    centered = imputed - means_f32[None, :]
-    css = jnp.sum(centered * centered, axis=0, dtype=jnp.float64)
+    imputed = jnp.where(mask, values, means[None, :])
+    centered = imputed - means[None, :]
+    css = jnp.sum(centered * centered, axis=0)
 
     return sums, counts, support, css
 
 
 @jax.jit
-def _batch_all_stats_with_screening(
-    batch_values: jnp.ndarray,
+def _batch_all_stats_with_screening_i8(
+    batch_i8: jnp.ndarray,
     residual: jnp.ndarray,
 ) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray]:
-    """Single-pass JIT: stats + marginal screening scores in one kernel.
+    """Single-pass JIT: stats + screening on int8 genotypes."""
+    mask = batch_i8 != -127
+    values = jnp.where(mask, batch_i8.astype(jnp.float64), 0.0)
 
-    Computes everything _batch_all_stats does, PLUS marginal association
-    scores (|X_standardized^T @ residual|) to avoid a separate screening pass.
-    """
-    mask = ~jnp.isnan(batch_values)
-    observed = jnp.where(mask, batch_values, 0.0)
-
-    sums = jnp.sum(observed, axis=0, dtype=jnp.float64)
+    sums = jnp.sum(values, axis=0)
     counts = jnp.sum(mask, axis=0, dtype=jnp.int32)
-    support = jnp.sum(mask & (jnp.abs(observed) > 0.5), axis=0, dtype=jnp.int32)
+    support = jnp.sum(mask & (batch_i8 > 0), axis=0, dtype=jnp.int32)
 
     safe_counts = jnp.maximum(counts, 1).astype(jnp.float64)
     means = sums / safe_counts
-    means_f32 = means.astype(jnp.float32)
-    imputed = jnp.where(mask, batch_values, means_f32[None, :])
-    centered = imputed - means_f32[None, :]
-    css = jnp.sum(centered * centered, axis=0, dtype=jnp.float64)
+    imputed = jnp.where(mask, values, means[None, :])
+    centered = imputed - means[None, :]
+    css = jnp.sum(centered * centered, axis=0)
 
-    # Standardize and compute marginal score: |X_std^T @ residual|
-    n = batch_values.shape[0]
+    n = batch_i8.shape[0]
     scales = jnp.sqrt(css / jnp.maximum(n, 1))
     scales = jnp.where(scales < 1e-6, 1.0, scales)
     standardized = centered / scales[None, :]
     scores = jnp.abs(standardized.T @ residual.astype(jnp.float64))
 
     return sums, counts, support, css, scores
+
+
+# Keep float32 versions for VCF path
+@jax.jit
+def _batch_all_stats(batch_values: jnp.ndarray) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray]:
+    """Float32 path for VCF/dense genotypes."""
+    mask = ~jnp.isnan(batch_values)
+    observed = jnp.where(mask, batch_values, 0.0)
+    sums = jnp.sum(observed, axis=0, dtype=jnp.float64)
+    counts = jnp.sum(mask, axis=0, dtype=jnp.int32)
+    support = jnp.sum(mask & (jnp.abs(observed) > 0.5), axis=0, dtype=jnp.int32)
+    safe_counts = jnp.maximum(counts, 1).astype(jnp.float64)
+    means = sums / safe_counts
+    means_f32 = means.astype(jnp.float32)
+    imputed = jnp.where(mask, batch_values, means_f32[None, :])
+    centered = imputed - means_f32[None, :]
+    css = jnp.sum(centered * centered, axis=0, dtype=jnp.float64)
+    return sums, counts, support, css
 
 
 def compute_variant_statistics(
@@ -117,15 +125,30 @@ def compute_variant_statistics(
     if compute_scores:
         marginal_scores = np.zeros(variant_count, dtype=np.float64)
 
+    # Use int8 path for PLINK data (4x less memory, avoids float32 intermediate)
+    from sv_pgs.genotype import PlinkRawGenotypeMatrix
+    use_i8 = isinstance(raw_genotypes, PlinkRawGenotypeMatrix)
+    if use_i8:
+        log(f"  using int8 native path (4x less memory per batch)")
+
     variants_done = 0
-    for batch in raw_genotypes.iter_column_batches(batch_size=batch_size):
-        batch_jax = jnp.asarray(batch.values)
+    batch_iter = raw_genotypes.iter_column_batches_i8(batch_size=batch_size) if use_i8 else raw_genotypes.iter_column_batches(batch_size=batch_size)
+    for batch in batch_iter:
         idx = batch.variant_indices
-        if compute_scores:
-            batch_sums, batch_counts, batch_support, batch_css, batch_scores = _batch_all_stats_with_screening(batch_jax, residual_jax)
-            marginal_scores[idx] = np.asarray(batch_scores, dtype=np.float64)
+        if use_i8:
+            batch_jax = jnp.asarray(batch.values)  # int8 on JAX
+            if compute_scores:
+                batch_sums, batch_counts, batch_support, batch_css, batch_scores = _batch_all_stats_with_screening_i8(batch_jax, residual_jax)
+                marginal_scores[idx] = np.asarray(batch_scores, dtype=np.float64)
+            else:
+                batch_sums, batch_counts, batch_support, batch_css = _batch_all_stats_i8(batch_jax)
         else:
-            batch_sums, batch_counts, batch_support, batch_css = _batch_all_stats(batch_jax)
+            batch_jax = jnp.asarray(batch.values)  # float32 on JAX
+            if compute_scores:
+                batch_sums, batch_counts, batch_support, batch_css, batch_scores = _batch_all_stats_with_screening(batch_jax, residual_jax)
+                marginal_scores[idx] = np.asarray(batch_scores, dtype=np.float64)
+            else:
+                batch_sums, batch_counts, batch_support, batch_css = _batch_all_stats(batch_jax)
         sums[idx] = np.asarray(batch_sums, dtype=np.float64)
         non_missing_counts[idx] = np.asarray(batch_counts, dtype=np.int32)
         support_counts[idx] = np.asarray(batch_support, dtype=np.int32)

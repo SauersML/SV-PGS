@@ -419,9 +419,12 @@ def _load_plink1_metadata(bed_path: Path) -> _PlinkMetadata:
     sample_ids = _read_plink_sample_ids(fam_path)
     log(f"  .fam: {len(sample_ids)} samples  mem={mem()}")
 
-    log(f"parsing .bim file: {bim_path}")
-    variant_count = _count_plink_variants(bim_path)
-    log(f"  .bim: {variant_count} variants  mem={mem()}")
+    # Count .bim lines without full parsing (fast: just count newlines)
+    log(f"counting .bim variants: {bim_path}")
+    bim_size = bim_path.stat().st_size
+    with bim_path.open("rb") as handle:
+        variant_count = sum(1 for _ in handle)
+    log(f"  .bim: {variant_count} variants ({bim_size / 1e6:.1f} MB)  mem={mem()}")
 
     if variant_count == 0:
         raise ValueError("PLINK bed contains no variants: " + str(bed_path))
