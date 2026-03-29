@@ -255,7 +255,9 @@ def build_tie_map(
 
     exact_signature_to_group: dict[bytes, int] = {}
     sign_flipped_signature_to_group: dict[bytes, int] = {}
-    tie_groups: list[TieGroup] = []
+    tie_group_member_indices: list[list[int]] = []
+    tie_group_signs: list[list[float]] = []
+    representative_indices: list[int] = []
     kept_variant_indices: list[int] = []
     original_to_reduced = np.full(n_total, -1, dtype=np.int32)
 
@@ -277,41 +279,47 @@ def build_tie_map(
 
             if genotype_signature in exact_signature_to_group:
                 reduced_index = exact_signature_to_group[genotype_signature]
-                tie_group = tie_groups[reduced_index]
-                tie_group.member_indices = np.append(tie_group.member_indices, variant_index)
-                tie_group.signs = np.append(tie_group.signs, 1.0)
+                tie_group_member_indices[reduced_index].append(int(variant_index))
+                tie_group_signs[reduced_index].append(1.0)
                 original_to_reduced[int(variant_index)] = reduced_index
                 continue
 
             if genotype_signature in sign_flipped_signature_to_group:
                 reduced_index = sign_flipped_signature_to_group[genotype_signature]
-                tie_group = tie_groups[reduced_index]
-                tie_group.member_indices = np.append(tie_group.member_indices, variant_index)
-                tie_group.signs = np.append(tie_group.signs, -1.0)
+                tie_group_member_indices[reduced_index].append(int(variant_index))
+                tie_group_signs[reduced_index].append(-1.0)
                 original_to_reduced[int(variant_index)] = reduced_index
                 continue
 
-            reduced_index = len(tie_groups)
-            tie_groups.append(
-                TieGroup(
-                    representative_index=int(variant_index),
-                    member_indices=np.asarray([variant_index], dtype=np.int32),
-                    signs=np.asarray([1.0], dtype=np.float32),
-                )
-            )
+            reduced_index = len(representative_indices)
+            representative_indices.append(int(variant_index))
+            tie_group_member_indices.append([int(variant_index)])
+            tie_group_signs.append([1.0])
             kept_variant_indices.append(int(variant_index))
             exact_signature_to_group[genotype_signature] = reduced_index
             sign_flipped_signature_to_group[sign_flipped_signature] = reduced_index
             original_to_reduced[int(variant_index)] = reduced_index
         variants_done += len(batch.variant_indices)
         if variants_done == len(batch.variant_indices) or variants_done % max(n_total // 10, 1) < len(batch.variant_indices) or variants_done == n_total:
-            log(f"  tie map: {variants_done}/{n_total} ({100*variants_done//n_total}%)  unique={len(kept_variant_indices)}  groups={len(tie_groups)}  mem={mem()}")
+            log(f"  tie map: {variants_done}/{n_total} ({100*variants_done//n_total}%)  unique={len(kept_variant_indices)}  groups={len(representative_indices)}  mem={mem()}")
 
     log(f"  tie map done: {n_total} -> {len(kept_variant_indices)} unique representatives  mem={mem()}")
     return TieMap(
         kept_indices=np.asarray(kept_variant_indices, dtype=np.int32),
         original_to_reduced=original_to_reduced,
-        reduced_to_group=tie_groups,
+        reduced_to_group=[
+            TieGroup(
+                representative_index=representative_index,
+                member_indices=np.asarray(member_indices, dtype=np.int32),
+                signs=np.asarray(signs, dtype=np.float32),
+            )
+            for representative_index, member_indices, signs in zip(
+                representative_indices,
+                tie_group_member_indices,
+                tie_group_signs,
+                strict=True,
+            )
+        ],
     )
 
 

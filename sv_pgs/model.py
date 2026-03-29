@@ -127,7 +127,10 @@ class BayesianPGS:
                 np.asarray(validation_targets, dtype=np.float32),
             )
 
-        log(f"starting variational EM  max_iterations={self.config.max_outer_iterations}  reduced_matrix={reduced_genotypes.shape}  mem={mem()}")
+        # Try to cache the reduced genotype matrix in RAM to avoid re-reading
+        # from disk on every EM iteration (huge speedup when it fits).
+        cached = reduced_genotypes.try_materialize()
+        log(f"starting variational EM  max_iterations={self.config.max_outer_iterations}  reduced_matrix={reduced_genotypes.shape}  in_memory={cached}  mem={mem()}")
         fit_result = fit_variational_em(
             genotypes=reduced_genotypes,
             covariates=prepared_arrays.covariates,
@@ -395,13 +398,28 @@ def _compute_support_counts(
     records: Sequence[VariantRecord],
     config: ModelConfig,
 ) -> np.ndarray:
-    """Compute support counts by streaming (fallback when no pre-computed stats)."""
+    """Compute support counts only for structural variants that still need them."""
     support_counts = np.zeros(len(records), dtype=np.int32)
-    for batch in raw_genotypes.iter_column_batches(batch_size=config.genotype_batch_size):
-        for local_index, variant_index in enumerate(batch.variant_indices):
-            col = batch.values[:, local_index]
-            non_missing = col[~np.isnan(col)]
-            support_counts[int(variant_index)] = int(np.count_nonzero(np.abs(non_missing) > 0.5))
+    unresolved_structural_variant_indices: list[int] = []
+    for variant_index, record in enumerate(records):
+        if record.variant_class not in STRUCTURAL_VARIANT_CLASSES:
+            continue
+        if record.training_support is not None:
+            support_counts[variant_index] = int(record.training_support)
+            continue
+        unresolved_structural_variant_indices.append(variant_index)
+
+    if not unresolved_structural_variant_indices:
+        return support_counts
+
+    for batch in raw_genotypes.iter_column_batches(
+        unresolved_structural_variant_indices,
+        batch_size=config.genotype_batch_size,
+    ):
+        support_counts[batch.variant_indices] = np.count_nonzero(
+            np.abs(np.where(np.isnan(batch.values), 0.0, batch.values)) > 0.5,
+            axis=0,
+        ).astype(np.int32, copy=False)
     return support_counts
 
 
