@@ -155,8 +155,8 @@ def test_load_dataset_from_plink_auto_detects_person_id_column(tmp_path: Path):
         covariate_columns=("age",),
     )
 
-    assert dataset.sample_ids == ["102", "101"]
-    np.testing.assert_allclose(dataset.genotypes, np.array([[2.0, 0.0], [0.0, 1.0]], dtype=np.float32))
+    assert dataset.sample_ids == ["101", "102"]
+    np.testing.assert_allclose(dataset.genotypes, np.array([[0.0, 1.0], [2.0, 0.0]], dtype=np.float32))
 
 
 def test_plink_loader_uses_indexed_bed_reads(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
@@ -227,10 +227,8 @@ def test_plink_loader_uses_indexed_bed_reads(tmp_path: Path, monkeypatch: pytest
     )
 
     assert indexed_read_calls
-    assert all(
-        isinstance(call_sample_indices, slice) or np.asarray(call_sample_indices, dtype=np.int32).shape == (3,)
-        for _, call_sample_indices in indexed_read_calls
-    )
+    assert all(isinstance(call_sample_indices, slice) for _, call_sample_indices in indexed_read_calls)
+    assert indexed_read_calls[0][1] == slice(0, 3, 1)
     assert sum(
         (
             call_variant_indices.stop - call_variant_indices.start
@@ -239,7 +237,7 @@ def test_plink_loader_uses_indexed_bed_reads(tmp_path: Path, monkeypatch: pytest
         )
         for call_variant_indices, _ in indexed_read_calls
     ) >= 3
-    np.testing.assert_allclose(dataset.genotypes, np.array([[2.0, 0.0, 1.0], [0.0, 1.0, 0.0], [1.0, 2.0, 0.0]], dtype=np.float32))
+    np.testing.assert_allclose(dataset.genotypes, np.array([[0.0, 1.0, 0.0], [2.0, 0.0, 1.0], [1.0, 2.0, 0.0]], dtype=np.float32))
 
 
 def test_load_dataset_from_plink_filters_non_genotyped_sample_rows(tmp_path: Path):
@@ -285,10 +283,10 @@ def test_load_dataset_from_plink_filters_non_genotyped_sample_rows(tmp_path: Pat
         covariate_columns=("age",),
     )
 
-    assert dataset.sample_ids == ["102", "101"]
-    np.testing.assert_allclose(dataset.targets, np.array([1.0, 0.0], dtype=np.float32))
-    np.testing.assert_allclose(dataset.covariates, np.array([[55.0], [44.0]], dtype=np.float32))
-    np.testing.assert_allclose(dataset.genotypes, np.array([[2.0, 0.0], [0.0, 1.0]], dtype=np.float32))
+    assert dataset.sample_ids == ["101", "102"]
+    np.testing.assert_allclose(dataset.targets, np.array([0.0, 1.0], dtype=np.float32))
+    np.testing.assert_allclose(dataset.covariates, np.array([[44.0], [55.0]], dtype=np.float32))
+    np.testing.assert_allclose(dataset.genotypes, np.array([[0.0, 1.0], [2.0, 0.0]], dtype=np.float32))
 
 
 def test_effective_bed_reader_batch_size_caps_large_sample_matrices():
