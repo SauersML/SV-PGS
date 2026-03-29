@@ -64,6 +64,10 @@ def build_parser() -> argparse.ArgumentParser:
     run_parser.add_argument("--output-dir", required=True, help="Directory for artifact and result tables.")
     run_parser.add_argument("--max-outer-iterations", type=int, default=30)
     run_parser.add_argument("--minimum-structural-variant-carriers", type=int, default=5)
+    run_parser.add_argument("--maximum-active-variants", type=int, default=2000,
+                            help="Max variants after screening (lower = faster, fits in RAM for in-memory EM).")
+    run_parser.add_argument("--genotype-batch-size", type=int, default=1024,
+                            help="Variants per batch for streaming passes. Auto-capped by memory limit.")
     run_parser.add_argument("--random-seed", type=int, default=0)
     return parser
 
@@ -131,6 +135,8 @@ def main(argv: list[str] | None = None) -> int:
             trait_type=inferred_trait_type,
             max_outer_iterations=args.max_outer_iterations,
             minimum_structural_variant_carriers=args.minimum_structural_variant_carriers,
+            maximum_active_variants=args.maximum_active_variants,
+            genotype_batch_size=args.genotype_batch_size,
             random_seed=args.random_seed,
         ),
         output_dir=Path(args.output_dir),
