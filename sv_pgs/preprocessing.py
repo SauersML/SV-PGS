@@ -158,9 +158,13 @@ def compute_variant_statistics(
     else:
         log(f"  using float32 path (type={type(raw_genotypes).__name__})")
 
+    import time as _time
     variants_done = 0
+    batch_number = 0
     batch_iter = raw_genotypes.iter_column_batches_i8(batch_size=batch_size) if use_i8 else raw_genotypes.iter_column_batches(batch_size=batch_size)
     for batch in batch_iter:
+        batch_number += 1
+        _t0 = _time.monotonic()
         idx = batch.variant_indices
         if use_i8:
             batch_jax = jnp.asarray(batch.values)  # int8 on JAX
@@ -181,9 +185,11 @@ def compute_variant_statistics(
         support_counts[idx] = np.asarray(batch_support, dtype=np.int32)
         centered_sum_squares[idx] = np.asarray(batch_css, dtype=np.float64)
         del batch_jax
+        _dt = _time.monotonic() - _t0
         variants_done += len(idx)
-        if variants_done == len(idx) or variants_done % max(variant_count // 10, 1) < len(idx) or variants_done == variant_count:
-            log(f"  {variants_done}/{variant_count} ({100*variants_done//variant_count}%)  mem={mem()}")
+        if batch_number <= 3 or variants_done % max(variant_count // 10, 1) < len(idx) or variants_done == variant_count:
+            est_total = _dt * ((variant_count - variants_done) / max(len(idx), 1)) if batch_number >= 2 else 0
+            log(f"  {variants_done}/{variant_count} ({100*variants_done//variant_count}%)  batch={_dt:.1f}s  est_remaining={est_total/60:.0f}min  mem={mem()}")
 
     means = np.divide(
         sums, np.maximum(non_missing_counts, 1),
