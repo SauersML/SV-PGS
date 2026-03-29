@@ -207,8 +207,8 @@ def test_plink_loader_uses_indexed_bed_reads(tmp_path: Path, monkeypatch: pytest
             sample_indices, variant_indices = index
             indexed_read_calls.append(
                 (
-                    np.asarray(variant_indices, dtype=np.int32),
-                    np.asarray(sample_indices, dtype=np.int32),
+                    variant_indices,
+                    sample_indices,
                 )
             )
             return self._delegate.read(*args, **kwargs)
@@ -227,8 +227,18 @@ def test_plink_loader_uses_indexed_bed_reads(tmp_path: Path, monkeypatch: pytest
     )
 
     assert indexed_read_calls
-    assert all(call_sample_indices.shape == (3,) for _, call_sample_indices in indexed_read_calls)
-    assert sum(call_variant_indices.shape[0] for call_variant_indices, _ in indexed_read_calls) >= 3
+    assert all(
+        isinstance(call_sample_indices, slice) or np.asarray(call_sample_indices, dtype=np.int32).shape == (3,)
+        for _, call_sample_indices in indexed_read_calls
+    )
+    assert sum(
+        (
+            call_variant_indices.stop - call_variant_indices.start
+            if isinstance(call_variant_indices, slice)
+            else np.asarray(call_variant_indices, dtype=np.int32).shape[0]
+        )
+        for call_variant_indices, _ in indexed_read_calls
+    ) >= 3
     np.testing.assert_allclose(dataset.genotypes, np.array([[2.0, 0.0, 1.0], [0.0, 1.0, 0.0], [1.0, 2.0, 0.0]], dtype=np.float32))
 
 
@@ -279,6 +289,24 @@ def test_load_dataset_from_plink_filters_non_genotyped_sample_rows(tmp_path: Pat
     np.testing.assert_allclose(dataset.targets, np.array([1.0, 0.0], dtype=np.float32))
     np.testing.assert_allclose(dataset.covariates, np.array([[55.0], [44.0]], dtype=np.float32))
     np.testing.assert_allclose(dataset.genotypes, np.array([[2.0, 0.0], [0.0, 1.0]], dtype=np.float32))
+
+
+def test_effective_bed_reader_batch_size_caps_large_sample_matrices():
+    assert genotype_module._effective_bed_reader_batch_size(
+        sample_count=447_278,
+        requested_batch_size=4_096,
+    ) < 4_096
+    assert genotype_module._effective_bed_reader_batch_size(
+        sample_count=447_278,
+        requested_batch_size=4_096,
+    ) == 150
+
+
+def test_contiguous_index_or_slice_prefers_slices_for_dense_ranges():
+    assert genotype_module._contiguous_index_or_slice(np.array([3, 4, 5], dtype=np.int32)) == slice(3, 6, 1)
+    non_contiguous = genotype_module._contiguous_index_or_slice(np.array([3, 5, 6], dtype=np.int32))
+    assert isinstance(non_contiguous, np.ndarray)
+    np.testing.assert_array_equal(non_contiguous, np.array([3, 5, 6], dtype=np.intp))
 
 
 def test_load_dataset_from_files_auto_detect_fails_when_no_identifier_column_matches(tmp_path: Path):

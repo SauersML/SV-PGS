@@ -11,6 +11,8 @@ import numpy as np
 from bed_reader import open_bed
 
 DEFAULT_GENOTYPE_BATCH_SIZE = 4096
+BED_READER_TARGET_BATCH_BYTES = 256 * 1024 * 1024
+MIN_BED_READER_BATCH_SIZE = 32
 
 
 def as_raw_genotype_matrix(genotypes: RawGenotypeMatrix | np.ndarray) -> RawGenotypeMatrix:
@@ -121,14 +123,27 @@ class PlinkRawGenotypeMatrix(RawGenotypeMatrix):
         batch_size: int | None = None,
     ) -> Iterator[RawGenotypeBatch]:
         resolved_indices = _resolve_variant_indices(self.variant_count, variant_indices)
-        safe_batch_size = max(int(self.batch_size if batch_size is None else batch_size), 1)
+        requested_batch_size = max(int(self.batch_size if batch_size is None else batch_size), 1)
+        safe_batch_size = _effective_bed_reader_batch_size(
+            sample_count=self.shape[0],
+            requested_batch_size=requested_batch_size,
+        )
         reader = self._bed_reader()
         total = resolved_indices.shape[0]
+        from sv_pgs.progress import log, mem
+        raw_batch_mb = self.shape[0] * safe_batch_size * np.dtype(np.float32).itemsize / (1024 * 1024)
+        if safe_batch_size != requested_batch_size:
+            log(
+                "    capping bed_reader batch size from "
+                + f"{requested_batch_size} to {safe_batch_size} variants "
+                + f"(~{raw_batch_mb:.0f} MB raw float32)  mem={mem()}"
+            )
         for start_index in range(0, total, safe_batch_size):
             batch_indices = resolved_indices[start_index : start_index + safe_batch_size]
-            col_index = np.ascontiguousarray(batch_indices, dtype=np.intp)
+            sample_index = _contiguous_index_or_slice(self.sample_indices)
+            col_index = _contiguous_index_or_slice(batch_indices)
             values = np.asarray(
-                reader.read(index=(self.sample_indices, col_index), dtype="float32", order="F", num_threads=None),
+                reader.read(index=(sample_index, col_index), dtype="float32", order="F", num_threads=None),
                 dtype=np.float32,
             )
             yield RawGenotypeBatch(
@@ -142,9 +157,10 @@ class PlinkRawGenotypeMatrix(RawGenotypeMatrix):
     ) -> np.ndarray:
         resolved_indices = _resolve_variant_indices(self.variant_count, variant_indices)
         reader = self._bed_reader()
-        col_index = np.ascontiguousarray(resolved_indices, dtype=np.intp)
+        sample_index = _contiguous_index_or_slice(self.sample_indices)
+        col_index = _contiguous_index_or_slice(resolved_indices)
         return np.asarray(
-            reader.read(index=(self.sample_indices, col_index), dtype="float32", order="F", num_threads=None),
+            reader.read(index=(sample_index, col_index), dtype="float32", order="F", num_threads=None),
             dtype=np.float32,
         )
 
@@ -289,6 +305,34 @@ def _resolve_variant_indices(
     if resolved_indices.ndim != 1:
         raise ValueError("variant_indices must be 1D.")
     return resolved_indices
+
+
+def _effective_bed_reader_batch_size(
+    sample_count: int,
+    requested_batch_size: int,
+) -> int:
+    if sample_count < 1:
+        raise ValueError("sample_count must be positive.")
+    if requested_batch_size < 1:
+        raise ValueError("requested_batch_size must be positive.")
+    bytes_per_variant = sample_count * np.dtype(np.float32).itemsize
+    memory_capped_batch_size = max(BED_READER_TARGET_BATCH_BYTES // max(bytes_per_variant, 1), 1)
+    return max(1, min(requested_batch_size, max(memory_capped_batch_size, MIN_BED_READER_BATCH_SIZE)))
+
+
+def _contiguous_index_or_slice(indices: np.ndarray) -> slice | np.ndarray:
+    resolved_indices = np.asarray(indices, dtype=np.intp)
+    if resolved_indices.ndim != 1:
+        raise ValueError("indices must be 1D.")
+    if resolved_indices.size == 0:
+        return slice(0, 0, 1)
+    if resolved_indices.size == 1:
+        start = int(resolved_indices[0])
+        return slice(start, start + 1, 1)
+    deltas = np.diff(resolved_indices)
+    if np.all(deltas == 1):
+        return slice(int(resolved_indices[0]), int(resolved_indices[-1]) + 1, 1)
+    return np.ascontiguousarray(resolved_indices, dtype=np.intp)
 
 
 def _standardize_batch(batch: np.ndarray, means: np.ndarray, scales: np.ndarray) -> np.ndarray:
