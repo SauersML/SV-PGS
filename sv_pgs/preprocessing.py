@@ -132,15 +132,16 @@ def compute_variant_statistics(
     # Compute residual for screening if covariates/targets provided
     compute_scores = covariates is not None and targets is not None
     residual_jax: jnp.ndarray | None = None
+    jax_backend = jax.default_backend()
     if compute_scores:
         cov = np.asarray(covariates, dtype=np.float64)
         tgt = np.asarray(targets, dtype=np.float64).reshape(-1)
         coef, *_ = np.linalg.lstsq(cov, tgt, rcond=None)
         residual = tgt - cov @ coef
         residual_jax = jnp.asarray(residual)
-        log(f"=== VARIANT STATISTICS + SCREENING (1-pass, JAX) ===  {sample_count} samples x {variant_count} variants  batch_size={batch_size}  n_batches={n_batches}  mem={mem()}")
+        log(f"=== VARIANT STATISTICS + SCREENING (1-pass, JAX/{jax_backend}) ===  {sample_count} samples x {variant_count} variants  batch_size={batch_size}  mem={mem()}")
     else:
-        log(f"=== VARIANT STATISTICS (1-pass, JAX) ===  {sample_count} samples x {variant_count} variants  batch_size={batch_size}  n_batches={n_batches}  mem={mem()}")
+        log(f"=== VARIANT STATISTICS (1-pass, JAX/{jax_backend}) ===  {sample_count} samples x {variant_count} variants  batch_size={batch_size}  mem={mem()}")
 
     sums = np.zeros(variant_count, dtype=np.float64)
     non_missing_counts = np.zeros(variant_count, dtype=np.int32)
@@ -151,10 +152,11 @@ def compute_variant_statistics(
         marginal_scores = np.zeros(variant_count, dtype=np.float64)
 
     # Use int8 path for PLINK data (4x less memory, avoids float32 intermediate)
-    from sv_pgs.genotype import PlinkRawGenotypeMatrix
-    use_i8 = isinstance(raw_genotypes, PlinkRawGenotypeMatrix)
+    use_i8 = hasattr(raw_genotypes, "iter_column_batches_i8")
     if use_i8:
-        log(f"  using int8 native path (4x less memory per batch)")
+        log(f"  using int8 native path (4x less memory per batch, ~4x larger batches)")
+    else:
+        log(f"  using float32 path (type={type(raw_genotypes).__name__})")
 
     variants_done = 0
     batch_iter = raw_genotypes.iter_column_batches_i8(batch_size=batch_size) if use_i8 else raw_genotypes.iter_column_batches(batch_size=batch_size)

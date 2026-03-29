@@ -159,6 +159,10 @@ class PlinkRawGenotypeMatrix(RawGenotypeMatrix):
         safe_batch_size = min(requested * 4, max_variants)  # 4x headroom vs float32
         reader = self._bed_reader()
         total = resolved_indices.shape[0]
+        from sv_pgs.progress import log, mem
+        batch_mb = self.shape[0] * safe_batch_size / (1024 * 1024)
+        n_batches = (total + safe_batch_size - 1) // safe_batch_size
+        log(f"    int8 batch: {safe_batch_size} variants x {self.shape[0]} samples = {batch_mb:.0f} MB/batch, {n_batches} batches  mem={mem()}")
 
         if total <= safe_batch_size:
             values = self._read_batch_i8(reader, resolved_indices)

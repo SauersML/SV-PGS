@@ -35,6 +35,8 @@ class FittedState:
     full_coefficients: np.ndarray
     nonzero_coefficient_indices: np.ndarray
     nonzero_coefficients: np.ndarray
+    nonzero_means: np.ndarray
+    nonzero_scales: np.ndarray
 
 
 class BayesianPGS:
@@ -165,6 +167,8 @@ class BayesianPGS:
         full_coefficients = np.zeros(len(normalized_records), dtype=np.float32)
         full_coefficients[active_variant_indices] = active_coefficients
         nonzero_coefficient_indices, nonzero_coefficients = _nonzero_coefficient_cache(full_coefficients)
+        nonzero_means = np.asarray(prepared_arrays.means[nonzero_coefficient_indices], dtype=np.float32)
+        nonzero_scales = np.asarray(prepared_arrays.scales[nonzero_coefficient_indices], dtype=np.float32)
         nonzero_count = int(np.count_nonzero(full_coefficients))
         log(f"coefficients: {nonzero_count} non-zero out of {len(normalized_records)} total")
 
@@ -177,6 +181,8 @@ class BayesianPGS:
             full_coefficients=full_coefficients,
             nonzero_coefficient_indices=nonzero_coefficient_indices,
             nonzero_coefficients=nonzero_coefficients,
+            nonzero_means=nonzero_means,
+            nonzero_scales=nonzero_scales,
         )
         log(f"=== MODEL FIT DONE ===  mem={mem()}")
         return self
@@ -195,13 +201,13 @@ class BayesianPGS:
             return np.asarray(covariate_matrix @ fitted_state.fit_result.alpha, dtype=np.float32)
 
         raw_genotypes = as_raw_genotype_matrix(genotypes)
-        standardized_subset = raw_genotypes.standardized(
-            fitted_state.preprocessor.means, fitted_state.preprocessor.scales,
-        ).subset(nonzero_indices)
-
-        genotype_component = np.asarray(
-            standardized_subset.matvec(nonzero_coefficients, batch_size=self.config.genotype_batch_size),
-            dtype=np.float32,
+        genotype_component = _raw_standardized_subset_matvec(
+            raw_genotypes=raw_genotypes,
+            variant_indices=nonzero_indices,
+            means=fitted_state.nonzero_means,
+            scales=fitted_state.nonzero_scales,
+            coefficients=nonzero_coefficients,
+            batch_size=self.config.genotype_batch_size,
         )
         log(f"  decision_function done  mem={mem()}")
         return genotype_component + covariate_matrix @ fitted_state.fit_result.alpha
@@ -248,6 +254,8 @@ class BayesianPGS:
         artifact = load_artifact(path)
         loaded_model = cls(config=artifact.config)
         nonzero_coefficient_indices, nonzero_coefficients = _nonzero_coefficient_cache(artifact.beta_full)
+        nonzero_means = np.asarray(artifact.means[nonzero_coefficient_indices], dtype=np.float32)
+        nonzero_scales = np.asarray(artifact.scales[nonzero_coefficient_indices], dtype=np.float32)
         loaded_model.state = FittedState(
             variant_records=artifact.records,
             active_variant_indices=np.where(artifact.tie_map.original_to_reduced >= 0)[0].astype(np.int32),
@@ -271,6 +279,8 @@ class BayesianPGS:
             full_coefficients=artifact.beta_full,
             nonzero_coefficient_indices=nonzero_coefficient_indices,
             nonzero_coefficients=nonzero_coefficients,
+            nonzero_means=nonzero_means,
+            nonzero_scales=nonzero_scales,
         )
         return loaded_model
 
@@ -309,6 +319,27 @@ def _nonzero_coefficient_cache(coefficients: np.ndarray) -> tuple[np.ndarray, np
     coefficient_array = np.asarray(coefficients, dtype=np.float32)
     nonzero_indices = np.flatnonzero(np.abs(coefficient_array) > 0.0).astype(np.int32)
     return nonzero_indices, np.asarray(coefficient_array[nonzero_indices], dtype=np.float32)
+
+
+def _raw_standardized_subset_matvec(
+    raw_genotypes: RawGenotypeMatrix,
+    variant_indices: np.ndarray,
+    means: np.ndarray,
+    scales: np.ndarray,
+    coefficients: np.ndarray,
+    batch_size: int,
+) -> np.ndarray:
+    if variant_indices.shape[0] == 0:
+        return np.zeros(raw_genotypes.shape[0], dtype=np.float32)
+    result = np.zeros(raw_genotypes.shape[0], dtype=np.float32)
+    offset = 0
+    for batch in raw_genotypes.iter_column_batches(variant_indices, batch_size=batch_size):
+        batch_width = batch.variant_indices.shape[0]
+        batch_slice = slice(offset, offset + batch_width)
+        standardized_batch = _standardize_batch(batch.values, means[batch_slice], scales[batch_slice])
+        result += standardized_batch @ coefficients[batch_slice]
+        offset += batch_width
+    return result
 
 
 def _project_tie_map_to_original_space(
