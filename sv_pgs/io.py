@@ -357,11 +357,16 @@ def _resolve_sample_id_column(
         )
 
     available_sample_id_set = set(available_sample_ids)
+    # Sample first 1000 rows to pick the best column (avoids full 633k scan)
     match_counts = {column_name: 0 for column_name in candidate_columns}
+    rows_checked = 0
     for row in _iter_delimited_rows(table_spec):
         for column_name in candidate_columns:
             if str(row[column_name]).strip() in available_sample_id_set:
                 match_counts[column_name] += 1
+        rows_checked += 1
+        if rows_checked >= 1000:
+            break
     best_match_count = max(match_counts.values())
     best_columns = [column_name for column_name in candidate_columns if match_counts[column_name] == best_match_count]
     if best_match_count == 0:
