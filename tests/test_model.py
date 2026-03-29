@@ -162,3 +162,49 @@ def test_tie_group_export_weights_are_proportional_to_member_variances():
     )
 
     np.testing.assert_allclose(weights[0], np.array([0.9, 0.1], dtype=np.float32))
+
+
+def test_model_screens_active_variants_to_configured_limit():
+    genotype_matrix, covariate_matrix, target_vector, variant_records = _synthetic_binary_dataset()
+    extra_variants = np.random.default_rng(13).normal(size=(genotype_matrix.shape[0], 32)).astype(np.float32)
+    genotype_matrix = np.column_stack([genotype_matrix, extra_variants]).astype(np.float32)
+    variant_records = variant_records + [
+        VariantRecord(f"extra_{variant_index}", VariantClass.SNV, "1", 10_000 + variant_index)
+        for variant_index in range(extra_variants.shape[1])
+    ]
+
+    model = BayesianPGS(
+        ModelConfig(
+            trait_type=TraitType.BINARY,
+            max_outer_iterations=2,
+            maximum_active_variants=8,
+            maximum_tie_map_variants=8,
+            minimum_structural_variant_carriers=1,
+        )
+    ).fit(genotype_matrix, covariate_matrix, target_vector, variant_records)
+
+    assert model.state is not None
+    assert model.state.active_variant_indices.shape[0] == 8
+
+
+def test_model_skips_tie_map_when_active_variant_count_exceeds_limit():
+    genotype_matrix, covariate_matrix, target_vector, variant_records = _synthetic_binary_dataset()
+
+    model = BayesianPGS(
+        ModelConfig(
+            trait_type=TraitType.BINARY,
+            max_outer_iterations=2,
+            maximum_active_variants=64,
+            maximum_tie_map_variants=2,
+            minimum_structural_variant_carriers=1,
+        )
+    ).fit(genotype_matrix, covariate_matrix, target_vector, variant_records)
+
+    assert model.state is not None
+    active_count = model.state.active_variant_indices.shape[0]
+    assert active_count > 2
+    np.testing.assert_array_equal(model.state.tie_map.kept_indices, model.state.active_variant_indices)
+    np.testing.assert_array_equal(
+        model.state.tie_map.original_to_reduced[model.state.active_variant_indices],
+        np.arange(active_count, dtype=np.int32),
+    )
