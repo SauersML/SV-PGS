@@ -741,12 +741,16 @@ def _restricted_posterior_state(
         # Solves via p×p Cholesky (p=variants ≤ 2048) instead of CG on n×n (n=447k).
         log(f"    restricted posterior: Woodbury variant-space Cholesky (p={variant_count}, n={sample_count})  mem={mem()}")
         inv_diag = 1.0 / np.maximum(diagonal_noise, 1e-12)
-        X = np.asarray(genotype_matrix.materialize(), dtype=np.float64)
+        # Use JAX for the big matmul (benefits from GPU if available)
+        X_jax = jnp.asarray(genotype_matrix.materialize(), dtype=jnp.float64)
+        inv_diag_jax = jnp.asarray(inv_diag, dtype=jnp.float64)
         S_diag = np.asarray(prior_variances, dtype=np.float64)
         # Form p×p matrix: S^{-1} + X^T @ diag(1/D) @ X
-        XtDinvX = (X * inv_diag[:, None]).T @ X
+        XtDinvX = np.asarray((X_jax * inv_diag_jax[:, None]).T @ X_jax, dtype=np.float64)
         woodbury_matrix = np.diag(1.0 / np.maximum(S_diag, 1e-12)) + XtDinvX + np.eye(variant_count) * 1e-8
         woodbury_cholesky = np.linalg.cholesky(woodbury_matrix)
+        X = np.asarray(X_jax, dtype=np.float64)  # keep numpy copy for solve_rhs
+        del X_jax  # free JAX copy
 
         def solve_rhs(right_hand_side: np.ndarray) -> np.ndarray:
             rhs = np.asarray(right_hand_side, dtype=np.float64)
