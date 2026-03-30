@@ -290,14 +290,17 @@ def test_load_dataset_from_plink_filters_non_genotyped_sample_rows(tmp_path: Pat
 
 
 def test_effective_bed_reader_batch_size_caps_large_sample_matrices():
-    assert genotype_module._effective_bed_reader_batch_size(
+    capped = genotype_module._effective_bed_reader_batch_size(
         sample_count=447_278,
         requested_batch_size=4_096,
-    ) < 4_096
+    )
+    assert capped < 4_096, "should cap below requested size for large sample counts"
+    assert capped >= genotype_module.MIN_BED_READER_BATCH_SIZE, "should respect minimum batch size"
+    # Small sample counts should pass through the requested size unchanged.
     assert genotype_module._effective_bed_reader_batch_size(
-        sample_count=447_278,
+        sample_count=100,
         requested_batch_size=4_096,
-    ) == 150
+    ) == 4_096
 
 
 def test_contiguous_index_or_slice_prefers_slices_for_dense_ranges():
