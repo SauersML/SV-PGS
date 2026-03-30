@@ -13,11 +13,11 @@ from bed_reader import open_bed
 
 DEFAULT_GENOTYPE_BATCH_SIZE = 1024
 
-# Memory cap per bed_reader batch: 1.5 GB raw float32 output.
-# For 447k samples: 1.5 GB / (447278 * 4) ≈ 838 variants/batch → ~2075 batches.
-# Working memory (JAX intermediates) ≈ 5x this ≈ 7.5 GB.
-# Fits on 14.6 GB with ~1 GB base and ~5 GB margin.
-BED_READER_TARGET_BATCH_BYTES = 1_500_000_000
+# Memory cap per bed_reader batch based on actual JAX working memory, not raw read size.
+# The int8 screening kernel expands to float32 intermediates (~10 bytes/element peak),
+# so budget for total working memory, not just the raw int8 read.
+# 500 MB / 447k samples ≈ 1118 variants → ~4.3 GB float32 peak → fits 14.6 GB easily.
+BED_READER_TARGET_BATCH_BYTES = 500_000_000
 MIN_BED_READER_BATCH_SIZE = 32
 
 # Auto-materialize threshold: if the reduced EM genotype matrix fits in this
@@ -152,11 +152,12 @@ class PlinkRawGenotypeMatrix(RawGenotypeMatrix):
         Values are 0/1/2/-127(missing). Callers must handle -127 sentinel.
         """
         resolved_indices = _resolve_variant_indices(self.variant_count, None)
-        # int8 batches are 4x smaller, so allow 4x more variants per batch
+        # int8 reads are 4x smaller than float32, but JAX kernels still expand to
+        # float32 intermediates (~10 bytes/element peak), so do NOT inflate batch size.
         requested = max(int(self.batch_size if batch_size is None else batch_size), 1)
         bytes_per_variant = self.shape[0]  # 1 byte per sample for int8
         max_variants = max(BED_READER_TARGET_BATCH_BYTES // max(bytes_per_variant, 1), MIN_BED_READER_BATCH_SIZE)
-        safe_batch_size = min(requested * 4, max_variants)  # 4x headroom vs float32
+        safe_batch_size = min(requested, max_variants)
         reader = self._bed_reader()
         total = resolved_indices.shape[0]
         from sv_pgs.progress import log, mem

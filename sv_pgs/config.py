@@ -113,7 +113,6 @@ class ModelConfig:
     exact_solver_matrix_limit: int = 2048  # Woodbury used when variants ≤ this AND samples > this
     posterior_variance_batch_size: int = 1024
     genotype_batch_size: int = 1024
-    maximum_active_variants: int = 2000
     maximum_tie_map_variants: int = 5000
     validation_interval: int = 2
     binary_intercept_calibration: bool = False
@@ -180,8 +179,6 @@ class ModelConfig:
             raise ValueError("posterior_variance_batch_size must be positive.")
         if self.genotype_batch_size < 1:
             raise ValueError("genotype_batch_size must be positive.")
-        if self.maximum_active_variants < 1:
-            raise ValueError("maximum_active_variants must be positive.")
         if self.maximum_tie_map_variants < 1:
             raise ValueError("maximum_tie_map_variants must be positive.")
         if self.validation_interval < 1:

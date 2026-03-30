@@ -83,30 +83,6 @@ class BayesianPGS:
             support_counts=variant_stats.support_counts if variant_stats is not None else _compute_support_counts(raw_genotype_matrix, normalized_records, self.config),
             config=self.config,
         )
-        if active_variant_indices.shape[0] > self.config.maximum_active_variants:
-            if variant_stats is not None and variant_stats.marginal_scores is not None:
-                log(
-                    f"screening to top {self.config.maximum_active_variants} "
-                    f"from {active_variant_indices.shape[0]} using pre-computed scores [NO DATA PASS]"
-                )
-                local_scores = variant_stats.marginal_scores[active_variant_indices]
-                top_local = np.argpartition(local_scores, -self.config.maximum_active_variants)[-self.config.maximum_active_variants:]
-                active_variant_indices = np.sort(active_variant_indices[top_local]).astype(np.int32)
-            else:
-                log(
-                    f"screening to top {self.config.maximum_active_variants} "
-                    f"from {active_variant_indices.shape[0]} (streaming)..."
-                )
-                active_variant_indices = _screen_active_variant_indices(
-                    raw_genotypes=raw_genotype_matrix,
-                    active_variant_indices=active_variant_indices,
-                    covariates=prepared_arrays.covariates,
-                    targets=prepared_arrays.targets,
-                    means=prepared_arrays.means,
-                    scales=prepared_arrays.scales,
-                    maximum_active_variants=self.config.maximum_active_variants,
-                    batch_size=self.config.genotype_batch_size,
-                )
         log(f"active variants: {len(active_variant_indices)} / {len(normalized_records)} ({100.0*len(active_variant_indices)/max(len(normalized_records),1):.1f}%)")
         active_records = [normalized_records[int(variant_index)] for variant_index in active_variant_indices]
         active_genotypes = standardized_genotypes.subset(active_variant_indices)
@@ -485,54 +461,6 @@ def _compute_support_counts(
         ).astype(np.int32, copy=False)
     return support_counts
 
-
-def _screen_active_variant_indices(
-    raw_genotypes: RawGenotypeMatrix,
-    active_variant_indices: np.ndarray,
-    covariates: np.ndarray,
-    targets: np.ndarray,
-    means: np.ndarray,
-    scales: np.ndarray,
-    maximum_active_variants: int,
-    batch_size: int,
-) -> np.ndarray:
-    from sv_pgs.progress import log, mem
-    if active_variant_indices.shape[0] <= maximum_active_variants:
-        return np.asarray(active_variant_indices, dtype=np.int32)
-
-    covariate_matrix = np.asarray(covariates, dtype=np.float64)
-    target_vector = np.asarray(targets, dtype=np.float64).reshape(-1)
-    screening_coefficients, *_ = np.linalg.lstsq(covariate_matrix, target_vector, rcond=None)
-    residual = target_vector - covariate_matrix @ screening_coefficients
-    score_by_variant_index = np.full(raw_genotypes.shape[1], -np.inf, dtype=np.float32)
-
-    log(
-        f"  marginal screening: scoring {active_variant_indices.shape[0]} active variants "
-        f"with batch_size={batch_size}  mem={mem()}"
-    )
-    variants_done = 0
-    total_active = int(active_variant_indices.shape[0])
-    for batch in raw_genotypes.iter_column_batches(active_variant_indices, batch_size=batch_size):
-        batch_means = means[batch.variant_indices]
-        batch_scales = scales[batch.variant_indices]
-        standardized_batch = _standardize_batch(batch.values, batch_means, batch_scales).astype(np.float64, copy=False)
-        batch_scores = np.abs(standardized_batch.T @ residual).astype(np.float32, copy=False)
-        score_by_variant_index[batch.variant_indices] = batch_scores
-        variants_done += len(batch.variant_indices)
-        if variants_done == len(batch.variant_indices) or variants_done % max(total_active // 10, 1) < len(batch.variant_indices) or variants_done == total_active:
-            log(
-                f"  marginal screening: {variants_done}/{total_active} "
-                f"({100 * variants_done // total_active}%)  mem={mem()}"
-            )
-
-    local_scores = score_by_variant_index[active_variant_indices]
-    top_local_indices = np.argpartition(local_scores, -maximum_active_variants)[-maximum_active_variants:]
-    selected_variant_indices = np.sort(active_variant_indices[top_local_indices].astype(np.int32))
-    log(
-        f"  marginal screening done: kept {selected_variant_indices.shape[0]} / {active_variant_indices.shape[0]} "
-        f"active variants"
-    )
-    return selected_variant_indices
 
 
 def _identity_tie_map(variant_count: int) -> TieMap:

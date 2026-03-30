@@ -159,7 +159,7 @@ def compute_variant_statistics(
     # Use int8 path for PLINK data (4x less memory, avoids float32 intermediate)
     use_i8 = hasattr(raw_genotypes, "iter_column_batches_i8")
     if use_i8:
-        log(f"  using int8 native path (4x less memory per batch, ~4x larger batches)")
+        log(f"  using int8 native path (4x less IO per batch)")
     else:
         log(f"  using float32 path (type={type(raw_genotypes).__name__})")
 
