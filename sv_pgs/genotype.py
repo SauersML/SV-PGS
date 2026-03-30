@@ -11,7 +11,7 @@ import jax.numpy as jnp
 import numpy as np
 from bed_reader import open_bed
 
-DEFAULT_GENOTYPE_BATCH_SIZE = 1024  # variants per batch when streaming from disk
+DEFAULT_GENOTYPE_BATCH_SIZE = 1024  # fallback when sample count is unknown
 
 # Memory cap per bed_reader batch.  PLINK .bed files store genotypes on disk
 # as 2 bits per sample, but we expand to int8 or float32 in memory.  The JAX
@@ -427,6 +427,19 @@ def _resolve_variant_indices(
     if resolved_indices.ndim != 1:
         raise ValueError("variant_indices must be 1D.")
     return resolved_indices
+
+
+# Auto-choose a good batch size based on sample count and memory budget.
+# Larger batches = fewer I/O round-trips = faster, but each batch must fit
+# in memory.  With 447k samples at 4 bytes each, one variant = ~1.7 MB,
+# so 500 MB budget => ~279 variants per batch.
+def auto_batch_size(sample_count: int) -> int:
+    """Pick a genotype batch size that fits within the memory budget."""
+    if sample_count < 1:
+        return DEFAULT_GENOTYPE_BATCH_SIZE
+    bytes_per_variant = sample_count * 4  # float32
+    memory_capped = max(BED_READER_TARGET_BATCH_BYTES // max(bytes_per_variant, 1), 1)
+    return max(MIN_BED_READER_BATCH_SIZE, min(DEFAULT_GENOTYPE_BATCH_SIZE, memory_capped))
 
 
 # Cap the batch size so each batch doesn't exceed the memory budget.

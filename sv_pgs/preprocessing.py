@@ -16,6 +16,7 @@ from sv_pgs.genotype import (
     RawGenotypeMatrix,
     StandardizedGenotypeMatrix,
     as_raw_genotype_matrix,
+    auto_batch_size,
 )
 
 
@@ -161,7 +162,7 @@ def compute_variant_statistics(
     from sv_pgs.progress import log, mem
     variant_count = raw_genotypes.shape[1]
     sample_count = raw_genotypes.shape[0]
-    batch_size = config.genotype_batch_size
+    batch_size = auto_batch_size(sample_count)
     n_batches = (variant_count + batch_size - 1) // batch_size
 
     # Compute the trait residual for screening: residual = y - C @ (C^T C)^{-1} C^T y
@@ -312,7 +313,7 @@ def fit_preprocessor(
     sums = np.zeros(variant_count, dtype=np.float64)
     non_missing_counts = np.zeros(variant_count, dtype=np.int64)
     variants_done = 0
-    for batch in raw_genotypes.iter_column_batches(batch_size=config.genotype_batch_size):
+    for batch in raw_genotypes.iter_column_batches(batch_size=auto_batch_size(raw_genotypes.shape[0])):
         mask = ~np.isnan(batch.values)
         observed = np.where(mask, batch.values, 0.0)
         sums[batch.variant_indices] = np.sum(observed, axis=0, dtype=np.float64)
@@ -331,7 +332,7 @@ def fit_preprocessor(
     log(f"  preprocessor pass 2/2: computing scales over {variant_count} variants...")
     centered_sum_squares = np.zeros(variant_count, dtype=np.float64)
     variants_done = 0
-    for batch in raw_genotypes.iter_column_batches(batch_size=config.genotype_batch_size):
+    for batch in raw_genotypes.iter_column_batches(batch_size=auto_batch_size(raw_genotypes.shape[0])):
         batch_means = means[batch.variant_indices]
         imputed = np.where(np.isnan(batch.values), batch_means[None, :], batch.values)
         centered = imputed - batch_means[None, :]
@@ -444,7 +445,7 @@ def build_tie_map(
     original_to_reduced = np.full(n_total, -1, dtype=np.int32)
 
     variants_done = 0
-    for batch in standardized_genotypes.iter_column_batches(batch_size=config.genotype_batch_size):
+    for batch in standardized_genotypes.iter_column_batches(batch_size=auto_batch_size(standardized_genotypes.shape[0])):
         for local_batch_index, variant_index in enumerate(batch.variant_indices):
             standardized_column = np.where(
                 batch.values[:, local_batch_index] == 0.0,

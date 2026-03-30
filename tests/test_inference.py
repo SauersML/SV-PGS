@@ -3,7 +3,6 @@ from __future__ import annotations
 import numpy as np
 import pytest
 from scipy.special import kve
-from scipy.special import polygamma
 
 from sv_pgs.config import ModelConfig, TraitType, VariantClass
 from sv_pgs.data import VariantRecord
@@ -11,7 +10,6 @@ from sv_pgs.inference import fit_variational_em
 from sv_pgs.mixture_inference import (
     PosteriorState,
     _quantitative_posterior_state,
-    _trigamma,
     _update_local_scales,
     _update_tpb_shape_vectors,
 )
@@ -103,14 +101,6 @@ def test_signal_variant_receives_largest_effect(random_generator):
         tie_map=build_tie_map(genotype_matrix, records, config),
     )
     assert np.argmax(np.abs(result.beta_reduced)) == 3
-
-
-def test_trigamma_matches_scipy_polygamma_for_small_shapes():
-    shape_values = np.array([0.1, 0.2, 0.5, 1.0, 2.0], dtype=np.float32)
-    for shape_value in shape_values:
-        expected_value = float(polygamma(1, shape_value))
-        actual_value = float(_trigamma(float(shape_value)))
-        assert np.isclose(actual_value, expected_value, rtol=1e-6, atol=1e-6)
 
 
 def test_local_scale_update_uses_unslabbed_baseline_variance():

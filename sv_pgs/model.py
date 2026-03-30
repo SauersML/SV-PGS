@@ -9,7 +9,7 @@ import numpy as np
 from sv_pgs.artifact import ModelArtifact, load_artifact, save_artifact
 from sv_pgs.config import ModelConfig, TraitType
 from sv_pgs.data import TieGroup, TieMap, VariantRecord, VariantStatistics, normalize_variant_records
-from sv_pgs.genotype import RawGenotypeMatrix, StandardizedGenotypeMatrix, as_raw_genotype_matrix
+from sv_pgs.genotype import RawGenotypeMatrix, StandardizedGenotypeMatrix, as_raw_genotype_matrix, auto_batch_size
 from sv_pgs.inference import VariationalFitResult, fit_variational_em
 from sv_pgs.numeric import stable_sigmoid
 from sv_pgs.preprocessing import (
@@ -207,7 +207,7 @@ class BayesianPGS:
             means=fitted_state.nonzero_means,
             scales=fitted_state.nonzero_scales,
             coefficients=nonzero_coefficients,
-            batch_size=self.config.genotype_batch_size,
+            batch_size=auto_batch_size(raw_genotypes.shape[0]),
         )
         log(f"  decision_function done  mem={mem()}")
         return genotype_component + covariate_matrix @ fitted_state.fit_result.alpha
@@ -414,7 +414,7 @@ def _training_records(
     if unresolved_variant_indices:
         unresolved_lookup = {variant_index: offset for offset, variant_index in enumerate(unresolved_variant_indices)}
         unresolved_supports = [0] * len(unresolved_variant_indices)
-        for batch in raw_genotypes.iter_column_batches(unresolved_variant_indices, batch_size=config.genotype_batch_size):
+        for batch in raw_genotypes.iter_column_batches(unresolved_variant_indices, batch_size=auto_batch_size(raw_genotypes.shape[0])):
             for local_index, variant_index in enumerate(batch.variant_indices):
                 unresolved_supports[unresolved_lookup[int(variant_index)]] = _infer_support_count_from_raw_genotypes(
                     batch.values[:, local_index],
@@ -502,7 +502,7 @@ def _compute_support_counts(
 
     for batch in raw_genotypes.iter_column_batches(
         unresolved_structural_variant_indices,
-        batch_size=config.genotype_batch_size,
+        batch_size=auto_batch_size(raw_genotypes.shape[0]),
     ):
         support_counts[batch.variant_indices] = np.count_nonzero(
             np.abs(np.where(np.isnan(batch.values), 0.0, batch.values)) > 0.5,
