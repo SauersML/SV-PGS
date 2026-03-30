@@ -10,6 +10,12 @@ from sv_pgs.config import VariantClass
 
 @dataclass(slots=True)
 class VariantRecord:
+    """Metadata for a single genetic variant.
+
+    Carries all the non-genotype information about a variant that the model
+    uses to set its prior: what type of variant it is, how long it is,
+    how common it is, whether it overlaps a repeat region, etc.
+    """
     variant_id: str
     variant_class: VariantClass
     chromosome: str
@@ -54,6 +60,12 @@ class PreparedArrays:
 
 @dataclass(slots=True)
 class TieGroup:
+    """A group of variants with identical (or exactly negated) genotype columns.
+
+    representative_index: the variant we keep in the reduced model
+    member_indices: all variants in the group (including the representative)
+    signs: +1 if a member's column matches the representative, -1 if negated
+    """
     representative_index: int
     member_indices: np.ndarray
     signs: np.ndarray
@@ -61,6 +73,17 @@ class TieGroup:
 
 @dataclass(slots=True)
 class TieMap:
+    """Maps between the full variant set and the de-duplicated (reduced) set.
+
+    Many variants can have identical genotype patterns across all samples
+    (especially in LD or when multiple callers detect the same event).
+    The tie map lets us fit the model on unique columns only, then expand
+    the results back to all variants.
+
+    kept_indices: which original variants were kept as representatives
+    original_to_reduced: for each original variant, its reduced-space index (-1 if not active)
+    reduced_to_group: for each reduced variant, the full group of tied members
+    """
     kept_indices: np.ndarray
     original_to_reduced: np.ndarray
     reduced_to_group: list[TieGroup]
@@ -70,6 +93,11 @@ class TieMap:
         reduced_beta: np.ndarray,
         group_weights: Sequence[np.ndarray],
     ) -> np.ndarray:
+        """Distribute each group's single fitted effect back to all its members.
+
+        Each member gets: beta_member = beta_group * weight_member * sign_member
+        where weights are proportional to prior variance and signs handle negation.
+        """
         expanded_coefficients = np.zeros(self.original_to_reduced.shape[0], dtype=np.float32)
         for reduced_index, tie_group in enumerate(self.reduced_to_group):
             group_weight_vector = np.asarray(group_weights[reduced_index], dtype=np.float32)

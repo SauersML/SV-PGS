@@ -23,6 +23,11 @@ class VariantClass(str, Enum):
     OTHER_COMPLEX_SV = "other_complex_sv"
 
 
+# Default log-scale for each variant class's prior effect size.
+# More negative = smaller expected effects.  SNVs (-4.5) are expected to
+# have the smallest individual effects; complex SVs (-3.1) the largest.
+# These are starting points — the model updates them during fitting.
+# Values are in log-space: exp(-4.5) ≈ 0.011, exp(-3.1) ≈ 0.045.
 DEFAULT_CLASS_LOG_BASELINE_SCALE = {
     VariantClass.SNV: -4.5,
     VariantClass.SMALL_INDEL: -4.2,
@@ -36,6 +41,12 @@ DEFAULT_CLASS_LOG_BASELINE_SCALE = {
     VariantClass.OTHER_COMPLEX_SV: -3.3,
 }
 
+# TPB shape parameters control the "tail weight" of the shrinkage prior.
+# Shape_a (below) and shape_b control how tolerant the prior is of large effects:
+#   - shape_a=1.0 (SNVs): moderate tails — most effects shrunk to near zero
+#   - shape_a=0.55 (inversions): heavy tails — more tolerance for large effects
+# SVs get heavier tails because they disrupt more DNA and are more likely
+# to have individually detectable phenotypic effects.
 DEFAULT_CLASS_TPB_SHAPE_A: dict[VariantClass, float] = {
     VariantClass.SNV: 1.0,
     VariantClass.SMALL_INDEL: 0.9,
@@ -49,6 +60,9 @@ DEFAULT_CLASS_TPB_SHAPE_A: dict[VariantClass, float] = {
     VariantClass.OTHER_COMPLEX_SV: 0.6,
 }
 
+# Shape_b controls the auxiliary rate distribution.  Together with shape_a,
+# it determines the marginal distribution of the local shrinkage factor.
+# Smaller values = heavier tails = more large effects allowed.
 DEFAULT_CLASS_TPB_SHAPE_B: dict[VariantClass, float] = {
     VariantClass.SNV: 0.5,
     VariantClass.SMALL_INDEL: 0.5,
@@ -76,13 +90,25 @@ STRUCTURAL_VARIANT_CLASSES = (
 
 @dataclass(slots=True)
 class ModelConfig:
-    trait_type: TraitType = TraitType.BINARY
-    max_outer_iterations: int = 30
-    convergence_tolerance: float = 1e-4
-    minimum_scale: float = 1e-6
-    polya_gamma_minimum_weight: float = 1e-4
-    sigma_error_floor: float = 1e-3
-    minimum_structural_variant_carriers: int = 5
+    """All tunable parameters for the Bayesian PGS model.
+
+    Most users won't need to change these — the defaults are calibrated for
+    All of Us-scale data (~447k samples, ~900k variants).  Key groups:
+
+    Convergence: max_outer_iterations, convergence_tolerance
+    Prior structure: prior_scale_floor/ceiling, global_scale_floor/ceiling
+    SV filtering: minimum_structural_variant_carriers (default 5)
+    Linear algebra: exact_solver_matrix_limit (Woodbury vs CG cutoff),
+                    genotype_batch_size (memory vs throughput tradeoff)
+    TPB shapes: minimum/maximum_tpb_shape, tpb_shape_learning_rate
+    """
+    trait_type: TraitType = TraitType.BINARY       # binary (case/control) or quantitative
+    max_outer_iterations: int = 30                 # EM iterations (usually converges in 10-20)
+    convergence_tolerance: float = 1e-4            # stop when parameters change < this
+    minimum_scale: float = 1e-6                    # variants with std < this are treated as monomorphic
+    polya_gamma_minimum_weight: float = 1e-4       # floor on IRLS weights to prevent division by ~zero
+    sigma_error_floor: float = 1e-3                # noise variance can't go below this
+    minimum_structural_variant_carriers: int = 5   # SVs with fewer carriers are excluded
     prior_scale_floor: float = 1e-6
     prior_scale_ceiling: float = 10.0
     global_scale_floor: float = 1e-4
@@ -110,7 +136,7 @@ class ModelConfig:
     maximum_linear_solver_iterations: int = 256
     logdet_probe_count: int = 6
     logdet_lanczos_steps: int = 12
-    exact_solver_matrix_limit: int = 2048  # Woodbury used when variants ≤ this AND samples > this
+    exact_solver_matrix_limit: int = 2048  # below this: direct solve; above: Woodbury or CG
     posterior_variance_batch_size: int = 1024
     genotype_batch_size: int = 1024
     maximum_tie_map_variants: int = 5000

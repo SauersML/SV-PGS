@@ -1,4 +1,54 @@
-"""Operator-based TPB / gamma-gamma inference."""
+"""Variational EM inference for Bayesian polygenic scores.
+
+High-level idea
+---------------
+We want to estimate how much each genetic variant contributes to a trait
+(e.g. type-2 diabetes risk).  Most variants have near-zero effect, but a
+few may be large — especially structural variants (deletions, duplications,
+etc.).  This module fits a Bayesian model that automatically learns which
+variants matter and how much to trust each one.
+
+Model
+-----
+Each variant j gets an effect size beta_j drawn from a normal distribution
+whose variance tau_j^2 encodes our prior belief about how big that effect
+could be:
+
+    beta_j ~ Normal(0, tau_j^2)
+
+The prior variance tau_j^2 is built from three pieces:
+  - sigma_g      : a single global scale (shared across all variants)
+  - s_j          : a metadata-driven baseline scale (depends on variant
+                   type, length, repeat status — bigger for SVs than SNVs)
+  - lambda_j     : a per-variant local shrinkage factor that lets the model
+                   pull unimportant variants toward zero while letting
+                   important ones stay large
+
+Together:  tau_j^2 = (sigma_g * s_j)^2 * lambda_j
+
+The local shrinkage lambda_j uses a "three-parameter Beta" (TPB) prior
+(a type of heavy-tailed distribution), controlled by class-specific shape
+parameters (a_j, b_j).  Smaller shapes = heavier tails = more tolerance
+for large effects.
+
+Inference loop (variational EM)
+-------------------------------
+The algorithm iterates three steps until convergence:
+
+  1. **E-step (posterior)**: Given current prior variances, solve for the
+     best-fit effect sizes beta_j.  For continuous traits this uses REML
+     (restricted maximum likelihood); for binary traits it uses a
+     Newton trust-region optimizer with Polya-Gamma augmentation.
+
+  2. **Local scale update**: Given the fitted betas, update each variant's
+     local shrinkage lambda_j using Generalized Inverse Gaussian (GIG)
+     moments — think of this as re-calibrating how much each variant
+     should be shrunk toward zero.
+
+  3. **Hyperparameter update** (every 4th iteration): Re-estimate the
+     global scale sigma_g, the metadata scale-model coefficients, and
+     the TPB shape parameters (a_j, b_j) to better match the data.
+"""
 
 from __future__ import annotations
 
@@ -22,10 +72,18 @@ from sv_pgs.preprocessing import collapse_tie_groups
 
 @dataclass(slots=True)
 class PriorDesign:
-    design_matrix: np.ndarray
-    feature_names: list[str]
-    class_membership_matrix: np.ndarray
-    inverse_class_lookup: dict[int, VariantClass]
+    """Describes what we know about each variant *before* seeing the outcome data.
+
+    Each variant's "allowed effect size range" depends on its metadata:
+    variant type (SNV vs deletion vs duplication ...), length, whether it
+    overlaps a repeat region, etc.  This dataclass holds the matrices that
+    encode those relationships so the model can learn how metadata
+    predicts effect magnitude.
+    """
+    design_matrix: np.ndarray           # each row = one variant's metadata features
+    feature_names: list[str]            # human-readable names for each feature column
+    class_membership_matrix: np.ndarray # which variant class(es) each variant belongs to
+    inverse_class_lookup: dict[int, VariantClass]  # column index -> VariantClass enum
 
 
 @dataclass(slots=True)
@@ -47,12 +105,21 @@ class VariationalFitResult:
 
 @dataclass(slots=True)
 class PosteriorState:
-    alpha: np.ndarray
-    beta: np.ndarray
-    beta_variance: np.ndarray
-    linear_predictor: np.ndarray
-    collapsed_objective: float
-    sigma_error2: float
+    """Result of fitting effect sizes for one EM iteration.
+
+    The prediction model is:
+        predicted_trait = covariates_contribution + genotype_contribution
+                        = (covariates @ alpha)   + (genotypes @ beta)
+
+    alpha captures non-genetic effects (age, sex, PCs, intercept).
+    beta captures each variant's estimated effect on the trait.
+    """
+    alpha: np.ndarray          # covariate coefficients (intercept, age, sex, PCs ...)
+    beta: np.ndarray           # estimated effect size per variant (reduced/unique set)
+    beta_variance: np.ndarray  # uncertainty in each beta (larger = less confident)
+    linear_predictor: np.ndarray  # full predicted values for each sample
+    collapsed_objective: float    # model quality score (higher = better fit)
+    sigma_error2: float           # unexplained noise variance (fixed at 1.0 for binary)
 
 
 def fit_variational_em(
@@ -124,6 +191,11 @@ def fit_variational_em(
         posterior_local_scale = local_scale.copy()
         posterior_tpb_shape_a_vector = tpb_shape_a_vector.copy()
         posterior_tpb_shape_b_vector = tpb_shape_b_vector.copy()
+        # Build each variant's prior variance from three pieces:
+        #   1. global_scale — one number shared by all variants
+        #   2. metadata_baseline — per-variant, based on type/length/repeat
+        #   3. local_scale (lambda) — per-variant adaptive shrinkage
+        # A variant with large local_scale is "allowed" to have a big effect.
         metadata_baseline_scales = _metadata_baseline_scales_from_coefficients(
             scale_model_coefficients,
             prior_design.design_matrix,
@@ -151,7 +223,10 @@ def fit_variational_em(
         beta_state = posterior_state.beta
         sigma_error2 = posterior_state.sigma_error2
 
+        # How "big" is each variant's effect?  We need both the point estimate
+        # (beta^2) and the uncertainty (variance) to properly update the scales.
         reduced_second_moment = np.asarray(beta_state * beta_state + posterior_state.beta_variance, dtype=np.float64)
+        # Overall model quality = data fit + how well the shrinkage priors fit
         full_objective = posterior_state.collapsed_objective + _local_scale_prior_objective(
             local_scale=local_scale,
             auxiliary_delta=auxiliary_delta,
@@ -225,6 +300,10 @@ def fit_variational_em(
             local_shape_a = prior_design.class_membership_matrix @ tpb_shape_a_vector
             local_shape_b = prior_design.class_membership_matrix @ tpb_shape_b_vector
         local_scale = updated_local_scale
+        # Update the auxiliary rate parameter delta for each variant.
+        # delta controls how aggressively the prior pulls lambda (and thus
+        # beta) toward zero.  Variants with large local_scale get a smaller
+        # delta — the model "loosens" the leash on variants that look real.
         auxiliary_delta = (local_shape_a + local_shape_b) / np.maximum(1.0 + local_scale, config.local_scale_floor)
 
         parameter_change = _relative_parameter_change(
@@ -445,6 +524,15 @@ def _fit_collapsed_posterior(
     )
 
 
+# Fit effect sizes for a continuous trait (e.g. blood pressure, BMI).
+#
+# Strategy: build a covariance matrix that accounts for both random noise
+# (sigma_e^2) and the genotype-explained signal (via prior variances tau^2).
+# Then solve a weighted least-squares problem to get alpha (covariate effects)
+# and beta (variant effects).  Also re-estimate the noise variance sigma_e^2
+# by comparing predictions to actual values, correcting for model complexity
+# (leverage — variants the model is very confident about get less weight in
+# the noise estimate, to avoid double-counting).
 def _quantitative_posterior_state(
     genotype_matrix: StandardizedGenotypeMatrix | np.ndarray,
     covariate_matrix: np.ndarray,
@@ -479,11 +567,19 @@ def _quantitative_posterior_state(
             compute_logdet=True,
         )
     )
+    # Re-estimate noise variance.  Naive approach (just use residuals) would
+    # underestimate noise because the model "overfits" a little to noise.
+    # Leverage correction accounts for this: variants the model is very
+    # confident about (low variance relative to prior) contribute to the
+    # correction term, preventing the noise estimate from shrinking too fast.
     leverage_weight = np.maximum(prior_variances - beta_variance, 0.0) / np.maximum(prior_variances, 1e-12)
     residual_vector = targets - linear_predictor
     residual_sum_squares = float(np.dot(residual_vector, residual_vector))
     posterior_fit_uncertainty = sigma_error2 * float(np.sum(leverage_weight))
     sigma_error2_new = max((residual_sum_squares + posterior_fit_uncertainty) / sample_count, sigma_error_floor)
+    # Restricted log-likelihood: measures how well the model explains the data
+    # after accounting for model complexity (via log-determinant terms).
+    # Higher (less negative) = better fit with appropriate complexity.
     collapsed_objective = -0.5 * (
         restricted_quadratic
         + logdet_covariance
@@ -493,6 +589,21 @@ def _quantitative_posterior_state(
     return alpha, beta, beta_variance, linear_predictor, collapsed_objective, sigma_error2_new
 
 
+# Fit effect sizes for a binary trait (e.g. disease case/control).
+#
+# Binary traits can't use the simple least-squares approach above because
+# the outcome is 0/1, not continuous.  Instead we use logistic regression
+# with a Bayesian twist:
+#   - Convert the linear predictor to a probability via the sigmoid function
+#   - Use Newton's method with a "trust region" to find the best betas
+#   - The trust region (controlled by a damping parameter) prevents the
+#     optimizer from taking steps that are too large and overshooting
+#   - At each Newton step, we build a local quadratic approximation
+#     (iteratively reweighted least squares / IRLS) and solve it using
+#     the same linear algebra as the quantitative case
+#
+# The final objective is a Laplace approximation: the log-posterior at
+# its peak, corrected for the curvature (how "peaked" the posterior is).
 def _binary_posterior_state(
     genotype_matrix: StandardizedGenotypeMatrix | np.ndarray,
     covariate_matrix: np.ndarray,
@@ -523,6 +634,12 @@ def _binary_posterior_state(
     damping = float(initial_damping)
 
     def penalized_terms(current_parameters: np.ndarray) -> tuple[float, np.ndarray, np.ndarray, np.ndarray]:
+        """Compute the penalized log-posterior, its gradient, IRLS weights, and predictions.
+
+        The objective balances two things:
+          - Data fit: how well do the predicted probabilities match actual 0/1 outcomes
+          - Prior penalty: large betas are penalized (more so for small prior variance)
+        """
         alpha = current_parameters[:covariate_count]
         beta = current_parameters[covariate_count:]
         linear_predictor = covariate_matrix @ alpha + np.asarray(
@@ -530,6 +647,8 @@ def _binary_posterior_state(
             dtype=np.float64,
         )
         probabilities = np.asarray(stable_sigmoid(linear_predictor), dtype=np.float64)
+        # IRLS weights: p*(1-p).  Large near p=0.5 (uncertain samples contribute
+        # more to the update), small near 0 or 1 (confident predictions are stable).
         weights = np.maximum(probabilities * (1.0 - probabilities), minimum_weight)
         residual = targets - probabilities
         gradient_alpha = covariate_matrix.T @ residual
@@ -661,6 +780,11 @@ def _binary_posterior_state(
     )
 
 
+# Defines the covariance matrix V = D + X @ diag(tau^2) @ X^T as a
+# "matrix-free" operator — we never build V explicitly (it would be
+# n_samples x n_samples, way too big), instead we define how to multiply
+# V times a vector.  This lets us solve V^{-1} @ b using iterative methods
+# (conjugate gradient) without ever storing the full matrix.
 def _sample_space_operator(
     genotype_matrix: StandardizedGenotypeMatrix,
     prior_variances: np.ndarray,
@@ -719,7 +843,14 @@ def _restricted_posterior_state(
     variant_count = genotype_matrix.shape[1]
     use_woodbury = sample_count > exact_solver_matrix_limit and variant_count <= exact_solver_matrix_limit
 
+    # Three solver strategies, chosen by problem size:
+    #   1. Small sample count: build the full covariance matrix and solve directly
+    #   2. Few variants but many samples: use the Woodbury identity (matrix algebra
+    #      trick that inverts a big matrix via a small one — see below)
+    #   3. Large in both dimensions: use conjugate gradient (iterative solver
+    #      that never builds the full matrix, just multiplies it by vectors)
     if sample_count <= exact_solver_matrix_limit:
+        # Strategy 1: Direct solve.  Build V = D + X tau^2 X^T explicitly.
         log(f"    restricted posterior: exact sample-space Cholesky for n={sample_count}")
         covariance_matrix = np.diag(diagonal_noise)
         for batch in genotype_matrix.iter_column_batches(batch_size=posterior_variance_batch_size):
@@ -737,8 +868,11 @@ def _restricted_posterior_state(
         logdet_covariance = 2.0 * float(np.sum(np.log(np.diag(cholesky_factor)))) if compute_logdet else 0.0
 
     elif use_woodbury:
-        # Woodbury identity: (D + X S X^T)^{-1} = D^{-1} - D^{-1} X (S^{-1} + X^T D^{-1} X)^{-1} X^T D^{-1}
-        # Solves via p×p Cholesky (p=variants ≤ 2048) instead of CG on n×n (n=447k).
+        # Strategy 2: Woodbury identity.  Instead of inverting the huge
+        # n_samples x n_samples matrix V, we rearrange the algebra to
+        # invert a much smaller n_variants x n_variants matrix.  This works
+        # because V = D + X S X^T has low rank relative to sample count.
+        # Result: exact solve, but O(p^3) instead of O(n^3).
         log(f"    restricted posterior: Woodbury variant-space Cholesky (p={variant_count}, n={sample_count})  mem={mem()}")
         inv_diag = 1.0 / np.maximum(diagonal_noise, 1e-12)
         # Use JAX for the big matmul (benefits from GPU if available)
@@ -772,6 +906,8 @@ def _restricted_posterior_state(
             logdet_covariance = 0.0
 
     else:
+        # Strategy 3: Conjugate gradient.  Iteratively approximates V^{-1} b
+        # by repeatedly multiplying V times vectors.  Never stores V itself.
         log(f"    restricted posterior: conjugate-gradient sample-space solve (p={variant_count}, n={sample_count})")
         covariance_operator = _sample_space_operator(genotype_matrix, prior_variances, diagonal_noise)
 
@@ -797,6 +933,9 @@ def _restricted_posterior_state(
             else 0.0
         )
 
+    # Step 1: Estimate covariate effects (alpha) via generalized least squares.
+    # This "projects out" the covariates so variant effects aren't confounded
+    # by population structure, age, sex, etc.
     solve_rhs_function: Callable[[np.ndarray], np.ndarray] = solve_rhs
     gls_normal_matrix = covariate_matrix.T @ inverse_covariance_covariates + np.eye(covariate_matrix.shape[1]) * 1e-8
     gls_cholesky = np.linalg.cholesky(gls_normal_matrix)
@@ -804,10 +943,16 @@ def _restricted_posterior_state(
         _cholesky_solve(gls_cholesky, covariate_matrix.T @ inverse_covariance_targets),
         dtype=np.float64,
     )
+    # Step 2: Remove covariate contribution from the targets, leaving only
+    # the part that genetic variants need to explain.
     projected_targets: np.ndarray = np.asarray(
         inverse_covariance_targets - inverse_covariance_covariates @ alpha,
         dtype=np.float64,
     )
+    # Step 3: Recover variant effect sizes (beta).  Each beta is proportional
+    # to how much that variant's genotype column correlates with the residual,
+    # weighted by that variant's prior variance (variants we trust more a priori
+    # get to keep more of their observed correlation).
     beta = np.asarray(
         prior_variances * np.asarray(genotype_matrix.transpose_matvec(projected_targets), dtype=np.float64),
         dtype=np.float64,
@@ -843,6 +988,11 @@ def _restricted_posterior_state(
     )
 
 
+# Compute the "leverage" of each variant — how much influence it has on
+# its own predicted value.  High leverage = the model is very confident
+# about this variant's effect.  We need this to compute posterior variance
+# (uncertainty) for each beta: Var(beta_j) = tau_j^2 - tau_j^4 * h_j
+# where h_j is the leverage.  Computed in batches to limit memory usage.
 def _restricted_cross_leverage_diagonal(
     genotype_matrix: StandardizedGenotypeMatrix,
     covariate_matrix: np.ndarray,
@@ -869,6 +1019,16 @@ def _restricted_cross_leverage_diagonal(
     return leverage_diagonal
 
 
+# Build the metadata design matrix for the prior scale model.
+#
+# Each variant gets a row of features describing its properties:
+#   - Type indicators (one per variant class: SNV, deletion, duplication, ...)
+#   - log(length) polynomial (linear + quadratic) per class — longer SVs
+#     may have different effect size distributions
+#   - Repeat region indicator, copy number indicator
+#
+# These features let the model learn, e.g., "long deletions in repeat
+# regions tend to have larger effects" and set prior variances accordingly.
 def _build_prior_design(records: Sequence[VariantRecord]) -> PriorDesign:
     unique_classes = sorted(
         {
@@ -978,6 +1138,16 @@ def _initialize_scale_model(
     return initialized_global_scale, coefficients.astype(np.float64)
 
 
+# Re-estimate the global scale and metadata coefficients.
+#
+# Idea: given the fitted betas and local scales, what global scale and
+# metadata weights best explain the observed pattern of effect sizes?
+#
+# We work in log-space (log of the target scale per variant) and fit a
+# ridge regression of metadata features against these log-scales.  The
+# global scale is updated via the median residual (robust to outliers).
+# Uses damped iteration (50% blending with previous coefficients) for
+# stability.
 def _update_scale_model(
     reduced_second_moment: np.ndarray,
     local_scale: np.ndarray,
@@ -1065,6 +1235,16 @@ def _initialize_tpb_shape_b_vector(
     )
 
 
+# Update the TPB shape parameters (a, b) for each variant class.
+#
+# These shapes control the "tail weight" of the shrinkage prior:
+#   - Smaller a,b = heavier tails = more tolerance for large effects
+#   - Larger a,b  = lighter tails = more shrinkage toward zero
+#
+# SVs (deletions, duplications) get smaller shapes than SNVs because they
+# tend to have larger individual effects.  We optimize (a, b) by gradient
+# ascent on the marginal likelihood of the local scales, with a
+# hierarchical penalty that keeps classes from diverging too much.
 def _update_tpb_shape_vectors(
     class_membership_matrix: np.ndarray,
     current_shape_a_vector: np.ndarray,
@@ -1197,6 +1377,10 @@ def _unpack_theta(theta: np.ndarray) -> tuple[float, np.ndarray]:
     return float(np.exp(theta[0])), np.asarray(theta[1:], dtype=np.float64)
 
 
+# Log-probability of the local shrinkage factors under the TPB prior.
+# This is the "regularization" contribution to the overall objective:
+# it penalizes implausibly large or small local scales, with the penalty
+# shape determined by the class-specific (a, b) parameters.
 def _local_scale_prior_objective(
     local_scale: np.ndarray,
     auxiliary_delta: np.ndarray,
@@ -1218,6 +1402,20 @@ def _local_scale_prior_objective(
     )
 
 
+# Update the per-variant local shrinkage factors (lambda_j).
+#
+# Each variant's lambda controls how much its effect gets pulled toward
+# zero.  A variant with strong evidence (large beta^2 relative to its
+# baseline prior) will get a large lambda ("let it through"), while a
+# variant with weak evidence gets a small lambda ("shrink it to zero").
+#
+# The optimal lambda comes from a Generalized Inverse Gaussian (GIG)
+# distribution — a family that naturally arises when you combine a
+# Gaussian likelihood with a Gamma prior.  We compute its expected value
+# using modified Bessel functions (via TensorFlow Probability).
+#
+# We alternate between updating lambda and its auxiliary rate delta in a
+# fixed-point loop (typically converges in 2-3 iterations).
 def _update_local_scales(
     coefficient_second_moment: np.ndarray,
     baseline_prior_variances: np.ndarray,
@@ -1264,6 +1462,17 @@ def _update_local_scales(
     return updated_local_scale, current_auxiliary_delta
 
 
+# Compute the expected value of X^r where X ~ GIG(p, chi, psi).
+#
+# The Generalized Inverse Gaussian is the conjugate distribution that
+# appears when you combine a Gaussian likelihood (the data) with a Gamma
+# prior (the shrinkage).  Its moments involve ratios of modified Bessel
+# functions K_v(z).  We use the exponentially-scaled version (kve) for
+# numerical stability — the exponential scaling cancels in the ratio.
+#
+# In our context: p = shape_a - 0.5, chi = beta^2 / baseline_variance,
+# psi = 2 * delta.  The result E[lambda] tells us how much to shrink
+# each variant.
 def _gig_moment(
     p_parameter: np.ndarray,
     chi: np.ndarray,
@@ -1295,6 +1504,10 @@ def _gig_moment(
     )
 
 
+# When multiple variants are identical (tied), they share one representative
+# in the reduced model.  This function spreads the representative's prior
+# variance back to all group members, dividing equally among them — each
+# tied variant gets 1/k of the group's variance (k = group size).
 def _expand_group_prior_variances_to_members(
     reduced_prior_variances: np.ndarray,
     tie_map: TieMap,
@@ -1342,6 +1555,9 @@ def _relative_change(current_values: np.ndarray, previous_values: np.ndarray | N
     return float(np.linalg.norm(current_values - previous_values) / denominator)
 
 
+# Evaluate model performance on held-out validation data.
+# For binary traits: mean cross-entropy loss (lower = better predictions).
+# For quantitative traits: mean squared error (lower = better predictions).
 def _validation_metric(
     trait_type: TraitType,
     genotype_matrix: StandardizedGenotypeMatrix | np.ndarray,
@@ -1367,6 +1583,10 @@ def _validation_metric(
     return float(np.mean(residual_vector * residual_vector))
 
 
+# Adjust the intercept so that the model's average predicted prevalence
+# matches the observed prevalence in the training data.  Uses a few
+# Newton-Raphson steps on the logistic likelihood with respect to the
+# intercept only — fast because it's a 1D optimization.
 def _calibrate_binary_intercept(
     linear_predictor: np.ndarray,
     targets: np.ndarray,

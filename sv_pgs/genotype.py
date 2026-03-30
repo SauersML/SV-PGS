@@ -11,17 +11,19 @@ import jax.numpy as jnp
 import numpy as np
 from bed_reader import open_bed
 
-DEFAULT_GENOTYPE_BATCH_SIZE = 1024
+DEFAULT_GENOTYPE_BATCH_SIZE = 1024  # variants per batch when streaming from disk
 
-# Memory cap per bed_reader batch based on actual JAX working memory, not raw read size.
-# The int8 screening kernel expands to float32 intermediates (~10 bytes/element peak),
-# so budget for total working memory, not just the raw int8 read.
-# 500 MB / 447k samples ≈ 1118 variants → ~4.3 GB float32 peak → fits 14.6 GB easily.
+# Memory cap per bed_reader batch.  PLINK .bed files store genotypes on disk
+# as 2 bits per sample, but we expand to int8 or float32 in memory.  The JAX
+# screening kernels also create float32 intermediates (~10 bytes/element peak).
+# This budget ensures each batch fits comfortably in GPU/CPU memory:
+#   500 MB / (447k samples * 4 bytes) ≈ 279 variants per batch
 BED_READER_TARGET_BATCH_BYTES = 500_000_000
-MIN_BED_READER_BATCH_SIZE = 32
+MIN_BED_READER_BATCH_SIZE = 32  # always read at least this many variants
 
-# Auto-materialize threshold: if the reduced EM genotype matrix fits in this
-# many bytes, cache it in RAM to avoid re-reading from disk on every EM iteration.
+# If the reduced genotype matrix (after tie-group dedup) is smaller than 4 GB,
+# cache it in RAM.  This avoids re-reading from disk on every EM iteration
+# (typically 10-30 iterations), giving a huge speedup.
 MATERIALIZE_THRESHOLD_BYTES = 4_000_000_000  # 4 GB
 
 
@@ -38,6 +40,16 @@ class RawGenotypeBatch:
 
 
 class RawGenotypeMatrix(ABC):
+    """Abstract base for genotype matrices (samples x variants).
+
+    Values are dosages: 0 = homozygous reference, 1 = heterozygous,
+    2 = homozygous alternate, NaN = missing.  Subclasses handle different
+    storage backends (in-memory numpy array vs on-disk PLINK .bed file).
+
+    All access is through streaming iterators (iter_column_batches) that
+    read a few hundred variants at a time, keeping memory bounded even for
+    biobank-scale data (e.g. 447k samples x 900k variants).
+    """
     @property
     @abstractmethod
     def shape(self) -> tuple[int, int]:
@@ -248,10 +260,20 @@ class PlinkRawGenotypeMatrix(RawGenotypeMatrix):
 
 @dataclass(slots=True)
 class StandardizedGenotypeMatrix:
+    """A genotype matrix that applies z-score standardization on the fly.
+
+    For each variant j: standardized_value = (raw_dosage - mean_j) / scale_j
+    Missing values (NaN) are imputed to the mean (producing 0 after centering).
+
+    This wraps a RawGenotypeMatrix and applies the transformation lazily during
+    iteration, so we never need to store the full standardized matrix unless
+    we choose to cache it (try_materialize).  Supports matrix-vector products
+    (matvec, transpose_matvec) needed by the Bayesian inference engine.
+    """
     raw: RawGenotypeMatrix
-    means: np.ndarray
-    scales: np.ndarray
-    variant_indices: np.ndarray
+    means: np.ndarray       # per-variant mean from training data
+    scales: np.ndarray      # per-variant std dev from training data
+    variant_indices: np.ndarray  # which columns of raw to use (for subsetting)
     _dense_cache: np.ndarray | None = field(init=False, default=None, repr=False)
 
     def __post_init__(self) -> None:
@@ -344,6 +366,11 @@ class StandardizedGenotypeMatrix:
         return matrix
 
     def matvec(self, coefficients: np.ndarray | jnp.ndarray, batch_size: int = DEFAULT_GENOTYPE_BATCH_SIZE) -> jnp.ndarray:
+        """Compute X_std @ beta (genotype matrix times coefficient vector).
+
+        Returns one value per sample: each sample's polygenic score contribution
+        from the genetic variants.  Done in batches to bound memory.
+        """
         coefficient_vector = jnp.asarray(coefficients, dtype=jnp.float64)
         if coefficient_vector.ndim != 1 or coefficient_vector.shape[0] != self.shape[1]:
             raise ValueError("coefficient vector must match genotype column count.")
@@ -358,6 +385,12 @@ class StandardizedGenotypeMatrix:
         return jnp.asarray(result, dtype=jnp.float64)
 
     def transpose_matvec(self, vector: np.ndarray | jnp.ndarray, batch_size: int = DEFAULT_GENOTYPE_BATCH_SIZE) -> jnp.ndarray:
+        """Compute X_std^T @ v (transpose times a sample-length vector).
+
+        Returns one value per variant: the correlation of each variant's
+        genotype column with the input vector.  Used to compute gradients
+        and recover posterior mean effect sizes.
+        """
         sample_vector = jnp.asarray(vector, dtype=jnp.float64)
         if sample_vector.ndim != 1 or sample_vector.shape[0] != self.shape[0]:
             raise ValueError("sample vector must match genotype row count.")
@@ -396,6 +429,10 @@ def _resolve_variant_indices(
     return resolved_indices
 
 
+# Cap the batch size so each batch doesn't exceed the memory budget.
+# With 447k samples at 4 bytes (float32) each, one variant = ~1.7 MB.
+# At the 500 MB budget that's ~279 variants per batch.  We also enforce
+# a minimum of 32 variants per batch to avoid excessive I/O overhead.
 def _effective_bed_reader_batch_size(
     sample_count: int,
     requested_batch_size: int,
@@ -409,6 +446,9 @@ def _effective_bed_reader_batch_size(
     return max(1, min(requested_batch_size, max(memory_capped_batch_size, MIN_BED_READER_BATCH_SIZE)))
 
 
+# Optimization: if the requested variant indices are consecutive (e.g. [5,6,7,8]),
+# convert to a slice (5:9) which bed_reader can read much faster (sequential disk I/O)
+# than random-access indexing.  Falls back to an index array for non-contiguous indices.
 def _contiguous_index_or_slice(indices: np.ndarray) -> slice | np.ndarray:
     resolved_indices = np.asarray(indices, dtype=np.intp)
     if resolved_indices.ndim != 1:
@@ -424,6 +464,11 @@ def _contiguous_index_or_slice(indices: np.ndarray) -> slice | np.ndarray:
     return np.ascontiguousarray(resolved_indices, dtype=np.intp)
 
 
+# Z-score standardize a batch of genotype columns:
+#   1. Replace NaN (missing) with the variant's mean (mean imputation)
+#   2. Subtract the mean (centering)
+#   3. Divide by the standard deviation (scaling)
+# After this, each variant column has mean ~0 and std ~1.
 def _standardize_batch(batch: np.ndarray, means: np.ndarray, scales: np.ndarray) -> np.ndarray:
     mean_vector = np.asarray(means, dtype=np.float32)
     scale_vector = np.asarray(scales, dtype=np.float32)

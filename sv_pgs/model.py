@@ -40,6 +40,24 @@ class FittedState:
 
 
 class BayesianPGS:
+    """Main entry point for fitting and applying a Bayesian Polygenic Score.
+
+    A PGS predicts a trait (disease risk or continuous measurement) from an
+    individual's genotypes across many variants.  This implementation uses a
+    Bayesian approach that:
+
+      1. Automatically learns which variants matter (most get shrunk to ~zero)
+      2. Gives structural variants (deletions, duplications, etc.) wider priors
+         than SNVs, reflecting their potentially larger per-variant effects
+      3. Handles hundreds of thousands of samples and variants via streaming
+         genotype I/O, GPU-accelerated statistics, and efficient linear algebra
+
+    Typical workflow:
+        model = BayesianPGS(config)
+        model.fit(genotypes, covariates, targets, variant_records)
+        predictions = model.predict(new_genotypes, new_covariates)
+        model.export("model.npz")
+    """
     def __init__(self, config: ModelConfig) -> None:
         self.config = config
         self.state: FittedState | None = None
@@ -164,6 +182,12 @@ class BayesianPGS:
         return self
 
     def decision_function(self, genotypes: RawGenotypeMatrix | np.ndarray, covariates: np.ndarray) -> np.ndarray:
+        """Compute the raw linear predictor (before sigmoid for binary traits).
+
+        For each individual: score = sum_j(beta_j * standardized_genotype_j) + covariates @ alpha.
+        Only reads variants with non-zero coefficients (typically <1% of all variants),
+        making prediction fast even on huge genotype files.
+        """
         from sv_pgs.progress import log, mem
         fitted_state = self._require_state()
         covariate_matrix = self._with_intercept(np.asarray(covariates, dtype=np.float32))
@@ -189,6 +213,10 @@ class BayesianPGS:
         return genotype_component + covariate_matrix @ fitted_state.fit_result.alpha
 
     def predict_proba(self, genotypes: RawGenotypeMatrix | np.ndarray, covariates: np.ndarray) -> np.ndarray:
+        """For binary traits: convert the linear predictor to probabilities via sigmoid.
+
+        Returns an (n_samples, 2) array with columns [P(control), P(case)].
+        """
         if self.config.trait_type != TraitType.BINARY:
             raise ValueError("predict_proba is only available for binary traits.")
         linear_predictor = self.decision_function(genotypes, covariates)
@@ -297,6 +325,11 @@ def _nonzero_coefficient_cache(coefficients: np.ndarray) -> tuple[np.ndarray, np
     return nonzero_indices, np.asarray(coefficient_array[nonzero_indices], dtype=np.float32)
 
 
+# Compute genotypes @ coefficients for a subset of variants, standardizing
+# on the fly.  This avoids materializing the full standardized genotype
+# matrix — instead we read raw genotypes in batches, standardize each batch,
+# multiply by the corresponding coefficients, and accumulate the result.
+# This is the inner loop of prediction and is I/O-bound for PLINK files.
 def _raw_standardized_subset_matvec(
     raw_genotypes: RawGenotypeMatrix,
     variant_indices: np.ndarray,
@@ -318,6 +351,10 @@ def _raw_standardized_subset_matvec(
     return result
 
 
+# The tie map was built in "active variant space" (indices 0..n_active-1).
+# This function translates those indices back to the original variant numbering
+# so the exported model can be applied to new genotype files that use the
+# original variant ordering.
 def _project_tie_map_to_original_space(
     reduced_tie_map: TieMap,
     active_variant_indices: np.ndarray,
@@ -342,6 +379,12 @@ def _project_tie_map_to_original_space(
     )
 
 
+# When expanding a single group effect back to individual members, how much
+# weight does each member get?  We split proportional to each member's prior
+# variance — variants the model trusted more a priori get a larger share of
+# the group's fitted coefficient.  This is fairer than equal splitting when
+# group members differ in type (e.g. a deletion and a duplication tied
+# together).
 def _tie_group_export_weights(
     tie_map: TieMap,
     fit_result: VariationalFitResult,
@@ -437,7 +480,13 @@ def _compute_support_counts(
     records: Sequence[VariantRecord],
     config: ModelConfig,
 ) -> np.ndarray:
-    """Compute support counts only for structural variants that still need them."""
+    """Count how many individuals carry each structural variant.
+
+    "Support" = number of samples with a non-zero dosage (|dosage| > 0.5).
+    Only computed for SVs that don't already have a support count from
+    metadata.  SNVs/indels skip this step entirely.  Low-support SVs will
+    be filtered out before model fitting to avoid noisy estimates.
+    """
     support_counts = np.zeros(len(records), dtype=np.int32)
     unresolved_structural_variant_indices: list[int] = []
     for variant_index, record in enumerate(records):

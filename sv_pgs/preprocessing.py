@@ -21,7 +21,18 @@ from sv_pgs.genotype import (
 
 @jax.jit
 def _batch_all_stats_i8(batch_i8: jnp.ndarray) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray]:
-    """Single-pass JIT on int8 genotypes. Float32 intermediates, float64 accumulators."""
+    """Compute per-variant statistics from a batch of int8 genotypes (PLINK path).
+
+    For each variant (column), computes in one pass over the data:
+      - sum of non-missing dosages (0/1/2)
+      - count of non-missing samples
+      - support count (number of carriers, i.e. dosage > 0)
+      - centered sum of squares (CSS) — used to derive the standard deviation
+
+    Missing values are encoded as -127 in PLINK's int8 format.
+    Mean-imputation is applied before computing CSS so that missing samples
+    don't bias the variance estimate.
+    """
     mask = batch_i8 != -127
     values_f32 = jnp.where(mask, batch_i8.astype(jnp.float32), 0.0)
 
@@ -43,11 +54,17 @@ def _batch_all_stats_with_screening_i8(
     batch_i8: jnp.ndarray,
     residual: jnp.ndarray,
 ) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray]:
-    """Single-pass JIT: stats (float64) + screening (float32) on int8 genotypes.
+    """Same as _batch_all_stats_i8, but also computes a "screening score" per variant.
 
-    Uses float64 for precise sums/means/css over 447k samples,
-    but float32 for screening scores (precision not critical for ranking).
-    Halves memory bandwidth for the screening matmul.
+    The screening score measures how strongly each variant correlates with
+    the residual (trait values after removing covariate effects).  Variants
+    with high scores are likely to have real associations.  This lets us
+    optionally pre-filter variants before the expensive EM loop.
+
+    The score is: |X_standardized^T @ residual|  (absolute correlation).
+
+    Uses float64 for precise sums/means/css over ~447k samples, but float32
+    for the screening matrix multiply (precision isn't critical for ranking).
     """
     mask = batch_i8 != -127
     # Work in float32 throughout to halve memory (3354 × 447k × 4 = 6 GB vs 12 GB)
@@ -125,8 +142,21 @@ def compute_variant_statistics(
 ) -> VariantStatistics:
     """Compute all per-variant statistics in a SINGLE pass over the genotype data.
 
-    If covariates and targets are provided, also computes marginal screening
-    scores in the same pass (avoiding a separate screening pass later).
+    This is one of the most expensive operations in the pipeline — it reads
+    every genotype value once.  For ~900k variants x ~447k samples, that's
+    ~400 billion values.  We do it in batches on GPU/CPU via JAX to keep
+    memory bounded.
+
+    For each variant, we compute:
+      - mean dosage (used for standardization and allele frequency)
+      - standard deviation (used for standardization — z-scoring)
+      - carrier count (how many individuals carry the non-ref allele)
+      - optionally, a screening score (correlation with the trait residual)
+
+    If covariates and targets are provided, the screening residual is
+    computed first by regressing out covariates (OLS), so scores reflect
+    the variant's association with the trait *after* adjusting for
+    population structure, age, sex, etc.
     """
     from sv_pgs.progress import log, mem
     variant_count = raw_genotypes.shape[1]
@@ -134,7 +164,9 @@ def compute_variant_statistics(
     batch_size = config.genotype_batch_size
     n_batches = (variant_count + batch_size - 1) // batch_size
 
-    # Compute residual for screening if covariates/targets provided
+    # Compute the trait residual for screening: residual = y - C @ (C^T C)^{-1} C^T y
+    # This removes covariate effects so the screening score reflects
+    # each variant's marginal association with the trait itself.
     compute_scores = covariates is not None and targets is not None
     residual_jax: jnp.ndarray | None = None
     jax_backend = jax.default_backend()
@@ -196,6 +228,12 @@ def compute_variant_statistics(
             est_total = _dt * ((variant_count - variants_done) / max(len(idx), 1)) if batch_number >= 2 else 0
             log(f"  {variants_done}/{variant_count} ({100*variants_done//variant_count}%)  batch={_dt:.1f}s  est_remaining={est_total/60:.0f}min  mem={mem()}")
 
+    # Convert raw sums to per-variant statistics:
+    #   mean = sum / count (average dosage; range 0-2 for biallelic)
+    #   allele_frequency = mean / 2 (fraction of alleles that are non-ref)
+    #   scale = sqrt(CSS / n) = standard deviation (for z-score standardization)
+    # Variants with near-zero scale (monomorphic) get scale=1 to avoid
+    # division by zero during standardization — they'll have ~zero effect.
     means = np.divide(
         sums, np.maximum(non_missing_counts, 1),
         out=np.zeros_like(sums), where=non_missing_counts > 0,
@@ -216,8 +254,17 @@ def compute_variant_statistics(
 
 @dataclass(slots=True)
 class Preprocessor:
-    means: np.ndarray
-    scales: np.ndarray
+    """Stores per-variant mean and standard deviation learned during training.
+
+    Used to standardize (z-score) genotype matrices: for each variant,
+    subtract the mean and divide by the standard deviation.  This puts
+    all variants on a comparable scale regardless of allele frequency,
+    which is important for the Bayesian model to assign appropriate
+    shrinkage.  Missing genotypes are imputed to the variant's mean
+    (i.e. they contribute zero after standardization).
+    """
+    means: np.ndarray   # per-variant mean dosage (from training data)
+    scales: np.ndarray   # per-variant standard deviation
 
     def transform(self, genotypes: RawGenotypeMatrix | np.ndarray) -> StandardizedGenotypeMatrix | np.ndarray:
         raw_genotypes = as_raw_genotype_matrix(genotypes)
@@ -310,7 +357,14 @@ def select_active_variant_indices(
     support_counts: np.ndarray,
     config: ModelConfig,
 ) -> np.ndarray:
-    """Select active variants using pre-computed support counts (no data pass needed)."""
+    """Filter out structural variants with too few carriers.
+
+    SVs with very few carriers (< minimum_structural_variant_carriers,
+    default=5) have unreliable effect estimates and can cause numerical
+    instability.  SNVs and small indels are always kept regardless of
+    carrier count — they're more reliably genotyped and common enough
+    in array data.
+    """
     from sv_pgs.progress import log
     n_total = len(variant_records)
     active_flags = np.ones(n_total, dtype=bool)
@@ -357,6 +411,18 @@ def _infer_support_count_from_raw_genotypes(
     return int(np.count_nonzero(rounded_values > 0.0))
 
 
+# Detect groups of variants that have identical (or exactly negated) genotype
+# columns across all samples.  These "tied" variants are perfectly collinear
+# and would cause the model to split their effects arbitrarily.
+#
+# Instead, we keep one representative per group and fit a single effect for
+# the group.  After fitting, the effect is redistributed to all group members
+# proportional to their prior variances (variants the model trusts more
+# a priori get a larger share).
+#
+# Comparison uses exact float32 byte equality on the standardized columns.
+# Negated columns (e.g. a deletion and its reciprocal duplication) are also
+# detected and assigned a -1 sign so the effect is flipped when expanded.
 def build_tie_map(
     genotypes: StandardizedGenotypeMatrix | np.ndarray,
     records: Sequence[VariantRecord],
@@ -439,6 +505,11 @@ def build_tie_map(
     )
 
 
+# Create one merged record per tie group for use in the reduced model.
+# If all members share the same variant class, the group keeps that class.
+# If members span multiple classes (e.g. a deletion and a complex SV that
+# happen to have identical genotype patterns), the group is labeled
+# OTHER_COMPLEX_SV and its prior becomes a weighted average of all classes.
 def collapse_tie_groups(
     records: Sequence[VariantRecord],
     tie_map: TieMap,

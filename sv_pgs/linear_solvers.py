@@ -1,3 +1,20 @@
+"""Iterative linear algebra solvers for large-scale Bayesian inference.
+
+These solvers avoid building huge matrices (n_samples x n_samples) by
+working with "operators" — objects that know how to multiply by a vector
+but never store the full matrix.  This is essential when the sample count
+is in the hundreds of thousands.
+
+Two key algorithms:
+  1. Conjugate Gradient (CG): iteratively solves Ax = b for symmetric
+     positive-definite A.  Think of it as finding the bottom of a bowl
+     by sliding downhill, with each step orthogonal to the previous one.
+
+  2. Stochastic Lanczos Quadrature: estimates log(det(A)) — a measure of
+     the "volume" of the covariance matrix — without computing eigenvalues.
+     Uses random probe vectors and a tridiagonal approximation.  This is
+     needed for the restricted log-likelihood (model quality score).
+"""
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -23,6 +40,11 @@ def build_linear_operator(
     return LinearOperator(shape=shape, matvec=matvec, matmat=matmat)
 
 
+# Solve the linear system A @ x = b where A is symmetric positive-definite.
+# Uses conjugate gradient (CG) — an iterative method that converges in at
+# most n steps for an n x n matrix, but usually much fewer with a good
+# preconditioner or well-conditioned system.  Handles both single vectors
+# and matrices (solving column by column).
 def solve_spd_system(
     operator: LinearOperator | np.ndarray | jnp.ndarray,
     right_hand_side: np.ndarray | jnp.ndarray,
@@ -60,6 +82,16 @@ def solve_spd_system(
     return np.column_stack(solution_columns).astype(np.float64, copy=False)
 
 
+# Estimate log(determinant(A)) without computing the full eigendecomposition.
+#
+# Why we need this: the restricted log-likelihood includes a log-det term
+# that measures model complexity.  For a 447k x 447k matrix, computing
+# eigenvalues directly is infeasible.
+#
+# How it works: shoot random probe vectors through the matrix, build a
+# small tridiagonal approximation (Lanczos), compute eigenvalues of that
+# small matrix, and average.  Each probe gives a noisy estimate of
+# log(det); averaging over several probes reduces variance.
 def stochastic_logdet(
     operator: LinearOperator | np.ndarray | jnp.ndarray,
     dimension: int,
@@ -99,6 +131,17 @@ def _as_linear_operator(operator: LinearOperator | np.ndarray | jnp.ndarray) -> 
     )
 
 
+# Conjugate Gradient (CG) for a single right-hand side vector.
+#
+# Starting from an initial guess (or zero), iteratively refine the
+# solution by:
+#   1. Compute the residual r = b - A @ x (how far off we are)
+#   2. Pick a search direction (conjugate to all previous directions)
+#   3. Take an optimal step along that direction
+#   4. Repeat until ||residual|| < tolerance
+#
+# Each iteration requires one matrix-vector product (A @ direction).
+# Convergence is guaranteed for positive-definite A.
 def _solve_single_rhs(
     linear_operator: LinearOperator,
     rhs: jnp.ndarray,
@@ -129,6 +172,16 @@ def _solve_single_rhs(
     raise RuntimeError("Conjugate-gradient solve failed to converge.")
 
 
+# Build a small tridiagonal matrix that approximates the large operator A.
+#
+# Lanczos algorithm: starting from a random vector, repeatedly multiply
+# by A and orthogonalize.  After k steps we have a k x k tridiagonal
+# matrix T whose eigenvalues approximate those of A — like reading the
+# "cliff notes" version of a huge matrix.  The eigenvalues of T are used
+# to estimate log(det(A)) in the stochastic_logdet function above.
+#
+# The reorthogonalization loop (inner for-loop) prevents numerical
+# instability where basis vectors slowly lose orthogonality.
 def _lanczos_tridiagonal(
     linear_operator: LinearOperator,
     start_vector: jnp.ndarray,
