@@ -518,16 +518,16 @@ def _load_vcf(
 
     log(f"parsed {n_total} variants in {elapsed:.1f}s ({n_total / elapsed:.0f} variants/s)")
 
-    # Stack as int8, then convert to float32 with -127 → NaN
-    int8_mb = n_keep * n_total / 1e6
-    log(f"stacking int8 dosage matrix ({n_keep} samples x {n_total} variants, {int8_mb:.1f} MB)...")
-    int8_matrix = np.column_stack(dosage_columns)  # (n_keep, n_variants) int8
+    # Write int8 columns directly into pre-allocated float32 matrix.
+    # This avoids ever holding both an int8 and float32 copy simultaneously.
+    matrix_gb = n_keep * n_total * 4 / 1e9
+    log(f"building float32 matrix ({n_keep} samples x {n_total} variants, {matrix_gb:.1f} GB)...")
+    genotype_matrix = np.empty((n_keep, n_total), dtype=np.float32)
+    for col_idx, col in enumerate(dosage_columns):
+        # Convert int8 column to float32 in-place into the output matrix
+        np.copyto(genotype_matrix[:, col_idx], col, casting="unsafe")
     del dosage_columns
-    log(f"int8 matrix stacked  mem={mem()}")
-
-    log("converting int8 → float32 (with -127 → NaN)...")
-    genotype_matrix = int8_matrix.astype(np.float32)
-    del int8_matrix
+    # Replace missing sentinel (-127 → NaN)
     genotype_matrix[genotype_matrix == -127.0] = np.nan
     matrix_mb = genotype_matrix.nbytes / 1e6
     log(f"genotype matrix ready: {genotype_matrix.shape}, {matrix_mb:.1f} MB  mem={mem()}")
