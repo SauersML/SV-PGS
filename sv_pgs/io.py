@@ -383,11 +383,24 @@ def _resolve_sample_id_column(
 
 
 def _load_vcf(vcf_path: Path) -> tuple[list[str], np.ndarray, list[_VariantDefaults]]:
+    from sv_pgs.progress import log, mem
+    import time
+
+    # Report file size before starting
+    vcf_size_bytes = vcf_path.stat().st_size
+    vcf_size_mb = vcf_size_bytes / 1e6
+    log(f"opening VCF: {vcf_path.name} ({vcf_size_mb:.1f} MB)")
+
     reader = VCF(str(vcf_path))
     reader.set_threads(1)
     sample_ids = [str(sample_id) for sample_id in reader.samples]
+    log(f"VCF has {len(sample_ids)} samples")
     dosage_columns: list[np.ndarray] = []
     variants: list[_VariantDefaults] = []
+
+    t_start = time.monotonic()
+    last_log_time = t_start
+    last_chrom = None
 
     for record in reader:
         if len(record.ALT) != 1:
@@ -409,9 +422,34 @@ def _load_vcf(vcf_path: Path) -> tuple[list[str], np.ndarray, list[_VariantDefau
             )
         )
 
+        n = len(variants)
+        now = time.monotonic()
+        chrom = str(record.CHROM)
+
+        # Log on chromosome change
+        if chrom != last_chrom:
+            if last_chrom is not None:
+                log(f"  chromosome {last_chrom} done — {n} variants so far  mem={mem()}")
+            last_chrom = chrom
+            last_log_time = now
+
+        # Log every 5 seconds for long loads
+        elif now - last_log_time >= 5.0:
+            rate = n / (now - t_start)
+            log(f"  {n} variants loaded ({rate:.0f} variants/s, chr{chrom})  mem={mem()}")
+            last_log_time = now
+
+    elapsed = time.monotonic() - t_start
+    n_total = len(variants)
+
     if not dosage_columns:
         raise ValueError("VCF contains no variants: " + str(vcf_path))
+
+    log(f"parsed {n_total} variants in {elapsed:.1f}s ({n_total / elapsed:.0f} variants/s)")
+    log(f"stacking dosage matrix ({len(sample_ids)} samples x {n_total} variants)...")
     genotype_matrix = np.column_stack(dosage_columns).astype(np.float32)
+    matrix_mb = genotype_matrix.nbytes / 1e6
+    log(f"genotype matrix ready: {genotype_matrix.shape}, {matrix_mb:.1f} MB  mem={mem()}")
     return sample_ids, genotype_matrix, variants
 
 
