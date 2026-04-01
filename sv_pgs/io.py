@@ -428,24 +428,32 @@ def _load_vcf(
     vcf_path: Path,
     keep_sample_indices: np.ndarray | None = None,
 ) -> tuple[np.ndarray, list[_VariantDefaults]]:
-    """Load VCF genotypes, accumulating as int8 (-127 = missing) for memory efficiency.
+    """Load VCF genotypes into a float32 matrix.
 
     If keep_sample_indices is provided, only those sample positions are stored
     per variant (cuts sample dimension to phenotype-matched subset).
     Returns (float32 genotype matrix, variant defaults).
+
+    Memory strategy: accumulate per-variant dosage as int8 columns (1 byte each),
+    then pre-allocate the final float32 matrix and copy each int8 column into it
+    one at a time, freeing the int8 column immediately.  Peak memory is the int8
+    list (~2.5 GB for 97K×26K) plus the float32 output (~10 GB), but the int8
+    list is freed incrementally so the true peak is ~10 GB + a few MB.
     """
     from sv_pgs.progress import log, mem
     import time
+    import os
 
     # gt_types mapping: 0=HOM_REF, 1=HET, 2=UNKNOWN/MISSING, 3=HOM_ALT
-    # We map to int8 dosage: 0→0, 1→1, 3→2, 2→-127 (missing sentinel)
-    _GT_TO_INT8 = np.array([0, 1, -127, 2], dtype=np.int8)
+    # int8 dosage: 0→0, 1→1, 3→2, 2→-1 (missing sentinel)
+    _GT_TO_INT8 = np.array([0, 1, -1, 2], dtype=np.int8)
+    # float32 lookup for AF computation from all samples (before subsetting)
+    _GT_TO_FLOAT = np.array([0.0, 1.0, np.nan, 2.0], dtype=np.float32)
 
     vcf_size_mb = vcf_path.stat().st_size / 1e6
     log(f"opening VCF: {vcf_path.name} ({vcf_size_mb:.1f} MB)")
 
     reader = VCF(str(vcf_path))
-    import os
     n_threads = os.cpu_count() or 4
     reader.set_threads(n_threads)
     log(f"VCF decompression threads: {n_threads}")
@@ -467,20 +475,17 @@ def _load_vcf(
                 + _vcf_variant_key(record)
             )
 
-        # Convert gt_types (0/1/2/3) to int8 dosage via lookup table
-        gt = record.gt_types  # numpy array of uint8
-        int8_dosage_all = _GT_TO_INT8[gt]
+        gt = record.gt_types
 
         # Compute allele frequency from ALL samples before subsetting
-        af = _infer_vcf_allele_frequency_from_int8(record, int8_dosage_all)
+        af = _infer_vcf_allele_frequency_from_float(record, _GT_TO_FLOAT[gt])
 
-        # Subset to kept samples
+        # Store as int8 (1 byte per sample vs 4 for float32)
+        int8_col = _GT_TO_INT8[gt]
         if keep_sample_indices is not None:
-            int8_dosage = int8_dosage_all[keep_sample_indices]
-        else:
-            int8_dosage = int8_dosage_all
+            int8_col = int8_col[keep_sample_indices]
+        dosage_columns.append(int8_col)
 
-        dosage_columns.append(int8_dosage)
         variants.append(
             _VariantDefaults(
                 variant_id=_vcf_variant_id(record),
@@ -497,14 +502,11 @@ def _load_vcf(
         now = time.monotonic()
         chrom = str(record.CHROM)
 
-        # Log on chromosome change
         if chrom != last_chrom:
             if last_chrom is not None:
                 log(f"  chromosome {last_chrom} done — {n} variants so far  mem={mem()}")
             last_chrom = chrom
             last_log_time = now
-
-        # Log every 5 seconds for long loads
         elif now - last_log_time >= 5.0:
             rate = n / (now - t_start)
             log(f"  {n} variants loaded ({rate:.0f} variants/s, {chrom})  mem={mem()}")
@@ -513,39 +515,40 @@ def _load_vcf(
     elapsed = time.monotonic() - t_start
     n_total = len(variants)
 
-    if not dosage_columns:
+    if n_total == 0:
         raise ValueError("VCF contains no variants: " + str(vcf_path))
 
     log(f"parsed {n_total} variants in {elapsed:.1f}s ({n_total / elapsed:.0f} variants/s)")
 
-    # Write int8 columns directly into pre-allocated float32 matrix.
-    # This avoids ever holding both an int8 and float32 copy simultaneously.
+    # Build float32 matrix by copying each int8 column individually, then freeing it.
+    # This way we never hold the full int8 list AND the full float32 matrix at once.
     matrix_gb = n_keep * n_total * 4 / 1e9
-    log(f"building float32 matrix ({n_keep} samples x {n_total} variants, {matrix_gb:.1f} GB)...")
+    log(f"building float32 matrix ({n_keep} x {n_total}, {matrix_gb:.1f} GB)...")
     genotype_matrix = np.empty((n_keep, n_total), dtype=np.float32)
-    for col_idx, col in enumerate(dosage_columns):
-        # Convert int8 column to float32 in-place into the output matrix
-        np.copyto(genotype_matrix[:, col_idx], col, casting="unsafe")
+    for i in range(n_total):
+        col = dosage_columns[i]
+        # Convert int8 → float32: -1 becomes NaN, 0/1/2 stay as-is
+        f32_col = col.astype(np.float32)
+        f32_col[col == -1] = np.nan
+        genotype_matrix[:, i] = f32_col
+        dosage_columns[i] = None  # free int8 column immediately
     del dosage_columns
-    # Replace missing sentinel (-127 → NaN)
-    genotype_matrix[genotype_matrix == -127.0] = np.nan
+
     matrix_mb = genotype_matrix.nbytes / 1e6
     log(f"genotype matrix ready: {genotype_matrix.shape}, {matrix_mb:.1f} MB  mem={mem()}")
     return genotype_matrix, variants
 
 
-def _infer_vcf_allele_frequency_from_int8(record: Any, int8_dosage: np.ndarray) -> float:
-    """Compute allele frequency, preferring INFO/AF, falling back to int8 dosage."""
+def _infer_vcf_allele_frequency_from_float(record: Any, dosage: np.ndarray) -> float:
+    """Compute allele frequency, preferring INFO/AF, falling back to dosage array."""
     af_value = record.INFO.get("AF")
     if af_value is not None:
         if isinstance(af_value, (tuple, list)):
             return float(af_value[0])
         return float(af_value)
-    # Compute from int8 dosage: valid values are 0, 1, 2; -127 is missing
-    valid_mask = int8_dosage != -127
-    if not np.any(valid_mask):
+    if np.all(np.isnan(dosage)):
         return 0.0
-    return float(np.mean(int8_dosage[valid_mask].astype(np.float32)) / 2.0)
+    return float(np.nanmean(dosage) / 2.0)
 
 
 def _load_plink1_metadata(bed_path: Path) -> _PlinkMetadata:
