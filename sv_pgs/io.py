@@ -445,7 +445,10 @@ def _load_vcf(
     log(f"opening VCF: {vcf_path.name} ({vcf_size_mb:.1f} MB)")
 
     reader = VCF(str(vcf_path))
-    reader.set_threads(1)
+    import os
+    n_threads = os.cpu_count() or 4
+    reader.set_threads(n_threads)
+    log(f"VCF decompression threads: {n_threads}")
     n_all_samples = len(reader.samples)
     n_keep = len(keep_sample_indices) if keep_sample_indices is not None else n_all_samples
     log(f"VCF has {n_all_samples} samples, keeping {n_keep}")
@@ -504,7 +507,7 @@ def _load_vcf(
         # Log every 5 seconds for long loads
         elif now - last_log_time >= 5.0:
             rate = n / (now - t_start)
-            log(f"  {n} variants loaded ({rate:.0f} variants/s, chr{chrom})  mem={mem()}")
+            log(f"  {n} variants loaded ({rate:.0f} variants/s, {chrom})  mem={mem()}")
             last_log_time = now
 
     elapsed = time.monotonic() - t_start
