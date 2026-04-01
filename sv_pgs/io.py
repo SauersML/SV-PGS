@@ -91,9 +91,52 @@ def load_dataset_from_files(
 
     variant_stats: VariantStatistics | None = None
     if resolved_format == "vcf":
-        log("loading VCF genotypes...")
-        source_sample_ids, genotype_matrix, default_variants = _load_vcf(source_path)
-        log(f"VCF loaded: {len(source_sample_ids)} samples x {len(default_variants)} variants  mem={mem()}")
+        # Read VCF header to get sample IDs without parsing genotypes
+        log("reading VCF header for sample IDs...")
+        vcf_header_reader = VCF(str(source_path))
+        source_sample_ids = [str(s) for s in vcf_header_reader.samples]
+        vcf_header_reader.close()
+        log(f"VCF has {len(source_sample_ids)} samples")
+
+        # Match samples against phenotype table BEFORE loading genotypes
+        log("resolving sample ID column...")
+        resolved_sample_id_column = _resolve_sample_id_column(
+            table_spec=sample_table_spec,
+            requested_sample_id_column=sample_id_column,
+            available_sample_ids=source_sample_ids,
+        )
+        log(f"sample ID column: '{resolved_sample_id_column}'")
+
+        log("building filtered sample table (parsing target + covariates for matched genotype IDs only)...")
+        sample_table, total_sample_rows, unmatched_sample_rows = _build_sample_table(
+            table_spec=sample_table_spec,
+            sample_id_column=resolved_sample_id_column,
+            target_column=target_column,
+            covariate_columns=covariate_columns,
+            available_sample_ids=source_sample_ids,
+        )
+        n_cases = int(np.sum(np.asarray(sample_table.targets) == 1.0))
+        n_controls = int(np.sum(np.asarray(sample_table.targets) == 0.0))
+        log(
+            "sample table: "
+            + f"{len(sample_table.sample_ids)} matched rows kept from {total_sample_rows}, "
+            + f"{unmatched_sample_rows} dropped, {sample_table.covariates.shape[1]} covariates"
+        )
+        log(f"  target distribution: {n_cases} cases, {n_controls} controls (of {len(sample_table.sample_ids)} total)")
+
+        log("aligning sample IDs between sample table and genotype source...")
+        aligned_sample_indices = _align_sample_ids(
+            expected_sample_ids=sample_table.sample_ids,
+            available_sample_ids=source_sample_ids,
+            context="genotype source",
+        )
+        log(f"aligned {len(aligned_sample_indices)} phenotype rows against {len(source_sample_ids)} genotype samples")
+
+        # Load VCF genotypes, keeping only matched samples and accumulating as int8
+        keep_indices = np.array(aligned_sample_indices, dtype=np.intp)
+        log(f"loading VCF genotypes (keeping {len(keep_indices)} of {len(source_sample_ids)} samples, int8 accumulation)...")
+        genotype_matrix, default_variants = _load_vcf(source_path, keep_sample_indices=keep_indices)
+        log(f"VCF loaded: {genotype_matrix.shape[0]} samples x {len(default_variants)} variants  mem={mem()}")
         plink_metadata = None
     elif resolved_format == "plink1":
         log("reading PLINK .fam/.bim metadata (no genotype data yet)...")
@@ -108,54 +151,53 @@ def load_dataset_from_files(
     else:
         raise ValueError("Unsupported genotype format: " + resolved_format)
 
-    log("resolving sample ID column...")
-    resolved_sample_id_column = _resolve_sample_id_column(
-        table_spec=sample_table_spec,
-        requested_sample_id_column=sample_id_column,
-        available_sample_ids=source_sample_ids,
-    )
-    log(f"sample ID column: '{resolved_sample_id_column}'")
+    if resolved_format != "vcf":
+        # PLINK path: sample matching happens after metadata load (same as before)
+        log("resolving sample ID column...")
+        resolved_sample_id_column = _resolve_sample_id_column(
+            table_spec=sample_table_spec,
+            requested_sample_id_column=sample_id_column,
+            available_sample_ids=source_sample_ids,
+        )
+        log(f"sample ID column: '{resolved_sample_id_column}'")
 
-    log("building filtered sample table (parsing target + covariates for matched genotype IDs only)...")
-    sample_table, total_sample_rows, unmatched_sample_rows = _build_sample_table(
-        table_spec=sample_table_spec,
-        sample_id_column=resolved_sample_id_column,
-        target_column=target_column,
-        covariate_columns=covariate_columns,
-        available_sample_ids=source_sample_ids,
-    )
-    n_cases = int(np.sum(np.asarray(sample_table.targets) == 1.0))
-    n_controls = int(np.sum(np.asarray(sample_table.targets) == 0.0))
-    log(
-        "sample table: "
-        + f"{len(sample_table.sample_ids)} matched rows kept from {total_sample_rows}, "
-        + f"{unmatched_sample_rows} dropped, {sample_table.covariates.shape[1]} covariates"
-    )
-    log(f"  target distribution: {n_cases} cases, {n_controls} controls (of {len(sample_table.sample_ids)} total)")
+        log("building filtered sample table (parsing target + covariates for matched genotype IDs only)...")
+        sample_table, total_sample_rows, unmatched_sample_rows = _build_sample_table(
+            table_spec=sample_table_spec,
+            sample_id_column=resolved_sample_id_column,
+            target_column=target_column,
+            covariate_columns=covariate_columns,
+            available_sample_ids=source_sample_ids,
+        )
+        n_cases = int(np.sum(np.asarray(sample_table.targets) == 1.0))
+        n_controls = int(np.sum(np.asarray(sample_table.targets) == 0.0))
+        log(
+            "sample table: "
+            + f"{len(sample_table.sample_ids)} matched rows kept from {total_sample_rows}, "
+            + f"{unmatched_sample_rows} dropped, {sample_table.covariates.shape[1]} covariates"
+        )
+        log(f"  target distribution: {n_cases} cases, {n_controls} controls (of {len(sample_table.sample_ids)} total)")
 
-    log("aligning sample IDs between sample table and genotype source...")
-    aligned_sample_indices = _align_sample_ids(
-        expected_sample_ids=sample_table.sample_ids,
-        available_sample_ids=source_sample_ids,
-        context="genotype source",
-    )
-    if resolved_format == "plink1":
+        log("aligning sample IDs between sample table and genotype source...")
+        aligned_sample_indices = _align_sample_ids(
+            expected_sample_ids=sample_table.sample_ids,
+            available_sample_ids=source_sample_ids,
+            context="genotype source",
+        )
         sample_table, aligned_sample_indices, reordered = _reorder_sample_table_by_source_index(
             sample_table=sample_table,
             source_indices=aligned_sample_indices,
         )
         if reordered:
             log("reordered matched phenotype rows into genotype order for contiguous PLINK access")
-    log(f"aligned {len(aligned_sample_indices)} phenotype rows against {len(source_sample_ids)} genotype samples")
+        log(f"aligned {len(aligned_sample_indices)} phenotype rows against {len(source_sample_ids)} genotype samples")
 
     if resolved_format == "vcf":
-        log("subsetting VCF genotype matrix to aligned samples...")
-        raw_genotypes: RawGenotypeMatrix = DenseRawGenotypeMatrix(
-            np.asarray(genotype_matrix[aligned_sample_indices, :], dtype=np.float32)
-        )
+        # genotype_matrix is already subsetted to aligned samples and in float32
+        raw_genotypes: RawGenotypeMatrix = DenseRawGenotypeMatrix(genotype_matrix)
         if default_variants is None:
             raise RuntimeError("VCF defaults were not initialized.")
-        log(f"VCF subset: {raw_genotypes.shape}  mem={mem()}")
+        log(f"VCF matrix: {raw_genotypes.shape}  mem={mem()}")
     else:
         if plink_metadata is None:
             raise RuntimeError("PLINK metadata were not initialized.")
@@ -382,19 +424,32 @@ def _resolve_sample_id_column(
     return best_columns[0]
 
 
-def _load_vcf(vcf_path: Path) -> tuple[list[str], np.ndarray, list[_VariantDefaults]]:
+def _load_vcf(
+    vcf_path: Path,
+    keep_sample_indices: np.ndarray | None = None,
+) -> tuple[np.ndarray, list[_VariantDefaults]]:
+    """Load VCF genotypes, accumulating as int8 (-127 = missing) for memory efficiency.
+
+    If keep_sample_indices is provided, only those sample positions are stored
+    per variant (cuts sample dimension to phenotype-matched subset).
+    Returns (float32 genotype matrix, variant defaults).
+    """
     from sv_pgs.progress import log, mem
     import time
 
-    # Report file size before starting
-    vcf_size_bytes = vcf_path.stat().st_size
-    vcf_size_mb = vcf_size_bytes / 1e6
+    # gt_types mapping: 0=HOM_REF, 1=HET, 2=UNKNOWN/MISSING, 3=HOM_ALT
+    # We map to int8 dosage: 0→0, 1→1, 3→2, 2→-127 (missing sentinel)
+    _GT_TO_INT8 = np.array([0, 1, -127, 2], dtype=np.int8)
+
+    vcf_size_mb = vcf_path.stat().st_size / 1e6
     log(f"opening VCF: {vcf_path.name} ({vcf_size_mb:.1f} MB)")
 
     reader = VCF(str(vcf_path))
     reader.set_threads(1)
-    sample_ids = [str(sample_id) for sample_id in reader.samples]
-    log(f"VCF has {len(sample_ids)} samples")
+    n_all_samples = len(reader.samples)
+    n_keep = len(keep_sample_indices) if keep_sample_indices is not None else n_all_samples
+    log(f"VCF has {n_all_samples} samples, keeping {n_keep}")
+
     dosage_columns: list[np.ndarray] = []
     variants: list[_VariantDefaults] = []
 
@@ -408,8 +463,21 @@ def _load_vcf(vcf_path: Path) -> tuple[list[str], np.ndarray, list[_VariantDefau
                 "Only biallelic VCF records are supported. Normalize multiallelic records before loading: "
                 + _vcf_variant_key(record)
             )
-        dosage = _vcf_record_dosage(record)
-        dosage_columns.append(dosage)
+
+        # Convert gt_types (0/1/2/3) to int8 dosage via lookup table
+        gt = record.gt_types  # numpy array of uint8
+        int8_dosage_all = _GT_TO_INT8[gt]
+
+        # Compute allele frequency from ALL samples before subsetting
+        af = _infer_vcf_allele_frequency_from_int8(record, int8_dosage_all)
+
+        # Subset to kept samples
+        if keep_sample_indices is not None:
+            int8_dosage = int8_dosage_all[keep_sample_indices]
+        else:
+            int8_dosage = int8_dosage_all
+
+        dosage_columns.append(int8_dosage)
         variants.append(
             _VariantDefaults(
                 variant_id=_vcf_variant_id(record),
@@ -417,7 +485,7 @@ def _load_vcf(vcf_path: Path) -> tuple[list[str], np.ndarray, list[_VariantDefau
                 chromosome=str(record.CHROM),
                 position=int(record.POS),
                 length=_infer_vcf_length(record),
-                allele_frequency=_infer_vcf_allele_frequency(record, dosage),
+                allele_frequency=af,
                 quality=_normalize_quality(record.QUAL),
             )
         )
@@ -446,11 +514,35 @@ def _load_vcf(vcf_path: Path) -> tuple[list[str], np.ndarray, list[_VariantDefau
         raise ValueError("VCF contains no variants: " + str(vcf_path))
 
     log(f"parsed {n_total} variants in {elapsed:.1f}s ({n_total / elapsed:.0f} variants/s)")
-    log(f"stacking dosage matrix ({len(sample_ids)} samples x {n_total} variants)...")
-    genotype_matrix = np.column_stack(dosage_columns).astype(np.float32)
+
+    # Stack as int8, then convert to float32 with -127 → NaN
+    int8_mb = n_keep * n_total / 1e6
+    log(f"stacking int8 dosage matrix ({n_keep} samples x {n_total} variants, {int8_mb:.1f} MB)...")
+    int8_matrix = np.column_stack(dosage_columns)  # (n_keep, n_variants) int8
+    del dosage_columns
+    log(f"int8 matrix stacked  mem={mem()}")
+
+    log("converting int8 → float32 (with -127 → NaN)...")
+    genotype_matrix = int8_matrix.astype(np.float32)
+    del int8_matrix
+    genotype_matrix[genotype_matrix == -127.0] = np.nan
     matrix_mb = genotype_matrix.nbytes / 1e6
     log(f"genotype matrix ready: {genotype_matrix.shape}, {matrix_mb:.1f} MB  mem={mem()}")
-    return sample_ids, genotype_matrix, variants
+    return genotype_matrix, variants
+
+
+def _infer_vcf_allele_frequency_from_int8(record: Any, int8_dosage: np.ndarray) -> float:
+    """Compute allele frequency, preferring INFO/AF, falling back to int8 dosage."""
+    af_value = record.INFO.get("AF")
+    if af_value is not None:
+        if isinstance(af_value, (tuple, list)):
+            return float(af_value[0])
+        return float(af_value)
+    # Compute from int8 dosage: valid values are 0, 1, 2; -127 is missing
+    valid_mask = int8_dosage != -127
+    if not np.any(valid_mask):
+        return 0.0
+    return float(np.mean(int8_dosage[valid_mask].astype(np.float32)) / 2.0)
 
 
 def _load_plink1_metadata(bed_path: Path) -> _PlinkMetadata:
@@ -753,14 +845,6 @@ def _reorder_sample_table_by_source_index(
     return reordered_sample_table, reordered_source_indices, True
 
 
-def _vcf_record_dosage(record: Any) -> np.ndarray:
-    dosage = np.full(record.gt_types.shape[0], np.nan, dtype=np.float32)
-    dosage[record.gt_types == 0] = 0.0
-    dosage[record.gt_types == 1] = 1.0
-    dosage[record.gt_types == 3] = 2.0
-    return dosage
-
-
 def _vcf_variant_id(record: Any) -> str:
     if record.ID is None or str(record.ID) == ".":
         return _vcf_variant_key(record)
@@ -806,19 +890,6 @@ def _infer_vcf_length(record: Any) -> float:
     return float(max(len(record.REF), len(record.ALT[0])))
 
 
-def _infer_vcf_allele_frequency(record: Any, dosage: np.ndarray) -> float:
-    af_value = record.INFO.get("AF")
-    if af_value is not None:
-        if isinstance(af_value, (tuple, list)):
-            return float(af_value[0])
-        return float(af_value)
-    return _infer_dosage_allele_frequency(dosage)
-
-
-def _infer_dosage_allele_frequency(dosage: np.ndarray) -> float:
-    if np.all(np.isnan(dosage)):
-        return 0.0
-    return float(np.nanmean(dosage) / 2.0)
 
 
 @dataclass(slots=True)
