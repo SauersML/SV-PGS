@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import jax.numpy as jnp
 import numpy as np
 
 from sv_pgs.genotype import RawGenotypeBatch, RawGenotypeMatrix, as_raw_genotype_matrix
@@ -99,6 +100,46 @@ def test_streaming_standardized_linear_algebra_matches_dense_path():
     np.testing.assert_allclose(
         np.asarray(streaming.transpose_matmat(sample_matrix, batch_size=2), dtype=np.float64),
         np.asarray(dense.transpose_matmat(sample_matrix, batch_size=2), dtype=np.float64),
+    )
+
+
+def test_gpu_cached_chunked_linear_algebra_matches_dense_reference():
+    random_generator = np.random.default_rng(0)
+    raw_matrix = random_generator.normal(size=(12, 130)).astype(np.float32)
+    means = raw_matrix.mean(axis=0).astype(np.float32)
+    scales = np.maximum(raw_matrix.std(axis=0), 0.25).astype(np.float32)
+    coefficients = random_generator.normal(size=raw_matrix.shape[1]).astype(np.float64)
+    variant_matrix = random_generator.normal(size=(raw_matrix.shape[1], 11)).astype(np.float64)
+    sample_vector = random_generator.normal(size=raw_matrix.shape[0]).astype(np.float64)
+    sample_matrix = random_generator.normal(size=(raw_matrix.shape[0], 11)).astype(np.float64)
+
+    dense = as_raw_genotype_matrix(raw_matrix).standardized(means, scales)
+    gpu_cached = as_raw_genotype_matrix(raw_matrix).standardized(means, scales)
+    gpu_cached._gpu_cache = jnp.asarray(gpu_cached.materialize(), dtype=jnp.float32)
+
+    np.testing.assert_allclose(
+        np.asarray(gpu_cached.matvec(coefficients), dtype=np.float64),
+        np.asarray(dense.matvec(coefficients), dtype=np.float64),
+        rtol=1e-5,
+        atol=1e-5,
+    )
+    np.testing.assert_allclose(
+        np.asarray(gpu_cached.matmat(variant_matrix), dtype=np.float64),
+        np.asarray(dense.matmat(variant_matrix), dtype=np.float64),
+        rtol=1e-5,
+        atol=1e-5,
+    )
+    np.testing.assert_allclose(
+        np.asarray(gpu_cached.transpose_matvec(sample_vector), dtype=np.float64),
+        np.asarray(dense.transpose_matvec(sample_vector), dtype=np.float64),
+        rtol=1e-5,
+        atol=1e-5,
+    )
+    np.testing.assert_allclose(
+        np.asarray(gpu_cached.transpose_matmat(sample_matrix), dtype=np.float64),
+        np.asarray(dense.transpose_matmat(sample_matrix), dtype=np.float64),
+        rtol=1e-5,
+        atol=1e-5,
     )
 
 

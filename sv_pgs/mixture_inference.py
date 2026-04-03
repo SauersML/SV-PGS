@@ -824,17 +824,7 @@ def _sample_space_operator(
         # X^T @ M gives (p, k), scale by prior variance, then X @ result gives (n, k)
         projected = genotype_matrix.transpose_matmat(matrix_jax)  # (p, k)
         scaled = prior_var_jax[:, None] * projected  # (p, k)
-        # Use transpose_matmat in reverse: X @ scaled = (X @ scaled)
-        # For each column: diag * col + X @ (prior * X^T @ col)
-        # Vectorized: diag[:, None] * M + X @ (prior[:, None] * X^T @ M)
-        if genotype_matrix._gpu_cache is not None:
-            # Single GPU matmul for all columns at once
-            gpu = genotype_matrix._gpu_cache
-            genotype_term = (gpu.astype(jnp.float64) @ scaled).astype(jnp.float64)
-        else:
-            # Fall back to column-by-column
-            cols = [genotype_matrix.matvec(scaled[:, c]) for c in range(scaled.shape[1])]
-            genotype_term = jnp.stack(cols, axis=1)
+        genotype_term = genotype_matrix.matmat(scaled)
         return diag_noise_jax[:, None] * matrix_jax + genotype_term
 
     return build_linear_operator(
@@ -901,19 +891,27 @@ def _restricted_posterior_state(
         # Result: exact solve, but O(p^3) instead of O(n^3).
         log(f"    restricted posterior: Woodbury variant-space Cholesky (p={variant_count}, n={sample_count})  mem={mem()}")
         inv_diag = 1.0 / np.maximum(diagonal_noise, 1e-12)
-        # Use JAX for the big matmul (benefits from GPU if available)
-        X_jax = jnp.asarray(genotype_matrix.materialize(), dtype=jnp.float32)
+        # Keep the dense cross-product on device, but route it through the same
+        # chunked genotype helpers as the rest of the GPU path.
+        if genotype_matrix._gpu_cache is not None:
+            X_jax = genotype_matrix._gpu_cache
+        else:
+            X_jax = jnp.asarray(genotype_matrix.materialize(), dtype=jnp.float32)
         inv_diag_jax = jnp.asarray(inv_diag, dtype=jnp.float32)
         S_diag_jax = jnp.asarray(prior_variances, dtype=jnp.float32)
-        # Form p×p matrix: S^{-1} + X^T @ diag(1/D) @ X — keep on JAX/GPU
-        XtDinvX = (X_jax * inv_diag_jax[:, None]).T @ X_jax
+        # Form p×p matrix: S^{-1} + X^T @ diag(1/D) @ X — keep on JAX/GPU.
+        weighted_X_jax = X_jax * inv_diag_jax[:, None]
+        XtDinvX = jnp.asarray(
+            genotype_matrix.transpose_matmat(weighted_X_jax, batch_size=posterior_variance_batch_size),
+            dtype=jnp.float32,
+        )
         woodbury_matrix = jnp.diag(1.0 / jnp.maximum(S_diag_jax, 1e-12)) + XtDinvX + jnp.eye(variant_count) * 1e-8
         woodbury_cholesky = jnp.linalg.cholesky(woodbury_matrix)
         X = np.asarray(X_jax, dtype=np.float64)  # keep numpy copy for solve_rhs
         # Transfer back to numpy for _cholesky_solve and logdet
         S_diag = np.asarray(S_diag_jax, dtype=np.float64)
         woodbury_cholesky = np.asarray(woodbury_cholesky, dtype=np.float64)
-        del X_jax, XtDinvX  # free JAX copies
+        del X_jax, weighted_X_jax, XtDinvX  # free JAX copies
 
         def solve_rhs(right_hand_side: np.ndarray) -> np.ndarray:
             rhs = np.asarray(right_hand_side, dtype=np.float64)

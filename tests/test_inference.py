@@ -1,15 +1,18 @@
 from __future__ import annotations
 
+import jax.numpy as jnp
 import numpy as np
 import pytest
 from scipy.special import kve
 
 from sv_pgs.config import ModelConfig, TraitType, VariantClass
 from sv_pgs.data import VariantRecord
+from sv_pgs.genotype import as_raw_genotype_matrix
 from sv_pgs.inference import fit_variational_em
 from sv_pgs.mixture_inference import (
     PosteriorState,
     _quantitative_posterior_state,
+    _sample_space_operator,
     _update_local_scales,
     _update_tpb_shape_vectors,
 )
@@ -179,6 +182,78 @@ def test_quantitative_noise_update_includes_posterior_uncertainty(random_generat
 
     np.testing.assert_allclose(alpha, alpha_exact.astype(np.float32), rtol=1e-5, atol=1e-5)
     assert np.isclose(float(updated_sigma_error2), expected_sigma_error2, rtol=1e-5, atol=1e-5)
+
+
+def test_gpu_sample_space_operator_matmat_matches_dense_reference(random_generator):
+    sample_count, variant_count = 24, 96
+    genotype_values = random_generator.normal(size=(sample_count, variant_count)).astype(np.float32)
+    prior_variances = random_generator.uniform(0.2, 1.2, size=variant_count).astype(np.float64)
+    diagonal_noise = random_generator.uniform(0.5, 1.5, size=sample_count).astype(np.float64)
+    rhs_matrix = random_generator.normal(size=(sample_count, 11)).astype(np.float64)
+
+    standardized = as_raw_genotype_matrix(genotype_values).standardized(
+        means=np.zeros(variant_count, dtype=np.float32),
+        scales=np.ones(variant_count, dtype=np.float32),
+    )
+    standardized._gpu_cache = jnp.asarray(standardized.materialize(), dtype=jnp.float32)
+    operator = _sample_space_operator(standardized, prior_variances, diagonal_noise)
+
+    dense_matrix = genotype_values.astype(np.float64)
+    expected = diagonal_noise[:, None] * rhs_matrix + dense_matrix @ (
+        prior_variances[:, None] * (dense_matrix.T @ rhs_matrix)
+    )
+
+    np.testing.assert_allclose(
+        np.asarray(operator.matmat(rhs_matrix), dtype=np.float64),
+        expected,
+        rtol=1e-5,
+        atol=1e-5,
+    )
+
+
+def test_gpu_cached_woodbury_posterior_matches_dense_reference(random_generator):
+    sample_count, variant_count = 40, 6
+    genotype_values = random_generator.normal(size=(sample_count, variant_count)).astype(np.float32)
+    covariate_matrix = np.column_stack(
+        [np.ones(sample_count), random_generator.normal(size=(sample_count, 2))]
+    ).astype(np.float32)
+    target_vector = random_generator.normal(size=sample_count).astype(np.float32)
+    prior_variances = random_generator.uniform(0.2, 1.0, size=variant_count).astype(np.float32)
+
+    standardized = as_raw_genotype_matrix(genotype_values).standardized(
+        means=np.zeros(variant_count, dtype=np.float32),
+        scales=np.ones(variant_count, dtype=np.float32),
+    )
+    standardized._gpu_cache = jnp.asarray(standardized.materialize(), dtype=jnp.float32)
+
+    gpu_result = _quantitative_posterior_state(
+        genotype_matrix=standardized,
+        covariate_matrix=covariate_matrix,
+        targets=target_vector,
+        prior_variances=prior_variances,
+        sigma_error2=1.0,
+        sigma_error_floor=1e-6,
+        exact_solver_matrix_limit=8,
+        posterior_variance_batch_size=3,
+    )
+    dense_result = _quantitative_posterior_state(
+        genotype_matrix=genotype_values,
+        covariate_matrix=covariate_matrix,
+        targets=target_vector,
+        prior_variances=prior_variances,
+        sigma_error2=1.0,
+        sigma_error_floor=1e-6,
+        exact_solver_matrix_limit=8,
+        posterior_variance_batch_size=3,
+    )
+
+    for gpu_value, dense_value in zip(gpu_result, dense_result):
+        np.testing.assert_allclose(
+            np.asarray(gpu_value, dtype=np.float64),
+            np.asarray(dense_value, dtype=np.float64),
+            rtol=1e-5,
+            atol=1e-5,
+        )
 
 
 def test_validation_restores_best_iterate(monkeypatch: pytest.MonkeyPatch):

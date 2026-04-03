@@ -27,10 +27,19 @@ MIN_BED_READER_BATCH_SIZE = 32  # always read at least this many variants
 # (typically 10-30 iterations), giving a huge speedup.
 MATERIALIZE_THRESHOLD_BYTES = 4_000_000_000  # 4 GB
 
-# XLA can segfault compiling matmuls on very large shapes (e.g. 97K×10K).
-# Splitting into chunks of ~2048 columns avoids the crash while keeping
-# all data on GPU.  Each chunk compiles a (97K, 2048) @ (2048,) kernel once.
-_GPU_MATMUL_CHUNK = 2048
+# Keep individual dense GPU kernels small enough that XLA/CUDA compilation is
+# stable even for ~100k-sample matrices.  The chunk width is chosen
+# dynamically from these caps.
+_GPU_MATMUL_TARGET_ELEMENTS = 32_000_000
+_GPU_MATMUL_MIN_CHUNK = 64
+_GPU_MATMUL_MAX_CHUNK = 512
+_GPU_MATMAT_MAX_RHS_COLUMNS = 8
+
+
+def _floor_power_of_two(value: int) -> int:
+    if value <= 1:
+        return 1
+    return 1 << (value.bit_length() - 1)
 
 
 def as_raw_genotype_matrix(genotypes: RawGenotypeMatrix | np.ndarray) -> RawGenotypeMatrix:
@@ -418,9 +427,21 @@ class StandardizedGenotypeMatrix:
         self._dense_cache = matrix
         return matrix
 
+    def _gpu_column_chunk(self, rhs_columns: int = 1) -> int:
+        safe_rhs_columns = max(int(rhs_columns), 1)
+        target_chunk = max(
+            _GPU_MATMUL_TARGET_ELEMENTS // max(self.shape[0] * safe_rhs_columns, 1),
+            1,
+        )
+        chunk = _floor_power_of_two(target_chunk)
+        return max(_GPU_MATMUL_MIN_CHUNK, min(_GPU_MATMUL_MAX_CHUNK, chunk, self.shape[1]))
+
+    def _gpu_rhs_chunk(self, rhs_columns: int) -> int:
+        return max(1, min(int(rhs_columns), _GPU_MATMAT_MAX_RHS_COLUMNS))
+
     def _gpu_chunked_matvec(self, coeff: jnp.ndarray) -> jnp.ndarray:
-        """GPU matmul in chunks to avoid XLA compilation crash on large shapes."""
-        chunk = _GPU_MATMUL_CHUNK
+        """GPU matmul in bounded chunks to avoid large-shape XLA crashes."""
+        chunk = self._gpu_column_chunk(rhs_columns=1)
         result = jnp.zeros(self.shape[0], dtype=jnp.float32)
         for start in range(0, self.shape[1], chunk):
             end = min(start + chunk, self.shape[1])
@@ -428,13 +449,28 @@ class StandardizedGenotypeMatrix:
         return result
 
     def _gpu_chunked_transpose_matvec(self, v: jnp.ndarray) -> jnp.ndarray:
-        """GPU transpose matmul in chunks."""
-        chunk = _GPU_MATMUL_CHUNK
+        """GPU transpose matmul in bounded chunks."""
+        chunk = self._gpu_column_chunk(rhs_columns=1)
         parts = []
         for start in range(0, self.shape[1], chunk):
             end = min(start + chunk, self.shape[1])
             parts.append(self._gpu_cache[:, start:end].T @ v)
         return jnp.concatenate(parts)
+
+    def _gpu_chunked_matmat(self, matrix: jnp.ndarray) -> jnp.ndarray:
+        """GPU matrix-matrix multiply with chunking over both variants and RHS."""
+        variant_chunk = self._gpu_column_chunk(rhs_columns=matrix.shape[1])
+        rhs_chunk = self._gpu_rhs_chunk(matrix.shape[1])
+        result_blocks = []
+        for rhs_start in range(0, matrix.shape[1], rhs_chunk):
+            rhs_end = min(rhs_start + rhs_chunk, matrix.shape[1])
+            rhs_block = matrix[:, rhs_start:rhs_end]
+            rhs_result = jnp.zeros((self.shape[0], rhs_end - rhs_start), dtype=jnp.float32)
+            for start in range(0, self.shape[1], variant_chunk):
+                end = min(start + variant_chunk, self.shape[1])
+                rhs_result = rhs_result + self._gpu_cache[:, start:end] @ rhs_block[start:end, :]
+            result_blocks.append(rhs_result)
+        return jnp.concatenate(result_blocks, axis=1)
 
     def matvec(self, coefficients: np.ndarray | jnp.ndarray, batch_size: int = DEFAULT_GENOTYPE_BATCH_SIZE) -> jnp.ndarray:
         """Compute X_std @ beta (genotype matrix times coefficient vector).
@@ -454,6 +490,22 @@ class StandardizedGenotypeMatrix:
             batch_f64 = np.asarray(batch.values, dtype=np.float64)
             result += batch_f64 @ coeff_np[batch.variant_indices]
         return jnp.asarray(result, dtype=jnp.float64)
+
+    def matmat(self, matrix: np.ndarray | jnp.ndarray, batch_size: int = DEFAULT_GENOTYPE_BATCH_SIZE) -> jnp.ndarray:
+        """Compute X_std @ M. When GPU-cached: chunked GPU matmul. Otherwise: batched numpy."""
+        if self._gpu_cache is not None:
+            m = jnp.asarray(matrix, dtype=jnp.float32)
+            if m.ndim != 2 or m.shape[0] != self.shape[1]:
+                raise ValueError("variant matrix must match genotype column count.")
+            return self._gpu_chunked_matmat(m).astype(jnp.float64)
+        m_np = np.asarray(matrix, dtype=np.float64)
+        if m_np.ndim != 2 or m_np.shape[0] != self.shape[1]:
+            raise ValueError("variant matrix must match genotype column count.")
+        output = np.zeros((self.shape[0], m_np.shape[1]), dtype=np.float64)
+        for batch in self.iter_column_batches(batch_size=batch_size):
+            batch_f64 = np.asarray(batch.values, dtype=np.float64)
+            output += batch_f64 @ m_np[batch.variant_indices, :]
+        return jnp.asarray(output, dtype=jnp.float64)
 
     def transpose_matvec(self, vector: np.ndarray | jnp.ndarray, batch_size: int = DEFAULT_GENOTYPE_BATCH_SIZE) -> jnp.ndarray:
         """Compute X_std^T @ v. When GPU-cached: chunked GPU matmul. Otherwise: batched numpy."""
@@ -475,11 +527,16 @@ class StandardizedGenotypeMatrix:
             m = jnp.asarray(matrix, dtype=jnp.float32)
             if m.ndim != 2 or m.shape[0] != self.shape[0]:
                 raise ValueError("sample matrix must match genotype row count.")
-            chunk = _GPU_MATMUL_CHUNK
+            chunk = self._gpu_column_chunk(rhs_columns=m.shape[1])
+            rhs_chunk = self._gpu_rhs_chunk(m.shape[1])
             parts = []
             for start in range(0, self.shape[1], chunk):
                 end = min(start + chunk, self.shape[1])
-                parts.append(self._gpu_cache[:, start:end].T @ m)
+                rhs_blocks = []
+                for rhs_start in range(0, m.shape[1], rhs_chunk):
+                    rhs_end = min(rhs_start + rhs_chunk, m.shape[1])
+                    rhs_blocks.append(self._gpu_cache[:, start:end].T @ m[:, rhs_start:rhs_end])
+                parts.append(jnp.concatenate(rhs_blocks, axis=1))
             return jnp.concatenate(parts).astype(jnp.float64)
         m_np = np.asarray(matrix, dtype=np.float64)
         if m_np.ndim != 2 or m_np.shape[0] != self.shape[0]:
