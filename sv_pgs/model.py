@@ -6,6 +6,9 @@ from typing import Sequence
 
 import numpy as np
 
+import sv_pgs._jax  # noqa: F401
+import jax.numpy as jnp
+
 from sv_pgs.artifact import ModelArtifact, load_artifact, save_artifact
 from sv_pgs.config import ModelConfig, TraitType
 from sv_pgs.data import TieGroup, TieMap, VariantRecord, VariantStatistics, normalize_variant_records
@@ -134,10 +137,14 @@ class BayesianPGS:
                 np.asarray(validation_targets, dtype=np.float32),
             )
 
-        # Try to cache the reduced genotype matrix in RAM to avoid re-reading
-        # from disk on every EM iteration (huge speedup when it fits).
-        cached = reduced_genotypes.try_materialize()
-        log(f"starting variational EM  max_iterations={self.config.max_outer_iterations}  reduced_matrix={reduced_genotypes.shape}  in_memory={cached}  mem={mem()}")
+        # Try to upload the reduced genotype matrix to GPU VRAM for fast matmul.
+        # Falls back to CPU RAM cache, then streaming from raw matrix.
+        gpu_cached = reduced_genotypes.try_materialize_gpu()
+        if gpu_cached:
+            cached = True
+        else:
+            cached = reduced_genotypes.try_materialize()
+        log(f"starting variational EM  max_iterations={self.config.max_outer_iterations}  reduced_matrix={reduced_genotypes.shape}  in_memory={cached}  on_gpu={gpu_cached}  mem={mem()}")
         fit_result = fit_variational_em(
             genotypes=reduced_genotypes,
             covariates=prepared_arrays.covariates,
@@ -412,16 +419,18 @@ def _training_records(
     ]
     log(f"  training records: {len(records)} total, {len(unresolved_variant_indices)} SVs need support counts  mem={mem()}")
     if unresolved_variant_indices:
-        unresolved_lookup = {variant_index: offset for offset, variant_index in enumerate(unresolved_variant_indices)}
-        unresolved_supports = [0] * len(unresolved_variant_indices)
+        unresolved_supports = np.zeros(len(unresolved_variant_indices), dtype=np.int32)
+        offset = 0
         for batch in raw_genotypes.iter_column_batches(unresolved_variant_indices, batch_size=auto_batch_size(raw_genotypes.shape[0])):
-            for local_index, variant_index in enumerate(batch.variant_indices):
-                unresolved_supports[unresolved_lookup[int(variant_index)]] = _infer_support_count_from_raw_genotypes(
-                    batch.values[:, local_index],
-                    records[int(variant_index)],
-                )
-        for variant_index, support in zip(unresolved_variant_indices, unresolved_supports, strict=True):
-            training_supports[variant_index] = support
+            # Vectorized support count: count non-zero non-NaN values per column
+            batch_jax = jnp.asarray(batch.values)
+            valid = ~jnp.isnan(batch_jax)
+            counts = jnp.sum((jnp.abs(batch_jax) > 0.5) & valid, axis=0)
+            batch_len = len(batch.variant_indices)
+            unresolved_supports[offset:offset + batch_len] = np.asarray(counts, dtype=np.int32)
+            offset += batch_len
+        for i, variant_index in enumerate(unresolved_variant_indices):
+            training_supports[variant_index] = int(unresolved_supports[i])
 
     training_records: list[VariantRecord] = []
     for variant_index, record in enumerate(records):
@@ -504,10 +513,9 @@ def _compute_support_counts(
         unresolved_structural_variant_indices,
         batch_size=auto_batch_size(raw_genotypes.shape[0]),
     ):
-        support_counts[batch.variant_indices] = np.count_nonzero(
-            np.abs(np.where(np.isnan(batch.values), 0.0, batch.values)) > 0.5,
-            axis=0,
-        ).astype(np.int32, copy=False)
+        batch_jax = jnp.asarray(batch.values)
+        counts = jnp.sum(jnp.abs(jnp.where(jnp.isnan(batch_jax), 0.0, batch_jax)) > 0.5, axis=0)
+        support_counts[batch.variant_indices] = np.asarray(counts, dtype=np.int32)
     return support_counts
 
 

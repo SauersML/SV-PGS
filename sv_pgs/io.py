@@ -447,8 +447,6 @@ def _load_vcf(
     # gt_types mapping: 0=HOM_REF, 1=HET, 2=UNKNOWN/MISSING, 3=HOM_ALT
     # int8 dosage: 0→0, 1→1, 3→2, 2→-1 (missing sentinel)
     _GT_TO_INT8 = np.array([0, 1, -1, 2], dtype=np.int8)
-    # float32 lookup for AF computation from all samples (before subsetting)
-    _GT_TO_FLOAT = np.array([0.0, 1.0, np.nan, 2.0], dtype=np.float32)
 
     vcf_size_mb = vcf_path.stat().st_size / 1e6
     log(f"opening VCF: {vcf_path.name} ({vcf_size_mb:.1f} MB)")
@@ -468,6 +466,17 @@ def _load_vcf(
     last_log_time = t_start
     last_chrom = None
 
+    # Local references avoid repeated global/attribute lookups in the hot loop
+    _gt_to_i8 = _GT_TO_INT8
+    _append_col = dosage_columns.append
+    _append_var = variants.append
+    _VariantDef = _VariantDefaults
+    _vcf_id = _vcf_variant_id
+    _vcf_cls = _infer_vcf_variant_class
+    _vcf_len = _infer_vcf_length
+    _norm_q = _normalize_quality
+    _monotonic = time.monotonic
+
     for record in reader:
         if len(record.ALT) != 1:
             raise ValueError(
@@ -477,29 +486,36 @@ def _load_vcf(
 
         gt = record.gt_types
 
-        # Compute allele frequency from ALL samples before subsetting
-        af = _infer_vcf_allele_frequency_from_float(record, _GT_TO_FLOAT[gt])
+        # Compute AF from int8 directly (avoids creating a 97k float32 array per variant)
+        af_value = record.INFO.get("AF")
+        if af_value is not None:
+            af = float(af_value[0]) if isinstance(af_value, (tuple, list)) else float(af_value)
+        else:
+            int8_all = _gt_to_i8[gt]
+            valid_mask = int8_all != -1
+            n_valid = int(np.count_nonzero(valid_mask))
+            af = float(np.sum(int8_all[valid_mask])) / (2.0 * n_valid) if n_valid > 0 else 0.0
 
         # Store as int8 (1 byte per sample vs 4 for float32)
-        int8_col = _GT_TO_INT8[gt]
+        int8_col = _gt_to_i8[gt] if af_value is not None else int8_all
         if keep_sample_indices is not None:
             int8_col = int8_col[keep_sample_indices]
-        dosage_columns.append(int8_col)
+        _append_col(int8_col)
 
-        variants.append(
-            _VariantDefaults(
-                variant_id=_vcf_variant_id(record),
-                variant_class=_infer_vcf_variant_class(record),
+        _append_var(
+            _VariantDef(
+                variant_id=_vcf_id(record),
+                variant_class=_vcf_cls(record),
                 chromosome=str(record.CHROM),
                 position=int(record.POS),
-                length=_infer_vcf_length(record),
+                length=_vcf_len(record),
                 allele_frequency=af,
-                quality=_normalize_quality(record.QUAL),
+                quality=_norm_q(record.QUAL),
             )
         )
 
         n = len(variants)
-        now = time.monotonic()
+        now = _monotonic()
         chrom = str(record.CHROM)
 
         if chrom != last_chrom:
@@ -522,13 +538,16 @@ def _load_vcf(
 
     # Build int8 matrix directly — 4x smaller than float32 (2.5 GB vs 10 GB for 97K×26K).
     # Values: 0/1/2 for dosage, -1 for missing.  Converted to float32 per-batch on the fly.
+    # Use Fortran (column-major) order for fast column writes, then convert to C order
+    # for fast row-slice access during batch iteration.
     matrix_gb = n_keep * n_total / 1e9
     log(f"building int8 matrix ({n_keep} x {n_total}, {matrix_gb:.1f} GB)...")
-    genotype_matrix = np.empty((n_keep, n_total), dtype=np.int8)
+    genotype_matrix = np.empty((n_keep, n_total), dtype=np.int8, order='F')
     for i in range(n_total):
         genotype_matrix[:, i] = dosage_columns[i]
         dosage_columns[i] = None  # free column immediately
     del dosage_columns
+    genotype_matrix = np.ascontiguousarray(genotype_matrix)
 
     matrix_mb = genotype_matrix.nbytes / 1e6
     log(f"genotype matrix ready: {genotype_matrix.shape}, {matrix_mb:.1f} MB  mem={mem()}")

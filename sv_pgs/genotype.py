@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Iterator, Sequence
 
 import sv_pgs._jax  # noqa: F401
+import jax
 import jax.numpy as jnp
 import numpy as np
 from bed_reader import open_bed
@@ -279,12 +280,17 @@ class StandardizedGenotypeMatrix:
     iteration, so we never need to store the full standardized matrix unless
     we choose to cache it (try_materialize).  Supports matrix-vector products
     (matvec, transpose_matvec) needed by the Bayesian inference engine.
+
+    When the matrix fits in GPU VRAM (try_materialize_gpu), it is uploaded once
+    and kept resident — matvec/transpose_matvec then become single GPU matmul
+    calls with zero CPU→GPU transfer overhead per iteration.
     """
     raw: RawGenotypeMatrix
     means: np.ndarray       # per-variant mean from training data
     scales: np.ndarray      # per-variant std dev from training data
     variant_indices: np.ndarray  # which columns of raw to use (for subsetting)
     _dense_cache: np.ndarray | None = field(init=False, default=None, repr=False)
+    _gpu_cache: jnp.ndarray | None = field(init=False, default=None, repr=False)
 
     def __post_init__(self) -> None:
         self.means = np.asarray(self.means, dtype=np.float32)
@@ -303,12 +309,46 @@ class StandardizedGenotypeMatrix:
         """Estimated bytes if materialized as float32."""
         return int(self.shape[0]) * int(self.shape[1]) * 4
 
+    def try_materialize_gpu(self) -> bool:
+        """Materialize the standardized matrix directly into GPU VRAM.
+
+        If the matrix fits (float32), uploads it once so that matvec/transpose
+        become single GPU matmul calls with zero per-iteration transfer overhead.
+        Returns True if now resident on GPU, False on CPU-only or OOM.
+        """
+        if self._gpu_cache is not None:
+            return True
+        try:
+            devices = jax.devices()
+            if not devices or devices[0].platform == "cpu":
+                return False
+        except Exception:
+            return False
+        nbytes_f32 = self.dense_bytes()
+        from sv_pgs.progress import log, mem
+        log(f"    materializing {self.shape[1]} variants x {self.shape[0]} samples ({nbytes_f32 / 1e9:.1f} GB) onto GPU  mem={mem()}")
+        try:
+            # Build standardized matrix on CPU in batches, then upload to GPU
+            cpu_matrix = np.empty(self.shape, dtype=np.float32)
+            for batch in self.iter_column_batches(batch_size=auto_batch_size(self.shape[0])):
+                cpu_matrix[:, batch.variant_indices] = batch.values
+            self._gpu_cache = jnp.asarray(cpu_matrix, dtype=jnp.float32)
+            del cpu_matrix
+            # Force the transfer to complete and verify it landed on GPU
+            self._gpu_cache.block_until_ready()
+            log(f"    GPU-resident matrix ready ({self._gpu_cache.dtype}, {self._gpu_cache.device()})  mem={mem()}")
+            return True
+        except Exception as e:
+            log(f"    GPU materialization failed ({e}), falling back to streaming  mem={mem()}")
+            self._gpu_cache = None
+            return False
+
     def try_materialize(self) -> bool:
         """Materialize into RAM if below the auto-materialize threshold.
 
         Returns True if now cached in memory, False if still streaming from disk.
         """
-        if self._dense_cache is not None:
+        if self._gpu_cache is not None or self._dense_cache is not None:
             return True
         nbytes = self.dense_bytes()
         if nbytes > MATERIALIZE_THRESHOLD_BYTES:
@@ -327,7 +367,9 @@ class StandardizedGenotypeMatrix:
             scales=self.scales,
             variant_indices=self.variant_indices[resolved_local_indices],
         )
-        if self._dense_cache is not None:
+        if self._gpu_cache is not None:
+            subset._gpu_cache = self._gpu_cache[:, resolved_local_indices]
+        elif self._dense_cache is not None:
             subset._dense_cache = np.asarray(self._dense_cache[:, resolved_local_indices], dtype=np.float32)
         return subset
 
@@ -362,6 +404,9 @@ class StandardizedGenotypeMatrix:
     def materialize(self, batch_size: int = DEFAULT_GENOTYPE_BATCH_SIZE) -> np.ndarray:
         if self._dense_cache is not None:
             return self._dense_cache
+        if self._gpu_cache is not None:
+            self._dense_cache = np.asarray(self._gpu_cache, dtype=np.float32)
+            return self._dense_cache
         matrix = np.empty(self.shape, dtype=np.float32)
         for batch in self.iter_column_batches(batch_size=batch_size):
             matrix[:, batch.variant_indices] = batch.values
@@ -371,42 +416,49 @@ class StandardizedGenotypeMatrix:
     def matvec(self, coefficients: np.ndarray | jnp.ndarray, batch_size: int = DEFAULT_GENOTYPE_BATCH_SIZE) -> jnp.ndarray:
         """Compute X_std @ beta (genotype matrix times coefficient vector).
 
-        Returns one value per sample: each sample's polygenic score contribution
-        from the genetic variants.  Done in batches on GPU via JAX.
+        When GPU-cached: single GPU matmul. Otherwise: batched numpy on CPU.
         """
-        coefficient_vector = jnp.asarray(coefficients, dtype=jnp.float32)
-        if coefficient_vector.ndim != 1 or coefficient_vector.shape[0] != self.shape[1]:
+        if self._gpu_cache is not None:
+            coeff = jnp.asarray(coefficients, dtype=jnp.float32)
+            if coeff.ndim != 1 or coeff.shape[0] != self.shape[1]:
+                raise ValueError("coefficient vector must match genotype column count.")
+            return (self._gpu_cache @ coeff).astype(jnp.float64)
+        coeff_np = np.asarray(coefficients, dtype=np.float64).ravel()
+        if coeff_np.shape[0] != self.shape[1]:
             raise ValueError("coefficient vector must match genotype column count.")
-        result = jnp.zeros(self.shape[0], dtype=jnp.float32)
+        result = np.zeros(self.shape[0], dtype=np.float64)
         for batch in self.iter_column_batches(batch_size=batch_size):
-            batch_jax = jnp.asarray(batch.values, dtype=jnp.float32)
-            batch_coeff = coefficient_vector[batch.variant_indices]
-            result = result + batch_jax @ batch_coeff
-        return result.astype(jnp.float64)
+            batch_f64 = np.asarray(batch.values, dtype=np.float64)
+            result += batch_f64 @ coeff_np[batch.variant_indices]
+        return jnp.asarray(result, dtype=jnp.float64)
 
     def transpose_matvec(self, vector: np.ndarray | jnp.ndarray, batch_size: int = DEFAULT_GENOTYPE_BATCH_SIZE) -> jnp.ndarray:
-        """Compute X_std^T @ v (transpose times a sample-length vector).
-
-        Returns one value per variant: the correlation of each variant's
-        genotype column with the input vector.  Done in batches on GPU via JAX.
-        """
-        sample_vector = jnp.asarray(vector, dtype=jnp.float32)
-        if sample_vector.ndim != 1 or sample_vector.shape[0] != self.shape[0]:
+        """Compute X_std^T @ v. When GPU-cached: single GPU matmul. Otherwise: batched numpy."""
+        if self._gpu_cache is not None:
+            v = jnp.asarray(vector, dtype=jnp.float32)
+            if v.ndim != 1 or v.shape[0] != self.shape[0]:
+                raise ValueError("sample vector must match genotype row count.")
+            return (self._gpu_cache.T @ v).astype(jnp.float64)
+        v_np = np.asarray(vector, dtype=np.float64).ravel()
+        if v_np.shape[0] != self.shape[0]:
             raise ValueError("sample vector must match genotype row count.")
-        output = np.empty(self.shape[1], dtype=np.float32)
+        output = np.empty(self.shape[1], dtype=np.float64)
         for batch in self.iter_column_batches(batch_size=batch_size):
-            batch_jax = jnp.asarray(batch.values, dtype=jnp.float32)
-            output[batch.variant_indices] = np.asarray(batch_jax.T @ sample_vector, dtype=np.float32)
+            output[batch.variant_indices] = np.asarray(batch.values, dtype=np.float64).T @ v_np
         return jnp.asarray(output, dtype=jnp.float64)
 
     def transpose_matmat(self, matrix: np.ndarray | jnp.ndarray, batch_size: int = DEFAULT_GENOTYPE_BATCH_SIZE) -> jnp.ndarray:
-        sample_matrix = jnp.asarray(matrix, dtype=jnp.float32)
-        if sample_matrix.ndim != 2 or sample_matrix.shape[0] != self.shape[0]:
+        if self._gpu_cache is not None:
+            m = jnp.asarray(matrix, dtype=jnp.float32)
+            if m.ndim != 2 or m.shape[0] != self.shape[0]:
+                raise ValueError("sample matrix must match genotype row count.")
+            return (self._gpu_cache.T @ m).astype(jnp.float64)
+        m_np = np.asarray(matrix, dtype=np.float64)
+        if m_np.ndim != 2 or m_np.shape[0] != self.shape[0]:
             raise ValueError("sample matrix must match genotype row count.")
-        output = np.empty((self.shape[1], sample_matrix.shape[1]), dtype=np.float32)
+        output = np.empty((self.shape[1], m_np.shape[1]), dtype=np.float64)
         for batch in self.iter_column_batches(batch_size=batch_size):
-            batch_jax = jnp.asarray(batch.values, dtype=jnp.float32)
-            output[batch.variant_indices, :] = np.asarray(batch_jax.T @ sample_matrix, dtype=np.float32)
+            output[batch.variant_indices, :] = np.asarray(batch.values, dtype=np.float64).T @ m_np
         return jnp.asarray(output, dtype=jnp.float64)
 
 
@@ -475,11 +527,17 @@ def _contiguous_index_or_slice(indices: np.ndarray) -> slice | np.ndarray:
 #   2. Subtract the mean (centering)
 #   3. Divide by the standard deviation (scaling)
 # After this, each variant column has mean ~0 and std ~1.
-def _standardize_batch(batch: np.ndarray, means: np.ndarray, scales: np.ndarray) -> np.ndarray:
-    batch_jax = jnp.asarray(batch, dtype=jnp.float32)
-    mean_jax = jnp.asarray(means, dtype=jnp.float32)
-    scale_jax = jnp.asarray(scales, dtype=jnp.float32)
+# JIT-compiled for GPU acceleration — first call compiles, subsequent calls are fast.
+@jax.jit
+def _standardize_batch_jit(batch_jax: jnp.ndarray, mean_jax: jnp.ndarray, scale_jax: jnp.ndarray) -> jnp.ndarray:
     nan_mask = jnp.isnan(batch_jax)
     centered = batch_jax - mean_jax[None, :]
-    centered = jnp.where(nan_mask, 0.0, centered)
-    return np.asarray(centered / scale_jax[None, :], dtype=np.float32)
+    return jnp.where(nan_mask, 0.0, centered) / scale_jax[None, :]
+
+
+def _standardize_batch(batch: np.ndarray, means: np.ndarray, scales: np.ndarray) -> np.ndarray:
+    return np.asarray(_standardize_batch_jit(
+        jnp.asarray(batch, dtype=jnp.float32),
+        jnp.asarray(means, dtype=jnp.float32),
+        jnp.asarray(scales, dtype=jnp.float32),
+    ), dtype=np.float32)

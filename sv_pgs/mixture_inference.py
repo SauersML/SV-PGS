@@ -1306,20 +1306,27 @@ def _update_tpb_shape_vectors(
             np.sum(centered_log_shape_a * centered_log_shape_a)
             + np.sum(centered_log_shape_b * centered_log_shape_b)
         ) / config.tpb_hierarchical_prior_variance
+        # Batch all JAX special function calls into one GPU round-trip
+        a_jax = jnp.asarray(local_shape_a, dtype=jnp.float64)
+        b_jax = jnp.asarray(local_shape_b, dtype=jnp.float64)
+        gammaln_a = np.asarray(jax_gammaln(a_jax), dtype=np.float64)
+        gammaln_b = np.asarray(jax_gammaln(b_jax), dtype=np.float64)
+        digamma_a = np.asarray(jax_digamma(a_jax), dtype=np.float64)
+        digamma_b = np.asarray(jax_digamma(b_jax), dtype=np.float64)
         objective_value = float(
             np.sum(
                 local_shape_a * log_auxiliary_delta
-                - np.asarray(jax_gammaln(jnp.asarray(local_shape_a, dtype=jnp.float64)), dtype=np.float64)
+                - gammaln_a
                 + (local_shape_a - 1.0) * log_local_scale
             )
             + np.sum(
                 (local_shape_b - 1.0) * log_auxiliary_delta
-                - np.asarray(jax_gammaln(jnp.asarray(local_shape_b, dtype=jnp.float64)), dtype=np.float64)
+                - gammaln_b
             )
             + hierarchical_penalty
         )
-        score_a = log_auxiliary_delta - np.asarray(jax_digamma(jnp.asarray(local_shape_a, dtype=jnp.float64)), dtype=np.float64) + log_local_scale
-        score_b = log_auxiliary_delta - np.asarray(jax_digamma(jnp.asarray(local_shape_b, dtype=jnp.float64)), dtype=np.float64)
+        score_a = log_auxiliary_delta - digamma_a + log_local_scale
+        score_b = log_auxiliary_delta - digamma_b
         gradient_a = shape_a_vector * (class_membership_matrix.T @ score_a)
         gradient_b = shape_b_vector * (class_membership_matrix.T @ score_b)
         gradient_a -= centered_log_shape_a / config.tpb_hierarchical_prior_variance
@@ -1504,27 +1511,15 @@ def _gig_moment(
     psi: np.ndarray,
     moment_power: float,
 ) -> np.ndarray:
-    z_value = np.sqrt(np.maximum(chi * psi, 1e-12))
-    numerator = np.asarray(
-        tfp_bessel_kve(
-            jnp.asarray(np.abs(p_parameter + moment_power), dtype=jnp.float64),
-            jnp.asarray(z_value, dtype=jnp.float64),
-        ),
-        dtype=np.float64,
-    )
-    denominator = np.maximum(
-        np.asarray(
-            tfp_bessel_kve(
-                jnp.asarray(np.abs(p_parameter), dtype=jnp.float64),
-                jnp.asarray(z_value, dtype=jnp.float64),
-            ),
-            dtype=np.float64,
-        ),
-        1e-300,
-    )
+    chi_jax = jnp.asarray(chi, dtype=jnp.float64)
+    psi_jax = jnp.asarray(psi, dtype=jnp.float64)
+    p_jax = jnp.asarray(p_parameter, dtype=jnp.float64)
+    z_value = jnp.sqrt(jnp.maximum(chi_jax * psi_jax, 1e-12))
+    numerator = tfp_bessel_kve(jnp.abs(p_jax + moment_power), z_value)
+    denominator = jnp.maximum(tfp_bessel_kve(jnp.abs(p_jax), z_value), 1e-300)
     moment_ratio = numerator / denominator
     return np.asarray(
-        np.power(np.maximum(chi / psi, 1e-12), 0.5 * moment_power) * moment_ratio,
+        jnp.power(jnp.maximum(chi_jax / psi_jax, 1e-12), 0.5 * moment_power) * moment_ratio,
         dtype=np.float64,
     )
 
