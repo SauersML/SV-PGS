@@ -332,11 +332,12 @@ def fit_preprocessor(
 
     safe_counts = np.maximum(non_missing_counts, 1).astype(np.float64)
     means = np.where(non_missing_counts > 0, sums / safe_counts, 0.0)
-    # Var(X) = E[X^2] - E[X]^2, scale = sqrt(Var)
-    variances = np.maximum(sum_squares / safe_counts - means * means, 0.0)
-    scales = np.sqrt(variances)
+    # scale = sqrt(sum((x_i - mean)^2) / n_total) where missing contribute 0.
+    # Expanding: sum((x-mean)^2) = sum(x^2) - sum(x)^2 / n_valid
+    centered_sum_sq = np.maximum(sum_squares - sums * sums / safe_counts, 0.0)
+    scales = np.sqrt(centered_sum_sq / max(n_samples, 1))
     scales = np.where(scales < config.minimum_scale, 1.0, scales)
-    del sums, sum_squares, non_missing_counts, safe_counts, variances
+    del sums, sum_squares, non_missing_counts, safe_counts, centered_sum_sq
     log(f"  preprocessor done  mem={mem()}")
 
     return PreparedArrays(

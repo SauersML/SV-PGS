@@ -27,6 +27,11 @@ MIN_BED_READER_BATCH_SIZE = 32  # always read at least this many variants
 # (typically 10-30 iterations), giving a huge speedup.
 MATERIALIZE_THRESHOLD_BYTES = 4_000_000_000  # 4 GB
 
+# XLA can segfault compiling matmuls on very large shapes (e.g. 97K×10K).
+# Splitting into chunks of ~2048 columns avoids the crash while keeping
+# all data on GPU.  Each chunk compiles a (97K, 2048) @ (2048,) kernel once.
+_GPU_MATMUL_CHUNK = 2048
+
 
 def as_raw_genotype_matrix(genotypes: RawGenotypeMatrix | np.ndarray) -> RawGenotypeMatrix:
     if isinstance(genotypes, RawGenotypeMatrix):
@@ -413,16 +418,34 @@ class StandardizedGenotypeMatrix:
         self._dense_cache = matrix
         return matrix
 
+    def _gpu_chunked_matvec(self, coeff: jnp.ndarray) -> jnp.ndarray:
+        """GPU matmul in chunks to avoid XLA compilation crash on large shapes."""
+        chunk = _GPU_MATMUL_CHUNK
+        result = jnp.zeros(self.shape[0], dtype=jnp.float32)
+        for start in range(0, self.shape[1], chunk):
+            end = min(start + chunk, self.shape[1])
+            result = result + self._gpu_cache[:, start:end] @ coeff[start:end]
+        return result
+
+    def _gpu_chunked_transpose_matvec(self, v: jnp.ndarray) -> jnp.ndarray:
+        """GPU transpose matmul in chunks."""
+        chunk = _GPU_MATMUL_CHUNK
+        parts = []
+        for start in range(0, self.shape[1], chunk):
+            end = min(start + chunk, self.shape[1])
+            parts.append(self._gpu_cache[:, start:end].T @ v)
+        return jnp.concatenate(parts)
+
     def matvec(self, coefficients: np.ndarray | jnp.ndarray, batch_size: int = DEFAULT_GENOTYPE_BATCH_SIZE) -> jnp.ndarray:
         """Compute X_std @ beta (genotype matrix times coefficient vector).
 
-        When GPU-cached: single GPU matmul. Otherwise: batched numpy on CPU.
+        When GPU-cached: chunked GPU matmul. Otherwise: batched numpy on CPU.
         """
         if self._gpu_cache is not None:
             coeff = jnp.asarray(coefficients, dtype=jnp.float32)
             if coeff.ndim != 1 or coeff.shape[0] != self.shape[1]:
                 raise ValueError("coefficient vector must match genotype column count.")
-            return (self._gpu_cache @ coeff).astype(jnp.float64)
+            return self._gpu_chunked_matvec(coeff).astype(jnp.float64)
         coeff_np = np.asarray(coefficients, dtype=np.float64).ravel()
         if coeff_np.shape[0] != self.shape[1]:
             raise ValueError("coefficient vector must match genotype column count.")
@@ -433,12 +456,12 @@ class StandardizedGenotypeMatrix:
         return jnp.asarray(result, dtype=jnp.float64)
 
     def transpose_matvec(self, vector: np.ndarray | jnp.ndarray, batch_size: int = DEFAULT_GENOTYPE_BATCH_SIZE) -> jnp.ndarray:
-        """Compute X_std^T @ v. When GPU-cached: single GPU matmul. Otherwise: batched numpy."""
+        """Compute X_std^T @ v. When GPU-cached: chunked GPU matmul. Otherwise: batched numpy."""
         if self._gpu_cache is not None:
             v = jnp.asarray(vector, dtype=jnp.float32)
             if v.ndim != 1 or v.shape[0] != self.shape[0]:
                 raise ValueError("sample vector must match genotype row count.")
-            return (self._gpu_cache.T @ v).astype(jnp.float64)
+            return self._gpu_chunked_transpose_matvec(v).astype(jnp.float64)
         v_np = np.asarray(vector, dtype=np.float64).ravel()
         if v_np.shape[0] != self.shape[0]:
             raise ValueError("sample vector must match genotype row count.")
@@ -452,7 +475,12 @@ class StandardizedGenotypeMatrix:
             m = jnp.asarray(matrix, dtype=jnp.float32)
             if m.ndim != 2 or m.shape[0] != self.shape[0]:
                 raise ValueError("sample matrix must match genotype row count.")
-            return (self._gpu_cache.T @ m).astype(jnp.float64)
+            chunk = _GPU_MATMUL_CHUNK
+            parts = []
+            for start in range(0, self.shape[1], chunk):
+                end = min(start + chunk, self.shape[1])
+                parts.append(self._gpu_cache[:, start:end].T @ m)
+            return jnp.concatenate(parts).astype(jnp.float64)
         m_np = np.asarray(matrix, dtype=np.float64)
         if m_np.ndim != 2 or m_np.shape[0] != self.shape[0]:
             raise ValueError("sample matrix must match genotype row count.")
