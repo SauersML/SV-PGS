@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import csv
+import hashlib
 import json
+import pickle
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable, Iterator, Sequence
@@ -135,7 +137,15 @@ def load_dataset_from_files(
         # Load VCF genotypes, keeping only matched samples and accumulating as int8
         keep_indices = np.array(aligned_sample_indices, dtype=np.intp)
         log(f"loading VCF genotypes (keeping {len(keep_indices)} of {len(source_sample_ids)} samples, int8 accumulation)...")
-        genotype_matrix, default_variants = _load_vcf(source_path, keep_sample_indices=keep_indices)
+
+        # Try disk cache first to skip VCF re-parsing on repeated runs
+        cached = _load_vcf_from_cache(source_path, keep_sample_indices=keep_indices)
+        if cached is not None:
+            genotype_matrix, default_variants = cached
+        else:
+            genotype_matrix, default_variants = _load_vcf(source_path, keep_sample_indices=keep_indices)
+            _save_vcf_to_cache(source_path, keep_indices, genotype_matrix, default_variants)
+
         log(f"VCF loaded: {genotype_matrix.shape[0]} samples x {len(default_variants)} variants  mem={mem()}")
         plink_metadata = None
     elif resolved_format == "plink1":
@@ -422,6 +432,101 @@ def _resolve_sample_id_column(
             if preferred_column in best_columns:
                 return preferred_column
     return best_columns[0]
+
+
+# ---------------------------------------------------------------------------
+# VCF disk cache
+# ---------------------------------------------------------------------------
+
+_CACHE_DIR_NAME = ".sv_pgs_cache"
+# Bump this when _VariantDefaults, VariantClass, or the cache format changes
+# so stale caches are automatically invalidated.
+_CACHE_VERSION = 1
+
+
+def _vcf_cache_key(vcf_path: Path, keep_sample_indices: np.ndarray | None) -> str:
+    """Compute a hex digest that uniquely identifies a VCF + sample-subset."""
+    h = hashlib.sha256()
+    h.update(f"v{_CACHE_VERSION}:".encode())
+    h.update(str(vcf_path.resolve()).encode())
+    stat = vcf_path.stat()
+    h.update(f"{stat.st_size}:{stat.st_mtime_ns}".encode())
+    if keep_sample_indices is not None:
+        h.update(keep_sample_indices.tobytes())
+    return h.hexdigest()[:24]
+
+
+def _vcf_cache_dir(vcf_path: Path) -> Path:
+    return vcf_path.resolve().parent / _CACHE_DIR_NAME
+
+
+def _load_vcf_from_cache(
+    vcf_path: Path,
+    keep_sample_indices: np.ndarray | None,
+) -> tuple[np.ndarray, list[_VariantDefaults]] | None:
+    """Try to load cached VCF parse results. Returns None on miss."""
+    from sv_pgs.progress import log
+
+    cache_dir = _vcf_cache_dir(vcf_path)
+    if not cache_dir.exists():
+        return None
+
+    key = _vcf_cache_key(vcf_path, keep_sample_indices)
+    geno_path = cache_dir / f"{key}.genotypes.npy"
+    var_path = cache_dir / f"{key}.variants.pkl"
+
+    if not geno_path.exists() or not var_path.exists():
+        log(f"VCF cache miss (key={key})")
+        return None
+
+    try:
+        log(f"VCF cache hit — loading from {cache_dir.name}/{key}.*")
+        genotype_matrix = np.load(geno_path, mmap_mode=None)
+        with open(var_path, "rb") as f:
+            variants = pickle.load(f)
+        log(f"  cached matrix {genotype_matrix.shape}, {len(variants)} variants")
+        return genotype_matrix, variants
+    except Exception as exc:
+        log(f"VCF cache load failed ({exc}), will re-parse")
+        return None
+
+
+def _save_vcf_to_cache(
+    vcf_path: Path,
+    keep_sample_indices: np.ndarray | None,
+    genotype_matrix: np.ndarray,
+    variants: list[_VariantDefaults],
+) -> None:
+    """Persist parsed VCF results to disk cache."""
+    from sv_pgs.progress import log
+
+    cache_dir = _vcf_cache_dir(vcf_path)
+    cache_dir.mkdir(exist_ok=True)
+
+    key = _vcf_cache_key(vcf_path, keep_sample_indices)
+    geno_path = cache_dir / f"{key}.genotypes.npy"
+    var_path = cache_dir / f"{key}.variants.pkl"
+
+    try:
+        # Write to temp files first, then atomically rename to avoid
+        # corrupt cache entries if the process is killed mid-write.
+        geno_tmp = geno_path.with_suffix(".npy.tmp")
+        var_tmp = var_path.with_suffix(".pkl.tmp")
+        np.save(geno_tmp, genotype_matrix)
+        with open(var_tmp, "wb") as f:
+            pickle.dump(variants, f, protocol=pickle.HIGHEST_PROTOCOL)
+        geno_tmp.rename(geno_path)
+        var_tmp.rename(var_path)
+        total_mb = (geno_path.stat().st_size + var_path.stat().st_size) / 1e6
+        log(f"VCF cache saved ({total_mb:.1f} MB) → {cache_dir.name}/{key}.*")
+    except Exception as exc:
+        log(f"VCF cache save failed ({exc}), continuing without cache")
+        # Clean up any partial temp files
+        for p in (geno_tmp, var_tmp, geno_path, var_path):
+            try:
+                p.unlink(missing_ok=True)
+            except Exception:
+                pass
 
 
 def _load_vcf(
