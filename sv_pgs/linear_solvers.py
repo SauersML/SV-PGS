@@ -64,9 +64,13 @@ def solve_spd_system(
         )
         return np.asarray(solution, dtype=np.float64)
 
+    from sv_pgs.progress import log
+    n_cols = rhs_array.shape[1]
     solution_columns: list[np.ndarray] = []
     initial_matrix = None if initial_guess is None else jnp.asarray(initial_guess, dtype=jnp.float64)
-    for column_index in range(rhs_array.shape[1]):
+    for column_index in range(n_cols):
+        if n_cols > 1:
+            log(f"    CG solve: column {column_index+1}/{n_cols}")
         solution_columns.append(
             np.asarray(
                 _solve_single_rhs(
@@ -102,8 +106,10 @@ def stochastic_logdet(
     linear_operator = _as_linear_operator(operator)
     step_count = min(max(lanczos_steps, 2), dimension)
     random_generator = np.random.default_rng(random_seed)
+    from sv_pgs.progress import log
     estimates: list[float] = []
     for _probe_index in range(probe_count):
+        log(f"      logdet probe {_probe_index+1}/{probe_count} ({step_count} Lanczos steps)")
         probe_vector = jnp.asarray(
             random_generator.choice((-1.0, 1.0), size=dimension).astype(np.float64),
             dtype=jnp.float64,
@@ -159,6 +165,13 @@ def _solve_single_rhs(
     initial_residual = float(residual_dot_jax)
     if initial_residual <= tol_sq:
         return jnp.asarray(solution, dtype=jnp.float64)
+    import math
+    # Progress is measured in log-space: how far the residual has dropped
+    # from initial toward the tolerance.  E.g. if initial=1e0, tol=1e-6,
+    # and current=1e-3, we're 50% of the way (3 out of 6 orders of magnitude).
+    log_initial = math.log10(max(initial_residual, 1e-30))
+    log_target = math.log10(max(tol_sq, 1e-30))
+    log_range = max(log_initial - log_target, 1e-6)
     t_start = time.monotonic()
     last_log = t_start
     for _iteration_index in range(max_iterations):
@@ -171,8 +184,9 @@ def _solve_single_rhs(
         updated_residual_dot = float(updated_residual_dot_jax)
         now = time.monotonic()
         if now - last_log >= 5.0 or updated_residual_dot <= tol_sq:
-            reduction = updated_residual_dot / max(initial_residual, 1e-30)
-            log(f"      CG iter {_iteration_index+1}/{max_iterations}: residual={updated_residual_dot:.2e}  reduction={reduction:.2e}  ({now - t_start:.1f}s)  mem={mem()}")
+            log_current = math.log10(max(updated_residual_dot, 1e-30))
+            pct = min(100.0, max(0.0, 100.0 * (log_initial - log_current) / log_range))
+            log(f"      CG iter {_iteration_index+1}/{max_iterations}: {pct:.0f}% converged  residual={updated_residual_dot:.2e}  ({now - t_start:.1f}s)")
             last_log = now
         if updated_residual_dot <= tol_sq:
             return jnp.asarray(solution, dtype=jnp.float64)
