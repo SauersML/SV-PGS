@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import faulthandler
+import io
 import sys
 from pathlib import Path
 
@@ -69,7 +70,10 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: list[str] | None = None) -> int:
-    faulthandler.enable(file=sys.stderr, all_threads=True)
+    try:
+        faulthandler.enable(file=sys.stderr, all_threads=True)
+    except io.UnsupportedOperation:
+        pass  # stderr has no fileno (e.g. pytest capture)
     parser = build_parser()
     args = parser.parse_args(argv)
 
