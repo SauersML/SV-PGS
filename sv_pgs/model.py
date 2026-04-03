@@ -137,14 +137,12 @@ class BayesianPGS:
                 np.asarray(validation_targets, dtype=np.float32),
             )
 
-        # Try to upload the reduced genotype matrix to GPU VRAM for fast matmul.
-        # Falls back to CPU RAM cache, then streaming from raw matrix.
-        gpu_cached = reduced_genotypes.try_materialize_gpu()
-        if gpu_cached:
-            cached = True
-        else:
+        # Materialize the reduced genotype matrix into CPU RAM to avoid
+        # re-reading from disk on every EM iteration.
+        cached = reduced_genotypes.try_materialize_gpu()
+        if not cached:
             cached = reduced_genotypes.try_materialize()
-        log(f"starting variational EM  max_iterations={self.config.max_outer_iterations}  reduced_matrix={reduced_genotypes.shape}  in_memory={cached}  on_gpu={gpu_cached}   mem={mem()}")
+        log(f"starting variational EM  max_iterations={self.config.max_outer_iterations}  reduced_matrix={reduced_genotypes.shape}  in_memory={cached}  mem={mem()}")
         fit_result = fit_variational_em(
             genotypes=reduced_genotypes,
             covariates=prepared_arrays.covariates,

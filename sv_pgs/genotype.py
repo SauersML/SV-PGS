@@ -324,38 +324,26 @@ class StandardizedGenotypeMatrix:
         return int(self.shape[0]) * int(self.shape[1]) * 4
 
     def try_materialize_gpu(self) -> bool:
-        """Materialize the standardized matrix directly into GPU VRAM.
+        """Materialize the standardized matrix into CPU RAM.
 
-        If the matrix fits (float32), uploads it once so that matvec/transpose
-        become single GPU matmul calls with zero per-iteration transfer overhead.
-        Returns True if now resident on GPU, False on CPU-only or OOM.
+        GPU matmul is disabled because JAX/XLA has known segfault bugs on
+        Turing GPUs (T4) during GEMM execution (jax-ml/jax#17349).
+        The GPU is still used for element-wise ops (preprocessing, sigmoid).
+        CPU RAM materialization avoids re-reading from disk on every EM
+        iteration and is fast enough with numpy BLAS.
+
+        Returns True if now cached in memory.
         """
-        if self._gpu_cache is not None:
+        if self._dense_cache is not None:
             return True
-        try:
-            devices = jax.devices()
-            if not devices or devices[0].platform == "cpu":
-                return False
-        except Exception:
-            return False
-        nbytes_f32 = self.dense_bytes()
+        nbytes = self.dense_bytes()
         from sv_pgs.progress import log, mem
-        log(f"    materializing {self.shape[1]} variants x {self.shape[0]} samples ({nbytes_f32 / 1e9:.1f} GB) onto GPU  mem={mem()}")
-        try:
-            # Build standardized matrix on CPU in batches, then upload to GPU
-            cpu_matrix = np.empty(self.shape, dtype=np.float32)
-            for batch in self.iter_column_batches(batch_size=auto_batch_size(self.shape[0])):
-                cpu_matrix[:, batch.variant_indices] = batch.values
-            self._gpu_cache = jnp.asarray(cpu_matrix, dtype=jnp.float32)
-            del cpu_matrix
-            # Force the transfer to complete and verify it landed on GPU
-            self._gpu_cache.block_until_ready()
-            log(f"    GPU-resident matrix ready ({self._gpu_cache.dtype})  mem={mem()}")
-            return True
-        except Exception as e:
-            log(f"    GPU materialization failed ({e}), falling back to streaming  mem={mem()}")
-            self._gpu_cache = None
-            return False
+        log(f"    materializing {self.shape[1]} variants x {self.shape[0]} samples ({nbytes / 1e9:.1f} GB) into RAM  mem={mem()}")
+        self._dense_cache = np.empty(self.shape, dtype=np.float32)
+        for batch in self.iter_column_batches(batch_size=auto_batch_size(self.shape[0])):
+            self._dense_cache[:, batch.variant_indices] = batch.values
+        log(f"    RAM-resident matrix ready  mem={mem()}")
+        return True
 
     def try_materialize(self) -> bool:
         """Materialize into RAM if below the auto-materialize threshold.
