@@ -187,6 +187,71 @@ def test_model_skips_tie_map_when_active_variant_count_exceeds_limit():
     )
 
 
+def test_validation_path_keeps_raw_genotypes_streaming():
+    class NonMaterializingValidationMatrix(RawGenotypeMatrix):
+        def __init__(self, matrix: np.ndarray) -> None:
+            self.matrix = np.asarray(matrix, dtype=np.float32)
+            self.materialize_calls = 0
+
+        @property
+        def shape(self) -> tuple[int, int]:
+            return self.matrix.shape
+
+        def iter_column_batches(self, variant_indices=None, batch_size: int = 1024):
+            resolved_indices = (
+                np.arange(self.matrix.shape[1], dtype=np.int32)
+                if variant_indices is None
+                else np.asarray(variant_indices, dtype=np.int32)
+            )
+            for start_index in range(0, resolved_indices.shape[0], batch_size):
+                batch_indices = resolved_indices[start_index : start_index + batch_size]
+                yield RawGenotypeBatch(
+                    variant_indices=batch_indices,
+                    values=np.asarray(self.matrix[:, batch_indices], dtype=np.float32),
+                )
+
+        def materialize(self, variant_indices=None) -> np.ndarray:
+            self.materialize_calls += 1
+            raise AssertionError("validation genotypes should stay streaming")
+
+    train_genotypes = np.array(
+        [
+            [0.0, 1.0, 2.0],
+            [1.0, 0.0, 1.0],
+            [2.0, 1.0, 0.0],
+            [0.0, 2.0, 1.0],
+            [1.0, 1.0, 1.0],
+            [2.0, 0.0, 2.0],
+        ],
+        dtype=np.float32,
+    )
+    covariate_matrix = np.zeros((train_genotypes.shape[0], 1), dtype=np.float32)
+    target_vector = np.array([0.0, 1.0, 2.0, 0.5, 1.5, 2.5], dtype=np.float32)
+    validation_genotypes = NonMaterializingValidationMatrix(train_genotypes.copy())
+    variant_records = [
+        VariantRecord("variant_0", VariantClass.SNV, "1", 100),
+        VariantRecord("variant_1", VariantClass.SNV, "1", 101),
+        VariantRecord("variant_2", VariantClass.SNV, "1", 102),
+    ]
+
+    model = BayesianPGS(
+        ModelConfig(
+            trait_type=TraitType.QUANTITATIVE,
+            max_outer_iterations=2,
+            maximum_tie_map_variants=10,
+        )
+    ).fit(
+        train_genotypes,
+        covariate_matrix,
+        target_vector,
+        variant_records,
+        validation_data=(validation_genotypes, covariate_matrix, target_vector),
+    )
+
+    assert model.state is not None
+    assert validation_genotypes.materialize_calls == 0
+
+
 def test_compute_support_counts_only_reads_unresolved_structural_variants():
     class SpyRawGenotypeMatrix(RawGenotypeMatrix):
         def __init__(self, matrix: np.ndarray) -> None:

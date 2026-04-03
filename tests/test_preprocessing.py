@@ -3,7 +3,15 @@ import pytest
 
 from sv_pgs.config import ModelConfig, VariantClass
 from sv_pgs.data import VariantRecord
-from sv_pgs.preprocessing import Preprocessor, build_tie_map, collapse_tie_groups, fit_preprocessor, select_active_variant_indices
+from sv_pgs.genotype import as_raw_genotype_matrix
+from sv_pgs.preprocessing import (
+    Preprocessor,
+    build_tie_map,
+    collapse_tie_groups,
+    compute_variant_statistics,
+    fit_preprocessor,
+    select_active_variant_indices,
+)
 
 
 def test_fold_preprocessing_and_exact_ties_ignore_variant_class():
@@ -100,3 +108,27 @@ def test_select_active_variant_indices_filters_low_carrier_svs():
     # sv_1 has support=5 >= 2 → kept
     # snp_2 is SNV → always kept
     assert sorted(result.tolist()) == [1, 2]
+
+
+def test_fit_preprocessor_matches_streaming_variant_statistics_with_missing_values():
+    genotype_matrix = np.array(
+        [
+            [0.0, 1.0, np.nan],
+            [1.0, np.nan, 2.0],
+            [2.0, 0.0, 1.0],
+            [np.nan, 1.0, 0.0],
+        ],
+        dtype=np.float32,
+    )
+    covariate_matrix = np.zeros((4, 1), dtype=np.float32)
+    target_vector = np.array([0.0, 1.0, 0.0, 1.0], dtype=np.float32)
+    config = ModelConfig()
+
+    prepared_arrays = fit_preprocessor(genotype_matrix, covariate_matrix, target_vector, config)
+    variant_statistics = compute_variant_statistics(
+        raw_genotypes=as_raw_genotype_matrix(genotype_matrix),
+        config=config,
+    )
+
+    np.testing.assert_allclose(prepared_arrays.means, variant_statistics.means)
+    np.testing.assert_allclose(prepared_arrays.scales, variant_statistics.scales)

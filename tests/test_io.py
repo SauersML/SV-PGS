@@ -12,7 +12,13 @@ from sklearn.metrics import r2_score, roc_auc_score
 from sv_pgs import BayesianPGS
 from sv_pgs.config import ModelConfig, TraitType, VariantClass
 from sv_pgs.cli import main
-from sv_pgs.io import load_dataset_from_files, run_training_pipeline
+from sv_pgs.io import (
+    _VariantDefaults,
+    _load_vcf_from_cache,
+    _save_vcf_to_cache,
+    load_dataset_from_files,
+    run_training_pipeline,
+)
 import sv_pgs.genotype as genotype_module
 
 
@@ -112,6 +118,40 @@ def test_load_dataset_from_vcf_auto_detects_research_id_column(tmp_path: Path):
 
     assert dataset.sample_ids == ["rid1", "rid2"]
     np.testing.assert_allclose(dataset.genotypes, np.array([[2.0], [1.0]], dtype=np.float32))
+
+
+def test_vcf_cache_save_uses_real_temp_file_and_roundtrips(tmp_path: Path):
+    vcf_path = tmp_path / "cohort.vcf"
+    vcf_path.write_text("##fileformat=VCFv4.2\n", encoding="utf-8")
+    keep_sample_indices = np.array([0, 2], dtype=np.int32)
+    genotype_matrix = np.array([[0, 1], [1, 2]], dtype=np.int8)
+    variants = [
+        _VariantDefaults(
+            variant_id="variant_0",
+            variant_class=VariantClass.SNV,
+            chromosome="1",
+            position=100,
+            length=1.0,
+            allele_frequency=0.25,
+            quality=50.0,
+        )
+    ]
+
+    _save_vcf_to_cache(
+        vcf_path=vcf_path,
+        keep_sample_indices=keep_sample_indices,
+        genotype_matrix=genotype_matrix,
+        variants=variants,
+    )
+
+    cached = _load_vcf_from_cache(vcf_path=vcf_path, keep_sample_indices=keep_sample_indices)
+
+    assert cached is not None
+    cached_genotypes, cached_variants = cached
+    np.testing.assert_array_equal(cached_genotypes, genotype_matrix)
+    assert cached_variants == variants
+    assert not list((tmp_path / ".svpgs_cache").glob("*.tmp"))
+    assert not list((tmp_path / ".svpgs_cache").glob("*.tmp.npy"))
 
 
 def test_load_dataset_from_plink_auto_detects_person_id_column(tmp_path: Path):

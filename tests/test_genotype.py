@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import jax.numpy as jnp
 import numpy as np
 
 from sv_pgs.genotype import RawGenotypeBatch, RawGenotypeMatrix, as_raw_genotype_matrix
@@ -103,7 +102,7 @@ def test_streaming_standardized_linear_algebra_matches_dense_path():
     )
 
 
-def test_gpu_cached_chunked_linear_algebra_matches_dense_reference():
+def test_materialized_linear_algebra_matches_dense_reference():
     random_generator = np.random.default_rng(0)
     raw_matrix = random_generator.normal(size=(12, 130)).astype(np.float32)
     means = raw_matrix.mean(axis=0).astype(np.float32)
@@ -115,7 +114,7 @@ def test_gpu_cached_chunked_linear_algebra_matches_dense_reference():
 
     dense = as_raw_genotype_matrix(raw_matrix).standardized(means, scales)
     gpu_cached = as_raw_genotype_matrix(raw_matrix).standardized(means, scales)
-    gpu_cached._gpu_cache = jnp.asarray(gpu_cached.materialize(), dtype=jnp.float32)
+    gpu_cached._dense_cache = gpu_cached.materialize()
 
     np.testing.assert_allclose(
         np.asarray(gpu_cached.matvec(coefficients), dtype=np.float64),

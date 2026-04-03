@@ -9,7 +9,6 @@ from pathlib import Path
 from typing import Any, Iterable, Iterator, Sequence
 
 import numpy as np
-from cyvcf2 import VCF
 from sklearn.metrics import log_loss, r2_score, roc_auc_score
 
 from sv_pgs.config import ModelConfig, TraitType, VariantClass
@@ -96,6 +95,8 @@ def load_dataset_from_files(
     if resolved_format == "vcf":
         # Read VCF header to get sample IDs without parsing genotypes
         log("reading VCF header for sample IDs...")
+        from cyvcf2 import VCF
+
         vcf_header_reader = VCF(str(source_path))
         source_sample_ids = [str(s) for s in vcf_header_reader.samples]
         vcf_header_reader.close()
@@ -548,6 +549,8 @@ def _load_vcf(
 
     vcf_size_mb = vcf_path.stat().st_size / 1e6
     log(f"opening VCF: {vcf_path.name} ({vcf_size_mb:.1f} MB)")
+
+    from cyvcf2 import VCF
 
     reader = VCF(str(vcf_path))
     n_threads = os.cpu_count() or 4

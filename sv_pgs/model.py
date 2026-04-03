@@ -149,8 +149,8 @@ class BayesianPGS:
         log(
             f"starting variational EM  max_iterations={self.config.max_outer_iterations}  "
             f"reduced_matrix={reduced_genotypes.shape}  in_memory={cached}  "
-            f"on_gpu={reduced_genotypes._gpu_cache is not None}  "
-            f"{reduced_genotypes._gpu_chunk_description(rhs_columns=1)}  mem={mem()}"
+            f"on_gpu={reduced_genotypes._cupy_cache is not None}  "
+            f"mem={mem()}"
         )
         fit_result = fit_variational_em(
             genotypes=reduced_genotypes,

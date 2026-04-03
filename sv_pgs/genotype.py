@@ -4,16 +4,14 @@ from abc import ABC, abstractmethod
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
-import subprocess
-import sys
-from typing import Iterator, Sequence
+from typing import Any, Iterator, Sequence
 
 import sv_pgs._jax  # noqa: F401
 import jax
 import jax.numpy as jnp
 import numpy as np
 from bed_reader import open_bed
-from sv_pgs.progress import gpu_memory_snapshot, jax_runtime_snapshot, log, mem, nvidia_smi_snapshot
+from sv_pgs.progress import log, mem
 
 DEFAULT_GENOTYPE_BATCH_SIZE = 1024  # fallback when sample count is unknown
 
@@ -29,33 +27,6 @@ MIN_BED_READER_BATCH_SIZE = 32  # always read at least this many variants
 # cache it in RAM.  This avoids re-reading from disk on every EM iteration
 # (typically 10-30 iterations), giving a huge speedup.
 MATERIALIZE_THRESHOLD_BYTES = 4_000_000_000  # 4 GB
-
-# Keep individual dense GPU kernels small enough that XLA/CUDA compilation is
-# stable even for ~100k-sample matrices.  The chunk width is chosen
-# dynamically from these caps.
-_GPU_MATMUL_TARGET_ELEMENTS = 32_000_000
-_GPU_MATMUL_MIN_CHUNK = 16
-_GPU_MATMUL_MAX_CHUNK = 512
-_GPU_MATMAT_MAX_RHS_COLUMNS = 8
-_GPU_PROBE_TIMEOUT_SECONDS = 45.0
-_GPU_DIAGNOSTIC_LOG_LIMIT = 4
-
-
-def _floor_power_of_two(value: int) -> int:
-    if value <= 1:
-        return 1
-    return 1 << (value.bit_length() - 1)
-
-
-def _power_of_two_candidates(maximum_chunk: int) -> list[int]:
-    candidates: list[int] = []
-    current = _floor_power_of_two(max(maximum_chunk, _GPU_MATMUL_MIN_CHUNK))
-    while current >= _GPU_MATMUL_MIN_CHUNK:
-        candidates.append(current)
-        current //= 2
-    if _GPU_MATMUL_MIN_CHUNK not in candidates:
-        candidates.append(_GPU_MATMUL_MIN_CHUNK)
-    return candidates
 
 
 def as_raw_genotype_matrix(genotypes: RawGenotypeMatrix | np.ndarray) -> RawGenotypeMatrix:
@@ -169,7 +140,7 @@ class PlinkRawGenotypeMatrix(RawGenotypeMatrix):
     variant_count: int
     total_sample_count: int
     batch_size: int = DEFAULT_GENOTYPE_BATCH_SIZE
-    _reader: open_bed | None = field(init=False, default=None, repr=False)
+    _reader: Any | None = field(init=False, default=None, repr=False)
 
     def __post_init__(self) -> None:
         self.sample_indices = np.asarray(self.sample_indices, dtype=np.intp)
@@ -180,14 +151,14 @@ class PlinkRawGenotypeMatrix(RawGenotypeMatrix):
     def shape(self) -> tuple[int, int]:
         return int(self.sample_indices.shape[0]), int(self.variant_count)
 
-    def _read_batch(self, reader: open_bed, batch_indices: np.ndarray) -> np.ndarray:
+    def _read_batch(self, reader: Any, batch_indices: np.ndarray) -> np.ndarray:
         """Read one batch as int8, convert to float32 with NaN for missing."""
         raw_i8 = self._read_batch_i8(reader, batch_indices)
         result = np.asarray(raw_i8, dtype=np.float32)
         result[raw_i8 == -127] = np.nan
         return result
 
-    def _read_batch_i8(self, reader: open_bed, batch_indices: np.ndarray) -> np.ndarray:
+    def _read_batch_i8(self, reader: Any, batch_indices: np.ndarray) -> np.ndarray:
         """Read one batch as raw int8 (0/1/2/-127). No float conversion."""
         sample_index = _contiguous_index_or_slice(self.sample_indices)
         col_index = _contiguous_index_or_slice(batch_indices)
@@ -281,8 +252,10 @@ class PlinkRawGenotypeMatrix(RawGenotypeMatrix):
         reader = self._bed_reader()
         return self._read_batch(reader, resolved_indices)
 
-    def _bed_reader(self) -> open_bed:
+    def _bed_reader(self) -> Any:
         if self._reader is None:
+            if open_bed is None:
+                raise ModuleNotFoundError("bed_reader is required to read PLINK .bed files.")
             log(f"    opening bed_reader (lazy, no metadata): iid_count={self.total_sample_count} sid_count={self.variant_count}  mem={mem()}")
             self._reader = open_bed(
                 self.bed_path,
@@ -296,6 +269,17 @@ class PlinkRawGenotypeMatrix(RawGenotypeMatrix):
         return self._reader
 
 
+def _try_import_cupy():
+    """Import CuPy if available (GPU matmul via cuBLAS, bypassing JAX/XLA)."""
+    try:
+        import cupy
+        if cupy.cuda.runtime.getDeviceCount() > 0:
+            return cupy
+    except Exception:
+        pass
+    return None
+
+
 @dataclass(slots=True)
 class StandardizedGenotypeMatrix:
     """A genotype matrix that applies z-score standardization on the fly.
@@ -303,23 +287,15 @@ class StandardizedGenotypeMatrix:
     For each variant j: standardized_value = (raw_dosage - mean_j) / scale_j
     Missing values (NaN) are imputed to the mean (producing 0 after centering).
 
-    This wraps a RawGenotypeMatrix and applies the transformation lazily during
-    iteration, so we never need to store the full standardized matrix unless
-    we choose to cache it (try_materialize).  Supports matrix-vector products
-    (matvec, transpose_matvec) needed by the Bayesian inference engine.
-
-    When the matrix fits in GPU VRAM (try_materialize_gpu), it is uploaded once
-    and kept resident — matvec/transpose_matvec then become single GPU matmul
-    calls with zero CPU→GPU transfer overhead per iteration.
+    GPU acceleration uses CuPy (cuBLAS) for matmul, bypassing JAX/XLA which
+    has known segfault bugs on Turing GPUs.  Falls back to numpy BLAS on CPU.
     """
     raw: RawGenotypeMatrix
     means: np.ndarray       # per-variant mean from training data
     scales: np.ndarray      # per-variant std dev from training data
     variant_indices: np.ndarray  # which columns of raw to use (for subsetting)
     _dense_cache: np.ndarray | None = field(init=False, default=None, repr=False)
-    _gpu_cache: jnp.ndarray | None = field(init=False, default=None, repr=False)
-    _gpu_chunk_override: int | None = field(init=False, default=None, repr=False)
-    _gpu_op_counts: dict[str, int] = field(init=False, default_factory=dict, repr=False)
+    _cupy_cache: object | None = field(init=False, default=None, repr=False)  # cupy.ndarray
 
     def __post_init__(self) -> None:
         self.means = np.asarray(self.means, dtype=np.float32)
@@ -331,6 +307,14 @@ class StandardizedGenotypeMatrix:
             raise ValueError("variant_indices out of bounds.")
 
     @property
+    def _gpu_cache(self):
+        return self._cupy_cache
+
+    @_gpu_cache.setter
+    def _gpu_cache(self, value) -> None:
+        self._cupy_cache = value
+
+    @property
     def shape(self) -> tuple[int, int]:
         return self.raw.shape[0], int(self.variant_indices.shape[0])
 
@@ -338,71 +322,16 @@ class StandardizedGenotypeMatrix:
         """Estimated bytes if materialized as float32."""
         return int(self.shape[0]) * int(self.shape[1]) * 4
 
-    def _gpu_chunk_description(self, rhs_columns: int = 1) -> str:
-        auto_chunk = max(
-            _GPU_MATMUL_MIN_CHUNK,
-            min(_GPU_MATMUL_MAX_CHUNK, _floor_power_of_two(max(_GPU_MATMUL_TARGET_ELEMENTS // max(self.shape[0] * max(int(rhs_columns), 1), 1), 1))),
-        )
-        chunk = self._gpu_column_chunk(rhs_columns=rhs_columns)
-        return (
-            f"chunk={chunk} auto_chunk={auto_chunk} override={self._gpu_chunk_override} "
-            f"shape={self.shape} rhs_columns={rhs_columns}"
-        )
-
-    def _log_gpu_operation(self, operation: str, detail: str, *, limit: int = _GPU_DIAGNOSTIC_LOG_LIMIT) -> None:
-        current_count = self._gpu_op_counts.get(operation, 0) + 1
-        self._gpu_op_counts[operation] = current_count
-        if current_count > limit:
-            return
-        log(f"    GPU op {operation} call={current_count}: {detail}")
-        log(f"    GPU op {operation} device snapshot: {gpu_memory_snapshot()}")
-        if current_count == 1:
-            log(f"    GPU op {operation} nvidia-smi: {nvidia_smi_snapshot()}")
-
-    def _probe_safe_gpu_chunk(self, candidate_chunk: int) -> tuple[bool, str]:
-        probe_code = """
-import sys
-import jax
-import jax.numpy as jnp
-n_samples = int(sys.argv[1])
-chunk = int(sys.argv[2])
-matrix = jnp.zeros((n_samples, chunk), dtype=jnp.float32)
-vector = jnp.ones((chunk,), dtype=jnp.float32)
-result = matrix @ vector
-result.block_until_ready()
-print(f"backend={jax.default_backend()} devices={jax.devices()} shape={(n_samples, chunk)}")
-"""
-        try:
-            completed = subprocess.run(
-                [sys.executable, "-c", probe_code, str(self.shape[0]), str(candidate_chunk)],
-                capture_output=True,
-                text=True,
-                timeout=_GPU_PROBE_TIMEOUT_SECONDS,
-                check=False,
-            )
-        except subprocess.TimeoutExpired as error:
-            return False, f"timeout after {error.timeout}s"
-        except Exception as error:
-            return False, f"probe_error={error}"
-        stdout = completed.stdout.strip().replace("\n", " | ")
-        stderr = completed.stderr.strip().replace("\n", " | ")
-        if completed.returncode == 0:
-            return True, stdout or "probe_ok"
-        if completed.returncode < 0:
-            return False, f"signal={-completed.returncode} stdout={stdout} stderr={stderr}"
-        return False, f"rc={completed.returncode} stdout={stdout} stderr={stderr}"
-
     def try_materialize_gpu(self) -> bool:
         """Materialize the standardized matrix into RAM and optionally onto GPU.
 
-        GPU GEMM is disabled by default because JAX/XLA has known segfault bugs
-        on Turing GPUs (T4) during matmul execution (jax-ml/jax#17349).  Set
-        SV_PGS_GPU_MATMUL=1 to force GPU matmul if you know your GPU works.
+        Uses CuPy (cuBLAS) for GPU matmul if available, bypassing JAX/XLA
+        which has known segfault bugs on Turing GPUs (T4).
+        Falls back to CPU numpy BLAS if CuPy is not available.
         """
-        if self._gpu_cache is not None:
+        if self._cupy_cache is not None:
             return True
-        import os
-        gpu_matmul_enabled = os.environ.get("SV_PGS_GPU_MATMUL", "0") == "1"
+        # Materialize into CPU RAM first
         if self._dense_cache is None:
             nbytes = self.dense_bytes()
             log(f"    materializing {self.shape[1]} variants x {self.shape[0]} samples ({nbytes / 1e9:.1f} GB) into RAM  mem={mem()}")
@@ -410,61 +339,25 @@ print(f"backend={jax.default_backend()} devices={jax.devices()} shape={(n_sample
             for batch in self.iter_column_batches(batch_size=auto_batch_size(self.shape[0])):
                 self._dense_cache[:, batch.variant_indices] = batch.values
             log(f"    RAM-resident matrix ready  mem={mem()}")
-        if not gpu_matmul_enabled:
-            log("    GPU GEMM disabled (T4 segfault workaround; set SV_PGS_GPU_MATMUL=1 to override)")
-            return True  # materialized in RAM, skip GPU upload
-        try:
-            devices = jax.devices()
-            if not devices or devices[0].platform == "cpu":
-                log("    no GPU backend detected; leaving matrix in RAM")
-                return False
-            log(f"    GPU materialization runtime: {jax_runtime_snapshot()}")
-            log(f"    GPU materialization pre-upload: {gpu_memory_snapshot()}")
-            log(f"    GPU materialization nvidia-smi: {nvidia_smi_snapshot()}")
-            test_slice = jnp.asarray(self._dense_cache[:64, :64], dtype=jnp.float32)
-            test_vec = jnp.ones(64, dtype=jnp.float32)
-            test_result = test_slice @ test_vec
-            test_result.block_until_ready()
-            del test_slice, test_vec, test_result
-            auto_chunk = self._gpu_column_chunk(rhs_columns=1)
-            probe_candidates = _power_of_two_candidates(auto_chunk)
-            log(
-                "    GPU matmul probe candidates: "
-                + ", ".join(str(candidate) for candidate in probe_candidates)
-                + f"  sample_count={self.shape[0]}"
-            )
-            for candidate in probe_candidates:
-                probe_ok, probe_detail = self._probe_safe_gpu_chunk(candidate)
-                log(f"    GPU matmul probe chunk={candidate}: {'PASS' if probe_ok else 'FAIL'}  {probe_detail}")
-                if probe_ok:
-                    self._gpu_chunk_override = candidate
-                    break
-            if self._gpu_chunk_override is None:
-                log("    GPU probe found no safe dense matmul chunk; using auto chunk for live diagnostics")
-            else:
-                log(f"    GPU probe selected safe chunk={self._gpu_chunk_override}  auto_chunk={auto_chunk}")
-            log(
-                f"    uploading full matrix to GPU  {self._gpu_chunk_description(rhs_columns=1)}  mem={mem()}"
-            )
-            self._gpu_cache = jnp.asarray(self._dense_cache, dtype=jnp.float32)
-            self._gpu_cache.block_until_ready()
-            log(f"    GPU-resident matrix ready ({self._gpu_cache.dtype})  mem={mem()}")
-            log(f"    GPU materialization post-upload: {gpu_memory_snapshot()}")
-            log(f"    GPU materialization post-upload nvidia-smi: {nvidia_smi_snapshot()}")
-            return True
-        except Exception as error:
-            log(f"    GPU upload failed ({error}), leaving matrix in RAM  mem={mem()}")
-            log(f"    GPU materialization failure snapshot: {gpu_memory_snapshot()}")
-            log(f"    GPU materialization failure nvidia-smi: {nvidia_smi_snapshot()}")
-            self._gpu_cache = None
-            return False
+        # Try uploading to GPU via CuPy
+        cupy = _try_import_cupy()
+        if cupy is not None:
+            try:
+                self._cupy_cache = cupy.asarray(self._dense_cache)
+                log(f"    CuPy GPU matrix uploaded ({self._cupy_cache.nbytes / 1e9:.1f} GB)  mem={mem()}")
+                return True
+            except Exception as exc:
+                log(f"    CuPy GPU upload failed ({exc}), using CPU numpy BLAS  mem={mem()}")
+                return True
+        log(f"    CuPy not available, using CPU numpy BLAS  mem={mem()}")
+        return True
 
     def try_materialize(self) -> bool:
         """Materialize into RAM if below the auto-materialize threshold.
 
         Returns True if now cached in memory, False if still streaming from disk.
         """
-        if self._gpu_cache is not None or self._dense_cache is not None:
+        if self._cupy_cache is not None or self._dense_cache is not None:
             return True
         nbytes = self.dense_bytes()
         if nbytes > MATERIALIZE_THRESHOLD_BYTES:
@@ -482,9 +375,8 @@ print(f"backend={jax.default_backend()} devices={jax.devices()} shape={(n_sample
             scales=self.scales,
             variant_indices=self.variant_indices[resolved_local_indices],
         )
-        if self._gpu_cache is not None:
-            subset._gpu_cache = self._gpu_cache[:, resolved_local_indices]
-            subset._gpu_chunk_override = self._gpu_chunk_override
+        if self._cupy_cache is not None:
+            subset._cupy_cache = self._cupy_cache[:, resolved_local_indices]
         elif self._dense_cache is not None:
             subset._dense_cache = np.asarray(self._dense_cache[:, resolved_local_indices], dtype=np.float32)
         return subset
@@ -520,8 +412,8 @@ print(f"backend={jax.default_backend()} devices={jax.devices()} shape={(n_sample
     def materialize(self, batch_size: int = DEFAULT_GENOTYPE_BATCH_SIZE) -> np.ndarray:
         if self._dense_cache is not None:
             return self._dense_cache
-        if self._gpu_cache is not None:
-            self._dense_cache = np.asarray(self._gpu_cache, dtype=np.float32)
+        if self._cupy_cache is not None:
+            self._dense_cache = self._cupy_cache.get()  # cupy -> numpy
             return self._dense_cache
         matrix = np.empty(self.shape, dtype=np.float32)
         for batch in self.iter_column_batches(batch_size=batch_size):
@@ -529,90 +421,19 @@ print(f"backend={jax.default_backend()} devices={jax.devices()} shape={(n_sample
         self._dense_cache = matrix
         return matrix
 
-    def _gpu_column_chunk(self, rhs_columns: int = 1) -> int:
-        safe_rhs_columns = max(int(rhs_columns), 1)
-        target_chunk = max(
-            _GPU_MATMUL_TARGET_ELEMENTS // max(self.shape[0] * safe_rhs_columns, 1),
-            1,
-        )
-        chunk = _floor_power_of_two(target_chunk)
-        bounded_chunk = max(_GPU_MATMUL_MIN_CHUNK, min(_GPU_MATMUL_MAX_CHUNK, chunk, self.shape[1]))
-        if self._gpu_chunk_override is not None:
-            bounded_chunk = max(_GPU_MATMUL_MIN_CHUNK, min(bounded_chunk, self._gpu_chunk_override, self.shape[1]))
-        return bounded_chunk
-
-    def _gpu_rhs_chunk(self, rhs_columns: int) -> int:
-        return max(1, min(int(rhs_columns), _GPU_MATMAT_MAX_RHS_COLUMNS))
-
-    def _gpu_chunked_matvec(self, coeff: jnp.ndarray) -> jnp.ndarray:
-        """GPU matmul in bounded chunks to avoid large-shape XLA crashes."""
-        chunk = self._gpu_column_chunk(rhs_columns=1)
-        self._log_gpu_operation(
-            "matvec",
-            f"{self._gpu_chunk_description(rhs_columns=1)} coeff_shape={tuple(coeff.shape)} coeff_dtype={coeff.dtype}",
-        )
-        result = jnp.zeros(self.shape[0], dtype=jnp.float32)
-        for start in range(0, self.shape[1], chunk):
-            end = min(start + chunk, self.shape[1])
-            self._log_gpu_operation(
-                "matvec_chunk",
-                f"range=[{start}:{end}) matrix_shape=({self.shape[0]}, {end - start}) vector_shape=({end - start},)",
-            )
-            chunk_term = self._gpu_cache[:, start:end] @ coeff[start:end]
-            result = result + chunk_term
-        return result
-
-    def _gpu_chunked_transpose_matvec(self, v: jnp.ndarray) -> jnp.ndarray:
-        """GPU transpose matmul in bounded chunks."""
-        chunk = self._gpu_column_chunk(rhs_columns=1)
-        self._log_gpu_operation(
-            "transpose_matvec",
-            f"{self._gpu_chunk_description(rhs_columns=1)} vector_shape={tuple(v.shape)} vector_dtype={v.dtype}",
-        )
-        parts = []
-        for start in range(0, self.shape[1], chunk):
-            end = min(start + chunk, self.shape[1])
-            self._log_gpu_operation(
-                "transpose_matvec_chunk",
-                f"range=[{start}:{end}) matrix_shape=({self.shape[0]}, {end - start}) vector_shape=({self.shape[0]},)",
-            )
-            parts.append(self._gpu_cache[:, start:end].T @ v)
-        return jnp.concatenate(parts)
-
-    def _gpu_chunked_matmat(self, matrix: jnp.ndarray) -> jnp.ndarray:
-        """GPU matrix-matrix multiply with chunking over both variants and RHS."""
-        variant_chunk = self._gpu_column_chunk(rhs_columns=matrix.shape[1])
-        rhs_chunk = self._gpu_rhs_chunk(matrix.shape[1])
-        self._log_gpu_operation(
-            "matmat",
-            f"{self._gpu_chunk_description(rhs_columns=matrix.shape[1])} rhs_shape={tuple(matrix.shape)} rhs_chunk={rhs_chunk}",
-        )
-        result_blocks = []
-        for rhs_start in range(0, matrix.shape[1], rhs_chunk):
-            rhs_end = min(rhs_start + rhs_chunk, matrix.shape[1])
-            rhs_block = matrix[:, rhs_start:rhs_end]
-            rhs_result = jnp.zeros((self.shape[0], rhs_end - rhs_start), dtype=jnp.float32)
-            for start in range(0, self.shape[1], variant_chunk):
-                end = min(start + variant_chunk, self.shape[1])
-                self._log_gpu_operation(
-                    "matmat_chunk",
-                    f"col_range=[{start}:{end}) rhs_range=[{rhs_start}:{rhs_end}) matrix_shape=({self.shape[0]}, {end - start}) rhs_block_shape=({end - start}, {rhs_end - rhs_start})",
-                )
-                chunk_term = self._gpu_cache[:, start:end] @ rhs_block[start:end, :]
-                rhs_result = rhs_result + chunk_term
-            result_blocks.append(rhs_result)
-        return jnp.concatenate(result_blocks, axis=1)
-
     def matvec(self, coefficients: np.ndarray | jnp.ndarray, batch_size: int = DEFAULT_GENOTYPE_BATCH_SIZE) -> jnp.ndarray:
         """Compute X_std @ beta (genotype matrix times coefficient vector).
 
-        When GPU-cached: chunked GPU matmul. Otherwise: batched numpy on CPU.
+        When CuPy GPU-cached: cuBLAS matmul. Otherwise: batched numpy on CPU.
         """
-        if self._gpu_cache is not None:
-            coeff = jnp.asarray(coefficients, dtype=jnp.float32)
-            if coeff.ndim != 1 or coeff.shape[0] != self.shape[1]:
+        if self._cupy_cache is not None:
+            import cupy
+            coeff_np = np.asarray(coefficients, dtype=np.float32).ravel()
+            if coeff_np.shape[0] != self.shape[1]:
                 raise ValueError("coefficient vector must match genotype column count.")
-            return self._gpu_chunked_matvec(coeff).astype(jnp.float64)
+            coeff_cupy = cupy.asarray(coeff_np)
+            result = self._cupy_cache @ coeff_cupy
+            return jnp.asarray(result.get().astype(np.float64), dtype=jnp.float64)
         coeff_np = np.asarray(coefficients, dtype=np.float64).ravel()
         if coeff_np.shape[0] != self.shape[1]:
             raise ValueError("coefficient vector must match genotype column count.")
@@ -623,12 +444,15 @@ print(f"backend={jax.default_backend()} devices={jax.devices()} shape={(n_sample
         return jnp.asarray(result, dtype=jnp.float64)
 
     def matmat(self, matrix: np.ndarray | jnp.ndarray, batch_size: int = DEFAULT_GENOTYPE_BATCH_SIZE) -> jnp.ndarray:
-        """Compute X_std @ M. When GPU-cached: chunked GPU matmul. Otherwise: batched numpy."""
-        if self._gpu_cache is not None:
-            m = jnp.asarray(matrix, dtype=jnp.float32)
-            if m.ndim != 2 or m.shape[0] != self.shape[1]:
+        """Compute X_std @ M. When CuPy GPU-cached: cuBLAS matmul. Otherwise: batched numpy."""
+        if self._cupy_cache is not None:
+            import cupy
+            m_np = np.asarray(matrix, dtype=np.float32)
+            if m_np.ndim != 2 or m_np.shape[0] != self.shape[1]:
                 raise ValueError("variant matrix must match genotype column count.")
-            return self._gpu_chunked_matmat(m).astype(jnp.float64)
+            m_cupy = cupy.asarray(m_np)
+            result = self._cupy_cache @ m_cupy
+            return jnp.asarray(result.get().astype(np.float64), dtype=jnp.float64)
         m_np = np.asarray(matrix, dtype=np.float64)
         if m_np.ndim != 2 or m_np.shape[0] != self.shape[1]:
             raise ValueError("variant matrix must match genotype column count.")
@@ -639,12 +463,15 @@ print(f"backend={jax.default_backend()} devices={jax.devices()} shape={(n_sample
         return jnp.asarray(output, dtype=jnp.float64)
 
     def transpose_matvec(self, vector: np.ndarray | jnp.ndarray, batch_size: int = DEFAULT_GENOTYPE_BATCH_SIZE) -> jnp.ndarray:
-        """Compute X_std^T @ v. When GPU-cached: chunked GPU matmul. Otherwise: batched numpy."""
-        if self._gpu_cache is not None:
-            v = jnp.asarray(vector, dtype=jnp.float32)
-            if v.ndim != 1 or v.shape[0] != self.shape[0]:
+        """Compute X_std^T @ v. When CuPy GPU-cached: cuBLAS matmul. Otherwise: batched numpy."""
+        if self._cupy_cache is not None:
+            import cupy
+            v_np = np.asarray(vector, dtype=np.float32).ravel()
+            if v_np.shape[0] != self.shape[0]:
                 raise ValueError("sample vector must match genotype row count.")
-            return self._gpu_chunked_transpose_matvec(v).astype(jnp.float64)
+            v_cupy = cupy.asarray(v_np)
+            result = self._cupy_cache.T @ v_cupy
+            return jnp.asarray(result.get().astype(np.float64), dtype=jnp.float64)
         v_np = np.asarray(vector, dtype=np.float64).ravel()
         if v_np.shape[0] != self.shape[0]:
             raise ValueError("sample vector must match genotype row count.")
@@ -654,29 +481,15 @@ print(f"backend={jax.default_backend()} devices={jax.devices()} shape={(n_sample
         return jnp.asarray(output, dtype=jnp.float64)
 
     def transpose_matmat(self, matrix: np.ndarray | jnp.ndarray, batch_size: int = DEFAULT_GENOTYPE_BATCH_SIZE) -> jnp.ndarray:
-        if self._gpu_cache is not None:
-            m = jnp.asarray(matrix, dtype=jnp.float32)
-            if m.ndim != 2 or m.shape[0] != self.shape[0]:
+        """Compute X_std^T @ M. When CuPy GPU-cached: cuBLAS matmul. Otherwise: batched numpy."""
+        if self._cupy_cache is not None:
+            import cupy
+            m_np = np.asarray(matrix, dtype=np.float32)
+            if m_np.ndim != 2 or m_np.shape[0] != self.shape[0]:
                 raise ValueError("sample matrix must match genotype row count.")
-            chunk = self._gpu_column_chunk(rhs_columns=m.shape[1])
-            rhs_chunk = self._gpu_rhs_chunk(m.shape[1])
-            self._log_gpu_operation(
-                "transpose_matmat",
-                f"{self._gpu_chunk_description(rhs_columns=m.shape[1])} matrix_shape={tuple(m.shape)} rhs_chunk={rhs_chunk}",
-            )
-            parts = []
-            for start in range(0, self.shape[1], chunk):
-                end = min(start + chunk, self.shape[1])
-                rhs_blocks = []
-                for rhs_start in range(0, m.shape[1], rhs_chunk):
-                    rhs_end = min(rhs_start + rhs_chunk, m.shape[1])
-                    self._log_gpu_operation(
-                        "transpose_matmat_chunk",
-                        f"col_range=[{start}:{end}) rhs_range=[{rhs_start}:{rhs_end}) matrix_shape=({self.shape[0]}, {end - start}) sample_block_shape=({self.shape[0]}, {rhs_end - rhs_start})",
-                    )
-                    rhs_blocks.append(self._gpu_cache[:, start:end].T @ m[:, rhs_start:rhs_end])
-                parts.append(jnp.concatenate(rhs_blocks, axis=1))
-            return jnp.concatenate(parts).astype(jnp.float64)
+            m_cupy = cupy.asarray(m_np)
+            result = self._cupy_cache.T @ m_cupy
+            return jnp.asarray(result.get().astype(np.float64), dtype=jnp.float64)
         m_np = np.asarray(matrix, dtype=np.float64)
         if m_np.ndim != 2 or m_np.shape[0] != self.shape[0]:
             raise ValueError("sample matrix must match genotype row count.")

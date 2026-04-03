@@ -60,7 +60,7 @@ import jax.numpy as jnp
 from jax.scipy.special import digamma as jax_digamma
 from jax.scipy.special import gammaln as jax_gammaln
 import numpy as np
-from tensorflow_probability.substrates.jax.math import bessel_kve as tfp_bessel_kve
+from scipy.special import kve as scipy_bessel_kve
 
 from sv_pgs.config import ModelConfig, TraitType, VariantClass
 from sv_pgs.data import TieMap, VariantRecord
@@ -68,7 +68,7 @@ from sv_pgs.genotype import DenseRawGenotypeMatrix, StandardizedGenotypeMatrix
 from sv_pgs.linear_solvers import build_linear_operator, solve_spd_system, stochastic_logdet
 from sv_pgs.numeric import stable_sigmoid
 from sv_pgs.preprocessing import collapse_tie_groups
-from sv_pgs.progress import gpu_memory_snapshot, log, mem, nvidia_smi_snapshot
+from sv_pgs.progress import log, mem
 
 
 @dataclass(slots=True)
@@ -666,12 +666,8 @@ def _binary_posterior_state(
                 "      binary penalized_terms diagnostics: "
                 + f"call={penalized_term_calls} alpha_shape={alpha.shape} beta_shape={beta.shape} "
                 + f"covariates_shape={covariate_matrix_jax.shape} targets_shape={targets_jax.shape} "
-                + f"genotype_shape={standardized_genotypes.shape} gpu_cached={standardized_genotypes._gpu_cache is not None} "
-                + standardized_genotypes._gpu_chunk_description(rhs_columns=1)
+                + f"genotype_shape={standardized_genotypes.shape} gpu_cached={standardized_genotypes._cupy_cache is not None} "
             )
-            log(f"      binary penalized_terms device snapshot: {gpu_memory_snapshot()}")
-            if penalized_term_calls == 1:
-                log(f"      binary penalized_terms nvidia-smi: {nvidia_smi_snapshot()}")
         # Compute linear predictor on GPU: covariate part via JAX matmul,
         # genotype part via StandardizedGenotypeMatrix.matvec (already JAX).
         alpha_jax = jnp.asarray(alpha, dtype=jnp.float64)
@@ -974,28 +970,25 @@ def _restricted_posterior_state(
     compute_logdet: bool,
     compute_beta_variance: bool = True,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, float, float, float]:
+    from sv_pgs.progress import log, mem
     sample_count = genotype_matrix.shape[0]
     diagonal_noise = np.asarray(diagonal_noise, dtype=np.float64)
     if diagonal_noise.shape != (sample_count,):
         raise ValueError("diagonal_noise must have one entry per sample.")
 
+    prior_variances = np.maximum(np.asarray(prior_variances, dtype=np.float64), 1e-8)
+    prior_precision = 1.0 / prior_variances
     variant_count = genotype_matrix.shape[1]
-    use_woodbury = sample_count > exact_solver_matrix_limit and variant_count <= exact_solver_matrix_limit
+    use_exact_sample = sample_count <= exact_solver_matrix_limit
+    use_exact_variant = variant_count <= exact_solver_matrix_limit
+    use_variant_space = (not use_exact_sample) and (use_exact_variant or variant_count <= sample_count)
 
-    # Three solver strategies, chosen by problem size:
-    #   1. Small sample count: build the full covariance matrix and solve directly
-    #   2. Few variants but many samples: use the Woodbury identity (matrix algebra
-    #      trick that inverts a big matrix via a small one — see below)
-    #   3. Large in both dimensions: use conjugate gradient (iterative solver
-    #      that never builds the full matrix, just multiplies it by vectors)
-    if sample_count <= exact_solver_matrix_limit:
-        # Strategy 1: Direct solve.  Build V = D + X tau^2 X^T explicitly.
+    if use_exact_sample:
         log(f"    restricted posterior: exact sample-space Cholesky for n={sample_count}")
         covariance_matrix = np.diag(diagonal_noise)
         for batch in genotype_matrix.iter_column_batches(batch_size=posterior_variance_batch_size):
             genotype_batch = np.asarray(batch.values, dtype=np.float64)
-            batch_prior_variances = prior_variances[batch.variant_indices]
-            covariance_matrix += (genotype_batch * batch_prior_variances[None, :]) @ genotype_batch.T
+            covariance_matrix += (genotype_batch * prior_variances[batch.variant_indices][None, :]) @ genotype_batch.T
         covariance_matrix += np.eye(sample_count, dtype=np.float64) * 1e-8
         cholesky_factor = np.linalg.cholesky(covariance_matrix)
 
@@ -1005,122 +998,222 @@ def _restricted_posterior_state(
         inverse_covariance_targets = solve_rhs(targets)
         inverse_covariance_covariates = solve_rhs(covariate_matrix)
         logdet_covariance = 2.0 * float(np.sum(np.log(np.diag(cholesky_factor)))) if compute_logdet else 0.0
-
-    elif use_woodbury:
-        # Strategy 2: Woodbury identity.  Instead of inverting the huge
-        # n_samples x n_samples matrix V, we rearrange the algebra to
-        # invert a much smaller n_variants x n_variants matrix.  This works
-        # because V = D + X S X^T has low rank relative to sample count.
-        # Result: exact solve, but O(p^3) instead of O(n^3).
-        log(f"    restricted posterior: Woodbury variant-space Cholesky (p={variant_count}, n={sample_count})  mem={mem()}")
-        log(
-            "    Woodbury diagnostics: "
-            + f"gpu_cached={genotype_matrix._gpu_cache is not None} "
-            + genotype_matrix._gpu_chunk_description(rhs_columns=variant_count)
+        gls_normal_matrix = covariate_matrix.T @ inverse_covariance_covariates + np.eye(covariate_matrix.shape[1]) * 1e-8
+        gls_cholesky = np.linalg.cholesky(gls_normal_matrix)
+        alpha = np.asarray(
+            _cholesky_solve(gls_cholesky, covariate_matrix.T @ inverse_covariance_targets),
+            dtype=np.float64,
         )
-        log(f"    Woodbury device snapshot: {gpu_memory_snapshot()}")
-        log(f"    Woodbury nvidia-smi: {nvidia_smi_snapshot()}")
-        inv_diag = 1.0 / np.maximum(diagonal_noise, 1e-12)
-        # Keep the dense cross-product on device, but route it through the same
-        # chunked genotype helpers as the rest of the GPU path.
-        if genotype_matrix._gpu_cache is not None:
-            X_jax = genotype_matrix._gpu_cache
-        else:
-            X_jax = jnp.asarray(genotype_matrix.materialize(), dtype=jnp.float32)
-        inv_diag_jax = jnp.asarray(inv_diag, dtype=jnp.float32)
-        S_diag_jax = jnp.asarray(prior_variances, dtype=jnp.float32)
-        # Form p×p matrix: S^{-1} + X^T @ diag(1/D) @ X — keep on JAX/GPU.
-        weighted_X_jax = X_jax * inv_diag_jax[:, None]
-        XtDinvX = jnp.asarray(
-            genotype_matrix.transpose_matmat(weighted_X_jax, batch_size=posterior_variance_batch_size),
-            dtype=jnp.float32,
+        projected_targets = np.asarray(
+            inverse_covariance_targets - inverse_covariance_covariates @ alpha,
+            dtype=np.float64,
         )
-        woodbury_matrix = jnp.diag(1.0 / jnp.maximum(S_diag_jax, 1e-12)) + XtDinvX + jnp.eye(variant_count) * 1e-8
-        woodbury_cholesky = jnp.linalg.cholesky(woodbury_matrix)
-        X = np.asarray(X_jax, dtype=np.float64)  # keep numpy copy for solve_rhs
-        # Transfer back to numpy for _cholesky_solve and logdet
-        S_diag = np.asarray(S_diag_jax, dtype=np.float64)
-        woodbury_cholesky = np.asarray(woodbury_cholesky, dtype=np.float64)
-        del X_jax, weighted_X_jax, XtDinvX  # free JAX copies
-
-        def solve_rhs(right_hand_side: np.ndarray) -> np.ndarray:
-            rhs = np.asarray(right_hand_side, dtype=np.float64)
-            Dinv_rhs = inv_diag[:, None] * rhs if rhs.ndim == 2 else inv_diag * rhs
-            Xt_Dinv_rhs = X.T @ Dinv_rhs
-            woodbury_solve = _cholesky_solve(woodbury_cholesky, Xt_Dinv_rhs)
-            return Dinv_rhs - (inv_diag[:, None] if rhs.ndim == 2 else inv_diag) * (X @ woodbury_solve)
-
-        inverse_covariance_targets = solve_rhs(targets)
-        inverse_covariance_covariates = solve_rhs(covariate_matrix)
-
-        if compute_logdet:
-            # log|D + X S X^T| = log|D| + log|S| + log|S^{-1} + X^T D^{-1} X|
-            logdet_D = float(np.sum(np.log(np.maximum(diagonal_noise, 1e-12))))
-            logdet_S = float(np.sum(np.log(np.maximum(S_diag, 1e-12))))
-            logdet_woodbury = 2.0 * float(np.sum(np.log(np.diag(woodbury_cholesky))))
-            logdet_covariance = logdet_D + logdet_S + logdet_woodbury
+        beta = np.asarray(
+            prior_variances * np.asarray(genotype_matrix.transpose_matvec(projected_targets), dtype=np.float64),
+            dtype=np.float64,
+        )
+        if compute_beta_variance:
+            log(f"    computing leverage diagonal for beta variance ({variant_count} variants)...")
+            leverage_diagonal = _restricted_cross_leverage_diagonal(
+                genotype_matrix=genotype_matrix,
+                covariate_matrix=covariate_matrix,
+                solve_rhs=solve_rhs,
+                inverse_covariance_covariates=inverse_covariance_covariates,
+                gls_cholesky=gls_cholesky,
+                batch_size=posterior_variance_batch_size,
+            )
+            beta_variance = np.maximum(prior_variances - (prior_variances * prior_variances) * leverage_diagonal, 1e-8)
         else:
-            logdet_covariance = 0.0
+            beta_variance = np.zeros_like(prior_variances, dtype=np.float64)
+        linear_predictor = covariate_matrix @ alpha + np.asarray(
+            genotype_matrix.matvec(beta, batch_size=posterior_variance_batch_size),
+            dtype=np.float64,
+        )
+        sign_gls, logdet_gls = np.linalg.slogdet(gls_normal_matrix)
+        if sign_gls <= 0.0:
+            raise RuntimeError("Restricted GLS normal matrix is not positive definite.")
+        restricted_quadratic = float(np.dot(targets, projected_targets))
+        log(f"    posterior beta computed: max|beta|={float(np.max(np.abs(beta))):.4f}  mean|beta|={float(np.mean(np.abs(beta))):.6f}  logdet_cov={float(logdet_covariance):.4f}  mem={mem()}")
+        return (
+            np.asarray(alpha, dtype=np.float64),
+            np.asarray(beta, dtype=np.float64),
+            np.asarray(beta_variance, dtype=np.float64),
+            np.asarray(projected_targets, dtype=np.float64),
+            np.asarray(linear_predictor, dtype=np.float64),
+            restricted_quadratic,
+            float(logdet_covariance),
+            float(logdet_gls),
+        )
 
-    else:
-        # Strategy 3: Conjugate gradient.  Iteratively approximates V^{-1} b
-        # by repeatedly multiplying V times vectors.  Never stores V itself.
-        log(f"    restricted posterior: conjugate-gradient sample-space solve (p={variant_count}, n={sample_count})")
-        covariance_operator = _sample_space_operator(genotype_matrix, prior_variances, diagonal_noise)
+    inverse_diagonal_noise, covariate_precision_cholesky, covariate_precision_logdet, apply_projector = (
+        _restricted_precision_projector(covariate_matrix, diagonal_noise)
+    )
 
-        def solve_rhs(right_hand_side: np.ndarray) -> np.ndarray:
-            return solve_spd_system(
-                covariance_operator,
-                right_hand_side,
-                tolerance=solver_tolerance,
-                max_iterations=maximum_linear_solver_iterations,
+    if use_variant_space:
+        if use_exact_variant:
+            log(f"    restricted posterior: exact variant-space Cholesky (p={variant_count}, n={sample_count})  mem={mem()}")
+            dense_genotypes = np.asarray(genotype_matrix.materialize(batch_size=posterior_variance_batch_size), dtype=np.float64)
+            projected_genotypes = apply_projector(dense_genotypes)
+            variant_precision_matrix = (
+                np.diag(prior_precision)
+                + dense_genotypes.T @ projected_genotypes
+                + np.eye(variant_count, dtype=np.float64) * 1e-8
+            )
+            variant_precision_cholesky = np.linalg.cholesky(variant_precision_matrix)
+            variant_rhs = dense_genotypes.T @ apply_projector(targets)
+
+            def solve_variant_rhs(right_hand_side: np.ndarray) -> np.ndarray:
+                return _cholesky_solve(variant_precision_cholesky, np.asarray(right_hand_side, dtype=np.float64))
+
+            beta = np.asarray(solve_variant_rhs(variant_rhs), dtype=np.float64)
+            beta_variance = (
+                np.maximum(np.diag(solve_variant_rhs(np.eye(variant_count, dtype=np.float64))), 1e-8)
+                if compute_beta_variance
+                else np.zeros(variant_count, dtype=np.float64)
+            )
+            logdet_A = 2.0 * float(np.sum(np.log(np.diag(variant_precision_cholesky)))) if compute_logdet else 0.0
+            genetic_linear_predictor = dense_genotypes @ beta
+        else:
+            log(f"    restricted posterior: PCG variant-space solve (p={variant_count}, n={sample_count})  mem={mem()}")
+            variant_operator = _restricted_variant_space_operator(
+                genotype_matrix=genotype_matrix,
+                prior_precision=prior_precision,
+                apply_projector=apply_projector,
+                batch_size=posterior_variance_batch_size,
+            )
+            variant_preconditioner = _restricted_variant_space_diagonal_preconditioner(
+                genotype_matrix=genotype_matrix,
+                covariate_matrix=covariate_matrix,
+                inverse_diagonal_noise=inverse_diagonal_noise,
+                covariate_precision_cholesky=covariate_precision_cholesky,
+                prior_precision=prior_precision,
+                batch_size=posterior_variance_batch_size,
+            )
+            variant_rhs = np.asarray(
+                genotype_matrix.transpose_matvec(
+                    apply_projector(targets),
+                    batch_size=posterior_variance_batch_size,
+                ),
+                dtype=np.float64,
             )
 
-        inverse_covariance_targets = solve_rhs(targets)
-        inverse_covariance_covariates = solve_rhs(covariate_matrix)
+            def solve_variant_rhs(right_hand_side: np.ndarray) -> np.ndarray:
+                return solve_spd_system(
+                    variant_operator,
+                    right_hand_side,
+                    tolerance=solver_tolerance,
+                    max_iterations=maximum_linear_solver_iterations,
+                    preconditioner=variant_preconditioner,
+                )
+
+            beta = np.asarray(solve_variant_rhs(variant_rhs), dtype=np.float64)
+            beta_variance = (
+                _posterior_variance_hutchinson_diagonal(
+                    solve_variant_rhs=solve_variant_rhs,
+                    dimension=variant_count,
+                    probe_count=posterior_variance_probe_count,
+                    random_seed=random_seed,
+                )
+                if compute_beta_variance
+                else np.zeros(variant_count, dtype=np.float64)
+            )
+            logdet_A = (
+                stochastic_logdet(
+                    variant_operator,
+                    dimension=variant_count,
+                    probe_count=logdet_probe_count,
+                    lanczos_steps=logdet_lanczos_steps,
+                    random_seed=random_seed,
+                )
+                if compute_logdet
+                else 0.0
+            )
+            genetic_linear_predictor = np.asarray(
+                genotype_matrix.matvec(beta, batch_size=posterior_variance_batch_size),
+                dtype=np.float64,
+            )
+
+        alpha = np.asarray(
+            _cholesky_solve(
+                covariate_precision_cholesky,
+                covariate_matrix.T @ (inverse_diagonal_noise * (targets - genetic_linear_predictor)),
+            ),
+            dtype=np.float64,
+        )
+        projected_targets = np.asarray(apply_projector(targets - genetic_linear_predictor), dtype=np.float64)
+        linear_predictor = covariate_matrix @ alpha + genetic_linear_predictor
+        restricted_quadratic = float(np.dot(targets, projected_targets))
         logdet_covariance = (
-            stochastic_logdet(
-                covariance_operator,
-                dimension=sample_count,
-                probe_count=logdet_probe_count,
-                lanczos_steps=logdet_lanczos_steps,
-                random_seed=random_seed,
-            )
+            float(np.sum(np.log(np.maximum(diagonal_noise, 1e-12))))
+            - float(np.sum(np.log(np.maximum(prior_precision, 1e-12))))
+            + logdet_A
             if compute_logdet
             else 0.0
         )
+        logdet_gls = covariate_precision_logdet if compute_logdet else 0.0
+        log(f"    posterior beta computed: max|beta|={float(np.max(np.abs(beta))):.4f}  mean|beta|={float(np.mean(np.abs(beta))):.6f}  logdet_cov={float(logdet_covariance):.4f}  mem={mem()}")
+        return (
+            np.asarray(alpha, dtype=np.float64),
+            np.asarray(beta, dtype=np.float64),
+            np.asarray(beta_variance, dtype=np.float64),
+            np.asarray(projected_targets, dtype=np.float64),
+            np.asarray(linear_predictor, dtype=np.float64),
+            restricted_quadratic,
+            float(logdet_covariance),
+            float(logdet_gls),
+        )
 
-    # Step 1: Estimate covariate effects (alpha) via generalized least squares.
-    # This "projects out" the covariates so variant effects aren't confounded
-    # by population structure, age, sex, etc.
-    solve_rhs_function: Callable[[np.ndarray], np.ndarray] = solve_rhs
+    log(f"    restricted posterior: PCG sample-space solve (p={variant_count}, n={sample_count})")
+    covariance_operator = _sample_space_operator(genotype_matrix, prior_variances, diagonal_noise)
+    sample_space_preconditioner = _sample_space_diagonal_preconditioner(
+        genotype_matrix=genotype_matrix,
+        prior_variances=prior_variances,
+        diagonal_noise=diagonal_noise,
+        batch_size=posterior_variance_batch_size,
+    )
+
+    def solve_rhs(right_hand_side: np.ndarray) -> np.ndarray:
+        return solve_spd_system(
+            covariance_operator,
+            right_hand_side,
+            tolerance=solver_tolerance,
+            max_iterations=maximum_linear_solver_iterations,
+            preconditioner=sample_space_preconditioner,
+        )
+
+    inverse_covariance_targets = solve_rhs(targets)
+    inverse_covariance_covariates = solve_rhs(covariate_matrix)
+    logdet_covariance = (
+        stochastic_logdet(
+            covariance_operator,
+            dimension=sample_count,
+            probe_count=logdet_probe_count,
+            lanczos_steps=logdet_lanczos_steps,
+            random_seed=random_seed,
+        )
+        if compute_logdet
+        else 0.0
+    )
     gls_normal_matrix = covariate_matrix.T @ inverse_covariance_covariates + np.eye(covariate_matrix.shape[1]) * 1e-8
     gls_cholesky = np.linalg.cholesky(gls_normal_matrix)
     alpha = np.asarray(
         _cholesky_solve(gls_cholesky, covariate_matrix.T @ inverse_covariance_targets),
         dtype=np.float64,
     )
-    # Step 2: Remove covariate contribution from the targets, leaving only
-    # the part that genetic variants need to explain.
-    projected_targets: np.ndarray = np.asarray(
+    projected_targets = np.asarray(
         inverse_covariance_targets - inverse_covariance_covariates @ alpha,
         dtype=np.float64,
     )
-    # Step 3: Recover variant effect sizes (beta).  Each beta is proportional
-    # to how much that variant's genotype column correlates with the residual,
-    # weighted by that variant's prior variance (variants we trust more a priori
-    # get to keep more of their observed correlation).
     beta = np.asarray(
         prior_variances * np.asarray(genotype_matrix.transpose_matvec(projected_targets), dtype=np.float64),
         dtype=np.float64,
     )
-    log(f"    posterior beta computed: max|beta|={float(np.max(np.abs(beta))):.4f}  mean|beta|={float(np.mean(np.abs(beta))):.6f}  logdet_cov={float(logdet_covariance):.4f}  mem={mem()}")
     if compute_beta_variance:
-        log(f"    computing leverage diagonal for beta variance ({genotype_matrix.shape[1]} variants)...")
+        log(f"    computing leverage diagonal for beta variance ({variant_count} variants)...")
         leverage_diagonal = _restricted_cross_leverage_diagonal(
             genotype_matrix=genotype_matrix,
             covariate_matrix=covariate_matrix,
-            solve_rhs=solve_rhs_function,
+            solve_rhs=solve_rhs,
             inverse_covariance_covariates=inverse_covariance_covariates,
             gls_cholesky=gls_cholesky,
             batch_size=posterior_variance_batch_size,
@@ -1128,11 +1221,15 @@ def _restricted_posterior_state(
         beta_variance = np.maximum(prior_variances - (prior_variances * prior_variances) * leverage_diagonal, 1e-8)
     else:
         beta_variance = np.zeros_like(prior_variances, dtype=np.float64)
-    linear_predictor = covariate_matrix @ alpha + np.asarray(genotype_matrix.matvec(beta, batch_size=posterior_variance_batch_size), dtype=np.float64)
+    linear_predictor = covariate_matrix @ alpha + np.asarray(
+        genotype_matrix.matvec(beta, batch_size=posterior_variance_batch_size),
+        dtype=np.float64,
+    )
     sign_gls, logdet_gls = np.linalg.slogdet(gls_normal_matrix)
     if sign_gls <= 0.0:
         raise RuntimeError("Restricted GLS normal matrix is not positive definite.")
     restricted_quadratic = float(np.dot(targets, projected_targets))
+    log(f"    posterior beta computed: max|beta|={float(np.max(np.abs(beta))):.4f}  mean|beta|={float(np.mean(np.abs(beta))):.6f}  logdet_cov={float(logdet_covariance):.4f}  mem={mem()}")
     return (
         np.asarray(alpha, dtype=np.float64),
         np.asarray(beta, dtype=np.float64),
@@ -1158,6 +1255,7 @@ def _restricted_cross_leverage_diagonal(
     gls_cholesky: np.ndarray,
     batch_size: int,
 ) -> np.ndarray:
+    from sv_pgs.progress import log, mem
     variant_count = genotype_matrix.shape[1]
     leverage_diagonal = np.zeros(variant_count, dtype=np.float64)
     variants_done = 0
@@ -1356,16 +1454,8 @@ def _initialize_scale_model(
     return initialized_global_scale, coefficients.astype(np.float64)
 
 
-# Re-estimate the global scale and metadata coefficients.
-#
-# Idea: given the fitted betas and local scales, what global scale and
-# metadata weights best explain the observed pattern of effect sizes?
-#
-# We work in log-space (log of the target scale per variant) and fit a
-# ridge regression of metadata features against these log-scales.  The
-# global scale is updated via the median residual (robust to outliers).
-# Uses damped iteration (50% blending with previous coefficients) for
-# stability.
+# Re-estimate the global scale and metadata coefficients with the exact
+# convex Newton update for the expected Gaussian prior term.
 def _update_scale_model(
     reduced_second_moment: np.ndarray,
     local_scale: np.ndarray,
@@ -1375,54 +1465,69 @@ def _update_scale_model(
     current_scale_model_coefficients: np.ndarray,
     config: ModelConfig,
 ) -> tuple[float, np.ndarray]:
-    target_variances = np.maximum(
-        reduced_second_moment / np.maximum(local_scale, config.local_scale_floor),
+    expected_scale = np.maximum(
+        np.asarray(reduced_second_moment, dtype=np.float64) / np.maximum(local_scale, config.local_scale_floor),
         config.prior_scale_floor**2,
     )
-    target_scales = np.sqrt(np.clip(target_variances, config.prior_scale_floor**2, config.prior_scale_ceiling**2))
-    target_log_scales = np.log(target_scales)
+    global_log_floor = float(np.log(config.global_scale_floor))
+    global_log_ceiling = float(np.log(config.global_scale_ceiling))
     global_log_scale = float(
         np.clip(
             np.log(np.maximum(current_global_scale, config.global_scale_floor)),
-            np.log(config.global_scale_floor),
-            np.log(config.global_scale_ceiling),
+            global_log_floor,
+            global_log_ceiling,
         )
     )
-    if prior_design.design_matrix.shape[1] == 0:
-        return float(
-            np.exp(
-                np.clip(
-                    np.median(target_log_scales),
-                    np.log(config.global_scale_floor),
-                    np.log(config.global_scale_ceiling),
-                )
-            )
-        ), np.zeros(0, dtype=np.float64)
+    design_matrix = np.asarray(prior_design.design_matrix, dtype=np.float64)
     coefficients = np.asarray(current_scale_model_coefficients, dtype=np.float64).copy()
-    normal_matrix = prior_design.design_matrix.T @ prior_design.design_matrix + np.diag(np.maximum(scale_penalty, 1e-8))
-    for _iteration_index in range(config.maximum_scale_model_iterations):
-        fitted_log_scales = global_log_scale + prior_design.design_matrix @ coefficients
-        residual = target_log_scales - fitted_log_scales
+    penalty = np.maximum(np.asarray(scale_penalty, dtype=np.float64), 1e-8)
+    if design_matrix.shape[1] == 0:
         updated_global_log_scale = float(
             np.clip(
-                global_log_scale + 0.5 * np.median(residual),
-                np.log(config.global_scale_floor),
-                np.log(config.global_scale_ceiling),
+                0.5 * np.log(float(np.mean(expected_scale))),
+                global_log_floor,
+                global_log_ceiling,
             )
         )
-        target_offsets = target_log_scales - updated_global_log_scale
-        right_hand_side = prior_design.design_matrix.T @ target_offsets
-        target_coefficients = np.linalg.solve(normal_matrix, right_hand_side)
-        updated_coefficients = 0.5 * coefficients + 0.5 * target_coefficients
-        scale_change = max(
-            abs(updated_global_log_scale - global_log_scale) / max(abs(global_log_scale), 1e-8),
-            float(np.linalg.norm(updated_coefficients - coefficients)) / max(float(np.linalg.norm(coefficients)), 1e-8),
+        return float(np.exp(updated_global_log_scale)), np.zeros(0, dtype=np.float64)
+
+    augmented_design = np.column_stack(
+        [np.ones(design_matrix.shape[0], dtype=np.float64), design_matrix]
+    )
+    penalty_vector = np.concatenate([np.zeros(1, dtype=np.float64), penalty])
+    theta = np.concatenate([[global_log_scale], coefficients]).astype(np.float64, copy=False)
+
+    def objective(theta_value: np.ndarray) -> float:
+        linear_predictor = augmented_design @ theta_value
+        return float(
+            0.5 * np.sum(expected_scale * np.exp(-2.0 * linear_predictor) + 2.0 * linear_predictor)
+            + 0.5 * np.sum(penalty_vector[1:] * theta_value[1:] * theta_value[1:])
         )
-        global_log_scale = updated_global_log_scale
-        coefficients = updated_coefficients
+
+    for _iteration_index in range(config.maximum_scale_model_iterations):
+        linear_predictor = augmented_design @ theta
+        weights = expected_scale * np.exp(-2.0 * linear_predictor)
+        residual = 1.0 - weights
+        gradient = augmented_design.T @ residual + penalty_vector * theta
+        if float(np.linalg.norm(gradient)) <= config.convergence_tolerance:
+            break
+        hessian = 2.0 * augmented_design.T @ (weights[:, None] * augmented_design) + np.diag(penalty_vector)
+        newton_direction = -np.linalg.solve(hessian + np.eye(hessian.shape[0], dtype=np.float64) * 1e-10, gradient)
+        step_size = 1.0
+        current_objective = objective(theta)
+        candidate_theta = theta.copy()
+        while step_size >= 1e-4:
+            candidate_theta = theta + step_size * newton_direction
+            candidate_theta[0] = float(np.clip(candidate_theta[0], global_log_floor, global_log_ceiling))
+            if objective(candidate_theta) <= current_objective:
+                break
+            step_size *= 0.5
+        scale_change = float(np.linalg.norm(candidate_theta - theta)) / max(float(np.linalg.norm(theta)), 1e-8)
+        theta = candidate_theta
         if scale_change < config.convergence_tolerance:
             break
-    return float(np.exp(global_log_scale)), coefficients.astype(np.float64)
+
+    return float(np.exp(theta[0])), np.asarray(theta[1:], dtype=np.float64)
 
 
 def _initialize_tpb_shape_a_vector(
@@ -1699,15 +1804,15 @@ def _gig_moment(
     psi: np.ndarray,
     moment_power: float,
 ) -> np.ndarray:
-    chi_jax = jnp.asarray(chi, dtype=jnp.float64)
-    psi_jax = jnp.asarray(psi, dtype=jnp.float64)
-    p_jax = jnp.asarray(p_parameter, dtype=jnp.float64)
-    z_value = jnp.sqrt(jnp.maximum(chi_jax * psi_jax, 1e-12))
-    numerator = tfp_bessel_kve(jnp.abs(p_jax + moment_power), z_value)
-    denominator = jnp.maximum(tfp_bessel_kve(jnp.abs(p_jax), z_value), 1e-300)
+    chi_array = np.asarray(chi, dtype=np.float64)
+    psi_array = np.asarray(psi, dtype=np.float64)
+    p_array = np.asarray(p_parameter, dtype=np.float64)
+    z_value = np.sqrt(np.maximum(chi_array * psi_array, 1e-12))
+    numerator = scipy_bessel_kve(np.abs(p_array + moment_power), z_value)
+    denominator = np.maximum(scipy_bessel_kve(np.abs(p_array), z_value), 1e-300)
     moment_ratio = numerator / denominator
     return np.asarray(
-        jnp.power(jnp.maximum(chi_jax / psi_jax, 1e-12), 0.5 * moment_power) * moment_ratio,
+        np.power(np.maximum(chi_array / psi_array, 1e-12), 0.5 * moment_power) * moment_ratio,
         dtype=np.float64,
     )
 

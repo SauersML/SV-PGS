@@ -6,11 +6,12 @@ import pytest
 from scipy.special import kve
 
 from sv_pgs.config import ModelConfig, TraitType, VariantClass
-from sv_pgs.data import VariantRecord
+from sv_pgs.data import TieGroup, TieMap, VariantRecord
 from sv_pgs.genotype import as_raw_genotype_matrix
 from sv_pgs.inference import fit_variational_em
 from sv_pgs.mixture_inference import (
     PosteriorState,
+    _member_prior_variances_from_reduced_state,
     _quantitative_posterior_state,
     _sample_space_operator,
     _update_local_scales,
@@ -195,7 +196,7 @@ def test_gpu_sample_space_operator_matmat_matches_dense_reference(random_generat
         means=np.zeros(variant_count, dtype=np.float32),
         scales=np.ones(variant_count, dtype=np.float32),
     )
-    standardized._gpu_cache = jnp.asarray(standardized.materialize(), dtype=jnp.float32)
+    standardized._dense_cache = standardized.materialize()
     operator = _sample_space_operator(standardized, prior_variances, diagonal_noise)
 
     dense_matrix = genotype_values.astype(np.float64)
@@ -211,7 +212,7 @@ def test_gpu_sample_space_operator_matmat_matches_dense_reference(random_generat
     )
 
 
-def test_gpu_cached_woodbury_posterior_matches_dense_reference(random_generator):
+def test_materialized_woodbury_posterior_matches_dense_reference(random_generator):
     sample_count, variant_count = 40, 6
     genotype_values = random_generator.normal(size=(sample_count, variant_count)).astype(np.float32)
     covariate_matrix = np.column_stack(
@@ -224,7 +225,7 @@ def test_gpu_cached_woodbury_posterior_matches_dense_reference(random_generator)
         means=np.zeros(variant_count, dtype=np.float32),
         scales=np.ones(variant_count, dtype=np.float32),
     )
-    standardized._gpu_cache = jnp.asarray(standardized.materialize(), dtype=jnp.float32)
+    standardized._dense_cache = standardized.materialize()
 
     gpu_result = _quantitative_posterior_state(
         genotype_matrix=standardized,
@@ -336,3 +337,38 @@ def test_tpb_shape_vectors_are_learned_from_local_scale_state():
     assert not np.allclose(updated_shape_a, [1.0, 1.0])
     assert not np.allclose(updated_shape_b, [0.5, 0.5])
     assert not np.isclose(updated_shape_a[0], updated_shape_a[1])
+
+
+def test_member_prior_variances_preserve_member_metadata_with_ties():
+    member_records = [
+        VariantRecord("variant_0", VariantClass.SNV, "1", 100),
+        VariantRecord("variant_1", VariantClass.DELETION_SHORT, "1", 101, is_copy_number=True),
+    ]
+    tie_map = TieMap(
+        kept_indices=np.array([0], dtype=np.int32),
+        original_to_reduced=np.array([0, 0], dtype=np.int32),
+        reduced_to_group=[
+            TieGroup(
+                representative_index=0,
+                member_indices=np.array([0, 1], dtype=np.int32),
+                signs=np.array([1.0, 1.0], dtype=np.float32),
+            )
+        ],
+    )
+
+    member_prior_variances = _member_prior_variances_from_reduced_state(
+        member_records=member_records,
+        tie_map=tie_map,
+        scale_model_coefficients=np.array([1.0, -1.0], dtype=np.float64),
+        scale_model_feature_names=[
+            "type_offset::snv",
+            "type_offset::deletion_short",
+        ],
+        global_scale=1.0,
+        local_scale=np.array([2.0], dtype=np.float64),
+        config=ModelConfig(),
+    )
+
+    assert member_prior_variances.shape == (2,)
+    assert member_prior_variances[0] > member_prior_variances[1]
+    assert not np.isclose(member_prior_variances[0], member_prior_variances[1])
