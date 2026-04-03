@@ -4,6 +4,8 @@ from abc import ABC, abstractmethod
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
+import subprocess
+import sys
 from typing import Iterator, Sequence
 
 import sv_pgs._jax  # noqa: F401
@@ -11,6 +13,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 from bed_reader import open_bed
+from sv_pgs.progress import gpu_memory_snapshot, jax_runtime_snapshot, log, mem, nvidia_smi_snapshot
 
 DEFAULT_GENOTYPE_BATCH_SIZE = 1024  # fallback when sample count is unknown
 
@@ -31,15 +34,28 @@ MATERIALIZE_THRESHOLD_BYTES = 4_000_000_000  # 4 GB
 # stable even for ~100k-sample matrices.  The chunk width is chosen
 # dynamically from these caps.
 _GPU_MATMUL_TARGET_ELEMENTS = 32_000_000
-_GPU_MATMUL_MIN_CHUNK = 64
+_GPU_MATMUL_MIN_CHUNK = 16
 _GPU_MATMUL_MAX_CHUNK = 512
 _GPU_MATMAT_MAX_RHS_COLUMNS = 8
+_GPU_PROBE_TIMEOUT_SECONDS = 45.0
+_GPU_DIAGNOSTIC_LOG_LIMIT = 4
 
 
 def _floor_power_of_two(value: int) -> int:
     if value <= 1:
         return 1
     return 1 << (value.bit_length() - 1)
+
+
+def _power_of_two_candidates(maximum_chunk: int) -> list[int]:
+    candidates: list[int] = []
+    current = _floor_power_of_two(max(maximum_chunk, _GPU_MATMUL_MIN_CHUNK))
+    while current >= _GPU_MATMUL_MIN_CHUNK:
+        candidates.append(current)
+        current //= 2
+    if _GPU_MATMUL_MIN_CHUNK not in candidates:
+        candidates.append(_GPU_MATMUL_MIN_CHUNK)
+    return candidates
 
 
 def as_raw_genotype_matrix(genotypes: RawGenotypeMatrix | np.ndarray) -> RawGenotypeMatrix:
@@ -197,7 +213,6 @@ class PlinkRawGenotypeMatrix(RawGenotypeMatrix):
         safe_batch_size = min(requested, max_variants)
         reader = self._bed_reader()
         total = resolved_indices.shape[0]
-        from sv_pgs.progress import log, mem
         batch_mb = self.shape[0] * safe_batch_size / (1024 * 1024)
         n_batches = (total + safe_batch_size - 1) // safe_batch_size
         log(f"    int8 batch: {safe_batch_size} variants x {self.shape[0]} samples = {batch_mb:.0f} MB/batch, {n_batches} batches  mem={mem()}")
@@ -208,7 +223,6 @@ class PlinkRawGenotypeMatrix(RawGenotypeMatrix):
             return
 
         # Prefetch with background thread
-        from concurrent.futures import ThreadPoolExecutor
         batch_index_list = [
             resolved_indices[s : s + safe_batch_size]
             for s in range(0, total, safe_batch_size)
@@ -269,7 +283,6 @@ class PlinkRawGenotypeMatrix(RawGenotypeMatrix):
 
     def _bed_reader(self) -> open_bed:
         if self._reader is None:
-            from sv_pgs.progress import log, mem
             log(f"    opening bed_reader (lazy, no metadata): iid_count={self.total_sample_count} sid_count={self.variant_count}  mem={mem()}")
             self._reader = open_bed(
                 self.bed_path,
@@ -305,6 +318,8 @@ class StandardizedGenotypeMatrix:
     variant_indices: np.ndarray  # which columns of raw to use (for subsetting)
     _dense_cache: np.ndarray | None = field(init=False, default=None, repr=False)
     _gpu_cache: jnp.ndarray | None = field(init=False, default=None, repr=False)
+    _gpu_chunk_override: int | None = field(init=False, default=None, repr=False)
+    _gpu_op_counts: dict[str, int] = field(init=False, default_factory=dict, repr=False)
 
     def __post_init__(self) -> None:
         self.means = np.asarray(self.means, dtype=np.float32)
@@ -323,27 +338,126 @@ class StandardizedGenotypeMatrix:
         """Estimated bytes if materialized as float32."""
         return int(self.shape[0]) * int(self.shape[1]) * 4
 
+    def _gpu_chunk_description(self, rhs_columns: int = 1) -> str:
+        auto_chunk = max(
+            _GPU_MATMUL_MIN_CHUNK,
+            min(_GPU_MATMUL_MAX_CHUNK, _floor_power_of_two(max(_GPU_MATMUL_TARGET_ELEMENTS // max(self.shape[0] * max(int(rhs_columns), 1), 1), 1))),
+        )
+        chunk = self._gpu_column_chunk(rhs_columns=rhs_columns)
+        return (
+            f"chunk={chunk} auto_chunk={auto_chunk} override={self._gpu_chunk_override} "
+            f"shape={self.shape} rhs_columns={rhs_columns}"
+        )
+
+    def _log_gpu_operation(self, operation: str, detail: str, *, limit: int = _GPU_DIAGNOSTIC_LOG_LIMIT) -> None:
+        current_count = self._gpu_op_counts.get(operation, 0) + 1
+        self._gpu_op_counts[operation] = current_count
+        if current_count > limit:
+            return
+        log(f"    GPU op {operation} call={current_count}: {detail}")
+        log(f"    GPU op {operation} device snapshot: {gpu_memory_snapshot()}")
+        if current_count == 1:
+            log(f"    GPU op {operation} nvidia-smi: {nvidia_smi_snapshot()}")
+
+    def _probe_safe_gpu_chunk(self, candidate_chunk: int) -> tuple[bool, str]:
+        probe_code = """
+import sys
+import jax
+import jax.numpy as jnp
+n_samples = int(sys.argv[1])
+chunk = int(sys.argv[2])
+matrix = jnp.zeros((n_samples, chunk), dtype=jnp.float32)
+vector = jnp.ones((chunk,), dtype=jnp.float32)
+result = matrix @ vector
+result.block_until_ready()
+print(f"backend={jax.default_backend()} devices={jax.devices()} shape={(n_samples, chunk)}")
+"""
+        try:
+            completed = subprocess.run(
+                [sys.executable, "-c", probe_code, str(self.shape[0]), str(candidate_chunk)],
+                capture_output=True,
+                text=True,
+                timeout=_GPU_PROBE_TIMEOUT_SECONDS,
+                check=False,
+            )
+        except subprocess.TimeoutExpired as error:
+            return False, f"timeout after {error.timeout}s"
+        except Exception as error:
+            return False, f"probe_error={error}"
+        stdout = completed.stdout.strip().replace("\n", " | ")
+        stderr = completed.stderr.strip().replace("\n", " | ")
+        if completed.returncode == 0:
+            return True, stdout or "probe_ok"
+        if completed.returncode < 0:
+            return False, f"signal={-completed.returncode} stdout={stdout} stderr={stderr}"
+        return False, f"rc={completed.returncode} stdout={stdout} stderr={stderr}"
+
     def try_materialize_gpu(self) -> bool:
-        """Materialize the standardized matrix into CPU RAM.
+        """Materialize the standardized matrix into RAM and optionally onto GPU.
 
-        GPU matmul is disabled because JAX/XLA has known segfault bugs on
-        Turing GPUs (T4) during GEMM execution (jax-ml/jax#17349).
-        The GPU is still used for element-wise ops (preprocessing, sigmoid).
-        CPU RAM materialization avoids re-reading from disk on every EM
-        iteration and is fast enough with numpy BLAS.
-
-        Returns True if now cached in memory.
+        GPU GEMM is disabled by default because JAX/XLA has known segfault bugs
+        on Turing GPUs (T4) during matmul execution (jax-ml/jax#17349).  Set
+        SV_PGS_GPU_MATMUL=1 to force GPU matmul if you know your GPU works.
         """
-        if self._dense_cache is not None:
+        if self._gpu_cache is not None:
             return True
-        nbytes = self.dense_bytes()
-        from sv_pgs.progress import log, mem
-        log(f"    materializing {self.shape[1]} variants x {self.shape[0]} samples ({nbytes / 1e9:.1f} GB) into RAM  mem={mem()}")
-        self._dense_cache = np.empty(self.shape, dtype=np.float32)
-        for batch in self.iter_column_batches(batch_size=auto_batch_size(self.shape[0])):
-            self._dense_cache[:, batch.variant_indices] = batch.values
-        log(f"    RAM-resident matrix ready  mem={mem()}")
-        return True
+        import os
+        gpu_matmul_enabled = os.environ.get("SV_PGS_GPU_MATMUL", "0") == "1"
+        if self._dense_cache is None:
+            nbytes = self.dense_bytes()
+            log(f"    materializing {self.shape[1]} variants x {self.shape[0]} samples ({nbytes / 1e9:.1f} GB) into RAM  mem={mem()}")
+            self._dense_cache = np.empty(self.shape, dtype=np.float32)
+            for batch in self.iter_column_batches(batch_size=auto_batch_size(self.shape[0])):
+                self._dense_cache[:, batch.variant_indices] = batch.values
+            log(f"    RAM-resident matrix ready  mem={mem()}")
+        if not gpu_matmul_enabled:
+            log("    GPU GEMM disabled (T4 segfault workaround; set SV_PGS_GPU_MATMUL=1 to override)")
+            return True  # materialized in RAM, skip GPU upload
+        try:
+            devices = jax.devices()
+            if not devices or devices[0].platform == "cpu":
+                log("    no GPU backend detected; leaving matrix in RAM")
+                return False
+            log(f"    GPU materialization runtime: {jax_runtime_snapshot()}")
+            log(f"    GPU materialization pre-upload: {gpu_memory_snapshot()}")
+            log(f"    GPU materialization nvidia-smi: {nvidia_smi_snapshot()}")
+            test_slice = jnp.asarray(self._dense_cache[:64, :64], dtype=jnp.float32)
+            test_vec = jnp.ones(64, dtype=jnp.float32)
+            test_result = test_slice @ test_vec
+            test_result.block_until_ready()
+            del test_slice, test_vec, test_result
+            auto_chunk = self._gpu_column_chunk(rhs_columns=1)
+            probe_candidates = _power_of_two_candidates(auto_chunk)
+            log(
+                "    GPU matmul probe candidates: "
+                + ", ".join(str(candidate) for candidate in probe_candidates)
+                + f"  sample_count={self.shape[0]}"
+            )
+            for candidate in probe_candidates:
+                probe_ok, probe_detail = self._probe_safe_gpu_chunk(candidate)
+                log(f"    GPU matmul probe chunk={candidate}: {'PASS' if probe_ok else 'FAIL'}  {probe_detail}")
+                if probe_ok:
+                    self._gpu_chunk_override = candidate
+                    break
+            if self._gpu_chunk_override is None:
+                log("    GPU probe found no safe dense matmul chunk; using auto chunk for live diagnostics")
+            else:
+                log(f"    GPU probe selected safe chunk={self._gpu_chunk_override}  auto_chunk={auto_chunk}")
+            log(
+                f"    uploading full matrix to GPU  {self._gpu_chunk_description(rhs_columns=1)}  mem={mem()}"
+            )
+            self._gpu_cache = jnp.asarray(self._dense_cache, dtype=jnp.float32)
+            self._gpu_cache.block_until_ready()
+            log(f"    GPU-resident matrix ready ({self._gpu_cache.dtype})  mem={mem()}")
+            log(f"    GPU materialization post-upload: {gpu_memory_snapshot()}")
+            log(f"    GPU materialization post-upload nvidia-smi: {nvidia_smi_snapshot()}")
+            return True
+        except Exception as error:
+            log(f"    GPU upload failed ({error}), leaving matrix in RAM  mem={mem()}")
+            log(f"    GPU materialization failure snapshot: {gpu_memory_snapshot()}")
+            log(f"    GPU materialization failure nvidia-smi: {nvidia_smi_snapshot()}")
+            self._gpu_cache = None
+            return False
 
     def try_materialize(self) -> bool:
         """Materialize into RAM if below the auto-materialize threshold.
@@ -355,7 +469,6 @@ class StandardizedGenotypeMatrix:
         nbytes = self.dense_bytes()
         if nbytes > MATERIALIZE_THRESHOLD_BYTES:
             return False
-        from sv_pgs.progress import log, mem
         log(f"    auto-materializing {self.shape[1]} variants x {self.shape[0]} samples ({nbytes / 1e9:.1f} GB) into RAM  mem={mem()}")
         self._dense_cache = self.materialize()
         log(f"    materialized  mem={mem()}")
@@ -371,6 +484,7 @@ class StandardizedGenotypeMatrix:
         )
         if self._gpu_cache is not None:
             subset._gpu_cache = self._gpu_cache[:, resolved_local_indices]
+            subset._gpu_chunk_override = self._gpu_chunk_override
         elif self._dense_cache is not None:
             subset._dense_cache = np.asarray(self._dense_cache[:, resolved_local_indices], dtype=np.float32)
         return subset
@@ -422,7 +536,10 @@ class StandardizedGenotypeMatrix:
             1,
         )
         chunk = _floor_power_of_two(target_chunk)
-        return max(_GPU_MATMUL_MIN_CHUNK, min(_GPU_MATMUL_MAX_CHUNK, chunk, self.shape[1]))
+        bounded_chunk = max(_GPU_MATMUL_MIN_CHUNK, min(_GPU_MATMUL_MAX_CHUNK, chunk, self.shape[1]))
+        if self._gpu_chunk_override is not None:
+            bounded_chunk = max(_GPU_MATMUL_MIN_CHUNK, min(bounded_chunk, self._gpu_chunk_override, self.shape[1]))
+        return bounded_chunk
 
     def _gpu_rhs_chunk(self, rhs_columns: int) -> int:
         return max(1, min(int(rhs_columns), _GPU_MATMAT_MAX_RHS_COLUMNS))
@@ -430,18 +547,35 @@ class StandardizedGenotypeMatrix:
     def _gpu_chunked_matvec(self, coeff: jnp.ndarray) -> jnp.ndarray:
         """GPU matmul in bounded chunks to avoid large-shape XLA crashes."""
         chunk = self._gpu_column_chunk(rhs_columns=1)
+        self._log_gpu_operation(
+            "matvec",
+            f"{self._gpu_chunk_description(rhs_columns=1)} coeff_shape={tuple(coeff.shape)} coeff_dtype={coeff.dtype}",
+        )
         result = jnp.zeros(self.shape[0], dtype=jnp.float32)
         for start in range(0, self.shape[1], chunk):
             end = min(start + chunk, self.shape[1])
-            result = result + self._gpu_cache[:, start:end] @ coeff[start:end]
+            self._log_gpu_operation(
+                "matvec_chunk",
+                f"range=[{start}:{end}) matrix_shape=({self.shape[0]}, {end - start}) vector_shape=({end - start},)",
+            )
+            chunk_term = self._gpu_cache[:, start:end] @ coeff[start:end]
+            result = result + chunk_term
         return result
 
     def _gpu_chunked_transpose_matvec(self, v: jnp.ndarray) -> jnp.ndarray:
         """GPU transpose matmul in bounded chunks."""
         chunk = self._gpu_column_chunk(rhs_columns=1)
+        self._log_gpu_operation(
+            "transpose_matvec",
+            f"{self._gpu_chunk_description(rhs_columns=1)} vector_shape={tuple(v.shape)} vector_dtype={v.dtype}",
+        )
         parts = []
         for start in range(0, self.shape[1], chunk):
             end = min(start + chunk, self.shape[1])
+            self._log_gpu_operation(
+                "transpose_matvec_chunk",
+                f"range=[{start}:{end}) matrix_shape=({self.shape[0]}, {end - start}) vector_shape=({self.shape[0]},)",
+            )
             parts.append(self._gpu_cache[:, start:end].T @ v)
         return jnp.concatenate(parts)
 
@@ -449,6 +583,10 @@ class StandardizedGenotypeMatrix:
         """GPU matrix-matrix multiply with chunking over both variants and RHS."""
         variant_chunk = self._gpu_column_chunk(rhs_columns=matrix.shape[1])
         rhs_chunk = self._gpu_rhs_chunk(matrix.shape[1])
+        self._log_gpu_operation(
+            "matmat",
+            f"{self._gpu_chunk_description(rhs_columns=matrix.shape[1])} rhs_shape={tuple(matrix.shape)} rhs_chunk={rhs_chunk}",
+        )
         result_blocks = []
         for rhs_start in range(0, matrix.shape[1], rhs_chunk):
             rhs_end = min(rhs_start + rhs_chunk, matrix.shape[1])
@@ -456,7 +594,12 @@ class StandardizedGenotypeMatrix:
             rhs_result = jnp.zeros((self.shape[0], rhs_end - rhs_start), dtype=jnp.float32)
             for start in range(0, self.shape[1], variant_chunk):
                 end = min(start + variant_chunk, self.shape[1])
-                rhs_result = rhs_result + self._gpu_cache[:, start:end] @ rhs_block[start:end, :]
+                self._log_gpu_operation(
+                    "matmat_chunk",
+                    f"col_range=[{start}:{end}) rhs_range=[{rhs_start}:{rhs_end}) matrix_shape=({self.shape[0]}, {end - start}) rhs_block_shape=({end - start}, {rhs_end - rhs_start})",
+                )
+                chunk_term = self._gpu_cache[:, start:end] @ rhs_block[start:end, :]
+                rhs_result = rhs_result + chunk_term
             result_blocks.append(rhs_result)
         return jnp.concatenate(result_blocks, axis=1)
 
@@ -517,12 +660,20 @@ class StandardizedGenotypeMatrix:
                 raise ValueError("sample matrix must match genotype row count.")
             chunk = self._gpu_column_chunk(rhs_columns=m.shape[1])
             rhs_chunk = self._gpu_rhs_chunk(m.shape[1])
+            self._log_gpu_operation(
+                "transpose_matmat",
+                f"{self._gpu_chunk_description(rhs_columns=m.shape[1])} matrix_shape={tuple(m.shape)} rhs_chunk={rhs_chunk}",
+            )
             parts = []
             for start in range(0, self.shape[1], chunk):
                 end = min(start + chunk, self.shape[1])
                 rhs_blocks = []
                 for rhs_start in range(0, m.shape[1], rhs_chunk):
                     rhs_end = min(rhs_start + rhs_chunk, m.shape[1])
+                    self._log_gpu_operation(
+                        "transpose_matmat_chunk",
+                        f"col_range=[{start}:{end}) rhs_range=[{rhs_start}:{rhs_end}) matrix_shape=({self.shape[0]}, {end - start}) sample_block_shape=({self.shape[0]}, {rhs_end - rhs_start})",
+                    )
                     rhs_blocks.append(self._gpu_cache[:, start:end].T @ m[:, rhs_start:rhs_end])
                 parts.append(jnp.concatenate(rhs_blocks, axis=1))
             return jnp.concatenate(parts).astype(jnp.float64)
