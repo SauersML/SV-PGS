@@ -144,7 +144,7 @@ class BayesianPGS:
             cached = True
         else:
             cached = reduced_genotypes.try_materialize()
-        log(f"starting variational EM  max_iterations={self.config.max_outer_iterations}  reduced_matrix={reduced_genotypes.shape}  in_memory={cached}  on_gpu={gpu_cached}  mem={mem()}")
+        log(f"starting variational EM  max_iterations={self.config.max_outer_iterations}  reduced_matrix={reduced_genotypes.shape}  in_memory={cached}  on_gpu={gpu_cached}   mem={mem()}")
         fit_result = fit_variational_em(
             genotypes=reduced_genotypes,
             covariates=prepared_arrays.covariates,

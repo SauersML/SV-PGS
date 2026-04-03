@@ -149,25 +149,31 @@ def _solve_single_rhs(
     max_iterations: int,
     initial_guess: jnp.ndarray | None,
 ) -> jnp.ndarray:
+    import time
+    from sv_pgs.progress import log, mem
     tol_sq = tolerance * tolerance
     solution = jnp.zeros_like(rhs) if initial_guess is None else initial_guess
     residual = rhs - linear_operator.matvec(solution)
     search_direction = residual
-    # Keep residual_dot as a JAX scalar to avoid GPU sync every iteration.
-    # Only call float() when we actually need to check convergence.
     residual_dot_jax = jnp.vdot(residual, residual)
-    if float(residual_dot_jax) <= tol_sq:
+    initial_residual = float(residual_dot_jax)
+    if initial_residual <= tol_sq:
         return jnp.asarray(solution, dtype=jnp.float64)
+    t_start = time.monotonic()
+    last_log = t_start
     for _iteration_index in range(max_iterations):
         operator_search_direction = linear_operator.matvec(search_direction)
         step_denom_jax = jnp.vdot(search_direction, operator_search_direction)
-        # Compute step_size as JAX scalar — no sync
         step_size = residual_dot_jax / step_denom_jax
         solution = solution + step_size * search_direction
         residual = residual - step_size * operator_search_direction
         updated_residual_dot_jax = jnp.vdot(residual, residual)
-        # Only sync to check convergence (every iteration, but just one float())
         updated_residual_dot = float(updated_residual_dot_jax)
+        now = time.monotonic()
+        if now - last_log >= 5.0 or updated_residual_dot <= tol_sq:
+            reduction = updated_residual_dot / max(initial_residual, 1e-30)
+            log(f"      CG iter {_iteration_index+1}/{max_iterations}: residual={updated_residual_dot:.2e}  reduction={reduction:.2e}  ({now - t_start:.1f}s)  mem={mem()}")
+            last_log = now
         if updated_residual_dot <= tol_sq:
             return jnp.asarray(solution, dtype=jnp.float64)
         if float(step_denom_jax) <= 0.0:

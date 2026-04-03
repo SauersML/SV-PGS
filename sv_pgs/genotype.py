@@ -336,7 +336,7 @@ class StandardizedGenotypeMatrix:
             del cpu_matrix
             # Force the transfer to complete and verify it landed on GPU
             self._gpu_cache.block_until_ready()
-            log(f"    GPU-resident matrix ready ({self._gpu_cache.dtype}, {self._gpu_cache.device()})  mem={mem()}")
+            log(f"    GPU-resident matrix ready ({self._gpu_cache.dtype})  mem={mem()}")
             return True
         except Exception as e:
             log(f"    GPU materialization failed ({e}), falling back to streaming  mem={mem()}")
