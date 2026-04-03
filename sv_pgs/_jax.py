@@ -6,12 +6,15 @@ import os
 os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
 os.environ.setdefault("XLA_PYTHON_CLIENT_MEM_FRACTION", "0.7")
 
-# Disable Triton GEMM and autotuning to work around XLA compilation segfaults
-# on some GPU environments (e.g. T4 with certain CUDA driver versions).
+# Work around XLA compilation segfaults on Turing GPUs (T4) and other
+# environments.  See:
+#   https://github.com/jax-ml/jax/issues/17349  (Turing GPU segfaults)
+#   https://github.com/jax-ml/jax/issues/29139  (backend_compile segfault)
 _xla_flags = os.environ.get("XLA_FLAGS", "")
 for flag in [
     "--xla_gpu_enable_triton_gemm=false",
     "--xla_gpu_autotune_level=0",
+    "--xla_gpu_force_compilation_parallelism=1",
 ]:
     if flag not in _xla_flags:
         _xla_flags = f"{_xla_flags} {flag}".strip()
