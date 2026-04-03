@@ -137,6 +137,7 @@ class ModelConfig:
     logdet_lanczos_steps: int = 12
     exact_solver_matrix_limit: int = 2048  # below this: direct solve; above: Woodbury or CG
     posterior_variance_batch_size: int = 1024
+    posterior_variance_probe_count: int = 12
     maximum_tie_map_variants: int = 5000
     validation_interval: int = 2
     binary_intercept_calibration: bool = False
@@ -201,6 +202,8 @@ class ModelConfig:
             raise ValueError("exact_solver_matrix_limit must be positive.")
         if self.posterior_variance_batch_size < 1:
             raise ValueError("posterior_variance_batch_size must be positive.")
+        if self.posterior_variance_probe_count < 1:
+            raise ValueError("posterior_variance_probe_count must be positive.")
         if self.maximum_tie_map_variants < 1:
             raise ValueError("maximum_tie_map_variants must be positive.")
         if self.validation_interval < 1:

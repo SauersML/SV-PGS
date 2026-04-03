@@ -68,6 +68,7 @@ from sv_pgs.genotype import DenseRawGenotypeMatrix, StandardizedGenotypeMatrix
 from sv_pgs.linear_solvers import build_linear_operator, solve_spd_system, stochastic_logdet
 from sv_pgs.numeric import stable_sigmoid
 from sv_pgs.preprocessing import collapse_tie_groups
+from sv_pgs.progress import gpu_memory_snapshot, log, mem, nvidia_smi_snapshot
 
 
 @dataclass(slots=True)
@@ -129,9 +130,8 @@ def fit_variational_em(
     records: Sequence[VariantRecord],
     config: ModelConfig,
     tie_map: TieMap,
-    validation_data: tuple[np.ndarray, np.ndarray, np.ndarray] | None = None,
+    validation_data: tuple[StandardizedGenotypeMatrix | np.ndarray, np.ndarray, np.ndarray] | None = None,
 ) -> VariationalFitResult:
-    from sv_pgs.progress import log, mem
     genotype_matrix = _as_standardized_genotype_matrix(genotypes)
     covariate_matrix = np.asarray(covariates, dtype=np.float64)
     target_vector = np.asarray(targets, dtype=np.float64)
@@ -179,7 +179,6 @@ def fit_variational_em(
     best_tpb_shape_a_vector: np.ndarray | None = None
     best_tpb_shape_b_vector: np.ndarray | None = None
 
-    from sv_pgs.progress import log, mem
     log(f"  variational EM: {genotype_matrix.shape[1]} reduced variants, {covariate_matrix.shape[1]} covariates, {target_vector.shape[0]} samples, max_iter={config.max_outer_iterations}")
 
     for outer_iteration in range(config.max_outer_iterations):
@@ -404,9 +403,14 @@ def fit_variational_em(
         )
 
     log(f"  final posterior computed  obj={final_state.collapsed_objective:.6f}  sigma_e2={final_state.sigma_error2:.4f}  mem={mem()}")
-    final_member_prior_variances = _expand_group_prior_variances_to_members(
-        reduced_prior_variances=final_reduced_prior_variances,
+    final_member_prior_variances = _member_prior_variances_from_reduced_state(
+        member_records=member_records,
         tie_map=tie_map,
+        scale_model_coefficients=scale_model_coefficients,
+        scale_model_feature_names=prior_design.feature_names,
+        global_scale=float(global_scale),
+        local_scale=local_scale,
+        config=config,
     )
     local_shape_a = prior_design.class_membership_matrix @ tpb_shape_a_vector
     local_shape_b = prior_design.class_membership_matrix @ tpb_shape_b_vector
@@ -435,13 +439,13 @@ def fit_variational_em(
 
 
 def _prepare_validation(
-    validation_data: tuple[np.ndarray, np.ndarray, np.ndarray] | None,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray] | None:
+    validation_data: tuple[StandardizedGenotypeMatrix | np.ndarray, np.ndarray, np.ndarray] | None,
+) -> tuple[StandardizedGenotypeMatrix | np.ndarray, np.ndarray, np.ndarray] | None:
     if validation_data is None:
         return None
     validation_genotypes, validation_covariates, validation_targets = validation_data
     return (
-        np.asarray(validation_genotypes, dtype=np.float64),
+        validation_genotypes if isinstance(validation_genotypes, StandardizedGenotypeMatrix) else np.asarray(validation_genotypes, dtype=np.float64),
         np.asarray(validation_covariates, dtype=np.float64),
         np.asarray(validation_targets, dtype=np.float64),
     )
@@ -470,7 +474,6 @@ def _fit_collapsed_posterior(
     trait_type: TraitType,
     config: ModelConfig,
 ) -> PosteriorState:
-    from sv_pgs.progress import log, mem
     log(f"    collapsed posterior: trait={trait_type.value}  n_variants={genotype_matrix.shape[1]}  n_samples={genotype_matrix.shape[0]}  sigma_e2={sigma_error2:.6f}  mem={mem()}")
     prior_variances = np.maximum(np.asarray(reduced_prior_variances, dtype=np.float64), 1e-8)
     if trait_type == TraitType.QUANTITATIVE:
@@ -487,6 +490,7 @@ def _fit_collapsed_posterior(
             logdet_lanczos_steps=config.logdet_lanczos_steps,
             exact_solver_matrix_limit=config.exact_solver_matrix_limit,
             posterior_variance_batch_size=config.posterior_variance_batch_size,
+            posterior_variance_probe_count=config.posterior_variance_probe_count,
             random_seed=config.random_seed,
         )
     else:
@@ -511,6 +515,7 @@ def _fit_collapsed_posterior(
             logdet_lanczos_steps=config.logdet_lanczos_steps,
             exact_solver_matrix_limit=config.exact_solver_matrix_limit,
             posterior_variance_batch_size=config.posterior_variance_batch_size,
+            posterior_variance_probe_count=config.posterior_variance_probe_count,
             random_seed=config.random_seed,
         )
         sigma_error2_new = 1.0
@@ -546,6 +551,7 @@ def _quantitative_posterior_state(
     logdet_lanczos_steps: int = 12,
     exact_solver_matrix_limit: int = 512,
     posterior_variance_batch_size: int = 64,
+    posterior_variance_probe_count: int = 12,
     random_seed: int = 0,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, float, float]:
     standardized_genotypes = _as_standardized_genotype_matrix(genotype_matrix)
@@ -563,6 +569,7 @@ def _quantitative_posterior_state(
             logdet_lanczos_steps=logdet_lanczos_steps,
             exact_solver_matrix_limit=exact_solver_matrix_limit,
             posterior_variance_batch_size=posterior_variance_batch_size,
+            posterior_variance_probe_count=posterior_variance_probe_count,
             random_seed=random_seed,
             compute_logdet=True,
         )
@@ -625,6 +632,7 @@ def _binary_posterior_state(
     logdet_lanczos_steps: int = 12,
     exact_solver_matrix_limit: int = 512,
     posterior_variance_batch_size: int = 64,
+    posterior_variance_probe_count: int = 12,
     random_seed: int = 0,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, float]:
     standardized_genotypes = _as_standardized_genotype_matrix(genotype_matrix)
@@ -640,6 +648,8 @@ def _binary_posterior_state(
     targets_jax = jnp.asarray(targets, dtype=jnp.float64)
     prior_precision_jax = jnp.asarray(prior_precision, dtype=jnp.float64)
 
+    penalized_term_calls = 0
+
     def penalized_terms(current_parameters: np.ndarray) -> tuple[float, np.ndarray, np.ndarray, np.ndarray]:
         """Compute the penalized log-posterior, its gradient, IRLS weights, and predictions.
 
@@ -647,8 +657,21 @@ def _binary_posterior_state(
           - Data fit: how well do the predicted probabilities match actual 0/1 outcomes
           - Prior penalty: large betas are penalized (more so for small prior variance)
         """
+        nonlocal penalized_term_calls
+        penalized_term_calls += 1
         alpha = current_parameters[:covariate_count]
         beta = current_parameters[covariate_count:]
+        if penalized_term_calls <= 2:
+            log(
+                "      binary penalized_terms diagnostics: "
+                + f"call={penalized_term_calls} alpha_shape={alpha.shape} beta_shape={beta.shape} "
+                + f"covariates_shape={covariate_matrix_jax.shape} targets_shape={targets_jax.shape} "
+                + f"genotype_shape={standardized_genotypes.shape} gpu_cached={standardized_genotypes._gpu_cache is not None} "
+                + standardized_genotypes._gpu_chunk_description(rhs_columns=1)
+            )
+            log(f"      binary penalized_terms device snapshot: {gpu_memory_snapshot()}")
+            if penalized_term_calls == 1:
+                log(f"      binary penalized_terms nvidia-smi: {nvidia_smi_snapshot()}")
         # Compute linear predictor on GPU: covariate part via JAX matmul,
         # genotype part via StandardizedGenotypeMatrix.matvec (already JAX).
         alpha_jax = jnp.asarray(alpha, dtype=jnp.float64)
@@ -684,7 +707,6 @@ def _binary_posterior_state(
         weights = np.asarray(weights_jax, dtype=np.float64)
         return penalized_log_posterior, gradient, weights, linear_predictor
 
-    from sv_pgs.progress import log, mem
     log(f"      Newton trust-region: {standardized_genotypes.shape[1]} variants, max_iter={max_iterations}, damping={damping:.2e}  mem={mem()}")
     for _iteration_index in range(max_iterations):
         current_objective, gradient, weights, linear_predictor = penalized_terms(parameters)
@@ -706,6 +728,7 @@ def _binary_posterior_state(
                 logdet_lanczos_steps=logdet_lanczos_steps,
                 exact_solver_matrix_limit=exact_solver_matrix_limit,
                 posterior_variance_batch_size=posterior_variance_batch_size,
+                posterior_variance_probe_count=posterior_variance_probe_count,
                 random_seed=random_seed + _iteration_index,
                 compute_logdet=False,
                 compute_beta_variance=False,
@@ -751,6 +774,7 @@ def _binary_posterior_state(
             logdet_lanczos_steps=logdet_lanczos_steps,
             exact_solver_matrix_limit=exact_solver_matrix_limit,
             posterior_variance_batch_size=posterior_variance_batch_size,
+            posterior_variance_probe_count=posterior_variance_probe_count,
             random_seed=random_seed + 2 * max_iterations,
             compute_logdet=False,
             compute_beta_variance=False,
@@ -778,15 +802,17 @@ def _binary_posterior_state(
             logdet_lanczos_steps=logdet_lanczos_steps,
             exact_solver_matrix_limit=exact_solver_matrix_limit,
             posterior_variance_batch_size=posterior_variance_batch_size,
+            posterior_variance_probe_count=posterior_variance_probe_count,
             random_seed=random_seed + 2 * max_iterations + 17,
             compute_logdet=True,
         )
     )
+    laplace_weights = np.asarray(final_weights, dtype=np.float64)
     final_parameters = np.concatenate([final_alpha, final_beta], axis=0)
-    final_objective, _final_gradient, final_weights, linear_predictor = penalized_terms(final_parameters)
+    final_objective, _final_gradient, _final_penalty_weights, linear_predictor = penalized_terms(final_parameters)
     logdet_hessian = (
         float(np.sum(np.log(np.maximum(prior_precision, 1e-12))))
-        + float(np.sum(np.log(np.maximum(final_weights, 1e-12))))
+        + float(np.sum(np.log(np.maximum(laplace_weights, 1e-12))))
         + logdet_covariance
         + logdet_gls
     )
@@ -834,6 +860,103 @@ def _sample_space_operator(
     )
 
 
+def _sample_space_diagonal_preconditioner(
+    genotype_matrix: StandardizedGenotypeMatrix,
+    prior_variances: np.ndarray,
+    diagonal_noise: np.ndarray,
+    batch_size: int,
+) -> np.ndarray:
+    diagonal = np.asarray(diagonal_noise, dtype=np.float64).copy()
+    for batch in genotype_matrix.iter_column_batches(batch_size=batch_size):
+        genotype_batch = np.asarray(batch.values, dtype=np.float64)
+        diagonal += np.sum(
+            genotype_batch * genotype_batch * prior_variances[batch.variant_indices][None, :],
+            axis=1,
+        )
+    return np.maximum(diagonal, 1e-8)
+
+
+def _restricted_precision_projector(
+    covariate_matrix: np.ndarray,
+    diagonal_noise: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray, float, Callable[[np.ndarray], np.ndarray]]:
+    inverse_diagonal_noise = 1.0 / np.maximum(np.asarray(diagonal_noise, dtype=np.float64), 1e-12)
+    weighted_covariates = inverse_diagonal_noise[:, None] * covariate_matrix
+    covariate_precision = covariate_matrix.T @ weighted_covariates + np.eye(covariate_matrix.shape[1], dtype=np.float64) * 1e-8
+    covariate_precision_cholesky = np.linalg.cholesky(covariate_precision)
+    covariate_precision_logdet = 2.0 * float(np.sum(np.log(np.diag(covariate_precision_cholesky))))
+
+    def apply_projector(right_hand_side: np.ndarray) -> np.ndarray:
+        rhs = np.asarray(right_hand_side, dtype=np.float64)
+        weighted_rhs = inverse_diagonal_noise[:, None] * rhs if rhs.ndim == 2 else inverse_diagonal_noise * rhs
+        correction = weighted_covariates @ _cholesky_solve(
+            covariate_precision_cholesky,
+            covariate_matrix.T @ weighted_rhs,
+        )
+        return weighted_rhs - correction
+
+    return inverse_diagonal_noise, covariate_precision_cholesky, covariate_precision_logdet, apply_projector
+
+
+def _restricted_variant_space_operator(
+    genotype_matrix: StandardizedGenotypeMatrix,
+    prior_precision: np.ndarray,
+    apply_projector: Callable[[np.ndarray], np.ndarray],
+    batch_size: int,
+):
+    prior_precision_jax = jnp.asarray(prior_precision, dtype=jnp.float64)
+
+    def matvec(vector) -> jnp.ndarray:
+        coefficients = jnp.asarray(vector, dtype=jnp.float64)
+        genotype_projection = np.asarray(
+            genotype_matrix.matvec(coefficients, batch_size=batch_size),
+            dtype=np.float64,
+        )
+        restricted_projection = apply_projector(genotype_projection)
+        return prior_precision_jax * coefficients + genotype_matrix.transpose_matvec(
+            restricted_projection,
+            batch_size=batch_size,
+        )
+
+    return build_linear_operator(
+        shape=(genotype_matrix.shape[1], genotype_matrix.shape[1]),
+        matvec=matvec,
+    )
+
+
+def _restricted_variant_space_diagonal_preconditioner(
+    genotype_matrix: StandardizedGenotypeMatrix,
+    covariate_matrix: np.ndarray,
+    inverse_diagonal_noise: np.ndarray,
+    covariate_precision_cholesky: np.ndarray,
+    prior_precision: np.ndarray,
+    batch_size: int,
+) -> np.ndarray:
+    diagonal = np.asarray(prior_precision, dtype=np.float64).copy()
+    for batch in genotype_matrix.iter_column_batches(batch_size=batch_size):
+        genotype_batch = np.asarray(batch.values, dtype=np.float64)
+        weighted_batch = inverse_diagonal_noise[:, None] * genotype_batch
+        cross_terms = covariate_matrix.T @ weighted_batch
+        correction = _cholesky_solve(covariate_precision_cholesky, cross_terms)
+        diagonal[batch.variant_indices] += np.sum(genotype_batch * weighted_batch, axis=0) - np.sum(
+            cross_terms * correction,
+            axis=0,
+        )
+    return np.maximum(diagonal, 1e-8)
+
+
+def _posterior_variance_hutchinson_diagonal(
+    solve_variant_rhs: Callable[[np.ndarray], np.ndarray],
+    dimension: int,
+    probe_count: int,
+    random_seed: int,
+) -> np.ndarray:
+    random_generator = np.random.default_rng(random_seed)
+    probes = random_generator.choice((-1.0, 1.0), size=(dimension, probe_count)).astype(np.float64)
+    solutions = np.asarray(solve_variant_rhs(probes), dtype=np.float64)
+    return np.maximum(np.mean(probes * solutions, axis=1), 1e-8)
+
+
 def _restricted_posterior_state(
     genotype_matrix: StandardizedGenotypeMatrix,
     covariate_matrix: np.ndarray,
@@ -846,11 +969,11 @@ def _restricted_posterior_state(
     logdet_lanczos_steps: int,
     exact_solver_matrix_limit: int,
     posterior_variance_batch_size: int,
+    posterior_variance_probe_count: int,
     random_seed: int,
     compute_logdet: bool,
     compute_beta_variance: bool = True,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, float, float, float]:
-    from sv_pgs.progress import log, mem
     sample_count = genotype_matrix.shape[0]
     diagonal_noise = np.asarray(diagonal_noise, dtype=np.float64)
     if diagonal_noise.shape != (sample_count,):
@@ -890,6 +1013,13 @@ def _restricted_posterior_state(
         # because V = D + X S X^T has low rank relative to sample count.
         # Result: exact solve, but O(p^3) instead of O(n^3).
         log(f"    restricted posterior: Woodbury variant-space Cholesky (p={variant_count}, n={sample_count})  mem={mem()}")
+        log(
+            "    Woodbury diagnostics: "
+            + f"gpu_cached={genotype_matrix._gpu_cache is not None} "
+            + genotype_matrix._gpu_chunk_description(rhs_columns=variant_count)
+        )
+        log(f"    Woodbury device snapshot: {gpu_memory_snapshot()}")
+        log(f"    Woodbury nvidia-smi: {nvidia_smi_snapshot()}")
         inv_diag = 1.0 / np.maximum(diagonal_noise, 1e-12)
         # Keep the dense cross-product on device, but route it through the same
         # chunked genotype helpers as the rest of the GPU path.
@@ -1028,7 +1158,6 @@ def _restricted_cross_leverage_diagonal(
     gls_cholesky: np.ndarray,
     batch_size: int,
 ) -> np.ndarray:
-    from sv_pgs.progress import log, mem
     variant_count = genotype_matrix.shape[1]
     leverage_diagonal = np.zeros(variant_count, dtype=np.float64)
     variants_done = 0
@@ -1116,6 +1245,65 @@ def _build_prior_design(records: Sequence[VariantRecord]) -> PriorDesign:
         class_membership_matrix=class_membership_matrix,
         inverse_class_lookup=inverse_class_lookup,
     )
+
+
+def _design_matrix_for_feature_names(
+    records: Sequence[VariantRecord],
+    feature_names: Sequence[str],
+) -> np.ndarray:
+    if len(feature_names) == 0:
+        return np.zeros((len(records), 0), dtype=np.float64)
+    class_membership_by_class: dict[VariantClass, np.ndarray] = {}
+    for variant_class in VariantClass:
+        class_membership_by_class[variant_class] = np.asarray(
+            [
+                _class_membership_weight(record, variant_class)
+                for record in records
+            ],
+            dtype=np.float64,
+        )
+
+    log_length = np.log(np.maximum(np.asarray([record.length for record in records], dtype=np.float64), 1.0))
+    standardized_log_length = _standardize_metadata(log_length)
+    repeat_indicator = np.asarray([float(record.is_repeat) for record in records], dtype=np.float64)
+    copy_number_indicator = np.asarray([float(record.is_copy_number) for record in records], dtype=np.float64)
+
+    design_columns: list[np.ndarray] = []
+    for feature_name in feature_names:
+        if feature_name == "repeat_indicator":
+            design_columns.append(_center_design_column(repeat_indicator))
+            continue
+        if feature_name == "copy_number_indicator":
+            design_columns.append(_center_design_column(copy_number_indicator))
+            continue
+        prefix, _, class_name = feature_name.partition("::")
+        if not class_name:
+            raise ValueError("scale-model feature names must include a class suffix when required.")
+        variant_class = VariantClass(class_name)
+        class_membership = class_membership_by_class[variant_class]
+        if prefix == "type_offset":
+            design_columns.append(_center_design_column(class_membership))
+            continue
+        if prefix == "log_length_linear":
+            design_columns.append(_center_design_column(class_membership * standardized_log_length))
+            continue
+        if prefix == "log_length_quadratic":
+            design_columns.append(
+                _center_design_column(class_membership * standardized_log_length * standardized_log_length)
+            )
+            continue
+        raise ValueError("Unsupported scale-model feature: " + feature_name)
+
+    return np.column_stack(design_columns).astype(np.float64)
+
+
+def _class_membership_weight(record: VariantRecord, variant_class: VariantClass) -> float:
+    for member_class, member_weight in zip(record.prior_class_members, record.prior_class_membership, strict=True):
+        if member_class == variant_class:
+            return float(member_weight)
+    return 0.0
+
+
 def _standardize_metadata(values: np.ndarray) -> np.ndarray:
     centered_values = values - float(np.mean(values))
     scale_value = float(np.std(values))
@@ -1524,21 +1712,44 @@ def _gig_moment(
     )
 
 
-# When multiple variants are identical (tied), they share one representative
-# in the reduced model.  This function spreads the representative's prior
-# variance back to all group members, dividing equally among them — each
-# tied variant gets 1/k of the group's variance (k = group size).
-def _expand_group_prior_variances_to_members(
-    reduced_prior_variances: np.ndarray,
+def _member_prior_variances_from_reduced_state(
+    member_records: Sequence[VariantRecord],
+    tie_map: TieMap,
+    scale_model_coefficients: np.ndarray,
+    scale_model_feature_names: Sequence[str],
+    global_scale: float,
+    local_scale: np.ndarray,
+    config: ModelConfig,
+) -> np.ndarray:
+    member_design_matrix = _design_matrix_for_feature_names(
+        records=member_records,
+        feature_names=scale_model_feature_names,
+    )
+    member_baseline_scales = _metadata_baseline_scales_from_coefficients(
+        scale_model_coefficients=np.asarray(scale_model_coefficients, dtype=np.float64),
+        design_matrix=member_design_matrix,
+        config=config,
+    )
+    member_baseline_prior_variances = (float(global_scale) * member_baseline_scales) ** 2
+    member_local_scale = _expand_group_values_to_members(
+        reduced_values=np.asarray(local_scale, dtype=np.float64),
+        tie_map=tie_map,
+    )
+    return _effective_prior_variances(
+        baseline_prior_variances=member_baseline_prior_variances,
+        local_scale=member_local_scale,
+        config=config,
+    )
+
+
+def _expand_group_values_to_members(
+    reduced_values: np.ndarray,
     tie_map: TieMap,
 ) -> np.ndarray:
-    member_prior_variances = np.zeros(tie_map.original_to_reduced.shape[0], dtype=np.float64)
+    member_values = np.zeros(tie_map.original_to_reduced.shape[0], dtype=np.float64)
     for reduced_index, tie_group in enumerate(tie_map.reduced_to_group):
-        group_size = int(tie_group.member_indices.shape[0])
-        if group_size <= 0:
-            raise ValueError("tie groups must contain at least one member.")
-        member_prior_variances[tie_group.member_indices] = float(reduced_prior_variances[reduced_index]) / group_size
-    return member_prior_variances
+        member_values[tie_group.member_indices] = float(reduced_values[reduced_index])
+    return member_values
 
 
 def _relative_parameter_change(

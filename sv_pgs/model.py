@@ -12,18 +12,22 @@ import jax.numpy as jnp
 from sv_pgs.artifact import ModelArtifact, load_artifact, save_artifact
 from sv_pgs.config import ModelConfig, TraitType
 from sv_pgs.data import TieGroup, TieMap, VariantRecord, VariantStatistics, normalize_variant_records
-from sv_pgs.genotype import RawGenotypeMatrix, StandardizedGenotypeMatrix, as_raw_genotype_matrix, auto_batch_size
+from sv_pgs.genotype import (
+    RawGenotypeMatrix,
+    _standardize_batch,
+    as_raw_genotype_matrix,
+    auto_batch_size,
+)
 from sv_pgs.inference import VariationalFitResult, fit_variational_em
 from sv_pgs.numeric import stable_sigmoid
 from sv_pgs.preprocessing import (
     Preprocessor,
-    _infer_support_count_from_raw_genotypes,
     build_tie_map,
-    compute_variant_statistics,
     fit_preprocessor,
     fit_preprocessor_from_stats,
     select_active_variant_indices,
 )
+from sv_pgs.progress import log, mem
 
 STRUCTURAL_VARIANT_CLASSES = set(ModelConfig.structural_variant_classes())
 
@@ -71,10 +75,9 @@ class BayesianPGS:
         covariates: np.ndarray,
         targets: np.ndarray,
         variant_records: Sequence[VariantRecord | dict],
-        validation_data: tuple[np.ndarray, np.ndarray, np.ndarray] | None = None,
+        validation_data: tuple[RawGenotypeMatrix | np.ndarray, np.ndarray, np.ndarray] | None = None,
         variant_stats: VariantStatistics | None = None,
     ) -> BayesianPGS:
-        from sv_pgs.progress import log, mem
         log(f"=== MODEL FIT START ===  genotypes={genotypes.shape}  covariates={covariates.shape}  targets={targets.shape}  pre_computed_stats={'YES' if variant_stats else 'NO'}")
         raw_genotype_matrix = as_raw_genotype_matrix(genotypes)
 
@@ -128,11 +131,12 @@ class BayesianPGS:
         reduced_validation = None
         if validation_data is not None:
             validation_genotypes, validation_covariates, validation_targets = validation_data
-            standardized_validation = preprocessor.transform(np.asarray(validation_genotypes, dtype=np.float32))
-            if not isinstance(standardized_validation, np.ndarray):
-                raise RuntimeError("validation_data must produce an in-memory standardized matrix.")
+            standardized_validation = as_raw_genotype_matrix(validation_genotypes).standardized(
+                prepared_arrays.means,
+                prepared_arrays.scales,
+            )
             reduced_validation = (
-                standardized_validation[:, active_variant_indices][:, reduced_tie_map.kept_indices],
+                standardized_validation.subset(active_variant_indices).subset(reduced_tie_map.kept_indices),
                 self._with_intercept(np.asarray(validation_covariates, dtype=np.float32)),
                 np.asarray(validation_targets, dtype=np.float32),
             )
@@ -142,7 +146,12 @@ class BayesianPGS:
         cached = reduced_genotypes.try_materialize_gpu()
         if not cached:
             cached = reduced_genotypes.try_materialize()
-        log(f"starting variational EM  max_iterations={self.config.max_outer_iterations}  reduced_matrix={reduced_genotypes.shape}  in_memory={cached}  mem={mem()}")
+        log(
+            f"starting variational EM  max_iterations={self.config.max_outer_iterations}  "
+            f"reduced_matrix={reduced_genotypes.shape}  in_memory={cached}  "
+            f"on_gpu={reduced_genotypes._gpu_cache is not None}  "
+            f"{reduced_genotypes._gpu_chunk_description(rhs_columns=1)}  mem={mem()}"
+        )
         fit_result = fit_variational_em(
             genotypes=reduced_genotypes,
             covariates=prepared_arrays.covariates,
@@ -193,7 +202,6 @@ class BayesianPGS:
         Only reads variants with non-zero coefficients (typically <1% of all variants),
         making prediction fast even on huge genotype files.
         """
-        from sv_pgs.progress import log, mem
         fitted_state = self._require_state()
         covariate_matrix = self._with_intercept(np.asarray(covariates, dtype=np.float32))
 
@@ -408,7 +416,6 @@ def _training_records(
     records: Sequence[VariantRecord],
     config: ModelConfig,
 ) -> list[VariantRecord]:
-    from sv_pgs.progress import log, mem
     training_supports = [record.training_support for record in records]
     unresolved_variant_indices = [
         variant_index
@@ -456,7 +463,6 @@ def _training_records_from_stats(
     variant_stats: VariantStatistics,
 ) -> list[VariantRecord]:
     """Build training records using pre-computed support counts (no data pass)."""
-    from sv_pgs.progress import log
     training_records: list[VariantRecord] = []
     for variant_index, record in enumerate(records):
         support = record.training_support
@@ -532,15 +538,3 @@ def _identity_tie_map(variant_count: int) -> TieMap:
             for variant_index in range(variant_count)
         ],
     )
-
-
-def _standardize_batch(
-    batch: np.ndarray,
-    means: np.ndarray,
-    scales: np.ndarray,
-) -> np.ndarray:
-    mean_vector = np.asarray(means, dtype=np.float32)
-    scale_vector = np.asarray(scales, dtype=np.float32)
-    imputed = np.where(np.isnan(batch), mean_vector[None, :], batch)
-    standardized = (imputed - mean_vector[None, :]) / scale_vector[None, :]
-    return np.asarray(standardized, dtype=np.float32)

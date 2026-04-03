@@ -16,6 +16,8 @@ from sv_pgs.config import ModelConfig, TraitType, VariantClass
 from sv_pgs.data import VariantRecord, VariantStatistics
 from sv_pgs.genotype import DenseRawGenotypeMatrix, PlinkRawGenotypeMatrix, RawGenotypeMatrix
 from sv_pgs.model import BayesianPGS
+from sv_pgs.preprocessing import compute_variant_statistics
+from sv_pgs.progress import log, mem
 
 SV_LENGTH_THRESHOLD = 1_000.0
 DEFAULT_SAMPLE_ID_COLUMNS = ("sample_id", "research_id", "person_id")
@@ -80,7 +82,6 @@ def load_dataset_from_files(
     sample_id_column: str = "auto",
     variant_metadata_path: str | Path | None = None,
 ) -> LoadedDataset:
-    from sv_pgs.progress import log, mem
     log(f"=== LOAD DATASET START === mem={mem()}")
 
     source_path = Path(genotype_path)
@@ -221,7 +222,6 @@ def load_dataset_from_files(
             variant_count=plink_metadata.variant_count,
             total_sample_count=total_fam_samples,
         )
-        from sv_pgs.preprocessing import compute_variant_statistics
         # Add intercept column to covariates for residual computation (same as model.fit)
         cov_with_intercept = np.concatenate([
             np.ones((sample_table.covariates.shape[0], 1), dtype=np.float32),
@@ -261,7 +261,6 @@ def run_training_pipeline(
     config: ModelConfig,
     output_dir: str | Path,
 ) -> PipelineOutputs:
-    from sv_pgs.progress import log, mem
     log(f"=== TRAINING PIPELINE START ===  samples={len(dataset.sample_ids)}  variants={dataset.genotypes.shape[1]}  trait={config.trait_type.value}  mem={mem()}")
     destination = Path(output_dir)
     destination.mkdir(parents=True, exist_ok=True)
@@ -465,8 +464,6 @@ def _load_vcf_from_cache(
     keep_sample_indices: np.ndarray | None,
 ) -> tuple[np.ndarray, list[_VariantDefaults]] | None:
     """Try to load cached VCF parse results. Returns None on miss."""
-    from sv_pgs.progress import log
-
     cache_dir = _vcf_cache_dir(vcf_path)
     if not cache_dir.exists():
         return None
@@ -498,20 +495,19 @@ def _save_vcf_to_cache(
     variants: list[_VariantDefaults],
 ) -> None:
     """Persist parsed VCF results to disk cache."""
-    from sv_pgs.progress import log
-
     cache_dir = _vcf_cache_dir(vcf_path)
     key = _vcf_cache_key(vcf_path, keep_sample_indices)
     geno_path = cache_dir / f"{key}.genotypes.npy"
     var_path = cache_dir / f"{key}.variants.pkl"
-    geno_tmp = geno_path.with_suffix(".npy.tmp")
+    geno_tmp = cache_dir / f"{key}.genotypes.npy.tmp"
     var_tmp = var_path.with_suffix(".pkl.tmp")
 
     try:
         cache_dir.mkdir(parents=True, exist_ok=True)
         # Write to temp files first, then atomically rename to avoid
         # corrupt cache entries if the process is killed mid-write.
-        np.save(str(geno_tmp), genotype_matrix)
+        with open(geno_tmp, "wb") as geno_handle:
+            np.save(geno_handle, genotype_matrix)
         with open(str(var_tmp), "wb") as f:
             pickle.dump(variants, f, protocol=pickle.HIGHEST_PROTOCOL)
         geno_tmp.rename(geno_path)
@@ -543,7 +539,6 @@ def _load_vcf(
     DenseRawGenotypeMatrix.  Peak memory is ~2.5 GB for 97K×26K (4x smaller
     than the previous float32 approach).
     """
-    from sv_pgs.progress import log, mem
     import time
     import os
 
@@ -655,22 +650,7 @@ def _load_vcf(
     matrix_mb = genotype_matrix.nbytes / 1e6
     log(f"genotype matrix ready: {genotype_matrix.shape}, {matrix_mb:.1f} MB  mem={mem()}")
     return genotype_matrix, variants
-
-
-def _infer_vcf_allele_frequency_from_float(record: Any, dosage: np.ndarray) -> float:
-    """Compute allele frequency, preferring INFO/AF, falling back to dosage array."""
-    af_value = record.INFO.get("AF")
-    if af_value is not None:
-        if isinstance(af_value, (tuple, list)):
-            return float(af_value[0])
-        return float(af_value)
-    if np.all(np.isnan(dosage)):
-        return 0.0
-    return float(np.nanmean(dosage) / 2.0)
-
-
 def _load_plink1_metadata(bed_path: Path) -> _PlinkMetadata:
-    from sv_pgs.progress import log, mem
     fam_path = bed_path.with_suffix(".fam")
     bim_path = bed_path.with_suffix(".bim")
 
@@ -792,7 +772,6 @@ def _write_predictions_and_summary(
     dataset: LoadedDataset,
     model: BayesianPGS,
 ) -> dict[str, Any]:
-    from sv_pgs.progress import log, mem
     log(f"computing predictions for {len(dataset.sample_ids)} samples, trait={model.config.trait_type.value}  mem={mem()}")
     if model.config.trait_type == TraitType.BINARY:
         probabilities = model.predict_proba(dataset.genotypes, dataset.covariates)[:, 1]

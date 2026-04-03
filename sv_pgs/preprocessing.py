@@ -18,6 +18,7 @@ from sv_pgs.genotype import (
     as_raw_genotype_matrix,
     auto_batch_size,
 )
+from sv_pgs.progress import log, mem
 
 
 @jax.jit
@@ -159,7 +160,6 @@ def compute_variant_statistics(
     the variant's association with the trait *after* adjusting for
     population structure, age, sex, etc.
     """
-    from sv_pgs.progress import log, mem
     variant_count = raw_genotypes.shape[1]
     sample_count = raw_genotypes.shape[0]
     batch_size = auto_batch_size(sample_count)
@@ -240,8 +240,11 @@ def compute_variant_statistics(
         out=np.zeros_like(sums), where=non_missing_counts > 0,
     ).astype(np.float32)
     allele_frequencies = np.clip(means / 2.0, 0.0, 1.0).astype(np.float32)
-    scales = np.sqrt(centered_sum_squares / max(sample_count, 1)).astype(np.float32)
-    scales = np.where(scales < config.minimum_scale, 1.0, scales).astype(np.float32)
+    scales = _scales_from_centered_sum_squares(
+        centered_sum_squares=centered_sum_squares,
+        sample_count=sample_count,
+        minimum_scale=config.minimum_scale,
+    )
     log(f"=== VARIANT STATISTICS DONE ===  mean_af={float(np.mean(allele_frequencies)):.4f}  mean_scale={float(np.mean(scales)):.4f}  mean_support={float(np.mean(support_counts)):.0f}  mem={mem()}")
 
     return VariantStatistics(
@@ -251,6 +254,15 @@ def compute_variant_statistics(
         support_counts=support_counts.astype(np.int32),
         marginal_scores=marginal_scores,
     )
+
+
+def _scales_from_centered_sum_squares(
+    centered_sum_squares: np.ndarray,
+    sample_count: int,
+    minimum_scale: float,
+) -> np.ndarray:
+    scales = np.sqrt(np.asarray(centered_sum_squares, dtype=np.float64) / max(int(sample_count), 1))
+    return np.where(scales < minimum_scale, 1.0, scales).astype(np.float32)
 
 
 @dataclass(slots=True)
@@ -299,7 +311,6 @@ def fit_preprocessor(
     targets: np.ndarray,
     config: ModelConfig,
 ) -> PreparedArrays:
-    from sv_pgs.progress import log, mem
     raw_genotypes = as_raw_genotype_matrix(genotypes)
     covariate_matrix = np.asarray(covariates, dtype=np.float32)
     target_array = np.asarray(targets, dtype=np.float32).reshape(-1)
@@ -332,11 +343,14 @@ def fit_preprocessor(
 
     safe_counts = np.maximum(non_missing_counts, 1).astype(np.float64)
     means = np.where(non_missing_counts > 0, sums / safe_counts, 0.0)
-    # scale = sqrt(sum((x_i - mean)^2) / n_total) where missing contribute 0.
-    # Expanding: sum((x-mean)^2) = sum(x^2) - sum(x)^2 / n_valid
+    # scale = sqrt(sum((x_i - mean)^2) / n_total) where missing genotypes are
+    # mean-imputed before standardization. This matches compute_variant_statistics.
     centered_sum_sq = np.maximum(sum_squares - sums * sums / safe_counts, 0.0)
-    scales = np.sqrt(centered_sum_sq / max(n_samples, 1))
-    scales = np.where(scales < config.minimum_scale, 1.0, scales)
+    scales = _scales_from_centered_sum_squares(
+        centered_sum_squares=centered_sum_sq,
+        sample_count=n_samples,
+        minimum_scale=config.minimum_scale,
+    )
     del sums, sum_squares, non_missing_counts, safe_counts, centered_sum_sq
     log(f"  preprocessor done  mem={mem()}")
 
@@ -361,7 +375,6 @@ def select_active_variant_indices(
     carrier count — they're more reliably genotyped and common enough
     in array data.
     """
-    from sv_pgs.progress import log
     n_total = len(variant_records)
     active_flags = np.ones(n_total, dtype=bool)
     structural_variant_classes = set(config.structural_variant_classes())
@@ -382,31 +395,6 @@ def select_active_variant_indices(
     return result
 
 
-def _infer_support_count_from_raw_genotypes(
-    raw_variant_values: np.ndarray,
-    variant_record: VariantRecord,
-) -> int:
-    non_missing_values = np.asarray(raw_variant_values[~np.isnan(raw_variant_values)], dtype=np.float64)
-    if non_missing_values.size == 0:
-        return 0
-    rounded_values = np.rint(non_missing_values)
-    if not np.allclose(non_missing_values, rounded_values, atol=1e-6):
-        raise ValueError(
-            "Structural variant support requires explicit training_support metadata when "
-            "genotypes are transformed numeric values for "
-            + variant_record.variant_id
-            + "."
-        )
-    if np.any(rounded_values < 0.0):
-        raise ValueError(
-            "Structural variant support requires explicit training_support metadata when "
-            "raw genotypes are not non-negative counts for "
-            + variant_record.variant_id
-            + "."
-        )
-    return int(np.count_nonzero(rounded_values > 0.0))
-
-
 # Detect groups of variants that have identical (or exactly negated) genotype
 # columns across all samples.  These "tied" variants are perfectly collinear
 # and would cause the model to split their effects arbitrarily.
@@ -424,7 +412,6 @@ def build_tie_map(
     records: Sequence[VariantRecord],
     config: ModelConfig,
 ) -> TieMap:
-    from sv_pgs.progress import log, mem
     standardized_genotypes = _as_standardized_genotypes(genotypes)
     if standardized_genotypes.shape[1] != len(records):
         raise ValueError("genotypes and records length mismatch.")

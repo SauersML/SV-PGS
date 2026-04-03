@@ -3,12 +3,15 @@ from __future__ import annotations
 import argparse
 import faulthandler
 import io
+import os
+import platform
 import sys
 from pathlib import Path
 
 from sv_pgs.all_of_us import AllOfUsDiseaseRequest, available_disease_names, prepare_all_of_us_disease_sample_table
 from sv_pgs.config import ModelConfig, TraitType
 from sv_pgs.io import load_dataset_from_files, run_training_pipeline
+from sv_pgs.progress import gpu_memory_snapshot, jax_runtime_snapshot, log, mem, nvidia_smi_snapshot
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -97,8 +100,6 @@ def main(argv: list[str] | None = None) -> int:
     if args.command != "run":
         raise ValueError("Unsupported command: " + str(args.command))
 
-    from sv_pgs.progress import log, mem
-    import os, platform
     try:
         with open("/proc/meminfo") as f:
             for line in f:
@@ -110,10 +111,10 @@ def main(argv: list[str] | None = None) -> int:
         mem_info = f"total_ram={total_gb:.1f} GB"
     except OSError:
         mem_info = "total_ram=unknown"
-    import jax
-    jax_backend = jax.default_backend()
-    jax_devices = jax.devices()
-    log(f"=== CLI RUN START ===  pid={os.getpid()}  {mem_info}  cpu_count={os.cpu_count()}  jax_backend={jax_backend}  jax_devices={jax_devices}  platform={platform.platform()}")
+    log(f"=== CLI RUN START ===  pid={os.getpid()}  {mem_info}  cpu_count={os.cpu_count()}  platform={platform.platform()}")
+    log(f"jax runtime: {jax_runtime_snapshot()}")
+    log(f"gpu memory: {gpu_memory_snapshot()}")
+    log(f"nvidia-smi: {nvidia_smi_snapshot()}")
     log(f"genotypes={args.genotypes} sample_table={args.sample_table} output_dir={args.output_dir}")
     log(f"genotype_format={args.genotype_format} sample_id_column={args.sample_id_column} target_column={args.target_column}")
     log(f"covariates={list(args.covariate_column)}  max_outer_iter={args.max_outer_iterations}  min_sv_carriers={args.minimum_structural_variant_carriers}  seed={args.random_seed}")

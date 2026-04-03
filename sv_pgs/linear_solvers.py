@@ -51,8 +51,10 @@ def solve_spd_system(
     tolerance: float,
     max_iterations: int,
     initial_guess: np.ndarray | jnp.ndarray | None = None,
+    preconditioner: Callable[[jnp.ndarray], jnp.ndarray] | np.ndarray | jnp.ndarray | None = None,
 ) -> np.ndarray:
     linear_operator = _as_linear_operator(operator)
+    apply_preconditioner = _as_preconditioner(preconditioner)
     rhs_array = jnp.asarray(right_hand_side, dtype=jnp.float64)
     if rhs_array.ndim == 1:
         solution = _solve_single_rhs(
@@ -61,6 +63,7 @@ def solve_spd_system(
             tolerance=tolerance,
             max_iterations=max_iterations,
             initial_guess=None if initial_guess is None else jnp.asarray(initial_guess, dtype=jnp.float64),
+            preconditioner=apply_preconditioner,
         )
         return np.asarray(solution, dtype=np.float64)
 
@@ -79,6 +82,7 @@ def solve_spd_system(
                     tolerance=tolerance,
                     max_iterations=max_iterations,
                     initial_guess=None if initial_matrix is None else initial_matrix[:, column_index],
+                    preconditioner=apply_preconditioner,
                 ),
                 dtype=np.float64,
             )
@@ -137,6 +141,19 @@ def _as_linear_operator(operator: LinearOperator | np.ndarray | jnp.ndarray) -> 
     )
 
 
+def _as_preconditioner(
+    preconditioner: Callable[[jnp.ndarray], jnp.ndarray] | np.ndarray | jnp.ndarray | None,
+) -> Callable[[jnp.ndarray], jnp.ndarray] | None:
+    if preconditioner is None:
+        return None
+    if callable(preconditioner):
+        return lambda vector: jnp.asarray(preconditioner(vector), dtype=jnp.float64)
+    diagonal = jnp.asarray(preconditioner, dtype=jnp.float64)
+    if diagonal.ndim != 1:
+        raise ValueError("array preconditioner must be a diagonal vector.")
+    return lambda vector: vector / jnp.maximum(diagonal, 1e-12)
+
+
 # Conjugate Gradient (CG) for a single right-hand side vector.
 #
 # Starting from an initial guess (or zero), iteratively refine the
@@ -154,17 +171,20 @@ def _solve_single_rhs(
     tolerance: float,
     max_iterations: int,
     initial_guess: jnp.ndarray | None,
+    preconditioner: Callable[[jnp.ndarray], jnp.ndarray] | None,
 ) -> jnp.ndarray:
     import time
     from sv_pgs.progress import log, mem
     tol_sq = tolerance * tolerance
     solution = jnp.zeros_like(rhs) if initial_guess is None else initial_guess
     residual = rhs - linear_operator.matvec(solution)
-    search_direction = residual
-    residual_dot_jax = jnp.vdot(residual, residual)
-    initial_residual = float(residual_dot_jax)
+    residual_norm_sq_jax = jnp.vdot(residual, residual)
+    initial_residual = float(residual_norm_sq_jax)
     if initial_residual <= tol_sq:
         return jnp.asarray(solution, dtype=jnp.float64)
+    preconditioned_residual = residual if preconditioner is None else preconditioner(residual)
+    search_direction = preconditioned_residual
+    residual_dot_jax = jnp.vdot(residual, preconditioned_residual)
     import math
     # Progress is measured in log-space: how far the residual has dropped
     # from initial toward the tolerance.  E.g. if initial=1e0, tol=1e-6,
@@ -177,11 +197,13 @@ def _solve_single_rhs(
     for _iteration_index in range(max_iterations):
         operator_search_direction = linear_operator.matvec(search_direction)
         step_denom_jax = jnp.vdot(search_direction, operator_search_direction)
+        if float(step_denom_jax) <= 0.0:
+            raise RuntimeError("Conjugate-gradient operator is not positive definite.")
         step_size = residual_dot_jax / step_denom_jax
         solution = solution + step_size * search_direction
         residual = residual - step_size * operator_search_direction
-        updated_residual_dot_jax = jnp.vdot(residual, residual)
-        updated_residual_dot = float(updated_residual_dot_jax)
+        updated_residual_norm_sq_jax = jnp.vdot(residual, residual)
+        updated_residual_dot = float(updated_residual_norm_sq_jax)
         now = time.monotonic()
         if now - last_log >= 5.0 or updated_residual_dot <= tol_sq:
             log_current = math.log10(max(updated_residual_dot, 1e-30))
@@ -190,10 +212,10 @@ def _solve_single_rhs(
             last_log = now
         if updated_residual_dot <= tol_sq:
             return jnp.asarray(solution, dtype=jnp.float64)
-        if float(step_denom_jax) <= 0.0:
-            raise RuntimeError("Conjugate-gradient operator is not positive definite.")
+        updated_preconditioned_residual = residual if preconditioner is None else preconditioner(residual)
+        updated_residual_dot_jax = jnp.vdot(residual, updated_preconditioned_residual)
         beta = updated_residual_dot_jax / residual_dot_jax
-        search_direction = residual + beta * search_direction
+        search_direction = updated_preconditioned_residual + beta * search_direction
         residual_dot_jax = updated_residual_dot_jax
     raise RuntimeError("Conjugate-gradient solve failed to converge.")
 
