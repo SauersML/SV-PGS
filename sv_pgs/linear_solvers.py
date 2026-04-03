@@ -149,26 +149,32 @@ def _solve_single_rhs(
     max_iterations: int,
     initial_guess: jnp.ndarray | None,
 ) -> jnp.ndarray:
+    tol_sq = tolerance * tolerance
     solution = jnp.zeros_like(rhs) if initial_guess is None else initial_guess
     residual = rhs - linear_operator.matvec(solution)
     search_direction = residual
-    residual_dot = float(jnp.vdot(residual, residual))
-    if residual_dot <= tolerance * tolerance:
+    # Keep residual_dot as a JAX scalar to avoid GPU sync every iteration.
+    # Only call float() when we actually need to check convergence.
+    residual_dot_jax = jnp.vdot(residual, residual)
+    if float(residual_dot_jax) <= tol_sq:
         return jnp.asarray(solution, dtype=jnp.float64)
     for _iteration_index in range(max_iterations):
         operator_search_direction = linear_operator.matvec(search_direction)
-        step_denominator = float(jnp.vdot(search_direction, operator_search_direction))
-        if step_denominator <= 0.0:
-            raise RuntimeError("Conjugate-gradient operator is not positive definite.")
-        step_size = residual_dot / step_denominator
+        step_denom_jax = jnp.vdot(search_direction, operator_search_direction)
+        # Compute step_size as JAX scalar — no sync
+        step_size = residual_dot_jax / step_denom_jax
         solution = solution + step_size * search_direction
         residual = residual - step_size * operator_search_direction
-        updated_residual_dot = float(jnp.vdot(residual, residual))
-        if updated_residual_dot <= tolerance * tolerance:
+        updated_residual_dot_jax = jnp.vdot(residual, residual)
+        # Only sync to check convergence (every iteration, but just one float())
+        updated_residual_dot = float(updated_residual_dot_jax)
+        if updated_residual_dot <= tol_sq:
             return jnp.asarray(solution, dtype=jnp.float64)
-        beta = updated_residual_dot / residual_dot
+        if float(step_denom_jax) <= 0.0:
+            raise RuntimeError("Conjugate-gradient operator is not positive definite.")
+        beta = updated_residual_dot_jax / residual_dot_jax
         search_direction = residual + beta * search_direction
-        residual_dot = updated_residual_dot
+        residual_dot_jax = updated_residual_dot_jax
     raise RuntimeError("Conjugate-gradient solve failed to converge.")
 
 

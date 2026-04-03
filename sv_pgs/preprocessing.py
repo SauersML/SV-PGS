@@ -309,44 +309,34 @@ def fit_preprocessor(
         raise ValueError("genotypes, covariates, and targets must share sample dimension.")
 
     variant_count = raw_genotypes.shape[1]
-    log(f"  preprocessor pass 1/2: computing means over {variant_count} variants...")
+    n_samples = raw_genotypes.shape[0]
+    log(f"  preprocessor: computing means and scales in single pass over {variant_count} variants...")
     sums = np.zeros(variant_count, dtype=np.float64)
+    sum_squares = np.zeros(variant_count, dtype=np.float64)
     non_missing_counts = np.zeros(variant_count, dtype=np.int64)
     variants_done = 0
-    for batch in raw_genotypes.iter_column_batches(batch_size=auto_batch_size(raw_genotypes.shape[0])):
+    for batch in raw_genotypes.iter_column_batches(batch_size=auto_batch_size(n_samples)):
         batch_jax = jnp.asarray(batch.values)
         mask = ~jnp.isnan(batch_jax)
         observed = jnp.where(mask, batch_jax, 0.0)
-        sums[batch.variant_indices] = np.asarray(jnp.sum(observed, axis=0), dtype=np.float64)
-        non_missing_counts[batch.variant_indices] = np.asarray(jnp.sum(mask, axis=0), dtype=np.int64)
-        variants_done += len(batch.variant_indices)
-        if variants_done == len(batch.variant_indices) or variants_done % max(variant_count // 10, 1) < len(batch.variant_indices) or variants_done == variant_count:
-            log(f"  preprocessor pass 1/2: {variants_done}/{variant_count} ({100*variants_done//variant_count}%)  mem={mem()}")
+        batch_sums = jnp.sum(observed, axis=0)
+        batch_counts = jnp.sum(mask, axis=0)
+        batch_sum_sq = jnp.sum(observed * observed, axis=0)
+        idx = batch.variant_indices
+        sums[idx] = np.asarray(batch_sums, dtype=np.float64)
+        non_missing_counts[idx] = np.asarray(batch_counts, dtype=np.int64)
+        sum_squares[idx] = np.asarray(batch_sum_sq, dtype=np.float64)
+        variants_done += len(idx)
+        if variants_done == len(idx) or variants_done % max(variant_count // 10, 1) < len(idx) or variants_done == variant_count:
+            log(f"  preprocessor: {variants_done}/{variant_count} ({100*variants_done//variant_count}%)  mem={mem()}")
 
-    means = np.divide(
-        sums,
-        np.maximum(non_missing_counts, 1),
-        out=np.zeros_like(sums),
-        where=non_missing_counts > 0,
-    )
-
-    log(f"  preprocessor pass 2/2: computing scales over {variant_count} variants...")
-    centered_sum_squares = np.zeros(variant_count, dtype=np.float64)
-    variants_done = 0
-    for batch in raw_genotypes.iter_column_batches(batch_size=auto_batch_size(raw_genotypes.shape[0])):
-        batch_means = means[batch.variant_indices]
-        batch_jax = jnp.asarray(batch.values)
-        nan_mask = jnp.isnan(batch_jax)
-        vals = jnp.subtract(batch_jax, jnp.asarray(batch_means)[None, :])
-        vals = jnp.where(nan_mask, 0.0, vals)  # imputed-to-mean then centered = 0
-        centered_sum_squares[batch.variant_indices] = np.asarray(jnp.sum(vals * vals, axis=0), dtype=np.float64)
-        del batch_jax, vals, nan_mask
-        variants_done += len(batch.variant_indices)
-        if variants_done == len(batch.variant_indices) or variants_done % max(variant_count // 10, 1) < len(batch.variant_indices) or variants_done == variant_count:
-            log(f"  preprocessor pass 2/2: {variants_done}/{variant_count} ({100*variants_done//variant_count}%)  mem={mem()}")
-
-    scales = np.sqrt(centered_sum_squares / max(raw_genotypes.shape[0], 1))
+    safe_counts = np.maximum(non_missing_counts, 1).astype(np.float64)
+    means = np.where(non_missing_counts > 0, sums / safe_counts, 0.0)
+    # Var(X) = E[X^2] - E[X]^2, scale = sqrt(Var)
+    variances = np.maximum(sum_squares / safe_counts - means * means, 0.0)
+    scales = np.sqrt(variances)
     scales = np.where(scales < config.minimum_scale, 1.0, scales)
+    del sums, sum_squares, non_missing_counts, safe_counts, variances
     log(f"  preprocessor done  mem={mem()}")
 
     return PreparedArrays(

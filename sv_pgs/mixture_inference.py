@@ -692,7 +692,7 @@ def _binary_posterior_state(
         if gradient_norm <= gradient_tolerance:
             log(f"      Newton converged at iter {_iteration_index+1}: grad_norm={gradient_norm:.2e} <= tol={gradient_tolerance:.2e}")
             break
-        working_response = linear_predictor + (targets - np.asarray(stable_sigmoid(linear_predictor), dtype=np.float64)) / weights
+        working_response = linear_predictor + (targets - np.asarray(stable_sigmoid(jnp.asarray(linear_predictor)), dtype=np.float64)) / weights
         proposed_alpha, proposed_beta, _, _projected_targets, _fitted_response, _restricted_quadratic, _logdet_covariance, _logdet_gls = (
             _restricted_posterior_state(
                     genotype_matrix=standardized_genotypes,
@@ -821,14 +821,21 @@ def _sample_space_operator(
 
     def matmat(matrix) -> jnp.ndarray:
         matrix_jax = jnp.asarray(matrix, dtype=jnp.float64)
-        projected = genotype_matrix.transpose_matmat(matrix_jax)
-        columns = []
-        for column_index in range(projected.shape[1]):
-            columns.append(
-                diag_noise_jax * matrix_jax[:, column_index]
-                + genotype_matrix.matvec(prior_var_jax * projected[:, column_index])
-            )
-        return jnp.stack(columns, axis=1)
+        # X^T @ M gives (p, k), scale by prior variance, then X @ result gives (n, k)
+        projected = genotype_matrix.transpose_matmat(matrix_jax)  # (p, k)
+        scaled = prior_var_jax[:, None] * projected  # (p, k)
+        # Use transpose_matmat in reverse: X @ scaled = (X @ scaled)
+        # For each column: diag * col + X @ (prior * X^T @ col)
+        # Vectorized: diag[:, None] * M + X @ (prior[:, None] * X^T @ M)
+        if genotype_matrix._gpu_cache is not None:
+            # Single GPU matmul for all columns at once
+            gpu = genotype_matrix._gpu_cache
+            genotype_term = (gpu.astype(jnp.float64) @ scaled).astype(jnp.float64)
+        else:
+            # Fall back to column-by-column
+            cols = [genotype_matrix.matvec(scaled[:, c]) for c in range(scaled.shape[1])]
+            genotype_term = jnp.stack(cols, axis=1)
+        return diag_noise_jax[:, None] * matrix_jax + genotype_term
 
     return build_linear_operator(
         shape=(genotype_matrix.shape[0], genotype_matrix.shape[0]),
@@ -1419,18 +1426,13 @@ def _local_scale_prior_objective(
     local_shape_a: np.ndarray,
     local_shape_b: np.ndarray,
 ) -> float:
+    gammaln_a = np.asarray(jax_gammaln(jnp.asarray(local_shape_a, dtype=jnp.float64)), dtype=np.float64)
+    gammaln_b = np.asarray(jax_gammaln(jnp.asarray(local_shape_b, dtype=jnp.float64)), dtype=np.float64)
+    log_delta = np.log(np.maximum(auxiliary_delta, 1e-12))
+    log_scale = np.log(np.maximum(local_scale, 1e-12))
     return float(
-        np.sum(
-            local_shape_a * np.log(np.maximum(auxiliary_delta, 1e-12))
-            - np.asarray(jax_gammaln(jnp.asarray(local_shape_a, dtype=jnp.float64)), dtype=np.float64)
-            + (local_shape_a - 1.0) * np.log(np.maximum(local_scale, 1e-12))
-            - auxiliary_delta * local_scale
-        )
-        + np.sum(
-            -np.asarray(jax_gammaln(jnp.asarray(local_shape_b, dtype=jnp.float64)), dtype=np.float64)
-            + (local_shape_b - 1.0) * np.log(np.maximum(auxiliary_delta, 1e-12))
-            - auxiliary_delta
-        )
+        np.sum(local_shape_a * log_delta - gammaln_a + (local_shape_a - 1.0) * log_scale - auxiliary_delta * local_scale)
+        + np.sum(-gammaln_b + (local_shape_b - 1.0) * log_delta - auxiliary_delta)
     )
 
 
