@@ -501,19 +501,18 @@ def _save_vcf_to_cache(
     from sv_pgs.progress import log
 
     cache_dir = _vcf_cache_dir(vcf_path)
-    cache_dir.mkdir(exist_ok=True)
-
     key = _vcf_cache_key(vcf_path, keep_sample_indices)
     geno_path = cache_dir / f"{key}.genotypes.npy"
     var_path = cache_dir / f"{key}.variants.pkl"
+    geno_tmp = geno_path.with_suffix(".npy.tmp")
+    var_tmp = var_path.with_suffix(".pkl.tmp")
 
     try:
+        cache_dir.mkdir(parents=True, exist_ok=True)
         # Write to temp files first, then atomically rename to avoid
         # corrupt cache entries if the process is killed mid-write.
-        geno_tmp = geno_path.with_suffix(".npy.tmp")
-        var_tmp = var_path.with_suffix(".pkl.tmp")
-        np.save(geno_tmp, genotype_matrix)
-        with open(var_tmp, "wb") as f:
+        np.save(str(geno_tmp), genotype_matrix)
+        with open(str(var_tmp), "wb") as f:
             pickle.dump(variants, f, protocol=pickle.HIGHEST_PROTOCOL)
         geno_tmp.rename(geno_path)
         var_tmp.rename(var_path)
@@ -521,7 +520,6 @@ def _save_vcf_to_cache(
         log(f"VCF cache saved ({total_mb:.1f} MB) → {cache_dir.name}/{key}.*")
     except Exception as exc:
         log(f"VCF cache save failed ({exc}), continuing without cache")
-        # Clean up any partial temp files
         for p in (geno_tmp, var_tmp, geno_path, var_path):
             try:
                 p.unlink(missing_ok=True)
