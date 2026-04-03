@@ -314,10 +314,11 @@ def fit_preprocessor(
     non_missing_counts = np.zeros(variant_count, dtype=np.int64)
     variants_done = 0
     for batch in raw_genotypes.iter_column_batches(batch_size=auto_batch_size(raw_genotypes.shape[0])):
-        mask = ~np.isnan(batch.values)
-        observed = np.where(mask, batch.values, 0.0)
-        sums[batch.variant_indices] = np.sum(observed, axis=0, dtype=np.float64)
-        non_missing_counts[batch.variant_indices] = np.sum(mask, axis=0, dtype=np.int64)
+        batch_jax = jnp.asarray(batch.values)
+        mask = ~jnp.isnan(batch_jax)
+        observed = jnp.where(mask, batch_jax, 0.0)
+        sums[batch.variant_indices] = np.asarray(jnp.sum(observed, axis=0), dtype=np.float64)
+        non_missing_counts[batch.variant_indices] = np.asarray(jnp.sum(mask, axis=0), dtype=np.int64)
         variants_done += len(batch.variant_indices)
         if variants_done == len(batch.variant_indices) or variants_done % max(variant_count // 10, 1) < len(batch.variant_indices) or variants_done == variant_count:
             log(f"  preprocessor pass 1/2: {variants_done}/{variant_count} ({100*variants_done//variant_count}%)  mem={mem()}")
@@ -334,12 +335,12 @@ def fit_preprocessor(
     variants_done = 0
     for batch in raw_genotypes.iter_column_batches(batch_size=auto_batch_size(raw_genotypes.shape[0])):
         batch_means = means[batch.variant_indices]
-        vals = batch.values  # already a copy from iter_column_batches
-        nan_mask = np.isnan(vals)
-        np.subtract(vals, batch_means[None, :], out=vals)  # center in-place
-        vals[nan_mask] = 0.0  # imputed-to-mean then centered = 0
-        centered_sum_squares[batch.variant_indices] = np.einsum('ij,ij->j', vals, vals).astype(np.float64)
-        del vals, nan_mask
+        batch_jax = jnp.asarray(batch.values)
+        nan_mask = jnp.isnan(batch_jax)
+        vals = jnp.subtract(batch_jax, jnp.asarray(batch_means)[None, :])
+        vals = jnp.where(nan_mask, 0.0, vals)  # imputed-to-mean then centered = 0
+        centered_sum_squares[batch.variant_indices] = np.asarray(jnp.sum(vals * vals, axis=0), dtype=np.float64)
+        del batch_jax, vals, nan_mask
         variants_done += len(batch.variant_indices)
         if variants_done == len(batch.variant_indices) or variants_done % max(variant_count // 10, 1) < len(batch.variant_indices) or variants_done == variant_count:
             log(f"  preprocessor pass 2/2: {variants_done}/{variant_count} ({100*variants_done//variant_count}%)  mem={mem()}")

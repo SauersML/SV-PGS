@@ -372,45 +372,41 @@ class StandardizedGenotypeMatrix:
         """Compute X_std @ beta (genotype matrix times coefficient vector).
 
         Returns one value per sample: each sample's polygenic score contribution
-        from the genetic variants.  Done in batches to bound memory.
+        from the genetic variants.  Done in batches on GPU via JAX.
         """
-        coefficient_vector = jnp.asarray(coefficients, dtype=jnp.float64)
+        coefficient_vector = jnp.asarray(coefficients, dtype=jnp.float32)
         if coefficient_vector.ndim != 1 or coefficient_vector.shape[0] != self.shape[1]:
             raise ValueError("coefficient vector must match genotype column count.")
-        coefficient_array = np.asarray(coefficient_vector, dtype=np.float64)
-        result = np.zeros(self.shape[0], dtype=np.float64)
+        result = jnp.zeros(self.shape[0], dtype=jnp.float32)
         for batch in self.iter_column_batches(batch_size=batch_size):
-            batch_values = np.asarray(batch.values, dtype=np.float64)
-            batch_coefficients = coefficient_array[batch.variant_indices]
-            result += batch_values @ batch_coefficients
-        return jnp.asarray(result, dtype=jnp.float64)
+            batch_jax = jnp.asarray(batch.values, dtype=jnp.float32)
+            batch_coeff = coefficient_vector[batch.variant_indices]
+            result = result + batch_jax @ batch_coeff
+        return result.astype(jnp.float64)
 
     def transpose_matvec(self, vector: np.ndarray | jnp.ndarray, batch_size: int = DEFAULT_GENOTYPE_BATCH_SIZE) -> jnp.ndarray:
         """Compute X_std^T @ v (transpose times a sample-length vector).
 
         Returns one value per variant: the correlation of each variant's
-        genotype column with the input vector.  Used to compute gradients
-        and recover posterior mean effect sizes.
+        genotype column with the input vector.  Done in batches on GPU via JAX.
         """
-        sample_vector = jnp.asarray(vector, dtype=jnp.float64)
+        sample_vector = jnp.asarray(vector, dtype=jnp.float32)
         if sample_vector.ndim != 1 or sample_vector.shape[0] != self.shape[0]:
             raise ValueError("sample vector must match genotype row count.")
-        sample_array = np.asarray(sample_vector, dtype=np.float64)
-        output = np.empty(self.shape[1], dtype=np.float64)
+        output = np.empty(self.shape[1], dtype=np.float32)
         for batch in self.iter_column_batches(batch_size=batch_size):
-            batch_values = np.asarray(batch.values, dtype=np.float64)
-            output[batch.variant_indices] = batch_values.T @ sample_array
+            batch_jax = jnp.asarray(batch.values, dtype=jnp.float32)
+            output[batch.variant_indices] = np.asarray(batch_jax.T @ sample_vector, dtype=np.float32)
         return jnp.asarray(output, dtype=jnp.float64)
 
     def transpose_matmat(self, matrix: np.ndarray | jnp.ndarray, batch_size: int = DEFAULT_GENOTYPE_BATCH_SIZE) -> jnp.ndarray:
-        sample_matrix = jnp.asarray(matrix, dtype=jnp.float64)
+        sample_matrix = jnp.asarray(matrix, dtype=jnp.float32)
         if sample_matrix.ndim != 2 or sample_matrix.shape[0] != self.shape[0]:
             raise ValueError("sample matrix must match genotype row count.")
-        sample_array = np.asarray(sample_matrix, dtype=np.float64)
-        output = np.empty((self.shape[1], sample_array.shape[1]), dtype=np.float64)
+        output = np.empty((self.shape[1], sample_matrix.shape[1]), dtype=np.float32)
         for batch in self.iter_column_batches(batch_size=batch_size):
-            batch_values = np.asarray(batch.values, dtype=np.float64)
-            output[batch.variant_indices, :] = batch_values.T @ sample_array
+            batch_jax = jnp.asarray(batch.values, dtype=jnp.float32)
+            output[batch.variant_indices, :] = np.asarray(batch_jax.T @ sample_matrix, dtype=np.float32)
         return jnp.asarray(output, dtype=jnp.float64)
 
 
@@ -480,11 +476,10 @@ def _contiguous_index_or_slice(indices: np.ndarray) -> slice | np.ndarray:
 #   3. Divide by the standard deviation (scaling)
 # After this, each variant column has mean ~0 and std ~1.
 def _standardize_batch(batch: np.ndarray, means: np.ndarray, scales: np.ndarray) -> np.ndarray:
-    mean_vector = np.asarray(means, dtype=np.float32)
-    scale_vector = np.asarray(scales, dtype=np.float32)
-    result = batch.copy()
-    nan_mask = np.isnan(result)
-    np.subtract(result, mean_vector[None, :], out=result)
-    result[nan_mask] = 0.0  # impute-to-mean then center = 0
-    np.divide(result, scale_vector[None, :], out=result)
-    return result
+    batch_jax = jnp.asarray(batch, dtype=jnp.float32)
+    mean_jax = jnp.asarray(means, dtype=jnp.float32)
+    scale_jax = jnp.asarray(scales, dtype=jnp.float32)
+    nan_mask = jnp.isnan(batch_jax)
+    centered = batch_jax - mean_jax[None, :]
+    centered = jnp.where(nan_mask, 0.0, centered)
+    return np.asarray(centered / scale_jax[None, :], dtype=np.float32)

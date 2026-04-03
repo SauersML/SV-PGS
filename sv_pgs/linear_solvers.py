@@ -201,8 +201,10 @@ def _lanczos_tridiagonal(
             projected = projected - previous_beta * previous_vector
         alpha_value = float(jnp.dot(current_vector, projected))
         projected = projected - alpha_value * current_vector
-        for basis_vector in basis_vectors:
-            projected = projected - basis_vector * jnp.dot(basis_vector, projected)
+        if basis_vectors:
+            basis_matrix = jnp.stack(basis_vectors)
+            coeffs = basis_matrix @ projected
+            projected = projected - coeffs @ basis_matrix
         beta_value = float(jnp.linalg.norm(projected))
         basis_vectors.append(current_vector)
         alpha_values.append(alpha_value)

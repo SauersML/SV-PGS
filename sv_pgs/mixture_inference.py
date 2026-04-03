@@ -633,6 +633,13 @@ def _binary_posterior_state(
     parameters = np.concatenate([alpha_init, beta_init], axis=0).astype(np.float64, copy=True)
     damping = float(initial_damping)
 
+    # Pre-convert the covariate matrix to JAX once so that matmuls stay on GPU
+    # throughout the Newton loop.  The covariate matrix is small
+    # (n_samples x ~5-10 covariates) so this is cheap.
+    covariate_matrix_jax = jnp.asarray(covariate_matrix, dtype=jnp.float64)
+    targets_jax = jnp.asarray(targets, dtype=jnp.float64)
+    prior_precision_jax = jnp.asarray(prior_precision, dtype=jnp.float64)
+
     def penalized_terms(current_parameters: np.ndarray) -> tuple[float, np.ndarray, np.ndarray, np.ndarray]:
         """Compute the penalized log-posterior, its gradient, IRLS weights, and predictions.
 
@@ -642,25 +649,39 @@ def _binary_posterior_state(
         """
         alpha = current_parameters[:covariate_count]
         beta = current_parameters[covariate_count:]
-        linear_predictor = covariate_matrix @ alpha + np.asarray(
-            standardized_genotypes.matvec(beta, batch_size=posterior_variance_batch_size),
-            dtype=np.float64,
+        # Compute linear predictor on GPU: covariate part via JAX matmul,
+        # genotype part via StandardizedGenotypeMatrix.matvec (already JAX).
+        alpha_jax = jnp.asarray(alpha, dtype=jnp.float64)
+        beta_jax = jnp.asarray(beta, dtype=jnp.float64)
+        linear_predictor_jax = (
+            covariate_matrix_jax @ alpha_jax
+            + standardized_genotypes.matvec(beta, batch_size=posterior_variance_batch_size)
         )
-        probabilities = np.asarray(stable_sigmoid(linear_predictor), dtype=np.float64)
+        probabilities_jax = stable_sigmoid(linear_predictor_jax)
         # IRLS weights: p*(1-p).  Large near p=0.5 (uncertain samples contribute
         # more to the update), small near 0 or 1 (confident predictions are stable).
-        weights = np.maximum(probabilities * (1.0 - probabilities), minimum_weight)
-        residual = targets - probabilities
-        gradient_alpha = covariate_matrix.T @ residual
-        gradient_beta = np.asarray(
-            standardized_genotypes.transpose_matvec(residual, batch_size=posterior_variance_batch_size),
-            dtype=np.float64,
-        ) - prior_precision * beta
-        gradient = np.concatenate([gradient_alpha, gradient_beta], axis=0)
-        penalized_log_posterior = float(
-            np.sum(targets * np.log(probabilities + 1e-12) + (1.0 - targets) * np.log(1.0 - probabilities + 1e-12))
-            - 0.5 * np.sum(prior_precision * beta * beta)
+        weights_jax = jnp.maximum(probabilities_jax * (1.0 - probabilities_jax), minimum_weight)
+        residual_jax = targets_jax - probabilities_jax
+        # Gradient computations stay on GPU: covariate part via JAX matmul,
+        # genotype part via transpose_matvec (already JAX).
+        gradient_alpha_jax = covariate_matrix_jax.T @ residual_jax
+        gradient_beta_jax = (
+            standardized_genotypes.transpose_matvec(residual_jax, batch_size=posterior_variance_batch_size)
+            - prior_precision_jax * beta_jax
         )
+        gradient = np.concatenate(
+            [np.asarray(gradient_alpha_jax, dtype=np.float64),
+             np.asarray(gradient_beta_jax, dtype=np.float64)],
+            axis=0,
+        )
+        penalized_log_posterior = float(
+            jnp.sum(targets_jax * jnp.log(probabilities_jax + 1e-12)
+                     + (1.0 - targets_jax) * jnp.log(1.0 - probabilities_jax + 1e-12))
+            - 0.5 * jnp.sum(prior_precision_jax * beta_jax * beta_jax)
+        )
+        # Convert outputs to numpy for the outer Newton loop
+        linear_predictor = np.asarray(linear_predictor_jax, dtype=np.float64)
+        weights = np.asarray(weights_jax, dtype=np.float64)
         return penalized_log_posterior, gradient, weights, linear_predictor
 
     from sv_pgs.progress import log, mem
@@ -790,26 +811,24 @@ def _sample_space_operator(
     prior_variances: np.ndarray,
     diagonal_noise: np.ndarray,
 ):
+    diag_noise_jax = jnp.asarray(diagonal_noise, dtype=jnp.float64)
+    prior_var_jax = jnp.asarray(prior_variances, dtype=jnp.float64)
+
     def matvec(vector) -> jnp.ndarray:
-        projected = genotype_matrix.transpose_matvec(vector)
-        return jnp.asarray(diagonal_noise, dtype=jnp.float64) * jnp.asarray(vector, dtype=jnp.float64) + genotype_matrix.matvec(
-            jnp.asarray(prior_variances, dtype=jnp.float64) * projected
-        )
+        v = jnp.asarray(vector, dtype=jnp.float64)
+        projected = genotype_matrix.transpose_matvec(v)
+        return diag_noise_jax * v + genotype_matrix.matvec(prior_var_jax * projected)
 
     def matmat(matrix) -> jnp.ndarray:
-        projected = genotype_matrix.transpose_matmat(matrix)
+        matrix_jax = jnp.asarray(matrix, dtype=jnp.float64)
+        projected = genotype_matrix.transpose_matmat(matrix_jax)
         columns = []
         for column_index in range(projected.shape[1]):
             columns.append(
-                diagonal_noise * np.asarray(matrix[:, column_index], dtype=np.float64)
-                + np.asarray(
-                    genotype_matrix.matvec(
-                        jnp.asarray(prior_variances, dtype=jnp.float64) * projected[:, column_index]
-                    ),
-                    dtype=np.float64,
-                )
+                diag_noise_jax * matrix_jax[:, column_index]
+                + genotype_matrix.matvec(prior_var_jax * projected[:, column_index])
             )
-        return jnp.asarray(np.column_stack(columns), dtype=jnp.float64)
+        return jnp.stack(columns, axis=1)
 
     return build_linear_operator(
         shape=(genotype_matrix.shape[0], genotype_matrix.shape[0]),
@@ -876,15 +895,18 @@ def _restricted_posterior_state(
         log(f"    restricted posterior: Woodbury variant-space Cholesky (p={variant_count}, n={sample_count})  mem={mem()}")
         inv_diag = 1.0 / np.maximum(diagonal_noise, 1e-12)
         # Use JAX for the big matmul (benefits from GPU if available)
-        X_jax = jnp.asarray(genotype_matrix.materialize(), dtype=jnp.float64)
-        inv_diag_jax = jnp.asarray(inv_diag, dtype=jnp.float64)
-        S_diag = np.asarray(prior_variances, dtype=np.float64)
-        # Form p×p matrix: S^{-1} + X^T @ diag(1/D) @ X
-        XtDinvX = np.asarray((X_jax * inv_diag_jax[:, None]).T @ X_jax, dtype=np.float64)
-        woodbury_matrix = np.diag(1.0 / np.maximum(S_diag, 1e-12)) + XtDinvX + np.eye(variant_count) * 1e-8
-        woodbury_cholesky = np.linalg.cholesky(woodbury_matrix)
+        X_jax = jnp.asarray(genotype_matrix.materialize(), dtype=jnp.float32)
+        inv_diag_jax = jnp.asarray(inv_diag, dtype=jnp.float32)
+        S_diag_jax = jnp.asarray(prior_variances, dtype=jnp.float32)
+        # Form p×p matrix: S^{-1} + X^T @ diag(1/D) @ X — keep on JAX/GPU
+        XtDinvX = (X_jax * inv_diag_jax[:, None]).T @ X_jax
+        woodbury_matrix = jnp.diag(1.0 / jnp.maximum(S_diag_jax, 1e-12)) + XtDinvX + jnp.eye(variant_count) * 1e-8
+        woodbury_cholesky = jnp.linalg.cholesky(woodbury_matrix)
         X = np.asarray(X_jax, dtype=np.float64)  # keep numpy copy for solve_rhs
-        del X_jax  # free JAX copy
+        # Transfer back to numpy for _cholesky_solve and logdet
+        S_diag = np.asarray(S_diag_jax, dtype=np.float64)
+        woodbury_cholesky = np.asarray(woodbury_cholesky, dtype=np.float64)
+        del X_jax, XtDinvX  # free JAX copies
 
         def solve_rhs(right_hand_side: np.ndarray) -> np.ndarray:
             rhs = np.asarray(right_hand_side, dtype=np.float64)
@@ -1012,7 +1034,10 @@ def _restricted_cross_leverage_diagonal(
             gls_cholesky,
             covariate_matrix.T @ inverse_covariance_genotype_batch,
         )
-        leverage_diagonal[batch.variant_indices] = np.einsum("ij,ij->j", genotype_batch, restricted_batch, optimize=True)
+        leverage_diagonal[batch.variant_indices] = np.asarray(
+            jnp.sum(jnp.asarray(genotype_batch) * jnp.asarray(restricted_batch), axis=0),
+            dtype=np.float64,
+        )
         variants_done += len(batch.variant_indices)
         if variants_done == len(batch.variant_indices) or variants_done % max(variant_count // 5, 1) < len(batch.variant_indices) or variants_done == variant_count:
             log(f"      leverage diagonal: {variants_done}/{variant_count} ({100*variants_done//max(variant_count,1)}%)  mem={mem()}")
