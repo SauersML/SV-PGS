@@ -334,9 +334,12 @@ def fit_preprocessor(
     variants_done = 0
     for batch in raw_genotypes.iter_column_batches(batch_size=auto_batch_size(raw_genotypes.shape[0])):
         batch_means = means[batch.variant_indices]
-        imputed = np.where(np.isnan(batch.values), batch_means[None, :], batch.values)
-        centered = imputed - batch_means[None, :]
-        centered_sum_squares[batch.variant_indices] = np.sum(centered * centered, axis=0, dtype=np.float64)
+        vals = batch.values  # already a copy from iter_column_batches
+        nan_mask = np.isnan(vals)
+        np.subtract(vals, batch_means[None, :], out=vals)  # center in-place
+        vals[nan_mask] = 0.0  # imputed-to-mean then centered = 0
+        centered_sum_squares[batch.variant_indices] = np.einsum('ij,ij->j', vals, vals).astype(np.float64)
+        del vals, nan_mask
         variants_done += len(batch.variant_indices)
         if variants_done == len(batch.variant_indices) or variants_done % max(variant_count // 10, 1) < len(batch.variant_indices) or variants_done == variant_count:
             log(f"  preprocessor pass 2/2: {variants_done}/{variant_count} ({100*variants_done//variant_count}%)  mem={mem()}")

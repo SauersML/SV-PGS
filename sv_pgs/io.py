@@ -193,7 +193,7 @@ def load_dataset_from_files(
         log(f"aligned {len(aligned_sample_indices)} phenotype rows against {len(source_sample_ids)} genotype samples")
 
     if resolved_format == "vcf":
-        # genotype_matrix is already subsetted to aligned samples and in float32
+        # genotype_matrix is already subsetted to aligned samples (int8 for VCF)
         raw_genotypes: RawGenotypeMatrix = DenseRawGenotypeMatrix(genotype_matrix)
         if default_variants is None:
             raise RuntimeError("VCF defaults were not initialized.")
@@ -428,17 +428,17 @@ def _load_vcf(
     vcf_path: Path,
     keep_sample_indices: np.ndarray | None = None,
 ) -> tuple[np.ndarray, list[_VariantDefaults]]:
-    """Load VCF genotypes into a float32 matrix.
+    """Load VCF genotypes into an int8 matrix.
 
     If keep_sample_indices is provided, only those sample positions are stored
     per variant (cuts sample dimension to phenotype-matched subset).
-    Returns (float32 genotype matrix, variant defaults).
+    Returns (int8 genotype matrix, variant defaults).
 
     Memory strategy: accumulate per-variant dosage as int8 columns (1 byte each),
-    then pre-allocate the final float32 matrix and copy each int8 column into it
-    one at a time, freeing the int8 column immediately.  Peak memory is the int8
-    list (~2.5 GB for 97K×26K) plus the float32 output (~10 GB), but the int8
-    list is freed incrementally so the true peak is ~10 GB + a few MB.
+    then stack into a single int8 matrix.  Values are 0/1/2 for dosage, -1 for
+    missing.  Converted to float32 with NaN per-batch on the fly by
+    DenseRawGenotypeMatrix.  Peak memory is ~2.5 GB for 97K×26K (4x smaller
+    than the previous float32 approach).
     """
     from sv_pgs.progress import log, mem
     import time
@@ -520,18 +520,14 @@ def _load_vcf(
 
     log(f"parsed {n_total} variants in {elapsed:.1f}s ({n_total / elapsed:.0f} variants/s)")
 
-    # Build float32 matrix by copying each int8 column individually, then freeing it.
-    # This way we never hold the full int8 list AND the full float32 matrix at once.
-    matrix_gb = n_keep * n_total * 4 / 1e9
-    log(f"building float32 matrix ({n_keep} x {n_total}, {matrix_gb:.1f} GB)...")
-    genotype_matrix = np.empty((n_keep, n_total), dtype=np.float32)
+    # Build int8 matrix directly — 4x smaller than float32 (2.5 GB vs 10 GB for 97K×26K).
+    # Values: 0/1/2 for dosage, -1 for missing.  Converted to float32 per-batch on the fly.
+    matrix_gb = n_keep * n_total / 1e9
+    log(f"building int8 matrix ({n_keep} x {n_total}, {matrix_gb:.1f} GB)...")
+    genotype_matrix = np.empty((n_keep, n_total), dtype=np.int8)
     for i in range(n_total):
-        col = dosage_columns[i]
-        # Convert int8 → float32: -1 becomes NaN, 0/1/2 stay as-is
-        f32_col = col.astype(np.float32)
-        f32_col[col == -1] = np.nan
-        genotype_matrix[:, i] = f32_col
-        dosage_columns[i] = None  # free int8 column immediately
+        genotype_matrix[:, i] = dosage_columns[i]
+        dosage_columns[i] = None  # free column immediately
     del dosage_columns
 
     matrix_mb = genotype_matrix.nbytes / 1e6

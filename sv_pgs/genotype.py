@@ -90,10 +90,20 @@ class DenseRawGenotypeMatrix(RawGenotypeMatrix):
     matrix: np.ndarray
 
     def __post_init__(self) -> None:
-        array = np.asarray(self.matrix, dtype=np.float32)
-        if array.ndim != 2:
+        if self.matrix.dtype == np.int8:
+            pass  # int8 with -1 sentinel for missing — 4x smaller than float32
+        else:
+            self.matrix = np.asarray(self.matrix, dtype=np.float32)
+        if self.matrix.ndim != 2:
             raise ValueError("genotypes must be 2D.")
-        self.matrix = array
+
+    def _to_float32(self, batch: np.ndarray) -> np.ndarray:
+        """Convert a column slice to float32, replacing missing sentinels with NaN."""
+        if self.matrix.dtype == np.int8:
+            result = batch.astype(np.float32)
+            result[batch == -1] = np.nan
+            return result
+        return np.asarray(batch, dtype=np.float32)
 
     @property
     def shape(self) -> tuple[int, int]:
@@ -110,7 +120,7 @@ class DenseRawGenotypeMatrix(RawGenotypeMatrix):
             batch_indices = resolved_indices[start_index : start_index + safe_batch_size]
             yield RawGenotypeBatch(
                 variant_indices=batch_indices,
-                values=np.asarray(self.matrix[:, batch_indices], dtype=np.float32),
+                values=self._to_float32(self.matrix[:, batch_indices]),
             )
 
     def materialize(
@@ -118,7 +128,7 @@ class DenseRawGenotypeMatrix(RawGenotypeMatrix):
         variant_indices: Sequence[int] | np.ndarray | None = None,
     ) -> np.ndarray:
         resolved_indices = _resolve_variant_indices(self.shape[1], variant_indices)
-        return np.asarray(self.matrix[:, resolved_indices], dtype=np.float32)
+        return self._to_float32(self.matrix[:, resolved_indices])
 
 
 @dataclass(slots=True)
@@ -300,8 +310,6 @@ class StandardizedGenotypeMatrix:
         """
         if self._dense_cache is not None:
             return True
-        if isinstance(self.raw, DenseRawGenotypeMatrix):
-            return True  # already in-memory
         nbytes = self.dense_bytes()
         if nbytes > MATERIALIZE_THRESHOLD_BYTES:
             return False
@@ -327,14 +335,13 @@ class StandardizedGenotypeMatrix:
         self,
         batch_size: int = DEFAULT_GENOTYPE_BATCH_SIZE,
     ) -> Iterator[RawGenotypeBatch]:
-        if self._dense_cache is not None or isinstance(self.raw, DenseRawGenotypeMatrix):
-            dense_matrix = self.materialize()
+        if self._dense_cache is not None:
             safe_batch_size = max(int(batch_size), 1)
-            for start_index in range(0, dense_matrix.shape[1], safe_batch_size):
-                local_indices = np.arange(start_index, min(start_index + safe_batch_size, dense_matrix.shape[1]), dtype=np.int32)
+            for start_index in range(0, self._dense_cache.shape[1], safe_batch_size):
+                local_indices = np.arange(start_index, min(start_index + safe_batch_size, self._dense_cache.shape[1]), dtype=np.int32)
                 yield RawGenotypeBatch(
                     variant_indices=local_indices,
-                    values=np.asarray(dense_matrix[:, local_indices], dtype=np.float32),
+                    values=np.asarray(self._dense_cache[:, local_indices], dtype=np.float32),
                 )
             return
         safe_batch_size = max(int(batch_size), 1)
@@ -355,10 +362,6 @@ class StandardizedGenotypeMatrix:
     def materialize(self, batch_size: int = DEFAULT_GENOTYPE_BATCH_SIZE) -> np.ndarray:
         if self._dense_cache is not None:
             return self._dense_cache
-        if isinstance(self.raw, DenseRawGenotypeMatrix):
-            raw_values = np.asarray(self.raw.matrix[:, self.variant_indices], dtype=np.float32)
-            self._dense_cache = _standardize_batch(raw_values, self.means[self.variant_indices], self.scales[self.variant_indices])
-            return self._dense_cache
         matrix = np.empty(self.shape, dtype=np.float32)
         for batch in self.iter_column_batches(batch_size=batch_size):
             matrix[:, batch.variant_indices] = batch.values
@@ -374,8 +377,6 @@ class StandardizedGenotypeMatrix:
         coefficient_vector = jnp.asarray(coefficients, dtype=jnp.float64)
         if coefficient_vector.ndim != 1 or coefficient_vector.shape[0] != self.shape[1]:
             raise ValueError("coefficient vector must match genotype column count.")
-        if self._dense_cache is not None or isinstance(self.raw, DenseRawGenotypeMatrix):
-            return jnp.asarray(self.materialize(), dtype=jnp.float64) @ coefficient_vector
         coefficient_array = np.asarray(coefficient_vector, dtype=np.float64)
         result = np.zeros(self.shape[0], dtype=np.float64)
         for batch in self.iter_column_batches(batch_size=batch_size):
@@ -394,8 +395,6 @@ class StandardizedGenotypeMatrix:
         sample_vector = jnp.asarray(vector, dtype=jnp.float64)
         if sample_vector.ndim != 1 or sample_vector.shape[0] != self.shape[0]:
             raise ValueError("sample vector must match genotype row count.")
-        if self._dense_cache is not None or isinstance(self.raw, DenseRawGenotypeMatrix):
-            return jnp.asarray(self.materialize(), dtype=jnp.float64).T @ sample_vector
         sample_array = np.asarray(sample_vector, dtype=np.float64)
         output = np.empty(self.shape[1], dtype=np.float64)
         for batch in self.iter_column_batches(batch_size=batch_size):
@@ -407,8 +406,6 @@ class StandardizedGenotypeMatrix:
         sample_matrix = jnp.asarray(matrix, dtype=jnp.float64)
         if sample_matrix.ndim != 2 or sample_matrix.shape[0] != self.shape[0]:
             raise ValueError("sample matrix must match genotype row count.")
-        if self._dense_cache is not None or isinstance(self.raw, DenseRawGenotypeMatrix):
-            return jnp.asarray(self.materialize(), dtype=jnp.float64).T @ sample_matrix
         sample_array = np.asarray(sample_matrix, dtype=np.float64)
         output = np.empty((self.shape[1], sample_array.shape[1]), dtype=np.float64)
         for batch in self.iter_column_batches(batch_size=batch_size):
@@ -485,6 +482,9 @@ def _contiguous_index_or_slice(indices: np.ndarray) -> slice | np.ndarray:
 def _standardize_batch(batch: np.ndarray, means: np.ndarray, scales: np.ndarray) -> np.ndarray:
     mean_vector = np.asarray(means, dtype=np.float32)
     scale_vector = np.asarray(scales, dtype=np.float32)
-    imputed = np.where(np.isnan(batch), mean_vector[None, :], batch)
-    standardized = (imputed - mean_vector[None, :]) / scale_vector[None, :]
-    return np.asarray(standardized, dtype=np.float32)
+    result = batch.copy()
+    nan_mask = np.isnan(result)
+    np.subtract(result, mean_vector[None, :], out=result)
+    result[nan_mask] = 0.0  # impute-to-mean then center = 0
+    np.divide(result, scale_vector[None, :], out=result)
+    return result
