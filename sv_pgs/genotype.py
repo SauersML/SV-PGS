@@ -335,9 +335,10 @@ class StandardizedGenotypeMatrix:
         if self._dense_cache is None:
             nbytes = self.dense_bytes()
             log(f"    materializing {self.shape[1]} variants x {self.shape[0]} samples ({nbytes / 1e9:.1f} GB) into RAM  mem={mem()}")
-            self._dense_cache = np.empty(self.shape, dtype=np.float32)
+            dense_matrix = np.empty(self.shape, dtype=np.float32)
             for batch in self.iter_column_batches(batch_size=auto_batch_size(self.shape[0])):
-                self._dense_cache[:, batch.variant_indices] = batch.values
+                dense_matrix[:, batch.variant_indices] = batch.values
+            self._dense_cache = dense_matrix
             log(f"    RAM-resident matrix ready  mem={mem()}")
         # Try uploading to GPU via CuPy
         cupy = _try_import_cupy()

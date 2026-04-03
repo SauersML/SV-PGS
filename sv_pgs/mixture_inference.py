@@ -60,6 +60,7 @@ import jax.numpy as jnp
 from jax.scipy.special import digamma as jax_digamma
 from jax.scipy.special import gammaln as jax_gammaln
 import numpy as np
+from scipy.linalg import solve_triangular
 from scipy.special import kve as scipy_bessel_kve
 
 from sv_pgs.config import ModelConfig, TraitType, VariantClass
@@ -1411,8 +1412,19 @@ def _standardize_metadata(values: np.ndarray) -> np.ndarray:
 
 
 def _cholesky_solve(cholesky_factor: np.ndarray, right_hand_side: np.ndarray) -> np.ndarray:
-    lower_solution = np.linalg.solve(cholesky_factor, right_hand_side)
-    return np.linalg.solve(cholesky_factor.T, lower_solution)
+    lower_solution = solve_triangular(
+        cholesky_factor,
+        right_hand_side,
+        lower=True,
+        check_finite=False,
+    )
+    return solve_triangular(
+        cholesky_factor,
+        lower_solution,
+        lower=True,
+        trans="T",
+        check_finite=False,
+    )
 
 
 def _center_design_column(values: np.ndarray) -> np.ndarray:
