@@ -34,53 +34,8 @@ def sv_vcf_dir() -> str:
     return f"{_cdr_storage_path()}/wgs/short_read/structural_variants/vcf/full"
 
 
-def _find_ancestry_file() -> str | None:
-    """Search for the ancestry predictions file under common AoU paths."""
-    base = _cdr_storage_path()
-    candidates = [
-        f"{base}/wgs/short_read/auxiliary/ancestry/ancestry_preds.tsv",
-        f"{base}/auxiliary/ancestry/ancestry_preds.tsv",
-        f"{base}/wgs/auxiliary/ancestry/ancestry_preds.tsv",
-        f"{base}/wgs/short_read/auxiliary/ancestry_preds.tsv",
-    ]
-    # Also try gsutil ls to find it
-    for candidate in candidates:
-        try:
-            result = subprocess.run(
-                ["gsutil", "-u", _google_project(), "ls", candidate],
-                capture_output=True, text=True, timeout=10, check=False,
-            )
-            if result.returncode == 0 and candidate in result.stdout:
-                return candidate
-        except Exception:
-            continue
-    # Try listing the auxiliary directory
-    for aux_dir in [
-        f"{base}/wgs/short_read/auxiliary/",
-        f"{base}/auxiliary/",
-        f"{base}/wgs/auxiliary/",
-    ]:
-        try:
-            result = subprocess.run(
-                ["gsutil", "-u", _google_project(), "ls", aux_dir],
-                capture_output=True, text=True, timeout=10, check=False,
-            )
-            if result.returncode == 0:
-                for line in result.stdout.splitlines():
-                    if "ancestry" in line.lower():
-                        log(f"  found ancestry directory: {line.strip()}")
-                        # List inside it
-                        result2 = subprocess.run(
-                            ["gsutil", "-u", _google_project(), "ls", line.strip()],
-                            capture_output=True, text=True, timeout=10, check=False,
-                        )
-                        if result2.returncode == 0:
-                            for f in result2.stdout.splitlines():
-                                if f.strip().endswith(".tsv"):
-                                    return f.strip()
-        except Exception:
-            continue
-    return None
+def resolve_ancestry_predictions_path() -> str:
+    return f"{_cdr_storage_path()}/wgs/short_read/snpindel/aux/ancestry/ancestry_preds.tsv"
 
 
 def sv_vcf_name(chromosome: int) -> str:
@@ -167,20 +122,14 @@ def download_sv_vcfs(chromosomes: list[int], work_dir: Path) -> dict[int, Path]:
 # Ancestry / PC merging
 # ---------------------------------------------------------------------------
 
-def download_ancestry_preds(work_dir: Path) -> Path | None:
-    """Download the AoU ancestry predictions file (contains per-sample PCs).
-    Returns None if the file can't be found (PCs will be skipped)."""
-    local = work_dir / "ancestry_preds.tsv"
+def download_ancestry_preds(work_dir: Path) -> Path:
+    """Download the AoU ancestry predictions file (contains per-sample PCs)."""
+    remote = resolve_ancestry_predictions_path()
+    local = work_dir / Path(remote).name
     if local.exists():
-        log("  ancestry_preds.tsv already present")
+        log(f"  ancestry predictions already present: {local.name}")
         return local
-    log("  searching for ancestry predictions file in GCS...")
-    remote = _find_ancestry_file()
-    if remote is None:
-        log("  WARNING: ancestry predictions file not found in GCS. Continuing without PCs.")
-        log("  To find it manually, run: gsutil ls ${CDR_STORAGE_PATH}/")
-        return None
-    log(f"  found: {remote}")
+    log(f"  downloading ancestry predictions: {remote}")
     _gsutil_cp(remote, str(local))
     return local
 

@@ -6,6 +6,7 @@ from pathlib import Path
 
 import pytest
 
+import sv_pgs.aou_runner as aou_runner
 from sv_pgs.all_of_us import (
     AllOfUsDiseaseRequest,
     available_disease_names,
@@ -327,6 +328,37 @@ def test_cli_lists_available_all_of_us_diseases(capsys):
     assert "heart_failure" in printed
     assert "type2_diabetes" in printed
     assert printed == sorted(available_disease_names())
+
+
+def test_resolve_ancestry_predictions_path_uses_documented_cdr_v8_location(monkeypatch):
+    monkeypatch.setenv("CDR_STORAGE_PATH", "gs://bucket/cdr")
+
+    assert aou_runner.resolve_ancestry_predictions_path() == (
+        "gs://bucket/cdr/wgs/short_read/snpindel/aux/ancestry/ancestry_preds.tsv"
+    )
+
+
+def test_download_ancestry_preds_uses_documented_remote_path(monkeypatch, tmp_path: Path):
+    monkeypatch.setattr(
+        aou_runner,
+        "resolve_ancestry_predictions_path",
+        lambda: "gs://bucket/cdr/wgs/short_read/snpindel/aux/ancestry/ancestry_preds.tsv",
+    )
+
+    copied: list[tuple[str, str]] = []
+
+    def fake_cp(src: str, dst: str) -> None:
+        copied.append((src, dst))
+        Path(dst).write_text("research_id\tpc1\n1\t0.1\n", encoding="utf-8")
+
+    monkeypatch.setattr(aou_runner, "_gsutil_cp", fake_cp)
+
+    local_path = aou_runner.download_ancestry_preds(tmp_path)
+
+    assert local_path == tmp_path / "ancestry_preds.tsv"
+    assert copied == [
+        ("gs://bucket/cdr/wgs/short_read/snpindel/aux/ancestry/ancestry_preds.tsv", str(local_path))
+    ]
 
 
 def _read_tsv_rows(path: Path) -> list[dict[str, str]]:
