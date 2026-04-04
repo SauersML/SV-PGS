@@ -72,7 +72,10 @@ from sv_pgs.numeric import stable_sigmoid
 from sv_pgs.preprocessing import collapse_tie_groups
 from sv_pgs.progress import log, mem
 
-GPU_EXACT_VARIANT_SOLVE_LIMIT = 12_000
+# GPU exact variant solve needs ~3× the matrix memory for intermediates
+# (X + weighted_X + projected_X). On 16 GB T4 with 4 GB matrix, only ~6 GB
+# free → can handle up to ~2000 variants before OOM. Use PCG for larger.
+GPU_EXACT_VARIANT_SOLVE_LIMIT = 2_000
 
 
 @dataclass(slots=True)
