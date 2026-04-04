@@ -352,7 +352,29 @@ class StandardizedGenotypeMatrix:
         """
         if self._cupy_cache is not None:
             return True
-        # Materialize into CPU RAM first
+        cupy = _try_import_cupy()
+        if cupy is not None:
+            try:
+                nbytes = self.dense_bytes()
+                if self._dense_cache is not None:
+                    log(f"    uploading RAM-resident matrix to GPU ({nbytes / 1e9:.1f} GB)  mem={mem()}")
+                    self._cupy_cache = cupy.asarray(self._dense_cache)
+                    dense_ref = self._dense_cache
+                    self._dense_cache = None
+                    del dense_ref
+                else:
+                    log(f"    streaming {self.shape[1]} variants x {self.shape[0]} samples ({nbytes / 1e9:.1f} GB) directly to GPU  mem={mem()}")
+                    gpu_matrix = cupy.empty(self.shape, dtype=cupy.float32, order="C")
+                    for batch in self.iter_column_batches(batch_size=auto_batch_size(self.shape[0])):
+                        gpu_matrix[:, batch.variant_indices] = cupy.asarray(batch.values, dtype=cupy.float32)
+                    self._cupy_cache = gpu_matrix
+                cupy.cuda.Device().synchronize()
+                import gc; gc.collect()
+                log(f"    CuPy GPU matrix ready ({self._cupy_cache.nbytes / 1e9:.1f} GB)  mem={mem()}")
+                return True
+            except Exception as exc:
+                log(f"    CuPy GPU upload failed ({exc}), using CPU numpy BLAS  mem={mem()}")
+        # Materialize into CPU RAM only if GPU upload path is unavailable.
         if self._dense_cache is None:
             nbytes = self.dense_bytes()
             log(f"    materializing {self.shape[1]} variants x {self.shape[0]} samples ({nbytes / 1e9:.1f} GB) into RAM  mem={mem()}")
@@ -361,22 +383,6 @@ class StandardizedGenotypeMatrix:
                 dense_matrix[:, batch.variant_indices] = batch.values
             self._dense_cache = dense_matrix
             log(f"    RAM-resident matrix ready  mem={mem()}")
-        # Try uploading to GPU via CuPy
-        cupy = _try_import_cupy()
-        if cupy is not None:
-            try:
-                self._cupy_cache = cupy.asarray(self._dense_cache)
-                cupy.cuda.Device().synchronize()  # ensure copy completes before freeing source
-                # Free the CPU copy — data lives on GPU now, saves ~4 GB RAM
-                dense_ref = self._dense_cache
-                self._dense_cache = None
-                del dense_ref
-                import gc; gc.collect()
-                log(f"    CuPy GPU matrix uploaded ({self._cupy_cache.nbytes / 1e9:.1f} GB), CPU copy freed  mem={mem()}")
-                return True
-            except Exception as exc:
-                log(f"    CuPy GPU upload failed ({exc}), using CPU numpy BLAS  mem={mem()}")
-                return True
         log(f"    CuPy not available, using CPU numpy BLAS  mem={mem()}")
         return True
 

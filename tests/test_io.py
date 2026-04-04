@@ -12,6 +12,7 @@ from sklearn.metrics import r2_score, roc_auc_score
 from sv_pgs import BayesianPGS
 from sv_pgs.config import ModelConfig, TraitType, VariantClass
 from sv_pgs.cli import main
+from sv_pgs.data import VariantStatistics
 from sv_pgs.io import (
     _VariantDefaults,
     _load_vcf_from_cache,
@@ -20,6 +21,12 @@ from sv_pgs.io import (
     run_training_pipeline,
 )
 import sv_pgs.genotype as genotype_module
+import sv_pgs.cli as cli_module
+
+
+@pytest.fixture(autouse=True)
+def _skip_gpu_runtime_requirement_in_cli_tests(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setattr(cli_module, "require_full_gpu_runtime", lambda: None)
 
 
 def test_load_dataset_from_vcf_uses_metadata_and_sample_alignment(tmp_path: Path):
@@ -75,6 +82,9 @@ def test_load_dataset_from_vcf_uses_metadata_and_sample_alignment(tmp_path: Path
     np.testing.assert_allclose(dataset.genotypes, np.array([[2.0, 1.0], [1.0, 0.0]], dtype=np.float32))
     np.testing.assert_allclose(dataset.covariates, np.array([[42.0], [35.0]], dtype=np.float32))
     np.testing.assert_allclose(dataset.targets, np.array([1.0, 0.0], dtype=np.float32))
+    assert dataset.variant_stats is not None
+    np.testing.assert_allclose(dataset.variant_stats.support_counts, np.array([2, 1], dtype=np.int32))
+    np.testing.assert_allclose(dataset.variant_stats.means, np.array([1.5, 0.5], dtype=np.float32))
     assert dataset.variant_records[0].variant_class == VariantClass.SNV
     assert dataset.variant_records[1].variant_class == VariantClass.DELETION_SHORT
     assert dataset.variant_records[1].training_support == 2
@@ -136,22 +146,34 @@ def test_vcf_cache_save_uses_real_temp_file_and_roundtrips(tmp_path: Path):
             quality=50.0,
         )
     ]
+    variant_stats = VariantStatistics(
+        means=np.array([0.5], dtype=np.float32),
+        scales=np.array([0.75], dtype=np.float32),
+        allele_frequencies=np.array([0.25], dtype=np.float32),
+        support_counts=np.array([1], dtype=np.int32),
+        marginal_scores=None,
+    )
 
     _save_vcf_to_cache(
         vcf_path=vcf_path,
         keep_sample_indices=keep_sample_indices,
         genotype_matrix=genotype_matrix,
         variants=variants,
+        variant_stats=variant_stats,
     )
 
     cached = _load_vcf_from_cache(vcf_path=vcf_path, keep_sample_indices=keep_sample_indices)
 
     assert cached is not None
-    cached_genotypes, cached_variants = cached
+    cached_genotypes, cached_variants, cached_variant_stats = cached
     np.testing.assert_array_equal(cached_genotypes, genotype_matrix)
     assert cached_variants == variants
-    assert not list((tmp_path / ".svpgs_cache").glob("*.tmp"))
-    assert not list((tmp_path / ".svpgs_cache").glob("*.tmp.npy"))
+    np.testing.assert_allclose(cached_variant_stats.means, variant_stats.means)
+    np.testing.assert_allclose(cached_variant_stats.scales, variant_stats.scales)
+    np.testing.assert_allclose(cached_variant_stats.allele_frequencies, variant_stats.allele_frequencies)
+    np.testing.assert_array_equal(cached_variant_stats.support_counts, variant_stats.support_counts)
+    assert not list((tmp_path / ".sv_pgs_cache").glob("*.tmp"))
+    assert not list((tmp_path / ".sv_pgs_cache").glob("*.tmp.npy"))
 
 
 def test_load_dataset_from_plink_auto_detects_person_id_column(tmp_path: Path):

@@ -143,10 +143,10 @@ def load_dataset_from_files(
         # Try disk cache first to skip VCF re-parsing on repeated runs
         cached = _load_vcf_from_cache(source_path, keep_sample_indices=keep_indices)
         if cached is not None:
-            genotype_matrix, default_variants = cached
+            genotype_matrix, default_variants, variant_stats = cached
         else:
-            genotype_matrix, default_variants = _load_vcf(source_path, keep_sample_indices=keep_indices)
-            _save_vcf_to_cache(source_path, keep_indices, genotype_matrix, default_variants)
+            genotype_matrix, default_variants, variant_stats = _load_vcf(source_path, keep_sample_indices=keep_indices)
+            _save_vcf_to_cache(source_path, keep_indices, genotype_matrix, default_variants, variant_stats)
 
         log(f"VCF loaded: {genotype_matrix.shape[0]} samples x {len(default_variants)} variants  mem={mem()}")
         plink_metadata = None
@@ -441,7 +441,7 @@ def _resolve_sample_id_column(
 _CACHE_DIR_NAME = ".sv_pgs_cache"
 # Bump this when _VariantDefaults, VariantClass, or the cache format changes
 # so stale caches are automatically invalidated.
-_CACHE_VERSION = 1
+_CACHE_VERSION = 2
 
 
 def _vcf_cache_key(vcf_path: Path, keep_sample_indices: np.ndarray | None) -> str:
@@ -463,7 +463,7 @@ def _vcf_cache_dir(vcf_path: Path) -> Path:
 def _load_vcf_from_cache(
     vcf_path: Path,
     keep_sample_indices: np.ndarray | None,
-) -> tuple[np.ndarray, list[_VariantDefaults]] | None:
+) -> tuple[np.ndarray, list[_VariantDefaults], VariantStatistics] | None:
     """Try to load cached VCF parse results. Returns None on miss."""
     cache_dir = _vcf_cache_dir(vcf_path)
     if not cache_dir.exists():
@@ -472,8 +472,9 @@ def _load_vcf_from_cache(
     key = _vcf_cache_key(vcf_path, keep_sample_indices)
     geno_path = cache_dir / f"{key}.genotypes.npy"
     var_path = cache_dir / f"{key}.variants.pkl"
+    stats_path = cache_dir / f"{key}.stats.npz"
 
-    if not geno_path.exists() or not var_path.exists():
+    if not geno_path.exists() or not var_path.exists() or not stats_path.exists():
         log(f"VCF cache miss (key={key})")
         return None
 
@@ -482,8 +483,16 @@ def _load_vcf_from_cache(
         genotype_matrix = np.load(geno_path, mmap_mode=None)
         with open(var_path, "rb") as f:
             variants = pickle.load(f)
+        stats_payload = np.load(stats_path)
+        variant_stats = VariantStatistics(
+            means=np.asarray(stats_payload["means"], dtype=np.float32),
+            scales=np.asarray(stats_payload["scales"], dtype=np.float32),
+            allele_frequencies=np.asarray(stats_payload["allele_frequencies"], dtype=np.float32),
+            support_counts=np.asarray(stats_payload["support_counts"], dtype=np.int32),
+            marginal_scores=None,
+        )
         log(f"  cached matrix {genotype_matrix.shape}, {len(variants)} variants")
-        return genotype_matrix, variants
+        return genotype_matrix, variants, variant_stats
     except Exception as exc:
         log(f"VCF cache load failed ({exc}), will re-parse")
         return None
@@ -494,14 +503,17 @@ def _save_vcf_to_cache(
     keep_sample_indices: np.ndarray | None,
     genotype_matrix: np.ndarray,
     variants: list[_VariantDefaults],
+    variant_stats: VariantStatistics,
 ) -> None:
     """Persist parsed VCF results to disk cache."""
     cache_dir = _vcf_cache_dir(vcf_path)
     key = _vcf_cache_key(vcf_path, keep_sample_indices)
     geno_path = cache_dir / f"{key}.genotypes.npy"
     var_path = cache_dir / f"{key}.variants.pkl"
+    stats_path = cache_dir / f"{key}.stats.npz"
     geno_tmp = cache_dir / f"{key}.genotypes.npy.tmp"
     var_tmp = var_path.with_suffix(".pkl.tmp")
+    stats_tmp = cache_dir / f"{key}.stats.npz.tmp"
 
     try:
         cache_dir.mkdir(parents=True, exist_ok=True)
@@ -511,13 +523,22 @@ def _save_vcf_to_cache(
             np.save(geno_handle, genotype_matrix)
         with open(str(var_tmp), "wb") as f:
             pickle.dump(variants, f, protocol=pickle.HIGHEST_PROTOCOL)
+        with open(stats_tmp, "wb") as stats_handle:
+            np.savez_compressed(
+                stats_handle,
+                means=np.asarray(variant_stats.means, dtype=np.float32),
+                scales=np.asarray(variant_stats.scales, dtype=np.float32),
+                allele_frequencies=np.asarray(variant_stats.allele_frequencies, dtype=np.float32),
+                support_counts=np.asarray(variant_stats.support_counts, dtype=np.int32),
+            )
         geno_tmp.rename(geno_path)
         var_tmp.rename(var_path)
-        total_mb = (geno_path.stat().st_size + var_path.stat().st_size) / 1e6
+        stats_tmp.rename(stats_path)
+        total_mb = (geno_path.stat().st_size + var_path.stat().st_size + stats_path.stat().st_size) / 1e6
         log(f"VCF cache saved ({total_mb:.1f} MB) → {cache_dir.name}/{key}.*")
     except Exception as exc:
         log(f"VCF cache save failed ({exc}), continuing without cache")
-        for p in (geno_tmp, var_tmp, geno_path, var_path):
+        for p in (geno_tmp, var_tmp, stats_tmp, geno_path, var_path, stats_path):
             try:
                 p.unlink(missing_ok=True)
             except Exception:
@@ -527,7 +548,7 @@ def _save_vcf_to_cache(
 def _load_vcf(
     vcf_path: Path,
     keep_sample_indices: np.ndarray | None = None,
-) -> tuple[np.ndarray, list[_VariantDefaults]]:
+) -> tuple[np.ndarray, list[_VariantDefaults], VariantStatistics]:
     """Load VCF genotypes into an int8 matrix.
 
     If keep_sample_indices is provided, only those sample positions are stored
@@ -562,6 +583,10 @@ def _load_vcf(
 
     dosage_columns: list[np.ndarray] = []
     variants: list[_VariantDefaults] = []
+    means: list[float] = []
+    scales: list[float] = []
+    support_counts: list[int] = []
+    allele_frequencies: list[float] = []
 
     t_start = time.monotonic()
     last_log_time = t_start
@@ -571,6 +596,10 @@ def _load_vcf(
     _gt_to_i8 = _GT_TO_INT8
     _append_col = dosage_columns.append
     _append_var = variants.append
+    _append_mean = means.append
+    _append_scale = scales.append
+    _append_support = support_counts.append
+    _append_af = allele_frequencies.append
     _VariantDef = _VariantDefaults
     _vcf_id = _vcf_variant_id
     _vcf_cls = _infer_vcf_variant_class
@@ -588,20 +617,27 @@ def _load_vcf(
         gt = record.gt_types
 
         # Compute AF from int8 directly (avoids creating a 97k float32 array per variant)
-        af_value = record.INFO.get("AF")
-        if af_value is not None:
-            af = float(af_value[0]) if isinstance(af_value, (tuple, list)) else float(af_value)
-        else:
-            int8_all = _gt_to_i8[gt]
-            valid_mask = int8_all != -1
-            n_valid = int(np.count_nonzero(valid_mask))
-            af = float(np.sum(int8_all[valid_mask])) / (2.0 * n_valid) if n_valid > 0 else 0.0
+        int8_all = _gt_to_i8[gt]
 
         # Store as int8 (1 byte per sample vs 4 for float32)
-        int8_col = _gt_to_i8[gt] if af_value is not None else int8_all
+        int8_col = int8_all
         if keep_sample_indices is not None:
             int8_col = int8_col[keep_sample_indices]
+        valid_mask = int8_col != -1
+        n_valid = int(np.count_nonzero(valid_mask))
+        af = float(np.sum(int8_col[valid_mask], dtype=np.int64)) / (2.0 * n_valid) if n_valid > 0 else 0.0
+        observed = int8_col[valid_mask]
+        observed_f64 = observed.astype(np.float64, copy=False)
+        observed_sum = float(np.sum(observed, dtype=np.int64))
+        observed_sum_sq = float(np.dot(observed_f64, observed_f64))
+        mean = observed_sum / n_valid if n_valid > 0 else 0.0
+        centered_sum_sq = max(observed_sum_sq - observed_sum * observed_sum / max(n_valid, 1), 0.0)
+        scale = float(np.sqrt(centered_sum_sq / max(len(int8_col), 1)))
         _append_col(int8_col)
+        _append_mean(mean)
+        _append_scale(scale)
+        _append_support(int(np.count_nonzero(observed > 0)))
+        _append_af(af)
 
         _append_var(
             _VariantDef(
@@ -652,7 +688,14 @@ def _load_vcf(
 
     matrix_mb = genotype_matrix.nbytes / 1e6
     log(f"genotype matrix ready: {genotype_matrix.shape}, {matrix_mb:.1f} MB  mem={mem()}")
-    return genotype_matrix, variants
+    variant_stats = VariantStatistics(
+        means=np.asarray(means, dtype=np.float32),
+        scales=np.where(np.asarray(scales, dtype=np.float32) < 1e-6, 1.0, np.asarray(scales, dtype=np.float32)),
+        allele_frequencies=np.asarray(allele_frequencies, dtype=np.float32),
+        support_counts=np.asarray(support_counts, dtype=np.int32),
+        marginal_scores=None,
+    )
+    return genotype_matrix, variants, variant_stats
 def _load_plink1_metadata(bed_path: Path) -> _PlinkMetadata:
     fam_path = bed_path.with_suffix(".fam")
     bim_path = bed_path.with_suffix(".bim")
