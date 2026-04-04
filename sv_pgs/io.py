@@ -13,7 +13,7 @@ from sklearn.metrics import log_loss, r2_score, roc_auc_score
 
 from sv_pgs.config import ModelConfig, TraitType, VariantClass
 from sv_pgs.data import VariantRecord, VariantStatistics
-from sv_pgs.genotype import DenseRawGenotypeMatrix, PlinkRawGenotypeMatrix, RawGenotypeMatrix
+from sv_pgs.genotype import ConcatenatedRawGenotypeMatrix, DenseRawGenotypeMatrix, PlinkRawGenotypeMatrix, RawGenotypeMatrix
 from sv_pgs.model import BayesianPGS
 from sv_pgs.preprocessing import compute_variant_statistics
 from sv_pgs.progress import log, mem
@@ -141,12 +141,11 @@ def load_dataset_from_files(
         log(f"loading VCF genotypes (keeping {len(keep_indices)} of {len(source_sample_ids)} samples, int8 accumulation)...")
 
         # Try disk cache first to skip VCF re-parsing on repeated runs
-        cached = _load_vcf_from_cache(source_path, keep_sample_indices=keep_indices)
-        if cached is not None:
-            genotype_matrix, default_variants, variant_stats = cached
-        else:
-            genotype_matrix, default_variants, variant_stats = _load_vcf(source_path, keep_sample_indices=keep_indices)
-            _save_vcf_to_cache(source_path, keep_indices, genotype_matrix, default_variants, variant_stats)
+        genotype_matrix, default_variants, variant_stats = _load_vcf_with_cache(
+            source_path,
+            keep_sample_indices=keep_indices,
+            mmap_mode=None,
+        )
 
         log(f"VCF loaded: {genotype_matrix.shape[0]} samples x {len(default_variants)} variants  mem={mem()}")
         plink_metadata = None
@@ -247,6 +246,113 @@ def load_dataset_from_files(
     log(f"variant records: {len(variant_records)} total ({snv_count} SNVs, {sv_count} structural variants)")
 
     log(f"=== LOAD DATASET DONE === final shape={raw_genotypes.shape}  mem={mem()}")
+    return LoadedDataset(
+        sample_ids=list(sample_table.sample_ids),
+        genotypes=raw_genotypes,
+        covariates=np.asarray(sample_table.covariates, dtype=np.float32),
+        targets=np.asarray(sample_table.targets, dtype=np.float32),
+        variant_records=variant_records,
+        variant_stats=variant_stats,
+    )
+
+
+def load_multi_vcf_dataset_from_files(
+    genotype_paths: Sequence[str | Path],
+    sample_table_path: str | Path,
+    target_column: str,
+    covariate_columns: Sequence[str],
+    *,
+    sample_id_column: str = "auto",
+    variant_metadata_path: str | Path | None = None,
+) -> LoadedDataset:
+    log(f"=== LOAD MULTI-VCF DATASET START ===  chromosomes={len(genotype_paths)}  mem={mem()}")
+    source_paths = [Path(path) for path in genotype_paths]
+    if not source_paths:
+        raise ValueError("genotype_paths cannot be empty.")
+
+    log(f"reading sample table header: {sample_table_path}")
+    sample_table_spec = _inspect_delimited_table(sample_table_path)
+    log(f"sample table columns={list(sample_table_spec.columns)}")
+
+    first_source_path = source_paths[0]
+    log(f"reading VCF header for sample IDs: {first_source_path}")
+    source_sample_ids = _read_vcf_sample_ids(first_source_path)
+    log(f"VCF has {len(source_sample_ids)} samples")
+
+    log("resolving sample ID column...")
+    resolved_sample_id_column = _resolve_sample_id_column(
+        table_spec=sample_table_spec,
+        requested_sample_id_column=sample_id_column,
+        available_sample_ids=source_sample_ids,
+    )
+    log(f"sample ID column: '{resolved_sample_id_column}'")
+
+    log("building filtered sample table (parsing target + covariates for matched genotype IDs only)...")
+    sample_table, total_sample_rows, unmatched_sample_rows = _build_sample_table(
+        table_spec=sample_table_spec,
+        sample_id_column=resolved_sample_id_column,
+        target_column=target_column,
+        covariate_columns=covariate_columns,
+        available_sample_ids=source_sample_ids,
+    )
+    n_cases = int(np.sum(np.asarray(sample_table.targets) == 1.0))
+    n_controls = int(np.sum(np.asarray(sample_table.targets) == 0.0))
+    log(
+        "sample table: "
+        + f"{len(sample_table.sample_ids)} matched rows kept from {total_sample_rows}, "
+        + f"{unmatched_sample_rows} dropped, {sample_table.covariates.shape[1]} covariates"
+    )
+    log(f"  target distribution: {n_cases} cases, {n_controls} controls (of {len(sample_table.sample_ids)} total)")
+
+    log("aligning sample IDs between sample table and genotype source...")
+    aligned_sample_indices = _align_sample_ids(
+        expected_sample_ids=sample_table.sample_ids,
+        available_sample_ids=source_sample_ids,
+        context="genotype source",
+    )
+    keep_sample_indices = np.asarray(aligned_sample_indices, dtype=np.intp)
+    log(f"aligned {len(aligned_sample_indices)} phenotype rows against {len(source_sample_ids)} genotype samples")
+
+    raw_matrices: list[RawGenotypeMatrix] = []
+    default_variants: list[_VariantDefaults] = []
+    variant_stats_parts: list[VariantStatistics] = []
+    for source_path in source_paths:
+        log(f"loading chromosome VCF for unified fit: {source_path}")
+        chromosome_sample_ids = _read_vcf_sample_ids(source_path)
+        if chromosome_sample_ids != source_sample_ids:
+            raise RuntimeError(f"VCF sample IDs do not match the first chromosome: {source_path}")
+        genotype_matrix, chromosome_variants, chromosome_stats = _load_vcf_with_cache(
+            source_path,
+            keep_sample_indices=keep_sample_indices,
+            mmap_mode="r",
+        )
+        raw_matrices.append(DenseRawGenotypeMatrix(genotype_matrix))
+        default_variants.extend(chromosome_variants)
+        variant_stats_parts.append(chromosome_stats)
+        log(
+            f"  chromosome ready: {genotype_matrix.shape[0]} samples x {genotype_matrix.shape[1]} variants  "
+            f"total_variants_so_far={len(default_variants)}  mem={mem()}"
+        )
+
+    raw_genotypes: RawGenotypeMatrix = ConcatenatedRawGenotypeMatrix(tuple(raw_matrices))
+    variant_stats = VariantStatistics(
+        means=np.concatenate([stats.means for stats in variant_stats_parts]).astype(np.float32, copy=False),
+        scales=np.concatenate([stats.scales for stats in variant_stats_parts]).astype(np.float32, copy=False),
+        allele_frequencies=np.concatenate([stats.allele_frequencies for stats in variant_stats_parts]).astype(np.float32, copy=False),
+        support_counts=np.concatenate([stats.support_counts for stats in variant_stats_parts]).astype(np.int32, copy=False),
+        marginal_scores=None,
+    )
+
+    log("building variant records from defaults + optional metadata...")
+    variant_records = _build_variant_records(
+        default_variants=default_variants,
+        variant_metadata_path=variant_metadata_path,
+    )
+    sv_count = sum(1 for vr in variant_records if vr.variant_class.value not in ("snv", "small_indel"))
+    snv_count = sum(1 for vr in variant_records if vr.variant_class.value == "snv")
+    log(f"variant records: {len(variant_records)} total ({snv_count} SNVs, {sv_count} structural variants)")
+
+    log(f"=== LOAD MULTI-VCF DATASET DONE === final shape={raw_genotypes.shape}  mem={mem()}")
     return LoadedDataset(
         sample_ids=list(sample_table.sample_ids),
         genotypes=raw_genotypes,
@@ -417,16 +523,13 @@ def _resolve_sample_id_column(
         )
 
     available_sample_id_set = set(available_sample_ids)
-    # Sample first 1000 rows to pick the best column (avoids full 633k scan)
+    # Valid overlaps can start well after early rows in large phenotype exports,
+    # so resolve against the full table instead of an initial sample.
     match_counts = {column_name: 0 for column_name in candidate_columns}
-    rows_checked = 0
     for row in _iter_delimited_rows(table_spec):
         for column_name in candidate_columns:
             if str(row[column_name]).strip() in available_sample_id_set:
                 match_counts[column_name] += 1
-        rows_checked += 1
-        if rows_checked >= 1000:
-            break
     best_match_count = max(match_counts.values())
     best_columns = [column_name for column_name in candidate_columns if match_counts[column_name] == best_match_count]
     if best_match_count == 0:
@@ -485,6 +588,8 @@ def _vcf_cache_dir(vcf_path: Path) -> Path:
 def _load_vcf_from_cache(
     vcf_path: Path,
     keep_sample_indices: np.ndarray | None,
+    *,
+    mmap_mode: str | None = None,
 ) -> tuple[np.ndarray, list[_VariantDefaults], VariantStatistics] | None:
     """Try to load cached VCF parse results. Returns None on miss."""
     cache_dir = _vcf_cache_dir(vcf_path)
@@ -502,7 +607,7 @@ def _load_vcf_from_cache(
 
     try:
         log(f"VCF cache hit — loading from {cache_dir.name}/{key}.*")
-        genotype_matrix = np.load(geno_path, mmap_mode=None)
+        genotype_matrix = np.load(geno_path, mmap_mode=mmap_mode)
         with open(var_path, "rb") as f:
             variants = pickle.load(f)
         stats_payload = np.load(stats_path)
@@ -518,6 +623,45 @@ def _load_vcf_from_cache(
     except Exception as exc:
         log(f"VCF cache load failed ({exc}), will re-parse")
         return None
+
+
+def _read_vcf_sample_ids(vcf_path: Path) -> list[str]:
+    from cyvcf2 import VCF
+
+    reader = VCF(str(vcf_path))
+    try:
+        return [str(sample_id) for sample_id in reader.samples]
+    finally:
+        reader.close()
+
+
+def _load_vcf_with_cache(
+    vcf_path: Path,
+    keep_sample_indices: np.ndarray,
+    *,
+    mmap_mode: str | None,
+) -> tuple[np.ndarray, list[_VariantDefaults], VariantStatistics]:
+    cached = _load_vcf_from_cache(
+        vcf_path,
+        keep_sample_indices=keep_sample_indices,
+        mmap_mode=mmap_mode,
+    )
+    if cached is not None:
+        return cached
+
+    genotype_matrix, variants, variant_stats = _load_vcf(vcf_path, keep_sample_indices=keep_sample_indices)
+    _save_vcf_to_cache(vcf_path, keep_sample_indices, genotype_matrix, variants, variant_stats)
+    if mmap_mode is None:
+        return genotype_matrix, variants, variant_stats
+
+    cached = _load_vcf_from_cache(
+        vcf_path,
+        keep_sample_indices=keep_sample_indices,
+        mmap_mode=mmap_mode,
+    )
+    if cached is not None:
+        return cached
+    return genotype_matrix, variants, variant_stats
 
 
 def _save_vcf_to_cache(
@@ -862,23 +1006,31 @@ def _write_predictions_and_summary(
     model: BayesianPGS,
 ) -> dict[str, Any]:
     log(f"computing predictions for {len(dataset.sample_ids)} samples, trait={model.config.trait_type.value}  mem={mem()}")
+    genetic_score, covariate_score = model.decision_components(dataset.genotypes, dataset.covariates)
+    linear_predictor = np.asarray(genetic_score + covariate_score, dtype=np.float32)
     if model.config.trait_type == TraitType.BINARY:
-        probabilities = model.predict_proba(dataset.genotypes, dataset.covariates)[:, 1]
+        probabilities = np.asarray(model.predict_proba(dataset.genotypes, dataset.covariates)[:, 1], dtype=np.float32)
         predicted_labels = (probabilities >= 0.5).astype(np.int32)
         log(f"binary predictions: mean_prob={float(np.mean(probabilities)):.4f}  pred_positive={int(np.sum(predicted_labels))}  pred_negative={int(np.sum(1-predicted_labels))}")
         _write_delimited_rows(
             predictions_path,
-            header=("sample_id", "target", "probability", "predicted_label"),
+            header=("sample_id", "target", "genetic_score", "covariate_score", "linear_predictor", "probability", "predicted_label"),
             rows=(
                 (
                     sample_id,
                     _format_float(float(target)),
+                    _format_float(float(genetic_component)),
+                    _format_float(float(covariate_component)),
+                    _format_float(float(raw_score)),
                     _format_float(float(probability)),
                     str(int(predicted_label)),
                 )
-                for sample_id, target, probability, predicted_label in zip(
+                for sample_id, target, genetic_component, covariate_component, raw_score, probability, predicted_label in zip(
                     dataset.sample_ids,
                     dataset.targets,
+                    genetic_score,
+                    covariate_score,
+                    linear_predictor,
                     probabilities,
                     predicted_labels,
                     strict=True,
@@ -896,19 +1048,23 @@ def _write_predictions_and_summary(
             "training_accuracy": training_accuracy,
         }
 
-    predictions = model.predict(dataset.genotypes, dataset.covariates)
+    predictions = np.asarray(model.predict(dataset.genotypes, dataset.covariates), dtype=np.float32)
     _write_delimited_rows(
         predictions_path,
-        header=("sample_id", "target", "prediction"),
+        header=("sample_id", "target", "genetic_score", "covariate_score", "prediction"),
         rows=(
             (
                 sample_id,
                 _format_float(float(target)),
+                _format_float(float(genetic_component)),
+                _format_float(float(covariate_component)),
                 _format_float(float(prediction)),
             )
-            for sample_id, target, prediction in zip(
+            for sample_id, target, genetic_component, covariate_component, prediction in zip(
                 dataset.sample_ids,
                 dataset.targets,
+                genetic_score,
+                covariate_score,
                 predictions,
                 strict=True,
             )

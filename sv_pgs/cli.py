@@ -39,7 +39,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     aou_run_parser = subparsers.add_parser(
         "run-all-of-us",
-        help="Full AoU pipeline: download VCFs, prepare phenotype, merge PCs, fit per-chromosome.",
+        help="Full AoU pipeline: download VCFs, prepare phenotype, merge PCs, and fit one unified genome-wide model.",
     )
     aou_run_parser.add_argument("--disease", required=True, help="Disease name (e.g. hypertension, type2_diabetes).")
     aou_run_parser.add_argument("--chromosomes", default="1-22", help="Chromosome range (default: 1-22).")

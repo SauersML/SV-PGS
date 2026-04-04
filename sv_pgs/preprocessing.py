@@ -1,7 +1,8 @@
 from __future__ import annotations
 
+import hashlib
 from dataclasses import dataclass
-from typing import Sequence
+from typing import Iterator, Sequence
 
 import numpy as np
 
@@ -13,8 +14,10 @@ from sv_pgs.config import ModelConfig, VariantClass
 from sv_pgs.data import PreparedArrays, TieGroup, TieMap, VariantRecord, VariantStatistics
 from sv_pgs.genotype import (
     DenseRawGenotypeMatrix,
+    RawGenotypeBatch,
     RawGenotypeMatrix,
     StandardizedGenotypeMatrix,
+    _standardize_batch,
     as_raw_genotype_matrix,
     auto_batch_size,
 )
@@ -365,6 +368,7 @@ def select_active_variant_indices(
     variant_records: Sequence[VariantRecord],
     support_counts: np.ndarray,
     config: ModelConfig,
+    marginal_scores: np.ndarray | None = None,
 ) -> np.ndarray:
     """Filter out structural variants with too few carriers.
 
@@ -389,8 +393,72 @@ def select_active_variant_indices(
         if support < config.minimum_structural_variant_carriers:
             active_flags[variant_index] = False
             sv_filtered += 1
-    result = np.where(active_flags)[0].astype(np.int32)
-    log(f"  active variants: {len(result)}/{n_total} kept (SVs checked={sv_checked} filtered={sv_filtered}) [NO DATA PASS]")
+    base_active_indices = np.where(active_flags)[0].astype(np.int32)
+    if marginal_scores is None:
+        log(
+            f"  active variants: {len(base_active_indices)}/{n_total} kept "
+            f"(SVs checked={sv_checked} filtered={sv_filtered}; score screening skipped) [NO DATA PASS]"
+        )
+        return base_active_indices
+    score_array = np.asarray(marginal_scores, dtype=np.float64).reshape(-1)
+    if score_array.shape[0] != n_total:
+        raise ValueError("marginal_scores must align with variant_records.")
+
+    screened_flags = np.zeros(n_total, dtype=bool)
+    structural_kept = 0
+    always_kept_structural = 0
+    if config.screen_max_structural_variants_per_class != 0:
+        structural_indices_by_class: dict[VariantClass, list[int]] = {}
+        for variant_index in base_active_indices:
+            record = variant_records[int(variant_index)]
+            if record.variant_class not in structural_variant_classes:
+                continue
+            support = int(support_counts[int(variant_index)])
+            if record.training_support is not None:
+                support = record.training_support
+            if support >= config.screen_always_keep_structural_variants_above_support:
+                screened_flags[int(variant_index)] = True
+                always_kept_structural += 1
+                continue
+            structural_indices_by_class.setdefault(record.variant_class, []).append(int(variant_index))
+        for class_indices in structural_indices_by_class.values():
+            structural_kept += _keep_top_scoring_variants(
+                class_indices,
+                score_array,
+                config.screen_max_structural_variants_per_class,
+                screened_flags,
+            )
+    else:
+        for variant_index in base_active_indices:
+            if variant_records[int(variant_index)].variant_class in structural_variant_classes:
+                screened_flags[int(variant_index)] = True
+
+    small_variant_kept = 0
+    if config.screen_max_small_variants_per_chromosome != 0:
+        small_indices_by_chromosome: dict[str, list[int]] = {}
+        for variant_index in base_active_indices:
+            record = variant_records[int(variant_index)]
+            if record.variant_class in structural_variant_classes:
+                continue
+            small_indices_by_chromosome.setdefault(record.chromosome, []).append(int(variant_index))
+        for chromosome_indices in small_indices_by_chromosome.values():
+            small_variant_kept += _keep_top_scoring_variants(
+                chromosome_indices,
+                score_array,
+                config.screen_max_small_variants_per_chromosome,
+                screened_flags,
+            )
+    else:
+        for variant_index in base_active_indices:
+            if variant_records[int(variant_index)].variant_class not in structural_variant_classes:
+                screened_flags[int(variant_index)] = True
+
+    result = np.where(screened_flags & active_flags)[0].astype(np.int32)
+    log(
+        f"  active variants: {len(result)}/{n_total} kept "
+        f"(SVs checked={sv_checked} filtered={sv_filtered}; "
+        f"screened small={small_variant_kept} structural={structural_kept} always_keep_sv={always_kept_structural}) [NO DATA PASS]"
+    )
     return result
 
 
@@ -417,8 +485,8 @@ def build_tie_map(
     n_total = standardized_genotypes.shape[1]
     log(f"  building tie map over {n_total} variants...")
 
-    exact_signature_to_group: dict[bytes, int] = {}
-    sign_flipped_signature_to_group: dict[bytes, int] = {}
+    exact_signature_to_group: dict[tuple[bytes, bytes], int] = {}
+    sign_flipped_signature_to_group: dict[tuple[bytes, bytes], int] = {}
     tie_group_member_indices: list[list[int]] = []
     tie_group_signs: list[list[float]] = []
     representative_indices: list[int] = []
@@ -426,20 +494,15 @@ def build_tie_map(
     original_to_reduced = np.full(n_total, -1, dtype=np.int32)
 
     variants_done = 0
-    for batch in standardized_genotypes.iter_column_batches(batch_size=auto_batch_size(standardized_genotypes.shape[0])):
+    for batch, missing_mask in _iter_tie_map_batches(standardized_genotypes):
         for local_batch_index, variant_index in enumerate(batch.variant_indices):
-            standardized_column = np.where(
-                batch.values[:, local_batch_index] == 0.0,
-                np.float32(0.0),
-                batch.values[:, local_batch_index],
-            ).astype(np.float32, copy=False)
-            genotype_signature = np.ascontiguousarray(standardized_column).tobytes()
-            sign_flipped_column = np.where(
-                standardized_column == 0.0,
-                np.float32(0.0),
-                -standardized_column,
+            standardized_column = _normalize_signed_zeros(batch.values[:, local_batch_index])
+            column_missing_mask = np.asarray(missing_mask[:, local_batch_index], dtype=bool)
+            genotype_signature = _hashed_tie_signature(standardized_column, column_missing_mask)
+            sign_flipped_signature = _hashed_tie_signature(
+                _normalize_signed_zeros(-standardized_column),
+                column_missing_mask,
             )
-            sign_flipped_signature = np.ascontiguousarray(sign_flipped_column).tobytes()
 
             if genotype_signature in exact_signature_to_group:
                 reduced_index = exact_signature_to_group[genotype_signature]
@@ -487,6 +550,68 @@ def build_tie_map(
     )
 
 
+def _keep_top_scoring_variants(
+    variant_indices: list[int],
+    marginal_scores: np.ndarray,
+    maximum_kept: int,
+    keep_flags: np.ndarray,
+) -> int:
+    if len(variant_indices) == 0:
+        return 0
+    if maximum_kept <= 0 or len(variant_indices) <= maximum_kept:
+        keep_flags[np.asarray(variant_indices, dtype=np.int32)] = True
+        return len(variant_indices)
+    group_indices = np.asarray(variant_indices, dtype=np.int32)
+    group_scores = np.asarray(marginal_scores[group_indices], dtype=np.float64)
+    safe_scores = np.where(np.isfinite(group_scores), group_scores, -np.inf)
+    keep_order = np.argsort(-safe_scores, kind="mergesort")[:maximum_kept]
+    keep_flags[group_indices[keep_order]] = True
+    return int(keep_order.shape[0])
+
+
+def _iter_tie_map_batches(
+    standardized_genotypes: StandardizedGenotypeMatrix,
+) -> Iterator[tuple[RawGenotypeBatch, np.ndarray]]:
+    batch_size = auto_batch_size(standardized_genotypes.shape[0])
+    if standardized_genotypes.raw is not None:
+        local_start = 0
+        for raw_batch in standardized_genotypes.raw.iter_column_batches(
+            standardized_genotypes.variant_indices,
+            batch_size=batch_size,
+        ):
+            local_stop = local_start + raw_batch.variant_indices.shape[0]
+            local_indices = np.arange(local_start, local_stop, dtype=np.int32)
+            standardized_values = _standardize_batch(
+                raw_batch.values,
+                standardized_genotypes.means[raw_batch.variant_indices],
+                standardized_genotypes.scales[raw_batch.variant_indices],
+            )
+            yield RawGenotypeBatch(
+                variant_indices=local_indices,
+                values=standardized_values,
+            ), np.isnan(raw_batch.values)
+            local_start = local_stop
+        return
+    for batch in standardized_genotypes.iter_column_batches(batch_size=batch_size):
+        yield batch, np.zeros_like(batch.values, dtype=bool)
+
+
+def _normalize_signed_zeros(values: np.ndarray) -> np.ndarray:
+    array = np.asarray(values, dtype=np.float32)
+    return np.where(array == 0.0, np.float32(0.0), array).astype(np.float32, copy=False)
+
+
+def _hashed_tie_signature(
+    standardized_column: np.ndarray,
+    missing_mask: np.ndarray,
+) -> tuple[bytes, bytes]:
+    value_hasher = hashlib.blake2b(digest_size=16, person=b"svpgs_value")
+    value_hasher.update(np.ascontiguousarray(standardized_column).view(np.uint8))
+    mask_hasher = hashlib.blake2b(digest_size=16, person=b"svpgs_mask_")
+    mask_hasher.update(np.packbits(np.ascontiguousarray(missing_mask, dtype=np.uint8)))
+    return value_hasher.digest(), mask_hasher.digest()
+
+
 # Create one merged record per tie group for use in the reduced model.
 # If all members share the same variant class, the group keeps that class.
 # If members span multiple classes (e.g. a deletion and a complex SV that
@@ -503,6 +628,18 @@ def collapse_tie_groups(
         latent_variant_class = (
             unique_variant_classes[0] if len(unique_variant_classes) == 1 else VariantClass.OTHER_COMPLEX_SV
         )
+        support_values = [
+            float(member_record.training_support)
+            for member_record in member_records
+            if member_record.training_support is not None
+        ]
+        continuous_feature_names = sorted(
+            {
+                feature_name
+                for member_record in member_records
+                for feature_name in member_record.prior_continuous_features
+            }
+        )
         collapsed_records.append(
             VariantRecord(
                 variant_id=member_records[0].variant_id,
@@ -512,8 +649,20 @@ def collapse_tie_groups(
                 length=float(np.mean([member_record.length for member_record in member_records])),
                 allele_frequency=float(np.mean([member_record.allele_frequency for member_record in member_records])),
                 quality=float(np.mean([member_record.quality for member_record in member_records])),
+                training_support=(
+                    None
+                    if not support_values
+                    else int(np.round(np.mean(support_values)))
+                ),
                 is_repeat=any(member_record.is_repeat for member_record in member_records),
                 is_copy_number=any(member_record.is_copy_number for member_record in member_records),
+                prior_continuous_features={
+                    feature_name: float(np.mean([
+                        member_record.prior_continuous_features.get(feature_name, 0.0)
+                        for member_record in member_records
+                    ]))
+                    for feature_name in continuous_feature_names
+                },
                 prior_class_members=tuple(unique_variant_classes),
                 prior_class_membership=tuple(class_membership.tolist()),
             )

@@ -1756,9 +1756,47 @@ def _parse_scale_model_feature_names(
 def _continuous_prior_design_matrix(
     records: Sequence[VariantRecord],
 ) -> tuple[tuple[str, ...], np.ndarray]:
-    feature_names = ["log_length"]
+    allele_frequencies = np.clip(
+        np.nan_to_num(
+            np.asarray([record.allele_frequency for record in records], dtype=np.float64),
+            nan=0.5,
+            posinf=1.0,
+            neginf=0.0,
+        ),
+        1e-6,
+        1.0 - 1e-6,
+    )
+    training_support = np.maximum(
+        np.nan_to_num(
+            np.asarray(
+                [
+                    0.0 if record.training_support is None else float(record.training_support)
+                    for record in records
+                ],
+                dtype=np.float64,
+            ),
+            nan=0.0,
+            posinf=0.0,
+            neginf=0.0,
+        ),
+        0.0,
+    )
+    feature_names = [
+        "log_length",
+        "logit_allele_frequency",
+        "quality",
+        "log_training_support",
+    ]
     feature_columns = [
-        np.log(np.maximum(np.asarray([record.length for record in records], dtype=np.float64), 1.0))
+        np.log(np.maximum(np.asarray([record.length for record in records], dtype=np.float64), 1.0)),
+        np.log(allele_frequencies) - np.log1p(-allele_frequencies),
+        np.nan_to_num(
+            np.asarray([record.quality for record in records], dtype=np.float64),
+            nan=1.0,
+            posinf=1.0,
+            neginf=0.0,
+        ),
+        np.log1p(training_support),
     ]
     custom_feature_names = sorted(
         {

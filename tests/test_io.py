@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import csv
+import gzip
 import json
 import os
 from pathlib import Path
@@ -16,10 +17,13 @@ from sv_pgs.cli import main
 from sv_pgs.data import VariantStatistics
 from sv_pgs.io import (
     _VariantDefaults,
+    _inspect_delimited_table,
+    _resolve_sample_id_column,
     _vcf_cache_key,
     _load_vcf_from_cache,
     _save_vcf_to_cache,
     load_dataset_from_files,
+    load_multi_vcf_dataset_from_files,
     run_training_pipeline,
 )
 import sv_pgs.genotype as genotype_module
@@ -131,6 +135,136 @@ def test_load_dataset_from_vcf_auto_detects_research_id_column(tmp_path: Path):
     )
 
     assert dataset.sample_ids == ["rid1", "rid2"]
+    np.testing.assert_allclose(dataset.genotypes, np.array([[2.0], [1.0]], dtype=np.float32))
+
+
+def test_load_multi_vcf_dataset_from_files_concatenates_variants_across_chromosomes(tmp_path: Path):
+    vcf1_path = tmp_path / "chr1.vcf"
+    vcf1_path.write_text(
+        "\n".join(
+            [
+                "##fileformat=VCFv4.2",
+                "##contig=<ID=1>",
+                "##INFO=<ID=AF,Number=A,Type=Float,Description=\"Allele frequency\">",
+                "##FORMAT=<ID=GT,Number=1,Type=String,Description=\"Genotype\">",
+                "#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\ts2\ts1",
+                "1\t100\tchr1_var1\tA\tC\t50\tPASS\tAF=0.25\tGT\t0/1\t1/1",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    vcf2_path = tmp_path / "chr2.vcf"
+    vcf2_path.write_text(
+        "\n".join(
+            [
+                "##fileformat=VCFv4.2",
+                "##contig=<ID=2>",
+                "##INFO=<ID=AF,Number=A,Type=Float,Description=\"Allele frequency\">",
+                "##FORMAT=<ID=GT,Number=1,Type=String,Description=\"Genotype\">",
+                "#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\ts2\ts1",
+                "2\t200\tchr2_var1\tG\tT\t60\tPASS\tAF=0.5\tGT\t0/0\t0/1",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    sample_table_path = tmp_path / "samples.tsv"
+    _write_table(
+        sample_table_path,
+        header=("sample_id", "target", "age"),
+        rows=(
+            ("s1", "1", "42"),
+            ("s2", "0", "35"),
+        ),
+    )
+
+    dataset = load_multi_vcf_dataset_from_files(
+        genotype_paths=[vcf1_path, vcf2_path],
+        sample_table_path=sample_table_path,
+        sample_id_column="sample_id",
+        target_column="target",
+        covariate_columns=("age",),
+    )
+
+    assert dataset.sample_ids == ["s1", "s2"]
+    assert dataset.genotypes.shape == (2, 2)
+    np.testing.assert_allclose(
+        dataset.genotypes.materialize(),
+        np.array(
+            [
+                [2.0, 1.0],
+                [1.0, 0.0],
+            ],
+            dtype=np.float32,
+        ),
+    )
+    assert [record.variant_id for record in dataset.variant_records] == ["chr1_var1", "chr2_var1"]
+    assert dataset.variant_stats is not None
+    np.testing.assert_allclose(dataset.variant_stats.support_counts, np.array([2, 1], dtype=np.int32))
+
+
+def test_load_dataset_from_vcf_auto_detects_sample_id_column_after_first_1000_rows(tmp_path: Path):
+    sample_table_path = tmp_path / "samples.tsv"
+    _write_table(
+        sample_table_path,
+        header=("sample_id", "research_id", "target"),
+        rows=(
+            tuple((f"nomatch_sample_{row_index}", f"nomatch_research_{row_index}", "0") for row_index in range(1001))
+            + (
+                ("genotype_1", "other_1", "1"),
+                ("genotype_2", "other_2", "0"),
+            )
+        ),
+    )
+
+    resolved_column = _resolve_sample_id_column(
+        table_spec=_inspect_delimited_table(sample_table_path),
+        requested_sample_id_column="auto",
+        available_sample_ids=("genotype_1", "genotype_2"),
+    )
+
+    assert resolved_column == "sample_id"
+
+
+def test_load_dataset_from_gzipped_vcf(tmp_path: Path):
+    vcf_path = tmp_path / "cohort.vcf.gz"
+    with gzip.open(vcf_path, "wt", encoding="utf-8") as handle:
+        handle.write(
+            "\n".join(
+                [
+                    "##fileformat=VCFv4.2",
+                    "##contig=<ID=1>",
+                    "##INFO=<ID=AF,Number=A,Type=Float,Description=\"Allele frequency\">",
+                    "##FORMAT=<ID=GT,Number=1,Type=String,Description=\"Genotype\">",
+                    "#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\ts2\ts1",
+                    "1\t100\trs1\tA\tC\t50\tPASS\tAF=0.25\tGT\t0/1\t1/1",
+                    "",
+                ]
+            )
+        )
+
+    sample_table_path = tmp_path / "samples.tsv"
+    _write_table(
+        sample_table_path,
+        header=("sample_id", "target", "age"),
+        rows=(
+            ("s1", "1", "42"),
+            ("s2", "0", "35"),
+        ),
+    )
+
+    dataset = load_dataset_from_files(
+        genotype_path=vcf_path,
+        genotype_format="vcf",
+        sample_table_path=sample_table_path,
+        sample_id_column="sample_id",
+        target_column="target",
+        covariate_columns=("age",),
+    )
+
+    assert dataset.sample_ids == ["s1", "s2"]
     np.testing.assert_allclose(dataset.genotypes, np.array([[2.0], [1.0]], dtype=np.float32))
 
 

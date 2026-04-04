@@ -68,4 +68,4 @@ uv run python -c "import cupy as cp; print('cupy_devices', cp.cuda.runtime.getDe
 
 ## Data
 
-SV VCFs are sharded by chromosome under `${CDR_STORAGE_PATH}/wgs/short_read/structural_variants/vcf/full/`. Ancestry predictions with PCs are at `${CDR_STORAGE_PATH}/wgs/short_read/auxiliary/ancestry/ancestry_preds.tsv`. The `run-all-of-us` command handles all downloads automatically.
+SV VCFs are sharded by chromosome under `${CDR_STORAGE_PATH}/wgs/short_read/structural_variants/vcf/full/`. Ancestry predictions with PCs are at `${CDR_STORAGE_PATH}/wgs/short_read/snpindel/aux/ancestry/ancestry_preds.tsv`. The `run-all-of-us` command handles all downloads automatically.

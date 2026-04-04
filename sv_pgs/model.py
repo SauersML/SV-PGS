@@ -106,6 +106,7 @@ class BayesianPGS:
             variant_records=normalized_records,
             support_counts=variant_stats.support_counts if variant_stats is not None else _compute_support_counts(raw_genotype_matrix, normalized_records, self.config),
             config=self.config,
+            marginal_scores=None if variant_stats is None else variant_stats.marginal_scores,
         )
         log(f"active variants: {len(active_variant_indices)} / {len(normalized_records)} ({100.0*len(active_variant_indices)/max(len(normalized_records),1):.1f}%)")
         active_records = [normalized_records[int(variant_index)] for variant_index in active_variant_indices]
@@ -212,8 +213,18 @@ class BayesianPGS:
         Only reads variants with non-zero coefficients (typically <1% of all variants),
         making prediction fast even on huge genotype files.
         """
+        genotype_component, covariate_component = self.decision_components(genotypes, covariates)
+        return genotype_component + covariate_component
+
+    def decision_components(
+        self,
+        genotypes: RawGenotypeMatrix | np.ndarray,
+        covariates: np.ndarray,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """Return the separate genetic and covariate contributions to the predictor."""
         fitted_state = self._require_state()
         covariate_matrix = self._with_intercept(np.asarray(covariates, dtype=np.float32))
+        covariate_component = np.asarray(covariate_matrix @ fitted_state.fit_result.alpha, dtype=np.float32)
 
         # Only read variants with non-zero coefficients (skip 99%+ of the file)
         nonzero_indices = fitted_state.nonzero_coefficient_indices
@@ -221,7 +232,7 @@ class BayesianPGS:
         log(f"decision_function: {genotypes.shape[0]} samples, {len(nonzero_indices)} non-zero coefficients (of {len(fitted_state.full_coefficients)} total)  mem={mem()}")
 
         if len(nonzero_indices) == 0:
-            return np.asarray(covariate_matrix @ fitted_state.fit_result.alpha, dtype=np.float32)
+            return np.zeros(genotypes.shape[0], dtype=np.float32), covariate_component
 
         raw_genotypes = as_raw_genotype_matrix(genotypes)
         genotype_component = _raw_standardized_subset_matvec(
@@ -233,7 +244,7 @@ class BayesianPGS:
             batch_size=auto_batch_size(raw_genotypes.shape[0]),
         )
         log(f"  decision_function done  mem={mem()}")
-        return genotype_component + covariate_matrix @ fitted_state.fit_result.alpha
+        return np.asarray(genotype_component, dtype=np.float32), covariate_component
 
     def predict_proba(self, genotypes: RawGenotypeMatrix | np.ndarray, covariates: np.ndarray) -> np.ndarray:
         """For binary traits: convert the linear predictor to probabilities via sigmoid.
@@ -461,6 +472,7 @@ def _training_records(
                 training_support=training_supports[variant_index],
                 is_repeat=record.is_repeat,
                 is_copy_number=record.is_copy_number,
+                prior_continuous_features=dict(record.prior_continuous_features),
                 prior_class_members=record.prior_class_members,
                 prior_class_membership=record.prior_class_membership,
             )
@@ -490,6 +502,7 @@ def _training_records_from_stats(
                 training_support=support,
                 is_repeat=record.is_repeat,
                 is_copy_number=record.is_copy_number,
+                prior_continuous_features=dict(record.prior_continuous_features),
                 prior_class_members=record.prior_class_members,
                 prior_class_membership=record.prior_class_membership,
             )

@@ -8,7 +8,14 @@ import numpy as np
 from sv_pgs.config import VariantClass
 
 
-RESERVED_PRIOR_CONTINUOUS_FEATURE_NAMES = frozenset({"log_length"})
+RESERVED_PRIOR_CONTINUOUS_FEATURE_NAMES = frozenset(
+    {
+        "log_length",
+        "logit_allele_frequency",
+        "quality",
+        "log_training_support",
+    }
+)
 
 
 @dataclass(slots=True)

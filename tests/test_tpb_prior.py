@@ -94,14 +94,16 @@ class TestMetadataScaleModel:
         assert config.type_offset_penalty > 0.0
 
 
-    def test_quality_and_allele_frequency_do_not_enter_scale_design(self):
+    def test_quality_allele_frequency_and_support_enter_scale_design(self):
         records = [
             VariantRecord("sv_a", VariantClass.DELETION_SHORT, "chr1", 100, quality=0.95, allele_frequency=0.20),
-            VariantRecord("sv_b", VariantClass.DELETION_SHORT, "chr1", 101, quality=0.50, allele_frequency=0.05),
+            VariantRecord("sv_b", VariantClass.DELETION_SHORT, "chr1", 101, quality=0.50, allele_frequency=0.05, training_support=8),
+            VariantRecord("sv_c", VariantClass.DELETION_SHORT, "chr1", 102, quality=0.25, allele_frequency=0.01, training_support=3),
         ]
         prior_design = _build_prior_design(records)
-        assert all("quality" not in feature_name for feature_name in prior_design.feature_names)
-        assert all("allele_frequency" not in feature_name for feature_name in prior_design.feature_names)
+        assert "continuous_linear::quality::deletion_short" in prior_design.feature_names
+        assert "continuous_linear::logit_allele_frequency::deletion_short" in prior_design.feature_names
+        assert "continuous_linear::log_training_support::deletion_short" in prior_design.feature_names
 
     def test_structural_annotations_still_affect_prior_scale(self):
         records = [

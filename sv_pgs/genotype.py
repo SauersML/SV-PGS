@@ -10,13 +10,13 @@ import sv_pgs._jax  # noqa: F401
 import jax
 import jax.numpy as jnp
 import numpy as np
-from bed_reader import open_bed
 from sv_pgs._jax import gpu_compute_jax_dtype, gpu_compute_numpy_dtype
+from sv_pgs.plink import open_bed
 from sv_pgs.progress import log, mem
 
 DEFAULT_GENOTYPE_BATCH_SIZE = 1024  # fallback when sample count is unknown
 
-# Memory cap per bed_reader batch.  PLINK .bed files store genotypes on disk
+# Memory cap per PLINK batch. PLINK .bed files store genotypes on disk
 # as 2 bits per sample, but we expand to int8 or float32 in memory.  The JAX
 # screening kernels also create float32 intermediates (~10 bytes/element peak).
 # This budget ensures each batch fits comfortably in GPU/CPU memory:
@@ -255,9 +255,7 @@ class PlinkRawGenotypeMatrix(RawGenotypeMatrix):
 
     def _bed_reader(self) -> Any:
         if self._reader is None:
-            if open_bed is None:
-                raise ModuleNotFoundError("bed_reader is required to read PLINK .bed files.")
-            log(f"    opening bed_reader (lazy, no metadata): iid_count={self.total_sample_count} sid_count={self.variant_count}  mem={mem()}")
+            log(f"    opening PLINK reader (lazy, no metadata): iid_count={self.total_sample_count} sid_count={self.variant_count}  mem={mem()}")
             self._reader = open_bed(
                 self.bed_path,
                 iid_count=self.total_sample_count,
@@ -266,8 +264,63 @@ class PlinkRawGenotypeMatrix(RawGenotypeMatrix):
                 skip_format_check=True,
                 num_threads=None,
             )
-            log(f"    bed_reader opened  mem={mem()}")
+            log(f"    PLINK reader opened  mem={mem()}")
         return self._reader
+
+
+@dataclass(slots=True)
+class ConcatenatedRawGenotypeMatrix(RawGenotypeMatrix):
+    children: tuple[RawGenotypeMatrix, ...]
+    _sample_count: int = field(init=False, repr=False)
+    _variant_offsets: np.ndarray = field(init=False, repr=False)
+
+    def __post_init__(self) -> None:
+        if not self.children:
+            raise ValueError("children cannot be empty.")
+        self._sample_count = int(self.children[0].shape[0])
+        variant_offsets = [0]
+        for child in self.children:
+            if int(child.shape[0]) != self._sample_count:
+                raise ValueError("all concatenated genotype matrices must have the same sample count.")
+            variant_offsets.append(variant_offsets[-1] + int(child.shape[1]))
+        self._variant_offsets = np.asarray(variant_offsets, dtype=np.int64)
+
+    @property
+    def shape(self) -> tuple[int, int]:
+        return self._sample_count, int(self._variant_offsets[-1])
+
+    def iter_column_batches(
+        self,
+        variant_indices: Sequence[int] | np.ndarray | None = None,
+        batch_size: int = DEFAULT_GENOTYPE_BATCH_SIZE,
+    ) -> Iterator[RawGenotypeBatch]:
+        resolved_indices = _resolve_variant_indices(self.shape[1], variant_indices)
+        safe_batch_size = max(int(batch_size), 1)
+        for start_index in range(0, resolved_indices.shape[0], safe_batch_size):
+            batch_indices = resolved_indices[start_index : start_index + safe_batch_size]
+            child_ids = np.searchsorted(self._variant_offsets[1:], batch_indices, side="right")
+            batch_values = np.empty((self.shape[0], batch_indices.shape[0]), dtype=np.float32)
+            for child_index in np.unique(child_ids):
+                child_positions = np.nonzero(child_ids == child_index)[0]
+                child_variant_indices = batch_indices[child_positions] - int(self._variant_offsets[child_index])
+                batch_values[:, child_positions] = self.children[int(child_index)].materialize(child_variant_indices)
+            yield RawGenotypeBatch(
+                variant_indices=batch_indices,
+                values=batch_values,
+            )
+
+    def materialize(
+        self,
+        variant_indices: Sequence[int] | np.ndarray | None = None,
+    ) -> np.ndarray:
+        resolved_indices = _resolve_variant_indices(self.shape[1], variant_indices)
+        child_ids = np.searchsorted(self._variant_offsets[1:], resolved_indices, side="right")
+        matrix = np.empty((self.shape[0], resolved_indices.shape[0]), dtype=np.float32)
+        for child_index in np.unique(child_ids):
+            child_positions = np.nonzero(child_ids == child_index)[0]
+            child_variant_indices = resolved_indices[child_positions] - int(self._variant_offsets[child_index])
+            matrix[:, child_positions] = self.children[int(child_index)].materialize(child_variant_indices)
+        return matrix
 
 
 def _try_import_cupy():
@@ -576,7 +629,7 @@ def _effective_bed_reader_batch_size(
 
 
 # Optimization: if the requested variant indices are consecutive (e.g. [5,6,7,8]),
-# convert to a slice (5:9) which bed_reader can read much faster (sequential disk I/O)
+# convert to a slice (5:9) which the PLINK reader can read much faster (sequential disk I/O)
 # than random-access indexing.  Falls back to an index array for non-contiguous indices.
 def _contiguous_index_or_slice(indices: np.ndarray) -> slice | np.ndarray:
     resolved_indices = np.asarray(indices, dtype=np.intp)

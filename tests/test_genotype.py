@@ -4,7 +4,7 @@ import numpy as np
 import pytest
 
 import sv_pgs.genotype as genotype_module
-from sv_pgs.genotype import RawGenotypeBatch, RawGenotypeMatrix, as_raw_genotype_matrix
+from sv_pgs.genotype import ConcatenatedRawGenotypeMatrix, RawGenotypeBatch, RawGenotypeMatrix, as_raw_genotype_matrix
 
 
 class _StreamingRawGenotypeMatrix(RawGenotypeMatrix):
@@ -186,3 +186,59 @@ def test_subset_after_releasing_raw_storage_keeps_materialized_shape():
 
     assert subset.shape == (3, 2)
     np.testing.assert_allclose(subset.materialize(), raw_matrix[:, [1, 3]])
+
+
+def test_concatenated_raw_genotype_matrix_preserves_column_order_and_values():
+    left = _StreamingRawGenotypeMatrix(
+        np.array(
+            [
+                [0.0, 1.0],
+                [2.0, 3.0],
+            ],
+            dtype=np.float32,
+        )
+    )
+    right = _StreamingRawGenotypeMatrix(
+        np.array(
+            [
+                [4.0, 5.0, 6.0],
+                [7.0, 8.0, 9.0],
+            ],
+            dtype=np.float32,
+        )
+    )
+    concatenated = ConcatenatedRawGenotypeMatrix((left, right))
+
+    np.testing.assert_allclose(
+        concatenated.materialize(),
+        np.array(
+            [
+                [0.0, 1.0, 4.0, 5.0, 6.0],
+                [2.0, 3.0, 7.0, 8.0, 9.0],
+            ],
+            dtype=np.float32,
+        ),
+    )
+    np.testing.assert_allclose(
+        concatenated.materialize(np.array([4, 1, 3], dtype=np.int32)),
+        np.array(
+            [
+                [6.0, 1.0, 5.0],
+                [9.0, 3.0, 8.0],
+            ],
+            dtype=np.float32,
+        ),
+    )
+
+    batches = list(concatenated.iter_column_batches(np.array([4, 1, 3], dtype=np.int32), batch_size=2))
+    assert [batch.variant_indices.tolist() for batch in batches] == [[4, 1], [3]]
+    np.testing.assert_allclose(
+        batches[0].values,
+        np.array(
+            [
+                [6.0, 1.0],
+                [9.0, 3.0],
+            ],
+            dtype=np.float32,
+        ),
+    )
