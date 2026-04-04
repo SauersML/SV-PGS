@@ -1130,22 +1130,30 @@ def _restricted_posterior_state(
                 from cupyx.scipy.linalg import solve_triangular as cp_solve_triangular
                 X_gpu = genotype_matrix._cupy_cache  # (n, p) float32 on GPU
                 # Apply projector on GPU: P = D^{-1} - D^{-1} C (C^T D^{-1} C)^{-1} C^T D^{-1}
-                # Do X^T @ P @ X and X^T @ P @ targets entirely on GPU, only download p×p result.
+                # Do not materialize projected_X (another n x p matrix); on a T4 that
+                # blows VRAM. Use:
+                #   X^T P X = X^T D^{-1} X - (X^T D^{-1} C) A^{-1} (C^T D^{-1} X)
+                # where A = C^T D^{-1} C.
                 inv_d_cp = cp.asarray(inverse_diagonal_noise, dtype=cp.float32)
                 cov_cp = cp.asarray(covariate_matrix, dtype=cp.float32)
-                # Weighted X: D^{-1} X
-                weighted_X = inv_d_cp[:, None] * X_gpu  # (n, p) float32
-                # Correction: C @ solve(C^T D^{-1} C, C^T @ weighted_X)
-                CtWX = (cov_cp.T @ weighted_X).get().astype(np.float64)  # (k, p) — small download
+                chunk = 256
+                xtdxc_gpu = cp.empty((variant_count, cov_cp.shape[1]), dtype=cp.float32)
+                xtdx_gpu = cp.empty((variant_count, variant_count), dtype=cp.float32)
+                for start in range(0, variant_count, chunk):
+                    end = min(start + chunk, variant_count)
+                    weighted_chunk = inv_d_cp[:, None] * X_gpu[:, start:end]
+                    xtdxc_gpu[start:end, :] = weighted_chunk.T @ cov_cp
+                    xtdx_gpu[:, start:end] = X_gpu.T @ weighted_chunk
+                CtWX = xtdxc_gpu.T.get().astype(np.float64)  # (k, p)
                 correction_coeff = _cholesky_solve(covariate_precision_cholesky, CtWX)
-                projected_X = weighted_X - inv_d_cp[:, None] * (cov_cp @ cp.asarray(correction_coeff, dtype=cp.float32))
                 projected_targets_np = apply_projector(targets)
                 variant_rhs_cp = cp.asarray(
                     np.asarray(genotype_matrix.transpose_matvec(projected_targets_np), dtype=np.float32),
                     dtype=cp.float32,
                 )
                 if use_gpu_exact_variant:
-                    variant_precision_gpu = X_gpu.T @ projected_X
+                    correction_gpu = xtdxc_gpu @ cp.asarray(correction_coeff, dtype=cp.float32)
+                    variant_precision_gpu = xtdx_gpu - correction_gpu
                     variant_precision_gpu += cp.diag(cp.asarray(prior_precision, dtype=cp.float32))
                     variant_precision_gpu = (variant_precision_gpu + variant_precision_gpu.T) * 0.5
                     variant_precision_gpu += cp.eye(variant_count, dtype=cp.float32) * 1e-4
@@ -1174,11 +1182,12 @@ def _restricted_posterior_state(
                         else 0.0
                     )
                     genetic_linear_predictor = np.asarray(genotype_matrix.matvec(beta), dtype=np.float64)
-                    del weighted_X, projected_X, variant_precision_gpu, variant_precision_cholesky_gpu, variant_rhs_cp
+                    del correction_gpu, xtdxc_gpu, xtdx_gpu, variant_precision_gpu, variant_precision_cholesky_gpu, variant_rhs_cp
                 else:
-                    XtPX = np.asarray((X_gpu.T @ projected_X).get(), dtype=np.float64)  # (p, p) download
+                    correction_cpu = CtWX.T @ correction_coeff
+                    XtPX = np.asarray(xtdx_gpu.get(), dtype=np.float64) - correction_cpu
                     variant_rhs = np.asarray(variant_rhs_cp.get(), dtype=np.float64)
-                    del weighted_X, projected_X, variant_rhs_cp
+                    del xtdxc_gpu, xtdx_gpu, variant_rhs_cp
             else:
                 dense_genotypes = np.asarray(genotype_matrix.materialize(batch_size=posterior_variance_batch_size), dtype=np.float64)
                 projected_genotypes = apply_projector(dense_genotypes)
