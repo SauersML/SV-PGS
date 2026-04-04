@@ -952,22 +952,20 @@ def _restricted_variant_space_diagonal_preconditioner(
         import cupy as cp
         X = genotype_matrix._cupy_cache  # (n, p) float32 on GPU
         inv_d = cp.asarray(inverse_diagonal_noise, dtype=cp.float32)
-        # diag(X^T @ D^{-1} @ X) = sum(X^2 * inv_d[:, None], axis=0)
-        # Chunked by samples to avoid (n, p) intermediate.
+        cov_gpu = cp.asarray(covariate_matrix, dtype=cp.float32)  # (n, k) — tiny
+        # Compute diag(X^T D^{-1} X) and X^T D^{-1} C entirely on GPU.
+        # Only download small results: (p,) diagonal and (p, k) cross-term.
         raw_diag = cp.zeros(X.shape[1], dtype=cp.float32)
+        weighted_Xt_gpu = cp.empty((X.shape[1], cov_gpu.shape[1]), dtype=cp.float32)
         chunk = max(1, min(512, X.shape[1]))
         for start in range(0, X.shape[1], chunk):
             end = min(start + chunk, X.shape[1])
-            raw_diag[start:end] = cp.sum(X[:, start:end] ** 2 * inv_d[:, None], axis=0)
+            weighted_chunk = X[:, start:end] * inv_d[:, None]  # (n, chunk) on GPU
+            raw_diag[start:end] = cp.sum(X[:, start:end] * weighted_chunk, axis=0)
+            weighted_Xt_gpu[start:end, :] = weighted_chunk.T @ cov_gpu  # (chunk, k) on GPU
+        # Download only the small results: (p,) + (p, k) ≈ 120 KB
         raw_diag_np = raw_diag.get().astype(np.float64)
-        # Correction term: small (k × p) — safe on CPU
-        # weighted_X columns needed: X^T @ diag(inv_d) done in chunks
-        weighted_Xt = np.empty((X.shape[1], covariate_matrix.shape[1]), dtype=np.float64)
-        for start in range(0, X.shape[1], chunk):
-            end = min(start + chunk, X.shape[1])
-            w_chunk = (X[:, start:end] * inv_d[:, None]).get().astype(np.float64)
-            weighted_Xt[start:end, :] = w_chunk.T @ covariate_matrix
-        cross = weighted_Xt.T  # (k, p)
+        cross = weighted_Xt_gpu.get().astype(np.float64).T  # (k, p)
         correction = _cholesky_solve(covariate_precision_cholesky, cross)
         diag_correction = np.sum(cross * correction, axis=0)
         return np.maximum(prior_precision + raw_diag_np - diag_correction, 1e-8)
@@ -1099,11 +1097,21 @@ def _restricted_posterior_state(
             if genotype_matrix._cupy_cache is not None:
                 import cupy as cp
                 X_gpu = genotype_matrix._cupy_cache  # (n, p) float32 on GPU
+                # Apply projector on GPU: P = D^{-1} - D^{-1} C (C^T D^{-1} C)^{-1} C^T D^{-1}
+                # Do X^T @ P @ X and X^T @ P @ targets entirely on GPU, only download p×p result.
+                inv_d_cp = cp.asarray(inverse_diagonal_noise, dtype=cp.float32)
+                cov_cp = cp.asarray(covariate_matrix, dtype=cp.float32)
+                # Weighted X: D^{-1} X
+                weighted_X = inv_d_cp[:, None] * X_gpu  # (n, p) float32
+                # Correction: C @ solve(C^T D^{-1} C, C^T @ weighted_X)
+                CtWX = (cov_cp.T @ weighted_X).get().astype(np.float64)  # (k, p) — small download
+                correction_coeff = _cholesky_solve(covariate_precision_cholesky, CtWX)
+                projected_X = weighted_X - inv_d_cp[:, None] * (cov_cp @ cp.asarray(correction_coeff, dtype=cp.float32))
+                XtPX = np.asarray((X_gpu.T @ projected_X).get(), dtype=np.float64)  # (p, p) download
+                # X^T @ P @ targets
                 projected_targets_np = apply_projector(targets)
-                # X^T @ projector @ X on GPU (result is p×p, small enough for CPU)
-                projected_genotypes_gpu = cp.asarray(apply_projector(cp.asnumpy(X_gpu).astype(np.float64)), dtype=cp.float64)
-                XtPX = np.asarray((X_gpu.astype(cp.float64).T @ projected_genotypes_gpu).get(), dtype=np.float64)
-                variant_rhs = np.asarray((X_gpu.astype(cp.float64).T @ cp.asarray(projected_targets_np, dtype=cp.float64)).get(), dtype=np.float64)
+                variant_rhs = np.asarray(genotype_matrix.transpose_matvec(projected_targets_np), dtype=np.float64)
+                del weighted_X, projected_X
             else:
                 dense_genotypes = np.asarray(genotype_matrix.materialize(batch_size=posterior_variance_batch_size), dtype=np.float64)
                 projected_genotypes = apply_projector(dense_genotypes)
