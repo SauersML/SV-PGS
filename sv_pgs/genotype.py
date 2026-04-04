@@ -286,7 +286,9 @@ def _as_gpu_compute_jax(array) -> jnp.ndarray:
 
 
 def _cupy_to_jax(array) -> jnp.ndarray:
-    return jax.dlpack.from_dlpack(array.__dlpack__()).astype(gpu_compute_jax_dtype())
+    """Convert CuPy array to JAX float64. The matmul runs in float32 on GPU for
+    speed, but results must be float64 for the CG solver's numerical stability."""
+    return jax.dlpack.from_dlpack(array.__dlpack__()).astype(jnp.float64)
 
 
 def _to_cupy_float32(array):
