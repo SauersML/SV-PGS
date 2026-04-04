@@ -3,7 +3,6 @@ from __future__ import annotations
 
 import os
 import subprocess
-import shutil
 from pathlib import Path
 
 import numpy as np
@@ -47,14 +46,60 @@ def sv_vcf_name(chromosome: int) -> str:
 # gsutil helpers
 # ---------------------------------------------------------------------------
 
+def _check_disk_space(path: Path, required_bytes: int) -> None:
+    """Raise if the filesystem doesn't have enough free space."""
+    import shutil
+    stat = shutil.disk_usage(str(path))
+    if stat.free < required_bytes:
+        free_gb = stat.free / 1e9
+        need_gb = required_bytes / 1e9
+        raise RuntimeError(
+            f"Not enough disk space: {free_gb:.1f} GB free, need {need_gb:.1f} GB "
+            f"at {path}"
+        )
+
+
 def _gsutil_cp(src: str, dst: str) -> None:
-    cmd = ["gsutil", "-u", _google_project(), "cp", src, dst]
-    log(f"  gsutil cp {src} -> {dst}")
-    subprocess.run(cmd, check=True)
+    """Download with gsutil, showing real-time progress via -m flag."""
+    cmd = ["gsutil", "-u", _google_project(), "-m", "cp", src, dst]
+    log(f"  downloading {src}")
+    # Stream output in real time so user sees progress
+    process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+    for line in process.stdout:
+        stripped = line.strip()
+        if stripped:
+            log(f"    {stripped}")
+    process.wait()
+    if process.returncode != 0:
+        raise RuntimeError(f"gsutil cp failed (exit {process.returncode}): {src}")
+
+
+def _estimate_download_bytes(chromosomes: list[int]) -> int:
+    """Rough estimate: chr22 is ~1 GB, chr1 is ~10 GB. Total genome ~50 GB."""
+    # Approximate VCF sizes per chromosome (compressed, in bytes)
+    # Based on typical AoU SV VCF sizes
+    CHR_SIZES_GB = {
+        1: 10, 2: 9, 3: 7, 4: 6, 5: 6, 6: 6, 7: 5, 8: 5, 9: 4, 10: 5,
+        11: 5, 12: 5, 13: 3, 14: 3, 15: 3, 16: 3, 17: 3, 18: 3, 19: 2,
+        20: 2, 21: 1, 22: 1,
+    }
+    total = sum(CHR_SIZES_GB.get(c, 3) for c in chromosomes)
+    return int(total * 1.2 * 1e9)  # 20% margin for .tbi + temp files
 
 
 def download_sv_vcfs(chromosomes: list[int], work_dir: Path) -> dict[int, Path]:
     """Download SV VCFs for the requested chromosomes. Returns {chr: local_path}."""
+    # Check disk space upfront
+    needed = _estimate_download_bytes(chromosomes)
+    to_download = []
+    for chrom in chromosomes:
+        local_vcf = work_dir / sv_vcf_name(chrom)
+        if not local_vcf.exists():
+            to_download.append(chrom)
+    if to_download:
+        _check_disk_space(work_dir, needed)
+        log(f"  need to download {len(to_download)} VCFs (~{needed/1e9:.0f} GB), disk OK")
+
     vcf_paths: dict[int, Path] = {}
     remote_dir = sv_vcf_dir()
     for chrom in chromosomes:
@@ -62,9 +107,9 @@ def download_sv_vcfs(chromosomes: list[int], work_dir: Path) -> dict[int, Path]:
         local_vcf = work_dir / name
         local_tbi = work_dir / f"{name}.tbi"
         if local_vcf.exists():
-            log(f"  chr{chrom}: already present ({local_vcf})")
+            log(f"  chr{chrom}: already present")
         else:
-            log(f"  chr{chrom}: downloading...")
+            log(f"  chr{chrom}: downloading VCF + index...")
             _gsutil_cp(f"{remote_dir}/{name}", str(local_vcf))
             _gsutil_cp(f"{remote_dir}/{name}.tbi", str(local_tbi))
         vcf_paths[chrom] = local_vcf
@@ -79,9 +124,9 @@ def download_ancestry_preds(work_dir: Path) -> Path:
     """Download the AoU ancestry predictions file (contains per-sample PCs)."""
     local = work_dir / "ancestry_preds.tsv"
     if local.exists():
-        log(f"  ancestry_preds.tsv already present")
+        log("  ancestry_preds.tsv already present")
         return local
-    log(f"  downloading ancestry_preds.tsv...")
+    log("  downloading ancestry_preds.tsv...")
     _gsutil_cp(ancestry_preds_path(), str(local))
     return local
 
@@ -135,7 +180,7 @@ def merge_pcs_into_sample_table(
     if "age_at_observation_start" in samples.columns:
         samples["age_at_observation_start"] = pd.to_numeric(samples["age_at_observation_start"], errors="coerce")
         samples["age_squared"] = samples["age_at_observation_start"] ** 2
-        log(f"  added age_squared covariate")
+        log("  added age_squared covariate")
 
     ancestry_subset = ancestry[[id_col] + pc_cols].rename(columns={id_col: "person_id"})
     merged = samples.merge(ancestry_subset, on="person_id", how="left")

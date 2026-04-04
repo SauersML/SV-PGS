@@ -359,12 +359,20 @@ def _build_sample_table(
         if sample_id in seen_sample_ids:
             raise ValueError("Duplicate sample identifier in sample table: " + sample_id)
         seen_sample_ids.add(sample_id)
+        # Parse target and covariates; drop rows with missing values
+        try:
+            target_value = float(row[target_column])
+            covariate_values = [float(row[column_name]) for column_name in covariate_columns]
+        except (ValueError, TypeError):
+            unmatched_rows += 1
+            continue
+        # Drop rows where any value is NaN (e.g. missing PCs after merge)
+        if np.isnan(target_value) or any(np.isnan(v) for v in covariate_values):
+            unmatched_rows += 1
+            continue
         sample_ids.append(sample_id)
-        targets.append(_parse_float(row[target_column], column_name=target_column))
-        covariates.append([
-            _parse_float(row[column_name], column_name=column_name)
-            for column_name in covariate_columns
-        ])
+        targets.append(target_value)
+        covariates.append(covariate_values)
 
     covariate_matrix = np.asarray(covariates, dtype=np.float32)
     if covariate_matrix.ndim != 2:
