@@ -134,6 +134,30 @@ def download_ancestry_preds(work_dir: Path) -> Path:
     return local
 
 
+def _parse_pca_features_column(series: pd.Series, n_pcs: int) -> tuple[pd.DataFrame, list[str]]:
+    """Parse a compound pca_features column like '[0.01,-0.02,...]' into PC1..PCn."""
+    import json
+    pc_names = [f"PC{i+1}" for i in range(n_pcs)]
+
+    def _parse_row(val: str) -> list[float]:
+        if not isinstance(val, str) or not val.strip():
+            return [float("nan")] * n_pcs
+        cleaned = val.strip()
+        # Handle Hail array format: [0.01, -0.02, ...] or just 0.01,-0.02,...
+        if cleaned.startswith("["):
+            try:
+                values = json.loads(cleaned)
+            except json.JSONDecodeError:
+                return [float("nan")] * n_pcs
+        else:
+            values = [float(x.strip()) for x in cleaned.split(",") if x.strip()]
+        return [values[i] if i < len(values) else float("nan") for i in range(n_pcs)]
+
+    parsed = series.apply(_parse_row)
+    df = pd.DataFrame(parsed.tolist(), columns=pc_names, index=series.index)
+    return df, pc_names
+
+
 def merge_pcs_into_sample_table(
     sample_table_path: Path,
     ancestry_path: Path,
@@ -142,9 +166,8 @@ def merge_pcs_into_sample_table(
 ) -> tuple[Path, list[str]]:
     """Merge top N PCs from ancestry file into the sample table. Returns (output_path, pc_column_names)."""
     if output_path.exists():
-        # Read back the PC column names from the header
         header = pd.read_csv(output_path, sep="\t", nrows=0).columns.tolist()
-        pc_cols = [c for c in header if c.lower().startswith("pc") or c.lower().startswith("pca_")][:n_pcs]
+        pc_cols = [c for c in header if c.startswith("PC") and c[2:].isdigit()][:n_pcs]
         log(f"  merged sample table already exists with {len(pc_cols)} PCs")
         return output_path, pc_cols
 
@@ -153,42 +176,68 @@ def merge_pcs_into_sample_table(
 
     log(f"  loading ancestry predictions: {ancestry_path}")
     ancestry = pd.read_csv(ancestry_path, sep="\t", dtype=str)
+    log(f"  ancestry columns: {list(ancestry.columns)}")
+    log(f"  ancestry rows: {len(ancestry)}, sample rows: {len(samples)}")
 
-    # Find the ID column
+    # Find the ID column in ancestry
     id_col = None
     for candidate in ["research_id", "person_id", "sample_id", "s"]:
         if candidate in ancestry.columns:
             id_col = candidate
             break
     if id_col is None:
-        log(f"  WARNING: no ID column found in ancestry file. Columns: {list(ancestry.columns)[:15]}")
-        samples.to_csv(output_path, sep="\t", index=False)
-        return output_path, []
+        raise RuntimeError(f"No ID column found in ancestry file. Columns: {list(ancestry.columns)}")
 
-    # Find PC columns, sorted numerically
-    pc_cols = sorted(
-        [c for c in ancestry.columns if c.lower().startswith("pc") or c.lower().startswith("pca_")],
-        key=lambda x: int("".join(filter(str.isdigit, x)) or "0"),
-    )[:n_pcs]
-    if not pc_cols:
-        log(f"  WARNING: no PC columns found. Columns: {list(ancestry.columns)[:15]}")
-        samples.to_csv(output_path, sep="\t", index=False)
-        return output_path, []
+    # Extract PCs: either individual columns (PC1, PC2, ...) or a compound pca_features column
+    if "pca_features" in ancestry.columns:
+        log(f"  parsing compound pca_features column into PC1..PC{n_pcs}")
+        pc_df, pc_cols = _parse_pca_features_column(ancestry["pca_features"], n_pcs)
+        for col in pc_cols:
+            ancestry[col] = pc_df[col].values
+    else:
+        pc_cols = sorted(
+            [c for c in ancestry.columns if c.startswith("PC") and c[2:].isdigit()],
+            key=lambda x: int(x[2:]),
+        )[:n_pcs]
+        if not pc_cols:
+            raise RuntimeError(f"No PC columns found in ancestry file. Columns: {list(ancestry.columns)}")
+        for col in pc_cols:
+            ancestry[col] = pd.to_numeric(ancestry[col], errors="coerce")
 
-    log(f"  merging {len(pc_cols)} PCs via {id_col}: {pc_cols}")
-    for col in pc_cols:
-        ancestry[col] = pd.to_numeric(ancestry[col], errors="coerce")
+    log(f"  extracted {len(pc_cols)} PCs: {pc_cols}")
 
-    # Add age^2 if age column exists
+    # Add age^2
     if "age_at_observation_start" in samples.columns:
         samples["age_at_observation_start"] = pd.to_numeric(samples["age_at_observation_start"], errors="coerce")
         samples["age_squared"] = samples["age_at_observation_start"] ** 2
         log("  added age_squared covariate")
 
-    ancestry_subset = ancestry[[id_col] + pc_cols].rename(columns={id_col: "person_id"})
-    merged = samples.merge(ancestry_subset, on="person_id", how="left")
+    # Merge: try person_id first, fall back to sample_id
+    # In AoU controlled tier, person_id = research_id for most cases,
+    # but if they differ we try both join keys.
+    ancestry_subset = ancestry[[id_col] + pc_cols].copy()
+    merge_key = "person_id"
+    ancestry_subset = ancestry_subset.rename(columns={id_col: merge_key})
+    merged = samples.merge(ancestry_subset, on=merge_key, how="left")
     n_with_pcs = int(merged[pc_cols[0]].notna().sum())
+
+    # If merge on person_id gave 0 matches, try merging on sample_id instead
+    if n_with_pcs == 0 and "sample_id" in samples.columns:
+        log(f"  merge on person_id matched 0 rows, trying sample_id...")
+        ancestry_subset2 = ancestry[[id_col] + pc_cols].copy()
+        ancestry_subset2 = ancestry_subset2.rename(columns={id_col: "sample_id"})
+        merged = samples.merge(ancestry_subset2, on="sample_id", how="left", suffixes=("", "_anc"))
+        # Drop duplicate PC columns if any
+        for col in pc_cols:
+            if f"{col}_anc" in merged.columns:
+                merged[col] = merged[f"{col}_anc"]
+                merged.drop(columns=[f"{col}_anc"], inplace=True)
+        n_with_pcs = int(merged[pc_cols[0]].notna().sum())
+
     log(f"  merged: {len(merged)} rows, {n_with_pcs} with PCs ({100*n_with_pcs/max(len(merged),1):.0f}%)")
+    if n_with_pcs == 0:
+        log("  WARNING: 0 samples matched ancestry file. PCs will be empty — check ID column mapping.")
+
     merged.to_csv(output_path, sep="\t", index=False)
     return output_path, pc_cols
 
