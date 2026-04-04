@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import csv
 import json
+import os
 from pathlib import Path
 
 import numpy as np
@@ -15,6 +16,7 @@ from sv_pgs.cli import main
 from sv_pgs.data import VariantStatistics
 from sv_pgs.io import (
     _VariantDefaults,
+    _vcf_cache_key,
     _load_vcf_from_cache,
     _save_vcf_to_cache,
     load_dataset_from_files,
@@ -176,6 +178,32 @@ def test_vcf_cache_save_uses_real_temp_file_and_roundtrips(tmp_path: Path):
     np.testing.assert_array_equal(cached_variant_stats.support_counts, variant_stats.support_counts)
     assert not list((tmp_path / ".sv_pgs_cache").glob("*.tmp"))
     assert not list((tmp_path / ".sv_pgs_cache").glob("*.tmp.npy"))
+
+
+def test_vcf_cache_key_ignores_mtime_for_identical_content(tmp_path: Path):
+    vcf_path = tmp_path / "cohort.vcf.gz"
+    vcf_path.write_bytes(b"header\nbody\ntrailer\n")
+    keep_sample_indices = np.array([0, 2], dtype=np.int32)
+
+    first_key = _vcf_cache_key(vcf_path, keep_sample_indices)
+    original_mtime = vcf_path.stat().st_mtime_ns
+    new_mtime = original_mtime + 1_000_000
+    os.utime(vcf_path, ns=(new_mtime, new_mtime))
+    second_key = _vcf_cache_key(vcf_path, keep_sample_indices)
+
+    assert first_key == second_key
+
+
+def test_vcf_cache_key_changes_when_content_changes(tmp_path: Path):
+    vcf_path = tmp_path / "cohort.vcf.gz"
+    vcf_path.write_bytes(b"header\nbody\ntrailer\n")
+    keep_sample_indices = np.array([0, 2], dtype=np.int32)
+
+    first_key = _vcf_cache_key(vcf_path, keep_sample_indices)
+    vcf_path.write_bytes(b"header\nchanged-body\ntrailer\n")
+    second_key = _vcf_cache_key(vcf_path, keep_sample_indices)
+
+    assert first_key != second_key
 
 
 def test_load_dataset_from_plink_auto_detects_person_id_column(tmp_path: Path):

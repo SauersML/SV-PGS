@@ -452,13 +452,27 @@ _CACHE_DIR_NAME = ".sv_pgs_cache"
 _CACHE_VERSION = 2
 
 
+def _cache_file_fingerprint(path: Path, sample_bytes: int = 1_048_576) -> bytes:
+    """Return a cheap content fingerprint that is stable across re-downloads."""
+    stat = path.stat()
+    h = hashlib.sha256()
+    h.update(f"{stat.st_size}:".encode())
+    with path.open("rb") as handle:
+        head = handle.read(sample_bytes)
+        h.update(head)
+        if stat.st_size > sample_bytes:
+            tail_offset = max(len(head), stat.st_size - sample_bytes)
+            handle.seek(tail_offset)
+            h.update(handle.read(sample_bytes))
+    return h.digest()
+
+
 def _vcf_cache_key(vcf_path: Path, keep_sample_indices: np.ndarray | None) -> str:
     """Compute a hex digest that uniquely identifies a VCF + sample-subset."""
     h = hashlib.sha256()
     h.update(f"v{_CACHE_VERSION}:".encode())
     h.update(str(vcf_path.resolve()).encode())
-    stat = vcf_path.stat()
-    h.update(f"{stat.st_size}:{stat.st_mtime_ns}".encode())
+    h.update(_cache_file_fingerprint(vcf_path))
     if keep_sample_indices is not None:
         h.update(keep_sample_indices.tobytes())
     return h.hexdigest()[:24]
