@@ -161,7 +161,7 @@ def _as_preconditioner(
 #   1. Compute the residual r = b - A @ x (how far off we are)
 #   2. Pick a search direction (conjugate to all previous directions)
 #   3. Take an optimal step along that direction
-#   4. Repeat until ||residual|| < tolerance
+#   4. Repeat until the residual is below a mixed absolute/relative tolerance
 #
 # Each iteration requires one matrix-vector product (A @ direction).
 # Convergence is guaranteed for positive-definite A.
@@ -174,23 +174,28 @@ def _solve_single_rhs(
     preconditioner: Callable[[jnp.ndarray], jnp.ndarray] | None,
 ) -> jnp.ndarray:
     import time
-    from sv_pgs.progress import log, mem
+    import math
+    from sv_pgs.progress import log
     tol_sq = tolerance * tolerance
     solution = jnp.zeros_like(rhs) if initial_guess is None else initial_guess
     residual = rhs - linear_operator.matvec(solution)
     residual_norm_sq_jax = jnp.vdot(residual, residual)
     initial_residual = float(residual_norm_sq_jax)
-    if initial_residual <= tol_sq:
+    rhs_norm_sq = float(jnp.vdot(rhs, rhs))
+    convergence_threshold_sq = max(
+        tol_sq,
+        tol_sq * max(initial_residual, rhs_norm_sq),
+    )
+    if initial_residual <= convergence_threshold_sq:
         return jnp.asarray(solution, dtype=jnp.float64)
     preconditioned_residual = residual if preconditioner is None else preconditioner(residual)
     search_direction = preconditioned_residual
     residual_dot_jax = jnp.vdot(residual, preconditioned_residual)
-    import math
     # Progress is measured in log-space: how far the residual has dropped
     # from initial toward the tolerance.  E.g. if initial=1e0, tol=1e-6,
     # and current=1e-3, we're 50% of the way (3 out of 6 orders of magnitude).
     log_initial = math.log10(max(initial_residual, 1e-30))
-    log_target = math.log10(max(tol_sq, 1e-30))
+    log_target = math.log10(max(convergence_threshold_sq, 1e-30))
     log_range = max(log_initial - log_target, 1e-6)
     t_start = time.monotonic()
     last_log = t_start
@@ -205,19 +210,24 @@ def _solve_single_rhs(
         updated_residual_norm_sq_jax = jnp.vdot(residual, residual)
         updated_residual_dot = float(updated_residual_norm_sq_jax)
         now = time.monotonic()
-        if now - last_log >= 5.0 or updated_residual_dot <= tol_sq:
+        if now - last_log >= 5.0 or updated_residual_dot <= convergence_threshold_sq:
             log_current = math.log10(max(updated_residual_dot, 1e-30))
             pct = min(100.0, max(0.0, 100.0 * (log_initial - log_current) / log_range))
             log(f"      CG iter {_iteration_index+1}/{max_iterations}: {pct:.0f}% converged  residual={updated_residual_dot:.2e}  ({now - t_start:.1f}s)")
             last_log = now
-        if updated_residual_dot <= tol_sq:
+        if updated_residual_dot <= convergence_threshold_sq:
             return jnp.asarray(solution, dtype=jnp.float64)
         updated_preconditioned_residual = residual if preconditioner is None else preconditioner(residual)
         updated_residual_dot_jax = jnp.vdot(residual, updated_preconditioned_residual)
         beta = updated_residual_dot_jax / residual_dot_jax
         search_direction = updated_preconditioned_residual + beta * search_direction
         residual_dot_jax = updated_residual_dot_jax
-    raise RuntimeError("Conjugate-gradient solve failed to converge.")
+    final_residual = float(jnp.vdot(residual, residual))
+    raise RuntimeError(
+        "Conjugate-gradient solve failed to converge: "
+        + f"residual={final_residual:.2e} threshold={convergence_threshold_sq:.2e} "
+        + f"iterations={max_iterations}"
+    )
 
 
 # Build a small tridiagonal matrix that approximates the large operator A.
