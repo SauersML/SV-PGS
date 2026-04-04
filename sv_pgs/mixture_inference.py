@@ -715,14 +715,26 @@ def _binary_posterior_state(
     import time as _time
     stalled_objective_relative_tolerance = 1e-12
     stalled_step_tolerance = max(1e-3, gradient_tolerance * 100.0)
+    cached_terms_parameters: np.ndarray | None = None
+    cached_terms: tuple[float, np.ndarray, np.ndarray, np.ndarray] | None = None
     cached_proposal_base_parameters: np.ndarray | None = None
     cached_proposed_parameters: np.ndarray | None = None
     cached_newton_direction: np.ndarray | None = None
     log(f"      Newton trust-region: {standardized_genotypes.shape[1]} variants, max_iter={max_iterations}, damping={damping:.2e}  mem={mem()}")
     for _iteration_index in range(max_iterations):
         _newton_t0 = _time.monotonic()
-        current_objective, gradient, weights, linear_predictor = penalized_terms(parameters)
-        _t_penalized = _time.monotonic() - _newton_t0
+        if (
+            cached_terms_parameters is not None
+            and cached_terms is not None
+            and np.array_equal(parameters, cached_terms_parameters)
+        ):
+            current_objective, gradient, weights, linear_predictor = cached_terms
+            _t_penalized = 0.0
+        else:
+            current_objective, gradient, weights, linear_predictor = penalized_terms(parameters)
+            cached_terms_parameters = parameters.copy()
+            cached_terms = (current_objective, gradient, weights, linear_predictor)
+            _t_penalized = _time.monotonic() - _newton_t0
         gradient_norm = float(np.linalg.norm(gradient))
         if gradient_norm <= gradient_tolerance:
             log(f"      Newton converged at iter {_iteration_index+1}: grad_norm={gradient_norm:.2e} <= tol={gradient_tolerance:.2e}")
@@ -780,6 +792,13 @@ def _binary_posterior_state(
         accept = np.isfinite(candidate_objective) and actual_gain > 0.0 and gain_ratio >= success_threshold
         if accept:
             parameters = candidate_parameters
+            cached_terms_parameters = candidate_parameters.copy()
+            cached_terms = (
+                candidate_objective,
+                _candidate_gradient,
+                _candidate_weights,
+                _candidate_linear_predictor,
+            )
             cached_proposal_base_parameters = None
             cached_proposed_parameters = None
             cached_newton_direction = None
