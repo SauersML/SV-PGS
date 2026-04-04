@@ -1258,12 +1258,13 @@ def _restricted_posterior_state(
             log(f"      rhs: {_time.monotonic() - _t0:.1f}s  mem={mem()}")
 
             def solve_variant_rhs(right_hand_side: np.ndarray) -> np.ndarray:
+                rhs_array = np.asarray(right_hand_side, dtype=np.float64)
                 return solve_spd_system(
                     variant_operator,
-                    right_hand_side,
+                    rhs_array,
                     tolerance=solver_tolerance,
                     max_iterations=maximum_linear_solver_iterations,
-                    initial_guess=initial_beta_guess,
+                    initial_guess=initial_beta_guess if rhs_array.ndim == 1 else None,
                     preconditioner=variant_preconditioner,
                 )
 

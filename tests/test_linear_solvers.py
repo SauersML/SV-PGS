@@ -54,3 +54,23 @@ def test_solve_spd_system_uses_preconditioner_as_initial_guess():
     )
 
     np.testing.assert_allclose(solution, expected_solution, atol=1e-12)
+
+
+def test_solve_spd_system_rejects_vector_initial_guess_for_matrix_rhs():
+    operator = build_linear_operator(
+        shape=(2, 2),
+        matvec=lambda vector: jnp.asarray(np.asarray(vector, dtype=np.float64), dtype=jnp.float64),
+    )
+    right_hand_side = np.eye(2, dtype=np.float64)
+
+    with np.testing.assert_raises_regex(
+        ValueError,
+        "matrix right_hand_side requires initial_guess with matching column dimension",
+    ):
+        solve_spd_system(
+            operator=operator,
+            right_hand_side=right_hand_side,
+            tolerance=1e-12,
+            max_iterations=1,
+            initial_guess=np.ones(2, dtype=np.float64),
+        )
