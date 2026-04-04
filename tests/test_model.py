@@ -126,10 +126,6 @@ def test_benchmark_suite_runs_from_shared_trainer():
 
 
 def test_tie_group_export_weights_are_proportional_to_member_variances():
-    records = [
-        VariantRecord("variant_0", VariantClass.SNV, "1", 100),
-        VariantRecord("variant_1", VariantClass.SNV, "1", 101),
-    ]
     tie_map = TieMap(
         kept_indices=np.array([0], dtype=np.int32),
         original_to_reduced=np.array([0, 0], dtype=np.int32),

@@ -344,47 +344,35 @@ class StandardizedGenotypeMatrix:
         return int(self.shape[0]) * int(self.shape[1]) * 4
 
     def try_materialize_gpu(self) -> bool:
-        """Materialize the standardized matrix into RAM and optionally onto GPU.
-
-        Uses CuPy (cuBLAS) for GPU matmul if available, bypassing JAX/XLA
-        which has known segfault bugs on Turing GPUs (T4).
-        Falls back to CPU numpy BLAS if CuPy is not available.
-        """
+        """Materialize the standardized matrix onto GPU memory when possible."""
         if self._cupy_cache is not None:
             return True
         cupy = _try_import_cupy()
-        if cupy is not None:
-            try:
-                nbytes = self.dense_bytes()
-                if self._dense_cache is not None:
-                    log(f"    uploading RAM-resident matrix to GPU ({nbytes / 1e9:.1f} GB)  mem={mem()}")
-                    self._cupy_cache = cupy.asarray(self._dense_cache)
-                    dense_ref = self._dense_cache
-                    self._dense_cache = None
-                    del dense_ref
-                else:
-                    log(f"    streaming {self.shape[1]} variants x {self.shape[0]} samples ({nbytes / 1e9:.1f} GB) directly to GPU  mem={mem()}")
-                    gpu_matrix = cupy.empty(self.shape, dtype=cupy.float32, order="C")
-                    for batch in self.iter_column_batches(batch_size=auto_batch_size(self.shape[0])):
-                        gpu_matrix[:, batch.variant_indices] = cupy.asarray(batch.values, dtype=cupy.float32)
-                    self._cupy_cache = gpu_matrix
-                cupy.cuda.Device().synchronize()
-                import gc; gc.collect()
-                log(f"    CuPy GPU matrix ready ({self._cupy_cache.nbytes / 1e9:.1f} GB)  mem={mem()}")
-                return True
-            except Exception as exc:
-                log(f"    CuPy GPU upload failed ({exc}), using CPU numpy BLAS  mem={mem()}")
-        # Materialize into CPU RAM only if GPU upload path is unavailable.
-        if self._dense_cache is None:
+        if cupy is None:
+            return False
+        try:
             nbytes = self.dense_bytes()
-            log(f"    materializing {self.shape[1]} variants x {self.shape[0]} samples ({nbytes / 1e9:.1f} GB) into RAM  mem={mem()}")
-            dense_matrix = np.empty(self.shape, dtype=np.float32)
-            for batch in self.iter_column_batches(batch_size=auto_batch_size(self.shape[0])):
-                dense_matrix[:, batch.variant_indices] = batch.values
-            self._dense_cache = dense_matrix
-            log(f"    RAM-resident matrix ready  mem={mem()}")
-        log(f"    CuPy not available, using CPU numpy BLAS  mem={mem()}")
-        return True
+            if self._dense_cache is not None:
+                log(f"    uploading RAM-resident matrix to GPU ({nbytes / 1e9:.1f} GB)  mem={mem()}")
+                self._cupy_cache = cupy.asarray(self._dense_cache)
+                dense_ref = self._dense_cache
+                self._dense_cache = None
+                del dense_ref
+            else:
+                log(f"    streaming {self.shape[1]} variants x {self.shape[0]} samples ({nbytes / 1e9:.1f} GB) directly to GPU  mem={mem()}")
+                gpu_matrix = cupy.empty(self.shape, dtype=cupy.float32, order="C")
+                for batch in self.iter_column_batches(batch_size=auto_batch_size(self.shape[0])):
+                    gpu_matrix[:, batch.variant_indices] = cupy.asarray(batch.values, dtype=cupy.float32)
+                self._cupy_cache = gpu_matrix
+            cupy.cuda.Device().synchronize()
+            import gc
+            gc.collect()
+            log(f"    CuPy GPU matrix ready ({self._cupy_cache.nbytes / 1e9:.1f} GB)  mem={mem()}")
+            return True
+        except Exception as exc:
+            log(f"    CuPy GPU upload failed ({exc})  mem={mem()}")
+            self._cupy_cache = None
+            return False
 
     def try_materialize(self) -> bool:
         """Materialize into RAM if below the auto-materialize threshold.

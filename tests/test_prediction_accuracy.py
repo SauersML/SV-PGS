@@ -16,7 +16,7 @@ from __future__ import annotations
 import numpy as np
 from sklearn.metrics import r2_score, roc_auc_score
 
-from sv_pgs.config import BenchmarkConfig, ModelConfig, TraitType, VariantClass
+from sv_pgs.config import ModelConfig, TraitType, VariantClass
 from sv_pgs.data import VariantRecord
 from sv_pgs.model import BayesianPGS
 

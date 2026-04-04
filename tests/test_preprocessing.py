@@ -1,5 +1,4 @@
 import numpy as np
-import pytest
 
 from sv_pgs.config import ModelConfig, VariantClass
 from sv_pgs.data import VariantRecord

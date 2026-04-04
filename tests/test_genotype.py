@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import numpy as np
+import pytest
 
+import sv_pgs.genotype as genotype_module
 from sv_pgs.genotype import RawGenotypeBatch, RawGenotypeMatrix, as_raw_genotype_matrix
 
 
@@ -155,3 +157,17 @@ def test_standardized_streaming_batches_delegate_to_raw_batch_iterator():
     assert [batch.variant_indices.tolist() for batch in batches] == [[0, 1], [2]]
     assert raw.iter_requests == [[1, 3, 4]]
     assert raw.materialize_requests == []
+
+
+def test_try_materialize_gpu_does_not_force_cpu_dense_fallback(monkeypatch: pytest.MonkeyPatch):
+    raw_matrix = np.arange(24, dtype=np.float32).reshape(4, 6)
+    standardized = as_raw_genotype_matrix(raw_matrix).standardized(
+        means=np.zeros(raw_matrix.shape[1], dtype=np.float32),
+        scales=np.ones(raw_matrix.shape[1], dtype=np.float32),
+    )
+
+    monkeypatch.setattr(genotype_module, "_try_import_cupy", lambda: None)
+
+    assert standardized.try_materialize_gpu() is False
+    assert standardized._cupy_cache is None
+    assert standardized._dense_cache is None

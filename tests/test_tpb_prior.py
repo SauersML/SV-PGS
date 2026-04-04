@@ -14,7 +14,6 @@ from sv_pgs.config import (
     DEFAULT_CLASS_TPB_SHAPE_A,
     DEFAULT_CLASS_TPB_SHAPE_B,
     ModelConfig,
-    TraitType,
     VariantClass,
 )
 from sv_pgs.data import VariantRecord

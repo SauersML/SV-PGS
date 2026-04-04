@@ -153,7 +153,8 @@ class BayesianPGS:
         # After materialization, reduced_genotypes no longer needs raw.
         reduced_genotypes.raw = None  # type: ignore[assignment]
         del raw_genotype_matrix, standardized_genotypes, active_genotypes
-        import gc; gc.collect()
+        import gc
+        gc.collect()
         log(f"memory freed after materialization  mem={mem()}")
         log(
             f"starting variational EM  max_iterations={self.config.max_outer_iterations}  "

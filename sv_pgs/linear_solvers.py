@@ -196,7 +196,29 @@ def _as_preconditioner(
     if preconditioner is None:
         return None
     if callable(preconditioner):
-        return lambda vector: jnp.asarray(preconditioner(vector), dtype=solver_dtype)
+        def apply_callable(vector: jnp.ndarray) -> jnp.ndarray:
+            array = jnp.asarray(vector, dtype=solver_dtype)
+            if array.ndim == 1:
+                result = jnp.asarray(preconditioner(array), dtype=solver_dtype)
+                if result.shape != array.shape:
+                    raise ValueError("callable preconditioner must preserve vector shape.")
+                return result
+            if array.ndim != 2:
+                raise ValueError("preconditioner input must be a vector or matrix.")
+            try:
+                result = jnp.asarray(preconditioner(array), dtype=solver_dtype)
+            except Exception:
+                result = None
+            if result is not None and result.shape == array.shape:
+                return result
+            return jnp.column_stack(
+                [
+                    jnp.asarray(preconditioner(array[:, column_index]), dtype=solver_dtype)
+                    for column_index in range(array.shape[1])
+                ]
+            )
+
+        return apply_callable
     diagonal = jnp.asarray(preconditioner, dtype=solver_dtype)
     if diagonal.ndim != 1:
         raise ValueError("array preconditioner must be a diagonal vector.")
@@ -330,7 +352,6 @@ def _solve_multiple_rhs(
     preconditioner: Callable[[jnp.ndarray], jnp.ndarray] | None,
 ) -> jnp.ndarray:
     import time
-    import math
     from sv_pgs.progress import log
 
     residual_refresh_interval = 32

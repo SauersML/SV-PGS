@@ -71,12 +71,12 @@ if turing_workarounds_enabled():
             _xla_flags = f"{_xla_flags} {flag}".strip()
     os.environ["XLA_FLAGS"] = _xla_flags
 
-from jax import config as jax_config
+from jax import config as jax_config  # noqa: E402
 
 # Enable 64-bit precision (required for Bayesian inference numerics).
 jax_config.update("jax_enable_x64", True)
 
-import jax.numpy as jnp
+import jax.numpy as jnp  # noqa: E402
 
 
 def _cupy_runtime_status() -> tuple[bool, str]:
@@ -125,6 +125,10 @@ def require_full_gpu_runtime() -> None:
         problems.append(cupy_status)
     if not problems:
         return
+    device_descriptions = [
+        f"{device.platform}:{getattr(device, 'device_kind', 'unknown')}"
+        for device in devices
+    ]
     raise RuntimeError(
         "SV-PGS now requires a real CUDA runtime for full-GPU execution. "
         + "Current status: "
@@ -132,7 +136,7 @@ def require_full_gpu_runtime() -> None:
             [
                 f"jax={jax.__version__}",
                 f"jaxlib={jaxlib.__version__}",
-                f"devices={[f'{device.platform}:{getattr(device, 'device_kind', 'unknown')}' for device in devices]}",
+                f"devices={device_descriptions}",
                 cupy_status,
                 f"turing_workarounds={'on' if turing_workarounds_enabled() else 'off'}",
             ]

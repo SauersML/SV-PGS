@@ -103,6 +103,32 @@ def test_solve_spd_system_batched_matrix_rhs_matches_dense_solution(random_gener
     np.testing.assert_allclose(solution, np.linalg.solve(dense_operator, rhs), rtol=1e-7, atol=1e-7)
 
 
+def test_solve_spd_system_batched_matrix_rhs_accepts_vector_only_callable_preconditioner():
+    diagonal = np.array([2.0, 5.0, 11.0], dtype=np.float64)
+    rhs = np.column_stack(
+        [
+            np.array([3.0, -1.0, 2.0], dtype=np.float64),
+            np.array([-2.0, 4.0, 1.0], dtype=np.float64),
+        ]
+    )
+    operator = build_linear_operator(
+        shape=(3, 3),
+        matvec=lambda vector: jnp.asarray(diagonal * np.asarray(vector, dtype=np.float64), dtype=jnp.float64),
+        matmat=lambda matrix: jnp.asarray(diagonal[:, None] * np.asarray(matrix, dtype=np.float64), dtype=jnp.float64),
+    )
+    inverse_diagonal = 1.0 / diagonal
+
+    solution = solve_spd_system(
+        operator=operator,
+        right_hand_side=rhs,
+        tolerance=1e-12,
+        max_iterations=4,
+        preconditioner=lambda vector: jnp.asarray(inverse_diagonal * np.asarray(vector, dtype=np.float64), dtype=jnp.float64),
+    )
+
+    np.testing.assert_allclose(solution, inverse_diagonal[:, None] * rhs, atol=1e-12)
+
+
 def test_stochastic_logdet_uses_numpy_eigh(monkeypatch):
     monkeypatch.setattr(
         linear_solvers.jnp.linalg,

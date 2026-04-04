@@ -12,7 +12,7 @@ from sv_pgs._jax import require_full_gpu_runtime
 from sv_pgs.all_of_us import AllOfUsDiseaseRequest, available_disease_names, prepare_all_of_us_disease_sample_table
 from sv_pgs.config import ModelConfig, TraitType
 from sv_pgs.io import load_dataset_from_files, run_training_pipeline
-from sv_pgs.progress import gpu_memory_snapshot, jax_runtime_snapshot, log, mem, nvidia_smi_snapshot
+from sv_pgs.progress import gpu_memory_snapshot, jax_runtime_snapshot, log, nvidia_smi_snapshot
 
 
 def build_parser() -> argparse.ArgumentParser:

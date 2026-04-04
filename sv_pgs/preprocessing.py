@@ -163,7 +163,6 @@ def compute_variant_statistics(
     variant_count = raw_genotypes.shape[1]
     sample_count = raw_genotypes.shape[0]
     batch_size = auto_batch_size(sample_count)
-    n_batches = (variant_count + batch_size - 1) // batch_size
 
     # Compute the trait residual for screening: residual = y - C @ (C^T C)^{-1} C^T y
     # This removes covariate effects so the screening score reflects
@@ -192,7 +191,7 @@ def compute_variant_statistics(
     # Use int8 path for PLINK data (4x less memory, avoids float32 intermediate)
     use_i8 = hasattr(raw_genotypes, "iter_column_batches_i8")
     if use_i8:
-        log(f"  using int8 native path (4x less IO per batch)")
+        log("  using int8 native path (4x less IO per batch)")
     else:
         log(f"  using float32 path (type={type(raw_genotypes).__name__})")
 

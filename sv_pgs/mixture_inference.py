@@ -714,7 +714,6 @@ def _binary_posterior_state(
 
     import time as _time
     stalled_objective_relative_tolerance = 1e-12
-    stalled_step_tolerance = max(1e-3, gradient_tolerance * 100.0)
     cached_terms_parameters: np.ndarray | None = None
     cached_terms: tuple[float, np.ndarray, np.ndarray, np.ndarray] | None = None
     cached_proposal_base_parameters: np.ndarray | None = None
@@ -812,7 +811,6 @@ def _binary_posterior_state(
             if (
                 np.isfinite(candidate_objective)
                 and abs(actual_gain) <= stalled_objective_tolerance
-                and relative_step_size <= stalled_step_tolerance
             ):
                 log(
                     f"      Newton converged at iter {_iteration_index+1}: stalled gain={actual_gain:.2e} "
