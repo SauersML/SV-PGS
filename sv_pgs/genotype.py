@@ -347,8 +347,12 @@ class StandardizedGenotypeMatrix:
         if cupy is not None:
             try:
                 self._cupy_cache = cupy.asarray(self._dense_cache)
+                cupy.cuda.Device().synchronize()  # ensure copy completes before freeing source
                 # Free the CPU copy — data lives on GPU now, saves ~4 GB RAM
+                dense_ref = self._dense_cache
                 self._dense_cache = None
+                del dense_ref
+                import gc; gc.collect()
                 log(f"    CuPy GPU matrix uploaded ({self._cupy_cache.nbytes / 1e9:.1f} GB), CPU copy freed  mem={mem()}")
                 return True
             except Exception as exc:
