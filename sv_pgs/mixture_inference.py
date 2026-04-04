@@ -863,6 +863,15 @@ def _sample_space_diagonal_preconditioner(
     diagonal_noise: np.ndarray,
     batch_size: int,
 ) -> np.ndarray:
+    if genotype_matrix._cupy_cache is not None:
+        import cupy as cp
+        X = genotype_matrix._cupy_cache  # (n, p) float32 on GPU
+        pv = cp.asarray(prior_variances, dtype=cp.float32)
+        # diag(X @ diag(pv) @ X^T) = sum(X^2 * pv, axis=1)
+        diag_gpu = cp.asarray(diagonal_noise, dtype=cp.float64) + cp.sum(
+            X * X * pv[None, :], axis=1, dtype=cp.float64,
+        )
+        return np.asarray(cp.maximum(diag_gpu, 1e-8).get(), dtype=np.float64)
     diagonal = np.asarray(diagonal_noise, dtype=np.float64).copy()
     for batch in genotype_matrix.iter_column_batches(batch_size=batch_size):
         genotype_batch = np.asarray(batch.values, dtype=np.float64)
@@ -929,6 +938,18 @@ def _restricted_variant_space_diagonal_preconditioner(
     prior_precision: np.ndarray,
     batch_size: int,
 ) -> np.ndarray:
+    if genotype_matrix._cupy_cache is not None:
+        import cupy as cp
+        X = genotype_matrix._cupy_cache.astype(cp.float64)
+        inv_d = cp.asarray(inverse_diagonal_noise, dtype=cp.float64)
+        weighted = inv_d[:, None] * X  # (n, p)
+        # diag(X^T @ D^{-1} @ X) = sum(X * weighted, axis=0)
+        raw_diag = cp.sum(X * weighted, axis=0).get().astype(np.float64)
+        # Correction: diag(X^T D^{-1} C (C^T D^{-1} C)^{-1} C^T D^{-1} X)
+        cross = covariate_matrix.T @ np.asarray(weighted.get(), dtype=np.float64)  # (k, p)
+        correction = _cholesky_solve(covariate_precision_cholesky, cross)
+        diag_correction = np.sum(cross * correction, axis=0)
+        return np.maximum(prior_precision + raw_diag - diag_correction, 1e-8)
     diagonal = np.asarray(prior_precision, dtype=np.float64).copy()
     for batch in genotype_matrix.iter_column_batches(batch_size=batch_size):
         genotype_batch = np.asarray(batch.values, dtype=np.float64)
@@ -1053,15 +1074,24 @@ def _restricted_posterior_state(
     if use_variant_space:
         if use_exact_variant:
             log(f"    restricted posterior: exact variant-space Cholesky (p={variant_count}, n={sample_count})  mem={mem()}")
-            dense_genotypes = np.asarray(genotype_matrix.materialize(batch_size=posterior_variance_batch_size), dtype=np.float64)
-            projected_genotypes = apply_projector(dense_genotypes)
+            # Use CuPy GPU path if available to avoid downloading 4 GB from GPU
+            if genotype_matrix._cupy_cache is not None:
+                import cupy as cp
+                X_gpu = genotype_matrix._cupy_cache  # (n, p) float32 on GPU
+                projected_targets_np = apply_projector(targets)
+                # X^T @ projector @ X on GPU (result is p×p, small enough for CPU)
+                projected_genotypes_gpu = cp.asarray(apply_projector(cp.asnumpy(X_gpu).astype(np.float64)), dtype=cp.float64)
+                XtPX = np.asarray((X_gpu.astype(cp.float64).T @ projected_genotypes_gpu).get(), dtype=np.float64)
+                variant_rhs = np.asarray((X_gpu.astype(cp.float64).T @ cp.asarray(projected_targets_np, dtype=cp.float64)).get(), dtype=np.float64)
+            else:
+                dense_genotypes = np.asarray(genotype_matrix.materialize(batch_size=posterior_variance_batch_size), dtype=np.float64)
+                projected_genotypes = apply_projector(dense_genotypes)
+                XtPX = dense_genotypes.T @ projected_genotypes
+                variant_rhs = dense_genotypes.T @ apply_projector(targets)
             variant_precision_matrix = (
-                np.diag(prior_precision)
-                + dense_genotypes.T @ projected_genotypes
-                + np.eye(variant_count, dtype=np.float64) * 1e-8
+                np.diag(prior_precision) + XtPX + np.eye(variant_count, dtype=np.float64) * 1e-8
             )
             variant_precision_cholesky = np.linalg.cholesky(variant_precision_matrix)
-            variant_rhs = dense_genotypes.T @ apply_projector(targets)
 
             def solve_variant_rhs(right_hand_side: np.ndarray) -> np.ndarray:
                 return _cholesky_solve(variant_precision_cholesky, np.asarray(right_hand_side, dtype=np.float64))
@@ -1073,7 +1103,7 @@ def _restricted_posterior_state(
                 else np.zeros(variant_count, dtype=np.float64)
             )
             logdet_A = 2.0 * float(np.sum(np.log(np.diag(variant_precision_cholesky)))) if compute_logdet else 0.0
-            genetic_linear_predictor = dense_genotypes @ beta
+            genetic_linear_predictor = np.asarray(genotype_matrix.matvec(beta), dtype=np.float64)
         else:
             log(f"    restricted posterior: PCG variant-space solve (p={variant_count}, n={sample_count})  mem={mem()}")
             variant_operator = _restricted_variant_space_operator(

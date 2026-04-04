@@ -125,7 +125,10 @@ class BayesianPGS:
             active_variant_indices=active_variant_indices,
             original_variant_count=len(normalized_records),
         )
-        reduced_genotypes = active_genotypes.subset(reduced_tie_map.kept_indices)
+        # Combine active + tie-map indices into one subset call to avoid
+        # intermediate GPU/RAM copies.
+        combined_indices = active_variant_indices[reduced_tie_map.kept_indices]
+        reduced_genotypes = standardized_genotypes.subset(combined_indices)
         log(f"tie map: {len(active_variant_indices)} active -> {len(reduced_tie_map.kept_indices)} unique ({len(reduced_tie_map.reduced_to_group)} groups)  mem={mem()}")
 
         reduced_validation = None
@@ -135,19 +138,23 @@ class BayesianPGS:
                 prepared_arrays.means,
                 prepared_arrays.scales,
             )
+            combined_validation_indices = active_variant_indices[reduced_tie_map.kept_indices]
             reduced_validation = (
-                standardized_validation.subset(active_variant_indices).subset(reduced_tie_map.kept_indices),
+                standardized_validation.subset(combined_validation_indices),
                 self._with_intercept(np.asarray(validation_covariates, dtype=np.float32)),
                 np.asarray(validation_targets, dtype=np.float32),
             )
 
         # Materialize the reduced genotype matrix (RAM or GPU via CuPy).
-        # Free the raw int8 matrix afterward — no longer needed.
         cached = reduced_genotypes.try_materialize_gpu()
         if not cached:
             cached = reduced_genotypes.try_materialize()
+        # Break reference to the 2.5 GB raw int8 matrix so it can be freed.
+        # After materialization, reduced_genotypes no longer needs raw.
+        reduced_genotypes.raw = None  # type: ignore[assignment]
         del raw_genotype_matrix, standardized_genotypes, active_genotypes
         import gc; gc.collect()
+        log(f"memory freed after materialization  mem={mem()}")
         log(
             f"starting variational EM  max_iterations={self.config.max_outer_iterations}  "
             f"reduced_matrix={reduced_genotypes.shape}  in_memory={cached}  "
