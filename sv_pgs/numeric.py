@@ -21,7 +21,9 @@ def stable_sigmoid(values) -> jnp.ndarray:
     Both branches give the same mathematical result, just different
     floating-point paths for numerical safety.
     """
-    value_array = jnp.asarray(values, dtype=jnp.float64)
+    value_array = jnp.asarray(values)
+    compute_dtype = jnp.result_type(value_array.dtype, jnp.float32)
+    value_array = value_array.astype(compute_dtype)
     positive_branch = value_array >= 0.0
     negative_exponential = jnp.exp(jnp.where(positive_branch, -value_array, value_array))
     return jnp.where(

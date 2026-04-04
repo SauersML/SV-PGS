@@ -11,6 +11,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 from bed_reader import open_bed
+from sv_pgs._jax import gpu_compute_jax_dtype, gpu_compute_numpy_dtype
 from sv_pgs.progress import log, mem
 
 DEFAULT_GENOTYPE_BATCH_SIZE = 1024  # fallback when sample count is unknown
@@ -280,6 +281,23 @@ def _try_import_cupy():
     return None
 
 
+def _as_gpu_compute_jax(array) -> jnp.ndarray:
+    return jnp.asarray(array, dtype=gpu_compute_jax_dtype())
+
+
+def _cupy_to_jax(array) -> jnp.ndarray:
+    return jax.dlpack.from_dlpack(array.__dlpack__()).astype(gpu_compute_jax_dtype())
+
+
+def _to_cupy_float32(array):
+    cupy = _try_import_cupy()
+    if cupy is None:
+        raise RuntimeError("CuPy is not available.")
+    if isinstance(array, jax.Array):
+        return cupy.from_dlpack(jax.dlpack.to_dlpack(jnp.asarray(array, dtype=jnp.float32)))
+    return cupy.asarray(np.asarray(array, dtype=np.float32))
+
+
 @dataclass(slots=True)
 class StandardizedGenotypeMatrix:
     """A genotype matrix that applies z-score standardization on the fly.
@@ -436,76 +454,69 @@ class StandardizedGenotypeMatrix:
         When CuPy GPU-cached: cuBLAS matmul. Otherwise: batched numpy on CPU.
         """
         if self._cupy_cache is not None:
-            import cupy
-            coeff_np = np.asarray(coefficients, dtype=np.float32).ravel()
-            if coeff_np.shape[0] != self.shape[1]:
+            coeff_jax = jnp.ravel(jnp.asarray(coefficients, dtype=jnp.float32))
+            if coeff_jax.shape[0] != self.shape[1]:
                 raise ValueError("coefficient vector must match genotype column count.")
-            coeff_cupy = cupy.asarray(coeff_np)
+            coeff_cupy = _to_cupy_float32(coeff_jax)
             result = self._cupy_cache @ coeff_cupy
-            return jnp.asarray(result.get().astype(np.float64), dtype=jnp.float64)
-        coeff_np = np.asarray(coefficients, dtype=np.float64).ravel()
+            return _cupy_to_jax(result)
+        coeff_np = np.asarray(coefficients, dtype=gpu_compute_numpy_dtype()).ravel()
         if coeff_np.shape[0] != self.shape[1]:
             raise ValueError("coefficient vector must match genotype column count.")
-        result = np.zeros(self.shape[0], dtype=np.float64)
+        result = np.zeros(self.shape[0], dtype=gpu_compute_numpy_dtype())
         for batch in self.iter_column_batches(batch_size=batch_size):
-            batch_f64 = np.asarray(batch.values, dtype=np.float64)
-            result += batch_f64 @ coeff_np[batch.variant_indices]
-        return jnp.asarray(result, dtype=jnp.float64)
+            batch_values = np.asarray(batch.values, dtype=result.dtype)
+            result += batch_values @ coeff_np[batch.variant_indices]
+        return _as_gpu_compute_jax(result)
 
     def matmat(self, matrix: np.ndarray | jnp.ndarray, batch_size: int = DEFAULT_GENOTYPE_BATCH_SIZE) -> jnp.ndarray:
         """Compute X_std @ M. When CuPy GPU-cached: cuBLAS matmul. Otherwise: batched numpy."""
         if self._cupy_cache is not None:
-            import cupy
-            m_np = np.asarray(matrix, dtype=np.float32)
-            if m_np.ndim != 2 or m_np.shape[0] != self.shape[1]:
+            matrix_jax = jnp.asarray(matrix, dtype=jnp.float32)
+            if matrix_jax.ndim != 2 or matrix_jax.shape[0] != self.shape[1]:
                 raise ValueError("variant matrix must match genotype column count.")
-            m_cupy = cupy.asarray(m_np)
-            result = self._cupy_cache @ m_cupy
-            return jnp.asarray(result.get().astype(np.float64), dtype=jnp.float64)
-        m_np = np.asarray(matrix, dtype=np.float64)
+            result = self._cupy_cache @ _to_cupy_float32(matrix_jax)
+            return _cupy_to_jax(result)
+        m_np = np.asarray(matrix, dtype=gpu_compute_numpy_dtype())
         if m_np.ndim != 2 or m_np.shape[0] != self.shape[1]:
             raise ValueError("variant matrix must match genotype column count.")
-        output = np.zeros((self.shape[0], m_np.shape[1]), dtype=np.float64)
+        output = np.zeros((self.shape[0], m_np.shape[1]), dtype=m_np.dtype)
         for batch in self.iter_column_batches(batch_size=batch_size):
-            batch_f64 = np.asarray(batch.values, dtype=np.float64)
-            output += batch_f64 @ m_np[batch.variant_indices, :]
-        return jnp.asarray(output, dtype=jnp.float64)
+            batch_values = np.asarray(batch.values, dtype=output.dtype)
+            output += batch_values @ m_np[batch.variant_indices, :]
+        return _as_gpu_compute_jax(output)
 
     def transpose_matvec(self, vector: np.ndarray | jnp.ndarray, batch_size: int = DEFAULT_GENOTYPE_BATCH_SIZE) -> jnp.ndarray:
         """Compute X_std^T @ v. When CuPy GPU-cached: cuBLAS matmul. Otherwise: batched numpy."""
         if self._cupy_cache is not None:
-            import cupy
-            v_np = np.asarray(vector, dtype=np.float32).ravel()
-            if v_np.shape[0] != self.shape[0]:
+            vector_jax = jnp.ravel(jnp.asarray(vector, dtype=jnp.float32))
+            if vector_jax.shape[0] != self.shape[0]:
                 raise ValueError("sample vector must match genotype row count.")
-            v_cupy = cupy.asarray(v_np)
-            result = self._cupy_cache.T @ v_cupy
-            return jnp.asarray(result.get().astype(np.float64), dtype=jnp.float64)
-        v_np = np.asarray(vector, dtype=np.float64).ravel()
+            result = self._cupy_cache.T @ _to_cupy_float32(vector_jax)
+            return _cupy_to_jax(result)
+        v_np = np.asarray(vector, dtype=gpu_compute_numpy_dtype()).ravel()
         if v_np.shape[0] != self.shape[0]:
             raise ValueError("sample vector must match genotype row count.")
-        output = np.empty(self.shape[1], dtype=np.float64)
+        output = np.empty(self.shape[1], dtype=v_np.dtype)
         for batch in self.iter_column_batches(batch_size=batch_size):
-            output[batch.variant_indices] = np.asarray(batch.values, dtype=np.float64).T @ v_np
-        return jnp.asarray(output, dtype=jnp.float64)
+            output[batch.variant_indices] = np.asarray(batch.values, dtype=output.dtype).T @ v_np
+        return _as_gpu_compute_jax(output)
 
     def transpose_matmat(self, matrix: np.ndarray | jnp.ndarray, batch_size: int = DEFAULT_GENOTYPE_BATCH_SIZE) -> jnp.ndarray:
         """Compute X_std^T @ M. When CuPy GPU-cached: cuBLAS matmul. Otherwise: batched numpy."""
         if self._cupy_cache is not None:
-            import cupy
-            m_np = np.asarray(matrix, dtype=np.float32)
-            if m_np.ndim != 2 or m_np.shape[0] != self.shape[0]:
+            matrix_jax = jnp.asarray(matrix, dtype=jnp.float32)
+            if matrix_jax.ndim != 2 or matrix_jax.shape[0] != self.shape[0]:
                 raise ValueError("sample matrix must match genotype row count.")
-            m_cupy = cupy.asarray(m_np)
-            result = self._cupy_cache.T @ m_cupy
-            return jnp.asarray(result.get().astype(np.float64), dtype=jnp.float64)
-        m_np = np.asarray(matrix, dtype=np.float64)
+            result = self._cupy_cache.T @ _to_cupy_float32(matrix_jax)
+            return _cupy_to_jax(result)
+        m_np = np.asarray(matrix, dtype=gpu_compute_numpy_dtype())
         if m_np.ndim != 2 or m_np.shape[0] != self.shape[0]:
             raise ValueError("sample matrix must match genotype row count.")
-        output = np.empty((self.shape[1], m_np.shape[1]), dtype=np.float64)
+        output = np.empty((self.shape[1], m_np.shape[1]), dtype=m_np.dtype)
         for batch in self.iter_column_batches(batch_size=batch_size):
-            output[batch.variant_indices, :] = np.asarray(batch.values, dtype=np.float64).T @ m_np
-        return jnp.asarray(output, dtype=jnp.float64)
+            output[batch.variant_indices, :] = np.asarray(batch.values, dtype=output.dtype).T @ m_np
+        return _as_gpu_compute_jax(output)
 
 
 def _resolve_variant_indices(

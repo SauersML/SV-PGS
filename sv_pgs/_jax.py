@@ -4,6 +4,8 @@ import subprocess
 from collections.abc import Sequence
 from functools import lru_cache
 
+import numpy as np
+
 # Do not let JAX reserve nearly all VRAM up front.  The training pipeline keeps
 # large genotype matrices resident on device, and the compiler also needs its
 # own scratch space during the first dense-kernel builds.
@@ -74,6 +76,8 @@ from jax import config as jax_config
 # Enable 64-bit precision (required for Bayesian inference numerics).
 jax_config.update("jax_enable_x64", True)
 
+import jax.numpy as jnp
+
 
 def _cupy_runtime_status() -> tuple[bool, str]:
     try:
@@ -87,6 +91,18 @@ def _cupy_runtime_status() -> tuple[bool, str]:
     if device_count < 1:
         return False, "cupy_devices=0"
     return True, f"cupy_devices={device_count}"
+
+
+def t4_fast_math_enabled() -> bool:
+    return turing_workarounds_enabled()
+
+
+def gpu_compute_numpy_dtype() -> np.dtype:
+    return np.dtype(np.float32 if t4_fast_math_enabled() else np.float64)
+
+
+def gpu_compute_jax_dtype():
+    return jnp.float32 if t4_fast_math_enabled() else jnp.float64
 
 
 def require_full_gpu_runtime() -> None:

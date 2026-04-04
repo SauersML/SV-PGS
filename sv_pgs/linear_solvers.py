@@ -30,14 +30,16 @@ class LinearOperator:
     shape: tuple[int, int]
     matvec: Callable[[jnp.ndarray], jnp.ndarray]
     matmat: Callable[[jnp.ndarray], jnp.ndarray] | None = None
+    dtype: jnp.dtype | None = None
 
 
 def build_linear_operator(
     shape: tuple[int, int],
     matvec: Callable[[jnp.ndarray], jnp.ndarray],
     matmat: Callable[[jnp.ndarray], jnp.ndarray] | None = None,
+    dtype: jnp.dtype | None = None,
 ) -> LinearOperator:
-    return LinearOperator(shape=shape, matvec=matvec, matmat=matmat)
+    return LinearOperator(shape=shape, matvec=matvec, matmat=matmat, dtype=dtype)
 
 
 # Solve the linear system A @ x = b where A is symmetric positive-definite.
@@ -54,23 +56,27 @@ def solve_spd_system(
     preconditioner: Callable[[jnp.ndarray], jnp.ndarray] | np.ndarray | jnp.ndarray | None = None,
 ) -> np.ndarray:
     linear_operator = _as_linear_operator(operator)
-    apply_preconditioner = _as_preconditioner(preconditioner)
-    rhs_array = jnp.asarray(right_hand_side, dtype=jnp.float64)
+    rhs_array = jnp.asarray(right_hand_side)
+    solver_dtype = linear_operator.dtype or jnp.result_type(rhs_array.dtype, jnp.float32)
+    rhs_array = rhs_array.astype(solver_dtype)
+    apply_preconditioner = _as_preconditioner(preconditioner, solver_dtype)
+    output_dtype = np.asarray(jnp.zeros((), dtype=solver_dtype)).dtype
     if rhs_array.ndim == 1:
         solution = _solve_single_rhs(
             linear_operator=linear_operator,
             rhs=rhs_array,
+            solver_dtype=solver_dtype,
             tolerance=tolerance,
             max_iterations=max_iterations,
-            initial_guess=None if initial_guess is None else jnp.asarray(initial_guess, dtype=jnp.float64),
+            initial_guess=None if initial_guess is None else jnp.asarray(initial_guess, dtype=solver_dtype),
             preconditioner=apply_preconditioner,
         )
-        return np.asarray(solution, dtype=np.float64)
+        return np.asarray(solution, dtype=output_dtype)
 
     from sv_pgs.progress import log
     n_cols = rhs_array.shape[1]
     solution_columns: list[np.ndarray] = []
-    initial_matrix = None if initial_guess is None else jnp.asarray(initial_guess, dtype=jnp.float64)
+    initial_matrix = None if initial_guess is None else jnp.asarray(initial_guess, dtype=solver_dtype)
     for column_index in range(n_cols):
         if n_cols > 1:
             log(f"    CG solve: column {column_index+1}/{n_cols}")
@@ -79,15 +85,16 @@ def solve_spd_system(
                 _solve_single_rhs(
                     linear_operator=linear_operator,
                     rhs=rhs_array[:, column_index],
+                    solver_dtype=solver_dtype,
                     tolerance=tolerance,
                     max_iterations=max_iterations,
                     initial_guess=None if initial_matrix is None else initial_matrix[:, column_index],
                     preconditioner=apply_preconditioner,
                 ),
-                dtype=np.float64,
+                dtype=output_dtype,
             )
         )
-    return np.column_stack(solution_columns).astype(np.float64, copy=False)
+    return np.column_stack(solution_columns).astype(output_dtype, copy=False)
 
 
 # Estimate log(determinant(A)) without computing the full eigendecomposition.
@@ -108,6 +115,7 @@ def stochastic_logdet(
     random_seed: int,
 ) -> float:
     linear_operator = _as_linear_operator(operator)
+    operator_dtype = linear_operator.dtype or jnp.float32
     step_count = min(max(lanczos_steps, 2), dimension)
     random_generator = np.random.default_rng(random_seed)
     from sv_pgs.progress import log
@@ -115,8 +123,8 @@ def stochastic_logdet(
     for _probe_index in range(probe_count):
         log(f"      logdet probe {_probe_index+1}/{probe_count} ({step_count} Lanczos steps)")
         probe_vector = jnp.asarray(
-            random_generator.choice((-1.0, 1.0), size=dimension).astype(np.float64),
-            dtype=jnp.float64,
+            random_generator.choice((-1.0, 1.0), size=dimension).astype(np.asarray(jnp.zeros((), dtype=operator_dtype)).dtype),
+            dtype=operator_dtype,
         )
         probe_vector /= jnp.maximum(jnp.linalg.norm(probe_vector), 1e-12)
         tridiagonal = _lanczos_tridiagonal(
@@ -133,22 +141,26 @@ def stochastic_logdet(
 def _as_linear_operator(operator: LinearOperator | np.ndarray | jnp.ndarray) -> LinearOperator:
     if isinstance(operator, LinearOperator):
         return operator
-    matrix = jnp.asarray(operator, dtype=jnp.float64)
+    matrix = jnp.asarray(operator)
+    matrix_dtype = jnp.result_type(matrix.dtype, jnp.float32)
+    matrix = matrix.astype(matrix_dtype)
     return LinearOperator(
         shape=tuple(matrix.shape),
         matvec=lambda vector: matrix @ vector,
         matmat=lambda block: matrix @ block,
+        dtype=matrix_dtype,
     )
 
 
 def _as_preconditioner(
     preconditioner: Callable[[jnp.ndarray], jnp.ndarray] | np.ndarray | jnp.ndarray | None,
+    solver_dtype: jnp.dtype,
 ) -> Callable[[jnp.ndarray], jnp.ndarray] | None:
     if preconditioner is None:
         return None
     if callable(preconditioner):
-        return lambda vector: jnp.asarray(preconditioner(vector), dtype=jnp.float64)
-    diagonal = jnp.asarray(preconditioner, dtype=jnp.float64)
+        return lambda vector: jnp.asarray(preconditioner(vector), dtype=solver_dtype)
+    diagonal = jnp.asarray(preconditioner, dtype=solver_dtype)
     if diagonal.ndim != 1:
         raise ValueError("array preconditioner must be a diagonal vector.")
     return lambda vector: vector / jnp.maximum(diagonal, 1e-12)
@@ -168,6 +180,7 @@ def _as_preconditioner(
 def _solve_single_rhs(
     linear_operator: LinearOperator,
     rhs: jnp.ndarray,
+    solver_dtype: jnp.dtype,
     tolerance: float,
     max_iterations: int,
     initial_guess: jnp.ndarray | None,
@@ -187,7 +200,7 @@ def _solve_single_rhs(
         tol_sq * max(initial_residual, rhs_norm_sq),
     )
     if initial_residual <= convergence_threshold_sq:
-        return jnp.asarray(solution, dtype=jnp.float64)
+        return jnp.asarray(solution, dtype=solver_dtype)
     preconditioned_residual = residual if preconditioner is None else preconditioner(residual)
     search_direction = preconditioned_residual
     residual_dot_jax = jnp.vdot(residual, preconditioned_residual)
@@ -216,7 +229,7 @@ def _solve_single_rhs(
             log(f"      CG iter {_iteration_index+1}/{max_iterations}: {pct:.0f}% converged  residual={updated_residual_dot:.2e}  ({now - t_start:.1f}s)")
             last_log = now
         if updated_residual_dot <= convergence_threshold_sq:
-            return jnp.asarray(solution, dtype=jnp.float64)
+            return jnp.asarray(solution, dtype=solver_dtype)
         updated_preconditioned_residual = residual if preconditioner is None else preconditioner(residual)
         updated_residual_dot_jax = jnp.vdot(residual, updated_preconditioned_residual)
         beta = updated_residual_dot_jax / residual_dot_jax
@@ -245,7 +258,8 @@ def _lanczos_tridiagonal(
     start_vector: jnp.ndarray,
     step_count: int,
 ) -> jnp.ndarray:
-    normalized_start = jnp.asarray(start_vector, dtype=jnp.float64)
+    operator_dtype = linear_operator.dtype or jnp.result_type(start_vector.dtype, jnp.float32)
+    normalized_start = jnp.asarray(start_vector, dtype=operator_dtype)
     normalized_start /= jnp.maximum(jnp.linalg.norm(normalized_start), 1e-12)
     basis_vectors: list[jnp.ndarray] = []
     alpha_values: list[float] = []
@@ -254,7 +268,7 @@ def _lanczos_tridiagonal(
     previous_vector = jnp.zeros_like(current_vector)
     previous_beta = 0.0
     for _step_index in range(step_count):
-        projected = jnp.asarray(linear_operator.matvec(current_vector), dtype=jnp.float64)
+        projected = jnp.asarray(linear_operator.matvec(current_vector), dtype=operator_dtype)
         if basis_vectors:
             projected = projected - previous_beta * previous_vector
         alpha_value = float(jnp.dot(current_vector, projected))
@@ -273,9 +287,9 @@ def _lanczos_tridiagonal(
         previous_beta = beta_value
         current_vector = projected / beta_value
 
-    tridiagonal = jnp.diag(jnp.asarray(alpha_values, dtype=jnp.float64))
+    tridiagonal = jnp.diag(jnp.asarray(alpha_values, dtype=operator_dtype))
     if beta_values:
-        off_diagonal = jnp.asarray(beta_values[: max(len(alpha_values) - 1, 0)], dtype=jnp.float64)
+        off_diagonal = jnp.asarray(beta_values[: max(len(alpha_values) - 1, 0)], dtype=operator_dtype)
         tridiagonal = tridiagonal.at[jnp.arange(off_diagonal.shape[0]), jnp.arange(1, off_diagonal.shape[0] + 1)].set(off_diagonal)
         tridiagonal = tridiagonal.at[jnp.arange(1, off_diagonal.shape[0] + 1), jnp.arange(off_diagonal.shape[0])].set(off_diagonal)
     return tridiagonal
