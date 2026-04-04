@@ -171,3 +171,18 @@ def test_try_materialize_gpu_does_not_force_cpu_dense_fallback(monkeypatch: pyte
     assert standardized.try_materialize_gpu() is False
     assert standardized._cupy_cache is None
     assert standardized._dense_cache is None
+
+
+def test_subset_after_releasing_raw_storage_keeps_materialized_shape():
+    raw_matrix = np.arange(12, dtype=np.float32).reshape(3, 4)
+    standardized = as_raw_genotype_matrix(raw_matrix).standardized(
+        means=np.zeros(raw_matrix.shape[1], dtype=np.float32),
+        scales=np.ones(raw_matrix.shape[1], dtype=np.float32),
+    )
+    standardized._dense_cache = standardized.materialize()
+    standardized.release_raw_storage()
+
+    subset = standardized.subset(np.array([1, 3], dtype=np.int32))
+
+    assert subset.shape == (3, 2)
+    np.testing.assert_allclose(subset.materialize(), raw_matrix[:, [1, 3]])

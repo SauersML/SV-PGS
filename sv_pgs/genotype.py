@@ -313,18 +313,29 @@ class StandardizedGenotypeMatrix:
     means: np.ndarray       # per-variant mean from training data
     scales: np.ndarray      # per-variant std dev from training data
     variant_indices: np.ndarray  # which columns of raw to use (for subsetting)
+    sample_count: int | None = field(default=None, repr=False)
     _dense_cache: np.ndarray | None = field(init=False, default=None, repr=False)
     _cupy_cache: object | None = field(init=False, default=None, repr=False)  # cupy.ndarray
     _n_samples: int = field(init=False, default=0, repr=False)
 
     def __post_init__(self) -> None:
-        self._n_samples = self.raw.shape[0] if self.raw is not None else 0
         self.means = np.asarray(self.means, dtype=np.float32)
         self.scales = np.asarray(self.scales, dtype=np.float32)
+        if self.means.ndim != 1 or self.scales.ndim != 1 or self.means.shape != self.scales.shape:
+            raise ValueError("means and scales must be matching 1D arrays.")
         self.variant_indices = np.asarray(self.variant_indices, dtype=np.int32)
+        source_variant_count = int(self.means.shape[0])
+        if self.raw is not None:
+            self._n_samples = int(self.raw.shape[0])
+            if int(self.raw.shape[1]) != source_variant_count:
+                raise ValueError("raw genotype matrix width must match means/scales.")
+        elif self.sample_count is not None:
+            self._n_samples = int(self.sample_count)
+        else:
+            self._n_samples = 0
         if self.variant_indices.ndim != 1:
             raise ValueError("variant_indices must be 1D.")
-        if np.any(self.variant_indices < 0) or np.any(self.variant_indices >= self.raw.shape[1]):
+        if np.any(self.variant_indices < 0) or np.any(self.variant_indices >= source_variant_count):
             raise ValueError("variant_indices out of bounds.")
 
     @property
@@ -402,6 +413,7 @@ class StandardizedGenotypeMatrix:
             means=self.means,
             scales=self.scales,
             variant_indices=self.variant_indices[resolved_local_indices],
+            sample_count=self.shape[0],
         )
         if self._cupy_cache is not None:
             subset._cupy_cache = self._cupy_cache[:, resolved_local_indices]
