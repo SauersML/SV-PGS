@@ -11,6 +11,7 @@ from sv_pgs.genotype import as_raw_genotype_matrix
 from sv_pgs.inference import fit_variational_em
 from sv_pgs.mixture_inference import (
     PosteriorState,
+    _binary_posterior_state,
     _member_prior_variances_from_reduced_state,
     _quantitative_posterior_state,
     _sample_space_operator,
@@ -72,6 +73,82 @@ def test_binary_inference_runs(random_generator):
     assert result.sigma_error2 == 1.0
     assert len(result.class_tpb_shape_a) == 1
     assert len(result.class_tpb_shape_b) == 1
+
+
+def test_binary_posterior_stops_after_stalled_trust_region_step(random_generator, monkeypatch):
+    sample_count, variant_count = 64, 6
+    genotype_matrix = random_generator.standard_normal((sample_count, variant_count)).astype(np.float32)
+    standardized = as_raw_genotype_matrix(genotype_matrix).standardized(
+        means=np.zeros(variant_count, dtype=np.float32),
+        scales=np.ones(variant_count, dtype=np.float32),
+    )
+    standardized._dense_cache = standardized.materialize()
+    covariate_matrix = np.ones((sample_count, 1), dtype=np.float32)
+    targets = np.concatenate(
+        [np.ones(sample_count // 2, dtype=np.float32), np.zeros(sample_count - sample_count // 2, dtype=np.float32)]
+    )
+    prior_variances = np.ones(variant_count, dtype=np.float32)
+    restricted_call_count = 0
+
+    def fake_restricted_posterior_state(
+        genotype_matrix,
+        covariate_matrix,
+        targets,
+        prior_variances,
+        diagonal_noise,
+        solver_tolerance,
+        maximum_linear_solver_iterations,
+        logdet_probe_count,
+        logdet_lanczos_steps,
+        exact_solver_matrix_limit,
+        posterior_variance_batch_size,
+        posterior_variance_probe_count,
+        random_seed,
+        compute_logdet,
+        compute_beta_variance=True,
+        initial_beta_guess=None,
+    ):
+        nonlocal restricted_call_count
+        restricted_call_count += 1
+        beta = np.zeros(prior_variances.shape[0], dtype=np.float64) if initial_beta_guess is None else np.asarray(initial_beta_guess, dtype=np.float64)
+        alpha = np.zeros(covariate_matrix.shape[1], dtype=np.float64)
+        sample_dim = targets.shape[0]
+        return (
+            alpha,
+            beta,
+            np.zeros_like(beta),
+            np.zeros(sample_dim, dtype=np.float64),
+            np.zeros(sample_dim, dtype=np.float64),
+            0.0,
+            0.0,
+            0.0,
+        )
+
+    monkeypatch.setattr(mixture_inference, "_restricted_posterior_state", fake_restricted_posterior_state)
+
+    alpha, beta, beta_variance, linear_predictor, objective = _binary_posterior_state(
+        genotype_matrix=standardized,
+        covariate_matrix=covariate_matrix,
+        targets=targets,
+        prior_variances=prior_variances,
+        alpha_init=np.zeros(1, dtype=np.float32),
+        beta_init=np.zeros(variant_count, dtype=np.float32),
+        minimum_weight=1e-4,
+        max_iterations=20,
+        gradient_tolerance=1e-5,
+        initial_damping=1.0,
+        damping_increase_factor=10.0,
+        damping_decrease_factor=0.1,
+        success_threshold=0.25,
+        minimum_damping=1e-8,
+    )
+
+    assert restricted_call_count == 3
+    assert alpha.shape == (1,)
+    assert beta.shape == (variant_count,)
+    assert beta_variance.shape == (variant_count,)
+    assert linear_predictor.shape == (sample_count,)
+    assert np.isfinite(objective)
 
 
 def test_signal_variant_receives_largest_effect(random_generator):

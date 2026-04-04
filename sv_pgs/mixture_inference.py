@@ -713,6 +713,8 @@ def _binary_posterior_state(
         return penalized_log_posterior, gradient, weights, linear_predictor
 
     import time as _time
+    stalled_objective_relative_tolerance = 1e-12
+    stalled_step_tolerance = max(1e-3, gradient_tolerance * 100.0)
     log(f"      Newton trust-region: {standardized_genotypes.shape[1]} variants, max_iter={max_iterations}, damping={damping:.2e}  mem={mem()}")
     for _iteration_index in range(max_iterations):
         _newton_t0 = _time.monotonic()
@@ -755,21 +757,32 @@ def _binary_posterior_state(
         newton_curvature = float(np.dot(gradient, newton_direction))
         predicted_gain = step_scale * (1.0 - 0.5 * step_scale) * max(newton_curvature, 1e-12)
         gain_ratio = actual_gain / max(predicted_gain, 1e-8)
+        relative_step_size = float(np.linalg.norm(step_scale * newton_direction)) / max(
+            float(np.linalg.norm(parameters)),
+            1e-8,
+        )
         accept = np.isfinite(candidate_objective) and actual_gain > 0.0 and gain_ratio >= success_threshold
         if accept:
             parameters = candidate_parameters
             damping = max(damping * damping_decrease_factor, minimum_damping)
-            relative_step_size = float(np.linalg.norm(step_scale * newton_direction)) / max(
-                float(np.linalg.norm(parameters)),
-                1e-8,
-            )
             log(f"      Newton iter {_iteration_index+1}/{max_iterations}: ACCEPT  obj={candidate_objective:.4f}  gain={actual_gain:.2e}  ratio={gain_ratio:.3f}  grad={gradient_norm:.2e}  step={relative_step_size:.2e}  damping={damping:.2e}  [penalized={_t_penalized:.1f}s solve={_t_solve:.1f}s total={_t_total:.1f}s]  mem={mem()}")
             if relative_step_size <= gradient_tolerance:
                 log(f"      Newton converged at iter {_iteration_index+1}: step_size={relative_step_size:.2e} <= tol={gradient_tolerance:.2e}")
                 break
         else:
+            stalled_objective_tolerance = stalled_objective_relative_tolerance * max(abs(current_objective), 1.0)
+            if (
+                np.isfinite(candidate_objective)
+                and abs(actual_gain) <= stalled_objective_tolerance
+                and relative_step_size <= stalled_step_tolerance
+            ):
+                log(
+                    f"      Newton converged at iter {_iteration_index+1}: stalled gain={actual_gain:.2e} "
+                    + f"with step={relative_step_size:.2e}"
+                )
+                break
             damping *= damping_increase_factor
-            log(f"      Newton iter {_iteration_index+1}/{max_iterations}: REJECT  obj={current_objective:.4f}  cand_obj={candidate_objective:.4f}  gain={actual_gain:.2e}  ratio={gain_ratio:.3f}  grad={gradient_norm:.2e}  damping={damping:.2e}  [penalized={_t_penalized:.1f}s solve={_t_solve:.1f}s total={_t_total:.1f}s]  mem={mem()}")
+            log(f"      Newton iter {_iteration_index+1}/{max_iterations}: REJECT  obj={current_objective:.4f}  cand_obj={candidate_objective:.4f}  gain={actual_gain:.2e}  ratio={gain_ratio:.3f}  grad={gradient_norm:.2e}  step={relative_step_size:.2e}  damping={damping:.2e}  [penalized={_t_penalized:.1f}s solve={_t_solve:.1f}s total={_t_total:.1f}s]  mem={mem()}")
 
     final_objective, _final_gradient, final_weights, linear_predictor = penalized_terms(parameters)
     target_values = targets.astype(compute_np_dtype, copy=False)
