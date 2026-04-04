@@ -138,23 +138,42 @@ def _parse_pca_features_column(series: pd.Series, n_pcs: int) -> tuple[pd.DataFr
     """Parse a compound pca_features column like '[0.01,-0.02,...]' into PC1..PCn."""
     import json
     pc_names = [f"PC{i+1}" for i in range(n_pcs)]
+    n_failed = 0
 
     def _parse_row(val: str) -> list[float]:
+        nonlocal n_failed
         if not isinstance(val, str) or not val.strip():
+            n_failed += 1
             return [float("nan")] * n_pcs
         cleaned = val.strip()
-        # Handle Hail array format: [0.01, -0.02, ...] or just 0.01,-0.02,...
-        if cleaned.startswith("["):
-            try:
+        try:
+            if cleaned.startswith("["):
                 values = json.loads(cleaned)
-            except json.JSONDecodeError:
-                return [float("nan")] * n_pcs
-        else:
-            values = [float(x.strip()) for x in cleaned.split(",") if x.strip()]
-        return [values[i] if i < len(values) else float("nan") for i in range(n_pcs)]
+            else:
+                values = [float(x.strip()) for x in cleaned.split(",") if x.strip()]
+            return [float(values[i]) if i < len(values) else float("nan") for i in range(n_pcs)]
+        except (json.JSONDecodeError, ValueError, IndexError):
+            n_failed += 1
+            return [float("nan")] * n_pcs
+
+    # Log the format of the first non-empty value (truncated, no individual data)
+    first_val = series.dropna().iloc[0] if len(series.dropna()) > 0 else ""
+    preview = str(first_val)[:80] + ("..." if len(str(first_val)) > 80 else "")
+    log(f"  pca_features format preview (first row, truncated): {preview}")
 
     parsed = series.apply(_parse_row)
     df = pd.DataFrame(parsed.tolist(), columns=pc_names, index=series.index)
+
+    n_total = len(series)
+    n_parsed = n_total - n_failed
+    log(f"  parsed: {n_parsed}/{n_total} rows successfully ({n_failed} failed)")
+    if n_parsed > 0:
+        # Log aggregate stats only (no individual values)
+        for col in pc_names[:3]:
+            vals = df[col].dropna()
+            if len(vals) > 0:
+                log(f"    {col}: mean={vals.mean():.4f}  std={vals.std():.4f}  min={vals.min():.4f}  max={vals.max():.4f}")
+
     return df, pc_names
 
 
@@ -176,8 +195,8 @@ def merge_pcs_into_sample_table(
 
     log(f"  loading ancestry predictions: {ancestry_path}")
     ancestry = pd.read_csv(ancestry_path, sep="\t", dtype=str)
-    log(f"  ancestry columns: {list(ancestry.columns)}")
-    log(f"  ancestry rows: {len(ancestry)}, sample rows: {len(samples)}")
+    log(f"  ancestry columns ({len(ancestry.columns)}): {list(ancestry.columns)}")
+    log(f"  ancestry rows: {len(ancestry)}, sample table rows: {len(samples)}")
 
     # Find the ID column in ancestry
     id_col = None
@@ -212,31 +231,39 @@ def merge_pcs_into_sample_table(
         samples["age_squared"] = samples["age_at_observation_start"] ** 2
         log("  added age_squared covariate")
 
-    # Merge: try person_id first, fall back to sample_id
-    # In AoU controlled tier, person_id = research_id for most cases,
-    # but if they differ we try both join keys.
+    # Check ID overlap before merging (aggregate counts only, no individual IDs)
+    ancestry_ids = set(ancestry[id_col].dropna().astype(str))
+    sample_person_ids = set(samples["person_id"].dropna().astype(str))
+    sample_sample_ids = set(samples["sample_id"].dropna().astype(str)) if "sample_id" in samples.columns else set()
+    overlap_person = len(ancestry_ids & sample_person_ids)
+    overlap_sample = len(ancestry_ids & sample_sample_ids)
+    log(f"  ancestry ID column: {id_col} ({len(ancestry_ids)} unique IDs)")
+    log(f"  overlap with person_id: {overlap_person}/{len(sample_person_ids)}")
+    log(f"  overlap with sample_id: {overlap_sample}/{len(sample_sample_ids)}")
+
+    # Choose the best merge key based on actual overlap
+    if overlap_person >= overlap_sample and overlap_person > 0:
+        merge_key = "person_id"
+        log(f"  merging on person_id ({overlap_person} matches)")
+    elif overlap_sample > 0:
+        merge_key = "sample_id"
+        log(f"  merging on sample_id ({overlap_sample} matches)")
+    else:
+        log(f"  WARNING: 0 ID overlap between ancestry and sample table")
+        log(f"    ancestry IDs look like (count, not values): {len(ancestry_ids)} unique")
+        log(f"    sample person_ids: {len(sample_person_ids)} unique")
+        log(f"    sample sample_ids: {len(sample_sample_ids)} unique")
+        merge_key = "person_id"  # try anyway
+
     ancestry_subset = ancestry[[id_col] + pc_cols].copy()
-    merge_key = "person_id"
     ancestry_subset = ancestry_subset.rename(columns={id_col: merge_key})
     merged = samples.merge(ancestry_subset, on=merge_key, how="left")
     n_with_pcs = int(merged[pc_cols[0]].notna().sum())
 
-    # If merge on person_id gave 0 matches, try merging on sample_id instead
-    if n_with_pcs == 0 and "sample_id" in samples.columns:
-        log(f"  merge on person_id matched 0 rows, trying sample_id...")
-        ancestry_subset2 = ancestry[[id_col] + pc_cols].copy()
-        ancestry_subset2 = ancestry_subset2.rename(columns={id_col: "sample_id"})
-        merged = samples.merge(ancestry_subset2, on="sample_id", how="left", suffixes=("", "_anc"))
-        # Drop duplicate PC columns if any
-        for col in pc_cols:
-            if f"{col}_anc" in merged.columns:
-                merged[col] = merged[f"{col}_anc"]
-                merged.drop(columns=[f"{col}_anc"], inplace=True)
-        n_with_pcs = int(merged[pc_cols[0]].notna().sum())
-
     log(f"  merged: {len(merged)} rows, {n_with_pcs} with PCs ({100*n_with_pcs/max(len(merged),1):.0f}%)")
     if n_with_pcs == 0:
-        log("  WARNING: 0 samples matched ancestry file. PCs will be empty — check ID column mapping.")
+        log("  WARNING: 0 samples matched ancestry file. PCs will be empty.")
+        log("  Continuing without PCs — samples missing PCs will be dropped during model fitting.")
 
     merged.to_csv(output_path, sep="\t", index=False)
     return output_path, pc_cols
