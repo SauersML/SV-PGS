@@ -741,6 +741,7 @@ def _binary_posterior_state(
                 random_seed=random_seed + _iteration_index,
                 compute_logdet=False,
                 compute_beta_variance=False,
+                initial_beta_guess=parameters[covariate_count:],
             )
         )
         proposed_parameters = np.concatenate([proposed_alpha, proposed_beta], axis=0)
@@ -775,7 +776,7 @@ def _binary_posterior_state(
     final_working_response = linear_predictor + (target_values - np.asarray(stable_sigmoid(linear_predictor), dtype=compute_np_dtype)) / final_weights
     working_alpha, working_beta, _working_variance, _working_projected_targets, _working_fitted_response, _working_quadratic, _working_logdet_covariance, _working_logdet_gls = (
         _restricted_posterior_state(
-                genotype_matrix=standardized_genotypes,
+            genotype_matrix=standardized_genotypes,
             covariate_matrix=covariate_matrix,
             targets=final_working_response,
             prior_variances=prior_variances,
@@ -790,6 +791,7 @@ def _binary_posterior_state(
             random_seed=random_seed + 2 * max_iterations,
             compute_logdet=False,
             compute_beta_variance=False,
+            initial_beta_guess=parameters[covariate_count:],
         )
     )
     working_parameters = np.concatenate([working_alpha, working_beta], axis=0)
@@ -817,6 +819,7 @@ def _binary_posterior_state(
             posterior_variance_probe_count=posterior_variance_probe_count,
             random_seed=random_seed + 2 * max_iterations + 17,
             compute_logdet=True,
+            initial_beta_guess=parameters[covariate_count:],
         )
     )
     laplace_weights = np.asarray(final_weights, dtype=compute_np_dtype)
@@ -1038,6 +1041,7 @@ def _restricted_posterior_state(
     random_seed: int,
     compute_logdet: bool,
     compute_beta_variance: bool = True,
+    initial_beta_guess: np.ndarray | None = None,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, float, float, float]:
     from sv_pgs.progress import log, mem
     compute_np_dtype = gpu_compute_numpy_dtype()
@@ -1259,6 +1263,7 @@ def _restricted_posterior_state(
                     right_hand_side,
                     tolerance=solver_tolerance,
                     max_iterations=maximum_linear_solver_iterations,
+                    initial_guess=initial_beta_guess,
                     preconditioner=variant_preconditioner,
                 )
 

@@ -190,8 +190,16 @@ def _solve_single_rhs(
     import time
     import math
     from sv_pgs.progress import log
+    residual_refresh_interval = 32
     tol_sq = tolerance * tolerance
-    solution = jnp.zeros_like(rhs) if initial_guess is None else initial_guess
+    if initial_guess is None:
+        if preconditioner is None:
+            solution = jnp.zeros_like(rhs)
+        else:
+            # Jacobi-like preconditioners are often a good first approximation.
+            solution = jnp.asarray(preconditioner(rhs), dtype=solver_dtype)
+    else:
+        solution = initial_guess
     residual = rhs - jnp.asarray(linear_operator.matvec(solution), dtype=solver_dtype)
     residual_norm_sq_jax = jnp.vdot(residual, residual)
     initial_residual = float(residual_norm_sq_jax)
@@ -205,6 +213,7 @@ def _solve_single_rhs(
     preconditioned_residual = residual if preconditioner is None else preconditioner(residual)
     search_direction = preconditioned_residual
     residual_dot_jax = jnp.vdot(residual, preconditioned_residual)
+    best_residual_dot = float(residual_norm_sq_jax)
     # Progress is measured in log-space: how far the residual has dropped
     # from initial toward the tolerance.  E.g. if initial=1e0, tol=1e-6,
     # and current=1e-3, we're 50% of the way (3 out of 6 orders of magnitude).
@@ -216,13 +225,25 @@ def _solve_single_rhs(
     for _iteration_index in range(max_iterations):
         operator_search_direction = jnp.asarray(linear_operator.matvec(search_direction), dtype=solver_dtype)
         step_denom_jax = jnp.vdot(search_direction, operator_search_direction)
-        if float(step_denom_jax) <= 0.0:
-            raise RuntimeError("Conjugate-gradient operator is not positive definite.")
+        step_denom = float(step_denom_jax)
+        if not np.isfinite(step_denom) or step_denom <= 0.0:
+            residual = rhs - jnp.asarray(linear_operator.matvec(solution), dtype=solver_dtype)
+            preconditioned_residual = residual if preconditioner is None else preconditioner(residual)
+            search_direction = preconditioned_residual
+            residual_dot_jax = jnp.vdot(residual, preconditioned_residual)
+            operator_search_direction = jnp.asarray(linear_operator.matvec(search_direction), dtype=solver_dtype)
+            step_denom_jax = jnp.vdot(search_direction, operator_search_direction)
+            step_denom = float(step_denom_jax)
+            if not np.isfinite(step_denom) or step_denom <= 0.0:
+                raise RuntimeError("Conjugate-gradient operator is not positive definite.")
         step_size = residual_dot_jax / step_denom_jax
         solution = solution + step_size * search_direction
         residual = residual - step_size * operator_search_direction
+        if (_iteration_index + 1) % residual_refresh_interval == 0:
+            residual = rhs - jnp.asarray(linear_operator.matvec(solution), dtype=solver_dtype)
         updated_residual_norm_sq_jax = jnp.vdot(residual, residual)
         updated_residual_dot = float(updated_residual_norm_sq_jax)
+        best_residual_dot = min(best_residual_dot, updated_residual_dot)
         now = time.monotonic()
         if now - last_log >= 5.0 or updated_residual_dot <= convergence_threshold_sq:
             log_current = math.log10(max(updated_residual_dot, 1e-30))
@@ -234,7 +255,16 @@ def _solve_single_rhs(
         updated_preconditioned_residual = residual if preconditioner is None else preconditioner(residual)
         updated_residual_dot_jax = jnp.vdot(residual, updated_preconditioned_residual)
         beta = updated_residual_dot_jax / residual_dot_jax
-        search_direction = updated_preconditioned_residual + beta * search_direction
+        beta_value = float(beta)
+        if not np.isfinite(beta_value) or beta_value < 0.0:
+            residual = rhs - jnp.asarray(linear_operator.matvec(solution), dtype=solver_dtype)
+            search_direction = updated_preconditioned_residual
+            updated_preconditioned_residual = residual if preconditioner is None else preconditioner(residual)
+            updated_residual_dot_jax = jnp.vdot(residual, updated_preconditioned_residual)
+            updated_residual_dot = float(jnp.vdot(residual, residual))
+            best_residual_dot = min(best_residual_dot, updated_residual_dot)
+        else:
+            search_direction = updated_preconditioned_residual + beta * search_direction
         residual_dot_jax = updated_residual_dot_jax
     final_residual = float(jnp.vdot(residual, residual))
     raise RuntimeError(
