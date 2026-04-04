@@ -8,6 +8,7 @@ import platform
 import sys
 from pathlib import Path
 
+from sv_pgs._jax import require_full_gpu_runtime
 from sv_pgs.all_of_us import AllOfUsDiseaseRequest, available_disease_names, prepare_all_of_us_disease_sample_table
 from sv_pgs.config import ModelConfig, TraitType
 from sv_pgs.io import load_dataset_from_files, run_training_pipeline
@@ -115,6 +116,7 @@ def main(argv: list[str] | None = None) -> int:
     log(f"jax runtime: {jax_runtime_snapshot()}")
     log(f"gpu memory: {gpu_memory_snapshot()}")
     log(f"nvidia-smi: {nvidia_smi_snapshot()}")
+    require_full_gpu_runtime()
     log(f"genotypes={args.genotypes} sample_table={args.sample_table} output_dir={args.output_dir}")
     log(f"genotype_format={args.genotype_format} sample_id_column={args.sample_id_column} target_column={args.target_column}")
     log(f"covariates={list(args.covariate_column)}  max_outer_iter={args.max_outer_iterations}  min_sv_carriers={args.minimum_structural_variant_carriers}  seed={args.random_seed}")
