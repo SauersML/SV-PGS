@@ -131,6 +131,12 @@ def merge_pcs_into_sample_table(
     for col in pc_cols:
         ancestry[col] = pd.to_numeric(ancestry[col], errors="coerce")
 
+    # Add age^2 if age column exists
+    if "age_at_observation_start" in samples.columns:
+        samples["age_at_observation_start"] = pd.to_numeric(samples["age_at_observation_start"], errors="coerce")
+        samples["age_squared"] = samples["age_at_observation_start"] ** 2
+        log(f"  added age_squared covariate")
+
     ancestry_subset = ancestry[[id_col] + pc_cols].rename(columns={id_col: "person_id"})
     merged = samples.merge(ancestry_subset, on="person_id", how="left")
     n_with_pcs = int(merged[pc_cols[0]].notna().sum())
@@ -145,6 +151,7 @@ def merge_pcs_into_sample_table(
 
 DEFAULT_COVARIATES = [
     "age_at_observation_start",
+    "age_squared",
     "gender_concept_id",
     "race_concept_id",
     "ethnicity_concept_id",
