@@ -151,7 +151,7 @@ class BayesianPGS:
             cached = reduced_genotypes.try_materialize()
         # Break reference to the 2.5 GB raw int8 matrix so it can be freed.
         # After materialization, reduced_genotypes no longer needs raw.
-        reduced_genotypes.raw = None  # type: ignore[assignment]
+        reduced_genotypes.release_raw_storage()
         del raw_genotype_matrix, standardized_genotypes, active_genotypes
         import gc
         gc.collect()

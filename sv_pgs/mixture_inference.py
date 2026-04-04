@@ -659,7 +659,7 @@ def _binary_posterior_state(
 
     penalized_term_calls = 0
 
-    def penalized_terms(current_parameters: np.ndarray) -> tuple[float, np.ndarray, np.ndarray, np.ndarray]:
+    def penalized_terms(current_parameters: np.ndarray) -> tuple[float, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
         """Compute the penalized log-posterior, its gradient, IRLS weights, and predictions.
 
         The objective balances two things:
@@ -710,12 +710,13 @@ def _binary_posterior_state(
         # Convert outputs to numpy for the outer Newton loop
         linear_predictor = np.asarray(linear_predictor_jax, dtype=compute_np_dtype)
         weights = np.asarray(weights_jax, dtype=compute_np_dtype)
-        return penalized_log_posterior, gradient, weights, linear_predictor
+        probabilities = np.asarray(probabilities_jax, dtype=compute_np_dtype)
+        return penalized_log_posterior, gradient, weights, linear_predictor, probabilities
 
     import time as _time
     stalled_objective_relative_tolerance = 1e-12
     cached_terms_parameters: np.ndarray | None = None
-    cached_terms: tuple[float, np.ndarray, np.ndarray, np.ndarray] | None = None
+    cached_terms: tuple[float, np.ndarray, np.ndarray, np.ndarray, np.ndarray] | None = None
     cached_proposal_base_parameters: np.ndarray | None = None
     cached_proposed_parameters: np.ndarray | None = None
     cached_newton_direction: np.ndarray | None = None
@@ -727,18 +728,18 @@ def _binary_posterior_state(
             and cached_terms is not None
             and np.array_equal(parameters, cached_terms_parameters)
         ):
-            current_objective, gradient, weights, linear_predictor = cached_terms
+            current_objective, gradient, weights, linear_predictor, probabilities = cached_terms
             _t_penalized = 0.0
         else:
-            current_objective, gradient, weights, linear_predictor = penalized_terms(parameters)
+            current_objective, gradient, weights, linear_predictor, probabilities = penalized_terms(parameters)
             cached_terms_parameters = parameters.copy()
-            cached_terms = (current_objective, gradient, weights, linear_predictor)
+            cached_terms = (current_objective, gradient, weights, linear_predictor, probabilities)
             _t_penalized = _time.monotonic() - _newton_t0
         gradient_norm = float(np.linalg.norm(gradient))
         if gradient_norm <= gradient_tolerance:
             log(f"      Newton converged at iter {_iteration_index+1}: grad_norm={gradient_norm:.2e} <= tol={gradient_tolerance:.2e}")
             break
-        working_response = linear_predictor + (targets.astype(compute_np_dtype, copy=False) - np.asarray(stable_sigmoid(jnp.asarray(linear_predictor, dtype=compute_jax_dtype)), dtype=compute_np_dtype)) / weights
+        working_response = linear_predictor + (targets.astype(compute_np_dtype, copy=False) - probabilities) / weights
         if (
             cached_proposal_base_parameters is not None
             and np.array_equal(parameters, cached_proposal_base_parameters)
@@ -778,7 +779,7 @@ def _binary_posterior_state(
             _t_solve = _time.monotonic() - _t_solve_start
         step_scale = 1.0 / (1.0 + damping)
         candidate_parameters = parameters + step_scale * newton_direction
-        candidate_objective, _candidate_gradient, _candidate_weights, _candidate_linear_predictor = penalized_terms(candidate_parameters)
+        candidate_objective, _candidate_gradient, _candidate_weights, _candidate_linear_predictor, _candidate_probabilities = penalized_terms(candidate_parameters)
         _t_total = _time.monotonic() - _newton_t0
         actual_gain = candidate_objective - current_objective
         newton_curvature = float(np.dot(gradient, newton_direction))
@@ -797,6 +798,7 @@ def _binary_posterior_state(
                 _candidate_gradient,
                 _candidate_weights,
                 _candidate_linear_predictor,
+                _candidate_probabilities,
             )
             cached_proposal_base_parameters = None
             cached_proposed_parameters = None
@@ -820,9 +822,9 @@ def _binary_posterior_state(
             damping *= damping_increase_factor
             log(f"      Newton iter {_iteration_index+1}/{max_iterations}: REJECT  obj={current_objective:.4f}  cand_obj={candidate_objective:.4f}  gain={actual_gain:.2e}  ratio={gain_ratio:.3f}  grad={gradient_norm:.2e}  step={relative_step_size:.2e}  damping={damping:.2e}  [penalized={_t_penalized:.1f}s solve={_t_solve:.1f}s total={_t_total:.1f}s]  mem={mem()}")
 
-    final_objective, _final_gradient, final_weights, linear_predictor = penalized_terms(parameters)
+    final_objective, _final_gradient, final_weights, linear_predictor, probabilities = penalized_terms(parameters)
     target_values = targets.astype(compute_np_dtype, copy=False)
-    final_working_response = linear_predictor + (target_values - np.asarray(stable_sigmoid(linear_predictor), dtype=compute_np_dtype)) / final_weights
+    final_working_response = linear_predictor + (target_values - probabilities) / final_weights
     working_alpha, working_beta, _working_variance, _working_projected_targets, _working_fitted_response, _working_quadratic, _working_logdet_covariance, _working_logdet_gls = (
         _restricted_posterior_state(
             genotype_matrix=standardized_genotypes,
@@ -844,14 +846,15 @@ def _binary_posterior_state(
         )
     )
     working_parameters = np.concatenate([working_alpha, working_beta], axis=0)
-    working_objective, _working_gradient, _working_weights, _working_linear_predictor = penalized_terms(working_parameters)
+    working_objective, _working_gradient, _working_weights, _working_linear_predictor, _working_probabilities = penalized_terms(working_parameters)
     if working_objective >= final_objective:
         parameters = working_parameters
         final_objective = working_objective
         final_weights = _working_weights
         linear_predictor = _working_linear_predictor
+        probabilities = _working_probabilities
 
-    final_working_response = linear_predictor + (target_values - np.asarray(stable_sigmoid(linear_predictor), dtype=compute_np_dtype)) / final_weights
+    final_working_response = linear_predictor + (target_values - probabilities) / final_weights
     final_alpha, final_beta, beta_variance, _projected_targets, _fitted_response, _restricted_quadratic, logdet_covariance, logdet_gls = (
         _restricted_posterior_state(
                 genotype_matrix=standardized_genotypes,
@@ -873,7 +876,7 @@ def _binary_posterior_state(
     )
     laplace_weights = np.asarray(final_weights, dtype=compute_np_dtype)
     final_parameters = np.concatenate([final_alpha, final_beta], axis=0)
-    final_objective, _final_gradient, _final_penalty_weights, linear_predictor = penalized_terms(final_parameters)
+    final_objective, _final_gradient, _final_penalty_weights, linear_predictor, _final_probabilities = penalized_terms(final_parameters)
     logdet_hessian = (
         float(np.sum(np.log(np.maximum(prior_precision, 1e-12))))
         + float(np.sum(np.log(np.maximum(laplace_weights, 1e-12))))

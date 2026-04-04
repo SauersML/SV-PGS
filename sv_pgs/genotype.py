@@ -343,6 +343,12 @@ class StandardizedGenotypeMatrix:
         """Estimated bytes if materialized as float32."""
         return int(self.shape[0]) * int(self.shape[1]) * 4
 
+    def release_raw_storage(self) -> None:
+        """Drop the backing raw matrix once a dense or GPU cache exists."""
+        if self._dense_cache is None and self._cupy_cache is None:
+            raise RuntimeError("cannot release raw storage before materializing genotype data.")
+        self.raw = None
+
     def try_materialize_gpu(self) -> bool:
         """Materialize the standardized matrix onto GPU memory when possible."""
         if self._cupy_cache is not None:
@@ -416,6 +422,8 @@ class StandardizedGenotypeMatrix:
                     values=np.asarray(self._dense_cache[:, local_indices], dtype=np.float32),
                 )
             return
+        if self.raw is None:
+            raise RuntimeError("streaming genotype batches require raw backing storage or a materialized cache.")
         safe_batch_size = max(int(batch_size), 1)
         local_start = 0
         for raw_batch in self.raw.iter_column_batches(self.variant_indices, batch_size=safe_batch_size):
