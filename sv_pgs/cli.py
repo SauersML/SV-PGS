@@ -37,6 +37,18 @@ def build_parser() -> argparse.ArgumentParser:
     )
     aou_parser.add_argument("--output", required=True, help="Output TSV path for the prepared sample table.")
 
+    aou_run_parser = subparsers.add_parser(
+        "run-all-of-us",
+        help="Full AoU pipeline: download VCFs, prepare phenotype, merge PCs, fit per-chromosome.",
+    )
+    aou_run_parser.add_argument("--disease", required=True, help="Disease name (e.g. hypertension, type2_diabetes).")
+    aou_run_parser.add_argument("--chromosomes", default="1-22", help="Chromosome range (default: 1-22).")
+    aou_run_parser.add_argument("--output-dir", required=True, help="Base output directory.")
+    aou_run_parser.add_argument("--n-pcs", type=int, default=10, help="Number of genomic PCs to include (default: 10).")
+    aou_run_parser.add_argument("--max-outer-iterations", type=int, default=30)
+    aou_run_parser.add_argument("--minimum-structural-variant-carriers", type=int, default=5)
+    aou_run_parser.add_argument("--random-seed", type=int, default=0)
+
     run_parser = subparsers.add_parser("run", help="Load genotype files, fit the model, and write outputs.")
     run_parser.add_argument("--genotypes", required=True, help="Path to a VCF/BCF file or PLINK 1 .bed file.")
     run_parser.add_argument(
@@ -96,6 +108,28 @@ def main(argv: list[str] | None = None) -> int:
         print("sample_table\t" + str(outputs.sample_table_path))
         print("sql\t" + str(outputs.sql_path))
         print("metadata\t" + str(outputs.metadata_path))
+        return 0
+
+    if args.command == "run-all-of-us":
+        from sv_pgs.aou_runner import run_all_of_us
+        # Parse chromosome range: "1-22" -> [1,2,...,22], "22" -> [22], "1,5,22" -> [1,5,22]
+        chr_str = args.chromosomes
+        if "-" in chr_str:
+            lo, hi = chr_str.split("-", 1)
+            chromosomes = list(range(int(lo), int(hi) + 1))
+        elif "," in chr_str:
+            chromosomes = [int(c.strip()) for c in chr_str.split(",")]
+        else:
+            chromosomes = [int(chr_str)]
+        run_all_of_us(
+            disease=args.disease,
+            chromosomes=chromosomes,
+            output_base=args.output_dir,
+            n_pcs=args.n_pcs,
+            max_outer_iterations=args.max_outer_iterations,
+            min_sv_carriers=args.minimum_structural_variant_carriers,
+            random_seed=args.random_seed,
+        )
         return 0
 
     if args.command != "run":
