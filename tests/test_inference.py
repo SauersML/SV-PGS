@@ -14,6 +14,8 @@ from sv_pgs.mixture_inference import (
     _binary_posterior_state,
     _member_prior_variances_from_reduced_state,
     _quantitative_posterior_state,
+    _restricted_precision_projector,
+    _restricted_variant_space_operator,
     _sample_space_operator,
     _update_local_scales,
     _update_tpb_shape_vectors,
@@ -279,6 +281,46 @@ def test_gpu_sample_space_operator_matmat_matches_dense_reference(random_generat
     dense_matrix = genotype_values.astype(np.float64)
     expected = diagonal_noise[:, None] * rhs_matrix + dense_matrix @ (
         prior_variances[:, None] * (dense_matrix.T @ rhs_matrix)
+    )
+
+    np.testing.assert_allclose(
+        np.asarray(operator.matmat(rhs_matrix), dtype=np.float64),
+        expected,
+        rtol=1e-5,
+        atol=1e-5,
+    )
+
+
+def test_restricted_variant_space_operator_matmat_matches_columnwise(random_generator):
+    sample_count, variant_count = 32, 7
+    genotype_values = random_generator.normal(size=(sample_count, variant_count)).astype(np.float32)
+    covariate_matrix = np.column_stack(
+        [np.ones(sample_count), random_generator.normal(size=(sample_count, 2))]
+    ).astype(np.float32)
+    diagonal_noise = random_generator.uniform(0.5, 1.5, size=sample_count).astype(np.float64)
+    prior_precision = random_generator.uniform(0.8, 2.0, size=variant_count).astype(np.float64)
+    rhs_matrix = random_generator.normal(size=(variant_count, 5)).astype(np.float64)
+
+    standardized = as_raw_genotype_matrix(genotype_values).standardized(
+        means=np.zeros(variant_count, dtype=np.float32),
+        scales=np.ones(variant_count, dtype=np.float32),
+    )
+    standardized._dense_cache = standardized.materialize()
+    _inverse_diagonal_noise, covariate_precision_cholesky, _covariate_precision_logdet, apply_projector = (
+        _restricted_precision_projector(covariate_matrix.astype(np.float64), diagonal_noise)
+    )
+    operator = _restricted_variant_space_operator(
+        genotype_matrix=standardized,
+        prior_precision=prior_precision,
+        apply_projector=apply_projector,
+        batch_size=4,
+    )
+
+    expected = np.column_stack(
+        [
+            np.asarray(operator.matvec(rhs_matrix[:, column_index]), dtype=np.float64)
+            for column_index in range(rhs_matrix.shape[1])
+        ]
     )
 
     np.testing.assert_allclose(

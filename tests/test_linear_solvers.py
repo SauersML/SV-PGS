@@ -77,6 +77,32 @@ def test_solve_spd_system_rejects_vector_initial_guess_for_matrix_rhs():
         )
 
 
+def test_solve_spd_system_batched_matrix_rhs_matches_dense_solution(random_generator):
+    dimension = 12
+    rhs_count = 4
+    basis, _ = np.linalg.qr(random_generator.normal(size=(dimension, dimension)))
+    eigenvalues = np.geomspace(1.0, 30.0, dimension)
+    dense_operator = (basis * eigenvalues) @ basis.T
+    dense_operator = ((dense_operator + dense_operator.T) * 0.5).astype(np.float64)
+    rhs = random_generator.normal(size=(dimension, rhs_count)).astype(np.float64)
+    diagonal_preconditioner = np.diag(dense_operator).astype(np.float64)
+    operator = build_linear_operator(
+        shape=dense_operator.shape,
+        matvec=lambda vector: jnp.asarray(dense_operator @ np.asarray(vector, dtype=np.float64), dtype=jnp.float64),
+        matmat=lambda matrix: jnp.asarray(dense_operator @ np.asarray(matrix, dtype=np.float64), dtype=jnp.float64),
+    )
+
+    solution = solve_spd_system(
+        operator=operator,
+        right_hand_side=rhs,
+        tolerance=1e-8,
+        max_iterations=128,
+        preconditioner=diagonal_preconditioner,
+    )
+
+    np.testing.assert_allclose(solution, np.linalg.solve(dense_operator, rhs), rtol=1e-7, atol=1e-7)
+
+
 def test_stochastic_logdet_uses_numpy_eigh(monkeypatch):
     monkeypatch.setattr(
         linear_solvers.jnp.linalg,

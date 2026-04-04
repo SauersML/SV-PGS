@@ -964,9 +964,22 @@ def _restricted_variant_space_operator(
             batch_size=batch_size,
         )
 
+    def matmat(matrix) -> jnp.ndarray:
+        coefficients = jnp.asarray(matrix, dtype=compute_dtype)
+        genotype_projection = np.asarray(
+            genotype_matrix.matmat(coefficients, batch_size=batch_size),
+            dtype=compute_np_dtype,
+        )
+        restricted_projection = apply_projector(genotype_projection)
+        return prior_precision_jax[:, None] * coefficients + genotype_matrix.transpose_matmat(
+            restricted_projection,
+            batch_size=batch_size,
+        )
+
     return build_linear_operator(
         shape=(genotype_matrix.shape[1], genotype_matrix.shape[1]),
         matvec=matvec,
+        matmat=matmat,
         dtype=compute_dtype,
     )
 

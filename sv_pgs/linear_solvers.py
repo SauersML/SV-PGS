@@ -76,12 +76,24 @@ def solve_spd_system(
 
     from sv_pgs.progress import log
     n_cols = rhs_array.shape[1]
-    solution_columns: list[np.ndarray] = []
     initial_matrix = None if initial_guess is None else jnp.asarray(initial_guess, dtype=solver_dtype)
     if initial_matrix is not None and initial_matrix.ndim != 2:
         raise ValueError("matrix right_hand_side requires initial_guess with matching column dimension.")
     if initial_matrix is not None and initial_matrix.shape != rhs_array.shape:
         raise ValueError("matrix initial_guess must have the same shape as right_hand_side.")
+    if linear_operator.matmat is not None:
+        solution_matrix = _solve_multiple_rhs(
+            linear_operator=linear_operator,
+            rhs=rhs_array,
+            solver_dtype=solver_dtype,
+            tolerance=tolerance,
+            max_iterations=max_iterations,
+            initial_guess=initial_matrix,
+            preconditioner=apply_preconditioner,
+        )
+        return np.asarray(solution_matrix, dtype=output_dtype)
+
+    solution_columns: list[np.ndarray] = []
     for column_index in range(n_cols):
         if n_cols > 1:
             log(f"    CG solve: column {column_index+1}/{n_cols}")
@@ -188,7 +200,17 @@ def _as_preconditioner(
     diagonal = jnp.asarray(preconditioner, dtype=solver_dtype)
     if diagonal.ndim != 1:
         raise ValueError("array preconditioner must be a diagonal vector.")
-    return lambda vector: vector / jnp.maximum(diagonal, 1e-12)
+    safe_diagonal = jnp.maximum(diagonal, 1e-12)
+
+    def apply_diagonal(vector: jnp.ndarray) -> jnp.ndarray:
+        array = jnp.asarray(vector, dtype=solver_dtype)
+        if array.ndim == 1:
+            return array / safe_diagonal
+        if array.ndim == 2:
+            return array / safe_diagonal[:, None]
+        raise ValueError("preconditioner input must be a vector or matrix.")
+
+    return apply_diagonal
 
 
 # Conjugate Gradient (CG) for a single right-hand side vector.
@@ -294,6 +316,128 @@ def _solve_single_rhs(
     raise RuntimeError(
         "Conjugate-gradient solve failed to converge: "
         + f"residual={final_residual:.2e} threshold={convergence_threshold_sq:.2e} "
+        + f"iterations={max_iterations}"
+    )
+
+
+def _solve_multiple_rhs(
+    linear_operator: LinearOperator,
+    rhs: jnp.ndarray,
+    solver_dtype: jnp.dtype,
+    tolerance: float,
+    max_iterations: int,
+    initial_guess: jnp.ndarray | None,
+    preconditioner: Callable[[jnp.ndarray], jnp.ndarray] | None,
+) -> jnp.ndarray:
+    import time
+    import math
+    from sv_pgs.progress import log
+
+    residual_refresh_interval = 32
+    tol_sq = tolerance * tolerance
+    if initial_guess is None:
+        if preconditioner is None:
+            solution = jnp.zeros_like(rhs)
+        else:
+            solution = jnp.asarray(preconditioner(rhs), dtype=solver_dtype)
+    else:
+        solution = initial_guess
+    operator_matmat = linear_operator.matmat
+    if operator_matmat is None:
+        raise ValueError("matrix solve requires an operator matmat implementation.")
+
+    residual = rhs - jnp.asarray(operator_matmat(solution), dtype=solver_dtype)
+    residual_norm_sq = np.asarray(jnp.sum(residual * residual, axis=0), dtype=np.float64)
+    rhs_norm_sq = np.asarray(jnp.sum(rhs * rhs, axis=0), dtype=np.float64)
+    convergence_threshold_sq = np.maximum(tol_sq, tol_sq * np.maximum(residual_norm_sq, rhs_norm_sq))
+    converged = residual_norm_sq <= convergence_threshold_sq
+    if np.all(converged):
+        return jnp.asarray(solution, dtype=solver_dtype)
+
+    preconditioned_residual = residual if preconditioner is None else preconditioner(residual)
+    search_direction = preconditioned_residual
+    residual_dot = np.asarray(jnp.sum(residual * preconditioned_residual, axis=0), dtype=np.float64)
+    log_initial = np.log10(np.maximum(residual_norm_sq, 1e-30))
+    log_target = np.log10(np.maximum(convergence_threshold_sq, 1e-30))
+    log_range = np.maximum(log_initial - log_target, 1e-6)
+    t_start = time.monotonic()
+    last_log = t_start
+    active_count = int(np.sum(~converged))
+    for iteration_index in range(max_iterations):
+        active_mask = jnp.asarray((~converged).astype(np.asarray(jnp.zeros((), dtype=solver_dtype)).dtype), dtype=solver_dtype)
+        masked_search = search_direction * active_mask[None, :]
+        operator_search = jnp.asarray(operator_matmat(masked_search), dtype=solver_dtype) * active_mask[None, :]
+        step_denom = np.asarray(jnp.sum(masked_search * operator_search, axis=0), dtype=np.float64)
+        invalid = (~converged) & (~np.isfinite(step_denom) | (step_denom <= 0.0))
+        if np.any(invalid):
+            invalid_mask = jnp.asarray(invalid.astype(np.asarray(jnp.zeros((), dtype=solver_dtype)).dtype), dtype=solver_dtype)
+            residual = rhs - jnp.asarray(operator_matmat(solution), dtype=solver_dtype)
+            refreshed_preconditioned = residual if preconditioner is None else preconditioner(residual)
+            search_direction = search_direction * (1.0 - invalid_mask[None, :]) + refreshed_preconditioned * invalid_mask[None, :]
+            residual_dot = np.where(
+                invalid,
+                np.asarray(jnp.sum(residual * refreshed_preconditioned, axis=0), dtype=np.float64),
+                residual_dot,
+            )
+            masked_search = search_direction * active_mask[None, :]
+            operator_search = jnp.asarray(operator_matmat(masked_search), dtype=solver_dtype) * active_mask[None, :]
+            step_denom = np.asarray(jnp.sum(masked_search * operator_search, axis=0), dtype=np.float64)
+            if np.any((~converged) & (~np.isfinite(step_denom) | (step_denom <= 0.0))):
+                raise RuntimeError("Conjugate-gradient operator is not positive definite.")
+        step_scale = np.zeros_like(step_denom)
+        active_indices = ~converged
+        step_scale[active_indices] = residual_dot[active_indices] / step_denom[active_indices]
+        step_scale_jax = jnp.asarray(step_scale, dtype=solver_dtype)
+        solution = solution + masked_search * step_scale_jax[None, :]
+        residual = residual - operator_search * step_scale_jax[None, :]
+        if (iteration_index + 1) % residual_refresh_interval == 0:
+            residual = rhs - jnp.asarray(operator_matmat(solution), dtype=solver_dtype)
+        residual_norm_sq = np.asarray(jnp.sum(residual * residual, axis=0), dtype=np.float64)
+        converged = residual_norm_sq <= convergence_threshold_sq
+        now = time.monotonic()
+        new_active_count = int(np.sum(~converged))
+        if now - last_log >= 5.0 or new_active_count == 0:
+            if active_count > 0:
+                progress = np.zeros_like(residual_norm_sq)
+                progress[~converged] = np.clip(
+                    100.0 * (log_initial[~converged] - np.log10(np.maximum(residual_norm_sq[~converged], 1e-30))) / log_range[~converged],
+                    0.0,
+                    100.0,
+                )
+                progress[converged] = 100.0
+                mean_progress = float(np.mean(progress))
+            else:
+                mean_progress = 100.0
+            residual_summary = float(np.max(residual_norm_sq))
+            log(
+                f"      CG iter {iteration_index+1}/{max_iterations}: {mean_progress:.0f}% converged  "
+                + f"active={new_active_count}/{rhs.shape[1]}  residual={residual_summary:.2e}  ({now - t_start:.1f}s)"
+            )
+            last_log = now
+        if new_active_count == 0:
+            return jnp.asarray(solution, dtype=solver_dtype)
+        updated_preconditioned = residual if preconditioner is None else preconditioner(residual)
+        updated_residual_dot = np.asarray(jnp.sum(residual * updated_preconditioned, axis=0), dtype=np.float64)
+        beta = np.zeros_like(updated_residual_dot)
+        beta[~converged] = updated_residual_dot[~converged] / np.maximum(residual_dot[~converged], 1e-30)
+        invalid_beta = (~converged) & (~np.isfinite(beta) | (beta < 0.0))
+        if np.any(invalid_beta):
+            invalid_beta_mask = jnp.asarray(invalid_beta.astype(np.asarray(jnp.zeros((), dtype=solver_dtype)).dtype), dtype=solver_dtype)
+            residual = rhs - jnp.asarray(operator_matmat(solution), dtype=solver_dtype)
+            updated_preconditioned = residual if preconditioner is None else preconditioner(residual)
+            updated_residual_dot = np.asarray(jnp.sum(residual * updated_preconditioned, axis=0), dtype=np.float64)
+            search_direction = search_direction * (1.0 - invalid_beta_mask[None, :]) + updated_preconditioned * invalid_beta_mask[None, :]
+            beta[invalid_beta] = 0.0
+        beta_jax = jnp.asarray(beta, dtype=solver_dtype)
+        search_direction = updated_preconditioned + search_direction * beta_jax[None, :]
+        search_direction = search_direction * jnp.asarray((~converged).astype(np.asarray(jnp.zeros((), dtype=solver_dtype)).dtype), dtype=solver_dtype)[None, :]
+        residual_dot = updated_residual_dot
+        active_count = new_active_count
+    final_residual = float(np.max(np.asarray(jnp.sum(residual * residual, axis=0), dtype=np.float64)))
+    final_threshold = float(np.max(convergence_threshold_sq))
+    raise RuntimeError(
+        "Conjugate-gradient solve failed to converge: "
+        + f"residual={final_residual:.2e} threshold={final_threshold:.2e} "
         + f"iterations={max_iterations}"
     )
 
