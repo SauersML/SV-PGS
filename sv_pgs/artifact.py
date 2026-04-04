@@ -145,6 +145,7 @@ def _record_to_json(record: VariantRecord) -> dict[str, Any]:
         "training_support": record.training_support,
         "is_repeat": record.is_repeat,
         "is_copy_number": record.is_copy_number,
+        "prior_continuous_features": dict(record.prior_continuous_features),
         "prior_class_members": [member.value for member in record.prior_class_members],
         "prior_class_membership": list(record.prior_class_membership),
     }
@@ -162,6 +163,10 @@ def _record_from_json(payload: dict[str, Any]) -> VariantRecord:
         training_support=None if payload["training_support"] is None else int(payload["training_support"]),
         is_repeat=bool(payload["is_repeat"]),
         is_copy_number=bool(payload["is_copy_number"]),
+        prior_continuous_features={
+            str(feature_name): float(feature_value)
+            for feature_name, feature_value in payload.get("prior_continuous_features", {}).items()
+        },
         prior_class_members=tuple(VariantClass(member) for member in payload["prior_class_members"]),
         prior_class_membership=tuple(float(weight) for weight in payload["prior_class_membership"]),
     )

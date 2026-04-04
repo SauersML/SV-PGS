@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 import numpy as np
+import pytest
 
 from sv_pgs.config import (
     DEFAULT_CLASS_LOG_BASELINE_SCALE,
@@ -110,45 +111,92 @@ class TestMetadataScaleModel:
         ]
         prior_design = _build_prior_design(records)
         coefficients = np.zeros(len(prior_design.feature_names), dtype=np.float64)
-        coefficients[prior_design.feature_names.index("log_length_linear::deletion_short")] = 0.5
+        coefficients[prior_design.feature_names.index("continuous_linear::log_length::deletion_short")] = 0.5
         coefficients[prior_design.feature_names.index("copy_number_indicator")] = 0.5
         coefficients[prior_design.feature_names.index("repeat_indicator")] = -0.5
         baseline_scales = _metadata_baseline_scales_from_coefficients(coefficients, prior_design.design_matrix, ModelConfig())
         assert np.unique(np.round(baseline_scales, 6)).shape[0] > 1
+
+    def test_custom_continuous_features_enter_scale_design_and_affect_prior_scale(self):
+        records = [
+            VariantRecord(
+                "sv_a",
+                VariantClass.DELETION_SHORT,
+                "chr1",
+                100,
+                prior_continuous_features={"sv_length_score": 0.1},
+            ),
+            VariantRecord(
+                "sv_b",
+                VariantClass.DELETION_SHORT,
+                "chr1",
+                101,
+                prior_continuous_features={"sv_length_score": 0.4},
+            ),
+            VariantRecord(
+                "sv_c",
+                VariantClass.DELETION_SHORT,
+                "chr1",
+                102,
+                prior_continuous_features={"sv_length_score": 0.9},
+            ),
+        ]
+        prior_design = _build_prior_design(records)
+        coefficients = np.zeros(len(prior_design.feature_names), dtype=np.float64)
+        coefficients[prior_design.feature_names.index("continuous_linear::sv_length_score::deletion_short")] = 0.5
+        coefficients[prior_design.feature_names.index("continuous_quadratic::sv_length_score::deletion_short")] = -0.25
+        baseline_scales = _metadata_baseline_scales_from_coefficients(coefficients, prior_design.design_matrix, ModelConfig())
+        assert "continuous_linear::sv_length_score::deletion_short" in prior_design.feature_names
+        assert "continuous_quadratic::sv_length_score::deletion_short" in prior_design.feature_names
+        assert np.unique(np.round(baseline_scales, 6)).shape[0] > 1
+
+    def test_custom_continuous_features_cannot_override_reserved_names(self):
+        with pytest.raises(ValueError, match="built-in features: log_length"):
+            VariantRecord(
+                "sv_a",
+                VariantClass.DELETION_SHORT,
+                "chr1",
+                100,
+                prior_continuous_features={"log_length": 1.0},
+            )
+
+    def test_custom_continuous_features_cannot_contain_feature_delimiter(self):
+        with pytest.raises(ValueError, match="cannot contain '::'"):
+            VariantRecord(
+                "sv_a",
+                VariantClass.DELETION_SHORT,
+                "chr1",
+                100,
+                prior_continuous_features={"bad::name": 1.0},
+            )
 
 
 class TestConfigValidation:
     """Config validation catches invalid parameter combinations."""
 
     def test_tpb_shape_bounds_validated(self):
-        import pytest
         with pytest.raises(ValueError):
             ModelConfig(minimum_tpb_shape=-0.1)
         with pytest.raises(ValueError):
             ModelConfig(maximum_tpb_shape=0.05, minimum_tpb_shape=0.1)
 
     def test_scale_model_iteration_count_validated(self):
-        import pytest
         with pytest.raises(ValueError):
             ModelConfig(maximum_scale_model_iterations=0)
 
     def test_tpb_shape_iteration_count_validated(self):
-        import pytest
         with pytest.raises(ValueError):
             ModelConfig(maximum_tpb_shape_iterations=0)
 
     def test_hierarchical_variance_validated(self):
-        import pytest
         with pytest.raises(ValueError):
             ModelConfig(tpb_hierarchical_prior_variance=-1.0)
 
     def test_tpb_shape_learning_rate_validated(self):
-        import pytest
         with pytest.raises(ValueError):
             ModelConfig(tpb_shape_learning_rate=0.0)
 
     def test_active_solver_config_validated(self):
-        import pytest
         with pytest.raises(ValueError):
             ModelConfig(max_inner_newton_iterations=0)
         with pytest.raises(ValueError):
@@ -165,7 +213,6 @@ class TestConfigValidation:
             ModelConfig(trust_region_minimum_damping=0.0)
 
     def test_linear_solver_config_validated(self):
-        import pytest
         with pytest.raises(ValueError):
             ModelConfig(linear_solver_tolerance=0.0)
         with pytest.raises(ValueError):

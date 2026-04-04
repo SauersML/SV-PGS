@@ -304,6 +304,7 @@ def test_artifact_roundtrip_preserves_prior_membership_metadata(tmp_path: Path):
                 length=750.0,
                 allele_frequency=0.03,
                 quality=0.9,
+                prior_continuous_features={"sv_length_score": 1.5},
                 prior_class_members=(VariantClass.DELETION_SHORT, VariantClass.SNV),
                 prior_class_membership=(0.25, 0.75),
             )
@@ -341,5 +342,6 @@ def test_artifact_roundtrip_preserves_prior_membership_metadata(tmp_path: Path):
     restored_artifact = load_artifact(artifact_path)
 
     restored_record = restored_artifact.records[0]
+    assert restored_record.prior_continuous_features == {"sv_length_score": 1.5}
     assert restored_record.prior_class_members == (VariantClass.DELETION_SHORT, VariantClass.SNV)
     np.testing.assert_allclose(restored_record.prior_class_membership, [0.25, 0.75])

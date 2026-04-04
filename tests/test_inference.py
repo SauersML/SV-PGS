@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import numpy as np
 import pytest
+import jax.numpy as jnp
 from scipy.special import kve
 
 from sv_pgs.config import ModelConfig, TraitType, VariantClass
@@ -9,9 +10,11 @@ from sv_pgs.data import TieGroup, TieMap, VariantRecord
 from sv_pgs.genotype import as_raw_genotype_matrix
 from sv_pgs.inference import fit_variational_em
 from sv_pgs.mixture_inference import (
+    _build_restricted_projector_jax,
     PosteriorState,
     _binary_posterior_state,
     _member_prior_variances_from_reduced_state,
+    _parse_scale_model_feature_names,
     _quantitative_posterior_state,
     _restricted_precision_projector,
     _restricted_variant_space_operator,
@@ -457,13 +460,15 @@ def test_restricted_variant_space_operator_matmat_matches_columnwise(random_gene
         scales=np.ones(variant_count, dtype=np.float32),
     )
     standardized._dense_cache = standardized.materialize()
-    _inverse_diagonal_noise, covariate_precision_cholesky, _covariate_precision_logdet, apply_projector = (
+    _inverse_diagonal_noise, covariate_precision_cholesky, _covariate_precision_logdet, _apply_projector = (
         _restricted_precision_projector(covariate_matrix.astype(np.float64), diagonal_noise)
     )
     operator = _restricted_variant_space_operator(
         genotype_matrix=standardized,
         prior_precision=prior_precision,
-        apply_projector=apply_projector,
+        inverse_diagonal_noise=_inverse_diagonal_noise,
+        covariate_matrix=covariate_matrix.astype(np.float64),
+        covariate_precision_cholesky=covariate_precision_cholesky,
         batch_size=4,
     )
 
@@ -480,6 +485,30 @@ def test_restricted_variant_space_operator_matmat_matches_columnwise(random_gene
         rtol=1e-5,
         atol=1e-5,
     )
+
+
+def test_restricted_projector_jax_matches_numpy_projector(random_generator):
+    sample_count = 24
+    covariate_matrix = np.column_stack(
+        [np.ones(sample_count), random_generator.normal(size=(sample_count, 2))]
+    ).astype(np.float64)
+    diagonal_noise = random_generator.uniform(0.5, 1.5, size=sample_count).astype(np.float64)
+    rhs_matrix = random_generator.normal(size=(sample_count, 4)).astype(np.float64)
+
+    inverse_diagonal_noise, covariate_precision_cholesky, _covariate_precision_logdet, apply_projector = (
+        _restricted_precision_projector(covariate_matrix, diagonal_noise)
+    )
+
+    expected = apply_projector(rhs_matrix)
+    apply_projector_jax = _build_restricted_projector_jax(
+        inverse_diagonal_noise=inverse_diagonal_noise,
+        covariate_matrix=covariate_matrix,
+        covariate_precision_cholesky=covariate_precision_cholesky,
+        compute_dtype=jnp.float64,
+    )
+    actual = np.asarray(apply_projector_jax(rhs_matrix), dtype=np.float64)
+
+    np.testing.assert_allclose(actual, expected, rtol=1e-7, atol=1e-7)
 
 
 def test_materialized_woodbury_posterior_matches_dense_reference(random_generator):
@@ -630,10 +659,10 @@ def test_member_prior_variances_preserve_member_metadata_with_ties():
         member_records=member_records,
         tie_map=tie_map,
         scale_model_coefficients=np.array([1.0, -1.0], dtype=np.float64),
-        scale_model_feature_names=[
+        scale_model_feature_specs=_parse_scale_model_feature_names([
             "type_offset::snv",
             "type_offset::deletion_short",
-        ],
+        ]),
         global_scale=1.0,
         local_scale=np.array([2.0], dtype=np.float64),
         config=ModelConfig(),

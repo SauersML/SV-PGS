@@ -57,6 +57,7 @@ from typing import Callable, Sequence
 
 import sv_pgs._jax  # noqa: F401
 import jax.numpy as jnp
+from jax.scipy.linalg import solve_triangular as jax_solve_triangular
 from jax.scipy.special import digamma as jax_digamma
 from jax.scipy.special import gammaln as jax_gammaln
 import numpy as np
@@ -90,8 +91,16 @@ class PriorDesign:
     """
     design_matrix: np.ndarray           # each row = one variant's metadata features
     feature_names: list[str]            # human-readable names for each feature column
+    feature_specs: tuple[ScaleModelFeatureSpec, ...]  # compiled feature descriptors for fast reuse
     class_membership_matrix: np.ndarray # which variant class(es) each variant belongs to
     inverse_class_lookup: dict[int, VariantClass]  # column index -> VariantClass enum
+
+
+@dataclass(slots=True)
+class ScaleModelFeatureSpec:
+    kind: str
+    variant_class: VariantClass | None = None
+    continuous_feature_name: str | None = None
 
 
 @dataclass(slots=True)
@@ -414,7 +423,7 @@ def fit_variational_em(
         member_records=member_records,
         tie_map=tie_map,
         scale_model_coefficients=scale_model_coefficients,
-        scale_model_feature_names=prior_design.feature_names,
+        scale_model_feature_specs=prior_design.feature_specs,
         global_scale=float(global_scale),
         local_scale=local_scale,
         config=config,
@@ -984,19 +993,23 @@ def _restricted_precision_projector(
 def _restricted_variant_space_operator(
     genotype_matrix: StandardizedGenotypeMatrix,
     prior_precision: np.ndarray,
-    apply_projector: Callable[[np.ndarray], np.ndarray],
+    inverse_diagonal_noise: np.ndarray,
+    covariate_matrix: np.ndarray,
+    covariate_precision_cholesky: np.ndarray,
     batch_size: int,
 ):
     compute_dtype = gpu_compute_jax_dtype()
-    compute_np_dtype = gpu_compute_numpy_dtype()
     prior_precision_jax = jnp.asarray(prior_precision, dtype=compute_dtype)
+    apply_projector = _build_restricted_projector_jax(
+        inverse_diagonal_noise=inverse_diagonal_noise,
+        covariate_matrix=covariate_matrix,
+        covariate_precision_cholesky=covariate_precision_cholesky,
+        compute_dtype=compute_dtype,
+    )
 
     def matvec(vector) -> jnp.ndarray:
         coefficients = jnp.asarray(vector, dtype=compute_dtype)
-        genotype_projection = np.asarray(
-            genotype_matrix.matvec(coefficients, batch_size=batch_size),
-            dtype=compute_np_dtype,
-        )
+        genotype_projection = genotype_matrix.matvec(coefficients, batch_size=batch_size)
         restricted_projection = apply_projector(genotype_projection)
         return prior_precision_jax * coefficients + genotype_matrix.transpose_matvec(
             restricted_projection,
@@ -1005,10 +1018,7 @@ def _restricted_variant_space_operator(
 
     def matmat(matrix) -> jnp.ndarray:
         coefficients = jnp.asarray(matrix, dtype=compute_dtype)
-        genotype_projection = np.asarray(
-            genotype_matrix.matmat(coefficients, batch_size=batch_size),
-            dtype=compute_np_dtype,
-        )
+        genotype_projection = genotype_matrix.matmat(coefficients, batch_size=batch_size)
         restricted_projection = apply_projector(genotype_projection)
         return prior_precision_jax[:, None] * coefficients + genotype_matrix.transpose_matmat(
             restricted_projection,
@@ -1021,6 +1031,42 @@ def _restricted_variant_space_operator(
         matmat=matmat,
         dtype=compute_dtype,
     )
+
+
+def _build_restricted_projector_jax(
+    inverse_diagonal_noise: np.ndarray,
+    covariate_matrix: np.ndarray,
+    covariate_precision_cholesky: np.ndarray,
+    compute_dtype,
+):
+    inverse_diagonal_noise_jax = jnp.asarray(inverse_diagonal_noise, dtype=compute_dtype)
+    covariate_matrix_jax = jnp.asarray(covariate_matrix, dtype=compute_dtype)
+    covariate_precision_cholesky_jax = jnp.asarray(covariate_precision_cholesky, dtype=compute_dtype)
+    weighted_covariates_jax = inverse_diagonal_noise_jax[:, None] * covariate_matrix_jax
+
+    def apply_projector(right_hand_side: np.ndarray | jnp.ndarray) -> jnp.ndarray:
+        rhs = jnp.asarray(right_hand_side, dtype=compute_dtype)
+        if rhs.ndim not in (1, 2):
+            raise ValueError("restricted projector expects a vector or matrix right-hand side.")
+        weighted_rhs = (
+            inverse_diagonal_noise_jax[:, None] * rhs
+            if rhs.ndim == 2
+            else inverse_diagonal_noise_jax * rhs
+        )
+        correction_rhs = covariate_matrix_jax.T @ weighted_rhs
+        lower_solution = jax_solve_triangular(
+            covariate_precision_cholesky_jax,
+            correction_rhs,
+            lower=True,
+        )
+        upper_solution = jax_solve_triangular(
+            covariate_precision_cholesky_jax.T,
+            lower_solution,
+            lower=False,
+        )
+        return weighted_rhs - weighted_covariates_jax @ upper_solution
+
+    return apply_projector
 
 
 def _restricted_variant_space_diagonal_preconditioner(
@@ -1109,6 +1155,7 @@ def _restricted_posterior_state(
     initial_beta_guess: np.ndarray | None = None,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, float, float, float]:
     from sv_pgs.progress import log, mem
+    compute_jax_dtype = gpu_compute_jax_dtype()
     compute_np_dtype = gpu_compute_numpy_dtype()
     sample_count = genotype_matrix.shape[0]
     diagonal_noise = np.asarray(diagonal_noise, dtype=np.float64)
@@ -1191,6 +1238,12 @@ def _restricted_posterior_state(
 
     inverse_diagonal_noise, covariate_precision_cholesky, covariate_precision_logdet, apply_projector = (
         _restricted_precision_projector(covariate_matrix, diagonal_noise)
+    )
+    apply_projector_jax = _build_restricted_projector_jax(
+        inverse_diagonal_noise=inverse_diagonal_noise,
+        covariate_matrix=covariate_matrix,
+        covariate_precision_cholesky=covariate_precision_cholesky,
+        compute_dtype=compute_jax_dtype,
     )
 
     if use_variant_space:
@@ -1298,7 +1351,9 @@ def _restricted_posterior_state(
             variant_operator = _restricted_variant_space_operator(
                 genotype_matrix=genotype_matrix,
                 prior_precision=prior_precision,
-                apply_projector=apply_projector,
+                inverse_diagonal_noise=inverse_diagonal_noise,
+                covariate_matrix=covariate_matrix,
+                covariate_precision_cholesky=covariate_precision_cholesky,
                 batch_size=posterior_variance_batch_size,
             )
             log(f"      operator setup: {_time.monotonic() - _t0:.1f}s  mem={mem()}")
@@ -1313,9 +1368,10 @@ def _restricted_posterior_state(
             )
             log(f"      preconditioner: {_time.monotonic() - _t0:.1f}s  mem={mem()}")
             _t0 = _time.monotonic()
+            restricted_targets = apply_projector_jax(targets)
             variant_rhs = np.asarray(
                 genotype_matrix.transpose_matvec(
-                    apply_projector(targets),
+                    restricted_targets,
                     batch_size=posterior_variance_batch_size,
                 ),
                 dtype=np.float64,
@@ -1539,34 +1595,53 @@ def _build_prior_design(records: Sequence[VariantRecord]) -> PriorDesign:
             class_membership_matrix[record_index, class_lookup[prior_class]] = prior_weight
     class_membership_totals = np.sum(class_membership_matrix, axis=0)
 
-    log_length = np.log(np.maximum(np.asarray([record.length for record in records], dtype=np.float64), 1.0))
+    continuous_feature_names, continuous_feature_matrix = _continuous_prior_design_matrix(records)
     repeat_indicator = np.asarray([float(record.is_repeat) for record in records], dtype=np.float64)
     copy_number_indicator = np.asarray([float(record.is_copy_number) for record in records], dtype=np.float64)
 
-    standardized_log_length = _standardize_metadata(log_length)
-
     design_columns: list[np.ndarray] = []
     feature_names: list[str] = []
+    feature_specs: list[ScaleModelFeatureSpec] = []
     for class_index, variant_class in enumerate(unique_classes):
         class_membership = class_membership_matrix[:, class_index]
         design_columns.append(_center_design_column(class_membership))
         feature_names.append("type_offset::" + variant_class.value)
+        feature_specs.append(ScaleModelFeatureSpec(kind="type_offset", variant_class=variant_class))
 
         if class_membership_totals[class_index] < 3.0:
             continue
 
-        design_columns.append(_center_design_column(class_membership * standardized_log_length))
-        feature_names.append("log_length_linear::" + variant_class.value)
-        design_columns.append(_center_design_column(class_membership * standardized_log_length * standardized_log_length))
-        feature_names.append("log_length_quadratic::" + variant_class.value)
+        for continuous_feature_index, continuous_feature_name in enumerate(continuous_feature_names):
+            standardized_values = continuous_feature_matrix[:, continuous_feature_index]
+            design_columns.append(_center_design_column(class_membership * standardized_values))
+            feature_names.append(f"continuous_linear::{continuous_feature_name}::{variant_class.value}")
+            feature_specs.append(
+                ScaleModelFeatureSpec(
+                    kind="continuous_linear",
+                    variant_class=variant_class,
+                    continuous_feature_name=continuous_feature_name,
+                )
+            )
+            design_columns.append(_center_design_column(class_membership * standardized_values * standardized_values))
+            feature_names.append(f"continuous_quadratic::{continuous_feature_name}::{variant_class.value}")
+            feature_specs.append(
+                ScaleModelFeatureSpec(
+                    kind="continuous_quadratic",
+                    variant_class=variant_class,
+                    continuous_feature_name=continuous_feature_name,
+                )
+            )
     design_columns.append(_center_design_column(repeat_indicator))
     feature_names.append("repeat_indicator")
+    feature_specs.append(ScaleModelFeatureSpec(kind="repeat_indicator"))
     design_columns.append(_center_design_column(copy_number_indicator))
     feature_names.append("copy_number_indicator")
+    feature_specs.append(ScaleModelFeatureSpec(kind="copy_number_indicator"))
 
     return PriorDesign(
         design_matrix=np.column_stack(design_columns).astype(np.float64),
         feature_names=feature_names,
+        feature_specs=tuple(feature_specs),
         class_membership_matrix=class_membership_matrix,
         inverse_class_lookup=inverse_class_lookup,
     )
@@ -1576,7 +1651,15 @@ def _design_matrix_for_feature_names(
     records: Sequence[VariantRecord],
     feature_names: Sequence[str],
 ) -> np.ndarray:
-    if len(feature_names) == 0:
+    feature_specs = _parse_scale_model_feature_names(feature_names)
+    return _design_matrix_for_feature_specs(records, feature_specs)
+
+
+def _design_matrix_for_feature_specs(
+    records: Sequence[VariantRecord],
+    feature_specs: Sequence[ScaleModelFeatureSpec],
+) -> np.ndarray:
+    if len(feature_specs) == 0:
         return np.zeros((len(records), 0), dtype=np.float64)
     class_membership_by_class: dict[VariantClass, np.ndarray] = {}
     for variant_class in VariantClass:
@@ -1588,36 +1671,48 @@ def _design_matrix_for_feature_names(
             dtype=np.float64,
         )
 
-    log_length = np.log(np.maximum(np.asarray([record.length for record in records], dtype=np.float64), 1.0))
-    standardized_log_length = _standardize_metadata(log_length)
+    continuous_feature_names, continuous_feature_matrix = _continuous_prior_design_matrix(records)
+    continuous_feature_index_by_name = {
+        feature_name: feature_index
+        for feature_index, feature_name in enumerate(continuous_feature_names)
+    }
     repeat_indicator = np.asarray([float(record.is_repeat) for record in records], dtype=np.float64)
     copy_number_indicator = np.asarray([float(record.is_copy_number) for record in records], dtype=np.float64)
 
     design_columns: list[np.ndarray] = []
-    for feature_name in feature_names:
-        if feature_name == "repeat_indicator":
+    for feature_spec in feature_specs:
+        if feature_spec.kind == "repeat_indicator":
             design_columns.append(_center_design_column(repeat_indicator))
             continue
-        if feature_name == "copy_number_indicator":
+        if feature_spec.kind == "copy_number_indicator":
             design_columns.append(_center_design_column(copy_number_indicator))
             continue
-        prefix, _, class_name = feature_name.partition("::")
-        if not class_name:
-            raise ValueError("scale-model feature names must include a class suffix when required.")
-        variant_class = VariantClass(class_name)
+        if feature_spec.variant_class is None:
+            raise ValueError("Scale-model feature spec is missing variant_class.")
+        variant_class = feature_spec.variant_class
         class_membership = class_membership_by_class[variant_class]
-        if prefix == "type_offset":
+        if feature_spec.kind == "type_offset":
             design_columns.append(_center_design_column(class_membership))
             continue
-        if prefix == "log_length_linear":
-            design_columns.append(_center_design_column(class_membership * standardized_log_length))
+        if feature_spec.continuous_feature_name is None:
+            raise ValueError("Scale-model feature spec is missing continuous_feature_name.")
+        if feature_spec.continuous_feature_name not in continuous_feature_index_by_name:
+            raise ValueError("Unknown continuous scale-model feature: " + str(feature_spec.continuous_feature_name))
+        standardized_values = continuous_feature_matrix[
+            :,
+            continuous_feature_index_by_name[feature_spec.continuous_feature_name],
+        ]
+        if feature_spec.kind == "continuous_linear":
+            design_columns.append(_center_design_column(class_membership * standardized_values))
             continue
-        if prefix == "log_length_quadratic":
+        if feature_spec.kind == "continuous_quadratic":
             design_columns.append(
-                _center_design_column(class_membership * standardized_log_length * standardized_log_length)
+                _center_design_column(
+                    class_membership * standardized_values * standardized_values
+                )
             )
             continue
-        raise ValueError("Unsupported scale-model feature: " + feature_name)
+        raise ValueError("Unsupported scale-model feature kind: " + feature_spec.kind)
 
     return np.column_stack(design_columns).astype(np.float64)
 
@@ -1627,6 +1722,63 @@ def _class_membership_weight(record: VariantRecord, variant_class: VariantClass)
         if member_class == variant_class:
             return float(member_weight)
     return 0.0
+
+
+def _parse_scale_model_feature_names(
+    feature_names: Sequence[str],
+) -> tuple[ScaleModelFeatureSpec, ...]:
+    feature_specs: list[ScaleModelFeatureSpec] = []
+    for feature_name in feature_names:
+        if feature_name == "repeat_indicator":
+            feature_specs.append(ScaleModelFeatureSpec(kind="repeat_indicator"))
+            continue
+        if feature_name == "copy_number_indicator":
+            feature_specs.append(ScaleModelFeatureSpec(kind="copy_number_indicator"))
+            continue
+        feature_parts = feature_name.split("::")
+        if len(feature_parts) == 2:
+            prefix, class_name = feature_parts
+            continuous_feature_name = None
+        elif len(feature_parts) == 3:
+            prefix, continuous_feature_name, class_name = feature_parts
+        else:
+            raise ValueError("Unsupported scale-model feature: " + feature_name)
+        feature_specs.append(
+            ScaleModelFeatureSpec(
+                kind=prefix,
+                variant_class=VariantClass(class_name),
+                continuous_feature_name=continuous_feature_name,
+            )
+        )
+    return tuple(feature_specs)
+
+
+def _continuous_prior_design_matrix(
+    records: Sequence[VariantRecord],
+) -> tuple[tuple[str, ...], np.ndarray]:
+    feature_names = ["log_length"]
+    feature_columns = [
+        np.log(np.maximum(np.asarray([record.length for record in records], dtype=np.float64), 1.0))
+    ]
+    custom_feature_names = sorted(
+        {
+            feature_name
+            for record in records
+            for feature_name in record.prior_continuous_features
+        }
+    )
+    for feature_name in custom_feature_names:
+        feature_names.append(feature_name)
+        feature_columns.append(
+            [
+                record.prior_continuous_features.get(feature_name, 0.0)
+                for record in records
+            ]
+        )
+    feature_matrix = np.column_stack(feature_columns).astype(np.float64)
+    for feature_index in range(feature_matrix.shape[1]):
+        feature_matrix[:, feature_index] = _standardize_metadata(feature_matrix[:, feature_index])
+    return tuple(feature_names), feature_matrix
 
 
 def _standardize_metadata(values: np.ndarray) -> np.ndarray:
@@ -2059,14 +2211,14 @@ def _member_prior_variances_from_reduced_state(
     member_records: Sequence[VariantRecord],
     tie_map: TieMap,
     scale_model_coefficients: np.ndarray,
-    scale_model_feature_names: Sequence[str],
+    scale_model_feature_specs: Sequence[ScaleModelFeatureSpec],
     global_scale: float,
     local_scale: np.ndarray,
     config: ModelConfig,
 ) -> np.ndarray:
-    member_design_matrix = _design_matrix_for_feature_names(
+    member_design_matrix = _design_matrix_for_feature_specs(
         records=member_records,
-        feature_names=scale_model_feature_names,
+        feature_specs=scale_model_feature_specs,
     )
     member_baseline_scales = _metadata_baseline_scales_from_coefficients(
         scale_model_coefficients=np.asarray(scale_model_coefficients, dtype=np.float64),

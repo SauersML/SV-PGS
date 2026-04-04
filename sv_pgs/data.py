@@ -1,11 +1,14 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Sequence
 
 import numpy as np
 
 from sv_pgs.config import VariantClass
+
+
+RESERVED_PRIOR_CONTINUOUS_FEATURE_NAMES = frozenset({"log_length"})
 
 
 @dataclass(slots=True)
@@ -26,10 +29,27 @@ class VariantRecord:
     training_support: int | None = None
     is_repeat: bool = False
     is_copy_number: bool = False
+    prior_continuous_features: dict[str, float] = field(default_factory=dict)
     prior_class_members: tuple[VariantClass, ...] = ()
     prior_class_membership: tuple[float, ...] = ()
 
     def __post_init__(self) -> None:
+        self.prior_continuous_features = {
+            str(feature_name): float(feature_value)
+            for feature_name, feature_value in self.prior_continuous_features.items()
+        }
+        for feature_name, feature_value in self.prior_continuous_features.items():
+            if not feature_name:
+                raise ValueError("prior_continuous_features keys cannot be empty.")
+            if "::" in feature_name:
+                raise ValueError("prior_continuous_features keys cannot contain '::'.")
+            if feature_name in RESERVED_PRIOR_CONTINUOUS_FEATURE_NAMES:
+                raise ValueError(
+                    "prior_continuous_features keys cannot override built-in features: "
+                    + feature_name
+                )
+            if not np.isfinite(feature_value):
+                raise ValueError("prior_continuous_features values must be finite.")
         if not self.prior_class_members and not self.prior_class_membership:
             self.prior_class_members = (self.variant_class,)
             self.prior_class_membership = (1.0,)
@@ -129,6 +149,7 @@ def normalize_variant_records(records: Sequence[VariantRecord | dict[str, Any]])
                     training_support=record.training_support,
                     is_repeat=record.is_repeat,
                     is_copy_number=record.is_copy_number,
+                    prior_continuous_features=dict(record.prior_continuous_features),
                     prior_class_members=record.prior_class_members,
                     prior_class_membership=record.prior_class_membership,
                 )
@@ -150,6 +171,10 @@ def normalize_variant_records(records: Sequence[VariantRecord | dict[str, Any]])
                 ),
                 is_repeat=bool(record.get("is_repeat", False)),
                 is_copy_number=bool(record.get("is_copy_number", False)),
+                prior_continuous_features={
+                    str(feature_name): float(feature_value)
+                    for feature_name, feature_value in record.get("prior_continuous_features", {}).items()
+                },
                 prior_class_members=tuple(
                     VariantClass(member_value) for member_value in record.get("prior_class_members", ())
                 ),

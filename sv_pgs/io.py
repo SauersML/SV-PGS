@@ -812,6 +812,15 @@ def _merge_variant_metadata(
 
     prior_class_members = _parse_variant_classes(metadata_row.get("prior_class_members"))
     prior_class_membership = _parse_float_list(metadata_row.get("prior_class_membership"))
+    prior_continuous_features = {
+        column_name.removeprefix("prior_continuous__"): _parse_float_or_default(
+            column_value,
+            0.0,
+            column_name=column_name,
+        )
+        for column_name, column_value in metadata_row.items()
+        if column_name.startswith("prior_continuous__")
+    }
     return VariantRecord(
         variant_id=_coalesce_string(metadata_row.get("variant_id"), default_variant.variant_id),
         variant_class=_parse_variant_class(metadata_row.get("variant_class"), default_variant.variant_class),
@@ -827,6 +836,7 @@ def _merge_variant_metadata(
         training_support=_parse_optional_int(metadata_row.get("training_support"), column_name="training_support"),
         is_repeat=_parse_bool_or_default(metadata_row.get("is_repeat"), False, column_name="is_repeat"),
         is_copy_number=_parse_bool_or_default(metadata_row.get("is_copy_number"), False, column_name="is_copy_number"),
+        prior_continuous_features=prior_continuous_features,
         prior_class_members=prior_class_members,
         prior_class_membership=prior_class_membership,
     )

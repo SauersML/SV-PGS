@@ -61,10 +61,10 @@ def test_load_dataset_from_vcf_uses_metadata_and_sample_alignment(tmp_path: Path
     metadata_path = tmp_path / "variants.tsv"
     _write_table(
         metadata_path,
-        header=("variant_id", "variant_class", "training_support", "is_copy_number"),
+        header=("variant_id", "variant_class", "training_support", "is_copy_number", "prior_continuous__sv_length_score"),
         rows=(
-            ("rs1", "snv", "", "false"),
-            ("sv1", "deletion_short", "2", "true"),
+            ("rs1", "snv", "", "false", "0.25"),
+            ("sv1", "deletion_short", "2", "true", "1.75"),
         ),
     )
 
@@ -87,8 +87,10 @@ def test_load_dataset_from_vcf_uses_metadata_and_sample_alignment(tmp_path: Path
     np.testing.assert_allclose(dataset.variant_stats.means, np.array([1.5, 0.5], dtype=np.float32))
     assert dataset.variant_records[0].variant_class == VariantClass.SNV
     assert dataset.variant_records[1].variant_class == VariantClass.DELETION_SHORT
+    assert dataset.variant_records[0].prior_continuous_features == {"sv_length_score": 0.25}
     assert dataset.variant_records[1].training_support == 2
     assert dataset.variant_records[1].is_copy_number is True
+    assert dataset.variant_records[1].prior_continuous_features == {"sv_length_score": 1.75}
 
 
 def test_load_dataset_from_vcf_auto_detects_research_id_column(tmp_path: Path):

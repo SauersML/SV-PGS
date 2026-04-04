@@ -286,13 +286,12 @@ def _as_gpu_compute_jax(array) -> jnp.ndarray:
 
 
 def _cupy_to_jax(array) -> jnp.ndarray:
-    """Convert CuPy result to JAX float64 via CPU.  dlpack zero-copy is avoided
-    because CuPy and JAX use separate CUDA streams/contexts that can desync."""
-    return jnp.asarray(array.get().astype(np.float64), dtype=jnp.float64)
+    """Convert CuPy result to JAX via host copy for stream-safe interop."""
+    return jnp.asarray(array.get(), dtype=gpu_compute_jax_dtype())
 
 
 def _to_cupy_float32(array):
-    """Convert JAX/numpy array to CuPy float32 for GPU matmul."""
+    """Convert JAX/numpy array to CuPy float32 for CuPy matmul."""
     cupy = _try_import_cupy()
     if cupy is None:
         raise RuntimeError("CuPy is not available.")
