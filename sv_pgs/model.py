@@ -141,11 +141,13 @@ class BayesianPGS:
                 np.asarray(validation_targets, dtype=np.float32),
             )
 
-        # Materialize the reduced genotype matrix into CPU RAM to avoid
-        # re-reading from disk on every EM iteration.
+        # Materialize the reduced genotype matrix (RAM or GPU via CuPy).
+        # Free the raw int8 matrix afterward — no longer needed.
         cached = reduced_genotypes.try_materialize_gpu()
         if not cached:
             cached = reduced_genotypes.try_materialize()
+        del raw_genotype_matrix, standardized_genotypes, active_genotypes
+        import gc; gc.collect()
         log(
             f"starting variational EM  max_iterations={self.config.max_outer_iterations}  "
             f"reduced_matrix={reduced_genotypes.shape}  in_memory={cached}  "

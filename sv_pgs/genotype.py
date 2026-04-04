@@ -345,7 +345,9 @@ class StandardizedGenotypeMatrix:
         if cupy is not None:
             try:
                 self._cupy_cache = cupy.asarray(self._dense_cache)
-                log(f"    CuPy GPU matrix uploaded ({self._cupy_cache.nbytes / 1e9:.1f} GB)  mem={mem()}")
+                # Free the CPU copy — data lives on GPU now, saves ~4 GB RAM
+                self._dense_cache = None
+                log(f"    CuPy GPU matrix uploaded ({self._cupy_cache.nbytes / 1e9:.1f} GB), CPU copy freed  mem={mem()}")
                 return True
             except Exception as exc:
                 log(f"    CuPy GPU upload failed ({exc}), using CPU numpy BLAS  mem={mem()}")
