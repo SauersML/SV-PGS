@@ -131,8 +131,8 @@ class ModelConfig:
     trust_region_success_threshold: float = 0.25
     trust_region_minimum_damping: float = 1e-8
 
-    linear_solver_tolerance: float = 1e-6
-    maximum_linear_solver_iterations: int = 256
+    linear_solver_tolerance: float = 1e-5
+    maximum_linear_solver_iterations: int = 512
     logdet_probe_count: int = 6
     logdet_lanczos_steps: int = 12
     exact_solver_matrix_limit: int = 2048  # below this: direct solve; above: Woodbury or CG
