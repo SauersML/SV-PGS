@@ -1,1 +1,67 @@
-cd ~/SV-PGS && git pull && uv sync --python 3.12 --extra gpu && uv run sv-pgs run --genotypes AoU_srWGS_SV.v8.chr22.vcf.gz --genotype-format vcf --sample-table t2d.samples.tsv --target-column target --covariate-column age_at_observation_start --covariate-column gender_concept_id --covariate-column race_concept_id --covariate-column ethnicity_concept_id --output-dir t2d_sv_chr22_results
+#!/bin/bash
+# SV-PGS: All diseases × All autosomes on AoU
+# Covariates: age, sex, race, ethnicity
+# Note: PCs not available in EHR tables; race/ethnicity_concept_id partially controls for ancestry
+#
+# VCF source: ${CDR_STORAGE_PATH}/wgs/short_read/structural_variants/vcf/full/
+# VCFs are per-chromosome: AoU_srWGS_SV.v8.chr{1..22}.vcf.gz
+
+set -euo pipefail
+cd ~/SV-PGS && git pull && uv sync --python 3.12 --extra gpu
+
+COVARIATES="--covariate-column age_at_observation_start --covariate-column gender_concept_id --covariate-column race_concept_id --covariate-column ethnicity_concept_id"
+VCF_DIR="${CDR_STORAGE_PATH}/wgs/short_read/structural_variants/vcf/full"
+
+DISEASES=(
+  type2_diabetes
+  heart_failure
+  atrial_fibrillation
+  asthma
+  copd
+  chronic_kidney_disease
+  coronary_artery_disease
+  stroke
+  depression
+  hypertension
+)
+
+# Step 1: Download all chromosome VCFs (skip if already present)
+for CHR in $(seq 1 22); do
+  VCF="AoU_srWGS_SV.v8.chr${CHR}.vcf.gz"
+  if [ ! -f "$VCF" ]; then
+    echo "=== Downloading ${VCF} ==="
+    gsutil -u $GOOGLE_PROJECT cp "${VCF_DIR}/${VCF}" "${VCF_DIR}/${VCF}.tbi" .
+  fi
+done
+
+# Step 2: Prepare sample tables for each disease
+for DISEASE in "${DISEASES[@]}"; do
+  SAMPLE_TABLE="${DISEASE}.samples.tsv"
+  if [ ! -f "$SAMPLE_TABLE" ]; then
+    echo "=== Preparing sample table: ${DISEASE} ==="
+    uv run sv-pgs prepare-all-of-us-disease --disease "$DISEASE" --output "$SAMPLE_TABLE"
+  fi
+done
+
+# Step 3: Run SV-PGS for each disease × each chromosome
+for DISEASE in "${DISEASES[@]}"; do
+  SAMPLE_TABLE="${DISEASE}.samples.tsv"
+  for CHR in $(seq 1 22); do
+    VCF="AoU_srWGS_SV.v8.chr${CHR}.vcf.gz"
+    OUTPUT_DIR="${DISEASE}_sv_chr${CHR}_results"
+    if [ -d "$OUTPUT_DIR" ]; then
+      echo "=== Skipping ${DISEASE} chr${CHR} (already done) ==="
+      continue
+    fi
+    echo "=== Running ${DISEASE} chr${CHR} ==="
+    uv run sv-pgs run \
+      --genotypes "$VCF" \
+      --genotype-format vcf \
+      --sample-table "$SAMPLE_TABLE" \
+      --target-column target \
+      $COVARIATES \
+      --output-dir "$OUTPUT_DIR"
+  done
+done
+
+echo "=== ALL DONE ==="
