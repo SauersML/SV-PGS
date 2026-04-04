@@ -715,6 +715,9 @@ def _binary_posterior_state(
     import time as _time
     stalled_objective_relative_tolerance = 1e-12
     stalled_step_tolerance = max(1e-3, gradient_tolerance * 100.0)
+    cached_proposal_base_parameters: np.ndarray | None = None
+    cached_proposed_parameters: np.ndarray | None = None
+    cached_newton_direction: np.ndarray | None = None
     log(f"      Newton trust-region: {standardized_genotypes.shape[1]} variants, max_iter={max_iterations}, damping={damping:.2e}  mem={mem()}")
     for _iteration_index in range(max_iterations):
         _newton_t0 = _time.monotonic()
@@ -725,32 +728,45 @@ def _binary_posterior_state(
             log(f"      Newton converged at iter {_iteration_index+1}: grad_norm={gradient_norm:.2e} <= tol={gradient_tolerance:.2e}")
             break
         working_response = linear_predictor + (targets.astype(compute_np_dtype, copy=False) - np.asarray(stable_sigmoid(jnp.asarray(linear_predictor, dtype=compute_jax_dtype)), dtype=compute_np_dtype)) / weights
-        _t_solve_start = _time.monotonic()
-        proposed_alpha, proposed_beta, _, _projected_targets, _fitted_response, _restricted_quadratic, _logdet_covariance, _logdet_gls = (
-            _restricted_posterior_state(
-                    genotype_matrix=standardized_genotypes,
-                covariate_matrix=covariate_matrix,
-                targets=working_response,
-                prior_variances=prior_variances,
-                diagonal_noise=1.0 / weights,
-                solver_tolerance=solver_tolerance,
-                maximum_linear_solver_iterations=maximum_linear_solver_iterations,
-                logdet_probe_count=logdet_probe_count,
-                logdet_lanczos_steps=logdet_lanczos_steps,
-                exact_solver_matrix_limit=exact_solver_matrix_limit,
-                posterior_variance_batch_size=posterior_variance_batch_size,
-                posterior_variance_probe_count=posterior_variance_probe_count,
-                random_seed=random_seed + _iteration_index,
-                compute_logdet=False,
-                compute_beta_variance=False,
-                initial_beta_guess=parameters[covariate_count:],
+        if (
+            cached_proposal_base_parameters is not None
+            and np.array_equal(parameters, cached_proposal_base_parameters)
+            and cached_proposed_parameters is not None
+            and cached_newton_direction is not None
+        ):
+            proposed_parameters = cached_proposed_parameters
+            newton_direction = cached_newton_direction
+            _t_solve = 0.0
+        else:
+            _t_solve_start = _time.monotonic()
+            proposed_alpha, proposed_beta, _, _projected_targets, _fitted_response, _restricted_quadratic, _logdet_covariance, _logdet_gls = (
+                _restricted_posterior_state(
+                        genotype_matrix=standardized_genotypes,
+                    covariate_matrix=covariate_matrix,
+                    targets=working_response,
+                    prior_variances=prior_variances,
+                    diagonal_noise=1.0 / weights,
+                    solver_tolerance=solver_tolerance,
+                    maximum_linear_solver_iterations=maximum_linear_solver_iterations,
+                    logdet_probe_count=logdet_probe_count,
+                    logdet_lanczos_steps=logdet_lanczos_steps,
+                    exact_solver_matrix_limit=exact_solver_matrix_limit,
+                    posterior_variance_batch_size=posterior_variance_batch_size,
+                    posterior_variance_probe_count=posterior_variance_probe_count,
+                    random_seed=random_seed + _iteration_index,
+                    compute_logdet=False,
+                    compute_beta_variance=False,
+                    initial_beta_guess=parameters[covariate_count:],
+                )
             )
-        )
-        proposed_parameters = np.concatenate([proposed_alpha, proposed_beta], axis=0)
-        newton_direction = proposed_parameters - parameters
+            proposed_parameters = np.concatenate([proposed_alpha, proposed_beta], axis=0)
+            newton_direction = proposed_parameters - parameters
+            cached_proposal_base_parameters = parameters.copy()
+            cached_proposed_parameters = proposed_parameters
+            cached_newton_direction = newton_direction
+            _t_solve = _time.monotonic() - _t_solve_start
         step_scale = 1.0 / (1.0 + damping)
         candidate_parameters = parameters + step_scale * newton_direction
-        _t_solve = _time.monotonic() - _t_solve_start
         candidate_objective, _candidate_gradient, _candidate_weights, _candidate_linear_predictor = penalized_terms(candidate_parameters)
         _t_total = _time.monotonic() - _newton_t0
         actual_gain = candidate_objective - current_objective
@@ -764,6 +780,9 @@ def _binary_posterior_state(
         accept = np.isfinite(candidate_objective) and actual_gain > 0.0 and gain_ratio >= success_threshold
         if accept:
             parameters = candidate_parameters
+            cached_proposal_base_parameters = None
+            cached_proposed_parameters = None
+            cached_newton_direction = None
             damping = max(damping * damping_decrease_factor, minimum_damping)
             log(f"      Newton iter {_iteration_index+1}/{max_iterations}: ACCEPT  obj={candidate_objective:.4f}  gain={actual_gain:.2e}  ratio={gain_ratio:.3f}  grad={gradient_norm:.2e}  step={relative_step_size:.2e}  damping={damping:.2e}  [penalized={_t_penalized:.1f}s solve={_t_solve:.1f}s total={_t_total:.1f}s]  mem={mem()}")
             if relative_step_size <= gradient_tolerance:
