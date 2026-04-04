@@ -139,9 +139,12 @@ def stochastic_logdet(
             start_vector=probe_vector,
             step_count=step_count,
         )
-        eigenvalues, eigenvectors = jnp.linalg.eigh(tridiagonal)
-        clipped_eigenvalues = jnp.maximum(eigenvalues, 1e-12)
-        estimates.append(float(jnp.sum((eigenvectors[0, :] ** 2) * jnp.log(clipped_eigenvalues))))
+        # Use numpy for the tiny (step_count × step_count) eigendecomposition.
+        # JAX's eigh uses cuSolver which can fail when CuPy holds the GPU context.
+        tri_np = np.asarray(tridiagonal, dtype=np.float64)
+        eigenvalues, eigenvectors = np.linalg.eigh(tri_np)
+        clipped_eigenvalues = np.maximum(eigenvalues, 1e-12)
+        estimates.append(float(np.sum((eigenvectors[0, :] ** 2) * np.log(clipped_eigenvalues))))
     return float(dimension * np.mean(estimates))
 
 
