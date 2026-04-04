@@ -26,6 +26,9 @@ DISEASE_DEFINITIONS: tuple[DiseaseDefinition, ...] = (
         canonical_name="type2_diabetes",
         aliases=("t2d", "type_2_diabetes", "type 2 diabetes", "diabetes_type_2"),
         description="Type 2 diabetes mellitus phenotype from EHR conditions.",
+        # ICD-9 250.x0/250.x2 = T2D; 250.x1/250.x3 = T1D. Using broad prefix
+        # 250 captures some T1D but matches standard EHR phenotyping practice.
+        # ICD-10 E11 is specific to T2D.
         icd9_prefixes=("250",),
         icd10_prefixes=("E11",),
     ),
@@ -40,7 +43,7 @@ DISEASE_DEFINITIONS: tuple[DiseaseDefinition, ...] = (
         canonical_name="atrial_fibrillation",
         aliases=("af", "afib", "a_fib", "atrial fibrillation"),
         description="Atrial fibrillation and flutter phenotype from EHR conditions.",
-        icd9_prefixes=("42731", "42732"),
+        icd9_prefixes=("427.3",),
         icd10_prefixes=("I48",),
     ),
     DiseaseDefinition(
@@ -54,8 +57,8 @@ DISEASE_DEFINITIONS: tuple[DiseaseDefinition, ...] = (
         canonical_name="copd",
         aliases=("chronic_obstructive_pulmonary_disease", "chronic obstructive pulmonary disease"),
         description="Chronic obstructive pulmonary disease phenotype from EHR conditions.",
-        icd9_prefixes=("496", "491", "492"),
-        icd10_prefixes=("J41", "J42", "J43", "J44"),
+        icd9_prefixes=("490", "491", "492", "496"),
+        icd10_prefixes=("J40", "J41", "J42", "J43", "J44"),
     ),
     DiseaseDefinition(
         canonical_name="chronic_kidney_disease",
@@ -82,7 +85,7 @@ DISEASE_DEFINITIONS: tuple[DiseaseDefinition, ...] = (
         canonical_name="depression",
         aliases=("major_depression", "major depressive disorder", "depression"),
         description="Broad depression phenotype from EHR conditions.",
-        icd9_prefixes=("2962", "2963", "311"),
+        icd9_prefixes=("296.2", "296.3", "311"),
         icd10_prefixes=("F32", "F33"),
     ),
     DiseaseDefinition(
