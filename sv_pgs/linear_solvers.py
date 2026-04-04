@@ -77,13 +77,11 @@ def solve_spd_system(
     from sv_pgs.progress import log
     n_cols = rhs_array.shape[1]
     solution_columns: list[np.ndarray] = []
-    if initial_guess is not None:
-        initial_matrix = jnp.asarray(initial_guess, dtype=solver_dtype)
-        # 1D initial guess can't be sliced per-column; drop it for matrix RHS
-        if initial_matrix.ndim != 2 or initial_matrix.shape != rhs_array.shape:
-            initial_matrix = None
-    else:
-        initial_matrix = None
+    initial_matrix = None if initial_guess is None else jnp.asarray(initial_guess, dtype=solver_dtype)
+    if initial_matrix is not None and initial_matrix.ndim != 2:
+        raise ValueError("matrix right_hand_side requires initial_guess with matching column dimension.")
+    if initial_matrix is not None and initial_matrix.shape != rhs_array.shape:
+        raise ValueError("matrix initial_guess must have the same shape as right_hand_side.")
     for column_index in range(n_cols):
         if n_cols > 1:
             log(f"    CG solve: column {column_index+1}/{n_cols}")

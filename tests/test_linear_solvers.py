@@ -3,6 +3,7 @@ from __future__ import annotations
 import jax.numpy as jnp
 import numpy as np
 
+import sv_pgs.linear_solvers as linear_solvers
 from sv_pgs.linear_solvers import build_linear_operator, solve_spd_system
 
 
@@ -74,3 +75,28 @@ def test_solve_spd_system_rejects_vector_initial_guess_for_matrix_rhs():
             max_iterations=1,
             initial_guess=np.ones(2, dtype=np.float64),
         )
+
+
+def test_stochastic_logdet_uses_numpy_eigh(monkeypatch):
+    monkeypatch.setattr(
+        linear_solvers.jnp.linalg,
+        "eigh",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("unexpected JAX eigh")),
+    )
+    operator = build_linear_operator(
+        shape=(2, 2),
+        matvec=lambda vector: jnp.asarray(
+            np.array([[3.0, 0.5], [0.5, 2.0]], dtype=np.float64) @ np.asarray(vector, dtype=np.float64),
+            dtype=jnp.float64,
+        ),
+    )
+
+    estimate = linear_solvers.stochastic_logdet(
+        operator=operator,
+        dimension=2,
+        probe_count=2,
+        lanczos_steps=2,
+        random_seed=0,
+    )
+
+    assert np.isfinite(estimate)
