@@ -100,3 +100,26 @@ def test_stochastic_logdet_uses_numpy_eigh(monkeypatch):
     )
 
     assert np.isfinite(estimate)
+
+
+def test_small_symmetric_eigh_rejects_non_finite_input():
+    with np.testing.assert_raises_regex(RuntimeError, "non-finite values"):
+        linear_solvers._small_symmetric_eigh(np.array([[1.0, np.nan], [np.nan, 2.0]], dtype=np.float64))
+
+
+def test_small_symmetric_eigh_retries_with_jitter(monkeypatch):
+    calls = {"count": 0}
+    original_eigh = np.linalg.eigh
+
+    def flaky_eigh(matrix):
+        calls["count"] += 1
+        if calls["count"] == 1:
+            raise np.linalg.LinAlgError("transient failure")
+        return original_eigh(matrix)
+
+    monkeypatch.setattr(linear_solvers.np.linalg, "eigh", flaky_eigh)
+    eigenvalues, eigenvectors = linear_solvers._small_symmetric_eigh(np.array([[2.0, 1e-14], [0.0, 3.0]], dtype=np.float64))
+
+    assert calls["count"] >= 2
+    assert eigenvalues.shape == (2,)
+    assert eigenvectors.shape == (2, 2)

@@ -137,13 +137,30 @@ def stochastic_logdet(
             start_vector=probe_vector,
             step_count=step_count,
         )
-        # Use numpy for the tiny (step_count × step_count) eigendecomposition.
-        # JAX's eigh uses cuSolver which can fail when CuPy holds the GPU context.
-        tri_np = np.asarray(tridiagonal, dtype=np.float64)
-        eigenvalues, eigenvectors = np.linalg.eigh(tri_np)
+        eigenvalues, eigenvectors = _small_symmetric_eigh(tridiagonal)
         clipped_eigenvalues = np.maximum(eigenvalues, 1e-12)
         estimates.append(float(np.sum((eigenvectors[0, :] ** 2) * np.log(clipped_eigenvalues))))
     return float(dimension * np.mean(estimates))
+
+
+def _small_symmetric_eigh(matrix: np.ndarray | jnp.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    # Tiny Lanczos tridiagonals should stay off GPU solver libraries entirely.
+    matrix_np = np.asarray(matrix, dtype=np.float64)
+    if matrix_np.ndim != 2 or matrix_np.shape[0] != matrix_np.shape[1]:
+        raise ValueError("small symmetric eigendecomposition requires a square matrix.")
+    if not np.all(np.isfinite(matrix_np)):
+        raise RuntimeError("small symmetric eigendecomposition received non-finite values.")
+    symmetric_matrix = 0.5 * (matrix_np + matrix_np.T)
+    diagonal_scale = max(float(np.max(np.abs(np.diag(symmetric_matrix)))), 1.0)
+    for jitter_scale in (0.0, 1e-12, 1e-10, 1e-8):
+        try:
+            if jitter_scale == 0.0:
+                return np.linalg.eigh(symmetric_matrix)
+            jitter = np.eye(symmetric_matrix.shape[0], dtype=np.float64) * (jitter_scale * diagonal_scale)
+            return np.linalg.eigh(symmetric_matrix + jitter)
+        except np.linalg.LinAlgError:
+            continue
+    raise RuntimeError("small symmetric eigendecomposition failed after CPU retries.")
 
 
 def _as_linear_operator(operator: LinearOperator | np.ndarray | jnp.ndarray) -> LinearOperator:
