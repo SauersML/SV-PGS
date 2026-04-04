@@ -74,31 +74,33 @@ def _gsutil_cp(src: str, dst: str) -> None:
         raise RuntimeError(f"gsutil cp failed (exit {process.returncode}): {src}")
 
 
-def _estimate_download_bytes(chromosomes: list[int]) -> int:
-    """Rough estimate: chr22 is ~1 GB, chr1 is ~10 GB. Total genome ~50 GB."""
-    # Approximate VCF sizes per chromosome (compressed, in bytes)
-    # Based on typical AoU SV VCF sizes
-    CHR_SIZES_GB = {
-        1: 10, 2: 9, 3: 7, 4: 6, 5: 6, 6: 6, 7: 5, 8: 5, 9: 4, 10: 5,
-        11: 5, 12: 5, 13: 3, 14: 3, 15: 3, 16: 3, 17: 3, 18: 3, 19: 2,
-        20: 2, 21: 1, 22: 1,
-    }
-    total = sum(CHR_SIZES_GB.get(c, 3) for c in chromosomes)
-    return int(total * 1.2 * 1e9)  # 20% margin for .tbi + temp files
+def _gsutil_size(path: str) -> int:
+    """Get the size of a remote GCS object in bytes."""
+    cmd = ["gsutil", "-u", _google_project(), "du", "-s", path]
+    result = subprocess.run(cmd, capture_output=True, text=True, check=True)
+    return int(result.stdout.strip().split()[0])
 
 
 def download_sv_vcfs(chromosomes: list[int], work_dir: Path) -> dict[int, Path]:
     """Download SV VCFs for the requested chromosomes. Returns {chr: local_path}."""
-    # Check disk space upfront
-    needed = _estimate_download_bytes(chromosomes)
-    to_download = []
+    remote_dir = sv_vcf_dir()
+    to_download: list[tuple[int, str, str]] = []  # (chrom, vcf_remote, tbi_remote)
     for chrom in chromosomes:
-        local_vcf = work_dir / sv_vcf_name(chrom)
-        if not local_vcf.exists():
-            to_download.append(chrom)
+        if not (work_dir / sv_vcf_name(chrom)).exists():
+            name = sv_vcf_name(chrom)
+            to_download.append((chrom, f"{remote_dir}/{name}", f"{remote_dir}/{name}.tbi"))
+
     if to_download:
-        _check_disk_space(work_dir, needed)
-        log(f"  need to download {len(to_download)} VCFs (~{needed/1e9:.0f} GB), disk OK")
+        # Query actual sizes from GCS
+        log(f"  checking sizes for {len(to_download)} VCFs...")
+        total_bytes = 0
+        for chrom, vcf_remote, tbi_remote in to_download:
+            vcf_size = _gsutil_size(vcf_remote)
+            tbi_size = _gsutil_size(tbi_remote)
+            total_bytes += vcf_size + tbi_size
+            log(f"    chr{chrom}: {vcf_size/1e9:.1f} GB")
+        _check_disk_space(work_dir, total_bytes)
+        log(f"  total download: {total_bytes/1e9:.1f} GB, disk OK")
 
     vcf_paths: dict[int, Path] = {}
     remote_dir = sv_vcf_dir()
