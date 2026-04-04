@@ -57,7 +57,8 @@ def solve_spd_system(
 ) -> np.ndarray:
     linear_operator = _as_linear_operator(operator)
     rhs_array = jnp.asarray(right_hand_side)
-    solver_dtype = linear_operator.dtype or jnp.result_type(rhs_array.dtype, jnp.float32)
+    operator_dtype = linear_operator.dtype or rhs_array.dtype
+    solver_dtype = jnp.result_type(operator_dtype, rhs_array.dtype)
     rhs_array = rhs_array.astype(solver_dtype)
     apply_preconditioner = _as_preconditioner(preconditioner, solver_dtype)
     output_dtype = np.asarray(jnp.zeros((), dtype=solver_dtype)).dtype
@@ -191,7 +192,7 @@ def _solve_single_rhs(
     from sv_pgs.progress import log
     tol_sq = tolerance * tolerance
     solution = jnp.zeros_like(rhs) if initial_guess is None else initial_guess
-    residual = rhs - linear_operator.matvec(solution)
+    residual = rhs - jnp.asarray(linear_operator.matvec(solution), dtype=solver_dtype)
     residual_norm_sq_jax = jnp.vdot(residual, residual)
     initial_residual = float(residual_norm_sq_jax)
     rhs_norm_sq = float(jnp.vdot(rhs, rhs))
@@ -213,7 +214,7 @@ def _solve_single_rhs(
     t_start = time.monotonic()
     last_log = t_start
     for _iteration_index in range(max_iterations):
-        operator_search_direction = linear_operator.matvec(search_direction)
+        operator_search_direction = jnp.asarray(linear_operator.matvec(search_direction), dtype=solver_dtype)
         step_denom_jax = jnp.vdot(search_direction, operator_search_direction)
         if float(step_denom_jax) <= 0.0:
             raise RuntimeError("Conjugate-gradient operator is not positive definite.")

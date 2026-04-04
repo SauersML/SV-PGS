@@ -72,6 +72,8 @@ from sv_pgs.numeric import stable_sigmoid
 from sv_pgs.preprocessing import collapse_tie_groups
 from sv_pgs.progress import log, mem
 
+GPU_EXACT_VARIANT_SOLVE_LIMIT = 12_000
+
 
 @dataclass(slots=True)
 class PriorDesign:
@@ -999,11 +1001,22 @@ def _posterior_variance_hutchinson_diagonal(
     probe_count: int,
     random_seed: int,
 ) -> np.ndarray:
-    compute_np_dtype = gpu_compute_numpy_dtype()
     random_generator = np.random.default_rng(random_seed)
-    probes = random_generator.choice((-1.0, 1.0), size=(dimension, probe_count)).astype(compute_np_dtype)
-    solutions = np.asarray(solve_variant_rhs(probes), dtype=compute_np_dtype)
+    probes = random_generator.choice((-1.0, 1.0), size=(dimension, probe_count)).astype(np.float64)
+    solutions = np.asarray(solve_variant_rhs(probes), dtype=np.float64)
     return np.maximum(np.mean(probes * solutions, axis=1), 1e-8)
+
+
+def _use_gpu_exact_variant_solve(
+    genotype_matrix: StandardizedGenotypeMatrix,
+    variant_count: int,
+    exact_solver_matrix_limit: int,
+) -> bool:
+    return (
+        genotype_matrix._cupy_cache is not None
+        and variant_count > exact_solver_matrix_limit
+        and variant_count <= GPU_EXACT_VARIANT_SOLVE_LIMIT
+    )
 
 
 def _restricted_posterior_state(
@@ -1035,7 +1048,12 @@ def _restricted_posterior_state(
     variant_count = genotype_matrix.shape[1]
     use_exact_sample = sample_count <= exact_solver_matrix_limit
     use_exact_variant = variant_count <= exact_solver_matrix_limit
-    use_variant_space = (not use_exact_sample) and (use_exact_variant or variant_count <= sample_count)
+    use_gpu_exact_variant = _use_gpu_exact_variant_solve(
+        genotype_matrix=genotype_matrix,
+        variant_count=variant_count,
+        exact_solver_matrix_limit=exact_solver_matrix_limit,
+    )
+    use_variant_space = (not use_exact_sample) and (use_exact_variant or use_gpu_exact_variant or variant_count <= sample_count)
 
     if use_exact_sample:
         log(f"    restricted posterior: exact sample-space Cholesky for n={sample_count}")
@@ -1104,11 +1122,12 @@ def _restricted_posterior_state(
     )
 
     if use_variant_space:
-        if use_exact_variant:
+        if use_exact_variant or use_gpu_exact_variant:
             log(f"    restricted posterior: exact variant-space Cholesky (p={variant_count}, n={sample_count})  mem={mem()}")
             # Use CuPy GPU path if available to avoid downloading 4 GB from GPU
             if genotype_matrix._cupy_cache is not None:
                 import cupy as cp
+                from cupyx.scipy.linalg import solve_triangular as cp_solve_triangular
                 X_gpu = genotype_matrix._cupy_cache  # (n, p) float32 on GPU
                 # Apply projector on GPU: P = D^{-1} - D^{-1} C (C^T D^{-1} C)^{-1} C^T D^{-1}
                 # Do X^T @ P @ X and X^T @ P @ targets entirely on GPU, only download p×p result.
@@ -1120,32 +1139,77 @@ def _restricted_posterior_state(
                 CtWX = (cov_cp.T @ weighted_X).get().astype(np.float64)  # (k, p) — small download
                 correction_coeff = _cholesky_solve(covariate_precision_cholesky, CtWX)
                 projected_X = weighted_X - inv_d_cp[:, None] * (cov_cp @ cp.asarray(correction_coeff, dtype=cp.float32))
-                XtPX = np.asarray((X_gpu.T @ projected_X).get(), dtype=np.float64)  # (p, p) download
-                # X^T @ P @ targets
                 projected_targets_np = apply_projector(targets)
-                variant_rhs = np.asarray(genotype_matrix.transpose_matvec(projected_targets_np), dtype=np.float64)
-                del weighted_X, projected_X
+                variant_rhs_cp = cp.asarray(
+                    np.asarray(genotype_matrix.transpose_matvec(projected_targets_np), dtype=np.float32),
+                    dtype=cp.float32,
+                )
+                if use_gpu_exact_variant:
+                    variant_precision_gpu = X_gpu.T @ projected_X
+                    variant_precision_gpu += cp.diag(cp.asarray(prior_precision, dtype=cp.float32))
+                    variant_precision_gpu = (variant_precision_gpu + variant_precision_gpu.T) * 0.5
+                    variant_precision_gpu += cp.eye(variant_count, dtype=cp.float32) * 1e-4
+                    variant_precision_cholesky_gpu = cp.linalg.cholesky(variant_precision_gpu)
+
+                    def solve_variant_rhs(right_hand_side: np.ndarray) -> np.ndarray:
+                        rhs_cp = cp.asarray(np.asarray(right_hand_side, dtype=np.float32), dtype=cp.float32)
+                        y = cp_solve_triangular(variant_precision_cholesky_gpu, rhs_cp, lower=True)
+                        x = cp_solve_triangular(variant_precision_cholesky_gpu.T, y, lower=False)
+                        return np.asarray(x.get(), dtype=np.float64)
+
+                    beta = np.asarray(solve_variant_rhs(variant_rhs_cp.get()), dtype=np.float64)
+                    beta_variance = (
+                        _posterior_variance_hutchinson_diagonal(
+                            solve_variant_rhs=solve_variant_rhs,
+                            dimension=variant_count,
+                            probe_count=posterior_variance_probe_count,
+                            random_seed=random_seed,
+                        )
+                        if compute_beta_variance
+                        else np.zeros(variant_count, dtype=np.float64)
+                    )
+                    logdet_A = (
+                        2.0 * float(cp.sum(cp.log(cp.diag(variant_precision_cholesky_gpu))).get())
+                        if compute_logdet
+                        else 0.0
+                    )
+                    genetic_linear_predictor = np.asarray(genotype_matrix.matvec(beta), dtype=np.float64)
+                    del weighted_X, projected_X, variant_precision_gpu, variant_precision_cholesky_gpu, variant_rhs_cp
+                else:
+                    XtPX = np.asarray((X_gpu.T @ projected_X).get(), dtype=np.float64)  # (p, p) download
+                    variant_rhs = np.asarray(variant_rhs_cp.get(), dtype=np.float64)
+                    del weighted_X, projected_X, variant_rhs_cp
             else:
                 dense_genotypes = np.asarray(genotype_matrix.materialize(batch_size=posterior_variance_batch_size), dtype=np.float64)
                 projected_genotypes = apply_projector(dense_genotypes)
                 XtPX = dense_genotypes.T @ projected_genotypes
                 variant_rhs = dense_genotypes.T @ apply_projector(targets)
-            variant_precision_matrix = (
-                np.diag(prior_precision) + XtPX + np.eye(variant_count, dtype=np.float64) * 1e-8
-            )
-            variant_precision_cholesky = np.linalg.cholesky(variant_precision_matrix)
+            if not use_gpu_exact_variant:
+                variant_precision_matrix = (
+                    np.diag(prior_precision) + XtPX + np.eye(variant_count, dtype=np.float64) * 1e-8
+                )
+                variant_precision_cholesky = np.linalg.cholesky(variant_precision_matrix)
 
-            def solve_variant_rhs(right_hand_side: np.ndarray) -> np.ndarray:
-                return _cholesky_solve(variant_precision_cholesky, np.asarray(right_hand_side, dtype=np.float64))
+                def solve_variant_rhs(right_hand_side: np.ndarray) -> np.ndarray:
+                    return _cholesky_solve(variant_precision_cholesky, np.asarray(right_hand_side, dtype=np.float64))
 
-            beta = np.asarray(solve_variant_rhs(variant_rhs), dtype=np.float64)
-            beta_variance = (
-                np.maximum(np.diag(solve_variant_rhs(np.eye(variant_count, dtype=np.float64))), 1e-8)
-                if compute_beta_variance
-                else np.zeros(variant_count, dtype=np.float64)
-            )
-            logdet_A = 2.0 * float(np.sum(np.log(np.diag(variant_precision_cholesky)))) if compute_logdet else 0.0
-            genetic_linear_predictor = np.asarray(genotype_matrix.matvec(beta), dtype=np.float64)
+                beta = np.asarray(solve_variant_rhs(variant_rhs), dtype=np.float64)
+                beta_variance = (
+                    np.maximum(np.diag(solve_variant_rhs(np.eye(variant_count, dtype=np.float64))), 1e-8)
+                    if compute_beta_variance and variant_count <= exact_solver_matrix_limit
+                    else (
+                        _posterior_variance_hutchinson_diagonal(
+                            solve_variant_rhs=solve_variant_rhs,
+                            dimension=variant_count,
+                            probe_count=posterior_variance_probe_count,
+                            random_seed=random_seed,
+                        )
+                        if compute_beta_variance
+                        else np.zeros(variant_count, dtype=np.float64)
+                    )
+                )
+                logdet_A = 2.0 * float(np.sum(np.log(np.diag(variant_precision_cholesky)))) if compute_logdet else 0.0
+                genetic_linear_predictor = np.asarray(genotype_matrix.matvec(beta), dtype=np.float64)
         else:
             import time as _time
             log(f"    restricted posterior: PCG variant-space solve (p={variant_count}, n={sample_count})  mem={mem()}")
@@ -1173,7 +1237,7 @@ def _restricted_posterior_state(
                     apply_projector(targets),
                     batch_size=posterior_variance_batch_size,
                 ),
-                dtype=compute_np_dtype,
+                dtype=np.float64,
             )
             log(f"      rhs: {_time.monotonic() - _t0:.1f}s  mem={mem()}")
 
@@ -1186,7 +1250,7 @@ def _restricted_posterior_state(
                     preconditioner=variant_preconditioner,
                 )
 
-            beta = np.asarray(solve_variant_rhs(variant_rhs), dtype=compute_np_dtype)
+            beta = np.asarray(solve_variant_rhs(variant_rhs), dtype=np.float64)
             beta_variance = (
                 _posterior_variance_hutchinson_diagonal(
                     solve_variant_rhs=solve_variant_rhs,
