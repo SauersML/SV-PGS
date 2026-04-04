@@ -1120,13 +1120,17 @@ def _restricted_posterior_state(
             logdet_A = 2.0 * float(np.sum(np.log(np.diag(variant_precision_cholesky)))) if compute_logdet else 0.0
             genetic_linear_predictor = np.asarray(genotype_matrix.matvec(beta), dtype=np.float64)
         else:
+            import time as _time
             log(f"    restricted posterior: PCG variant-space solve (p={variant_count}, n={sample_count})  mem={mem()}")
+            _t0 = _time.monotonic()
             variant_operator = _restricted_variant_space_operator(
                 genotype_matrix=genotype_matrix,
                 prior_precision=prior_precision,
                 apply_projector=apply_projector,
                 batch_size=posterior_variance_batch_size,
             )
+            log(f"      operator setup: {_time.monotonic() - _t0:.1f}s  mem={mem()}")
+            _t0 = _time.monotonic()
             variant_preconditioner = _restricted_variant_space_diagonal_preconditioner(
                 genotype_matrix=genotype_matrix,
                 covariate_matrix=covariate_matrix,
@@ -1135,6 +1139,8 @@ def _restricted_posterior_state(
                 prior_precision=prior_precision,
                 batch_size=posterior_variance_batch_size,
             )
+            log(f"      preconditioner: {_time.monotonic() - _t0:.1f}s  mem={mem()}")
+            _t0 = _time.monotonic()
             variant_rhs = np.asarray(
                 genotype_matrix.transpose_matvec(
                     apply_projector(targets),
@@ -1142,6 +1148,7 @@ def _restricted_posterior_state(
                 ),
                 dtype=np.float64,
             )
+            log(f"      rhs: {_time.monotonic() - _t0:.1f}s  mem={mem()}")
 
             def solve_variant_rhs(right_hand_side: np.ndarray) -> np.ndarray:
                 return solve_spd_system(
