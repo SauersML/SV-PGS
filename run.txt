@@ -1,67 +1,121 @@
 #!/bin/bash
-# SV-PGS: All diseases × All autosomes on AoU
-# Covariates: age, sex, race, ethnicity
-# Note: PCs not available in EHR tables; race/ethnicity_concept_id partially controls for ancestry
-#
-# VCF source: ${CDR_STORAGE_PATH}/wgs/short_read/structural_variants/vcf/full/
-# VCFs are per-chromosome: AoU_srWGS_SV.v8.chr{1..22}.vcf.gz
-
+# SV-PGS: Hypertension × 22 autosomes on AoU
+# Covariates: age, sex, race, ethnicity + top 10 genomic PCs
+# ICD codes: ICD-9 401-405, ICD-10 I10/I11/I12/I13/I15
 set -euo pipefail
+
 cd ~/SV-PGS && git pull && uv sync --python 3.12 --extra gpu
 
-COVARIATES="--covariate-column age_at_observation_start --covariate-column gender_concept_id --covariate-column race_concept_id --covariate-column ethnicity_concept_id"
 VCF_DIR="${CDR_STORAGE_PATH}/wgs/short_read/structural_variants/vcf/full"
+ANCESTRY_FILE="${CDR_STORAGE_PATH}/wgs/short_read/auxiliary/ancestry/ancestry_preds.tsv"
+DISEASE="hypertension"
+SAMPLE_TABLE="${DISEASE}.samples.tsv"
+SAMPLE_TABLE_WITH_PCS="${DISEASE}.samples.with_pcs.tsv"
 
-DISEASES=(
-  type2_diabetes
-  heart_failure
-  atrial_fibrillation
-  asthma
-  copd
-  chronic_kidney_disease
-  coronary_artery_disease
-  stroke
-  depression
-  hypertension
-)
-
-# Step 1: Download all chromosome VCFs (skip if already present)
+# Step 1: Download all 22 chromosome VCFs + indices (skip existing)
 for CHR in $(seq 1 22); do
   VCF="AoU_srWGS_SV.v8.chr${CHR}.vcf.gz"
   if [ ! -f "$VCF" ]; then
     echo "=== Downloading ${VCF} ==="
     gsutil -u $GOOGLE_PROJECT cp "${VCF_DIR}/${VCF}" "${VCF_DIR}/${VCF}.tbi" .
+  else
+    echo "=== ${VCF} already present ==="
   fi
 done
 
-# Step 2: Prepare sample tables for each disease
-for DISEASE in "${DISEASES[@]}"; do
-  SAMPLE_TABLE="${DISEASE}.samples.tsv"
-  if [ ! -f "$SAMPLE_TABLE" ]; then
-    echo "=== Preparing sample table: ${DISEASE} ==="
-    uv run sv-pgs prepare-all-of-us-disease --disease "$DISEASE" --output "$SAMPLE_TABLE"
+# Step 2: Download ancestry predictions (contains per-sample PCs)
+if [ ! -f ancestry_preds.tsv ]; then
+  echo "=== Downloading ancestry predictions (PCs) ==="
+  gsutil -u $GOOGLE_PROJECT cp "$ANCESTRY_FILE" ancestry_preds.tsv
+fi
+
+# Step 3: Prepare phenotype sample table from BigQuery
+if [ ! -f "$SAMPLE_TABLE" ]; then
+  echo "=== Preparing sample table: ${DISEASE} ==="
+  uv run sv-pgs prepare-all-of-us-disease --disease "$DISEASE" --output "$SAMPLE_TABLE"
+fi
+
+# Step 4: Merge top 10 PCs into the sample table
+if [ ! -f "$SAMPLE_TABLE_WITH_PCS" ]; then
+  echo "=== Merging PCs into sample table ==="
+  uv run python -c "
+import pandas as pd
+
+# Load sample table
+samples = pd.read_csv('${SAMPLE_TABLE}', sep='\t', dtype={'sample_id': str, 'person_id': str})
+
+# Load ancestry preds — column names vary by AoU release
+ancestry = pd.read_csv('ancestry_preds.tsv', sep='\t', dtype=str)
+
+# Find the ID column (research_id or person_id)
+id_col = None
+for candidate in ['research_id', 'person_id', 'sample_id', 's']:
+    if candidate in ancestry.columns:
+        id_col = candidate
+        break
+if id_col is None:
+    print('WARNING: Could not find ID column in ancestry_preds.tsv')
+    print('Columns:', list(ancestry.columns)[:20])
+    # Fall back to no PCs
+    samples.to_csv('${SAMPLE_TABLE_WITH_PCS}', sep='\t', index=False)
+    exit(0)
+
+# Find PC columns
+pc_cols = sorted([c for c in ancestry.columns if c.lower().startswith('pc') or c.lower().startswith('pca_')],
+                 key=lambda x: int(''.join(filter(str.isdigit, x)) or '0'))[:10]
+if not pc_cols:
+    print('WARNING: No PC columns found in ancestry_preds.tsv')
+    print('Columns:', list(ancestry.columns)[:20])
+    samples.to_csv('${SAMPLE_TABLE_WITH_PCS}', sep='\t', index=False)
+    exit(0)
+
+print(f'Merging {len(pc_cols)} PCs using ID column: {id_col}')
+print(f'PC columns: {pc_cols}')
+
+# Convert PCs to float
+for col in pc_cols:
+    ancestry[col] = pd.to_numeric(ancestry[col], errors='coerce')
+
+# Merge on person_id = ancestry ID
+ancestry_subset = ancestry[[id_col] + pc_cols].copy()
+ancestry_subset = ancestry_subset.rename(columns={id_col: 'person_id'})
+merged = samples.merge(ancestry_subset, on='person_id', how='left')
+print(f'Merged: {len(merged)} rows, {merged[pc_cols[0]].notna().sum()} with PCs')
+merged.to_csv('${SAMPLE_TABLE_WITH_PCS}', sep='\t', index=False)
+"
+fi
+
+# Step 5: Build covariate flags (age + sex + race + ethnicity + PCs)
+# Read PC column names from the merged file header
+PC_COVARIATES=""
+HEADER=$(head -1 "$SAMPLE_TABLE_WITH_PCS")
+for COL in $HEADER; do
+  case "$COL" in
+    pc*|pca_*|PC*|PCA_*)
+      PC_COVARIATES="$PC_COVARIATES --covariate-column $COL"
+      ;;
+  esac
+done
+echo "=== PC covariates: ${PC_COVARIATES:-NONE} ==="
+
+COVARIATES="--covariate-column age_at_observation_start --covariate-column gender_concept_id --covariate-column race_concept_id --covariate-column ethnicity_concept_id ${PC_COVARIATES}"
+
+# Step 6: Run SV-PGS for each chromosome
+for CHR in $(seq 1 22); do
+  VCF="AoU_srWGS_SV.v8.chr${CHR}.vcf.gz"
+  OUTPUT_DIR="${DISEASE}_sv_chr${CHR}_results"
+  if [ -d "$OUTPUT_DIR" ]; then
+    echo "=== Skipping chr${CHR} (already done) ==="
+    continue
   fi
+  echo "=== Running ${DISEASE} chr${CHR} ==="
+  uv run sv-pgs run \
+    --genotypes "$VCF" \
+    --genotype-format vcf \
+    --sample-table "$SAMPLE_TABLE_WITH_PCS" \
+    --target-column target \
+    $COVARIATES \
+    --output-dir "$OUTPUT_DIR"
 done
 
-# Step 3: Run SV-PGS for each disease × each chromosome
-for DISEASE in "${DISEASES[@]}"; do
-  SAMPLE_TABLE="${DISEASE}.samples.tsv"
-  for CHR in $(seq 1 22); do
-    VCF="AoU_srWGS_SV.v8.chr${CHR}.vcf.gz"
-    OUTPUT_DIR="${DISEASE}_sv_chr${CHR}_results"
-    if [ -d "$OUTPUT_DIR" ]; then
-      echo "=== Skipping ${DISEASE} chr${CHR} (already done) ==="
-      continue
-    fi
-    echo "=== Running ${DISEASE} chr${CHR} ==="
-    uv run sv-pgs run \
-      --genotypes "$VCF" \
-      --genotype-format vcf \
-      --sample-table "$SAMPLE_TABLE" \
-      --target-column target \
-      $COVARIATES \
-      --output-dir "$OUTPUT_DIR"
-  done
-done
-
-echo "=== ALL DONE ==="
+echo "=== ALL 22 CHROMOSOMES DONE ==="
