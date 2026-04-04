@@ -583,10 +583,6 @@ def _load_vcf(
 
     dosage_columns: list[np.ndarray] = []
     variants: list[_VariantDefaults] = []
-    means: list[float] = []
-    scales: list[float] = []
-    support_counts: list[int] = []
-    allele_frequencies: list[float] = []
 
     t_start = time.monotonic()
     last_log_time = t_start
@@ -596,10 +592,6 @@ def _load_vcf(
     _gt_to_i8 = _GT_TO_INT8
     _append_col = dosage_columns.append
     _append_var = variants.append
-    _append_mean = means.append
-    _append_scale = scales.append
-    _append_support = support_counts.append
-    _append_af = allele_frequencies.append
     _VariantDef = _VariantDefaults
     _vcf_id = _vcf_variant_id
     _vcf_cls = _infer_vcf_variant_class
@@ -615,30 +607,14 @@ def _load_vcf(
             )
 
         gt = record.gt_types
-
-        # Compute AF from int8 directly (avoids creating a 97k float32 array per variant)
-        int8_all = _gt_to_i8[gt]
-
-        # Store as int8 (1 byte per sample vs 4 for float32)
-        int8_col = int8_all
+        int8_col = _gt_to_i8[gt]
         if keep_sample_indices is not None:
             int8_col = int8_col[keep_sample_indices]
-        valid_mask = int8_col != -1
-        n_valid = int(np.count_nonzero(valid_mask))
-        af = float(np.sum(int8_col[valid_mask], dtype=np.int64)) / (2.0 * n_valid) if n_valid > 0 else 0.0
-        observed = int8_col[valid_mask]
-        observed_f64 = observed.astype(np.float64, copy=False)
-        observed_sum = float(np.sum(observed, dtype=np.int64))
-        observed_sum_sq = float(np.dot(observed_f64, observed_f64))
-        mean = observed_sum / n_valid if n_valid > 0 else 0.0
-        centered_sum_sq = max(observed_sum_sq - observed_sum * observed_sum / max(n_valid, 1), 0.0)
-        scale = float(np.sqrt(centered_sum_sq / max(len(int8_col), 1)))
         _append_col(int8_col)
-        _append_mean(mean)
-        _append_scale(scale)
-        _append_support(int(np.count_nonzero(observed > 0)))
-        _append_af(af)
 
+        # Defer AF to INFO field or post-hoc batch computation
+        af_value = record.INFO.get("AF")
+        af = float(af_value[0]) if isinstance(af_value, (tuple, list)) else float(af_value) if af_value is not None else -1.0
         _append_var(
             _VariantDef(
                 variant_id=_vcf_id(record),
@@ -688,11 +664,46 @@ def _load_vcf(
 
     matrix_mb = genotype_matrix.nbytes / 1e6
     log(f"genotype matrix ready: {genotype_matrix.shape}, {matrix_mb:.1f} MB  mem={mem()}")
+
+    # Compute variant stats in column chunks to avoid 20 GB intermediate.
+    # Each chunk processes ~1024 variants at a time using int8→int64 accumulation.
+    log(f"computing variant statistics (chunked over {n_total} variants)...")
+    col_sums = np.empty(n_total, dtype=np.int64)
+    col_sum_sq = np.empty(n_total, dtype=np.int64)
+    n_valid = np.empty(n_total, dtype=np.int64)
+    support_arr = np.empty(n_total, dtype=np.int32)
+    chunk = 1024
+    for start in range(0, n_total, chunk):
+        end = min(start + chunk, n_total)
+        block = genotype_matrix[:, start:end]  # int8 view, no copy
+        valid = block != -1
+        obs = np.where(valid, block.astype(np.int32), 0)
+        col_sums[start:end] = np.sum(obs, axis=0, dtype=np.int64)
+        col_sum_sq[start:end] = np.sum(obs * obs, axis=0, dtype=np.int64)
+        n_valid[start:end] = np.count_nonzero(valid, axis=0)
+        support_arr[start:end] = np.count_nonzero(obs > 0, axis=0)
+    safe_n_valid = np.maximum(n_valid, 1).astype(np.float64)
+    means_arr = (col_sums / safe_n_valid).astype(np.float32)
+    allele_freqs = np.clip(means_arr / 2.0, 0.0, 1.0).astype(np.float32)
+    centered_sum_sq = np.maximum(col_sum_sq.astype(np.float64) - col_sums.astype(np.float64) ** 2 / safe_n_valid, 0.0)
+    scales_arr = np.sqrt(centered_sum_sq / max(n_keep, 1)).astype(np.float32)
+    scales_arr = np.where(scales_arr < 1e-6, 1.0, scales_arr)
+    # Fix AFs for variants where INFO/AF was missing (marked as -1)
+    for i, v in enumerate(variants):
+        if v.allele_frequency < 0:
+            variants[i] = _VariantDefaults(
+                variant_id=v.variant_id, variant_class=v.variant_class,
+                chromosome=v.chromosome, position=v.position, length=v.length,
+                allele_frequency=float(allele_freqs[i]), quality=v.quality,
+            )
+    del col_sums, col_sum_sq, centered_sum_sq, safe_n_valid
+    log(f"variant statistics done  mem={mem()}")
+
     variant_stats = VariantStatistics(
-        means=np.asarray(means, dtype=np.float32),
-        scales=np.where(np.asarray(scales, dtype=np.float32) < 1e-6, 1.0, np.asarray(scales, dtype=np.float32)),
-        allele_frequencies=np.asarray(allele_frequencies, dtype=np.float32),
-        support_counts=np.asarray(support_counts, dtype=np.int32),
+        means=means_arr,
+        scales=scales_arr,
+        allele_frequencies=allele_freqs,
+        support_counts=support_arr,
         marginal_scores=None,
     )
     return genotype_matrix, variants, variant_stats
