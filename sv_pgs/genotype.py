@@ -290,14 +290,16 @@ class StandardizedGenotypeMatrix:
     GPU acceleration uses CuPy (cuBLAS) for matmul, bypassing JAX/XLA which
     has known segfault bugs on Turing GPUs.  Falls back to numpy BLAS on CPU.
     """
-    raw: RawGenotypeMatrix
+    raw: RawGenotypeMatrix | None
     means: np.ndarray       # per-variant mean from training data
     scales: np.ndarray      # per-variant std dev from training data
     variant_indices: np.ndarray  # which columns of raw to use (for subsetting)
     _dense_cache: np.ndarray | None = field(init=False, default=None, repr=False)
     _cupy_cache: object | None = field(init=False, default=None, repr=False)  # cupy.ndarray
+    _n_samples: int = field(init=False, default=0, repr=False)
 
     def __post_init__(self) -> None:
+        self._n_samples = self.raw.shape[0] if self.raw is not None else 0
         self.means = np.asarray(self.means, dtype=np.float32)
         self.scales = np.asarray(self.scales, dtype=np.float32)
         self.variant_indices = np.asarray(self.variant_indices, dtype=np.int32)
@@ -316,7 +318,7 @@ class StandardizedGenotypeMatrix:
 
     @property
     def shape(self) -> tuple[int, int]:
-        return self.raw.shape[0], int(self.variant_indices.shape[0])
+        return self._n_samples, int(self.variant_indices.shape[0])
 
     def dense_bytes(self) -> int:
         """Estimated bytes if materialized as float32."""
