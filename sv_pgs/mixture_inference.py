@@ -868,10 +868,14 @@ def _sample_space_diagonal_preconditioner(
         X = genotype_matrix._cupy_cache  # (n, p) float32 on GPU
         pv = cp.asarray(prior_variances, dtype=cp.float32)
         # diag(X @ diag(pv) @ X^T) = sum(X^2 * pv, axis=1)
-        diag_gpu = cp.asarray(diagonal_noise, dtype=cp.float64) + cp.sum(
-            X * X * pv[None, :], axis=1, dtype=cp.float64,
-        )
-        return np.asarray(cp.maximum(diag_gpu, 1e-8).get(), dtype=np.float64)
+        # Chunked to avoid allocating a full (n, p) intermediate on GPU.
+        diag_gpu = cp.zeros(X.shape[0], dtype=cp.float32)
+        chunk = max(1, min(512, X.shape[1]))
+        for start in range(0, X.shape[1], chunk):
+            end = min(start + chunk, X.shape[1])
+            diag_gpu += cp.sum(X[:, start:end] ** 2 * pv[start:end], axis=1)
+        result = np.asarray(diagonal_noise, dtype=np.float64) + diag_gpu.get().astype(np.float64)
+        return np.maximum(result, 1e-8)
     diagonal = np.asarray(diagonal_noise, dtype=np.float64).copy()
     for batch in genotype_matrix.iter_column_batches(batch_size=batch_size):
         genotype_batch = np.asarray(batch.values, dtype=np.float64)
@@ -940,16 +944,27 @@ def _restricted_variant_space_diagonal_preconditioner(
 ) -> np.ndarray:
     if genotype_matrix._cupy_cache is not None:
         import cupy as cp
-        X = genotype_matrix._cupy_cache.astype(cp.float64)
-        inv_d = cp.asarray(inverse_diagonal_noise, dtype=cp.float64)
-        weighted = inv_d[:, None] * X  # (n, p)
-        # diag(X^T @ D^{-1} @ X) = sum(X * weighted, axis=0)
-        raw_diag = cp.sum(X * weighted, axis=0).get().astype(np.float64)
-        # Correction: diag(X^T D^{-1} C (C^T D^{-1} C)^{-1} C^T D^{-1} X)
-        cross = covariate_matrix.T @ np.asarray(weighted.get(), dtype=np.float64)  # (k, p)
+        X = genotype_matrix._cupy_cache  # (n, p) float32 on GPU
+        inv_d = cp.asarray(inverse_diagonal_noise, dtype=cp.float32)
+        # diag(X^T @ D^{-1} @ X) = sum(X^2 * inv_d[:, None], axis=0)
+        # Chunked by samples to avoid (n, p) intermediate.
+        raw_diag = cp.zeros(X.shape[1], dtype=cp.float32)
+        chunk = max(1, min(512, X.shape[1]))
+        for start in range(0, X.shape[1], chunk):
+            end = min(start + chunk, X.shape[1])
+            raw_diag[start:end] = cp.sum(X[:, start:end] ** 2 * inv_d[:, None], axis=0)
+        raw_diag_np = raw_diag.get().astype(np.float64)
+        # Correction term: small (k × p) — safe on CPU
+        # weighted_X columns needed: X^T @ diag(inv_d) done in chunks
+        weighted_Xt = np.empty((X.shape[1], covariate_matrix.shape[1]), dtype=np.float64)
+        for start in range(0, X.shape[1], chunk):
+            end = min(start + chunk, X.shape[1])
+            w_chunk = (X[:, start:end] * inv_d[:, None]).get().astype(np.float64)
+            weighted_Xt[start:end, :] = w_chunk.T @ covariate_matrix
+        cross = weighted_Xt.T  # (k, p)
         correction = _cholesky_solve(covariate_precision_cholesky, cross)
         diag_correction = np.sum(cross * correction, axis=0)
-        return np.maximum(prior_precision + raw_diag - diag_correction, 1e-8)
+        return np.maximum(prior_precision + raw_diag_np - diag_correction, 1e-8)
     diagonal = np.asarray(prior_precision, dtype=np.float64).copy()
     for batch in genotype_matrix.iter_column_batches(batch_size=batch_size):
         genotype_batch = np.asarray(batch.values, dtype=np.float64)
