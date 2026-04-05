@@ -490,20 +490,3 @@ def _training_records_from_stats(
         )
     log(f"  training records from stats: {len(training_records)} records [NO DATA PASS]")
     return training_records
-
-
-
-def _identity_tie_map(variant_count: int) -> TieMap:
-    kept_indices = np.arange(variant_count, dtype=np.int32)
-    return TieMap(
-        kept_indices=kept_indices,
-        original_to_reduced=kept_indices.copy(),
-        reduced_to_group=[
-            TieGroup(
-                representative_index=int(variant_index),
-                member_indices=np.asarray([variant_index], dtype=np.int32),
-                signs=np.asarray([1.0], dtype=np.float32),
-            )
-            for variant_index in range(variant_count)
-        ],
-    )

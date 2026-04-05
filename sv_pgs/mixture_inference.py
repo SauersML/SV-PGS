@@ -1645,16 +1645,6 @@ def _build_prior_design(records: Sequence[VariantRecord]) -> PriorDesign:
         class_membership_matrix=class_membership_matrix,
         inverse_class_lookup=inverse_class_lookup,
     )
-
-
-def _design_matrix_for_feature_names(
-    records: Sequence[VariantRecord],
-    feature_names: Sequence[str],
-) -> np.ndarray:
-    feature_specs = _parse_scale_model_feature_names(feature_names)
-    return _design_matrix_for_feature_specs(records, feature_specs)
-
-
 def _design_matrix_for_feature_specs(
     records: Sequence[VariantRecord],
     feature_specs: Sequence[ScaleModelFeatureSpec],

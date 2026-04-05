@@ -176,63 +176,6 @@ def fit_preprocessor_from_stats(
         means=np.asarray(variant_stats.means, dtype=np.float32),
         scales=np.asarray(variant_stats.scales, dtype=np.float32),
     )
-
-
-def fit_preprocessor(
-    genotypes: RawGenotypeMatrix | np.ndarray,
-    covariates: np.ndarray,
-    targets: np.ndarray,
-    config: ModelConfig,
-) -> PreparedArrays:
-    raw_genotypes = as_raw_genotype_matrix(genotypes)
-    covariate_matrix = np.asarray(covariates, dtype=np.float32)
-    target_array = np.asarray(targets, dtype=np.float32).reshape(-1)
-    if covariate_matrix.ndim != 2:
-        raise ValueError("covariates must be 2D.")
-    if raw_genotypes.shape[0] != covariate_matrix.shape[0] or raw_genotypes.shape[0] != target_array.shape[0]:
-        raise ValueError("genotypes, covariates, and targets must share sample dimension.")
-
-    variant_count = raw_genotypes.shape[1]
-    sample_count = raw_genotypes.shape[0]
-    log(f"  preprocessor: computing means and scales in single pass over {variant_count} variants...")
-    sums = np.zeros(variant_count, dtype=np.float64)
-    sum_squares = np.zeros(variant_count, dtype=np.float64)
-    non_missing_counts = np.zeros(variant_count, dtype=np.int64)
-    variants_done = 0
-    for batch in raw_genotypes.iter_column_batches(batch_size=auto_batch_size(sample_count)):
-        batch_jax = jnp.asarray(batch.values)
-        mask = ~jnp.isnan(batch_jax)
-        observed = jnp.where(mask, batch_jax, 0.0)
-        batch_sums = jnp.sum(observed, axis=0)
-        batch_counts = jnp.sum(mask, axis=0)
-        batch_sum_sq = jnp.sum(observed * observed, axis=0)
-        batch_indices = batch.variant_indices
-        sums[batch_indices] = np.asarray(batch_sums, dtype=np.float64)
-        non_missing_counts[batch_indices] = np.asarray(batch_counts, dtype=np.int64)
-        sum_squares[batch_indices] = np.asarray(batch_sum_sq, dtype=np.float64)
-        variants_done += len(batch_indices)
-        if variants_done == len(batch_indices) or variants_done % max(variant_count // 10, 1) < len(batch_indices) or variants_done == variant_count:
-            log(f"  preprocessor: {variants_done}/{variant_count} ({100 * variants_done // variant_count}%)  mem={mem()}")
-
-    safe_counts = np.maximum(non_missing_counts, 1).astype(np.float64)
-    means = np.where(non_missing_counts > 0, sums / safe_counts, 0.0)
-    centered_sum_sq = np.maximum(sum_squares - sums * sums / safe_counts, 0.0)
-    scales = _scales_from_centered_sum_squares(
-        centered_sum_squares=centered_sum_sq,
-        sample_count=sample_count,
-        minimum_scale=config.minimum_scale,
-    )
-    del sums, sum_squares, non_missing_counts, safe_counts, centered_sum_sq
-    log(f"  preprocessor done  mem={mem()}")
-
-    return PreparedArrays(
-        covariates=np.asarray(covariate_matrix, dtype=np.float32),
-        targets=np.asarray(target_array, dtype=np.float32),
-        means=np.asarray(means, dtype=np.float32),
-        scales=np.asarray(scales, dtype=np.float32),
-    )
-
-
 def select_active_variant_indices(
     variant_records: Sequence[VariantRecord],
     config: ModelConfig,
