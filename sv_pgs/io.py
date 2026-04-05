@@ -650,48 +650,222 @@ def _read_vcf_sample_ids(vcf_path: Path) -> list[str]:
 _INCREMENTAL_CHECKPOINT_INTERVAL = 5000  # variants between disk flushes
 
 
+def _vcf_contig_info(vcf_path: Path) -> tuple[str, int] | None:
+    """Get (chromosome_name, length) from VCF header contigs.
+
+    Returns None if the VCF is empty or has no contig length info.
+    Falls back to reading the first record for the chromosome name
+    and returns length=0 if the header lacks contig lengths.
+    """
+    reader = _open_vcf_reader(vcf_path)
+    seqnames = list(reader.seqnames) if hasattr(reader, "seqnames") else []
+    seqlens = list(reader.seqlens) if hasattr(reader, "seqlens") else []
+    # Try header contigs first
+    for name, length in zip(seqnames, seqlens):
+        if length and int(length) > 0:
+            return str(name), int(length)
+    # Header lacks lengths — read first record for chrom name
+    for record in reader:
+        chrom = str(record.CHROM)
+        # Check if this chrom has a length in the header
+        for name, length in zip(seqnames, seqlens):
+            if str(name) == chrom and length and int(length) > 0:
+                return chrom, int(length)
+        return chrom, 0
+    return None
+
+
+def _split_into_regions(chrom: str, chrom_length: int, n_regions: int) -> list[str]:
+    """Split a chromosome into n_regions non-overlapping tabix region strings."""
+    if chrom_length <= 0 or n_regions <= 1:
+        return [chrom]  # can't split without known length
+    step = max(chrom_length // n_regions, 1)
+    regions = []
+    for i in range(n_regions):
+        start = i * step + 1
+        end = (i + 1) * step if i < n_regions - 1 else chrom_length
+        regions.append(f"{chrom}:{start}-{end}")
+    return regions
+
+
+def _region_parse_worker(args: tuple) -> tuple[int, str]:
+    """Worker: parse one region of one VCF, write raw binary output files.
+    Runs in a separate process. Returns (variant_count, output_prefix)."""
+    import json as _json
+    import struct
+    vcf_path_str, region, keep_indices_list, output_prefix = args
+    keep_indices = np.array(keep_indices_list, dtype=np.intp) if keep_indices_list is not None else None
+
+    from cyvcf2 import VCF
+    reader = VCF(vcf_path_str)
+    reader.set_threads(1)
+
+    gt_map = np.array([0, 1, -1, 2], dtype=np.int8)
+    stats_pack = struct.Struct("<qqii")
+    geno_fh = open(f"{output_prefix}.geno", "wb")
+    var_fh = open(f"{output_prefix}.var", "w")
+    stats_fh = open(f"{output_prefix}.stats", "wb")
+
+    count = 0
+    iterator = reader(region) if region else reader
+    for record in iterator:
+        if len(record.ALT) != 1:
+            continue
+        col = gt_map[record.gt_types]
+        if keep_indices is not None:
+            col = col[keep_indices]
+        geno_fh.write(col.tobytes())
+        observed = col[col >= 0].astype(np.int32, copy=False)
+        stats_fh.write(stats_pack.pack(
+            int(np.sum(observed, dtype=np.int64)),
+            int(np.sum(observed * observed, dtype=np.int64)),
+            int(observed.shape[0]),
+            int(np.count_nonzero(observed > 0)),
+        ))
+        vd = _variant_defaults_from_vcf_record(record)
+        var_fh.write(_json.dumps({
+            "variant_id": vd.variant_id, "variant_class": vd.variant_class.value,
+            "chromosome": vd.chromosome, "position": vd.position,
+            "length": vd.length, "allele_frequency": vd.allele_frequency,
+            "quality": vd.quality,
+        }) + "\n")
+        count += 1
+
+    geno_fh.close()
+    var_fh.close()
+    stats_fh.close()
+    reader.close()
+    return count, output_prefix
+
+
 def precache_vcfs_parallel(
     vcf_paths: list[Path],
     keep_sample_indices: np.ndarray,
-    max_workers: int | None = None,
 ) -> None:
-    """Parse and cache multiple VCFs in parallel. Each VCF is parsed in a
-    separate process, writing its own incremental cache. Already-cached VCFs
-    are skipped. After this returns, all VCFs can be loaded from cache instantly.
+    """Parse and cache multiple VCFs in parallel, auto-detecting CPU count.
+
+    Allocates workers across AND within chromosomes proportional to file size.
+    Uses VCF header contig lengths for region splitting (no hardcoded lengths).
+    If contig length is unknown, that VCF gets 1 worker (no splitting).
+
+    Fully compatible with existing .npy cache — already-cached VCFs are skipped.
+    Produces the same final cache format via the incremental → .npy pipeline.
     """
     import multiprocessing
     import os
+    import shutil
 
-    if max_workers is None:
-        max_workers = min(os.cpu_count() or 4, len(vcf_paths))
+    total_cpus = os.cpu_count() or 4
 
-    # Filter to only uncached VCFs
+    # Skip already-cached VCFs (compatible with existing .npy cache)
     uncached: list[Path] = []
     for vcf_path in vcf_paths:
         cache_dir = _vcf_cache_dir(vcf_path)
         key = _vcf_cache_key(vcf_path, keep_sample_indices)
-        geno_path = cache_dir / f"{key}.genotypes.npy"
-        if not geno_path.exists():
+        if not (cache_dir / f"{key}.genotypes.npy").exists():
             uncached.append(vcf_path)
 
     if not uncached:
         log(f"all {len(vcf_paths)} VCFs already cached")
         return
 
-    log(f"parallel VCF precache: {len(uncached)} uncached of {len(vcf_paths)} total, {max_workers} workers")
+    # Get contig info and file sizes for allocation
+    vcf_info: dict[Path, tuple[str | None, int, int]] = {}  # path → (chrom, length, file_size)
+    for vcf_path in uncached:
+        info = _vcf_contig_info(vcf_path)
+        chrom = info[0] if info else None
+        chrom_length = info[1] if info else 0
+        vcf_info[vcf_path] = (chrom, chrom_length, vcf_path.stat().st_size)
 
-    # Each worker parses one VCF and writes the cache
-    def _worker(vcf_path_str: str) -> str:
-        vcf_path = Path(vcf_path_str)
-        _load_vcf_with_cache(vcf_path, keep_sample_indices, mmap_mode="r")
-        return f"done: {vcf_path.name}"
+    total_size = sum(v[2] for v in vcf_info.values())
 
-    # Use spawn context to avoid fork issues with CUDA/JAX
+    # Allocate workers proportional to file size
+    # Each VCF gets at least 1, large VCFs get more if CPUs available
+    allocation: dict[Path, int] = {}
+    for vcf_path, (chrom, chrom_length, file_size) in vcf_info.items():
+        share = file_size / max(total_size, 1)
+        n_workers = max(1, round(share * total_cpus))
+        # Can't split if we don't know the contig length
+        if chrom_length <= 0:
+            n_workers = 1
+        allocation[vcf_path] = n_workers
+
+    # Build task list
+    keep_list = keep_sample_indices.tolist() if keep_sample_indices is not None else None
+    tasks: list[tuple] = []
+    for vcf_path, n_workers in allocation.items():
+        chrom, chrom_length, _ = vcf_info[vcf_path]
+        cache_dir = _vcf_cache_dir(vcf_path)
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        key = _vcf_cache_key(vcf_path, keep_sample_indices)
+        tmp_dir = cache_dir / f"{key}.tmp_parallel"
+        tmp_dir.mkdir(parents=True, exist_ok=True)
+
+        if n_workers <= 1 or chrom is None:
+            # Single worker: parse entire VCF (no region filter)
+            tasks.append((str(vcf_path), None, keep_list, str(tmp_dir / "region_0")))
+        else:
+            regions = _split_into_regions(chrom, chrom_length, n_workers)
+            for i, region in enumerate(regions):
+                tasks.append((str(vcf_path), region, keep_list, str(tmp_dir / f"region_{i}")))
+
+    log(f"parallel VCF precache: {len(uncached)} VCFs, {len(tasks)} tasks, {total_cpus} CPUs")
+    for vcf_path, n_workers in allocation.items():
+        chrom, chrom_length, file_size = vcf_info[vcf_path]
+        log(f"  {vcf_path.name}: {n_workers} workers, {chrom}:{chrom_length}, {file_size/1e9:.1f} GB")
+
+    # Parse all regions in parallel
     ctx = multiprocessing.get_context("spawn")
-    with ctx.Pool(processes=max_workers) as pool:
-        results = pool.imap_unordered(_worker, [str(p) for p in uncached])
-        for result in results:
-            log(f"  {result}")
+    with ctx.Pool(processes=min(total_cpus, len(tasks))) as pool:
+        for count, prefix in pool.imap_unordered(_region_parse_worker, tasks):
+            log(f"  region done: {Path(prefix).name} ({count} variants)")
+
+    # Merge region results per VCF → incremental cache → final .npy cache
+    for vcf_path in uncached:
+        cache_dir = _vcf_cache_dir(vcf_path)
+        key = _vcf_cache_key(vcf_path, keep_sample_indices)
+        tmp_dir = cache_dir / f"{key}.tmp_parallel"
+        if not tmp_dir.exists():
+            continue
+
+        # Find region files sorted by index
+        geno_files = sorted(tmp_dir.glob("region_*.geno"), key=lambda p: int(p.stem.split("_")[1]))
+        if not geno_files:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+            continue
+
+        # Concatenate regions → incremental cache files
+        inc_geno = cache_dir / f"{key}.inc.genotypes.bin"
+        inc_var = cache_dir / f"{key}.inc.variants.jsonl"
+        inc_stats = cache_dir / f"{key}.inc.stats.bin"
+        n_total = 0
+        with open(inc_geno, "wb") as gout, open(inc_var, "w") as vout, open(inc_stats, "wb") as sout:
+            for geno_file in geno_files:
+                prefix = str(geno_file).removesuffix(".geno")
+                with open(f"{prefix}.geno", "rb") as f:
+                    shutil.copyfileobj(f, gout)
+                with open(f"{prefix}.var") as f:
+                    vout.write(f.read())
+                with open(f"{prefix}.stats", "rb") as f:
+                    data = f.read()
+                    sout.write(data)
+                    n_total += len(data) // 24
+
+        # Write progress marker so the incremental loader recognizes it as complete
+        reader = _open_vcf_reader(vcf_path)
+        actual_n_keep = len(keep_sample_indices) if keep_sample_indices is not None else len(reader.samples)
+        _atomic_write_text(cache_dir / f"{key}.inc.progress.json", json.dumps({
+            "n_variants": n_total,
+            "n_samples": actual_n_keep,
+        }))
+
+        # Finalize: incremental cache → .npy (same path as sequential)
+        log(f"  finalizing {vcf_path.name}: {n_total} variants from {len(geno_files)} regions")
+        _load_vcf_with_cache(vcf_path, keep_sample_indices, mmap_mode="r")
+
+        # Clean up temp region files
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+        log(f"  {vcf_path.name}: cached")
 
 
 def _load_vcf_with_cache(
