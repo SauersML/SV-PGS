@@ -129,12 +129,6 @@ def download_ancestry_preds(work_dir: Path) -> Path:
     return local
 
 
-def cleanup_local_sv_vcf(vcf_path: Path) -> None:
-    tbi_path = Path(f"{vcf_path}.tbi")
-    for path in (vcf_path, tbi_path):
-        path.unlink(missing_ok=True)
-
-
 def release_process_memory() -> None:
     gc.collect()
     try:

@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import csv
-import gzip
 import hashlib
 import json
 import pickle
@@ -71,161 +70,11 @@ class _DelimitedTableSpec:
     columns: tuple[str, ...]
 
 
-class _SimpleVCFInfo:
-    def __init__(self, values: dict[str, Any]) -> None:
-        self._values = values
-
-    def get(self, key: str) -> Any:
-        return self._values.get(key)
-
-
-class _SimpleVCFRecord:
-    def __init__(
-        self,
-        chrom: str,
-        pos: int,
-        record_id: str | None,
-        ref: str,
-        alt: str,
-        qual: float | None,
-        info: dict[str, Any],
-        gt_types: np.ndarray,
-    ) -> None:
-        self.CHROM = chrom
-        self.POS = pos
-        self.ID = record_id
-        self.REF = ref
-        self.ALT = [alt]
-        self.QUAL = qual
-        self.INFO = _SimpleVCFInfo(info)
-        self.gt_types = gt_types
-        self.end = info.get("END")
-        self.is_sv = alt.startswith("<") and alt.endswith(">") or info.get("SVTYPE") is not None
-        self.is_snp = not self.is_sv and len(ref) == 1 and len(alt) == 1
-        self.is_indel = not self.is_sv and not self.is_snp
-
-
-class _SimpleVCFReader:
-    def __init__(self, path: Path) -> None:
-        self.path = path
-        self._handle = gzip.open(path, "rt", encoding="utf-8") if path.suffix == ".gz" else path.open("r", encoding="utf-8")
-        self.samples: list[str] = []
-        self._header_consumed = False
-        self._advance_to_records()
-
-    def _advance_to_records(self) -> None:
-        for line in self._handle:
-            if line.startswith("##"):
-                continue
-            if line.startswith("#CHROM"):
-                header_fields = line.rstrip("\n").split("\t")
-                self.samples = [str(field) for field in header_fields[9:]]
-                self._header_consumed = True
-                return
-        raise ValueError("VCF header is missing #CHROM line: " + str(self.path))
-
-    def set_threads(self, n_threads: int) -> None:
-        del n_threads
-
-    def close(self) -> None:
-        self._handle.close()
-
-    def __iter__(self) -> Iterator[_SimpleVCFRecord]:
-        if not self._header_consumed:
-            self._advance_to_records()
-        for line in self._handle:
-            stripped = line.strip()
-            if not stripped:
-                continue
-            yield _parse_simple_vcf_record(stripped)
-
-
-def _parse_simple_vcf_record(line: str) -> _SimpleVCFRecord:
-    fields = line.split("\t")
-    if len(fields) < 10:
-        raise ValueError("VCF record has fewer than 10 fields: " + line)
-    chrom, pos, record_id, ref, alt_field, qual_field, _filter, info_field, fmt = fields[:9]
-    sample_fields = fields[9:]
-    alt_values = alt_field.split(",")
-    if len(alt_values) != 1:
-        raise ValueError("Only biallelic VCF records are supported. Normalize multiallelic records before loading: " + line)
-    info_values = _parse_simple_vcf_info(info_field)
-    gt_index = 0
-    if fmt:
-        format_fields = fmt.split(":")
-        if "GT" not in format_fields:
-            raise ValueError("VCF FORMAT field must include GT: " + line)
-        gt_index = format_fields.index("GT")
-    gt_types = np.asarray(
-        [
-            _simple_vcf_gt_type(sample_field.split(":")[gt_index] if sample_field else "./.")
-            for sample_field in sample_fields
-        ],
-        dtype=np.int8,
-    )
-    qual = None if qual_field == "." else float(qual_field)
-    return _SimpleVCFRecord(
-        chrom=str(chrom),
-        pos=int(pos),
-        record_id=None if record_id == "." else str(record_id),
-        ref=str(ref),
-        alt=str(alt_values[0]),
-        qual=qual,
-        info=info_values,
-        gt_types=gt_types,
-    )
-
-
-def _parse_simple_vcf_info(info_field: str) -> dict[str, Any]:
-    if info_field == ".":
-        return {}
-    parsed: dict[str, Any] = {}
-    for item in info_field.split(";"):
-        if not item:
-            continue
-        if "=" not in item:
-            parsed[item] = True
-            continue
-        key, value = item.split("=", 1)
-        if "," in value:
-            parsed[key] = tuple(_coerce_vcf_info_scalar(part) for part in value.split(","))
-        else:
-            parsed[key] = _coerce_vcf_info_scalar(value)
-    return parsed
-
-
-def _coerce_vcf_info_scalar(value: str) -> Any:
-    try:
-        numeric_value = float(value)
-    except ValueError:
-        return value
-    if numeric_value.is_integer():
-        return int(numeric_value)
-    return numeric_value
-
-
-def _simple_vcf_gt_type(genotype: str) -> int:
-    normalized = genotype.replace("|", "/")
-    if normalized in {".", "./.", "./0", "0/.", "./1", "1/."}:
-        return 2
-    if normalized == "0/0":
-        return 0
-    if normalized in {"0/1", "1/0"}:
-        return 1
-    if normalized == "1/1":
-        return 3
-    if "." in normalized:
-        return 2
-    raise ValueError("Unsupported diploid GT in VCF: " + genotype)
 
 
 def _open_vcf_reader(vcf_path: Path) -> Any:
-    try:
-        from cyvcf2 import VCF
-        return VCF(str(vcf_path))
-    except ModuleNotFoundError:
-        log(f"cyvcf2 unavailable; falling back to pure-python VCF parser for {vcf_path.name}")
-        return _SimpleVCFReader(vcf_path)
+    from cyvcf2 import VCF
+    return VCF(str(vcf_path))
 
 
 def _vcf_record_count_hint(reader: Any) -> int | None:

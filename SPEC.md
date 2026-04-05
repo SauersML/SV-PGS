@@ -7,6 +7,8 @@
 - Duplicated code is not allowed.
 - Unnecessary conditionals should be avoided.
 - Conditional imports are never allowed.
+- Never silently fall back if a dependency is missing. Crash immediately.
+- Never silently swallow errors with bare `except Exception: pass`. If something fails, let it fail loud.
 - Only use UV, never pip.
 - No multi-GPU support.
 - Fully and unconditionally use JAX.

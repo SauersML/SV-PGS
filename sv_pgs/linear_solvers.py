@@ -205,18 +205,12 @@ def _as_preconditioner(
                 return result
             if array.ndim != 2:
                 raise ValueError("preconditioner input must be a vector or matrix.")
-            try:
-                result = jnp.asarray(preconditioner(array), dtype=solver_dtype)
-            except Exception:
-                result = None
-            if result is not None and result.shape == array.shape:
-                return result
-            return jnp.column_stack(
-                [
-                    jnp.asarray(preconditioner(array[:, column_index]), dtype=solver_dtype)
-                    for column_index in range(array.shape[1])
-                ]
-            )
+            result = jnp.asarray(preconditioner(array), dtype=solver_dtype)
+            if result.shape != array.shape:
+                raise ValueError(
+                    f"callable preconditioner returned shape {result.shape} for input shape {array.shape}."
+                )
+            return result
 
         return apply_callable
     diagonal = jnp.asarray(preconditioner, dtype=solver_dtype)
