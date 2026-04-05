@@ -343,13 +343,50 @@ def run_all_of_us(
     """Full AoU pipeline: download requested chromosomes, merge them, and run one fit."""
     chromosomes = _validate_aou_chromosomes(chromosomes)
 
+    import os
+
     # Validate disease
     disease_def = resolve_disease_definition(disease)
-    log(f"=== ALL OF US PIPELINE ===  disease={disease_def.canonical_name}  chromosomes={chromosomes}  n_pcs={n_pcs}")
-    log(f"  ICD-9: {disease_def.icd9_prefixes}  ICD-10: {disease_def.icd10_prefixes}")
-
     work_dir = Path(output_base)
     work_dir.mkdir(parents=True, exist_ok=True)
+
+    log(f"=== ALL OF US PIPELINE ===  disease={disease_def.canonical_name}  chromosomes={chromosomes}  n_pcs={n_pcs}  cpus={os.cpu_count()}")
+    log(f"  ICD-9: {disease_def.icd9_prefixes}  ICD-10: {disease_def.icd10_prefixes}")
+    log(f"  output: {work_dir}")
+
+    # Status summary: what's done vs what's left
+    from sv_pgs.io import _vcf_cache_dir, _vcf_cache_key, _read_vcf_sample_ids
+    log("=== STATUS CHECK ===")
+    sample_table_path = work_dir / f"{disease_def.canonical_name}.samples.tsv"
+    merged_path = work_dir / f"{disease_def.canonical_name}.samples.with_pcs.tsv"
+    log(f"  phenotype table: {'DONE' if sample_table_path.exists() else 'NEEDED'}")
+    log(f"  PC-merged table: {'DONE' if merged_path.exists() else 'NEEDED'}")
+    log(f"  ancestry file:   {'DONE' if (work_dir / 'ancestry_preds.tsv').exists() else 'NEEDED'}")
+    cached_chrs = []
+    uncached_chrs = []
+    for chrom in chromosomes:
+        vcf_path = work_dir / sv_vcf_name(chrom)
+        if not vcf_path.exists():
+            uncached_chrs.append(f"chr{chrom}(no VCF)")
+            continue
+        cache_dir = _vcf_cache_dir(vcf_path)
+        # We need keep_indices to check cache key, but we don't have them yet.
+        # Just check if any .npy file exists for this VCF.
+        has_cache = any(cache_dir.glob("*.genotypes.npy")) if cache_dir.exists() else False
+        if has_cache:
+            cached_chrs.append(f"chr{chrom}")
+        else:
+            # Check for partial incremental cache
+            has_partial = any(cache_dir.glob("*.inc.progress.json")) if cache_dir.exists() else False
+            if has_partial:
+                uncached_chrs.append(f"chr{chrom}(partial)")
+            else:
+                uncached_chrs.append(f"chr{chrom}")
+    log(f"  VCF cached ({len(cached_chrs)}): {', '.join(cached_chrs) if cached_chrs else 'none'}")
+    log(f"  VCF needed ({len(uncached_chrs)}): {', '.join(uncached_chrs) if uncached_chrs else 'none — all cached!'}")
+    summary_path = work_dir / "summary.json"
+    log(f"  model fitted:    {'DONE' if summary_path.exists() else 'NEEDED'}")
+    log("===================")
 
     # Step 1: Prepare phenotype
     log("=== STEP 1: Prepare phenotype ===")

@@ -1,1 +1,1 @@
-cd ~ && rm -rf SV-PGS && git clone https://github.com/SauersML/SV-PGS.git && cd SV-PGS && curl -LsSf https://astral.sh/uv/install.sh | sh && export PATH="$HOME/.local/bin:$PATH" && uv sync --python 3.12 --extra gpu && uv run sv-pgs run-all-of-us --disease hypertension --output-dir ~/hypertension_results
+cd ~/SV-PGS && git pull && uv sync --python 3.12 --extra gpu && uv run sv-pgs run-all-of-us --disease hypertension --output-dir ~/hypertension_results
