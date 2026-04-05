@@ -361,7 +361,25 @@ def run_all_of_us(
     merged_path = work_dir / f"{disease_def.canonical_name}.samples.with_pcs.tsv"
     log(f"  phenotype table: {'DONE' if sample_table_path.exists() else 'NEEDED'}")
     log(f"  PC-merged table: {'DONE' if merged_path.exists() else 'NEEDED'}")
-    log(f"  ancestry file:   {'DONE' if (work_dir / 'ancestry_preds.tsv').exists() else 'NEEDED'}")
+    ancestry_local = work_dir / Path(resolve_ancestry_predictions_path()).name
+    log(f"  ancestry file:   {'DONE' if ancestry_local.exists() else 'NEEDED'}")
+
+    # Compute keep_indices from VCF header + merged sample table (if both exist)
+    # so we can check the EXACT cache key, not just glob for any .npy
+    keep_indices_for_status: np.ndarray | None = None
+    first_vcf = work_dir / sv_vcf_name(chromosomes[0])
+    if merged_path.exists() and first_vcf.exists():
+        try:
+            all_sample_ids = _read_vcf_sample_ids(first_vcf)
+            status_df = pd.read_csv(str(merged_path), sep="\t", nrows=0)  # just header
+            status_df = pd.read_csv(str(merged_path), sep="\t", dtype={"sample_id": str}, usecols=["sample_id"])
+            keep_ids = set(status_df["sample_id"].dropna().astype(str))
+            keep_indices_for_status = np.array(
+                [i for i, sid in enumerate(all_sample_ids) if sid in keep_ids], dtype=np.intp,
+            )
+        except Exception:
+            pass
+
     cached_chrs = []
     uncached_chrs = []
     for chrom in chromosomes:
@@ -370,18 +388,24 @@ def run_all_of_us(
             uncached_chrs.append(f"chr{chrom}(no VCF)")
             continue
         cache_dir = _vcf_cache_dir(vcf_path)
-        # We need keep_indices to check cache key, but we don't have them yet.
-        # Just check if any .npy file exists for this VCF.
-        has_cache = any(cache_dir.glob("*.genotypes.npy")) if cache_dir.exists() else False
+        if keep_indices_for_status is not None:
+            # Check the EXACT cache key
+            key = _vcf_cache_key(vcf_path, keep_indices_for_status)
+            has_cache = (cache_dir / f"{key}.genotypes.npy").exists()
+            has_partial = (cache_dir / f"{key}.inc.progress.json").exists()
+            has_tmp = (cache_dir / f"{key}.tmp_parallel").exists()
+        else:
+            has_cache = False
+            has_partial = False
+            has_tmp = False
         if has_cache:
             cached_chrs.append(f"chr{chrom}")
+        elif has_partial:
+            uncached_chrs.append(f"chr{chrom}(partial)")
+        elif has_tmp:
+            uncached_chrs.append(f"chr{chrom}(parallel-partial)")
         else:
-            # Check for partial incremental cache
-            has_partial = any(cache_dir.glob("*.inc.progress.json")) if cache_dir.exists() else False
-            if has_partial:
-                uncached_chrs.append(f"chr{chrom}(partial)")
-            else:
-                uncached_chrs.append(f"chr{chrom}")
+            uncached_chrs.append(f"chr{chrom}")
     log(f"  VCF cached ({len(cached_chrs)}): {', '.join(cached_chrs) if cached_chrs else 'none'}")
     log(f"  VCF needed ({len(uncached_chrs)}): {', '.join(uncached_chrs) if uncached_chrs else 'none — all cached!'}")
     summary_path = work_dir / "summary.json"
