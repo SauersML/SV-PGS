@@ -32,7 +32,6 @@ class LoadedDataset:
     variant_records: list[VariantRecord]
     variant_stats: VariantStatistics | None = None
 
-
 @dataclass(slots=True)
 class PipelineOutputs:
     artifact_dir: Path
@@ -430,6 +429,9 @@ def load_multi_vcf_dataset_from_files(
     source_paths = [Path(path) for path in genotype_paths]
     if not source_paths:
         raise ValueError("genotype_paths cannot be empty.")
+    resolved_paths = [path.resolve() for path in source_paths]
+    if len(set(resolved_paths)) != len(resolved_paths):
+        raise ValueError("genotype_paths must be unique.")
 
     log(f"reading sample table header: {sample_table_path}")
     sample_table_spec = _inspect_delimited_table(sample_table_path)
@@ -502,6 +504,7 @@ def load_multi_vcf_dataset_from_files(
         allele_frequencies=np.concatenate([stats.allele_frequencies for stats in variant_stats_parts]).astype(np.float32, copy=False),
         support_counts=np.concatenate([stats.support_counts for stats in variant_stats_parts]).astype(np.int32, copy=False),
     )
+    _validate_multi_vcf_variant_keys(default_variants)
 
     log("building variant records from defaults + optional metadata...")
     variant_records = _build_variant_records(
@@ -521,6 +524,20 @@ def load_multi_vcf_dataset_from_files(
         variant_records=variant_records,
         variant_stats=variant_stats,
     )
+
+
+def _validate_multi_vcf_variant_keys(default_variants: Sequence[_VariantDefaults]) -> None:
+    seen_keys: set[tuple[str, int, str]] = set()
+    duplicate_keys: list[tuple[str, int, str]] = []
+    for variant in default_variants:
+        variant_key = (str(variant.chromosome), int(variant.position), str(variant.variant_id))
+        if variant_key in seen_keys:
+            duplicate_keys.append(variant_key)
+        else:
+            seen_keys.add(variant_key)
+    if duplicate_keys:
+        preview = ", ".join(f"{chrom}:{position}:{variant_id}" for chrom, position, variant_id in duplicate_keys[:3])
+        raise ValueError(f"duplicate variants detected across genotype_paths: {preview}")
 
 
 def run_training_pipeline(
@@ -777,6 +794,12 @@ def _load_vcf_from_cache(
             allele_frequencies=np.asarray(stats_payload["allele_frequencies"], dtype=np.float32),
             support_counts=np.asarray(stats_payload["support_counts"], dtype=np.int32),
         )
+        if not genotype_matrix.flags.f_contiguous:
+            log("  cache matrix uses legacy row-major layout; rewriting cache entry in column-major order")
+            genotype_matrix = np.asfortranarray(np.asarray(genotype_matrix, dtype=np.int8))
+            _save_vcf_to_cache(vcf_path, keep_sample_indices, genotype_matrix, variants, variant_stats)
+            if mmap_mode is not None:
+                genotype_matrix = np.load(geno_path, mmap_mode=mmap_mode)
         log(f"  cached matrix {genotype_matrix.shape}, {len(variants)} variants")
         return genotype_matrix, variants, variant_stats
     except Exception as exc:
@@ -792,12 +815,16 @@ def _read_vcf_sample_ids(vcf_path: Path) -> list[str]:
         reader.close()
 
 
+_INCREMENTAL_CHECKPOINT_INTERVAL = 5000  # variants between disk flushes
+
+
 def _load_vcf_with_cache(
     vcf_path: Path,
     keep_sample_indices: np.ndarray,
     *,
     mmap_mode: str | None,
 ) -> tuple[np.ndarray, list[_VariantDefaults], VariantStatistics]:
+    # Check for completed cache first
     cached = _load_vcf_from_cache(
         vcf_path,
         keep_sample_indices=keep_sample_indices,
@@ -806,19 +833,251 @@ def _load_vcf_with_cache(
     if cached is not None:
         return cached
 
-    genotype_matrix, variants, variant_stats = _load_vcf(vcf_path, keep_sample_indices=keep_sample_indices)
+    # Parse with incremental checkpointing
+    cache_dir = _vcf_cache_dir(vcf_path)
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    key = _vcf_cache_key(vcf_path, keep_sample_indices)
+    genotype_matrix, variants, variant_stats = _load_vcf_incremental(
+        vcf_path, keep_sample_indices, cache_dir, key,
+    )
     _save_vcf_to_cache(vcf_path, keep_sample_indices, genotype_matrix, variants, variant_stats)
-    if mmap_mode is None:
-        return genotype_matrix, variants, variant_stats
-
-    cached = _load_vcf_from_cache(
-        vcf_path,
-        keep_sample_indices=keep_sample_indices,
-        mmap_mode=mmap_mode,
-    )
-    if cached is not None:
-        return cached
+    if mmap_mode is not None:
+        cached = _load_vcf_from_cache(vcf_path, keep_sample_indices=keep_sample_indices, mmap_mode=mmap_mode)
+        if cached is not None:
+            return cached
     return genotype_matrix, variants, variant_stats
+
+
+def _load_vcf_incremental(
+    vcf_path: Path,
+    keep_sample_indices: np.ndarray | None,
+    cache_dir: Path,
+    key: str,
+) -> tuple[np.ndarray, list[_VariantDefaults], VariantStatistics]:
+    """Parse VCF with incremental checkpointing. Resumes from last checkpoint if interrupted."""
+    import time
+    import os
+    import json as _json
+
+    n_all_samples = len(_open_vcf_reader(vcf_path).samples)
+    n_keep = len(keep_sample_indices) if keep_sample_indices is not None else n_all_samples
+
+    # Incremental files
+    geno_bin = cache_dir / f"{key}.inc.genotypes.bin"
+    var_jsonl = cache_dir / f"{key}.inc.variants.jsonl"
+    stats_bin = cache_dir / f"{key}.inc.stats.bin"  # 4 int32/int64 values per variant
+    progress_file = cache_dir / f"{key}.inc.progress.json"
+
+    # Check for existing progress
+    n_cached = 0
+    resume_chrom: str | None = None
+    resume_pos: int = 0
+    if progress_file.exists():
+        try:
+            prog = _json.loads(progress_file.read_text())
+            n_cached = int(prog["n_variants"])
+            resume_chrom = prog.get("resume_chrom")
+            resume_pos = int(prog.get("resume_pos", 0))
+            # Truncate files to exact checkpoint (guard against partial writes)
+            expected_geno_bytes = n_cached * n_keep
+            if geno_bin.exists() and geno_bin.stat().st_size > expected_geno_bytes:
+                with open(geno_bin, "r+b") as f:
+                    f.truncate(expected_geno_bytes)
+            log(f"  incremental cache: resuming from {n_cached} variants (last pos: {resume_chrom}:{resume_pos})")
+        except Exception as exc:
+            log(f"  incremental cache progress corrupt ({exc}), starting fresh")
+            n_cached = 0
+            for p in (geno_bin, var_jsonl, stats_bin, progress_file):
+                try:
+                    p.unlink(missing_ok=True)
+                except Exception:
+                    pass
+
+    # Open VCF
+    reader = _open_vcf_reader(vcf_path)
+    n_threads = os.cpu_count() or 4
+    reader.set_threads(n_threads)
+    log(f"  VCF decompression threads: {n_threads}")
+
+    _GT_TO_INT8 = np.array([0, 1, -1, 2], dtype=np.int8)
+    _gt_to_i8 = _GT_TO_INT8
+
+    # Open files for append
+    geno_fh = open(geno_bin, "ab")
+    var_fh = open(var_jsonl, "a")
+    # Stats: 4 values per variant (sum_i64, sum_sq_i64, n_valid_i32, support_i32) = 24 bytes
+    stats_fh = open(stats_bin, "ab")
+
+    t_start = time.monotonic()
+    last_log_time = t_start
+    last_chrom = None
+    variant_index = 0
+    variants_since_checkpoint = 0
+    _monotonic = time.monotonic
+
+    # Skip already-cached records
+    if n_cached > 0:
+        log(f"  skipping {n_cached} already-cached variants...")
+        skip_start = time.monotonic()
+        skipped = 0
+        for record in reader:
+            skipped += 1
+            if skipped >= n_cached:
+                break
+        skip_elapsed = time.monotonic() - skip_start
+        log(f"  skipped {skipped} variants in {skip_elapsed:.1f}s ({skipped/max(skip_elapsed,0.01):.0f}/s)")
+        variant_index = n_cached
+        t_start = time.monotonic()
+        last_log_time = t_start
+
+    # Parse remaining variants
+    for record in reader:
+        if len(record.ALT) != 1:
+            continue  # skip multiallelic silently in incremental mode
+
+        gt = record.gt_types
+        int8_col = _gt_to_i8[gt]
+        if keep_sample_indices is not None:
+            int8_col = int8_col[keep_sample_indices]
+
+        # Write genotype column to disk immediately
+        geno_fh.write(int8_col.tobytes())
+
+        # Compute per-variant stats
+        observed = int8_col[int8_col >= 0].astype(np.int32, copy=False)
+        dosage_sum = int(np.sum(observed, dtype=np.int64))
+        dosage_sum_sq = int(np.sum(observed * observed, dtype=np.int64))
+        n_valid = observed.shape[0]
+        support = int(np.count_nonzero(observed > 0))
+
+        # Write stats (fixed 24 bytes per variant)
+        import struct
+        stats_fh.write(struct.pack("<qqii", dosage_sum, dosage_sum_sq, n_valid, support))
+
+        # Write variant metadata
+        vd = _variant_defaults_from_vcf_record(record)
+        var_fh.write(_json.dumps({
+            "variant_id": vd.variant_id, "variant_class": vd.variant_class.value,
+            "chromosome": vd.chromosome, "position": vd.position,
+            "length": vd.length, "allele_frequency": vd.allele_frequency,
+            "quality": vd.quality,
+        }) + "\n")
+
+        variant_index += 1
+        variants_since_checkpoint += 1
+
+        # Periodic checkpoint
+        if variants_since_checkpoint >= _INCREMENTAL_CHECKPOINT_INTERVAL:
+            geno_fh.flush()
+            var_fh.flush()
+            stats_fh.flush()
+            os.fsync(geno_fh.fileno())
+            os.fsync(var_fh.fileno())
+            os.fsync(stats_fh.fileno())
+            _atomic_write_text(progress_file, _json.dumps({
+                "n_variants": variant_index,
+                "n_samples": n_keep,
+                "resume_chrom": str(record.CHROM),
+                "resume_pos": int(record.POS),
+            }))
+            variants_since_checkpoint = 0
+
+        # Progress log
+        now = _monotonic()
+        chrom = str(record.CHROM)
+        if chrom != last_chrom:
+            if last_chrom is not None:
+                log(f"  chromosome {last_chrom} done — {variant_index} variants so far  mem={mem()}")
+            last_chrom = chrom
+            last_log_time = now
+        elif now - last_log_time >= 5.0:
+            rate = (variant_index - n_cached) / max(now - t_start, 0.01)
+            log(f"  {variant_index} variants loaded ({rate:.0f} variants/s, {chrom})  mem={mem()}")
+            last_log_time = now
+
+    # Final flush
+    geno_fh.flush()
+    var_fh.flush()
+    stats_fh.flush()
+    geno_fh.close()
+    var_fh.close()
+    stats_fh.close()
+
+    n_total = variant_index
+    if n_total == 0:
+        raise ValueError("VCF contains no variants: " + str(vcf_path))
+
+    elapsed = time.monotonic() - t_start
+    new_variants = n_total - n_cached
+    log(f"  parsed {new_variants} new variants in {elapsed:.1f}s ({n_total} total)")
+
+    # Load the complete matrix from the incremental file — zero-copy transpose
+    log(f"  loading incremental cache ({n_total} variants x {n_keep} samples)...")
+    raw = np.fromfile(str(geno_bin), dtype=np.int8)
+    genotype_matrix = raw.reshape(n_total, n_keep).T  # Fortran-order view, no copy
+    genotype_matrix = np.asfortranarray(genotype_matrix)  # ensure proper Fortran layout
+
+    # Load variant metadata
+    import json as _json2
+    variants: list[_VariantDefaults] = []
+    with open(var_jsonl) as f:
+        for line in f:
+            d = _json2.loads(line)
+            variants.append(_VariantDefaults(
+                variant_id=d["variant_id"],
+                variant_class=VariantClass(d["variant_class"]),
+                chromosome=d["chromosome"],
+                position=d["position"],
+                length=d["length"],
+                allele_frequency=d["allele_frequency"],
+                quality=d["quality"],
+            ))
+
+    # Load stats and compute final statistics
+    import struct
+    stats_raw = open(stats_bin, "rb").read()
+    n_stats = len(stats_raw) // 24
+    col_sums = np.empty(n_stats, dtype=np.int64)
+    col_sum_sq = np.empty(n_stats, dtype=np.int64)
+    n_valid_arr = np.empty(n_stats, dtype=np.int32)
+    support_arr = np.empty(n_stats, dtype=np.int32)
+    for i in range(n_stats):
+        s, sq, nv, sp = struct.unpack_from("<qqii", stats_raw, i * 24)
+        col_sums[i] = s
+        col_sum_sq[i] = sq
+        n_valid_arr[i] = nv
+        support_arr[i] = sp
+
+    safe_n_valid = np.maximum(n_valid_arr.astype(np.int64), 1).astype(np.float64)
+    means_arr = (col_sums / safe_n_valid).astype(np.float32)
+    allele_freqs = np.clip(means_arr / 2.0, 0.0, 1.0).astype(np.float32)
+    centered_sum_sq = np.maximum(col_sum_sq.astype(np.float64) - col_sums.astype(np.float64) ** 2 / safe_n_valid, 0.0)
+    scales_arr = np.sqrt(centered_sum_sq / max(n_keep, 1)).astype(np.float32)
+    scales_arr = np.where(scales_arr < 1e-6, 1.0, scales_arr)
+
+    variant_stats = VariantStatistics(
+        means=means_arr,
+        scales=scales_arr,
+        allele_frequencies=allele_freqs,
+        support_counts=support_arr,
+    )
+
+    # Clean up incremental files (final cache will be saved by caller)
+    for p in (geno_bin, var_jsonl, stats_bin, progress_file):
+        try:
+            p.unlink(missing_ok=True)
+        except Exception:
+            pass
+
+    log(f"  incremental parse complete: {genotype_matrix.shape}  mem={mem()}")
+    return genotype_matrix, variants, variant_stats
+
+
+def _atomic_write_text(path: Path, text: str) -> None:
+    """Write text atomically via temp file + rename."""
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(text)
+    tmp.rename(path)
 
 
 def _save_vcf_to_cache(
@@ -905,10 +1164,18 @@ def _load_vcf(
     record_count_hint = _vcf_record_count_hint(reader)
     genotype_matrix: np.ndarray | None
     dosage_columns: list[np.ndarray] | None
+    column_sums: np.ndarray | list[np.int64]
+    column_sum_squares: np.ndarray | list[np.int64]
+    column_non_missing: np.ndarray | list[np.int32]
+    column_support: np.ndarray | list[np.int32]
     if record_count_hint is None:
         genotype_matrix = None
         dosage_columns = []
         variants: list[_VariantDefaults] = []
+        column_sums = []
+        column_sum_squares = []
+        column_non_missing = []
+        column_support = []
     else:
         matrix_gb = n_keep * record_count_hint / 1e9
         log(
@@ -918,6 +1185,10 @@ def _load_vcf(
         genotype_matrix = np.empty((n_keep, record_count_hint), dtype=np.int8, order="F")
         dosage_columns = None
         variants = []
+        column_sums = np.empty(record_count_hint, dtype=np.int64)
+        column_sum_squares = np.empty(record_count_hint, dtype=np.int64)
+        column_non_missing = np.empty(record_count_hint, dtype=np.int32)
+        column_support = np.empty(record_count_hint, dtype=np.int32)
 
     t_start = time.monotonic()
     last_log_time = t_start
@@ -927,6 +1198,10 @@ def _load_vcf(
     _gt_to_i8 = _GT_TO_INT8
     _append_var = variants.append
     _monotonic = time.monotonic
+    _sum_list_append = column_sums.append if isinstance(column_sums, list) else None
+    _sum_sq_list_append = column_sum_squares.append if isinstance(column_sum_squares, list) else None
+    _n_valid_list_append = column_non_missing.append if isinstance(column_non_missing, list) else None
+    _support_list_append = column_support.append if isinstance(column_support, list) else None
 
     for record in reader:
         if len(record.ALT) != 1:
@@ -951,6 +1226,21 @@ def _load_vcf(
                     f"expected={genotype_matrix.shape[1]} parsed_at_least={n + 1}"
                 )
             genotype_matrix[:, n] = int8_col
+        observed = int8_col[int8_col >= 0].astype(np.int32, copy=False)
+        support = np.count_nonzero(observed > 0)
+        dosage_sum = np.sum(observed, dtype=np.int64)
+        dosage_sum_sq = np.sum(observed * observed, dtype=np.int64)
+        n_valid = int(observed.shape[0])
+        if _sum_list_append is None:
+            column_sums[n] = dosage_sum
+            column_sum_squares[n] = dosage_sum_sq
+            column_non_missing[n] = n_valid
+            column_support[n] = support
+        else:
+            _sum_list_append(np.int64(dosage_sum))
+            _sum_sq_list_append(np.int64(dosage_sum_sq))
+            _n_valid_list_append(np.int32(n_valid))
+            _support_list_append(np.int32(support))
         _append_var(_variant_defaults_from_vcf_record(record))
         n += 1
 
@@ -977,8 +1267,8 @@ def _load_vcf(
 
     # Build int8 matrix directly — 4x smaller than float32 (2.5 GB vs 10 GB for 97K×26K).
     # Values: 0/1/2 for dosage, -1 for missing.  Converted to float32 per-batch on the fly.
-    # Use Fortran (column-major) order for fast column writes, then convert to C order
-    # for fast row-slice access during batch iteration.
+    # Keep Fortran order because both parse-time writes and downstream column-batch reads
+    # are column-major operations.
     if genotype_matrix is None:
         if dosage_columns is None:
             raise RuntimeError("VCF loader column buffer was not initialized.")
@@ -991,28 +1281,24 @@ def _load_vcf(
         del dosage_columns
     elif genotype_matrix.shape[1] != n_total:
         genotype_matrix = genotype_matrix[:, :n_total]
-    genotype_matrix = np.ascontiguousarray(genotype_matrix)
 
     matrix_mb = genotype_matrix.nbytes / 1e6
     log(f"genotype matrix ready: {genotype_matrix.shape}, {matrix_mb:.1f} MB  mem={mem()}")
 
-    # Compute variant stats in column chunks to avoid 20 GB intermediate.
-    # Each chunk processes ~1024 variants at a time using int8→int64 accumulation.
-    log(f"computing variant statistics (chunked over {n_total} variants)...")
-    col_sums = np.empty(n_total, dtype=np.int64)
-    col_sum_sq = np.empty(n_total, dtype=np.int64)
-    n_valid = np.empty(n_total, dtype=np.int64)
-    support_arr = np.empty(n_total, dtype=np.int32)
-    chunk = 1024
-    for start in range(0, n_total, chunk):
-        end = min(start + chunk, n_total)
-        block = genotype_matrix[:, start:end]  # int8 view, no copy
-        valid = block != -1
-        obs = np.where(valid, block.astype(np.int32), 0)
-        col_sums[start:end] = np.sum(obs, axis=0, dtype=np.int64)
-        col_sum_sq[start:end] = np.sum(obs * obs, axis=0, dtype=np.int64)
-        n_valid[start:end] = np.count_nonzero(valid, axis=0)
-        support_arr[start:end] = np.count_nonzero(obs > 0, axis=0)
+    log("finalizing VCF variant statistics...")
+    col_sums = np.asarray(column_sums[:n_total] if isinstance(column_sums, np.ndarray) else column_sums, dtype=np.int64)
+    col_sum_sq = np.asarray(
+        column_sum_squares[:n_total] if isinstance(column_sum_squares, np.ndarray) else column_sum_squares,
+        dtype=np.int64,
+    )
+    n_valid = np.asarray(
+        column_non_missing[:n_total] if isinstance(column_non_missing, np.ndarray) else column_non_missing,
+        dtype=np.int64,
+    )
+    support_arr = np.asarray(
+        column_support[:n_total] if isinstance(column_support, np.ndarray) else column_support,
+        dtype=np.int32,
+    )
     safe_n_valid = np.maximum(n_valid, 1).astype(np.float64)
     means_arr = (col_sums / safe_n_valid).astype(np.float32)
     allele_freqs = np.clip(means_arr / 2.0, 0.0, 1.0).astype(np.float32)
