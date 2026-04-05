@@ -9,6 +9,7 @@ import sys
 from pathlib import Path
 
 from sv_pgs._jax import require_full_gpu_runtime
+from sv_pgs.aou_runner import run_all_of_us
 from sv_pgs.all_of_us import AllOfUsDiseaseRequest, available_disease_names, prepare_all_of_us_disease_sample_table
 from sv_pgs.config import ModelConfig, TraitType
 from sv_pgs.io import load_dataset_from_files, run_training_pipeline
@@ -111,7 +112,6 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     if args.command == "run-all-of-us":
-        from sv_pgs.aou_runner import run_all_of_us
         # Parse chromosome range: "1-22" -> [1,2,...,22], "22" -> [22], "1,5,22" -> [1,5,22]
         chr_str = args.chromosomes
         if "-" in chr_str:

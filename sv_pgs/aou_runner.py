@@ -4,6 +4,7 @@ from __future__ import annotations
 import gc
 import json
 import os
+import shutil
 import subprocess
 from pathlib import Path
 
@@ -11,7 +12,8 @@ import numpy as np
 import pandas as pd
 
 from sv_pgs.all_of_us import AllOfUsDiseaseRequest, prepare_all_of_us_disease_sample_table, resolve_disease_definition
-from sv_pgs.config import TraitType
+from sv_pgs.config import ModelConfig, TraitType
+from sv_pgs.io import load_multi_vcf_dataset_from_files, run_training_pipeline
 from sv_pgs.progress import log
 
 
@@ -51,7 +53,6 @@ def sv_vcf_name(chromosome: int) -> str:
 
 def _check_disk_space(path: Path, required_bytes: int) -> None:
     """Raise if the filesystem doesn't have enough free space."""
-    import shutil
     stat = shutil.disk_usage(str(path))
     if stat.free < required_bytes:
         free_gb = stat.free / 1e9
@@ -337,8 +338,6 @@ def run_all_of_us(
     random_seed: int = 0,
 ) -> None:
     """Full AoU pipeline: download requested chromosomes, merge them, and run one fit."""
-    from sv_pgs.io import load_multi_vcf_dataset_from_files, run_training_pipeline
-    from sv_pgs.config import ModelConfig
 
     # Validate disease
     disease_def = resolve_disease_definition(disease)

@@ -522,8 +522,8 @@ def build_tie_map(
     n_total = standardized_genotypes.shape[1]
     log(f"  building tie map over {n_total} variants...")
 
-    exact_signature_to_group: dict[tuple[bytes, bytes], int] = {}
-    sign_flipped_signature_to_group: dict[tuple[bytes, bytes], int] = {}
+    exact_signature_to_group: dict[tuple[bytes, bytes], list[int]] = {}
+    sign_flipped_signature_to_group: dict[tuple[bytes, bytes], list[int]] = {}
     tie_group_member_indices: list[list[int]] = []
     tie_group_signs: list[list[float]] = []
     representative_indices: list[int] = []
@@ -541,18 +541,32 @@ def build_tie_map(
                 column_missing_mask,
             )
 
-            if genotype_signature in exact_signature_to_group:
-                reduced_index = exact_signature_to_group[genotype_signature]
-                tie_group_member_indices[reduced_index].append(int(variant_index))
-                tie_group_signs[reduced_index].append(1.0)
-                original_to_reduced[int(variant_index)] = reduced_index
+            exact_match_index = _matching_tie_group_index(
+                standardized_genotypes=standardized_genotypes,
+                candidate_group_indices=exact_signature_to_group.get(genotype_signature, ()),
+                representative_member_indices=tie_group_member_indices,
+                column=standardized_column,
+                missing_mask=column_missing_mask,
+                sign=1.0,
+            )
+            if exact_match_index is not None:
+                tie_group_member_indices[exact_match_index].append(int(variant_index))
+                tie_group_signs[exact_match_index].append(1.0)
+                original_to_reduced[int(variant_index)] = exact_match_index
                 continue
 
-            if genotype_signature in sign_flipped_signature_to_group:
-                reduced_index = sign_flipped_signature_to_group[genotype_signature]
-                tie_group_member_indices[reduced_index].append(int(variant_index))
-                tie_group_signs[reduced_index].append(-1.0)
-                original_to_reduced[int(variant_index)] = reduced_index
+            sign_flipped_match_index = _matching_tie_group_index(
+                standardized_genotypes=standardized_genotypes,
+                candidate_group_indices=sign_flipped_signature_to_group.get(genotype_signature, ()),
+                representative_member_indices=tie_group_member_indices,
+                column=standardized_column,
+                missing_mask=column_missing_mask,
+                sign=-1.0,
+            )
+            if sign_flipped_match_index is not None:
+                tie_group_member_indices[sign_flipped_match_index].append(int(variant_index))
+                tie_group_signs[sign_flipped_match_index].append(-1.0)
+                original_to_reduced[int(variant_index)] = sign_flipped_match_index
                 continue
 
             reduced_index = len(representative_indices)
@@ -560,8 +574,8 @@ def build_tie_map(
             tie_group_member_indices.append([int(variant_index)])
             tie_group_signs.append([1.0])
             kept_variant_indices.append(int(variant_index))
-            exact_signature_to_group[genotype_signature] = reduced_index
-            sign_flipped_signature_to_group[sign_flipped_signature] = reduced_index
+            exact_signature_to_group.setdefault(genotype_signature, []).append(reduced_index)
+            sign_flipped_signature_to_group.setdefault(sign_flipped_signature, []).append(reduced_index)
             original_to_reduced[int(variant_index)] = reduced_index
         variants_done += len(batch.variant_indices)
         if variants_done == len(batch.variant_indices) or variants_done % max(n_total // 10, 1) < len(batch.variant_indices) or variants_done == n_total:
@@ -647,6 +661,48 @@ def _hashed_tie_signature(
     mask_hasher = hashlib.blake2b(digest_size=16, person=b"svpgs_mask_")
     mask_hasher.update(np.packbits(np.ascontiguousarray(missing_mask, dtype=np.uint8)))
     return value_hasher.digest(), mask_hasher.digest()
+
+
+def _matching_tie_group_index(
+    standardized_genotypes: StandardizedGenotypeMatrix,
+    candidate_group_indices: Sequence[int],
+    representative_member_indices: Sequence[list[int]],
+    column: np.ndarray,
+    missing_mask: np.ndarray,
+    sign: float,
+) -> int | None:
+    for reduced_index in candidate_group_indices:
+        representative_column, representative_missing_mask = _load_standardized_column_with_missingness(
+            standardized_genotypes,
+            int(representative_member_indices[int(reduced_index)][0]),
+        )
+        if not np.array_equal(missing_mask, representative_missing_mask):
+            continue
+        if sign < 0.0:
+            representative_column = _normalize_signed_zeros(-representative_column)
+        if np.array_equal(column, representative_column):
+            return int(reduced_index)
+    return None
+
+
+def _load_standardized_column_with_missingness(
+    standardized_genotypes: StandardizedGenotypeMatrix,
+    local_variant_index: int,
+) -> tuple[np.ndarray, np.ndarray]:
+    if standardized_genotypes.raw is not None:
+        raw_variant_index = int(standardized_genotypes.variant_indices[local_variant_index])
+        raw_column = standardized_genotypes.raw.materialize([raw_variant_index]).reshape(-1, 1)
+        standardized_column = _standardize_batch(
+            raw_column,
+            standardized_genotypes.means[np.asarray([raw_variant_index], dtype=np.int32)],
+            standardized_genotypes.scales[np.asarray([raw_variant_index], dtype=np.int32)],
+        )[:, 0]
+        return _normalize_signed_zeros(standardized_column), np.isnan(raw_column[:, 0])
+    if standardized_genotypes._dense_cache is None:
+        dense_column = standardized_genotypes.materialize()[:, local_variant_index]
+    else:
+        dense_column = standardized_genotypes._dense_cache[:, local_variant_index]
+    return _normalize_signed_zeros(dense_column), np.zeros(dense_column.shape[0], dtype=bool)
 
 
 # Create one merged record per tie group for use in the reduced model.

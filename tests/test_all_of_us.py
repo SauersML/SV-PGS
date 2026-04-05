@@ -596,11 +596,13 @@ def test_run_all_of_us_runs_single_unified_fit_and_cleans_downloads(monkeypatch,
     monkeypatch.setattr(aou_runner, "download_sv_vcf", fake_download_sv_vcf)
     monkeypatch.setattr(aou_runner, "release_process_memory", lambda: release_calls.append("released"))
     monkeypatch.setattr(
-        "sv_pgs.io.load_multi_vcf_dataset_from_files",
+        aou_runner,
+        "load_multi_vcf_dataset_from_files",
         lambda **kwargs: loader_calls.append([str(path) for path in kwargs["genotype_paths"]]) or _Dataset(),
     )
     monkeypatch.setattr(
-        "sv_pgs.io.run_training_pipeline",
+        aou_runner,
+        "run_training_pipeline",
         lambda **kwargs: pipeline_calls.append((kwargs["dataset"].targets.shape[0], Path(kwargs["output_dir"]))),
     )
 
@@ -667,11 +669,13 @@ def test_run_all_of_us_skips_existing_fit_only_when_run_metadata_matches(monkeyp
         lambda chromosome, work_dir: (_ for _ in ()).throw(AssertionError("download_sv_vcf should not run")),
     )
     monkeypatch.setattr(
-        "sv_pgs.io.load_multi_vcf_dataset_from_files",
+        aou_runner,
+        "load_multi_vcf_dataset_from_files",
         lambda **kwargs: (_ for _ in ()).throw(AssertionError("dataset loading should not run")),
     )
     monkeypatch.setattr(
-        "sv_pgs.io.run_training_pipeline",
+        aou_runner,
+        "run_training_pipeline",
         lambda **kwargs: (_ for _ in ()).throw(AssertionError("training should not run")),
     )
 
@@ -735,11 +739,13 @@ def test_run_all_of_us_reruns_when_existing_fit_metadata_differs(monkeypatch, tm
     monkeypatch.setattr(aou_runner, "download_sv_vcf", fake_download_sv_vcf)
     monkeypatch.setattr(aou_runner, "release_process_memory", lambda: None)
     monkeypatch.setattr(
-        "sv_pgs.io.load_multi_vcf_dataset_from_files",
+        aou_runner,
+        "load_multi_vcf_dataset_from_files",
         lambda **kwargs: loader_calls.append([str(path) for path in kwargs["genotype_paths"]]) or _Dataset(),
     )
     monkeypatch.setattr(
-        "sv_pgs.io.run_training_pipeline",
+        aou_runner,
+        "run_training_pipeline",
         lambda **kwargs: pipeline_calls.append(Path(kwargs["output_dir"])),
     )
 

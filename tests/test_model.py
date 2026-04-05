@@ -3,6 +3,7 @@ from __future__ import annotations
 import numpy as np
 from sklearn.metrics import roc_auc_score
 
+import sv_pgs.genotype as genotype_module
 from sv_pgs import BayesianPGS, BenchmarkConfig, ModelConfig, TraitType, VariantClass, VariantRecord, run_benchmark_suite
 from sv_pgs.data import TieGroup, TieMap
 from sv_pgs.genotype import RawGenotypeBatch, RawGenotypeMatrix
@@ -277,6 +278,28 @@ def test_validation_path_keeps_raw_genotypes_streaming():
 
     assert model.state is not None
     assert validation_genotypes.materialize_calls == 0
+
+
+def test_model_fit_keeps_streaming_when_materialization_is_skipped(monkeypatch):
+    genotype_matrix, covariate_matrix, target_vector, variant_records = _synthetic_binary_dataset()
+
+    monkeypatch.setattr(genotype_module.StandardizedGenotypeMatrix, "try_materialize_gpu", lambda self: False)
+    monkeypatch.setattr(genotype_module.StandardizedGenotypeMatrix, "try_materialize", lambda self: False)
+    monkeypatch.setattr(
+        genotype_module.StandardizedGenotypeMatrix,
+        "release_raw_storage",
+        lambda self: (_ for _ in ()).throw(AssertionError("release_raw_storage should not be called for streaming fits")),
+    )
+
+    model = BayesianPGS(
+        ModelConfig(
+            trait_type=TraitType.BINARY,
+            max_outer_iterations=2,
+            minimum_structural_variant_carriers=1,
+        )
+    ).fit(genotype_matrix, covariate_matrix, target_vector, variant_records)
+
+    assert model.state is not None
 
 
 def test_compute_support_counts_only_reads_unresolved_structural_variants():

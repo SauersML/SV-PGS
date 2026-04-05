@@ -273,13 +273,14 @@ def test_try_materialize_gpu_skips_when_matrix_exceeds_budget(monkeypatch: pytes
         def empty(shape, dtype=None, order=None):
             raise AssertionError("GPU allocation should be skipped before empty.")
 
-    raw_matrix = np.zeros((10, 30_000_000), dtype=np.int8)
+    raw_matrix = np.zeros((4, 6), dtype=np.int8)
     standardized = as_raw_genotype_matrix(raw_matrix).standardized(
         means=np.zeros(raw_matrix.shape[1], dtype=np.float32),
         scales=np.ones(raw_matrix.shape[1], dtype=np.float32),
     )
 
     monkeypatch.setattr(genotype_module, "_try_import_cupy", lambda: _FakeCupy())
+    monkeypatch.setattr(genotype_module, "_gpu_materialization_budget_bytes", lambda cupy: 1)
 
     assert standardized.try_materialize_gpu() is False
     assert standardized._cupy_cache is None

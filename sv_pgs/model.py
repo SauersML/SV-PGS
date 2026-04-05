@@ -23,7 +23,7 @@ from sv_pgs.numeric import stable_sigmoid
 from sv_pgs.preprocessing import (
     Preprocessor,
     build_tie_map,
-    fit_preprocessor,
+    compute_variant_statistics,
     fit_preprocessor_from_stats,
     select_active_variant_indices,
 )
@@ -90,11 +90,18 @@ class BayesianPGS:
             covariate_matrix = self._with_intercept(covariates)
             prepared_arrays = fit_preprocessor_from_stats(variant_stats, covariate_matrix, targets)
         else:
-            log("normalizing variant records and computing training support...")
-            normalized_records = _training_records(raw_genotype_matrix, normalize_variant_records(variant_records), self.config)
             covariate_matrix = self._with_intercept(covariates)
-            log(f"fitting preprocessor (streaming mean/scale over {raw_genotype_matrix.shape[1]} variants)...")
-            prepared_arrays = fit_preprocessor(raw_genotype_matrix, covariate_matrix, targets, self.config)
+            log("computing variant statistics in-fit so screening/support/standardization share one pass...")
+            variant_stats = compute_variant_statistics(
+                raw_genotypes=raw_genotype_matrix,
+                config=self.config,
+                covariates=covariate_matrix,
+                targets=targets,
+            )
+            normalized_records = _training_records_from_stats(
+                normalize_variant_records(variant_records), variant_stats,
+            )
+            prepared_arrays = fit_preprocessor_from_stats(variant_stats, covariate_matrix, targets)
         preprocessor = Preprocessor(means=prepared_arrays.means, scales=prepared_arrays.scales)
         log(f"preprocessor ready  {len(normalized_records)} variant records  mem={mem()}")
 
@@ -432,54 +439,6 @@ def _tie_group_export_weights(
         normalized_weights = member_variances / np.maximum(np.sum(member_variances), 1e-12)
         group_weights.append(normalized_weights.astype(np.float32))
     return group_weights
-
-
-def _training_records(
-    raw_genotypes: RawGenotypeMatrix,
-    records: Sequence[VariantRecord],
-    config: ModelConfig,
-) -> list[VariantRecord]:
-    training_supports = [record.training_support for record in records]
-    unresolved_variant_indices = [
-        variant_index
-        for variant_index, record in enumerate(records)
-        if record.variant_class in STRUCTURAL_VARIANT_CLASSES and record.training_support is None
-    ]
-    log(f"  training records: {len(records)} total, {len(unresolved_variant_indices)} SVs need support counts  mem={mem()}")
-    if unresolved_variant_indices:
-        unresolved_supports = np.zeros(len(unresolved_variant_indices), dtype=np.int32)
-        offset = 0
-        for batch in raw_genotypes.iter_column_batches(unresolved_variant_indices, batch_size=auto_batch_size(raw_genotypes.shape[0])):
-            # Vectorized support count: count non-zero non-NaN values per column
-            batch_jax = jnp.asarray(batch.values)
-            valid = ~jnp.isnan(batch_jax)
-            counts = jnp.sum((jnp.abs(batch_jax) > 0.5) & valid, axis=0)
-            batch_len = len(batch.variant_indices)
-            unresolved_supports[offset:offset + batch_len] = np.asarray(counts, dtype=np.int32)
-            offset += batch_len
-        for i, variant_index in enumerate(unresolved_variant_indices):
-            training_supports[variant_index] = int(unresolved_supports[i])
-
-    training_records: list[VariantRecord] = []
-    for variant_index, record in enumerate(records):
-        training_records.append(
-            VariantRecord(
-                variant_id=record.variant_id,
-                variant_class=record.variant_class,
-                chromosome=record.chromosome,
-                position=record.position,
-                length=record.length,
-                allele_frequency=record.allele_frequency,
-                quality=record.quality,
-                training_support=training_supports[variant_index],
-                is_repeat=record.is_repeat,
-                is_copy_number=record.is_copy_number,
-                prior_continuous_features=dict(record.prior_continuous_features),
-                prior_class_members=record.prior_class_members,
-                prior_class_membership=record.prior_class_membership,
-            )
-        )
-    return training_records
 
 
 def _training_records_from_stats(
