@@ -371,13 +371,23 @@ def run_all_of_us(
     if merged_path.exists() and first_vcf.exists():
         try:
             all_sample_ids = _read_vcf_sample_ids(first_vcf)
-            status_df = pd.read_csv(str(merged_path), sep="\t", nrows=0)  # just header
-            status_df = pd.read_csv(str(merged_path), sep="\t", dtype={"sample_id": str}, usecols=["sample_id"])
+            status_df = pd.read_csv(str(merged_path), sep="\t", dtype={"sample_id": str})
+            # Replicate the NaN-dropping that _build_sample_table does:
+            # rows with NaN in target or any covariate get dropped during loading.
+            pc_cols = [c for c in status_df.columns if c.startswith("PC") and c[2:].isdigit()][:n_pcs]
+            covariate_cols = list(DEFAULT_COVARIATES) + pc_cols
+            required_cols = ["target"] + [c for c in covariate_cols if c in status_df.columns]
+            for col in required_cols:
+                if col in status_df.columns:
+                    status_df[col] = pd.to_numeric(status_df[col], errors="coerce")
+            status_df = status_df.dropna(subset=[c for c in required_cols if c in status_df.columns])
             keep_ids = set(status_df["sample_id"].dropna().astype(str))
             keep_indices_for_status = np.array(
                 [i for i, sid in enumerate(all_sample_ids) if sid in keep_ids], dtype=np.intp,
             )
-        except Exception:
+            log(f"  status check: {len(keep_indices_for_status)} samples after NaN filtering")
+        except Exception as exc:
+            log(f"  status check: could not compute cache key ({exc})")
             pass
 
     cached_chrs = []
