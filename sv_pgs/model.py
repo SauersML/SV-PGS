@@ -84,19 +84,17 @@ class BayesianPGS:
         # Use pre-computed stats if available (saves 3 full data passes)
         if variant_stats is not None:
             log("using pre-computed variant statistics (means, scales, support) [NO DATA PASSES]")
+            covariate_matrix = self._with_intercept(covariates)
             normalized_records = _training_records_from_stats(
                 normalize_variant_records(variant_records), variant_stats,
             )
-            covariate_matrix = self._with_intercept(covariates)
             prepared_arrays = fit_preprocessor_from_stats(variant_stats, covariate_matrix, targets)
         else:
             covariate_matrix = self._with_intercept(covariates)
-            log("computing variant statistics in-fit so screening/support/standardization share one pass...")
+            log("computing variant statistics in-fit so support/standardization share one pass...")
             variant_stats = compute_variant_statistics(
                 raw_genotypes=raw_genotype_matrix,
                 config=self.config,
-                covariates=covariate_matrix,
-                targets=targets,
             )
             normalized_records = _training_records_from_stats(
                 normalize_variant_records(variant_records), variant_stats,
@@ -111,34 +109,14 @@ class BayesianPGS:
         log("selecting active variant indices...")
         active_variant_indices = select_active_variant_indices(
             variant_records=normalized_records,
-            support_counts=variant_stats.support_counts,
             config=self.config,
-            marginal_scores=variant_stats.marginal_scores,
         )
         log(f"active variants: {len(active_variant_indices)} / {len(normalized_records)} ({100.0*len(active_variant_indices)/max(len(normalized_records),1):.1f}%)")
         active_records = [normalized_records[int(variant_index)] for variant_index in active_variant_indices]
         active_genotypes = standardized_genotypes.subset(active_variant_indices)
 
-        if active_variant_indices.shape[0] > self.config.maximum_tie_map_variants:
-            log(
-                "skipping tie map because active variant count exceeds limit "
-                f"(limit={self.config.maximum_tie_map_variants}); using identity mapping"
-            )
-            reduced_tie_map = TieMap(
-                kept_indices=np.arange(active_variant_indices.shape[0], dtype=np.int32),
-                original_to_reduced=np.arange(active_variant_indices.shape[0], dtype=np.int32),
-                reduced_to_group=[
-                    TieGroup(
-                        representative_index=int(active_index),
-                        member_indices=np.asarray([active_index], dtype=np.int32),
-                        signs=np.asarray([1.0], dtype=np.float32),
-                    )
-                    for active_index in range(active_variant_indices.shape[0])
-                ],
-            )
-        else:
-            log("building tie map (detecting identical/negated genotype columns)...")
-            reduced_tie_map = build_tie_map(active_genotypes, active_records, self.config)
+        log("building tie map (detecting identical/negated genotype columns)...")
+        reduced_tie_map = build_tie_map(active_genotypes, active_records, self.config)
         original_space_tie_map = _project_tie_map_to_original_space(
             reduced_tie_map=reduced_tie_map,
             active_variant_indices=active_variant_indices,

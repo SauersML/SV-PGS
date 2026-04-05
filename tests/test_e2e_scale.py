@@ -203,7 +203,7 @@ def test_large_scale_binary_end_to_end_roundtrip(tmp_path: Path):
     assert model.state is not None
     assert model.state.tie_map.original_to_reduced[0] == model.state.tie_map.original_to_reduced[1]
     assert model.state.tie_map.original_to_reduced[0] == model.state.tie_map.original_to_reduced[2]
-    assert model.state.tie_map.original_to_reduced[30] != -1
+    assert model.state.tie_map.original_to_reduced[30] == -1
 
     test_probability = model.predict_proba(genotype_matrix[train_stop:], covariate_matrix[train_stop:])[:, 1]
     assert np.all(np.isfinite(test_probability))

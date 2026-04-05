@@ -101,7 +101,6 @@ class _SimpleVCFRecord:
         self.INFO = _SimpleVCFInfo(info)
         self.gt_types = gt_types
         self.end = info.get("END")
-        alt_upper = alt.upper()
         self.is_sv = alt.startswith("<") and alt.endswith(">") or info.get("SVTYPE") is not None
         self.is_snp = not self.is_sv and len(ref) == 1 and len(alt) == 1
         self.is_indel = not self.is_sv and not self.is_snp

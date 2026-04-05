@@ -80,7 +80,6 @@ def build_parser() -> argparse.ArgumentParser:
     )
     run_parser.add_argument("--output-dir", required=True, help="Directory for artifact and result tables.")
     run_parser.add_argument("--max-outer-iterations", type=int, default=30)
-    run_parser.add_argument("--minimum-structural-variant-carriers", type=int, default=5)
     run_parser.add_argument("--random-seed", type=int, default=0)
     return parser
 

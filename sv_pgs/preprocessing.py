@@ -26,38 +26,23 @@ from sv_pgs.progress import log, mem
 
 @jax.jit
 def _batch_all_stats_i8(batch_i8: jnp.ndarray) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray]:
-    """Compute per-variant statistics from a batch of int8 genotypes (PLINK path).
-
-    For each variant (column), computes in one pass over the data:
-      - sum of non-missing dosages (0/1/2)
-      - count of non-missing samples
-      - support count (number of carriers, i.e. dosage > 0)
-      - centered sum of squares (CSS) — used to derive the standard deviation
-
-    Missing values are encoded as -127 in PLINK's int8 format.
-    Mean-imputation is applied before computing CSS so that missing samples
-    don't bias the variance estimate.
-    """
+    """Compute per-variant statistics from int8 genotypes."""
     mask = batch_i8 != -127
     values_f32 = jnp.where(mask, batch_i8.astype(jnp.float32), 0.0)
-
     sums = jnp.sum(values_f32, axis=0, dtype=jnp.float64)
     counts = jnp.sum(mask, axis=0, dtype=jnp.int32)
     support = jnp.sum(mask & (batch_i8 > 0), axis=0, dtype=jnp.int32)
-
     safe_counts = jnp.maximum(counts, 1).astype(jnp.float32)
     means_f32 = (sums / safe_counts.astype(jnp.float64)).astype(jnp.float32)
     imputed = jnp.where(mask, values_f32, means_f32[None, :])
     centered = imputed - means_f32[None, :]
     css = jnp.sum(centered * centered, axis=0, dtype=jnp.float64)
-
     return sums, counts, support, css
 
 
-# Keep float32 versions for VCF path
 @jax.jit
 def _batch_all_stats(batch_values: jnp.ndarray) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray]:
-    """Float32 path for VCF/dense genotypes."""
+    """Compute per-variant statistics from float32 genotypes."""
     mask = ~jnp.isnan(batch_values)
     observed = jnp.where(mask, batch_values, 0.0)
     sums = jnp.sum(observed, axis=0, dtype=jnp.float64)
@@ -75,13 +60,18 @@ def _batch_all_stats(batch_values: jnp.ndarray) -> tuple[jnp.ndarray, jnp.ndarra
 def compute_variant_statistics(
     raw_genotypes: RawGenotypeMatrix,
     config: ModelConfig,
+    covariates: np.ndarray | None = None,
+    targets: np.ndarray | None = None,
 ) -> VariantStatistics:
-    """Compute all per-variant statistics in a single pass over the genotype data."""
+    """Compute per-variant moments and optional marginal screening scores."""
     variant_count = raw_genotypes.shape[1]
     sample_count = raw_genotypes.shape[0]
     batch_size = auto_batch_size(sample_count)
     jax_backend = jax.default_backend()
-    log(f"=== VARIANT STATISTICS (1-pass, JAX/{jax_backend}) ===  {sample_count} samples x {variant_count} variants  batch_size={batch_size}  mem={mem()}")
+    log(
+        f"=== VARIANT STATISTICS (1-pass, JAX/{jax_backend}) ===  "
+        f"{sample_count} samples x {variant_count} variants  batch_size={batch_size}  mem={mem()}"
+    )
 
     sums = np.zeros(variant_count, dtype=np.float64)
     non_missing_counts = np.zeros(variant_count, dtype=np.int32)
@@ -91,37 +81,44 @@ def compute_variant_statistics(
     use_i8 = hasattr(raw_genotypes, "iter_column_batches_i8")
     if use_i8:
         log("  using int8 native path (4x less IO per batch)")
+        batch_iter = raw_genotypes.iter_column_batches_i8(batch_size=batch_size)
     else:
         log(f"  using float32 path (type={type(raw_genotypes).__name__})")
+        batch_iter = raw_genotypes.iter_column_batches(batch_size=batch_size)
 
     import time as _time
+
     variants_done = 0
     batch_number = 0
-    batch_iter = raw_genotypes.iter_column_batches_i8(batch_size=batch_size) if use_i8 else raw_genotypes.iter_column_batches(batch_size=batch_size)
     for batch in batch_iter:
         batch_number += 1
-        _t0 = _time.monotonic()
-        idx = batch.variant_indices
+        start_time = _time.monotonic()
+        batch_indices = batch.variant_indices
+        batch_jax = jnp.asarray(batch.values)
         if use_i8:
-            batch_jax = jnp.asarray(batch.values)
             batch_sums, batch_counts, batch_support, batch_css = _batch_all_stats_i8(batch_jax)
         else:
-            batch_jax = jnp.asarray(batch.values)
             batch_sums, batch_counts, batch_support, batch_css = _batch_all_stats(batch_jax)
-        sums[idx] = np.asarray(batch_sums, dtype=np.float64)
-        non_missing_counts[idx] = np.asarray(batch_counts, dtype=np.int32)
-        support_counts[idx] = np.asarray(batch_support, dtype=np.int32)
-        centered_sum_squares[idx] = np.asarray(batch_css, dtype=np.float64)
+        sums[batch_indices] = np.asarray(batch_sums, dtype=np.float64)
+        non_missing_counts[batch_indices] = np.asarray(batch_counts, dtype=np.int32)
+        support_counts[batch_indices] = np.asarray(batch_support, dtype=np.int32)
+        centered_sum_squares[batch_indices] = np.asarray(batch_css, dtype=np.float64)
         del batch_jax
-        _dt = _time.monotonic() - _t0
-        variants_done += len(idx)
-        if batch_number <= 3 or variants_done % max(variant_count // 10, 1) < len(idx) or variants_done == variant_count:
-            est_total = _dt * ((variant_count - variants_done) / max(len(idx), 1)) if batch_number >= 2 else 0
-            log(f"  {variants_done}/{variant_count} ({100*variants_done//variant_count}%)  batch={_dt:.1f}s  est_remaining={est_total/60:.0f}min  mem={mem()}")
+
+        batch_seconds = _time.monotonic() - start_time
+        variants_done += len(batch_indices)
+        if batch_number <= 3 or variants_done % max(variant_count // 10, 1) < len(batch_indices) or variants_done == variant_count:
+            estimated_total = batch_seconds * ((variant_count - variants_done) / max(len(batch_indices), 1)) if batch_number >= 2 else 0.0
+            log(
+                f"  {variants_done}/{variant_count} ({100 * variants_done // variant_count}%)  "
+                f"batch={batch_seconds:.1f}s  est_remaining={estimated_total / 60:.0f}min  mem={mem()}"
+            )
 
     means = np.divide(
-        sums, np.maximum(non_missing_counts, 1),
-        out=np.zeros_like(sums), where=non_missing_counts > 0,
+        sums,
+        np.maximum(non_missing_counts, 1),
+        out=np.zeros_like(sums),
+        where=non_missing_counts > 0,
     ).astype(np.float32)
     allele_frequencies = np.clip(means / 2.0, 0.0, 1.0).astype(np.float32)
     scales = _scales_from_centered_sum_squares(
@@ -129,7 +126,10 @@ def compute_variant_statistics(
         sample_count=sample_count,
         minimum_scale=config.minimum_scale,
     )
-    log(f"=== VARIANT STATISTICS DONE ===  mean_af={float(np.mean(allele_frequencies)):.4f}  mean_scale={float(np.mean(scales)):.4f}  mean_support={float(np.mean(support_counts)):.0f}  mem={mem()}")
+    log(
+        f"=== VARIANT STATISTICS DONE ===  mean_af={float(np.mean(allele_frequencies)):.4f}  "
+        f"mean_scale={float(np.mean(scales)):.4f}  mean_support={float(np.mean(support_counts)):.0f}  mem={mem()}"
+    )
 
     return VariantStatistics(
         means=means,
@@ -150,17 +150,10 @@ def _scales_from_centered_sum_squares(
 
 @dataclass(slots=True)
 class Preprocessor:
-    """Stores per-variant mean and standard deviation learned during training.
+    """Stores per-variant mean and standard deviation learned during training."""
 
-    Used to standardize (z-score) genotype matrices: for each variant,
-    subtract the mean and divide by the standard deviation.  This puts
-    all variants on a comparable scale regardless of allele frequency,
-    which is important for the Bayesian model to assign appropriate
-    shrinkage.  Missing genotypes are imputed to the variant's mean
-    (i.e. they contribute zero after standardization).
-    """
-    means: np.ndarray   # per-variant mean dosage (from training data)
-    scales: np.ndarray   # per-variant standard deviation
+    means: np.ndarray
+    scales: np.ndarray
 
     def transform(self, genotypes: RawGenotypeMatrix | np.ndarray) -> StandardizedGenotypeMatrix | np.ndarray:
         raw_genotypes = as_raw_genotype_matrix(genotypes)
@@ -203,35 +196,33 @@ def fit_preprocessor(
         raise ValueError("genotypes, covariates, and targets must share sample dimension.")
 
     variant_count = raw_genotypes.shape[1]
-    n_samples = raw_genotypes.shape[0]
+    sample_count = raw_genotypes.shape[0]
     log(f"  preprocessor: computing means and scales in single pass over {variant_count} variants...")
     sums = np.zeros(variant_count, dtype=np.float64)
     sum_squares = np.zeros(variant_count, dtype=np.float64)
     non_missing_counts = np.zeros(variant_count, dtype=np.int64)
     variants_done = 0
-    for batch in raw_genotypes.iter_column_batches(batch_size=auto_batch_size(n_samples)):
+    for batch in raw_genotypes.iter_column_batches(batch_size=auto_batch_size(sample_count)):
         batch_jax = jnp.asarray(batch.values)
         mask = ~jnp.isnan(batch_jax)
         observed = jnp.where(mask, batch_jax, 0.0)
         batch_sums = jnp.sum(observed, axis=0)
         batch_counts = jnp.sum(mask, axis=0)
         batch_sum_sq = jnp.sum(observed * observed, axis=0)
-        idx = batch.variant_indices
-        sums[idx] = np.asarray(batch_sums, dtype=np.float64)
-        non_missing_counts[idx] = np.asarray(batch_counts, dtype=np.int64)
-        sum_squares[idx] = np.asarray(batch_sum_sq, dtype=np.float64)
-        variants_done += len(idx)
-        if variants_done == len(idx) or variants_done % max(variant_count // 10, 1) < len(idx) or variants_done == variant_count:
-            log(f"  preprocessor: {variants_done}/{variant_count} ({100*variants_done//variant_count}%)  mem={mem()}")
+        batch_indices = batch.variant_indices
+        sums[batch_indices] = np.asarray(batch_sums, dtype=np.float64)
+        non_missing_counts[batch_indices] = np.asarray(batch_counts, dtype=np.int64)
+        sum_squares[batch_indices] = np.asarray(batch_sum_sq, dtype=np.float64)
+        variants_done += len(batch_indices)
+        if variants_done == len(batch_indices) or variants_done % max(variant_count // 10, 1) < len(batch_indices) or variants_done == variant_count:
+            log(f"  preprocessor: {variants_done}/{variant_count} ({100 * variants_done // variant_count}%)  mem={mem()}")
 
     safe_counts = np.maximum(non_missing_counts, 1).astype(np.float64)
     means = np.where(non_missing_counts > 0, sums / safe_counts, 0.0)
-    # scale = sqrt(sum((x_i - mean)^2) / n_total) where missing genotypes are
-    # mean-imputed before standardization. This matches compute_variant_statistics.
     centered_sum_sq = np.maximum(sum_squares - sums * sums / safe_counts, 0.0)
     scales = _scales_from_centered_sum_squares(
         centered_sum_squares=centered_sum_sq,
-        sample_count=n_samples,
+        sample_count=sample_count,
         minimum_scale=config.minimum_scale,
     )
     del sums, sum_squares, non_missing_counts, safe_counts, centered_sum_sq
@@ -248,115 +239,21 @@ def fit_preprocessor(
 def select_active_variant_indices(
     variant_records: Sequence[VariantRecord],
     config: ModelConfig,
-    support_counts: np.ndarray | None = None,
-    marginal_scores: np.ndarray | None = None,
 ) -> np.ndarray:
-    """Filter SVs by support and optionally score-screen variants class-aware."""
+    """Keep every variant in the fit."""
+    del config
     n_total = len(variant_records)
-    active_flags = np.ones(n_total, dtype=bool)
-    structural_variant_classes = set(config.structural_variant_classes())
-    sv_checked = 0
-    sv_filtered = 0
-    support_array = None if support_counts is None else np.asarray(support_counts, dtype=np.int32).reshape(-1)
-    if support_array is not None and support_array.shape[0] != n_total:
-        raise ValueError("support_counts must align with variant_records.")
-    for variant_index, variant_record in enumerate(variant_records):
-        if variant_record.variant_class not in structural_variant_classes:
-            continue
-        sv_checked += 1
-        support = 0 if support_array is None else int(support_array[variant_index])
-        if variant_record.training_support is not None:
-            support = variant_record.training_support
-        if support < config.minimum_structural_variant_carriers:
-            active_flags[variant_index] = False
-            sv_filtered += 1
-    base_active_indices = np.where(active_flags)[0].astype(np.int32)
-    if marginal_scores is None:
-        log(
-            f"  active variants: {len(base_active_indices)}/{n_total} kept "
-            f"(SVs checked={sv_checked} filtered={sv_filtered}; score screening skipped) [NO DATA PASS]"
-        )
-        return base_active_indices
+    log(f"  active variants: {n_total}/{n_total} kept [NO DATA PASS]")
+    return np.arange(n_total, dtype=np.int32)
 
-    score_array = np.asarray(marginal_scores, dtype=np.float64).reshape(-1)
-    if score_array.shape[0] != n_total:
-        raise ValueError("marginal_scores must align with variant_records.")
 
-    screened_flags = np.zeros(n_total, dtype=bool)
-    structural_kept = 0
-    always_kept_structural = 0
-    if config.screen_max_structural_variants_per_class != 0:
-        structural_indices_by_class: dict[VariantClass, list[int]] = {}
-        for variant_index in base_active_indices:
-            record = variant_records[int(variant_index)]
-            if record.variant_class not in structural_variant_classes:
-                continue
-            support = 0 if support_array is None else int(support_array[int(variant_index)])
-            if record.training_support is not None:
-                support = record.training_support
-            if support >= config.screen_always_keep_structural_variants_above_support:
-                screened_flags[int(variant_index)] = True
-                always_kept_structural += 1
-                continue
-            structural_indices_by_class.setdefault(record.variant_class, []).append(int(variant_index))
-        for class_indices in structural_indices_by_class.values():
-            structural_kept += _keep_top_scoring_variants(
-                class_indices,
-                score_array,
-                config.screen_max_structural_variants_per_class,
-                screened_flags,
-            )
-    else:
-        for variant_index in base_active_indices:
-            if variant_records[int(variant_index)].variant_class in structural_variant_classes:
-                screened_flags[int(variant_index)] = True
-
-    small_variant_kept = 0
-    if config.screen_max_small_variants_per_chromosome != 0:
-        small_indices_by_chromosome: dict[str, list[int]] = {}
-        for variant_index in base_active_indices:
-            record = variant_records[int(variant_index)]
-            if record.variant_class in structural_variant_classes:
-                continue
-            small_indices_by_chromosome.setdefault(record.chromosome, []).append(int(variant_index))
-        for chromosome_indices in small_indices_by_chromosome.values():
-            small_variant_kept += _keep_top_scoring_variants(
-                chromosome_indices,
-                score_array,
-                config.screen_max_small_variants_per_chromosome,
-                screened_flags,
-            )
-    else:
-        for variant_index in base_active_indices:
-            if variant_records[int(variant_index)].variant_class not in structural_variant_classes:
-                screened_flags[int(variant_index)] = True
-
-    result = np.where(screened_flags & active_flags)[0].astype(np.int32)
-    log(
-        f"  active variants: {len(result)}/{n_total} kept "
-        f"(SVs checked={sv_checked} filtered={sv_filtered}; "
-        f"screened small={small_variant_kept} structural={structural_kept} always_keep_sv={always_kept_structural}) [NO DATA PASS]"
-    )
-    return result
-# Detect groups of variants that have identical (or exactly negated) genotype
-# columns across all samples.  These "tied" variants are perfectly collinear
-# and would cause the model to split their effects arbitrarily.
-#
-# Instead, we keep one representative per group and fit a single effect for
-# the group.  After fitting, the effect is redistributed to all group members
-# proportional to their prior variances (variants the model trusts more
-# a priori get a larger share).
-#
-# Comparison uses compact hashes of the standardized values plus the original
-# missingness mask, so exact mean-imputed ties still collapse but variants that
-# only look identical after missing values were zero-filled remain separate.
-# Negated columns (e.g. a deletion and its reciprocal duplication) are also
-# detected and assigned a -1 sign so the effect is flipped when expanded.
 def build_tie_map(
     genotypes: StandardizedGenotypeMatrix | np.ndarray,
     records: Sequence[VariantRecord],
     config: ModelConfig,
 ) -> TieMap:
+    """Collapse exact and sign-flipped duplicate genotype columns."""
+    del config
     standardized_genotypes = _as_standardized_genotypes(genotypes)
     if standardized_genotypes.shape[1] != len(records):
         raise ValueError("genotypes and records length mismatch.")
@@ -374,6 +271,14 @@ def build_tie_map(
     variants_done = 0
     for batch, missing_mask in _iter_tie_map_batches(standardized_genotypes):
         for local_batch_index, variant_index in enumerate(batch.variant_indices):
+            record = records[int(variant_index)]
+            if (
+                record.variant_class in set(config.structural_variant_classes())
+                and record.training_support is not None
+                and int(record.training_support) <= 1
+            ):
+                original_to_reduced[int(variant_index)] = -1
+                continue
             standardized_column = _normalize_signed_zeros(batch.values[:, local_batch_index])
             column_missing_mask = np.asarray(missing_mask[:, local_batch_index], dtype=bool)
             genotype_signature = _hashed_tie_signature(standardized_column, column_missing_mask)
@@ -418,9 +323,13 @@ def build_tie_map(
             exact_signature_to_group.setdefault(genotype_signature, []).append(reduced_index)
             sign_flipped_signature_to_group.setdefault(sign_flipped_signature, []).append(reduced_index)
             original_to_reduced[int(variant_index)] = reduced_index
+
         variants_done += len(batch.variant_indices)
         if variants_done == len(batch.variant_indices) or variants_done % max(n_total // 10, 1) < len(batch.variant_indices) or variants_done == n_total:
-            log(f"  tie map: {variants_done}/{n_total} ({100*variants_done//n_total}%)  unique={len(kept_variant_indices)}  groups={len(representative_indices)}  mem={mem()}")
+            log(
+                f"  tie map: {variants_done}/{n_total} ({100 * variants_done // n_total}%)  "
+                f"unique={len(kept_variant_indices)}  groups={len(representative_indices)}  mem={mem()}"
+            )
 
     log(f"  tie map done: {n_total} -> {len(kept_variant_indices)} unique representatives  mem={mem()}")
     return TieMap(
@@ -527,22 +436,16 @@ def _load_standardized_column_with_missingness(
     return _normalize_signed_zeros(dense_column), np.zeros(dense_column.shape[0], dtype=bool)
 
 
-# Create one merged record per tie group for use in the reduced model.
-# If all members share the same variant class, the group keeps that class.
-# If members span multiple classes (e.g. a deletion and a complex SV that
-# happen to have identical genotype patterns), the group is labeled
-# OTHER_COMPLEX_SV and its prior becomes a weighted average of all classes.
 def collapse_tie_groups(
     records: Sequence[VariantRecord],
     tie_map: TieMap,
 ) -> list[VariantRecord]:
+    """Create one merged record per tie group for use in the reduced model."""
     collapsed_records: list[VariantRecord] = []
     for tie_group in tie_map.reduced_to_group:
         member_records = [records[int(member_index)] for member_index in tie_group.member_indices]
         unique_variant_classes, class_membership = _class_membership(member_records)
-        latent_variant_class = (
-            unique_variant_classes[0] if len(unique_variant_classes) == 1 else VariantClass.OTHER_COMPLEX_SV
-        )
+        latent_variant_class = unique_variant_classes[0] if len(unique_variant_classes) == 1 else VariantClass.OTHER_COMPLEX_SV
         support_values = [
             float(member_record.training_support)
             for member_record in member_records
@@ -564,18 +467,18 @@ def collapse_tie_groups(
                 length=float(np.mean([member_record.length for member_record in member_records])),
                 allele_frequency=float(np.mean([member_record.allele_frequency for member_record in member_records])),
                 quality=float(np.mean([member_record.quality for member_record in member_records])),
-                training_support=(
-                    None
-                    if not support_values
-                    else int(np.round(np.mean(support_values)))
-                ),
+                training_support=None if not support_values else int(np.round(np.mean(support_values))),
                 is_repeat=any(member_record.is_repeat for member_record in member_records),
                 is_copy_number=any(member_record.is_copy_number for member_record in member_records),
                 prior_continuous_features={
-                    feature_name: float(np.mean([
-                        member_record.prior_continuous_features.get(feature_name, 0.0)
-                        for member_record in member_records
-                    ]))
+                    feature_name: float(
+                        np.mean(
+                            [
+                                member_record.prior_continuous_features.get(feature_name, 0.0)
+                                for member_record in member_records
+                            ]
+                        )
+                    )
                     for feature_name in continuous_feature_names
                 },
                 prior_class_members=tuple(unique_variant_classes),

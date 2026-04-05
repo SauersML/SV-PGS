@@ -74,7 +74,6 @@ class VariantStatistics:
     scales: np.ndarray
     allele_frequencies: np.ndarray
     support_counts: np.ndarray  # int32, non-zero dosage count per variant
-    marginal_scores: np.ndarray | None = None  # float64, |X_std^T @ residual| for screening
 
 
 @dataclass(slots=True)

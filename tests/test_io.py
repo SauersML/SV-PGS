@@ -885,8 +885,6 @@ def test_vcf_cli_end_to_end_recovers_binary_signal_with_symbolic_svs(tmp_path: P
             str(output_dir),
             "--max-outer-iterations",
             "6",
-            "--minimum-structural-variant-carriers",
-            "2",
             "--random-seed",
             "0",
         ]
@@ -1001,8 +999,6 @@ def test_plink_end_to_end_recovers_quantitative_signal_with_sv_style_alleles(tmp
             str(output_dir),
             "--max-outer-iterations",
             "6",
-            "--minimum-structural-variant-carriers",
-            "2",
             "--random-seed",
             "0",
         ]
@@ -1095,8 +1091,6 @@ def test_cli_handles_single_class_binary_targets_without_metric_crash(tmp_path: 
             str(output_dir),
             "--max-outer-iterations",
             "2",
-            "--minimum-structural-variant-carriers",
-            "1",
         ]
     )
 

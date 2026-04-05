@@ -106,7 +106,6 @@ class ModelConfig:
     minimum_scale: float = 1e-6                    # variants with std < this are treated as monomorphic
     polya_gamma_minimum_weight: float = 1e-4       # floor on IRLS weights to prevent division by ~zero
     sigma_error_floor: float = 1e-3                # noise variance can't go below this
-    minimum_structural_variant_carriers: int = 5   # SVs with fewer carriers are excluded
     prior_scale_floor: float = 1e-6
     prior_scale_ceiling: float = 10.0
     global_scale_floor: float = 1e-4
@@ -137,10 +136,6 @@ class ModelConfig:
     exact_solver_matrix_limit: int = 2048  # below this: direct solve; above: Woodbury or CG
     posterior_variance_batch_size: int = 1024
     posterior_variance_probe_count: int = 12
-    maximum_tie_map_variants: int = 5000
-    screen_max_small_variants_per_chromosome: int = 4096
-    screen_max_structural_variants_per_class: int = 1024
-    screen_always_keep_structural_variants_above_support: int = 32
     validation_interval: int = 2
     binary_intercept_calibration: bool = False
 
@@ -154,8 +149,6 @@ class ModelConfig:
             raise ValueError("minimum_scale must be positive.")
         if self.polya_gamma_minimum_weight <= 0.0:
             raise ValueError("polya_gamma_minimum_weight must be positive.")
-        if self.minimum_structural_variant_carriers < 1:
-            raise ValueError("minimum_structural_variant_carriers must be positive.")
         if self.prior_scale_floor <= 0.0:
             raise ValueError("prior_scale_floor must be positive.")
         if self.prior_scale_ceiling <= self.prior_scale_floor:
@@ -206,14 +199,6 @@ class ModelConfig:
             raise ValueError("posterior_variance_batch_size must be positive.")
         if self.posterior_variance_probe_count < 1:
             raise ValueError("posterior_variance_probe_count must be positive.")
-        if self.maximum_tie_map_variants < 1:
-            raise ValueError("maximum_tie_map_variants must be positive.")
-        if self.screen_max_small_variants_per_chromosome < 0:
-            raise ValueError("screen_max_small_variants_per_chromosome cannot be negative.")
-        if self.screen_max_structural_variants_per_class < 0:
-            raise ValueError("screen_max_structural_variants_per_class cannot be negative.")
-        if self.screen_always_keep_structural_variants_above_support < 0:
-            raise ValueError("screen_always_keep_structural_variants_above_support cannot be negative.")
         if self.validation_interval < 1:
             raise ValueError("validation_interval must be positive.")
 

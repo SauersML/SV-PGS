@@ -305,6 +305,7 @@ def _build_aou_run_metadata(
     pc_cols: list[str],
     covariates: list[str],
     max_outer_iterations: int,
+    min_sv_carriers: int,
     random_seed: int,
 ) -> dict[str, object]:
     return {
@@ -314,6 +315,7 @@ def _build_aou_run_metadata(
         "effective_pc_columns": pc_cols,
         "covariates": covariates,
         "max_outer_iterations": max_outer_iterations,
+        "min_sv_carriers": min_sv_carriers,
         "random_seed": random_seed,
     }
 
@@ -379,6 +381,7 @@ def run_all_of_us(
         pc_cols=pc_cols,
         covariates=covariates,
         max_outer_iterations=max_outer_iterations,
+        min_sv_carriers=ModelConfig().minimum_structural_variant_carriers,
         random_seed=random_seed,
     )
     if summary_path.exists():

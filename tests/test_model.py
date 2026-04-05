@@ -63,7 +63,7 @@ def _synthetic_binary_dataset() -> tuple[np.ndarray, np.ndarray, np.ndarray, lis
     return genotype_matrix, covariate_matrix, target_vector, variant_records
 
 
-def test_binary_model_fit_roundtrip_and_rare_sv_filter(tmp_path):
+def test_binary_model_fit_roundtrip_and_filters_rare_sv(tmp_path):
     genotype_matrix, covariate_matrix, target_vector, variant_records = _synthetic_binary_dataset()
     genotype_matrix[:159, 4] = 0.0
     genotype_matrix[159, 4] = 1.0
@@ -88,7 +88,7 @@ def test_binary_model_fit_roundtrip_and_rare_sv_filter(tmp_path):
 
     assert model.state is not None
     assert 4 not in model.state.active_variant_indices.tolist()
-    assert model.state.tie_map.kept_indices.tolist() == [0, 3]
+    assert model.state.tie_map.kept_indices.tolist() == [0, 3, 4]
     predicted_probabilities = model.predict_proba(genotype_matrix, covariate_matrix)[:, 1]
     assert roc_auc_score(target_vector, predicted_probabilities) > 0.55
 
