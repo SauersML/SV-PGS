@@ -10,7 +10,7 @@ import sv_pgs._jax  # noqa: F401
 import jax
 import jax.numpy as jnp
 
-from sv_pgs.config import ModelConfig, VariantClass
+from sv_pgs.config import ModelConfig, TraitType, VariantClass
 from sv_pgs.data import PreparedArrays, TieGroup, TieMap, VariantRecord, VariantStatistics
 from sv_pgs.genotype import (
     DenseRawGenotypeMatrix,
@@ -21,6 +21,7 @@ from sv_pgs.genotype import (
     as_raw_genotype_matrix,
     auto_batch_size,
 )
+from sv_pgs.numeric import stable_sigmoid
 from sv_pgs.progress import log, mem
 
 
@@ -167,17 +168,22 @@ def compute_variant_statistics(
     sample_count = raw_genotypes.shape[0]
     batch_size = auto_batch_size(sample_count)
 
-    # Compute the trait residual for screening: residual = y - C @ (C^T C)^{-1} C^T y
-    # This removes covariate effects so the screening score reflects
-    # each variant's marginal association with the trait itself.
+    # Compute the trait residual for screening:
+    #   quantitative -> OLS residual under the covariate-only null
+    #   binary       -> logistic null score residual y - p(covariates)
+    # This makes screening reflect each variant's marginal association with the
+    # trait after adjusting for covariates.
     compute_scores = covariates is not None and targets is not None
     residual_jax: jnp.ndarray | None = None
     jax_backend = jax.default_backend()
     if compute_scores:
         cov = np.asarray(covariates, dtype=np.float64)
         tgt = np.asarray(targets, dtype=np.float64).reshape(-1)
-        coef, *_ = np.linalg.lstsq(cov, tgt, rcond=None)
-        residual = tgt - cov @ coef
+        if config.trait_type == TraitType.BINARY:
+            residual = _binary_null_score_residuals(cov, tgt)
+        else:
+            coef, *_ = np.linalg.lstsq(cov, tgt, rcond=None)
+            residual = tgt - cov @ coef
         residual_jax = jnp.asarray(residual)
         log(f"=== VARIANT STATISTICS + SCREENING (1-pass, JAX/{jax_backend}) ===  {sample_count} samples x {variant_count} variants  batch_size={batch_size}  mem={mem()}")
     else:
@@ -256,6 +262,35 @@ def compute_variant_statistics(
         support_counts=support_counts.astype(np.int32),
         marginal_scores=marginal_scores,
     )
+
+
+def _binary_null_score_residuals(
+    covariates: np.ndarray,
+    targets: np.ndarray,
+) -> np.ndarray:
+    covariate_matrix = np.asarray(covariates, dtype=np.float64)
+    target_array = np.asarray(targets, dtype=np.float64).reshape(-1)
+    coefficients = np.zeros(covariate_matrix.shape[1], dtype=np.float64)
+    for _iteration_index in range(25):
+        linear_predictor = covariate_matrix @ coefficients
+        probabilities = np.clip(
+            np.asarray(stable_sigmoid(linear_predictor), dtype=np.float64),
+            1e-6,
+            1.0 - 1e-6,
+        )
+        weights = np.maximum(probabilities * (1.0 - probabilities), 1e-6)
+        gradient = covariate_matrix.T @ (target_array - probabilities)
+        hessian = covariate_matrix.T @ (weights[:, None] * covariate_matrix)
+        step = np.linalg.solve(hessian + np.eye(hessian.shape[0], dtype=np.float64) * 1e-8, gradient)
+        coefficients += step
+        if float(np.max(np.abs(step))) < 1e-8:
+            break
+    final_probabilities = np.clip(
+        np.asarray(stable_sigmoid(covariate_matrix @ coefficients), dtype=np.float64),
+        1e-6,
+        1.0 - 1e-6,
+    )
+    return target_array - final_probabilities
 
 
 def _scales_from_centered_sum_squares(
@@ -471,7 +506,9 @@ def select_active_variant_indices(
 # proportional to their prior variances (variants the model trusts more
 # a priori get a larger share).
 #
-# Comparison uses exact float32 byte equality on the standardized columns.
+# Comparison uses compact hashes of the standardized values plus the original
+# missingness mask, so exact mean-imputed ties still collapse but variants that
+# only look identical after missing values were zero-filled remain separate.
 # Negated columns (e.g. a deletion and its reciprocal duplication) are also
 # detected and assigned a -1 sign so the effect is flipped when expanded.
 def build_tie_map(

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import gc
+import json
 import os
 import subprocess
 from pathlib import Path
@@ -290,6 +291,33 @@ def merge_pcs_into_sample_table(
 # Main orchestrator
 # ---------------------------------------------------------------------------
 
+
+def _aou_run_metadata_path(work_dir: Path) -> Path:
+    return work_dir / "aou_run_metadata.json"
+
+
+def _build_aou_run_metadata(
+    *,
+    disease: str,
+    chromosomes: list[int],
+    n_pcs: int,
+    pc_cols: list[str],
+    covariates: list[str],
+    max_outer_iterations: int,
+    min_sv_carriers: int,
+    random_seed: int,
+) -> dict[str, object]:
+    return {
+        "disease": disease,
+        "chromosomes": chromosomes,
+        "requested_n_pcs": n_pcs,
+        "effective_pc_columns": pc_cols,
+        "covariates": covariates,
+        "max_outer_iterations": max_outer_iterations,
+        "minimum_structural_variant_carriers": min_sv_carriers,
+        "random_seed": random_seed,
+    }
+
 DEFAULT_COVARIATES = [
     "age_at_observation_start",
     "age_squared",
@@ -347,9 +375,26 @@ def run_all_of_us(
     log(f"  covariates ({len(covariates)}): {covariates}")
 
     summary_path = work_dir / "summary.json"
+    run_metadata_path = _aou_run_metadata_path(work_dir)
+    run_metadata = _build_aou_run_metadata(
+        disease=disease_def.canonical_name,
+        chromosomes=chromosomes,
+        n_pcs=n_pcs,
+        pc_cols=pc_cols,
+        covariates=covariates,
+        max_outer_iterations=max_outer_iterations,
+        min_sv_carriers=min_sv_carriers,
+        random_seed=random_seed,
+    )
     if summary_path.exists():
-        log(f"  unified fit already exists: {summary_path}")
-        return
+        if run_metadata_path.exists():
+            existing_run_metadata = json.loads(run_metadata_path.read_text(encoding="utf-8"))
+            if existing_run_metadata == run_metadata:
+                log(f"  unified fit already exists with matching configuration: {summary_path}")
+                return
+            log("  existing unified fit configuration differs; rerunning and overwriting outputs")
+        else:
+            log("  unified fit exists without run metadata; rerunning and overwriting outputs")
 
     log("=== STEP 3: Download chromosome VCFs ===")
     vcf_paths: list[Path] = []
@@ -379,6 +424,7 @@ def run_all_of_us(
             ),
             output_dir=work_dir,
         )
+        run_metadata_path.write_text(json.dumps(run_metadata, indent=2), encoding="utf-8")
     finally:
         if dataset is not None:
             del dataset

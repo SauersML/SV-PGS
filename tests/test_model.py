@@ -7,7 +7,12 @@ from sv_pgs import BayesianPGS, BenchmarkConfig, ModelConfig, TraitType, Variant
 from sv_pgs.data import TieGroup, TieMap
 from sv_pgs.genotype import RawGenotypeBatch, RawGenotypeMatrix
 from sv_pgs.inference import VariationalFitResult
-from sv_pgs.model import _compute_support_counts, _raw_standardized_subset_matvec, _tie_group_export_weights
+from sv_pgs.model import (
+    _compute_support_counts,
+    _raw_standardized_subset_matvec,
+    _tie_group_export_weights,
+    _training_records_from_stats,
+)
 
 
 def _synthetic_binary_dataset() -> tuple[np.ndarray, np.ndarray, np.ndarray, list[VariantRecord]]:
@@ -181,6 +186,32 @@ def test_model_skips_tie_map_when_active_variant_count_exceeds_limit():
         model.state.tie_map.original_to_reduced[model.state.active_variant_indices],
         np.arange(active_count, dtype=np.int32),
     )
+
+
+def test_training_records_from_stats_preserve_prior_continuous_features():
+    records = [
+        VariantRecord(
+            "variant_0",
+            VariantClass.DELETION_SHORT,
+            "1",
+            100,
+            prior_continuous_features={"sv_length_score": 1.5},
+        )
+    ]
+
+    training_records = _training_records_from_stats(
+        records,
+        variant_stats=type(
+            "Stats",
+            (),
+            {
+                "support_counts": np.array([7], dtype=np.int32),
+            },
+        )(),
+    )
+
+    assert training_records[0].training_support == 7
+    assert training_records[0].prior_continuous_features == {"sv_length_score": 1.5}
 
 
 def test_validation_path_keeps_raw_genotypes_streaming():

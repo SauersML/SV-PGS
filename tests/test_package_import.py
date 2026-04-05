@@ -5,6 +5,8 @@ from pathlib import Path
 import subprocess
 import sys
 
+import pytest
+
 
 def test_import_sv_pgs_exports_symbols_directly():
     completed = subprocess.run(
@@ -45,6 +47,7 @@ def test_import_sv_pgs_exports_symbols_directly():
 def test_repo_root_does_not_shadow_installed_cyvcf2():
     repo_root = Path(__file__).resolve().parents[1]
     shadow_path = repo_root / "cyvcf2.py"
+    pytest.importorskip("cyvcf2")
     completed = subprocess.run(
         [
             sys.executable,

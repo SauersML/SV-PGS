@@ -7,7 +7,6 @@ import os
 from pathlib import Path
 
 import numpy as np
-from bed_reader import to_bed
 import pytest
 from sklearn.metrics import r2_score, roc_auc_score
 
@@ -28,6 +27,7 @@ from sv_pgs.io import (
 )
 import sv_pgs.genotype as genotype_module
 import sv_pgs.cli as cli_module
+from sv_pgs.plink import to_bed
 
 
 @pytest.fixture(autouse=True)
@@ -383,6 +383,66 @@ def test_load_dataset_from_plink_auto_detects_person_id_column(tmp_path: Path):
 
     assert dataset.sample_ids == ["101", "102"]
     np.testing.assert_allclose(dataset.genotypes, np.array([[0.0, 1.0], [2.0, 0.0]], dtype=np.float32))
+
+
+def test_load_dataset_from_real_plink_bed_header_bytes(tmp_path: Path):
+    bed_path = tmp_path / "cohort.bed"
+    bed_path.write_bytes(bytes.fromhex("6c 1b 01 0b 34"))
+    bed_path.with_suffix(".fam").write_text(
+        "\n".join(
+            [
+                "f1 s1 0 0 0 -9",
+                "f2 s2 0 0 0 -9",
+                "f3 s3 0 0 0 -9",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    bed_path.with_suffix(".bim").write_text(
+        "\n".join(
+            [
+                "1 rs1 0 100 A C",
+                "1 rs2 0 200 G T",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    sample_table_path = tmp_path / "samples.tsv"
+    _write_table(
+        sample_table_path,
+        header=("sample_id", "target"),
+        rows=(
+            ("s3", "1"),
+            ("s1", "0"),
+            ("s2", "1"),
+        ),
+    )
+
+    dataset = load_dataset_from_files(
+        genotype_path=bed_path,
+        genotype_format="plink1",
+        sample_table_path=sample_table_path,
+        sample_id_column="sample_id",
+        target_column="target",
+        covariate_columns=(),
+    )
+
+    assert dataset.sample_ids == ["s1", "s2", "s3"]
+    np.testing.assert_allclose(
+        dataset.genotypes,
+        np.array(
+            [
+                [0.0, 2.0],
+                [1.0, np.nan],
+                [2.0, 0.0],
+            ],
+            dtype=np.float32,
+        ),
+        equal_nan=True,
+    )
 
 
 def test_plink_loader_uses_indexed_bed_reads(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):

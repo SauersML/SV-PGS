@@ -12,7 +12,7 @@ cd ~ && rm -rf SV-PGS && git clone https://github.com/SauersML/SV-PGS.git && cd 
   && uv sync --python 3.12 --extra gpu
 ```
 
-**Run a full analysis** (downloads VCFs, prepares phenotype, merges PCs, fits per-chromosome):
+**Run a full analysis** (downloads VCFs, prepares phenotype, merges PCs, fits one unified genome-wide model):
 
 ```bash
 cd ~/SV-PGS && uv run sv-pgs run-all-of-us --disease hypertension --output-dir hypertension_results
@@ -22,9 +22,11 @@ That single command:
 1. Downloads all 22 chromosome SV VCFs from the controlled-tier bucket (skips existing)
 2. Downloads ancestry predictions and merges top 10 genomic PCs
 3. Queries BigQuery for the disease phenotype (ICD-9/10 codes built-in)
-4. Fits the Bayesian PGS model per chromosome on GPU
-5. Covariates: age, age^2, sex at birth, race, ethnicity, PC1-PC10
-6. Skips already-completed chromosomes (restartable)
+4. Concatenates the requested chromosome VCFs into one genome-wide training dataset
+5. Fits one Bayesian PGS model on GPU across all requested chromosomes
+6. Deletes downloaded chromosome VCFs after the fit completes
+7. Reuses an existing fit only when the full AoU run configuration matches
+8. Covariates: age, age^2, sex at birth, race, ethnicity, PC1-PC10
 
 **Available diseases:**
 

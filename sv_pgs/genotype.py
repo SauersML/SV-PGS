@@ -28,6 +28,7 @@ MIN_BED_READER_BATCH_SIZE = 32  # always read at least this many variants
 # cache it in RAM.  This avoids re-reading from disk on every EM iteration
 # (typically 10-30 iterations), giving a huge speedup.
 MATERIALIZE_THRESHOLD_BYTES = 4_000_000_000  # 4 GB
+T4_SAFE_GPU_CACHE_BYTES = 4_500_000_000
 
 
 def as_raw_genotype_matrix(genotypes: RawGenotypeMatrix | np.ndarray) -> RawGenotypeMatrix:
@@ -351,6 +352,17 @@ def _to_cupy_float32(array):
     return cupy.asarray(np.asarray(array, dtype=np.float32))
 
 
+def _gpu_materialization_budget_bytes(cupy) -> int:
+    """Conservative GPU cache budget for a single-device training run.
+
+    The T4 path needs room for the cached genotype matrix plus iterative solver
+    workspace. Cap the cache at a T4-safe fixed ceiling and at most 60% of the
+    currently free device memory.
+    """
+    free_bytes, _ = cupy.cuda.runtime.memGetInfo()
+    return min(int(free_bytes * 0.6), T4_SAFE_GPU_CACHE_BYTES)
+
+
 @dataclass(slots=True)
 class StandardizedGenotypeMatrix:
     """A genotype matrix that applies z-score standardization on the fly.
@@ -421,6 +433,13 @@ class StandardizedGenotypeMatrix:
             return False
         try:
             nbytes = self.dense_bytes()
+            budget_bytes = _gpu_materialization_budget_bytes(cupy)
+            if nbytes > budget_bytes:
+                log(
+                    f"    skipping GPU materialization: need {nbytes / 1e9:.1f} GB, "
+                    f"budget is {budget_bytes / 1e9:.1f} GB  mem={mem()}"
+                )
+                return False
             if self._dense_cache is not None:
                 log(f"    uploading RAM-resident matrix to GPU ({nbytes / 1e9:.1f} GB)  mem={mem()}")
                 self._cupy_cache = cupy.asarray(self._dense_cache)

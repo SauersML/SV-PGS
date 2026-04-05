@@ -242,3 +242,44 @@ def test_concatenated_raw_genotype_matrix_preserves_column_order_and_values():
             dtype=np.float32,
         ),
     )
+
+
+def test_try_materialize_gpu_skips_when_matrix_exceeds_budget(monkeypatch: pytest.MonkeyPatch):
+    class _FakeCudaRuntime:
+        @staticmethod
+        def memGetInfo():
+            return (1_000_000_000, 16_000_000_000)
+
+    class _FakeDevice:
+        def synchronize(self) -> None:
+            return None
+
+    class _FakeCuda:
+        runtime = _FakeCudaRuntime()
+
+        @staticmethod
+        def Device():
+            return _FakeDevice()
+
+    class _FakeCupy:
+        float32 = np.float32
+        cuda = _FakeCuda()
+
+        @staticmethod
+        def asarray(array, dtype=None):
+            raise AssertionError("GPU upload should be skipped before asarray.")
+
+        @staticmethod
+        def empty(shape, dtype=None, order=None):
+            raise AssertionError("GPU allocation should be skipped before empty.")
+
+    raw_matrix = np.zeros((10, 30_000_000), dtype=np.int8)
+    standardized = as_raw_genotype_matrix(raw_matrix).standardized(
+        means=np.zeros(raw_matrix.shape[1], dtype=np.float32),
+        scales=np.ones(raw_matrix.shape[1], dtype=np.float32),
+    )
+
+    monkeypatch.setattr(genotype_module, "_try_import_cupy", lambda: _FakeCupy())
+
+    assert standardized.try_materialize_gpu() is False
+    assert standardized._cupy_cache is None

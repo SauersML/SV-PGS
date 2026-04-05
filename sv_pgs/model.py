@@ -150,9 +150,11 @@ class BayesianPGS:
         cached = reduced_genotypes.try_materialize_gpu()
         if not cached:
             cached = reduced_genotypes.try_materialize()
-        # Break reference to the 2.5 GB raw int8 matrix so it can be freed.
-        # After materialization, reduced_genotypes no longer needs raw.
-        reduced_genotypes.release_raw_storage()
+        if cached:
+            # After materialization, reduced_genotypes no longer needs raw.
+            reduced_genotypes.release_raw_storage()
+        else:
+            log("keeping reduced genotype matrix streaming (no RAM/GPU cache)  mem=" + mem())
         del raw_genotype_matrix, standardized_genotypes, active_genotypes
         import gc
         gc.collect()

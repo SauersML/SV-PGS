@@ -241,8 +241,9 @@ def _encode_variant(column: np.ndarray, *, bytes_per_variant: int) -> bytes:
         raise ValueError("PLINK BED supports only hardcall dosages 0, 1, 2, or NaN.")
 
     codes = np.zeros(bytes_per_variant * 4, dtype=np.uint8)
-    codes[: column.shape[0]][~observed] = 0b01
-    codes[: column.shape[0]][observed] = _ENCODE_LOOKUP_A1[rounded_i8]
+    sample_codes = codes[: column.shape[0]]
+    sample_codes[~observed] = 0b01
+    sample_codes[observed] = _ENCODE_LOOKUP_A1[rounded_i8]
     packed = (
         codes[0::4]
         | (codes[1::4] << 2)
