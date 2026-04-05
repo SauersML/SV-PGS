@@ -75,18 +75,6 @@ class _DelimitedTableSpec:
 def _open_vcf_reader(vcf_path: Path) -> Any:
     from cyvcf2 import VCF
     return VCF(str(vcf_path))
-
-
-def _vcf_record_count_hint(reader: Any) -> int | None:
-    try:
-        record_count = int(reader.num_records)
-    except (AttributeError, TypeError, ValueError):
-        return None
-    if record_count < 0:
-        return None
-    return record_count
-
-
 def load_dataset_from_files(
     genotype_path: str | Path,
     sample_table_path: str | Path,
