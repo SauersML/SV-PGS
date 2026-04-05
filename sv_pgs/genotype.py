@@ -17,8 +17,8 @@ from sv_pgs.progress import log, mem
 DEFAULT_GENOTYPE_BATCH_SIZE = 1024  # fallback when sample count is unknown
 
 # Memory cap per PLINK batch. PLINK .bed files store genotypes on disk
-# as 2 bits per sample, but we expand to int8 or float32 in memory.  The JAX
-# screening kernels also create float32 intermediates (~10 bytes/element peak).
+# as 2 bits per sample, but we expand to int8 or float32 in memory. JAX
+# batch statistics and solver setup also create float32 intermediates.
 # This budget ensures each batch fits comfortably in GPU/CPU memory:
 #   500 MB / (447k samples * 4 bytes) ≈ 279 variants per batch
 BED_READER_TARGET_BATCH_BYTES = 500_000_000

@@ -139,7 +139,7 @@ def test_tie_map_verifies_hash_collisions_before_grouping(monkeypatch: pytest.Mo
     assert tie_map.original_to_reduced.tolist() == [0, 1]
 
 
-def test_select_active_variant_indices_filters_low_support_structural_variants():
+def test_select_active_variant_indices_keeps_low_support_structural_variants():
     variant_records = [
         VariantRecord("sv_0", VariantClass.DELETION_SHORT, "1", 100, training_support=1),
         VariantRecord("sv_1", VariantClass.DELETION_SHORT, "1", 101, training_support=5),
@@ -150,7 +150,7 @@ def test_select_active_variant_indices_filters_low_support_structural_variants()
         variant_records=variant_records,
         config=ModelConfig(),
     )
-    assert result.tolist() == [1, 2]
+    assert result.tolist() == [0, 1, 2]
 
 
 def test_fit_preprocessor_matches_streaming_variant_statistics_with_missing_values():

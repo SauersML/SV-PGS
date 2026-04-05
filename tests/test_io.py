@@ -206,6 +206,87 @@ def test_load_multi_vcf_dataset_from_files_concatenates_variants_across_chromoso
     np.testing.assert_allclose(dataset.variant_stats.support_counts, np.array([2, 1], dtype=np.int32))
 
 
+def test_load_multi_vcf_dataset_from_files_rejects_duplicate_paths(tmp_path: Path):
+    vcf_path = tmp_path / "chr1.vcf"
+    vcf_path.write_text(
+        "\n".join(
+            [
+                "##fileformat=VCFv4.2",
+                "##contig=<ID=1>",
+                "##INFO=<ID=AF,Number=A,Type=Float,Description=\"Allele frequency\">",
+                "##FORMAT=<ID=GT,Number=1,Type=String,Description=\"Genotype\">",
+                "#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\ts1",
+                "1\t100\tdup\tA\tC\t50\tPASS\tAF=0.25\tGT\t0/1",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    sample_table_path = tmp_path / "samples.tsv"
+    _write_table(
+        sample_table_path,
+        header=("sample_id", "target", "age"),
+        rows=(("s1", "1", "42"),),
+    )
+
+    with pytest.raises(ValueError, match="genotype_paths must be unique"):
+        load_multi_vcf_dataset_from_files(
+            genotype_paths=[vcf_path, vcf_path],
+            sample_table_path=sample_table_path,
+            sample_id_column="sample_id",
+            target_column="target",
+            covariate_columns=("age",),
+        )
+
+
+def test_load_multi_vcf_dataset_from_files_rejects_duplicate_variant_keys(tmp_path: Path):
+    vcf1_path = tmp_path / "chr1_a.vcf"
+    vcf1_path.write_text(
+        "\n".join(
+            [
+                "##fileformat=VCFv4.2",
+                "##contig=<ID=1>",
+                "##INFO=<ID=AF,Number=A,Type=Float,Description=\"Allele frequency\">",
+                "##FORMAT=<ID=GT,Number=1,Type=String,Description=\"Genotype\">",
+                "#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\ts1",
+                "1\t100\tdup\tA\tC\t50\tPASS\tAF=0.25\tGT\t0/1",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    vcf2_path = tmp_path / "chr1_b.vcf"
+    vcf2_path.write_text(
+        "\n".join(
+            [
+                "##fileformat=VCFv4.2",
+                "##contig=<ID=1>",
+                "##INFO=<ID=AF,Number=A,Type=Float,Description=\"Allele frequency\">",
+                "##FORMAT=<ID=GT,Number=1,Type=String,Description=\"Genotype\">",
+                "#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\ts1",
+                "1\t100\tdup\tA\tC\t50\tPASS\tAF=0.25\tGT\t0/1",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    sample_table_path = tmp_path / "samples.tsv"
+    _write_table(
+        sample_table_path,
+        header=("sample_id", "target", "age"),
+        rows=(("s1", "1", "42"),),
+    )
+
+    with pytest.raises(ValueError, match="duplicate variants detected across genotype_paths"):
+        load_multi_vcf_dataset_from_files(
+            genotype_paths=[vcf1_path, vcf2_path],
+            sample_table_path=sample_table_path,
+            sample_id_column="sample_id",
+            target_column="target",
+            covariate_columns=("age",),
+        )
+
+
 def test_load_dataset_from_vcf_auto_detects_sample_id_column_after_first_1000_rows(tmp_path: Path):
     sample_table_path = tmp_path / "samples.tsv"
     _write_table(
@@ -310,6 +391,7 @@ def test_load_dataset_from_vcf_uses_record_count_hint_for_direct_preallocation(
     )
 
     assert dataset.genotypes.shape == (2, 1)
+    assert dataset.genotypes.matrix.flags.f_contiguous
     np.testing.assert_allclose(dataset.genotypes, np.array([[2.0], [1.0]], dtype=np.float32))
 
 
@@ -317,7 +399,7 @@ def test_vcf_cache_save_uses_real_temp_file_and_roundtrips(tmp_path: Path):
     vcf_path = tmp_path / "cohort.vcf"
     vcf_path.write_text("##fileformat=VCFv4.2\n", encoding="utf-8")
     keep_sample_indices = np.array([0, 2], dtype=np.int32)
-    genotype_matrix = np.array([[0, 1], [1, 2]], dtype=np.int8)
+    genotype_matrix = np.array([[0, 1], [1, 2]], dtype=np.int8, order="F")
     variants = [
         _VariantDefaults(
             variant_id="variant_0",
@@ -349,6 +431,8 @@ def test_vcf_cache_save_uses_real_temp_file_and_roundtrips(tmp_path: Path):
     assert cached is not None
     cached_genotypes, cached_variants, cached_variant_stats = cached
     np.testing.assert_array_equal(cached_genotypes, genotype_matrix)
+    assert cached_genotypes.flags.f_contiguous
+    assert not cached_genotypes.flags.c_contiguous
     assert cached_variants == variants
     np.testing.assert_allclose(cached_variant_stats.means, variant_stats.means)
     np.testing.assert_allclose(cached_variant_stats.scales, variant_stats.scales)
@@ -356,6 +440,51 @@ def test_vcf_cache_save_uses_real_temp_file_and_roundtrips(tmp_path: Path):
     np.testing.assert_array_equal(cached_variant_stats.support_counts, variant_stats.support_counts)
     assert not list((tmp_path / ".sv_pgs_cache").glob("*.tmp"))
     assert not list((tmp_path / ".sv_pgs_cache").glob("*.tmp.npy"))
+
+
+def test_vcf_cache_load_upgrades_legacy_row_major_matrix(tmp_path: Path):
+    vcf_path = tmp_path / "cohort.vcf"
+    vcf_path.write_text("##fileformat=VCFv4.2\n", encoding="utf-8")
+    genotype_matrix = np.array([[0, 1], [1, 2]], dtype=np.int8, order="C")
+    variants = [
+        _VariantDefaults(
+            variant_id="variant_0",
+            variant_class=VariantClass.SNV,
+            chromosome="1",
+            position=100,
+            length=1.0,
+            allele_frequency=0.25,
+            quality=50.0,
+        )
+    ]
+    variant_stats = VariantStatistics(
+        means=np.array([0.5], dtype=np.float32),
+        scales=np.array([0.75], dtype=np.float32),
+        allele_frequencies=np.array([0.25], dtype=np.float32),
+        support_counts=np.array([1], dtype=np.int32),
+    )
+
+    _save_vcf_to_cache(
+        vcf_path=vcf_path,
+        keep_sample_indices=None,
+        genotype_matrix=genotype_matrix,
+        variants=variants,
+        variant_stats=variant_stats,
+    )
+
+    cached = _load_vcf_from_cache(vcf_path=vcf_path, keep_sample_indices=None)
+
+    assert cached is not None
+    cached_genotypes, _, _ = cached
+    np.testing.assert_array_equal(cached_genotypes, genotype_matrix)
+    assert cached_genotypes.flags.f_contiguous
+
+    reloaded = _load_vcf_from_cache(vcf_path=vcf_path, keep_sample_indices=None)
+
+    assert reloaded is not None
+    reloaded_genotypes, _, _ = reloaded
+    np.testing.assert_array_equal(reloaded_genotypes, genotype_matrix)
+    assert reloaded_genotypes.flags.f_contiguous
 
 
 def test_vcf_cache_key_ignores_mtime_for_identical_content(tmp_path: Path):

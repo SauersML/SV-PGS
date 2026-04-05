@@ -297,6 +297,18 @@ def _aou_run_metadata_path(work_dir: Path) -> Path:
     return work_dir / "aou_run_metadata.json"
 
 
+def _validate_aou_chromosomes(chromosomes: list[int]) -> list[int]:
+    if not chromosomes:
+        raise ValueError("chromosomes cannot be empty.")
+    normalized = [int(chromosome) for chromosome in chromosomes]
+    invalid = [chromosome for chromosome in normalized if chromosome < 1 or chromosome > 22]
+    if invalid:
+        raise ValueError(f"chromosomes must be autosomes 1-22; got {invalid}")
+    if len(set(normalized)) != len(normalized):
+        raise ValueError(f"chromosomes must be unique; got {normalized}")
+    return normalized
+
+
 def _build_aou_run_metadata(
     *,
     disease: str,
@@ -305,7 +317,6 @@ def _build_aou_run_metadata(
     pc_cols: list[str],
     covariates: list[str],
     max_outer_iterations: int,
-    min_sv_carriers: int,
     random_seed: int,
 ) -> dict[str, object]:
     return {
@@ -315,7 +326,6 @@ def _build_aou_run_metadata(
         "effective_pc_columns": pc_cols,
         "covariates": covariates,
         "max_outer_iterations": max_outer_iterations,
-        "min_sv_carriers": min_sv_carriers,
         "random_seed": random_seed,
     }
 
@@ -337,6 +347,7 @@ def run_all_of_us(
     random_seed: int = 0,
 ) -> None:
     """Full AoU pipeline: download requested chromosomes, merge them, and run one fit."""
+    chromosomes = _validate_aou_chromosomes(chromosomes)
 
     # Validate disease
     disease_def = resolve_disease_definition(disease)
@@ -381,7 +392,6 @@ def run_all_of_us(
         pc_cols=pc_cols,
         covariates=covariates,
         max_outer_iterations=max_outer_iterations,
-        min_sv_carriers=ModelConfig().minimum_structural_variant_carriers,
         random_seed=random_seed,
     )
     if summary_path.exists():

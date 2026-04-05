@@ -60,10 +60,8 @@ def _batch_all_stats(batch_values: jnp.ndarray) -> tuple[jnp.ndarray, jnp.ndarra
 def compute_variant_statistics(
     raw_genotypes: RawGenotypeMatrix,
     config: ModelConfig,
-    covariates: np.ndarray | None = None,
-    targets: np.ndarray | None = None,
 ) -> VariantStatistics:
-    """Compute per-variant moments and optional marginal screening scores."""
+    """Compute per-variant moments from a single streaming pass."""
     variant_count = raw_genotypes.shape[1]
     sample_count = raw_genotypes.shape[0]
     batch_size = auto_batch_size(sample_count)
@@ -72,7 +70,6 @@ def compute_variant_statistics(
         f"=== VARIANT STATISTICS (1-pass, JAX/{jax_backend}) ===  "
         f"{sample_count} samples x {variant_count} variants  batch_size={batch_size}  mem={mem()}"
     )
-
     sums = np.zeros(variant_count, dtype=np.float64)
     non_missing_counts = np.zeros(variant_count, dtype=np.int32)
     support_counts = np.zeros(variant_count, dtype=np.int32)
@@ -253,7 +250,6 @@ def build_tie_map(
     config: ModelConfig,
 ) -> TieMap:
     """Collapse exact and sign-flipped duplicate genotype columns."""
-    del config
     standardized_genotypes = _as_standardized_genotypes(genotypes)
     if standardized_genotypes.shape[1] != len(records):
         raise ValueError("genotypes and records length mismatch.")
@@ -271,14 +267,6 @@ def build_tie_map(
     variants_done = 0
     for batch, missing_mask in _iter_tie_map_batches(standardized_genotypes):
         for local_batch_index, variant_index in enumerate(batch.variant_indices):
-            record = records[int(variant_index)]
-            if (
-                record.variant_class in set(config.structural_variant_classes())
-                and record.training_support is not None
-                and int(record.training_support) <= 1
-            ):
-                original_to_reduced[int(variant_index)] = -1
-                continue
             standardized_column = _normalize_signed_zeros(batch.values[:, local_batch_index])
             column_missing_mask = np.asarray(missing_mask[:, local_batch_index], dtype=bool)
             genotype_signature = _hashed_tie_signature(standardized_column, column_missing_mask)

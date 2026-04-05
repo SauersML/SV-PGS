@@ -624,6 +624,22 @@ def test_run_all_of_us_runs_single_unified_fit_and_cleans_downloads(monkeypatch,
     assert release_calls == ["released"]
 
 
+def test_run_all_of_us_rejects_duplicate_or_invalid_chromosomes(tmp_path: Path):
+    with pytest.raises(ValueError, match="chromosomes must be unique"):
+        aou_runner.run_all_of_us(
+            disease="heart_failure",
+            chromosomes=[1, 1],
+            output_base=str(tmp_path),
+        )
+
+    with pytest.raises(ValueError, match="chromosomes must be autosomes 1-22"):
+        aou_runner.run_all_of_us(
+            disease="heart_failure",
+            chromosomes=[0, 23],
+            output_base=str(tmp_path),
+        )
+
+
 def test_run_all_of_us_skips_existing_fit_only_when_run_metadata_matches(monkeypatch, tmp_path: Path):
     disease = "heart_failure"
     sample_table_path = tmp_path / f"{disease}.samples.tsv"
@@ -646,7 +662,6 @@ def test_run_all_of_us_skips_existing_fit_only_when_run_metadata_matches(monkeyp
                 pc_cols=pc_cols,
                 covariates=covariates,
                 max_outer_iterations=30,
-                min_sv_carriers=5,
                 random_seed=0,
             ),
             indent=2,
@@ -710,7 +725,6 @@ def test_run_all_of_us_reruns_when_existing_fit_metadata_differs(monkeypatch, tm
                 pc_cols=["PC1", "PC2"],
                 covariates=aou_runner.DEFAULT_COVARIATES + ["PC1", "PC2"],
                 max_outer_iterations=30,
-                min_sv_carriers=5,
                 random_seed=0,
             ),
             indent=2,

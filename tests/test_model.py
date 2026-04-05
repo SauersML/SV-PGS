@@ -9,7 +9,6 @@ from sv_pgs.data import TieGroup, TieMap
 from sv_pgs.genotype import RawGenotypeBatch, RawGenotypeMatrix
 from sv_pgs.inference import VariationalFitResult
 from sv_pgs.model import (
-    _compute_support_counts,
     _raw_standardized_subset_matvec,
     _tie_group_export_weights,
     _training_records_from_stats,
@@ -63,7 +62,7 @@ def _synthetic_binary_dataset() -> tuple[np.ndarray, np.ndarray, np.ndarray, lis
     return genotype_matrix, covariate_matrix, target_vector, variant_records
 
 
-def test_binary_model_fit_roundtrip_and_filters_rare_sv(tmp_path):
+def test_binary_model_fit_roundtrip_and_keeps_all_variants(tmp_path):
     genotype_matrix, covariate_matrix, target_vector, variant_records = _synthetic_binary_dataset()
     genotype_matrix[:159, 4] = 0.0
     genotype_matrix[159, 4] = 1.0
@@ -87,7 +86,7 @@ def test_binary_model_fit_roundtrip_and_filters_rare_sv(tmp_path):
     ).fit(genotype_matrix, covariate_matrix, target_vector, variant_records)
 
     assert model.state is not None
-    assert 4 not in model.state.active_variant_indices.tolist()
+    assert model.state.active_variant_indices.tolist() == [0, 1, 2, 3, 4]
     assert model.state.tie_map.kept_indices.tolist() == [0, 3, 4]
     predicted_probabilities = model.predict_proba(genotype_matrix, covariate_matrix)[:, 1]
     assert roc_auc_score(target_vector, predicted_probabilities) > 0.55
@@ -190,6 +189,33 @@ def test_training_records_from_stats_preserve_prior_continuous_features():
     assert training_records[0].prior_continuous_features == {"sv_length_score": 1.5}
 
 
+def test_fit_rejects_variant_stats_shape_mismatch():
+    genotype_matrix, covariate_matrix, target_vector, variant_records = _synthetic_binary_dataset()
+
+    with np.testing.assert_raises_regex(ValueError, "variant_stats.means must match genotype column count."):
+        BayesianPGS(
+            ModelConfig(
+                trait_type=TraitType.BINARY,
+                max_outer_iterations=2,
+            )
+        ).fit(
+            genotype_matrix,
+            covariate_matrix,
+            target_vector,
+            variant_records,
+            variant_stats=type(
+                "Stats",
+                (),
+                {
+                    "means": np.zeros(genotype_matrix.shape[1] - 1, dtype=np.float32),
+                    "scales": np.ones(genotype_matrix.shape[1], dtype=np.float32),
+                    "allele_frequencies": np.zeros(genotype_matrix.shape[1], dtype=np.float32),
+                    "support_counts": np.ones(genotype_matrix.shape[1], dtype=np.int32),
+                },
+            )(),
+        )
+
+
 def test_validation_path_keeps_raw_genotypes_streaming():
     class NonMaterializingValidationMatrix(RawGenotypeMatrix):
         def __init__(self, matrix: np.ndarray) -> None:
@@ -273,56 +299,6 @@ def test_model_fit_keeps_streaming_when_materialization_is_skipped(monkeypatch):
     ).fit(genotype_matrix, covariate_matrix, target_vector, variant_records)
 
     assert model.state is not None
-
-
-def test_compute_support_counts_only_reads_unresolved_structural_variants():
-    class SpyRawGenotypeMatrix(RawGenotypeMatrix):
-        def __init__(self, matrix: np.ndarray) -> None:
-            self.matrix = np.asarray(matrix, dtype=np.float32)
-            self.requested_variant_indices: list[list[int]] = []
-
-        @property
-        def shape(self) -> tuple[int, int]:
-            return self.matrix.shape
-
-        def iter_column_batches(
-            self,
-            variant_indices=None,
-            batch_size: int = 1024,
-        ):
-            resolved_indices = np.arange(self.matrix.shape[1], dtype=np.int32) if variant_indices is None else np.asarray(variant_indices, dtype=np.int32)
-            self.requested_variant_indices.append(resolved_indices.tolist())
-            yield RawGenotypeBatch(
-                variant_indices=resolved_indices,
-                values=np.asarray(self.matrix[:, resolved_indices], dtype=np.float32),
-            )
-
-        def materialize(self, variant_indices=None) -> np.ndarray:
-            resolved_indices = np.arange(self.matrix.shape[1], dtype=np.int32) if variant_indices is None else np.asarray(variant_indices, dtype=np.int32)
-            return np.asarray(self.matrix[:, resolved_indices], dtype=np.float32)
-
-    raw_genotypes = SpyRawGenotypeMatrix(
-        np.array(
-            [
-                [0.0, 0.0, 1.0, 0.0],
-                [1.0, 0.0, 0.0, 1.0],
-                [2.0, 1.0, 1.0, 0.0],
-            ],
-            dtype=np.float32,
-        )
-    )
-    records = [
-        VariantRecord("snv_0", VariantClass.SNV, "1", 100),
-        VariantRecord("sv_from_metadata", VariantClass.DELETION_SHORT, "1", 101, training_support=7),
-        VariantRecord("sv_needs_count", VariantClass.DUPLICATION_SHORT, "1", 102),
-        VariantRecord("snv_1", VariantClass.SNV, "1", 103),
-    ]
-
-    support_counts = _compute_support_counts(raw_genotypes, records, ModelConfig())
-
-    assert raw_genotypes.requested_variant_indices == [[2]]
-    np.testing.assert_array_equal(support_counts, np.array([0, 7, 2, 0], dtype=np.int32))
-
 
 def test_raw_standardized_subset_matvec_reads_only_requested_columns():
     class SpyRawGenotypeMatrix(RawGenotypeMatrix):

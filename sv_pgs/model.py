@@ -7,7 +7,6 @@ from typing import Sequence
 import numpy as np
 
 import sv_pgs._jax  # noqa: F401
-import jax.numpy as jnp
 
 from sv_pgs.artifact import ModelArtifact, load_artifact, save_artifact
 from sv_pgs.config import ModelConfig, TraitType
@@ -31,7 +30,6 @@ from sv_pgs.progress import log, mem
 
 STRUCTURAL_VARIANT_CLASSES = set(ModelConfig.structural_variant_classes())
 
-
 @dataclass(slots=True)
 class FittedState:
     variant_records: list[VariantRecord]
@@ -44,6 +42,36 @@ class FittedState:
     nonzero_coefficients: np.ndarray
     nonzero_means: np.ndarray
     nonzero_scales: np.ndarray
+
+
+def _validate_fit_inputs(
+    genotype_matrix: RawGenotypeMatrix,
+    covariates: np.ndarray,
+    targets: np.ndarray,
+    variant_records: Sequence[VariantRecord | dict],
+    variant_stats: VariantStatistics | None,
+) -> None:
+    sample_count, variant_count = genotype_matrix.shape
+    covariate_matrix = np.asarray(covariates)
+    target_array = np.asarray(targets).reshape(-1)
+    if covariate_matrix.ndim != 2:
+        raise ValueError("covariates must be 2D.")
+    if covariate_matrix.shape[0] != sample_count:
+        raise ValueError("covariates sample count must match genotypes.")
+    if target_array.shape[0] != sample_count:
+        raise ValueError("targets sample count must match genotypes.")
+    if len(variant_records) != variant_count:
+        raise ValueError("variant_records length must match genotype column count.")
+    if variant_stats is None:
+        return
+    if variant_stats.means.shape != (variant_count,):
+        raise ValueError("variant_stats.means must match genotype column count.")
+    if variant_stats.scales.shape != (variant_count,):
+        raise ValueError("variant_stats.scales must match genotype column count.")
+    if variant_stats.allele_frequencies.shape != (variant_count,):
+        raise ValueError("variant_stats.allele_frequencies must match genotype column count.")
+    if variant_stats.support_counts.shape != (variant_count,):
+        raise ValueError("variant_stats.support_counts must match genotype column count.")
 
 
 class BayesianPGS:
@@ -80,25 +108,28 @@ class BayesianPGS:
     ) -> BayesianPGS:
         log(f"=== MODEL FIT START ===  genotypes={genotypes.shape}  covariates={covariates.shape}  targets={targets.shape}  pre_computed_stats={'YES' if variant_stats else 'NO'}")
         raw_genotype_matrix = as_raw_genotype_matrix(genotypes)
+        _validate_fit_inputs(
+            genotype_matrix=raw_genotype_matrix,
+            covariates=covariates,
+            targets=targets,
+            variant_records=variant_records,
+            variant_stats=variant_stats,
+        )
+        covariate_matrix = self._with_intercept(covariates)
+        selection_records = normalize_variant_records(variant_records)
 
         # Use pre-computed stats if available (saves 3 full data passes)
         if variant_stats is not None:
             log("using pre-computed variant statistics (means, scales, support) [NO DATA PASSES]")
-            covariate_matrix = self._with_intercept(covariates)
-            normalized_records = _training_records_from_stats(
-                normalize_variant_records(variant_records), variant_stats,
-            )
+            normalized_records = _training_records_from_stats(selection_records, variant_stats)
             prepared_arrays = fit_preprocessor_from_stats(variant_stats, covariate_matrix, targets)
         else:
-            covariate_matrix = self._with_intercept(covariates)
             log("computing variant statistics in-fit so support/standardization share one pass...")
             variant_stats = compute_variant_statistics(
                 raw_genotypes=raw_genotype_matrix,
                 config=self.config,
             )
-            normalized_records = _training_records_from_stats(
-                normalize_variant_records(variant_records), variant_stats,
-            )
+            normalized_records = _training_records_from_stats(selection_records, variant_stats)
             prepared_arrays = fit_preprocessor_from_stats(variant_stats, covariate_matrix, targets)
         preprocessor = Preprocessor(means=prepared_arrays.means, scales=prepared_arrays.scales)
         log(f"preprocessor ready  {len(normalized_records)} variant records  mem={mem()}")
@@ -108,7 +139,7 @@ class BayesianPGS:
 
         log("selecting active variant indices...")
         active_variant_indices = select_active_variant_indices(
-            variant_records=normalized_records,
+            variant_records=selection_records,
             config=self.config,
         )
         log(f"active variants: {len(active_variant_indices)} / {len(normalized_records)} ({100.0*len(active_variant_indices)/max(len(normalized_records),1):.1f}%)")
@@ -459,41 +490,6 @@ def _training_records_from_stats(
         )
     log(f"  training records from stats: {len(training_records)} records [NO DATA PASS]")
     return training_records
-
-
-def _compute_support_counts(
-    raw_genotypes: RawGenotypeMatrix,
-    records: Sequence[VariantRecord],
-    config: ModelConfig,
-) -> np.ndarray:
-    """Count how many individuals carry each structural variant.
-
-    "Support" = number of samples with a non-zero dosage (|dosage| > 0.5).
-    Only computed for SVs that don't already have a support count from
-    metadata.  SNVs/indels skip this step entirely.  Low-support SVs will
-    be filtered out before model fitting to avoid noisy estimates.
-    """
-    support_counts = np.zeros(len(records), dtype=np.int32)
-    unresolved_structural_variant_indices: list[int] = []
-    for variant_index, record in enumerate(records):
-        if record.variant_class not in STRUCTURAL_VARIANT_CLASSES:
-            continue
-        if record.training_support is not None:
-            support_counts[variant_index] = int(record.training_support)
-            continue
-        unresolved_structural_variant_indices.append(variant_index)
-
-    if not unresolved_structural_variant_indices:
-        return support_counts
-
-    for batch in raw_genotypes.iter_column_batches(
-        unresolved_structural_variant_indices,
-        batch_size=auto_batch_size(raw_genotypes.shape[0]),
-    ):
-        batch_jax = jnp.asarray(batch.values)
-        counts = jnp.sum(jnp.abs(jnp.where(jnp.isnan(batch_jax), 0.0, batch_jax)) > 0.5, axis=0)
-        support_counts[batch.variant_indices] = np.asarray(counts, dtype=np.int32)
-    return support_counts
 
 
 

@@ -930,10 +930,21 @@ def _load_vcf_incremental(
         t_start = time.monotonic()
         last_log_time = t_start
 
+    def _abort_incremental_load(message: str) -> None:
+        geno_fh.close()
+        var_fh.close()
+        stats_fh.close()
+        for path in (geno_bin, var_jsonl, stats_bin, progress_file):
+            path.unlink(missing_ok=True)
+        raise ValueError(message)
+
     # Parse remaining variants
     for record in reader:
         if len(record.ALT) != 1:
-            continue  # skip multiallelic silently in incremental mode
+            _abort_incremental_load(
+                "Only biallelic VCF records are supported. Normalize multiallelic records before loading: "
+                + _vcf_variant_key(record)
+            )
 
         gt = record.gt_types
         int8_col = _gt_to_i8[gt]
