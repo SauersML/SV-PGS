@@ -97,7 +97,6 @@ class ModelConfig:
 
     Convergence: max_outer_iterations, convergence_tolerance
     Prior structure: prior_scale_floor/ceiling, global_scale_floor/ceiling
-    SV filtering: minimum_structural_variant_carriers (default 5)
     Linear algebra: exact_solver_matrix_limit (Woodbury vs CG cutoff)
     TPB shapes: minimum/maximum_tpb_shape, tpb_shape_learning_rate
     """

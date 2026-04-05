@@ -63,7 +63,6 @@ def test_p_greater_than_n_sparse_quantitative_should_still_recover_positive_hold
         ModelConfig(
             trait_type=TraitType.QUANTITATIVE,
             max_outer_iterations=12,
-            minimum_structural_variant_carriers=2,
         )
     ).fit(
         genotype_matrix[:train_stop],
@@ -92,7 +91,6 @@ def test_p_greater_than_n_sparse_quantitative_should_rank_multiple_causal_varian
         ModelConfig(
             trait_type=TraitType.QUANTITATIVE,
             max_outer_iterations=12,
-            minimum_structural_variant_carriers=2,
         )
     ).fit(
         genotype_matrix[:train_stop],

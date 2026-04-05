@@ -83,7 +83,6 @@ def test_binary_model_fit_roundtrip_and_rare_sv_filter(tmp_path):
         ModelConfig(
             trait_type=TraitType.BINARY,
             max_outer_iterations=10,
-            minimum_structural_variant_carriers=2,
         )
     ).fit(genotype_matrix, covariate_matrix, target_vector, variant_records)
 
@@ -165,30 +164,6 @@ def test_tie_group_export_weights_are_proportional_to_member_variances():
     )
 
     np.testing.assert_allclose(weights[0], np.array([0.9, 0.1], dtype=np.float32))
-
-
-def test_model_skips_tie_map_when_active_variant_count_exceeds_limit():
-    genotype_matrix, covariate_matrix, target_vector, variant_records = _synthetic_binary_dataset()
-
-    model = BayesianPGS(
-        ModelConfig(
-            trait_type=TraitType.BINARY,
-            max_outer_iterations=2,
-            maximum_tie_map_variants=2,
-            minimum_structural_variant_carriers=1,
-        )
-    ).fit(genotype_matrix, covariate_matrix, target_vector, variant_records)
-
-    assert model.state is not None
-    active_count = model.state.active_variant_indices.shape[0]
-    assert active_count > 2
-    np.testing.assert_array_equal(model.state.tie_map.kept_indices, model.state.active_variant_indices)
-    np.testing.assert_array_equal(
-        model.state.tie_map.original_to_reduced[model.state.active_variant_indices],
-        np.arange(active_count, dtype=np.int32),
-    )
-
-
 def test_training_records_from_stats_preserve_prior_continuous_features():
     records = [
         VariantRecord(
@@ -266,7 +241,6 @@ def test_validation_path_keeps_raw_genotypes_streaming():
         ModelConfig(
             trait_type=TraitType.QUANTITATIVE,
             max_outer_iterations=2,
-            maximum_tie_map_variants=10,
         )
     ).fit(
         train_genotypes,
@@ -295,7 +269,6 @@ def test_model_fit_keeps_streaming_when_materialization_is_skipped(monkeypatch):
         ModelConfig(
             trait_type=TraitType.BINARY,
             max_outer_iterations=2,
-            minimum_structural_variant_carriers=1,
         )
     ).fit(genotype_matrix, covariate_matrix, target_vector, variant_records)
 

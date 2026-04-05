@@ -27,6 +27,7 @@ from sv_pgs.io import (
 )
 import sv_pgs.genotype as genotype_module
 import sv_pgs.cli as cli_module
+import sv_pgs.io as io_module
 from sv_pgs.plink import to_bed
 
 
@@ -268,6 +269,50 @@ def test_load_dataset_from_gzipped_vcf(tmp_path: Path):
     np.testing.assert_allclose(dataset.genotypes, np.array([[2.0], [1.0]], dtype=np.float32))
 
 
+def test_load_dataset_from_vcf_uses_record_count_hint_for_direct_preallocation(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+):
+    vcf_path = tmp_path / "cohort.vcf"
+    vcf_path.write_text(
+        "\n".join(
+            [
+                "##fileformat=VCFv4.2",
+                "##contig=<ID=1>",
+                "##INFO=<ID=AF,Number=A,Type=Float,Description=\"Allele frequency\">",
+                "##FORMAT=<ID=GT,Number=1,Type=String,Description=\"Genotype\">",
+                "#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\ts2\ts1",
+                "1\t100\trs1\tA\tC\t50\tPASS\tAF=0.25\tGT\t0/1\t1/1",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    sample_table_path = tmp_path / "samples.tsv"
+    _write_table(
+        sample_table_path,
+        header=("sample_id", "target", "age"),
+        rows=(
+            ("s1", "1", "42"),
+            ("s2", "0", "35"),
+        ),
+    )
+
+    monkeypatch.setattr(io_module, "_vcf_record_count_hint", lambda reader: 1)
+
+    dataset = load_dataset_from_files(
+        genotype_path=vcf_path,
+        genotype_format="vcf",
+        sample_table_path=sample_table_path,
+        sample_id_column="sample_id",
+        target_column="target",
+        covariate_columns=("age",),
+    )
+
+    assert dataset.genotypes.shape == (2, 1)
+    np.testing.assert_allclose(dataset.genotypes, np.array([[2.0], [1.0]], dtype=np.float32))
+
+
 def test_vcf_cache_save_uses_real_temp_file_and_roundtrips(tmp_path: Path):
     vcf_path = tmp_path / "cohort.vcf"
     vcf_path.write_text("##fileformat=VCFv4.2\n", encoding="utf-8")
@@ -289,7 +334,6 @@ def test_vcf_cache_save_uses_real_temp_file_and_roundtrips(tmp_path: Path):
         scales=np.array([0.75], dtype=np.float32),
         allele_frequencies=np.array([0.25], dtype=np.float32),
         support_counts=np.array([1], dtype=np.int32),
-        marginal_scores=None,
     )
 
     _save_vcf_to_cache(
@@ -695,7 +739,6 @@ def test_run_training_pipeline_from_plink_inputs_writes_outputs(tmp_path: Path):
         config=ModelConfig(
             trait_type=TraitType.QUANTITATIVE,
             max_outer_iterations=2,
-            minimum_structural_variant_carriers=1,
         ),
         output_dir=output_dir,
     )
@@ -761,8 +804,6 @@ def test_cli_infers_binary_trait_type(tmp_path: Path):
             "--output-dir",
             str(output_dir),
             "--max-outer-iterations",
-            "1",
-            "--minimum-structural-variant-carriers",
             "1",
         ]
     )

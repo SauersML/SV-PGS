@@ -187,7 +187,6 @@ def test_large_scale_binary_end_to_end_roundtrip(tmp_path: Path):
         ModelConfig(
             trait_type=TraitType.BINARY,
             max_outer_iterations=12,
-            minimum_structural_variant_carriers=2,
         )
     ).fit(
         genotype_matrix[:train_stop],
@@ -204,7 +203,7 @@ def test_large_scale_binary_end_to_end_roundtrip(tmp_path: Path):
     assert model.state is not None
     assert model.state.tie_map.original_to_reduced[0] == model.state.tie_map.original_to_reduced[1]
     assert model.state.tie_map.original_to_reduced[0] == model.state.tie_map.original_to_reduced[2]
-    assert model.state.tie_map.original_to_reduced[30] == -1
+    assert model.state.tie_map.original_to_reduced[30] != -1
 
     test_probability = model.predict_proba(genotype_matrix[train_stop:], covariate_matrix[train_stop:])[:, 1]
     assert np.all(np.isfinite(test_probability))
@@ -235,7 +234,6 @@ def test_large_scale_benchmark_and_quantitative_fit():
                 shared_config=ModelConfig(
                     trait_type=TraitType.BINARY,
                     max_outer_iterations=10,
-                    minimum_structural_variant_carriers=2,
                 )
         ),
     )
@@ -258,7 +256,6 @@ def test_large_scale_benchmark_and_quantitative_fit():
             shared_config=ModelConfig(
                 trait_type=TraitType.QUANTITATIVE,
                 max_outer_iterations=7,
-                minimum_structural_variant_carriers=2,
             )
         ),
     )
@@ -271,7 +268,6 @@ def test_large_scale_benchmark_and_quantitative_fit():
         ModelConfig(
             trait_type=TraitType.QUANTITATIVE,
             max_outer_iterations=7,
-            minimum_structural_variant_carriers=2,
         )
     ).fit(
         quantitative_genotypes[:390],

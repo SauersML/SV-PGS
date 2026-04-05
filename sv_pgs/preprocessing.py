@@ -10,7 +10,7 @@ import sv_pgs._jax  # noqa: F401
 import jax
 import jax.numpy as jnp
 
-from sv_pgs.config import ModelConfig, TraitType, VariantClass
+from sv_pgs.config import ModelConfig, VariantClass
 from sv_pgs.data import PreparedArrays, TieGroup, TieMap, VariantRecord, VariantStatistics
 from sv_pgs.genotype import (
     DenseRawGenotypeMatrix,
@@ -21,7 +21,6 @@ from sv_pgs.genotype import (
     as_raw_genotype_matrix,
     auto_batch_size,
 )
-from sv_pgs.numeric import stable_sigmoid
 from sv_pgs.progress import log, mem
 
 
@@ -55,48 +54,6 @@ def _batch_all_stats_i8(batch_i8: jnp.ndarray) -> tuple[jnp.ndarray, jnp.ndarray
     return sums, counts, support, css
 
 
-@jax.jit
-def _batch_all_stats_with_screening_i8(
-    batch_i8: jnp.ndarray,
-    residual: jnp.ndarray,
-) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray]:
-    """Same as _batch_all_stats_i8, but also computes a "screening score" per variant.
-
-    The screening score measures how strongly each variant correlates with
-    the residual (trait values after removing covariate effects).  Variants
-    with high scores are likely to have real associations.  This lets us
-    optionally pre-filter variants before the expensive EM loop.
-
-    The score is: |X_standardized^T @ residual|  (absolute correlation).
-
-    Uses float64 for precise sums/means/css over ~447k samples, but float32
-    for the screening matrix multiply (precision isn't critical for ranking).
-    """
-    mask = batch_i8 != -127
-    # Work in float32 throughout to halve memory (3354 × 447k × 4 = 6 GB vs 12 GB)
-    # Genotypes are 0/1/2 so float32 precision is exact for sums up to 2^24 = 16M samples
-    values_f32 = jnp.where(mask, batch_i8.astype(jnp.float32), 0.0)
-
-    sums = jnp.sum(values_f32, axis=0, dtype=jnp.float64)  # accumulate in f64
-    counts = jnp.sum(mask, axis=0, dtype=jnp.int32)
-    support = jnp.sum(mask & (batch_i8 > 0), axis=0, dtype=jnp.int32)
-
-    safe_counts = jnp.maximum(counts, 1).astype(jnp.float32)
-    means_f32 = (sums / safe_counts.astype(jnp.float64)).astype(jnp.float32)
-    imputed = jnp.where(mask, values_f32, means_f32[None, :])
-    centered = imputed - means_f32[None, :]
-    css = jnp.sum(centered * centered, axis=0, dtype=jnp.float64)  # accumulate in f64
-
-    # Screening score: |X_std^T @ residual| in float32
-    n = batch_i8.shape[0]
-    scales_f32 = jnp.sqrt((css / jnp.maximum(n, 1))).astype(jnp.float32)
-    scales_f32 = jnp.where(scales_f32 < 1e-6, jnp.float32(1.0), scales_f32)
-    standardized = centered / scales_f32[None, :]
-    scores = jnp.abs(standardized.T @ residual.astype(jnp.float32)).astype(jnp.float64)
-
-    return sums, counts, support, css, scores
-
-
 # Keep float32 versions for VCF path
 @jax.jit
 def _batch_all_stats(batch_values: jnp.ndarray) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray]:
@@ -115,89 +72,22 @@ def _batch_all_stats(batch_values: jnp.ndarray) -> tuple[jnp.ndarray, jnp.ndarra
     return sums, counts, support, css
 
 
-@jax.jit
-def _batch_all_stats_with_screening(
-    batch_values: jnp.ndarray,
-    residual: jnp.ndarray,
-) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray]:
-    """Float32 path with screening for VCF/dense genotypes."""
-    mask = ~jnp.isnan(batch_values)
-    observed = jnp.where(mask, batch_values, 0.0)
-    sums = jnp.sum(observed, axis=0, dtype=jnp.float64)
-    counts = jnp.sum(mask, axis=0, dtype=jnp.int32)
-    support = jnp.sum(mask & (jnp.abs(observed) > 0.5), axis=0, dtype=jnp.int32)
-    safe_counts = jnp.maximum(counts, 1).astype(jnp.float64)
-    means = sums / safe_counts
-    means_f32 = means.astype(jnp.float32)
-    imputed = jnp.where(mask, batch_values, means_f32[None, :])
-    centered = imputed - means_f32[None, :]
-    css = jnp.sum(centered * centered, axis=0, dtype=jnp.float64)
-    n = batch_values.shape[0]
-    scales = jnp.sqrt(css / jnp.maximum(n, 1))
-    scales = jnp.where(scales < 1e-6, 1.0, scales)
-    standardized = centered / scales[None, :]
-    scores = jnp.abs(standardized.T @ residual.astype(jnp.float64))
-    return sums, counts, support, css, scores
-
-
 def compute_variant_statistics(
     raw_genotypes: RawGenotypeMatrix,
     config: ModelConfig,
-    covariates: np.ndarray | None = None,
-    targets: np.ndarray | None = None,
 ) -> VariantStatistics:
-    """Compute all per-variant statistics in a SINGLE pass over the genotype data.
-
-    This is one of the most expensive operations in the pipeline — it reads
-    every genotype value once.  For ~900k variants x ~447k samples, that's
-    ~400 billion values.  We do it in batches on GPU/CPU via JAX to keep
-    memory bounded.
-
-    For each variant, we compute:
-      - mean dosage (used for standardization and allele frequency)
-      - standard deviation (used for standardization — z-scoring)
-      - carrier count (how many individuals carry the non-ref allele)
-      - optionally, a screening score (correlation with the trait residual)
-
-    If covariates and targets are provided, the screening residual is
-    computed first by regressing out covariates (OLS), so scores reflect
-    the variant's association with the trait *after* adjusting for
-    population structure, age, sex, etc.
-    """
+    """Compute all per-variant statistics in a single pass over the genotype data."""
     variant_count = raw_genotypes.shape[1]
     sample_count = raw_genotypes.shape[0]
     batch_size = auto_batch_size(sample_count)
-
-    # Compute the trait residual for screening:
-    #   quantitative -> OLS residual under the covariate-only null
-    #   binary       -> logistic null score residual y - p(covariates)
-    # This makes screening reflect each variant's marginal association with the
-    # trait after adjusting for covariates.
-    compute_scores = covariates is not None and targets is not None
-    residual_jax: jnp.ndarray | None = None
     jax_backend = jax.default_backend()
-    if compute_scores:
-        cov = np.asarray(covariates, dtype=np.float64)
-        tgt = np.asarray(targets, dtype=np.float64).reshape(-1)
-        if config.trait_type == TraitType.BINARY:
-            residual = _binary_null_score_residuals(cov, tgt)
-        else:
-            coef, *_ = np.linalg.lstsq(cov, tgt, rcond=None)
-            residual = tgt - cov @ coef
-        residual_jax = jnp.asarray(residual)
-        log(f"=== VARIANT STATISTICS + SCREENING (1-pass, JAX/{jax_backend}) ===  {sample_count} samples x {variant_count} variants  batch_size={batch_size}  mem={mem()}")
-    else:
-        log(f"=== VARIANT STATISTICS (1-pass, JAX/{jax_backend}) ===  {sample_count} samples x {variant_count} variants  batch_size={batch_size}  mem={mem()}")
+    log(f"=== VARIANT STATISTICS (1-pass, JAX/{jax_backend}) ===  {sample_count} samples x {variant_count} variants  batch_size={batch_size}  mem={mem()}")
 
     sums = np.zeros(variant_count, dtype=np.float64)
     non_missing_counts = np.zeros(variant_count, dtype=np.int32)
     support_counts = np.zeros(variant_count, dtype=np.int32)
     centered_sum_squares = np.zeros(variant_count, dtype=np.float64)
-    marginal_scores: np.ndarray | None = None
-    if compute_scores:
-        marginal_scores = np.zeros(variant_count, dtype=np.float64)
 
-    # Use int8 path for PLINK data (4x less memory, avoids float32 intermediate)
     use_i8 = hasattr(raw_genotypes, "iter_column_batches_i8")
     if use_i8:
         log("  using int8 native path (4x less IO per batch)")
@@ -213,19 +103,11 @@ def compute_variant_statistics(
         _t0 = _time.monotonic()
         idx = batch.variant_indices
         if use_i8:
-            batch_jax = jnp.asarray(batch.values)  # int8 on JAX
-            if compute_scores:
-                batch_sums, batch_counts, batch_support, batch_css, batch_scores = _batch_all_stats_with_screening_i8(batch_jax, residual_jax)
-                marginal_scores[idx] = np.asarray(batch_scores, dtype=np.float64)
-            else:
-                batch_sums, batch_counts, batch_support, batch_css = _batch_all_stats_i8(batch_jax)
+            batch_jax = jnp.asarray(batch.values)
+            batch_sums, batch_counts, batch_support, batch_css = _batch_all_stats_i8(batch_jax)
         else:
-            batch_jax = jnp.asarray(batch.values)  # float32 on JAX
-            if compute_scores:
-                batch_sums, batch_counts, batch_support, batch_css, batch_scores = _batch_all_stats_with_screening(batch_jax, residual_jax)
-                marginal_scores[idx] = np.asarray(batch_scores, dtype=np.float64)
-            else:
-                batch_sums, batch_counts, batch_support, batch_css = _batch_all_stats(batch_jax)
+            batch_jax = jnp.asarray(batch.values)
+            batch_sums, batch_counts, batch_support, batch_css = _batch_all_stats(batch_jax)
         sums[idx] = np.asarray(batch_sums, dtype=np.float64)
         non_missing_counts[idx] = np.asarray(batch_counts, dtype=np.int32)
         support_counts[idx] = np.asarray(batch_support, dtype=np.int32)
@@ -237,12 +119,6 @@ def compute_variant_statistics(
             est_total = _dt * ((variant_count - variants_done) / max(len(idx), 1)) if batch_number >= 2 else 0
             log(f"  {variants_done}/{variant_count} ({100*variants_done//variant_count}%)  batch={_dt:.1f}s  est_remaining={est_total/60:.0f}min  mem={mem()}")
 
-    # Convert raw sums to per-variant statistics:
-    #   mean = sum / count (average dosage; range 0-2 for biallelic)
-    #   allele_frequency = mean / 2 (fraction of alleles that are non-ref)
-    #   scale = sqrt(CSS / n) = standard deviation (for z-score standardization)
-    # Variants with near-zero scale (monomorphic) get scale=1 to avoid
-    # division by zero during standardization — they'll have ~zero effect.
     means = np.divide(
         sums, np.maximum(non_missing_counts, 1),
         out=np.zeros_like(sums), where=non_missing_counts > 0,
@@ -260,37 +136,7 @@ def compute_variant_statistics(
         scales=scales,
         allele_frequencies=allele_frequencies,
         support_counts=support_counts.astype(np.int32),
-        marginal_scores=marginal_scores,
     )
-
-
-def _binary_null_score_residuals(
-    covariates: np.ndarray,
-    targets: np.ndarray,
-) -> np.ndarray:
-    covariate_matrix = np.asarray(covariates, dtype=np.float64)
-    target_array = np.asarray(targets, dtype=np.float64).reshape(-1)
-    coefficients = np.zeros(covariate_matrix.shape[1], dtype=np.float64)
-    for _iteration_index in range(25):
-        linear_predictor = covariate_matrix @ coefficients
-        probabilities = np.clip(
-            np.asarray(stable_sigmoid(linear_predictor), dtype=np.float64),
-            1e-6,
-            1.0 - 1e-6,
-        )
-        weights = np.maximum(probabilities * (1.0 - probabilities), 1e-6)
-        gradient = covariate_matrix.T @ (target_array - probabilities)
-        hessian = covariate_matrix.T @ (weights[:, None] * covariate_matrix)
-        step = np.linalg.solve(hessian + np.eye(hessian.shape[0], dtype=np.float64) * 1e-8, gradient)
-        coefficients += step
-        if float(np.max(np.abs(step))) < 1e-8:
-            break
-    final_probabilities = np.clip(
-        np.asarray(stable_sigmoid(covariate_matrix @ coefficients), dtype=np.float64),
-        1e-6,
-        1.0 - 1e-6,
-    )
-    return target_array - final_probabilities
 
 
 def _scales_from_centered_sum_squares(
@@ -401,28 +247,24 @@ def fit_preprocessor(
 
 def select_active_variant_indices(
     variant_records: Sequence[VariantRecord],
-    support_counts: np.ndarray,
     config: ModelConfig,
+    support_counts: np.ndarray | None = None,
     marginal_scores: np.ndarray | None = None,
 ) -> np.ndarray:
-    """Filter out structural variants with too few carriers.
-
-    SVs with very few carriers (< minimum_structural_variant_carriers,
-    default=5) have unreliable effect estimates and can cause numerical
-    instability.  SNVs and small indels are always kept regardless of
-    carrier count — they're more reliably genotyped and common enough
-    in array data.
-    """
+    """Filter SVs by support and optionally score-screen variants class-aware."""
     n_total = len(variant_records)
     active_flags = np.ones(n_total, dtype=bool)
     structural_variant_classes = set(config.structural_variant_classes())
     sv_checked = 0
     sv_filtered = 0
+    support_array = None if support_counts is None else np.asarray(support_counts, dtype=np.int32).reshape(-1)
+    if support_array is not None and support_array.shape[0] != n_total:
+        raise ValueError("support_counts must align with variant_records.")
     for variant_index, variant_record in enumerate(variant_records):
         if variant_record.variant_class not in structural_variant_classes:
             continue
         sv_checked += 1
-        support = int(support_counts[variant_index])
+        support = 0 if support_array is None else int(support_array[variant_index])
         if variant_record.training_support is not None:
             support = variant_record.training_support
         if support < config.minimum_structural_variant_carriers:
@@ -435,6 +277,7 @@ def select_active_variant_indices(
             f"(SVs checked={sv_checked} filtered={sv_filtered}; score screening skipped) [NO DATA PASS]"
         )
         return base_active_indices
+
     score_array = np.asarray(marginal_scores, dtype=np.float64).reshape(-1)
     if score_array.shape[0] != n_total:
         raise ValueError("marginal_scores must align with variant_records.")
@@ -448,7 +291,7 @@ def select_active_variant_indices(
             record = variant_records[int(variant_index)]
             if record.variant_class not in structural_variant_classes:
                 continue
-            support = int(support_counts[int(variant_index)])
+            support = 0 if support_array is None else int(support_array[int(variant_index)])
             if record.training_support is not None:
                 support = record.training_support
             if support >= config.screen_always_keep_structural_variants_above_support:
@@ -495,8 +338,6 @@ def select_active_variant_indices(
         f"screened small={small_variant_kept} structural={structural_kept} always_keep_sv={always_kept_structural}) [NO DATA PASS]"
     )
     return result
-
-
 # Detect groups of variants that have identical (or exactly negated) genotype
 # columns across all samples.  These "tied" variants are perfectly collinear
 # and would cause the model to split their effects arbitrarily.
@@ -599,25 +440,6 @@ def build_tie_map(
             )
         ],
     )
-
-
-def _keep_top_scoring_variants(
-    variant_indices: list[int],
-    marginal_scores: np.ndarray,
-    maximum_kept: int,
-    keep_flags: np.ndarray,
-) -> int:
-    if len(variant_indices) == 0:
-        return 0
-    if maximum_kept <= 0 or len(variant_indices) <= maximum_kept:
-        keep_flags[np.asarray(variant_indices, dtype=np.int32)] = True
-        return len(variant_indices)
-    group_indices = np.asarray(variant_indices, dtype=np.int32)
-    group_scores = np.asarray(marginal_scores[group_indices], dtype=np.float64)
-    safe_scores = np.where(np.isfinite(group_scores), group_scores, -np.inf)
-    keep_order = np.argsort(-safe_scores, kind="mergesort")[:maximum_kept]
-    keep_flags[group_indices[keep_order]] = True
-    return int(keep_order.shape[0])
 
 
 def _iter_tie_map_batches(

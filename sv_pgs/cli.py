@@ -47,7 +47,6 @@ def build_parser() -> argparse.ArgumentParser:
     aou_run_parser.add_argument("--output-dir", required=True, help="Base output directory.")
     aou_run_parser.add_argument("--n-pcs", type=int, default=10, help="Number of genomic PCs to include (default: 10).")
     aou_run_parser.add_argument("--max-outer-iterations", type=int, default=30)
-    aou_run_parser.add_argument("--minimum-structural-variant-carriers", type=int, default=5)
     aou_run_parser.add_argument("--random-seed", type=int, default=0)
 
     run_parser = subparsers.add_parser("run", help="Load genotype files, fit the model, and write outputs.")
@@ -127,7 +126,6 @@ def main(argv: list[str] | None = None) -> int:
             output_base=args.output_dir,
             n_pcs=args.n_pcs,
             max_outer_iterations=args.max_outer_iterations,
-            min_sv_carriers=args.minimum_structural_variant_carriers,
             random_seed=args.random_seed,
         )
         return 0
@@ -153,7 +151,7 @@ def main(argv: list[str] | None = None) -> int:
     require_full_gpu_runtime()
     log(f"genotypes={args.genotypes} sample_table={args.sample_table} output_dir={args.output_dir}")
     log(f"genotype_format={args.genotype_format} sample_id_column={args.sample_id_column} target_column={args.target_column}")
-    log(f"covariates={list(args.covariate_column)}  max_outer_iter={args.max_outer_iterations}  min_sv_carriers={args.minimum_structural_variant_carriers}  seed={args.random_seed}")
+    log(f"covariates={list(args.covariate_column)}  max_outer_iter={args.max_outer_iterations}  seed={args.random_seed}")
     dataset = load_dataset_from_files(
         genotype_path=args.genotypes,
         genotype_format=args.genotype_format,
@@ -171,7 +169,6 @@ def main(argv: list[str] | None = None) -> int:
         config=ModelConfig(
             trait_type=inferred_trait_type,
             max_outer_iterations=args.max_outer_iterations,
-            minimum_structural_variant_carriers=args.minimum_structural_variant_carriers,
             random_seed=args.random_seed,
         ),
         output_dir=Path(args.output_dir),

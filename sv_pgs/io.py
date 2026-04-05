@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import csv
+import gzip
 import hashlib
 import json
 import pickle
@@ -71,6 +72,174 @@ class _DelimitedTableSpec:
     columns: tuple[str, ...]
 
 
+class _SimpleVCFInfo:
+    def __init__(self, values: dict[str, Any]) -> None:
+        self._values = values
+
+    def get(self, key: str) -> Any:
+        return self._values.get(key)
+
+
+class _SimpleVCFRecord:
+    def __init__(
+        self,
+        chrom: str,
+        pos: int,
+        record_id: str | None,
+        ref: str,
+        alt: str,
+        qual: float | None,
+        info: dict[str, Any],
+        gt_types: np.ndarray,
+    ) -> None:
+        self.CHROM = chrom
+        self.POS = pos
+        self.ID = record_id
+        self.REF = ref
+        self.ALT = [alt]
+        self.QUAL = qual
+        self.INFO = _SimpleVCFInfo(info)
+        self.gt_types = gt_types
+        self.end = info.get("END")
+        alt_upper = alt.upper()
+        self.is_sv = alt.startswith("<") and alt.endswith(">") or info.get("SVTYPE") is not None
+        self.is_snp = not self.is_sv and len(ref) == 1 and len(alt) == 1
+        self.is_indel = not self.is_sv and not self.is_snp
+
+
+class _SimpleVCFReader:
+    def __init__(self, path: Path) -> None:
+        self.path = path
+        self._handle = gzip.open(path, "rt", encoding="utf-8") if path.suffix == ".gz" else path.open("r", encoding="utf-8")
+        self.samples: list[str] = []
+        self._header_consumed = False
+        self._advance_to_records()
+
+    def _advance_to_records(self) -> None:
+        for line in self._handle:
+            if line.startswith("##"):
+                continue
+            if line.startswith("#CHROM"):
+                header_fields = line.rstrip("\n").split("\t")
+                self.samples = [str(field) for field in header_fields[9:]]
+                self._header_consumed = True
+                return
+        raise ValueError("VCF header is missing #CHROM line: " + str(self.path))
+
+    def set_threads(self, n_threads: int) -> None:
+        del n_threads
+
+    def close(self) -> None:
+        self._handle.close()
+
+    def __iter__(self) -> Iterator[_SimpleVCFRecord]:
+        if not self._header_consumed:
+            self._advance_to_records()
+        for line in self._handle:
+            stripped = line.strip()
+            if not stripped:
+                continue
+            yield _parse_simple_vcf_record(stripped)
+
+
+def _parse_simple_vcf_record(line: str) -> _SimpleVCFRecord:
+    fields = line.split("\t")
+    if len(fields) < 10:
+        raise ValueError("VCF record has fewer than 10 fields: " + line)
+    chrom, pos, record_id, ref, alt_field, qual_field, _filter, info_field, fmt = fields[:9]
+    sample_fields = fields[9:]
+    alt_values = alt_field.split(",")
+    if len(alt_values) != 1:
+        raise ValueError("Only biallelic VCF records are supported. Normalize multiallelic records before loading: " + line)
+    info_values = _parse_simple_vcf_info(info_field)
+    gt_index = 0
+    if fmt:
+        format_fields = fmt.split(":")
+        if "GT" not in format_fields:
+            raise ValueError("VCF FORMAT field must include GT: " + line)
+        gt_index = format_fields.index("GT")
+    gt_types = np.asarray(
+        [
+            _simple_vcf_gt_type(sample_field.split(":")[gt_index] if sample_field else "./.")
+            for sample_field in sample_fields
+        ],
+        dtype=np.int8,
+    )
+    qual = None if qual_field == "." else float(qual_field)
+    return _SimpleVCFRecord(
+        chrom=str(chrom),
+        pos=int(pos),
+        record_id=None if record_id == "." else str(record_id),
+        ref=str(ref),
+        alt=str(alt_values[0]),
+        qual=qual,
+        info=info_values,
+        gt_types=gt_types,
+    )
+
+
+def _parse_simple_vcf_info(info_field: str) -> dict[str, Any]:
+    if info_field == ".":
+        return {}
+    parsed: dict[str, Any] = {}
+    for item in info_field.split(";"):
+        if not item:
+            continue
+        if "=" not in item:
+            parsed[item] = True
+            continue
+        key, value = item.split("=", 1)
+        if "," in value:
+            parsed[key] = tuple(_coerce_vcf_info_scalar(part) for part in value.split(","))
+        else:
+            parsed[key] = _coerce_vcf_info_scalar(value)
+    return parsed
+
+
+def _coerce_vcf_info_scalar(value: str) -> Any:
+    try:
+        numeric_value = float(value)
+    except ValueError:
+        return value
+    if numeric_value.is_integer():
+        return int(numeric_value)
+    return numeric_value
+
+
+def _simple_vcf_gt_type(genotype: str) -> int:
+    normalized = genotype.replace("|", "/")
+    if normalized in {".", "./.", "./0", "0/.", "./1", "1/."}:
+        return 2
+    if normalized == "0/0":
+        return 0
+    if normalized in {"0/1", "1/0"}:
+        return 1
+    if normalized == "1/1":
+        return 3
+    if "." in normalized:
+        return 2
+    raise ValueError("Unsupported diploid GT in VCF: " + genotype)
+
+
+def _open_vcf_reader(vcf_path: Path) -> Any:
+    try:
+        from cyvcf2 import VCF
+        return VCF(str(vcf_path))
+    except ModuleNotFoundError:
+        log(f"cyvcf2 unavailable; falling back to pure-python VCF parser for {vcf_path.name}")
+        return _SimpleVCFReader(vcf_path)
+
+
+def _vcf_record_count_hint(reader: Any) -> int | None:
+    try:
+        record_count = int(reader.num_records)
+    except (AttributeError, TypeError, ValueError):
+        return None
+    if record_count < 0:
+        return None
+    return record_count
+
+
 def load_dataset_from_files(
     genotype_path: str | Path,
     sample_table_path: str | Path,
@@ -95,9 +264,7 @@ def load_dataset_from_files(
     if resolved_format == "vcf":
         # Read VCF header to get sample IDs without parsing genotypes
         log("reading VCF header for sample IDs...")
-        from cyvcf2 import VCF
-
-        vcf_header_reader = VCF(str(source_path))
+        vcf_header_reader = _open_vcf_reader(source_path)
         source_sample_ids = [str(s) for s in vcf_header_reader.samples]
         vcf_header_reader.close()
         log(f"VCF has {len(source_sample_ids)} samples")
@@ -222,15 +389,10 @@ def load_dataset_from_files(
             variant_count=plink_metadata.variant_count,
             total_sample_count=total_fam_samples,
         )
-        # Add intercept column to covariates for residual computation (same as model.fit)
-        cov_with_intercept = np.concatenate([
-            np.ones((sample_table.covariates.shape[0], 1), dtype=np.float32),
-            sample_table.covariates,
-        ], axis=1)
-        log("computing variant statistics + screening scores (single pass, JAX)...")
+        log("computing variant statistics (single pass, JAX)...")
         variant_stats = compute_variant_statistics(
-            raw_genotypes, config=ModelConfig(),
-            covariates=cov_with_intercept, targets=sample_table.targets,
+            raw_genotypes,
+            config=ModelConfig(),
         )
         log("building PLINK variant defaults from pre-computed allele frequencies...")
         default_variants = _build_plink_variant_defaults_from_stats(source_path, variant_stats)
@@ -340,7 +502,6 @@ def load_multi_vcf_dataset_from_files(
         scales=np.concatenate([stats.scales for stats in variant_stats_parts]).astype(np.float32, copy=False),
         allele_frequencies=np.concatenate([stats.allele_frequencies for stats in variant_stats_parts]).astype(np.float32, copy=False),
         support_counts=np.concatenate([stats.support_counts for stats in variant_stats_parts]).astype(np.int32, copy=False),
-        marginal_scores=None,
     )
 
     log("building variant records from defaults + optional metadata...")
@@ -616,7 +777,6 @@ def _load_vcf_from_cache(
             scales=np.asarray(stats_payload["scales"], dtype=np.float32),
             allele_frequencies=np.asarray(stats_payload["allele_frequencies"], dtype=np.float32),
             support_counts=np.asarray(stats_payload["support_counts"], dtype=np.int32),
-            marginal_scores=None,
         )
         log(f"  cached matrix {genotype_matrix.shape}, {len(variants)} variants")
         return genotype_matrix, variants, variant_stats
@@ -626,9 +786,7 @@ def _load_vcf_from_cache(
 
 
 def _read_vcf_sample_ids(vcf_path: Path) -> list[str]:
-    from cyvcf2 import VCF
-
-    reader = VCF(str(vcf_path))
+    reader = _open_vcf_reader(vcf_path)
     try:
         return [str(sample_id) for sample_id in reader.samples]
     finally:
@@ -737,9 +895,7 @@ def _load_vcf(
     vcf_size_mb = vcf_path.stat().st_size / 1e6
     log(f"opening VCF: {vcf_path.name} ({vcf_size_mb:.1f} MB)")
 
-    from cyvcf2 import VCF
-
-    reader = VCF(str(vcf_path))
+    reader = _open_vcf_reader(vcf_path)
     n_threads = os.cpu_count() or 4
     reader.set_threads(n_threads)
     log(f"VCF decompression threads: {n_threads}")
@@ -747,8 +903,22 @@ def _load_vcf(
     n_keep = len(keep_sample_indices) if keep_sample_indices is not None else n_all_samples
     log(f"VCF has {n_all_samples} samples, keeping {n_keep}")
 
-    dosage_columns: list[np.ndarray] = []
-    variants: list[_VariantDefaults] = []
+    record_count_hint = _vcf_record_count_hint(reader)
+    genotype_matrix: np.ndarray | None
+    dosage_columns: list[np.ndarray] | None
+    if record_count_hint is None:
+        genotype_matrix = None
+        dosage_columns = []
+        variants: list[_VariantDefaults] = []
+    else:
+        matrix_gb = n_keep * record_count_hint / 1e9
+        log(
+            f"indexed VCF reports {record_count_hint} records; "
+            f"preallocating int8 matrix ({n_keep} x {record_count_hint}, {matrix_gb:.1f} GB)"
+        )
+        genotype_matrix = np.empty((n_keep, record_count_hint), dtype=np.int8, order="F")
+        dosage_columns = None
+        variants = []
 
     t_start = time.monotonic()
     last_log_time = t_start
@@ -756,13 +926,7 @@ def _load_vcf(
 
     # Local references avoid repeated global/attribute lookups in the hot loop
     _gt_to_i8 = _GT_TO_INT8
-    _append_col = dosage_columns.append
     _append_var = variants.append
-    _VariantDef = _VariantDefaults
-    _vcf_id = _vcf_variant_id
-    _vcf_cls = _infer_vcf_variant_class
-    _vcf_len = _infer_vcf_length
-    _norm_q = _normalize_quality
     _monotonic = time.monotonic
 
     for record in reader:
@@ -776,24 +940,21 @@ def _load_vcf(
         int8_col = _gt_to_i8[gt]
         if keep_sample_indices is not None:
             int8_col = int8_col[keep_sample_indices]
-        _append_col(int8_col)
-
-        # Defer AF to INFO field or post-hoc batch computation
-        af_value = record.INFO.get("AF")
-        af = float(af_value[0]) if isinstance(af_value, (tuple, list)) else float(af_value) if af_value is not None else -1.0
-        _append_var(
-            _VariantDef(
-                variant_id=_vcf_id(record),
-                variant_class=_vcf_cls(record),
-                chromosome=str(record.CHROM),
-                position=int(record.POS),
-                length=_vcf_len(record),
-                allele_frequency=af,
-                quality=_norm_q(record.QUAL),
-            )
-        )
-
         n = len(variants)
+        if genotype_matrix is None:
+            if dosage_columns is None:
+                raise RuntimeError("VCF loader column buffer was not initialized.")
+            dosage_columns.append(int8_col)
+        else:
+            if n >= genotype_matrix.shape[1]:
+                raise RuntimeError(
+                    "VCF index record count was smaller than the parsed record count. "
+                    f"expected={genotype_matrix.shape[1]} parsed_at_least={n + 1}"
+                )
+            genotype_matrix[:, n] = int8_col
+        _append_var(_variant_defaults_from_vcf_record(record))
+        n += 1
+
         now = _monotonic()
         chrom = str(record.CHROM)
 
@@ -819,13 +980,18 @@ def _load_vcf(
     # Values: 0/1/2 for dosage, -1 for missing.  Converted to float32 per-batch on the fly.
     # Use Fortran (column-major) order for fast column writes, then convert to C order
     # for fast row-slice access during batch iteration.
-    matrix_gb = n_keep * n_total / 1e9
-    log(f"building int8 matrix ({n_keep} x {n_total}, {matrix_gb:.1f} GB)...")
-    genotype_matrix = np.empty((n_keep, n_total), dtype=np.int8, order='F')
-    for i in range(n_total):
-        genotype_matrix[:, i] = dosage_columns[i]
-        dosage_columns[i] = None  # free column immediately
-    del dosage_columns
+    if genotype_matrix is None:
+        if dosage_columns is None:
+            raise RuntimeError("VCF loader column buffer was not initialized.")
+        matrix_gb = n_keep * n_total / 1e9
+        log(f"building int8 matrix ({n_keep} x {n_total}, {matrix_gb:.1f} GB)...")
+        genotype_matrix = np.empty((n_keep, n_total), dtype=np.int8, order="F")
+        for i in range(n_total):
+            genotype_matrix[:, i] = dosage_columns[i]
+            dosage_columns[i] = None  # free column immediately
+        del dosage_columns
+    elif genotype_matrix.shape[1] != n_total:
+        genotype_matrix = genotype_matrix[:, :n_total]
     genotype_matrix = np.ascontiguousarray(genotype_matrix)
 
     matrix_mb = genotype_matrix.nbytes / 1e6
@@ -870,7 +1036,6 @@ def _load_vcf(
         scales=scales_arr,
         allele_frequencies=allele_freqs,
         support_counts=support_arr,
-        marginal_scores=None,
     )
     return genotype_matrix, variants, variant_stats
 def _load_plink1_metadata(bed_path: Path) -> _PlinkMetadata:
@@ -1193,27 +1358,58 @@ def _reorder_sample_table_by_source_index(
     return reordered_sample_table, reordered_source_indices, True
 
 
-def _vcf_variant_id(record: Any) -> str:
-    if record.ID is None or str(record.ID) == ".":
-        return _vcf_variant_key(record)
-    return str(record.ID)
-
-
 def _vcf_variant_key(record: Any) -> str:
     return str(record.CHROM) + ":" + str(record.POS) + ":" + str(record.REF) + ":" + str(record.ALT[0])
 
 
-def _infer_vcf_variant_class(record: Any) -> VariantClass:
+def _variant_defaults_from_vcf_record(record: Any) -> _VariantDefaults:
+    alt = str(record.ALT[0])
+    info = record.INFO
+    record_id = record.ID
+    variant_id = _vcf_variant_key(record) if record_id is None or str(record_id) == "." else str(record_id)
+    svlen_value = info.get("SVLEN")
+    if svlen_value is not None:
+        if isinstance(svlen_value, (tuple, list)):
+            length = float(abs(float(svlen_value[0])))
+        else:
+            length = float(abs(float(svlen_value)))
+    elif record.is_snp:
+        length = 1.0
+    elif record.end is not None and int(record.end) >= int(record.POS):
+        length = float(int(record.end) - int(record.POS) + 1)
+    else:
+        length = float(max(len(record.REF), len(alt)))
+
     if record.is_snp:
-        return VariantClass.SNV
-    if record.is_indel and not record.is_sv:
-        return VariantClass.SMALL_INDEL
-    variant_token = _normalize_variant_token(record.INFO.get("SVTYPE"))
-    if variant_token is None:
-        variant_token = _normalize_variant_token(record.ALT[0])
-    if variant_token is None:
-        return VariantClass.OTHER_COMPLEX_SV
-    return _structural_variant_class_from_token(variant_token, _infer_vcf_length(record))
+        variant_class = VariantClass.SNV
+    elif record.is_indel and not record.is_sv:
+        variant_class = VariantClass.SMALL_INDEL
+    else:
+        variant_token = _normalize_variant_token(info.get("SVTYPE"))
+        if variant_token is None:
+            variant_token = _normalize_variant_token(alt)
+        if variant_token is None:
+            variant_class = VariantClass.OTHER_COMPLEX_SV
+        else:
+            variant_class = _structural_variant_class_from_token(variant_token, length)
+
+    af_value = info.get("AF")
+    if isinstance(af_value, (tuple, list)):
+        allele_frequency = float(af_value[0])
+    elif af_value is not None:
+        allele_frequency = float(af_value)
+    else:
+        allele_frequency = -1.0
+
+    return _VariantDefaults(
+        variant_id=variant_id,
+        variant_class=variant_class,
+        chromosome=str(record.CHROM),
+        position=int(record.POS),
+        length=length,
+        allele_frequency=allele_frequency,
+        quality=_normalize_quality(record.QUAL),
+    )
 
 
 def _infer_plink_variant_class(allele_1: str, allele_2: str) -> VariantClass:
@@ -1223,19 +1419,6 @@ def _infer_plink_variant_class(allele_1: str, allele_2: str) -> VariantClass:
     if len(allele_1) == 1 and len(allele_2) == 1:
         return VariantClass.SNV
     return VariantClass.SMALL_INDEL
-
-
-def _infer_vcf_length(record: Any) -> float:
-    svlen_value = record.INFO.get("SVLEN")
-    if svlen_value is not None:
-        if isinstance(svlen_value, (tuple, list)):
-            return float(abs(float(svlen_value[0])))
-        return float(abs(float(svlen_value)))
-    if record.is_snp:
-        return 1.0
-    if record.end is not None and int(record.end) >= int(record.POS):
-        return float(int(record.end) - int(record.POS) + 1)
-    return float(max(len(record.REF), len(record.ALT[0])))
 
 
 

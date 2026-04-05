@@ -1,8 +1,10 @@
 import numpy as np
+import pytest
 
 from sv_pgs.config import ModelConfig, VariantClass
 from sv_pgs.data import VariantRecord
 from sv_pgs.genotype import as_raw_genotype_matrix
+import sv_pgs.preprocessing as preprocessing_module
 from sv_pgs.preprocessing import (
     Preprocessor,
     build_tie_map,
@@ -110,52 +112,45 @@ def test_tie_map_uses_missingness_aware_signatures():
     assert tie_map.original_to_reduced.tolist() == [0, 1]
 
 
-def test_select_active_variant_indices_filters_low_carrier_svs():
-    """SVs with support below threshold are filtered; SNVs always pass."""
+def test_tie_map_verifies_hash_collisions_before_grouping(monkeypatch: pytest.MonkeyPatch):
+    genotype_matrix = np.array(
+        [
+            [0.0, 1.0],
+            [1.0, 0.0],
+            [0.0, 1.0],
+            [1.0, 0.0],
+        ],
+        dtype=np.float32,
+    )
+    variant_records = [
+        VariantRecord("variant_0", VariantClass.SNV, "1", 100),
+        VariantRecord("variant_1", VariantClass.SNV, "1", 101),
+    ]
+
+    monkeypatch.setattr(
+        preprocessing_module,
+        "_hashed_tie_signature",
+        lambda standardized_column, missing_mask: (b"forced", b"forced"),
+    )
+
+    tie_map = build_tie_map(genotype_matrix, variant_records, ModelConfig())
+
+    assert tie_map.kept_indices.tolist() == [0, 1]
+    assert tie_map.original_to_reduced.tolist() == [0, 1]
+
+
+def test_select_active_variant_indices_filters_low_support_structural_variants():
     variant_records = [
         VariantRecord("sv_0", VariantClass.DELETION_SHORT, "1", 100, training_support=1),
         VariantRecord("sv_1", VariantClass.DELETION_SHORT, "1", 101, training_support=5),
         VariantRecord("snp_2", VariantClass.SNV, "1", 102),
     ]
-    support_counts = np.array([1, 5, 100], dtype=np.int32)
 
     result = select_active_variant_indices(
         variant_records=variant_records,
-        support_counts=support_counts,
-        config=ModelConfig(minimum_structural_variant_carriers=2),
+        config=ModelConfig(),
     )
-    # sv_0 has support=1 < min_carriers=2 → filtered
-    # sv_1 has support=5 >= 2 → kept
-    # snp_2 is SNV → always kept
-    assert sorted(result.tolist()) == [1, 2]
-
-
-def test_select_active_variant_indices_applies_class_aware_score_screening():
-    variant_records = [
-        VariantRecord("snv_chr1_low", VariantClass.SNV, "1", 100),
-        VariantRecord("snv_chr1_high", VariantClass.SNV, "1", 101),
-        VariantRecord("snv_chr2_high", VariantClass.SNV, "2", 200),
-        VariantRecord("del_low", VariantClass.DELETION_SHORT, "1", 300, training_support=3),
-        VariantRecord("del_high_support", VariantClass.DELETION_SHORT, "1", 301, training_support=12),
-        VariantRecord("dup_top", VariantClass.DUPLICATION_SHORT, "1", 302, training_support=4),
-        VariantRecord("dup_low", VariantClass.DUPLICATION_SHORT, "1", 303, training_support=4),
-    ]
-    support_counts = np.array([100, 100, 80, 3, 12, 4, 4], dtype=np.int32)
-    marginal_scores = np.array([1.0, 5.0, 4.0, 2.0, 0.2, 3.0, 1.5], dtype=np.float64)
-
-    result = select_active_variant_indices(
-        variant_records=variant_records,
-        support_counts=support_counts,
-        config=ModelConfig(
-            minimum_structural_variant_carriers=2,
-            screen_max_small_variants_per_chromosome=1,
-            screen_max_structural_variants_per_class=1,
-            screen_always_keep_structural_variants_above_support=10,
-        ),
-        marginal_scores=marginal_scores,
-    )
-
-    assert sorted(result.tolist()) == [1, 2, 3, 4, 5]
+    assert result.tolist() == [1, 2]
 
 
 def test_fit_preprocessor_matches_streaming_variant_statistics_with_missing_values():

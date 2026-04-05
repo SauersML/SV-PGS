@@ -108,12 +108,12 @@ class BayesianPGS:
         log("creating standardized genotype view...")
         standardized_genotypes = raw_genotype_matrix.standardized(prepared_arrays.means, prepared_arrays.scales)
 
-        log("selecting active variant indices (filtering low-carrier SVs)...")
+        log("selecting active variant indices...")
         active_variant_indices = select_active_variant_indices(
             variant_records=normalized_records,
-            support_counts=variant_stats.support_counts if variant_stats is not None else _compute_support_counts(raw_genotype_matrix, normalized_records, self.config),
+            support_counts=variant_stats.support_counts,
             config=self.config,
-            marginal_scores=None if variant_stats is None else variant_stats.marginal_scores,
+            marginal_scores=variant_stats.marginal_scores,
         )
         log(f"active variants: {len(active_variant_indices)} / {len(normalized_records)} ({100.0*len(active_variant_indices)/max(len(normalized_records),1):.1f}%)")
         active_records = [normalized_records[int(variant_index)] for variant_index in active_variant_indices]
@@ -121,10 +121,21 @@ class BayesianPGS:
 
         if active_variant_indices.shape[0] > self.config.maximum_tie_map_variants:
             log(
-                f"skipping tie map for {active_variant_indices.shape[0]} active variants "
+                "skipping tie map because active variant count exceeds limit "
                 f"(limit={self.config.maximum_tie_map_variants}); using identity mapping"
             )
-            reduced_tie_map = _identity_tie_map(active_variant_indices.shape[0])
+            reduced_tie_map = TieMap(
+                kept_indices=np.arange(active_variant_indices.shape[0], dtype=np.int32),
+                original_to_reduced=np.arange(active_variant_indices.shape[0], dtype=np.int32),
+                reduced_to_group=[
+                    TieGroup(
+                        representative_index=int(active_index),
+                        member_indices=np.asarray([active_index], dtype=np.int32),
+                        signs=np.asarray([1.0], dtype=np.float32),
+                    )
+                    for active_index in range(active_variant_indices.shape[0])
+                ],
+            )
         else:
             log("building tie map (detecting identical/negated genotype columns)...")
             reduced_tie_map = build_tie_map(active_genotypes, active_records, self.config)
