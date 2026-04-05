@@ -405,6 +405,18 @@ def run_all_of_us(
         for chrom in chromosomes:
             vcf_paths.append(download_sv_vcf(chrom, work_dir))
 
+        log("=== STEP 3.5: Parallel VCF precache ===")
+        from sv_pgs.io import precache_vcfs_parallel, _read_vcf_sample_ids
+        # Get sample indices for the first VCF (all VCFs have the same samples)
+        all_sample_ids = _read_vcf_sample_ids(vcf_paths[0])
+        # Read the sample table to find which sample IDs to keep
+        import pandas as pd
+        sample_table_df = pd.read_csv(str(merged_path), sep="\t", dtype={"sample_id": str})
+        keep_ids = set(sample_table_df["sample_id"].dropna().astype(str))
+        keep_indices = np.array([i for i, sid in enumerate(all_sample_ids) if sid in keep_ids], dtype=np.intp)
+        log(f"  {len(keep_indices)} of {len(all_sample_ids)} samples matched")
+        precache_vcfs_parallel(vcf_paths, keep_indices)
+
         log("=== STEP 4: Load unified genome-wide dataset ===")
         dataset = load_multi_vcf_dataset_from_files(
             genotype_paths=vcf_paths,

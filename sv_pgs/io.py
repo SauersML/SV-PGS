@@ -650,6 +650,50 @@ def _read_vcf_sample_ids(vcf_path: Path) -> list[str]:
 _INCREMENTAL_CHECKPOINT_INTERVAL = 5000  # variants between disk flushes
 
 
+def precache_vcfs_parallel(
+    vcf_paths: list[Path],
+    keep_sample_indices: np.ndarray,
+    max_workers: int | None = None,
+) -> None:
+    """Parse and cache multiple VCFs in parallel. Each VCF is parsed in a
+    separate process, writing its own incremental cache. Already-cached VCFs
+    are skipped. After this returns, all VCFs can be loaded from cache instantly.
+    """
+    import multiprocessing
+    import os
+
+    if max_workers is None:
+        max_workers = min(os.cpu_count() or 4, len(vcf_paths))
+
+    # Filter to only uncached VCFs
+    uncached: list[Path] = []
+    for vcf_path in vcf_paths:
+        cache_dir = _vcf_cache_dir(vcf_path)
+        key = _vcf_cache_key(vcf_path, keep_sample_indices)
+        geno_path = cache_dir / f"{key}.genotypes.npy"
+        if not geno_path.exists():
+            uncached.append(vcf_path)
+
+    if not uncached:
+        log(f"all {len(vcf_paths)} VCFs already cached")
+        return
+
+    log(f"parallel VCF precache: {len(uncached)} uncached of {len(vcf_paths)} total, {max_workers} workers")
+
+    # Each worker parses one VCF and writes the cache
+    def _worker(vcf_path_str: str) -> str:
+        vcf_path = Path(vcf_path_str)
+        _load_vcf_with_cache(vcf_path, keep_sample_indices, mmap_mode="r")
+        return f"done: {vcf_path.name}"
+
+    # Use spawn context to avoid fork issues with CUDA/JAX
+    ctx = multiprocessing.get_context("spawn")
+    with ctx.Pool(processes=max_workers) as pool:
+        results = pool.imap_unordered(_worker, [str(p) for p in uncached])
+        for result in results:
+            log(f"  {result}")
+
+
 def _load_vcf_with_cache(
     vcf_path: Path,
     keep_sample_indices: np.ndarray,
