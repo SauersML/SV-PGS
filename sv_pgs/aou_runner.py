@@ -481,7 +481,6 @@ def run_all_of_us(
         # Get sample indices for the first VCF (all VCFs have the same samples)
         all_sample_ids = _read_vcf_sample_ids(vcf_paths[0])
         # Read the sample table to find which sample IDs to keep
-        import pandas as pd
         sample_table_df = pd.read_csv(str(merged_path), sep="\t", dtype={"sample_id": str})
         keep_ids = set(sample_table_df["sample_id"].dropna().astype(str))
         keep_indices = np.array([i for i, sid in enumerate(all_sample_ids) if sid in keep_ids], dtype=np.intp)
