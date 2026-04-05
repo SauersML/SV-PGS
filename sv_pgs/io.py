@@ -1039,20 +1039,15 @@ def _load_vcf_incremental(
                 quality=d["quality"],
             ))
 
-    # Load stats and compute final statistics
-    import struct
-    stats_raw = open(stats_bin, "rb").read()
-    n_stats = len(stats_raw) // 24
-    col_sums = np.empty(n_stats, dtype=np.int64)
-    col_sum_sq = np.empty(n_stats, dtype=np.int64)
-    n_valid_arr = np.empty(n_stats, dtype=np.int32)
-    support_arr = np.empty(n_stats, dtype=np.int32)
-    for i in range(n_stats):
-        s, sq, nv, sp = struct.unpack_from("<qqii", stats_raw, i * 24)
-        col_sums[i] = s
-        col_sum_sq[i] = sq
-        n_valid_arr[i] = nv
-        support_arr[i] = sp
+    # Load stats via numpy structured dtype — no Python loop
+    stats_dtype = np.dtype([
+        ("sum", "<i8"), ("sum_sq", "<i8"), ("n_valid", "<i4"), ("support", "<i4"),
+    ])
+    stats_arr = np.fromfile(str(stats_bin), dtype=stats_dtype, count=n_total)
+    col_sums = stats_arr["sum"]
+    col_sum_sq = stats_arr["sum_sq"]
+    n_valid_arr = stats_arr["n_valid"]
+    support_arr = stats_arr["support"]
 
     safe_n_valid = np.maximum(n_valid_arr.astype(np.int64), 1).astype(np.float64)
     means_arr = (col_sums / safe_n_valid).astype(np.float32)
