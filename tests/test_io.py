@@ -86,6 +86,7 @@ def test_load_dataset_from_vcf_uses_metadata_and_sample_alignment(tmp_path: Path
     )
 
     assert dataset.sample_ids == ["s1", "s2"]
+    assert isinstance(dataset.genotypes.matrix, np.memmap)
     np.testing.assert_allclose(dataset.genotypes, np.array([[2.0, 1.0], [1.0, 0.0]], dtype=np.float32))
     np.testing.assert_allclose(dataset.covariates, np.array([[42.0], [35.0]], dtype=np.float32))
     np.testing.assert_allclose(dataset.targets, np.array([1.0, 0.0], dtype=np.float32))
@@ -430,6 +431,7 @@ def test_vcf_cache_save_uses_real_temp_file_and_roundtrips(tmp_path: Path):
 
     assert cached is not None
     cached_genotypes, cached_variants, cached_variant_stats = cached
+    assert isinstance(cached_genotypes, np.memmap)
     np.testing.assert_array_equal(cached_genotypes, genotype_matrix)
     assert cached_genotypes.flags.f_contiguous
     assert not cached_genotypes.flags.c_contiguous
@@ -476,6 +478,7 @@ def test_vcf_cache_load_upgrades_legacy_row_major_matrix(tmp_path: Path):
 
     assert cached is not None
     cached_genotypes, _, _ = cached
+    assert isinstance(cached_genotypes, np.memmap)
     np.testing.assert_array_equal(cached_genotypes, genotype_matrix)
     assert cached_genotypes.flags.f_contiguous
 
@@ -483,6 +486,7 @@ def test_vcf_cache_load_upgrades_legacy_row_major_matrix(tmp_path: Path):
 
     assert reloaded is not None
     reloaded_genotypes, _, _ = reloaded
+    assert isinstance(reloaded_genotypes, np.memmap)
     np.testing.assert_array_equal(reloaded_genotypes, genotype_matrix)
     assert reloaded_genotypes.flags.f_contiguous
 

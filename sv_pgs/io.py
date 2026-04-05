@@ -309,7 +309,7 @@ def load_dataset_from_files(
         genotype_matrix, default_variants, variant_stats = _load_vcf_with_cache(
             source_path,
             keep_sample_indices=keep_indices,
-            mmap_mode=None,
+            mmap_mode="r",
         )
 
         log(f"VCF loaded: {genotype_matrix.shape[0]} samples x {len(default_variants)} variants  mem={mem()}")
@@ -784,7 +784,8 @@ def _load_vcf_from_cache(
 
     try:
         log(f"VCF cache hit — loading from {cache_dir.name}/{key}.*")
-        genotype_matrix = np.load(geno_path, mmap_mode=mmap_mode)
+        effective_mmap_mode = "r" if mmap_mode is None else mmap_mode
+        genotype_matrix = np.load(geno_path, mmap_mode=effective_mmap_mode)
         with open(var_path, "rb") as f:
             variants = pickle.load(f)
         stats_payload = np.load(stats_path)
@@ -794,12 +795,6 @@ def _load_vcf_from_cache(
             allele_frequencies=np.asarray(stats_payload["allele_frequencies"], dtype=np.float32),
             support_counts=np.asarray(stats_payload["support_counts"], dtype=np.int32),
         )
-        if not genotype_matrix.flags.f_contiguous:
-            log("  cache matrix uses legacy row-major layout; rewriting cache entry in column-major order")
-            genotype_matrix = np.asfortranarray(np.asarray(genotype_matrix, dtype=np.int8))
-            _save_vcf_to_cache(vcf_path, keep_sample_indices, genotype_matrix, variants, variant_stats)
-            if mmap_mode is not None:
-                genotype_matrix = np.load(geno_path, mmap_mode=mmap_mode)
         log(f"  cached matrix {genotype_matrix.shape}, {len(variants)} variants")
         return genotype_matrix, variants, variant_stats
     except Exception as exc:
@@ -824,11 +819,12 @@ def _load_vcf_with_cache(
     *,
     mmap_mode: str | None,
 ) -> tuple[np.ndarray, list[_VariantDefaults], VariantStatistics]:
+    effective_mmap_mode = "r" if mmap_mode is None else mmap_mode
     # Check for completed cache first
     cached = _load_vcf_from_cache(
         vcf_path,
         keep_sample_indices=keep_sample_indices,
-        mmap_mode=mmap_mode,
+        mmap_mode=effective_mmap_mode,
     )
     if cached is not None:
         return cached
@@ -838,13 +834,8 @@ def _load_vcf_with_cache(
     cache_dir.mkdir(parents=True, exist_ok=True)
     key = _vcf_cache_key(vcf_path, keep_sample_indices)
     genotype_matrix, variants, variant_stats = _load_vcf_incremental(
-        vcf_path, keep_sample_indices, cache_dir, key,
+        vcf_path, keep_sample_indices, cache_dir, key, mmap_mode=effective_mmap_mode,
     )
-    _save_vcf_to_cache(vcf_path, keep_sample_indices, genotype_matrix, variants, variant_stats)
-    if mmap_mode is not None:
-        cached = _load_vcf_from_cache(vcf_path, keep_sample_indices=keep_sample_indices, mmap_mode=mmap_mode)
-        if cached is not None:
-            return cached
     return genotype_matrix, variants, variant_stats
 
 
@@ -853,13 +844,17 @@ def _load_vcf_incremental(
     keep_sample_indices: np.ndarray | None,
     cache_dir: Path,
     key: str,
+    *,
+    mmap_mode: str,
 ) -> tuple[np.ndarray, list[_VariantDefaults], VariantStatistics]:
     """Parse VCF with incremental checkpointing. Resumes from last checkpoint if interrupted."""
-    import time
-    import os
     import json as _json
+    import os
+    import struct
+    import time
 
-    n_all_samples = len(_open_vcf_reader(vcf_path).samples)
+    reader = _open_vcf_reader(vcf_path)
+    n_all_samples = len(reader.samples)
     n_keep = len(keep_sample_indices) if keep_sample_indices is not None else n_all_samples
 
     # Incremental files
@@ -878,11 +873,19 @@ def _load_vcf_incremental(
             n_cached = int(prog["n_variants"])
             resume_chrom = prog.get("resume_chrom")
             resume_pos = int(prog.get("resume_pos", 0))
-            # Truncate files to exact checkpoint (guard against partial writes)
+            # Truncate ALL incremental files to exact checkpoint (guard against partial writes)
             expected_geno_bytes = n_cached * n_keep
+            expected_stats_bytes = n_cached * 24  # struct "<qqii" = 24 bytes
             if geno_bin.exists() and geno_bin.stat().st_size > expected_geno_bytes:
                 with open(geno_bin, "r+b") as f:
                     f.truncate(expected_geno_bytes)
+            if stats_bin.exists() and stats_bin.stat().st_size > expected_stats_bytes:
+                with open(stats_bin, "r+b") as f:
+                    f.truncate(expected_stats_bytes)
+            if var_jsonl.exists():
+                # Truncate JSONL to exactly n_cached lines
+                lines = var_jsonl.read_text().splitlines()[:n_cached]
+                var_jsonl.write_text("\n".join(lines) + "\n" if lines else "")
             log(f"  incremental cache: resuming from {n_cached} variants (last pos: {resume_chrom}:{resume_pos})")
         except Exception as exc:
             log(f"  incremental cache progress corrupt ({exc}), starting fresh")
@@ -893,8 +896,7 @@ def _load_vcf_incremental(
                 except Exception:
                     pass
 
-    # Open VCF
-    reader = _open_vcf_reader(vcf_path)
+    # Reuse the reader opened above for sample IDs
     n_threads = os.cpu_count() or 4
     reader.set_threads(n_threads)
     log(f"  VCF decompression threads: {n_threads}")
@@ -962,7 +964,6 @@ def _load_vcf_incremental(
         support = int(np.count_nonzero(observed > 0))
 
         # Write stats (fixed 24 bytes per variant)
-        import struct
         stats_fh.write(struct.pack("<qqii", dosage_sum, dosage_sum_sq, n_valid, support))
 
         # Write variant metadata
@@ -1022,12 +1023,6 @@ def _load_vcf_incremental(
     new_variants = n_total - n_cached
     log(f"  parsed {new_variants} new variants in {elapsed:.1f}s ({n_total} total)")
 
-    # Load the complete matrix from the incremental file — zero-copy transpose
-    log(f"  loading incremental cache ({n_total} variants x {n_keep} samples)...")
-    raw = np.fromfile(str(geno_bin), dtype=np.int8)
-    genotype_matrix = raw.reshape(n_total, n_keep).T  # Fortran-order view, no copy
-    genotype_matrix = np.asfortranarray(genotype_matrix)  # ensure proper Fortran layout
-
     # Load variant metadata
     import json as _json2
     variants: list[_VariantDefaults] = []
@@ -1073,13 +1068,37 @@ def _load_vcf_incremental(
         support_counts=support_arr,
     )
 
-    # Clean up incremental files (final cache will be saved by caller)
+    log(f"  finalizing disk-backed VCF cache ({n_keep} samples x {n_total} variants)...")
+    incremental_matrix = np.memmap(
+        geno_bin,
+        dtype=np.int8,
+        mode="r",
+        shape=(n_total, n_keep),
+    ).T
+    _save_vcf_to_cache(
+        vcf_path=vcf_path,
+        keep_sample_indices=keep_sample_indices,
+        genotype_matrix=incremental_matrix,
+        variants=variants,
+        variant_stats=variant_stats,
+    )
+    del incremental_matrix
+
+    # Clean up incremental files after the final cache is complete.
     for p in (geno_bin, var_jsonl, stats_bin, progress_file):
         try:
             p.unlink(missing_ok=True)
         except Exception:
             pass
 
+    cached = _load_vcf_from_cache(
+        vcf_path=vcf_path,
+        keep_sample_indices=keep_sample_indices,
+        mmap_mode=mmap_mode,
+    )
+    if cached is None:
+        raise RuntimeError("VCF cache finalization failed.")
+    genotype_matrix, _, _ = cached
     log(f"  incremental parse complete: {genotype_matrix.shape}  mem={mem()}")
     return genotype_matrix, variants, variant_stats
 
@@ -1110,10 +1129,21 @@ def _save_vcf_to_cache(
 
     try:
         cache_dir.mkdir(parents=True, exist_ok=True)
-        # Write to temp files first, then atomically rename to avoid
-        # corrupt cache entries if the process is killed mid-write.
-        with open(geno_tmp, "wb") as geno_handle:
-            np.save(geno_handle, genotype_matrix)
+        genotype_matrix_i8 = genotype_matrix if np.asarray(genotype_matrix).dtype == np.int8 else np.asarray(genotype_matrix, dtype=np.int8)
+        sample_count, variant_count = genotype_matrix_i8.shape
+        copy_batch_size = max(1, min(variant_count, 500_000_000 // max(sample_count, 1)))
+        genotype_memmap = np.lib.format.open_memmap(
+            geno_tmp,
+            mode="w+",
+            dtype=np.int8,
+            shape=(sample_count, variant_count),
+            fortran_order=True,
+        )
+        for start_index in range(0, variant_count, copy_batch_size):
+            stop_index = min(start_index + copy_batch_size, variant_count)
+            genotype_memmap[:, start_index:stop_index] = genotype_matrix_i8[:, start_index:stop_index]
+        genotype_memmap.flush()
+        del genotype_memmap
         with open(str(var_tmp), "wb") as f:
             pickle.dump(variants, f, protocol=pickle.HIGHEST_PROTOCOL)
         with open(stats_tmp, "wb") as stats_handle:
