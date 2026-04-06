@@ -251,69 +251,6 @@ def select_active_variant_indices(
         + f"(min_maf={config.minimum_minor_allele_frequency:.6f})"
     )
     return maf_kept
-
-
-def _top_scoring_variant_indices(
-    variant_indices: np.ndarray,
-    scores: np.ndarray,
-    maximum_count: int,
-) -> np.ndarray:
-    resolved_indices = np.asarray(variant_indices, dtype=np.int32)
-    resolved_scores = np.asarray(scores, dtype=np.float64)
-    if maximum_count <= 0 or resolved_indices.shape[0] == 0:
-        return np.zeros(0, dtype=np.int32)
-    if resolved_indices.shape[0] <= maximum_count:
-        return resolved_indices
-    top_order = np.argpartition(-resolved_scores, maximum_count - 1)[:maximum_count]
-    return resolved_indices[np.asarray(top_order, dtype=np.intp)]
-
-
-def _covariate_adjusted_marginal_scores(
-    standardized_genotypes: StandardizedGenotypeMatrix | np.ndarray,
-    covariates: np.ndarray,
-    targets: np.ndarray,
-    trait_type: TraitType,
-) -> np.ndarray:
-    genotype_matrix = _as_standardized_genotypes(standardized_genotypes)
-    covariate_matrix = np.asarray(covariates, dtype=np.float64)
-    target_array = np.asarray(targets, dtype=np.float64).reshape(-1)
-    if covariate_matrix.ndim != 2:
-        raise ValueError("covariates must be 2D.")
-    if covariate_matrix.shape[0] != genotype_matrix.shape[0]:
-        raise ValueError("covariates sample count must match standardized_genotypes.")
-    if target_array.shape[0] != genotype_matrix.shape[0]:
-        raise ValueError("targets sample count must match standardized_genotypes.")
-
-    residual_targets = _screening_target_residuals(
-        covariate_matrix=covariate_matrix,
-        targets=target_array,
-        trait_type=trait_type,
-    )
-    q_matrix = _orthonormal_covariate_basis(covariate_matrix)
-    scores = np.zeros(genotype_matrix.shape[1], dtype=np.float64)
-    for batch in genotype_matrix.iter_column_batches(batch_size=auto_batch_size(genotype_matrix.shape[0])):
-        batch_values = np.asarray(batch.values, dtype=np.float64)
-        adjusted_batch = _project_out_covariates(batch_values, q_matrix)
-        numerator = adjusted_batch.T @ residual_targets
-        denominator = np.sqrt(np.maximum(np.sum(adjusted_batch * adjusted_batch, axis=0), 1e-12))
-        scores[batch.variant_indices] = np.abs(numerator) / denominator
-    return scores.astype(np.float32, copy=False)
-
-
-def _screening_target_residuals(
-    covariate_matrix: np.ndarray,
-    targets: np.ndarray,
-    trait_type: TraitType,
-) -> np.ndarray:
-    if trait_type == TraitType.BINARY:
-        fitted_alpha = _fit_logistic_covariates_only(covariate_matrix, targets)
-        linear_predictor = covariate_matrix @ fitted_alpha
-        probabilities = 1.0 / (1.0 + np.exp(-np.clip(linear_predictor, -60.0, 60.0)))
-        return np.asarray(targets - probabilities, dtype=np.float64)
-    fitted_alpha, *_ = np.linalg.lstsq(covariate_matrix, targets, rcond=None)
-    return np.asarray(targets - covariate_matrix @ fitted_alpha, dtype=np.float64)
-
-
 def _orthonormal_covariate_basis(covariate_matrix: np.ndarray) -> np.ndarray:
     if covariate_matrix.shape[1] == 0:
         return np.empty((covariate_matrix.shape[0], 0), dtype=np.float64)
