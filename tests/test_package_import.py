@@ -24,7 +24,7 @@ def test_import_sv_pgs_exports_symbols_directly():
                 "'sv_pgs.model': 'sv_pgs.model' in sys.modules, "
                 "'BayesianPGS': hasattr(sv_pgs, 'BayesianPGS'), "
                 "'run_training_pipeline': hasattr(sv_pgs, 'run_training_pipeline'), "
-                "'AllOfUsDiseaseRequest': hasattr(sv_pgs, 'AllOfUsDiseaseRequest')"
+                "'AllOfUsDiseaseRequest': 'AllOfUsDiseaseRequest' in sv_pgs.__dict__"
                 "}))"
             ),
         ],
@@ -68,7 +68,8 @@ def test_import_sv_pgs_succeeds_without_bigquery():
 
                 print(json.dumps({
                     "BayesianPGS": hasattr(sv_pgs, "BayesianPGS"),
-                    "AllOfUsDiseaseRequest": hasattr(sv_pgs, "AllOfUsDiseaseRequest"),
+                    "sv_pgs.all_of_us": "sv_pgs.all_of_us" in __import__("sys").modules,
+                    "AllOfUsDiseaseRequest": "AllOfUsDiseaseRequest" in sv_pgs.__dict__,
                 }))
                 """
             ),
@@ -81,6 +82,7 @@ def test_import_sv_pgs_succeeds_without_bigquery():
     loaded_symbols = json.loads(completed.stdout.strip())
     assert loaded_symbols == {
         "BayesianPGS": True,
+        "sv_pgs.all_of_us": False,
         "AllOfUsDiseaseRequest": False,
     }
 

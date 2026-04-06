@@ -93,6 +93,75 @@ def test_binary_inference_runs(random_generator):
     assert len(result.class_tpb_shape_b) == 1
 
 
+def test_quantitative_inference_runs_with_stochastic_variant_updates(random_generator):
+    sample_count, variant_count = 64, 12
+    genotype_matrix = random_generator.standard_normal((sample_count, variant_count)).astype(np.float32)
+    covariate_matrix = np.column_stack(
+        [np.ones(sample_count, dtype=np.float32), random_generator.standard_normal(sample_count).astype(np.float32)]
+    )
+    true_coefficients = np.zeros(variant_count, dtype=np.float32)
+    true_coefficients[:2] = np.array([1.1, -0.8], dtype=np.float32)
+    target_vector = genotype_matrix @ true_coefficients + 0.2 * random_generator.standard_normal(sample_count).astype(np.float32)
+    records = make_variant_records(variant_count)
+    config = ModelConfig(
+        trait_type=TraitType.QUANTITATIVE,
+        max_outer_iterations=3,
+        update_hyperparameters=False,
+        stochastic_variational_updates=True,
+        stochastic_min_variant_count=1,
+        stochastic_variant_batch_size=4,
+    )
+
+    result = fit_variational_em(
+        genotypes=genotype_matrix,
+        covariates=covariate_matrix,
+        targets=target_vector,
+        records=records,
+        config=config,
+        tie_map=build_tie_map(genotype_matrix, records, config),
+    )
+
+    assert result.objective_history
+    assert np.all(np.isfinite(result.alpha))
+    assert np.all(np.isfinite(result.beta_reduced))
+    assert float(np.linalg.norm(result.beta_reduced)) > 0.0
+
+
+def test_binary_inference_runs_with_stochastic_variant_updates(random_generator):
+    sample_count, variant_count = 72, 10
+    genotype_matrix = random_generator.standard_normal((sample_count, variant_count)).astype(np.float32)
+    covariate_matrix = np.column_stack(
+        [np.ones(sample_count, dtype=np.float32), random_generator.standard_normal(sample_count).astype(np.float32)]
+    )
+    true_coefficients = np.zeros(variant_count, dtype=np.float32)
+    true_coefficients[0] = 1.25
+    linear_predictor = genotype_matrix @ true_coefficients + 0.3 * covariate_matrix[:, 1]
+    target_vector = (random_generator.random(sample_count) < (1.0 / (1.0 + np.exp(-linear_predictor)))).astype(np.float32)
+    records = make_variant_records(variant_count)
+    config = ModelConfig(
+        trait_type=TraitType.BINARY,
+        max_outer_iterations=3,
+        update_hyperparameters=False,
+        stochastic_variational_updates=True,
+        stochastic_min_variant_count=1,
+        stochastic_variant_batch_size=3,
+    )
+
+    result = fit_variational_em(
+        genotypes=genotype_matrix,
+        covariates=covariate_matrix,
+        targets=target_vector,
+        records=records,
+        config=config,
+        tie_map=build_tie_map(genotype_matrix, records, config),
+    )
+
+    assert result.objective_history
+    assert np.all(np.isfinite(result.alpha))
+    assert np.all(np.isfinite(result.beta_reduced))
+    assert result.sigma_error2 == 1.0
+
+
 def test_fit_variational_em_ignores_incompatible_resume_checkpoint(random_generator):
     sample_count, variant_count = 24, 5
     genotype_matrix = random_generator.normal(size=(sample_count, variant_count)).astype(np.float32)
@@ -1200,6 +1269,7 @@ def test_gpu_sample_space_solver_retries_in_float64_after_mixed_precision_stalls
             return np.zeros_like(rhs, dtype=np.float64)
         return np.linalg.solve(covariance_matrix, rhs)
 
+    monkeypatch.setitem(sys.modules, "cupy", fake_cupy)
     monkeypatch.setattr(mixture_inference, "_try_import_cupy", lambda: fake_cupy)
     monkeypatch.setattr(mixture_inference, "_cupy_compute_dtype", lambda cp: cp.float32)
     monkeypatch.setattr(mixture_inference, "_solve_sample_space_rhs_gpu_inner", fake_inner)

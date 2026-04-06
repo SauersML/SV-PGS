@@ -349,6 +349,7 @@ def test_load_dataset_from_gzipped_vcf(tmp_path: Path):
 
     dataset = load_dataset_from_files(
         genotype_path=vcf_path,
+        config=ModelConfig(),
         genotype_format="vcf",
         sample_table_path=sample_table_path,
         sample_id_column="sample_id",
@@ -393,6 +394,7 @@ def test_load_dataset_from_vcf_uses_record_count_hint_for_direct_preallocation(
 
     dataset = load_dataset_from_files(
         genotype_path=vcf_path,
+        config=ModelConfig(),
         genotype_format="vcf",
         sample_table_path=sample_table_path,
         sample_id_column="sample_id",
@@ -410,6 +412,7 @@ def test_vcf_cache_save_uses_real_temp_file_and_roundtrips(tmp_path: Path):
     vcf_path = tmp_path / "cohort.vcf"
     vcf_path.write_text("##fileformat=VCFv4.2\n", encoding="utf-8")
     keep_sample_indices = np.array([0, 2], dtype=np.int32)
+    config = ModelConfig()
     genotype_matrix = np.array([[0, 1], [1, 2]], dtype=np.int8, order="F")
     variants = [
         _VariantDefaults(
@@ -435,9 +438,10 @@ def test_vcf_cache_save_uses_real_temp_file_and_roundtrips(tmp_path: Path):
         genotype_matrix=genotype_matrix,
         variants=variants,
         variant_stats=variant_stats,
+        config=config,
     )
 
-    cached = _load_vcf_from_cache(vcf_path=vcf_path, keep_sample_indices=keep_sample_indices)
+    cached = _load_vcf_from_cache(vcf_path=vcf_path, keep_sample_indices=keep_sample_indices, config=config)
 
     assert cached is not None
     cached_genotypes, cached_variants, cached_variant_stats = cached
@@ -457,6 +461,7 @@ def test_vcf_cache_save_uses_real_temp_file_and_roundtrips(tmp_path: Path):
 def test_vcf_cache_load_upgrades_legacy_row_major_matrix(tmp_path: Path):
     vcf_path = tmp_path / "cohort.vcf"
     vcf_path.write_text("##fileformat=VCFv4.2\n", encoding="utf-8")
+    config = ModelConfig()
     genotype_matrix = np.array([[0, 1], [1, 2]], dtype=np.int8, order="C")
     variants = [
         _VariantDefaults(
@@ -482,9 +487,10 @@ def test_vcf_cache_load_upgrades_legacy_row_major_matrix(tmp_path: Path):
         genotype_matrix=genotype_matrix,
         variants=variants,
         variant_stats=variant_stats,
+        config=config,
     )
 
-    cached = _load_vcf_from_cache(vcf_path=vcf_path, keep_sample_indices=None)
+    cached = _load_vcf_from_cache(vcf_path=vcf_path, keep_sample_indices=None, config=config)
 
     assert cached is not None
     cached_genotypes, _, _ = cached
@@ -492,7 +498,7 @@ def test_vcf_cache_load_upgrades_legacy_row_major_matrix(tmp_path: Path):
     np.testing.assert_array_equal(cached_genotypes, genotype_matrix)
     assert cached_genotypes.flags.f_contiguous
 
-    reloaded = _load_vcf_from_cache(vcf_path=vcf_path, keep_sample_indices=None)
+    reloaded = _load_vcf_from_cache(vcf_path=vcf_path, keep_sample_indices=None, config=config)
 
     assert reloaded is not None
     reloaded_genotypes, _, _ = reloaded
@@ -505,12 +511,13 @@ def test_vcf_cache_key_ignores_mtime_for_identical_content(tmp_path: Path):
     vcf_path = tmp_path / "cohort.vcf.gz"
     vcf_path.write_bytes(b"header\nbody\ntrailer\n")
     keep_sample_indices = np.array([0, 2], dtype=np.int32)
+    config = ModelConfig()
 
-    first_key = _vcf_cache_key(vcf_path, keep_sample_indices)
+    first_key = _vcf_cache_key(vcf_path, keep_sample_indices, config)
     original_mtime = vcf_path.stat().st_mtime_ns
     new_mtime = original_mtime + 1_000_000
     os.utime(vcf_path, ns=(new_mtime, new_mtime))
-    second_key = _vcf_cache_key(vcf_path, keep_sample_indices)
+    second_key = _vcf_cache_key(vcf_path, keep_sample_indices, config)
 
     assert first_key == second_key
 
@@ -519,10 +526,22 @@ def test_vcf_cache_key_changes_when_content_changes(tmp_path: Path):
     vcf_path = tmp_path / "cohort.vcf.gz"
     vcf_path.write_bytes(b"header\nbody\ntrailer\n")
     keep_sample_indices = np.array([0, 2], dtype=np.int32)
+    config = ModelConfig()
 
-    first_key = _vcf_cache_key(vcf_path, keep_sample_indices)
+    first_key = _vcf_cache_key(vcf_path, keep_sample_indices, config)
     vcf_path.write_bytes(b"header\nchanged-body\ntrailer\n")
-    second_key = _vcf_cache_key(vcf_path, keep_sample_indices)
+    second_key = _vcf_cache_key(vcf_path, keep_sample_indices, config)
+
+    assert first_key != second_key
+
+
+def test_vcf_cache_key_changes_when_minimum_scale_changes(tmp_path: Path):
+    vcf_path = tmp_path / "cohort.vcf.gz"
+    vcf_path.write_bytes(b"header\nbody\ntrailer\n")
+    keep_sample_indices = np.array([0, 2], dtype=np.int32)
+
+    first_key = _vcf_cache_key(vcf_path, keep_sample_indices, ModelConfig(minimum_scale=1e-6))
+    second_key = _vcf_cache_key(vcf_path, keep_sample_indices, ModelConfig(minimum_scale=0.25))
 
     assert first_key != second_key
 
@@ -531,7 +550,8 @@ def test_vcf_cache_load_upgrades_legacy_stats_bundle_to_manifest(tmp_path: Path)
     vcf_path = tmp_path / "cohort.vcf"
     vcf_path.write_text("##fileformat=VCFv4.2\n", encoding="utf-8")
     keep_sample_indices = np.array([0, 2], dtype=np.int32)
-    key = _vcf_cache_key(vcf_path, keep_sample_indices)
+    config = ModelConfig()
+    key = _vcf_cache_key(vcf_path, keep_sample_indices, config)
     cache_dir = tmp_path / ".sv_pgs_cache"
     cache_dir.mkdir()
 
@@ -570,7 +590,7 @@ def test_vcf_cache_load_upgrades_legacy_stats_bundle_to_manifest(tmp_path: Path)
         support_counts=np.array([1, 2], dtype=np.int32),
     )
 
-    cached = _load_vcf_from_cache(vcf_path=vcf_path, keep_sample_indices=keep_sample_indices)
+    cached = _load_vcf_from_cache(vcf_path=vcf_path, keep_sample_indices=keep_sample_indices, config=config)
 
     assert cached is not None
     cached_genotypes, _, cached_variant_stats = cached
@@ -585,7 +605,8 @@ def test_vcf_cache_load_upgrades_legacy_stats_bundle_to_manifest(tmp_path: Path)
 def test_vcf_cache_load_ignores_incomplete_manifestless_new_bundle(tmp_path: Path):
     vcf_path = tmp_path / "cohort.vcf"
     vcf_path.write_text("##fileformat=VCFv4.2\n", encoding="utf-8")
-    key = _vcf_cache_key(vcf_path, None)
+    config = ModelConfig()
+    key = _vcf_cache_key(vcf_path, None, config)
     cache_dir = tmp_path / ".sv_pgs_cache"
     cache_dir.mkdir()
 
@@ -602,7 +623,7 @@ def test_vcf_cache_load_ignores_incomplete_manifestless_new_bundle(tmp_path: Pat
     )
     np.save(cache_dir / f"{key}.stats.npy", np.zeros(1, dtype=stats_dtype), allow_pickle=False)
 
-    assert _load_vcf_from_cache(vcf_path=vcf_path, keep_sample_indices=None) is None
+    assert _load_vcf_from_cache(vcf_path=vcf_path, keep_sample_indices=None, config=config) is None
 
 
 def test_prepare_keep_sample_selector_collapses_full_and_contiguous_ranges():
@@ -637,9 +658,10 @@ def test_precache_vcfs_parallel_reuses_completed_region_outputs(monkeypatch: pyt
     vcf_path = tmp_path / "chr1.vcf.gz"
     vcf_path.write_bytes(b"vcf")
     keep_sample_indices = np.array([0, 1], dtype=np.intp)
+    config = ModelConfig(minimum_scale=0.2)
     cache_dir = io_module._vcf_cache_dir(vcf_path)
     cache_dir.mkdir()
-    key = _vcf_cache_key(vcf_path, keep_sample_indices)
+    key = _vcf_cache_key(vcf_path, keep_sample_indices, config)
     tmp_dir = cache_dir / f"{key}.tmp_parallel"
     tmp_dir.mkdir()
 
@@ -714,13 +736,13 @@ def test_precache_vcfs_parallel_reuses_completed_region_outputs(monkeypatch: pyt
     monkeypatch.setattr(_multiprocessing, "get_all_start_methods", lambda: ["fork", "spawn"])
     monkeypatch.setattr(_multiprocessing, "get_context", lambda method: _FakeContext())
 
-    io_module.precache_vcfs_parallel([vcf_path], keep_sample_indices)
+    io_module.precache_vcfs_parallel([vcf_path], keep_sample_indices, config)
 
     assert len(scheduled_tasks) == 1
     assert scheduled_tasks[0][3] == str(region1_prefix)
     assert scheduled_tasks[0][4] == 2
 
-    cached = _load_vcf_from_cache(vcf_path=vcf_path, keep_sample_indices=keep_sample_indices)
+    cached = _load_vcf_from_cache(vcf_path=vcf_path, keep_sample_indices=keep_sample_indices, config=config)
     assert cached is not None
     genotype_matrix, variants, variant_stats = cached
     np.testing.assert_array_equal(
@@ -766,6 +788,7 @@ def test_load_dataset_from_plink_auto_detects_person_id_column(tmp_path: Path):
 
     dataset = load_dataset_from_files(
         genotype_path=bed_path,
+        config=ModelConfig(),
         genotype_format="plink1",
         sample_table_path=sample_table_path,
         target_column="target",
@@ -814,6 +837,7 @@ def test_load_dataset_from_real_plink_bed_header_bytes(tmp_path: Path):
 
     dataset = load_dataset_from_files(
         genotype_path=bed_path,
+        config=ModelConfig(),
         genotype_format="plink1",
         sample_table_path=sample_table_path,
         sample_id_column="sample_id",
@@ -897,6 +921,7 @@ def test_plink_loader_uses_indexed_bed_reads(tmp_path: Path, monkeypatch: pytest
 
     dataset = load_dataset_from_files(
         genotype_path=bed_path,
+        config=ModelConfig(),
         genotype_format="plink1",
         sample_table_path=sample_table_path,
         target_column="target",
@@ -954,6 +979,7 @@ def test_load_dataset_from_plink_filters_non_genotyped_sample_rows(tmp_path: Pat
 
     dataset = load_dataset_from_files(
         genotype_path=bed_path,
+        config=ModelConfig(),
         genotype_format="plink1",
         sample_table_path=sample_table_path,
         target_column="target",
@@ -1075,6 +1101,7 @@ def test_load_dataset_from_files_auto_detect_fails_when_no_identifier_column_mat
     with pytest.raises(ValueError, match="Could not find a sample identifier column"):
         load_dataset_from_files(
             genotype_path=vcf_path,
+            config=ModelConfig(),
             genotype_format="vcf",
             sample_table_path=sample_table_path,
             target_column="target",
@@ -1134,6 +1161,10 @@ def test_run_training_pipeline_from_plink_inputs_writes_outputs(tmp_path: Path):
 
     dataset = load_dataset_from_files(
         genotype_path=bed_path,
+        config=ModelConfig(
+            trait_type=TraitType.QUANTITATIVE,
+            max_outer_iterations=2,
+        ),
         genotype_format="plink1",
         sample_table_path=sample_table_path,
         sample_id_column="sample_id",
@@ -1169,6 +1200,30 @@ def test_run_training_pipeline_from_plink_inputs_writes_outputs(tmp_path: Path):
     coefficient_lines = outputs.coefficients_path.read_text(encoding="utf-8").strip().splitlines()
     assert len(prediction_lines) == 7
     assert len(coefficient_lines) == 4
+
+
+def test_run_training_pipeline_rejects_mismatched_precomputed_stats_config(tmp_path: Path):
+    dataset = io_module.LoadedDataset(
+        sample_ids=["sample_0"],
+        genotypes=np.zeros((1, 1), dtype=np.float32),
+        covariates=np.zeros((1, 0), dtype=np.float32),
+        targets=np.zeros(1, dtype=np.float32),
+        variant_records=[],
+        variant_stats=VariantStatistics(
+            means=np.zeros(1, dtype=np.float32),
+            scales=np.ones(1, dtype=np.float32),
+            allele_frequencies=np.zeros(1, dtype=np.float32),
+            support_counts=np.zeros(1, dtype=np.int32),
+        ),
+        variant_stats_minimum_scale=0.25,
+    )
+
+    with pytest.raises(ValueError, match="minimum_scale"):
+        run_training_pipeline(
+            dataset=dataset,
+            config=ModelConfig(minimum_scale=0.5),
+            output_dir=tmp_path / "run",
+        )
 
 
 def test_cli_infers_binary_trait_type(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
@@ -1309,6 +1364,7 @@ def test_vcf_cli_end_to_end_recovers_binary_signal_with_symbolic_svs(tmp_path: P
 
     dataset = load_dataset_from_files(
         genotype_path=vcf_path,
+        config=ModelConfig(),
         genotype_format="vcf",
         sample_table_path=sample_table_path,
         sample_id_column="sample_id",
@@ -1423,6 +1479,7 @@ def test_plink_end_to_end_recovers_quantitative_signal_with_sv_style_alleles(tmp
 
     dataset = load_dataset_from_files(
         genotype_path=bed_path,
+        config=ModelConfig(),
         genotype_format="plink1",
         sample_table_path=sample_table_path,
         sample_id_column="sample_id",
@@ -1463,6 +1520,7 @@ def test_multiallelic_vcf_raises_clear_error(tmp_path: Path):
     with pytest.raises(ValueError, match="Only biallelic VCF records are supported"):
         load_dataset_from_files(
             genotype_path=vcf_path,
+            config=ModelConfig(),
             genotype_format="vcf",
             sample_table_path=sample_table_path,
             sample_id_column="sample_id",
@@ -1541,6 +1599,7 @@ def test_vcf_symbolic_sv_type_is_inferred_without_metadata(tmp_path: Path):
 
     dataset = load_dataset_from_files(
         genotype_path=vcf_path,
+        config=ModelConfig(),
         genotype_format="vcf",
         sample_table_path=sample_table_path,
         sample_id_column="sample_id",
@@ -1594,6 +1653,7 @@ def test_plink_symbolic_sv_type_is_inferred_without_metadata(tmp_path: Path):
 
     dataset = load_dataset_from_files(
         genotype_path=bed_path,
+        config=ModelConfig(),
         genotype_format="plink1",
         sample_table_path=sample_table_path,
         sample_id_column="sample_id",

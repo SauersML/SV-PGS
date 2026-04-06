@@ -77,6 +77,7 @@ from sv_pgs.genotype import (
     _try_import_cupy,
     _cupy_to_jax,
     _to_cupy_compute,
+    _to_cupy_float64,
 )
 from sv_pgs.linear_solvers import build_linear_operator, solve_spd_system, stochastic_logdet
 from sv_pgs.numeric import stable_sigmoid
@@ -671,21 +672,12 @@ def fit_variational_em(
             )
 
     log(f"  variational EM: {genotype_matrix.shape[1]} reduced variants, {covariate_matrix.shape[1]} covariates, {target_vector.shape[0]} samples, max_iter={config.max_outer_iterations}")
-
-    for outer_iteration in range(start_iteration, config.max_outer_iterations):
-        log(f"  variational EM iteration {outer_iteration + 1}/{config.max_outer_iterations} start  sigma_e2={sigma_error2:.6f}  global_scale={global_scale:.6f}  mem={mem()}")
-        posterior_theta = _pack_theta(
-            global_scale=float(global_scale),
-            scale_model_coefficients=scale_model_coefficients,
-        )
-        posterior_local_scale = local_scale.copy()
-        posterior_tpb_shape_a_vector = tpb_shape_a_vector.copy()
-        posterior_tpb_shape_b_vector = tpb_shape_b_vector.copy()
-        # Build each variant's prior variance from three pieces:
-        #   1. global_scale — one number shared by all variants
-        #   2. metadata_baseline — per-variant, based on type/length/repeat
-        #   3. local_scale (lambda) — per-variant adaptive shrinkage
-        # A variant with large local_scale is "allowed" to have a big effect.
+    use_stochastic_updates = _should_use_stochastic_variational_updates(genotype_matrix, config)
+    if use_stochastic_updates:
+        block_size = min(int(config.stochastic_variant_batch_size), int(genotype_matrix.shape[1]))
+        block_count = max((int(genotype_matrix.shape[1]) + block_size - 1) // block_size, 1)
+        step_index = start_iteration * block_count
+        empty_covariates = np.zeros((target_vector.shape[0], 0), dtype=np.float64)
         metadata_baseline_scales = _metadata_baseline_scales_from_coefficients(
             scale_model_coefficients,
             prior_design.design_matrix,
@@ -697,151 +689,446 @@ def fit_variational_em(
             local_scale=local_scale,
             config=config,
         )
-
-        posterior_state = _fit_collapsed_posterior(
-            genotype_matrix=genotype_matrix,
-            covariate_matrix=covariate_matrix,
-            targets=target_vector,
-            reduced_prior_variances=reduced_prior_variances,
-            sigma_error2=sigma_error2,
-            alpha_init=alpha_state,
-            beta_init=beta_state,
-            trait_type=config.trait_type,
-            config=config,
-            compute_logdet=False,
-            compute_beta_variance=True,
+        reduced_second_moment = np.maximum(
+            np.asarray(beta_state * beta_state, dtype=np.float64),
+            np.asarray(reduced_prior_variances, dtype=np.float64),
         )
-        if config.trait_type == TraitType.BINARY and config.binary_intercept_calibration:
-            posterior_state = _apply_binary_intercept_calibration(
-                posterior_state=posterior_state,
-                targets=target_vector,
-            )
-        alpha_state = posterior_state.alpha
-        beta_state = posterior_state.beta
-        sigma_error2 = posterior_state.sigma_error2
-
-        # How "big" is each variant's effect?  We need both the point estimate
-        # (beta^2) and the uncertainty (variance) to properly update the scales.
-        reduced_second_moment = np.asarray(beta_state * beta_state + posterior_state.beta_variance, dtype=np.float64)
-        # Overall model quality = data fit + how well the shrinkage priors fit
-        full_objective = posterior_state.collapsed_objective + _local_scale_prior_objective(
-            local_scale=local_scale,
-            auxiliary_delta=auxiliary_delta,
-            local_shape_a=local_shape_a,
-            local_shape_b=local_shape_b,
-        ) + _scale_penalty_objective(
-            scale_model_coefficients=scale_model_coefficients,
-            scale_penalty=scale_penalty,
+        log(
+            "  variational inference mode: stochastic variant-block updates "
+            + f"(block_size={block_size}, blocks_per_epoch={block_count})"
         )
-        objective_history.append(float(full_objective))
-        log(f"  variational EM iteration {outer_iteration + 1}: objective={full_objective:.6f} sigma_e2={sigma_error2:.6f}")
-
-        if validation_payload is not None:
-            should_validate = (
-                outer_iteration == 0
-                or ((outer_iteration + 1) % config.validation_interval == 0)
-                or outer_iteration + 1 == config.max_outer_iterations
+        for outer_iteration in range(start_iteration, config.max_outer_iterations):
+            log(f"  variational EM epoch {outer_iteration + 1}/{config.max_outer_iterations} start  sigma_e2={sigma_error2:.6f}  global_scale={global_scale:.6f}  mem={mem()}")
+            posterior_theta = _pack_theta(
+                global_scale=float(global_scale),
+                scale_model_coefficients=scale_model_coefficients,
             )
-            if should_validate:
-                validation_metric = _validation_metric(
-                    trait_type=config.trait_type,
-                    genotype_matrix=validation_payload[0],
-                    covariate_matrix=validation_payload[1],
-                    targets=validation_payload[2],
-                    alpha=alpha_state,
-                    beta=beta_state,
-                )
-                validation_history.append(validation_metric)
-                if best_validation_metric is None or validation_metric < best_validation_metric:
-                    best_validation_metric = validation_metric
-                    best_alpha = alpha_state.copy()
-                    best_beta = beta_state.copy()
-                    best_local_scale = posterior_local_scale.copy()
-                    best_theta = posterior_theta.copy()
-                    best_sigma_error2 = float(sigma_error2)
-                    best_tpb_shape_a_vector = posterior_tpb_shape_a_vector.copy()
-                    best_tpb_shape_b_vector = posterior_tpb_shape_b_vector.copy()
-                log(f"  variational EM iteration {outer_iteration + 1}: validation_metric={validation_metric:.6f}")
-
-        updated_local_scale, updated_auxiliary_delta = _update_local_scales(
-            coefficient_second_moment=reduced_second_moment,
-            baseline_prior_variances=baseline_reduced_prior_variances,
-            local_shape_a=local_shape_a,
-            local_shape_b=local_shape_b,
-            auxiliary_delta=auxiliary_delta,
-            config=config,
-        )
-        should_update_hyperparameters = (
-            config.update_hyperparameters
-            and (outer_iteration + 1 >= 4)
-            and ((outer_iteration + 1) % 4 == 0 or outer_iteration + 1 == config.max_outer_iterations)
-        )
-        if should_update_hyperparameters:
-            global_scale, scale_model_coefficients = _update_scale_model(
-                reduced_second_moment=reduced_second_moment,
-                local_scale=updated_local_scale,
-                prior_design=prior_design,
-                scale_penalty=scale_penalty,
-                current_global_scale=float(global_scale),
-                current_scale_model_coefficients=scale_model_coefficients,
-                config=config,
-            )
-            tpb_shape_a_vector, tpb_shape_b_vector = _update_tpb_shape_vectors(
-                class_membership_matrix=prior_design.class_membership_matrix,
-                current_shape_a_vector=tpb_shape_a_vector,
-                current_shape_b_vector=tpb_shape_b_vector,
-                local_scale=updated_local_scale,
-                auxiliary_delta=updated_auxiliary_delta,
-                config=config,
-            )
+            epoch_rng = np.random.default_rng(config.random_seed + outer_iteration)
             local_shape_a = prior_design.class_membership_matrix @ tpb_shape_a_vector
             local_shape_b = prior_design.class_membership_matrix @ tpb_shape_b_vector
-        local_scale = updated_local_scale
-        # Update the auxiliary rate parameter delta for each variant.
-        # delta controls how aggressively the prior pulls lambda (and thus
-        # beta) toward zero.  Variants with large local_scale get a smaller
-        # delta — the model "loosens" the leash on variants that look real.
-        auxiliary_delta = (local_shape_a + local_shape_b) / np.maximum(1.0 + local_scale, config.local_scale_floor)
+            metadata_baseline_scales = _metadata_baseline_scales_from_coefficients(
+                scale_model_coefficients,
+                prior_design.design_matrix,
+                config,
+            )
+            baseline_reduced_prior_variances = (float(global_scale) * metadata_baseline_scales) ** 2
+            reduced_prior_variances = _effective_prior_variances(
+                baseline_prior_variances=baseline_reduced_prior_variances,
+                local_scale=local_scale,
+                config=config,
+            )
+            genetic_linear_predictor = np.array(
+                genotype_matrix.matvec(beta_state, batch_size=config.posterior_variance_batch_size),
+                dtype=np.float64,
+                copy=True,
+            )
+            if config.trait_type == TraitType.BINARY:
+                alpha_state = _fit_binary_alpha_with_offset(
+                    covariate_matrix=covariate_matrix,
+                    targets=target_vector,
+                    predictor_offset=genetic_linear_predictor,
+                    minimum_weight=config.polya_gamma_minimum_weight,
+                    max_iterations=config.max_inner_newton_iterations,
+                    gradient_tolerance=config.newton_gradient_tolerance,
+                    alpha_init=alpha_state,
+                )
+                sigma_error2 = 1.0
+            else:
+                alpha_state = _initialize_alpha_state(
+                    covariate_matrix=covariate_matrix,
+                    targets=target_vector - genetic_linear_predictor,
+                    trait_type=TraitType.QUANTITATIVE,
+                )
+            covariate_linear_predictor = np.asarray(covariate_matrix @ alpha_state, dtype=np.float64)
 
-        parameter_change = _relative_parameter_change(
-            current_beta=beta_state,
-            previous_beta=previous_beta,
-            current_alpha=alpha_state,
-            previous_alpha=previous_alpha,
-            current_local_scale=local_scale,
-            previous_local_scale=previous_local_scale,
-            current_theta=_pack_theta(global_scale, scale_model_coefficients),
-            previous_theta=previous_theta,
-            current_tpb_shape_a_vector=tpb_shape_a_vector,
-            previous_tpb_shape_a_vector=previous_tpb_shape_a_vector,
-            current_tpb_shape_b_vector=tpb_shape_b_vector,
-            previous_tpb_shape_b_vector=previous_tpb_shape_b_vector,
-        )
-        previous_alpha = alpha_state.copy()
-        previous_beta = beta_state.copy()
-        previous_local_scale = local_scale.copy()
-        previous_theta = _pack_theta(global_scale, scale_model_coefficients)
-        previous_tpb_shape_a_vector = tpb_shape_a_vector.copy()
-        previous_tpb_shape_b_vector = tpb_shape_b_vector.copy()
+            for block_indices in _stochastic_variant_blocks(genotype_matrix.shape[1], block_size, epoch_rng):
+                step_index += 1
+                step_size = _stochastic_step_size(config, step_index)
+                block_genotypes = genotype_matrix.subset(block_indices)
+                block_prior_variances = np.asarray(reduced_prior_variances[block_indices], dtype=np.float64)
+                block_beta_previous = np.asarray(beta_state[block_indices], dtype=np.float64).copy()
+                block_linear_predictor_previous = np.asarray(
+                    block_genotypes.matvec(block_beta_previous, batch_size=config.posterior_variance_batch_size),
+                    dtype=np.float64,
+                )
+                predictor_offset = covariate_linear_predictor + genetic_linear_predictor - block_linear_predictor_previous
+                if config.trait_type == TraitType.BINARY:
+                    block_state = _binary_posterior_state(
+                        genotype_matrix=block_genotypes,
+                        covariate_matrix=empty_covariates,
+                        targets=target_vector,
+                        prior_variances=block_prior_variances,
+                        alpha_init=np.zeros(0, dtype=np.float64),
+                        beta_init=block_beta_previous,
+                        minimum_weight=config.polya_gamma_minimum_weight,
+                        max_iterations=config.max_inner_newton_iterations,
+                        gradient_tolerance=config.newton_gradient_tolerance,
+                        initial_damping=config.trust_region_initial_damping,
+                        damping_increase_factor=config.trust_region_damping_increase_factor,
+                        damping_decrease_factor=config.trust_region_damping_decrease_factor,
+                        success_threshold=config.trust_region_success_threshold,
+                        minimum_damping=config.trust_region_minimum_damping,
+                        solver_tolerance=config.linear_solver_tolerance,
+                        maximum_linear_solver_iterations=config.maximum_linear_solver_iterations,
+                        logdet_probe_count=config.logdet_probe_count,
+                        logdet_lanczos_steps=config.logdet_lanczos_steps,
+                        exact_solver_matrix_limit=config.exact_solver_matrix_limit,
+                        posterior_variance_batch_size=config.posterior_variance_batch_size,
+                        posterior_variance_probe_count=config.posterior_variance_probe_count,
+                        random_seed=config.random_seed + step_index,
+                        compute_logdet=False,
+                        compute_beta_variance=True,
+                        sample_space_preconditioner_rank=config.sample_space_preconditioner_rank,
+                        predictor_offset=predictor_offset,
+                    )
+                    block_beta_candidate = np.asarray(block_state[1], dtype=np.float64)
+                    block_beta_variance = np.asarray(block_state[2], dtype=np.float64)
+                else:
+                    block_state = _fit_collapsed_posterior(
+                        genotype_matrix=block_genotypes,
+                        covariate_matrix=empty_covariates,
+                        targets=target_vector - predictor_offset,
+                        reduced_prior_variances=block_prior_variances,
+                        sigma_error2=sigma_error2,
+                        alpha_init=np.zeros(0, dtype=np.float64),
+                        beta_init=block_beta_previous,
+                        trait_type=TraitType.QUANTITATIVE,
+                        config=config,
+                        compute_logdet=False,
+                        compute_beta_variance=True,
+                    )
+                    block_beta_candidate = np.asarray(block_state.beta, dtype=np.float64)
+                    block_beta_variance = np.asarray(block_state.beta_variance, dtype=np.float64)
+                block_beta_updated = block_beta_previous + step_size * (block_beta_candidate - block_beta_previous)
+                beta_delta = block_beta_updated - block_beta_previous
+                if np.any(beta_delta):
+                    genetic_linear_predictor += np.asarray(
+                        block_genotypes.matvec(beta_delta, batch_size=config.posterior_variance_batch_size),
+                        dtype=np.float64,
+                    )
+                    beta_state[block_indices] = block_beta_updated
+                block_second_moment = np.asarray(
+                    block_beta_candidate * block_beta_candidate + block_beta_variance,
+                    dtype=np.float64,
+                )
+                reduced_second_moment[block_indices] = (
+                    (1.0 - step_size) * reduced_second_moment[block_indices]
+                    + step_size * block_second_moment
+                )
+                updated_local_scale_block, updated_auxiliary_delta_block = _update_local_scales(
+                    coefficient_second_moment=reduced_second_moment[block_indices],
+                    baseline_prior_variances=baseline_reduced_prior_variances[block_indices],
+                    local_shape_a=local_shape_a[block_indices],
+                    local_shape_b=local_shape_b[block_indices],
+                    auxiliary_delta=auxiliary_delta[block_indices],
+                    config=config,
+                )
+                local_scale[block_indices] = (
+                    (1.0 - step_size) * local_scale[block_indices]
+                    + step_size * updated_local_scale_block
+                )
+                auxiliary_delta[block_indices] = (
+                    (1.0 - step_size) * auxiliary_delta[block_indices]
+                    + step_size * updated_auxiliary_delta_block
+                )
 
-        iter_num = outer_iteration + 1
-        obj_str = f"{objective_history[-1]:.6f}" if objective_history else "N/A"
-        val_str = f"  val={validation_history[-1]:.6f}" if validation_history else ""
-        hyper_str = "  [+hyper]" if should_update_hyperparameters else ""
-        nonzero_beta = int(np.count_nonzero(np.abs(beta_state) > 1e-8))
-        log(f"  EM iter {iter_num}/{config.max_outer_iterations}  obj={obj_str}  delta={parameter_change:.2e}  sigma_e2={sigma_error2:.4f}  g_scale={float(global_scale):.4f}  nz_beta={nonzero_beta}{val_str}{hyper_str}  mem={mem()}")
-        if checkpoint_callback is not None:
-            checkpoint_callback(_build_checkpoint(iter_num))
+            if config.trait_type == TraitType.BINARY:
+                alpha_state = _fit_binary_alpha_with_offset(
+                    covariate_matrix=covariate_matrix,
+                    targets=target_vector,
+                    predictor_offset=genetic_linear_predictor,
+                    minimum_weight=config.polya_gamma_minimum_weight,
+                    max_iterations=config.max_inner_newton_iterations,
+                    gradient_tolerance=config.newton_gradient_tolerance,
+                    alpha_init=alpha_state,
+                )
+                sigma_error2 = 1.0
+            else:
+                alpha_state = _initialize_alpha_state(
+                    covariate_matrix=covariate_matrix,
+                    targets=target_vector - genetic_linear_predictor,
+                    trait_type=TraitType.QUANTITATIVE,
+                )
+            should_update_hyperparameters = (
+                config.update_hyperparameters
+                and (outer_iteration + 1 >= 4)
+                and ((outer_iteration + 1) % 4 == 0 or outer_iteration + 1 == config.max_outer_iterations)
+            )
+            if should_update_hyperparameters:
+                global_scale, scale_model_coefficients = _update_scale_model(
+                    reduced_second_moment=reduced_second_moment,
+                    local_scale=local_scale,
+                    prior_design=prior_design,
+                    scale_penalty=scale_penalty,
+                    current_global_scale=float(global_scale),
+                    current_scale_model_coefficients=scale_model_coefficients,
+                    config=config,
+                )
+                tpb_shape_a_vector, tpb_shape_b_vector = _update_tpb_shape_vectors(
+                    class_membership_matrix=prior_design.class_membership_matrix,
+                    current_shape_a_vector=tpb_shape_a_vector,
+                    current_shape_b_vector=tpb_shape_b_vector,
+                    local_scale=local_scale,
+                    auxiliary_delta=auxiliary_delta,
+                    config=config,
+                )
+                local_shape_a = prior_design.class_membership_matrix @ tpb_shape_a_vector
+                local_shape_b = prior_design.class_membership_matrix @ tpb_shape_b_vector
+            auxiliary_delta = (local_shape_a + local_shape_b) / np.maximum(1.0 + local_scale, config.local_scale_floor)
+            reduced_prior_variances = _effective_prior_variances(
+                baseline_prior_variances=(float(global_scale) * _metadata_baseline_scales_from_coefficients(
+                    scale_model_coefficients,
+                    prior_design.design_matrix,
+                    config,
+                )) ** 2,
+                local_scale=local_scale,
+                config=config,
+            )
+            covariate_linear_predictor = np.asarray(covariate_matrix @ alpha_state, dtype=np.float64)
+            linear_predictor = covariate_linear_predictor + genetic_linear_predictor
+            beta_variance_state = np.maximum(reduced_second_moment - beta_state * beta_state, 1e-8)
+            if config.trait_type == TraitType.QUANTITATIVE:
+                leverage_weight = np.maximum(reduced_prior_variances - beta_variance_state, 0.0) / np.maximum(reduced_prior_variances, 1e-12)
+                residual_vector = np.asarray(target_vector - linear_predictor, dtype=np.float64)
+                effective_dof = max(float(target_vector.shape[0]) - float(np.sum(leverage_weight)), 1.0)
+                sigma_error2 = max(float(np.dot(residual_vector, residual_vector)) / effective_dof, config.sigma_error_floor)
+            objective_history.append(
+                _stochastic_epoch_objective(
+                    trait_type=config.trait_type,
+                    targets=target_vector,
+                    linear_predictor=linear_predictor,
+                    beta=beta_state,
+                    reduced_prior_variances=reduced_prior_variances,
+                    local_scale=local_scale,
+                    auxiliary_delta=auxiliary_delta,
+                    local_shape_a=local_shape_a,
+                    local_shape_b=local_shape_b,
+                    scale_model_coefficients=scale_model_coefficients,
+                    scale_penalty=scale_penalty,
+                )
+            )
+            if validation_payload is not None:
+                should_validate = (
+                    outer_iteration == 0
+                    or ((outer_iteration + 1) % config.validation_interval == 0)
+                    or outer_iteration + 1 == config.max_outer_iterations
+                )
+                if should_validate:
+                    validation_metric = _validation_metric(
+                        trait_type=config.trait_type,
+                        genotype_matrix=validation_payload[0],
+                        covariate_matrix=validation_payload[1],
+                        targets=validation_payload[2],
+                        alpha=alpha_state,
+                        beta=beta_state,
+                    )
+                    validation_history.append(validation_metric)
+                    if best_validation_metric is None or validation_metric < best_validation_metric:
+                        best_validation_metric = validation_metric
+                        best_alpha = alpha_state.copy()
+                        best_beta = beta_state.copy()
+                        best_local_scale = local_scale.copy()
+                        best_theta = _pack_theta(global_scale, scale_model_coefficients)
+                        best_sigma_error2 = float(sigma_error2)
+                        best_tpb_shape_a_vector = tpb_shape_a_vector.copy()
+                        best_tpb_shape_b_vector = tpb_shape_b_vector.copy()
+                    log(f"  variational EM epoch {outer_iteration + 1}: validation_metric={validation_metric:.6f}")
+            parameter_change = _relative_parameter_change(
+                current_beta=beta_state,
+                previous_beta=previous_beta,
+                current_alpha=alpha_state,
+                previous_alpha=previous_alpha,
+                current_local_scale=local_scale,
+                previous_local_scale=previous_local_scale,
+                current_theta=_pack_theta(global_scale, scale_model_coefficients),
+                previous_theta=previous_theta,
+                current_tpb_shape_a_vector=tpb_shape_a_vector,
+                previous_tpb_shape_a_vector=previous_tpb_shape_a_vector,
+                current_tpb_shape_b_vector=tpb_shape_b_vector,
+                previous_tpb_shape_b_vector=previous_tpb_shape_b_vector,
+            )
+            previous_alpha = alpha_state.copy()
+            previous_beta = beta_state.copy()
+            previous_local_scale = local_scale.copy()
+            previous_theta = _pack_theta(global_scale, scale_model_coefficients)
+            previous_tpb_shape_a_vector = tpb_shape_a_vector.copy()
+            previous_tpb_shape_b_vector = tpb_shape_b_vector.copy()
+            iter_num = outer_iteration + 1
+            obj_str = f"{objective_history[-1]:.6f}" if objective_history else "N/A"
+            val_str = f"  val={validation_history[-1]:.6f}" if validation_history else ""
+            hyper_str = "  [+hyper]" if should_update_hyperparameters else ""
+            nonzero_beta = int(np.count_nonzero(np.abs(beta_state) > 1e-8))
+            log(f"  SVI epoch {iter_num}/{config.max_outer_iterations}  obj={obj_str}  delta={parameter_change:.2e}  sigma_e2={sigma_error2:.4f}  g_scale={float(global_scale):.4f}  nz_beta={nonzero_beta}{val_str}{hyper_str}  mem={mem()}")
+            if checkpoint_callback is not None:
+                checkpoint_callback(_build_checkpoint(iter_num))
+            if validation_history:
+                if len(validation_history) >= 2:
+                    validation_delta = abs(validation_history[-1] - validation_history[-2])
+                    if parameter_change < config.convergence_tolerance and validation_delta < config.convergence_tolerance:
+                        log(f"  stochastic variational updates converged on epoch {outer_iteration + 1} with parameter_change={parameter_change:.3e} validation_delta={validation_delta:.3e}")
+                        break
+            elif parameter_change < config.convergence_tolerance:
+                log(f"  stochastic variational updates converged on epoch {outer_iteration + 1} with parameter_change={parameter_change:.3e}")
+                break
+    else:
+        for outer_iteration in range(start_iteration, config.max_outer_iterations):
+            log(f"  variational EM iteration {outer_iteration + 1}/{config.max_outer_iterations} start  sigma_e2={sigma_error2:.6f}  global_scale={global_scale:.6f}  mem={mem()}")
+            posterior_theta = _pack_theta(
+                global_scale=float(global_scale),
+                scale_model_coefficients=scale_model_coefficients,
+            )
+            posterior_local_scale = local_scale.copy()
+            posterior_tpb_shape_a_vector = tpb_shape_a_vector.copy()
+            posterior_tpb_shape_b_vector = tpb_shape_b_vector.copy()
+            metadata_baseline_scales = _metadata_baseline_scales_from_coefficients(
+                scale_model_coefficients,
+                prior_design.design_matrix,
+                config,
+            )
+            baseline_reduced_prior_variances = (float(global_scale) * metadata_baseline_scales) ** 2
+            reduced_prior_variances = _effective_prior_variances(
+                baseline_prior_variances=baseline_reduced_prior_variances,
+                local_scale=local_scale,
+                config=config,
+            )
 
-        if validation_history:
-            if len(validation_history) >= 2:
-                validation_delta = abs(validation_history[-1] - validation_history[-2])
-                if parameter_change < config.convergence_tolerance and validation_delta < config.convergence_tolerance:
-                    log(f"  variational EM converged on iteration {outer_iteration + 1} with parameter_change={parameter_change:.3e} validation_delta={validation_delta:.3e}")
-                    break
-        elif parameter_change < config.convergence_tolerance:
-            log(f"  variational EM converged on iteration {outer_iteration + 1} with parameter_change={parameter_change:.3e}")
-            break
+            posterior_state = _fit_collapsed_posterior(
+                genotype_matrix=genotype_matrix,
+                covariate_matrix=covariate_matrix,
+                targets=target_vector,
+                reduced_prior_variances=reduced_prior_variances,
+                sigma_error2=sigma_error2,
+                alpha_init=alpha_state,
+                beta_init=beta_state,
+                trait_type=config.trait_type,
+                config=config,
+                compute_logdet=False,
+                compute_beta_variance=True,
+            )
+            if config.trait_type == TraitType.BINARY and config.binary_intercept_calibration:
+                posterior_state = _apply_binary_intercept_calibration(
+                    posterior_state=posterior_state,
+                    targets=target_vector,
+                )
+            alpha_state = posterior_state.alpha
+            beta_state = posterior_state.beta
+            sigma_error2 = posterior_state.sigma_error2
+
+            reduced_second_moment = np.asarray(beta_state * beta_state + posterior_state.beta_variance, dtype=np.float64)
+            full_objective = posterior_state.collapsed_objective + _local_scale_prior_objective(
+                local_scale=local_scale,
+                auxiliary_delta=auxiliary_delta,
+                local_shape_a=local_shape_a,
+                local_shape_b=local_shape_b,
+            ) + _scale_penalty_objective(
+                scale_model_coefficients=scale_model_coefficients,
+                scale_penalty=scale_penalty,
+            )
+            objective_history.append(float(full_objective))
+            log(f"  variational EM iteration {outer_iteration + 1}: objective={full_objective:.6f} sigma_e2={sigma_error2:.6f}")
+
+            if validation_payload is not None:
+                should_validate = (
+                    outer_iteration == 0
+                    or ((outer_iteration + 1) % config.validation_interval == 0)
+                    or outer_iteration + 1 == config.max_outer_iterations
+                )
+                if should_validate:
+                    validation_metric = _validation_metric(
+                        trait_type=config.trait_type,
+                        genotype_matrix=validation_payload[0],
+                        covariate_matrix=validation_payload[1],
+                        targets=validation_payload[2],
+                        alpha=alpha_state,
+                        beta=beta_state,
+                    )
+                    validation_history.append(validation_metric)
+                    if best_validation_metric is None or validation_metric < best_validation_metric:
+                        best_validation_metric = validation_metric
+                        best_alpha = alpha_state.copy()
+                        best_beta = beta_state.copy()
+                        best_local_scale = posterior_local_scale.copy()
+                        best_theta = posterior_theta.copy()
+                        best_sigma_error2 = float(sigma_error2)
+                        best_tpb_shape_a_vector = posterior_tpb_shape_a_vector.copy()
+                        best_tpb_shape_b_vector = posterior_tpb_shape_b_vector.copy()
+                    log(f"  variational EM iteration {outer_iteration + 1}: validation_metric={validation_metric:.6f}")
+
+            updated_local_scale, updated_auxiliary_delta = _update_local_scales(
+                coefficient_second_moment=reduced_second_moment,
+                baseline_prior_variances=baseline_reduced_prior_variances,
+                local_shape_a=local_shape_a,
+                local_shape_b=local_shape_b,
+                auxiliary_delta=auxiliary_delta,
+                config=config,
+            )
+            should_update_hyperparameters = (
+                config.update_hyperparameters
+                and (outer_iteration + 1 >= 4)
+                and ((outer_iteration + 1) % 4 == 0 or outer_iteration + 1 == config.max_outer_iterations)
+            )
+            if should_update_hyperparameters:
+                global_scale, scale_model_coefficients = _update_scale_model(
+                    reduced_second_moment=reduced_second_moment,
+                    local_scale=updated_local_scale,
+                    prior_design=prior_design,
+                    scale_penalty=scale_penalty,
+                    current_global_scale=float(global_scale),
+                    current_scale_model_coefficients=scale_model_coefficients,
+                    config=config,
+                )
+                tpb_shape_a_vector, tpb_shape_b_vector = _update_tpb_shape_vectors(
+                    class_membership_matrix=prior_design.class_membership_matrix,
+                    current_shape_a_vector=tpb_shape_a_vector,
+                    current_shape_b_vector=tpb_shape_b_vector,
+                    local_scale=updated_local_scale,
+                    auxiliary_delta=updated_auxiliary_delta,
+                    config=config,
+                )
+                local_shape_a = prior_design.class_membership_matrix @ tpb_shape_a_vector
+                local_shape_b = prior_design.class_membership_matrix @ tpb_shape_b_vector
+            local_scale = updated_local_scale
+            auxiliary_delta = (local_shape_a + local_shape_b) / np.maximum(1.0 + local_scale, config.local_scale_floor)
+
+            parameter_change = _relative_parameter_change(
+                current_beta=beta_state,
+                previous_beta=previous_beta,
+                current_alpha=alpha_state,
+                previous_alpha=previous_alpha,
+                current_local_scale=local_scale,
+                previous_local_scale=previous_local_scale,
+                current_theta=_pack_theta(global_scale, scale_model_coefficients),
+                previous_theta=previous_theta,
+                current_tpb_shape_a_vector=tpb_shape_a_vector,
+                previous_tpb_shape_a_vector=previous_tpb_shape_a_vector,
+                current_tpb_shape_b_vector=tpb_shape_b_vector,
+                previous_tpb_shape_b_vector=previous_tpb_shape_b_vector,
+            )
+            previous_alpha = alpha_state.copy()
+            previous_beta = beta_state.copy()
+            previous_local_scale = local_scale.copy()
+            previous_theta = _pack_theta(global_scale, scale_model_coefficients)
+            previous_tpb_shape_a_vector = tpb_shape_a_vector.copy()
+            previous_tpb_shape_b_vector = tpb_shape_b_vector.copy()
+
+            iter_num = outer_iteration + 1
+            obj_str = f"{objective_history[-1]:.6f}" if objective_history else "N/A"
+            val_str = f"  val={validation_history[-1]:.6f}" if validation_history else ""
+            hyper_str = "  [+hyper]" if should_update_hyperparameters else ""
+            nonzero_beta = int(np.count_nonzero(np.abs(beta_state) > 1e-8))
+            log(f"  EM iter {iter_num}/{config.max_outer_iterations}  obj={obj_str}  delta={parameter_change:.2e}  sigma_e2={sigma_error2:.4f}  g_scale={float(global_scale):.4f}  nz_beta={nonzero_beta}{val_str}{hyper_str}  mem={mem()}")
+            if checkpoint_callback is not None:
+                checkpoint_callback(_build_checkpoint(iter_num))
+
+            if validation_history:
+                if len(validation_history) >= 2:
+                    validation_delta = abs(validation_history[-1] - validation_history[-2])
+                    if parameter_change < config.convergence_tolerance and validation_delta < config.convergence_tolerance:
+                        log(f"  variational EM converged on iteration {outer_iteration + 1} with parameter_change={parameter_change:.3e} validation_delta={validation_delta:.3e}")
+                        break
+            elif parameter_change < config.convergence_tolerance:
+                log(f"  variational EM converged on iteration {outer_iteration + 1} with parameter_change={parameter_change:.3e}")
+                break
 
     if best_validation_metric is not None:
         if (
@@ -1212,7 +1499,7 @@ def _binary_posterior_state(
         beta_jax = jnp.asarray(beta, dtype=compute_jax_dtype)
         linear_predictor_jax = (
             predictor_offset_jax
-            covariate_matrix_jax @ alpha_jax
+            + covariate_matrix_jax @ alpha_jax
             + standardized_genotypes.matvec(beta, batch_size=posterior_variance_batch_size)
         )
         probabilities_jax = stable_sigmoid(linear_predictor_jax)
@@ -1269,7 +1556,11 @@ def _binary_posterior_state(
         if gradient_norm <= gradient_tolerance:
             log(f"      Newton converged at iter {_iteration_index+1}: grad_norm={gradient_norm:.2e} <= tol={gradient_tolerance:.2e}")
             break
-        working_response = linear_predictor + (targets.astype(compute_np_dtype, copy=False) - probabilities) / weights
+        working_response = (
+            linear_predictor
+            + (targets.astype(compute_np_dtype, copy=False) - probabilities) / weights
+            - predictor_offset_array
+        )
         if (
             cached_proposal_base_parameters is not None
             and np.array_equal(parameters, cached_proposal_base_parameters)
@@ -1355,7 +1646,7 @@ def _binary_posterior_state(
 
     final_objective, _final_gradient, final_weights, linear_predictor, probabilities = penalized_terms(parameters)
     target_values = targets.astype(compute_np_dtype, copy=False)
-    final_working_response = linear_predictor + (target_values - probabilities) / final_weights
+    final_working_response = linear_predictor + (target_values - probabilities) / final_weights - predictor_offset_array
     working_alpha, working_beta, _working_variance, _working_projected_targets, _working_fitted_response, _working_quadratic, _working_logdet_covariance, _working_logdet_gls = (
         _restricted_posterior_state(
             genotype_matrix=standardized_genotypes,
@@ -1386,7 +1677,7 @@ def _binary_posterior_state(
         linear_predictor = _working_linear_predictor
         probabilities = _working_probabilities
 
-    final_working_response = linear_predictor + (target_values - probabilities) / final_weights
+    final_working_response = linear_predictor + (target_values - probabilities) / final_weights - predictor_offset_array
     final_alpha, final_beta, beta_variance, _projected_targets, _fitted_response, _restricted_quadratic, logdet_covariance, logdet_gls = (
         _restricted_posterior_state(
                 genotype_matrix=standardized_genotypes,
