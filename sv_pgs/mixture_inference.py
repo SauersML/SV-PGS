@@ -1628,15 +1628,10 @@ def _effective_sample_space_preconditioner_rank(
     resolved_rank = max(int(requested_rank), 0)
     if resolved_rank == 0:
         return 0
-    if genotype_matrix._cupy_cache is not None or (
-        genotype_matrix.raw is not None
-        and not genotype_matrix.supports_jax_dense_ops()
-        and _try_import_cupy() is not None
-    ):
-        return min(resolved_rank, variant_count)
-    if sample_count < 32_768 or variant_count < 65_536:
-        return min(resolved_rank, variant_count)
-    return min(max(resolved_rank, 1_024), variant_count)
+    target_rank = resolved_rank
+    if sample_count >= 32_768 and variant_count >= 65_536:
+        target_rank = max(target_rank, 1_024)
+    return min(target_rank, variant_count)
 
 
 def _prefer_iterative_variant_space(

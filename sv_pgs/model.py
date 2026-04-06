@@ -761,13 +761,17 @@ def _runtime_tuned_config_for_fit(
         return config, None
     gpu_budget_bytes = _gpu_materialization_budget_bytes(cupy)
     cacheable_dense_variants = max(int(gpu_budget_bytes // max(sample_count * 4, 1)), 1)
-    tuned_exact_solver_limit = min(int(config.exact_solver_matrix_limit), GPU_EXACT_SOLVER_LIMIT)
+    tuned_exact_solver_limit = min(
+        int(config.exact_solver_matrix_limit),
         max(int(cacheable_dense_variants * 0.9), 1),
+        GPU_EXACT_SOLVER_LIMIT,
     )
     max_gpu_preconditioner_rank = max(1, min(cacheable_dense_variants, GPU_PRECONDITIONER_RANK_LIMIT))
-    tuned_preconditioner_rank = min(int(config.sample_space_preconditioner_rank), max_gpu_preconditioner_rank)
+    target_preconditioner_rank = int(config.sample_space_preconditioner_rank)
+    if sample_count >= 32_768 and genotype_matrix.shape[1] >= 65_536:
+        target_preconditioner_rank = max(target_preconditioner_rank, GPU_PRECONDITIONER_RANK_LIMIT)
+    tuned_preconditioner_rank = min(target_preconditioner_rank, max_gpu_preconditioner_rank)
     if (
-        and
         tuned_exact_solver_limit == int(config.exact_solver_matrix_limit)
         and tuned_preconditioner_rank == int(config.sample_space_preconditioner_rank)
     ):
