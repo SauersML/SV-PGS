@@ -9,9 +9,10 @@ from typing import Any, Iterator, Sequence
 import sv_pgs._jax  # noqa: F401
 import jax
 import jax.numpy as jnp
+from jax import dlpack as jax_dlpack
 import numpy as np
 from sv_pgs._jax import gpu_compute_jax_dtype, gpu_compute_numpy_dtype
-from sv_pgs.plink import open_bed
+from sv_pgs.plink import PLINK_MISSING_INT8, open_bed
 from sv_pgs.progress import log, mem
 
 DEFAULT_GENOTYPE_BATCH_SIZE = 1024  # fallback when sample count is unknown
@@ -171,13 +172,14 @@ class PlinkRawGenotypeMatrix(RawGenotypeMatrix):
 
     def iter_column_batches_i8(
         self,
+        variant_indices: Sequence[int] | np.ndarray | None = None,
         batch_size: int | None = None,
     ) -> Iterator[RawGenotypeBatch]:
         """Iterate as int8 batches (4x less memory, no float conversion).
 
         Values are 0/1/2/-127(missing). Callers must handle -127 sentinel.
         """
-        resolved_indices = _resolve_variant_indices(self.variant_count, None)
+        resolved_indices = _resolve_variant_indices(self.variant_count, variant_indices)
         # int8 reads are 4x smaller than float32, but JAX kernels still expand to
         # float32 intermediates (~10 bytes/element peak), so do NOT inflate batch size.
         requested = max(int(self.batch_size if batch_size is None else batch_size), 1)
@@ -340,7 +342,9 @@ def _as_gpu_compute_jax(array) -> jnp.ndarray:
 
 
 def _cupy_to_jax(array) -> jnp.ndarray:
-    """Convert CuPy result to JAX via host copy for stream-safe interop."""
+    """Convert CuPy result to JAX, preferring zero-copy DLPack interop."""
+    if hasattr(array, "__dlpack__"):
+        return jax_dlpack.from_dlpack(array).astype(gpu_compute_jax_dtype())
     return jnp.asarray(array.get(), dtype=gpu_compute_jax_dtype())
 
 
@@ -349,7 +353,61 @@ def _to_cupy_float32(array):
     cupy = _try_import_cupy()
     if cupy is None:
         raise RuntimeError("CuPy is not available.")
+    if isinstance(array, jax.Array) and hasattr(cupy, "from_dlpack"):
+        return cupy.from_dlpack(array).astype(cupy.float32, copy=False)
     return cupy.asarray(np.asarray(array, dtype=np.float32))
+
+
+def _standardize_batch_cupy(
+    batch_values: np.ndarray,
+    means,
+    scales,
+    cupy,
+    *,
+    missing_sentinel: int | None = None,
+):
+    """Standardize a raw batch directly on GPU."""
+    standardized = cupy.asarray(batch_values, dtype=cupy.float32)
+    if missing_sentinel is None:
+        missing_mask = cupy.isnan(standardized)
+    else:
+        missing_mask = standardized == float(missing_sentinel)
+    standardized -= means[None, :]
+    standardized /= scales[None, :]
+    standardized[missing_mask] = 0.0
+    return standardized
+
+
+def _iter_standardized_gpu_batches(
+    raw: RawGenotypeMatrix,
+    variant_indices: np.ndarray,
+    means,
+    scales,
+    *,
+    batch_size: int,
+    cupy,
+):
+    selected_means = cupy.asarray(means[variant_indices], dtype=cupy.float32)
+    selected_scales = cupy.asarray(scales[variant_indices], dtype=cupy.float32)
+    local_start = 0
+    if hasattr(raw, "iter_column_batches_i8"):
+        batch_iter = raw.iter_column_batches_i8(variant_indices, batch_size=batch_size)
+        missing_sentinel = PLINK_MISSING_INT8
+    else:
+        batch_iter = raw.iter_column_batches(variant_indices, batch_size=batch_size)
+        missing_sentinel = None
+    for raw_batch in batch_iter:
+        batch_width = raw_batch.values.shape[1]
+        local_stop = local_start + batch_width
+        batch_slice = slice(local_start, local_stop)
+        yield batch_slice, _standardize_batch_cupy(
+            raw_batch.values,
+            selected_means[batch_slice],
+            selected_scales[batch_slice],
+            cupy,
+            missing_sentinel=missing_sentinel,
+        )
+        local_start = local_stop
 
 
 def _gpu_materialization_budget_bytes(cupy) -> int:
@@ -449,8 +507,17 @@ class StandardizedGenotypeMatrix:
             else:
                 log(f"    streaming {self.shape[1]} variants x {self.shape[0]} samples ({nbytes / 1e9:.1f} GB) directly to GPU  mem={mem()}")
                 gpu_matrix = cupy.empty(self.shape, dtype=cupy.float32, order="C")
-                for batch in self.iter_column_batches(batch_size=auto_batch_size(self.shape[0])):
-                    gpu_matrix[:, batch.variant_indices] = cupy.asarray(batch.values, dtype=cupy.float32)
+                if self.raw is None:
+                    raise RuntimeError("GPU materialization requires raw backing storage or a dense cache.")
+                for batch_slice, standardized_batch in _iter_standardized_gpu_batches(
+                    self.raw,
+                    self.variant_indices,
+                    self.means,
+                    self.scales,
+                    batch_size=auto_batch_size(self.shape[0]),
+                    cupy=cupy,
+                ):
+                    gpu_matrix[:, batch_slice] = standardized_batch
                 self._cupy_cache = gpu_matrix
             cupy.cuda.Device().synchronize()
             import gc
@@ -665,22 +732,11 @@ def _contiguous_index_or_slice(indices: np.ndarray) -> slice | np.ndarray:
     return np.ascontiguousarray(resolved_indices, dtype=np.intp)
 
 
-# Z-score standardize a batch of genotype columns:
-#   1. Replace NaN (missing) with the variant's mean (mean imputation)
-#   2. Subtract the mean (centering)
-#   3. Divide by the standard deviation (scaling)
-# After this, each variant column has mean ~0 and std ~1.
-# JIT-compiled for GPU acceleration — first call compiles, subsequent calls are fast.
-@jax.jit
-def _standardize_batch_jit(batch_jax: jnp.ndarray, mean_jax: jnp.ndarray, scale_jax: jnp.ndarray) -> jnp.ndarray:
-    nan_mask = jnp.isnan(batch_jax)
-    centered = batch_jax - mean_jax[None, :]
-    return jnp.where(nan_mask, 0.0, centered) / scale_jax[None, :]
-
-
 def _standardize_batch(batch: np.ndarray, means: np.ndarray, scales: np.ndarray) -> np.ndarray:
-    return np.asarray(_standardize_batch_jit(
-        jnp.asarray(batch, dtype=jnp.float32),
-        jnp.asarray(means, dtype=jnp.float32),
-        jnp.asarray(scales, dtype=jnp.float32),
-    ), dtype=np.float32)
+    batch_f32 = np.asarray(batch, dtype=np.float32)
+    means_f32 = np.asarray(means, dtype=np.float32)
+    scales_f32 = np.asarray(scales, dtype=np.float32)
+    standardized = batch_f32 - means_f32[None, :]
+    standardized[np.isnan(batch_f32)] = 0.0
+    standardized /= scales_f32[None, :]
+    return standardized.astype(np.float32, copy=False)

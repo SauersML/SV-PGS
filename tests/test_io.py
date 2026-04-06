@@ -4,6 +4,7 @@ import csv
 import gzip
 import json
 import os
+import pickle
 from pathlib import Path
 
 import numpy as np
@@ -515,6 +516,84 @@ def test_vcf_cache_key_changes_when_content_changes(tmp_path: Path):
     second_key = _vcf_cache_key(vcf_path, keep_sample_indices)
 
     assert first_key != second_key
+
+
+def test_vcf_cache_load_upgrades_legacy_stats_bundle_to_manifest(tmp_path: Path):
+    vcf_path = tmp_path / "cohort.vcf"
+    vcf_path.write_text("##fileformat=VCFv4.2\n", encoding="utf-8")
+    keep_sample_indices = np.array([0, 2], dtype=np.int32)
+    key = _vcf_cache_key(vcf_path, keep_sample_indices)
+    cache_dir = tmp_path / ".sv_pgs_cache"
+    cache_dir.mkdir()
+
+    genotype_matrix = np.array([[0, 1], [1, 2]], dtype=np.int8, order="F")
+    np.save(cache_dir / f"{key}.genotypes.npy", genotype_matrix, allow_pickle=False)
+    with open(cache_dir / f"{key}.variants.pkl", "wb") as handle:
+        pickle.dump(
+            [
+                _VariantDefaults(
+                    variant_id="variant_0",
+                    variant_class=VariantClass.SNV,
+                    chromosome="1",
+                    position=100,
+                    length=1.0,
+                    allele_frequency=0.25,
+                    quality=50.0,
+                ),
+                _VariantDefaults(
+                    variant_id="variant_1",
+                    variant_class=VariantClass.SNV,
+                    chromosome="1",
+                    position=200,
+                    length=1.0,
+                    allele_frequency=0.5,
+                    quality=40.0,
+                ),
+            ],
+            handle,
+            protocol=pickle.HIGHEST_PROTOCOL,
+        )
+    np.savez_compressed(
+        cache_dir / f"{key}.stats.npz",
+        means=np.array([0.5, 1.5], dtype=np.float32),
+        scales=np.array([0.75, 0.5], dtype=np.float32),
+        allele_frequencies=np.array([0.25, 0.75], dtype=np.float32),
+        support_counts=np.array([1, 2], dtype=np.int32),
+    )
+
+    cached = _load_vcf_from_cache(vcf_path=vcf_path, keep_sample_indices=keep_sample_indices)
+
+    assert cached is not None
+    cached_genotypes, _, cached_variant_stats = cached
+    np.testing.assert_array_equal(cached_genotypes, genotype_matrix)
+    np.testing.assert_allclose(cached_variant_stats.means, np.array([0.5, 1.5], dtype=np.float32))
+
+    manifest = json.loads((cache_dir / f"{key}.manifest.json").read_text(encoding="utf-8"))
+    assert manifest["stats_file"] == f"{key}.stats.npy"
+    assert (cache_dir / f"{key}.stats.npy").exists()
+
+
+def test_vcf_cache_load_ignores_incomplete_manifestless_new_bundle(tmp_path: Path):
+    vcf_path = tmp_path / "cohort.vcf"
+    vcf_path.write_text("##fileformat=VCFv4.2\n", encoding="utf-8")
+    key = _vcf_cache_key(vcf_path, None)
+    cache_dir = tmp_path / ".sv_pgs_cache"
+    cache_dir.mkdir()
+
+    np.save(cache_dir / f"{key}.genotypes.npy", np.array([[0, 1]], dtype=np.int8), allow_pickle=False)
+    with open(cache_dir / f"{key}.variants.pkl", "wb") as handle:
+        pickle.dump([], handle, protocol=pickle.HIGHEST_PROTOCOL)
+    stats_dtype = np.dtype(
+        [
+            ("means", "<f4"),
+            ("scales", "<f4"),
+            ("allele_frequencies", "<f4"),
+            ("support_counts", "<i4"),
+        ]
+    )
+    np.save(cache_dir / f"{key}.stats.npy", np.zeros(1, dtype=stats_dtype), allow_pickle=False)
+
+    assert _load_vcf_from_cache(vcf_path=vcf_path, keep_sample_indices=None) is None
 
 
 def test_load_dataset_from_plink_auto_detects_person_id_column(tmp_path: Path):

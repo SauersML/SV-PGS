@@ -139,6 +139,63 @@ class PosteriorState:
     sigma_error2: float           # unexplained noise variance (fixed at 1.0 for binary)
 
 
+def _initialize_alpha_state(
+    covariate_matrix: np.ndarray,
+    targets: np.ndarray,
+    trait_type: TraitType,
+) -> np.ndarray:
+    covariates = np.asarray(covariate_matrix, dtype=np.float64)
+    target_array = np.asarray(targets, dtype=np.float64)
+    if covariates.ndim != 2:
+        raise ValueError("covariate_matrix must be 2D.")
+    alpha_state = np.zeros(covariates.shape[1], dtype=np.float64)
+    if covariates.shape[1] == 0:
+        return alpha_state
+    if trait_type == TraitType.BINARY:
+        prevalence = float(np.clip(np.mean(target_array), 1e-6, 1.0 - 1e-6))
+        alpha_state[0] = float(np.log(prevalence / (1.0 - prevalence)))
+        return alpha_state
+    normal_matrix = covariates.T @ covariates + np.eye(covariates.shape[1], dtype=np.float64) * 1e-8
+    right_hand_side = covariates.T @ target_array
+    return np.linalg.solve(normal_matrix, right_hand_side).astype(np.float64, copy=False)
+
+
+def _apply_binary_intercept_calibration(
+    posterior_state: PosteriorState,
+    targets: np.ndarray,
+) -> PosteriorState:
+    intercept_shift = np.float64(
+        _calibrate_binary_intercept(
+            linear_predictor=posterior_state.linear_predictor,
+            targets=targets,
+        )
+    )
+    calibrated_alpha = np.asarray(posterior_state.alpha, dtype=np.float64).copy()
+    calibrated_alpha[0] += intercept_shift
+    return PosteriorState(
+        alpha=calibrated_alpha,
+        beta=np.asarray(posterior_state.beta, dtype=np.float64),
+        beta_variance=np.asarray(posterior_state.beta_variance, dtype=np.float64),
+        linear_predictor=np.asarray(posterior_state.linear_predictor, dtype=np.float64) + intercept_shift,
+        collapsed_objective=float(posterior_state.collapsed_objective),
+        sigma_error2=float(posterior_state.sigma_error2),
+    )
+
+
+def _gpu_exact_variant_linear_predictor(X_gpu, beta: np.ndarray) -> np.ndarray:
+    import cupy as cp
+
+    return np.asarray((X_gpu @ cp.asarray(beta, dtype=cp.float32)).get(), dtype=np.float64)
+
+
+def _gpu_cholesky_solve(right_hand_side, cholesky_factor_gpu, solve_triangular_gpu):
+    import cupy as cp
+
+    rhs_gpu = cp.asarray(right_hand_side, dtype=cp.float32)
+    lower_solution = solve_triangular_gpu(cholesky_factor_gpu, rhs_gpu, lower=True)
+    return solve_triangular_gpu(cholesky_factor_gpu.T, lower_solution, lower=False)
+
+
 def fit_variational_em(
     genotypes: StandardizedGenotypeMatrix | np.ndarray,
     covariates: np.ndarray,
@@ -174,7 +231,11 @@ def fit_variational_em(
     local_scale = np.ones(len(reduced_records), dtype=np.float64)
     auxiliary_delta = np.asarray(local_shape_b, dtype=np.float64)
     sigma_error2 = 1.0
-    alpha_state = np.zeros(covariate_matrix.shape[1], dtype=np.float64)
+    alpha_state = _initialize_alpha_state(
+        covariate_matrix=covariate_matrix,
+        targets=target_vector,
+        trait_type=config.trait_type,
+    )
     beta_state = np.zeros(genotype_matrix.shape[1], dtype=np.float64)
 
     objective_history: list[float] = []
@@ -234,6 +295,11 @@ def fit_variational_em(
             trait_type=config.trait_type,
             config=config,
         )
+        if config.trait_type == TraitType.BINARY and config.binary_intercept_calibration:
+            posterior_state = _apply_binary_intercept_calibration(
+                posterior_state=posterior_state,
+                targets=target_vector,
+            )
         alpha_state = posterior_state.alpha
         beta_state = posterior_state.beta
         sigma_error2 = posterior_state.sigma_error2
@@ -402,20 +468,9 @@ def fit_variational_em(
         config=config,
     )
     if config.trait_type == TraitType.BINARY and config.binary_intercept_calibration:
-        calibrated_alpha = final_state.alpha.copy()
-        calibrated_alpha[0] += np.float64(
-            _calibrate_binary_intercept(
-                linear_predictor=final_state.linear_predictor,
-                targets=target_vector,
-            )
-        )
-        final_state = PosteriorState(
-            alpha=calibrated_alpha,
-            beta=final_state.beta,
-            beta_variance=final_state.beta_variance,
-            linear_predictor=np.asarray(genotype_matrix.matvec(final_state.beta), dtype=np.float64) + covariate_matrix @ calibrated_alpha,
-            collapsed_objective=final_state.collapsed_objective,
-            sigma_error2=final_state.sigma_error2,
+        final_state = _apply_binary_intercept_calibration(
+            posterior_state=final_state,
+            targets=target_vector,
         )
 
     log(f"  final posterior computed  obj={final_state.collapsed_objective:.6f}  sigma_e2={final_state.sigma_error2:.4f}  mem={mem()}")
@@ -1272,25 +1327,33 @@ def _restricted_posterior_state(
                 CtWX = xtdxc_gpu.T.get().astype(np.float64)  # (k, p)
                 correction_coeff = _cholesky_solve(covariate_precision_cholesky, CtWX)
                 projected_targets_np = apply_projector(targets)
-                variant_rhs_cp = cp.asarray(
-                    np.asarray(genotype_matrix.transpose_matvec(projected_targets_np), dtype=np.float32),
-                    dtype=cp.float32,
-                )
+                projected_targets_cp = cp.asarray(projected_targets_np, dtype=cp.float32)
+                variant_rhs_cp = X_gpu.T @ projected_targets_cp
                 if use_gpu_exact_variant:
                     correction_gpu = xtdxc_gpu @ cp.asarray(correction_coeff, dtype=cp.float32)
+                    prior_precision_cp = cp.asarray(prior_precision, dtype=cp.float32)
                     variant_precision_gpu = xtdx_gpu - correction_gpu
-                    variant_precision_gpu += cp.diag(cp.asarray(prior_precision, dtype=cp.float32))
+                    variant_precision_gpu += cp.diag(prior_precision_cp)
                     variant_precision_gpu = (variant_precision_gpu + variant_precision_gpu.T) * 0.5
                     variant_precision_gpu += cp.eye(variant_count, dtype=cp.float32) * 1e-4
                     variant_precision_cholesky_gpu = cp.linalg.cholesky(variant_precision_gpu)
 
                     def solve_variant_rhs(right_hand_side: np.ndarray) -> np.ndarray:
-                        rhs_cp = cp.asarray(np.asarray(right_hand_side, dtype=np.float32), dtype=cp.float32)
-                        y = cp_solve_triangular(variant_precision_cholesky_gpu, rhs_cp, lower=True)
-                        x = cp_solve_triangular(variant_precision_cholesky_gpu.T, y, lower=False)
-                        return np.asarray(x.get(), dtype=np.float64)
+                        return np.asarray(
+                            _gpu_cholesky_solve(
+                                right_hand_side,
+                                variant_precision_cholesky_gpu,
+                                cp_solve_triangular,
+                            ).get(),
+                            dtype=np.float64,
+                        )
 
-                    beta = np.asarray(solve_variant_rhs(variant_rhs_cp.get()), dtype=np.float64)
+                    beta_cp = _gpu_cholesky_solve(
+                        variant_rhs_cp,
+                        variant_precision_cholesky_gpu,
+                        cp_solve_triangular,
+                    )
+                    beta = np.asarray(beta_cp.get(), dtype=np.float64)
                     beta_variance = (
                         _posterior_variance_hutchinson_diagonal(
                             solve_variant_rhs=solve_variant_rhs,
@@ -1306,13 +1369,23 @@ def _restricted_posterior_state(
                         if compute_logdet
                         else 0.0
                     )
-                    genetic_linear_predictor = np.asarray(genotype_matrix.matvec(beta), dtype=np.float64)
-                    del correction_gpu, xtdxc_gpu, xtdx_gpu, variant_precision_gpu, variant_precision_cholesky_gpu, variant_rhs_cp
+                    genetic_linear_predictor = _gpu_exact_variant_linear_predictor(X_gpu, beta)
+                    del (
+                        beta_cp,
+                        correction_gpu,
+                        prior_precision_cp,
+                        projected_targets_cp,
+                        xtdxc_gpu,
+                        xtdx_gpu,
+                        variant_precision_gpu,
+                        variant_precision_cholesky_gpu,
+                        variant_rhs_cp,
+                    )
                 else:
                     correction_cpu = CtWX.T @ correction_coeff
                     XtPX = np.asarray(xtdx_gpu.get(), dtype=np.float64) - correction_cpu
                     variant_rhs = np.asarray(variant_rhs_cp.get(), dtype=np.float64)
-                    del xtdxc_gpu, xtdx_gpu, variant_rhs_cp
+                    del projected_targets_cp, xtdxc_gpu, xtdx_gpu, variant_rhs_cp
             else:
                 dense_genotypes = np.asarray(genotype_matrix.materialize(batch_size=posterior_variance_batch_size), dtype=np.float64)
                 projected_genotypes = apply_projector(dense_genotypes)
@@ -1343,7 +1416,10 @@ def _restricted_posterior_state(
                     )
                 )
                 logdet_A = 2.0 * float(np.sum(np.log(np.diag(variant_precision_cholesky)))) if compute_logdet else 0.0
-                genetic_linear_predictor = np.asarray(genotype_matrix.matvec(beta), dtype=np.float64)
+                if genotype_matrix._cupy_cache is not None:
+                    genetic_linear_predictor = _gpu_exact_variant_linear_predictor(X_gpu, beta)
+                else:
+                    genetic_linear_predictor = np.asarray(genotype_matrix.matvec(beta), dtype=np.float64)
         else:
             import time as _time
             log(f"    restricted posterior: PCG variant-space solve (p={variant_count}, n={sample_count})  mem={mem()}")

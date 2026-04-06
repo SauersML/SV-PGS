@@ -141,33 +141,16 @@ class BayesianPGS:
         active_variant_indices = select_active_variant_indices(
             variant_records=selection_records,
             config=self.config,
+            standardized_genotypes=standardized_genotypes,
+            covariates=prepared_arrays.covariates,
+            targets=prepared_arrays.targets,
+            trait_type=self.config.trait_type,
         )
         log(f"active variants: {len(active_variant_indices)} / {len(normalized_records)} ({100.0*len(active_variant_indices)/max(len(normalized_records),1):.1f}%)")
         active_records = [normalized_records[int(variant_index)] for variant_index in active_variant_indices]
         active_genotypes = standardized_genotypes.subset(active_variant_indices)
-
-        if active_variant_indices.shape[0] > self.config.maximum_tie_map_variants:
-            log(
-                f"skipping tie map for {active_variant_indices.shape[0]} active variants "
-                f"(limit={self.config.maximum_tie_map_variants}); using identity mapping"
-            )
-            n_active = active_variant_indices.shape[0]
-            kept = np.arange(n_active, dtype=np.int32)
-            reduced_tie_map = TieMap(
-                kept_indices=kept,
-                original_to_reduced=kept.copy(),
-                reduced_to_group=[
-                    TieGroup(
-                        representative_index=int(i),
-                        member_indices=np.asarray([i], dtype=np.int32),
-                        signs=np.asarray([1.0], dtype=np.float32),
-                    )
-                    for i in range(n_active)
-                ],
-            )
-        else:
-            log("building tie map (detecting identical/negated genotype columns)...")
-            reduced_tie_map = build_tie_map(active_genotypes, active_records, self.config)
+        log("building tie map (detecting identical/negated genotype columns)...")
+        reduced_tie_map = build_tie_map(active_genotypes, active_records, self.config)
         original_space_tie_map = _project_tie_map_to_original_space(
             reduced_tie_map=reduced_tie_map,
             active_variant_indices=active_variant_indices,

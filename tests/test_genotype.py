@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import jax.numpy as jnp
 import numpy as np
 import pytest
 
@@ -69,6 +70,59 @@ class _SpyStreamingRawGenotypeMatrix(_StreamingRawGenotypeMatrix):
         )
         self.materialize_requests.append(resolved_indices.tolist())
         return super().materialize(resolved_indices)
+
+
+class _SpyInt8StreamingRawGenotypeMatrix(RawGenotypeMatrix):
+    def __init__(self, matrix: np.ndarray) -> None:
+        self.matrix = np.asarray(matrix, dtype=np.int8)
+        self.i8_requests: list[list[int]] = []
+        self.float_requests: list[list[int]] = []
+
+    @property
+    def shape(self) -> tuple[int, int]:
+        return self.matrix.shape
+
+    def iter_column_batches_i8(
+        self,
+        variant_indices=None,
+        batch_size: int = 1024,
+    ):
+        resolved_indices = (
+            np.arange(self.matrix.shape[1], dtype=np.int32)
+            if variant_indices is None
+            else np.asarray(variant_indices, dtype=np.int32)
+        )
+        self.i8_requests.append(resolved_indices.tolist())
+        safe_batch_size = max(int(batch_size), 1)
+        for start_index in range(0, resolved_indices.shape[0], safe_batch_size):
+            batch_indices = resolved_indices[start_index : start_index + safe_batch_size]
+            yield RawGenotypeBatch(
+                variant_indices=batch_indices,
+                values=np.asarray(self.matrix[:, batch_indices], dtype=np.int8),
+            )
+
+    def iter_column_batches(
+        self,
+        variant_indices=None,
+        batch_size: int = 1024,
+    ):
+        resolved_indices = (
+            np.arange(self.matrix.shape[1], dtype=np.int32)
+            if variant_indices is None
+            else np.asarray(variant_indices, dtype=np.int32)
+        )
+        self.float_requests.append(resolved_indices.tolist())
+        raise AssertionError("GPU materialization should prefer int8 batches when available.")
+
+    def materialize(self, variant_indices=None) -> np.ndarray:
+        resolved_indices = (
+            np.arange(self.matrix.shape[1], dtype=np.int32)
+            if variant_indices is None
+            else np.asarray(variant_indices, dtype=np.int32)
+        )
+        values = self.matrix[:, resolved_indices].astype(np.float32)
+        values[self.matrix[:, resolved_indices] == -127] = np.nan
+        return values
 
 
 def test_streaming_standardized_linear_algebra_matches_dense_path():
@@ -284,3 +338,171 @@ def test_try_materialize_gpu_skips_when_matrix_exceeds_budget(monkeypatch: pytes
 
     assert standardized.try_materialize_gpu() is False
     assert standardized._cupy_cache is None
+
+
+def test_to_cupy_float32_uses_dlpack_for_jax_arrays(monkeypatch: pytest.MonkeyPatch):
+    dlpack_inputs: list[object] = []
+
+    class _FakeCupyArray:
+        def astype(self, dtype, copy=False):
+            return ("astype", dtype, copy)
+
+    fake_cupy_array = _FakeCupyArray()
+
+    class _FakeCupy:
+        float32 = np.float32
+
+        @staticmethod
+        def from_dlpack(array):
+            dlpack_inputs.append(array)
+            return fake_cupy_array
+
+        @staticmethod
+        def asarray(array, dtype=None):
+            raise AssertionError("DLPack path should bypass host asarray.")
+
+    monkeypatch.setattr(genotype_module, "_try_import_cupy", lambda: _FakeCupy())
+
+    result = genotype_module._to_cupy_float32(jnp.asarray([1.0, 2.0], dtype=jnp.float32))
+
+    assert len(dlpack_inputs) == 1
+    assert result == ("astype", np.float32, False)
+
+
+def test_cupy_to_jax_uses_dlpack_when_available(monkeypatch: pytest.MonkeyPatch):
+    dlpack_inputs: list[object] = []
+
+    class _FakeCupyArray:
+        def __dlpack__(self, stream=None):
+            return "dlpack-capsule"
+
+        def get(self):
+            raise AssertionError("DLPack path should bypass host get().")
+
+    fake_array = _FakeCupyArray()
+    expected = jnp.asarray([3.0, 4.0], dtype=genotype_module.gpu_compute_jax_dtype())
+
+    monkeypatch.setattr(
+        genotype_module.jax_dlpack,
+        "from_dlpack",
+        lambda array: dlpack_inputs.append(array) or expected,
+    )
+
+    result = genotype_module._cupy_to_jax(fake_array)
+
+    assert dlpack_inputs == [fake_array]
+    np.testing.assert_allclose(np.asarray(result), np.asarray(expected))
+
+
+def test_try_materialize_gpu_standardizes_batches_directly_on_gpu(monkeypatch: pytest.MonkeyPatch):
+    class _FakeCudaRuntime:
+        @staticmethod
+        def memGetInfo():
+            return (8_000_000_000, 16_000_000_000)
+
+    class _FakeDevice:
+        def synchronize(self) -> None:
+            return None
+
+    class _FakeCuda:
+        runtime = _FakeCudaRuntime()
+
+        @staticmethod
+        def Device():
+            return _FakeDevice()
+
+    class _FakeCupy:
+        float32 = np.float32
+        cuda = _FakeCuda()
+
+        @staticmethod
+        def asarray(array, dtype=None):
+            return np.asarray(array, dtype=dtype)
+
+        @staticmethod
+        def empty(shape, dtype=None, order=None):
+            return np.empty(shape, dtype=dtype, order="C" if order is None else order)
+
+        @staticmethod
+        def isnan(array):
+            return np.isnan(array)
+
+    raw_matrix = np.array(
+        [
+            [0.0, 1.0, np.nan],
+            [1.0, np.nan, 2.0],
+            [2.0, 1.0, 0.0],
+        ],
+        dtype=np.float32,
+    )
+    means = np.array([1.0, 1.0, 1.0], dtype=np.float32)
+    scales = np.array([0.5, 2.0, 1.0], dtype=np.float32)
+    expected = as_raw_genotype_matrix(raw_matrix).standardized(means, scales).materialize()
+    standardized = as_raw_genotype_matrix(raw_matrix).standardized(means, scales)
+
+    monkeypatch.setattr(genotype_module, "_try_import_cupy", lambda: _FakeCupy())
+
+    assert standardized.try_materialize_gpu() is True
+    np.testing.assert_allclose(standardized._cupy_cache, expected)
+
+
+def test_try_materialize_gpu_prefers_int8_batches_when_available(monkeypatch: pytest.MonkeyPatch):
+    class _FakeCudaRuntime:
+        @staticmethod
+        def memGetInfo():
+            return (8_000_000_000, 16_000_000_000)
+
+    class _FakeDevice:
+        def synchronize(self) -> None:
+            return None
+
+    class _FakeCuda:
+        runtime = _FakeCudaRuntime()
+
+        @staticmethod
+        def Device():
+            return _FakeDevice()
+
+    class _FakeCupy:
+        float32 = np.float32
+        cuda = _FakeCuda()
+
+        @staticmethod
+        def asarray(array, dtype=None):
+            return np.asarray(array, dtype=dtype)
+
+        @staticmethod
+        def empty(shape, dtype=None, order=None):
+            return np.empty(shape, dtype=dtype, order="C" if order is None else order)
+
+        @staticmethod
+        def isnan(array):
+            return np.isnan(array)
+
+    raw_i8 = np.array(
+        [
+            [0, 1, -127, 2],
+            [1, -127, 2, 0],
+            [2, 1, 0, 1],
+        ],
+        dtype=np.int8,
+    )
+    raw = _SpyInt8StreamingRawGenotypeMatrix(raw_i8)
+    means = np.array([1.0, 1.0, 1.0, 1.0], dtype=np.float32)
+    scales = np.array([0.5, 2.0, 1.0, 0.5], dtype=np.float32)
+    standardized = raw.standardized(means, scales).subset(np.array([1, 3], dtype=np.int32))
+    expected = np.array(
+        [
+            [0.0, 2.0],
+            [0.0, -2.0],
+            [0.0, 0.0],
+        ],
+        dtype=np.float32,
+    )
+
+    monkeypatch.setattr(genotype_module, "_try_import_cupy", lambda: _FakeCupy())
+
+    assert standardized.try_materialize_gpu() is True
+    assert raw.i8_requests == [[1, 3]]
+    assert raw.float_requests == []
+    np.testing.assert_allclose(standardized._cupy_cache, expected)

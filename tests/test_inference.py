@@ -11,8 +11,10 @@ from sv_pgs.genotype import as_raw_genotype_matrix
 from sv_pgs.inference import fit_variational_em
 from sv_pgs.mixture_inference import (
     _build_restricted_projector_jax,
+    _calibrate_binary_intercept,
     PosteriorState,
     _binary_posterior_state,
+    _initialize_alpha_state,
     _member_prior_variances_from_reduced_state,
     _parse_scale_model_feature_names,
     _quantitative_posterior_state,
@@ -77,6 +79,42 @@ def test_binary_inference_runs(random_generator):
     assert result.sigma_error2 == 1.0
     assert len(result.class_tpb_shape_a) == 1
     assert len(result.class_tpb_shape_b) == 1
+
+
+def test_initialize_alpha_state_uses_target_prevalence_for_binary():
+    covariate_matrix = np.ones((6, 2), dtype=np.float64)
+    targets = np.array([1.0, 1.0, 1.0, 0.0, 0.0, 0.0], dtype=np.float64)
+
+    alpha_state = _initialize_alpha_state(
+        covariate_matrix=covariate_matrix,
+        targets=targets,
+        trait_type=TraitType.BINARY,
+    )
+
+    assert alpha_state.shape == (2,)
+    assert np.isclose(alpha_state[0], 0.0, atol=1e-8)
+    assert np.isclose(alpha_state[1], 0.0, atol=1e-8)
+
+
+def test_initialize_alpha_state_fits_covariates_for_quantitative():
+    covariate_matrix = np.array(
+        [
+            [1.0, -1.0],
+            [1.0, 0.0],
+            [1.0, 1.0],
+            [1.0, 2.0],
+        ],
+        dtype=np.float64,
+    )
+    targets = np.array([-1.0, 1.0, 3.0, 5.0], dtype=np.float64)
+
+    alpha_state = _initialize_alpha_state(
+        covariate_matrix=covariate_matrix,
+        targets=targets,
+        trait_type=TraitType.QUANTITATIVE,
+    )
+
+    np.testing.assert_allclose(alpha_state, np.array([1.0, 2.0], dtype=np.float64), atol=1e-6)
 
 
 def test_binary_posterior_stops_after_stalled_trust_region_step(random_generator, monkeypatch):
@@ -621,6 +659,71 @@ def test_validation_restores_best_iterate(monkeypatch: pytest.MonkeyPatch):
     )
 
     assert np.isclose(float(result.beta_reduced[0]), 1.0)
+
+
+def test_binary_validation_uses_calibrated_intercept(monkeypatch: pytest.MonkeyPatch):
+    validation_alphas: list[np.ndarray] = []
+    expected_shift = _calibrate_binary_intercept(
+        linear_predictor=np.zeros(8, dtype=np.float64),
+        targets=np.array([1.0] * 6 + [0.0] * 2, dtype=np.float64),
+    )
+
+    def fake_fit_collapsed_posterior(
+        genotype_matrix,
+        covariate_matrix,
+        targets,
+        reduced_prior_variances,
+        sigma_error2,
+        alpha_init,
+        beta_init,
+        trait_type,
+        config,
+    ):
+        return PosteriorState(
+            alpha=np.zeros(covariate_matrix.shape[1], dtype=np.float64),
+            beta=np.zeros(1, dtype=np.float64),
+            beta_variance=np.ones(1, dtype=np.float64),
+            linear_predictor=np.zeros(targets.shape[0], dtype=np.float64),
+            collapsed_objective=0.0,
+            sigma_error2=1.0,
+        )
+
+    def fake_validation_metric(trait_type, genotype_matrix, covariate_matrix, targets, alpha, beta):
+        validation_alphas.append(np.asarray(alpha, dtype=np.float64).copy())
+        return 0.0
+
+    monkeypatch.setattr(mixture_inference, "_fit_collapsed_posterior", fake_fit_collapsed_posterior)
+    monkeypatch.setattr(mixture_inference, "_validation_metric", fake_validation_metric)
+
+    config = ModelConfig(
+        trait_type=TraitType.BINARY,
+        max_outer_iterations=1,
+        update_hyperparameters=False,
+        binary_intercept_calibration=True,
+    )
+    targets = np.array([1.0] * 6 + [0.0] * 2, dtype=np.float32)
+
+    result = fit_variational_em(
+        genotypes=np.zeros((8, 1), dtype=np.float32),
+        covariates=np.ones((8, 1), dtype=np.float32),
+        targets=targets,
+        records=[VariantRecord("variant_0", VariantClass.SNV, "1", 100)],
+        config=config,
+        tie_map=build_tie_map(
+            np.zeros((8, 1), dtype=np.float32),
+            [VariantRecord("variant_0", VariantClass.SNV, "1", 100)],
+            config,
+        ),
+        validation_data=(
+            np.zeros((4, 1), dtype=np.float32),
+            np.ones((4, 1), dtype=np.float32),
+            np.array([1.0, 1.0, 0.0, 1.0], dtype=np.float32),
+        ),
+    )
+
+    assert validation_alphas
+    assert np.isclose(validation_alphas[0][0], expected_shift, atol=1e-6)
+    assert np.isclose(float(result.alpha[0]), expected_shift, atol=1e-6)
 
 
 def test_tpb_shape_vectors_are_learned_from_local_scale_state():
