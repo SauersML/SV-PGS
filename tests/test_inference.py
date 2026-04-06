@@ -736,6 +736,7 @@ def test_sample_space_preconditioner_gpu_path_matches_exact_covariance_inverse_a
 
     fake_cupy: Any = types.ModuleType("cupy")
     fake_cupy.float32 = np.float32
+    fake_cupy.float64 = np.float64
     fake_cupy.asarray = lambda array, dtype=None: np.asarray(array, dtype=dtype)
     fake_cupy.sum = np.sum
     fake_cupy.sqrt = np.sqrt
@@ -752,12 +753,7 @@ def test_sample_space_preconditioner_gpu_path_matches_exact_covariance_inverse_a
     monkeypatch.setitem(sys.modules, "cupyx", fake_cupyx)
     monkeypatch.setitem(sys.modules, "cupyx.scipy", fake_cupyx_scipy)
     monkeypatch.setitem(sys.modules, "cupyx.scipy.linalg", fake_cupyx_scipy_linalg)
-    monkeypatch.setattr(mixture_inference, "_to_cupy_float32", lambda array: np.asarray(array, dtype=np.float32))
-    monkeypatch.setattr(
-        mixture_inference,
-        "_cupy_to_jax",
-        lambda array: jnp.asarray(np.asarray(array), dtype=mixture_inference.gpu_compute_jax_dtype()),
-    )
+    monkeypatch.setattr(mixture_inference, "_to_cupy_float64", lambda array: np.asarray(array, dtype=np.float64))
     monkeypatch.setattr(
         mixture_inference,
         "_sample_space_diagonal_preconditioner",
@@ -801,6 +797,7 @@ def test_sample_space_preconditioner_uses_gpu_subset_without_full_gpu_cache(monk
 
     fake_cupy: Any = types.ModuleType("cupy")
     fake_cupy.float32 = np.float32
+    fake_cupy.float64 = np.float64
     fake_cupy.asarray = lambda array, dtype=None: np.asarray(array, dtype=dtype)
     fake_cupy.sum = np.sum
     fake_cupy.sqrt = np.sqrt
@@ -817,12 +814,7 @@ def test_sample_space_preconditioner_uses_gpu_subset_without_full_gpu_cache(monk
     monkeypatch.setitem(sys.modules, "cupyx", fake_cupyx)
     monkeypatch.setitem(sys.modules, "cupyx.scipy", fake_cupyx_scipy)
     monkeypatch.setitem(sys.modules, "cupyx.scipy.linalg", fake_cupyx_scipy_linalg)
-    monkeypatch.setattr(mixture_inference, "_to_cupy_float32", lambda array: np.asarray(array, dtype=np.float32))
-    monkeypatch.setattr(
-        mixture_inference,
-        "_cupy_to_jax",
-        lambda array: jnp.asarray(np.asarray(array), dtype=mixture_inference.gpu_compute_jax_dtype()),
-    )
+    monkeypatch.setattr(mixture_inference, "_to_cupy_float64", lambda array: np.asarray(array, dtype=np.float64))
 
     def _fake_try_materialize_gpu_subset(self, indices):
         resolved_indices = np.asarray(indices, dtype=np.int32)
@@ -885,11 +877,13 @@ def test_gpu_sample_space_block_cg_matches_dense_solution(monkeypatch: pytest.Mo
 
     fake_cupy: Any = types.ModuleType("cupy")
     fake_cupy.float32 = np.float32
+    fake_cupy.float64 = np.float64
     fake_cupy.asarray = lambda array, dtype=None: np.asarray(array, dtype=dtype)
     fake_cupy.sum = np.sum
     fake_cupy.sqrt = np.sqrt
     fake_cupy.maximum = np.maximum
     fake_cupy.eye = np.eye
+    fake_cupy.zeros = np.zeros
     fake_cupy.linalg = types.SimpleNamespace(cholesky=np.linalg.cholesky)
     fake_cupyx: Any = types.ModuleType("cupyx")
     fake_cupyx_scipy: Any = types.ModuleType("cupyx.scipy")
@@ -902,6 +896,7 @@ def test_gpu_sample_space_block_cg_matches_dense_solution(monkeypatch: pytest.Mo
     monkeypatch.setitem(sys.modules, "cupyx.scipy", fake_cupyx_scipy)
     monkeypatch.setitem(sys.modules, "cupyx.scipy.linalg", fake_cupyx_scipy_linalg)
     monkeypatch.setattr(mixture_inference, "_try_import_cupy", lambda: fake_cupy)
+    monkeypatch.setattr(mixture_inference, "_to_cupy_float64", lambda array: np.asarray(array, dtype=np.float64))
     monkeypatch.setattr(
         mixture_inference,
         "_sample_space_diagonal_preconditioner",

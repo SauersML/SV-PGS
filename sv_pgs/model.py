@@ -56,7 +56,7 @@ GPU_EXACT_SOLVER_LIMIT = 1_024
 GPU_PRECONDITIONER_RANK_LIMIT = 1_024
 _FIT_STAGE_CACHE_DIRNAME = ".sv_pgs_cache"
 _FIT_STAGE_CACHE_SUBDIR = "fit_stage"
-_FIT_STAGE_CACHE_VERSION = 1
+_FIT_STAGE_CACHE_VERSION = 2
 
 
 @dataclass(slots=True)
@@ -127,6 +127,7 @@ def _fit_stage_cache_paths(
     key_hasher = hashlib.sha256()
     key_hasher.update(f"fit-stage-cache-v{_FIT_STAGE_CACHE_VERSION}".encode("utf-8"))
     key_hasher.update(raw_signature.encode("utf-8"))
+    key_hasher.update(config.trait_type.value.encode("utf-8"))
     key_hasher.update(np.asarray([config.minimum_minor_allele_frequency], dtype=np.float64).tobytes())
     _update_hash_with_array_bytes(key_hasher, np.asarray(allele_frequencies, dtype=np.float32))
     _update_hash_with_array_bytes(key_hasher, np.asarray(means, dtype=np.float32))
@@ -238,6 +239,24 @@ def _try_load_fit_stage_cache(
         active_variant_indices = np.load(cache_paths.active_indices_path, mmap_mode="r").astype(np.int32, copy=False)
         with cache_paths.tie_map_path.open("rb") as handle:
             reduced_tie_map = pickle.load(handle)
+        expected_active_variant_count = int(manifest_payload.get("active_variant_count", -1))
+        expected_reduced_variant_count = int(manifest_payload.get("reduced_variant_count", -1))
+        if active_variant_indices.ndim != 1:
+            raise ValueError("active variant cache must be 1D.")
+        if expected_active_variant_count != active_variant_indices.shape[0]:
+            raise ValueError("active variant cache count does not match manifest.")
+        if np.any(active_variant_indices < 0) or np.any(active_variant_indices >= standardized_genotypes.shape[1]):
+            raise ValueError("active variant cache indices are out of bounds.")
+        if reduced_tie_map.kept_indices.ndim != 1:
+            raise ValueError("tie-map kept indices cache must be 1D.")
+        if expected_reduced_variant_count != reduced_tie_map.kept_indices.shape[0]:
+            raise ValueError("tie-map kept-index count does not match manifest.")
+        if np.any(reduced_tie_map.kept_indices < 0) or np.any(reduced_tie_map.kept_indices >= active_variant_indices.shape[0]):
+            raise ValueError("tie-map kept indices are out of bounds for cached active variants.")
+        if reduced_tie_map.original_to_reduced.shape != (active_variant_indices.shape[0],):
+            raise ValueError("cached tie-map original_to_reduced shape does not match cached active variants.")
+        if len(reduced_tie_map.reduced_to_group) != reduced_tie_map.kept_indices.shape[0]:
+            raise ValueError("cached tie-map group count does not match kept indices.")
         combined_indices = np.asarray(active_variant_indices[reduced_tie_map.kept_indices], dtype=np.int32)
         if cache_paths.reduced_raw_i8_path.exists():
             reduced_raw = Int8RawGenotypeMatrix(np.load(cache_paths.reduced_raw_i8_path, mmap_mode="r"))
@@ -400,6 +419,10 @@ class BayesianPGS:
             active_variant_indices = select_active_variant_indices(
                 variant_records=normalized_records,
                 config=self.config,
+                standardized_genotypes=standardized_genotypes,
+                covariates=prepared_arrays.covariates,
+                targets=prepared_arrays.targets,
+                trait_type=self.config.trait_type,
             )
             log(f"active variants: {len(active_variant_indices)} / {len(normalized_records)} ({100.0*len(active_variant_indices)/max(len(normalized_records),1):.1f}%)")
         else:

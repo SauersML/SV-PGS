@@ -138,6 +138,7 @@ class ModelConfig:
     posterior_variance_probe_count: int = 24
     minimum_minor_allele_frequency: float = 1e-3
 
+
     sample_space_preconditioner_rank: int = 256
     validation_interval: int = 2
     binary_intercept_calibration: bool = True
