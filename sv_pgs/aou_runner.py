@@ -407,6 +407,10 @@ def run_all_of_us(
     log(f"=== ALL OF US PIPELINE ===  disease={disease_def.canonical_name}  chromosomes={chromosomes}  n_pcs={n_pcs}  cpus={os.cpu_count()}")
     log(f"  ICD-9: {disease_def.icd9_prefixes}  ICD-10: {disease_def.icd10_prefixes}")
     log(f"  output: {work_dir}")
+    config = ModelConfig(
+        max_outer_iterations=max_outer_iterations,
+        random_seed=random_seed,
+    )
 
     # Status summary: what's done vs what's left
     from sv_pgs.io import _vcf_cache_dir, _vcf_cache_key, _read_vcf_sample_ids
@@ -460,7 +464,7 @@ def run_all_of_us(
         cache_dir = _vcf_cache_dir(vcf_path)
         if keep_indices_for_status is not None:
             # Check the EXACT cache key
-            key = _vcf_cache_key(vcf_path, keep_indices_for_status)
+            key = _vcf_cache_key(vcf_path, keep_indices_for_status, config)
             has_cache = (cache_dir / f"{key}.genotypes.npy").exists()
             has_partial = (cache_dir / f"{key}.inc.progress.json").exists()
             has_tmp = (cache_dir / f"{key}.tmp_parallel").exists()
@@ -557,13 +561,14 @@ def run_all_of_us(
             surviving_ids = sample_table_df["sample_id"].astype(str).tolist()
             keep_indices = np.array([vcf_index_map[sid] for sid in surviving_ids if sid in vcf_index_map], dtype=np.intp)
             log(f"  {len(keep_indices)} of {len(all_sample_ids)} samples matched")
-            precache_vcfs_parallel(vcf_paths, keep_indices)
+            precache_vcfs_parallel(vcf_paths, keep_indices, config)
         except Exception as exc:
             log(f"  precache skipped: {exc}")
 
         log("=== STEP 4: Load unified genome-wide dataset ===")
         dataset = load_multi_vcf_dataset_from_files(
             genotype_paths=vcf_paths,
+            config=config,
             sample_table_path=str(merged_path),
             sample_id_column="auto",
             target_column="target",
@@ -572,13 +577,10 @@ def run_all_of_us(
         inferred_trait = TraitType.BINARY if len(np.unique(dataset.targets)) <= 2 else TraitType.QUANTITATIVE
 
         log("=== STEP 5: Fit unified genome-wide model ===")
+        config.trait_type = inferred_trait
         run_training_pipeline(
             dataset=dataset,
-            config=ModelConfig(
-                trait_type=inferred_trait,
-                max_outer_iterations=max_outer_iterations,
-                random_seed=random_seed,
-            ),
+            config=config,
             output_dir=work_dir,
         )
         run_metadata_path.write_text(json.dumps(run_metadata, indent=2), encoding="utf-8")

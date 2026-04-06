@@ -80,6 +80,7 @@ def test_load_dataset_from_vcf_uses_metadata_and_sample_alignment(tmp_path: Path
 
     dataset = load_dataset_from_files(
         genotype_path=vcf_path,
+        config=ModelConfig(),
         genotype_format="vcf",
         sample_table_path=sample_table_path,
         sample_id_column="sample_id",
@@ -134,6 +135,7 @@ def test_load_dataset_from_vcf_auto_detects_research_id_column(tmp_path: Path):
 
     dataset = load_dataset_from_files(
         genotype_path=vcf_path,
+        config=ModelConfig(),
         genotype_format="vcf",
         sample_table_path=sample_table_path,
         target_column="target",
@@ -188,6 +190,7 @@ def test_load_multi_vcf_dataset_from_files_concatenates_variants_across_chromoso
 
     dataset = load_multi_vcf_dataset_from_files(
         genotype_paths=[vcf1_path, vcf2_path],
+        config=ModelConfig(),
         sample_table_path=sample_table_path,
         sample_id_column="sample_id",
         target_column="target",
@@ -237,6 +240,7 @@ def test_load_multi_vcf_dataset_from_files_rejects_duplicate_paths(tmp_path: Pat
     with pytest.raises(ValueError, match="genotype_paths must be unique"):
         load_multi_vcf_dataset_from_files(
             genotype_paths=[vcf_path, vcf_path],
+            config=ModelConfig(),
             sample_table_path=sample_table_path,
             sample_id_column="sample_id",
             target_column="target",
@@ -285,6 +289,7 @@ def test_load_multi_vcf_dataset_from_files_rejects_duplicate_variant_keys(tmp_pa
     with pytest.raises(ValueError, match="duplicate variants detected across genotype_paths"):
         load_multi_vcf_dataset_from_files(
             genotype_paths=[vcf1_path, vcf2_path],
+            config=ModelConfig(),
             sample_table_path=sample_table_path,
             sample_id_column="sample_id",
             target_column="target",

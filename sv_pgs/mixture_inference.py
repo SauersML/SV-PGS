@@ -364,6 +364,126 @@ def _fit_covariates_only_binary(
     return np.asarray(alpha, dtype=np.float64)
 
 
+def _fit_binary_alpha_with_offset(
+    covariate_matrix: np.ndarray,
+    targets: np.ndarray,
+    predictor_offset: np.ndarray,
+    minimum_weight: float,
+    max_iterations: int,
+    gradient_tolerance: float,
+    alpha_init: np.ndarray | None = None,
+) -> np.ndarray:
+    covariates = np.asarray(covariate_matrix, dtype=np.float64)
+    target_array = np.asarray(targets, dtype=np.float64)
+    offset = np.asarray(predictor_offset, dtype=np.float64).reshape(-1)
+    if covariates.shape[0] != offset.shape[0]:
+        raise ValueError("predictor_offset sample count must match covariates.")
+    if covariates.shape[1] == 0:
+        return np.zeros(0, dtype=np.float64)
+    alpha = (
+        np.asarray(alpha_init, dtype=np.float64).copy()
+        if alpha_init is not None
+        else _initialize_alpha_state(covariates, target_array, TraitType.BINARY)
+    )
+    for _ in range(max_iterations):
+        linear_predictor = np.asarray(offset + covariates @ alpha, dtype=np.float64)
+        probabilities = np.asarray(stable_sigmoid(linear_predictor), dtype=np.float64)
+        weights = np.maximum(probabilities * (1.0 - probabilities), minimum_weight)
+        gradient = covariates.T @ (target_array - probabilities)
+        if float(np.linalg.norm(gradient)) <= gradient_tolerance:
+            break
+        hessian = covariates.T @ (weights[:, None] * covariates)
+        step = np.linalg.solve(
+            hessian + np.eye(hessian.shape[0], dtype=np.float64) * 1e-8,
+            gradient,
+        )
+        alpha += step
+        if float(np.linalg.norm(step)) <= gradient_tolerance:
+            break
+    return np.asarray(alpha, dtype=np.float64)
+
+
+def _stochastic_step_size(config: ModelConfig, step_index: int) -> float:
+    if step_index < 1:
+        raise ValueError("step_index must be positive.")
+    return float((config.stochastic_step_offset + float(step_index)) ** (-config.stochastic_step_exponent))
+
+
+def _stochastic_variant_blocks(
+    variant_count: int,
+    block_size: int,
+    random_generator: np.random.Generator,
+) -> list[np.ndarray]:
+    if variant_count < 1:
+        return []
+    safe_block_size = max(int(block_size), 1)
+    block_starts = np.arange(0, variant_count, safe_block_size, dtype=np.int32)
+    random_generator.shuffle(block_starts)
+    return [
+        np.arange(
+            int(block_start),
+            min(int(block_start) + safe_block_size, variant_count),
+            dtype=np.int32,
+        )
+        for block_start in block_starts
+    ]
+
+
+def _should_use_stochastic_variational_updates(
+    genotype_matrix: StandardizedGenotypeMatrix,
+    config: ModelConfig,
+) -> bool:
+    variant_count = int(genotype_matrix.shape[1])
+    if not config.stochastic_variational_updates:
+        return False
+    if variant_count < max(int(config.stochastic_min_variant_count), 1):
+        return False
+    return variant_count > int(config.stochastic_variant_batch_size)
+
+
+def _stochastic_epoch_objective(
+    trait_type: TraitType,
+    targets: np.ndarray,
+    linear_predictor: np.ndarray,
+    beta: np.ndarray,
+    reduced_prior_variances: np.ndarray,
+    local_scale: np.ndarray,
+    auxiliary_delta: np.ndarray,
+    local_shape_a: np.ndarray,
+    local_shape_b: np.ndarray,
+    scale_model_coefficients: np.ndarray,
+    scale_penalty: np.ndarray,
+) -> float:
+    predictor = np.asarray(linear_predictor, dtype=np.float64)
+    target_array = np.asarray(targets, dtype=np.float64)
+    if trait_type == TraitType.BINARY:
+        probabilities = np.asarray(stable_sigmoid(predictor), dtype=np.float64)
+        data_term = float(
+            np.mean(
+                target_array * np.log(probabilities + 1e-12)
+                + (1.0 - target_array) * np.log(1.0 - probabilities + 1e-12)
+            )
+        )
+    else:
+        residual = np.asarray(target_array - predictor, dtype=np.float64)
+        data_term = float(-0.5 * np.mean(residual * residual))
+    beta_array = np.asarray(beta, dtype=np.float64)
+    prior_term = float(
+        -0.5 * np.mean(beta_array * beta_array / np.maximum(np.asarray(reduced_prior_variances, dtype=np.float64), 1e-8))
+    )
+    local_scale_term = _local_scale_prior_objective(
+        local_scale=local_scale,
+        auxiliary_delta=auxiliary_delta,
+        local_shape_a=local_shape_a,
+        local_shape_b=local_shape_b,
+    ) / max(int(beta_array.shape[0]), 1)
+    scale_penalty_term = _scale_penalty_objective(
+        scale_model_coefficients=scale_model_coefficients,
+        scale_penalty=scale_penalty,
+    ) / max(int(beta_array.shape[0]), 1)
+    return float(data_term + prior_term + local_scale_term + scale_penalty_term)
+
+
 def fit_variational_em(
     genotypes: StandardizedGenotypeMatrix | np.ndarray,
     covariates: np.ndarray,
@@ -1036,6 +1156,7 @@ def _binary_posterior_state(
     compute_logdet: bool = True,
     compute_beta_variance: bool = True,
     sample_space_preconditioner_rank: int = 256,
+    predictor_offset: np.ndarray | None = None,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, float]:
     standardized_genotypes = _as_standardized_genotype_matrix(genotype_matrix)
     compute_np_dtype = gpu_compute_numpy_dtype()
@@ -1044,6 +1165,13 @@ def _binary_posterior_state(
     covariate_count = covariate_matrix.shape[1]
     parameters = np.concatenate([alpha_init, beta_init], axis=0).astype(compute_np_dtype, copy=True)
     damping = float(initial_damping)
+    predictor_offset_array = (
+        np.zeros(standardized_genotypes.shape[0], dtype=compute_np_dtype)
+        if predictor_offset is None
+        else np.asarray(predictor_offset, dtype=compute_np_dtype).reshape(-1)
+    )
+    if predictor_offset_array.shape != (standardized_genotypes.shape[0],):
+        raise ValueError("predictor_offset must match genotype sample count.")
 
     # Pre-convert the covariate matrix to JAX once so that matmuls stay on GPU
     # throughout the Newton loop.  The covariate matrix is small
@@ -1051,6 +1179,7 @@ def _binary_posterior_state(
     covariate_matrix_jax = jnp.asarray(covariate_matrix, dtype=compute_jax_dtype)
     targets_jax = jnp.asarray(targets, dtype=compute_jax_dtype)
     prior_precision_jax = jnp.asarray(prior_precision, dtype=compute_jax_dtype)
+    predictor_offset_jax = jnp.asarray(predictor_offset_array, dtype=compute_jax_dtype)
     newton_solver_tolerance, newton_maximum_linear_solver_iterations = _binary_newton_solver_controls(
         standardized_genotypes,
         solver_tolerance=solver_tolerance,
@@ -1082,6 +1211,7 @@ def _binary_posterior_state(
         alpha_jax = jnp.asarray(alpha, dtype=compute_jax_dtype)
         beta_jax = jnp.asarray(beta, dtype=compute_jax_dtype)
         linear_predictor_jax = (
+            predictor_offset_jax
             covariate_matrix_jax @ alpha_jax
             + standardized_genotypes.matvec(beta, batch_size=posterior_variance_batch_size)
         )

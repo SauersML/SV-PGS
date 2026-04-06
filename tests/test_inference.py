@@ -1159,6 +1159,67 @@ def test_gpu_sample_space_block_cg_mixed_precision_refinement_matches_dense_solu
     np.testing.assert_allclose(actual, expected, rtol=2e-4, atol=5e-5)
 
 
+def test_gpu_sample_space_solver_retries_in_float64_after_mixed_precision_stalls(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    genotype_matrix = np.array(
+        [
+            [1.0, 0.0, 1.0],
+            [0.0, 1.0, 1.0],
+            [1.0, 1.0, 0.0],
+            [0.0, 1.0, 0.0],
+        ],
+        dtype=np.float32,
+    )
+    standardized = as_raw_genotype_matrix(genotype_matrix).standardized(
+        means=np.zeros(genotype_matrix.shape[1], dtype=np.float32),
+        scales=np.ones(genotype_matrix.shape[1], dtype=np.float32),
+    )
+    standardized._cupy_cache = standardized.materialize().astype(np.float32, copy=False)
+    standardized._dense_cache = None
+    prior_variances = np.array([1.5, 0.75, 0.5], dtype=np.float64)
+    diagonal_noise = np.array([1.0, 1.25, 0.8, 1.1], dtype=np.float64)
+    right_hand_side = np.array([0.5, -1.0, 0.2, 1.5], dtype=np.float64)
+    covariance_matrix = np.diag(diagonal_noise) + genotype_matrix @ np.diag(prior_variances) @ genotype_matrix.T
+    expected = np.linalg.solve(covariance_matrix, right_hand_side)
+
+    fake_cupy: Any = types.ModuleType("cupy")
+    fake_cupy.float32 = np.float32
+    fake_cupy.float64 = np.float64
+    fake_cupy.asarray = lambda array, dtype=None: np.asarray(array, dtype=dtype)
+    fake_cupy.sum = np.sum
+    fake_cupy.zeros = np.zeros
+
+    inner_call_dtypes: list[type[np.floating[Any]]] = []
+
+    def fake_inner(**kwargs):
+        compute_cp_dtype = kwargs["compute_cp_dtype"]
+        rhs = np.asarray(kwargs["right_hand_side_gpu"], dtype=np.float64)
+        inner_call_dtypes.append(compute_cp_dtype)
+        if compute_cp_dtype == np.float32:
+            return np.zeros_like(rhs, dtype=np.float64)
+        return np.linalg.solve(covariance_matrix, rhs)
+
+    monkeypatch.setattr(mixture_inference, "_try_import_cupy", lambda: fake_cupy)
+    monkeypatch.setattr(mixture_inference, "_cupy_compute_dtype", lambda cp: cp.float32)
+    monkeypatch.setattr(mixture_inference, "_solve_sample_space_rhs_gpu_inner", fake_inner)
+
+    actual = mixture_inference._solve_sample_space_rhs_gpu(
+        genotype_matrix=standardized,
+        prior_variances=prior_variances,
+        diagonal_noise=diagonal_noise,
+        right_hand_side=right_hand_side,
+        tolerance=1e-7,
+        max_iterations=64,
+        preconditioner=lambda rhs: rhs,
+        batch_size=2,
+    )
+
+    np.testing.assert_allclose(actual, expected, rtol=1e-7, atol=1e-7)
+    assert inner_call_dtypes[-1] == np.float64
+    assert any(dtype == np.float32 for dtype in inner_call_dtypes[:-1])
+
+
 def test_cpu_sample_space_block_cg_matches_dense_solution(monkeypatch: pytest.MonkeyPatch):
     genotype_matrix = np.array(
         [

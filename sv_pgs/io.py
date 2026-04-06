@@ -1375,7 +1375,7 @@ def precache_vcfs_parallel(
     # Merge region results per VCF → incremental cache → final .npy cache
     for vcf_path in uncached:
         cache_dir = _vcf_cache_dir(vcf_path)
-        key = _vcf_cache_key(vcf_path, keep_sample_indices)
+        key = _vcf_cache_key(vcf_path, keep_sample_indices, config)
         tmp_dir = cache_dir / f"{key}.tmp_parallel"
         if not tmp_dir.exists():
             continue

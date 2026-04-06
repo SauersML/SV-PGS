@@ -141,6 +141,11 @@ class ModelConfig:
     sample_space_preconditioner_rank: int = 256
     validation_interval: int = 2
     binary_intercept_calibration: bool = True
+    stochastic_variational_updates: bool = True
+    stochastic_min_variant_count: int = 4096
+    stochastic_variant_batch_size: int = 2048
+    stochastic_step_offset: float = 8.0
+    stochastic_step_exponent: float = 0.6
 
     update_hyperparameters: bool = True
     random_seed: int = 0
@@ -208,6 +213,14 @@ class ModelConfig:
             raise ValueError("sample_space_preconditioner_rank must be non-negative.")
         if self.validation_interval < 1:
             raise ValueError("validation_interval must be positive.")
+        if self.stochastic_min_variant_count < 0:
+            raise ValueError("stochastic_min_variant_count must be non-negative.")
+        if self.stochastic_variant_batch_size < 1:
+            raise ValueError("stochastic_variant_batch_size must be positive.")
+        if self.stochastic_step_offset < 0.0:
+            raise ValueError("stochastic_step_offset must be non-negative.")
+        if not 0.0 < self.stochastic_step_exponent <= 1.0:
+            raise ValueError("stochastic_step_exponent must lie in (0.0, 1.0].")
 
     def class_log_baseline_scales(self) -> Mapping[VariantClass, float]:
         return dict(DEFAULT_CLASS_LOG_BASELINE_SCALE)
