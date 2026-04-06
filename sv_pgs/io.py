@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import csv
+import gzip
 import hashlib
 import json
 import pickle
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable, Iterator, Sequence
@@ -68,13 +70,253 @@ class _DelimitedTableSpec:
     path: Path
     delimiter: str
     columns: tuple[str, ...]
+    column_index_by_name: dict[str, int]
 
 
+
+
+@dataclass(slots=True)
+class _TextVcfRecord:
+    CHROM: str
+    POS: int
+    ID: str | None
+    REF: str
+    ALT: tuple[str, ...]
+    QUAL: float | None
+    INFO: dict[str, Any]
+    gt_types: np.ndarray
+    end: int | None
+
+    @property
+    def is_snp(self) -> bool:
+        return len(self.ALT) == 1 and len(self.REF) == 1 and len(self.ALT[0]) == 1 and not self.ALT[0].startswith("<")
+
+    @property
+    def is_indel(self) -> bool:
+        return len(self.ALT) == 1 and not self.ALT[0].startswith("<") and len(self.REF) != len(self.ALT[0])
+
+    @property
+    def is_sv(self) -> bool:
+        alt = self.ALT[0] if self.ALT else ""
+        if alt.startswith("<") and alt.endswith(">"):
+            return True
+        svtype = self.INFO.get("SVTYPE")
+        if isinstance(svtype, (tuple, list)):
+            return len(svtype) > 0
+        return svtype is not None
+
+
+class _TextVcfReader:
+    __slots__ = ("_path", "samples", "seqnames", "seqlens")
+
+    def __init__(self, vcf_path: Path) -> None:
+        self._path = Path(vcf_path)
+        self.samples: tuple[str, ...] = ()
+        self.seqnames: tuple[str, ...] = ()
+        self.seqlens: tuple[int, ...] = ()
+        self._load_header()
+
+    def _load_header(self) -> None:
+        sample_names: tuple[str, ...] = ()
+        contig_lengths: dict[str, int] = {}
+        with _open_vcf_text(self._path) as handle:
+            for raw_line in handle:
+                line = raw_line.rstrip("\n")
+                if line.startswith("##contig=<"):
+                    contig_name, contig_length = _parse_contig_header(line)
+                    if contig_name is not None:
+                        contig_lengths[contig_name] = contig_length
+                    continue
+                if not line.startswith("#CHROM\t"):
+                    continue
+                header_fields = line.split("\t")
+                sample_names = tuple(header_fields[9:])
+                break
+        self.samples = sample_names
+        self.seqnames = tuple(contig_lengths.keys())
+        self.seqlens = tuple(contig_lengths[contig_name] for contig_name in self.seqnames)
+
+    def close(self) -> None:
+        return None
+
+    def set_threads(self, threads: int) -> None:
+        return None
+
+    def __iter__(self) -> Iterator[_TextVcfRecord]:
+        return self._iter_records(region=None)
+
+    def __call__(self, region: str) -> Iterator[_TextVcfRecord]:
+        return self._iter_records(region=region)
+
+    def _iter_records(self, region: str | None) -> Iterator[_TextVcfRecord]:
+        region_filter = _parse_vcf_region(region)
+        with _open_vcf_text(self._path) as handle:
+            for raw_line in handle:
+                if raw_line.startswith("#"):
+                    continue
+                record = _parse_text_vcf_record(raw_line, sample_names=self.samples)
+                if region_filter is not None and not _text_vcf_record_in_region(record, region_filter):
+                    continue
+                yield record
+
+
+def _open_vcf_text(vcf_path: Path) -> Any:
+    if vcf_path.suffix == ".gz":
+        return gzip.open(vcf_path, "rt", encoding="utf-8")
+    return vcf_path.open("r", encoding="utf-8")
+
+
+def _parse_contig_header(line: str) -> tuple[str | None, int]:
+    content = line.removeprefix("##contig=<").removesuffix(">")
+    fields = [field.strip() for field in content.split(",")]
+    contig_name: str | None = None
+    contig_length = 0
+    for field in fields:
+        if field.startswith("ID="):
+            contig_name = field.split("=", 1)[1]
+        elif field.startswith("length="):
+            contig_length = int(field.split("=", 1)[1])
+    return contig_name, contig_length
+
+
+def _parse_vcf_region(region: str | None) -> tuple[str, int, int | None] | None:
+    if region is None:
+        return None
+    if ":" not in region:
+        return region, 1, None
+    chrom, coordinates = region.split(":", 1)
+    if "-" not in coordinates:
+        return chrom, int(coordinates), int(coordinates)
+    start_text, end_text = coordinates.split("-", 1)
+    return chrom, int(start_text), int(end_text)
+
+
+def _text_vcf_record_in_region(record: _TextVcfRecord, region_filter: tuple[str, int, int | None]) -> bool:
+    chrom, start, end = region_filter
+    if record.CHROM != chrom:
+        return False
+    if record.POS < start:
+        return False
+    if end is not None and record.POS > end:
+        return False
+    return True
+
+
+def _parse_text_vcf_record(line: str, *, sample_names: tuple[str, ...]) -> _TextVcfRecord:
+    fields = line.rstrip("\n").split("\t")
+    chrom = fields[0]
+    pos = int(fields[1])
+    record_id = None if fields[2] == "." else fields[2]
+    ref = fields[3]
+    alt_field = fields[4]
+    alt = () if alt_field == "." else tuple(alt_field.split(","))
+    qual = None if fields[5] == "." else float(fields[5])
+    info = _parse_vcf_info(fields[7])
+    gt_types = _parse_vcf_gt_types(fields[8], fields[9:9 + len(sample_names)])
+    end = info.get("END")
+    return _TextVcfRecord(
+        CHROM=chrom,
+        POS=pos,
+        ID=record_id,
+        REF=ref,
+        ALT=alt,
+        QUAL=qual,
+        INFO=info,
+        gt_types=gt_types,
+        end=int(end) if end is not None else None,
+    )
+
+
+def _parse_vcf_info(info_field: str) -> dict[str, Any]:
+    if info_field == ".":
+        return {}
+    parsed: dict[str, Any] = {}
+    for token in info_field.split(";"):
+        if "=" not in token:
+            parsed[token] = True
+            continue
+        key, raw_value = token.split("=", 1)
+        if "," in raw_value:
+            parsed[key] = tuple(_parse_vcf_scalar(value) for value in raw_value.split(","))
+        else:
+            parsed[key] = _parse_vcf_scalar(raw_value)
+    return parsed
+
+
+def _parse_vcf_scalar(value: str) -> Any:
+    if value == ".":
+        return None
+    try:
+        return int(value)
+    except ValueError:
+        pass
+    try:
+        return float(value)
+    except ValueError:
+        return value
+
+
+def _parse_vcf_gt_types(format_field: str, sample_fields: Sequence[str]) -> np.ndarray:
+    format_tokens = format_field.split(":")
+    try:
+        gt_index = format_tokens.index("GT")
+    except ValueError:
+        return np.full(len(sample_fields), 2, dtype=np.int8)
+    gt_types = np.empty(len(sample_fields), dtype=np.int8)
+    for sample_index, sample_field in enumerate(sample_fields):
+        sample_tokens = sample_field.split(":")
+        gt_token = sample_tokens[gt_index] if gt_index < len(sample_tokens) else "."
+        gt_types[sample_index] = _gt_type_from_token(gt_token)
+    return gt_types
+
+
+def _gt_type_from_token(gt_token: str) -> int:
+    if gt_token == "." or gt_token == "./." or gt_token == ".|.":
+        return 2
+    alleles = gt_token.replace("|", "/").split("/")
+    if not alleles:
+        return 2
+    saw_ref = False
+    saw_alt = False
+    for allele in alleles:
+        if allele == "." or allele == "":
+            return 2
+        if allele == "0":
+            saw_ref = True
+        else:
+            saw_alt = True
+    if saw_ref and saw_alt:
+        return 1
+    if saw_alt:
+        return 3
+    return 0
 
 
 def _open_vcf_reader(vcf_path: Path) -> Any:
-    from cyvcf2 import VCF
-    return VCF(str(vcf_path))
+    try:
+        from cyvcf2 import VCF
+
+        return VCF(str(vcf_path))
+    except ModuleNotFoundError:
+        return _TextVcfReader(vcf_path)
+
+
+def _vcf_record_count_hint(reader: Any) -> int | None:
+    for attribute_name in ("num_records", "nrecords"):
+        value = getattr(reader, attribute_name, None)
+        if callable(value):
+            try:
+                value = value()
+            except TypeError:
+                continue
+        if value is None:
+            continue
+        resolved_value = int(value)
+        if resolved_value >= 0:
+            return resolved_value
+    return None
+
+
 def load_dataset_from_files(
     genotype_path: str | Path,
     sample_table_path: str | Path,
@@ -459,6 +701,9 @@ def _build_sample_table(
         required_columns=(sample_id_column, target_column, *covariate_columns),
         context="sample table",
     )
+    sample_id_index = table_spec.column_index_by_name[sample_id_column]
+    target_index = table_spec.column_index_by_name[target_column]
+    covariate_indices = tuple(table_spec.column_index_by_name[column_name] for column_name in covariate_columns)
 
     sample_ids: list[str] = []
     covariates: list[list[float]] = []
@@ -468,9 +713,9 @@ def _build_sample_table(
     total_rows = 0
     unmatched_rows = 0
 
-    for row in _iter_delimited_rows(table_spec):
+    for row_values in _iter_delimited_row_values(table_spec):
         total_rows += 1
-        sample_id = str(row[sample_id_column]).strip()
+        sample_id = row_values[sample_id_index].strip()
         if not sample_id:
             raise ValueError("Encountered blank sample identifier in sample table.")
         if sample_id not in available_sample_id_set:
@@ -481,8 +726,8 @@ def _build_sample_table(
         seen_sample_ids.add(sample_id)
         # Parse target and covariates; drop rows with missing values
         try:
-            target_value = float(row[target_column])
-            covariate_values = [float(row[column_name]) for column_name in covariate_columns]
+            target_value = float(row_values[target_index])
+            covariate_values = [float(row_values[column_index]) for column_index in covariate_indices]
         except (ValueError, TypeError):
             unmatched_rows += 1
             continue
@@ -537,12 +782,16 @@ def _resolve_sample_id_column(
         )
 
     available_sample_id_set = set(available_sample_ids)
+    candidate_indices = {
+        column_name: table_spec.column_index_by_name[column_name]
+        for column_name in candidate_columns
+    }
     # Valid overlaps can start well after early rows in large phenotype exports,
     # so resolve against the full table instead of an initial sample.
     match_counts = {column_name: 0 for column_name in candidate_columns}
-    for row in _iter_delimited_rows(table_spec):
+    for row_values in _iter_delimited_row_values(table_spec):
         for column_name in candidate_columns:
-            if str(row[column_name]).strip() in available_sample_id_set:
+            if row_values[candidate_indices[column_name]].strip() in available_sample_id_set:
                 match_counts[column_name] += 1
     best_match_count = max(match_counts.values())
     best_columns = [column_name for column_name in candidate_columns if match_counts[column_name] == best_match_count]
@@ -567,6 +816,26 @@ _CACHE_DIR_NAME = ".sv_pgs_cache"
 # Bump this when _VariantDefaults, VariantClass, or the cache format changes
 # so stale caches are automatically invalidated.
 _CACHE_VERSION = 2
+_VCF_CACHE_MANIFEST_VERSION = 1
+_VCF_CACHE_STATS_DTYPE = np.dtype(
+    [
+        ("means", "<f4"),
+        ("scales", "<f4"),
+        ("allele_frequencies", "<f4"),
+        ("support_counts", "<i4"),
+    ]
+)
+
+
+@dataclass(slots=True)
+class _VcfCachePaths:
+    key: str
+    cache_dir: Path
+    geno_path: Path
+    var_path: Path
+    stats_path: Path
+    legacy_stats_path: Path
+    manifest_path: Path
 
 
 def _cache_file_fingerprint(path: Path, sample_bytes: int = 1_048_576) -> bytes:
@@ -599,6 +868,161 @@ def _vcf_cache_dir(vcf_path: Path) -> Path:
     return vcf_path.resolve().parent / _CACHE_DIR_NAME
 
 
+def _vcf_cache_paths(vcf_path: Path, keep_sample_indices: np.ndarray | None) -> _VcfCachePaths:
+    cache_dir = _vcf_cache_dir(vcf_path)
+    key = _vcf_cache_key(vcf_path, keep_sample_indices)
+    return _VcfCachePaths(
+        key=key,
+        cache_dir=cache_dir,
+        geno_path=cache_dir / f"{key}.genotypes.npy",
+        var_path=cache_dir / f"{key}.variants.pkl",
+        stats_path=cache_dir / f"{key}.stats.npy",
+        legacy_stats_path=cache_dir / f"{key}.stats.npz",
+        manifest_path=cache_dir / f"{key}.manifest.json",
+    )
+
+
+def _cleanup_stale_vcf_cache_temps(cache_dir: Path, key: str) -> None:
+    for stale_path in cache_dir.glob(f"{key}.*.tmp*"):
+        if stale_path.is_dir():
+            continue
+        try:
+            stale_path.unlink()
+        except Exception:
+            pass
+    for stale_dir in cache_dir.glob(f"{key}.bundle.*"):
+        if not stale_dir.is_dir():
+            continue
+        try:
+            for child in stale_dir.iterdir():
+                child.unlink(missing_ok=True)
+            stale_dir.rmdir()
+        except Exception:
+            pass
+
+
+def _load_vcf_cache_manifest(manifest_path: Path) -> dict[str, Any] | None:
+    if not manifest_path.exists():
+        return None
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+    if int(manifest.get("manifest_version", 0)) != _VCF_CACHE_MANIFEST_VERSION:
+        return None
+    return manifest
+
+
+def _write_vcf_cache_manifest(
+    manifest_path: Path,
+    *,
+    sample_count: int,
+    variant_count: int,
+    stats_file: str,
+) -> None:
+    _atomic_write_text(
+        manifest_path,
+        json.dumps(
+            {
+                "manifest_version": _VCF_CACHE_MANIFEST_VERSION,
+                "sample_count": int(sample_count),
+                "variant_count": int(variant_count),
+                "dtype": "int8",
+                "fortran_order": True,
+                "stats_file": stats_file,
+            }
+        ),
+    )
+
+
+def _load_vcf_cache_stats(stats_path: Path) -> VariantStatistics:
+    stats_payload = np.load(stats_path, mmap_mode="r")
+    try:
+        if isinstance(stats_payload, np.lib.npyio.NpzFile):
+            return VariantStatistics(
+                means=np.asarray(stats_payload["means"], dtype=np.float32),
+                scales=np.asarray(stats_payload["scales"], dtype=np.float32),
+                allele_frequencies=np.asarray(stats_payload["allele_frequencies"], dtype=np.float32),
+                support_counts=np.asarray(stats_payload["support_counts"], dtype=np.int32),
+            )
+        return VariantStatistics(
+            means=np.asarray(stats_payload["means"], dtype=np.float32),
+            scales=np.asarray(stats_payload["scales"], dtype=np.float32),
+            allele_frequencies=np.asarray(stats_payload["allele_frequencies"], dtype=np.float32),
+            support_counts=np.asarray(stats_payload["support_counts"], dtype=np.int32),
+        )
+    finally:
+        if isinstance(stats_payload, np.lib.npyio.NpzFile):
+            stats_payload.close()
+
+
+def _write_vcf_cache_stats(stats_path: Path, variant_stats: VariantStatistics) -> None:
+    stats_matrix = np.empty(variant_stats.means.shape[0], dtype=_VCF_CACHE_STATS_DTYPE)
+    stats_matrix["means"] = np.asarray(variant_stats.means, dtype=np.float32)
+    stats_matrix["scales"] = np.asarray(variant_stats.scales, dtype=np.float32)
+    stats_matrix["allele_frequencies"] = np.asarray(variant_stats.allele_frequencies, dtype=np.float32)
+    stats_matrix["support_counts"] = np.asarray(variant_stats.support_counts, dtype=np.int32)
+    np.save(stats_path, stats_matrix, allow_pickle=False)
+
+
+def _is_vcf_cache_bundle_complete(paths: _VcfCachePaths) -> bool:
+    if paths.manifest_path.exists():
+        manifest = _load_vcf_cache_manifest(paths.manifest_path)
+        if manifest is None:
+            return False
+        stats_filename = str(manifest.get("stats_file", paths.stats_path.name))
+        return paths.geno_path.exists() and paths.var_path.exists() and (paths.cache_dir / stats_filename).exists()
+    return paths.geno_path.exists() and paths.var_path.exists() and paths.legacy_stats_path.exists()
+
+
+def _ensure_vcf_cache_matrix_fast(paths: _VcfCachePaths, genotype_matrix: np.ndarray) -> np.ndarray:
+    if genotype_matrix.flags.f_contiguous and not genotype_matrix.flags.c_contiguous:
+        return genotype_matrix
+    with open(paths.var_path, "rb") as handle:
+        variants = pickle.load(handle)
+    stats_path = paths.stats_path if paths.stats_path.exists() else paths.legacy_stats_path
+    variant_stats = _load_vcf_cache_stats(stats_path)
+    _save_vcf_to_cache(
+        vcf_path=paths.geno_path,
+        keep_sample_indices=None,
+        genotype_matrix=np.asarray(genotype_matrix, dtype=np.int8),
+        variants=variants,
+        variant_stats=variant_stats,
+        cache_paths=paths,
+    )
+    return np.load(paths.geno_path, mmap_mode="r")
+
+
+def _upgrade_legacy_vcf_cache_bundle(
+    paths: _VcfCachePaths,
+    genotype_matrix: np.ndarray,
+    variant_stats: VariantStatistics,
+) -> None:
+    created_stats = False
+    try:
+        if not paths.stats_path.exists():
+            stats_tmp = paths.cache_dir / f"{paths.key}.stats.tmp.npy"
+            _write_vcf_cache_stats(stats_tmp, variant_stats)
+            stats_tmp.replace(paths.stats_path)
+            created_stats = True
+        _write_vcf_cache_manifest(
+            paths.manifest_path,
+            sample_count=int(genotype_matrix.shape[0]),
+            variant_count=int(genotype_matrix.shape[1]),
+            stats_file=paths.stats_path.name,
+        )
+    except Exception:
+        try:
+            (paths.cache_dir / f"{paths.key}.stats.tmp.npy").unlink(missing_ok=True)
+        except Exception:
+            pass
+        if created_stats:
+            try:
+                paths.stats_path.unlink(missing_ok=True)
+            except Exception:
+                pass
+
+
 def _load_vcf_from_cache(
     vcf_path: Path,
     keep_sample_indices: np.ndarray | None,
@@ -606,32 +1030,46 @@ def _load_vcf_from_cache(
     mmap_mode: str | None = None,
 ) -> tuple[np.ndarray, list[_VariantDefaults], VariantStatistics] | None:
     """Try to load cached VCF parse results. Returns None on miss."""
-    cache_dir = _vcf_cache_dir(vcf_path)
-    if not cache_dir.exists():
+    paths = _vcf_cache_paths(vcf_path, keep_sample_indices)
+    if not paths.cache_dir.exists():
         return None
 
-    key = _vcf_cache_key(vcf_path, keep_sample_indices)
-    geno_path = cache_dir / f"{key}.genotypes.npy"
-    var_path = cache_dir / f"{key}.variants.pkl"
-    stats_path = cache_dir / f"{key}.stats.npz"
-
-    if not geno_path.exists() or not var_path.exists() or not stats_path.exists():
-        log(f"VCF cache miss (key={key})")
+    _cleanup_stale_vcf_cache_temps(paths.cache_dir, paths.key)
+    if not _is_vcf_cache_bundle_complete(paths):
+        log(f"VCF cache miss (key={paths.key})")
         return None
 
     try:
-        log(f"VCF cache hit — loading from {cache_dir.name}/{key}.*")
+        log(f"VCF cache hit — loading from {paths.cache_dir.name}/{paths.key}.*")
         effective_mmap_mode = "r" if mmap_mode is None else mmap_mode
-        genotype_matrix = np.load(geno_path, mmap_mode=effective_mmap_mode)
-        with open(var_path, "rb") as f:
+        manifest = _load_vcf_cache_manifest(paths.manifest_path)
+        stats_path = paths.legacy_stats_path
+        expected_sample_count: int | None = None
+        expected_variant_count: int | None = None
+        if manifest is not None:
+            expected_sample_count = int(manifest["sample_count"])
+            expected_variant_count = int(manifest["variant_count"])
+            stats_path = paths.cache_dir / str(manifest.get("stats_file", paths.stats_path.name))
+
+        genotype_matrix = np.load(paths.geno_path, mmap_mode=effective_mmap_mode)
+        with open(paths.var_path, "rb") as f:
             variants = pickle.load(f)
-        stats_payload = np.load(stats_path)
-        variant_stats = VariantStatistics(
-            means=np.asarray(stats_payload["means"], dtype=np.float32),
-            scales=np.asarray(stats_payload["scales"], dtype=np.float32),
-            allele_frequencies=np.asarray(stats_payload["allele_frequencies"], dtype=np.float32),
-            support_counts=np.asarray(stats_payload["support_counts"], dtype=np.int32),
-        )
+        variant_stats = _load_vcf_cache_stats(stats_path)
+        if expected_sample_count is not None and genotype_matrix.shape[0] != expected_sample_count:
+            raise ValueError(f"cached sample count mismatch: {genotype_matrix.shape[0]} != {expected_sample_count}")
+        if expected_variant_count is not None and genotype_matrix.shape[1] != expected_variant_count:
+            raise ValueError(f"cached variant count mismatch: {genotype_matrix.shape[1]} != {expected_variant_count}")
+        stats_lengths = {
+            int(variant_stats.means.shape[0]),
+            int(variant_stats.scales.shape[0]),
+            int(variant_stats.allele_frequencies.shape[0]),
+            int(variant_stats.support_counts.shape[0]),
+        }
+        if len(stats_lengths) != 1:
+            raise ValueError("cached stats shape mismatch")
+        genotype_matrix = _ensure_vcf_cache_matrix_fast(paths, genotype_matrix)
+        if manifest is None:
+            _upgrade_legacy_vcf_cache_bundle(paths, genotype_matrix, variant_stats)
         log(f"  cached matrix {genotype_matrix.shape}, {len(variants)} variants")
         return genotype_matrix, variants, variant_stats
     except Exception as exc:
@@ -657,15 +1095,18 @@ def _vcf_contig_info(vcf_path: Path) -> tuple[str, int] | None:
     its length from the header contigs. Returns length=0 if unknown.
     """
     reader = _open_vcf_reader(vcf_path)
-    seqnames = list(reader.seqnames) if hasattr(reader, "seqnames") else []
-    seqlens = list(reader.seqlens) if hasattr(reader, "seqlens") else []
-    contig_lengths = {str(n): int(l) for n, l in zip(seqnames, seqlens) if l and int(l) > 0}
-    # Read first record to find which chromosome actually has data
-    for record in reader:
-        chrom = str(record.CHROM)
-        length = contig_lengths.get(chrom, 0)
-        return chrom, length
-    return None
+    try:
+        seqnames = list(reader.seqnames) if hasattr(reader, "seqnames") else []
+        seqlens = list(reader.seqlens) if hasattr(reader, "seqlens") else []
+        contig_lengths = {str(n): int(l) for n, l in zip(seqnames, seqlens) if l and int(l) > 0}
+        # Read first record to find which chromosome actually has data
+        for record in reader:
+            chrom = str(record.CHROM)
+            length = contig_lengths.get(chrom, 0)
+            return chrom, length
+        return None
+    finally:
+        reader.close()
 
 
 def _split_into_regions(chrom: str, chrom_length: int, n_regions: int) -> list[str]:
@@ -692,8 +1133,7 @@ def _region_parse_worker(args: tuple) -> tuple[int, str]:
     keep_indices = np.array(keep_indices_list, dtype=np.intp) if keep_indices_list is not None else None
     vcf_name = Path(vcf_path_str).name
 
-    from cyvcf2 import VCF
-    reader = VCF(vcf_path_str)
+    reader = _open_vcf_reader(Path(vcf_path_str))
     reader.set_threads(1)
 
     gt_map = np.array([0, 1, -1, 2], dtype=np.int8)
@@ -765,9 +1205,8 @@ def precache_vcfs_parallel(
     # Skip already-cached VCFs (compatible with existing .npy cache)
     uncached: list[Path] = []
     for vcf_path in vcf_paths:
-        cache_dir = _vcf_cache_dir(vcf_path)
-        key = _vcf_cache_key(vcf_path, keep_sample_indices)
-        if not (cache_dir / f"{key}.genotypes.npy").exists():
+        cache_paths = _vcf_cache_paths(vcf_path, keep_sample_indices)
+        if not _is_vcf_cache_bundle_complete(cache_paths):
             uncached.append(vcf_path)
 
     if not uncached:
@@ -856,17 +1295,53 @@ def precache_vcfs_parallel(
                     sout.write(data)
                     n_total += len(data) // 24
 
-        # Write progress marker so the incremental loader recognizes it as complete
-        reader = _open_vcf_reader(vcf_path)
-        actual_n_keep = len(keep_sample_indices) if keep_sample_indices is not None else len(reader.samples)
-        _atomic_write_text(cache_dir / f"{key}.inc.progress.json", json.dumps({
-            "n_variants": n_total,
-            "n_samples": actual_n_keep,
-        }))
-
-        # Finalize: incremental cache → .npy (same path as sequential)
+        # Finalize: convert incremental binary directly to .npy cache.
+        # Do NOT call _load_vcf_with_cache — that would re-open the VCF and
+        # waste 20+ min skipping already-parsed variants.
+        actual_n_keep = len(keep_sample_indices) if keep_sample_indices is not None else len(_read_vcf_sample_ids(vcf_path))
         log(f"  finalizing {vcf_path.name}: {n_total} variants from {len(geno_files)} regions")
-        _load_vcf_with_cache(vcf_path, keep_sample_indices, mmap_mode="r")
+
+        # Load incremental binary via memmap (zero copy)
+        inc_matrix = np.memmap(inc_geno, dtype=np.int8, mode="r", shape=(n_total, actual_n_keep)).T
+
+        # Load variant metadata from JSONL
+        import json as _json_mod
+        inc_variants: list[_VariantDefaults] = []
+        with open(inc_var) as vf:
+            for line in vf:
+                d = _json_mod.loads(line)
+                inc_variants.append(_VariantDefaults(
+                    variant_id=d["variant_id"],
+                    variant_class=VariantClass(d["variant_class"]),
+                    chromosome=d["chromosome"],
+                    position=d["position"],
+                    length=d["length"],
+                    allele_frequency=d["allele_frequency"],
+                    quality=d["quality"],
+                ))
+
+        # Load stats via structured dtype
+        stats_dtype = np.dtype([("sum", "<i8"), ("sum_sq", "<i8"), ("n_valid", "<i4"), ("support", "<i4")])
+        stats_arr = np.fromfile(str(inc_stats), dtype=stats_dtype, count=n_total)
+        col_sums = stats_arr["sum"]
+        col_sum_sq = stats_arr["sum_sq"]
+        n_valid_arr = stats_arr["n_valid"]
+        support_arr = stats_arr["support"]
+        safe_n = np.maximum(n_valid_arr.astype(np.int64), 1).astype(np.float64)
+        means = (col_sums / safe_n).astype(np.float32)
+        afs = np.clip(means / 2.0, 0.0, 1.0).astype(np.float32)
+        css = np.maximum(col_sum_sq.astype(np.float64) - col_sums.astype(np.float64) ** 2 / safe_n, 0.0)
+        scales = np.sqrt(css / max(actual_n_keep, 1)).astype(np.float32)
+        scales = np.where(scales < 1e-6, 1.0, scales)
+        inc_stats_obj = VariantStatistics(means=means, scales=scales, allele_frequencies=afs, support_counts=support_arr)
+
+        # Save as final .npy cache
+        _save_vcf_to_cache(vcf_path, keep_sample_indices, inc_matrix, inc_variants, inc_stats_obj)
+        del inc_matrix
+
+        # Clean up incremental files
+        for p in (inc_geno, inc_var, inc_stats):
+            p.unlink(missing_ok=True)
 
         # Clean up temp region files
         shutil.rmtree(tmp_dir, ignore_errors=True)
@@ -955,6 +1430,9 @@ def _load_vcf_incremental(
                     p.unlink(missing_ok=True)
                 except Exception:
                     pass
+    else:
+        for p in (geno_bin, var_jsonl, stats_bin):
+            p.unlink(missing_ok=True)
 
     # Reuse the reader opened above for sample IDs
     n_threads = os.cpu_count() or 4
@@ -964,11 +1442,23 @@ def _load_vcf_incremental(
     _GT_TO_INT8 = np.array([0, 1, -1, 2], dtype=np.int8)
     _gt_to_i8 = _GT_TO_INT8
 
-    # Open files for append
-    geno_fh = open(geno_bin, "ab")
+    record_count_hint = _vcf_record_count_hint(reader) if n_cached == 0 else None
+    if record_count_hint is not None and record_count_hint > 0:
+        log(f"  record count hint: preallocating for {record_count_hint} variants")
+        with open(geno_bin, "wb") as geno_prealloc_fh:
+            geno_prealloc_fh.truncate(record_count_hint * n_keep)
+        with open(stats_bin, "wb") as stats_prealloc_fh:
+            stats_prealloc_fh.truncate(record_count_hint * 24)
+        geno_fh = open(geno_bin, "r+b")
+        stats_fh = open(stats_bin, "r+b")
+    else:
+        geno_fh = open(geno_bin, "ab")
+        stats_fh = open(stats_bin, "ab")
+    if n_cached > 0:
+        geno_fh.seek(n_cached * n_keep)
+        stats_fh.seek(n_cached * 24)
     var_fh = open(var_jsonl, "a")
     # Stats: 4 values per variant (sum_i64, sum_sq_i64, n_valid_i32, support_i32) = 24 bytes
-    stats_fh = open(stats_bin, "ab")
 
     t_start = time.monotonic()
     last_log_time = t_start
@@ -996,6 +1486,7 @@ def _load_vcf_incremental(
         geno_fh.close()
         var_fh.close()
         stats_fh.close()
+        reader.close()
         for path in (geno_bin, var_jsonl, stats_bin, progress_file):
             path.unlink(missing_ok=True)
         raise ValueError(message)
@@ -1074,6 +1565,13 @@ def _load_vcf_incremental(
     geno_fh.close()
     var_fh.close()
     stats_fh.close()
+    reader.close()
+
+    if record_count_hint is not None and record_count_hint > variant_index:
+        with open(geno_bin, "r+b") as geno_trim_fh:
+            geno_trim_fh.truncate(variant_index * n_keep)
+        with open(stats_bin, "r+b") as stats_trim_fh:
+            stats_trim_fh.truncate(variant_index * 24)
 
     n_total = variant_index
     if n_total == 0:
@@ -1171,21 +1669,30 @@ def _save_vcf_to_cache(
     genotype_matrix: np.ndarray,
     variants: list[_VariantDefaults],
     variant_stats: VariantStatistics,
+    *,
+    cache_paths: _VcfCachePaths | None = None,
 ) -> None:
     """Persist parsed VCF results to disk cache."""
-    cache_dir = _vcf_cache_dir(vcf_path)
-    key = _vcf_cache_key(vcf_path, keep_sample_indices)
-    geno_path = cache_dir / f"{key}.genotypes.npy"
-    var_path = cache_dir / f"{key}.variants.pkl"
-    stats_path = cache_dir / f"{key}.stats.npz"
-    geno_tmp = cache_dir / f"{key}.genotypes.npy.tmp"
-    var_tmp = var_path.with_suffix(".pkl.tmp")
-    stats_tmp = cache_dir / f"{key}.stats.npz.tmp"
+    paths = _vcf_cache_paths(vcf_path, keep_sample_indices) if cache_paths is None else cache_paths
 
     try:
-        cache_dir.mkdir(parents=True, exist_ok=True)
+        paths.cache_dir.mkdir(parents=True, exist_ok=True)
+        _cleanup_stale_vcf_cache_temps(paths.cache_dir, paths.key)
         genotype_matrix_i8 = genotype_matrix if np.asarray(genotype_matrix).dtype == np.int8 else np.asarray(genotype_matrix, dtype=np.int8)
         sample_count, variant_count = genotype_matrix_i8.shape
+        stats_lengths = {
+            int(variant_stats.means.shape[0]),
+            int(variant_stats.scales.shape[0]),
+            int(variant_stats.allele_frequencies.shape[0]),
+            int(variant_stats.support_counts.shape[0]),
+        }
+        if len(stats_lengths) != 1:
+            raise ValueError("stats length mismatch during cache save")
+        bundle_dir = Path(tempfile.mkdtemp(prefix=f"{paths.key}.bundle.", dir=paths.cache_dir))
+        geno_tmp = bundle_dir / paths.geno_path.name
+        var_tmp = bundle_dir / paths.var_path.name
+        stats_tmp = bundle_dir / paths.stats_path.name
+        manifest_tmp = bundle_dir / paths.manifest_path.name
         copy_batch_size = max(1, min(variant_count, 500_000_000 // max(sample_count, 1)))
         genotype_memmap = np.lib.format.open_memmap(
             geno_tmp,
@@ -1201,26 +1708,39 @@ def _save_vcf_to_cache(
         del genotype_memmap
         with open(str(var_tmp), "wb") as f:
             pickle.dump(variants, f, protocol=pickle.HIGHEST_PROTOCOL)
-        with open(stats_tmp, "wb") as stats_handle:
-            np.savez_compressed(
-                stats_handle,
-                means=np.asarray(variant_stats.means, dtype=np.float32),
-                scales=np.asarray(variant_stats.scales, dtype=np.float32),
-                allele_frequencies=np.asarray(variant_stats.allele_frequencies, dtype=np.float32),
-                support_counts=np.asarray(variant_stats.support_counts, dtype=np.int32),
-            )
-        geno_tmp.rename(geno_path)
-        var_tmp.rename(var_path)
-        stats_tmp.rename(stats_path)
-        total_mb = (geno_path.stat().st_size + var_path.stat().st_size + stats_path.stat().st_size) / 1e6
-        log(f"VCF cache saved ({total_mb:.1f} MB) → {cache_dir.name}/{key}.*")
+        _write_vcf_cache_stats(stats_tmp, variant_stats)
+        _atomic_write_text(
+            manifest_tmp,
+            json.dumps(
+                {
+                    "manifest_version": _VCF_CACHE_MANIFEST_VERSION,
+                    "sample_count": int(sample_count),
+                    "variant_count": int(variant_count),
+                    "dtype": "int8",
+                    "fortran_order": True,
+                    "stats_file": paths.stats_path.name,
+                }
+            ),
+        )
+        geno_tmp.replace(paths.geno_path)
+        var_tmp.replace(paths.var_path)
+        stats_tmp.replace(paths.stats_path)
+        manifest_tmp.replace(paths.manifest_path)
+        try:
+            paths.legacy_stats_path.unlink(missing_ok=True)
+        except Exception:
+            pass
+        bundle_dir.rmdir()
+        total_mb = (
+            paths.geno_path.stat().st_size
+            + paths.var_path.stat().st_size
+            + paths.stats_path.stat().st_size
+            + paths.manifest_path.stat().st_size
+        ) / 1e6
+        log(f"VCF cache saved ({total_mb:.1f} MB) → {paths.cache_dir.name}/{paths.key}.*")
     except Exception as exc:
         log(f"VCF cache save failed ({exc}), continuing without cache")
-        for p in (geno_tmp, var_tmp, stats_tmp, geno_path, var_path, stats_path):
-            try:
-                p.unlink(missing_ok=True)
-            except Exception:
-                pass
+        _cleanup_stale_vcf_cache_temps(paths.cache_dir, paths.key)
 
 
 def _load_plink1_metadata(bed_path: Path) -> _PlinkMetadata:
@@ -1273,17 +1793,21 @@ def _build_variant_records(
 ) -> list[VariantRecord]:
     metadata_rows_by_id: dict[str, dict[str, str]] = {}
     if variant_metadata_path is not None:
-        rows = _read_delimited_rows(variant_metadata_path)
-        if not rows:
+        table_spec = _inspect_delimited_table(variant_metadata_path)
+        if not table_spec.columns:
             raise ValueError("Variant metadata file is empty: " + str(variant_metadata_path))
-        _require_columns(available_columns=tuple(rows[0].keys()), required_columns=("variant_id",), context="variant metadata")
-        for row in rows:
+        _require_columns(available_columns=table_spec.columns, required_columns=("variant_id",), context="variant metadata")
+        saw_rows = False
+        for row in _iter_delimited_rows(table_spec):
+            saw_rows = True
             variant_id = str(row["variant_id"]).strip()
             if not variant_id:
                 raise ValueError("Encountered blank variant_id in variant metadata.")
             if variant_id in metadata_rows_by_id:
                 raise ValueError("Duplicate variant_id in variant metadata: " + variant_id)
             metadata_rows_by_id[variant_id] = row
+        if not saw_rows:
+            raise ValueError("Variant metadata file is empty: " + str(variant_metadata_path))
 
     records: list[VariantRecord] = []
     seen_variant_ids: set[str] = set()
@@ -1456,17 +1980,29 @@ def _inspect_delimited_table(path: str | Path) -> _DelimitedTableSpec:
         path=resolved_path,
         delimiter=delimiter,
         columns=columns,
+        column_index_by_name={column_name: column_index for column_index, column_name in enumerate(columns)},
     )
 
 
 def _iter_delimited_rows(table_spec: _DelimitedTableSpec) -> Iterator[dict[str, str]]:
+    columns = table_spec.columns
+    for row_values in _iter_delimited_row_values(table_spec):
+        yield {
+            column_name: row_values[column_index]
+            for column_index, column_name in enumerate(columns)
+        }
+
+
+def _iter_delimited_row_values(table_spec: _DelimitedTableSpec) -> Iterator[list[str]]:
     with table_spec.path.open("r", encoding="utf-8", newline="") as handle:
-        reader = csv.DictReader(handle, delimiter=table_spec.delimiter)
+        reader = csv.reader(handle, delimiter=table_spec.delimiter)
+        next(reader, None)
+        expected_width = len(table_spec.columns)
         for row in reader:
-            yield {
-                str(key): "" if value is None else str(value)
-                for key, value in row.items()
-            }
+            normalized_row = ["" if value is None else str(value) for value in row[:expected_width]]
+            if len(normalized_row) < expected_width:
+                normalized_row.extend([""] * (expected_width - len(normalized_row)))
+            yield normalized_row
 
 
 def _infer_delimiter(sample: str) -> str:
