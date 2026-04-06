@@ -127,3 +127,39 @@ def test_preprocessing_source_has_no_maximum_active_variants():
     source = inspect.getsource(mod)
     assert "maximum_active_variants" not in source, \
         "preprocessing module contains 'maximum_active_variants' — delete it"
+
+
+def test_no_production_module_contains_maximum_active_variants():
+    """Scan ALL production modules for the banned string."""
+    import sv_pgs.config
+    import sv_pgs.model
+    import sv_pgs.preprocessing
+    import sv_pgs.mixture_inference
+    import sv_pgs.genotype
+    import sv_pgs.io
+    import sv_pgs.linear_solvers
+    import sv_pgs.aou_runner
+    modules = [
+        sv_pgs.config, sv_pgs.model, sv_pgs.preprocessing,
+        sv_pgs.mixture_inference, sv_pgs.genotype, sv_pgs.io,
+        sv_pgs.linear_solvers, sv_pgs.aou_runner,
+    ]
+    for mod in modules:
+        source = inspect.getsource(mod)
+        assert "maximum_active_variants" not in source, \
+            f"{mod.__name__} contains 'maximum_active_variants' — delete it"
+
+
+def test_no_production_module_contains_screening_cap_functions():
+    """Ensure dead screening functions don't come back."""
+    import sv_pgs.preprocessing
+    source = inspect.getsource(sv_pgs.preprocessing)
+    banned = [
+        "_covariate_adjusted_marginal_scores",
+        "_top_scoring_variant_indices",
+        "_binary_screening_state",
+        "_quantitative_screening_state",
+    ]
+    for name in banned:
+        assert name not in source, \
+            f"preprocessing contains '{name}' — this is a banned screening function, delete it"
