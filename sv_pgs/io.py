@@ -1096,6 +1096,47 @@ def _read_vcf_sample_ids(vcf_path: Path) -> list[str]:
 _INCREMENTAL_CHECKPOINT_INTERVAL = 5000  # variants between disk flushes
 
 
+def _prepare_keep_sample_selector(
+    keep_sample_indices: np.ndarray | Sequence[int] | None,
+    total_sample_count: int,
+) -> slice | np.ndarray | None:
+    if keep_sample_indices is None:
+        return None
+    indices = np.asarray(keep_sample_indices, dtype=np.intp)
+    if indices.ndim != 1:
+        raise ValueError("keep_sample_indices must be one-dimensional.")
+    if indices.size == 0:
+        return slice(0, 0)
+    if (
+        indices.size == total_sample_count
+        and int(indices[0]) == 0
+        and int(indices[-1]) == total_sample_count - 1
+        and np.all(np.diff(indices) == 1)
+    ):
+        return None
+    if np.all(np.diff(indices) == 1):
+        return slice(int(indices[0]), int(indices[-1]) + 1)
+    return indices
+
+
+def _record_gt_types_to_int8(
+    gt_types: np.ndarray,
+    gt_map: np.ndarray,
+    keep_selector: slice | np.ndarray | None,
+) -> np.ndarray:
+    selected_gt_types = gt_types if keep_selector is None else gt_types[keep_selector]
+    return gt_map[selected_gt_types]
+
+
+def _region_output_complete(output_prefix: str | Path) -> bool:
+    prefix = Path(output_prefix)
+    return (
+        Path(f"{prefix}.geno").exists()
+        and Path(f"{prefix}.var").exists()
+        and Path(f"{prefix}.stats").exists()
+    )
+
+
 def _vcf_contig_info(vcf_path: Path) -> tuple[str, int] | None:
     """Get (chromosome_name, length) for the chromosome that has data in this VCF.
 
@@ -1141,12 +1182,13 @@ def _region_parse_worker(args: tuple) -> tuple[int, str]:
     import struct
     import sys
     import time
-    vcf_path_str, region, keep_indices_list, output_prefix = args
+    vcf_path_str, region, keep_indices_list, output_prefix, threads_per_reader = args
     keep_indices = np.array(keep_indices_list, dtype=np.intp) if keep_indices_list is not None else None
     vcf_name = Path(vcf_path_str).name
 
     reader = _open_vcf_reader(Path(vcf_path_str))
-    reader.set_threads(1)
+    reader.set_threads(max(int(threads_per_reader), 1))
+    keep_selector = _prepare_keep_sample_selector(keep_indices, len(reader.samples))
 
     gt_map = np.array([0, 1, PLINK_MISSING_INT8, 2], dtype=np.int8)
     stats_pack = struct.Struct("<qqii")
@@ -1161,14 +1203,13 @@ def _region_parse_worker(args: tuple) -> tuple[int, str]:
     for record in iterator:
         if len(record.ALT) != 1:
             continue
-        col = gt_map[record.gt_types]
-        if keep_indices is not None:
-            col = col[keep_indices]
+        col = _record_gt_types_to_int8(record.gt_types, gt_map, keep_selector)
         geno_fh.write(col.tobytes())
-        observed = col[col >= 0].astype(np.int32, copy=False)
+        observed = col[col >= 0]
+        observed_i64 = observed.astype(np.int64, copy=False)
         stats_fh.write(stats_pack.pack(
-            int(np.sum(observed, dtype=np.int64)),
-            int(np.sum(observed * observed, dtype=np.int64)),
+            int(np.sum(observed_i64, dtype=np.int64)),
+            int(np.sum(observed_i64 * observed_i64, dtype=np.int64)),
             int(observed.shape[0]),
             int(np.count_nonzero(observed > 0)),
         ))
@@ -1249,6 +1290,8 @@ def precache_vcfs_parallel(
     # Build task list
     keep_list = keep_sample_indices.tolist() if keep_sample_indices is not None else None
     tasks: list[tuple] = []
+    completed_regions_by_vcf: dict[Path, int] = {}
+    total_regions_by_vcf: dict[Path, int] = {}
     for vcf_path, n_workers in allocation.items():
         chrom, chrom_length, _ = vcf_info[vcf_path]
         cache_dir = _vcf_cache_dir(vcf_path)
@@ -1259,22 +1302,55 @@ def precache_vcfs_parallel(
 
         if n_workers <= 1 or chrom is None:
             # Single worker: parse entire VCF (no region filter)
-            tasks.append((str(vcf_path), None, keep_list, str(tmp_dir / "region_0")))
+            region_prefix = tmp_dir / "region_0"
+            total_regions_by_vcf[vcf_path] = 1
+            if _region_output_complete(region_prefix):
+                completed_regions_by_vcf[vcf_path] = 1
+            else:
+                completed_regions_by_vcf[vcf_path] = 0
+                tasks.append((str(vcf_path), None, keep_list, str(region_prefix), 1))
         else:
             regions = _split_into_regions(chrom, chrom_length, n_workers)
+            total_regions_by_vcf[vcf_path] = len(regions)
+            completed_count = 0
             for i, region in enumerate(regions):
-                tasks.append((str(vcf_path), region, keep_list, str(tmp_dir / f"region_{i}")))
+                region_prefix = tmp_dir / f"region_{i}"
+                if _region_output_complete(region_prefix):
+                    completed_count += 1
+                    continue
+                tasks.append((str(vcf_path), region, keep_list, str(region_prefix), 1))
+            completed_regions_by_vcf[vcf_path] = completed_count
 
-    log(f"parallel VCF precache: {len(uncached)} VCFs, {len(tasks)} tasks, {total_cpus} CPUs")
+    process_count = min(total_cpus, max(len(tasks), 1))
+    threads_per_worker = max(total_cpus // max(process_count, 1), 1)
+    if threads_per_worker > 1:
+        tasks = [
+            (vcf_path_str, region, keep_list_arg, output_prefix, threads_per_worker)
+            for vcf_path_str, region, keep_list_arg, output_prefix, _ in tasks
+        ]
+
+    log(
+        f"parallel VCF precache: {len(uncached)} VCFs, {len(tasks)} pending tasks, "
+        + f"{total_cpus} CPUs, {process_count} workers x {threads_per_worker} reader threads"
+    )
     for vcf_path, n_workers in allocation.items():
         chrom, chrom_length, file_size = vcf_info[vcf_path]
-        log(f"  {vcf_path.name}: {n_workers} workers, {chrom}:{chrom_length}, {file_size/1e9:.1f} GB")
+        completed_count = completed_regions_by_vcf.get(vcf_path, 0)
+        total_regions = total_regions_by_vcf.get(vcf_path, 0)
+        log(
+            f"  {vcf_path.name}: {n_workers} regions, {chrom}:{chrom_length}, {file_size/1e9:.1f} GB"
+            + f"  completed={completed_count}/{total_regions}"
+        )
 
     # Parse all regions in parallel
-    ctx = multiprocessing.get_context("spawn")
-    with ctx.Pool(processes=min(total_cpus, len(tasks))) as pool:
-        for count, prefix in pool.imap_unordered(_region_parse_worker, tasks):
-            log(f"  region done: {Path(prefix).name} ({count} variants)")
+    if tasks:
+        start_method = "fork" if "fork" in multiprocessing.get_all_start_methods() else "spawn"
+        ctx = multiprocessing.get_context(start_method)
+        with ctx.Pool(processes=process_count) as pool:
+            for count, prefix in pool.imap_unordered(_region_parse_worker, tasks):
+                log(f"  region done: {Path(prefix).name} ({count} variants)")
+    else:
+        log("  no region parsing needed; resuming from completed temporary region cache")
 
     # Merge region results per VCF → incremental cache → final .npy cache
     for vcf_path in uncached:
@@ -1453,6 +1529,7 @@ def _load_vcf_incremental(
 
     _GT_TO_INT8 = np.array([0, 1, PLINK_MISSING_INT8, 2], dtype=np.int8)
     _gt_to_i8 = _GT_TO_INT8
+    keep_selector = _prepare_keep_sample_selector(keep_sample_indices, len(reader.samples))
 
     record_count_hint = _vcf_record_count_hint(reader) if n_cached == 0 else None
     if record_count_hint is not None and record_count_hint > 0:
@@ -1511,18 +1588,16 @@ def _load_vcf_incremental(
                 + _vcf_variant_key(record)
             )
 
-        gt = record.gt_types
-        int8_col = _gt_to_i8[gt]
-        if keep_sample_indices is not None:
-            int8_col = int8_col[keep_sample_indices]
+        int8_col = _record_gt_types_to_int8(record.gt_types, _gt_to_i8, keep_selector)
 
         # Write genotype column to disk immediately
         geno_fh.write(int8_col.tobytes())
 
         # Compute per-variant stats
-        observed = int8_col[int8_col >= 0].astype(np.int32, copy=False)
+        observed = int8_col[int8_col >= 0]
         dosage_sum = int(np.sum(observed, dtype=np.int64))
-        dosage_sum_sq = int(np.sum(observed * observed, dtype=np.int64))
+        observed_i64 = observed.astype(np.int64, copy=False)
+        dosage_sum_sq = int(np.sum(observed_i64 * observed_i64, dtype=np.int64))
         n_valid = observed.shape[0]
         support = int(np.count_nonzero(observed > 0))
 

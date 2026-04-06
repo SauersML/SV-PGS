@@ -5,6 +5,7 @@ import gzip
 import json
 import os
 import pickle
+import struct
 from pathlib import Path
 
 import numpy as np
@@ -597,6 +598,132 @@ def test_vcf_cache_load_ignores_incomplete_manifestless_new_bundle(tmp_path: Pat
     np.save(cache_dir / f"{key}.stats.npy", np.zeros(1, dtype=stats_dtype), allow_pickle=False)
 
     assert _load_vcf_from_cache(vcf_path=vcf_path, keep_sample_indices=None) is None
+
+
+def test_prepare_keep_sample_selector_collapses_full_and_contiguous_ranges():
+    assert io_module._prepare_keep_sample_selector(None, total_sample_count=4) is None
+    assert io_module._prepare_keep_sample_selector(np.array([0, 1, 2, 3], dtype=np.intp), total_sample_count=4) is None
+
+    contiguous = io_module._prepare_keep_sample_selector(np.array([2, 3, 4], dtype=np.intp), total_sample_count=8)
+    assert isinstance(contiguous, slice)
+    assert contiguous.start == 2
+    assert contiguous.stop == 5
+
+    scattered = io_module._prepare_keep_sample_selector(np.array([1, 3, 4], dtype=np.intp), total_sample_count=8)
+    assert isinstance(scattered, np.ndarray)
+    np.testing.assert_array_equal(scattered, np.array([1, 3, 4], dtype=np.intp))
+
+
+def test_record_gt_types_to_int8_subsets_before_mapping():
+    gt_map = np.array([0, 1, io_module.PLINK_MISSING_INT8, 2], dtype=np.int8)
+    gt_types = np.array([0, 3, 2, 1, 0], dtype=np.int8)
+
+    full = io_module._record_gt_types_to_int8(gt_types, gt_map, None)
+    np.testing.assert_array_equal(full, np.array([0, 2, io_module.PLINK_MISSING_INT8, 1, 0], dtype=np.int8))
+
+    contiguous = io_module._record_gt_types_to_int8(gt_types, gt_map, slice(1, 4))
+    np.testing.assert_array_equal(contiguous, np.array([2, io_module.PLINK_MISSING_INT8, 1], dtype=np.int8))
+
+    scattered = io_module._record_gt_types_to_int8(gt_types, gt_map, np.array([0, 3, 4], dtype=np.intp))
+    np.testing.assert_array_equal(scattered, np.array([0, 1, 0], dtype=np.int8))
+
+
+def test_precache_vcfs_parallel_reuses_completed_region_outputs(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
+    vcf_path = tmp_path / "chr1.vcf.gz"
+    vcf_path.write_bytes(b"vcf")
+    keep_sample_indices = np.array([0, 1], dtype=np.intp)
+    cache_dir = io_module._vcf_cache_dir(vcf_path)
+    cache_dir.mkdir()
+    key = _vcf_cache_key(vcf_path, keep_sample_indices)
+    tmp_dir = cache_dir / f"{key}.tmp_parallel"
+    tmp_dir.mkdir()
+
+    region0_prefix = tmp_dir / "region_0"
+    region1_prefix = tmp_dir / "region_1"
+
+    Path(f"{region0_prefix}.geno").write_bytes(np.array([0, 1], dtype=np.int8).tobytes())
+    Path(f"{region0_prefix}.var").write_text(
+        json.dumps(
+            {
+                "variant_id": "var0",
+                "variant_class": VariantClass.SNV.value,
+                "chromosome": "1",
+                "position": 100,
+                "length": 1.0,
+                "allele_frequency": 0.25,
+                "quality": 50.0,
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    Path(f"{region0_prefix}.stats").write_bytes(struct.pack("<qqii", 1, 1, 2, 1))
+
+    scheduled_tasks: list[tuple] = []
+
+    class _FakePool:
+        def __init__(self, processes: int) -> None:
+            self.processes = processes
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb) -> None:
+            return None
+
+        def imap_unordered(self, _func, tasks):
+            for task in tasks:
+                scheduled_tasks.append(task)
+                _vcf_path_str, _region, _keep_list, output_prefix, _threads = task
+                Path(f"{output_prefix}.geno").write_bytes(np.array([2, 0], dtype=np.int8).tobytes())
+                Path(f"{output_prefix}.var").write_text(
+                    json.dumps(
+                        {
+                            "variant_id": "var1",
+                            "variant_class": VariantClass.SNV.value,
+                            "chromosome": "1",
+                            "position": 200,
+                            "length": 1.0,
+                            "allele_frequency": 0.50,
+                            "quality": 40.0,
+                        }
+                    )
+                    + "\n",
+                    encoding="utf-8",
+                )
+                Path(f"{output_prefix}.stats").write_bytes(struct.pack("<qqii", 2, 4, 2, 1))
+                yield 1, str(output_prefix)
+
+    class _FakeContext:
+        def Pool(self, processes: int):
+            return _FakePool(processes)
+
+    monkeypatch.setattr(
+        io_module,
+        "_is_vcf_cache_bundle_complete",
+        lambda paths: paths.geno_path.exists() and paths.var_path.exists() and paths.stats_path.exists() and paths.manifest_path.exists(),
+    )
+    monkeypatch.setattr(io_module, "_vcf_contig_info", lambda path: ("1", 200))
+    monkeypatch.setattr(os, "cpu_count", lambda: 2)
+    import multiprocessing as _multiprocessing
+    monkeypatch.setattr(_multiprocessing, "get_all_start_methods", lambda: ["fork", "spawn"])
+    monkeypatch.setattr(_multiprocessing, "get_context", lambda method: _FakeContext())
+
+    io_module.precache_vcfs_parallel([vcf_path], keep_sample_indices)
+
+    assert len(scheduled_tasks) == 1
+    assert scheduled_tasks[0][3] == str(region1_prefix)
+    assert scheduled_tasks[0][4] == 2
+
+    cached = _load_vcf_from_cache(vcf_path=vcf_path, keep_sample_indices=keep_sample_indices)
+    assert cached is not None
+    genotype_matrix, variants, variant_stats = cached
+    np.testing.assert_array_equal(
+        np.asarray(genotype_matrix),
+        np.array([[0, 2], [1, 0]], dtype=np.int8),
+    )
+    assert [variant.variant_id for variant in variants] == ["var0", "var1"]
+    np.testing.assert_allclose(variant_stats.means, np.array([0.5, 1.0], dtype=np.float32))
 
 
 def test_load_dataset_from_plink_auto_detects_person_id_column(tmp_path: Path):
