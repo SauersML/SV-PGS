@@ -1,7 +1,7 @@
 import numpy as np
 import pytest
 
-from sv_pgs.config import ModelConfig, TraitType, VariantClass
+from sv_pgs.config import ModelConfig, VariantClass
 from sv_pgs.data import VariantRecord
 from sv_pgs.genotype import as_raw_genotype_matrix
 from sv_pgs.plink import PLINK_MISSING_INT8
@@ -317,23 +317,7 @@ def test_select_active_variant_indices_keeps_all_post_maf_variants():
     assert result.tolist() == [0, 1, 2, 3, 4]
 
 
-def test_select_active_variant_indices_screens_to_top_signal_and_keeps_structural_variants():
-    genotype_matrix = np.array(
-        [
-            [3.0, 0.0, 0.2],
-            [2.5, 0.0, -0.1],
-            [-2.5, 0.0, 0.0],
-            [-3.0, 1.0, 0.1],
-        ],
-        dtype=np.float32,
-    )
-    covariate_matrix = np.ones((genotype_matrix.shape[0], 1), dtype=np.float32)
-    target_vector = np.array([1.0, 1.0, 0.0, 0.0], dtype=np.float32)
-    prepared_arrays = fit_preprocessor(genotype_matrix, covariate_matrix, target_vector, ModelConfig())
-    standardized_genotypes = as_raw_genotype_matrix(genotype_matrix).standardized(
-        prepared_arrays.means,
-        prepared_arrays.scales,
-    )
+def test_select_active_variant_indices_keeps_structural_and_snv_variants_after_maf_filter():
     variant_records = [
         VariantRecord("snv_signal", VariantClass.SNV, "1", 100, allele_frequency=0.1),
         VariantRecord("structural_keep", VariantClass.DELETION_SHORT, "1", 101, allele_frequency=0.1),
@@ -343,7 +327,6 @@ def test_select_active_variant_indices_screens_to_top_signal_and_keeps_structura
     result = select_active_variant_indices(
         variant_records=variant_records,
         config=ModelConfig(
-            trait_type=TraitType.BINARY,
             minimum_minor_allele_frequency=0.0,
         ),
     )

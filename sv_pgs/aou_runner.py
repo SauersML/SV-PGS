@@ -541,8 +541,7 @@ def run_all_of_us(
     finally:
         if dataset is not None:
             del dataset
-        for vcf_path in vcf_paths:
-            cleanup_local_sv_vcf(vcf_path)
+        # Keep VCFs on disk for cache / reruns (do NOT delete)
         release_process_memory()
         log("=== UNIFIED FIT CLEANUP DONE ===")
 

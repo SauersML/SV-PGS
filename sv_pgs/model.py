@@ -44,7 +44,6 @@ class FittedState:
     nonzero_scales: np.ndarray
 
 
-GPU_ACTIVE_VARIANT_BUDGET_FRACTION = 0.9
 GPU_EXACT_SOLVER_LIMIT = 1_024
 GPU_PRECONDITIONER_RANK_LIMIT = 128
 
@@ -165,10 +164,6 @@ class BayesianPGS:
         active_variant_indices = select_active_variant_indices(
             variant_records=normalized_records,
             config=self.config,
-            standardized_genotypes=standardized_genotypes,
-            covariates=prepared_arrays.covariates,
-            targets=prepared_arrays.targets,
-            trait_type=self.config.trait_type,
         )
         log(f"active variants: {len(active_variant_indices)} / {len(normalized_records)} ({100.0*len(active_variant_indices)/max(len(normalized_records),1):.1f}%)")
         if active_variant_indices.size == 0:
@@ -454,10 +449,6 @@ def _runtime_tuned_config_for_fit(
         return config, None
     gpu_budget_bytes = _gpu_materialization_budget_bytes(cupy)
     cacheable_dense_variants = max(int(gpu_budget_bytes // max(sample_count * 4, 1)), 1)
-    target_active_variants = max(
-        1,
-        int(cacheable_dense_variants * GPU_ACTIVE_VARIANT_BUDGET_FRACTION),
-    )
     tuned_exact_solver_limit = min(int(config.exact_solver_matrix_limit), GPU_EXACT_SOLVER_LIMIT)
     tuned_preconditioner_rank = min(
         int(config.sample_space_preconditioner_rank),

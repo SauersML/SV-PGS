@@ -10,7 +10,7 @@ import sv_pgs._jax  # noqa: F401
 import jax
 import jax.numpy as jnp
 
-from sv_pgs.config import ModelConfig, TraitType, VariantClass
+from sv_pgs.config import ModelConfig, VariantClass
 from sv_pgs.data import PreparedArrays, TieGroup, TieMap, VariantRecord, VariantStatistics
 from sv_pgs.genotype import (
     DenseRawGenotypeMatrix,
@@ -222,11 +222,6 @@ def fit_preprocessor(
 def select_active_variant_indices(
     variant_records: Sequence[VariantRecord],
     config: ModelConfig,
-    *,
-    standardized_genotypes: StandardizedGenotypeMatrix | np.ndarray | None = None,
-    covariates: np.ndarray | None = None,
-    targets: np.ndarray | None = None,
-    trait_type: TraitType | None = None,
 ) -> np.ndarray:
     n_total = len(variant_records)
     if n_total == 0:
@@ -251,122 +246,7 @@ def select_active_variant_indices(
         f"  active variants: {maf_kept.shape[0]}/{n_total} kept after MAF filter "
         + f"(min_maf={config.minimum_minor_allele_frequency:.6f})"
     )
-    if standardized_genotypes is None or covariates is None or targets is None or trait_type is None:
-        return maf_kept
-
-    standardized_matrix = _as_standardized_genotypes(standardized_genotypes)
-    if standardized_matrix.shape[0] != np.asarray(targets).reshape(-1).shape[0]:
-        raise ValueError("targets sample count must match standardized genotypes.")
-    if standardized_matrix.shape[0] != np.asarray(covariates).shape[0]:
-        raise ValueError("covariates sample count must match standardized genotypes.")
-
     return maf_kept
-
-
-def _covariate_adjusted_marginal_scores(
-    standardized_genotypes: StandardizedGenotypeMatrix | np.ndarray,
-    covariates: np.ndarray,
-    targets: np.ndarray,
-    trait_type: TraitType,
-    config: ModelConfig,
-) -> np.ndarray:
-    standardized_matrix = _as_standardized_genotypes(standardized_genotypes)
-    covariate_matrix = np.asarray(covariates, dtype=np.float64)
-    target_array = np.asarray(targets, dtype=np.float64).reshape(-1)
-    if covariate_matrix.ndim != 2:
-        raise ValueError("covariates must be 2D.")
-    if covariate_matrix.shape[0] != standardized_matrix.shape[0]:
-        raise ValueError("covariates sample count must match standardized genotypes.")
-    if target_array.shape[0] != standardized_matrix.shape[0]:
-        raise ValueError("targets sample count must match standardized genotypes.")
-
-    if trait_type == TraitType.BINARY:
-        alpha = _fit_covariate_only_binary(
-            covariate_matrix=covariate_matrix,
-            targets=target_array,
-            minimum_weight=config.polya_gamma_minimum_weight,
-            max_iterations=config.max_inner_newton_iterations,
-            gradient_tolerance=config.newton_gradient_tolerance,
-        )
-        residual = target_array - _stable_sigmoid_numpy(covariate_matrix @ alpha)
-    else:
-        alpha = _fit_covariate_only_quantitative(
-            covariate_matrix=covariate_matrix,
-            targets=target_array,
-        )
-        residual = target_array - covariate_matrix @ alpha
-    return np.abs(
-        np.asarray(
-            standardized_matrix.transpose_matvec(
-                residual,
-                batch_size=auto_batch_size(standardized_matrix.shape[0]),
-            ),
-            dtype=np.float64,
-        )
-    )
-
-
-def _fit_covariate_only_quantitative(
-    covariate_matrix: np.ndarray,
-    targets: np.ndarray,
-) -> np.ndarray:
-    covariates = np.asarray(covariate_matrix, dtype=np.float64)
-    target_array = np.asarray(targets, dtype=np.float64)
-    if covariates.shape[1] == 0:
-        return np.zeros(0, dtype=np.float64)
-    normal_matrix = covariates.T @ covariates + np.eye(covariates.shape[1], dtype=np.float64) * 1e-8
-    return np.linalg.solve(normal_matrix, covariates.T @ target_array).astype(np.float64, copy=False)
-
-
-def _fit_covariate_only_binary(
-    covariate_matrix: np.ndarray,
-    targets: np.ndarray,
-    minimum_weight: float,
-    max_iterations: int,
-    gradient_tolerance: float,
-) -> np.ndarray:
-    covariates = np.asarray(covariate_matrix, dtype=np.float64)
-    target_array = np.asarray(targets, dtype=np.float64)
-    alpha = np.zeros(covariates.shape[1], dtype=np.float64)
-    if covariates.shape[1] == 0:
-        return alpha
-    prevalence = float(np.clip(np.mean(target_array), 1e-6, 1.0 - 1e-6))
-    alpha[0] = float(np.log(prevalence / (1.0 - prevalence)))
-    for _ in range(max_iterations):
-        linear_predictor = covariates @ alpha
-        probabilities = _stable_sigmoid_numpy(linear_predictor)
-        weights = np.maximum(probabilities * (1.0 - probabilities), minimum_weight)
-        gradient = covariates.T @ (target_array - probabilities)
-        if float(np.linalg.norm(gradient)) <= gradient_tolerance:
-            break
-        hessian = covariates.T @ (weights[:, None] * covariates)
-        step = np.linalg.solve(
-            hessian + np.eye(hessian.shape[0], dtype=np.float64) * 1e-8,
-            gradient,
-        )
-        alpha += step
-        if float(np.linalg.norm(step)) <= gradient_tolerance:
-            break
-    return alpha
-
-
-def _stable_sigmoid_numpy(values: np.ndarray) -> np.ndarray:
-    value_array = np.asarray(values, dtype=np.float64)
-    positive_mask = value_array >= 0.0
-    result = np.empty_like(value_array, dtype=np.float64)
-    result[positive_mask] = 1.0 / (1.0 + np.exp(-value_array[positive_mask]))
-    exp_values = np.exp(value_array[~positive_mask])
-    result[~positive_mask] = exp_values / (1.0 + exp_values)
-    return result
-
-
-def _top_k_indices(scores: np.ndarray, k: int) -> np.ndarray:
-    score_array = np.asarray(scores, dtype=np.float64)
-    if k <= 0 or score_array.size == 0:
-        return np.zeros(0, dtype=np.int32)
-    if k >= score_array.shape[0]:
-        return np.arange(score_array.shape[0], dtype=np.int32)
-    return np.argpartition(-score_array, kth=k - 1)[:k].astype(np.int32, copy=False)
 
 
 def _minor_allele_frequency(allele_frequency: float) -> float:

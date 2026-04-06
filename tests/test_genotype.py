@@ -608,6 +608,74 @@ def test_try_materialize_gpu_prefers_int8_batches_when_available(monkeypatch: py
     np.testing.assert_allclose(np.asarray(cast(Any, standardized._cupy_cache)), expected)
 
 
+def test_streaming_linear_algebra_uses_gpu_batches_when_available(monkeypatch: pytest.MonkeyPatch):
+    gpu_batch_calls = 0
+    original_iter_standardized_gpu_batches = genotype_module._iter_standardized_gpu_batches
+
+    class _FakeCupy:
+        float32 = np.float32
+
+        @staticmethod
+        def asarray(array, dtype=None):
+            return np.asarray(array, dtype=dtype)
+
+        @staticmethod
+        def zeros(shape, dtype=None):
+            return np.zeros(shape, dtype=dtype)
+
+        @staticmethod
+        def empty(shape, dtype=None, order=None):
+            return np.empty(shape, dtype=dtype, order="C" if order is None else order)
+
+        @staticmethod
+        def isnan(array):
+            return np.isnan(array)
+
+    def _record_gpu_batches(*args, **kwargs):
+        nonlocal gpu_batch_calls
+        gpu_batch_calls += 1
+        yield from original_iter_standardized_gpu_batches(*args, **kwargs)
+
+    raw_matrix = np.array(
+        [
+            [0.0, 1.0, np.nan, 0.0],
+            [1.0, 0.0, 2.0, 1.0],
+            [2.0, 1.0, 1.0, 0.0],
+            [np.nan, 2.0, 0.0, 1.0],
+        ],
+        dtype=np.float32,
+    )
+    means = np.array([1.0, 1.0, 1.0, 0.5], dtype=np.float32)
+    scales = np.array([0.5, 1.0, 1.0, 0.5], dtype=np.float32)
+    sample_matrix = np.column_stack(
+        [
+            np.array([1.0, -2.0, 0.5, 3.0], dtype=np.float32),
+            np.array([-1.5, 0.0, 2.0, 1.0], dtype=np.float32),
+        ]
+    )
+
+    dense = as_raw_genotype_matrix(raw_matrix).standardized(means, scales)
+    streaming = _StreamingRawGenotypeMatrix(raw_matrix).standardized(means, scales)
+
+    monkeypatch.setattr(genotype_module, "_try_import_cupy", lambda: _FakeCupy())
+    monkeypatch.setattr(
+        genotype_module,
+        "_cupy_to_jax",
+        lambda array: jnp.asarray(np.asarray(array), dtype=genotype_module.gpu_compute_jax_dtype()),
+    )
+    monkeypatch.setattr(genotype_module, "_iter_standardized_gpu_batches", _record_gpu_batches)
+
+    result = streaming.transpose_matmat(sample_matrix, batch_size=2)
+
+    assert gpu_batch_calls > 0
+    np.testing.assert_allclose(
+        np.asarray(result, dtype=np.float64),
+        np.asarray(dense.transpose_matmat(sample_matrix, batch_size=2), dtype=np.float64),
+        rtol=1e-5,
+        atol=1e-5,
+    )
+
+
 def test_try_materialize_gpu_subset_streams_only_selected_columns(monkeypatch: pytest.MonkeyPatch):
     class _FakeCudaRuntime:
         @staticmethod

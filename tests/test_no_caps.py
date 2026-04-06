@@ -5,9 +5,6 @@ and similar caps. If any of these tests fail, someone added a cap that violates
 the spec. Delete the cap, not the test.
 """
 import inspect
-import re
-
-import numpy as np
 import pytest
 
 from sv_pgs.config import ModelConfig

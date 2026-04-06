@@ -23,9 +23,11 @@ from sv_pgs.mixture_inference import (
     _member_prior_variances_from_reduced_state,
     _orthogonal_probe_matrix,
     _parse_scale_model_feature_names,
+    _prefer_iterative_variant_space,
     _quantitative_posterior_state,
     _restricted_precision_projector,
     _sample_space_preconditioner,
+    _solve_sample_space_rhs_cpu,
     _stochastic_restricted_cross_leverage_diagonal,
     _restricted_variant_space_operator,
     _sample_space_operator,
@@ -284,6 +286,62 @@ def test_binary_posterior_stops_after_stalled_trust_region_step(random_generator
     assert beta_variance.shape == (variant_count,)
     assert linear_predictor.shape == (sample_count,)
     assert np.isfinite(objective)
+
+
+def test_cpu_sample_space_solver_uses_single_streaming_operator_pass(monkeypatch):
+    genotype_matrix = np.array(
+        [
+            [0.0, 1.0, 2.0, 0.0],
+            [1.0, 0.0, 1.0, 2.0],
+            [2.0, 1.0, 0.0, 1.0],
+            [1.0, 2.0, 1.0, 0.0],
+            [0.0, 1.0, 1.0, 2.0],
+            [2.0, 0.0, 2.0, 1.0],
+        ],
+        dtype=np.float32,
+    )
+    standardized = as_raw_genotype_matrix(genotype_matrix).standardized(
+        means=np.mean(genotype_matrix, axis=0, dtype=np.float32),
+        scales=np.std(genotype_matrix, axis=0, dtype=np.float32) + 1e-3,
+    )
+    dense_standardized = np.asarray(standardized.materialize(), dtype=np.float64)
+    prior_variances = np.array([0.6, 1.2, 0.8, 1.1], dtype=np.float64)
+    diagonal_noise = np.full(genotype_matrix.shape[0], 0.7, dtype=np.float64)
+    right_hand_side = np.array(
+        [
+            [1.0, 0.5],
+            [0.2, -0.1],
+            [-0.4, 0.7],
+            [0.6, 0.3],
+            [-0.2, 0.4],
+            [0.1, -0.5],
+        ],
+        dtype=np.float64,
+    )
+    exact_operator = (
+        np.diag(diagonal_noise)
+        + dense_standardized @ np.diag(prior_variances) @ dense_standardized.T
+    )
+    expected_solution = np.linalg.solve(exact_operator, right_hand_side)
+
+    def _forbid_two_pass(*args, **kwargs):
+        raise AssertionError("CPU sample-space solve regressed to the two-pass matmat path.")
+
+    monkeypatch.setattr(type(standardized), "transpose_matmat", _forbid_two_pass)
+    monkeypatch.setattr(type(standardized), "matmat", _forbid_two_pass)
+
+    solved = _solve_sample_space_rhs_cpu(
+        genotype_matrix=standardized,
+        prior_variances=prior_variances,
+        diagonal_noise=diagonal_noise,
+        right_hand_side=right_hand_side,
+        tolerance=1e-10,
+        max_iterations=64,
+        preconditioner=np.diag(exact_operator).astype(np.float64),
+        batch_size=2,
+    )
+
+    np.testing.assert_allclose(solved, expected_solution, atol=1e-7, rtol=1e-7)
 
 
 def test_binary_posterior_stops_immediately_after_tiny_reject_gain(random_generator, monkeypatch):
@@ -966,6 +1024,57 @@ def test_streaming_sample_space_operator_matmat_matches_dense_reference(random_g
         expected,
         rtol=1e-5,
         atol=1e-5,
+    )
+
+
+def test_prefer_iterative_variant_space_targets_warm_started_cpu_binary_updates():
+    sample_count, variant_count = 4, 6
+    genotype_values = np.array(
+        [
+            [1.0, 0.0, 1.0, 0.0, 1.0, 0.0],
+            [0.0, 1.0, 1.0, 0.0, 0.0, 1.0],
+            [1.0, 1.0, 0.0, 1.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0, 1.0, 1.0, 0.0],
+        ],
+        dtype=np.float32,
+    )
+    covariate_matrix = np.column_stack(
+        [
+            np.ones(sample_count, dtype=np.float64),
+            np.array([-1.0, 0.0, 1.0, 0.5], dtype=np.float64),
+        ]
+    )
+    targets = np.array([0.25, -0.5, 1.0, 0.75], dtype=np.float64)
+    prior_variances = np.linspace(0.5, 1.5, variant_count, dtype=np.float64)
+    diagonal_noise = np.linspace(1.0, 1.3, sample_count, dtype=np.float64)
+    standardized = as_raw_genotype_matrix(genotype_values).standardized(
+        means=np.zeros(variant_count, dtype=np.float32),
+        scales=np.ones(variant_count, dtype=np.float32),
+    )
+    standardized._dense_cache = standardized.materialize()
+    assert _prefer_iterative_variant_space(
+        genotype_matrix=standardized,
+        sample_count=sample_count,
+        variant_count=variant_count,
+        compute_beta_variance=False,
+        compute_logdet=False,
+        initial_beta_guess=np.zeros(variant_count, dtype=np.float64),
+    )
+    assert not _prefer_iterative_variant_space(
+        genotype_matrix=standardized,
+        sample_count=sample_count,
+        variant_count=variant_count,
+        compute_beta_variance=True,
+        compute_logdet=False,
+        initial_beta_guess=np.zeros(variant_count, dtype=np.float64),
+    )
+    assert not _prefer_iterative_variant_space(
+        genotype_matrix=standardized,
+        sample_count=sample_count,
+        variant_count=sample_count,
+        compute_beta_variance=False,
+        compute_logdet=False,
+        initial_beta_guess=np.zeros(sample_count, dtype=np.float64),
     )
 
 
