@@ -1,7 +1,7 @@
 import numpy as np
 import pytest
 
-from sv_pgs.config import ModelConfig, TraitType, VariantClass
+from sv_pgs.config import ModelConfig, VariantClass
 from sv_pgs.data import VariantRecord
 from sv_pgs.genotype import as_raw_genotype_matrix
 import sv_pgs.preprocessing as preprocessing_module
@@ -249,42 +249,6 @@ def test_select_active_variant_indices_keeps_all_variants_when_maf_filter_is_dis
     )
 
     assert result.tolist() == [0, 1, 2]
-
-
-def test_select_active_variant_indices_screens_to_top_marginal_signal_and_keeps_structural_variants():
-    genotype_matrix = np.array(
-        [
-            [0.0, 2.0, 0.0, 0.0, 0.0],
-            [0.0, 2.0, 1.0, 1.0, 0.0],
-            [0.0, 2.0, 0.0, 0.0, 1.0],
-            [2.0, 2.0, 1.0, 1.0, 1.0],
-            [2.0, 2.0, 0.0, 0.0, 0.0],
-            [2.0, 2.0, 1.0, 1.0, 1.0],
-        ],
-        dtype=np.float32,
-    )
-    covariate_matrix = np.ones((genotype_matrix.shape[0], 1), dtype=np.float32)
-    target_vector = np.array([0.0, 0.0, 0.0, 1.0, 1.0, 1.0], dtype=np.float32)
-    variant_records = [
-        VariantRecord("snv_signal", VariantClass.SNV, "1", 100),
-        VariantRecord("sv_keep", VariantClass.DELETION_SHORT, "1", 101, training_support=1),
-        VariantRecord("snv_noise_0", VariantClass.SNV, "1", 102),
-        VariantRecord("snv_noise_1", VariantClass.SNV, "1", 103),
-        VariantRecord("snv_noise_2", VariantClass.SNV, "1", 104),
-    ]
-    prepared_arrays = fit_preprocessor(genotype_matrix, covariate_matrix, target_vector, ModelConfig())
-    standardized_genotypes = Preprocessor(means=prepared_arrays.means, scales=prepared_arrays.scales).transform(genotype_matrix)
-
-    result = select_active_variant_indices(
-        variant_records=variant_records,
-        config=ModelConfig(trait_type=TraitType.BINARY, minimum_minor_allele_frequency=0.0, maximum_active_variants=2),
-        standardized_genotypes=standardized_genotypes,
-        covariates=prepared_arrays.covariates,
-        targets=prepared_arrays.targets,
-        trait_type=TraitType.BINARY,
-    )
-
-    assert result.tolist() == [0, 1]
 
 
 def test_fit_preprocessor_matches_streaming_variant_statistics_with_missing_values():

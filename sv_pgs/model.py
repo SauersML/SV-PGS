@@ -177,21 +177,25 @@ class BayesianPGS:
             )
 
         # Materialize the reduced genotype matrix (RAM or GPU via CuPy).
-        cached = reduced_genotypes.try_materialize_gpu()
-        if not cached:
-            cached = reduced_genotypes.try_materialize()
-        if cached:
+        in_memory = reduced_genotypes.try_materialize_gpu()
+        if not in_memory:
+            in_memory = reduced_genotypes.try_materialize()
+        local_cache = False
+        if in_memory:
             # After materialization, reduced_genotypes no longer needs raw.
             reduced_genotypes.release_raw_storage()
         else:
-            log("keeping reduced genotype matrix streaming (no RAM/GPU cache)  mem=" + mem())
+            local_cache = reduced_genotypes.try_cache_locally()
+            if not local_cache:
+                log("keeping reduced genotype matrix streaming (no RAM/GPU/local cache)  mem=" + mem())
         del raw_genotype_matrix, standardized_genotypes, active_genotypes
         import gc
         gc.collect()
         log(f"memory freed after materialization  mem={mem()}")
         log(
             f"starting variational EM  max_iterations={self.config.max_outer_iterations}  "
-            f"reduced_matrix={reduced_genotypes.shape}  in_memory={cached}  "
+            f"reduced_matrix={reduced_genotypes.shape}  in_memory={in_memory}  "
+            f"local_cache={local_cache}  "
             f"on_gpu={reduced_genotypes._cupy_cache is not None}  "
             f"mem={mem()}"
         )

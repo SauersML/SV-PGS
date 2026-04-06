@@ -205,7 +205,15 @@ def _as_preconditioner(
                 return result
             if array.ndim != 2:
                 raise ValueError("preconditioner input must be a vector or matrix.")
-            result = jnp.asarray(preconditioner(array), dtype=solver_dtype)
+            try:
+                result = jnp.asarray(preconditioner(array), dtype=solver_dtype)
+            except (TypeError, ValueError):
+                result = jnp.column_stack(
+                    [
+                        jnp.asarray(preconditioner(array[:, column_index]), dtype=solver_dtype)
+                        for column_index in range(array.shape[1])
+                    ]
+                )
             if result.shape != array.shape:
                 raise ValueError(
                     f"callable preconditioner returned shape {result.shape} for input shape {array.shape}."
@@ -361,7 +369,17 @@ def _solve_multiple_rhs(
     if operator_matmat is None:
         raise ValueError("matrix solve requires an operator matmat implementation.")
 
-    residual = rhs - jnp.asarray(operator_matmat(solution), dtype=solver_dtype)
+    def apply_operator_active(matrix: jnp.ndarray, active_columns: np.ndarray | None = None) -> jnp.ndarray:
+        if active_columns is None:
+            return jnp.asarray(operator_matmat(matrix), dtype=solver_dtype)
+        if active_columns.size == 0:
+            return jnp.zeros_like(matrix)
+        active_index_array = jnp.asarray(active_columns, dtype=jnp.int32)
+        active_matrix = matrix[:, active_index_array]
+        active_result = jnp.asarray(operator_matmat(active_matrix), dtype=solver_dtype)
+        return jnp.zeros_like(matrix).at[:, active_index_array].set(active_result)
+
+    residual = rhs - apply_operator_active(solution)
     residual_norm_sq = np.asarray(jnp.sum(residual * residual, axis=0), dtype=np.float64)
     rhs_norm_sq = np.asarray(jnp.sum(rhs * rhs, axis=0), dtype=np.float64)
     convergence_threshold_sq = np.maximum(tol_sq, tol_sq * np.maximum(residual_norm_sq, rhs_norm_sq))
@@ -379,14 +397,15 @@ def _solve_multiple_rhs(
     last_log = t_start
     active_count = int(np.sum(~converged))
     for iteration_index in range(max_iterations):
+        active_columns = np.flatnonzero(~converged).astype(np.int32, copy=False)
         active_mask = jnp.asarray((~converged).astype(np.asarray(jnp.zeros((), dtype=solver_dtype)).dtype), dtype=solver_dtype)
         masked_search = search_direction * active_mask[None, :]
-        operator_search = jnp.asarray(operator_matmat(masked_search), dtype=solver_dtype) * active_mask[None, :]
+        operator_search = apply_operator_active(masked_search, active_columns) * active_mask[None, :]
         step_denom = np.asarray(jnp.sum(masked_search * operator_search, axis=0), dtype=np.float64)
         invalid = (~converged) & (~np.isfinite(step_denom) | (step_denom <= 0.0))
         if np.any(invalid):
             invalid_mask = jnp.asarray(invalid.astype(np.asarray(jnp.zeros((), dtype=solver_dtype)).dtype), dtype=solver_dtype)
-            residual = rhs - jnp.asarray(operator_matmat(solution), dtype=solver_dtype)
+            residual = rhs - apply_operator_active(solution, active_columns)
             refreshed_preconditioned = residual if preconditioner is None else preconditioner(residual)
             search_direction = search_direction * (1.0 - invalid_mask[None, :]) + refreshed_preconditioned * invalid_mask[None, :]
             residual_dot = np.where(
@@ -395,7 +414,7 @@ def _solve_multiple_rhs(
                 residual_dot,
             )
             masked_search = search_direction * active_mask[None, :]
-            operator_search = jnp.asarray(operator_matmat(masked_search), dtype=solver_dtype) * active_mask[None, :]
+            operator_search = apply_operator_active(masked_search, active_columns) * active_mask[None, :]
             step_denom = np.asarray(jnp.sum(masked_search * operator_search, axis=0), dtype=np.float64)
             if np.any((~converged) & (~np.isfinite(step_denom) | (step_denom <= 0.0))):
                 raise RuntimeError("Conjugate-gradient operator is not positive definite.")
@@ -406,7 +425,7 @@ def _solve_multiple_rhs(
         solution = solution + masked_search * step_scale_jax[None, :]
         residual = residual - operator_search * step_scale_jax[None, :]
         if (iteration_index + 1) % residual_refresh_interval == 0:
-            residual = rhs - jnp.asarray(operator_matmat(solution), dtype=solver_dtype)
+            residual = rhs - apply_operator_active(solution, active_columns)
         residual_norm_sq = np.asarray(jnp.sum(residual * residual, axis=0), dtype=np.float64)
         converged = residual_norm_sq <= convergence_threshold_sq
         now = time.monotonic()
@@ -438,7 +457,7 @@ def _solve_multiple_rhs(
         invalid_beta = (~converged) & (~np.isfinite(beta) | (beta < 0.0))
         if np.any(invalid_beta):
             invalid_beta_mask = jnp.asarray(invalid_beta.astype(np.asarray(jnp.zeros((), dtype=solver_dtype)).dtype), dtype=solver_dtype)
-            residual = rhs - jnp.asarray(operator_matmat(solution), dtype=solver_dtype)
+            residual = rhs - apply_operator_active(solution, active_columns)
             updated_preconditioned = residual if preconditioner is None else preconditioner(residual)
             updated_residual_dot = np.asarray(jnp.sum(residual * updated_preconditioned, axis=0), dtype=np.float64)
             search_direction = search_direction * (1.0 - invalid_beta_mask[None, :]) + updated_preconditioned * invalid_beta_mask[None, :]

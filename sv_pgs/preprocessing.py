@@ -10,7 +10,7 @@ import sv_pgs._jax  # noqa: F401
 import jax
 import jax.numpy as jnp
 
-from sv_pgs.config import ModelConfig, TraitType, VariantClass
+from sv_pgs.config import ModelConfig, VariantClass
 from sv_pgs.data import PreparedArrays, TieGroup, TieMap, VariantRecord, VariantStatistics
 from sv_pgs.genotype import (
     DenseRawGenotypeMatrix,
@@ -23,9 +23,6 @@ from sv_pgs.genotype import (
 )
 from sv_pgs.plink import PLINK_MISSING_INT8
 from sv_pgs.progress import log, mem
-
-STRUCTURAL_VARIANT_CLASSES = frozenset(ModelConfig.structural_variant_classes())
-
 
 @jax.jit
 def _batch_all_stats_i8(batch_i8: jnp.ndarray) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray]:
@@ -203,7 +200,7 @@ def select_active_variant_indices(
     standardized_genotypes: StandardizedGenotypeMatrix | np.ndarray | None = None,
     covariates: np.ndarray | None = None,
     targets: np.ndarray | None = None,
-    trait_type: TraitType | None = None,
+    trait_type: object | None = None,
 ) -> np.ndarray:
     n_total = len(variant_records)
     if n_total == 0:
@@ -224,144 +221,16 @@ def select_active_variant_indices(
         )
         return maf_kept
 
-    max_active = min(int(config.maximum_active_variants), int(maf_kept.shape[0]))
-    if (
-        max_active >= maf_kept.shape[0]
-        or standardized_genotypes is None
-        or covariates is None
-        or targets is None
-        or trait_type is None
-    ):
-        log(
-            f"  active variants: {maf_kept.shape[0]}/{n_total} kept after MAF filter "
-            + f"(min_maf={config.minimum_minor_allele_frequency:.6f})"
-        )
-        return maf_kept
-
-    maf_kept_set = set(int(variant_index) for variant_index in maf_kept.tolist())
-    structural_indices = np.asarray(
-        [
-            variant_index
-            for variant_index, record in enumerate(variant_records)
-            if variant_index in maf_kept_set and record.variant_class in STRUCTURAL_VARIANT_CLASSES
-        ],
-        dtype=np.int32,
-    )
-    structural_count = int(structural_indices.shape[0])
-    if structural_count >= maf_kept.shape[0]:
-        log(f"  active variants: {maf_kept.shape[0]}/{n_total} kept [all structural after MAF filter]")
-        return maf_kept
-
-    score_budget = max(max_active - structural_count, 0)
-    if score_budget == 0:
-        kept = np.sort(np.unique(structural_indices).astype(np.int32, copy=False))
-        log(f"  active variants: {kept.shape[0]}/{n_total} kept [structural-only budget]")
-        return kept
-
     log(
-        f"  screening active variants: target={max_active} total={n_total} "
-        + f"maf_kept={maf_kept.shape[0]} structural_keep={structural_count} "
-        + f"trait={trait_type.value}  mem={mem()}"
+        f"  active variants: {maf_kept.shape[0]}/{n_total} kept after MAF filter "
+        + f"(min_maf={config.minimum_minor_allele_frequency:.6f})"
     )
-    marginal_scores = _covariate_adjusted_marginal_scores(
-        standardized_genotypes=standardized_genotypes,
-        covariates=np.asarray(covariates, dtype=np.float64),
-        targets=np.asarray(targets, dtype=np.float64),
-        trait_type=trait_type,
-        minimum_weight=float(config.polya_gamma_minimum_weight),
-    )
-    eligible_mask = np.zeros(n_total, dtype=bool)
-    eligible_mask[maf_kept] = True
-    marginal_scores[~eligible_mask] = -np.inf
-    if structural_indices.size:
-        marginal_scores[structural_indices] = np.inf
-    selected = np.argpartition(-marginal_scores, kth=max_active - 1)[:max_active]
-    selected = np.sort(np.unique(selected.astype(np.int32, copy=False)))
-    log(
-        f"  active variants: {selected.shape[0]}/{n_total} kept after marginal screen "
-        + f"(budget={max_active}, maf_kept={maf_kept.shape[0]}, structural={structural_count})  mem={mem()}"
-    )
-    return selected
+    return maf_kept
 
 
 def _minor_allele_frequency(allele_frequency: float) -> float:
     normalized_frequency = float(np.clip(allele_frequency, 0.0, 1.0))
     return min(normalized_frequency, 1.0 - normalized_frequency)
-
-
-def _covariate_adjusted_marginal_scores(
-    standardized_genotypes: StandardizedGenotypeMatrix | np.ndarray,
-    covariates: np.ndarray,
-    targets: np.ndarray,
-    trait_type: TraitType,
-    minimum_weight: float,
-) -> np.ndarray:
-    standardized_matrix = _as_standardized_genotypes(standardized_genotypes)
-    if trait_type == TraitType.BINARY:
-        alpha = _fit_covariate_only_binary(covariates, targets, minimum_weight)
-        linear_predictor = covariates @ alpha
-        probabilities = _stable_sigmoid_numpy(linear_predictor)
-        residual = targets - probabilities
-        weights = np.maximum(probabilities * (1.0 - probabilities), minimum_weight)
-    else:
-        alpha = _fit_covariate_only_quantitative(covariates, targets)
-        residual = targets - covariates @ alpha
-        weights = np.ones_like(residual, dtype=np.float64)
-
-    scores = np.empty(standardized_matrix.shape[1], dtype=np.float32)
-    batch_size = auto_batch_size(standardized_matrix.shape[0])
-    for batch in standardized_matrix.iter_column_batches(batch_size=batch_size):
-        batch_values = np.asarray(batch.values, dtype=np.float64)
-        numerator = batch_values.T @ residual
-        denominator = np.sqrt(np.sum((batch_values * batch_values) * weights[:, None], axis=0))
-        scores[batch.variant_indices] = np.asarray(
-            np.abs(numerator) / np.maximum(denominator, 1e-8),
-            dtype=np.float32,
-        )
-    return scores
-
-
-def _fit_covariate_only_quantitative(covariates: np.ndarray, targets: np.ndarray) -> np.ndarray:
-    normal_matrix = covariates.T @ covariates + np.eye(covariates.shape[1], dtype=np.float64) * 1e-8
-    right_hand_side = covariates.T @ targets
-    return np.linalg.solve(normal_matrix, right_hand_side).astype(np.float64, copy=False)
-
-
-def _fit_covariate_only_binary(
-    covariates: np.ndarray,
-    targets: np.ndarray,
-    minimum_weight: float,
-    max_iterations: int = 12,
-) -> np.ndarray:
-    alpha = np.zeros(covariates.shape[1], dtype=np.float64)
-    prevalence = float(np.clip(np.mean(targets), 1e-6, 1.0 - 1e-6))
-    if alpha.shape[0] > 0:
-        alpha[0] = np.log(prevalence / (1.0 - prevalence))
-    for _ in range(max_iterations):
-        linear_predictor = covariates @ alpha
-        probabilities = _stable_sigmoid_numpy(linear_predictor)
-        weights = np.maximum(probabilities * (1.0 - probabilities), minimum_weight)
-        working_response = linear_predictor + (targets - probabilities) / weights
-        weighted_covariates = covariates * weights[:, None]
-        hessian = covariates.T @ weighted_covariates + np.eye(covariates.shape[1], dtype=np.float64) * 1e-8
-        rhs = covariates.T @ (weights * working_response)
-        updated_alpha = np.linalg.solve(hessian, rhs).astype(np.float64, copy=False)
-        if np.max(np.abs(updated_alpha - alpha)) <= 1e-6:
-            alpha = updated_alpha
-            break
-        alpha = updated_alpha
-    return alpha
-
-
-def _stable_sigmoid_numpy(values: np.ndarray) -> np.ndarray:
-    value_array = np.asarray(values, dtype=np.float64)
-    positive_mask = value_array >= 0.0
-    negative_exponential = np.exp(np.where(positive_mask, -value_array, value_array))
-    return np.where(
-        positive_mask,
-        1.0 / (1.0 + negative_exponential),
-        negative_exponential / (1.0 + negative_exponential),
-    )
 
 
 def build_tie_map(

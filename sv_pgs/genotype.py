@@ -4,6 +4,7 @@ from abc import ABC, abstractmethod
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
+import tempfile
 from typing import Any, Iterator, Sequence
 
 import sv_pgs._jax  # noqa: F401
@@ -35,7 +36,10 @@ T4_SAFE_GPU_CACHE_BYTES = 4_500_000_000
 def as_raw_genotype_matrix(genotypes: RawGenotypeMatrix | np.ndarray) -> RawGenotypeMatrix:
     if isinstance(genotypes, RawGenotypeMatrix):
         return genotypes
-    return DenseRawGenotypeMatrix(np.asarray(genotypes, dtype=np.float32))
+    array = np.asanyarray(genotypes)
+    if array.dtype == np.int8:
+        return Int8RawGenotypeMatrix(array)
+    return DenseRawGenotypeMatrix(np.asarray(array, dtype=np.float32))
 
 
 @dataclass(slots=True)
@@ -95,10 +99,11 @@ class DenseRawGenotypeMatrix(RawGenotypeMatrix):
     matrix: np.ndarray
 
     def __post_init__(self) -> None:
-        if self.matrix.dtype == np.int8:
-            pass  # int8 with -1 sentinel for missing — 4x smaller than float32
+        matrix_array = np.asanyarray(self.matrix)
+        if matrix_array.dtype == np.int8:
+            self.matrix = matrix_array  # preserve memmap-backed int8 arrays
         else:
-            self.matrix = np.asarray(self.matrix, dtype=np.float32)
+            self.matrix = np.asarray(matrix_array, dtype=np.float32)
         if self.matrix.ndim != 2:
             raise ValueError("genotypes must be 2D.")
 
@@ -134,6 +139,53 @@ class DenseRawGenotypeMatrix(RawGenotypeMatrix):
     ) -> np.ndarray:
         resolved_indices = _resolve_variant_indices(self.shape[1], variant_indices)
         return self._to_float32(self.matrix[:, resolved_indices])
+
+
+@dataclass(slots=True)
+class Int8RawGenotypeMatrix(RawGenotypeMatrix):
+    matrix: np.ndarray
+
+    def __post_init__(self) -> None:
+        matrix_array = np.asanyarray(self.matrix)
+        self.matrix = matrix_array if matrix_array.dtype == np.int8 else np.asarray(matrix_array, dtype=np.int8)
+        if self.matrix.ndim != 2:
+            raise ValueError("genotypes must be 2D.")
+
+    @property
+    def shape(self) -> tuple[int, int]:
+        return self.matrix.shape
+
+    def iter_column_batches_i8(
+        self,
+        variant_indices: Sequence[int] | np.ndarray | None = None,
+        batch_size: int = DEFAULT_GENOTYPE_BATCH_SIZE,
+    ) -> Iterator[RawGenotypeBatch]:
+        resolved_indices = _resolve_variant_indices(self.shape[1], variant_indices)
+        safe_batch_size = max(int(batch_size), 1)
+        for start_index in range(0, resolved_indices.shape[0], safe_batch_size):
+            batch_indices = resolved_indices[start_index : start_index + safe_batch_size]
+            yield RawGenotypeBatch(
+                variant_indices=batch_indices,
+                values=np.asarray(self.matrix[:, batch_indices], dtype=np.int8),
+            )
+
+    def iter_column_batches(
+        self,
+        variant_indices: Sequence[int] | np.ndarray | None = None,
+        batch_size: int = DEFAULT_GENOTYPE_BATCH_SIZE,
+    ) -> Iterator[RawGenotypeBatch]:
+        for batch in self.iter_column_batches_i8(variant_indices, batch_size=batch_size):
+            yield RawGenotypeBatch(
+                variant_indices=batch.variant_indices,
+                values=_int8_batch_to_float32(batch.values),
+            )
+
+    def materialize(
+        self,
+        variant_indices: Sequence[int] | np.ndarray | None = None,
+    ) -> np.ndarray:
+        resolved_indices = _resolve_variant_indices(self.shape[1], variant_indices)
+        return _int8_batch_to_float32(self.matrix[:, resolved_indices])
 
 
 @dataclass(slots=True)
@@ -312,6 +364,31 @@ class ConcatenatedRawGenotypeMatrix(RawGenotypeMatrix):
                 values=batch_values,
             )
 
+    def iter_column_batches_i8(
+        self,
+        variant_indices: Sequence[int] | np.ndarray | None = None,
+        batch_size: int = DEFAULT_GENOTYPE_BATCH_SIZE,
+    ) -> Iterator[RawGenotypeBatch]:
+        if not all(hasattr(child, "iter_column_batches_i8") for child in self.children):
+            raise RuntimeError("int8 batch iteration requires every concatenated child to support iter_column_batches_i8.")
+        resolved_indices = _resolve_variant_indices(self.shape[1], variant_indices)
+        safe_batch_size = max(int(batch_size), 1)
+        for start_index in range(0, resolved_indices.shape[0], safe_batch_size):
+            batch_indices = resolved_indices[start_index : start_index + safe_batch_size]
+            child_ids = np.searchsorted(self._variant_offsets[1:], batch_indices, side="right")
+            batch_values = np.empty((self.shape[0], batch_indices.shape[0]), dtype=np.int8)
+            for child_index in np.unique(child_ids):
+                child_positions = np.nonzero(child_ids == child_index)[0]
+                child_variant_indices = batch_indices[child_positions] - int(self._variant_offsets[child_index])
+                child = self.children[int(child_index)]
+                child_batch_iter = child.iter_column_batches_i8(child_variant_indices, batch_size=max(child_variant_indices.shape[0], 1))
+                child_batch = next(child_batch_iter)
+                batch_values[:, child_positions] = np.asarray(child_batch.values, dtype=np.int8)
+            yield RawGenotypeBatch(
+                variant_indices=batch_indices,
+                values=batch_values,
+            )
+
     def materialize(
         self,
         variant_indices: Sequence[int] | np.ndarray | None = None,
@@ -438,6 +515,7 @@ class StandardizedGenotypeMatrix:
     sample_count: int | None = field(default=None, repr=False)
     _dense_cache: np.ndarray | None = field(init=False, default=None, repr=False)
     _cupy_cache: object | None = field(init=False, default=None, repr=False)  # cupy.ndarray
+    _local_cache_directory: tempfile.TemporaryDirectory[str] | None = field(init=False, default=None, repr=False)
     _n_samples: int = field(init=False, default=0, repr=False)
 
     def __post_init__(self) -> None:
@@ -481,6 +559,7 @@ class StandardizedGenotypeMatrix:
         if self._dense_cache is None and self._cupy_cache is None:
             raise RuntimeError("cannot release raw storage before materializing genotype data.")
         self.raw = None
+        self._local_cache_directory = None
 
     def try_materialize_gpu(self) -> bool:
         """Materialize the standardized matrix onto GPU memory when possible."""
@@ -544,6 +623,51 @@ class StandardizedGenotypeMatrix:
         log(f"    materialized  mem={mem()}")
         return True
 
+    def try_cache_locally(self) -> bool:
+        """Rebase onto a local int8 memmap to avoid repeated upstream streaming passes."""
+        if self.raw is None or self._dense_cache is not None or self._cupy_cache is not None:
+            return False
+        if not hasattr(self.raw, "iter_column_batches_i8"):
+            return False
+        if isinstance(self.raw, Int8RawGenotypeMatrix):
+            return True
+        batch_size = auto_batch_size(self.shape[0])
+        selected_variant_count = int(self.variant_indices.shape[0])
+        log(
+            f"    caching reduced raw genotypes locally as int8 "
+            + f"({selected_variant_count} variants x {self.shape[0]} samples)  mem={mem()}"
+        )
+        cache_directory = tempfile.TemporaryDirectory(prefix="svpgs-genotype-")
+        cache_path = Path(cache_directory.name) / "reduced_raw_i8.npy"
+        try:
+            raw_cache = np.lib.format.open_memmap(
+                cache_path,
+                mode="w+",
+                dtype=np.int8,
+                shape=self.shape,
+                fortran_order=True,
+            )
+            local_start = 0
+            for raw_batch in self.raw.iter_column_batches_i8(self.variant_indices, batch_size=batch_size):
+                batch_width = raw_batch.values.shape[1]
+                local_stop = local_start + batch_width
+                raw_cache[:, local_start:local_stop] = raw_batch.values
+                local_start = local_stop
+            raw_cache.flush()
+            del raw_cache
+            rebased_raw = Int8RawGenotypeMatrix(np.load(cache_path, mmap_mode="r"))
+            self.raw = rebased_raw
+            self.means = np.asarray(self.means[self.variant_indices], dtype=np.float32)
+            self.scales = np.asarray(self.scales[self.variant_indices], dtype=np.float32)
+            self.variant_indices = np.arange(selected_variant_count, dtype=np.int32)
+            self._local_cache_directory = cache_directory
+            log("    local int8 cache ready  mem=" + mem())
+            return True
+        except Exception as exc:
+            cache_directory.cleanup()
+            log(f"    local int8 cache failed ({exc})  mem={mem()}")
+            return False
+
     def subset(self, local_variant_indices: Sequence[int] | np.ndarray) -> StandardizedGenotypeMatrix:
         resolved_local_indices = np.asarray(local_variant_indices, dtype=np.int32)
         subset = StandardizedGenotypeMatrix(
@@ -557,6 +681,7 @@ class StandardizedGenotypeMatrix:
             subset._cupy_cache = self._cupy_cache[:, resolved_local_indices]
         elif self._dense_cache is not None:
             subset._dense_cache = np.asarray(self._dense_cache[:, resolved_local_indices], dtype=np.float32)
+        subset._local_cache_directory = self._local_cache_directory
         return subset
 
     def iter_column_batches(
@@ -576,6 +701,20 @@ class StandardizedGenotypeMatrix:
             raise RuntimeError("streaming genotype batches require raw backing storage or a materialized cache.")
         safe_batch_size = max(int(batch_size), 1)
         local_start = 0
+        if hasattr(self.raw, "iter_column_batches_i8"):
+            for raw_batch in self.raw.iter_column_batches_i8(self.variant_indices, batch_size=safe_batch_size):
+                local_stop = local_start + raw_batch.variant_indices.shape[0]
+                local_indices = np.arange(local_start, local_stop, dtype=np.int32)
+                yield RawGenotypeBatch(
+                    variant_indices=local_indices,
+                    values=_standardize_batch_i8(
+                        raw_batch.values,
+                        self.means[raw_batch.variant_indices],
+                        self.scales[raw_batch.variant_indices],
+                    ),
+                )
+                local_start = local_stop
+            return
         for raw_batch in self.raw.iter_column_batches(self.variant_indices, batch_size=safe_batch_size):
             local_stop = local_start + raw_batch.variant_indices.shape[0]
             local_indices = np.arange(local_start, local_stop, dtype=np.int32)
@@ -610,12 +749,16 @@ class StandardizedGenotypeMatrix:
             coeff_jax = jnp.ravel(jnp.asarray(coefficients, dtype=jnp.float32))
             if coeff_jax.shape[0] != self.shape[1]:
                 raise ValueError("coefficient vector must match genotype column count.")
+            if bool(jnp.all(coeff_jax == 0.0)):
+                return _as_gpu_compute_jax(np.zeros(self.shape[0], dtype=np.float32))
             coeff_cupy = _to_cupy_float32(coeff_jax)
             result = self._cupy_cache @ coeff_cupy
             return _cupy_to_jax(result)
         coeff_np = np.asarray(coefficients, dtype=gpu_compute_numpy_dtype()).ravel()
         if coeff_np.shape[0] != self.shape[1]:
             raise ValueError("coefficient vector must match genotype column count.")
+        if not np.any(coeff_np):
+            return _as_gpu_compute_jax(np.zeros(self.shape[0], dtype=coeff_np.dtype))
         result = np.zeros(self.shape[0], dtype=gpu_compute_numpy_dtype())
         for batch in self.iter_column_batches(batch_size=batch_size):
             batch_values = np.asarray(batch.values, dtype=result.dtype)
@@ -628,11 +771,15 @@ class StandardizedGenotypeMatrix:
             matrix_jax = jnp.asarray(matrix, dtype=jnp.float32)
             if matrix_jax.ndim != 2 or matrix_jax.shape[0] != self.shape[1]:
                 raise ValueError("variant matrix must match genotype column count.")
+            if bool(jnp.all(matrix_jax == 0.0)):
+                return _as_gpu_compute_jax(np.zeros((self.shape[0], matrix_jax.shape[1]), dtype=np.float32))
             result = self._cupy_cache @ _to_cupy_float32(matrix_jax)
             return _cupy_to_jax(result)
         m_np = np.asarray(matrix, dtype=gpu_compute_numpy_dtype())
         if m_np.ndim != 2 or m_np.shape[0] != self.shape[1]:
             raise ValueError("variant matrix must match genotype column count.")
+        if not np.any(m_np):
+            return _as_gpu_compute_jax(np.zeros((self.shape[0], m_np.shape[1]), dtype=m_np.dtype))
         output = np.zeros((self.shape[0], m_np.shape[1]), dtype=m_np.dtype)
         for batch in self.iter_column_batches(batch_size=batch_size):
             batch_values = np.asarray(batch.values, dtype=output.dtype)
@@ -645,11 +792,15 @@ class StandardizedGenotypeMatrix:
             vector_jax = jnp.ravel(jnp.asarray(vector, dtype=jnp.float32))
             if vector_jax.shape[0] != self.shape[0]:
                 raise ValueError("sample vector must match genotype row count.")
+            if bool(jnp.all(vector_jax == 0.0)):
+                return _as_gpu_compute_jax(np.zeros(self.shape[1], dtype=np.float32))
             result = self._cupy_cache.T @ _to_cupy_float32(vector_jax)
             return _cupy_to_jax(result)
         v_np = np.asarray(vector, dtype=gpu_compute_numpy_dtype()).ravel()
         if v_np.shape[0] != self.shape[0]:
             raise ValueError("sample vector must match genotype row count.")
+        if not np.any(v_np):
+            return _as_gpu_compute_jax(np.zeros(self.shape[1], dtype=v_np.dtype))
         output = np.empty(self.shape[1], dtype=v_np.dtype)
         for batch in self.iter_column_batches(batch_size=batch_size):
             output[batch.variant_indices] = np.asarray(batch.values, dtype=output.dtype).T @ v_np
@@ -661,11 +812,15 @@ class StandardizedGenotypeMatrix:
             matrix_jax = jnp.asarray(matrix, dtype=jnp.float32)
             if matrix_jax.ndim != 2 or matrix_jax.shape[0] != self.shape[0]:
                 raise ValueError("sample matrix must match genotype row count.")
+            if bool(jnp.all(matrix_jax == 0.0)):
+                return _as_gpu_compute_jax(np.zeros((self.shape[1], matrix_jax.shape[1]), dtype=np.float32))
             result = self._cupy_cache.T @ _to_cupy_float32(matrix_jax)
             return _cupy_to_jax(result)
         m_np = np.asarray(matrix, dtype=gpu_compute_numpy_dtype())
         if m_np.ndim != 2 or m_np.shape[0] != self.shape[0]:
             raise ValueError("sample matrix must match genotype row count.")
+        if not np.any(m_np):
+            return _as_gpu_compute_jax(np.zeros((self.shape[1], m_np.shape[1]), dtype=m_np.dtype))
         output = np.empty((self.shape[1], m_np.shape[1]), dtype=m_np.dtype)
         for batch in self.iter_column_batches(batch_size=batch_size):
             output[batch.variant_indices, :] = np.asarray(batch.values, dtype=output.dtype).T @ m_np
@@ -738,5 +893,24 @@ def _standardize_batch(batch: np.ndarray, means: np.ndarray, scales: np.ndarray)
     scales_f32 = np.asarray(scales, dtype=np.float32)
     standardized = batch_f32 - means_f32[None, :]
     standardized[np.isnan(batch_f32)] = 0.0
+    standardized /= scales_f32[None, :]
+    return standardized.astype(np.float32, copy=False)
+
+
+def _int8_batch_to_float32(batch: np.ndarray) -> np.ndarray:
+    batch_i8 = np.asarray(batch, dtype=np.int8)
+    batch_f32 = batch_i8.astype(np.float32)
+    batch_f32[batch_i8 == PLINK_MISSING_INT8] = np.nan
+    return batch_f32
+
+
+def _standardize_batch_i8(batch: np.ndarray, means: np.ndarray, scales: np.ndarray) -> np.ndarray:
+    batch_i8 = np.asarray(batch, dtype=np.int8)
+    means_f32 = np.asarray(means, dtype=np.float32)
+    scales_f32 = np.asarray(scales, dtype=np.float32)
+    standardized = batch_i8.astype(np.float32)
+    missing_mask = batch_i8 == PLINK_MISSING_INT8
+    standardized -= means_f32[None, :]
+    standardized[missing_mask] = 0.0
     standardized /= scales_f32[None, :]
     return standardized.astype(np.float32, copy=False)

@@ -5,7 +5,7 @@ import numpy as np
 import pytest
 
 import sv_pgs.genotype as genotype_module
-from sv_pgs.genotype import ConcatenatedRawGenotypeMatrix, RawGenotypeBatch, RawGenotypeMatrix, as_raw_genotype_matrix
+from sv_pgs.genotype import ConcatenatedRawGenotypeMatrix, Int8RawGenotypeMatrix, RawGenotypeBatch, RawGenotypeMatrix, as_raw_genotype_matrix
 
 
 class _StreamingRawGenotypeMatrix(RawGenotypeMatrix):
@@ -213,6 +213,53 @@ def test_standardized_streaming_batches_delegate_to_raw_batch_iterator():
     assert raw.materialize_requests == []
 
 
+def test_matvec_skips_streaming_when_coefficients_are_zero():
+    raw_matrix = np.arange(24, dtype=np.float32).reshape(4, 6)
+    raw = _SpyStreamingRawGenotypeMatrix(raw_matrix)
+    standardized = raw.standardized(
+        means=np.zeros(raw_matrix.shape[1], dtype=np.float32),
+        scales=np.ones(raw_matrix.shape[1], dtype=np.float32),
+    )
+
+    result = standardized.matvec(np.zeros(raw_matrix.shape[1], dtype=np.float32), batch_size=2)
+
+    np.testing.assert_allclose(np.asarray(result), np.zeros(raw_matrix.shape[0], dtype=np.float32))
+    assert raw.iter_requests == []
+
+
+def test_try_cache_locally_rebases_to_local_int8_cache():
+    raw_i8 = np.array(
+        [
+            [0, 1, -127, 2],
+            [1, -127, 2, 0],
+            [2, 1, 0, 1],
+        ],
+        dtype=np.int8,
+    )
+    raw = _SpyInt8StreamingRawGenotypeMatrix(raw_i8)
+    means = np.array([1.0, 1.0, 1.0, 1.0], dtype=np.float32)
+    scales = np.array([0.5, 2.0, 1.0, 0.5], dtype=np.float32)
+    standardized = raw.standardized(means, scales).subset(np.array([1, 3], dtype=np.int32))
+
+    assert standardized.try_cache_locally() is True
+    assert raw.i8_requests == [[1, 3]]
+    assert isinstance(standardized.raw, Int8RawGenotypeMatrix)
+
+    raw.i8_requests.clear()
+    np.testing.assert_allclose(
+        standardized.materialize(),
+        np.array(
+            [
+                [0.0, 2.0],
+                [0.0, -2.0],
+                [0.0, 0.0],
+            ],
+            dtype=np.float32,
+        ),
+    )
+    assert raw.i8_requests == []
+
+
 def test_try_materialize_gpu_does_not_force_cpu_dense_fallback(monkeypatch: pytest.MonkeyPatch):
     raw_matrix = np.arange(24, dtype=np.float32).reshape(4, 6)
     standardized = as_raw_genotype_matrix(raw_matrix).standardized(
@@ -294,6 +341,52 @@ def test_concatenated_raw_genotype_matrix_preserves_column_order_and_values():
                 [9.0, 3.0],
             ],
             dtype=np.float32,
+        ),
+    )
+
+
+def test_concatenated_raw_genotype_matrix_supports_int8_batch_iteration():
+    left = Int8RawGenotypeMatrix(
+        np.array(
+            [
+                [0, 1],
+                [2, -127],
+            ],
+            dtype=np.int8,
+        )
+    )
+    right = Int8RawGenotypeMatrix(
+        np.array(
+            [
+                [2, 0, 1],
+                [1, 2, -127],
+            ],
+            dtype=np.int8,
+        )
+    )
+    concatenated = ConcatenatedRawGenotypeMatrix((left, right))
+
+    batches = list(concatenated.iter_column_batches_i8(np.array([4, 1, 3], dtype=np.int32), batch_size=2))
+
+    assert [batch.variant_indices.tolist() for batch in batches] == [[4, 1], [3]]
+    np.testing.assert_array_equal(
+        batches[0].values,
+        np.array(
+            [
+                [1, 1],
+                [-127, -127],
+            ],
+            dtype=np.int8,
+        ),
+    )
+    np.testing.assert_array_equal(
+        batches[1].values,
+        np.array(
+            [
+                [0],
+                [2],
+            ],
+            dtype=np.int8,
         ),
     )
 

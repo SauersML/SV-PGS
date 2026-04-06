@@ -15,7 +15,7 @@ from sklearn.metrics import log_loss, r2_score, roc_auc_score
 
 from sv_pgs.config import ModelConfig, TraitType, VariantClass
 from sv_pgs.data import VariantRecord, VariantStatistics
-from sv_pgs.genotype import ConcatenatedRawGenotypeMatrix, DenseRawGenotypeMatrix, PlinkRawGenotypeMatrix, RawGenotypeMatrix
+from sv_pgs.genotype import ConcatenatedRawGenotypeMatrix, PlinkRawGenotypeMatrix, RawGenotypeMatrix, as_raw_genotype_matrix
 from sv_pgs.model import BayesianPGS
 from sv_pgs.preprocessing import compute_variant_statistics
 from sv_pgs.progress import log, mem
@@ -449,7 +449,7 @@ def load_dataset_from_files(
 
     if resolved_format == "vcf":
         # genotype_matrix is already subsetted to aligned samples (int8 for VCF)
-        raw_genotypes: RawGenotypeMatrix = DenseRawGenotypeMatrix(genotype_matrix)
+        raw_genotypes = as_raw_genotype_matrix(genotype_matrix)
         if default_variants is None:
             raise RuntimeError("VCF defaults were not initialized.")
         log(f"VCF matrix: {raw_genotypes.shape}  mem={mem()}")
@@ -568,7 +568,7 @@ def load_multi_vcf_dataset_from_files(
             keep_sample_indices=keep_sample_indices,
             mmap_mode="r",
         )
-        raw_matrices.append(DenseRawGenotypeMatrix(genotype_matrix))
+        raw_matrices.append(as_raw_genotype_matrix(genotype_matrix))
         default_variants.extend(chromosome_variants)
         variant_stats_parts.append(chromosome_stats)
         log(
