@@ -651,27 +651,20 @@ _INCREMENTAL_CHECKPOINT_INTERVAL = 5000  # variants between disk flushes
 
 
 def _vcf_contig_info(vcf_path: Path) -> tuple[str, int] | None:
-    """Get (chromosome_name, length) from VCF header contigs.
+    """Get (chromosome_name, length) for the chromosome that has data in this VCF.
 
-    Returns None if the VCF is empty or has no contig length info.
-    Falls back to reading the first record for the chromosome name
-    and returns length=0 if the header lacks contig lengths.
+    Reads the first record to find which chromosome has data, then looks up
+    its length from the header contigs. Returns length=0 if unknown.
     """
     reader = _open_vcf_reader(vcf_path)
     seqnames = list(reader.seqnames) if hasattr(reader, "seqnames") else []
     seqlens = list(reader.seqlens) if hasattr(reader, "seqlens") else []
-    # Try header contigs first
-    for name, length in zip(seqnames, seqlens):
-        if length and int(length) > 0:
-            return str(name), int(length)
-    # Header lacks lengths — read first record for chrom name
+    contig_lengths = {str(n): int(l) for n, l in zip(seqnames, seqlens) if l and int(l) > 0}
+    # Read first record to find which chromosome actually has data
     for record in reader:
         chrom = str(record.CHROM)
-        # Check if this chrom has a length in the header
-        for name, length in zip(seqnames, seqlens):
-            if str(name) == chrom and length and int(length) > 0:
-                return chrom, int(length)
-        return chrom, 0
+        length = contig_lengths.get(chrom, 0)
+        return chrom, length
     return None
 
 
@@ -693,8 +686,11 @@ def _region_parse_worker(args: tuple) -> tuple[int, str]:
     Runs in a separate process. Returns (variant_count, output_prefix)."""
     import json as _json
     import struct
+    import sys
+    import time
     vcf_path_str, region, keep_indices_list, output_prefix = args
     keep_indices = np.array(keep_indices_list, dtype=np.intp) if keep_indices_list is not None else None
+    vcf_name = Path(vcf_path_str).name
 
     from cyvcf2 import VCF
     reader = VCF(vcf_path_str)
@@ -707,6 +703,8 @@ def _region_parse_worker(args: tuple) -> tuple[int, str]:
     stats_fh = open(f"{output_prefix}.stats", "wb")
 
     count = 0
+    t_start = time.monotonic()
+    last_log = t_start
     iterator = reader(region) if region else reader
     for record in iterator:
         if len(record.ALT) != 1:
@@ -730,11 +728,18 @@ def _region_parse_worker(args: tuple) -> tuple[int, str]:
             "quality": vd.quality,
         }) + "\n")
         count += 1
+        now = time.monotonic()
+        if now - last_log >= 10.0:
+            rate = count / max(now - t_start, 0.01)
+            print(f"  [worker] {vcf_name}: {count} variants ({rate:.0f}/s)", file=sys.stderr, flush=True)
+            last_log = now
 
     geno_fh.close()
     var_fh.close()
     stats_fh.close()
     reader.close()
+    elapsed = time.monotonic() - t_start
+    print(f"  [worker] {vcf_name}: DONE {count} variants in {elapsed:.0f}s", file=sys.stderr, flush=True)
     return count, output_prefix
 
 
