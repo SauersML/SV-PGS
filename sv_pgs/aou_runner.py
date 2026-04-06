@@ -61,6 +61,10 @@ def local_sv_vcf_path(chromosome: int, work_dir: Path) -> Path:
     return local_sv_vcf_cache_dir(work_dir) / sv_vcf_name(chromosome)
 
 
+def legacy_local_sv_vcf_path(chromosome: int, work_dir: Path) -> Path:
+    return work_dir / sv_vcf_name(chromosome)
+
+
 # ---------------------------------------------------------------------------
 # gsutil helpers
 # ---------------------------------------------------------------------------
@@ -114,12 +118,28 @@ def _download_gcs_object_if_missing(remote_path: str, local_path: Path) -> None:
         raise
 
 
+def _adopt_legacy_sv_vcf_cache(chromosome: int, work_dir: Path) -> Path:
+    cache_vcf = local_sv_vcf_path(chromosome, work_dir)
+    cache_tbi = cache_vcf.parent / f"{cache_vcf.name}.tbi"
+    legacy_vcf = legacy_local_sv_vcf_path(chromosome, work_dir)
+    legacy_tbi = legacy_vcf.parent / f"{legacy_vcf.name}.tbi"
+    cache_vcf.parent.mkdir(parents=True, exist_ok=True)
+    if not cache_vcf.exists() and legacy_vcf.exists():
+        legacy_vcf.replace(cache_vcf)
+    elif cache_vcf.exists() and legacy_vcf.exists():
+        legacy_vcf.unlink(missing_ok=True)
+    if not cache_tbi.exists() and legacy_tbi.exists():
+        legacy_tbi.replace(cache_tbi)
+    elif cache_tbi.exists() and legacy_tbi.exists():
+        legacy_tbi.unlink(missing_ok=True)
+    return cache_vcf
+
+
 def download_sv_vcf(chromosome: int, work_dir: Path) -> Path:
     """Download one SV VCF + index when needed and return the local VCF path."""
     remote_dir = sv_vcf_dir()
     name = sv_vcf_name(chromosome)
-    local_vcf = local_sv_vcf_path(chromosome, work_dir)
-    local_tbi = work_dir / f"{name}.tbi"
+    local_vcf = _adopt_legacy_sv_vcf_cache(chromosome, work_dir)
     local_tbi = local_vcf.parent / f"{name}.tbi"
     vcf_remote = f"{remote_dir}/{name}"
     tbi_remote = f"{remote_dir}/{name}.tbi"
@@ -401,7 +421,7 @@ def run_all_of_us(
     # Compute keep_indices from VCF header + merged sample table (if both exist)
     # so we can check the EXACT cache key, not just glob for any .npy
     keep_indices_for_status: np.ndarray | None = None
-    first_vcf = local_sv_vcf_path(chromosomes[0], work_dir)
+    first_vcf = _adopt_legacy_sv_vcf_cache(chromosomes[0], work_dir)
     if merged_path.exists() and first_vcf.exists():
         try:
             all_sample_ids = _read_vcf_sample_ids(first_vcf)
@@ -433,7 +453,7 @@ def run_all_of_us(
     cached_chrs = []
     uncached_chrs = []
     for chrom in chromosomes:
-        vcf_path = local_sv_vcf_path(chrom, work_dir)
+        vcf_path = _adopt_legacy_sv_vcf_cache(chrom, work_dir)
         if not vcf_path.exists():
             uncached_chrs.append(f"chr{chrom}(no VCF)")
             continue

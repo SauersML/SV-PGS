@@ -500,6 +500,37 @@ def test_download_sv_vcf_downloads_missing_index_for_existing_vcf(monkeypatch, t
         )
     ]
 
+
+def test_download_sv_vcf_adopts_existing_legacy_work_dir_cache(monkeypatch, tmp_path: Path):
+    monkeypatch.setenv("CDR_STORAGE_PATH", "gs://bucket/cdr")
+    monkeypatch.setenv("GOOGLE_PROJECT", "billing-project")
+    work_dir = tmp_path / "run"
+    work_dir.mkdir(parents=True, exist_ok=True)
+    legacy_vcf = work_dir / "AoU_srWGS_SV.v8.chr22.vcf.gz"
+    legacy_tbi = work_dir / "AoU_srWGS_SV.v8.chr22.vcf.gz.tbi"
+    legacy_vcf.write_text("vcf\n", encoding="utf-8")
+    legacy_tbi.write_text("tbi\n", encoding="utf-8")
+
+    monkeypatch.setattr(
+        aou_runner,
+        "_gsutil_size",
+        lambda path: (_ for _ in ()).throw(AssertionError("legacy cache should prevent size lookup")),
+    )
+    monkeypatch.setattr(
+        aou_runner,
+        "_gsutil_cp",
+        lambda src, dst: (_ for _ in ()).throw(AssertionError("legacy cache should prevent download")),
+    )
+
+    local_vcf = aou_runner.download_sv_vcf(22, work_dir)
+    cache_dir = aou_runner.local_sv_vcf_cache_dir(work_dir)
+
+    assert local_vcf == cache_dir / "AoU_srWGS_SV.v8.chr22.vcf.gz"
+    assert local_vcf.exists()
+    assert Path(f"{local_vcf}.tbi").exists()
+    assert not legacy_vcf.exists()
+    assert not legacy_tbi.exists()
+
 def test_merge_pcs_into_sample_table_raises_when_ids_do_not_overlap(tmp_path: Path):
     sample_table_path = tmp_path / "samples.tsv"
     ancestry_path = tmp_path / "ancestry.tsv"
