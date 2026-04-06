@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 import numpy as np
 
@@ -112,7 +112,7 @@ class open_bed:
         self,
         index=None,
         dtype: str | np.dtype = "float32",
-        order: str = "F",
+        order: Literal["F", "C"] = "F",
         num_threads: int | None = None,
     ) -> np.ndarray:
         del num_threads
@@ -130,7 +130,7 @@ class open_bed:
             result[raw_i8 == PLINK_MISSING_INT8] = np.nan
         if order == "F":
             return np.asfortranarray(result)
-        return np.asarray(result, order=order)
+        return np.ascontiguousarray(result)
 
     def _read_int8_matrix(self, variant_index: slice | np.ndarray) -> np.ndarray:
         bytes_per_variant = _bytes_per_variant(self.iid_count)

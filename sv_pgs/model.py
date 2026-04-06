@@ -56,8 +56,12 @@ def _validate_fit_inputs(
         raise ValueError("covariates must be 2D.")
     if covariate_matrix.shape[0] != sample_count:
         raise ValueError("covariates sample count must match genotypes.")
+    if not np.all(np.isfinite(covariate_matrix)):
+        raise ValueError("covariates must be finite.")
     if target_array.shape[0] != sample_count:
         raise ValueError("targets sample count must match genotypes.")
+    if not np.all(np.isfinite(target_array)):
+        raise ValueError("targets must be finite.")
     if len(variant_records) != variant_count:
         raise ValueError("variant_records length must match genotype column count.")
     if variant_stats is None:
@@ -70,6 +74,14 @@ def _validate_fit_inputs(
         raise ValueError("variant_stats.allele_frequencies must match genotype column count.")
     if variant_stats.support_counts.shape != (variant_count,):
         raise ValueError("variant_stats.support_counts must match genotype column count.")
+    if not np.all(np.isfinite(variant_stats.means)):
+        raise ValueError("variant_stats.means must be finite.")
+    if not np.all(np.isfinite(variant_stats.scales)) or np.any(variant_stats.scales <= 0.0):
+        raise ValueError("variant_stats.scales must be finite and positive.")
+    if not np.all(np.isfinite(variant_stats.allele_frequencies)) or np.any(variant_stats.allele_frequencies < 0.0) or np.any(variant_stats.allele_frequencies > 1.0):
+        raise ValueError("variant_stats.allele_frequencies must be finite and lie in [0.0, 1.0].")
+    if np.any(np.asarray(variant_stats.support_counts) < 0):
+        raise ValueError("variant_stats.support_counts must be non-negative.")
 
 
 class BayesianPGS:
@@ -141,6 +153,40 @@ class BayesianPGS:
             config=self.config,
         )
         log(f"active variants: {len(active_variant_indices)} / {len(normalized_records)} ({100.0*len(active_variant_indices)/max(len(normalized_records),1):.1f}%)")
+        if active_variant_indices.size == 0:
+            log("no active variants remain after filtering; fitting covariates-only model...")
+            reduced_validation_dense: tuple[np.ndarray, np.ndarray, np.ndarray] | None = None
+            if validation_data is not None:
+                _validation_genotypes, validation_covariates, validation_targets = validation_data
+                reduced_validation_dense = (
+                    np.empty((len(validation_targets), 0), dtype=np.float32),
+                    self._with_intercept(np.asarray(validation_covariates, dtype=np.float32)),
+                    np.asarray(validation_targets, dtype=np.float32),
+                )
+            fit_result = _fit_without_active_variants(
+                covariates=prepared_arrays.covariates,
+                targets=prepared_arrays.targets,
+                config=self.config,
+                validation_data=reduced_validation_dense,
+            )
+            full_coefficients = np.zeros(len(normalized_records), dtype=np.float32)
+            nonzero_coefficient_indices, nonzero_coefficients = _nonzero_coefficient_cache(full_coefficients)
+            self.state = FittedState(
+                variant_records=normalized_records,
+                active_variant_indices=np.zeros(0, dtype=np.int32),
+                preprocessor=preprocessor,
+                tie_map=_empty_tie_map(len(normalized_records)),
+                fit_result=fit_result,
+                full_coefficients=full_coefficients,
+                nonzero_coefficient_indices=nonzero_coefficient_indices,
+                nonzero_coefficients=nonzero_coefficients,
+                nonzero_means=np.zeros(0, dtype=np.float32),
+                nonzero_scales=np.zeros(0, dtype=np.float32),
+            )
+            log(f"coefficients: 0 non-zero out of {len(normalized_records)} total")
+            log(f"=== MODEL FIT DONE ===  mem={mem()}")
+            return self
+
         active_records = [normalized_records[int(variant_index)] for variant_index in active_variant_indices]
         active_genotypes = standardized_genotypes.subset(active_variant_indices)
         log("building tie map (detecting identical/negated genotype columns)...")
@@ -387,6 +433,31 @@ def _nonzero_coefficient_cache(coefficients: np.ndarray) -> tuple[np.ndarray, np
     coefficient_array = np.asarray(coefficients, dtype=np.float32)
     nonzero_indices = np.flatnonzero(np.abs(coefficient_array) > 0.0).astype(np.int32)
     return nonzero_indices, np.asarray(coefficient_array[nonzero_indices], dtype=np.float32)
+
+
+def _empty_tie_map(original_variant_count: int) -> TieMap:
+    return TieMap(
+        kept_indices=np.zeros(0, dtype=np.int32),
+        original_to_reduced=np.full(original_variant_count, -1, dtype=np.int32),
+        reduced_to_group=[],
+    )
+
+
+def _fit_without_active_variants(
+    covariates: np.ndarray,
+    targets: np.ndarray,
+    config: ModelConfig,
+    validation_data: tuple[np.ndarray, np.ndarray, np.ndarray] | None,
+) -> VariationalFitResult:
+    return fit_variational_em(
+        genotypes=np.empty((covariates.shape[0], 0), dtype=np.float32),
+        covariates=covariates,
+        targets=targets,
+        records=[],
+        config=config,
+        tie_map=_empty_tie_map(0),
+        validation_data=validation_data,
+    )
 
 
 # Compute genotypes @ coefficients for a subset of variants, standardizing

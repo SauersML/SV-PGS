@@ -4,15 +4,17 @@ import numpy as np
 from sklearn.metrics import roc_auc_score
 
 import sv_pgs.genotype as genotype_module
+import sv_pgs.model as model_module
 from sv_pgs import BayesianPGS, BenchmarkConfig, ModelConfig, TraitType, VariantClass, VariantRecord, run_benchmark_suite
 from sv_pgs.data import TieGroup, TieMap
-from sv_pgs.genotype import RawGenotypeBatch, RawGenotypeMatrix
+from sv_pgs.genotype import RawGenotypeBatch, RawGenotypeMatrix, as_raw_genotype_matrix
 from sv_pgs.inference import VariationalFitResult
 from sv_pgs.model import (
     _raw_standardized_subset_matvec,
     _tie_group_export_weights,
     _training_records_from_stats,
 )
+from sv_pgs.preprocessing import compute_variant_statistics
 
 
 def _synthetic_binary_dataset() -> tuple[np.ndarray, np.ndarray, np.ndarray, list[VariantRecord]]:
@@ -82,6 +84,7 @@ def test_binary_model_fit_roundtrip_and_keeps_all_variants(tmp_path):
         ModelConfig(
             trait_type=TraitType.BINARY,
             max_outer_iterations=10,
+            minimum_minor_allele_frequency=0.0,
         )
     ).fit(genotype_matrix, covariate_matrix, target_vector, variant_records)
 
@@ -116,6 +119,7 @@ def test_benchmark_suite_runs_from_shared_trainer():
             shared_config=ModelConfig(
                 trait_type=TraitType.BINARY,
                 max_outer_iterations=8,
+                minimum_minor_allele_frequency=0.0,
             )
         ),
     )
@@ -180,13 +184,159 @@ def test_training_records_from_stats_preserve_prior_continuous_features():
             "Stats",
             (),
             {
+                "allele_frequencies": np.array([0.2], dtype=np.float32),
                 "support_counts": np.array([7], dtype=np.int32),
             },
         )(),
     )
 
     assert training_records[0].training_support == 7
+    np.testing.assert_allclose(training_records[0].allele_frequency, 0.2)
     assert training_records[0].prior_continuous_features == {"sv_length_score": 1.5}
+
+
+def test_fit_uses_cohort_allele_frequencies_for_maf_filter(monkeypatch):
+    genotype_matrix = np.array(
+        [
+            [0.0, 0.0],
+            [0.0, 1.0],
+            [2.0, 1.0],
+            [2.0, 0.0],
+        ],
+        dtype=np.float32,
+    )
+    covariate_matrix = np.zeros((genotype_matrix.shape[0], 1), dtype=np.float32)
+    target_vector = np.array([0.0, 0.0, 1.0, 1.0], dtype=np.float32)
+    variant_records = [
+        VariantRecord("variant_0", VariantClass.SNV, "1", 100, allele_frequency=1e-5),
+        VariantRecord("variant_1", VariantClass.SNV, "1", 101, allele_frequency=0.25),
+    ]
+    config = ModelConfig(
+        trait_type=TraitType.BINARY,
+        minimum_minor_allele_frequency=0.1,
+        max_outer_iterations=1,
+    )
+    variant_stats = compute_variant_statistics(
+        raw_genotypes=as_raw_genotype_matrix(genotype_matrix),
+        config=config,
+    )
+
+    def fake_fit_variational_em(genotypes, covariates, targets, records, tie_map, config, validation_data):
+        reduced_count = genotypes.shape[1]
+        active_count = len(records)
+        return VariationalFitResult(
+            alpha=np.zeros(covariates.shape[1], dtype=np.float32),
+            beta_reduced=np.zeros(reduced_count, dtype=np.float32),
+            beta_variance=np.ones(reduced_count, dtype=np.float32),
+            prior_scales=np.ones(active_count, dtype=np.float32),
+            global_scale=1.0,
+            class_tpb_shape_a=dict(config.class_tpb_shape_a()),
+            class_tpb_shape_b=dict(config.class_tpb_shape_b()),
+            scale_model_coefficients=np.zeros(1, dtype=np.float32),
+            scale_model_feature_names=["intercept"],
+            sigma_error2=1.0,
+            objective_history=[0.0],
+            validation_history=[],
+            member_prior_variances=np.ones(active_count, dtype=np.float32),
+        )
+
+    monkeypatch.setattr(model_module, "fit_variational_em", fake_fit_variational_em)
+
+    model = BayesianPGS(config).fit(
+        genotype_matrix,
+        covariate_matrix,
+        target_vector,
+        variant_records,
+        variant_stats=variant_stats,
+    )
+
+    assert model.state is not None
+    assert model.state.variant_records[0].allele_frequency > 0.1
+    assert model.state.active_variant_indices.tolist() == [0, 1]
+
+
+def test_model_fit_supports_covariates_only_when_no_variants_survive(tmp_path):
+    genotype_matrix = np.zeros((6, 3), dtype=np.float32)
+    alternate_genotypes = np.array(
+        [
+            [0.0, 1.0, 2.0],
+            [2.0, 1.0, 0.0],
+            [1.0, 1.0, 1.0],
+            [0.0, 2.0, 1.0],
+            [2.0, 0.0, 2.0],
+            [1.0, 0.0, 0.0],
+        ],
+        dtype=np.float32,
+    )
+    covariate_matrix = np.array(
+        [[-2.0], [-1.0], [0.0], [1.0], [2.0], [3.0]],
+        dtype=np.float32,
+    )
+    target_vector = np.array([0.0, 0.0, 0.0, 1.0, 1.0, 1.0], dtype=np.float32)
+    variant_records = [
+        VariantRecord("variant_0", VariantClass.SNV, "1", 100, allele_frequency=0.2),
+        VariantRecord("variant_1", VariantClass.SNV, "1", 101, allele_frequency=0.2),
+        VariantRecord("variant_2", VariantClass.SNV, "1", 102, allele_frequency=0.2),
+    ]
+
+    model = BayesianPGS(
+        ModelConfig(
+            trait_type=TraitType.BINARY,
+            minimum_minor_allele_frequency=0.01,
+            max_outer_iterations=5,
+        )
+    ).fit(genotype_matrix, covariate_matrix, target_vector, variant_records)
+
+    assert model.state is not None
+    assert model.state.active_variant_indices.shape == (0,)
+    assert model.state.tie_map.kept_indices.shape == (0,)
+    assert np.all(model.state.tie_map.original_to_reduced == -1)
+    np.testing.assert_array_equal(model.state.full_coefficients, np.zeros(genotype_matrix.shape[1], dtype=np.float32))
+    probabilities = model.predict_proba(genotype_matrix, covariate_matrix)[:, 1]
+    assert roc_auc_score(target_vector, probabilities) > 0.95
+    np.testing.assert_allclose(
+        model.decision_function(genotype_matrix, covariate_matrix),
+        model.decision_function(alternate_genotypes, covariate_matrix),
+    )
+
+    artifact_directory = tmp_path / "covariates_only_artifact"
+    model.export(artifact_directory)
+    loaded_model = BayesianPGS.load(artifact_directory)
+    np.testing.assert_allclose(
+        loaded_model.predict_proba(alternate_genotypes, covariate_matrix),
+        model.predict_proba(alternate_genotypes, covariate_matrix),
+    )
+
+
+def test_fit_rejects_invalid_variant_stats_allele_frequencies():
+    genotype_matrix, covariate_matrix, target_vector, variant_records = _synthetic_binary_dataset()
+
+    with np.testing.assert_raises_regex(
+        ValueError,
+        r"variant_stats.allele_frequencies must be finite and lie in \[0.0, 1.0\]\.",
+    ):
+        BayesianPGS(
+            ModelConfig(
+                trait_type=TraitType.BINARY,
+                minimum_minor_allele_frequency=0.0,
+                max_outer_iterations=2,
+            )
+        ).fit(
+            genotype_matrix,
+            covariate_matrix,
+            target_vector,
+            variant_records,
+            variant_stats=type(
+                "Stats",
+                (),
+                {
+                    "means": np.zeros(genotype_matrix.shape[1], dtype=np.float32),
+                    "scales": np.ones(genotype_matrix.shape[1], dtype=np.float32),
+                    "allele_frequencies": np.array([0.2, 0.1, 1.2, 0.3, 0.4], dtype=np.float32),
+                    "support_counts": np.ones(genotype_matrix.shape[1], dtype=np.int32),
+                },
+            )(),
+        )
 
 
 def test_fit_rejects_variant_stats_shape_mismatch():
@@ -295,6 +445,7 @@ def test_model_fit_keeps_streaming_when_materialization_is_skipped(monkeypatch):
         ModelConfig(
             trait_type=TraitType.BINARY,
             max_outer_iterations=2,
+            minimum_minor_allele_frequency=0.0,
         )
     ).fit(genotype_matrix, covariate_matrix, target_vector, variant_records)
 

@@ -268,6 +268,25 @@ def test_select_active_variant_indices_uses_only_maf_filter():
     assert result.tolist() == [1, 2, 3, 4]
 
 
+def test_select_active_variant_indices_keeps_all_post_maf_variants():
+    variant_records = [
+        VariantRecord("snv_signal", VariantClass.SNV, "1", 100),
+        VariantRecord("sv_keep", VariantClass.DELETION_SHORT, "1", 101, training_support=1),
+        VariantRecord("snv_noise_0", VariantClass.SNV, "1", 102),
+        VariantRecord("snv_noise_1", VariantClass.SNV, "1", 103),
+        VariantRecord("snv_noise_2", VariantClass.SNV, "1", 104),
+    ]
+
+    result = select_active_variant_indices(
+        variant_records=variant_records,
+        config=ModelConfig(
+            minimum_minor_allele_frequency=0.0,
+        ),
+    )
+
+    assert result.tolist() == [0, 1, 2, 3, 4]
+
+
 def test_fit_preprocessor_matches_streaming_variant_statistics_with_missing_values():
     genotype_matrix = np.array(
         [
@@ -290,6 +309,44 @@ def test_fit_preprocessor_matches_streaming_variant_statistics_with_missing_valu
 
     np.testing.assert_allclose(prepared_arrays.means, variant_statistics.means)
     np.testing.assert_allclose(prepared_arrays.scales, variant_statistics.scales)
+
+
+def test_compute_variant_statistics_uses_neutral_af_for_non_dosage_float_columns():
+    genotype_matrix = np.array(
+        [
+            [-1.0, 1.0],
+            [0.0, 0.0],
+            [1.0, -1.0],
+            [0.5, -0.5],
+        ],
+        dtype=np.float32,
+    )
+
+    variant_statistics = compute_variant_statistics(
+        raw_genotypes=as_raw_genotype_matrix(genotype_matrix),
+        config=ModelConfig(),
+    )
+
+    np.testing.assert_allclose(variant_statistics.allele_frequencies, np.array([0.5, 0.5], dtype=np.float32))
+
+
+def test_compute_variant_statistics_preserves_af_for_continuous_dosage_columns():
+    genotype_matrix = np.array(
+        [
+            [0.2, 1.8],
+            [0.4, 1.6],
+            [0.6, 1.4],
+            [0.8, 1.2],
+        ],
+        dtype=np.float32,
+    )
+
+    variant_statistics = compute_variant_statistics(
+        raw_genotypes=as_raw_genotype_matrix(genotype_matrix),
+        config=ModelConfig(),
+    )
+
+    np.testing.assert_allclose(variant_statistics.allele_frequencies, np.array([0.25, 0.75], dtype=np.float32))
 
 
 def test_collapse_tie_groups_preserves_support_and_continuous_features():

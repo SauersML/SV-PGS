@@ -126,6 +126,7 @@ class TestQuantitativePrediction:
         config = ModelConfig(
             trait_type=TraitType.QUANTITATIVE,
             max_outer_iterations=15,
+            minimum_minor_allele_frequency=0.0,
         )
         model = BayesianPGS(config).fit(
             genotype_matrix[:train_stop],
@@ -159,6 +160,7 @@ class TestQuantitativePrediction:
         config = ModelConfig(
             trait_type=TraitType.QUANTITATIVE,
             max_outer_iterations=15,
+            minimum_minor_allele_frequency=0.0,
         )
         model = BayesianPGS(config).fit(
             genotype_matrix, covariate_matrix, target_vector, variant_records,
@@ -199,6 +201,7 @@ class TestBinaryPrediction:
         config = ModelConfig(
             trait_type=TraitType.BINARY,
             max_outer_iterations=12,
+            minimum_minor_allele_frequency=0.0,
         )
         model = BayesianPGS(config).fit(
             genotype_matrix[:train_stop],
@@ -246,6 +249,7 @@ class TestJointSNVSVBenefit:
         base_config = ModelConfig(
             trait_type=TraitType.QUANTITATIVE,
             max_outer_iterations=12,
+            minimum_minor_allele_frequency=0.0,
         )
 
         snv_only_model = BayesianPGS(base_config).fit(
@@ -307,6 +311,7 @@ class TestExactCorrelationSetHandling:
         config = ModelConfig(
             trait_type=TraitType.QUANTITATIVE,
             max_outer_iterations=10,
+            minimum_minor_allele_frequency=0.0,
         )
         model = BayesianPGS(config).fit(
             genotype_matrix, covariate_matrix, target_vector, variant_records,

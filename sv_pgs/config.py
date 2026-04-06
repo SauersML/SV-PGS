@@ -102,7 +102,7 @@ class ModelConfig:
     """
     trait_type: TraitType = TraitType.BINARY       # binary (case/control) or quantitative
     max_outer_iterations: int = 30                 # EM iterations (usually converges in 10-20)
-    convergence_tolerance: float = 1e-4            # stop when parameters change < this
+    convergence_tolerance: float = 1e-5            # stop when parameters change < this
     minimum_scale: float = 1e-6                    # variants with std < this are treated as monomorphic
     polya_gamma_minimum_weight: float = 1e-4       # floor on IRLS weights to prevent division by ~zero
     sigma_error_floor: float = 1e-3                # noise variance can't go below this
@@ -122,20 +122,20 @@ class ModelConfig:
     maximum_tpb_shape: float = 10.0
 
     max_inner_newton_iterations: int = 20
-    newton_gradient_tolerance: float = 1e-5
+    newton_gradient_tolerance: float = 1e-6
     trust_region_initial_damping: float = 1.0
     trust_region_damping_increase_factor: float = 10.0
     trust_region_damping_decrease_factor: float = 0.1
     trust_region_success_threshold: float = 0.25
     trust_region_minimum_damping: float = 1e-8
 
-    linear_solver_tolerance: float = 1e-5
-    maximum_linear_solver_iterations: int = 512
-    logdet_probe_count: int = 6
-    logdet_lanczos_steps: int = 12
+    linear_solver_tolerance: float = 1e-6
+    maximum_linear_solver_iterations: int = 1024
+    logdet_probe_count: int = 12
+    logdet_lanczos_steps: int = 20
     exact_solver_matrix_limit: int = 2048  # below this: direct solve; above: Woodbury or CG
     posterior_variance_batch_size: int = 1024
-    posterior_variance_probe_count: int = 12
+    posterior_variance_probe_count: int = 24
     minimum_minor_allele_frequency: float = 1e-3
     sample_space_preconditioner_rank: int = 256
     validation_interval: int = 2

@@ -29,7 +29,7 @@ from sv_pgs.progress import log, mem
 @jax.jit
 def _batch_all_stats_i8(batch_i8: jnp.ndarray) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray]:
     """Compute per-variant statistics from int8 genotypes."""
-    mask = batch_i8 != -127
+    mask = batch_i8 != PLINK_MISSING_INT8
     values_f32 = jnp.where(mask, batch_i8.astype(jnp.float32), 0.0)
     sums = jnp.sum(values_f32, axis=0, dtype=jnp.float64)
     counts = jnp.sum(mask, axis=0, dtype=jnp.int32)
@@ -76,6 +76,7 @@ def compute_variant_statistics(
     non_missing_counts = np.zeros(variant_count, dtype=np.int32)
     support_counts = np.zeros(variant_count, dtype=np.int32)
     centered_sum_squares = np.zeros(variant_count, dtype=np.float64)
+    dosage_like = np.ones(variant_count, dtype=bool)
 
     use_i8 = _supports_int8_batches(raw_genotypes)
     if use_i8:
@@ -102,6 +103,14 @@ def compute_variant_statistics(
         non_missing_counts[batch_indices] = np.asarray(batch_counts, dtype=np.int32)
         support_counts[batch_indices] = np.asarray(batch_support, dtype=np.int32)
         centered_sum_squares[batch_indices] = np.asarray(batch_css, dtype=np.float64)
+        if not use_i8:
+            batch_values = np.asarray(batch.values, dtype=np.float32)
+            observed_mask = ~np.isnan(batch_values)
+            bounded = np.all(
+                (~observed_mask) | ((batch_values >= 0.0) & (batch_values <= 2.0)),
+                axis=0,
+            )
+            dosage_like[batch_indices] = bounded
         del batch_jax
 
         batch_seconds = _time.monotonic() - start_time
@@ -119,7 +128,7 @@ def compute_variant_statistics(
         out=np.zeros_like(sums),
         where=non_missing_counts > 0,
     ).astype(np.float32)
-    allele_frequencies = np.clip(means / 2.0, 0.0, 1.0).astype(np.float32)
+    allele_frequencies = _allele_frequencies_from_means(means=means, dosage_like=dosage_like)
     scales = _scales_from_centered_sum_squares(
         centered_sum_squares=centered_sum_squares,
         sample_count=sample_count,
@@ -136,6 +145,19 @@ def compute_variant_statistics(
         allele_frequencies=allele_frequencies,
         support_counts=support_counts.astype(np.int32),
     )
+
+
+def _allele_frequencies_from_means(
+    means: np.ndarray,
+    dosage_like: np.ndarray,
+) -> np.ndarray:
+    mean_array = np.asarray(means, dtype=np.float32)
+    dosage_mask = np.asarray(dosage_like, dtype=bool)
+    return np.where(
+        dosage_mask,
+        np.clip(mean_array / 2.0, 0.0, 1.0),
+        np.float32(0.5),
+    ).astype(np.float32, copy=False)
 
 
 def _scales_from_centered_sum_squares(

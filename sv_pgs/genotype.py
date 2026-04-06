@@ -123,7 +123,7 @@ class DenseRawGenotypeMatrix(RawGenotypeMatrix):
         """Convert a column slice to float32, replacing missing sentinels with NaN."""
         if self.matrix.dtype == np.int8:
             result = batch.astype(np.float32)
-            result[batch == -1] = np.nan
+            result[batch == PLINK_MISSING_INT8] = np.nan
             return result
         return np.asarray(batch, dtype=np.float32)
 
@@ -222,11 +222,11 @@ class PlinkRawGenotypeMatrix(RawGenotypeMatrix):
         """Read one batch as int8, convert to float32 with NaN for missing."""
         raw_i8 = self._read_batch_i8(reader, batch_indices)
         result = np.asarray(raw_i8, dtype=np.float32)
-        result[raw_i8 == -127] = np.nan
+        result[raw_i8 == PLINK_MISSING_INT8] = np.nan
         return result
 
     def _read_batch_i8(self, reader: Any, batch_indices: np.ndarray) -> np.ndarray:
-        """Read one batch as raw int8 (0/1/2/-127). No float conversion."""
+        """Read one batch as raw int8 (0/1/2/PLINK_MISSING_INT8). No float conversion."""
         sample_index = _contiguous_index_or_slice(self.sample_indices)
         col_index = _contiguous_index_or_slice(batch_indices)
         return np.asarray(
@@ -241,7 +241,7 @@ class PlinkRawGenotypeMatrix(RawGenotypeMatrix):
     ) -> Iterator[RawGenotypeBatch]:
         """Iterate as int8 batches (4x less memory, no float conversion).
 
-        Values are 0/1/2/-127(missing). Callers must handle -127 sentinel.
+        Values are 0/1/2/PLINK_MISSING_INT8 (missing). Callers must handle the shared sentinel.
         """
         resolved_indices = _resolve_variant_indices(self.variant_count, variant_indices)
         # int8 reads are 4x smaller than float32, but JAX kernels still expand to
@@ -596,7 +596,7 @@ class StandardizedGenotypeMatrix:
                 del dense_ref
             else:
                 log(f"    streaming {self.shape[1]} variants x {self.shape[0]} samples ({nbytes / 1e9:.1f} GB) directly to GPU  mem={mem()}")
-                gpu_matrix = cupy.empty(self.shape, dtype=cupy.float32, order="C")
+                gpu_matrix = cupy.empty(self.shape, dtype=cupy.float32, order="F")
                 if self.raw is None:
                     raise RuntimeError("GPU materialization requires raw backing storage or a dense cache.")
                 for batch_slice, standardized_batch in _iter_standardized_gpu_batches(
@@ -645,7 +645,7 @@ class StandardizedGenotypeMatrix:
         batch_size = auto_batch_size(self.shape[0])
         selected_variant_count = int(self.variant_indices.shape[0])
         log(
-            f"    caching reduced raw genotypes locally as int8 "
+            "    caching reduced raw genotypes locally as int8 "
             + f"({selected_variant_count} variants x {self.shape[0]} samples)  mem={mem()}"
         )
         cache_directory = tempfile.TemporaryDirectory(prefix="svpgs-genotype-")

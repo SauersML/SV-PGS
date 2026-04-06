@@ -15,7 +15,13 @@ from sklearn.metrics import log_loss, r2_score, roc_auc_score
 
 from sv_pgs.config import ModelConfig, TraitType, VariantClass
 from sv_pgs.data import VariantRecord, VariantStatistics
-from sv_pgs.genotype import ConcatenatedRawGenotypeMatrix, PlinkRawGenotypeMatrix, RawGenotypeMatrix, as_raw_genotype_matrix
+from sv_pgs.genotype import (
+    PLINK_MISSING_INT8,
+    ConcatenatedRawGenotypeMatrix,
+    PlinkRawGenotypeMatrix,
+    RawGenotypeMatrix,
+    as_raw_genotype_matrix,
+)
 from sv_pgs.model import BayesianPGS
 from sv_pgs.preprocessing import compute_variant_statistics
 from sv_pgs.progress import log, mem
@@ -1100,7 +1106,11 @@ def _vcf_contig_info(vcf_path: Path) -> tuple[str, int] | None:
     try:
         seqnames = list(reader.seqnames) if hasattr(reader, "seqnames") else []
         seqlens = list(reader.seqlens) if hasattr(reader, "seqlens") else []
-        contig_lengths = {str(n): int(l) for n, l in zip(seqnames, seqlens) if l and int(l) > 0}
+        contig_lengths = {
+            str(name): int(length)
+            for name, length in zip(seqnames, seqlens)
+            if length and int(length) > 0
+        }
         # Read first record to find which chromosome actually has data
         for record in reader:
             chrom = str(record.CHROM)
@@ -1138,7 +1148,7 @@ def _region_parse_worker(args: tuple) -> tuple[int, str]:
     reader = _open_vcf_reader(Path(vcf_path_str))
     reader.set_threads(1)
 
-    gt_map = np.array([0, 1, -1, 2], dtype=np.int8)
+    gt_map = np.array([0, 1, PLINK_MISSING_INT8, 2], dtype=np.int8)
     stats_pack = struct.Struct("<qqii")
     geno_fh = open(f"{output_prefix}.geno", "wb")
     var_fh = open(f"{output_prefix}.var", "w")
@@ -1382,7 +1392,7 @@ def _load_vcf_incremental(
     cache_dir: Path,
     key: str,
     *,
-    mmap_mode: str,
+    mmap_mode: Literal["r", "r+", "w+", "c"],
 ) -> tuple[np.ndarray, list[_VariantDefaults], VariantStatistics]:
     """Parse VCF with incremental checkpointing. Resumes from last checkpoint if interrupted."""
     import json as _json
@@ -1441,7 +1451,7 @@ def _load_vcf_incremental(
     reader.set_threads(n_threads)
     log(f"  VCF decompression threads: {n_threads}")
 
-    _GT_TO_INT8 = np.array([0, 1, -1, 2], dtype=np.int8)
+    _GT_TO_INT8 = np.array([0, 1, PLINK_MISSING_INT8, 2], dtype=np.int8)
     _gt_to_i8 = _GT_TO_INT8
 
     record_count_hint = _vcf_record_count_hint(reader) if n_cached == 0 else None

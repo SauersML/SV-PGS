@@ -490,6 +490,8 @@ def test_cupy_to_jax_uses_dlpack_when_available(monkeypatch: pytest.MonkeyPatch)
 
 
 def test_try_materialize_gpu_standardizes_batches_directly_on_gpu(monkeypatch: pytest.MonkeyPatch):
+    allocation_orders: list[str | None] = []
+
     class _FakeCudaRuntime:
         @staticmethod
         def memGetInfo():
@@ -516,6 +518,7 @@ def test_try_materialize_gpu_standardizes_batches_directly_on_gpu(monkeypatch: p
 
         @staticmethod
         def empty(shape, dtype=None, order=None):
+            allocation_orders.append(order)
             return np.empty(shape, dtype=dtype, order="C" if order is None else order)
 
         @staticmethod
@@ -538,6 +541,7 @@ def test_try_materialize_gpu_standardizes_batches_directly_on_gpu(monkeypatch: p
     monkeypatch.setattr(genotype_module, "_try_import_cupy", lambda: _FakeCupy())
 
     assert standardized.try_materialize_gpu() is True
+    assert allocation_orders == ["F"]
     np.testing.assert_allclose(np.asarray(cast(Any, standardized._cupy_cache)), expected)
 
 

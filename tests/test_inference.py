@@ -1,8 +1,13 @@
 from __future__ import annotations
 
+import sys
+import types
+from typing import Any, cast
+
 import numpy as np
 import pytest
 import jax.numpy as jnp
+from scipy.linalg import solve_triangular as scipy_solve_triangular
 from scipy.special import kve
 
 from sv_pgs.config import ModelConfig, TraitType, VariantClass
@@ -82,6 +87,90 @@ def test_binary_inference_runs(random_generator):
     assert result.sigma_error2 == 1.0
     assert len(result.class_tpb_shape_a) == 1
     assert len(result.class_tpb_shape_b) == 1
+
+
+def test_variational_em_supports_covariates_only_mode():
+    covariate_matrix = np.array(
+        [
+            [1.0, -1.0],
+            [1.0, 0.0],
+            [1.0, 1.0],
+            [1.0, 2.0],
+        ],
+        dtype=np.float32,
+    )
+    target_vector = np.array([-1.0, 0.0, 1.0, 2.0], dtype=np.float32)
+    validation_covariates = np.array(
+        [
+            [1.0, -0.5],
+            [1.0, 1.5],
+        ],
+        dtype=np.float32,
+    )
+    validation_targets = np.array([-0.5, 1.5], dtype=np.float32)
+
+    result = fit_variational_em(
+        genotypes=np.empty((covariate_matrix.shape[0], 0), dtype=np.float32),
+        covariates=covariate_matrix,
+        targets=target_vector,
+        records=[],
+        config=ModelConfig(trait_type=TraitType.QUANTITATIVE, max_outer_iterations=5),
+        tie_map=TieMap(
+            kept_indices=np.zeros(0, dtype=np.int32),
+            original_to_reduced=np.zeros(0, dtype=np.int32),
+            reduced_to_group=[],
+        ),
+        validation_data=(
+            np.empty((validation_covariates.shape[0], 0), dtype=np.float32),
+            validation_covariates,
+            validation_targets,
+        ),
+    )
+
+    np.testing.assert_allclose(
+        result.alpha,
+        _initialize_alpha_state(covariate_matrix, target_vector, TraitType.QUANTITATIVE).astype(np.float32),
+    )
+    assert result.beta_reduced.shape == (0,)
+    assert result.beta_variance.shape == (0,)
+    assert result.prior_scales.shape == (0,)
+    assert result.member_prior_variances.shape == (0,)
+    assert len(result.objective_history) == 1
+    assert len(result.validation_history) == 1
+
+
+def test_variational_em_supports_binary_covariates_only_mode():
+    covariate_matrix = np.array(
+        [
+            [1.0, -2.0],
+            [1.0, -1.0],
+            [1.0, 0.0],
+            [1.0, 1.0],
+            [1.0, 2.0],
+            [1.0, 3.0],
+        ],
+        dtype=np.float32,
+    )
+    target_vector = np.array([0.0, 0.0, 0.0, 1.0, 1.0, 1.0], dtype=np.float32)
+
+    result = fit_variational_em(
+        genotypes=np.empty((covariate_matrix.shape[0], 0), dtype=np.float32),
+        covariates=covariate_matrix,
+        targets=target_vector,
+        records=[],
+        config=ModelConfig(trait_type=TraitType.BINARY, max_outer_iterations=5),
+        tie_map=TieMap(
+            kept_indices=np.zeros(0, dtype=np.int32),
+            original_to_reduced=np.zeros(0, dtype=np.int32),
+            reduced_to_group=[],
+        ),
+    )
+
+    probabilities = 1.0 / (1.0 + np.exp(-(covariate_matrix @ result.alpha)))
+    assert result.beta_reduced.shape == (0,)
+    assert result.beta_variance.shape == (0,)
+    assert probabilities[0] < probabilities[-1]
+    assert float(np.mean(probabilities[target_vector == 1.0])) > float(np.mean(probabilities[target_vector == 0.0]))
 
 
 def test_initialize_alpha_state_uses_target_prevalence_for_binary():
@@ -377,6 +466,72 @@ def test_sample_space_preconditioner_matches_exact_covariance_inverse_at_full_ra
     actual = np.asarray(apply_preconditioner(right_hand_side), dtype=np.float64)
 
     np.testing.assert_allclose(actual, expected, rtol=1e-7, atol=1e-7)
+
+
+def test_sample_space_preconditioner_gpu_path_matches_exact_covariance_inverse_at_full_rank(monkeypatch: pytest.MonkeyPatch):
+    genotype_matrix = np.array(
+        [
+            [1.0, 0.0],
+            [0.0, 1.0],
+            [1.0, 1.0],
+        ],
+        dtype=np.float32,
+    )
+    standardized = as_raw_genotype_matrix(genotype_matrix).standardized(
+        means=np.zeros(genotype_matrix.shape[1], dtype=np.float32),
+        scales=np.ones(genotype_matrix.shape[1], dtype=np.float32),
+    )
+    standardized._cupy_cache = standardized.materialize().astype(np.float32, copy=False)
+    standardized._dense_cache = None
+    prior_variances = np.array([2.0, 0.5], dtype=np.float64)
+    diagonal_noise = np.array([1.5, 1.0, 2.0], dtype=np.float64)
+    right_hand_side = np.array([0.5, -1.0, 2.0], dtype=np.float64)
+
+    fake_cupy: Any = types.ModuleType("cupy")
+    fake_cupy.float32 = np.float32
+    fake_cupy.asarray = lambda array, dtype=None: np.asarray(array, dtype=dtype)
+    fake_cupy.sum = np.sum
+    fake_cupy.sqrt = np.sqrt
+    fake_cupy.maximum = np.maximum
+    fake_cupy.eye = np.eye
+    fake_cupy.linalg = types.SimpleNamespace(cholesky=np.linalg.cholesky)
+    fake_cupyx: Any = types.ModuleType("cupyx")
+    fake_cupyx_scipy: Any = types.ModuleType("cupyx.scipy")
+    fake_cupyx_scipy_linalg: Any = types.ModuleType("cupyx.scipy.linalg")
+    fake_cupyx_scipy_linalg.solve_triangular = scipy_solve_triangular
+    fake_cupyx_scipy.linalg = fake_cupyx_scipy_linalg
+
+    monkeypatch.setitem(sys.modules, "cupy", fake_cupy)
+    monkeypatch.setitem(sys.modules, "cupyx", fake_cupyx)
+    monkeypatch.setitem(sys.modules, "cupyx.scipy", fake_cupyx_scipy)
+    monkeypatch.setitem(sys.modules, "cupyx.scipy.linalg", fake_cupyx_scipy_linalg)
+    monkeypatch.setattr(mixture_inference, "_to_cupy_float32", lambda array: np.asarray(array, dtype=np.float32))
+    monkeypatch.setattr(
+        mixture_inference,
+        "_cupy_to_jax",
+        lambda array: jnp.asarray(np.asarray(array), dtype=mixture_inference.gpu_compute_jax_dtype()),
+    )
+    monkeypatch.setattr(
+        mixture_inference,
+        "_sample_space_diagonal_preconditioner",
+        lambda **kwargs: np.diag(
+            np.diag(diagonal_noise) + genotype_matrix @ np.diag(prior_variances) @ genotype_matrix.T
+        ).astype(np.float64, copy=False),
+    )
+
+    apply_preconditioner = _sample_space_preconditioner(
+        genotype_matrix=standardized,
+        prior_variances=prior_variances,
+        diagonal_noise=diagonal_noise,
+        batch_size=2,
+        rank=genotype_matrix.shape[1],
+    )
+
+    covariance_matrix = np.diag(diagonal_noise) + genotype_matrix @ np.diag(prior_variances) @ genotype_matrix.T
+    expected = np.linalg.solve(covariance_matrix, right_hand_side)
+    actual = np.asarray(cast(Any, apply_preconditioner)(right_hand_side), dtype=np.float64)
+
+    np.testing.assert_allclose(actual, expected, rtol=1e-4, atol=2e-5)
 
 
 def test_orthogonal_probe_matrix_has_expected_column_norms_and_shape():
@@ -707,6 +862,7 @@ def test_validation_restores_best_iterate(monkeypatch: pytest.MonkeyPatch):
         trait_type,
         config,
         compute_logdet,
+        compute_beta_variance=True,
     ):
         call_counter["count"] += 1
         if call_counter["count"] <= config.max_outer_iterations:
@@ -779,6 +935,7 @@ def test_binary_validation_uses_calibrated_intercept(monkeypatch: pytest.MonkeyP
         trait_type,
         config,
         compute_logdet,
+        compute_beta_variance=True,
     ):
         return PosteriorState(
             alpha=np.zeros(covariate_matrix.shape[1], dtype=np.float64),
