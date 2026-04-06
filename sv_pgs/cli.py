@@ -151,6 +151,10 @@ def main(argv: list[str] | None = None) -> int:
     log(f"genotypes={args.genotypes} sample_table={args.sample_table} output_dir={args.output_dir}")
     log(f"genotype_format={args.genotype_format} sample_id_column={args.sample_id_column} target_column={args.target_column}")
     log(f"covariates={list(args.covariate_column)}  max_outer_iter={args.max_outer_iterations}  seed={args.random_seed}")
+    config = ModelConfig(
+        max_outer_iterations=args.max_outer_iterations,
+        random_seed=args.random_seed,
+    )
     dataset = load_dataset_from_files(
         genotype_path=args.genotypes,
         genotype_format=args.genotype_format,
@@ -159,17 +163,15 @@ def main(argv: list[str] | None = None) -> int:
         target_column=args.target_column,
         covariate_columns=args.covariate_column,
         variant_metadata_path=args.variant_metadata,
+        config=config,
     )
     log(f"dataset loaded: samples={len(dataset.sample_ids)} variants={dataset.genotypes.shape[1]}")
     inferred_trait_type = _infer_trait_type(dataset.targets)
     log(f"inferred trait type: {inferred_trait_type.value}")
+    config.trait_type = inferred_trait_type
     pipeline_outputs = run_training_pipeline(
         dataset=dataset,
-        config=ModelConfig(
-            trait_type=inferred_trait_type,
-            max_outer_iterations=args.max_outer_iterations,
-            random_seed=args.random_seed,
-        ),
+        config=config,
         output_dir=Path(args.output_dir),
     )
 

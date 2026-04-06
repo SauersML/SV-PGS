@@ -332,8 +332,10 @@ def load_dataset_from_files(
     genotype_format: str = "auto",
     sample_id_column: str = "auto",
     variant_metadata_path: str | Path | None = None,
+    config: ModelConfig | None = None,
 ) -> LoadedDataset:
     log(f"=== LOAD DATASET START === mem={mem()}")
+    resolved_config = ModelConfig() if config is None else config
 
     source_path = Path(genotype_path)
     resolved_format = _resolve_genotype_format(source_path, genotype_format)
@@ -477,7 +479,7 @@ def load_dataset_from_files(
         log("computing variant statistics (single pass, JAX)...")
         variant_stats = compute_variant_statistics(
             raw_genotypes,
-            config=ModelConfig(),
+            config=resolved_config,
         )
         log("building PLINK variant defaults from pre-computed allele frequencies...")
         default_variants = _build_plink_variant_defaults_from_stats(source_path, variant_stats)

@@ -958,6 +958,68 @@ def test_load_dataset_from_plink_filters_non_genotyped_sample_rows(tmp_path: Pat
     assert dataset.sample_ids == ["101", "102"]
     np.testing.assert_allclose(dataset.targets, np.array([0.0, 1.0], dtype=np.float32))
     np.testing.assert_allclose(dataset.covariates, np.array([[44.0], [55.0]], dtype=np.float32))
+
+
+def test_load_dataset_from_plink_passes_user_config_to_variant_statistics(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    bed_path = tmp_path / "cohort.bed"
+    genotype_matrix = np.array(
+        [
+            [0.0, 1.0],
+            [2.0, 0.0],
+        ],
+        dtype=np.float32,
+    )
+    to_bed(
+        bed_path,
+        genotype_matrix,
+        properties={
+            "fid": ["f1", "f2"],
+            "iid": ["101", "102"],
+            "sid": ["rs1", "rs2"],
+            "chromosome": ["1", "1"],
+            "bp_position": [100, 200],
+            "allele_1": ["A", "G"],
+            "allele_2": ["C", "T"],
+        },
+    )
+    sample_table_path = tmp_path / "samples.tsv"
+    _write_table(
+        sample_table_path,
+        header=("person_id", "target"),
+        rows=(
+            ("101", "0"),
+            ("102", "1"),
+        ),
+    )
+
+    captured_config: ModelConfig | None = None
+    expected_stats = VariantStatistics(
+        means=np.array([1.0, 0.5], dtype=np.float32),
+        scales=np.array([0.25, 0.75], dtype=np.float32),
+        allele_frequencies=np.array([0.5, 0.25], dtype=np.float32),
+        support_counts=np.array([1, 1], dtype=np.int32),
+    )
+
+    def fake_compute_variant_statistics(raw_genotypes, config):
+        nonlocal captured_config
+        captured_config = config
+        assert raw_genotypes.shape == (2, 2)
+        return expected_stats
+
+    monkeypatch.setattr(io_module, "compute_variant_statistics", fake_compute_variant_statistics)
+
+    config = ModelConfig(minimum_scale=0.123, minimum_minor_allele_frequency=0.2)
+    dataset = load_dataset_from_files(
+        genotype_path=bed_path,
+        genotype_format="plink1",
+        sample_table_path=sample_table_path,
+        target_column="target",
+        covariate_columns=(),
+        config=config,
+    )
+
+    assert captured_config is config
+    assert dataset.variant_stats is expected_stats
     np.testing.assert_allclose(dataset.genotypes, np.array([[0.0, 1.0], [2.0, 0.0]], dtype=np.float32))
 
 

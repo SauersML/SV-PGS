@@ -94,9 +94,10 @@ def _cupy_runtime_status() -> tuple[bool, str]:
 
 
 def t4_fast_math_enabled() -> bool:
-    # T4/Turing GPUs are extremely slow at float64. Keep outer inference
-    # state in float64, but route bulk GPU operator work through float32.
-    return turing_workarounds_enabled()
+    # Keep x64 available for numerically sensitive outer-loop work, but only
+    # enable the mixed-precision T4 path when a real CuPy CUDA runtime exists.
+    cupy_ok, _ = _cupy_runtime_status()
+    return turing_workarounds_enabled() and cupy_ok
 
 
 def jax_dense_linear_algebra_preferred() -> bool:

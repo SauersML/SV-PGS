@@ -4,6 +4,7 @@ import json
 from pathlib import Path
 import subprocess
 import sys
+import textwrap
 
 import pytest
 
@@ -17,13 +18,13 @@ def test_import_sv_pgs_exports_symbols_directly():
                 "import json, sys; "
                 "import sv_pgs; "
                 "print(json.dumps({"
-                "'has___getattr__': hasattr(sv_pgs, '__getattr__'), "
                 "'sv_pgs.all_of_us': 'sv_pgs.all_of_us' in sys.modules, "
                 "'sv_pgs.benchmark': 'sv_pgs.benchmark' in sys.modules, "
                 "'sv_pgs.io': 'sv_pgs.io' in sys.modules, "
                 "'sv_pgs.model': 'sv_pgs.model' in sys.modules, "
                 "'BayesianPGS': hasattr(sv_pgs, 'BayesianPGS'), "
-                "'run_training_pipeline': hasattr(sv_pgs, 'run_training_pipeline')"
+                "'run_training_pipeline': hasattr(sv_pgs, 'run_training_pipeline'), "
+                "'AllOfUsDiseaseRequest': hasattr(sv_pgs, 'AllOfUsDiseaseRequest')"
                 "}))"
             ),
         ],
@@ -34,13 +35,53 @@ def test_import_sv_pgs_exports_symbols_directly():
 
     loaded_modules = json.loads(completed.stdout.strip())
     assert loaded_modules == {
-        "has___getattr__": False,
-        "sv_pgs.all_of_us": True,
+        "sv_pgs.all_of_us": False,
         "sv_pgs.benchmark": True,
         "sv_pgs.io": True,
         "sv_pgs.model": True,
         "BayesianPGS": True,
         "run_training_pipeline": True,
+        "AllOfUsDiseaseRequest": False,
+    }
+
+
+def test_import_sv_pgs_succeeds_without_bigquery():
+    completed = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            textwrap.dedent(
+                """
+                import builtins
+                import json
+
+                real_import = builtins.__import__
+
+                def blocked_import(name, globals=None, locals=None, fromlist=(), level=0):
+                    if name == "google.cloud" and "bigquery" in fromlist:
+                        raise ModuleNotFoundError("No module named 'google.cloud.bigquery'")
+                    return real_import(name, globals, locals, fromlist, level)
+
+                builtins.__import__ = blocked_import
+
+                import sv_pgs
+
+                print(json.dumps({
+                    "BayesianPGS": hasattr(sv_pgs, "BayesianPGS"),
+                    "AllOfUsDiseaseRequest": hasattr(sv_pgs, "AllOfUsDiseaseRequest"),
+                }))
+                """
+            ),
+        ],
+        capture_output=True,
+        check=True,
+        text=True,
+    )
+
+    loaded_symbols = json.loads(completed.stdout.strip())
+    assert loaded_symbols == {
+        "BayesianPGS": True,
+        "AllOfUsDiseaseRequest": False,
     }
 
 

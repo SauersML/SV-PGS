@@ -813,9 +813,11 @@ def test_sample_space_preconditioner_gpu_path_matches_exact_covariance_inverse_a
     fake_cupy.asarray = lambda array, dtype=None: np.asarray(array, dtype=dtype)
     fake_cupy.sum = np.sum
     fake_cupy.sqrt = np.sqrt
+    fake_cupy.abs = np.abs
+    fake_cupy.diag = np.diag
     fake_cupy.maximum = np.maximum
     fake_cupy.eye = np.eye
-    fake_cupy.linalg = types.SimpleNamespace(cholesky=np.linalg.cholesky)
+    fake_cupy.linalg = types.SimpleNamespace(cholesky=np.linalg.cholesky, qr=np.linalg.qr)
     fake_cupyx: Any = types.ModuleType("cupyx")
     fake_cupyx_scipy: Any = types.ModuleType("cupyx.scipy")
     fake_cupyx_scipy_linalg: Any = types.ModuleType("cupyx.scipy.linalg")
@@ -850,7 +852,7 @@ def test_sample_space_preconditioner_gpu_path_matches_exact_covariance_inverse_a
     np.testing.assert_allclose(actual, expected, rtol=1e-4, atol=2e-5)
 
 
-def test_sample_space_preconditioner_uses_gpu_subset_without_full_gpu_cache(monkeypatch: pytest.MonkeyPatch):
+def test_sample_space_preconditioner_uses_operator_sketch_without_subset_materialization(monkeypatch: pytest.MonkeyPatch):
     genotype_matrix = np.array(
         [
             [1.0, 0.0],
@@ -866,17 +868,17 @@ def test_sample_space_preconditioner_uses_gpu_subset_without_full_gpu_cache(monk
     prior_variances = np.array([2.0, 0.5], dtype=np.float64)
     diagonal_noise = np.array([1.5, 1.0, 2.0], dtype=np.float64)
     right_hand_side = np.array([0.5, -1.0, 2.0], dtype=np.float64)
-    gpu_subset_requests: list[list[int]] = []
-
     fake_cupy: Any = types.ModuleType("cupy")
     fake_cupy.float32 = np.float32
     fake_cupy.float64 = np.float64
     fake_cupy.asarray = lambda array, dtype=None: np.asarray(array, dtype=dtype)
     fake_cupy.sum = np.sum
     fake_cupy.sqrt = np.sqrt
+    fake_cupy.abs = np.abs
+    fake_cupy.diag = np.diag
     fake_cupy.maximum = np.maximum
     fake_cupy.eye = np.eye
-    fake_cupy.linalg = types.SimpleNamespace(cholesky=np.linalg.cholesky)
+    fake_cupy.linalg = types.SimpleNamespace(cholesky=np.linalg.cholesky, qr=np.linalg.qr)
     fake_cupyx: Any = types.ModuleType("cupyx")
     fake_cupyx_scipy: Any = types.ModuleType("cupyx.scipy")
     fake_cupyx_scipy_linalg: Any = types.ModuleType("cupyx.scipy.linalg")
@@ -889,15 +891,10 @@ def test_sample_space_preconditioner_uses_gpu_subset_without_full_gpu_cache(monk
     monkeypatch.setitem(sys.modules, "cupyx.scipy.linalg", fake_cupyx_scipy_linalg)
     monkeypatch.setattr(mixture_inference, "_to_cupy_float64", lambda array: np.asarray(array, dtype=np.float64))
 
-    def _fake_try_materialize_gpu_subset(self, indices):
-        resolved_indices = np.asarray(indices, dtype=np.int32)
-        gpu_subset_requests.append(resolved_indices.tolist())
-        return standardized.materialize()[:, resolved_indices].astype(np.float32, copy=False)
-
     monkeypatch.setattr(
         type(standardized),
         "try_materialize_gpu_subset",
-        _fake_try_materialize_gpu_subset,
+        lambda self, indices: (_ for _ in ()).throw(AssertionError("subset materialization should not be used")),
     )
     monkeypatch.setattr(
         mixture_inference,
@@ -919,7 +916,6 @@ def test_sample_space_preconditioner_uses_gpu_subset_without_full_gpu_cache(monk
     expected = np.linalg.solve(covariance_matrix, right_hand_side)
     actual = np.asarray(cast(Any, apply_preconditioner)(right_hand_side), dtype=np.float64)
 
-    assert gpu_subset_requests == [[0, 1]]
     np.testing.assert_allclose(actual, expected, rtol=1e-4, atol=2e-5)
 
 
@@ -954,10 +950,12 @@ def test_gpu_sample_space_block_cg_matches_dense_solution(monkeypatch: pytest.Mo
     fake_cupy.asarray = lambda array, dtype=None: np.asarray(array, dtype=dtype)
     fake_cupy.sum = np.sum
     fake_cupy.sqrt = np.sqrt
+    fake_cupy.abs = np.abs
+    fake_cupy.diag = np.diag
     fake_cupy.maximum = np.maximum
     fake_cupy.eye = np.eye
     fake_cupy.zeros = np.zeros
-    fake_cupy.linalg = types.SimpleNamespace(cholesky=np.linalg.cholesky)
+    fake_cupy.linalg = types.SimpleNamespace(cholesky=np.linalg.cholesky, qr=np.linalg.qr)
     fake_cupyx: Any = types.ModuleType("cupyx")
     fake_cupyx_scipy: Any = types.ModuleType("cupyx.scipy")
     fake_cupyx_scipy_linalg: Any = types.ModuleType("cupyx.scipy.linalg")
@@ -1000,6 +998,90 @@ def test_gpu_sample_space_block_cg_matches_dense_solution(monkeypatch: pytest.Mo
     expected = np.linalg.solve(covariance_matrix, right_hand_side)
 
     np.testing.assert_allclose(actual, expected, rtol=1e-4, atol=2e-5)
+
+
+def test_gpu_sample_space_block_cg_mixed_precision_refinement_matches_dense_solution(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    genotype_matrix = np.array(
+        [
+            [1.0, 0.0, 1.0],
+            [0.0, 1.0, 1.0],
+            [1.0, 1.0, 0.0],
+            [0.0, 1.0, 0.0],
+        ],
+        dtype=np.float32,
+    )
+    standardized = as_raw_genotype_matrix(genotype_matrix).standardized(
+        means=np.zeros(genotype_matrix.shape[1], dtype=np.float32),
+        scales=np.ones(genotype_matrix.shape[1], dtype=np.float32),
+    )
+    standardized._cupy_cache = standardized.materialize().astype(np.float32, copy=False)
+    standardized._dense_cache = None
+    prior_variances = np.array([1.5, 0.75, 0.5], dtype=np.float64)
+    diagonal_noise = np.array([1.0, 1.25, 0.8, 1.1], dtype=np.float64)
+    right_hand_side = np.column_stack(
+        [
+            np.array([0.5, -1.0, 0.2, 1.5], dtype=np.float64),
+            np.array([-0.25, 0.75, 1.0, -0.5], dtype=np.float64),
+        ]
+    )
+
+    fake_cupy: Any = types.ModuleType("cupy")
+    fake_cupy.float32 = np.float32
+    fake_cupy.float64 = np.float64
+    fake_cupy.asarray = lambda array, dtype=None: np.asarray(array, dtype=dtype)
+    fake_cupy.sum = np.sum
+    fake_cupy.sqrt = np.sqrt
+    fake_cupy.abs = np.abs
+    fake_cupy.diag = np.diag
+    fake_cupy.maximum = np.maximum
+    fake_cupy.eye = np.eye
+    fake_cupy.zeros = np.zeros
+    fake_cupy.linalg = types.SimpleNamespace(cholesky=np.linalg.cholesky, qr=np.linalg.qr)
+    fake_cupyx: Any = types.ModuleType("cupyx")
+    fake_cupyx_scipy: Any = types.ModuleType("cupyx.scipy")
+    fake_cupyx_scipy_linalg: Any = types.ModuleType("cupyx.scipy.linalg")
+    fake_cupyx_scipy_linalg.solve_triangular = scipy_solve_triangular
+    fake_cupyx_scipy.linalg = fake_cupyx_scipy_linalg
+
+    monkeypatch.setitem(sys.modules, "cupy", fake_cupy)
+    monkeypatch.setitem(sys.modules, "cupyx", fake_cupyx)
+    monkeypatch.setitem(sys.modules, "cupyx.scipy", fake_cupyx_scipy)
+    monkeypatch.setitem(sys.modules, "cupyx.scipy.linalg", fake_cupyx_scipy_linalg)
+    monkeypatch.setattr(mixture_inference, "_try_import_cupy", lambda: fake_cupy)
+    monkeypatch.setattr(mixture_inference, "_to_cupy_float64", lambda array: np.asarray(array, dtype=np.float64))
+    monkeypatch.setattr(mixture_inference, "_cupy_compute_dtype", lambda cupy_module: cupy_module.float32)
+    monkeypatch.setattr(
+        mixture_inference,
+        "_sample_space_diagonal_preconditioner",
+        lambda **kwargs: np.diag(
+            np.diag(diagonal_noise) + genotype_matrix @ np.diag(prior_variances) @ genotype_matrix.T
+        ).astype(np.float64, copy=False),
+    )
+
+    preconditioner = mixture_inference._sample_space_gpu_preconditioner(
+        genotype_matrix=standardized,
+        prior_variances=prior_variances,
+        diagonal_noise=diagonal_noise,
+        batch_size=2,
+        rank=genotype_matrix.shape[1],
+    )
+    actual = mixture_inference._solve_sample_space_rhs_gpu(
+        genotype_matrix=standardized,
+        prior_variances=prior_variances,
+        diagonal_noise=diagonal_noise,
+        right_hand_side=right_hand_side,
+        tolerance=1e-7,
+        max_iterations=64,
+        preconditioner=preconditioner,
+        batch_size=2,
+    )
+
+    covariance_matrix = np.diag(diagonal_noise) + genotype_matrix @ np.diag(prior_variances) @ genotype_matrix.T
+    expected = np.linalg.solve(covariance_matrix, right_hand_side)
+
+    np.testing.assert_allclose(actual, expected, rtol=2e-4, atol=5e-5)
 
 
 def test_cpu_sample_space_block_cg_matches_dense_solution(monkeypatch: pytest.MonkeyPatch):

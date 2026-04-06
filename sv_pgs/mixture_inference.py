@@ -77,7 +77,6 @@ from sv_pgs.genotype import (
     _try_import_cupy,
     _cupy_to_jax,
     _to_cupy_compute,
-    _to_cupy_float64,
 )
 from sv_pgs.linear_solvers import build_linear_operator, solve_spd_system, stochastic_logdet
 from sv_pgs.numeric import stable_sigmoid
@@ -1452,12 +1451,167 @@ def _sample_space_diagonal_preconditioner(
     return np.maximum(diagonal, 1e-8)
 
 
+def _sample_space_nystrom_rank(rank: int, sample_count: int) -> int:
+    resolved_rank = min(max(int(rank), 0), int(sample_count))
+    if resolved_rank <= 0:
+        return 0
+    oversampling = min(16, max(4, resolved_rank // 8))
+    return min(sample_count, resolved_rank + oversampling)
+
+
+def _sample_space_kernel_matmat_cpu(
+    genotype_matrix: StandardizedGenotypeMatrix,
+    prior_variances: np.ndarray,
+    matrix: np.ndarray,
+    *,
+    batch_size: int,
+) -> np.ndarray:
+    rhs = np.asarray(matrix, dtype=np.float64)
+    vector_input = rhs.ndim == 1
+    if vector_input:
+        rhs = rhs[:, None]
+    elif rhs.ndim != 2:
+        raise ValueError("sample-space kernel expects a vector or matrix right-hand side.")
+    kernel_term = np.zeros((genotype_matrix.shape[0], rhs.shape[1]), dtype=np.float64)
+    prior_variances_f64 = np.asarray(prior_variances, dtype=np.float64)
+    for batch in genotype_matrix.iter_column_batches(batch_size=batch_size):
+        genotype_batch = np.asarray(batch.values, dtype=np.float64)
+        scaled_projection = prior_variances_f64[batch.variant_indices, None] * (genotype_batch.T @ rhs)
+        kernel_term += genotype_batch @ scaled_projection
+    return kernel_term[:, 0] if vector_input else kernel_term
+
+
+def _sample_space_nystrom_basis_cpu(
+    genotype_matrix: StandardizedGenotypeMatrix,
+    prior_variances: np.ndarray,
+    batch_size: int,
+    rank: int,
+    random_seed: int,
+) -> np.ndarray | None:
+    sketch_rank = _sample_space_nystrom_rank(rank, genotype_matrix.shape[0])
+    if sketch_rank <= 0:
+        return None
+    sketch_probes = _orthogonal_probe_matrix(
+        dimension=genotype_matrix.shape[0],
+        probe_count=sketch_rank,
+        random_seed=random_seed,
+    )
+    sketch_response = _sample_space_kernel_matmat_cpu(
+        genotype_matrix=genotype_matrix,
+        prior_variances=prior_variances,
+        matrix=sketch_probes,
+        batch_size=batch_size,
+    )
+    basis_matrix, triangular_matrix = np.linalg.qr(np.asarray(sketch_response, dtype=np.float64), mode="reduced")
+    diagonal = np.abs(np.diag(triangular_matrix))
+    effective_rank = min(int(rank), int(np.sum(diagonal > 1e-10)))
+    if effective_rank <= 0:
+        return None
+    return np.asarray(basis_matrix[:, :effective_rank], dtype=np.float64)
+
+
+def _sample_space_nystrom_factor_cpu(
+    genotype_matrix: StandardizedGenotypeMatrix,
+    prior_variances: np.ndarray,
+    batch_size: int,
+    rank: int,
+    random_seed: int,
+) -> np.ndarray | None:
+    basis_matrix = _sample_space_nystrom_basis_cpu(
+        genotype_matrix=genotype_matrix,
+        prior_variances=prior_variances,
+        batch_size=batch_size,
+        rank=rank,
+        random_seed=random_seed,
+    )
+    if basis_matrix is None:
+        return None
+    projected_kernel = _sample_space_kernel_matmat_cpu(
+        genotype_matrix=genotype_matrix,
+        prior_variances=prior_variances,
+        matrix=basis_matrix,
+        batch_size=batch_size,
+    )
+    gram_matrix = np.asarray(basis_matrix.T @ projected_kernel, dtype=np.float64)
+    gram_matrix = (gram_matrix + gram_matrix.T) * 0.5
+    try:
+        gram_cholesky = np.linalg.cholesky(
+            gram_matrix + np.eye(gram_matrix.shape[0], dtype=np.float64) * 1e-8
+        )
+    except np.linalg.LinAlgError:
+        return None
+    return np.asarray(basis_matrix @ gram_cholesky, dtype=np.float64)
+
+
+def _sample_space_nystrom_factor_gpu(
+    genotype_matrix: StandardizedGenotypeMatrix,
+    prior_variances: np.ndarray,
+    diagonal_noise: np.ndarray,
+    batch_size: int,
+    rank: int,
+    random_seed: int,
+):
+    cupy = _try_import_cupy()
+    if cupy is None:
+        return None
+    compute_cp_dtype = cupy.float64
+    sketch_rank = _sample_space_nystrom_rank(rank, genotype_matrix.shape[0])
+    if sketch_rank <= 0:
+        return None
+    sketch_probes_gpu = cupy.asarray(
+        _orthogonal_probe_matrix(
+            dimension=genotype_matrix.shape[0],
+            probe_count=sketch_rank,
+            random_seed=random_seed,
+        ),
+        dtype=compute_cp_dtype,
+    )
+    zero_diagonal_noise = np.zeros(genotype_matrix.shape[0], dtype=np.float64)
+    sketch_response_gpu = _apply_sample_space_operator_gpu(
+        genotype_matrix=genotype_matrix,
+        prior_variances=prior_variances,
+        diagonal_noise=zero_diagonal_noise,
+        matrix_gpu=sketch_probes_gpu,
+        batch_size=batch_size,
+        cp=cupy,
+        dtype=compute_cp_dtype,
+    )
+    try:
+        basis_gpu, triangular_gpu = cupy.linalg.qr(sketch_response_gpu, mode="reduced")
+    except TypeError:
+        basis_gpu, triangular_gpu = cupy.linalg.qr(sketch_response_gpu)
+    diagonal = np.asarray(cupy.abs(cupy.diag(triangular_gpu)), dtype=np.float64)
+    effective_rank = min(int(rank), int(np.sum(diagonal > 1e-10)))
+    if effective_rank <= 0:
+        return None
+    basis_gpu = cupy.asarray(basis_gpu[:, :effective_rank], dtype=compute_cp_dtype)
+    projected_kernel_gpu = _apply_sample_space_operator_gpu(
+        genotype_matrix=genotype_matrix,
+        prior_variances=prior_variances,
+        diagonal_noise=zero_diagonal_noise,
+        matrix_gpu=basis_gpu,
+        batch_size=batch_size,
+        cp=cupy,
+        dtype=compute_cp_dtype,
+    )
+    gram_gpu = basis_gpu.T @ projected_kernel_gpu
+    gram_gpu = (gram_gpu + gram_gpu.T) * compute_cp_dtype(0.5)
+    try:
+        gram_cholesky_gpu = cupy.linalg.cholesky(
+            gram_gpu + cupy.eye(effective_rank, dtype=compute_cp_dtype) * compute_cp_dtype(1e-8)
+        )
+    except Exception:
+        return None
+    return basis_gpu @ gram_cholesky_gpu
+
+
 def _sample_space_preconditioner(
     genotype_matrix: StandardizedGenotypeMatrix,
     prior_variances: np.ndarray,
     diagonal_noise: np.ndarray,
     batch_size: int,
     rank: int,
+    random_seed: int = 0,
 ) -> Callable[[jnp.ndarray], jnp.ndarray] | np.ndarray | jnp.ndarray:
     diagonal_preconditioner = _sample_space_diagonal_preconditioner(
         genotype_matrix=genotype_matrix,
@@ -1467,42 +1621,42 @@ def _sample_space_preconditioner(
     )
     if rank <= 0:
         return diagonal_preconditioner
-    selected_rank = min(int(rank), int(genotype_matrix.shape[1]))
+    selected_rank = min(int(rank), int(genotype_matrix.shape[0]))
     if selected_rank <= 0:
         return diagonal_preconditioner
-    selected_variant_indices = np.argpartition(
-        -np.asarray(prior_variances, dtype=np.float64),
-        kth=selected_rank - 1,
-    )[:selected_rank].astype(np.int32, copy=False)
-    selected_variant_indices.sort()
-    selected_gpu_genotypes = genotype_matrix.try_materialize_gpu_subset(selected_variant_indices)
-    if selected_gpu_genotypes is not None:
+    low_rank_factor_gpu = _sample_space_nystrom_factor_gpu(
+        genotype_matrix=genotype_matrix,
+        prior_variances=prior_variances,
+        diagonal_noise=diagonal_noise,
+        batch_size=batch_size,
+        rank=selected_rank,
+        random_seed=random_seed,
+    )
+    if low_rank_factor_gpu is not None:
         import cupy as cp
         from cupyx.scipy.linalg import solve_triangular as cp_solve_triangular
 
-        gpu_cache_source = "full" if genotype_matrix._cupy_cache is not None else "subset"
-        log(f"      sample-space preconditioner: GPU Woodbury rank={selected_rank} source={gpu_cache_source}")
-        weighted_selected_genotypes = selected_gpu_genotypes.astype(cp.float64, copy=False)
-        weighted_selected_genotypes = weighted_selected_genotypes * cp.asarray(
-            np.sqrt(np.asarray(prior_variances[selected_variant_indices], dtype=np.float64)),
-            dtype=cp.float64,
-        )[None, :]
+        gpu_cache_source = "full" if genotype_matrix._cupy_cache is not None else "streaming"
+        effective_rank = int(low_rank_factor_gpu.shape[1])
+        log(f"      sample-space preconditioner: GPU Nyström-Woodbury rank={effective_rank} source={gpu_cache_source}")
+        compute_cp_dtype = _cupy_compute_dtype(cp)
+        weighted_selected_genotypes = low_rank_factor_gpu.astype(compute_cp_dtype, copy=False)
         base_diagonal = cp.maximum(
-            cp.asarray(diagonal_preconditioner, dtype=cp.float64)
+            cp.asarray(diagonal_preconditioner, dtype=compute_cp_dtype)
             - cp.sum(weighted_selected_genotypes * weighted_selected_genotypes, axis=1),
-            cp.float64(1e-8),
+            compute_cp_dtype(1e-8),
         )
-        inverse_base_diagonal = 1.0 / base_diagonal
+        inverse_base_diagonal = compute_cp_dtype(1.0) / base_diagonal
         weighted_inverse_selected = inverse_base_diagonal[:, None] * weighted_selected_genotypes
-        low_rank_precision = cp.eye(selected_rank, dtype=cp.float64) + (
+        low_rank_precision = cp.eye(effective_rank, dtype=compute_cp_dtype) + (
             weighted_selected_genotypes.T @ weighted_inverse_selected
         )
         low_rank_cholesky = cp.linalg.cholesky(
-            low_rank_precision + cp.eye(selected_rank, dtype=cp.float64) * cp.float64(1e-8)
+            low_rank_precision + cp.eye(effective_rank, dtype=compute_cp_dtype) * compute_cp_dtype(1e-8)
         )
 
         def apply_preconditioner_gpu(right_hand_side: jnp.ndarray) -> jnp.ndarray:
-            right_hand_side_gpu = _to_cupy_float64(right_hand_side)
+            right_hand_side_gpu = _to_cupy_compute(right_hand_side)
             if right_hand_side_gpu.ndim not in (1, 2):
                 raise ValueError("sample-space preconditioner expects a vector or matrix right-hand side.")
             weighted_rhs = (
@@ -1519,20 +1673,24 @@ def _sample_space_preconditioner(
             return _cupy_to_jax(weighted_rhs - correction)
 
         return apply_preconditioner_gpu
-    selected_genotypes = np.asarray(
-        genotype_matrix.subset(selected_variant_indices).materialize(batch_size=batch_size),
-        dtype=np.float64,
+    low_rank_factor = _sample_space_nystrom_factor_cpu(
+        genotype_matrix=genotype_matrix,
+        prior_variances=prior_variances,
+        batch_size=batch_size,
+        rank=selected_rank,
+        random_seed=random_seed,
     )
-    weighted_selected_genotypes = (
-        selected_genotypes
-        * np.sqrt(np.asarray(prior_variances[selected_variant_indices], dtype=np.float64))[None, :]
-    )
+    if low_rank_factor is None:
+        return diagonal_preconditioner
+    effective_rank = int(low_rank_factor.shape[1])
+    log(f"      sample-space preconditioner: CPU Nyström-Woodbury rank={effective_rank}")
+    weighted_selected_genotypes = np.asarray(low_rank_factor, dtype=np.float64)
     selected_diagonal = np.sum(weighted_selected_genotypes * weighted_selected_genotypes, axis=1)
     base_diagonal = np.maximum(diagonal_preconditioner - selected_diagonal, 1e-8)
     inverse_base_diagonal = 1.0 / base_diagonal
     weighted_inverse_selected = inverse_base_diagonal[:, None] * weighted_selected_genotypes
-    low_rank_precision = np.eye(selected_rank, dtype=np.float64) + weighted_selected_genotypes.T @ weighted_inverse_selected
-    low_rank_cholesky = np.linalg.cholesky(low_rank_precision + np.eye(selected_rank, dtype=np.float64) * 1e-8)
+    low_rank_precision = np.eye(effective_rank, dtype=np.float64) + weighted_selected_genotypes.T @ weighted_inverse_selected
+    low_rank_cholesky = np.linalg.cholesky(low_rank_precision + np.eye(effective_rank, dtype=np.float64) * 1e-8)
 
     def apply_preconditioner_cpu(right_hand_side: jnp.ndarray) -> jnp.ndarray:
         right_hand_side_array = np.asarray(right_hand_side, dtype=np.float64)
@@ -1557,6 +1715,7 @@ def _sample_space_gpu_preconditioner(
     diagonal_noise: np.ndarray,
     batch_size: int,
     rank: int,
+    random_seed: int = 0,
 ):
     import cupy as cp
     from cupyx.scipy.linalg import solve_triangular as cp_solve_triangular
@@ -1571,48 +1730,62 @@ def _sample_space_gpu_preconditioner(
     compute_cp_dtype = _cupy_compute_dtype(cp)
 
     def apply_diagonal(right_hand_side_gpu):
-        right_hand_side_gpu = cp.asarray(right_hand_side_gpu, dtype=compute_cp_dtype)
+        right_hand_side_gpu = cp.asarray(right_hand_side_gpu)
+        target_dtype = cp.float64 if right_hand_side_gpu.dtype == cp.float64 else compute_cp_dtype
+        right_hand_side_gpu = right_hand_side_gpu.astype(target_dtype, copy=False)
         if right_hand_side_gpu.ndim == 2:
-            return right_hand_side_gpu / diagonal_preconditioner_gpu[:, None].astype(compute_cp_dtype, copy=False)
-        return right_hand_side_gpu / diagonal_preconditioner_gpu.astype(compute_cp_dtype, copy=False)
+            return right_hand_side_gpu / diagonal_preconditioner_gpu[:, None].astype(target_dtype, copy=False)
+        return right_hand_side_gpu / diagonal_preconditioner_gpu.astype(target_dtype, copy=False)
 
     if rank <= 0:
         return apply_diagonal
-    selected_rank = min(int(rank), int(genotype_matrix.shape[1]))
+    selected_rank = min(int(rank), int(genotype_matrix.shape[0]))
     if selected_rank <= 0:
         return apply_diagonal
-    selected_variant_indices = np.argpartition(
-        -np.asarray(prior_variances, dtype=np.float64),
-        kth=selected_rank - 1,
-    )[:selected_rank].astype(np.int32, copy=False)
-    selected_variant_indices.sort()
-    selected_gpu_genotypes = genotype_matrix.try_materialize_gpu_subset(selected_variant_indices)
-    if selected_gpu_genotypes is None:
+    low_rank_factor_gpu = _sample_space_nystrom_factor_gpu(
+        genotype_matrix=genotype_matrix,
+        prior_variances=prior_variances,
+        diagonal_noise=diagonal_noise,
+        batch_size=batch_size,
+        rank=selected_rank,
+        random_seed=random_seed,
+    )
+    if low_rank_factor_gpu is None:
         return apply_diagonal
 
-    gpu_cache_source = "full" if genotype_matrix._cupy_cache is not None else "subset"
-    log(f"      sample-space preconditioner: GPU Woodbury rank={selected_rank} source={gpu_cache_source}")
-    weighted_selected_genotypes = selected_gpu_genotypes.astype(compute_cp_dtype, copy=False) * cp.asarray(
-        np.sqrt(np.asarray(prior_variances[selected_variant_indices], dtype=np.float64)),
-        dtype=compute_cp_dtype,
-    )[None, :]
-    base_diagonal = cp.maximum(
-        diagonal_preconditioner_gpu.astype(compute_cp_dtype, copy=False) - cp.sum(weighted_selected_genotypes * weighted_selected_genotypes, axis=1),
-        compute_cp_dtype(1e-8),
-    )
-    inverse_base_diagonal = compute_cp_dtype(1.0) / base_diagonal
-    weighted_inverse_selected = inverse_base_diagonal[:, None] * weighted_selected_genotypes
-    low_rank_precision = cp.eye(selected_rank, dtype=compute_cp_dtype) + (
-        weighted_selected_genotypes.T @ weighted_inverse_selected
-    )
-    low_rank_cholesky = cp.linalg.cholesky(
-        low_rank_precision + cp.eye(selected_rank, dtype=compute_cp_dtype) * compute_cp_dtype(1e-8)
-    )
+    gpu_cache_source = "full" if genotype_matrix._cupy_cache is not None else "streaming"
+    effective_rank = int(low_rank_factor_gpu.shape[1])
+    log(f"      sample-space preconditioner: GPU Nyström-Woodbury rank={effective_rank} source={gpu_cache_source}")
+    def build_low_rank_bundle(target_dtype):
+        weighted_selected_genotypes = low_rank_factor_gpu.astype(target_dtype, copy=False)
+        base_diagonal = cp.maximum(
+            diagonal_preconditioner_gpu.astype(target_dtype, copy=False)
+            - cp.sum(weighted_selected_genotypes * weighted_selected_genotypes, axis=1),
+            target_dtype(1e-8),
+        )
+        inverse_base_diagonal = target_dtype(1.0) / base_diagonal
+        weighted_inverse_selected = inverse_base_diagonal[:, None] * weighted_selected_genotypes
+        low_rank_precision = cp.eye(effective_rank, dtype=target_dtype) + (
+            weighted_selected_genotypes.T @ weighted_inverse_selected
+        )
+        low_rank_cholesky = cp.linalg.cholesky(
+            low_rank_precision + cp.eye(effective_rank, dtype=target_dtype) * target_dtype(1e-8)
+        )
+        return weighted_selected_genotypes, inverse_base_diagonal, weighted_inverse_selected, low_rank_cholesky
+
+    low_rank_bundles = {
+        compute_cp_dtype: build_low_rank_bundle(compute_cp_dtype),
+    }
 
     def apply_low_rank(right_hand_side_gpu):
         if right_hand_side_gpu.ndim not in (1, 2):
             raise ValueError("sample-space preconditioner expects a vector or matrix right-hand side.")
-        right_hand_side_gpu = cp.asarray(right_hand_side_gpu, dtype=compute_cp_dtype)
+        right_hand_side_gpu = cp.asarray(right_hand_side_gpu)
+        target_dtype = cp.float64 if right_hand_side_gpu.dtype == cp.float64 else compute_cp_dtype
+        right_hand_side_gpu = right_hand_side_gpu.astype(target_dtype, copy=False)
+        if target_dtype not in low_rank_bundles:
+            low_rank_bundles[target_dtype] = build_low_rank_bundle(target_dtype)
+        weighted_selected_genotypes, inverse_base_diagonal, weighted_inverse_selected, low_rank_cholesky = low_rank_bundles[target_dtype]
         weighted_rhs = (
             inverse_base_diagonal[:, None] * right_hand_side_gpu
             if right_hand_side_gpu.ndim == 2
@@ -1807,9 +1980,8 @@ def _solve_sample_space_rhs_gpu(
     cupy = _try_import_cupy()
     if cupy is None:
         raise RuntimeError("GPU sample-space solve requires CuPy.")
-    X_gpu = genotype_matrix._cupy_cache
-    streaming_gpu_enabled = X_gpu is None and genotype_matrix.raw is not None and not genotype_matrix.supports_jax_dense_ops()
-    if X_gpu is None and not streaming_gpu_enabled:
+    streaming_gpu_enabled = genotype_matrix._cupy_cache is None and genotype_matrix.raw is not None and not genotype_matrix.supports_jax_dense_ops()
+    if genotype_matrix._cupy_cache is None and not streaming_gpu_enabled:
         raise RuntimeError("GPU sample-space solve requires a CuPy-resident matrix or GPU-streamable raw storage.")
     compute_cp_dtype = _cupy_compute_dtype(cp)
     right_hand_side_gpu64 = cp.asarray(right_hand_side, dtype=cp.float64)
@@ -1821,11 +1993,46 @@ def _solve_sample_space_rhs_gpu(
 
     rhs_norm_sq = np.asarray(cp.sum(right_hand_side_gpu64 * right_hand_side_gpu64, axis=0, dtype=cp.float64), dtype=np.float64)
     convergence_threshold_sq = np.maximum(float(tolerance) * float(tolerance), float(tolerance) * float(tolerance) * rhs_norm_sq)
-    solution_gpu64 = cp.zeros_like(right_hand_side_gpu64, dtype=cp.float64)
     mixed_precision_enabled = compute_cp_dtype == cp.float32
-    inner_tolerance = max(float(tolerance), 1e-4) if mixed_precision_enabled else float(tolerance)
-    max_refinement_steps = 3 if mixed_precision_enabled else 1
+    if not mixed_precision_enabled:
+        solution_gpu64 = _solve_sample_space_rhs_gpu_inner(
+            genotype_matrix=genotype_matrix,
+            prior_variances=prior_variances,
+            diagonal_noise=diagonal_noise,
+            right_hand_side_gpu=right_hand_side_gpu64,
+            tolerance=float(tolerance),
+            max_iterations=max_iterations,
+            preconditioner=preconditioner,
+            batch_size=batch_size,
+            cp=cp,
+            compute_cp_dtype=cp.float64,
+        )
+        if solution_gpu64.ndim == 1:
+            solution_gpu64 = solution_gpu64[:, None]
+        residual_gpu64 = right_hand_side_gpu64 - _apply_sample_space_operator_gpu(
+            genotype_matrix=genotype_matrix,
+            prior_variances=prior_variances,
+            diagonal_noise=diagonal_noise,
+            matrix_gpu=solution_gpu64,
+            batch_size=batch_size,
+            cp=cp,
+            dtype=cp.float64,
+        )
+        residual_norm_sq = np.asarray(cp.sum(residual_gpu64 * residual_gpu64, axis=0, dtype=cp.float64), dtype=np.float64)
+        final_residual = float(np.max(residual_norm_sq))
+        final_threshold = float(np.max(convergence_threshold_sq))
+        if final_residual > final_threshold:
+            raise RuntimeError(
+                "GPU conjugate-gradient solve failed to converge: "
+                + f"residual={final_residual:.2e} threshold={final_threshold:.2e} "
+                + f"iterations={max_iterations}"
+            )
+        solution = np.asarray(solution_gpu64.get() if hasattr(solution_gpu64, "get") else solution_gpu64, dtype=np.float64)
+        return solution[:, 0] if vector_input else solution
 
+    solution_gpu64 = cp.zeros(right_hand_side_gpu64.shape, dtype=cp.float64)
+    inner_tolerance = max(float(tolerance), 1e-4)
+    max_refinement_steps = 4
     for refinement_index in range(max_refinement_steps):
         residual_gpu64 = right_hand_side_gpu64 - _apply_sample_space_operator_gpu(
             genotype_matrix=genotype_matrix,
@@ -1855,15 +2062,24 @@ def _solve_sample_space_rhs_gpu(
         if correction_gpu64.ndim == 1:
             correction_gpu64 = correction_gpu64[:, None]
         solution_gpu64 += correction_gpu64
-        if refinement_index + 1 == max_refinement_steps:
-            final_residual = float(np.max(residual_norm_sq))
-            final_threshold = float(np.max(convergence_threshold_sq))
-            if final_residual > final_threshold:
-                raise RuntimeError(
-                    "GPU conjugate-gradient solve failed to converge after iterative refinement: "
-                    + f"residual={final_residual:.2e} threshold={final_threshold:.2e} "
-                    + f"iterations={max_iterations} refinement_steps={max_refinement_steps}"
-                )
+    residual_gpu64 = right_hand_side_gpu64 - _apply_sample_space_operator_gpu(
+        genotype_matrix=genotype_matrix,
+        prior_variances=prior_variances,
+        diagonal_noise=diagonal_noise,
+        matrix_gpu=solution_gpu64,
+        batch_size=batch_size,
+        cp=cp,
+        dtype=cp.float64,
+    )
+    residual_norm_sq = np.asarray(cp.sum(residual_gpu64 * residual_gpu64, axis=0, dtype=cp.float64), dtype=np.float64)
+    final_residual = float(np.max(residual_norm_sq))
+    final_threshold = float(np.max(convergence_threshold_sq))
+    if final_residual > final_threshold:
+        raise RuntimeError(
+            "GPU conjugate-gradient solve failed to converge after iterative refinement: "
+            + f"residual={final_residual:.2e} threshold={final_threshold:.2e} "
+            + f"iterations={max_iterations} refinement_steps={max_refinement_steps}"
+        )
     solution = np.asarray(solution_gpu64.get() if hasattr(solution_gpu64, "get") else solution_gpu64, dtype=np.float64)
     return solution[:, 0] if vector_input else solution
 
@@ -2613,6 +2829,7 @@ def _restricted_posterior_state(
             diagonal_noise=diagonal_noise,
             batch_size=posterior_variance_batch_size,
             rank=effective_sample_space_preconditioner_rank,
+            random_seed=random_seed,
         )
 
         def solve_rhs_iterative(right_hand_side: np.ndarray) -> np.ndarray:
@@ -2637,6 +2854,7 @@ def _restricted_posterior_state(
             diagonal_noise=diagonal_noise,
             batch_size=posterior_variance_batch_size,
             rank=effective_sample_space_preconditioner_rank,
+            random_seed=random_seed,
         )
 
         def solve_rhs_iterative(right_hand_side: np.ndarray) -> np.ndarray:
@@ -2651,11 +2869,29 @@ def _restricted_posterior_state(
                 batch_size=posterior_variance_batch_size,
             )
 
-    inverse_covariance_rhs = solve_rhs_iterative(
-        np.concatenate([targets[:, None], covariate_matrix], axis=1),
+    sample_probes = (
+        _orthogonal_probe_matrix(
+            dimension=sample_count,
+            probe_count=posterior_variance_probe_count,
+            random_seed=random_seed,
+        )
+        if compute_beta_variance
+        else None
     )
+    solve_rhs_blocks = [targets[:, None], covariate_matrix]
+    if sample_probes is not None:
+        solve_rhs_blocks.append(sample_probes)
+    inverse_covariance_rhs = solve_rhs_iterative(np.concatenate(solve_rhs_blocks, axis=1))
     inverse_covariance_targets = np.asarray(inverse_covariance_rhs[:, 0], dtype=np.float64)
-    inverse_covariance_covariates = np.asarray(inverse_covariance_rhs[:, 1:], dtype=np.float64)
+    inverse_covariance_covariates = np.asarray(
+        inverse_covariance_rhs[:, 1 : 1 + covariate_matrix.shape[1]],
+        dtype=np.float64,
+    )
+    inverse_covariance_probe_matrix = (
+        np.asarray(inverse_covariance_rhs[:, 1 + covariate_matrix.shape[1] :], dtype=np.float64)
+        if sample_probes is not None
+        else None
+    )
     logdet_covariance = (
         stochastic_logdet(
             _sample_space_operator(
@@ -2697,6 +2933,8 @@ def _restricted_posterior_state(
             batch_size=posterior_variance_batch_size,
             probe_count=posterior_variance_probe_count,
             random_seed=random_seed,
+            sample_probes=sample_probes,
+            inverse_covariance_probe_matrix=inverse_covariance_probe_matrix,
         )
         beta_variance = np.maximum(prior_variances - (prior_variances * prior_variances) * leverage_diagonal, 1e-8)
     else:
@@ -2765,14 +3003,25 @@ def _stochastic_restricted_cross_leverage_diagonal(
     batch_size: int,
     probe_count: int,
     random_seed: int,
+    sample_probes: np.ndarray | None = None,
+    inverse_covariance_probe_matrix: np.ndarray | None = None,
 ) -> np.ndarray:
-    random_generator = np.random.default_rng(random_seed)
-    sample_count = genotype_matrix.shape[0]
-    sample_probes = random_generator.choice(
-        (-1.0, 1.0),
-        size=(sample_count, probe_count),
-    ).astype(np.float64)
-    inverse_covariance_probe_matrix = np.asarray(solve_rhs(sample_probes), dtype=np.float64)
+    if sample_probes is None:
+        sample_probes = _orthogonal_probe_matrix(
+            dimension=genotype_matrix.shape[0],
+            probe_count=probe_count,
+            random_seed=random_seed,
+        )
+    else:
+        sample_probes = np.asarray(sample_probes, dtype=np.float64)
+        if sample_probes.shape != (genotype_matrix.shape[0], probe_count):
+            raise ValueError("sample_probes shape does not match sample_count/probe_count.")
+    if inverse_covariance_probe_matrix is None:
+        inverse_covariance_probe_matrix = np.asarray(solve_rhs(sample_probes), dtype=np.float64)
+    else:
+        inverse_covariance_probe_matrix = np.asarray(inverse_covariance_probe_matrix, dtype=np.float64)
+        if inverse_covariance_probe_matrix.shape != sample_probes.shape:
+            raise ValueError("inverse_covariance_probe_matrix shape does not match sample_probes.")
     restricted_probe_matrix = inverse_covariance_probe_matrix - inverse_covariance_covariates @ _cholesky_solve(
         gls_cholesky,
         covariate_matrix.T @ inverse_covariance_probe_matrix,
