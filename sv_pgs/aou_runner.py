@@ -16,6 +16,8 @@ from sv_pgs.config import ModelConfig, TraitType
 from sv_pgs.io import load_multi_vcf_dataset_from_files, run_training_pipeline
 from sv_pgs.progress import log
 
+_LOCAL_CACHE_DIRNAME = ".sv_pgs_cache"
+_AOU_SV_VCF_CACHE_SUBDIR = "aou_sv_vcfs"
 
 # ---------------------------------------------------------------------------
 # AoU paths
@@ -49,6 +51,14 @@ def local_ancestry_predictions_path(work_dir: Path) -> Path:
 
 def sv_vcf_name(chromosome: int) -> str:
     return f"AoU_srWGS_SV.v8.chr{chromosome}.vcf.gz"
+
+
+def local_sv_vcf_cache_dir(work_dir: Path) -> Path:
+    return work_dir.parent / _LOCAL_CACHE_DIRNAME / _AOU_SV_VCF_CACHE_SUBDIR
+
+
+def local_sv_vcf_path(chromosome: int, work_dir: Path) -> Path:
+    return local_sv_vcf_cache_dir(work_dir) / sv_vcf_name(chromosome)
 
 
 # ---------------------------------------------------------------------------
@@ -90,12 +100,27 @@ def _gsutil_size(path: str) -> int:
     return int(result.stdout.strip().split()[0])
 
 
+def _download_gcs_object_if_missing(remote_path: str, local_path: Path) -> None:
+    if local_path.exists():
+        return
+    local_path.parent.mkdir(parents=True, exist_ok=True)
+    partial_path = local_path.with_name(local_path.name + ".partial")
+    partial_path.unlink(missing_ok=True)
+    try:
+        _gsutil_cp(remote_path, str(partial_path))
+        partial_path.replace(local_path)
+    except Exception:
+        partial_path.unlink(missing_ok=True)
+        raise
+
+
 def download_sv_vcf(chromosome: int, work_dir: Path) -> Path:
     """Download one SV VCF + index when needed and return the local VCF path."""
     remote_dir = sv_vcf_dir()
     name = sv_vcf_name(chromosome)
-    local_vcf = work_dir / name
+    local_vcf = local_sv_vcf_path(chromosome, work_dir)
     local_tbi = work_dir / f"{name}.tbi"
+    local_tbi = local_vcf.parent / f"{name}.tbi"
     vcf_remote = f"{remote_dir}/{name}"
     tbi_remote = f"{remote_dir}/{name}.tbi"
 
@@ -106,15 +131,20 @@ def download_sv_vcf(chromosome: int, work_dir: Path) -> Path:
         missing_downloads.append((tbi_remote, local_tbi, "index"))
 
     if not missing_downloads:
-        log(f"  chr{chromosome}: VCF already present")
+        log(f"  chr{chromosome}: VCF already present in local cache")
         return local_vcf
 
     required_bytes = sum(_gsutil_size(remote) for remote, _, _ in missing_downloads)
-    _check_disk_space(work_dir, required_bytes)
+    cache_dir = local_sv_vcf_cache_dir(work_dir)
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    _check_disk_space(cache_dir, required_bytes)
     missing_labels = " + ".join(label for _, _, label in missing_downloads)
-    log(f"  chr{chromosome}: downloading missing {missing_labels} ({required_bytes/1e9:.1f} GB)")
+    log(
+        f"  chr{chromosome}: downloading missing {missing_labels} into cache "
+        + f"{cache_dir} ({required_bytes/1e9:.1f} GB)"
+    )
     for remote, local_path, _ in missing_downloads:
-        _gsutil_cp(remote, str(local_path))
+        _download_gcs_object_if_missing(remote, local_path)
     return local_vcf
 
 
@@ -132,12 +162,6 @@ def download_ancestry_preds(work_dir: Path) -> Path:
     log(f"  downloading ancestry predictions: {remote}")
     _gsutil_cp(remote, str(local))
     return local
-
-
-def cleanup_local_sv_vcf(vcf_path: Path) -> None:
-    Path(vcf_path).unlink(missing_ok=True)
-    Path(f"{vcf_path}.tbi").unlink(missing_ok=True)
-
 
 def release_process_memory() -> None:
     gc.collect()
@@ -377,7 +401,7 @@ def run_all_of_us(
     # Compute keep_indices from VCF header + merged sample table (if both exist)
     # so we can check the EXACT cache key, not just glob for any .npy
     keep_indices_for_status: np.ndarray | None = None
-    first_vcf = work_dir / sv_vcf_name(chromosomes[0])
+    first_vcf = local_sv_vcf_path(chromosomes[0], work_dir)
     if merged_path.exists() and first_vcf.exists():
         try:
             all_sample_ids = _read_vcf_sample_ids(first_vcf)
@@ -409,7 +433,7 @@ def run_all_of_us(
     cached_chrs = []
     uncached_chrs = []
     for chrom in chromosomes:
-        vcf_path = work_dir / sv_vcf_name(chrom)
+        vcf_path = local_sv_vcf_path(chrom, work_dir)
         if not vcf_path.exists():
             uncached_chrs.append(f"chr{chrom}(no VCF)")
             continue

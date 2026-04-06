@@ -126,7 +126,7 @@ def test_runtime_tuned_config_for_t4_caps_solver_from_gpu_budget(monkeypatch):
     tuned_config, summary = _runtime_tuned_config_for_fit(config, raw_genotypes)
 
     assert tuned_config.exact_solver_matrix_limit == 1_024
-    assert tuned_config.sample_space_preconditioner_rank == 128
+    assert tuned_config.sample_space_preconditioner_rank == 256
     assert summary is not None
 
 

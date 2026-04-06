@@ -443,19 +443,23 @@ def test_download_sv_vcf_downloads_one_chromosome_at_a_time(monkeypatch, tmp_pat
 
     monkeypatch.setattr(aou_runner, "_gsutil_cp", fake_cp)
 
-    local_vcf = aou_runner.download_sv_vcf(22, tmp_path)
+    work_dir = tmp_path / "run"
+    cache_dir = aou_runner.local_sv_vcf_cache_dir(work_dir)
+    local_vcf = aou_runner.download_sv_vcf(22, work_dir)
 
-    assert local_vcf == tmp_path / "AoU_srWGS_SV.v8.chr22.vcf.gz"
+    assert local_vcf == cache_dir / "AoU_srWGS_SV.v8.chr22.vcf.gz"
     assert copied == [
         (
             "gs://bucket/cdr/wgs/short_read/structural_variants/vcf/full/AoU_srWGS_SV.v8.chr22.vcf.gz",
-            str(tmp_path / "AoU_srWGS_SV.v8.chr22.vcf.gz"),
+            str(cache_dir / "AoU_srWGS_SV.v8.chr22.vcf.gz.partial"),
         ),
         (
             "gs://bucket/cdr/wgs/short_read/structural_variants/vcf/full/AoU_srWGS_SV.v8.chr22.vcf.gz.tbi",
-            str(tmp_path / "AoU_srWGS_SV.v8.chr22.vcf.gz.tbi"),
+            str(cache_dir / "AoU_srWGS_SV.v8.chr22.vcf.gz.tbi.partial"),
         ),
     ]
+    assert local_vcf.exists()
+    assert Path(f"{local_vcf}.tbi").exists()
 
 
 def test_download_sv_vcf_downloads_missing_index_for_existing_vcf(monkeypatch, tmp_path: Path):
@@ -463,7 +467,10 @@ def test_download_sv_vcf_downloads_missing_index_for_existing_vcf(monkeypatch, t
     monkeypatch.setenv("GOOGLE_PROJECT", "billing-project")
     monkeypatch.setattr(aou_runner, "_check_disk_space", lambda path, required_bytes: None)
 
-    local_vcf = tmp_path / "AoU_srWGS_SV.v8.chr22.vcf.gz"
+    work_dir = tmp_path / "run"
+    cache_dir = aou_runner.local_sv_vcf_cache_dir(work_dir)
+    local_vcf = cache_dir / "AoU_srWGS_SV.v8.chr22.vcf.gz"
+    cache_dir.mkdir(parents=True, exist_ok=True)
     local_vcf.write_text("data\n", encoding="utf-8")
 
     sized: list[str] = []
@@ -480,7 +487,7 @@ def test_download_sv_vcf_downloads_missing_index_for_existing_vcf(monkeypatch, t
     monkeypatch.setattr(aou_runner, "_gsutil_size", fake_size)
     monkeypatch.setattr(aou_runner, "_gsutil_cp", fake_cp)
 
-    local_path = aou_runner.download_sv_vcf(22, tmp_path)
+    local_path = aou_runner.download_sv_vcf(22, work_dir)
 
     assert local_path == local_vcf
     assert sized == [
@@ -489,22 +496,9 @@ def test_download_sv_vcf_downloads_missing_index_for_existing_vcf(monkeypatch, t
     assert copied == [
         (
             "gs://bucket/cdr/wgs/short_read/structural_variants/vcf/full/AoU_srWGS_SV.v8.chr22.vcf.gz.tbi",
-            str(tmp_path / "AoU_srWGS_SV.v8.chr22.vcf.gz.tbi"),
+            str(cache_dir / "AoU_srWGS_SV.v8.chr22.vcf.gz.tbi.partial"),
         )
     ]
-
-
-def test_cleanup_local_sv_vcf_removes_vcf_and_index(tmp_path: Path):
-    vcf_path = tmp_path / "AoU_srWGS_SV.v8.chr22.vcf.gz"
-    tbi_path = tmp_path / "AoU_srWGS_SV.v8.chr22.vcf.gz.tbi"
-    vcf_path.write_text("vcf\n", encoding="utf-8")
-    tbi_path.write_text("tbi\n", encoding="utf-8")
-
-    aou_runner.cleanup_local_sv_vcf(vcf_path)
-
-    assert not vcf_path.exists()
-    assert not tbi_path.exists()
-
 
 def test_merge_pcs_into_sample_table_raises_when_ids_do_not_overlap(tmp_path: Path):
     sample_table_path = tmp_path / "samples.tsv"
@@ -566,7 +560,7 @@ def test_merge_pcs_into_sample_table_raises_when_merge_produces_zero_pcs(tmp_pat
         )
 
 
-def test_run_all_of_us_runs_single_unified_fit_and_cleans_downloads(monkeypatch, tmp_path: Path):
+def test_run_all_of_us_runs_single_unified_fit_and_reuses_cached_downloads(monkeypatch, tmp_path: Path):
     class _Dataset:
         def __init__(self) -> None:
             self.targets = np.array([0.0, 1.0], dtype=np.float32)
@@ -586,7 +580,8 @@ def test_run_all_of_us_runs_single_unified_fit_and_cleans_downloads(monkeypatch,
         return output_path, []
 
     def fake_download_sv_vcf(chromosome: int, work_dir: Path) -> Path:
-        vcf_path = work_dir / f"AoU_srWGS_SV.v8.chr{chromosome}.vcf.gz"
+        vcf_path = aou_runner.local_sv_vcf_path(chromosome, work_dir)
+        vcf_path.parent.mkdir(parents=True, exist_ok=True)
         Path(vcf_path).write_text("vcf\n", encoding="utf-8")
         Path(f"{vcf_path}.tbi").write_text("tbi\n", encoding="utf-8")
         return vcf_path
@@ -613,13 +608,14 @@ def test_run_all_of_us_runs_single_unified_fit_and_cleans_downloads(monkeypatch,
         output_base=str(tmp_path),
     )
 
-    assert not (tmp_path / "AoU_srWGS_SV.v8.chr1.vcf.gz").exists()
-    assert not (tmp_path / "AoU_srWGS_SV.v8.chr1.vcf.gz.tbi").exists()
-    assert not (tmp_path / "AoU_srWGS_SV.v8.chr2.vcf.gz").exists()
-    assert not (tmp_path / "AoU_srWGS_SV.v8.chr2.vcf.gz.tbi").exists()
+    cache_dir = aou_runner.local_sv_vcf_cache_dir(tmp_path)
+    assert (cache_dir / "AoU_srWGS_SV.v8.chr1.vcf.gz").exists()
+    assert (cache_dir / "AoU_srWGS_SV.v8.chr1.vcf.gz.tbi").exists()
+    assert (cache_dir / "AoU_srWGS_SV.v8.chr2.vcf.gz").exists()
+    assert (cache_dir / "AoU_srWGS_SV.v8.chr2.vcf.gz.tbi").exists()
     assert loader_calls == [[
-        str(tmp_path / "AoU_srWGS_SV.v8.chr1.vcf.gz"),
-        str(tmp_path / "AoU_srWGS_SV.v8.chr2.vcf.gz"),
+        str(cache_dir / "AoU_srWGS_SV.v8.chr1.vcf.gz"),
+        str(cache_dir / "AoU_srWGS_SV.v8.chr2.vcf.gz"),
     ]]
     assert pipeline_calls == [(2, tmp_path)]
     assert release_calls == ["released"]
@@ -744,7 +740,8 @@ def test_run_all_of_us_reruns_when_existing_fit_metadata_differs(monkeypatch, tm
         return output_path, ["PC1", "PC2", "PC3"]
 
     def fake_download_sv_vcf(chromosome: int, work_dir: Path) -> Path:
-        vcf_path = work_dir / f"AoU_srWGS_SV.v8.chr{chromosome}.vcf.gz"
+        vcf_path = aou_runner.local_sv_vcf_path(chromosome, work_dir)
+        vcf_path.parent.mkdir(parents=True, exist_ok=True)
         Path(vcf_path).write_text("vcf\n", encoding="utf-8")
         Path(f"{vcf_path}.tbi").write_text("tbi\n", encoding="utf-8")
         return vcf_path
@@ -771,9 +768,10 @@ def test_run_all_of_us_reruns_when_existing_fit_metadata_differs(monkeypatch, tm
         n_pcs=3,
     )
 
+    cache_dir = aou_runner.local_sv_vcf_cache_dir(tmp_path)
     assert loader_calls == [[
-        str(tmp_path / "AoU_srWGS_SV.v8.chr1.vcf.gz"),
-        str(tmp_path / "AoU_srWGS_SV.v8.chr2.vcf.gz"),
+        str(cache_dir / "AoU_srWGS_SV.v8.chr1.vcf.gz"),
+        str(cache_dir / "AoU_srWGS_SV.v8.chr2.vcf.gz"),
     ]]
     assert pipeline_calls == [tmp_path]
     rerun_metadata = json.loads(aou_runner._aou_run_metadata_path(tmp_path).read_text(encoding="utf-8"))

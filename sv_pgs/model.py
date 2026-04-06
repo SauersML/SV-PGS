@@ -434,10 +434,6 @@ class BayesianPGS:
             active_variant_indices = select_active_variant_indices(
                 variant_records=normalized_records,
                 config=self.config,
-                standardized_genotypes=standardized_genotypes,
-                covariates=prepared_arrays.covariates,
-                targets=prepared_arrays.targets,
-                trait_type=self.config.trait_type,
             )
             log(f"active variants: {len(active_variant_indices)} / {len(normalized_records)} ({100.0*len(active_variant_indices)/max(len(normalized_records),1):.1f}%)")
         else:

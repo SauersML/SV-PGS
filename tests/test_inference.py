@@ -156,6 +156,79 @@ def test_fit_variational_em_ignores_incompatible_resume_checkpoint(random_genera
     assert np.all(np.isfinite(result.beta_reduced))
 
 
+def test_fit_variational_em_ignores_resume_checkpoint_when_validation_is_present(random_generator):
+    sample_count, variant_count = 24, 5
+    genotype_matrix = random_generator.normal(size=(sample_count, variant_count)).astype(np.float32)
+    covariate_matrix = np.column_stack(
+        [np.ones(sample_count, dtype=np.float32), random_generator.normal(size=sample_count).astype(np.float32)]
+    )
+    target_vector = random_generator.normal(size=sample_count).astype(np.float32)
+    validation_genotypes = random_generator.normal(size=(8, variant_count)).astype(np.float32)
+    validation_covariates = np.column_stack(
+        [np.ones(8, dtype=np.float32), random_generator.normal(size=8).astype(np.float32)]
+    )
+    validation_targets = random_generator.normal(size=8).astype(np.float32)
+    records = make_variant_records(variant_count)
+    config = ModelConfig(
+        trait_type=TraitType.QUANTITATIVE,
+        max_outer_iterations=2,
+        exact_solver_matrix_limit=128,
+        minimum_minor_allele_frequency=0.0,
+    )
+    tie_map = build_tie_map(genotype_matrix, records, config)
+    reduced_records = mixture_inference.collapse_tie_groups(list(records), tie_map)
+    prior_design = mixture_inference._build_prior_design(reduced_records)
+    reduced_count = len(tie_map.reduced_to_group)
+    checkpoint = VariationalFitCheckpoint(
+        config_signature=mixture_inference._checkpoint_config_signature(config),
+        prior_design_signature=mixture_inference._checkpoint_prior_design_signature(prior_design),
+        validation_enabled=True,
+        completed_iterations=1,
+        alpha_state=np.full(covariate_matrix.shape[1], np.nan, dtype=np.float64),
+        beta_state=np.full(reduced_count, np.nan, dtype=np.float64),
+        local_scale=np.full(reduced_count, np.nan, dtype=np.float64),
+        auxiliary_delta=np.full(reduced_count, np.nan, dtype=np.float64),
+        sigma_error2=np.nan,
+        global_scale=np.nan,
+        scale_model_coefficients=np.full(prior_design.design_matrix.shape[1], np.nan, dtype=np.float64),
+        tpb_shape_a_vector=np.full(prior_design.class_membership_matrix.shape[1], np.nan, dtype=np.float64),
+        tpb_shape_b_vector=np.full(prior_design.class_membership_matrix.shape[1], np.nan, dtype=np.float64),
+        objective_history=[np.nan],
+        validation_history=[np.nan],
+        previous_alpha=None,
+        previous_beta=None,
+        previous_local_scale=None,
+        previous_theta=None,
+        previous_tpb_shape_a_vector=None,
+        previous_tpb_shape_b_vector=None,
+        best_validation_metric=None,
+        best_alpha=None,
+        best_beta=None,
+        best_local_scale=None,
+        best_theta=None,
+        best_sigma_error2=None,
+        best_tpb_shape_a_vector=None,
+        best_tpb_shape_b_vector=None,
+    )
+
+    result = fit_variational_em(
+        genotypes=genotype_matrix,
+        covariates=covariate_matrix,
+        targets=target_vector,
+        records=records,
+        config=config,
+        tie_map=tie_map,
+        validation_data=(validation_genotypes, validation_covariates, validation_targets),
+        resume_checkpoint=checkpoint,
+        checkpoint_callback=lambda _checkpoint: (_ for _ in ()).throw(AssertionError("checkpoint callback should be disabled")),
+    )
+
+    assert result.objective_history
+    assert result.validation_history
+    assert np.all(np.isfinite(result.alpha))
+    assert np.all(np.isfinite(result.beta_reduced))
+
+
 def test_variational_em_supports_covariates_only_mode():
     covariate_matrix = np.array(
         [
@@ -1213,7 +1286,7 @@ def test_streaming_sample_space_operator_matmat_matches_dense_reference(random_g
     )
 
 
-def test_prefer_iterative_variant_space_targets_warm_started_cpu_binary_updates():
+def test_prefer_iterative_variant_space_targets_fast_warm_started_point_estimate_updates():
     sample_count, variant_count = 4, 6
     genotype_values = np.array(
         [
@@ -1224,25 +1297,24 @@ def test_prefer_iterative_variant_space_targets_warm_started_cpu_binary_updates(
         ],
         dtype=np.float32,
     )
-    covariate_matrix = np.column_stack(
-        [
-            np.ones(sample_count, dtype=np.float64),
-            np.array([-1.0, 0.0, 1.0, 0.5], dtype=np.float64),
-        ]
-    )
-    targets = np.array([0.25, -0.5, 1.0, 0.75], dtype=np.float64)
-    prior_variances = np.linspace(0.5, 1.5, variant_count, dtype=np.float64)
-    diagonal_noise = np.linspace(1.0, 1.3, sample_count, dtype=np.float64)
     standardized = as_raw_genotype_matrix(genotype_values).standardized(
         means=np.zeros(variant_count, dtype=np.float32),
         scales=np.ones(variant_count, dtype=np.float32),
     )
     standardized._dense_cache = standardized.materialize()
-    assert _prefer_iterative_variant_space(
+    assert not _prefer_iterative_variant_space(
         genotype_matrix=standardized,
         sample_count=sample_count,
         variant_count=variant_count,
         compute_beta_variance=True,
+        compute_logdet=False,
+        initial_beta_guess=np.zeros(variant_count, dtype=np.float64),
+    )
+    assert _prefer_iterative_variant_space(
+        genotype_matrix=standardized,
+        sample_count=sample_count,
+        variant_count=variant_count,
+        compute_beta_variance=False,
         compute_logdet=False,
         initial_beta_guess=np.zeros(variant_count, dtype=np.float64),
     )

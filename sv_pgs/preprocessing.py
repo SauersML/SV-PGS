@@ -10,7 +10,7 @@ import sv_pgs._jax  # noqa: F401
 import jax
 import jax.numpy as jnp
 
-from sv_pgs.config import ModelConfig, TraitType, VariantClass
+from sv_pgs.config import ModelConfig, VariantClass
 from sv_pgs.data import PreparedArrays, TieGroup, TieMap, VariantRecord, VariantStatistics
 from sv_pgs.genotype import (
     DenseRawGenotypeMatrix,
@@ -26,8 +26,6 @@ from sv_pgs.genotype import (
 )
 from sv_pgs.plink import PLINK_MISSING_INT8
 from sv_pgs.progress import log, mem
-
-STRUCTURAL_VARIANT_CLASSES = frozenset(ModelConfig.structural_variant_classes())
 
 @jax.jit
 def _batch_all_stats_i8(batch_i8: jnp.ndarray) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray]:
@@ -223,10 +221,6 @@ def fit_preprocessor(
 def select_active_variant_indices(
     variant_records: Sequence[VariantRecord],
     config: ModelConfig,
-    standardized_genotypes: StandardizedGenotypeMatrix | np.ndarray | None = None,
-    covariates: np.ndarray | None = None,
-    targets: np.ndarray | None = None,
-    trait_type: TraitType | None = None,
 ) -> np.ndarray:
     n_total = len(variant_records)
     if n_total == 0:
@@ -251,120 +245,7 @@ def select_active_variant_indices(
         f"  active variants: {maf_kept.shape[0]}/{n_total} kept after MAF filter "
         + f"(min_maf={config.minimum_minor_allele_frequency:.6f})"
     )
-
-
-def _top_scoring_variant_indices(
-    variant_indices: np.ndarray,
-    scores: np.ndarray,
-    maximum_count: int,
-) -> np.ndarray:
-    resolved_indices = np.asarray(variant_indices, dtype=np.int32)
-    resolved_scores = np.asarray(scores, dtype=np.float64)
-    if maximum_count <= 0 or resolved_indices.shape[0] == 0:
-        return np.zeros(0, dtype=np.int32)
-    if resolved_indices.shape[0] <= maximum_count:
-        return resolved_indices
-    top_order = np.argpartition(-resolved_scores, maximum_count - 1)[:maximum_count]
-    return resolved_indices[np.asarray(top_order, dtype=np.intp)]
-
-
-def _covariate_adjusted_marginal_scores(
-    standardized_genotypes: StandardizedGenotypeMatrix | np.ndarray,
-    covariates: np.ndarray,
-    targets: np.ndarray,
-    trait_type: TraitType,
-) -> np.ndarray:
-    genotype_matrix = _as_standardized_genotypes(standardized_genotypes)
-    covariate_matrix = np.asarray(covariates, dtype=np.float64)
-    target_array = np.asarray(targets, dtype=np.float64).reshape(-1)
-    if covariate_matrix.ndim != 2:
-        raise ValueError("covariates must be 2D.")
-    if covariate_matrix.shape[0] != genotype_matrix.shape[0]:
-        raise ValueError("covariates sample count must match standardized_genotypes.")
-    if target_array.shape[0] != genotype_matrix.shape[0]:
-        raise ValueError("targets sample count must match standardized_genotypes.")
-
-    if trait_type == TraitType.BINARY:
-        residual_targets, q_matrix, sqrt_weights = _binary_screening_state(covariate_matrix, target_array)
-    else:
-        residual_targets, q_matrix = _quantitative_screening_state(covariate_matrix, target_array)
-        sqrt_weights = None
-
-    scores = np.zeros(genotype_matrix.shape[1], dtype=np.float64)
-    for batch in genotype_matrix.iter_column_batches(batch_size=auto_batch_size(genotype_matrix.shape[0])):
-        batch_values = np.asarray(batch.values, dtype=np.float64)
-        if sqrt_weights is None:
-            adjusted_batch = _project_out_covariates(batch_values, q_matrix)
-            numerator = adjusted_batch.T @ residual_targets
-            denominator = np.sqrt(np.maximum(np.sum(adjusted_batch * adjusted_batch, axis=0), 1e-12))
-        else:
-            weighted_batch = batch_values * sqrt_weights[:, None]
-            adjusted_weighted_batch = _project_out_covariates(weighted_batch, q_matrix)
-            numerator = batch_values.T @ residual_targets
-            denominator = np.sqrt(np.maximum(np.sum(adjusted_weighted_batch * adjusted_weighted_batch, axis=0), 1e-12))
-        scores[batch.variant_indices] = np.abs(numerator) / denominator
-    return scores.astype(np.float32, copy=False)
-
-
-def _binary_screening_state(
-    covariate_matrix: np.ndarray,
-    targets: np.ndarray,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    fitted_alpha = _fit_logistic_covariates_only(covariate_matrix, targets)
-    linear_predictor = covariate_matrix @ fitted_alpha
-    probabilities = 1.0 / (1.0 + np.exp(-np.clip(linear_predictor, -60.0, 60.0)))
-    residual_targets = np.asarray(targets - probabilities, dtype=np.float64)
-    sqrt_weights = np.sqrt(np.maximum(probabilities * (1.0 - probabilities), 1e-6))
-    weighted_covariates = covariate_matrix * sqrt_weights[:, None]
-    return residual_targets, _orthonormal_covariate_basis(weighted_covariates), np.asarray(sqrt_weights, dtype=np.float64)
-
-
-def _quantitative_screening_state(
-    covariate_matrix: np.ndarray,
-    targets: np.ndarray,
-) -> tuple[np.ndarray, np.ndarray]:
-    fitted_alpha, *_ = np.linalg.lstsq(covariate_matrix, targets, rcond=None)
-    residual_targets = np.asarray(targets - covariate_matrix @ fitted_alpha, dtype=np.float64)
-    return residual_targets, _orthonormal_covariate_basis(covariate_matrix)
-
-
-def _orthonormal_covariate_basis(covariate_matrix: np.ndarray) -> np.ndarray:
-    if covariate_matrix.shape[1] == 0:
-        return np.empty((covariate_matrix.shape[0], 0), dtype=np.float64)
-    q_matrix, r_matrix = np.linalg.qr(covariate_matrix, mode="reduced")
-    diagonal = np.abs(np.diag(r_matrix))
-    rank = int(np.sum(diagonal > 1e-10))
-    return np.asarray(q_matrix[:, :rank], dtype=np.float64)
-
-
-def _project_out_covariates(values: np.ndarray, q_matrix: np.ndarray) -> np.ndarray:
-    if q_matrix.shape[1] == 0:
-        return values
-    return values - q_matrix @ (q_matrix.T @ values)
-
-
-def _fit_logistic_covariates_only(
-    covariate_matrix: np.ndarray,
-    targets: np.ndarray,
-    maximum_iterations: int = 25,
-    tolerance: float = 1e-6,
-) -> np.ndarray:
-    alpha = np.zeros(covariate_matrix.shape[1], dtype=np.float64)
-    for _ in range(maximum_iterations):
-        linear_predictor = covariate_matrix @ alpha
-        probabilities = 1.0 / (1.0 + np.exp(-np.clip(linear_predictor, -60.0, 60.0)))
-        weights = np.maximum(probabilities * (1.0 - probabilities), 1e-6)
-        gradient = covariate_matrix.T @ (targets - probabilities)
-        weighted_covariates = covariate_matrix * weights[:, None]
-        hessian = covariate_matrix.T @ weighted_covariates
-        try:
-            step = np.linalg.solve(hessian, gradient)
-        except np.linalg.LinAlgError:
-            step, *_ = np.linalg.lstsq(hessian, gradient, rcond=None)
-        alpha += step
-        if float(np.linalg.norm(step)) <= tolerance:
-            break
-    return alpha
+    return maf_kept
 
 
 def _minor_allele_frequency(allele_frequency: float) -> float:
