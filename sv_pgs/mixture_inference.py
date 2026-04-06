@@ -249,13 +249,13 @@ def _apply_binary_intercept_calibration(
 def _gpu_exact_variant_linear_predictor(X_gpu, beta: np.ndarray) -> np.ndarray:
     import cupy as cp
 
-    return np.asarray((X_gpu @ cp.asarray(beta, dtype=cp.float32)).get(), dtype=np.float64)
+    return np.asarray((X_gpu.astype(cp.float64, copy=False) @ cp.asarray(beta, dtype=cp.float64)).get(), dtype=np.float64)
 
 
 def _gpu_cholesky_solve(right_hand_side, cholesky_factor_gpu, solve_triangular_gpu):
     import cupy as cp
 
-    rhs_gpu = cp.asarray(right_hand_side, dtype=cp.float32)
+    rhs_gpu = cp.asarray(right_hand_side, dtype=cholesky_factor_gpu.dtype)
     lower_solution = solve_triangular_gpu(cholesky_factor_gpu, rhs_gpu, lower=True)
     return solve_triangular_gpu(cholesky_factor_gpu.T, lower_solution, lower=False)
 
@@ -1310,7 +1310,7 @@ def _sample_space_operator(
     compute_dtype = gpu_compute_jax_dtype()
     diag_noise_jax = jnp.asarray(diagonal_noise, dtype=compute_dtype)
     prior_var_jax = jnp.asarray(prior_variances, dtype=compute_dtype)
-    streaming_dtype = np.float32
+    streaming_dtype = np.float64
     cupy = None
     streaming_gpu_enabled = False
     if genotype_matrix._cupy_cache is None and not genotype_matrix.supports_jax_dense_ops() and genotype_matrix.raw is not None:
@@ -1433,15 +1433,15 @@ def _sample_space_diagonal_preconditioner(
                     axis=1,
                 )
             return np.maximum(np.asarray(diagonal_gpu.get(), dtype=np.float64), 1e-8)
-    diagonal = np.asarray(diagonal_noise, dtype=np.float32).copy()
-    prior_variances_f32 = np.asarray(prior_variances, dtype=np.float32)
+    diagonal = np.asarray(diagonal_noise, dtype=np.float64).copy()
+    prior_variances_f64 = np.asarray(prior_variances, dtype=np.float64)
     for batch in genotype_matrix.iter_column_batches(batch_size=batch_size):
-        genotype_batch = np.asarray(batch.values, dtype=np.float32)
+        genotype_batch = np.asarray(batch.values, dtype=np.float64)
         diagonal += np.sum(
-            genotype_batch * genotype_batch * prior_variances_f32[batch.variant_indices][None, :],
+            genotype_batch * genotype_batch * prior_variances_f64[batch.variant_indices][None, :],
             axis=1,
         )
-    return np.maximum(np.asarray(diagonal, dtype=np.float64), 1e-8)
+    return np.maximum(diagonal, 1e-8)
 
 
 def _sample_space_preconditioner(
@@ -1648,8 +1648,9 @@ def _prefer_iterative_variant_space(
     compute_logdet: bool,
     initial_beta_guess: np.ndarray | None,
 ) -> bool:
-    del compute_beta_variance
     return (
+        not compute_beta_variance
+        and
         not compute_logdet
         and initial_beta_guess is not None
         and genotype_matrix._cupy_cache is None
@@ -2140,12 +2141,6 @@ def _use_gpu_exact_variant_solve(
     )
 
 
-def _approximate_beta_variance_from_precision_diagonal(
-    precision_diagonal: np.ndarray,
-) -> np.ndarray:
-    return np.maximum(1.0 / np.maximum(np.asarray(precision_diagonal, dtype=np.float64), 1e-8), 1e-8)
-
-
 def _restricted_posterior_state(
     genotype_matrix: StandardizedGenotypeMatrix,
     covariate_matrix: np.ndarray,
@@ -2291,28 +2286,28 @@ def _restricted_posterior_state(
                 # blows VRAM. Use:
                 #   X^T P X = X^T D^{-1} X - (X^T D^{-1} C) A^{-1} (C^T D^{-1} X)
                 # where A = C^T D^{-1} C.
-                inv_d_cp = cp.asarray(inverse_diagonal_noise, dtype=cp.float32)
-                cov_cp = cp.asarray(covariate_matrix, dtype=cp.float32)
+                inv_d_cp = cp.asarray(inverse_diagonal_noise, dtype=cp.float64)
+                cov_cp = cp.asarray(covariate_matrix, dtype=cp.float64)
                 chunk = 256
-                xtdxc_gpu = cp.empty((variant_count, cov_cp.shape[1]), dtype=cp.float32)
-                xtdx_gpu = cp.empty((variant_count, variant_count), dtype=cp.float32)
+                xtdxc_gpu = cp.empty((variant_count, cov_cp.shape[1]), dtype=cp.float64)
+                xtdx_gpu = cp.empty((variant_count, variant_count), dtype=cp.float64)
                 for start in range(0, variant_count, chunk):
                     end = min(start + chunk, variant_count)
-                    weighted_chunk = inv_d_cp[:, None] * X_gpu[:, start:end]
+                    weighted_chunk = inv_d_cp[:, None] * X_gpu[:, start:end].astype(cp.float64, copy=False)
                     xtdxc_gpu[start:end, :] = weighted_chunk.T @ cov_cp
-                    xtdx_gpu[:, start:end] = X_gpu.T @ weighted_chunk
+                    xtdx_gpu[:, start:end] = X_gpu.astype(cp.float64, copy=False).T @ weighted_chunk
                 CtWX = xtdxc_gpu.T.get().astype(np.float64)  # (k, p)
                 correction_coeff = _cholesky_solve(covariate_precision_cholesky, CtWX)
                 projected_targets_np = apply_projector(targets)
-                projected_targets_cp = cp.asarray(projected_targets_np, dtype=cp.float32)
-                variant_rhs_cp = X_gpu.T @ projected_targets_cp
+                projected_targets_cp = cp.asarray(projected_targets_np, dtype=cp.float64)
+                variant_rhs_cp = X_gpu.astype(cp.float64, copy=False).T @ projected_targets_cp
                 if use_gpu_exact_variant:
-                    correction_gpu = xtdxc_gpu @ cp.asarray(correction_coeff, dtype=cp.float32)
-                    prior_precision_cp = cp.asarray(prior_precision, dtype=cp.float32)
+                    correction_gpu = xtdxc_gpu @ cp.asarray(correction_coeff, dtype=cp.float64)
+                    prior_precision_cp = cp.asarray(prior_precision, dtype=cp.float64)
                     variant_precision_gpu = xtdx_gpu - correction_gpu
                     variant_precision_gpu += cp.diag(prior_precision_cp)
                     variant_precision_gpu = (variant_precision_gpu + variant_precision_gpu.T) * 0.5
-                    variant_precision_gpu += cp.eye(variant_count, dtype=cp.float32) * 1e-4
+                    variant_precision_gpu += cp.eye(variant_count, dtype=cp.float64) * 1e-8
                     variant_precision_cholesky_gpu = cp.linalg.cholesky(variant_precision_gpu)
 
                     def solve_variant_rhs(right_hand_side: np.ndarray) -> np.ndarray:
@@ -2444,19 +2439,12 @@ def _restricted_posterior_state(
 
             beta = np.asarray(solve_variant_rhs(variant_rhs), dtype=np.float64)
             if compute_beta_variance:
-                if prefer_iterative_variant_space:
-                    log(
-                        "      beta variance: using variant-precision diagonal approximation "
-                        + f"for warm-started binary update (p={variant_count})"
-                    )
-                    beta_variance = _approximate_beta_variance_from_precision_diagonal(variant_preconditioner)
-                else:
-                    beta_variance = _posterior_variance_hutchinson_diagonal(
-                        solve_variant_rhs=solve_variant_rhs,
-                        dimension=variant_count,
-                        probe_count=posterior_variance_probe_count,
-                        random_seed=random_seed,
-                    )
+                beta_variance = _posterior_variance_hutchinson_diagonal(
+                    solve_variant_rhs=solve_variant_rhs,
+                    dimension=variant_count,
+                    probe_count=posterior_variance_probe_count,
+                    random_seed=random_seed,
+                )
             else:
                 beta_variance = np.zeros(variant_count, dtype=compute_np_dtype)
             logdet_A = (

@@ -614,6 +614,7 @@ def test_streaming_linear_algebra_uses_gpu_batches_when_available(monkeypatch: p
 
     class _FakeCupy:
         float32 = np.float32
+        float64 = np.float64
 
         @staticmethod
         def asarray(array, dtype=None):

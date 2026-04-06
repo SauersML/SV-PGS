@@ -276,7 +276,22 @@ def _try_load_fit_stage_cache(
         return active_variant_indices, reduced_tie_map, standardized_genotypes.subset(combined_indices), False
     except Exception as exc:
         log(f"fit-stage cache load failed ({exc}), rebuilding")
+        _invalidate_fit_stage_cache(cache_paths)
         return None
+
+
+def _invalidate_fit_stage_cache(cache_paths: _FitStageCachePaths) -> None:
+    for path in (
+        cache_paths.manifest_path,
+        cache_paths.active_indices_path,
+        cache_paths.tie_map_path,
+        cache_paths.reduced_raw_i8_path,
+        cache_paths.em_checkpoint_path,
+    ):
+        try:
+            path.unlink(missing_ok=True)
+        except Exception:
+            pass
 
 
 def _save_variational_checkpoint(
@@ -747,13 +762,12 @@ def _runtime_tuned_config_for_fit(
     gpu_budget_bytes = _gpu_materialization_budget_bytes(cupy)
     cacheable_dense_variants = max(int(gpu_budget_bytes // max(sample_count * 4, 1)), 1)
     tuned_exact_solver_limit = min(int(config.exact_solver_matrix_limit), GPU_EXACT_SOLVER_LIMIT)
-    max_gpu_preconditioner_rank = max(1, min(cacheable_dense_variants, GPU_PRECONDITIONER_RANK_LIMIT))
-    tuned_preconditioner_rank = min(
-        int(config.sample_space_preconditioner_rank),
-        max_gpu_preconditioner_rank,
-        max(tuned_exact_solver_limit // 8, 1),
+        max(int(cacheable_dense_variants * 0.9), 1),
     )
+    max_gpu_preconditioner_rank = max(1, min(cacheable_dense_variants, GPU_PRECONDITIONER_RANK_LIMIT))
+    tuned_preconditioner_rank = min(int(config.sample_space_preconditioner_rank), max_gpu_preconditioner_rank)
     if (
+        and
         tuned_exact_solver_limit == int(config.exact_solver_matrix_limit)
         and tuned_preconditioner_rank == int(config.sample_space_preconditioner_rank)
     ):

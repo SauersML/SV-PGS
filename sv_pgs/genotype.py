@@ -743,7 +743,7 @@ class StandardizedGenotypeMatrix:
             return False
         if isinstance(self.raw, Int8RawGenotypeMatrix):
             return True
-        batch_size = auto_batch_size(self.shape[0])
+        batch_size = auto_batch_size_i8(self.shape[0])
         selected_variant_count = int(self.variant_indices.shape[0])
         log(
             "    caching reduced raw genotypes locally as int8 "
@@ -789,7 +789,7 @@ class StandardizedGenotypeMatrix:
             return False
         cache_path = Path(cache_path)
         cache_path.parent.mkdir(parents=True, exist_ok=True)
-        batch_size = auto_batch_size(self.shape[0])
+        batch_size = auto_batch_size_i8(self.shape[0])
         selected_variant_count = int(self.variant_indices.shape[0])
         temp_directory = Path(tempfile.mkdtemp(prefix=f"{cache_path.name}.tmp.", dir=cache_path.parent))
         temp_path = temp_directory / cache_path.name
@@ -1145,6 +1145,15 @@ def auto_batch_size(sample_count: int) -> int:
     bytes_per_variant = sample_count * 4  # float32
     memory_capped = max(BED_READER_TARGET_BATCH_BYTES // max(bytes_per_variant, 1), 1)
     return max(MIN_BED_READER_BATCH_SIZE, min(DEFAULT_GENOTYPE_BATCH_SIZE, memory_capped))
+
+
+def auto_batch_size_i8(sample_count: int) -> int:
+    """Pick an int8-native batch size that fits the same IO budget."""
+    if sample_count < 1:
+        return DEFAULT_GENOTYPE_BATCH_SIZE
+    bytes_per_variant = sample_count  # int8
+    memory_capped = max(BED_READER_TARGET_BATCH_BYTES // max(bytes_per_variant, 1), 1)
+    return max(MIN_BED_READER_BATCH_SIZE, min(int(memory_capped), 8 * DEFAULT_GENOTYPE_BATCH_SIZE))
 
 
 def _effective_standardized_streaming_batch_size(
