@@ -1,15 +1,18 @@
 from __future__ import annotations
 
 import numpy as np
+import pytest
 from sklearn.metrics import roc_auc_score
 
 import sv_pgs.genotype as genotype_module
+import sv_pgs.mixture_inference as mixture_module
 import sv_pgs.model as model_module
 from sv_pgs import BayesianPGS, BenchmarkConfig, ModelConfig, TraitType, VariantClass, VariantRecord, run_benchmark_suite
 from sv_pgs.data import TieGroup, TieMap
 from sv_pgs.genotype import RawGenotypeBatch, RawGenotypeMatrix, as_raw_genotype_matrix
-from sv_pgs.inference import VariationalFitResult
+from sv_pgs.inference import VariationalFitCheckpoint, VariationalFitResult
 from sv_pgs.model import (
+    _FitStageCachePaths,
     _raw_standardized_subset_matvec,
     _runtime_tuned_config_for_fit,
     _tie_group_export_weights,
@@ -125,6 +128,176 @@ def test_runtime_tuned_config_for_t4_caps_solver_from_gpu_budget(monkeypatch):
     assert tuned_config.exact_solver_matrix_limit == 1_024
     assert tuned_config.sample_space_preconditioner_rank == 128
     assert summary is not None
+
+
+def test_fit_resumes_from_variational_checkpoint(tmp_path, monkeypatch):
+    genotype_matrix, covariate_matrix, target_vector, variant_records = _synthetic_binary_dataset()
+    cache_paths = _FitStageCachePaths(
+        key="resume-test",
+        cache_dir=tmp_path,
+        manifest_path=tmp_path / "resume-test.manifest.json",
+        active_indices_path=tmp_path / "resume-test.active.npy",
+        tie_map_path=tmp_path / "resume-test.tie.pkl",
+        reduced_raw_i8_path=tmp_path / "resume-test.reduced_raw_i8.npy",
+        em_checkpoint_path=tmp_path / "resume-test.em.pkl",
+    )
+    call_log: list[int | None] = []
+
+    monkeypatch.setattr(
+        model_module,
+        "_fit_stage_cache_paths",
+        lambda **kwargs: cache_paths,
+    )
+
+    def fake_fit_variational_em(
+        genotypes,
+        covariates,
+        targets,
+        records,
+        tie_map,
+        config,
+        validation_data,
+        resume_checkpoint=None,
+        checkpoint_callback=None,
+    ):
+        completed_iterations = None if resume_checkpoint is None else resume_checkpoint.completed_iterations
+        call_log.append(completed_iterations)
+        reduced_records = mixture_module.collapse_tie_groups(list(records), tie_map)
+        prior_design = mixture_module._build_prior_design(reduced_records)
+        if resume_checkpoint is None:
+            checkpoint_callback(
+                VariationalFitCheckpoint(
+                    config_signature="resume-config",
+                    prior_design_signature="resume-design",
+                    validation_enabled=False,
+                    completed_iterations=1,
+                    alpha_state=np.linspace(0.5, -0.25, covariates.shape[1], dtype=np.float64),
+                    beta_state=np.linspace(0.1, -0.2, genotypes.shape[1], dtype=np.float64),
+                    local_scale=np.ones(genotypes.shape[1], dtype=np.float64),
+                    auxiliary_delta=np.ones(genotypes.shape[1], dtype=np.float64) * 0.5,
+                    sigma_error2=1.0,
+                    global_scale=0.75,
+                    scale_model_coefficients=np.zeros(prior_design.design_matrix.shape[1], dtype=np.float64),
+                    tpb_shape_a_vector=np.ones(prior_design.class_membership_matrix.shape[1], dtype=np.float64),
+                    tpb_shape_b_vector=np.ones(prior_design.class_membership_matrix.shape[1], dtype=np.float64) * 0.5,
+                    objective_history=[-1.0],
+                    validation_history=[],
+                    previous_alpha=np.linspace(0.5, -0.25, covariates.shape[1], dtype=np.float64),
+                    previous_beta=np.linspace(0.1, -0.2, genotypes.shape[1], dtype=np.float64),
+                    previous_local_scale=np.ones(genotypes.shape[1], dtype=np.float64),
+                    previous_theta=np.zeros(1 + prior_design.design_matrix.shape[1], dtype=np.float64),
+                    previous_tpb_shape_a_vector=np.ones(prior_design.class_membership_matrix.shape[1], dtype=np.float64),
+                    previous_tpb_shape_b_vector=np.ones(prior_design.class_membership_matrix.shape[1], dtype=np.float64) * 0.5,
+                    best_validation_metric=None,
+                    best_alpha=None,
+                    best_beta=None,
+                    best_local_scale=None,
+                    best_theta=None,
+                    best_sigma_error2=None,
+                    best_tpb_shape_a_vector=None,
+                    best_tpb_shape_b_vector=None,
+                )
+            )
+            raise RuntimeError("stop-after-checkpoint")
+        return VariationalFitResult(
+            alpha=np.zeros(covariates.shape[1], dtype=np.float32),
+            beta_reduced=np.zeros(genotypes.shape[1], dtype=np.float32),
+            beta_variance=np.ones(genotypes.shape[1], dtype=np.float32),
+            prior_scales=np.ones(len(records), dtype=np.float32),
+            global_scale=1.0,
+            class_tpb_shape_a={VariantClass.SNV: 1.0},
+            class_tpb_shape_b={VariantClass.SNV: 0.5},
+            scale_model_coefficients=np.zeros(prior_design.design_matrix.shape[1], dtype=np.float32),
+            scale_model_feature_names=[f"feature_{index}" for index in range(prior_design.design_matrix.shape[1])],
+            sigma_error2=1.0,
+            objective_history=[-1.0, -0.5],
+            validation_history=[],
+            member_prior_variances=np.ones(len(records), dtype=np.float32),
+        )
+
+    monkeypatch.setattr(model_module, "fit_variational_em", fake_fit_variational_em)
+
+    with pytest.raises(RuntimeError, match="stop-after-checkpoint"):
+        BayesianPGS(
+            ModelConfig(
+                trait_type=TraitType.BINARY,
+                max_outer_iterations=2,
+                minimum_minor_allele_frequency=0.0,
+            )
+        ).fit(genotype_matrix, covariate_matrix, target_vector, variant_records)
+
+    assert cache_paths.em_checkpoint_path.exists()
+
+    resumed_model = BayesianPGS(
+        ModelConfig(
+            trait_type=TraitType.BINARY,
+            max_outer_iterations=2,
+            minimum_minor_allele_frequency=0.0,
+        )
+    ).fit(genotype_matrix, covariate_matrix, target_vector, variant_records)
+
+    assert resumed_model.state is not None
+    assert call_log == [None, 1]
+    assert not cache_paths.em_checkpoint_path.exists()
+
+
+def test_corrupt_variational_checkpoint_is_ignored(tmp_path, monkeypatch):
+    genotype_matrix, covariate_matrix, target_vector, variant_records = _synthetic_binary_dataset()
+    cache_paths = _FitStageCachePaths(
+        key="corrupt-checkpoint-test",
+        cache_dir=tmp_path,
+        manifest_path=tmp_path / "corrupt-checkpoint-test.manifest.json",
+        active_indices_path=tmp_path / "corrupt-checkpoint-test.active.npy",
+        tie_map_path=tmp_path / "corrupt-checkpoint-test.tie.pkl",
+        reduced_raw_i8_path=tmp_path / "corrupt-checkpoint-test.reduced_raw_i8.npy",
+        em_checkpoint_path=tmp_path / "corrupt-checkpoint-test.em.pkl",
+    )
+    cache_paths.em_checkpoint_path.write_bytes(b"not-a-pickle")
+    observed_resume_values: list[object] = []
+
+    monkeypatch.setattr(model_module, "_fit_stage_cache_paths", lambda **kwargs: cache_paths)
+
+    def fake_fit_variational_em(
+        genotypes,
+        covariates,
+        targets,
+        records,
+        tie_map,
+        config,
+        validation_data,
+        resume_checkpoint=None,
+        checkpoint_callback=None,
+    ):
+        observed_resume_values.append(resume_checkpoint)
+        return VariationalFitResult(
+            alpha=np.zeros(covariates.shape[1], dtype=np.float32),
+            beta_reduced=np.zeros(genotypes.shape[1], dtype=np.float32),
+            beta_variance=np.ones(genotypes.shape[1], dtype=np.float32),
+            prior_scales=np.ones(len(records), dtype=np.float32),
+            global_scale=1.0,
+            class_tpb_shape_a={VariantClass.SNV: 1.0},
+            class_tpb_shape_b={VariantClass.SNV: 0.5},
+            scale_model_coefficients=np.zeros(1, dtype=np.float32),
+            scale_model_feature_names=["feature_0"],
+            sigma_error2=1.0,
+            objective_history=[0.0],
+            validation_history=[],
+            member_prior_variances=np.ones(len(records), dtype=np.float32),
+        )
+
+    monkeypatch.setattr(model_module, "fit_variational_em", fake_fit_variational_em)
+
+    model = BayesianPGS(
+        ModelConfig(
+            trait_type=TraitType.BINARY,
+            max_outer_iterations=1,
+            minimum_minor_allele_frequency=0.0,
+        )
+    ).fit(genotype_matrix, covariate_matrix, target_vector, variant_records)
+
+    assert model.state is not None
+    assert observed_resume_values == [None]
+    assert not cache_paths.em_checkpoint_path.exists()
 
 
 def test_benchmark_suite_runs_from_shared_trainer():
@@ -244,7 +417,17 @@ def test_fit_uses_cohort_allele_frequencies_for_maf_filter(monkeypatch):
         config=config,
     )
 
-    def fake_fit_variational_em(genotypes, covariates, targets, records, tie_map, config, validation_data):
+    def fake_fit_variational_em(
+        genotypes,
+        covariates,
+        targets,
+        records,
+        tie_map,
+        config,
+        validation_data,
+        resume_checkpoint=None,
+        checkpoint_callback=None,
+    ):
         reduced_count = genotypes.shape[1]
         active_count = len(records)
         return VariationalFitResult(

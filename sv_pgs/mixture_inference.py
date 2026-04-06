@@ -52,7 +52,9 @@ The algorithm iterates three steps until convergence:
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, fields as dataclass_fields
+import hashlib
+import json
 from typing import Callable, Sequence, cast
 
 import sv_pgs._jax  # noqa: F401
@@ -70,8 +72,10 @@ from sv_pgs.data import TieMap, VariantRecord
 from sv_pgs.genotype import (
     DenseRawGenotypeMatrix,
     StandardizedGenotypeMatrix,
+    _iter_standardized_gpu_batches,
+    _try_import_cupy,
     _cupy_to_jax,
-    _to_cupy_float32,
+    _to_cupy_float64,
 )
 from sv_pgs.linear_solvers import build_linear_operator, solve_spd_system, stochastic_logdet
 from sv_pgs.numeric import stable_sigmoid
@@ -126,6 +130,39 @@ class VariationalFitResult:
 
 
 @dataclass(slots=True)
+class VariationalFitCheckpoint:
+    config_signature: str
+    prior_design_signature: str
+    validation_enabled: bool
+    completed_iterations: int
+    alpha_state: np.ndarray
+    beta_state: np.ndarray
+    local_scale: np.ndarray
+    auxiliary_delta: np.ndarray
+    sigma_error2: float
+    global_scale: float
+    scale_model_coefficients: np.ndarray
+    tpb_shape_a_vector: np.ndarray
+    tpb_shape_b_vector: np.ndarray
+    objective_history: list[float]
+    validation_history: list[float]
+    previous_alpha: np.ndarray | None
+    previous_beta: np.ndarray | None
+    previous_local_scale: np.ndarray | None
+    previous_theta: np.ndarray | None
+    previous_tpb_shape_a_vector: np.ndarray | None
+    previous_tpb_shape_b_vector: np.ndarray | None
+    best_validation_metric: float | None
+    best_alpha: np.ndarray | None
+    best_beta: np.ndarray | None
+    best_local_scale: np.ndarray | None
+    best_theta: np.ndarray | None
+    best_sigma_error2: float | None
+    best_tpb_shape_a_vector: np.ndarray | None
+    best_tpb_shape_b_vector: np.ndarray | None
+
+
+@dataclass(slots=True)
 class PosteriorState:
     """Result of fitting effect sizes for one EM iteration.
 
@@ -142,6 +179,28 @@ class PosteriorState:
     linear_predictor: np.ndarray  # full predicted values for each sample
     collapsed_objective: float    # model quality score (higher = better fit)
     sigma_error2: float           # unexplained noise variance (fixed at 1.0 for binary)
+
+
+def _checkpoint_config_signature(config: ModelConfig) -> str:
+    payload: dict[str, object] = {}
+    for field in dataclass_fields(config):
+        value = getattr(config, field.name)
+        payload[field.name] = value.value if hasattr(value, "value") else value
+    return hashlib.sha256(json.dumps(payload, sort_keys=True).encode("utf-8")).hexdigest()
+
+
+def _checkpoint_prior_design_signature(prior_design: PriorDesign) -> str:
+    hasher = hashlib.sha256()
+    hasher.update(np.ascontiguousarray(prior_design.design_matrix, dtype=np.float64).view(np.uint8).tobytes())
+    hasher.update(np.ascontiguousarray(prior_design.class_membership_matrix, dtype=np.float64).view(np.uint8).tobytes())
+    hasher.update(json.dumps(list(prior_design.feature_names), sort_keys=False).encode("utf-8"))
+    hasher.update(
+        json.dumps(
+            {int(index): variant_class.value for index, variant_class in sorted(prior_design.inverse_class_lookup.items())},
+            sort_keys=True,
+        ).encode("utf-8")
+    )
+    return hasher.hexdigest()
 
 
 def _initialize_alpha_state(
@@ -312,6 +371,8 @@ def fit_variational_em(
     config: ModelConfig,
     tie_map: TieMap,
     validation_data: tuple[StandardizedGenotypeMatrix | np.ndarray, np.ndarray, np.ndarray] | None = None,
+    resume_checkpoint: VariationalFitCheckpoint | None = None,
+    checkpoint_callback: Callable[[VariationalFitCheckpoint], None] | None = None,
 ) -> VariationalFitResult:
     genotype_matrix = _as_standardized_genotype_matrix(genotypes)
     covariate_matrix = np.asarray(covariates, dtype=np.float64)
@@ -327,6 +388,11 @@ def fit_variational_em(
         raise ValueError("Collapsed records must align with reduced genotype matrix.")
 
     validation_payload = _prepare_validation(validation_data)
+    if validation_payload is not None:
+        if resume_checkpoint is not None:
+            log("  variational EM: ignoring resume checkpoint because validation data is present")
+            resume_checkpoint = None
+        checkpoint_callback = None
     if genotype_matrix.shape[1] == 0:
         log(
             f"  variational EM: covariates-only mode, 0 reduced variants, "
@@ -340,45 +406,152 @@ def fit_variational_em(
             validation_data=validation_payload,
         )
     prior_design = _build_prior_design(reduced_records)
+    config_signature = _checkpoint_config_signature(config)
+    prior_design_signature = _checkpoint_prior_design_signature(prior_design)
     scale_penalty = _scale_model_penalty(prior_design.feature_names, config)
 
-    global_scale, scale_model_coefficients = _initialize_scale_model(prior_design, config)
-    tpb_shape_a_vector = _initialize_tpb_shape_a_vector(prior_design, config)
-    tpb_shape_b_vector = _initialize_tpb_shape_b_vector(prior_design, config)
-    local_shape_a = prior_design.class_membership_matrix @ tpb_shape_a_vector
-    local_shape_b = prior_design.class_membership_matrix @ tpb_shape_b_vector
+    def _copy_optional(array: np.ndarray | None) -> np.ndarray | None:
+        return None if array is None else np.asarray(array, dtype=np.float64).copy()
 
-    local_scale = np.ones(len(reduced_records), dtype=np.float64)
-    auxiliary_delta = np.asarray(local_shape_b, dtype=np.float64)
-    sigma_error2 = 1.0
-    alpha_state = _initialize_alpha_state(
-        covariate_matrix=covariate_matrix,
-        targets=target_vector,
-        trait_type=config.trait_type,
-    )
-    beta_state = np.zeros(genotype_matrix.shape[1], dtype=np.float64)
+    def _build_checkpoint(completed_iterations: int) -> VariationalFitCheckpoint:
+        return VariationalFitCheckpoint(
+            config_signature=config_signature,
+            prior_design_signature=prior_design_signature,
+            validation_enabled=validation_payload is not None,
+            completed_iterations=int(completed_iterations),
+            alpha_state=np.asarray(alpha_state, dtype=np.float64).copy(),
+            beta_state=np.asarray(beta_state, dtype=np.float64).copy(),
+            local_scale=np.asarray(local_scale, dtype=np.float64).copy(),
+            auxiliary_delta=np.asarray(auxiliary_delta, dtype=np.float64).copy(),
+            sigma_error2=float(sigma_error2),
+            global_scale=float(global_scale),
+            scale_model_coefficients=np.asarray(scale_model_coefficients, dtype=np.float64).copy(),
+            tpb_shape_a_vector=np.asarray(tpb_shape_a_vector, dtype=np.float64).copy(),
+            tpb_shape_b_vector=np.asarray(tpb_shape_b_vector, dtype=np.float64).copy(),
+            objective_history=[float(value) for value in objective_history],
+            validation_history=[float(value) for value in validation_history],
+            previous_alpha=_copy_optional(previous_alpha),
+            previous_beta=_copy_optional(previous_beta),
+            previous_local_scale=_copy_optional(previous_local_scale),
+            previous_theta=_copy_optional(previous_theta),
+            previous_tpb_shape_a_vector=_copy_optional(previous_tpb_shape_a_vector),
+            previous_tpb_shape_b_vector=_copy_optional(previous_tpb_shape_b_vector),
+            best_validation_metric=None if best_validation_metric is None else float(best_validation_metric),
+            best_alpha=_copy_optional(best_alpha),
+            best_beta=_copy_optional(best_beta),
+            best_local_scale=_copy_optional(best_local_scale),
+            best_theta=_copy_optional(best_theta),
+            best_sigma_error2=None if best_sigma_error2 is None else float(best_sigma_error2),
+            best_tpb_shape_a_vector=_copy_optional(best_tpb_shape_a_vector),
+            best_tpb_shape_b_vector=_copy_optional(best_tpb_shape_b_vector),
+        )
 
-    objective_history: list[float] = []
-    validation_history: list[float] = []
+    def _initialize_em_state() -> None:
+        nonlocal global_scale, scale_model_coefficients, tpb_shape_a_vector, tpb_shape_b_vector
+        nonlocal local_shape_a, local_shape_b, local_scale, auxiliary_delta, sigma_error2
+        nonlocal alpha_state, beta_state, objective_history, validation_history
+        nonlocal previous_alpha, previous_beta, previous_local_scale, previous_theta
+        nonlocal previous_tpb_shape_a_vector, previous_tpb_shape_b_vector
+        nonlocal best_validation_metric, best_alpha, best_beta, best_local_scale, best_theta
+        nonlocal best_sigma_error2, best_tpb_shape_a_vector, best_tpb_shape_b_vector, start_iteration
+        global_scale, scale_model_coefficients = _initialize_scale_model(prior_design, config)
+        tpb_shape_a_vector = _initialize_tpb_shape_a_vector(prior_design, config)
+        tpb_shape_b_vector = _initialize_tpb_shape_b_vector(prior_design, config)
+        local_scale = np.ones(len(reduced_records), dtype=np.float64)
+        local_shape_a = prior_design.class_membership_matrix @ tpb_shape_a_vector
+        local_shape_b = prior_design.class_membership_matrix @ tpb_shape_b_vector
+        auxiliary_delta = np.asarray(local_shape_b, dtype=np.float64)
+        sigma_error2 = 1.0
+        alpha_state = _initialize_alpha_state(
+            covariate_matrix=covariate_matrix,
+            targets=target_vector,
+            trait_type=config.trait_type,
+        )
+        beta_state = np.zeros(genotype_matrix.shape[1], dtype=np.float64)
+        objective_history = []
+        validation_history = []
+        previous_alpha = None
+        previous_beta = None
+        previous_local_scale = None
+        previous_theta = None
+        previous_tpb_shape_a_vector = None
+        previous_tpb_shape_b_vector = None
+        best_validation_metric = None
+        best_alpha = None
+        best_beta = None
+        best_local_scale = None
+        best_theta = None
+        best_sigma_error2 = None
+        best_tpb_shape_a_vector = None
+        best_tpb_shape_b_vector = None
+        start_iteration = 0
 
-    previous_alpha: np.ndarray | None = None
-    previous_beta: np.ndarray | None = None
-    previous_local_scale: np.ndarray | None = None
-    previous_theta: np.ndarray | None = None
-    previous_tpb_shape_a_vector: np.ndarray | None = None
-    previous_tpb_shape_b_vector: np.ndarray | None = None
-    best_validation_metric: float | None = None
-    best_alpha: np.ndarray | None = None
-    best_beta: np.ndarray | None = None
-    best_local_scale: np.ndarray | None = None
-    best_theta: np.ndarray | None = None
-    best_sigma_error2: float | None = None
-    best_tpb_shape_a_vector: np.ndarray | None = None
-    best_tpb_shape_b_vector: np.ndarray | None = None
+    if resume_checkpoint is None:
+        _initialize_em_state()
+    else:
+        if (
+            resume_checkpoint.config_signature != config_signature
+            or resume_checkpoint.prior_design_signature != prior_design_signature
+            or bool(resume_checkpoint.validation_enabled) != bool(validation_payload is not None)
+        ):
+            log("  variational EM: checkpoint incompatible with current fit inputs; starting from scratch")
+            resume_checkpoint = None
+            _initialize_em_state()
+        else:
+            if resume_checkpoint.alpha_state.shape != (covariate_matrix.shape[1],):
+                raise ValueError("resume checkpoint alpha_state shape does not match covariates.")
+            if resume_checkpoint.beta_state.shape != (genotype_matrix.shape[1],):
+                raise ValueError("resume checkpoint beta_state shape does not match reduced genotypes.")
+            if resume_checkpoint.local_scale.shape != (len(reduced_records),):
+                raise ValueError("resume checkpoint local_scale shape does not match reduced records.")
+            if resume_checkpoint.auxiliary_delta.shape != (len(reduced_records),):
+                raise ValueError("resume checkpoint auxiliary_delta shape does not match reduced records.")
+            if resume_checkpoint.scale_model_coefficients.shape != (prior_design.design_matrix.shape[1],):
+                raise ValueError("resume checkpoint scale_model_coefficients shape does not match prior design.")
+            if resume_checkpoint.tpb_shape_a_vector.shape != (prior_design.class_membership_matrix.shape[1],):
+                raise ValueError("resume checkpoint TPB shape-a size does not match prior classes.")
+            if resume_checkpoint.tpb_shape_b_vector.shape != (prior_design.class_membership_matrix.shape[1],):
+                raise ValueError("resume checkpoint TPB shape-b size does not match prior classes.")
+            if resume_checkpoint.completed_iterations < 0 or resume_checkpoint.completed_iterations > config.max_outer_iterations:
+                raise ValueError("resume checkpoint completed_iterations is out of range.")
+            if len(resume_checkpoint.objective_history) != resume_checkpoint.completed_iterations:
+                raise ValueError("resume checkpoint objective history length does not match completed iterations.")
+            global_scale = float(resume_checkpoint.global_scale)
+            scale_model_coefficients = np.asarray(resume_checkpoint.scale_model_coefficients, dtype=np.float64).copy()
+            tpb_shape_a_vector = np.asarray(resume_checkpoint.tpb_shape_a_vector, dtype=np.float64).copy()
+            tpb_shape_b_vector = np.asarray(resume_checkpoint.tpb_shape_b_vector, dtype=np.float64).copy()
+            local_shape_a = prior_design.class_membership_matrix @ tpb_shape_a_vector
+            local_shape_b = prior_design.class_membership_matrix @ tpb_shape_b_vector
+            local_scale = np.asarray(resume_checkpoint.local_scale, dtype=np.float64).copy()
+            auxiliary_delta = np.asarray(resume_checkpoint.auxiliary_delta, dtype=np.float64).copy()
+            sigma_error2 = float(resume_checkpoint.sigma_error2)
+            alpha_state = np.asarray(resume_checkpoint.alpha_state, dtype=np.float64).copy()
+            beta_state = np.asarray(resume_checkpoint.beta_state, dtype=np.float64).copy()
+            objective_history = [float(value) for value in resume_checkpoint.objective_history]
+            validation_history = [float(value) for value in resume_checkpoint.validation_history]
+            previous_alpha = _copy_optional(resume_checkpoint.previous_alpha)
+            previous_beta = _copy_optional(resume_checkpoint.previous_beta)
+            previous_local_scale = _copy_optional(resume_checkpoint.previous_local_scale)
+            previous_theta = _copy_optional(resume_checkpoint.previous_theta)
+            previous_tpb_shape_a_vector = _copy_optional(resume_checkpoint.previous_tpb_shape_a_vector)
+            previous_tpb_shape_b_vector = _copy_optional(resume_checkpoint.previous_tpb_shape_b_vector)
+            best_validation_metric = None if resume_checkpoint.best_validation_metric is None else float(resume_checkpoint.best_validation_metric)
+            best_alpha = _copy_optional(resume_checkpoint.best_alpha)
+            best_beta = _copy_optional(resume_checkpoint.best_beta)
+            best_local_scale = _copy_optional(resume_checkpoint.best_local_scale)
+            best_theta = _copy_optional(resume_checkpoint.best_theta)
+            best_sigma_error2 = None if resume_checkpoint.best_sigma_error2 is None else float(resume_checkpoint.best_sigma_error2)
+            best_tpb_shape_a_vector = _copy_optional(resume_checkpoint.best_tpb_shape_a_vector)
+            best_tpb_shape_b_vector = _copy_optional(resume_checkpoint.best_tpb_shape_b_vector)
+            start_iteration = int(resume_checkpoint.completed_iterations)
+            log(
+                "  variational EM: resuming from checkpoint "
+                + f"after {start_iteration}/{config.max_outer_iterations} iterations  mem={mem()}"
+            )
 
     log(f"  variational EM: {genotype_matrix.shape[1]} reduced variants, {covariate_matrix.shape[1]} covariates, {target_vector.shape[0]} samples, max_iter={config.max_outer_iterations}")
 
-    for outer_iteration in range(config.max_outer_iterations):
+    for outer_iteration in range(start_iteration, config.max_outer_iterations):
         log(f"  variational EM iteration {outer_iteration + 1}/{config.max_outer_iterations} start  sigma_e2={sigma_error2:.6f}  global_scale={global_scale:.6f}  mem={mem()}")
         posterior_theta = _pack_theta(
             global_scale=float(global_scale),
@@ -536,6 +709,8 @@ def fit_variational_em(
         hyper_str = "  [+hyper]" if should_update_hyperparameters else ""
         nonzero_beta = int(np.count_nonzero(np.abs(beta_state) > 1e-8))
         log(f"  EM iter {iter_num}/{config.max_outer_iterations}  obj={obj_str}  delta={parameter_change:.2e}  sigma_e2={sigma_error2:.4f}  g_scale={float(global_scale):.4f}  nz_beta={nonzero_beta}{val_str}{hyper_str}  mem={mem()}")
+        if checkpoint_callback is not None:
+            checkpoint_callback(_build_checkpoint(iter_num))
 
         if validation_history:
             if len(validation_history) >= 2:
@@ -803,6 +978,22 @@ def _quantitative_posterior_state(
     return alpha, beta, beta_variance, linear_predictor, collapsed_objective, sigma_error2_new
 
 
+def _binary_newton_solver_controls(
+    genotype_matrix: StandardizedGenotypeMatrix,
+    *,
+    solver_tolerance: float,
+    maximum_linear_solver_iterations: int,
+) -> tuple[float, int]:
+    if genotype_matrix.shape[0] < 16_384 and genotype_matrix.shape[1] < 16_384:
+        return solver_tolerance, maximum_linear_solver_iterations
+    relaxed_tolerance = max(float(solver_tolerance), 1e-3)
+    relaxed_maximum_iterations = min(int(maximum_linear_solver_iterations), 128)
+    if genotype_matrix.shape[1] > genotype_matrix.shape[0]:
+        relaxed_tolerance = max(relaxed_tolerance, 5e-3)
+        relaxed_maximum_iterations = min(relaxed_maximum_iterations, 96)
+    return relaxed_tolerance, max(relaxed_maximum_iterations, 16)
+
+
 # Fit effect sizes for a binary trait (e.g. disease case/control).
 #
 # Binary traits can't use the simple least-squares approach above because
@@ -859,6 +1050,11 @@ def _binary_posterior_state(
     covariate_matrix_jax = jnp.asarray(covariate_matrix, dtype=compute_jax_dtype)
     targets_jax = jnp.asarray(targets, dtype=compute_jax_dtype)
     prior_precision_jax = jnp.asarray(prior_precision, dtype=compute_jax_dtype)
+    newton_solver_tolerance, newton_maximum_linear_solver_iterations = _binary_newton_solver_controls(
+        standardized_genotypes,
+        solver_tolerance=solver_tolerance,
+        maximum_linear_solver_iterations=maximum_linear_solver_iterations,
+    )
 
     penalized_term_calls = 0
 
@@ -961,8 +1157,8 @@ def _binary_posterior_state(
                     targets=working_response,
                     prior_variances=prior_variances,
                     diagonal_noise=1.0 / weights,
-                    solver_tolerance=solver_tolerance,
-                    maximum_linear_solver_iterations=maximum_linear_solver_iterations,
+                    solver_tolerance=newton_solver_tolerance,
+                    maximum_linear_solver_iterations=newton_maximum_linear_solver_iterations,
                     logdet_probe_count=logdet_probe_count,
                     logdet_lanczos_steps=logdet_lanczos_steps,
                     exact_solver_matrix_limit=exact_solver_matrix_limit,
@@ -1036,8 +1232,8 @@ def _binary_posterior_state(
             targets=final_working_response,
             prior_variances=prior_variances,
             diagonal_noise=1.0 / final_weights,
-            solver_tolerance=solver_tolerance,
-            maximum_linear_solver_iterations=maximum_linear_solver_iterations,
+            solver_tolerance=newton_solver_tolerance,
+            maximum_linear_solver_iterations=newton_maximum_linear_solver_iterations,
             logdet_probe_count=logdet_probe_count,
             logdet_lanczos_steps=logdet_lanczos_steps,
             exact_solver_matrix_limit=exact_solver_matrix_limit,
@@ -1115,9 +1311,34 @@ def _sample_space_operator(
     diag_noise_jax = jnp.asarray(diagonal_noise, dtype=compute_dtype)
     prior_var_jax = jnp.asarray(prior_variances, dtype=compute_dtype)
     streaming_dtype = np.float32
+    cupy = None
+    streaming_gpu_enabled = False
+    if genotype_matrix._cupy_cache is None and not genotype_matrix.supports_jax_dense_ops() and genotype_matrix.raw is not None:
+        cupy = _try_import_cupy()
+        streaming_gpu_enabled = cupy is not None
+    if streaming_gpu_enabled:
+        assert cupy is not None
+        diag_noise_gpu = cupy.asarray(diagonal_noise, dtype=cupy.float64)
+        prior_var_gpu = cupy.asarray(prior_variances, dtype=cupy.float64)
 
     def matvec(vector) -> jnp.ndarray:
         v = jnp.asarray(vector, dtype=compute_dtype)
+        if streaming_gpu_enabled:
+            assert cupy is not None
+            vector_gpu = _to_cupy_float64(v)
+            result_gpu = diag_noise_gpu * vector_gpu
+            for batch_slice, standardized_batch in _iter_standardized_gpu_batches(
+                genotype_matrix.raw,
+                genotype_matrix.variant_indices,
+                genotype_matrix.means,
+                genotype_matrix.scales,
+                batch_size=batch_size,
+                cupy=cupy,
+                dtype=cupy.float64,
+            ):
+                scaled_projection = prior_var_gpu[batch_slice] * (standardized_batch.T @ vector_gpu)
+                result_gpu += standardized_batch @ scaled_projection
+            return _cupy_to_jax(result_gpu)
         if genotype_matrix._cupy_cache is None and not genotype_matrix.supports_jax_dense_ops():
             vector_np = np.asarray(v, dtype=streaming_dtype)
             genotype_term = np.zeros(genotype_matrix.shape[0], dtype=streaming_dtype)
@@ -1133,6 +1354,22 @@ def _sample_space_operator(
 
     def matmat(matrix) -> jnp.ndarray:
         matrix_jax = jnp.asarray(matrix, dtype=compute_dtype)
+        if streaming_gpu_enabled:
+            assert cupy is not None
+            matrix_gpu = _to_cupy_float64(matrix_jax)
+            result_gpu = diag_noise_gpu[:, None] * matrix_gpu
+            for batch_slice, standardized_batch in _iter_standardized_gpu_batches(
+                genotype_matrix.raw,
+                genotype_matrix.variant_indices,
+                genotype_matrix.means,
+                genotype_matrix.scales,
+                batch_size=batch_size,
+                cupy=cupy,
+                dtype=cupy.float64,
+            ):
+                scaled_projection = prior_var_gpu[batch_slice, None] * (standardized_batch.T @ matrix_gpu)
+                result_gpu += standardized_batch @ scaled_projection
+            return _cupy_to_jax(result_gpu)
         if genotype_matrix._cupy_cache is None and not genotype_matrix.supports_jax_dense_ops():
             matrix_np = np.asarray(matrix_jax, dtype=streaming_dtype)
             genotype_term = np.zeros((genotype_matrix.shape[0], matrix_np.shape[1]), dtype=streaming_dtype)
@@ -1167,16 +1404,35 @@ def _sample_space_diagonal_preconditioner(
     if genotype_matrix._cupy_cache is not None:
         import cupy as cp
         X = genotype_matrix._cupy_cache  # (n, p) float32 on GPU
-        pv = cp.asarray(prior_variances, dtype=cp.float32)
+        pv = cp.asarray(prior_variances, dtype=cp.float64)
         # diag(X @ diag(pv) @ X^T) = sum(X^2 * pv, axis=1)
         # Chunked to avoid allocating a full (n, p) intermediate on GPU.
-        diag_gpu = cp.zeros(X.shape[0], dtype=cp.float32)
+        diag_gpu = cp.zeros(X.shape[0], dtype=cp.float64)
         chunk = max(1, min(512, X.shape[1]))
         for start in range(0, X.shape[1], chunk):
             end = min(start + chunk, X.shape[1])
             diag_gpu += cp.sum(X[:, start:end] ** 2 * pv[start:end], axis=1)
         result = np.asarray(diagonal_noise, dtype=np.float64) + diag_gpu.get().astype(np.float64)
         return np.maximum(result, 1e-8)
+    if genotype_matrix.raw is not None and not genotype_matrix.supports_jax_dense_ops():
+        cupy = _try_import_cupy()
+        if cupy is not None:
+            diagonal_gpu = cupy.asarray(diagonal_noise, dtype=cupy.float64)
+            prior_variances_gpu = cupy.asarray(prior_variances, dtype=cupy.float64)
+            for batch_slice, standardized_batch in _iter_standardized_gpu_batches(
+                genotype_matrix.raw,
+                genotype_matrix.variant_indices,
+                genotype_matrix.means,
+                genotype_matrix.scales,
+                batch_size=batch_size,
+                cupy=cupy,
+                dtype=cupy.float64,
+            ):
+                diagonal_gpu += cupy.sum(
+                    standardized_batch * standardized_batch * prior_variances_gpu[batch_slice][None, :],
+                    axis=1,
+                )
+            return np.maximum(np.asarray(diagonal_gpu.get(), dtype=np.float64), 1e-8)
     diagonal = np.asarray(diagonal_noise, dtype=np.float32).copy()
     prior_variances_f32 = np.asarray(prior_variances, dtype=np.float32)
     for batch in genotype_matrix.iter_column_batches(batch_size=batch_size):
@@ -1218,27 +1474,27 @@ def _sample_space_preconditioner(
 
         gpu_cache_source = "full" if genotype_matrix._cupy_cache is not None else "subset"
         log(f"      sample-space preconditioner: GPU Woodbury rank={selected_rank} source={gpu_cache_source}")
-        weighted_selected_genotypes = selected_gpu_genotypes
+        weighted_selected_genotypes = selected_gpu_genotypes.astype(cp.float64, copy=False)
         weighted_selected_genotypes = weighted_selected_genotypes * cp.asarray(
-            np.sqrt(np.asarray(prior_variances[selected_variant_indices], dtype=np.float32)),
-            dtype=cp.float32,
+            np.sqrt(np.asarray(prior_variances[selected_variant_indices], dtype=np.float64)),
+            dtype=cp.float64,
         )[None, :]
         base_diagonal = cp.maximum(
-            cp.asarray(diagonal_preconditioner, dtype=cp.float32)
+            cp.asarray(diagonal_preconditioner, dtype=cp.float64)
             - cp.sum(weighted_selected_genotypes * weighted_selected_genotypes, axis=1),
-            cp.float32(1e-8),
+            cp.float64(1e-8),
         )
         inverse_base_diagonal = 1.0 / base_diagonal
         weighted_inverse_selected = inverse_base_diagonal[:, None] * weighted_selected_genotypes
-        low_rank_precision = cp.eye(selected_rank, dtype=cp.float32) + (
+        low_rank_precision = cp.eye(selected_rank, dtype=cp.float64) + (
             weighted_selected_genotypes.T @ weighted_inverse_selected
         )
         low_rank_cholesky = cp.linalg.cholesky(
-            low_rank_precision + cp.eye(selected_rank, dtype=cp.float32) * cp.float32(1e-4)
+            low_rank_precision + cp.eye(selected_rank, dtype=cp.float64) * cp.float64(1e-8)
         )
 
         def apply_preconditioner_gpu(right_hand_side: jnp.ndarray) -> jnp.ndarray:
-            right_hand_side_gpu = _to_cupy_float32(right_hand_side)
+            right_hand_side_gpu = _to_cupy_float64(right_hand_side)
             if right_hand_side_gpu.ndim not in (1, 2):
                 raise ValueError("sample-space preconditioner expects a vector or matrix right-hand side.")
             weighted_rhs = (
@@ -1303,7 +1559,7 @@ def _sample_space_gpu_preconditioner(
         diagonal_noise=diagonal_noise,
         batch_size=batch_size,
     )
-    diagonal_preconditioner_gpu = cp.asarray(diagonal_preconditioner, dtype=cp.float32)
+    diagonal_preconditioner_gpu = cp.asarray(diagonal_preconditioner, dtype=cp.float64)
 
     def apply_diagonal(right_hand_side_gpu):
         if right_hand_side_gpu.ndim == 2:
@@ -1326,26 +1582,27 @@ def _sample_space_gpu_preconditioner(
 
     gpu_cache_source = "full" if genotype_matrix._cupy_cache is not None else "subset"
     log(f"      sample-space preconditioner: GPU Woodbury rank={selected_rank} source={gpu_cache_source}")
-    weighted_selected_genotypes = selected_gpu_genotypes * cp.asarray(
-        np.sqrt(np.asarray(prior_variances[selected_variant_indices], dtype=np.float32)),
-        dtype=cp.float32,
+    weighted_selected_genotypes = selected_gpu_genotypes.astype(cp.float64, copy=False) * cp.asarray(
+        np.sqrt(np.asarray(prior_variances[selected_variant_indices], dtype=np.float64)),
+        dtype=cp.float64,
     )[None, :]
     base_diagonal = cp.maximum(
         diagonal_preconditioner_gpu - cp.sum(weighted_selected_genotypes * weighted_selected_genotypes, axis=1),
-        cp.float32(1e-8),
+        cp.float64(1e-8),
     )
     inverse_base_diagonal = 1.0 / base_diagonal
     weighted_inverse_selected = inverse_base_diagonal[:, None] * weighted_selected_genotypes
-    low_rank_precision = cp.eye(selected_rank, dtype=cp.float32) + (
+    low_rank_precision = cp.eye(selected_rank, dtype=cp.float64) + (
         weighted_selected_genotypes.T @ weighted_inverse_selected
     )
     low_rank_cholesky = cp.linalg.cholesky(
-        low_rank_precision + cp.eye(selected_rank, dtype=cp.float32) * cp.float32(1e-4)
+        low_rank_precision + cp.eye(selected_rank, dtype=cp.float64) * cp.float64(1e-8)
     )
 
     def apply_low_rank(right_hand_side_gpu):
         if right_hand_side_gpu.ndim not in (1, 2):
             raise ValueError("sample-space preconditioner expects a vector or matrix right-hand side.")
+        right_hand_side_gpu = _to_cupy_float64(right_hand_side_gpu)
         weighted_rhs = (
             inverse_base_diagonal[:, None] * right_hand_side_gpu
             if right_hand_side_gpu.ndim == 2
@@ -1371,7 +1628,11 @@ def _effective_sample_space_preconditioner_rank(
     resolved_rank = max(int(requested_rank), 0)
     if resolved_rank == 0:
         return 0
-    if genotype_matrix._cupy_cache is not None:
+    if genotype_matrix._cupy_cache is not None or (
+        genotype_matrix.raw is not None
+        and not genotype_matrix.supports_jax_dense_ops()
+        and _try_import_cupy() is not None
+    ):
         return min(resolved_rank, variant_count)
     if sample_count < 32_768 or variant_count < 65_536:
         return min(resolved_rank, variant_count)
@@ -1383,9 +1644,11 @@ def _prefer_iterative_variant_space(
     sample_count: int,
     variant_count: int,
     *,
+    compute_beta_variance: bool,
     compute_logdet: bool,
     initial_beta_guess: np.ndarray | None,
 ) -> bool:
+    del compute_beta_variance
     return (
         not compute_logdet
         and initial_beta_guess is not None
@@ -1402,15 +1665,20 @@ def _solve_sample_space_rhs_gpu(
     tolerance: float,
     max_iterations: int,
     preconditioner,
+    batch_size: int,
 ) -> np.ndarray:
     import cupy as cp
 
-    if genotype_matrix._cupy_cache is None:
-        raise RuntimeError("GPU sample-space solve requires a CuPy-resident genotype matrix.")
+    cupy = _try_import_cupy()
+    if cupy is None:
+        raise RuntimeError("GPU sample-space solve requires CuPy.")
     X_gpu = genotype_matrix._cupy_cache
-    prior_variances_gpu = cp.asarray(prior_variances, dtype=cp.float32)
-    diagonal_noise_gpu = cp.asarray(diagonal_noise, dtype=cp.float32)
-    right_hand_side_gpu = cp.asarray(right_hand_side, dtype=cp.float32)
+    streaming_gpu_enabled = X_gpu is None and genotype_matrix.raw is not None and not genotype_matrix.supports_jax_dense_ops()
+    if X_gpu is None and not streaming_gpu_enabled:
+        raise RuntimeError("GPU sample-space solve requires a CuPy-resident matrix or GPU-streamable raw storage.")
+    prior_variances_gpu = cp.asarray(prior_variances, dtype=cp.float64)
+    diagonal_noise_gpu = cp.asarray(diagonal_noise, dtype=cp.float64)
+    right_hand_side_gpu = cp.asarray(right_hand_side, dtype=cp.float64)
     vector_input = right_hand_side_gpu.ndim == 1
     if vector_input:
         right_hand_side_gpu = right_hand_side_gpu[:, None]
@@ -1418,9 +1686,23 @@ def _solve_sample_space_rhs_gpu(
         raise ValueError("GPU sample-space solve expects a vector or matrix right-hand side.")
 
     def apply_operator(matrix_gpu):
-        return diagonal_noise_gpu[:, None] * matrix_gpu + X_gpu @ (
-            prior_variances_gpu[:, None] * (X_gpu.T @ matrix_gpu)
-        )
+        if X_gpu is not None:
+            return diagonal_noise_gpu[:, None] * matrix_gpu + X_gpu @ (
+                prior_variances_gpu[:, None] * (X_gpu.T @ matrix_gpu)
+            )
+        result_gpu = diagonal_noise_gpu[:, None] * matrix_gpu
+        for batch_slice, standardized_batch in _iter_standardized_gpu_batches(
+            genotype_matrix.raw,
+            genotype_matrix.variant_indices,
+            genotype_matrix.means,
+            genotype_matrix.scales,
+            batch_size=batch_size,
+            cupy=cp,
+            dtype=cp.float64,
+        ):
+            scaled_projection = prior_variances_gpu[batch_slice, None] * (standardized_batch.T @ matrix_gpu)
+            result_gpu += standardized_batch @ scaled_projection
+        return result_gpu
 
     residual_refresh_interval = 32
     tol_sq = float(tolerance) * float(tolerance)
@@ -1447,7 +1729,7 @@ def _solve_sample_space_rhs_gpu(
         if np.any(~np.isfinite(step_denom) | (step_denom <= 0.0)):
             raise RuntimeError("GPU conjugate-gradient operator is not positive definite.")
         step_scale = residual_dot[active_columns] / step_denom
-        step_scale_gpu = cp.asarray(step_scale, dtype=cp.float32)
+        step_scale_gpu = cp.asarray(step_scale, dtype=cp.float64)
         solution_gpu[:, active_columns] += masked_search_gpu * step_scale_gpu[None, :]
         residual_gpu[:, active_columns] -= operator_search_gpu * step_scale_gpu[None, :]
         if (iteration_index + 1) % residual_refresh_interval == 0:
@@ -1470,7 +1752,7 @@ def _solve_sample_space_rhs_gpu(
         beta_active = updated_residual_dot_active / np.maximum(residual_dot[active_columns], 1e-30)
         if np.any(~np.isfinite(beta_active) | (beta_active < 0.0)):
             raise RuntimeError("GPU conjugate-gradient preconditioner produced an invalid update.")
-        beta_active_gpu = cp.asarray(beta_active, dtype=cp.float32)
+        beta_active_gpu = cp.asarray(beta_active, dtype=cp.float64)
         search_direction_gpu[:, active_columns] = refreshed_preconditioned_gpu + (
             search_direction_gpu[:, active_columns] * beta_active_gpu[None, :]
         )
@@ -1507,8 +1789,6 @@ def _solve_sample_space_rhs_cpu(
     elif rhs.ndim != 2:
         raise ValueError("CPU sample-space solve expects a vector or matrix right-hand side.")
 
-    diagonal_noise_array = np.asarray(diagonal_noise, dtype=np.float64)
-    prior_variances_array = np.asarray(prior_variances, dtype=np.float64)
     diagonal_noise_stream = np.asarray(diagonal_noise, dtype=np.float32)
     prior_variances_stream = np.asarray(prior_variances, dtype=np.float32)
 
@@ -1754,12 +2034,12 @@ def _restricted_variant_space_diagonal_preconditioner(
     if genotype_matrix._cupy_cache is not None:
         import cupy as cp
         X = genotype_matrix._cupy_cache  # (n, p) float32 on GPU
-        inv_d = cp.asarray(inverse_diagonal_noise, dtype=cp.float32)
-        cov_gpu = cp.asarray(covariate_matrix, dtype=cp.float32)  # (n, k) — tiny
+        inv_d = cp.asarray(inverse_diagonal_noise, dtype=cp.float64)
+        cov_gpu = cp.asarray(covariate_matrix, dtype=cp.float64)  # (n, k) — tiny
         # Compute diag(X^T D^{-1} X) and X^T D^{-1} C entirely on GPU.
         # Only download small results: (p,) diagonal and (p, k) cross-term.
-        raw_diag = cp.zeros(X.shape[1], dtype=cp.float32)
-        weighted_Xt_gpu = cp.empty((X.shape[1], cov_gpu.shape[1]), dtype=cp.float32)
+        raw_diag = cp.zeros(X.shape[1], dtype=cp.float64)
+        weighted_Xt_gpu = cp.empty((X.shape[1], cov_gpu.shape[1]), dtype=cp.float64)
         chunk = max(1, min(512, X.shape[1]))
         for start in range(0, X.shape[1], chunk):
             end = min(start + chunk, X.shape[1])
@@ -1772,6 +2052,30 @@ def _restricted_variant_space_diagonal_preconditioner(
         correction = _cholesky_solve(covariate_precision_cholesky, cross)
         diag_correction = np.sum(cross * correction, axis=0)
         return np.maximum(prior_precision + raw_diag_np - diag_correction, 1e-8)
+    if genotype_matrix.raw is not None and not genotype_matrix.supports_jax_dense_ops():
+        cupy = _try_import_cupy()
+        if cupy is not None:
+            inv_d_gpu = cupy.asarray(inverse_diagonal_noise, dtype=cupy.float64)
+            cov_gpu = cupy.asarray(covariate_matrix, dtype=cupy.float64)
+            raw_diag_gpu = cupy.empty(genotype_matrix.shape[1], dtype=cupy.float64)
+            weighted_xt_gpu = cupy.empty((genotype_matrix.shape[1], cov_gpu.shape[1]), dtype=cupy.float64)
+            for batch_slice, standardized_batch in _iter_standardized_gpu_batches(
+                genotype_matrix.raw,
+                genotype_matrix.variant_indices,
+                genotype_matrix.means,
+                genotype_matrix.scales,
+                batch_size=batch_size,
+                cupy=cupy,
+                dtype=cupy.float64,
+            ):
+                weighted_batch = inv_d_gpu[:, None] * standardized_batch
+                raw_diag_gpu[batch_slice] = cupy.sum(standardized_batch * weighted_batch, axis=0)
+                weighted_xt_gpu[batch_slice, :] = weighted_batch.T @ cov_gpu
+            raw_diag_np = raw_diag_gpu.get().astype(compute_np_dtype)
+            cross = weighted_xt_gpu.get().astype(compute_np_dtype).T
+            correction = _cholesky_solve(covariate_precision_cholesky, cross)
+            diag_correction = np.sum(cross * correction, axis=0)
+            return np.maximum(prior_precision + raw_diag_np - diag_correction, 1e-8)
     diagonal = np.asarray(prior_precision, dtype=compute_np_dtype).copy()
     for batch in genotype_matrix.iter_column_batches(batch_size=batch_size):
         genotype_batch = np.asarray(batch.values, dtype=compute_np_dtype)
@@ -1883,6 +2187,7 @@ def _restricted_posterior_state(
         genotype_matrix=genotype_matrix,
         sample_count=sample_count,
         variant_count=variant_count,
+        compute_beta_variance=compute_beta_variance,
         compute_logdet=compute_logdet,
         initial_beta_guess=initial_beta_guess,
     )
@@ -2200,20 +2505,23 @@ def _restricted_posterior_state(
             float(logdet_gls),
         )
 
-    covariance_operator = _sample_space_operator(
-        genotype_matrix,
-        prior_variances,
-        diagonal_noise,
-        batch_size=posterior_variance_batch_size,
-    )
     effective_sample_space_preconditioner_rank = _effective_sample_space_preconditioner_rank(
         genotype_matrix=genotype_matrix,
         sample_count=sample_count,
         variant_count=variant_count,
         requested_rank=sample_space_preconditioner_rank,
     )
-    if genotype_matrix._cupy_cache is not None:
-        log(f"    restricted posterior: GPU block-CG sample-space solve (p={variant_count}, n={sample_count})")
+    sample_space_gpu_enabled = genotype_matrix._cupy_cache is not None or (
+        genotype_matrix.raw is not None
+        and not genotype_matrix.supports_jax_dense_ops()
+        and _try_import_cupy() is not None
+    )
+    if sample_space_gpu_enabled:
+        gpu_source = "full-cache" if genotype_matrix._cupy_cache is not None else "streaming"
+        log(
+            "    restricted posterior: GPU block-CG sample-space solve "
+            + f"(p={variant_count}, n={sample_count}, source={gpu_source})"
+        )
         sample_space_preconditioner_gpu = _sample_space_gpu_preconditioner(
             genotype_matrix=genotype_matrix,
             prior_variances=prior_variances,
@@ -2231,6 +2539,7 @@ def _restricted_posterior_state(
                 tolerance=solver_tolerance,
                 max_iterations=maximum_linear_solver_iterations,
                 preconditioner=sample_space_preconditioner_gpu,
+                batch_size=posterior_variance_batch_size,
             )
     else:
         log(
@@ -2264,7 +2573,12 @@ def _restricted_posterior_state(
     inverse_covariance_covariates = np.asarray(inverse_covariance_rhs[:, 1:], dtype=np.float64)
     logdet_covariance = (
         stochastic_logdet(
-            covariance_operator,
+            _sample_space_operator(
+                genotype_matrix,
+                prior_variances,
+                diagonal_noise,
+                batch_size=posterior_variance_batch_size,
+            ),
             dimension=sample_count,
             probe_count=logdet_probe_count,
             lanczos_steps=logdet_lanczos_steps,

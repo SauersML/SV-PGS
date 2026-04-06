@@ -15,9 +15,11 @@ from sv_pgs.data import TieGroup, TieMap, VariantRecord
 from sv_pgs.genotype import as_raw_genotype_matrix
 from sv_pgs.inference import fit_variational_em
 from sv_pgs.mixture_inference import (
+    _binary_newton_solver_controls,
     _build_restricted_projector_jax,
     _calibrate_binary_intercept,
     PosteriorState,
+    VariationalFitCheckpoint,
     _binary_posterior_state,
     _initialize_alpha_state,
     _member_prior_variances_from_reduced_state,
@@ -89,6 +91,69 @@ def test_binary_inference_runs(random_generator):
     assert result.sigma_error2 == 1.0
     assert len(result.class_tpb_shape_a) == 1
     assert len(result.class_tpb_shape_b) == 1
+
+
+def test_fit_variational_em_ignores_incompatible_resume_checkpoint(random_generator):
+    sample_count, variant_count = 24, 5
+    genotype_matrix = random_generator.normal(size=(sample_count, variant_count)).astype(np.float32)
+    covariate_matrix = np.column_stack(
+        [np.ones(sample_count, dtype=np.float32), random_generator.normal(size=sample_count).astype(np.float32)]
+    )
+    target_vector = random_generator.normal(size=sample_count).astype(np.float32)
+    records = make_variant_records(variant_count)
+    config = ModelConfig(
+        trait_type=TraitType.QUANTITATIVE,
+        max_outer_iterations=2,
+        exact_solver_matrix_limit=128,
+        minimum_minor_allele_frequency=0.0,
+    )
+    tie_map = build_tie_map(genotype_matrix, records, config)
+    reduced_count = len(tie_map.reduced_to_group)
+    checkpoint = VariationalFitCheckpoint(
+        config_signature="stale-config",
+        prior_design_signature="stale-design",
+        validation_enabled=False,
+        completed_iterations=1,
+        alpha_state=np.full(covariate_matrix.shape[1], np.nan, dtype=np.float64),
+        beta_state=np.full(reduced_count, np.nan, dtype=np.float64),
+        local_scale=np.full(reduced_count, np.nan, dtype=np.float64),
+        auxiliary_delta=np.full(reduced_count, np.nan, dtype=np.float64),
+        sigma_error2=np.nan,
+        global_scale=np.nan,
+        scale_model_coefficients=np.full(1, np.nan, dtype=np.float64),
+        tpb_shape_a_vector=np.full(1, np.nan, dtype=np.float64),
+        tpb_shape_b_vector=np.full(1, np.nan, dtype=np.float64),
+        objective_history=[np.nan],
+        validation_history=[],
+        previous_alpha=None,
+        previous_beta=None,
+        previous_local_scale=None,
+        previous_theta=None,
+        previous_tpb_shape_a_vector=None,
+        previous_tpb_shape_b_vector=None,
+        best_validation_metric=None,
+        best_alpha=None,
+        best_beta=None,
+        best_local_scale=None,
+        best_theta=None,
+        best_sigma_error2=None,
+        best_tpb_shape_a_vector=None,
+        best_tpb_shape_b_vector=None,
+    )
+
+    result = fit_variational_em(
+        genotypes=genotype_matrix,
+        covariates=covariate_matrix,
+        targets=target_vector,
+        records=records,
+        config=config,
+        tie_map=tie_map,
+        resume_checkpoint=checkpoint,
+    )
+
+    assert result.objective_history
+    assert np.all(np.isfinite(result.alpha))
+    assert np.all(np.isfinite(result.beta_reduced))
 
 
 def test_variational_em_supports_covariates_only_mode():
@@ -493,6 +558,130 @@ def test_binary_posterior_reuses_proposal_across_rejects(random_generator, monke
     assert restricted_call_count == 3
 
 
+def test_binary_newton_solver_controls_relax_large_problem_settings():
+    standardized = as_raw_genotype_matrix(np.zeros((1, 1), dtype=np.float32)).standardized(
+        means=np.zeros(1, dtype=np.float32),
+        scales=np.ones(1, dtype=np.float32),
+    )
+    standardized._n_samples = 20_000
+    standardized.variant_indices = np.arange(40_000, dtype=np.int32)
+    standardized.means = np.zeros(40_000, dtype=np.float32)
+    standardized.scales = np.ones(40_000, dtype=np.float32)
+
+    tolerance, max_iterations = _binary_newton_solver_controls(
+        standardized,
+        solver_tolerance=1e-6,
+        maximum_linear_solver_iterations=1024,
+    )
+
+    assert tolerance == 5e-3
+    assert max_iterations == 96
+
+
+def test_binary_posterior_uses_inexact_solver_controls_before_final_solve(monkeypatch):
+    sample_count, variant_count = 8, 6
+    genotype_values = np.array(
+        [
+            [0.0, 1.0, 2.0, 0.0, 1.0, 2.0],
+            [1.0, 0.0, 1.0, 2.0, 0.0, 1.0],
+            [2.0, 1.0, 0.0, 1.0, 2.0, 0.0],
+            [0.0, 2.0, 1.0, 0.0, 2.0, 1.0],
+            [1.0, 1.0, 1.0, 2.0, 2.0, 2.0],
+            [2.0, 0.0, 2.0, 1.0, 0.0, 1.0],
+            [0.0, 1.0, 0.0, 2.0, 1.0, 2.0],
+            [1.0, 2.0, 1.0, 0.0, 1.0, 0.0],
+        ],
+        dtype=np.float32,
+    )
+    standardized = as_raw_genotype_matrix(genotype_values).standardized(
+        means=np.ones(variant_count, dtype=np.float32),
+        scales=np.ones(variant_count, dtype=np.float32),
+    )
+    standardized._dense_cache = standardized.materialize()
+    covariate_matrix = np.column_stack(
+        [
+            np.ones(sample_count, dtype=np.float32),
+            np.linspace(-1.0, 1.0, sample_count, dtype=np.float32),
+        ]
+    )
+    targets = np.array([1.0, 0.0, 1.0, 0.0, 1.0, 0.0, 1.0, 0.0], dtype=np.float32)
+    solver_settings: list[tuple[float, int, bool, bool]] = []
+
+    monkeypatch.setattr(
+        mixture_inference,
+        "_binary_newton_solver_controls",
+        lambda *args, **kwargs: (7e-4, 33),
+    )
+
+    def fake_restricted_posterior_state(
+        genotype_matrix,
+        covariate_matrix,
+        targets,
+        prior_variances,
+        diagonal_noise,
+        solver_tolerance,
+        maximum_linear_solver_iterations,
+        logdet_probe_count,
+        logdet_lanczos_steps,
+        exact_solver_matrix_limit,
+        posterior_variance_batch_size,
+        posterior_variance_probe_count,
+        random_seed,
+        compute_logdet,
+        compute_beta_variance=True,
+        initial_beta_guess=None,
+        sample_space_preconditioner_rank=256,
+    ):
+        solver_settings.append(
+            (
+                float(solver_tolerance),
+                int(maximum_linear_solver_iterations),
+                bool(compute_logdet),
+                bool(compute_beta_variance),
+            )
+        )
+        beta = np.zeros(prior_variances.shape[0], dtype=np.float64)
+        alpha = np.zeros(covariate_matrix.shape[1], dtype=np.float64)
+        sample_dim = targets.shape[0]
+        return (
+            alpha,
+            beta,
+            np.zeros_like(beta),
+            np.zeros(sample_dim, dtype=np.float64),
+            np.zeros(sample_dim, dtype=np.float64),
+            0.0,
+            0.0,
+            0.0,
+        )
+
+    monkeypatch.setattr(mixture_inference, "_restricted_posterior_state", fake_restricted_posterior_state)
+
+    _binary_posterior_state(
+        genotype_matrix=standardized,
+        covariate_matrix=covariate_matrix,
+        targets=targets,
+        prior_variances=np.ones(variant_count, dtype=np.float32),
+        alpha_init=np.zeros(covariate_matrix.shape[1], dtype=np.float32),
+        beta_init=np.zeros(variant_count, dtype=np.float32),
+        minimum_weight=1e-4,
+        max_iterations=1,
+        gradient_tolerance=1e-8,
+        initial_damping=1.0,
+        damping_increase_factor=10.0,
+        damping_decrease_factor=0.1,
+        success_threshold=0.25,
+        minimum_damping=1e-8,
+        solver_tolerance=1e-6,
+        maximum_linear_solver_iterations=1024,
+    )
+
+    assert solver_settings[:2] == [
+        (7e-4, 33, False, False),
+        (7e-4, 33, False, False),
+    ]
+    assert solver_settings[2] == (1e-6, 1024, True, True)
+
+
 def test_sample_space_preconditioner_matches_exact_covariance_inverse_at_full_rank():
     genotype_matrix = np.array(
         [
@@ -712,6 +901,7 @@ def test_gpu_sample_space_block_cg_matches_dense_solution(monkeypatch: pytest.Mo
     monkeypatch.setitem(sys.modules, "cupyx", fake_cupyx)
     monkeypatch.setitem(sys.modules, "cupyx.scipy", fake_cupyx_scipy)
     monkeypatch.setitem(sys.modules, "cupyx.scipy.linalg", fake_cupyx_scipy_linalg)
+    monkeypatch.setattr(mixture_inference, "_try_import_cupy", lambda: fake_cupy)
     monkeypatch.setattr(
         mixture_inference,
         "_sample_space_diagonal_preconditioner",
@@ -735,6 +925,7 @@ def test_gpu_sample_space_block_cg_matches_dense_solution(monkeypatch: pytest.Mo
         tolerance=1e-7,
         max_iterations=64,
         preconditioner=preconditioner,
+        batch_size=2,
     )
 
     covariance_matrix = np.diag(diagonal_noise) + genotype_matrix @ np.diag(prior_variances) @ genotype_matrix.T
@@ -1056,7 +1247,7 @@ def test_prefer_iterative_variant_space_targets_warm_started_cpu_binary_updates(
         genotype_matrix=standardized,
         sample_count=sample_count,
         variant_count=variant_count,
-        compute_beta_variance=False,
+        compute_beta_variance=True,
         compute_logdet=False,
         initial_beta_guess=np.zeros(variant_count, dtype=np.float64),
     )
@@ -1065,7 +1256,7 @@ def test_prefer_iterative_variant_space_targets_warm_started_cpu_binary_updates(
         sample_count=sample_count,
         variant_count=variant_count,
         compute_beta_variance=True,
-        compute_logdet=False,
+        compute_logdet=True,
         initial_beta_guess=np.zeros(variant_count, dtype=np.float64),
     )
     assert not _prefer_iterative_variant_space(

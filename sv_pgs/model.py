@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
+import hashlib
+import json
 from pathlib import Path
+import pickle
 from typing import Sequence
 
 import numpy as np
@@ -12,14 +15,19 @@ from sv_pgs.artifact import ModelArtifact, load_artifact, save_artifact
 from sv_pgs.config import ModelConfig, TraitType
 from sv_pgs.data import TieGroup, TieMap, VariantRecord, VariantStatistics, normalize_variant_records
 from sv_pgs.genotype import (
+    ConcatenatedRawGenotypeMatrix,
+    DenseRawGenotypeMatrix,
+    Int8RawGenotypeMatrix,
+    PlinkRawGenotypeMatrix,
     RawGenotypeMatrix,
+    StandardizedGenotypeMatrix,
     _gpu_materialization_budget_bytes,
     _try_import_cupy,
     _standardize_batch,
     as_raw_genotype_matrix,
     auto_batch_size,
 )
-from sv_pgs.inference import VariationalFitResult, fit_variational_em
+from sv_pgs.inference import VariationalFitCheckpoint, VariationalFitResult, fit_variational_em
 from sv_pgs.numeric import stable_sigmoid
 from sv_pgs.preprocessing import (
     Preprocessor,
@@ -45,7 +53,21 @@ class FittedState:
 
 
 GPU_EXACT_SOLVER_LIMIT = 1_024
-GPU_PRECONDITIONER_RANK_LIMIT = 128
+GPU_PRECONDITIONER_RANK_LIMIT = 1_024
+_FIT_STAGE_CACHE_DIRNAME = ".sv_pgs_cache"
+_FIT_STAGE_CACHE_SUBDIR = "fit_stage"
+_FIT_STAGE_CACHE_VERSION = 1
+
+
+@dataclass(slots=True)
+class _FitStageCachePaths:
+    key: str
+    cache_dir: Path
+    manifest_path: Path
+    active_indices_path: Path
+    tie_map_path: Path
+    reduced_raw_i8_path: Path
+    em_checkpoint_path: Path
 
 
 def _validate_fit_inputs(
@@ -88,6 +110,202 @@ def _validate_fit_inputs(
         raise ValueError("variant_stats.allele_frequencies must be finite and lie in [0.0, 1.0].")
     if np.any(np.asarray(variant_stats.support_counts) < 0):
         raise ValueError("variant_stats.support_counts must be non-negative.")
+
+
+def _fit_stage_cache_paths(
+    genotype_matrix: RawGenotypeMatrix,
+    allele_frequencies: np.ndarray,
+    means: np.ndarray,
+    scales: np.ndarray,
+    covariates: np.ndarray,
+    targets: np.ndarray,
+    config: ModelConfig,
+) -> _FitStageCachePaths | None:
+    raw_signature = _persistent_raw_signature(genotype_matrix)
+    if raw_signature is None:
+        return None
+    key_hasher = hashlib.sha256()
+    key_hasher.update(f"fit-stage-cache-v{_FIT_STAGE_CACHE_VERSION}".encode("utf-8"))
+    key_hasher.update(raw_signature.encode("utf-8"))
+    key_hasher.update(np.asarray([config.minimum_minor_allele_frequency], dtype=np.float64).tobytes())
+    _update_hash_with_array_bytes(key_hasher, np.asarray(allele_frequencies, dtype=np.float32))
+    _update_hash_with_array_bytes(key_hasher, np.asarray(means, dtype=np.float32))
+    _update_hash_with_array_bytes(key_hasher, np.asarray(scales, dtype=np.float32))
+    _update_hash_with_array_bytes(key_hasher, np.asarray(covariates, dtype=np.float32))
+    _update_hash_with_array_bytes(key_hasher, np.asarray(targets, dtype=np.float32))
+    key = key_hasher.hexdigest()[:24]
+    cache_dir = Path.cwd() / _FIT_STAGE_CACHE_DIRNAME / _FIT_STAGE_CACHE_SUBDIR
+    return _FitStageCachePaths(
+        key=key,
+        cache_dir=cache_dir,
+        manifest_path=cache_dir / f"{key}.manifest.json",
+        active_indices_path=cache_dir / f"{key}.active.npy",
+        tie_map_path=cache_dir / f"{key}.tie.pkl",
+        reduced_raw_i8_path=cache_dir / f"{key}.reduced_raw_i8.npy",
+        em_checkpoint_path=cache_dir / f"{key}.em.pkl",
+    )
+
+
+def _update_hash_with_array_bytes(hasher, array: np.ndarray) -> None:
+    contiguous = np.ascontiguousarray(array)
+    hasher.update(str(contiguous.dtype).encode("utf-8"))
+    hasher.update(np.asarray(contiguous.shape, dtype=np.int64).tobytes())
+    hasher.update(contiguous.view(np.uint8).tobytes())
+
+
+def _persistent_raw_signature(genotype_matrix: RawGenotypeMatrix) -> str | None:
+    if isinstance(genotype_matrix, PlinkRawGenotypeMatrix):
+        stat = genotype_matrix.bed_path.stat()
+        sample_hash = hashlib.sha256(np.asarray(genotype_matrix.sample_indices, dtype=np.int64).tobytes()).hexdigest()[:16]
+        return (
+            f"plink:{genotype_matrix.bed_path.resolve()}:{stat.st_size}:{stat.st_mtime_ns}:"
+            + f"{genotype_matrix.variant_count}:{sample_hash}"
+        )
+    if isinstance(genotype_matrix, ConcatenatedRawGenotypeMatrix):
+        child_signatures = [_persistent_raw_signature(child) for child in genotype_matrix.children]
+        if any(signature is None for signature in child_signatures):
+            return None
+        return "concat:" + "|".join(str(signature) for signature in child_signatures)
+    if isinstance(genotype_matrix, (Int8RawGenotypeMatrix, DenseRawGenotypeMatrix)):
+        backing_matrix = np.asanyarray(genotype_matrix.matrix)
+        if isinstance(backing_matrix, np.memmap):
+            backing_path = Path(str(backing_matrix.filename)).resolve()
+            stat = backing_path.stat()
+            return f"memmap:{backing_path}:{stat.st_size}:{stat.st_mtime_ns}:{backing_matrix.shape}:{backing_matrix.dtype}"
+    return None
+
+
+def _save_fit_stage_structure_cache(
+    cache_paths: _FitStageCachePaths,
+    active_variant_indices: np.ndarray,
+    reduced_tie_map: TieMap,
+) -> None:
+    cache_paths.cache_dir.mkdir(parents=True, exist_ok=True)
+    active_tmp = cache_paths.cache_dir / f"{cache_paths.key}.active.tmp.npy"
+    tie_tmp = cache_paths.cache_dir / f"{cache_paths.key}.tie.tmp.pkl"
+    np.save(active_tmp, np.asarray(active_variant_indices, dtype=np.int32))
+    with tie_tmp.open("wb") as handle:
+        pickle.dump(reduced_tie_map, handle, protocol=pickle.HIGHEST_PROTOCOL)
+    active_tmp.replace(cache_paths.active_indices_path)
+    tie_tmp.replace(cache_paths.tie_map_path)
+    _write_fit_stage_cache_manifest(
+        cache_paths=cache_paths,
+        active_variant_count=int(np.asarray(active_variant_indices).shape[0]),
+        reduced_variant_count=int(np.asarray(reduced_tie_map.kept_indices).shape[0]),
+        has_reduced_raw_i8=cache_paths.reduced_raw_i8_path.exists(),
+    )
+    log(
+        "fit-stage cache saved: "
+        + f"{cache_paths.cache_dir.name}/{cache_paths.key}.* "
+        + f"({int(np.asarray(active_variant_indices).shape[0])} active -> {int(np.asarray(reduced_tie_map.kept_indices).shape[0])} unique)"
+    )
+
+
+def _write_fit_stage_cache_manifest(
+    cache_paths: _FitStageCachePaths,
+    *,
+    active_variant_count: int,
+    reduced_variant_count: int,
+    has_reduced_raw_i8: bool,
+) -> None:
+    manifest_tmp = cache_paths.cache_dir / f"{cache_paths.key}.manifest.tmp.json"
+    manifest_payload = {
+        "version": _FIT_STAGE_CACHE_VERSION,
+        "active_variant_count": int(active_variant_count),
+        "reduced_variant_count": int(reduced_variant_count),
+        "has_reduced_raw_i8": bool(has_reduced_raw_i8),
+    }
+    manifest_tmp.write_text(json.dumps(manifest_payload, indent=2), encoding="utf-8")
+    manifest_tmp.replace(cache_paths.manifest_path)
+
+
+def _try_load_fit_stage_cache(
+    cache_paths: _FitStageCachePaths,
+    prepared_arrays,
+    standardized_genotypes: StandardizedGenotypeMatrix,
+) -> tuple[np.ndarray, TieMap, StandardizedGenotypeMatrix, bool] | None:
+    if not cache_paths.manifest_path.exists():
+        log(f"fit-stage cache miss (key={cache_paths.key})")
+        return None
+    if not cache_paths.active_indices_path.exists() or not cache_paths.tie_map_path.exists():
+        log(f"fit-stage cache incomplete (key={cache_paths.key})")
+        return None
+    try:
+        manifest_payload = json.loads(cache_paths.manifest_path.read_text(encoding="utf-8"))
+        if int(manifest_payload.get("version", -1)) != _FIT_STAGE_CACHE_VERSION:
+            log(f"fit-stage cache version mismatch (key={cache_paths.key}), rebuilding")
+            return None
+        active_variant_indices = np.load(cache_paths.active_indices_path, mmap_mode="r").astype(np.int32, copy=False)
+        with cache_paths.tie_map_path.open("rb") as handle:
+            reduced_tie_map = pickle.load(handle)
+        combined_indices = np.asarray(active_variant_indices[reduced_tie_map.kept_indices], dtype=np.int32)
+        if cache_paths.reduced_raw_i8_path.exists():
+            reduced_raw = Int8RawGenotypeMatrix(np.load(cache_paths.reduced_raw_i8_path, mmap_mode="r"))
+            if reduced_raw.shape != (standardized_genotypes.shape[0], combined_indices.shape[0]):
+                raise ValueError(
+                    f"reduced raw cache shape mismatch: {reduced_raw.shape} != {(standardized_genotypes.shape[0], combined_indices.shape[0])}"
+                )
+            reduced_genotypes = StandardizedGenotypeMatrix(
+                raw=reduced_raw,
+                means=np.asarray(prepared_arrays.means[combined_indices], dtype=np.float32),
+                scales=np.asarray(prepared_arrays.scales[combined_indices], dtype=np.float32),
+                variant_indices=np.arange(combined_indices.shape[0], dtype=np.int32),
+            )
+            log(f"fit-stage cache hit — loading from {cache_paths.cache_dir.name}/{cache_paths.key}.*")
+            return active_variant_indices, reduced_tie_map, reduced_genotypes, True
+        log(f"fit-stage structure cache hit — loading from {cache_paths.cache_dir.name}/{cache_paths.key}.*")
+        return active_variant_indices, reduced_tie_map, standardized_genotypes.subset(combined_indices), False
+    except Exception as exc:
+        log(f"fit-stage cache load failed ({exc}), rebuilding")
+        return None
+
+
+def _save_variational_checkpoint(
+    cache_paths: _FitStageCachePaths,
+    checkpoint: VariationalFitCheckpoint,
+) -> None:
+    checkpoint_tmp = cache_paths.cache_dir / f"{cache_paths.key}.em.tmp.pkl"
+    try:
+        cache_paths.cache_dir.mkdir(parents=True, exist_ok=True)
+        with checkpoint_tmp.open("wb") as handle:
+            pickle.dump(checkpoint, handle, protocol=pickle.HIGHEST_PROTOCOL)
+        checkpoint_tmp.replace(cache_paths.em_checkpoint_path)
+        log(
+            "variational checkpoint saved: "
+            + f"{cache_paths.cache_dir.name}/{cache_paths.key}.em.pkl "
+            + f"(completed_iterations={checkpoint.completed_iterations})"
+        )
+    except Exception as exc:
+        if checkpoint_tmp.exists():
+            checkpoint_tmp.unlink()
+        log(f"variational checkpoint save failed ({exc}); continuing without durable resume state")
+
+
+def _try_load_variational_checkpoint(
+    cache_paths: _FitStageCachePaths,
+) -> VariationalFitCheckpoint | None:
+    if not cache_paths.em_checkpoint_path.exists():
+        return None
+    try:
+        with cache_paths.em_checkpoint_path.open("rb") as handle:
+            checkpoint = pickle.load(handle)
+        if not isinstance(checkpoint, VariationalFitCheckpoint):
+            raise ValueError("variational checkpoint has unexpected type.")
+        log(
+            "variational checkpoint restored: "
+            + f"{cache_paths.cache_dir.name}/{cache_paths.key}.em.pkl "
+            + f"(completed_iterations={checkpoint.completed_iterations})"
+        )
+        return checkpoint
+    except Exception as exc:
+        log(f"variational checkpoint load failed ({exc}); discarding stale checkpoint")
+        _clear_variational_checkpoint(cache_paths)
+        return None
+
+
+def _clear_variational_checkpoint(cache_paths: _FitStageCachePaths) -> None:
+    if cache_paths.em_checkpoint_path.exists():
+        cache_paths.em_checkpoint_path.unlink()
 
 
 class BayesianPGS:
@@ -159,13 +377,37 @@ class BayesianPGS:
 
         log("creating standardized genotype view...")
         standardized_genotypes = raw_genotype_matrix.standardized(prepared_arrays.means, prepared_arrays.scales)
-
-        log("selecting active variant indices...")
-        active_variant_indices = select_active_variant_indices(
-            variant_records=normalized_records,
+        fit_stage_cache_paths = _fit_stage_cache_paths(
+            genotype_matrix=raw_genotype_matrix,
+            allele_frequencies=np.asarray([record.allele_frequency for record in normalized_records], dtype=np.float32),
+            means=prepared_arrays.means,
+            scales=prepared_arrays.scales,
+            covariates=prepared_arrays.covariates,
+            targets=prepared_arrays.targets,
             config=self.config,
         )
-        log(f"active variants: {len(active_variant_indices)} / {len(normalized_records)} ({100.0*len(active_variant_indices)/max(len(normalized_records),1):.1f}%)")
+        cached_fit_stage = (
+            None
+            if fit_stage_cache_paths is None
+            else _try_load_fit_stage_cache(
+                cache_paths=fit_stage_cache_paths,
+                prepared_arrays=prepared_arrays,
+                standardized_genotypes=standardized_genotypes,
+            )
+        )
+        if cached_fit_stage is None:
+            log("selecting active variant indices...")
+            active_variant_indices = select_active_variant_indices(
+                variant_records=normalized_records,
+                config=self.config,
+            )
+            log(f"active variants: {len(active_variant_indices)} / {len(normalized_records)} ({100.0*len(active_variant_indices)/max(len(normalized_records),1):.1f}%)")
+        else:
+            active_variant_indices, reduced_tie_map, reduced_genotypes, local_cache = cached_fit_stage
+            log(
+                "active/tie cache restored: "
+                + f"{len(active_variant_indices)} active -> {len(reduced_tie_map.kept_indices)} unique  mem={mem()}"
+            )
         if active_variant_indices.size == 0:
             log("no active variants remain after filtering; fitting covariates-only model...")
             reduced_validation_dense: tuple[np.ndarray, np.ndarray, np.ndarray] | None = None
@@ -196,23 +438,33 @@ class BayesianPGS:
                 nonzero_means=np.zeros(0, dtype=np.float32),
                 nonzero_scales=np.zeros(0, dtype=np.float32),
             )
+            if fit_stage_cache_paths is not None:
+                _clear_variational_checkpoint(fit_stage_cache_paths)
             log(f"coefficients: 0 non-zero out of {len(normalized_records)} total")
             log(f"=== MODEL FIT DONE ===  mem={mem()}")
             return self
 
         active_records = [normalized_records[int(variant_index)] for variant_index in active_variant_indices]
-        active_genotypes = standardized_genotypes.subset(active_variant_indices)
-        log("building tie map (detecting identical/negated genotype columns)...")
-        reduced_tie_map = build_tie_map(active_genotypes, active_records, self.config)
+        if cached_fit_stage is None:
+            active_genotypes = standardized_genotypes.subset(active_variant_indices)
+            log("building tie map (detecting identical/negated genotype columns)...")
+            reduced_tie_map = build_tie_map(active_genotypes, active_records, self.config)
+            if fit_stage_cache_paths is not None:
+                _save_fit_stage_structure_cache(
+                    cache_paths=fit_stage_cache_paths,
+                    active_variant_indices=active_variant_indices,
+                    reduced_tie_map=reduced_tie_map,
+                )
+            combined_indices = active_variant_indices[reduced_tie_map.kept_indices]
+            reduced_genotypes = standardized_genotypes.subset(combined_indices)
+            local_cache = False
+        else:
+            active_genotypes = None
         original_space_tie_map = _project_tie_map_to_original_space(
             reduced_tie_map=reduced_tie_map,
             active_variant_indices=active_variant_indices,
             original_variant_count=len(normalized_records),
         )
-        # Combine active + tie-map indices into one subset call to avoid
-        # intermediate GPU/RAM copies.
-        combined_indices = active_variant_indices[reduced_tie_map.kept_indices]
-        reduced_genotypes = standardized_genotypes.subset(combined_indices)
         log(f"tie map: {len(active_variant_indices)} active -> {len(reduced_tie_map.kept_indices)} unique ({len(reduced_tie_map.reduced_to_group)} groups)  mem={mem()}")
 
         reduced_validation = None
@@ -233,12 +485,21 @@ class BayesianPGS:
         in_memory = reduced_genotypes.try_materialize_gpu()
         if not in_memory:
             in_memory = reduced_genotypes.try_materialize()
-        local_cache = False
         if in_memory:
             # After materialization, reduced_genotypes no longer needs raw.
             reduced_genotypes.release_raw_storage()
         else:
-            local_cache = reduced_genotypes.try_cache_locally()
+            if not local_cache and fit_stage_cache_paths is not None:
+                local_cache = reduced_genotypes.try_cache_persistently(fit_stage_cache_paths.reduced_raw_i8_path)
+                if local_cache:
+                    _write_fit_stage_cache_manifest(
+                        cache_paths=fit_stage_cache_paths,
+                        active_variant_count=int(active_variant_indices.shape[0]),
+                        reduced_variant_count=int(reduced_tie_map.kept_indices.shape[0]),
+                        has_reduced_raw_i8=True,
+                    )
+            if not local_cache:
+                local_cache = reduced_genotypes.try_cache_locally()
             if not local_cache:
                 log("keeping reduced genotype matrix streaming (no RAM/GPU/local cache)  mem=" + mem())
         del raw_genotype_matrix, standardized_genotypes, active_genotypes
@@ -252,6 +513,11 @@ class BayesianPGS:
             f"on_gpu={reduced_genotypes._cupy_cache is not None}  "
             f"mem={mem()}"
         )
+        resume_checkpoint = (
+            None
+            if fit_stage_cache_paths is None
+            else _try_load_variational_checkpoint(fit_stage_cache_paths)
+        )
         fit_result = fit_variational_em(
             genotypes=reduced_genotypes,
             covariates=prepared_arrays.covariates,
@@ -260,7 +526,15 @@ class BayesianPGS:
             tie_map=reduced_tie_map,
             config=self.config,
             validation_data=reduced_validation,
+            resume_checkpoint=resume_checkpoint,
+            checkpoint_callback=(
+                None
+                if fit_stage_cache_paths is None
+                else lambda checkpoint: _save_variational_checkpoint(fit_stage_cache_paths, checkpoint)
+            ),
         )
+        if fit_stage_cache_paths is not None:
+            _clear_variational_checkpoint(fit_stage_cache_paths)
         log(f"variational EM converged in {len(fit_result.objective_history)} iterations  final_obj={fit_result.objective_history[-1]:.4f}  mem={mem()}")
 
         log("expanding coefficients from reduced to full space...")
@@ -450,9 +724,11 @@ def _runtime_tuned_config_for_fit(
     gpu_budget_bytes = _gpu_materialization_budget_bytes(cupy)
     cacheable_dense_variants = max(int(gpu_budget_bytes // max(sample_count * 4, 1)), 1)
     tuned_exact_solver_limit = min(int(config.exact_solver_matrix_limit), GPU_EXACT_SOLVER_LIMIT)
+    max_gpu_preconditioner_rank = max(1, min(cacheable_dense_variants, GPU_PRECONDITIONER_RANK_LIMIT))
     tuned_preconditioner_rank = min(
         int(config.sample_space_preconditioner_rank),
-        GPU_PRECONDITIONER_RANK_LIMIT,
+        max_gpu_preconditioner_rank,
+        max(tuned_exact_solver_limit // 8, 1),
     )
     if (
         tuned_exact_solver_limit == int(config.exact_solver_matrix_limit)
