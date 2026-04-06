@@ -1554,9 +1554,11 @@ def _sample_space_nystrom_factor_gpu(
     cupy = _try_import_cupy()
     if cupy is None:
         return None
-    compute_cp_dtype = cupy.float64
+    compute_cp_dtype = _cupy_compute_dtype(cupy)
     sketch_rank = _sample_space_nystrom_rank(rank, genotype_matrix.shape[0])
     if sketch_rank <= 0:
+        return None
+    if not hasattr(cupy.linalg, "qr") or not hasattr(cupy, "abs") or not hasattr(cupy, "diag"):
         return None
     sketch_probes_gpu = cupy.asarray(
         _orthogonal_probe_matrix(
@@ -1994,6 +1996,21 @@ def _solve_sample_space_rhs_gpu(
     rhs_norm_sq = np.asarray(cp.sum(right_hand_side_gpu64 * right_hand_side_gpu64, axis=0, dtype=cp.float64), dtype=np.float64)
     convergence_threshold_sq = np.maximum(float(tolerance) * float(tolerance), float(tolerance) * float(tolerance) * rhs_norm_sq)
     mixed_precision_enabled = compute_cp_dtype == cp.float32
+    mixed_precision_failure: RuntimeError | None = None
+
+    def true_residual(solution_gpu):
+        residual_gpu64 = right_hand_side_gpu64 - _apply_sample_space_operator_gpu(
+            genotype_matrix=genotype_matrix,
+            prior_variances=prior_variances,
+            diagonal_noise=diagonal_noise,
+            matrix_gpu=solution_gpu,
+            batch_size=batch_size,
+            cp=cp,
+            dtype=cp.float64,
+        )
+        residual_norm_sq = np.asarray(cp.sum(residual_gpu64 * residual_gpu64, axis=0, dtype=cp.float64), dtype=np.float64)
+        return residual_gpu64, residual_norm_sq
+
     if not mixed_precision_enabled:
         solution_gpu64 = _solve_sample_space_rhs_gpu_inner(
             genotype_matrix=genotype_matrix,
@@ -2009,16 +2026,7 @@ def _solve_sample_space_rhs_gpu(
         )
         if solution_gpu64.ndim == 1:
             solution_gpu64 = solution_gpu64[:, None]
-        residual_gpu64 = right_hand_side_gpu64 - _apply_sample_space_operator_gpu(
-            genotype_matrix=genotype_matrix,
-            prior_variances=prior_variances,
-            diagonal_noise=diagonal_noise,
-            matrix_gpu=solution_gpu64,
-            batch_size=batch_size,
-            cp=cp,
-            dtype=cp.float64,
-        )
-        residual_norm_sq = np.asarray(cp.sum(residual_gpu64 * residual_gpu64, axis=0, dtype=cp.float64), dtype=np.float64)
+        _, residual_norm_sq = true_residual(solution_gpu64)
         final_residual = float(np.max(residual_norm_sq))
         final_threshold = float(np.max(convergence_threshold_sq))
         if final_residual > final_threshold:
@@ -2034,51 +2042,66 @@ def _solve_sample_space_rhs_gpu(
     inner_tolerance = max(float(tolerance), 1e-4)
     max_refinement_steps = 4
     for refinement_index in range(max_refinement_steps):
-        residual_gpu64 = right_hand_side_gpu64 - _apply_sample_space_operator_gpu(
-            genotype_matrix=genotype_matrix,
-            prior_variances=prior_variances,
-            diagonal_noise=diagonal_noise,
-            matrix_gpu=solution_gpu64,
-            batch_size=batch_size,
-            cp=cp,
-            dtype=cp.float64,
-        )
-        residual_norm_sq = np.asarray(cp.sum(residual_gpu64 * residual_gpu64, axis=0, dtype=cp.float64), dtype=np.float64)
+        residual_gpu64, residual_norm_sq = true_residual(solution_gpu64)
         if np.all(residual_norm_sq <= convergence_threshold_sq):
             solution = np.asarray(solution_gpu64.get() if hasattr(solution_gpu64, "get") else solution_gpu64, dtype=np.float64)
             return solution[:, 0] if vector_input else solution
+        try:
+            correction_gpu64 = _solve_sample_space_rhs_gpu_inner(
+                genotype_matrix=genotype_matrix,
+                prior_variances=prior_variances,
+                diagonal_noise=diagonal_noise,
+                right_hand_side_gpu=residual_gpu64,
+                tolerance=inner_tolerance,
+                max_iterations=max_iterations,
+                preconditioner=preconditioner,
+                batch_size=batch_size,
+                cp=cp,
+                compute_cp_dtype=compute_cp_dtype,
+            )
+        except RuntimeError as exc:
+            mixed_precision_failure = exc
+            break
+        if correction_gpu64.ndim == 1:
+            correction_gpu64 = correction_gpu64[:, None]
+        solution_gpu64 += correction_gpu64
+    residual_gpu64, residual_norm_sq = true_residual(solution_gpu64)
+    if np.any(residual_norm_sq > convergence_threshold_sq):
+        fallback_reason = (
+            str(mixed_precision_failure)
+            if mixed_precision_failure is not None
+            else "mixed-precision iterative refinement did not hit the float64 residual target"
+        )
+        log(f"      sample-space solve: retrying GPU CG in float64 ({fallback_reason})")
         correction_gpu64 = _solve_sample_space_rhs_gpu_inner(
             genotype_matrix=genotype_matrix,
             prior_variances=prior_variances,
             diagonal_noise=diagonal_noise,
             right_hand_side_gpu=residual_gpu64,
-            tolerance=inner_tolerance,
+            tolerance=float(tolerance),
             max_iterations=max_iterations,
             preconditioner=preconditioner,
             batch_size=batch_size,
             cp=cp,
-            compute_cp_dtype=compute_cp_dtype,
+            compute_cp_dtype=cp.float64,
         )
         if correction_gpu64.ndim == 1:
             correction_gpu64 = correction_gpu64[:, None]
         solution_gpu64 += correction_gpu64
-    residual_gpu64 = right_hand_side_gpu64 - _apply_sample_space_operator_gpu(
-        genotype_matrix=genotype_matrix,
-        prior_variances=prior_variances,
-        diagonal_noise=diagonal_noise,
-        matrix_gpu=solution_gpu64,
-        batch_size=batch_size,
-        cp=cp,
-        dtype=cp.float64,
-    )
-    residual_norm_sq = np.asarray(cp.sum(residual_gpu64 * residual_gpu64, axis=0, dtype=cp.float64), dtype=np.float64)
+        _, residual_norm_sq = true_residual(solution_gpu64)
     final_residual = float(np.max(residual_norm_sq))
     final_threshold = float(np.max(convergence_threshold_sq))
     if final_residual > final_threshold:
+        failure_suffix = (
+            f" last_mixed_precision_error={mixed_precision_failure}"
+            if mixed_precision_failure is not None
+            else ""
+        )
         raise RuntimeError(
             "GPU conjugate-gradient solve failed to converge after iterative refinement: "
             + f"residual={final_residual:.2e} threshold={final_threshold:.2e} "
             + f"iterations={max_iterations} refinement_steps={max_refinement_steps}"
+            + failure_suffix
         )
     solution = np.asarray(solution_gpu64.get() if hasattr(solution_gpu64, "get") else solution_gpu64, dtype=np.float64)
     return solution[:, 0] if vector_input else solution

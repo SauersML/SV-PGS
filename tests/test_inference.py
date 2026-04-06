@@ -482,6 +482,86 @@ def test_cpu_sample_space_solver_uses_single_streaming_operator_pass(monkeypatch
     np.testing.assert_allclose(solved, expected_solution, atol=1e-7, rtol=1e-7)
 
 
+def test_restricted_posterior_sample_space_merges_probe_rhs(monkeypatch: pytest.MonkeyPatch):
+    sample_count, variant_count = 6, 7
+    genotype_values = np.array(
+        [
+            [0.0, 1.0, 2.0, 0.0, 1.0, 2.0, 0.0],
+            [1.0, 0.0, 1.0, 2.0, 0.0, 1.0, 2.0],
+            [2.0, 1.0, 0.0, 1.0, 2.0, 0.0, 1.0],
+            [1.0, 2.0, 1.0, 0.0, 1.0, 2.0, 1.0],
+            [0.0, 1.0, 1.0, 2.0, 1.0, 0.0, 2.0],
+            [2.0, 0.0, 2.0, 1.0, 0.0, 2.0, 1.0],
+        ],
+        dtype=np.float32,
+    )
+    standardized = as_raw_genotype_matrix(genotype_values).standardized(
+        means=np.mean(genotype_values, axis=0, dtype=np.float32),
+        scales=np.std(genotype_values, axis=0, dtype=np.float32) + 1e-3,
+    )
+    covariate_matrix = np.column_stack(
+        [
+            np.ones(sample_count, dtype=np.float64),
+            np.linspace(-1.0, 1.0, sample_count, dtype=np.float64),
+        ]
+    )
+    targets = np.linspace(-0.5, 0.75, sample_count, dtype=np.float64)
+    prior_variances = np.linspace(0.5, 1.1, variant_count, dtype=np.float64)
+    diagonal_noise = np.linspace(0.8, 1.3, sample_count, dtype=np.float64)
+    solve_rhs_shapes: list[tuple[int, int]] = []
+
+    monkeypatch.setattr(
+        mixture_inference,
+        "_sample_space_preconditioner",
+        lambda **kwargs: np.ones(sample_count, dtype=np.float64),
+    )
+    monkeypatch.setattr(mixture_inference, "stochastic_logdet", lambda *args, **kwargs: 0.0)
+
+    def fake_solve_sample_space_rhs_cpu(
+        genotype_matrix,
+        prior_variances,
+        diagonal_noise,
+        right_hand_side,
+        tolerance,
+        max_iterations,
+        preconditioner,
+        batch_size,
+    ):
+        rhs = np.asarray(right_hand_side, dtype=np.float64)
+        if rhs.ndim == 1:
+            rhs = rhs[:, None]
+        solve_rhs_shapes.append(rhs.shape)
+        return rhs
+
+    monkeypatch.setattr(mixture_inference, "_solve_sample_space_rhs_cpu", fake_solve_sample_space_rhs_cpu)
+
+    alpha, beta, beta_variance, projected_targets, linear_predictor, *_ = mixture_inference._restricted_posterior_state(
+        genotype_matrix=standardized,
+        covariate_matrix=covariate_matrix,
+        targets=targets,
+        prior_variances=prior_variances,
+        diagonal_noise=diagonal_noise,
+        solver_tolerance=1e-6,
+        maximum_linear_solver_iterations=16,
+        logdet_probe_count=2,
+        logdet_lanczos_steps=4,
+        exact_solver_matrix_limit=2,
+        posterior_variance_batch_size=3,
+        posterior_variance_probe_count=5,
+        random_seed=7,
+        compute_logdet=False,
+        compute_beta_variance=True,
+        sample_space_preconditioner_rank=0,
+    )
+
+    assert solve_rhs_shapes == [(sample_count, 1 + covariate_matrix.shape[1] + 5)]
+    assert alpha.shape == (covariate_matrix.shape[1],)
+    assert beta.shape == (variant_count,)
+    assert beta_variance.shape == (variant_count,)
+    assert projected_targets.shape == (sample_count,)
+    assert linear_predictor.shape == (sample_count,)
+
+
 def test_binary_posterior_stops_immediately_after_tiny_reject_gain(random_generator, monkeypatch):
     sample_count, variant_count = 64, 6
     genotype_matrix = random_generator.standard_normal((sample_count, variant_count)).astype(np.float32)
@@ -828,7 +908,6 @@ def test_sample_space_preconditioner_gpu_path_matches_exact_covariance_inverse_a
     monkeypatch.setitem(sys.modules, "cupyx", fake_cupyx)
     monkeypatch.setitem(sys.modules, "cupyx.scipy", fake_cupyx_scipy)
     monkeypatch.setitem(sys.modules, "cupyx.scipy.linalg", fake_cupyx_scipy_linalg)
-    monkeypatch.setattr(mixture_inference, "_to_cupy_float64", lambda array: np.asarray(array, dtype=np.float64))
     monkeypatch.setattr(
         mixture_inference,
         "_sample_space_diagonal_preconditioner",
@@ -889,8 +968,6 @@ def test_sample_space_preconditioner_uses_operator_sketch_without_subset_materia
     monkeypatch.setitem(sys.modules, "cupyx", fake_cupyx)
     monkeypatch.setitem(sys.modules, "cupyx.scipy", fake_cupyx_scipy)
     monkeypatch.setitem(sys.modules, "cupyx.scipy.linalg", fake_cupyx_scipy_linalg)
-    monkeypatch.setattr(mixture_inference, "_to_cupy_float64", lambda array: np.asarray(array, dtype=np.float64))
-
     monkeypatch.setattr(
         type(standardized),
         "try_materialize_gpu_subset",
@@ -967,7 +1044,6 @@ def test_gpu_sample_space_block_cg_matches_dense_solution(monkeypatch: pytest.Mo
     monkeypatch.setitem(sys.modules, "cupyx.scipy", fake_cupyx_scipy)
     monkeypatch.setitem(sys.modules, "cupyx.scipy.linalg", fake_cupyx_scipy_linalg)
     monkeypatch.setattr(mixture_inference, "_try_import_cupy", lambda: fake_cupy)
-    monkeypatch.setattr(mixture_inference, "_to_cupy_float64", lambda array: np.asarray(array, dtype=np.float64))
     monkeypatch.setattr(
         mixture_inference,
         "_sample_space_diagonal_preconditioner",
@@ -1050,7 +1126,6 @@ def test_gpu_sample_space_block_cg_mixed_precision_refinement_matches_dense_solu
     monkeypatch.setitem(sys.modules, "cupyx.scipy", fake_cupyx_scipy)
     monkeypatch.setitem(sys.modules, "cupyx.scipy.linalg", fake_cupyx_scipy_linalg)
     monkeypatch.setattr(mixture_inference, "_try_import_cupy", lambda: fake_cupy)
-    monkeypatch.setattr(mixture_inference, "_to_cupy_float64", lambda array: np.asarray(array, dtype=np.float64))
     monkeypatch.setattr(mixture_inference, "_cupy_compute_dtype", lambda cupy_module: cupy_module.float32)
     monkeypatch.setattr(
         mixture_inference,

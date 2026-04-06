@@ -38,6 +38,7 @@ class LoadedDataset:
     targets: np.ndarray
     variant_records: list[VariantRecord]
     variant_stats: VariantStatistics | None = None
+    variant_stats_minimum_scale: float | None = None
 
 @dataclass(slots=True)
 class PipelineOutputs:
@@ -325,6 +326,7 @@ def _vcf_record_count_hint(reader: Any) -> int | None:
 
 def load_dataset_from_files(
     genotype_path: str | Path,
+    config: ModelConfig,
     sample_table_path: str | Path,
     target_column: str,
     covariate_columns: Sequence[str],
@@ -332,10 +334,8 @@ def load_dataset_from_files(
     genotype_format: str = "auto",
     sample_id_column: str = "auto",
     variant_metadata_path: str | Path | None = None,
-    config: ModelConfig | None = None,
 ) -> LoadedDataset:
     log(f"=== LOAD DATASET START === mem={mem()}")
-    resolved_config = ModelConfig() if config is None else config
 
     source_path = Path(genotype_path)
     resolved_format = _resolve_genotype_format(source_path, genotype_format)
@@ -396,6 +396,7 @@ def load_dataset_from_files(
         genotype_matrix, default_variants, variant_stats = _load_vcf_with_cache(
             source_path,
             keep_sample_indices=keep_indices,
+            config=config,
             mmap_mode="r",
         )
 
@@ -479,7 +480,7 @@ def load_dataset_from_files(
         log("computing variant statistics (single pass, JAX)...")
         variant_stats = compute_variant_statistics(
             raw_genotypes,
-            config=resolved_config,
+            config=config,
         )
         log("building PLINK variant defaults from pre-computed allele frequencies...")
         default_variants = _build_plink_variant_defaults_from_stats(source_path, variant_stats)
@@ -502,11 +503,13 @@ def load_dataset_from_files(
         targets=np.asarray(sample_table.targets, dtype=np.float32),
         variant_records=variant_records,
         variant_stats=variant_stats,
+        variant_stats_minimum_scale=(float(config.minimum_scale) if variant_stats is not None else None),
     )
 
 
 def load_multi_vcf_dataset_from_files(
     genotype_paths: Sequence[str | Path],
+    config: ModelConfig,
     sample_table_path: str | Path,
     target_column: str,
     covariate_columns: Sequence[str],
@@ -576,6 +579,7 @@ def load_multi_vcf_dataset_from_files(
         genotype_matrix, chromosome_variants, chromosome_stats = _load_vcf_with_cache(
             source_path,
             keep_sample_indices=keep_sample_indices,
+            config=config,
             mmap_mode="r",
         )
         raw_matrices.append(as_raw_genotype_matrix(genotype_matrix))
@@ -612,6 +616,7 @@ def load_multi_vcf_dataset_from_files(
         targets=np.asarray(sample_table.targets, dtype=np.float32),
         variant_records=variant_records,
         variant_stats=variant_stats,
+        variant_stats_minimum_scale=float(config.minimum_scale),
     )
 
 
@@ -637,6 +642,16 @@ def run_training_pipeline(
     log(f"=== TRAINING PIPELINE START ===  samples={len(dataset.sample_ids)}  variants={dataset.genotypes.shape[1]}  trait={config.trait_type.value}  mem={mem()}")
     destination = Path(output_dir)
     destination.mkdir(parents=True, exist_ok=True)
+
+    if dataset.variant_stats is not None:
+        if dataset.variant_stats_minimum_scale is None:
+            raise ValueError("dataset.variant_stats_minimum_scale must be set when variant_stats are provided.")
+        if float(dataset.variant_stats_minimum_scale) != float(config.minimum_scale):
+            raise ValueError(
+                "dataset.variant_stats were computed with minimum_scale="
+                + f"{dataset.variant_stats_minimum_scale:.6g}, but run_training_pipeline received minimum_scale="
+                + f"{config.minimum_scale:.6g}. Reload the dataset with the same config."
+            )
 
     log("fitting Bayesian PGS model...")
     model = BayesianPGS(config).fit(
@@ -863,12 +878,13 @@ def _cache_file_fingerprint(path: Path, sample_bytes: int = 1_048_576) -> bytes:
     return h.digest()
 
 
-def _vcf_cache_key(vcf_path: Path, keep_sample_indices: np.ndarray | None) -> str:
+def _vcf_cache_key(vcf_path: Path, keep_sample_indices: np.ndarray | None, config: ModelConfig) -> str:
     """Compute a hex digest that uniquely identifies a VCF + sample-subset."""
     h = hashlib.sha256()
     h.update(f"v{_CACHE_VERSION}:".encode())
     h.update(str(vcf_path.resolve()).encode())
     h.update(_cache_file_fingerprint(vcf_path))
+    h.update(f"minimum_scale={config.minimum_scale:.17g}".encode())
     if keep_sample_indices is not None:
         h.update(keep_sample_indices.tobytes())
     return h.hexdigest()[:24]
@@ -878,9 +894,9 @@ def _vcf_cache_dir(vcf_path: Path) -> Path:
     return vcf_path.resolve().parent / _CACHE_DIR_NAME
 
 
-def _vcf_cache_paths(vcf_path: Path, keep_sample_indices: np.ndarray | None) -> _VcfCachePaths:
+def _vcf_cache_paths(vcf_path: Path, keep_sample_indices: np.ndarray | None, config: ModelConfig) -> _VcfCachePaths:
     cache_dir = _vcf_cache_dir(vcf_path)
-    key = _vcf_cache_key(vcf_path, keep_sample_indices)
+    key = _vcf_cache_key(vcf_path, keep_sample_indices, config)
     return _VcfCachePaths(
         key=key,
         cache_dir=cache_dir,
@@ -1036,11 +1052,12 @@ def _upgrade_legacy_vcf_cache_bundle(
 def _load_vcf_from_cache(
     vcf_path: Path,
     keep_sample_indices: np.ndarray | None,
+    config: ModelConfig,
     *,
     mmap_mode: Literal["r", "r+", "w+", "c"] | None = None,
 ) -> tuple[np.ndarray, list[_VariantDefaults], VariantStatistics] | None:
     """Try to load cached VCF parse results. Returns None on miss."""
-    paths = _vcf_cache_paths(vcf_path, keep_sample_indices)
+    paths = _vcf_cache_paths(vcf_path, keep_sample_indices, config)
     if not paths.cache_dir.exists():
         return None
 
@@ -1241,6 +1258,7 @@ def _region_parse_worker(args: tuple) -> tuple[int, str]:
 def precache_vcfs_parallel(
     vcf_paths: list[Path],
     keep_sample_indices: np.ndarray,
+    config: ModelConfig,
 ) -> None:
     """Parse and cache multiple VCFs in parallel, auto-detecting CPU count.
 
@@ -1260,7 +1278,7 @@ def precache_vcfs_parallel(
     # Skip already-cached VCFs (compatible with existing .npy cache)
     uncached: list[Path] = []
     for vcf_path in vcf_paths:
-        cache_paths = _vcf_cache_paths(vcf_path, keep_sample_indices)
+        cache_paths = _vcf_cache_paths(vcf_path, keep_sample_indices, config)
         if not _is_vcf_cache_bundle_complete(cache_paths):
             uncached.append(vcf_path)
 
@@ -1298,7 +1316,7 @@ def precache_vcfs_parallel(
         chrom, chrom_length, _ = vcf_info[vcf_path]
         cache_dir = _vcf_cache_dir(vcf_path)
         cache_dir.mkdir(parents=True, exist_ok=True)
-        key = _vcf_cache_key(vcf_path, keep_sample_indices)
+        key = _vcf_cache_key(vcf_path, keep_sample_indices, config)
         tmp_dir = cache_dir / f"{key}.tmp_parallel"
         tmp_dir.mkdir(parents=True, exist_ok=True)
 
@@ -1422,11 +1440,11 @@ def precache_vcfs_parallel(
         afs = np.clip(means / 2.0, 0.0, 1.0).astype(np.float32)
         css = np.maximum(col_sum_sq.astype(np.float64) - col_sums.astype(np.float64) ** 2 / safe_n, 0.0)
         scales = np.sqrt(css / max(actual_n_keep, 1)).astype(np.float32)
-        scales = np.where(scales < 1e-6, 1.0, scales)
+        scales = np.where(scales < config.minimum_scale, 1.0, scales)
         inc_stats_obj = VariantStatistics(means=means, scales=scales, allele_frequencies=afs, support_counts=support_arr)
 
         # Save as final .npy cache
-        _save_vcf_to_cache(vcf_path, keep_sample_indices, inc_matrix, inc_variants, inc_stats_obj)
+        _save_vcf_to_cache(vcf_path, keep_sample_indices, inc_matrix, inc_variants, inc_stats_obj, config=config)
         del inc_matrix
 
         # Clean up incremental files
@@ -1441,6 +1459,7 @@ def precache_vcfs_parallel(
 def _load_vcf_with_cache(
     vcf_path: Path,
     keep_sample_indices: np.ndarray,
+    config: ModelConfig,
     *,
     mmap_mode: Literal["r", "r+", "w+", "c"] | None,
 ) -> tuple[np.ndarray, list[_VariantDefaults], VariantStatistics]:
@@ -1449,6 +1468,7 @@ def _load_vcf_with_cache(
     cached = _load_vcf_from_cache(
         vcf_path,
         keep_sample_indices=keep_sample_indices,
+        config=config,
         mmap_mode=effective_mmap_mode,
     )
     if cached is not None:
@@ -1457,9 +1477,9 @@ def _load_vcf_with_cache(
     # Parse with incremental checkpointing
     cache_dir = _vcf_cache_dir(vcf_path)
     cache_dir.mkdir(parents=True, exist_ok=True)
-    key = _vcf_cache_key(vcf_path, keep_sample_indices)
+    key = _vcf_cache_key(vcf_path, keep_sample_indices, config)
     genotype_matrix, variants, variant_stats = _load_vcf_incremental(
-        vcf_path, keep_sample_indices, cache_dir, key, mmap_mode=effective_mmap_mode,
+        vcf_path, keep_sample_indices, cache_dir, key, config=config, mmap_mode=effective_mmap_mode,
     )
     return genotype_matrix, variants, variant_stats
 
@@ -1470,6 +1490,7 @@ def _load_vcf_incremental(
     cache_dir: Path,
     key: str,
     *,
+    config: ModelConfig,
     mmap_mode: Literal["r", "r+", "w+", "c"],
 ) -> tuple[np.ndarray, list[_VariantDefaults], VariantStatistics]:
     """Parse VCF with incremental checkpointing. Resumes from last checkpoint if interrupted."""
@@ -1701,7 +1722,7 @@ def _load_vcf_incremental(
     allele_freqs = np.clip(means_arr / 2.0, 0.0, 1.0).astype(np.float32)
     centered_sum_sq = np.maximum(col_sum_sq.astype(np.float64) - col_sums.astype(np.float64) ** 2 / safe_n_valid, 0.0)
     scales_arr = np.sqrt(centered_sum_sq / max(n_keep, 1)).astype(np.float32)
-    scales_arr = np.where(scales_arr < 1e-6, 1.0, scales_arr)
+    scales_arr = np.where(scales_arr < config.minimum_scale, 1.0, scales_arr)
 
     variant_stats = VariantStatistics(
         means=means_arr,
@@ -1723,6 +1744,7 @@ def _load_vcf_incremental(
         genotype_matrix=incremental_matrix,
         variants=variants,
         variant_stats=variant_stats,
+        config=config,
     )
     del incremental_matrix
 
@@ -1736,6 +1758,7 @@ def _load_vcf_incremental(
     cached = _load_vcf_from_cache(
         vcf_path=vcf_path,
         keep_sample_indices=keep_sample_indices,
+        config=config,
         mmap_mode=mmap_mode,
     )
     if cached is None:
@@ -1758,11 +1781,17 @@ def _save_vcf_to_cache(
     genotype_matrix: np.ndarray,
     variants: list[_VariantDefaults],
     variant_stats: VariantStatistics,
+    config: ModelConfig | None = None,
     *,
     cache_paths: _VcfCachePaths | None = None,
 ) -> None:
     """Persist parsed VCF results to disk cache."""
-    paths = _vcf_cache_paths(vcf_path, keep_sample_indices) if cache_paths is None else cache_paths
+    if cache_paths is None:
+        if config is None:
+            raise ValueError("config is required when cache_paths is not provided.")
+        paths = _vcf_cache_paths(vcf_path, keep_sample_indices, config)
+    else:
+        paths = cache_paths
 
     try:
         paths.cache_dir.mkdir(parents=True, exist_ok=True)
