@@ -260,57 +260,7 @@ def select_active_variant_indices(
     if standardized_matrix.shape[0] != np.asarray(covariates).shape[0]:
         raise ValueError("covariates sample count must match standardized genotypes.")
 
-    maximum_active = min(
-        int(config.maximum_active_variants),
-        int(standardized_matrix.shape[0]),
-        int(maf_kept.shape[0]),
-    )
-    if maximum_active >= maf_kept.shape[0]:
-        log(f"  active screening skipped: budget keeps all post-MAF variants ({maximum_active})")
-        return maf_kept
-
-    maf_kept_matrix = standardized_matrix.subset(maf_kept)
-    marginal_scores = _covariate_adjusted_marginal_scores(
-        standardized_genotypes=maf_kept_matrix,
-        covariates=covariates,
-        targets=targets,
-        trait_type=trait_type,
-        config=config,
-    )
-    structural_mask = np.asarray(
-        [variant_records[int(variant_index)].variant_class in STRUCTURAL_VARIANT_CLASSES for variant_index in maf_kept],
-        dtype=bool,
-    )
-    structural_positions = np.flatnonzero(structural_mask)
-    if structural_positions.shape[0] >= maximum_active:
-        selected_positions = structural_positions[
-            _top_k_indices(marginal_scores[structural_positions], maximum_active)
-        ]
-    else:
-        remaining_budget = maximum_active - int(structural_positions.shape[0])
-        non_structural_positions = np.flatnonzero(~structural_mask)
-        selected_parts: list[np.ndarray] = []
-        if structural_positions.size > 0:
-            selected_parts.append(structural_positions)
-        if remaining_budget > 0 and non_structural_positions.size > 0:
-            selected_parts.append(
-                non_structural_positions[
-                    _top_k_indices(marginal_scores[non_structural_positions], remaining_budget)
-                ]
-            )
-        selected_positions = (
-            np.asarray(np.concatenate(selected_parts), dtype=np.int32)
-            if selected_parts
-            else np.zeros(0, dtype=np.int32)
-        )
-
-    selected_positions = np.sort(np.asarray(selected_positions, dtype=np.int32))
-    selected_indices = maf_kept[selected_positions]
-    log(
-        f"  active screening kept {selected_indices.shape[0]}/{maf_kept.shape[0]} post-MAF variants "
-        + f"(budget={maximum_active}, structural={int(np.sum(structural_mask[selected_positions]))})"
-    )
-    return selected_indices
+    return maf_kept
 
 
 def _covariate_adjusted_marginal_scores(

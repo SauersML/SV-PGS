@@ -11,6 +11,7 @@ from sv_pgs.genotype import RawGenotypeBatch, RawGenotypeMatrix, as_raw_genotype
 from sv_pgs.inference import VariationalFitResult
 from sv_pgs.model import (
     _raw_standardized_subset_matvec,
+    _runtime_tuned_config_for_fit,
     _tie_group_export_weights,
     _training_records_from_stats,
 )
@@ -102,6 +103,28 @@ def test_binary_model_fit_roundtrip_and_keeps_all_variants(tmp_path):
         model.decision_function(genotype_matrix, covariate_matrix),
         atol=1e-5,
     )
+
+
+def test_runtime_tuned_config_for_t4_caps_solver_from_gpu_budget(monkeypatch):
+    raw_genotypes = as_raw_genotype_matrix(np.zeros((1_000, 50_000), dtype=np.float32))
+    config = ModelConfig(
+        trait_type=TraitType.BINARY,
+        exact_solver_matrix_limit=2_048,
+        sample_space_preconditioner_rank=256,
+    )
+
+    monkeypatch.setattr(model_module, "_try_import_cupy", lambda: object())
+    monkeypatch.setattr(
+        model_module,
+        "_gpu_materialization_budget_bytes",
+        lambda _cupy: 1_000 * 4 * 10_000,
+    )
+
+    tuned_config, summary = _runtime_tuned_config_for_fit(config, raw_genotypes)
+
+    assert tuned_config.exact_solver_matrix_limit == 1_024
+    assert tuned_config.sample_space_preconditioner_rank == 128
+    assert summary is not None
 
 
 def test_benchmark_suite_runs_from_shared_trainer():

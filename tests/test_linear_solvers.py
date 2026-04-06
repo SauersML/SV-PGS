@@ -180,7 +180,7 @@ def test_small_symmetric_eigh_retries_with_jitter(monkeypatch):
 def test_solve_spd_system_uses_jax_cg_for_jax_compatible_operator(monkeypatch):
     calls: list[dict[str, object]] = []
 
-    def fake_cg(A, b, x0=None, *, tol=1e-5, atol=0.0, maxiter=None, M=None):
+    def fake_cg(_A, b, x0=None, *, tol=1e-5, atol=0.0, maxiter=None, M=None):
         calls.append(
             {
                 "shape": tuple(np.asarray(b).shape),

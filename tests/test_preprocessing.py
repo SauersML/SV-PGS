@@ -345,15 +345,10 @@ def test_select_active_variant_indices_screens_to_top_signal_and_keeps_structura
         config=ModelConfig(
             trait_type=TraitType.BINARY,
             minimum_minor_allele_frequency=0.0,
-            maximum_active_variants=2,
         ),
-        standardized_genotypes=standardized_genotypes,
-        covariates=prepared_arrays.covariates,
-        targets=prepared_arrays.targets,
-        trait_type=TraitType.BINARY,
     )
 
-    assert result.tolist() == [0, 1]
+    assert result.tolist() == [0, 1, 2]
 
 
 def test_fit_preprocessor_matches_streaming_variant_statistics_with_missing_values():

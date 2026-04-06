@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import sv_pgs._jax as jax_module
 from sv_pgs._jax import _is_turing_gpu
 
 
@@ -13,3 +14,8 @@ def test_turing_detection_uses_device_name() -> None:
 
 def test_non_turing_gpu_does_not_enable_workarounds() -> None:
     assert not _is_turing_gpu(device_names=("NVIDIA A100-SXM4-40GB",), compute_capabilities=("8.0",))
+
+
+def test_turing_gpu_disables_dense_jax_linear_algebra_preference(monkeypatch) -> None:
+    monkeypatch.setattr(jax_module, "turing_workarounds_enabled", lambda: True)
+    assert not jax_module.jax_dense_linear_algebra_preferred()

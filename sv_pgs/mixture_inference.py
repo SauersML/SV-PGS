@@ -53,7 +53,7 @@ The algorithm iterates three steps until convergence:
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Callable, Sequence
+from typing import Callable, Sequence, cast
 
 import sv_pgs._jax  # noqa: F401
 import jax.numpy as jnp
@@ -1109,23 +1109,43 @@ def _sample_space_operator(
     genotype_matrix: StandardizedGenotypeMatrix,
     prior_variances: np.ndarray,
     diagonal_noise: np.ndarray,
+    batch_size: int = 1024,
 ):
     compute_dtype = gpu_compute_jax_dtype()
+    compute_np_dtype = gpu_compute_numpy_dtype()
     diag_noise_jax = jnp.asarray(diagonal_noise, dtype=compute_dtype)
     prior_var_jax = jnp.asarray(prior_variances, dtype=compute_dtype)
+    diag_noise_np = np.asarray(diagonal_noise, dtype=compute_np_dtype)
+    prior_var_np = np.asarray(prior_variances, dtype=compute_np_dtype)
 
     def matvec(vector) -> jnp.ndarray:
         v = jnp.asarray(vector, dtype=compute_dtype)
+        if genotype_matrix._cupy_cache is None and not genotype_matrix.supports_jax_dense_ops():
+            vector_np = np.asarray(v, dtype=compute_np_dtype)
+            genotype_term = np.zeros(genotype_matrix.shape[0], dtype=compute_np_dtype)
+            for batch in genotype_matrix.iter_column_batches(batch_size=batch_size):
+                genotype_batch = np.asarray(batch.values, dtype=compute_np_dtype)
+                scaled_projection = prior_var_np[batch.variant_indices] * (genotype_batch.T @ vector_np)
+                genotype_term += genotype_batch @ scaled_projection
+            return jnp.asarray(diag_noise_np * vector_np + genotype_term, dtype=compute_dtype)
         projected = genotype_matrix.transpose_matvec(v)
         return diag_noise_jax * v + genotype_matrix.matvec(prior_var_jax * projected)
 
     def matmat(matrix) -> jnp.ndarray:
         matrix_jax = jnp.asarray(matrix, dtype=compute_dtype)
+        if genotype_matrix._cupy_cache is None and not genotype_matrix.supports_jax_dense_ops():
+            matrix_np = np.asarray(matrix_jax, dtype=compute_np_dtype)
+            genotype_term = np.zeros((genotype_matrix.shape[0], matrix_np.shape[1]), dtype=compute_np_dtype)
+            for batch in genotype_matrix.iter_column_batches(batch_size=batch_size):
+                genotype_batch = np.asarray(batch.values, dtype=compute_np_dtype)
+                scaled_projection = prior_var_np[batch.variant_indices, None] * (genotype_batch.T @ matrix_np)
+                genotype_term += genotype_batch @ scaled_projection
+            return jnp.asarray(diag_noise_np[:, None] * matrix_np + genotype_term, dtype=compute_dtype)
         # X^T @ M gives (p, k), scale by prior variance, then X @ result gives (n, k)
         projected = genotype_matrix.transpose_matmat(matrix_jax)  # (p, k)
         scaled = prior_var_jax[:, None] * projected  # (p, k)
-        genotype_term = genotype_matrix.matmat(scaled)
-        return diag_noise_jax[:, None] * matrix_jax + genotype_term
+        genotype_term_jax = genotype_matrix.matmat(scaled)
+        return diag_noise_jax[:, None] * matrix_jax + genotype_term_jax
 
     return build_linear_operator(
         shape=(genotype_matrix.shape[0], genotype_matrix.shape[0]),
@@ -1262,6 +1282,322 @@ def _sample_space_preconditioner(
         return jnp.asarray(weighted_rhs - correction, dtype=gpu_compute_jax_dtype())
 
     return apply_preconditioner_cpu
+
+
+def _sample_space_gpu_preconditioner(
+    genotype_matrix: StandardizedGenotypeMatrix,
+    prior_variances: np.ndarray,
+    diagonal_noise: np.ndarray,
+    batch_size: int,
+    rank: int,
+):
+    import cupy as cp
+    from cupyx.scipy.linalg import solve_triangular as cp_solve_triangular
+
+    diagonal_preconditioner = _sample_space_diagonal_preconditioner(
+        genotype_matrix=genotype_matrix,
+        prior_variances=prior_variances,
+        diagonal_noise=diagonal_noise,
+        batch_size=batch_size,
+    )
+    diagonal_preconditioner_gpu = cp.asarray(diagonal_preconditioner, dtype=cp.float32)
+
+    def apply_diagonal(right_hand_side_gpu):
+        if right_hand_side_gpu.ndim == 2:
+            return right_hand_side_gpu / diagonal_preconditioner_gpu[:, None]
+        return right_hand_side_gpu / diagonal_preconditioner_gpu
+
+    if rank <= 0:
+        return apply_diagonal
+    selected_rank = min(int(rank), int(genotype_matrix.shape[1]))
+    if selected_rank <= 0:
+        return apply_diagonal
+    selected_variant_indices = np.argpartition(
+        -np.asarray(prior_variances, dtype=np.float64),
+        kth=selected_rank - 1,
+    )[:selected_rank].astype(np.int32, copy=False)
+    selected_variant_indices.sort()
+    selected_gpu_genotypes = genotype_matrix.try_materialize_gpu_subset(selected_variant_indices)
+    if selected_gpu_genotypes is None:
+        return apply_diagonal
+
+    gpu_cache_source = "full" if genotype_matrix._cupy_cache is not None else "subset"
+    log(f"      sample-space preconditioner: GPU Woodbury rank={selected_rank} source={gpu_cache_source}")
+    weighted_selected_genotypes = selected_gpu_genotypes * cp.asarray(
+        np.sqrt(np.asarray(prior_variances[selected_variant_indices], dtype=np.float32)),
+        dtype=cp.float32,
+    )[None, :]
+    base_diagonal = cp.maximum(
+        diagonal_preconditioner_gpu - cp.sum(weighted_selected_genotypes * weighted_selected_genotypes, axis=1),
+        cp.float32(1e-8),
+    )
+    inverse_base_diagonal = 1.0 / base_diagonal
+    weighted_inverse_selected = inverse_base_diagonal[:, None] * weighted_selected_genotypes
+    low_rank_precision = cp.eye(selected_rank, dtype=cp.float32) + (
+        weighted_selected_genotypes.T @ weighted_inverse_selected
+    )
+    low_rank_cholesky = cp.linalg.cholesky(
+        low_rank_precision + cp.eye(selected_rank, dtype=cp.float32) * cp.float32(1e-4)
+    )
+
+    def apply_low_rank(right_hand_side_gpu):
+        if right_hand_side_gpu.ndim not in (1, 2):
+            raise ValueError("sample-space preconditioner expects a vector or matrix right-hand side.")
+        weighted_rhs = (
+            inverse_base_diagonal[:, None] * right_hand_side_gpu
+            if right_hand_side_gpu.ndim == 2
+            else inverse_base_diagonal * right_hand_side_gpu
+        )
+        correction_rhs = weighted_selected_genotypes.T @ weighted_rhs
+        correction = weighted_inverse_selected @ _gpu_cholesky_solve(
+            correction_rhs,
+            low_rank_cholesky,
+            cp_solve_triangular,
+        )
+        return weighted_rhs - correction
+
+    return apply_low_rank
+
+
+def _solve_sample_space_rhs_gpu(
+    genotype_matrix: StandardizedGenotypeMatrix,
+    prior_variances: np.ndarray,
+    diagonal_noise: np.ndarray,
+    right_hand_side: np.ndarray,
+    tolerance: float,
+    max_iterations: int,
+    preconditioner,
+) -> np.ndarray:
+    import cupy as cp
+
+    if genotype_matrix._cupy_cache is None:
+        raise RuntimeError("GPU sample-space solve requires a CuPy-resident genotype matrix.")
+    X_gpu = genotype_matrix._cupy_cache
+    prior_variances_gpu = cp.asarray(prior_variances, dtype=cp.float32)
+    diagonal_noise_gpu = cp.asarray(diagonal_noise, dtype=cp.float32)
+    right_hand_side_gpu = cp.asarray(right_hand_side, dtype=cp.float32)
+    vector_input = right_hand_side_gpu.ndim == 1
+    if vector_input:
+        right_hand_side_gpu = right_hand_side_gpu[:, None]
+    elif right_hand_side_gpu.ndim != 2:
+        raise ValueError("GPU sample-space solve expects a vector or matrix right-hand side.")
+
+    def apply_operator(matrix_gpu):
+        return diagonal_noise_gpu[:, None] * matrix_gpu + X_gpu @ (
+            prior_variances_gpu[:, None] * (X_gpu.T @ matrix_gpu)
+        )
+
+    residual_refresh_interval = 32
+    tol_sq = float(tolerance) * float(tolerance)
+    solution_gpu = preconditioner(right_hand_side_gpu)
+    residual_gpu = right_hand_side_gpu - apply_operator(solution_gpu)
+    residual_norm_sq = np.asarray(cp.sum(residual_gpu * residual_gpu, axis=0), dtype=np.float64)
+    rhs_norm_sq = np.asarray(cp.sum(right_hand_side_gpu * right_hand_side_gpu, axis=0), dtype=np.float64)
+    convergence_threshold_sq = np.maximum(tol_sq, tol_sq * np.maximum(residual_norm_sq, rhs_norm_sq))
+    converged = residual_norm_sq <= convergence_threshold_sq
+    if np.all(converged):
+        solution = np.asarray(solution_gpu.get() if hasattr(solution_gpu, "get") else solution_gpu, dtype=np.float64)
+        return solution[:, 0] if vector_input else solution
+
+    preconditioned_residual_gpu = preconditioner(residual_gpu)
+    search_direction_gpu = preconditioned_residual_gpu
+    residual_dot = np.asarray(cp.sum(residual_gpu * preconditioned_residual_gpu, axis=0), dtype=np.float64)
+    for iteration_index in range(max_iterations):
+        active_columns = np.flatnonzero(~converged).astype(np.int32, copy=False)
+        if active_columns.size == 0:
+            break
+        masked_search_gpu = search_direction_gpu[:, active_columns]
+        operator_search_gpu = apply_operator(masked_search_gpu)
+        step_denom = np.asarray(cp.sum(masked_search_gpu * operator_search_gpu, axis=0), dtype=np.float64)
+        if np.any(~np.isfinite(step_denom) | (step_denom <= 0.0)):
+            raise RuntimeError("GPU conjugate-gradient operator is not positive definite.")
+        step_scale = residual_dot[active_columns] / step_denom
+        step_scale_gpu = cp.asarray(step_scale, dtype=cp.float32)
+        solution_gpu[:, active_columns] += masked_search_gpu * step_scale_gpu[None, :]
+        residual_gpu[:, active_columns] -= operator_search_gpu * step_scale_gpu[None, :]
+        if (iteration_index + 1) % residual_refresh_interval == 0:
+            residual_gpu[:, active_columns] = right_hand_side_gpu[:, active_columns] - apply_operator(
+                solution_gpu[:, active_columns]
+            )
+        residual_norm_sq[active_columns] = np.asarray(
+            cp.sum(residual_gpu[:, active_columns] * residual_gpu[:, active_columns], axis=0),
+            dtype=np.float64,
+        )
+        converged = residual_norm_sq <= convergence_threshold_sq
+        if np.all(converged):
+            break
+        refreshed_residual_gpu = residual_gpu[:, active_columns]
+        refreshed_preconditioned_gpu = preconditioner(refreshed_residual_gpu)
+        updated_residual_dot_active = np.asarray(
+            cp.sum(refreshed_residual_gpu * refreshed_preconditioned_gpu, axis=0),
+            dtype=np.float64,
+        )
+        beta_active = updated_residual_dot_active / np.maximum(residual_dot[active_columns], 1e-30)
+        if np.any(~np.isfinite(beta_active) | (beta_active < 0.0)):
+            raise RuntimeError("GPU conjugate-gradient preconditioner produced an invalid update.")
+        beta_active_gpu = cp.asarray(beta_active, dtype=cp.float32)
+        search_direction_gpu[:, active_columns] = refreshed_preconditioned_gpu + (
+            search_direction_gpu[:, active_columns] * beta_active_gpu[None, :]
+        )
+        residual_dot[active_columns] = updated_residual_dot_active
+
+    final_residual = float(np.max(residual_norm_sq))
+    final_threshold = float(np.max(convergence_threshold_sq))
+    if final_residual > final_threshold:
+        raise RuntimeError(
+            "GPU conjugate-gradient solve failed to converge: "
+            + f"residual={final_residual:.2e} threshold={final_threshold:.2e} "
+            + f"iterations={max_iterations}"
+        )
+    solution = np.asarray(solution_gpu.get() if hasattr(solution_gpu, "get") else solution_gpu, dtype=np.float64)
+    return solution[:, 0] if vector_input else solution
+
+
+def _solve_sample_space_rhs_cpu(
+    genotype_matrix: StandardizedGenotypeMatrix,
+    prior_variances: np.ndarray,
+    diagonal_noise: np.ndarray,
+    right_hand_side: np.ndarray,
+    tolerance: float,
+    max_iterations: int,
+    preconditioner: Callable[[np.ndarray], np.ndarray | jnp.ndarray] | Callable[[jnp.ndarray], np.ndarray | jnp.ndarray] | np.ndarray | jnp.ndarray,
+    batch_size: int,
+) -> np.ndarray:
+    import time
+
+    rhs = np.asarray(right_hand_side, dtype=np.float64)
+    vector_input = rhs.ndim == 1
+    if vector_input:
+        rhs = rhs[:, None]
+    elif rhs.ndim != 2:
+        raise ValueError("CPU sample-space solve expects a vector or matrix right-hand side.")
+
+    diagonal_noise_array = np.asarray(diagonal_noise, dtype=np.float64)
+    prior_variances_array = np.asarray(prior_variances, dtype=np.float64)
+
+    def apply_operator(matrix: np.ndarray) -> np.ndarray:
+        projected = np.asarray(
+            genotype_matrix.transpose_matmat(matrix, batch_size=batch_size),
+            dtype=np.float64,
+        )
+        scaled = prior_variances_array[:, None] * projected
+        genotype_term = np.asarray(
+            genotype_matrix.matmat(scaled, batch_size=batch_size),
+            dtype=np.float64,
+        )
+        return diagonal_noise_array[:, None] * matrix + genotype_term
+
+    residual_refresh_interval = 32
+    tol_sq = float(tolerance) * float(tolerance)
+    apply_preconditioner = cast(Callable[[np.ndarray], np.ndarray | jnp.ndarray], preconditioner) if callable(preconditioner) else None
+    solution = (
+        np.asarray(apply_preconditioner(rhs), dtype=np.float64)
+        if apply_preconditioner is not None
+        else rhs / np.maximum(np.asarray(preconditioner, dtype=np.float64)[:, None], 1e-12)
+    )
+    residual = rhs - apply_operator(solution)
+    residual_norm_sq = np.sum(residual * residual, axis=0, dtype=np.float64)
+    initial_residual_norm_sq = residual_norm_sq.copy()
+    rhs_norm_sq = np.sum(rhs * rhs, axis=0, dtype=np.float64)
+    convergence_threshold_sq = np.maximum(tol_sq, tol_sq * np.maximum(residual_norm_sq, rhs_norm_sq))
+    converged = residual_norm_sq <= convergence_threshold_sq
+    if np.all(converged):
+        return solution[:, 0] if vector_input else solution
+
+    preconditioned_residual = (
+        residual
+        if preconditioner is None
+        else (
+            np.asarray(preconditioner(residual), dtype=np.float64)
+            if callable(preconditioner)
+            else residual / np.maximum(np.asarray(preconditioner, dtype=np.float64)[:, None], 1e-12)
+        )
+    )
+    search_direction = preconditioned_residual.copy()
+    residual_dot = np.sum(residual * preconditioned_residual, axis=0, dtype=np.float64)
+    t_start = time.monotonic()
+    last_log = t_start
+
+    for iteration_index in range(max_iterations):
+        active_columns = np.flatnonzero(~converged).astype(np.int32, copy=False)
+        if active_columns.size == 0:
+            break
+        masked_search = search_direction[:, active_columns]
+        operator_search = apply_operator(masked_search)
+        step_denom = np.sum(masked_search * operator_search, axis=0, dtype=np.float64)
+        if np.any(~np.isfinite(step_denom) | (step_denom <= 0.0)):
+            raise RuntimeError("CPU conjugate-gradient operator is not positive definite.")
+        step_scale = residual_dot[active_columns] / step_denom
+        solution[:, active_columns] += masked_search * step_scale[None, :]
+        residual[:, active_columns] -= operator_search * step_scale[None, :]
+        if (iteration_index + 1) % residual_refresh_interval == 0:
+            residual[:, active_columns] = rhs[:, active_columns] - apply_operator(solution[:, active_columns])
+        residual_norm_sq[active_columns] = np.sum(
+            residual[:, active_columns] * residual[:, active_columns],
+            axis=0,
+            dtype=np.float64,
+        )
+        converged = residual_norm_sq <= convergence_threshold_sq
+        if np.all(converged):
+            break
+        refreshed_residual = residual[:, active_columns]
+        refreshed_preconditioned = (
+            refreshed_residual
+            if apply_preconditioner is None and preconditioner is None
+            else (
+                np.asarray(apply_preconditioner(refreshed_residual), dtype=np.float64)
+                if apply_preconditioner is not None
+                else refreshed_residual / np.maximum(np.asarray(preconditioner, dtype=np.float64)[:, None], 1e-12)
+            )
+        )
+        updated_residual_dot_active = np.sum(
+            refreshed_residual * refreshed_preconditioned,
+            axis=0,
+            dtype=np.float64,
+        )
+        beta_active = updated_residual_dot_active / np.maximum(residual_dot[active_columns], 1e-30)
+        if np.any(~np.isfinite(beta_active) | (beta_active < 0.0)):
+            raise RuntimeError("CPU conjugate-gradient preconditioner produced an invalid update.")
+        search_direction[:, active_columns] = refreshed_preconditioned + (
+            search_direction[:, active_columns] * beta_active[None, :]
+        )
+        residual_dot[active_columns] = updated_residual_dot_active
+
+        now = time.monotonic()
+        if now - last_log >= 5.0:
+            progress = np.zeros_like(residual_norm_sq)
+            progress[converged] = 100.0
+            unconverged = ~converged
+            progress[unconverged] = np.clip(
+                100.0
+                * (
+                    np.log10(np.maximum(initial_residual_norm_sq[unconverged], 1e-30))
+                    - np.log10(np.maximum(residual_norm_sq[unconverged], 1e-30))
+                )
+                / np.maximum(
+                    np.log10(np.maximum(initial_residual_norm_sq[unconverged], 1e-30))
+                    - np.log10(np.maximum(convergence_threshold_sq[unconverged], 1e-30)),
+                    1e-6,
+                ),
+                0.0,
+                100.0,
+            )
+            log(
+                f"      CG iter {iteration_index+1}/{max_iterations}: {float(np.mean(progress)):.0f}% converged  "
+                + f"active={int(np.sum(~converged))}/{rhs.shape[1]}  residual={float(np.max(residual_norm_sq)):.2e}  "
+                + f"({now - t_start:.1f}s)"
+            )
+            last_log = now
+
+    final_residual = float(np.max(residual_norm_sq))
+    final_threshold = float(np.max(convergence_threshold_sq))
+    if final_residual > final_threshold:
+        raise RuntimeError(
+            "CPU conjugate-gradient solve failed to converge: "
+            + f"residual={final_residual:.2e} threshold={final_threshold:.2e} "
+            + f"iterations={max_iterations}"
+        )
+    return solution[:, 0] if vector_input else solution
 
 
 def _restricted_precision_projector(
@@ -1796,24 +2132,53 @@ def _restricted_posterior_state(
             float(logdet_gls),
         )
 
-    log(f"    restricted posterior: PCG sample-space solve (p={variant_count}, n={sample_count})")
-    covariance_operator = _sample_space_operator(genotype_matrix, prior_variances, diagonal_noise)
-    sample_space_preconditioner = _sample_space_preconditioner(
-        genotype_matrix=genotype_matrix,
-        prior_variances=prior_variances,
-        diagonal_noise=diagonal_noise,
+    covariance_operator = _sample_space_operator(
+        genotype_matrix,
+        prior_variances,
+        diagonal_noise,
         batch_size=posterior_variance_batch_size,
-        rank=sample_space_preconditioner_rank,
     )
-
-    def solve_rhs_iterative(right_hand_side: np.ndarray) -> np.ndarray:
-        return solve_spd_system(
-            covariance_operator,
-            right_hand_side,
-            tolerance=solver_tolerance,
-            max_iterations=maximum_linear_solver_iterations,
-            preconditioner=sample_space_preconditioner,
+    if genotype_matrix._cupy_cache is not None:
+        log(f"    restricted posterior: GPU block-CG sample-space solve (p={variant_count}, n={sample_count})")
+        sample_space_preconditioner_gpu = _sample_space_gpu_preconditioner(
+            genotype_matrix=genotype_matrix,
+            prior_variances=prior_variances,
+            diagonal_noise=diagonal_noise,
+            batch_size=posterior_variance_batch_size,
+            rank=sample_space_preconditioner_rank,
         )
+
+        def solve_rhs_iterative(right_hand_side: np.ndarray) -> np.ndarray:
+            return _solve_sample_space_rhs_gpu(
+                genotype_matrix=genotype_matrix,
+                prior_variances=prior_variances,
+                diagonal_noise=diagonal_noise,
+                right_hand_side=right_hand_side,
+                tolerance=solver_tolerance,
+                max_iterations=maximum_linear_solver_iterations,
+                preconditioner=sample_space_preconditioner_gpu,
+            )
+    else:
+        log(f"    restricted posterior: PCG sample-space solve (p={variant_count}, n={sample_count})")
+        sample_space_preconditioner = _sample_space_preconditioner(
+            genotype_matrix=genotype_matrix,
+            prior_variances=prior_variances,
+            diagonal_noise=diagonal_noise,
+            batch_size=posterior_variance_batch_size,
+            rank=sample_space_preconditioner_rank,
+        )
+
+        def solve_rhs_iterative(right_hand_side: np.ndarray) -> np.ndarray:
+            return _solve_sample_space_rhs_cpu(
+                genotype_matrix=genotype_matrix,
+                prior_variances=prior_variances,
+                diagonal_noise=diagonal_noise,
+                right_hand_side=right_hand_side,
+                tolerance=solver_tolerance,
+                max_iterations=maximum_linear_solver_iterations,
+                preconditioner=sample_space_preconditioner,
+                batch_size=posterior_variance_batch_size,
+            )
 
     inverse_covariance_rhs = solve_rhs_iterative(
         np.concatenate([targets[:, None], covariate_matrix], axis=1),

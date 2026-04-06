@@ -9,7 +9,6 @@ import numpy as np
 import sv_pgs._jax  # noqa: F401
 
 from sv_pgs.artifact import ModelArtifact, load_artifact, save_artifact
-from sv_pgs._jax import turing_workarounds_enabled
 from sv_pgs.config import ModelConfig, TraitType
 from sv_pgs.data import TieGroup, TieMap, VariantRecord, VariantStatistics, normalize_variant_records
 from sv_pgs.genotype import (
@@ -45,9 +44,9 @@ class FittedState:
     nonzero_scales: np.ndarray
 
 
-T4_ACTIVE_VARIANT_HEADROOM_MULTIPLIER = 2
-T4_MINIMUM_ACTIVE_VARIANTS = 4_096
-T4_EXACT_SOLVER_LIMIT = 1_024
+GPU_ACTIVE_VARIANT_BUDGET_FRACTION = 0.9
+GPU_EXACT_SOLVER_LIMIT = 1_024
+GPU_PRECONDITIONER_RANK_LIMIT = 128
 
 
 def _validate_fit_inputs(
@@ -301,54 +300,6 @@ class BayesianPGS:
         log(f"=== MODEL FIT DONE ===  mem={mem()}")
         return self
 
-
-def _runtime_tuned_config_for_fit(
-    config: ModelConfig,
-    genotype_matrix: RawGenotypeMatrix,
-) -> tuple[ModelConfig, str | None]:
-    if not turing_workarounds_enabled():
-        return config, None
-    cupy = _try_import_cupy()
-    if cupy is None:
-        return config, "T4 runtime detected but CuPy is unavailable; keeping user config."
-    sample_count = int(genotype_matrix.shape[0])
-    if sample_count < 1:
-        return config, None
-    gpu_budget_bytes = _gpu_materialization_budget_bytes(cupy)
-    cacheable_dense_variants = max(int(gpu_budget_bytes // max(sample_count * 4, 1)), 1)
-    target_active_variants = max(
-        T4_MINIMUM_ACTIVE_VARIANTS,
-        cacheable_dense_variants * T4_ACTIVE_VARIANT_HEADROOM_MULTIPLIER,
-    )
-    tuned_maximum_active_variants = min(int(config.maximum_active_variants), int(target_active_variants))
-    tuned_exact_solver_limit = min(int(config.exact_solver_matrix_limit), T4_EXACT_SOLVER_LIMIT)
-    tuned_preconditioner_rank = min(int(config.sample_space_preconditioner_rank), tuned_maximum_active_variants)
-    if (
-        tuned_maximum_active_variants == int(config.maximum_active_variants)
-        and tuned_exact_solver_limit == int(config.exact_solver_matrix_limit)
-        and tuned_preconditioner_rank == int(config.sample_space_preconditioner_rank)
-    ):
-        return config, (
-            "T4 runtime profile active: "
-            + f"gpu_budget={gpu_budget_bytes / 1e9:.1f} GB "
-            + f"cacheable_dense_variants~{cacheable_dense_variants} "
-            + "(user config already fits T4 profile)"
-        )
-    tuned_config = replace(
-        config,
-        maximum_active_variants=tuned_maximum_active_variants,
-        exact_solver_matrix_limit=tuned_exact_solver_limit,
-        sample_space_preconditioner_rank=tuned_preconditioner_rank,
-    )
-    return tuned_config, (
-        "T4 runtime profile active: "
-        + f"gpu_budget={gpu_budget_bytes / 1e9:.1f} GB "
-        + f"cacheable_dense_variants~{cacheable_dense_variants} "
-        + f"maximum_active_variants={config.maximum_active_variants}->{tuned_maximum_active_variants} "
-        + f"exact_solver_matrix_limit={config.exact_solver_matrix_limit}->{tuned_exact_solver_limit} "
-        + f"sample_space_preconditioner_rank={config.sample_space_preconditioner_rank}->{tuned_preconditioner_rank}"
-    )
-
     def decision_function(self, genotypes: RawGenotypeMatrix | np.ndarray, covariates: np.ndarray) -> np.ndarray:
         """Compute the raw linear predictor (before sigmoid for binary traits).
 
@@ -369,7 +320,6 @@ def _runtime_tuned_config_for_fit(
         covariate_matrix = self._with_intercept(np.asarray(covariates, dtype=np.float32))
         covariate_component = np.asarray(covariate_matrix @ fitted_state.fit_result.alpha, dtype=np.float32)
 
-        # Only read variants with non-zero coefficients (skip 99%+ of the file)
         nonzero_indices = fitted_state.nonzero_coefficient_indices
         nonzero_coefficients = fitted_state.nonzero_coefficients
         log(f"decision_function: {genotypes.shape[0]} samples, {len(nonzero_indices)} non-zero coefficients (of {len(fitted_state.full_coefficients)} total)  mem={mem()}")
@@ -390,10 +340,6 @@ def _runtime_tuned_config_for_fit(
         return np.asarray(genotype_component, dtype=np.float32), covariate_component
 
     def predict_proba(self, genotypes: RawGenotypeMatrix | np.ndarray, covariates: np.ndarray) -> np.ndarray:
-        """For binary traits: convert the linear predictor to probabilities via sigmoid.
-
-        Returns an (n_samples, 2) array with columns [P(control), P(case)].
-        """
         if self.config.trait_type != TraitType.BINARY:
             raise ValueError("predict_proba is only available for binary traits.")
         linear_predictor = self.decision_function(genotypes, covariates)
@@ -494,6 +440,51 @@ def _runtime_tuned_config_for_fit(
         output[:, 0] = 1.0
         output[:, 1:] = covariate_matrix
         return output
+
+
+def _runtime_tuned_config_for_fit(
+    config: ModelConfig,
+    genotype_matrix: RawGenotypeMatrix,
+) -> tuple[ModelConfig, str | None]:
+    cupy = _try_import_cupy()
+    if cupy is None:
+        return config, None
+    sample_count = int(genotype_matrix.shape[0])
+    if sample_count < 1:
+        return config, None
+    gpu_budget_bytes = _gpu_materialization_budget_bytes(cupy)
+    cacheable_dense_variants = max(int(gpu_budget_bytes // max(sample_count * 4, 1)), 1)
+    target_active_variants = max(
+        1,
+        int(cacheable_dense_variants * GPU_ACTIVE_VARIANT_BUDGET_FRACTION),
+    )
+    tuned_exact_solver_limit = min(int(config.exact_solver_matrix_limit), GPU_EXACT_SOLVER_LIMIT)
+    tuned_preconditioner_rank = min(
+        int(config.sample_space_preconditioner_rank),
+        GPU_PRECONDITIONER_RANK_LIMIT,
+    )
+    if (
+        tuned_exact_solver_limit == int(config.exact_solver_matrix_limit)
+        and tuned_preconditioner_rank == int(config.sample_space_preconditioner_rank)
+    ):
+        return config, (
+            "GPU runtime profile active: "
+            + f"gpu_budget={gpu_budget_bytes / 1e9:.1f} GB "
+            + f"cacheable_dense_variants~{cacheable_dense_variants} "
+            + "(user config already fits GPU profile)"
+        )
+    tuned_config = replace(
+        config,
+        exact_solver_matrix_limit=tuned_exact_solver_limit,
+        sample_space_preconditioner_rank=tuned_preconditioner_rank,
+    )
+    return tuned_config, (
+        "GPU runtime profile active: "
+        + f"gpu_budget={gpu_budget_bytes / 1e9:.1f} GB "
+        + f"cacheable_dense_variants~{cacheable_dense_variants} "
+        + f"exact_solver_matrix_limit={config.exact_solver_matrix_limit}->{tuned_exact_solver_limit} "
+        + f"sample_space_preconditioner_rank={config.sample_space_preconditioner_rank}->{tuned_preconditioner_rank}"
+    )
 
 
 def _nonzero_coefficient_cache(coefficients: np.ndarray) -> tuple[np.ndarray, np.ndarray]:

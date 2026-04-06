@@ -564,7 +564,6 @@ def test_sample_space_preconditioner_uses_gpu_subset_without_full_gpu_cache(monk
     fake_cupyx_scipy: Any = types.ModuleType("cupyx.scipy")
     fake_cupyx_scipy_linalg: Any = types.ModuleType("cupyx.scipy.linalg")
     fake_cupyx_scipy_linalg.solve_triangular = scipy_solve_triangular
-    fake_cupyx.scipy = fake_cupyx_scipy
     fake_cupyx_scipy.linalg = fake_cupyx_scipy_linalg
 
     monkeypatch.setitem(sys.modules, "cupy", fake_cupy)
@@ -577,11 +576,16 @@ def test_sample_space_preconditioner_uses_gpu_subset_without_full_gpu_cache(monk
         "_cupy_to_jax",
         lambda array: jnp.asarray(np.asarray(array), dtype=mixture_inference.gpu_compute_jax_dtype()),
     )
+
+    def _fake_try_materialize_gpu_subset(self, indices):
+        resolved_indices = np.asarray(indices, dtype=np.int32)
+        gpu_subset_requests.append(resolved_indices.tolist())
+        return standardized.materialize()[:, resolved_indices].astype(np.float32, copy=False)
+
     monkeypatch.setattr(
         type(standardized),
         "try_materialize_gpu_subset",
-        lambda self, indices: gpu_subset_requests.append(np.asarray(indices, dtype=np.int32).tolist())
-        or standardized.materialize()[:, np.asarray(indices, dtype=np.int32)].astype(np.float32, copy=False),
+        _fake_try_materialize_gpu_subset,
     )
     monkeypatch.setattr(
         mixture_inference,
@@ -604,6 +608,135 @@ def test_sample_space_preconditioner_uses_gpu_subset_without_full_gpu_cache(monk
     actual = np.asarray(cast(Any, apply_preconditioner)(right_hand_side), dtype=np.float64)
 
     assert gpu_subset_requests == [[0, 1]]
+    np.testing.assert_allclose(actual, expected, rtol=1e-4, atol=2e-5)
+
+
+def test_gpu_sample_space_block_cg_matches_dense_solution(monkeypatch: pytest.MonkeyPatch):
+    genotype_matrix = np.array(
+        [
+            [1.0, 0.0, 1.0],
+            [0.0, 1.0, 1.0],
+            [1.0, 1.0, 0.0],
+            [0.0, 1.0, 0.0],
+        ],
+        dtype=np.float32,
+    )
+    standardized = as_raw_genotype_matrix(genotype_matrix).standardized(
+        means=np.zeros(genotype_matrix.shape[1], dtype=np.float32),
+        scales=np.ones(genotype_matrix.shape[1], dtype=np.float32),
+    )
+    standardized._cupy_cache = standardized.materialize().astype(np.float32, copy=False)
+    standardized._dense_cache = None
+    prior_variances = np.array([1.5, 0.75, 0.5], dtype=np.float64)
+    diagonal_noise = np.array([1.0, 1.25, 0.8, 1.1], dtype=np.float64)
+    right_hand_side = np.column_stack(
+        [
+            np.array([0.5, -1.0, 0.2, 1.5], dtype=np.float64),
+            np.array([-0.25, 0.75, 1.0, -0.5], dtype=np.float64),
+        ]
+    )
+
+    fake_cupy: Any = types.ModuleType("cupy")
+    fake_cupy.float32 = np.float32
+    fake_cupy.asarray = lambda array, dtype=None: np.asarray(array, dtype=dtype)
+    fake_cupy.sum = np.sum
+    fake_cupy.sqrt = np.sqrt
+    fake_cupy.maximum = np.maximum
+    fake_cupy.eye = np.eye
+    fake_cupy.linalg = types.SimpleNamespace(cholesky=np.linalg.cholesky)
+    fake_cupyx: Any = types.ModuleType("cupyx")
+    fake_cupyx_scipy: Any = types.ModuleType("cupyx.scipy")
+    fake_cupyx_scipy_linalg: Any = types.ModuleType("cupyx.scipy.linalg")
+    fake_cupyx_scipy_linalg.solve_triangular = scipy_solve_triangular
+    fake_cupyx_scipy.linalg = fake_cupyx_scipy_linalg
+
+    monkeypatch.setitem(sys.modules, "cupy", fake_cupy)
+    monkeypatch.setitem(sys.modules, "cupyx", fake_cupyx)
+    monkeypatch.setitem(sys.modules, "cupyx.scipy", fake_cupyx_scipy)
+    monkeypatch.setitem(sys.modules, "cupyx.scipy.linalg", fake_cupyx_scipy_linalg)
+    monkeypatch.setattr(
+        mixture_inference,
+        "_sample_space_diagonal_preconditioner",
+        lambda **kwargs: np.diag(
+            np.diag(diagonal_noise) + genotype_matrix @ np.diag(prior_variances) @ genotype_matrix.T
+        ).astype(np.float64, copy=False),
+    )
+
+    preconditioner = mixture_inference._sample_space_gpu_preconditioner(
+        genotype_matrix=standardized,
+        prior_variances=prior_variances,
+        diagonal_noise=diagonal_noise,
+        batch_size=2,
+        rank=genotype_matrix.shape[1],
+    )
+    actual = mixture_inference._solve_sample_space_rhs_gpu(
+        genotype_matrix=standardized,
+        prior_variances=prior_variances,
+        diagonal_noise=diagonal_noise,
+        right_hand_side=right_hand_side,
+        tolerance=1e-7,
+        max_iterations=64,
+        preconditioner=preconditioner,
+    )
+
+    covariance_matrix = np.diag(diagonal_noise) + genotype_matrix @ np.diag(prior_variances) @ genotype_matrix.T
+    expected = np.linalg.solve(covariance_matrix, right_hand_side)
+
+    np.testing.assert_allclose(actual, expected, rtol=1e-4, atol=2e-5)
+
+
+def test_cpu_sample_space_block_cg_matches_dense_solution(monkeypatch: pytest.MonkeyPatch):
+    genotype_matrix = np.array(
+        [
+            [1.0, 0.0, 1.0],
+            [0.0, 1.0, 1.0],
+            [1.0, 1.0, 0.0],
+            [0.0, 1.0, 0.0],
+        ],
+        dtype=np.float32,
+    )
+    standardized = as_raw_genotype_matrix(genotype_matrix).standardized(
+        means=np.zeros(genotype_matrix.shape[1], dtype=np.float32),
+        scales=np.ones(genotype_matrix.shape[1], dtype=np.float32),
+    )
+    prior_variances = np.array([1.5, 0.75, 0.5], dtype=np.float64)
+    diagonal_noise = np.array([1.0, 1.25, 0.8, 1.1], dtype=np.float64)
+    right_hand_side = np.column_stack(
+        [
+            np.array([0.5, -1.0, 0.2, 1.5], dtype=np.float64),
+            np.array([-0.25, 0.75, 1.0, -0.5], dtype=np.float64),
+        ]
+    )
+
+    monkeypatch.setattr(
+        mixture_inference,
+        "_sample_space_diagonal_preconditioner",
+        lambda **kwargs: np.diag(
+            np.diag(diagonal_noise) + genotype_matrix @ np.diag(prior_variances) @ genotype_matrix.T
+        ).astype(np.float64, copy=False),
+    )
+
+    preconditioner = _sample_space_preconditioner(
+        genotype_matrix=standardized,
+        prior_variances=prior_variances,
+        diagonal_noise=diagonal_noise,
+        batch_size=2,
+        rank=genotype_matrix.shape[1],
+    )
+    actual = mixture_inference._solve_sample_space_rhs_cpu(
+        genotype_matrix=standardized,
+        prior_variances=prior_variances,
+        diagonal_noise=diagonal_noise,
+        right_hand_side=right_hand_side,
+        tolerance=1e-7,
+        max_iterations=64,
+        preconditioner=preconditioner,
+        batch_size=2,
+    )
+
+    covariance_matrix = np.diag(diagonal_noise) + genotype_matrix @ np.diag(prior_variances) @ genotype_matrix.T
+    expected = np.linalg.solve(covariance_matrix, right_hand_side)
+
     np.testing.assert_allclose(actual, expected, rtol=1e-4, atol=2e-5)
 
 
@@ -796,6 +929,32 @@ def test_gpu_sample_space_operator_matmat_matches_dense_reference(random_generat
     )
     standardized._dense_cache = standardized.materialize()
     operator = _sample_space_operator(standardized, prior_variances, diagonal_noise)
+
+    dense_matrix = genotype_values.astype(np.float64)
+    expected = diagonal_noise[:, None] * rhs_matrix + dense_matrix @ (
+        prior_variances[:, None] * (dense_matrix.T @ rhs_matrix)
+    )
+
+    np.testing.assert_allclose(
+        np.asarray(operator.matmat(rhs_matrix), dtype=np.float64),
+        expected,
+        rtol=1e-5,
+        atol=1e-5,
+    )
+
+
+def test_streaming_sample_space_operator_matmat_matches_dense_reference(random_generator):
+    sample_count, variant_count = 24, 96
+    genotype_values = random_generator.normal(size=(sample_count, variant_count)).astype(np.float32)
+    prior_variances = random_generator.uniform(0.2, 1.2, size=variant_count).astype(np.float64)
+    diagonal_noise = random_generator.uniform(0.5, 1.5, size=sample_count).astype(np.float64)
+    rhs_matrix = random_generator.normal(size=(sample_count, 7)).astype(np.float64)
+
+    standardized = as_raw_genotype_matrix(genotype_values).standardized(
+        means=np.zeros(variant_count, dtype=np.float32),
+        scales=np.ones(variant_count, dtype=np.float32),
+    )
+    operator = _sample_space_operator(standardized, prior_variances, diagonal_noise, batch_size=11)
 
     dense_matrix = genotype_values.astype(np.float64)
     expected = diagonal_noise[:, None] * rhs_matrix + dense_matrix @ (
