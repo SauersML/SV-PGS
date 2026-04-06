@@ -955,13 +955,18 @@ class StandardizedGenotypeMatrix:
         When CuPy GPU-cached: cuBLAS matmul. Otherwise: batched numpy on CPU.
         """
         if self._cupy_cache is not None:
-            coeff_jax = jnp.ravel(jnp.asarray(coefficients, dtype=jnp.float32))
+            cupy = _try_import_cupy()
+            if cupy is None:
+                raise RuntimeError("CuPy cache requires CuPy runtime.")
+            compute_np_dtype = gpu_compute_numpy_dtype()
+            compute_cp_dtype = _cupy_compute_dtype(cupy)
+            coeff_jax = jnp.ravel(jnp.asarray(coefficients, dtype=gpu_compute_jax_dtype()))
             if coeff_jax.shape[0] != self.shape[1]:
                 raise ValueError("coefficient vector must match genotype column count.")
             if bool(jnp.all(coeff_jax == 0.0)):
-                return _as_gpu_compute_jax(np.zeros(self.shape[0], dtype=np.float32))
-            coeff_cupy = _to_cupy_float32(coeff_jax)
-            result = self._cupy_cache @ coeff_cupy
+                return _as_gpu_compute_jax(np.zeros(self.shape[0], dtype=compute_np_dtype))
+            coeff_cupy = _to_cupy_compute(coeff_jax)
+            result = self._cupy_cache.astype(compute_cp_dtype, copy=False) @ coeff_cupy
             return _cupy_to_jax(result)
         cupy, streaming_batch_size = self._streaming_gpu_context(batch_size)
         if cupy is not None and streaming_batch_size is not None:
@@ -1004,12 +1009,17 @@ class StandardizedGenotypeMatrix:
     def matmat(self, matrix: np.ndarray | jnp.ndarray, batch_size: int = DEFAULT_GENOTYPE_BATCH_SIZE) -> jnp.ndarray:
         """Compute X_std @ M. When CuPy GPU-cached: cuBLAS matmul. Otherwise: batched numpy."""
         if self._cupy_cache is not None:
-            matrix_jax = jnp.asarray(matrix, dtype=jnp.float32)
+            cupy = _try_import_cupy()
+            if cupy is None:
+                raise RuntimeError("CuPy cache requires CuPy runtime.")
+            compute_np_dtype = gpu_compute_numpy_dtype()
+            compute_cp_dtype = _cupy_compute_dtype(cupy)
+            matrix_jax = jnp.asarray(matrix, dtype=gpu_compute_jax_dtype())
             if matrix_jax.ndim != 2 or matrix_jax.shape[0] != self.shape[1]:
                 raise ValueError("variant matrix must match genotype column count.")
             if bool(jnp.all(matrix_jax == 0.0)):
-                return _as_gpu_compute_jax(np.zeros((self.shape[0], matrix_jax.shape[1]), dtype=np.float32))
-            result = self._cupy_cache @ _to_cupy_float32(matrix_jax)
+                return _as_gpu_compute_jax(np.zeros((self.shape[0], matrix_jax.shape[1]), dtype=compute_np_dtype))
+            result = self._cupy_cache.astype(compute_cp_dtype, copy=False) @ _to_cupy_compute(matrix_jax)
             return _cupy_to_jax(result)
         cupy, streaming_batch_size = self._streaming_gpu_context(batch_size)
         if cupy is not None and streaming_batch_size is not None:
@@ -1052,12 +1062,17 @@ class StandardizedGenotypeMatrix:
     def transpose_matvec(self, vector: np.ndarray | jnp.ndarray, batch_size: int = DEFAULT_GENOTYPE_BATCH_SIZE) -> jnp.ndarray:
         """Compute X_std^T @ v. When CuPy GPU-cached: cuBLAS matmul. Otherwise: batched numpy."""
         if self._cupy_cache is not None:
-            vector_jax = jnp.ravel(jnp.asarray(vector, dtype=jnp.float32))
+            cupy = _try_import_cupy()
+            if cupy is None:
+                raise RuntimeError("CuPy cache requires CuPy runtime.")
+            compute_np_dtype = gpu_compute_numpy_dtype()
+            compute_cp_dtype = _cupy_compute_dtype(cupy)
+            vector_jax = jnp.ravel(jnp.asarray(vector, dtype=gpu_compute_jax_dtype()))
             if vector_jax.shape[0] != self.shape[0]:
                 raise ValueError("sample vector must match genotype row count.")
             if bool(jnp.all(vector_jax == 0.0)):
-                return _as_gpu_compute_jax(np.zeros(self.shape[1], dtype=np.float32))
-            result = self._cupy_cache.T @ _to_cupy_float32(vector_jax)
+                return _as_gpu_compute_jax(np.zeros(self.shape[1], dtype=compute_np_dtype))
+            result = self._cupy_cache.astype(compute_cp_dtype, copy=False).T @ _to_cupy_compute(vector_jax)
             return _cupy_to_jax(result)
         cupy, streaming_batch_size = self._streaming_gpu_context(batch_size)
         if cupy is not None and streaming_batch_size is not None:
@@ -1099,12 +1114,17 @@ class StandardizedGenotypeMatrix:
     def transpose_matmat(self, matrix: np.ndarray | jnp.ndarray, batch_size: int = DEFAULT_GENOTYPE_BATCH_SIZE) -> jnp.ndarray:
         """Compute X_std^T @ M. When CuPy GPU-cached: cuBLAS matmul. Otherwise: batched numpy."""
         if self._cupy_cache is not None:
-            matrix_jax = jnp.asarray(matrix, dtype=jnp.float32)
+            cupy = _try_import_cupy()
+            if cupy is None:
+                raise RuntimeError("CuPy cache requires CuPy runtime.")
+            compute_np_dtype = gpu_compute_numpy_dtype()
+            compute_cp_dtype = _cupy_compute_dtype(cupy)
+            matrix_jax = jnp.asarray(matrix, dtype=gpu_compute_jax_dtype())
             if matrix_jax.ndim != 2 or matrix_jax.shape[0] != self.shape[0]:
                 raise ValueError("sample matrix must match genotype row count.")
             if bool(jnp.all(matrix_jax == 0.0)):
-                return _as_gpu_compute_jax(np.zeros((self.shape[1], matrix_jax.shape[1]), dtype=np.float32))
-            result = self._cupy_cache.T @ _to_cupy_float32(matrix_jax)
+                return _as_gpu_compute_jax(np.zeros((self.shape[1], matrix_jax.shape[1]), dtype=compute_np_dtype))
+            result = self._cupy_cache.astype(compute_cp_dtype, copy=False).T @ _to_cupy_compute(matrix_jax)
             return _cupy_to_jax(result)
         cupy, streaming_batch_size = self._streaming_gpu_context(batch_size)
         if cupy is not None and streaming_batch_size is not None:

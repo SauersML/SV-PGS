@@ -156,22 +156,62 @@ def stochastic_logdet(
     random_generator = np.random.default_rng(random_seed)
     from sv_pgs.progress import log
     estimates: list[float] = []
-    for _probe_index in range(probe_count):
-        log(f"      logdet probe {_probe_index+1}/{probe_count} ({step_count} Lanczos steps)")
-        probe_vector = jnp.asarray(
-            random_generator.choice((-1.0, 1.0), size=dimension).astype(np.asarray(jnp.zeros((), dtype=operator_dtype)).dtype),
-            dtype=operator_dtype,
+    probe_dtype = np.asarray(jnp.zeros((), dtype=operator_dtype)).dtype
+    probe_block_size = min(max(1, min(8, dimension)), probe_count)
+    probes_completed = 0
+    while probes_completed < probe_count:
+        current_block_size = min(probe_block_size, probe_count - probes_completed)
+        block_start = probes_completed + 1
+        block_stop = probes_completed + current_block_size
+        log(f"      logdet probe block {block_start}-{block_stop}/{probe_count} ({step_count} Lanczos steps)")
+        probe_block = _normalized_rademacher_probe_block(
+            dimension=dimension,
+            probe_count=current_block_size,
+            random_generator=random_generator,
+            dtype=probe_dtype,
         )
-        probe_vector /= jnp.maximum(jnp.linalg.norm(probe_vector), 1e-12)
-        tridiagonal = _lanczos_tridiagonal(
+        tridiagonal_blocks = _lanczos_tridiagonal_block(
             linear_operator=linear_operator,
-            start_vector=probe_vector,
+            start_matrix=jnp.asarray(probe_block, dtype=operator_dtype),
             step_count=step_count,
         )
-        eigenvalues, eigenvectors = _small_symmetric_eigh(tridiagonal)
-        clipped_eigenvalues = np.maximum(eigenvalues, 1e-12)
-        estimates.append(float(np.sum((eigenvectors[0, :] ** 2) * np.log(clipped_eigenvalues))))
+        for tridiagonal in tridiagonal_blocks:
+            eigenvalues, eigenvectors = _small_symmetric_eigh(tridiagonal)
+            clipped_eigenvalues = np.maximum(eigenvalues, 1e-12)
+            estimates.append(float(np.sum((eigenvectors[0, :] ** 2) * np.log(clipped_eigenvalues))))
+        probes_completed += current_block_size
     return float(dimension * np.mean(estimates))
+
+
+def _normalized_rademacher_probe_block(
+    dimension: int,
+    probe_count: int,
+    random_generator: np.random.Generator,
+    dtype: np.dtype,
+) -> np.ndarray:
+    probe_block = random_generator.choice((-1.0, 1.0), size=(dimension, probe_count)).astype(dtype, copy=False)
+    probe_norms = np.linalg.norm(probe_block, axis=0, keepdims=True)
+    probe_norms = np.maximum(probe_norms, 1e-12)
+    return probe_block / probe_norms
+
+
+def _apply_operator_block(
+    linear_operator: LinearOperator,
+    block: jnp.ndarray,
+    operator_dtype: jnp.dtype,
+) -> jnp.ndarray:
+    if block.ndim != 2:
+        raise ValueError("operator block application expects a matrix input.")
+    if block.shape[1] == 1:
+        return jnp.asarray(linear_operator.matvec(block[:, 0]), dtype=operator_dtype)[:, None]
+    if linear_operator.matmat is not None:
+        return jnp.asarray(linear_operator.matmat(block), dtype=operator_dtype)
+    return jnp.column_stack(
+        [
+            jnp.asarray(linear_operator.matvec(block[:, column_index]), dtype=operator_dtype)
+            for column_index in range(block.shape[1])
+        ]
+    )
 
 
 def _small_symmetric_eigh(matrix: np.ndarray | jnp.ndarray) -> tuple[np.ndarray, np.ndarray]:
