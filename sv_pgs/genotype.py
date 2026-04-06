@@ -463,6 +463,20 @@ def _to_cupy_float64(array):
     return cupy.asarray(np.asarray(array, dtype=np.float64))
 
 
+def _cupy_compute_dtype(cupy):
+    return cupy.float32 if gpu_compute_numpy_dtype() == np.dtype(np.float32) else cupy.float64
+
+
+def _to_cupy_compute(array):
+    cupy = _try_import_cupy()
+    if cupy is None:
+        raise RuntimeError("CuPy is not available.")
+    compute_dtype = _cupy_compute_dtype(cupy)
+    if compute_dtype == cupy.float32:
+        return _to_cupy_float32(array)
+    return _to_cupy_float64(array)
+
+
 def _standardize_batch_cupy(
     batch_values: np.ndarray,
     means,
@@ -951,13 +965,15 @@ class StandardizedGenotypeMatrix:
             return _cupy_to_jax(result)
         cupy, streaming_batch_size = self._streaming_gpu_context(batch_size)
         if cupy is not None and streaming_batch_size is not None:
-            coeff_np = np.asarray(coefficients, dtype=np.float64).ravel()
+            compute_np_dtype = gpu_compute_numpy_dtype()
+            compute_cp_dtype = _cupy_compute_dtype(cupy)
+            coeff_np = np.asarray(coefficients, dtype=compute_np_dtype).ravel()
             if coeff_np.shape[0] != self.shape[1]:
                 raise ValueError("coefficient vector must match genotype column count.")
             if not np.any(coeff_np):
-                return _as_gpu_compute_jax(np.zeros(self.shape[0], dtype=np.float64))
-            coeff_gpu = _to_cupy_float64(coeff_np)
-            result_gpu = cupy.zeros(self.shape[0], dtype=cupy.float64)
+                return _as_gpu_compute_jax(np.zeros(self.shape[0], dtype=compute_np_dtype))
+            coeff_gpu = _to_cupy_compute(coeff_np)
+            result_gpu = cupy.zeros(self.shape[0], dtype=compute_cp_dtype)
             for batch_slice, standardized_batch in _iter_standardized_gpu_batches(
                 self.raw,
                 self.variant_indices,
@@ -965,7 +981,7 @@ class StandardizedGenotypeMatrix:
                 self.scales,
                 batch_size=streaming_batch_size,
                 cupy=cupy,
-                dtype=cupy.float64,
+                dtype=compute_cp_dtype,
             ):
                 result_gpu += standardized_batch @ coeff_gpu[batch_slice]
             return _cupy_to_jax(result_gpu)
@@ -997,13 +1013,15 @@ class StandardizedGenotypeMatrix:
             return _cupy_to_jax(result)
         cupy, streaming_batch_size = self._streaming_gpu_context(batch_size)
         if cupy is not None and streaming_batch_size is not None:
-            matrix_np = np.asarray(matrix, dtype=np.float64)
+            compute_np_dtype = gpu_compute_numpy_dtype()
+            compute_cp_dtype = _cupy_compute_dtype(cupy)
+            matrix_np = np.asarray(matrix, dtype=compute_np_dtype)
             if matrix_np.ndim != 2 or matrix_np.shape[0] != self.shape[1]:
                 raise ValueError("variant matrix must match genotype column count.")
             if not np.any(matrix_np):
-                return _as_gpu_compute_jax(np.zeros((self.shape[0], matrix_np.shape[1]), dtype=np.float64))
-            matrix_gpu = _to_cupy_float64(matrix_np)
-            result_gpu = cupy.zeros((self.shape[0], matrix_np.shape[1]), dtype=cupy.float64)
+                return _as_gpu_compute_jax(np.zeros((self.shape[0], matrix_np.shape[1]), dtype=compute_np_dtype))
+            matrix_gpu = _to_cupy_compute(matrix_np)
+            result_gpu = cupy.zeros((self.shape[0], matrix_np.shape[1]), dtype=compute_cp_dtype)
             for batch_slice, standardized_batch in _iter_standardized_gpu_batches(
                 self.raw,
                 self.variant_indices,
@@ -1011,7 +1029,7 @@ class StandardizedGenotypeMatrix:
                 self.scales,
                 batch_size=streaming_batch_size,
                 cupy=cupy,
-                dtype=cupy.float64,
+                dtype=compute_cp_dtype,
             ):
                 result_gpu += standardized_batch @ matrix_gpu[batch_slice, :]
             return _cupy_to_jax(result_gpu)
@@ -1043,13 +1061,15 @@ class StandardizedGenotypeMatrix:
             return _cupy_to_jax(result)
         cupy, streaming_batch_size = self._streaming_gpu_context(batch_size)
         if cupy is not None and streaming_batch_size is not None:
-            vector_np = np.asarray(vector, dtype=np.float64).ravel()
+            compute_np_dtype = gpu_compute_numpy_dtype()
+            compute_cp_dtype = _cupy_compute_dtype(cupy)
+            vector_np = np.asarray(vector, dtype=compute_np_dtype).ravel()
             if vector_np.shape[0] != self.shape[0]:
                 raise ValueError("sample vector must match genotype row count.")
             if not np.any(vector_np):
-                return _as_gpu_compute_jax(np.zeros(self.shape[1], dtype=np.float64))
-            vector_gpu = _to_cupy_float64(vector_np)
-            output_gpu = cupy.empty(self.shape[1], dtype=cupy.float64)
+                return _as_gpu_compute_jax(np.zeros(self.shape[1], dtype=compute_np_dtype))
+            vector_gpu = _to_cupy_compute(vector_np)
+            output_gpu = cupy.empty(self.shape[1], dtype=compute_cp_dtype)
             for batch_slice, standardized_batch in _iter_standardized_gpu_batches(
                 self.raw,
                 self.variant_indices,
@@ -1057,7 +1077,7 @@ class StandardizedGenotypeMatrix:
                 self.scales,
                 batch_size=streaming_batch_size,
                 cupy=cupy,
-                dtype=cupy.float64,
+                dtype=compute_cp_dtype,
             ):
                 output_gpu[batch_slice] = standardized_batch.T @ vector_gpu
             return _cupy_to_jax(output_gpu)
@@ -1088,13 +1108,15 @@ class StandardizedGenotypeMatrix:
             return _cupy_to_jax(result)
         cupy, streaming_batch_size = self._streaming_gpu_context(batch_size)
         if cupy is not None and streaming_batch_size is not None:
-            matrix_np = np.asarray(matrix, dtype=np.float64)
+            compute_np_dtype = gpu_compute_numpy_dtype()
+            compute_cp_dtype = _cupy_compute_dtype(cupy)
+            matrix_np = np.asarray(matrix, dtype=compute_np_dtype)
             if matrix_np.ndim != 2 or matrix_np.shape[0] != self.shape[0]:
                 raise ValueError("sample matrix must match genotype row count.")
             if not np.any(matrix_np):
-                return _as_gpu_compute_jax(np.zeros((self.shape[1], matrix_np.shape[1]), dtype=np.float64))
-            matrix_gpu = _to_cupy_float64(matrix_np)
-            output_gpu = cupy.empty((self.shape[1], matrix_np.shape[1]), dtype=cupy.float64)
+                return _as_gpu_compute_jax(np.zeros((self.shape[1], matrix_np.shape[1]), dtype=compute_np_dtype))
+            matrix_gpu = _to_cupy_compute(matrix_np)
+            output_gpu = cupy.empty((self.shape[1], matrix_np.shape[1]), dtype=compute_cp_dtype)
             for batch_slice, standardized_batch in _iter_standardized_gpu_batches(
                 self.raw,
                 self.variant_indices,
@@ -1102,7 +1124,7 @@ class StandardizedGenotypeMatrix:
                 self.scales,
                 batch_size=streaming_batch_size,
                 cupy=cupy,
-                dtype=cupy.float64,
+                dtype=compute_cp_dtype,
             ):
                 output_gpu[batch_slice, :] = standardized_batch.T @ matrix_gpu
             return _cupy_to_jax(output_gpu)

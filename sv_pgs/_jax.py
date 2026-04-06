@@ -94,10 +94,9 @@ def _cupy_runtime_status() -> tuple[bool, str]:
 
 
 def t4_fast_math_enabled() -> bool:
-    # Float64 is required throughout for CG solver numerical stability.
-    # CuPy matmul is explicitly float32 (fast on GPU), but everything
-    # else (solver, preconditioner, operator) must be float64.
-    return False
+    # T4/Turing GPUs are extremely slow at float64. Keep outer inference
+    # state in float64, but route bulk GPU operator work through float32.
+    return turing_workarounds_enabled()
 
 
 def jax_dense_linear_algebra_preferred() -> bool:
