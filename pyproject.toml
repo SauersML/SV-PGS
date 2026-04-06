@@ -38,6 +38,16 @@ python_version = "3.12"
 module = [
     "sklearn",
     "sklearn.*",
+    "google.cloud",
+    "google.cloud.*",
+    "cupy",
+    "cupy.*",
+    "cupyx",
+    "cupyx.*",
+    "scipy",
+    "scipy.*",
+    "cyvcf2",
+    "pandas",
 ]
 ignore_missing_imports = true
 

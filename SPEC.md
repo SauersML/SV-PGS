@@ -13,3 +13,4 @@
 - No multi-GPU support.
 - Fully and unconditionally use JAX.
 - Do not restrict or cap the number of variants included, for any reason.
+- Do not restrict or cap the number of samples included, for any reason.

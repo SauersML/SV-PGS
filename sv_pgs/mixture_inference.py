@@ -1241,10 +1241,37 @@ def _posterior_variance_hutchinson_diagonal(
     probe_count: int,
     random_seed: int,
 ) -> np.ndarray:
-    random_generator = np.random.default_rng(random_seed)
-    probes = random_generator.choice((-1.0, 1.0), size=(dimension, probe_count)).astype(np.float64)
+    probes = _orthogonal_probe_matrix(
+        dimension=dimension,
+        probe_count=probe_count,
+        random_seed=random_seed,
+    )
     solutions = np.asarray(solve_variant_rhs(probes), dtype=np.float64)
     return np.maximum(np.mean(probes * solutions, axis=1), 1e-8)
+
+
+def _orthogonal_probe_matrix(
+    dimension: int,
+    probe_count: int,
+    random_seed: int,
+) -> np.ndarray:
+    if dimension < 1:
+        raise ValueError("dimension must be positive.")
+    if probe_count < 1:
+        raise ValueError("probe_count must be positive.")
+    random_generator = np.random.default_rng(random_seed)
+    probe_blocks: list[np.ndarray] = []
+    probes_remaining = int(probe_count)
+    while probes_remaining > 0:
+        block_probe_count = min(probes_remaining, dimension)
+        gaussian_block = random_generator.standard_normal((dimension, block_probe_count)).astype(np.float64)
+        orthogonal_block, triangular_block = np.linalg.qr(gaussian_block, mode="reduced")
+        diagonal_signs = np.sign(np.diag(triangular_block))
+        diagonal_signs[diagonal_signs == 0.0] = 1.0
+        orthogonal_block *= diagonal_signs[None, :]
+        probe_blocks.append(np.sqrt(float(dimension)) * orthogonal_block[:, :block_probe_count])
+        probes_remaining -= block_probe_count
+    return np.ascontiguousarray(np.column_stack(probe_blocks), dtype=np.float64)
 
 
 def _use_gpu_exact_variant_solve(
@@ -1644,14 +1671,16 @@ def _restricted_posterior_state(
         dtype=compute_np_dtype,
     )
     if compute_beta_variance:
-        log(f"    computing leverage diagonal for beta variance ({variant_count} variants)...")
-        leverage_diagonal = _restricted_cross_leverage_diagonal(
+        log(f"    computing stochastic leverage diagonal for beta variance ({variant_count} variants, {posterior_variance_probe_count} probes)...")
+        leverage_diagonal = _stochastic_restricted_cross_leverage_diagonal(
             genotype_matrix=genotype_matrix,
             covariate_matrix=covariate_matrix,
             solve_rhs=solve_rhs,
             inverse_covariance_covariates=inverse_covariance_covariates,
             gls_cholesky=gls_cholesky,
             batch_size=posterior_variance_batch_size,
+            probe_count=posterior_variance_probe_count,
+            random_seed=random_seed,
         )
         beta_variance = np.maximum(prior_variances - (prior_variances * prior_variances) * leverage_diagonal, 1e-8)
     else:
@@ -1709,6 +1738,41 @@ def _restricted_cross_leverage_diagonal(
         if variants_done == len(batch.variant_indices) or variants_done % max(variant_count // 5, 1) < len(batch.variant_indices) or variants_done == variant_count:
             log(f"      leverage diagonal: {variants_done}/{variant_count} ({100*variants_done//max(variant_count,1)}%)  mem={mem()}")
     return leverage_diagonal
+
+
+def _stochastic_restricted_cross_leverage_diagonal(
+    genotype_matrix: StandardizedGenotypeMatrix,
+    covariate_matrix: np.ndarray,
+    solve_rhs,
+    inverse_covariance_covariates: np.ndarray,
+    gls_cholesky: np.ndarray,
+    batch_size: int,
+    probe_count: int,
+    random_seed: int,
+) -> np.ndarray:
+    random_generator = np.random.default_rng(random_seed)
+    sample_count = genotype_matrix.shape[0]
+    sample_probes = random_generator.choice(
+        (-1.0, 1.0),
+        size=(sample_count, probe_count),
+    ).astype(np.float64)
+    inverse_covariance_probe_matrix = np.asarray(solve_rhs(sample_probes), dtype=np.float64)
+    restricted_probe_matrix = inverse_covariance_probe_matrix - inverse_covariance_covariates @ _cholesky_solve(
+        gls_cholesky,
+        covariate_matrix.T @ inverse_covariance_probe_matrix,
+    )
+    probe_projection_matrix = np.asarray(
+        genotype_matrix.transpose_matmat(sample_probes, batch_size=batch_size),
+        dtype=np.float64,
+    )
+    restricted_probe_projection_matrix = np.asarray(
+        genotype_matrix.transpose_matmat(restricted_probe_matrix, batch_size=batch_size),
+        dtype=np.float64,
+    )
+    return np.maximum(
+        np.mean(probe_projection_matrix * restricted_probe_projection_matrix, axis=1),
+        1e-8,
+    )
 
 
 # Build the metadata design matrix for the prior scale model.

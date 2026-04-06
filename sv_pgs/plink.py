@@ -81,20 +81,17 @@ def to_bed(
 @dataclass(slots=True)
 class open_bed:
     path: str | Path
-    iid_count: int | None = None
-    sid_count: int | None = None
+    iid_count: int
+    sid_count: int
     properties: dict[str, Any] | None = None
     count_A1: bool = True
-    skip_format_check: bool = True
     num_threads: int | None = None
 
     def __post_init__(self) -> None:
         self.path = Path(self.path)
-        if self.iid_count is None or self.sid_count is None:
-            raise ValueError("iid_count and sid_count are required for PLINK BED reads.")
         if self.iid_count < 1 or self.sid_count < 1:
             raise ValueError("iid_count and sid_count must be positive.")
-        with self.path.open("rb") as bed_handle:
+        with Path(self.path).open("rb") as bed_handle:
             header = bed_handle.read(PLINK1_HEADER_SIZE)
         if header != PLINK1_MAGIC:
             raise ValueError(
@@ -104,7 +101,7 @@ class open_bed:
                 + header.hex(" ")
             )
         expected_size = PLINK1_HEADER_SIZE + self.sid_count * _bytes_per_variant(self.iid_count)
-        actual_size = self.path.stat().st_size
+        actual_size = Path(self.path).stat().st_size
         if actual_size != expected_size:
             raise ValueError(
                 "PLINK 1 .bed size does not match iid_count/sid_count: "
@@ -129,7 +126,7 @@ class open_bed:
         if resolved_dtype == np.dtype(np.int8):
             result = np.asarray(raw_i8, dtype=np.int8)
         else:
-            result = np.asarray(raw_i8, dtype=resolved_dtype)
+            result = raw_i8.astype(resolved_dtype, copy=False)
             result[raw_i8 == PLINK_MISSING_INT8] = np.nan
         if order == "F":
             return np.asfortranarray(result)
@@ -141,7 +138,7 @@ class open_bed:
             variant_count = max(variant_index.stop - variant_index.start, 0)
             if variant_count == 0:
                 return np.empty((self.iid_count, 0), dtype=np.int8)
-            with self.path.open("rb") as bed_handle:
+            with Path(self.path).open("rb") as bed_handle:
                 bed_handle.seek(PLINK1_HEADER_SIZE + variant_index.start * bytes_per_variant)
                 payload = bed_handle.read(variant_count * bytes_per_variant)
             return _decode_payload(
@@ -153,7 +150,7 @@ class open_bed:
             )
 
         result = np.empty((self.iid_count, variant_index.shape[0]), dtype=np.int8)
-        with self.path.open("rb") as bed_handle:
+        with Path(self.path).open("rb") as bed_handle:
             for output_index, bed_variant_index in enumerate(variant_index):
                 bed_handle.seek(PLINK1_HEADER_SIZE + int(bed_variant_index) * bytes_per_variant)
                 payload = bed_handle.read(bytes_per_variant)
@@ -188,7 +185,7 @@ def _normalize_index(index: Any, limit: int) -> slice | np.ndarray:
             return slice(start, stop, 1)
         return np.arange(start, stop, step, dtype=np.intp)
     if np.isscalar(index):
-        value = int(index)
+        value = int(np.asarray(index, dtype=np.intp).item())
         if value < 0:
             value += limit
         if value < 0 or value >= limit:

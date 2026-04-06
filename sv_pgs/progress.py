@@ -50,7 +50,7 @@ def log(message: str) -> None:
 
 def _format_bytes(value: object) -> str:
     try:
-        size = float(value)
+        size = float(str(value))
     except (TypeError, ValueError):
         return str(value)
     units = ("B", "KB", "MB", "GB", "TB")

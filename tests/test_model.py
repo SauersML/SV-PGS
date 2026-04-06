@@ -224,7 +224,7 @@ def test_validation_path_keeps_raw_genotypes_streaming():
 
         @property
         def shape(self) -> tuple[int, int]:
-            return self.matrix.shape
+            return int(self.matrix.shape[0]), int(self.matrix.shape[1])
 
         def iter_column_batches(self, variant_indices=None, batch_size: int = 1024):
             resolved_indices = (
@@ -308,7 +308,7 @@ def test_raw_standardized_subset_matvec_reads_only_requested_columns():
 
         @property
         def shape(self) -> tuple[int, int]:
-            return self.matrix.shape
+            return int(self.matrix.shape[0]), int(self.matrix.shape[1])
 
         def iter_column_batches(
             self,

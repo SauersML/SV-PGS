@@ -3,6 +3,7 @@ from __future__ import annotations
 import csv
 import json
 from pathlib import Path
+from typing import cast
 
 import numpy as np
 import pytest
@@ -281,7 +282,7 @@ def test_cli_prepare_all_of_us_disease_wires_request_and_outputs(monkeypatch, tm
 
     assert exit_code == 0
     assert calls["output_path"] == output_path
-    request = calls["request"]
+    request = cast(AllOfUsDiseaseRequest, calls["request"])
     assert request.disease == "copd"
 
 
@@ -318,7 +319,7 @@ def test_cli_prepare_all_of_us_disease_accepts_aliases(monkeypatch, tmp_path: Pa
     )
 
     assert exit_code == 0
-    request = calls["request"]
+    request = cast(AllOfUsDiseaseRequest, calls["request"])
     assert request.disease == "heart failure"
 
 
@@ -595,16 +596,16 @@ def test_run_all_of_us_runs_single_unified_fit_and_cleans_downloads(monkeypatch,
     monkeypatch.setattr(aou_runner, "merge_pcs_into_sample_table", fake_merge)
     monkeypatch.setattr(aou_runner, "download_sv_vcf", fake_download_sv_vcf)
     monkeypatch.setattr(aou_runner, "release_process_memory", lambda: release_calls.append("released"))
-    monkeypatch.setattr(
-        aou_runner,
-        "load_multi_vcf_dataset_from_files",
-        lambda **kwargs: loader_calls.append([str(path) for path in kwargs["genotype_paths"]]) or _Dataset(),
-    )
-    monkeypatch.setattr(
-        aou_runner,
-        "run_training_pipeline",
-        lambda **kwargs: pipeline_calls.append((kwargs["dataset"].targets.shape[0], Path(kwargs["output_dir"]))),
-    )
+    def fake_load_multi_vcf_dataset_from_files(**kwargs):
+        loader_calls.append([str(path) for path in kwargs["genotype_paths"]])
+        return _Dataset()
+
+    def fake_run_training_pipeline(**kwargs):
+        pipeline_calls.append((kwargs["dataset"].targets.shape[0], Path(kwargs["output_dir"])))
+        return None
+
+    monkeypatch.setattr(aou_runner, "load_multi_vcf_dataset_from_files", fake_load_multi_vcf_dataset_from_files)
+    monkeypatch.setattr(aou_runner, "run_training_pipeline", fake_run_training_pipeline)
 
     aou_runner.run_all_of_us(
         disease="heart_failure",
@@ -752,16 +753,16 @@ def test_run_all_of_us_reruns_when_existing_fit_metadata_differs(monkeypatch, tm
     monkeypatch.setattr(aou_runner, "merge_pcs_into_sample_table", fake_merge)
     monkeypatch.setattr(aou_runner, "download_sv_vcf", fake_download_sv_vcf)
     monkeypatch.setattr(aou_runner, "release_process_memory", lambda: None)
-    monkeypatch.setattr(
-        aou_runner,
-        "load_multi_vcf_dataset_from_files",
-        lambda **kwargs: loader_calls.append([str(path) for path in kwargs["genotype_paths"]]) or _Dataset(),
-    )
-    monkeypatch.setattr(
-        aou_runner,
-        "run_training_pipeline",
-        lambda **kwargs: pipeline_calls.append(Path(kwargs["output_dir"])),
-    )
+    def fake_load_multi_vcf_dataset_from_files(**kwargs):
+        loader_calls.append([str(path) for path in kwargs["genotype_paths"]])
+        return _Dataset()
+
+    def fake_run_training_pipeline(**kwargs):
+        pipeline_calls.append(Path(kwargs["output_dir"]))
+        return None
+
+    monkeypatch.setattr(aou_runner, "load_multi_vcf_dataset_from_files", fake_load_multi_vcf_dataset_from_files)
+    monkeypatch.setattr(aou_runner, "run_training_pipeline", fake_run_training_pipeline)
 
     aou_runner.run_all_of_us(
         disease=disease,

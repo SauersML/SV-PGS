@@ -43,6 +43,10 @@ def resolve_ancestry_predictions_path() -> str:
     return f"{_cdr_storage_path()}/wgs/short_read/snpindel/aux/ancestry/ancestry_preds.tsv"
 
 
+def local_ancestry_predictions_path(work_dir: Path) -> Path:
+    return work_dir / "ancestry_preds.tsv"
+
+
 def sv_vcf_name(chromosome: int) -> str:
     return f"AoU_srWGS_SV.v8.chr{chromosome}.vcf.gz"
 
@@ -69,10 +73,11 @@ def _gsutil_cp(src: str, dst: str) -> None:
     log(f"  downloading {src}")
     # Stream output in real time so user sees progress
     process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
-    for line in process.stdout:
-        stripped = line.strip()
-        if stripped:
-            log(f"    {stripped}")
+    if process.stdout is not None:
+        for line in process.stdout:
+            stripped = line.strip()
+            if stripped:
+                log(f"    {stripped}")
     process.wait()
     if process.returncode != 0:
         raise RuntimeError(f"gsutil cp failed (exit {process.returncode}): {src}")
@@ -120,13 +125,18 @@ def download_sv_vcf(chromosome: int, work_dir: Path) -> Path:
 def download_ancestry_preds(work_dir: Path) -> Path:
     """Download the AoU ancestry predictions file (contains per-sample PCs)."""
     remote = resolve_ancestry_predictions_path()
-    local = work_dir / Path(remote).name
+    local = local_ancestry_predictions_path(work_dir)
     if local.exists():
         log(f"  ancestry predictions already present: {local.name}")
         return local
     log(f"  downloading ancestry predictions: {remote}")
     _gsutil_cp(remote, str(local))
     return local
+
+
+def cleanup_local_sv_vcf(vcf_path: Path) -> None:
+    Path(vcf_path).unlink(missing_ok=True)
+    Path(f"{vcf_path}.tbi").unlink(missing_ok=True)
 
 
 def release_process_memory() -> None:
@@ -258,7 +268,7 @@ def merge_pcs_into_sample_table(
         if column in sample_id_sets:
             log(f"  overlap with {column}: {overlap_counts[column]}/{len(sample_id_sets[column])}")
 
-    merge_key = max(overlap_counts, key=overlap_counts.get)
+    merge_key = max(overlap_counts, key=lambda column: overlap_counts[column])
     if overlap_counts[merge_key] == 0:
         available_keys = ", ".join(sample_id_sets)
         raise RuntimeError(
@@ -361,7 +371,7 @@ def run_all_of_us(
     merged_path = work_dir / f"{disease_def.canonical_name}.samples.with_pcs.tsv"
     log(f"  phenotype table: {'DONE' if sample_table_path.exists() else 'NEEDED'}")
     log(f"  PC-merged table: {'DONE' if merged_path.exists() else 'NEEDED'}")
-    ancestry_local = work_dir / Path(resolve_ancestry_predictions_path()).name
+    ancestry_local = local_ancestry_predictions_path(work_dir)
     log(f"  ancestry file:   {'DONE' if ancestry_local.exists() else 'NEEDED'}")
 
     # Compute keep_indices from VCF header + merged sample table (if both exist)
@@ -483,26 +493,29 @@ def run_all_of_us(
             vcf_paths.append(download_sv_vcf(chrom, work_dir))
 
         log("=== STEP 3.5: Parallel VCF precache ===")
-        from sv_pgs.io import precache_vcfs_parallel, _read_vcf_sample_ids
-        # Compute keep_indices in SAMPLE-TABLE ORDER (same as loader's _align_sample_ids).
-        # Must match exactly or the cache key won't match.
-        all_sample_ids = _read_vcf_sample_ids(vcf_paths[0])
-        vcf_id_set = set(str(s) for s in all_sample_ids)
-        vcf_index_map = {str(s): i for i, s in enumerate(all_sample_ids)}
-        sample_table_df = pd.read_csv(str(merged_path), sep="\t", dtype={"sample_id": str})
-        # Filter to VCF-matching + drop NaN covariates (same as _build_sample_table)
-        sample_table_df = sample_table_df[sample_table_df["sample_id"].astype(str).isin(vcf_id_set)]
-        pc_cols = [c for c in sample_table_df.columns if c.startswith("PC") and c[2:].isdigit()][:n_pcs]
-        covariate_cols = list(DEFAULT_COVARIATES) + pc_cols
-        check_cols = ["target"] + [c for c in covariate_cols if c in sample_table_df.columns]
-        for col in check_cols:
-            if col in sample_table_df.columns:
-                sample_table_df[col] = pd.to_numeric(sample_table_df[col], errors="coerce")
-        sample_table_df = sample_table_df.dropna(subset=[c for c in check_cols if c in sample_table_df.columns])
-        surviving_ids = sample_table_df["sample_id"].astype(str).tolist()
-        keep_indices = np.array([vcf_index_map[sid] for sid in surviving_ids if sid in vcf_index_map], dtype=np.intp)
-        log(f"  {len(keep_indices)} of {len(all_sample_ids)} samples matched")
-        precache_vcfs_parallel(vcf_paths, keep_indices)
+        try:
+            from sv_pgs.io import precache_vcfs_parallel, _read_vcf_sample_ids
+            # Compute keep_indices in SAMPLE-TABLE ORDER (same as loader's _align_sample_ids).
+            # Must match exactly or the cache key won't match.
+            all_sample_ids = _read_vcf_sample_ids(vcf_paths[0])
+            vcf_id_set = set(str(s) for s in all_sample_ids)
+            vcf_index_map = {str(s): i for i, s in enumerate(all_sample_ids)}
+            sample_table_df = pd.read_csv(str(merged_path), sep="\t", dtype={"sample_id": str})
+            # Filter to VCF-matching + drop NaN covariates (same as _build_sample_table)
+            sample_table_df = sample_table_df[sample_table_df["sample_id"].astype(str).isin(vcf_id_set)]
+            pc_cols = [c for c in sample_table_df.columns if c.startswith("PC") and c[2:].isdigit()][:n_pcs]
+            covariate_cols = list(DEFAULT_COVARIATES) + pc_cols
+            check_cols = ["target"] + [c for c in covariate_cols if c in sample_table_df.columns]
+            for col in check_cols:
+                if col in sample_table_df.columns:
+                    sample_table_df[col] = pd.to_numeric(sample_table_df[col], errors="coerce")
+            sample_table_df = sample_table_df.dropna(subset=[c for c in check_cols if c in sample_table_df.columns])
+            surviving_ids = sample_table_df["sample_id"].astype(str).tolist()
+            keep_indices = np.array([vcf_index_map[sid] for sid in surviving_ids if sid in vcf_index_map], dtype=np.intp)
+            log(f"  {len(keep_indices)} of {len(all_sample_ids)} samples matched")
+            precache_vcfs_parallel(vcf_paths, keep_indices)
+        except Exception as exc:
+            log(f"  precache skipped: {exc}")
 
         log("=== STEP 4: Load unified genome-wide dataset ===")
         dataset = load_multi_vcf_dataset_from_files(
@@ -528,8 +541,8 @@ def run_all_of_us(
     finally:
         if dataset is not None:
             del dataset
-        # Keep VCFs on disk for cache / reruns
-        pass
+        for vcf_path in vcf_paths:
+            cleanup_local_sv_vcf(vcf_path)
         release_process_memory()
         log("=== UNIFIED FIT CLEANUP DONE ===")
 

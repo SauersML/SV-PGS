@@ -251,6 +251,23 @@ def test_select_active_variant_indices_keeps_all_variants_when_maf_filter_is_dis
     assert result.tolist() == [0, 1, 2]
 
 
+def test_select_active_variant_indices_uses_only_maf_filter():
+    variant_records = [
+        VariantRecord("rare_drop", VariantClass.SNV, "1", 100, allele_frequency=0.0005),
+        VariantRecord("structural_keep", VariantClass.DELETION_SHORT, "1", 101, allele_frequency=0.0020),
+        VariantRecord("snv_keep", VariantClass.SNV, "1", 102, allele_frequency=0.0100),
+        VariantRecord("common_ref_keep", VariantClass.SNV, "1", 103, allele_frequency=0.4000),
+        VariantRecord("common_alt_keep", VariantClass.SNV, "1", 104, allele_frequency=0.9990),
+    ]
+
+    result = select_active_variant_indices(
+        variant_records=variant_records,
+        config=ModelConfig(minimum_minor_allele_frequency=0.001),
+    )
+
+    assert result.tolist() == [1, 2, 3, 4]
+
+
 def test_fit_preprocessor_matches_streaming_variant_statistics_with_missing_values():
     genotype_matrix = np.array(
         [

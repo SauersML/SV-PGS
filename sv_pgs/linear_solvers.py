@@ -182,7 +182,7 @@ def _as_linear_operator(operator: LinearOperator | np.ndarray | jnp.ndarray) -> 
     matrix_dtype = jnp.result_type(matrix.dtype, jnp.float32)
     matrix = matrix.astype(matrix_dtype)
     return LinearOperator(
-        shape=tuple(matrix.shape),
+        shape=(int(matrix.shape[0]), int(matrix.shape[1])),
         matvec=lambda vector: matrix @ vector,
         matmat=lambda block: matrix @ block,
         dtype=matrix_dtype,

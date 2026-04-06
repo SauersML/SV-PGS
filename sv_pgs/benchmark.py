@@ -114,7 +114,7 @@ def _compute_metrics(
             pr_auc=pr_auc,
             r2=None,
             top_tail_enrichment=_top_tail_enrichment(
-                probabilities,
+                np.asarray(probabilities, dtype=np.float64),
                 targets,
                 benchmark_config.top_tail_fraction,
                 trait_type=trait_type,

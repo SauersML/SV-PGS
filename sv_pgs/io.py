@@ -8,7 +8,7 @@ import pickle
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Iterable, Iterator, Sequence
+from typing import Any, BinaryIO, Iterable, Iterator, Literal, Sequence, TextIO
 
 import numpy as np
 from sklearn.metrics import log_loss, r2_score, roc_auc_score
@@ -139,7 +139,7 @@ class _TextVcfReader:
     def close(self) -> None:
         return None
 
-    def set_threads(self, threads: int) -> None:
+    def set_threads(self, _threads: int) -> None:
         return None
 
     def __iter__(self) -> Iterator[_TextVcfRecord]:
@@ -449,6 +449,8 @@ def load_dataset_from_files(
 
     if resolved_format == "vcf":
         # genotype_matrix is already subsetted to aligned samples (int8 for VCF)
+        if genotype_matrix is None:
+            raise RuntimeError("VCF genotype matrix was not initialized.")
         raw_genotypes = as_raw_genotype_matrix(genotype_matrix)
         if default_variants is None:
             raise RuntimeError("VCF defaults were not initialized.")
@@ -653,7 +655,7 @@ def run_training_pipeline(
             (
                 str(coefficient_row["variant_id"]),
                 str(coefficient_row["variant_class"]),
-                _format_float(float(coefficient_row["beta"])),
+                _format_float(_coerce_float(coefficient_row["beta"])),
             )
             for coefficient_row in coefficient_rows
         ),
@@ -1027,7 +1029,7 @@ def _load_vcf_from_cache(
     vcf_path: Path,
     keep_sample_indices: np.ndarray | None,
     *,
-    mmap_mode: str | None = None,
+    mmap_mode: Literal["r", "r+", "w+", "c"] | None = None,
 ) -> tuple[np.ndarray, list[_VariantDefaults], VariantStatistics] | None:
     """Try to load cached VCF parse results. Returns None on miss."""
     paths = _vcf_cache_paths(vcf_path, keep_sample_indices)
@@ -1041,7 +1043,7 @@ def _load_vcf_from_cache(
 
     try:
         log(f"VCF cache hit — loading from {paths.cache_dir.name}/{paths.key}.*")
-        effective_mmap_mode = "r" if mmap_mode is None else mmap_mode
+        effective_mmap_mode: Literal["r", "r+", "w+", "c"] = "r" if mmap_mode is None else mmap_mode
         manifest = _load_vcf_cache_manifest(paths.manifest_path)
         stats_path = paths.legacy_stats_path
         expected_sample_count: int | None = None
@@ -1052,8 +1054,8 @@ def _load_vcf_from_cache(
             stats_path = paths.cache_dir / str(manifest.get("stats_file", paths.stats_path.name))
 
         genotype_matrix = np.load(paths.geno_path, mmap_mode=effective_mmap_mode)
-        with open(paths.var_path, "rb") as f:
-            variants = pickle.load(f)
+        with open(paths.var_path, "rb") as variant_handle:
+            variants = pickle.load(variant_handle)
         variant_stats = _load_vcf_cache_stats(stats_path)
         if expected_sample_count is not None and genotype_matrix.shape[0] != expected_sample_count:
             raise ValueError(f"cached sample count mismatch: {genotype_matrix.shape[0]} != {expected_sample_count}")
@@ -1352,9 +1354,9 @@ def _load_vcf_with_cache(
     vcf_path: Path,
     keep_sample_indices: np.ndarray,
     *,
-    mmap_mode: str | None,
+    mmap_mode: Literal["r", "r+", "w+", "c"] | None,
 ) -> tuple[np.ndarray, list[_VariantDefaults], VariantStatistics]:
-    effective_mmap_mode = "r" if mmap_mode is None else mmap_mode
+    effective_mmap_mode: Literal["r", "r+", "w+", "c"] = "r" if mmap_mode is None else mmap_mode
     # Check for completed cache first
     cached = _load_vcf_from_cache(
         vcf_path,
@@ -1449,15 +1451,15 @@ def _load_vcf_incremental(
             geno_prealloc_fh.truncate(record_count_hint * n_keep)
         with open(stats_bin, "wb") as stats_prealloc_fh:
             stats_prealloc_fh.truncate(record_count_hint * 24)
-        geno_fh = open(geno_bin, "r+b")
-        stats_fh = open(stats_bin, "r+b")
+        geno_fh: BinaryIO = open(geno_bin, "r+b")
+        stats_fh: BinaryIO = open(stats_bin, "r+b")
     else:
         geno_fh = open(geno_bin, "ab")
         stats_fh = open(stats_bin, "ab")
     if n_cached > 0:
         geno_fh.seek(n_cached * n_keep)
         stats_fh.seek(n_cached * 24)
-    var_fh = open(var_jsonl, "a")
+    var_fh: TextIO = open(var_jsonl, "a", encoding="utf-8")
     # Stats: 4 values per variant (sum_i64, sum_sq_i64, n_valid_i32, support_i32) = 24 bytes
 
     t_start = time.monotonic()
@@ -1584,8 +1586,8 @@ def _load_vcf_incremental(
     # Load variant metadata
     import json as _json2
     variants: list[_VariantDefaults] = []
-    with open(var_jsonl) as f:
-        for line in f:
+    with open(var_jsonl, encoding="utf-8") as var_read_handle:
+        for line in var_read_handle:
             d = _json2.loads(line)
             variants.append(_VariantDefaults(
                 variant_id=d["variant_id"],
@@ -1960,12 +1962,6 @@ def _write_delimited_rows(
         writer = csv.writer(handle, delimiter="\t")
         writer.writerow(header)
         writer.writerows(rows)
-
-
-def _read_delimited_rows(path: str | Path) -> list[dict[str, str]]:
-    return list(_iter_delimited_rows(_inspect_delimited_table(path)))
-
-
 def _inspect_delimited_table(path: str | Path) -> _DelimitedTableSpec:
     resolved_path = Path(path)
     with resolved_path.open("r", encoding="utf-8", newline="") as handle:
@@ -2258,6 +2254,10 @@ def _parse_float(value: str, column_name: str) -> float:
 
 def _format_float(value: float) -> str:
     return format(value, ".8g")
+
+
+def _coerce_float(value: object) -> float:
+    return float(str(value))
 
 
 def _normalize_variant_token(value: Any) -> str | None:

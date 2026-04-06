@@ -28,8 +28,6 @@ from sv_pgs.preprocessing import (
 )
 from sv_pgs.progress import log, mem
 
-STRUCTURAL_VARIANT_CLASSES = set(ModelConfig.structural_variant_classes())
-
 @dataclass(slots=True)
 class FittedState:
     variant_records: list[VariantRecord]
@@ -139,12 +137,8 @@ class BayesianPGS:
 
         log("selecting active variant indices...")
         active_variant_indices = select_active_variant_indices(
-            variant_records=selection_records,
+            variant_records=normalized_records,
             config=self.config,
-            standardized_genotypes=standardized_genotypes,
-            covariates=prepared_arrays.covariates,
-            targets=prepared_arrays.targets,
-            trait_type=self.config.trait_type,
         )
         log(f"active variants: {len(active_variant_indices)} / {len(normalized_records)} ({100.0*len(active_variant_indices)/max(len(normalized_records),1):.1f}%)")
         active_records = [normalized_records[int(variant_index)] for variant_index in active_variant_indices]
@@ -472,11 +466,11 @@ def _training_records_from_stats(
     records: Sequence[VariantRecord],
     variant_stats: VariantStatistics,
 ) -> list[VariantRecord]:
-    """Build training records using pre-computed support counts (no data pass)."""
+    """Build training records using cohort-derived training statistics."""
     training_records: list[VariantRecord] = []
     for variant_index, record in enumerate(records):
         support = record.training_support
-        if support is None and record.variant_class in STRUCTURAL_VARIANT_CLASSES:
+        if support is None and record.variant_class in ModelConfig.structural_variant_classes():
             support = int(variant_stats.support_counts[variant_index])
         training_records.append(
             VariantRecord(
@@ -485,7 +479,7 @@ def _training_records_from_stats(
                 chromosome=record.chromosome,
                 position=record.position,
                 length=record.length,
-                allele_frequency=record.allele_frequency,
+                allele_frequency=float(variant_stats.allele_frequencies[variant_index]),
                 quality=record.quality,
                 training_support=support,
                 is_repeat=record.is_repeat,

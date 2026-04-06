@@ -15,6 +15,7 @@ from sv_pgs import BayesianPGS
 from sv_pgs.config import ModelConfig, TraitType, VariantClass
 from sv_pgs.cli import main
 from sv_pgs.data import VariantStatistics
+from sv_pgs.genotype import Int8RawGenotypeMatrix
 from sv_pgs.io import (
     _VariantDefaults,
     _inspect_delimited_table,
@@ -32,9 +33,9 @@ import sv_pgs.io as io_module
 from sv_pgs.plink import to_bed
 
 
-@pytest.fixture(autouse=True)
-def _skip_gpu_runtime_requirement_in_cli_tests(monkeypatch: pytest.MonkeyPatch):
+def _run_cli_without_gpu_runtime(argv: list[str], monkeypatch: pytest.MonkeyPatch) -> int:
     monkeypatch.setattr(cli_module, "require_full_gpu_runtime", lambda: None)
+    return main(argv)
 
 
 def test_load_dataset_from_vcf_uses_metadata_and_sample_alignment(tmp_path: Path):
@@ -87,6 +88,7 @@ def test_load_dataset_from_vcf_uses_metadata_and_sample_alignment(tmp_path: Path
     )
 
     assert dataset.sample_ids == ["s1", "s2"]
+    assert isinstance(dataset.genotypes, Int8RawGenotypeMatrix)
     assert isinstance(dataset.genotypes.matrix, np.memmap)
     np.testing.assert_allclose(dataset.genotypes, np.array([[2.0, 1.0], [1.0, 0.0]], dtype=np.float32))
     np.testing.assert_allclose(dataset.covariates, np.array([[42.0], [35.0]], dtype=np.float32))
@@ -393,6 +395,7 @@ def test_load_dataset_from_vcf_uses_record_count_hint_for_direct_preallocation(
     )
 
     assert dataset.genotypes.shape == (2, 1)
+    assert isinstance(dataset.genotypes, Int8RawGenotypeMatrix)
     assert dataset.genotypes.matrix.flags.f_contiguous
     np.testing.assert_allclose(dataset.genotypes, np.array([[2.0], [1.0]], dtype=np.float32))
 
@@ -974,7 +977,7 @@ def test_run_training_pipeline_from_plink_inputs_writes_outputs(tmp_path: Path):
     assert len(coefficient_lines) == 4
 
 
-def test_cli_infers_binary_trait_type(tmp_path: Path):
+def test_cli_infers_binary_trait_type(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     vcf_path = tmp_path / "cohort.vcf"
     vcf_path.write_text(
         "\n".join(
@@ -1004,7 +1007,7 @@ def test_cli_infers_binary_trait_type(tmp_path: Path):
     )
 
     output_dir = tmp_path / "run"
-    exit_code = main(
+    exit_code = _run_cli_without_gpu_runtime(
         [
             "run",
             "--genotypes",
@@ -1017,7 +1020,8 @@ def test_cli_infers_binary_trait_type(tmp_path: Path):
             str(output_dir),
             "--max-outer-iterations",
             "1",
-        ]
+        ],
+        monkeypatch,
     )
 
     assert exit_code == 0
@@ -1025,7 +1029,7 @@ def test_cli_infers_binary_trait_type(tmp_path: Path):
     assert summary_payload["trait_type"] == "binary"
 
 
-def test_vcf_cli_end_to_end_recovers_binary_signal_with_symbolic_svs(tmp_path: Path):
+def test_vcf_cli_end_to_end_recovers_binary_signal_with_symbolic_svs(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     random_generator = np.random.default_rng(7)
     sample_count = 96
     sample_ids = [f"sample_{sample_index}" for sample_index in range(sample_count)]
@@ -1080,7 +1084,7 @@ def test_vcf_cli_end_to_end_recovers_binary_signal_with_symbolic_svs(tmp_path: P
     )
 
     output_dir = tmp_path / "binary_run"
-    exit_code = main(
+    exit_code = _run_cli_without_gpu_runtime(
         [
             "run",
             "--genotypes",
@@ -1099,7 +1103,8 @@ def test_vcf_cli_end_to_end_recovers_binary_signal_with_symbolic_svs(tmp_path: P
             "6",
             "--random-seed",
             "0",
-        ]
+        ],
+        monkeypatch,
     )
 
     assert exit_code == 0
@@ -1126,7 +1131,7 @@ def test_vcf_cli_end_to_end_recovers_binary_signal_with_symbolic_svs(tmp_path: P
     np.testing.assert_allclose(file_probability, loaded_probability, atol=1e-5)
 
 
-def test_plink_end_to_end_recovers_quantitative_signal_with_sv_style_alleles(tmp_path: Path):
+def test_plink_end_to_end_recovers_quantitative_signal_with_sv_style_alleles(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     random_generator = np.random.default_rng(11)
     sample_count = 84
     sample_ids = [f"sample_{sample_index}" for sample_index in range(sample_count)]
@@ -1194,7 +1199,7 @@ def test_plink_end_to_end_recovers_quantitative_signal_with_sv_style_alleles(tmp
     )
 
     output_dir = tmp_path / "quantitative_run"
-    exit_code = main(
+    exit_code = _run_cli_without_gpu_runtime(
         [
             "run",
             "--genotypes",
@@ -1213,7 +1218,8 @@ def test_plink_end_to_end_recovers_quantitative_signal_with_sv_style_alleles(tmp
             "6",
             "--random-seed",
             "0",
-        ]
+        ],
+        monkeypatch,
     )
 
     assert exit_code == 0
@@ -1271,7 +1277,7 @@ def test_multiallelic_vcf_raises_clear_error(tmp_path: Path):
         )
 
 
-def test_cli_handles_single_class_binary_targets_without_metric_crash(tmp_path: Path):
+def test_cli_handles_single_class_binary_targets_without_metric_crash(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     sample_ids = [f"sample_{sample_index}" for sample_index in range(12)]
     variant_dosage = np.asarray([0.0, 1.0, 2.0, 0.0, 1.0, 2.0, 0.0, 1.0, 2.0, 0.0, 1.0, 2.0], dtype=np.float32)
     vcf_path = tmp_path / "single_class.vcf"
@@ -1290,7 +1296,7 @@ def test_cli_handles_single_class_binary_targets_without_metric_crash(tmp_path: 
     )
 
     output_dir = tmp_path / "single_class_run"
-    exit_code = main(
+    exit_code = _run_cli_without_gpu_runtime(
         [
             "run",
             "--genotypes",
@@ -1303,7 +1309,8 @@ def test_cli_handles_single_class_binary_targets_without_metric_crash(tmp_path: 
             str(output_dir),
             "--max-outer-iterations",
             "2",
-        ]
+        ],
+        monkeypatch,
     )
 
     assert exit_code == 0

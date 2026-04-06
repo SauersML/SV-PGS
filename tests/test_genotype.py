@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from typing import Any, cast
+
 import jax.numpy as jnp
 import numpy as np
 import pytest
@@ -14,7 +16,7 @@ class _StreamingRawGenotypeMatrix(RawGenotypeMatrix):
 
     @property
     def shape(self) -> tuple[int, int]:
-        return self.matrix.shape
+        return int(self.matrix.shape[0]), int(self.matrix.shape[1])
 
     def iter_column_batches(
         self,
@@ -80,7 +82,7 @@ class _SpyInt8StreamingRawGenotypeMatrix(RawGenotypeMatrix):
 
     @property
     def shape(self) -> tuple[int, int]:
-        return self.matrix.shape
+        return int(self.matrix.shape[0]), int(self.matrix.shape[1])
 
     def iter_column_batches_i8(
         self,
@@ -466,7 +468,7 @@ def test_cupy_to_jax_uses_dlpack_when_available(monkeypatch: pytest.MonkeyPatch)
     dlpack_inputs: list[object] = []
 
     class _FakeCupyArray:
-        def __dlpack__(self, stream=None):
+        def __dlpack__(self, _stream=None):
             return "dlpack-capsule"
 
         def get(self):
@@ -475,11 +477,11 @@ def test_cupy_to_jax_uses_dlpack_when_available(monkeypatch: pytest.MonkeyPatch)
     fake_array = _FakeCupyArray()
     expected = jnp.asarray([3.0, 4.0], dtype=genotype_module.gpu_compute_jax_dtype())
 
-    monkeypatch.setattr(
-        genotype_module.jax_dlpack,
-        "from_dlpack",
-        lambda array: dlpack_inputs.append(array) or expected,
-    )
+    def _record_from_dlpack(array: object):
+        dlpack_inputs.append(array)
+        return expected
+
+    monkeypatch.setattr(genotype_module.jax_dlpack, "from_dlpack", _record_from_dlpack)
 
     result = genotype_module._cupy_to_jax(fake_array)
 
@@ -536,7 +538,7 @@ def test_try_materialize_gpu_standardizes_batches_directly_on_gpu(monkeypatch: p
     monkeypatch.setattr(genotype_module, "_try_import_cupy", lambda: _FakeCupy())
 
     assert standardized.try_materialize_gpu() is True
-    np.testing.assert_allclose(standardized._cupy_cache, expected)
+    np.testing.assert_allclose(np.asarray(cast(Any, standardized._cupy_cache)), expected)
 
 
 def test_try_materialize_gpu_prefers_int8_batches_when_available(monkeypatch: pytest.MonkeyPatch):
@@ -598,4 +600,4 @@ def test_try_materialize_gpu_prefers_int8_batches_when_available(monkeypatch: py
     assert standardized.try_materialize_gpu() is True
     assert raw.i8_requests == [[1, 3]]
     assert raw.float_requests == []
-    np.testing.assert_allclose(standardized._cupy_cache, expected)
+    np.testing.assert_allclose(np.asarray(cast(Any, standardized._cupy_cache)), expected)

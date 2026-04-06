@@ -98,15 +98,15 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     if args.command == "prepare-all-of-us-disease":
-        outputs = prepare_all_of_us_disease_sample_table(
+        prepared_outputs = prepare_all_of_us_disease_sample_table(
             request=AllOfUsDiseaseRequest(
                 disease=args.disease,
             ),
             output_path=Path(args.output),
         )
-        print("sample_table\t" + str(outputs.sample_table_path))
-        print("sql\t" + str(outputs.sql_path))
-        print("metadata\t" + str(outputs.metadata_path))
+        print("sample_table\t" + str(prepared_outputs.sample_table_path))
+        print("sql\t" + str(prepared_outputs.sql_path))
+        print("metadata\t" + str(prepared_outputs.metadata_path))
         return 0
 
     if args.command == "run-all-of-us":
@@ -163,7 +163,7 @@ def main(argv: list[str] | None = None) -> int:
     log(f"dataset loaded: samples={len(dataset.sample_ids)} variants={dataset.genotypes.shape[1]}")
     inferred_trait_type = _infer_trait_type(dataset.targets)
     log(f"inferred trait type: {inferred_trait_type.value}")
-    outputs = run_training_pipeline(
+    pipeline_outputs = run_training_pipeline(
         dataset=dataset,
         config=ModelConfig(
             trait_type=inferred_trait_type,
@@ -174,10 +174,10 @@ def main(argv: list[str] | None = None) -> int:
     )
 
     log("=== CLI RUN DONE ===")
-    print("artifact_dir\t" + str(outputs.artifact_dir))
-    print("summary\t" + str(outputs.summary_path))
-    print("predictions\t" + str(outputs.predictions_path))
-    print("coefficients\t" + str(outputs.coefficients_path))
+    print("artifact_dir\t" + str(pipeline_outputs.artifact_dir))
+    print("summary\t" + str(pipeline_outputs.summary_path))
+    print("predictions\t" + str(pipeline_outputs.predictions_path))
+    print("coefficients\t" + str(pipeline_outputs.coefficients_path))
     return 0
 
 

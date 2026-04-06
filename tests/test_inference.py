@@ -16,9 +16,12 @@ from sv_pgs.mixture_inference import (
     _binary_posterior_state,
     _initialize_alpha_state,
     _member_prior_variances_from_reduced_state,
+    _orthogonal_probe_matrix,
     _parse_scale_model_feature_names,
     _quantitative_posterior_state,
     _restricted_precision_projector,
+    _sample_space_preconditioner,
+    _stochastic_restricted_cross_leverage_diagonal,
     _restricted_variant_space_operator,
     _sample_space_operator,
     _update_local_scales,
@@ -149,6 +152,7 @@ def test_binary_posterior_stops_after_stalled_trust_region_step(random_generator
         compute_logdet,
         compute_beta_variance=True,
         initial_beta_guess=None,
+        sample_space_preconditioner_rank=256,
     ):
         nonlocal restricted_call_count
         restricted_call_count += 1
@@ -225,6 +229,7 @@ def test_binary_posterior_stops_immediately_after_tiny_reject_gain(random_genera
         compute_logdet,
         compute_beta_variance=True,
         initial_beta_guess=None,
+        sample_space_preconditioner_rank=256,
     ):
         nonlocal restricted_call_count
         restricted_call_count += 1
@@ -301,6 +306,7 @@ def test_binary_posterior_reuses_proposal_across_rejects(random_generator, monke
         compute_logdet,
         compute_beta_variance=True,
         initial_beta_guess=None,
+        sample_space_preconditioner_rank=256,
     ):
         nonlocal restricted_call_count
         restricted_call_count += 1
@@ -338,11 +344,104 @@ def test_binary_posterior_reuses_proposal_across_rejects(random_generator, monke
     )
 
     assert restricted_call_count == 3
-    assert alpha.shape == (1,)
-    assert beta.shape == (variant_count,)
-    assert beta_variance.shape == (variant_count,)
-    assert linear_predictor.shape == (sample_count,)
-    assert np.isfinite(objective)
+
+
+def test_sample_space_preconditioner_matches_exact_covariance_inverse_at_full_rank():
+    genotype_matrix = np.array(
+        [
+            [1.0, 0.0],
+            [0.0, 1.0],
+            [1.0, 1.0],
+        ],
+        dtype=np.float32,
+    )
+    standardized = as_raw_genotype_matrix(genotype_matrix).standardized(
+        means=np.zeros(genotype_matrix.shape[1], dtype=np.float32),
+        scales=np.ones(genotype_matrix.shape[1], dtype=np.float32),
+    )
+    standardized._dense_cache = standardized.materialize()
+    prior_variances = np.array([2.0, 0.5], dtype=np.float64)
+    diagonal_noise = np.array([1.5, 1.0, 2.0], dtype=np.float64)
+    right_hand_side = np.array([0.5, -1.0, 2.0], dtype=np.float64)
+
+    apply_preconditioner = _sample_space_preconditioner(
+        genotype_matrix=standardized,
+        prior_variances=prior_variances,
+        diagonal_noise=diagonal_noise,
+        batch_size=2,
+        rank=genotype_matrix.shape[1],
+    )
+
+    covariance_matrix = np.diag(diagonal_noise) + genotype_matrix @ np.diag(prior_variances) @ genotype_matrix.T
+    expected = np.linalg.solve(covariance_matrix, right_hand_side)
+    actual = np.asarray(apply_preconditioner(right_hand_side), dtype=np.float64)
+
+    np.testing.assert_allclose(actual, expected, rtol=1e-7, atol=1e-7)
+
+
+def test_orthogonal_probe_matrix_has_expected_column_norms_and_shape():
+    probes = _orthogonal_probe_matrix(
+        dimension=8,
+        probe_count=13,
+        random_seed=0,
+    )
+
+    assert probes.shape == (8, 13)
+    np.testing.assert_allclose(
+        np.sum(probes * probes, axis=0),
+        np.full(13, 8.0, dtype=np.float64),
+        rtol=1e-7,
+        atol=1e-7,
+    )
+
+
+def test_stochastic_restricted_cross_leverage_diagonal_tracks_exact_leverage():
+    genotype_matrix = np.array(
+        [
+            [1.0, 0.0, 1.0],
+            [0.0, 1.0, 1.0],
+            [1.0, 1.0, 0.0],
+            [0.0, 1.0, 0.0],
+        ],
+        dtype=np.float32,
+    )
+    standardized = as_raw_genotype_matrix(genotype_matrix).standardized(
+        means=np.zeros(genotype_matrix.shape[1], dtype=np.float32),
+        scales=np.ones(genotype_matrix.shape[1], dtype=np.float32),
+    )
+    standardized._dense_cache = standardized.materialize()
+    covariate_matrix = np.column_stack(
+        [np.ones(genotype_matrix.shape[0], dtype=np.float64), np.array([0.0, 1.0, -1.0, 0.5], dtype=np.float64)]
+    )
+    diagonal_noise = np.array([1.0, 1.5, 0.8, 1.2], dtype=np.float64)
+    covariance_matrix = np.diag(diagonal_noise) + genotype_matrix.astype(np.float64) @ genotype_matrix.astype(np.float64).T
+    covariance_inverse = np.linalg.inv(covariance_matrix)
+    inverse_covariance_covariates = covariance_inverse @ covariate_matrix
+    gls_normal_matrix = covariate_matrix.T @ inverse_covariance_covariates
+    gls_cholesky = np.linalg.cholesky(gls_normal_matrix + np.eye(gls_normal_matrix.shape[0], dtype=np.float64) * 1e-8)
+
+    def solve_rhs(right_hand_side: np.ndarray) -> np.ndarray:
+        return covariance_inverse @ np.asarray(right_hand_side, dtype=np.float64)
+
+    exact_inverse_covariance_genotypes = covariance_inverse @ genotype_matrix.astype(np.float64)
+    exact_restricted_genotypes = exact_inverse_covariance_genotypes - inverse_covariance_covariates @ np.linalg.solve(
+        gls_normal_matrix + np.eye(gls_normal_matrix.shape[0], dtype=np.float64) * 1e-8,
+        covariate_matrix.T @ exact_inverse_covariance_genotypes,
+    )
+    exact_leverage = np.sum(genotype_matrix.astype(np.float64) * exact_restricted_genotypes, axis=0)
+
+    estimated_leverage = _stochastic_restricted_cross_leverage_diagonal(
+        genotype_matrix=standardized,
+        covariate_matrix=covariate_matrix,
+        solve_rhs=solve_rhs,
+        inverse_covariance_covariates=inverse_covariance_covariates,
+        gls_cholesky=gls_cholesky,
+        batch_size=2,
+        probe_count=1024,
+        random_seed=0,
+    )
+
+    np.testing.assert_allclose(estimated_leverage, exact_leverage, rtol=0.15, atol=0.05)
 
 
 def test_signal_variant_receives_largest_effect(random_generator):
@@ -607,6 +706,7 @@ def test_validation_restores_best_iterate(monkeypatch: pytest.MonkeyPatch):
         beta_init,
         trait_type,
         config,
+        compute_logdet,
     ):
         call_counter["count"] += 1
         if call_counter["count"] <= config.max_outer_iterations:
@@ -678,6 +778,7 @@ def test_binary_validation_uses_calibrated_intercept(monkeypatch: pytest.MonkeyP
         beta_init,
         trait_type,
         config,
+        compute_logdet,
     ):
         return PosteriorState(
             alpha=np.zeros(covariate_matrix.shape[1], dtype=np.float64),

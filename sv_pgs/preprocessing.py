@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import hashlib
 from dataclasses import dataclass
-from typing import Iterator, Sequence
+from typing import Iterator, Sequence, cast
 
 import numpy as np
 
@@ -14,9 +14,11 @@ from sv_pgs.config import ModelConfig, VariantClass
 from sv_pgs.data import PreparedArrays, TieGroup, TieMap, VariantRecord, VariantStatistics
 from sv_pgs.genotype import (
     DenseRawGenotypeMatrix,
+    Int8BatchCapable,
     RawGenotypeBatch,
     RawGenotypeMatrix,
     StandardizedGenotypeMatrix,
+    _supports_int8_batches,
     _standardize_batch,
     as_raw_genotype_matrix,
     auto_batch_size,
@@ -75,10 +77,10 @@ def compute_variant_statistics(
     support_counts = np.zeros(variant_count, dtype=np.int32)
     centered_sum_squares = np.zeros(variant_count, dtype=np.float64)
 
-    use_i8 = hasattr(raw_genotypes, "iter_column_batches_i8")
+    use_i8 = _supports_int8_batches(raw_genotypes)
     if use_i8:
         log("  using int8 native path (4x less IO per batch)")
-        batch_iter = raw_genotypes.iter_column_batches_i8(batch_size=batch_size)
+        batch_iter = cast(Int8BatchCapable, raw_genotypes).iter_column_batches_i8(batch_size=batch_size)
     else:
         log(f"  using float32 path (type={type(raw_genotypes).__name__})")
         batch_iter = raw_genotypes.iter_column_batches(batch_size=batch_size)
@@ -196,11 +198,6 @@ def fit_preprocessor(
 def select_active_variant_indices(
     variant_records: Sequence[VariantRecord],
     config: ModelConfig,
-    *,
-    standardized_genotypes: StandardizedGenotypeMatrix | np.ndarray | None = None,
-    covariates: np.ndarray | None = None,
-    targets: np.ndarray | None = None,
-    trait_type: object | None = None,
 ) -> np.ndarray:
     n_total = len(variant_records)
     if n_total == 0:
