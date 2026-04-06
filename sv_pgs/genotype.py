@@ -26,6 +26,7 @@ DEFAULT_GENOTYPE_BATCH_SIZE = 1024  # fallback when sample count is unknown
 #   500 MB / (447k samples * 4 bytes) ≈ 279 variants per batch
 BED_READER_TARGET_BATCH_BYTES = 500_000_000
 MIN_BED_READER_BATCH_SIZE = 32  # always read at least this many variants
+STANDARDIZED_STREAMING_TARGET_BATCH_BYTES = 128_000_000
 
 # If the reduced genotype matrix (after tie-group dedup) is smaller than 4 GB,
 # cache it in RAM.  This avoids re-reading from disk on every EM iteration
@@ -793,7 +794,7 @@ class StandardizedGenotypeMatrix:
             return
         if self.raw is None:
             raise RuntimeError("streaming genotype batches require raw backing storage or a materialized cache.")
-        safe_batch_size = max(int(batch_size), 1)
+        safe_batch_size = _effective_standardized_streaming_batch_size(self.shape[0], batch_size)
         local_start = 0
         if _supports_int8_batches(self.raw):
             raw_int8 = cast(Int8BatchCapable, self.raw)
@@ -967,6 +968,19 @@ def auto_batch_size(sample_count: int) -> int:
     bytes_per_variant = sample_count * 4  # float32
     memory_capped = max(BED_READER_TARGET_BATCH_BYTES // max(bytes_per_variant, 1), 1)
     return max(MIN_BED_READER_BATCH_SIZE, min(DEFAULT_GENOTYPE_BATCH_SIZE, memory_capped))
+
+
+def _effective_standardized_streaming_batch_size(
+    sample_count: int,
+    requested_batch_size: int,
+) -> int:
+    if sample_count < 1:
+        raise ValueError("sample_count must be positive.")
+    if requested_batch_size < 1:
+        raise ValueError("requested_batch_size must be positive.")
+    bytes_per_variant = sample_count * np.dtype(np.float32).itemsize
+    memory_capped_batch_size = max(STANDARDIZED_STREAMING_TARGET_BATCH_BYTES // max(bytes_per_variant, 1), 1)
+    return max(1, min(requested_batch_size, max(memory_capped_batch_size, MIN_BED_READER_BATCH_SIZE)))
 
 
 # Cap the batch size so each batch doesn't exceed the memory budget.

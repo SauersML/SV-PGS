@@ -1112,35 +1112,37 @@ def _sample_space_operator(
     batch_size: int = 1024,
 ):
     compute_dtype = gpu_compute_jax_dtype()
-    compute_np_dtype = gpu_compute_numpy_dtype()
     diag_noise_jax = jnp.asarray(diagonal_noise, dtype=compute_dtype)
     prior_var_jax = jnp.asarray(prior_variances, dtype=compute_dtype)
-    diag_noise_np = np.asarray(diagonal_noise, dtype=compute_np_dtype)
-    prior_var_np = np.asarray(prior_variances, dtype=compute_np_dtype)
+    streaming_dtype = np.float32
 
     def matvec(vector) -> jnp.ndarray:
         v = jnp.asarray(vector, dtype=compute_dtype)
         if genotype_matrix._cupy_cache is None and not genotype_matrix.supports_jax_dense_ops():
-            vector_np = np.asarray(v, dtype=compute_np_dtype)
-            genotype_term = np.zeros(genotype_matrix.shape[0], dtype=compute_np_dtype)
+            vector_np = np.asarray(v, dtype=streaming_dtype)
+            genotype_term = np.zeros(genotype_matrix.shape[0], dtype=streaming_dtype)
+            prior_var_stream = np.asarray(prior_variances, dtype=streaming_dtype)
+            diag_noise_stream = np.asarray(diagonal_noise, dtype=streaming_dtype)
             for batch in genotype_matrix.iter_column_batches(batch_size=batch_size):
-                genotype_batch = np.asarray(batch.values, dtype=compute_np_dtype)
-                scaled_projection = prior_var_np[batch.variant_indices] * (genotype_batch.T @ vector_np)
+                genotype_batch = np.asarray(batch.values, dtype=streaming_dtype)
+                scaled_projection = prior_var_stream[batch.variant_indices] * (genotype_batch.T @ vector_np)
                 genotype_term += genotype_batch @ scaled_projection
-            return jnp.asarray(diag_noise_np * vector_np + genotype_term, dtype=compute_dtype)
+            return jnp.asarray(diag_noise_stream * vector_np + genotype_term, dtype=compute_dtype)
         projected = genotype_matrix.transpose_matvec(v)
         return diag_noise_jax * v + genotype_matrix.matvec(prior_var_jax * projected)
 
     def matmat(matrix) -> jnp.ndarray:
         matrix_jax = jnp.asarray(matrix, dtype=compute_dtype)
         if genotype_matrix._cupy_cache is None and not genotype_matrix.supports_jax_dense_ops():
-            matrix_np = np.asarray(matrix_jax, dtype=compute_np_dtype)
-            genotype_term = np.zeros((genotype_matrix.shape[0], matrix_np.shape[1]), dtype=compute_np_dtype)
+            matrix_np = np.asarray(matrix_jax, dtype=streaming_dtype)
+            genotype_term = np.zeros((genotype_matrix.shape[0], matrix_np.shape[1]), dtype=streaming_dtype)
+            prior_var_stream = np.asarray(prior_variances, dtype=streaming_dtype)
+            diag_noise_stream = np.asarray(diagonal_noise, dtype=streaming_dtype)
             for batch in genotype_matrix.iter_column_batches(batch_size=batch_size):
-                genotype_batch = np.asarray(batch.values, dtype=compute_np_dtype)
-                scaled_projection = prior_var_np[batch.variant_indices, None] * (genotype_batch.T @ matrix_np)
+                genotype_batch = np.asarray(batch.values, dtype=streaming_dtype)
+                scaled_projection = prior_var_stream[batch.variant_indices, None] * (genotype_batch.T @ matrix_np)
                 genotype_term += genotype_batch @ scaled_projection
-            return jnp.asarray(diag_noise_np[:, None] * matrix_np + genotype_term, dtype=compute_dtype)
+            return jnp.asarray(diag_noise_stream[:, None] * matrix_np + genotype_term, dtype=compute_dtype)
         # X^T @ M gives (p, k), scale by prior variance, then X @ result gives (n, k)
         projected = genotype_matrix.transpose_matmat(matrix_jax)  # (p, k)
         scaled = prior_var_jax[:, None] * projected  # (p, k)
@@ -1357,6 +1359,22 @@ def _sample_space_gpu_preconditioner(
         return weighted_rhs - correction
 
     return apply_low_rank
+
+
+def _effective_sample_space_preconditioner_rank(
+    genotype_matrix: StandardizedGenotypeMatrix,
+    sample_count: int,
+    variant_count: int,
+    requested_rank: int,
+) -> int:
+    resolved_rank = max(int(requested_rank), 0)
+    if resolved_rank == 0:
+        return 0
+    if genotype_matrix._cupy_cache is not None:
+        return min(resolved_rank, variant_count)
+    if sample_count < 32_768 or variant_count < 65_536:
+        return min(resolved_rank, variant_count)
+    return min(max(resolved_rank, 1_024), variant_count)
 
 
 def _solve_sample_space_rhs_gpu(
@@ -2138,6 +2156,12 @@ def _restricted_posterior_state(
         diagonal_noise,
         batch_size=posterior_variance_batch_size,
     )
+    effective_sample_space_preconditioner_rank = _effective_sample_space_preconditioner_rank(
+        genotype_matrix=genotype_matrix,
+        sample_count=sample_count,
+        variant_count=variant_count,
+        requested_rank=sample_space_preconditioner_rank,
+    )
     if genotype_matrix._cupy_cache is not None:
         log(f"    restricted posterior: GPU block-CG sample-space solve (p={variant_count}, n={sample_count})")
         sample_space_preconditioner_gpu = _sample_space_gpu_preconditioner(
@@ -2145,7 +2169,7 @@ def _restricted_posterior_state(
             prior_variances=prior_variances,
             diagonal_noise=diagonal_noise,
             batch_size=posterior_variance_batch_size,
-            rank=sample_space_preconditioner_rank,
+            rank=effective_sample_space_preconditioner_rank,
         )
 
         def solve_rhs_iterative(right_hand_side: np.ndarray) -> np.ndarray:
@@ -2159,13 +2183,16 @@ def _restricted_posterior_state(
                 preconditioner=sample_space_preconditioner_gpu,
             )
     else:
-        log(f"    restricted posterior: PCG sample-space solve (p={variant_count}, n={sample_count})")
+        log(
+            "    restricted posterior: CPU block-PCG sample-space solve "
+            + f"(p={variant_count}, n={sample_count}, preconditioner_rank={effective_sample_space_preconditioner_rank})"
+        )
         sample_space_preconditioner = _sample_space_preconditioner(
             genotype_matrix=genotype_matrix,
             prior_variances=prior_variances,
             diagonal_noise=diagonal_noise,
             batch_size=posterior_variance_batch_size,
-            rank=sample_space_preconditioner_rank,
+            rank=effective_sample_space_preconditioner_rank,
         )
 
         def solve_rhs_iterative(right_hand_side: np.ndarray) -> np.ndarray:
