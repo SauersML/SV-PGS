@@ -484,12 +484,23 @@ def run_all_of_us(
 
         log("=== STEP 3.5: Parallel VCF precache ===")
         from sv_pgs.io import precache_vcfs_parallel, _read_vcf_sample_ids
-        # Get sample indices for the first VCF (all VCFs have the same samples)
+        # Compute keep_indices in SAMPLE-TABLE ORDER (same as loader's _align_sample_ids).
+        # Must match exactly or the cache key won't match.
         all_sample_ids = _read_vcf_sample_ids(vcf_paths[0])
-        # Read the sample table to find which sample IDs to keep
+        vcf_id_set = set(str(s) for s in all_sample_ids)
+        vcf_index_map = {str(s): i for i, s in enumerate(all_sample_ids)}
         sample_table_df = pd.read_csv(str(merged_path), sep="\t", dtype={"sample_id": str})
-        keep_ids = set(sample_table_df["sample_id"].dropna().astype(str))
-        keep_indices = np.array([i for i, sid in enumerate(all_sample_ids) if sid in keep_ids], dtype=np.intp)
+        # Filter to VCF-matching + drop NaN covariates (same as _build_sample_table)
+        sample_table_df = sample_table_df[sample_table_df["sample_id"].astype(str).isin(vcf_id_set)]
+        pc_cols = [c for c in sample_table_df.columns if c.startswith("PC") and c[2:].isdigit()][:n_pcs]
+        covariate_cols = list(DEFAULT_COVARIATES) + pc_cols
+        check_cols = ["target"] + [c for c in covariate_cols if c in sample_table_df.columns]
+        for col in check_cols:
+            if col in sample_table_df.columns:
+                sample_table_df[col] = pd.to_numeric(sample_table_df[col], errors="coerce")
+        sample_table_df = sample_table_df.dropna(subset=[c for c in check_cols if c in sample_table_df.columns])
+        surviving_ids = sample_table_df["sample_id"].astype(str).tolist()
+        keep_indices = np.array([vcf_index_map[sid] for sid in surviving_ids if sid in vcf_index_map], dtype=np.intp)
         log(f"  {len(keep_indices)} of {len(all_sample_ids)} samples matched")
         precache_vcfs_parallel(vcf_paths, keep_indices)
 
