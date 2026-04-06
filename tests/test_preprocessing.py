@@ -1,9 +1,10 @@
 import numpy as np
 import pytest
 
-from sv_pgs.config import ModelConfig, VariantClass
+from sv_pgs.config import ModelConfig, TraitType, VariantClass
 from sv_pgs.data import VariantRecord
 from sv_pgs.genotype import as_raw_genotype_matrix
+from sv_pgs.plink import PLINK_MISSING_INT8
 import sv_pgs.preprocessing as preprocessing_module
 from sv_pgs.preprocessing import (
     Preprocessor,
@@ -172,6 +173,35 @@ def test_tie_map_groups_monomorphic_columns_regardless_of_raw_level():
     assert tie_map.original_to_reduced.tolist() == [0, 0, 0]
 
 
+def test_tie_map_groups_monomorphic_raw_columns_even_with_different_missingness():
+    raw_genotype_matrix = np.array(
+        [
+            [0, 2],
+            [PLINK_MISSING_INT8, 2],
+            [0, 2],
+            [0, PLINK_MISSING_INT8],
+        ],
+        dtype=np.int8,
+    )
+    covariate_matrix = np.zeros((raw_genotype_matrix.shape[0], 1), dtype=np.float32)
+    target_vector = np.array([0.0, 0.0, 1.0, 1.0], dtype=np.float32)
+    variant_records = [
+        VariantRecord("variant_0", VariantClass.SNV, "1", 100),
+        VariantRecord("variant_1", VariantClass.SNV, "1", 101),
+    ]
+    raw_genotypes = as_raw_genotype_matrix(raw_genotype_matrix)
+    prepared_arrays = fit_preprocessor(raw_genotypes, covariate_matrix, target_vector, ModelConfig())
+    standardized_genotypes = raw_genotypes.standardized(
+        prepared_arrays.means,
+        prepared_arrays.scales,
+    )
+
+    tie_map = build_tie_map(standardized_genotypes, variant_records, ModelConfig())
+
+    assert tie_map.kept_indices.tolist() == [0]
+    assert tie_map.original_to_reduced.tolist() == [0, 0]
+
+
 def test_tie_map_handles_dense_float_columns_with_more_than_127_distinct_values():
     sample_count = 256
     dense_genotypes = np.column_stack(
@@ -285,6 +315,45 @@ def test_select_active_variant_indices_keeps_all_post_maf_variants():
     )
 
     assert result.tolist() == [0, 1, 2, 3, 4]
+
+
+def test_select_active_variant_indices_screens_to_top_signal_and_keeps_structural_variants():
+    genotype_matrix = np.array(
+        [
+            [3.0, 0.0, 0.2],
+            [2.5, 0.0, -0.1],
+            [-2.5, 0.0, 0.0],
+            [-3.0, 1.0, 0.1],
+        ],
+        dtype=np.float32,
+    )
+    covariate_matrix = np.ones((genotype_matrix.shape[0], 1), dtype=np.float32)
+    target_vector = np.array([1.0, 1.0, 0.0, 0.0], dtype=np.float32)
+    prepared_arrays = fit_preprocessor(genotype_matrix, covariate_matrix, target_vector, ModelConfig())
+    standardized_genotypes = as_raw_genotype_matrix(genotype_matrix).standardized(
+        prepared_arrays.means,
+        prepared_arrays.scales,
+    )
+    variant_records = [
+        VariantRecord("snv_signal", VariantClass.SNV, "1", 100, allele_frequency=0.1),
+        VariantRecord("structural_keep", VariantClass.DELETION_SHORT, "1", 101, allele_frequency=0.1),
+        VariantRecord("snv_noise", VariantClass.SNV, "1", 102, allele_frequency=0.1),
+    ]
+
+    result = select_active_variant_indices(
+        variant_records=variant_records,
+        config=ModelConfig(
+            trait_type=TraitType.BINARY,
+            minimum_minor_allele_frequency=0.0,
+            maximum_active_variants=2,
+        ),
+        standardized_genotypes=standardized_genotypes,
+        covariates=prepared_arrays.covariates,
+        targets=prepared_arrays.targets,
+        trait_type=TraitType.BINARY,
+    )
+
+    assert result.tolist() == [0, 1]
 
 
 def test_fit_preprocessor_matches_streaming_variant_statistics_with_missing_values():

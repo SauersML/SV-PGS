@@ -1132,6 +1132,7 @@ def _sample_space_operator(
         matvec=matvec,
         matmat=matmat,
         dtype=compute_dtype,
+        jax_compatible=genotype_matrix.supports_jax_dense_ops(),
     )
 
 
@@ -1187,12 +1188,14 @@ def _sample_space_preconditioner(
         kth=selected_rank - 1,
     )[:selected_rank].astype(np.int32, copy=False)
     selected_variant_indices.sort()
-    if genotype_matrix._cupy_cache is not None:
+    selected_gpu_genotypes = genotype_matrix.try_materialize_gpu_subset(selected_variant_indices)
+    if selected_gpu_genotypes is not None:
         import cupy as cp
         from cupyx.scipy.linalg import solve_triangular as cp_solve_triangular
 
-        log(f"      sample-space preconditioner: GPU Woodbury rank={selected_rank}")
-        weighted_selected_genotypes = genotype_matrix._cupy_cache[:, selected_variant_indices]
+        gpu_cache_source = "full" if genotype_matrix._cupy_cache is not None else "subset"
+        log(f"      sample-space preconditioner: GPU Woodbury rank={selected_rank} source={gpu_cache_source}")
+        weighted_selected_genotypes = selected_gpu_genotypes
         weighted_selected_genotypes = weighted_selected_genotypes * cp.asarray(
             np.sqrt(np.asarray(prior_variances[selected_variant_indices], dtype=np.float32)),
             dtype=cp.float32,
@@ -1324,6 +1327,7 @@ def _restricted_variant_space_operator(
         matvec=matvec,
         matmat=matmat,
         dtype=compute_dtype,
+        jax_compatible=genotype_matrix.supports_jax_dense_ops(),
     )
 
 

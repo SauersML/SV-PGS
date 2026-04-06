@@ -9,10 +9,11 @@ from typing import Any, Iterator, Protocol, Sequence, TypeGuard, cast
 
 import sv_pgs._jax  # noqa: F401
 import jax
+from jax import core as jax_core
 import jax.numpy as jnp
 from jax import dlpack as jax_dlpack
 import numpy as np
-from sv_pgs._jax import gpu_compute_jax_dtype, gpu_compute_numpy_dtype
+from sv_pgs._jax import gpu_compute_jax_dtype, gpu_compute_numpy_dtype, jax_dense_linear_algebra_preferred
 from sv_pgs.plink import PLINK_MISSING_INT8, open_bed
 from sv_pgs.progress import log, mem
 
@@ -526,6 +527,9 @@ class StandardizedGenotypeMatrix:
     sample_count: int | None = field(default=None, repr=False)
     _dense_cache: np.ndarray | None = field(init=False, default=None, repr=False)
     _cupy_cache: Any | None = field(init=False, default=None, repr=False)  # cupy.ndarray
+    _jax_cache: jax.Array | None = field(init=False, default=None, repr=False)
+    _cupy_subset_cache: Any | None = field(init=False, default=None, repr=False)
+    _cupy_subset_cache_local_indices: np.ndarray | None = field(init=False, default=None, repr=False)
     _local_cache_directory: tempfile.TemporaryDirectory[str] | None = field(init=False, default=None, repr=False)
     _n_samples: int = field(init=False, default=0, repr=False)
 
@@ -619,6 +623,67 @@ class StandardizedGenotypeMatrix:
             self._cupy_cache = None
             return False
 
+    def try_materialize_gpu_subset(
+        self,
+        local_variant_indices: Sequence[int] | np.ndarray,
+    ) -> Any | None:
+        """Materialize a selected standardized column subset onto GPU memory when possible."""
+        resolved_local_indices = np.asarray(local_variant_indices, dtype=np.int32)
+        if resolved_local_indices.ndim != 1:
+            raise ValueError("local_variant_indices must be 1D.")
+        if resolved_local_indices.size == 0:
+            return None
+        if self._cupy_cache is not None:
+            return self._cupy_cache[:, resolved_local_indices]
+        if (
+            self._cupy_subset_cache is not None
+            and self._cupy_subset_cache_local_indices is not None
+            and np.array_equal(self._cupy_subset_cache_local_indices, resolved_local_indices)
+        ):
+            return self._cupy_subset_cache
+
+        cupy = _try_import_cupy()
+        if cupy is None:
+            return None
+        nbytes = int(self.shape[0]) * int(resolved_local_indices.shape[0]) * 4
+        budget_bytes = _gpu_materialization_budget_bytes(cupy)
+        if nbytes > budget_bytes:
+            log(
+                f"    skipping GPU subset materialization: need {nbytes / 1e9:.1f} GB, "
+                f"budget is {budget_bytes / 1e9:.1f} GB  mem={mem()}"
+            )
+            return None
+        try:
+            if self._dense_cache is not None:
+                gpu_subset = cupy.asarray(self._dense_cache[:, resolved_local_indices], dtype=cupy.float32)
+            else:
+                if self.raw is None:
+                    raise RuntimeError("GPU subset materialization requires raw backing storage or a dense cache.")
+                gpu_subset = cupy.empty((self.shape[0], resolved_local_indices.shape[0]), dtype=cupy.float32, order="F")
+                selected_variant_indices = self.variant_indices[resolved_local_indices]
+                for batch_slice, standardized_batch in _iter_standardized_gpu_batches(
+                    self.raw,
+                    selected_variant_indices,
+                    self.means,
+                    self.scales,
+                    batch_size=auto_batch_size(self.shape[0]),
+                    cupy=cupy,
+                ):
+                    gpu_subset[:, batch_slice] = standardized_batch
+            cupy.cuda.Device().synchronize()
+            self._cupy_subset_cache = gpu_subset
+            self._cupy_subset_cache_local_indices = resolved_local_indices.copy()
+            log(
+                "    CuPy GPU subset ready "
+                + f"({resolved_local_indices.shape[0]} variants, {nbytes / 1e9:.1f} GB)  mem={mem()}"
+            )
+            return self._cupy_subset_cache
+        except Exception as exc:
+            log(f"    CuPy GPU subset upload failed ({exc})  mem={mem()}")
+            self._cupy_subset_cache = None
+            self._cupy_subset_cache_local_indices = None
+            return None
+
     def try_materialize(self) -> bool:
         """Materialize into RAM if below the auto-materialize threshold.
 
@@ -631,8 +696,23 @@ class StandardizedGenotypeMatrix:
             return False
         log(f"    auto-materializing {self.shape[1]} variants x {self.shape[0]} samples ({nbytes / 1e9:.1f} GB) into RAM  mem={mem()}")
         self._dense_cache = self.materialize()
+        self._jax_cache = None
         log(f"    materialized  mem={mem()}")
         return True
+
+    def supports_jax_dense_ops(self) -> bool:
+        return jax_dense_linear_algebra_preferred() and (self._dense_cache is not None or self._jax_cache is not None)
+
+    def _ensure_jax_cache(self) -> jax.Array:
+        if self._jax_cache is not None:
+            return self._jax_cache
+        if self._dense_cache is None:
+            raise RuntimeError("JAX cache requires a dense materialized genotype matrix.")
+        jax_cache = jnp.asarray(self._dense_cache, dtype=gpu_compute_jax_dtype())
+        if isinstance(jax_cache, jax_core.Tracer):
+            return jax_cache
+        self._jax_cache = jax_cache
+        return self._jax_cache
 
     def try_cache_locally(self) -> bool:
         """Rebase onto a local int8 memmap to avoid repeated upstream streaming passes."""
@@ -691,6 +771,8 @@ class StandardizedGenotypeMatrix:
         )
         if self._cupy_cache is not None:
             subset._cupy_cache = self._cupy_cache[:, resolved_local_indices]
+        if self._jax_cache is not None:
+            subset._jax_cache = self._jax_cache[:, resolved_local_indices]
         elif self._dense_cache is not None:
             subset._dense_cache = np.asarray(self._dense_cache[:, resolved_local_indices], dtype=np.float32)
         subset._local_cache_directory = self._local_cache_directory
@@ -746,11 +828,13 @@ class StandardizedGenotypeMatrix:
             return self._dense_cache
         if self._cupy_cache is not None:
             self._dense_cache = self._cupy_cache.get()  # cupy -> numpy
+            self._jax_cache = None
             return self._dense_cache
         matrix = np.empty(self.shape, dtype=np.float32)
         for batch in self.iter_column_batches(batch_size=batch_size):
             matrix[:, batch.variant_indices] = batch.values
         self._dense_cache = matrix
+        self._jax_cache = None
         return matrix
 
     def matvec(self, coefficients: np.ndarray | jnp.ndarray, batch_size: int = DEFAULT_GENOTYPE_BATCH_SIZE) -> jnp.ndarray:
@@ -767,6 +851,11 @@ class StandardizedGenotypeMatrix:
             coeff_cupy = _to_cupy_float32(coeff_jax)
             result = self._cupy_cache @ coeff_cupy
             return _cupy_to_jax(result)
+        if self.supports_jax_dense_ops():
+            coeff_jax = jnp.ravel(jnp.asarray(coefficients, dtype=gpu_compute_jax_dtype()))
+            if coeff_jax.shape[0] != self.shape[1]:
+                raise ValueError("coefficient vector must match genotype column count.")
+            return self._ensure_jax_cache() @ coeff_jax
         coeff_np = np.asarray(coefficients, dtype=gpu_compute_numpy_dtype()).ravel()
         if coeff_np.shape[0] != self.shape[1]:
             raise ValueError("coefficient vector must match genotype column count.")
@@ -788,6 +877,11 @@ class StandardizedGenotypeMatrix:
                 return _as_gpu_compute_jax(np.zeros((self.shape[0], matrix_jax.shape[1]), dtype=np.float32))
             result = self._cupy_cache @ _to_cupy_float32(matrix_jax)
             return _cupy_to_jax(result)
+        if self.supports_jax_dense_ops():
+            matrix_jax = jnp.asarray(matrix, dtype=gpu_compute_jax_dtype())
+            if matrix_jax.ndim != 2 or matrix_jax.shape[0] != self.shape[1]:
+                raise ValueError("variant matrix must match genotype column count.")
+            return self._ensure_jax_cache() @ matrix_jax
         m_np = np.asarray(matrix, dtype=gpu_compute_numpy_dtype())
         if m_np.ndim != 2 or m_np.shape[0] != self.shape[1]:
             raise ValueError("variant matrix must match genotype column count.")
@@ -809,6 +903,11 @@ class StandardizedGenotypeMatrix:
                 return _as_gpu_compute_jax(np.zeros(self.shape[1], dtype=np.float32))
             result = self._cupy_cache.T @ _to_cupy_float32(vector_jax)
             return _cupy_to_jax(result)
+        if self.supports_jax_dense_ops():
+            vector_jax = jnp.ravel(jnp.asarray(vector, dtype=gpu_compute_jax_dtype()))
+            if vector_jax.shape[0] != self.shape[0]:
+                raise ValueError("sample vector must match genotype row count.")
+            return self._ensure_jax_cache().T @ vector_jax
         v_np = np.asarray(vector, dtype=gpu_compute_numpy_dtype()).ravel()
         if v_np.shape[0] != self.shape[0]:
             raise ValueError("sample vector must match genotype row count.")
@@ -829,6 +928,11 @@ class StandardizedGenotypeMatrix:
                 return _as_gpu_compute_jax(np.zeros((self.shape[1], matrix_jax.shape[1]), dtype=np.float32))
             result = self._cupy_cache.T @ _to_cupy_float32(matrix_jax)
             return _cupy_to_jax(result)
+        if self.supports_jax_dense_ops():
+            matrix_jax = jnp.asarray(matrix, dtype=gpu_compute_jax_dtype())
+            if matrix_jax.ndim != 2 or matrix_jax.shape[0] != self.shape[0]:
+                raise ValueError("sample matrix must match genotype row count.")
+            return self._ensure_jax_cache().T @ matrix_jax
         m_np = np.asarray(matrix, dtype=gpu_compute_numpy_dtype())
         if m_np.ndim != 2 or m_np.shape[0] != self.shape[0]:
             raise ValueError("sample matrix must match genotype row count.")

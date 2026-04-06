@@ -100,6 +100,11 @@ def t4_fast_math_enabled() -> bool:
     return False
 
 
+def jax_dense_linear_algebra_preferred() -> bool:
+    """Whether dense linear algebra should prefer JAX over backend-specific kernels."""
+    return not turing_workarounds_enabled()
+
+
 def gpu_compute_numpy_dtype() -> np.dtype:
     return np.dtype(np.float32 if t4_fast_math_enabled() else np.float64)
 

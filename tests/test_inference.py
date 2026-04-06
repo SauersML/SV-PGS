@@ -534,6 +534,79 @@ def test_sample_space_preconditioner_gpu_path_matches_exact_covariance_inverse_a
     np.testing.assert_allclose(actual, expected, rtol=1e-4, atol=2e-5)
 
 
+def test_sample_space_preconditioner_uses_gpu_subset_without_full_gpu_cache(monkeypatch: pytest.MonkeyPatch):
+    genotype_matrix = np.array(
+        [
+            [1.0, 0.0],
+            [0.0, 1.0],
+            [1.0, 1.0],
+        ],
+        dtype=np.float32,
+    )
+    standardized = as_raw_genotype_matrix(genotype_matrix).standardized(
+        means=np.zeros(genotype_matrix.shape[1], dtype=np.float32),
+        scales=np.ones(genotype_matrix.shape[1], dtype=np.float32),
+    )
+    prior_variances = np.array([2.0, 0.5], dtype=np.float64)
+    diagonal_noise = np.array([1.5, 1.0, 2.0], dtype=np.float64)
+    right_hand_side = np.array([0.5, -1.0, 2.0], dtype=np.float64)
+    gpu_subset_requests: list[list[int]] = []
+
+    fake_cupy: Any = types.ModuleType("cupy")
+    fake_cupy.float32 = np.float32
+    fake_cupy.asarray = lambda array, dtype=None: np.asarray(array, dtype=dtype)
+    fake_cupy.sum = np.sum
+    fake_cupy.sqrt = np.sqrt
+    fake_cupy.maximum = np.maximum
+    fake_cupy.eye = np.eye
+    fake_cupy.linalg = types.SimpleNamespace(cholesky=np.linalg.cholesky)
+    fake_cupyx: Any = types.ModuleType("cupyx")
+    fake_cupyx_scipy: Any = types.ModuleType("cupyx.scipy")
+    fake_cupyx_scipy_linalg: Any = types.ModuleType("cupyx.scipy.linalg")
+    fake_cupyx_scipy_linalg.solve_triangular = scipy_solve_triangular
+    fake_cupyx.scipy = fake_cupyx_scipy
+    fake_cupyx_scipy.linalg = fake_cupyx_scipy_linalg
+
+    monkeypatch.setitem(sys.modules, "cupy", fake_cupy)
+    monkeypatch.setitem(sys.modules, "cupyx", fake_cupyx)
+    monkeypatch.setitem(sys.modules, "cupyx.scipy", fake_cupyx_scipy)
+    monkeypatch.setitem(sys.modules, "cupyx.scipy.linalg", fake_cupyx_scipy_linalg)
+    monkeypatch.setattr(mixture_inference, "_to_cupy_float32", lambda array: np.asarray(array, dtype=np.float32))
+    monkeypatch.setattr(
+        mixture_inference,
+        "_cupy_to_jax",
+        lambda array: jnp.asarray(np.asarray(array), dtype=mixture_inference.gpu_compute_jax_dtype()),
+    )
+    monkeypatch.setattr(
+        type(standardized),
+        "try_materialize_gpu_subset",
+        lambda self, indices: gpu_subset_requests.append(np.asarray(indices, dtype=np.int32).tolist())
+        or standardized.materialize()[:, np.asarray(indices, dtype=np.int32)].astype(np.float32, copy=False),
+    )
+    monkeypatch.setattr(
+        mixture_inference,
+        "_sample_space_diagonal_preconditioner",
+        lambda **kwargs: np.diag(
+            np.diag(diagonal_noise) + genotype_matrix @ np.diag(prior_variances) @ genotype_matrix.T
+        ).astype(np.float64, copy=False),
+    )
+
+    apply_preconditioner = _sample_space_preconditioner(
+        genotype_matrix=standardized,
+        prior_variances=prior_variances,
+        diagonal_noise=diagonal_noise,
+        batch_size=2,
+        rank=genotype_matrix.shape[1],
+    )
+
+    covariance_matrix = np.diag(diagonal_noise) + genotype_matrix @ np.diag(prior_variances) @ genotype_matrix.T
+    expected = np.linalg.solve(covariance_matrix, right_hand_side)
+    actual = np.asarray(cast(Any, apply_preconditioner)(right_hand_side), dtype=np.float64)
+
+    assert gpu_subset_requests == [[0, 1]]
+    np.testing.assert_allclose(actual, expected, rtol=1e-4, atol=2e-5)
+
+
 def test_orthogonal_probe_matrix_has_expected_column_norms_and_shape():
     probes = _orthogonal_probe_matrix(
         dimension=8,

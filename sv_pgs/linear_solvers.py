@@ -22,6 +22,7 @@ from typing import Callable
 
 import sv_pgs._jax  # noqa: F401
 import jax.numpy as jnp
+from jax.scipy import sparse as jax_sparse
 import numpy as np
 
 
@@ -31,6 +32,7 @@ class LinearOperator:
     matvec: Callable[[jnp.ndarray], jnp.ndarray]
     matmat: Callable[[jnp.ndarray], jnp.ndarray] | None = None
     dtype: jnp.dtype | None = None
+    jax_compatible: bool = False
 
 
 def build_linear_operator(
@@ -38,8 +40,15 @@ def build_linear_operator(
     matvec: Callable[[jnp.ndarray], jnp.ndarray],
     matmat: Callable[[jnp.ndarray], jnp.ndarray] | None = None,
     dtype: jnp.dtype | None = None,
+    jax_compatible: bool = False,
 ) -> LinearOperator:
-    return LinearOperator(shape=shape, matvec=matvec, matmat=matmat, dtype=dtype)
+    return LinearOperator(
+        shape=shape,
+        matvec=matvec,
+        matmat=matmat,
+        dtype=dtype,
+        jax_compatible=jax_compatible,
+    )
 
 
 # Solve the linear system A @ x = b where A is symmetric positive-definite.
@@ -60,6 +69,16 @@ def solve_spd_system(
     operator_dtype = linear_operator.dtype or rhs_array.dtype
     solver_dtype = jnp.result_type(operator_dtype, rhs_array.dtype)
     rhs_array = rhs_array.astype(solver_dtype)
+    if linear_operator.jax_compatible and (preconditioner is None or not callable(preconditioner)):
+        return _solve_spd_system_with_jax_cg(
+            linear_operator=linear_operator,
+            rhs=rhs_array,
+            solver_dtype=solver_dtype,
+            tolerance=tolerance,
+            max_iterations=max_iterations,
+            initial_guess=None if initial_guess is None else jnp.asarray(initial_guess, dtype=solver_dtype),
+            preconditioner=preconditioner,
+        )
     apply_preconditioner = _as_preconditioner(preconditioner, solver_dtype)
     output_dtype = np.asarray(jnp.zeros((), dtype=solver_dtype)).dtype
     if rhs_array.ndim == 1:
@@ -186,7 +205,88 @@ def _as_linear_operator(operator: LinearOperator | np.ndarray | jnp.ndarray) -> 
         matvec=lambda vector: matrix @ vector,
         matmat=lambda block: matrix @ block,
         dtype=matrix_dtype,
+        jax_compatible=True,
     )
+
+
+def _solve_spd_system_with_jax_cg(
+    linear_operator: LinearOperator,
+    rhs: jnp.ndarray,
+    solver_dtype: jnp.dtype,
+    tolerance: float,
+    max_iterations: int,
+    initial_guess: jnp.ndarray | None,
+    preconditioner: np.ndarray | jnp.ndarray | None,
+) -> np.ndarray:
+    output_dtype = np.asarray(jnp.zeros((), dtype=solver_dtype)).dtype
+    diagonal_preconditioner = None if preconditioner is None else jnp.asarray(preconditioner, dtype=solver_dtype)
+    if diagonal_preconditioner is not None and diagonal_preconditioner.ndim != 1:
+        raise ValueError("array preconditioner must be a diagonal vector.")
+    safe_diagonal = None if diagonal_preconditioner is None else jnp.maximum(diagonal_preconditioner, 1e-12)
+
+    def apply_operator(vector: jnp.ndarray) -> jnp.ndarray:
+        return jnp.asarray(linear_operator.matvec(vector), dtype=solver_dtype)
+
+    def apply_preconditioner(vector: jnp.ndarray) -> jnp.ndarray:
+        if safe_diagonal is None:
+            return vector
+        return vector / safe_diagonal
+
+    def solve_one(rhs_vector: jnp.ndarray, x0_vector: jnp.ndarray | None) -> jnp.ndarray:
+        solution, _ = jax_sparse.linalg.cg(
+            apply_operator,
+            rhs_vector,
+            x0=x0_vector,
+            tol=tolerance,
+            atol=tolerance,
+            maxiter=max_iterations,
+            M=None if safe_diagonal is None else apply_preconditioner,
+        )
+        return jnp.asarray(solution, dtype=solver_dtype)
+
+    if rhs.ndim == 1:
+        initial_vector = (
+            initial_guess
+            if initial_guess is not None
+            else (None if safe_diagonal is None else apply_preconditioner(rhs))
+        )
+        solution = solve_one(rhs, initial_vector)
+        residual = rhs - apply_operator(solution)
+        residual_norm = float(jnp.linalg.norm(residual))
+        rhs_norm = float(jnp.linalg.norm(rhs))
+        threshold = max(tolerance, tolerance * rhs_norm)
+        if not np.isfinite(residual_norm) or residual_norm > threshold:
+            raise RuntimeError(
+                "JAX conjugate-gradient solve failed to converge: "
+                + f"residual={residual_norm:.2e} threshold={threshold:.2e} iterations={max_iterations}"
+            )
+        return np.asarray(solution, dtype=output_dtype)
+
+    if rhs.ndim != 2:
+        raise ValueError("right_hand_side must be a vector or matrix.")
+    if initial_guess is not None and initial_guess.shape != rhs.shape:
+        raise ValueError("matrix initial_guess must have the same shape as right_hand_side.")
+    solutions: list[np.ndarray] = []
+    for column_index in range(rhs.shape[1]):
+        initial_vector = (
+            None
+            if initial_guess is None
+            else initial_guess[:, column_index]
+        )
+        if initial_vector is None and safe_diagonal is not None:
+            initial_vector = apply_preconditioner(rhs[:, column_index])
+        solutions.append(
+            _solve_spd_system_with_jax_cg(
+                linear_operator=linear_operator,
+                rhs=rhs[:, column_index],
+                solver_dtype=solver_dtype,
+                tolerance=tolerance,
+                max_iterations=max_iterations,
+                initial_guess=initial_vector,
+                preconditioner=None if safe_diagonal is None else np.asarray(safe_diagonal),
+            )
+        )
+    return np.column_stack(solutions).astype(output_dtype, copy=False)
 
 
 def _as_preconditioner(

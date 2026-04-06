@@ -10,7 +10,7 @@ import sv_pgs._jax  # noqa: F401
 import jax
 import jax.numpy as jnp
 
-from sv_pgs.config import ModelConfig, VariantClass
+from sv_pgs.config import ModelConfig, TraitType, VariantClass
 from sv_pgs.data import PreparedArrays, TieGroup, TieMap, VariantRecord, VariantStatistics
 from sv_pgs.genotype import (
     DenseRawGenotypeMatrix,
@@ -25,6 +25,8 @@ from sv_pgs.genotype import (
 )
 from sv_pgs.plink import PLINK_MISSING_INT8
 from sv_pgs.progress import log, mem
+
+STRUCTURAL_VARIANT_CLASSES = frozenset(ModelConfig.structural_variant_classes())
 
 @jax.jit
 def _batch_all_stats_i8(batch_i8: jnp.ndarray) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray]:
@@ -220,6 +222,11 @@ def fit_preprocessor(
 def select_active_variant_indices(
     variant_records: Sequence[VariantRecord],
     config: ModelConfig,
+    *,
+    standardized_genotypes: StandardizedGenotypeMatrix | np.ndarray | None = None,
+    covariates: np.ndarray | None = None,
+    targets: np.ndarray | None = None,
+    trait_type: TraitType | None = None,
 ) -> np.ndarray:
     n_total = len(variant_records)
     if n_total == 0:
@@ -244,7 +251,172 @@ def select_active_variant_indices(
         f"  active variants: {maf_kept.shape[0]}/{n_total} kept after MAF filter "
         + f"(min_maf={config.minimum_minor_allele_frequency:.6f})"
     )
-    return maf_kept
+    if standardized_genotypes is None or covariates is None or targets is None or trait_type is None:
+        return maf_kept
+
+    standardized_matrix = _as_standardized_genotypes(standardized_genotypes)
+    if standardized_matrix.shape[0] != np.asarray(targets).reshape(-1).shape[0]:
+        raise ValueError("targets sample count must match standardized genotypes.")
+    if standardized_matrix.shape[0] != np.asarray(covariates).shape[0]:
+        raise ValueError("covariates sample count must match standardized genotypes.")
+
+    maximum_active = min(
+        int(config.maximum_active_variants),
+        int(standardized_matrix.shape[0]),
+        int(maf_kept.shape[0]),
+    )
+    if maximum_active >= maf_kept.shape[0]:
+        log(f"  active screening skipped: budget keeps all post-MAF variants ({maximum_active})")
+        return maf_kept
+
+    maf_kept_matrix = standardized_matrix.subset(maf_kept)
+    marginal_scores = _covariate_adjusted_marginal_scores(
+        standardized_genotypes=maf_kept_matrix,
+        covariates=covariates,
+        targets=targets,
+        trait_type=trait_type,
+        config=config,
+    )
+    structural_mask = np.asarray(
+        [variant_records[int(variant_index)].variant_class in STRUCTURAL_VARIANT_CLASSES for variant_index in maf_kept],
+        dtype=bool,
+    )
+    structural_positions = np.flatnonzero(structural_mask)
+    if structural_positions.shape[0] >= maximum_active:
+        selected_positions = structural_positions[
+            _top_k_indices(marginal_scores[structural_positions], maximum_active)
+        ]
+    else:
+        remaining_budget = maximum_active - int(structural_positions.shape[0])
+        non_structural_positions = np.flatnonzero(~structural_mask)
+        selected_parts: list[np.ndarray] = []
+        if structural_positions.size > 0:
+            selected_parts.append(structural_positions)
+        if remaining_budget > 0 and non_structural_positions.size > 0:
+            selected_parts.append(
+                non_structural_positions[
+                    _top_k_indices(marginal_scores[non_structural_positions], remaining_budget)
+                ]
+            )
+        selected_positions = (
+            np.asarray(np.concatenate(selected_parts), dtype=np.int32)
+            if selected_parts
+            else np.zeros(0, dtype=np.int32)
+        )
+
+    selected_positions = np.sort(np.asarray(selected_positions, dtype=np.int32))
+    selected_indices = maf_kept[selected_positions]
+    log(
+        f"  active screening kept {selected_indices.shape[0]}/{maf_kept.shape[0]} post-MAF variants "
+        + f"(budget={maximum_active}, structural={int(np.sum(structural_mask[selected_positions]))})"
+    )
+    return selected_indices
+
+
+def _covariate_adjusted_marginal_scores(
+    standardized_genotypes: StandardizedGenotypeMatrix | np.ndarray,
+    covariates: np.ndarray,
+    targets: np.ndarray,
+    trait_type: TraitType,
+    config: ModelConfig,
+) -> np.ndarray:
+    standardized_matrix = _as_standardized_genotypes(standardized_genotypes)
+    covariate_matrix = np.asarray(covariates, dtype=np.float64)
+    target_array = np.asarray(targets, dtype=np.float64).reshape(-1)
+    if covariate_matrix.ndim != 2:
+        raise ValueError("covariates must be 2D.")
+    if covariate_matrix.shape[0] != standardized_matrix.shape[0]:
+        raise ValueError("covariates sample count must match standardized genotypes.")
+    if target_array.shape[0] != standardized_matrix.shape[0]:
+        raise ValueError("targets sample count must match standardized genotypes.")
+
+    if trait_type == TraitType.BINARY:
+        alpha = _fit_covariate_only_binary(
+            covariate_matrix=covariate_matrix,
+            targets=target_array,
+            minimum_weight=config.polya_gamma_minimum_weight,
+            max_iterations=config.max_inner_newton_iterations,
+            gradient_tolerance=config.newton_gradient_tolerance,
+        )
+        residual = target_array - _stable_sigmoid_numpy(covariate_matrix @ alpha)
+    else:
+        alpha = _fit_covariate_only_quantitative(
+            covariate_matrix=covariate_matrix,
+            targets=target_array,
+        )
+        residual = target_array - covariate_matrix @ alpha
+    return np.abs(
+        np.asarray(
+            standardized_matrix.transpose_matvec(
+                residual,
+                batch_size=auto_batch_size(standardized_matrix.shape[0]),
+            ),
+            dtype=np.float64,
+        )
+    )
+
+
+def _fit_covariate_only_quantitative(
+    covariate_matrix: np.ndarray,
+    targets: np.ndarray,
+) -> np.ndarray:
+    covariates = np.asarray(covariate_matrix, dtype=np.float64)
+    target_array = np.asarray(targets, dtype=np.float64)
+    if covariates.shape[1] == 0:
+        return np.zeros(0, dtype=np.float64)
+    normal_matrix = covariates.T @ covariates + np.eye(covariates.shape[1], dtype=np.float64) * 1e-8
+    return np.linalg.solve(normal_matrix, covariates.T @ target_array).astype(np.float64, copy=False)
+
+
+def _fit_covariate_only_binary(
+    covariate_matrix: np.ndarray,
+    targets: np.ndarray,
+    minimum_weight: float,
+    max_iterations: int,
+    gradient_tolerance: float,
+) -> np.ndarray:
+    covariates = np.asarray(covariate_matrix, dtype=np.float64)
+    target_array = np.asarray(targets, dtype=np.float64)
+    alpha = np.zeros(covariates.shape[1], dtype=np.float64)
+    if covariates.shape[1] == 0:
+        return alpha
+    prevalence = float(np.clip(np.mean(target_array), 1e-6, 1.0 - 1e-6))
+    alpha[0] = float(np.log(prevalence / (1.0 - prevalence)))
+    for _ in range(max_iterations):
+        linear_predictor = covariates @ alpha
+        probabilities = _stable_sigmoid_numpy(linear_predictor)
+        weights = np.maximum(probabilities * (1.0 - probabilities), minimum_weight)
+        gradient = covariates.T @ (target_array - probabilities)
+        if float(np.linalg.norm(gradient)) <= gradient_tolerance:
+            break
+        hessian = covariates.T @ (weights[:, None] * covariates)
+        step = np.linalg.solve(
+            hessian + np.eye(hessian.shape[0], dtype=np.float64) * 1e-8,
+            gradient,
+        )
+        alpha += step
+        if float(np.linalg.norm(step)) <= gradient_tolerance:
+            break
+    return alpha
+
+
+def _stable_sigmoid_numpy(values: np.ndarray) -> np.ndarray:
+    value_array = np.asarray(values, dtype=np.float64)
+    positive_mask = value_array >= 0.0
+    result = np.empty_like(value_array, dtype=np.float64)
+    result[positive_mask] = 1.0 / (1.0 + np.exp(-value_array[positive_mask]))
+    exp_values = np.exp(value_array[~positive_mask])
+    result[~positive_mask] = exp_values / (1.0 + exp_values)
+    return result
+
+
+def _top_k_indices(scores: np.ndarray, k: int) -> np.ndarray:
+    score_array = np.asarray(scores, dtype=np.float64)
+    if k <= 0 or score_array.size == 0:
+        return np.zeros(0, dtype=np.int32)
+    if k >= score_array.shape[0]:
+        return np.arange(score_array.shape[0], dtype=np.int32)
+    return np.argpartition(-score_array, kth=k - 1)[:k].astype(np.int32, copy=False)
 
 
 def _minor_allele_frequency(allele_frequency: float) -> float:
@@ -263,6 +435,14 @@ def build_tie_map(
         raise ValueError("genotypes and records length mismatch.")
     n_total = standardized_genotypes.shape[1]
     log(f"  building tie map over {n_total} variants...")
+    using_raw_int8_fast_path = bool(
+        standardized_genotypes.raw is not None
+        and _supports_int8_batches(standardized_genotypes.raw)
+        and not _uses_identity_standardization(standardized_genotypes)
+    )
+    if using_raw_int8_fast_path:
+        log("  tie map fast path: hardcall int8 canonical signatures")
+        return _build_tie_map_from_hardcall_int8(standardized_genotypes)
 
     exact_signature_to_group: dict[tuple[bytes, bytes], list[int]] = {}
     sign_flipped_signature_to_group: dict[tuple[bytes, bytes], list[int]] = {}
@@ -343,6 +523,96 @@ def build_tie_map(
 
         variants_done += len(batch.variant_indices)
         if variants_done == len(batch.variant_indices) or variants_done % max(n_total // 10, 1) < len(batch.variant_indices) or variants_done == n_total:
+            log(
+                f"  tie map: {variants_done}/{n_total} ({100 * variants_done // n_total}%)  "
+                f"unique={len(kept_variant_indices)}  groups={len(representative_indices)}  mem={mem()}"
+            )
+
+    log(f"  tie map done: {n_total} -> {len(kept_variant_indices)} unique representatives  mem={mem()}")
+    return TieMap(
+        kept_indices=np.asarray(kept_variant_indices, dtype=np.int32),
+        original_to_reduced=original_to_reduced,
+        reduced_to_group=[
+            TieGroup(
+                representative_index=representative_index,
+                member_indices=np.asarray(member_indices, dtype=np.int32),
+                signs=np.asarray(signs, dtype=np.float32),
+            )
+            for representative_index, member_indices, signs in zip(
+                representative_indices,
+                tie_group_member_indices,
+                tie_group_signs,
+                strict=True,
+            )
+        ],
+    )
+
+
+def _build_tie_map_from_hardcall_int8(
+    standardized_genotypes: StandardizedGenotypeMatrix,
+) -> TieMap:
+    n_total = standardized_genotypes.shape[1]
+    exact_signature_to_group: dict[bytes, int | list[int]] = {}
+    sign_flipped_signature_to_group: dict[bytes, int | list[int]] = {}
+    tie_group_member_indices: list[list[int]] = []
+    tie_group_signs: list[list[float]] = []
+    representative_indices: list[int] = []
+    kept_variant_indices: list[int] = []
+    original_to_reduced = np.full(n_total, -1, dtype=np.int32)
+    raw_int8 = cast(Int8BatchCapable, standardized_genotypes.raw)
+    variants_done = 0
+    local_start = 0
+    batch_size = auto_batch_size(standardized_genotypes.shape[0])
+
+    for raw_batch in raw_int8.iter_column_batches_i8(standardized_genotypes.variant_indices, batch_size=batch_size):
+        state_masks = _hardcall_state_masks(raw_batch.values)
+        for local_batch_index, state_mask in enumerate(state_masks):
+            variant_index = local_start + local_batch_index
+            exact_column, sign_flipped_column = _canonicalize_hardcall_tie_column_i8(
+                raw_batch.values[:, local_batch_index],
+                int(state_mask),
+            )
+            exact_signature = _hashed_tie_signature_i8(exact_column)
+            sign_flipped_signature = _hashed_tie_signature_i8(sign_flipped_column)
+
+            exact_match_index = _matching_hardcall_tie_group_index(
+                standardized_genotypes=standardized_genotypes,
+                candidate_group_indices=_candidate_group_indices(exact_signature_to_group.get(exact_signature)),
+                representative_member_indices=tie_group_member_indices,
+                tie_column=exact_column,
+                sign=1.0,
+            )
+            if exact_match_index is not None:
+                tie_group_member_indices[exact_match_index].append(int(variant_index))
+                tie_group_signs[exact_match_index].append(1.0)
+                original_to_reduced[int(variant_index)] = exact_match_index
+                continue
+
+            sign_flipped_match_index = _matching_hardcall_tie_group_index(
+                standardized_genotypes=standardized_genotypes,
+                candidate_group_indices=_candidate_group_indices(sign_flipped_signature_to_group.get(exact_signature)),
+                representative_member_indices=tie_group_member_indices,
+                tie_column=exact_column,
+                sign=-1.0,
+            )
+            if sign_flipped_match_index is not None:
+                tie_group_member_indices[sign_flipped_match_index].append(int(variant_index))
+                tie_group_signs[sign_flipped_match_index].append(-1.0)
+                original_to_reduced[int(variant_index)] = sign_flipped_match_index
+                continue
+
+            reduced_index = len(representative_indices)
+            representative_indices.append(int(variant_index))
+            tie_group_member_indices.append([int(variant_index)])
+            tie_group_signs.append([1.0])
+            kept_variant_indices.append(int(variant_index))
+            _record_candidate_group(exact_signature_to_group, exact_signature, reduced_index)
+            _record_candidate_group(sign_flipped_signature_to_group, sign_flipped_signature, reduced_index)
+            original_to_reduced[int(variant_index)] = reduced_index
+
+        local_start += raw_batch.variant_indices.shape[0]
+        variants_done += raw_batch.variant_indices.shape[0]
+        if variants_done == raw_batch.variant_indices.shape[0] or variants_done % max(n_total // 10, 1) < raw_batch.variant_indices.shape[0] or variants_done == n_total:
             log(
                 f"  tie map: {variants_done}/{n_total} ({100 * variants_done // n_total}%)  "
                 f"unique={len(kept_variant_indices)}  groups={len(representative_indices)}  mem={mem()}"
@@ -488,6 +758,58 @@ def _sign_flip_canonical_tie_column(canonical_column: np.ndarray) -> np.ndarray:
     return flipped
 
 
+def _hardcall_state_masks(batch_values: np.ndarray) -> np.ndarray:
+    values = np.asarray(batch_values, dtype=np.int8)
+    observed = values != PLINK_MISSING_INT8
+    return (
+        np.any(observed & (values == 0), axis=0).astype(np.uint8)
+        + (2 * np.any(observed & (values == 1), axis=0).astype(np.uint8))
+        + (4 * np.any(observed & (values == 2), axis=0).astype(np.uint8))
+    )
+
+
+def _canonicalize_hardcall_tie_column_i8(
+    column: np.ndarray,
+    state_mask: int,
+) -> tuple[np.ndarray, np.ndarray]:
+    values = np.asarray(column, dtype=np.int8)
+    canonical = np.zeros(values.shape[0], dtype=np.int8)
+    if state_mask in (0, 1, 2, 4):
+        return canonical, canonical
+
+    canonical.fill(3)
+    sign_flipped = np.full(values.shape[0], 3, dtype=np.int8)
+    observed = values != PLINK_MISSING_INT8
+    if not np.any(observed):
+        return np.zeros(values.shape[0], dtype=np.int8), np.zeros(values.shape[0], dtype=np.int8)
+
+    if state_mask == 3:
+        exact_lut = np.asarray([0, 1, 0], dtype=np.int8)
+        sign_lut = np.asarray([1, 0, 0], dtype=np.int8)
+    elif state_mask == 5:
+        exact_lut = np.asarray([0, 0, 1], dtype=np.int8)
+        sign_lut = np.asarray([1, 0, 0], dtype=np.int8)
+    elif state_mask == 6:
+        exact_lut = np.asarray([0, 0, 1], dtype=np.int8)
+        sign_lut = np.asarray([0, 1, 0], dtype=np.int8)
+    elif state_mask == 7:
+        exact_lut = np.asarray([0, 1, 2], dtype=np.int8)
+        sign_lut = np.asarray([2, 1, 0], dtype=np.int8)
+    else:
+        raise ValueError(f"Unexpected hardcall state mask: {state_mask}")
+
+    observed_values = values[observed]
+    canonical[observed] = exact_lut[observed_values]
+    sign_flipped[observed] = sign_lut[observed_values]
+    return canonical, sign_flipped
+
+
+def _hashed_tie_signature_i8(canonical_column: np.ndarray) -> bytes:
+    value_hasher = hashlib.blake2b(digest_size=16, person=b"svpgs_i8_tie")
+    value_hasher.update(np.ascontiguousarray(canonical_column, dtype=np.int8))
+    return value_hasher.digest()
+
+
 def _hashed_tie_signature(
     standardized_column: np.ndarray,
     missing_mask: np.ndarray,
@@ -497,6 +819,29 @@ def _hashed_tie_signature(
     mask_hasher = hashlib.blake2b(digest_size=8, person=b"svpgs_mask_")
     mask_hasher.update(np.packbits(np.ascontiguousarray(missing_mask, dtype=np.uint8)))
     return value_hasher.digest(), mask_hasher.digest()
+
+
+def _candidate_group_indices(candidate_entry: int | list[int] | None) -> tuple[int, ...]:
+    if candidate_entry is None:
+        return ()
+    if isinstance(candidate_entry, list):
+        return tuple(candidate_entry)
+    return (int(candidate_entry),)
+
+
+def _record_candidate_group(
+    candidate_map: dict[bytes, int | list[int]],
+    signature: bytes,
+    reduced_index: int,
+) -> None:
+    existing = candidate_map.get(signature)
+    if existing is None:
+        candidate_map[signature] = reduced_index
+        return
+    if isinstance(existing, list):
+        existing.append(reduced_index)
+        return
+    candidate_map[signature] = [existing, reduced_index]
 
 
 def _matching_tie_group_index(
@@ -524,6 +869,43 @@ def _matching_tie_group_index(
         if np.array_equal(tie_column, representative_column):
             return int(reduced_index)
     return None
+
+
+def _matching_hardcall_tie_group_index(
+    standardized_genotypes: StandardizedGenotypeMatrix,
+    candidate_group_indices: Sequence[int],
+    representative_member_indices: Sequence[list[int]],
+    tie_column: np.ndarray,
+    sign: float,
+) -> int | None:
+    for reduced_index in candidate_group_indices:
+        representative_column = _load_hardcall_canonical_tie_column(
+            standardized_genotypes,
+            int(representative_member_indices[int(reduced_index)][0]),
+            sign=sign,
+        )
+        if np.array_equal(tie_column, representative_column):
+            return int(reduced_index)
+    return None
+
+
+def _load_hardcall_canonical_tie_column(
+    standardized_genotypes: StandardizedGenotypeMatrix,
+    local_variant_index: int,
+    *,
+    sign: float,
+) -> np.ndarray:
+    if standardized_genotypes.raw is None or not _supports_int8_batches(standardized_genotypes.raw):
+        raise RuntimeError("hardcall tie loading requires int8 raw backing storage.")
+    raw_int8 = cast(Int8BatchCapable, standardized_genotypes.raw)
+    raw_variant_index = int(standardized_genotypes.variant_indices[local_variant_index])
+    batch = next(raw_int8.iter_column_batches_i8([raw_variant_index], batch_size=1))
+    state_mask = int(_hardcall_state_masks(batch.values)[0])
+    exact_column, sign_flipped_column = _canonicalize_hardcall_tie_column_i8(
+        batch.values[:, 0],
+        state_mask,
+    )
+    return sign_flipped_column if sign < 0.0 else exact_column
 
 
 def _load_tie_column_with_missingness(

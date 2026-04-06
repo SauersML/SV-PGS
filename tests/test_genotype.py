@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from typing import Any, cast
 
+import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
@@ -605,3 +606,100 @@ def test_try_materialize_gpu_prefers_int8_batches_when_available(monkeypatch: py
     assert raw.i8_requests == [[1, 3]]
     assert raw.float_requests == []
     np.testing.assert_allclose(np.asarray(cast(Any, standardized._cupy_cache)), expected)
+
+
+def test_try_materialize_gpu_subset_streams_only_selected_columns(monkeypatch: pytest.MonkeyPatch):
+    class _FakeCudaRuntime:
+        @staticmethod
+        def memGetInfo():
+            return (8_000_000_000, 16_000_000_000)
+
+    class _FakeDevice:
+        def synchronize(self) -> None:
+            return None
+
+    class _FakeCuda:
+        runtime = _FakeCudaRuntime()
+
+        @staticmethod
+        def Device():
+            return _FakeDevice()
+
+    class _FakeCupy:
+        float32 = np.float32
+        cuda = _FakeCuda()
+
+        @staticmethod
+        def asarray(array, dtype=None):
+            return np.asarray(array, dtype=dtype)
+
+        @staticmethod
+        def empty(shape, dtype=None, order=None):
+            return np.empty(shape, dtype=dtype, order="C" if order is None else order)
+
+        @staticmethod
+        def isnan(array):
+            return np.isnan(array)
+
+    raw = _SpyStreamingRawGenotypeMatrix(
+        np.array(
+            [
+                [0.0, 1.0, 2.0, 3.0],
+                [1.0, 2.0, 3.0, 4.0],
+                [2.0, 3.0, 4.0, 5.0],
+            ],
+            dtype=np.float32,
+        )
+    )
+    means = np.array([1.0, 2.0, 3.0, 4.0], dtype=np.float32)
+    scales = np.ones(4, dtype=np.float32)
+    standardized = raw.standardized(means, scales)
+
+    monkeypatch.setattr(genotype_module, "_try_import_cupy", lambda: _FakeCupy())
+
+    gpu_subset = standardized.try_materialize_gpu_subset(np.array([1, 3], dtype=np.int32))
+
+    assert gpu_subset is not None
+    assert raw.iter_requests == [[1, 3]]
+    np.testing.assert_allclose(
+        np.asarray(cast(Any, gpu_subset)),
+        np.array(
+            [
+                [-1.0, -1.0],
+                [0.0, 0.0],
+                [1.0, 1.0],
+            ],
+            dtype=np.float32,
+        ),
+    )
+
+
+def test_dense_materialized_genotype_ops_are_jax_traceable():
+    raw_matrix = np.array(
+        [
+            [0.0, 1.0, 2.0],
+            [1.0, 2.0, 3.0],
+            [2.0, 3.0, 4.0],
+        ],
+        dtype=np.float32,
+    )
+    standardized = as_raw_genotype_matrix(raw_matrix).standardized(
+        means=np.array([1.0, 2.0, 3.0], dtype=np.float32),
+        scales=np.ones(3, dtype=np.float32),
+    )
+    standardized.try_materialize()
+
+    coefficient_vector = jnp.asarray([1.0, -2.0, 0.5], dtype=jnp.float64)
+    sample_vector = jnp.asarray([0.5, -1.0, 2.0], dtype=jnp.float64)
+
+    jit_matvec = jax.jit(lambda beta: standardized.matvec(beta))
+    jit_transpose_matvec = jax.jit(lambda vector: standardized.transpose_matvec(vector))
+
+    np.testing.assert_allclose(
+        np.asarray(jit_matvec(coefficient_vector), dtype=np.float64),
+        np.asarray(standardized.materialize(), dtype=np.float64) @ np.asarray(coefficient_vector, dtype=np.float64),
+    )
+    np.testing.assert_allclose(
+        np.asarray(jit_transpose_matvec(sample_vector), dtype=np.float64),
+        np.asarray(standardized.materialize(), dtype=np.float64).T @ np.asarray(sample_vector, dtype=np.float64),
+    )

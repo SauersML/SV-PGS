@@ -175,3 +175,52 @@ def test_small_symmetric_eigh_retries_with_jitter(monkeypatch):
     assert calls["count"] >= 2
     assert eigenvalues.shape == (2,)
     assert eigenvectors.shape == (2, 2)
+
+
+def test_solve_spd_system_uses_jax_cg_for_jax_compatible_operator(monkeypatch):
+    calls: list[dict[str, object]] = []
+
+    def fake_cg(A, b, x0=None, *, tol=1e-5, atol=0.0, maxiter=None, M=None):
+        calls.append(
+            {
+                "shape": tuple(np.asarray(b).shape),
+                "tol": tol,
+                "atol": atol,
+                "maxiter": maxiter,
+                "has_preconditioner": M is not None,
+                "x0": None if x0 is None else np.asarray(x0, dtype=np.float64),
+            }
+        )
+        matrix = np.array([[4.0, 1.0], [1.0, 3.0]], dtype=np.float64)
+        solution = np.linalg.solve(matrix, np.asarray(b, dtype=np.float64))
+        return jnp.asarray(solution, dtype=jnp.float64), None
+
+    monkeypatch.setattr(linear_solvers.jax_sparse.linalg, "cg", fake_cg)
+
+    operator = build_linear_operator(
+        shape=(2, 2),
+        matvec=lambda vector: jnp.asarray(
+            np.array([[4.0, 1.0], [1.0, 3.0]], dtype=np.float64) @ np.asarray(vector, dtype=np.float64),
+            dtype=jnp.float64,
+        ),
+        dtype=jnp.float64,
+        jax_compatible=True,
+    )
+    right_hand_side = np.array([1.0, 2.0], dtype=np.float64)
+    diagonal_preconditioner = np.array([4.0, 3.0], dtype=np.float64)
+
+    solution = solve_spd_system(
+        operator=operator,
+        right_hand_side=right_hand_side,
+        tolerance=1e-8,
+        max_iterations=32,
+        preconditioner=diagonal_preconditioner,
+    )
+
+    np.testing.assert_allclose(
+        solution,
+        np.linalg.solve(np.array([[4.0, 1.0], [1.0, 3.0]], dtype=np.float64), right_hand_side),
+    )
+    assert len(calls) == 1
+    assert calls[0]["has_preconditioner"] is True
+    np.testing.assert_allclose(calls[0]["x0"], right_hand_side / diagonal_preconditioner)
