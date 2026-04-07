@@ -1060,17 +1060,19 @@ def _find_any_complete_vcf_cache(cache_dir: Path) -> _VcfCachePaths | None:
 
     This allows reusing caches created with an older key format (e.g. when
     keep_sample_indices was part of the key) even though the current key is different.
+    Scans for .genotypes.npy files (which ALL cache bundles have), not just
+    manifests, so it also finds pre-manifest legacy caches.
     """
-    for manifest_file in sorted(cache_dir.glob("*.manifest.json")):
-        key = manifest_file.name.removesuffix(".manifest.json")
+    for geno_file in sorted(cache_dir.glob("*.genotypes.npy")):
+        key = geno_file.name.removesuffix(".genotypes.npy")
         candidate = _VcfCachePaths(
             key=key,
             cache_dir=cache_dir,
-            geno_path=cache_dir / f"{key}.genotypes.npy",
+            geno_path=geno_file,
             var_path=cache_dir / f"{key}.variants.pkl",
             stats_path=cache_dir / f"{key}.stats.npy",
             legacy_stats_path=cache_dir / f"{key}.stats.npz",
-            manifest_path=manifest_file,
+            manifest_path=cache_dir / f"{key}.manifest.json",
         )
         if _is_vcf_cache_bundle_complete(candidate):
             return candidate
