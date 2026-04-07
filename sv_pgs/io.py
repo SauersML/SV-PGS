@@ -398,10 +398,7 @@ def load_dataset_from_files(
             config=config,
             mmap_mode="r",
         )
-        expected_source_order = np.arange(len(source_sample_ids), dtype=np.intp)
-        # Reorder whenever the phenotype-aligned sample order differs from the VCF header order.
-        if genotype_matrix.shape[0] != len(keep_indices) or not np.array_equal(keep_indices, expected_source_order):
-            genotype_matrix = genotype_matrix[keep_indices, :]
+        genotype_matrix = _fast_mmap_row_reindex(genotype_matrix, keep_indices)
 
         log(f"VCF loaded: {genotype_matrix.shape[0]} samples x {len(default_variants)} variants  mem={mem()}")
         plink_metadata = None
@@ -510,6 +507,32 @@ def load_dataset_from_files(
     )
 
 
+def _fast_mmap_row_reindex(matrix: np.ndarray, row_indices: np.ndarray) -> np.ndarray:
+    """Reindex rows of a (possibly mmap'd, column-major) matrix efficiently.
+
+    Direct fancy indexing on a column-major mmap is catastrophically slow
+    (random disk access per row per column). Instead, read columns in batches
+    (contiguous in F-order), reindex in RAM, and write to a pre-allocated result.
+    """
+    n_rows_out = len(row_indices)
+    n_cols = matrix.shape[1]
+    # If it's identity, skip entirely
+    if n_rows_out == matrix.shape[0] and np.array_equal(row_indices, np.arange(n_rows_out, dtype=row_indices.dtype)):
+        return matrix
+    result = np.empty((n_rows_out, n_cols), dtype=matrix.dtype, order="F")
+    batch_size = 2048
+    n_batches = (n_cols + batch_size - 1) // batch_size
+    for batch_idx in range(n_batches):
+        start = batch_idx * batch_size
+        end = min(start + batch_size, n_cols)
+        # np.array() forces mmap read for the column batch (contiguous in F-order)
+        col_batch = np.array(matrix[:, start:end])
+        result[:, start:end] = col_batch[row_indices, :]
+        if batch_idx % 20 == 0 or batch_idx == n_batches - 1:
+            log(f"    reindexing: {end:,}/{n_cols:,} columns ({100*end/n_cols:.0f}%)  mem={mem()}")
+    return result
+
+
 def load_multi_vcf_dataset_from_files(
     genotype_paths: Sequence[str | Path],
     config: ModelConfig,
@@ -596,8 +619,7 @@ def load_multi_vcf_dataset_from_files(
             source_path, config=config, mmap_mode="r",
         )
         if not skip_subset:
-            log(f"    subsetting {genotype_matrix.shape[0]} → {len(keep_sample_indices)} samples...")
-            genotype_matrix = genotype_matrix[keep_sample_indices, :]
+            genotype_matrix = _fast_mmap_row_reindex(genotype_matrix, keep_sample_indices)
         raw_matrices.append(as_raw_genotype_matrix(genotype_matrix))
         default_variants.extend(chromosome_variants)
         variant_stats_parts.append(chromosome_stats)
