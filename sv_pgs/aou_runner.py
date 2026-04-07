@@ -449,15 +449,15 @@ def run_all_of_us(
                     if not current_vcf.exists():
                         continue
                     new_key = _vcf_cache_key(current_vcf, config)
+                    # Always delete stale manifest symlinks (they reference wrong stats filename)
+                    stale_manifest = new_vcf_cache_dir / f"{new_key}.manifest.json"
+                    if stale_manifest.is_symlink() or stale_manifest.exists():
+                        stale_manifest.unlink(missing_ok=True)
                     if (new_vcf_cache_dir / f"{new_key}.genotypes.npy").exists():
                         continue  # already cached under new key
                     old_k = old_chr_to_key.get(str(chrom))
                     if old_k is None:
                         continue
-                    # Delete stale manifest symlink from previous migration attempts
-                    stale_manifest = new_vcf_cache_dir / f"{new_key}.manifest.json"
-                    if stale_manifest.is_symlink() or stale_manifest.exists():
-                        stale_manifest.unlink(missing_ok=True)
                     # Symlink: new_key.X → old file. Skip manifest because it
                     # references old key's stats filename which won't exist under new key.
                     for suffix in (".genotypes.npy", ".variants.pkl", ".stats.npy", ".stats.npz"):

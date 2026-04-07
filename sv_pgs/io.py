@@ -1193,9 +1193,19 @@ def _load_vcf_from_cache(
         expected_sample_count: int | None = None
         expected_variant_count: int | None = None
         if manifest is not None:
-            expected_sample_count = int(manifest["sample_count"])
-            expected_variant_count = int(manifest["variant_count"])
-            stats_path = paths.cache_dir / str(manifest.get("stats_file", paths.stats_path.name))
+            manifest_stats = paths.cache_dir / str(manifest.get("stats_file", paths.stats_path.name))
+            if manifest_stats.exists():
+                expected_sample_count = int(manifest["sample_count"])
+                expected_variant_count = int(manifest["variant_count"])
+                stats_path = manifest_stats
+            else:
+                manifest = None  # manifest references missing file, ignore it
+        # Fall back to direct stats paths if manifest was missing or broken
+        if manifest is None:
+            if paths.legacy_stats_path.exists():
+                stats_path = paths.legacy_stats_path
+            elif paths.stats_path.exists():
+                stats_path = paths.stats_path
 
         genotype_matrix = np.load(paths.geno_path, mmap_mode=effective_mmap_mode)
         with open(paths.var_path, "rb") as variant_handle:
