@@ -2420,7 +2420,7 @@ def _sample_space_nystrom_basis_gpu(
         basis_gpu, triangular_gpu = cupy.linalg.qr(sketch_response_gpu, mode="reduced")
     except TypeError:
         basis_gpu, triangular_gpu = cupy.linalg.qr(sketch_response_gpu)
-    diagonal = np.asarray(cupy.abs(cupy.diag(triangular_gpu)), dtype=np.float64)
+    diagonal = cupy.abs(cupy.diag(triangular_gpu)).get().astype(np.float64)
     effective_rank = min(requested_rank, int(np.sum(diagonal > 1e-10)))
     if effective_rank <= 0:
         return None
