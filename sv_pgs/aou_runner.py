@@ -415,13 +415,11 @@ def run_all_of_us(
 
     # Migrate old VCF caches: VCFs were moved from work_dir to a shared cache dir,
     # but the finalized .npy caches stayed in work_dir/.sv_pgs_cache.
-    # Reconstruct the old cache key per chromosome (using the legacy VCF path
-    # but reading fingerprint from the current file) and symlink into the new dir.
-    from sv_pgs.io import (
-        _vcf_cache_dir, _vcf_cache_key, _vcf_cache_paths,
-        _is_vcf_cache_bundle_complete, _find_matching_complete_vcf_cache,
-        _cache_file_fingerprint, _CACHE_VERSION,
-    )
+    # For each chromosome, find the old cache bundle (by reading variants.pkl to
+    # match chromosome), then symlink into the new cache dir using the NEW key name
+    # so the primary key lookup succeeds immediately.
+    from sv_pgs.io import _vcf_cache_dir, _vcf_cache_key, _vcf_cache_paths, _is_vcf_cache_bundle_complete
+    import pickle as _pickle
     old_vcf_cache_dir = work_dir / ".sv_pgs_cache"
     if old_vcf_cache_dir.exists():
         first_vcf = _adopt_legacy_sv_vcf_cache(chromosomes[0], work_dir)
@@ -429,6 +427,22 @@ def run_all_of_us(
             new_vcf_cache_dir = _vcf_cache_dir(first_vcf)
             if old_vcf_cache_dir.resolve() != new_vcf_cache_dir.resolve():
                 new_vcf_cache_dir.mkdir(parents=True, exist_ok=True)
+                # Build map: chromosome → old key (by reading variants.pkl)
+                old_chr_to_key: dict[str, str] = {}
+                for geno_file in old_vcf_cache_dir.glob("*.genotypes.npy"):
+                    old_k = geno_file.name.removesuffix(".genotypes.npy")
+                    var_pkl = old_vcf_cache_dir / f"{old_k}.variants.pkl"
+                    if not var_pkl.exists():
+                        continue
+                    try:
+                        with open(var_pkl, "rb") as f:
+                            variants = _pickle.load(f)
+                        if variants:
+                            chr_val = str(getattr(variants[0], "chromosome", "")).replace("chr", "")
+                            old_chr_to_key[chr_val] = old_k
+                    except Exception:
+                        continue
+                # Symlink old files using NEW key names
                 migrated_chrs = 0
                 for chrom in chromosomes:
                     current_vcf = local_sv_vcf_path(chrom, work_dir)
@@ -437,54 +451,28 @@ def run_all_of_us(
                     new_key = _vcf_cache_key(current_vcf, config)
                     if (new_vcf_cache_dir / f"{new_key}.genotypes.npy").exists():
                         continue  # already cached under new key
-                    # Compute what the old key would have been (old path, no keep_indices)
-                    old_path_str = str(legacy_local_sv_vcf_path(chrom, work_dir).resolve())
-                    fingerprint = _cache_file_fingerprint(current_vcf)  # same file content
-                    h = hashlib.sha256()
-                    h.update(f"v{_CACHE_VERSION}:".encode())
-                    h.update(old_path_str.encode())
-                    h.update(fingerprint)
-                    h.update(f"minimum_scale={config.minimum_scale:.17g}".encode())
-                    old_key_no_keep = h.hexdigest()[:24]
-                    # Check if old cache exists under this key (without keep_indices)
-                    if (old_vcf_cache_dir / f"{old_key_no_keep}.genotypes.npy").exists():
-                        for suffix in (".genotypes.npy", ".variants.pkl", ".stats.npy", ".stats.npz", ".manifest.json"):
-                            src = old_vcf_cache_dir / f"{old_key_no_keep}{suffix}"
-                            dst = new_vcf_cache_dir / f"{old_key_no_keep}{suffix}"
-                            if src.exists() and not dst.exists():
-                                dst.symlink_to(src.resolve())
-                        migrated_chrs += 1
+                    old_k = old_chr_to_key.get(str(chrom))
+                    if old_k is None:
                         continue
-                    # Old cache might have keep_sample_indices baked in — we can't
-                    # reconstruct that key. Scan old dir for any bundle whose manifest
-                    # has the right variant count. Load variants.pkl header to match chr.
-                    import pickle as _pickle
-                    for geno_file in sorted(old_vcf_cache_dir.glob("*.genotypes.npy")):
-                        old_k = geno_file.name.removesuffix(".genotypes.npy")
-                        var_pkl = old_vcf_cache_dir / f"{old_k}.variants.pkl"
-                        if not var_pkl.exists():
-                            continue
-                        # Quick check: read first variant to verify chromosome
-                        try:
-                            with open(var_pkl, "rb") as f:
-                                variants = _pickle.load(f)
-                            if not variants:
-                                continue
-                            first_chr = str(getattr(variants[0], "chromosome", ""))
-                            if first_chr != str(chrom):
-                                continue
-                        except Exception:
-                            continue
-                        # Match! Symlink all files for this key
-                        for suffix in (".genotypes.npy", ".variants.pkl", ".stats.npy", ".stats.npz", ".manifest.json"):
-                            src = old_vcf_cache_dir / f"{old_k}{suffix}"
-                            dst = new_vcf_cache_dir / f"{old_k}{suffix}"
-                            if src.exists() and not dst.exists():
+                    # Symlink: new_key.genotypes.npy → old file
+                    for suffix in (".genotypes.npy", ".variants.pkl", ".stats.npy", ".stats.npz", ".manifest.json"):
+                        src = old_vcf_cache_dir / f"{old_k}{suffix}"
+                        dst = new_vcf_cache_dir / f"{new_key}{suffix}"
+                        if src.exists() and not dst.exists():
+                            try:
                                 dst.symlink_to(src.resolve())
-                        migrated_chrs += 1
-                        break
+                            except Exception:
+                                pass
+                    migrated_chrs += 1
                 if migrated_chrs:
                     log(f"  migrated caches for {migrated_chrs} chromosomes from {old_vcf_cache_dir}")
+                # Clean up old empty tmp_parallel dirs to free disk space
+                for tmp_dir in list(new_vcf_cache_dir.glob("*.tmp_parallel")):
+                    try:
+                        if tmp_dir.is_dir() and not any(tmp_dir.iterdir()):
+                            tmp_dir.rmdir()
+                    except Exception:
+                        pass
 
     # Status summary: what's done vs what's left
     log("=== STATUS CHECK ===")
