@@ -189,6 +189,12 @@ def _persistent_raw_signature(genotype_matrix: RawGenotypeMatrix) -> str | None:
         if isinstance(backing_matrix, np.memmap):
             backing_path = Path(str(backing_matrix.filename)).resolve()
             stat = backing_path.stat()
+            path_parts = set(backing_path.parts)
+            if _FIT_STAGE_CACHE_DIRNAME in path_parts:
+                # Persisted genotype caches already use content-derived filenames.
+                # Avoid invalidating downstream fit/tie caches when the memmap file
+                # is rewritten or touched without any semantic data change.
+                return f"memmap-cache:{backing_path}:{stat.st_size}:{backing_matrix.shape}:{backing_matrix.dtype}"
             return f"memmap:{backing_path}:{stat.st_size}:{stat.st_mtime_ns}:{backing_matrix.shape}:{backing_matrix.dtype}"
     return None
 
@@ -508,7 +514,8 @@ class BayesianPGS:
             prepared_arrays.scales,
             support_counts=prepared_arrays.support_counts,
         )
-        log(f"standardized view ready  mem={mem()}")
+        log(f"  standardized view created  mem={mem()}")
+        log("  computing fit-stage cache key...")
         fit_stage_cache_paths = _fit_stage_cache_paths(
             genotype_matrix=raw_genotype_matrix,
             allele_frequencies=variant_stats.allele_frequencies,
@@ -518,6 +525,8 @@ class BayesianPGS:
             targets=prepared_arrays.targets,
             config=self.config,
         )
+        log(f"  fit-stage cache key: {fit_stage_cache_paths.key if fit_stage_cache_paths else 'NONE'}  mem={mem()}")
+        log("  checking fit-stage cache...")
         cached_fit_stage = (
             None
             if fit_stage_cache_paths is None
