@@ -486,7 +486,7 @@ class BayesianPGS:
         if tuning_summary is not None:
             log(tuning_summary)
         covariate_matrix = self._with_intercept(covariates)
-        selection_records = normalize_variant_records(variant_records)
+        total_variant_count = len(variant_records)
 
         # Use pre-computed stats if available (saves 3 full data passes)
         if variant_stats is not None:
@@ -500,7 +500,6 @@ class BayesianPGS:
             )
             prepared_arrays = fit_preprocessor_from_stats(variant_stats, covariate_matrix, targets)
         preprocessor = Preprocessor(means=prepared_arrays.means, scales=prepared_arrays.scales)
-        total_variant_count = len(selection_records)
         log(f"preprocessor ready  {total_variant_count} variants  mem={mem()}")
 
         log("creating standardized genotype view...")
@@ -582,7 +581,9 @@ class BayesianPGS:
         # Create VariantRecord objects ONLY for active variants (not all 1.68M)
         # This saves ~840 MB of Python object overhead
         log(f"creating training records for {len(active_variant_indices)} active variants...")
-        active_selection_records = [selection_records[int(i)] for i in active_variant_indices]
+        active_selection_records = normalize_variant_records(
+            [variant_records[int(i)] for i in active_variant_indices]
+        )
         active_stats = VariantStatistics(
             means=variant_stats.means[active_variant_indices],
             scales=variant_stats.scales[active_variant_indices],
@@ -590,7 +591,7 @@ class BayesianPGS:
             support_counts=variant_stats.support_counts[active_variant_indices],
         )
         active_records = _training_records_from_stats(active_selection_records, active_stats)
-        del active_selection_records, active_stats, selection_records
+        del active_selection_records, active_stats
         import gc; gc.collect()
         log(f"active training records created: {len(active_records)}  mem={mem()}")
         if cached_fit_stage is None:
