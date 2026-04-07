@@ -20,7 +20,9 @@ from sv_pgs.config import (
 from sv_pgs.data import VariantRecord
 from sv_pgs.mixture_inference import (
     _build_prior_design,
+    _design_matrix_for_feature_specs,
     _metadata_baseline_scales_from_coefficients,
+    _parse_scale_model_feature_names,
 )
 
 
@@ -101,9 +103,106 @@ class TestMetadataScaleModel:
             VariantRecord("sv_c", VariantClass.DELETION_SHORT, "chr1", 102, quality=0.25, allele_frequency=0.01, training_support=3),
         ]
         prior_design = _build_prior_design(records)
+        assert "continuous_shared::quality" in prior_design.feature_names
         assert "continuous_linear::quality::deletion_short" in prior_design.feature_names
         assert "continuous_linear::logit_allele_frequency::deletion_short" in prior_design.feature_names
         assert "continuous_linear::log_training_support::deletion_short" in prior_design.feature_names
+
+    def test_annotation_binary_features_and_frequency_bins_enter_scale_design(self):
+        records = [
+            VariantRecord(
+                "sv_a",
+                VariantClass.DELETION_SHORT,
+                "chr1",
+                100,
+                allele_frequency=5e-4,
+                prior_continuous_features={"coding_annotation": 1.0, "constraint_score": 0.2},
+            ),
+            VariantRecord(
+                "sv_b",
+                VariantClass.DELETION_SHORT,
+                "chr1",
+                101,
+                allele_frequency=5e-3,
+                prior_continuous_features={"coding_annotation": 0.0, "constraint_score": 0.7},
+            ),
+            VariantRecord(
+                "sv_c",
+                VariantClass.DELETION_SHORT,
+                "chr1",
+                102,
+                allele_frequency=2e-2,
+                prior_continuous_features={"coding_annotation": 1.0, "constraint_score": 0.9},
+            ),
+            VariantRecord(
+                "sv_d",
+                VariantClass.DELETION_SHORT,
+                "chr1",
+                103,
+                allele_frequency=0.2,
+                prior_continuous_features={"coding_annotation": 0.0, "constraint_score": 1.1},
+            ),
+        ]
+        prior_design = _build_prior_design(records)
+
+        assert "binary_indicator::coding_annotation" in prior_design.feature_names
+        assert "binary_interaction::coding_annotation::deletion_short" in prior_design.feature_names
+        assert "continuous_shared::constraint_score" in prior_design.feature_names
+        assert "binary_indicator::maf_ultra_rare_indicator" in prior_design.feature_names
+        assert "binary_interaction::maf_rare_indicator::deletion_short" in prior_design.feature_names
+        assert "binary_interaction::maf_low_frequency_indicator::deletion_short" in prior_design.feature_names
+
+        coefficients = np.zeros(len(prior_design.feature_names), dtype=np.float64)
+        coefficients[prior_design.feature_names.index("binary_indicator::coding_annotation")] = 0.3
+        coefficients[prior_design.feature_names.index("binary_interaction::coding_annotation::deletion_short")] = 0.5
+        coefficients[prior_design.feature_names.index("continuous_shared::constraint_score")] = 0.4
+        baseline_scales = _metadata_baseline_scales_from_coefficients(
+            coefficients,
+            prior_design.design_matrix,
+            ModelConfig(),
+        )
+        assert np.unique(np.round(baseline_scales, 6)).shape[0] > 1
+
+    def test_feature_name_parser_round_trips_new_annotation_features(self):
+        records = [
+            VariantRecord(
+                "sv_a",
+                VariantClass.DELETION_SHORT,
+                "chr1",
+                100,
+                allele_frequency=5e-4,
+                prior_continuous_features={"coding_annotation": 1.0, "constraint_score": 0.2},
+            ),
+            VariantRecord(
+                "sv_b",
+                VariantClass.DELETION_SHORT,
+                "chr1",
+                101,
+                allele_frequency=5e-3,
+                prior_continuous_features={"coding_annotation": 0.0, "constraint_score": 0.7},
+            ),
+            VariantRecord(
+                "sv_c",
+                VariantClass.DELETION_SHORT,
+                "chr1",
+                102,
+                allele_frequency=2e-2,
+                prior_continuous_features={"coding_annotation": 1.0, "constraint_score": 0.9},
+            ),
+        ]
+        feature_specs = _parse_scale_model_feature_names(
+            [
+                "continuous_shared::constraint_score",
+                "binary_indicator::coding_annotation",
+                "binary_interaction::coding_annotation::deletion_short",
+                "binary_interaction::maf_ultra_rare_indicator::deletion_short",
+            ]
+        )
+
+        design_matrix = _design_matrix_for_feature_specs(records, feature_specs)
+
+        assert design_matrix.shape == (3, 4)
+        assert np.all(np.isfinite(design_matrix))
 
     def test_structural_annotations_still_affect_prior_scale(self):
         records = [

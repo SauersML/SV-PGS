@@ -14,6 +14,7 @@ from sv_pgs.genotype import RawGenotypeBatch, RawGenotypeMatrix, as_raw_genotype
 from sv_pgs.inference import VariationalFitCheckpoint, VariationalFitResult
 from sv_pgs.model import (
     _FitStageCachePaths,
+    _fit_stage_cache_paths,
     _raw_standardized_subset_matvec,
     _runtime_tuned_config_for_fit,
     _tie_group_export_weights,
@@ -130,6 +131,116 @@ def test_runtime_tuned_config_for_t4_caps_solver_from_gpu_budget(monkeypatch):
     assert tuned_config.sample_space_preconditioner_rank == 256
     assert tuned_config.final_posterior_refinement is False
     assert summary is not None
+
+
+def test_fit_stage_structure_cache_key_is_shared_across_traits(monkeypatch):
+    genotype_matrix, covariate_matrix, target_vector, variant_records = _synthetic_binary_dataset()
+    raw_genotypes = as_raw_genotype_matrix(genotype_matrix)
+    monkeypatch.setattr(model_module, "_persistent_raw_signature", lambda genotype_matrix: "synthetic-raw-signature")
+    variant_stats = compute_variant_statistics(
+        raw_genotypes=raw_genotypes,
+        config=ModelConfig(
+            trait_type=TraitType.BINARY,
+            max_outer_iterations=1,
+            minimum_minor_allele_frequency=0.0,
+        ),
+    )
+    prepared_binary = model_module.fit_preprocessor_from_stats(
+        variant_stats,
+        np.column_stack([np.ones(covariate_matrix.shape[0], dtype=np.float32), covariate_matrix]).astype(np.float32),
+        target_vector,
+    )
+    binary_paths = _fit_stage_cache_paths(
+        genotype_matrix=raw_genotypes,
+        allele_frequencies=np.asarray([record.allele_frequency for record in variant_records], dtype=np.float32),
+        means=prepared_binary.means,
+        scales=prepared_binary.scales,
+        covariates=prepared_binary.covariates,
+        targets=prepared_binary.targets,
+        config=ModelConfig(
+            trait_type=TraitType.BINARY,
+            minimum_minor_allele_frequency=0.0,
+        ),
+    )
+    quantitative_targets = np.asarray(target_vector * 2.0 - 0.5, dtype=np.float32)
+    prepared_quantitative = model_module.fit_preprocessor_from_stats(
+        variant_stats,
+        np.column_stack([np.ones(covariate_matrix.shape[0], dtype=np.float32), covariate_matrix]).astype(np.float32),
+        quantitative_targets,
+    )
+    quantitative_paths = _fit_stage_cache_paths(
+        genotype_matrix=raw_genotypes,
+        allele_frequencies=np.asarray([record.allele_frequency for record in variant_records], dtype=np.float32),
+        means=prepared_quantitative.means,
+        scales=prepared_quantitative.scales,
+        covariates=prepared_quantitative.covariates,
+        targets=prepared_quantitative.targets,
+        config=ModelConfig(
+            trait_type=TraitType.QUANTITATIVE,
+            minimum_minor_allele_frequency=0.0,
+        ),
+    )
+
+    assert binary_paths is not None
+    assert quantitative_paths is not None
+    assert binary_paths.key == quantitative_paths.key
+    assert binary_paths.manifest_path == quantitative_paths.manifest_path
+    assert binary_paths.reduced_raw_i8_path == quantitative_paths.reduced_raw_i8_path
+    assert binary_paths.em_checkpoint_path != quantitative_paths.em_checkpoint_path
+    assert binary_paths.fit_key != quantitative_paths.fit_key
+
+
+def test_sample_space_basis_cache_round_trip(tmp_path):
+    genotype_matrix, covariate_matrix, target_vector, variant_records = _synthetic_binary_dataset()
+    raw_genotypes = as_raw_genotype_matrix(genotype_matrix)
+    variant_stats = compute_variant_statistics(
+        raw_genotypes=raw_genotypes,
+        config=ModelConfig(
+            trait_type=TraitType.BINARY,
+            max_outer_iterations=1,
+            minimum_minor_allele_frequency=0.0,
+        ),
+    )
+    prepared = model_module.fit_preprocessor_from_stats(
+        variant_stats,
+        np.column_stack([np.ones(covariate_matrix.shape[0], dtype=np.float32), covariate_matrix]).astype(np.float32),
+        target_vector,
+    )
+    standardized = raw_genotypes.standardized(
+        prepared.means,
+        prepared.scales,
+        support_counts=prepared.support_counts,
+    )
+    cache_paths = _FitStageCachePaths(
+        key="basis-structure",
+        fit_key="basis-fit",
+        cache_dir=tmp_path,
+        manifest_path=tmp_path / "basis-structure.manifest.json",
+        active_indices_path=tmp_path / "basis-structure.active.npy",
+        tie_map_path=tmp_path / "basis-structure.tie.pkl",
+        reduced_raw_i8_path=tmp_path / "basis-structure.reduced_raw_i8.npy",
+        em_checkpoint_path=tmp_path / "basis-fit.em.pkl",
+    )
+    basis = np.arange(standardized.shape[0] * 3, dtype=np.float64).reshape(standardized.shape[0], 3)
+    standardized._sample_space_nystrom_basis_cpu_cache[(3, 19)] = basis
+
+    assert model_module._save_sample_space_basis_cache(
+        cache_paths,
+        standardized,
+        rank=3,
+        random_seed=19,
+    )
+
+    restored = standardized.subset(np.arange(standardized.shape[1], dtype=np.int32))
+    restored.clear_sample_space_nystrom_cache()
+
+    assert model_module._try_restore_sample_space_basis_cache(
+        cache_paths,
+        restored,
+        rank=3,
+        random_seed=19,
+    )
+    np.testing.assert_allclose(restored._sample_space_nystrom_basis_cpu_cache[(3, 19)], basis)
 
 
 def test_fit_resumes_from_variational_checkpoint(tmp_path, monkeypatch):

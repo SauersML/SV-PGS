@@ -499,6 +499,7 @@ def test_binary_posterior_converges_after_single_latent_gaussian_update(random_g
         compute_beta_variance=True,
         initial_beta_guess=None,
         sample_space_preconditioner_rank=256,
+        warm_start=None,
     ):
         nonlocal restricted_call_count
         restricted_call_count += 1
@@ -590,6 +591,7 @@ def test_cpu_sample_space_solver_uses_single_streaming_operator_pass(monkeypatch
         prior_variances=prior_variances,
         diagonal_noise=diagonal_noise,
         right_hand_side=right_hand_side,
+        initial_guess=None,
         tolerance=1e-10,
         max_iterations=64,
         preconditioner=np.diag(exact_operator).astype(np.float64),
@@ -639,6 +641,7 @@ def test_restricted_posterior_sample_space_merges_probe_rhs(monkeypatch: pytest.
         prior_variances,
         diagonal_noise,
         right_hand_side,
+        initial_guess,
         tolerance,
         max_iterations,
         preconditioner,
@@ -679,6 +682,86 @@ def test_restricted_posterior_sample_space_merges_probe_rhs(monkeypatch: pytest.
     assert linear_predictor.shape == (sample_count,)
 
 
+def test_restricted_posterior_sample_space_reuses_matching_warm_start(monkeypatch: pytest.MonkeyPatch):
+    sample_count, variant_count = 6, 7
+    genotype_values = np.array(
+        [
+            [0.0, 1.0, 2.0, 0.0, 1.0, 2.0, 0.0],
+            [1.0, 0.0, 1.0, 2.0, 0.0, 1.0, 2.0],
+            [2.0, 1.0, 0.0, 1.0, 2.0, 0.0, 1.0],
+            [1.0, 2.0, 1.0, 0.0, 1.0, 2.0, 1.0],
+            [0.0, 1.0, 1.0, 2.0, 1.0, 0.0, 2.0],
+            [2.0, 0.0, 2.0, 1.0, 0.0, 2.0, 1.0],
+        ],
+        dtype=np.float32,
+    )
+    standardized = as_raw_genotype_matrix(genotype_values).standardized(
+        means=np.mean(genotype_values, axis=0, dtype=np.float32),
+        scales=np.std(genotype_values, axis=0, dtype=np.float32) + 1e-3,
+    )
+    covariate_matrix = np.column_stack(
+        [
+            np.ones(sample_count, dtype=np.float64),
+            np.linspace(-1.0, 1.0, sample_count, dtype=np.float64),
+        ]
+    )
+    targets = np.linspace(-0.5, 0.75, sample_count, dtype=np.float64)
+    prior_variances = np.linspace(0.5, 1.1, variant_count, dtype=np.float64)
+    diagonal_noise = np.linspace(0.8, 1.3, sample_count, dtype=np.float64)
+    initial_guess_shapes: list[tuple[int, int] | None] = []
+    warm_start = mixture_inference._RestrictedPosteriorWarmStart(
+        sample_space_inverse_covariance_rhs=np.ones((sample_count, 1 + covariate_matrix.shape[1] + 5), dtype=np.float64)
+    )
+
+    monkeypatch.setattr(
+        mixture_inference,
+        "_sample_space_preconditioner",
+        lambda **kwargs: np.ones(sample_count, dtype=np.float64),
+    )
+    monkeypatch.setattr(mixture_inference, "stochastic_logdet", lambda *args, **kwargs: 0.0)
+
+    def fake_solve_sample_space_rhs_cpu(
+        genotype_matrix,
+        prior_variances,
+        diagonal_noise,
+        right_hand_side,
+        initial_guess,
+        tolerance,
+        max_iterations,
+        preconditioner,
+        batch_size,
+    ):
+        rhs = np.asarray(right_hand_side, dtype=np.float64)
+        if rhs.ndim == 1:
+            rhs = rhs[:, None]
+        initial_guess_shapes.append(None if initial_guess is None else tuple(np.asarray(initial_guess).shape))
+        return rhs
+
+    monkeypatch.setattr(mixture_inference, "_solve_sample_space_rhs_cpu", fake_solve_sample_space_rhs_cpu)
+
+    mixture_inference._restricted_posterior_state(
+        genotype_matrix=standardized,
+        covariate_matrix=covariate_matrix,
+        targets=targets,
+        prior_variances=prior_variances,
+        diagonal_noise=diagonal_noise,
+        solver_tolerance=1e-6,
+        maximum_linear_solver_iterations=16,
+        logdet_probe_count=2,
+        logdet_lanczos_steps=4,
+        exact_solver_matrix_limit=2,
+        posterior_variance_batch_size=3,
+        posterior_variance_probe_count=5,
+        random_seed=7,
+        compute_logdet=False,
+        compute_beta_variance=True,
+        sample_space_preconditioner_rank=0,
+        warm_start=warm_start,
+    )
+
+    assert initial_guess_shapes == [(sample_count, 1 + covariate_matrix.shape[1] + 5)]
+
+
 def test_binary_posterior_stops_when_predictor_update_is_stalled(random_generator, monkeypatch):
     sample_count, variant_count = 64, 6
     genotype_matrix = random_generator.standard_normal((sample_count, variant_count)).astype(np.float32)
@@ -712,6 +795,7 @@ def test_binary_posterior_stops_when_predictor_update_is_stalled(random_generato
         compute_beta_variance=True,
         initial_beta_guess=None,
         sample_space_preconditioner_rank=256,
+        warm_start=None,
     ):
         nonlocal restricted_call_count
         restricted_call_count += 1
@@ -829,6 +913,7 @@ def test_binary_posterior_uses_inexact_solver_controls_before_final_solve(monkey
         compute_beta_variance=True,
         initial_beta_guess=None,
         sample_space_preconditioner_rank=256,
+        warm_start=None,
     ):
         solver_settings.append(
             (
@@ -1256,6 +1341,7 @@ def test_gpu_sample_space_block_cg_matches_dense_solution(monkeypatch: pytest.Mo
         prior_variances=prior_variances,
         diagonal_noise=diagonal_noise,
         right_hand_side=right_hand_side,
+        initial_guess=None,
         tolerance=1e-7,
         max_iterations=64,
         preconditioner=preconditioner,
@@ -1339,6 +1425,7 @@ def test_gpu_sample_space_block_cg_mixed_precision_refinement_matches_dense_solu
         prior_variances=prior_variances,
         diagonal_noise=diagonal_noise,
         right_hand_side=right_hand_side,
+        initial_guess=None,
         tolerance=1e-7,
         max_iterations=64,
         preconditioner=preconditioner,
@@ -1402,6 +1489,7 @@ def test_gpu_sample_space_solver_retries_in_float64_after_mixed_precision_stalls
         prior_variances=prior_variances,
         diagonal_noise=diagonal_noise,
         right_hand_side=right_hand_side,
+        initial_guess=None,
         tolerance=1e-7,
         max_iterations=64,
         preconditioner=lambda rhs: rhs,
@@ -1581,6 +1669,7 @@ def test_cpu_sample_space_block_cg_matches_dense_solution(monkeypatch: pytest.Mo
         prior_variances=prior_variances,
         diagonal_noise=diagonal_noise,
         right_hand_side=right_hand_side,
+        initial_guess=None,
         tolerance=1e-7,
         max_iterations=64,
         preconditioner=preconditioner,
@@ -2165,6 +2254,7 @@ def test_validation_restores_best_iterate(monkeypatch: pytest.MonkeyPatch):
         compute_beta_variance=True,
         predictor_offset=None,
         stale_beta_variance=None,
+        restricted_posterior_warm_start=None,
     ):
         call_counter["count"] += 1
         if call_counter["count"] <= config.max_outer_iterations:
@@ -2240,6 +2330,7 @@ def test_binary_validation_uses_calibrated_intercept(monkeypatch: pytest.MonkeyP
         compute_beta_variance=True,
         predictor_offset=None,
         stale_beta_variance=None,
+        restricted_posterior_warm_start=None,
     ):
         return PosteriorState(
             alpha=np.zeros(covariate_matrix.shape[1], dtype=np.float64),
@@ -2306,6 +2397,7 @@ def test_variational_em_reuses_beta_variance_between_refreshes(monkeypatch: pyte
         compute_beta_variance=True,
         predictor_offset=None,
         stale_beta_variance=None,
+        restricted_posterior_warm_start=None,
     ):
         compute_beta_variance_calls.append(bool(compute_beta_variance))
         stale_beta_variance_flags.append(stale_beta_variance is not None)
@@ -2346,8 +2438,8 @@ def test_variational_em_reuses_beta_variance_between_refreshes(monkeypatch: pyte
         ),
     )
 
-    assert compute_beta_variance_calls == [True, False, False, True, False, True]
-    assert stale_beta_variance_flags == [False, True, True, True, True, False]
+    assert compute_beta_variance_calls == [False, False, False, True, False, True]
+    assert stale_beta_variance_flags == [True, True, True, True, True, False]
 
 
 def test_tpb_shape_vectors_are_learned_from_local_scale_state():

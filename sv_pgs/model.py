@@ -26,7 +26,6 @@ from sv_pgs.genotype import (
     auto_batch_size,
 )
 from sv_pgs.inference import VariationalFitCheckpoint, VariationalFitResult, fit_variational_em
-from sv_pgs.mixture_inference import prepare_sample_space_nystrom_basis_cache
 from sv_pgs.numeric import stable_sigmoid
 from sv_pgs.null_model import NullModelFit, fit_stage1_null_model
 from sv_pgs.preprocessing import (
@@ -276,14 +275,7 @@ def _save_sample_space_basis_cache(
     basis_path = _sample_space_basis_cache_path(cache_paths, rank=rank, random_seed=random_seed)
     cached_basis = genotype_matrix._sample_space_nystrom_basis_cpu_cache.get((int(rank), int(random_seed)))
     if cached_basis is None:
-        prepared_rank = prepare_sample_space_nystrom_basis_cache(
-            genotype_matrix=genotype_matrix,
-            rank=rank,
-            random_seed=random_seed,
-        )
-        if prepared_rank <= 0:
-            return False
-        cached_basis = genotype_matrix._sample_space_nystrom_basis_cpu_cache.get((int(prepared_rank), int(random_seed)))
+        return False
     if cached_basis is None:
         return False
     basis_array = np.asarray(cached_basis, dtype=np.float64)
