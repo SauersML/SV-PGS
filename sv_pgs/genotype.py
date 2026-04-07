@@ -3,7 +3,10 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
+import io
+import os
 from pathlib import Path
+import shutil
 import tempfile
 from typing import Any, Iterator, Protocol, Sequence, TypeGuard, cast
 
@@ -36,6 +39,7 @@ MATERIALIZE_THRESHOLD_BYTES = 4_000_000_000  # 4 GB
 T4_SAFE_GPU_CACHE_BYTES = 4_500_000_000
 HYBRID_SPARSE_SUPPORT_THRESHOLD = 4_096
 HYBRID_SPARSE_MIN_VARIANT_COUNT = 64
+REDUCED_INT8_CACHE_FREE_SPACE_RESERVE_BYTES = 1_000_000_000
 
 
 def as_raw_genotype_matrix(genotypes: RawGenotypeMatrix | np.ndarray) -> RawGenotypeMatrix:
@@ -45,6 +49,61 @@ def as_raw_genotype_matrix(genotypes: RawGenotypeMatrix | np.ndarray) -> RawGeno
     if array.dtype == np.int8:
         return Int8RawGenotypeMatrix(array)
     return DenseRawGenotypeMatrix(np.asarray(array, dtype=np.float32))
+
+
+def _int8_npy_header_bytes(shape: tuple[int, int], *, fortran_order: bool) -> bytes:
+    header_buffer = io.BytesIO()
+    np.lib.format.write_array_header_2_0(
+        header_buffer,
+        {
+            "descr": np.lib.format.dtype_to_descr(np.dtype(np.int8)),
+            "fortran_order": bool(fortran_order),
+            "shape": tuple(int(dimension) for dimension in shape),
+        },
+    )
+    return header_buffer.getvalue()
+
+
+def _int8_npy_expected_size(shape: tuple[int, int], *, fortran_order: bool) -> int:
+    return len(_int8_npy_header_bytes(shape, fortran_order=fortran_order)) + int(np.prod(shape, dtype=np.int64))
+
+
+def _has_sufficient_free_space_for_int8_npy(path: Path, shape: tuple[int, int], *, fortran_order: bool) -> tuple[bool, int, int]:
+    required_bytes = _int8_npy_expected_size(shape, fortran_order=fortran_order)
+    available_bytes = shutil.disk_usage(path).free
+    reserve_bytes = max(REDUCED_INT8_CACHE_FREE_SPACE_RESERVE_BYTES, required_bytes // 20)
+    return available_bytes >= required_bytes + reserve_bytes, required_bytes, available_bytes
+
+
+def _stream_write_int8_npy(
+    path: Path,
+    *,
+    shape: tuple[int, int],
+    column_batches: Iterator[np.ndarray],
+    fortran_order: bool,
+) -> None:
+    expected_sample_count = int(shape[0])
+    expected_variant_count = int(shape[1])
+    written_variant_count = 0
+    header_bytes = _int8_npy_header_bytes(shape, fortran_order=fortran_order)
+    with path.open("wb") as handle:
+        handle.write(header_bytes)
+        for batch_values in column_batches:
+            batch_array = np.asarray(batch_values, dtype=np.int8)
+            if batch_array.ndim != 2:
+                raise ValueError("int8 cache batches must be two-dimensional.")
+            if batch_array.shape[0] != expected_sample_count:
+                raise ValueError(
+                    f"int8 cache batch sample count mismatch: {batch_array.shape[0]} != {expected_sample_count}"
+                )
+            handle.write(np.asfortranarray(batch_array).tobytes(order="F"))
+            written_variant_count += int(batch_array.shape[1])
+        handle.flush()
+        os.fsync(handle.fileno())
+    if written_variant_count != expected_variant_count:
+        raise ValueError(
+            f"int8 cache variant count mismatch after streaming write: {written_variant_count} != {expected_variant_count}"
+        )
 
 
 @dataclass(slots=True)
@@ -1267,22 +1326,28 @@ class StandardizedGenotypeMatrix:
         cache_directory = tempfile.TemporaryDirectory(prefix="svpgs-genotype-")
         cache_path = Path(cache_directory.name) / "reduced_raw_i8.npy"
         try:
-            raw_cache = np.lib.format.open_memmap(
-                cache_path,
-                mode="w+",
-                dtype=np.int8,
-                shape=self.shape,
+            has_space, required_bytes, available_bytes = _has_sufficient_free_space_for_int8_npy(
+                Path(cache_directory.name),
+                self.shape,
                 fortran_order=True,
             )
-            local_start = 0
+            if not has_space:
+                log(
+                    "    local int8 cache skipped: insufficient free space "
+                    + f"(need~{required_bytes / 1e9:.1f} GB, free~{available_bytes / 1e9:.1f} GB)  mem={mem()}"
+                )
+                cache_directory.cleanup()
+                return False
             raw_int8 = cast(Int8BatchCapable, self.raw)
-            for raw_batch in raw_int8.iter_column_batches_i8(self.variant_indices, batch_size=batch_size):
-                batch_width = raw_batch.values.shape[1]
-                local_stop = local_start + batch_width
-                raw_cache[:, local_start:local_stop] = raw_batch.values
-                local_start = local_stop
-            raw_cache.flush()
-            del raw_cache
+            def _column_batches() -> Iterator[np.ndarray]:
+                for raw_batch in raw_int8.iter_column_batches_i8(self.variant_indices, batch_size=batch_size):
+                    yield raw_batch.values
+            _stream_write_int8_npy(
+                cache_path,
+                shape=self.shape,
+                column_batches=_column_batches(),
+                fortran_order=True,
+            )
             rebased_raw = Int8RawGenotypeMatrix(np.load(cache_path, mmap_mode="r"))
             self.raw = rebased_raw
             self.means = np.asarray(self.means[self.variant_indices], dtype=np.float32)
@@ -1294,7 +1359,7 @@ class StandardizedGenotypeMatrix:
             self._local_cache_directory = cache_directory
             self._cupy_subset_cache = None
             self._cupy_subset_cache_local_indices = None
-            self._configure_operator_backend()
+            self._enable_hybrid_backend = False  # GPU streaming handles everything
             log("    local int8 cache ready  mem=" + mem())
             return True
         except Exception as exc:
@@ -1319,22 +1384,27 @@ class StandardizedGenotypeMatrix:
             + f"({selected_variant_count} variants x {self.shape[0]} samples) → {cache_path}  mem={mem()}"
         )
         try:
-            raw_cache = np.lib.format.open_memmap(
-                temp_path,
-                mode="w+",
-                dtype=np.int8,
-                shape=self.shape,
+            has_space, required_bytes, available_bytes = _has_sufficient_free_space_for_int8_npy(
+                temp_directory,
+                self.shape,
                 fortran_order=True,
             )
-            local_start = 0
+            if not has_space:
+                log(
+                    "    persistent int8 cache skipped: insufficient free space "
+                    + f"(need~{required_bytes / 1e9:.1f} GB, free~{available_bytes / 1e9:.1f} GB)  mem={mem()}"
+                )
+                return False
             raw_int8 = cast(Int8BatchCapable, self.raw)
-            for raw_batch in raw_int8.iter_column_batches_i8(self.variant_indices, batch_size=batch_size):
-                batch_width = raw_batch.values.shape[1]
-                local_stop = local_start + batch_width
-                raw_cache[:, local_start:local_stop] = raw_batch.values
-                local_start = local_stop
-            raw_cache.flush()
-            del raw_cache
+            def _column_batches() -> Iterator[np.ndarray]:
+                for raw_batch in raw_int8.iter_column_batches_i8(self.variant_indices, batch_size=batch_size):
+                    yield raw_batch.values
+            _stream_write_int8_npy(
+                temp_path,
+                shape=self.shape,
+                column_batches=_column_batches(),
+                fortran_order=True,
+            )
             temp_path.replace(cache_path)
             persisted_raw = Int8RawGenotypeMatrix(np.load(cache_path, mmap_mode="r"))
             self.raw = persisted_raw
@@ -1347,7 +1417,8 @@ class StandardizedGenotypeMatrix:
             self._local_cache_directory = None
             self._cupy_subset_cache = None
             self._cupy_subset_cache_local_indices = None
-            self._configure_operator_backend()
+            # Don't rebuild hybrid backend — GPU streaming handles everything
+            self._enable_hybrid_backend = False
             log("    persistent int8 cache ready  mem=" + mem())
             return True
         except Exception as exc:

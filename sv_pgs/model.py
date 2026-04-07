@@ -644,6 +644,16 @@ class BayesianPGS:
                 np.asarray(validation_targets, dtype=np.float32),
             )
 
+        # Free original mmap'd chromosome data BEFORE materialization/persistence.
+        # The tie map is done — we only need reduced_genotypes going forward.
+        # Freeing early reduces memory pressure and prevents Bus errors from
+        # mmap page faults on full disk during int8 persistence.
+        log(f"  freeing original genotype data before materialization...")
+        del raw_genotype_matrix, standardized_genotypes, active_genotypes
+        import gc
+        gc.collect()
+        log(f"  freed. mem={mem()}")
+
         # Materialize the reduced genotype matrix (RAM or GPU via CuPy).
         log(f"materializing reduced genotype matrix ({reduced_genotypes.shape})...")
         in_memory = reduced_genotypes.try_materialize_gpu()
@@ -673,11 +683,6 @@ class BayesianPGS:
                     log(f"  local tmpdir cache ready  mem={mem()}")
             if not local_cache:
                 log(f"  no materialization possible — streaming from mmap  mem={mem()}")
-        log(f"  freeing intermediate data...")
-        del raw_genotype_matrix, standardized_genotypes, active_genotypes
-        import gc
-        gc.collect()
-        log(f"  done. mem={mem()}")
         if fit_stage_cache_paths is not None and int(self.config.sample_space_preconditioner_rank) > 0:
             log("  restoring preconditioner basis cache...")
             _try_restore_sample_space_basis_cache(
