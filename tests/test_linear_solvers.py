@@ -192,6 +192,56 @@ def test_stochastic_logdet_uses_block_matmat_when_available():
     assert call_counts["matvec"] == 0
     assert call_counts["matmat"] > 0
 
+
+def test_stochastic_logdet_stops_early_when_estimate_variance_is_zero():
+    dimension = 8
+    call_counts = {"matmat": 0}
+
+    def tracked_matmat(matrix):
+        call_counts["matmat"] += 1
+        return jnp.asarray(np.asarray(matrix, dtype=np.float64), dtype=jnp.float64)
+
+    operator = build_linear_operator(
+        shape=(dimension, dimension),
+        matvec=lambda vector: jnp.asarray(vector, dtype=jnp.float64),
+        matmat=tracked_matmat,
+        dtype=jnp.float64,
+    )
+
+    estimate = linear_solvers.stochastic_logdet(
+        operator=operator,
+        dimension=dimension,
+        probe_count=16,
+        lanczos_steps=3,
+        random_seed=0,
+        minimum_probe_count=4,
+        relative_error_tolerance=1e-6,
+    )
+
+    np.testing.assert_allclose(estimate, 0.0, atol=1e-10)
+    assert call_counts["matmat"] == 2
+
+
+def test_stochastic_logdet_diagonal_control_variate_is_exact_for_matching_diagonal():
+    diagonal = np.array([4.0, 9.0, 16.0], dtype=np.float64)
+    operator = build_linear_operator(
+        shape=(3, 3),
+        matvec=lambda vector: jnp.asarray(diagonal * np.asarray(vector, dtype=np.float64), dtype=jnp.float64),
+        matmat=lambda matrix: jnp.asarray(diagonal[:, None] * np.asarray(matrix, dtype=np.float64), dtype=jnp.float64),
+        dtype=jnp.float64,
+    )
+
+    estimate = linear_solvers.stochastic_logdet(
+        operator=operator,
+        dimension=diagonal.shape[0],
+        probe_count=8,
+        lanczos_steps=3,
+        random_seed=0,
+        control_variate_diagonal=diagonal,
+    )
+
+    np.testing.assert_allclose(estimate, np.sum(np.log(diagonal)), atol=1e-10)
+
 def test_small_symmetric_eigh_rejects_non_finite_input():
     with np.testing.assert_raises_regex(RuntimeError, "non-finite values"):
         linear_solvers._small_symmetric_eigh(np.array([[1.0, np.nan], [np.nan, 2.0]], dtype=np.float64))

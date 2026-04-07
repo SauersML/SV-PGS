@@ -149,8 +149,49 @@ def stochastic_logdet(
     probe_count: int,
     lanczos_steps: int,
     random_seed: int,
+    minimum_probe_count: int = 4,
+    relative_error_tolerance: float = 0.05,
+    absolute_error_tolerance: float = 0.0,
+    control_variate_diagonal: np.ndarray | jnp.ndarray | None = None,
 ) -> float:
     linear_operator = _as_linear_operator(operator)
+    baseline_logdet = 0.0
+    if control_variate_diagonal is not None:
+        diagonal = np.asarray(control_variate_diagonal, dtype=np.float64).reshape(-1)
+        if diagonal.shape != (dimension,):
+            raise ValueError("control_variate_diagonal must have one entry per operator dimension.")
+        if np.any(~np.isfinite(diagonal)) or np.any(diagonal <= 0.0):
+            raise ValueError("control_variate_diagonal must be finite and strictly positive.")
+        inverse_sqrt_diagonal = np.asarray(1.0 / np.sqrt(diagonal), dtype=np.float64)
+        baseline_logdet = float(np.sum(np.log(diagonal)))
+        transformed_dtype = linear_operator.dtype or jnp.float64
+
+        def transformed_matvec(vector: jnp.ndarray) -> jnp.ndarray:
+            scaled_vector = inverse_sqrt_diagonal * np.asarray(vector, dtype=np.float64)
+            applied = np.asarray(linear_operator.matvec(jnp.asarray(scaled_vector, dtype=transformed_dtype)), dtype=np.float64)
+            return jnp.asarray(inverse_sqrt_diagonal * applied, dtype=transformed_dtype)
+
+        def transformed_matmat(matrix: jnp.ndarray) -> jnp.ndarray:
+            matrix_array = np.asarray(matrix, dtype=np.float64)
+            scaled_matrix = inverse_sqrt_diagonal[:, None] * matrix_array
+            if linear_operator.matmat is not None:
+                applied = np.asarray(linear_operator.matmat(jnp.asarray(scaled_matrix, dtype=transformed_dtype)), dtype=np.float64)
+            else:
+                applied = np.column_stack(
+                    [
+                        np.asarray(linear_operator.matvec(jnp.asarray(scaled_matrix[:, column_index], dtype=transformed_dtype)), dtype=np.float64)
+                        for column_index in range(scaled_matrix.shape[1])
+                    ]
+                )
+            return jnp.asarray(inverse_sqrt_diagonal[:, None] * applied, dtype=transformed_dtype)
+
+        linear_operator = build_linear_operator(
+            shape=linear_operator.shape,
+            matvec=transformed_matvec,
+            matmat=transformed_matmat,
+            dtype=transformed_dtype,
+            jax_compatible=False,
+        )
     operator_dtype = linear_operator.dtype or jnp.float32
     step_count = min(max(lanczos_steps, 2), dimension)
     random_generator = np.random.default_rng(random_seed)
@@ -158,6 +199,9 @@ def stochastic_logdet(
     estimates: list[float] = []
     probe_dtype = np.asarray(jnp.zeros((), dtype=operator_dtype)).dtype
     probe_block_size = min(max(1, min(8, dimension)), probe_count)
+    minimum_required_probes = min(max(int(minimum_probe_count), 1), max(int(probe_count), 1))
+    resolved_relative_error_tolerance = max(float(relative_error_tolerance), 0.0)
+    resolved_absolute_error_tolerance = max(float(absolute_error_tolerance), 0.0)
     probes_completed = 0
     while probes_completed < probe_count:
         current_block_size = min(probe_block_size, probe_count - probes_completed)
@@ -180,7 +224,24 @@ def stochastic_logdet(
             clipped_eigenvalues = np.maximum(eigenvalues, 1e-12)
             estimates.append(float(np.sum((eigenvectors[0, :] ** 2) * np.log(clipped_eigenvalues))))
         probes_completed += current_block_size
-    return float(dimension * np.mean(estimates))
+        if probes_completed < minimum_required_probes or len(estimates) < 2:
+            continue
+        block_estimate = float(dimension * np.mean(estimates))
+        block_standard_error = float(
+            dimension * np.std(np.asarray(estimates, dtype=np.float64), ddof=1) / np.sqrt(len(estimates))
+        )
+        error_threshold = max(
+            resolved_absolute_error_tolerance,
+            resolved_relative_error_tolerance * max(abs(baseline_logdet + block_estimate), 1.0),
+        )
+        if block_standard_error <= error_threshold:
+            log(
+                "      logdet adaptive stop: "
+                + f"used {probes_completed}/{probe_count} probes  stderr={block_standard_error:.2e} "
+                + f"threshold={error_threshold:.2e}"
+            )
+            break
+    return float(baseline_logdet + dimension * np.mean(estimates))
 
 
 def _normalized_rademacher_probe_block(

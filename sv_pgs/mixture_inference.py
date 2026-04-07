@@ -4255,6 +4255,7 @@ def _restricted_posterior_state(
                     probe_count=logdet_probe_count,
                     lanczos_steps=logdet_lanczos_steps,
                     random_seed=random_seed,
+                    control_variate_diagonal=variant_preconditioner,
                 )
                 if compute_logdet
                 else 0.0
@@ -4425,6 +4426,7 @@ def _restricted_posterior_state(
             probe_count=logdet_probe_count,
             lanczos_steps=logdet_lanczos_steps,
             random_seed=random_seed,
+            control_variate_diagonal=sample_space_preconditioner_cache_entry.diagonal_preconditioner,
         )
         if compute_logdet
         else 0.0
