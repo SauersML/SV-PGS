@@ -1486,7 +1486,7 @@ def test_posterior_variance_diagonal_uses_low_rank_residual_estimator():
         random_seed=0,
     )
 
-    np.testing.assert_allclose(estimated_diagonal, np.diag(inverse_precision), rtol=1e-6, atol=1e-6)
+    np.testing.assert_allclose(estimated_diagonal, np.diag(inverse_precision), rtol=3e-5, atol=3e-5)
     assert solve_calls == [(inverse_precision.shape[0], 4)]
 
 

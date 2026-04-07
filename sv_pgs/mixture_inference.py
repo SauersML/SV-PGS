@@ -268,11 +268,19 @@ def _covariates_only_fit_result(
     trait_type: TraitType,
     config: ModelConfig,
     validation_data: tuple[StandardizedGenotypeMatrix | np.ndarray, np.ndarray, np.ndarray] | None,
+    predictor_offset: np.ndarray | None = None,
+    validation_offset: np.ndarray | None = None,
 ) -> VariationalFitResult:
+    offset = (
+        np.zeros(len(targets), dtype=np.float64)
+        if predictor_offset is None
+        else np.asarray(predictor_offset, dtype=np.float64).reshape(-1)
+    )
     alpha = (
-        _fit_covariates_only_binary(
+        _fit_binary_alpha_with_offset(
             covariate_matrix=covariate_matrix,
             targets=targets,
+            predictor_offset=offset,
             minimum_weight=config.polya_gamma_minimum_weight,
             max_iterations=config.max_inner_newton_iterations,
             gradient_tolerance=config.newton_gradient_tolerance,
@@ -280,12 +288,12 @@ def _covariates_only_fit_result(
         if trait_type == TraitType.BINARY
         else _initialize_alpha_state(
             covariate_matrix=covariate_matrix,
-            targets=targets,
+            targets=np.asarray(targets, dtype=np.float64) - offset,
             trait_type=trait_type,
         )
     )
     beta = np.zeros(0, dtype=np.float64)
-    linear_predictor = np.asarray(covariate_matrix @ alpha, dtype=np.float64)
+    linear_predictor = np.asarray(offset + covariate_matrix @ alpha, dtype=np.float64)
     sigma_error2 = 1.0
     if trait_type == TraitType.BINARY:
         if config.binary_intercept_calibration and alpha.size > 0:
@@ -315,6 +323,7 @@ def _covariates_only_fit_result(
                 targets=validation_data[2],
                 alpha=alpha,
                 beta=beta,
+                predictor_offset=validation_offset,
             )
         )
 
@@ -495,10 +504,24 @@ def fit_variational_em(
     validation_data: tuple[StandardizedGenotypeMatrix | np.ndarray, np.ndarray, np.ndarray] | None = None,
     resume_checkpoint: VariationalFitCheckpoint | None = None,
     checkpoint_callback: Callable[[VariationalFitCheckpoint], None] | None = None,
+    predictor_offset: np.ndarray | None = None,
+    validation_offset: np.ndarray | None = None,
 ) -> VariationalFitResult:
     genotype_matrix = _as_standardized_genotype_matrix(genotypes)
     covariate_matrix = np.asarray(covariates, dtype=np.float64)
     target_vector = np.asarray(targets, dtype=np.float64)
+    predictor_offset_array = (
+        np.zeros(target_vector.shape[0], dtype=np.float64)
+        if predictor_offset is None
+        else np.asarray(predictor_offset, dtype=np.float64).reshape(-1)
+    )
+    if predictor_offset_array.shape != target_vector.shape:
+        raise ValueError("predictor_offset must match training target shape.")
+    validation_offset_array = (
+        None
+        if validation_offset is None
+        else np.asarray(validation_offset, dtype=np.float64).reshape(-1)
+    )
     member_records = list(records)
     if genotype_matrix.shape[1] != len(tie_map.reduced_to_group):
         raise ValueError("Reduced genotype columns must match tie-map group count.")
@@ -526,6 +549,8 @@ def fit_variational_em(
             trait_type=config.trait_type,
             config=config,
             validation_data=validation_payload,
+            predictor_offset=predictor_offset_array,
+            validation_offset=validation_offset_array,
         )
     prior_design = _build_prior_design(reduced_records)
     config_signature = _checkpoint_config_signature(config)
@@ -725,8 +750,8 @@ def fit_variational_em(
             if config.trait_type == TraitType.BINARY:
                 alpha_state = _fit_binary_alpha_with_offset(
                     covariate_matrix=covariate_matrix,
-                    targets=target_vector,
-                    predictor_offset=genetic_linear_predictor,
+                targets=target_vector,
+                predictor_offset=predictor_offset_array + genetic_linear_predictor,
                     minimum_weight=config.polya_gamma_minimum_weight,
                     max_iterations=config.max_inner_newton_iterations,
                     gradient_tolerance=config.newton_gradient_tolerance,
@@ -736,7 +761,7 @@ def fit_variational_em(
             else:
                 alpha_state = _initialize_alpha_state(
                     covariate_matrix=covariate_matrix,
-                    targets=target_vector - genetic_linear_predictor,
+                    targets=target_vector - predictor_offset_array - genetic_linear_predictor,
                     trait_type=TraitType.QUANTITATIVE,
                 )
             covariate_linear_predictor = np.asarray(covariate_matrix @ alpha_state, dtype=np.float64)
@@ -751,7 +776,7 @@ def fit_variational_em(
                     block_genotypes.matvec(block_beta_previous, batch_size=config.posterior_variance_batch_size),
                     dtype=np.float64,
                 )
-                predictor_offset = covariate_linear_predictor + genetic_linear_predictor - block_linear_predictor_previous
+                predictor_offset = predictor_offset_array + covariate_linear_predictor + genetic_linear_predictor - block_linear_predictor_previous
                 if config.trait_type == TraitType.BINARY:
                     block_state = _binary_posterior_state(
                         genotype_matrix=block_genotypes,
@@ -787,7 +812,7 @@ def fit_variational_em(
                     block_state = _fit_collapsed_posterior(
                         genotype_matrix=block_genotypes,
                         covariate_matrix=empty_covariates,
-                        targets=target_vector - predictor_offset,
+                            targets=target_vector - predictor_offset,
                         reduced_prior_variances=block_prior_variances,
                         sigma_error2=sigma_error2,
                         alpha_init=np.zeros(0, dtype=np.float64),
@@ -835,8 +860,8 @@ def fit_variational_em(
             if config.trait_type == TraitType.BINARY:
                 alpha_state = _fit_binary_alpha_with_offset(
                     covariate_matrix=covariate_matrix,
-                    targets=target_vector,
-                    predictor_offset=genetic_linear_predictor,
+                        targets=target_vector,
+                        predictor_offset=predictor_offset_array + genetic_linear_predictor,
                     minimum_weight=config.polya_gamma_minimum_weight,
                     max_iterations=config.max_inner_newton_iterations,
                     gradient_tolerance=config.newton_gradient_tolerance,
@@ -846,9 +871,9 @@ def fit_variational_em(
             else:
                 alpha_state = _initialize_alpha_state(
                     covariate_matrix=covariate_matrix,
-                    targets=target_vector - genetic_linear_predictor,
-                    trait_type=TraitType.QUANTITATIVE,
-                )
+                        targets=target_vector - predictor_offset_array - genetic_linear_predictor,
+                        trait_type=TraitType.QUANTITATIVE,
+                    )
             should_update_hyperparameters = (
                 config.update_hyperparameters
                 and (outer_iteration + 1 >= 4)
@@ -885,7 +910,7 @@ def fit_variational_em(
                 config=config,
             )
             covariate_linear_predictor = np.asarray(covariate_matrix @ alpha_state, dtype=np.float64)
-            linear_predictor = covariate_linear_predictor + genetic_linear_predictor
+            linear_predictor = predictor_offset_array + covariate_linear_predictor + genetic_linear_predictor
             beta_variance_state = np.maximum(reduced_second_moment - beta_state * beta_state, 1e-8)
             if config.trait_type == TraitType.QUANTITATIVE:
                 leverage_weight = np.maximum(reduced_prior_variances - beta_variance_state, 0.0) / np.maximum(reduced_prior_variances, 1e-12)
@@ -921,6 +946,7 @@ def fit_variational_em(
                         targets=validation_payload[2],
                         alpha=alpha_state,
                         beta=beta_state,
+                        predictor_offset=validation_offset_array,
                     )
                     validation_history.append(validation_metric)
                     if best_validation_metric is None or validation_metric < best_validation_metric:
@@ -1004,6 +1030,7 @@ def fit_variational_em(
                 config=config,
                 compute_logdet=False,
                 compute_beta_variance=True,
+                predictor_offset=predictor_offset_array,
             )
             if config.trait_type == TraitType.BINARY and config.binary_intercept_calibration:
                 posterior_state = _apply_binary_intercept_calibration(
@@ -1041,6 +1068,7 @@ def fit_variational_em(
                         targets=validation_payload[2],
                         alpha=alpha_state,
                         beta=beta_state,
+                        predictor_offset=validation_offset_array,
                     )
                     validation_history.append(validation_metric)
                     if best_validation_metric is None or validation_metric < best_validation_metric:
@@ -1173,6 +1201,7 @@ def fit_variational_em(
         config=config,
         compute_logdet=True,
         compute_beta_variance=True,
+        predictor_offset=predictor_offset_array,
     )
     if config.trait_type == TraitType.BINARY and config.binary_intercept_calibration:
         final_state = _apply_binary_intercept_calibration(
@@ -1253,14 +1282,22 @@ def _fit_collapsed_posterior(
     config: ModelConfig,
     compute_logdet: bool = True,
     compute_beta_variance: bool = True,
+    predictor_offset: np.ndarray | None = None,
 ) -> PosteriorState:
     log(f"    collapsed posterior: trait={trait_type.value}  n_variants={genotype_matrix.shape[1]}  n_samples={genotype_matrix.shape[0]}  sigma_e2={sigma_error2:.6f}  mem={mem()}")
     prior_variances = np.maximum(np.asarray(reduced_prior_variances, dtype=np.float64), 1e-8)
+    predictor_offset_array = (
+        np.zeros(genotype_matrix.shape[0], dtype=np.float64)
+        if predictor_offset is None
+        else np.asarray(predictor_offset, dtype=np.float64).reshape(-1)
+    )
+    if predictor_offset_array.shape != (genotype_matrix.shape[0],):
+        raise ValueError("predictor_offset must match genotype sample count.")
     if trait_type == TraitType.QUANTITATIVE:
         alpha, beta, beta_variance, linear_predictor, collapsed_objective, sigma_error2_new = _quantitative_posterior_state(
             genotype_matrix=genotype_matrix,
             covariate_matrix=covariate_matrix,
-            targets=targets,
+            targets=np.asarray(targets, dtype=np.float64) - predictor_offset_array,
             prior_variances=prior_variances,
             sigma_error2=max(float(sigma_error2), config.sigma_error_floor),
             sigma_error_floor=config.sigma_error_floor,
@@ -1276,6 +1313,7 @@ def _fit_collapsed_posterior(
             compute_beta_variance=compute_beta_variance,
             sample_space_preconditioner_rank=config.sample_space_preconditioner_rank,
         )
+        linear_predictor = np.asarray(linear_predictor, dtype=np.float64) + predictor_offset_array
     else:
         alpha, beta, beta_variance, linear_predictor, collapsed_objective = _binary_posterior_state(
             genotype_matrix=genotype_matrix,
@@ -1303,6 +1341,7 @@ def _fit_collapsed_posterior(
             compute_logdet=compute_logdet,
             compute_beta_variance=compute_beta_variance,
             sample_space_preconditioner_rank=config.sample_space_preconditioner_rank,
+            predictor_offset=predictor_offset_array,
         )
         sigma_error2_new = 1.0
     return PosteriorState(
@@ -4284,12 +4323,18 @@ def _validation_metric(
     targets: np.ndarray,
     alpha: np.ndarray,
     beta: np.ndarray,
+    predictor_offset: np.ndarray | None = None,
 ) -> float:
+    offset = (
+        np.zeros(len(targets), dtype=np.float64)
+        if predictor_offset is None
+        else np.asarray(predictor_offset, dtype=np.float64).reshape(-1)
+    )
     if isinstance(genotype_matrix, StandardizedGenotypeMatrix):
         genotype_component = np.asarray(genotype_matrix.matvec(beta), dtype=np.float64)
     else:
         genotype_component = np.asarray(genotype_matrix @ beta, dtype=np.float64)
-    linear_predictor = genotype_component + covariate_matrix @ alpha
+    linear_predictor = offset + genotype_component + covariate_matrix @ alpha
     if trait_type == TraitType.BINARY:
         positive_probability = np.asarray(stable_sigmoid(linear_predictor), dtype=np.float64)
         return float(

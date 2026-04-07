@@ -29,6 +29,7 @@ from sv_pgs.genotype import (
 )
 from sv_pgs.inference import VariationalFitCheckpoint, VariationalFitResult, fit_variational_em
 from sv_pgs.numeric import stable_sigmoid
+from sv_pgs.null_model import NullModelFit, fit_stage1_null_model
 from sv_pgs.preprocessing import (
     Preprocessor,
     build_tie_map,
@@ -37,6 +38,7 @@ from sv_pgs.preprocessing import (
     select_active_variant_indices,
 )
 from sv_pgs.progress import log, mem
+from sv_pgs.runtime_policy import runtime_training_policy_for_fit, runtime_training_policy_summary
 
 @dataclass(slots=True)
 class FittedState:
@@ -749,46 +751,11 @@ def _runtime_tuned_config_for_fit(
     config: ModelConfig,
     genotype_matrix: RawGenotypeMatrix,
 ) -> tuple[ModelConfig, str | None]:
-    cupy = _try_import_cupy()
-    if cupy is None:
-        return config, None
-    sample_count = int(genotype_matrix.shape[0])
-    if sample_count < 1:
-        return config, None
-    gpu_budget_bytes = _gpu_materialization_budget_bytes(cupy)
-    cacheable_dense_variants = max(int(gpu_budget_bytes // max(sample_count * 4, 1)), 1)
-    tuned_exact_solver_limit = min(
-        int(config.exact_solver_matrix_limit),
-        max(int(cacheable_dense_variants * 0.9), 1),
-        GPU_EXACT_SOLVER_LIMIT,
+    policy = runtime_training_policy_for_fit(
+        config=config,
+        genotype_matrix=genotype_matrix,
     )
-    max_gpu_preconditioner_rank = max(1, min(cacheable_dense_variants, GPU_PRECONDITIONER_RANK_LIMIT))
-    target_preconditioner_rank = int(config.sample_space_preconditioner_rank)
-    if sample_count >= 32_768 and genotype_matrix.shape[1] >= 65_536:
-        target_preconditioner_rank = max(target_preconditioner_rank, GPU_PRECONDITIONER_RANK_LIMIT)
-    tuned_preconditioner_rank = min(target_preconditioner_rank, max_gpu_preconditioner_rank)
-    if (
-        tuned_exact_solver_limit == int(config.exact_solver_matrix_limit)
-        and tuned_preconditioner_rank == int(config.sample_space_preconditioner_rank)
-    ):
-        return config, (
-            "GPU runtime profile active: "
-            + f"gpu_budget={gpu_budget_bytes / 1e9:.1f} GB "
-            + f"cacheable_dense_variants~{cacheable_dense_variants} "
-            + "(user config already fits GPU profile)"
-        )
-    tuned_config = replace(
-        config,
-        exact_solver_matrix_limit=tuned_exact_solver_limit,
-        sample_space_preconditioner_rank=tuned_preconditioner_rank,
-    )
-    return tuned_config, (
-        "GPU runtime profile active: "
-        + f"gpu_budget={gpu_budget_bytes / 1e9:.1f} GB "
-        + f"cacheable_dense_variants~{cacheable_dense_variants} "
-        + f"exact_solver_matrix_limit={config.exact_solver_matrix_limit}->{tuned_exact_solver_limit} "
-        + f"sample_space_preconditioner_rank={config.sample_space_preconditioner_rank}->{tuned_preconditioner_rank}"
-    )
+    return policy.tuned_config, runtime_training_policy_summary(policy, config)
 
 
 def _nonzero_coefficient_cache(coefficients: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
