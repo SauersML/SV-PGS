@@ -291,6 +291,11 @@ def fit_stage1_null_model(
         )
     log(f"  subsetting {selected_variant_indices.shape[0]} stage1 variants from {standardized_genotypes.shape[1]}...")
     stage1_genotypes = standardized_genotypes.subset(selected_variant_indices)
+    # Materialize stage1 subset into RAM — streaming mmap'd matvecs across 22 files
+    # is catastrophically slow for CG (each iteration reads ~4GB from scattered positions).
+    # 46K variants × 97K samples × 1 byte ≈ 4.3 GB fits in RAM.
+    log(f"  materializing stage1 genotype matrix into RAM ({stage1_genotypes.shape})...")
+    stage1_genotypes._dense_cache = stage1_genotypes.materialize()
     log(f"  stage1 genotypes ready: {stage1_genotypes.shape}  mem={mem()}")
     if small_problem:
         stage1_dense_matrix = np.asarray(stage1_genotypes.materialize(), dtype=np.float32)
