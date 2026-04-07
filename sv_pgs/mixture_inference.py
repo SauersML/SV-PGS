@@ -2486,7 +2486,7 @@ def _sample_space_nystrom_factor_gpu(
         cp=cupy,
         dtype=compute_cp_dtype,
     )
-    gram_factor = _positive_semidefinite_factor(np.asarray(basis_gpu.T @ projected_kernel_gpu, dtype=np.float64))
+    gram_factor = _positive_semidefinite_factor((basis_gpu.T @ projected_kernel_gpu).get().astype(np.float64))
     if gram_factor is None:
         return None
     return basis_gpu @ cupy.asarray(gram_factor, dtype=compute_cp_dtype)
@@ -2984,8 +2984,8 @@ def _solve_sample_space_rhs_gpu_inner(
     else:
         solution_gpu = cp.asarray(preconditioner(rhs_gpu), dtype=compute_cp_dtype)
     residual_gpu = rhs_gpu - apply_operator(solution_gpu)
-    residual_norm_sq = np.asarray(cp.sum(residual_gpu * residual_gpu, axis=0, dtype=cp.float64), dtype=np.float64)
-    rhs_norm_sq = np.asarray(cp.sum(rhs_gpu * rhs_gpu, axis=0, dtype=cp.float64), dtype=np.float64)
+    residual_norm_sq = cp.sum(residual_gpu * residual_gpu, axis=0, dtype=cp.float64).get().astype(np.float64)
+    rhs_norm_sq = cp.sum(rhs_gpu * rhs_gpu, axis=0, dtype=cp.float64).get().astype(np.float64)
     convergence_threshold_sq = np.maximum(tol_sq, tol_sq * np.maximum(residual_norm_sq, rhs_norm_sq))
     converged = residual_norm_sq <= convergence_threshold_sq
     if np.all(converged):
@@ -2994,7 +2994,7 @@ def _solve_sample_space_rhs_gpu_inner(
 
     preconditioned_residual_gpu = preconditioner(residual_gpu)
     search_direction_gpu = preconditioned_residual_gpu
-    residual_dot = np.asarray(cp.sum(residual_gpu * preconditioned_residual_gpu, axis=0, dtype=cp.float64), dtype=np.float64)
+    residual_dot = cp.sum(residual_gpu * preconditioned_residual_gpu, axis=0, dtype=cp.float64).get().astype(np.float64)
     iterations_used = 0
     for iteration_index in range(max_iterations):
         iterations_used = iteration_index + 1
@@ -3003,7 +3003,7 @@ def _solve_sample_space_rhs_gpu_inner(
             break
         masked_search_gpu = search_direction_gpu[:, active_columns]
         operator_search_gpu = apply_operator(masked_search_gpu)
-        step_denom = np.asarray(cp.sum(masked_search_gpu * operator_search_gpu, axis=0, dtype=cp.float64), dtype=np.float64)
+        step_denom = cp.sum(masked_search_gpu * operator_search_gpu, axis=0, dtype=cp.float64).get().astype(np.float64)
         if np.any(~np.isfinite(step_denom) | (step_denom <= 0.0)):
             raise RuntimeError("GPU conjugate-gradient operator is not positive definite.")
         step_scale = residual_dot[active_columns] / step_denom
@@ -3204,7 +3204,7 @@ def _solve_sample_space_rhs_gpu(
         if initial_solution_gpu64.shape != right_hand_side_gpu64.shape:
             raise ValueError("GPU sample-space initial_guess must match right_hand_side shape.")
 
-    rhs_norm_sq = np.asarray(cp.sum(right_hand_side_gpu64 * right_hand_side_gpu64, axis=0, dtype=cp.float64), dtype=np.float64)
+    rhs_norm_sq = cp.sum(right_hand_side_gpu64 * right_hand_side_gpu64, axis=0, dtype=cp.float64).get().astype(np.float64)
     convergence_threshold_sq = np.maximum(float(tolerance) * float(tolerance), float(tolerance) * float(tolerance) * rhs_norm_sq)
     mixed_precision_enabled = compute_cp_dtype == cp.float32
     mixed_precision_failure: RuntimeError | None = None
@@ -3220,7 +3220,7 @@ def _solve_sample_space_rhs_gpu(
             cp=cp,
             dtype=cp.float64,
         )
-        residual_norm_sq = np.asarray(cp.sum(residual_gpu64 * residual_gpu64, axis=0, dtype=cp.float64), dtype=np.float64)
+        residual_norm_sq = cp.sum(residual_gpu64 * residual_gpu64, axis=0, dtype=cp.float64).get().astype(np.float64)
         return residual_gpu64, residual_norm_sq
 
     if not mixed_precision_enabled:
