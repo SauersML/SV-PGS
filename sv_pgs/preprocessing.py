@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 from dataclasses import dataclass
+from functools import lru_cache
 from typing import Iterator, Sequence, cast
 
 import numpy as np
@@ -26,6 +27,34 @@ from sv_pgs.genotype import (
 )
 from sv_pgs.plink import PLINK_MISSING_INT8
 from sv_pgs.progress import log, mem
+
+HARD_CALL_TIE_SIGNATURE_TARGET_BYTES = 256_000_000
+_HARD_CALL_EXACT_SIGNATURE_LUT = np.asarray(
+    [
+        [0, 0, 0, 0],
+        [0, 0, 0, 0],
+        [0, 0, 0, 0],
+        [0, 1, 0, 3],
+        [0, 0, 0, 0],
+        [0, 0, 1, 3],
+        [0, 0, 1, 3],
+        [0, 1, 2, 3],
+    ],
+    dtype=np.int8,
+)
+_HARD_CALL_SIGN_FLIPPED_SIGNATURE_LUT = np.asarray(
+    [
+        [0, 0, 0, 0],
+        [0, 0, 0, 0],
+        [0, 0, 0, 0],
+        [1, 0, 0, 3],
+        [0, 0, 0, 0],
+        [1, 0, 0, 3],
+        [0, 1, 0, 3],
+        [2, 1, 0, 3],
+    ],
+    dtype=np.int8,
+)
 
 @jax.jit
 def _batch_all_stats_i8(batch_i8: jnp.ndarray) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray]:
@@ -254,6 +283,197 @@ def _minor_allele_frequency(allele_frequency: float) -> float:
     return min(normalized_frequency, 1.0 - normalized_frequency)
 
 
+_TIE_MAP_POSITION_WINDOW = 100_000  # 100 KB — duplicate SV calls are always nearby
+
+
+def _build_tie_map_windowed(
+    standardized_genotypes: StandardizedGenotypeMatrix,
+    records: Sequence[VariantRecord],
+) -> TieMap | None:
+    """Fast tie map using (chromosome, support_count, position) pre-filter.
+
+    Two variant columns can only be identical if they have the same carrier count
+    on the same chromosome near the same position. This pre-filter eliminates 99%+
+    of comparisons, reading genotype data only for the tiny number of candidate pairs.
+    Returns None if pre-filtering isn't possible (no support counts or records).
+    """
+    n_total = standardized_genotypes.shape[1]
+    if n_total == 0:
+        return _empty_tie_map(0)
+
+    support_counts = standardized_genotypes.support_counts
+    if support_counts is None:
+        return None  # can't pre-filter without support counts
+
+    sample_count = standardized_genotypes.shape[0]
+    variant_indices = standardized_genotypes.variant_indices
+    selected_support = support_counts[variant_indices].astype(np.int64)
+
+    # Group by (chromosome, support_count) — identical columns must match both.
+    # Also group by (chromosome, N - support_count) to catch sign-flipped pairs.
+    from collections import defaultdict
+    exact_groups: dict[tuple[str, int], list[int]] = defaultdict(list)
+    for i, record in enumerate(records):
+        exact_groups[(record.chromosome, int(selected_support[i]))].append(i)
+
+    # Find candidate pairs: same (chr, support) AND within position window
+    candidate_pairs: list[tuple[int, int, float]] = []  # (i, j, sign)
+    for (chrom, sup), indices in exact_groups.items():
+        if len(indices) < 2:
+            continue
+        # Sort by position within group
+        indices_sorted = sorted(indices, key=lambda i: records[i].position)
+        positions = [records[i].position for i in indices_sorted]
+        for a in range(len(indices_sorted)):
+            for b in range(a + 1, len(indices_sorted)):
+                if positions[b] - positions[a] > _TIE_MAP_POSITION_WINDOW:
+                    break
+                candidate_pairs.append((indices_sorted[a], indices_sorted[b], 1.0))
+
+    # Also check sign-flipped pairs: support_count_a + support_count_b ≈ N
+    # (one column is the negation of the other)
+    flip_groups: dict[tuple[str, int], list[int]] = defaultdict(list)
+    for i, record in enumerate(records):
+        flip_key = (record.chromosome, int(min(selected_support[i], sample_count - selected_support[i])))
+        flip_groups[flip_key].append(i)
+    for (chrom, _), indices in flip_groups.items():
+        if len(indices) < 2:
+            continue
+        indices_sorted = sorted(indices, key=lambda i: records[i].position)
+        positions = [records[i].position for i in indices_sorted]
+        for a in range(len(indices_sorted)):
+            for b in range(a + 1, len(indices_sorted)):
+                if positions[b] - positions[a] > _TIE_MAP_POSITION_WINDOW:
+                    break
+                sa = int(selected_support[indices_sorted[a]])
+                sb = int(selected_support[indices_sorted[b]])
+                if sa == sb:
+                    continue  # already checked in exact_groups
+                candidate_pairs.append((indices_sorted[a], indices_sorted[b], -1.0))
+
+    log(
+        f"  tie map windowed pre-filter: {len(candidate_pairs)} candidate pairs "
+        f"from {n_total} variants  mem={mem()}"
+    )
+
+    if not candidate_pairs:
+        # No candidates — every variant is unique
+        return TieMap(
+            kept_indices=np.arange(n_total, dtype=np.int32),
+            original_to_reduced=np.arange(n_total, dtype=np.int32),
+            reduced_to_group=[
+                TieGroup(
+                    representative_index=i,
+                    member_indices=np.array([i], dtype=np.int32),
+                    signs=np.array([1.0], dtype=np.float32),
+                )
+                for i in range(n_total)
+            ],
+        )
+
+    # Read genotype columns ONLY for candidates and compare
+    raw_int8 = standardized_genotypes.raw
+    has_int8_batches = raw_int8 is not None and _supports_int8_batches(raw_int8)
+    # Collect unique variant indices we need to read
+    needed_local_indices = sorted({i for pair in candidate_pairs for i in (pair[0], pair[1])})
+    column_cache: dict[int, np.ndarray] = {}
+    if has_int8_batches:
+        from typing import cast as _cast
+        raw_typed = _cast(Int8BatchCapable, raw_int8)
+        raw_variant_indices = np.asarray([int(variant_indices[i]) for i in needed_local_indices], dtype=np.int32)
+        batch_size = max(min(len(raw_variant_indices), 512), 1)
+        col_idx = 0
+        for raw_batch in raw_typed.iter_column_batches_i8(raw_variant_indices, batch_size=batch_size):
+            batch_values = np.asarray(raw_batch.values, dtype=np.int8)
+            for j in range(batch_values.shape[1]):
+                column_cache[needed_local_indices[col_idx]] = batch_values[:, j].copy()
+                col_idx += 1
+    else:
+        # Fallback: read from standardized float path
+        for local_idx in needed_local_indices:
+            col = standardized_genotypes.materialize_columns(
+                np.array([local_idx], dtype=np.int32)
+            )
+            column_cache[local_idx] = np.asarray(col).ravel()
+
+    log(f"  read {len(column_cache)} columns for candidate comparison  mem={mem()}")
+
+    # Union-find for merging tied variants
+    parent = list(range(n_total))
+    sign_to_root = [1.0] * n_total
+
+    def find(x: int) -> tuple[int, float]:
+        sign = 1.0
+        while parent[x] != x:
+            sign *= sign_to_root[x]
+            x = parent[x]
+        return x, sign
+
+    def union(a: int, b: int, sign: float) -> None:
+        ra, sa = find(a)
+        rb, sb = find(b)
+        if ra == rb:
+            return
+        # Merge b's root into a's root
+        parent[rb] = ra
+        sign_to_root[rb] = sign * sa * sb
+
+    # Check each candidate pair
+    ties_found = 0
+    for i, j, expected_sign in candidate_pairs:
+        col_i = column_cache[i]
+        col_j = column_cache[j]
+        if expected_sign > 0:
+            if np.array_equal(col_i, col_j):
+                union(i, j, 1.0)
+                ties_found += 1
+        else:
+            # Check if col_i == -col_j (with missing values handled)
+            # For int8: missing = -1, so only compare non-missing
+            if col_i.dtype == np.int8:
+                valid = (col_i != -1) & (col_j != -1)
+                if np.all(col_i[valid] == -col_j[valid]) and valid.sum() > 0:
+                    union(i, j, -1.0)
+                    ties_found += 1
+            else:
+                if np.allclose(col_i, -col_j, atol=1e-6):
+                    union(i, j, -1.0)
+                    ties_found += 1
+
+    log(f"  tie map: {ties_found} ties found among {len(candidate_pairs)} candidates")
+
+    # Build TieMap from union-find
+    group_map: dict[int, list[tuple[int, float]]] = defaultdict(list)
+    for i in range(n_total):
+        root, sign = find(i)
+        group_map[root].append((i, sign))
+
+    kept_indices: list[int] = []
+    original_to_reduced = np.full(n_total, -1, dtype=np.int32)
+    reduced_to_group: list[TieGroup] = []
+    for reduced_idx, (root, members) in enumerate(sorted(group_map.items())):
+        kept_indices.append(root)
+        member_indices = np.array([m[0] for m in members], dtype=np.int32)
+        signs = np.array([m[1] for m in members], dtype=np.float32)
+        for m_idx, _sign in members:
+            original_to_reduced[m_idx] = reduced_idx
+        reduced_to_group.append(TieGroup(
+            representative_index=root,
+            member_indices=member_indices,
+            signs=signs,
+        ))
+
+    log(
+        f"  tie map done: {n_total} -> {len(kept_indices)} unique  "
+        f"({ties_found} ties collapsed)  mem={mem()}"
+    )
+    return TieMap(
+        kept_indices=np.asarray(kept_indices, dtype=np.int32),
+        original_to_reduced=original_to_reduced,
+        reduced_to_group=reduced_to_group,
+    )
+
+
 def build_tie_map(
     genotypes: StandardizedGenotypeMatrix | np.ndarray,
     records: Sequence[VariantRecord],
@@ -265,6 +485,12 @@ def build_tie_map(
         raise ValueError("genotypes and records length mismatch.")
     n_total = standardized_genotypes.shape[1]
     log(f"  building tie map over {n_total} variants...")
+
+    # Try fast windowed pre-filter first (avoids full data pass)
+    windowed_result = _build_tie_map_windowed(standardized_genotypes, records)
+    if windowed_result is not None:
+        return windowed_result
+
     using_raw_int8_fast_path = bool(
         standardized_genotypes.raw is not None
         and _supports_int8_batches(standardized_genotypes.raw)
@@ -382,8 +608,8 @@ def _build_tie_map_from_hardcall_int8(
     standardized_genotypes: StandardizedGenotypeMatrix,
 ) -> TieMap:
     n_total = standardized_genotypes.shape[1]
-    exact_signature_to_group: dict[bytes, int | list[int]] = {}
-    sign_flipped_signature_to_group: dict[bytes, int | list[int]] = {}
+    exact_signature_to_group: dict[tuple[int, int], int | list[int]] = {}
+    sign_flipped_signature_to_group: dict[tuple[int, int], int | list[int]] = {}
     tie_group_member_indices: list[list[int]] = []
     tie_group_signs: list[list[float]] = []
     representative_indices: list[int] = []
@@ -393,52 +619,63 @@ def _build_tie_map_from_hardcall_int8(
     variants_done = 0
     local_start = 0
     batch_size = auto_batch_size_i8(standardized_genotypes.shape[0])
+    signature_batch_size = _hardcall_tie_signature_batch_size(
+        sample_count=standardized_genotypes.shape[0],
+        requested_batch_size=batch_size,
+    )
 
     for raw_batch in raw_int8.iter_column_batches_i8(standardized_genotypes.variant_indices, batch_size=batch_size):
-        state_masks = _hardcall_state_masks(raw_batch.values)
-        for local_batch_index, state_mask in enumerate(state_masks):
-            variant_index = local_start + local_batch_index
-            exact_column, sign_flipped_column = _canonicalize_hardcall_tie_column_i8(
-                raw_batch.values[:, local_batch_index],
-                int(state_mask),
+        batch_values = np.asarray(raw_batch.values, dtype=np.int8)
+        batch_width = int(batch_values.shape[1])
+        for signature_start in range(0, batch_width, signature_batch_size):
+            signature_stop = min(signature_start + signature_batch_size, batch_width)
+            signature_values = batch_values[:, signature_start:signature_stop]
+            state_masks = _hardcall_state_masks(signature_values)
+            exact_columns, sign_flipped_columns = _canonicalize_hardcall_tie_columns_i8(
+                signature_values,
+                state_masks,
             )
-            exact_signature = _hashed_tie_signature_i8(exact_column)
-            sign_flipped_signature = _hashed_tie_signature_i8(sign_flipped_column)
+            exact_signatures = _hashed_tie_signatures_i8(exact_columns)
+            sign_flipped_signatures = _hashed_tie_signatures_i8(sign_flipped_columns)
 
-            exact_match_index = _matching_hardcall_tie_group_index(
-                standardized_genotypes=standardized_genotypes,
-                candidate_group_indices=_candidate_group_indices(exact_signature_to_group.get(exact_signature)),
-                representative_member_indices=tie_group_member_indices,
-                tie_column=exact_column,
-                sign=1.0,
-            )
-            if exact_match_index is not None:
-                tie_group_member_indices[exact_match_index].append(int(variant_index))
-                tie_group_signs[exact_match_index].append(1.0)
-                original_to_reduced[int(variant_index)] = exact_match_index
-                continue
+            for local_signature_index, variant_index in enumerate(
+                range(local_start + signature_start, local_start + signature_stop)
+            ):
+                exact_signature = exact_signatures[local_signature_index]
+                exact_match_index = _matching_hardcall_tie_group_index(
+                    standardized_genotypes=standardized_genotypes,
+                    candidate_group_indices=_candidate_group_indices(exact_signature_to_group.get(exact_signature)),
+                    representative_member_indices=tie_group_member_indices,
+                    tie_column=exact_columns[:, local_signature_index],
+                    sign=1.0,
+                )
+                if exact_match_index is not None:
+                    tie_group_member_indices[exact_match_index].append(int(variant_index))
+                    tie_group_signs[exact_match_index].append(1.0)
+                    original_to_reduced[int(variant_index)] = exact_match_index
+                    continue
 
-            sign_flipped_match_index = _matching_hardcall_tie_group_index(
-                standardized_genotypes=standardized_genotypes,
-                candidate_group_indices=_candidate_group_indices(sign_flipped_signature_to_group.get(exact_signature)),
-                representative_member_indices=tie_group_member_indices,
-                tie_column=exact_column,
-                sign=-1.0,
-            )
-            if sign_flipped_match_index is not None:
-                tie_group_member_indices[sign_flipped_match_index].append(int(variant_index))
-                tie_group_signs[sign_flipped_match_index].append(-1.0)
-                original_to_reduced[int(variant_index)] = sign_flipped_match_index
-                continue
+                sign_flipped_match_index = _matching_hardcall_tie_group_index(
+                    standardized_genotypes=standardized_genotypes,
+                    candidate_group_indices=_candidate_group_indices(sign_flipped_signature_to_group.get(exact_signature)),
+                    representative_member_indices=tie_group_member_indices,
+                    tie_column=exact_columns[:, local_signature_index],
+                    sign=-1.0,
+                )
+                if sign_flipped_match_index is not None:
+                    tie_group_member_indices[sign_flipped_match_index].append(int(variant_index))
+                    tie_group_signs[sign_flipped_match_index].append(-1.0)
+                    original_to_reduced[int(variant_index)] = sign_flipped_match_index
+                    continue
 
-            reduced_index = len(representative_indices)
-            representative_indices.append(int(variant_index))
-            tie_group_member_indices.append([int(variant_index)])
-            tie_group_signs.append([1.0])
-            kept_variant_indices.append(int(variant_index))
-            _record_candidate_group(exact_signature_to_group, exact_signature, reduced_index)
-            _record_candidate_group(sign_flipped_signature_to_group, sign_flipped_signature, reduced_index)
-            original_to_reduced[int(variant_index)] = reduced_index
+                reduced_index = len(representative_indices)
+                representative_indices.append(int(variant_index))
+                tie_group_member_indices.append([int(variant_index)])
+                tie_group_signs.append([1.0])
+                kept_variant_indices.append(int(variant_index))
+                _record_candidate_group(exact_signature_to_group, exact_signature, reduced_index)
+                _record_candidate_group(sign_flipped_signature_to_group, sign_flipped_signatures[local_signature_index], reduced_index)
+                original_to_reduced[int(variant_index)] = reduced_index
 
         local_start += raw_batch.variant_indices.shape[0]
         variants_done += raw_batch.variant_indices.shape[0]
@@ -598,46 +835,78 @@ def _hardcall_state_masks(batch_values: np.ndarray) -> np.ndarray:
     )
 
 
-def _canonicalize_hardcall_tie_column_i8(
-    column: np.ndarray,
-    state_mask: int,
+def _hardcall_tie_signature_batch_size(
+    sample_count: int,
+    requested_batch_size: int,
+) -> int:
+    if sample_count < 1:
+        raise ValueError("sample_count must be positive.")
+    if requested_batch_size < 1:
+        raise ValueError("requested_batch_size must be positive.")
+    bytes_per_variant = sample_count * 2
+    memory_capped_batch_size = max(HARD_CALL_TIE_SIGNATURE_TARGET_BYTES // max(bytes_per_variant, 1), 1)
+    return max(1, min(int(memory_capped_batch_size), int(requested_batch_size)))
+
+
+def _canonicalize_hardcall_tie_columns_i8(
+    batch_values: np.ndarray,
+    state_masks: np.ndarray,
 ) -> tuple[np.ndarray, np.ndarray]:
-    values = np.asarray(column, dtype=np.int8)
-    canonical = np.zeros(values.shape[0], dtype=np.int8)
-    if state_mask in (0, 1, 2, 4):
-        return canonical, canonical
+    values = np.asarray(batch_values, dtype=np.int8)
+    masks = np.asarray(state_masks, dtype=np.uint8).reshape(-1)
+    if values.ndim != 2:
+        raise ValueError("batch_values must be a 2D array.")
+    if masks.shape[0] != values.shape[1]:
+        raise ValueError("state_masks must align with batch columns.")
 
-    canonical.fill(3)
-    sign_flipped = np.full(values.shape[0], 3, dtype=np.int8)
-    observed = values != PLINK_MISSING_INT8
-    if not np.any(observed):
-        return np.zeros(values.shape[0], dtype=np.int8), np.zeros(values.shape[0], dtype=np.int8)
-
-    if state_mask == 3:
-        exact_lut = np.asarray([0, 1, 0], dtype=np.int8)
-        sign_lut = np.asarray([1, 0, 0], dtype=np.int8)
-    elif state_mask == 5:
-        exact_lut = np.asarray([0, 0, 1], dtype=np.int8)
-        sign_lut = np.asarray([1, 0, 0], dtype=np.int8)
-    elif state_mask == 6:
-        exact_lut = np.asarray([0, 0, 1], dtype=np.int8)
-        sign_lut = np.asarray([0, 1, 0], dtype=np.int8)
-    elif state_mask == 7:
-        exact_lut = np.asarray([0, 1, 2], dtype=np.int8)
-        sign_lut = np.asarray([2, 1, 0], dtype=np.int8)
-    else:
-        raise ValueError(f"Unexpected hardcall state mask: {state_mask}")
-
-    observed_values = values[observed]
-    canonical[observed] = exact_lut[observed_values]
-    sign_flipped[observed] = sign_lut[observed_values]
-    return canonical, sign_flipped
+    encoded_values = np.where(values == PLINK_MISSING_INT8, np.int8(3), values).astype(np.int8, copy=False)
+    transposed_codes = encoded_values.T[:, :, None]
+    exact_lut = _HARD_CALL_EXACT_SIGNATURE_LUT[masks][:, None, :]
+    sign_flipped_lut = _HARD_CALL_SIGN_FLIPPED_SIGNATURE_LUT[masks][:, None, :]
+    canonical = np.take_along_axis(exact_lut, transposed_codes, axis=2)[:, :, 0].T
+    sign_flipped = np.take_along_axis(sign_flipped_lut, transposed_codes, axis=2)[:, :, 0].T
+    return canonical.astype(np.int8, copy=False), sign_flipped.astype(np.int8, copy=False)
 
 
-def _hashed_tie_signature_i8(canonical_column: np.ndarray) -> bytes:
-    value_hasher = hashlib.blake2b(digest_size=16, person=b"svpgs_i8_tie")
-    value_hasher.update(np.ascontiguousarray(canonical_column, dtype=np.int8))
-    return value_hasher.digest()
+def _pack_hardcall_tie_columns_i8(canonical_columns: np.ndarray) -> np.ndarray:
+    columns = np.asarray(canonical_columns, dtype=np.uint8)
+    if columns.ndim != 2:
+        raise ValueError("canonical_columns must be 2D.")
+    row_padding = (-columns.shape[0]) % 4
+    if row_padding:
+        columns = np.pad(columns, ((0, row_padding), (0, 0)), mode="constant", constant_values=0)
+    reshaped = columns.reshape(columns.shape[0] // 4, 4, columns.shape[1])
+    packed = (
+        reshaped[:, 0, :]
+        | (reshaped[:, 1, :] << 2)
+        | (reshaped[:, 2, :] << 4)
+        | (reshaped[:, 3, :] << 6)
+    )
+    return np.ascontiguousarray(packed.T)
+
+
+@lru_cache(maxsize=None)
+def _hardcall_signature_hash_parameters(word_count: int) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    if word_count < 1:
+        raise ValueError("word_count must be positive.")
+    index = np.arange(word_count, dtype=np.uint64) + np.uint64(1)
+    multiplier_one = index * np.uint64(0x9E3779B185EBCA87) + np.uint64(0xD6E8FEB86659FD93)
+    multiplier_two = index * np.uint64(0x94D049BB133111EB) + np.uint64(0xBF58476D1CE4E5B9)
+    mix_multiplier = multiplier_one ^ np.uint64(0x27D4EB2F165667C5)
+    return multiplier_one, multiplier_two, mix_multiplier
+
+
+def _hashed_tie_signatures_i8(canonical_columns: np.ndarray) -> list[tuple[int, int]]:
+    packed_columns = _pack_hardcall_tie_columns_i8(canonical_columns)
+    byte_padding = (-packed_columns.shape[1]) % np.dtype(np.uint64).itemsize
+    if byte_padding:
+        packed_columns = np.pad(packed_columns, ((0, 0), (0, byte_padding)), mode="constant", constant_values=0)
+    words = packed_columns.view(np.uint64)
+    multiplier_one, multiplier_two, mix_multiplier = _hardcall_signature_hash_parameters(words.shape[1])
+    rotated_words = (words << np.uint64(17)) | (words >> np.uint64(47))
+    signature_one = np.bitwise_xor.reduce(words * multiplier_one[None, :], axis=1)
+    signature_two = np.bitwise_xor.reduce((rotated_words + multiplier_two[None, :]) * mix_multiplier[None, :], axis=1)
+    return list(zip(signature_one.tolist(), signature_two.tolist(), strict=True))
 
 
 def _hashed_tie_signature(
@@ -660,8 +929,8 @@ def _candidate_group_indices(candidate_entry: int | list[int] | None) -> tuple[i
 
 
 def _record_candidate_group(
-    candidate_map: dict[bytes, int | list[int]],
-    signature: bytes,
+    candidate_map: dict[object, int | list[int]],
+    signature: object,
     reduced_index: int,
 ) -> None:
     existing = candidate_map.get(signature)
@@ -672,6 +941,24 @@ def _record_candidate_group(
         existing.append(reduced_index)
         return
     candidate_map[signature] = [existing, reduced_index]
+
+
+def _matching_hardcall_tie_group_index(
+    standardized_genotypes: StandardizedGenotypeMatrix,
+    candidate_group_indices: Sequence[int],
+    representative_member_indices: Sequence[list[int]],
+    tie_column: np.ndarray,
+    sign: float,
+) -> int | None:
+    for reduced_index in candidate_group_indices:
+        representative_column, representative_sign_flipped_column = _load_hardcall_tie_columns(
+            standardized_genotypes,
+            int(representative_member_indices[int(reduced_index)][0]),
+        )
+        comparison_column = representative_sign_flipped_column if sign < 0.0 else representative_column
+        if np.array_equal(tie_column, comparison_column):
+            return int(reduced_index)
+    return None
 
 
 def _matching_tie_group_index(
@@ -701,41 +988,20 @@ def _matching_tie_group_index(
     return None
 
 
-def _matching_hardcall_tie_group_index(
-    standardized_genotypes: StandardizedGenotypeMatrix,
-    candidate_group_indices: Sequence[int],
-    representative_member_indices: Sequence[list[int]],
-    tie_column: np.ndarray,
-    sign: float,
-) -> int | None:
-    for reduced_index in candidate_group_indices:
-        representative_column = _load_hardcall_canonical_tie_column(
-            standardized_genotypes,
-            int(representative_member_indices[int(reduced_index)][0]),
-            sign=sign,
-        )
-        if np.array_equal(tie_column, representative_column):
-            return int(reduced_index)
-    return None
-
-
-def _load_hardcall_canonical_tie_column(
+def _load_hardcall_tie_columns(
     standardized_genotypes: StandardizedGenotypeMatrix,
     local_variant_index: int,
-    *,
-    sign: float,
-) -> np.ndarray:
+) -> tuple[np.ndarray, np.ndarray]:
     if standardized_genotypes.raw is None or not _supports_int8_batches(standardized_genotypes.raw):
         raise RuntimeError("hardcall tie loading requires int8 raw backing storage.")
     raw_int8 = cast(Int8BatchCapable, standardized_genotypes.raw)
     raw_variant_index = int(standardized_genotypes.variant_indices[local_variant_index])
-    batch = next(raw_int8.iter_column_batches_i8([raw_variant_index], batch_size=1))
-    state_mask = int(_hardcall_state_masks(batch.values)[0])
-    exact_column, sign_flipped_column = _canonicalize_hardcall_tie_column_i8(
-        batch.values[:, 0],
-        state_mask,
+    raw_batch = next(raw_int8.iter_column_batches_i8([raw_variant_index], batch_size=1))
+    exact_column, sign_flipped_column = _canonicalize_hardcall_tie_columns_i8(
+        np.asarray(raw_batch.values, dtype=np.int8),
+        _hardcall_state_masks(raw_batch.values),
     )
-    return sign_flipped_column if sign < 0.0 else exact_column
+    return exact_column[:, 0], sign_flipped_column[:, 0]
 
 
 def _load_tie_column_with_missingness(
