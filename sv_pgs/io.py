@@ -578,52 +578,39 @@ def load_multi_vcf_dataset_from_files(
         and np.array_equal(keep_sample_indices, expected_source_order)
     )
     # Verify sample IDs match for first chromosome only
+    log(f"  verifying sample IDs for {source_paths[0].name}...")
     first_sample_ids = _read_vcf_sample_ids(source_paths[0])
     if first_sample_ids != source_sample_ids:
         raise RuntimeError(f"VCF sample IDs do not match: {source_paths[0]}")
+    log(f"  sample IDs verified. skip_subset={skip_subset}. loading {n_chromosomes} chromosomes...")
 
     import time as _time_mod
-    from concurrent.futures import ThreadPoolExecutor, as_completed
     _t_start = _time_mod.monotonic()
-
-    def _load_one_chromosome(source_path: Path) -> tuple[np.ndarray, list[_VariantDefaults], VariantStatistics]:
-        geno, variants, stats = _load_vcf_with_cache(source_path, config=config, mmap_mode="r")
-        if not skip_subset:
-            geno = geno[keep_sample_indices, :]
-        return geno, variants, stats
-
-    # Load all chromosomes in parallel threads (IO-bound: pickle, mmap, npz reads)
-    log(f"  loading {n_chromosomes} chromosomes in parallel...")
-    results: dict[int, tuple[np.ndarray, list[_VariantDefaults], VariantStatistics]] = {}
-    completed = 0
-    with ThreadPoolExecutor(max_workers=min(n_chromosomes, 8)) as executor:
-        futures = {
-            executor.submit(_load_one_chromosome, source_path): chr_idx
-            for chr_idx, source_path in enumerate(source_paths)
-        }
-        for future in as_completed(futures):
-            chr_idx = futures[future]
-            results[chr_idx] = future.result()
-            completed += 1
-            geno = results[chr_idx][0]
-            _elapsed = _time_mod.monotonic() - _t_start
-            log(
-                f"  [{completed}/{n_chromosomes}] {source_paths[chr_idx].name}: "
-                f"{geno.shape[1]:,} variants  "
-                f"{_elapsed:.0f}s elapsed  mem={mem()}"
-            )
-
-    # Assemble in chromosome order
     raw_matrices: list[RawGenotypeMatrix] = []
     default_variants: list[_VariantDefaults] = []
     variant_stats_parts: list[VariantStatistics] = []
-    for chr_idx in range(n_chromosomes):
-        geno, variants, stats = results[chr_idx]
-        raw_matrices.append(as_raw_genotype_matrix(geno))
-        default_variants.extend(variants)
-        variant_stats_parts.append(stats)
+    total_variants = 0
+    for chr_idx, source_path in enumerate(source_paths):
+        _t_chr = _time_mod.monotonic()
+        genotype_matrix, chromosome_variants, chromosome_stats = _load_vcf_with_cache(
+            source_path, config=config, mmap_mode="r",
+        )
+        if not skip_subset:
+            log(f"    subsetting {genotype_matrix.shape[0]} → {len(keep_sample_indices)} samples...")
+            genotype_matrix = genotype_matrix[keep_sample_indices, :]
+        raw_matrices.append(as_raw_genotype_matrix(genotype_matrix))
+        default_variants.extend(chromosome_variants)
+        variant_stats_parts.append(chromosome_stats)
+        total_variants += len(chromosome_variants)
+        _elapsed = _time_mod.monotonic() - _t_start
+        _chr_time = _time_mod.monotonic() - _t_chr
+        log(
+            f"  [{chr_idx+1}/{n_chromosomes}] {source_path.name}: "
+            f"{len(chromosome_variants):,} variants in {_chr_time:.1f}s  "
+            f"total={total_variants:,}  {_elapsed:.0f}s elapsed  mem={mem()}"
+        )
     _elapsed = _time_mod.monotonic() - _t_start
-    log(f"  all {n_chromosomes} chromosomes loaded: {len(default_variants):,} total variants in {_elapsed:.0f}s")
+    log(f"  all {n_chromosomes} chromosomes loaded: {total_variants:,} total variants in {_elapsed:.0f}s")
 
     raw_genotypes: RawGenotypeMatrix = ConcatenatedRawGenotypeMatrix(tuple(raw_matrices))
     variant_stats = VariantStatistics(
@@ -1240,13 +1227,14 @@ def _load_vcf_from_cache(
         import time as _time_mod
         _t0 = _time_mod.monotonic()
         genotype_matrix = np.load(paths.geno_path, mmap_mode=effective_mmap_mode)
+        log(f"  mmap ready: {genotype_matrix.shape} {genotype_matrix.dtype} ({_time_mod.monotonic()-_t0:.1f}s)")
         _t1 = _time_mod.monotonic()
         with open(paths.var_path, "rb") as variant_handle:
             variants = pickle.load(variant_handle)
+        log(f"  variants loaded: {len(variants)} ({_time_mod.monotonic()-_t1:.1f}s)")
         _t2 = _time_mod.monotonic()
         variant_stats = _load_vcf_cache_stats(stats_path)
-        _t3 = _time_mod.monotonic()
-        log(f"  load times: mmap={_t1-_t0:.1f}s  variants={_t2-_t1:.1f}s  stats={_t3-_t2:.1f}s")
+        log(f"  stats loaded ({_time_mod.monotonic()-_t2:.1f}s)")
         if expected_sample_count is not None and genotype_matrix.shape[0] != expected_sample_count:
             raise ValueError(f"cached sample count mismatch: {genotype_matrix.shape[0]} != {expected_sample_count}")
         if expected_variant_count is not None and genotype_matrix.shape[1] != expected_variant_count:
