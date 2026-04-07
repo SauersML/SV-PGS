@@ -114,6 +114,7 @@ class _SampleSpacePreconditionerCacheEntry:
     random_seed: int
     prior_variances: np.ndarray
     diagonal_noise: np.ndarray
+    diagonal_preconditioner: np.ndarray
     preconditioner: Any
     previous_iterations: int | None = None
     last_iterations: int | None = None
@@ -2557,13 +2558,16 @@ def _sample_space_preconditioner(
     batch_size: int,
     rank: int,
     random_seed: int = 0,
+    diagonal_preconditioner: np.ndarray | None = None,
 ) -> Callable[[jnp.ndarray], jnp.ndarray] | np.ndarray | jnp.ndarray:
-    diagonal_preconditioner = _sample_space_diagonal_preconditioner(
-        genotype_matrix=genotype_matrix,
-        prior_variances=prior_variances,
-        diagonal_noise=diagonal_noise,
-        batch_size=batch_size,
-    )
+    if diagonal_preconditioner is None:
+        diagonal_preconditioner = _sample_space_diagonal_preconditioner(
+            genotype_matrix=genotype_matrix,
+            prior_variances=prior_variances,
+            diagonal_noise=diagonal_noise,
+            batch_size=batch_size,
+        )
+    diagonal_preconditioner = np.asarray(diagonal_preconditioner, dtype=np.float64)
     if rank <= 0:
         return diagonal_preconditioner
     selected_rank = min(int(rank), int(genotype_matrix.shape[0]))
@@ -2663,17 +2667,20 @@ def _sample_space_gpu_preconditioner(
     batch_size: int,
     rank: int,
     random_seed: int = 0,
+    diagonal_preconditioner: np.ndarray | None = None,
 ):
     import cupy as cp
     from cupyx.scipy.linalg import solve_triangular as cp_solve_triangular
 
     compute_cp_dtype = _cupy_compute_dtype(cp)
-    diagonal_preconditioner = _sample_space_diagonal_preconditioner(
-        genotype_matrix=genotype_matrix,
-        prior_variances=prior_variances,
-        diagonal_noise=diagonal_noise,
-        batch_size=batch_size,
-    )
+    if diagonal_preconditioner is None:
+        diagonal_preconditioner = _sample_space_diagonal_preconditioner(
+            genotype_matrix=genotype_matrix,
+            prior_variances=prior_variances,
+            diagonal_noise=diagonal_noise,
+            batch_size=batch_size,
+        )
+    diagonal_preconditioner = np.asarray(diagonal_preconditioner, dtype=np.float64)
     diagonal_preconditioner_gpu = cp.asarray(diagonal_preconditioner, dtype=compute_cp_dtype)
 
     def apply_diagonal(right_hand_side_gpu):
@@ -2754,6 +2761,12 @@ def _get_cached_sample_space_cpu_preconditioner(
         diagonal_noise=diagonal_noise,
     ):
         return cache_entry.preconditioner, cache_entry
+    diagonal_preconditioner = _sample_space_diagonal_preconditioner(
+        genotype_matrix=genotype_matrix,
+        prior_variances=prior_variances,
+        diagonal_noise=diagonal_noise,
+        batch_size=batch_size,
+    )
     preconditioner = _sample_space_preconditioner(
         genotype_matrix=genotype_matrix,
         prior_variances=prior_variances,
@@ -2761,6 +2774,7 @@ def _get_cached_sample_space_cpu_preconditioner(
         batch_size=batch_size,
         rank=rank,
         random_seed=random_seed,
+        diagonal_preconditioner=diagonal_preconditioner,
     )
     cache_entry = _SampleSpacePreconditionerCacheEntry(
         batch_size=int(batch_size),
@@ -2768,6 +2782,7 @@ def _get_cached_sample_space_cpu_preconditioner(
         random_seed=int(random_seed),
         prior_variances=np.asarray(prior_variances, dtype=np.float64).copy(),
         diagonal_noise=np.asarray(diagonal_noise, dtype=np.float64).copy(),
+        diagonal_preconditioner=np.asarray(diagonal_preconditioner, dtype=np.float64).copy(),
         preconditioner=preconditioner,
     )
     genotype_matrix._sample_space_cpu_preconditioner_cache = cache_entry
@@ -2793,6 +2808,12 @@ def _get_cached_sample_space_gpu_preconditioner(
         diagonal_noise=diagonal_noise,
     ):
         return cache_entry.preconditioner, cache_entry
+    diagonal_preconditioner = _sample_space_diagonal_preconditioner(
+        genotype_matrix=genotype_matrix,
+        prior_variances=prior_variances,
+        diagonal_noise=diagonal_noise,
+        batch_size=batch_size,
+    )
     preconditioner = _sample_space_gpu_preconditioner(
         genotype_matrix=genotype_matrix,
         prior_variances=prior_variances,
@@ -2800,6 +2821,7 @@ def _get_cached_sample_space_gpu_preconditioner(
         batch_size=batch_size,
         rank=rank,
         random_seed=random_seed,
+        diagonal_preconditioner=diagonal_preconditioner,
     )
     cache_entry = _SampleSpacePreconditionerCacheEntry(
         batch_size=int(batch_size),
@@ -2807,6 +2829,7 @@ def _get_cached_sample_space_gpu_preconditioner(
         random_seed=int(random_seed),
         prior_variances=np.asarray(prior_variances, dtype=np.float64).copy(),
         diagonal_noise=np.asarray(diagonal_noise, dtype=np.float64).copy(),
+        diagonal_preconditioner=np.asarray(diagonal_preconditioner, dtype=np.float64).copy(),
         preconditioner=preconditioner,
     )
     genotype_matrix._sample_space_gpu_preconditioner_cache = cache_entry
