@@ -501,6 +501,7 @@ class BayesianPGS:
             prepared_arrays.scales,
             support_counts=prepared_arrays.support_counts,
         )
+        log(f"standardized view ready  mem={mem()}")
         if self.config.enable_stage1_null_model:
             stage1_null_fit = fit_stage1_null_model(
                 standardized_genotypes=standardized_genotypes,

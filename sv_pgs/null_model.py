@@ -289,7 +289,9 @@ def fit_stage1_null_model(
             variant_count=len(variant_records),
             selected_variant_indices=selected_variant_indices,
         )
+    log(f"  subsetting {selected_variant_indices.shape[0]} stage1 variants from {standardized_genotypes.shape[1]}...")
     stage1_genotypes = standardized_genotypes.subset(selected_variant_indices)
+    log(f"  stage1 genotypes ready: {stage1_genotypes.shape}  mem={mem()}")
     if small_problem:
         stage1_dense_matrix = np.asarray(stage1_genotypes.materialize(), dtype=np.float32)
         if not _stage1_small_problem_accepts_genotype_offset(
@@ -306,6 +308,7 @@ def fit_stage1_null_model(
                 variant_count=len(variant_records),
                 selected_variant_indices=np.zeros(0, dtype=np.int32),
             )
+    log(f"  fitting stage1 collapsed posterior ({selected_variant_indices.shape[0]} variants, {target_array.shape[0]} samples)...")
     stage1_state = _fit_collapsed_posterior(
         genotype_matrix=stage1_genotypes,
         covariate_matrix=covariate_matrix,
