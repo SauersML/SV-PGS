@@ -1094,15 +1094,17 @@ class StandardizedGenotypeMatrix:
             raise RuntimeError("cannot release raw storage before materializing genotype data.")
         self.raw = None
         self._local_cache_directory = None
+        self._cupy_subset_cache = None
+        self._cupy_subset_cache_local_indices = None
+        if self._dense_backend is not None:
+            self._dense_backend.raw = None
+            self._dense_backend._local_cache_directory = None
 
     def clear_sample_space_nystrom_cache(self) -> None:
         self._sample_space_nystrom_basis_cpu_cache.clear()
         self._sample_space_nystrom_basis_gpu_cache.clear()
         self._cupy_subset_cache = None
         self._cupy_subset_cache_local_indices = None
-        if self._dense_backend is not None:
-            self._dense_backend.raw = None
-            self._dense_backend._local_cache_directory = None
 
     def try_materialize_gpu(self) -> bool:
         """Materialize the standardized matrix onto GPU memory when possible."""
