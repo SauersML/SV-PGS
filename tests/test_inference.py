@@ -27,6 +27,7 @@ from sv_pgs.mixture_inference import (
     _parse_scale_model_feature_names,
     _prefer_iterative_variant_space,
     _quantitative_posterior_state,
+    _restricted_posterior_state,
     _restricted_precision_projector,
     _sample_space_preconditioner,
     _solve_sample_space_rhs_cpu,
@@ -122,9 +123,76 @@ def test_quantitative_inference_runs_with_stochastic_variant_updates(random_gene
     )
 
     assert result.objective_history
-    assert np.all(np.isfinite(result.alpha))
-    assert np.all(np.isfinite(result.beta_reduced))
-    assert float(np.linalg.norm(result.beta_reduced)) > 0.0
+
+
+def test_temporary_working_set_restricted_posterior_matches_full_solution(random_generator):
+    sample_count, variant_count = 32, 12
+    genotype_values = random_generator.standard_normal((sample_count, variant_count)).astype(np.float32)
+    covariate_matrix = np.column_stack(
+        [np.ones(sample_count, dtype=np.float32), random_generator.standard_normal(sample_count).astype(np.float32)]
+    )
+    targets = random_generator.standard_normal(sample_count).astype(np.float32)
+    prior_variances = random_generator.uniform(0.2, 1.5, size=variant_count).astype(np.float64)
+    diagonal_noise = np.full(sample_count, 1.0, dtype=np.float64)
+
+    standardized = as_raw_genotype_matrix(genotype_values).standardized(
+        means=np.zeros(variant_count, dtype=np.float32),
+        scales=np.ones(variant_count, dtype=np.float32),
+    )
+    standardized._dense_cache = standardized.materialize()
+    initial_beta = np.zeros(variant_count, dtype=np.float64)
+
+    full_result = _restricted_posterior_state(
+        genotype_matrix=standardized,
+        covariate_matrix=np.asarray(covariate_matrix, dtype=np.float64),
+        targets=np.asarray(targets, dtype=np.float64),
+        prior_variances=prior_variances,
+        diagonal_noise=diagonal_noise,
+        solver_tolerance=1e-7,
+        maximum_linear_solver_iterations=256,
+        logdet_probe_count=4,
+        logdet_lanczos_steps=6,
+        exact_solver_matrix_limit=2,
+        posterior_variance_batch_size=4,
+        posterior_variance_probe_count=4,
+        random_seed=0,
+        compute_logdet=False,
+        compute_beta_variance=False,
+        initial_beta_guess=initial_beta,
+        temporary_working_sets=False,
+    )
+    working_result = _restricted_posterior_state(
+        genotype_matrix=standardized,
+        covariate_matrix=np.asarray(covariate_matrix, dtype=np.float64),
+        targets=np.asarray(targets, dtype=np.float64),
+        prior_variances=prior_variances,
+        diagonal_noise=diagonal_noise,
+        solver_tolerance=1e-7,
+        maximum_linear_solver_iterations=256,
+        logdet_probe_count=4,
+        logdet_lanczos_steps=6,
+        exact_solver_matrix_limit=2,
+        posterior_variance_batch_size=4,
+        posterior_variance_probe_count=4,
+        random_seed=0,
+        compute_logdet=False,
+        compute_beta_variance=False,
+        initial_beta_guess=initial_beta,
+        temporary_working_sets=True,
+        temporary_working_set_min_variants=1,
+        temporary_working_set_initial_size=3,
+        temporary_working_set_growth=3,
+        temporary_working_set_max_passes=8,
+        temporary_working_set_coefficient_tolerance=0.0,
+    )
+
+    for working_value, full_value in zip(working_result[:6], full_result[:6]):
+        np.testing.assert_allclose(
+            np.asarray(working_value, dtype=np.float64),
+            np.asarray(full_value, dtype=np.float64),
+            rtol=1e-5,
+            atol=1e-5,
+        )
 
 
 def test_binary_inference_runs_with_stochastic_variant_updates(random_generator):

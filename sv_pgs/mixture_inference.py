@@ -3008,7 +3008,8 @@ def _solve_sample_space_rhs_gpu(
     max_iterations: int,
     preconditioner,
     batch_size: int,
-) -> np.ndarray:
+    return_iterations: bool = False,
+) -> np.ndarray | tuple[np.ndarray, int]:
     import cupy as cp
 
     cupy = _try_import_cupy()
@@ -3036,6 +3037,7 @@ def _solve_sample_space_rhs_gpu(
     convergence_threshold_sq = np.maximum(float(tolerance) * float(tolerance), float(tolerance) * float(tolerance) * rhs_norm_sq)
     mixed_precision_enabled = compute_cp_dtype == cp.float32
     mixed_precision_failure: RuntimeError | None = None
+    total_iterations_used = 0
 
     def true_residual(solution_gpu):
         residual_gpu64 = right_hand_side_gpu64 - _apply_sample_space_operator_gpu(
@@ -3051,7 +3053,7 @@ def _solve_sample_space_rhs_gpu(
         return residual_gpu64, residual_norm_sq
 
     if not mixed_precision_enabled:
-        solution_gpu64 = _solve_sample_space_rhs_gpu_inner(
+        solution_gpu64_result = _solve_sample_space_rhs_gpu_inner(
             genotype_matrix=genotype_matrix,
             prior_variances=prior_variances,
             diagonal_noise=diagonal_noise,
@@ -3064,6 +3066,11 @@ def _solve_sample_space_rhs_gpu(
             compute_cp_dtype=cp.float64,
             initial_guess_gpu=initial_solution_gpu64,
         )
+        solution_gpu64, iterations_used = _resolve_sample_space_solve_result(
+            solution_gpu64_result,
+            fallback_iterations=max_iterations,
+        )
+        total_iterations_used += iterations_used
         if solution_gpu64.ndim == 1:
             solution_gpu64 = solution_gpu64[:, None]
         _, residual_norm_sq = true_residual(solution_gpu64)
@@ -3076,7 +3083,10 @@ def _solve_sample_space_rhs_gpu(
                 + f"iterations={max_iterations}"
             )
         solution = np.asarray(solution_gpu64.get() if hasattr(solution_gpu64, "get") else solution_gpu64, dtype=np.float64)
-        return solution[:, 0] if vector_input else solution
+        resolved_solution = solution[:, 0] if vector_input else solution
+        if return_iterations:
+            return resolved_solution, total_iterations_used
+        return resolved_solution
 
     solution_gpu64 = (
         cp.asarray(initial_solution_gpu64, dtype=cp.float64)
@@ -3089,9 +3099,12 @@ def _solve_sample_space_rhs_gpu(
         residual_gpu64, residual_norm_sq = true_residual(solution_gpu64)
         if np.all(residual_norm_sq <= convergence_threshold_sq):
             solution = np.asarray(solution_gpu64.get() if hasattr(solution_gpu64, "get") else solution_gpu64, dtype=np.float64)
-            return solution[:, 0] if vector_input else solution
+            resolved_solution = solution[:, 0] if vector_input else solution
+            if return_iterations:
+                return resolved_solution, total_iterations_used
+            return resolved_solution
         try:
-            correction_gpu64 = _solve_sample_space_rhs_gpu_inner(
+            correction_gpu64_result = _solve_sample_space_rhs_gpu_inner(
                 genotype_matrix=genotype_matrix,
                 prior_variances=prior_variances,
                 diagonal_noise=diagonal_noise,
@@ -3104,6 +3117,11 @@ def _solve_sample_space_rhs_gpu(
                 compute_cp_dtype=compute_cp_dtype,
                 initial_guess_gpu=None,
             )
+            correction_gpu64, iterations_used = _resolve_sample_space_solve_result(
+                correction_gpu64_result,
+                fallback_iterations=max_iterations,
+            )
+            total_iterations_used += iterations_used
         except RuntimeError as exc:
             mixed_precision_failure = exc
             break
@@ -3118,7 +3136,7 @@ def _solve_sample_space_rhs_gpu(
             else "mixed-precision iterative refinement did not hit the float64 residual target"
         )
         log(f"      sample-space solve: retrying GPU CG in float64 ({fallback_reason})")
-        correction_gpu64 = _solve_sample_space_rhs_gpu_inner(
+        correction_gpu64_result = _solve_sample_space_rhs_gpu_inner(
             genotype_matrix=genotype_matrix,
             prior_variances=prior_variances,
             diagonal_noise=diagonal_noise,
@@ -3131,6 +3149,11 @@ def _solve_sample_space_rhs_gpu(
             compute_cp_dtype=cp.float64,
             initial_guess_gpu=None,
         )
+        correction_gpu64, iterations_used = _resolve_sample_space_solve_result(
+            correction_gpu64_result,
+            fallback_iterations=max_iterations,
+        )
+        total_iterations_used += iterations_used
         if correction_gpu64.ndim == 1:
             correction_gpu64 = correction_gpu64[:, None]
         solution_gpu64 += correction_gpu64
@@ -3150,7 +3173,10 @@ def _solve_sample_space_rhs_gpu(
             + failure_suffix
         )
     solution = np.asarray(solution_gpu64.get() if hasattr(solution_gpu64, "get") else solution_gpu64, dtype=np.float64)
-    return solution[:, 0] if vector_input else solution
+    resolved_solution = solution[:, 0] if vector_input else solution
+    if return_iterations:
+        return resolved_solution, total_iterations_used
+    return resolved_solution
 
 
 def _solve_sample_space_rhs_cpu(
@@ -3163,7 +3189,8 @@ def _solve_sample_space_rhs_cpu(
     max_iterations: int,
     preconditioner: Callable[[np.ndarray], np.ndarray | jnp.ndarray] | Callable[[jnp.ndarray], np.ndarray | jnp.ndarray] | np.ndarray | jnp.ndarray,
     batch_size: int,
-) -> np.ndarray:
+    return_iterations: bool = False,
+) -> np.ndarray | tuple[np.ndarray, int]:
     import time
 
     rhs = np.asarray(right_hand_side, dtype=np.float64)
@@ -3212,7 +3239,10 @@ def _solve_sample_space_rhs_cpu(
     convergence_threshold_sq = np.maximum(tol_sq, tol_sq * np.maximum(residual_norm_sq, rhs_norm_sq))
     converged = residual_norm_sq <= convergence_threshold_sq
     if np.all(converged):
-        return solution[:, 0] if vector_input else solution
+        resolved_solution = solution[:, 0] if vector_input else solution
+        if return_iterations:
+            return resolved_solution, 0
+        return resolved_solution
 
     preconditioned_residual = (
         residual
@@ -3307,7 +3337,11 @@ def _solve_sample_space_rhs_cpu(
             + f"residual={final_residual:.2e} threshold={final_threshold:.2e} "
             + f"iterations={max_iterations}"
         )
-    return solution[:, 0] if vector_input else solution
+    resolved_solution = solution[:, 0] if vector_input else solution
+    iterations_used = iteration_index + 1 if "iteration_index" in locals() else 0
+    if return_iterations:
+        return resolved_solution, iterations_used
+    return resolved_solution
 
 
 def _restricted_precision_projector(
@@ -4113,7 +4147,7 @@ def _restricted_posterior_state(
             "    restricted posterior: GPU block-CG sample-space solve "
             + f"(p={variant_count}, n={sample_count}, source={gpu_source})"
         )
-        sample_space_preconditioner_gpu = _sample_space_gpu_preconditioner(
+        sample_space_preconditioner_gpu, sample_space_preconditioner_cache_entry = _get_cached_sample_space_gpu_preconditioner(
             genotype_matrix=genotype_matrix,
             prior_variances=prior_variances,
             diagonal_noise=diagonal_noise,
@@ -4122,24 +4156,34 @@ def _restricted_posterior_state(
             random_seed=random_seed,
         )
 
-        def solve_rhs_iterative(right_hand_side: np.ndarray) -> np.ndarray:
-            return _solve_sample_space_rhs_gpu(
+        def solve_rhs_iterative(right_hand_side: np.ndarray, *, initial_guess: np.ndarray | None = None) -> np.ndarray:
+            solve_result = _solve_sample_space_rhs_gpu(
                 genotype_matrix=genotype_matrix,
                 prior_variances=prior_variances,
                 diagonal_noise=diagonal_noise,
                 right_hand_side=right_hand_side,
-                initial_guess=None,
+                initial_guess=initial_guess,
                 tolerance=solver_tolerance,
                 max_iterations=maximum_linear_solver_iterations,
                 preconditioner=sample_space_preconditioner_gpu,
                 batch_size=posterior_variance_batch_size,
+                return_iterations=True,
             )
+            solved_rhs, iterations_used = _resolve_sample_space_solve_result(
+                solve_result,
+                fallback_iterations=maximum_linear_solver_iterations,
+            )
+            _update_sample_space_preconditioner_iterations(
+                sample_space_preconditioner_cache_entry,
+                iterations_used,
+            )
+            return np.asarray(solved_rhs, dtype=np.float64)
     else:
         log(
             "    restricted posterior: CPU block-PCG sample-space solve "
             + f"(p={variant_count}, n={sample_count}, preconditioner_rank={effective_sample_space_preconditioner_rank})"
         )
-        sample_space_preconditioner = _sample_space_preconditioner(
+        sample_space_preconditioner, sample_space_preconditioner_cache_entry = _get_cached_sample_space_cpu_preconditioner(
             genotype_matrix=genotype_matrix,
             prior_variances=prior_variances,
             diagonal_noise=diagonal_noise,
@@ -4148,18 +4192,28 @@ def _restricted_posterior_state(
             random_seed=random_seed,
         )
 
-        def solve_rhs_iterative(right_hand_side: np.ndarray) -> np.ndarray:
-            return _solve_sample_space_rhs_cpu(
+        def solve_rhs_iterative(right_hand_side: np.ndarray, *, initial_guess: np.ndarray | None = None) -> np.ndarray:
+            solve_result = _solve_sample_space_rhs_cpu(
                 genotype_matrix=genotype_matrix,
                 prior_variances=prior_variances,
                 diagonal_noise=diagonal_noise,
                 right_hand_side=right_hand_side,
-                initial_guess=None,
+                initial_guess=initial_guess,
                 tolerance=solver_tolerance,
                 max_iterations=maximum_linear_solver_iterations,
                 preconditioner=sample_space_preconditioner,
                 batch_size=posterior_variance_batch_size,
+                return_iterations=True,
             )
+            solved_rhs, iterations_used = _resolve_sample_space_solve_result(
+                solve_result,
+                fallback_iterations=maximum_linear_solver_iterations,
+            )
+            _update_sample_space_preconditioner_iterations(
+                sample_space_preconditioner_cache_entry,
+                iterations_used,
+            )
+            return np.asarray(solved_rhs, dtype=np.float64)
 
     sample_probes = (
         _orthogonal_probe_matrix(
@@ -4179,30 +4233,10 @@ def _restricted_posterior_state(
         cached_guess = np.asarray(warm_start.sample_space_inverse_covariance_rhs, dtype=np.float64)
         if cached_guess.shape == solve_rhs_matrix.shape:
             initial_sample_space_guess = cached_guess
-    if sample_space_gpu_enabled:
-        inverse_covariance_rhs = _solve_sample_space_rhs_gpu(
-            genotype_matrix=genotype_matrix,
-            prior_variances=prior_variances,
-            diagonal_noise=diagonal_noise,
-            right_hand_side=solve_rhs_matrix,
-            initial_guess=initial_sample_space_guess,
-            tolerance=solver_tolerance,
-            max_iterations=maximum_linear_solver_iterations,
-            preconditioner=sample_space_preconditioner_gpu,
-            batch_size=posterior_variance_batch_size,
-        )
-    else:
-        inverse_covariance_rhs = _solve_sample_space_rhs_cpu(
-            genotype_matrix=genotype_matrix,
-            prior_variances=prior_variances,
-            diagonal_noise=diagonal_noise,
-            right_hand_side=solve_rhs_matrix,
-            initial_guess=initial_sample_space_guess,
-            tolerance=solver_tolerance,
-            max_iterations=maximum_linear_solver_iterations,
-            preconditioner=sample_space_preconditioner,
-            batch_size=posterior_variance_batch_size,
-        )
+    inverse_covariance_rhs = solve_rhs_iterative(
+        solve_rhs_matrix,
+        initial_guess=initial_sample_space_guess,
+    )
     if warm_start is not None:
         warm_start.sample_space_inverse_covariance_rhs = np.asarray(inverse_covariance_rhs, dtype=np.float64)
     inverse_covariance_targets = np.asarray(inverse_covariance_rhs[:, 0], dtype=np.float64)
@@ -4246,6 +4280,13 @@ def _restricted_posterior_state(
         dtype=compute_np_dtype,
     )
     if compute_beta_variance:
+        probe_projection_matrix = _cached_sample_probe_projection(
+            genotype_matrix=genotype_matrix,
+            sample_probes=sample_probes,
+            batch_size=posterior_variance_batch_size,
+            probe_count=posterior_variance_probe_count,
+            random_seed=random_seed,
+        )
         log(f"    computing stochastic leverage diagonal for beta variance ({variant_count} variants, {posterior_variance_probe_count} probes)...")
         leverage_diagonal = _stochastic_restricted_cross_leverage_diagonal(
             genotype_matrix=genotype_matrix,
@@ -4258,6 +4299,7 @@ def _restricted_posterior_state(
             random_seed=random_seed,
             sample_probes=sample_probes,
             inverse_covariance_probe_matrix=inverse_covariance_probe_matrix,
+            probe_projection_matrix=probe_projection_matrix,
         )
         beta_variance = np.maximum(prior_variances - (prior_variances * prior_variances) * leverage_diagonal, 1e-8)
     else:
@@ -4328,6 +4370,7 @@ def _stochastic_restricted_cross_leverage_diagonal(
     random_seed: int,
     sample_probes: np.ndarray | None = None,
     inverse_covariance_probe_matrix: np.ndarray | None = None,
+    probe_projection_matrix: np.ndarray | None = None,
 ) -> np.ndarray:
     if sample_probes is None:
         sample_probes = _orthogonal_probe_matrix(
@@ -4349,10 +4392,18 @@ def _stochastic_restricted_cross_leverage_diagonal(
         gls_cholesky,
         covariate_matrix.T @ inverse_covariance_probe_matrix,
     )
-    probe_projection_matrix = np.asarray(
-        genotype_matrix.transpose_matmat(sample_probes, batch_size=batch_size),
-        dtype=np.float64,
-    )
+    if probe_projection_matrix is None:
+        probe_projection_matrix = _cached_sample_probe_projection(
+            genotype_matrix=genotype_matrix,
+            sample_probes=sample_probes,
+            batch_size=batch_size,
+            probe_count=probe_count,
+            random_seed=random_seed,
+        )
+    else:
+        probe_projection_matrix = np.asarray(probe_projection_matrix, dtype=np.float64)
+        if probe_projection_matrix.shape != (genotype_matrix.shape[1], probe_count):
+            raise ValueError("probe_projection_matrix shape does not match variant_count/probe_count.")
     restricted_probe_projection_matrix = np.asarray(
         genotype_matrix.transpose_matmat(restricted_probe_matrix, batch_size=batch_size),
         dtype=np.float64,
