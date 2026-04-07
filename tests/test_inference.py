@@ -258,6 +258,35 @@ def test_temporary_working_set_warm_start_tracks_ever_active_support(random_gene
     assert set(active_support.tolist()).issubset(set(warm_start.temporary_working_set_ever_active.tolist()))
 
 
+def test_temporary_working_set_warm_start_resets_for_new_matrix_with_same_width(random_generator):
+    sample_count, variant_count = 20, 8
+    first_genotype_values = random_generator.standard_normal((sample_count, variant_count)).astype(np.float32)
+    second_genotype_values = random_generator.standard_normal((sample_count, variant_count)).astype(np.float32)
+    first_standardized = as_raw_genotype_matrix(first_genotype_values).standardized(
+        means=np.zeros(variant_count, dtype=np.float32),
+        scales=np.ones(variant_count, dtype=np.float32),
+    )
+    second_standardized = as_raw_genotype_matrix(second_genotype_values).standardized(
+        means=np.zeros(variant_count, dtype=np.float32),
+        scales=np.ones(variant_count, dtype=np.float32),
+    )
+    warm_start = mixture_inference._RestrictedPosteriorWarmStart(
+        temporary_working_set_variant_count=variant_count,
+        temporary_working_set_matrix_token=id(first_standardized),
+        temporary_working_set_ever_active=np.array([1, 3, 5], dtype=np.int32),
+    )
+
+    mixture_inference._reset_temporary_working_set_warm_start(
+        warm_start=warm_start,
+        genotype_matrix=second_standardized,
+        variant_count=variant_count,
+    )
+
+    assert warm_start.temporary_working_set_variant_count == variant_count
+    assert warm_start.temporary_working_set_matrix_token == id(second_standardized)
+    assert warm_start.temporary_working_set_ever_active is None
+
+
 def test_binary_inference_runs_with_stochastic_variant_updates(random_generator):
     sample_count, variant_count = 72, 10
     genotype_matrix = random_generator.standard_normal((sample_count, variant_count)).astype(np.float32)

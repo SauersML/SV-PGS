@@ -201,6 +201,7 @@ class PosteriorState:
 class _RestrictedPosteriorWarmStart:
     sample_space_inverse_covariance_rhs: np.ndarray | None = None
     temporary_working_set_variant_count: int | None = None
+    temporary_working_set_matrix_token: int | None = None
     temporary_working_set_ever_active: np.ndarray | None = None
 
 
@@ -1386,6 +1387,13 @@ def _fit_collapsed_posterior(
 ) -> PosteriorState:
     log(f"    collapsed posterior: trait={trait_type.value}  n_variants={genotype_matrix.shape[1]}  n_samples={genotype_matrix.shape[0]}  sigma_e2={sigma_error2:.6f}  mem={mem()}")
     prior_variances = np.maximum(np.asarray(reduced_prior_variances, dtype=np.float64), 1e-8)
+    posterior_solver_tolerance, posterior_maximum_linear_solver_iterations = _collapsed_posterior_solver_controls(
+        genotype_matrix=genotype_matrix,
+        solver_tolerance=config.linear_solver_tolerance,
+        maximum_linear_solver_iterations=config.maximum_linear_solver_iterations,
+        compute_logdet=compute_logdet,
+        compute_beta_variance=compute_beta_variance,
+    )
     predictor_offset_array = (
         np.zeros(genotype_matrix.shape[0], dtype=np.float64)
         if predictor_offset is None
@@ -1401,8 +1409,8 @@ def _fit_collapsed_posterior(
             prior_variances=prior_variances,
             sigma_error2=max(float(sigma_error2), config.sigma_error_floor),
             sigma_error_floor=config.sigma_error_floor,
-            solver_tolerance=config.linear_solver_tolerance,
-            maximum_linear_solver_iterations=config.maximum_linear_solver_iterations,
+            solver_tolerance=posterior_solver_tolerance,
+            maximum_linear_solver_iterations=posterior_maximum_linear_solver_iterations,
             logdet_probe_count=config.logdet_probe_count,
             logdet_lanczos_steps=config.logdet_lanczos_steps,
             exact_solver_matrix_limit=config.exact_solver_matrix_limit,
@@ -1438,8 +1446,8 @@ def _fit_collapsed_posterior(
             damping_decrease_factor=config.trust_region_damping_decrease_factor,
             success_threshold=config.trust_region_success_threshold,
             minimum_damping=config.trust_region_minimum_damping,
-            solver_tolerance=config.linear_solver_tolerance,
-            maximum_linear_solver_iterations=config.maximum_linear_solver_iterations,
+            solver_tolerance=posterior_solver_tolerance,
+            maximum_linear_solver_iterations=posterior_maximum_linear_solver_iterations,
             logdet_probe_count=config.logdet_probe_count,
             logdet_lanczos_steps=config.logdet_lanczos_steps,
             exact_solver_matrix_limit=config.exact_solver_matrix_limit,
@@ -1576,6 +1584,29 @@ def _binary_newton_solver_controls(
         relaxed_tolerance = max(relaxed_tolerance, 5e-3)
         relaxed_maximum_iterations = min(relaxed_maximum_iterations, 96)
     return relaxed_tolerance, max(relaxed_maximum_iterations, 16)
+
+
+def _collapsed_posterior_solver_controls(
+    genotype_matrix: StandardizedGenotypeMatrix,
+    *,
+    solver_tolerance: float,
+    maximum_linear_solver_iterations: int,
+    compute_logdet: bool,
+    compute_beta_variance: bool,
+) -> tuple[float, int]:
+    if compute_logdet and compute_beta_variance:
+        return float(solver_tolerance), int(maximum_linear_solver_iterations)
+    if genotype_matrix.shape[0] < 16_384 and genotype_matrix.shape[1] < 16_384:
+        return float(solver_tolerance), int(maximum_linear_solver_iterations)
+    relaxed_tolerance = max(float(solver_tolerance), 1e-4)
+    relaxed_maximum_iterations = min(int(maximum_linear_solver_iterations), 256)
+    if genotype_matrix.shape[1] > genotype_matrix.shape[0]:
+        relaxed_tolerance = max(relaxed_tolerance, 5e-4)
+        relaxed_maximum_iterations = min(relaxed_maximum_iterations, 192)
+    if not compute_beta_variance:
+        relaxed_tolerance = max(relaxed_tolerance, 1e-3)
+        relaxed_maximum_iterations = min(relaxed_maximum_iterations, 128)
+    return relaxed_tolerance, max(relaxed_maximum_iterations, 32)
 
 
 def _binary_expected_polya_gamma_weights(
@@ -3741,12 +3772,18 @@ def _basil_working_set_indices(
 
 def _reset_temporary_working_set_warm_start(
     warm_start: _RestrictedPosteriorWarmStart | None,
+    genotype_matrix: StandardizedGenotypeMatrix,
     variant_count: int,
 ) -> None:
     if warm_start is None:
         return
-    if warm_start.temporary_working_set_variant_count != int(variant_count):
+    matrix_token = id(genotype_matrix)
+    if (
+        warm_start.temporary_working_set_variant_count != int(variant_count)
+        or warm_start.temporary_working_set_matrix_token != matrix_token
+    ):
         warm_start.temporary_working_set_variant_count = int(variant_count)
+        warm_start.temporary_working_set_matrix_token = matrix_token
         warm_start.temporary_working_set_ever_active = None
 
 
@@ -3774,7 +3811,7 @@ def _restricted_posterior_state_temporary_working_set(
     warm_start: _RestrictedPosteriorWarmStart | None,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, float, float, float]:
     variant_count = genotype_matrix.shape[1]
-    _reset_temporary_working_set_warm_start(warm_start, variant_count)
+    _reset_temporary_working_set_warm_start(warm_start, genotype_matrix, variant_count)
     current_beta = (
         np.zeros(variant_count, dtype=np.float64)
         if initial_beta_guess is None
