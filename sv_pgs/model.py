@@ -509,10 +509,13 @@ class BayesianPGS:
         log(f"preprocessor ready  {total_variant_count} variants  mem={mem()}")
 
         log("creating standardized genotype view...")
-        standardized_genotypes = raw_genotype_matrix.standardized(
-            prepared_arrays.means,
-            prepared_arrays.scales,
+        standardized_genotypes = StandardizedGenotypeMatrix(
+            raw=raw_genotype_matrix,
+            means=prepared_arrays.means,
+            scales=prepared_arrays.scales,
+            variant_indices=np.arange(raw_genotype_matrix.shape[1], dtype=np.int32),
             support_counts=prepared_arrays.support_counts,
+            _enable_hybrid_backend=False,  # skip sparse backend build on 1.68M mmap'd variants
         )
         log(f"  standardized view created  mem={mem()}")
         log("  computing fit-stage cache key...")
