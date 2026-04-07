@@ -152,6 +152,12 @@ class ModelConfig:
     stochastic_step_offset: float = 8.0
     stochastic_step_exponent: float = 0.6
     final_posterior_refinement: bool = True
+    temporary_working_sets: bool = True
+    temporary_working_set_min_variants: int = 65_536
+    temporary_working_set_initial_size: int = 16_384
+    temporary_working_set_growth: int = 16_384
+    temporary_working_set_max_passes: int = 6
+    temporary_working_set_coefficient_tolerance: float = 1e-4
 
     update_hyperparameters: bool = True
     random_seed: int = 0
@@ -235,6 +241,16 @@ class ModelConfig:
             raise ValueError("stochastic_step_offset must be non-negative.")
         if not 0.0 < self.stochastic_step_exponent <= 1.0:
             raise ValueError("stochastic_step_exponent must lie in (0.0, 1.0].")
+        if self.temporary_working_set_min_variants < 0:
+            raise ValueError("temporary_working_set_min_variants must be non-negative.")
+        if self.temporary_working_set_initial_size < 1:
+            raise ValueError("temporary_working_set_initial_size must be positive.")
+        if self.temporary_working_set_growth < 1:
+            raise ValueError("temporary_working_set_growth must be positive.")
+        if self.temporary_working_set_max_passes < 1:
+            raise ValueError("temporary_working_set_max_passes must be positive.")
+        if self.temporary_working_set_coefficient_tolerance < 0.0:
+            raise ValueError("temporary_working_set_coefficient_tolerance must be non-negative.")
 
     def class_log_baseline_scales(self) -> Mapping[VariantClass, float]:
         return dict(DEFAULT_CLASS_LOG_BASELINE_SCALE)

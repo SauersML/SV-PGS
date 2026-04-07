@@ -26,6 +26,7 @@ from sv_pgs.genotype import (
     auto_batch_size,
 )
 from sv_pgs.inference import VariationalFitCheckpoint, VariationalFitResult, fit_variational_em
+from sv_pgs.mixture_inference import prepare_sample_space_nystrom_basis_cache
 from sv_pgs.numeric import stable_sigmoid
 from sv_pgs.null_model import NullModelFit, fit_stage1_null_model
 from sv_pgs.preprocessing import (
@@ -54,7 +55,7 @@ class FittedState:
 
 _FIT_STAGE_CACHE_DIRNAME = ".sv_pgs_cache"
 _FIT_STAGE_CACHE_SUBDIR = "fit_stage"
-_FIT_STAGE_CACHE_VERSION = 2
+_FIT_STAGE_CACHE_VERSION = 3
 
 
 @dataclass(slots=True)
@@ -66,6 +67,11 @@ class _FitStageCachePaths:
     tie_map_path: Path
     reduced_raw_i8_path: Path
     em_checkpoint_path: Path
+    fit_key: str | None = None
+
+    def __post_init__(self) -> None:
+        if self.fit_key is None:
+            self.fit_key = self.key
 
 
 def _validate_fit_inputs(
