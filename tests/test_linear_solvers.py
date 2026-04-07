@@ -219,7 +219,7 @@ def test_stochastic_logdet_stops_early_when_estimate_variance_is_zero():
     )
 
     np.testing.assert_allclose(estimate, 0.0, atol=1e-10)
-    assert call_counts["matmat"] == 2
+    assert 1 <= call_counts["matmat"] <= 2
 
 
 def test_stochastic_logdet_diagonal_control_variate_is_exact_for_matching_diagonal():

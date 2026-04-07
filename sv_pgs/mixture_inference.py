@@ -3679,21 +3679,6 @@ def _working_set_posterior_update_score(
     return np.abs(np.asarray(prior_variances, dtype=np.float64) * np.asarray(gradient, dtype=np.float64))
 
 
-def _top_working_set_indices(
-    score: np.ndarray,
-    target_size: int,
-) -> np.ndarray:
-    score_array = np.asarray(score, dtype=np.float64).reshape(-1)
-    if score_array.ndim != 1:
-        raise ValueError("working-set score must be one-dimensional.")
-    resolved_size = min(max(int(target_size), 1), score_array.shape[0])
-    if resolved_size == score_array.shape[0]:
-        return np.arange(score_array.shape[0], dtype=np.int32)
-    partition = np.argpartition(score_array, score_array.shape[0] - resolved_size)[-resolved_size:]
-    ranked = partition[np.argsort(score_array[partition])[::-1]]
-    return np.asarray(ranked, dtype=np.int32)
-
-
 def _ordered_unique_indices(
     index_blocks: Sequence[np.ndarray | None],
     variant_count: int,
