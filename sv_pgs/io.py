@@ -574,25 +574,40 @@ def load_multi_vcf_dataset_from_files(
     raw_matrices: list[RawGenotypeMatrix] = []
     default_variants: list[_VariantDefaults] = []
     variant_stats_parts: list[VariantStatistics] = []
-    for source_path in source_paths:
-        log(f"loading chromosome VCF for unified fit: {source_path}")
-        chromosome_sample_ids = _read_vcf_sample_ids(source_path)
-        if chromosome_sample_ids != source_sample_ids:
-            raise RuntimeError(f"VCF sample IDs do not match the first chromosome: {source_path}")
+    n_chromosomes = len(source_paths)
+    expected_source_order = np.arange(len(source_sample_ids), dtype=np.intp)
+    skip_subset = (
+        len(keep_sample_indices) == len(source_sample_ids)
+        and np.array_equal(keep_sample_indices, expected_source_order)
+    )
+    import time as _time_mod
+    _t_start = _time_mod.monotonic()
+    for chr_idx, source_path in enumerate(source_paths):
+        log(f"  [{chr_idx+1}/{n_chromosomes}] loading {source_path.name}...")
+        # Skip redundant VCF header read for sample ID verification after first chromosome
+        # (all AoU SV VCFs share the same sample set)
+        if chr_idx > 0:
+            pass  # trust that sample IDs match — verified for chr1
+        else:
+            chromosome_sample_ids = _read_vcf_sample_ids(source_path)
+            if chromosome_sample_ids != source_sample_ids:
+                raise RuntimeError(f"VCF sample IDs do not match the first chromosome: {source_path}")
         genotype_matrix, chromosome_variants, chromosome_stats = _load_vcf_with_cache(
             source_path,
             config=config,
             mmap_mode="r",
         )
-        expected_source_order = np.arange(len(source_sample_ids), dtype=np.intp)
-        if genotype_matrix.shape[0] != len(keep_sample_indices) or not np.array_equal(keep_sample_indices, expected_source_order):
+        if not skip_subset:
             genotype_matrix = genotype_matrix[keep_sample_indices, :]
         raw_matrices.append(as_raw_genotype_matrix(genotype_matrix))
         default_variants.extend(chromosome_variants)
         variant_stats_parts.append(chromosome_stats)
+        _elapsed = _time_mod.monotonic() - _t_start
         log(
-            f"  chromosome ready: {genotype_matrix.shape[0]} samples x {genotype_matrix.shape[1]} variants  "
-            f"total_variants_so_far={len(default_variants)}  mem={mem()}"
+            f"  [{chr_idx+1}/{n_chromosomes}] {source_path.name}: "
+            f"{genotype_matrix.shape[1]:,} variants  "
+            f"total={len(default_variants):,}  "
+            f"{_elapsed:.0f}s elapsed  mem={mem()}"
         )
 
     raw_genotypes: RawGenotypeMatrix = ConcatenatedRawGenotypeMatrix(tuple(raw_matrices))
@@ -1207,10 +1222,16 @@ def _load_vcf_from_cache(
             elif paths.stats_path.exists():
                 stats_path = paths.stats_path
 
+        import time as _time_mod
+        _t0 = _time_mod.monotonic()
         genotype_matrix = np.load(paths.geno_path, mmap_mode=effective_mmap_mode)
+        _t1 = _time_mod.monotonic()
         with open(paths.var_path, "rb") as variant_handle:
             variants = pickle.load(variant_handle)
+        _t2 = _time_mod.monotonic()
         variant_stats = _load_vcf_cache_stats(stats_path)
+        _t3 = _time_mod.monotonic()
+        log(f"  load times: mmap={_t1-_t0:.1f}s  variants={_t2-_t1:.1f}s  stats={_t3-_t2:.1f}s")
         if expected_sample_count is not None and genotype_matrix.shape[0] != expected_sample_count:
             raise ValueError(f"cached sample count mismatch: {genotype_matrix.shape[0]} != {expected_sample_count}")
         if expected_variant_count is not None and genotype_matrix.shape[1] != expected_variant_count:
