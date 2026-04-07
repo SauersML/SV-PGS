@@ -142,10 +142,6 @@ class ModelConfig:
     sample_space_preconditioner_rank: int = 256
     validation_interval: int = 2
     binary_intercept_calibration: bool = True
-    enable_stage1_null_model: bool = False
-    stage1_min_minor_allele_frequency: float = 0.01
-    stage1_max_variants: int = 65_536
-    stage1_prior_variance: float = 0.05
     stochastic_variational_updates: bool = True
     stochastic_min_variant_count: int = 4096
     stochastic_variant_batch_size: int = 2048
@@ -227,12 +223,6 @@ class ModelConfig:
             raise ValueError("sample_space_preconditioner_rank must be non-negative.")
         if self.validation_interval < 1:
             raise ValueError("validation_interval must be positive.")
-        if not 0.0 <= self.stage1_min_minor_allele_frequency < 0.5:
-            raise ValueError("stage1_min_minor_allele_frequency must lie in [0.0, 0.5).")
-        if self.stage1_max_variants < 0:
-            raise ValueError("stage1_max_variants must be non-negative.")
-        if self.stage1_prior_variance <= 0.0:
-            raise ValueError("stage1_prior_variance must be positive.")
         if self.stochastic_min_variant_count < 0:
             raise ValueError("stochastic_min_variant_count must be non-negative.")
         if self.stochastic_variant_batch_size < 1:

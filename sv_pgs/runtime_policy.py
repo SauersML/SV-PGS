@@ -51,10 +51,6 @@ def runtime_training_policy_for_fit(
         int(config.stochastic_variant_batch_size),
         max(max(cacheable_dense_variants // 4, 256), 1),
     )
-    tuned_stage1_max_variants = min(
-        int(config.stage1_max_variants),
-        max(int(cacheable_dense_variants * 4), 4_096),
-    )
     tuned_final_posterior_refinement = (
         bool(config.final_posterior_refinement)
         and int(genotype_matrix.shape[1])
@@ -65,7 +61,6 @@ def runtime_training_policy_for_fit(
         exact_solver_matrix_limit=tuned_exact_solver_limit,
         sample_space_preconditioner_rank=tuned_preconditioner_rank,
         stochastic_variant_batch_size=max(tuned_stochastic_batch_size, 1),
-        stage1_max_variants=max(tuned_stage1_max_variants, 0),
         final_posterior_refinement=tuned_final_posterior_refinement,
     )
     return RuntimeTrainingPolicy(
@@ -93,6 +88,5 @@ def runtime_training_policy_summary(policy: RuntimeTrainingPolicy, original_conf
         + f"exact_solver_matrix_limit={original_config.exact_solver_matrix_limit}->{tuned_config.exact_solver_matrix_limit} "
         + f"sample_space_preconditioner_rank={original_config.sample_space_preconditioner_rank}->{tuned_config.sample_space_preconditioner_rank} "
         + f"stochastic_variant_batch_size={original_config.stochastic_variant_batch_size}->{tuned_config.stochastic_variant_batch_size} "
-        + f"stage1_max_variants={original_config.stage1_max_variants}->{tuned_config.stage1_max_variants} "
         + f"final_posterior_refinement={original_config.final_posterior_refinement}->{tuned_config.final_posterior_refinement}"
     )
