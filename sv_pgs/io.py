@@ -1213,9 +1213,15 @@ def _load_vcf_from_cache(
         }
         if len(stats_lengths) != 1:
             raise ValueError("cached stats shape mismatch")
-        genotype_matrix = _ensure_vcf_cache_matrix_fast(paths, genotype_matrix)
+        try:
+            genotype_matrix = _ensure_vcf_cache_matrix_fast(paths, genotype_matrix)
+        except Exception:
+            pass  # keep row-major if column-major rewrite fails (e.g. disk full)
         if manifest is None:
-            _upgrade_legacy_vcf_cache_bundle(paths, genotype_matrix, variant_stats, vcf_path=vcf_path)
+            try:
+                _upgrade_legacy_vcf_cache_bundle(paths, genotype_matrix, variant_stats, vcf_path=vcf_path)
+            except Exception:
+                pass  # upgrade is optional — data is already loaded
         log(f"  cached matrix {genotype_matrix.shape}, {len(variants)} variants")
         return genotype_matrix, variants, variant_stats
     except Exception as exc:
