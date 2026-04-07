@@ -15,7 +15,7 @@ import pandas as pd
 from sv_pgs.all_of_us import AllOfUsDiseaseRequest, prepare_all_of_us_disease_sample_table, resolve_disease_definition
 from sv_pgs.config import ModelConfig, TraitType
 from sv_pgs.io import load_multi_vcf_dataset_from_files, run_training_pipeline
-from sv_pgs.progress import log
+from sv_pgs.progress import log, mem
 
 _LOCAL_CACHE_DIRNAME = ".sv_pgs_cache"
 _AOU_SV_VCF_CACHE_SUBDIR = "aou_sv_vcfs"
