@@ -199,6 +199,8 @@ class PosteriorState:
 @dataclass(slots=True)
 class _RestrictedPosteriorWarmStart:
     sample_space_inverse_covariance_rhs: np.ndarray | None = None
+    temporary_working_set_variant_count: int | None = None
+    temporary_working_set_ever_active: np.ndarray | None = None
 
 
 def _checkpoint_config_signature(config: ModelConfig) -> str:
@@ -3647,6 +3649,13 @@ def _working_set_screening_score(
     return np.maximum(coefficient_scale_violation, np.abs(np.asarray(beta, dtype=np.float64)))
 
 
+def _working_set_posterior_update_score(
+    gradient: np.ndarray,
+    prior_variances: np.ndarray,
+) -> np.ndarray:
+    return np.abs(np.asarray(prior_variances, dtype=np.float64) * np.asarray(gradient, dtype=np.float64))
+
+
 def _top_working_set_indices(
     score: np.ndarray,
     target_size: int,
@@ -3660,6 +3669,77 @@ def _top_working_set_indices(
     partition = np.argpartition(score_array, score_array.shape[0] - resolved_size)[-resolved_size:]
     ranked = partition[np.argsort(score_array[partition])[::-1]]
     return np.asarray(ranked, dtype=np.int32)
+
+
+def _ordered_unique_indices(
+    index_blocks: Sequence[np.ndarray | None],
+    variant_count: int,
+) -> np.ndarray:
+    seen = np.zeros(max(int(variant_count), 0), dtype=bool)
+    ordered_blocks: list[np.ndarray] = []
+    for block in index_blocks:
+        if block is None:
+            continue
+        block_array = np.asarray(block, dtype=np.int64).reshape(-1)
+        if block_array.size == 0:
+            continue
+        block_array = block_array[(block_array >= 0) & (block_array < variant_count)]
+        if block_array.size == 0:
+            continue
+        unseen_mask = ~seen[block_array]
+        if not np.any(unseen_mask):
+            continue
+        unique_block = np.asarray(block_array[unseen_mask], dtype=np.int32)
+        seen[unique_block] = True
+        ordered_blocks.append(unique_block)
+    if not ordered_blocks:
+        return np.empty(0, dtype=np.int32)
+    return np.concatenate(ordered_blocks).astype(np.int32, copy=False)
+
+
+def _active_working_set_indices(
+    beta: np.ndarray,
+    coefficient_tolerance: float,
+) -> np.ndarray:
+    active_threshold = max(float(coefficient_tolerance), 1e-10)
+    return np.flatnonzero(np.abs(np.asarray(beta, dtype=np.float64)) > active_threshold).astype(np.int32, copy=False)
+
+
+def _basil_working_set_indices(
+    screening_score: np.ndarray,
+    ever_active_indices: np.ndarray,
+    target_size: int,
+) -> np.ndarray:
+    total_variants = int(np.asarray(screening_score).shape[0])
+    mandatory = _ordered_unique_indices([ever_active_indices], total_variants)
+    if mandatory.shape[0] >= total_variants:
+        return np.arange(total_variants, dtype=np.int32)
+    if mandatory.shape[0] >= max(int(target_size), 1):
+        return mandatory
+    candidate_score = np.asarray(screening_score, dtype=np.float64).reshape(-1)
+    remaining_size = max(int(target_size) - mandatory.shape[0], 0)
+    if remaining_size <= 0:
+        return mandatory
+    available_mask = np.ones(total_variants, dtype=bool)
+    available_mask[mandatory] = False
+    available_indices = np.flatnonzero(available_mask).astype(np.int32, copy=False)
+    if available_indices.size <= remaining_size:
+        return _ordered_unique_indices([mandatory, available_indices], total_variants)
+    ranked_remaining = available_indices[
+        np.argsort(candidate_score[available_indices])[-remaining_size:][::-1]
+    ]
+    return _ordered_unique_indices([mandatory, ranked_remaining], total_variants)
+
+
+def _reset_temporary_working_set_warm_start(
+    warm_start: _RestrictedPosteriorWarmStart | None,
+    variant_count: int,
+) -> None:
+    if warm_start is None:
+        return
+    if warm_start.temporary_working_set_variant_count != int(variant_count):
+        warm_start.temporary_working_set_variant_count = int(variant_count)
+        warm_start.temporary_working_set_ever_active = None
 
 
 def _restricted_posterior_state_temporary_working_set(
@@ -3683,8 +3763,10 @@ def _restricted_posterior_state_temporary_working_set(
     temporary_working_set_growth: int,
     temporary_working_set_max_passes: int,
     temporary_working_set_coefficient_tolerance: float,
+    warm_start: _RestrictedPosteriorWarmStart | None,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, float, float, float]:
     variant_count = genotype_matrix.shape[1]
+    _reset_temporary_working_set_warm_start(warm_start, variant_count)
     current_beta = (
         np.zeros(variant_count, dtype=np.float64)
         if initial_beta_guess is None
@@ -3705,22 +3787,31 @@ def _restricted_posterior_state_temporary_working_set(
                 projected_residual,
                 batch_size=posterior_variance_batch_size,
             ),
-            dtype=np.float64,
+        dtype=np.float64,
         ) - prior_precision * beta_vector
         return genetic_linear_predictor, projected_residual, gradient
 
     _genetic_linear_predictor, _projected_residual, current_gradient = _projected_residual_and_gradient(current_beta)
+    ever_active_indices = _ordered_unique_indices(
+        [
+            warm_start.temporary_working_set_ever_active if warm_start is not None else None,
+            _active_working_set_indices(current_beta, temporary_working_set_coefficient_tolerance),
+        ],
+        variant_count,
+    )
     working_size = min(max(int(temporary_working_set_initial_size), 1), variant_count)
-    working_indices = _top_working_set_indices(
+    working_indices = _basil_working_set_indices(
         _working_set_screening_score(current_gradient, current_beta, prior_variances),
-        working_size,
+        ever_active_indices,
+        max(working_size, ever_active_indices.shape[0]),
     )
 
     for working_pass in range(max(int(temporary_working_set_max_passes), 1)):
         log(
             "    restricted posterior: temporary working set "
             + f"pass {working_pass + 1}/{int(temporary_working_set_max_passes)} "
-            + f"size={working_indices.shape[0]}/{variant_count}"
+            + f"size={working_indices.shape[0]}/{variant_count} "
+            + f"ever_active={ever_active_indices.shape[0]}"
         )
         subset_state = _restricted_posterior_state(
             genotype_matrix=genotype_matrix.subset(working_indices),
@@ -3745,12 +3836,27 @@ def _restricted_posterior_state_temporary_working_set(
         )
         candidate_beta = np.zeros(variant_count, dtype=np.float64)
         candidate_beta[working_indices] = np.asarray(subset_state[1], dtype=np.float64)
+        ever_active_indices = _ordered_unique_indices(
+            [
+                ever_active_indices,
+                _active_working_set_indices(candidate_beta, temporary_working_set_coefficient_tolerance),
+            ],
+            variant_count,
+        )
         genetic_linear_predictor, projected_targets, candidate_gradient = _projected_residual_and_gradient(candidate_beta)
         candidate_score = _working_set_screening_score(candidate_gradient, candidate_beta, prior_variances)
+        candidate_update_score = _working_set_posterior_update_score(candidate_gradient, prior_variances)
         excluded_mask = np.ones(variant_count, dtype=bool)
         excluded_mask[working_indices] = False
-        max_excluded_score = float(np.max(candidate_score[excluded_mask])) if np.any(excluded_mask) else 0.0
-        if max_excluded_score <= float(temporary_working_set_coefficient_tolerance) or working_indices.shape[0] == variant_count:
+        max_excluded_update = (
+            float(np.max(candidate_update_score[excluded_mask]))
+            if np.any(excluded_mask)
+            else 0.0
+        )
+        if (
+            max_excluded_update <= float(temporary_working_set_coefficient_tolerance)
+            or working_indices.shape[0] == variant_count
+        ):
             alpha = np.asarray(
                 _cholesky_solve(
                     covariate_precision_cholesky,
@@ -3762,8 +3868,11 @@ def _restricted_posterior_state_temporary_working_set(
             restricted_quadratic = float(np.dot(targets, projected_targets))
             log(
                 "    temporary working set accepted "
-                + f"(size={working_indices.shape[0]}/{variant_count}, excluded_score={max_excluded_score:.2e})"
+                + f"(size={working_indices.shape[0]}/{variant_count}, ever_active={ever_active_indices.shape[0]}, "
+                + f"excluded_update={max_excluded_update:.2e})"
             )
+            if warm_start is not None:
+                warm_start.temporary_working_set_ever_active = np.asarray(ever_active_indices, dtype=np.int32)
             return (
                 np.asarray(alpha, dtype=np.float64),
                 np.asarray(candidate_beta, dtype=np.float64),
@@ -3775,11 +3884,31 @@ def _restricted_posterior_state_temporary_working_set(
                 covariate_precision_logdet,
             )
         current_beta = candidate_beta
-        working_size = min(working_indices.shape[0] + int(temporary_working_set_growth), variant_count)
-        working_indices = _top_working_set_indices(candidate_score, working_size)
+        violating_indices = np.flatnonzero(
+            excluded_mask & (candidate_update_score > float(temporary_working_set_coefficient_tolerance))
+        ).astype(np.int32, copy=False)
+        next_size = min(
+            max(
+                working_indices.shape[0] + int(temporary_working_set_growth),
+                ever_active_indices.shape[0] + int(temporary_working_set_growth),
+            ),
+            variant_count,
+        )
+        working_indices = _ordered_unique_indices(
+            [
+                ever_active_indices,
+                violating_indices,
+                _basil_working_set_indices(candidate_score, ever_active_indices, next_size),
+            ],
+            variant_count,
+        )
+        log(
+            "    temporary working set expanded "
+            + f"(violations={violating_indices.shape[0]}, next_size={working_indices.shape[0]}/{variant_count})"
+        )
 
     log("    temporary working set validation failed to certify a subset; falling back to full solve")
-    return _restricted_posterior_state(
+    full_state = _restricted_posterior_state(
         genotype_matrix=genotype_matrix,
         covariate_matrix=covariate_matrix,
         targets=targets,
@@ -3800,6 +3929,12 @@ def _restricted_posterior_state_temporary_working_set(
         temporary_working_sets=False,
         allow_working_set=False,
     )
+    if warm_start is not None:
+        warm_start.temporary_working_set_ever_active = _active_working_set_indices(
+            np.asarray(full_state[1], dtype=np.float64),
+            temporary_working_set_coefficient_tolerance,
+        )
+    return full_state
 
 
 def _restricted_posterior_state(
@@ -3966,6 +4101,7 @@ def _restricted_posterior_state(
             temporary_working_set_growth=temporary_working_set_growth,
             temporary_working_set_max_passes=temporary_working_set_max_passes,
             temporary_working_set_coefficient_tolerance=temporary_working_set_coefficient_tolerance,
+            warm_start=warm_start,
         )
 
     if use_variant_space:

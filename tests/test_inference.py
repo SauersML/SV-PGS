@@ -16,6 +16,7 @@ from sv_pgs.genotype import as_raw_genotype_matrix
 from sv_pgs.inference import fit_variational_em
 from sv_pgs.mixture_inference import (
     _binary_newton_solver_controls,
+    _basil_working_set_indices,
     _build_restricted_projector_jax,
     _calibrate_binary_intercept,
     PosteriorState,
@@ -193,6 +194,68 @@ def test_temporary_working_set_restricted_posterior_matches_full_solution(random
             rtol=1e-5,
             atol=1e-5,
         )
+
+
+def test_basil_working_set_keeps_ever_active_variants():
+    screening_score = np.array([0.9, 0.1, 0.8, 0.7, 0.6], dtype=np.float64)
+    ever_active_indices = np.array([1, 4], dtype=np.int32)
+
+    working_indices = _basil_working_set_indices(
+        screening_score=screening_score,
+        ever_active_indices=ever_active_indices,
+        target_size=3,
+    )
+
+    assert set(working_indices.tolist()) >= {1, 4}
+    assert working_indices.shape == (3,)
+
+
+def test_temporary_working_set_warm_start_tracks_ever_active_support(random_generator):
+    sample_count, variant_count = 36, 14
+    genotype_values = random_generator.standard_normal((sample_count, variant_count)).astype(np.float32)
+    targets = (
+        1.4 * genotype_values[:, 0]
+        - 0.9 * genotype_values[:, 5]
+        + 0.2 * random_generator.standard_normal(sample_count).astype(np.float32)
+    )
+    standardized = as_raw_genotype_matrix(genotype_values).standardized(
+        means=np.zeros(variant_count, dtype=np.float32),
+        scales=np.ones(variant_count, dtype=np.float32),
+    )
+    standardized._dense_cache = standardized.materialize()
+    warm_start = mixture_inference._RestrictedPosteriorWarmStart()
+
+    result = _restricted_posterior_state(
+        genotype_matrix=standardized,
+        covariate_matrix=np.ones((sample_count, 1), dtype=np.float64),
+        targets=np.asarray(targets, dtype=np.float64),
+        prior_variances=np.ones(variant_count, dtype=np.float64),
+        diagonal_noise=np.ones(sample_count, dtype=np.float64),
+        solver_tolerance=1e-7,
+        maximum_linear_solver_iterations=256,
+        logdet_probe_count=2,
+        logdet_lanczos_steps=4,
+        exact_solver_matrix_limit=2,
+        posterior_variance_batch_size=4,
+        posterior_variance_probe_count=2,
+        random_seed=0,
+        compute_logdet=False,
+        compute_beta_variance=False,
+        initial_beta_guess=np.zeros(variant_count, dtype=np.float64),
+        warm_start=warm_start,
+        temporary_working_sets=True,
+        temporary_working_set_min_variants=1,
+        temporary_working_set_initial_size=2,
+        temporary_working_set_growth=2,
+        temporary_working_set_max_passes=8,
+        temporary_working_set_coefficient_tolerance=0.0,
+    )
+
+    assert warm_start.temporary_working_set_variant_count == variant_count
+    assert warm_start.temporary_working_set_ever_active is not None
+    assert warm_start.temporary_working_set_ever_active.size > 0
+    active_support = np.flatnonzero(np.abs(np.asarray(result[1], dtype=np.float64)) > 1e-10)
+    assert set(active_support.tolist()).issubset(set(warm_start.temporary_working_set_ever_active.tolist()))
 
 
 def test_binary_inference_runs_with_stochastic_variant_updates(random_generator):
