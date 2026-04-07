@@ -154,6 +154,83 @@ def test_stochastic_logdet_uses_numpy_eigh(monkeypatch):
     assert np.isfinite(estimate)
 
 
+def test_stochastic_logdet_uses_block_matmat_when_available():
+    dense_operator = np.array(
+        [
+            [4.0, 0.5, 0.0],
+            [0.5, 3.0, 0.25],
+            [0.0, 0.25, 2.0],
+        ],
+        dtype=np.float64,
+    )
+    call_counts = {"matvec": 0, "matmat": 0}
+
+    def forbidden_matvec(_vector):
+        call_counts["matvec"] += 1
+        raise AssertionError("block SLQ should use matmat when it is available")
+
+    def tracked_matmat(matrix):
+        call_counts["matmat"] += 1
+        return jnp.asarray(dense_operator @ np.asarray(matrix, dtype=np.float64), dtype=jnp.float64)
+
+    operator = build_linear_operator(
+        shape=dense_operator.shape,
+        matvec=forbidden_matvec,
+        matmat=tracked_matmat,
+        dtype=jnp.float64,
+    )
+
+    estimate = linear_solvers.stochastic_logdet(
+        operator=operator,
+        dimension=3,
+        probe_count=3,
+        lanczos_steps=3,
+        random_seed=0,
+    )
+
+    assert np.isfinite(estimate)
+    assert call_counts["matvec"] == 0
+    assert call_counts["matmat"] > 0
+
+
+def test_stochastic_logdet_uses_matmat_for_probe_blocks():
+    dense_operator = np.array(
+        [
+            [3.0, 0.5, 0.0, 0.0],
+            [0.5, 2.5, 0.2, 0.0],
+            [0.0, 0.2, 1.8, 0.1],
+            [0.0, 0.0, 0.1, 1.5],
+        ],
+        dtype=np.float64,
+    )
+    calls = {"matmat": 0}
+
+    def matvec(_vector):
+        raise AssertionError("stochastic_logdet should batch probe applications through matmat")
+
+    def matmat(block):
+        calls["matmat"] += 1
+        return jnp.asarray(dense_operator @ np.asarray(block, dtype=np.float64), dtype=jnp.float64)
+
+    operator = build_linear_operator(
+        shape=dense_operator.shape,
+        matvec=matvec,
+        matmat=matmat,
+        dtype=jnp.float64,
+    )
+
+    estimate = linear_solvers.stochastic_logdet(
+        operator=operator,
+        dimension=dense_operator.shape[0],
+        probe_count=4,
+        lanczos_steps=3,
+        random_seed=0,
+    )
+
+    assert np.isfinite(estimate)
+    assert calls["matmat"] > 0
+
+
 def test_small_symmetric_eigh_rejects_non_finite_input():
     with np.testing.assert_raises_regex(RuntimeError, "non-finite values"):
         linear_solvers._small_symmetric_eigh(np.array([[1.0, np.nan], [np.nan, 2.0]], dtype=np.float64))

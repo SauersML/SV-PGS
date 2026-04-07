@@ -666,3 +666,67 @@ def _lanczos_tridiagonal(
         tridiagonal = tridiagonal.at[jnp.arange(off_diagonal.shape[0]), jnp.arange(1, off_diagonal.shape[0] + 1)].set(off_diagonal)
         tridiagonal = tridiagonal.at[jnp.arange(1, off_diagonal.shape[0] + 1), jnp.arange(off_diagonal.shape[0])].set(off_diagonal)
     return tridiagonal
+
+
+def _lanczos_tridiagonal_block(
+    linear_operator: LinearOperator,
+    start_matrix: jnp.ndarray,
+    step_count: int,
+) -> tuple[np.ndarray, ...]:
+    if start_matrix.ndim != 2:
+        raise ValueError("Lanczos block requires a matrix of start vectors.")
+    if start_matrix.shape[1] == 1:
+        return (np.asarray(_lanczos_tridiagonal(linear_operator, start_matrix[:, 0], step_count), dtype=np.float64),)
+    operator_dtype = linear_operator.dtype or jnp.result_type(start_matrix.dtype, jnp.float32)
+    current_block = jnp.asarray(start_matrix, dtype=operator_dtype)
+    current_norms = jnp.maximum(jnp.linalg.norm(current_block, axis=0, keepdims=True), 1e-12)
+    current_block = current_block / current_norms
+    basis_blocks: list[jnp.ndarray] = []
+    alpha_rows: list[np.ndarray] = []
+    beta_rows: list[np.ndarray] = []
+    previous_block = jnp.zeros_like(current_block)
+    previous_beta = jnp.zeros(current_block.shape[1], dtype=operator_dtype)
+    active = np.ones(current_block.shape[1], dtype=bool)
+    step_lengths = np.full(current_block.shape[1], step_count, dtype=np.int32)
+    steps_completed = 0
+    for step_index in range(step_count):
+        projected_block = _apply_operator_block(linear_operator, current_block, operator_dtype)
+        if basis_blocks:
+            projected_block = projected_block - previous_block * previous_beta[None, :]
+        alpha_row = np.asarray(jnp.sum(current_block * projected_block, axis=0), dtype=np.float64)
+        projected_block = projected_block - current_block * jnp.asarray(alpha_row, dtype=operator_dtype)[None, :]
+        if basis_blocks:
+            for basis_block in basis_blocks:
+                coefficients = jnp.sum(basis_block * projected_block, axis=0)
+                projected_block = projected_block - basis_block * coefficients[None, :]
+        beta_row = np.asarray(jnp.linalg.norm(projected_block, axis=0), dtype=np.float64)
+        basis_blocks.append(current_block)
+        alpha_rows.append(alpha_row)
+        steps_completed = step_index + 1
+        if step_index + 1 >= step_count:
+            break
+        beta_rows.append(beta_row)
+        newly_converged = active & (beta_row < 1e-10)
+        step_lengths[newly_converged] = step_index + 1
+        active = active & ~newly_converged
+        if not np.any(active):
+            break
+        beta_safe = np.where(active, beta_row, 1.0)
+        normalized_next = np.asarray(projected_block, dtype=np.float64) / beta_safe[None, :]
+        normalized_next[:, ~active] = 0.0
+        previous_block = current_block
+        previous_beta = jnp.asarray(np.where(active, beta_row, 0.0), dtype=operator_dtype)
+        current_block = jnp.asarray(normalized_next, dtype=operator_dtype)
+    tridiagonal_blocks: list[np.ndarray] = []
+    alpha_matrix = np.asarray(alpha_rows, dtype=np.float64)
+    beta_matrix = np.asarray(beta_rows, dtype=np.float64) if beta_rows else np.zeros((0, current_block.shape[1]), dtype=np.float64)
+    for column_index in range(current_block.shape[1]):
+        current_steps = int(step_lengths[column_index]) if not active[column_index] else steps_completed
+        diagonal = alpha_matrix[:current_steps, column_index]
+        tridiagonal = np.diag(diagonal)
+        if current_steps > 1:
+            off_diagonal = beta_matrix[: current_steps - 1, column_index]
+            tridiagonal[np.arange(current_steps - 1), np.arange(1, current_steps)] = off_diagonal
+            tridiagonal[np.arange(1, current_steps), np.arange(current_steps - 1)] = off_diagonal
+        tridiagonal_blocks.append(tridiagonal.astype(np.float64, copy=False))
+    return tuple(tridiagonal_blocks)

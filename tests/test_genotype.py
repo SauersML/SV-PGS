@@ -741,6 +741,80 @@ def test_streaming_linear_algebra_uses_float32_gpu_batches_on_t4(monkeypatch: py
     assert set(gpu_batch_dtypes) == {np.float32}
 
 
+def test_dense_gpu_cache_linear_algebra_respects_gpu_compute_dtype(monkeypatch: pytest.MonkeyPatch):
+    class _FakeCupy:
+        float32 = np.float32
+        float64 = np.float64
+
+        @staticmethod
+        def asarray(array, dtype=None):
+            return np.asarray(array, dtype=dtype)
+
+    raw_matrix = np.array(
+        [
+            [0.0, 1.0, np.nan, 0.0],
+            [1.0, 0.0, 2.0, 1.0],
+            [2.0, 1.0, 1.0, 0.0],
+            [np.nan, 2.0, 0.0, 1.0],
+        ],
+        dtype=np.float32,
+    )
+    means = np.array([1.0, 1.0, 1.0, 0.5], dtype=np.float32)
+    scales = np.array([0.5, 1.0, 1.0, 0.5], dtype=np.float32)
+    coefficients = np.array([0.25, -0.75, 0.5, 1.25], dtype=np.float64)
+    sample_matrix = np.column_stack(
+        [
+            np.array([1.0, -2.0, 0.5, 3.0], dtype=np.float64),
+            np.array([-1.5, 0.0, 2.0, 1.0], dtype=np.float64),
+        ]
+    )
+    standardized = as_raw_genotype_matrix(raw_matrix).standardized(means, scales)
+    dense_matrix = standardized.materialize().astype(np.float64, copy=False)
+    standardized._cupy_cache = standardized.materialize().astype(np.float32, copy=False)
+    standardized._dense_cache = None
+
+    monkeypatch.setattr(genotype_module, "_try_import_cupy", lambda: _FakeCupy())
+    monkeypatch.setattr(genotype_module, "gpu_compute_numpy_dtype", lambda: np.dtype(np.float64))
+    monkeypatch.setattr(genotype_module, "gpu_compute_jax_dtype", lambda: jnp.float64)
+    monkeypatch.setattr(
+        genotype_module,
+        "_cupy_to_jax",
+        lambda array: jnp.asarray(np.asarray(array), dtype=jnp.float64),
+    )
+
+    matvec_result = standardized.matvec(coefficients)
+    matmat_result = standardized.matmat(sample_matrix)
+    transpose_matvec_result = standardized.transpose_matvec(np.array([1.5, -0.25, 0.75, -1.0], dtype=np.float64))
+    transpose_matmat_result = standardized.transpose_matmat(
+        np.column_stack(
+            [
+                np.array([1.0, -0.5, 0.25, 2.0], dtype=np.float64),
+                np.array([-1.5, 0.0, 1.0, 0.5], dtype=np.float64),
+            ]
+        )
+    )
+
+    assert np.asarray(matvec_result).dtype == np.float64
+    assert np.asarray(matmat_result).dtype == np.float64
+    assert np.asarray(transpose_matvec_result).dtype == np.float64
+    assert np.asarray(transpose_matmat_result).dtype == np.float64
+    np.testing.assert_allclose(np.asarray(matvec_result), dense_matrix @ coefficients)
+    np.testing.assert_allclose(np.asarray(matmat_result), dense_matrix @ sample_matrix)
+    np.testing.assert_allclose(
+        np.asarray(transpose_matvec_result),
+        dense_matrix.T @ np.array([1.5, -0.25, 0.75, -1.0], dtype=np.float64),
+    )
+    np.testing.assert_allclose(
+        np.asarray(transpose_matmat_result),
+        dense_matrix.T @ np.column_stack(
+            [
+                np.array([1.0, -0.5, 0.25, 2.0], dtype=np.float64),
+                np.array([-1.5, 0.0, 1.0, 0.5], dtype=np.float64),
+            ]
+        ),
+    )
+
+
 def test_try_materialize_gpu_subset_streams_only_selected_columns(monkeypatch: pytest.MonkeyPatch):
     class _FakeCudaRuntime:
         @staticmethod

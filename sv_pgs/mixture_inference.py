@@ -2846,13 +2846,60 @@ def _posterior_variance_hutchinson_diagonal(
     probe_count: int,
     random_seed: int,
 ) -> np.ndarray:
-    probes = _orthogonal_probe_matrix(
+    if probe_count < 1:
+        raise ValueError("probe_count must be positive.")
+    if probe_count == 1:
+        probes = _orthogonal_probe_matrix(
+            dimension=dimension,
+            probe_count=probe_count,
+            random_seed=random_seed,
+        )
+        solutions = np.asarray(solve_variant_rhs(probes), dtype=np.float64)
+        return np.maximum(np.mean(probes * solutions, axis=1), 1e-8)
+
+    sketch_probe_count = min(max(1, probe_count // 2), dimension)
+    residual_probe_count = max(probe_count - sketch_probe_count, 0)
+    sketch_probes = _orthogonal_probe_matrix(
         dimension=dimension,
-        probe_count=probe_count,
+        probe_count=sketch_probe_count,
         random_seed=random_seed,
     )
-    solutions = np.asarray(solve_variant_rhs(probes), dtype=np.float64)
-    return np.maximum(np.mean(probes * solutions, axis=1), 1e-8)
+    residual_probes = (
+        _orthogonal_probe_matrix(
+            dimension=dimension,
+            probe_count=residual_probe_count,
+            random_seed=random_seed + 1,
+        )
+        if residual_probe_count > 0
+        else None
+    )
+    all_probes = (
+        np.concatenate([sketch_probes, residual_probes], axis=1)
+        if residual_probes is not None
+        else sketch_probes
+    )
+    all_solutions = np.asarray(solve_variant_rhs(all_probes), dtype=np.float64)
+    sketch_solutions = np.asarray(all_solutions[:, :sketch_probe_count], dtype=np.float64)
+    sketch_gram = np.asarray(sketch_probes.T @ sketch_solutions, dtype=np.float64)
+    sketch_gram = 0.5 * (sketch_gram + sketch_gram.T)
+    sketch_gram += np.eye(sketch_gram.shape[0], dtype=np.float64) * 1e-8
+    try:
+        sketch_gram_inverse = np.linalg.inv(sketch_gram)
+    except np.linalg.LinAlgError:
+        sketch_gram_inverse = np.linalg.pinv(sketch_gram, rcond=1e-10)
+    low_rank_weighted_solutions = sketch_solutions @ sketch_gram_inverse
+    low_rank_diagonal = np.sum(low_rank_weighted_solutions * sketch_solutions, axis=1)
+    if residual_probe_count == 0 or residual_probes is None:
+        return np.maximum(low_rank_diagonal, 1e-8)
+    residual_solutions = np.asarray(all_solutions[:, sketch_probe_count:], dtype=np.float64)
+    low_rank_residual_projection = sketch_solutions @ (
+        sketch_gram_inverse @ (sketch_solutions.T @ residual_probes)
+    )
+    residual_diagonal = np.mean(
+        residual_probes * (residual_solutions - low_rank_residual_projection),
+        axis=1,
+    )
+    return np.maximum(low_rank_diagonal + residual_diagonal, 1e-8)
 
 
 def _orthogonal_probe_matrix(

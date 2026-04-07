@@ -1457,6 +1457,39 @@ def test_orthogonal_probe_matrix_has_expected_column_norms_and_shape():
     )
 
 
+def test_posterior_variance_diagonal_uses_low_rank_residual_estimator():
+    low_rank_factor = np.array(
+        [
+            [1.0, 0.0],
+            [0.5, 1.0],
+            [0.0, 1.5],
+            [1.0, -0.5],
+            [0.25, 0.75],
+            [0.75, 0.25],
+        ],
+        dtype=np.float64,
+    )
+    inverse_precision = low_rank_factor @ low_rank_factor.T
+    solve_calls: list[tuple[int, int]] = []
+
+    def solve_variant_rhs(right_hand_side: np.ndarray) -> np.ndarray:
+        rhs = np.asarray(right_hand_side, dtype=np.float64)
+        if rhs.ndim == 1:
+            rhs = rhs[:, None]
+        solve_calls.append(rhs.shape)
+        return inverse_precision @ rhs
+
+    estimated_diagonal = mixture_inference._posterior_variance_hutchinson_diagonal(
+        solve_variant_rhs=solve_variant_rhs,
+        dimension=inverse_precision.shape[0],
+        probe_count=4,
+        random_seed=0,
+    )
+
+    np.testing.assert_allclose(estimated_diagonal, np.diag(inverse_precision), rtol=1e-6, atol=1e-6)
+    assert solve_calls == [(inverse_precision.shape[0], 4)]
+
+
 def test_stochastic_restricted_cross_leverage_diagonal_tracks_exact_leverage():
     genotype_matrix = np.array(
         [
