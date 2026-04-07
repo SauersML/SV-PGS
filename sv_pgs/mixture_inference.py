@@ -1441,21 +1441,48 @@ def _binary_newton_solver_controls(
     return relaxed_tolerance, max(relaxed_maximum_iterations, 16)
 
 
-# Fit effect sizes for a binary trait (e.g. disease case/control).
+def _binary_expected_polya_gamma_weights(
+    linear_predictor: np.ndarray,
+    minimum_weight: float,
+) -> np.ndarray:
+    absolute_predictor = np.abs(np.asarray(linear_predictor, dtype=np.float64))
+    weights = np.empty_like(absolute_predictor, dtype=np.float64)
+    tiny_mask = absolute_predictor < 1e-6
+    weights[tiny_mask] = 0.25
+    nonzero_predictor = absolute_predictor[~tiny_mask]
+    if nonzero_predictor.size > 0:
+        weights[~tiny_mask] = np.tanh(nonzero_predictor * 0.5) / (2.0 * nonzero_predictor)
+    return np.maximum(weights, float(minimum_weight))
+
+
+def _binary_penalized_log_posterior(
+    linear_predictor: np.ndarray,
+    targets: np.ndarray,
+    prior_precision: np.ndarray,
+    beta: np.ndarray,
+) -> float:
+    probabilities = np.asarray(stable_sigmoid(np.asarray(linear_predictor, dtype=np.float64)), dtype=np.float64)
+    target_array = np.asarray(targets, dtype=np.float64)
+    beta_array = np.asarray(beta, dtype=np.float64)
+    prior_precision_array = np.asarray(prior_precision, dtype=np.float64)
+    return float(
+        np.sum(
+            target_array * np.log(probabilities + 1e-12)
+            + (1.0 - target_array) * np.log(1.0 - probabilities + 1e-12)
+        )
+        - 0.5 * np.sum(prior_precision_array * beta_array * beta_array)
+    )
+
+
+# Fit effect sizes for a binary trait (e.g. disease case/control) by
+# alternating between:
+#   1. updating expected Polya-Gamma latent weights from the current
+#      logistic linear predictor, and
+#   2. solving the resulting Gaussian subproblem with the same restricted
+#      posterior machinery used by the quantitative path.
 #
-# Binary traits can't use the simple least-squares approach above because
-# the outcome is 0/1, not continuous.  Instead we use logistic regression
-# with a Bayesian twist:
-#   - Convert the linear predictor to a probability via the sigmoid function
-#   - Use Newton's method with a "trust region" to find the best betas
-#   - The trust region (controlled by a damping parameter) prevents the
-#     optimizer from taking steps that are too large and overshooting
-#   - At each Newton step, we build a local quadratic approximation
-#     (iteratively reweighted least squares / IRLS) and solve it using
-#     the same linear algebra as the quantitative case
-#
-# The final objective is a Laplace approximation: the log-posterior at
-# its peak, corrected for the curvature (how "peaked" the posterior is).
+# This avoids trust-region accept/reject loops and turns each binary
+# iteration into one posterior solve plus one weight refresh.
 def _binary_posterior_state(
     genotype_matrix: StandardizedGenotypeMatrix | np.ndarray,
     covariate_matrix: np.ndarray,
@@ -1485,243 +1512,110 @@ def _binary_posterior_state(
     predictor_offset: np.ndarray | None = None,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, float]:
     standardized_genotypes = _as_standardized_genotype_matrix(genotype_matrix)
-    compute_np_dtype = gpu_compute_numpy_dtype()
-    compute_jax_dtype = gpu_compute_jax_dtype()
-    prior_precision = (1.0 / np.maximum(prior_variances, 1e-8)).astype(compute_np_dtype, copy=False)
+    prior_precision = np.asarray(1.0 / np.maximum(prior_variances, 1e-8), dtype=np.float64)
     covariate_count = covariate_matrix.shape[1]
-    parameters = np.concatenate([alpha_init, beta_init], axis=0).astype(compute_np_dtype, copy=True)
-    damping = float(initial_damping)
+    parameters = np.concatenate([alpha_init, beta_init], axis=0).astype(np.float64, copy=True)
     predictor_offset_array = (
-        np.zeros(standardized_genotypes.shape[0], dtype=compute_np_dtype)
+        np.zeros(standardized_genotypes.shape[0], dtype=np.float64)
         if predictor_offset is None
-        else np.asarray(predictor_offset, dtype=compute_np_dtype).reshape(-1)
+        else np.asarray(predictor_offset, dtype=np.float64).reshape(-1)
     )
     if predictor_offset_array.shape != (standardized_genotypes.shape[0],):
         raise ValueError("predictor_offset must match genotype sample count.")
-
-    # Pre-convert the covariate matrix to JAX once so that matmuls stay on GPU
-    # throughout the Newton loop.  The covariate matrix is small
-    # (n_samples x ~5-10 covariates) so this is cheap.
-    covariate_matrix_jax = jnp.asarray(covariate_matrix, dtype=compute_jax_dtype)
-    targets_jax = jnp.asarray(targets, dtype=compute_jax_dtype)
-    prior_precision_jax = jnp.asarray(prior_precision, dtype=compute_jax_dtype)
-    predictor_offset_jax = jnp.asarray(predictor_offset_array, dtype=compute_jax_dtype)
-    newton_solver_tolerance, newton_maximum_linear_solver_iterations = _binary_newton_solver_controls(
+    covariate_matrix_f64 = np.asarray(covariate_matrix, dtype=np.float64)
+    target_array = np.asarray(targets, dtype=np.float64).reshape(-1)
+    kappa = target_array - 0.5
+    inexact_solver_tolerance, inexact_maximum_linear_solver_iterations = _binary_newton_solver_controls(
         standardized_genotypes,
         solver_tolerance=solver_tolerance,
         maximum_linear_solver_iterations=maximum_linear_solver_iterations,
     )
-
-    penalized_term_calls = 0
-
-    def penalized_terms(current_parameters: np.ndarray) -> tuple[float, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-        """Compute the penalized log-posterior, its gradient, IRLS weights, and predictions.
-
-        The objective balances two things:
-          - Data fit: how well do the predicted probabilities match actual 0/1 outcomes
-          - Prior penalty: large betas are penalized (more so for small prior variance)
-        """
-        nonlocal penalized_term_calls
-        penalized_term_calls += 1
-        alpha = current_parameters[:covariate_count]
-        beta = current_parameters[covariate_count:]
-        if penalized_term_calls <= 2:
-            log(
-                "      binary penalized_terms diagnostics: "
-                + f"call={penalized_term_calls} alpha_shape={alpha.shape} beta_shape={beta.shape} "
-                + f"covariates_shape={covariate_matrix_jax.shape} targets_shape={targets_jax.shape} "
-                + f"genotype_shape={standardized_genotypes.shape} gpu_cached={standardized_genotypes._cupy_cache is not None} "
-            )
-        # Compute linear predictor on GPU: covariate part via JAX matmul,
-        # genotype part via StandardizedGenotypeMatrix.matvec (already JAX).
-        alpha_jax = jnp.asarray(alpha, dtype=compute_jax_dtype)
-        beta_jax = jnp.asarray(beta, dtype=compute_jax_dtype)
-        linear_predictor_jax = (
-            predictor_offset_jax
-            + covariate_matrix_jax @ alpha_jax
-            + standardized_genotypes.matvec(beta, batch_size=posterior_variance_batch_size)
-        )
-        probabilities_jax = stable_sigmoid(linear_predictor_jax)
-        # IRLS weights: p*(1-p).  Large near p=0.5 (uncertain samples contribute
-        # more to the update), small near 0 or 1 (confident predictions are stable).
-        weights_jax = jnp.maximum(probabilities_jax * (1.0 - probabilities_jax), minimum_weight)
-        residual_jax = targets_jax - probabilities_jax
-        # Gradient computations stay on GPU: covariate part via JAX matmul,
-        # genotype part via transpose_matvec (already JAX).
-        gradient_alpha_jax = covariate_matrix_jax.T @ residual_jax
-        gradient_beta_jax = (
-            standardized_genotypes.transpose_matvec(residual_jax, batch_size=posterior_variance_batch_size)
-            - prior_precision_jax * beta_jax
-        )
-        gradient = np.concatenate(
-            [np.asarray(gradient_alpha_jax, dtype=compute_np_dtype),
-             np.asarray(gradient_beta_jax, dtype=compute_np_dtype)],
-            axis=0,
-        )
-        penalized_log_posterior = float(
-            jnp.sum(targets_jax * jnp.log(probabilities_jax + 1e-12)
-                     + (1.0 - targets_jax) * jnp.log(1.0 - probabilities_jax + 1e-12))
-            - 0.5 * jnp.sum(prior_precision_jax * beta_jax * beta_jax)
-        )
-        # Convert outputs to numpy for the outer Newton loop
-        linear_predictor = np.asarray(linear_predictor_jax, dtype=compute_np_dtype)
-        weights = np.asarray(weights_jax, dtype=compute_np_dtype)
-        probabilities = np.asarray(probabilities_jax, dtype=compute_np_dtype)
-        return penalized_log_posterior, gradient, weights, linear_predictor, probabilities
-
     import time as _time
-    stalled_objective_relative_tolerance = 1e-12
-    cached_terms_parameters: np.ndarray | None = None
-    cached_terms: tuple[float, np.ndarray, np.ndarray, np.ndarray, np.ndarray] | None = None
-    cached_proposal_base_parameters: np.ndarray | None = None
-    cached_proposed_parameters: np.ndarray | None = None
-    cached_newton_direction: np.ndarray | None = None
-    log(f"      Newton trust-region: {standardized_genotypes.shape[1]} variants, max_iter={max_iterations}, damping={damping:.2e}  mem={mem()}")
-    for _iteration_index in range(max_iterations):
-        _newton_t0 = _time.monotonic()
-        if (
-            cached_terms_parameters is not None
-            and cached_terms is not None
-            and np.array_equal(parameters, cached_terms_parameters)
-        ):
-            current_objective, gradient, weights, linear_predictor, probabilities = cached_terms
-            _t_penalized = 0.0
-        else:
-            current_objective, gradient, weights, linear_predictor, probabilities = penalized_terms(parameters)
-            cached_terms_parameters = parameters.copy()
-            cached_terms = (current_objective, gradient, weights, linear_predictor, probabilities)
-            _t_penalized = _time.monotonic() - _newton_t0
-        gradient_norm = float(np.linalg.norm(gradient))
-        if gradient_norm <= gradient_tolerance:
-            log(f"      Newton converged at iter {_iteration_index+1}: grad_norm={gradient_norm:.2e} <= tol={gradient_tolerance:.2e}")
-            break
-        working_response = (
-            linear_predictor
-            + (targets.astype(compute_np_dtype, copy=False) - probabilities) / weights
-            - predictor_offset_array
-        )
-        if (
-            cached_proposal_base_parameters is not None
-            and np.array_equal(parameters, cached_proposal_base_parameters)
-            and cached_proposed_parameters is not None
-            and cached_newton_direction is not None
-        ):
-            proposed_parameters = cached_proposed_parameters
-            newton_direction = cached_newton_direction
-            _t_solve = 0.0
-        else:
-            _t_solve_start = _time.monotonic()
-            proposed_alpha, proposed_beta, _, _projected_targets, _fitted_response, _restricted_quadratic, _logdet_covariance, _logdet_gls = (
-                _restricted_posterior_state(
-                        genotype_matrix=standardized_genotypes,
-                    covariate_matrix=covariate_matrix,
-                    targets=working_response,
-                    prior_variances=prior_variances,
-                    diagonal_noise=1.0 / weights,
-                    solver_tolerance=newton_solver_tolerance,
-                    maximum_linear_solver_iterations=newton_maximum_linear_solver_iterations,
-                    logdet_probe_count=logdet_probe_count,
-                    logdet_lanczos_steps=logdet_lanczos_steps,
-                    exact_solver_matrix_limit=exact_solver_matrix_limit,
-                    posterior_variance_batch_size=posterior_variance_batch_size,
-                    posterior_variance_probe_count=posterior_variance_probe_count,
-                    random_seed=random_seed + _iteration_index,
-                    compute_logdet=False,
-                    compute_beta_variance=False,
-                    initial_beta_guess=parameters[covariate_count:],
-                    sample_space_preconditioner_rank=sample_space_preconditioner_rank,
-                )
+    current_linear_predictor = predictor_offset_array + np.asarray(
+        covariate_matrix_f64 @ parameters[:covariate_count]
+        + standardized_genotypes.matvec(parameters[covariate_count:], batch_size=posterior_variance_batch_size),
+        dtype=np.float64,
+    )
+    current_objective = _binary_penalized_log_posterior(
+        linear_predictor=current_linear_predictor,
+        targets=target_array,
+        prior_precision=prior_precision,
+        beta=parameters[covariate_count:],
+    )
+    log(
+        f"      binary PG updates: {standardized_genotypes.shape[1]} variants, "
+        + f"max_iter={max_iterations}  mem={mem()}"
+    )
+    final_weights = _binary_expected_polya_gamma_weights(current_linear_predictor, minimum_weight)
+    for iteration_index in range(max_iterations):
+        iteration_start = _time.monotonic()
+        current_weights = _binary_expected_polya_gamma_weights(current_linear_predictor, minimum_weight)
+        pseudo_response = kappa / current_weights - predictor_offset_array
+        solve_start = _time.monotonic()
+        updated_alpha, updated_beta, _, _projected_targets, updated_fitted_response, _restricted_quadratic, _logdet_covariance, _logdet_gls = (
+            _restricted_posterior_state(
+                genotype_matrix=standardized_genotypes,
+                covariate_matrix=covariate_matrix,
+                targets=pseudo_response,
+                prior_variances=prior_variances,
+                diagonal_noise=1.0 / current_weights,
+                solver_tolerance=inexact_solver_tolerance,
+                maximum_linear_solver_iterations=inexact_maximum_linear_solver_iterations,
+                logdet_probe_count=logdet_probe_count,
+                logdet_lanczos_steps=logdet_lanczos_steps,
+                exact_solver_matrix_limit=exact_solver_matrix_limit,
+                posterior_variance_batch_size=posterior_variance_batch_size,
+                posterior_variance_probe_count=posterior_variance_probe_count,
+                random_seed=random_seed + iteration_index,
+                compute_logdet=False,
+                compute_beta_variance=False,
+                initial_beta_guess=parameters[covariate_count:],
+                sample_space_preconditioner_rank=sample_space_preconditioner_rank,
             )
-            proposed_parameters = np.concatenate([proposed_alpha, proposed_beta], axis=0)
-            newton_direction = proposed_parameters - parameters
-            cached_proposal_base_parameters = parameters.copy()
-            cached_proposed_parameters = proposed_parameters
-            cached_newton_direction = newton_direction
-            _t_solve = _time.monotonic() - _t_solve_start
-        step_scale = 1.0 / (1.0 + damping)
-        candidate_parameters = parameters + step_scale * newton_direction
-        candidate_objective, _candidate_gradient, _candidate_weights, _candidate_linear_predictor, _candidate_probabilities = penalized_terms(candidate_parameters)
-        _t_total = _time.monotonic() - _newton_t0
-        actual_gain = candidate_objective - current_objective
-        newton_curvature = float(np.dot(gradient, newton_direction))
-        predicted_gain = step_scale * (1.0 - 0.5 * step_scale) * max(newton_curvature, 1e-12)
-        gain_ratio = actual_gain / max(predicted_gain, 1e-8)
-        relative_step_size = float(np.linalg.norm(step_scale * newton_direction)) / max(
+        )
+        solve_seconds = _time.monotonic() - solve_start
+        updated_parameters = np.concatenate([updated_alpha, updated_beta], axis=0).astype(np.float64, copy=False)
+        updated_linear_predictor = predictor_offset_array + np.asarray(updated_fitted_response, dtype=np.float64)
+        updated_objective = _binary_penalized_log_posterior(
+            linear_predictor=updated_linear_predictor,
+            targets=target_array,
+            prior_precision=prior_precision,
+            beta=updated_beta,
+        )
+        relative_parameter_step = float(np.linalg.norm(updated_parameters - parameters)) / max(
             float(np.linalg.norm(parameters)),
             1e-8,
         )
-        accept = np.isfinite(candidate_objective) and actual_gain > 0.0 and gain_ratio >= success_threshold
-        if accept:
-            parameters = candidate_parameters
-            cached_terms_parameters = candidate_parameters.copy()
-            cached_terms = (
-                candidate_objective,
-                _candidate_gradient,
-                _candidate_weights,
-                _candidate_linear_predictor,
-                _candidate_probabilities,
+        relative_predictor_step = float(np.linalg.norm(updated_linear_predictor - current_linear_predictor)) / max(
+            float(np.linalg.norm(current_linear_predictor)),
+            max(np.sqrt(float(updated_linear_predictor.shape[0])), 1.0),
+        )
+        objective_gain = updated_objective - current_objective
+        total_seconds = _time.monotonic() - iteration_start
+        log(
+            f"      binary iter {iteration_index + 1}/{max_iterations}: "
+            + f"obj={updated_objective:.4f} gain={objective_gain:.2e} "
+            + f"param_step={relative_parameter_step:.2e} predictor_step={relative_predictor_step:.2e} "
+            + f"mean_omega={float(np.mean(current_weights)):.3e} "
+            + f"[solve={solve_seconds:.1f}s total={total_seconds:.1f}s]  mem={mem()}"
+        )
+        parameters = updated_parameters
+        current_linear_predictor = updated_linear_predictor
+        current_objective = updated_objective
+        final_weights = current_weights
+        if max(relative_parameter_step, relative_predictor_step) <= gradient_tolerance:
+            log(
+                f"      binary converged at iter {iteration_index + 1}: "
+                + f"step={max(relative_parameter_step, relative_predictor_step):.2e} <= tol={gradient_tolerance:.2e}"
             )
-            cached_proposal_base_parameters = None
-            cached_proposed_parameters = None
-            cached_newton_direction = None
-            damping = max(damping * damping_decrease_factor, minimum_damping)
-            log(f"      Newton iter {_iteration_index+1}/{max_iterations}: ACCEPT  obj={candidate_objective:.4f}  gain={actual_gain:.2e}  ratio={gain_ratio:.3f}  grad={gradient_norm:.2e}  step={relative_step_size:.2e}  damping={damping:.2e}  [penalized={_t_penalized:.1f}s solve={_t_solve:.1f}s total={_t_total:.1f}s]  mem={mem()}")
-            if relative_step_size <= gradient_tolerance:
-                log(f"      Newton converged at iter {_iteration_index+1}: step_size={relative_step_size:.2e} <= tol={gradient_tolerance:.2e}")
-                break
-        else:
-            stalled_objective_tolerance = stalled_objective_relative_tolerance * max(abs(current_objective), 1.0)
-            if (
-                np.isfinite(candidate_objective)
-                and abs(actual_gain) <= stalled_objective_tolerance
-            ):
-                log(
-                    f"      Newton converged at iter {_iteration_index+1}: stalled gain={actual_gain:.2e} "
-                    + f"with step={relative_step_size:.2e}"
-                )
-                break
-            damping *= damping_increase_factor
-            log(f"      Newton iter {_iteration_index+1}/{max_iterations}: REJECT  obj={current_objective:.4f}  cand_obj={candidate_objective:.4f}  gain={actual_gain:.2e}  ratio={gain_ratio:.3f}  grad={gradient_norm:.2e}  step={relative_step_size:.2e}  damping={damping:.2e}  [penalized={_t_penalized:.1f}s solve={_t_solve:.1f}s total={_t_total:.1f}s]  mem={mem()}")
+            break
 
-    final_objective, _final_gradient, final_weights, linear_predictor, probabilities = penalized_terms(parameters)
-    target_values = targets.astype(compute_np_dtype, copy=False)
-    final_working_response = linear_predictor + (target_values - probabilities) / final_weights - predictor_offset_array
-    working_alpha, working_beta, _working_variance, _working_projected_targets, _working_fitted_response, _working_quadratic, _working_logdet_covariance, _working_logdet_gls = (
+    final_pseudo_response = kappa / final_weights - predictor_offset_array
+    final_alpha, final_beta, beta_variance, _projected_targets, _fitted_response, _restricted_quadratic, logdet_covariance, logdet_gls = (
         _restricted_posterior_state(
             genotype_matrix=standardized_genotypes,
             covariate_matrix=covariate_matrix,
-            targets=final_working_response,
-            prior_variances=prior_variances,
-            diagonal_noise=1.0 / final_weights,
-            solver_tolerance=newton_solver_tolerance,
-            maximum_linear_solver_iterations=newton_maximum_linear_solver_iterations,
-            logdet_probe_count=logdet_probe_count,
-            logdet_lanczos_steps=logdet_lanczos_steps,
-            exact_solver_matrix_limit=exact_solver_matrix_limit,
-            posterior_variance_batch_size=posterior_variance_batch_size,
-            posterior_variance_probe_count=posterior_variance_probe_count,
-            random_seed=random_seed + 2 * max_iterations,
-            compute_logdet=False,
-            compute_beta_variance=False,
-            initial_beta_guess=parameters[covariate_count:],
-            sample_space_preconditioner_rank=sample_space_preconditioner_rank,
-        )
-    )
-    working_parameters = np.concatenate([working_alpha, working_beta], axis=0)
-    working_objective, _working_gradient, _working_weights, _working_linear_predictor, _working_probabilities = penalized_terms(working_parameters)
-    if working_objective >= final_objective:
-        parameters = working_parameters
-        final_objective = working_objective
-        final_weights = _working_weights
-        linear_predictor = _working_linear_predictor
-        probabilities = _working_probabilities
-
-    final_working_response = linear_predictor + (target_values - probabilities) / final_weights - predictor_offset_array
-    final_alpha, final_beta, beta_variance, _projected_targets, _fitted_response, _restricted_quadratic, logdet_covariance, logdet_gls = (
-        _restricted_posterior_state(
-                genotype_matrix=standardized_genotypes,
-            covariate_matrix=covariate_matrix,
-            targets=final_working_response,
+            targets=final_pseudo_response,
             prior_variances=prior_variances,
             diagonal_noise=1.0 / final_weights,
             solver_tolerance=solver_tolerance,
@@ -1731,19 +1625,25 @@ def _binary_posterior_state(
             exact_solver_matrix_limit=exact_solver_matrix_limit,
             posterior_variance_batch_size=posterior_variance_batch_size,
             posterior_variance_probe_count=posterior_variance_probe_count,
-            random_seed=random_seed + 2 * max_iterations + 17,
+            random_seed=random_seed + max_iterations + 17,
             compute_logdet=compute_logdet,
             compute_beta_variance=compute_beta_variance,
             initial_beta_guess=parameters[covariate_count:],
             sample_space_preconditioner_rank=sample_space_preconditioner_rank,
         )
     )
-    laplace_weights = np.asarray(final_weights, dtype=compute_np_dtype)
-    final_parameters = np.concatenate([final_alpha, final_beta], axis=0)
-    final_objective, _final_gradient, _final_penalty_weights, linear_predictor, _final_probabilities = penalized_terms(final_parameters)
+    final_linear_predictor = predictor_offset_array + np.asarray(_fitted_response, dtype=np.float64)
+    final_weights = _binary_expected_polya_gamma_weights(final_linear_predictor, minimum_weight)
+    final_parameters = np.concatenate([final_alpha, final_beta], axis=0).astype(np.float64, copy=False)
+    final_objective = _binary_penalized_log_posterior(
+        linear_predictor=final_linear_predictor,
+        targets=target_array,
+        prior_precision=prior_precision,
+        beta=final_beta,
+    )
     logdet_hessian = (
         float(np.sum(np.log(np.maximum(prior_precision, 1e-12))))
-        + float(np.sum(np.log(np.maximum(laplace_weights, 1e-12))))
+        + float(np.sum(np.log(np.maximum(final_weights, 1e-12))))
         + (logdet_covariance + logdet_gls if compute_logdet else 0.0)
     )
     laplace_objective = final_objective - 0.5 * logdet_hessian
@@ -1752,7 +1652,7 @@ def _binary_posterior_state(
         final_parameters[:covariate_count],
         final_parameters[covariate_count:],
         beta_variance,
-        linear_predictor,
+        final_linear_predictor,
         float(laplace_objective),
     )
 
@@ -2879,12 +2779,13 @@ def _restricted_variant_space_diagonal_preconditioner(
     return np.maximum(diagonal, 1e-8)
 
 
-def _posterior_variance_hutchinson_diagonal(
+def _posterior_variance_low_rank_residual_diagonal(
     solve_variant_rhs: Callable[[np.ndarray], np.ndarray],
     dimension: int,
     probe_count: int,
     random_seed: int,
 ) -> np.ndarray:
+    """Estimate diag(A^{-1}) from one batched solve via low-rank + residual probes."""
     if probe_count < 1:
         raise ValueError("probe_count must be positive.")
     if probe_count == 1:
@@ -3163,7 +3064,7 @@ def _restricted_posterior_state(
                     )
                     beta = np.asarray(beta_cp.get(), dtype=np.float64)
                     beta_variance = (
-                        _posterior_variance_hutchinson_diagonal(
+                        _posterior_variance_low_rank_residual_diagonal(
                             solve_variant_rhs=solve_variant_rhs,
                             dimension=variant_count,
                             probe_count=posterior_variance_probe_count,
@@ -3213,7 +3114,7 @@ def _restricted_posterior_state(
                     np.maximum(np.diag(solve_variant_rhs(np.eye(variant_count, dtype=np.float64))), 1e-8)
                     if compute_beta_variance and variant_count <= exact_solver_matrix_limit
                     else (
-                        _posterior_variance_hutchinson_diagonal(
+                        _posterior_variance_low_rank_residual_diagonal(
                             solve_variant_rhs=solve_variant_rhs,
                             dimension=variant_count,
                             probe_count=posterior_variance_probe_count,
@@ -3275,7 +3176,7 @@ def _restricted_posterior_state(
 
             beta = np.asarray(solve_variant_rhs(variant_rhs), dtype=np.float64)
             if compute_beta_variance:
-                beta_variance = _posterior_variance_hutchinson_diagonal(
+                beta_variance = _posterior_variance_low_rank_residual_diagonal(
                     solve_variant_rhs=solve_variant_rhs,
                     dimension=variant_count,
                     probe_count=posterior_variance_probe_count,

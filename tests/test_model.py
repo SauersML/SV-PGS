@@ -159,6 +159,8 @@ def test_fit_resumes_from_variational_checkpoint(tmp_path, monkeypatch):
         validation_data,
         resume_checkpoint=None,
         checkpoint_callback=None,
+        predictor_offset=None,
+        validation_offset=None,
     ):
         completed_iterations = None if resume_checkpoint is None else resume_checkpoint.completed_iterations
         call_log.append(completed_iterations)
@@ -267,6 +269,8 @@ def test_corrupt_variational_checkpoint_is_ignored(tmp_path, monkeypatch):
         validation_data,
         resume_checkpoint=None,
         checkpoint_callback=None,
+        predictor_offset=None,
+        validation_offset=None,
     ):
         observed_resume_values.append(resume_checkpoint)
         return VariationalFitResult(
@@ -427,6 +431,8 @@ def test_fit_uses_cohort_allele_frequencies_for_maf_filter(monkeypatch):
         validation_data,
         resume_checkpoint=None,
         checkpoint_callback=None,
+        predictor_offset=None,
+        validation_offset=None,
     ):
         reduced_count = genotypes.shape[1]
         active_count = len(records)

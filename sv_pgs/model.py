@@ -21,8 +21,6 @@ from sv_pgs.genotype import (
     PlinkRawGenotypeMatrix,
     RawGenotypeMatrix,
     StandardizedGenotypeMatrix,
-    _gpu_materialization_budget_bytes,
-    _try_import_cupy,
     _standardize_batch,
     as_raw_genotype_matrix,
     auto_batch_size,
@@ -54,8 +52,6 @@ class FittedState:
     nonzero_scales: np.ndarray
 
 
-GPU_EXACT_SOLVER_LIMIT = 1_024
-GPU_PRECONDITIONER_RANK_LIMIT = 1_024
 _FIT_STAGE_CACHE_DIRNAME = ".sv_pgs_cache"
 _FIT_STAGE_CACHE_SUBDIR = "fit_stage"
 _FIT_STAGE_CACHE_VERSION = 2
@@ -413,6 +409,26 @@ class BayesianPGS:
 
         log("creating standardized genotype view...")
         standardized_genotypes = raw_genotype_matrix.standardized(prepared_arrays.means, prepared_arrays.scales)
+        if self.config.enable_stage1_null_model:
+            stage1_null_fit = fit_stage1_null_model(
+                standardized_genotypes=standardized_genotypes,
+                covariates=prepared_arrays.covariates,
+                targets=prepared_arrays.targets,
+                variant_records=normalized_records,
+                config=self.config,
+            )
+            stage1_training_offset = np.asarray(stage1_null_fit.linear_predictor, dtype=np.float64)
+        else:
+            stage1_null_fit = NullModelFit(
+                alpha=np.zeros(prepared_arrays.covariates.shape[1], dtype=np.float32),
+                full_coefficients=np.zeros(len(normalized_records), dtype=np.float32),
+                selected_variant_indices=np.zeros(0, dtype=np.int32),
+                linear_predictor=np.zeros(prepared_arrays.targets.shape[0], dtype=np.float32),
+            )
+            stage1_training_offset = None
+        stage1_nonzero_indices, stage1_nonzero_coefficients = _nonzero_coefficient_cache(stage1_null_fit.full_coefficients)
+        stage1_nonzero_means = np.asarray(prepared_arrays.means[stage1_nonzero_indices], dtype=np.float32)
+        stage1_nonzero_scales = np.asarray(prepared_arrays.scales[stage1_nonzero_indices], dtype=np.float32)
         fit_stage_cache_paths = _fit_stage_cache_paths(
             genotype_matrix=raw_genotype_matrix,
             allele_frequencies=np.asarray([record.allele_frequency for record in normalized_records], dtype=np.float32),
@@ -447,20 +463,40 @@ class BayesianPGS:
         if active_variant_indices.size == 0:
             log("no active variants remain after filtering; fitting covariates-only model...")
             reduced_validation_dense: tuple[np.ndarray, np.ndarray, np.ndarray] | None = None
+            validation_stage1_offset = None
             if validation_data is not None:
-                _validation_genotypes, validation_covariates, validation_targets = validation_data
+                validation_genotypes_raw, validation_covariates, validation_targets = validation_data
                 reduced_validation_dense = (
                     np.empty((len(validation_targets), 0), dtype=np.float32),
                     self._with_intercept(np.asarray(validation_covariates, dtype=np.float32)),
                     np.asarray(validation_targets, dtype=np.float32),
                 )
+                validation_stage1_offset = np.asarray(
+                    reduced_validation_dense[1] @ stage1_null_fit.alpha,
+                    dtype=np.float32,
+                )
+                if stage1_nonzero_indices.shape[0] > 0:
+                    validation_stage1_offset += _raw_standardized_subset_matvec(
+                        raw_genotypes=as_raw_genotype_matrix(validation_genotypes_raw),
+                        variant_indices=stage1_nonzero_indices,
+                        means=stage1_nonzero_means,
+                        scales=stage1_nonzero_scales,
+                        coefficients=stage1_nonzero_coefficients,
+                        batch_size=auto_batch_size(as_raw_genotype_matrix(validation_genotypes_raw).shape[0]),
+                    )
             fit_result = _fit_without_active_variants(
                 covariates=prepared_arrays.covariates,
                 targets=prepared_arrays.targets,
                 config=self.config,
                 validation_data=reduced_validation_dense,
+                predictor_offset=stage1_training_offset,
+                validation_offset=validation_stage1_offset,
             )
-            full_coefficients = np.zeros(len(normalized_records), dtype=np.float32)
+            fit_result = replace(
+                fit_result,
+                alpha=np.asarray(fit_result.alpha + stage1_null_fit.alpha, dtype=np.float32),
+            )
+            full_coefficients = np.asarray(stage1_null_fit.full_coefficients, dtype=np.float32)
             nonzero_coefficient_indices, nonzero_coefficients = _nonzero_coefficient_cache(full_coefficients)
             self.state = FittedState(
                 variant_records=normalized_records,
@@ -504,6 +540,7 @@ class BayesianPGS:
         log(f"tie map: {len(active_variant_indices)} active -> {len(reduced_tie_map.kept_indices)} unique ({len(reduced_tie_map.reduced_to_group)} groups)  mem={mem()}")
 
         reduced_validation = None
+        validation_stage1_offset = None
         if validation_data is not None:
             validation_genotypes, validation_covariates, validation_targets = validation_data
             standardized_validation = as_raw_genotype_matrix(validation_genotypes).standardized(
@@ -516,6 +553,19 @@ class BayesianPGS:
                 self._with_intercept(np.asarray(validation_covariates, dtype=np.float32)),
                 np.asarray(validation_targets, dtype=np.float32),
             )
+            validation_stage1_offset = np.asarray(
+                reduced_validation[1] @ stage1_null_fit.alpha,
+                dtype=np.float32,
+            )
+            if stage1_nonzero_indices.shape[0] > 0:
+                validation_stage1_offset += _raw_standardized_subset_matvec(
+                    raw_genotypes=as_raw_genotype_matrix(validation_genotypes),
+                    variant_indices=stage1_nonzero_indices,
+                    means=stage1_nonzero_means,
+                    scales=stage1_nonzero_scales,
+                    coefficients=stage1_nonzero_coefficients,
+                    batch_size=auto_batch_size(as_raw_genotype_matrix(validation_genotypes).shape[0]),
+                )
 
         # Materialize the reduced genotype matrix (RAM or GPU via CuPy).
         in_memory = reduced_genotypes.try_materialize_gpu()
@@ -568,6 +618,8 @@ class BayesianPGS:
                 if fit_stage_cache_paths is None
                 else lambda checkpoint: _save_variational_checkpoint(fit_stage_cache_paths, checkpoint)
             ),
+            predictor_offset=stage1_training_offset,
+            validation_offset=validation_stage1_offset,
         )
         if fit_stage_cache_paths is not None:
             _clear_variational_checkpoint(fit_stage_cache_paths)
@@ -582,8 +634,13 @@ class BayesianPGS:
             fit_result.beta_reduced,
             group_weights=tie_group_weights,
         )
-        full_coefficients = np.zeros(len(normalized_records), dtype=np.float32)
-        full_coefficients[active_variant_indices] = active_coefficients
+        stage2_full_coefficients = np.zeros(len(normalized_records), dtype=np.float32)
+        stage2_full_coefficients[active_variant_indices] = active_coefficients
+        fit_result = replace(
+            fit_result,
+            alpha=np.asarray(fit_result.alpha + stage1_null_fit.alpha, dtype=np.float32),
+        )
+        full_coefficients = np.asarray(stage1_null_fit.full_coefficients + stage2_full_coefficients, dtype=np.float32)
         nonzero_coefficient_indices, nonzero_coefficients = _nonzero_coefficient_cache(full_coefficients)
         nonzero_means = np.asarray(prepared_arrays.means[nonzero_coefficient_indices], dtype=np.float32)
         nonzero_scales = np.asarray(prepared_arrays.scales[nonzero_coefficient_indices], dtype=np.float32)
@@ -777,6 +834,8 @@ def _fit_without_active_variants(
     targets: np.ndarray,
     config: ModelConfig,
     validation_data: tuple[np.ndarray, np.ndarray, np.ndarray] | None,
+    predictor_offset: np.ndarray | None = None,
+    validation_offset: np.ndarray | None = None,
 ) -> VariationalFitResult:
     return fit_variational_em(
         genotypes=np.empty((covariates.shape[0], 0), dtype=np.float32),
@@ -786,6 +845,8 @@ def _fit_without_active_variants(
         config=config,
         tie_map=_empty_tie_map(0),
         validation_data=validation_data,
+        predictor_offset=predictor_offset,
+        validation_offset=validation_offset,
     )
 
 

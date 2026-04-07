@@ -418,7 +418,7 @@ def test_initialize_alpha_state_fits_covariates_for_quantitative():
     np.testing.assert_allclose(alpha_state, np.array([1.0, 2.0], dtype=np.float64), atol=1e-6)
 
 
-def test_binary_posterior_stops_after_stalled_trust_region_step(random_generator, monkeypatch):
+def test_binary_posterior_converges_after_single_latent_gaussian_update(random_generator, monkeypatch):
     sample_count, variant_count = 64, 6
     genotype_matrix = random_generator.standard_normal((sample_count, variant_count)).astype(np.float32)
     standardized = as_raw_genotype_matrix(genotype_matrix).standardized(
@@ -487,7 +487,7 @@ def test_binary_posterior_stops_after_stalled_trust_region_step(random_generator
         minimum_damping=1e-8,
     )
 
-    assert restricted_call_count == 3
+    assert restricted_call_count == 2
     assert alpha.shape == (1,)
     assert beta.shape == (variant_count,)
     assert beta_variance.shape == (variant_count,)
@@ -631,7 +631,7 @@ def test_restricted_posterior_sample_space_merges_probe_rhs(monkeypatch: pytest.
     assert linear_predictor.shape == (sample_count,)
 
 
-def test_binary_posterior_stops_immediately_after_tiny_reject_gain(random_generator, monkeypatch):
+def test_binary_posterior_stops_when_predictor_update_is_stalled(random_generator, monkeypatch):
     sample_count, variant_count = 64, 6
     genotype_matrix = random_generator.standard_normal((sample_count, variant_count)).astype(np.float32)
     standardized = as_raw_genotype_matrix(genotype_matrix).standardized(
@@ -700,84 +700,12 @@ def test_binary_posterior_stops_immediately_after_tiny_reject_gain(random_genera
         minimum_damping=1e-8,
     )
 
-    assert restricted_call_count == 3
+    assert restricted_call_count == 2
     assert alpha.shape == (1,)
     assert beta.shape == (variant_count,)
     assert beta_variance.shape == (variant_count,)
     assert linear_predictor.shape == (sample_count,)
     assert np.isfinite(objective)
-
-
-def test_binary_posterior_reuses_proposal_across_rejects(random_generator, monkeypatch):
-    sample_count, variant_count = 64, 6
-    genotype_matrix = random_generator.standard_normal((sample_count, variant_count)).astype(np.float32)
-    standardized = as_raw_genotype_matrix(genotype_matrix).standardized(
-        means=np.zeros(variant_count, dtype=np.float32),
-        scales=np.ones(variant_count, dtype=np.float32),
-    )
-    standardized._dense_cache = standardized.materialize()
-    covariate_matrix = np.ones((sample_count, 1), dtype=np.float32)
-    targets = np.concatenate(
-        [np.ones(sample_count // 2, dtype=np.float32), np.zeros(sample_count - sample_count // 2, dtype=np.float32)]
-    )
-    prior_variances = np.full(variant_count, 1e-3, dtype=np.float32)
-    restricted_call_count = 0
-
-    def fake_restricted_posterior_state(
-        genotype_matrix,
-        covariate_matrix,
-        targets,
-        prior_variances,
-        diagonal_noise,
-        solver_tolerance,
-        maximum_linear_solver_iterations,
-        logdet_probe_count,
-        logdet_lanczos_steps,
-        exact_solver_matrix_limit,
-        posterior_variance_batch_size,
-        posterior_variance_probe_count,
-        random_seed,
-        compute_logdet,
-        compute_beta_variance=True,
-        initial_beta_guess=None,
-        sample_space_preconditioner_rank=256,
-    ):
-        nonlocal restricted_call_count
-        restricted_call_count += 1
-        alpha = np.zeros(covariate_matrix.shape[1], dtype=np.float64)
-        beta = np.full(prior_variances.shape[0], 100.0, dtype=np.float64)
-        sample_dim = targets.shape[0]
-        return (
-            alpha,
-            beta,
-            np.zeros_like(beta),
-            np.zeros(sample_dim, dtype=np.float64),
-            np.zeros(sample_dim, dtype=np.float64),
-            0.0,
-            0.0,
-            0.0,
-        )
-
-    monkeypatch.setattr(mixture_inference, "_restricted_posterior_state", fake_restricted_posterior_state)
-
-    alpha, beta, beta_variance, linear_predictor, objective = _binary_posterior_state(
-        genotype_matrix=standardized,
-        covariate_matrix=covariate_matrix,
-        targets=targets,
-        prior_variances=prior_variances,
-        alpha_init=np.zeros(1, dtype=np.float32),
-        beta_init=np.zeros(variant_count, dtype=np.float32),
-        minimum_weight=1e-4,
-        max_iterations=5,
-        gradient_tolerance=1e-8,
-        initial_damping=1.0,
-        damping_increase_factor=10.0,
-        damping_decrease_factor=0.1,
-        success_threshold=0.25,
-        minimum_damping=1e-8,
-    )
-
-    assert restricted_call_count == 3
 
 
 def test_binary_newton_solver_controls_relax_large_problem_settings():
@@ -897,11 +825,8 @@ def test_binary_posterior_uses_inexact_solver_controls_before_final_solve(monkey
         maximum_linear_solver_iterations=1024,
     )
 
-    assert solver_settings[:2] == [
-        (7e-4, 33, False, False),
-        (7e-4, 33, False, False),
-    ]
-    assert solver_settings[2] == (1e-6, 1024, True, True)
+    assert solver_settings[0] == (7e-4, 33, False, False)
+    assert solver_settings[1] == (1e-6, 1024, True, True)
 
 
 def test_sample_space_preconditioner_matches_exact_covariance_inverse_at_full_rank():
@@ -1479,7 +1404,7 @@ def test_posterior_variance_diagonal_uses_low_rank_residual_estimator():
         solve_calls.append(rhs.shape)
         return inverse_precision @ rhs
 
-    estimated_diagonal = mixture_inference._posterior_variance_hutchinson_diagonal(
+    estimated_diagonal = mixture_inference._posterior_variance_low_rank_residual_diagonal(
         solve_variant_rhs=solve_variant_rhs,
         dimension=inverse_precision.shape[0],
         probe_count=4,
@@ -1879,6 +1804,7 @@ def test_validation_restores_best_iterate(monkeypatch: pytest.MonkeyPatch):
         config,
         compute_logdet,
         compute_beta_variance=True,
+        predictor_offset=None,
     ):
         call_counter["count"] += 1
         if call_counter["count"] <= config.max_outer_iterations:
@@ -1900,7 +1826,7 @@ def test_validation_restores_best_iterate(monkeypatch: pytest.MonkeyPatch):
             sigma_error2=1.0,
         )
 
-    def fake_validation_metric(trait_type, genotype_matrix, covariate_matrix, targets, alpha, beta):
+    def fake_validation_metric(trait_type, genotype_matrix, covariate_matrix, targets, alpha, beta, predictor_offset=None):
         return float(beta[0])
 
     monkeypatch.setattr(mixture_inference, "_fit_collapsed_posterior", fake_fit_collapsed_posterior)
@@ -1952,6 +1878,7 @@ def test_binary_validation_uses_calibrated_intercept(monkeypatch: pytest.MonkeyP
         config,
         compute_logdet,
         compute_beta_variance=True,
+        predictor_offset=None,
     ):
         return PosteriorState(
             alpha=np.zeros(covariate_matrix.shape[1], dtype=np.float64),
@@ -1962,7 +1889,7 @@ def test_binary_validation_uses_calibrated_intercept(monkeypatch: pytest.MonkeyP
             sigma_error2=1.0,
         )
 
-    def fake_validation_metric(trait_type, genotype_matrix, covariate_matrix, targets, alpha, beta):
+    def fake_validation_metric(trait_type, genotype_matrix, covariate_matrix, targets, alpha, beta, predictor_offset=None):
         validation_alphas.append(np.asarray(alpha, dtype=np.float64).copy())
         return 0.0
 
