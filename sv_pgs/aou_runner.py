@@ -425,6 +425,7 @@ def run_all_of_us(
     # Cache key no longer depends on sample indices — only on VCF content + config.
     cached_chrs = []
     uncached_chrs = []
+    _diag_printed = False
     for chrom in chromosomes:
         vcf_path = _adopt_legacy_sv_vcf_cache(chrom, work_dir)
         if not vcf_path.exists():
@@ -432,6 +433,34 @@ def run_all_of_us(
             continue
         cache_dir = _vcf_cache_dir(vcf_path)
         key = _vcf_cache_key(vcf_path, config)
+        # One-time diagnostic: dump cache dir contents for chr1
+        if not _diag_printed:
+            _diag_printed = True
+            log(f"  DIAG vcf_path={vcf_path}")
+            log(f"  DIAG cache_dir={cache_dir} exists={cache_dir.exists()}")
+            log(f"  DIAG current_key={key}")
+            if cache_dir.exists():
+                import os as _os
+                all_entries = sorted(_os.listdir(cache_dir))
+                log(f"  DIAG cache_dir has {len(all_entries)} entries:")
+                for entry in all_entries[:40]:
+                    full = cache_dir / entry
+                    if full.is_dir():
+                        n_children = len(list(full.iterdir()))
+                        log(f"    DIR  {entry} ({n_children} files)")
+                    else:
+                        log(f"    FILE {entry} ({full.stat().st_size:,} bytes)")
+            # Also check other possible cache locations
+            for alt_dir in [Path("/home/jupyter/hypertension_results/.sv_pgs_cache")]:
+                if alt_dir.exists():
+                    alt_entries = sorted(_os.listdir(alt_dir))
+                    log(f"  DIAG alt_dir={alt_dir} has {len(alt_entries)} entries:")
+                    for entry in alt_entries[:20]:
+                        full = alt_dir / entry
+                        if full.is_dir():
+                            log(f"    DIR  {entry}")
+                        else:
+                            log(f"    FILE {entry} ({full.stat().st_size:,} bytes)")
         has_cache = (cache_dir / f"{key}.genotypes.npy").exists()
         # Also check for legacy cache bundles (old key format)
         if not has_cache and cache_dir.exists():
