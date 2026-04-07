@@ -1849,6 +1849,76 @@ def test_prefer_iterative_variant_space_targets_fast_warm_started_point_estimate
         compute_logdet=False,
         initial_beta_guess=np.zeros(sample_count, dtype=np.float64),
     )
+    streamed = as_raw_genotype_matrix(genotype_values).standardized(
+        means=np.zeros(variant_count, dtype=np.float32),
+        scales=np.ones(variant_count, dtype=np.float32),
+    )
+    assert not _prefer_iterative_variant_space(
+        genotype_matrix=streamed,
+        sample_count=sample_count,
+        variant_count=variant_count,
+        compute_beta_variance=False,
+        compute_logdet=False,
+        initial_beta_guess=np.zeros(variant_count, dtype=np.float64),
+    )
+
+
+def test_restricted_posterior_state_streaming_warm_start_keeps_sample_space_dispatch(monkeypatch: pytest.MonkeyPatch):
+    sample_count, variant_count = 4, 6
+    genotype_values = np.array(
+        [
+            [1.0, 0.0, 1.0, 0.0, 1.0, 0.0],
+            [0.0, 1.0, 1.0, 0.0, 0.0, 1.0],
+            [1.0, 1.0, 0.0, 1.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0, 1.0, 1.0, 0.0],
+        ],
+        dtype=np.float32,
+    )
+    standardized = as_raw_genotype_matrix(genotype_values).standardized(
+        means=np.zeros(variant_count, dtype=np.float32),
+        scales=np.ones(variant_count, dtype=np.float32),
+    )
+    covariate_matrix = np.ones((sample_count, 1), dtype=np.float32)
+    targets = np.array([0.5, -1.0, 0.25, 1.5], dtype=np.float32)
+    prior_variances = np.ones(variant_count, dtype=np.float64)
+    diagonal_noise = np.ones(sample_count, dtype=np.float64)
+
+    def _unexpected_variant_solver(*args, **kwargs):
+        raise AssertionError("streamed warm-started solve should not force iterative variant-space dispatch")
+
+    monkeypatch.setattr(mixture_inference, "_solve_spd_system_variant_space", _unexpected_variant_solver, raising=False)
+    monkeypatch.setattr(mixture_inference, "_try_import_cupy", lambda: None)
+
+    alpha, beta, beta_variance, projected_targets, linear_predictor, restricted_quadratic, logdet_covariance, logdet_gls = (
+        mixture_inference._restricted_posterior_state(
+            genotype_matrix=standardized,
+            covariate_matrix=covariate_matrix,
+            targets=targets,
+            prior_variances=prior_variances,
+            diagonal_noise=diagonal_noise,
+            solver_tolerance=1e-6,
+            maximum_linear_solver_iterations=32,
+            logdet_probe_count=4,
+            logdet_lanczos_steps=8,
+            exact_solver_matrix_limit=2,
+            posterior_variance_batch_size=2,
+            posterior_variance_probe_count=4,
+            random_seed=0,
+            compute_logdet=False,
+            compute_beta_variance=False,
+            initial_beta_guess=np.zeros(variant_count, dtype=np.float64),
+            sample_space_preconditioner_rank=4,
+        )
+    )
+
+    assert alpha.shape == (covariate_matrix.shape[1],)
+    assert beta.shape == (variant_count,)
+    assert beta_variance.shape == (variant_count,)
+    assert projected_targets.shape == (sample_count,)
+    assert linear_predictor.shape == (sample_count,)
+    assert np.isfinite(restricted_quadratic)
+    assert np.isfinite(logdet_covariance)
+    assert np.isfinite(logdet_gls)
 
 
 def test_restricted_variant_space_operator_matmat_matches_columnwise(random_generator):

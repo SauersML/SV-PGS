@@ -2192,7 +2192,7 @@ def _sample_space_nystrom_factor_gpu(
     cupy = _try_import_cupy()
     if cupy is None:
         return None
-    compute_cp_dtype = cupy.float64
+    compute_cp_dtype = _cupy_compute_dtype(cupy)
     sketch_rank = _sample_space_nystrom_rank(rank, genotype_matrix.shape[0])
     if sketch_rank <= 0:
         return None
@@ -2240,6 +2240,57 @@ def _sample_space_nystrom_factor_gpu(
     return basis_gpu @ cupy.asarray(gram_factor, dtype=compute_cp_dtype)
 
 
+def _build_sample_space_low_rank_bundle_gpu(
+    low_rank_factor_gpu,
+    diagonal_preconditioner_gpu,
+    *,
+    cp,
+    bundle_dtype,
+):
+    effective_rank = int(low_rank_factor_gpu.shape[1])
+    weighted_selected_genotypes = cp.asarray(low_rank_factor_gpu, dtype=bundle_dtype)
+    diagonal_vector = cp.asarray(diagonal_preconditioner_gpu, dtype=bundle_dtype)
+    base_diagonal = cp.maximum(
+        diagonal_vector - cp.sum(weighted_selected_genotypes * weighted_selected_genotypes, axis=1),
+        bundle_dtype(1e-8),
+    )
+    inverse_base_diagonal = bundle_dtype(1.0) / base_diagonal
+    weighted_inverse_selected = inverse_base_diagonal[:, None] * weighted_selected_genotypes
+    low_rank_precision = cp.eye(effective_rank, dtype=bundle_dtype) + (
+        weighted_selected_genotypes.T @ weighted_inverse_selected
+    )
+    jitter_scale = 1e-6 if bundle_dtype == cp.float32 else 1e-8
+    low_rank_cholesky = cp.linalg.cholesky(
+        low_rank_precision + cp.eye(effective_rank, dtype=bundle_dtype) * bundle_dtype(jitter_scale)
+    )
+    return weighted_selected_genotypes, inverse_base_diagonal, weighted_inverse_selected, low_rank_cholesky
+
+
+def _apply_sample_space_low_rank_preconditioner_gpu(
+    right_hand_side_gpu,
+    bundle,
+    *,
+    cp,
+    solve_triangular_gpu,
+):
+    weighted_selected_genotypes, inverse_base_diagonal, weighted_inverse_selected, low_rank_cholesky = bundle
+    right_hand_side_gpu = cp.asarray(right_hand_side_gpu, dtype=low_rank_cholesky.dtype)
+    if right_hand_side_gpu.ndim not in (1, 2):
+        raise ValueError("sample-space preconditioner expects a vector or matrix right-hand side.")
+    weighted_rhs = (
+        inverse_base_diagonal[:, None] * right_hand_side_gpu
+        if right_hand_side_gpu.ndim == 2
+        else inverse_base_diagonal * right_hand_side_gpu
+    )
+    correction_rhs = weighted_selected_genotypes.T @ weighted_rhs
+    correction = weighted_inverse_selected @ _gpu_cholesky_solve(
+        correction_rhs,
+        low_rank_cholesky,
+        solve_triangular_gpu,
+    )
+    return weighted_rhs - correction
+
+
 def _sample_space_preconditioner(
     genotype_matrix: StandardizedGenotypeMatrix,
     prior_variances: np.ndarray,
@@ -2273,37 +2324,41 @@ def _sample_space_preconditioner(
         gpu_cache_source = "full" if genotype_matrix._cupy_cache is not None else "streaming"
         effective_rank = int(low_rank_factor_gpu.shape[1])
         log(f"      sample-space preconditioner: GPU Nyström-Woodbury rank={effective_rank} source={gpu_cache_source}")
-        weighted_selected_genotypes = low_rank_factor_gpu.astype(cp.float64, copy=False)
-        base_diagonal = cp.maximum(
-            cp.asarray(diagonal_preconditioner, dtype=cp.float64)
-            - cp.sum(weighted_selected_genotypes * weighted_selected_genotypes, axis=1),
-            cp.float64(1e-8),
+        compute_cp_dtype = _cupy_compute_dtype(cp)
+        diagonal_preconditioner_gpu = cp.asarray(diagonal_preconditioner, dtype=compute_cp_dtype)
+        compute_bundle = _build_sample_space_low_rank_bundle_gpu(
+            low_rank_factor_gpu,
+            diagonal_preconditioner_gpu,
+            cp=cp,
+            bundle_dtype=compute_cp_dtype,
         )
-        inverse_base_diagonal = cp.float64(1.0) / base_diagonal
-        weighted_inverse_selected = inverse_base_diagonal[:, None] * weighted_selected_genotypes
-        low_rank_precision = cp.eye(effective_rank, dtype=cp.float64) + (
-            weighted_selected_genotypes.T @ weighted_inverse_selected
-        )
-        low_rank_cholesky = cp.linalg.cholesky(
-            low_rank_precision + cp.eye(effective_rank, dtype=cp.float64) * cp.float64(1e-8)
-        )
+        float64_bundle = None
 
         def apply_preconditioner_gpu(right_hand_side: jnp.ndarray) -> jnp.ndarray:
-            right_hand_side_gpu = _to_cupy_float64(right_hand_side)
-            if right_hand_side_gpu.ndim not in (1, 2):
-                raise ValueError("sample-space preconditioner expects a vector or matrix right-hand side.")
-            weighted_rhs = (
-                inverse_base_diagonal[:, None] * right_hand_side_gpu
-                if right_hand_side_gpu.ndim == 2
-                else inverse_base_diagonal * right_hand_side_gpu
+            nonlocal float64_bundle
+            right_hand_side_array = np.asarray(right_hand_side)
+            use_float64_bundle = compute_cp_dtype != cp.float64 and right_hand_side_array.dtype == np.float64
+            if use_float64_bundle:
+                if float64_bundle is None:
+                    float64_bundle = _build_sample_space_low_rank_bundle_gpu(
+                        low_rank_factor_gpu,
+                        cp.asarray(diagonal_preconditioner, dtype=cp.float64),
+                        cp=cp,
+                        bundle_dtype=cp.float64,
+                    )
+                bundle = float64_bundle
+                right_hand_side_gpu = _to_cupy_float64(right_hand_side)
+            else:
+                bundle = compute_bundle
+                right_hand_side_gpu = _to_cupy_compute(right_hand_side)
+            return _cupy_to_jax(
+                _apply_sample_space_low_rank_preconditioner_gpu(
+                    right_hand_side_gpu,
+                    bundle,
+                    cp=cp,
+                    solve_triangular_gpu=cp_solve_triangular,
+                )
             )
-            correction_rhs = weighted_selected_genotypes.T @ weighted_rhs
-            correction = weighted_inverse_selected @ _gpu_cholesky_solve(
-                correction_rhs,
-                low_rank_cholesky,
-                cp_solve_triangular,
-            )
-            return _cupy_to_jax(weighted_rhs - correction)
 
         return apply_preconditioner_gpu
     low_rank_factor = _sample_space_nystrom_factor_cpu(
@@ -2353,19 +2408,23 @@ def _sample_space_gpu_preconditioner(
     import cupy as cp
     from cupyx.scipy.linalg import solve_triangular as cp_solve_triangular
 
+    compute_cp_dtype = _cupy_compute_dtype(cp)
     diagonal_preconditioner = _sample_space_diagonal_preconditioner(
         genotype_matrix=genotype_matrix,
         prior_variances=prior_variances,
         diagonal_noise=diagonal_noise,
         batch_size=batch_size,
     )
-    diagonal_preconditioner_gpu = cp.asarray(diagonal_preconditioner, dtype=cp.float64)
+    diagonal_preconditioner_gpu = cp.asarray(diagonal_preconditioner, dtype=compute_cp_dtype)
 
     def apply_diagonal(right_hand_side_gpu):
-        right_hand_side_gpu = cp.asarray(right_hand_side_gpu, dtype=cp.float64)
+        rhs_dtype = getattr(right_hand_side_gpu, "dtype", compute_cp_dtype)
+        resolved_dtype = cp.float64 if compute_cp_dtype != cp.float64 and rhs_dtype == cp.float64 else compute_cp_dtype
+        right_hand_side_gpu = cp.asarray(right_hand_side_gpu, dtype=resolved_dtype)
+        diagonal_vector = diagonal_preconditioner_gpu.astype(resolved_dtype, copy=False)
         if right_hand_side_gpu.ndim == 2:
-            return right_hand_side_gpu / diagonal_preconditioner_gpu[:, None]
-        return right_hand_side_gpu / diagonal_preconditioner_gpu
+            return right_hand_side_gpu / diagonal_vector[:, None]
+        return right_hand_side_gpu / diagonal_vector
 
     if rank <= 0:
         return apply_diagonal
@@ -2385,41 +2444,34 @@ def _sample_space_gpu_preconditioner(
     gpu_cache_source = "full" if genotype_matrix._cupy_cache is not None else "streaming"
     effective_rank = int(low_rank_factor_gpu.shape[1])
     log(f"      sample-space preconditioner: GPU Nyström-Woodbury rank={effective_rank} source={gpu_cache_source}")
-    def build_low_rank_bundle():
-        weighted_selected_genotypes = low_rank_factor_gpu.astype(cp.float64, copy=False)
-        base_diagonal = cp.maximum(
-            diagonal_preconditioner_gpu
-            - cp.sum(weighted_selected_genotypes * weighted_selected_genotypes, axis=1),
-            cp.float64(1e-8),
-        )
-        inverse_base_diagonal = cp.float64(1.0) / base_diagonal
-        weighted_inverse_selected = inverse_base_diagonal[:, None] * weighted_selected_genotypes
-        low_rank_precision = cp.eye(effective_rank, dtype=cp.float64) + (
-            weighted_selected_genotypes.T @ weighted_inverse_selected
-        )
-        low_rank_cholesky = cp.linalg.cholesky(
-            low_rank_precision + cp.eye(effective_rank, dtype=cp.float64) * cp.float64(1e-8)
-        )
-        return weighted_selected_genotypes, inverse_base_diagonal, weighted_inverse_selected, low_rank_cholesky
-
-    weighted_selected_genotypes, inverse_base_diagonal, weighted_inverse_selected, low_rank_cholesky = build_low_rank_bundle()
+    compute_bundle = _build_sample_space_low_rank_bundle_gpu(
+        low_rank_factor_gpu,
+        diagonal_preconditioner_gpu,
+        cp=cp,
+        bundle_dtype=compute_cp_dtype,
+    )
+    float64_bundle = None
 
     def apply_low_rank(right_hand_side_gpu):
-        if right_hand_side_gpu.ndim not in (1, 2):
-            raise ValueError("sample-space preconditioner expects a vector or matrix right-hand side.")
-        right_hand_side_gpu = cp.asarray(right_hand_side_gpu, dtype=cp.float64)
-        weighted_rhs = (
-            inverse_base_diagonal[:, None] * right_hand_side_gpu
-            if right_hand_side_gpu.ndim == 2
-            else inverse_base_diagonal * right_hand_side_gpu
+        nonlocal float64_bundle
+        rhs_dtype = getattr(right_hand_side_gpu, "dtype", compute_cp_dtype)
+        if compute_cp_dtype != cp.float64 and rhs_dtype == cp.float64:
+            if float64_bundle is None:
+                float64_bundle = _build_sample_space_low_rank_bundle_gpu(
+                    low_rank_factor_gpu,
+                    cp.asarray(diagonal_preconditioner, dtype=cp.float64),
+                    cp=cp,
+                    bundle_dtype=cp.float64,
+                )
+            bundle = float64_bundle
+        else:
+            bundle = compute_bundle
+        return _apply_sample_space_low_rank_preconditioner_gpu(
+            right_hand_side_gpu,
+            bundle,
+            cp=cp,
+            solve_triangular_gpu=cp_solve_triangular,
         )
-        correction_rhs = weighted_selected_genotypes.T @ weighted_rhs
-        correction = weighted_inverse_selected @ _gpu_cholesky_solve(
-            correction_rhs,
-            low_rank_cholesky,
-            cp_solve_triangular,
-        )
-        return weighted_rhs - correction
 
     return apply_low_rank
 
@@ -2577,6 +2629,14 @@ def _prefer_iterative_variant_space(
     compute_logdet: bool,
     initial_beta_guess: np.ndarray | None,
 ) -> bool:
+    streaming_matrix = (
+        genotype_matrix._cupy_cache is None
+        and genotype_matrix._dense_cache is None
+        and genotype_matrix._jax_cache is None
+        and genotype_matrix.raw is not None
+    )
+    if streaming_matrix:
+        return False
     return (
         not compute_beta_variance
         and

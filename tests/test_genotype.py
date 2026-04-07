@@ -910,3 +910,85 @@ def test_dense_materialized_genotype_ops_are_jax_traceable():
         np.asarray(jit_transpose_matvec(sample_vector), dtype=np.float64),
         np.asarray(standardized.materialize(), dtype=np.float64).T @ np.asarray(sample_vector, dtype=np.float64),
     )
+
+
+def test_hybrid_standardized_operator_matches_dense_reference(monkeypatch: pytest.MonkeyPatch):
+    raw_i8 = np.array(
+        [
+            [0, 1, genotype_module.PLINK_MISSING_INT8, 2, 0, 1],
+            [1, 1, 0, 1, 2, 0],
+            [0, 2, 1, 0, 1, genotype_module.PLINK_MISSING_INT8],
+            [0, 0, 0, 2, 1, 0],
+        ],
+        dtype=np.int8,
+    )
+    raw_float = raw_i8.astype(np.float32)
+    raw_float[raw_i8 == genotype_module.PLINK_MISSING_INT8] = np.nan
+    means = np.nanmean(raw_float, axis=0).astype(np.float32)
+    scales = np.maximum(np.nanstd(raw_float, axis=0), 0.25).astype(np.float32)
+    support_counts = np.array([1, 3, 1, 3, 3, 1], dtype=np.int32)
+    coefficients = np.array([0.5, -0.25, 1.0, 0.75, -0.5, 0.125], dtype=np.float64)
+    variant_matrix = np.array(
+        [
+            [0.5, -1.0],
+            [1.0, 0.25],
+            [-0.5, 0.75],
+            [0.25, -0.5],
+            [1.5, 0.5],
+            [-1.25, 1.0],
+        ],
+        dtype=np.float64,
+    )
+    sample_vector = np.array([1.0, -0.75, 0.5, 1.25], dtype=np.float64)
+    sample_matrix = np.column_stack([sample_vector, sample_vector * -0.5]).astype(np.float64)
+
+    monkeypatch.setattr(genotype_module, "HYBRID_SPARSE_SUPPORT_THRESHOLD", 1)
+    monkeypatch.setattr(genotype_module, "HYBRID_SPARSE_MIN_VARIANT_COUNT", 1)
+
+    raw = _SpyInt8StreamingRawGenotypeMatrix(raw_i8)
+    hybrid = raw.standardized(means, scales, support_counts=support_counts)
+    dense = as_raw_genotype_matrix(raw_float).standardized(means, scales)
+
+    assert hybrid._uses_hybrid_backend() is True
+    assert hybrid._sparse_backend is not None
+    assert hybrid._dense_backend is not None
+    assert raw.float_requests == []
+
+    np.testing.assert_allclose(
+        np.asarray(hybrid.matvec(coefficients, batch_size=2), dtype=np.float64),
+        np.asarray(dense.matvec(coefficients, batch_size=2), dtype=np.float64),
+        rtol=1e-5,
+        atol=1e-5,
+    )
+    np.testing.assert_allclose(
+        np.asarray(hybrid.matmat(variant_matrix, batch_size=2), dtype=np.float64),
+        np.asarray(dense.matmat(variant_matrix, batch_size=2), dtype=np.float64),
+        rtol=1e-5,
+        atol=1e-5,
+    )
+    np.testing.assert_allclose(
+        np.asarray(hybrid.transpose_matvec(sample_vector, batch_size=2), dtype=np.float64),
+        np.asarray(dense.transpose_matvec(sample_vector, batch_size=2), dtype=np.float64),
+        rtol=1e-5,
+        atol=1e-5,
+    )
+    np.testing.assert_allclose(
+        np.asarray(hybrid.transpose_matmat(sample_matrix, batch_size=2), dtype=np.float64),
+        np.asarray(dense.transpose_matmat(sample_matrix, batch_size=2), dtype=np.float64),
+        rtol=1e-5,
+        atol=1e-5,
+    )
+
+    raw.i8_requests.clear()
+    subset = hybrid.subset(np.array([5, 1, 0, 3], dtype=np.int32))
+    assert raw.i8_requests == []
+    batches = list(subset.iter_column_batches(batch_size=2))
+
+    assert [batch.variant_indices.tolist() for batch in batches] == [[0, 1], [2, 3]]
+    np.testing.assert_allclose(
+        np.concatenate([np.asarray(batch.values, dtype=np.float32) for batch in batches], axis=1),
+        dense.subset(np.array([5, 1, 0, 3], dtype=np.int32)).materialize(batch_size=2),
+        rtol=1e-5,
+        atol=1e-5,
+    )
+    assert raw.float_requests == []
