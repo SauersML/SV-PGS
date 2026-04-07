@@ -2951,9 +2951,14 @@ def _solve_sample_space_rhs_gpu_inner(
 
 
 def _resolve_sample_space_solve_result(result, *, fallback_iterations: int) -> tuple[Any, int]:
-    if isinstance(result, tuple) and len(result) == 2:
-        return result[0], int(result[1])
-    return result, int(fallback_iterations)
+    resolved_result = result
+    total_iterations = 0
+    while isinstance(resolved_result, tuple) and len(resolved_result) == 2 and isinstance(resolved_result[1], (int, np.integer)):
+        total_iterations += int(resolved_result[1])
+        resolved_result = resolved_result[0]
+    if total_iterations == 0:
+        total_iterations = int(fallback_iterations)
+    return resolved_result, total_iterations
 
 
 def _effective_sample_space_preconditioner_rank(

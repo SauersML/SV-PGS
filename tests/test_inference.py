@@ -568,6 +568,7 @@ def test_binary_posterior_converges_after_single_latent_gaussian_update(random_g
         initial_beta_guess=None,
         sample_space_preconditioner_rank=256,
         warm_start=None,
+        **_kwargs,
     ):
         nonlocal restricted_call_count
         restricted_call_count += 1
@@ -714,12 +715,13 @@ def test_restricted_posterior_sample_space_merges_probe_rhs(monkeypatch: pytest.
         max_iterations,
         preconditioner,
         batch_size,
+        return_iterations=False,
     ):
         rhs = np.asarray(right_hand_side, dtype=np.float64)
         if rhs.ndim == 1:
             rhs = rhs[:, None]
         solve_rhs_shapes.append(rhs.shape)
-        return rhs
+        return (rhs, 3) if return_iterations else rhs
 
     monkeypatch.setattr(mixture_inference, "_solve_sample_space_rhs_cpu", fake_solve_sample_space_rhs_cpu)
 
@@ -798,12 +800,13 @@ def test_restricted_posterior_sample_space_reuses_matching_warm_start(monkeypatc
         max_iterations,
         preconditioner,
         batch_size,
+        return_iterations=False,
     ):
         rhs = np.asarray(right_hand_side, dtype=np.float64)
         if rhs.ndim == 1:
             rhs = rhs[:, None]
         initial_guess_shapes.append(None if initial_guess is None else tuple(np.asarray(initial_guess).shape))
-        return rhs
+        return (rhs, 3) if return_iterations else rhs
 
     monkeypatch.setattr(mixture_inference, "_solve_sample_space_rhs_cpu", fake_solve_sample_space_rhs_cpu)
 
@@ -828,6 +831,158 @@ def test_restricted_posterior_sample_space_reuses_matching_warm_start(monkeypatc
     )
 
     assert initial_guess_shapes == [(sample_count, 1 + covariate_matrix.shape[1] + 5)]
+
+
+def test_stochastic_restricted_cross_leverage_diagonal_caches_fixed_probe_projection(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    sample_count, variant_count = 6, 4
+    genotype_values = np.array(
+        [
+            [0.0, 1.0, 2.0, 0.0],
+            [1.0, 0.0, 1.0, 2.0],
+            [2.0, 1.0, 0.0, 1.0],
+            [1.0, 2.0, 1.0, 0.0],
+            [0.0, 1.0, 1.0, 2.0],
+            [2.0, 0.0, 2.0, 1.0],
+        ],
+        dtype=np.float32,
+    )
+    standardized = as_raw_genotype_matrix(genotype_values).standardized(
+        means=np.mean(genotype_values, axis=0, dtype=np.float32),
+        scales=np.std(genotype_values, axis=0, dtype=np.float32) + 1e-3,
+    )
+    covariate_matrix = np.ones((sample_count, 1), dtype=np.float64)
+    sample_probes = _orthogonal_probe_matrix(
+        dimension=sample_count,
+        probe_count=3,
+        random_seed=11,
+    )
+    inverse_covariance_probe_matrix = sample_probes * 0.5
+    inverse_covariance_covariates = np.ones((sample_count, 1), dtype=np.float64) * 0.1
+    gls_cholesky = np.linalg.cholesky(covariate_matrix.T @ covariate_matrix + np.eye(1, dtype=np.float64) * 1e-8)
+
+    transpose_probe_counts = {"fixed": 0, "restricted": 0}
+    original_transpose_matmat = type(standardized).transpose_matmat
+
+    def counting_transpose_matmat(self, matrix, batch_size):
+        matrix_array = np.asarray(matrix, dtype=np.float64)
+        if self is standardized and np.allclose(matrix_array, sample_probes):
+            transpose_probe_counts["fixed"] += 1
+        elif self is standardized:
+            transpose_probe_counts["restricted"] += 1
+        return original_transpose_matmat(self, matrix, batch_size=batch_size)
+
+    monkeypatch.setattr(type(standardized), "transpose_matmat", counting_transpose_matmat)
+
+    expected = mixture_inference._stochastic_restricted_cross_leverage_diagonal(
+        genotype_matrix=standardized,
+        covariate_matrix=covariate_matrix,
+        solve_rhs=lambda rhs: rhs,
+        inverse_covariance_covariates=inverse_covariance_covariates,
+        gls_cholesky=gls_cholesky,
+        batch_size=2,
+        probe_count=sample_probes.shape[1],
+        random_seed=11,
+        sample_probes=sample_probes,
+        inverse_covariance_probe_matrix=inverse_covariance_probe_matrix,
+    )
+    actual = mixture_inference._stochastic_restricted_cross_leverage_diagonal(
+        genotype_matrix=standardized,
+        covariate_matrix=covariate_matrix,
+        solve_rhs=lambda rhs: rhs,
+        inverse_covariance_covariates=inverse_covariance_covariates,
+        gls_cholesky=gls_cholesky,
+        batch_size=2,
+        probe_count=sample_probes.shape[1],
+        random_seed=11,
+        sample_probes=sample_probes,
+        inverse_covariance_probe_matrix=inverse_covariance_probe_matrix,
+    )
+
+    np.testing.assert_allclose(actual, expected, rtol=1e-7, atol=1e-7)
+    assert transpose_probe_counts["fixed"] == 1
+    assert transpose_probe_counts["restricted"] == 2
+
+
+def test_restricted_posterior_sample_space_reuses_preconditioner_until_iterations_blow_up(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    sample_count, variant_count = 6, 7
+    genotype_values = np.array(
+        [
+            [0.0, 1.0, 2.0, 0.0, 1.0, 2.0, 0.0],
+            [1.0, 0.0, 1.0, 2.0, 0.0, 1.0, 2.0],
+            [2.0, 1.0, 0.0, 1.0, 2.0, 0.0, 1.0],
+            [1.0, 2.0, 1.0, 0.0, 1.0, 2.0, 1.0],
+            [0.0, 1.0, 1.0, 2.0, 1.0, 0.0, 2.0],
+            [2.0, 0.0, 2.0, 1.0, 0.0, 2.0, 1.0],
+        ],
+        dtype=np.float32,
+    )
+    standardized = as_raw_genotype_matrix(genotype_values).standardized(
+        means=np.mean(genotype_values, axis=0, dtype=np.float32),
+        scales=np.std(genotype_values, axis=0, dtype=np.float32) + 1e-3,
+    )
+    covariate_matrix = np.column_stack(
+        [
+            np.ones(sample_count, dtype=np.float64),
+            np.linspace(-1.0, 1.0, sample_count, dtype=np.float64),
+        ]
+    )
+    targets = np.linspace(-0.5, 0.75, sample_count, dtype=np.float64)
+    prior_variances = np.linspace(0.5, 1.1, variant_count, dtype=np.float64)
+    diagonal_noise = np.linspace(0.8, 1.3, sample_count, dtype=np.float64)
+    built_preconditioners: list[object] = []
+    iteration_sequence = iter([4, 20, 5])
+
+    def fake_sample_space_preconditioner(**kwargs):
+        preconditioner = object()
+        built_preconditioners.append(preconditioner)
+        return preconditioner
+
+    def fake_solve_sample_space_rhs_cpu(
+        genotype_matrix,
+        prior_variances,
+        diagonal_noise,
+        right_hand_side,
+        initial_guess,
+        tolerance,
+        max_iterations,
+        preconditioner,
+        batch_size,
+        return_iterations=False,
+    ):
+        rhs = np.asarray(right_hand_side, dtype=np.float64)
+        if rhs.ndim == 1:
+            rhs = rhs[:, None]
+        iterations_used = next(iteration_sequence)
+        return (rhs, iterations_used) if return_iterations else rhs
+
+    monkeypatch.setattr(mixture_inference, "_sample_space_preconditioner", fake_sample_space_preconditioner)
+    monkeypatch.setattr(mixture_inference, "_solve_sample_space_rhs_cpu", fake_solve_sample_space_rhs_cpu)
+
+    for _ in range(3):
+        mixture_inference._restricted_posterior_state(
+            genotype_matrix=standardized,
+            covariate_matrix=covariate_matrix,
+            targets=targets,
+            prior_variances=prior_variances,
+            diagonal_noise=diagonal_noise,
+            solver_tolerance=1e-6,
+            maximum_linear_solver_iterations=32,
+            logdet_probe_count=2,
+            logdet_lanczos_steps=4,
+            exact_solver_matrix_limit=2,
+            posterior_variance_batch_size=3,
+            posterior_variance_probe_count=5,
+            random_seed=7,
+            compute_logdet=False,
+            compute_beta_variance=False,
+            sample_space_preconditioner_rank=0,
+        )
+
+    assert len(built_preconditioners) == 2
 
 
 def test_binary_posterior_stops_when_predictor_update_is_stalled(random_generator, monkeypatch):
@@ -864,6 +1019,7 @@ def test_binary_posterior_stops_when_predictor_update_is_stalled(random_generato
         initial_beta_guess=None,
         sample_space_preconditioner_rank=256,
         warm_start=None,
+        **_kwargs,
     ):
         nonlocal restricted_call_count
         restricted_call_count += 1
@@ -982,6 +1138,7 @@ def test_binary_posterior_uses_inexact_solver_controls_before_final_solve(monkey
         initial_beta_guess=None,
         sample_space_preconditioner_rank=256,
         warm_start=None,
+        **_kwargs,
     ):
         solver_settings.append(
             (
@@ -2488,6 +2645,7 @@ def test_variational_em_reuses_beta_variance_between_refreshes(monkeypatch: pyte
     config = ModelConfig(
         trait_type=TraitType.QUANTITATIVE,
         max_outer_iterations=5,
+        convergence_tolerance=0.0,
         update_hyperparameters=False,
         beta_variance_update_interval=4,
         stochastic_variational_updates=False,
