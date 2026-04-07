@@ -644,16 +644,22 @@ class BayesianPGS:
             )
 
         # Materialize the reduced genotype matrix (RAM or GPU via CuPy).
+        log(f"materializing reduced genotype matrix ({reduced_genotypes.shape})...")
         in_memory = reduced_genotypes.try_materialize_gpu()
+        if in_memory:
+            log(f"  GPU materialization succeeded  mem={mem()}")
         if not in_memory:
             in_memory = reduced_genotypes.try_materialize()
+            if in_memory:
+                log(f"  RAM materialization succeeded  mem={mem()}")
         if in_memory:
-            # After materialization, reduced_genotypes no longer needs raw.
             reduced_genotypes.release_raw_storage()
         else:
             if not local_cache and fit_stage_cache_paths is not None:
+                log(f"  persisting reduced int8 genotypes to disk...")
                 local_cache = reduced_genotypes.try_cache_persistently(fit_stage_cache_paths.reduced_raw_i8_path)
                 if local_cache:
+                    log(f"  persistent int8 cache saved  mem={mem()}")
                     _write_fit_stage_cache_manifest(
                         cache_paths=fit_stage_cache_paths,
                         active_variant_count=int(active_variant_indices.shape[0]),
@@ -662,19 +668,24 @@ class BayesianPGS:
                     )
             if not local_cache:
                 local_cache = reduced_genotypes.try_cache_locally()
+                if local_cache:
+                    log(f"  local tmpdir cache ready  mem={mem()}")
             if not local_cache:
-                log("keeping reduced genotype matrix streaming (no RAM/GPU/local cache)  mem=" + mem())
+                log(f"  no materialization possible — streaming from mmap  mem={mem()}")
+        log(f"  freeing intermediate data...")
         del raw_genotype_matrix, standardized_genotypes, active_genotypes
         import gc
         gc.collect()
-        log(f"memory freed after materialization  mem={mem()}")
+        log(f"  done. mem={mem()}")
         if fit_stage_cache_paths is not None and int(self.config.sample_space_preconditioner_rank) > 0:
+            log("  restoring preconditioner basis cache...")
             _try_restore_sample_space_basis_cache(
                 cache_paths=fit_stage_cache_paths,
                 genotype_matrix=reduced_genotypes,
                 rank=int(self.config.sample_space_preconditioner_rank),
                 random_seed=int(self.config.random_seed),
             )
+            log(f"  preconditioner cache restored  mem={mem()}")
         log(
             f"starting variational EM  max_iterations={self.config.max_outer_iterations}  "
             f"reduced_matrix={reduced_genotypes.shape}  in_memory={in_memory}  "
@@ -682,11 +693,13 @@ class BayesianPGS:
             f"on_gpu={reduced_genotypes._cupy_cache is not None}  "
             f"mem={mem()}"
         )
+        log("  checking for EM checkpoint to resume from...")
         resume_checkpoint = (
             None
             if fit_stage_cache_paths is None
             else _try_load_variational_checkpoint(fit_stage_cache_paths)
         )
+        log(f"  EM checkpoint: {'found — resuming' if resume_checkpoint else 'none — starting fresh'}")
         fit_result = fit_variational_em(
             genotypes=reduced_genotypes,
             covariates=prepared_arrays.covariates,
