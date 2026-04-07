@@ -419,7 +419,7 @@ def run_all_of_us(
     # but reading fingerprint from the current file) and symlink into the new dir.
     from sv_pgs.io import (
         _vcf_cache_dir, _vcf_cache_key, _vcf_cache_paths,
-        _is_vcf_cache_bundle_complete, _find_any_complete_vcf_cache,
+        _is_vcf_cache_bundle_complete, _find_matching_complete_vcf_cache,
         _cache_file_fingerprint, _CACHE_VERSION,
     )
     old_vcf_cache_dir = work_dir / ".sv_pgs_cache"
@@ -508,7 +508,7 @@ def run_all_of_us(
         has_cache = (cache_dir / f"{key}.genotypes.npy").exists()
         # Also check for legacy cache bundles (old key format)
         if not has_cache and cache_dir.exists():
-            legacy = _find_any_complete_vcf_cache(cache_dir)
+            legacy = _find_matching_complete_vcf_cache(cache_dir, vcf_path=vcf_path, config=config, expected_chromosome=str(chrom))
             has_cache = legacy is not None
         has_partial = (cache_dir / f"{key}.inc.progress.json").exists() if cache_dir.exists() else False
         has_tmp = any(cache_dir.glob("*.tmp_parallel")) if cache_dir.exists() else False

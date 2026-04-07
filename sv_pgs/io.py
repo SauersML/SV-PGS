@@ -398,8 +398,9 @@ def load_dataset_from_files(
             config=config,
             mmap_mode="r",
         )
-        # Subset to matched samples (skip if cache was already subsetted to this exact set)
-        if genotype_matrix.shape[0] != len(keep_indices):
+        expected_source_order = np.arange(len(source_sample_ids), dtype=np.intp)
+        # Reorder whenever the phenotype-aligned sample order differs from the VCF header order.
+        if genotype_matrix.shape[0] != len(keep_indices) or not np.array_equal(keep_indices, expected_source_order):
             genotype_matrix = genotype_matrix[keep_indices, :]
 
         log(f"VCF loaded: {genotype_matrix.shape[0]} samples x {len(default_variants)} variants  mem={mem()}")
@@ -583,8 +584,8 @@ def load_multi_vcf_dataset_from_files(
             config=config,
             mmap_mode="r",
         )
-        # Subset to matched samples (skip if cache was already subsetted to this exact set)
-        if genotype_matrix.shape[0] != len(keep_sample_indices):
+        expected_source_order = np.arange(len(source_sample_ids), dtype=np.intp)
+        if genotype_matrix.shape[0] != len(keep_sample_indices) or not np.array_equal(keep_sample_indices, expected_source_order):
             genotype_matrix = genotype_matrix[keep_sample_indices, :]
         raw_matrices.append(as_raw_genotype_matrix(genotype_matrix))
         default_variants.extend(chromosome_variants)
@@ -897,6 +898,13 @@ def _vcf_cache_key(vcf_path: Path, config: ModelConfig) -> str:
     return h.hexdigest()[:24]
 
 
+def _vcf_cache_source_signature(vcf_path: Path) -> str:
+    h = hashlib.sha256()
+    h.update(str(vcf_path.resolve()).encode())
+    h.update(_cache_file_fingerprint(vcf_path))
+    return h.hexdigest()
+
+
 def _vcf_cache_dir(vcf_path: Path) -> Path:
     return vcf_path.resolve().parent / _CACHE_DIR_NAME
 
@@ -952,6 +960,7 @@ def _write_vcf_cache_manifest(
     sample_count: int,
     variant_count: int,
     stats_file: str,
+    source_signature: str,
 ) -> None:
     _atomic_write_text(
         manifest_path,
@@ -963,6 +972,7 @@ def _write_vcf_cache_manifest(
                 "dtype": "int8",
                 "fortran_order": True,
                 "stats_file": stats_file,
+                "source_signature": source_signature,
             }
         ),
     )
@@ -1029,6 +1039,8 @@ def _upgrade_legacy_vcf_cache_bundle(
     paths: _VcfCachePaths,
     genotype_matrix: np.ndarray,
     variant_stats: VariantStatistics,
+    *,
+    vcf_path: Path,
 ) -> None:
     created_stats = False
     try:
@@ -1042,6 +1054,7 @@ def _upgrade_legacy_vcf_cache_bundle(
             sample_count=int(genotype_matrix.shape[0]),
             variant_count=int(genotype_matrix.shape[1]),
             stats_file=paths.stats_path.name,
+            source_signature=_vcf_cache_source_signature(vcf_path),
         )
     except Exception:
         try:
@@ -1055,14 +1068,23 @@ def _upgrade_legacy_vcf_cache_bundle(
                 pass
 
 
-def _find_any_complete_vcf_cache(cache_dir: Path) -> _VcfCachePaths | None:
-    """Scan a cache directory for ANY complete cache bundle (legacy or current key).
+def _find_matching_complete_vcf_cache(
+    cache_dir: Path,
+    *,
+    vcf_path: Path,
+    config: ModelConfig,
+    expected_chromosome: str | None = None,
+) -> _VcfCachePaths | None:
+    """Find a complete cache bundle that matches the given VCF.
 
-    This allows reusing caches created with an older key format (e.g. when
-    keep_sample_indices was part of the key) even though the current key is different.
-    Scans for .genotypes.npy files (which ALL cache bundles have), not just
-    manifests, so it also finds pre-manifest legacy caches.
+    Matching priority:
+    1. Exact current key match
+    2. source_signature match (same path + content)
+    3. Chromosome match via variants.pkl (for caches created at a different path)
     """
+    current_key = _vcf_cache_key(vcf_path, config)
+    source_signature = _vcf_cache_source_signature(vcf_path)
+    # First pass: exact key or source_signature match
     for geno_file in sorted(cache_dir.glob("*.genotypes.npy")):
         key = geno_file.name.removesuffix(".genotypes.npy")
         candidate = _VcfCachePaths(
@@ -1074,8 +1096,39 @@ def _find_any_complete_vcf_cache(cache_dir: Path) -> _VcfCachePaths | None:
             legacy_stats_path=cache_dir / f"{key}.stats.npz",
             manifest_path=cache_dir / f"{key}.manifest.json",
         )
-        if _is_vcf_cache_bundle_complete(candidate):
+        if not _is_vcf_cache_bundle_complete(candidate):
+            continue
+        if key == current_key:
             return candidate
+        manifest = _load_vcf_cache_manifest(candidate.manifest_path)
+        if manifest is not None and str(manifest.get("source_signature", "")) == source_signature:
+            return candidate
+    # Second pass: match by chromosome from variants.pkl (handles VCF path changes)
+    if expected_chromosome is not None:
+        # Normalize: strip "chr" prefix for comparison
+        norm_expected = str(expected_chromosome).replace("chr", "")
+        for geno_file in sorted(cache_dir.glob("*.genotypes.npy")):
+            key = geno_file.name.removesuffix(".genotypes.npy")
+            candidate = _VcfCachePaths(
+                key=key,
+                cache_dir=cache_dir,
+                geno_path=geno_file,
+                var_path=cache_dir / f"{key}.variants.pkl",
+                stats_path=cache_dir / f"{key}.stats.npy",
+                legacy_stats_path=cache_dir / f"{key}.stats.npz",
+                manifest_path=cache_dir / f"{key}.manifest.json",
+            )
+            if not _is_vcf_cache_bundle_complete(candidate):
+                continue
+            try:
+                with open(candidate.var_path, "rb") as f:
+                    variants = pickle.load(f)
+                if variants:
+                    stored_chr = str(getattr(variants[0], "chromosome", "")).replace("chr", "")
+                    if stored_chr == norm_expected:
+                        return candidate
+            except Exception:
+                continue
     return None
 
 
@@ -1107,8 +1160,20 @@ def _load_vcf_from_cache(
 
     _cleanup_stale_vcf_cache_temps(paths.cache_dir, paths.key)
     if not _is_vcf_cache_bundle_complete(paths):
-        # Try to find a legacy cache (e.g. created with old key that included keep_sample_indices)
-        legacy = _find_any_complete_vcf_cache(paths.cache_dir)
+        # Try to extract chromosome from VCF for matching legacy caches
+        expected_chr: str | None = None
+        try:
+            contig_info = _vcf_contig_info(vcf_path)
+            if contig_info[0] is not None:
+                expected_chr = contig_info[0].replace("chr", "")
+        except Exception:
+            pass
+        legacy = _find_matching_complete_vcf_cache(
+            paths.cache_dir,
+            vcf_path=vcf_path,
+            config=config,
+            expected_chromosome=expected_chr,
+        )
         if legacy is not None:
             log(f"VCF cache: current key {paths.key} not found, but found legacy bundle {legacy.key}")
             paths = legacy
@@ -1146,7 +1211,7 @@ def _load_vcf_from_cache(
             raise ValueError("cached stats shape mismatch")
         genotype_matrix = _ensure_vcf_cache_matrix_fast(paths, genotype_matrix)
         if manifest is None:
-            _upgrade_legacy_vcf_cache_bundle(paths, genotype_matrix, variant_stats)
+            _upgrade_legacy_vcf_cache_bundle(paths, genotype_matrix, variant_stats, vcf_path=vcf_path)
         log(f"  cached matrix {genotype_matrix.shape}, {len(variants)} variants")
         return genotype_matrix, variants, variant_stats
     except Exception as exc:
@@ -1330,10 +1395,15 @@ def precache_vcfs_parallel(
         cache_paths = _vcf_cache_paths(vcf_path, config)
         if _is_vcf_cache_bundle_complete(cache_paths):
             continue
-        # Also check for legacy cache bundles (old key format with keep_sample_indices)
         cache_dir = _vcf_cache_dir(vcf_path)
-        if cache_dir.exists() and _find_any_complete_vcf_cache(cache_dir) is not None:
-            continue
+        if cache_dir.exists():
+            try:
+                chr_info = _vcf_contig_info(vcf_path)
+                chr_name = chr_info[0].replace("chr", "") if chr_info[0] else None
+            except Exception:
+                chr_name = None
+            if _find_matching_complete_vcf_cache(cache_dir, vcf_path=vcf_path, config=config, expected_chromosome=chr_name) is not None:
+                continue
         uncached.append(vcf_path)
 
     if not uncached:
@@ -1886,6 +1956,7 @@ def _save_vcf_to_cache(
                     "dtype": "int8",
                     "fortran_order": True,
                     "stats_file": paths.stats_path.name,
+                    "source_signature": _vcf_cache_source_signature(vcf_path),
                 }
             ),
         )
