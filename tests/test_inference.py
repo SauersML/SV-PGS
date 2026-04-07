@@ -1071,6 +1071,60 @@ def test_sample_space_preconditioner_handles_semidefinite_sketch_exactly():
     np.testing.assert_allclose(actual, expected, rtol=1e-7, atol=1e-7)
 
 
+def test_sample_space_preconditioner_reuses_cached_genotype_sketch(monkeypatch: pytest.MonkeyPatch):
+    genotype_matrix = np.array(
+        [
+            [1.0, 0.0, 1.0],
+            [0.0, 1.0, 1.0],
+            [1.0, 1.0, 0.0],
+            [0.0, 1.0, 0.0],
+        ],
+        dtype=np.float32,
+    )
+    standardized = as_raw_genotype_matrix(genotype_matrix).standardized(
+        means=np.zeros(genotype_matrix.shape[1], dtype=np.float32),
+        scales=np.ones(genotype_matrix.shape[1], dtype=np.float32),
+    )
+    standardized._dense_cache = standardized.materialize()
+    gram_call_count = 0
+    weighted_kernel_call_count = 0
+    original_gram = mixture_inference._sample_space_genotype_gram_matmat_cpu
+    original_weighted_kernel = mixture_inference._sample_space_kernel_matmat_cpu
+
+    def counted_gram(*args, **kwargs):
+        nonlocal gram_call_count
+        gram_call_count += 1
+        return original_gram(*args, **kwargs)
+
+    def counted_weighted_kernel(*args, **kwargs):
+        nonlocal weighted_kernel_call_count
+        weighted_kernel_call_count += 1
+        return original_weighted_kernel(*args, **kwargs)
+
+    monkeypatch.setattr(mixture_inference, "_sample_space_genotype_gram_matmat_cpu", counted_gram)
+    monkeypatch.setattr(mixture_inference, "_sample_space_kernel_matmat_cpu", counted_weighted_kernel)
+
+    _sample_space_preconditioner(
+        genotype_matrix=standardized,
+        prior_variances=np.array([1.0, 0.5, 0.75], dtype=np.float64),
+        diagonal_noise=np.ones(genotype_matrix.shape[0], dtype=np.float64),
+        batch_size=2,
+        rank=2,
+        random_seed=11,
+    )
+    _sample_space_preconditioner(
+        genotype_matrix=standardized,
+        prior_variances=np.array([0.75, 1.25, 0.4], dtype=np.float64),
+        diagonal_noise=np.full(genotype_matrix.shape[0], 1.5, dtype=np.float64),
+        batch_size=2,
+        rank=2,
+        random_seed=11,
+    )
+
+    assert gram_call_count == 1
+    assert weighted_kernel_call_count == 2
+
+
 def test_sample_space_preconditioner_gpu_path_handles_semidefinite_sketch_exactly(monkeypatch: pytest.MonkeyPatch):
     genotype_matrix = np.array(
         [

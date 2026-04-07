@@ -2125,14 +2125,62 @@ def _sample_space_kernel_matmat_cpu(
     return kernel_term[:, 0] if vector_input else kernel_term
 
 
+def _sample_space_genotype_gram_matmat_cpu(
+    genotype_matrix: StandardizedGenotypeMatrix,
+    matrix: np.ndarray,
+    *,
+    batch_size: int,
+) -> np.ndarray:
+    rhs = np.asarray(matrix, dtype=np.float64)
+    vector_input = rhs.ndim == 1
+    if vector_input:
+        rhs = rhs[:, None]
+    elif rhs.ndim != 2:
+        raise ValueError("sample-space genotype Gram expects a vector or matrix right-hand side.")
+    gram_term = np.zeros((genotype_matrix.shape[0], rhs.shape[1]), dtype=np.float64)
+    for batch in genotype_matrix.iter_column_batches(batch_size=batch_size):
+        genotype_batch = np.asarray(batch.values, dtype=np.float64)
+        gram_term += genotype_batch @ (genotype_batch.T @ rhs)
+    return gram_term[:, 0] if vector_input else gram_term
+
+
+def _cached_sample_space_basis(
+    basis_cache: dict[tuple[int, int], Any],
+    *,
+    requested_rank: int,
+    random_seed: int,
+):
+    matching_basis: Any | None = None
+    matching_width: int | None = None
+    for (cached_rank, cached_seed), cached_basis in basis_cache.items():
+        if cached_seed != random_seed:
+            continue
+        basis_width = int(cached_basis.shape[1])
+        if basis_width < requested_rank:
+            continue
+        if matching_width is None or basis_width < matching_width:
+            matching_basis = cached_basis
+            matching_width = basis_width
+    return matching_basis
+
+
 def _sample_space_nystrom_basis_cpu(
     genotype_matrix: StandardizedGenotypeMatrix,
-    prior_variances: np.ndarray,
     batch_size: int,
     rank: int,
     random_seed: int,
 ) -> np.ndarray | None:
-    sketch_rank = _sample_space_nystrom_rank(rank, genotype_matrix.shape[0])
+    requested_rank = min(max(int(rank), 0), int(genotype_matrix.shape[0]))
+    if requested_rank <= 0:
+        return None
+    cached_basis = _cached_sample_space_basis(
+        genotype_matrix._sample_space_nystrom_basis_cpu_cache,
+        requested_rank=requested_rank,
+        random_seed=random_seed,
+    )
+    if cached_basis is not None:
+        return np.asarray(cached_basis[:, :requested_rank], dtype=np.float64)
+    sketch_rank = _sample_space_nystrom_rank(requested_rank, genotype_matrix.shape[0])
     if sketch_rank <= 0:
         return None
     sketch_probes = _orthogonal_probe_matrix(
@@ -2140,18 +2188,82 @@ def _sample_space_nystrom_basis_cpu(
         probe_count=sketch_rank,
         random_seed=random_seed,
     )
-    sketch_response = _sample_space_kernel_matmat_cpu(
+    sketch_response = _sample_space_genotype_gram_matmat_cpu(
         genotype_matrix=genotype_matrix,
-        prior_variances=prior_variances,
         matrix=sketch_probes,
         batch_size=batch_size,
     )
     basis_matrix, triangular_matrix = np.linalg.qr(np.asarray(sketch_response, dtype=np.float64), mode="reduced")
     diagonal = np.abs(np.diag(triangular_matrix))
-    effective_rank = min(int(rank), int(np.sum(diagonal > 1e-10)))
+    effective_rank = min(requested_rank, int(np.sum(diagonal > 1e-10)))
     if effective_rank <= 0:
         return None
-    return np.asarray(basis_matrix[:, :effective_rank], dtype=np.float64)
+    basis_matrix = np.asarray(basis_matrix[:, :effective_rank], dtype=np.float64)
+    genotype_matrix._sample_space_nystrom_basis_cpu_cache[(effective_rank, int(random_seed))] = basis_matrix
+    return basis_matrix
+
+
+def _sample_space_nystrom_basis_gpu(
+    genotype_matrix: StandardizedGenotypeMatrix,
+    batch_size: int,
+    rank: int,
+    random_seed: int,
+):
+    cupy = _try_import_cupy()
+    if cupy is None:
+        return None
+    requested_rank = min(max(int(rank), 0), int(genotype_matrix.shape[0]))
+    if requested_rank <= 0:
+        return None
+    cached_basis_gpu = _cached_sample_space_basis(
+        genotype_matrix._sample_space_nystrom_basis_gpu_cache,
+        requested_rank=requested_rank,
+        random_seed=random_seed,
+    )
+    if cached_basis_gpu is not None:
+        return cached_basis_gpu[:, :requested_rank]
+    cached_basis_cpu = _cached_sample_space_basis(
+        genotype_matrix._sample_space_nystrom_basis_cpu_cache,
+        requested_rank=requested_rank,
+        random_seed=random_seed,
+    )
+    if cached_basis_cpu is not None:
+        basis_gpu = cupy.asarray(np.asarray(cached_basis_cpu[:, :requested_rank], dtype=np.float64), dtype=cupy.float64)
+        genotype_matrix._sample_space_nystrom_basis_gpu_cache[(basis_gpu.shape[1], int(random_seed))] = basis_gpu
+        return basis_gpu
+    sketch_rank = _sample_space_nystrom_rank(requested_rank, genotype_matrix.shape[0])
+    if sketch_rank <= 0 or not hasattr(cupy.linalg, "qr") or not hasattr(cupy, "abs") or not hasattr(cupy, "diag"):
+        return None
+    sketch_probes_gpu = cupy.asarray(
+        _orthogonal_probe_matrix(
+            dimension=genotype_matrix.shape[0],
+            probe_count=sketch_rank,
+            random_seed=random_seed,
+        ),
+        dtype=cupy.float64,
+    )
+    sketch_response_gpu = _apply_sample_space_operator_gpu(
+        genotype_matrix=genotype_matrix,
+        prior_variances=np.ones(genotype_matrix.shape[1], dtype=np.float64),
+        diagonal_noise=np.zeros(genotype_matrix.shape[0], dtype=np.float64),
+        matrix_gpu=sketch_probes_gpu,
+        batch_size=batch_size,
+        cp=cupy,
+        dtype=cupy.float64,
+    )
+    try:
+        basis_gpu, triangular_gpu = cupy.linalg.qr(sketch_response_gpu, mode="reduced")
+    except TypeError:
+        basis_gpu, triangular_gpu = cupy.linalg.qr(sketch_response_gpu)
+    diagonal = np.asarray(cupy.abs(cupy.diag(triangular_gpu)), dtype=np.float64)
+    effective_rank = min(requested_rank, int(np.sum(diagonal > 1e-10)))
+    if effective_rank <= 0:
+        return None
+    basis_gpu = cupy.asarray(basis_gpu[:, :effective_rank], dtype=cupy.float64)
+    basis_cpu = np.asarray(basis_gpu.get() if hasattr(basis_gpu, "get") else basis_gpu, dtype=np.float64)
+    genotype_matrix._sample_space_nystrom_basis_cpu_cache[(effective_rank, int(random_seed))] = basis_cpu
+    genotype_matrix._sample_space_nystrom_basis_gpu_cache[(effective_rank, int(random_seed))] = basis_gpu
+    return basis_gpu
 
 
 def _sample_space_nystrom_factor_cpu(
@@ -2163,7 +2275,6 @@ def _sample_space_nystrom_factor_cpu(
 ) -> np.ndarray | None:
     basis_matrix = _sample_space_nystrom_basis_cpu(
         genotype_matrix=genotype_matrix,
-        prior_variances=prior_variances,
         batch_size=batch_size,
         rank=rank,
         random_seed=random_seed,
@@ -2192,43 +2303,19 @@ def _sample_space_nystrom_factor_gpu(
     cupy = _try_import_cupy()
     if cupy is None:
         return None
-    compute_cp_dtype = _cupy_compute_dtype(cupy)
-    sketch_rank = _sample_space_nystrom_rank(rank, genotype_matrix.shape[0])
-    if sketch_rank <= 0:
-        return None
-    if not hasattr(cupy.linalg, "qr") or not hasattr(cupy, "abs") or not hasattr(cupy, "diag"):
-        return None
-    sketch_probes_gpu = cupy.asarray(
-        _orthogonal_probe_matrix(
-            dimension=genotype_matrix.shape[0],
-            probe_count=sketch_rank,
-            random_seed=random_seed,
-        ),
-        dtype=compute_cp_dtype,
-    )
-    zero_diagonal_noise = np.zeros(genotype_matrix.shape[0], dtype=np.float64)
-    sketch_response_gpu = _apply_sample_space_operator_gpu(
+    compute_cp_dtype = cupy.float64
+    basis_gpu = _sample_space_nystrom_basis_gpu(
         genotype_matrix=genotype_matrix,
-        prior_variances=prior_variances,
-        diagonal_noise=zero_diagonal_noise,
-        matrix_gpu=sketch_probes_gpu,
         batch_size=batch_size,
-        cp=cupy,
-        dtype=compute_cp_dtype,
+        rank=rank,
+        random_seed=random_seed,
     )
-    try:
-        basis_gpu, triangular_gpu = cupy.linalg.qr(sketch_response_gpu, mode="reduced")
-    except TypeError:
-        basis_gpu, triangular_gpu = cupy.linalg.qr(sketch_response_gpu)
-    diagonal = np.asarray(cupy.abs(cupy.diag(triangular_gpu)), dtype=np.float64)
-    effective_rank = min(int(rank), int(np.sum(diagonal > 1e-10)))
-    if effective_rank <= 0:
+    if basis_gpu is None:
         return None
-    basis_gpu = cupy.asarray(basis_gpu[:, :effective_rank], dtype=compute_cp_dtype)
     projected_kernel_gpu = _apply_sample_space_operator_gpu(
         genotype_matrix=genotype_matrix,
         prior_variances=prior_variances,
-        diagonal_noise=zero_diagonal_noise,
+        diagonal_noise=np.zeros(genotype_matrix.shape[0], dtype=np.float64),
         matrix_gpu=basis_gpu,
         batch_size=batch_size,
         cp=cupy,
