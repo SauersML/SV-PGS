@@ -488,6 +488,7 @@ def test_training_records_from_stats_preserve_prior_continuous_features():
             VariantClass.DELETION_SHORT,
             "1",
             100,
+            prior_binary_features={"coding_annotation": True},
             prior_continuous_features={"sv_length_score": 1.5},
         )
     ]
@@ -506,6 +507,7 @@ def test_training_records_from_stats_preserve_prior_continuous_features():
 
     assert training_records[0].training_support == 7
     np.testing.assert_allclose(training_records[0].allele_frequency, 0.2)
+    assert training_records[0].prior_binary_features == {"coding_annotation": True}
     assert training_records[0].prior_continuous_features == {"sv_length_score": 1.5}
 
 

@@ -412,6 +412,7 @@ def test_collapse_tie_groups_preserves_support_and_continuous_features():
             "1",
             100,
             training_support=6,
+            prior_binary_features={"coding_annotation": True},
             prior_continuous_features={"sv_length_score": 1.0},
         ),
         VariantRecord(
@@ -420,6 +421,7 @@ def test_collapse_tie_groups_preserves_support_and_continuous_features():
             "1",
             101,
             training_support=8,
+            prior_binary_features={"coding_annotation": False},
             prior_continuous_features={"sv_length_score": 3.0},
         ),
         VariantRecord("variant_2", VariantClass.SNV, "1", 102),
@@ -429,4 +431,5 @@ def test_collapse_tie_groups_preserves_support_and_continuous_features():
     collapsed_records = collapse_tie_groups(variant_records, tie_map)
 
     assert collapsed_records[0].training_support == 7
+    assert collapsed_records[0].prior_binary_features == {"coding_annotation": True}
     assert collapsed_records[0].prior_continuous_features == {"sv_length_score": 2.0}

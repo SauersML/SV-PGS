@@ -413,7 +413,7 @@ def run_all_of_us(
     )
 
     # Status summary: what's done vs what's left
-    from sv_pgs.io import _vcf_cache_dir, _vcf_cache_key, _read_vcf_sample_ids
+    from sv_pgs.io import _vcf_cache_dir, _vcf_cache_key
     log("=== STATUS CHECK ===")
     sample_table_path = work_dir / f"{disease_def.canonical_name}.samples.tsv"
     merged_path = work_dir / f"{disease_def.canonical_name}.samples.with_pcs.tsv"
@@ -422,38 +422,7 @@ def run_all_of_us(
     ancestry_local = local_ancestry_predictions_path(work_dir)
     log(f"  ancestry file:   {'DONE' if ancestry_local.exists() else 'NEEDED'}")
 
-    # Compute keep_indices from VCF header + merged sample table (if both exist)
-    # so we can check the EXACT cache key, not just glob for any .npy
-    keep_indices_for_status: np.ndarray | None = None
-    first_vcf = _adopt_legacy_sv_vcf_cache(chromosomes[0], work_dir)
-    if merged_path.exists() and first_vcf.exists():
-        try:
-            all_sample_ids = _read_vcf_sample_ids(first_vcf)
-            vcf_id_set = set(str(s) for s in all_sample_ids)
-            vcf_index_map = {str(s): i for i, s in enumerate(all_sample_ids)}
-            status_df = pd.read_csv(str(merged_path), sep="\t", dtype={"sample_id": str})
-            # Replicate _build_sample_table exactly:
-            # 1. Keep only rows whose sample_id is in the VCF
-            status_df = status_df[status_df["sample_id"].astype(str).isin(vcf_id_set)]
-            # 2. Drop rows with NaN in target or any covariate
-            pc_cols = [c for c in status_df.columns if c.startswith("PC") and c[2:].isdigit()][:n_pcs]
-            covariate_cols = list(DEFAULT_COVARIATES) + pc_cols
-            check_cols = ["target"] + [c for c in covariate_cols if c in status_df.columns]
-            for col in check_cols:
-                if col in status_df.columns:
-                    status_df[col] = pd.to_numeric(status_df[col], errors="coerce")
-            status_df = status_df.dropna(subset=[c for c in check_cols if c in status_df.columns])
-            # 3. Map to VCF indices in SAMPLE TABLE ORDER (same as _align_sample_ids)
-            surviving_ids = status_df["sample_id"].astype(str).tolist()
-            keep_indices_for_status = np.array(
-                [vcf_index_map[sid] for sid in surviving_ids if sid in vcf_index_map],
-                dtype=np.intp,
-            )
-            log(f"  status check: {len(keep_indices_for_status)} samples after NaN filtering")
-        except Exception as exc:
-            log(f"  status check: could not compute cache key ({exc})")
-            pass
-
+    # Cache key no longer depends on sample indices — only on VCF content + config.
     cached_chrs = []
     uncached_chrs = []
     for chrom in chromosomes:
@@ -462,16 +431,10 @@ def run_all_of_us(
             uncached_chrs.append(f"chr{chrom}(no VCF)")
             continue
         cache_dir = _vcf_cache_dir(vcf_path)
-        if keep_indices_for_status is not None:
-            # Check the EXACT cache key
-            key = _vcf_cache_key(vcf_path, keep_indices_for_status, config)
-            has_cache = (cache_dir / f"{key}.genotypes.npy").exists()
-            has_partial = (cache_dir / f"{key}.inc.progress.json").exists()
-            has_tmp = (cache_dir / f"{key}.tmp_parallel").exists()
-        else:
-            has_cache = False
-            has_partial = False
-            has_tmp = False
+        key = _vcf_cache_key(vcf_path, config)
+        has_cache = (cache_dir / f"{key}.genotypes.npy").exists()
+        has_partial = (cache_dir / f"{key}.inc.progress.json").exists()
+        has_tmp = (cache_dir / f"{key}.tmp_parallel").exists()
         if has_cache:
             cached_chrs.append(f"chr{chrom}")
         elif has_partial:
@@ -542,26 +505,8 @@ def run_all_of_us(
 
         log("=== STEP 3.5: Parallel VCF precache ===")
         try:
-            from sv_pgs.io import precache_vcfs_parallel, _read_vcf_sample_ids
-            # Compute keep_indices in SAMPLE-TABLE ORDER (same as loader's _align_sample_ids).
-            # Must match exactly or the cache key won't match.
-            all_sample_ids = _read_vcf_sample_ids(vcf_paths[0])
-            vcf_id_set = set(str(s) for s in all_sample_ids)
-            vcf_index_map = {str(s): i for i, s in enumerate(all_sample_ids)}
-            sample_table_df = pd.read_csv(str(merged_path), sep="\t", dtype={"sample_id": str})
-            # Filter to VCF-matching + drop NaN covariates (same as _build_sample_table)
-            sample_table_df = sample_table_df[sample_table_df["sample_id"].astype(str).isin(vcf_id_set)]
-            pc_cols = [c for c in sample_table_df.columns if c.startswith("PC") and c[2:].isdigit()][:n_pcs]
-            covariate_cols = list(DEFAULT_COVARIATES) + pc_cols
-            check_cols = ["target"] + [c for c in covariate_cols if c in sample_table_df.columns]
-            for col in check_cols:
-                if col in sample_table_df.columns:
-                    sample_table_df[col] = pd.to_numeric(sample_table_df[col], errors="coerce")
-            sample_table_df = sample_table_df.dropna(subset=[c for c in check_cols if c in sample_table_df.columns])
-            surviving_ids = sample_table_df["sample_id"].astype(str).tolist()
-            keep_indices = np.array([vcf_index_map[sid] for sid in surviving_ids if sid in vcf_index_map], dtype=np.intp)
-            log(f"  {len(keep_indices)} of {len(all_sample_ids)} samples matched")
-            precache_vcfs_parallel(vcf_paths, keep_indices, config)
+            from sv_pgs.io import precache_vcfs_parallel
+            precache_vcfs_parallel(vcf_paths, config)
         except Exception as exc:
             log(f"  precache skipped: {exc}")
 

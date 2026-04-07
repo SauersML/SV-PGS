@@ -36,11 +36,26 @@ class VariantRecord:
     training_support: int | None = None
     is_repeat: bool = False
     is_copy_number: bool = False
+    prior_binary_features: dict[str, bool] = field(default_factory=dict)
     prior_continuous_features: dict[str, float] = field(default_factory=dict)
     prior_class_members: tuple[VariantClass, ...] = ()
     prior_class_membership: tuple[float, ...] = ()
 
     def __post_init__(self) -> None:
+        self.prior_binary_features = {
+            str(feature_name): bool(feature_value)
+            for feature_name, feature_value in self.prior_binary_features.items()
+        }
+        for feature_name in self.prior_binary_features:
+            if not feature_name:
+                raise ValueError("prior_binary_features keys cannot be empty.")
+            if "::" in feature_name:
+                raise ValueError("prior_binary_features keys cannot contain '::'.")
+            if feature_name in RESERVED_PRIOR_CONTINUOUS_FEATURE_NAMES:
+                raise ValueError(
+                    "prior_binary_features keys cannot override built-in features: "
+                    + feature_name
+                )
         self.prior_continuous_features = {
             str(feature_name): float(feature_value)
             for feature_name, feature_value in self.prior_continuous_features.items()
@@ -156,6 +171,7 @@ def normalize_variant_records(records: Sequence[VariantRecord | dict[str, Any]])
                     training_support=record.training_support,
                     is_repeat=record.is_repeat,
                     is_copy_number=record.is_copy_number,
+                    prior_binary_features=dict(record.prior_binary_features),
                     prior_continuous_features=dict(record.prior_continuous_features),
                     prior_class_members=record.prior_class_members,
                     prior_class_membership=record.prior_class_membership,
@@ -178,6 +194,10 @@ def normalize_variant_records(records: Sequence[VariantRecord | dict[str, Any]])
                 ),
                 is_repeat=bool(record.get("is_repeat", False)),
                 is_copy_number=bool(record.get("is_copy_number", False)),
+                prior_binary_features={
+                    str(feature_name): bool(feature_value)
+                    for feature_name, feature_value in record.get("prior_binary_features", {}).items()
+                },
                 prior_continuous_features={
                     str(feature_name): float(feature_value)
                     for feature_name, feature_value in record.get("prior_continuous_features", {}).items()

@@ -388,17 +388,18 @@ def load_dataset_from_files(
         )
         log(f"aligned {len(aligned_sample_indices)} phenotype rows against {len(source_sample_ids)} genotype samples")
 
-        # Load VCF genotypes, keeping only matched samples and accumulating as int8
+        # Load VCF genotypes (full matrix from cache), then subset to matched samples
         keep_indices = np.array(aligned_sample_indices, dtype=np.intp)
-        log(f"loading VCF genotypes (keeping {len(keep_indices)} of {len(source_sample_ids)} samples, int8 accumulation)...")
+        log(f"loading VCF genotypes (will subset to {len(keep_indices)} of {len(source_sample_ids)} samples)...")
 
         # Try disk cache first to skip VCF re-parsing on repeated runs
         genotype_matrix, default_variants, variant_stats = _load_vcf_with_cache(
             source_path,
-            keep_sample_indices=keep_indices,
             config=config,
             mmap_mode="r",
         )
+        # Subset to the samples that survived covariate filtering
+        genotype_matrix = genotype_matrix[keep_indices, :]
 
         log(f"VCF loaded: {genotype_matrix.shape[0]} samples x {len(default_variants)} variants  mem={mem()}")
         plink_metadata = None
@@ -578,10 +579,11 @@ def load_multi_vcf_dataset_from_files(
             raise RuntimeError(f"VCF sample IDs do not match the first chromosome: {source_path}")
         genotype_matrix, chromosome_variants, chromosome_stats = _load_vcf_with_cache(
             source_path,
-            keep_sample_indices=keep_sample_indices,
             config=config,
             mmap_mode="r",
         )
+        # Subset to the samples that survived covariate filtering
+        genotype_matrix = genotype_matrix[keep_sample_indices, :]
         raw_matrices.append(as_raw_genotype_matrix(genotype_matrix))
         default_variants.extend(chromosome_variants)
         variant_stats_parts.append(chromosome_stats)
@@ -878,15 +880,18 @@ def _cache_file_fingerprint(path: Path, sample_bytes: int = 1_048_576) -> bytes:
     return h.digest()
 
 
-def _vcf_cache_key(vcf_path: Path, keep_sample_indices: np.ndarray | None, config: ModelConfig) -> str:
-    """Compute a hex digest that uniquely identifies a VCF + sample-subset."""
+def _vcf_cache_key(vcf_path: Path, config: ModelConfig) -> str:
+    """Compute a hex digest that uniquely identifies a VCF file.
+
+    The key is independent of which samples are kept so that changing
+    covariates (e.g. adding PCs) never invalidates the genotype cache.
+    Sample subsetting is done at load time, not at cache time.
+    """
     h = hashlib.sha256()
     h.update(f"v{_CACHE_VERSION}:".encode())
     h.update(str(vcf_path.resolve()).encode())
     h.update(_cache_file_fingerprint(vcf_path))
     h.update(f"minimum_scale={config.minimum_scale:.17g}".encode())
-    if keep_sample_indices is not None:
-        h.update(keep_sample_indices.tobytes())
     return h.hexdigest()[:24]
 
 
@@ -894,9 +899,9 @@ def _vcf_cache_dir(vcf_path: Path) -> Path:
     return vcf_path.resolve().parent / _CACHE_DIR_NAME
 
 
-def _vcf_cache_paths(vcf_path: Path, keep_sample_indices: np.ndarray | None, config: ModelConfig) -> _VcfCachePaths:
+def _vcf_cache_paths(vcf_path: Path, config: ModelConfig) -> _VcfCachePaths:
     cache_dir = _vcf_cache_dir(vcf_path)
-    key = _vcf_cache_key(vcf_path, keep_sample_indices, config)
+    key = _vcf_cache_key(vcf_path, config)
     return _VcfCachePaths(
         key=key,
         cache_dir=cache_dir,
@@ -1010,7 +1015,6 @@ def _ensure_vcf_cache_matrix_fast(paths: _VcfCachePaths, genotype_matrix: np.nda
     variant_stats = _load_vcf_cache_stats(stats_path)
     _save_vcf_to_cache(
         vcf_path=paths.geno_path,
-        keep_sample_indices=None,
         genotype_matrix=np.asarray(genotype_matrix, dtype=np.int8),
         variants=variants,
         variant_stats=variant_stats,
@@ -1051,13 +1055,12 @@ def _upgrade_legacy_vcf_cache_bundle(
 
 def _load_vcf_from_cache(
     vcf_path: Path,
-    keep_sample_indices: np.ndarray | None,
     config: ModelConfig,
     *,
     mmap_mode: Literal["r", "r+", "w+", "c"] | None = None,
 ) -> tuple[np.ndarray, list[_VariantDefaults], VariantStatistics] | None:
     """Try to load cached VCF parse results. Returns None on miss."""
-    paths = _vcf_cache_paths(vcf_path, keep_sample_indices, config)
+    paths = _vcf_cache_paths(vcf_path, config)
     if not paths.cache_dir.exists():
         return None
 
@@ -1257,7 +1260,6 @@ def _region_parse_worker(args: tuple) -> tuple[int, str]:
 
 def precache_vcfs_parallel(
     vcf_paths: list[Path],
-    keep_sample_indices: np.ndarray,
     config: ModelConfig,
 ) -> None:
     """Parse and cache multiple VCFs in parallel, auto-detecting CPU count.
@@ -1278,7 +1280,7 @@ def precache_vcfs_parallel(
     # Skip already-cached VCFs (compatible with existing .npy cache)
     uncached: list[Path] = []
     for vcf_path in vcf_paths:
-        cache_paths = _vcf_cache_paths(vcf_path, keep_sample_indices, config)
+        cache_paths = _vcf_cache_paths(vcf_path, config)
         if not _is_vcf_cache_bundle_complete(cache_paths):
             uncached.append(vcf_path)
 
@@ -1307,8 +1309,7 @@ def precache_vcfs_parallel(
             n_workers = 1
         allocation[vcf_path] = n_workers
 
-    # Build task list
-    keep_list = keep_sample_indices.tolist() if keep_sample_indices is not None else None
+    # Build task list — cache stores ALL samples; no keep_sample_indices filtering
     tasks: list[tuple] = []
     completed_regions_by_vcf: dict[Path, int] = {}
     total_regions_by_vcf: dict[Path, int] = {}
@@ -1316,7 +1317,7 @@ def precache_vcfs_parallel(
         chrom, chrom_length, _ = vcf_info[vcf_path]
         cache_dir = _vcf_cache_dir(vcf_path)
         cache_dir.mkdir(parents=True, exist_ok=True)
-        key = _vcf_cache_key(vcf_path, keep_sample_indices, config)
+        key = _vcf_cache_key(vcf_path, config)
         tmp_dir = cache_dir / f"{key}.tmp_parallel"
         tmp_dir.mkdir(parents=True, exist_ok=True)
 
@@ -1328,7 +1329,7 @@ def precache_vcfs_parallel(
                 completed_regions_by_vcf[vcf_path] = 1
             else:
                 completed_regions_by_vcf[vcf_path] = 0
-                tasks.append((str(vcf_path), None, keep_list, str(region_prefix), 1))
+                tasks.append((str(vcf_path), None, None, str(region_prefix), 1))
         else:
             regions = _split_into_regions(chrom, chrom_length, n_workers)
             total_regions_by_vcf[vcf_path] = len(regions)
@@ -1338,7 +1339,7 @@ def precache_vcfs_parallel(
                 if _region_output_complete(region_prefix):
                     completed_count += 1
                     continue
-                tasks.append((str(vcf_path), region, keep_list, str(region_prefix), 1))
+                tasks.append((str(vcf_path), region, None, str(region_prefix), 1))
             completed_regions_by_vcf[vcf_path] = completed_count
 
     process_count = min(total_cpus, max(len(tasks), 1))
@@ -1375,7 +1376,7 @@ def precache_vcfs_parallel(
     # Merge region results per VCF → incremental cache → final .npy cache
     for vcf_path in uncached:
         cache_dir = _vcf_cache_dir(vcf_path)
-        key = _vcf_cache_key(vcf_path, keep_sample_indices, config)
+        key = _vcf_cache_key(vcf_path, config)
         tmp_dir = cache_dir / f"{key}.tmp_parallel"
         if not tmp_dir.exists():
             continue
@@ -1406,7 +1407,7 @@ def precache_vcfs_parallel(
         # Finalize: convert incremental binary directly to .npy cache.
         # Do NOT call _load_vcf_with_cache — that would re-open the VCF and
         # waste 20+ min skipping already-parsed variants.
-        actual_n_keep = len(keep_sample_indices) if keep_sample_indices is not None else len(_read_vcf_sample_ids(vcf_path))
+        actual_n_keep = len(_read_vcf_sample_ids(vcf_path))
         log(f"  finalizing {vcf_path.name}: {n_total} variants from {len(geno_files)} regions")
 
         # Load incremental binary via memmap (zero copy)
@@ -1444,7 +1445,7 @@ def precache_vcfs_parallel(
         inc_stats_obj = VariantStatistics(means=means, scales=scales, allele_frequencies=afs, support_counts=support_arr)
 
         # Save as final .npy cache
-        _save_vcf_to_cache(vcf_path, keep_sample_indices, inc_matrix, inc_variants, inc_stats_obj, config=config)
+        _save_vcf_to_cache(vcf_path, inc_matrix, inc_variants, inc_stats_obj, config=config)
         del inc_matrix
 
         # Clean up incremental files
@@ -1458,28 +1459,26 @@ def precache_vcfs_parallel(
 
 def _load_vcf_with_cache(
     vcf_path: Path,
-    keep_sample_indices: np.ndarray,
     config: ModelConfig,
     *,
     mmap_mode: Literal["r", "r+", "w+", "c"] | None,
 ) -> tuple[np.ndarray, list[_VariantDefaults], VariantStatistics]:
     effective_mmap_mode: Literal["r", "r+", "w+", "c"] = "r" if mmap_mode is None else mmap_mode
-    # Check for completed cache first
+    # Check for completed cache first (full genotype matrix, all samples)
     cached = _load_vcf_from_cache(
         vcf_path,
-        keep_sample_indices=keep_sample_indices,
         config=config,
         mmap_mode=effective_mmap_mode,
     )
     if cached is not None:
         return cached
 
-    # Parse with incremental checkpointing
+    # Parse with incremental checkpointing (all samples)
     cache_dir = _vcf_cache_dir(vcf_path)
     cache_dir.mkdir(parents=True, exist_ok=True)
-    key = _vcf_cache_key(vcf_path, keep_sample_indices, config)
+    key = _vcf_cache_key(vcf_path, config)
     genotype_matrix, variants, variant_stats = _load_vcf_incremental(
-        vcf_path, keep_sample_indices, cache_dir, key, config=config, mmap_mode=effective_mmap_mode,
+        vcf_path, None, cache_dir, key, config=config, mmap_mode=effective_mmap_mode,
     )
     return genotype_matrix, variants, variant_stats
 
@@ -1740,7 +1739,6 @@ def _load_vcf_incremental(
     ).T
     _save_vcf_to_cache(
         vcf_path=vcf_path,
-        keep_sample_indices=keep_sample_indices,
         genotype_matrix=incremental_matrix,
         variants=variants,
         variant_stats=variant_stats,
@@ -1757,7 +1755,6 @@ def _load_vcf_incremental(
 
     cached = _load_vcf_from_cache(
         vcf_path=vcf_path,
-        keep_sample_indices=keep_sample_indices,
         config=config,
         mmap_mode=mmap_mode,
     )
@@ -1777,7 +1774,6 @@ def _atomic_write_text(path: Path, text: str) -> None:
 
 def _save_vcf_to_cache(
     vcf_path: Path,
-    keep_sample_indices: np.ndarray | None,
     genotype_matrix: np.ndarray,
     variants: list[_VariantDefaults],
     variant_stats: VariantStatistics,
@@ -1789,7 +1785,7 @@ def _save_vcf_to_cache(
     if cache_paths is None:
         if config is None:
             raise ValueError("config is required when cache_paths is not provided.")
-        paths = _vcf_cache_paths(vcf_path, keep_sample_indices, config)
+        paths = _vcf_cache_paths(vcf_path, config)
     else:
         paths = cache_paths
 
@@ -1962,6 +1958,15 @@ def _merge_variant_metadata(
 
     prior_class_members = _parse_variant_classes(metadata_row.get("prior_class_members"))
     prior_class_membership = _parse_float_list(metadata_row.get("prior_class_membership"))
+    prior_binary_features = {
+        column_name.removeprefix("prior_binary__"): _parse_bool_or_default(
+            column_value,
+            False,
+            column_name=column_name,
+        )
+        for column_name, column_value in metadata_row.items()
+        if column_name.startswith("prior_binary__")
+    }
     prior_continuous_features = {
         column_name.removeprefix("prior_continuous__"): _parse_float_or_default(
             column_value,
@@ -1986,6 +1991,7 @@ def _merge_variant_metadata(
         training_support=_parse_optional_int(metadata_row.get("training_support"), column_name="training_support"),
         is_repeat=_parse_bool_or_default(metadata_row.get("is_repeat"), False, column_name="is_repeat"),
         is_copy_number=_parse_bool_or_default(metadata_row.get("is_copy_number"), False, column_name="is_copy_number"),
+        prior_binary_features=prior_binary_features,
         prior_continuous_features=prior_continuous_features,
         prior_class_members=prior_class_members,
         prior_class_membership=prior_class_membership,

@@ -785,6 +785,13 @@ def collapse_tie_groups(
                 for feature_name in member_record.prior_continuous_features
             }
         )
+        binary_feature_names = sorted(
+            {
+                feature_name
+                for member_record in member_records
+                for feature_name in member_record.prior_binary_features
+            }
+        )
         collapsed_records.append(
             VariantRecord(
                 variant_id=member_records[0].variant_id,
@@ -797,6 +804,13 @@ def collapse_tie_groups(
                 training_support=None if not support_values else int(np.round(np.mean(support_values))),
                 is_repeat=any(member_record.is_repeat for member_record in member_records),
                 is_copy_number=any(member_record.is_copy_number for member_record in member_records),
+                prior_binary_features={
+                    feature_name: any(
+                        member_record.prior_binary_features.get(feature_name, False)
+                        for member_record in member_records
+                    )
+                    for feature_name in binary_feature_names
+                },
                 prior_continuous_features={
                     feature_name: float(
                         np.mean(

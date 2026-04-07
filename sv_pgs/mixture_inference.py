@@ -4280,10 +4280,6 @@ def _restricted_posterior_state(
         inverse_covariance_targets - inverse_covariance_covariates @ alpha,
         dtype=np.float64,
     )
-    beta = np.asarray(
-        prior_variances * np.asarray(genotype_matrix.transpose_matvec(projected_targets), dtype=compute_np_dtype),
-        dtype=compute_np_dtype,
-    )
     if compute_beta_variance:
         probe_projection_matrix = _cached_sample_probe_projection(
             genotype_matrix=genotype_matrix,
@@ -4292,7 +4288,27 @@ def _restricted_posterior_state(
             probe_count=posterior_variance_probe_count,
             random_seed=random_seed,
         )
+        restricted_probe_matrix = np.asarray(
+            inverse_covariance_probe_matrix - inverse_covariance_covariates @ _cholesky_solve(
+                gls_cholesky,
+                covariate_matrix.T @ inverse_covariance_probe_matrix,
+            ),
+            dtype=np.float64,
+        )
+        combined_projection_matrix = np.asarray(
+            genotype_matrix.transpose_matmat(
+                np.column_stack([projected_targets, restricted_probe_matrix]),
+                batch_size=posterior_variance_batch_size,
+            ),
+            dtype=compute_np_dtype,
+        )
+        beta_projection = np.asarray(combined_projection_matrix[:, 0], dtype=compute_np_dtype)
+        restricted_probe_projection_matrix = np.asarray(
+            combined_projection_matrix[:, 1:],
+            dtype=np.float64,
+        )
         log(f"    computing stochastic leverage diagonal for beta variance ({variant_count} variants, {posterior_variance_probe_count} probes)...")
+        beta = np.asarray(prior_variances * beta_projection, dtype=compute_np_dtype)
         leverage_diagonal = _stochastic_restricted_cross_leverage_diagonal(
             genotype_matrix=genotype_matrix,
             covariate_matrix=covariate_matrix,
@@ -4305,9 +4321,14 @@ def _restricted_posterior_state(
             sample_probes=sample_probes,
             inverse_covariance_probe_matrix=inverse_covariance_probe_matrix,
             probe_projection_matrix=probe_projection_matrix,
+            restricted_probe_projection_matrix=restricted_probe_projection_matrix,
         )
         beta_variance = np.maximum(prior_variances - (prior_variances * prior_variances) * leverage_diagonal, 1e-8)
     else:
+        beta = np.asarray(
+            prior_variances * np.asarray(genotype_matrix.transpose_matvec(projected_targets), dtype=compute_np_dtype),
+            dtype=compute_np_dtype,
+        )
         beta_variance = np.zeros_like(prior_variances, dtype=np.float64)
     linear_predictor = covariate_matrix @ alpha + np.asarray(
         genotype_matrix.matvec(beta, batch_size=posterior_variance_batch_size),
@@ -4376,6 +4397,7 @@ def _stochastic_restricted_cross_leverage_diagonal(
     sample_probes: np.ndarray | None = None,
     inverse_covariance_probe_matrix: np.ndarray | None = None,
     probe_projection_matrix: np.ndarray | None = None,
+    restricted_probe_projection_matrix: np.ndarray | None = None,
 ) -> np.ndarray:
     if sample_probes is None:
         sample_probes = _orthogonal_probe_matrix(
@@ -4409,10 +4431,15 @@ def _stochastic_restricted_cross_leverage_diagonal(
         probe_projection_matrix = np.asarray(probe_projection_matrix, dtype=np.float64)
         if probe_projection_matrix.shape != (genotype_matrix.shape[1], probe_count):
             raise ValueError("probe_projection_matrix shape does not match variant_count/probe_count.")
-    restricted_probe_projection_matrix = np.asarray(
-        genotype_matrix.transpose_matmat(restricted_probe_matrix, batch_size=batch_size),
-        dtype=np.float64,
-    )
+    if restricted_probe_projection_matrix is None:
+        restricted_probe_projection_matrix = np.asarray(
+            genotype_matrix.transpose_matmat(restricted_probe_matrix, batch_size=batch_size),
+            dtype=np.float64,
+        )
+    else:
+        restricted_probe_projection_matrix = np.asarray(restricted_probe_projection_matrix, dtype=np.float64)
+        if restricted_probe_projection_matrix.shape != (genotype_matrix.shape[1], probe_count):
+            raise ValueError("restricted_probe_projection_matrix shape does not match variant_count/probe_count.")
     return np.maximum(
         np.mean(probe_projection_matrix * restricted_probe_projection_matrix, axis=1),
         1e-8,
@@ -4736,19 +4763,7 @@ def _continuous_prior_design_matrix(
         ),
         np.log1p(training_support),
     ]
-    custom_feature_names = [
-        feature_name
-        for feature_name in _custom_prior_feature_names(records)
-        if not _is_binary_prior_feature_values(
-            np.asarray(
-                [
-                    record.prior_continuous_features.get(feature_name, 0.0)
-                    for record in records
-                ],
-                dtype=np.float64,
-            )
-        )
-    ]
+    custom_feature_names = list(_custom_prior_continuous_feature_names(records))
     for feature_name in custom_feature_names:
         feature_names.append(feature_name)
         feature_columns.append(
@@ -4781,19 +4796,18 @@ def _binary_prior_design_matrix(
         np.asarray((minor_allele_frequency >= 1e-3) & (minor_allele_frequency < 1e-2), dtype=np.float64),
         np.asarray((minor_allele_frequency >= 1e-2) & (minor_allele_frequency < 5e-2), dtype=np.float64),
     ]
-    for feature_name in _custom_prior_feature_names(records):
-        feature_values = np.asarray(
-            [record.prior_continuous_features.get(feature_name, 0.0) for record in records],
-            dtype=np.float64,
-        )
-        if not _is_binary_prior_feature_values(feature_values):
-            continue
+    for feature_name in _custom_prior_binary_feature_names(records):
         feature_names.append(feature_name)
-        feature_columns.append(feature_values)
+        feature_columns.append(
+            np.asarray(
+                [float(record.prior_binary_features.get(feature_name, False)) for record in records],
+                dtype=np.float64,
+            )
+        )
     return tuple(feature_names), np.column_stack(feature_columns).astype(np.float64)
 
 
-def _custom_prior_feature_names(records: Sequence[VariantRecord]) -> tuple[str, ...]:
+def _custom_prior_continuous_feature_names(records: Sequence[VariantRecord]) -> tuple[str, ...]:
     return tuple(
         sorted(
             {
@@ -4805,14 +4819,15 @@ def _custom_prior_feature_names(records: Sequence[VariantRecord]) -> tuple[str, 
     )
 
 
-def _is_binary_prior_feature_values(values: np.ndarray) -> bool:
-    value_array = np.asarray(values, dtype=np.float64)
-    if value_array.size == 0:
-        return False
-    return bool(
-        np.all(np.isfinite(value_array))
-        and np.all(np.isclose(value_array, np.round(value_array), atol=1e-8))
-        and np.all((value_array == 0.0) | (value_array == 1.0))
+def _custom_prior_binary_feature_names(records: Sequence[VariantRecord]) -> tuple[str, ...]:
+    return tuple(
+        sorted(
+            {
+                feature_name
+                for record in records
+                for feature_name in record.prior_binary_features
+            }
+        )
     )
 
 

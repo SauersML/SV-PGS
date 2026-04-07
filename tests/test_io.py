@@ -71,10 +71,17 @@ def test_load_dataset_from_vcf_uses_metadata_and_sample_alignment(tmp_path: Path
     metadata_path = tmp_path / "variants.tsv"
     _write_table(
         metadata_path,
-        header=("variant_id", "variant_class", "training_support", "is_copy_number", "prior_continuous__sv_length_score"),
+        header=(
+            "variant_id",
+            "variant_class",
+            "training_support",
+            "is_copy_number",
+            "prior_binary__coding_annotation",
+            "prior_continuous__sv_length_score",
+        ),
         rows=(
-            ("rs1", "snv", "", "false", "0.25"),
-            ("sv1", "deletion_short", "2", "true", "1.75"),
+            ("rs1", "snv", "", "false", "false", "0.25"),
+            ("sv1", "deletion_short", "2", "true", "true", "1.75"),
         ),
     )
 
@@ -91,7 +98,6 @@ def test_load_dataset_from_vcf_uses_metadata_and_sample_alignment(tmp_path: Path
 
     assert dataset.sample_ids == ["s1", "s2"]
     assert isinstance(dataset.genotypes, Int8RawGenotypeMatrix)
-    assert isinstance(dataset.genotypes.matrix, np.memmap)
     np.testing.assert_allclose(dataset.genotypes, np.array([[2.0, 1.0], [1.0, 0.0]], dtype=np.float32))
     np.testing.assert_allclose(dataset.covariates, np.array([[42.0], [35.0]], dtype=np.float32))
     np.testing.assert_allclose(dataset.targets, np.array([1.0, 0.0], dtype=np.float32))
@@ -100,9 +106,11 @@ def test_load_dataset_from_vcf_uses_metadata_and_sample_alignment(tmp_path: Path
     np.testing.assert_allclose(dataset.variant_stats.means, np.array([1.5, 0.5], dtype=np.float32))
     assert dataset.variant_records[0].variant_class == VariantClass.SNV
     assert dataset.variant_records[1].variant_class == VariantClass.DELETION_SHORT
+    assert dataset.variant_records[0].prior_binary_features == {"coding_annotation": False}
     assert dataset.variant_records[0].prior_continuous_features == {"sv_length_score": 0.25}
     assert dataset.variant_records[1].training_support == 2
     assert dataset.variant_records[1].is_copy_number is True
+    assert dataset.variant_records[1].prior_binary_features == {"coding_annotation": True}
     assert dataset.variant_records[1].prior_continuous_features == {"sv_length_score": 1.75}
 
 
@@ -434,14 +442,13 @@ def test_vcf_cache_save_uses_real_temp_file_and_roundtrips(tmp_path: Path):
 
     _save_vcf_to_cache(
         vcf_path=vcf_path,
-        keep_sample_indices=keep_sample_indices,
         genotype_matrix=genotype_matrix,
         variants=variants,
         variant_stats=variant_stats,
         config=config,
     )
 
-    cached = _load_vcf_from_cache(vcf_path=vcf_path, keep_sample_indices=keep_sample_indices, config=config)
+    cached = _load_vcf_from_cache(vcf_path=vcf_path, config=config)
 
     assert cached is not None
     cached_genotypes, cached_variants, cached_variant_stats = cached
@@ -483,14 +490,13 @@ def test_vcf_cache_load_upgrades_legacy_row_major_matrix(tmp_path: Path):
 
     _save_vcf_to_cache(
         vcf_path=vcf_path,
-        keep_sample_indices=None,
         genotype_matrix=genotype_matrix,
         variants=variants,
         variant_stats=variant_stats,
         config=config,
     )
 
-    cached = _load_vcf_from_cache(vcf_path=vcf_path, keep_sample_indices=None, config=config)
+    cached = _load_vcf_from_cache(vcf_path=vcf_path, config=config)
 
     assert cached is not None
     cached_genotypes, _, _ = cached
@@ -498,7 +504,7 @@ def test_vcf_cache_load_upgrades_legacy_row_major_matrix(tmp_path: Path):
     np.testing.assert_array_equal(cached_genotypes, genotype_matrix)
     assert cached_genotypes.flags.f_contiguous
 
-    reloaded = _load_vcf_from_cache(vcf_path=vcf_path, keep_sample_indices=None, config=config)
+    reloaded = _load_vcf_from_cache(vcf_path=vcf_path, config=config)
 
     assert reloaded is not None
     reloaded_genotypes, _, _ = reloaded
@@ -513,11 +519,11 @@ def test_vcf_cache_key_ignores_mtime_for_identical_content(tmp_path: Path):
     keep_sample_indices = np.array([0, 2], dtype=np.int32)
     config = ModelConfig()
 
-    first_key = _vcf_cache_key(vcf_path, keep_sample_indices, config)
+    first_key = _vcf_cache_key(vcf_path, config)
     original_mtime = vcf_path.stat().st_mtime_ns
     new_mtime = original_mtime + 1_000_000
     os.utime(vcf_path, ns=(new_mtime, new_mtime))
-    second_key = _vcf_cache_key(vcf_path, keep_sample_indices, config)
+    second_key = _vcf_cache_key(vcf_path, config)
 
     assert first_key == second_key
 
@@ -528,9 +534,9 @@ def test_vcf_cache_key_changes_when_content_changes(tmp_path: Path):
     keep_sample_indices = np.array([0, 2], dtype=np.int32)
     config = ModelConfig()
 
-    first_key = _vcf_cache_key(vcf_path, keep_sample_indices, config)
+    first_key = _vcf_cache_key(vcf_path, config)
     vcf_path.write_bytes(b"header\nchanged-body\ntrailer\n")
-    second_key = _vcf_cache_key(vcf_path, keep_sample_indices, config)
+    second_key = _vcf_cache_key(vcf_path, config)
 
     assert first_key != second_key
 
@@ -540,8 +546,8 @@ def test_vcf_cache_key_changes_when_minimum_scale_changes(tmp_path: Path):
     vcf_path.write_bytes(b"header\nbody\ntrailer\n")
     keep_sample_indices = np.array([0, 2], dtype=np.int32)
 
-    first_key = _vcf_cache_key(vcf_path, keep_sample_indices, ModelConfig(minimum_scale=1e-6))
-    second_key = _vcf_cache_key(vcf_path, keep_sample_indices, ModelConfig(minimum_scale=0.25))
+    first_key = _vcf_cache_key(vcf_path, ModelConfig(minimum_scale=1e-6))
+    second_key = _vcf_cache_key(vcf_path, ModelConfig(minimum_scale=0.25))
 
     assert first_key != second_key
 
@@ -551,7 +557,7 @@ def test_vcf_cache_load_upgrades_legacy_stats_bundle_to_manifest(tmp_path: Path)
     vcf_path.write_text("##fileformat=VCFv4.2\n", encoding="utf-8")
     keep_sample_indices = np.array([0, 2], dtype=np.int32)
     config = ModelConfig()
-    key = _vcf_cache_key(vcf_path, keep_sample_indices, config)
+    key = _vcf_cache_key(vcf_path, config)
     cache_dir = tmp_path / ".sv_pgs_cache"
     cache_dir.mkdir()
 
@@ -590,7 +596,7 @@ def test_vcf_cache_load_upgrades_legacy_stats_bundle_to_manifest(tmp_path: Path)
         support_counts=np.array([1, 2], dtype=np.int32),
     )
 
-    cached = _load_vcf_from_cache(vcf_path=vcf_path, keep_sample_indices=keep_sample_indices, config=config)
+    cached = _load_vcf_from_cache(vcf_path=vcf_path, config=config)
 
     assert cached is not None
     cached_genotypes, _, cached_variant_stats = cached
@@ -606,7 +612,7 @@ def test_vcf_cache_load_ignores_incomplete_manifestless_new_bundle(tmp_path: Pat
     vcf_path = tmp_path / "cohort.vcf"
     vcf_path.write_text("##fileformat=VCFv4.2\n", encoding="utf-8")
     config = ModelConfig()
-    key = _vcf_cache_key(vcf_path, None, config)
+    key = _vcf_cache_key(vcf_path, config)
     cache_dir = tmp_path / ".sv_pgs_cache"
     cache_dir.mkdir()
 
@@ -623,7 +629,7 @@ def test_vcf_cache_load_ignores_incomplete_manifestless_new_bundle(tmp_path: Pat
     )
     np.save(cache_dir / f"{key}.stats.npy", np.zeros(1, dtype=stats_dtype), allow_pickle=False)
 
-    assert _load_vcf_from_cache(vcf_path=vcf_path, keep_sample_indices=None, config=config) is None
+    assert _load_vcf_from_cache(vcf_path=vcf_path, config=config) is None
 
 
 def test_prepare_keep_sample_selector_collapses_full_and_contiguous_ranges():
@@ -661,7 +667,7 @@ def test_precache_vcfs_parallel_reuses_completed_region_outputs(monkeypatch: pyt
     config = ModelConfig(minimum_scale=0.2)
     cache_dir = io_module._vcf_cache_dir(vcf_path)
     cache_dir.mkdir()
-    key = _vcf_cache_key(vcf_path, keep_sample_indices, config)
+    key = _vcf_cache_key(vcf_path, config)
     tmp_dir = cache_dir / f"{key}.tmp_parallel"
     tmp_dir.mkdir()
 
@@ -731,18 +737,19 @@ def test_precache_vcfs_parallel_reuses_completed_region_outputs(monkeypatch: pyt
         lambda paths: paths.geno_path.exists() and paths.var_path.exists() and paths.stats_path.exists() and paths.manifest_path.exists(),
     )
     monkeypatch.setattr(io_module, "_vcf_contig_info", lambda path: ("1", 200))
+    monkeypatch.setattr(io_module, "_read_vcf_sample_ids", lambda path: ["s0", "s1"])
     monkeypatch.setattr(os, "cpu_count", lambda: 2)
     import multiprocessing as _multiprocessing
     monkeypatch.setattr(_multiprocessing, "get_all_start_methods", lambda: ["fork", "spawn"])
     monkeypatch.setattr(_multiprocessing, "get_context", lambda method: _FakeContext())
 
-    io_module.precache_vcfs_parallel([vcf_path], keep_sample_indices, config)
+    io_module.precache_vcfs_parallel([vcf_path], config)
 
     assert len(scheduled_tasks) == 1
     assert scheduled_tasks[0][3] == str(region1_prefix)
     assert scheduled_tasks[0][4] == 2
 
-    cached = _load_vcf_from_cache(vcf_path=vcf_path, keep_sample_indices=keep_sample_indices, config=config)
+    cached = _load_vcf_from_cache(vcf_path=vcf_path, config=config)
     assert cached is not None
     genotype_matrix, variants, variant_stats = cached
     np.testing.assert_array_equal(

@@ -1052,6 +1052,7 @@ def _training_records_from_stats(
                 training_support=support,
                 is_repeat=record.is_repeat,
                 is_copy_number=record.is_copy_number,
+                prior_binary_features=dict(record.prior_binary_features),
                 prior_continuous_features=dict(record.prior_continuous_features),
                 prior_class_members=record.prior_class_members,
                 prior_class_membership=record.prior_class_membership,

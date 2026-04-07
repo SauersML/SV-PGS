@@ -116,7 +116,8 @@ class TestMetadataScaleModel:
                 "chr1",
                 100,
                 allele_frequency=5e-4,
-                prior_continuous_features={"coding_annotation": 1.0, "constraint_score": 0.2},
+                prior_binary_features={"coding_annotation": True},
+                prior_continuous_features={"constraint_score": 0.2},
             ),
             VariantRecord(
                 "sv_b",
@@ -124,7 +125,8 @@ class TestMetadataScaleModel:
                 "chr1",
                 101,
                 allele_frequency=5e-3,
-                prior_continuous_features={"coding_annotation": 0.0, "constraint_score": 0.7},
+                prior_binary_features={"coding_annotation": False},
+                prior_continuous_features={"constraint_score": 0.7},
             ),
             VariantRecord(
                 "sv_c",
@@ -132,7 +134,8 @@ class TestMetadataScaleModel:
                 "chr1",
                 102,
                 allele_frequency=2e-2,
-                prior_continuous_features={"coding_annotation": 1.0, "constraint_score": 0.9},
+                prior_binary_features={"coding_annotation": True},
+                prior_continuous_features={"constraint_score": 0.9},
             ),
             VariantRecord(
                 "sv_d",
@@ -140,7 +143,8 @@ class TestMetadataScaleModel:
                 "chr1",
                 103,
                 allele_frequency=0.2,
-                prior_continuous_features={"coding_annotation": 0.0, "constraint_score": 1.1},
+                prior_binary_features={"coding_annotation": False},
+                prior_continuous_features={"constraint_score": 1.1},
             ),
         ]
         prior_design = _build_prior_design(records)
@@ -171,7 +175,8 @@ class TestMetadataScaleModel:
                 "chr1",
                 100,
                 allele_frequency=5e-4,
-                prior_continuous_features={"coding_annotation": 1.0, "constraint_score": 0.2},
+                prior_binary_features={"coding_annotation": True},
+                prior_continuous_features={"constraint_score": 0.2},
             ),
             VariantRecord(
                 "sv_b",
@@ -179,7 +184,8 @@ class TestMetadataScaleModel:
                 "chr1",
                 101,
                 allele_frequency=5e-3,
-                prior_continuous_features={"coding_annotation": 0.0, "constraint_score": 0.7},
+                prior_binary_features={"coding_annotation": False},
+                prior_continuous_features={"constraint_score": 0.7},
             ),
             VariantRecord(
                 "sv_c",
@@ -187,7 +193,8 @@ class TestMetadataScaleModel:
                 "chr1",
                 102,
                 allele_frequency=2e-2,
-                prior_continuous_features={"coding_annotation": 1.0, "constraint_score": 0.9},
+                prior_binary_features={"coding_annotation": True},
+                prior_continuous_features={"constraint_score": 0.9},
             ),
         ]
         feature_specs = _parse_scale_model_feature_names(

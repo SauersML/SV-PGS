@@ -836,7 +836,7 @@ def test_restricted_posterior_sample_space_reuses_matching_warm_start(monkeypatc
 def test_stochastic_restricted_cross_leverage_diagonal_caches_fixed_probe_projection(
     monkeypatch: pytest.MonkeyPatch,
 ):
-    sample_count, variant_count = 6, 4
+    sample_count = 6
     genotype_values = np.array(
         [
             [0.0, 1.0, 2.0, 0.0],
@@ -863,20 +863,30 @@ def test_stochastic_restricted_cross_leverage_diagonal_caches_fixed_probe_projec
     gls_cholesky = np.linalg.cholesky(covariate_matrix.T @ covariate_matrix + np.eye(1, dtype=np.float64) * 1e-8)
 
     transpose_probe_counts = {"fixed": 0, "restricted": 0}
-    original_transpose_matmat = type(standardized).transpose_matmat
 
-    def counting_transpose_matmat(self, matrix, batch_size):
-        matrix_array = np.asarray(matrix, dtype=np.float64)
-        if self is standardized and np.allclose(matrix_array, sample_probes):
-            transpose_probe_counts["fixed"] += 1
-        elif self is standardized:
-            transpose_probe_counts["restricted"] += 1
-        return original_transpose_matmat(self, matrix, batch_size=batch_size)
+    class _CountingGenotypeMatrix:
+        def __init__(self, base_matrix):
+            self._base_matrix = base_matrix
 
-    monkeypatch.setattr(type(standardized), "transpose_matmat", counting_transpose_matmat)
+        def __getattr__(self, name):
+            return getattr(self._base_matrix, name)
+
+        @property
+        def shape(self):
+            return self._base_matrix.shape
+
+        def transpose_matmat(self, matrix, batch_size):
+            matrix_array = np.asarray(matrix, dtype=np.float64)
+            if np.allclose(matrix_array, sample_probes):
+                transpose_probe_counts["fixed"] += 1
+            else:
+                transpose_probe_counts["restricted"] += 1
+            return self._base_matrix.transpose_matmat(matrix, batch_size=batch_size)
+
+    counting_standardized = _CountingGenotypeMatrix(standardized)
 
     expected = mixture_inference._stochastic_restricted_cross_leverage_diagonal(
-        genotype_matrix=standardized,
+        genotype_matrix=counting_standardized,
         covariate_matrix=covariate_matrix,
         solve_rhs=lambda rhs: rhs,
         inverse_covariance_covariates=inverse_covariance_covariates,
@@ -888,7 +898,7 @@ def test_stochastic_restricted_cross_leverage_diagonal_caches_fixed_probe_projec
         inverse_covariance_probe_matrix=inverse_covariance_probe_matrix,
     )
     actual = mixture_inference._stochastic_restricted_cross_leverage_diagonal(
-        genotype_matrix=standardized,
+        genotype_matrix=counting_standardized,
         covariate_matrix=covariate_matrix,
         solve_rhs=lambda rhs: rhs,
         inverse_covariance_covariates=inverse_covariance_covariates,
@@ -983,6 +993,119 @@ def test_restricted_posterior_sample_space_reuses_preconditioner_until_iteration
         )
 
     assert len(built_preconditioners) == 2
+
+
+def test_restricted_posterior_sample_space_fuses_beta_and_restricted_probe_transpose_passes(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    sample_count, variant_count = 6, 7
+    genotype_values = np.array(
+        [
+            [0.0, 1.0, 2.0, 0.0, 1.0, 2.0, 0.0],
+            [1.0, 0.0, 1.0, 2.0, 0.0, 1.0, 2.0],
+            [2.0, 1.0, 0.0, 1.0, 2.0, 0.0, 1.0],
+            [1.0, 2.0, 1.0, 0.0, 1.0, 2.0, 1.0],
+            [0.0, 1.0, 1.0, 2.0, 1.0, 0.0, 2.0],
+            [2.0, 0.0, 2.0, 1.0, 0.0, 2.0, 1.0],
+        ],
+        dtype=np.float32,
+    )
+    standardized = as_raw_genotype_matrix(genotype_values).standardized(
+        means=np.mean(genotype_values, axis=0, dtype=np.float32),
+        scales=np.std(genotype_values, axis=0, dtype=np.float32) + 1e-3,
+    )
+    covariate_matrix = np.column_stack(
+        [
+            np.ones(sample_count, dtype=np.float64),
+            np.linspace(-1.0, 1.0, sample_count, dtype=np.float64),
+        ]
+    )
+    targets = np.linspace(-0.5, 0.75, sample_count, dtype=np.float64)
+    prior_variances = np.linspace(0.5, 1.1, variant_count, dtype=np.float64)
+    diagonal_noise = np.linspace(0.8, 1.3, sample_count, dtype=np.float64)
+    transpose_matvec_calls = 0
+    transpose_matmat_widths: list[int] = []
+
+    class _CountingGenotypeMatrix:
+        def __init__(self, base_matrix):
+            self._base_matrix = base_matrix
+
+        def __getattr__(self, name):
+            return getattr(self._base_matrix, name)
+
+        @property
+        def shape(self):
+            return self._base_matrix.shape
+
+        def transpose_matvec(self, vector, batch_size=None):
+            nonlocal transpose_matvec_calls
+            transpose_matvec_calls += 1
+            return self._base_matrix.transpose_matvec(vector, batch_size=batch_size)
+
+        def transpose_matmat(self, matrix, batch_size):
+            transpose_matmat_widths.append(np.asarray(matrix).shape[1])
+            return self._base_matrix.transpose_matmat(matrix, batch_size=batch_size)
+
+        def matvec(self, vector, batch_size=None):
+            return self._base_matrix.matvec(vector, batch_size=batch_size)
+
+        def iter_column_batches(self, batch_size):
+            return self._base_matrix.iter_column_batches(batch_size=batch_size)
+
+    counting_standardized = _CountingGenotypeMatrix(standardized)
+
+    def fake_solve_sample_space_rhs_cpu(
+        genotype_matrix,
+        prior_variances,
+        diagonal_noise,
+        right_hand_side,
+        initial_guess,
+        tolerance,
+        max_iterations,
+        preconditioner,
+        batch_size,
+        return_iterations=False,
+    ):
+        rhs = np.asarray(right_hand_side, dtype=np.float64)
+        if rhs.ndim == 1:
+            rhs = rhs[:, None]
+        return (rhs, 2) if return_iterations else rhs
+
+    monkeypatch.setattr(
+        mixture_inference,
+        "_sample_space_preconditioner",
+        lambda **kwargs: np.ones(sample_count, dtype=np.float64),
+    )
+    monkeypatch.setattr(mixture_inference, "_solve_sample_space_rhs_cpu", fake_solve_sample_space_rhs_cpu)
+    monkeypatch.setattr(mixture_inference, "stochastic_logdet", lambda *args, **kwargs: 0.0)
+
+    alpha, beta, beta_variance, projected_targets, linear_predictor, *_ = mixture_inference._restricted_posterior_state(
+        genotype_matrix=counting_standardized,
+        covariate_matrix=covariate_matrix,
+        targets=targets,
+        prior_variances=prior_variances,
+        diagonal_noise=diagonal_noise,
+        solver_tolerance=1e-6,
+        maximum_linear_solver_iterations=16,
+        logdet_probe_count=2,
+        logdet_lanczos_steps=4,
+        exact_solver_matrix_limit=2,
+        posterior_variance_batch_size=3,
+        posterior_variance_probe_count=5,
+        random_seed=7,
+        compute_logdet=False,
+        compute_beta_variance=True,
+        sample_space_preconditioner_rank=0,
+        allow_working_set=False,
+    )
+
+    assert alpha.shape == (covariate_matrix.shape[1],)
+    assert beta.shape == (variant_count,)
+    assert beta_variance.shape == (variant_count,)
+    assert projected_targets.shape == (sample_count,)
+    assert linear_predictor.shape == (sample_count,)
+    assert transpose_matvec_calls == 0
+    assert sorted(transpose_matmat_widths) == [5, 6]
 
 
 def test_binary_posterior_stops_when_predictor_update_is_stalled(random_generator, monkeypatch):
