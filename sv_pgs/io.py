@@ -510,26 +510,33 @@ def load_dataset_from_files(
 def _fast_mmap_row_reindex(matrix: np.ndarray, row_indices: np.ndarray) -> np.ndarray:
     """Reindex rows of a (possibly mmap'd, column-major) matrix efficiently.
 
-    Direct fancy indexing on a column-major mmap is catastrophically slow
-    (random disk access per row per column). Instead, read columns in batches
-    (contiguous in F-order), reindex in RAM, and write to a pre-allocated result.
+    If all rows are kept (same count), skip reindexing entirely — the matrix
+    is already in the correct order. This handles migrated caches (rows in
+    sample-table order from the original run) and new caches (rows in VCF
+    order with identity permutation).
+
+    If a true subset is needed, read columns in batches (contiguous in
+    F-order) to avoid catastrophic random disk access on column-major mmaps.
     """
     n_rows_out = len(row_indices)
     n_cols = matrix.shape[1]
-    # If it's identity, skip entirely
-    if n_rows_out == matrix.shape[0] and np.array_equal(row_indices, np.arange(n_rows_out, dtype=row_indices.dtype)):
+    # Same row count → matrix is already in the correct order (migrated cache
+    # or identity permutation). Skip to avoid 13GB random mmap access AND
+    # to avoid incorrect double-permutation on migrated caches.
+    if n_rows_out == matrix.shape[0]:
         return matrix
+    # True subset: fewer rows out than in. Batch column reads for speed.
+    log(f"    subsetting {matrix.shape[0]:,} → {n_rows_out:,} samples...")
     result = np.empty((n_rows_out, n_cols), dtype=matrix.dtype, order="F")
     batch_size = 2048
     n_batches = (n_cols + batch_size - 1) // batch_size
     for batch_idx in range(n_batches):
         start = batch_idx * batch_size
         end = min(start + batch_size, n_cols)
-        # np.array() forces mmap read for the column batch (contiguous in F-order)
         col_batch = np.array(matrix[:, start:end])
         result[:, start:end] = col_batch[row_indices, :]
         if batch_idx % 20 == 0 or batch_idx == n_batches - 1:
-            log(f"    reindexing: {end:,}/{n_cols:,} columns ({100*end/n_cols:.0f}%)  mem={mem()}")
+            log(f"    subsetting: {end:,}/{n_cols:,} columns ({100*end/n_cols:.0f}%)  mem={mem()}")
     return result
 
 
