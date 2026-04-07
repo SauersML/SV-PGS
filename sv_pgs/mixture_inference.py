@@ -55,7 +55,7 @@ from __future__ import annotations
 from dataclasses import dataclass, fields as dataclass_fields
 import hashlib
 import json
-from typing import Callable, Sequence, cast
+from typing import Any, Callable, Sequence, cast
 
 import sv_pgs._jax  # noqa: F401
 import jax.numpy as jnp
@@ -157,6 +157,7 @@ class VariationalFitCheckpoint:
     best_validation_metric: float | None
     best_alpha: np.ndarray | None
     best_beta: np.ndarray | None
+    best_beta_variance: np.ndarray | None
     best_local_scale: np.ndarray | None
     best_theta: np.ndarray | None
     best_sigma_error2: float | None
@@ -586,6 +587,7 @@ def fit_variational_em(
             best_validation_metric=None if best_validation_metric is None else float(best_validation_metric),
             best_alpha=_copy_optional(best_alpha),
             best_beta=_copy_optional(best_beta),
+            best_beta_variance=_copy_optional(best_beta_variance),
             best_local_scale=_copy_optional(best_local_scale),
             best_theta=_copy_optional(best_theta),
             best_sigma_error2=None if best_sigma_error2 is None else float(best_sigma_error2),
@@ -599,7 +601,7 @@ def fit_variational_em(
         nonlocal alpha_state, beta_state, objective_history, validation_history
         nonlocal previous_alpha, previous_beta, previous_local_scale, previous_theta
         nonlocal previous_tpb_shape_a_vector, previous_tpb_shape_b_vector
-        nonlocal best_validation_metric, best_alpha, best_beta, best_local_scale, best_theta
+        nonlocal best_validation_metric, best_alpha, best_beta, best_beta_variance, best_local_scale, best_theta
         nonlocal best_sigma_error2, best_tpb_shape_a_vector, best_tpb_shape_b_vector, start_iteration
         global_scale, scale_model_coefficients = _initialize_scale_model(prior_design, config)
         tpb_shape_a_vector = _initialize_tpb_shape_a_vector(prior_design, config)
@@ -626,6 +628,7 @@ def fit_variational_em(
         best_validation_metric = None
         best_alpha = None
         best_beta = None
+        best_beta_variance = None
         best_local_scale = None
         best_theta = None
         best_sigma_error2 = None
@@ -685,6 +688,7 @@ def fit_variational_em(
             best_validation_metric = None if resume_checkpoint.best_validation_metric is None else float(resume_checkpoint.best_validation_metric)
             best_alpha = _copy_optional(resume_checkpoint.best_alpha)
             best_beta = _copy_optional(resume_checkpoint.best_beta)
+            best_beta_variance = _copy_optional(resume_checkpoint.best_beta_variance)
             best_local_scale = _copy_optional(resume_checkpoint.best_local_scale)
             best_theta = _copy_optional(resume_checkpoint.best_theta)
             best_sigma_error2 = None if resume_checkpoint.best_sigma_error2 is None else float(resume_checkpoint.best_sigma_error2)
@@ -698,6 +702,7 @@ def fit_variational_em(
 
     log(f"  variational EM: {genotype_matrix.shape[1]} reduced variants, {covariate_matrix.shape[1]} covariates, {target_vector.shape[0]} samples, max_iter={config.max_outer_iterations}")
     use_stochastic_updates = _should_use_stochastic_variational_updates(genotype_matrix, config)
+    beta_variance_state: np.ndarray | None = None
     if use_stochastic_updates:
         block_size = min(int(config.stochastic_variant_batch_size), int(genotype_matrix.shape[1]))
         block_count = max((int(genotype_matrix.shape[1]) + block_size - 1) // block_size, 1)
@@ -724,6 +729,11 @@ def fit_variational_em(
         )
         for outer_iteration in range(start_iteration, config.max_outer_iterations):
             log(f"  variational EM epoch {outer_iteration + 1}/{config.max_outer_iterations} start  sigma_e2={sigma_error2:.6f}  global_scale={global_scale:.6f}  mem={mem()}")
+            refresh_beta_variance = _should_refresh_beta_variance(
+                outer_iteration,
+                cached_beta_variance=beta_variance_state,
+                refresh_interval=config.beta_variance_update_interval,
+            )
             posterior_theta = _pack_theta(
                 global_scale=float(global_scale),
                 scale_model_coefficients=scale_model_coefficients,
@@ -802,17 +812,21 @@ def fit_variational_em(
                         posterior_variance_probe_count=config.posterior_variance_probe_count,
                         random_seed=config.random_seed + step_index,
                         compute_logdet=False,
-                        compute_beta_variance=True,
+                        compute_beta_variance=refresh_beta_variance,
                         sample_space_preconditioner_rank=config.sample_space_preconditioner_rank,
                         predictor_offset=predictor_offset,
                     )
                     block_beta_candidate = np.asarray(block_state[1], dtype=np.float64)
-                    block_beta_variance = np.asarray(block_state[2], dtype=np.float64)
+                    block_beta_variance = (
+                        np.asarray(block_state[2], dtype=np.float64)
+                        if refresh_beta_variance
+                        else np.asarray(beta_variance_state[block_indices], dtype=np.float64)
+                    )
                 else:
                     block_state = _fit_collapsed_posterior(
                         genotype_matrix=block_genotypes,
                         covariate_matrix=empty_covariates,
-                            targets=target_vector - predictor_offset,
+                        targets=target_vector - predictor_offset,
                         reduced_prior_variances=block_prior_variances,
                         sigma_error2=sigma_error2,
                         alpha_init=np.zeros(0, dtype=np.float64),
@@ -820,10 +834,13 @@ def fit_variational_em(
                         trait_type=TraitType.QUANTITATIVE,
                         config=config,
                         compute_logdet=False,
-                        compute_beta_variance=True,
+                        compute_beta_variance=refresh_beta_variance,
+                        stale_beta_variance=None if beta_variance_state is None else beta_variance_state[block_indices],
                     )
                     block_beta_candidate = np.asarray(block_state.beta, dtype=np.float64)
                     block_beta_variance = np.asarray(block_state.beta_variance, dtype=np.float64)
+                if beta_variance_state is None:
+                    beta_variance_state = np.maximum(reduced_prior_variances.copy(), 1e-8)
                 block_beta_updated = block_beta_previous + step_size * (block_beta_candidate - block_beta_previous)
                 beta_delta = block_beta_updated - block_beta_previous
                 if np.any(beta_delta):
@@ -835,6 +852,10 @@ def fit_variational_em(
                 block_second_moment = np.asarray(
                     block_beta_candidate * block_beta_candidate + block_beta_variance,
                     dtype=np.float64,
+                )
+                beta_variance_state[block_indices] = (
+                    (1.0 - step_size) * beta_variance_state[block_indices]
+                    + step_size * block_beta_variance
                 )
                 reduced_second_moment[block_indices] = (
                     (1.0 - step_size) * reduced_second_moment[block_indices]
@@ -953,6 +974,7 @@ def fit_variational_em(
                         best_validation_metric = validation_metric
                         best_alpha = alpha_state.copy()
                         best_beta = beta_state.copy()
+                        best_beta_variance = beta_variance_state.copy()
                         best_local_scale = local_scale.copy()
                         best_theta = _pack_theta(global_scale, scale_model_coefficients)
                         best_sigma_error2 = float(sigma_error2)
@@ -983,8 +1005,9 @@ def fit_variational_em(
             obj_str = f"{objective_history[-1]:.6f}" if objective_history else "N/A"
             val_str = f"  val={validation_history[-1]:.6f}" if validation_history else ""
             hyper_str = "  [+hyper]" if should_update_hyperparameters else ""
+            variance_str = "  [beta_var]" if refresh_beta_variance else "  [beta_var=reuse]"
             nonzero_beta = int(np.count_nonzero(np.abs(beta_state) > 1e-8))
-            log(f"  SVI epoch {iter_num}/{config.max_outer_iterations}  obj={obj_str}  delta={parameter_change:.2e}  sigma_e2={sigma_error2:.4f}  g_scale={float(global_scale):.4f}  nz_beta={nonzero_beta}{val_str}{hyper_str}  mem={mem()}")
+            log(f"  SVI epoch {iter_num}/{config.max_outer_iterations}  obj={obj_str}  delta={parameter_change:.2e}  sigma_e2={sigma_error2:.4f}  g_scale={float(global_scale):.4f}  nz_beta={nonzero_beta}{val_str}{hyper_str}{variance_str}  mem={mem()}")
             if checkpoint_callback is not None:
                 checkpoint_callback(_build_checkpoint(iter_num))
             if validation_history:
@@ -999,6 +1022,11 @@ def fit_variational_em(
     else:
         for outer_iteration in range(start_iteration, config.max_outer_iterations):
             log(f"  variational EM iteration {outer_iteration + 1}/{config.max_outer_iterations} start  sigma_e2={sigma_error2:.6f}  global_scale={global_scale:.6f}  mem={mem()}")
+            refresh_beta_variance = _should_refresh_beta_variance(
+                outer_iteration,
+                cached_beta_variance=beta_variance_state,
+                refresh_interval=config.beta_variance_update_interval,
+            )
             posterior_theta = _pack_theta(
                 global_scale=float(global_scale),
                 scale_model_coefficients=scale_model_coefficients,
@@ -1029,8 +1057,9 @@ def fit_variational_em(
                 trait_type=config.trait_type,
                 config=config,
                 compute_logdet=False,
-                compute_beta_variance=True,
+                compute_beta_variance=refresh_beta_variance,
                 predictor_offset=predictor_offset_array,
+                stale_beta_variance=beta_variance_state,
             )
             if config.trait_type == TraitType.BINARY and config.binary_intercept_calibration:
                 posterior_state = _apply_binary_intercept_calibration(
@@ -1040,8 +1069,9 @@ def fit_variational_em(
             alpha_state = posterior_state.alpha
             beta_state = posterior_state.beta
             sigma_error2 = posterior_state.sigma_error2
+            beta_variance_state = np.asarray(posterior_state.beta_variance, dtype=np.float64)
 
-            reduced_second_moment = np.asarray(beta_state * beta_state + posterior_state.beta_variance, dtype=np.float64)
+            reduced_second_moment = np.asarray(beta_state * beta_state + beta_variance_state, dtype=np.float64)
             full_objective = posterior_state.collapsed_objective + _local_scale_prior_objective(
                 local_scale=local_scale,
                 auxiliary_delta=auxiliary_delta,
@@ -1075,6 +1105,7 @@ def fit_variational_em(
                         best_validation_metric = validation_metric
                         best_alpha = alpha_state.copy()
                         best_beta = beta_state.copy()
+                        best_beta_variance = beta_variance_state.copy()
                         best_local_scale = posterior_local_scale.copy()
                         best_theta = posterior_theta.copy()
                         best_sigma_error2 = float(sigma_error2)
@@ -1143,8 +1174,9 @@ def fit_variational_em(
             obj_str = f"{objective_history[-1]:.6f}" if objective_history else "N/A"
             val_str = f"  val={validation_history[-1]:.6f}" if validation_history else ""
             hyper_str = "  [+hyper]" if should_update_hyperparameters else ""
+            variance_str = "  [beta_var]" if refresh_beta_variance else "  [beta_var=reuse]"
             nonzero_beta = int(np.count_nonzero(np.abs(beta_state) > 1e-8))
-            log(f"  EM iter {iter_num}/{config.max_outer_iterations}  obj={obj_str}  delta={parameter_change:.2e}  sigma_e2={sigma_error2:.4f}  g_scale={float(global_scale):.4f}  nz_beta={nonzero_beta}{val_str}{hyper_str}  mem={mem()}")
+            log(f"  EM iter {iter_num}/{config.max_outer_iterations}  obj={obj_str}  delta={parameter_change:.2e}  sigma_e2={sigma_error2:.4f}  g_scale={float(global_scale):.4f}  nz_beta={nonzero_beta}{val_str}{hyper_str}{variance_str}  mem={mem()}")
             if checkpoint_callback is not None:
                 checkpoint_callback(_build_checkpoint(iter_num))
 
@@ -1162,6 +1194,7 @@ def fit_variational_em(
         if (
             best_alpha is None
             or best_beta is None
+            or best_beta_variance is None
             or best_local_scale is None
             or best_theta is None
             or best_sigma_error2 is None
@@ -1171,6 +1204,7 @@ def fit_variational_em(
             raise RuntimeError("best validation snapshot is incomplete")
         alpha_state = best_alpha
         beta_state = best_beta
+        beta_variance_state = best_beta_variance
         local_scale = best_local_scale
         sigma_error2 = best_sigma_error2
         global_scale, scale_model_coefficients = _unpack_theta(best_theta)
@@ -1258,6 +1292,17 @@ def _prepare_validation(
     )
 
 
+def _should_refresh_beta_variance(
+    iteration_index: int,
+    *,
+    cached_beta_variance: np.ndarray | None,
+    refresh_interval: int,
+) -> bool:
+    if cached_beta_variance is None:
+        return True
+    return ((iteration_index + 1) % max(int(refresh_interval), 1)) == 0
+
+
 def _as_standardized_genotype_matrix(
     genotypes: StandardizedGenotypeMatrix | np.ndarray,
 ) -> StandardizedGenotypeMatrix:
@@ -1283,6 +1328,7 @@ def _fit_collapsed_posterior(
     compute_logdet: bool = True,
     compute_beta_variance: bool = True,
     predictor_offset: np.ndarray | None = None,
+    stale_beta_variance: np.ndarray | None = None,
 ) -> PosteriorState:
     log(f"    collapsed posterior: trait={trait_type.value}  n_variants={genotype_matrix.shape[1]}  n_samples={genotype_matrix.shape[0]}  sigma_e2={sigma_error2:.6f}  mem={mem()}")
     prior_variances = np.maximum(np.asarray(reduced_prior_variances, dtype=np.float64), 1e-8)
@@ -1312,6 +1358,7 @@ def _fit_collapsed_posterior(
             compute_logdet=compute_logdet,
             compute_beta_variance=compute_beta_variance,
             sample_space_preconditioner_rank=config.sample_space_preconditioner_rank,
+            stale_beta_variance=stale_beta_variance,
         )
         linear_predictor = np.asarray(linear_predictor, dtype=np.float64) + predictor_offset_array
     else:
@@ -1343,6 +1390,8 @@ def _fit_collapsed_posterior(
             sample_space_preconditioner_rank=config.sample_space_preconditioner_rank,
             predictor_offset=predictor_offset_array,
         )
+        if not compute_beta_variance and stale_beta_variance is not None:
+            beta_variance = np.asarray(stale_beta_variance, dtype=np.float64)
         sigma_error2_new = 1.0
     return PosteriorState(
         alpha=np.asarray(alpha, dtype=np.float64),
@@ -1381,6 +1430,7 @@ def _quantitative_posterior_state(
     compute_logdet: bool = True,
     compute_beta_variance: bool = True,
     sample_space_preconditioner_rank: int = 256,
+    stale_beta_variance: np.ndarray | None = None,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, float, float]:
     standardized_genotypes = _as_standardized_genotype_matrix(genotype_matrix)
     sample_count = standardized_genotypes.shape[0]
@@ -1409,7 +1459,12 @@ def _quantitative_posterior_state(
     # Leverage correction accounts for this: variants the model is very
     # confident about (low variance relative to prior) contribute to the
     # correction term, preventing the noise estimate from shrinking too fast.
-    leverage_weight = np.maximum(prior_variances - beta_variance, 0.0) / np.maximum(prior_variances, 1e-12)
+    effective_beta_variance = (
+        np.asarray(beta_variance, dtype=np.float64)
+        if compute_beta_variance or stale_beta_variance is None
+        else np.asarray(stale_beta_variance, dtype=np.float64)
+    )
+    leverage_weight = np.maximum(prior_variances - effective_beta_variance, 0.0) / np.maximum(prior_variances, 1e-12)
     residual_vector = targets - linear_predictor
     residual_sum_squares = float(np.dot(residual_vector, residual_vector))
     posterior_fit_uncertainty = sigma_error2 * float(np.sum(leverage_weight))
@@ -1422,7 +1477,7 @@ def _quantitative_posterior_state(
         + (logdet_covariance + logdet_gls if compute_logdet else 0.0)
         + (sample_count - covariate_matrix.shape[1]) * np.log(2.0 * np.pi)
     )
-    return alpha, beta, beta_variance, linear_predictor, collapsed_objective, sigma_error2_new
+    return alpha, beta, effective_beta_variance, linear_predictor, collapsed_objective, sigma_error2_new
 
 
 def _binary_newton_solver_controls(
@@ -1471,6 +1526,107 @@ def _binary_penalized_log_posterior(
             + (1.0 - target_array) * np.log(1.0 - probabilities + 1e-12)
         )
         - 0.5 * np.sum(prior_precision_array * beta_array * beta_array)
+    )
+
+
+def _cupy_array_to_numpy(array, *, dtype: np.dtype | type[np.floating[Any]]) -> np.ndarray:
+    host_array = array.get() if hasattr(array, "get") else array
+    return np.asarray(host_array, dtype=dtype)
+
+
+def _stable_sigmoid_cupy(cp, values_gpu, *, dtype):
+    positive_branch = values_gpu >= dtype(0.0)
+    negative_exponential = cp.exp(cp.where(positive_branch, -values_gpu, values_gpu))
+    return cp.where(
+        positive_branch,
+        dtype(1.0) / (dtype(1.0) + negative_exponential),
+        negative_exponential / (dtype(1.0) + negative_exponential),
+    )
+
+
+def _softplus_cupy(cp, values_gpu, *, dtype):
+    positive_branch = values_gpu >= dtype(0.0)
+    return cp.where(
+        positive_branch,
+        values_gpu + cp.log1p(cp.exp(-values_gpu)),
+        cp.log1p(cp.exp(values_gpu)),
+    )
+
+
+def _streaming_gpu_genotype_matvec(
+    genotype_matrix: StandardizedGenotypeMatrix,
+    coefficients_gpu,
+    *,
+    batch_size: int,
+    cp,
+    dtype,
+):
+    result_gpu = cp.zeros(genotype_matrix.shape[0], dtype=dtype)
+    for batch_slice, standardized_batch in _iter_standardized_gpu_batches(
+        genotype_matrix.raw,
+        genotype_matrix.variant_indices,
+        genotype_matrix.means,
+        genotype_matrix.scales,
+        batch_size=batch_size,
+        cupy=cp,
+        dtype=dtype,
+    ):
+        result_gpu += standardized_batch @ coefficients_gpu[batch_slice]
+    return result_gpu
+
+
+def _streaming_gpu_genotype_transpose_matvec(
+    genotype_matrix: StandardizedGenotypeMatrix,
+    sample_weights_gpu,
+    *,
+    batch_size: int,
+    cp,
+    dtype,
+):
+    result_gpu = cp.empty(genotype_matrix.shape[1], dtype=dtype)
+    for batch_slice, standardized_batch in _iter_standardized_gpu_batches(
+        genotype_matrix.raw,
+        genotype_matrix.variant_indices,
+        genotype_matrix.means,
+        genotype_matrix.scales,
+        batch_size=batch_size,
+        cupy=cp,
+        dtype=dtype,
+    ):
+        result_gpu[batch_slice] = standardized_batch.T @ sample_weights_gpu
+    return result_gpu
+
+
+def _binary_expected_polya_gamma_weights_cupy(
+    cp,
+    linear_predictor_gpu,
+    minimum_weight: float,
+    *,
+    dtype,
+):
+    absolute_predictor = cp.abs(linear_predictor_gpu)
+    tiny_mask = absolute_predictor < dtype(1e-6)
+    safe_predictor = cp.where(tiny_mask, dtype(1.0), absolute_predictor)
+    nonzero_weights = cp.tanh(safe_predictor * dtype(0.5)) / (dtype(2.0) * safe_predictor)
+    weights = cp.where(tiny_mask, dtype(0.25), nonzero_weights)
+    return cp.maximum(weights, dtype(minimum_weight))
+
+
+def _binary_penalized_log_posterior_cupy(
+    cp,
+    linear_predictor_gpu,
+    targets_gpu,
+    prior_precision_gpu,
+    beta_gpu,
+    *,
+    dtype,
+) -> float:
+    return float(
+        cp.sum(
+            targets_gpu * linear_predictor_gpu - _softplus_cupy(cp, linear_predictor_gpu, dtype=dtype),
+            dtype=cp.float64,
+        )
+        - dtype(0.5) * cp.sum(prior_precision_gpu * beta_gpu * beta_gpu, dtype=cp.float64)
     )
 
 
@@ -1525,23 +1681,62 @@ def _binary_posterior_state(
     covariate_matrix_f64 = np.asarray(covariate_matrix, dtype=np.float64)
     target_array = np.asarray(targets, dtype=np.float64).reshape(-1)
     kappa = target_array - 0.5
+    cupy = None
+    streaming_gpu_binary_backend = (
+        standardized_genotypes._cupy_cache is None
+        and standardized_genotypes.raw is not None
+        and not standardized_genotypes.supports_jax_dense_ops()
+    )
+    if streaming_gpu_binary_backend:
+        cupy = _try_import_cupy()
+        streaming_gpu_binary_backend = cupy is not None
+    if streaming_gpu_binary_backend:
+        assert cupy is not None
+        compute_cp_dtype = _cupy_compute_dtype(cupy)
+        covariate_matrix_gpu = cupy.asarray(covariate_matrix_f64, dtype=compute_cp_dtype)
+        target_array_gpu = cupy.asarray(target_array, dtype=compute_cp_dtype)
+        prior_precision_gpu = cupy.asarray(prior_precision, dtype=compute_cp_dtype)
+        predictor_offset_gpu = cupy.asarray(predictor_offset_array, dtype=compute_cp_dtype)
     inexact_solver_tolerance, inexact_maximum_linear_solver_iterations = _binary_newton_solver_controls(
         standardized_genotypes,
         solver_tolerance=solver_tolerance,
         maximum_linear_solver_iterations=maximum_linear_solver_iterations,
     )
     import time as _time
-    current_linear_predictor = predictor_offset_array + np.asarray(
-        covariate_matrix_f64 @ parameters[:covariate_count]
-        + standardized_genotypes.matvec(parameters[covariate_count:], batch_size=posterior_variance_batch_size),
-        dtype=np.float64,
-    )
-    current_objective = _binary_penalized_log_posterior(
-        linear_predictor=current_linear_predictor,
-        targets=target_array,
-        prior_precision=prior_precision,
-        beta=parameters[covariate_count:],
-    )
+    if streaming_gpu_binary_backend:
+        assert cupy is not None
+        current_linear_predictor_gpu = (
+            predictor_offset_gpu
+            + covariate_matrix_gpu @ cupy.asarray(parameters[:covariate_count], dtype=compute_cp_dtype)
+            + _streaming_gpu_genotype_matvec(
+                standardized_genotypes,
+                cupy.asarray(parameters[covariate_count:], dtype=compute_cp_dtype),
+                batch_size=posterior_variance_batch_size,
+                cp=cupy,
+                dtype=compute_cp_dtype,
+            )
+        )
+        current_linear_predictor = _cupy_array_to_numpy(current_linear_predictor_gpu, dtype=np.float64)
+        current_objective = _binary_penalized_log_posterior_cupy(
+            cupy,
+            current_linear_predictor_gpu,
+            target_array_gpu,
+            prior_precision_gpu,
+            cupy.asarray(parameters[covariate_count:], dtype=compute_cp_dtype),
+            dtype=compute_cp_dtype,
+        )
+    else:
+        current_linear_predictor = predictor_offset_array + np.asarray(
+            covariate_matrix_f64 @ parameters[:covariate_count]
+            + standardized_genotypes.matvec(parameters[covariate_count:], batch_size=posterior_variance_batch_size),
+            dtype=np.float64,
+        )
+        current_objective = _binary_penalized_log_posterior(
+            linear_predictor=current_linear_predictor,
+            targets=target_array,
+            prior_precision=prior_precision,
+            beta=parameters[covariate_count:],
+        )
     log(
         f"      binary PG updates: {standardized_genotypes.shape[1]} variants, "
         + f"max_iter={max_iterations}  mem={mem()}"
@@ -1549,7 +1744,17 @@ def _binary_posterior_state(
     final_weights = _binary_expected_polya_gamma_weights(current_linear_predictor, minimum_weight)
     for iteration_index in range(max_iterations):
         iteration_start = _time.monotonic()
-        current_weights = _binary_expected_polya_gamma_weights(current_linear_predictor, minimum_weight)
+        if streaming_gpu_binary_backend:
+            assert cupy is not None
+            current_weights_gpu = _binary_expected_polya_gamma_weights_cupy(
+                cupy,
+                current_linear_predictor_gpu,
+                minimum_weight,
+                dtype=compute_cp_dtype,
+            )
+            current_weights = _cupy_array_to_numpy(current_weights_gpu, dtype=np.float64)
+        else:
+            current_weights = _binary_expected_polya_gamma_weights(current_linear_predictor, minimum_weight)
         pseudo_response = kappa / current_weights - predictor_offset_array
         solve_start = _time.monotonic()
         updated_alpha, updated_beta, _, _projected_targets, updated_fitted_response, _restricted_quadratic, _logdet_covariance, _logdet_gls = (
@@ -1576,12 +1781,24 @@ def _binary_posterior_state(
         solve_seconds = _time.monotonic() - solve_start
         updated_parameters = np.concatenate([updated_alpha, updated_beta], axis=0).astype(np.float64, copy=False)
         updated_linear_predictor = predictor_offset_array + np.asarray(updated_fitted_response, dtype=np.float64)
-        updated_objective = _binary_penalized_log_posterior(
-            linear_predictor=updated_linear_predictor,
-            targets=target_array,
-            prior_precision=prior_precision,
-            beta=updated_beta,
-        )
+        if streaming_gpu_binary_backend:
+            assert cupy is not None
+            updated_linear_predictor_gpu = cupy.asarray(updated_linear_predictor, dtype=compute_cp_dtype)
+            updated_objective = _binary_penalized_log_posterior_cupy(
+                cupy,
+                updated_linear_predictor_gpu,
+                target_array_gpu,
+                prior_precision_gpu,
+                cupy.asarray(updated_beta, dtype=compute_cp_dtype),
+                dtype=compute_cp_dtype,
+            )
+        else:
+            updated_objective = _binary_penalized_log_posterior(
+                linear_predictor=updated_linear_predictor,
+                targets=target_array,
+                prior_precision=prior_precision,
+                beta=updated_beta,
+            )
         relative_parameter_step = float(np.linalg.norm(updated_parameters - parameters)) / max(
             float(np.linalg.norm(parameters)),
             1e-8,
@@ -1601,12 +1818,15 @@ def _binary_posterior_state(
         )
         parameters = updated_parameters
         current_linear_predictor = updated_linear_predictor
+        if streaming_gpu_binary_backend:
+            current_linear_predictor_gpu = updated_linear_predictor_gpu
         current_objective = updated_objective
         final_weights = current_weights
-        if max(relative_parameter_step, relative_predictor_step) <= gradient_tolerance:
+        if relative_predictor_step <= gradient_tolerance or max(relative_parameter_step, relative_predictor_step) <= gradient_tolerance:
             log(
                 f"      binary converged at iter {iteration_index + 1}: "
-                + f"step={max(relative_parameter_step, relative_predictor_step):.2e} <= tol={gradient_tolerance:.2e}"
+                + f"param_step={relative_parameter_step:.2e} predictor_step={relative_predictor_step:.2e} "
+                + f"tol={gradient_tolerance:.2e}"
             )
             break
 
@@ -1633,14 +1853,38 @@ def _binary_posterior_state(
         )
     )
     final_linear_predictor = predictor_offset_array + np.asarray(_fitted_response, dtype=np.float64)
-    final_weights = _binary_expected_polya_gamma_weights(final_linear_predictor, minimum_weight)
+    if streaming_gpu_binary_backend:
+        assert cupy is not None
+        final_linear_predictor_gpu = cupy.asarray(final_linear_predictor, dtype=compute_cp_dtype)
+        final_weights = _cupy_array_to_numpy(
+            _binary_expected_polya_gamma_weights_cupy(
+                cupy,
+                final_linear_predictor_gpu,
+                minimum_weight,
+                dtype=compute_cp_dtype,
+            ),
+            dtype=np.float64,
+        )
+    else:
+        final_weights = _binary_expected_polya_gamma_weights(final_linear_predictor, minimum_weight)
     final_parameters = np.concatenate([final_alpha, final_beta], axis=0).astype(np.float64, copy=False)
-    final_objective = _binary_penalized_log_posterior(
-        linear_predictor=final_linear_predictor,
-        targets=target_array,
-        prior_precision=prior_precision,
-        beta=final_beta,
-    )
+    if streaming_gpu_binary_backend:
+        assert cupy is not None
+        final_objective = _binary_penalized_log_posterior_cupy(
+            cupy,
+            final_linear_predictor_gpu,
+            target_array_gpu,
+            prior_precision_gpu,
+            cupy.asarray(final_beta, dtype=compute_cp_dtype),
+            dtype=compute_cp_dtype,
+        )
+    else:
+        final_objective = _binary_penalized_log_posterior(
+            linear_predictor=final_linear_predictor,
+            targets=target_array,
+            prior_precision=prior_precision,
+            beta=final_beta,
+        )
     logdet_hessian = (
         float(np.sum(np.log(np.maximum(prior_precision, 1e-12))))
         + float(np.sum(np.log(np.maximum(final_weights, 1e-12))))

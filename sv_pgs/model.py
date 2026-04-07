@@ -267,6 +267,7 @@ def _try_load_fit_stage_cache(
                 means=np.asarray(prepared_arrays.means[combined_indices], dtype=np.float32),
                 scales=np.asarray(prepared_arrays.scales[combined_indices], dtype=np.float32),
                 variant_indices=np.arange(combined_indices.shape[0], dtype=np.int32),
+                support_counts=np.asarray(prepared_arrays.support_counts[combined_indices], dtype=np.int32),
             )
             log(f"fit-stage cache hit — loading from {cache_paths.cache_dir.name}/{cache_paths.key}.*")
             return active_variant_indices, reduced_tie_map, reduced_genotypes, True
@@ -408,7 +409,11 @@ class BayesianPGS:
         log(f"preprocessor ready  {len(normalized_records)} variant records  mem={mem()}")
 
         log("creating standardized genotype view...")
-        standardized_genotypes = raw_genotype_matrix.standardized(prepared_arrays.means, prepared_arrays.scales)
+        standardized_genotypes = raw_genotype_matrix.standardized(
+            prepared_arrays.means,
+            prepared_arrays.scales,
+            support_counts=prepared_arrays.support_counts,
+        )
         if self.config.enable_stage1_null_model:
             stage1_null_fit = fit_stage1_null_model(
                 standardized_genotypes=standardized_genotypes,

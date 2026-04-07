@@ -1311,6 +1311,131 @@ def test_gpu_sample_space_solver_retries_in_float64_after_mixed_precision_stalls
     assert any(dtype == np.float32 for dtype in inner_call_dtypes[:-1])
 
 
+def test_binary_posterior_state_streaming_gpu_avoids_jax_genotype_matvec(monkeypatch: pytest.MonkeyPatch):
+    genotype_matrix = np.array(
+        [
+            [0.0, 1.0, 0.0],
+            [1.0, 0.0, 2.0],
+            [2.0, 1.0, 1.0],
+            [0.0, 2.0, 0.0],
+        ],
+        dtype=np.float32,
+    )
+    standardized = as_raw_genotype_matrix(genotype_matrix).standardized(
+        means=np.array([0.75, 1.0, 0.75], dtype=np.float32),
+        scales=np.array([0.8291562, 0.70710677, 0.8291562], dtype=np.float32),
+    )
+    covariate_matrix = np.column_stack(
+        [
+            np.ones(genotype_matrix.shape[0], dtype=np.float32),
+            np.array([0.5, -1.0, 1.5, 0.25], dtype=np.float32),
+        ]
+    )
+    targets = np.array([0.0, 1.0, 1.0, 0.0], dtype=np.float32)
+    prior_variances = np.array([1.0, 0.5, 0.75], dtype=np.float64)
+
+    class _FakeCupy:
+        float32 = np.float32
+        float64 = np.float64
+
+        @staticmethod
+        def asarray(array, dtype=None):
+            return np.asarray(array, dtype=dtype)
+
+        @staticmethod
+        def zeros(shape, dtype=None):
+            return np.zeros(shape, dtype=dtype)
+
+        @staticmethod
+        def empty(shape, dtype=None, order=None):
+            return np.empty(shape, dtype=dtype, order="C" if order is None else order)
+
+        @staticmethod
+        def isnan(array):
+            return np.isnan(array)
+
+        @staticmethod
+        def exp(array):
+            return np.exp(array)
+
+        @staticmethod
+        def where(condition, x, y):
+            return np.where(condition, x, y)
+
+        @staticmethod
+        def log1p(array):
+            return np.log1p(array)
+
+        @staticmethod
+        def abs(array):
+            return np.abs(array)
+
+        @staticmethod
+        def tanh(array):
+            return np.tanh(array)
+
+        @staticmethod
+        def maximum(x, y):
+            return np.maximum(x, y)
+
+        @staticmethod
+        def sum(array, axis=None, dtype=None):
+            return np.sum(array, axis=axis, dtype=dtype)
+
+    def _unexpected_matvec(*args, **kwargs):
+        raise AssertionError("streaming GPU binary path should not call StandardizedGenotypeMatrix.matvec")
+
+    def _unexpected_transpose_matvec(*args, **kwargs):
+        raise AssertionError("streaming GPU binary path should not call StandardizedGenotypeMatrix.transpose_matvec")
+
+    def _fake_restricted_posterior_state(**kwargs):
+        covariates = np.asarray(kwargs["covariate_matrix"], dtype=np.float64)
+        target_vector = np.asarray(kwargs["targets"], dtype=np.float64)
+        variant_count = kwargs["genotype_matrix"].shape[1]
+        return (
+            np.zeros(covariates.shape[1], dtype=np.float64),
+            np.zeros(variant_count, dtype=np.float64),
+            np.ones(variant_count, dtype=np.float64),
+            np.zeros_like(target_vector),
+            np.zeros_like(target_vector),
+            0.0,
+            0.0,
+            0.0,
+        )
+
+    monkeypatch.setattr(mixture_inference, "_try_import_cupy", lambda: _FakeCupy())
+    monkeypatch.setattr(mixture_inference, "_cupy_compute_dtype", lambda cp: cp.float32)
+    monkeypatch.setattr(type(standardized), "matvec", _unexpected_matvec)
+    monkeypatch.setattr(type(standardized), "transpose_matvec", _unexpected_transpose_matvec)
+    monkeypatch.setattr(mixture_inference, "_restricted_posterior_state", _fake_restricted_posterior_state)
+
+    alpha, beta, beta_variance, linear_predictor, collapsed_objective = mixture_inference._binary_posterior_state(
+        genotype_matrix=standardized,
+        covariate_matrix=covariate_matrix,
+        targets=targets,
+        prior_variances=prior_variances,
+        alpha_init=np.array([0.1, -0.2], dtype=np.float64),
+        beta_init=np.array([0.3, -0.1, 0.2], dtype=np.float64),
+        minimum_weight=1e-4,
+        max_iterations=1,
+        gradient_tolerance=1e-6,
+        initial_damping=1.0,
+        damping_increase_factor=2.0,
+        damping_decrease_factor=0.5,
+        success_threshold=0.1,
+        minimum_damping=1e-4,
+        compute_logdet=False,
+        compute_beta_variance=False,
+        posterior_variance_batch_size=2,
+    )
+
+    assert alpha.shape == (covariate_matrix.shape[1],)
+    assert beta.shape == (genotype_matrix.shape[1],)
+    assert beta_variance.shape == (genotype_matrix.shape[1],)
+    assert linear_predictor.shape == (genotype_matrix.shape[0],)
+    assert np.isfinite(collapsed_objective)
+
+
 def test_cpu_sample_space_block_cg_matches_dense_solution(monkeypatch: pytest.MonkeyPatch):
     genotype_matrix = np.array(
         [
@@ -1805,6 +1930,7 @@ def test_validation_restores_best_iterate(monkeypatch: pytest.MonkeyPatch):
         compute_logdet,
         compute_beta_variance=True,
         predictor_offset=None,
+        stale_beta_variance=None,
     ):
         call_counter["count"] += 1
         if call_counter["count"] <= config.max_outer_iterations:
@@ -1879,6 +2005,7 @@ def test_binary_validation_uses_calibrated_intercept(monkeypatch: pytest.MonkeyP
         compute_logdet,
         compute_beta_variance=True,
         predictor_offset=None,
+        stale_beta_variance=None,
     ):
         return PosteriorState(
             alpha=np.zeros(covariate_matrix.shape[1], dtype=np.float64),
@@ -1925,6 +2052,68 @@ def test_binary_validation_uses_calibrated_intercept(monkeypatch: pytest.MonkeyP
     assert validation_alphas
     assert np.isclose(validation_alphas[0][0], expected_shift, atol=1e-6)
     assert np.isclose(float(result.alpha[0]), expected_shift, atol=1e-6)
+
+
+def test_variational_em_reuses_beta_variance_between_refreshes(monkeypatch: pytest.MonkeyPatch):
+    compute_beta_variance_calls: list[bool] = []
+    stale_beta_variance_flags: list[bool] = []
+
+    def fake_fit_collapsed_posterior(
+        genotype_matrix,
+        covariate_matrix,
+        targets,
+        reduced_prior_variances,
+        sigma_error2,
+        alpha_init,
+        beta_init,
+        trait_type,
+        config,
+        compute_logdet,
+        compute_beta_variance=True,
+        predictor_offset=None,
+        stale_beta_variance=None,
+    ):
+        compute_beta_variance_calls.append(bool(compute_beta_variance))
+        stale_beta_variance_flags.append(stale_beta_variance is not None)
+        beta_variance = (
+            np.full(1, float(len(compute_beta_variance_calls)), dtype=np.float64)
+            if compute_beta_variance
+            else np.asarray(stale_beta_variance, dtype=np.float64)
+        )
+        return PosteriorState(
+            alpha=np.asarray(alpha_init, dtype=np.float64),
+            beta=np.asarray(beta_init, dtype=np.float64),
+            beta_variance=beta_variance,
+            linear_predictor=np.zeros(targets.shape[0], dtype=np.float64),
+            collapsed_objective=0.0,
+            sigma_error2=1.0,
+        )
+
+    monkeypatch.setattr(mixture_inference, "_fit_collapsed_posterior", fake_fit_collapsed_posterior)
+
+    config = ModelConfig(
+        trait_type=TraitType.QUANTITATIVE,
+        max_outer_iterations=5,
+        update_hyperparameters=False,
+        beta_variance_update_interval=4,
+        stochastic_variational_updates=False,
+    )
+
+    fit_variational_em(
+        genotypes=np.zeros((8, 1), dtype=np.float32),
+        covariates=np.ones((8, 1), dtype=np.float32),
+        targets=np.zeros(8, dtype=np.float32),
+        records=[VariantRecord("variant_0", VariantClass.SNV, "1", 100)],
+        config=config,
+        tie_map=build_tie_map(
+            np.zeros((8, 1), dtype=np.float32),
+            [VariantRecord("variant_0", VariantClass.SNV, "1", 100)],
+            config,
+        ),
+    )
+
+    assert compute_beta_variance_calls == [True, False, False, True, False, True]
+    assert stale_beta_variance_flags == [False, True, True, True, True, False]
 
 
 def test_tpb_shape_vectors_are_learned_from_local_scale_state():

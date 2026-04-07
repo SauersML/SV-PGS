@@ -34,6 +34,8 @@ LOCAL_INT8_STANDARDIZED_STREAMING_TARGET_BATCH_BYTES = 512_000_000
 # (typically 10-30 iterations), giving a huge speedup.
 MATERIALIZE_THRESHOLD_BYTES = 4_000_000_000  # 4 GB
 T4_SAFE_GPU_CACHE_BYTES = 4_500_000_000
+HYBRID_SPARSE_SUPPORT_THRESHOLD = 4_096
+HYBRID_SPARSE_MIN_VARIANT_COUNT = 64
 
 
 def as_raw_genotype_matrix(genotypes: RawGenotypeMatrix | np.ndarray) -> RawGenotypeMatrix:
@@ -82,12 +84,18 @@ class RawGenotypeMatrix(ABC):
     ) -> np.ndarray:
         raise NotImplementedError
 
-    def standardized(self, means: np.ndarray, scales: np.ndarray) -> StandardizedGenotypeMatrix:
+    def standardized(
+        self,
+        means: np.ndarray,
+        scales: np.ndarray,
+        support_counts: np.ndarray | None = None,
+    ) -> StandardizedGenotypeMatrix:
         return StandardizedGenotypeMatrix(
             raw=self,
             means=np.asarray(means, dtype=np.float32),
             scales=np.asarray(scales, dtype=np.float32),
             variant_indices=np.arange(self.shape[1], dtype=np.int32),
+            support_counts=None if support_counts is None else np.asarray(support_counts, dtype=np.int32),
         )
 
     def __array__(self, dtype: np.dtype | type | None = None) -> np.ndarray:
@@ -490,7 +498,11 @@ def _standardize_batch_cupy(
     resolved_dtype = cupy.float32 if dtype is None else dtype
     standardized = cupy.asarray(batch_values, dtype=resolved_dtype)
     if missing_sentinel is None:
-        missing_mask = cupy.isnan(standardized)
+        missing_mask = (
+            cupy.isnan(standardized)
+            if hasattr(cupy, "isnan")
+            else np.isnan(np.asarray(standardized))
+        )
     else:
         missing_mask = standardized == float(missing_sentinel)
     standardized -= means[None, :]
@@ -546,6 +558,342 @@ def _gpu_materialization_budget_bytes(cupy) -> int:
 
 
 @dataclass(slots=True)
+class _SparseCarrierBackend:
+    sample_count: int
+    means: np.ndarray
+    scales: np.ndarray
+    variant_ptr: np.ndarray
+    variant_sample_indices: np.ndarray
+    variant_dosages: np.ndarray
+    missing_variant_ptr: np.ndarray
+    missing_variant_sample_indices: np.ndarray
+    sample_ptr: np.ndarray
+    sample_variant_indices: np.ndarray
+    sample_dosages: np.ndarray
+    sample_missing_ptr: np.ndarray
+    sample_missing_variant_indices: np.ndarray
+
+    @property
+    def shape(self) -> tuple[int, int]:
+        return self.sample_count, int(self.means.shape[0])
+
+    def materialize_columns(self, local_variant_indices: np.ndarray) -> np.ndarray:
+        resolved_local_indices = np.asarray(local_variant_indices, dtype=np.int32)
+        if resolved_local_indices.ndim != 1:
+            raise ValueError("local_variant_indices must be 1D.")
+        output = np.empty((self.sample_count, resolved_local_indices.shape[0]), dtype=np.float32)
+        for output_column, local_variant_index in enumerate(resolved_local_indices.tolist()):
+            baseline = -float(self.means[local_variant_index] / self.scales[local_variant_index])
+            column = np.full(self.sample_count, baseline, dtype=np.float32)
+            start = int(self.variant_ptr[local_variant_index])
+            stop = int(self.variant_ptr[local_variant_index + 1])
+            if stop > start:
+                sample_indices = self.variant_sample_indices[start:stop]
+                dosages = self.variant_dosages[start:stop]
+                column[sample_indices] += dosages / self.scales[local_variant_index]
+            missing_start = int(self.missing_variant_ptr[local_variant_index])
+            missing_stop = int(self.missing_variant_ptr[local_variant_index + 1])
+            if missing_stop > missing_start:
+                column[self.missing_variant_sample_indices[missing_start:missing_stop]] = 0.0
+            output[:, output_column] = column
+        return output
+
+    def matvec(self, coefficients: np.ndarray) -> np.ndarray:
+        coefficient_array = np.asarray(coefficients, dtype=gpu_compute_numpy_dtype()).reshape(-1)
+        if coefficient_array.shape[0] != self.shape[1]:
+            raise ValueError("coefficient vector must match sparse variant count.")
+        if not np.any(coefficient_array):
+            return np.zeros(self.sample_count, dtype=coefficient_array.dtype)
+        scaled_coefficients = coefficient_array / np.asarray(self.scales, dtype=coefficient_array.dtype)
+        result = np.full(
+            self.sample_count,
+            -float(np.dot(np.asarray(self.means, dtype=coefficient_array.dtype), scaled_coefficients)),
+            dtype=coefficient_array.dtype,
+        )
+        if self.sample_variant_indices.size > 0:
+            carrier_weights = self.sample_dosages.astype(coefficient_array.dtype, copy=False) * scaled_coefficients[self.sample_variant_indices]
+            nonempty_samples = self.sample_ptr[1:] > self.sample_ptr[:-1]
+            if np.any(nonempty_samples):
+                starts = self.sample_ptr[:-1][nonempty_samples]
+                result[nonempty_samples] += np.add.reduceat(carrier_weights, starts)
+        if self.sample_missing_variant_indices.size > 0:
+            missing_weights = np.asarray(
+                self.means[self.sample_missing_variant_indices] * scaled_coefficients[self.sample_missing_variant_indices],
+                dtype=coefficient_array.dtype,
+            )
+            nonempty_missing = self.sample_missing_ptr[1:] > self.sample_missing_ptr[:-1]
+            if np.any(nonempty_missing):
+                starts = self.sample_missing_ptr[:-1][nonempty_missing]
+                result[nonempty_missing] += np.add.reduceat(missing_weights, starts)
+        return result
+
+    def matmat(self, matrix: np.ndarray) -> np.ndarray:
+        matrix_array = np.asarray(matrix, dtype=gpu_compute_numpy_dtype())
+        if matrix_array.ndim != 2 or matrix_array.shape[0] != self.shape[1]:
+            raise ValueError("variant matrix must match sparse variant count.")
+        if not np.any(matrix_array):
+            return np.zeros((self.sample_count, matrix_array.shape[1]), dtype=matrix_array.dtype)
+        scaled_matrix = matrix_array / np.asarray(self.scales, dtype=matrix_array.dtype)[:, None]
+        output = np.broadcast_to(
+            -np.sum(np.asarray(self.means, dtype=matrix_array.dtype)[:, None] * scaled_matrix, axis=0, dtype=matrix_array.dtype),
+            (self.sample_count, matrix_array.shape[1]),
+        ).copy()
+        if self.sample_variant_indices.size > 0:
+            carrier_weights = self.sample_dosages.astype(matrix_array.dtype, copy=False)[:, None] * scaled_matrix[self.sample_variant_indices, :]
+            nonempty_samples = self.sample_ptr[1:] > self.sample_ptr[:-1]
+            if np.any(nonempty_samples):
+                starts = self.sample_ptr[:-1][nonempty_samples]
+                output[nonempty_samples, :] += np.add.reduceat(carrier_weights, starts, axis=0)
+        if self.sample_missing_variant_indices.size > 0:
+            missing_weights = np.asarray(
+                self.means[self.sample_missing_variant_indices, None] * scaled_matrix[self.sample_missing_variant_indices, :],
+                dtype=matrix_array.dtype,
+            )
+            nonempty_missing = self.sample_missing_ptr[1:] > self.sample_missing_ptr[:-1]
+            if np.any(nonempty_missing):
+                starts = self.sample_missing_ptr[:-1][nonempty_missing]
+                output[nonempty_missing, :] += np.add.reduceat(missing_weights, starts, axis=0)
+        return output
+
+    def transpose_matvec(self, vector: np.ndarray) -> np.ndarray:
+        vector_array = np.asarray(vector, dtype=gpu_compute_numpy_dtype()).reshape(-1)
+        if vector_array.shape[0] != self.sample_count:
+            raise ValueError("sample vector must match sparse sample count.")
+        if not np.any(vector_array):
+            return np.zeros(self.shape[1], dtype=vector_array.dtype)
+        output = np.zeros(self.shape[1], dtype=vector_array.dtype)
+        global_sum = float(np.sum(vector_array, dtype=vector_array.dtype))
+        if self.variant_sample_indices.size > 0:
+            carrier_weights = self.variant_dosages.astype(vector_array.dtype, copy=False) * vector_array[self.variant_sample_indices]
+            nonempty_variants = self.variant_ptr[1:] > self.variant_ptr[:-1]
+            if np.any(nonempty_variants):
+                starts = self.variant_ptr[:-1][nonempty_variants]
+                output[nonempty_variants] += np.add.reduceat(carrier_weights, starts)
+        observed_sums = np.full(self.shape[1], global_sum, dtype=vector_array.dtype)
+        if self.missing_variant_sample_indices.size > 0:
+            missing_weights = vector_array[self.missing_variant_sample_indices]
+            nonempty_missing = self.missing_variant_ptr[1:] > self.missing_variant_ptr[:-1]
+            if np.any(nonempty_missing):
+                starts = self.missing_variant_ptr[:-1][nonempty_missing]
+                observed_sums[nonempty_missing] -= np.add.reduceat(missing_weights, starts)
+        output -= np.asarray(self.means, dtype=vector_array.dtype) * observed_sums
+        output /= np.asarray(self.scales, dtype=vector_array.dtype)
+        return output
+
+    def transpose_matmat(self, matrix: np.ndarray) -> np.ndarray:
+        matrix_array = np.asarray(matrix, dtype=gpu_compute_numpy_dtype())
+        if matrix_array.ndim != 2 or matrix_array.shape[0] != self.sample_count:
+            raise ValueError("sample matrix must match sparse sample count.")
+        if not np.any(matrix_array):
+            return np.zeros((self.shape[1], matrix_array.shape[1]), dtype=matrix_array.dtype)
+        output = np.zeros((self.shape[1], matrix_array.shape[1]), dtype=matrix_array.dtype)
+        global_sum = np.sum(matrix_array, axis=0, dtype=matrix_array.dtype)
+        if self.variant_sample_indices.size > 0:
+            carrier_weights = self.variant_dosages.astype(matrix_array.dtype, copy=False)[:, None] * matrix_array[self.variant_sample_indices, :]
+            nonempty_variants = self.variant_ptr[1:] > self.variant_ptr[:-1]
+            if np.any(nonempty_variants):
+                starts = self.variant_ptr[:-1][nonempty_variants]
+                output[nonempty_variants, :] += np.add.reduceat(carrier_weights, starts, axis=0)
+        observed_sums = np.broadcast_to(global_sum, output.shape).copy()
+        if self.missing_variant_sample_indices.size > 0:
+            missing_weights = matrix_array[self.missing_variant_sample_indices, :]
+            nonempty_missing = self.missing_variant_ptr[1:] > self.missing_variant_ptr[:-1]
+            if np.any(nonempty_missing):
+                starts = self.missing_variant_ptr[:-1][nonempty_missing]
+                observed_sums[nonempty_missing, :] -= np.add.reduceat(missing_weights, starts, axis=0)
+        output -= np.asarray(self.means, dtype=matrix_array.dtype)[:, None] * observed_sums
+        output /= np.asarray(self.scales, dtype=matrix_array.dtype)[:, None]
+        return output
+
+    def subset(self, local_variant_indices: np.ndarray) -> _SparseCarrierBackend:
+        resolved_local_indices = np.asarray(local_variant_indices, dtype=np.int32)
+        if resolved_local_indices.ndim != 1:
+            raise ValueError("local_variant_indices must be 1D.")
+        if resolved_local_indices.size == 0:
+            empty_int = np.zeros(0, dtype=np.int32)
+            empty_ptr = np.zeros(1, dtype=np.int64)
+            return _SparseCarrierBackend(
+                sample_count=self.sample_count,
+                means=np.zeros(0, dtype=np.float32),
+                scales=np.zeros(0, dtype=np.float32),
+                variant_ptr=empty_ptr,
+                variant_sample_indices=empty_int,
+                variant_dosages=np.zeros(0, dtype=np.float32),
+                missing_variant_ptr=empty_ptr.copy(),
+                missing_variant_sample_indices=empty_int.copy(),
+                sample_ptr=np.zeros(self.sample_count + 1, dtype=np.int64),
+                sample_variant_indices=empty_int.copy(),
+                sample_dosages=np.zeros(0, dtype=np.float32),
+                sample_missing_ptr=np.zeros(self.sample_count + 1, dtype=np.int64),
+                sample_missing_variant_indices=empty_int.copy(),
+            )
+        old_to_new = np.full(self.shape[1], -1, dtype=np.int32)
+        old_to_new[resolved_local_indices] = np.arange(resolved_local_indices.shape[0], dtype=np.int32)
+        selected_variant_sample_indices: list[np.ndarray] = []
+        selected_variant_dosages: list[np.ndarray] = []
+        variant_counts = np.zeros(resolved_local_indices.shape[0], dtype=np.int64)
+        selected_missing_sample_indices: list[np.ndarray] = []
+        missing_counts = np.zeros(resolved_local_indices.shape[0], dtype=np.int64)
+        for new_variant_index, old_variant_index in enumerate(resolved_local_indices.tolist()):
+            carrier_start = int(self.variant_ptr[old_variant_index])
+            carrier_stop = int(self.variant_ptr[old_variant_index + 1])
+            selected_variant_sample_indices.append(self.variant_sample_indices[carrier_start:carrier_stop].astype(np.int32, copy=False))
+            selected_variant_dosages.append(self.variant_dosages[carrier_start:carrier_stop].astype(np.float32, copy=False))
+            variant_counts[new_variant_index] = carrier_stop - carrier_start
+            missing_start = int(self.missing_variant_ptr[old_variant_index])
+            missing_stop = int(self.missing_variant_ptr[old_variant_index + 1])
+            selected_missing_sample_indices.append(self.missing_variant_sample_indices[missing_start:missing_stop].astype(np.int32, copy=False))
+            missing_counts[new_variant_index] = missing_stop - missing_start
+        variant_sample_indices = (
+            np.concatenate(selected_variant_sample_indices).astype(np.int32, copy=False)
+            if selected_variant_sample_indices else np.zeros(0, dtype=np.int32)
+        )
+        variant_dosages = (
+            np.concatenate(selected_variant_dosages).astype(np.float32, copy=False)
+            if selected_variant_dosages else np.zeros(0, dtype=np.float32)
+        )
+        missing_variant_sample_indices = (
+            np.concatenate(selected_missing_sample_indices).astype(np.int32, copy=False)
+            if selected_missing_sample_indices else np.zeros(0, dtype=np.int32)
+        )
+        sample_mask = old_to_new[self.sample_variant_indices] >= 0
+        sample_variant_indices = old_to_new[self.sample_variant_indices[sample_mask]].astype(np.int32, copy=False)
+        sample_dosages = self.sample_dosages[sample_mask].astype(np.float32, copy=False)
+        if sample_mask.any():
+            kept_sample_ids = np.repeat(
+                np.arange(self.sample_count, dtype=np.int32),
+                np.diff(self.sample_ptr).astype(np.int32, copy=False),
+            )[sample_mask]
+            sample_counts = np.bincount(kept_sample_ids, minlength=self.sample_count).astype(np.int64, copy=False)
+        else:
+            sample_counts = np.zeros(self.sample_count, dtype=np.int64)
+        sample_missing_mask = old_to_new[self.sample_missing_variant_indices] >= 0
+        sample_missing_variant_indices = old_to_new[self.sample_missing_variant_indices[sample_missing_mask]].astype(np.int32, copy=False)
+        if sample_missing_mask.any():
+            kept_missing_sample_ids = np.repeat(
+                np.arange(self.sample_count, dtype=np.int32),
+                np.diff(self.sample_missing_ptr).astype(np.int32, copy=False),
+            )[sample_missing_mask]
+            sample_missing_counts = np.bincount(kept_missing_sample_ids, minlength=self.sample_count).astype(np.int64, copy=False)
+        else:
+            sample_missing_counts = np.zeros(self.sample_count, dtype=np.int64)
+        variant_ptr = np.zeros(resolved_local_indices.shape[0] + 1, dtype=np.int64)
+        variant_ptr[1:] = np.cumsum(variant_counts, dtype=np.int64)
+        missing_variant_ptr = np.zeros(resolved_local_indices.shape[0] + 1, dtype=np.int64)
+        missing_variant_ptr[1:] = np.cumsum(missing_counts, dtype=np.int64)
+        sample_ptr = np.zeros(self.sample_count + 1, dtype=np.int64)
+        sample_ptr[1:] = np.cumsum(sample_counts, dtype=np.int64)
+        sample_missing_ptr = np.zeros(self.sample_count + 1, dtype=np.int64)
+        sample_missing_ptr[1:] = np.cumsum(sample_missing_counts, dtype=np.int64)
+        return _SparseCarrierBackend(
+            sample_count=self.sample_count,
+            means=np.asarray(self.means[resolved_local_indices], dtype=np.float32),
+            scales=np.asarray(self.scales[resolved_local_indices], dtype=np.float32),
+            variant_ptr=variant_ptr,
+            variant_sample_indices=variant_sample_indices,
+            variant_dosages=variant_dosages,
+            missing_variant_ptr=missing_variant_ptr,
+            missing_variant_sample_indices=missing_variant_sample_indices,
+            sample_ptr=sample_ptr,
+            sample_variant_indices=sample_variant_indices,
+            sample_dosages=sample_dosages,
+            sample_missing_ptr=sample_missing_ptr,
+            sample_missing_variant_indices=sample_missing_variant_indices,
+        )
+
+
+def _build_sparse_backend(
+    raw: Int8BatchCapable,
+    raw_variant_indices: np.ndarray,
+    means: np.ndarray,
+    scales: np.ndarray,
+    sample_count: int,
+) -> _SparseCarrierBackend:
+    resolved_variant_indices = np.asarray(raw_variant_indices, dtype=np.int32)
+    carrier_sample_chunks: list[np.ndarray] = []
+    carrier_dosage_chunks: list[np.ndarray] = []
+    carrier_counts = np.zeros(resolved_variant_indices.shape[0], dtype=np.int64)
+    missing_sample_chunks: list[np.ndarray] = []
+    missing_counts = np.zeros(resolved_variant_indices.shape[0], dtype=np.int64)
+    local_start = 0
+    batch_size = max(auto_batch_size_i8(sample_count), 1)
+    for raw_batch in raw.iter_column_batches_i8(resolved_variant_indices, batch_size=batch_size):
+        batch_values = np.asarray(raw_batch.values, dtype=np.int8)
+        for local_batch_index in range(batch_values.shape[1]):
+            local_variant_index = local_start + local_batch_index
+            column = batch_values[:, local_batch_index]
+            carrier_sample_indices = np.flatnonzero((column != PLINK_MISSING_INT8) & (column > 0)).astype(np.int32)
+            missing_sample_indices = np.flatnonzero(column == PLINK_MISSING_INT8).astype(np.int32)
+            carrier_sample_chunks.append(carrier_sample_indices)
+            carrier_dosage_chunks.append(column[carrier_sample_indices].astype(np.float32, copy=False))
+            missing_sample_chunks.append(missing_sample_indices)
+            carrier_counts[local_variant_index] = carrier_sample_indices.shape[0]
+            missing_counts[local_variant_index] = missing_sample_indices.shape[0]
+        local_start += batch_values.shape[1]
+    variant_sample_indices = (
+        np.concatenate(carrier_sample_chunks).astype(np.int32, copy=False)
+        if carrier_sample_chunks else np.zeros(0, dtype=np.int32)
+    )
+    variant_dosages = (
+        np.concatenate(carrier_dosage_chunks).astype(np.float32, copy=False)
+        if carrier_dosage_chunks else np.zeros(0, dtype=np.float32)
+    )
+    missing_variant_sample_indices = (
+        np.concatenate(missing_sample_chunks).astype(np.int32, copy=False)
+        if missing_sample_chunks else np.zeros(0, dtype=np.int32)
+    )
+    variant_ptr = np.zeros(resolved_variant_indices.shape[0] + 1, dtype=np.int64)
+    variant_ptr[1:] = np.cumsum(carrier_counts, dtype=np.int64)
+    missing_variant_ptr = np.zeros(resolved_variant_indices.shape[0] + 1, dtype=np.int64)
+    missing_variant_ptr[1:] = np.cumsum(missing_counts, dtype=np.int64)
+    carrier_variant_indices = np.repeat(
+        np.arange(resolved_variant_indices.shape[0], dtype=np.int32),
+        carrier_counts.astype(np.int32, copy=False),
+    )
+    if variant_sample_indices.size > 0:
+        sample_order = np.argsort(variant_sample_indices, kind="stable")
+        sample_variant_indices = carrier_variant_indices[sample_order].astype(np.int32, copy=False)
+        sample_dosages = variant_dosages[sample_order].astype(np.float32, copy=False)
+        sorted_sample_indices = variant_sample_indices[sample_order]
+        sample_counts = np.bincount(sorted_sample_indices, minlength=sample_count).astype(np.int64, copy=False)
+    else:
+        sample_variant_indices = np.zeros(0, dtype=np.int32)
+        sample_dosages = np.zeros(0, dtype=np.float32)
+        sample_counts = np.zeros(sample_count, dtype=np.int64)
+    sample_ptr = np.zeros(sample_count + 1, dtype=np.int64)
+    sample_ptr[1:] = np.cumsum(sample_counts, dtype=np.int64)
+    missing_variant_indices = np.repeat(
+        np.arange(resolved_variant_indices.shape[0], dtype=np.int32),
+        missing_counts.astype(np.int32, copy=False),
+    )
+    if missing_variant_sample_indices.size > 0:
+        missing_sample_order = np.argsort(missing_variant_sample_indices, kind="stable")
+        sample_missing_variant_indices = missing_variant_indices[missing_sample_order].astype(np.int32, copy=False)
+        sorted_missing_sample_indices = missing_variant_sample_indices[missing_sample_order]
+        sample_missing_counts = np.bincount(sorted_missing_sample_indices, minlength=sample_count).astype(np.int64, copy=False)
+    else:
+        sample_missing_variant_indices = np.zeros(0, dtype=np.int32)
+        sample_missing_counts = np.zeros(sample_count, dtype=np.int64)
+    sample_missing_ptr = np.zeros(sample_count + 1, dtype=np.int64)
+    sample_missing_ptr[1:] = np.cumsum(sample_missing_counts, dtype=np.int64)
+    return _SparseCarrierBackend(
+        sample_count=sample_count,
+        means=np.asarray(means[resolved_variant_indices], dtype=np.float32),
+        scales=np.asarray(scales[resolved_variant_indices], dtype=np.float32),
+        variant_ptr=variant_ptr,
+        variant_sample_indices=variant_sample_indices,
+        variant_dosages=variant_dosages,
+        missing_variant_ptr=missing_variant_ptr,
+        missing_variant_sample_indices=missing_variant_sample_indices,
+        sample_ptr=sample_ptr,
+        sample_variant_indices=sample_variant_indices,
+        sample_dosages=sample_dosages,
+        sample_missing_ptr=sample_missing_ptr,
+        sample_missing_variant_indices=sample_missing_variant_indices,
+    )
+
+
+@dataclass(slots=True)
 class StandardizedGenotypeMatrix:
     """A genotype matrix that applies z-score standardization on the fly.
 
@@ -559,13 +907,19 @@ class StandardizedGenotypeMatrix:
     means: np.ndarray       # per-variant mean from training data
     scales: np.ndarray      # per-variant std dev from training data
     variant_indices: np.ndarray  # which columns of raw to use (for subsetting)
+    support_counts: np.ndarray | None = None  # non-zero dosage count per source variant
     sample_count: int | None = field(default=None, repr=False)
+    _enable_hybrid_backend: bool = field(default=True, repr=False)
     _dense_cache: np.ndarray | None = field(init=False, default=None, repr=False)
     _cupy_cache: Any | None = field(init=False, default=None, repr=False)  # cupy.ndarray
     _jax_cache: jax.Array | None = field(init=False, default=None, repr=False)
     _cupy_subset_cache: Any | None = field(init=False, default=None, repr=False)
     _cupy_subset_cache_local_indices: np.ndarray | None = field(init=False, default=None, repr=False)
     _local_cache_directory: tempfile.TemporaryDirectory[str] | None = field(init=False, default=None, repr=False)
+    _dense_backend: StandardizedGenotypeMatrix | None = field(init=False, default=None, repr=False)
+    _sparse_backend: _SparseCarrierBackend | None = field(init=False, default=None, repr=False)
+    _dense_local_lookup: np.ndarray | None = field(init=False, default=None, repr=False)
+    _sparse_local_lookup: np.ndarray | None = field(init=False, default=None, repr=False)
     _n_samples: int = field(init=False, default=0, repr=False)
 
     def __post_init__(self) -> None:
@@ -573,6 +927,10 @@ class StandardizedGenotypeMatrix:
         self.scales = np.asarray(self.scales, dtype=np.float32)
         if self.means.ndim != 1 or self.scales.ndim != 1 or self.means.shape != self.scales.shape:
             raise ValueError("means and scales must be matching 1D arrays.")
+        if self.support_counts is not None:
+            self.support_counts = np.asarray(self.support_counts, dtype=np.int32)
+            if self.support_counts.ndim != 1 or self.support_counts.shape != self.means.shape:
+                raise ValueError("support_counts must match means/scales shape.")
         self.variant_indices = np.asarray(self.variant_indices, dtype=np.int32)
         source_variant_count = int(self.means.shape[0])
         if self.raw is not None:
@@ -587,6 +945,56 @@ class StandardizedGenotypeMatrix:
             raise ValueError("variant_indices must be 1D.")
         if np.any(self.variant_indices < 0) or np.any(self.variant_indices >= source_variant_count):
             raise ValueError("variant_indices out of bounds.")
+        self._configure_operator_backend()
+
+    def _configure_operator_backend(self) -> None:
+        self._dense_backend = None
+        self._sparse_backend = None
+        self._dense_local_lookup = None
+        self._sparse_local_lookup = None
+        if (
+            not self._enable_hybrid_backend
+            or self.raw is None
+            or self.support_counts is None
+            or not _supports_int8_batches(self.raw)
+            or self.shape[1] == 0
+        ):
+            return
+        selected_support_counts = np.asarray(self.support_counts[self.variant_indices], dtype=np.int32)
+        sparse_local_indices = np.flatnonzero(selected_support_counts <= HYBRID_SPARSE_SUPPORT_THRESHOLD).astype(np.int32)
+        if sparse_local_indices.shape[0] < HYBRID_SPARSE_MIN_VARIANT_COUNT:
+            return
+        dense_mask = np.ones(self.shape[1], dtype=bool)
+        dense_mask[sparse_local_indices] = False
+        dense_local_indices = np.flatnonzero(dense_mask).astype(np.int32)
+        self._sparse_backend = _build_sparse_backend(
+            raw=cast(Int8BatchCapable, self.raw),
+            raw_variant_indices=self.variant_indices[sparse_local_indices],
+            means=self.means,
+            scales=self.scales,
+            sample_count=self.shape[0],
+        )
+        self._sparse_local_lookup = np.full(self.shape[1], -1, dtype=np.int32)
+        self._sparse_local_lookup[sparse_local_indices] = np.arange(sparse_local_indices.shape[0], dtype=np.int32)
+        if dense_local_indices.shape[0] > 0:
+            self._dense_backend = StandardizedGenotypeMatrix(
+                raw=self.raw,
+                means=self.means,
+                scales=self.scales,
+                variant_indices=self.variant_indices[dense_local_indices],
+                support_counts=self.support_counts,
+                sample_count=self.shape[0],
+                _enable_hybrid_backend=False,
+            )
+            self._dense_local_lookup = np.full(self.shape[1], -1, dtype=np.int32)
+            self._dense_local_lookup[dense_local_indices] = np.arange(dense_local_indices.shape[0], dtype=np.int32)
+        log(
+            "    hybrid standardized operator: "
+            + f"{sparse_local_indices.shape[0]} sparse variants + {dense_local_indices.shape[0]} dense variants  mem={mem()}"
+        )
+
+    def _uses_hybrid_backend(self) -> bool:
+        return self._sparse_backend is not None
 
     @property
     def _gpu_cache(self) -> Any | None:
@@ -786,6 +1194,8 @@ class StandardizedGenotypeMatrix:
             self.raw = rebased_raw
             self.means = np.asarray(self.means[self.variant_indices], dtype=np.float32)
             self.scales = np.asarray(self.scales[self.variant_indices], dtype=np.float32)
+            if self.support_counts is not None:
+                self.support_counts = np.asarray(self.support_counts[self.variant_indices], dtype=np.int32)
             self.variant_indices = np.arange(selected_variant_count, dtype=np.int32)
             self._local_cache_directory = cache_directory
             log("    local int8 cache ready  mem=" + mem())
@@ -833,6 +1243,8 @@ class StandardizedGenotypeMatrix:
             self.raw = persisted_raw
             self.means = np.asarray(self.means[self.variant_indices], dtype=np.float32)
             self.scales = np.asarray(self.scales[self.variant_indices], dtype=np.float32)
+            if self.support_counts is not None:
+                self.support_counts = np.asarray(self.support_counts[self.variant_indices], dtype=np.int32)
             self.variant_indices = np.arange(selected_variant_count, dtype=np.int32)
             self._local_cache_directory = None
             log("    persistent int8 cache ready  mem=" + mem())
@@ -853,6 +1265,7 @@ class StandardizedGenotypeMatrix:
             means=self.means,
             scales=self.scales,
             variant_indices=self.variant_indices[resolved_local_indices],
+            support_counts=self.support_counts,
             sample_count=self.shape[0],
         )
         if self._cupy_cache is not None:

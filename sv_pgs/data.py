@@ -82,6 +82,7 @@ class PreparedArrays:
     targets: np.ndarray
     means: np.ndarray
     scales: np.ndarray
+    support_counts: np.ndarray
 
 
 @dataclass(slots=True)

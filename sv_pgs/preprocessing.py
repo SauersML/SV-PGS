@@ -200,6 +200,7 @@ def fit_preprocessor_from_stats(
         targets=target_array,
         means=np.asarray(variant_stats.means, dtype=np.float32),
         scales=np.asarray(variant_stats.scales, dtype=np.float32),
+        support_counts=np.asarray(variant_stats.support_counts, dtype=np.int32),
     )
 
 

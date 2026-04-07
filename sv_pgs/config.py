@@ -136,6 +136,7 @@ class ModelConfig:
     exact_solver_matrix_limit: int = 2048  # below this: direct solve; above: Woodbury or CG
     posterior_variance_batch_size: int = 1024
     posterior_variance_probe_count: int = 24
+    beta_variance_update_interval: int = 4
     minimum_minor_allele_frequency: float = 1e-3
 
     sample_space_preconditioner_rank: int = 256
@@ -150,6 +151,7 @@ class ModelConfig:
     stochastic_variant_batch_size: int = 2048
     stochastic_step_offset: float = 8.0
     stochastic_step_exponent: float = 0.6
+    final_posterior_refinement: bool = True
 
     update_hyperparameters: bool = True
     random_seed: int = 0
@@ -211,6 +213,8 @@ class ModelConfig:
             raise ValueError("posterior_variance_batch_size must be positive.")
         if self.posterior_variance_probe_count < 1:
             raise ValueError("posterior_variance_probe_count must be positive.")
+        if self.beta_variance_update_interval < 1:
+            raise ValueError("beta_variance_update_interval must be positive.")
         if not 0.0 <= self.minimum_minor_allele_frequency < 0.5:
             raise ValueError("minimum_minor_allele_frequency must lie in [0.0, 0.5).")
         if self.sample_space_preconditioner_rank < 0:

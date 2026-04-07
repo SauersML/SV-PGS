@@ -7,6 +7,7 @@ from sklearn.metrics import roc_auc_score
 import sv_pgs.genotype as genotype_module
 import sv_pgs.mixture_inference as mixture_module
 import sv_pgs.model as model_module
+import sv_pgs.runtime_policy as runtime_policy_module
 from sv_pgs import BayesianPGS, BenchmarkConfig, ModelConfig, TraitType, VariantClass, VariantRecord, run_benchmark_suite
 from sv_pgs.data import TieGroup, TieMap
 from sv_pgs.genotype import RawGenotypeBatch, RawGenotypeMatrix, as_raw_genotype_matrix
@@ -116,9 +117,9 @@ def test_runtime_tuned_config_for_t4_caps_solver_from_gpu_budget(monkeypatch):
         sample_space_preconditioner_rank=256,
     )
 
-    monkeypatch.setattr(model_module, "_try_import_cupy", lambda: object())
+    monkeypatch.setattr(runtime_policy_module, "_try_import_cupy", lambda: object())
     monkeypatch.setattr(
-        model_module,
+        runtime_policy_module,
         "_gpu_materialization_budget_bytes",
         lambda _cupy: 1_000 * 4 * 10_000,
     )
