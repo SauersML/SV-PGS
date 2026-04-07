@@ -571,44 +571,59 @@ def load_multi_vcf_dataset_from_files(
     keep_sample_indices = np.asarray(aligned_sample_indices, dtype=np.intp)
     log(f"aligned {len(aligned_sample_indices)} phenotype rows against {len(source_sample_ids)} genotype samples")
 
-    raw_matrices: list[RawGenotypeMatrix] = []
-    default_variants: list[_VariantDefaults] = []
-    variant_stats_parts: list[VariantStatistics] = []
     n_chromosomes = len(source_paths)
     expected_source_order = np.arange(len(source_sample_ids), dtype=np.intp)
     skip_subset = (
         len(keep_sample_indices) == len(source_sample_ids)
         and np.array_equal(keep_sample_indices, expected_source_order)
     )
+    # Verify sample IDs match for first chromosome only
+    first_sample_ids = _read_vcf_sample_ids(source_paths[0])
+    if first_sample_ids != source_sample_ids:
+        raise RuntimeError(f"VCF sample IDs do not match: {source_paths[0]}")
+
     import time as _time_mod
+    from concurrent.futures import ThreadPoolExecutor, as_completed
     _t_start = _time_mod.monotonic()
-    for chr_idx, source_path in enumerate(source_paths):
-        log(f"  [{chr_idx+1}/{n_chromosomes}] loading {source_path.name}...")
-        # Skip redundant VCF header read for sample ID verification after first chromosome
-        # (all AoU SV VCFs share the same sample set)
-        if chr_idx > 0:
-            pass  # trust that sample IDs match — verified for chr1
-        else:
-            chromosome_sample_ids = _read_vcf_sample_ids(source_path)
-            if chromosome_sample_ids != source_sample_ids:
-                raise RuntimeError(f"VCF sample IDs do not match the first chromosome: {source_path}")
-        genotype_matrix, chromosome_variants, chromosome_stats = _load_vcf_with_cache(
-            source_path,
-            config=config,
-            mmap_mode="r",
-        )
+
+    def _load_one_chromosome(source_path: Path) -> tuple[np.ndarray, list[_VariantDefaults], VariantStatistics]:
+        geno, variants, stats = _load_vcf_with_cache(source_path, config=config, mmap_mode="r")
         if not skip_subset:
-            genotype_matrix = genotype_matrix[keep_sample_indices, :]
-        raw_matrices.append(as_raw_genotype_matrix(genotype_matrix))
-        default_variants.extend(chromosome_variants)
-        variant_stats_parts.append(chromosome_stats)
-        _elapsed = _time_mod.monotonic() - _t_start
-        log(
-            f"  [{chr_idx+1}/{n_chromosomes}] {source_path.name}: "
-            f"{genotype_matrix.shape[1]:,} variants  "
-            f"total={len(default_variants):,}  "
-            f"{_elapsed:.0f}s elapsed  mem={mem()}"
-        )
+            geno = geno[keep_sample_indices, :]
+        return geno, variants, stats
+
+    # Load all chromosomes in parallel threads (IO-bound: pickle, mmap, npz reads)
+    log(f"  loading {n_chromosomes} chromosomes in parallel...")
+    results: dict[int, tuple[np.ndarray, list[_VariantDefaults], VariantStatistics]] = {}
+    completed = 0
+    with ThreadPoolExecutor(max_workers=min(n_chromosomes, 8)) as executor:
+        futures = {
+            executor.submit(_load_one_chromosome, source_path): chr_idx
+            for chr_idx, source_path in enumerate(source_paths)
+        }
+        for future in as_completed(futures):
+            chr_idx = futures[future]
+            results[chr_idx] = future.result()
+            completed += 1
+            geno = results[chr_idx][0]
+            _elapsed = _time_mod.monotonic() - _t_start
+            log(
+                f"  [{completed}/{n_chromosomes}] {source_paths[chr_idx].name}: "
+                f"{geno.shape[1]:,} variants  "
+                f"{_elapsed:.0f}s elapsed  mem={mem()}"
+            )
+
+    # Assemble in chromosome order
+    raw_matrices: list[RawGenotypeMatrix] = []
+    default_variants: list[_VariantDefaults] = []
+    variant_stats_parts: list[VariantStatistics] = []
+    for chr_idx in range(n_chromosomes):
+        geno, variants, stats = results[chr_idx]
+        raw_matrices.append(as_raw_genotype_matrix(geno))
+        default_variants.extend(variants)
+        variant_stats_parts.append(stats)
+    _elapsed = _time_mod.monotonic() - _t_start
+    log(f"  all {n_chromosomes} chromosomes loaded: {len(default_variants):,} total variants in {_elapsed:.0f}s")
 
     raw_genotypes: RawGenotypeMatrix = ConcatenatedRawGenotypeMatrix(tuple(raw_matrices))
     variant_stats = VariantStatistics(
