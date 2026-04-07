@@ -203,6 +203,9 @@ class _RestrictedPosteriorWarmStart:
     temporary_working_set_variant_count: int | None = None
     temporary_working_set_matrix_token: int | None = None
     temporary_working_set_ever_active: np.ndarray | None = None
+    weighted_covariate_projection_matrix_token: int | None = None
+    weighted_covariate_projection_signature: str | None = None
+    weighted_covariate_projection: np.ndarray | None = None
 
 
 def _checkpoint_config_signature(config: ModelConfig) -> str:
@@ -1369,6 +1372,24 @@ def _as_standardized_genotype_matrix(
     )
 
 
+def _effective_beta_variance_state(
+    *,
+    compute_beta_variance: bool,
+    beta_variance: np.ndarray,
+    stale_beta_variance: np.ndarray | None,
+    prior_variances: np.ndarray,
+) -> np.ndarray:
+    if compute_beta_variance:
+        resolved = np.asarray(beta_variance, dtype=np.float64)
+    elif stale_beta_variance is not None:
+        resolved = np.asarray(stale_beta_variance, dtype=np.float64)
+    else:
+        resolved = np.asarray(prior_variances, dtype=np.float64)
+    if resolved.shape != np.asarray(prior_variances, dtype=np.float64).shape:
+        raise ValueError("beta_variance state must match prior_variances shape.")
+    return np.maximum(resolved, 1e-8)
+
+
 def _fit_collapsed_posterior(
     genotype_matrix: StandardizedGenotypeMatrix,
     covariate_matrix: np.ndarray,
@@ -1429,6 +1450,12 @@ def _fit_collapsed_posterior(
             stale_beta_variance=stale_beta_variance,
             restricted_posterior_warm_start=restricted_posterior_warm_start,
         )
+        beta_variance = _effective_beta_variance_state(
+            compute_beta_variance=compute_beta_variance,
+            beta_variance=np.asarray(beta_variance, dtype=np.float64),
+            stale_beta_variance=stale_beta_variance,
+            prior_variances=prior_variances,
+        )
         linear_predictor = np.asarray(linear_predictor, dtype=np.float64) + predictor_offset_array
     else:
         alpha, beta, beta_variance, linear_predictor, collapsed_objective = _binary_posterior_state(
@@ -1466,8 +1493,12 @@ def _fit_collapsed_posterior(
             temporary_working_set_coefficient_tolerance=config.temporary_working_set_coefficient_tolerance,
             restricted_posterior_warm_start=restricted_posterior_warm_start,
         )
-        if not compute_beta_variance and stale_beta_variance is not None:
-            beta_variance = np.asarray(stale_beta_variance, dtype=np.float64)
+        beta_variance = _effective_beta_variance_state(
+            compute_beta_variance=compute_beta_variance,
+            beta_variance=np.asarray(beta_variance, dtype=np.float64),
+            stale_beta_variance=stale_beta_variance,
+            prior_variances=prior_variances,
+        )
         sigma_error2_new = 1.0
     return PosteriorState(
         alpha=np.asarray(alpha, dtype=np.float64),
@@ -2951,7 +2982,7 @@ def _solve_sample_space_rhs_gpu_inner(
         if solution_gpu.shape != rhs_gpu.shape:
             raise ValueError("GPU sample-space initial_guess must match right_hand_side shape.")
     else:
-        solution_gpu = preconditioner(rhs_gpu)
+        solution_gpu = cp.asarray(preconditioner(rhs_gpu), dtype=compute_cp_dtype)
     residual_gpu = rhs_gpu - apply_operator(solution_gpu)
     residual_norm_sq = np.asarray(cp.sum(residual_gpu * residual_gpu, axis=0, dtype=cp.float64), dtype=np.float64)
     rhs_norm_sq = np.asarray(cp.sum(rhs_gpu * rhs_gpu, axis=0, dtype=cp.float64), dtype=np.float64)
@@ -3032,6 +3063,15 @@ def _effective_sample_space_preconditioner_rank(
     return min(target_rank, variant_count)
 
 
+def _streaming_cupy_backend_available(genotype_matrix: StandardizedGenotypeMatrix) -> bool:
+    return (
+        genotype_matrix._cupy_cache is None
+        and genotype_matrix.raw is not None
+        and not genotype_matrix.supports_jax_dense_ops()
+        and _try_import_cupy() is not None
+    )
+
+
 def _prefer_iterative_variant_space(
     genotype_matrix: StandardizedGenotypeMatrix,
     sample_count: int,
@@ -3041,6 +3081,8 @@ def _prefer_iterative_variant_space(
     compute_logdet: bool,
     initial_beta_guess: np.ndarray | None,
 ) -> bool:
+    if _streaming_cupy_backend_available(genotype_matrix):
+        return False
     streaming_matrix = (
         genotype_matrix._cupy_cache is None
         and genotype_matrix._dense_cache is None
@@ -3057,6 +3099,74 @@ def _prefer_iterative_variant_space(
         and genotype_matrix._cupy_cache is None
         and variant_count > sample_count
     )
+
+
+def _weighted_covariate_projection_signature(
+    inverse_diagonal_noise: np.ndarray,
+    covariate_matrix: np.ndarray,
+) -> str:
+    hasher = hashlib.sha256()
+    hasher.update(np.ascontiguousarray(np.asarray(inverse_diagonal_noise, dtype=np.float64)).view(np.uint8).tobytes())
+    covariate_array = np.asarray(covariate_matrix, dtype=np.float64)
+    hasher.update(np.asarray(covariate_array.shape, dtype=np.int64).tobytes())
+    hasher.update(np.ascontiguousarray(covariate_array).view(np.uint8).tobytes())
+    return hasher.hexdigest()
+
+
+def _cached_weighted_covariate_projection(
+    genotype_matrix: StandardizedGenotypeMatrix,
+    covariate_matrix: np.ndarray,
+    inverse_diagonal_noise: np.ndarray,
+    batch_size: int,
+    warm_start: _RestrictedPosteriorWarmStart | None,
+) -> np.ndarray:
+    variant_count = genotype_matrix.shape[1]
+    covariate_count = int(covariate_matrix.shape[1])
+    if covariate_count == 0:
+        return np.zeros((variant_count, 0), dtype=np.float64)
+    matrix_token = id(genotype_matrix)
+    cache_signature = _weighted_covariate_projection_signature(inverse_diagonal_noise, covariate_matrix)
+    if (
+        warm_start is not None
+        and warm_start.weighted_covariate_projection is not None
+        and warm_start.weighted_covariate_projection_matrix_token == matrix_token
+        and warm_start.weighted_covariate_projection_signature == cache_signature
+        and warm_start.weighted_covariate_projection.shape == (variant_count, covariate_count)
+    ):
+        return np.asarray(warm_start.weighted_covariate_projection, dtype=np.float64)
+    weighted_covariates = np.asarray(inverse_diagonal_noise[:, None] * covariate_matrix, dtype=np.float64)
+    if genotype_matrix._cupy_cache is not None:
+        import cupy as cp
+
+        weighted_covariates_gpu = cp.asarray(weighted_covariates, dtype=cp.float64)
+        projection = cp.asarray(genotype_matrix._cupy_cache, dtype=cp.float64).T @ weighted_covariates_gpu
+        projection_matrix = _cupy_array_to_numpy(projection, dtype=np.float64)
+    elif _streaming_cupy_backend_available(genotype_matrix):
+        cupy = _try_import_cupy()
+        assert cupy is not None
+        weighted_covariates_gpu = cupy.asarray(weighted_covariates, dtype=cupy.float64)
+        projection_gpu = cupy.empty((variant_count, covariate_count), dtype=cupy.float64)
+        for batch_slice, standardized_batch in _iter_standardized_gpu_batches(
+            genotype_matrix.raw,
+            genotype_matrix.variant_indices,
+            genotype_matrix.means,
+            genotype_matrix.scales,
+            batch_size=batch_size,
+            cupy=cupy,
+            dtype=cupy.float64,
+        ):
+            projection_gpu[batch_slice, :] = standardized_batch.T @ weighted_covariates_gpu
+        projection_matrix = _cupy_array_to_numpy(projection_gpu, dtype=np.float64)
+    else:
+        projection_matrix = np.asarray(
+            genotype_matrix.transpose_matmat(weighted_covariates, batch_size=batch_size),
+            dtype=np.float64,
+        )
+    if warm_start is not None:
+        warm_start.weighted_covariate_projection_matrix_token = matrix_token
+        warm_start.weighted_covariate_projection_signature = cache_signature
+        warm_start.weighted_covariate_projection = np.asarray(projection_matrix, dtype=np.float64)
+    return np.asarray(projection_matrix, dtype=np.float64)
 
 
 def _solve_sample_space_rhs_gpu(
@@ -3282,16 +3392,16 @@ def _solve_sample_space_rhs_cpu(
     tol_sq = float(tolerance) * float(tolerance)
     apply_preconditioner = cast(Callable[[np.ndarray], np.ndarray | jnp.ndarray], preconditioner) if callable(preconditioner) else None
     if initial_guess is not None:
-        solution = np.asarray(initial_guess, dtype=np.float64)
+        solution = np.array(initial_guess, dtype=np.float64, copy=True)
         if solution.ndim == 1:
             solution = solution[:, None]
         if solution.shape != rhs.shape:
             raise ValueError("CPU sample-space initial_guess must match right_hand_side shape.")
     else:
         solution = (
-            np.asarray(apply_preconditioner(rhs), dtype=np.float64)
+            np.array(apply_preconditioner(rhs), dtype=np.float64, copy=True)
             if apply_preconditioner is not None
-            else rhs / np.maximum(np.asarray(preconditioner, dtype=np.float64)[:, None], 1e-12)
+            else np.array(rhs / np.maximum(np.asarray(preconditioner, dtype=np.float64)[:, None], 1e-12), dtype=np.float64, copy=True)
         )
     residual = rhs - apply_operator(solution)
     residual_norm_sq = np.sum(residual * residual, axis=0, dtype=np.float64)
@@ -3515,36 +3625,37 @@ def _restricted_variant_space_diagonal_preconditioner(
     covariate_precision_cholesky: np.ndarray,
     prior_precision: np.ndarray,
     batch_size: int,
+    warm_start: _RestrictedPosteriorWarmStart | None = None,
 ) -> np.ndarray:
     compute_np_dtype = gpu_compute_numpy_dtype()
+    weighted_covariate_projection = _cached_weighted_covariate_projection(
+        genotype_matrix=genotype_matrix,
+        covariate_matrix=covariate_matrix,
+        inverse_diagonal_noise=inverse_diagonal_noise,
+        batch_size=batch_size,
+        warm_start=warm_start,
+    )
+    cross = np.asarray(weighted_covariate_projection.T, dtype=compute_np_dtype)
+    correction = _cholesky_solve(covariate_precision_cholesky, cross)
+    diag_correction = np.sum(cross * correction, axis=0)
     if genotype_matrix._cupy_cache is not None:
         import cupy as cp
         X = genotype_matrix._cupy_cache  # (n, p) float32 on GPU
         inv_d = cp.asarray(inverse_diagonal_noise, dtype=cp.float64)
-        cov_gpu = cp.asarray(covariate_matrix, dtype=cp.float64)  # (n, k) — tiny
-        # Compute diag(X^T D^{-1} X) and X^T D^{-1} C entirely on GPU.
-        # Only download small results: (p,) diagonal and (p, k) cross-term.
+        # Compute diag(X^T D^{-1} X) on GPU and reuse cached X^T D^{-1} C.
         raw_diag = cp.zeros(X.shape[1], dtype=cp.float64)
-        weighted_Xt_gpu = cp.empty((X.shape[1], cov_gpu.shape[1]), dtype=cp.float64)
         chunk = max(1, min(512, X.shape[1]))
         for start in range(0, X.shape[1], chunk):
             end = min(start + chunk, X.shape[1])
             weighted_chunk = X[:, start:end] * inv_d[:, None]  # (n, chunk) on GPU
             raw_diag[start:end] = cp.sum(X[:, start:end] * weighted_chunk, axis=0)
-            weighted_Xt_gpu[start:end, :] = weighted_chunk.T @ cov_gpu  # (chunk, k) on GPU
-        # Download only the small results: (p,) + (p, k) ≈ 120 KB
         raw_diag_np = raw_diag.get().astype(compute_np_dtype)
-        cross = weighted_Xt_gpu.get().astype(compute_np_dtype).T  # (k, p)
-        correction = _cholesky_solve(covariate_precision_cholesky, cross)
-        diag_correction = np.sum(cross * correction, axis=0)
         return np.maximum(prior_precision + raw_diag_np - diag_correction, 1e-8)
-    if genotype_matrix.raw is not None and not genotype_matrix.supports_jax_dense_ops():
+    if _streaming_cupy_backend_available(genotype_matrix):
         cupy = _try_import_cupy()
         if cupy is not None:
             inv_d_gpu = cupy.asarray(inverse_diagonal_noise, dtype=cupy.float64)
-            cov_gpu = cupy.asarray(covariate_matrix, dtype=cupy.float64)
             raw_diag_gpu = cupy.empty(genotype_matrix.shape[1], dtype=cupy.float64)
-            weighted_xt_gpu = cupy.empty((genotype_matrix.shape[1], cov_gpu.shape[1]), dtype=cupy.float64)
             for batch_slice, standardized_batch in _iter_standardized_gpu_batches(
                 genotype_matrix.raw,
                 genotype_matrix.variant_indices,
@@ -3556,22 +3667,14 @@ def _restricted_variant_space_diagonal_preconditioner(
             ):
                 weighted_batch = inv_d_gpu[:, None] * standardized_batch
                 raw_diag_gpu[batch_slice] = cupy.sum(standardized_batch * weighted_batch, axis=0)
-                weighted_xt_gpu[batch_slice, :] = weighted_batch.T @ cov_gpu
             raw_diag_np = raw_diag_gpu.get().astype(compute_np_dtype)
-            cross = weighted_xt_gpu.get().astype(compute_np_dtype).T
-            correction = _cholesky_solve(covariate_precision_cholesky, cross)
-            diag_correction = np.sum(cross * correction, axis=0)
             return np.maximum(prior_precision + raw_diag_np - diag_correction, 1e-8)
     diagonal = np.asarray(prior_precision, dtype=compute_np_dtype).copy()
     for batch in genotype_matrix.iter_column_batches(batch_size=batch_size):
         genotype_batch = np.asarray(batch.values, dtype=compute_np_dtype)
         weighted_batch = inverse_diagonal_noise[:, None] * genotype_batch
-        cross_terms = covariate_matrix.T @ weighted_batch
-        correction = _cholesky_solve(covariate_precision_cholesky, cross_terms)
-        diagonal[batch.variant_indices] += np.sum(genotype_batch * weighted_batch, axis=0) - np.sum(
-            cross_terms * correction,
-            axis=0,
-        )
+        diagonal[batch.variant_indices] += np.sum(genotype_batch * weighted_batch, axis=0)
+    diagonal -= diag_correction
     return np.maximum(diagonal, 1e-8)
 
 
@@ -4027,6 +4130,7 @@ def _restricted_posterior_state(
         variant_count=variant_count,
         exact_solver_matrix_limit=exact_solver_matrix_limit,
     )
+    prefer_streamed_gpu_sample_space = _streaming_cupy_backend_available(genotype_matrix)
     prefer_iterative_variant_space = _prefer_iterative_variant_space(
         genotype_matrix=genotype_matrix,
         sample_count=sample_count,
@@ -4035,7 +4139,7 @@ def _restricted_posterior_state(
         compute_logdet=compute_logdet,
         initial_beta_guess=initial_beta_guess,
     )
-    use_variant_space = (not use_exact_sample) and (
+    use_variant_space = (not use_exact_sample) and (not prefer_streamed_gpu_sample_space) and (
         use_exact_variant
         or use_gpu_exact_variant
         or variant_count <= sample_count
@@ -4165,23 +4269,26 @@ def _restricted_posterior_state(
                 # Build the exact p x p summaries on GPU in compute precision,
                 # then factor the small system on CPU in float64.
                 inv_d_cp = cp.asarray(inverse_diagonal_noise, dtype=compute_cp_dtype)
-                cov_cp = cp.asarray(covariate_matrix, dtype=compute_cp_dtype)
                 chunk = 256
-                xtdxc_gpu = cp.empty((variant_count, cov_cp.shape[1]), dtype=compute_cp_dtype)
                 xtdx_gpu = cp.empty((variant_count, variant_count), dtype=compute_cp_dtype)
                 for start in range(0, variant_count, chunk):
                     end = min(start + chunk, variant_count)
                     weighted_chunk = inv_d_cp[:, None] * X_gpu_compute[:, start:end]
-                    xtdxc_gpu[start:end, :] = weighted_chunk.T @ cov_cp
                     xtdx_gpu[:, start:end] = X_gpu_compute.T @ weighted_chunk
-                CtWX = _cupy_array_to_numpy(xtdxc_gpu.T, dtype=np.float64)  # (k, p)
+                CtWX = _cached_weighted_covariate_projection(
+                    genotype_matrix=genotype_matrix,
+                    covariate_matrix=covariate_matrix,
+                    inverse_diagonal_noise=inverse_diagonal_noise,
+                    batch_size=posterior_variance_batch_size,
+                    warm_start=warm_start,
+                ).T
                 correction_coeff = _cholesky_solve(covariate_precision_cholesky, CtWX)
                 projected_targets_np = apply_projector(targets)
                 projected_targets_cp = cp.asarray(projected_targets_np, dtype=compute_cp_dtype)
                 correction_cpu = CtWX.T @ correction_coeff
                 XtPX = _cupy_array_to_numpy(xtdx_gpu, dtype=np.float64) - correction_cpu
                 variant_rhs = _cupy_array_to_numpy(X_gpu_compute.T @ projected_targets_cp, dtype=np.float64)
-                del projected_targets_cp, xtdxc_gpu, xtdx_gpu
+                del projected_targets_cp, xtdx_gpu
             else:
                 dense_genotypes = np.asarray(genotype_matrix.materialize(batch_size=posterior_variance_batch_size), dtype=np.float64)
                 projected_genotypes = apply_projector(dense_genotypes)
@@ -4236,6 +4343,7 @@ def _restricted_posterior_state(
                 covariate_precision_cholesky=covariate_precision_cholesky,
                 prior_precision=prior_precision,
                 batch_size=posterior_variance_batch_size,
+                warm_start=warm_start,
             )
             log(f"      preconditioner: {_time.monotonic() - _t0:.1f}s  mem={mem()}")
             _t0 = _time.monotonic()
