@@ -2215,6 +2215,7 @@ def _sample_space_nystrom_basis_gpu(
     cupy = _try_import_cupy()
     if cupy is None:
         return None
+    compute_cp_dtype = _cupy_compute_dtype(cupy)
     requested_rank = min(max(int(rank), 0), int(genotype_matrix.shape[0]))
     if requested_rank <= 0:
         return None
@@ -2231,7 +2232,7 @@ def _sample_space_nystrom_basis_gpu(
         random_seed=random_seed,
     )
     if cached_basis_cpu is not None:
-        basis_gpu = cupy.asarray(np.asarray(cached_basis_cpu[:, :requested_rank], dtype=np.float64), dtype=cupy.float64)
+        basis_gpu = cupy.asarray(np.asarray(cached_basis_cpu[:, :requested_rank], dtype=np.float64), dtype=compute_cp_dtype)
         genotype_matrix._sample_space_nystrom_basis_gpu_cache[(basis_gpu.shape[1], int(random_seed))] = basis_gpu
         return basis_gpu
     sketch_rank = _sample_space_nystrom_rank(requested_rank, genotype_matrix.shape[0])
@@ -2243,7 +2244,7 @@ def _sample_space_nystrom_basis_gpu(
             probe_count=sketch_rank,
             random_seed=random_seed,
         ),
-        dtype=cupy.float64,
+        dtype=compute_cp_dtype,
     )
     sketch_response_gpu = _apply_sample_space_operator_gpu(
         genotype_matrix=genotype_matrix,
@@ -2252,7 +2253,7 @@ def _sample_space_nystrom_basis_gpu(
         matrix_gpu=sketch_probes_gpu,
         batch_size=batch_size,
         cp=cupy,
-        dtype=cupy.float64,
+        dtype=compute_cp_dtype,
     )
     try:
         basis_gpu, triangular_gpu = cupy.linalg.qr(sketch_response_gpu, mode="reduced")
@@ -2262,7 +2263,7 @@ def _sample_space_nystrom_basis_gpu(
     effective_rank = min(requested_rank, int(np.sum(diagonal > 1e-10)))
     if effective_rank <= 0:
         return None
-    basis_gpu = cupy.asarray(basis_gpu[:, :effective_rank], dtype=cupy.float64)
+    basis_gpu = cupy.asarray(basis_gpu[:, :effective_rank], dtype=compute_cp_dtype)
     basis_cpu = np.asarray(basis_gpu.get() if hasattr(basis_gpu, "get") else basis_gpu, dtype=np.float64)
     genotype_matrix._sample_space_nystrom_basis_cpu_cache[(effective_rank, int(random_seed))] = basis_cpu
     genotype_matrix._sample_space_nystrom_basis_gpu_cache[(effective_rank, int(random_seed))] = basis_gpu
@@ -2306,7 +2307,7 @@ def _sample_space_nystrom_factor_gpu(
     cupy = _try_import_cupy()
     if cupy is None:
         return None
-    compute_cp_dtype = cupy.float64
+    compute_cp_dtype = _cupy_compute_dtype(cupy)
     basis_gpu = _sample_space_nystrom_basis_gpu(
         genotype_matrix=genotype_matrix,
         batch_size=batch_size,

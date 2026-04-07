@@ -2086,6 +2086,68 @@ def test_materialized_woodbury_posterior_matches_dense_reference(random_generato
         )
 
 
+def test_exact_variant_gpu_summary_path_matches_dense_reference(monkeypatch: pytest.MonkeyPatch, random_generator):
+    sample_count, variant_count = 12, 5
+    genotype_values = random_generator.normal(size=(sample_count, variant_count)).astype(np.float32)
+    covariate_matrix = np.column_stack(
+        [np.ones(sample_count), random_generator.normal(size=(sample_count, 2))]
+    ).astype(np.float32)
+    target_vector = random_generator.normal(size=sample_count).astype(np.float32)
+    prior_variances = random_generator.uniform(0.2, 1.0, size=variant_count).astype(np.float32)
+
+    standardized = as_raw_genotype_matrix(genotype_values).standardized(
+        means=np.zeros(variant_count, dtype=np.float32),
+        scales=np.ones(variant_count, dtype=np.float32),
+    )
+    standardized._cupy_cache = standardized.materialize().astype(np.float32, copy=False)
+    standardized._dense_cache = None
+
+    empty_dtypes: list[object] = []
+
+    fake_cupy: Any = types.ModuleType("cupy")
+    fake_cupy.float32 = np.float32
+    fake_cupy.float64 = np.float64
+    fake_cupy.asarray = lambda array, dtype=None: np.asarray(array, dtype=dtype)
+    fake_cupy.empty = lambda shape, dtype=None, order=None: (
+        empty_dtypes.append(dtype),
+        np.empty(shape, dtype=dtype, order="C" if order is None else order),
+    )[1]
+    fake_cupy.eye = np.eye
+
+    monkeypatch.setitem(sys.modules, "cupy", fake_cupy)
+    monkeypatch.setattr(mixture_inference, "_cupy_compute_dtype", lambda cp: cp.float32)
+
+    gpu_result = _quantitative_posterior_state(
+        genotype_matrix=standardized,
+        covariate_matrix=covariate_matrix,
+        targets=target_vector,
+        prior_variances=prior_variances,
+        sigma_error2=1.0,
+        sigma_error_floor=1e-6,
+        exact_solver_matrix_limit=6,
+        posterior_variance_batch_size=3,
+    )
+    dense_result = _quantitative_posterior_state(
+        genotype_matrix=genotype_values,
+        covariate_matrix=covariate_matrix,
+        targets=target_vector,
+        prior_variances=prior_variances,
+        sigma_error2=1.0,
+        sigma_error_floor=1e-6,
+        exact_solver_matrix_limit=6,
+        posterior_variance_batch_size=3,
+    )
+
+    assert np.float32 in empty_dtypes
+    for gpu_value, dense_value in zip(gpu_result, dense_result):
+        np.testing.assert_allclose(
+            np.asarray(gpu_value, dtype=np.float64),
+            np.asarray(dense_value, dtype=np.float64),
+            rtol=1e-5,
+            atol=1e-5,
+        )
+
+
 def test_validation_restores_best_iterate(monkeypatch: pytest.MonkeyPatch):
     call_counter = {"count": 0}
 
