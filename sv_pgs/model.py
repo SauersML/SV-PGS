@@ -37,6 +37,16 @@ from sv_pgs.preprocessing import (
 from sv_pgs.progress import log, mem
 from sv_pgs.runtime_policy import runtime_training_policy_for_fit, runtime_training_policy_summary
 
+def _select_active_variant_indices_fast(
+    allele_frequencies: np.ndarray,
+    minimum_minor_allele_frequency: float,
+) -> np.ndarray:
+    """Vectorized MAF filter — avoids creating 1.68M VariantRecord objects."""
+    af = np.asarray(allele_frequencies, dtype=np.float32)
+    maf = np.minimum(af, 1.0 - af)
+    return np.flatnonzero(maf >= minimum_minor_allele_frequency).astype(np.int32)
+
+
 @dataclass(slots=True)
 class FittedState:
     variant_records: list[VariantRecord]
@@ -481,7 +491,6 @@ class BayesianPGS:
         # Use pre-computed stats if available (saves 3 full data passes)
         if variant_stats is not None:
             log("using pre-computed variant statistics (means, scales, support) [NO DATA PASSES]")
-            normalized_records = _training_records_from_stats(selection_records, variant_stats)
             prepared_arrays = fit_preprocessor_from_stats(variant_stats, covariate_matrix, targets)
         else:
             log("computing variant statistics in-fit so support/standardization share one pass...")
@@ -489,12 +498,10 @@ class BayesianPGS:
                 raw_genotypes=raw_genotype_matrix,
                 config=self.config,
             )
-            normalized_records = _training_records_from_stats(selection_records, variant_stats)
             prepared_arrays = fit_preprocessor_from_stats(variant_stats, covariate_matrix, targets)
         preprocessor = Preprocessor(means=prepared_arrays.means, scales=prepared_arrays.scales)
-        del selection_records  # free ~1.68M duplicate records
-        import gc; gc.collect()
-        log(f"preprocessor ready  {len(normalized_records)} variant records  mem={mem()}")
+        total_variant_count = len(selection_records)
+        log(f"preprocessor ready  {total_variant_count} variants  mem={mem()}")
 
         log("creating standardized genotype view...")
         standardized_genotypes = raw_genotype_matrix.standardized(
@@ -505,7 +512,7 @@ class BayesianPGS:
         log(f"standardized view ready  mem={mem()}")
         fit_stage_cache_paths = _fit_stage_cache_paths(
             genotype_matrix=raw_genotype_matrix,
-            allele_frequencies=np.asarray([record.allele_frequency for record in normalized_records], dtype=np.float32),
+            allele_frequencies=variant_stats.allele_frequencies,
             means=prepared_arrays.means,
             scales=prepared_arrays.scales,
             covariates=prepared_arrays.covariates,
@@ -522,12 +529,12 @@ class BayesianPGS:
             )
         )
         if cached_fit_stage is None:
-            log("selecting active variant indices...")
-            active_variant_indices = select_active_variant_indices(
-                variant_records=normalized_records,
-                config=self.config,
+            log("selecting active variant indices (vectorized MAF filter)...")
+            active_variant_indices = _select_active_variant_indices_fast(
+                allele_frequencies=variant_stats.allele_frequencies,
+                minimum_minor_allele_frequency=self.config.minimum_minor_allele_frequency,
             )
-            log(f"active variants: {len(active_variant_indices)} / {len(normalized_records)} ({100.0*len(active_variant_indices)/max(len(normalized_records),1):.1f}%)")
+            log(f"active variants: {len(active_variant_indices)} / {total_variant_count} ({100.0*len(active_variant_indices)/max(total_variant_count,1):.1f}%)")
         else:
             active_variant_indices, reduced_tie_map, reduced_genotypes, local_cache = cached_fit_stage
             log(
@@ -552,13 +559,13 @@ class BayesianPGS:
                 predictor_offset=None,
                 validation_offset=None,
             )
-            full_coefficients = np.zeros(len(normalized_records), dtype=np.float32)
+            full_coefficients = np.zeros(total_variant_count, dtype=np.float32)
             nonzero_coefficient_indices, nonzero_coefficients = _nonzero_coefficient_cache(full_coefficients)
             self.state = FittedState(
-                variant_records=normalized_records,
+                variant_records=[],
                 active_variant_indices=np.zeros(0, dtype=np.int32),
                 preprocessor=preprocessor,
-                tie_map=_empty_tie_map(len(normalized_records)),
+                tie_map=_empty_tie_map(total_variant_count),
                 fit_result=fit_result,
                 full_coefficients=full_coefficients,
                 nonzero_coefficient_indices=nonzero_coefficient_indices,
@@ -568,11 +575,24 @@ class BayesianPGS:
             )
             if fit_stage_cache_paths is not None:
                 _clear_variational_checkpoint(fit_stage_cache_paths)
-            log(f"coefficients: 0 non-zero out of {len(normalized_records)} total")
+            log(f"coefficients: 0 non-zero out of {total_variant_count} total")
             log(f"=== MODEL FIT DONE ===  mem={mem()}")
             return self
 
-        active_records = [normalized_records[int(variant_index)] for variant_index in active_variant_indices]
+        # Create VariantRecord objects ONLY for active variants (not all 1.68M)
+        # This saves ~840 MB of Python object overhead
+        log(f"creating training records for {len(active_variant_indices)} active variants...")
+        active_selection_records = [selection_records[int(i)] for i in active_variant_indices]
+        active_stats = VariantStatistics(
+            means=variant_stats.means[active_variant_indices],
+            scales=variant_stats.scales[active_variant_indices],
+            allele_frequencies=variant_stats.allele_frequencies[active_variant_indices],
+            support_counts=variant_stats.support_counts[active_variant_indices],
+        )
+        active_records = _training_records_from_stats(active_selection_records, active_stats)
+        del active_selection_records, active_stats, selection_records
+        import gc; gc.collect()
+        log(f"active training records created: {len(active_records)}  mem={mem()}")
         if cached_fit_stage is None:
             active_genotypes = standardized_genotypes.subset(active_variant_indices)
             log("building tie map (detecting identical/negated genotype columns)...")
@@ -591,7 +611,7 @@ class BayesianPGS:
         original_space_tie_map = _project_tie_map_to_original_space(
             reduced_tie_map=reduced_tie_map,
             active_variant_indices=active_variant_indices,
-            original_variant_count=len(normalized_records),
+            original_variant_count=total_variant_count,
         )
         log(f"tie map: {len(active_variant_indices)} active -> {len(reduced_tie_map.kept_indices)} unique ({len(reduced_tie_map.reduced_to_group)} groups)  mem={mem()}")
 
@@ -691,16 +711,16 @@ class BayesianPGS:
             fit_result.beta_reduced,
             group_weights=tie_group_weights,
         )
-        full_coefficients = np.zeros(len(normalized_records), dtype=np.float32)
+        full_coefficients = np.zeros(total_variant_count, dtype=np.float32)
         full_coefficients[active_variant_indices] = active_coefficients
         nonzero_coefficient_indices, nonzero_coefficients = _nonzero_coefficient_cache(full_coefficients)
         nonzero_means = np.asarray(prepared_arrays.means[nonzero_coefficient_indices], dtype=np.float32)
         nonzero_scales = np.asarray(prepared_arrays.scales[nonzero_coefficient_indices], dtype=np.float32)
         nonzero_count = int(np.count_nonzero(full_coefficients))
-        log(f"coefficients: {nonzero_count} non-zero out of {len(normalized_records)} total")
+        log(f"coefficients: {nonzero_count} non-zero out of {total_variant_count} total")
 
         self.state = FittedState(
-            variant_records=normalized_records,
+            variant_records=active_records,
             active_variant_indices=active_variant_indices,
             preprocessor=preprocessor,
             tie_map=original_space_tie_map,
