@@ -1077,6 +1077,21 @@ def _find_any_complete_vcf_cache(cache_dir: Path) -> _VcfCachePaths | None:
     return None
 
 
+def _find_any_tmp_parallel(cache_dir: Path, current_key: str) -> Path:
+    """Find any existing .tmp_parallel directory, preferring the current key.
+
+    Falls back to any legacy .tmp_parallel dir (from an old key format)
+    so that partially-completed parallel parses are not wasted.
+    """
+    current = cache_dir / f"{current_key}.tmp_parallel"
+    if current.exists():
+        return current
+    for candidate in sorted(cache_dir.glob("*.tmp_parallel")):
+        if candidate.is_dir():
+            return candidate
+    return current  # no legacy found, use the current key
+
+
 def _load_vcf_from_cache(
     vcf_path: Path,
     config: ModelConfig,
@@ -1353,7 +1368,8 @@ def precache_vcfs_parallel(
         cache_dir = _vcf_cache_dir(vcf_path)
         cache_dir.mkdir(parents=True, exist_ok=True)
         key = _vcf_cache_key(vcf_path, config)
-        tmp_dir = cache_dir / f"{key}.tmp_parallel"
+        # Reuse any existing tmp_parallel dir (may have been created with a legacy key)
+        tmp_dir = _find_any_tmp_parallel(cache_dir, key)
         tmp_dir.mkdir(parents=True, exist_ok=True)
 
         if n_workers <= 1 or chrom is None:
@@ -1412,7 +1428,7 @@ def precache_vcfs_parallel(
     for vcf_path in uncached:
         cache_dir = _vcf_cache_dir(vcf_path)
         key = _vcf_cache_key(vcf_path, config)
-        tmp_dir = cache_dir / f"{key}.tmp_parallel"
+        tmp_dir = _find_any_tmp_parallel(cache_dir, key)
         if not tmp_dir.exists():
             continue
 

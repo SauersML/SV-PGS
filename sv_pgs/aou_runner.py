@@ -437,8 +437,8 @@ def run_all_of_us(
         if not has_cache and cache_dir.exists():
             legacy = _find_any_complete_vcf_cache(cache_dir)
             has_cache = legacy is not None
-        has_partial = (cache_dir / f"{key}.inc.progress.json").exists()
-        has_tmp = (cache_dir / f"{key}.tmp_parallel").exists()
+        has_partial = (cache_dir / f"{key}.inc.progress.json").exists() if cache_dir.exists() else False
+        has_tmp = any(cache_dir.glob("*.tmp_parallel")) if cache_dir.exists() else False
         if has_cache:
             cached_chrs.append(f"chr{chrom}")
         elif has_partial:
