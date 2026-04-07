@@ -922,6 +922,9 @@ class StandardizedGenotypeMatrix:
     _sparse_local_lookup: np.ndarray | None = field(init=False, default=None, repr=False)
     _sample_space_nystrom_basis_cpu_cache: dict[tuple[int, int], np.ndarray] = field(init=False, default_factory=dict, repr=False)
     _sample_space_nystrom_basis_gpu_cache: dict[tuple[int, int], Any] = field(init=False, default_factory=dict, repr=False)
+    _sample_space_probe_projection_cache: dict[tuple[int, int], np.ndarray] = field(init=False, default_factory=dict, repr=False)
+    _sample_space_cpu_preconditioner_cache: Any | None = field(init=False, default=None, repr=False)
+    _sample_space_gpu_preconditioner_cache: Any | None = field(init=False, default=None, repr=False)
     _n_samples: int = field(init=False, default=0, repr=False)
 
     def __post_init__(self) -> None:
@@ -1103,6 +1106,9 @@ class StandardizedGenotypeMatrix:
     def clear_sample_space_nystrom_cache(self) -> None:
         self._sample_space_nystrom_basis_cpu_cache.clear()
         self._sample_space_nystrom_basis_gpu_cache.clear()
+        self._sample_space_probe_projection_cache.clear()
+        self._sample_space_cpu_preconditioner_cache = None
+        self._sample_space_gpu_preconditioner_cache = None
         self._cupy_subset_cache = None
         self._cupy_subset_cache_local_indices = None
 

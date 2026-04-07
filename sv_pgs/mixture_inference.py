@@ -72,6 +72,7 @@ from sv_pgs.data import TieMap, VariantRecord
 from sv_pgs.genotype import (
     DenseRawGenotypeMatrix,
     StandardizedGenotypeMatrix,
+    auto_batch_size,
     _cupy_compute_dtype,
     _iter_standardized_gpu_batches,
     _try_import_cupy,
@@ -105,6 +106,18 @@ class PriorDesign:
     feature_specs: tuple[ScaleModelFeatureSpec, ...]  # compiled feature descriptors for fast reuse
     class_membership_matrix: np.ndarray # which variant class(es) each variant belongs to
     inverse_class_lookup: dict[int, VariantClass]  # column index -> VariantClass enum
+
+
+@dataclass(slots=True)
+class _SampleSpacePreconditionerCacheEntry:
+    batch_size: int
+    rank: int
+    random_seed: int
+    prior_variances: np.ndarray
+    diagonal_noise: np.ndarray
+    preconditioner: Any
+    previous_iterations: int | None = None
+    last_iterations: int | None = None
 
 
 @dataclass(slots=True)
@@ -182,6 +195,11 @@ class PosteriorState:
     linear_predictor: np.ndarray  # full predicted values for each sample
     collapsed_objective: float    # model quality score (higher = better fit)
     sigma_error2: float           # unexplained noise variance (fixed at 1.0 for binary)
+
+
+@dataclass(slots=True)
+class _RestrictedPosteriorWarmStart:
+    sample_space_inverse_covariance_rhs: np.ndarray | None = None
 
 
 def _checkpoint_config_signature(config: ModelConfig) -> str:
@@ -706,6 +724,7 @@ def fit_variational_em(
     log(f"  variational EM: {genotype_matrix.shape[1]} reduced variants, {covariate_matrix.shape[1]} covariates, {target_vector.shape[0]} samples, max_iter={config.max_outer_iterations}")
     use_stochastic_updates = _should_use_stochastic_variational_updates(genotype_matrix, config)
     beta_variance_state: np.ndarray | None = None
+    restricted_posterior_warm_start = _RestrictedPosteriorWarmStart()
     if use_stochastic_updates:
         block_size = min(int(config.stochastic_variant_batch_size), int(genotype_matrix.shape[1]))
         block_count = max((int(genotype_matrix.shape[1]) + block_size - 1) // block_size, 1)
@@ -722,6 +741,7 @@ def fit_variational_em(
             local_scale=local_scale,
             config=config,
         )
+        beta_variance_state = np.maximum(reduced_prior_variances.copy(), 1e-8)
         reduced_second_moment = np.maximum(
             np.asarray(beta_state * beta_state, dtype=np.float64),
             np.asarray(reduced_prior_variances, dtype=np.float64),
@@ -734,8 +754,9 @@ def fit_variational_em(
             log(f"  variational EM epoch {outer_iteration + 1}/{config.max_outer_iterations} start  sigma_e2={sigma_error2:.6f}  global_scale={global_scale:.6f}  mem={mem()}")
             refresh_beta_variance = _should_refresh_beta_variance(
                 outer_iteration,
-                cached_beta_variance=beta_variance_state,
                 refresh_interval=config.beta_variance_update_interval,
+                total_iterations=config.max_outer_iterations,
+                force_final_refresh=not config.final_posterior_refinement,
             )
             posterior_theta = _pack_theta(
                 global_scale=float(global_scale),
@@ -839,11 +860,10 @@ def fit_variational_em(
                         compute_logdet=False,
                         compute_beta_variance=refresh_beta_variance,
                         stale_beta_variance=None if beta_variance_state is None else beta_variance_state[block_indices],
+                        restricted_posterior_warm_start=None,
                     )
                     block_beta_candidate = np.asarray(block_state.beta, dtype=np.float64)
                     block_beta_variance = np.asarray(block_state.beta_variance, dtype=np.float64)
-                if beta_variance_state is None:
-                    beta_variance_state = np.maximum(reduced_prior_variances.copy(), 1e-8)
                 block_beta_updated = block_beta_previous + step_size * (block_beta_candidate - block_beta_previous)
                 beta_delta = block_beta_updated - block_beta_previous
                 if np.any(beta_delta):
@@ -1025,11 +1045,6 @@ def fit_variational_em(
     else:
         for outer_iteration in range(start_iteration, config.max_outer_iterations):
             log(f"  variational EM iteration {outer_iteration + 1}/{config.max_outer_iterations} start  sigma_e2={sigma_error2:.6f}  global_scale={global_scale:.6f}  mem={mem()}")
-            refresh_beta_variance = _should_refresh_beta_variance(
-                outer_iteration,
-                cached_beta_variance=beta_variance_state,
-                refresh_interval=config.beta_variance_update_interval,
-            )
             posterior_theta = _pack_theta(
                 global_scale=float(global_scale),
                 scale_model_coefficients=scale_model_coefficients,
@@ -1048,6 +1063,14 @@ def fit_variational_em(
                 local_scale=local_scale,
                 config=config,
             )
+            if beta_variance_state is None:
+                beta_variance_state = np.maximum(reduced_prior_variances.copy(), 1e-8)
+            refresh_beta_variance = _should_refresh_beta_variance(
+                outer_iteration,
+                refresh_interval=config.beta_variance_update_interval,
+                total_iterations=config.max_outer_iterations,
+                force_final_refresh=not config.final_posterior_refinement,
+            )
 
             posterior_state = _fit_collapsed_posterior(
                 genotype_matrix=genotype_matrix,
@@ -1063,6 +1086,7 @@ def fit_variational_em(
                 compute_beta_variance=refresh_beta_variance,
                 predictor_offset=predictor_offset_array,
                 stale_beta_variance=beta_variance_state,
+                restricted_posterior_warm_start=restricted_posterior_warm_start,
             )
             if config.trait_type == TraitType.BINARY and config.binary_intercept_calibration:
                 posterior_state = _apply_binary_intercept_calibration(
@@ -1321,10 +1345,11 @@ def _prepare_validation(
 def _should_refresh_beta_variance(
     iteration_index: int,
     *,
-    cached_beta_variance: np.ndarray | None,
     refresh_interval: int,
+    total_iterations: int,
+    force_final_refresh: bool,
 ) -> bool:
-    if cached_beta_variance is None:
+    if force_final_refresh and iteration_index + 1 == max(int(total_iterations), 1):
         return True
     return ((iteration_index + 1) % max(int(refresh_interval), 1)) == 0
 
@@ -1355,6 +1380,7 @@ def _fit_collapsed_posterior(
     compute_beta_variance: bool = True,
     predictor_offset: np.ndarray | None = None,
     stale_beta_variance: np.ndarray | None = None,
+    restricted_posterior_warm_start: _RestrictedPosteriorWarmStart | None = None,
 ) -> PosteriorState:
     log(f"    collapsed posterior: trait={trait_type.value}  n_variants={genotype_matrix.shape[1]}  n_samples={genotype_matrix.shape[0]}  sigma_e2={sigma_error2:.6f}  mem={mem()}")
     prior_variances = np.maximum(np.asarray(reduced_prior_variances, dtype=np.float64), 1e-8)
@@ -1385,6 +1411,7 @@ def _fit_collapsed_posterior(
             compute_beta_variance=compute_beta_variance,
             sample_space_preconditioner_rank=config.sample_space_preconditioner_rank,
             stale_beta_variance=stale_beta_variance,
+            restricted_posterior_warm_start=restricted_posterior_warm_start,
         )
         linear_predictor = np.asarray(linear_predictor, dtype=np.float64) + predictor_offset_array
     else:
@@ -1415,6 +1442,7 @@ def _fit_collapsed_posterior(
             compute_beta_variance=compute_beta_variance,
             sample_space_preconditioner_rank=config.sample_space_preconditioner_rank,
             predictor_offset=predictor_offset_array,
+            restricted_posterior_warm_start=restricted_posterior_warm_start,
         )
         if not compute_beta_variance and stale_beta_variance is not None:
             beta_variance = np.asarray(stale_beta_variance, dtype=np.float64)
@@ -1457,6 +1485,7 @@ def _quantitative_posterior_state(
     compute_beta_variance: bool = True,
     sample_space_preconditioner_rank: int = 256,
     stale_beta_variance: np.ndarray | None = None,
+    restricted_posterior_warm_start: _RestrictedPosteriorWarmStart | None = None,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, float, float]:
     standardized_genotypes = _as_standardized_genotype_matrix(genotype_matrix)
     sample_count = standardized_genotypes.shape[0]
@@ -1478,6 +1507,7 @@ def _quantitative_posterior_state(
             compute_logdet=compute_logdet,
             compute_beta_variance=compute_beta_variance,
             sample_space_preconditioner_rank=sample_space_preconditioner_rank,
+            warm_start=restricted_posterior_warm_start,
         )
     )
     # Re-estimate noise variance.  Naive approach (just use residuals) would
@@ -1692,6 +1722,7 @@ def _binary_posterior_state(
     compute_beta_variance: bool = True,
     sample_space_preconditioner_rank: int = 256,
     predictor_offset: np.ndarray | None = None,
+    restricted_posterior_warm_start: _RestrictedPosteriorWarmStart | None = None,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, float]:
     standardized_genotypes = _as_standardized_genotype_matrix(genotype_matrix)
     prior_precision = np.asarray(1.0 / np.maximum(prior_variances, 1e-8), dtype=np.float64)
@@ -1707,6 +1738,11 @@ def _binary_posterior_state(
     covariate_matrix_f64 = np.asarray(covariate_matrix, dtype=np.float64)
     target_array = np.asarray(targets, dtype=np.float64).reshape(-1)
     kappa = target_array - 0.5
+    warm_start = (
+        _RestrictedPosteriorWarmStart()
+        if restricted_posterior_warm_start is None
+        else restricted_posterior_warm_start
+    )
     cupy = None
     streaming_gpu_binary_backend = (
         standardized_genotypes._cupy_cache is None
@@ -1802,6 +1838,7 @@ def _binary_posterior_state(
                 compute_beta_variance=False,
                 initial_beta_guess=parameters[covariate_count:],
                 sample_space_preconditioner_rank=sample_space_preconditioner_rank,
+                warm_start=warm_start,
             )
         )
         solve_seconds = _time.monotonic() - solve_start
@@ -1876,6 +1913,7 @@ def _binary_posterior_state(
             compute_beta_variance=compute_beta_variance,
             initial_beta_guess=parameters[covariate_count:],
             sample_space_preconditioner_rank=sample_space_preconditioner_rank,
+            warm_start=warm_start,
         )
     )
     final_linear_predictor = predictor_offset_array + np.asarray(_fitted_response, dtype=np.float64)
@@ -2331,6 +2369,22 @@ def _sample_space_nystrom_factor_gpu(
     return basis_gpu @ cupy.asarray(gram_factor, dtype=compute_cp_dtype)
 
 
+def prepare_sample_space_nystrom_basis_cache(
+    genotype_matrix: StandardizedGenotypeMatrix,
+    rank: int,
+    random_seed: int,
+) -> int:
+    basis_matrix = _sample_space_nystrom_basis_cpu(
+        genotype_matrix=genotype_matrix,
+        batch_size=auto_batch_size(genotype_matrix.shape[0]),
+        rank=rank,
+        random_seed=random_seed,
+    )
+    if basis_matrix is None:
+        return 0
+    return int(basis_matrix.shape[1])
+
+
 def _build_sample_space_low_rank_bundle_gpu(
     low_rank_factor_gpu,
     diagonal_preconditioner_gpu,
@@ -2380,6 +2434,76 @@ def _apply_sample_space_low_rank_preconditioner_gpu(
         solve_triangular_gpu,
     )
     return weighted_rhs - correction
+
+
+def _relative_array_change(current: np.ndarray, previous: np.ndarray) -> float:
+    current_array = np.asarray(current, dtype=np.float64)
+    previous_array = np.asarray(previous, dtype=np.float64)
+    if current_array.shape != previous_array.shape:
+        return np.inf
+    denominator = np.maximum(np.abs(previous_array), 1e-8)
+    return float(np.max(np.abs(current_array - previous_array) / denominator))
+
+
+def _sample_space_preconditioner_stale(cache_entry: _SampleSpacePreconditionerCacheEntry) -> bool:
+    if cache_entry.previous_iterations is None or cache_entry.last_iterations is None:
+        return False
+    return cache_entry.last_iterations > max(int(cache_entry.previous_iterations * 1.5), cache_entry.previous_iterations + 8)
+
+
+def _can_reuse_sample_space_preconditioner(
+    cache_entry: _SampleSpacePreconditionerCacheEntry | None,
+    *,
+    batch_size: int,
+    rank: int,
+    random_seed: int,
+    prior_variances: np.ndarray,
+    diagonal_noise: np.ndarray,
+) -> bool:
+    if cache_entry is None:
+        return False
+    if (
+        cache_entry.batch_size != int(batch_size)
+        or cache_entry.rank != int(rank)
+        or cache_entry.random_seed != int(random_seed)
+    ):
+        return False
+    if _sample_space_preconditioner_stale(cache_entry):
+        return False
+    return (
+        _relative_array_change(prior_variances, cache_entry.prior_variances) <= 0.15
+        and _relative_array_change(diagonal_noise, cache_entry.diagonal_noise) <= 0.15
+    )
+
+
+def _update_sample_space_preconditioner_iterations(
+    cache_entry: _SampleSpacePreconditionerCacheEntry | None,
+    iterations: int,
+) -> None:
+    if cache_entry is None:
+        return
+    cache_entry.previous_iterations = cache_entry.last_iterations
+    cache_entry.last_iterations = int(iterations)
+
+
+def _cached_sample_probe_projection(
+    genotype_matrix: StandardizedGenotypeMatrix,
+    sample_probes: np.ndarray,
+    *,
+    batch_size: int,
+    probe_count: int,
+    random_seed: int,
+) -> np.ndarray:
+    cache_key = (int(probe_count), int(random_seed))
+    cached_projection = genotype_matrix._sample_space_probe_projection_cache.get(cache_key)
+    if cached_projection is not None:
+        return np.asarray(cached_projection, dtype=np.float64)
+    probe_projection_matrix = np.asarray(
+        genotype_matrix.transpose_matmat(sample_probes, batch_size=batch_size),
+        dtype=np.float64,
+    )
+    genotype_matrix._sample_space_probe_projection_cache[cache_key] = probe_projection_matrix
+    return probe_projection_matrix
 
 
 def _sample_space_preconditioner(
@@ -3296,6 +3420,190 @@ def _use_gpu_exact_variant_solve(
     )
 
 
+def _should_use_temporary_working_set(
+    genotype_matrix: StandardizedGenotypeMatrix,
+    *,
+    variant_count: int,
+    compute_logdet: bool,
+    compute_beta_variance: bool,
+    temporary_working_sets: bool,
+    temporary_working_set_min_variants: int,
+    allow_working_set: bool,
+) -> bool:
+    return (
+        allow_working_set
+        and temporary_working_sets
+        and not compute_logdet
+        and not compute_beta_variance
+        and variant_count >= max(int(temporary_working_set_min_variants), 0)
+        and genotype_matrix.shape[0] > 0
+    )
+
+
+def _working_set_screening_score(
+    gradient: np.ndarray,
+    beta: np.ndarray,
+    prior_variances: np.ndarray,
+) -> np.ndarray:
+    coefficient_scale_violation = np.abs(np.asarray(prior_variances, dtype=np.float64) * np.asarray(gradient, dtype=np.float64))
+    return np.maximum(coefficient_scale_violation, np.abs(np.asarray(beta, dtype=np.float64)))
+
+
+def _top_working_set_indices(
+    score: np.ndarray,
+    target_size: int,
+) -> np.ndarray:
+    score_array = np.asarray(score, dtype=np.float64).reshape(-1)
+    if score_array.ndim != 1:
+        raise ValueError("working-set score must be one-dimensional.")
+    resolved_size = min(max(int(target_size), 1), score_array.shape[0])
+    if resolved_size == score_array.shape[0]:
+        return np.arange(score_array.shape[0], dtype=np.int32)
+    partition = np.argpartition(score_array, score_array.shape[0] - resolved_size)[-resolved_size:]
+    ranked = partition[np.argsort(score_array[partition])[::-1]]
+    return np.asarray(ranked, dtype=np.int32)
+
+
+def _restricted_posterior_state_temporary_working_set(
+    genotype_matrix: StandardizedGenotypeMatrix,
+    covariate_matrix: np.ndarray,
+    targets: np.ndarray,
+    prior_variances: np.ndarray,
+    prior_precision: np.ndarray,
+    inverse_diagonal_noise: np.ndarray,
+    covariate_precision_cholesky: np.ndarray,
+    covariate_precision_logdet: float,
+    apply_projector: Callable[[np.ndarray], np.ndarray],
+    solver_tolerance: float,
+    maximum_linear_solver_iterations: int,
+    exact_solver_matrix_limit: int,
+    posterior_variance_batch_size: int,
+    random_seed: int,
+    sample_space_preconditioner_rank: int,
+    initial_beta_guess: np.ndarray | None,
+    temporary_working_set_initial_size: int,
+    temporary_working_set_growth: int,
+    temporary_working_set_max_passes: int,
+    temporary_working_set_coefficient_tolerance: float,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, float, float, float]:
+    variant_count = genotype_matrix.shape[1]
+    current_beta = (
+        np.zeros(variant_count, dtype=np.float64)
+        if initial_beta_guess is None
+        else np.asarray(initial_beta_guess, dtype=np.float64).copy()
+    )
+    if current_beta.shape != (variant_count,):
+        raise ValueError("initial_beta_guess must match variant count for temporary working sets.")
+
+    def _projected_residual_and_gradient(beta_vector: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        genetic_linear_predictor = np.asarray(
+            genotype_matrix.matvec(beta_vector, batch_size=posterior_variance_batch_size),
+            dtype=np.float64,
+        )
+        residual_vector = np.asarray(targets - genetic_linear_predictor, dtype=np.float64)
+        projected_residual = np.asarray(apply_projector(residual_vector), dtype=np.float64)
+        gradient = np.asarray(
+            genotype_matrix.transpose_matvec(
+                projected_residual,
+                batch_size=posterior_variance_batch_size,
+            ),
+            dtype=np.float64,
+        ) - prior_precision * beta_vector
+        return genetic_linear_predictor, projected_residual, gradient
+
+    _genetic_linear_predictor, _projected_residual, current_gradient = _projected_residual_and_gradient(current_beta)
+    working_size = min(max(int(temporary_working_set_initial_size), 1), variant_count)
+    working_indices = _top_working_set_indices(
+        _working_set_screening_score(current_gradient, current_beta, prior_variances),
+        working_size,
+    )
+
+    for working_pass in range(max(int(temporary_working_set_max_passes), 1)):
+        log(
+            "    restricted posterior: temporary working set "
+            + f"pass {working_pass + 1}/{int(temporary_working_set_max_passes)} "
+            + f"size={working_indices.shape[0]}/{variant_count}"
+        )
+        subset_state = _restricted_posterior_state(
+            genotype_matrix=genotype_matrix.subset(working_indices),
+            covariate_matrix=covariate_matrix,
+            targets=targets,
+            prior_variances=prior_variances[working_indices],
+            diagonal_noise=1.0 / np.maximum(inverse_diagonal_noise, 1e-12),
+            solver_tolerance=solver_tolerance,
+            maximum_linear_solver_iterations=maximum_linear_solver_iterations,
+            logdet_probe_count=1,
+            logdet_lanczos_steps=2,
+            exact_solver_matrix_limit=exact_solver_matrix_limit,
+            posterior_variance_batch_size=posterior_variance_batch_size,
+            posterior_variance_probe_count=1,
+            random_seed=random_seed + working_pass,
+            compute_logdet=False,
+            compute_beta_variance=False,
+            initial_beta_guess=current_beta[working_indices],
+            sample_space_preconditioner_rank=sample_space_preconditioner_rank,
+            temporary_working_sets=False,
+            allow_working_set=False,
+        )
+        candidate_beta = np.zeros(variant_count, dtype=np.float64)
+        candidate_beta[working_indices] = np.asarray(subset_state[1], dtype=np.float64)
+        genetic_linear_predictor, projected_targets, candidate_gradient = _projected_residual_and_gradient(candidate_beta)
+        candidate_score = _working_set_screening_score(candidate_gradient, candidate_beta, prior_variances)
+        excluded_mask = np.ones(variant_count, dtype=bool)
+        excluded_mask[working_indices] = False
+        max_excluded_score = float(np.max(candidate_score[excluded_mask])) if np.any(excluded_mask) else 0.0
+        if max_excluded_score <= float(temporary_working_set_coefficient_tolerance) or working_indices.shape[0] == variant_count:
+            alpha = np.asarray(
+                _cholesky_solve(
+                    covariate_precision_cholesky,
+                    covariate_matrix.T @ (inverse_diagonal_noise * (targets - genetic_linear_predictor)),
+                ),
+                dtype=np.float64,
+            )
+            linear_predictor = covariate_matrix @ alpha + genetic_linear_predictor
+            restricted_quadratic = float(np.dot(targets, projected_targets))
+            log(
+                "    temporary working set accepted "
+                + f"(size={working_indices.shape[0]}/{variant_count}, excluded_score={max_excluded_score:.2e})"
+            )
+            return (
+                np.asarray(alpha, dtype=np.float64),
+                np.asarray(candidate_beta, dtype=np.float64),
+                np.zeros(variant_count, dtype=np.float64),
+                np.asarray(projected_targets, dtype=np.float64),
+                np.asarray(linear_predictor, dtype=np.float64),
+                restricted_quadratic,
+                0.0,
+                covariate_precision_logdet,
+            )
+        current_beta = candidate_beta
+        working_size = min(working_indices.shape[0] + int(temporary_working_set_growth), variant_count)
+        working_indices = _top_working_set_indices(candidate_score, working_size)
+
+    log("    temporary working set validation failed to certify a subset; falling back to full solve")
+    return _restricted_posterior_state(
+        genotype_matrix=genotype_matrix,
+        covariate_matrix=covariate_matrix,
+        targets=targets,
+        prior_variances=prior_variances,
+        diagonal_noise=1.0 / np.maximum(inverse_diagonal_noise, 1e-12),
+        solver_tolerance=solver_tolerance,
+        maximum_linear_solver_iterations=maximum_linear_solver_iterations,
+        logdet_probe_count=1,
+        logdet_lanczos_steps=2,
+        exact_solver_matrix_limit=exact_solver_matrix_limit,
+        posterior_variance_batch_size=posterior_variance_batch_size,
+        posterior_variance_probe_count=1,
+        random_seed=random_seed + int(temporary_working_set_max_passes),
+        compute_logdet=False,
+        compute_beta_variance=False,
+        initial_beta_guess=current_beta,
+        sample_space_preconditioner_rank=sample_space_preconditioner_rank,
+        temporary_working_sets=False,
+        allow_working_set=False,
+    )
+
+
 def _restricted_posterior_state(
     genotype_matrix: StandardizedGenotypeMatrix,
     covariate_matrix: np.ndarray,
@@ -3314,6 +3622,13 @@ def _restricted_posterior_state(
     compute_beta_variance: bool = True,
     initial_beta_guess: np.ndarray | None = None,
     sample_space_preconditioner_rank: int = 256,
+    temporary_working_sets: bool = True,
+    temporary_working_set_min_variants: int = 65_536,
+    temporary_working_set_initial_size: int = 16_384,
+    temporary_working_set_growth: int = 16_384,
+    temporary_working_set_max_passes: int = 6,
+    temporary_working_set_coefficient_tolerance: float = 1e-4,
+    allow_working_set: bool = True,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, float, float, float]:
     from sv_pgs.progress import log, mem
     compute_jax_dtype = gpu_compute_jax_dtype()
@@ -3422,6 +3737,37 @@ def _restricted_posterior_state(
         covariate_precision_cholesky=covariate_precision_cholesky,
         compute_dtype=compute_jax_dtype,
     )
+    if _should_use_temporary_working_set(
+        genotype_matrix=genotype_matrix,
+        variant_count=variant_count,
+        compute_logdet=compute_logdet,
+        compute_beta_variance=compute_beta_variance,
+        temporary_working_sets=temporary_working_sets,
+        temporary_working_set_min_variants=temporary_working_set_min_variants,
+        allow_working_set=allow_working_set,
+    ):
+        return _restricted_posterior_state_temporary_working_set(
+            genotype_matrix=genotype_matrix,
+            covariate_matrix=covariate_matrix,
+            targets=targets,
+            prior_variances=prior_variances,
+            prior_precision=prior_precision,
+            inverse_diagonal_noise=inverse_diagonal_noise,
+            covariate_precision_cholesky=covariate_precision_cholesky,
+            covariate_precision_logdet=covariate_precision_logdet,
+            apply_projector=apply_projector,
+            solver_tolerance=solver_tolerance,
+            maximum_linear_solver_iterations=maximum_linear_solver_iterations,
+            exact_solver_matrix_limit=exact_solver_matrix_limit,
+            posterior_variance_batch_size=posterior_variance_batch_size,
+            random_seed=random_seed,
+            sample_space_preconditioner_rank=sample_space_preconditioner_rank,
+            initial_beta_guess=initial_beta_guess,
+            temporary_working_set_initial_size=temporary_working_set_initial_size,
+            temporary_working_set_growth=temporary_working_set_growth,
+            temporary_working_set_max_passes=temporary_working_set_max_passes,
+            temporary_working_set_coefficient_tolerance=temporary_working_set_coefficient_tolerance,
+        )
 
     if use_variant_space:
         if prefer_iterative_variant_space and not (use_exact_variant or use_gpu_exact_variant):

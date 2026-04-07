@@ -128,26 +128,31 @@ def _fit_stage_cache_paths(
     raw_signature = _persistent_raw_signature(genotype_matrix)
     if raw_signature is None:
         return None
-    key_hasher = hashlib.sha256()
-    key_hasher.update(f"fit-stage-cache-v{_FIT_STAGE_CACHE_VERSION}".encode("utf-8"))
-    key_hasher.update(raw_signature.encode("utf-8"))
-    key_hasher.update(config.trait_type.value.encode("utf-8"))
-    key_hasher.update(np.asarray([config.minimum_minor_allele_frequency], dtype=np.float64).tobytes())
-    _update_hash_with_array_bytes(key_hasher, np.asarray(allele_frequencies, dtype=np.float32))
-    _update_hash_with_array_bytes(key_hasher, np.asarray(means, dtype=np.float32))
-    _update_hash_with_array_bytes(key_hasher, np.asarray(scales, dtype=np.float32))
-    _update_hash_with_array_bytes(key_hasher, np.asarray(covariates, dtype=np.float32))
-    _update_hash_with_array_bytes(key_hasher, np.asarray(targets, dtype=np.float32))
-    key = key_hasher.hexdigest()[:24]
+    structure_hasher = hashlib.sha256()
+    structure_hasher.update(f"fit-stage-structure-v{_FIT_STAGE_CACHE_VERSION}".encode("utf-8"))
+    structure_hasher.update(raw_signature.encode("utf-8"))
+    structure_hasher.update(np.asarray([config.minimum_minor_allele_frequency], dtype=np.float64).tobytes())
+    _update_hash_with_array_bytes(structure_hasher, np.asarray(allele_frequencies, dtype=np.float32))
+    _update_hash_with_array_bytes(structure_hasher, np.asarray(means, dtype=np.float32))
+    _update_hash_with_array_bytes(structure_hasher, np.asarray(scales, dtype=np.float32))
+    structure_key = structure_hasher.hexdigest()[:24]
+    fit_hasher = hashlib.sha256()
+    fit_hasher.update(f"fit-stage-fit-v{_FIT_STAGE_CACHE_VERSION}".encode("utf-8"))
+    fit_hasher.update(structure_key.encode("utf-8"))
+    fit_hasher.update(config.trait_type.value.encode("utf-8"))
+    _update_hash_with_array_bytes(fit_hasher, np.asarray(covariates, dtype=np.float32))
+    _update_hash_with_array_bytes(fit_hasher, np.asarray(targets, dtype=np.float32))
+    fit_key = fit_hasher.hexdigest()[:24]
     cache_dir = Path.cwd() / _FIT_STAGE_CACHE_DIRNAME / _FIT_STAGE_CACHE_SUBDIR
     return _FitStageCachePaths(
-        key=key,
+        key=structure_key,
         cache_dir=cache_dir,
-        manifest_path=cache_dir / f"{key}.manifest.json",
-        active_indices_path=cache_dir / f"{key}.active.npy",
-        tie_map_path=cache_dir / f"{key}.tie.pkl",
-        reduced_raw_i8_path=cache_dir / f"{key}.reduced_raw_i8.npy",
-        em_checkpoint_path=cache_dir / f"{key}.em.pkl",
+        manifest_path=cache_dir / f"{structure_key}.manifest.json",
+        active_indices_path=cache_dir / f"{structure_key}.active.npy",
+        tie_map_path=cache_dir / f"{structure_key}.tie.pkl",
+        reduced_raw_i8_path=cache_dir / f"{structure_key}.reduced_raw_i8.npy",
+        em_checkpoint_path=cache_dir / f"{fit_key}.em.pkl",
+        fit_key=fit_key,
     )
 
 
@@ -224,6 +229,85 @@ def _write_fit_stage_cache_manifest(
     manifest_tmp.replace(cache_paths.manifest_path)
 
 
+def _sample_space_basis_cache_path(
+    cache_paths: _FitStageCachePaths,
+    *,
+    rank: int,
+    random_seed: int,
+) -> Path:
+    return cache_paths.cache_dir / f"{cache_paths.key}.sample_space_basis.r{int(rank)}.seed{int(random_seed)}.npy"
+
+
+def _try_restore_sample_space_basis_cache(
+    cache_paths: _FitStageCachePaths,
+    genotype_matrix: StandardizedGenotypeMatrix,
+    *,
+    rank: int,
+    random_seed: int,
+) -> bool:
+    basis_path = _sample_space_basis_cache_path(cache_paths, rank=rank, random_seed=random_seed)
+    if not basis_path.exists():
+        return False
+    try:
+        basis_matrix = np.load(basis_path, mmap_mode="r")
+        basis_array = np.asarray(basis_matrix, dtype=np.float64)
+        if basis_array.ndim != 2 or basis_array.shape[0] != genotype_matrix.shape[0]:
+            raise ValueError("sample-space basis cache shape mismatch.")
+        genotype_matrix._sample_space_nystrom_basis_cpu_cache[(basis_array.shape[1], int(random_seed))] = basis_array
+        log(
+            "sample-space basis cache restored: "
+            + f"{cache_paths.cache_dir.name}/{basis_path.name} "
+            + f"(rank={basis_array.shape[1]})"
+        )
+        return True
+    except Exception as exc:
+        log(f"sample-space basis cache load failed ({exc}); rebuilding")
+        basis_path.unlink(missing_ok=True)
+        return False
+
+
+def _save_sample_space_basis_cache(
+    cache_paths: _FitStageCachePaths,
+    genotype_matrix: StandardizedGenotypeMatrix,
+    *,
+    rank: int,
+    random_seed: int,
+) -> bool:
+    basis_path = _sample_space_basis_cache_path(cache_paths, rank=rank, random_seed=random_seed)
+    cached_basis = genotype_matrix._sample_space_nystrom_basis_cpu_cache.get((int(rank), int(random_seed)))
+    if cached_basis is None:
+        prepared_rank = prepare_sample_space_nystrom_basis_cache(
+            genotype_matrix=genotype_matrix,
+            rank=rank,
+            random_seed=random_seed,
+        )
+        if prepared_rank <= 0:
+            return False
+        cached_basis = genotype_matrix._sample_space_nystrom_basis_cpu_cache.get((int(prepared_rank), int(random_seed)))
+    if cached_basis is None:
+        return False
+    basis_array = np.asarray(cached_basis, dtype=np.float64)
+    if basis_array.ndim != 2 or basis_array.shape[0] != genotype_matrix.shape[0]:
+        return False
+    cache_paths.cache_dir.mkdir(parents=True, exist_ok=True)
+    tmp_path = cache_paths.cache_dir / f"{basis_path.name}.tmp"
+    try:
+        np.save(tmp_path, basis_array)
+        tmp_npy = tmp_path if tmp_path.suffix == ".npy" else tmp_path.with_suffix(tmp_path.suffix + ".npy")
+        tmp_npy.replace(basis_path)
+        log(
+            "sample-space basis cache saved: "
+            + f"{cache_paths.cache_dir.name}/{basis_path.name} "
+            + f"(rank={basis_array.shape[1]})"
+        )
+        return True
+    except Exception as exc:
+        tmp_path.unlink(missing_ok=True)
+        tmp_path.with_suffix(tmp_path.suffix + ".npy").unlink(missing_ok=True)
+        log(f"sample-space basis cache save failed ({exc}); continuing without durable solver cache")
+        return False
+
+
 def _try_load_fit_stage_cache(
     cache_paths: _FitStageCachePaths,
     prepared_arrays,
@@ -297,6 +381,11 @@ def _invalidate_fit_stage_cache(cache_paths: _FitStageCachePaths) -> None:
             path.unlink(missing_ok=True)
         except Exception:
             pass
+    try:
+        for basis_path in cache_paths.cache_dir.glob(f"{cache_paths.key}.sample_space_basis.r*.seed*.npy"):
+            basis_path.unlink(missing_ok=True)
+    except Exception:
+        pass
 
 
 def _save_variational_checkpoint(
@@ -604,6 +693,13 @@ class BayesianPGS:
         import gc
         gc.collect()
         log(f"memory freed after materialization  mem={mem()}")
+        if fit_stage_cache_paths is not None and int(self.config.sample_space_preconditioner_rank) > 0:
+            _try_restore_sample_space_basis_cache(
+                cache_paths=fit_stage_cache_paths,
+                genotype_matrix=reduced_genotypes,
+                rank=int(self.config.sample_space_preconditioner_rank),
+                random_seed=int(self.config.random_seed),
+            )
         log(
             f"starting variational EM  max_iterations={self.config.max_outer_iterations}  "
             f"reduced_matrix={reduced_genotypes.shape}  in_memory={in_memory}  "
@@ -635,6 +731,13 @@ class BayesianPGS:
         )
         if fit_stage_cache_paths is not None:
             _clear_variational_checkpoint(fit_stage_cache_paths)
+            if int(self.config.sample_space_preconditioner_rank) > 0:
+                _save_sample_space_basis_cache(
+                    cache_paths=fit_stage_cache_paths,
+                    genotype_matrix=reduced_genotypes,
+                    rank=int(self.config.sample_space_preconditioner_rank),
+                    random_seed=int(self.config.random_seed),
+                )
         log(f"variational EM converged in {len(fit_result.objective_history)} iterations  final_obj={fit_result.objective_history[-1]:.4f}  mem={mem()}")
 
         log("expanding coefficients from reduced to full space...")
