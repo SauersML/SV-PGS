@@ -398,8 +398,9 @@ def load_dataset_from_files(
             config=config,
             mmap_mode="r",
         )
-        # Subset to the samples that survived covariate filtering
-        genotype_matrix = genotype_matrix[keep_indices, :]
+        # Subset to matched samples (skip if cache was already subsetted to this exact set)
+        if genotype_matrix.shape[0] != len(keep_indices):
+            genotype_matrix = genotype_matrix[keep_indices, :]
 
         log(f"VCF loaded: {genotype_matrix.shape[0]} samples x {len(default_variants)} variants  mem={mem()}")
         plink_metadata = None
@@ -582,8 +583,9 @@ def load_multi_vcf_dataset_from_files(
             config=config,
             mmap_mode="r",
         )
-        # Subset to the samples that survived covariate filtering
-        genotype_matrix = genotype_matrix[keep_sample_indices, :]
+        # Subset to matched samples (skip if cache was already subsetted to this exact set)
+        if genotype_matrix.shape[0] != len(keep_sample_indices):
+            genotype_matrix = genotype_matrix[keep_sample_indices, :]
         raw_matrices.append(as_raw_genotype_matrix(genotype_matrix))
         default_variants.extend(chromosome_variants)
         variant_stats_parts.append(chromosome_stats)
@@ -1053,6 +1055,28 @@ def _upgrade_legacy_vcf_cache_bundle(
                 pass
 
 
+def _find_any_complete_vcf_cache(cache_dir: Path) -> _VcfCachePaths | None:
+    """Scan a cache directory for ANY complete cache bundle (legacy or current key).
+
+    This allows reusing caches created with an older key format (e.g. when
+    keep_sample_indices was part of the key) even though the current key is different.
+    """
+    for manifest_file in sorted(cache_dir.glob("*.manifest.json")):
+        key = manifest_file.name.removesuffix(".manifest.json")
+        candidate = _VcfCachePaths(
+            key=key,
+            cache_dir=cache_dir,
+            geno_path=cache_dir / f"{key}.genotypes.npy",
+            var_path=cache_dir / f"{key}.variants.pkl",
+            stats_path=cache_dir / f"{key}.stats.npy",
+            legacy_stats_path=cache_dir / f"{key}.stats.npz",
+            manifest_path=manifest_file,
+        )
+        if _is_vcf_cache_bundle_complete(candidate):
+            return candidate
+    return None
+
+
 def _load_vcf_from_cache(
     vcf_path: Path,
     config: ModelConfig,
@@ -1066,8 +1090,14 @@ def _load_vcf_from_cache(
 
     _cleanup_stale_vcf_cache_temps(paths.cache_dir, paths.key)
     if not _is_vcf_cache_bundle_complete(paths):
-        log(f"VCF cache miss (key={paths.key})")
-        return None
+        # Try to find a legacy cache (e.g. created with old key that included keep_sample_indices)
+        legacy = _find_any_complete_vcf_cache(paths.cache_dir)
+        if legacy is not None:
+            log(f"VCF cache: current key {paths.key} not found, but found legacy bundle {legacy.key}")
+            paths = legacy
+        else:
+            log(f"VCF cache miss (key={paths.key})")
+            return None
 
     try:
         log(f"VCF cache hit — loading from {paths.cache_dir.name}/{paths.key}.*")
@@ -1277,12 +1307,17 @@ def precache_vcfs_parallel(
 
     total_cpus = os.cpu_count() or 4
 
-    # Skip already-cached VCFs (compatible with existing .npy cache)
+    # Skip already-cached VCFs (compatible with existing .npy cache AND legacy keys)
     uncached: list[Path] = []
     for vcf_path in vcf_paths:
         cache_paths = _vcf_cache_paths(vcf_path, config)
-        if not _is_vcf_cache_bundle_complete(cache_paths):
-            uncached.append(vcf_path)
+        if _is_vcf_cache_bundle_complete(cache_paths):
+            continue
+        # Also check for legacy cache bundles (old key format with keep_sample_indices)
+        cache_dir = _vcf_cache_dir(vcf_path)
+        if cache_dir.exists() and _find_any_complete_vcf_cache(cache_dir) is not None:
+            continue
+        uncached.append(vcf_path)
 
     if not uncached:
         log(f"all {len(vcf_paths)} VCFs already cached")

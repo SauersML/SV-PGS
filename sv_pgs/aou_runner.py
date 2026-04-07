@@ -413,7 +413,7 @@ def run_all_of_us(
     )
 
     # Status summary: what's done vs what's left
-    from sv_pgs.io import _vcf_cache_dir, _vcf_cache_key
+    from sv_pgs.io import _vcf_cache_dir, _vcf_cache_key, _vcf_cache_paths, _is_vcf_cache_bundle_complete, _find_any_complete_vcf_cache
     log("=== STATUS CHECK ===")
     sample_table_path = work_dir / f"{disease_def.canonical_name}.samples.tsv"
     merged_path = work_dir / f"{disease_def.canonical_name}.samples.with_pcs.tsv"
@@ -433,6 +433,10 @@ def run_all_of_us(
         cache_dir = _vcf_cache_dir(vcf_path)
         key = _vcf_cache_key(vcf_path, config)
         has_cache = (cache_dir / f"{key}.genotypes.npy").exists()
+        # Also check for legacy cache bundles (old key format)
+        if not has_cache and cache_dir.exists():
+            legacy = _find_any_complete_vcf_cache(cache_dir)
+            has_cache = legacy is not None
         has_partial = (cache_dir / f"{key}.inc.progress.json").exists()
         has_tmp = (cache_dir / f"{key}.tmp_parallel").exists()
         if has_cache:
