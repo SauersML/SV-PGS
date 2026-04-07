@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import gc
+import hashlib
 import json
 import os
 import shutil
@@ -412,8 +413,80 @@ def run_all_of_us(
         random_seed=random_seed,
     )
 
+    # Migrate old VCF caches: VCFs were moved from work_dir to a shared cache dir,
+    # but the finalized .npy caches stayed in work_dir/.sv_pgs_cache.
+    # Reconstruct the old cache key per chromosome (using the legacy VCF path
+    # but reading fingerprint from the current file) and symlink into the new dir.
+    from sv_pgs.io import (
+        _vcf_cache_dir, _vcf_cache_key, _vcf_cache_paths,
+        _is_vcf_cache_bundle_complete, _find_any_complete_vcf_cache,
+        _cache_file_fingerprint, _CACHE_VERSION,
+    )
+    old_vcf_cache_dir = work_dir / ".sv_pgs_cache"
+    if old_vcf_cache_dir.exists():
+        first_vcf = _adopt_legacy_sv_vcf_cache(chromosomes[0], work_dir)
+        if first_vcf.exists():
+            new_vcf_cache_dir = _vcf_cache_dir(first_vcf)
+            if old_vcf_cache_dir.resolve() != new_vcf_cache_dir.resolve():
+                new_vcf_cache_dir.mkdir(parents=True, exist_ok=True)
+                migrated_chrs = 0
+                for chrom in chromosomes:
+                    current_vcf = local_sv_vcf_path(chrom, work_dir)
+                    if not current_vcf.exists():
+                        continue
+                    new_key = _vcf_cache_key(current_vcf, config)
+                    if (new_vcf_cache_dir / f"{new_key}.genotypes.npy").exists():
+                        continue  # already cached under new key
+                    # Compute what the old key would have been (old path, no keep_indices)
+                    old_path_str = str(legacy_local_sv_vcf_path(chrom, work_dir).resolve())
+                    fingerprint = _cache_file_fingerprint(current_vcf)  # same file content
+                    h = hashlib.sha256()
+                    h.update(f"v{_CACHE_VERSION}:".encode())
+                    h.update(old_path_str.encode())
+                    h.update(fingerprint)
+                    h.update(f"minimum_scale={config.minimum_scale:.17g}".encode())
+                    old_key_no_keep = h.hexdigest()[:24]
+                    # Check if old cache exists under this key (without keep_indices)
+                    if (old_vcf_cache_dir / f"{old_key_no_keep}.genotypes.npy").exists():
+                        for suffix in (".genotypes.npy", ".variants.pkl", ".stats.npy", ".stats.npz", ".manifest.json"):
+                            src = old_vcf_cache_dir / f"{old_key_no_keep}{suffix}"
+                            dst = new_vcf_cache_dir / f"{old_key_no_keep}{suffix}"
+                            if src.exists() and not dst.exists():
+                                dst.symlink_to(src.resolve())
+                        migrated_chrs += 1
+                        continue
+                    # Old cache might have keep_sample_indices baked in — we can't
+                    # reconstruct that key. Scan old dir for any bundle whose manifest
+                    # has the right variant count. Load variants.pkl header to match chr.
+                    import pickle as _pickle
+                    for geno_file in sorted(old_vcf_cache_dir.glob("*.genotypes.npy")):
+                        old_k = geno_file.name.removesuffix(".genotypes.npy")
+                        var_pkl = old_vcf_cache_dir / f"{old_k}.variants.pkl"
+                        if not var_pkl.exists():
+                            continue
+                        # Quick check: read first variant to verify chromosome
+                        try:
+                            with open(var_pkl, "rb") as f:
+                                variants = _pickle.load(f)
+                            if not variants:
+                                continue
+                            first_chr = str(getattr(variants[0], "chromosome", ""))
+                            if first_chr != str(chrom):
+                                continue
+                        except Exception:
+                            continue
+                        # Match! Symlink all files for this key
+                        for suffix in (".genotypes.npy", ".variants.pkl", ".stats.npy", ".stats.npz", ".manifest.json"):
+                            src = old_vcf_cache_dir / f"{old_k}{suffix}"
+                            dst = new_vcf_cache_dir / f"{old_k}{suffix}"
+                            if src.exists() and not dst.exists():
+                                dst.symlink_to(src.resolve())
+                        migrated_chrs += 1
+                        break
+                if migrated_chrs:
+                    log(f"  migrated caches for {migrated_chrs} chromosomes from {old_vcf_cache_dir}")
+
     # Status summary: what's done vs what's left
-    from sv_pgs.io import _vcf_cache_dir, _vcf_cache_key, _vcf_cache_paths, _is_vcf_cache_bundle_complete, _find_any_complete_vcf_cache
     log("=== STATUS CHECK ===")
     sample_table_path = work_dir / f"{disease_def.canonical_name}.samples.tsv"
     merged_path = work_dir / f"{disease_def.canonical_name}.samples.with_pcs.tsv"
@@ -425,7 +498,6 @@ def run_all_of_us(
     # Cache key no longer depends on sample indices — only on VCF content + config.
     cached_chrs = []
     uncached_chrs = []
-    _diag_printed = False
     for chrom in chromosomes:
         vcf_path = _adopt_legacy_sv_vcf_cache(chrom, work_dir)
         if not vcf_path.exists():
@@ -433,34 +505,6 @@ def run_all_of_us(
             continue
         cache_dir = _vcf_cache_dir(vcf_path)
         key = _vcf_cache_key(vcf_path, config)
-        # One-time diagnostic: dump cache dir contents for chr1
-        if not _diag_printed:
-            _diag_printed = True
-            log(f"  DIAG vcf_path={vcf_path}")
-            log(f"  DIAG cache_dir={cache_dir} exists={cache_dir.exists()}")
-            log(f"  DIAG current_key={key}")
-            if cache_dir.exists():
-                import os as _os
-                all_entries = sorted(_os.listdir(cache_dir))
-                log(f"  DIAG cache_dir has {len(all_entries)} entries:")
-                for entry in all_entries[:40]:
-                    full = cache_dir / entry
-                    if full.is_dir():
-                        n_children = len(list(full.iterdir()))
-                        log(f"    DIR  {entry} ({n_children} files)")
-                    else:
-                        log(f"    FILE {entry} ({full.stat().st_size:,} bytes)")
-            # Also check other possible cache locations
-            for alt_dir in [Path("/home/jupyter/hypertension_results/.sv_pgs_cache")]:
-                if alt_dir.exists():
-                    alt_entries = sorted(_os.listdir(alt_dir))
-                    log(f"  DIAG alt_dir={alt_dir} has {len(alt_entries)} entries:")
-                    for entry in alt_entries[:20]:
-                        full = alt_dir / entry
-                        if full.is_dir():
-                            log(f"    DIR  {entry}")
-                        else:
-                            log(f"    FILE {entry} ({full.stat().st_size:,} bytes)")
         has_cache = (cache_dir / f"{key}.genotypes.npy").exists()
         # Also check for legacy cache bundles (old key format)
         if not has_cache and cache_dir.exists():
