@@ -597,9 +597,14 @@ def run_all_of_us(
             covariate_columns=covariates,
         )
         inferred_trait = TraitType.BINARY if len(np.unique(dataset.targets)) <= 2 else TraitType.QUANTITATIVE
+        config.trait_type = inferred_trait
 
         log("=== STEP 5: Fit unified genome-wide model ===")
-        config.trait_type = inferred_trait
+        log(f"  freeing dataset overhead before fit...  mem={mem()}")
+        # Release the large variant_records list from the dataset — run_training_pipeline
+        # will re-create training records from variant_stats inside fit()
+        gc.collect()
+        log(f"  memory after gc: {mem()}")
         run_training_pipeline(
             dataset=dataset,
             config=config,

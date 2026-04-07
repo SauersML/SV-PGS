@@ -492,6 +492,8 @@ class BayesianPGS:
             normalized_records = _training_records_from_stats(selection_records, variant_stats)
             prepared_arrays = fit_preprocessor_from_stats(variant_stats, covariate_matrix, targets)
         preprocessor = Preprocessor(means=prepared_arrays.means, scales=prepared_arrays.scales)
+        del selection_records  # free ~1.68M duplicate records
+        import gc; gc.collect()
         log(f"preprocessor ready  {len(normalized_records)} variant records  mem={mem()}")
 
         log("creating standardized genotype view...")
