@@ -454,9 +454,12 @@ def run_all_of_us(
                     old_k = old_chr_to_key.get(str(chrom))
                     if old_k is None:
                         continue
+                    # Delete stale manifest symlink from previous migration attempts
+                    stale_manifest = new_vcf_cache_dir / f"{new_key}.manifest.json"
+                    if stale_manifest.is_symlink() or stale_manifest.exists():
+                        stale_manifest.unlink(missing_ok=True)
                     # Symlink: new_key.X → old file. Skip manifest because it
                     # references old key's stats filename which won't exist under new key.
-                    # Without manifest, _is_vcf_cache_bundle_complete uses legacy .stats.npz path.
                     for suffix in (".genotypes.npy", ".variants.pkl", ".stats.npy", ".stats.npz"):
                         src = old_vcf_cache_dir / f"{old_k}{suffix}"
                         dst = new_vcf_cache_dir / f"{new_key}{suffix}"
@@ -468,11 +471,18 @@ def run_all_of_us(
                     migrated_chrs += 1
                 if migrated_chrs:
                     log(f"  migrated caches for {migrated_chrs} chromosomes from {old_vcf_cache_dir}")
-                # Clean up old empty tmp_parallel dirs to free disk space
+                # Clean up ALL old tmp_parallel dirs — they're from interrupted
+                # precache runs and cause the precache to try re-finalizing
                 for tmp_dir in list(new_vcf_cache_dir.glob("*.tmp_parallel")):
                     try:
-                        if tmp_dir.is_dir() and not any(tmp_dir.iterdir()):
-                            tmp_dir.rmdir()
+                        if tmp_dir.is_dir():
+                            shutil.rmtree(tmp_dir, ignore_errors=True)
+                    except Exception:
+                        pass
+                # Also clean up stale incremental files
+                for inc_file in list(new_vcf_cache_dir.glob("*.inc.*")):
+                    try:
+                        inc_file.unlink(missing_ok=True)
                     except Exception:
                         pass
 

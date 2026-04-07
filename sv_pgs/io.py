@@ -1011,11 +1011,15 @@ def _write_vcf_cache_stats(stats_path: Path, variant_stats: VariantStatistics) -
 def _is_vcf_cache_bundle_complete(paths: _VcfCachePaths) -> bool:
     if paths.manifest_path.exists():
         manifest = _load_vcf_cache_manifest(paths.manifest_path)
-        if manifest is None:
-            return False
-        stats_filename = str(manifest.get("stats_file", paths.stats_path.name))
-        return paths.geno_path.exists() and paths.var_path.exists() and (paths.cache_dir / stats_filename).exists()
-    return paths.geno_path.exists() and paths.var_path.exists() and paths.legacy_stats_path.exists()
+        if manifest is not None:
+            stats_filename = str(manifest.get("stats_file", paths.stats_path.name))
+            if paths.geno_path.exists() and paths.var_path.exists() and (paths.cache_dir / stats_filename).exists():
+                return True
+        # Manifest exists but is broken or references missing files — fall through
+        # to legacy check (handles migrated symlinks where manifest points to old key)
+    return paths.geno_path.exists() and paths.var_path.exists() and (
+        paths.legacy_stats_path.exists() or paths.stats_path.exists()
+    )
 
 
 def _ensure_vcf_cache_matrix_fast(paths: _VcfCachePaths, genotype_matrix: np.ndarray) -> np.ndarray:
