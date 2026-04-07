@@ -365,6 +365,7 @@ def _try_load_fit_stage_cache(
                 scales=np.asarray(prepared_arrays.scales[combined_indices], dtype=np.float32),
                 variant_indices=np.arange(combined_indices.shape[0], dtype=np.int32),
                 support_counts=np.asarray(prepared_arrays.support_counts[combined_indices], dtype=np.int32),
+                _enable_hybrid_backend=False,  # skip sparse backend on mmap — GPU streaming handles it
             )
             log(f"fit-stage cache hit — loading from {cache_paths.cache_dir.name}/{cache_paths.key}.*")
             return active_variant_indices, reduced_tie_map, reduced_genotypes, True
