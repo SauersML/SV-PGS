@@ -454,8 +454,10 @@ def run_all_of_us(
                     old_k = old_chr_to_key.get(str(chrom))
                     if old_k is None:
                         continue
-                    # Symlink: new_key.genotypes.npy → old file
-                    for suffix in (".genotypes.npy", ".variants.pkl", ".stats.npy", ".stats.npz", ".manifest.json"):
+                    # Symlink: new_key.X → old file. Skip manifest because it
+                    # references old key's stats filename which won't exist under new key.
+                    # Without manifest, _is_vcf_cache_bundle_complete uses legacy .stats.npz path.
+                    for suffix in (".genotypes.npy", ".variants.pkl", ".stats.npy", ".stats.npz"):
                         src = old_vcf_cache_dir / f"{old_k}{suffix}"
                         dst = new_vcf_cache_dir / f"{new_key}{suffix}"
                         if src.exists() and not dst.exists():
