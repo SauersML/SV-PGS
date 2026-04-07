@@ -551,6 +551,7 @@ class BayesianPGS:
             standardized_validation = as_raw_genotype_matrix(validation_genotypes).standardized(
                 prepared_arrays.means,
                 prepared_arrays.scales,
+                support_counts=prepared_arrays.support_counts,
             )
             combined_validation_indices = active_variant_indices[reduced_tie_map.kept_indices]
             reduced_validation = (

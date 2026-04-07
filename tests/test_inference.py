@@ -162,6 +162,52 @@ def test_binary_inference_runs_with_stochastic_variant_updates(random_generator)
     assert result.sigma_error2 == 1.0
 
 
+def test_stochastic_updates_can_skip_final_posterior_refinement(random_generator, monkeypatch):
+    sample_count, variant_count = 48, 9
+    genotype_matrix = random_generator.standard_normal((sample_count, variant_count)).astype(np.float32)
+    covariate_matrix = np.column_stack(
+        [np.ones(sample_count, dtype=np.float32), random_generator.standard_normal(sample_count).astype(np.float32)]
+    )
+    target_vector = (
+        genotype_matrix[:, 0] * 0.8
+        - genotype_matrix[:, 1] * 0.4
+        + 0.1 * random_generator.standard_normal(sample_count).astype(np.float32)
+    )
+    records = make_variant_records(variant_count)
+    config = ModelConfig(
+        trait_type=TraitType.QUANTITATIVE,
+        max_outer_iterations=2,
+        update_hyperparameters=False,
+        stochastic_variational_updates=True,
+        stochastic_min_variant_count=1,
+        stochastic_variant_batch_size=3,
+        final_posterior_refinement=False,
+    )
+    tie_map = build_tie_map(genotype_matrix, records, config)
+    original_fit_collapsed_posterior = mixture_inference._fit_collapsed_posterior
+
+    def guarded_fit_collapsed_posterior(*args, **kwargs):
+        genotype_arg = kwargs["genotype_matrix"]
+        compute_logdet = kwargs.get("compute_logdet", True)
+        if compute_logdet and genotype_arg.shape[1] == tie_map.kept_indices.shape[0]:
+            raise AssertionError("unexpected final posterior refinement")
+        return original_fit_collapsed_posterior(*args, **kwargs)
+
+    monkeypatch.setattr(mixture_inference, "_fit_collapsed_posterior", guarded_fit_collapsed_posterior)
+
+    result = fit_variational_em(
+        genotypes=genotype_matrix,
+        covariates=covariate_matrix,
+        targets=target_vector,
+        records=records,
+        config=config,
+        tie_map=tie_map,
+    )
+
+    assert result.objective_history
+    assert np.all(np.isfinite(result.beta_variance))
+
+
 def test_fit_variational_em_ignores_incompatible_resume_checkpoint(random_generator):
     sample_count, variant_count = 24, 5
     genotype_matrix = random_generator.normal(size=(sample_count, variant_count)).astype(np.float32)
@@ -203,6 +249,7 @@ def test_fit_variational_em_ignores_incompatible_resume_checkpoint(random_genera
         best_validation_metric=None,
         best_alpha=None,
         best_beta=None,
+        best_beta_variance=None,
         best_local_scale=None,
         best_theta=None,
         best_sigma_error2=None,
@@ -273,6 +320,7 @@ def test_fit_variational_em_ignores_resume_checkpoint_when_validation_is_present
         best_validation_metric=None,
         best_alpha=None,
         best_beta=None,
+        best_beta_variance=None,
         best_local_scale=None,
         best_theta=None,
         best_sigma_error2=None,

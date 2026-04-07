@@ -996,6 +996,80 @@ class StandardizedGenotypeMatrix:
     def _uses_hybrid_backend(self) -> bool:
         return self._sparse_backend is not None
 
+    def _hybrid_local_components(
+        self,
+        local_variant_indices: np.ndarray,
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+        resolved_local_indices = np.asarray(local_variant_indices, dtype=np.int32)
+        if resolved_local_indices.ndim != 1:
+            raise ValueError("local_variant_indices must be 1D.")
+        if not self._uses_hybrid_backend():
+            empty = np.zeros(0, dtype=np.int32)
+            empty_mask = np.zeros(resolved_local_indices.shape[0], dtype=bool)
+            return empty_mask, empty, empty_mask.copy(), empty
+        sparse_lookup = (
+            np.full(self.shape[1], -1, dtype=np.int32)
+            if self._sparse_local_lookup is None
+            else self._sparse_local_lookup
+        )
+        dense_lookup = (
+            np.full(self.shape[1], -1, dtype=np.int32)
+            if self._dense_local_lookup is None
+            else self._dense_local_lookup
+        )
+        sparse_child_local_indices = sparse_lookup[resolved_local_indices]
+        dense_child_local_indices = dense_lookup[resolved_local_indices]
+        sparse_mask = sparse_child_local_indices >= 0
+        dense_mask = dense_child_local_indices >= 0
+        if np.any(~(sparse_mask | dense_mask)):
+            raise RuntimeError("hybrid standardized operator lost local column mapping.")
+        return (
+            sparse_mask,
+            sparse_child_local_indices[sparse_mask].astype(np.int32, copy=False),
+            dense_mask,
+            dense_child_local_indices[dense_mask].astype(np.int32, copy=False),
+        )
+
+    def _hybrid_parent_local_indices(self) -> tuple[np.ndarray, np.ndarray]:
+        if not self._uses_hybrid_backend():
+            return np.zeros(0, dtype=np.int32), np.zeros(0, dtype=np.int32)
+        sparse_parent_local_indices = (
+            np.flatnonzero(self._sparse_local_lookup >= 0).astype(np.int32)
+            if self._sparse_local_lookup is not None
+            else np.zeros(0, dtype=np.int32)
+        )
+        dense_parent_local_indices = (
+            np.flatnonzero(self._dense_local_lookup >= 0).astype(np.int32)
+            if self._dense_local_lookup is not None
+            else np.zeros(0, dtype=np.int32)
+        )
+        return sparse_parent_local_indices, dense_parent_local_indices
+
+    def _materialize_hybrid_columns(
+        self,
+        local_variant_indices: np.ndarray,
+        *,
+        batch_size: int,
+    ) -> np.ndarray:
+        resolved_local_indices = np.asarray(local_variant_indices, dtype=np.int32)
+        if resolved_local_indices.ndim != 1:
+            raise ValueError("local_variant_indices must be 1D.")
+        output = np.empty((self.shape[0], resolved_local_indices.shape[0]), dtype=np.float32)
+        if resolved_local_indices.size == 0:
+            return output
+        sparse_mask, sparse_child_local_indices, dense_mask, dense_child_local_indices = self._hybrid_local_components(
+            resolved_local_indices
+        )
+        if np.any(sparse_mask):
+            if self._sparse_backend is None:
+                raise RuntimeError("hybrid sparse backend is not configured.")
+            output[:, sparse_mask] = self._sparse_backend.materialize_columns(sparse_child_local_indices)
+        if np.any(dense_mask):
+            if self._dense_backend is None:
+                raise RuntimeError("hybrid dense backend is not configured.")
+            output[:, dense_mask] = self._dense_backend.subset(dense_child_local_indices).materialize(batch_size=batch_size)
+        return output
+
     @property
     def _gpu_cache(self) -> Any | None:
         return self._cupy_cache
@@ -1018,6 +1092,11 @@ class StandardizedGenotypeMatrix:
             raise RuntimeError("cannot release raw storage before materializing genotype data.")
         self.raw = None
         self._local_cache_directory = None
+        self._cupy_subset_cache = None
+        self._cupy_subset_cache_local_indices = None
+        if self._dense_backend is not None:
+            self._dense_backend.raw = None
+            self._dense_backend._local_cache_directory = None
 
     def try_materialize_gpu(self) -> bool:
         """Materialize the standardized matrix onto GPU memory when possible."""
@@ -1198,6 +1277,9 @@ class StandardizedGenotypeMatrix:
                 self.support_counts = np.asarray(self.support_counts[self.variant_indices], dtype=np.int32)
             self.variant_indices = np.arange(selected_variant_count, dtype=np.int32)
             self._local_cache_directory = cache_directory
+            self._cupy_subset_cache = None
+            self._cupy_subset_cache_local_indices = None
+            self._configure_operator_backend()
             log("    local int8 cache ready  mem=" + mem())
             return True
         except Exception as exc:
@@ -1247,6 +1329,9 @@ class StandardizedGenotypeMatrix:
                 self.support_counts = np.asarray(self.support_counts[self.variant_indices], dtype=np.int32)
             self.variant_indices = np.arange(selected_variant_count, dtype=np.int32)
             self._local_cache_directory = None
+            self._cupy_subset_cache = None
+            self._cupy_subset_cache_local_indices = None
+            self._configure_operator_backend()
             log("    persistent int8 cache ready  mem=" + mem())
             return True
         except Exception as exc:
@@ -1260,6 +1345,12 @@ class StandardizedGenotypeMatrix:
 
     def subset(self, local_variant_indices: Sequence[int] | np.ndarray) -> StandardizedGenotypeMatrix:
         resolved_local_indices = np.asarray(local_variant_indices, dtype=np.int32)
+        preserve_hybrid = (
+            self._uses_hybrid_backend()
+            and self._dense_cache is None
+            and self._cupy_cache is None
+            and self._jax_cache is None
+        )
         subset = StandardizedGenotypeMatrix(
             raw=self.raw,
             means=self.means,
@@ -1267,7 +1358,24 @@ class StandardizedGenotypeMatrix:
             variant_indices=self.variant_indices[resolved_local_indices],
             support_counts=self.support_counts,
             sample_count=self.shape[0],
+            _enable_hybrid_backend=False if preserve_hybrid else self._enable_hybrid_backend,
         )
+        if preserve_hybrid:
+            sparse_mask, sparse_child_local_indices, dense_mask, dense_child_local_indices = self._hybrid_local_components(
+                resolved_local_indices
+            )
+            if np.any(sparse_mask):
+                if self._sparse_backend is None:
+                    raise RuntimeError("hybrid sparse backend is not configured.")
+                subset._sparse_backend = self._sparse_backend.subset(sparse_child_local_indices)
+                subset._sparse_local_lookup = np.full(resolved_local_indices.shape[0], -1, dtype=np.int32)
+                subset._sparse_local_lookup[sparse_mask] = np.arange(sparse_child_local_indices.shape[0], dtype=np.int32)
+            if np.any(dense_mask):
+                if self._dense_backend is None:
+                    raise RuntimeError("hybrid dense backend is not configured.")
+                subset._dense_backend = self._dense_backend.subset(dense_child_local_indices)
+                subset._dense_local_lookup = np.full(resolved_local_indices.shape[0], -1, dtype=np.int32)
+                subset._dense_local_lookup[dense_mask] = np.arange(dense_child_local_indices.shape[0], dtype=np.int32)
         if self._cupy_cache is not None:
             subset._cupy_cache = self._cupy_cache[:, resolved_local_indices]
         if self._jax_cache is not None:
@@ -1288,6 +1396,19 @@ class StandardizedGenotypeMatrix:
                 yield RawGenotypeBatch(
                     variant_indices=local_indices,
                     values=np.asarray(self._dense_cache[:, local_indices], dtype=np.float32),
+                )
+            return
+        if self._uses_hybrid_backend():
+            safe_batch_size = _effective_standardized_streaming_batch_size(
+                self.shape[0],
+                max(int(batch_size), 1),
+                target_batch_bytes=STANDARDIZED_STREAMING_TARGET_BATCH_BYTES,
+            )
+            for start_index in range(0, self.shape[1], safe_batch_size):
+                local_indices = np.arange(start_index, min(start_index + safe_batch_size, self.shape[1]), dtype=np.int32)
+                yield RawGenotypeBatch(
+                    variant_indices=local_indices,
+                    values=self._materialize_hybrid_columns(local_indices, batch_size=safe_batch_size),
                 )
             return
         if self.raw is None:
@@ -1346,7 +1467,7 @@ class StandardizedGenotypeMatrix:
         return matrix
 
     def _streaming_gpu_context(self, batch_size: int):
-        if self._cupy_cache is not None or self.supports_jax_dense_ops() or self.raw is None:
+        if self._cupy_cache is not None or self.supports_jax_dense_ops() or self.raw is None or self._uses_hybrid_backend():
             return None, None
         cupy = _try_import_cupy()
         if cupy is None:
@@ -1413,6 +1534,21 @@ class StandardizedGenotypeMatrix:
             raise ValueError("coefficient vector must match genotype column count.")
         if not np.any(coeff_np):
             return _as_gpu_compute_jax(np.zeros(self.shape[0], dtype=coeff_np.dtype))
+        if self._uses_hybrid_backend():
+            sparse_parent_local_indices, dense_parent_local_indices = self._hybrid_parent_local_indices()
+            result = np.zeros(self.shape[0], dtype=coeff_np.dtype)
+            if sparse_parent_local_indices.size > 0:
+                if self._sparse_backend is None:
+                    raise RuntimeError("hybrid sparse backend is not configured.")
+                result += self._sparse_backend.matvec(coeff_np[sparse_parent_local_indices])
+            if dense_parent_local_indices.size > 0:
+                if self._dense_backend is None:
+                    raise RuntimeError("hybrid dense backend is not configured.")
+                result += np.asarray(
+                    self._dense_backend.matvec(coeff_np[dense_parent_local_indices], batch_size=batch_size),
+                    dtype=coeff_np.dtype,
+                )
+            return _as_gpu_compute_jax(result)
         result = np.zeros(self.shape[0], dtype=gpu_compute_numpy_dtype())
         for batch in self.iter_column_batches(batch_size=batch_size):
             batch_values = np.asarray(batch.values, dtype=result.dtype)
@@ -1466,6 +1602,21 @@ class StandardizedGenotypeMatrix:
             raise ValueError("variant matrix must match genotype column count.")
         if not np.any(m_np):
             return _as_gpu_compute_jax(np.zeros((self.shape[0], m_np.shape[1]), dtype=m_np.dtype))
+        if self._uses_hybrid_backend():
+            sparse_parent_local_indices, dense_parent_local_indices = self._hybrid_parent_local_indices()
+            output = np.zeros((self.shape[0], m_np.shape[1]), dtype=m_np.dtype)
+            if sparse_parent_local_indices.size > 0:
+                if self._sparse_backend is None:
+                    raise RuntimeError("hybrid sparse backend is not configured.")
+                output += self._sparse_backend.matmat(m_np[sparse_parent_local_indices, :])
+            if dense_parent_local_indices.size > 0:
+                if self._dense_backend is None:
+                    raise RuntimeError("hybrid dense backend is not configured.")
+                output += np.asarray(
+                    self._dense_backend.matmat(m_np[dense_parent_local_indices, :], batch_size=batch_size),
+                    dtype=m_np.dtype,
+                )
+            return _as_gpu_compute_jax(output)
         output = np.zeros((self.shape[0], m_np.shape[1]), dtype=m_np.dtype)
         for batch in self.iter_column_batches(batch_size=batch_size):
             batch_values = np.asarray(batch.values, dtype=output.dtype)
@@ -1519,6 +1670,21 @@ class StandardizedGenotypeMatrix:
             raise ValueError("sample vector must match genotype row count.")
         if not np.any(v_np):
             return _as_gpu_compute_jax(np.zeros(self.shape[1], dtype=v_np.dtype))
+        if self._uses_hybrid_backend():
+            sparse_parent_local_indices, dense_parent_local_indices = self._hybrid_parent_local_indices()
+            output = np.empty(self.shape[1], dtype=v_np.dtype)
+            if sparse_parent_local_indices.size > 0:
+                if self._sparse_backend is None:
+                    raise RuntimeError("hybrid sparse backend is not configured.")
+                output[sparse_parent_local_indices] = self._sparse_backend.transpose_matvec(v_np)
+            if dense_parent_local_indices.size > 0:
+                if self._dense_backend is None:
+                    raise RuntimeError("hybrid dense backend is not configured.")
+                output[dense_parent_local_indices] = np.asarray(
+                    self._dense_backend.transpose_matvec(v_np, batch_size=batch_size),
+                    dtype=v_np.dtype,
+                )
+            return _as_gpu_compute_jax(output)
         output = np.empty(self.shape[1], dtype=v_np.dtype)
         for batch in self.iter_column_batches(batch_size=batch_size):
             output[batch.variant_indices] = np.asarray(batch.values, dtype=output.dtype).T @ v_np
@@ -1571,6 +1737,21 @@ class StandardizedGenotypeMatrix:
             raise ValueError("sample matrix must match genotype row count.")
         if not np.any(m_np):
             return _as_gpu_compute_jax(np.zeros((self.shape[1], m_np.shape[1]), dtype=m_np.dtype))
+        if self._uses_hybrid_backend():
+            sparse_parent_local_indices, dense_parent_local_indices = self._hybrid_parent_local_indices()
+            output = np.empty((self.shape[1], m_np.shape[1]), dtype=m_np.dtype)
+            if sparse_parent_local_indices.size > 0:
+                if self._sparse_backend is None:
+                    raise RuntimeError("hybrid sparse backend is not configured.")
+                output[sparse_parent_local_indices, :] = self._sparse_backend.transpose_matmat(m_np)
+            if dense_parent_local_indices.size > 0:
+                if self._dense_backend is None:
+                    raise RuntimeError("hybrid dense backend is not configured.")
+                output[dense_parent_local_indices, :] = np.asarray(
+                    self._dense_backend.transpose_matmat(m_np, batch_size=batch_size),
+                    dtype=m_np.dtype,
+                )
+            return _as_gpu_compute_jax(output)
         output = np.empty((self.shape[1], m_np.shape[1]), dtype=m_np.dtype)
         for batch in self.iter_column_batches(batch_size=batch_size):
             output[batch.variant_indices, :] = np.asarray(batch.values, dtype=output.dtype).T @ m_np

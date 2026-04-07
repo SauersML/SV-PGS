@@ -1211,7 +1211,6 @@ def fit_variational_em(
         tpb_shape_a_vector = best_tpb_shape_a_vector
         tpb_shape_b_vector = best_tpb_shape_b_vector
 
-    log(f"  EM loop done after {len(objective_history)} iterations, computing final posterior...  mem={mem()}")
     final_metadata_baseline_scales = _metadata_baseline_scales_from_coefficients(
         scale_model_coefficients,
         prior_design.design_matrix,
@@ -1223,27 +1222,51 @@ def fit_variational_em(
         local_scale=local_scale,
         config=config,
     )
-    final_state = _fit_collapsed_posterior(
-        genotype_matrix=genotype_matrix,
-        covariate_matrix=covariate_matrix,
-        targets=target_vector,
-        reduced_prior_variances=final_reduced_prior_variances,
-        sigma_error2=sigma_error2,
-        alpha_init=alpha_state,
-        beta_init=beta_state,
-        trait_type=config.trait_type,
-        config=config,
-        compute_logdet=True,
-        compute_beta_variance=True,
-        predictor_offset=predictor_offset_array,
-    )
-    if config.trait_type == TraitType.BINARY and config.binary_intercept_calibration:
-        final_state = _apply_binary_intercept_calibration(
-            posterior_state=final_state,
+    if config.final_posterior_refinement:
+        log(f"  EM loop done after {len(objective_history)} iterations, computing final posterior...  mem={mem()}")
+        final_state = _fit_collapsed_posterior(
+            genotype_matrix=genotype_matrix,
+            covariate_matrix=covariate_matrix,
             targets=target_vector,
+            reduced_prior_variances=final_reduced_prior_variances,
+            sigma_error2=sigma_error2,
+            alpha_init=alpha_state,
+            beta_init=beta_state,
+            trait_type=config.trait_type,
+            config=config,
+            compute_logdet=True,
+            compute_beta_variance=True,
+            predictor_offset=predictor_offset_array,
         )
-
-    log(f"  final posterior computed  obj={final_state.collapsed_objective:.6f}  sigma_e2={final_state.sigma_error2:.4f}  mem={mem()}")
+        if config.trait_type == TraitType.BINARY and config.binary_intercept_calibration:
+            final_state = _apply_binary_intercept_calibration(
+                posterior_state=final_state,
+                targets=target_vector,
+            )
+        log(f"  final posterior computed  obj={final_state.collapsed_objective:.6f}  sigma_e2={final_state.sigma_error2:.4f}  mem={mem()}")
+    else:
+        if beta_variance_state is None:
+            beta_variance_state = np.maximum(final_reduced_prior_variances, 1e-8)
+        final_linear_predictor = predictor_offset_array + np.asarray(covariate_matrix @ alpha_state, dtype=np.float64)
+        if genotype_matrix.shape[1] > 0:
+            final_linear_predictor = final_linear_predictor + np.asarray(
+                genotype_matrix.matvec(beta_state, batch_size=config.posterior_variance_batch_size),
+                dtype=np.float64,
+            )
+        final_state = PosteriorState(
+            alpha=np.asarray(alpha_state, dtype=np.float64).copy(),
+            beta=np.asarray(beta_state, dtype=np.float64).copy(),
+            beta_variance=np.asarray(beta_variance_state, dtype=np.float64).copy(),
+            linear_predictor=np.asarray(final_linear_predictor, dtype=np.float64),
+            collapsed_objective=float(objective_history[-1]) if objective_history else 0.0,
+            sigma_error2=float(sigma_error2),
+        )
+        if config.trait_type == TraitType.BINARY and config.binary_intercept_calibration:
+            final_state = _apply_binary_intercept_calibration(
+                posterior_state=final_state,
+                targets=target_vector,
+            )
+        log("  final posterior refinement skipped; returning current variational state  mem=" + mem())
     final_member_prior_variances = _member_prior_variances_from_reduced_state(
         member_records=member_records,
         tie_map=tie_map,

@@ -128,6 +128,7 @@ def test_runtime_tuned_config_for_t4_caps_solver_from_gpu_budget(monkeypatch):
 
     assert tuned_config.exact_solver_matrix_limit == 1_024
     assert tuned_config.sample_space_preconditioner_rank == 256
+    assert tuned_config.final_posterior_refinement is False
     assert summary is not None
 
 
@@ -194,6 +195,7 @@ def test_fit_resumes_from_variational_checkpoint(tmp_path, monkeypatch):
                     best_validation_metric=None,
                     best_alpha=None,
                     best_beta=None,
+                    best_beta_variance=None,
                     best_local_scale=None,
                     best_theta=None,
                     best_sigma_error2=None,
