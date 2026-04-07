@@ -19,6 +19,7 @@ from sv_pgs.mixture_inference import (
     _basil_working_set_indices,
     _build_restricted_projector_jax,
     _calibrate_binary_intercept,
+    _collapsed_posterior_solver_controls,
     PosteriorState,
     VariationalFitCheckpoint,
     _binary_posterior_state,
@@ -1380,6 +1381,143 @@ def test_binary_newton_solver_controls_relax_large_problem_settings():
 
     assert tolerance == 5e-3
     assert max_iterations == 96
+
+
+def test_collapsed_posterior_solver_controls_relax_large_em_updates_and_keep_final_polish():
+    standardized = as_raw_genotype_matrix(np.zeros((1, 1), dtype=np.float32)).standardized(
+        means=np.zeros(1, dtype=np.float32),
+        scales=np.ones(1, dtype=np.float32),
+    )
+    standardized._n_samples = 20_000
+    standardized.variant_indices = np.arange(40_000, dtype=np.int32)
+    standardized.means = np.zeros(40_000, dtype=np.float32)
+    standardized.scales = np.ones(40_000, dtype=np.float32)
+
+    relaxed_tolerance, relaxed_iterations = _collapsed_posterior_solver_controls(
+        standardized,
+        solver_tolerance=1e-6,
+        maximum_linear_solver_iterations=1024,
+        compute_logdet=False,
+        compute_beta_variance=False,
+    )
+    full_tolerance, full_iterations = _collapsed_posterior_solver_controls(
+        standardized,
+        solver_tolerance=1e-6,
+        maximum_linear_solver_iterations=1024,
+        compute_logdet=True,
+        compute_beta_variance=True,
+    )
+
+    assert relaxed_tolerance == 1e-3
+    assert relaxed_iterations == 128
+    assert full_tolerance == 1e-6
+    assert full_iterations == 1024
+
+
+def test_fit_collapsed_posterior_relaxes_quantitative_solver_during_em_and_keeps_final_polish(monkeypatch):
+    sample_count, variant_count = 8, 6
+    genotype_values = np.array(
+        [
+            [0.0, 1.0, 2.0, 0.0, 1.0, 2.0],
+            [1.0, 0.0, 1.0, 2.0, 0.0, 1.0],
+            [2.0, 1.0, 0.0, 1.0, 2.0, 0.0],
+            [0.0, 2.0, 1.0, 0.0, 2.0, 1.0],
+            [1.0, 1.0, 1.0, 2.0, 2.0, 2.0],
+            [2.0, 0.0, 2.0, 1.0, 0.0, 1.0],
+            [0.0, 1.0, 0.0, 2.0, 1.0, 2.0],
+            [1.0, 2.0, 1.0, 0.0, 1.0, 0.0],
+        ],
+        dtype=np.float32,
+    )
+    standardized = as_raw_genotype_matrix(genotype_values).standardized(
+        means=np.ones(variant_count, dtype=np.float32),
+        scales=np.ones(variant_count, dtype=np.float32),
+    )
+    standardized._n_samples = 20_000
+    standardized.variant_indices = np.arange(40_000, dtype=np.int32)
+    standardized.means = np.zeros(40_000, dtype=np.float32)
+    standardized.scales = np.ones(40_000, dtype=np.float32)
+    covariate_matrix = np.column_stack(
+        [
+            np.ones(sample_count, dtype=np.float32),
+            np.linspace(-1.0, 1.0, sample_count, dtype=np.float32),
+        ]
+    )
+    targets = np.linspace(-0.5, 0.75, sample_count, dtype=np.float32)
+    solver_settings: list[tuple[float, int, bool, bool]] = []
+
+    def fake_quantitative_posterior_state(
+        genotype_matrix,
+        covariate_matrix,
+        targets,
+        prior_variances,
+        sigma_error2,
+        sigma_error_floor,
+        solver_tolerance,
+        maximum_linear_solver_iterations,
+        logdet_probe_count,
+        logdet_lanczos_steps,
+        exact_solver_matrix_limit,
+        posterior_variance_batch_size,
+        posterior_variance_probe_count,
+        random_seed,
+        compute_logdet,
+        compute_beta_variance=True,
+        **_kwargs,
+    ):
+        solver_settings.append(
+            (
+                float(solver_tolerance),
+                int(maximum_linear_solver_iterations),
+                bool(compute_logdet),
+                bool(compute_beta_variance),
+            )
+        )
+        return (
+            np.zeros(covariate_matrix.shape[1], dtype=np.float64),
+            np.zeros(prior_variances.shape[0], dtype=np.float64),
+            np.zeros(prior_variances.shape[0], dtype=np.float64),
+            np.zeros(targets.shape[0], dtype=np.float64),
+            0.0,
+            1.0,
+        )
+
+    monkeypatch.setattr(mixture_inference, "_quantitative_posterior_state", fake_quantitative_posterior_state)
+
+    config = ModelConfig(
+        trait_type=TraitType.QUANTITATIVE,
+        linear_solver_tolerance=1e-6,
+        maximum_linear_solver_iterations=1024,
+    )
+    mixture_inference._fit_collapsed_posterior(
+        genotype_matrix=standardized,
+        covariate_matrix=covariate_matrix,
+        targets=targets,
+        reduced_prior_variances=np.ones(variant_count, dtype=np.float64),
+        sigma_error2=1.0,
+        alpha_init=np.zeros(covariate_matrix.shape[1], dtype=np.float64),
+        beta_init=np.zeros(variant_count, dtype=np.float64),
+        trait_type=TraitType.QUANTITATIVE,
+        config=config,
+        compute_logdet=False,
+        compute_beta_variance=False,
+    )
+    mixture_inference._fit_collapsed_posterior(
+        genotype_matrix=standardized,
+        covariate_matrix=covariate_matrix,
+        targets=targets,
+        reduced_prior_variances=np.ones(variant_count, dtype=np.float64),
+        sigma_error2=1.0,
+        alpha_init=np.zeros(covariate_matrix.shape[1], dtype=np.float64),
+        beta_init=np.zeros(variant_count, dtype=np.float64),
+        trait_type=TraitType.QUANTITATIVE,
+        config=config,
+        compute_logdet=True,
+        compute_beta_variance=True,
+    )
+
+    assert solver_settings[0] == (1e-3, 128, False, False)
+    assert solver_settings[1] == (1e-6, 1024, True, True)
 
 
 def test_binary_posterior_uses_inexact_solver_controls_before_final_solve(monkeypatch):
