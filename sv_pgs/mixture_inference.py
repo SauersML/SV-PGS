@@ -4437,11 +4437,14 @@ def _restricted_posterior_state(
         and _try_import_cupy() is not None
     )
     if sample_space_gpu_enabled:
+        import time as _time
         gpu_source = "full-cache" if genotype_matrix._cupy_cache is not None else "streaming"
         log(
             "    restricted posterior: GPU block-CG sample-space solve "
             + f"(p={variant_count}, n={sample_count}, source={gpu_source})"
         )
+        _t0 = _time.monotonic()
+        log(f"      building preconditioner...")
         sample_space_preconditioner_gpu, sample_space_preconditioner_cache_entry = _get_cached_sample_space_gpu_preconditioner(
             genotype_matrix=genotype_matrix,
             prior_variances=prior_variances,
@@ -4450,8 +4453,11 @@ def _restricted_posterior_state(
             rank=effective_sample_space_preconditioner_rank,
             random_seed=random_seed,
         )
+        log(f"      preconditioner ready ({_time.monotonic()-_t0:.1f}s)  mem={mem()}")
 
         def solve_rhs_iterative(right_hand_side: np.ndarray, *, initial_guess: np.ndarray | None = None) -> np.ndarray:
+            _solve_t0 = _time.monotonic()
+            log(f"      GPU CG solve starting: rhs_cols={right_hand_side.shape[1] if right_hand_side.ndim > 1 else 1}")
             solve_result = _solve_sample_space_rhs_gpu(
                 genotype_matrix=genotype_matrix,
                 prior_variances=prior_variances,
@@ -4472,6 +4478,7 @@ def _restricted_posterior_state(
                 sample_space_preconditioner_cache_entry,
                 iterations_used,
             )
+            log(f"      GPU CG done: {iterations_used} iterations in {_time.monotonic()-_solve_t0:.1f}s  mem={mem()}")
             return np.asarray(solved_rhs, dtype=np.float64)
     else:
         log(
@@ -4616,20 +4623,28 @@ def _restricted_posterior_state(
         )
         beta_variance = np.maximum(prior_variances - (prior_variances * prior_variances) * leverage_diagonal, 1e-8)
     else:
+        import time as _time
+        _t0 = _time.monotonic()
+        log(f"    computing beta: X^T @ projected_targets ({variant_count:,} variants)...")
         beta = np.asarray(
             prior_variances * np.asarray(genotype_matrix.transpose_matvec(projected_targets), dtype=compute_np_dtype),
             dtype=compute_np_dtype,
         )
+        log(f"    beta computed in {_time.monotonic()-_t0:.1f}s  mem={mem()}")
         beta_variance = np.zeros_like(prior_variances, dtype=np.float64)
+    import time as _time
+    _t0 = _time.monotonic()
+    log(f"    computing linear predictor: X @ beta ({variant_count:,} variants)...")
     linear_predictor = covariate_matrix @ alpha + np.asarray(
         genotype_matrix.matvec(beta, batch_size=posterior_variance_batch_size),
         dtype=compute_np_dtype,
     )
+    log(f"    linear predictor computed in {_time.monotonic()-_t0:.1f}s  mem={mem()}")
     sign_gls, logdet_gls = np.linalg.slogdet(gls_normal_matrix)
     if sign_gls <= 0.0:
         raise RuntimeError("Restricted GLS normal matrix is not positive definite.")
     restricted_quadratic = float(np.dot(targets, projected_targets))
-    log(f"    posterior beta computed: max|beta|={float(np.max(np.abs(beta))):.4f}  mean|beta|={float(np.mean(np.abs(beta))):.6f}  logdet_cov={float(logdet_covariance):.4f}  mem={mem()}")
+    log(f"    posterior done: max|beta|={float(np.max(np.abs(beta))):.4f}  mean|beta|={float(np.mean(np.abs(beta))):.6f}  logdet_cov={float(logdet_covariance):.4f}  mem={mem()}")
     return (
         np.asarray(alpha, dtype=np.float64),
         np.asarray(beta, dtype=np.float64),

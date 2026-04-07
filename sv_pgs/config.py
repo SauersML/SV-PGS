@@ -142,7 +142,7 @@ class ModelConfig:
     sample_space_preconditioner_rank: int = 256
     validation_interval: int = 2
     binary_intercept_calibration: bool = True
-    enable_stage1_null_model: bool = True
+    enable_stage1_null_model: bool = False
     stage1_min_minor_allele_frequency: float = 0.01
     stage1_max_variants: int = 65_536
     stage1_prior_variance: float = 0.05
