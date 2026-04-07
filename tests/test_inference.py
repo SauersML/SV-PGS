@@ -1171,6 +1171,89 @@ def test_restricted_posterior_sample_space_fuses_beta_and_restricted_probe_trans
     assert sorted(transpose_matmat_widths) == [5, 6]
 
 
+def test_restricted_posterior_sample_space_logdet_uses_cached_diagonal_control_variate(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    sample_count, variant_count = 6, 7
+    genotype_values = np.array(
+        [
+            [0.0, 1.0, 2.0, 0.0, 1.0, 2.0, 0.0],
+            [1.0, 0.0, 1.0, 2.0, 0.0, 1.0, 2.0],
+            [2.0, 1.0, 0.0, 1.0, 2.0, 0.0, 1.0],
+            [1.0, 2.0, 1.0, 0.0, 1.0, 2.0, 1.0],
+            [0.0, 1.0, 1.0, 2.0, 1.0, 0.0, 2.0],
+            [2.0, 0.0, 2.0, 1.0, 0.0, 2.0, 1.0],
+        ],
+        dtype=np.float32,
+    )
+    standardized = as_raw_genotype_matrix(genotype_values).standardized(
+        means=np.mean(genotype_values, axis=0, dtype=np.float32),
+        scales=np.std(genotype_values, axis=0, dtype=np.float32) + 1e-3,
+    )
+    covariate_matrix = np.column_stack(
+        [
+            np.ones(sample_count, dtype=np.float64),
+            np.linspace(-1.0, 1.0, sample_count, dtype=np.float64),
+        ]
+    )
+    targets = np.linspace(-0.5, 0.75, sample_count, dtype=np.float64)
+    prior_variances = np.linspace(0.5, 1.1, variant_count, dtype=np.float64)
+    diagonal_noise = np.linspace(0.8, 1.3, sample_count, dtype=np.float64)
+    expected_diagonal = np.linspace(2.0, 3.0, sample_count, dtype=np.float64)
+    captured_control_variate: list[np.ndarray] = []
+
+    def fake_diagonal_preconditioner(**kwargs):
+        return expected_diagonal
+
+    def fake_solve_sample_space_rhs_cpu(
+        genotype_matrix,
+        prior_variances,
+        diagonal_noise,
+        right_hand_side,
+        initial_guess,
+        tolerance,
+        max_iterations,
+        preconditioner,
+        batch_size,
+        return_iterations=False,
+    ):
+        rhs = np.asarray(right_hand_side, dtype=np.float64)
+        if rhs.ndim == 1:
+            rhs = rhs[:, None]
+        return (rhs, 2) if return_iterations else rhs
+
+    def fake_stochastic_logdet(operator, dimension, probe_count, lanczos_steps, random_seed, **kwargs):
+        captured_control_variate.append(np.asarray(kwargs["control_variate_diagonal"], dtype=np.float64))
+        return 0.0
+
+    monkeypatch.setattr(mixture_inference, "_sample_space_diagonal_preconditioner", fake_diagonal_preconditioner)
+    monkeypatch.setattr(mixture_inference, "_solve_sample_space_rhs_cpu", fake_solve_sample_space_rhs_cpu)
+    monkeypatch.setattr(mixture_inference, "stochastic_logdet", fake_stochastic_logdet)
+
+    mixture_inference._restricted_posterior_state(
+        genotype_matrix=standardized,
+        covariate_matrix=covariate_matrix,
+        targets=targets,
+        prior_variances=prior_variances,
+        diagonal_noise=diagonal_noise,
+        solver_tolerance=1e-6,
+        maximum_linear_solver_iterations=16,
+        logdet_probe_count=8,
+        logdet_lanczos_steps=4,
+        exact_solver_matrix_limit=2,
+        posterior_variance_batch_size=3,
+        posterior_variance_probe_count=5,
+        random_seed=7,
+        compute_logdet=True,
+        compute_beta_variance=False,
+        sample_space_preconditioner_rank=0,
+        allow_working_set=False,
+    )
+
+    assert len(captured_control_variate) == 1
+    np.testing.assert_allclose(captured_control_variate[0], expected_diagonal, atol=0.0)
+
+
 def test_binary_posterior_stops_when_predictor_update_is_stalled(random_generator, monkeypatch):
     sample_count, variant_count = 64, 6
     genotype_matrix = random_generator.standard_normal((sample_count, variant_count)).astype(np.float32)

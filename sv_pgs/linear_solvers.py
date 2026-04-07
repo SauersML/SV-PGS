@@ -157,6 +157,7 @@ def stochastic_logdet(
     linear_operator = _as_linear_operator(operator)
     baseline_logdet = 0.0
     if control_variate_diagonal is not None:
+        base_operator = linear_operator
         diagonal = np.asarray(control_variate_diagonal, dtype=np.float64).reshape(-1)
         if diagonal.shape != (dimension,):
             raise ValueError("control_variate_diagonal must have one entry per operator dimension.")
@@ -168,18 +169,18 @@ def stochastic_logdet(
 
         def transformed_matvec(vector: jnp.ndarray) -> jnp.ndarray:
             scaled_vector = inverse_sqrt_diagonal * np.asarray(vector, dtype=np.float64)
-            applied = np.asarray(linear_operator.matvec(jnp.asarray(scaled_vector, dtype=transformed_dtype)), dtype=np.float64)
+            applied = np.asarray(base_operator.matvec(jnp.asarray(scaled_vector, dtype=transformed_dtype)), dtype=np.float64)
             return jnp.asarray(inverse_sqrt_diagonal * applied, dtype=transformed_dtype)
 
         def transformed_matmat(matrix: jnp.ndarray) -> jnp.ndarray:
             matrix_array = np.asarray(matrix, dtype=np.float64)
             scaled_matrix = inverse_sqrt_diagonal[:, None] * matrix_array
-            if linear_operator.matmat is not None:
-                applied = np.asarray(linear_operator.matmat(jnp.asarray(scaled_matrix, dtype=transformed_dtype)), dtype=np.float64)
+            if base_operator.matmat is not None:
+                applied = np.asarray(base_operator.matmat(jnp.asarray(scaled_matrix, dtype=transformed_dtype)), dtype=np.float64)
             else:
                 applied = np.column_stack(
                     [
-                        np.asarray(linear_operator.matvec(jnp.asarray(scaled_matrix[:, column_index], dtype=transformed_dtype)), dtype=np.float64)
+                        np.asarray(base_operator.matvec(jnp.asarray(scaled_matrix[:, column_index], dtype=transformed_dtype)), dtype=np.float64)
                         for column_index in range(scaled_matrix.shape[1])
                     ]
                 )
