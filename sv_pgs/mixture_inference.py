@@ -5116,34 +5116,42 @@ def _restricted_posterior_state(
                     variant_precision_gpu[diagonal_index, diagonal_index] += jitter
                     variant_precision_cholesky_gpu = cp.linalg.cholesky(variant_precision_gpu)
 
+                def solve_variant_rhs_gpu(right_hand_side):
+                    return _gpu_cholesky_solve(
+                        right_hand_side,
+                        variant_precision_cholesky_gpu,
+                        cp_solve_triangular,
+                    )
+
                 def solve_variant_rhs(right_hand_side: np.ndarray) -> np.ndarray:
                     return _cupy_array_to_numpy(
-                        _gpu_cholesky_solve(
-                            right_hand_side,
-                            variant_precision_cholesky_gpu,
-                            cp_solve_triangular,
-                        ),
+                        solve_variant_rhs_gpu(right_hand_side),
                         dtype=np.float64,
                     )
 
-                beta_gpu = _gpu_cholesky_solve(
-                    variant_rhs_gpu,
-                    variant_precision_cholesky_gpu,
-                    cp_solve_triangular,
-                )
-                beta = _cupy_array_to_numpy(beta_gpu, dtype=np.float64)
+                beta_gpu = solve_variant_rhs_gpu(variant_rhs_gpu)
             beta_variance = (
-                np.maximum(np.diag(solve_variant_rhs(np.eye(variant_count, dtype=np.float64))), 1e-8)
-                if compute_beta_variance and variant_count <= exact_solver_matrix_limit
+                np.maximum(
+                    _cupy_array_to_numpy(
+                        solve_variant_rhs_gpu(cp.eye(variant_count, dtype=cp.float64))[diagonal_index, diagonal_index],
+                        dtype=np.float64,
+                    ),
+                    1e-8,
+                )
+                if genotype_matrix._cupy_cache is not None and compute_beta_variance and variant_count <= exact_solver_matrix_limit
                 else (
-                    _posterior_variance_low_rank_residual_diagonal(
-                        solve_variant_rhs=solve_variant_rhs,
-                        dimension=variant_count,
-                        probe_count=posterior_variance_probe_count,
-                        random_seed=random_seed,
+                    np.maximum(np.diag(solve_variant_rhs(np.eye(variant_count, dtype=np.float64))), 1e-8)
+                    if compute_beta_variance and variant_count <= exact_solver_matrix_limit
+                    else (
+                        _posterior_variance_low_rank_residual_diagonal(
+                            solve_variant_rhs=solve_variant_rhs,
+                            dimension=variant_count,
+                            probe_count=posterior_variance_probe_count,
+                            random_seed=random_seed,
+                        )
+                        if compute_beta_variance
+                        else np.zeros(variant_count, dtype=np.float64)
                     )
-                    if compute_beta_variance
-                    else np.zeros(variant_count, dtype=np.float64)
                 )
             )
             if genotype_matrix._cupy_cache is not None:
@@ -5168,7 +5176,9 @@ def _restricted_posterior_state(
                     if compute_logdet
                     else 0.0
                 )
-                genetic_linear_predictor = _cupy_array_to_numpy(X_gpu_compute @ cp.asarray(beta_gpu, dtype=compute_cp_dtype), dtype=np.float64)
+                genetic_linear_predictor_gpu = X_gpu_compute @ cp.asarray(beta_gpu, dtype=compute_cp_dtype)
+                genetic_linear_predictor = _cupy_array_to_numpy(genetic_linear_predictor_gpu, dtype=np.float64)
+                beta = _cupy_array_to_numpy(beta_gpu, dtype=np.float64)
             else:
                 logdet_A = 2.0 * float(np.sum(np.log(np.diag(variant_precision_cholesky)))) if compute_logdet else 0.0
                 genetic_linear_predictor = np.asarray(genotype_matrix.matvec(beta), dtype=np.float64)
@@ -5401,7 +5411,7 @@ def _restricted_posterior_state(
             if gpu_postprocess_enabled
             else np.asarray(inverse_covariance_rhs, dtype=np.float64)
         )
-    if gpu_postprocess_enabled and not compute_beta_variance:
+    if gpu_postprocess_enabled:
         cp = cupy_module
         cp_solve_triangular = _resolve_gpu_solve_triangular()
 
@@ -5428,7 +5438,65 @@ def _restricted_posterior_state(
             cp=cp,
             dtype=compute_cp_dtype,
         )
-        beta_variance = np.zeros_like(prior_variances, dtype=np.float64)
+        inverse_covariance_covariates_cpu = _cupy_array_to_numpy(inverse_covariance_covariates_gpu, dtype=np.float64)
+        alpha = _cupy_array_to_numpy(alpha_gpu, dtype=np.float64)
+        projected_targets = _cupy_array_to_numpy(projected_targets_gpu, dtype=np.float64)
+        gls_cholesky = _cupy_array_to_numpy(gls_cholesky_gpu, dtype=np.float64)
+        if compute_beta_variance:
+            inverse_covariance_probe_matrix_cpu = (
+                _cupy_array_to_numpy(
+                    inverse_covariance_rhs_gpu[:, 1 + covariate_matrix.shape[1] :],
+                    dtype=np.float64,
+                )
+                if sample_probes is not None
+                else None
+            )
+            probe_projection_matrix = _cached_sample_probe_projection(
+                genotype_matrix=genotype_matrix,
+                sample_probes=sample_probes,
+                batch_size=posterior_variance_batch_size,
+                probe_count=posterior_variance_probe_count,
+                random_seed=random_seed,
+            )
+            restricted_probe_matrix_cpu = (
+                inverse_covariance_probe_matrix_cpu - inverse_covariance_covariates_cpu @ _cholesky_solve(
+                    gls_cholesky,
+                    covariate_matrix.T @ inverse_covariance_probe_matrix_cpu,
+                )
+                if inverse_covariance_probe_matrix_cpu is not None
+                else None
+            )
+            restricted_probe_projection_matrix = (
+                _cupy_array_to_numpy(
+                    _gpu_genotype_transpose_matmul(
+                        genotype_matrix,
+                        cp.asarray(restricted_probe_matrix_cpu, dtype=compute_cp_dtype),
+                        batch_size=posterior_variance_batch_size,
+                        cp=cp,
+                        dtype=compute_cp_dtype,
+                    ),
+                    dtype=np.float64,
+                )
+                if restricted_probe_matrix_cpu is not None
+                else None
+            )
+            leverage_diagonal = _stochastic_restricted_cross_leverage_diagonal(
+                genotype_matrix=genotype_matrix,
+                covariate_matrix=covariate_matrix,
+                solve_rhs=solve_rhs_iterative,
+                inverse_covariance_covariates=inverse_covariance_covariates_cpu,
+                gls_cholesky=gls_cholesky,
+                batch_size=posterior_variance_batch_size,
+                probe_count=posterior_variance_probe_count,
+                random_seed=random_seed,
+                sample_probes=sample_probes,
+                inverse_covariance_probe_matrix=inverse_covariance_probe_matrix_cpu,
+                probe_projection_matrix=probe_projection_matrix,
+                restricted_probe_projection_matrix=restricted_probe_projection_matrix,
+            )
+            beta_variance = np.maximum(prior_variances - (prior_variances * prior_variances) * leverage_diagonal, 1e-8)
+        else:
+            beta_variance = np.zeros_like(prior_variances, dtype=np.float64)
         linear_predictor_gpu = covariate_matrix_gpu @ alpha_gpu + _gpu_genotype_matmul(
             genotype_matrix,
             beta_gpu,
@@ -5472,12 +5540,10 @@ def _restricted_posterior_state(
         restricted_quadratic = float(
             np.dot(
                 targets,
-                _cupy_array_to_numpy(projected_targets_gpu, dtype=np.float64),
+                projected_targets,
             )
         )
         beta = _cupy_array_to_numpy(beta_gpu, dtype=np.float64)
-        alpha = _cupy_array_to_numpy(alpha_gpu, dtype=np.float64)
-        projected_targets = _cupy_array_to_numpy(projected_targets_gpu, dtype=np.float64)
         linear_predictor = _cupy_array_to_numpy(linear_predictor_gpu, dtype=np.float64)
         if sign_gls <= 0.0:
             raise RuntimeError("Restricted GLS normal matrix is not positive definite.")

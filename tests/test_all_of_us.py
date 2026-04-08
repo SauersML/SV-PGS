@@ -332,7 +332,7 @@ def test_cli_lists_available_all_of_us_diseases(capsys):
     assert printed == sorted(available_disease_names())
 
 
-def test_cli_run_all_of_us_forwards_validation_tuning_settings(monkeypatch, tmp_path: Path):
+def test_cli_run_all_of_us_forwards_core_settings(monkeypatch, tmp_path: Path):
     calls: dict[str, object] = {}
 
     def fake_run_all_of_us(**kwargs):
@@ -349,10 +349,6 @@ def test_cli_run_all_of_us_forwards_validation_tuning_settings(monkeypatch, tmp_
             "1,2",
             "--output-dir",
             str(tmp_path),
-            "--pipeline-validation-fraction",
-            "0.2",
-            "--pipeline-validation-min-samples",
-            "2048",
         ]
     )
 
@@ -364,12 +360,10 @@ def test_cli_run_all_of_us_forwards_validation_tuning_settings(monkeypatch, tmp_
         "n_pcs": 10,
         "max_outer_iterations": 30,
         "random_seed": 0,
-        "pipeline_validation_fraction": 0.2,
-        "pipeline_validation_min_samples": 2048,
     }
 
 
-def test_cli_run_builds_config_with_validation_tuning_settings(monkeypatch, tmp_path: Path):
+def test_cli_run_builds_config(monkeypatch, tmp_path: Path):
     captured: dict[str, object] = {}
     dataset = type(
         "Dataset",
@@ -421,20 +415,14 @@ def test_cli_run_builds_config_with_validation_tuning_settings(monkeypatch, tmp_
             "target",
             "--output-dir",
             str(tmp_path / "out"),
-            "--pipeline-validation-fraction",
-            "0.3",
-            "--pipeline-validation-min-samples",
-            "1024",
         ]
     )
 
     assert exit_code == 0
     load_config = cast(object, captured["load_config"])
     pipeline_config = cast(object, captured["pipeline_config"])
-    assert load_config.pipeline_validation_fraction == pytest.approx(0.3)
-    assert load_config.pipeline_validation_min_samples == 1024
-    assert pipeline_config.pipeline_validation_fraction == pytest.approx(0.3)
-    assert pipeline_config.pipeline_validation_min_samples == 1024
+    assert load_config.max_outer_iterations == 30
+    assert pipeline_config.max_outer_iterations == 30
     assert pipeline_config.trait_type == aou_runner.TraitType.BINARY
     assert captured["output_dir"] == tmp_path / "out"
 
@@ -738,8 +726,6 @@ def test_run_all_of_us_runs_single_unified_fit_and_reuses_cached_downloads(monke
             (
                 kwargs["dataset"].targets.shape[0],
                 Path(kwargs["output_dir"]),
-                float(kwargs["config"].pipeline_validation_fraction),
-                int(kwargs["config"].pipeline_validation_min_samples),
             )
         )
         return None
@@ -751,8 +737,6 @@ def test_run_all_of_us_runs_single_unified_fit_and_reuses_cached_downloads(monke
         disease="heart_failure",
         chromosomes=[1, 2],
         output_base=str(tmp_path),
-        pipeline_validation_fraction=0.2,
-        pipeline_validation_min_samples=2048,
     )
 
     cache_dir = aou_runner.local_sv_vcf_cache_dir(tmp_path)
@@ -764,7 +748,7 @@ def test_run_all_of_us_runs_single_unified_fit_and_reuses_cached_downloads(monke
         str(cache_dir / "AoU_srWGS_SV.v8.chr1.vcf.gz"),
         str(cache_dir / "AoU_srWGS_SV.v8.chr2.vcf.gz"),
     ]]
-    assert pipeline_calls == [(2, tmp_path, 0.2, 2048)]
+    assert pipeline_calls == [(2, tmp_path)]
     assert release_calls == ["released"]
 
 
@@ -807,8 +791,6 @@ def test_run_all_of_us_skips_existing_fit_only_when_run_metadata_matches(monkeyp
                 covariates=covariates,
                 max_outer_iterations=30,
                 random_seed=0,
-                pipeline_validation_fraction=0.1,
-                pipeline_validation_min_samples=512,
             ),
             indent=2,
         ),
@@ -872,8 +854,6 @@ def test_run_all_of_us_reruns_when_existing_fit_metadata_differs(monkeypatch, tm
                 covariates=aou_runner.DEFAULT_COVARIATES + ["PC1", "PC2"],
                 max_outer_iterations=30,
                 random_seed=0,
-                pipeline_validation_fraction=0.1,
-                pipeline_validation_min_samples=512,
             ),
             indent=2,
         ),
@@ -928,97 +908,6 @@ def test_run_all_of_us_reruns_when_existing_fit_metadata_differs(monkeypatch, tm
     rerun_metadata = json.loads(aou_runner._aou_run_metadata_path(tmp_path).read_text(encoding="utf-8"))
     assert rerun_metadata["requested_n_pcs"] == 3
     assert rerun_metadata["effective_pc_columns"] == ["PC1", "PC2", "PC3"]
-
-
-def test_run_all_of_us_reruns_when_validation_tuning_metadata_differs(monkeypatch, tmp_path: Path):
-    class _Dataset:
-        def __init__(self) -> None:
-            self.targets = np.array([0.0, 1.0], dtype=np.float32)
-
-    disease = "heart_failure"
-    sample_table_path = tmp_path / f"{disease}.samples.tsv"
-    sample_table_path.write_text(
-        "sample_id\tperson_id\ttarget\tage_at_observation_start\tgender_concept_id\trace_concept_id\tethnicity_concept_id\n",
-        encoding="utf-8",
-    )
-    ancestry_path = tmp_path / "ancestry_preds.tsv"
-    ancestry_path.write_text("research_id\tpca_features\n1\t[0.1,0.2]\n", encoding="utf-8")
-    (tmp_path / "summary.json").write_text("{}", encoding="utf-8")
-    aou_runner._aou_run_metadata_path(tmp_path).write_text(
-        json.dumps(
-            aou_runner._build_aou_run_metadata(
-                disease=disease,
-                chromosomes=[1, 2],
-                n_pcs=2,
-                pc_cols=["PC1", "PC2"],
-                covariates=aou_runner.DEFAULT_COVARIATES + ["PC1", "PC2"],
-                max_outer_iterations=30,
-                random_seed=0,
-                pipeline_validation_fraction=0.1,
-                pipeline_validation_min_samples=512,
-            ),
-            indent=2,
-        ),
-        encoding="utf-8",
-    )
-
-    def fake_merge(sample_table_path, ancestry_path, output_path, n_pcs):
-        Path(output_path).write_text(
-            "sample_id\tperson_id\ttarget\tage_at_observation_start\tage_squared\tgender_concept_id\trace_concept_id\tethnicity_concept_id\tPC1\tPC2\n",
-            encoding="utf-8",
-        )
-        return output_path, ["PC1", "PC2"]
-
-    def fake_download_sv_vcf(chromosome: int, work_dir: Path) -> Path:
-        vcf_path = aou_runner.local_sv_vcf_path(chromosome, work_dir)
-        vcf_path.parent.mkdir(parents=True, exist_ok=True)
-        Path(vcf_path).write_text("vcf\n", encoding="utf-8")
-        Path(f"{vcf_path}.tbi").write_text("tbi\n", encoding="utf-8")
-        return vcf_path
-
-    loader_calls: list[list[str]] = []
-    pipeline_calls: list[tuple[float, int]] = []
-
-    monkeypatch.setattr(aou_runner, "download_ancestry_preds", lambda work_dir: ancestry_path)
-    monkeypatch.setattr(aou_runner, "merge_pcs_into_sample_table", fake_merge)
-    monkeypatch.setattr(aou_runner, "download_sv_vcf", fake_download_sv_vcf)
-    monkeypatch.setattr(aou_runner, "release_process_memory", lambda: None)
-
-    def fake_load_multi_vcf_dataset_from_files(**kwargs):
-        loader_calls.append([str(path) for path in kwargs["genotype_paths"]])
-        return _Dataset()
-
-    def fake_run_training_pipeline(**kwargs):
-        pipeline_calls.append(
-            (
-                float(kwargs["config"].pipeline_validation_fraction),
-                int(kwargs["config"].pipeline_validation_min_samples),
-            )
-        )
-        return None
-
-    monkeypatch.setattr(aou_runner, "load_multi_vcf_dataset_from_files", fake_load_multi_vcf_dataset_from_files)
-    monkeypatch.setattr(aou_runner, "run_training_pipeline", fake_run_training_pipeline)
-
-    aou_runner.run_all_of_us(
-        disease=disease,
-        chromosomes=[1, 2],
-        output_base=str(tmp_path),
-        n_pcs=2,
-        pipeline_validation_fraction=0.2,
-        pipeline_validation_min_samples=1024,
-    )
-
-    cache_dir = aou_runner.local_sv_vcf_cache_dir(tmp_path)
-    assert loader_calls == [[
-        str(cache_dir / "AoU_srWGS_SV.v8.chr1.vcf.gz"),
-        str(cache_dir / "AoU_srWGS_SV.v8.chr2.vcf.gz"),
-    ]]
-    assert pipeline_calls == [(0.2, 1024)]
-    rerun_metadata = json.loads(aou_runner._aou_run_metadata_path(tmp_path).read_text(encoding="utf-8"))
-    assert rerun_metadata["pipeline_validation_fraction"] == pytest.approx(0.2)
-    assert rerun_metadata["pipeline_validation_min_samples"] == 1024
-
 
 def _read_tsv_rows(path: Path) -> list[dict[str, str]]:
     with path.open("r", encoding="utf-8", newline="") as handle:

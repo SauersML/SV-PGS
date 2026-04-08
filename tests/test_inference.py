@@ -3122,8 +3122,18 @@ def test_exact_variant_gpu_summary_path_matches_dense_reference(monkeypatch: pyt
         np.empty(shape, dtype=dtype, order="C" if order is None else order),
     )[1]
     fake_cupy.eye = np.eye
+    fake_cupy.diag = np.diag
+    fake_cupy.linalg = types.SimpleNamespace(cholesky=np.linalg.cholesky)
+    fake_cupyx: Any = types.ModuleType("cupyx")
+    fake_cupyx_scipy: Any = types.ModuleType("cupyx.scipy")
+    fake_cupyx_scipy_linalg: Any = types.ModuleType("cupyx.scipy.linalg")
+    fake_cupyx_scipy_linalg.solve_triangular = scipy_solve_triangular
+    fake_cupyx_scipy.linalg = fake_cupyx_scipy_linalg
 
     monkeypatch.setitem(sys.modules, "cupy", fake_cupy)
+    monkeypatch.setitem(sys.modules, "cupyx", fake_cupyx)
+    monkeypatch.setitem(sys.modules, "cupyx.scipy", fake_cupyx_scipy)
+    monkeypatch.setitem(sys.modules, "cupyx.scipy.linalg", fake_cupyx_scipy_linalg)
     monkeypatch.setattr(mixture_inference, "_cupy_compute_dtype", lambda cp: cp.float32)
 
     gpu_result = _quantitative_posterior_state(
@@ -3155,6 +3165,158 @@ def test_exact_variant_gpu_summary_path_matches_dense_reference(monkeypatch: pyt
             rtol=1e-5,
             atol=1e-5,
         )
+
+
+def test_cached_weighted_covariate_projection_gpu_reuses_device_cache(monkeypatch: pytest.MonkeyPatch):
+    genotype_values = np.array(
+        [
+            [1.0, 0.0, 1.0],
+            [0.0, 1.0, 1.0],
+            [1.0, 1.0, 0.0],
+        ],
+        dtype=np.float32,
+    )
+    standardized = as_raw_genotype_matrix(genotype_values).standardized(
+        means=np.zeros(genotype_values.shape[1], dtype=np.float32),
+        scales=np.ones(genotype_values.shape[1], dtype=np.float32),
+    )
+    standardized._cupy_cache = standardized.materialize().astype(np.float32, copy=False)
+    standardized._dense_cache = None
+    covariate_matrix = np.ones((genotype_values.shape[0], 1), dtype=np.float32)
+    inverse_diagonal_noise = np.ones(genotype_values.shape[0], dtype=np.float64)
+    warm_start = mixture_inference._RestrictedPosteriorWarmStart()
+
+    fake_cupy: Any = types.ModuleType("cupy")
+    fake_cupy.float64 = np.float64
+    fake_cupy.asarray = lambda array, dtype=None: np.asarray(array, dtype=dtype)
+    fake_cupy.empty = lambda shape, dtype=None, order=None: np.empty(shape, dtype=dtype, order="C" if order is None else order)
+    monkeypatch.setitem(sys.modules, "cupy", fake_cupy)
+
+    first_projection = mixture_inference._cached_weighted_covariate_projection(
+        genotype_matrix=standardized,
+        covariate_matrix=covariate_matrix,
+        inverse_diagonal_noise=inverse_diagonal_noise,
+        batch_size=2,
+        warm_start=warm_start,
+        return_gpu=True,
+        cupy=fake_cupy,
+    )
+
+    monkeypatch.setattr(
+        mixture_inference,
+        "_cupy_array_to_numpy",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("GPU cache should be reused without host copy")),
+    )
+
+    second_projection = mixture_inference._cached_weighted_covariate_projection(
+        genotype_matrix=standardized,
+        covariate_matrix=covariate_matrix,
+        inverse_diagonal_noise=inverse_diagonal_noise,
+        batch_size=2,
+        warm_start=warm_start,
+        return_gpu=True,
+        cupy=fake_cupy,
+    )
+
+    np.testing.assert_allclose(np.asarray(second_projection, dtype=np.float64), np.asarray(first_projection, dtype=np.float64))
+
+
+def test_restricted_posterior_state_sample_space_gpu_beta_variance_uses_gpu_postprocess(monkeypatch: pytest.MonkeyPatch):
+    sample_count, variant_count = 5, 8
+    genotype_values = np.array(
+        [
+            [1.0, 0.0, 1.0, 0.0, 1.0, 0.0, 1.0, 0.0],
+            [0.0, 1.0, 1.0, 0.0, 0.0, 1.0, 0.0, 1.0],
+            [1.0, 1.0, 0.0, 1.0, 0.0, 0.0, 1.0, 0.0],
+            [0.0, 1.0, 0.0, 1.0, 1.0, 0.0, 0.0, 1.0],
+            [1.0, 0.0, 1.0, 0.0, 0.0, 1.0, 1.0, 0.0],
+        ],
+        dtype=np.float32,
+    )
+    standardized = as_raw_genotype_matrix(genotype_values).standardized(
+        means=np.zeros(variant_count, dtype=np.float32),
+        scales=np.ones(variant_count, dtype=np.float32),
+    )
+    standardized._cupy_cache = standardized.materialize().astype(np.float32, copy=False)
+    standardized._dense_cache = None
+    covariate_matrix = np.ones((sample_count, 1), dtype=np.float32)
+    targets = np.linspace(-1.0, 1.0, sample_count, dtype=np.float32)
+    prior_variances = np.ones(variant_count, dtype=np.float64)
+    diagonal_noise = np.ones(sample_count, dtype=np.float64)
+    gpu_transpose_calls = {"count": 0}
+
+    fake_cupy: Any = types.ModuleType("cupy")
+    fake_cupy.float32 = np.float32
+    fake_cupy.float64 = np.float64
+    fake_cupy.asarray = lambda array, dtype=None: np.asarray(array, dtype=dtype)
+    fake_cupy.empty = lambda shape, dtype=None, order=None: np.empty(shape, dtype=dtype, order="C" if order is None else order)
+    fake_cupy.zeros = lambda shape, dtype=None: np.zeros(shape, dtype=dtype)
+    fake_cupy.eye = np.eye
+    fake_cupy.diag = np.diag
+    fake_cupy.linalg = types.SimpleNamespace(cholesky=np.linalg.cholesky)
+    fake_cupyx: Any = types.ModuleType("cupyx")
+    fake_cupyx_scipy: Any = types.ModuleType("cupyx.scipy")
+    fake_cupyx_scipy_linalg: Any = types.ModuleType("cupyx.scipy.linalg")
+    fake_cupyx_scipy_linalg.solve_triangular = scipy_solve_triangular
+    fake_cupyx_scipy.linalg = fake_cupyx_scipy_linalg
+
+    monkeypatch.setitem(sys.modules, "cupy", fake_cupy)
+    monkeypatch.setitem(sys.modules, "cupyx", fake_cupyx)
+    monkeypatch.setitem(sys.modules, "cupyx.scipy", fake_cupyx_scipy)
+    monkeypatch.setitem(sys.modules, "cupyx.scipy.linalg", fake_cupyx_scipy_linalg)
+    monkeypatch.setattr(mixture_inference, "_try_import_cupy", lambda: fake_cupy)
+    monkeypatch.setattr(mixture_inference, "_cupy_compute_dtype", lambda cp: cp.float32)
+    monkeypatch.setattr(mixture_inference, "_use_gpu_exact_variant_solve", lambda **kwargs: False)
+    monkeypatch.setattr(
+        mixture_inference,
+        "_get_cached_sample_space_gpu_preconditioner",
+        lambda **kwargs: (
+            lambda rhs: np.asarray(rhs, dtype=np.float64),
+            types.SimpleNamespace(diagonal_preconditioner=np.ones(sample_count, dtype=np.float64)),
+        ),
+    )
+    monkeypatch.setattr(
+        mixture_inference,
+        "_solve_sample_space_rhs_gpu",
+        lambda **kwargs: np.asarray(kwargs["right_hand_side"], dtype=np.float64),
+    )
+    monkeypatch.setattr(mixture_inference, "_update_sample_space_preconditioner_iterations", lambda *args, **kwargs: None)
+    monkeypatch.setattr(mixture_inference, "stochastic_logdet", lambda *args, **kwargs: 0.0)
+
+    original_gpu_transpose = mixture_inference._gpu_genotype_transpose_matmul
+
+    def counted_gpu_transpose(*args, **kwargs):
+        gpu_transpose_calls["count"] += 1
+        return original_gpu_transpose(*args, **kwargs)
+
+    monkeypatch.setattr(mixture_inference, "_gpu_genotype_transpose_matmul", counted_gpu_transpose)
+    monkeypatch.setattr(
+        mixture_inference,
+        "_stochastic_restricted_cross_leverage_diagonal",
+        lambda **kwargs: np.full(variant_count, 0.5, dtype=np.float64),
+    )
+
+    result = mixture_inference._restricted_posterior_state(
+        genotype_matrix=standardized,
+        covariate_matrix=covariate_matrix,
+        targets=targets,
+        prior_variances=prior_variances,
+        diagonal_noise=diagonal_noise,
+        solver_tolerance=1e-6,
+        maximum_linear_solver_iterations=32,
+        logdet_probe_count=4,
+        logdet_lanczos_steps=8,
+        exact_solver_matrix_limit=2,
+        posterior_variance_batch_size=2,
+        posterior_variance_probe_count=4,
+        random_seed=0,
+        compute_logdet=False,
+        compute_beta_variance=True,
+        sample_space_preconditioner_rank=4,
+    )
+
+    assert gpu_transpose_calls["count"] >= 2
+    np.testing.assert_allclose(result[2], np.full(variant_count, 0.5, dtype=np.float64), atol=1e-12)
 
 
 def test_validation_restores_best_iterate(monkeypatch: pytest.MonkeyPatch):

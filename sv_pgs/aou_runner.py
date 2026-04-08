@@ -19,7 +19,6 @@ from sv_pgs.progress import log, mem
 
 _LOCAL_CACHE_DIRNAME = ".sv_pgs_cache"
 _AOU_SV_VCF_CACHE_SUBDIR = "aou_sv_vcfs"
-_DEFAULT_MODEL_CONFIG = ModelConfig()
 
 # ---------------------------------------------------------------------------
 # AoU paths

@@ -16,7 +16,6 @@ from sv_pgs.progress import gpu_memory_snapshot, jax_runtime_snapshot, log, nvid
 
 
 def build_parser() -> argparse.ArgumentParser:
-    default_config = ModelConfig()
     parser = argparse.ArgumentParser(prog="sv-pgs")
     subparsers = parser.add_subparsers(dest="command", required=True)
 

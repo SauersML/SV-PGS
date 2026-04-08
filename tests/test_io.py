@@ -6,6 +6,7 @@ import json
 import os
 import pickle
 import struct
+from types import SimpleNamespace
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -1261,7 +1262,7 @@ def test_run_training_pipeline_rejects_mismatched_precomputed_stats_config(tmp_p
         )
 
 
-def test_run_training_pipeline_uses_validation_tuning_then_refits_full_cohort(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+def test_run_training_pipeline_fits_full_cohort_once(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     fit_calls: list[dict[str, object]] = []
 
     class FakeBayesianPGS:
@@ -1286,12 +1287,11 @@ def test_run_training_pipeline_uses_validation_tuning_then_refits_full_cohort(tm
                     "max_outer_iterations": int(self.config.max_outer_iterations),
                 }
             )
-            selected_iteration_count = 3 if validation_data is not None else int(self.config.max_outer_iterations)
             self.state = SimpleNamespace(
                 active_variant_indices=np.array([0], dtype=np.int32),
                 fit_result=SimpleNamespace(
-                    validation_history=[0.42, 0.31] if validation_data is not None else [],
-                    selected_iteration_count=selected_iteration_count,
+                    validation_history=[],
+                    selected_iteration_count=int(self.config.max_outer_iterations),
                 ),
             )
             return self
@@ -1339,36 +1339,26 @@ def test_run_training_pipeline_uses_validation_tuning_then_refits_full_cohort(tm
         config=ModelConfig(
             trait_type=TraitType.BINARY,
             max_outer_iterations=9,
-            pipeline_validation_fraction=0.25,
-            pipeline_validation_min_samples=2,
         ),
         output_dir=tmp_path / "run_validation",
     )
 
     assert fit_calls == [
         {
-            "sample_count": 6,
-            "variant_stats_is_none": True,
-            "validation_sample_count": 2,
-            "max_outer_iterations": 9,
-        },
-        {
             "sample_count": 8,
             "variant_stats_is_none": False,
             "validation_sample_count": None,
-            "max_outer_iterations": 3,
+            "max_outer_iterations": 9,
         },
     ]
 
     summary_payload = json.loads(outputs.summary_path.read_text(encoding="utf-8"))
-    assert summary_payload["validation_enabled"] is True
-    assert summary_payload["tuning_sample_count"] == 6
-    assert summary_payload["validation_sample_count"] == 2
-    assert summary_payload["selected_iteration_count"] == 3
-    assert summary_payload["fit_max_outer_iterations"] == 3
-    assert summary_payload["validation_history"] == [0.42, 0.31]
-    assert "validation_log_loss" in summary_payload
-    assert "validation_accuracy" in summary_payload
+    assert summary_payload["validation_enabled"] is False
+    assert summary_payload["tuning_sample_count"] == 8
+    assert summary_payload["validation_sample_count"] == 0
+    assert summary_payload["selected_iteration_count"] == 9
+    assert summary_payload["fit_max_outer_iterations"] == 9
+    assert summary_payload["validation_history"] == []
 
 
 def test_write_predictions_and_summary_binary_uses_single_decision_pass(tmp_path: Path):

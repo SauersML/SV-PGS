@@ -132,6 +132,8 @@ class ModelConfig:
 
     sample_space_preconditioner_rank: int = 256
     validation_interval: int = 2
+    pipeline_validation_fraction: float = 0.0
+    pipeline_validation_min_samples: int = 0
     binary_intercept_calibration: bool = True
     stochastic_variational_updates: bool = True
     stochastic_min_variant_count: int = 4096
@@ -204,6 +206,10 @@ class ModelConfig:
             raise ValueError("sample_space_preconditioner_rank must be non-negative.")
         if self.validation_interval < 1:
             raise ValueError("validation_interval must be positive.")
+        if not 0.0 <= self.pipeline_validation_fraction < 1.0:
+            raise ValueError("pipeline_validation_fraction must lie in [0.0, 1.0).")
+        if self.pipeline_validation_min_samples < 0:
+            raise ValueError("pipeline_validation_min_samples must be non-negative.")
         if self.stochastic_min_variant_count < 0:
             raise ValueError("stochastic_min_variant_count must be non-negative.")
         if self.stochastic_variant_batch_size < 1:
