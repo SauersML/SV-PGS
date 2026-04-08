@@ -47,9 +47,11 @@ def runtime_training_policy_for_fit(
         int(config.sample_space_preconditioner_rank),
         max_gpu_preconditioner_rank,
     )
-    tuned_stochastic_batch_size = min(
-        int(config.stochastic_variant_batch_size),
-        max(max(cacheable_dense_variants // 4, 256), 1),
+    # Use up to 75% of GPU budget for stochastic blocks — larger blocks mean
+    # fewer blocks per epoch, fewer preconditioner builds, better convergence.
+    tuned_stochastic_batch_size = max(
+        min(int(config.stochastic_variant_batch_size), max(int(cacheable_dense_variants * 0.75), 256)),
+        256,
     )
     tuned_final_posterior_refinement = (
         bool(config.final_posterior_refinement)

@@ -144,7 +144,7 @@ class ModelConfig:
     binary_intercept_calibration: bool = True
     stochastic_variational_updates: bool = True
     stochastic_min_variant_count: int = 4096
-    stochastic_variant_batch_size: int = 2048
+    stochastic_variant_batch_size: int = 8192
     stochastic_step_offset: float = 8.0
     stochastic_step_exponent: float = 0.6
     final_posterior_refinement: bool = True

@@ -806,13 +806,18 @@ def fit_variational_em(
                 )
             covariate_linear_predictor = np.asarray(covariate_matrix @ alpha_state, dtype=np.float64)
 
+            n_blocks = (genotype_matrix.shape[1] + block_size - 1) // block_size
+            block_count = 0
             for block_indices in _stochastic_variant_blocks(genotype_matrix.shape[1], block_size, epoch_rng):
                 step_index += 1
+                block_count += 1
                 step_size = _stochastic_step_size(config, step_index)
                 block_genotypes = genotype_matrix.subset(block_indices)
-                # Upload block to GPU — 2048 × 97K × 4 bytes ≈ 760 MB fits easily.
+                # Upload block to GPU — fits easily in GPU budget.
                 # Without this, every CG iteration streams from mmap (40s vs 2s).
                 block_genotypes.try_materialize_gpu()
+                if block_count <= 3 or block_count % max(n_blocks // 10, 1) == 0 or block_count == n_blocks:
+                    log(f"    block {block_count}/{n_blocks}  variants={len(block_indices)}  step_size={step_size:.4f}  gpu={'yes' if block_genotypes._cupy_cache is not None else 'no'}  mem={mem()}")
                 block_prior_variances = np.asarray(reduced_prior_variances[block_indices], dtype=np.float64)
                 block_beta_previous = np.asarray(beta_state[block_indices], dtype=np.float64).copy()
                 block_linear_predictor_previous = np.asarray(
