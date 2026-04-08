@@ -7,6 +7,7 @@ import json
 import os
 import shutil
 import subprocess
+import time
 from pathlib import Path
 
 import numpy as np
@@ -453,7 +454,7 @@ def run_all_of_us(
     work_dir.mkdir(parents=True, exist_ok=True)
 
     from sv_pgs.progress import set_log_file
-    log_path = work_dir / f"{disease_def.canonical_name}.log"
+    log_path = work_dir / f"{disease_def.canonical_name}.{time.strftime('%Y%m%d_%H%M%S')}.log"
     set_log_file(log_path)
 
     log(f"=== ALL OF US PIPELINE ===  disease={disease_def.canonical_name}  chromosomes={chromosomes}  n_pcs={n_pcs}  cpus={os.cpu_count()}")

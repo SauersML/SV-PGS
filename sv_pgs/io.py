@@ -689,9 +689,10 @@ def run_training_pipeline(
 ) -> PipelineOutputs:
     destination = Path(output_dir)
     destination.mkdir(parents=True, exist_ok=True)
+    import time as _time_mod
     from sv_pgs.progress import set_log_file, _log_file
     if _log_file is None:
-        set_log_file(destination / "training.log")
+        set_log_file(destination / f"training.{_time_mod.strftime('%Y%m%d_%H%M%S')}.log")
     log(f"=== TRAINING PIPELINE START ===  samples={len(dataset.sample_ids)}  variants={dataset.genotypes.shape[1]}  trait={config.trait_type.value}  mem={mem()}")
 
     if dataset.variant_stats is not None:
