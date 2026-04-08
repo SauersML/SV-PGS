@@ -255,89 +255,85 @@ def _coerce_variant_class(value: Any) -> VariantClass:
     return VariantClass(str(value))
 
 
-def normalize_variant_records(records: Sequence[VariantRecord | dict[str, Any]]) -> list[VariantRecord]:
-    normalized_records: list[VariantRecord] = []
-    for record in records:
-        if isinstance(record, VariantRecord):
-            normalized_records.append(
-                VariantRecord(
-                    variant_id=record.variant_id,
-                    variant_class=record.variant_class,
-                    chromosome=record.chromosome,
-                    position=record.position,
-                    length=record.length,
-                    allele_frequency=record.allele_frequency,
-                    quality=record.quality,
-                    training_support=record.training_support,
-                    is_repeat=record.is_repeat,
-                    is_copy_number=record.is_copy_number,
-                    prior_binary_features=dict(record.prior_binary_features),
-                    prior_continuous_features=dict(record.prior_continuous_features),
-                    prior_categorical_features=dict(record.prior_categorical_features),
-                    prior_membership_features={
-                        feature_name: dict(feature_memberships)
-                        for feature_name, feature_memberships in record.prior_membership_features.items()
-                    },
-                    prior_nested_features=dict(record.prior_nested_features),
-                    prior_nested_membership_features={
-                        feature_name: dict(feature_memberships)
-                        for feature_name, feature_memberships in record.prior_nested_membership_features.items()
-                    },
-                    prior_class_members=record.prior_class_members,
-                    prior_class_membership=record.prior_class_membership,
-                )
-            )
-            continue
-        normalized_records.append(
-            VariantRecord(
-                variant_id=str(record["variant_id"]),
-                variant_class=_coerce_variant_class(record["variant_class"]),
-                chromosome=str(record["chromosome"]),
-                position=int(record["position"]),
-                length=float(record.get("length", 1.0)),
-                allele_frequency=float(record.get("allele_frequency", 0.01)),
-                quality=float(record.get("quality", 1.0)),
-                training_support=(
-                    None
-                    if record.get("training_support") is None
-                    else int(record["training_support"])
-                ),
-                is_repeat=bool(record.get("is_repeat", False)),
-                is_copy_number=bool(record.get("is_copy_number", False)),
-                prior_binary_features={
-                    str(feature_name): bool(feature_value)
-                    for feature_name, feature_value in record.get("prior_binary_features", {}).items()
-                },
-                prior_continuous_features={
-                    str(feature_name): float(feature_value)
-                    for feature_name, feature_value in record.get("prior_continuous_features", {}).items()
-                },
-                prior_categorical_features={
-                    str(feature_name): str(feature_value)
-                    for feature_name, feature_value in record.get("prior_categorical_features", {}).items()
-                },
-                prior_membership_features={
-                    str(feature_name): {
-                        str(level_name): float(level_weight)
-                        for level_name, level_weight in feature_memberships.items()
-                    }
-                    for feature_name, feature_memberships in record.get("prior_membership_features", {}).items()
-                },
-                prior_nested_features={
-                    str(feature_name): _normalize_nested_path(feature_value, "prior_nested_features")
-                    for feature_name, feature_value in record.get("prior_nested_features", {}).items()
-                },
-                prior_nested_membership_features={
-                    str(feature_name): {
-                        _encode_nested_path(path_name, "prior_nested_membership_features"): float(path_weight)
-                        for path_name, path_weight in feature_memberships.items()
-                    }
-                    for feature_name, feature_memberships in record.get("prior_nested_membership_features", {}).items()
-                },
-                prior_class_members=tuple(
-                    VariantClass(member_value) for member_value in record.get("prior_class_members", ())
-                ),
-                prior_class_membership=tuple(float(member_weight) for member_weight in record.get("prior_class_membership", ())),
-            )
+def normalize_variant_record(record: VariantRecord | dict[str, Any]) -> VariantRecord:
+    if isinstance(record, VariantRecord):
+        return VariantRecord(
+            variant_id=record.variant_id,
+            variant_class=record.variant_class,
+            chromosome=record.chromosome,
+            position=record.position,
+            length=record.length,
+            allele_frequency=record.allele_frequency,
+            quality=record.quality,
+            training_support=record.training_support,
+            is_repeat=record.is_repeat,
+            is_copy_number=record.is_copy_number,
+            prior_binary_features=dict(record.prior_binary_features),
+            prior_continuous_features=dict(record.prior_continuous_features),
+            prior_categorical_features=dict(record.prior_categorical_features),
+            prior_membership_features={
+                feature_name: dict(feature_memberships)
+                for feature_name, feature_memberships in record.prior_membership_features.items()
+            },
+            prior_nested_features=dict(record.prior_nested_features),
+            prior_nested_membership_features={
+                feature_name: dict(feature_memberships)
+                for feature_name, feature_memberships in record.prior_nested_membership_features.items()
+            },
+            prior_class_members=record.prior_class_members,
+            prior_class_membership=record.prior_class_membership,
         )
-    return normalized_records
+    return VariantRecord(
+        variant_id=str(record["variant_id"]),
+        variant_class=_coerce_variant_class(record["variant_class"]),
+        chromosome=str(record["chromosome"]),
+        position=int(record["position"]),
+        length=float(record.get("length", 1.0)),
+        allele_frequency=float(record.get("allele_frequency", 0.01)),
+        quality=float(record.get("quality", 1.0)),
+        training_support=(
+            None
+            if record.get("training_support") is None
+            else int(record["training_support"])
+        ),
+        is_repeat=bool(record.get("is_repeat", False)),
+        is_copy_number=bool(record.get("is_copy_number", False)),
+        prior_binary_features={
+            str(feature_name): bool(feature_value)
+            for feature_name, feature_value in record.get("prior_binary_features", {}).items()
+        },
+        prior_continuous_features={
+            str(feature_name): float(feature_value)
+            for feature_name, feature_value in record.get("prior_continuous_features", {}).items()
+        },
+        prior_categorical_features={
+            str(feature_name): str(feature_value)
+            for feature_name, feature_value in record.get("prior_categorical_features", {}).items()
+        },
+        prior_membership_features={
+            str(feature_name): {
+                str(level_name): float(level_weight)
+                for level_name, level_weight in feature_memberships.items()
+            }
+            for feature_name, feature_memberships in record.get("prior_membership_features", {}).items()
+        },
+        prior_nested_features={
+            str(feature_name): _normalize_nested_path(feature_value, "prior_nested_features")
+            for feature_name, feature_value in record.get("prior_nested_features", {}).items()
+        },
+        prior_nested_membership_features={
+            str(feature_name): {
+                _encode_nested_path(path_name, "prior_nested_membership_features"): float(path_weight)
+                for path_name, path_weight in feature_memberships.items()
+            }
+            for feature_name, feature_memberships in record.get("prior_nested_membership_features", {}).items()
+        },
+        prior_class_members=tuple(
+            VariantClass(member_value) for member_value in record.get("prior_class_members", ())
+        ),
+        prior_class_membership=tuple(float(member_weight) for member_weight in record.get("prior_class_membership", ())),
+    )
+
+
+def normalize_variant_records(records: Sequence[VariantRecord | dict[str, Any]]) -> list[VariantRecord]:
+    return [normalize_variant_record(record) for record in records]

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import csv
+import gzip
 import json
 from pathlib import Path
 from typing import cast
@@ -18,6 +19,15 @@ from sv_pgs.all_of_us import (
     resolve_disease_definition,
 )
 from sv_pgs.cli import main
+from sv_pgs.config import ModelConfig
+from sv_pgs.io import load_multi_vcf_dataset_from_files
+
+
+def _write_aou_variant_metadata_stub(path: Path) -> Path:
+    with gzip.open(path, "wt", encoding="utf-8", newline="") as handle:
+        writer = csv.writer(handle, delimiter="\t")
+        writer.writerow(("variant_id", "variant_class"))
+    return path
 
 
 class _FakeQueryJob:
@@ -395,9 +405,9 @@ def test_cli_run_builds_config(monkeypatch, tmp_path: Path):
             (),
             {
                 "artifact_dir": tmp_path / "artifact",
-                "summary_path": tmp_path / "summary.json",
-                "predictions_path": tmp_path / "predictions.tsv",
-                "coefficients_path": tmp_path / "coefficients.tsv",
+                "summary_path": tmp_path / "summary.json.gz",
+                "predictions_path": tmp_path / "predictions.tsv.gz",
+                "coefficients_path": tmp_path / "coefficients.tsv.gz",
             },
         )()
 
@@ -606,36 +616,6 @@ def test_download_sv_vcf_downloads_missing_index_for_existing_vcf(monkeypatch, t
     ]
 
 
-def test_download_sv_vcf_adopts_existing_legacy_work_dir_cache(monkeypatch, tmp_path: Path):
-    monkeypatch.setenv("CDR_STORAGE_PATH", "gs://bucket/cdr")
-    monkeypatch.setenv("GOOGLE_PROJECT", "billing-project")
-    work_dir = tmp_path / "run"
-    work_dir.mkdir(parents=True, exist_ok=True)
-    legacy_vcf = work_dir / "AoU_srWGS_SV.v8.chr22.vcf.gz"
-    legacy_tbi = work_dir / "AoU_srWGS_SV.v8.chr22.vcf.gz.tbi"
-    legacy_vcf.write_text("vcf\n", encoding="utf-8")
-    legacy_tbi.write_text("tbi\n", encoding="utf-8")
-
-    monkeypatch.setattr(
-        aou_runner,
-        "_gsutil_size",
-        lambda path: (_ for _ in ()).throw(AssertionError("legacy cache should prevent size lookup")),
-    )
-    monkeypatch.setattr(
-        aou_runner,
-        "_gsutil_cp",
-        lambda src, dst: (_ for _ in ()).throw(AssertionError("legacy cache should prevent download")),
-    )
-
-    local_vcf = aou_runner.download_sv_vcf(22, work_dir)
-    cache_dir = aou_runner.local_sv_vcf_cache_dir(work_dir)
-
-    assert local_vcf == cache_dir / "AoU_srWGS_SV.v8.chr22.vcf.gz"
-    assert local_vcf.exists()
-    assert Path(f"{local_vcf}.tbi").exists()
-    assert not legacy_vcf.exists()
-    assert not legacy_tbi.exists()
-
 def test_merge_pcs_into_sample_table_raises_when_ids_do_not_overlap(tmp_path: Path):
     sample_table_path = tmp_path / "samples.tsv"
     ancestry_path = tmp_path / "ancestry.tsv"
@@ -726,9 +706,16 @@ def test_run_all_of_us_runs_single_unified_fit_and_reuses_cached_downloads(monke
     monkeypatch.setattr(aou_runner, "download_ancestry_preds", lambda work_dir: ancestry_path)
     monkeypatch.setattr(aou_runner, "merge_pcs_into_sample_table", fake_merge)
     monkeypatch.setattr(aou_runner, "download_sv_vcf", fake_download_sv_vcf)
+    monkeypatch.setattr("sv_pgs.io.precache_vcfs_parallel", lambda vcf_paths, config: None)
+    monkeypatch.setattr(
+        aou_runner,
+        "build_aou_sv_variant_metadata",
+        lambda *, vcf_paths, output_path: _write_aou_variant_metadata_stub(output_path),
+    )
     monkeypatch.setattr(aou_runner, "release_process_memory", lambda: release_calls.append("released"))
     def fake_load_multi_vcf_dataset_from_files(**kwargs):
         loader_calls.append([str(path) for path in kwargs["genotype_paths"]])
+        assert kwargs["variant_metadata_path"] == tmp_path / "variant_metadata.tsv.gz"
         return _Dataset()
 
     def fake_run_training_pipeline(**kwargs):
@@ -778,6 +765,70 @@ def test_run_all_of_us_rejects_duplicate_or_invalid_chromosomes(tmp_path: Path):
         )
 
 
+def test_build_aou_sv_variant_metadata_extracts_prior_annotation_features(tmp_path: Path):
+    vcf_path = tmp_path / "annotated_sv.vcf"
+    vcf_path.write_text(
+        "\n".join(
+            [
+                "##fileformat=VCFv4.2",
+                "##contig=<ID=1>",
+                "##INFO=<ID=AF,Number=A,Type=Float,Description=\"Allele frequency\">",
+                "##INFO=<ID=SVTYPE,Number=1,Type=String,Description=\"SV type\">",
+                "##INFO=<ID=SVLEN,Number=1,Type=Integer,Description=\"SV length\">",
+                "##INFO=<ID=ALGORITHMS,Number=.,Type=String,Description=\"Calling algorithms\">",
+                "##INFO=<ID=PREDICTED_LOF,Number=.,Type=String,Description=\"Predicted LOF genes\">",
+                "##INFO=<ID=PREDICTED_NONCODING_SPAN,Number=.,Type=String,Description=\"Noncoding span annotations\">",
+                "##INFO=<ID=CNQ,Number=1,Type=Float,Description=\"Copy number quality\">",
+                "##INFO=<ID=LOEUF,Number=1,Type=Float,Description=\"Constraint score\">",
+                "##INFO=<ID=PHYLOP,Number=1,Type=Float,Description=\"Conservation score\">",
+                "##INFO=<ID=REPEATMASKER,Number=1,Type=String,Description=\"Repeat annotation\">",
+                "##INFO=<ID=PREDICTED_PROMOTER,Number=.,Type=String,Description=\"Promoter overlaps\">",
+                "##FORMAT=<ID=GT,Number=1,Type=String,Description=\"Genotype\">",
+                "#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\ts1",
+                "1\t100\tsv_lof\tN\t<DEL>\t80\tPASS\tAF=0.01;SVTYPE=DEL;SVLEN=-1200;ALGORITHMS=MANTA,WHAM;PREDICTED_LOF=GENE1,GENE2;PREDICTED_NONCODING_SPAN=enhancer,promoter;CNQ=42;LOEUF=0.12;PHYLOP=1.5\tGT\t0/1",
+                "1\t300\tsv_repeat\tN\t<DUP>\t50\tPASS\tAF=0.05;SVTYPE=DUP;SVLEN=600;ALGORITHMS=DEPTH;PREDICTED_PROMOTER=GENE3;REPEATMASKER=LINE\tGT\t0/1",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    metadata_path = aou_runner.build_aou_sv_variant_metadata(
+        vcf_paths=[vcf_path],
+        output_path=tmp_path / "variant_metadata.tsv.gz",
+    )
+
+    rows = _read_tsv_rows(metadata_path)
+    assert [row["variant_id"] for row in rows] == ["sv_lof", "sv_repeat"]
+    assert rows[0]["prior_binary__predicted_lof"] == "true"
+    assert rows[0]["prior_continuous__lof_gene_count"] == "2"
+    assert rows[0]["prior_membership__calling_algorithms"] == "manta=0.5,wham=0.5"
+    assert rows[0]["prior_membership__noncoding_span"] == "enhancer=0.5,promoter=0.5"
+    assert rows[0]["prior_categorical__strongest_effect"] == "lof"
+    assert rows[0]["prior_nested__functional_context"] == "genic>loss_of_function"
+    assert rows[0]["prior_continuous__constraint_score"] == "0.12"
+    assert rows[0]["prior_continuous__conservation_score"] == "1.5"
+    assert rows[1]["prior_binary__is_repeat"] == "true"
+    assert rows[1]["prior_binary__predicted_promoter"] == "true"
+    assert rows[1]["prior_categorical__strongest_effect"] == "promoter"
+
+    sample_table_path = tmp_path / "samples.tsv"
+    sample_table_path.write_text("sample_id\ttarget\ns1\t1\n", encoding="utf-8")
+    dataset = load_multi_vcf_dataset_from_files(
+        genotype_paths=[vcf_path],
+        config=ModelConfig(),
+        sample_table_path=sample_table_path,
+        sample_id_column="sample_id",
+        target_column="target",
+        covariate_columns=(),
+        variant_metadata_path=metadata_path,
+    )
+    assert dataset.variant_records[0].prior_binary_features["predicted_lof"] is True
+    assert dataset.variant_records[0].prior_membership_features["calling_algorithms"] == {"manta": 0.5, "wham": 0.5}
+    assert dataset.variant_records[0].prior_categorical_features["strongest_effect"] == "lof"
+    assert dataset.variant_records[0].prior_nested_features["functional_context"] == ("genic", "loss_of_function")
+
+
 def test_run_all_of_us_skips_existing_fit_only_when_run_metadata_matches(monkeypatch, tmp_path: Path):
     disease = "heart_failure"
     sample_table_path = tmp_path / f"{disease}.samples.tsv"
@@ -787,7 +838,8 @@ def test_run_all_of_us_skips_existing_fit_only_when_run_metadata_matches(monkeyp
     )
     ancestry_path = tmp_path / "ancestry_preds.tsv"
     ancestry_path.write_text("research_id\tpca_features\n1\t[0.1,0.2]\n", encoding="utf-8")
-    (tmp_path / "summary.json").write_text("{}", encoding="utf-8")
+    with gzip.open(tmp_path / "summary.json.gz", "wt", encoding="utf-8") as handle:
+        handle.write("{}")
 
     pc_cols = ["PC1", "PC2"]
     covariates = aou_runner.DEFAULT_COVARIATES + pc_cols
@@ -803,6 +855,7 @@ def test_run_all_of_us_skips_existing_fit_only_when_run_metadata_matches(monkeyp
                 pipeline_validation_fraction=0.0,
                 pipeline_validation_min_samples=0,
                 random_seed=0,
+                variant_metadata_schema_version=aou_runner._AOU_VARIANT_METADATA_SCHEMA_VERSION,
             ),
             indent=2,
         ),
@@ -855,7 +908,8 @@ def test_run_all_of_us_reruns_when_existing_fit_metadata_differs(monkeypatch, tm
     )
     ancestry_path = tmp_path / "ancestry_preds.tsv"
     ancestry_path.write_text("research_id\tpca_features\n1\t[0.1,0.2,0.3]\n", encoding="utf-8")
-    (tmp_path / "summary.json").write_text("{}", encoding="utf-8")
+    with gzip.open(tmp_path / "summary.json.gz", "wt", encoding="utf-8") as handle:
+        handle.write("{}")
     aou_runner._aou_run_metadata_path(tmp_path).write_text(
         json.dumps(
             aou_runner._build_aou_run_metadata(
@@ -868,6 +922,7 @@ def test_run_all_of_us_reruns_when_existing_fit_metadata_differs(monkeypatch, tm
                 pipeline_validation_fraction=0.0,
                 pipeline_validation_min_samples=0,
                 random_seed=0,
+                variant_metadata_schema_version=aou_runner._AOU_VARIANT_METADATA_SCHEMA_VERSION,
             ),
             indent=2,
         ),
@@ -894,9 +949,16 @@ def test_run_all_of_us_reruns_when_existing_fit_metadata_differs(monkeypatch, tm
     monkeypatch.setattr(aou_runner, "download_ancestry_preds", lambda work_dir: ancestry_path)
     monkeypatch.setattr(aou_runner, "merge_pcs_into_sample_table", fake_merge)
     monkeypatch.setattr(aou_runner, "download_sv_vcf", fake_download_sv_vcf)
+    monkeypatch.setattr("sv_pgs.io.precache_vcfs_parallel", lambda vcf_paths, config: None)
+    monkeypatch.setattr(
+        aou_runner,
+        "build_aou_sv_variant_metadata",
+        lambda *, vcf_paths, output_path: _write_aou_variant_metadata_stub(output_path),
+    )
     monkeypatch.setattr(aou_runner, "release_process_memory", lambda: None)
     def fake_load_multi_vcf_dataset_from_files(**kwargs):
         loader_calls.append([str(path) for path in kwargs["genotype_paths"]])
+        assert kwargs["variant_metadata_path"] == tmp_path / "variant_metadata.tsv.gz"
         return _Dataset()
 
     def fake_run_training_pipeline(**kwargs):
@@ -923,8 +985,60 @@ def test_run_all_of_us_reruns_when_existing_fit_metadata_differs(monkeypatch, tm
     assert rerun_metadata["requested_n_pcs"] == 3
     assert rerun_metadata["effective_pc_columns"] == ["PC1", "PC2", "PC3"]
 
+
+def test_run_all_of_us_raises_when_parallel_precache_fails(monkeypatch, tmp_path: Path):
+    disease = "heart_failure"
+    sample_table_path = tmp_path / f"{disease}.samples.tsv"
+    sample_table_path.write_text(
+        "sample_id\tperson_id\ttarget\tage_at_observation_start\tgender_concept_id\trace_concept_id\tethnicity_concept_id\n",
+        encoding="utf-8",
+    )
+    ancestry_path = tmp_path / "ancestry_preds.tsv"
+    ancestry_path.write_text("research_id\tpca_features\n1\t[0.1,0.2]\n", encoding="utf-8")
+    vcf_path = tmp_path / "AoU_srWGS_SV.v8.chr1.vcf.gz"
+    vcf_path.write_bytes(b"vcf")
+
+    def fake_merge(sample_table_path, ancestry_path, output_path, n_pcs):
+        Path(output_path).write_text(
+            "sample_id\tperson_id\ttarget\tage_at_observation_start\tage_squared\tgender_concept_id\trace_concept_id\tethnicity_concept_id\tPC1\tPC2\n",
+            encoding="utf-8",
+        )
+        return output_path, ["PC1", "PC2"]
+
+    monkeypatch.setattr(aou_runner, "download_ancestry_preds", lambda work_dir: ancestry_path)
+    monkeypatch.setattr(aou_runner, "merge_pcs_into_sample_table", fake_merge)
+    monkeypatch.setattr(aou_runner, "download_sv_vcf", lambda chromosome, work_dir: vcf_path)
+    monkeypatch.setattr(
+        "sv_pgs.io.precache_vcfs_parallel",
+        lambda vcf_paths, config: (_ for _ in ()).throw(ValueError("boom")),
+    )
+    monkeypatch.setattr(
+        aou_runner,
+        "build_aou_sv_variant_metadata",
+        lambda *, vcf_paths, output_path: (_ for _ in ()).throw(AssertionError("metadata build should not run")),
+    )
+    monkeypatch.setattr(
+        aou_runner,
+        "load_multi_vcf_dataset_from_files",
+        lambda **kwargs: (_ for _ in ()).throw(AssertionError("dataset loading should not run")),
+    )
+    monkeypatch.setattr(
+        aou_runner,
+        "run_training_pipeline",
+        lambda **kwargs: (_ for _ in ()).throw(AssertionError("training should not run")),
+    )
+
+    with pytest.raises(RuntimeError, match="parallel VCF precache failed"):
+        aou_runner.run_all_of_us(
+            disease=disease,
+            chromosomes=[1],
+            output_base=str(tmp_path),
+            n_pcs=2,
+        )
+
 def _read_tsv_rows(path: Path) -> list[dict[str, str]]:
-    with path.open("r", encoding="utf-8", newline="") as handle:
+    opener = gzip.open if path.suffix == ".gz" else Path.open
+    with opener(path, "rt", encoding="utf-8", newline="") as handle:
         reader = csv.DictReader(handle, delimiter="\t")
         return [{str(key): "" if value is None else str(value) for key, value in row.items()} for row in reader]
 

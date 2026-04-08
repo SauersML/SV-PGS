@@ -4,7 +4,6 @@ import csv
 import gzip
 import json
 import os
-import pickle
 import struct
 from types import SimpleNamespace
 from pathlib import Path
@@ -580,61 +579,6 @@ def test_vcf_cache_key_changes_when_minimum_scale_changes(tmp_path: Path):
     assert first_key != second_key
 
 
-def test_vcf_cache_load_upgrades_legacy_stats_bundle_to_manifest(tmp_path: Path):
-    vcf_path = tmp_path / "cohort.vcf"
-    vcf_path.write_text("##fileformat=VCFv4.2\n", encoding="utf-8")
-    config = ModelConfig()
-    key = _vcf_cache_key(vcf_path, config)
-    cache_dir = tmp_path / ".sv_pgs_cache"
-    cache_dir.mkdir()
-
-    genotype_matrix = np.array([[0, 1], [1, 2]], dtype=np.int8, order="F")
-    np.save(cache_dir / f"{key}.genotypes.npy", genotype_matrix, allow_pickle=False)
-    with open(cache_dir / f"{key}.variants.pkl", "wb") as handle:
-        pickle.dump(
-            [
-                _VariantDefaults(
-                    variant_id="variant_0",
-                    variant_class=VariantClass.SNV,
-                    chromosome="1",
-                    position=100,
-                    length=1.0,
-                    allele_frequency=0.25,
-                    quality=50.0,
-                ),
-                _VariantDefaults(
-                    variant_id="variant_1",
-                    variant_class=VariantClass.SNV,
-                    chromosome="1",
-                    position=200,
-                    length=1.0,
-                    allele_frequency=0.5,
-                    quality=40.0,
-                ),
-            ],
-            handle,
-            protocol=pickle.HIGHEST_PROTOCOL,
-        )
-    np.savez_compressed(
-        cache_dir / f"{key}.stats.npz",
-        means=np.array([0.5, 1.5], dtype=np.float32),
-        scales=np.array([0.75, 0.5], dtype=np.float32),
-        allele_frequencies=np.array([0.25, 0.75], dtype=np.float32),
-        support_counts=np.array([1, 2], dtype=np.int32),
-    )
-
-    cached = _load_vcf_from_cache(vcf_path=vcf_path, config=config)
-
-    assert cached is not None
-    cached_genotypes, _, cached_variant_stats = cached
-    np.testing.assert_array_equal(cached_genotypes, genotype_matrix)
-    np.testing.assert_allclose(cached_variant_stats.means, np.array([0.5, 1.5], dtype=np.float32))
-
-    manifest = json.loads((cache_dir / f"{key}.manifest.json").read_text(encoding="utf-8"))
-    assert manifest["stats_file"] == f"{key}.stats.npy"
-    assert (cache_dir / f"{key}.stats.npy").exists()
-
-
 def test_vcf_cache_load_ignores_incomplete_manifestless_new_bundle(tmp_path: Path):
     vcf_path = tmp_path / "cohort.vcf"
     vcf_path.write_text("##fileformat=VCFv4.2\n", encoding="utf-8")
@@ -644,8 +588,7 @@ def test_vcf_cache_load_ignores_incomplete_manifestless_new_bundle(tmp_path: Pat
     cache_dir.mkdir()
 
     np.save(cache_dir / f"{key}.genotypes.npy", np.array([[0, 1]], dtype=np.int8), allow_pickle=False)
-    with open(cache_dir / f"{key}.variants.pkl", "wb") as handle:
-        pickle.dump([], handle, protocol=pickle.HIGHEST_PROTOCOL)
+    io_module._write_variant_metadata(cache_dir / f"{key}.variants.npz", [])
     stats_dtype = np.dtype(
         [
             ("means", "<f4"),
@@ -701,20 +644,19 @@ def test_precache_vcfs_parallel_reuses_completed_region_outputs(monkeypatch: pyt
     region1_prefix = tmp_dir / "region_1"
 
     Path(f"{region0_prefix}.geno").write_bytes(np.array([0, 1], dtype=np.int8).tobytes())
-    Path(f"{region0_prefix}.var").write_text(
-        json.dumps(
-            {
-                "variant_id": "var0",
-                "variant_class": VariantClass.SNV.value,
-                "chromosome": "1",
-                "position": 100,
-                "length": 1.0,
-                "allele_frequency": 0.25,
-                "quality": 50.0,
-            }
-        )
-        + "\n",
-        encoding="utf-8",
+    io_module._write_variant_metadata(
+        Path(f"{region0_prefix}.variants.npz"),
+        [
+            _VariantDefaults(
+                variant_id="var0",
+                variant_class=VariantClass.SNV,
+                chromosome="1",
+                position=100,
+                length=1.0,
+                allele_frequency=0.25,
+                quality=50.0,
+            )
+        ],
     )
     Path(f"{region0_prefix}.stats").write_bytes(struct.pack("<qqii", 1, 1, 2, 1))
 
@@ -735,20 +677,19 @@ def test_precache_vcfs_parallel_reuses_completed_region_outputs(monkeypatch: pyt
                 scheduled_tasks.append(task)
                 _vcf_path_str, _region, _keep_list, output_prefix, _threads = task
                 Path(f"{output_prefix}.geno").write_bytes(np.array([2, 0], dtype=np.int8).tobytes())
-                Path(f"{output_prefix}.var").write_text(
-                    json.dumps(
-                        {
-                            "variant_id": "var1",
-                            "variant_class": VariantClass.SNV.value,
-                            "chromosome": "1",
-                            "position": 200,
-                            "length": 1.0,
-                            "allele_frequency": 0.50,
-                            "quality": 40.0,
-                        }
-                    )
-                    + "\n",
-                    encoding="utf-8",
+                io_module._write_variant_metadata(
+                    Path(f"{output_prefix}.variants.npz"),
+                    [
+                        _VariantDefaults(
+                            variant_id="var1",
+                            variant_class=VariantClass.SNV,
+                            chromosome="1",
+                            position=200,
+                            length=1.0,
+                            allele_frequency=0.50,
+                            quality=40.0,
+                        )
+                    ],
                 )
                 Path(f"{output_prefix}.stats").write_bytes(struct.pack("<qqii", 2, 4, 2, 1))
                 yield 1, str(output_prefix)
@@ -1222,15 +1163,20 @@ def test_run_training_pipeline_from_plink_inputs_writes_outputs(tmp_path: Path):
     assert outputs.coefficients_path.is_file()
     assert (outputs.artifact_dir / "arrays.npz").is_file()
     assert (outputs.artifact_dir / "metadata.json").is_file()
+    assert outputs.summary_path.name == "summary.json.gz"
+    assert outputs.predictions_path.name == "predictions.tsv.gz"
+    assert outputs.coefficients_path.name == "coefficients.tsv.gz"
 
-    summary_payload = json.loads(outputs.summary_path.read_text(encoding="utf-8"))
+    summary_payload = _read_json_payload(outputs.summary_path)
     assert summary_payload["sample_count"] == 6
     assert summary_payload["variant_count"] == 3
     assert summary_payload["trait_type"] == "quantitative"
     assert "training_r2" in summary_payload
 
-    prediction_lines = outputs.predictions_path.read_text(encoding="utf-8").strip().splitlines()
-    coefficient_lines = outputs.coefficients_path.read_text(encoding="utf-8").strip().splitlines()
+    with gzip.open(outputs.predictions_path, "rt", encoding="utf-8") as handle:
+        prediction_lines = handle.read().strip().splitlines()
+    with gzip.open(outputs.coefficients_path, "rt", encoding="utf-8") as handle:
+        coefficient_lines = handle.read().strip().splitlines()
     assert len(prediction_lines) == 7
     assert coefficient_lines[0] == "variant_id\tvariant_class\tbeta"
     for coefficient_line in coefficient_lines[1:]:
@@ -1351,7 +1297,7 @@ def test_run_training_pipeline_fits_full_cohort_once(tmp_path: Path, monkeypatch
         },
     ]
 
-    summary_payload = json.loads(outputs.summary_path.read_text(encoding="utf-8"))
+    summary_payload = _read_json_payload(outputs.summary_path)
     assert summary_payload["validation_enabled"] is False
     assert summary_payload["tuning_sample_count"] == 8
     assert summary_payload["validation_sample_count"] == 0
@@ -1463,7 +1409,7 @@ def test_run_training_pipeline_uses_validation_split_then_refits_full_cohort(
         },
     ]
 
-    summary_payload = json.loads(outputs.summary_path.read_text(encoding="utf-8"))
+    summary_payload = _read_json_payload(outputs.summary_path)
     assert summary_payload["validation_enabled"] is True
     assert summary_payload["tuning_sample_count"] == 8
     assert summary_payload["validation_sample_count"] == 2
@@ -1676,7 +1622,7 @@ def test_run_training_pipeline_keeps_full_coefficient_alignment_after_filtering(
     finally:
         monkeypatch.undo()
 
-    with outputs.coefficients_path.open(encoding="utf-8", newline="") as handle:
+    with gzip.open(outputs.coefficients_path, "rt", encoding="utf-8", newline="") as handle:
         coefficient_rows = list(csv.DictReader(handle, delimiter="\t"))
 
     assert [row["variant_id"] for row in coefficient_rows] == [
@@ -1746,7 +1692,7 @@ def test_cli_infers_binary_trait_type(tmp_path: Path, monkeypatch: pytest.Monkey
     )
 
     assert exit_code == 0
-    summary_payload = json.loads((output_dir / "summary.json").read_text(encoding="utf-8"))
+    summary_payload = _read_json_payload(output_dir / "summary.json.gz")
     assert summary_payload["trait_type"] == "binary"
 
 
@@ -1828,7 +1774,7 @@ def test_vcf_cli_end_to_end_recovers_binary_signal_with_symbolic_svs(tmp_path: P
     )
 
     assert exit_code == 0
-    summary_payload = json.loads((output_dir / "summary.json").read_text(encoding="utf-8"))
+    summary_payload = _read_json_payload(output_dir / "summary.json.gz")
     assert summary_payload["trait_type"] == "binary"
     assert summary_payload["training_auc"] is not None
     assert summary_payload["training_auc"] == pytest.approx(0.7313368055555556)
@@ -1847,7 +1793,7 @@ def test_vcf_cli_end_to_end_recovers_binary_signal_with_symbolic_svs(tmp_path: P
     loaded_probability = loaded_model.predict_proba(dataset.genotypes, dataset.covariates)[:, 1]
     assert roc_auc_score(dataset.targets, loaded_probability) == pytest.approx(0.7313368055555556)
 
-    prediction_rows = _read_tsv_rows(output_dir / "predictions.tsv")
+    prediction_rows = _read_tsv_rows(output_dir / "predictions.tsv.gz")
     file_probability = np.asarray([float(row["probability"]) for row in prediction_rows], dtype=np.float32)
     np.testing.assert_allclose(file_probability, loaded_probability, atol=1e-5)
 
@@ -1943,7 +1889,7 @@ def test_plink_end_to_end_recovers_quantitative_signal_with_sv_style_alleles(tmp
     )
 
     assert exit_code == 0
-    summary_payload = json.loads((output_dir / "summary.json").read_text(encoding="utf-8"))
+    summary_payload = _read_json_payload(output_dir / "summary.json.gz")
     assert summary_payload["trait_type"] == "quantitative"
     assert summary_payload["training_r2"] > 0.55
 
@@ -1961,7 +1907,7 @@ def test_plink_end_to_end_recovers_quantitative_signal_with_sv_style_alleles(tmp
     loaded_prediction = loaded_model.predict(dataset.genotypes, dataset.covariates)
     assert r2_score(dataset.targets, loaded_prediction) > 0.55
 
-    prediction_rows = _read_tsv_rows(output_dir / "predictions.tsv")
+    prediction_rows = _read_tsv_rows(output_dir / "predictions.tsv.gz")
     file_prediction = np.asarray([float(row["prediction"]) for row in prediction_rows], dtype=np.float32)
     np.testing.assert_allclose(file_prediction, loaded_prediction, atol=1e-5)
 
@@ -2035,7 +1981,7 @@ def test_cli_handles_single_class_binary_targets_without_metric_crash(tmp_path: 
     )
 
     assert exit_code == 0
-    summary_payload = json.loads((output_dir / "summary.json").read_text(encoding="utf-8"))
+    summary_payload = _read_json_payload(output_dir / "summary.json.gz")
     assert summary_payload["trait_type"] == "binary"
     assert summary_payload["training_auc"] is None
     assert "training_log_loss" in summary_payload
@@ -2146,9 +2092,16 @@ def _write_table(path: Path, header: tuple[str, ...], rows: tuple[tuple[str, ...
 
 
 def _read_tsv_rows(path: Path) -> list[dict[str, str]]:
-    with path.open("r", encoding="utf-8", newline="") as handle:
+    opener = gzip.open if path.suffix == ".gz" else Path.open
+    with opener(path, "rt", encoding="utf-8", newline="") as handle:
         reader = csv.DictReader(handle, delimiter="\t")
         return [{str(key): str(value) for key, value in row.items()} for row in reader]
+
+
+def _read_json_payload(path: Path) -> dict[str, object]:
+    opener = gzip.open if path.suffix == ".gz" else Path.open
+    with opener(path, "rt", encoding="utf-8") as handle:
+        return json.load(handle)
 
 
 def _write_vcf(

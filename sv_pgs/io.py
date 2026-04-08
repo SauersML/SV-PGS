@@ -5,11 +5,10 @@ import gzip
 import hashlib
 import json
 import os
-import pickle
 import tempfile
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Any, BinaryIO, Iterable, Iterator, Literal, Sequence, TextIO
+from typing import Any, BinaryIO, Iterable, Iterator, Literal, Sequence
 
 import numpy as np
 from sklearn.metrics import log_loss, r2_score, roc_auc_score
@@ -174,6 +173,12 @@ def _open_vcf_text(vcf_path: Path) -> Any:
     if vcf_path.suffix == ".gz":
         return gzip.open(vcf_path, "rt", encoding="utf-8")
     return vcf_path.open("r", encoding="utf-8")
+
+
+def _open_text_file(path: Path, mode: Literal["rt", "wt"], *, newline: str | None = None) -> Any:
+    if path.suffix == ".gz":
+        return gzip.open(path, mode, encoding="utf-8", newline=newline)
+    return path.open(mode.replace("t", ""), encoding="utf-8", newline=newline)
 
 
 def _parse_contig_header(line: str) -> tuple[str | None, int]:
@@ -806,7 +811,7 @@ def run_training_pipeline(
     log(f"artifacts written to {artifact_dir}")
 
     log("writing coefficients table...")
-    coefficients_path = destination / "coefficients.tsv"
+    coefficients_path = destination / "coefficients.tsv.gz"
     coefficient_rows = model.coefficient_table(nonzero_only=True)
     _write_delimited_rows(
         coefficients_path,
@@ -823,7 +828,7 @@ def run_training_pipeline(
     log(f"wrote {len(coefficient_rows)} non-zero coefficient rows to {coefficients_path}")
 
     log("writing predictions...")
-    predictions_path = destination / "predictions.tsv"
+    predictions_path = destination / "predictions.tsv.gz"
     summary_payload.update(_write_predictions_and_summary(
         predictions_path=predictions_path,
         dataset=dataset,
@@ -850,8 +855,9 @@ def run_training_pipeline(
     log(f"predictions written: {active_count} active variants out of {dataset.genotypes.shape[1]}")
 
     log("writing summary JSON...")
-    summary_path = destination / "summary.json"
-    summary_path.write_text(json.dumps(summary_payload, indent=2), encoding="utf-8")
+    summary_path = destination / "summary.json.gz"
+    with _open_text_file(summary_path, "wt") as handle:
+        handle.write(json.dumps(summary_payload, indent=2))
     log(f"=== TRAINING PIPELINE DONE ===  mem={mem()}")
     return PipelineOutputs(
         artifact_dir=artifact_dir,
@@ -1095,8 +1101,8 @@ def _resolve_sample_id_column(
 _CACHE_DIR_NAME = ".sv_pgs_cache"
 # Bump this when _VariantDefaults, VariantClass, or the cache format changes
 # so stale caches are automatically invalidated.
-_CACHE_VERSION = 2
-_VCF_CACHE_MANIFEST_VERSION = 1
+_CACHE_VERSION = 3
+_VCF_CACHE_MANIFEST_VERSION = 2
 _VCF_CACHE_STATS_DTYPE = np.dtype(
     [
         ("means", "<f4"),
@@ -1105,6 +1111,23 @@ _VCF_CACHE_STATS_DTYPE = np.dtype(
         ("support_counts", "<i4"),
     ]
 )
+_VCF_CACHE_VARIANT_NUMERIC_DTYPE = np.dtype(
+    [
+        ("variant_class_code", "<u2"),
+        ("position", "<i8"),
+        ("length", "<f4"),
+        ("allele_frequency", "<f4"),
+        ("quality", "<f4"),
+    ]
+)
+_VARIANT_CLASS_TO_CODE = {
+    variant_class: code
+    for code, variant_class in enumerate(VariantClass)
+}
+_VARIANT_CODE_TO_CLASS = {
+    code: variant_class
+    for variant_class, code in _VARIANT_CLASS_TO_CODE.items()
+}
 
 
 @dataclass(slots=True)
@@ -1114,7 +1137,6 @@ class _VcfCachePaths:
     geno_path: Path
     var_path: Path
     stats_path: Path
-    legacy_stats_path: Path
     manifest_path: Path
 
 
@@ -1166,9 +1188,8 @@ def _vcf_cache_paths(vcf_path: Path, config: ModelConfig) -> _VcfCachePaths:
         key=key,
         cache_dir=cache_dir,
         geno_path=cache_dir / f"{key}.genotypes.npy",
-        var_path=cache_dir / f"{key}.variants.pkl",
+        var_path=cache_dir / f"{key}.variants.npz",
         stats_path=cache_dir / f"{key}.stats.npy",
-        legacy_stats_path=cache_dir / f"{key}.stats.npz",
         manifest_path=cache_dir / f"{key}.manifest.json",
     )
 
@@ -1204,6 +1225,67 @@ def _load_vcf_cache_manifest(manifest_path: Path) -> dict[str, Any] | None:
     return manifest
 
 
+def _variants_to_metadata_arrays(
+    variants: Sequence[_VariantDefaults],
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    variant_ids = np.asarray(
+        [variant.variant_id for variant in variants],
+        dtype=f"<U{max((len(variant.variant_id) for variant in variants), default=1)}",
+    )
+    chromosomes = np.asarray(
+        [variant.chromosome for variant in variants],
+        dtype=f"<U{max((len(variant.chromosome) for variant in variants), default=1)}",
+    )
+    numeric = np.empty(len(variants), dtype=_VCF_CACHE_VARIANT_NUMERIC_DTYPE)
+    numeric["variant_class_code"] = np.asarray(
+        [_VARIANT_CLASS_TO_CODE[variant.variant_class] for variant in variants],
+        dtype=np.uint16,
+    )
+    numeric["position"] = np.asarray([variant.position for variant in variants], dtype=np.int64)
+    numeric["length"] = np.asarray([variant.length for variant in variants], dtype=np.float32)
+    numeric["allele_frequency"] = np.asarray([variant.allele_frequency for variant in variants], dtype=np.float32)
+    numeric["quality"] = np.asarray([variant.quality for variant in variants], dtype=np.float32)
+    return variant_ids, chromosomes, numeric
+
+
+def _write_variant_metadata(path: Path, variants: Sequence[_VariantDefaults]) -> None:
+    variant_ids, chromosomes, numeric = _variants_to_metadata_arrays(variants)
+    with path.open("wb") as handle:
+        np.savez(
+            handle,
+            variant_ids=variant_ids,
+            chromosomes=chromosomes,
+            numeric=numeric,
+        )
+
+
+def _load_variant_metadata(path: Path) -> list[_VariantDefaults]:
+    payload = np.load(path, allow_pickle=False)
+    try:
+        variant_ids = np.asarray(payload["variant_ids"], dtype=str)
+        chromosomes = np.asarray(payload["chromosomes"], dtype=str)
+        numeric = np.asarray(payload["numeric"], dtype=_VCF_CACHE_VARIANT_NUMERIC_DTYPE)
+    finally:
+        payload.close()
+    return [
+        _VariantDefaults(
+            variant_id=str(variant_id),
+            variant_class=_VARIANT_CODE_TO_CLASS[int(numeric_row["variant_class_code"])],
+            chromosome=str(chromosome),
+            position=int(numeric_row["position"]),
+            length=float(numeric_row["length"]),
+            allele_frequency=float(numeric_row["allele_frequency"]),
+            quality=float(numeric_row["quality"]),
+        )
+        for variant_id, chromosome, numeric_row in zip(
+            variant_ids,
+            chromosomes,
+            numeric,
+            strict=True,
+        )
+    ]
+
+
 def _write_vcf_cache_manifest(
     manifest_path: Path,
     *,
@@ -1231,13 +1313,6 @@ def _write_vcf_cache_manifest(
 def _load_vcf_cache_stats(stats_path: Path) -> VariantStatistics:
     stats_payload = np.load(stats_path, mmap_mode="r")
     try:
-        if isinstance(stats_payload, np.lib.npyio.NpzFile):
-            return VariantStatistics(
-                means=np.asarray(stats_payload["means"], dtype=np.float32),
-                scales=np.asarray(stats_payload["scales"], dtype=np.float32),
-                allele_frequencies=np.asarray(stats_payload["allele_frequencies"], dtype=np.float32),
-                support_counts=np.asarray(stats_payload["support_counts"], dtype=np.int32),
-            )
         return VariantStatistics(
             means=np.asarray(stats_payload["means"], dtype=np.float32),
             scales=np.asarray(stats_payload["scales"], dtype=np.float32),
@@ -1245,7 +1320,7 @@ def _load_vcf_cache_stats(stats_path: Path) -> VariantStatistics:
             support_counts=np.asarray(stats_payload["support_counts"], dtype=np.int32),
         )
     finally:
-        if isinstance(stats_payload, np.lib.npyio.NpzFile):
+        if hasattr(stats_payload, "close"):
             stats_payload.close()
 
 
@@ -1259,26 +1334,18 @@ def _write_vcf_cache_stats(stats_path: Path, variant_stats: VariantStatistics) -
 
 
 def _is_vcf_cache_bundle_complete(paths: _VcfCachePaths) -> bool:
-    if paths.manifest_path.exists():
-        manifest = _load_vcf_cache_manifest(paths.manifest_path)
-        if manifest is not None:
-            stats_filename = str(manifest.get("stats_file", paths.stats_path.name))
-            if paths.geno_path.exists() and paths.var_path.exists() and (paths.cache_dir / stats_filename).exists():
-                return True
-        # Manifest exists but is broken or references missing files — fall through
-        # to legacy check (handles migrated symlinks where manifest points to old key)
-    return paths.geno_path.exists() and paths.var_path.exists() and (
-        paths.legacy_stats_path.exists() or paths.stats_path.exists()
-    )
+    manifest = _load_vcf_cache_manifest(paths.manifest_path)
+    if manifest is None:
+        return False
+    stats_filename = str(manifest.get("stats_file", paths.stats_path.name))
+    return paths.geno_path.exists() and paths.var_path.exists() and (paths.cache_dir / stats_filename).exists()
 
 
 def _ensure_vcf_cache_matrix_fast(paths: _VcfCachePaths, genotype_matrix: np.ndarray) -> np.ndarray:
     if genotype_matrix.flags.f_contiguous and not genotype_matrix.flags.c_contiguous:
         return genotype_matrix
-    with open(paths.var_path, "rb") as handle:
-        variants = pickle.load(handle)
-    stats_path = paths.stats_path if paths.stats_path.exists() else paths.legacy_stats_path
-    variant_stats = _load_vcf_cache_stats(stats_path)
+    variants = _load_variant_metadata(paths.var_path)
+    variant_stats = _load_vcf_cache_stats(paths.stats_path)
     _save_vcf_to_cache(
         vcf_path=paths.geno_path,
         genotype_matrix=np.asarray(genotype_matrix, dtype=np.int8),
@@ -1287,118 +1354,6 @@ def _ensure_vcf_cache_matrix_fast(paths: _VcfCachePaths, genotype_matrix: np.nda
         cache_paths=paths,
     )
     return np.load(paths.geno_path, mmap_mode="r")
-
-
-def _upgrade_legacy_vcf_cache_bundle(
-    paths: _VcfCachePaths,
-    genotype_matrix: np.ndarray,
-    variant_stats: VariantStatistics,
-    *,
-    vcf_path: Path,
-) -> None:
-    created_stats = False
-    try:
-        if not paths.stats_path.exists():
-            stats_tmp = paths.cache_dir / f"{paths.key}.stats.tmp.npy"
-            _write_vcf_cache_stats(stats_tmp, variant_stats)
-            stats_tmp.replace(paths.stats_path)
-            created_stats = True
-        _write_vcf_cache_manifest(
-            paths.manifest_path,
-            sample_count=int(genotype_matrix.shape[0]),
-            variant_count=int(genotype_matrix.shape[1]),
-            stats_file=paths.stats_path.name,
-            source_signature=_vcf_cache_source_signature(vcf_path),
-        )
-    except Exception:
-        try:
-            (paths.cache_dir / f"{paths.key}.stats.tmp.npy").unlink(missing_ok=True)
-        except Exception:
-            pass
-        if created_stats:
-            try:
-                paths.stats_path.unlink(missing_ok=True)
-            except Exception:
-                pass
-
-
-def _find_matching_complete_vcf_cache(
-    cache_dir: Path,
-    *,
-    vcf_path: Path,
-    config: ModelConfig,
-    expected_chromosome: str | None = None,
-) -> _VcfCachePaths | None:
-    """Find a complete cache bundle that matches the given VCF.
-
-    Matching priority:
-    1. Exact current key match
-    2. source_signature match (same path + content)
-    3. Chromosome match via variants.pkl (for caches created at a different path)
-    """
-    current_key = _vcf_cache_key(vcf_path, config)
-    source_signature = _vcf_cache_source_signature(vcf_path)
-    # First pass: exact key or source_signature match
-    for geno_file in sorted(cache_dir.glob("*.genotypes.npy")):
-        key = geno_file.name.removesuffix(".genotypes.npy")
-        candidate = _VcfCachePaths(
-            key=key,
-            cache_dir=cache_dir,
-            geno_path=geno_file,
-            var_path=cache_dir / f"{key}.variants.pkl",
-            stats_path=cache_dir / f"{key}.stats.npy",
-            legacy_stats_path=cache_dir / f"{key}.stats.npz",
-            manifest_path=cache_dir / f"{key}.manifest.json",
-        )
-        if not _is_vcf_cache_bundle_complete(candidate):
-            continue
-        if key == current_key:
-            return candidate
-        manifest = _load_vcf_cache_manifest(candidate.manifest_path)
-        if manifest is not None and str(manifest.get("source_signature", "")) == source_signature:
-            return candidate
-    # Second pass: match by chromosome from variants.pkl (handles VCF path changes)
-    if expected_chromosome is not None:
-        # Normalize: strip "chr" prefix for comparison
-        norm_expected = str(expected_chromosome).replace("chr", "")
-        for geno_file in sorted(cache_dir.glob("*.genotypes.npy")):
-            key = geno_file.name.removesuffix(".genotypes.npy")
-            candidate = _VcfCachePaths(
-                key=key,
-                cache_dir=cache_dir,
-                geno_path=geno_file,
-                var_path=cache_dir / f"{key}.variants.pkl",
-                stats_path=cache_dir / f"{key}.stats.npy",
-                legacy_stats_path=cache_dir / f"{key}.stats.npz",
-                manifest_path=cache_dir / f"{key}.manifest.json",
-            )
-            if not _is_vcf_cache_bundle_complete(candidate):
-                continue
-            try:
-                with open(candidate.var_path, "rb") as f:
-                    variants = pickle.load(f)
-                if variants:
-                    stored_chr = str(getattr(variants[0], "chromosome", "")).replace("chr", "")
-                    if stored_chr == norm_expected:
-                        return candidate
-            except Exception:
-                continue
-    return None
-
-
-def _find_any_tmp_parallel(cache_dir: Path, current_key: str) -> Path:
-    """Find any existing .tmp_parallel directory, preferring the current key.
-
-    Falls back to any legacy .tmp_parallel dir (from an old key format)
-    so that partially-completed parallel parses are not wasted.
-    """
-    current = cache_dir / f"{current_key}.tmp_parallel"
-    if current.exists():
-        return current
-    for candidate in sorted(cache_dir.glob("*.tmp_parallel")):
-        if candidate.is_dir():
-            return candidate
-    return current  # no legacy found, use the current key
 
 
 def _load_vcf_from_cache(
@@ -1414,63 +1369,34 @@ def _load_vcf_from_cache(
 
     _cleanup_stale_vcf_cache_temps(paths.cache_dir, paths.key)
     if not _is_vcf_cache_bundle_complete(paths):
-        # Try to extract chromosome from VCF for matching legacy caches
-        expected_chr: str | None = None
-        try:
-            contig_info = _vcf_contig_info(vcf_path)
-            if contig_info[0] is not None:
-                expected_chr = contig_info[0].replace("chr", "")
-        except Exception:
-            pass
-        legacy = _find_matching_complete_vcf_cache(
-            paths.cache_dir,
-            vcf_path=vcf_path,
-            config=config,
-            expected_chromosome=expected_chr,
-        )
-        if legacy is not None:
-            log(f"VCF cache: current key {paths.key} not found, but found legacy bundle {legacy.key}")
-            paths = legacy
-        else:
-            log(f"VCF cache miss (key={paths.key})")
-            return None
+        log(f"VCF cache miss (key={paths.key})")
+        return None
 
     try:
         log(f"VCF cache hit — loading from {paths.cache_dir.name}/{paths.key}.*")
         effective_mmap_mode: Literal["r", "r+", "w+", "c"] = "r" if mmap_mode is None else mmap_mode
         manifest = _load_vcf_cache_manifest(paths.manifest_path)
-        stats_path = paths.legacy_stats_path
-        expected_sample_count: int | None = None
-        expected_variant_count: int | None = None
-        if manifest is not None:
-            manifest_stats = paths.cache_dir / str(manifest.get("stats_file", paths.stats_path.name))
-            if manifest_stats.exists():
-                expected_sample_count = int(manifest["sample_count"])
-                expected_variant_count = int(manifest["variant_count"])
-                stats_path = manifest_stats
-            else:
-                manifest = None  # manifest references missing file, ignore it
-        # Fall back to direct stats paths if manifest was missing or broken
         if manifest is None:
-            if paths.legacy_stats_path.exists():
-                stats_path = paths.legacy_stats_path
-            elif paths.stats_path.exists():
-                stats_path = paths.stats_path
+            raise ValueError("cache manifest missing or invalid")
+        expected_sample_count = int(manifest["sample_count"])
+        expected_variant_count = int(manifest["variant_count"])
+        stats_path = paths.cache_dir / str(manifest.get("stats_file", paths.stats_path.name))
+        if not stats_path.exists():
+            raise ValueError(f"cache manifest references missing stats file: {stats_path.name}")
 
         import time as _time_mod
         _t0 = _time_mod.monotonic()
         genotype_matrix = np.load(paths.geno_path, mmap_mode=effective_mmap_mode)
         log(f"  mmap ready: {genotype_matrix.shape} {genotype_matrix.dtype} ({_time_mod.monotonic()-_t0:.1f}s)")
         _t1 = _time_mod.monotonic()
-        with open(paths.var_path, "rb") as variant_handle:
-            variants = pickle.load(variant_handle)
+        variants = _load_variant_metadata(paths.var_path)
         log(f"  variants loaded: {len(variants)} ({_time_mod.monotonic()-_t1:.1f}s)")
         _t2 = _time_mod.monotonic()
         variant_stats = _load_vcf_cache_stats(stats_path)
         log(f"  stats loaded ({_time_mod.monotonic()-_t2:.1f}s)")
-        if expected_sample_count is not None and genotype_matrix.shape[0] != expected_sample_count:
+        if genotype_matrix.shape[0] != expected_sample_count:
             raise ValueError(f"cached sample count mismatch: {genotype_matrix.shape[0]} != {expected_sample_count}")
-        if expected_variant_count is not None and genotype_matrix.shape[1] != expected_variant_count:
+        if genotype_matrix.shape[1] != expected_variant_count:
             raise ValueError(f"cached variant count mismatch: {genotype_matrix.shape[1]} != {expected_variant_count}")
         stats_lengths = {
             int(variant_stats.means.shape[0]),
@@ -1496,12 +1422,7 @@ def _load_vcf_from_cache(
         try:
             genotype_matrix = _ensure_vcf_cache_matrix_fast(paths, genotype_matrix)
         except Exception:
-            pass  # keep row-major if column-major rewrite fails (e.g. disk full)
-        if manifest is None:
-            try:
-                _upgrade_legacy_vcf_cache_bundle(paths, genotype_matrix, variant_stats, vcf_path=vcf_path)
-            except Exception:
-                pass  # upgrade is optional — data is already loaded
+            pass
         log(f"  cached matrix {genotype_matrix.shape}, {len(variants)} variants")
         return genotype_matrix, variants, variant_stats
     except Exception as exc:
@@ -1517,7 +1438,16 @@ def _read_vcf_sample_ids(vcf_path: Path) -> list[str]:
         reader.close()
 
 
-_INCREMENTAL_CHECKPOINT_INTERVAL = 5000  # variants between disk flushes
+_INCREMENTAL_CHECKPOINT_BYTE_INTERVAL = 256 * 1024 * 1024
+_INCREMENTAL_CHECKPOINT_TIME_SECONDS = 30.0
+
+
+def _incremental_variant_chunk_path(cache_dir: Path, key: str, chunk_index: int) -> Path:
+    return cache_dir / f"{key}.inc.variants.{chunk_index:06d}.npz"
+
+
+def _iter_incremental_variant_chunk_paths(cache_dir: Path, key: str) -> list[Path]:
+    return sorted(cache_dir.glob(f"{key}.inc.variants.*.npz"))
 
 
 def _prepare_keep_sample_selector(
@@ -1556,7 +1486,7 @@ def _region_output_complete(output_prefix: str | Path) -> bool:
     prefix = Path(output_prefix)
     return (
         Path(f"{prefix}.geno").exists()
-        and Path(f"{prefix}.var").exists()
+        and Path(f"{prefix}.variants.npz").exists()
         and Path(f"{prefix}.stats").exists()
     )
 
@@ -1602,7 +1532,6 @@ def _split_into_regions(chrom: str, chrom_length: int, n_regions: int) -> list[s
 def _region_parse_worker(args: tuple) -> tuple[int, str]:
     """Worker: parse one region of one VCF, write raw binary output files.
     Runs in a separate process. Returns (variant_count, output_prefix)."""
-    import json as _json
     import struct
     import sys
     import time
@@ -1617,8 +1546,8 @@ def _region_parse_worker(args: tuple) -> tuple[int, str]:
     gt_map = np.array([0, 1, PLINK_MISSING_INT8, 2], dtype=np.int8)
     stats_pack = struct.Struct("<qqii")
     geno_fh = open(f"{output_prefix}.geno", "wb")
-    var_fh = open(f"{output_prefix}.var", "w")
     stats_fh = open(f"{output_prefix}.stats", "wb")
+    variants: list[_VariantDefaults] = []
 
     count = 0
     t_start = time.monotonic()
@@ -1637,13 +1566,7 @@ def _region_parse_worker(args: tuple) -> tuple[int, str]:
             int(observed.shape[0]),
             int(np.count_nonzero(observed > 0)),
         ))
-        vd = _variant_defaults_from_vcf_record(record)
-        var_fh.write(_json.dumps({
-            "variant_id": vd.variant_id, "variant_class": vd.variant_class.value,
-            "chromosome": vd.chromosome, "position": vd.position,
-            "length": vd.length, "allele_frequency": vd.allele_frequency,
-            "quality": vd.quality,
-        }) + "\n")
+        variants.append(_variant_defaults_from_vcf_record(record))
         count += 1
         now = time.monotonic()
         if now - last_log >= 10.0:
@@ -1652,9 +1575,9 @@ def _region_parse_worker(args: tuple) -> tuple[int, str]:
             last_log = now
 
     geno_fh.close()
-    var_fh.close()
     stats_fh.close()
     reader.close()
+    _write_variant_metadata(Path(f"{output_prefix}.variants.npz"), variants)
     elapsed = time.monotonic() - t_start
     print(f"  [worker] {vcf_name}: DONE {count} variants in {elapsed:.0f}s", file=sys.stderr, flush=True)
     return count, output_prefix
@@ -1670,7 +1593,7 @@ def precache_vcfs_parallel(
     Uses VCF header contig lengths for region splitting (no hardcoded lengths).
     If contig length is unknown, that VCF gets 1 worker (no splitting).
 
-    Fully compatible with existing .npy cache — already-cached VCFs are skipped.
+    Already-cached VCFs under the current cache key are skipped.
     Produces the same final cache format via the incremental → .npy pipeline.
     """
     import multiprocessing
@@ -1679,21 +1602,12 @@ def precache_vcfs_parallel(
 
     total_cpus = os.cpu_count() or 4
 
-    # Skip already-cached VCFs (compatible with existing .npy cache AND legacy keys)
+    # Skip already-cached VCFs under the current cache key only.
     uncached: list[Path] = []
     for vcf_path in vcf_paths:
         cache_paths = _vcf_cache_paths(vcf_path, config)
         if _is_vcf_cache_bundle_complete(cache_paths):
             continue
-        cache_dir = _vcf_cache_dir(vcf_path)
-        if cache_dir.exists():
-            try:
-                chr_info = _vcf_contig_info(vcf_path)
-                chr_name = chr_info[0].replace("chr", "") if chr_info[0] else None
-            except Exception:
-                chr_name = None
-            if _find_matching_complete_vcf_cache(cache_dir, vcf_path=vcf_path, config=config, expected_chromosome=chr_name) is not None:
-                continue
         uncached.append(vcf_path)
 
     if not uncached:
@@ -1730,8 +1644,7 @@ def precache_vcfs_parallel(
         cache_dir = _vcf_cache_dir(vcf_path)
         cache_dir.mkdir(parents=True, exist_ok=True)
         key = _vcf_cache_key(vcf_path, config)
-        # Reuse any existing tmp_parallel dir (may have been created with a legacy key)
-        tmp_dir = _find_any_tmp_parallel(cache_dir, key)
+        tmp_dir = cache_dir / f"{key}.tmp_parallel"
         tmp_dir.mkdir(parents=True, exist_ok=True)
 
         if n_workers <= 1 or chrom is None:
@@ -1790,7 +1703,7 @@ def precache_vcfs_parallel(
     for vcf_path in uncached:
         cache_dir = _vcf_cache_dir(vcf_path)
         key = _vcf_cache_key(vcf_path, config)
-        tmp_dir = _find_any_tmp_parallel(cache_dir, key)
+        tmp_dir = cache_dir / f"{key}.tmp_parallel"
         if not tmp_dir.exists():
             continue
 
@@ -1802,16 +1715,17 @@ def precache_vcfs_parallel(
 
         # Concatenate regions → incremental cache files
         inc_geno = cache_dir / f"{key}.inc.genotypes.bin"
-        inc_var = cache_dir / f"{key}.inc.variants.jsonl"
         inc_stats = cache_dir / f"{key}.inc.stats.bin"
+        region_variant_paths = [
+            Path(f"{str(geno_file).removesuffix('.geno')}.variants.npz")
+            for geno_file in geno_files
+        ]
         n_total = 0
-        with open(inc_geno, "wb") as gout, open(inc_var, "w") as vout, open(inc_stats, "wb") as sout:
+        with open(inc_geno, "wb") as gout, open(inc_stats, "wb") as sout:
             for geno_file in geno_files:
                 prefix = str(geno_file).removesuffix(".geno")
                 with open(f"{prefix}.geno", "rb") as f:
                     shutil.copyfileobj(f, gout)
-                with open(f"{prefix}.var") as f:
-                    vout.write(f.read())
                 with open(f"{prefix}.stats", "rb") as f:
                     data = f.read()
                     sout.write(data)
@@ -1826,21 +1740,9 @@ def precache_vcfs_parallel(
         # Load incremental binary via memmap (zero copy)
         inc_matrix = np.memmap(inc_geno, dtype=np.int8, mode="r", shape=(n_total, actual_n_keep)).T
 
-        # Load variant metadata from JSONL
-        import json as _json_mod
         inc_variants: list[_VariantDefaults] = []
-        with open(inc_var) as vf:
-            for line in vf:
-                d = _json_mod.loads(line)
-                inc_variants.append(_VariantDefaults(
-                    variant_id=d["variant_id"],
-                    variant_class=VariantClass(d["variant_class"]),
-                    chromosome=d["chromosome"],
-                    position=d["position"],
-                    length=d["length"],
-                    allele_frequency=d["allele_frequency"],
-                    quality=d["quality"],
-                ))
+        for region_variant_path in region_variant_paths:
+            inc_variants.extend(_load_variant_metadata(region_variant_path))
 
         # Load stats via structured dtype
         stats_dtype = np.dtype([("sum", "<i8"), ("sum_sq", "<i8"), ("n_valid", "<i4"), ("support", "<i4")])
@@ -1862,7 +1764,7 @@ def precache_vcfs_parallel(
         del inc_matrix
 
         # Clean up incremental files
-        for p in (inc_geno, inc_var, inc_stats):
+        for p in (inc_geno, inc_stats, *region_variant_paths):
             p.unlink(missing_ok=True)
 
         # Clean up temp region files
@@ -1906,7 +1808,6 @@ def _load_vcf_incremental(
     mmap_mode: Literal["r", "r+", "w+", "c"],
 ) -> tuple[np.ndarray, list[_VariantDefaults], VariantStatistics]:
     """Parse VCF with incremental checkpointing. Resumes from last checkpoint if interrupted."""
-    import json as _json
     import os
     import struct
     import time
@@ -1917,21 +1818,17 @@ def _load_vcf_incremental(
 
     # Incremental files
     geno_bin = cache_dir / f"{key}.inc.genotypes.bin"
-    var_jsonl = cache_dir / f"{key}.inc.variants.jsonl"
     stats_bin = cache_dir / f"{key}.inc.stats.bin"  # 4 int32/int64 values per variant
     progress_file = cache_dir / f"{key}.inc.progress.json"
 
     # Check for existing progress
     n_cached = 0
-    resume_chrom: str | None = None
-    resume_pos: int = 0
+    metadata_chunk_count = 0
     if progress_file.exists():
         try:
-            prog = _json.loads(progress_file.read_text())
+            prog = json.loads(progress_file.read_text(encoding="utf-8"))
             n_cached = int(prog["n_variants"])
-            resume_chrom = prog.get("resume_chrom")
-            resume_pos = int(prog.get("resume_pos", 0))
-            # Truncate ALL incremental files to exact checkpoint (guard against partial writes)
+            metadata_chunk_count = int(prog.get("metadata_chunk_count", 0))
             expected_geno_bytes = n_cached * n_keep
             expected_stats_bytes = n_cached * 24  # struct "<qqii" = 24 bytes
             if geno_bin.exists() and geno_bin.stat().st_size > expected_geno_bytes:
@@ -1940,21 +1837,23 @@ def _load_vcf_incremental(
             if stats_bin.exists() and stats_bin.stat().st_size > expected_stats_bytes:
                 with open(stats_bin, "r+b") as f:
                     f.truncate(expected_stats_bytes)
-            if var_jsonl.exists():
-                # Truncate JSONL to exactly n_cached lines
-                lines = var_jsonl.read_text().splitlines()[:n_cached]
-                var_jsonl.write_text("\n".join(lines) + "\n" if lines else "")
-            log(f"  incremental cache: resuming from {n_cached} variants (last pos: {resume_chrom}:{resume_pos})")
+            chunk_paths = _iter_incremental_variant_chunk_paths(cache_dir, key)
+            if len(chunk_paths) < metadata_chunk_count:
+                raise ValueError("missing variant metadata chunks for incremental resume")
+            for chunk_path in chunk_paths[metadata_chunk_count:]:
+                chunk_path.unlink(missing_ok=True)
+            log(f"  incremental cache: resuming from {n_cached} variants ({metadata_chunk_count} metadata chunks)")
         except Exception as exc:
             log(f"  incremental cache progress corrupt ({exc}), starting fresh")
             n_cached = 0
-            for p in (geno_bin, var_jsonl, stats_bin, progress_file):
+            metadata_chunk_count = 0
+            for p in (geno_bin, stats_bin, progress_file, *_iter_incremental_variant_chunk_paths(cache_dir, key)):
                 try:
                     p.unlink(missing_ok=True)
                 except Exception:
                     pass
     else:
-        for p in (geno_bin, var_jsonl, stats_bin):
+        for p in (geno_bin, stats_bin, progress_file, *_iter_incremental_variant_chunk_paths(cache_dir, key)):
             p.unlink(missing_ok=True)
 
     # Reuse the reader opened above for sample IDs
@@ -1981,15 +1880,17 @@ def _load_vcf_incremental(
     if n_cached > 0:
         geno_fh.seek(n_cached * n_keep)
         stats_fh.seek(n_cached * 24)
-    var_fh: TextIO = open(var_jsonl, "a", encoding="utf-8")
-    # Stats: 4 values per variant (sum_i64, sum_sq_i64, n_valid_i32, support_i32) = 24 bytes
 
     t_start = time.monotonic()
     last_log_time = t_start
     last_chrom = None
     variant_index = 0
-    variants_since_checkpoint = 0
+    bytes_since_checkpoint = 0
+    metadata_chunk_index = metadata_chunk_count
+    buffered_variants: list[_VariantDefaults] = []
+    last_record_coordinates: tuple[str, int] | None = None
     _monotonic = time.monotonic
+    checkpoint_started_at = t_start
 
     # Skip already-cached records
     if n_cached > 0:
@@ -2005,15 +1906,53 @@ def _load_vcf_incremental(
         variant_index = n_cached
         t_start = time.monotonic()
         last_log_time = t_start
+        checkpoint_started_at = t_start
+
+    def _clear_incremental_artifacts() -> None:
+        for path in (geno_bin, stats_bin, progress_file, *_iter_incremental_variant_chunk_paths(cache_dir, key)):
+            path.unlink(missing_ok=True)
 
     def _abort_incremental_load(message: str) -> None:
         geno_fh.close()
-        var_fh.close()
         stats_fh.close()
         reader.close()
-        for path in (geno_bin, var_jsonl, stats_bin, progress_file):
-            path.unlink(missing_ok=True)
+        _clear_incremental_artifacts()
         raise ValueError(message)
+
+    def _flush_incremental_checkpoint(*, force: bool = False) -> None:
+        nonlocal buffered_variants
+        nonlocal bytes_since_checkpoint
+        nonlocal checkpoint_started_at
+        nonlocal metadata_chunk_index
+        if not buffered_variants and not force:
+            return
+        elapsed = _monotonic() - checkpoint_started_at
+        if not force and bytes_since_checkpoint < _INCREMENTAL_CHECKPOINT_BYTE_INTERVAL and elapsed < _INCREMENTAL_CHECKPOINT_TIME_SECONDS:
+            return
+        geno_fh.flush()
+        stats_fh.flush()
+        if buffered_variants:
+            _write_variant_metadata(
+                _incremental_variant_chunk_path(cache_dir, key, metadata_chunk_index),
+                buffered_variants,
+            )
+            metadata_chunk_index += 1
+            buffered_variants = []
+        resume_chrom, resume_pos = last_record_coordinates if last_record_coordinates is not None else (None, 0)
+        _atomic_write_text(
+            progress_file,
+            json.dumps(
+                {
+                    "n_variants": variant_index,
+                    "n_samples": n_keep,
+                    "resume_chrom": resume_chrom,
+                    "resume_pos": resume_pos,
+                    "metadata_chunk_count": metadata_chunk_index,
+                }
+            ),
+        )
+        bytes_since_checkpoint = 0
+        checkpoint_started_at = _monotonic()
 
     # Parse remaining variants
     for record in reader:
@@ -2036,36 +1975,20 @@ def _load_vcf_incremental(
         n_valid = observed.shape[0]
         support = int(np.count_nonzero(observed > 0))
 
-        # Write stats (fixed 24 bytes per variant)
         stats_fh.write(struct.pack("<qqii", dosage_sum, dosage_sum_sq, n_valid, support))
-
-        # Write variant metadata
         vd = _variant_defaults_from_vcf_record(record)
-        var_fh.write(_json.dumps({
-            "variant_id": vd.variant_id, "variant_class": vd.variant_class.value,
-            "chromosome": vd.chromosome, "position": vd.position,
-            "length": vd.length, "allele_frequency": vd.allele_frequency,
-            "quality": vd.quality,
-        }) + "\n")
+        buffered_variants.append(vd)
+        last_record_coordinates = (str(record.CHROM), int(record.POS))
 
         variant_index += 1
-        variants_since_checkpoint += 1
-
-        # Periodic checkpoint
-        if variants_since_checkpoint >= _INCREMENTAL_CHECKPOINT_INTERVAL:
-            geno_fh.flush()
-            var_fh.flush()
-            stats_fh.flush()
-            os.fsync(geno_fh.fileno())
-            os.fsync(var_fh.fileno())
-            os.fsync(stats_fh.fileno())
-            _atomic_write_text(progress_file, _json.dumps({
-                "n_variants": variant_index,
-                "n_samples": n_keep,
-                "resume_chrom": str(record.CHROM),
-                "resume_pos": int(record.POS),
-            }))
-            variants_since_checkpoint = 0
+        bytes_since_checkpoint += int(
+            int8_col.nbytes
+            + 24
+            + len(vd.variant_id.encode("utf-8"))
+            + len(vd.chromosome.encode("utf-8"))
+            + 32
+        )
+        _flush_incremental_checkpoint()
 
         # Progress log
         now = _monotonic()
@@ -2081,11 +2004,10 @@ def _load_vcf_incremental(
             last_log_time = now
 
     # Final flush
+    _flush_incremental_checkpoint(force=True)
     geno_fh.flush()
-    var_fh.flush()
     stats_fh.flush()
     geno_fh.close()
-    var_fh.close()
     stats_fh.close()
     reader.close()
 
@@ -2103,21 +2025,13 @@ def _load_vcf_incremental(
     new_variants = n_total - n_cached
     log(f"  parsed {new_variants} new variants in {elapsed:.1f}s ({n_total} total)")
 
-    # Load variant metadata
-    import json as _json2
     variants: list[_VariantDefaults] = []
-    with open(var_jsonl, encoding="utf-8") as var_read_handle:
-        for line in var_read_handle:
-            d = _json2.loads(line)
-            variants.append(_VariantDefaults(
-                variant_id=d["variant_id"],
-                variant_class=VariantClass(d["variant_class"]),
-                chromosome=d["chromosome"],
-                position=d["position"],
-                length=d["length"],
-                allele_frequency=d["allele_frequency"],
-                quality=d["quality"],
-            ))
+    metadata_chunk_paths = _iter_incremental_variant_chunk_paths(cache_dir, key)
+    for metadata_chunk_path in metadata_chunk_paths:
+        variants.extend(_load_variant_metadata(metadata_chunk_path))
+    if len(variants) != n_total:
+        _clear_incremental_artifacts()
+        raise ValueError(f"incremental metadata mismatch: expected {n_total} variants, found {len(variants)}")
 
     # Load stats via numpy structured dtype — no Python loop
     stats_dtype = np.dtype([
@@ -2160,7 +2074,7 @@ def _load_vcf_incremental(
     del incremental_matrix
 
     # Clean up incremental files after the final cache is complete.
-    for p in (geno_bin, var_jsonl, stats_bin, progress_file):
+    for p in (geno_bin, stats_bin, progress_file, *metadata_chunk_paths):
         try:
             p.unlink(missing_ok=True)
         except Exception:
@@ -2233,8 +2147,7 @@ def _save_vcf_to_cache(
             genotype_memmap[:, start_index:stop_index] = genotype_matrix_i8[:, start_index:stop_index]
         genotype_memmap.flush()
         del genotype_memmap
-        with open(str(var_tmp), "wb") as f:
-            pickle.dump(variants, f, protocol=pickle.HIGHEST_PROTOCOL)
+        _write_variant_metadata(var_tmp, variants)
         _write_vcf_cache_stats(stats_tmp, variant_stats)
         _atomic_write_text(
             manifest_tmp,
@@ -2254,10 +2167,6 @@ def _save_vcf_to_cache(
         var_tmp.replace(paths.var_path)
         stats_tmp.replace(paths.stats_path)
         manifest_tmp.replace(paths.manifest_path)
-        try:
-            paths.legacy_stats_path.unlink(missing_ok=True)
-        except Exception:
-            pass
         bundle_dir.rmdir()
         total_mb = (
             paths.geno_path.stat().st_size
@@ -2536,13 +2445,15 @@ def _write_delimited_rows(
     header: Sequence[str],
     rows: Iterable[Sequence[str]],
 ) -> None:
-    with path.open("w", encoding="utf-8", newline="") as handle:
+    with _open_text_file(path, "wt", newline="") as handle:
         writer = csv.writer(handle, delimiter="\t")
         writer.writerow(header)
         writer.writerows(rows)
+
+
 def _inspect_delimited_table(path: str | Path) -> _DelimitedTableSpec:
     resolved_path = Path(path)
-    with resolved_path.open("r", encoding="utf-8", newline="") as handle:
+    with _open_text_file(resolved_path, "rt", newline="") as handle:
         sample = handle.read(4096)
         handle.seek(0)
         delimiter = _infer_delimiter(sample)
@@ -2568,7 +2479,7 @@ def _iter_delimited_rows(table_spec: _DelimitedTableSpec) -> Iterator[dict[str, 
 
 
 def _iter_delimited_row_values(table_spec: _DelimitedTableSpec) -> Iterator[list[str]]:
-    with table_spec.path.open("r", encoding="utf-8", newline="") as handle:
+    with _open_text_file(table_spec.path, "rt", newline="") as handle:
         reader = csv.reader(handle, delimiter=table_spec.delimiter)
         next(reader, None)
         expected_width = len(table_spec.columns)

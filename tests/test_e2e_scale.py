@@ -341,8 +341,8 @@ def test_artifact_roundtrip_preserves_full_variant_metadata(tmp_path: Path):
     save_artifact(artifact_path, artifact)
     restored_artifact = load_artifact(artifact_path)
 
-    assert restored_artifact.variant_metadata.variant_ids == ["latent_0", "latent_1"]
-    assert restored_artifact.variant_metadata.variant_classes == [
+    assert [record.variant_id for record in restored_artifact.records] == ["latent_0", "latent_1"]
+    assert [record.variant_class for record in restored_artifact.records] == [
         VariantClass.OTHER_COMPLEX_SV,
         VariantClass.SNV,
     ]

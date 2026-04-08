@@ -32,6 +32,7 @@ from sv_pgs.mixture_inference import (
     _restricted_precision_projector,
     ScaleModelFeatureSpec,
     _sample_space_preconditioner,
+    _solve_sample_space_rhs_gpu,
     _solve_sample_space_rhs_cpu,
     _stochastic_restricted_cross_leverage_diagonal,
     _restricted_variant_space_operator,
@@ -127,7 +128,7 @@ def test_quantitative_inference_runs_with_stochastic_variant_updates(random_gene
     assert result.objective_history
 
 
-def test_temporary_working_set_restricted_posterior_matches_full_solution(random_generator):
+def test_posterior_working_set_restricted_posterior_matches_full_solution(random_generator):
     sample_count, variant_count = 32, 12
     genotype_values = random_generator.standard_normal((sample_count, variant_count)).astype(np.float32)
     covariate_matrix = np.column_stack(
@@ -161,7 +162,7 @@ def test_temporary_working_set_restricted_posterior_matches_full_solution(random
         compute_logdet=False,
         compute_beta_variance=False,
         initial_beta_guess=initial_beta,
-        temporary_working_sets=False,
+        posterior_working_sets=False,
     )
     working_result = _restricted_posterior_state(
         genotype_matrix=standardized,
@@ -180,12 +181,12 @@ def test_temporary_working_set_restricted_posterior_matches_full_solution(random
         compute_logdet=False,
         compute_beta_variance=False,
         initial_beta_guess=initial_beta,
-        temporary_working_sets=True,
-        temporary_working_set_min_variants=1,
-        temporary_working_set_initial_size=3,
-        temporary_working_set_growth=3,
-        temporary_working_set_max_passes=8,
-        temporary_working_set_coefficient_tolerance=0.0,
+        posterior_working_sets=True,
+        posterior_working_set_min_variants=1,
+        posterior_working_set_initial_size=3,
+        posterior_working_set_growth=3,
+        posterior_working_set_max_passes=8,
+        posterior_working_set_coefficient_tolerance=0.0,
     )
 
     for working_value, full_value in zip(working_result[:6], full_result[:6]):
@@ -194,6 +195,84 @@ def test_temporary_working_set_restricted_posterior_matches_full_solution(random
             np.asarray(full_value, dtype=np.float64),
             rtol=1e-5,
             atol=1e-5,
+        )
+
+
+def test_posterior_working_set_falls_back_to_exact_solver_when_uncertified(random_generator, monkeypatch):
+    sample_count, variant_count = 12, 4
+    genotype_values = random_generator.standard_normal((sample_count, variant_count)).astype(np.float32)
+    covariate_matrix = np.ones((sample_count, 1), dtype=np.float64)
+    targets = (1.2 * genotype_values[:, 0] - 0.8 * genotype_values[:, 1]).astype(np.float64)
+    prior_variances = np.full(variant_count, 0.7, dtype=np.float64)
+    diagonal_noise = np.full(sample_count, 1.0, dtype=np.float64)
+
+    standardized = as_raw_genotype_matrix(genotype_values).standardized(
+        means=np.zeros(variant_count, dtype=np.float32),
+        scales=np.ones(variant_count, dtype=np.float32),
+    )
+    standardized._dense_cache = standardized.materialize()
+
+    original_update_score = mixture_inference._working_set_posterior_update_score
+
+    def force_failed_certification(gradient: np.ndarray, prior_variances: np.ndarray) -> np.ndarray:
+        update_score = np.asarray(original_update_score(gradient, prior_variances), dtype=np.float64)
+        update_score[1:] += 1.0
+        return update_score
+
+    monkeypatch.setattr(
+        mixture_inference,
+        "_working_set_posterior_update_score",
+        force_failed_certification,
+    )
+
+    full_result = _restricted_posterior_state(
+        genotype_matrix=standardized,
+        covariate_matrix=covariate_matrix,
+        targets=targets,
+        prior_variances=prior_variances,
+        diagonal_noise=diagonal_noise,
+        solver_tolerance=1e-8,
+        maximum_linear_solver_iterations=256,
+        logdet_probe_count=4,
+        logdet_lanczos_steps=6,
+        exact_solver_matrix_limit=4,
+        posterior_variance_batch_size=4,
+        posterior_variance_probe_count=4,
+        random_seed=0,
+        compute_logdet=False,
+        compute_beta_variance=False,
+        posterior_working_sets=False,
+    )
+    working_result = _restricted_posterior_state(
+        genotype_matrix=standardized,
+        covariate_matrix=covariate_matrix,
+        targets=targets,
+        prior_variances=prior_variances,
+        diagonal_noise=diagonal_noise,
+        solver_tolerance=1e-8,
+        maximum_linear_solver_iterations=256,
+        logdet_probe_count=4,
+        logdet_lanczos_steps=6,
+        exact_solver_matrix_limit=4,
+        posterior_variance_batch_size=4,
+        posterior_variance_probe_count=4,
+        random_seed=0,
+        compute_logdet=False,
+        compute_beta_variance=False,
+        posterior_working_sets=True,
+        posterior_working_set_min_variants=1,
+        posterior_working_set_initial_size=1,
+        posterior_working_set_growth=1,
+        posterior_working_set_max_passes=1,
+        posterior_working_set_coefficient_tolerance=0.0,
+    )
+
+    for working_value, full_value in zip(working_result[:6], full_result[:6]):
+        np.testing.assert_allclose(
+            np.asarray(working_value, dtype=np.float64),
+            np.asarray(full_value, dtype=np.float64),
+            rtol=1e-6,
+            atol=1e-6,
         )
 
 
@@ -211,7 +290,7 @@ def test_posterior_working_set_keeps_ever_active_variants():
     assert working_indices.shape == (3,)
 
 
-def test_temporary_working_set_warm_start_tracks_ever_active_support(random_generator):
+def test_posterior_working_set_warm_start_tracks_ever_active_support(random_generator):
     sample_count, variant_count = 36, 14
     genotype_values = random_generator.standard_normal((sample_count, variant_count)).astype(np.float32)
     targets = (
@@ -244,22 +323,22 @@ def test_temporary_working_set_warm_start_tracks_ever_active_support(random_gene
         compute_beta_variance=False,
         initial_beta_guess=np.zeros(variant_count, dtype=np.float64),
         warm_start=warm_start,
-        temporary_working_sets=True,
-        temporary_working_set_min_variants=1,
-        temporary_working_set_initial_size=2,
-        temporary_working_set_growth=2,
-        temporary_working_set_max_passes=8,
-        temporary_working_set_coefficient_tolerance=0.0,
+        posterior_working_sets=True,
+        posterior_working_set_min_variants=1,
+        posterior_working_set_initial_size=2,
+        posterior_working_set_growth=2,
+        posterior_working_set_max_passes=8,
+        posterior_working_set_coefficient_tolerance=0.0,
     )
 
-    assert warm_start.temporary_working_set_variant_count == variant_count
-    assert warm_start.temporary_working_set_ever_active is not None
-    assert warm_start.temporary_working_set_ever_active.size > 0
+    assert warm_start.posterior_working_set_variant_count == variant_count
+    assert warm_start.posterior_working_set_ever_active is not None
+    assert warm_start.posterior_working_set_ever_active.size > 0
     active_support = np.flatnonzero(np.abs(np.asarray(result[1], dtype=np.float64)) > 1e-10)
-    assert set(active_support.tolist()).issubset(set(warm_start.temporary_working_set_ever_active.tolist()))
+    assert set(active_support.tolist()).issubset(set(warm_start.posterior_working_set_ever_active.tolist()))
 
 
-def test_temporary_working_set_warm_start_resets_for_new_matrix_with_same_width(random_generator):
+def test_posterior_working_set_warm_start_resets_for_new_matrix_with_same_width(random_generator):
     sample_count, variant_count = 20, 8
     first_genotype_values = random_generator.standard_normal((sample_count, variant_count)).astype(np.float32)
     second_genotype_values = random_generator.standard_normal((sample_count, variant_count)).astype(np.float32)
@@ -272,20 +351,20 @@ def test_temporary_working_set_warm_start_resets_for_new_matrix_with_same_width(
         scales=np.ones(variant_count, dtype=np.float32),
     )
     warm_start = mixture_inference._RestrictedPosteriorWarmStart(
-        temporary_working_set_variant_count=variant_count,
-        temporary_working_set_matrix_token=id(first_standardized),
-        temporary_working_set_ever_active=np.array([1, 3, 5], dtype=np.int32),
+        posterior_working_set_variant_count=variant_count,
+        posterior_working_set_matrix_token=id(first_standardized),
+        posterior_working_set_ever_active=np.array([1, 3, 5], dtype=np.int32),
     )
 
-    mixture_inference._reset_temporary_working_set_warm_start(
+    mixture_inference._reset_posterior_working_set_warm_start(
         warm_start=warm_start,
         genotype_matrix=second_standardized,
         variant_count=variant_count,
     )
 
-    assert warm_start.temporary_working_set_variant_count == variant_count
-    assert warm_start.temporary_working_set_matrix_token == id(second_standardized)
-    assert warm_start.temporary_working_set_ever_active is None
+    assert warm_start.posterior_working_set_variant_count == variant_count
+    assert warm_start.posterior_working_set_matrix_token == id(second_standardized)
+    assert warm_start.posterior_working_set_ever_active is None
 
 
 def test_binary_inference_runs_with_stochastic_variant_updates(random_generator):
@@ -3117,10 +3196,12 @@ def test_exact_variant_gpu_summary_path_matches_dense_reference(monkeypatch: pyt
     fake_cupy.float32 = np.float32
     fake_cupy.float64 = np.float64
     fake_cupy.asarray = lambda array, dtype=None: np.asarray(array, dtype=dtype)
+    fake_cupy.arange = np.arange
     fake_cupy.empty = lambda shape, dtype=None, order=None: (
         empty_dtypes.append(dtype),
         np.empty(shape, dtype=dtype, order="C" if order is None else order),
     )[1]
+    fake_cupy.zeros = np.zeros
     fake_cupy.eye = np.eye
     fake_cupy.diag = np.diag
     fake_cupy.linalg = types.SimpleNamespace(cholesky=np.linalg.cholesky)
@@ -3164,6 +3245,50 @@ def test_exact_variant_gpu_summary_path_matches_dense_reference(monkeypatch: pyt
             np.asarray(dense_value, dtype=np.float64),
             rtol=1e-5,
             atol=1e-5,
+        )
+
+
+def test_gpu_sample_space_solver_rejects_near_converged_residual(monkeypatch: pytest.MonkeyPatch):
+    genotype_values = np.eye(3, dtype=np.float32)
+    standardized = as_raw_genotype_matrix(genotype_values).standardized(
+        means=np.zeros(3, dtype=np.float32),
+        scales=np.ones(3, dtype=np.float32),
+    )
+    standardized._cupy_cache = standardized.materialize().astype(np.float32, copy=False)
+    standardized._dense_cache = None
+
+    fake_cupy: Any = types.ModuleType("cupy")
+    fake_cupy.float32 = np.float32
+    fake_cupy.float64 = np.float64
+    fake_cupy.asarray = lambda array, dtype=None: np.asarray(array, dtype=dtype)
+    fake_cupy.zeros = np.zeros
+    fake_cupy.sum = np.sum
+
+    monkeypatch.setitem(sys.modules, "cupy", fake_cupy)
+    monkeypatch.setattr(mixture_inference, "_try_import_cupy", lambda: fake_cupy)
+    monkeypatch.setattr(mixture_inference, "_cupy_compute_dtype", lambda cp: cp.float32)
+    monkeypatch.setattr(
+        mixture_inference,
+        "_apply_sample_space_operator_gpu",
+        lambda **kwargs: np.asarray(kwargs["matrix_gpu"], dtype=np.float64),
+    )
+    monkeypatch.setattr(
+        mixture_inference,
+        "_solve_sample_space_rhs_gpu_inner",
+        lambda **kwargs: (np.zeros_like(np.asarray(kwargs["right_hand_side_gpu"], dtype=np.float64)), 1),
+    )
+
+    with pytest.raises(RuntimeError, match="failed to converge after iterative refinement"):
+        _solve_sample_space_rhs_gpu(
+            genotype_matrix=standardized,
+            prior_variances=np.ones(3, dtype=np.float64),
+            diagonal_noise=np.ones(3, dtype=np.float64),
+            right_hand_side=np.ones(3, dtype=np.float64),
+            initial_guess=None,
+            tolerance=0.9,
+            max_iterations=2,
+            preconditioner=None,
+            batch_size=2,
         )
 
 

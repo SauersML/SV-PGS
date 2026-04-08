@@ -11,9 +11,9 @@ import numpy as np
 
 import sv_pgs._jax  # noqa: F401
 
-from sv_pgs.artifact import ModelArtifact, VariantMetadataTable, load_artifact, save_artifact
-from sv_pgs.config import ModelConfig, TraitType, VariantClass
-from sv_pgs.data import TieGroup, TieMap, VariantRecord, VariantStatistics, normalize_variant_records
+from sv_pgs.artifact import ModelArtifact, load_artifact, save_artifact
+from sv_pgs.config import ModelConfig, TraitType
+from sv_pgs.data import TieGroup, TieMap, VariantRecord, VariantStatistics, normalize_variant_record
 from sv_pgs.genotype import (
     ConcatenatedRawGenotypeMatrix,
     DenseRawGenotypeMatrix,
@@ -50,7 +50,6 @@ def _select_active_variant_indices_fast(
 class FittedState:
     variant_records: list[VariantRecord]
     full_variant_records: list[VariantRecord]
-    full_variant_metadata: VariantMetadataTable
     active_variant_indices: np.ndarray
     preprocessor: Preprocessor
     tie_map: TieMap
@@ -65,17 +64,15 @@ class FittedState:
     training_linear_predictor: np.ndarray | None = None
 
     def __post_init__(self) -> None:
-        variant_count = len(self.full_variant_metadata)
-        if len(self.full_variant_records) != variant_count:
-            raise ValueError("full_variant_records must align with full_variant_metadata.")
+        variant_count = len(self.full_variant_records)
         if self.full_coefficients.shape != (variant_count,):
-            raise ValueError("full_coefficients must align with full_variant_metadata.")
+            raise ValueError("full_coefficients must align with full_variant_records.")
         if self.preprocessor.means.shape != (variant_count,):
-            raise ValueError("Preprocessor means must align with full_variant_metadata.")
+            raise ValueError("Preprocessor means must align with full_variant_records.")
         if self.preprocessor.scales.shape != (variant_count,):
-            raise ValueError("Preprocessor scales must align with full_variant_metadata.")
+            raise ValueError("Preprocessor scales must align with full_variant_records.")
         if self.tie_map.original_to_reduced.shape != (variant_count,):
-            raise ValueError("tie_map must align with full_variant_metadata.")
+            raise ValueError("tie_map must align with full_variant_records.")
         training_arrays = (
             self.training_genetic_score,
             self.training_covariate_score,
@@ -155,29 +152,6 @@ def _validate_fit_inputs(
         raise ValueError("variant_stats.allele_frequencies must be finite and lie in [0.0, 1.0].")
     if np.any(np.asarray(variant_stats.support_counts) < 0):
         raise ValueError("variant_stats.support_counts must be non-negative.")
-
-
-def _variant_metadata_from_records(
-    records: Sequence[VariantRecord | dict[str, object]],
-) -> VariantMetadataTable:
-    variant_ids: list[str] = []
-    variant_classes: list[VariantClass] = []
-    for record in records:
-        if isinstance(record, VariantRecord):
-            variant_ids.append(record.variant_id)
-            variant_classes.append(record.variant_class)
-            continue
-        variant_ids.append(str(record["variant_id"]))
-        raw_variant_class = record["variant_class"]
-        if isinstance(raw_variant_class, VariantClass):
-            variant_classes.append(raw_variant_class)
-        else:
-            variant_classes.append(VariantClass(str(raw_variant_class)))
-    return VariantMetadataTable(
-        variant_ids=variant_ids,
-        variant_classes=variant_classes,
-    )
-
 
 def _fit_stage_cache_paths(
     genotype_matrix: RawGenotypeMatrix,
@@ -542,12 +516,7 @@ class BayesianPGS:
             variant_records=variant_records,
             variant_stats=variant_stats,
         )
-        full_variant_records = [
-            record
-            if isinstance(record, VariantRecord)
-            else normalize_variant_records([record])[0]
-            for record in variant_records
-        ]
+        full_variant_records = [normalize_variant_record(record) for record in variant_records]
         tuned_config, tuning_summary = _runtime_tuned_config_for_fit(
             config=self.config,
             genotype_matrix=raw_genotype_matrix,
@@ -557,9 +526,7 @@ class BayesianPGS:
             log(tuning_summary)
         covariate_matrix = self._with_intercept(covariates)
         total_variant_count = len(variant_records)
-        log(f"building variant metadata for {total_variant_count:,} records...  mem={mem()}")
-        full_variant_metadata = _variant_metadata_from_records(full_variant_records)
-        log(f"variant metadata ready  mem={mem()}")
+        log(f"normalized full variant records: {total_variant_count:,}  mem={mem()}")
 
         # Use pre-computed stats if available (saves 3 full data passes)
         if variant_stats is not None:
@@ -647,7 +614,6 @@ class BayesianPGS:
             self.state = FittedState(
                 variant_records=[],
                 full_variant_records=full_variant_records,
-                full_variant_metadata=full_variant_metadata,
                 active_variant_indices=np.zeros(0, dtype=np.int32),
                 preprocessor=preprocessor,
                 tie_map=_empty_tie_map(total_variant_count),
@@ -670,17 +636,17 @@ class BayesianPGS:
         # Create VariantRecord objects ONLY for active variants (not all 1.68M)
         # This saves ~840 MB of Python object overhead
         log(f"creating training records for {len(active_variant_indices)} active variants...")
-        active_selection_records = normalize_variant_records(
-            [full_variant_records[int(i)] for i in active_variant_indices]
-        )
         active_stats = VariantStatistics(
             means=variant_stats.means[active_variant_indices],
             scales=variant_stats.scales[active_variant_indices],
             allele_frequencies=variant_stats.allele_frequencies[active_variant_indices],
             support_counts=variant_stats.support_counts[active_variant_indices],
         )
-        active_records = _training_records_from_stats(active_selection_records, active_stats)
-        del active_selection_records, active_stats
+        active_records = _training_records_from_stats(
+            [full_variant_records[int(i)] for i in active_variant_indices],
+            active_stats,
+        )
+        del active_stats
         import gc
         gc.collect()
         log(f"active training records created: {len(active_records)}  mem={mem()}")
@@ -856,7 +822,6 @@ class BayesianPGS:
         self.state = FittedState(
             variant_records=active_records,
             full_variant_records=full_variant_records,
-            full_variant_metadata=full_variant_metadata,
             active_variant_indices=active_variant_indices,
             preprocessor=preprocessor,
             tie_map=original_space_tie_map,
@@ -959,7 +924,6 @@ class BayesianPGS:
         loaded_model.state = FittedState(
             variant_records=[],
             full_variant_records=artifact.records,
-            full_variant_metadata=artifact.variant_metadata,
             active_variant_indices=np.where(artifact.tie_map.original_to_reduced >= 0)[0].astype(np.int32),
             preprocessor=Preprocessor(means=artifact.means, scales=artifact.scales),
             tie_map=artifact.tie_map,
@@ -1006,8 +970,8 @@ class BayesianPGS:
         fitted_state = self._require_state()
         if minimum_abs_beta < 0.0:
             raise ValueError("minimum_abs_beta must be non-negative.")
-        if len(fitted_state.full_variant_metadata) != len(fitted_state.full_coefficients):
-            raise ValueError("Full variant metadata must align with full_coefficients.")
+        if len(fitted_state.full_variant_records) != len(fitted_state.full_coefficients):
+            raise ValueError("Full variant records must align with full_coefficients.")
         if nonzero_only:
             if minimum_abs_beta == 0.0:
                 row_indices = fitted_state.nonzero_coefficient_indices
@@ -1023,8 +987,8 @@ class BayesianPGS:
             row_indices = np.arange(len(fitted_state.full_coefficients), dtype=np.int32)
         return [
             {
-                "variant_id": fitted_state.full_variant_metadata.variant_ids[int(row_index)],
-                "variant_class": fitted_state.full_variant_metadata.variant_classes[int(row_index)].value,
+                "variant_id": fitted_state.full_variant_records[int(row_index)].variant_id,
+                "variant_class": fitted_state.full_variant_records[int(row_index)].variant_class.value,
                 "beta": float(fitted_state.full_coefficients[int(row_index)]),
             }
             for row_index in row_indices

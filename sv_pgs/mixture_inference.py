@@ -4023,25 +4023,17 @@ def _solve_sample_space_rhs_gpu(
     final_residual = float(np.max(residual_norm_sq))
     final_threshold = float(np.max(convergence_threshold_sq))
     if final_residual > final_threshold:
-        # Allow up to 10x tolerance overshoot — close enough for iterative methods.
-        # For stochastic blocks, exact convergence is unnecessary.
-        if final_residual > final_threshold * 100.0:
-            failure_suffix = (
-                f" last_mixed_precision_error={mixed_precision_failure}"
-                if mixed_precision_failure is not None
-                else ""
-            )
-            raise RuntimeError(
-                "GPU conjugate-gradient solve failed to converge after iterative refinement: "
-                + f"residual={final_residual:.2e} threshold={final_threshold:.2e} "
-                + f"iterations={max_iterations} refinement_steps={max_refinement_steps}"
+        failure_suffix = (
+            f" last_mixed_precision_error={mixed_precision_failure}"
+            if mixed_precision_failure is not None
+            else ""
+        )
+        raise RuntimeError(
+            "GPU conjugate-gradient solve failed to converge after iterative refinement: "
+            + f"residual={final_residual:.2e} threshold={final_threshold:.2e} "
+            + f"iterations={max_iterations} refinement_steps={max_refinement_steps}"
             + failure_suffix
-            )
-        else:
-            log(
-                f"      GPU CG near-converged: residual={final_residual:.2e} threshold={final_threshold:.2e} "
-                + "(within 10x, accepting approximate solution)"
-            )
+        )
     solution = np.asarray(solution_gpu64.get() if hasattr(solution_gpu64, "get") else solution_gpu64, dtype=np.float64)
     resolved_solution = solution[:, 0] if vector_input else solution
     if return_iterations:
@@ -4822,36 +4814,45 @@ def _restricted_posterior_state_posterior_working_set(
             + f"next_size={working_indices.shape[0]}/{variant_count})"
         )
 
-    # Accept the last working-set solution rather than falling back to a
-    # catastrophic full solve on all variants.  The working set grew across
-    # passes and the last solution is the best we have — a full solve on
-    # 222K variants would take hours and likely OOM.
     log(
-        "    working set exhausted max passes; accepting last solution "
-        + f"(size={working_indices.shape[0]}/{variant_count}, "
+        "    working set exhausted max passes; retrying exact restricted solve "
+        + f"(last_size={working_indices.shape[0]}/{variant_count}, "
         + f"max_excluded_update={max_excluded_update:.2e})"
     )
-    alpha = np.asarray(
-        _cholesky_solve(
-            covariate_precision_cholesky,
-            covariate_matrix.T @ (inverse_diagonal_noise * (targets - genetic_linear_predictor)),
-        ),
-        dtype=np.float64,
+    exact_result = _restricted_posterior_state(
+        genotype_matrix=genotype_matrix,
+        covariate_matrix=covariate_matrix,
+        targets=targets,
+        prior_variances=prior_variances,
+        diagonal_noise=1.0 / np.maximum(inverse_diagonal_noise, 1e-12),
+        solver_tolerance=solver_tolerance,
+        maximum_linear_solver_iterations=maximum_linear_solver_iterations,
+        logdet_probe_count=1,
+        logdet_lanczos_steps=2,
+        exact_solver_matrix_limit=exact_solver_matrix_limit,
+        posterior_variance_batch_size=posterior_variance_batch_size,
+        posterior_variance_probe_count=1,
+        random_seed=random_seed + max(int(posterior_working_set_max_passes), 1),
+        compute_logdet=False,
+        compute_beta_variance=False,
+        initial_beta_guess=current_beta,
+        sample_space_preconditioner_rank=sample_space_preconditioner_rank,
+        warm_start=warm_start,
+        posterior_working_sets=False,
+        allow_working_set=False,
     )
-    linear_predictor = covariate_matrix @ alpha + genetic_linear_predictor
-    restricted_quadratic = float(np.dot(targets, projected_targets))
     if warm_start is not None:
-        warm_start.posterior_working_set_ever_active = np.asarray(ever_active_indices, dtype=np.int32)
-    return (
-        np.asarray(alpha, dtype=np.float64),
-        np.asarray(candidate_beta, dtype=np.float64),
-        np.zeros(variant_count, dtype=np.float64),
-        np.asarray(projected_targets, dtype=np.float64),
-        np.asarray(linear_predictor, dtype=np.float64),
-        restricted_quadratic,
-        0.0,
-        covariate_precision_logdet,
-    )
+        warm_start.posterior_working_set_ever_active = _ordered_unique_indices(
+            [
+                ever_active_indices,
+                _active_working_set_indices(
+                    np.asarray(exact_result[1], dtype=np.float64),
+                    posterior_working_set_coefficient_tolerance,
+                ),
+            ],
+            variant_count,
+        )
+    return exact_result
 
 
 def _restricted_posterior_state(

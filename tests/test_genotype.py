@@ -230,6 +230,73 @@ def test_matvec_skips_streaming_when_coefficients_are_zero():
     assert raw.iter_requests == []
 
 
+def test_matvec_streams_only_active_variant_columns():
+    raw_matrix = np.arange(24, dtype=np.float32).reshape(4, 6)
+    raw = _SpyStreamingRawGenotypeMatrix(raw_matrix)
+    standardized = raw.standardized(
+        means=np.zeros(raw_matrix.shape[1], dtype=np.float32),
+        scales=np.ones(raw_matrix.shape[1], dtype=np.float32),
+    )
+
+    result = standardized.matvec(np.array([0.0, 2.0, 0.0, 0.0, -1.5, 0.0], dtype=np.float32), batch_size=2)
+
+    np.testing.assert_allclose(
+        np.asarray(result),
+        raw_matrix[:, [1, 4]] @ np.array([2.0, -1.5], dtype=np.float32),
+    )
+    assert raw.iter_requests == [[1, 4]]
+
+
+def test_matvec_rejects_nonfinite_coefficients():
+    raw_matrix = np.arange(12, dtype=np.float32).reshape(3, 4)
+    standardized = as_raw_genotype_matrix(raw_matrix).standardized(
+        means=np.zeros(raw_matrix.shape[1], dtype=np.float32),
+        scales=np.ones(raw_matrix.shape[1], dtype=np.float32),
+    )
+
+    with pytest.raises(ValueError, match="coefficient vector must contain only finite values"):
+        standardized.matvec(np.array([0.5, np.nan, 0.0, 1.0], dtype=np.float32))
+
+
+def test_transpose_matvec_rejects_nonfinite_sample_vector():
+    raw_matrix = np.arange(12, dtype=np.float32).reshape(3, 4)
+    standardized = as_raw_genotype_matrix(raw_matrix).standardized(
+        means=np.zeros(raw_matrix.shape[1], dtype=np.float32),
+        scales=np.ones(raw_matrix.shape[1], dtype=np.float32),
+    )
+
+    with pytest.raises(ValueError, match="sample vector must contain only finite values"):
+        standardized.transpose_matvec(np.array([1.0, np.inf, -0.5], dtype=np.float32))
+
+
+def test_matmat_streams_only_active_variant_rows():
+    raw_matrix = np.arange(24, dtype=np.float32).reshape(4, 6)
+    raw = _SpyStreamingRawGenotypeMatrix(raw_matrix)
+    standardized = raw.standardized(
+        means=np.zeros(raw_matrix.shape[1], dtype=np.float32),
+        scales=np.ones(raw_matrix.shape[1], dtype=np.float32),
+    )
+    variant_matrix = np.array(
+        [
+            [0.0, 0.0],
+            [2.0, -1.0],
+            [0.0, 0.0],
+            [0.0, 0.0],
+            [-1.5, 0.25],
+            [0.0, 0.0],
+        ],
+        dtype=np.float32,
+    )
+
+    result = standardized.matmat(variant_matrix, batch_size=2)
+
+    np.testing.assert_allclose(
+        np.asarray(result),
+        raw_matrix[:, [1, 4]] @ variant_matrix[[1, 4], :],
+    )
+    assert raw.iter_requests == [[1, 4]]
+
+
 def test_try_cache_locally_rebases_to_local_int8_cache():
     raw_i8 = np.array(
         [
@@ -693,6 +760,101 @@ def test_try_materialize_gpu_prefers_int8_batches_when_available(monkeypatch: py
     assert raw.i8_requests == [[1, 3]]
     assert raw.float_requests == []
     np.testing.assert_allclose(np.asarray(cast(Any, standardized._cupy_cache)), expected)
+
+
+def test_streaming_gpu_context_uses_int8_budget_for_plink_like_backends(monkeypatch: pytest.MonkeyPatch):
+    class _FakeCudaRuntime:
+        @staticmethod
+        def memGetInfo():
+            return (8_000_000_000, 16_000_000_000)
+
+    class _FakeDevice:
+        def synchronize(self) -> None:
+            return None
+
+    class _FakeCuda:
+        runtime = _FakeCudaRuntime()
+
+        @staticmethod
+        def Device():
+            return _FakeDevice()
+
+    class _FakeCupy:
+        float32 = np.float32
+        cuda = _FakeCuda()
+
+    raw = _SpyInt8StreamingRawGenotypeMatrix(np.zeros((1_000, 16), dtype=np.int8))
+    standardized = raw.standardized(
+        np.zeros(16, dtype=np.float32),
+        np.ones(16, dtype=np.float32),
+    )
+
+    monkeypatch.setattr(genotype_module, "_try_import_cupy", lambda: _FakeCupy())
+
+    _, streaming_batch_size = standardized._streaming_gpu_context(batch_size=32)
+
+    assert streaming_batch_size == genotype_module.auto_batch_size_i8(standardized.shape[0])
+
+
+def test_try_materialize_gpu_uses_int8_batch_size_for_plink_like_backends(monkeypatch: pytest.MonkeyPatch):
+    class _FakeCudaRuntime:
+        @staticmethod
+        def memGetInfo():
+            return (8_000_000_000, 16_000_000_000)
+
+    class _FakeDevice:
+        def synchronize(self) -> None:
+            return None
+
+    class _FakeCuda:
+        runtime = _FakeCudaRuntime()
+
+        @staticmethod
+        def Device():
+            return _FakeDevice()
+
+    class _FakeCupy:
+        float32 = np.float32
+        int8 = np.int8
+        cuda = _FakeCuda()
+
+        @staticmethod
+        def asarray(array, dtype=None):
+            return np.asarray(array, dtype=dtype)
+
+        @staticmethod
+        def empty(shape, dtype=None, order=None):
+            return np.empty(shape, dtype=dtype, order="C" if order is None else order)
+
+        @staticmethod
+        def isnan(array):
+            return np.isnan(array)
+
+    class _RecordingInt8Raw(_SpyInt8StreamingRawGenotypeMatrix):
+        def __init__(self, matrix: np.ndarray) -> None:
+            super().__init__(matrix)
+            self.i8_batch_sizes: list[int] = []
+
+        def iter_column_batches_i8(
+            self,
+            variant_indices=None,
+            batch_size: int = 1024,
+        ):
+            self.i8_batch_sizes.append(int(batch_size))
+            yield from super().iter_column_batches_i8(variant_indices=variant_indices, batch_size=batch_size)
+
+    raw = _RecordingInt8Raw(np.zeros((32, 8), dtype=np.int8))
+    standardized = raw.standardized(
+        np.zeros(8, dtype=np.float32),
+        np.ones(8, dtype=np.float32),
+    )
+
+    monkeypatch.setattr(genotype_module, "_try_import_cupy", lambda: _FakeCupy())
+    monkeypatch.setattr(genotype_module, "auto_batch_size", lambda sample_count: 3)
+    monkeypatch.setattr(genotype_module, "auto_batch_size_i8", lambda sample_count: 7)
+
+    assert standardized.try_materialize_gpu() is True
+    assert raw.i8_batch_sizes == [7]
 
 
 def test_int8_gpu_cache_supports_linear_algebra(monkeypatch: pytest.MonkeyPatch):

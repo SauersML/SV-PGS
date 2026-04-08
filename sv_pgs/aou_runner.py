@@ -1,24 +1,33 @@
 """All of Us orchestration: download VCFs, prepare phenotypes, merge PCs, run one unified fit."""
 from __future__ import annotations
 
+import csv
 import gc
+import gzip
 import json
+import math
 import os
+import re
 import shutil
 import subprocess
 import time
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 import pandas as pd
 
 from sv_pgs.all_of_us import AllOfUsDiseaseRequest, prepare_all_of_us_disease_sample_table, resolve_disease_definition
-from sv_pgs.config import ModelConfig, TraitType
-from sv_pgs.io import _find_matching_complete_vcf_cache, load_multi_vcf_dataset_from_files, run_training_pipeline
+from sv_pgs.config import ModelConfig, TraitType, VariantClass
+from sv_pgs.data import NESTED_PATH_DELIMITER
+from sv_pgs.io import load_multi_vcf_dataset_from_files, run_training_pipeline
 from sv_pgs.progress import log, mem
 
 _LOCAL_CACHE_DIRNAME = ".sv_pgs_cache"
 _AOU_SV_VCF_CACHE_SUBDIR = "aou_sv_vcfs"
+_AOU_VARIANT_METADATA_SCHEMA_VERSION = 1
+_AOU_VARIANT_METADATA_FILENAME = "variant_metadata.tsv.gz"
+_AOU_VARIANT_METADATA_MANIFEST_FILENAME = "variant_metadata.manifest.json"
 
 # ---------------------------------------------------------------------------
 # AoU paths
@@ -62,8 +71,12 @@ def local_sv_vcf_path(chromosome: int, work_dir: Path) -> Path:
     return local_sv_vcf_cache_dir(work_dir) / sv_vcf_name(chromosome)
 
 
-def legacy_local_sv_vcf_path(chromosome: int, work_dir: Path) -> Path:
-    return work_dir / sv_vcf_name(chromosome)
+def aou_variant_metadata_path(work_dir: Path) -> Path:
+    return work_dir / _AOU_VARIANT_METADATA_FILENAME
+
+
+def _aou_variant_metadata_manifest_path(work_dir: Path) -> Path:
+    return work_dir / _AOU_VARIANT_METADATA_MANIFEST_FILENAME
 
 
 # ---------------------------------------------------------------------------
@@ -119,28 +132,12 @@ def _download_gcs_object_if_missing(remote_path: str, local_path: Path) -> None:
         raise
 
 
-def _adopt_legacy_sv_vcf_cache(chromosome: int, work_dir: Path) -> Path:
-    cache_vcf = local_sv_vcf_path(chromosome, work_dir)
-    cache_tbi = cache_vcf.parent / f"{cache_vcf.name}.tbi"
-    legacy_vcf = legacy_local_sv_vcf_path(chromosome, work_dir)
-    legacy_tbi = legacy_vcf.parent / f"{legacy_vcf.name}.tbi"
-    cache_vcf.parent.mkdir(parents=True, exist_ok=True)
-    if not cache_vcf.exists() and legacy_vcf.exists():
-        legacy_vcf.replace(cache_vcf)
-    elif cache_vcf.exists() and legacy_vcf.exists():
-        legacy_vcf.unlink(missing_ok=True)
-    if not cache_tbi.exists() and legacy_tbi.exists():
-        legacy_tbi.replace(cache_tbi)
-    elif cache_tbi.exists() and legacy_tbi.exists():
-        legacy_tbi.unlink(missing_ok=True)
-    return cache_vcf
-
-
 def download_sv_vcf(chromosome: int, work_dir: Path) -> Path:
     """Download one SV VCF + index when needed and return the local VCF path."""
     remote_dir = sv_vcf_dir()
     name = sv_vcf_name(chromosome)
-    local_vcf = _adopt_legacy_sv_vcf_cache(chromosome, work_dir)
+    local_vcf = local_sv_vcf_path(chromosome, work_dir)
+    local_vcf.parent.mkdir(parents=True, exist_ok=True)
     local_tbi = local_vcf.parent / f"{name}.tbi"
     vcf_remote = f"{remote_dir}/{name}"
     tbi_remote = f"{remote_dir}/{name}.tbi"
@@ -368,6 +365,322 @@ def _validate_aou_chromosomes(chromosomes: list[int]) -> list[int]:
     return normalized
 
 
+def _aou_vcf_source_signature(vcf_path: Path) -> dict[str, object]:
+    stat = vcf_path.stat()
+    return {
+        "path": str(vcf_path),
+        "size": int(stat.st_size),
+        "mtime_ns": int(stat.st_mtime_ns),
+    }
+
+
+def _normalize_info_strings(value: Any) -> list[str]:
+    if value is None:
+        return []
+    if isinstance(value, (tuple, list)):
+        normalized_values: list[str] = []
+        for member in value:
+            normalized_values.extend(_normalize_info_strings(member))
+        return normalized_values
+    text = str(value).strip()
+    if not text or text == ".":
+        return []
+    pieces = re.split(r"[,&|]", text)
+    return [piece.strip() for piece in pieces if piece.strip() and piece.strip() != "."]
+
+
+def _normalize_info_tokens(value: Any) -> list[str]:
+    return [token.upper().replace(" ", "_") for token in _normalize_info_strings(value)]
+
+
+def _info_float(value: Any) -> float | None:
+    if value is None:
+        return None
+    if isinstance(value, (tuple, list)):
+        numeric_values = [numeric_value for numeric_value in (_info_float(member) for member in value) if numeric_value is not None]
+        if not numeric_values:
+            return None
+        return float(numeric_values[0])
+    try:
+        numeric_value = float(value)
+    except (TypeError, ValueError):
+        return None
+    if math.isnan(numeric_value):
+        return None
+    return numeric_value
+
+
+def _info_best_numeric(info: Any, candidate_keys: tuple[str, ...]) -> float | None:
+    for key in candidate_keys:
+        try:
+            raw_value = info.get(key)
+        except Exception:
+            raw_value = None
+        numeric_value = _info_float(raw_value)
+        if numeric_value is not None:
+            return numeric_value
+    return None
+
+
+def _membership_weights(tokens: list[str]) -> str:
+    if not tokens:
+        return ""
+    unique_tokens = sorted(set(tokens))
+    weight = 1.0 / float(len(unique_tokens))
+    return ",".join(f"{token.lower()}={weight:.8g}" for token in unique_tokens)
+
+
+def _count_if_present(tokens: list[str]) -> str:
+    if not tokens:
+        return ""
+    return str(len(sorted(set(tokens))))
+
+
+def _format_optional_float(value: float | None) -> str:
+    if value is None:
+        return ""
+    if math.isnan(value):
+        return ""
+    return format(float(value), ".8g")
+
+
+def _boolean_string(value: bool) -> str:
+    return "true" if value else "false"
+
+
+def _string_contains_any(text: str, needles: tuple[str, ...]) -> bool:
+    normalized_text = text.lower()
+    return any(needle in normalized_text for needle in needles)
+
+
+def _strongest_effect_label(
+    *,
+    lof_tokens: list[str],
+    copy_gain_tokens: list[str],
+    promoter_tokens: list[str],
+    intronic_tokens: list[str],
+    utr_tokens: list[str],
+    noncoding_span_tokens: list[str],
+    noncoding_breakpoint_tokens: list[str],
+    is_repeat: bool,
+    is_copy_number: bool,
+) -> str:
+    if lof_tokens:
+        return "lof"
+    if copy_gain_tokens:
+        return "copy_gain"
+    if promoter_tokens:
+        return "promoter"
+    if intronic_tokens:
+        return "intronic"
+    if utr_tokens:
+        return "utr"
+    if noncoding_breakpoint_tokens:
+        return "regulatory_breakpoint"
+    if noncoding_span_tokens:
+        return "regulatory_span"
+    if is_repeat:
+        return "repeat"
+    if is_copy_number:
+        return "copy_number"
+    return "other"
+
+
+def _strongest_effect_path(label: str) -> str:
+    if label == "lof":
+        return NESTED_PATH_DELIMITER.join(("genic", "loss_of_function"))
+    if label == "copy_gain":
+        return NESTED_PATH_DELIMITER.join(("genic", "copy_gain"))
+    if label in {"promoter", "regulatory_breakpoint", "regulatory_span"}:
+        return NESTED_PATH_DELIMITER.join(("regulatory", label))
+    if label in {"intronic", "utr"}:
+        return NESTED_PATH_DELIMITER.join(("genic", label))
+    if label == "repeat":
+        return NESTED_PATH_DELIMITER.join(("repeat", "context"))
+    if label == "copy_number":
+        return NESTED_PATH_DELIMITER.join(("copy_number", "structural"))
+    return NESTED_PATH_DELIMITER.join(("other", "structural"))
+
+
+def build_aou_sv_variant_metadata(
+    *,
+    vcf_paths: list[Path],
+    output_path: Path,
+) -> Path:
+    from sv_pgs.io import _open_vcf_reader, _variant_defaults_from_vcf_record
+
+    manifest_path = _aou_variant_metadata_manifest_path(output_path.parent)
+    source_signatures = [_aou_vcf_source_signature(vcf_path) for vcf_path in vcf_paths]
+    if output_path.exists() and manifest_path.exists():
+        try:
+            existing_manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            if (
+                int(existing_manifest.get("schema_version", -1)) == _AOU_VARIANT_METADATA_SCHEMA_VERSION
+                and existing_manifest.get("source_vcfs") == source_signatures
+            ):
+                log(f"  variant metadata already up to date: {output_path}")
+                return output_path
+        except Exception:
+            pass
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    row_count = 0
+    header = (
+        "variant_id",
+        "variant_class",
+        "chromosome",
+        "position",
+        "length",
+        "allele_frequency",
+        "quality",
+        "is_copy_number",
+        "is_repeat",
+        "prior_binary__is_copy_number",
+        "prior_binary__is_repeat",
+        "prior_binary__predicted_lof",
+        "prior_binary__predicted_copy_gain",
+        "prior_binary__predicted_promoter",
+        "prior_binary__predicted_intronic",
+        "prior_binary__predicted_utr",
+        "prior_binary__predicted_intergenic",
+        "prior_binary__pathogenic_or_disease_associated",
+        "prior_continuous__sv_length_log10",
+        "prior_continuous__site_quality",
+        "prior_continuous__cohort_allele_frequency",
+        "prior_continuous__algorithm_count",
+        "prior_continuous__copy_number_quality",
+        "prior_continuous__constraint_score",
+        "prior_continuous__conservation_score",
+        "prior_continuous__lof_gene_count",
+        "prior_continuous__copy_gain_gene_count",
+        "prior_continuous__promoter_gene_count",
+        "prior_continuous__intronic_gene_count",
+        "prior_continuous__utr_gene_count",
+        "prior_membership__calling_algorithms",
+        "prior_membership__noncoding_span",
+        "prior_membership__noncoding_breakpoint",
+        "prior_categorical__strongest_effect",
+        "prior_nested__functional_context",
+    )
+    temporary_output_path = output_path.with_suffix(output_path.suffix + ".tmp")
+    with gzip.open(temporary_output_path, "wt", encoding="utf-8", newline="") as handle:
+        writer = csv.writer(handle, delimiter="\t")
+        writer.writerow(header)
+        for vcf_path in vcf_paths:
+            reader = _open_vcf_reader(vcf_path)
+            try:
+                for record in reader:
+                    if len(record.ALT) != 1:
+                        continue
+                    variant_defaults = _variant_defaults_from_vcf_record(record)
+                    info = record.INFO
+                    variant_class = variant_defaults.variant_class
+                    is_copy_number = variant_class in {
+                        VariantClass.DELETION_SHORT,
+                        VariantClass.DELETION_LONG,
+                        VariantClass.DUPLICATION_SHORT,
+                        VariantClass.DUPLICATION_LONG,
+                    }
+                    repeat_tokens = [
+                        key.lower()
+                        for key in ("REPEATMASKER", "REPEATS", "TRF", "SEGDUP", "REPEAT_CLASS")
+                        if info.get(key) not in (None, False, ".", "")
+                    ]
+                    is_repeat = (
+                        variant_class == VariantClass.STR_VNTR_REPEAT
+                        or bool(repeat_tokens)
+                    )
+                    lof_tokens = _normalize_info_tokens(info.get("PREDICTED_LOF"))
+                    copy_gain_tokens = _normalize_info_tokens(info.get("PREDICTED_COPY_GAIN"))
+                    promoter_tokens = _normalize_info_tokens(info.get("PREDICTED_PROMOTER"))
+                    intronic_tokens = _normalize_info_tokens(info.get("PREDICTED_INTRONIC"))
+                    utr_tokens = _normalize_info_tokens(info.get("PREDICTED_UTR"))
+                    intergenic_tokens = _normalize_info_tokens(info.get("PREDICTED_INTERGENIC"))
+                    noncoding_span_tokens = _normalize_info_tokens(info.get("PREDICTED_NONCODING_SPAN"))
+                    noncoding_breakpoint_tokens = _normalize_info_tokens(info.get("PREDICTED_NONCODING_BREAKPOINT"))
+                    algorithm_tokens = _normalize_info_tokens(info.get("ALGORITHMS"))
+                    copy_number_quality = _info_best_numeric(info, ("CNQ", "RD_CNQ", "QS"))
+                    constraint_score = _info_best_numeric(info, ("LOEUF", "LOEUF_MIN", "MIN_LOEUF", "CONSTRAINT", "CONSTRAINT_SCORE"))
+                    conservation_score = _info_best_numeric(info, ("PHYLOP", "PHASTCONS", "GERP", "CONSERVATION"))
+                    pathogenic_or_disease_associated = any(
+                        info.get(key) not in (None, False, ".", "", "0", "false", "FALSE", "none", "None")
+                        for key in (
+                            "CLINVAR_PATHOGENIC",
+                            "PATHOGENIC",
+                            "PATHOGENICITY",
+                            "DISEASE_ASSOCIATION",
+                            "OMIM",
+                        )
+                    )
+                    strongest_effect = _strongest_effect_label(
+                        lof_tokens=lof_tokens,
+                        copy_gain_tokens=copy_gain_tokens,
+                        promoter_tokens=promoter_tokens,
+                        intronic_tokens=intronic_tokens,
+                        utr_tokens=utr_tokens,
+                        noncoding_span_tokens=noncoding_span_tokens,
+                        noncoding_breakpoint_tokens=noncoding_breakpoint_tokens,
+                        is_repeat=is_repeat,
+                        is_copy_number=is_copy_number,
+                    )
+                    writer.writerow(
+                        (
+                            variant_defaults.variant_id,
+                            variant_defaults.variant_class.value,
+                            variant_defaults.chromosome,
+                            str(variant_defaults.position),
+                            format(variant_defaults.length, ".8g"),
+                            format(variant_defaults.allele_frequency, ".8g"),
+                            format(variant_defaults.quality, ".8g"),
+                            _boolean_string(is_copy_number),
+                            _boolean_string(is_repeat),
+                            _boolean_string(is_copy_number),
+                            _boolean_string(is_repeat),
+                            _boolean_string(bool(lof_tokens)),
+                            _boolean_string(bool(copy_gain_tokens)),
+                            _boolean_string(bool(promoter_tokens)),
+                            _boolean_string(bool(intronic_tokens)),
+                            _boolean_string(bool(utr_tokens)),
+                            _boolean_string(bool(intergenic_tokens)),
+                            _boolean_string(pathogenic_or_disease_associated),
+                            format(math.log10(max(float(variant_defaults.length), 1.0)), ".8g"),
+                            format(variant_defaults.quality, ".8g"),
+                            format(variant_defaults.allele_frequency, ".8g"),
+                            format(float(len(sorted(set(algorithm_tokens)))), ".8g") if algorithm_tokens else "",
+                            _format_optional_float(copy_number_quality),
+                            _format_optional_float(constraint_score),
+                            _format_optional_float(conservation_score),
+                            _count_if_present(lof_tokens),
+                            _count_if_present(copy_gain_tokens),
+                            _count_if_present(promoter_tokens),
+                            _count_if_present(intronic_tokens),
+                            _count_if_present(utr_tokens),
+                            _membership_weights(algorithm_tokens),
+                            _membership_weights(noncoding_span_tokens),
+                            _membership_weights(noncoding_breakpoint_tokens),
+                            strongest_effect,
+                            _strongest_effect_path(strongest_effect),
+                        )
+                    )
+                    row_count += 1
+            finally:
+                reader.close()
+    temporary_output_path.replace(output_path)
+    manifest_path.write_text(
+        json.dumps(
+            {
+                "schema_version": _AOU_VARIANT_METADATA_SCHEMA_VERSION,
+                "source_vcfs": source_signatures,
+                "row_count": row_count,
+            },
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+    log(f"  AoU variant metadata written: {output_path} ({row_count} variants)")
+    return output_path
+
+
 def _build_aou_run_metadata(
     *,
     disease: str,
@@ -379,6 +692,7 @@ def _build_aou_run_metadata(
     pipeline_validation_fraction: float,
     pipeline_validation_min_samples: int,
     random_seed: int,
+    variant_metadata_schema_version: int,
 ) -> dict[str, object]:
     return {
         "disease": disease,
@@ -390,6 +704,7 @@ def _build_aou_run_metadata(
         "pipeline_validation_fraction": pipeline_validation_fraction,
         "pipeline_validation_min_samples": pipeline_validation_min_samples,
         "random_seed": random_seed,
+        "variant_metadata_schema_version": variant_metadata_schema_version,
     }
 
 DEFAULT_COVARIATES = [
@@ -441,79 +756,6 @@ def run_all_of_us(
         random_seed=random_seed,
     )
 
-    # Migrate old VCF caches: VCFs were moved from work_dir to a shared cache dir,
-    # but the finalized .npy caches stayed in work_dir/.sv_pgs_cache.
-    # For each chromosome, find the old cache bundle (by reading variants.pkl to
-    # match chromosome), then symlink into the new cache dir using the NEW key name
-    # so the primary key lookup succeeds immediately.
-    from sv_pgs.io import _vcf_cache_dir, _vcf_cache_key
-    import pickle as _pickle
-    old_vcf_cache_dir = work_dir / ".sv_pgs_cache"
-    if old_vcf_cache_dir.exists():
-        first_vcf = _adopt_legacy_sv_vcf_cache(chromosomes[0], work_dir)
-        if first_vcf.exists():
-            new_vcf_cache_dir = _vcf_cache_dir(first_vcf)
-            if old_vcf_cache_dir.resolve() != new_vcf_cache_dir.resolve():
-                new_vcf_cache_dir.mkdir(parents=True, exist_ok=True)
-                # Build map: chromosome → old key (by reading variants.pkl)
-                old_chr_to_key: dict[str, str] = {}
-                for geno_file in old_vcf_cache_dir.glob("*.genotypes.npy"):
-                    old_k = geno_file.name.removesuffix(".genotypes.npy")
-                    var_pkl = old_vcf_cache_dir / f"{old_k}.variants.pkl"
-                    if not var_pkl.exists():
-                        continue
-                    try:
-                        with open(var_pkl, "rb") as f:
-                            variants = _pickle.load(f)
-                        if variants:
-                            chr_val = str(getattr(variants[0], "chromosome", "")).replace("chr", "")
-                            old_chr_to_key[chr_val] = old_k
-                    except Exception:
-                        continue
-                # Symlink old files using NEW key names
-                migrated_chrs = 0
-                for chrom in chromosomes:
-                    current_vcf = local_sv_vcf_path(chrom, work_dir)
-                    if not current_vcf.exists():
-                        continue
-                    new_key = _vcf_cache_key(current_vcf, config)
-                    # Always delete stale manifest symlinks (they reference wrong stats filename)
-                    stale_manifest = new_vcf_cache_dir / f"{new_key}.manifest.json"
-                    if stale_manifest.is_symlink() or stale_manifest.exists():
-                        stale_manifest.unlink(missing_ok=True)
-                    if (new_vcf_cache_dir / f"{new_key}.genotypes.npy").exists():
-                        continue  # already cached under new key
-                    old_k = old_chr_to_key.get(str(chrom))
-                    if old_k is None:
-                        continue
-                    # Symlink: new_key.X → old file. Skip manifest because it
-                    # references old key's stats filename which won't exist under new key.
-                    for suffix in (".genotypes.npy", ".variants.pkl", ".stats.npy", ".stats.npz"):
-                        src = old_vcf_cache_dir / f"{old_k}{suffix}"
-                        dst = new_vcf_cache_dir / f"{new_key}{suffix}"
-                        if src.exists() and not dst.exists():
-                            try:
-                                dst.symlink_to(src.resolve())
-                            except Exception:
-                                pass
-                    migrated_chrs += 1
-                if migrated_chrs:
-                    log(f"  migrated caches for {migrated_chrs} chromosomes from {old_vcf_cache_dir}")
-                # Clean up ALL old tmp_parallel dirs — they're from interrupted
-                # precache runs and cause the precache to try re-finalizing
-                for tmp_dir in list(new_vcf_cache_dir.glob("*.tmp_parallel")):
-                    try:
-                        if tmp_dir.is_dir():
-                            shutil.rmtree(tmp_dir, ignore_errors=True)
-                    except Exception:
-                        pass
-                # Also clean up stale incremental files
-                for inc_file in list(new_vcf_cache_dir.glob("*.inc.*")):
-                    try:
-                        inc_file.unlink(missing_ok=True)
-                    except Exception:
-                        pass
-
     # Status summary: what's done vs what's left
     log("=== STATUS CHECK ===")
     sample_table_path = work_dir / f"{disease_def.canonical_name}.samples.tsv"
@@ -521,25 +763,24 @@ def run_all_of_us(
     log(f"  phenotype table: {'DONE' if sample_table_path.exists() else 'NEEDED'}")
     log(f"  PC-merged table: {'DONE' if merged_path.exists() else 'NEEDED'}")
     ancestry_local = local_ancestry_predictions_path(work_dir)
+    variant_metadata_path = aou_variant_metadata_path(work_dir)
     log(f"  ancestry file:   {'DONE' if ancestry_local.exists() else 'NEEDED'}")
+    log(f"  variant metadata:{'DONE' if variant_metadata_path.exists() else 'NEEDED'}")
 
     # Cache key no longer depends on sample indices — only on VCF content + config.
     cached_chrs = []
     uncached_chrs = []
+    from sv_pgs.io import _is_vcf_cache_bundle_complete, _vcf_cache_dir, _vcf_cache_paths
     for chrom in chromosomes:
-        vcf_path = _adopt_legacy_sv_vcf_cache(chrom, work_dir)
+        vcf_path = local_sv_vcf_path(chrom, work_dir)
         if not vcf_path.exists():
             uncached_chrs.append(f"chr{chrom}(no VCF)")
             continue
         cache_dir = _vcf_cache_dir(vcf_path)
-        key = _vcf_cache_key(vcf_path, config)
-        has_cache = (cache_dir / f"{key}.genotypes.npy").exists()
-        # Also check for legacy cache bundles (old key format)
-        if not has_cache and cache_dir.exists():
-            legacy = _find_matching_complete_vcf_cache(cache_dir, vcf_path=vcf_path, config=config, expected_chromosome=str(chrom))
-            has_cache = legacy is not None
-        has_partial = (cache_dir / f"{key}.inc.progress.json").exists() if cache_dir.exists() else False
-        has_tmp = any(cache_dir.glob("*.tmp_parallel")) if cache_dir.exists() else False
+        cache_paths = _vcf_cache_paths(vcf_path, config)
+        has_cache = _is_vcf_cache_bundle_complete(cache_paths)
+        has_partial = (cache_dir / f"{cache_paths.key}.inc.progress.json").exists() if cache_dir.exists() else False
+        has_tmp = (cache_dir / f"{cache_paths.key}.tmp_parallel").exists() if cache_dir.exists() else False
         if has_cache:
             cached_chrs.append(f"chr{chrom}")
         elif has_partial:
@@ -550,7 +791,7 @@ def run_all_of_us(
             uncached_chrs.append(f"chr{chrom}")
     log(f"  VCF cached ({len(cached_chrs)}): {', '.join(cached_chrs) if cached_chrs else 'none'}")
     log(f"  VCF needed ({len(uncached_chrs)}): {', '.join(uncached_chrs) if uncached_chrs else 'none — all cached!'}")
-    summary_path = work_dir / "summary.json"
+    summary_path = work_dir / "summary.json.gz"
     log(f"  model fitted:    {'DONE' if summary_path.exists() else 'NEEDED'}")
     log("===================")
 
@@ -580,7 +821,7 @@ def run_all_of_us(
     covariates = DEFAULT_COVARIATES + pc_cols
     log(f"  covariates ({len(covariates)}): {covariates}")
 
-    summary_path = work_dir / "summary.json"
+    summary_path = work_dir / "summary.json.gz"
     run_metadata_path = _aou_run_metadata_path(work_dir)
     run_metadata = _build_aou_run_metadata(
         disease=disease_def.canonical_name,
@@ -592,6 +833,7 @@ def run_all_of_us(
         pipeline_validation_fraction=pipeline_validation_fraction,
         pipeline_validation_min_samples=pipeline_validation_min_samples,
         random_seed=random_seed,
+        variant_metadata_schema_version=_AOU_VARIANT_METADATA_SCHEMA_VERSION,
     )
     if summary_path.exists():
         if run_metadata_path.exists():
@@ -611,11 +853,17 @@ def run_all_of_us(
             vcf_paths.append(download_sv_vcf(chrom, work_dir))
 
         log("=== STEP 3.5: Parallel VCF precache ===")
+        from sv_pgs.io import precache_vcfs_parallel
         try:
-            from sv_pgs.io import precache_vcfs_parallel
             precache_vcfs_parallel(vcf_paths, config)
         except Exception as exc:
-            log(f"  precache skipped: {exc}")
+            raise RuntimeError("parallel VCF precache failed") from exc
+
+        log("=== STEP 3.6: Build variant metadata priors ===")
+        variant_metadata_path = build_aou_sv_variant_metadata(
+            vcf_paths=vcf_paths,
+            output_path=variant_metadata_path,
+        )
 
         log("=== STEP 4: Load unified genome-wide dataset ===")
         dataset = load_multi_vcf_dataset_from_files(
@@ -625,6 +873,7 @@ def run_all_of_us(
             sample_id_column="auto",
             target_column="target",
             covariate_columns=covariates,
+            variant_metadata_path=variant_metadata_path,
         )
         inferred_trait = TraitType.BINARY if len(np.unique(dataset.targets)) <= 2 else TraitType.QUANTITATIVE
         config.trait_type = inferred_trait

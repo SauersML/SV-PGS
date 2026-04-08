@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import json
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
 
@@ -9,24 +9,6 @@ import numpy as np
 
 from sv_pgs.config import ModelConfig, TraitType, VariantClass
 from sv_pgs.data import VariantRecord, TieGroup, TieMap, normalize_variant_records
-
-
-@dataclass(slots=True)
-class VariantMetadataTable:
-    variant_ids: list[str]
-    variant_classes: list[VariantClass]
-
-    def __post_init__(self) -> None:
-        self.variant_ids = [str(variant_id) for variant_id in self.variant_ids]
-        self.variant_classes = [
-            variant_class if isinstance(variant_class, VariantClass) else VariantClass(str(variant_class))
-            for variant_class in self.variant_classes
-        ]
-        if len(self.variant_ids) != len(self.variant_classes):
-            raise ValueError("variant_ids and variant_classes must have the same length.")
-
-    def __len__(self) -> int:
-        return len(self.variant_ids)
 
 
 @dataclass(slots=True)
@@ -49,23 +31,18 @@ class ModelArtifact:
     scale_model_feature_names: list[str]
     objective_history: list[float]
     validation_history: list[float]
-    variant_metadata: VariantMetadataTable = field(init=False)
 
     def __post_init__(self) -> None:
         self.records = normalize_variant_records(self.records)
-        self.variant_metadata = VariantMetadataTable(
-            variant_ids=[record.variant_id for record in self.records],
-            variant_classes=[record.variant_class for record in self.records],
-        )
-        variant_count = len(self.variant_metadata)
+        variant_count = len(self.records)
         if self.means.shape != (variant_count,):
-            raise ValueError("Artifact means must align with full variant metadata.")
+            raise ValueError("Artifact means must align with records.")
         if self.scales.shape != (variant_count,):
-            raise ValueError("Artifact scales must align with full variant metadata.")
+            raise ValueError("Artifact scales must align with records.")
         if self.beta_full.shape != (variant_count,):
-            raise ValueError("Artifact beta_full must align with full variant metadata.")
+            raise ValueError("Artifact beta_full must align with records.")
         if self.tie_map.original_to_reduced.shape != (variant_count,):
-            raise ValueError("Artifact tie_map must align with full variant metadata.")
+            raise ValueError("Artifact tie_map must align with records.")
 
 
 def save_artifact(path: str | Path, artifact: ModelArtifact) -> None:
@@ -163,7 +140,7 @@ def load_artifact(path: str | Path) -> ModelArtifact:
     )
     return ModelArtifact(
         config=_config_from_json(payload["config"]),
-        records=normalize_variant_records(payload["records"]),
+        records=payload["records"],
         means=arrays["means"].astype(np.float32),
         scales=arrays["scales"].astype(np.float32),
         alpha=arrays["alpha"].astype(np.float32),
