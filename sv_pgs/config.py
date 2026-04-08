@@ -95,18 +95,16 @@ STRUCTURAL_VARIANT_CLASSES = (
 
 @dataclass(slots=True)
 class ModelConfig:
-    """All tunable parameters for the Bayesian PGS model.
+    """All tunable parameters for SV-PGS inference.
 
-    Most users won't need to change these — the defaults are calibrated for
-    All of Us-scale data (~447k samples, ~900k variants).  Key groups:
+    Most users won't need to change these. Key groups:
 
-    Convergence: max_outer_iterations, convergence_tolerance
-    Prior structure: prior_scale_floor/ceiling, global_scale_floor/ceiling
-    Linear algebra: exact_solver_matrix_limit (Woodbury vs CG cutoff)
-    TPB shapes: minimum/maximum_tpb_shape, tpb_shape_learning_rate
+    Backend selection: inference_backend
+    Variational Bayes: prior scales, TPB shapes, linear algebra, working sets
+    BASIL: lambda path controls, strong-set growth, KKT tolerance
     """
     trait_type: TraitType = TraitType.BINARY       # binary (case/control) or quantitative
-    inference_backend: InferenceBackend = InferenceBackend.VARIATIONAL_BAYES
+    inference_backend: InferenceBackend = InferenceBackend.BASIL
     max_outer_iterations: int = 20                 # EM iterations (usually converges in 10-15, step size negligible beyond 20)
     convergence_tolerance: float = 1e-5            # stop when parameters change < this
     minimum_scale: float = 1e-6                    # variants with std < this are treated as monomorphic
@@ -154,7 +152,6 @@ class ModelConfig:
     stochastic_step_offset: float = 8.0
     stochastic_step_exponent: float = 0.6
     final_posterior_refinement: bool = True
-    basil_screening: bool = True
     basil_l1_ratio: float = 1.0
     basil_lambda_min_ratio: float = 1e-3
     basil_n_lambdas: int = 64

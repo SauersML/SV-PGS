@@ -12,7 +12,7 @@ import numpy as np
 import sv_pgs._jax  # noqa: F401
 
 from sv_pgs.artifact import ModelArtifact, load_artifact, save_artifact
-from sv_pgs.config import ModelConfig, TraitType
+from sv_pgs.config import InferenceBackend, ModelConfig, TraitType
 from sv_pgs.data import TieGroup, TieMap, VariantRecord, VariantStatistics, normalize_variant_records
 from sv_pgs.genotype import (
     ConcatenatedRawGenotypeMatrix,
@@ -696,22 +696,31 @@ class BayesianPGS:
                 random_seed=int(self.config.random_seed),
             )
             log(f"  preconditioner cache restored  mem={mem()}")
+        backend_label = (
+            "starting BASIL path solve"
+            if self.config.inference_backend == InferenceBackend.BASIL
+            else "starting variational EM"
+        )
         log(
-            f"starting variational EM  max_iterations={self.config.max_outer_iterations}  "
+            f"{backend_label}  max_iterations={self.config.max_outer_iterations}  "
             f"reduced_matrix={reduced_genotypes.shape}  in_memory={in_memory}  "
             f"local_cache={local_cache}  "
             f"on_gpu={reduced_genotypes._cupy_cache is not None}  "
             f"mem={mem()}"
         )
-        log("  checking for EM checkpoint to resume from...")
-        resume_checkpoint = (
-            None
-            if fit_stage_cache_paths is None
-            else _try_load_variational_checkpoint(fit_stage_cache_paths)
-        )
-        log(f"  EM checkpoint: {'found — resuming' if resume_checkpoint else 'none — starting fresh'}")
         checkpoint_callback = None
-        if fit_stage_cache_paths is not None:
+        resume_checkpoint = None
+        if self.config.inference_backend == InferenceBackend.VARIATIONAL_BAYES:
+            log("  checking for EM checkpoint to resume from...")
+            resume_checkpoint = (
+                None
+                if fit_stage_cache_paths is None
+                else _try_load_variational_checkpoint(fit_stage_cache_paths)
+            )
+            log(f"  EM checkpoint: {'found — resuming' if resume_checkpoint else 'none — starting fresh'}")
+        elif fit_stage_cache_paths is not None:
+            log("  backend=basil: skipping EM checkpoint load/save")
+        if fit_stage_cache_paths is not None and self.config.inference_backend == InferenceBackend.VARIATIONAL_BAYES:
             def checkpoint_callback(checkpoint: VariationalFitCheckpoint) -> None:
                 _save_variational_checkpoint(fit_stage_cache_paths, checkpoint)
                 if int(self.config.sample_space_preconditioner_rank) <= 0:
@@ -742,7 +751,7 @@ class BayesianPGS:
             predictor_offset=None,
             validation_offset=None,
         )
-        if fit_stage_cache_paths is not None:
+        if fit_stage_cache_paths is not None and self.config.inference_backend == InferenceBackend.VARIATIONAL_BAYES:
             _clear_variational_checkpoint(fit_stage_cache_paths)
             if int(self.config.sample_space_preconditioner_rank) > 0:
                 _save_sample_space_basis_cache(
@@ -751,7 +760,15 @@ class BayesianPGS:
                     rank=int(self.config.sample_space_preconditioner_rank),
                     random_seed=int(self.config.random_seed),
                 )
-        log(f"variational EM converged in {len(fit_result.objective_history)} iterations  final_obj={fit_result.objective_history[-1]:.4f}  mem={mem()}")
+        completion_label = (
+            "BASIL path complete"
+            if self.config.inference_backend == InferenceBackend.BASIL
+            else "variational EM converged"
+        )
+        log(
+            f"{completion_label} in {len(fit_result.objective_history)} iterations  "
+            f"final_obj={fit_result.objective_history[-1]:.4f}  mem={mem()}"
+        )
 
         log("expanding coefficients from reduced to full space...")
         tie_group_weights = _tie_group_export_weights(

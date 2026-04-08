@@ -7,7 +7,7 @@ from typing import Any
 
 import numpy as np
 
-from sv_pgs.config import ModelConfig, TraitType, VariantClass
+from sv_pgs.config import InferenceBackend, ModelConfig, TraitType, VariantClass
 from sv_pgs.data import TieGroup, TieMap, VariantRecord
 
 
@@ -124,12 +124,16 @@ def load_artifact(path: str | Path) -> ModelArtifact:
 def _config_to_json(config: ModelConfig) -> dict[str, Any]:
     payload = asdict(config)
     payload["trait_type"] = config.trait_type.value
+    payload["inference_backend"] = config.inference_backend.value
     return payload
 
 
 def _config_from_json(payload: dict[str, Any]) -> ModelConfig:
     restored_payload = dict(payload)
     restored_payload["trait_type"] = TraitType(payload["trait_type"])
+    if "inference_backend" not in payload:
+        raise ValueError("artifact config is missing inference_backend.")
+    restored_payload["inference_backend"] = InferenceBackend(payload["inference_backend"])
     return ModelConfig(**restored_payload)
 
 

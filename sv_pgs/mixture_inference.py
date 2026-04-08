@@ -69,7 +69,7 @@ from scipy.linalg import solve_triangular
 from scipy.special import kve as scipy_bessel_kve
 
 from sv_pgs._jax import gpu_compute_jax_dtype, gpu_compute_numpy_dtype
-from sv_pgs.config import ModelConfig, TraitType, VariantClass
+from sv_pgs.config import InferenceBackend, ModelConfig, TraitType, VariantClass
 from sv_pgs.data import TieMap, VariantRecord
 from sv_pgs.genotype import (
     DenseRawGenotypeMatrix,
@@ -85,6 +85,8 @@ from sv_pgs.linear_solvers import build_linear_operator, solve_spd_system, stoch
 from sv_pgs.numeric import stable_sigmoid
 from sv_pgs.preprocessing import collapse_tie_groups
 from sv_pgs.progress import log, mem
+
+BASIL_STRONG_SET_HOST_MATERIALIZE_MAX_BYTES = 512_000_000
 
 # GPU exact variant solve needs ~3× the matrix memory for intermediates
 # (X + weighted_X + projected_X). On 16 GB T4 with 4 GB matrix, only ~6 GB
@@ -522,13 +524,6 @@ def _should_use_stochastic_variational_updates(
     variant_count = int(genotype_matrix.shape[1])
     if not config.stochastic_variational_updates:
         return False
-    # BASIL screening replaces stochastic block-coordinate descent:
-    # instead of partitioning into random blocks with step-size blending,
-    # each EM iteration does a full solve using gradient-based screening
-    # (working-set selection + KKT certification) via the collapsed
-    # posterior path.  This converges in 5-10 iterations vs 15-20 epochs.
-    if config.basil_screening:
-        return False
     if variant_count < max(int(config.stochastic_min_variant_count), 1):
         return False
     return variant_count > int(config.stochastic_variant_batch_size)
@@ -605,6 +600,9 @@ def fit_variational_em(
         if validation_offset is None
         else np.asarray(validation_offset, dtype=np.float64).reshape(-1)
     )
+    if config.inference_backend == InferenceBackend.BASIL:
+        if resume_checkpoint is not None or checkpoint_callback is not None:
+            raise ValueError("BASIL backend does not support EM checkpointing.")
     member_records = list(records)
     if genotype_matrix.shape[1] != len(tie_map.reduced_to_group):
         raise ValueError("Reduced genotype columns must match tie-map group count.")
@@ -630,6 +628,18 @@ def fit_variational_em(
             covariate_matrix=covariate_matrix,
             targets=target_vector,
             trait_type=config.trait_type,
+            config=config,
+            validation_data=validation_payload,
+            predictor_offset=predictor_offset_array,
+            validation_offset=validation_offset_array,
+        )
+    if config.inference_backend == InferenceBackend.BASIL:
+        return _fit_basil_path(
+            genotype_matrix=genotype_matrix,
+            covariate_matrix=covariate_matrix,
+            targets=target_vector,
+            records=member_records,
+            tie_map=tie_map,
             config=config,
             validation_data=validation_payload,
             predictor_offset=predictor_offset_array,
@@ -1214,12 +1224,15 @@ def fit_variational_em(
                 log(f"  stochastic variational updates converged on epoch {outer_iteration + 1} with parameter_change={parameter_change:.3e}")
                 break
     else:
-        if config.basil_screening and genotype_matrix.shape[1] >= config.temporary_working_set_min_variants:
+        if (
+            config.temporary_working_sets
+            and genotype_matrix.shape[1] >= config.temporary_working_set_min_variants
+        ):
             log(
-                f"  variational inference mode: BASIL screening "
-                f"(total_variants={genotype_matrix.shape[1]}, "
-                f"working_set_initial={config.temporary_working_set_initial_size}, "
-                f"max_passes={config.temporary_working_set_max_passes})"
+                "  variational inference mode: posterior working sets "
+                + f"(total_variants={genotype_matrix.shape[1]}, "
+                + f"initial={config.temporary_working_set_initial_size}, "
+                + f"max_passes={config.temporary_working_set_max_passes})"
             )
         for outer_iteration in range(start_iteration, config.max_outer_iterations):
             iter_wall_t0 = time.monotonic()
@@ -1506,6 +1519,876 @@ def fit_variational_em(
         objective_history=objective_history,
         validation_history=validation_history,
         member_prior_variances=final_member_prior_variances.astype(np.float32),
+    )
+
+
+def _soft_threshold(value: float, threshold: float) -> float:
+    if value > threshold:
+        return float(value - threshold)
+    if value < -threshold:
+        return float(value + threshold)
+    return 0.0
+
+
+def _elastic_net_kkt_violations(
+    score: np.ndarray,
+    beta: np.ndarray,
+    penalty: float,
+    l1_ratio: float,
+) -> np.ndarray:
+    score_array = np.asarray(score, dtype=np.float64)
+    beta_array = np.asarray(beta, dtype=np.float64)
+    ridge_component = float(penalty) * (1.0 - float(l1_ratio)) * beta_array
+    active_mask = np.abs(beta_array) > 1e-10
+    violations = np.maximum(np.abs(score_array) - float(penalty) * float(l1_ratio), 0.0)
+    if np.any(active_mask):
+        violations[active_mask] = np.abs(
+            score_array[active_mask]
+            - ridge_component[active_mask]
+            - float(penalty) * float(l1_ratio) * np.sign(beta_array[active_mask])
+        )
+    return np.asarray(violations, dtype=np.float64)
+
+
+def _basil_lambda_grid(
+    lambda_max: float,
+    lambda_min_ratio: float,
+    n_lambdas: int,
+) -> np.ndarray:
+    safe_lambda_max = max(float(lambda_max), 1e-8)
+    if int(n_lambdas) == 1:
+        return np.asarray([safe_lambda_max], dtype=np.float64)
+    lambda_min = max(safe_lambda_max * float(lambda_min_ratio), 1e-8)
+    return np.geomspace(safe_lambda_max, lambda_min, num=int(n_lambdas), dtype=np.float64)
+
+
+def _select_basil_solution_index(
+    validation_scores: Sequence[float | None],
+    selection_scores: Sequence[float | None],
+) -> int:
+    validation_array = np.asarray(
+        [np.inf if value is None else float(value) for value in validation_scores],
+        dtype=np.float64,
+    )
+    if np.isfinite(validation_array).any():
+        return int(np.argmin(validation_array))
+    selection_array = np.asarray(
+        [np.inf if value is None else float(value) for value in selection_scores],
+        dtype=np.float64,
+    )
+    if not np.isfinite(selection_array).any():
+        raise RuntimeError("BASIL path did not produce any valid model-selection scores.")
+    return int(np.argmin(selection_array))
+
+
+def _basil_strong_set_indices(
+    screening_score: np.ndarray,
+    ever_active_indices: np.ndarray,
+    target_size: int,
+) -> np.ndarray:
+    total_variants = int(np.asarray(screening_score, dtype=np.float64).shape[0])
+    mandatory = _ordered_unique_indices([ever_active_indices], total_variants)
+    if mandatory.shape[0] >= total_variants:
+        return np.arange(total_variants, dtype=np.int32)
+    if mandatory.shape[0] >= max(int(target_size), 1):
+        return mandatory
+    candidate_score = np.asarray(screening_score, dtype=np.float64).reshape(-1)
+    available_mask = np.ones(total_variants, dtype=bool)
+    available_mask[mandatory] = False
+    available_indices = np.flatnonzero(available_mask).astype(np.int32, copy=False)
+    remaining_size = max(int(target_size) - mandatory.shape[0], 0)
+    if available_indices.shape[0] <= remaining_size:
+        return _ordered_unique_indices([mandatory, available_indices], total_variants)
+    ranked_remaining = available_indices[
+        np.argsort(candidate_score[available_indices])[-remaining_size:][::-1]
+    ]
+    return _ordered_unique_indices([mandatory, ranked_remaining], total_variants)
+
+
+def _solve_weighted_covariates(
+    covariate_matrix: np.ndarray,
+    response: np.ndarray,
+    weights: np.ndarray,
+) -> np.ndarray:
+    covariates = np.asarray(covariate_matrix, dtype=np.float64)
+    if covariates.shape[1] == 0:
+        return np.zeros(0, dtype=np.float64)
+    response_array = np.asarray(response, dtype=np.float64)
+    weight_array = np.asarray(weights, dtype=np.float64)
+    weighted_covariates = weight_array[:, None] * covariates
+    gram = covariates.T @ weighted_covariates + np.eye(covariates.shape[1], dtype=np.float64) * 1e-8
+    rhs = weighted_covariates.T @ response_array
+    gram_cholesky = np.linalg.cholesky(gram)
+    lower_solution = solve_triangular(gram_cholesky, rhs, lower=True)
+    return np.asarray(solve_triangular(gram_cholesky.T, lower_solution, lower=False), dtype=np.float64)
+
+
+def _require_finite_basil_state(label: str, *arrays: np.ndarray) -> None:
+    for array in arrays:
+        resolved = np.asarray(array, dtype=np.float64)
+        if not np.all(np.isfinite(resolved)):
+            raise RuntimeError(f"BASIL produced non-finite values in {label}.")
+
+
+def _prepare_basil_strong_set_matrix(
+    genotype_matrix: StandardizedGenotypeMatrix,
+    strong_indices: np.ndarray,
+) -> StandardizedGenotypeMatrix:
+    subset_matrix = genotype_matrix.subset(np.asarray(strong_indices, dtype=np.int32))
+    if subset_matrix._dense_cache is not None:
+        return subset_matrix
+    if subset_matrix.raw is not None:
+        subset_matrix.try_cache_locally()
+        return subset_matrix
+    if subset_matrix._jax_cache is not None or subset_matrix._cupy_cache is not None:
+        if subset_matrix.dense_bytes() > BASIL_STRONG_SET_HOST_MATERIALIZE_MAX_BYTES:
+            raise RuntimeError(
+                "BASIL strong set would require too much host RAM without raw backing storage."
+            )
+        if subset_matrix._jax_cache is not None:
+            subset_matrix._dense_cache = np.asarray(subset_matrix._jax_cache, dtype=np.float32)
+            subset_matrix._jax_cache = None
+        elif subset_matrix._cupy_cache is not None:
+            subset_matrix._dense_cache = np.asarray(subset_matrix._cupy_cache.get(), dtype=np.float32)
+            subset_matrix._cupy_cache = None
+        return subset_matrix
+    if subset_matrix._dense_cache is None and subset_matrix.raw is None:
+        raise RuntimeError("BASIL strong set requires a dense cache or raw backing storage.")
+    return subset_matrix
+
+
+def _basil_strong_set_matvec(
+    strong_matrix: StandardizedGenotypeMatrix,
+    coefficients: np.ndarray,
+    *,
+    batch_size: int,
+) -> np.ndarray:
+    coefficient_array = np.asarray(coefficients, dtype=np.float64)
+    if coefficient_array.shape[0] == 0:
+        return np.zeros(strong_matrix.shape[0], dtype=np.float64)
+    result = np.asarray(strong_matrix.matvec(coefficient_array, batch_size=batch_size), dtype=np.float64)
+    _require_finite_basil_state("strong-set matvec", result)
+    return result
+
+
+def _basil_batch_diagonals(
+    strong_matrix: StandardizedGenotypeMatrix,
+    weights: np.ndarray,
+    *,
+    batch_size: int,
+    sample_count: int,
+) -> tuple[np.ndarray, ...]:
+    weight_array = np.asarray(weights, dtype=np.float64)
+    use_unit_weights = bool(np.all(weight_array == 1.0))
+    diagonals: list[np.ndarray] = []
+    for batch in strong_matrix.iter_column_batches(batch_size=batch_size):
+        values = np.asarray(batch.values, dtype=np.float64)
+        if use_unit_weights:
+            diagonal = np.sum(values * values, axis=0) / sample_count
+        else:
+            diagonal = np.sum(values * (weight_array[:, None] * values), axis=0) / sample_count
+        diagonals.append(np.asarray(diagonal, dtype=np.float64))
+    return tuple(diagonals)
+
+
+def _weighted_elastic_net_dense_strong_set_path(
+    dense_strong_matrix: np.ndarray,
+    covariate_matrix: np.ndarray,
+    response: np.ndarray,
+    weights: np.ndarray,
+    penalties: Sequence[float],
+    l1_ratio: float,
+    alpha_init: np.ndarray,
+    beta_init: np.ndarray,
+    *,
+    max_epochs: int,
+    tolerance: float,
+) -> list[tuple[np.ndarray, np.ndarray, float]]:
+    dense_values = np.asarray(dense_strong_matrix, dtype=np.float64, order="F")
+    covariates = np.asarray(covariate_matrix, dtype=np.float64)
+    target_array = np.asarray(response, dtype=np.float64)
+    weight_array = np.asarray(weights, dtype=np.float64)
+    sample_count = max(int(target_array.shape[0]), 1)
+    strong_size = int(dense_values.shape[1])
+    weighted_covariates = weight_array[:, None] * covariates if covariates.shape[1] > 0 else np.zeros_like(covariates)
+    covariate_cholesky = (
+        np.linalg.cholesky(covariates.T @ weighted_covariates + np.eye(covariates.shape[1], dtype=np.float64) * 1e-8)
+        if covariates.shape[1] > 0
+        else np.zeros((0, 0), dtype=np.float64)
+    )
+    alpha = np.asarray(alpha_init, dtype=np.float64).copy()
+    beta = np.asarray(beta_init, dtype=np.float64).copy()
+    if beta.shape[0] != strong_size:
+        raise ValueError("beta_init must match strong-set width.")
+    use_unit_weights = bool(np.all(weight_array == 1.0))
+    weighted_values = dense_values if use_unit_weights else weight_array[:, None] * dense_values
+    diagonal = np.sum(dense_values * weighted_values, axis=0) / sample_count
+    results: list[tuple[np.ndarray, np.ndarray, float]] = []
+    residual = target_array - covariates @ alpha - dense_values @ beta
+    _require_finite_basil_state("dense coordinate-descent initialization", alpha, beta, residual)
+    for penalty in penalties:
+        penalty_value = float(penalty)
+        for _epoch_index in range(max(int(max_epochs), 1)):
+            if covariates.shape[1] > 0:
+                current_covariate_component = covariates @ alpha
+                covariate_rhs = weighted_covariates.T @ (residual + current_covariate_component)
+                lower_solution = solve_triangular(covariate_cholesky, covariate_rhs, lower=True)
+                alpha_next = solve_triangular(covariate_cholesky.T, lower_solution, lower=False)
+            else:
+                alpha_next = np.zeros(0, dtype=np.float64)
+            max_change = float(np.max(np.abs(alpha_next - alpha))) if alpha_next.size > 0 else 0.0
+            if alpha_next.size > 0:
+                residual -= covariates @ (alpha_next - alpha)
+            alpha = np.asarray(alpha_next, dtype=np.float64)
+            for variant_index in range(strong_size):
+                column = dense_values[:, variant_index]
+                weighted_column = weighted_values[:, variant_index]
+                old_value = float(beta[variant_index])
+                rho = float(weighted_column @ (residual + column * old_value)) / sample_count
+                denominator = float(diagonal[variant_index] + penalty_value * (1.0 - float(l1_ratio)))
+                new_value = 0.0 if denominator <= 0.0 else _soft_threshold(rho, penalty_value * float(l1_ratio)) / denominator
+                delta = new_value - old_value
+                if delta != 0.0:
+                    beta[variant_index] = new_value
+                    residual -= column * delta
+                    max_change = max(max_change, abs(delta))
+            _require_finite_basil_state("dense coordinate-descent epoch", alpha, beta, residual)
+            if max_change <= float(tolerance):
+                break
+        objective = (
+            0.5 * float(np.mean(weight_array * residual * residual))
+            + penalty_value * float(l1_ratio) * float(np.sum(np.abs(beta)))
+            + 0.5 * penalty_value * (1.0 - float(l1_ratio)) * float(np.dot(beta, beta))
+        )
+        if not np.isfinite(objective):
+            raise RuntimeError("BASIL produced a non-finite dense objective.")
+        results.append((np.asarray(alpha, dtype=np.float64).copy(), np.asarray(beta, dtype=np.float64).copy(), objective))
+    return results
+
+
+def _weighted_elastic_net_strong_set_path(
+    strong_matrix: StandardizedGenotypeMatrix,
+    covariate_matrix: np.ndarray,
+    response: np.ndarray,
+    weights: np.ndarray,
+    penalties: Sequence[float],
+    l1_ratio: float,
+    alpha_init: np.ndarray,
+    beta_init: np.ndarray,
+    *,
+    batch_size: int,
+    max_epochs: int,
+    tolerance: float,
+) -> list[tuple[np.ndarray, np.ndarray, float]]:
+    if strong_matrix._dense_cache is not None:
+        return _weighted_elastic_net_dense_strong_set_path(
+            dense_strong_matrix=strong_matrix._dense_cache,
+            covariate_matrix=covariate_matrix,
+            response=response,
+            weights=weights,
+            penalties=penalties,
+            l1_ratio=l1_ratio,
+            alpha_init=alpha_init,
+            beta_init=beta_init,
+            max_epochs=max_epochs,
+            tolerance=tolerance,
+        )
+    covariates = np.asarray(covariate_matrix, dtype=np.float64)
+    target_array = np.asarray(response, dtype=np.float64)
+    weight_array = np.asarray(weights, dtype=np.float64)
+    sample_count = max(int(target_array.shape[0]), 1)
+    strong_size = int(strong_matrix.shape[1])
+    weighted_covariates = weight_array[:, None] * covariates if covariates.shape[1] > 0 else np.zeros_like(covariates)
+    covariate_cholesky = (
+        np.linalg.cholesky(covariates.T @ weighted_covariates + np.eye(covariates.shape[1], dtype=np.float64) * 1e-8)
+        if covariates.shape[1] > 0
+        else np.zeros((0, 0), dtype=np.float64)
+    )
+    alpha = np.asarray(alpha_init, dtype=np.float64).copy()
+    beta = np.asarray(beta_init, dtype=np.float64).copy()
+    if beta.shape[0] != strong_size:
+        raise ValueError("beta_init must match strong-set width.")
+    use_unit_weights = bool(np.all(weight_array == 1.0))
+    batch_diagonals = _basil_batch_diagonals(
+        strong_matrix,
+        weight_array,
+        batch_size=batch_size,
+        sample_count=sample_count,
+    )
+    results: list[tuple[np.ndarray, np.ndarray, float]] = []
+    residual = target_array - covariates @ alpha - _basil_strong_set_matvec(
+        strong_matrix,
+        beta,
+        batch_size=batch_size,
+    )
+    _require_finite_basil_state("coordinate-descent initialization", alpha, beta, residual)
+    for penalty in penalties:
+        penalty_value = float(penalty)
+        for _epoch_index in range(max(int(max_epochs), 1)):
+            if covariates.shape[1] > 0:
+                current_covariate_component = covariates @ alpha
+                covariate_rhs = weighted_covariates.T @ (residual + current_covariate_component)
+                lower_solution = solve_triangular(covariate_cholesky, covariate_rhs, lower=True)
+                alpha_next = solve_triangular(covariate_cholesky.T, lower_solution, lower=False)
+            else:
+                alpha_next = np.zeros(0, dtype=np.float64)
+            max_change = float(np.max(np.abs(alpha_next - alpha))) if alpha_next.size > 0 else 0.0
+            if alpha_next.size > 0:
+                residual -= covariates @ (alpha_next - alpha)
+            alpha = np.asarray(alpha_next, dtype=np.float64)
+            for batch, diagonal in zip(strong_matrix.iter_column_batches(batch_size=batch_size), batch_diagonals):
+                positions = np.asarray(batch.variant_indices, dtype=np.int32)
+                values = np.asarray(batch.values, dtype=np.float64)
+                if use_unit_weights:
+                    weighted_values = values
+                else:
+                    weighted_values = weight_array[:, None] * values
+                for batch_offset, variant_index in enumerate(positions):
+                    column = values[:, batch_offset]
+                    weighted_column = weighted_values[:, batch_offset]
+                    old_value = float(beta[variant_index])
+                    rho = float(weighted_column @ (residual + column * old_value)) / sample_count
+                    denominator = float(diagonal[batch_offset] + penalty_value * (1.0 - float(l1_ratio)))
+                    new_value = 0.0 if denominator <= 0.0 else _soft_threshold(rho, penalty_value * float(l1_ratio)) / denominator
+                    delta = new_value - old_value
+                    if delta != 0.0:
+                        beta[variant_index] = new_value
+                        residual -= column * delta
+                        max_change = max(max_change, abs(delta))
+            _require_finite_basil_state("coordinate-descent epoch", alpha, beta, residual)
+            if max_change <= float(tolerance):
+                break
+        objective = (
+            0.5 * float(np.mean(weight_array * residual * residual))
+            + penalty_value * float(l1_ratio) * float(np.sum(np.abs(beta)))
+            + 0.5 * penalty_value * (1.0 - float(l1_ratio)) * float(np.dot(beta, beta))
+        )
+        if not np.isfinite(objective):
+            raise RuntimeError("BASIL produced a non-finite objective.")
+        results.append((np.asarray(alpha, dtype=np.float64).copy(), np.asarray(beta, dtype=np.float64).copy(), objective))
+    return results
+
+
+def _penalized_logistic_objective(
+    linear_predictor: np.ndarray,
+    targets: np.ndarray,
+    beta: np.ndarray,
+    penalty: float,
+    l1_ratio: float,
+) -> float:
+    predictor = np.asarray(linear_predictor, dtype=np.float64)
+    target_array = np.asarray(targets, dtype=np.float64)
+    beta_array = np.asarray(beta, dtype=np.float64)
+    return float(
+        np.mean(np.logaddexp(0.0, predictor) - target_array * predictor)
+        + float(penalty) * float(l1_ratio) * np.sum(np.abs(beta_array))
+        + 0.5 * float(penalty) * (1.0 - float(l1_ratio)) * np.dot(beta_array, beta_array)
+    )
+
+
+def _quantitative_basil_bic_score(
+    residual: np.ndarray,
+    alpha: np.ndarray,
+    beta: np.ndarray,
+) -> float:
+    residual_array = np.asarray(residual, dtype=np.float64)
+    sample_count = max(int(residual_array.shape[0]), 1)
+    residual_sum_squares = max(float(np.dot(residual_array, residual_array)), 1e-12)
+    parameter_count = int(np.count_nonzero(np.abs(np.asarray(beta, dtype=np.float64)) > 1e-10)) + int(
+        np.asarray(alpha, dtype=np.float64).shape[0]
+    )
+    return float(sample_count * np.log(residual_sum_squares / sample_count) + parameter_count * np.log(sample_count))
+
+
+def _binary_basil_bic_score(
+    linear_predictor: np.ndarray,
+    targets: np.ndarray,
+    alpha: np.ndarray,
+    beta: np.ndarray,
+) -> float:
+    predictor = np.asarray(linear_predictor, dtype=np.float64)
+    target_array = np.asarray(targets, dtype=np.float64)
+    probabilities = np.asarray(stable_sigmoid(predictor), dtype=np.float64)
+    log_likelihood = float(
+        np.sum(
+            target_array * np.log(probabilities + 1e-12)
+            + (1.0 - target_array) * np.log(1.0 - probabilities + 1e-12)
+        )
+    )
+    sample_count = max(int(target_array.shape[0]), 1)
+    parameter_count = int(np.count_nonzero(np.abs(np.asarray(beta, dtype=np.float64)) > 1e-10)) + int(
+        np.asarray(alpha, dtype=np.float64).shape[0]
+    )
+    return float(-2.0 * log_likelihood + parameter_count * np.log(sample_count))
+
+
+def _fit_basil_quantitative_path(
+    genotype_matrix: StandardizedGenotypeMatrix,
+    covariate_matrix: np.ndarray,
+    targets: np.ndarray,
+    config: ModelConfig,
+    *,
+    predictor_offset: np.ndarray,
+    validation_data: tuple[StandardizedGenotypeMatrix | np.ndarray, np.ndarray, np.ndarray] | None,
+    validation_offset: np.ndarray | None,
+) -> tuple[np.ndarray, np.ndarray, list[float], list[float]]:
+    sample_count = max(int(genotype_matrix.shape[0]), 1)
+    variant_count = int(genotype_matrix.shape[1])
+    response = np.asarray(targets, dtype=np.float64) - np.asarray(predictor_offset, dtype=np.float64)
+    weights = np.ones(sample_count, dtype=np.float64)
+    alpha_start = _solve_weighted_covariates(covariate_matrix, response, weights)
+    residual_start = response - covariate_matrix @ alpha_start
+    lambda_max = float(
+        np.max(
+            np.abs(
+                np.asarray(
+                    genotype_matrix.transpose_matvec(residual_start, batch_size=config.posterior_variance_batch_size),
+                    dtype=np.float64,
+                )
+            )
+        )
+    ) / max(float(config.basil_l1_ratio) * sample_count, 1e-8)
+    penalties = _basil_lambda_grid(lambda_max, config.basil_lambda_min_ratio, config.basil_n_lambdas)
+    objective_by_index: list[float | None] = [None] * len(penalties)
+    validation_by_index: list[float | None] = [None] * len(penalties)
+    selection_score_by_index: list[float | None] = [None] * len(penalties)
+    solution_alphas: list[np.ndarray | None] = [None] * len(penalties)
+    solution_betas: list[np.ndarray | None] = [None] * len(penalties)
+    ever_active = np.empty(0, dtype=np.int32)
+    beta_previous = np.zeros(variant_count, dtype=np.float64)
+    alpha_previous = np.asarray(alpha_start, dtype=np.float64)
+    gradient_previous = np.asarray(
+        genotype_matrix.transpose_matvec(residual_start, batch_size=config.posterior_variance_batch_size),
+        dtype=np.float64,
+    ) / sample_count
+    certified_index = -1
+    while certified_index < len(penalties) - 1:
+        strong_budget = min(
+            max(int(config.basil_strong_set_initial_size), ever_active.shape[0]),
+            variant_count,
+        )
+        screening_score = np.abs(gradient_previous)
+        strong_indices = _basil_strong_set_indices(screening_score, ever_active, strong_budget)
+        for screening_pass in range(max(int(config.basil_max_screening_passes), 1)):
+            batch_start = certified_index + 1
+            batch_end = min(certified_index + int(config.basil_batch_size), len(penalties) - 1)
+            full_strong_set = strong_indices.shape[0] == variant_count
+            solve_max_epochs = int(config.basil_coordinate_descent_max_epochs)
+            if full_strong_set:
+                solve_max_epochs *= screening_pass + 1
+            strong_matrix = _prepare_basil_strong_set_matrix(
+                genotype_matrix,
+                strong_indices,
+            )
+            path_results = _weighted_elastic_net_strong_set_path(
+                strong_matrix=strong_matrix,
+                covariate_matrix=covariate_matrix,
+                response=response,
+                weights=weights,
+                penalties=penalties[batch_start : batch_end + 1],
+                l1_ratio=config.basil_l1_ratio,
+                alpha_init=alpha_previous,
+                beta_init=beta_previous[strong_indices],
+                batch_size=config.posterior_variance_batch_size,
+                max_epochs=solve_max_epochs,
+                tolerance=config.basil_coordinate_descent_tolerance,
+            )
+            failed_gradient: np.ndarray | None = None
+            failed_beta: np.ndarray | None = None
+            failed_alpha: np.ndarray | None = None
+            failed_penalty: float | None = None
+            accepted_any = False
+            for batch_offset, (candidate_alpha, candidate_subset_beta, candidate_objective) in enumerate(path_results):
+                penalty_index = batch_start + batch_offset
+                beta_candidate = np.zeros(variant_count, dtype=np.float64)
+                beta_candidate[strong_indices] = np.asarray(candidate_subset_beta, dtype=np.float64)
+                residual = response - covariate_matrix @ candidate_alpha - np.asarray(
+                    genotype_matrix.matvec(beta_candidate, batch_size=config.posterior_variance_batch_size),
+                    dtype=np.float64,
+                )
+                gradient = np.asarray(
+                    genotype_matrix.transpose_matvec(residual, batch_size=config.posterior_variance_batch_size),
+                    dtype=np.float64,
+                ) / sample_count
+                kkt_violations = _elastic_net_kkt_violations(
+                    gradient,
+                    beta_candidate,
+                    penalties[penalty_index],
+                    config.basil_l1_ratio,
+                    )
+                if float(np.max(kkt_violations)) > float(config.basil_kkt_tolerance):
+                    failed_alpha = np.asarray(candidate_alpha, dtype=np.float64)
+                    failed_gradient = gradient
+                    failed_beta = beta_candidate
+                    failed_penalty = float(penalties[penalty_index])
+                    break
+                accepted_any = True
+                certified_index = penalty_index
+                alpha_previous = np.asarray(candidate_alpha, dtype=np.float64)
+                beta_previous = np.asarray(beta_candidate, dtype=np.float64)
+                gradient_previous = np.asarray(gradient, dtype=np.float64)
+                ever_active = _ordered_unique_indices(
+                    [ever_active, np.flatnonzero(np.abs(beta_previous) > 1e-10).astype(np.int32)],
+                    variant_count,
+                )
+                solution_alphas[penalty_index] = alpha_previous.copy()
+                solution_betas[penalty_index] = beta_previous.copy()
+                objective_by_index[penalty_index] = float(candidate_objective)
+                selection_score_by_index[penalty_index] = _quantitative_basil_bic_score(
+                    residual=residual,
+                    alpha=alpha_previous,
+                    beta=beta_previous,
+                )
+                if validation_data is not None:
+                    validation_metric = _validation_metric(
+                        trait_type=TraitType.QUANTITATIVE,
+                        genotype_matrix=validation_data[0],
+                        covariate_matrix=validation_data[1],
+                        targets=validation_data[2],
+                        alpha=alpha_previous,
+                        beta=beta_previous,
+                        predictor_offset=validation_offset,
+                    )
+                    validation_by_index[penalty_index] = float(validation_metric)
+            if failed_gradient is None:
+                log(
+                    "  BASIL quantitative batch certified "
+                    + f"(lambdas={certified_index + 1}/{len(penalties)}, strong_set={strong_indices.shape[0]}/{variant_count})"
+                )
+                break
+            if failed_alpha is not None and failed_beta is not None and failed_gradient is not None:
+                alpha_previous = failed_alpha.copy()
+                beta_previous = np.asarray(failed_beta, dtype=np.float64).copy()
+                gradient_previous = np.asarray(failed_gradient, dtype=np.float64).copy()
+            violating_indices = np.flatnonzero(
+                _elastic_net_kkt_violations(
+                    failed_gradient,
+                    np.asarray(failed_beta, dtype=np.float64),
+                    float(failed_penalty),
+                    config.basil_l1_ratio,
+                ) > float(config.basil_kkt_tolerance)
+            ).astype(np.int32, copy=False)
+            strong_budget = min(
+                max(strong_budget + int(config.basil_strong_set_growth), ever_active.shape[0]),
+                variant_count,
+            )
+            strong_indices = _ordered_unique_indices(
+                [
+                    ever_active,
+                    violating_indices,
+                    _basil_strong_set_indices(np.abs(failed_gradient), ever_active, strong_budget),
+                ],
+                variant_count,
+            )
+            log(
+                "  BASIL quantitative expanded strong set "
+                + f"(pass={screening_pass + 1}, strong_set={strong_indices.shape[0]}/{variant_count}, "
+                + f"violations={violating_indices.shape[0]}, accepted_prefix={certified_index + 1})"
+            )
+            if not accepted_any:
+                alpha_previous = alpha_previous.copy()
+                beta_previous = beta_previous.copy()
+        else:
+            raise RuntimeError("BASIL quantitative path failed to certify a strong set.")
+    if not any(solution is not None for solution in solution_betas):
+        raise RuntimeError("BASIL quantitative path did not produce any certified solution.")
+    compact_objective_history = [float(value) for value in objective_by_index if value is not None]
+    compact_validation_history = [float(value) for value in validation_by_index if value is not None]
+    selected_index = _select_basil_solution_index(
+        validation_scores=validation_by_index,
+        selection_scores=selection_score_by_index,
+    )
+    selected_alpha = solution_alphas[selected_index]
+    selected_beta = solution_betas[selected_index]
+    if selected_alpha is None or selected_beta is None:
+        raise RuntimeError("BASIL quantitative path did not retain the selected solution.")
+    return selected_alpha, selected_beta, compact_objective_history, compact_validation_history
+
+
+def _fit_basil_binary_single_lambda(
+    genotype_matrix: StandardizedGenotypeMatrix,
+    covariate_matrix: np.ndarray,
+    targets: np.ndarray,
+    config: ModelConfig,
+    *,
+    penalty: float,
+    predictor_offset: np.ndarray,
+    alpha_init: np.ndarray,
+    beta_init: np.ndarray,
+    ever_active: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray, float, np.ndarray, np.ndarray]:
+    sample_count = max(int(genotype_matrix.shape[0]), 1)
+    variant_count = int(genotype_matrix.shape[1])
+    beta_previous = np.asarray(beta_init, dtype=np.float64).copy()
+    alpha_previous = np.asarray(alpha_init, dtype=np.float64).copy()
+    strong_budget = min(
+        max(int(config.basil_strong_set_initial_size), int(ever_active.shape[0]), 1),
+        variant_count,
+    )
+    linear_predictor_start = np.asarray(
+        predictor_offset + covariate_matrix @ alpha_previous + genotype_matrix.matvec(beta_previous, batch_size=config.posterior_variance_batch_size),
+        dtype=np.float64,
+    )
+    probability_start = np.asarray(stable_sigmoid(linear_predictor_start), dtype=np.float64)
+    score_start = np.asarray(
+        genotype_matrix.transpose_matvec(
+            np.asarray(targets, dtype=np.float64) - probability_start,
+            batch_size=config.posterior_variance_batch_size,
+        ),
+        dtype=np.float64,
+    ) / sample_count
+    strong_indices = _basil_strong_set_indices(np.abs(score_start), ever_active, strong_budget)
+    for screening_pass in range(max(int(config.basil_max_screening_passes), 1)):
+        full_strong_set = strong_indices.shape[0] == variant_count
+        solve_max_epochs = int(config.basil_coordinate_descent_max_epochs)
+        if full_strong_set:
+            solve_max_epochs *= screening_pass + 1
+        strong_matrix = _prepare_basil_strong_set_matrix(
+            genotype_matrix,
+            strong_indices,
+        )
+        subset_beta = np.asarray(beta_previous[strong_indices], dtype=np.float64).copy()
+        alpha = np.asarray(alpha_previous, dtype=np.float64).copy()
+        for _irls_iteration in range(max(int(config.basil_irls_max_iterations), 1)):
+            linear_predictor = predictor_offset + covariate_matrix @ alpha + _basil_strong_set_matvec(
+                strong_matrix,
+                subset_beta,
+                batch_size=config.posterior_variance_batch_size,
+            )
+            probabilities = np.asarray(stable_sigmoid(linear_predictor), dtype=np.float64)
+            weights = np.maximum(
+                probabilities * (1.0 - probabilities),
+                float(config.polya_gamma_minimum_weight),
+            )
+            pseudo_response = linear_predictor + (np.asarray(targets, dtype=np.float64) - probabilities) / weights - predictor_offset
+            alpha_next, subset_beta_next, _ = _weighted_elastic_net_strong_set_path(
+                strong_matrix=strong_matrix,
+                covariate_matrix=covariate_matrix,
+                response=pseudo_response,
+                weights=weights,
+                penalties=[penalty],
+                l1_ratio=config.basil_l1_ratio,
+                alpha_init=alpha,
+                beta_init=subset_beta,
+                batch_size=config.posterior_variance_batch_size,
+                max_epochs=solve_max_epochs,
+                tolerance=config.basil_coordinate_descent_tolerance,
+            )[0]
+            step_size = max(
+                float(np.max(np.abs(alpha_next - alpha))) if alpha_next.size > 0 else 0.0,
+                float(np.max(np.abs(subset_beta_next - subset_beta))) if subset_beta_next.size > 0 else 0.0,
+            )
+            alpha = np.asarray(alpha_next, dtype=np.float64)
+            subset_beta = np.asarray(subset_beta_next, dtype=np.float64)
+            if step_size <= float(config.convergence_tolerance):
+                break
+        beta_candidate = np.zeros(variant_count, dtype=np.float64)
+        beta_candidate[strong_indices] = subset_beta
+        full_linear_predictor = np.asarray(
+            predictor_offset + covariate_matrix @ alpha + genotype_matrix.matvec(beta_candidate, batch_size=config.posterior_variance_batch_size),
+            dtype=np.float64,
+        )
+        full_probabilities = np.asarray(stable_sigmoid(full_linear_predictor), dtype=np.float64)
+        full_score = np.asarray(
+            genotype_matrix.transpose_matvec(
+                np.asarray(targets, dtype=np.float64) - full_probabilities,
+                batch_size=config.posterior_variance_batch_size,
+            ),
+            dtype=np.float64,
+        ) / sample_count
+        kkt_violations = _elastic_net_kkt_violations(
+            full_score,
+            beta_candidate,
+            penalty,
+            config.basil_l1_ratio,
+        )
+        if float(np.max(kkt_violations)) <= float(config.basil_kkt_tolerance):
+            objective = _penalized_logistic_objective(
+                full_linear_predictor,
+                np.asarray(targets, dtype=np.float64),
+                beta_candidate,
+                penalty,
+                config.basil_l1_ratio,
+            )
+            next_ever_active = _ordered_unique_indices(
+                [ever_active, np.flatnonzero(np.abs(beta_candidate) > 1e-10).astype(np.int32)],
+                variant_count,
+            )
+            return alpha, beta_candidate, objective, full_score, next_ever_active
+        violating_indices = np.flatnonzero(kkt_violations > float(config.basil_kkt_tolerance)).astype(np.int32, copy=False)
+        strong_budget = min(
+            max(strong_budget + int(config.basil_strong_set_growth), ever_active.shape[0]),
+            variant_count,
+        )
+        strong_indices = _ordered_unique_indices(
+            [
+                ever_active,
+                violating_indices,
+                _basil_strong_set_indices(np.abs(full_score), ever_active, strong_budget),
+            ],
+            variant_count,
+        )
+        log(
+            "  BASIL binary expanded strong set "
+            + f"(pass={screening_pass + 1}, strong_set={strong_indices.shape[0]}/{variant_count}, "
+            + f"violations={violating_indices.shape[0]}, lambda={penalty:.3e})"
+        )
+    raise RuntimeError("BASIL binary path failed to certify a strong set.")
+
+
+def _fit_basil_path(
+    genotype_matrix: StandardizedGenotypeMatrix,
+    covariate_matrix: np.ndarray,
+    targets: np.ndarray,
+    records: Sequence[VariantRecord],
+    tie_map: TieMap,
+    config: ModelConfig,
+    *,
+    validation_data: tuple[StandardizedGenotypeMatrix | np.ndarray, np.ndarray, np.ndarray] | None,
+    predictor_offset: np.ndarray,
+    validation_offset: np.ndarray | None,
+) -> VariationalFitResult:
+    sample_count = int(genotype_matrix.shape[0])
+    response_targets = np.asarray(targets, dtype=np.float64)
+    offset = np.asarray(predictor_offset, dtype=np.float64)
+    if config.trait_type == TraitType.QUANTITATIVE:
+        alpha, beta, objective_history, validation_history = _fit_basil_quantitative_path(
+            genotype_matrix=genotype_matrix,
+            covariate_matrix=covariate_matrix,
+            targets=response_targets,
+            config=config,
+            predictor_offset=offset,
+            validation_data=validation_data,
+            validation_offset=validation_offset,
+        )
+        sigma_error2 = max(
+            float(
+                np.mean(
+                    (
+                        response_targets
+                        - offset
+                        - covariate_matrix @ alpha
+                        - np.asarray(genotype_matrix.matvec(beta, batch_size=config.posterior_variance_batch_size), dtype=np.float64)
+                    )
+                    ** 2
+                )
+            ),
+            float(config.sigma_error_floor),
+        )
+    else:
+        null_alpha = _fit_binary_alpha_with_offset(
+            covariate_matrix=covariate_matrix,
+            targets=response_targets,
+            predictor_offset=offset,
+            minimum_weight=config.polya_gamma_minimum_weight,
+            max_iterations=config.max_inner_newton_iterations,
+            gradient_tolerance=config.newton_gradient_tolerance,
+            alpha_init=None,
+        )
+        null_linear_predictor = np.asarray(offset + covariate_matrix @ null_alpha, dtype=np.float64)
+        null_probabilities = np.asarray(stable_sigmoid(null_linear_predictor), dtype=np.float64)
+        lambda_max = float(
+            np.max(
+                np.abs(
+                    np.asarray(
+                        genotype_matrix.transpose_matvec(
+                            response_targets - null_probabilities,
+                            batch_size=config.posterior_variance_batch_size,
+                        ),
+                        dtype=np.float64,
+                    )
+                )
+            )
+        ) / max(float(config.basil_l1_ratio) * max(int(sample_count), 1), 1e-8)
+        penalties = _basil_lambda_grid(lambda_max, config.basil_lambda_min_ratio, config.basil_n_lambdas)
+        alpha = np.asarray(null_alpha, dtype=np.float64)
+        beta = np.zeros(genotype_matrix.shape[1], dtype=np.float64)
+        ever_active = np.empty(0, dtype=np.int32)
+        objective_history = []
+        validation_history = []
+        selection_history = []
+        alpha_path: list[np.ndarray] = []
+        beta_path: list[np.ndarray] = []
+        linear_predictor_path: list[np.ndarray] = []
+        for penalty in penalties:
+            alpha, beta, objective, _score, ever_active = _fit_basil_binary_single_lambda(
+                genotype_matrix=genotype_matrix,
+                covariate_matrix=covariate_matrix,
+                targets=response_targets,
+                config=config,
+                penalty=float(penalty),
+                predictor_offset=offset,
+                alpha_init=alpha,
+                beta_init=beta,
+                ever_active=ever_active,
+            )
+            alpha_path.append(alpha.copy())
+            beta_path.append(beta.copy())
+            objective_history.append(float(objective))
+            linear_predictor_path.append(
+                np.asarray(
+                    offset + covariate_matrix @ alpha + genotype_matrix.matvec(beta, batch_size=config.posterior_variance_batch_size),
+                    dtype=np.float64,
+                )
+            )
+            selection_history.append(
+                _binary_basil_bic_score(
+                    linear_predictor=linear_predictor_path[-1],
+                    targets=response_targets,
+                    alpha=alpha,
+                    beta=beta,
+                )
+            )
+            if validation_data is not None:
+                validation_history.append(
+                    _validation_metric(
+                        trait_type=TraitType.BINARY,
+                        genotype_matrix=validation_data[0],
+                        covariate_matrix=validation_data[1],
+                        targets=validation_data[2],
+                        alpha=alpha,
+                        beta=beta,
+                        predictor_offset=validation_offset,
+                    )
+                )
+        selected_index = _select_basil_solution_index(
+            validation_scores=validation_history,
+            selection_scores=selection_history,
+        )
+        alpha = alpha_path[selected_index]
+        beta = beta_path[selected_index]
+        sigma_error2 = 1.0
+    if config.trait_type == TraitType.BINARY and config.binary_intercept_calibration:
+        predictor = offset + covariate_matrix @ alpha + np.asarray(
+            genotype_matrix.matvec(beta, batch_size=config.posterior_variance_batch_size),
+            dtype=np.float64,
+        )
+        intercept_shift = _calibrate_binary_intercept(predictor, response_targets)
+        alpha = np.asarray(alpha, dtype=np.float64).copy()
+        if alpha.shape[0] > 0:
+            alpha[0] += intercept_shift
+    default_shape_a = config.class_tpb_shape_a()
+    default_shape_b = config.class_tpb_shape_b()
+    member_prior_variances = np.ones(len(records), dtype=np.float32)
+    log(
+        "  BASIL fit complete "
+        + f"(backend={config.inference_backend.value}, trait={config.trait_type.value}, "
+        + f"nonzero={int(np.count_nonzero(np.abs(beta) > 1e-10))}/{genotype_matrix.shape[1]})"
+    )
+    return VariationalFitResult(
+        alpha=np.asarray(alpha, dtype=np.float32),
+        beta_reduced=np.asarray(beta, dtype=np.float32),
+        beta_variance=np.zeros(genotype_matrix.shape[1], dtype=np.float32),
+        prior_scales=member_prior_variances.copy(),
+        global_scale=1.0,
+        class_tpb_shape_a={variant_class: float(value) for variant_class, value in default_shape_a.items()},
+        class_tpb_shape_b={variant_class: float(value) for variant_class, value in default_shape_b.items()},
+        scale_model_coefficients=np.zeros(0, dtype=np.float32),
+        scale_model_feature_names=[],
+        sigma_error2=float(sigma_error2),
+        objective_history=[float(value) for value in objective_history],
+        validation_history=[float(value) for value in validation_history],
+        member_prior_variances=member_prior_variances.copy(),
     )
 
 
@@ -4309,7 +5192,7 @@ def _active_working_set_indices(
     return np.flatnonzero(np.abs(np.asarray(beta, dtype=np.float64)) > active_threshold).astype(np.int32, copy=False)
 
 
-def _basil_working_set_indices(
+def _posterior_working_set_indices(
     screening_score: np.ndarray,
     ever_active_indices: np.ndarray,
     target_size: int,
@@ -4410,7 +5293,7 @@ def _restricted_posterior_state_temporary_working_set(
         variant_count,
     )
     working_size = min(max(int(temporary_working_set_initial_size), 1), variant_count)
-    working_indices = _basil_working_set_indices(
+    working_indices = _posterior_working_set_indices(
         _working_set_screening_score(current_gradient, current_beta, prior_variances),
         ever_active_indices,
         max(working_size, ever_active_indices.shape[0]),
@@ -4420,7 +5303,7 @@ def _restricted_posterior_state_temporary_working_set(
         import time as _ws_time
         _ws_pass_t0 = _ws_time.monotonic()
         log(
-            "    BASIL screening pass "
+            "    posterior working-set pass "
             + f"{working_pass + 1}/{int(temporary_working_set_max_passes)} "
             + f"size={working_indices.shape[0]}/{variant_count} "
             + f"ever_active={ever_active_indices.shape[0]}  mem={mem()}"
@@ -4536,7 +5419,7 @@ def _restricted_posterior_state_temporary_working_set(
             [
                 ever_active_indices,
                 violating_indices,
-                _basil_working_set_indices(candidate_score, ever_active_indices, next_size),
+                _posterior_working_set_indices(candidate_score, ever_active_indices, next_size),
             ],
             variant_count,
         )
