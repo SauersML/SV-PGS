@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
+from typing import cast
 
 import numpy as np
 import pytest
@@ -905,13 +906,13 @@ def test_coefficient_table_preserves_full_variant_alignment_after_filtering(tmp_
     assert [row["variant_class"] for row in coefficient_rows] == [
         record.variant_class.value for record in variant_records
     ]
-    assert [float(row["beta"]) for row in coefficient_rows] == pytest.approx([0.0, 1.5, 0.0, -0.25])
+    assert [float(cast(float, row["beta"])) for row in coefficient_rows] == pytest.approx([0.0, 1.5, 0.0, -0.25])
 
     artifact_dir = tmp_path / "filtered_artifact"
     model.export(artifact_dir)
     loaded_rows = BayesianPGS.load(artifact_dir).coefficient_table()
     assert [row["variant_id"] for row in loaded_rows] == [record.variant_id for record in variant_records]
-    assert [float(row["beta"]) for row in loaded_rows] == pytest.approx([0.0, 1.5, 0.0, -0.25])
+    assert [float(cast(float, row["beta"])) for row in loaded_rows] == pytest.approx([0.0, 1.5, 0.0, -0.25])
 
 
 def test_model_fit_supports_covariates_only_when_no_variants_survive(tmp_path):

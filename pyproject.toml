@@ -36,6 +36,14 @@ python_version = "3.12"
 
 [[tool.mypy.overrides]]
 module = [
+    "numpy",
+    "numpy.*",
+    "pytest",
+    "pytest.*",
+    "jax",
+    "jax.*",
+    "jaxlib",
+    "jaxlib.*",
     "sklearn",
     "sklearn.*",
     "google.cloud",

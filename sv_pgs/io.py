@@ -770,9 +770,12 @@ def run_training_pipeline(
             ),
             variant_stats=None,
         )
+        tuning_state = tuning_model.state
+        if tuning_state is None:
+            raise RuntimeError("tuning model fit completed without state.")
         selected_iteration_count = int(
             getattr(
-                tuning_model.state.fit_result,
+                tuning_state.fit_result,
                 "selected_iteration_count",
                 config.max_outer_iterations,
             )
@@ -785,7 +788,7 @@ def run_training_pipeline(
                 "validation_sample_count": int(held_out_dataset.genotypes.shape[0]),
                 "validation_history": [
                     float(value)
-                    for value in getattr(tuning_model.state.fit_result, "validation_history", [])
+                    for value in getattr(tuning_state.fit_result, "validation_history", [])
                 ],
             }
         )
@@ -834,9 +837,12 @@ def run_training_pipeline(
         dataset=dataset,
         model=model,
     ))
-    active_count = int(model.state.active_variant_indices.shape[0]) if model.state is not None else 0
+    fitted_state = model.state
+    if fitted_state is None:
+        raise RuntimeError("trained model is missing fitted state.")
+    active_count = int(fitted_state.active_variant_indices.shape[0])
     selected_iteration_count = getattr(
-        model.state.fit_result,
+        fitted_state.fit_result,
         "selected_iteration_count",
         model.config.max_outer_iterations,
     )
@@ -2359,11 +2365,14 @@ def _merge_variant_metadata(
         for column_name, column_value in metadata_row.items()
         if column_name.startswith("prior_continuous__")
     }
-    prior_categorical_features = {
-        column_name.removeprefix("prior_categorical__"): _parse_string_feature_or_skip(column_value)
-        for column_name, column_value in metadata_row.items()
-        if column_name.startswith("prior_categorical__") and _parse_string_feature_or_skip(column_value) is not None
-    }
+    prior_categorical_features: dict[str, str] = {}
+    for column_name, column_value in metadata_row.items():
+        if not column_name.startswith("prior_categorical__"):
+            continue
+        parsed_value = _parse_string_feature_or_skip(column_value)
+        if parsed_value is None:
+            continue
+        prior_categorical_features[column_name.removeprefix("prior_categorical__")] = parsed_value
     prior_membership_features = {
         column_name.removeprefix("prior_membership__"): _parse_weighted_levels(
             column_value,

@@ -435,8 +435,8 @@ def test_cli_run_builds_config(monkeypatch, tmp_path: Path):
     )
 
     assert exit_code == 0
-    load_config = cast(object, captured["load_config"])
-    pipeline_config = cast(object, captured["pipeline_config"])
+    load_config = cast(ModelConfig, captured["load_config"])
+    pipeline_config = cast(ModelConfig, captured["pipeline_config"])
     assert load_config.max_outer_iterations == 30
     assert load_config.pipeline_validation_fraction == pytest.approx(0.25)
     assert load_config.pipeline_validation_min_samples == 7

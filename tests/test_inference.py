@@ -1172,7 +1172,7 @@ def test_stochastic_restricted_cross_leverage_diagonal_caches_fixed_probe_projec
     counting_standardized = _CountingGenotypeMatrix(standardized)
 
     expected = mixture_inference._stochastic_restricted_cross_leverage_diagonal(
-        genotype_matrix=counting_standardized,
+        genotype_matrix=cast(Any, counting_standardized),
         covariate_matrix=covariate_matrix,
         solve_rhs=lambda rhs: rhs,
         inverse_covariance_covariates=inverse_covariance_covariates,
@@ -1184,7 +1184,7 @@ def test_stochastic_restricted_cross_leverage_diagonal_caches_fixed_probe_projec
         inverse_covariance_probe_matrix=inverse_covariance_probe_matrix,
     )
     actual = mixture_inference._stochastic_restricted_cross_leverage_diagonal(
-        genotype_matrix=counting_standardized,
+        genotype_matrix=cast(Any, counting_standardized),
         covariate_matrix=covariate_matrix,
         solve_rhs=lambda rhs: rhs,
         inverse_covariance_covariates=inverse_covariance_covariates,
@@ -1366,7 +1366,7 @@ def test_restricted_posterior_sample_space_fuses_beta_and_restricted_probe_trans
     monkeypatch.setattr(mixture_inference, "stochastic_logdet", lambda *args, **kwargs: 0.0)
 
     alpha, beta, beta_variance, projected_targets, linear_predictor, *_ = mixture_inference._restricted_posterior_state(
-        genotype_matrix=counting_standardized,
+        genotype_matrix=cast(Any, counting_standardized),
         covariate_matrix=covariate_matrix,
         targets=targets,
         prior_variances=prior_variances,
@@ -3197,10 +3197,11 @@ def test_exact_variant_gpu_summary_path_matches_dense_reference(monkeypatch: pyt
     fake_cupy.float64 = np.float64
     fake_cupy.asarray = lambda array, dtype=None: np.asarray(array, dtype=dtype)
     fake_cupy.arange = np.arange
-    fake_cupy.empty = lambda shape, dtype=None, order=None: (
-        empty_dtypes.append(dtype),
-        np.empty(shape, dtype=dtype, order="C" if order is None else order),
-    )[1]
+    def fake_empty(shape, dtype=None, order=None):
+        empty_dtypes.append(dtype)
+        return np.empty(shape, dtype=dtype, order="C" if order is None else order)
+
+    fake_cupy.empty = fake_empty
     fake_cupy.zeros = np.zeros
     fake_cupy.eye = np.eye
     fake_cupy.diag = np.diag

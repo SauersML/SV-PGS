@@ -7,6 +7,7 @@ import os
 import struct
 from types import SimpleNamespace
 from pathlib import Path
+from typing import cast
 
 import numpy as np
 import pytest
@@ -542,6 +543,54 @@ def test_vcf_cache_load_upgrades_legacy_row_major_matrix(tmp_path: Path):
     assert isinstance(reloaded_genotypes, np.memmap)
     np.testing.assert_array_equal(reloaded_genotypes, genotype_matrix)
     assert reloaded_genotypes.flags.f_contiguous
+
+
+def test_vcf_cache_load_rejects_cache_when_layout_normalization_fails(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    vcf_path = tmp_path / "cohort.vcf"
+    vcf_path.write_text("##fileformat=VCFv4.2\n", encoding="utf-8")
+    config = ModelConfig()
+    genotype_matrix = np.array([[0, 1], [1, 2]], dtype=np.int8, order="C")
+    variants = [
+        _VariantDefaults(
+            variant_id="variant_0",
+            variant_class=VariantClass.SNV,
+            chromosome="1",
+            position=100,
+            length=1.0,
+            allele_frequency=0.25,
+            quality=50.0,
+        ),
+        _VariantDefaults(
+            variant_id="variant_1",
+            variant_class=VariantClass.SNV,
+            chromosome="1",
+            position=101,
+            length=1.0,
+            allele_frequency=0.75,
+            quality=40.0,
+        ),
+    ]
+    variant_stats = VariantStatistics(
+        means=np.array([0.5, 1.5], dtype=np.float32),
+        scales=np.array([0.75, 0.75], dtype=np.float32),
+        allele_frequencies=np.array([0.25, 0.75], dtype=np.float32),
+        support_counts=np.array([1, 2], dtype=np.int32),
+    )
+
+    _save_vcf_to_cache(
+        vcf_path=vcf_path,
+        genotype_matrix=genotype_matrix,
+        variants=variants,
+        variant_stats=variant_stats,
+        config=config,
+    )
+
+    monkeypatch.setattr(
+        "sv_pgs.io._ensure_vcf_cache_matrix_fast",
+        lambda paths, genotype_matrix: (_ for _ in ()).throw(RuntimeError("broken cache layout")),
+    )
+
+    assert _load_vcf_from_cache(vcf_path=vcf_path, config=config) is None
 
 
 def test_vcf_cache_key_ignores_mtime_for_identical_content(tmp_path: Path):
@@ -1450,7 +1499,7 @@ def test_write_predictions_and_summary_binary_uses_single_decision_pass(tmp_path
     summary = io_module._write_predictions_and_summary(
         predictions_path=predictions_path,
         dataset=dataset,
-        model=model,
+        model=cast(BayesianPGS, model),
     )
 
     assert model.decision_component_calls == 1
@@ -1495,7 +1544,7 @@ def test_write_predictions_and_summary_quantitative_uses_single_decision_pass(tm
     summary = io_module._write_predictions_and_summary(
         predictions_path=predictions_path,
         dataset=dataset,
-        model=model,
+        model=cast(BayesianPGS, model),
     )
 
     assert model.decision_component_calls == 1
@@ -1531,7 +1580,7 @@ def test_write_predictions_and_summary_uses_cached_training_scores_without_resco
     io_module._write_predictions_and_summary(
         predictions_path=predictions_path,
         dataset=dataset,
-        model=FakeCachedModel(),
+        model=cast(BayesianPGS, FakeCachedModel()),
     )
 
     prediction_rows = _read_tsv_rows(predictions_path)
@@ -1642,7 +1691,7 @@ def test_run_training_pipeline_keeps_full_coefficient_alignment_after_filtering(
     assert [row["variant_class"] for row in loaded_rows] == [
         record.variant_class.value for record in variant_records
     ]
-    assert [float(row["beta"]) for row in loaded_rows] == pytest.approx([0.0, 1.25, 0.0, -0.5])
+    assert [float(cast(float, row["beta"])) for row in loaded_rows] == pytest.approx([0.0, 1.25, 0.0, -0.5])
 
 
 def test_cli_infers_binary_trait_type(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
@@ -1891,7 +1940,7 @@ def test_plink_end_to_end_recovers_quantitative_signal_with_sv_style_alleles(tmp
     assert exit_code == 0
     summary_payload = _read_json_payload(output_dir / "summary.json.gz")
     assert summary_payload["trait_type"] == "quantitative"
-    assert summary_payload["training_r2"] > 0.55
+    assert cast(float, summary_payload["training_r2"]) > 0.55
 
     dataset = load_dataset_from_files(
         genotype_path=bed_path,

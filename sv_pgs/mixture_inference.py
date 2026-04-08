@@ -73,6 +73,7 @@ from sv_pgs.config import ModelConfig, TraitType, VariantClass
 from sv_pgs.data import NESTED_PATH_DELIMITER, TieMap, VariantRecord
 from sv_pgs.genotype import (
     DenseRawGenotypeMatrix,
+    RawGenotypeMatrix,
     StandardizedGenotypeMatrix,
     _cupy_cache_standardized_columns,
     _iter_cupy_cache_standardized_batches,
@@ -655,6 +656,35 @@ def fit_variational_em(
     prior_design_signature = _checkpoint_prior_design_signature(prior_design)
     scale_penalty = _scale_model_penalty(prior_design.feature_names, config)
     best_validation_iteration: int | None = None
+    global_scale = 0.0
+    scale_model_coefficients = np.zeros(prior_design.design_matrix.shape[1], dtype=np.float64)
+    tpb_shape_a_vector = np.zeros(prior_design.class_membership_matrix.shape[1], dtype=np.float64)
+    tpb_shape_b_vector = np.zeros(prior_design.class_membership_matrix.shape[1], dtype=np.float64)
+    local_shape_a = np.zeros(len(reduced_records), dtype=np.float64)
+    local_shape_b = np.zeros(len(reduced_records), dtype=np.float64)
+    local_scale = np.ones(len(reduced_records), dtype=np.float64)
+    auxiliary_delta = np.zeros(len(reduced_records), dtype=np.float64)
+    sigma_error2 = 1.0
+    alpha_state = np.zeros(covariate_matrix.shape[1], dtype=np.float64)
+    beta_state = np.zeros(genotype_matrix.shape[1], dtype=np.float64)
+    objective_history: list[float] = []
+    validation_history: list[float] = []
+    previous_alpha: np.ndarray | None = None
+    previous_beta: np.ndarray | None = None
+    previous_local_scale: np.ndarray | None = None
+    previous_theta: np.ndarray | None = None
+    previous_tpb_shape_a_vector: np.ndarray | None = None
+    previous_tpb_shape_b_vector: np.ndarray | None = None
+    best_validation_metric: float | None = None
+    best_alpha: np.ndarray | None = None
+    best_beta: np.ndarray | None = None
+    best_beta_variance: np.ndarray | None = None
+    best_local_scale: np.ndarray | None = None
+    best_theta: np.ndarray | None = None
+    best_sigma_error2: float | None = None
+    best_tpb_shape_a_vector: np.ndarray | None = None
+    best_tpb_shape_b_vector: np.ndarray | None = None
+    start_iteration = 0
 
     def _copy_optional(array: np.ndarray | None) -> np.ndarray | None:
         return None if array is None else np.asarray(array, dtype=np.float64).copy()
@@ -1006,7 +1036,7 @@ def fit_variational_em(
                     )
                     epoch_total_newton_iters += int(block_state[5])
                 else:
-                    block_state = _fit_collapsed_posterior(
+                    collapsed_block_state = _fit_collapsed_posterior(
                         genotype_matrix=block_genotypes,
                         covariate_matrix=empty_covariates,
                         targets=target_vector - predictor_offset,
@@ -1024,8 +1054,8 @@ def fit_variational_em(
                         total_em_iterations=config.max_outer_iterations,
                         update_blend_weight=step_size,
                     )
-                    block_beta_candidate = np.asarray(block_state.beta, dtype=np.float64)
-                    block_beta_variance = np.asarray(block_state.beta_variance, dtype=np.float64)
+                    block_beta_candidate = np.asarray(collapsed_block_state.beta, dtype=np.float64)
+                    block_beta_variance = np.asarray(collapsed_block_state.beta_variance, dtype=np.float64)
                     epoch_total_newton_iters += 1
                 block_beta_updated = block_beta_previous + step_size * (block_beta_candidate - block_beta_previous)
                 beta_delta = block_beta_updated - block_beta_previous
@@ -1980,13 +2010,14 @@ def _streaming_gpu_genotype_matvec(
     cp,
     dtype,
 ):
+    raw_matrix = cast(RawGenotypeMatrix, genotype_matrix.raw)
     result_gpu = cp.zeros(genotype_matrix.shape[0], dtype=dtype)
     _tv = genotype_matrix.shape[1]
     _cv = 0
     _lv = 0
     _li = max(_tv // 10, 1)
     for batch_slice, standardized_batch in _iter_standardized_gpu_batches(
-        genotype_matrix.raw,
+        raw_matrix,
         genotype_matrix.variant_indices,
         genotype_matrix.means,
         genotype_matrix.scales,
@@ -2424,11 +2455,12 @@ def _sample_space_operator(
         v = jnp.asarray(vector, dtype=compute_dtype)
         if streaming_gpu_enabled:
             assert cupy is not None
+            raw_matrix = cast(RawGenotypeMatrix, genotype_matrix.raw)
             compute_cp_dtype = _cupy_compute_dtype(cupy)
             vector_gpu = _to_cupy_compute(v)
             result_gpu = diag_noise_gpu * vector_gpu
             for batch_slice, standardized_batch in _iter_standardized_gpu_batches(
-                genotype_matrix.raw,
+                raw_matrix,
                 genotype_matrix.variant_indices,
                 genotype_matrix.means,
                 genotype_matrix.scales,
@@ -2456,11 +2488,12 @@ def _sample_space_operator(
         matrix_jax = jnp.asarray(matrix, dtype=compute_dtype)
         if streaming_gpu_enabled:
             assert cupy is not None
+            raw_matrix = cast(RawGenotypeMatrix, genotype_matrix.raw)
             compute_cp_dtype = _cupy_compute_dtype(cupy)
             matrix_gpu = _to_cupy_compute(matrix_jax)
             result_gpu = diag_noise_gpu[:, None] * matrix_gpu
             for batch_slice, standardized_batch in _iter_standardized_gpu_batches(
-                genotype_matrix.raw,
+                raw_matrix,
                 genotype_matrix.variant_indices,
                 genotype_matrix.means,
                 genotype_matrix.scales,
@@ -3158,6 +3191,7 @@ def _get_cached_sample_space_cpu_preconditioner(
         prior_variances=prior_variances,
         diagonal_noise=diagonal_noise,
     ):
+        assert cache_entry is not None
         return cache_entry.preconditioner, cache_entry
     diagonal_preconditioner = _sample_space_diagonal_preconditioner(
         genotype_matrix=genotype_matrix,
@@ -3343,6 +3377,7 @@ def _get_cached_sample_space_gpu_preconditioner(
         prior_variances=prior_variances,
         diagonal_noise=diagonal_noise,
     ):
+        assert cache_entry is not None
         return cache_entry.preconditioner, cache_entry
 
     # Check if we can reuse the expensive Nyström factor (depends on X and
@@ -3365,6 +3400,8 @@ def _get_cached_sample_space_gpu_preconditioner(
 
     if reuse_nystrom:
         # Fast path: reuse cached Nyström factor, only rebuild diagonal + Woodbury
+        assert cache_entry is not None
+        assert cache_entry.nystrom_factor_gpu is not None
         preconditioner = _sample_space_gpu_preconditioner_from_factor(
             genotype_matrix=genotype_matrix,
             nystrom_factor_gpu=cache_entry.nystrom_factor_gpu,
@@ -3430,8 +3467,9 @@ def _apply_sample_space_operator_gpu(
             scaled_projection = prior_variances_gpu[batch_slice, None] * (x_chunk.T @ input_gpu)
             result_gpu += x_chunk @ scaled_projection
     else:
+        raw_matrix = cast(RawGenotypeMatrix, genotype_matrix.raw)
         for batch_slice, standardized_batch in _iter_standardized_gpu_batches(
-            genotype_matrix.raw,
+            raw_matrix,
             genotype_matrix.variant_indices,
             genotype_matrix.means,
             genotype_matrix.scales,
@@ -3672,17 +3710,18 @@ def _cached_weighted_covariate_projection(
         return np.asarray(warm_start.weighted_covariate_projection, dtype=np.float64)
     weighted_covariates = np.asarray(inverse_diagonal_noise[:, None] * covariate_matrix, dtype=np.float64)
     if genotype_matrix._cupy_cache is not None:
-        cp = cupy
-        if cp is None:
-            import cupy as cp
-        weighted_covariates_gpu = cp.asarray(weighted_covariates, dtype=cp.float64)
-        projection_gpu = cp.empty((variant_count, covariate_count), dtype=cp.float64)
+        cp_module = cupy
+        if cp_module is None:
+            import cupy as imported_cupy
+            cp_module = imported_cupy
+        weighted_covariates_gpu = cp_module.asarray(weighted_covariates, dtype=cp_module.float64)
+        projection_gpu = cp_module.empty((variant_count, covariate_count), dtype=cp_module.float64)
         for batch_slice, standardized_batch in _iter_cupy_cache_standardized_batches(
             genotype_matrix._cupy_cache,
             sample_count=genotype_matrix.shape[0],
             batch_size=batch_size,
-            cupy=cp,
-            dtype=cp.float64,
+            cupy=cp_module,
+            dtype=cp_module.float64,
         ):
             projection_gpu[batch_slice, :] = standardized_batch.T @ weighted_covariates_gpu
         if warm_start is not None:
@@ -3695,10 +3734,11 @@ def _cached_weighted_covariate_projection(
     elif _streaming_cupy_backend_available(genotype_matrix):
         cp = cupy if cupy is not None else _try_import_cupy()
         assert cp is not None
+        raw_matrix = cast(RawGenotypeMatrix, genotype_matrix.raw)
         weighted_covariates_gpu = cp.asarray(weighted_covariates, dtype=cp.float64)
         projection_gpu = cp.empty((variant_count, covariate_count), dtype=cp.float64)
         for batch_slice, standardized_batch in _iter_standardized_gpu_batches(
-            genotype_matrix.raw,
+            raw_matrix,
             genotype_matrix.variant_indices,
             genotype_matrix.means,
             genotype_matrix.scales,
@@ -3804,8 +3844,9 @@ def _gpu_genotype_matmul(
         ):
             result_gpu += standardized_batch @ coefficient_matrix_gpu[batch_slice, :]
     else:
+        raw_matrix = cast(RawGenotypeMatrix, genotype_matrix.raw)
         for batch_slice, standardized_batch in _iter_standardized_gpu_batches(
-            genotype_matrix.raw,
+            raw_matrix,
             genotype_matrix.variant_indices,
             genotype_matrix.means,
             genotype_matrix.scales,
@@ -3847,8 +3888,9 @@ def _gpu_genotype_transpose_matmul(
         ):
             result_gpu[batch_slice, :] = standardized_batch.T @ sample_matrix_gpu
     else:
+        raw_matrix = cast(RawGenotypeMatrix, genotype_matrix.raw)
         for batch_slice, standardized_batch in _iter_standardized_gpu_batches(
-            genotype_matrix.raw,
+            raw_matrix,
             genotype_matrix.variant_indices,
             genotype_matrix.means,
             genotype_matrix.scales,
@@ -4348,10 +4390,11 @@ def _restricted_variant_space_diagonal_preconditioner(
     if _streaming_cupy_backend_available(genotype_matrix):
         cupy = _try_import_cupy()
         if cupy is not None:
+            raw_matrix = cast(RawGenotypeMatrix, genotype_matrix.raw)
             inv_d_gpu = cupy.asarray(inverse_diagonal_noise, dtype=cupy.float64)
             raw_diag_gpu = cupy.empty(genotype_matrix.shape[1], dtype=cupy.float64)
             for batch_slice, standardized_batch in _iter_standardized_gpu_batches(
-                genotype_matrix.raw,
+                raw_matrix,
                 genotype_matrix.variant_indices,
                 genotype_matrix.means,
                 genotype_matrix.scales,
@@ -4618,7 +4661,7 @@ def _restricted_posterior_state_posterior_working_set(
         else np.asarray(initial_beta_guess, dtype=np.float64).copy()
     )
     if current_beta.shape != (variant_count,):
-        raise ValueError("initial_beta_guess must match variant count for temporary working sets.")
+        raise ValueError("initial_beta_guess must match variant count for posterior working sets.")
 
     def _projected_residual_and_gradient(beta_vector: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         genetic_linear_predictor = np.asarray(
@@ -5423,6 +5466,7 @@ def _restricted_posterior_state(
             else np.asarray(inverse_covariance_rhs, dtype=np.float64)
         )
     if gpu_postprocess_enabled:
+        assert cupy_module is not None
         cp = cupy_module
         cp_solve_triangular = _resolve_gpu_solve_triangular()
 

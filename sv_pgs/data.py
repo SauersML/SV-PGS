@@ -106,15 +106,16 @@ class VariantRecord:
             _validate_prior_feature_name(feature_name, "prior_continuous_features")
             if not np.isfinite(feature_value):
                 raise ValueError("prior_continuous_features values must be finite.")
-        self.prior_categorical_features = {
+        normalized_categorical_features: dict[str, str] = {
             str(feature_name): str(feature_value)
             for feature_name, feature_value in self.prior_categorical_features.items()
         }
-        for feature_name, feature_value in self.prior_categorical_features.items():
+        self.prior_categorical_features = normalized_categorical_features
+        for feature_name, categorical_value in normalized_categorical_features.items():
             _validate_prior_feature_name(feature_name, "prior_categorical_features")
-            if not feature_value:
+            if not categorical_value:
                 raise ValueError("prior_categorical_features values cannot be empty.")
-            if "::" in feature_value:
+            if "::" in categorical_value:
                 raise ValueError("prior_categorical_features values cannot contain '::'.")
         self.prior_membership_features = {
             str(feature_name): {

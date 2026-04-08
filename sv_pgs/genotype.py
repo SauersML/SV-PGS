@@ -1314,8 +1314,9 @@ class StandardizedGenotypeMatrix:
         self._sparse_local_lookup = np.full(self.shape[1], -1, dtype=np.int32)
         self._sparse_local_lookup[sparse_local_indices] = np.arange(sparse_local_indices.shape[0], dtype=np.int32)
         if dense_local_indices.shape[0] > 0:
+            dense_raw = cast(RawGenotypeMatrix, self.raw)
             self._dense_backend = StandardizedGenotypeMatrix(
-                raw=self.raw,
+                raw=dense_raw,
                 means=self.means,
                 scales=self.scales,
                 variant_indices=self.variant_indices[dense_local_indices],
@@ -1506,8 +1507,9 @@ class StandardizedGenotypeMatrix:
                     upload_batch_size = auto_batch_size_i8(self.shape[0])
                 else:
                     upload_batch_size = auto_batch_size(self.shape[0])
+                raw_matrix = cast(RawGenotypeMatrix, self.raw)
                 for batch_slice, standardized_batch in _iter_standardized_gpu_batches(
-                    self.raw,
+                    raw_matrix,
                     self.variant_indices,
                     self.means,
                     self.scales,
@@ -2034,12 +2036,13 @@ class StandardizedGenotypeMatrix:
             active_variant_indices = self.variant_indices[active_local_indices]
             coeff_gpu = _to_cupy_compute(coeff_np[active_local_indices])
             result_gpu = cupy.zeros(self.shape[0], dtype=compute_cp_dtype)
+            raw_matrix = cast(RawGenotypeMatrix, self.raw)
             _tv = int(active_local_indices.shape[0])
             _cv = 0
             _lv = 0
             _li = max(_tv // 10, 1)
             for batch_slice, standardized_batch in _iter_standardized_gpu_batches(
-                self.raw,
+                raw_matrix,
                 active_variant_indices,
                 self.means,
                 self.scales,
@@ -2131,8 +2134,9 @@ class StandardizedGenotypeMatrix:
             active_variant_indices = self.variant_indices[active_local_indices]
             matrix_gpu = _to_cupy_compute(m_np[active_local_indices, :])
             result_gpu = cupy.zeros((self.shape[0], m_np.shape[1]), dtype=compute_cp_dtype)
+            raw_matrix = cast(RawGenotypeMatrix, self.raw)
             for batch_slice, standardized_batch in _iter_standardized_gpu_batches(
-                self.raw,
+                raw_matrix,
                 active_variant_indices,
                 self.means,
                 self.scales,
@@ -2208,12 +2212,13 @@ class StandardizedGenotypeMatrix:
             compute_cp_dtype = _cupy_compute_dtype(cupy)
             vector_gpu = _to_cupy_compute(v_np)
             output_gpu = cupy.empty(self.shape[1], dtype=compute_cp_dtype)
+            raw_matrix = cast(RawGenotypeMatrix, self.raw)
             _tv = self.shape[1]
             _cv = 0
             _lv = 0
             _li = max(_tv // 10, 1)
             for batch_slice, standardized_batch in _iter_standardized_gpu_batches(
-                self.raw,
+                raw_matrix,
                 self.variant_indices,
                 self.means,
                 self.scales,
@@ -2300,8 +2305,9 @@ class StandardizedGenotypeMatrix:
             compute_cp_dtype = _cupy_compute_dtype(cupy)
             matrix_gpu = _to_cupy_compute(m_np)
             output_gpu = cupy.empty((self.shape[1], m_np.shape[1]), dtype=compute_cp_dtype)
+            raw_matrix = cast(RawGenotypeMatrix, self.raw)
             for batch_slice, standardized_batch in _iter_standardized_gpu_batches(
-                self.raw,
+                raw_matrix,
                 self.variant_indices,
                 self.means,
                 self.scales,

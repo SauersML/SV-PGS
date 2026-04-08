@@ -3,7 +3,7 @@ from __future__ import annotations
 import hashlib
 from dataclasses import dataclass
 from functools import lru_cache
-from typing import Iterator, Sequence, cast
+from typing import Hashable, Iterator, Sequence, TypeVar, cast
 
 import numpy as np
 
@@ -939,9 +939,12 @@ def _candidate_group_indices(candidate_entry: int | list[int] | None) -> tuple[i
     return (int(candidate_entry),)
 
 
+_CandidateKey = TypeVar("_CandidateKey", bound=Hashable)
+
+
 def _record_candidate_group(
-    candidate_map: dict[object, int | list[int]],
-    signature: object,
+    candidate_map: dict[_CandidateKey, int | list[int]],
+    signature: _CandidateKey,
     reduced_index: int,
 ) -> None:
     existing = candidate_map.get(signature)
