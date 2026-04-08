@@ -1981,6 +1981,10 @@ def _streaming_gpu_genotype_matvec(
     dtype,
 ):
     result_gpu = cp.zeros(genotype_matrix.shape[0], dtype=dtype)
+    _tv = genotype_matrix.shape[1]
+    _cv = 0
+    _lv = 0
+    _li = max(_tv // 10, 1)
     for batch_slice, standardized_batch in _iter_standardized_gpu_batches(
         genotype_matrix.raw,
         genotype_matrix.variant_indices,
@@ -1991,6 +1995,10 @@ def _streaming_gpu_genotype_matvec(
         dtype=dtype,
     ):
         result_gpu += standardized_batch @ coefficients_gpu[batch_slice]
+        _cv = batch_slice.stop if isinstance(batch_slice, slice) else _cv + standardized_batch.shape[1]
+        if _cv - _lv >= _li:
+            _lv = _cv
+            log(f"        GPU streaming matvec: {_cv:,}/{_tv:,} ({100*_cv/_tv:.0f}%)  mem={mem()}")
     return result_gpu
 
 def _binary_expected_polya_gamma_weights_cupy(
