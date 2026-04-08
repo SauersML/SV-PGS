@@ -1198,13 +1198,17 @@ class StandardizedGenotypeMatrix:
                 gpu_matrix = cupy.empty(self.shape, dtype=cupy.float32, order="F")
                 if self.raw is None:
                     raise RuntimeError("GPU materialization requires raw backing storage or a dense cache.")
-                # Use int8-native batch size when raw is int8 — 4x larger batches
-                # than the float32-based auto_batch_size, reducing upload overhead.
-                upload_batch_size = (
-                    auto_batch_size_i8(self.shape[0])
-                    if isinstance(self.raw, Int8RawGenotypeMatrix)
-                    else auto_batch_size(self.shape[0])
-                )
+                # For GPU materialization, maximize batch size to minimize Python
+                # overhead and kernel launch latency. The working memory per batch is
+                # ~5 bytes/element (int8 + float32), so we can fit larger batches than
+                # the CPU-oriented BED_READER_TARGET_BATCH_BYTES assumes.
+                gpu_working_bytes = int(self.shape[0]) * int(self.shape[1]) * 5
+                if gpu_working_bytes < _gpu_materialization_budget_bytes(cupy) * 0.5:
+                    upload_batch_size = self.shape[1]  # entire block in one batch
+                elif isinstance(self.raw, Int8RawGenotypeMatrix):
+                    upload_batch_size = auto_batch_size_i8(self.shape[0])
+                else:
+                    upload_batch_size = auto_batch_size(self.shape[0])
                 for batch_slice, standardized_batch in _iter_standardized_gpu_batches(
                     self.raw,
                     self.variant_indices,
