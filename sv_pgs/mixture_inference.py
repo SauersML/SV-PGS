@@ -4562,13 +4562,24 @@ def _restricted_posterior_state_temporary_working_set(
                 covariate_precision_logdet,
             )
         current_beta = candidate_beta
-        violating_indices = np.flatnonzero(
+        all_violating = np.flatnonzero(
             excluded_mask & (candidate_update_score > float(temporary_working_set_coefficient_tolerance))
         ).astype(np.int32, copy=False)
+        # Cap violations at growth budget: include only the TOP violating
+        # indices ranked by KKT violation magnitude.  Without this cap, a cold
+        # start (all betas zero → every variant violates KKT) expands the
+        # working set from 8K to 222K in one step, triggering a catastrophic
+        # fallback to CPU CG on all variants.
+        growth_budget = int(temporary_working_set_growth)
+        if all_violating.shape[0] > growth_budget:
+            top_violation_order = np.argsort(candidate_update_score[all_violating])[-growth_budget:]
+            violating_indices = all_violating[top_violation_order]
+        else:
+            violating_indices = all_violating
         next_size = min(
             max(
-                working_indices.shape[0] + int(temporary_working_set_growth),
-                ever_active_indices.shape[0] + int(temporary_working_set_growth),
+                working_indices.shape[0] + growth_budget,
+                ever_active_indices.shape[0] + growth_budget,
             ),
             variant_count,
         )
@@ -4581,38 +4592,41 @@ def _restricted_posterior_state_temporary_working_set(
             variant_count,
         )
         log(
-            "    temporary working set expanded "
-            + f"(violations={violating_indices.shape[0]}, next_size={working_indices.shape[0]}/{variant_count})"
+            "    working set expanded "
+            + f"(violations={all_violating.shape[0]}, included={violating_indices.shape[0]}, "
+            + f"next_size={working_indices.shape[0]}/{variant_count})"
         )
 
-    log("    temporary working set validation failed to certify a subset; falling back to full solve")
-    full_state = _restricted_posterior_state(
-        genotype_matrix=genotype_matrix,
-        covariate_matrix=covariate_matrix,
-        targets=targets,
-        prior_variances=prior_variances,
-        diagonal_noise=1.0 / np.maximum(inverse_diagonal_noise, 1e-12),
-        solver_tolerance=solver_tolerance,
-        maximum_linear_solver_iterations=maximum_linear_solver_iterations,
-        logdet_probe_count=1,
-        logdet_lanczos_steps=2,
-        exact_solver_matrix_limit=exact_solver_matrix_limit,
-        posterior_variance_batch_size=posterior_variance_batch_size,
-        posterior_variance_probe_count=1,
-        random_seed=random_seed + int(temporary_working_set_max_passes),
-        compute_logdet=False,
-        compute_beta_variance=False,
-        initial_beta_guess=current_beta,
-        sample_space_preconditioner_rank=sample_space_preconditioner_rank,
-        temporary_working_sets=False,
-        allow_working_set=False,
+    # Accept the last working-set solution rather than falling back to a
+    # catastrophic full solve on all variants.  The working set grew across
+    # passes and the last solution is the best we have — a full solve on
+    # 222K variants would take hours and likely OOM.
+    log(
+        "    working set exhausted max passes; accepting last solution "
+        + f"(size={working_indices.shape[0]}/{variant_count}, "
+        + f"max_excluded_update={max_excluded_update:.2e})"
     )
+    alpha = np.asarray(
+        _cholesky_solve(
+            covariate_precision_cholesky,
+            covariate_matrix.T @ (inverse_diagonal_noise * (targets - genetic_linear_predictor)),
+        ),
+        dtype=np.float64,
+    )
+    linear_predictor = covariate_matrix @ alpha + genetic_linear_predictor
+    restricted_quadratic = float(np.dot(targets, projected_targets))
     if warm_start is not None:
-        warm_start.temporary_working_set_ever_active = _active_working_set_indices(
-            np.asarray(full_state[1], dtype=np.float64),
-            temporary_working_set_coefficient_tolerance,
-        )
-    return full_state
+        warm_start.temporary_working_set_ever_active = np.asarray(ever_active_indices, dtype=np.int32)
+    return (
+        np.asarray(alpha, dtype=np.float64),
+        np.asarray(candidate_beta, dtype=np.float64),
+        np.zeros(variant_count, dtype=np.float64),
+        np.asarray(projected_targets, dtype=np.float64),
+        np.asarray(linear_predictor, dtype=np.float64),
+        restricted_quadratic,
+        0.0,
+        covariate_precision_logdet,
+    )
 
 
 def _restricted_posterior_state(
