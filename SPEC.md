@@ -16,3 +16,4 @@
 - Do not restrict or cap the number of samples included, for any reason.
 - The variant-class-specific prior structure is the core differentiator of this tool. Every inference path must use metadata-driven prior variances (variant type, length, repeat status) and per-variant local shrinkage (TPB). A generic LASSO/elastic net that applies the same penalty to all variants is not acceptable as a primary inference backend.
 - We have a single, best path for users. Options and choices must be absent unless absolutely necessary.
+- `# noqa` bypasses are never allowed. Fix the underlying issue instead of silencing the linter.
