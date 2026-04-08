@@ -874,8 +874,11 @@ def fit_variational_em(
                         alpha_init=np.zeros(0, dtype=np.float64),
                         beta_init=block_beta_previous,
                         minimum_weight=config.polya_gamma_minimum_weight,
-                        max_iterations=min(config.max_inner_newton_iterations, 8),  # stochastic blocks need approximate solutions
-                        gradient_tolerance=max(config.newton_gradient_tolerance, 1e-4),  # relaxed for stochastic
+                        # Dynamic Newton cap: fewer iterations when step size is small
+                        # (later epochs). With step_size=0.08, iters 6-8 gain <0.2
+                        # blended to <0.016 — not worth the ~12s compute cost.
+                        max_iterations=min(config.max_inner_newton_iterations, 5 if step_size < 0.12 else 8),
+                        gradient_tolerance=max(config.newton_gradient_tolerance, 1e-3 if step_size < 0.12 else 1e-4),
                         initial_damping=config.trust_region_initial_damping,
                         damping_increase_factor=config.trust_region_damping_increase_factor,
                         damping_decrease_factor=config.trust_region_damping_decrease_factor,
