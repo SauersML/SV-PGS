@@ -604,6 +604,24 @@ def load_multi_vcf_dataset_from_files(
         len(keep_sample_indices) == len(source_sample_ids)
         and np.array_equal(keep_sample_indices, expected_source_order)
     )
+    # If all samples are present but in different order, reorder the sample table
+    # (tiny: ~1 MB) instead of reindexing every chromosome matrix (~13 GB each).
+    if (
+        not skip_subset
+        and len(keep_sample_indices) == len(source_sample_ids)
+        and len(np.unique(keep_sample_indices)) == len(source_sample_ids)
+    ):
+        log("  samples are a permutation — reordering sample table instead of genotype matrices")
+        # keep_sample_indices[i] = VCF row for sample_table row i.
+        # We need the inverse: for VCF row j, which sample_table row?
+        inverse_perm = np.argsort(keep_sample_indices)
+        sample_table = _SampleTable(
+            sample_ids=[sample_table.sample_ids[int(i)] for i in inverse_perm],
+            targets=np.asarray(sample_table.targets, dtype=np.float64)[inverse_perm],
+            covariates=np.asarray(sample_table.covariates, dtype=np.float64)[inverse_perm],
+        )
+        skip_subset = True
+        log(f"  sample table reordered to match VCF order ({len(inverse_perm):,} samples)")
     # Verify sample IDs match for first chromosome only
     log(f"  verifying sample IDs for {source_paths[0].name}...")
     first_sample_ids = _read_vcf_sample_ids(source_paths[0])
@@ -1277,6 +1295,19 @@ def _load_vcf_from_cache(
         }
         if len(stats_lengths) != 1:
             raise ValueError("cached stats shape mismatch")
+        stats_variant_count = next(iter(stats_lengths))
+        cached_variant_count = int(genotype_matrix.shape[1])
+        variant_record_count = len(variants)
+        if cached_variant_count != variant_record_count:
+            raise ValueError(
+                f"cached variant metadata mismatch: matrix has {cached_variant_count} columns, "
+                f"but variants table has {variant_record_count} rows"
+            )
+        if cached_variant_count != stats_variant_count:
+            raise ValueError(
+                f"cached stats mismatch: matrix has {cached_variant_count} columns, "
+                f"but stats describe {stats_variant_count} variants"
+            )
         try:
             genotype_matrix = _ensure_vcf_cache_matrix_fast(paths, genotype_matrix)
         except Exception:
