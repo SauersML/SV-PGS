@@ -912,6 +912,9 @@ def fit_variational_em(
                 # Free GPU memory for this block before next iteration
                 block_genotypes._cupy_cache = None
                 del block_genotypes
+                # Intra-epoch checkpoint every 10 blocks so crashes don't lose progress
+                if checkpoint_callback is not None and step_index % 10 == 0:
+                    checkpoint_callback(_build_checkpoint(outer_iteration))
 
             if config.trait_type == TraitType.BINARY:
                 alpha_state = _fit_binary_alpha_with_offset(
