@@ -548,7 +548,9 @@ class BayesianPGS:
             log(tuning_summary)
         covariate_matrix = self._with_intercept(covariates)
         total_variant_count = len(variant_records)
+        log(f"building variant metadata for {total_variant_count:,} records...  mem={mem()}")
         full_variant_metadata = _variant_metadata_from_records(variant_records)
+        log(f"variant metadata ready  mem={mem()}")
 
         # Use pre-computed stats if available (saves 3 full data passes)
         if variant_stats is not None:

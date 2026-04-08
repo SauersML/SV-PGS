@@ -504,13 +504,19 @@ def _try_import_cupy() -> Any | None:
     return None
 
 
+_gpu_verified = False
+
+
 def require_gpu() -> Any:
     """Validate GPU+CuPy at pipeline entry. Crash loudly if GPU exists but CuPy fails.
 
     Returns the CuPy module if available, None if no GPU hardware at all.
+    Skips re-verification after first successful call.
     """
+    global _gpu_verified
+    if _gpu_verified:
+        return _cupy_module
     from sv_pgs.progress import log
-    # Check if NVIDIA GPU hardware exists
     import shutil
     import subprocess
     nvidia_smi = shutil.which("nvidia-smi")
@@ -538,6 +544,7 @@ def require_gpu() -> Any:
         )
     free_bytes, total_bytes = cupy.cuda.runtime.memGetInfo()
     log(f"  GPU verified: {total_bytes / 1e9:.1f} GB total, {free_bytes / 1e9:.1f} GB free")
+    _gpu_verified = True
     return cupy
 
 
