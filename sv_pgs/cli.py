@@ -48,18 +48,6 @@ def build_parser() -> argparse.ArgumentParser:
     aou_run_parser.add_argument("--n-pcs", type=int, default=10, help="Number of genomic PCs to include (default: 10).")
     aou_run_parser.add_argument("--max-outer-iterations", type=int, default=30)
     aou_run_parser.add_argument("--random-seed", type=int, default=0)
-    aou_run_parser.add_argument(
-        "--pipeline-validation-fraction",
-        type=float,
-        default=default_config.pipeline_validation_fraction,
-        help="Holdout fraction for validation-guided tuning before refitting on the full cohort.",
-    )
-    aou_run_parser.add_argument(
-        "--pipeline-validation-min-samples",
-        type=int,
-        default=default_config.pipeline_validation_min_samples,
-        help="Minimum cohort size required before the pipeline creates a validation split.",
-    )
 
     run_parser = subparsers.add_parser("run", help="Load genotype files, fit the Bayesian model, and write outputs.")
     run_parser.add_argument("--genotypes", required=True, help="Path to a VCF/BCF file or PLINK 1 .bed file.")
@@ -93,18 +81,6 @@ def build_parser() -> argparse.ArgumentParser:
     run_parser.add_argument("--output-dir", required=True, help="Directory for artifact and result tables.")
     run_parser.add_argument("--max-outer-iterations", type=int, default=30)
     run_parser.add_argument("--random-seed", type=int, default=0)
-    run_parser.add_argument(
-        "--pipeline-validation-fraction",
-        type=float,
-        default=default_config.pipeline_validation_fraction,
-        help="Holdout fraction for validation-guided tuning before refitting on the full cohort.",
-    )
-    run_parser.add_argument(
-        "--pipeline-validation-min-samples",
-        type=int,
-        default=default_config.pipeline_validation_min_samples,
-        help="Minimum cohort size required before the pipeline creates a validation split.",
-    )
     return parser
 
 
@@ -147,8 +123,6 @@ def main(argv: list[str] | None = None) -> int:
             n_pcs=args.n_pcs,
             max_outer_iterations=args.max_outer_iterations,
             random_seed=args.random_seed,
-            pipeline_validation_fraction=args.pipeline_validation_fraction,
-            pipeline_validation_min_samples=args.pipeline_validation_min_samples,
         )
         return 0
 
@@ -175,16 +149,12 @@ def main(argv: list[str] | None = None) -> int:
     log(f"genotype_format={args.genotype_format} sample_id_column={args.sample_id_column} target_column={args.target_column}")
     log(
         "covariates="
-        + f"{list(args.covariate_column)}  max_outer_iter={args.max_outer_iterations}  seed={args.random_seed}  "
-        + f"pipeline_validation_fraction={args.pipeline_validation_fraction}  "
-        + f"pipeline_validation_min_samples={args.pipeline_validation_min_samples}"
+        + f"{list(args.covariate_column)}  max_outer_iter={args.max_outer_iterations}  seed={args.random_seed}"
     )
 
     config = ModelConfig(
         max_outer_iterations=args.max_outer_iterations,
         random_seed=args.random_seed,
-        pipeline_validation_fraction=args.pipeline_validation_fraction,
-        pipeline_validation_min_samples=args.pipeline_validation_min_samples,
     )
     dataset = load_dataset_from_files(
         genotype_path=args.genotypes,
