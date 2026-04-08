@@ -554,6 +554,12 @@ def _should_use_stochastic_variational_updates(
     variant_count = int(genotype_matrix.shape[1])
     if not config.stochastic_variational_updates:
         return False
+    # When working-set screening is enabled and the variant count is large
+    # enough, use the collapsed posterior path instead.  Each EM iteration
+    # does a full solve via gradient-based screening + KKT certification,
+    # converging in 5-10 iterations vs 15-20 stochastic epochs.
+    if config.temporary_working_sets and variant_count >= config.temporary_working_set_min_variants:
+        return False
     if variant_count < max(int(config.stochastic_min_variant_count), 1):
         return False
     return variant_count > int(config.stochastic_variant_batch_size)
