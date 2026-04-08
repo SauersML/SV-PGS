@@ -13,12 +13,13 @@ import numpy as np
 import pandas as pd
 
 from sv_pgs.all_of_us import AllOfUsDiseaseRequest, prepare_all_of_us_disease_sample_table, resolve_disease_definition
-from sv_pgs.config import ModelConfig, TraitType
+from sv_pgs.config import InferenceBackend, ModelConfig, TraitType
 from sv_pgs.io import load_multi_vcf_dataset_from_files, run_training_pipeline
 from sv_pgs.progress import log, mem
 
 _LOCAL_CACHE_DIRNAME = ".sv_pgs_cache"
 _AOU_SV_VCF_CACHE_SUBDIR = "aou_sv_vcfs"
+_DEFAULT_MODEL_CONFIG = ModelConfig()
 
 # ---------------------------------------------------------------------------
 # AoU paths
@@ -254,16 +255,16 @@ def merge_pcs_into_sample_table(
 ) -> tuple[Path, list[str]]:
     """Merge top N PCs from ancestry file into the sample table. Returns (output_path, pc_column_names)."""
     if output_path.exists():
+        existing = pd.read_csv(output_path, sep="\t", nrows=0)
+        existing_pc_cols = sorted(
+            [c for c in existing.columns if c.startswith("PC") and c[2:].isdigit()],
+            key=lambda x: int(x[2:]),
+        )
         merged_mtime = output_path.stat().st_mtime
         inputs_mtime = max(sample_table_path.stat().st_mtime, ancestry_path.stat().st_mtime)
-        if merged_mtime > inputs_mtime:
+        if merged_mtime > inputs_mtime and len(existing_pc_cols) == int(n_pcs):
             log("  PC-merged table up to date, skipping recomputation")
-            existing = pd.read_csv(output_path, sep="\t", nrows=0)
-            pc_cols = sorted(
-                [c for c in existing.columns if c.startswith("PC") and c[2:].isdigit()],
-                key=lambda x: int(x[2:]),
-            )[:n_pcs]
-            return output_path, pc_cols
+            return output_path, existing_pc_cols
         log(f"  merged sample table already exists but is stale; recomputing with n_pcs={n_pcs}")
 
     log(f"  loading sample table: {sample_table_path}")
@@ -377,6 +378,18 @@ def _build_aou_run_metadata(
     covariates: list[str],
     max_outer_iterations: int,
     random_seed: int,
+    inference_backend: InferenceBackend = InferenceBackend.VARIATIONAL_BAYES,
+    basil_l1_ratio: float = _DEFAULT_MODEL_CONFIG.basil_l1_ratio,
+    basil_lambda_min_ratio: float = _DEFAULT_MODEL_CONFIG.basil_lambda_min_ratio,
+    basil_n_lambdas: int = _DEFAULT_MODEL_CONFIG.basil_n_lambdas,
+    basil_strong_set_initial_size: int = _DEFAULT_MODEL_CONFIG.basil_strong_set_initial_size,
+    basil_strong_set_growth: int = _DEFAULT_MODEL_CONFIG.basil_strong_set_growth,
+    basil_batch_size: int = _DEFAULT_MODEL_CONFIG.basil_batch_size,
+    basil_max_screening_passes: int = _DEFAULT_MODEL_CONFIG.basil_max_screening_passes,
+    basil_irls_max_iterations: int = _DEFAULT_MODEL_CONFIG.basil_irls_max_iterations,
+    basil_coordinate_descent_max_epochs: int = _DEFAULT_MODEL_CONFIG.basil_coordinate_descent_max_epochs,
+    basil_coordinate_descent_tolerance: float = _DEFAULT_MODEL_CONFIG.basil_coordinate_descent_tolerance,
+    basil_kkt_tolerance: float = _DEFAULT_MODEL_CONFIG.basil_kkt_tolerance,
 ) -> dict[str, object]:
     return {
         "disease": disease,
@@ -386,6 +399,18 @@ def _build_aou_run_metadata(
         "covariates": covariates,
         "max_outer_iterations": max_outer_iterations,
         "random_seed": random_seed,
+        "inference_backend": inference_backend.value,
+        "basil_l1_ratio": basil_l1_ratio,
+        "basil_lambda_min_ratio": basil_lambda_min_ratio,
+        "basil_n_lambdas": basil_n_lambdas,
+        "basil_strong_set_initial_size": basil_strong_set_initial_size,
+        "basil_strong_set_growth": basil_strong_set_growth,
+        "basil_batch_size": basil_batch_size,
+        "basil_max_screening_passes": basil_max_screening_passes,
+        "basil_irls_max_iterations": basil_irls_max_iterations,
+        "basil_coordinate_descent_max_epochs": basil_coordinate_descent_max_epochs,
+        "basil_coordinate_descent_tolerance": basil_coordinate_descent_tolerance,
+        "basil_kkt_tolerance": basil_kkt_tolerance,
     }
 
 DEFAULT_COVARIATES = [
@@ -404,6 +429,18 @@ def run_all_of_us(
     n_pcs: int = 10,
     max_outer_iterations: int = 30,
     random_seed: int = 0,
+    inference_backend: InferenceBackend = InferenceBackend.VARIATIONAL_BAYES,
+    basil_l1_ratio: float = _DEFAULT_MODEL_CONFIG.basil_l1_ratio,
+    basil_lambda_min_ratio: float = _DEFAULT_MODEL_CONFIG.basil_lambda_min_ratio,
+    basil_n_lambdas: int = _DEFAULT_MODEL_CONFIG.basil_n_lambdas,
+    basil_strong_set_initial_size: int = _DEFAULT_MODEL_CONFIG.basil_strong_set_initial_size,
+    basil_strong_set_growth: int = _DEFAULT_MODEL_CONFIG.basil_strong_set_growth,
+    basil_batch_size: int = _DEFAULT_MODEL_CONFIG.basil_batch_size,
+    basil_max_screening_passes: int = _DEFAULT_MODEL_CONFIG.basil_max_screening_passes,
+    basil_irls_max_iterations: int = _DEFAULT_MODEL_CONFIG.basil_irls_max_iterations,
+    basil_coordinate_descent_max_epochs: int = _DEFAULT_MODEL_CONFIG.basil_coordinate_descent_max_epochs,
+    basil_coordinate_descent_tolerance: float = _DEFAULT_MODEL_CONFIG.basil_coordinate_descent_tolerance,
+    basil_kkt_tolerance: float = _DEFAULT_MODEL_CONFIG.basil_kkt_tolerance,
 ) -> None:
     """Full AoU pipeline: download requested chromosomes, merge them, and run one fit."""
     chromosomes = _validate_aou_chromosomes(chromosomes)
@@ -415,12 +452,28 @@ def run_all_of_us(
     work_dir = Path(output_base)
     work_dir.mkdir(parents=True, exist_ok=True)
 
+    from sv_pgs.progress import set_log_file
+    log_path = work_dir / f"{disease_def.canonical_name}.log"
+    set_log_file(log_path)
+
     log(f"=== ALL OF US PIPELINE ===  disease={disease_def.canonical_name}  chromosomes={chromosomes}  n_pcs={n_pcs}  cpus={os.cpu_count()}")
     log(f"  ICD-9: {disease_def.icd9_prefixes}  ICD-10: {disease_def.icd10_prefixes}")
     log(f"  output: {work_dir}")
     config = ModelConfig(
         max_outer_iterations=max_outer_iterations,
         random_seed=random_seed,
+        inference_backend=inference_backend,
+        basil_l1_ratio=basil_l1_ratio,
+        basil_lambda_min_ratio=basil_lambda_min_ratio,
+        basil_n_lambdas=basil_n_lambdas,
+        basil_strong_set_initial_size=basil_strong_set_initial_size,
+        basil_strong_set_growth=basil_strong_set_growth,
+        basil_batch_size=basil_batch_size,
+        basil_max_screening_passes=basil_max_screening_passes,
+        basil_irls_max_iterations=basil_irls_max_iterations,
+        basil_coordinate_descent_max_epochs=basil_coordinate_descent_max_epochs,
+        basil_coordinate_descent_tolerance=basil_coordinate_descent_tolerance,
+        basil_kkt_tolerance=basil_kkt_tolerance,
     )
 
     # Migrate old VCF caches: VCFs were moved from work_dir to a shared cache dir,
@@ -572,6 +625,18 @@ def run_all_of_us(
         covariates=covariates,
         max_outer_iterations=max_outer_iterations,
         random_seed=random_seed,
+        inference_backend=inference_backend,
+        basil_l1_ratio=basil_l1_ratio,
+        basil_lambda_min_ratio=basil_lambda_min_ratio,
+        basil_n_lambdas=basil_n_lambdas,
+        basil_strong_set_initial_size=basil_strong_set_initial_size,
+        basil_strong_set_growth=basil_strong_set_growth,
+        basil_batch_size=basil_batch_size,
+        basil_max_screening_passes=basil_max_screening_passes,
+        basil_irls_max_iterations=basil_irls_max_iterations,
+        basil_coordinate_descent_max_epochs=basil_coordinate_descent_max_epochs,
+        basil_coordinate_descent_tolerance=basil_coordinate_descent_tolerance,
+        basil_kkt_tolerance=basil_kkt_tolerance,
     )
     if summary_path.exists():
         if run_metadata_path.exists():

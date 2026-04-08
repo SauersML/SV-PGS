@@ -510,23 +510,20 @@ def load_dataset_from_files(
 def _fast_mmap_row_reindex(matrix: np.ndarray, row_indices: np.ndarray) -> np.ndarray:
     """Reindex rows of a (possibly mmap'd, column-major) matrix efficiently.
 
-    If all rows are kept (same count), skip reindexing entirely — the matrix
-    is already in the correct order. This handles migrated caches (rows in
-    sample-table order from the original run) and new caches (rows in VCF
-    order with identity permutation).
+    If all rows are kept in identity order, skip reindexing entirely.
 
     If a true subset is needed, read columns in batches (contiguous in
     F-order) to avoid catastrophic random disk access on column-major mmaps.
     """
+    resolved_row_indices = np.asarray(row_indices, dtype=np.intp)
     n_rows_out = len(row_indices)
     n_cols = matrix.shape[1]
-    # Same row count → matrix is already in the correct order (migrated cache
-    # or identity permutation). Skip to avoid 13GB random mmap access AND
-    # to avoid incorrect double-permutation on migrated caches.
-    if n_rows_out == matrix.shape[0]:
+    if n_rows_out == matrix.shape[0] and np.array_equal(
+        resolved_row_indices,
+        np.arange(matrix.shape[0], dtype=np.intp),
+    ):
         return matrix
-    # True subset: fewer rows out than in. Batch column reads for speed.
-    log(f"    subsetting {matrix.shape[0]:,} → {n_rows_out:,} samples...")
+    log(f"    reindexing {matrix.shape[0]:,} → {n_rows_out:,} samples...")
     result = np.empty((n_rows_out, n_cols), dtype=matrix.dtype, order="F")
     batch_size = 2048
     n_batches = (n_cols + batch_size - 1) // batch_size
@@ -534,9 +531,9 @@ def _fast_mmap_row_reindex(matrix: np.ndarray, row_indices: np.ndarray) -> np.nd
         start = batch_idx * batch_size
         end = min(start + batch_size, n_cols)
         col_batch = np.array(matrix[:, start:end])
-        result[:, start:end] = col_batch[row_indices, :]
+        result[:, start:end] = col_batch[resolved_row_indices, :]
         if batch_idx % 20 == 0 or batch_idx == n_batches - 1:
-            log(f"    subsetting: {end:,}/{n_cols:,} columns ({100*end/n_cols:.0f}%)  mem={mem()}")
+            log(f"    reindexing: {end:,}/{n_cols:,} columns ({100*end/n_cols:.0f}%)  mem={mem()}")
     return result
 
 
@@ -690,9 +687,12 @@ def run_training_pipeline(
     config: ModelConfig,
     output_dir: str | Path,
 ) -> PipelineOutputs:
-    log(f"=== TRAINING PIPELINE START ===  samples={len(dataset.sample_ids)}  variants={dataset.genotypes.shape[1]}  trait={config.trait_type.value}  mem={mem()}")
     destination = Path(output_dir)
     destination.mkdir(parents=True, exist_ok=True)
+    from sv_pgs.progress import set_log_file, _log_file
+    if _log_file is None:
+        set_log_file(destination / "training.log")
+    log(f"=== TRAINING PIPELINE START ===  samples={len(dataset.sample_ids)}  variants={dataset.genotypes.shape[1]}  trait={config.trait_type.value}  mem={mem()}")
 
     if dataset.variant_stats is not None:
         if dataset.variant_stats_minimum_scale is None:

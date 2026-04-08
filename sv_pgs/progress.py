@@ -10,6 +10,18 @@ import sys
 import time
 
 _start_time: float = time.monotonic()
+_log_file = None
+
+
+def set_log_file(path: str | os.PathLike) -> None:
+    """Set a file path where all log() output is mirrored."""
+    global _log_file
+    if _log_file is not None:
+        try:
+            _log_file.close()
+        except Exception:
+            pass
+    _log_file = open(path, "a", encoding="utf-8", buffering=1)  # line-buffered
 
 
 def mem() -> str:
@@ -44,8 +56,16 @@ def elapsed() -> str:
 
 
 def log(message: str) -> None:
-    """Print a timestamped progress message to stderr."""
-    print(f"[{elapsed()} | {mem()}] {message}", file=sys.stderr, flush=True)
+    """Print a timestamped progress message to stderr and log file."""
+    ts = time.strftime("%Y-%m-%d %H:%M:%S")
+    line = f"[{ts} | {elapsed()} | {mem()}] {message}"
+    print(line, file=sys.stderr, flush=True)
+    if _log_file is not None:
+        try:
+            _log_file.write(line + "\n")
+            _log_file.flush()
+        except Exception:
+            pass
 
 
 def _format_bytes(value: object) -> str:
