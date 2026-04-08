@@ -4331,8 +4331,11 @@ def _restricted_posterior_state_temporary_working_set(
             + f"size={working_indices.shape[0]}/{variant_count} "
             + f"ever_active={ever_active_indices.shape[0]}"
         )
+        working_set_genotypes = genotype_matrix.subset(working_indices)
+        # Upload working set to GPU for exact Cholesky solve (if it fits)
+        working_set_genotypes.try_materialize_gpu()
         subset_state = _restricted_posterior_state(
-            genotype_matrix=genotype_matrix.subset(working_indices),
+            genotype_matrix=working_set_genotypes,
             covariate_matrix=covariate_matrix,
             targets=targets,
             prior_variances=prior_variances[working_indices],
@@ -4352,6 +4355,9 @@ def _restricted_posterior_state_temporary_working_set(
             temporary_working_sets=False,
             allow_working_set=False,
         )
+        # Free GPU memory after subset solve
+        working_set_genotypes._cupy_cache = None
+        del working_set_genotypes
         candidate_beta = np.zeros(variant_count, dtype=np.float64)
         candidate_beta[working_indices] = np.asarray(subset_state[1], dtype=np.float64)
         ever_active_indices = _ordered_unique_indices(
