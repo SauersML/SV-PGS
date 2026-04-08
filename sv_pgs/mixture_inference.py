@@ -38,7 +38,7 @@ The algorithm iterates three steps until convergence:
   1. **E-step (posterior)**: Given current prior variances, solve for the
      best-fit effect sizes beta_j.  For continuous traits this uses REML
      (restricted maximum likelihood); for binary traits it uses a
-     Newton trust-region optimizer with Polya-Gamma augmentation.
+     Newton-style Polya-Gamma updates.
 
   2. **Local scale update**: Given the fitted betas, update each variant's
      local shrinkage lambda_j using Generalized Inverse Gaussian (GIG)
@@ -70,10 +70,12 @@ from scipy.special import kve as scipy_bessel_kve
 
 from sv_pgs._jax import gpu_compute_jax_dtype, gpu_compute_numpy_dtype
 from sv_pgs.config import ModelConfig, TraitType, VariantClass
-from sv_pgs.data import TieMap, VariantRecord
+from sv_pgs.data import NESTED_PATH_DELIMITER, TieMap, VariantRecord
 from sv_pgs.genotype import (
     DenseRawGenotypeMatrix,
     StandardizedGenotypeMatrix,
+    _cupy_cache_standardized_columns,
+    _iter_cupy_cache_standardized_batches,
     _cupy_compute_dtype,
     _gpu_free_bytes,
     _iter_standardized_gpu_batches,
@@ -165,7 +167,21 @@ class _SampleSpacePreconditionerCacheEntry:
 class ScaleModelFeatureSpec:
     kind: str
     variant_class: VariantClass | None = None
-    continuous_feature_name: str | None = None
+    source_name: str | None = None
+    level_name: str | None = None
+    nested_depth: int | None = None
+    basis_index: int | None = None
+    basis_kind: str | None = None
+    standardize_mean: float | None = None
+    standardize_scale: float | None = None
+    knot_values: tuple[float, ...] = ()
+
+
+@dataclass(slots=True)
+class _PriorAnnotationTables:
+    continuous_values_by_source: dict[str, np.ndarray]
+    factor_weights_by_source: dict[str, dict[str, np.ndarray]]
+    nested_weights_by_source: dict[str, dict[int, dict[str, np.ndarray]]]
 
 
 @dataclass(slots=True)
@@ -183,6 +199,7 @@ class VariationalFitResult:
     objective_history: list[float]
     validation_history: list[float]
     member_prior_variances: np.ndarray
+    linear_predictor: np.ndarray | None = None
 
 
 @dataclass(slots=True)
@@ -271,11 +288,6 @@ _CHECKPOINT_EXCLUDED_CONFIG_FIELDS = frozenset({
     "sample_space_preconditioner_rank",
     "max_inner_newton_iterations",
     "newton_gradient_tolerance",
-    "trust_region_initial_damping",
-    "trust_region_damping_increase_factor",
-    "trust_region_damping_decrease_factor",
-    "trust_region_success_threshold",
-    "trust_region_minimum_damping",
     "temporary_working_set_initial_size",
     "temporary_working_set_growth",
     "temporary_working_set_max_passes",
@@ -351,16 +363,6 @@ def _apply_binary_intercept_calibration(
         collapsed_objective=float(posterior_state.collapsed_objective),
         sigma_error2=float(posterior_state.sigma_error2),
     )
-
-
-def _gpu_exact_variant_linear_predictor(X_gpu, beta: np.ndarray) -> np.ndarray:
-    import cupy as cp
-
-    compute_cp_dtype = _cupy_compute_dtype(cp)
-    predictor_gpu = X_gpu.astype(compute_cp_dtype, copy=False) @ cp.asarray(beta, dtype=compute_cp_dtype)
-    predictor_host = predictor_gpu.get() if hasattr(predictor_gpu, "get") else predictor_gpu
-    return np.asarray(predictor_host, dtype=np.float64)
-
 
 def _gpu_cholesky_solve(right_hand_side, cholesky_factor_gpu, solve_triangular_gpu):
     import cupy as cp
@@ -449,38 +451,8 @@ def _covariates_only_fit_result(
         objective_history=[objective_value],
         validation_history=validation_history,
         member_prior_variances=np.zeros(0, dtype=np.float32),
+        linear_predictor=np.asarray(linear_predictor, dtype=np.float32),
     )
-
-
-def _fit_covariates_only_binary(
-    covariate_matrix: np.ndarray,
-    targets: np.ndarray,
-    minimum_weight: float,
-    max_iterations: int,
-    gradient_tolerance: float,
-) -> np.ndarray:
-    covariates = np.asarray(covariate_matrix, dtype=np.float64)
-    target_array = np.asarray(targets, dtype=np.float64)
-    alpha = _initialize_alpha_state(covariates, target_array, TraitType.BINARY)
-    if covariates.shape[1] == 0:
-        return alpha
-    for _ in range(max_iterations):
-        linear_predictor = np.asarray(covariates @ alpha, dtype=np.float64)
-        probabilities = np.asarray(stable_sigmoid(linear_predictor), dtype=np.float64)
-        weights = np.maximum(probabilities * (1.0 - probabilities), minimum_weight)
-        gradient = covariates.T @ (target_array - probabilities)
-        if float(np.linalg.norm(gradient)) <= gradient_tolerance:
-            break
-        hessian = covariates.T @ (weights[:, None] * covariates)
-        step = np.linalg.solve(
-            hessian + np.eye(hessian.shape[0], dtype=np.float64) * 1e-8,
-            gradient,
-        )
-        alpha += step
-        if float(np.linalg.norm(step)) <= gradient_tolerance:
-            break
-    return np.asarray(alpha, dtype=np.float64)
-
 
 def _fit_binary_alpha_with_offset(
     covariate_matrix: np.ndarray,
@@ -901,6 +873,10 @@ def fit_variational_em(
                 refresh_interval=config.beta_variance_update_interval,
                 total_iterations=config.max_outer_iterations,
                 force_final_refresh=not config.final_posterior_refinement,
+                trait_type=config.trait_type,
+                sample_count=genotype_matrix.shape[0],
+                variant_count=genotype_matrix.shape[1],
+                exact_solver_matrix_limit=config.exact_solver_matrix_limit,
             )
             posterior_theta = _pack_theta(
                 global_scale=float(global_scale),
@@ -989,11 +965,6 @@ def fit_variational_em(
                         # step_size) where block precision matters, fewer later.
                         max_iterations=min(config.max_inner_newton_iterations, max(2, int(8 * step_size / 0.27 + 0.5))),
                         gradient_tolerance=max(config.newton_gradient_tolerance, 1e-4),
-                        initial_damping=config.trust_region_initial_damping,
-                        damping_increase_factor=config.trust_region_damping_increase_factor,
-                        damping_decrease_factor=config.trust_region_damping_decrease_factor,
-                        success_threshold=config.trust_region_success_threshold,
-                        minimum_damping=config.trust_region_minimum_damping,
                         solver_tolerance=config.linear_solver_tolerance,
                         maximum_linear_solver_iterations=config.maximum_linear_solver_iterations,
                         logdet_probe_count=config.logdet_probe_count,
@@ -1029,6 +1000,9 @@ def fit_variational_em(
                         compute_beta_variance=refresh_beta_variance,
                         stale_beta_variance=None if beta_variance_state is None else beta_variance_state[block_indices],
                         restricted_posterior_warm_start=None,
+                        em_iteration_index=outer_iteration,
+                        total_em_iterations=config.max_outer_iterations,
+                        update_blend_weight=step_size,
                     )
                     block_beta_candidate = np.asarray(block_state.beta, dtype=np.float64)
                     block_beta_variance = np.asarray(block_state.beta_variance, dtype=np.float64)
@@ -1283,6 +1257,10 @@ def fit_variational_em(
                 refresh_interval=config.beta_variance_update_interval,
                 total_iterations=config.max_outer_iterations,
                 force_final_refresh=not config.final_posterior_refinement,
+                trait_type=config.trait_type,
+                sample_count=genotype_matrix.shape[0],
+                variant_count=genotype_matrix.shape[1],
+                exact_solver_matrix_limit=config.exact_solver_matrix_limit,
             )
 
             posterior_state = _fit_collapsed_posterior(
@@ -1300,6 +1278,8 @@ def fit_variational_em(
                 predictor_offset=predictor_offset_array,
                 stale_beta_variance=beta_variance_state,
                 restricted_posterior_warm_start=restricted_posterior_warm_start,
+                em_iteration_index=outer_iteration,
+                total_em_iterations=config.max_outer_iterations,
             )
             if config.trait_type == TraitType.BINARY and config.binary_intercept_calibration:
                 posterior_state = _apply_binary_intercept_calibration(
@@ -1540,6 +1520,7 @@ def fit_variational_em(
         objective_history=objective_history,
         validation_history=validation_history,
         member_prior_variances=final_member_prior_variances.astype(np.float32),
+        linear_predictor=np.asarray(final_state.linear_predictor, dtype=np.float32),
     )
 
 
@@ -1562,7 +1543,24 @@ def _should_refresh_beta_variance(
     refresh_interval: int,
     total_iterations: int,
     force_final_refresh: bool,
+    trait_type: TraitType | None = None,
+    sample_count: int | None = None,
+    variant_count: int | None = None,
+    exact_solver_matrix_limit: int | None = None,
 ) -> bool:
+    # In the exact small-n quantitative regime, stale beta variances destabilize
+    # the sigma_e^2 update because the leverage correction lags by several EM
+    # steps. Refresh every iteration there so the single Bayesian path remains
+    # well-behaved in p >> n settings.
+    if (
+        trait_type == TraitType.QUANTITATIVE
+        and sample_count is not None
+        and variant_count is not None
+        and exact_solver_matrix_limit is not None
+        and int(variant_count) > int(sample_count)
+        and int(sample_count) <= int(exact_solver_matrix_limit)
+    ):
+        return True
     if force_final_refresh and iteration_index + 1 == max(int(total_iterations), 1):
         return True
     return ((iteration_index + 1) % max(int(refresh_interval), 1)) == 0
@@ -1613,6 +1611,9 @@ def _fit_collapsed_posterior(
     predictor_offset: np.ndarray | None = None,
     stale_beta_variance: np.ndarray | None = None,
     restricted_posterior_warm_start: _RestrictedPosteriorWarmStart | None = None,
+    em_iteration_index: int | None = None,
+    total_em_iterations: int | None = None,
+    update_blend_weight: float | None = None,
 ) -> PosteriorState:
     log(f"    collapsed posterior: trait={trait_type.value}  n_variants={genotype_matrix.shape[1]}  n_samples={genotype_matrix.shape[0]}  sigma_e2={sigma_error2:.6f}  mem={mem()}")
     prior_variances = np.maximum(np.asarray(reduced_prior_variances, dtype=np.float64), 1e-8)
@@ -1629,6 +1630,9 @@ def _fit_collapsed_posterior(
         compute_logdet=compute_logdet,
         compute_beta_variance=compute_beta_variance,
         gpu_enabled=_collapsed_gpu_available,
+        em_iteration_index=em_iteration_index,
+        total_em_iterations=total_em_iterations,
+        update_blend_weight=update_blend_weight,
     )
     predictor_offset_array = (
         np.zeros(genotype_matrix.shape[0], dtype=np.float64)
@@ -1683,11 +1687,6 @@ def _fit_collapsed_posterior(
             minimum_weight=config.polya_gamma_minimum_weight,
             max_iterations=config.max_inner_newton_iterations,
             gradient_tolerance=config.newton_gradient_tolerance,
-            initial_damping=config.trust_region_initial_damping,
-            damping_increase_factor=config.trust_region_damping_increase_factor,
-            damping_decrease_factor=config.trust_region_damping_decrease_factor,
-            success_threshold=config.trust_region_success_threshold,
-            minimum_damping=config.trust_region_minimum_damping,
             solver_tolerance=posterior_solver_tolerance,
             maximum_linear_solver_iterations=posterior_maximum_linear_solver_iterations,
             logdet_probe_count=config.logdet_probe_count,
@@ -1845,18 +1844,51 @@ def _collapsed_posterior_solver_controls(
     compute_logdet: bool,
     compute_beta_variance: bool,
     gpu_enabled: bool = False,
+    em_iteration_index: int | None = None,
+    total_em_iterations: int | None = None,
+    update_blend_weight: float | None = None,
 ) -> tuple[float, int]:
     if compute_logdet and compute_beta_variance:
         return float(solver_tolerance), int(maximum_linear_solver_iterations)
-    if genotype_matrix.shape[0] < 16_384 and genotype_matrix.shape[1] < 16_384:
-        return float(solver_tolerance), int(maximum_linear_solver_iterations)
-    relaxed_tolerance = max(float(solver_tolerance), 1e-4)
-    # GPU CG iterations are cheap (~30ms each with cached data), so allow more
-    # iterations before declaring convergence failure on large blocks.
-    iteration_cap = 512 if gpu_enabled else 256
-    relaxed_maximum_iterations = min(int(maximum_linear_solver_iterations), iteration_cap)
+    resolved_tolerance = float(solver_tolerance)
+    resolved_maximum_iterations = int(maximum_linear_solver_iterations)
+    is_large_problem = genotype_matrix.shape[0] >= 16_384 or genotype_matrix.shape[1] >= 16_384
+
+    # For stochastic quantitative block updates, the candidate solve is blended
+    # back into the global state. Small step sizes do not justify a tight inner
+    # CG solve even when the block itself is modest in size.
+    if update_blend_weight is not None:
+        blend_weight = float(np.clip(update_blend_weight, 0.0, 1.0))
+        if blend_weight < 0.08:
+            relaxed_tolerance = max(resolved_tolerance, 5e-3)
+            iteration_cap = 128 if gpu_enabled else 64
+        elif blend_weight < 0.20:
+            relaxed_tolerance = max(resolved_tolerance, 2e-3)
+            iteration_cap = 192 if gpu_enabled else 96
+        else:
+            relaxed_tolerance = max(resolved_tolerance, 1e-3)
+            iteration_cap = 256 if gpu_enabled else 128
+        relaxed_maximum_iterations = min(resolved_maximum_iterations, iteration_cap)
+    elif is_large_problem:
+        progress_fraction = 1.0
+        if total_em_iterations is not None and total_em_iterations > 1 and em_iteration_index is not None:
+            progress_fraction = float(np.clip(em_iteration_index / (total_em_iterations - 1), 0.0, 1.0))
+        if progress_fraction < 1.0 / 3.0:
+            relaxed_tolerance = max(resolved_tolerance, 1e-3)
+            iteration_cap = 256 if gpu_enabled else 128
+        elif progress_fraction < 2.0 / 3.0:
+            relaxed_tolerance = max(resolved_tolerance, 3e-4)
+            iteration_cap = 512 if gpu_enabled else 256
+        else:
+            relaxed_tolerance = max(resolved_tolerance, 1e-4)
+            iteration_cap = 768 if gpu_enabled else 384
+        relaxed_maximum_iterations = min(resolved_maximum_iterations, iteration_cap)
+    else:
+        return resolved_tolerance, resolved_maximum_iterations
+
     if genotype_matrix.shape[1] > genotype_matrix.shape[0]:
-        relaxed_tolerance = max(relaxed_tolerance, 5e-4)
+        wide_tolerance_floor = 1e-4 if compute_beta_variance else 1e-3
+        relaxed_tolerance = max(relaxed_tolerance, wide_tolerance_floor)
         wide_cap = 384 if gpu_enabled else 192
         relaxed_maximum_iterations = min(relaxed_maximum_iterations, wide_cap)
     if not compute_beta_variance:
@@ -1904,16 +1936,6 @@ def _cupy_array_to_numpy(array, *, dtype: np.dtype | type[np.floating[Any]]) -> 
     return np.asarray(host_array, dtype=dtype)
 
 
-def _stable_sigmoid_cupy(cp, values_gpu, *, dtype):
-    positive_branch = values_gpu >= dtype(0.0)
-    negative_exponential = cp.exp(cp.where(positive_branch, -values_gpu, values_gpu))
-    return cp.where(
-        positive_branch,
-        dtype(1.0) / (dtype(1.0) + negative_exponential),
-        negative_exponential / (dtype(1.0) + negative_exponential),
-    )
-
-
 def _softplus_cupy(cp, values_gpu, *, dtype):
     positive_branch = values_gpu >= dtype(0.0)
     return cp.where(
@@ -1943,29 +1965,6 @@ def _streaming_gpu_genotype_matvec(
     ):
         result_gpu += standardized_batch @ coefficients_gpu[batch_slice]
     return result_gpu
-
-
-def _streaming_gpu_genotype_transpose_matvec(
-    genotype_matrix: StandardizedGenotypeMatrix,
-    sample_weights_gpu,
-    *,
-    batch_size: int,
-    cp,
-    dtype,
-):
-    result_gpu = cp.empty(genotype_matrix.shape[1], dtype=dtype)
-    for batch_slice, standardized_batch in _iter_standardized_gpu_batches(
-        genotype_matrix.raw,
-        genotype_matrix.variant_indices,
-        genotype_matrix.means,
-        genotype_matrix.scales,
-        batch_size=batch_size,
-        cupy=cp,
-        dtype=dtype,
-    ):
-        result_gpu[batch_slice] = standardized_batch.T @ sample_weights_gpu
-    return result_gpu
-
 
 def _binary_expected_polya_gamma_weights_cupy(
     cp,
@@ -2019,11 +2018,6 @@ def _binary_posterior_state(
     minimum_weight: float,
     max_iterations: int,
     gradient_tolerance: float,
-    initial_damping: float,
-    damping_increase_factor: float,
-    damping_decrease_factor: float,
-    success_threshold: float,
-    minimum_damping: float,
     solver_tolerance: float = 1e-6,
     maximum_linear_solver_iterations: int = 256,
     logdet_probe_count: int = 6,
@@ -2063,6 +2057,7 @@ def _binary_posterior_state(
         if restricted_posterior_warm_start is None
         else restricted_posterior_warm_start
     )
+    log(f"      binary setup: {standardized_genotypes.shape[1]} variants, {standardized_genotypes.shape[0]} samples  mem={mem()}")
     cupy = None
     streaming_gpu_binary_backend = (
         standardized_genotypes._cupy_cache is None
@@ -2074,6 +2069,7 @@ def _binary_posterior_state(
         streaming_gpu_binary_backend = cupy is not None
     if streaming_gpu_binary_backend:
         assert cupy is not None
+        log(f"      binary GPU streaming backend active  mem={mem()}")
         compute_cp_dtype = _cupy_compute_dtype(cupy)
         covariate_matrix_gpu = cupy.asarray(covariate_matrix_f64, dtype=compute_cp_dtype)
         target_array_gpu = cupy.asarray(target_array, dtype=compute_cp_dtype)
@@ -2092,6 +2088,8 @@ def _binary_posterior_state(
         gpu_enabled=_newton_gpu_available,
     )
     import time as _time
+    log(f"      computing initial linear predictor...  mem={mem()}")
+    _init_pred_t0 = _time.monotonic()
     if streaming_gpu_binary_backend:
         assert cupy is not None
         current_linear_predictor_gpu = (
@@ -2126,6 +2124,8 @@ def _binary_posterior_state(
             prior_precision=prior_precision,
             beta=parameters[covariate_count:],
         )
+    _init_pred_seconds = _time.monotonic() - _init_pred_t0
+    log(f"      initial predictor computed in {_init_pred_seconds:.1f}s  obj={current_objective:.4f}  mem={mem()}")
     log(
         f"      binary PG updates: {standardized_genotypes.shape[1]} variants, "
         + f"max_iter={max_iterations}  mem={mem()}"
@@ -2470,16 +2470,18 @@ def _sample_space_diagonal_preconditioner(
     if genotype_matrix._cupy_cache is not None:
         import cupy as cp
         compute_cp_dtype = _cupy_compute_dtype(cp)
-        X = genotype_matrix._cupy_cache  # (n, p) float32 on GPU
         pv = cp.asarray(prior_variances, dtype=compute_cp_dtype)
         # diag(X @ diag(pv) @ X^T) = sum(X^2 * pv, axis=1)
         # Chunked to avoid allocating a full (n, p) intermediate on GPU.
-        diag_gpu = cp.zeros(X.shape[0], dtype=compute_cp_dtype)
-        chunk = max(1, min(512, X.shape[1]))
-        for start in range(0, X.shape[1], chunk):
-            end = min(start + chunk, X.shape[1])
-            x_chunk = X[:, start:end].astype(compute_cp_dtype, copy=False)
-            diag_gpu += cp.sum(x_chunk * x_chunk * pv[start:end], axis=1)
+        diag_gpu = cp.zeros(genotype_matrix.shape[0], dtype=compute_cp_dtype)
+        for batch_slice, x_chunk in _iter_cupy_cache_standardized_batches(
+            genotype_matrix._cupy_cache,
+            sample_count=genotype_matrix.shape[0],
+            batch_size=512,
+            cupy=cp,
+            dtype=compute_cp_dtype,
+        ):
+            diag_gpu += cp.sum(x_chunk * x_chunk * pv[batch_slice], axis=1)
         result = np.asarray(diagonal_noise, dtype=np.float64) + _cupy_array_to_numpy(diag_gpu, dtype=np.float64)
         return np.maximum(result, 1e-8)
     if genotype_matrix.raw is not None and not genotype_matrix.supports_jax_dense_ops():
@@ -2587,7 +2589,7 @@ def _cached_sample_space_basis(
 ):
     matching_basis: Any | None = None
     matching_width: int | None = None
-    for (cached_rank, cached_seed), cached_basis in basis_cache.items():
+    for (_cached_rank, cached_seed), cached_basis in basis_cache.items():
         if cached_seed != random_seed:
             continue
         basis_width = int(cached_basis.shape[1])
@@ -2636,24 +2638,6 @@ def _sample_space_nystrom_basis_cpu(
     basis_matrix = np.asarray(basis_matrix[:, :effective_rank], dtype=np.float64)
     genotype_matrix._sample_space_nystrom_basis_cpu_cache[(effective_rank, int(random_seed))] = basis_matrix
     return basis_matrix
-
-
-def prepare_sample_space_nystrom_basis_cache(
-    genotype_matrix: StandardizedGenotypeMatrix,
-    rank: int,
-    random_seed: int = 0,
-    batch_size: int = 1024,
-) -> int:
-    basis_matrix = _sample_space_nystrom_basis_cpu(
-        genotype_matrix=genotype_matrix,
-        batch_size=batch_size,
-        rank=rank,
-        random_seed=random_seed,
-    )
-    if basis_matrix is None:
-        return 0
-    return int(basis_matrix.shape[1])
-
 
 def _sample_space_nystrom_basis_gpu(
     genotype_matrix: StandardizedGenotypeMatrix,
@@ -3401,12 +3385,14 @@ def _apply_sample_space_operator_gpu(
         raise ValueError("sample-space GPU operator expects a vector or matrix right-hand side.")
     result_gpu = diagonal_noise_gpu[:, None] * input_gpu
     if genotype_matrix._cupy_cache is not None:
-        x_gpu = genotype_matrix._cupy_cache
-        column_chunk = max(1, min(batch_size, x_gpu.shape[1]))
-        for start in range(0, x_gpu.shape[1], column_chunk):
-            stop = min(start + column_chunk, x_gpu.shape[1])
-            x_chunk = x_gpu[:, start:stop].astype(dtype, copy=False)
-            scaled_projection = prior_variances_gpu[start:stop, None] * (x_chunk.T @ input_gpu)
+        for batch_slice, x_chunk in _iter_cupy_cache_standardized_batches(
+            genotype_matrix._cupy_cache,
+            sample_count=genotype_matrix.shape[0],
+            batch_size=batch_size,
+            cupy=cp,
+            dtype=dtype,
+        ):
+            scaled_projection = prior_variances_gpu[batch_slice, None] * (x_chunk.T @ input_gpu)
             result_gpu += x_chunk @ scaled_projection
     else:
         for batch_slice, standardized_batch in _iter_standardized_gpu_batches(
@@ -3545,10 +3531,7 @@ def _effective_sample_space_preconditioner_rank(
     resolved_rank = max(int(requested_rank), 0)
     if resolved_rank == 0:
         return 0
-    target_rank = resolved_rank
-    if sample_count >= 32_768 and variant_count >= 65_536:
-        target_rank = max(target_rank, 1_024)
-    return min(target_rank, variant_count)
+    return min(resolved_rank, sample_count, variant_count)
 
 
 def _streaming_cupy_backend_available(genotype_matrix: StandardizedGenotypeMatrix) -> bool:
@@ -3627,8 +3610,16 @@ def _cached_weighted_covariate_projection(
         import cupy as cp
 
         weighted_covariates_gpu = cp.asarray(weighted_covariates, dtype=cp.float64)
-        projection = cp.asarray(genotype_matrix._cupy_cache, dtype=cp.float64).T @ weighted_covariates_gpu
-        projection_matrix = _cupy_array_to_numpy(projection, dtype=np.float64)
+        projection_gpu = cp.empty((variant_count, covariate_count), dtype=cp.float64)
+        for batch_slice, standardized_batch in _iter_cupy_cache_standardized_batches(
+            genotype_matrix._cupy_cache,
+            sample_count=genotype_matrix.shape[0],
+            batch_size=batch_size,
+            cupy=cp,
+            dtype=cp.float64,
+        ):
+            projection_gpu[batch_slice, :] = standardized_batch.T @ weighted_covariates_gpu
+        projection_matrix = _cupy_array_to_numpy(projection_gpu, dtype=np.float64)
     elif _streaming_cupy_backend_available(genotype_matrix):
         cupy = _try_import_cupy()
         assert cupy is not None
@@ -3754,7 +3745,7 @@ def _solve_sample_space_rhs_gpu(
     )
     inner_tolerance = max(float(tolerance), 1e-4)
     max_refinement_steps = 4
-    for refinement_index in range(max_refinement_steps):
+    for _refinement_index in range(max_refinement_steps):
         residual_gpu64, residual_norm_sq = true_residual(solution_gpu64)
         if np.all(residual_norm_sq <= convergence_threshold_sq):
             solution = np.asarray(solution_gpu64.get() if hasattr(solution_gpu64, "get") else solution_gpu64, dtype=np.float64)
@@ -3837,7 +3828,7 @@ def _solve_sample_space_rhs_gpu(
         else:
             log(
                 f"      GPU CG near-converged: residual={final_residual:.2e} threshold={final_threshold:.2e} "
-                + f"(within 10x, accepting approximate solution)"
+                + "(within 10x, accepting approximate solution)"
             )
     solution = np.asarray(solution_gpu64.get() if hasattr(solution_gpu64, "get") else solution_gpu64, dtype=np.float64)
     resolved_solution = solution[:, 0] if vector_input else solution
@@ -4136,15 +4127,18 @@ def _restricted_variant_space_diagonal_preconditioner(
     diag_correction = np.sum(cross * correction, axis=0)
     if genotype_matrix._cupy_cache is not None:
         import cupy as cp
-        X = genotype_matrix._cupy_cache  # (n, p) float32 on GPU
         inv_d = cp.asarray(inverse_diagonal_noise, dtype=cp.float64)
         # Compute diag(X^T D^{-1} X) on GPU and reuse cached X^T D^{-1} C.
-        raw_diag = cp.zeros(X.shape[1], dtype=cp.float64)
-        chunk = max(1, min(512, X.shape[1]))
-        for start in range(0, X.shape[1], chunk):
-            end = min(start + chunk, X.shape[1])
-            weighted_chunk = X[:, start:end] * inv_d[:, None]  # (n, chunk) on GPU
-            raw_diag[start:end] = cp.sum(X[:, start:end] * weighted_chunk, axis=0)
+        raw_diag = cp.empty(genotype_matrix.shape[1], dtype=cp.float64)
+        for batch_slice, standardized_batch in _iter_cupy_cache_standardized_batches(
+            genotype_matrix._cupy_cache,
+            sample_count=genotype_matrix.shape[0],
+            batch_size=batch_size,
+            cupy=cp,
+            dtype=cp.float64,
+        ):
+            weighted_batch = inv_d[:, None] * standardized_batch
+            raw_diag[batch_slice] = cp.sum(standardized_batch * weighted_batch, axis=0)
         raw_diag_np = raw_diag.get().astype(compute_np_dtype)
         return np.maximum(prior_precision + raw_diag_np - diag_correction, 1e-8)
     if _streaming_cupy_backend_available(genotype_matrix):
@@ -4818,9 +4812,13 @@ def _restricted_posterior_state(
             log(f"    restricted posterior: exact variant-space Cholesky (p={variant_count}, n={sample_count})  mem={mem()}")
             if genotype_matrix._cupy_cache is not None:
                 import cupy as cp
-                X_gpu = genotype_matrix._cupy_cache  # (n, p) float32 on GPU
                 compute_cp_dtype = _cupy_compute_dtype(cp)
-                X_gpu_compute = X_gpu.astype(compute_cp_dtype, copy=False)
+                X_gpu_compute = _cupy_cache_standardized_columns(
+                    genotype_matrix._cupy_cache,
+                    slice(None),
+                    cupy=cp,
+                    dtype=compute_cp_dtype,
+                )
                 # Build X^T diag(W) X on GPU in compute precision, chunked to
                 # avoid allocating a second full-size (n, p) intermediate.
                 inv_d_cp = cp.asarray(inverse_diagonal_noise, dtype=compute_cp_dtype)
@@ -4877,7 +4875,7 @@ def _restricted_posterior_state(
             )
             logdet_A = 2.0 * float(np.sum(np.log(np.diag(variant_precision_cholesky)))) if compute_logdet else 0.0
             if genotype_matrix._cupy_cache is not None:
-                genetic_linear_predictor = _gpu_exact_variant_linear_predictor(X_gpu, beta)
+                genetic_linear_predictor = np.asarray(genotype_matrix.matvec(beta), dtype=np.float64)
             else:
                 genetic_linear_predictor = np.asarray(genotype_matrix.matvec(beta), dtype=np.float64)
         else:
@@ -5002,7 +5000,7 @@ def _restricted_posterior_state(
             + f"(p={variant_count}, n={sample_count}, source={gpu_source})"
         )
         _t0 = _time.monotonic()
-        log(f"      building preconditioner...")
+        log("      building preconditioner...")
         sample_space_preconditioner_gpu, sample_space_preconditioner_cache_entry = _get_cached_sample_space_gpu_preconditioner(
             genotype_matrix=genotype_matrix,
             prior_variances=prior_variances,
@@ -5312,14 +5310,12 @@ def _stochastic_restricted_cross_leverage_diagonal(
 
 # Build the metadata design matrix for the prior scale model.
 #
-# Each variant gets a row of features describing its properties:
-#   - Type indicators (one per variant class: SNV, deletion, duplication, ...)
-#   - log(length) polynomial (linear + quadratic) per class — longer SVs
-#     may have different effect size distributions
-#   - Repeat region indicator, copy number indicator
-#
-# These features let the model learn, e.g., "long deletions in repeat
-# regions tend to have larger effects" and set prior variances accordingly.
+# The scale hypermodel is schema-driven:
+#   - class effects
+#   - pooled categorical / multi-membership effects
+#   - nested categorical node effects
+#   - smooth bases for continuous features
+#   - class-varying interactions for factor and smooth terms
 def _build_prior_design(records: Sequence[VariantRecord]) -> PriorDesign:
     unique_classes = sorted(
         {
@@ -5337,204 +5333,263 @@ def _build_prior_design(records: Sequence[VariantRecord]) -> PriorDesign:
         class_index: variant_class
         for variant_class, class_index in class_lookup.items()
     }
-
     class_membership_matrix = np.zeros((len(records), len(unique_classes)), dtype=np.float64)
     for record_index, record in enumerate(records):
-        prior_classes = record.prior_class_members
-        prior_membership = record.prior_class_membership
-        for prior_class, prior_weight in zip(prior_classes, prior_membership, strict=True):
+        for prior_class, prior_weight in zip(record.prior_class_members, record.prior_class_membership, strict=True):
             class_membership_matrix[record_index, class_lookup[prior_class]] = prior_weight
-    class_membership_totals = np.sum(class_membership_matrix, axis=0)
 
-    continuous_feature_names, continuous_feature_matrix = _continuous_prior_design_matrix(records)
-    binary_feature_names, binary_feature_matrix = _binary_prior_design_matrix(records)
-
-    design_columns: list[np.ndarray] = []
-    feature_names: list[str] = []
-    feature_specs: list[ScaleModelFeatureSpec] = []
-    for continuous_feature_index, continuous_feature_name in enumerate(continuous_feature_names):
-        design_columns.append(_center_design_column(continuous_feature_matrix[:, continuous_feature_index]))
-        feature_names.append(f"continuous_shared::{continuous_feature_name}")
-        feature_specs.append(
-            ScaleModelFeatureSpec(
-                kind="continuous_shared",
-                continuous_feature_name=continuous_feature_name,
-            )
-        )
-    for binary_feature_index, binary_feature_name in enumerate(binary_feature_names):
-        design_columns.append(_center_design_column(binary_feature_matrix[:, binary_feature_index]))
-        if binary_feature_name in ("repeat_indicator", "copy_number_indicator"):
-            feature_names.append(binary_feature_name)
-            feature_specs.append(ScaleModelFeatureSpec(kind=binary_feature_name))
-        else:
-            feature_names.append(f"binary_indicator::{binary_feature_name}")
-            feature_specs.append(
-                ScaleModelFeatureSpec(
-                    kind="binary_indicator",
-                    continuous_feature_name=binary_feature_name,
-                )
-            )
-    for class_index, variant_class in enumerate(unique_classes):
-        class_membership = class_membership_matrix[:, class_index]
-        design_columns.append(_center_design_column(class_membership))
-        feature_names.append("type_offset::" + variant_class.value)
-        feature_specs.append(ScaleModelFeatureSpec(kind="type_offset", variant_class=variant_class))
-
-        if class_membership_totals[class_index] < 3.0:
-            continue
-
-        for continuous_feature_index, continuous_feature_name in enumerate(continuous_feature_names):
-            standardized_values = continuous_feature_matrix[:, continuous_feature_index]
-            design_columns.append(_center_design_column(class_membership * standardized_values))
-            feature_names.append(f"continuous_linear::{continuous_feature_name}::{variant_class.value}")
-            feature_specs.append(
-                ScaleModelFeatureSpec(
-                    kind="continuous_linear",
-                    variant_class=variant_class,
-                    continuous_feature_name=continuous_feature_name,
-                )
-            )
-            design_columns.append(_center_design_column(class_membership * standardized_values * standardized_values))
-            feature_names.append(f"continuous_quadratic::{continuous_feature_name}::{variant_class.value}")
-            feature_specs.append(
-                ScaleModelFeatureSpec(
-                    kind="continuous_quadratic",
-                    variant_class=variant_class,
-                    continuous_feature_name=continuous_feature_name,
-                )
-            )
-        for binary_feature_index, binary_feature_name in enumerate(binary_feature_names):
-            design_columns.append(
-                _center_design_column(class_membership * binary_feature_matrix[:, binary_feature_index])
-            )
-            feature_names.append(f"binary_interaction::{binary_feature_name}::{variant_class.value}")
-            feature_specs.append(
-                ScaleModelFeatureSpec(
-                    kind="binary_interaction",
-                    variant_class=variant_class,
-                    continuous_feature_name=binary_feature_name,
-                )
-            )
-
+    annotation_tables = _prior_annotation_tables(records)
+    class_membership_by_class = {
+        variant_class: class_membership_matrix[:, class_index]
+        for class_index, variant_class in enumerate(unique_classes)
+    }
+    feature_specs = _compile_prior_feature_specs(
+        annotation_tables=annotation_tables,
+        class_membership_by_class=class_membership_by_class,
+    )
+    feature_names = [_feature_name_from_spec(feature_spec) for feature_spec in feature_specs]
+    design_matrix = _design_matrix_for_feature_specs(records=records, feature_specs=feature_specs)
     return PriorDesign(
-        design_matrix=np.column_stack(design_columns).astype(np.float64),
+        design_matrix=design_matrix,
         feature_names=feature_names,
-        feature_specs=tuple(feature_specs),
+        feature_specs=feature_specs,
         class_membership_matrix=class_membership_matrix,
         inverse_class_lookup=inverse_class_lookup,
     )
+
+
+def _compile_prior_feature_specs(
+    annotation_tables: _PriorAnnotationTables,
+    class_membership_by_class: dict[VariantClass, np.ndarray],
+) -> tuple[ScaleModelFeatureSpec, ...]:
+    feature_specs: list[ScaleModelFeatureSpec] = []
+    class_totals = {
+        variant_class: float(np.sum(class_membership))
+        for variant_class, class_membership in class_membership_by_class.items()
+    }
+
+    def append_if_nonzero(feature_spec: ScaleModelFeatureSpec) -> None:
+        feature_column = _column_for_feature_spec(
+            feature_spec=feature_spec,
+            annotation_tables=annotation_tables,
+            class_membership_by_class=class_membership_by_class,
+        )
+        if np.max(np.abs(_center_design_column(feature_column))) < 1e-10:
+            return
+        feature_specs.append(feature_spec)
+
+    for variant_class in sorted(class_membership_by_class, key=lambda class_value: class_value.value):
+        append_if_nonzero(ScaleModelFeatureSpec(kind="type_offset", variant_class=variant_class))
+
+    for source_name in sorted(annotation_tables.factor_weights_by_source):
+        level_weights_by_name = annotation_tables.factor_weights_by_source[source_name]
+        for level_name in _factor_levels_to_encode(level_weights_by_name):
+            append_if_nonzero(
+                ScaleModelFeatureSpec(
+                    kind="factor_level",
+                    source_name=source_name,
+                    level_name=level_name,
+                )
+            )
+            for variant_class, class_membership in class_membership_by_class.items():
+                if class_totals[variant_class] < 3.0 or np.max(class_membership) <= 0.0:
+                    continue
+                append_if_nonzero(
+                    ScaleModelFeatureSpec(
+                        kind="factor_interaction",
+                        variant_class=variant_class,
+                        source_name=source_name,
+                        level_name=level_name,
+                    )
+                )
+
+    for source_name in sorted(annotation_tables.nested_weights_by_source):
+        for nested_depth in sorted(annotation_tables.nested_weights_by_source[source_name]):
+            for level_name in sorted(annotation_tables.nested_weights_by_source[source_name][nested_depth]):
+                append_if_nonzero(
+                    ScaleModelFeatureSpec(
+                        kind="nested_level",
+                        source_name=source_name,
+                        level_name=level_name,
+                        nested_depth=nested_depth,
+                    )
+                )
+                for variant_class, class_membership in class_membership_by_class.items():
+                    if class_totals[variant_class] < 3.0 or np.max(class_membership) <= 0.0:
+                        continue
+                    append_if_nonzero(
+                        ScaleModelFeatureSpec(
+                            kind="nested_interaction",
+                            variant_class=variant_class,
+                            source_name=source_name,
+                            level_name=level_name,
+                            nested_depth=nested_depth,
+                        )
+                    )
+
+    for source_name in sorted(annotation_tables.continuous_values_by_source):
+        continuous_values = annotation_tables.continuous_values_by_source[source_name]
+        for base_feature_spec in _continuous_spline_feature_specs(source_name, continuous_values):
+            append_if_nonzero(base_feature_spec)
+            for variant_class, class_membership in class_membership_by_class.items():
+                if class_totals[variant_class] < 3.0 or np.max(class_membership) <= 0.0:
+                    continue
+                append_if_nonzero(
+                    ScaleModelFeatureSpec(
+                        kind="continuous_spline_interaction",
+                        variant_class=variant_class,
+                        source_name=base_feature_spec.source_name,
+                        basis_index=base_feature_spec.basis_index,
+                        basis_kind=base_feature_spec.basis_kind,
+                        standardize_mean=base_feature_spec.standardize_mean,
+                        standardize_scale=base_feature_spec.standardize_scale,
+                        knot_values=base_feature_spec.knot_values,
+                    )
+                )
+
+    return tuple(feature_specs)
+
+
 def _design_matrix_for_feature_specs(
     records: Sequence[VariantRecord],
     feature_specs: Sequence[ScaleModelFeatureSpec],
 ) -> np.ndarray:
     if len(feature_specs) == 0:
         return np.zeros((len(records), 0), dtype=np.float64)
-    class_membership_by_class: dict[VariantClass, np.ndarray] = {}
-    for variant_class in VariantClass:
-        class_membership_by_class[variant_class] = np.asarray(
+    class_membership_by_class = {
+        variant_class: np.asarray(
             [
                 _class_membership_weight(record, variant_class)
                 for record in records
             ],
             dtype=np.float64,
         )
-
-    continuous_feature_names, continuous_feature_matrix = _continuous_prior_design_matrix(records)
-    continuous_feature_index_by_name = {
-        feature_name: feature_index
-        for feature_index, feature_name in enumerate(continuous_feature_names)
+        for variant_class in VariantClass
     }
-    binary_feature_names, binary_feature_matrix = _binary_prior_design_matrix(records)
-    binary_feature_index_by_name = {
-        feature_name: feature_index
-        for feature_index, feature_name in enumerate(binary_feature_names)
-    }
+    annotation_tables = _prior_annotation_tables(records)
+    design_columns = [
+        _center_design_column(
+            _column_for_feature_spec(
+                feature_spec=feature_spec,
+                annotation_tables=annotation_tables,
+                class_membership_by_class=class_membership_by_class,
+            )
+        )
+        for feature_spec in feature_specs
+    ]
+    return np.column_stack(design_columns).astype(np.float64)
 
-    design_columns: list[np.ndarray] = []
-    for feature_spec in feature_specs:
-        if feature_spec.kind == "repeat_indicator":
-            design_columns.append(
-                _center_design_column(
-                    binary_feature_matrix[:, binary_feature_index_by_name["repeat_indicator"]]
-                )
-            )
-            continue
-        if feature_spec.kind == "copy_number_indicator":
-            design_columns.append(
-                _center_design_column(
-                    binary_feature_matrix[:, binary_feature_index_by_name["copy_number_indicator"]]
-                )
-            )
-            continue
-        if feature_spec.kind == "continuous_shared":
-            if feature_spec.continuous_feature_name is None:
-                raise ValueError("Scale-model feature spec is missing continuous_feature_name.")
-            if feature_spec.continuous_feature_name not in continuous_feature_index_by_name:
-                raise ValueError("Unknown continuous scale-model feature: " + str(feature_spec.continuous_feature_name))
-            design_columns.append(
-                _center_design_column(
-                    continuous_feature_matrix[
-                        :,
-                        continuous_feature_index_by_name[feature_spec.continuous_feature_name],
-                    ]
-                )
-            )
-            continue
-        if feature_spec.kind == "binary_indicator":
-            if feature_spec.continuous_feature_name is None:
-                raise ValueError("Scale-model feature spec is missing continuous_feature_name.")
-            if feature_spec.continuous_feature_name not in binary_feature_index_by_name:
-                raise ValueError("Unknown binary scale-model feature: " + str(feature_spec.continuous_feature_name))
-            design_columns.append(
-                _center_design_column(
-                    binary_feature_matrix[
-                        :,
-                        binary_feature_index_by_name[feature_spec.continuous_feature_name],
-                    ]
-                )
-            )
-            continue
+
+def _column_for_feature_spec(
+    feature_spec: ScaleModelFeatureSpec,
+    annotation_tables: _PriorAnnotationTables,
+    class_membership_by_class: dict[VariantClass, np.ndarray],
+) -> np.ndarray:
+    if feature_spec.kind == "type_offset":
         if feature_spec.variant_class is None:
             raise ValueError("Scale-model feature spec is missing variant_class.")
-        variant_class = feature_spec.variant_class
-        class_membership = class_membership_by_class[variant_class]
-        if feature_spec.kind == "type_offset":
-            design_columns.append(_center_design_column(class_membership))
-            continue
-        if feature_spec.continuous_feature_name is None:
-            raise ValueError("Scale-model feature spec is missing continuous_feature_name.")
-        if feature_spec.kind == "binary_interaction":
-            if feature_spec.continuous_feature_name not in binary_feature_index_by_name:
-                raise ValueError("Unknown binary scale-model feature: " + str(feature_spec.continuous_feature_name))
-            design_columns.append(
-                _center_design_column(
-                    class_membership
-                    * binary_feature_matrix[
-                        :,
-                        binary_feature_index_by_name[feature_spec.continuous_feature_name],
-                    ]
-                )
-            )
-            continue
-        if feature_spec.continuous_feature_name not in continuous_feature_index_by_name:
-            raise ValueError("Unknown continuous scale-model feature: " + str(feature_spec.continuous_feature_name))
-        standardized_values = continuous_feature_matrix[
-            :,
-            continuous_feature_index_by_name[feature_spec.continuous_feature_name],
-        ]
-        if feature_spec.kind == "continuous_linear":
-            design_columns.append(_center_design_column(class_membership * standardized_values))
-            continue
-        if feature_spec.kind == "continuous_quadratic":
-            design_columns.append(
-                _center_design_column(
-                    class_membership * standardized_values * standardized_values
-                )
-            )
-            continue
-        raise ValueError("Unsupported scale-model feature kind: " + feature_spec.kind)
+        return np.asarray(class_membership_by_class[feature_spec.variant_class], dtype=np.float64)
 
-    return np.column_stack(design_columns).astype(np.float64)
+    if feature_spec.kind in {"factor_level", "factor_interaction"}:
+        if feature_spec.source_name is None or feature_spec.level_name is None:
+            raise ValueError("Factor scale-model feature spec is missing source_name or level_name.")
+        if feature_spec.source_name not in annotation_tables.factor_weights_by_source:
+            raise ValueError("Unknown factor scale-model feature: " + str(feature_spec.source_name))
+        if feature_spec.level_name not in annotation_tables.factor_weights_by_source[feature_spec.source_name]:
+            raise ValueError("Unknown factor scale-model level: " + str(feature_spec.level_name))
+        feature_column = np.asarray(
+            annotation_tables.factor_weights_by_source[feature_spec.source_name][feature_spec.level_name],
+            dtype=np.float64,
+        )
+        if feature_spec.kind == "factor_level":
+            return feature_column
+        if feature_spec.variant_class is None:
+            raise ValueError("Scale-model interaction feature spec is missing variant_class.")
+        return feature_column * class_membership_by_class[feature_spec.variant_class]
+
+    if feature_spec.kind in {"nested_level", "nested_interaction"}:
+        if feature_spec.source_name is None or feature_spec.level_name is None or feature_spec.nested_depth is None:
+            raise ValueError("Nested scale-model feature spec is missing source_name, level_name, or nested_depth.")
+        if feature_spec.source_name not in annotation_tables.nested_weights_by_source:
+            raise ValueError("Unknown nested scale-model feature: " + str(feature_spec.source_name))
+        if feature_spec.nested_depth not in annotation_tables.nested_weights_by_source[feature_spec.source_name]:
+            raise ValueError("Unknown nested depth for scale-model feature: " + str(feature_spec.nested_depth))
+        nested_weights = annotation_tables.nested_weights_by_source[feature_spec.source_name][feature_spec.nested_depth]
+        if feature_spec.level_name not in nested_weights:
+            raise ValueError("Unknown nested scale-model level: " + str(feature_spec.level_name))
+        feature_column = np.asarray(nested_weights[feature_spec.level_name], dtype=np.float64)
+        if feature_spec.kind == "nested_level":
+            return feature_column
+        if feature_spec.variant_class is None:
+            raise ValueError("Scale-model interaction feature spec is missing variant_class.")
+        return feature_column * class_membership_by_class[feature_spec.variant_class]
+
+    if feature_spec.kind in {"continuous_spline", "continuous_spline_interaction"}:
+        if feature_spec.source_name is None:
+            raise ValueError("Continuous scale-model feature spec is missing source_name.")
+        if feature_spec.source_name not in annotation_tables.continuous_values_by_source:
+            raise ValueError("Unknown continuous scale-model feature: " + str(feature_spec.source_name))
+        feature_column = _continuous_spline_basis_column(
+            raw_values=annotation_tables.continuous_values_by_source[feature_spec.source_name],
+            feature_spec=feature_spec,
+        )
+        if feature_spec.kind == "continuous_spline":
+            return feature_column
+        if feature_spec.variant_class is None:
+            raise ValueError("Scale-model interaction feature spec is missing variant_class.")
+        return feature_column * class_membership_by_class[feature_spec.variant_class]
+
+    raise ValueError("Unsupported scale-model feature kind: " + feature_spec.kind)
+
+
+def _feature_name_from_spec(feature_spec: ScaleModelFeatureSpec) -> str:
+    if feature_spec.kind == "type_offset":
+        if feature_spec.variant_class is None:
+            raise ValueError("Class effect scale-model feature spec is missing variant_class.")
+        return "type_offset::" + feature_spec.variant_class.value
+    if feature_spec.kind == "factor_level":
+        return "factor_level::" + str(feature_spec.source_name) + "::" + str(feature_spec.level_name)
+    if feature_spec.kind == "factor_interaction":
+        return (
+            "factor_interaction::"
+            + str(feature_spec.source_name)
+            + "::"
+            + str(feature_spec.level_name)
+            + "::"
+            + str(feature_spec.variant_class.value if feature_spec.variant_class is not None else "")
+        )
+    if feature_spec.kind == "nested_level":
+        return (
+            "nested_level::"
+            + str(feature_spec.source_name)
+            + "::"
+            + str(feature_spec.nested_depth)
+            + "::"
+            + str(feature_spec.level_name)
+        )
+    if feature_spec.kind == "nested_interaction":
+        return (
+            "nested_interaction::"
+            + str(feature_spec.source_name)
+            + "::"
+            + str(feature_spec.nested_depth)
+            + "::"
+            + str(feature_spec.level_name)
+            + "::"
+            + str(feature_spec.variant_class.value if feature_spec.variant_class is not None else "")
+        )
+    if feature_spec.kind == "continuous_spline":
+        return "continuous_spline::" + str(feature_spec.source_name) + "::basis_" + str(feature_spec.basis_index)
+    if feature_spec.kind == "continuous_spline_interaction":
+        return (
+            "continuous_spline_interaction::"
+            + str(feature_spec.source_name)
+            + "::"
+            + str(feature_spec.variant_class.value if feature_spec.variant_class is not None else "")
+            + "::basis_"
+            + str(feature_spec.basis_index)
+        )
+    raise ValueError("Unsupported scale-model feature kind: " + feature_spec.kind)
 
 
 def _class_membership_weight(record: VariantRecord, variant_class: VariantClass) -> float:
@@ -5544,47 +5599,15 @@ def _class_membership_weight(record: VariantRecord, variant_class: VariantClass)
     return 0.0
 
 
-def _parse_scale_model_feature_names(
-    feature_names: Sequence[str],
-) -> tuple[ScaleModelFeatureSpec, ...]:
-    feature_specs: list[ScaleModelFeatureSpec] = []
-    for feature_name in feature_names:
-        if feature_name == "repeat_indicator":
-            feature_specs.append(ScaleModelFeatureSpec(kind="repeat_indicator"))
-            continue
-        if feature_name == "copy_number_indicator":
-            feature_specs.append(ScaleModelFeatureSpec(kind="copy_number_indicator"))
-            continue
-        feature_parts = feature_name.split("::")
-        if len(feature_parts) == 2:
-            prefix, suffix = feature_parts
-            if prefix in ("continuous_shared", "binary_indicator"):
-                feature_specs.append(
-                    ScaleModelFeatureSpec(
-                        kind=prefix,
-                        continuous_feature_name=suffix,
-                    )
-                )
-                continue
-            class_name = suffix
-            continuous_feature_name = None
-        elif len(feature_parts) == 3:
-            prefix, continuous_feature_name, class_name = feature_parts
-        else:
-            raise ValueError("Unsupported scale-model feature: " + feature_name)
-        feature_specs.append(
-            ScaleModelFeatureSpec(
-                kind=prefix,
-                variant_class=VariantClass(class_name),
-                continuous_feature_name=continuous_feature_name,
-            )
-        )
-    return tuple(feature_specs)
+def _prior_annotation_tables(records: Sequence[VariantRecord]) -> _PriorAnnotationTables:
+    return _PriorAnnotationTables(
+        continuous_values_by_source=_continuous_prior_annotation_values(records),
+        factor_weights_by_source=_factor_prior_annotation_weights(records),
+        nested_weights_by_source=_nested_prior_annotation_weights(records),
+    )
 
 
-def _continuous_prior_design_matrix(
-    records: Sequence[VariantRecord],
-) -> tuple[tuple[str, ...], np.ndarray]:
+def _continuous_prior_annotation_values(records: Sequence[VariantRecord]) -> dict[str, np.ndarray]:
     allele_frequencies = np.clip(
         np.nan_to_num(
             np.asarray([record.allele_frequency for record in records], dtype=np.float64),
@@ -5610,89 +5633,236 @@ def _continuous_prior_design_matrix(
         ),
         0.0,
     )
-    feature_names = [
-        "log_length",
-        "logit_allele_frequency",
-        "quality",
-        "log_training_support",
-    ]
-    feature_columns = [
-        np.log(np.maximum(np.asarray([record.length for record in records], dtype=np.float64), 1.0)),
-        np.log(allele_frequencies) - np.log1p(-allele_frequencies),
-        np.nan_to_num(
+    feature_values_by_name = {
+        "log_length": np.log(np.maximum(np.asarray([record.length for record in records], dtype=np.float64), 1.0)),
+        "logit_allele_frequency": np.log(allele_frequencies) - np.log1p(-allele_frequencies),
+        "quality": np.nan_to_num(
             np.asarray([record.quality for record in records], dtype=np.float64),
             nan=1.0,
             posinf=1.0,
             neginf=0.0,
         ),
-        np.log1p(training_support),
-    ]
-    custom_feature_names = list(_custom_prior_continuous_feature_names(records))
-    for feature_name in custom_feature_names:
-        feature_names.append(feature_name)
-        feature_columns.append(
+        "log_training_support": np.log1p(training_support),
+    }
+    for feature_name in sorted(
+        {
+            feature_name
+            for record in records
+            for feature_name in record.prior_continuous_features
+        }
+    ):
+        feature_values_by_name[feature_name] = np.asarray(
             [
                 record.prior_continuous_features.get(feature_name, 0.0)
                 for record in records
-            ]
+            ],
+            dtype=np.float64,
         )
-    feature_matrix = np.column_stack(feature_columns).astype(np.float64)
-    for feature_index in range(feature_matrix.shape[1]):
-        feature_matrix[:, feature_index] = _standardize_metadata(feature_matrix[:, feature_index])
-    return tuple(feature_names), feature_matrix
+    return feature_values_by_name
 
 
-def _binary_prior_design_matrix(
-    records: Sequence[VariantRecord],
-) -> tuple[tuple[str, ...], np.ndarray]:
+def _factor_prior_annotation_weights(records: Sequence[VariantRecord]) -> dict[str, dict[str, np.ndarray]]:
+    factor_weights_by_source: dict[str, dict[str, np.ndarray]] = {}
+    repeat_values = np.asarray([float(record.is_repeat) for record in records], dtype=np.float64)
+    factor_weights_by_source["repeat_indicator"] = {
+        "false": 1.0 - repeat_values,
+        "true": repeat_values,
+    }
+    copy_number_values = np.asarray([float(record.is_copy_number) for record in records], dtype=np.float64)
+    factor_weights_by_source["copy_number_indicator"] = {
+        "false": 1.0 - copy_number_values,
+        "true": copy_number_values,
+    }
+
     minor_allele_frequency = _minor_allele_frequency_values(records)
-    feature_names = [
-        "repeat_indicator",
-        "copy_number_indicator",
-        "maf_ultra_rare_indicator",
-        "maf_rare_indicator",
-        "maf_low_frequency_indicator",
-    ]
-    feature_columns = [
-        np.asarray([float(record.is_repeat) for record in records], dtype=np.float64),
-        np.asarray([float(record.is_copy_number) for record in records], dtype=np.float64),
-        np.asarray(minor_allele_frequency < 1e-3, dtype=np.float64),
-        np.asarray((minor_allele_frequency >= 1e-3) & (minor_allele_frequency < 1e-2), dtype=np.float64),
-        np.asarray((minor_allele_frequency >= 1e-2) & (minor_allele_frequency < 5e-2), dtype=np.float64),
-    ]
-    for feature_name in _custom_prior_binary_feature_names(records):
-        feature_names.append(feature_name)
-        feature_columns.append(
-            np.asarray(
-                [float(record.prior_binary_features.get(feature_name, False)) for record in records],
+    factor_weights_by_source["maf_bucket"] = {
+        "common": np.asarray(minor_allele_frequency >= 5e-2, dtype=np.float64),
+        "low_frequency": np.asarray((minor_allele_frequency >= 1e-2) & (minor_allele_frequency < 5e-2), dtype=np.float64),
+        "rare": np.asarray((minor_allele_frequency >= 1e-3) & (minor_allele_frequency < 1e-2), dtype=np.float64),
+        "ultra_rare": np.asarray(minor_allele_frequency < 1e-3, dtype=np.float64),
+    }
+
+    for feature_name in sorted(
+        {
+            binary_feature_name
+            for record in records
+            for binary_feature_name in record.prior_binary_features
+        }
+    ):
+        true_values = np.asarray(
+            [float(record.prior_binary_features.get(feature_name, False)) for record in records],
+            dtype=np.float64,
+        )
+        factor_weights_by_source[feature_name] = {
+            "false": 1.0 - true_values,
+            "true": true_values,
+        }
+
+    for feature_name in sorted(
+        {
+            categorical_feature_name
+            for record in records
+            for categorical_feature_name in record.prior_categorical_features
+        }
+    ):
+        levels = sorted(
+            {
+                record.prior_categorical_features[feature_name]
+                for record in records
+                if feature_name in record.prior_categorical_features
+            }
+        )
+        factor_weights_by_source[feature_name] = {
+            level_name: np.asarray(
+                [
+                    float(record.prior_categorical_features.get(feature_name) == level_name)
+                    for record in records
+                ],
                 dtype=np.float64,
             )
-        )
-    return tuple(feature_names), np.column_stack(feature_columns).astype(np.float64)
+            for level_name in levels
+        }
 
-
-def _custom_prior_continuous_feature_names(records: Sequence[VariantRecord]) -> tuple[str, ...]:
-    return tuple(
-        sorted(
+    for feature_name in sorted(
+        {
+            membership_feature_name
+            for record in records
+            for membership_feature_name in record.prior_membership_features
+        }
+    ):
+        levels = sorted(
             {
-                feature_name
+                level_name
                 for record in records
-                for feature_name in record.prior_continuous_features
+                for level_name in record.prior_membership_features.get(feature_name, {})
             }
         )
+        factor_weights_by_source[feature_name] = {
+            level_name: np.asarray(
+                [
+                    record.prior_membership_features.get(feature_name, {}).get(level_name, 0.0)
+                    for record in records
+                ],
+                dtype=np.float64,
+            )
+            for level_name in levels
+        }
+    return factor_weights_by_source
+
+
+def _nested_prior_annotation_weights(records: Sequence[VariantRecord]) -> dict[str, dict[int, dict[str, np.ndarray]]]:
+    nested_weights_by_source: dict[str, dict[int, dict[str, np.ndarray]]] = {}
+    nested_feature_names = sorted(
+        {
+            feature_name
+            for record in records
+            for feature_name in record.prior_nested_features
+        }
+        | {
+            feature_name
+            for record in records
+            for feature_name in record.prior_nested_membership_features
+        }
     )
+    for feature_name in nested_feature_names:
+        source_nested_weights: dict[int, dict[str, np.ndarray]] = {}
+        for record_index, record in enumerate(records):
+            path_weights: dict[str, float] = {}
+            if feature_name in record.prior_nested_features:
+                path_weights[NESTED_PATH_DELIMITER.join(record.prior_nested_features[feature_name])] = 1.0
+            for path_name, path_weight in record.prior_nested_membership_features.get(feature_name, {}).items():
+                path_weights[path_name] = path_weights.get(path_name, 0.0) + float(path_weight)
+            for path_name, path_weight in path_weights.items():
+                if path_weight <= 0.0:
+                    continue
+                path_parts = tuple(path_name.split(NESTED_PATH_DELIMITER))
+                for nested_depth in range(len(path_parts)):
+                    nested_level_name = NESTED_PATH_DELIMITER.join(path_parts[: nested_depth + 1])
+                    source_nested_weights.setdefault(nested_depth, {}).setdefault(
+                        nested_level_name,
+                        np.zeros(len(records), dtype=np.float64),
+                    )[record_index] += path_weight
+        nested_weights_by_source[feature_name] = source_nested_weights
+    return nested_weights_by_source
 
 
-def _custom_prior_binary_feature_names(records: Sequence[VariantRecord]) -> tuple[str, ...]:
-    return tuple(
-        sorted(
-            {
-                feature_name
-                for record in records
-                for feature_name in record.prior_binary_features
-            }
+def _factor_levels_to_encode(level_weights_by_name: dict[str, np.ndarray]) -> tuple[str, ...]:
+    if len(level_weights_by_name) <= 1:
+        return ()
+    reference_level = max(
+        sorted(level_weights_by_name),
+        key=lambda level_name: float(np.sum(level_weights_by_name[level_name])),
+    )
+    return tuple(level_name for level_name in sorted(level_weights_by_name) if level_name != reference_level)
+
+
+def _continuous_spline_feature_specs(
+    source_name: str,
+    raw_values: np.ndarray,
+) -> tuple[ScaleModelFeatureSpec, ...]:
+    mean_value = float(np.mean(raw_values))
+    scale_value = float(np.std(raw_values))
+    if scale_value < 1e-8:
+        return ()
+    standardized_values = (np.asarray(raw_values, dtype=np.float64) - mean_value) / scale_value
+    feature_specs = [
+        ScaleModelFeatureSpec(
+            kind="continuous_spline",
+            source_name=source_name,
+            basis_index=0,
+            basis_kind="linear",
+            standardize_mean=mean_value,
+            standardize_scale=scale_value,
         )
-    )
+    ]
+    for basis_index, knot_value in enumerate(_continuous_spline_knots(standardized_values), start=1):
+        feature_specs.append(
+            ScaleModelFeatureSpec(
+                kind="continuous_spline",
+                source_name=source_name,
+                basis_index=basis_index,
+                basis_kind="cubic_hinge",
+                standardize_mean=mean_value,
+                standardize_scale=scale_value,
+                knot_values=(float(knot_value),),
+            )
+        )
+    return tuple(feature_specs)
+
+
+def _continuous_spline_knots(standardized_values: np.ndarray) -> tuple[float, ...]:
+    if np.unique(np.round(standardized_values, 12)).shape[0] < 3:
+        return ()
+    candidate_knots = np.quantile(standardized_values, [0.25, 0.5, 0.75])
+    minimum_value = float(np.min(standardized_values))
+    maximum_value = float(np.max(standardized_values))
+    knot_values: list[float] = []
+    for knot_value in candidate_knots:
+        knot_float = float(knot_value)
+        if knot_float <= minimum_value + 1e-6 or knot_float >= maximum_value - 1e-6:
+            continue
+        if knot_values and abs(knot_values[-1] - knot_float) < 1e-6:
+            continue
+        knot_values.append(knot_float)
+    return tuple(knot_values)
+
+
+def _continuous_spline_basis_column(
+    raw_values: np.ndarray,
+    feature_spec: ScaleModelFeatureSpec,
+) -> np.ndarray:
+    if feature_spec.standardize_mean is None or feature_spec.standardize_scale is None:
+        raise ValueError("Continuous spline feature spec is missing standardization parameters.")
+    standardized_values = (
+        np.asarray(raw_values, dtype=np.float64) - float(feature_spec.standardize_mean)
+    ) / float(feature_spec.standardize_scale)
+    if feature_spec.basis_kind == "linear":
+        return standardized_values
+    if feature_spec.basis_kind == "cubic_hinge":
+        if len(feature_spec.knot_values) != 1:
+            raise ValueError("Cubic hinge spline feature spec must store exactly one knot.")
+        return np.maximum(standardized_values - float(feature_spec.knot_values[0]), 0.0) ** 3
+    raise ValueError("Unsupported continuous spline basis kind: " + str(feature_spec.basis_kind))
 
 
 def _minor_allele_frequency_values(records: Sequence[VariantRecord]) -> np.ndarray:
@@ -5707,14 +5877,6 @@ def _minor_allele_frequency_values(records: Sequence[VariantRecord]) -> np.ndarr
         1.0,
     )
     return np.minimum(allele_frequencies, 1.0 - allele_frequencies)
-
-
-def _standardize_metadata(values: np.ndarray) -> np.ndarray:
-    centered_values = values - float(np.mean(values))
-    scale_value = float(np.std(values))
-    if scale_value < 1e-8:
-        return np.zeros_like(values)
-    return centered_values / scale_value
 
 
 def _cholesky_solve(cholesky_factor: np.ndarray, right_hand_side: np.ndarray) -> np.ndarray:
