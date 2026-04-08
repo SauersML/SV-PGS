@@ -2627,19 +2627,18 @@ def _can_reuse_sample_space_preconditioner(
 ) -> bool:
     if cache_entry is None:
         return False
-    if (
-        cache_entry.batch_size != int(batch_size)
-        or cache_entry.rank != int(rank)
-        or cache_entry.random_seed != int(random_seed)
-    ):
+    if cache_entry.batch_size != int(batch_size) or cache_entry.rank != int(rank):
         return False
+    # Don't check random_seed — the seed only determines the initial random
+    # projection for the Nyström basis. Once built, the preconditioner is valid
+    # regardless of what seed was used. Checking seed defeats the cache across
+    # Newton iterations (which pass random_seed + iteration_index).
     if _sample_space_preconditioner_stale(cache_entry):
         return False
-    # Relaxed threshold (50%) — the preconditioner doesn't need to be exact,
-    # just a reasonable approximation. Within Newton iterations for binary traits,
-    # the Polya-Gamma weights change significantly but the preconditioner from
-    # the previous iteration is still a good starting point. Rebuilding costs
-    # ~5s per Newton step; reusing saves ~30s per block.
+    # Relaxed threshold (50%) — the preconditioner only needs to be a reasonable
+    # approximation. Within Newton iterations for binary traits, the Polya-Gamma
+    # weights change but the preconditioner from the previous iteration is still
+    # effective. Rebuilding costs ~5s; reusing saves ~30s per block.
     return (
         _relative_array_change(prior_variances, cache_entry.prior_variances) <= 0.50
         and _relative_array_change(diagonal_noise, cache_entry.diagonal_noise) <= 0.50
