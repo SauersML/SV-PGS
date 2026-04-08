@@ -1835,6 +1835,10 @@ class StandardizedGenotypeMatrix:
                 return _as_gpu_compute_jax(np.zeros(self.shape[0], dtype=compute_np_dtype))
             coeff_gpu = _to_cupy_compute(coeff_np)
             result_gpu = cupy.zeros(self.shape[0], dtype=compute_cp_dtype)
+            _tv = self.shape[1]
+            _cv = 0
+            _lv = 0
+            _li = max(_tv // 10, 1)
             for batch_slice, standardized_batch in _iter_standardized_gpu_batches(
                 self.raw,
                 self.variant_indices,
@@ -1845,6 +1849,10 @@ class StandardizedGenotypeMatrix:
                 dtype=compute_cp_dtype,
             ):
                 result_gpu += standardized_batch @ coeff_gpu[batch_slice]
+                _cv = batch_slice.stop if isinstance(batch_slice, slice) else _cv + standardized_batch.shape[1]
+                if _cv - _lv >= _li:
+                    _lv = _cv
+                    log(f"        GPU matvec: {_cv:,}/{_tv:,} ({100*_cv/_tv:.0f}%)  mem={mem()}")
             return _cupy_to_jax(result_gpu)
         if self.supports_jax_dense_ops():
             coeff_jax = jnp.ravel(jnp.asarray(coefficients, dtype=gpu_compute_jax_dtype()))
@@ -2009,6 +2017,10 @@ class StandardizedGenotypeMatrix:
                 return _as_gpu_compute_jax(np.zeros(self.shape[1], dtype=compute_np_dtype))
             vector_gpu = _to_cupy_compute(vector_np)
             output_gpu = cupy.empty(self.shape[1], dtype=compute_cp_dtype)
+            _tv = self.shape[1]
+            _cv = 0
+            _lv = 0
+            _li = max(_tv // 10, 1)
             for batch_slice, standardized_batch in _iter_standardized_gpu_batches(
                 self.raw,
                 self.variant_indices,
@@ -2019,6 +2031,10 @@ class StandardizedGenotypeMatrix:
                 dtype=compute_cp_dtype,
             ):
                 output_gpu[batch_slice] = standardized_batch.T @ vector_gpu
+                _cv = batch_slice.stop if isinstance(batch_slice, slice) else _cv + standardized_batch.shape[1]
+                if _cv - _lv >= _li:
+                    _lv = _cv
+                    log(f"        GPU transpose_matvec: {_cv:,}/{_tv:,} ({100*_cv/_tv:.0f}%)  mem={mem()}")
             return _cupy_to_jax(output_gpu)
         if self.supports_jax_dense_ops():
             vector_jax = jnp.ravel(jnp.asarray(vector, dtype=gpu_compute_jax_dtype()))

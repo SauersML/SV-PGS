@@ -200,6 +200,7 @@ class VariationalFitResult:
     validation_history: list[float]
     member_prior_variances: np.ndarray
     linear_predictor: np.ndarray | None = None
+    selected_iteration_count: int | None = None
 
 
 @dataclass(slots=True)
@@ -234,6 +235,7 @@ class VariationalFitCheckpoint:
     best_sigma_error2: float | None
     best_tpb_shape_a_vector: np.ndarray | None
     best_tpb_shape_b_vector: np.ndarray | None
+    best_validation_iteration: int | None = None
     completed_blocks_in_iteration: int = 0
     beta_variance_state: np.ndarray | None = None
     reduced_second_moment: np.ndarray | None = None
@@ -452,6 +454,7 @@ def _covariates_only_fit_result(
         validation_history=validation_history,
         member_prior_variances=np.zeros(0, dtype=np.float32),
         linear_predictor=np.asarray(linear_predictor, dtype=np.float32),
+        selected_iteration_count=1,
     )
 
 def _fit_binary_alpha_with_offset(
@@ -642,6 +645,7 @@ def fit_variational_em(
     config_signature = _checkpoint_config_signature(config)
     prior_design_signature = _checkpoint_prior_design_signature(prior_design)
     scale_penalty = _scale_model_penalty(prior_design.feature_names, config)
+    best_validation_iteration: int | None = None
 
     def _copy_optional(array: np.ndarray | None) -> np.ndarray | None:
         return None if array is None else np.asarray(array, dtype=np.float64).copy()
@@ -685,6 +689,7 @@ def fit_variational_em(
             best_sigma_error2=None if best_sigma_error2 is None else float(best_sigma_error2),
             best_tpb_shape_a_vector=_copy_optional(best_tpb_shape_a_vector),
             best_tpb_shape_b_vector=_copy_optional(best_tpb_shape_b_vector),
+            best_validation_iteration=None if best_validation_iteration is None else int(best_validation_iteration),
             completed_blocks_in_iteration=int(completed_blocks_in_iteration),
             beta_variance_state=_copy_optional(beta_variance_state_override),
             reduced_second_moment=_copy_optional(reduced_second_moment_override),
@@ -698,7 +703,7 @@ def fit_variational_em(
         nonlocal previous_alpha, previous_beta, previous_local_scale, previous_theta
         nonlocal previous_tpb_shape_a_vector, previous_tpb_shape_b_vector
         nonlocal best_validation_metric, best_alpha, best_beta, best_beta_variance, best_local_scale, best_theta
-        nonlocal best_sigma_error2, best_tpb_shape_a_vector, best_tpb_shape_b_vector, start_iteration
+        nonlocal best_sigma_error2, best_tpb_shape_a_vector, best_tpb_shape_b_vector, best_validation_iteration, start_iteration
         global_scale, scale_model_coefficients = _initialize_scale_model(prior_design, config)
         tpb_shape_a_vector = _initialize_tpb_shape_a_vector(prior_design, config)
         tpb_shape_b_vector = _initialize_tpb_shape_b_vector(prior_design, config)
@@ -730,6 +735,7 @@ def fit_variational_em(
         best_sigma_error2 = None
         best_tpb_shape_a_vector = None
         best_tpb_shape_b_vector = None
+        best_validation_iteration = None
         start_iteration = 0
 
     if resume_checkpoint is None:
@@ -790,6 +796,11 @@ def fit_variational_em(
             best_sigma_error2 = None if resume_checkpoint.best_sigma_error2 is None else float(resume_checkpoint.best_sigma_error2)
             best_tpb_shape_a_vector = _copy_optional(resume_checkpoint.best_tpb_shape_a_vector)
             best_tpb_shape_b_vector = _copy_optional(resume_checkpoint.best_tpb_shape_b_vector)
+            best_validation_iteration = (
+                None
+                if resume_checkpoint.best_validation_iteration is None
+                else int(resume_checkpoint.best_validation_iteration)
+            )
             start_iteration = int(resume_checkpoint.completed_iterations)
             log(
                 "  variational EM: resuming from checkpoint "
@@ -1171,6 +1182,7 @@ def fit_variational_em(
                     validation_history.append(validation_metric)
                     if best_validation_metric is None or validation_metric < best_validation_metric:
                         best_validation_metric = validation_metric
+                        best_validation_iteration = outer_iteration + 1
                         best_alpha = alpha_state.copy()
                         best_beta = beta_state.copy()
                         best_beta_variance = beta_variance_state.copy()
@@ -1323,6 +1335,7 @@ def fit_variational_em(
                     validation_history.append(validation_metric)
                     if best_validation_metric is None or validation_metric < best_validation_metric:
                         best_validation_metric = validation_metric
+                        best_validation_iteration = outer_iteration + 1
                         best_alpha = alpha_state.copy()
                         best_beta = beta_state.copy()
                         best_beta_variance = beta_variance_state.copy()
@@ -1521,6 +1534,11 @@ def fit_variational_em(
         validation_history=validation_history,
         member_prior_variances=final_member_prior_variances.astype(np.float32),
         linear_predictor=np.asarray(final_state.linear_predictor, dtype=np.float32),
+        selected_iteration_count=(
+            int(best_validation_iteration)
+            if best_validation_iteration is not None
+            else int(len(objective_history))
+        ),
     )
 
 
@@ -4850,10 +4868,19 @@ def _restricted_posterior_state(
                 projected_genotypes = apply_projector(dense_genotypes)
                 XtPX = dense_genotypes.T @ projected_genotypes
                 variant_rhs = dense_genotypes.T @ apply_projector(targets)
-            variant_precision_matrix = (
-                np.diag(prior_precision) + XtPX + np.eye(variant_count, dtype=np.float64) * 1e-8
-            )
-            variant_precision_cholesky = np.linalg.cholesky(variant_precision_matrix)
+            variant_precision_matrix = np.diag(prior_precision) + XtPX
+            # Ensure positive-definiteness: the GPU float32 X^T W X formation
+            # and covariate projection subtraction can introduce small negative
+            # eigenvalues.  Add a jitter proportional to the matrix scale.
+            jitter = max(float(np.max(np.diag(variant_precision_matrix))) * 1e-6, 1e-6)
+            variant_precision_matrix += np.eye(variant_count, dtype=np.float64) * jitter
+            try:
+                variant_precision_cholesky = np.linalg.cholesky(variant_precision_matrix)
+            except np.linalg.LinAlgError:
+                log(f"    Cholesky failed with jitter={jitter:.2e}, retrying with larger regularization  mem={mem()}")
+                jitter = max(float(np.max(np.diag(variant_precision_matrix))) * 1e-4, 1e-4)
+                variant_precision_matrix += np.eye(variant_count, dtype=np.float64) * jitter
+                variant_precision_cholesky = np.linalg.cholesky(variant_precision_matrix)
 
             def solve_variant_rhs(right_hand_side: np.ndarray) -> np.ndarray:
                 return _cholesky_solve(variant_precision_cholesky, np.asarray(right_hand_side, dtype=np.float64))
