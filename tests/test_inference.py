@@ -681,7 +681,7 @@ def test_binary_posterior_converges_after_single_latent_gaussian_update(random_g
 
     monkeypatch.setattr(mixture_inference, "_restricted_posterior_state", fake_restricted_posterior_state)
 
-    alpha, beta, beta_variance, linear_predictor, objective = _binary_posterior_state(
+    alpha, beta, beta_variance, linear_predictor, objective, _ = _binary_posterior_state(
         genotype_matrix=standardized,
         covariate_matrix=covariate_matrix,
         targets=targets,
@@ -1338,7 +1338,7 @@ def test_binary_posterior_stops_when_predictor_update_is_stalled(random_generato
 
     monkeypatch.setattr(mixture_inference, "_restricted_posterior_state", fake_restricted_posterior_state)
 
-    alpha, beta, beta_variance, linear_predictor, objective = _binary_posterior_state(
+    alpha, beta, beta_variance, linear_predictor, objective, _ = _binary_posterior_state(
         genotype_matrix=standardized,
         covariate_matrix=covariate_matrix,
         targets=targets,
@@ -2259,7 +2259,7 @@ def test_binary_posterior_state_streaming_gpu_avoids_jax_genotype_matvec(monkeyp
     monkeypatch.setattr(type(standardized), "transpose_matvec", _unexpected_transpose_matvec)
     monkeypatch.setattr(mixture_inference, "_restricted_posterior_state", _fake_restricted_posterior_state)
 
-    alpha, beta, beta_variance, linear_predictor, collapsed_objective = mixture_inference._binary_posterior_state(
+    alpha, beta, beta_variance, linear_predictor, collapsed_objective, _ = mixture_inference._binary_posterior_state(
         genotype_matrix=standardized,
         covariate_matrix=covariate_matrix,
         targets=targets,
@@ -3226,6 +3226,7 @@ def test_fit_collapsed_posterior_uses_prior_variance_when_refresh_is_skipped_wit
             np.zeros_like(prior_variances),
             np.zeros(kwargs["targets"].shape[0], dtype=np.float64),
             0.0,
+            1,
         ),
     )
 
@@ -3265,6 +3266,7 @@ def test_fit_collapsed_posterior_rejects_mismatched_stale_beta_variance(monkeypa
             np.zeros(2, dtype=np.float64),
             np.zeros(kwargs["targets"].shape[0], dtype=np.float64),
             0.0,
+            1,
         ),
     )
 
