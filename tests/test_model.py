@@ -142,7 +142,7 @@ def test_runtime_tuned_config_for_t4_caps_solver_from_gpu_budget(monkeypatch):
     config = ModelConfig(
         trait_type=TraitType.BINARY,
         exact_solver_matrix_limit=2_048,
-        sample_space_preconditioner_rank=256,
+        sample_space_preconditioner_rank=512,
     )
 
     monkeypatch.setattr(runtime_policy_module, "_try_import_cupy", lambda: object())
@@ -151,13 +151,15 @@ def test_runtime_tuned_config_for_t4_caps_solver_from_gpu_budget(monkeypatch):
         "_gpu_materialization_budget_bytes",
         lambda _cupy: 1_000 * 4 * 10_000,
     )
+    monkeypatch.setattr(runtime_policy_module, "t4_fast_math_enabled", lambda: True)
 
     tuned_config, summary = _runtime_tuned_config_for_fit(config, raw_genotypes)
 
     assert tuned_config.exact_solver_matrix_limit == 1_024
-    assert tuned_config.sample_space_preconditioner_rank == 256
+    assert tuned_config.sample_space_preconditioner_rank == 384
     assert tuned_config.final_posterior_refinement is False
     assert summary is not None
+    assert "t4_profile=on" in summary
 
 
 def test_fit_stage_structure_cache_key_is_shared_across_traits(monkeypatch):
@@ -723,6 +725,9 @@ def test_training_records_from_stats_preserve_prior_continuous_features():
             100,
             prior_binary_features={"coding_annotation": True},
             prior_continuous_features={"sv_length_score": 1.5},
+            prior_categorical_features={"functional_state": "lof"},
+            prior_membership_features={"regulatory_mix": {"enhancer": 0.75, "promoter": 0.25}},
+            prior_nested_features={"gene_context": ("protein_coding", "exon")},
         )
     ]
 
@@ -742,6 +747,9 @@ def test_training_records_from_stats_preserve_prior_continuous_features():
     np.testing.assert_allclose(training_records[0].allele_frequency, 0.2)
     assert training_records[0].prior_binary_features == {"coding_annotation": True}
     assert training_records[0].prior_continuous_features == {"sv_length_score": 1.5}
+    assert training_records[0].prior_categorical_features == {"functional_state": "lof"}
+    assert training_records[0].prior_membership_features == {"regulatory_mix": {"enhancer": 0.75, "promoter": 0.25}}
+    assert training_records[0].prior_nested_features == {"gene_context": ("protein_coding", "exon")}
 
 
 def test_fit_uses_cohort_allele_frequencies_for_maf_filter(monkeypatch):
@@ -814,6 +822,96 @@ def test_fit_uses_cohort_allele_frequencies_for_maf_filter(monkeypatch):
     assert model.state is not None
     assert model.state.variant_records[0].allele_frequency > 0.1
     assert model.state.active_variant_indices.tolist() == [0, 1]
+
+
+def test_coefficient_table_preserves_full_variant_alignment_after_filtering(tmp_path: Path, monkeypatch):
+    genotype_matrix = np.array(
+        [
+            [0.0, 0.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0, 1.0],
+            [0.0, 0.0, 0.0, 2.0],
+            [0.0, 1.0, 0.0, 1.0],
+            [0.0, 0.0, 0.0, 0.0],
+            [1.0, 1.0, 0.0, 2.0],
+        ],
+        dtype=np.float32,
+    )
+    covariate_matrix = np.zeros((genotype_matrix.shape[0], 1), dtype=np.float32)
+    target_vector = np.array([0.1, 1.0, 1.8, 1.1, 0.0, 2.7], dtype=np.float32)
+    variant_records = [
+        VariantRecord("rare_filtered", VariantClass.SNV, "1", 100, allele_frequency=0.01),
+        VariantRecord("common_keep_1", VariantClass.DELETION_SHORT, "1", 200, allele_frequency=0.25, length=400.0),
+        VariantRecord("zero_filtered", VariantClass.SNV, "1", 300, allele_frequency=0.0),
+        VariantRecord("common_keep_2", VariantClass.DUPLICATION_SHORT, "1", 400, allele_frequency=0.5, length=900.0),
+    ]
+    config = ModelConfig(
+        trait_type=TraitType.QUANTITATIVE,
+        minimum_minor_allele_frequency=0.2,
+        max_outer_iterations=1,
+    )
+    variant_stats = compute_variant_statistics(
+        raw_genotypes=as_raw_genotype_matrix(genotype_matrix),
+        config=config,
+    )
+
+    def fake_fit_variational_em(
+        genotypes,
+        covariates,
+        targets,
+        records,
+        tie_map,
+        config,
+        validation_data,
+        resume_checkpoint=None,
+        checkpoint_callback=None,
+        predictor_offset=None,
+        validation_offset=None,
+    ):
+        assert [record.variant_id for record in records] == ["common_keep_1", "common_keep_2"]
+        return VariationalFitResult(
+            alpha=np.zeros(covariates.shape[1], dtype=np.float32),
+            beta_reduced=np.array([1.5, -0.25], dtype=np.float32),
+            beta_variance=np.ones(genotypes.shape[1], dtype=np.float32),
+            prior_scales=np.ones(len(records), dtype=np.float32),
+            global_scale=1.0,
+            class_tpb_shape_a=dict(config.class_tpb_shape_a()),
+            class_tpb_shape_b=dict(config.class_tpb_shape_b()),
+            scale_model_coefficients=np.zeros(1, dtype=np.float32),
+            scale_model_feature_names=["intercept"],
+            sigma_error2=1.0,
+            objective_history=[0.0],
+            validation_history=[],
+            member_prior_variances=np.ones(len(records), dtype=np.float32),
+        )
+
+    monkeypatch.setattr(model_module, "fit_variational_em", fake_fit_variational_em)
+
+    model = BayesianPGS(config).fit(
+        genotype_matrix,
+        covariate_matrix,
+        target_vector,
+        variant_records,
+        variant_stats=variant_stats,
+    )
+
+    training_components = model.training_decision_components()
+    assert training_components is not None
+    recomputed_components = model.decision_components(genotype_matrix, covariate_matrix)
+    np.testing.assert_allclose(training_components[0], recomputed_components[0], atol=1e-6)
+    np.testing.assert_allclose(training_components[1], recomputed_components[1], atol=1e-6)
+
+    coefficient_rows = model.coefficient_table()
+    assert [row["variant_id"] for row in coefficient_rows] == [record.variant_id for record in variant_records]
+    assert [row["variant_class"] for row in coefficient_rows] == [
+        record.variant_class.value for record in variant_records
+    ]
+    assert [float(row["beta"]) for row in coefficient_rows] == pytest.approx([0.0, 1.5, 0.0, -0.25])
+
+    artifact_dir = tmp_path / "filtered_artifact"
+    model.export(artifact_dir)
+    loaded_rows = BayesianPGS.load(artifact_dir).coefficient_table()
+    assert [row["variant_id"] for row in loaded_rows] == [record.variant_id for record in variant_records]
+    assert [float(row["beta"]) for row in loaded_rows] == pytest.approx([0.0, 1.5, 0.0, -0.25])
 
 
 def test_model_fit_supports_covariates_only_when_no_variants_survive(tmp_path):

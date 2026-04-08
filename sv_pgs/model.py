@@ -11,8 +11,8 @@ import numpy as np
 
 import sv_pgs._jax  # noqa: F401
 
-from sv_pgs.artifact import ModelArtifact, load_artifact, save_artifact
-from sv_pgs.config import ModelConfig, TraitType
+from sv_pgs.artifact import ModelArtifact, VariantMetadataTable, load_artifact, save_artifact
+from sv_pgs.config import ModelConfig, TraitType, VariantClass
 from sv_pgs.data import TieGroup, TieMap, VariantRecord, VariantStatistics, normalize_variant_records
 from sv_pgs.genotype import (
     ConcatenatedRawGenotypeMatrix,
@@ -49,6 +49,7 @@ def _select_active_variant_indices_fast(
 @dataclass(slots=True)
 class FittedState:
     variant_records: list[VariantRecord]
+    full_variant_metadata: VariantMetadataTable
     active_variant_indices: np.ndarray
     preprocessor: Preprocessor
     tie_map: TieMap
@@ -58,6 +59,36 @@ class FittedState:
     nonzero_coefficients: np.ndarray
     nonzero_means: np.ndarray
     nonzero_scales: np.ndarray
+    training_genetic_score: np.ndarray | None = None
+    training_covariate_score: np.ndarray | None = None
+    training_linear_predictor: np.ndarray | None = None
+
+    def __post_init__(self) -> None:
+        variant_count = len(self.full_variant_metadata)
+        if self.full_coefficients.shape != (variant_count,):
+            raise ValueError("full_coefficients must align with full_variant_metadata.")
+        if self.preprocessor.means.shape != (variant_count,):
+            raise ValueError("Preprocessor means must align with full_variant_metadata.")
+        if self.preprocessor.scales.shape != (variant_count,):
+            raise ValueError("Preprocessor scales must align with full_variant_metadata.")
+        if self.tie_map.original_to_reduced.shape != (variant_count,):
+            raise ValueError("tie_map must align with full_variant_metadata.")
+        training_arrays = (
+            self.training_genetic_score,
+            self.training_covariate_score,
+            self.training_linear_predictor,
+        )
+        provided_training_arrays = [array for array in training_arrays if array is not None]
+        if provided_training_arrays and len(provided_training_arrays) != len(training_arrays):
+            raise ValueError("Training score cache must provide genetic, covariate, and linear arrays together.")
+        if self.training_linear_predictor is not None:
+            sample_count = self.training_linear_predictor.shape[0]
+            if self.training_linear_predictor.ndim != 1:
+                raise ValueError("training_linear_predictor must be 1D.")
+            if self.training_genetic_score is None or self.training_genetic_score.shape != (sample_count,):
+                raise ValueError("training_genetic_score must align with training_linear_predictor.")
+            if self.training_covariate_score is None or self.training_covariate_score.shape != (sample_count,):
+                raise ValueError("training_covariate_score must align with training_linear_predictor.")
 
 
 _FIT_STAGE_CACHE_DIRNAME = ".sv_pgs_cache"
@@ -121,6 +152,28 @@ def _validate_fit_inputs(
         raise ValueError("variant_stats.allele_frequencies must be finite and lie in [0.0, 1.0].")
     if np.any(np.asarray(variant_stats.support_counts) < 0):
         raise ValueError("variant_stats.support_counts must be non-negative.")
+
+
+def _variant_metadata_from_records(
+    records: Sequence[VariantRecord | dict[str, object]],
+) -> VariantMetadataTable:
+    variant_ids: list[str] = []
+    variant_classes: list[VariantClass] = []
+    for record in records:
+        if isinstance(record, VariantRecord):
+            variant_ids.append(record.variant_id)
+            variant_classes.append(record.variant_class)
+            continue
+        variant_ids.append(str(record["variant_id"]))
+        raw_variant_class = record["variant_class"]
+        if isinstance(raw_variant_class, VariantClass):
+            variant_classes.append(raw_variant_class)
+        else:
+            variant_classes.append(VariantClass(str(raw_variant_class)))
+    return VariantMetadataTable(
+        variant_ids=variant_ids,
+        variant_classes=variant_classes,
+    )
 
 
 def _fit_stage_cache_paths(
@@ -495,6 +548,7 @@ class BayesianPGS:
             log(tuning_summary)
         covariate_matrix = self._with_intercept(covariates)
         total_variant_count = len(variant_records)
+        full_variant_metadata = _variant_metadata_from_records(variant_records)
 
         # Use pre-computed stats if available (saves 3 full data passes)
         if variant_stats is not None:
@@ -558,7 +612,7 @@ class BayesianPGS:
             log("no active variants remain after filtering; fitting covariates-only model...")
             reduced_validation_dense: tuple[np.ndarray, np.ndarray, np.ndarray] | None = None
             if validation_data is not None:
-                validation_genotypes_raw, validation_covariates, validation_targets = validation_data
+                _, validation_covariates, validation_targets = validation_data
                 reduced_validation_dense = (
                     np.empty((len(validation_targets), 0), dtype=np.float32),
                     self._with_intercept(np.asarray(validation_covariates, dtype=np.float32)),
@@ -574,8 +628,14 @@ class BayesianPGS:
             )
             full_coefficients = np.zeros(total_variant_count, dtype=np.float32)
             nonzero_coefficient_indices, nonzero_coefficients = _nonzero_coefficient_cache(full_coefficients)
+            training_linear_predictor = _training_linear_predictor_cache(
+                fit_result=fit_result,
+                covariate_matrix=prepared_arrays.covariates,
+                reduced_genotypes=None,
+            )
             self.state = FittedState(
                 variant_records=[],
+                full_variant_metadata=full_variant_metadata,
                 active_variant_indices=np.zeros(0, dtype=np.int32),
                 preprocessor=preprocessor,
                 tie_map=_empty_tie_map(total_variant_count),
@@ -585,6 +645,9 @@ class BayesianPGS:
                 nonzero_coefficients=nonzero_coefficients,
                 nonzero_means=np.zeros(0, dtype=np.float32),
                 nonzero_scales=np.zeros(0, dtype=np.float32),
+                training_genetic_score=np.zeros(training_linear_predictor.shape[0], dtype=np.float32),
+                training_covariate_score=training_linear_predictor.copy(),
+                training_linear_predictor=training_linear_predictor,
             )
             # Free the full variant_records list — no active variants means we stored []
             # in FittedState, so the original 1.68M-element list is no longer needed.
@@ -611,7 +674,8 @@ class BayesianPGS:
         # Free the full variant_records list (1.68M objects, ~840 MB) — we've extracted
         # the active subset into active_records and no longer need the original reference.
         del active_selection_records, active_stats, variant_records
-        import gc; gc.collect()
+        import gc
+        gc.collect()
         log(f"active training records created: {len(active_records)}  mem={mem()}")
         if cached_fit_stage is None:
             active_genotypes = standardized_genotypes.subset(active_variant_indices)
@@ -654,7 +718,7 @@ class BayesianPGS:
         # The tie map is done — we only need reduced_genotypes going forward.
         # Freeing early reduces memory pressure and prevents Bus errors from
         # mmap page faults on full disk during int8 persistence.
-        log(f"  freeing original genotype data before materialization...")
+        log("  freeing original genotype data before materialization...")
         del raw_genotype_matrix, standardized_genotypes, active_genotypes
         import gc
         gc.collect()
@@ -673,7 +737,7 @@ class BayesianPGS:
             reduced_genotypes.release_raw_storage()
         else:
             if not local_cache and fit_stage_cache_paths is not None:
-                log(f"  persisting reduced int8 genotypes to disk...")
+                log("  persisting reduced int8 genotypes to disk...")
                 local_cache = reduced_genotypes.try_cache_persistently(fit_stage_cache_paths.reduced_raw_i8_path)
                 if local_cache:
                     log(f"  persistent int8 cache saved  mem={mem()}")
@@ -772,11 +836,19 @@ class BayesianPGS:
         nonzero_coefficient_indices, nonzero_coefficients = _nonzero_coefficient_cache(full_coefficients)
         nonzero_means = np.asarray(prepared_arrays.means[nonzero_coefficient_indices], dtype=np.float32)
         nonzero_scales = np.asarray(prepared_arrays.scales[nonzero_coefficient_indices], dtype=np.float32)
+        training_linear_predictor = _training_linear_predictor_cache(
+            fit_result=fit_result,
+            covariate_matrix=prepared_arrays.covariates,
+            reduced_genotypes=reduced_genotypes,
+        )
+        training_covariate_score = np.asarray(prepared_arrays.covariates @ fit_result.alpha, dtype=np.float32)
+        training_genetic_score = np.asarray(training_linear_predictor - training_covariate_score, dtype=np.float32)
         nonzero_count = int(np.count_nonzero(full_coefficients))
         log(f"coefficients: {nonzero_count} non-zero out of {total_variant_count} total")
 
         self.state = FittedState(
             variant_records=active_records,
+            full_variant_metadata=full_variant_metadata,
             active_variant_indices=active_variant_indices,
             preprocessor=preprocessor,
             tie_map=original_space_tie_map,
@@ -786,6 +858,9 @@ class BayesianPGS:
             nonzero_coefficients=nonzero_coefficients,
             nonzero_means=nonzero_means,
             nonzero_scales=nonzero_scales,
+            training_genetic_score=training_genetic_score,
+            training_covariate_score=training_covariate_score,
+            training_linear_predictor=training_linear_predictor,
         )
         log(f"=== MODEL FIT DONE ===  mem={mem()}")
         return self
@@ -846,7 +921,7 @@ class BayesianPGS:
         fitted_state = self._require_state()
         artifact = ModelArtifact(
             config=self.config,
-            records=fitted_state.variant_records,
+            variant_metadata=fitted_state.full_variant_metadata,
             means=fitted_state.preprocessor.means,
             scales=fitted_state.preprocessor.scales,
             alpha=fitted_state.fit_result.alpha,
@@ -874,7 +949,8 @@ class BayesianPGS:
         nonzero_means = np.asarray(artifact.means[nonzero_coefficient_indices], dtype=np.float32)
         nonzero_scales = np.asarray(artifact.scales[nonzero_coefficient_indices], dtype=np.float32)
         loaded_model.state = FittedState(
-            variant_records=artifact.records,
+            variant_records=[],
+            full_variant_metadata=artifact.variant_metadata,
             active_variant_indices=np.where(artifact.tie_map.original_to_reduced >= 0)[0].astype(np.int32),
             preprocessor=Preprocessor(means=artifact.means, scales=artifact.scales),
             tie_map=artifact.tie_map,
@@ -892,6 +968,8 @@ class BayesianPGS:
                 objective_history=artifact.objective_history,
                 validation_history=artifact.validation_history,
                 member_prior_variances=artifact.prior_scales,
+                linear_predictor=None,
+                selected_iteration_count=len(artifact.objective_history),
             ),
             full_coefficients=artifact.beta_full,
             nonzero_coefficient_indices=nonzero_coefficient_indices,
@@ -901,19 +979,46 @@ class BayesianPGS:
         )
         return loaded_model
 
-    def coefficient_table(self) -> list[dict[str, object]]:
+    def training_decision_components(self) -> tuple[np.ndarray, np.ndarray] | None:
         fitted_state = self._require_state()
+        if (
+            fitted_state.training_genetic_score is None
+            or fitted_state.training_covariate_score is None
+        ):
+            return None
+        return fitted_state.training_genetic_score, fitted_state.training_covariate_score
+
+    def coefficient_table(
+        self,
+        *,
+        nonzero_only: bool = False,
+        minimum_abs_beta: float = 0.0,
+    ) -> list[dict[str, object]]:
+        fitted_state = self._require_state()
+        if minimum_abs_beta < 0.0:
+            raise ValueError("minimum_abs_beta must be non-negative.")
+        if len(fitted_state.full_variant_metadata) != len(fitted_state.full_coefficients):
+            raise ValueError("Full variant metadata must align with full_coefficients.")
+        if nonzero_only:
+            if minimum_abs_beta == 0.0:
+                row_indices = fitted_state.nonzero_coefficient_indices
+            else:
+                row_indices = np.flatnonzero(
+                    np.abs(fitted_state.full_coefficients) > minimum_abs_beta
+                ).astype(np.int32)
+        elif minimum_abs_beta > 0.0:
+            row_indices = np.flatnonzero(
+                np.abs(fitted_state.full_coefficients) > minimum_abs_beta
+            ).astype(np.int32)
+        else:
+            row_indices = np.arange(len(fitted_state.full_coefficients), dtype=np.int32)
         return [
             {
-                "variant_id": variant_record.variant_id,
-                "variant_class": variant_record.variant_class.value,
-                "beta": float(coefficient),
+                "variant_id": fitted_state.full_variant_metadata.variant_ids[int(row_index)],
+                "variant_class": fitted_state.full_variant_metadata.variant_classes[int(row_index)].value,
+                "beta": float(fitted_state.full_coefficients[int(row_index)]),
             }
-            for variant_record, coefficient in zip(
-                fitted_state.variant_records,
-                fitted_state.full_coefficients,
-                strict=True,
-            )
+            for row_index in row_indices
         ]
 
     def _require_state(self) -> FittedState:
@@ -947,6 +1052,25 @@ def _nonzero_coefficient_cache(coefficients: np.ndarray) -> tuple[np.ndarray, np
     coefficient_array = np.asarray(coefficients, dtype=np.float32)
     nonzero_indices = np.flatnonzero(np.abs(coefficient_array) > 0.0).astype(np.int32)
     return nonzero_indices, np.asarray(coefficient_array[nonzero_indices], dtype=np.float32)
+
+
+def _training_linear_predictor_cache(
+    fit_result: VariationalFitResult,
+    covariate_matrix: np.ndarray,
+    reduced_genotypes: StandardizedGenotypeMatrix | np.ndarray | None,
+) -> np.ndarray:
+    if fit_result.linear_predictor is not None:
+        return np.asarray(fit_result.linear_predictor, dtype=np.float32)
+    training_linear_predictor = np.asarray(covariate_matrix @ fit_result.alpha, dtype=np.float32)
+    if reduced_genotypes is not None and fit_result.beta_reduced.shape[0] > 0:
+        training_linear_predictor = training_linear_predictor + np.asarray(
+            reduced_genotypes.matvec(
+                fit_result.beta_reduced,
+                batch_size=auto_batch_size(covariate_matrix.shape[0]),
+            ),
+            dtype=np.float32,
+        )
+    return np.asarray(training_linear_predictor, dtype=np.float32)
 
 
 def _empty_tie_map(original_variant_count: int) -> TieMap:
@@ -1075,6 +1199,16 @@ def _training_records_from_stats(
                 is_copy_number=record.is_copy_number,
                 prior_binary_features=dict(record.prior_binary_features),
                 prior_continuous_features=dict(record.prior_continuous_features),
+                prior_categorical_features=dict(record.prior_categorical_features),
+                prior_membership_features={
+                    feature_name: dict(feature_memberships)
+                    for feature_name, feature_memberships in record.prior_membership_features.items()
+                },
+                prior_nested_features=dict(record.prior_nested_features),
+                prior_nested_membership_features={
+                    feature_name: dict(feature_memberships)
+                    for feature_name, feature_memberships in record.prior_nested_membership_features.items()
+                },
                 prior_class_members=record.prior_class_members,
                 prior_class_membership=record.prior_class_membership,
             )

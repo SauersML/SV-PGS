@@ -4,9 +4,10 @@ import csv
 import gzip
 import hashlib
 import json
+import os
 import pickle
 import tempfile
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, BinaryIO, Iterable, Iterator, Literal, Sequence, TextIO
 
@@ -14,15 +15,18 @@ import numpy as np
 from sklearn.metrics import log_loss, r2_score, roc_auc_score
 
 from sv_pgs.config import ModelConfig, TraitType, VariantClass
-from sv_pgs.data import VariantRecord, VariantStatistics
+from sv_pgs.data import NESTED_PATH_DELIMITER, VariantRecord, VariantStatistics
 from sv_pgs.genotype import (
     PLINK_MISSING_INT8,
     ConcatenatedRawGenotypeMatrix,
+    DenseRawGenotypeMatrix,
+    Int8RawGenotypeMatrix,
     PlinkRawGenotypeMatrix,
     RawGenotypeMatrix,
     as_raw_genotype_matrix,
 )
 from sv_pgs.model import BayesianPGS
+from sv_pgs.numeric import stable_sigmoid
 from sv_pgs.preprocessing import compute_variant_statistics
 from sv_pgs.progress import log, mem
 
@@ -46,6 +50,12 @@ class PipelineOutputs:
     summary_path: Path
     predictions_path: Path
     coefficients_path: Path
+
+
+@dataclass(slots=True)
+class _ValidationRun:
+    train_dataset: LoadedDataset
+    validation_dataset: LoadedDataset
 
 
 @dataclass(slots=True)
@@ -310,15 +320,21 @@ def _open_vcf_reader(vcf_path: Path) -> Any:
 
 def _vcf_record_count_hint(reader: Any) -> int | None:
     for attribute_name in ("num_records", "nrecords"):
-        value = getattr(reader, attribute_name, None)
+        try:
+            value = getattr(reader, attribute_name, None)
+        except ValueError:
+            continue
         if callable(value):
             try:
                 value = value()
-            except TypeError:
+            except (TypeError, ValueError):
                 continue
         if value is None:
             continue
-        resolved_value = int(value)
+        try:
+            resolved_value = int(value)
+        except (TypeError, ValueError):
+            continue
         if resolved_value >= 0:
             return resolved_value
     return None
@@ -721,8 +737,57 @@ def run_training_pipeline(
                 + f"{config.minimum_scale:.6g}. Reload the dataset with the same config."
             )
 
-    log("fitting Bayesian PGS model...")
-    model = BayesianPGS(config).fit(
+    validation_run = _build_pipeline_validation_run(dataset, config)
+    summary_payload: dict[str, Any] = {}
+    fit_config = config
+    if validation_run is not None:
+        log(
+            "running validation-tuned fit on training split..."
+            + f" train_samples={len(validation_run.train_dataset.sample_ids)}"
+            + f" validation_samples={len(validation_run.validation_dataset.sample_ids)}"
+        )
+        tuning_model = BayesianPGS(config).fit(
+            validation_run.train_dataset.genotypes,
+            validation_run.train_dataset.covariates,
+            validation_run.train_dataset.targets,
+            validation_run.train_dataset.variant_records,
+            validation_data=(
+                validation_run.validation_dataset.genotypes,
+                validation_run.validation_dataset.covariates,
+                validation_run.validation_dataset.targets,
+            ),
+            variant_stats=None,
+        )
+        if tuning_model.state is None:
+            raise RuntimeError("Validation-tuned fit did not produce model state.")
+        selected_iteration_count = tuning_model.state.fit_result.selected_iteration_count
+        if selected_iteration_count is None or selected_iteration_count < 1:
+            raise RuntimeError("Validation-tuned fit did not report a selected iteration count.")
+        fit_config = replace(tuning_model.config, max_outer_iterations=int(selected_iteration_count))
+        validation_metrics = _dataset_metrics(
+            dataset=validation_run.validation_dataset,
+            model=tuning_model,
+        )
+        summary_payload.update(validation_metrics)
+        summary_payload.update(
+            {
+                "validation_enabled": True,
+                "tuning_sample_count": int(len(validation_run.train_dataset.sample_ids)),
+                "validation_sample_count": int(len(validation_run.validation_dataset.sample_ids)),
+                "selected_iteration_count": int(selected_iteration_count),
+                "validation_history": [
+                    float(value) for value in tuning_model.state.fit_result.validation_history
+                ],
+            }
+        )
+        log(
+            "refitting Bayesian PGS model on full cohort..."
+            + f" selected_iterations={selected_iteration_count}"
+        )
+    else:
+        summary_payload["validation_enabled"] = False
+        log("fitting Bayesian PGS model...")
+    model = BayesianPGS(fit_config).fit(
         dataset.genotypes,
         dataset.covariates,
         dataset.targets,
@@ -738,7 +803,7 @@ def run_training_pipeline(
 
     log("writing coefficients table...")
     coefficients_path = destination / "coefficients.tsv"
-    coefficient_rows = model.coefficient_table()
+    coefficient_rows = model.coefficient_table(nonzero_only=True)
     _write_delimited_rows(
         coefficients_path,
         header=("variant_id", "variant_class", "beta"),
@@ -751,14 +816,15 @@ def run_training_pipeline(
             for coefficient_row in coefficient_rows
         ),
     )
+    log(f"wrote {len(coefficient_rows)} non-zero coefficient rows to {coefficients_path}")
 
     log("writing predictions...")
     predictions_path = destination / "predictions.tsv"
-    summary_payload = _write_predictions_and_summary(
+    summary_payload.update(_write_predictions_and_summary(
         predictions_path=predictions_path,
         dataset=dataset,
         model=model,
-    )
+    ))
     active_count = int(model.state.active_variant_indices.shape[0]) if model.state is not None else 0
     summary_payload.update(
         {
@@ -766,6 +832,7 @@ def run_training_pipeline(
             "variant_count": int(dataset.genotypes.shape[1]),
             "active_variant_count": active_count,
             "trait_type": config.trait_type.value,
+            "fit_max_outer_iterations": int(model.config.max_outer_iterations),
         }
     )
     log(f"predictions written: {active_count} active variants out of {dataset.genotypes.shape[1]}")
@@ -780,6 +847,172 @@ def run_training_pipeline(
         predictions_path=predictions_path,
         coefficients_path=coefficients_path,
     )
+
+
+def _build_pipeline_validation_run(
+    dataset: LoadedDataset,
+    config: ModelConfig,
+) -> _ValidationRun | None:
+    sample_count = int(len(dataset.sample_ids))
+    validation_fraction = float(config.pipeline_validation_fraction)
+    minimum_validation_samples = int(config.pipeline_validation_min_samples)
+    if validation_fraction <= 0.0 or minimum_validation_samples == 0:
+        return None
+    requested_validation_count = max(
+        minimum_validation_samples,
+        int(np.ceil(sample_count * validation_fraction)),
+    )
+    if requested_validation_count >= sample_count:
+        return None
+    train_indices, validation_indices = _train_validation_indices(
+        targets=dataset.targets,
+        trait_type=config.trait_type,
+        train_sample_count=sample_count - requested_validation_count,
+        validation_sample_count=requested_validation_count,
+        random_seed=int(config.random_seed),
+    )
+    if train_indices.size == 0 or validation_indices.size == 0:
+        return None
+    return _ValidationRun(
+        train_dataset=_subset_loaded_dataset(dataset, train_indices),
+        validation_dataset=_subset_loaded_dataset(dataset, validation_indices),
+    )
+
+
+def _train_validation_indices(
+    *,
+    targets: np.ndarray,
+    trait_type: TraitType,
+    train_sample_count: int,
+    validation_sample_count: int,
+    random_seed: int,
+) -> tuple[np.ndarray, np.ndarray]:
+    target_array = np.asarray(targets)
+    total_sample_count = int(target_array.shape[0])
+    if train_sample_count + validation_sample_count != total_sample_count:
+        raise ValueError("train/validation split must cover all samples exactly once.")
+    random_generator = np.random.default_rng(random_seed)
+    if trait_type == TraitType.BINARY:
+        validation_indices = _stratified_validation_indices(
+            targets=target_array,
+            validation_sample_count=validation_sample_count,
+            random_generator=random_generator,
+        )
+    else:
+        shuffled_indices = random_generator.permutation(total_sample_count).astype(np.int32, copy=False)
+        validation_indices = np.sort(shuffled_indices[:validation_sample_count].astype(np.int32, copy=False))
+    validation_mask = np.zeros(total_sample_count, dtype=bool)
+    validation_mask[validation_indices] = True
+    train_indices = np.flatnonzero(~validation_mask).astype(np.int32)
+    return train_indices, validation_indices
+
+
+def _stratified_validation_indices(
+    *,
+    targets: np.ndarray,
+    validation_sample_count: int,
+    random_generator: np.random.Generator,
+) -> np.ndarray:
+    unique_targets, inverse_targets = np.unique(targets, return_inverse=True)
+    if unique_targets.shape[0] <= 1:
+        shuffled_indices = random_generator.permutation(targets.shape[0]).astype(np.int32, copy=False)
+        return np.sort(shuffled_indices[:validation_sample_count].astype(np.int32, copy=False))
+    class_indices = [
+        np.flatnonzero(inverse_targets == class_index).astype(np.int32)
+        for class_index in range(unique_targets.shape[0])
+    ]
+    class_counts = np.asarray([indices.shape[0] for indices in class_indices], dtype=np.int32)
+    class_proportions = class_counts / float(np.sum(class_counts))
+    requested_validation = class_proportions * float(validation_sample_count)
+    validation_counts = np.floor(requested_validation).astype(np.int32)
+    validation_counts = np.minimum(validation_counts, np.maximum(class_counts - 1, 0))
+    remainder = validation_sample_count - int(np.sum(validation_counts))
+    if remainder > 0:
+        allocation_order = np.argsort(-(requested_validation - validation_counts))
+        for class_index in allocation_order.tolist():
+            if remainder == 0:
+                break
+            maximum_extra = int(max(class_counts[class_index] - 1 - validation_counts[class_index], 0))
+            if maximum_extra <= 0:
+                continue
+            validation_counts[class_index] += 1
+            remainder -= 1
+    if remainder > 0:
+        shuffled_indices = random_generator.permutation(targets.shape[0]).astype(np.int32, copy=False)
+        return np.sort(shuffled_indices[:validation_sample_count].astype(np.int32, copy=False))
+    selected_indices = [
+        np.sort(
+            random_generator.choice(class_indices[class_index], size=int(validation_counts[class_index]), replace=False)
+            .astype(np.int32, copy=False)
+        )
+        for class_index in range(unique_targets.shape[0])
+        if validation_counts[class_index] > 0
+    ]
+    if not selected_indices:
+        shuffled_indices = random_generator.permutation(targets.shape[0]).astype(np.int32, copy=False)
+        return np.sort(shuffled_indices[:validation_sample_count].astype(np.int32, copy=False))
+    return np.sort(np.concatenate(selected_indices).astype(np.int32, copy=False))
+
+
+def _subset_loaded_dataset(dataset: LoadedDataset, sample_indices: np.ndarray) -> LoadedDataset:
+    resolved_indices = np.asarray(sample_indices, dtype=np.int32)
+    return LoadedDataset(
+        sample_ids=[dataset.sample_ids[int(index)] for index in resolved_indices],
+        genotypes=_subset_genotype_matrix_rows(dataset.genotypes, resolved_indices),
+        covariates=np.asarray(dataset.covariates[resolved_indices], dtype=np.float32),
+        targets=np.asarray(dataset.targets[resolved_indices], dtype=np.float32),
+        variant_records=dataset.variant_records,
+        variant_stats=None,
+        variant_stats_minimum_scale=None,
+    )
+
+
+def _subset_genotype_matrix_rows(
+    genotypes: RawGenotypeMatrix | np.ndarray,
+    sample_indices: np.ndarray,
+) -> RawGenotypeMatrix:
+    raw_genotypes = as_raw_genotype_matrix(genotypes)
+    if isinstance(raw_genotypes, DenseRawGenotypeMatrix):
+        return DenseRawGenotypeMatrix(np.asarray(raw_genotypes.matrix[sample_indices, :]))
+    if isinstance(raw_genotypes, Int8RawGenotypeMatrix):
+        return Int8RawGenotypeMatrix(np.asarray(raw_genotypes.matrix[sample_indices, :]))
+    if isinstance(raw_genotypes, PlinkRawGenotypeMatrix):
+        return PlinkRawGenotypeMatrix(
+            bed_path=raw_genotypes.bed_path,
+            sample_indices=np.asarray(raw_genotypes.sample_indices[sample_indices], dtype=np.intp),
+            variant_count=raw_genotypes.variant_count,
+            total_sample_count=raw_genotypes.total_sample_count,
+            batch_size=raw_genotypes.batch_size,
+        )
+    if isinstance(raw_genotypes, ConcatenatedRawGenotypeMatrix):
+        return ConcatenatedRawGenotypeMatrix(
+            tuple(_subset_genotype_matrix_rows(child, sample_indices) for child in raw_genotypes.children)
+        )
+    return DenseRawGenotypeMatrix(np.asarray(raw_genotypes.materialize()[sample_indices, :], dtype=np.float32))
+
+
+def _dataset_metrics(
+    dataset: LoadedDataset,
+    model: BayesianPGS,
+) -> dict[str, Any]:
+    genetic_score, covariate_score = model.decision_components(dataset.genotypes, dataset.covariates)
+    linear_predictor = np.asarray(genetic_score + covariate_score, dtype=np.float32)
+    target_array = np.asarray(dataset.targets, dtype=np.float32)
+    if model.config.trait_type == TraitType.BINARY:
+        probabilities = np.asarray(stable_sigmoid(linear_predictor), dtype=np.float32)
+        predicted_labels = (probabilities >= 0.5).astype(np.int32)
+        unique_targets = np.unique(target_array)
+        validation_auc = None if unique_targets.shape[0] < 2 else float(roc_auc_score(target_array, probabilities))
+        return {
+            "validation_auc": validation_auc,
+            "validation_log_loss": float(log_loss(target_array, probabilities, labels=[0.0, 1.0])),
+            "validation_accuracy": float(np.mean(predicted_labels == target_array)),
+        }
+    residuals = target_array - linear_predictor
+    return {
+        "validation_r2": float(r2_score(target_array, linear_predictor)),
+        "validation_rmse": float(np.sqrt(np.mean(residuals * residuals))),
+    }
 
 
 def _build_sample_table(
@@ -2210,6 +2443,35 @@ def _merge_variant_metadata(
         for column_name, column_value in metadata_row.items()
         if column_name.startswith("prior_continuous__")
     }
+    prior_categorical_features = {
+        column_name.removeprefix("prior_categorical__"): _parse_string_feature_or_skip(column_value)
+        for column_name, column_value in metadata_row.items()
+        if column_name.startswith("prior_categorical__") and _parse_string_feature_or_skip(column_value) is not None
+    }
+    prior_membership_features = {
+        column_name.removeprefix("prior_membership__"): _parse_weighted_levels(
+            column_value,
+            column_name=column_name,
+        )
+        for column_name, column_value in metadata_row.items()
+        if column_name.startswith("prior_membership__") and column_value is not None and column_value.strip()
+    }
+    prior_nested_features = {
+        column_name.removeprefix("prior_nested__"): _parse_nested_path(
+            column_value,
+            column_name=column_name,
+        )
+        for column_name, column_value in metadata_row.items()
+        if column_name.startswith("prior_nested__") and column_value is not None and column_value.strip()
+    }
+    prior_nested_membership_features = {
+        column_name.removeprefix("prior_nested_membership__"): _parse_weighted_nested_paths(
+            column_value,
+            column_name=column_name,
+        )
+        for column_name, column_value in metadata_row.items()
+        if column_name.startswith("prior_nested_membership__") and column_value is not None and column_value.strip()
+    }
     return VariantRecord(
         variant_id=_coalesce_string(metadata_row.get("variant_id"), default_variant.variant_id),
         variant_class=_parse_variant_class(metadata_row.get("variant_class"), default_variant.variant_class),
@@ -2227,6 +2489,10 @@ def _merge_variant_metadata(
         is_copy_number=_parse_bool_or_default(metadata_row.get("is_copy_number"), False, column_name="is_copy_number"),
         prior_binary_features=prior_binary_features,
         prior_continuous_features=prior_continuous_features,
+        prior_categorical_features=prior_categorical_features,
+        prior_membership_features=prior_membership_features,
+        prior_nested_features=prior_nested_features,
+        prior_nested_membership_features=prior_nested_membership_features,
         prior_class_members=prior_class_members,
         prior_class_membership=prior_class_membership,
     )
@@ -2238,10 +2504,19 @@ def _write_predictions_and_summary(
     model: BayesianPGS,
 ) -> dict[str, Any]:
     log(f"computing predictions for {len(dataset.sample_ids)} samples, trait={model.config.trait_type.value}  mem={mem()}")
-    genetic_score, covariate_score = model.decision_components(dataset.genotypes, dataset.covariates)
+    training_components_getter = getattr(model, "training_decision_components", None)
+    cached_components = None if training_components_getter is None else training_components_getter()
+    if (
+        cached_components is not None
+        and cached_components[0].shape == (len(dataset.sample_ids),)
+        and cached_components[1].shape == (len(dataset.sample_ids),)
+    ):
+        genetic_score, covariate_score = cached_components
+    else:
+        genetic_score, covariate_score = model.decision_components(dataset.genotypes, dataset.covariates)
     linear_predictor = np.asarray(genetic_score + covariate_score, dtype=np.float32)
     if model.config.trait_type == TraitType.BINARY:
-        probabilities = np.asarray(model.predict_proba(dataset.genotypes, dataset.covariates)[:, 1], dtype=np.float32)
+        probabilities = np.asarray(stable_sigmoid(linear_predictor), dtype=np.float32)
         predicted_labels = (probabilities >= 0.5).astype(np.int32)
         log(f"binary predictions: mean_prob={float(np.mean(probabilities)):.4f}  pred_positive={int(np.sum(predicted_labels))}  pred_negative={int(np.sum(1-predicted_labels))}")
         _write_delimited_rows(
@@ -2280,7 +2555,7 @@ def _write_predictions_and_summary(
             "training_accuracy": training_accuracy,
         }
 
-    predictions = np.asarray(model.predict(dataset.genotypes, dataset.covariates), dtype=np.float32)
+    predictions = linear_predictor
     _write_delimited_rows(
         predictions_path,
         header=("sample_id", "target", "genetic_score", "covariate_score", "prediction"),
@@ -2564,6 +2839,41 @@ def _parse_float_list(value: str | None) -> tuple[float, ...]:
     if value is None or not value.strip():
         return ()
     return tuple(float(member.strip()) for member in value.split(",") if member.strip())
+
+
+def _parse_string_feature_or_skip(value: str | None) -> str | None:
+    if value is None or not value.strip():
+        return None
+    return value.strip()
+
+
+def _parse_weighted_levels(value: str, column_name: str) -> dict[str, float]:
+    weighted_levels: dict[str, float] = {}
+    for level_assignment in value.split(","):
+        assignment_value = level_assignment.strip()
+        if not assignment_value:
+            continue
+        if "=" not in assignment_value:
+            raise ValueError("Could not parse weighted levels for " + column_name + ": " + value)
+        level_name, level_weight = assignment_value.split("=", 1)
+        weighted_levels[level_name.strip()] = _parse_float(level_weight.strip(), column_name=column_name)
+    return weighted_levels
+
+
+def _parse_nested_path(value: str, column_name: str) -> tuple[str, ...]:
+    path_parts = tuple(path_part.strip() for path_part in value.split(NESTED_PATH_DELIMITER))
+    if not path_parts or any(not path_part for path_part in path_parts):
+        raise ValueError("Could not parse nested path for " + column_name + ": " + value)
+    return path_parts
+
+
+def _parse_weighted_nested_paths(value: str, column_name: str) -> dict[str, float]:
+    weighted_paths = _parse_weighted_levels(value, column_name=column_name)
+    normalized_paths: dict[str, float] = {}
+    for path_name, path_weight in weighted_paths.items():
+        path_parts = _parse_nested_path(path_name, column_name=column_name)
+        normalized_paths[NESTED_PATH_DELIMITER.join(path_parts)] = path_weight
+    return normalized_paths
 
 
 def _parse_optional_int(value: str | None, column_name: str) -> int | None:

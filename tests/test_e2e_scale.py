@@ -5,7 +5,7 @@ from pathlib import Path
 import numpy as np
 from sklearn.metrics import r2_score, roc_auc_score
 
-from sv_pgs.artifact import ModelArtifact, load_artifact, save_artifact
+from sv_pgs.artifact import ModelArtifact, VariantMetadataTable, load_artifact, save_artifact
 from sv_pgs.benchmark import run_benchmark_suite
 from sv_pgs.config import BenchmarkConfig, ModelConfig, TraitType, VariantClass
 from sv_pgs.data import TieGroup, TieMap, VariantRecord
@@ -288,33 +288,22 @@ def test_large_scale_benchmark_and_quantitative_fit():
     assert r2_score(quantitative_targets[390:], quantitative_prediction) > 0.03
 
 
-def test_artifact_roundtrip_preserves_prior_membership_metadata(tmp_path: Path):
+def test_artifact_roundtrip_preserves_full_variant_metadata(tmp_path: Path):
     artifact = ModelArtifact(
         config=ModelConfig(),
-        records=[
-            VariantRecord(
-                variant_id="latent_0",
-                variant_class=VariantClass.OTHER_COMPLEX_SV,
-                chromosome="chr1",
-                position=100,
-                length=750.0,
-                allele_frequency=0.03,
-                quality=0.9,
-                prior_binary_features={"coding_annotation": True},
-                prior_continuous_features={"sv_length_score": 1.5},
-                prior_class_members=(VariantClass.DELETION_SHORT, VariantClass.SNV),
-                prior_class_membership=(0.25, 0.75),
-            )
-        ],
-        means=np.zeros(1, dtype=np.float32),
-        scales=np.ones(1, dtype=np.float32),
+        variant_metadata=VariantMetadataTable(
+            variant_ids=["latent_0", "latent_1"],
+            variant_classes=[VariantClass.OTHER_COMPLEX_SV, VariantClass.SNV],
+        ),
+        means=np.zeros(2, dtype=np.float32),
+        scales=np.ones(2, dtype=np.float32),
         alpha=np.zeros(2, dtype=np.float32),
         beta_reduced=np.zeros(1, dtype=np.float32),
-        beta_full=np.zeros(1, dtype=np.float32),
+        beta_full=np.zeros(2, dtype=np.float32),
         beta_variance=np.ones(1, dtype=np.float32),
         tie_map=TieMap(
             kept_indices=np.array([0], dtype=np.int32),
-            original_to_reduced=np.array([0], dtype=np.int32),
+            original_to_reduced=np.array([0, -1], dtype=np.int32),
             reduced_to_group=[
                 TieGroup(
                     representative_index=0,
@@ -338,8 +327,8 @@ def test_artifact_roundtrip_preserves_prior_membership_metadata(tmp_path: Path):
     save_artifact(artifact_path, artifact)
     restored_artifact = load_artifact(artifact_path)
 
-    restored_record = restored_artifact.records[0]
-    assert restored_record.prior_binary_features == {"coding_annotation": True}
-    assert restored_record.prior_continuous_features == {"sv_length_score": 1.5}
-    assert restored_record.prior_class_members == (VariantClass.DELETION_SHORT, VariantClass.SNV)
-    np.testing.assert_allclose(restored_record.prior_class_membership, [0.25, 0.75])
+    assert restored_artifact.variant_metadata.variant_ids == ["latent_0", "latent_1"]
+    assert restored_artifact.variant_metadata.variant_classes == [
+        VariantClass.OTHER_COMPLEX_SV,
+        VariantClass.SNV,
+    ]

@@ -22,7 +22,6 @@ from sv_pgs.mixture_inference import (
     _build_prior_design,
     _design_matrix_for_feature_specs,
     _metadata_baseline_scales_from_coefficients,
-    _parse_scale_model_feature_names,
 )
 
 
@@ -103,10 +102,10 @@ class TestMetadataScaleModel:
             VariantRecord("sv_c", VariantClass.DELETION_SHORT, "chr1", 102, quality=0.25, allele_frequency=0.01, training_support=3),
         ]
         prior_design = _build_prior_design(records)
-        assert "continuous_shared::quality" in prior_design.feature_names
-        assert "continuous_linear::quality::deletion_short" in prior_design.feature_names
-        assert "continuous_linear::logit_allele_frequency::deletion_short" in prior_design.feature_names
-        assert "continuous_linear::log_training_support::deletion_short" in prior_design.feature_names
+        assert "continuous_spline::quality::basis_0" in prior_design.feature_names
+        assert "continuous_spline_interaction::quality::deletion_short::basis_0" in prior_design.feature_names
+        assert "continuous_spline_interaction::logit_allele_frequency::deletion_short::basis_0" in prior_design.feature_names
+        assert "continuous_spline_interaction::log_training_support::deletion_short::basis_0" in prior_design.feature_names
 
     def test_annotation_binary_features_and_frequency_bins_enter_scale_design(self):
         records = [
@@ -149,17 +148,17 @@ class TestMetadataScaleModel:
         ]
         prior_design = _build_prior_design(records)
 
-        assert "binary_indicator::coding_annotation" in prior_design.feature_names
-        assert "binary_interaction::coding_annotation::deletion_short" in prior_design.feature_names
-        assert "continuous_shared::constraint_score" in prior_design.feature_names
-        assert "binary_indicator::maf_ultra_rare_indicator" in prior_design.feature_names
-        assert "binary_interaction::maf_rare_indicator::deletion_short" in prior_design.feature_names
-        assert "binary_interaction::maf_low_frequency_indicator::deletion_short" in prior_design.feature_names
+        assert "factor_level::coding_annotation::true" in prior_design.feature_names
+        assert "factor_interaction::coding_annotation::true::deletion_short" in prior_design.feature_names
+        assert "continuous_spline::constraint_score::basis_0" in prior_design.feature_names
+        assert "factor_level::maf_bucket::ultra_rare" in prior_design.feature_names
+        assert "factor_interaction::maf_bucket::rare::deletion_short" in prior_design.feature_names
+        assert "factor_interaction::maf_bucket::low_frequency::deletion_short" in prior_design.feature_names
 
         coefficients = np.zeros(len(prior_design.feature_names), dtype=np.float64)
-        coefficients[prior_design.feature_names.index("binary_indicator::coding_annotation")] = 0.3
-        coefficients[prior_design.feature_names.index("binary_interaction::coding_annotation::deletion_short")] = 0.5
-        coefficients[prior_design.feature_names.index("continuous_shared::constraint_score")] = 0.4
+        coefficients[prior_design.feature_names.index("factor_level::coding_annotation::true")] = 0.3
+        coefficients[prior_design.feature_names.index("factor_interaction::coding_annotation::true::deletion_short")] = 0.5
+        coefficients[prior_design.feature_names.index("continuous_spline::constraint_score::basis_0")] = 0.4
         baseline_scales = _metadata_baseline_scales_from_coefficients(
             coefficients,
             prior_design.design_matrix,
@@ -167,7 +166,7 @@ class TestMetadataScaleModel:
         )
         assert np.unique(np.round(baseline_scales, 6)).shape[0] > 1
 
-    def test_feature_name_parser_round_trips_new_annotation_features(self):
+    def test_feature_specs_round_trip_design_matrix(self):
         records = [
             VariantRecord(
                 "sv_a",
@@ -177,6 +176,9 @@ class TestMetadataScaleModel:
                 allele_frequency=5e-4,
                 prior_binary_features={"coding_annotation": True},
                 prior_continuous_features={"constraint_score": 0.2},
+                prior_categorical_features={"functional_state": "lof"},
+                prior_membership_features={"regulatory_mix": {"enhancer": 0.75, "promoter": 0.25}},
+                prior_nested_features={"gene_context": ("protein_coding", "exon")},
             ),
             VariantRecord(
                 "sv_b",
@@ -186,6 +188,9 @@ class TestMetadataScaleModel:
                 allele_frequency=5e-3,
                 prior_binary_features={"coding_annotation": False},
                 prior_continuous_features={"constraint_score": 0.7},
+                prior_categorical_features={"functional_state": "missense"},
+                prior_membership_features={"regulatory_mix": {"enhancer": 0.10, "promoter": 0.90}},
+                prior_nested_features={"gene_context": ("protein_coding", "intron")},
             ),
             VariantRecord(
                 "sv_c",
@@ -195,21 +200,15 @@ class TestMetadataScaleModel:
                 allele_frequency=2e-2,
                 prior_binary_features={"coding_annotation": True},
                 prior_continuous_features={"constraint_score": 0.9},
+                prior_categorical_features={"functional_state": "lof"},
+                prior_membership_features={"regulatory_mix": {"enhancer": 0.40, "promoter": 0.60}},
+                prior_nested_features={"gene_context": ("lncRNA", "exon")},
             ),
         ]
-        feature_specs = _parse_scale_model_feature_names(
-            [
-                "continuous_shared::constraint_score",
-                "binary_indicator::coding_annotation",
-                "binary_interaction::coding_annotation::deletion_short",
-                "binary_interaction::maf_ultra_rare_indicator::deletion_short",
-            ]
-        )
+        prior_design = _build_prior_design(records)
+        design_matrix = _design_matrix_for_feature_specs(records, prior_design.feature_specs)
 
-        design_matrix = _design_matrix_for_feature_specs(records, feature_specs)
-
-        assert design_matrix.shape == (3, 4)
-        assert np.all(np.isfinite(design_matrix))
+        np.testing.assert_allclose(design_matrix, prior_design.design_matrix)
 
     def test_structural_annotations_still_affect_prior_scale(self):
         records = [
@@ -219,9 +218,9 @@ class TestMetadataScaleModel:
         ]
         prior_design = _build_prior_design(records)
         coefficients = np.zeros(len(prior_design.feature_names), dtype=np.float64)
-        coefficients[prior_design.feature_names.index("continuous_linear::log_length::deletion_short")] = 0.5
-        coefficients[prior_design.feature_names.index("copy_number_indicator")] = 0.5
-        coefficients[prior_design.feature_names.index("repeat_indicator")] = -0.5
+        coefficients[prior_design.feature_names.index("continuous_spline_interaction::log_length::deletion_short::basis_0")] = 0.5
+        coefficients[prior_design.feature_names.index("factor_level::copy_number_indicator::true")] = 0.5
+        coefficients[prior_design.feature_names.index("factor_level::repeat_indicator::true")] = -0.5
         baseline_scales = _metadata_baseline_scales_from_coefficients(coefficients, prior_design.design_matrix, ModelConfig())
         assert np.unique(np.round(baseline_scales, 6)).shape[0] > 1
 
@@ -251,11 +250,56 @@ class TestMetadataScaleModel:
         ]
         prior_design = _build_prior_design(records)
         coefficients = np.zeros(len(prior_design.feature_names), dtype=np.float64)
-        coefficients[prior_design.feature_names.index("continuous_linear::sv_length_score::deletion_short")] = 0.5
-        coefficients[prior_design.feature_names.index("continuous_quadratic::sv_length_score::deletion_short")] = -0.25
+        coefficients[prior_design.feature_names.index("continuous_spline_interaction::sv_length_score::deletion_short::basis_0")] = 0.5
+        coefficients[prior_design.feature_names.index("continuous_spline_interaction::sv_length_score::deletion_short::basis_1")] = -0.25
         baseline_scales = _metadata_baseline_scales_from_coefficients(coefficients, prior_design.design_matrix, ModelConfig())
-        assert "continuous_linear::sv_length_score::deletion_short" in prior_design.feature_names
-        assert "continuous_quadratic::sv_length_score::deletion_short" in prior_design.feature_names
+        assert "continuous_spline_interaction::sv_length_score::deletion_short::basis_0" in prior_design.feature_names
+        assert "continuous_spline_interaction::sv_length_score::deletion_short::basis_1" in prior_design.feature_names
+        assert np.unique(np.round(baseline_scales, 6)).shape[0] > 1
+
+    def test_schema_driven_annotations_compile_categorical_nested_and_membership_terms(self):
+        records = [
+            VariantRecord(
+                "sv_a",
+                VariantClass.DELETION_SHORT,
+                "chr1",
+                100,
+                prior_categorical_features={"functional_state": "lof"},
+                prior_membership_features={"regulatory_mix": {"enhancer": 0.8, "promoter": 0.2}},
+                prior_nested_features={"gene_context": ("protein_coding", "exon")},
+            ),
+            VariantRecord(
+                "sv_b",
+                VariantClass.DELETION_SHORT,
+                "chr1",
+                101,
+                prior_categorical_features={"functional_state": "missense"},
+                prior_membership_features={"regulatory_mix": {"enhancer": 0.2, "promoter": 0.8}},
+                prior_nested_features={"gene_context": ("protein_coding", "intron")},
+            ),
+            VariantRecord(
+                "sv_c",
+                VariantClass.DELETION_SHORT,
+                "chr1",
+                102,
+                prior_categorical_features={"functional_state": "lof"},
+                prior_membership_features={"regulatory_mix": {"enhancer": 0.5, "promoter": 0.5}},
+                prior_nested_features={"gene_context": ("lncRNA", "exon")},
+            ),
+        ]
+        prior_design = _build_prior_design(records)
+
+        assert "factor_level::functional_state::missense" in prior_design.feature_names
+        assert "factor_level::regulatory_mix::promoter" in prior_design.feature_names
+        assert "nested_level::gene_context::0::protein_coding" in prior_design.feature_names
+        assert "nested_level::gene_context::1::protein_coding>exon" in prior_design.feature_names
+
+        coefficients = np.zeros(len(prior_design.feature_names), dtype=np.float64)
+        coefficients[prior_design.feature_names.index("factor_level::functional_state::missense")] = 0.4
+        coefficients[prior_design.feature_names.index("factor_level::regulatory_mix::promoter")] = 0.5
+        coefficients[prior_design.feature_names.index("nested_level::gene_context::1::protein_coding>exon")] = 0.6
+        baseline_scales = _metadata_baseline_scales_from_coefficients(coefficients, prior_design.design_matrix, ModelConfig())
+
         assert np.unique(np.round(baseline_scales, 6)).shape[0] > 1
 
     def test_custom_continuous_features_cannot_override_reserved_names(self):
@@ -276,6 +320,17 @@ class TestMetadataScaleModel:
                 "chr1",
                 100,
                 prior_continuous_features={"bad::name": 1.0},
+            )
+
+    def test_custom_prior_feature_names_must_be_unique_across_annotation_families(self):
+        with pytest.raises(ValueError, match="unique across annotation families"):
+            VariantRecord(
+                "sv_a",
+                VariantClass.DELETION_SHORT,
+                "chr1",
+                100,
+                prior_binary_features={"shared_name": True},
+                prior_categorical_features={"shared_name": "lof"},
             )
 
 
@@ -309,16 +364,6 @@ class TestConfigValidation:
             ModelConfig(max_inner_newton_iterations=0)
         with pytest.raises(ValueError):
             ModelConfig(newton_gradient_tolerance=0.0)
-        with pytest.raises(ValueError):
-            ModelConfig(trust_region_initial_damping=0.0)
-        with pytest.raises(ValueError):
-            ModelConfig(trust_region_damping_increase_factor=1.0)
-        with pytest.raises(ValueError):
-            ModelConfig(trust_region_damping_decrease_factor=1.0)
-        with pytest.raises(ValueError):
-            ModelConfig(trust_region_success_threshold=1.0)
-        with pytest.raises(ValueError):
-            ModelConfig(trust_region_minimum_damping=0.0)
 
     def test_linear_solver_config_validated(self):
         with pytest.raises(ValueError):

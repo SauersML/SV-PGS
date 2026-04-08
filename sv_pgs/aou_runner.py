@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import gc
-import hashlib
 import json
 import os
 import shutil
@@ -15,7 +14,7 @@ import pandas as pd
 
 from sv_pgs.all_of_us import AllOfUsDiseaseRequest, prepare_all_of_us_disease_sample_table, resolve_disease_definition
 from sv_pgs.config import ModelConfig, TraitType
-from sv_pgs.io import load_multi_vcf_dataset_from_files, run_training_pipeline
+from sv_pgs.io import _find_matching_complete_vcf_cache, load_multi_vcf_dataset_from_files, run_training_pipeline
 from sv_pgs.progress import log, mem
 
 _LOCAL_CACHE_DIRNAME = ".sv_pgs_cache"
@@ -437,7 +436,7 @@ def run_all_of_us(
     # For each chromosome, find the old cache bundle (by reading variants.pkl to
     # match chromosome), then symlink into the new cache dir using the NEW key name
     # so the primary key lookup succeeds immediately.
-    from sv_pgs.io import _vcf_cache_dir, _vcf_cache_key, _vcf_cache_paths, _is_vcf_cache_bundle_complete
+    from sv_pgs.io import _vcf_cache_dir, _vcf_cache_key
     import pickle as _pickle
     old_vcf_cache_dir = work_dir / ".sv_pgs_cache"
     if old_vcf_cache_dir.exists():

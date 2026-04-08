@@ -8,13 +8,31 @@ from typing import Any
 import numpy as np
 
 from sv_pgs.config import ModelConfig, TraitType, VariantClass
-from sv_pgs.data import TieGroup, TieMap, VariantRecord
+from sv_pgs.data import TieGroup, TieMap
+
+
+@dataclass(slots=True)
+class VariantMetadataTable:
+    variant_ids: list[str]
+    variant_classes: list[VariantClass]
+
+    def __post_init__(self) -> None:
+        self.variant_ids = [str(variant_id) for variant_id in self.variant_ids]
+        self.variant_classes = [
+            variant_class if isinstance(variant_class, VariantClass) else VariantClass(str(variant_class))
+            for variant_class in self.variant_classes
+        ]
+        if len(self.variant_ids) != len(self.variant_classes):
+            raise ValueError("variant_ids and variant_classes must have the same length.")
+
+    def __len__(self) -> int:
+        return len(self.variant_ids)
 
 
 @dataclass(slots=True)
 class ModelArtifact:
     config: ModelConfig
-    records: list[VariantRecord]
+    variant_metadata: VariantMetadataTable
     means: np.ndarray
     scales: np.ndarray
     alpha: np.ndarray
@@ -31,6 +49,17 @@ class ModelArtifact:
     scale_model_feature_names: list[str]
     objective_history: list[float]
     validation_history: list[float]
+
+    def __post_init__(self) -> None:
+        variant_count = len(self.variant_metadata)
+        if self.means.shape != (variant_count,):
+            raise ValueError("Artifact means must align with full variant metadata.")
+        if self.scales.shape != (variant_count,):
+            raise ValueError("Artifact scales must align with full variant metadata.")
+        if self.beta_full.shape != (variant_count,):
+            raise ValueError("Artifact beta_full must align with full variant metadata.")
+        if self.tie_map.original_to_reduced.shape != (variant_count,):
+            raise ValueError("Artifact tie_map must align with full variant metadata.")
 
 
 def save_artifact(path: str | Path, artifact: ModelArtifact) -> None:
@@ -52,7 +81,13 @@ def save_artifact(path: str | Path, artifact: ModelArtifact) -> None:
 
     payload = {
         "config": _config_to_json(artifact.config),
-        "records": [_record_to_json(record) for record in artifact.records],
+        "variant_metadata": {
+            "variant_ids": list(artifact.variant_metadata.variant_ids),
+            "variant_classes": [
+                variant_class.value
+                for variant_class in artifact.variant_metadata.variant_classes
+            ],
+        },
         "tie_groups": [
             {
                 "representative_index": group.representative_index,
@@ -95,7 +130,13 @@ def load_artifact(path: str | Path) -> ModelArtifact:
     )
     return ModelArtifact(
         config=_config_from_json(payload["config"]),
-        records=[_record_from_json(record) for record in payload["records"]],
+        variant_metadata=VariantMetadataTable(
+            variant_ids=[str(variant_id) for variant_id in payload["variant_metadata"]["variant_ids"]],
+            variant_classes=[
+                VariantClass(variant_class)
+                for variant_class in payload["variant_metadata"]["variant_classes"]
+            ],
+        ),
         means=arrays["means"].astype(np.float32),
         scales=arrays["scales"].astype(np.float32),
         alpha=arrays["alpha"].astype(np.float32),
@@ -131,47 +172,3 @@ def _config_from_json(payload: dict[str, Any]) -> ModelConfig:
     restored_payload = dict(payload)
     restored_payload["trait_type"] = TraitType(payload["trait_type"])
     return ModelConfig(**restored_payload)
-
-
-def _record_to_json(record: VariantRecord) -> dict[str, Any]:
-    return {
-        "variant_id": record.variant_id,
-        "variant_class": record.variant_class.value,
-        "chromosome": record.chromosome,
-        "position": record.position,
-        "length": record.length,
-        "allele_frequency": record.allele_frequency,
-        "quality": record.quality,
-        "training_support": record.training_support,
-        "is_repeat": record.is_repeat,
-        "is_copy_number": record.is_copy_number,
-        "prior_binary_features": dict(record.prior_binary_features),
-        "prior_continuous_features": dict(record.prior_continuous_features),
-        "prior_class_members": [member.value for member in record.prior_class_members],
-        "prior_class_membership": list(record.prior_class_membership),
-    }
-
-
-def _record_from_json(payload: dict[str, Any]) -> VariantRecord:
-    return VariantRecord(
-        variant_id=payload["variant_id"],
-        variant_class=VariantClass(payload["variant_class"]),
-        chromosome=payload["chromosome"],
-        position=int(payload["position"]),
-        length=float(payload["length"]),
-        allele_frequency=float(payload["allele_frequency"]),
-        quality=float(payload["quality"]),
-        training_support=None if payload["training_support"] is None else int(payload["training_support"]),
-        is_repeat=bool(payload["is_repeat"]),
-        is_copy_number=bool(payload["is_copy_number"]),
-        prior_binary_features={
-            str(feature_name): bool(feature_value)
-            for feature_name, feature_value in payload.get("prior_binary_features", {}).items()
-        },
-        prior_continuous_features={
-            str(feature_name): float(feature_value)
-            for feature_name, feature_value in payload.get("prior_continuous_features", {}).items()
-        },
-        prior_class_members=tuple(VariantClass(member) for member in payload["prior_class_members"]),
-        prior_class_membership=tuple(float(weight) for weight in payload["prior_class_membership"]),
-    )

@@ -8,6 +8,7 @@ import numpy as np
 from sv_pgs.config import VariantClass
 
 
+NESTED_PATH_DELIMITER = ">"
 RESERVED_PRIOR_CONTINUOUS_FEATURE_NAMES = frozenset(
     {
         "log_length",
@@ -16,6 +17,51 @@ RESERVED_PRIOR_CONTINUOUS_FEATURE_NAMES = frozenset(
         "log_training_support",
     }
 )
+RESERVED_PRIOR_FACTOR_FEATURE_NAMES = frozenset(
+    {
+        "repeat_indicator",
+        "copy_number_indicator",
+        "maf_bucket",
+    }
+)
+RESERVED_PRIOR_FEATURE_NAMES = frozenset(
+    set(RESERVED_PRIOR_CONTINUOUS_FEATURE_NAMES) | set(RESERVED_PRIOR_FACTOR_FEATURE_NAMES)
+)
+
+
+def _validate_prior_feature_name(feature_name: str, field_name: str) -> None:
+    if not feature_name:
+        raise ValueError(field_name + " keys cannot be empty.")
+    if "::" in feature_name:
+        raise ValueError(field_name + " keys cannot contain '::'.")
+    if feature_name in RESERVED_PRIOR_FEATURE_NAMES:
+        raise ValueError(
+            field_name + " keys cannot override built-in features: " + feature_name
+        )
+
+
+def _normalize_nested_path(path_value: Any, field_name: str) -> tuple[str, ...]:
+    if isinstance(path_value, str):
+        path_parts = tuple(path_value.split(NESTED_PATH_DELIMITER))
+    else:
+        path_parts = tuple(str(path_part) for path_part in path_value)
+    if not path_parts:
+        raise ValueError(field_name + " paths cannot be empty.")
+    normalized_parts: list[str] = []
+    for path_part in path_parts:
+        part_value = str(path_part).strip()
+        if not part_value:
+            raise ValueError(field_name + " paths cannot contain empty levels.")
+        if "::" in part_value:
+            raise ValueError(field_name + " paths cannot contain '::'.")
+        if NESTED_PATH_DELIMITER in part_value:
+            raise ValueError(field_name + f" paths cannot contain '{NESTED_PATH_DELIMITER}'.")
+        normalized_parts.append(part_value)
+    return tuple(normalized_parts)
+
+
+def _encode_nested_path(path_value: Any, field_name: str) -> str:
+    return NESTED_PATH_DELIMITER.join(_normalize_nested_path(path_value, field_name))
 
 
 @dataclass(slots=True)
@@ -38,6 +84,10 @@ class VariantRecord:
     is_copy_number: bool = False
     prior_binary_features: dict[str, bool] = field(default_factory=dict)
     prior_continuous_features: dict[str, float] = field(default_factory=dict)
+    prior_categorical_features: dict[str, str] = field(default_factory=dict)
+    prior_membership_features: dict[str, dict[str, float]] = field(default_factory=dict)
+    prior_nested_features: dict[str, tuple[str, ...]] = field(default_factory=dict)
+    prior_nested_membership_features: dict[str, dict[str, float]] = field(default_factory=dict)
     prior_class_members: tuple[VariantClass, ...] = ()
     prior_class_membership: tuple[float, ...] = ()
 
@@ -47,31 +97,81 @@ class VariantRecord:
             for feature_name, feature_value in self.prior_binary_features.items()
         }
         for feature_name in self.prior_binary_features:
-            if not feature_name:
-                raise ValueError("prior_binary_features keys cannot be empty.")
-            if "::" in feature_name:
-                raise ValueError("prior_binary_features keys cannot contain '::'.")
-            if feature_name in RESERVED_PRIOR_CONTINUOUS_FEATURE_NAMES:
-                raise ValueError(
-                    "prior_binary_features keys cannot override built-in features: "
-                    + feature_name
-                )
+            _validate_prior_feature_name(feature_name, "prior_binary_features")
         self.prior_continuous_features = {
             str(feature_name): float(feature_value)
             for feature_name, feature_value in self.prior_continuous_features.items()
         }
         for feature_name, feature_value in self.prior_continuous_features.items():
-            if not feature_name:
-                raise ValueError("prior_continuous_features keys cannot be empty.")
-            if "::" in feature_name:
-                raise ValueError("prior_continuous_features keys cannot contain '::'.")
-            if feature_name in RESERVED_PRIOR_CONTINUOUS_FEATURE_NAMES:
-                raise ValueError(
-                    "prior_continuous_features keys cannot override built-in features: "
-                    + feature_name
-                )
+            _validate_prior_feature_name(feature_name, "prior_continuous_features")
             if not np.isfinite(feature_value):
                 raise ValueError("prior_continuous_features values must be finite.")
+        self.prior_categorical_features = {
+            str(feature_name): str(feature_value)
+            for feature_name, feature_value in self.prior_categorical_features.items()
+        }
+        for feature_name, feature_value in self.prior_categorical_features.items():
+            _validate_prior_feature_name(feature_name, "prior_categorical_features")
+            if not feature_value:
+                raise ValueError("prior_categorical_features values cannot be empty.")
+            if "::" in feature_value:
+                raise ValueError("prior_categorical_features values cannot contain '::'.")
+        self.prior_membership_features = {
+            str(feature_name): {
+                str(level_name): float(level_weight)
+                for level_name, level_weight in feature_memberships.items()
+            }
+            for feature_name, feature_memberships in self.prior_membership_features.items()
+        }
+        for feature_name, feature_memberships in self.prior_membership_features.items():
+            _validate_prior_feature_name(feature_name, "prior_membership_features")
+            for level_name, level_weight in feature_memberships.items():
+                if not level_name:
+                    raise ValueError("prior_membership_features level names cannot be empty.")
+                if "::" in level_name:
+                    raise ValueError("prior_membership_features level names cannot contain '::'.")
+                if not np.isfinite(level_weight):
+                    raise ValueError("prior_membership_features weights must be finite.")
+                if level_weight < 0.0:
+                    raise ValueError("prior_membership_features weights must be non-negative.")
+        self.prior_nested_features = {
+            str(feature_name): _normalize_nested_path(feature_value, "prior_nested_features")
+            for feature_name, feature_value in self.prior_nested_features.items()
+        }
+        for feature_name in self.prior_nested_features:
+            _validate_prior_feature_name(feature_name, "prior_nested_features")
+        self.prior_nested_membership_features = {
+            str(feature_name): {
+                _encode_nested_path(path_name, "prior_nested_membership_features"): float(path_weight)
+                for path_name, path_weight in feature_memberships.items()
+            }
+            for feature_name, feature_memberships in self.prior_nested_membership_features.items()
+        }
+        for feature_name, feature_memberships in self.prior_nested_membership_features.items():
+            _validate_prior_feature_name(feature_name, "prior_nested_membership_features")
+            for path_weight in feature_memberships.values():
+                if not np.isfinite(path_weight):
+                    raise ValueError("prior_nested_membership_features weights must be finite.")
+                if path_weight < 0.0:
+                    raise ValueError("prior_nested_membership_features weights must be non-negative.")
+        custom_feature_name_sets = {
+            "prior_binary_features": set(self.prior_binary_features),
+            "prior_continuous_features": set(self.prior_continuous_features),
+            "prior_categorical_features": set(self.prior_categorical_features),
+            "prior_membership_features": set(self.prior_membership_features),
+            "prior_nested_features": set(self.prior_nested_features),
+            "prior_nested_membership_features": set(self.prior_nested_membership_features),
+        }
+        for left_field_name, left_feature_names in custom_feature_name_sets.items():
+            for right_field_name, right_feature_names in custom_feature_name_sets.items():
+                if left_field_name >= right_field_name:
+                    continue
+                overlapping_feature_names = sorted(left_feature_names & right_feature_names)
+                if overlapping_feature_names:
+                    raise ValueError(
+                        "Custom prior feature names must be unique across annotation families: "
+                        + ", ".join(overlapping_feature_names)
+                    )
         if not self.prior_class_members and not self.prior_class_membership:
             self.prior_class_members = (self.variant_class,)
             self.prior_class_membership = (1.0,)
@@ -173,6 +273,16 @@ def normalize_variant_records(records: Sequence[VariantRecord | dict[str, Any]])
                     is_copy_number=record.is_copy_number,
                     prior_binary_features=dict(record.prior_binary_features),
                     prior_continuous_features=dict(record.prior_continuous_features),
+                    prior_categorical_features=dict(record.prior_categorical_features),
+                    prior_membership_features={
+                        feature_name: dict(feature_memberships)
+                        for feature_name, feature_memberships in record.prior_membership_features.items()
+                    },
+                    prior_nested_features=dict(record.prior_nested_features),
+                    prior_nested_membership_features={
+                        feature_name: dict(feature_memberships)
+                        for feature_name, feature_memberships in record.prior_nested_membership_features.items()
+                    },
                     prior_class_members=record.prior_class_members,
                     prior_class_membership=record.prior_class_membership,
                 )
@@ -201,6 +311,28 @@ def normalize_variant_records(records: Sequence[VariantRecord | dict[str, Any]])
                 prior_continuous_features={
                     str(feature_name): float(feature_value)
                     for feature_name, feature_value in record.get("prior_continuous_features", {}).items()
+                },
+                prior_categorical_features={
+                    str(feature_name): str(feature_value)
+                    for feature_name, feature_value in record.get("prior_categorical_features", {}).items()
+                },
+                prior_membership_features={
+                    str(feature_name): {
+                        str(level_name): float(level_weight)
+                        for level_name, level_weight in feature_memberships.items()
+                    }
+                    for feature_name, feature_memberships in record.get("prior_membership_features", {}).items()
+                },
+                prior_nested_features={
+                    str(feature_name): _normalize_nested_path(feature_value, "prior_nested_features")
+                    for feature_name, feature_value in record.get("prior_nested_features", {}).items()
+                },
+                prior_nested_membership_features={
+                    str(feature_name): {
+                        _encode_nested_path(path_name, "prior_nested_membership_features"): float(path_weight)
+                        for path_name, path_weight in feature_memberships.items()
+                    }
+                    for feature_name, feature_memberships in record.get("prior_nested_membership_features", {}).items()
                 },
                 prior_class_members=tuple(
                     VariantClass(member_value) for member_value in record.get("prior_class_members", ())

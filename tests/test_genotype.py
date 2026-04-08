@@ -695,6 +695,84 @@ def test_try_materialize_gpu_prefers_int8_batches_when_available(monkeypatch: py
     np.testing.assert_allclose(np.asarray(cast(Any, standardized._cupy_cache)), expected)
 
 
+def test_int8_gpu_cache_supports_linear_algebra(monkeypatch: pytest.MonkeyPatch):
+    class _FakeCudaRuntime:
+        @staticmethod
+        def memGetInfo():
+            return (8_000_000_000, 16_000_000_000)
+
+    class _FakeDevice:
+        def synchronize(self) -> None:
+            return None
+
+    class _FakeCuda:
+        runtime = _FakeCudaRuntime()
+
+        @staticmethod
+        def Device():
+            return _FakeDevice()
+
+    class _FakeCupy:
+        float32 = np.float32
+        float64 = np.float64
+        cuda = _FakeCuda()
+
+        @staticmethod
+        def asarray(array, dtype=None):
+            return np.asarray(array, dtype=dtype)
+
+        @staticmethod
+        def empty(shape, dtype=None, order=None):
+            return np.empty(shape, dtype=dtype, order="C" if order is None else order)
+
+        @staticmethod
+        def zeros(shape, dtype=None):
+            return np.zeros(shape, dtype=dtype)
+
+        @staticmethod
+        def where(condition, x, y):
+            return np.where(condition, x, y)
+
+    raw_i8 = np.array(
+        [
+            [0, 1, -127, 2],
+            [1, -127, 2, 0],
+            [2, 1, 0, 1],
+            [-127, 2, 1, 1],
+        ],
+        dtype=np.int8,
+    )
+    means = np.array([1.0, 1.0, 1.0, 1.0], dtype=np.float32)
+    scales = np.array([0.5, 1.0, 1.0, 0.5], dtype=np.float32)
+    coefficients = np.array([0.25, -0.75, 0.5, 1.25], dtype=np.float64)
+    sample_matrix = np.column_stack(
+        [
+            np.array([1.0, -2.0, 0.5, 3.0], dtype=np.float64),
+            np.array([-1.5, 0.0, 2.0, 1.0], dtype=np.float64),
+        ]
+    )
+    standardized = as_raw_genotype_matrix(raw_i8).standardized(means, scales)
+    dense_matrix = standardized.materialize().astype(np.float64, copy=False)
+    standardized._dense_cache = None
+
+    monkeypatch.setattr(genotype_module, "_try_import_cupy", lambda: _FakeCupy())
+    monkeypatch.setattr(genotype_module, "gpu_compute_numpy_dtype", lambda: np.dtype(np.float64))
+    monkeypatch.setattr(genotype_module, "gpu_compute_jax_dtype", lambda: jnp.float64)
+    monkeypatch.setattr(
+        genotype_module,
+        "_cupy_to_jax",
+        lambda array: jnp.asarray(np.asarray(array), dtype=jnp.float64),
+    )
+
+    assert standardized.try_materialize_gpu() is True
+
+    np.testing.assert_allclose(np.asarray(standardized.matvec(coefficients)), dense_matrix @ coefficients)
+    np.testing.assert_allclose(np.asarray(standardized.matmat(sample_matrix)), dense_matrix @ sample_matrix)
+    transpose_vector = np.array([1.5, -0.25, 0.75, -1.0], dtype=np.float64)
+    np.testing.assert_allclose(np.asarray(standardized.transpose_matvec(transpose_vector)), dense_matrix.T @ transpose_vector)
+    np.testing.assert_allclose(np.asarray(standardized.transpose_matmat(sample_matrix)), dense_matrix.T @ sample_matrix)
+
+
 def test_streaming_linear_algebra_uses_gpu_batches_when_available(monkeypatch: pytest.MonkeyPatch):
     gpu_batch_calls = 0
     original_iter_standardized_gpu_batches = genotype_module._iter_standardized_gpu_batches

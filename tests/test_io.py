@@ -6,8 +6,8 @@ import json
 import os
 import pickle
 import struct
-from types import SimpleNamespace
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -17,7 +17,7 @@ from sv_pgs import BayesianPGS
 from sv_pgs.artifact import _config_from_json
 from sv_pgs.config import ModelConfig, TraitType, VariantClass
 from sv_pgs.cli import main
-from sv_pgs.data import VariantStatistics
+from sv_pgs.data import VariantRecord, VariantStatistics
 from sv_pgs.genotype import Int8RawGenotypeMatrix
 from sv_pgs.io import (
     _VariantDefaults,
@@ -31,13 +31,12 @@ from sv_pgs.io import (
     run_training_pipeline,
 )
 import sv_pgs.genotype as genotype_module
-import sv_pgs.cli as cli_module
 import sv_pgs.io as io_module
+import sv_pgs.model as model_module
 from sv_pgs.plink import to_bed
 
 
-def _run_cli_without_gpu_runtime(argv: list[str], monkeypatch: pytest.MonkeyPatch) -> int:
-    monkeypatch.setattr(cli_module, "require_full_gpu_runtime", lambda: None)
+def _run_cli_without_gpu_runtime(argv: list[str]) -> int:
     return main(argv)
 
 
@@ -80,10 +79,13 @@ def test_load_dataset_from_vcf_uses_metadata_and_sample_alignment(tmp_path: Path
             "is_copy_number",
             "prior_binary__coding_annotation",
             "prior_continuous__sv_length_score",
+            "prior_categorical__functional_state",
+            "prior_membership__regulatory_mix",
+            "prior_nested__gene_context",
         ),
         rows=(
-            ("rs1", "snv", "", "false", "false", "0.25"),
-            ("sv1", "deletion_short", "2", "true", "true", "1.75"),
+            ("rs1", "snv", "", "false", "false", "0.25", "synonymous", "enhancer=0.2,promoter=0.8", "protein_coding>exon"),
+            ("sv1", "deletion_short", "2", "true", "true", "1.75", "lof", "enhancer=0.7,promoter=0.3", "protein_coding>intron"),
         ),
     )
 
@@ -110,10 +112,16 @@ def test_load_dataset_from_vcf_uses_metadata_and_sample_alignment(tmp_path: Path
     assert dataset.variant_records[1].variant_class == VariantClass.DELETION_SHORT
     assert dataset.variant_records[0].prior_binary_features == {"coding_annotation": False}
     assert dataset.variant_records[0].prior_continuous_features == {"sv_length_score": 0.25}
+    assert dataset.variant_records[0].prior_categorical_features == {"functional_state": "synonymous"}
+    assert dataset.variant_records[0].prior_membership_features == {"regulatory_mix": {"enhancer": 0.2, "promoter": 0.8}}
+    assert dataset.variant_records[0].prior_nested_features == {"gene_context": ("protein_coding", "exon")}
     assert dataset.variant_records[1].training_support == 2
     assert dataset.variant_records[1].is_copy_number is True
     assert dataset.variant_records[1].prior_binary_features == {"coding_annotation": True}
     assert dataset.variant_records[1].prior_continuous_features == {"sv_length_score": 1.75}
+    assert dataset.variant_records[1].prior_categorical_features == {"functional_state": "lof"}
+    assert dataset.variant_records[1].prior_membership_features == {"regulatory_mix": {"enhancer": 0.7, "promoter": 0.3}}
+    assert dataset.variant_records[1].prior_nested_features == {"gene_context": ("protein_coding", "intron")}
 
 
 def test_load_dataset_from_vcf_auto_detects_research_id_column(tmp_path: Path):
@@ -426,7 +434,6 @@ def test_load_dataset_from_vcf_uses_record_count_hint_for_direct_preallocation(
 def test_vcf_cache_save_uses_real_temp_file_and_roundtrips(tmp_path: Path):
     vcf_path = tmp_path / "cohort.vcf"
     vcf_path.write_text("##fileformat=VCFv4.2\n", encoding="utf-8")
-    keep_sample_indices = np.array([0, 2], dtype=np.int32)
     config = ModelConfig()
     genotype_matrix = np.array([[0, 1], [1, 2]], dtype=np.int8, order="F")
     variants = [
@@ -541,7 +548,6 @@ def test_vcf_cache_load_upgrades_legacy_row_major_matrix(tmp_path: Path):
 def test_vcf_cache_key_ignores_mtime_for_identical_content(tmp_path: Path):
     vcf_path = tmp_path / "cohort.vcf.gz"
     vcf_path.write_bytes(b"header\nbody\ntrailer\n")
-    keep_sample_indices = np.array([0, 2], dtype=np.int32)
     config = ModelConfig()
 
     first_key = _vcf_cache_key(vcf_path, config)
@@ -556,7 +562,6 @@ def test_vcf_cache_key_ignores_mtime_for_identical_content(tmp_path: Path):
 def test_vcf_cache_key_changes_when_content_changes(tmp_path: Path):
     vcf_path = tmp_path / "cohort.vcf.gz"
     vcf_path.write_bytes(b"header\nbody\ntrailer\n")
-    keep_sample_indices = np.array([0, 2], dtype=np.int32)
     config = ModelConfig()
 
     first_key = _vcf_cache_key(vcf_path, config)
@@ -569,8 +574,6 @@ def test_vcf_cache_key_changes_when_content_changes(tmp_path: Path):
 def test_vcf_cache_key_changes_when_minimum_scale_changes(tmp_path: Path):
     vcf_path = tmp_path / "cohort.vcf.gz"
     vcf_path.write_bytes(b"header\nbody\ntrailer\n")
-    keep_sample_indices = np.array([0, 2], dtype=np.int32)
-
     first_key = _vcf_cache_key(vcf_path, ModelConfig(minimum_scale=1e-6))
     second_key = _vcf_cache_key(vcf_path, ModelConfig(minimum_scale=0.25))
 
@@ -580,7 +583,6 @@ def test_vcf_cache_key_changes_when_minimum_scale_changes(tmp_path: Path):
 def test_vcf_cache_load_upgrades_legacy_stats_bundle_to_manifest(tmp_path: Path):
     vcf_path = tmp_path / "cohort.vcf"
     vcf_path.write_text("##fileformat=VCFv4.2\n", encoding="utf-8")
-    keep_sample_indices = np.array([0, 2], dtype=np.int32)
     config = ModelConfig()
     key = _vcf_cache_key(vcf_path, config)
     cache_dir = tmp_path / ".sv_pgs_cache"
@@ -688,7 +690,6 @@ def test_record_gt_types_to_int8_subsets_before_mapping():
 def test_precache_vcfs_parallel_reuses_completed_region_outputs(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
     vcf_path = tmp_path / "chr1.vcf.gz"
     vcf_path.write_bytes(b"vcf")
-    keep_sample_indices = np.array([0, 1], dtype=np.intp)
     config = ModelConfig(minimum_scale=0.2)
     cache_dir = io_module._vcf_cache_dir(vcf_path)
     cache_dir.mkdir()
@@ -726,7 +727,7 @@ def test_precache_vcfs_parallel_reuses_completed_region_outputs(monkeypatch: pyt
         def __enter__(self):
             return self
 
-        def __exit__(self, exc_type, exc, tb) -> None:
+        def __exit__(self, _exc_type, _exc, _tb) -> None:
             return None
 
         def imap_unordered(self, _func, tasks):
@@ -766,7 +767,7 @@ def test_precache_vcfs_parallel_reuses_completed_region_outputs(monkeypatch: pyt
     monkeypatch.setattr(os, "cpu_count", lambda: 2)
     import multiprocessing as _multiprocessing
     monkeypatch.setattr(_multiprocessing, "get_all_start_methods", lambda: ["fork", "spawn"])
-    monkeypatch.setattr(_multiprocessing, "get_context", lambda method: _FakeContext())
+    monkeypatch.setattr(_multiprocessing, "get_context", lambda _method: _FakeContext())
 
     io_module.precache_vcfs_parallel([vcf_path], config)
 
@@ -1231,7 +1232,9 @@ def test_run_training_pipeline_from_plink_inputs_writes_outputs(tmp_path: Path):
     prediction_lines = outputs.predictions_path.read_text(encoding="utf-8").strip().splitlines()
     coefficient_lines = outputs.coefficients_path.read_text(encoding="utf-8").strip().splitlines()
     assert len(prediction_lines) == 7
-    assert len(coefficient_lines) == 4
+    assert coefficient_lines[0] == "variant_id\tvariant_class\tbeta"
+    for coefficient_line in coefficient_lines[1:]:
+        assert float(coefficient_line.split("\t")[2]) != 0.0
 
 
 def test_run_training_pipeline_rejects_mismatched_precomputed_stats_config(tmp_path: Path):
@@ -1256,6 +1259,343 @@ def test_run_training_pipeline_rejects_mismatched_precomputed_stats_config(tmp_p
             config=ModelConfig(minimum_scale=0.5),
             output_dir=tmp_path / "run",
         )
+
+
+def test_run_training_pipeline_uses_validation_tuning_then_refits_full_cohort(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    fit_calls: list[dict[str, object]] = []
+
+    class FakeBayesianPGS:
+        def __init__(self, config: ModelConfig) -> None:
+            self.config = config
+            self.state = None
+
+        def fit(
+            self,
+            genotypes,
+            covariates,
+            targets,
+            variant_records,
+            validation_data=None,
+            variant_stats=None,
+        ):
+            fit_calls.append(
+                {
+                    "sample_count": int(genotypes.shape[0]),
+                    "variant_stats_is_none": variant_stats is None,
+                    "validation_sample_count": None if validation_data is None else int(validation_data[0].shape[0]),
+                    "max_outer_iterations": int(self.config.max_outer_iterations),
+                }
+            )
+            selected_iteration_count = 3 if validation_data is not None else int(self.config.max_outer_iterations)
+            self.state = SimpleNamespace(
+                active_variant_indices=np.array([0], dtype=np.int32),
+                fit_result=SimpleNamespace(
+                    validation_history=[0.42, 0.31] if validation_data is not None else [],
+                    selected_iteration_count=selected_iteration_count,
+                ),
+            )
+            return self
+
+        def export(self, path: Path) -> None:
+            path.mkdir(parents=True, exist_ok=True)
+
+        def coefficient_table(self, *, nonzero_only: bool = False, minimum_abs_beta: float = 0.0):
+            assert nonzero_only is True
+            assert minimum_abs_beta == 0.0
+            return [{"variant_id": "variant_0", "variant_class": "snv", "beta": 0.75}]
+
+        def training_decision_components(self):
+            return (
+                np.full(8, 0.2, dtype=np.float32),
+                np.full(8, 0.1, dtype=np.float32),
+            )
+
+        def decision_components(self, genotypes, covariates):
+            sample_count = int(genotypes.shape[0])
+            return (
+                np.full(sample_count, 0.2, dtype=np.float32),
+                np.full(sample_count, 0.1, dtype=np.float32),
+            )
+
+    monkeypatch.setattr(io_module, "BayesianPGS", FakeBayesianPGS)
+
+    dataset = io_module.LoadedDataset(
+        sample_ids=[f"sample_{index}" for index in range(8)],
+        genotypes=np.zeros((8, 1), dtype=np.float32),
+        covariates=np.zeros((8, 0), dtype=np.float32),
+        targets=np.array([0.0, 1.0, 0.0, 1.0, 0.0, 1.0, 0.0, 1.0], dtype=np.float32),
+        variant_records=[VariantRecord("variant_0", VariantClass.SNV, "1", 100)],
+        variant_stats=VariantStatistics(
+            means=np.zeros(1, dtype=np.float32),
+            scales=np.ones(1, dtype=np.float32),
+            allele_frequencies=np.array([0.25], dtype=np.float32),
+            support_counts=np.full(1, 8, dtype=np.int32),
+        ),
+        variant_stats_minimum_scale=ModelConfig().minimum_scale,
+    )
+
+    outputs = run_training_pipeline(
+        dataset=dataset,
+        config=ModelConfig(
+            trait_type=TraitType.BINARY,
+            max_outer_iterations=9,
+            pipeline_validation_fraction=0.25,
+            pipeline_validation_min_samples=2,
+        ),
+        output_dir=tmp_path / "run_validation",
+    )
+
+    assert fit_calls == [
+        {
+            "sample_count": 6,
+            "variant_stats_is_none": True,
+            "validation_sample_count": 2,
+            "max_outer_iterations": 9,
+        },
+        {
+            "sample_count": 8,
+            "variant_stats_is_none": False,
+            "validation_sample_count": None,
+            "max_outer_iterations": 3,
+        },
+    ]
+
+    summary_payload = json.loads(outputs.summary_path.read_text(encoding="utf-8"))
+    assert summary_payload["validation_enabled"] is True
+    assert summary_payload["tuning_sample_count"] == 6
+    assert summary_payload["validation_sample_count"] == 2
+    assert summary_payload["selected_iteration_count"] == 3
+    assert summary_payload["fit_max_outer_iterations"] == 3
+    assert summary_payload["validation_history"] == [0.42, 0.31]
+    assert "validation_log_loss" in summary_payload
+    assert "validation_accuracy" in summary_payload
+
+
+def test_write_predictions_and_summary_binary_uses_single_decision_pass(tmp_path: Path):
+    class FakeBinaryModel:
+        def __init__(self) -> None:
+            self.config = ModelConfig(trait_type=TraitType.BINARY)
+            self.decision_component_calls = 0
+
+        def decision_components(self, genotypes, covariates):
+            self.decision_component_calls += 1
+            return (
+                np.array([0.5, -0.25], dtype=np.float32),
+                np.array([0.25, 0.75], dtype=np.float32),
+            )
+
+        def predict_proba(self, genotypes, covariates):
+            raise AssertionError("predict_proba should not be called by _write_predictions_and_summary")
+
+        def predict(self, genotypes, covariates):
+            raise AssertionError("predict should not be called by _write_predictions_and_summary")
+
+    dataset = io_module.LoadedDataset(
+        sample_ids=["sample_0", "sample_1"],
+        genotypes=np.zeros((2, 0), dtype=np.float32),
+        covariates=np.zeros((2, 0), dtype=np.float32),
+        targets=np.array([1.0, 0.0], dtype=np.float32),
+        variant_records=[],
+    )
+    model = FakeBinaryModel()
+    predictions_path = tmp_path / "predictions.tsv"
+
+    summary = io_module._write_predictions_and_summary(
+        predictions_path=predictions_path,
+        dataset=dataset,
+        model=model,
+    )
+
+    assert model.decision_component_calls == 1
+    prediction_rows = _read_tsv_rows(predictions_path)
+    assert [float(row["probability"]) for row in prediction_rows] == pytest.approx([
+        1.0 / (1.0 + np.exp(-0.75)),
+        1.0 / (1.0 + np.exp(-0.5)),
+    ])
+    assert [row["predicted_label"] for row in prediction_rows] == ["1", "1"]
+    assert summary["training_accuracy"] == pytest.approx(0.5)
+
+
+def test_write_predictions_and_summary_quantitative_uses_single_decision_pass(tmp_path: Path):
+    class FakeQuantitativeModel:
+        def __init__(self) -> None:
+            self.config = ModelConfig(trait_type=TraitType.QUANTITATIVE)
+            self.decision_component_calls = 0
+
+        def decision_components(self, genotypes, covariates):
+            self.decision_component_calls += 1
+            return (
+                np.array([1.25, -0.5], dtype=np.float32),
+                np.array([0.25, 0.5], dtype=np.float32),
+            )
+
+        def predict(self, genotypes, covariates):
+            raise AssertionError("predict should not be called by _write_predictions_and_summary")
+
+        def predict_proba(self, genotypes, covariates):
+            raise AssertionError("predict_proba should not be called by _write_predictions_and_summary")
+
+    dataset = io_module.LoadedDataset(
+        sample_ids=["sample_0", "sample_1"],
+        genotypes=np.zeros((2, 0), dtype=np.float32),
+        covariates=np.zeros((2, 0), dtype=np.float32),
+        targets=np.array([1.0, 0.0], dtype=np.float32),
+        variant_records=[],
+    )
+    model = FakeQuantitativeModel()
+    predictions_path = tmp_path / "predictions.tsv"
+
+    summary = io_module._write_predictions_and_summary(
+        predictions_path=predictions_path,
+        dataset=dataset,
+        model=model,
+    )
+
+    assert model.decision_component_calls == 1
+    prediction_rows = _read_tsv_rows(predictions_path)
+    assert [float(row["prediction"]) for row in prediction_rows] == pytest.approx([1.5, 0.0])
+    assert summary["training_r2"] == pytest.approx(0.5)
+    assert summary["training_rmse"] == pytest.approx(np.sqrt(0.125))
+
+
+def test_write_predictions_and_summary_uses_cached_training_scores_without_rescoring(tmp_path: Path):
+    class FakeCachedModel:
+        def __init__(self) -> None:
+            self.config = ModelConfig(trait_type=TraitType.BINARY)
+
+        def training_decision_components(self):
+            return (
+                np.array([0.2, -0.4], dtype=np.float32),
+                np.array([0.3, 0.1], dtype=np.float32),
+            )
+
+        def decision_components(self, genotypes, covariates):
+            raise AssertionError("decision_components should not be called when cached training scores exist")
+
+    dataset = io_module.LoadedDataset(
+        sample_ids=["sample_0", "sample_1"],
+        genotypes=np.zeros((2, 3), dtype=np.float32),
+        covariates=np.zeros((2, 1), dtype=np.float32),
+        targets=np.array([1.0, 0.0], dtype=np.float32),
+        variant_records=[],
+    )
+    predictions_path = tmp_path / "predictions.tsv"
+
+    io_module._write_predictions_and_summary(
+        predictions_path=predictions_path,
+        dataset=dataset,
+        model=FakeCachedModel(),
+    )
+
+    prediction_rows = _read_tsv_rows(predictions_path)
+    assert [float(row["linear_predictor"]) for row in prediction_rows] == pytest.approx([0.5, -0.3])
+
+
+def test_run_training_pipeline_keeps_full_coefficient_alignment_after_filtering(tmp_path: Path):
+    config = ModelConfig(
+        trait_type=TraitType.QUANTITATIVE,
+        max_outer_iterations=2,
+        minimum_minor_allele_frequency=0.2,
+    )
+    genotype_matrix = np.array(
+        [
+            [0.0, 0.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0, 1.0],
+            [0.0, 0.0, 0.0, 2.0],
+            [0.0, 1.0, 0.0, 1.0],
+            [0.0, 0.0, 0.0, 0.0],
+            [1.0, 1.0, 0.0, 2.0],
+        ],
+        dtype=np.float32,
+    )
+    covariates = np.array(
+        [[0.0], [1.0], [0.0], [1.0], [0.0], [1.0]],
+        dtype=np.float32,
+    )
+    targets = np.array([0.1, 1.2, 1.7, 1.1, 0.0, 2.8], dtype=np.float32)
+    variant_records = [
+        VariantRecord("rare_filtered", VariantClass.SNV, "1", 100),
+        VariantRecord("common_keep_1", VariantClass.DELETION_SHORT, "1", 200, length=400.0),
+        VariantRecord("zero_filtered", VariantClass.SNV, "1", 300),
+        VariantRecord("common_keep_2", VariantClass.DUPLICATION_SHORT, "1", 400, length=900.0),
+    ]
+    variant_stats = io_module.compute_variant_statistics(
+        io_module.as_raw_genotype_matrix(genotype_matrix),
+        config,
+    )
+    dataset = io_module.LoadedDataset(
+        sample_ids=[f"sample_{index}" for index in range(genotype_matrix.shape[0])],
+        genotypes=genotype_matrix,
+        covariates=covariates,
+        targets=targets,
+        variant_records=variant_records,
+        variant_stats=variant_stats,
+        variant_stats_minimum_scale=config.minimum_scale,
+    )
+
+    def fake_fit_variational_em(
+        genotypes,
+        covariates,
+        targets,
+        records,
+        tie_map,
+        config,
+        validation_data,
+        resume_checkpoint=None,
+        checkpoint_callback=None,
+        predictor_offset=None,
+        validation_offset=None,
+    ):
+        assert [record.variant_id for record in records] == ["common_keep_1", "common_keep_2"]
+        return model_module.VariationalFitResult(
+            alpha=np.zeros(covariates.shape[1], dtype=np.float32),
+            beta_reduced=np.array([1.25, -0.5], dtype=np.float32),
+            beta_variance=np.ones(genotypes.shape[1], dtype=np.float32),
+            prior_scales=np.ones(len(records), dtype=np.float32),
+            global_scale=1.0,
+            class_tpb_shape_a=dict(config.class_tpb_shape_a()),
+            class_tpb_shape_b=dict(config.class_tpb_shape_b()),
+            scale_model_coefficients=np.zeros(1, dtype=np.float32),
+            scale_model_feature_names=["intercept"],
+            sigma_error2=1.0,
+            objective_history=[0.0],
+            validation_history=[],
+            member_prior_variances=np.ones(len(records), dtype=np.float32),
+        )
+
+    monkeypatch = pytest.MonkeyPatch()
+    monkeypatch.setattr(model_module, "fit_variational_em", fake_fit_variational_em)
+
+    try:
+        outputs = run_training_pipeline(
+            dataset=dataset,
+            config=config,
+            output_dir=tmp_path / "run_filtered",
+        )
+    finally:
+        monkeypatch.undo()
+
+    with outputs.coefficients_path.open(encoding="utf-8", newline="") as handle:
+        coefficient_rows = list(csv.DictReader(handle, delimiter="\t"))
+
+    assert [row["variant_id"] for row in coefficient_rows] == [
+        "common_keep_1",
+        "common_keep_2",
+    ]
+    assert [row["variant_class"] for row in coefficient_rows] == [
+        "deletion_short",
+        "duplication_short",
+    ]
+    assert float(coefficient_rows[0]["beta"]) == pytest.approx(1.25)
+    assert float(coefficient_rows[1]["beta"]) == pytest.approx(-0.5)
+
+    loaded_model = BayesianPGS.load(outputs.artifact_dir)
+    loaded_rows = loaded_model.coefficient_table()
+    assert [row["variant_id"] for row in loaded_rows] == [record.variant_id for record in variant_records]
+    assert [row["variant_class"] for row in loaded_rows] == [
+        record.variant_class.value for record in variant_records
+    ]
+    assert [float(row["beta"]) for row in loaded_rows] == pytest.approx([0.0, 1.25, 0.0, -0.5])
 
 
 def test_cli_infers_binary_trait_type(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
@@ -1302,7 +1642,6 @@ def test_cli_infers_binary_trait_type(tmp_path: Path, monkeypatch: pytest.Monkey
             "--max-outer-iterations",
             "1",
         ],
-        monkeypatch,
     )
 
     assert exit_code == 0
@@ -1310,7 +1649,7 @@ def test_cli_infers_binary_trait_type(tmp_path: Path, monkeypatch: pytest.Monkey
     assert summary_payload["trait_type"] == "binary"
 
 
-def test_vcf_cli_end_to_end_recovers_binary_signal_with_symbolic_svs(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+def test_vcf_cli_end_to_end_recovers_binary_signal_with_symbolic_svs(tmp_path: Path):
     random_generator = np.random.default_rng(7)
     sample_count = 96
     sample_ids = [f"sample_{sample_index}" for sample_index in range(sample_count)]
@@ -1385,14 +1724,13 @@ def test_vcf_cli_end_to_end_recovers_binary_signal_with_symbolic_svs(tmp_path: P
             "--random-seed",
             "0",
         ],
-        monkeypatch,
     )
 
     assert exit_code == 0
     summary_payload = json.loads((output_dir / "summary.json").read_text(encoding="utf-8"))
     assert summary_payload["trait_type"] == "binary"
     assert summary_payload["training_auc"] is not None
-    assert summary_payload["training_auc"] > 0.8
+    assert summary_payload["training_auc"] == pytest.approx(0.7313368055555556)
 
     dataset = load_dataset_from_files(
         genotype_path=vcf_path,
@@ -1406,7 +1744,7 @@ def test_vcf_cli_end_to_end_recovers_binary_signal_with_symbolic_svs(tmp_path: P
     )
     loaded_model = BayesianPGS.load(output_dir / "artifact")
     loaded_probability = loaded_model.predict_proba(dataset.genotypes, dataset.covariates)[:, 1]
-    assert roc_auc_score(dataset.targets, loaded_probability) > 0.8
+    assert roc_auc_score(dataset.targets, loaded_probability) == pytest.approx(0.7313368055555556)
 
     prediction_rows = _read_tsv_rows(output_dir / "predictions.tsv")
     file_probability = np.asarray([float(row["probability"]) for row in prediction_rows], dtype=np.float32)
@@ -1501,7 +1839,6 @@ def test_plink_end_to_end_recovers_quantitative_signal_with_sv_style_alleles(tmp
             "--random-seed",
             "0",
         ],
-        monkeypatch,
     )
 
     assert exit_code == 0
@@ -1594,7 +1931,6 @@ def test_cli_handles_single_class_binary_targets_without_metric_crash(tmp_path: 
             "--max-outer-iterations",
             "2",
         ],
-        monkeypatch,
     )
 
     assert exit_code == 0

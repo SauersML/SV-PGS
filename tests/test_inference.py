@@ -26,11 +26,11 @@ from sv_pgs.mixture_inference import (
     _initialize_alpha_state,
     _member_prior_variances_from_reduced_state,
     _orthogonal_probe_matrix,
-    _parse_scale_model_feature_names,
     _prefer_iterative_variant_space,
     _quantitative_posterior_state,
     _restricted_posterior_state,
     _restricted_precision_projector,
+    ScaleModelFeatureSpec,
     _sample_space_preconditioner,
     _solve_sample_space_rhs_cpu,
     _stochastic_restricted_cross_leverage_diagonal,
@@ -810,11 +810,6 @@ def test_binary_posterior_converges_after_single_latent_gaussian_update(random_g
         minimum_weight=1e-4,
         max_iterations=20,
         gradient_tolerance=1e-5,
-        initial_damping=1.0,
-        damping_increase_factor=10.0,
-        damping_decrease_factor=0.1,
-        success_threshold=0.25,
-        minimum_damping=1e-8,
     )
 
     assert restricted_call_count == 2
@@ -1467,11 +1462,6 @@ def test_binary_posterior_stops_when_predictor_update_is_stalled(random_generato
         minimum_weight=1e-4,
         max_iterations=20,
         gradient_tolerance=1e-8,
-        initial_damping=1.0,
-        damping_increase_factor=10.0,
-        damping_decrease_factor=0.1,
-        success_threshold=0.25,
-        minimum_damping=1e-8,
     )
 
     assert restricted_call_count == 2
@@ -1518,6 +1508,17 @@ def test_collapsed_posterior_solver_controls_relax_large_em_updates_and_keep_fin
         maximum_linear_solver_iterations=1024,
         compute_logdet=False,
         compute_beta_variance=False,
+        em_iteration_index=0,
+        total_em_iterations=6,
+    )
+    mid_tolerance, mid_iterations = _collapsed_posterior_solver_controls(
+        standardized,
+        solver_tolerance=1e-6,
+        maximum_linear_solver_iterations=1024,
+        compute_logdet=False,
+        compute_beta_variance=True,
+        em_iteration_index=3,
+        total_em_iterations=6,
     )
     full_tolerance, full_iterations = _collapsed_posterior_solver_controls(
         standardized,
@@ -1529,6 +1530,8 @@ def test_collapsed_posterior_solver_controls_relax_large_em_updates_and_keep_fin
 
     assert relaxed_tolerance == 1e-3
     assert relaxed_iterations == 128
+    assert mid_tolerance == 3e-4
+    assert mid_iterations == 192
     assert full_tolerance == 1e-6
     assert full_iterations == 1024
 
@@ -1619,6 +1622,23 @@ def test_fit_collapsed_posterior_relaxes_quantitative_solver_during_em_and_keeps
         config=config,
         compute_logdet=False,
         compute_beta_variance=False,
+        em_iteration_index=0,
+        total_em_iterations=6,
+    )
+    mixture_inference._fit_collapsed_posterior(
+        genotype_matrix=standardized,
+        covariate_matrix=covariate_matrix,
+        targets=targets,
+        reduced_prior_variances=np.ones(variant_count, dtype=np.float64),
+        sigma_error2=1.0,
+        alpha_init=np.zeros(covariate_matrix.shape[1], dtype=np.float64),
+        beta_init=np.zeros(variant_count, dtype=np.float64),
+        trait_type=TraitType.QUANTITATIVE,
+        config=config,
+        compute_logdet=False,
+        compute_beta_variance=True,
+        em_iteration_index=4,
+        total_em_iterations=6,
     )
     mixture_inference._fit_collapsed_posterior(
         genotype_matrix=standardized,
@@ -1635,7 +1655,27 @@ def test_fit_collapsed_posterior_relaxes_quantitative_solver_during_em_and_keeps
     )
 
     assert solver_settings[0] == (1e-3, 128, False, False)
-    assert solver_settings[1] == (1e-6, 1024, True, True)
+    assert solver_settings[1] == (1e-4, 192, False, True)
+    assert solver_settings[2] == (1e-6, 1024, True, True)
+
+
+def test_collapsed_posterior_solver_controls_relax_small_stochastic_block_updates():
+    standardized = as_raw_genotype_matrix(np.zeros((128, 256), dtype=np.float32)).standardized(
+        means=np.zeros(256, dtype=np.float32),
+        scales=np.ones(256, dtype=np.float32),
+    )
+
+    tolerance, max_iterations = _collapsed_posterior_solver_controls(
+        standardized,
+        solver_tolerance=1e-6,
+        maximum_linear_solver_iterations=1024,
+        compute_logdet=False,
+        compute_beta_variance=False,
+        update_blend_weight=0.05,
+    )
+
+    assert tolerance == 5e-3
+    assert max_iterations == 64
 
 
 def test_binary_posterior_uses_inexact_solver_controls_before_final_solve(monkeypatch):
@@ -1728,11 +1768,6 @@ def test_binary_posterior_uses_inexact_solver_controls_before_final_solve(monkey
         minimum_weight=1e-4,
         max_iterations=1,
         gradient_tolerance=1e-8,
-        initial_damping=1.0,
-        damping_increase_factor=10.0,
-        damping_decrease_factor=0.1,
-        success_threshold=0.25,
-        minimum_damping=1e-8,
         solver_tolerance=1e-6,
         maximum_linear_solver_iterations=1024,
     )
@@ -2388,11 +2423,6 @@ def test_binary_posterior_state_streaming_gpu_avoids_jax_genotype_matvec(monkeyp
         minimum_weight=1e-4,
         max_iterations=1,
         gradient_tolerance=1e-6,
-        initial_damping=1.0,
-        damping_increase_factor=2.0,
-        damping_decrease_factor=0.5,
-        success_threshold=0.1,
-        minimum_damping=1e-4,
         compute_logdet=False,
         compute_beta_variance=False,
         posterior_variance_batch_size=2,
@@ -3145,6 +3175,7 @@ def test_validation_restores_best_iterate(monkeypatch: pytest.MonkeyPatch):
         predictor_offset=None,
         stale_beta_variance=None,
         restricted_posterior_warm_start=None,
+        **kwargs,
     ):
         call_counter["count"] += 1
         if call_counter["count"] <= config.max_outer_iterations:
@@ -3221,6 +3252,7 @@ def test_binary_validation_uses_calibrated_intercept(monkeypatch: pytest.MonkeyP
         predictor_offset=None,
         stale_beta_variance=None,
         restricted_posterior_warm_start=None,
+        **kwargs,
     ):
         return PosteriorState(
             alpha=np.zeros(covariate_matrix.shape[1], dtype=np.float64),
@@ -3288,6 +3320,7 @@ def test_variational_em_reuses_beta_variance_between_refreshes(monkeypatch: pyte
         predictor_offset=None,
         stale_beta_variance=None,
         restricted_posterior_warm_start=None,
+        **kwargs,
     ):
         compute_beta_variance_calls.append(bool(compute_beta_variance))
         stale_beta_variance_flags.append(stale_beta_variance is not None)
@@ -3451,10 +3484,10 @@ def test_member_prior_variances_preserve_member_metadata_with_ties():
         member_records=member_records,
         tie_map=tie_map,
         scale_model_coefficients=np.array([1.0, -1.0], dtype=np.float64),
-        scale_model_feature_specs=_parse_scale_model_feature_names([
-            "type_offset::snv",
-            "type_offset::deletion_short",
-        ]),
+        scale_model_feature_specs=(
+            ScaleModelFeatureSpec(kind="type_offset", variant_class=VariantClass.SNV),
+            ScaleModelFeatureSpec(kind="type_offset", variant_class=VariantClass.DELETION_SHORT),
+        ),
         global_scale=1.0,
         local_scale=np.array([2.0], dtype=np.float64),
         config=ModelConfig(),

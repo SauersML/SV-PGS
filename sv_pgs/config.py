@@ -119,11 +119,6 @@ class ModelConfig:
 
     max_inner_newton_iterations: int = 20
     newton_gradient_tolerance: float = 1e-6
-    trust_region_initial_damping: float = 1.0
-    trust_region_damping_increase_factor: float = 10.0
-    trust_region_damping_decrease_factor: float = 0.1
-    trust_region_success_threshold: float = 0.25
-    trust_region_minimum_damping: float = 1e-8
 
     linear_solver_tolerance: float = 1e-6
     maximum_linear_solver_iterations: int = 1024
@@ -137,6 +132,8 @@ class ModelConfig:
 
     sample_space_preconditioner_rank: int = 256
     validation_interval: int = 2
+    pipeline_validation_fraction: float = 0.1
+    pipeline_validation_min_samples: int = 512
     binary_intercept_calibration: bool = True
     stochastic_variational_updates: bool = True
     stochastic_min_variant_count: int = 4096
@@ -187,16 +184,6 @@ class ModelConfig:
             raise ValueError("max_inner_newton_iterations must be positive.")
         if self.newton_gradient_tolerance <= 0.0:
             raise ValueError("newton_gradient_tolerance must be positive.")
-        if self.trust_region_initial_damping <= 0.0:
-            raise ValueError("trust_region_initial_damping must be positive.")
-        if self.trust_region_damping_increase_factor <= 1.0:
-            raise ValueError("trust_region_damping_increase_factor must exceed 1.")
-        if not 0.0 < self.trust_region_damping_decrease_factor < 1.0:
-            raise ValueError("trust_region_damping_decrease_factor must lie in (0, 1).")
-        if not 0.0 < self.trust_region_success_threshold < 1.0:
-            raise ValueError("trust_region_success_threshold must lie in (0, 1).")
-        if self.trust_region_minimum_damping <= 0.0:
-            raise ValueError("trust_region_minimum_damping must be positive.")
         if self.linear_solver_tolerance <= 0.0:
             raise ValueError("linear_solver_tolerance must be positive.")
         if self.maximum_linear_solver_iterations < 1:
@@ -219,6 +206,10 @@ class ModelConfig:
             raise ValueError("sample_space_preconditioner_rank must be non-negative.")
         if self.validation_interval < 1:
             raise ValueError("validation_interval must be positive.")
+        if not 0.0 <= self.pipeline_validation_fraction < 0.5:
+            raise ValueError("pipeline_validation_fraction must lie in [0.0, 0.5).")
+        if self.pipeline_validation_min_samples < 0:
+            raise ValueError("pipeline_validation_min_samples must be non-negative.")
         if self.stochastic_min_variant_count < 0:
             raise ValueError("stochastic_min_variant_count must be non-negative.")
         if self.stochastic_variant_batch_size < 1:

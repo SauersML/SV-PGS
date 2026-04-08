@@ -489,6 +489,8 @@ def test_collapse_tie_groups_preserves_support_and_continuous_features():
             training_support=6,
             prior_binary_features={"coding_annotation": True},
             prior_continuous_features={"sv_length_score": 1.0},
+            prior_categorical_features={"functional_state": "lof"},
+            prior_nested_features={"gene_context": ("protein_coding", "exon")},
         ),
         VariantRecord(
             "variant_1",
@@ -498,6 +500,8 @@ def test_collapse_tie_groups_preserves_support_and_continuous_features():
             training_support=8,
             prior_binary_features={"coding_annotation": False},
             prior_continuous_features={"sv_length_score": 3.0},
+            prior_categorical_features={"functional_state": "missense"},
+            prior_nested_features={"gene_context": ("protein_coding", "intron")},
         ),
         VariantRecord("variant_2", VariantClass.SNV, "1", 102),
     ]
@@ -506,5 +510,11 @@ def test_collapse_tie_groups_preserves_support_and_continuous_features():
     collapsed_records = collapse_tie_groups(variant_records, tie_map)
 
     assert collapsed_records[0].training_support == 7
-    assert collapsed_records[0].prior_binary_features == {"coding_annotation": True}
+    assert collapsed_records[0].prior_binary_features == {}
     assert collapsed_records[0].prior_continuous_features == {"sv_length_score": 2.0}
+    assert collapsed_records[0].prior_membership_features["coding_annotation"] == {"false": 0.5, "true": 0.5}
+    assert collapsed_records[0].prior_membership_features["functional_state"] == {"lof": 0.5, "missense": 0.5}
+    assert collapsed_records[0].prior_nested_membership_features["gene_context"] == {
+        "protein_coding>exon": 0.5,
+        "protein_coding>intron": 0.5,
+    }

@@ -286,6 +286,15 @@ def _minor_allele_frequency(allele_frequency: float) -> float:
 _TIE_MAP_POSITION_WINDOW = 100_000  # 100 KB — duplicate SV calls are always nearby
 
 
+def _empty_tie_map(original_variant_count: int) -> TieMap:
+    original_to_reduced = np.full(original_variant_count, -1, dtype=np.int32)
+    return TieMap(
+        kept_indices=np.zeros(0, dtype=np.int32),
+        original_to_reduced=original_to_reduced,
+        reduced_to_group=[],
+    )
+
+
 def _build_tie_map_windowed(
     standardized_genotypes: StandardizedGenotypeMatrix,
     records: Sequence[VariantRecord],
@@ -320,7 +329,7 @@ def _build_tie_map_windowed(
 
     # Find candidate pairs: same (chr, support) AND within position window
     candidate_pairs: list[tuple[int, int, float]] = []  # (i, j, sign)
-    for (chrom, sup), indices in exact_groups.items():
+    for (chrom, _sup), indices in exact_groups.items():
         if len(indices) < 2:
             continue
         # Sort by position within group
@@ -1060,6 +1069,88 @@ def collapse_tie_groups(
                 for feature_name in member_record.prior_binary_features
             }
         )
+        categorical_feature_names = sorted(
+            {
+                feature_name
+                for member_record in member_records
+                for feature_name in member_record.prior_categorical_features
+            }
+        )
+        nested_feature_names = sorted(
+            {
+                feature_name
+                for member_record in member_records
+                for feature_name in member_record.prior_nested_features
+            }
+        )
+        collapsed_binary_features: dict[str, bool] = {}
+        collapsed_categorical_features: dict[str, str] = {}
+        collapsed_membership_features = _average_weighted_feature_dicts(
+            [
+                member_record.prior_membership_features
+                for member_record in member_records
+            ]
+        )
+        collapsed_nested_features: dict[str, tuple[str, ...]] = {}
+        collapsed_nested_membership_features = _average_weighted_feature_dicts(
+            [
+                member_record.prior_nested_membership_features
+                for member_record in member_records
+            ]
+        )
+
+        for feature_name in binary_feature_names:
+            true_frequency = float(
+                np.mean(
+                    [
+                        float(member_record.prior_binary_features.get(feature_name, False))
+                        for member_record in member_records
+                    ]
+                )
+            )
+            if np.isclose(true_frequency, 0.0):
+                collapsed_binary_features[feature_name] = False
+                continue
+            if np.isclose(true_frequency, 1.0):
+                collapsed_binary_features[feature_name] = True
+                continue
+            collapsed_membership_features[feature_name] = {
+                "false": 1.0 - true_frequency,
+                "true": true_frequency,
+            }
+
+        for feature_name in categorical_feature_names:
+            feature_values = [
+                member_record.prior_categorical_features.get(feature_name)
+                for member_record in member_records
+            ]
+            observed_feature_values = [feature_value for feature_value in feature_values if feature_value is not None]
+            if not observed_feature_values:
+                continue
+            if len(set(observed_feature_values)) == 1 and len(observed_feature_values) == len(member_records):
+                collapsed_categorical_features[feature_name] = observed_feature_values[0]
+                continue
+            collapsed_membership_features[feature_name] = {
+                feature_value: float(np.mean([value == feature_value for value in feature_values]))
+                for feature_value in sorted(set(observed_feature_values))
+            }
+
+        for feature_name in nested_feature_names:
+            feature_paths = [
+                member_record.prior_nested_features.get(feature_name)
+                for member_record in member_records
+            ]
+            observed_feature_paths = [feature_path for feature_path in feature_paths if feature_path is not None]
+            if not observed_feature_paths:
+                continue
+            if len(set(observed_feature_paths)) == 1 and len(observed_feature_paths) == len(member_records):
+                collapsed_nested_features[feature_name] = observed_feature_paths[0]
+                continue
+            collapsed_nested_membership_features[feature_name] = {
+                ">".join(feature_path): float(np.mean([path_value == feature_path for path_value in feature_paths]))
+                for feature_path in sorted(set(observed_feature_paths))
+            }
+
         collapsed_records.append(
             VariantRecord(
                 variant_id=member_records[0].variant_id,
@@ -1072,13 +1163,7 @@ def collapse_tie_groups(
                 training_support=None if not support_values else int(np.round(np.mean(support_values))),
                 is_repeat=any(member_record.is_repeat for member_record in member_records),
                 is_copy_number=any(member_record.is_copy_number for member_record in member_records),
-                prior_binary_features={
-                    feature_name: any(
-                        member_record.prior_binary_features.get(feature_name, False)
-                        for member_record in member_records
-                    )
-                    for feature_name in binary_feature_names
-                },
+                prior_binary_features=collapsed_binary_features,
                 prior_continuous_features={
                     feature_name: float(
                         np.mean(
@@ -1090,11 +1175,55 @@ def collapse_tie_groups(
                     )
                     for feature_name in continuous_feature_names
                 },
+                prior_categorical_features=collapsed_categorical_features,
+                prior_membership_features=collapsed_membership_features,
+                prior_nested_features=collapsed_nested_features,
+                prior_nested_membership_features=collapsed_nested_membership_features,
                 prior_class_members=tuple(unique_variant_classes),
                 prior_class_membership=tuple(class_membership.tolist()),
             )
         )
     return collapsed_records
+
+
+def _average_weighted_feature_dicts(
+    weighted_feature_dicts: Sequence[dict[str, dict[str, float]]],
+) -> dict[str, dict[str, float]]:
+    averaged_features: dict[str, dict[str, float]] = {}
+    feature_names = sorted(
+        {
+            feature_name
+            for feature_dict in weighted_feature_dicts
+            for feature_name in feature_dict
+        }
+    )
+    for feature_name in feature_names:
+        level_names = sorted(
+            {
+                level_name
+                for feature_dict in weighted_feature_dicts
+                for level_name in feature_dict.get(feature_name, {})
+            }
+        )
+        averaged_levels = {
+            level_name: float(
+                np.mean(
+                    [
+                        feature_dict.get(feature_name, {}).get(level_name, 0.0)
+                        for feature_dict in weighted_feature_dicts
+                    ]
+                )
+            )
+            for level_name in level_names
+        }
+        nonzero_levels = {
+            level_name: level_weight
+            for level_name, level_weight in averaged_levels.items()
+            if level_weight > 0.0
+        }
+        if nonzero_levels:
+            averaged_features[feature_name] = nonzero_levels
+    return averaged_features
 
 
 def _class_membership(member_records: Sequence[VariantRecord]) -> tuple[list[VariantClass], np.ndarray]:
