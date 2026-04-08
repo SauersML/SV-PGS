@@ -4186,20 +4186,25 @@ def _restricted_posterior_state(
         variant_count=variant_count,
         exact_solver_matrix_limit=exact_solver_matrix_limit,
     )
-    prefer_streamed_gpu_sample_space = _streaming_cupy_backend_available(genotype_matrix)
-    prefer_iterative_variant_space = _prefer_iterative_variant_space(
-        genotype_matrix=genotype_matrix,
-        sample_count=sample_count,
-        variant_count=variant_count,
-        compute_beta_variance=compute_beta_variance,
-        compute_logdet=compute_logdet,
-        initial_beta_guess=initial_beta_guess,
+    # GPU availability: cached (uploaded to GPU memory) or streaming (mmap→GPU batches)
+    gpu_available = (
+        genotype_matrix._cupy_cache is not None
+        or _streaming_cupy_backend_available(genotype_matrix)
     )
-    use_variant_space = (not use_exact_sample) and (not prefer_streamed_gpu_sample_space) and (
+
+    # Solver selection:
+    # 1. Exact sample-space Cholesky when n is tiny (≤ exact_solver_matrix_limit)
+    # 2. Exact variant-space Cholesky when p is tiny (direct solve, no convergence risk)
+    # 3. GPU sample-space CG with Nyström preconditioner — the Nyström captures the top
+    #    eigenspace of X D X^T, giving reliable convergence in ~30-50 iterations.
+    #    This is mathematically superior to variant-space CG with diagonal preconditioner,
+    #    especially for binary traits where Polya-Gamma weights make X^T W X ill-conditioned.
+    # 4. CPU sample-space CG with Nyström — same algorithm, slower matvecs.
+    # 5. Iterative variant-space CG — last resort, poorly preconditioned, can diverge.
+    use_variant_space = (not use_exact_sample) and (not gpu_available) and (
         use_exact_variant
         or use_gpu_exact_variant
-        or variant_count <= sample_count
-        or prefer_iterative_variant_space
+        or (variant_count <= sample_count and not gpu_available)
     )
 
     if use_exact_sample:
@@ -4310,10 +4315,10 @@ def _restricted_posterior_state(
         )
 
     if use_variant_space:
-        if prefer_iterative_variant_space and not (use_exact_variant or use_gpu_exact_variant):
+        if not (use_exact_variant or use_gpu_exact_variant):
             log(
-                "    restricted posterior: forcing iterative variant-space solve "
-                + f"for warm-started binary update (p={variant_count}, n={sample_count})  mem={mem()}"
+                "    restricted posterior: iterative variant-space solve "
+                + f"(p={variant_count}, n={sample_count})  mem={mem()}"
             )
         if use_exact_variant or use_gpu_exact_variant:
             log(f"    restricted posterior: exact variant-space Cholesky (p={variant_count}, n={sample_count})  mem={mem()}")
