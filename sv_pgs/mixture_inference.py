@@ -4634,15 +4634,15 @@ def _restricted_posterior_state(
             log(f"    restricted posterior: exact variant-space Cholesky (p={variant_count}, n={sample_count})  mem={mem()}")
             if genotype_matrix._cupy_cache is not None:
                 import cupy as cp
-                import cupy.cublas as cupy_cublas
                 X_gpu = genotype_matrix._cupy_cache  # (n, p) float32 on GPU
                 compute_cp_dtype = _cupy_compute_dtype(cp)
                 X_gpu_compute = X_gpu.astype(compute_cp_dtype, copy=False)
                 # Build the exact p x p summaries on GPU in compute precision,
                 # then factor the small system on CPU in float64.
+                # Form X^T diag(W) X as (W^{1/2}X)^T (W^{1/2}X) — one cuBLAS gemm.
                 inv_d_cp = cp.asarray(inverse_diagonal_noise, dtype=compute_cp_dtype)
                 weighted_design_gpu = X_gpu_compute * cp.sqrt(inv_d_cp)[:, None]
-                xtdx_gpu = cupy_cublas.syrk("T", weighted_design_gpu, lower=False)
+                xtdx_gpu = weighted_design_gpu.T @ weighted_design_gpu
                 CtWX = _cached_weighted_covariate_projection(
                     genotype_matrix=genotype_matrix,
                     covariate_matrix=covariate_matrix,
