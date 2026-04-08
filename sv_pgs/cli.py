@@ -8,51 +8,11 @@ import platform
 import sys
 from pathlib import Path
 
-from sv_pgs._jax import require_full_gpu_runtime
-from sv_pgs.aou_runner import run_all_of_us
 from sv_pgs.all_of_us import AllOfUsDiseaseRequest, available_disease_names, prepare_all_of_us_disease_sample_table
-from sv_pgs.config import InferenceBackend, ModelConfig, TraitType
+from sv_pgs.aou_runner import run_all_of_us
+from sv_pgs.config import ModelConfig, TraitType
 from sv_pgs.io import load_dataset_from_files, run_training_pipeline
 from sv_pgs.progress import gpu_memory_snapshot, jax_runtime_snapshot, log, nvidia_smi_snapshot
-
-
-def _add_basil_arguments(parser: argparse.ArgumentParser) -> None:
-    defaults = ModelConfig()
-    parser.add_argument("--basil-l1-ratio", type=float, default=defaults.basil_l1_ratio)
-    parser.add_argument("--basil-lambda-min-ratio", type=float, default=defaults.basil_lambda_min_ratio)
-    parser.add_argument("--basil-n-lambdas", type=int, default=defaults.basil_n_lambdas)
-    parser.add_argument("--basil-strong-set-initial-size", type=int, default=defaults.basil_strong_set_initial_size)
-    parser.add_argument("--basil-strong-set-growth", type=int, default=defaults.basil_strong_set_growth)
-    parser.add_argument("--basil-batch-size", type=int, default=defaults.basil_batch_size)
-    parser.add_argument("--basil-max-screening-passes", type=int, default=defaults.basil_max_screening_passes)
-    parser.add_argument("--basil-irls-max-iterations", type=int, default=defaults.basil_irls_max_iterations)
-    parser.add_argument(
-        "--basil-coordinate-descent-max-epochs",
-        type=int,
-        default=defaults.basil_coordinate_descent_max_epochs,
-    )
-    parser.add_argument(
-        "--basil-coordinate-descent-tolerance",
-        type=float,
-        default=defaults.basil_coordinate_descent_tolerance,
-    )
-    parser.add_argument("--basil-kkt-tolerance", type=float, default=defaults.basil_kkt_tolerance)
-
-
-def _basil_config_from_args(args: argparse.Namespace) -> dict[str, int | float]:
-    return {
-        "basil_l1_ratio": float(args.basil_l1_ratio),
-        "basil_lambda_min_ratio": float(args.basil_lambda_min_ratio),
-        "basil_n_lambdas": int(args.basil_n_lambdas),
-        "basil_strong_set_initial_size": int(args.basil_strong_set_initial_size),
-        "basil_strong_set_growth": int(args.basil_strong_set_growth),
-        "basil_batch_size": int(args.basil_batch_size),
-        "basil_max_screening_passes": int(args.basil_max_screening_passes),
-        "basil_irls_max_iterations": int(args.basil_irls_max_iterations),
-        "basil_coordinate_descent_max_epochs": int(args.basil_coordinate_descent_max_epochs),
-        "basil_coordinate_descent_tolerance": float(args.basil_coordinate_descent_tolerance),
-        "basil_kkt_tolerance": float(args.basil_kkt_tolerance),
-    }
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -79,7 +39,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     aou_run_parser = subparsers.add_parser(
         "run-all-of-us",
-        help="Full AoU pipeline: download VCFs, prepare phenotype, merge PCs, and fit one unified genome-wide model.",
+        help="Full AoU pipeline: download VCFs, prepare phenotype, merge PCs, and fit one unified genome-wide Bayesian model.",
     )
     aou_run_parser.add_argument("--disease", required=True, help="Disease name (e.g. hypertension, type2_diabetes).")
     aou_run_parser.add_argument("--chromosomes", default="1-22", help="Chromosome range (default: 1-22).")
@@ -87,15 +47,8 @@ def build_parser() -> argparse.ArgumentParser:
     aou_run_parser.add_argument("--n-pcs", type=int, default=10, help="Number of genomic PCs to include (default: 10).")
     aou_run_parser.add_argument("--max-outer-iterations", type=int, default=30)
     aou_run_parser.add_argument("--random-seed", type=int, default=0)
-    aou_run_parser.add_argument(
-        "--inference-backend",
-        default=InferenceBackend.BASIL.value,
-        choices=tuple(backend.value for backend in InferenceBackend),
-        help="Inference backend to use for fitting.",
-    )
-    _add_basil_arguments(aou_run_parser)
 
-    run_parser = subparsers.add_parser("run", help="Load genotype files, fit the model, and write outputs.")
+    run_parser = subparsers.add_parser("run", help="Load genotype files, fit the Bayesian model, and write outputs.")
     run_parser.add_argument("--genotypes", required=True, help="Path to a VCF/BCF file or PLINK 1 .bed file.")
     run_parser.add_argument(
         "--genotype-format",
@@ -127,13 +80,6 @@ def build_parser() -> argparse.ArgumentParser:
     run_parser.add_argument("--output-dir", required=True, help="Directory for artifact and result tables.")
     run_parser.add_argument("--max-outer-iterations", type=int, default=30)
     run_parser.add_argument("--random-seed", type=int, default=0)
-    run_parser.add_argument(
-        "--inference-backend",
-        default=InferenceBackend.BASIL.value,
-        choices=tuple(backend.value for backend in InferenceBackend),
-        help="Inference backend to use for fitting.",
-    )
-    _add_basil_arguments(run_parser)
     return parser
 
 
@@ -141,7 +87,7 @@ def main(argv: list[str] | None = None) -> int:
     try:
         faulthandler.enable(file=sys.stderr, all_threads=True)
     except io.UnsupportedOperation:
-        pass  # stderr has no fileno (e.g. pytest capture)
+        pass
     parser = build_parser()
     args = parser.parse_args(argv)
 
@@ -152,9 +98,7 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.command == "prepare-all-of-us-disease":
         prepared_outputs = prepare_all_of_us_disease_sample_table(
-            request=AllOfUsDiseaseRequest(
-                disease=args.disease,
-            ),
+            request=AllOfUsDiseaseRequest(disease=args.disease),
             output_path=Path(args.output),
         )
         print("sample_table\t" + str(prepared_outputs.sample_table_path))
@@ -163,15 +107,14 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     if args.command == "run-all-of-us":
-        # Parse chromosome range: "1-22" -> [1,2,...,22], "22" -> [22], "1,5,22" -> [1,5,22]
-        chr_str = args.chromosomes
-        if "-" in chr_str:
-            lo, hi = chr_str.split("-", 1)
-            chromosomes = list(range(int(lo), int(hi) + 1))
-        elif "," in chr_str:
-            chromosomes = [int(c.strip()) for c in chr_str.split(",")]
+        chromosome_text = args.chromosomes
+        if "-" in chromosome_text:
+            low, high = chromosome_text.split("-", 1)
+            chromosomes = list(range(int(low), int(high) + 1))
+        elif "," in chromosome_text:
+            chromosomes = [int(chromosome.strip()) for chromosome in chromosome_text.split(",")]
         else:
-            chromosomes = [int(chr_str)]
+            chromosomes = [int(chromosome_text)]
         run_all_of_us(
             disease=args.disease,
             chromosomes=chromosomes,
@@ -179,8 +122,6 @@ def main(argv: list[str] | None = None) -> int:
             n_pcs=args.n_pcs,
             max_outer_iterations=args.max_outer_iterations,
             random_seed=args.random_seed,
-            inference_backend=InferenceBackend(args.inference_backend),
-            **_basil_config_from_args(args),
         )
         return 0
 
@@ -188,8 +129,8 @@ def main(argv: list[str] | None = None) -> int:
         raise ValueError("Unsupported command: " + str(args.command))
 
     try:
-        with open("/proc/meminfo") as f:
-            for line in f:
+        with open("/proc/meminfo") as meminfo_file:
+            for line in meminfo_file:
                 if line.startswith("MemTotal:"):
                     total_gb = int(line.split()[1]) / 1024 / 1024
                     break
@@ -198,31 +139,19 @@ def main(argv: list[str] | None = None) -> int:
         mem_info = f"total_ram={total_gb:.1f} GB"
     except OSError:
         mem_info = "total_ram=unknown"
+
     log(f"=== CLI RUN START ===  pid={os.getpid()}  {mem_info}  cpu_count={os.cpu_count()}  platform={platform.platform()}")
     log(f"jax runtime: {jax_runtime_snapshot()}")
     log(f"gpu memory: {gpu_memory_snapshot()}")
     log(f"nvidia-smi: {nvidia_smi_snapshot()}")
-    requested_backend = InferenceBackend(args.inference_backend)
-    if requested_backend == InferenceBackend.VARIATIONAL_BAYES:
-        require_full_gpu_runtime()
-    else:
-        log(f"skipping GPU-runtime enforcement for backend={requested_backend.value}")
     log(f"genotypes={args.genotypes} sample_table={args.sample_table} output_dir={args.output_dir}")
     log(f"genotype_format={args.genotype_format} sample_id_column={args.sample_id_column} target_column={args.target_column}")
     log(f"covariates={list(args.covariate_column)}  max_outer_iter={args.max_outer_iterations}  seed={args.random_seed}")
+
     config = ModelConfig(
         max_outer_iterations=args.max_outer_iterations,
         random_seed=args.random_seed,
-        inference_backend=requested_backend,
-        **_basil_config_from_args(args),
     )
-    if requested_backend == InferenceBackend.BASIL:
-        log(
-            "basil controls: "
-            + f"l1_ratio={config.basil_l1_ratio} n_lambdas={config.basil_n_lambdas} "
-            + f"lambda_min_ratio={config.basil_lambda_min_ratio} strong_init={config.basil_strong_set_initial_size} "
-            + f"strong_growth={config.basil_strong_set_growth} batch={config.basil_batch_size}"
-        )
     dataset = load_dataset_from_files(
         genotype_path=args.genotypes,
         genotype_format=args.genotype_format,
@@ -256,7 +185,3 @@ def _infer_trait_type(targets) -> TraitType:
     if all(target_value in {0.0, 1.0} for target_value in unique_targets):
         return TraitType.BINARY
     return TraitType.QUANTITATIVE
-
-
-if __name__ == "__main__":
-    raise SystemExit(main())

@@ -14,7 +14,6 @@ import sv_pgs.runtime_policy as runtime_policy_module
 from sv_pgs import (
     BayesianPGS,
     BenchmarkConfig,
-    InferenceBackend,
     ModelConfig,
     TraitType,
     VariantClass,
@@ -303,7 +302,6 @@ def test_fit_stage_cache_survives_cache_backed_memmap_mtime_changes(tmp_path: Pa
 
     config = ModelConfig(
         trait_type=TraitType.BINARY,
-        inference_backend=InferenceBackend.VARIATIONAL_BAYES,
         max_outer_iterations=1,
         minimum_minor_allele_frequency=0.0,
         sample_space_preconditioner_rank=0,
@@ -481,7 +479,6 @@ def test_fit_resumes_from_variational_checkpoint(tmp_path, monkeypatch):
         BayesianPGS(
             ModelConfig(
                 trait_type=TraitType.BINARY,
-                inference_backend=InferenceBackend.VARIATIONAL_BAYES,
                 max_outer_iterations=2,
                 minimum_minor_allele_frequency=0.0,
             )
@@ -492,7 +489,6 @@ def test_fit_resumes_from_variational_checkpoint(tmp_path, monkeypatch):
     resumed_model = BayesianPGS(
         ModelConfig(
             trait_type=TraitType.BINARY,
-            inference_backend=InferenceBackend.VARIATIONAL_BAYES,
             max_outer_iterations=2,
             minimum_minor_allele_frequency=0.0,
         )
@@ -580,7 +576,6 @@ def test_fit_checkpoint_persists_basis_cache_during_interrupted_run(tmp_path, mo
         BayesianPGS(
             ModelConfig(
                 trait_type=TraitType.BINARY,
-                inference_backend=InferenceBackend.VARIATIONAL_BAYES,
                 max_outer_iterations=2,
                 minimum_minor_allele_frequency=0.0,
                 sample_space_preconditioner_rank=3,
@@ -646,7 +641,6 @@ def test_corrupt_variational_checkpoint_is_ignored(tmp_path, monkeypatch):
     model = BayesianPGS(
         ModelConfig(
             trait_type=TraitType.BINARY,
-            inference_backend=InferenceBackend.VARIATIONAL_BAYES,
             max_outer_iterations=1,
             minimum_minor_allele_frequency=0.0,
         )
@@ -768,7 +762,6 @@ def test_fit_uses_cohort_allele_frequencies_for_maf_filter(monkeypatch):
     ]
     config = ModelConfig(
         trait_type=TraitType.BINARY,
-        inference_backend=InferenceBackend.VARIATIONAL_BAYES,
         minimum_minor_allele_frequency=0.1,
         max_outer_iterations=1,
     )

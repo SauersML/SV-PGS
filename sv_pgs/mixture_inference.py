@@ -75,6 +75,7 @@ from sv_pgs.genotype import (
     DenseRawGenotypeMatrix,
     StandardizedGenotypeMatrix,
     _cupy_compute_dtype,
+    _gpu_free_bytes,
     _iter_standardized_gpu_batches,
     _try_import_cupy,
     _cupy_to_jax,
@@ -86,16 +87,47 @@ from sv_pgs.numeric import stable_sigmoid
 from sv_pgs.preprocessing import collapse_tie_groups
 from sv_pgs.progress import log, mem
 
-# GPU exact variant solve needs ~3× the matrix memory for intermediates
-# (X + weighted_X + projected_X). On 16 GB T4 with 4 GB matrix, only ~6 GB
-# free → can handle up to ~2000 variants before OOM. Use PCG for larger.
 # GPU exact variant-space Cholesky: form X^T W X via cuBLAS + Cholesky.
-# Cost: O(n p²) matmul + O(p³) Cholesky. With p=8192, n=97K on T4:
-#   matmul ~0.4s, Cholesky ~0.02s = 0.42s total.
-# This is 10-20x faster than sample-space CG (3-12s) and gives exact solutions
-# with no convergence issues. Limit at 10K: above this, float64 intermediates
-# for the covariate projection can exhaust T4's 16GB VRAM.
-GPU_EXACT_VARIANT_SOLVE_LIMIT = 10_000
+# Cost: O(n p²) matmul + O(p³) Cholesky. This is 10-20x faster than
+# sample-space CG and gives exact solutions with no convergence issues.
+# The maximum number of variants is determined dynamically from the actual
+# GPU memory available (see _gpu_exact_variant_solve_limit).
+_GPU_EXACT_VARIANT_SOLVE_LIMIT_FALLBACK = 10_000  # conservative CPU-only default
+
+
+def _gpu_exact_variant_solve_limit(cupy, sample_count: int) -> int:
+    """Max variants for GPU exact Cholesky based on actual GPU VRAM.
+
+    GPU exact Cholesky needs roughly 3x the matrix memory for intermediates:
+      - n x p float32 matrix (X):          4 * n * p bytes
+      - n x p float32 weighted copy:       4 * n * p bytes
+      - p x p float64 Gram matrix (X^TWX): 8 * p * p bytes
+    We budget 40% of free GPU memory for this.
+
+    Solving for p_max given a memory budget B and n samples:
+      B = 2 * 4 * n * p + 8 * p^2
+    Using the quadratic formula (keeping the positive root):
+      p_max = (-8n + sqrt(64n^2 + 32B)) / 16
+    """
+    if cupy is None:
+        return _GPU_EXACT_VARIANT_SOLVE_LIMIT_FALLBACK
+    try:
+        free = _gpu_free_bytes(cupy)
+    except Exception:
+        return _GPU_EXACT_VARIANT_SOLVE_LIMIT_FALLBACK
+    if free <= 0:
+        return _GPU_EXACT_VARIANT_SOLVE_LIMIT_FALLBACK
+
+    budget = free * 0.4
+    n = max(sample_count, 1)
+    # Solve: 8*n*p + 8*p^2 <= budget  (two n×p float32 matrices = 8*n*p bytes)
+    # 8*p^2 + 8*n*p - budget = 0  →  p = (-8n + sqrt(64n^2 + 32*budget)) / 16
+    import math
+    discriminant = 64.0 * n * n + 32.0 * budget
+    p_max = (-8.0 * n + math.sqrt(discriminant)) / 16.0
+    p_max = max(int(p_max), 0)
+    # Floor at fallback for very large GPUs (no reason to go below the old limit)
+    return max(p_max, _GPU_EXACT_VARIANT_SOLVE_LIMIT_FALLBACK) if p_max > 0 else _GPU_EXACT_VARIANT_SOLVE_LIMIT_FALLBACK
 
 
 @dataclass(slots=True)
@@ -4228,11 +4260,14 @@ def _use_gpu_exact_variant_solve(
     variant_count: int,
     exact_solver_matrix_limit: int,
 ) -> bool:
-    return (
-        genotype_matrix._cupy_cache is not None
-        and variant_count > exact_solver_matrix_limit
-        and variant_count <= GPU_EXACT_VARIANT_SOLVE_LIMIT
-    )
+    if genotype_matrix._cupy_cache is None:
+        return False
+    if variant_count <= exact_solver_matrix_limit:
+        return False
+    cupy = _try_import_cupy()
+    sample_count = genotype_matrix.shape[0]
+    limit = _gpu_exact_variant_solve_limit(cupy, sample_count)
+    return variant_count <= limit
 
 
 def _should_use_temporary_working_set(
@@ -4633,11 +4668,11 @@ def _restricted_posterior_state(
 
     # Solver hierarchy:
     # 1. Exact sample-space Cholesky when n is tiny (≤ exact_solver_matrix_limit)
-    # 2. GPU exact variant-space Cholesky when p ≤ GPU_EXACT_VARIANT_SOLVE_LIMIT and
-    #    matrix is GPU-cached. Forms X^T W X via cuBLAS syrk (~0.4s for p=8192) +
-    #    Cholesky (~0.02s). 10-20x faster than CG and gives exact solutions.
+    # 2. GPU exact variant-space Cholesky when p fits in GPU VRAM (dynamic limit).
+    #    Forms X^T W X via cuBLAS syrk + Cholesky. 10-20x faster than CG and
+    #    gives exact solutions.
     # 3. CPU exact variant-space Cholesky when p ≤ exact_solver_matrix_limit
-    # 4. GPU sample-space CG with Nyström preconditioner (for p > 16K)
+    # 4. GPU sample-space CG with Nyström preconditioner (for large p)
     # 5. CPU sample-space CG with Nyström
     # 6. Iterative variant-space CG — last resort
     use_variant_space = (not use_exact_sample) and (

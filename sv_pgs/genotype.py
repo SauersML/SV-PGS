@@ -36,7 +36,6 @@ LOCAL_INT8_STANDARDIZED_STREAMING_TARGET_BATCH_BYTES = 512_000_000
 # cache it in RAM.  This avoids re-reading from disk on every EM iteration
 # (typically 10-30 iterations), giving a huge speedup.
 MATERIALIZE_THRESHOLD_BYTES = 4_000_000_000  # 4 GB
-T4_SAFE_GPU_CACHE_BYTES = 4_500_000_000
 HYBRID_SPARSE_SUPPORT_THRESHOLD = 4_096
 HYBRID_SPARSE_MIN_VARIANT_COUNT = 64
 REDUCED_INT8_CACHE_FREE_SPACE_RESERVE_BYTES = 1_000_000_000
@@ -605,15 +604,33 @@ def _iter_standardized_gpu_batches(
         local_start = local_stop
 
 
+def _gpu_total_bytes(cupy) -> int:
+    """Return total GPU device memory in bytes, or 0 if unavailable."""
+    try:
+        _, total = cupy.cuda.runtime.memGetInfo()
+        return int(total)
+    except Exception:
+        return 0
+
+
+def _gpu_free_bytes(cupy) -> int:
+    """Return free GPU device memory in bytes, or 0 if unavailable."""
+    try:
+        free, _ = cupy.cuda.runtime.memGetInfo()
+        return int(free)
+    except Exception:
+        return 0
+
+
 def _gpu_materialization_budget_bytes(cupy) -> int:
     """Conservative GPU cache budget for a single-device training run.
 
-    The T4 path needs room for the cached genotype matrix plus iterative solver
-    workspace. Cap the cache at a T4-safe fixed ceiling and at most 60% of the
-    currently free device memory.
+    Returns 50% of currently free device memory. This leaves room for the
+    cached genotype matrix plus iterative solver workspace and other GPU
+    allocations.
     """
-    free_bytes, _ = cupy.cuda.runtime.memGetInfo()
-    return min(int(free_bytes * 0.6), T4_SAFE_GPU_CACHE_BYTES)
+    free_bytes = _gpu_free_bytes(cupy)
+    return int(free_bytes * 0.5)
 
 
 @dataclass(slots=True)

@@ -15,7 +15,7 @@ from sklearn.metrics import r2_score, roc_auc_score
 
 from sv_pgs import BayesianPGS
 from sv_pgs.artifact import _config_from_json
-from sv_pgs.config import InferenceBackend, ModelConfig, TraitType, VariantClass
+from sv_pgs.config import ModelConfig, TraitType, VariantClass
 from sv_pgs.cli import main
 from sv_pgs.data import VariantStatistics
 from sv_pgs.genotype import Int8RawGenotypeMatrix
@@ -156,9 +156,9 @@ def test_load_dataset_from_vcf_auto_detects_research_id_column(tmp_path: Path):
     np.testing.assert_allclose(dataset.genotypes, np.array([[1.0], [2.0]], dtype=np.float32))
 
 
-def test_artifact_config_requires_explicit_inference_backend():
-    with pytest.raises(ValueError, match="missing inference_backend"):
-        _config_from_json({"trait_type": TraitType.QUANTITATIVE.value})
+def test_artifact_config_parses_trait_type_without_backend():
+    config = _config_from_json({"trait_type": TraitType.QUANTITATIVE.value})
+    assert config.trait_type == TraitType.QUANTITATIVE
 
 
 def test_load_multi_vcf_dataset_from_files_concatenates_variants_across_chromosomes(tmp_path: Path):
@@ -1308,122 +1308,6 @@ def test_cli_infers_binary_trait_type(tmp_path: Path, monkeypatch: pytest.Monkey
     assert exit_code == 0
     summary_payload = json.loads((output_dir / "summary.json").read_text(encoding="utf-8"))
     assert summary_payload["trait_type"] == "binary"
-
-
-def test_cli_basil_backend_skips_gpu_runtime_check(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
-    vcf_path = tmp_path / "cohort.vcf"
-    vcf_path.write_text(
-        "\n".join(
-            [
-                "##fileformat=VCFv4.2",
-                "##contig=<ID=1>",
-                "##INFO=<ID=AF,Number=A,Type=Float,Description=\"Allele frequency\">",
-                "##FORMAT=<ID=GT,Number=1,Type=String,Description=\"Genotype\">",
-                "#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\ts1\ts2\ts3\ts4",
-                "1\t100\trs1\tA\tC\t50\tPASS\tAF=0.25\tGT\t0/0\t0/1\t1/1\t0/1",
-                "",
-            ]
-        ),
-        encoding="utf-8",
-    )
-    sample_table_path = tmp_path / "samples.tsv"
-    _write_table(
-        sample_table_path,
-        header=("sample_id", "target"),
-        rows=(
-            ("s1", "0"),
-            ("s2", "1"),
-            ("s3", "1"),
-            ("s4", "0"),
-        ),
-    )
-    output_dir = tmp_path / "run"
-    monkeypatch.setattr(
-        cli_module,
-        "require_full_gpu_runtime",
-        lambda: (_ for _ in ()).throw(AssertionError("GPU runtime should not be required for BASIL")),
-    )
-
-    exit_code = main(
-        [
-            "run",
-            "--genotypes",
-            str(vcf_path),
-            "--sample-table",
-            str(sample_table_path),
-            "--target-column",
-            "target",
-            "--output-dir",
-            str(output_dir),
-            "--max-outer-iterations",
-            "1",
-            "--inference-backend",
-            InferenceBackend.BASIL.value,
-        ]
-    )
-
-    assert exit_code == 0
-
-
-def test_cli_basil_backend_forwards_basil_controls(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
-    captured_config: ModelConfig | None = None
-
-    def _fake_load_dataset_from_files(**_kwargs):
-        return SimpleNamespace(
-            sample_ids=["s1", "s2"],
-            genotypes=np.zeros((2, 3), dtype=np.float32),
-            targets=np.array([0.0, 1.0], dtype=np.float32),
-        )
-
-    def _fake_run_training_pipeline(*, dataset, config, output_dir):
-        nonlocal captured_config
-        captured_config = config
-        output_dir.mkdir(parents=True, exist_ok=True)
-        return SimpleNamespace(
-            artifact_dir=output_dir / "artifact",
-            summary_path=output_dir / "summary.json",
-            predictions_path=output_dir / "predictions.tsv",
-            coefficients_path=output_dir / "coefficients.tsv",
-        )
-
-    monkeypatch.setattr(cli_module, "load_dataset_from_files", _fake_load_dataset_from_files)
-    monkeypatch.setattr(cli_module, "run_training_pipeline", _fake_run_training_pipeline)
-    monkeypatch.setattr(cli_module, "require_full_gpu_runtime", lambda: None)
-
-    exit_code = main(
-        [
-            "run",
-            "--genotypes",
-            str(tmp_path / "dummy.vcf"),
-            "--sample-table",
-            str(tmp_path / "dummy.tsv"),
-            "--target-column",
-            "target",
-            "--output-dir",
-            str(tmp_path / "run"),
-            "--inference-backend",
-            InferenceBackend.BASIL.value,
-            "--basil-n-lambdas",
-            "11",
-            "--basil-strong-set-initial-size",
-            "7",
-            "--basil-strong-set-growth",
-            "5",
-            "--basil-batch-size",
-            "3",
-            "--basil-kkt-tolerance",
-            "1e-5",
-        ]
-    )
-
-    assert exit_code == 0
-    assert captured_config is not None
-    assert captured_config.inference_backend == InferenceBackend.BASIL
-    assert captured_config.basil_n_lambdas == 11
-    assert captured_config.basil_strong_set_initial_size == 7
-    assert captured_config.basil_strong_set_growth == 5
-    assert captured_config.basil_batch_size == 3
-    assert captured_config.basil_kkt_tolerance == pytest.approx(1e-5)
 
 
 def test_vcf_cli_end_to_end_recovers_binary_signal_with_symbolic_svs(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):

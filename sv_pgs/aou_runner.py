@@ -14,7 +14,7 @@ import numpy as np
 import pandas as pd
 
 from sv_pgs.all_of_us import AllOfUsDiseaseRequest, prepare_all_of_us_disease_sample_table, resolve_disease_definition
-from sv_pgs.config import InferenceBackend, ModelConfig, TraitType
+from sv_pgs.config import ModelConfig, TraitType
 from sv_pgs.io import load_multi_vcf_dataset_from_files, run_training_pipeline
 from sv_pgs.progress import log, mem
 
@@ -379,18 +379,6 @@ def _build_aou_run_metadata(
     covariates: list[str],
     max_outer_iterations: int,
     random_seed: int,
-    inference_backend: InferenceBackend = InferenceBackend.BASIL,
-    basil_l1_ratio: float = _DEFAULT_MODEL_CONFIG.basil_l1_ratio,
-    basil_lambda_min_ratio: float = _DEFAULT_MODEL_CONFIG.basil_lambda_min_ratio,
-    basil_n_lambdas: int = _DEFAULT_MODEL_CONFIG.basil_n_lambdas,
-    basil_strong_set_initial_size: int = _DEFAULT_MODEL_CONFIG.basil_strong_set_initial_size,
-    basil_strong_set_growth: int = _DEFAULT_MODEL_CONFIG.basil_strong_set_growth,
-    basil_batch_size: int = _DEFAULT_MODEL_CONFIG.basil_batch_size,
-    basil_max_screening_passes: int = _DEFAULT_MODEL_CONFIG.basil_max_screening_passes,
-    basil_irls_max_iterations: int = _DEFAULT_MODEL_CONFIG.basil_irls_max_iterations,
-    basil_coordinate_descent_max_epochs: int = _DEFAULT_MODEL_CONFIG.basil_coordinate_descent_max_epochs,
-    basil_coordinate_descent_tolerance: float = _DEFAULT_MODEL_CONFIG.basil_coordinate_descent_tolerance,
-    basil_kkt_tolerance: float = _DEFAULT_MODEL_CONFIG.basil_kkt_tolerance,
 ) -> dict[str, object]:
     return {
         "disease": disease,
@@ -400,18 +388,6 @@ def _build_aou_run_metadata(
         "covariates": covariates,
         "max_outer_iterations": max_outer_iterations,
         "random_seed": random_seed,
-        "inference_backend": inference_backend.value,
-        "basil_l1_ratio": basil_l1_ratio,
-        "basil_lambda_min_ratio": basil_lambda_min_ratio,
-        "basil_n_lambdas": basil_n_lambdas,
-        "basil_strong_set_initial_size": basil_strong_set_initial_size,
-        "basil_strong_set_growth": basil_strong_set_growth,
-        "basil_batch_size": basil_batch_size,
-        "basil_max_screening_passes": basil_max_screening_passes,
-        "basil_irls_max_iterations": basil_irls_max_iterations,
-        "basil_coordinate_descent_max_epochs": basil_coordinate_descent_max_epochs,
-        "basil_coordinate_descent_tolerance": basil_coordinate_descent_tolerance,
-        "basil_kkt_tolerance": basil_kkt_tolerance,
     }
 
 DEFAULT_COVARIATES = [
@@ -430,18 +406,6 @@ def run_all_of_us(
     n_pcs: int = 10,
     max_outer_iterations: int = 30,
     random_seed: int = 0,
-    inference_backend: InferenceBackend = InferenceBackend.BASIL,
-    basil_l1_ratio: float = _DEFAULT_MODEL_CONFIG.basil_l1_ratio,
-    basil_lambda_min_ratio: float = _DEFAULT_MODEL_CONFIG.basil_lambda_min_ratio,
-    basil_n_lambdas: int = _DEFAULT_MODEL_CONFIG.basil_n_lambdas,
-    basil_strong_set_initial_size: int = _DEFAULT_MODEL_CONFIG.basil_strong_set_initial_size,
-    basil_strong_set_growth: int = _DEFAULT_MODEL_CONFIG.basil_strong_set_growth,
-    basil_batch_size: int = _DEFAULT_MODEL_CONFIG.basil_batch_size,
-    basil_max_screening_passes: int = _DEFAULT_MODEL_CONFIG.basil_max_screening_passes,
-    basil_irls_max_iterations: int = _DEFAULT_MODEL_CONFIG.basil_irls_max_iterations,
-    basil_coordinate_descent_max_epochs: int = _DEFAULT_MODEL_CONFIG.basil_coordinate_descent_max_epochs,
-    basil_coordinate_descent_tolerance: float = _DEFAULT_MODEL_CONFIG.basil_coordinate_descent_tolerance,
-    basil_kkt_tolerance: float = _DEFAULT_MODEL_CONFIG.basil_kkt_tolerance,
 ) -> None:
     """Full AoU pipeline: download requested chromosomes, merge them, and run one fit."""
     chromosomes = _validate_aou_chromosomes(chromosomes)
@@ -463,18 +427,6 @@ def run_all_of_us(
     config = ModelConfig(
         max_outer_iterations=max_outer_iterations,
         random_seed=random_seed,
-        inference_backend=inference_backend,
-        basil_l1_ratio=basil_l1_ratio,
-        basil_lambda_min_ratio=basil_lambda_min_ratio,
-        basil_n_lambdas=basil_n_lambdas,
-        basil_strong_set_initial_size=basil_strong_set_initial_size,
-        basil_strong_set_growth=basil_strong_set_growth,
-        basil_batch_size=basil_batch_size,
-        basil_max_screening_passes=basil_max_screening_passes,
-        basil_irls_max_iterations=basil_irls_max_iterations,
-        basil_coordinate_descent_max_epochs=basil_coordinate_descent_max_epochs,
-        basil_coordinate_descent_tolerance=basil_coordinate_descent_tolerance,
-        basil_kkt_tolerance=basil_kkt_tolerance,
     )
 
     # Migrate old VCF caches: VCFs were moved from work_dir to a shared cache dir,
@@ -626,18 +578,6 @@ def run_all_of_us(
         covariates=covariates,
         max_outer_iterations=max_outer_iterations,
         random_seed=random_seed,
-        inference_backend=inference_backend,
-        basil_l1_ratio=basil_l1_ratio,
-        basil_lambda_min_ratio=basil_lambda_min_ratio,
-        basil_n_lambdas=basil_n_lambdas,
-        basil_strong_set_initial_size=basil_strong_set_initial_size,
-        basil_strong_set_growth=basil_strong_set_growth,
-        basil_batch_size=basil_batch_size,
-        basil_max_screening_passes=basil_max_screening_passes,
-        basil_irls_max_iterations=basil_irls_max_iterations,
-        basil_coordinate_descent_max_epochs=basil_coordinate_descent_max_epochs,
-        basil_coordinate_descent_tolerance=basil_coordinate_descent_tolerance,
-        basil_kkt_tolerance=basil_kkt_tolerance,
     )
     if summary_path.exists():
         if run_metadata_path.exists():

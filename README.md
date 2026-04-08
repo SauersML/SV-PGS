@@ -2,10 +2,6 @@
 
 Bayesian polygenic scoring for structural variants. Fits a joint empirical-Bayes GLM on GPU via CuPy (cuBLAS) with JAX for element-wise ops.
 
-The training pipeline supports two inference backends:
-- `variational_bayes`: empirical-Bayes dense shrinkage model
-- `basil`: sparse elastic-net / lasso path via BASIL
-
 ## All of Us Quickstart
 
 **First-time setup** (installs uv + Python 3.12 + GPU dependencies):
@@ -62,10 +58,6 @@ uv run sv-pgs run \
   --target-column target \
   --covariate-column age \
   --covariate-column sex \
-  --inference-backend basil \
-  --basil-n-lambdas 128 \
-  --basil-strong-set-initial-size 8192 \
-  --basil-strong-set-growth 8192 \
   --output-dir results
 ```
 

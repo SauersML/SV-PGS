@@ -3,8 +3,11 @@ from __future__ import annotations
 from dataclasses import dataclass, replace
 
 from sv_pgs.config import ModelConfig
-from sv_pgs.genotype import RawGenotypeMatrix, _gpu_materialization_budget_bytes, _try_import_cupy
+from sv_pgs.genotype import RawGenotypeMatrix, _gpu_free_bytes, _gpu_materialization_budget_bytes, _try_import_cupy
 
+# Algorithmic limits — not GPU-memory-dependent.
+# The exact solver limit caps dense Cholesky factorizations on GPU to avoid
+# excessive O(p^3) cost. The preconditioner rank bounds the Nyström approximation.
 GPU_EXACT_SOLVER_LIMIT = 1_024
 GPU_PRECONDITIONER_RANK_LIMIT = 1_024
 GPU_FINAL_REFINEMENT_VARIANT_MULTIPLIER = 2

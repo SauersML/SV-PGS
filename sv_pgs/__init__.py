@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from sv_pgs.benchmark import run_benchmark_suite
-from sv_pgs.config import BenchmarkConfig, InferenceBackend, ModelConfig, TraitType, VariantClass
+from sv_pgs.config import BenchmarkConfig, ModelConfig, TraitType, VariantClass
 from sv_pgs.data import VariantRecord
 from sv_pgs.io import load_dataset_from_files, run_training_pipeline
 from sv_pgs.model import BayesianPGS
@@ -27,7 +27,6 @@ def __getattr__(name: str):
 __all__ = [
     "BayesianPGS",
     "BenchmarkConfig",
-    "InferenceBackend",
     "ModelConfig",
     "TraitType",
     "VariantClass",
