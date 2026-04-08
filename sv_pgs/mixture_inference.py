@@ -1480,12 +1480,19 @@ def _fit_collapsed_posterior(
 ) -> PosteriorState:
     log(f"    collapsed posterior: trait={trait_type.value}  n_variants={genotype_matrix.shape[1]}  n_samples={genotype_matrix.shape[0]}  sigma_e2={sigma_error2:.6f}  mem={mem()}")
     prior_variances = np.maximum(np.asarray(reduced_prior_variances, dtype=np.float64), 1e-8)
+    # Mirror the gpu_available check in _restricted_posterior_state so the
+    # solver-controls function knows whether GPU CG (cheap ~30ms/iter) will be used.
+    _collapsed_gpu_available = (
+        genotype_matrix._cupy_cache is not None
+        or _streaming_cupy_backend_available(genotype_matrix)
+    )
     posterior_solver_tolerance, posterior_maximum_linear_solver_iterations = _collapsed_posterior_solver_controls(
         genotype_matrix=genotype_matrix,
         solver_tolerance=config.linear_solver_tolerance,
         maximum_linear_solver_iterations=config.maximum_linear_solver_iterations,
         compute_logdet=compute_logdet,
         compute_beta_variance=compute_beta_variance,
+        gpu_enabled=_collapsed_gpu_available,
     )
     predictor_offset_array = (
         np.zeros(genotype_matrix.shape[0], dtype=np.float64)
@@ -1678,14 +1685,19 @@ def _binary_newton_solver_controls(
     *,
     solver_tolerance: float,
     maximum_linear_solver_iterations: int,
+    gpu_enabled: bool = False,
 ) -> tuple[float, int]:
     if genotype_matrix.shape[0] < 16_384 and genotype_matrix.shape[1] < 16_384:
         return solver_tolerance, maximum_linear_solver_iterations
     relaxed_tolerance = max(float(solver_tolerance), 1e-3)
-    relaxed_maximum_iterations = min(int(maximum_linear_solver_iterations), 128)
+    # GPU CG iterations are cheap (~30ms each with cached data), so allow more
+    # iterations before declaring convergence failure on large blocks.
+    iteration_cap = 512 if gpu_enabled else 128
+    relaxed_maximum_iterations = min(int(maximum_linear_solver_iterations), iteration_cap)
     if genotype_matrix.shape[1] > genotype_matrix.shape[0]:
         relaxed_tolerance = max(relaxed_tolerance, 5e-3)
-        relaxed_maximum_iterations = min(relaxed_maximum_iterations, 96)
+        wide_cap = 384 if gpu_enabled else 96
+        relaxed_maximum_iterations = min(relaxed_maximum_iterations, wide_cap)
     return relaxed_tolerance, max(relaxed_maximum_iterations, 16)
 
 
@@ -1696,19 +1708,25 @@ def _collapsed_posterior_solver_controls(
     maximum_linear_solver_iterations: int,
     compute_logdet: bool,
     compute_beta_variance: bool,
+    gpu_enabled: bool = False,
 ) -> tuple[float, int]:
     if compute_logdet and compute_beta_variance:
         return float(solver_tolerance), int(maximum_linear_solver_iterations)
     if genotype_matrix.shape[0] < 16_384 and genotype_matrix.shape[1] < 16_384:
         return float(solver_tolerance), int(maximum_linear_solver_iterations)
     relaxed_tolerance = max(float(solver_tolerance), 1e-4)
-    relaxed_maximum_iterations = min(int(maximum_linear_solver_iterations), 256)
+    # GPU CG iterations are cheap (~30ms each with cached data), so allow more
+    # iterations before declaring convergence failure on large blocks.
+    iteration_cap = 512 if gpu_enabled else 256
+    relaxed_maximum_iterations = min(int(maximum_linear_solver_iterations), iteration_cap)
     if genotype_matrix.shape[1] > genotype_matrix.shape[0]:
         relaxed_tolerance = max(relaxed_tolerance, 5e-4)
-        relaxed_maximum_iterations = min(relaxed_maximum_iterations, 192)
+        wide_cap = 384 if gpu_enabled else 192
+        relaxed_maximum_iterations = min(relaxed_maximum_iterations, wide_cap)
     if not compute_beta_variance:
         relaxed_tolerance = max(relaxed_tolerance, 1e-3)
-        relaxed_maximum_iterations = min(relaxed_maximum_iterations, 128)
+        no_variance_cap = 512 if gpu_enabled else 128
+        relaxed_maximum_iterations = min(relaxed_maximum_iterations, no_variance_cap)
     return relaxed_tolerance, max(relaxed_maximum_iterations, 32)
 
 
@@ -1925,10 +1943,17 @@ def _binary_posterior_state(
         target_array_gpu = cupy.asarray(target_array, dtype=compute_cp_dtype)
         prior_precision_gpu = cupy.asarray(prior_precision, dtype=compute_cp_dtype)
         predictor_offset_gpu = cupy.asarray(predictor_offset_array, dtype=compute_cp_dtype)
+    # Mirror the gpu_available check in _restricted_posterior_state so the
+    # solver-controls function knows whether GPU CG (cheap ~30ms/iter) will be used.
+    _newton_gpu_available = (
+        standardized_genotypes._cupy_cache is not None
+        or _streaming_cupy_backend_available(standardized_genotypes)
+    )
     inexact_solver_tolerance, inexact_maximum_linear_solver_iterations = _binary_newton_solver_controls(
         standardized_genotypes,
         solver_tolerance=solver_tolerance,
         maximum_linear_solver_iterations=maximum_linear_solver_iterations,
+        gpu_enabled=_newton_gpu_available,
     )
     import time as _time
     if streaming_gpu_binary_backend:
@@ -2714,6 +2739,31 @@ def _can_reuse_sample_space_preconditioner(
     )
 
 
+def _can_reuse_nystrom_factor(
+    cache_entry: _SampleSpacePreconditionerCacheEntry | None,
+    *,
+    batch_size: int,
+    rank: int,
+    prior_variances: np.ndarray,
+) -> bool:
+    """Check if the cached Nyström factor can be reused.
+
+    The Nyström factor depends only on X (genotype_matrix) and prior_variances,
+    NOT on diagonal_noise. So when only diagonal_noise changes (e.g. Polya-Gamma
+    weight updates during Newton iterations), we can skip the expensive Nyström
+    computation (~3s) and only rebuild the cheap diagonal + Woodbury bundle (~0.5s).
+    """
+    if cache_entry is None:
+        return False
+    if cache_entry.nystrom_factor_gpu is None:
+        return False
+    if cache_entry.batch_size != int(batch_size) or cache_entry.rank != int(rank):
+        return False
+    if _sample_space_preconditioner_stale(cache_entry):
+        return False
+    return _relative_array_change(prior_variances, cache_entry.prior_variances) <= 0.50
+
+
 def _update_sample_space_preconditioner_iterations(
     cache_entry: _SampleSpacePreconditionerCacheEntry | None,
     iterations: int,
@@ -2982,6 +3032,144 @@ def _get_cached_sample_space_cpu_preconditioner(
     return preconditioner, cache_entry
 
 
+def _sample_space_gpu_preconditioner_from_factor(
+    genotype_matrix: StandardizedGenotypeMatrix,
+    nystrom_factor_gpu,
+    diagonal_preconditioner: np.ndarray,
+):
+    """Build a GPU preconditioner from a pre-computed Nyström factor.
+
+    This is the fast path: skip the expensive Nyström factor computation (~3s)
+    and only rebuild the cheap diagonal + Woodbury bundle (~0.5s).
+    """
+    import cupy as cp
+    from cupyx.scipy.linalg import solve_triangular as cp_solve_triangular
+
+    compute_cp_dtype = _cupy_compute_dtype(cp)
+    diagonal_preconditioner = np.asarray(diagonal_preconditioner, dtype=np.float64)
+    diagonal_preconditioner_gpu = cp.asarray(diagonal_preconditioner, dtype=compute_cp_dtype)
+
+    gpu_cache_source = "full" if genotype_matrix._cupy_cache is not None else "streaming"
+    effective_rank = int(nystrom_factor_gpu.shape[1])
+    log(f"      sample-space preconditioner: GPU Nyström-Woodbury rank={effective_rank} source={gpu_cache_source} (factor reused)")
+    compute_bundle = _build_sample_space_low_rank_bundle_gpu(
+        nystrom_factor_gpu,
+        diagonal_preconditioner_gpu,
+        cp=cp,
+        bundle_dtype=compute_cp_dtype,
+    )
+    float64_bundle = None
+
+    def apply_low_rank(right_hand_side_gpu):
+        nonlocal float64_bundle
+        rhs_dtype = getattr(right_hand_side_gpu, "dtype", compute_cp_dtype)
+        if compute_cp_dtype != cp.float64 and rhs_dtype == cp.float64:
+            if float64_bundle is None:
+                float64_bundle = _build_sample_space_low_rank_bundle_gpu(
+                    nystrom_factor_gpu,
+                    cp.asarray(diagonal_preconditioner, dtype=cp.float64),
+                    cp=cp,
+                    bundle_dtype=cp.float64,
+                )
+            bundle = float64_bundle
+        else:
+            bundle = compute_bundle
+        return _apply_sample_space_low_rank_preconditioner_gpu(
+            right_hand_side_gpu,
+            bundle,
+            cp=cp,
+            solve_triangular_gpu=cp_solve_triangular,
+        )
+
+    return apply_low_rank
+
+
+def _sample_space_gpu_preconditioner_with_factor(
+    genotype_matrix: StandardizedGenotypeMatrix,
+    prior_variances: np.ndarray,
+    diagonal_noise: np.ndarray,
+    batch_size: int,
+    rank: int,
+    random_seed: int = 0,
+    diagonal_preconditioner: np.ndarray | None = None,
+):
+    """Build GPU preconditioner and return both the preconditioner and the Nyström factor.
+
+    Returns (preconditioner_callable, nystrom_factor_gpu_or_None).
+    """
+    import cupy as cp
+    from cupyx.scipy.linalg import solve_triangular as cp_solve_triangular
+
+    compute_cp_dtype = _cupy_compute_dtype(cp)
+    if diagonal_preconditioner is None:
+        diagonal_preconditioner = _sample_space_diagonal_preconditioner(
+            genotype_matrix=genotype_matrix,
+            prior_variances=prior_variances,
+            diagonal_noise=diagonal_noise,
+            batch_size=batch_size,
+        )
+    diagonal_preconditioner = np.asarray(diagonal_preconditioner, dtype=np.float64)
+    diagonal_preconditioner_gpu = cp.asarray(diagonal_preconditioner, dtype=compute_cp_dtype)
+
+    def apply_diagonal(right_hand_side_gpu):
+        rhs_dtype = getattr(right_hand_side_gpu, "dtype", compute_cp_dtype)
+        resolved_dtype = cp.float64 if compute_cp_dtype != cp.float64 and rhs_dtype == cp.float64 else compute_cp_dtype
+        right_hand_side_gpu = cp.asarray(right_hand_side_gpu, dtype=resolved_dtype)
+        diagonal_vector = diagonal_preconditioner_gpu.astype(resolved_dtype, copy=False)
+        if right_hand_side_gpu.ndim == 2:
+            return right_hand_side_gpu / diagonal_vector[:, None]
+        return right_hand_side_gpu / diagonal_vector
+
+    if rank <= 0:
+        return apply_diagonal, None
+    selected_rank = min(int(rank), int(genotype_matrix.shape[0]))
+    if selected_rank <= 0:
+        return apply_diagonal, None
+    low_rank_factor_gpu = _sample_space_nystrom_factor_gpu(
+        genotype_matrix=genotype_matrix,
+        prior_variances=prior_variances,
+        batch_size=batch_size,
+        rank=selected_rank,
+        random_seed=random_seed,
+    )
+    if low_rank_factor_gpu is None:
+        return apply_diagonal, None
+
+    gpu_cache_source = "full" if genotype_matrix._cupy_cache is not None else "streaming"
+    effective_rank = int(low_rank_factor_gpu.shape[1])
+    log(f"      sample-space preconditioner: GPU Nyström-Woodbury rank={effective_rank} source={gpu_cache_source}")
+    compute_bundle = _build_sample_space_low_rank_bundle_gpu(
+        low_rank_factor_gpu,
+        diagonal_preconditioner_gpu,
+        cp=cp,
+        bundle_dtype=compute_cp_dtype,
+    )
+    float64_bundle = None
+
+    def apply_low_rank(right_hand_side_gpu):
+        nonlocal float64_bundle
+        rhs_dtype = getattr(right_hand_side_gpu, "dtype", compute_cp_dtype)
+        if compute_cp_dtype != cp.float64 and rhs_dtype == cp.float64:
+            if float64_bundle is None:
+                float64_bundle = _build_sample_space_low_rank_bundle_gpu(
+                    low_rank_factor_gpu,
+                    cp.asarray(diagonal_preconditioner, dtype=cp.float64),
+                    cp=cp,
+                    bundle_dtype=cp.float64,
+                )
+            bundle = float64_bundle
+        else:
+            bundle = compute_bundle
+        return _apply_sample_space_low_rank_preconditioner_gpu(
+            right_hand_side_gpu,
+            bundle,
+            cp=cp,
+            solve_triangular_gpu=cp_solve_triangular,
+        )
+
+    return apply_low_rank, low_rank_factor_gpu
+
+
 def _get_cached_sample_space_gpu_preconditioner(
     genotype_matrix: StandardizedGenotypeMatrix,
     *,
@@ -3001,21 +3189,45 @@ def _get_cached_sample_space_gpu_preconditioner(
         diagonal_noise=diagonal_noise,
     ):
         return cache_entry.preconditioner, cache_entry
+
+    # Check if we can reuse the expensive Nyström factor (depends on X and
+    # prior_variances only) and just rebuild the cheap diagonal + Woodbury bundle
+    # (depends on diagonal_noise). This is the common case during Newton iterations
+    # where only Polya-Gamma weights change.
+    reuse_nystrom = _can_reuse_nystrom_factor(
+        cache_entry,
+        batch_size=batch_size,
+        rank=rank,
+        prior_variances=prior_variances,
+    )
+
     diagonal_preconditioner = _sample_space_diagonal_preconditioner(
         genotype_matrix=genotype_matrix,
         prior_variances=prior_variances,
         diagonal_noise=diagonal_noise,
         batch_size=batch_size,
     )
-    preconditioner = _sample_space_gpu_preconditioner(
-        genotype_matrix=genotype_matrix,
-        prior_variances=prior_variances,
-        diagonal_noise=diagonal_noise,
-        batch_size=batch_size,
-        rank=rank,
-        random_seed=random_seed,
-        diagonal_preconditioner=diagonal_preconditioner,
-    )
+
+    if reuse_nystrom:
+        # Fast path: reuse cached Nyström factor, only rebuild diagonal + Woodbury
+        preconditioner = _sample_space_gpu_preconditioner_from_factor(
+            genotype_matrix=genotype_matrix,
+            nystrom_factor_gpu=cache_entry.nystrom_factor_gpu,
+            diagonal_preconditioner=diagonal_preconditioner,
+        )
+        nystrom_factor_gpu = cache_entry.nystrom_factor_gpu
+    else:
+        # Slow path: rebuild everything including the expensive Nyström factor
+        preconditioner, nystrom_factor_gpu = _sample_space_gpu_preconditioner_with_factor(
+            genotype_matrix=genotype_matrix,
+            prior_variances=prior_variances,
+            diagonal_noise=diagonal_noise,
+            batch_size=batch_size,
+            rank=rank,
+            random_seed=random_seed,
+            diagonal_preconditioner=diagonal_preconditioner,
+        )
+
     cache_entry = _SampleSpacePreconditionerCacheEntry(
         batch_size=int(batch_size),
         rank=int(rank),
@@ -3024,6 +3236,7 @@ def _get_cached_sample_space_gpu_preconditioner(
         diagonal_noise=np.asarray(diagonal_noise, dtype=np.float64).copy(),
         diagonal_preconditioner=np.asarray(diagonal_preconditioner, dtype=np.float64).copy(),
         preconditioner=preconditioner,
+        nystrom_factor_gpu=nystrom_factor_gpu,
     )
     genotype_matrix._sample_space_gpu_preconditioner_cache = cache_entry
     return preconditioner, cache_entry
