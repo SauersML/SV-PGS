@@ -53,6 +53,7 @@ The algorithm iterates three steps until convergence:
 from __future__ import annotations
 
 from dataclasses import dataclass, fields as dataclass_fields
+import gc
 import hashlib
 import json
 import time
@@ -119,6 +120,7 @@ class _SampleSpacePreconditionerCacheEntry:
     preconditioner: Any
     previous_iterations: int | None = None
     last_iterations: int | None = None
+    nystrom_factor_gpu: Any = None  # cached GPU Nyström factor (cupy array)
 
 
 @dataclass(slots=True)
@@ -957,6 +959,17 @@ def fit_variational_em(
                 # Free GPU memory for this block before next iteration
                 block_genotypes._cupy_cache = None
                 del block_genotypes
+                # Clear preconditioner caches on the parent genotype_matrix.
+                # Each block builds its own preconditioner from a different variant
+                # subset, so these caches are never reused across blocks.  Without
+                # this the Nyström cache (~190 MB per rebuild) accumulates on the
+                # parent object and is not released until the epoch ends.
+                genotype_matrix._sample_space_gpu_preconditioner_cache = None
+                genotype_matrix._sample_space_cpu_preconditioner_cache = None
+                # Periodic GC to reclaim any cyclic garbage built up over blocks.
+                if block_count % 5 == 0:
+                    gc.collect()
+                log(f"    block {block_count}/{n_blocks} done  mem={mem()}")
                 # Intra-epoch checkpoint every 10 blocks so crashes don't lose progress
                 if checkpoint_callback is not None and step_index % 10 == 0:
                     checkpoint_callback(_build_checkpoint(outer_iteration))
@@ -1957,6 +1970,13 @@ def _binary_posterior_state(
         + f"max_iter={max_iterations}  mem={mem()}"
     )
     final_weights = _binary_expected_polya_gamma_weights(current_linear_predictor, minimum_weight)
+    # Best-objective tracking for stall detection.
+    best_objective = current_objective
+    best_parameters = parameters.copy()
+    best_linear_predictor = current_linear_predictor.copy()
+    best_linear_predictor_gpu = current_linear_predictor_gpu if streaming_gpu_binary_backend else None
+    best_weights = final_weights.copy()
+    stall_count = 0
     _binary_newton_iters_used = 0
     for iteration_index in range(max_iterations):
         _binary_newton_iters_used = iteration_index + 1
@@ -2046,6 +2066,30 @@ def _binary_posterior_state(
             current_linear_predictor_gpu = updated_linear_predictor_gpu
         current_objective = updated_objective
         final_weights = current_weights
+        # Stall detection: track whether the objective has improved.
+        if updated_objective > best_objective:
+            best_objective = updated_objective
+            best_parameters = parameters.copy()
+            best_linear_predictor = current_linear_predictor.copy()
+            best_linear_predictor_gpu = current_linear_predictor_gpu if streaming_gpu_binary_backend else None
+            best_weights = final_weights.copy()
+            stall_count = 0
+        else:
+            stall_count += 1
+            if stall_count >= 3:
+                log(
+                    f"      binary stall-break at iter {iteration_index + 1}: "
+                    f"objective has not improved for {stall_count} consecutive iterations "
+                    f"(best={best_objective:.4f}, current={updated_objective:.4f}), "
+                    f"reverting to best-seen state"
+                )
+                parameters = best_parameters
+                current_linear_predictor = best_linear_predictor
+                if streaming_gpu_binary_backend:
+                    current_linear_predictor_gpu = best_linear_predictor_gpu
+                current_objective = best_objective
+                final_weights = best_weights
+                break
         if relative_predictor_step <= gradient_tolerance or max(relative_parameter_step, relative_predictor_step) <= gradient_tolerance:
             log(
                 f"      binary converged at iter {iteration_index + 1}: "
