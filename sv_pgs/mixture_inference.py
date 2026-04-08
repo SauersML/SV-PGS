@@ -869,8 +869,8 @@ def fit_variational_em(
                         alpha_init=np.zeros(0, dtype=np.float64),
                         beta_init=block_beta_previous,
                         minimum_weight=config.polya_gamma_minimum_weight,
-                        max_iterations=config.max_inner_newton_iterations,
-                        gradient_tolerance=config.newton_gradient_tolerance,
+                        max_iterations=min(config.max_inner_newton_iterations, 8),  # stochastic blocks need approximate solutions
+                        gradient_tolerance=max(config.newton_gradient_tolerance, 1e-4),  # relaxed for stochastic
                         initial_damping=config.trust_region_initial_damping,
                         damping_increase_factor=config.trust_region_damping_increase_factor,
                         damping_decrease_factor=config.trust_region_damping_decrease_factor,
