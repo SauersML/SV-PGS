@@ -2635,9 +2635,14 @@ def _can_reuse_sample_space_preconditioner(
         return False
     if _sample_space_preconditioner_stale(cache_entry):
         return False
+    # Relaxed threshold (50%) — the preconditioner doesn't need to be exact,
+    # just a reasonable approximation. Within Newton iterations for binary traits,
+    # the Polya-Gamma weights change significantly but the preconditioner from
+    # the previous iteration is still a good starting point. Rebuilding costs
+    # ~5s per Newton step; reusing saves ~30s per block.
     return (
-        _relative_array_change(prior_variances, cache_entry.prior_variances) <= 0.15
-        and _relative_array_change(diagonal_noise, cache_entry.diagonal_noise) <= 0.15
+        _relative_array_change(prior_variances, cache_entry.prior_variances) <= 0.50
+        and _relative_array_change(diagonal_noise, cache_entry.diagonal_noise) <= 0.50
     )
 
 
