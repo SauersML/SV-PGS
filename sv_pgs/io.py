@@ -512,9 +512,12 @@ def _fast_mmap_row_reindex(matrix: np.ndarray, row_indices: np.ndarray) -> np.nd
 
     If all rows are kept in identity order, skip reindexing entirely.
 
-    If a true subset is needed, read columns in batches (contiguous in
-    F-order) to avoid catastrophic random disk access on column-major mmaps.
+    If a true subset is needed, write to a temporary mmap file (not RAM)
+    and read columns in batches to avoid catastrophic random disk access
+    on column-major mmaps.  The temp-mmap approach prevents OOM when the
+    output matrix is large (e.g. 97K × 142K int8 = 13 GB).
     """
+    import tempfile
     resolved_row_indices = np.asarray(row_indices, dtype=np.intp)
     n_rows_out = len(row_indices)
     n_cols = matrix.shape[1]
@@ -523,17 +526,28 @@ def _fast_mmap_row_reindex(matrix: np.ndarray, row_indices: np.ndarray) -> np.nd
         np.arange(matrix.shape[0], dtype=np.intp),
     ):
         return matrix
-    log(f"    reindexing {matrix.shape[0]:,} → {n_rows_out:,} samples...")
-    result = np.empty((n_rows_out, n_cols), dtype=matrix.dtype, order="F")
-    batch_size = 2048
+    output_bytes = int(n_rows_out) * int(n_cols) * int(matrix.dtype.itemsize)
+    log(f"    reindexing {matrix.shape[0]:,} → {n_rows_out:,} samples ({output_bytes / 1e9:.1f} GB)...")
+    # Use a temporary mmap file for large outputs to avoid OOM.
+    if output_bytes > 1_000_000_000:
+        tmp_fd, tmp_path = tempfile.mkstemp(suffix=".reindex.npy")
+        os.close(tmp_fd)
+        result = np.memmap(tmp_path, dtype=matrix.dtype, mode="w+", shape=(n_rows_out, n_cols), order="F")
+        log(f"    using temp mmap: {tmp_path}")
+    else:
+        tmp_path = None
+        result = np.empty((n_rows_out, n_cols), dtype=matrix.dtype, order="F")
+    batch_size = 4096
     n_batches = (n_cols + batch_size - 1) // batch_size
     for batch_idx in range(n_batches):
         start = batch_idx * batch_size
         end = min(start + batch_size, n_cols)
         col_batch = np.array(matrix[:, start:end])
         result[:, start:end] = col_batch[resolved_row_indices, :]
-        if batch_idx % 20 == 0 or batch_idx == n_batches - 1:
+        if batch_idx % 10 == 0 or batch_idx == n_batches - 1:
             log(f"    reindexing: {end:,}/{n_cols:,} columns ({100*end/n_cols:.0f}%)  mem={mem()}")
+    if tmp_path is not None:
+        result.flush()
     return result
 
 
@@ -596,6 +610,18 @@ def load_multi_vcf_dataset_from_files(
         context="genotype source",
     )
     keep_sample_indices = np.asarray(aligned_sample_indices, dtype=np.intp)
+    # Reorder the sample table to match VCF sample order so genotype matrices
+    # can stay as zero-copy mmaps.  This is the same logic the single-VCF path
+    # uses (_reorder_sample_table_by_source_index) — without it, every
+    # chromosome matrix (~13 GB) gets copied into RAM just to permute rows,
+    # which OOM-kills the process before the EM loop even starts.
+    sample_table, keep_sample_indices_reordered, reordered = _reorder_sample_table_by_source_index(
+        sample_table=sample_table,
+        source_indices=keep_sample_indices,
+    )
+    keep_sample_indices = np.asarray(keep_sample_indices_reordered, dtype=np.intp)
+    if reordered:
+        log(f"  reordered sample table to match VCF order ({len(keep_sample_indices):,} samples) — genotype matrices stay as zero-copy mmaps")
     log(f"aligned {len(aligned_sample_indices)} phenotype rows against {len(source_sample_ids)} genotype samples")
 
     n_chromosomes = len(source_paths)
@@ -604,24 +630,6 @@ def load_multi_vcf_dataset_from_files(
         len(keep_sample_indices) == len(source_sample_ids)
         and np.array_equal(keep_sample_indices, expected_source_order)
     )
-    # If all samples are present but in different order, reorder the sample table
-    # (tiny: ~1 MB) instead of reindexing every chromosome matrix (~13 GB each).
-    if (
-        not skip_subset
-        and len(keep_sample_indices) == len(source_sample_ids)
-        and len(np.unique(keep_sample_indices)) == len(source_sample_ids)
-    ):
-        log("  samples are a permutation — reordering sample table instead of genotype matrices")
-        # keep_sample_indices[i] = VCF row for sample_table row i.
-        # We need the inverse: for VCF row j, which sample_table row?
-        inverse_perm = np.argsort(keep_sample_indices)
-        sample_table = _SampleTable(
-            sample_ids=[sample_table.sample_ids[int(i)] for i in inverse_perm],
-            targets=np.asarray(sample_table.targets, dtype=np.float64)[inverse_perm],
-            covariates=np.asarray(sample_table.covariates, dtype=np.float64)[inverse_perm],
-        )
-        skip_subset = True
-        log(f"  sample table reordered to match VCF order ({len(inverse_perm):,} samples)")
     # Verify sample IDs match for first chromosome only
     log(f"  verifying sample IDs for {source_paths[0].name}...")
     first_sample_ids = _read_vcf_sample_ids(source_paths[0])
