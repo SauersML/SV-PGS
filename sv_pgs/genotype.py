@@ -483,15 +483,62 @@ class ConcatenatedRawGenotypeMatrix(RawGenotypeMatrix):
         return matrix
 
 
+_cupy_module = None
+_cupy_checked = False
+
+
 def _try_import_cupy() -> Any | None:
-    """Import CuPy if available (GPU matmul via cuBLAS, bypassing JAX/XLA)."""
+    """Import CuPy, caching the result. Returns None only during tests."""
+    global _cupy_module, _cupy_checked
+    if _cupy_checked:
+        return _cupy_module
+    _cupy_checked = True
     try:
         import cupy
         if cupy.cuda.runtime.getDeviceCount() > 0:
+            _cupy_module = cupy
             return cupy
     except Exception:
         pass
+    _cupy_module = None
     return None
+
+
+def require_gpu() -> Any:
+    """Validate GPU+CuPy at pipeline entry. Crash loudly if GPU exists but CuPy fails.
+
+    Returns the CuPy module if available, None if no GPU hardware at all.
+    """
+    from sv_pgs.progress import log
+    # Check if NVIDIA GPU hardware exists
+    import shutil
+    import subprocess
+    nvidia_smi = shutil.which("nvidia-smi")
+    has_gpu_hardware = False
+    if nvidia_smi is not None:
+        try:
+            result = subprocess.run(
+                [nvidia_smi, "--query-gpu=name", "--format=csv,noheader"],
+                capture_output=True, text=True, timeout=5.0, check=False,
+            )
+            has_gpu_hardware = result.returncode == 0 and bool(result.stdout.strip())
+        except Exception:
+            pass
+    if not has_gpu_hardware:
+        log("  no NVIDIA GPU detected — running CPU-only (this will be slow)")
+        return None
+    # GPU exists — CuPy MUST work
+    cupy = _try_import_cupy()
+    if cupy is None:
+        raise RuntimeError(
+            "NVIDIA GPU detected but CuPy is not working. "
+            "Install with: uv pip install cupy-cuda12x  "
+            "(or cupy-cuda11x for CUDA 11). "
+            "Verify: python -c 'import cupy; print(cupy.cuda.runtime.memGetInfo())'"
+        )
+    free_bytes, total_bytes = cupy.cuda.runtime.memGetInfo()
+    log(f"  GPU verified: {total_bytes / 1e9:.1f} GB total, {free_bytes / 1e9:.1f} GB free")
+    return cupy
 
 
 def _as_gpu_compute_jax(array) -> jnp.ndarray:

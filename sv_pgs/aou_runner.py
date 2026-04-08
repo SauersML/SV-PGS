@@ -421,6 +421,9 @@ def run_all_of_us(
     log_path = work_dir / f"{disease_def.canonical_name}.{time.strftime('%Y%m%d_%H%M%S')}.log"
     set_log_file(log_path)
 
+    from sv_pgs.genotype import require_gpu
+    require_gpu()
+
     log(f"=== ALL OF US PIPELINE ===  disease={disease_def.canonical_name}  chromosomes={chromosomes}  n_pcs={n_pcs}  cpus={os.cpu_count()}")
     log(f"  ICD-9: {disease_def.icd9_prefixes}  ICD-10: {disease_def.icd10_prefixes}")
     log(f"  output: {work_dir}")

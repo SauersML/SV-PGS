@@ -475,6 +475,8 @@ class BayesianPGS:
         validation_data: tuple[RawGenotypeMatrix | np.ndarray, np.ndarray, np.ndarray] | None = None,
         variant_stats: VariantStatistics | None = None,
     ) -> BayesianPGS:
+        from sv_pgs.genotype import require_gpu
+        require_gpu()
         log(f"=== MODEL FIT START ===  genotypes={genotypes.shape}  covariates={covariates.shape}  targets={targets.shape}  pre_computed_stats={'YES' if variant_stats else 'NO'}")
         raw_genotype_matrix = as_raw_genotype_matrix(genotypes)
         _validate_fit_inputs(
