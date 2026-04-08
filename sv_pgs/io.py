@@ -1284,15 +1284,24 @@ def _load_variant_metadata(path: Path) -> list[_VariantDefaults]:
         import pickle
         with open(path, "rb") as fh:
             legacy_variants = pickle.load(fh)
+
+        def _legacy_field(rec: object, name: str, default: object = "") -> object:
+            val = getattr(rec, name, None)
+            if val is not None:
+                return val
+            if isinstance(rec, dict):
+                return rec.get(name, default)
+            return default
+
         return [
             _VariantDefaults(
-                variant_id=str(getattr(rec, "variant_id", rec.get("variant_id", ""))),
+                variant_id=str(_legacy_field(rec, "variant_id", "")),
                 variant_class=_classify_variant_from_record(rec),
-                chromosome=str(getattr(rec, "chromosome", rec.get("chromosome", ""))),
-                position=int(getattr(rec, "position", rec.get("position", 0))),
-                length=float(getattr(rec, "length", rec.get("length", 0.0))),
-                allele_frequency=float(getattr(rec, "allele_frequency", rec.get("allele_frequency", 0.0))),
-                quality=float(getattr(rec, "quality", rec.get("quality", 0.0))),
+                chromosome=str(_legacy_field(rec, "chromosome", "")),
+                position=int(_legacy_field(rec, "position", 0)),
+                length=float(_legacy_field(rec, "length", 0.0)),
+                allele_frequency=float(_legacy_field(rec, "allele_frequency", 0.0)),
+                quality=float(_legacy_field(rec, "quality", 0.0)),
             )
             for rec in legacy_variants
         ]
