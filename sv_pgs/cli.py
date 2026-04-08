@@ -86,7 +86,11 @@ def build_parser() -> argparse.ArgumentParser:
     )
     run_parser.add_argument(
         "--variant-metadata",
-        help="Optional CSV or TSV keyed by variant_id with VariantRecord fields.",
+        help=(
+            "Optional CSV or TSV keyed by variant_id. Supports prior_binary__, "
+            "prior_continuous__, prior_categorical__, prior_membership__, "
+            "prior_nested__, and prior_nested_membership__ annotation columns."
+        ),
     )
     run_parser.add_argument("--output-dir", required=True, help="Directory for artifact and result tables.")
     run_parser.add_argument("--max-outer-iterations", type=int, default=30)

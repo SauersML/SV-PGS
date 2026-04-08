@@ -49,6 +49,7 @@ def _select_active_variant_indices_fast(
 @dataclass(slots=True)
 class FittedState:
     variant_records: list[VariantRecord]
+    full_variant_records: list[VariantRecord]
     full_variant_metadata: VariantMetadataTable
     active_variant_indices: np.ndarray
     preprocessor: Preprocessor
@@ -65,6 +66,8 @@ class FittedState:
 
     def __post_init__(self) -> None:
         variant_count = len(self.full_variant_metadata)
+        if len(self.full_variant_records) != variant_count:
+            raise ValueError("full_variant_records must align with full_variant_metadata.")
         if self.full_coefficients.shape != (variant_count,):
             raise ValueError("full_coefficients must align with full_variant_metadata.")
         if self.preprocessor.means.shape != (variant_count,):
@@ -539,6 +542,12 @@ class BayesianPGS:
             variant_records=variant_records,
             variant_stats=variant_stats,
         )
+        full_variant_records = [
+            record
+            if isinstance(record, VariantRecord)
+            else normalize_variant_records([record])[0]
+            for record in variant_records
+        ]
         tuned_config, tuning_summary = _runtime_tuned_config_for_fit(
             config=self.config,
             genotype_matrix=raw_genotype_matrix,
@@ -549,7 +558,7 @@ class BayesianPGS:
         covariate_matrix = self._with_intercept(covariates)
         total_variant_count = len(variant_records)
         log(f"building variant metadata for {total_variant_count:,} records...  mem={mem()}")
-        full_variant_metadata = _variant_metadata_from_records(variant_records)
+        full_variant_metadata = _variant_metadata_from_records(full_variant_records)
         log(f"variant metadata ready  mem={mem()}")
 
         # Use pre-computed stats if available (saves 3 full data passes)
@@ -637,6 +646,7 @@ class BayesianPGS:
             )
             self.state = FittedState(
                 variant_records=[],
+                full_variant_records=full_variant_records,
                 full_variant_metadata=full_variant_metadata,
                 active_variant_indices=np.zeros(0, dtype=np.int32),
                 preprocessor=preprocessor,
@@ -651,9 +661,6 @@ class BayesianPGS:
                 training_covariate_score=training_linear_predictor.copy(),
                 training_linear_predictor=training_linear_predictor,
             )
-            # Free the full variant_records list — no active variants means we stored []
-            # in FittedState, so the original 1.68M-element list is no longer needed.
-            del variant_records
             if fit_stage_cache_paths is not None:
                 _clear_variational_checkpoint(fit_stage_cache_paths)
             log(f"coefficients: 0 non-zero out of {total_variant_count} total")
@@ -664,7 +671,7 @@ class BayesianPGS:
         # This saves ~840 MB of Python object overhead
         log(f"creating training records for {len(active_variant_indices)} active variants...")
         active_selection_records = normalize_variant_records(
-            [variant_records[int(i)] for i in active_variant_indices]
+            [full_variant_records[int(i)] for i in active_variant_indices]
         )
         active_stats = VariantStatistics(
             means=variant_stats.means[active_variant_indices],
@@ -673,9 +680,7 @@ class BayesianPGS:
             support_counts=variant_stats.support_counts[active_variant_indices],
         )
         active_records = _training_records_from_stats(active_selection_records, active_stats)
-        # Free the full variant_records list (1.68M objects, ~840 MB) — we've extracted
-        # the active subset into active_records and no longer need the original reference.
-        del active_selection_records, active_stats, variant_records
+        del active_selection_records, active_stats
         import gc
         gc.collect()
         log(f"active training records created: {len(active_records)}  mem={mem()}")
@@ -850,6 +855,7 @@ class BayesianPGS:
 
         self.state = FittedState(
             variant_records=active_records,
+            full_variant_records=full_variant_records,
             full_variant_metadata=full_variant_metadata,
             active_variant_indices=active_variant_indices,
             preprocessor=preprocessor,
@@ -923,7 +929,7 @@ class BayesianPGS:
         fitted_state = self._require_state()
         artifact = ModelArtifact(
             config=self.config,
-            variant_metadata=fitted_state.full_variant_metadata,
+            records=fitted_state.full_variant_records,
             means=fitted_state.preprocessor.means,
             scales=fitted_state.preprocessor.scales,
             alpha=fitted_state.fit_result.alpha,
@@ -952,6 +958,7 @@ class BayesianPGS:
         nonzero_scales = np.asarray(artifact.scales[nonzero_coefficient_indices], dtype=np.float32)
         loaded_model.state = FittedState(
             variant_records=[],
+            full_variant_records=artifact.records,
             full_variant_metadata=artifact.variant_metadata,
             active_variant_indices=np.where(artifact.tie_map.original_to_reduced >= 0)[0].astype(np.int32),
             preprocessor=Preprocessor(means=artifact.means, scales=artifact.scales),

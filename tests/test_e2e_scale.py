@@ -5,7 +5,7 @@ from pathlib import Path
 import numpy as np
 from sklearn.metrics import r2_score, roc_auc_score
 
-from sv_pgs.artifact import ModelArtifact, VariantMetadataTable, load_artifact, save_artifact
+from sv_pgs.artifact import ModelArtifact, load_artifact, save_artifact
 from sv_pgs.benchmark import run_benchmark_suite
 from sv_pgs.config import BenchmarkConfig, ModelConfig, TraitType, VariantClass
 from sv_pgs.data import TieGroup, TieMap, VariantRecord
@@ -291,10 +291,24 @@ def test_large_scale_benchmark_and_quantitative_fit():
 def test_artifact_roundtrip_preserves_full_variant_metadata(tmp_path: Path):
     artifact = ModelArtifact(
         config=ModelConfig(),
-        variant_metadata=VariantMetadataTable(
-            variant_ids=["latent_0", "latent_1"],
-            variant_classes=[VariantClass.OTHER_COMPLEX_SV, VariantClass.SNV],
-        ),
+        records=[
+            VariantRecord(
+                variant_id="latent_0",
+                variant_class=VariantClass.OTHER_COMPLEX_SV,
+                chromosome="1",
+                position=100,
+                prior_categorical_features={"functional_state": "lof"},
+                prior_nested_features={"gene_context": ("protein_coding", "exon")},
+            ),
+            VariantRecord(
+                variant_id="latent_1",
+                variant_class=VariantClass.SNV,
+                chromosome="1",
+                position=200,
+                prior_membership_features={"regulatory_mix": {"enhancer": 0.25, "promoter": 0.75}},
+                prior_continuous_features={"constraint_score": 0.8},
+            ),
+        ],
         means=np.zeros(2, dtype=np.float32),
         scales=np.ones(2, dtype=np.float32),
         alpha=np.zeros(2, dtype=np.float32),
@@ -332,3 +346,9 @@ def test_artifact_roundtrip_preserves_full_variant_metadata(tmp_path: Path):
         VariantClass.OTHER_COMPLEX_SV,
         VariantClass.SNV,
     ]
+    assert restored_artifact.records[0].prior_categorical_features == {"functional_state": "lof"}
+    assert restored_artifact.records[0].prior_nested_features == {"gene_context": ("protein_coding", "exon")}
+    assert restored_artifact.records[1].prior_membership_features == {
+        "regulatory_mix": {"enhancer": 0.25, "promoter": 0.75}
+    }
+    assert restored_artifact.records[1].prior_continuous_features == {"constraint_score": 0.8}

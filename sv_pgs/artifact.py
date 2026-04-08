@@ -1,14 +1,14 @@
 from __future__ import annotations
 
 import json
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
 
 import numpy as np
 
 from sv_pgs.config import ModelConfig, TraitType, VariantClass
-from sv_pgs.data import TieGroup, TieMap
+from sv_pgs.data import VariantRecord, TieGroup, TieMap, normalize_variant_records
 
 
 @dataclass(slots=True)
@@ -32,7 +32,7 @@ class VariantMetadataTable:
 @dataclass(slots=True)
 class ModelArtifact:
     config: ModelConfig
-    variant_metadata: VariantMetadataTable
+    records: list[VariantRecord]
     means: np.ndarray
     scales: np.ndarray
     alpha: np.ndarray
@@ -49,8 +49,14 @@ class ModelArtifact:
     scale_model_feature_names: list[str]
     objective_history: list[float]
     validation_history: list[float]
+    variant_metadata: VariantMetadataTable = field(init=False)
 
     def __post_init__(self) -> None:
+        self.records = normalize_variant_records(self.records)
+        self.variant_metadata = VariantMetadataTable(
+            variant_ids=[record.variant_id for record in self.records],
+            variant_classes=[record.variant_class for record in self.records],
+        )
         variant_count = len(self.variant_metadata)
         if self.means.shape != (variant_count,):
             raise ValueError("Artifact means must align with full variant metadata.")
@@ -81,13 +87,40 @@ def save_artifact(path: str | Path, artifact: ModelArtifact) -> None:
 
     payload = {
         "config": _config_to_json(artifact.config),
-        "variant_metadata": {
-            "variant_ids": list(artifact.variant_metadata.variant_ids),
-            "variant_classes": [
-                variant_class.value
-                for variant_class in artifact.variant_metadata.variant_classes
-            ],
-        },
+        "records": [
+            {
+                "variant_id": record.variant_id,
+                "variant_class": record.variant_class.value,
+                "chromosome": record.chromosome,
+                "position": record.position,
+                "length": record.length,
+                "allele_frequency": record.allele_frequency,
+                "quality": record.quality,
+                "training_support": record.training_support,
+                "is_repeat": record.is_repeat,
+                "is_copy_number": record.is_copy_number,
+                "prior_binary_features": dict(record.prior_binary_features),
+                "prior_continuous_features": dict(record.prior_continuous_features),
+                "prior_categorical_features": dict(record.prior_categorical_features),
+                "prior_membership_features": {
+                    feature_name: dict(feature_memberships)
+                    for feature_name, feature_memberships in record.prior_membership_features.items()
+                },
+                "prior_nested_features": {
+                    feature_name: list(feature_path)
+                    for feature_name, feature_path in record.prior_nested_features.items()
+                },
+                "prior_nested_membership_features": {
+                    feature_name: dict(feature_memberships)
+                    for feature_name, feature_memberships in record.prior_nested_membership_features.items()
+                },
+                "prior_class_members": [
+                    variant_class.value for variant_class in record.prior_class_members
+                ],
+                "prior_class_membership": list(record.prior_class_membership),
+            }
+            for record in artifact.records
+        ],
         "tie_groups": [
             {
                 "representative_index": group.representative_index,
@@ -130,13 +163,7 @@ def load_artifact(path: str | Path) -> ModelArtifact:
     )
     return ModelArtifact(
         config=_config_from_json(payload["config"]),
-        variant_metadata=VariantMetadataTable(
-            variant_ids=[str(variant_id) for variant_id in payload["variant_metadata"]["variant_ids"]],
-            variant_classes=[
-                VariantClass(variant_class)
-                for variant_class in payload["variant_metadata"]["variant_classes"]
-            ],
-        ),
+        records=normalize_variant_records(payload["records"]),
         means=arrays["means"].astype(np.float32),
         scales=arrays["scales"].astype(np.float32),
         alpha=arrays["alpha"].astype(np.float32),

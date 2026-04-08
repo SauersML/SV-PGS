@@ -9,8 +9,6 @@ from sv_pgs.genotype import RawGenotypeMatrix, _gpu_materialization_budget_bytes
 # Algorithmic limits — not GPU-memory-dependent.
 # The exact solver limit caps dense Cholesky factorizations on GPU to avoid
 # excessive O(p^3) cost. The preconditioner rank bounds the Nyström approximation.
-GPU_EXACT_SOLVER_LIMIT = 1_024
-GPU_PRECONDITIONER_RANK_LIMIT = 1_024
 GPU_FINAL_REFINEMENT_VARIANT_MULTIPLIER = 2
 T4_GPU_PRECONDITIONER_RANK_LIMIT = 384
 
@@ -45,12 +43,11 @@ def runtime_training_policy_for_fit(
     preconditioner_rank_limit = (
         T4_GPU_PRECONDITIONER_RANK_LIMIT
         if t4_fast_math_enabled()
-        else GPU_PRECONDITIONER_RANK_LIMIT
+        else cacheable_dense_variants
     )
     tuned_exact_solver_limit = min(
         int(config.exact_solver_matrix_limit),
         max(int(cacheable_dense_variants * 0.9), 1),
-        GPU_EXACT_SOLVER_LIMIT,
     )
     max_gpu_preconditioner_rank = max(1, min(cacheable_dense_variants, preconditioner_rank_limit))
     tuned_preconditioner_rank = min(
@@ -66,7 +63,10 @@ def runtime_training_policy_for_fit(
     tuned_final_posterior_refinement = (
         bool(config.final_posterior_refinement)
         and int(genotype_matrix.shape[1])
-        <= max(int(cacheable_dense_variants) * GPU_FINAL_REFINEMENT_VARIANT_MULTIPLIER, GPU_EXACT_SOLVER_LIMIT)
+        <= max(
+            int(cacheable_dense_variants) * GPU_FINAL_REFINEMENT_VARIANT_MULTIPLIER,
+            tuned_exact_solver_limit,
+        )
     )
     tuned_config = replace(
         config,

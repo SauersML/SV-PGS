@@ -58,7 +58,25 @@ uv run sv-pgs run \
   --target-column target \
   --covariate-column age \
   --covariate-column sex \
+  --variant-metadata variant_metadata.tsv \
   --output-dir results
+```
+
+`--variant-metadata` is keyed by `variant_id` and drives the schema-based prior hypermodel. Supported annotation columns are:
+
+- `prior_binary__NAME`: boolean feature
+- `prior_continuous__NAME`: numeric feature
+- `prior_categorical__NAME`: single categorical level
+- `prior_membership__NAME`: weighted levels like `enhancer=0.7,promoter=0.3`
+- `prior_nested__NAME`: hierarchical path like `protein_coding>exon`
+- `prior_nested_membership__NAME`: weighted hierarchical paths like `protein_coding>exon=0.5,protein_coding>intron=0.5`
+
+Example:
+
+```tsv
+variant_id	prior_binary__coding	prior_continuous__constraint	prior_categorical__functional_state	prior_membership__regulatory_mix	prior_nested__gene_context
+sv1	1	0.82	lof	enhancer=0.7,promoter=0.3	protein_coding>exon
+sv2	0	0.15	missense	enhancer=0.2,promoter=0.8	protein_coding>intron
 ```
 
 ## Verify GPU runtime

@@ -137,12 +137,12 @@ def test_binary_model_fit_roundtrip_and_keeps_all_variants(tmp_path):
     )
 
 
-def test_runtime_tuned_config_for_t4_caps_solver_from_gpu_budget(monkeypatch):
+def test_runtime_tuned_config_for_t4_uses_budget_driven_solver_limit(monkeypatch):
     raw_genotypes = ShapeOnlyRawGenotypeMatrix(sample_count=1_000, variant_count=50_000)
     config = ModelConfig(
         trait_type=TraitType.BINARY,
-        exact_solver_matrix_limit=2_048,
-        sample_space_preconditioner_rank=512,
+        exact_solver_matrix_limit=20_000,
+        sample_space_preconditioner_rank=20_000,
     )
 
     monkeypatch.setattr(runtime_policy_module, "_try_import_cupy", lambda: object())
@@ -155,7 +155,7 @@ def test_runtime_tuned_config_for_t4_caps_solver_from_gpu_budget(monkeypatch):
 
     tuned_config, summary = _runtime_tuned_config_for_fit(config, raw_genotypes)
 
-    assert tuned_config.exact_solver_matrix_limit == 1_024
+    assert tuned_config.exact_solver_matrix_limit == 9_000
     assert tuned_config.sample_space_preconditioner_rank == 384
     assert tuned_config.final_posterior_refinement is False
     assert summary is not None
