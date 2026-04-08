@@ -4637,12 +4637,15 @@ def _restricted_posterior_state(
                 X_gpu = genotype_matrix._cupy_cache  # (n, p) float32 on GPU
                 compute_cp_dtype = _cupy_compute_dtype(cp)
                 X_gpu_compute = X_gpu.astype(compute_cp_dtype, copy=False)
-                # Build the exact p x p summaries on GPU in compute precision,
-                # then factor the small system on CPU in float64.
-                # Form X^T diag(W) X as (W^{1/2}X)^T (W^{1/2}X) — one cuBLAS gemm.
+                # Build X^T diag(W) X on GPU in compute precision, chunked to
+                # avoid allocating a second full-size (n, p) intermediate.
                 inv_d_cp = cp.asarray(inverse_diagonal_noise, dtype=compute_cp_dtype)
-                weighted_design_gpu = X_gpu_compute * cp.sqrt(inv_d_cp)[:, None]
-                xtdx_gpu = weighted_design_gpu.T @ weighted_design_gpu
+                xtdx_gpu = cp.empty((variant_count, variant_count), dtype=compute_cp_dtype)
+                chunk = min(1024, variant_count)
+                for start in range(0, variant_count, chunk):
+                    end = min(start + chunk, variant_count)
+                    weighted_chunk = inv_d_cp[:, None] * X_gpu_compute[:, start:end]
+                    xtdx_gpu[:, start:end] = X_gpu_compute.T @ weighted_chunk
                 CtWX = _cached_weighted_covariate_projection(
                     genotype_matrix=genotype_matrix,
                     covariate_matrix=covariate_matrix,
@@ -4659,7 +4662,7 @@ def _restricted_posterior_state(
                 xtdx_cpu = xtdx_cpu + np.triu(xtdx_cpu, k=1).T
                 XtPX = xtdx_cpu - correction_cpu
                 variant_rhs = _cupy_array_to_numpy(X_gpu_compute.T @ projected_targets_cp, dtype=np.float64)
-                del projected_targets_cp, weighted_design_gpu, xtdx_gpu
+                del projected_targets_cp, xtdx_gpu
             else:
                 dense_genotypes = np.asarray(genotype_matrix.materialize(batch_size=posterior_variance_batch_size), dtype=np.float64)
                 projected_genotypes = apply_projector(dense_genotypes)
