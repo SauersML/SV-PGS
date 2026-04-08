@@ -918,10 +918,12 @@ def run_all_of_us(
             raise RuntimeError("parallel VCF precache failed") from exc
 
         log("=== STEP 3.6: Build variant metadata priors ===")
-        variant_metadata_path = build_aou_sv_variant_metadata(
-            vcf_paths=vcf_paths,
-            output_path=variant_metadata_path,
-        )
+        if variant_metadata_path.exists():
+            log(f"  variant metadata already exists: {variant_metadata_path}")
+        else:
+            log("  skipping variant metadata extraction (not yet built — run will use default priors)")
+            log("  to build enriched priors, run: uv run sv-pgs build-variant-metadata ...")
+            variant_metadata_path = None
 
         log("=== STEP 4: Load unified genome-wide dataset ===")
         dataset = load_multi_vcf_dataset_from_files(
