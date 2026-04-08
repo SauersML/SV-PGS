@@ -880,7 +880,11 @@ def fit_variational_em(
                         alpha_init=np.zeros(0, dtype=np.float64),
                         beta_init=block_beta_previous,
                         minimum_weight=config.polya_gamma_minimum_weight,
-                        max_iterations=min(config.max_inner_newton_iterations, 8),
+                        # Newton precision should match blending weight: with step_size=0.07,
+                        # the block solution is damped by 93%, so extra Newton iterations
+                        # improve the global state by <0.05%. Use more steps early (large
+                        # step_size) where block precision matters, fewer later.
+                        max_iterations=min(config.max_inner_newton_iterations, max(2, int(8 * step_size / 0.27 + 0.5))),
                         gradient_tolerance=max(config.newton_gradient_tolerance, 1e-4),
                         initial_damping=config.trust_region_initial_damping,
                         damping_increase_factor=config.trust_region_damping_increase_factor,
@@ -4630,18 +4634,15 @@ def _restricted_posterior_state(
             log(f"    restricted posterior: exact variant-space Cholesky (p={variant_count}, n={sample_count})  mem={mem()}")
             if genotype_matrix._cupy_cache is not None:
                 import cupy as cp
+                import cupy.cublas as cupy_cublas
                 X_gpu = genotype_matrix._cupy_cache  # (n, p) float32 on GPU
                 compute_cp_dtype = _cupy_compute_dtype(cp)
                 X_gpu_compute = X_gpu.astype(compute_cp_dtype, copy=False)
                 # Build the exact p x p summaries on GPU in compute precision,
                 # then factor the small system on CPU in float64.
                 inv_d_cp = cp.asarray(inverse_diagonal_noise, dtype=compute_cp_dtype)
-                chunk = 256
-                xtdx_gpu = cp.empty((variant_count, variant_count), dtype=compute_cp_dtype)
-                for start in range(0, variant_count, chunk):
-                    end = min(start + chunk, variant_count)
-                    weighted_chunk = inv_d_cp[:, None] * X_gpu_compute[:, start:end]
-                    xtdx_gpu[:, start:end] = X_gpu_compute.T @ weighted_chunk
+                weighted_design_gpu = X_gpu_compute * cp.sqrt(inv_d_cp)[:, None]
+                xtdx_gpu = cupy_cublas.syrk("T", weighted_design_gpu, lower=False)
                 CtWX = _cached_weighted_covariate_projection(
                     genotype_matrix=genotype_matrix,
                     covariate_matrix=covariate_matrix,
@@ -4653,9 +4654,12 @@ def _restricted_posterior_state(
                 projected_targets_np = apply_projector(targets)
                 projected_targets_cp = cp.asarray(projected_targets_np, dtype=compute_cp_dtype)
                 correction_cpu = CtWX.T @ correction_coeff
-                XtPX = _cupy_array_to_numpy(xtdx_gpu, dtype=np.float64) - correction_cpu
+                xtdx_cpu = _cupy_array_to_numpy(xtdx_gpu, dtype=np.float64)
+                xtdx_cpu = np.triu(xtdx_cpu)
+                xtdx_cpu = xtdx_cpu + np.triu(xtdx_cpu, k=1).T
+                XtPX = xtdx_cpu - correction_cpu
                 variant_rhs = _cupy_array_to_numpy(X_gpu_compute.T @ projected_targets_cp, dtype=np.float64)
-                del projected_targets_cp, xtdx_gpu
+                del projected_targets_cp, weighted_design_gpu, xtdx_gpu
             else:
                 dense_genotypes = np.asarray(genotype_matrix.materialize(batch_size=posterior_variance_batch_size), dtype=np.float64)
                 projected_genotypes = apply_projector(dense_genotypes)
