@@ -208,9 +208,44 @@ class _RestrictedPosteriorWarmStart:
     weighted_covariate_projection: np.ndarray | None = None
 
 
+# Fields that affect convergence speed but not the mathematical model result.
+# Changing these should NOT invalidate EM checkpoints.
+_CHECKPOINT_EXCLUDED_CONFIG_FIELDS = frozenset({
+    "stochastic_variant_batch_size",
+    "stochastic_step_offset",
+    "stochastic_step_exponent",
+    "stochastic_min_variant_count",
+    "linear_solver_tolerance",
+    "maximum_linear_solver_iterations",
+    "logdet_probe_count",
+    "logdet_lanczos_steps",
+    "exact_solver_matrix_limit",
+    "posterior_variance_batch_size",
+    "posterior_variance_probe_count",
+    "beta_variance_update_interval",
+    "sample_space_preconditioner_rank",
+    "max_inner_newton_iterations",
+    "newton_gradient_tolerance",
+    "trust_region_initial_damping",
+    "trust_region_damping_increase_factor",
+    "trust_region_damping_decrease_factor",
+    "trust_region_success_threshold",
+    "trust_region_minimum_damping",
+    "temporary_working_set_initial_size",
+    "temporary_working_set_growth",
+    "temporary_working_set_max_passes",
+    "temporary_working_set_coefficient_tolerance",
+    "validation_interval",
+    "random_seed",
+    "final_posterior_refinement",
+})
+
+
 def _checkpoint_config_signature(config: ModelConfig) -> str:
     payload: dict[str, object] = {}
     for field in dataclass_fields(config):
+        if field.name in _CHECKPOINT_EXCLUDED_CONFIG_FIELDS:
+            continue
         value = getattr(config, field.name)
         payload[field.name] = value.value if hasattr(value, "value") else value
     return hashlib.sha256(json.dumps(payload, sort_keys=True).encode("utf-8")).hexdigest()
