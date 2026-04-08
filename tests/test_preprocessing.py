@@ -202,6 +202,81 @@ def test_tie_map_groups_monomorphic_raw_columns_even_with_different_missingness(
     assert tie_map.original_to_reduced.tolist() == [0, 0]
 
 
+def test_tie_map_groups_int8_sign_flipped_hardcalls():
+    raw_genotype_matrix = np.array(
+        [
+            [0, 1, 1],
+            [1, 0, 1],
+            [0, 1, 1],
+            [1, 0, 1],
+        ],
+        dtype=np.int8,
+    )
+    covariate_matrix = np.zeros((raw_genotype_matrix.shape[0], 1), dtype=np.float32)
+    target_vector = np.array([0.0, 0.0, 1.0, 1.0], dtype=np.float32)
+    variant_records = [
+        VariantRecord("variant_0", VariantClass.SNV, "1", 100),
+        VariantRecord("variant_1", VariantClass.SNV, "1", 101),
+        VariantRecord("variant_2", VariantClass.SNV, "1", 102),
+    ]
+    raw_genotypes = as_raw_genotype_matrix(raw_genotype_matrix)
+    prepared_arrays = fit_preprocessor(raw_genotypes, covariate_matrix, target_vector, ModelConfig())
+    standardized_genotypes = raw_genotypes.standardized(
+        prepared_arrays.means,
+        prepared_arrays.scales,
+    )
+
+    tie_map = build_tie_map(standardized_genotypes, variant_records, ModelConfig())
+
+    assert tie_map.kept_indices.tolist() == [0, 2]
+    assert tie_map.original_to_reduced.tolist() == [0, 0, 1]
+    np.testing.assert_allclose(tie_map.reduced_to_group[0].signs, [1.0, -1.0])
+
+
+def test_hardcall_batch_canonicalization_matches_expected_state_mappings():
+    batch_values = np.array(
+        [
+            [PLINK_MISSING_INT8, 0, 1, 2, 0, 0, 1, 0],
+            [PLINK_MISSING_INT8, 0, 1, 2, 1, 2, 2, 1],
+            [PLINK_MISSING_INT8, PLINK_MISSING_INT8, PLINK_MISSING_INT8, PLINK_MISSING_INT8, PLINK_MISSING_INT8, PLINK_MISSING_INT8, PLINK_MISSING_INT8, 2],
+            [PLINK_MISSING_INT8, 0, 1, 2, 0, 0, 1, PLINK_MISSING_INT8],
+        ],
+        dtype=np.int8,
+    )
+
+    state_masks = preprocessing_module._hardcall_state_masks(batch_values)
+    canonical, sign_flipped = preprocessing_module._canonicalize_hardcall_tie_columns_i8(
+        batch_values,
+        state_masks,
+    )
+
+    np.testing.assert_array_equal(state_masks, np.array([0, 1, 2, 4, 3, 5, 6, 7], dtype=np.uint8))
+    np.testing.assert_array_equal(
+        canonical,
+        np.array(
+            [
+                [0, 0, 0, 0, 0, 0, 0, 0],
+                [0, 0, 0, 0, 1, 1, 1, 1],
+                [0, 0, 0, 0, 3, 3, 3, 2],
+                [0, 0, 0, 0, 0, 0, 0, 3],
+            ],
+            dtype=np.int8,
+        ),
+    )
+    np.testing.assert_array_equal(
+        sign_flipped,
+        np.array(
+            [
+                [0, 0, 0, 0, 1, 1, 1, 2],
+                [0, 0, 0, 0, 0, 0, 0, 1],
+                [0, 0, 0, 0, 3, 3, 3, 0],
+                [0, 0, 0, 0, 1, 1, 1, 3],
+            ],
+            dtype=np.int8,
+        ),
+    )
+
+
 def test_tie_map_handles_dense_float_columns_with_more_than_127_distinct_values():
     sample_count = 256
     dense_genotypes = np.column_stack(

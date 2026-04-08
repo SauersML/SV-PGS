@@ -254,7 +254,17 @@ def merge_pcs_into_sample_table(
 ) -> tuple[Path, list[str]]:
     """Merge top N PCs from ancestry file into the sample table. Returns (output_path, pc_column_names)."""
     if output_path.exists():
-        log(f"  merged sample table already exists; recomputing with n_pcs={n_pcs}")
+        merged_mtime = output_path.stat().st_mtime
+        inputs_mtime = max(sample_table_path.stat().st_mtime, ancestry_path.stat().st_mtime)
+        if merged_mtime > inputs_mtime:
+            log("  PC-merged table up to date, skipping recomputation")
+            existing = pd.read_csv(output_path, sep="\t", nrows=0)
+            pc_cols = sorted(
+                [c for c in existing.columns if c.startswith("PC") and c[2:].isdigit()],
+                key=lambda x: int(x[2:]),
+            )[:n_pcs]
+            return output_path, pc_cols
+        log(f"  merged sample table already exists but is stale; recomputing with n_pcs={n_pcs}")
 
     log(f"  loading sample table: {sample_table_path}")
     samples = pd.read_csv(sample_table_path, sep="\t", dtype={"sample_id": str, "person_id": str})

@@ -304,6 +304,8 @@ def _build_tie_map_windowed(
     support_counts = standardized_genotypes.support_counts
     if support_counts is None:
         return None  # can't pre-filter without support counts
+    if standardized_genotypes.raw is None or not _supports_int8_batches(standardized_genotypes.raw):
+        return None  # windowed pruning is only safe on raw hardcall int8 columns
 
     sample_count = standardized_genotypes.shape[0]
     variant_indices = standardized_genotypes.variant_indices
@@ -391,10 +393,10 @@ def _build_tie_map_windowed(
     else:
         # Fallback: read from standardized float path
         for local_idx in needed_local_indices:
-            col = standardized_genotypes.materialize_columns(
+            col = standardized_genotypes.subset(
                 np.array([local_idx], dtype=np.int32)
-            )
-            column_cache[local_idx] = np.asarray(col).ravel()
+            ).materialize()
+            column_cache[local_idx] = np.asarray(col[:, 0], dtype=np.float32)
 
     log(f"  read {len(column_cache)} columns for candidate comparison  mem={mem()}")
 

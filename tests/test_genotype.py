@@ -263,6 +263,93 @@ def test_try_cache_locally_rebases_to_local_int8_cache():
     assert raw.i8_requests == []
 
 
+def test_try_cache_persistently_rebases_to_persistent_int8_cache(tmp_path):
+    raw_i8 = np.array(
+        [
+            [0, 1, -127, 2],
+            [1, -127, 2, 0],
+            [2, 1, 0, 1],
+        ],
+        dtype=np.int8,
+    )
+    raw = _SpyInt8StreamingRawGenotypeMatrix(raw_i8)
+    means = np.array([1.0, 1.0, 1.0, 1.0], dtype=np.float32)
+    scales = np.array([0.5, 2.0, 1.0, 0.5], dtype=np.float32)
+    standardized = raw.standardized(means, scales).subset(np.array([1, 3], dtype=np.int32))
+    cache_path = tmp_path / "reduced_raw_i8.npy"
+
+    assert standardized.try_cache_persistently(cache_path) is True
+    assert raw.i8_requests == [[1, 3]]
+    assert isinstance(standardized.raw, Int8RawGenotypeMatrix)
+    assert cache_path.exists()
+
+    raw.i8_requests.clear()
+    np.testing.assert_allclose(
+        standardized.materialize(),
+        np.array(
+            [
+                [0.0, 2.0],
+                [0.0, -2.0],
+                [0.0, 0.0],
+            ],
+            dtype=np.float32,
+        ),
+    )
+    assert raw.i8_requests == []
+
+
+def test_try_cache_persistently_skips_when_disk_space_is_insufficient(tmp_path, monkeypatch: pytest.MonkeyPatch):
+    raw_i8 = np.array(
+        [
+            [0, 1, -127, 2],
+            [1, -127, 2, 0],
+            [2, 1, 0, 1],
+        ],
+        dtype=np.int8,
+    )
+    raw = _SpyInt8StreamingRawGenotypeMatrix(raw_i8)
+    standardized = raw.standardized(
+        means=np.ones(raw_i8.shape[1], dtype=np.float32),
+        scales=np.ones(raw_i8.shape[1], dtype=np.float32),
+    )
+    cache_path = tmp_path / "reduced_raw_i8.npy"
+
+    monkeypatch.setattr(
+        genotype_module,
+        "_has_sufficient_free_space_for_int8_npy",
+        lambda path, shape, fortran_order: (False, 123, 45),
+    )
+
+    assert standardized.try_cache_persistently(cache_path) is False
+    assert not cache_path.exists()
+    assert raw.i8_requests == []
+
+
+def test_try_cache_locally_skips_when_disk_space_is_insufficient(monkeypatch: pytest.MonkeyPatch):
+    raw_i8 = np.array(
+        [
+            [0, 1, -127, 2],
+            [1, -127, 2, 0],
+            [2, 1, 0, 1],
+        ],
+        dtype=np.int8,
+    )
+    raw = _SpyInt8StreamingRawGenotypeMatrix(raw_i8)
+    standardized = raw.standardized(
+        means=np.ones(raw_i8.shape[1], dtype=np.float32),
+        scales=np.ones(raw_i8.shape[1], dtype=np.float32),
+    )
+
+    monkeypatch.setattr(
+        genotype_module,
+        "_has_sufficient_free_space_for_int8_npy",
+        lambda path, shape, fortran_order: (False, 123, 45),
+    )
+
+    assert standardized.try_cache_locally() is False
+    assert raw.i8_requests == []
+
+
 def test_try_materialize_gpu_does_not_force_cpu_dense_fallback(monkeypatch: pytest.MonkeyPatch):
     raw_matrix = np.arange(24, dtype=np.float32).reshape(4, 6)
     standardized = as_raw_genotype_matrix(raw_matrix).standardized(

@@ -32,7 +32,6 @@ from sv_pgs.preprocessing import (
     build_tie_map,
     compute_variant_statistics,
     fit_preprocessor_from_stats,
-    select_active_variant_indices,
 )
 from sv_pgs.progress import log, mem
 from sv_pgs.runtime_policy import runtime_training_policy_for_fit, runtime_training_policy_summary
@@ -195,7 +194,7 @@ def _persistent_raw_signature(genotype_matrix: RawGenotypeMatrix) -> str | None:
                 # Avoid invalidating downstream fit/tie caches when the memmap file
                 # is rewritten or touched without any semantic data change.
                 return f"memmap-cache:{backing_path}:{stat.st_size}:{backing_matrix.shape}:{backing_matrix.dtype}"
-            return f"memmap:{backing_path}:{stat.st_size}:{stat.st_mtime_ns}:{backing_matrix.shape}:{backing_matrix.dtype}"
+            return f"memmap:{backing_path}:{stat.st_size}:{backing_matrix.shape}:{backing_matrix.dtype}"
     return None
 
 
@@ -585,6 +584,9 @@ class BayesianPGS:
                 nonzero_means=np.zeros(0, dtype=np.float32),
                 nonzero_scales=np.zeros(0, dtype=np.float32),
             )
+            # Free the full variant_records list — no active variants means we stored []
+            # in FittedState, so the original 1.68M-element list is no longer needed.
+            del variant_records
             if fit_stage_cache_paths is not None:
                 _clear_variational_checkpoint(fit_stage_cache_paths)
             log(f"coefficients: 0 non-zero out of {total_variant_count} total")
@@ -604,7 +606,9 @@ class BayesianPGS:
             support_counts=variant_stats.support_counts[active_variant_indices],
         )
         active_records = _training_records_from_stats(active_selection_records, active_stats)
-        del active_selection_records, active_stats
+        # Free the full variant_records list (1.68M objects, ~840 MB) — we've extracted
+        # the active subset into active_records and no longer need the original reference.
+        del active_selection_records, active_stats, variant_records
         import gc; gc.collect()
         log(f"active training records created: {len(active_records)}  mem={mem()}")
         if cached_fit_stage is None:

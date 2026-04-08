@@ -7,8 +7,6 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from google.cloud import bigquery
-
 MIN_DISEASE_OCCURRENCES = 2
 
 
@@ -220,7 +218,9 @@ ORDER BY ehr_participants.person_id
 """.strip()
 
 
-def build_all_of_us_disease_query_config(disease_definition: DiseaseDefinition) -> bigquery.QueryJobConfig:
+def build_all_of_us_disease_query_config(disease_definition: DiseaseDefinition):
+    from google.cloud import bigquery
+
     return bigquery.QueryJobConfig(
         query_parameters=[
             bigquery.ArrayQueryParameter("icd9_prefixes", "STRING", list(disease_definition.icd9_prefixes)),
@@ -231,8 +231,10 @@ def build_all_of_us_disease_query_config(disease_definition: DiseaseDefinition) 
 
 def fetch_all_of_us_disease_rows(
     request: AllOfUsDiseaseRequest,
-    client: bigquery.Client | None = None,
+    client: "bigquery.Client | None" = None,
 ) -> list[dict[str, Any]]:
+    from google.cloud import bigquery
+
     disease_definition = resolve_disease_definition(request.disease)
     active_client = client if client is not None else bigquery.Client(project=_require_env("GOOGLE_PROJECT"))
     query_job = active_client.query(
@@ -246,8 +248,9 @@ def prepare_all_of_us_disease_sample_table(
     request: AllOfUsDiseaseRequest,
     output_path: str | Path,
     *,
-    client: bigquery.Client | None = None,
+    client: "bigquery.Client | None" = None,
 ) -> AllOfUsPreparedPhenotype:
+    from google.cloud import bigquery
     disease_definition = resolve_disease_definition(request.disease)
     rows = fetch_all_of_us_disease_rows(request=request, client=client)
     billing_project = _resolve_billing_project(client)
@@ -314,7 +317,7 @@ def _require_env(name: str) -> str:
     return value.strip()
 
 
-def _resolve_billing_project(client: bigquery.Client | None) -> str:
+def _resolve_billing_project(client: "bigquery.Client | None") -> str:
     if client is not None:
         client_project = getattr(client, "project", None)
         if isinstance(client_project, str) and client_project.strip():
