@@ -566,7 +566,10 @@ def build_aou_sv_variant_metadata(
     with gzip.open(temporary_output_path, "wt", encoding="utf-8", newline="") as handle:
         writer = csv.writer(handle, delimiter="\t")
         writer.writerow(header)
-        for vcf_path in vcf_paths:
+        for vcf_idx, vcf_path in enumerate(vcf_paths, 1):
+            log(f"  [{vcf_idx}/{len(vcf_paths)}] extracting metadata from {vcf_path.name}...")
+            chr_start = time.monotonic()
+            chr_count = 0
             reader = _open_vcf_reader(vcf_path)
             try:
                 for record in reader:
@@ -663,8 +666,14 @@ def build_aou_sv_variant_metadata(
                         )
                     )
                     row_count += 1
+                    chr_count += 1
+                    if chr_count % 10000 == 0:
+                        elapsed = time.monotonic() - chr_start
+                        log(f"    {vcf_path.name}: {chr_count} variants ({elapsed:.0f}s)")
             finally:
                 reader.close()
+            chr_elapsed = time.monotonic() - chr_start
+            log(f"  [{vcf_idx}/{len(vcf_paths)}] {vcf_path.name}: done {chr_count} variants in {chr_elapsed:.0f}s")
     temporary_output_path.replace(output_path)
     manifest_path.write_text(
         json.dumps(
@@ -921,9 +930,16 @@ def run_all_of_us(
         if variant_metadata_path.exists():
             log(f"  variant metadata already exists: {variant_metadata_path}")
         else:
-            log("  skipping variant metadata extraction (not yet built — run will use default priors)")
-            log("  to build enriched priors, run: uv run sv-pgs build-variant-metadata ...")
-            variant_metadata_path = None
+            # Try assembling from precache side-effect metadata files
+            from sv_pgs.io import _load_cached_variant_metadata
+            if _load_cached_variant_metadata(vcf_paths, config, variant_metadata_path):
+                log(f"  variant metadata assembled from VCF precache: {variant_metadata_path}")
+            else:
+                log("  cached metadata not available for all chromosomes; building from VCFs...")
+                build_aou_sv_variant_metadata(
+                    vcf_paths=vcf_paths,
+                    output_path=variant_metadata_path,
+                )
 
         log("=== STEP 4: Load unified genome-wide dataset ===")
         dataset = load_multi_vcf_dataset_from_files(

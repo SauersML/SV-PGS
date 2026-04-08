@@ -30,6 +30,44 @@ from sv_pgs.progress import log, mem
 SV_LENGTH_THRESHOLD = 1_000.0
 DEFAULT_SAMPLE_ID_COLUMNS = ("sample_id", "research_id", "person_id")
 
+_VARIANT_METADATA_HEADER = (
+    "variant_id",
+    "variant_class",
+    "chromosome",
+    "position",
+    "length",
+    "allele_frequency",
+    "quality",
+    "is_copy_number",
+    "is_repeat",
+    "prior_binary__is_copy_number",
+    "prior_binary__is_repeat",
+    "prior_binary__predicted_lof",
+    "prior_binary__predicted_copy_gain",
+    "prior_binary__predicted_promoter",
+    "prior_binary__predicted_intronic",
+    "prior_binary__predicted_utr",
+    "prior_binary__predicted_intergenic",
+    "prior_binary__pathogenic_or_disease_associated",
+    "prior_continuous__sv_length_log10",
+    "prior_continuous__site_quality",
+    "prior_continuous__cohort_allele_frequency",
+    "prior_continuous__algorithm_count",
+    "prior_continuous__copy_number_quality",
+    "prior_continuous__constraint_score",
+    "prior_continuous__conservation_score",
+    "prior_continuous__lof_gene_count",
+    "prior_continuous__copy_gain_gene_count",
+    "prior_continuous__promoter_gene_count",
+    "prior_continuous__intronic_gene_count",
+    "prior_continuous__utr_gene_count",
+    "prior_membership__calling_algorithms",
+    "prior_membership__noncoding_span",
+    "prior_membership__noncoding_breakpoint",
+    "prior_categorical__strongest_effect",
+    "prior_nested__functional_context",
+)
+
 
 @dataclass(slots=True)
 class LoadedDataset:
@@ -1606,13 +1644,33 @@ def _split_into_regions(chrom: str, chrom_length: int, n_regions: int) -> list[s
 
 def _region_parse_worker(args: tuple) -> tuple[int, str]:
     """Worker: parse one region of one VCF, write raw binary output files.
-    Runs in a separate process. Returns (variant_count, output_prefix)."""
+    Runs in a separate process. Returns (variant_count, output_prefix).
+
+    Also writes a .metadata.tsv.gz alongside genotype data, extracting the
+    same INFO fields that aou_runner.build_aou_sv_variant_metadata uses.
+    This avoids an expensive second pass over the VCFs.
+    """
+    import csv as _csv
+    import gzip as _gzip
+    import math as _math
     import struct
     import sys
     import time
     vcf_path_str, region, keep_indices_list, output_prefix, threads_per_reader = args
     keep_indices = np.array(keep_indices_list, dtype=np.intp) if keep_indices_list is not None else None
     vcf_name = Path(vcf_path_str).name
+
+    # Import metadata helper functions from aou_runner
+    from sv_pgs.aou_runner import (
+        _boolean_string,
+        _count_if_present,
+        _format_optional_float,
+        _info_best_numeric,
+        _membership_weights,
+        _normalize_info_tokens,
+        _strongest_effect_label,
+        _strongest_effect_path,
+    )
 
     reader = _open_vcf_reader(Path(vcf_path_str))
     reader.set_threads(max(int(threads_per_reader), 1))
@@ -1622,6 +1680,9 @@ def _region_parse_worker(args: tuple) -> tuple[int, str]:
     stats_pack = struct.Struct("<qqii")
     geno_fh = open(f"{output_prefix}.geno", "wb")
     stats_fh = open(f"{output_prefix}.stats", "wb")
+    meta_fh = _gzip.open(f"{output_prefix}.metadata.tsv.gz", "wt", encoding="utf-8", newline="")
+    meta_writer = _csv.writer(meta_fh, delimiter="\t")
+    meta_writer.writerow(_VARIANT_METADATA_HEADER)
     variants: list[_VariantDefaults] = []
 
     count = 0
@@ -1641,7 +1702,100 @@ def _region_parse_worker(args: tuple) -> tuple[int, str]:
             int(observed.shape[0]),
             int(np.count_nonzero(observed > 0)),
         ))
-        variants.append(_variant_defaults_from_vcf_record(record))
+        variant_defaults = _variant_defaults_from_vcf_record(record)
+        variants.append(variant_defaults)
+
+        # --- Extract variant metadata (same logic as build_aou_sv_variant_metadata) ---
+        info = record.INFO
+        variant_class = variant_defaults.variant_class
+        is_copy_number = variant_class in {
+            VariantClass.DELETION_SHORT,
+            VariantClass.DELETION_LONG,
+            VariantClass.DUPLICATION_SHORT,
+            VariantClass.DUPLICATION_LONG,
+        }
+        repeat_tokens = [
+            key.lower()
+            for key in ("REPEATMASKER", "REPEATS", "TRF", "SEGDUP", "REPEAT_CLASS")
+            if info.get(key) not in (None, False, ".", "")
+        ]
+        is_repeat = (
+            variant_class == VariantClass.STR_VNTR_REPEAT
+            or bool(repeat_tokens)
+        )
+        lof_tokens = _normalize_info_tokens(info.get("PREDICTED_LOF"))
+        copy_gain_tokens = _normalize_info_tokens(info.get("PREDICTED_COPY_GAIN"))
+        promoter_tokens = _normalize_info_tokens(info.get("PREDICTED_PROMOTER"))
+        intronic_tokens = _normalize_info_tokens(info.get("PREDICTED_INTRONIC"))
+        utr_tokens = _normalize_info_tokens(info.get("PREDICTED_UTR"))
+        intergenic_tokens = _normalize_info_tokens(info.get("PREDICTED_INTERGENIC"))
+        noncoding_span_tokens = _normalize_info_tokens(info.get("PREDICTED_NONCODING_SPAN"))
+        noncoding_breakpoint_tokens = _normalize_info_tokens(info.get("PREDICTED_NONCODING_BREAKPOINT"))
+        algorithm_tokens = _normalize_info_tokens(info.get("ALGORITHMS"))
+        copy_number_quality = _info_best_numeric(info, ("CNQ", "RD_CNQ", "QS"))
+        constraint_score = _info_best_numeric(info, ("LOEUF", "LOEUF_MIN", "MIN_LOEUF", "CONSTRAINT", "CONSTRAINT_SCORE"))
+        conservation_score = _info_best_numeric(info, ("PHYLOP", "PHASTCONS", "GERP", "CONSERVATION"))
+        pathogenic_or_disease_associated = any(
+            info.get(key) not in (None, False, ".", "", "0", "false", "FALSE", "none", "None")
+            for key in (
+                "CLINVAR_PATHOGENIC",
+                "PATHOGENIC",
+                "PATHOGENICITY",
+                "DISEASE_ASSOCIATION",
+                "OMIM",
+            )
+        )
+        strongest_effect = _strongest_effect_label(
+            lof_tokens=lof_tokens,
+            copy_gain_tokens=copy_gain_tokens,
+            promoter_tokens=promoter_tokens,
+            intronic_tokens=intronic_tokens,
+            utr_tokens=utr_tokens,
+            noncoding_span_tokens=noncoding_span_tokens,
+            noncoding_breakpoint_tokens=noncoding_breakpoint_tokens,
+            is_repeat=is_repeat,
+            is_copy_number=is_copy_number,
+        )
+        meta_writer.writerow(
+            (
+                variant_defaults.variant_id,
+                variant_defaults.variant_class.value,
+                variant_defaults.chromosome,
+                str(variant_defaults.position),
+                format(variant_defaults.length, ".8g"),
+                format(variant_defaults.allele_frequency, ".8g"),
+                format(variant_defaults.quality, ".8g"),
+                _boolean_string(is_copy_number),
+                _boolean_string(is_repeat),
+                _boolean_string(is_copy_number),
+                _boolean_string(is_repeat),
+                _boolean_string(bool(lof_tokens)),
+                _boolean_string(bool(copy_gain_tokens)),
+                _boolean_string(bool(promoter_tokens)),
+                _boolean_string(bool(intronic_tokens)),
+                _boolean_string(bool(utr_tokens)),
+                _boolean_string(bool(intergenic_tokens)),
+                _boolean_string(pathogenic_or_disease_associated),
+                format(_math.log10(max(float(variant_defaults.length), 1.0)), ".8g"),
+                format(variant_defaults.quality, ".8g"),
+                format(variant_defaults.allele_frequency, ".8g"),
+                format(float(len(sorted(set(algorithm_tokens)))), ".8g") if algorithm_tokens else "",
+                _format_optional_float(copy_number_quality),
+                _format_optional_float(constraint_score),
+                _format_optional_float(conservation_score),
+                _count_if_present(lof_tokens),
+                _count_if_present(copy_gain_tokens),
+                _count_if_present(promoter_tokens),
+                _count_if_present(intronic_tokens),
+                _count_if_present(utr_tokens),
+                _membership_weights(algorithm_tokens),
+                _membership_weights(noncoding_span_tokens),
+                _membership_weights(noncoding_breakpoint_tokens),
+                strongest_effect,
+                _strongest_effect_path(strongest_effect),
+            )
+        )
+
         count += 1
         now = time.monotonic()
         if now - last_log >= 10.0:
@@ -1651,6 +1805,7 @@ def _region_parse_worker(args: tuple) -> tuple[int, str]:
 
     geno_fh.close()
     stats_fh.close()
+    meta_fh.close()
     reader.close()
     _write_variant_metadata(Path(f"{output_prefix}.variants.npz"), variants)
     elapsed = time.monotonic() - t_start
@@ -1838,13 +1993,69 @@ def precache_vcfs_parallel(
         _save_vcf_to_cache(vcf_path, inc_matrix, inc_variants, inc_stats_obj, config=config)
         del inc_matrix
 
+        # Concatenate per-region metadata TSVs into a single per-VCF metadata file
+        region_meta_paths = [
+            Path(f"{str(geno_file).removesuffix('.geno')}.metadata.tsv.gz")
+            for geno_file in geno_files
+        ]
+        if all(p.exists() for p in region_meta_paths):
+            import csv as _csv
+            merged_meta_path = cache_dir / f"{key}.metadata.tsv.gz"
+            with gzip.open(merged_meta_path, "wt", encoding="utf-8", newline="") as mout:
+                meta_writer = _csv.writer(mout, delimiter="\t")
+                meta_writer.writerow(_VARIANT_METADATA_HEADER)
+                for region_meta_path in region_meta_paths:
+                    with gzip.open(region_meta_path, "rt", encoding="utf-8", newline="") as min_fh:
+                        reader = _csv.reader(min_fh, delimiter="\t")
+                        next(reader, None)  # skip header
+                        for row in reader:
+                            meta_writer.writerow(row)
+            log(f"  {vcf_path.name}: merged variant metadata ({len(region_meta_paths)} regions)")
+
         # Clean up incremental files
-        for p in (inc_geno, inc_stats, *region_variant_paths):
+        for p in (inc_geno, inc_stats, *region_variant_paths, *region_meta_paths):
             p.unlink(missing_ok=True)
 
         # Clean up temp region files
         shutil.rmtree(tmp_dir, ignore_errors=True)
         log(f"  {vcf_path.name}: cached")
+
+
+def _load_cached_variant_metadata(
+    vcf_paths: list[Path],
+    config: ModelConfig,
+    output_path: Path,
+) -> bool:
+    """Concatenate per-VCF .metadata.tsv.gz files (produced during precache) into a
+    single variant metadata file.  Returns True if all VCFs had cached metadata and
+    the output was written successfully, False otherwise (caller should fall back to
+    the slow build_aou_sv_variant_metadata path)."""
+    import csv as _csv
+
+    meta_file_paths: list[Path] = []
+    for vcf_path in vcf_paths:
+        cache_paths = _vcf_cache_paths(vcf_path, config)
+        meta_path = cache_paths.cache_dir / f"{cache_paths.key}.metadata.tsv.gz"
+        if not meta_path.exists():
+            return False
+        meta_file_paths.append(meta_path)
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = output_path.with_suffix(output_path.suffix + ".tmp")
+    row_count = 0
+    with gzip.open(tmp_path, "wt", encoding="utf-8", newline="") as fout:
+        writer = _csv.writer(fout, delimiter="\t")
+        writer.writerow(_VARIANT_METADATA_HEADER)
+        for meta_path in meta_file_paths:
+            with gzip.open(meta_path, "rt", encoding="utf-8", newline="") as fin:
+                reader = _csv.reader(fin, delimiter="\t")
+                next(reader, None)  # skip header
+                for row in reader:
+                    writer.writerow(row)
+                    row_count += 1
+    tmp_path.replace(output_path)
+    log(f"  variant metadata assembled from precache: {output_path} ({row_count} variants)")
+    return True
 
 
 def _load_vcf_with_cache(
