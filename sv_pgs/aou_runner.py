@@ -768,9 +768,11 @@ def run_all_of_us(
     log(f"  variant metadata:{'DONE' if variant_metadata_path.exists() else 'NEEDED'}")
 
     # Migrate old caches: previous versions stored caches in work_dir/.sv_pgs_cache/
-    # but the current code looks next to the VCF files.  Symlink old→new so existing
-    # caches are found without re-parsing.
+    # with keys computed from the OLD VCF path.  The current code looks next to the
+    # VCF files with keys computed from the NEW path.  We symlink old files under
+    # the NEW key names so existing caches are found without re-parsing.
     from sv_pgs.io import _is_vcf_cache_bundle_complete, _vcf_cache_dir, _vcf_cache_key, _vcf_cache_paths
+    import pickle as _pickle
     old_cache_dir = work_dir / _LOCAL_CACHE_DIRNAME
     if old_cache_dir.exists():
         first_vcf = local_sv_vcf_path(chromosomes[0], work_dir)
@@ -778,17 +780,52 @@ def run_all_of_us(
             new_cache_dir = _vcf_cache_dir(first_vcf)
             if old_cache_dir.resolve() != new_cache_dir.resolve():
                 new_cache_dir.mkdir(parents=True, exist_ok=True)
-                migrated = 0
-                for src in old_cache_dir.iterdir():
-                    dst = new_cache_dir / src.name
-                    if not dst.exists():
-                        try:
-                            dst.symlink_to(src.resolve())
-                            migrated += 1
-                        except OSError:
-                            pass
-                if migrated > 0:
-                    log(f"  migrated {migrated} cache files from {old_cache_dir} → {new_cache_dir}")
+                # Build map: chromosome → old key by reading variants.pkl
+                old_chr_to_key: dict[str, str] = {}
+                for geno_file in old_cache_dir.glob("*.genotypes.npy"):
+                    old_k = geno_file.name.removesuffix(".genotypes.npy")
+                    var_pkl = old_cache_dir / f"{old_k}.variants.pkl"
+                    if not var_pkl.exists():
+                        continue
+                    try:
+                        with open(var_pkl, "rb") as fh:
+                            variants = _pickle.load(fh)
+                        if variants:
+                            chr_val = str(getattr(variants[0], "chromosome", "")).replace("chr", "")
+                            old_chr_to_key[chr_val] = old_k
+                    except Exception:
+                        continue
+                # Symlink old files under NEW key names
+                migrated_chrs = 0
+                for chrom in chromosomes:
+                    vcf_path = local_sv_vcf_path(chrom, work_dir)
+                    if not vcf_path.exists():
+                        continue
+                    new_key = _vcf_cache_key(vcf_path, config)
+                    old_k = old_chr_to_key.get(str(chrom))
+                    if old_k is None:
+                        continue
+                    # Check if new key already has a complete cache
+                    new_geno = new_cache_dir / f"{new_key}.genotypes.npy"
+                    if new_geno.exists():
+                        continue
+                    for suffix in (".genotypes.npy", ".variants.pkl", ".stats.npy", ".stats.npz", ".manifest.json"):
+                        src = old_cache_dir / f"{old_k}{suffix}"
+                        dst = new_cache_dir / f"{new_key}{suffix}"
+                        if src.exists() and not dst.exists():
+                            try:
+                                dst.symlink_to(src.resolve())
+                            except OSError:
+                                pass
+                    migrated_chrs += 1
+                # Clean up .tmp_parallel directories from failed parallel parses
+                for tmp_dir in new_cache_dir.glob("*.tmp_parallel"):
+                    try:
+                        shutil.rmtree(tmp_dir)
+                    except OSError:
+                        pass
+                if migrated_chrs > 0:
+                    log(f"  migrated {migrated_chrs} chromosome caches (old key → new key) from {old_cache_dir}")
 
     cached_chrs = []
     uncached_chrs = []
