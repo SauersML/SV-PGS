@@ -10,6 +10,11 @@ class TraitType(str, Enum):
     BINARY = "binary"
 
 
+class InferenceBackend(str, Enum):
+    VARIATIONAL_BAYES = "variational_bayes"
+    BASIL = "basil"
+
+
 class VariantClass(str, Enum):
     SNV = "snv"
     SMALL_INDEL = "small_indel"
@@ -101,6 +106,7 @@ class ModelConfig:
     TPB shapes: minimum/maximum_tpb_shape, tpb_shape_learning_rate
     """
     trait_type: TraitType = TraitType.BINARY       # binary (case/control) or quantitative
+    inference_backend: InferenceBackend = InferenceBackend.VARIATIONAL_BAYES
     max_outer_iterations: int = 20                 # EM iterations (usually converges in 10-15, step size negligible beyond 20)
     convergence_tolerance: float = 1e-5            # stop when parameters change < this
     minimum_scale: float = 1e-6                    # variants with std < this are treated as monomorphic
@@ -148,6 +154,18 @@ class ModelConfig:
     stochastic_step_offset: float = 8.0
     stochastic_step_exponent: float = 0.6
     final_posterior_refinement: bool = True
+    basil_screening: bool = True
+    basil_l1_ratio: float = 1.0
+    basil_lambda_min_ratio: float = 1e-3
+    basil_n_lambdas: int = 64
+    basil_strong_set_initial_size: int = 4096
+    basil_strong_set_growth: int = 4096
+    basil_batch_size: int = 8
+    basil_max_screening_passes: int = 64
+    basil_irls_max_iterations: int = 30
+    basil_coordinate_descent_max_epochs: int = 200
+    basil_coordinate_descent_tolerance: float = 1e-6
+    basil_kkt_tolerance: float = 1e-6
     temporary_working_sets: bool = True
     temporary_working_set_min_variants: int = 65_536
     temporary_working_set_initial_size: int = 16_384
@@ -231,6 +249,28 @@ class ModelConfig:
             raise ValueError("stochastic_step_offset must be non-negative.")
         if not 0.0 < self.stochastic_step_exponent <= 1.0:
             raise ValueError("stochastic_step_exponent must lie in (0.0, 1.0].")
+        if not 0.0 < self.basil_l1_ratio <= 1.0:
+            raise ValueError("basil_l1_ratio must lie in (0.0, 1.0].")
+        if not 0.0 < self.basil_lambda_min_ratio < 1.0:
+            raise ValueError("basil_lambda_min_ratio must lie in (0.0, 1.0).")
+        if self.basil_n_lambdas < 1:
+            raise ValueError("basil_n_lambdas must be positive.")
+        if self.basil_strong_set_initial_size < 1:
+            raise ValueError("basil_strong_set_initial_size must be positive.")
+        if self.basil_strong_set_growth < 1:
+            raise ValueError("basil_strong_set_growth must be positive.")
+        if self.basil_batch_size < 1:
+            raise ValueError("basil_batch_size must be positive.")
+        if self.basil_max_screening_passes < 1:
+            raise ValueError("basil_max_screening_passes must be positive.")
+        if self.basil_irls_max_iterations < 1:
+            raise ValueError("basil_irls_max_iterations must be positive.")
+        if self.basil_coordinate_descent_max_epochs < 1:
+            raise ValueError("basil_coordinate_descent_max_epochs must be positive.")
+        if self.basil_coordinate_descent_tolerance <= 0.0:
+            raise ValueError("basil_coordinate_descent_tolerance must be positive.")
+        if self.basil_kkt_tolerance <= 0.0:
+            raise ValueError("basil_kkt_tolerance must be positive.")
         if self.temporary_working_set_min_variants < 0:
             raise ValueError("temporary_working_set_min_variants must be non-negative.")
         if self.temporary_working_set_initial_size < 1:

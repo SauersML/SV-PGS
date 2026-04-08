@@ -185,6 +185,10 @@ class VariationalFitCheckpoint:
     best_sigma_error2: float | None
     best_tpb_shape_a_vector: np.ndarray | None
     best_tpb_shape_b_vector: np.ndarray | None
+    completed_blocks_in_iteration: int = 0
+    beta_variance_state: np.ndarray | None = None
+    reduced_second_moment: np.ndarray | None = None
+    epoch_reduced_prior_variances: np.ndarray | None = None
 
 
 @dataclass(slots=True)
@@ -518,6 +522,13 @@ def _should_use_stochastic_variational_updates(
     variant_count = int(genotype_matrix.shape[1])
     if not config.stochastic_variational_updates:
         return False
+    # BASIL screening replaces stochastic block-coordinate descent:
+    # instead of partitioning into random blocks with step-size blending,
+    # each EM iteration does a full solve using gradient-based screening
+    # (working-set selection + KKT certification) via the collapsed
+    # posterior path.  This converges in 5-10 iterations vs 15-20 epochs.
+    if config.basil_screening:
+        return False
     if variant_count < max(int(config.stochastic_min_variant_count), 1):
         return False
     return variant_count > int(config.stochastic_variant_batch_size)
@@ -632,7 +643,14 @@ def fit_variational_em(
     def _copy_optional(array: np.ndarray | None) -> np.ndarray | None:
         return None if array is None else np.asarray(array, dtype=np.float64).copy()
 
-    def _build_checkpoint(completed_iterations: int) -> VariationalFitCheckpoint:
+    def _build_checkpoint(
+        completed_iterations: int,
+        *,
+        completed_blocks_in_iteration: int = 0,
+        beta_variance_state_override: np.ndarray | None = None,
+        reduced_second_moment_override: np.ndarray | None = None,
+        epoch_reduced_prior_variances_override: np.ndarray | None = None,
+    ) -> VariationalFitCheckpoint:
         return VariationalFitCheckpoint(
             config_signature=config_signature,
             prior_design_signature=prior_design_signature,
@@ -664,6 +682,10 @@ def fit_variational_em(
             best_sigma_error2=None if best_sigma_error2 is None else float(best_sigma_error2),
             best_tpb_shape_a_vector=_copy_optional(best_tpb_shape_a_vector),
             best_tpb_shape_b_vector=_copy_optional(best_tpb_shape_b_vector),
+            completed_blocks_in_iteration=int(completed_blocks_in_iteration),
+            beta_variance_state=_copy_optional(beta_variance_state_override),
+            reduced_second_moment=_copy_optional(reduced_second_moment_override),
+            epoch_reduced_prior_variances=_copy_optional(epoch_reduced_prior_variances_override),
         )
 
     def _initialize_em_state() -> None:
@@ -778,7 +800,37 @@ def fit_variational_em(
     if use_stochastic_updates:
         block_size = min(int(config.stochastic_variant_batch_size), int(genotype_matrix.shape[1]))
         block_count = max((int(genotype_matrix.shape[1]) + block_size - 1) // block_size, 1)
-        step_index = start_iteration * block_count
+        resume_completed_blocks_in_iteration = (
+            0
+            if resume_checkpoint is None
+            else int(resume_checkpoint.completed_blocks_in_iteration)
+        )
+        if resume_completed_blocks_in_iteration < 0 or resume_completed_blocks_in_iteration >= block_count:
+            if not (resume_completed_blocks_in_iteration == 0 and block_count == 1):
+                raise ValueError("resume checkpoint completed_blocks_in_iteration is out of range.")
+        resume_beta_variance_state = None
+        resume_reduced_second_moment = None
+        resume_epoch_reduced_prior_variances = None
+        if resume_completed_blocks_in_iteration > 0:
+            if resume_checkpoint is None:
+                raise ValueError("resume checkpoint block progress requires checkpoint state.")
+            if resume_checkpoint.beta_variance_state is None or resume_checkpoint.reduced_second_moment is None:
+                raise ValueError("resume checkpoint missing stochastic state for mid-epoch resume.")
+            if resume_checkpoint.epoch_reduced_prior_variances is None:
+                raise ValueError("resume checkpoint missing frozen epoch prior variances for mid-epoch resume.")
+            if resume_checkpoint.beta_variance_state.shape != (genotype_matrix.shape[1],):
+                raise ValueError("resume checkpoint beta_variance_state shape does not match reduced genotypes.")
+            if resume_checkpoint.reduced_second_moment.shape != (genotype_matrix.shape[1],):
+                raise ValueError("resume checkpoint reduced_second_moment shape does not match reduced genotypes.")
+            if resume_checkpoint.epoch_reduced_prior_variances.shape != (genotype_matrix.shape[1],):
+                raise ValueError("resume checkpoint epoch_reduced_prior_variances shape does not match reduced genotypes.")
+            resume_beta_variance_state = np.asarray(resume_checkpoint.beta_variance_state, dtype=np.float64).copy()
+            resume_reduced_second_moment = np.asarray(resume_checkpoint.reduced_second_moment, dtype=np.float64).copy()
+            resume_epoch_reduced_prior_variances = np.asarray(
+                resume_checkpoint.epoch_reduced_prior_variances,
+                dtype=np.float64,
+            ).copy()
+        step_index = start_iteration * block_count + resume_completed_blocks_in_iteration
         empty_covariates = np.zeros((target_vector.shape[0], 0), dtype=np.float64)
         metadata_baseline_scales = _metadata_baseline_scales_from_coefficients(
             scale_model_coefficients,
@@ -791,10 +843,18 @@ def fit_variational_em(
             local_scale=local_scale,
             config=config,
         )
-        beta_variance_state = np.maximum(reduced_prior_variances.copy(), 1e-8)
-        reduced_second_moment = np.maximum(
-            np.asarray(beta_state * beta_state, dtype=np.float64),
-            np.asarray(reduced_prior_variances, dtype=np.float64),
+        beta_variance_state = (
+            np.maximum(reduced_prior_variances.copy(), 1e-8)
+            if resume_beta_variance_state is None
+            else resume_beta_variance_state
+        )
+        reduced_second_moment = (
+            np.maximum(
+                np.asarray(beta_state * beta_state, dtype=np.float64),
+                np.asarray(reduced_prior_variances, dtype=np.float64),
+            )
+            if resume_reduced_second_moment is None
+            else resume_reduced_second_moment
         )
         log(
             "  variational inference mode: stochastic variant-block updates "
@@ -804,6 +864,7 @@ def fit_variational_em(
             log(f"  variational EM epoch {outer_iteration + 1}/{config.max_outer_iterations} start  sigma_e2={sigma_error2:.6f}  global_scale={global_scale:.6f}  mem={mem()}")
             epoch_wall_t0 = time.monotonic()
             epoch_total_newton_iters = 0
+            resuming_mid_epoch = outer_iteration == start_iteration and resume_completed_blocks_in_iteration > 0
             refresh_beta_variance = _should_refresh_beta_variance(
                 outer_iteration,
                 refresh_interval=config.beta_variance_update_interval,
@@ -823,38 +884,49 @@ def fit_variational_em(
                 config,
             )
             baseline_reduced_prior_variances = (float(global_scale) * metadata_baseline_scales) ** 2
-            reduced_prior_variances = _effective_prior_variances(
-                baseline_prior_variances=baseline_reduced_prior_variances,
-                local_scale=local_scale,
-                config=config,
+            reduced_prior_variances = (
+                np.asarray(resume_epoch_reduced_prior_variances, dtype=np.float64).copy()
+                if resuming_mid_epoch and resume_epoch_reduced_prior_variances is not None
+                else _effective_prior_variances(
+                    baseline_prior_variances=baseline_reduced_prior_variances,
+                    local_scale=local_scale,
+                    config=config,
+                )
             )
             genetic_linear_predictor = np.array(
                 genotype_matrix.matvec(beta_state, batch_size=config.posterior_variance_batch_size),
                 dtype=np.float64,
                 copy=True,
             )
-            if config.trait_type == TraitType.BINARY:
-                alpha_state = _fit_binary_alpha_with_offset(
-                    covariate_matrix=covariate_matrix,
-                targets=target_vector,
-                predictor_offset=predictor_offset_array + genetic_linear_predictor,
-                    minimum_weight=config.polya_gamma_minimum_weight,
-                    max_iterations=config.max_inner_newton_iterations,
-                    gradient_tolerance=config.newton_gradient_tolerance,
-                    alpha_init=alpha_state,
-                )
-                sigma_error2 = 1.0
-            else:
-                alpha_state = _initialize_alpha_state(
-                    covariate_matrix=covariate_matrix,
-                    targets=target_vector - predictor_offset_array - genetic_linear_predictor,
-                    trait_type=TraitType.QUANTITATIVE,
-                )
+            if not resuming_mid_epoch:
+                if config.trait_type == TraitType.BINARY:
+                    alpha_state = _fit_binary_alpha_with_offset(
+                        covariate_matrix=covariate_matrix,
+                        targets=target_vector,
+                        predictor_offset=predictor_offset_array + genetic_linear_predictor,
+                        minimum_weight=config.polya_gamma_minimum_weight,
+                        max_iterations=config.max_inner_newton_iterations,
+                        gradient_tolerance=config.newton_gradient_tolerance,
+                        alpha_init=alpha_state,
+                    )
+                    sigma_error2 = 1.0
+                else:
+                    alpha_state = _initialize_alpha_state(
+                        covariate_matrix=covariate_matrix,
+                        targets=target_vector - predictor_offset_array - genetic_linear_predictor,
+                        trait_type=TraitType.QUANTITATIVE,
+                    )
             covariate_linear_predictor = np.asarray(covariate_matrix @ alpha_state, dtype=np.float64)
 
-            n_blocks = (genotype_matrix.shape[1] + block_size - 1) // block_size
-            block_count = 0
-            for block_indices in _stochastic_variant_blocks(genotype_matrix.shape[1], block_size, epoch_rng):
+            epoch_blocks = _stochastic_variant_blocks(genotype_matrix.shape[1], block_size, epoch_rng)
+            n_blocks = len(epoch_blocks)
+            block_count = 0 if not resuming_mid_epoch else resume_completed_blocks_in_iteration
+            if resuming_mid_epoch:
+                log(
+                    "  variational EM: resuming stochastic epoch "
+                    + f"{outer_iteration + 1}/{config.max_outer_iterations} at block {resume_completed_blocks_in_iteration + 1}/{n_blocks}  mem={mem()}"
+                )
+            for block_indices in epoch_blocks[resume_completed_blocks_in_iteration:]:
                 step_index += 1
                 block_count += 1
                 step_size = _stochastic_step_size(config, step_index)
@@ -980,9 +1052,20 @@ def fit_variational_em(
                 if block_count % 5 == 0:
                     gc.collect()
                 log(f"    block {block_count}/{n_blocks} done  mem={mem()}")
-                # Intra-epoch checkpoint every 10 blocks so crashes don't lose progress
-                if checkpoint_callback is not None and step_index % 10 == 0:
-                    checkpoint_callback(_build_checkpoint(outer_iteration))
+                if checkpoint_callback is not None:
+                    checkpoint_callback(
+                        _build_checkpoint(
+                            outer_iteration,
+                            completed_blocks_in_iteration=block_count,
+                            beta_variance_state_override=beta_variance_state,
+                            reduced_second_moment_override=reduced_second_moment,
+                            epoch_reduced_prior_variances_override=reduced_prior_variances,
+                        )
+                    )
+            resume_completed_blocks_in_iteration = 0
+            resume_beta_variance_state = None
+            resume_reduced_second_moment = None
+            resume_epoch_reduced_prior_variances = None
 
             epoch_wall_seconds = time.monotonic() - epoch_wall_t0
             n_nonzero_beta = int(np.sum(beta_state != 0.0))
@@ -1131,7 +1214,15 @@ def fit_variational_em(
                 log(f"  stochastic variational updates converged on epoch {outer_iteration + 1} with parameter_change={parameter_change:.3e}")
                 break
     else:
+        if config.basil_screening and genotype_matrix.shape[1] >= config.temporary_working_set_min_variants:
+            log(
+                f"  variational inference mode: BASIL screening "
+                f"(total_variants={genotype_matrix.shape[1]}, "
+                f"working_set_initial={config.temporary_working_set_initial_size}, "
+                f"max_passes={config.temporary_working_set_max_passes})"
+            )
         for outer_iteration in range(start_iteration, config.max_outer_iterations):
+            iter_wall_t0 = time.monotonic()
             log(f"  variational EM iteration {outer_iteration + 1}/{config.max_outer_iterations} start  sigma_e2={sigma_error2:.6f}  global_scale={global_scale:.6f}  mem={mem()}")
             posterior_theta = _pack_theta(
                 global_scale=float(global_scale),
@@ -1291,7 +1382,8 @@ def fit_variational_em(
             hyper_str = "  [+hyper]" if should_update_hyperparameters else ""
             variance_str = "  [beta_var]" if refresh_beta_variance else "  [beta_var=reuse]"
             nonzero_beta = int(np.count_nonzero(np.abs(beta_state) > 1e-8))
-            log(f"  EM iter {iter_num}/{config.max_outer_iterations}  obj={obj_str}  delta={parameter_change:.2e}  sigma_e2={sigma_error2:.4f}  g_scale={float(global_scale):.4f}  nz_beta={nonzero_beta}{val_str}{hyper_str}{variance_str}  mem={mem()}")
+            iter_wall_seconds = time.monotonic() - iter_wall_t0
+            log(f"  EM iter {iter_num}/{config.max_outer_iterations}  obj={obj_str}  delta={parameter_change:.2e}  sigma_e2={sigma_error2:.4f}  g_scale={float(global_scale):.4f}  nz_beta={nonzero_beta}  wall={iter_wall_seconds:.1f}s{val_str}{hyper_str}{variance_str}  mem={mem()}")
             if checkpoint_callback is not None:
                 checkpoint_callback(_build_checkpoint(iter_num))
 
@@ -4325,11 +4417,13 @@ def _restricted_posterior_state_temporary_working_set(
     )
 
     for working_pass in range(max(int(temporary_working_set_max_passes), 1)):
+        import time as _ws_time
+        _ws_pass_t0 = _ws_time.monotonic()
         log(
-            "    restricted posterior: temporary working set "
-            + f"pass {working_pass + 1}/{int(temporary_working_set_max_passes)} "
+            "    BASIL screening pass "
+            + f"{working_pass + 1}/{int(temporary_working_set_max_passes)} "
             + f"size={working_indices.shape[0]}/{variant_count} "
-            + f"ever_active={ever_active_indices.shape[0]}"
+            + f"ever_active={ever_active_indices.shape[0]}  mem={mem()}"
         )
         working_set_genotypes = genotype_matrix.subset(working_indices)
         # Upload working set to GPU for exact Cholesky solve (if it fits)
@@ -4355,7 +4449,13 @@ def _restricted_posterior_state_temporary_working_set(
             temporary_working_sets=False,
             allow_working_set=False,
         )
-        # Free GPU memory after subset solve
+        # Extract genetic prediction from subset result — avoids one full forward
+        # matvec on all variants.  The subset solve returns linear_predictor =
+        # covariates @ alpha + working_genotypes @ beta_working.  Since excluded
+        # betas are zero, this equals the full genotype_matrix.matvec(candidate_beta).
+        subset_alpha = np.asarray(subset_state[0], dtype=np.float64)
+        subset_fitted = np.asarray(subset_state[4], dtype=np.float64)
+        # Free GPU memory after extracting what we need
         working_set_genotypes._cupy_cache = None
         del working_set_genotypes
         candidate_beta = np.zeros(variant_count, dtype=np.float64)
@@ -4367,7 +4467,21 @@ def _restricted_posterior_state_temporary_working_set(
             ],
             variant_count,
         )
-        genetic_linear_predictor, projected_targets, candidate_gradient = _projected_residual_and_gradient(candidate_beta)
+        # Incremental gradient: use subset's fitted response for forward prediction,
+        # only do one full transpose matvec for gradient (saves ~12s per pass).
+        genetic_linear_predictor = np.asarray(
+            subset_fitted - covariate_matrix @ subset_alpha,
+            dtype=np.float64,
+        )
+        residual_vector = np.asarray(targets - genetic_linear_predictor, dtype=np.float64)
+        projected_targets = np.asarray(apply_projector(residual_vector), dtype=np.float64)
+        candidate_gradient = np.asarray(
+            genotype_matrix.transpose_matvec(
+                projected_targets,
+                batch_size=posterior_variance_batch_size,
+            ),
+            dtype=np.float64,
+        ) - prior_precision * candidate_beta
         candidate_score = _working_set_screening_score(candidate_gradient, candidate_beta, prior_variances)
         candidate_update_score = _working_set_posterior_update_score(candidate_gradient, prior_variances)
         excluded_mask = np.ones(variant_count, dtype=bool)

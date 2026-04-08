@@ -74,6 +74,21 @@ def _synthetic_binary_dataset() -> tuple[np.ndarray, np.ndarray, np.ndarray, lis
     return genotype_matrix, covariate_matrix, target_vector, variant_records
 
 
+class ShapeOnlyRawGenotypeMatrix(RawGenotypeMatrix):
+    def __init__(self, sample_count: int, variant_count: int) -> None:
+        self._shape = (int(sample_count), int(variant_count))
+
+    @property
+    def shape(self) -> tuple[int, int]:
+        return self._shape
+
+    def iter_column_batches(self, variant_indices=None, batch_size: int = 1024):
+        raise AssertionError("shape-only test double should not be iterated")
+
+    def materialize(self, variant_indices=None) -> np.ndarray:
+        raise AssertionError("shape-only test double should not be materialized")
+
+
 def test_binary_model_fit_roundtrip_and_keeps_all_variants(tmp_path):
     genotype_matrix, covariate_matrix, target_vector, variant_records = _synthetic_binary_dataset()
     genotype_matrix[:159, 4] = 0.0
@@ -115,7 +130,7 @@ def test_binary_model_fit_roundtrip_and_keeps_all_variants(tmp_path):
 
 
 def test_runtime_tuned_config_for_t4_caps_solver_from_gpu_budget(monkeypatch):
-    raw_genotypes = as_raw_genotype_matrix(np.zeros((1_000, 50_000), dtype=np.float32))
+    raw_genotypes = ShapeOnlyRawGenotypeMatrix(sample_count=1_000, variant_count=50_000)
     config = ModelConfig(
         trait_type=TraitType.BINARY,
         exact_solver_matrix_limit=2_048,
@@ -474,6 +489,97 @@ def test_fit_resumes_from_variational_checkpoint(tmp_path, monkeypatch):
     assert resumed_model.state is not None
     assert call_log == [None, 1]
     assert not cache_paths.em_checkpoint_path.exists()
+
+
+def test_fit_checkpoint_persists_basis_cache_during_interrupted_run(tmp_path, monkeypatch):
+    genotype_matrix, covariate_matrix, target_vector, variant_records = _synthetic_binary_dataset()
+    cache_paths = _FitStageCachePaths(
+        key="runtime-basis-test",
+        cache_dir=tmp_path,
+        manifest_path=tmp_path / "runtime-basis-test.manifest.json",
+        active_indices_path=tmp_path / "runtime-basis-test.active.npy",
+        tie_map_path=tmp_path / "runtime-basis-test.tie.pkl",
+        reduced_raw_i8_path=tmp_path / "runtime-basis-test.reduced_raw_i8.npy",
+        em_checkpoint_path=tmp_path / "runtime-basis-test.em.pkl",
+    )
+
+    monkeypatch.setattr(model_module, "_fit_stage_cache_paths", lambda **kwargs: cache_paths)
+
+    def fake_fit_variational_em(
+        genotypes,
+        covariates,
+        targets,
+        records,
+        tie_map,
+        config,
+        validation_data,
+        resume_checkpoint=None,
+        checkpoint_callback=None,
+        predictor_offset=None,
+        validation_offset=None,
+    ):
+        reduced_records = mixture_module.collapse_tie_groups(list(records), tie_map)
+        prior_design = mixture_module._build_prior_design(reduced_records)
+        basis = np.arange(genotypes.shape[0] * 3, dtype=np.float64).reshape(genotypes.shape[0], 3)
+        genotypes._sample_space_nystrom_basis_cpu_cache[(3, 19)] = basis
+        checkpoint_callback(
+            VariationalFitCheckpoint(
+                config_signature="runtime-basis-config",
+                prior_design_signature="runtime-basis-design",
+                validation_enabled=False,
+                completed_iterations=0,
+                alpha_state=np.zeros(covariates.shape[1], dtype=np.float64),
+                beta_state=np.zeros(genotypes.shape[1], dtype=np.float64),
+                local_scale=np.ones(genotypes.shape[1], dtype=np.float64),
+                auxiliary_delta=np.ones(genotypes.shape[1], dtype=np.float64),
+                sigma_error2=1.0,
+                global_scale=1.0,
+                scale_model_coefficients=np.zeros(prior_design.design_matrix.shape[1], dtype=np.float64),
+                tpb_shape_a_vector=np.ones(prior_design.class_membership_matrix.shape[1], dtype=np.float64),
+                tpb_shape_b_vector=np.ones(prior_design.class_membership_matrix.shape[1], dtype=np.float64),
+                objective_history=[],
+                validation_history=[],
+                previous_alpha=None,
+                previous_beta=None,
+                previous_local_scale=None,
+                previous_theta=None,
+                previous_tpb_shape_a_vector=None,
+                previous_tpb_shape_b_vector=None,
+                best_validation_metric=None,
+                best_alpha=None,
+                best_beta=None,
+                best_beta_variance=None,
+                best_local_scale=None,
+                best_theta=None,
+                best_sigma_error2=None,
+                best_tpb_shape_a_vector=None,
+                best_tpb_shape_b_vector=None,
+                completed_blocks_in_iteration=1,
+                beta_variance_state=np.ones(genotypes.shape[1], dtype=np.float64),
+                reduced_second_moment=np.ones(genotypes.shape[1], dtype=np.float64),
+                epoch_reduced_prior_variances=np.ones(genotypes.shape[1], dtype=np.float64),
+            )
+        )
+        raise RuntimeError("stop-after-runtime-basis-checkpoint")
+
+    monkeypatch.setattr(model_module, "fit_variational_em", fake_fit_variational_em)
+
+    with pytest.raises(RuntimeError, match="stop-after-runtime-basis-checkpoint"):
+        BayesianPGS(
+            ModelConfig(
+                trait_type=TraitType.BINARY,
+                max_outer_iterations=2,
+                minimum_minor_allele_frequency=0.0,
+                sample_space_preconditioner_rank=3,
+                random_seed=19,
+            )
+        ).fit(genotype_matrix, covariate_matrix, target_vector, variant_records)
+
+    basis_path = model_module._sample_space_basis_cache_path(cache_paths, rank=3, random_seed=19)
+    assert cache_paths.em_checkpoint_path.exists()
+    assert basis_path.exists()
+    restored_basis = np.load(basis_path)
+    assert restored_basis.shape[1] == 3
 
 
 def test_corrupt_variational_checkpoint_is_ignored(tmp_path, monkeypatch):

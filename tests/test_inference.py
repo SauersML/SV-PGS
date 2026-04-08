@@ -507,6 +507,126 @@ def test_fit_variational_em_ignores_resume_checkpoint_when_validation_is_present
     assert np.all(np.isfinite(result.beta_reduced))
 
 
+def test_fit_variational_em_resumes_mid_stochastic_epoch(monkeypatch):
+    sample_count, variant_count = 12, 4
+    genotype_matrix = np.array(
+        [
+            [0.2, -0.1, 0.4, 0.0],
+            [0.0, 0.3, -0.2, 0.5],
+            [0.1, 0.0, 0.2, -0.4],
+            [-0.3, 0.2, 0.0, 0.1],
+            [0.4, -0.2, 0.1, 0.0],
+            [0.3, 0.1, -0.1, 0.2],
+            [-0.2, 0.4, 0.3, -0.1],
+            [0.5, -0.3, 0.0, 0.4],
+            [0.0, 0.2, -0.4, 0.3],
+            [0.1, -0.4, 0.5, 0.2],
+            [-0.1, 0.5, 0.2, -0.3],
+            [0.2, 0.0, 0.1, 0.4],
+        ],
+        dtype=np.float32,
+    )
+    covariate_matrix = np.column_stack(
+        [
+            np.ones(sample_count, dtype=np.float32),
+            np.linspace(-1.0, 1.0, sample_count, dtype=np.float32),
+        ]
+    )
+    target_vector = np.linspace(-0.5, 0.5, sample_count, dtype=np.float32)
+    records = make_variant_records(variant_count)
+    config = ModelConfig(
+        trait_type=TraitType.QUANTITATIVE,
+        max_outer_iterations=1,
+        update_hyperparameters=False,
+        basil_screening=False,
+        final_posterior_refinement=False,
+        stochastic_variational_updates=True,
+        stochastic_min_variant_count=1,
+        stochastic_variant_batch_size=2,
+        stochastic_step_offset=0.0,
+        stochastic_step_exponent=1.0,
+        minimum_minor_allele_frequency=0.0,
+    )
+    tie_map = build_tie_map(genotype_matrix, records, config)
+    block_sequence = [
+        np.array([0, 1], dtype=np.int32),
+        np.array([2, 3], dtype=np.int32),
+    ]
+    processed_blocks: list[int] = []
+
+    monkeypatch.setattr(
+        mixture_inference,
+        "_stochastic_variant_blocks",
+        lambda variant_count, block_size, random_generator: [block.copy() for block in block_sequence],
+    )
+
+    def fake_fit_collapsed_posterior(
+        genotype_matrix,
+        covariate_matrix,
+        targets,
+        reduced_prior_variances,
+        sigma_error2,
+        alpha_init,
+        beta_init,
+        trait_type,
+        config,
+        compute_logdet,
+        compute_beta_variance,
+        stale_beta_variance,
+        restricted_posterior_warm_start,
+        **kwargs,
+    ):
+        first_variant = int(genotype_matrix.variant_indices[0])
+        processed_blocks.append(first_variant)
+        block_beta = np.full(genotype_matrix.shape[1], float(first_variant + 1), dtype=np.float64)
+        return PosteriorState(
+            alpha=np.zeros(0, dtype=np.float64),
+            beta=block_beta,
+            beta_variance=np.full(genotype_matrix.shape[1], 0.25, dtype=np.float64),
+            linear_predictor=np.zeros(targets.shape[0], dtype=np.float64),
+            collapsed_objective=float(first_variant),
+            sigma_error2=float(sigma_error2),
+        )
+
+    monkeypatch.setattr(mixture_inference, "_fit_collapsed_posterior", fake_fit_collapsed_posterior)
+
+    saved_checkpoints: list[VariationalFitCheckpoint] = []
+
+    def stop_after_first_block(checkpoint: VariationalFitCheckpoint) -> None:
+        saved_checkpoints.append(checkpoint)
+        raise RuntimeError("stop-after-first-block")
+
+    with pytest.raises(RuntimeError, match="stop-after-first-block"):
+        fit_variational_em(
+            genotypes=genotype_matrix,
+            covariates=covariate_matrix,
+            targets=target_vector,
+            records=records,
+            config=config,
+            tie_map=tie_map,
+            checkpoint_callback=stop_after_first_block,
+        )
+
+    assert processed_blocks == [0]
+    assert len(saved_checkpoints) == 1
+    assert saved_checkpoints[0].completed_iterations == 0
+    assert saved_checkpoints[0].completed_blocks_in_iteration == 1
+
+    processed_blocks.clear()
+    result = fit_variational_em(
+        genotypes=genotype_matrix,
+        covariates=covariate_matrix,
+        targets=target_vector,
+        records=records,
+        config=config,
+        tie_map=tie_map,
+        resume_checkpoint=saved_checkpoints[0],
+    )
+
+    assert processed_blocks == [2]
+    np.testing.assert_allclose(result.beta_reduced, np.array([1.0, 1.0, 1.5, 1.5], dtype=np.float32))
+
+
 def test_variational_em_supports_covariates_only_mode():
     covariate_matrix = np.array(
         [

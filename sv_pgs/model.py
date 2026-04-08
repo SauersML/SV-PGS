@@ -710,6 +710,25 @@ class BayesianPGS:
             else _try_load_variational_checkpoint(fit_stage_cache_paths)
         )
         log(f"  EM checkpoint: {'found — resuming' if resume_checkpoint else 'none — starting fresh'}")
+        checkpoint_callback = None
+        if fit_stage_cache_paths is not None:
+            def checkpoint_callback(checkpoint: VariationalFitCheckpoint) -> None:
+                _save_variational_checkpoint(fit_stage_cache_paths, checkpoint)
+                if int(self.config.sample_space_preconditioner_rank) <= 0:
+                    return
+                basis_path = _sample_space_basis_cache_path(
+                    fit_stage_cache_paths,
+                    rank=int(self.config.sample_space_preconditioner_rank),
+                    random_seed=int(self.config.random_seed),
+                )
+                if not basis_path.exists():
+                    _save_sample_space_basis_cache(
+                        cache_paths=fit_stage_cache_paths,
+                        genotype_matrix=reduced_genotypes,
+                        rank=int(self.config.sample_space_preconditioner_rank),
+                        random_seed=int(self.config.random_seed),
+                    )
+
         fit_result = fit_variational_em(
             genotypes=reduced_genotypes,
             covariates=prepared_arrays.covariates,
@@ -719,11 +738,7 @@ class BayesianPGS:
             config=self.config,
             validation_data=reduced_validation,
             resume_checkpoint=resume_checkpoint,
-            checkpoint_callback=(
-                None
-                if fit_stage_cache_paths is None
-                else lambda checkpoint: _save_variational_checkpoint(fit_stage_cache_paths, checkpoint)
-            ),
+            checkpoint_callback=checkpoint_callback,
             predictor_offset=None,
             validation_offset=None,
         )
