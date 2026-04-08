@@ -264,9 +264,9 @@ class PosteriorState:
 @dataclass(slots=True)
 class _RestrictedPosteriorWarmStart:
     sample_space_inverse_covariance_rhs: Any = None
-    temporary_working_set_variant_count: int | None = None
-    temporary_working_set_matrix_token: int | None = None
-    temporary_working_set_ever_active: np.ndarray | None = None
+    posterior_working_set_variant_count: int | None = None
+    posterior_working_set_matrix_token: int | None = None
+    posterior_working_set_ever_active: np.ndarray | None = None
     weighted_covariate_projection_matrix_token: int | None = None
     weighted_covariate_projection_signature: str | None = None
     weighted_covariate_projection: np.ndarray | None = None
@@ -291,10 +291,10 @@ _CHECKPOINT_EXCLUDED_CONFIG_FIELDS = frozenset({
     "sample_space_preconditioner_rank",
     "max_inner_newton_iterations",
     "newton_gradient_tolerance",
-    "temporary_working_set_initial_size",
-    "temporary_working_set_growth",
-    "temporary_working_set_max_passes",
-    "temporary_working_set_coefficient_tolerance",
+    "posterior_working_set_initial_size",
+    "posterior_working_set_growth",
+    "posterior_working_set_max_passes",
+    "posterior_working_set_coefficient_tolerance",
     "validation_interval",
     "random_seed",
     "final_posterior_refinement",
@@ -542,7 +542,7 @@ def _should_use_stochastic_variational_updates(
     # enough, use the collapsed posterior path instead.  Each EM iteration
     # does a full solve via gradient-based screening + KKT certification,
     # converging in 5-10 iterations vs 15-20 stochastic epochs.
-    if config.temporary_working_sets and variant_count >= config.temporary_working_set_min_variants:
+    if config.posterior_working_sets and variant_count >= config.posterior_working_set_min_variants:
         return False
     if variant_count < max(int(config.stochastic_min_variant_count), 1):
         return False
@@ -1241,14 +1241,14 @@ def fit_variational_em(
                 break
     else:
         if (
-            config.temporary_working_sets
-            and genotype_matrix.shape[1] >= config.temporary_working_set_min_variants
+            config.posterior_working_sets
+            and genotype_matrix.shape[1] >= config.posterior_working_set_min_variants
         ):
             log(
                 "  variational inference mode: posterior working sets "
                 + f"(total_variants={genotype_matrix.shape[1]}, "
-                + f"initial={config.temporary_working_set_initial_size}, "
-                + f"max_passes={config.temporary_working_set_max_passes})"
+                + f"initial={config.posterior_working_set_initial_size}, "
+                + f"max_passes={config.posterior_working_set_max_passes})"
             )
         for outer_iteration in range(start_iteration, config.max_outer_iterations):
             iter_wall_t0 = time.monotonic()
@@ -1687,12 +1687,12 @@ def _fit_collapsed_posterior(
             compute_logdet=compute_logdet,
             compute_beta_variance=compute_beta_variance,
             sample_space_preconditioner_rank=config.sample_space_preconditioner_rank,
-            temporary_working_sets=config.temporary_working_sets,
-            temporary_working_set_min_variants=config.temporary_working_set_min_variants,
-            temporary_working_set_initial_size=config.temporary_working_set_initial_size,
-            temporary_working_set_growth=config.temporary_working_set_growth,
-            temporary_working_set_max_passes=config.temporary_working_set_max_passes,
-            temporary_working_set_coefficient_tolerance=config.temporary_working_set_coefficient_tolerance,
+            posterior_working_sets=config.posterior_working_sets,
+            posterior_working_set_min_variants=config.posterior_working_set_min_variants,
+            posterior_working_set_initial_size=config.posterior_working_set_initial_size,
+            posterior_working_set_growth=config.posterior_working_set_growth,
+            posterior_working_set_max_passes=config.posterior_working_set_max_passes,
+            posterior_working_set_coefficient_tolerance=config.posterior_working_set_coefficient_tolerance,
             stale_beta_variance=stale_beta_variance,
             restricted_posterior_warm_start=restricted_posterior_warm_start,
         )
@@ -1726,12 +1726,12 @@ def _fit_collapsed_posterior(
             compute_beta_variance=compute_beta_variance,
             sample_space_preconditioner_rank=config.sample_space_preconditioner_rank,
             predictor_offset=predictor_offset_array,
-            temporary_working_sets=config.temporary_working_sets,
-            temporary_working_set_min_variants=config.temporary_working_set_min_variants,
-            temporary_working_set_initial_size=config.temporary_working_set_initial_size,
-            temporary_working_set_growth=config.temporary_working_set_growth,
-            temporary_working_set_max_passes=config.temporary_working_set_max_passes,
-            temporary_working_set_coefficient_tolerance=config.temporary_working_set_coefficient_tolerance,
+            posterior_working_sets=config.posterior_working_sets,
+            posterior_working_set_min_variants=config.posterior_working_set_min_variants,
+            posterior_working_set_initial_size=config.posterior_working_set_initial_size,
+            posterior_working_set_growth=config.posterior_working_set_growth,
+            posterior_working_set_max_passes=config.posterior_working_set_max_passes,
+            posterior_working_set_coefficient_tolerance=config.posterior_working_set_coefficient_tolerance,
             restricted_posterior_warm_start=restricted_posterior_warm_start,
         )
         beta_variance = _effective_beta_variance_state(
@@ -1778,12 +1778,12 @@ def _quantitative_posterior_state(
     compute_logdet: bool = True,
     compute_beta_variance: bool = True,
     sample_space_preconditioner_rank: int = 256,
-    temporary_working_sets: bool = True,
-    temporary_working_set_min_variants: int = 65_536,
-    temporary_working_set_initial_size: int = 16_384,
-    temporary_working_set_growth: int = 16_384,
-    temporary_working_set_max_passes: int = 6,
-    temporary_working_set_coefficient_tolerance: float = 1e-4,
+    posterior_working_sets: bool = True,
+    posterior_working_set_min_variants: int = 65_536,
+    posterior_working_set_initial_size: int = 16_384,
+    posterior_working_set_growth: int = 16_384,
+    posterior_working_set_max_passes: int = 6,
+    posterior_working_set_coefficient_tolerance: float = 1e-4,
     stale_beta_variance: np.ndarray | None = None,
     restricted_posterior_warm_start: _RestrictedPosteriorWarmStart | None = None,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, float, float]:
@@ -1807,12 +1807,12 @@ def _quantitative_posterior_state(
             compute_logdet=compute_logdet,
             compute_beta_variance=compute_beta_variance,
             sample_space_preconditioner_rank=sample_space_preconditioner_rank,
-            temporary_working_sets=temporary_working_sets,
-            temporary_working_set_min_variants=temporary_working_set_min_variants,
-            temporary_working_set_initial_size=temporary_working_set_initial_size,
-            temporary_working_set_growth=temporary_working_set_growth,
-            temporary_working_set_max_passes=temporary_working_set_max_passes,
-            temporary_working_set_coefficient_tolerance=temporary_working_set_coefficient_tolerance,
+            posterior_working_sets=posterior_working_sets,
+            posterior_working_set_min_variants=posterior_working_set_min_variants,
+            posterior_working_set_initial_size=posterior_working_set_initial_size,
+            posterior_working_set_growth=posterior_working_set_growth,
+            posterior_working_set_max_passes=posterior_working_set_max_passes,
+            posterior_working_set_coefficient_tolerance=posterior_working_set_coefficient_tolerance,
             warm_start=restricted_posterior_warm_start,
         )
     )
@@ -2065,12 +2065,12 @@ def _binary_posterior_state(
     compute_beta_variance: bool = True,
     sample_space_preconditioner_rank: int = 256,
     predictor_offset: np.ndarray | None = None,
-    temporary_working_sets: bool = True,
-    temporary_working_set_min_variants: int = 65_536,
-    temporary_working_set_initial_size: int = 16_384,
-    temporary_working_set_growth: int = 16_384,
-    temporary_working_set_max_passes: int = 6,
-    temporary_working_set_coefficient_tolerance: float = 1e-4,
+    posterior_working_sets: bool = True,
+    posterior_working_set_min_variants: int = 65_536,
+    posterior_working_set_initial_size: int = 16_384,
+    posterior_working_set_growth: int = 16_384,
+    posterior_working_set_max_passes: int = 6,
+    posterior_working_set_coefficient_tolerance: float = 1e-4,
     restricted_posterior_warm_start: _RestrictedPosteriorWarmStart | None = None,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, float, int]:
     standardized_genotypes = _as_standardized_genotype_matrix(genotype_matrix)
@@ -2209,12 +2209,12 @@ def _binary_posterior_state(
                 compute_beta_variance=False,
                 initial_beta_guess=parameters[covariate_count:],
                 sample_space_preconditioner_rank=sample_space_preconditioner_rank,
-                temporary_working_sets=temporary_working_sets,
-                temporary_working_set_min_variants=temporary_working_set_min_variants,
-                temporary_working_set_initial_size=temporary_working_set_initial_size,
-                temporary_working_set_growth=temporary_working_set_growth,
-                temporary_working_set_max_passes=temporary_working_set_max_passes,
-                temporary_working_set_coefficient_tolerance=temporary_working_set_coefficient_tolerance,
+                posterior_working_sets=posterior_working_sets,
+                posterior_working_set_min_variants=posterior_working_set_min_variants,
+                posterior_working_set_initial_size=posterior_working_set_initial_size,
+                posterior_working_set_growth=posterior_working_set_growth,
+                posterior_working_set_max_passes=posterior_working_set_max_passes,
+                posterior_working_set_coefficient_tolerance=posterior_working_set_coefficient_tolerance,
                 warm_start=warm_start,
             )
         )
@@ -2327,12 +2327,12 @@ def _binary_posterior_state(
                     compute_beta_variance=compute_beta_variance,
                     initial_beta_guess=parameters[covariate_count:],
                     sample_space_preconditioner_rank=sample_space_preconditioner_rank,
-                    temporary_working_sets=temporary_working_sets,
-                    temporary_working_set_min_variants=temporary_working_set_min_variants,
-                    temporary_working_set_initial_size=temporary_working_set_initial_size,
-                    temporary_working_set_growth=temporary_working_set_growth,
-                    temporary_working_set_max_passes=temporary_working_set_max_passes,
-                    temporary_working_set_coefficient_tolerance=temporary_working_set_coefficient_tolerance,
+                    posterior_working_sets=posterior_working_sets,
+                    posterior_working_set_min_variants=posterior_working_set_min_variants,
+                    posterior_working_set_initial_size=posterior_working_set_initial_size,
+                    posterior_working_set_growth=posterior_working_set_growth,
+                    posterior_working_set_max_passes=posterior_working_set_max_passes,
+                    posterior_working_set_coefficient_tolerance=posterior_working_set_coefficient_tolerance,
                     warm_start=warm_start,
                 )
             )
@@ -4482,22 +4482,22 @@ def _use_gpu_exact_variant_solve(
     return variant_count <= limit
 
 
-def _should_use_temporary_working_set(
+def _should_use_posterior_working_set(
     genotype_matrix: StandardizedGenotypeMatrix,
     *,
     variant_count: int,
     compute_logdet: bool,
     compute_beta_variance: bool,
-    temporary_working_sets: bool,
-    temporary_working_set_min_variants: int,
+    posterior_working_sets: bool,
+    posterior_working_set_min_variants: int,
     allow_working_set: bool,
 ) -> bool:
     return (
         allow_working_set
-        and temporary_working_sets
+        and posterior_working_sets
         and not compute_logdet
         and not compute_beta_variance
-        and variant_count >= max(int(temporary_working_set_min_variants), 0)
+        and variant_count >= max(int(posterior_working_set_min_variants), 0)
         and genotype_matrix.shape[0] > 0
     )
 
@@ -4578,7 +4578,7 @@ def _posterior_working_set_indices(
     return _ordered_unique_indices([mandatory, ranked_remaining], total_variants)
 
 
-def _reset_temporary_working_set_warm_start(
+def _reset_posterior_working_set_warm_start(
     warm_start: _RestrictedPosteriorWarmStart | None,
     genotype_matrix: StandardizedGenotypeMatrix,
     variant_count: int,
@@ -4587,15 +4587,15 @@ def _reset_temporary_working_set_warm_start(
         return
     matrix_token = id(genotype_matrix)
     if (
-        warm_start.temporary_working_set_variant_count != int(variant_count)
-        or warm_start.temporary_working_set_matrix_token != matrix_token
+        warm_start.posterior_working_set_variant_count != int(variant_count)
+        or warm_start.posterior_working_set_matrix_token != matrix_token
     ):
-        warm_start.temporary_working_set_variant_count = int(variant_count)
-        warm_start.temporary_working_set_matrix_token = matrix_token
-        warm_start.temporary_working_set_ever_active = None
+        warm_start.posterior_working_set_variant_count = int(variant_count)
+        warm_start.posterior_working_set_matrix_token = matrix_token
+        warm_start.posterior_working_set_ever_active = None
 
 
-def _restricted_posterior_state_temporary_working_set(
+def _restricted_posterior_state_posterior_working_set(
     genotype_matrix: StandardizedGenotypeMatrix,
     covariate_matrix: np.ndarray,
     targets: np.ndarray,
@@ -4612,14 +4612,14 @@ def _restricted_posterior_state_temporary_working_set(
     random_seed: int,
     sample_space_preconditioner_rank: int,
     initial_beta_guess: np.ndarray | None,
-    temporary_working_set_initial_size: int,
-    temporary_working_set_growth: int,
-    temporary_working_set_max_passes: int,
-    temporary_working_set_coefficient_tolerance: float,
+    posterior_working_set_initial_size: int,
+    posterior_working_set_growth: int,
+    posterior_working_set_max_passes: int,
+    posterior_working_set_coefficient_tolerance: float,
     warm_start: _RestrictedPosteriorWarmStart | None,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, float, float, float]:
     variant_count = genotype_matrix.shape[1]
-    _reset_temporary_working_set_warm_start(warm_start, genotype_matrix, variant_count)
+    _reset_posterior_working_set_warm_start(warm_start, genotype_matrix, variant_count)
     current_beta = (
         np.zeros(variant_count, dtype=np.float64)
         if initial_beta_guess is None
@@ -4664,24 +4664,24 @@ def _restricted_posterior_state_temporary_working_set(
     log(f"    initial gradient computed in {_ws_time.monotonic() - _ws_init_t0:.1f}s  mem={mem()}")
     ever_active_indices = _ordered_unique_indices(
         [
-            warm_start.temporary_working_set_ever_active if warm_start is not None else None,
-            _active_working_set_indices(current_beta, temporary_working_set_coefficient_tolerance),
+            warm_start.posterior_working_set_ever_active if warm_start is not None else None,
+            _active_working_set_indices(current_beta, posterior_working_set_coefficient_tolerance),
         ],
         variant_count,
     )
-    working_size = min(max(int(temporary_working_set_initial_size), 1), variant_count)
+    working_size = min(max(int(posterior_working_set_initial_size), 1), variant_count)
     working_indices = _posterior_working_set_indices(
         _working_set_screening_score(current_gradient, current_beta, prior_variances),
         ever_active_indices,
         max(working_size, ever_active_indices.shape[0]),
     )
 
-    for working_pass in range(max(int(temporary_working_set_max_passes), 1)):
+    for working_pass in range(max(int(posterior_working_set_max_passes), 1)):
         import time as _ws_time
         _ws_pass_t0 = _ws_time.monotonic()
         log(
             "    posterior working-set pass "
-            + f"{working_pass + 1}/{int(temporary_working_set_max_passes)} "
+            + f"{working_pass + 1}/{int(posterior_working_set_max_passes)} "
             + f"size={working_indices.shape[0]}/{variant_count} "
             + f"ever_active={ever_active_indices.shape[0]}  mem={mem()}"
         )
@@ -4706,7 +4706,7 @@ def _restricted_posterior_state_temporary_working_set(
             compute_beta_variance=False,
             initial_beta_guess=current_beta[working_indices],
             sample_space_preconditioner_rank=sample_space_preconditioner_rank,
-            temporary_working_sets=False,
+            posterior_working_sets=False,
             allow_working_set=False,
         )
         # Extract genetic prediction from subset result — avoids one full forward
@@ -4723,7 +4723,7 @@ def _restricted_posterior_state_temporary_working_set(
         ever_active_indices = _ordered_unique_indices(
             [
                 ever_active_indices,
-                _active_working_set_indices(candidate_beta, temporary_working_set_coefficient_tolerance),
+                _active_working_set_indices(candidate_beta, posterior_working_set_coefficient_tolerance),
             ],
             variant_count,
         )
@@ -4756,7 +4756,7 @@ def _restricted_posterior_state_temporary_working_set(
             else 0.0
         )
         if (
-            max_excluded_update <= float(temporary_working_set_coefficient_tolerance)
+            max_excluded_update <= float(posterior_working_set_coefficient_tolerance)
             or working_indices.shape[0] == variant_count
         ):
             alpha = np.asarray(
@@ -4775,7 +4775,7 @@ def _restricted_posterior_state_temporary_working_set(
                 + f"excluded_update={max_excluded_update:.2e}, pass_time={_ws_pass_seconds:.1f}s)"
             )
             if warm_start is not None:
-                warm_start.temporary_working_set_ever_active = np.asarray(ever_active_indices, dtype=np.int32)
+                warm_start.posterior_working_set_ever_active = np.asarray(ever_active_indices, dtype=np.int32)
             return (
                 np.asarray(alpha, dtype=np.float64),
                 np.asarray(candidate_beta, dtype=np.float64),
@@ -4788,14 +4788,14 @@ def _restricted_posterior_state_temporary_working_set(
             )
         current_beta = candidate_beta
         all_violating = np.flatnonzero(
-            excluded_mask & (candidate_update_score > float(temporary_working_set_coefficient_tolerance))
+            excluded_mask & (candidate_update_score > float(posterior_working_set_coefficient_tolerance))
         ).astype(np.int32, copy=False)
         # Cap violations at growth budget: include only the TOP violating
         # indices ranked by KKT violation magnitude.  Without this cap, a cold
         # start (all betas zero → every variant violates KKT) expands the
         # working set from 8K to 222K in one step, triggering a catastrophic
         # fallback to CPU CG on all variants.
-        growth_budget = int(temporary_working_set_growth)
+        growth_budget = int(posterior_working_set_growth)
         if all_violating.shape[0] > growth_budget:
             top_violation_order = np.argsort(candidate_update_score[all_violating])[-growth_budget:]
             violating_indices = all_violating[top_violation_order]
@@ -4841,7 +4841,7 @@ def _restricted_posterior_state_temporary_working_set(
     linear_predictor = covariate_matrix @ alpha + genetic_linear_predictor
     restricted_quadratic = float(np.dot(targets, projected_targets))
     if warm_start is not None:
-        warm_start.temporary_working_set_ever_active = np.asarray(ever_active_indices, dtype=np.int32)
+        warm_start.posterior_working_set_ever_active = np.asarray(ever_active_indices, dtype=np.int32)
     return (
         np.asarray(alpha, dtype=np.float64),
         np.asarray(candidate_beta, dtype=np.float64),
@@ -4873,12 +4873,12 @@ def _restricted_posterior_state(
     initial_beta_guess: np.ndarray | None = None,
     sample_space_preconditioner_rank: int = 256,
     warm_start: _RestrictedPosteriorWarmStart | None = None,
-    temporary_working_sets: bool = True,
-    temporary_working_set_min_variants: int = 65_536,
-    temporary_working_set_initial_size: int = 16_384,
-    temporary_working_set_growth: int = 16_384,
-    temporary_working_set_max_passes: int = 6,
-    temporary_working_set_coefficient_tolerance: float = 1e-4,
+    posterior_working_sets: bool = True,
+    posterior_working_set_min_variants: int = 65_536,
+    posterior_working_set_initial_size: int = 16_384,
+    posterior_working_set_growth: int = 16_384,
+    posterior_working_set_max_passes: int = 6,
+    posterior_working_set_coefficient_tolerance: float = 1e-4,
     allow_working_set: bool = True,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, float, float, float]:
     from sv_pgs.progress import log, mem
@@ -4994,16 +4994,16 @@ def _restricted_posterior_state(
         covariate_precision_cholesky=covariate_precision_cholesky,
         compute_dtype=compute_jax_dtype,
     )
-    if _should_use_temporary_working_set(
+    if _should_use_posterior_working_set(
         genotype_matrix=genotype_matrix,
         variant_count=variant_count,
         compute_logdet=compute_logdet,
         compute_beta_variance=compute_beta_variance,
-        temporary_working_sets=temporary_working_sets,
-        temporary_working_set_min_variants=temporary_working_set_min_variants,
+        posterior_working_sets=posterior_working_sets,
+        posterior_working_set_min_variants=posterior_working_set_min_variants,
         allow_working_set=allow_working_set,
     ):
-        return _restricted_posterior_state_temporary_working_set(
+        return _restricted_posterior_state_posterior_working_set(
             genotype_matrix=genotype_matrix,
             covariate_matrix=covariate_matrix,
             targets=targets,
@@ -5020,10 +5020,10 @@ def _restricted_posterior_state(
             random_seed=random_seed,
             sample_space_preconditioner_rank=sample_space_preconditioner_rank,
             initial_beta_guess=initial_beta_guess,
-            temporary_working_set_initial_size=temporary_working_set_initial_size,
-            temporary_working_set_growth=temporary_working_set_growth,
-            temporary_working_set_max_passes=temporary_working_set_max_passes,
-            temporary_working_set_coefficient_tolerance=temporary_working_set_coefficient_tolerance,
+            posterior_working_set_initial_size=posterior_working_set_initial_size,
+            posterior_working_set_growth=posterior_working_set_growth,
+            posterior_working_set_max_passes=posterior_working_set_max_passes,
+            posterior_working_set_coefficient_tolerance=posterior_working_set_coefficient_tolerance,
             warm_start=warm_start,
         )
 
@@ -5056,13 +5056,20 @@ def _restricted_posterior_state(
                 # Pre-compute X^T in float64 once; shape (p, n) — same memory
                 # as X_gpu_compute but in float64.  Freed after the loop.
                 X_gpu_T_f64 = cp.asarray(X_gpu_compute.T, dtype=cp.float64)
-                xtdx_gpu = cp.zeros((variant_count, variant_count), dtype=cp.float64)
+                xtdx_gpu = cp.empty((variant_count, variant_count), dtype=cp.float64)
+                xtdx_gpu[...] = 0.0
                 chunk = min(1024, variant_count)
+                chunk_cache_gpu = cp.empty(
+                    (sample_count, chunk),
+                    dtype=compute_cp_dtype,
+                )
                 for start in range(0, variant_count, chunk):
                     end = min(start + chunk, variant_count)
+                    chunk_values_gpu = chunk_cache_gpu[:, : end - start]
+                    chunk_values_gpu[...] = X_gpu_compute[:, start:end]
                     # weighted_chunk is (n, chunk) in float64 — ~750 MB for
                     # chunk=1024, n=97K, fits comfortably in GPU memory.
-                    weighted_chunk = inv_d_cp[:, None] * cp.asarray(X_gpu_compute[:, start:end], dtype=cp.float64)
+                    weighted_chunk = inv_d_cp[:, None] * cp.asarray(chunk_values_gpu, dtype=cp.float64)
                     xtdx_gpu[:, start:end] = X_gpu_T_f64 @ weighted_chunk
                 del X_gpu_T_f64
                 projector_bundle_gpu = _build_restricted_projector_gpu_bundle(
@@ -5097,8 +5104,8 @@ def _restricted_posterior_state(
                 )
                 variant_rhs_gpu = X_gpu_compute.T @ projected_targets_gpu
                 variant_precision_gpu = XtPX_gpu  # already float64
-                diagonal_index = np.arange(variant_count)
-                variant_precision_gpu[diagonal_index, diagonal_index] += prior_precision
+                diagonal_index = cp.arange(variant_count)
+                variant_precision_gpu[diagonal_index, diagonal_index] += cp.asarray(prior_precision, dtype=cp.float64)
             else:
                 dense_genotypes = np.asarray(genotype_matrix.materialize(batch_size=posterior_variance_batch_size), dtype=np.float64)
                 projected_genotypes = apply_projector(dense_genotypes)
