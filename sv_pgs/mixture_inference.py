@@ -2042,44 +2042,56 @@ def _binary_posterior_state(
             )
             break
 
-    final_pseudo_response = kappa / final_weights - predictor_offset_array
-    try:
-        final_alpha, final_beta, beta_variance, _projected_targets, _fitted_response, _restricted_quadratic, logdet_covariance, logdet_gls = (
-            _restricted_posterior_state(
-                genotype_matrix=standardized_genotypes,
-                covariate_matrix=covariate_matrix,
-                targets=final_pseudo_response,
-                prior_variances=prior_variances,
-                diagonal_noise=1.0 / final_weights,
-                solver_tolerance=solver_tolerance,
-                maximum_linear_solver_iterations=maximum_linear_solver_iterations,
-                logdet_probe_count=logdet_probe_count,
-                logdet_lanczos_steps=logdet_lanczos_steps,
-                exact_solver_matrix_limit=exact_solver_matrix_limit,
-                posterior_variance_batch_size=posterior_variance_batch_size,
-                posterior_variance_probe_count=posterior_variance_probe_count,
-                random_seed=random_seed + max_iterations + 17,
-                compute_logdet=compute_logdet,
-                compute_beta_variance=compute_beta_variance,
-                initial_beta_guess=parameters[covariate_count:],
-                sample_space_preconditioner_rank=sample_space_preconditioner_rank,
-                temporary_working_sets=temporary_working_sets,
-                temporary_working_set_min_variants=temporary_working_set_min_variants,
-                temporary_working_set_initial_size=temporary_working_set_initial_size,
-                temporary_working_set_growth=temporary_working_set_growth,
-                temporary_working_set_max_passes=temporary_working_set_max_passes,
-                temporary_working_set_coefficient_tolerance=temporary_working_set_coefficient_tolerance,
-                warm_start=warm_start,
-            )
-        )
-    except RuntimeError as exc:
-        log(f"      final posterior solve failed ({exc}), using last Newton iteration result")
+    # Skip the expensive final re-solve when neither logdet nor beta_variance is
+    # needed. The Newton loop already converged to the same beta — the final solve
+    # only adds tighter tolerance. For stochastic blocks (compute_logdet=False,
+    # compute_beta_variance=False), this saves ~10s per block.
+    if not compute_logdet and not compute_beta_variance:
         final_alpha = parameters[:covariate_count]
         final_beta = parameters[covariate_count:]
         beta_variance = np.asarray(prior_variances, dtype=np.float64)
         _fitted_response = current_linear_predictor - predictor_offset_array
         logdet_covariance = 0.0
         logdet_gls = 0.0
+    else:
+        final_pseudo_response = kappa / final_weights - predictor_offset_array
+        try:
+            final_alpha, final_beta, beta_variance, _projected_targets, _fitted_response, _restricted_quadratic, logdet_covariance, logdet_gls = (
+                _restricted_posterior_state(
+                    genotype_matrix=standardized_genotypes,
+                    covariate_matrix=covariate_matrix,
+                    targets=final_pseudo_response,
+                    prior_variances=prior_variances,
+                    diagonal_noise=1.0 / final_weights,
+                    solver_tolerance=solver_tolerance,
+                    maximum_linear_solver_iterations=maximum_linear_solver_iterations,
+                    logdet_probe_count=logdet_probe_count,
+                    logdet_lanczos_steps=logdet_lanczos_steps,
+                    exact_solver_matrix_limit=exact_solver_matrix_limit,
+                    posterior_variance_batch_size=posterior_variance_batch_size,
+                    posterior_variance_probe_count=posterior_variance_probe_count,
+                    random_seed=random_seed + max_iterations + 17,
+                    compute_logdet=compute_logdet,
+                    compute_beta_variance=compute_beta_variance,
+                    initial_beta_guess=parameters[covariate_count:],
+                    sample_space_preconditioner_rank=sample_space_preconditioner_rank,
+                    temporary_working_sets=temporary_working_sets,
+                    temporary_working_set_min_variants=temporary_working_set_min_variants,
+                    temporary_working_set_initial_size=temporary_working_set_initial_size,
+                    temporary_working_set_growth=temporary_working_set_growth,
+                    temporary_working_set_max_passes=temporary_working_set_max_passes,
+                    temporary_working_set_coefficient_tolerance=temporary_working_set_coefficient_tolerance,
+                    warm_start=warm_start,
+                )
+            )
+        except RuntimeError as exc:
+            log(f"      final posterior solve failed ({exc}), using last Newton iteration result")
+            final_alpha = parameters[:covariate_count]
+            final_beta = parameters[covariate_count:]
+            beta_variance = np.asarray(prior_variances, dtype=np.float64)
+            _fitted_response = current_linear_predictor - predictor_offset_array
+            logdet_covariance = 0.0
+            logdet_gls = 0.0
     final_linear_predictor = predictor_offset_array + np.asarray(_fitted_response, dtype=np.float64)
     if streaming_gpu_binary_backend:
         assert cupy is not None
