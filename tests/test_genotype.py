@@ -980,6 +980,56 @@ def test_dense_gpu_cache_linear_algebra_respects_gpu_compute_dtype(monkeypatch: 
     )
 
 
+def test_dense_gpu_cache_prefers_jax_dense_ops_without_cupy_bridge(monkeypatch: pytest.MonkeyPatch):
+    raw_matrix = np.array(
+        [
+            [0.0, 1.0, 2.0, 3.0],
+            [1.0, 2.0, 3.0, 4.0],
+            [2.0, 3.0, 4.0, 5.0],
+        ],
+        dtype=np.float32,
+    )
+    standardized = as_raw_genotype_matrix(raw_matrix).standardized(
+        means=np.array([1.0, 2.0, 3.0, 4.0], dtype=np.float32),
+        scales=np.ones(4, dtype=np.float32),
+    )
+    dense_matrix = standardized.materialize().astype(np.float64, copy=False)
+    standardized._cupy_cache = standardized.materialize().astype(np.float32, copy=False)
+    standardized._dense_cache = None
+    coefficients = np.array([0.25, -0.75, 0.5, 1.25], dtype=np.float64)
+    sample_vector = np.array([1.5, -0.25, 0.75], dtype=np.float64)
+    sample_matrix = np.column_stack(
+        [
+            np.array([1.0, -0.5, 0.25], dtype=np.float64),
+            np.array([-1.5, 0.0, 1.0], dtype=np.float64),
+        ]
+    )
+    variant_matrix = np.column_stack(
+        [
+            np.array([1.0, -2.0, 0.5, 3.0], dtype=np.float64),
+            np.array([-1.5, 0.0, 2.0, 1.0], dtype=np.float64),
+        ]
+    )
+
+    monkeypatch.setattr(genotype_module, "jax_dense_linear_algebra_preferred", lambda: True)
+    monkeypatch.setattr(
+        genotype_module,
+        "_cupy_to_jax",
+        lambda array: (_ for _ in ()).throw(AssertionError("dense JAX path should not use CuPy->JAX conversion")),
+    )
+
+    np.testing.assert_allclose(np.asarray(standardized.matvec(coefficients), dtype=np.float64), dense_matrix @ coefficients)
+    np.testing.assert_allclose(np.asarray(standardized.matmat(variant_matrix), dtype=np.float64), dense_matrix @ variant_matrix)
+    np.testing.assert_allclose(
+        np.asarray(standardized.transpose_matvec(sample_vector), dtype=np.float64),
+        dense_matrix.T @ sample_vector,
+    )
+    np.testing.assert_allclose(
+        np.asarray(standardized.transpose_matmat(sample_matrix), dtype=np.float64),
+        dense_matrix.T @ sample_matrix,
+    )
+
+
 def test_try_materialize_gpu_subset_streams_only_selected_columns(monkeypatch: pytest.MonkeyPatch):
     class _FakeCudaRuntime:
         @staticmethod

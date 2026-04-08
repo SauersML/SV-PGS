@@ -359,6 +359,8 @@ def test_cli_run_all_of_us_forwards_core_settings(monkeypatch, tmp_path: Path):
         "output_base": str(tmp_path),
         "n_pcs": 10,
         "max_outer_iterations": 30,
+        "pipeline_validation_fraction": 0.0,
+        "pipeline_validation_min_samples": 0,
         "random_seed": 0,
     }
 
@@ -415,6 +417,10 @@ def test_cli_run_builds_config(monkeypatch, tmp_path: Path):
             "target",
             "--output-dir",
             str(tmp_path / "out"),
+            "--pipeline-validation-fraction",
+            "0.25",
+            "--pipeline-validation-min-samples",
+            "7",
         ]
     )
 
@@ -422,7 +428,11 @@ def test_cli_run_builds_config(monkeypatch, tmp_path: Path):
     load_config = cast(object, captured["load_config"])
     pipeline_config = cast(object, captured["pipeline_config"])
     assert load_config.max_outer_iterations == 30
+    assert load_config.pipeline_validation_fraction == pytest.approx(0.25)
+    assert load_config.pipeline_validation_min_samples == 7
     assert pipeline_config.max_outer_iterations == 30
+    assert pipeline_config.pipeline_validation_fraction == pytest.approx(0.25)
+    assert pipeline_config.pipeline_validation_min_samples == 7
     assert pipeline_config.trait_type == aou_runner.TraitType.BINARY
     assert captured["output_dir"] == tmp_path / "out"
 
@@ -790,6 +800,8 @@ def test_run_all_of_us_skips_existing_fit_only_when_run_metadata_matches(monkeyp
                 pc_cols=pc_cols,
                 covariates=covariates,
                 max_outer_iterations=30,
+                pipeline_validation_fraction=0.0,
+                pipeline_validation_min_samples=0,
                 random_seed=0,
             ),
             indent=2,
@@ -853,6 +865,8 @@ def test_run_all_of_us_reruns_when_existing_fit_metadata_differs(monkeypatch, tm
                 pc_cols=["PC1", "PC2"],
                 covariates=aou_runner.DEFAULT_COVARIATES + ["PC1", "PC2"],
                 max_outer_iterations=30,
+                pipeline_validation_fraction=0.0,
+                pipeline_validation_min_samples=0,
                 random_seed=0,
             ),
             indent=2,

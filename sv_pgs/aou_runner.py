@@ -376,6 +376,8 @@ def _build_aou_run_metadata(
     pc_cols: list[str],
     covariates: list[str],
     max_outer_iterations: int,
+    pipeline_validation_fraction: float,
+    pipeline_validation_min_samples: int,
     random_seed: int,
 ) -> dict[str, object]:
     return {
@@ -385,6 +387,8 @@ def _build_aou_run_metadata(
         "effective_pc_columns": pc_cols,
         "covariates": covariates,
         "max_outer_iterations": max_outer_iterations,
+        "pipeline_validation_fraction": pipeline_validation_fraction,
+        "pipeline_validation_min_samples": pipeline_validation_min_samples,
         "random_seed": random_seed,
     }
 
@@ -403,6 +407,8 @@ def run_all_of_us(
     output_base: str,
     n_pcs: int = 10,
     max_outer_iterations: int = 30,
+    pipeline_validation_fraction: float = 0.0,
+    pipeline_validation_min_samples: int = 0,
     random_seed: int = 0,
 ) -> None:
     """Full AoU pipeline: download requested chromosomes, merge them, and run one fit."""
@@ -430,6 +436,8 @@ def run_all_of_us(
     log(f"  output: {work_dir}")
     config = ModelConfig(
         max_outer_iterations=max_outer_iterations,
+        pipeline_validation_fraction=pipeline_validation_fraction,
+        pipeline_validation_min_samples=pipeline_validation_min_samples,
         random_seed=random_seed,
     )
 
@@ -581,6 +589,8 @@ def run_all_of_us(
         pc_cols=pc_cols,
         covariates=covariates,
         max_outer_iterations=max_outer_iterations,
+        pipeline_validation_fraction=pipeline_validation_fraction,
+        pipeline_validation_min_samples=pipeline_validation_min_samples,
         random_seed=random_seed,
     )
     if summary_path.exists():

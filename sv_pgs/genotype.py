@@ -762,6 +762,10 @@ def _cupy_cache_standardized_columns(
     return cache[:, local_variant_indices].astype(resolved_dtype, copy=False)
 
 
+def _dense_array_cache_available(cache: Any | None) -> bool:
+    return cache is not None and not _cupy_cache_is_int8_standardized(cache)
+
+
 def _iter_cupy_cache_standardized_batches(
     cache: Any,
     *,
@@ -1521,14 +1525,26 @@ class StandardizedGenotypeMatrix:
         return True
 
     def supports_jax_dense_ops(self) -> bool:
-        return jax_dense_linear_algebra_preferred() and (self._dense_cache is not None or self._jax_cache is not None)
+        return jax_dense_linear_algebra_preferred() and (
+            self._dense_cache is not None
+            or self._jax_cache is not None
+            or _dense_array_cache_available(self._cupy_cache)
+        )
 
     def _ensure_jax_cache(self) -> jax.Array:
         if self._jax_cache is not None:
             return self._jax_cache
-        if self._dense_cache is None:
+        if self._dense_cache is not None:
+            cache_source = self._dense_cache
+            jax_cache = jnp.asarray(cache_source, dtype=gpu_compute_jax_dtype())
+        elif _dense_array_cache_available(self._cupy_cache):
+            cache_source = self._cupy_cache
+            if hasattr(cache_source, "__dlpack__"):
+                jax_cache = jax_dlpack.from_dlpack(cache_source).astype(gpu_compute_jax_dtype())
+            else:
+                jax_cache = jnp.asarray(np.asarray(cache_source), dtype=gpu_compute_jax_dtype())
+        else:
             raise RuntimeError("JAX cache requires a dense materialized genotype matrix.")
-        jax_cache = jnp.asarray(self._dense_cache, dtype=gpu_compute_jax_dtype())
         if isinstance(jax_cache, jax_core.Tracer):
             return jax_cache
         self._jax_cache = jax_cache
@@ -1803,6 +1819,11 @@ class StandardizedGenotypeMatrix:
 
         When CuPy GPU-cached: cuBLAS matmul. Otherwise: batched numpy on CPU.
         """
+        if self.supports_jax_dense_ops():
+            coeff_jax = jnp.ravel(jnp.asarray(coefficients, dtype=gpu_compute_jax_dtype()))
+            if coeff_jax.shape[0] != self.shape[1]:
+                raise ValueError("coefficient vector must match genotype column count.")
+            return self._ensure_jax_cache() @ coeff_jax
         if self._cupy_cache is not None:
             cupy = _try_import_cupy()
             compute_np_dtype = gpu_compute_numpy_dtype()
@@ -1861,11 +1882,6 @@ class StandardizedGenotypeMatrix:
                     _lv = _cv
                     log(f"        GPU matvec: {_cv:,}/{_tv:,} ({100*_cv/_tv:.0f}%)  mem={mem()}")
             return _cupy_to_jax(result_gpu)
-        if self.supports_jax_dense_ops():
-            coeff_jax = jnp.ravel(jnp.asarray(coefficients, dtype=gpu_compute_jax_dtype()))
-            if coeff_jax.shape[0] != self.shape[1]:
-                raise ValueError("coefficient vector must match genotype column count.")
-            return self._ensure_jax_cache() @ coeff_jax
         coeff_np = np.asarray(coefficients, dtype=gpu_compute_numpy_dtype()).ravel()
         if coeff_np.shape[0] != self.shape[1]:
             raise ValueError("coefficient vector must match genotype column count.")
@@ -1902,6 +1918,11 @@ class StandardizedGenotypeMatrix:
 
     def matmat(self, matrix: np.ndarray | jnp.ndarray, batch_size: int = DEFAULT_GENOTYPE_BATCH_SIZE) -> jnp.ndarray:
         """Compute X_std @ M. When CuPy GPU-cached: cuBLAS matmul. Otherwise: batched numpy."""
+        if self.supports_jax_dense_ops():
+            matrix_jax = jnp.asarray(matrix, dtype=gpu_compute_jax_dtype())
+            if matrix_jax.ndim != 2 or matrix_jax.shape[0] != self.shape[1]:
+                raise ValueError("variant matrix must match genotype column count.")
+            return self._ensure_jax_cache() @ matrix_jax
         if self._cupy_cache is not None:
             cupy = _try_import_cupy()
             compute_np_dtype = gpu_compute_numpy_dtype()
@@ -1952,11 +1973,6 @@ class StandardizedGenotypeMatrix:
             ):
                 result_gpu += standardized_batch @ matrix_gpu[batch_slice, :]
             return _cupy_to_jax(result_gpu)
-        if self.supports_jax_dense_ops():
-            matrix_jax = jnp.asarray(matrix, dtype=gpu_compute_jax_dtype())
-            if matrix_jax.ndim != 2 or matrix_jax.shape[0] != self.shape[1]:
-                raise ValueError("variant matrix must match genotype column count.")
-            return self._ensure_jax_cache() @ matrix_jax
         m_np = np.asarray(matrix, dtype=gpu_compute_numpy_dtype())
         if m_np.ndim != 2 or m_np.shape[0] != self.shape[1]:
             raise ValueError("variant matrix must match genotype column count.")
@@ -1985,6 +2001,11 @@ class StandardizedGenotypeMatrix:
 
     def transpose_matvec(self, vector: np.ndarray | jnp.ndarray, batch_size: int = DEFAULT_GENOTYPE_BATCH_SIZE) -> jnp.ndarray:
         """Compute X_std^T @ v. When CuPy GPU-cached: cuBLAS matmul. Otherwise: batched numpy."""
+        if self.supports_jax_dense_ops():
+            vector_jax = jnp.ravel(jnp.asarray(vector, dtype=gpu_compute_jax_dtype()))
+            if vector_jax.shape[0] != self.shape[0]:
+                raise ValueError("sample vector must match genotype row count.")
+            return self._ensure_jax_cache().T @ vector_jax
         if self._cupy_cache is not None:
             cupy = _try_import_cupy()
             compute_np_dtype = gpu_compute_numpy_dtype()
@@ -2043,11 +2064,6 @@ class StandardizedGenotypeMatrix:
                     _lv = _cv
                     log(f"        GPU transpose_matvec: {_cv:,}/{_tv:,} ({100*_cv/_tv:.0f}%)  mem={mem()}")
             return _cupy_to_jax(output_gpu)
-        if self.supports_jax_dense_ops():
-            vector_jax = jnp.ravel(jnp.asarray(vector, dtype=gpu_compute_jax_dtype()))
-            if vector_jax.shape[0] != self.shape[0]:
-                raise ValueError("sample vector must match genotype row count.")
-            return self._ensure_jax_cache().T @ vector_jax
         v_np = np.asarray(vector, dtype=gpu_compute_numpy_dtype()).ravel()
         if v_np.shape[0] != self.shape[0]:
             raise ValueError("sample vector must match genotype row count.")
@@ -2083,6 +2099,11 @@ class StandardizedGenotypeMatrix:
 
     def transpose_matmat(self, matrix: np.ndarray | jnp.ndarray, batch_size: int = DEFAULT_GENOTYPE_BATCH_SIZE) -> jnp.ndarray:
         """Compute X_std^T @ M. When CuPy GPU-cached: cuBLAS matmul. Otherwise: batched numpy."""
+        if self.supports_jax_dense_ops():
+            matrix_jax = jnp.asarray(matrix, dtype=gpu_compute_jax_dtype())
+            if matrix_jax.ndim != 2 or matrix_jax.shape[0] != self.shape[0]:
+                raise ValueError("sample matrix must match genotype row count.")
+            return self._ensure_jax_cache().T @ matrix_jax
         if self._cupy_cache is not None:
             cupy = _try_import_cupy()
             compute_np_dtype = gpu_compute_numpy_dtype()
@@ -2133,11 +2154,6 @@ class StandardizedGenotypeMatrix:
             ):
                 output_gpu[batch_slice, :] = standardized_batch.T @ matrix_gpu
             return _cupy_to_jax(output_gpu)
-        if self.supports_jax_dense_ops():
-            matrix_jax = jnp.asarray(matrix, dtype=gpu_compute_jax_dtype())
-            if matrix_jax.ndim != 2 or matrix_jax.shape[0] != self.shape[0]:
-                raise ValueError("sample matrix must match genotype row count.")
-            return self._ensure_jax_cache().T @ matrix_jax
         m_np = np.asarray(matrix, dtype=gpu_compute_numpy_dtype())
         if m_np.ndim != 2 or m_np.shape[0] != self.shape[0]:
             raise ValueError("sample matrix must match genotype row count.")

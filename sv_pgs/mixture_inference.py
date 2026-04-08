@@ -5038,15 +5038,25 @@ def _restricted_posterior_state(
                     cupy=cp,
                     dtype=compute_cp_dtype,
                 )
-                # Build X^T diag(W) X on GPU in compute precision, chunked to
+                # Build X^T diag(W) X on GPU in float64 precision, chunked to
                 # avoid allocating a second full-size (n, p) intermediate.
-                inv_d_cp = cp.asarray(inverse_diagonal_noise, dtype=compute_cp_dtype)
-                xtdx_gpu = cp.empty((variant_count, variant_count), dtype=compute_cp_dtype)
+                # Keeping X_gpu_compute in float32 for the genotype cache,
+                # but computing the Gram matrix in float64 to prevent
+                # precision loss over ~97K samples that previously required
+                # a jitter hack for Cholesky stability.
+                inv_d_cp = cp.asarray(inverse_diagonal_noise, dtype=cp.float64)
+                # Pre-compute X^T in float64 once; shape (p, n) — same memory
+                # as X_gpu_compute but in float64.  Freed after the loop.
+                X_gpu_T_f64 = cp.asarray(X_gpu_compute.T, dtype=cp.float64)
+                xtdx_gpu = cp.zeros((variant_count, variant_count), dtype=cp.float64)
                 chunk = min(1024, variant_count)
                 for start in range(0, variant_count, chunk):
                     end = min(start + chunk, variant_count)
-                    weighted_chunk = inv_d_cp[:, None] * X_gpu_compute[:, start:end]
-                    xtdx_gpu[:, start:end] = X_gpu_compute.T @ weighted_chunk
+                    # weighted_chunk is (n, chunk) in float64 — ~750 MB for
+                    # chunk=1024, n=97K, fits comfortably in GPU memory.
+                    weighted_chunk = inv_d_cp[:, None] * cp.asarray(X_gpu_compute[:, start:end], dtype=cp.float64)
+                    xtdx_gpu[:, start:end] = X_gpu_T_f64 @ weighted_chunk
+                del X_gpu_T_f64
                 projector_bundle_gpu = _build_restricted_projector_gpu_bundle(
                     inverse_diagonal_noise=inverse_diagonal_noise,
                     covariate_matrix=covariate_matrix,
@@ -5068,7 +5078,7 @@ def _restricted_posterior_state(
                     projector_bundle_gpu[3],
                     cp_solve_triangular,
                 )
-                correction_gpu = CtWX_gpu @ correction_coeff_gpu
+                correction_gpu = cp.asarray(CtWX_gpu @ correction_coeff_gpu, dtype=cp.float64)
                 XtPX_gpu = xtdx_gpu - correction_gpu
                 XtPX_gpu = 0.5 * (XtPX_gpu + XtPX_gpu.T)
                 projected_targets_gpu = _apply_restricted_projector_gpu(
@@ -5078,7 +5088,7 @@ def _restricted_posterior_state(
                     solve_triangular_gpu=cp_solve_triangular,
                 )
                 variant_rhs_gpu = X_gpu_compute.T @ projected_targets_gpu
-                variant_precision_gpu = cp.asarray(XtPX_gpu, dtype=cp.float64)
+                variant_precision_gpu = XtPX_gpu  # already float64
                 diagonal_index = np.arange(variant_count)
                 variant_precision_gpu[diagonal_index, diagonal_index] += prior_precision
             else:
@@ -5087,34 +5097,19 @@ def _restricted_posterior_state(
                 XtPX = dense_genotypes.T @ projected_genotypes
                 variant_rhs = dense_genotypes.T @ apply_projector(targets)
                 variant_precision_matrix = np.diag(prior_precision) + XtPX
-                # Ensure positive-definiteness: the GPU float32 X^T W X formation
-                # and covariate projection subtraction can introduce small negative
-                # eigenvalues.  Add a jitter proportional to the matrix scale.
-                jitter = max(float(np.max(np.diag(variant_precision_matrix))) * 1e-6, 1e-6)
-                variant_precision_matrix += np.eye(variant_count, dtype=np.float64) * jitter
-                try:
-                    variant_precision_cholesky = np.linalg.cholesky(variant_precision_matrix)
-                except np.linalg.LinAlgError:
-                    log(f"    Cholesky failed with jitter={jitter:.2e}, retrying with larger regularization  mem={mem()}")
-                    jitter = max(float(np.max(np.diag(variant_precision_matrix))) * 1e-4, 1e-4)
-                    variant_precision_matrix += np.eye(variant_count, dtype=np.float64) * jitter
-                    variant_precision_cholesky = np.linalg.cholesky(variant_precision_matrix)
+                # Standard small regularization for numerical stability.
+                variant_precision_matrix += np.eye(variant_count, dtype=np.float64) * 1e-8
+                variant_precision_cholesky = np.linalg.cholesky(variant_precision_matrix)
 
                 def solve_variant_rhs(right_hand_side: np.ndarray) -> np.ndarray:
                     return _cholesky_solve(variant_precision_cholesky, np.asarray(right_hand_side, dtype=np.float64))
 
                 beta = np.asarray(solve_variant_rhs(variant_rhs), dtype=np.float64)
             if genotype_matrix._cupy_cache is not None:
-                diagonal_values = _cupy_array_to_numpy(variant_precision_gpu[diagonal_index, diagonal_index], dtype=np.float64)
-                jitter = max(float(np.max(diagonal_values)) * 1e-6, 1e-6)
-                variant_precision_gpu[diagonal_index, diagonal_index] += jitter
-                try:
-                    variant_precision_cholesky_gpu = cp.linalg.cholesky(variant_precision_gpu)
-                except np.linalg.LinAlgError:
-                    log(f"    Cholesky failed with jitter={jitter:.2e}, retrying with larger regularization  mem={mem()}")
-                    jitter = max(float(np.max(diagonal_values)) * 1e-4, 1e-4)
-                    variant_precision_gpu[diagonal_index, diagonal_index] += jitter
-                    variant_precision_cholesky_gpu = cp.linalg.cholesky(variant_precision_gpu)
+                # Standard small regularization — float64 Gram matrix
+                # accumulation ensures this is sufficient for Cholesky.
+                variant_precision_gpu[diagonal_index, diagonal_index] += 1e-8
+                variant_precision_cholesky_gpu = cp.linalg.cholesky(variant_precision_gpu)
 
                 def solve_variant_rhs_gpu(right_hand_side):
                     return _gpu_cholesky_solve(
