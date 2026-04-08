@@ -55,6 +55,7 @@ from __future__ import annotations
 from dataclasses import dataclass, fields as dataclass_fields
 import hashlib
 import json
+import time
 from typing import Any, Callable, Sequence, cast
 
 import sv_pgs._jax  # noqa: F401
@@ -793,6 +794,8 @@ def fit_variational_em(
         )
         for outer_iteration in range(start_iteration, config.max_outer_iterations):
             log(f"  variational EM epoch {outer_iteration + 1}/{config.max_outer_iterations} start  sigma_e2={sigma_error2:.6f}  global_scale={global_scale:.6f}  mem={mem()}")
+            epoch_wall_t0 = time.monotonic()
+            epoch_total_newton_iters = 0
             refresh_beta_variance = _should_refresh_beta_variance(
                 outer_iteration,
                 refresh_interval=config.beta_variance_update_interval,
@@ -895,6 +898,7 @@ def fit_variational_em(
                         if refresh_beta_variance
                         else np.asarray(beta_variance_state[block_indices], dtype=np.float64)
                     )
+                    epoch_total_newton_iters += int(block_state[5])
                 else:
                     block_state = _fit_collapsed_posterior(
                         genotype_matrix=block_genotypes,
@@ -913,6 +917,7 @@ def fit_variational_em(
                     )
                     block_beta_candidate = np.asarray(block_state.beta, dtype=np.float64)
                     block_beta_variance = np.asarray(block_state.beta_variance, dtype=np.float64)
+                    epoch_total_newton_iters += 1
                 block_beta_updated = block_beta_previous + step_size * (block_beta_candidate - block_beta_previous)
                 beta_delta = block_beta_updated - block_beta_previous
                 if np.any(beta_delta):
@@ -955,6 +960,11 @@ def fit_variational_em(
                 # Intra-epoch checkpoint every 10 blocks so crashes don't lose progress
                 if checkpoint_callback is not None and step_index % 10 == 0:
                     checkpoint_callback(_build_checkpoint(outer_iteration))
+
+            epoch_wall_seconds = time.monotonic() - epoch_wall_t0
+            n_nonzero_beta = int(np.sum(beta_state != 0.0))
+            avg_newton = epoch_total_newton_iters / max(block_count, 1)
+            log(f"  variational EM epoch {outer_iteration + 1} done: blocks={block_count}  wall={epoch_wall_seconds:.1f}s  nonzero_beta={n_nonzero_beta}  avg_newton_iters={avg_newton:.1f}")
 
             if config.trait_type == TraitType.BINARY:
                 alpha_state = _fit_binary_alpha_with_offset(
@@ -1507,7 +1517,7 @@ def _fit_collapsed_posterior(
         )
         linear_predictor = np.asarray(linear_predictor, dtype=np.float64) + predictor_offset_array
     else:
-        alpha, beta, beta_variance, linear_predictor, collapsed_objective = _binary_posterior_state(
+        alpha, beta, beta_variance, linear_predictor, collapsed_objective, _ = _binary_posterior_state(
             genotype_matrix=genotype_matrix,
             covariate_matrix=covariate_matrix,
             targets=targets,
@@ -1866,7 +1876,7 @@ def _binary_posterior_state(
     temporary_working_set_max_passes: int = 6,
     temporary_working_set_coefficient_tolerance: float = 1e-4,
     restricted_posterior_warm_start: _RestrictedPosteriorWarmStart | None = None,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, float]:
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, float, int]:
     standardized_genotypes = _as_standardized_genotype_matrix(genotype_matrix)
     prior_precision = np.asarray(1.0 / np.maximum(prior_variances, 1e-8), dtype=np.float64)
     covariate_count = covariate_matrix.shape[1]
@@ -1947,7 +1957,9 @@ def _binary_posterior_state(
         + f"max_iter={max_iterations}  mem={mem()}"
     )
     final_weights = _binary_expected_polya_gamma_weights(current_linear_predictor, minimum_weight)
+    _binary_newton_iters_used = 0
     for iteration_index in range(max_iterations):
+        _binary_newton_iters_used = iteration_index + 1
         iteration_start = _time.monotonic()
         if streaming_gpu_binary_backend:
             assert cupy is not None
@@ -2138,6 +2150,7 @@ def _binary_posterior_state(
         beta_variance,
         final_linear_predictor,
         float(laplace_objective),
+        _binary_newton_iters_used,
     )
 
 
