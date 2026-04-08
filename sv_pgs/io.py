@@ -603,6 +603,8 @@ def load_multi_vcf_dataset_from_files(
     )
     log(f"  target distribution: {n_cases} cases, {n_controls} controls (of {len(sample_table.sample_ids)} total)")
 
+    # _build_sample_table emits rows in VCF order (available_sample_ids),
+    # so alignment should produce identity indices → skip_subset=True.
     log("aligning sample IDs between sample table and genotype source...")
     aligned_sample_indices = _align_sample_ids(
         expected_sample_ids=sample_table.sample_ids,
@@ -610,18 +612,6 @@ def load_multi_vcf_dataset_from_files(
         context="genotype source",
     )
     keep_sample_indices = np.asarray(aligned_sample_indices, dtype=np.intp)
-    # Reorder the sample table to match VCF sample order so genotype matrices
-    # can stay as zero-copy mmaps.  This is the same logic the single-VCF path
-    # uses (_reorder_sample_table_by_source_index) — without it, every
-    # chromosome matrix (~13 GB) gets copied into RAM just to permute rows,
-    # which OOM-kills the process before the EM loop even starts.
-    sample_table, keep_sample_indices_reordered, reordered = _reorder_sample_table_by_source_index(
-        sample_table=sample_table,
-        source_indices=keep_sample_indices,
-    )
-    keep_sample_indices = np.asarray(keep_sample_indices_reordered, dtype=np.intp)
-    if reordered:
-        log(f"  reordered sample table to match VCF order ({len(keep_sample_indices):,} samples) — genotype matrices stay as zero-copy mmaps")
     log(f"aligned {len(aligned_sample_indices)} phenotype rows against {len(source_sample_ids)} genotype samples")
 
     n_chromosomes = len(source_paths)
@@ -808,10 +798,11 @@ def _build_sample_table(
     target_index = table_spec.column_index_by_name[target_column]
     covariate_indices = tuple(table_spec.column_index_by_name[column_name] for column_name in covariate_columns)
 
-    sample_ids: list[str] = []
-    covariates: list[list[float]] = []
-    targets: list[float] = []
-    seen_sample_ids: set[str] = set()
+    # Parse sample table into a dict keyed by sample_id so we can emit
+    # rows in VCF order (available_sample_ids) rather than file order.
+    # This guarantees the returned _SampleTable is already aligned with
+    # the genotype matrices — no reindexing needed downstream.
+    parsed: dict[str, tuple[float, list[float]]] = {}
     available_sample_id_set = set(available_sample_ids)
     total_rows = 0
     unmatched_rows = 0
@@ -824,23 +815,29 @@ def _build_sample_table(
         if sample_id not in available_sample_id_set:
             unmatched_rows += 1
             continue
-        if sample_id in seen_sample_ids:
+        if sample_id in parsed:
             raise ValueError("Duplicate sample identifier in sample table: " + sample_id)
-        seen_sample_ids.add(sample_id)
-        # Parse target and covariates; drop rows with missing values
         try:
             target_value = float(row_values[target_index])
             covariate_values = [float(row_values[column_index]) for column_index in covariate_indices]
         except (ValueError, TypeError):
             unmatched_rows += 1
             continue
-        # Drop rows where any value is NaN (e.g. missing PCs after merge)
         if np.isnan(target_value) or any(np.isnan(v) for v in covariate_values):
             unmatched_rows += 1
             continue
-        sample_ids.append(sample_id)
-        targets.append(target_value)
-        covariates.append(covariate_values)
+        parsed[sample_id] = (target_value, covariate_values)
+
+    # Emit rows in VCF sample order so genotype matrices need no reindexing.
+    sample_ids: list[str] = []
+    targets: list[float] = []
+    covariates: list[list[float]] = []
+    for vcf_sample_id in available_sample_ids:
+        if vcf_sample_id in parsed:
+            target_value, covariate_values = parsed[vcf_sample_id]
+            sample_ids.append(vcf_sample_id)
+            targets.append(target_value)
+            covariates.append(covariate_values)
 
     covariate_matrix = np.asarray(covariates, dtype=np.float32)
     if covariate_matrix.ndim != 2:
