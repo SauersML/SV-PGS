@@ -89,12 +89,13 @@ from sv_pgs.progress import log, mem
 # GPU exact variant solve needs ~3× the matrix memory for intermediates
 # (X + weighted_X + projected_X). On 16 GB T4 with 4 GB matrix, only ~6 GB
 # free → can handle up to ~2000 variants before OOM. Use PCG for larger.
-# GPU exact variant-space Cholesky: form X^T W X via cuBLAS syrk + Cholesky.
-# Cost: O(n p²) syrk + O(p³) Cholesky. With p=8192, n=97K on T4:
-#   syrk ~0.4s, Cholesky ~0.02s = 0.42s total.
+# GPU exact variant-space Cholesky: form X^T W X via cuBLAS + Cholesky.
+# Cost: O(n p²) matmul + O(p³) Cholesky. With p=8192, n=97K on T4:
+#   matmul ~0.4s, Cholesky ~0.02s = 0.42s total.
 # This is 10-20x faster than sample-space CG (3-12s) and gives exact solutions
-# with no convergence issues. Safe up to p~16K where syrk stays under ~2s.
-GPU_EXACT_VARIANT_SOLVE_LIMIT = 16_384
+# with no convergence issues. Limit at 10K: above this, float64 intermediates
+# for the covariate projection can exhaust T4's 16GB VRAM.
+GPU_EXACT_VARIANT_SOLVE_LIMIT = 10_000
 
 
 @dataclass(slots=True)
