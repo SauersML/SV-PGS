@@ -378,6 +378,8 @@ def _build_aou_run_metadata(
     covariates: list[str],
     max_outer_iterations: int,
     random_seed: int,
+    pipeline_validation_fraction: float,
+    pipeline_validation_min_samples: int,
 ) -> dict[str, object]:
     return {
         "disease": disease,
@@ -387,6 +389,8 @@ def _build_aou_run_metadata(
         "covariates": covariates,
         "max_outer_iterations": max_outer_iterations,
         "random_seed": random_seed,
+        "pipeline_validation_fraction": pipeline_validation_fraction,
+        "pipeline_validation_min_samples": pipeline_validation_min_samples,
     }
 
 DEFAULT_COVARIATES = [
@@ -405,6 +409,8 @@ def run_all_of_us(
     n_pcs: int = 10,
     max_outer_iterations: int = 30,
     random_seed: int = 0,
+    pipeline_validation_fraction: float = _DEFAULT_MODEL_CONFIG.pipeline_validation_fraction,
+    pipeline_validation_min_samples: int = _DEFAULT_MODEL_CONFIG.pipeline_validation_min_samples,
 ) -> None:
     """Full AoU pipeline: download requested chromosomes, merge them, and run one fit."""
     chromosomes = _validate_aou_chromosomes(chromosomes)
@@ -423,12 +429,19 @@ def run_all_of_us(
     from sv_pgs.genotype import require_gpu
     require_gpu()
 
-    log(f"=== ALL OF US PIPELINE ===  disease={disease_def.canonical_name}  chromosomes={chromosomes}  n_pcs={n_pcs}  cpus={os.cpu_count()}")
+    log(
+        "=== ALL OF US PIPELINE ===  "
+        + f"disease={disease_def.canonical_name}  chromosomes={chromosomes}  n_pcs={n_pcs}  "
+        + f"pipeline_validation_fraction={pipeline_validation_fraction}  "
+        + f"pipeline_validation_min_samples={pipeline_validation_min_samples}  cpus={os.cpu_count()}"
+    )
     log(f"  ICD-9: {disease_def.icd9_prefixes}  ICD-10: {disease_def.icd10_prefixes}")
     log(f"  output: {work_dir}")
     config = ModelConfig(
         max_outer_iterations=max_outer_iterations,
         random_seed=random_seed,
+        pipeline_validation_fraction=pipeline_validation_fraction,
+        pipeline_validation_min_samples=pipeline_validation_min_samples,
     )
 
     # Migrate old VCF caches: VCFs were moved from work_dir to a shared cache dir,
@@ -580,6 +593,8 @@ def run_all_of_us(
         covariates=covariates,
         max_outer_iterations=max_outer_iterations,
         random_seed=random_seed,
+        pipeline_validation_fraction=pipeline_validation_fraction,
+        pipeline_validation_min_samples=pipeline_validation_min_samples,
     )
     if summary_path.exists():
         if run_metadata_path.exists():

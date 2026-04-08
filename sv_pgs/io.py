@@ -7,7 +7,7 @@ import json
 import os
 import pickle
 import tempfile
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, BinaryIO, Iterable, Iterator, Literal, Sequence, TextIO
 
@@ -19,8 +19,6 @@ from sv_pgs.data import NESTED_PATH_DELIMITER, VariantRecord, VariantStatistics
 from sv_pgs.genotype import (
     PLINK_MISSING_INT8,
     ConcatenatedRawGenotypeMatrix,
-    DenseRawGenotypeMatrix,
-    Int8RawGenotypeMatrix,
     PlinkRawGenotypeMatrix,
     RawGenotypeMatrix,
     as_raw_genotype_matrix,
@@ -51,11 +49,6 @@ class PipelineOutputs:
     predictions_path: Path
     coefficients_path: Path
 
-
-@dataclass(slots=True)
-class _ValidationRun:
-    train_dataset: LoadedDataset
-    validation_dataset: LoadedDataset
 
 
 @dataclass(slots=True)
@@ -737,57 +730,8 @@ def run_training_pipeline(
                 + f"{config.minimum_scale:.6g}. Reload the dataset with the same config."
             )
 
-    validation_run = _build_pipeline_validation_run(dataset, config)
-    summary_payload: dict[str, Any] = {}
-    fit_config = config
-    if validation_run is not None:
-        log(
-            "running validation-tuned fit on training split..."
-            + f" train_samples={len(validation_run.train_dataset.sample_ids)}"
-            + f" validation_samples={len(validation_run.validation_dataset.sample_ids)}"
-        )
-        tuning_model = BayesianPGS(config).fit(
-            validation_run.train_dataset.genotypes,
-            validation_run.train_dataset.covariates,
-            validation_run.train_dataset.targets,
-            validation_run.train_dataset.variant_records,
-            validation_data=(
-                validation_run.validation_dataset.genotypes,
-                validation_run.validation_dataset.covariates,
-                validation_run.validation_dataset.targets,
-            ),
-            variant_stats=None,
-        )
-        if tuning_model.state is None:
-            raise RuntimeError("Validation-tuned fit did not produce model state.")
-        selected_iteration_count = tuning_model.state.fit_result.selected_iteration_count
-        if selected_iteration_count is None or selected_iteration_count < 1:
-            raise RuntimeError("Validation-tuned fit did not report a selected iteration count.")
-        fit_config = replace(tuning_model.config, max_outer_iterations=int(selected_iteration_count))
-        validation_metrics = _dataset_metrics(
-            dataset=validation_run.validation_dataset,
-            model=tuning_model,
-        )
-        summary_payload.update(validation_metrics)
-        summary_payload.update(
-            {
-                "validation_enabled": True,
-                "tuning_sample_count": int(len(validation_run.train_dataset.sample_ids)),
-                "validation_sample_count": int(len(validation_run.validation_dataset.sample_ids)),
-                "selected_iteration_count": int(selected_iteration_count),
-                "validation_history": [
-                    float(value) for value in tuning_model.state.fit_result.validation_history
-                ],
-            }
-        )
-        log(
-            "refitting Bayesian PGS model on full cohort..."
-            + f" selected_iterations={selected_iteration_count}"
-        )
-    else:
-        summary_payload["validation_enabled"] = False
-        log("fitting Bayesian PGS model...")
-    model = BayesianPGS(fit_config).fit(
+    log("fitting Bayesian PGS model...")
+    model = BayesianPGS(config).fit(
         dataset.genotypes,
         dataset.covariates,
         dataset.targets,
@@ -848,171 +792,6 @@ def run_training_pipeline(
         coefficients_path=coefficients_path,
     )
 
-
-def _build_pipeline_validation_run(
-    dataset: LoadedDataset,
-    config: ModelConfig,
-) -> _ValidationRun | None:
-    sample_count = int(len(dataset.sample_ids))
-    validation_fraction = float(config.pipeline_validation_fraction)
-    minimum_validation_samples = int(config.pipeline_validation_min_samples)
-    if validation_fraction <= 0.0 or minimum_validation_samples == 0:
-        return None
-    requested_validation_count = max(
-        minimum_validation_samples,
-        int(np.ceil(sample_count * validation_fraction)),
-    )
-    if requested_validation_count >= sample_count:
-        return None
-    train_indices, validation_indices = _train_validation_indices(
-        targets=dataset.targets,
-        trait_type=config.trait_type,
-        train_sample_count=sample_count - requested_validation_count,
-        validation_sample_count=requested_validation_count,
-        random_seed=int(config.random_seed),
-    )
-    if train_indices.size == 0 or validation_indices.size == 0:
-        return None
-    return _ValidationRun(
-        train_dataset=_subset_loaded_dataset(dataset, train_indices),
-        validation_dataset=_subset_loaded_dataset(dataset, validation_indices),
-    )
-
-
-def _train_validation_indices(
-    *,
-    targets: np.ndarray,
-    trait_type: TraitType,
-    train_sample_count: int,
-    validation_sample_count: int,
-    random_seed: int,
-) -> tuple[np.ndarray, np.ndarray]:
-    target_array = np.asarray(targets)
-    total_sample_count = int(target_array.shape[0])
-    if train_sample_count + validation_sample_count != total_sample_count:
-        raise ValueError("train/validation split must cover all samples exactly once.")
-    random_generator = np.random.default_rng(random_seed)
-    if trait_type == TraitType.BINARY:
-        validation_indices = _stratified_validation_indices(
-            targets=target_array,
-            validation_sample_count=validation_sample_count,
-            random_generator=random_generator,
-        )
-    else:
-        shuffled_indices = random_generator.permutation(total_sample_count).astype(np.int32, copy=False)
-        validation_indices = np.sort(shuffled_indices[:validation_sample_count].astype(np.int32, copy=False))
-    validation_mask = np.zeros(total_sample_count, dtype=bool)
-    validation_mask[validation_indices] = True
-    train_indices = np.flatnonzero(~validation_mask).astype(np.int32)
-    return train_indices, validation_indices
-
-
-def _stratified_validation_indices(
-    *,
-    targets: np.ndarray,
-    validation_sample_count: int,
-    random_generator: np.random.Generator,
-) -> np.ndarray:
-    unique_targets, inverse_targets = np.unique(targets, return_inverse=True)
-    if unique_targets.shape[0] <= 1:
-        shuffled_indices = random_generator.permutation(targets.shape[0]).astype(np.int32, copy=False)
-        return np.sort(shuffled_indices[:validation_sample_count].astype(np.int32, copy=False))
-    class_indices = [
-        np.flatnonzero(inverse_targets == class_index).astype(np.int32)
-        for class_index in range(unique_targets.shape[0])
-    ]
-    class_counts = np.asarray([indices.shape[0] for indices in class_indices], dtype=np.int32)
-    class_proportions = class_counts / float(np.sum(class_counts))
-    requested_validation = class_proportions * float(validation_sample_count)
-    validation_counts = np.floor(requested_validation).astype(np.int32)
-    validation_counts = np.minimum(validation_counts, np.maximum(class_counts - 1, 0))
-    remainder = validation_sample_count - int(np.sum(validation_counts))
-    if remainder > 0:
-        allocation_order = np.argsort(-(requested_validation - validation_counts))
-        for class_index in allocation_order.tolist():
-            if remainder == 0:
-                break
-            maximum_extra = int(max(class_counts[class_index] - 1 - validation_counts[class_index], 0))
-            if maximum_extra <= 0:
-                continue
-            validation_counts[class_index] += 1
-            remainder -= 1
-    if remainder > 0:
-        shuffled_indices = random_generator.permutation(targets.shape[0]).astype(np.int32, copy=False)
-        return np.sort(shuffled_indices[:validation_sample_count].astype(np.int32, copy=False))
-    selected_indices = [
-        np.sort(
-            random_generator.choice(class_indices[class_index], size=int(validation_counts[class_index]), replace=False)
-            .astype(np.int32, copy=False)
-        )
-        for class_index in range(unique_targets.shape[0])
-        if validation_counts[class_index] > 0
-    ]
-    if not selected_indices:
-        shuffled_indices = random_generator.permutation(targets.shape[0]).astype(np.int32, copy=False)
-        return np.sort(shuffled_indices[:validation_sample_count].astype(np.int32, copy=False))
-    return np.sort(np.concatenate(selected_indices).astype(np.int32, copy=False))
-
-
-def _subset_loaded_dataset(dataset: LoadedDataset, sample_indices: np.ndarray) -> LoadedDataset:
-    resolved_indices = np.asarray(sample_indices, dtype=np.int32)
-    return LoadedDataset(
-        sample_ids=[dataset.sample_ids[int(index)] for index in resolved_indices],
-        genotypes=_subset_genotype_matrix_rows(dataset.genotypes, resolved_indices),
-        covariates=np.asarray(dataset.covariates[resolved_indices], dtype=np.float32),
-        targets=np.asarray(dataset.targets[resolved_indices], dtype=np.float32),
-        variant_records=dataset.variant_records,
-        variant_stats=None,
-        variant_stats_minimum_scale=None,
-    )
-
-
-def _subset_genotype_matrix_rows(
-    genotypes: RawGenotypeMatrix | np.ndarray,
-    sample_indices: np.ndarray,
-) -> RawGenotypeMatrix:
-    raw_genotypes = as_raw_genotype_matrix(genotypes)
-    if isinstance(raw_genotypes, DenseRawGenotypeMatrix):
-        return DenseRawGenotypeMatrix(np.asarray(raw_genotypes.matrix[sample_indices, :]))
-    if isinstance(raw_genotypes, Int8RawGenotypeMatrix):
-        return Int8RawGenotypeMatrix(np.asarray(raw_genotypes.matrix[sample_indices, :]))
-    if isinstance(raw_genotypes, PlinkRawGenotypeMatrix):
-        return PlinkRawGenotypeMatrix(
-            bed_path=raw_genotypes.bed_path,
-            sample_indices=np.asarray(raw_genotypes.sample_indices[sample_indices], dtype=np.intp),
-            variant_count=raw_genotypes.variant_count,
-            total_sample_count=raw_genotypes.total_sample_count,
-            batch_size=raw_genotypes.batch_size,
-        )
-    if isinstance(raw_genotypes, ConcatenatedRawGenotypeMatrix):
-        return ConcatenatedRawGenotypeMatrix(
-            tuple(_subset_genotype_matrix_rows(child, sample_indices) for child in raw_genotypes.children)
-        )
-    return DenseRawGenotypeMatrix(np.asarray(raw_genotypes.materialize()[sample_indices, :], dtype=np.float32))
-
-
-def _dataset_metrics(
-    dataset: LoadedDataset,
-    model: BayesianPGS,
-) -> dict[str, Any]:
-    genetic_score, covariate_score = model.decision_components(dataset.genotypes, dataset.covariates)
-    linear_predictor = np.asarray(genetic_score + covariate_score, dtype=np.float32)
-    target_array = np.asarray(dataset.targets, dtype=np.float32)
-    if model.config.trait_type == TraitType.BINARY:
-        probabilities = np.asarray(stable_sigmoid(linear_predictor), dtype=np.float32)
-        predicted_labels = (probabilities >= 0.5).astype(np.int32)
-        unique_targets = np.unique(target_array)
-        validation_auc = None if unique_targets.shape[0] < 2 else float(roc_auc_score(target_array, probabilities))
-        return {
-            "validation_auc": validation_auc,
-            "validation_log_loss": float(log_loss(target_array, probabilities, labels=[0.0, 1.0])),
-            "validation_accuracy": float(np.mean(predicted_labels == target_array)),
-        }
-    residuals = target_array - linear_predictor
-    return {
-        "validation_r2": float(r2_score(target_array, linear_predictor)),
-        "validation_rmse": float(np.sqrt(np.mean(residuals * residuals))),
-    }
 
 
 def _build_sample_table(
