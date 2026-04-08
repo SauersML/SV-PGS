@@ -101,7 +101,7 @@ class ModelConfig:
     TPB shapes: minimum/maximum_tpb_shape, tpb_shape_learning_rate
     """
     trait_type: TraitType = TraitType.BINARY       # binary (case/control) or quantitative
-    max_outer_iterations: int = 30                 # EM iterations (usually converges in 10-20)
+    max_outer_iterations: int = 20                 # EM iterations (usually converges in 10-15, step size negligible beyond 20)
     convergence_tolerance: float = 1e-5            # stop when parameters change < this
     minimum_scale: float = 1e-6                    # variants with std < this are treated as monomorphic
     polya_gamma_minimum_weight: float = 1e-4       # floor on IRLS weights to prevent division by ~zero

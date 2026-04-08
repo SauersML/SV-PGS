@@ -2974,17 +2974,18 @@ def _get_cached_sample_space_gpu_preconditioner(
 
 def _apply_sample_space_operator_gpu(
     genotype_matrix: StandardizedGenotypeMatrix,
-    prior_variances: np.ndarray,
-    diagonal_noise: np.ndarray,
+    prior_variances,
+    diagonal_noise,
     matrix_gpu,
     *,
     batch_size: int,
     cp,
     dtype,
+    _already_on_gpu: bool = False,
 ):
     input_gpu = cp.asarray(matrix_gpu, dtype=dtype)
-    diagonal_noise_gpu = cp.asarray(diagonal_noise, dtype=dtype)
-    prior_variances_gpu = cp.asarray(prior_variances, dtype=dtype)
+    diagonal_noise_gpu = diagonal_noise if _already_on_gpu else cp.asarray(diagonal_noise, dtype=dtype)
+    prior_variances_gpu = prior_variances if _already_on_gpu else cp.asarray(prior_variances, dtype=dtype)
     if input_gpu.ndim == 1:
         input_gpu = input_gpu[:, None]
         vector_input = True
@@ -3036,15 +3037,20 @@ def _solve_sample_space_rhs_gpu_inner(
     elif rhs_gpu.ndim != 2:
         raise ValueError("GPU sample-space solve expects a vector or matrix right-hand side.")
 
+    # Pre-upload constants to GPU — avoids re-uploading every CG iteration
+    _diagonal_noise_gpu = cp.asarray(diagonal_noise, dtype=compute_cp_dtype)
+    _prior_variances_gpu = cp.asarray(prior_variances, dtype=compute_cp_dtype)
+
     def apply_operator(matrix_gpu):
         return _apply_sample_space_operator_gpu(
             genotype_matrix=genotype_matrix,
-            prior_variances=prior_variances,
-            diagonal_noise=diagonal_noise,
+            prior_variances=_prior_variances_gpu,
+            diagonal_noise=_diagonal_noise_gpu,
             matrix_gpu=matrix_gpu,
             batch_size=batch_size,
             cp=cp,
             dtype=compute_cp_dtype,
+            _already_on_gpu=True,
         )
 
     residual_refresh_interval = 32
