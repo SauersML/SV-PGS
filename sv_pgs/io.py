@@ -1259,7 +1259,37 @@ def _write_variant_metadata(path: Path, variants: Sequence[_VariantDefaults]) ->
         )
 
 
+def _classify_variant_from_record(rec: object) -> VariantClass:
+    raw = getattr(rec, "variant_class", None)
+    if raw is None and isinstance(rec, dict):
+        raw = rec.get("variant_class")
+    if isinstance(raw, VariantClass):
+        return raw
+    if raw is not None:
+        try:
+            return VariantClass(str(raw))
+        except ValueError:
+            pass
+    return VariantClass.OTHER_COMPLEX_SV
+
+
 def _load_variant_metadata(path: Path) -> list[_VariantDefaults]:
+    if path.suffix == ".pkl":
+        import pickle
+        with open(path, "rb") as fh:
+            legacy_variants = pickle.load(fh)
+        return [
+            _VariantDefaults(
+                variant_id=str(getattr(rec, "variant_id", rec.get("variant_id", ""))),
+                variant_class=_classify_variant_from_record(rec),
+                chromosome=str(getattr(rec, "chromosome", rec.get("chromosome", ""))),
+                position=int(getattr(rec, "position", rec.get("position", 0))),
+                length=float(getattr(rec, "length", rec.get("length", 0.0))),
+                allele_frequency=float(getattr(rec, "allele_frequency", rec.get("allele_frequency", 0.0))),
+                quality=float(getattr(rec, "quality", rec.get("quality", 0.0))),
+            )
+            for rec in legacy_variants
+        ]
     payload = np.load(path, allow_pickle=False)
     try:
         variant_ids = np.asarray(payload["variant_ids"], dtype=str)
@@ -1334,11 +1364,27 @@ def _write_vcf_cache_stats(stats_path: Path, variant_stats: VariantStatistics) -
 
 
 def _is_vcf_cache_bundle_complete(paths: _VcfCachePaths) -> bool:
-    manifest = _load_vcf_cache_manifest(paths.manifest_path)
-    if manifest is None:
+    if not paths.geno_path.exists():
         return False
-    stats_filename = str(manifest.get("stats_file", paths.stats_path.name))
-    return paths.geno_path.exists() and paths.var_path.exists() and (paths.cache_dir / stats_filename).exists()
+    # Support both new (.variants.npz) and legacy (.variants.pkl) formats
+    var_exists = paths.var_path.exists()
+    if not var_exists:
+        legacy_var = paths.cache_dir / f"{paths.key}.variants.pkl"
+        var_exists = legacy_var.exists()
+    if not var_exists:
+        return False
+    # Check stats — manifest may reference old name, or may not exist
+    manifest = _load_vcf_cache_manifest(paths.manifest_path)
+    if manifest is not None:
+        stats_filename = str(manifest.get("stats_file", paths.stats_path.name))
+        if (paths.cache_dir / stats_filename).exists():
+            return True
+    # Fall through: check for stats files directly (legacy formats)
+    if paths.stats_path.exists():
+        return True
+    legacy_stats_npy = paths.cache_dir / f"{paths.key}.stats.npy"
+    legacy_stats_npz = paths.cache_dir / f"{paths.key}.stats.npz"
+    return legacy_stats_npy.exists() or legacy_stats_npz.exists()
 
 
 def _ensure_vcf_cache_matrix_fast(paths: _VcfCachePaths, genotype_matrix: np.ndarray) -> np.ndarray:
@@ -1376,20 +1422,37 @@ def _load_vcf_from_cache(
         log(f"VCF cache hit — loading from {paths.cache_dir.name}/{paths.key}.*")
         effective_mmap_mode: Literal["r", "r+", "w+", "c"] = "r" if mmap_mode is None else mmap_mode
         manifest = _load_vcf_cache_manifest(paths.manifest_path)
-        if manifest is None:
-            raise ValueError("cache manifest missing or invalid")
-        expected_sample_count = int(manifest["sample_count"])
-        expected_variant_count = int(manifest["variant_count"])
-        stats_path = paths.cache_dir / str(manifest.get("stats_file", paths.stats_path.name))
-        if not stats_path.exists():
-            raise ValueError(f"cache manifest references missing stats file: {stats_path.name}")
-
+        # Legacy caches may not have manifests — infer from matrix shape
         import time as _time_mod
         _t0 = _time_mod.monotonic()
         genotype_matrix = np.load(paths.geno_path, mmap_mode=effective_mmap_mode)
         log(f"  mmap ready: {genotype_matrix.shape} {genotype_matrix.dtype} ({_time_mod.monotonic()-_t0:.1f}s)")
+        if manifest is not None:
+            expected_sample_count = int(manifest["sample_count"])
+            expected_variant_count = int(manifest["variant_count"])
+            stats_filename = str(manifest.get("stats_file", paths.stats_path.name))
+            stats_path = paths.cache_dir / stats_filename
+        else:
+            expected_sample_count = genotype_matrix.shape[0]
+            expected_variant_count = genotype_matrix.shape[1]
+            # Find stats file — try all known locations
+            stats_path = paths.stats_path
+            if not stats_path.exists():
+                for suffix in (".stats.npy", ".stats.npz"):
+                    candidate = paths.cache_dir / f"{paths.key}{suffix}"
+                    if candidate.exists():
+                        stats_path = candidate
+                        break
+        if not stats_path.exists():
+            raise ValueError(f"stats file not found: tried {stats_path.name}")
         _t1 = _time_mod.monotonic()
-        variants = _load_variant_metadata(paths.var_path)
+        # Support both .variants.npz (new) and .variants.pkl (legacy)
+        var_path = paths.var_path
+        if not var_path.exists():
+            legacy_var = paths.cache_dir / f"{paths.key}.variants.pkl"
+            if legacy_var.exists():
+                var_path = legacy_var
+        variants = _load_variant_metadata(var_path)
         log(f"  variants loaded: {len(variants)} ({_time_mod.monotonic()-_t1:.1f}s)")
         _t2 = _time_mod.monotonic()
         variant_stats = _load_vcf_cache_stats(stats_path)
@@ -1419,10 +1482,7 @@ def _load_vcf_from_cache(
                 f"cached stats mismatch: matrix has {cached_variant_count} columns, "
                 f"but stats describe {stats_variant_count} variants"
             )
-        try:
-            genotype_matrix = _ensure_vcf_cache_matrix_fast(paths, genotype_matrix)
-        except Exception:
-            pass
+        genotype_matrix = _ensure_vcf_cache_matrix_fast(paths, genotype_matrix)
         log(f"  cached matrix {genotype_matrix.shape}, {len(variants)} variants")
         return genotype_matrix, variants, variant_stats
     except Exception as exc:
