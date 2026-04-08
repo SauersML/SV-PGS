@@ -3012,19 +3012,17 @@ def _solve_sample_space_rhs_gpu_inner(
         residual_gpu[:, active_columns] -= operator_search_gpu * step_scale_gpu[None, :]
         if (iteration_index + 1) % residual_refresh_interval == 0:
             residual_gpu[:, active_columns] = rhs_gpu[:, active_columns] - apply_operator(solution_gpu[:, active_columns])
-        residual_norm_sq[active_columns] = np.asarray(
-            cp.sum(residual_gpu[:, active_columns] * residual_gpu[:, active_columns], axis=0, dtype=cp.float64),
-            dtype=np.float64,
-        )
+        residual_norm_sq[active_columns] = cp.sum(
+            residual_gpu[:, active_columns] * residual_gpu[:, active_columns], axis=0, dtype=cp.float64,
+        ).get().astype(np.float64)
         converged = residual_norm_sq <= convergence_threshold_sq
         if np.all(converged):
             break
         refreshed_residual_gpu = residual_gpu[:, active_columns]
         refreshed_preconditioned_gpu = preconditioner(refreshed_residual_gpu)
-        updated_residual_dot_active = np.asarray(
-            cp.sum(refreshed_residual_gpu * refreshed_preconditioned_gpu, axis=0, dtype=cp.float64),
-            dtype=np.float64,
-        )
+        updated_residual_dot_active = cp.sum(
+            refreshed_residual_gpu * refreshed_preconditioned_gpu, axis=0, dtype=cp.float64,
+        ).get().astype(np.float64)
         beta_active = updated_residual_dot_active / np.maximum(residual_dot[active_columns], 1e-30)
         if np.any(~np.isfinite(beta_active) | (beta_active < 0.0)):
             raise RuntimeError("GPU conjugate-gradient preconditioner produced an invalid update.")
