@@ -767,10 +767,31 @@ def run_all_of_us(
     log(f"  ancestry file:   {'DONE' if ancestry_local.exists() else 'NEEDED'}")
     log(f"  variant metadata:{'DONE' if variant_metadata_path.exists() else 'NEEDED'}")
 
-    # Cache key no longer depends on sample indices — only on VCF content + config.
+    # Migrate old caches: previous versions stored caches in work_dir/.sv_pgs_cache/
+    # but the current code looks next to the VCF files.  Symlink old→new so existing
+    # caches are found without re-parsing.
+    from sv_pgs.io import _is_vcf_cache_bundle_complete, _vcf_cache_dir, _vcf_cache_key, _vcf_cache_paths
+    old_cache_dir = work_dir / _LOCAL_CACHE_DIRNAME
+    if old_cache_dir.exists():
+        first_vcf = local_sv_vcf_path(chromosomes[0], work_dir)
+        if first_vcf.exists():
+            new_cache_dir = _vcf_cache_dir(first_vcf)
+            if old_cache_dir.resolve() != new_cache_dir.resolve():
+                new_cache_dir.mkdir(parents=True, exist_ok=True)
+                migrated = 0
+                for src in old_cache_dir.iterdir():
+                    dst = new_cache_dir / src.name
+                    if not dst.exists():
+                        try:
+                            dst.symlink_to(src.resolve())
+                            migrated += 1
+                        except OSError:
+                            pass
+                if migrated > 0:
+                    log(f"  migrated {migrated} cache files from {old_cache_dir} → {new_cache_dir}")
+
     cached_chrs = []
     uncached_chrs = []
-    from sv_pgs.io import _is_vcf_cache_bundle_complete, _vcf_cache_dir, _vcf_cache_paths
     for chrom in chromosomes:
         vcf_path = local_sv_vcf_path(chrom, work_dir)
         if not vcf_path.exists():
