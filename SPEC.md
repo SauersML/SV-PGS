@@ -18,3 +18,4 @@
 - We have a single, best path for users. Options and choices must be absent unless absolutely necessary.
 - `# noqa` bypasses are never allowed. Fix the underlying issue instead of silencing the linter.
 - No holdout splits or cross-validation. The Bayesian prior is the regularizer — all samples train the model.
+- No unnecessary environment variables.
