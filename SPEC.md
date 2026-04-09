@@ -19,3 +19,4 @@
 - `# noqa` bypasses are never allowed. Fix the underlying issue instead of silencing the linter.
 - No holdout splits or cross-validation. The Bayesian prior is the regularizer — all samples train the model.
 - No unnecessary environment variables.
+- One model, one inference pass. Every variant goes through the same Bayesian model with the same prior structure. No two-stage pipelines, no "background" models for some variants and "exact" models for others, no treating variant subsets differently at the algorithmic level. Computational shortcuts (working sets, stochastic blocks) are optimizations that must produce the same result as the full joint model — they are not license to use a different model for different variants.
