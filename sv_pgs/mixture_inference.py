@@ -5118,21 +5118,29 @@ def _restricted_posterior_state(
                 # precision loss over ~97K samples that previously required
                 # a jitter hack for Cholesky stability.
                 inv_d_cp = cp.asarray(inverse_diagonal_noise, dtype=cp.float64)
-                # Build X^T W X in float64 chunk-by-chunk. Each chunk computes
-                # X^T @ (W * X[:, chunk]) where the weighted chunk is float64.
-                # We avoid allocating a full p×n float64 transpose (6.2 GB for
-                # 8K×97K) by doing the matmul per output-column-block.
-                # Peak extra memory: ~750 MB per chunk (n × chunk_size × 8 bytes).
+                # Build X^T diag(W) X in float64 via double-chunked matmul.
+                # CuPy promotes float32 × float64 by copying the float32 operand
+                # to float64 — for X^T that's 6.2 GB (OOM on T4).  Instead we
+                # chunk over BOTH column blocks (output columns of X^T W X) and
+                # row blocks (samples), keeping float64 intermediates small.
+                # Peak extra memory: row_chunk × col_chunk × 8 bytes ≈ 256 MB.
                 xtdx_gpu = cp.zeros((variant_count, variant_count), dtype=cp.float64)
-                chunk = min(1024, variant_count)
-                for start in range(0, variant_count, chunk):
-                    end = min(start + chunk, variant_count)
-                    # weighted_chunk: (n, chunk) float64
-                    weighted_chunk = inv_d_cp[:, None] * cp.asarray(X_gpu_compute[:, start:end], dtype=cp.float64)
-                    # X_gpu_compute is (n, p) float32. X^T @ weighted_chunk does
-                    # float32 × float64 — CuPy promotes to float64 for the matmul.
-                    xtdx_gpu[:, start:end] = X_gpu_compute.T @ weighted_chunk
-                    del weighted_chunk
+                col_chunk = min(1024, variant_count)
+                row_chunk = min(4096, sample_count)
+                for row_start in range(0, sample_count, row_chunk):
+                    row_end = min(row_start + row_chunk, sample_count)
+                    # (p, row_chunk) float64 — ~256 MB for p=8K, row_chunk=4K
+                    x_rows_f64 = cp.asarray(X_gpu_compute[row_start:row_end, :].T, dtype=cp.float64)
+                    w_rows = inv_d_cp[row_start:row_end]
+                    for col_start in range(0, variant_count, col_chunk):
+                        col_end = min(col_start + col_chunk, variant_count)
+                        # (row_chunk, col_chunk) float64
+                        weighted_col = w_rows[:, None] * cp.asarray(
+                            X_gpu_compute[row_start:row_end, col_start:col_end], dtype=cp.float64
+                        )
+                        xtdx_gpu[:, col_start:col_end] += x_rows_f64 @ weighted_col
+                        del weighted_col
+                    del x_rows_f64
                 projector_bundle_gpu = _build_restricted_projector_gpu_bundle(
                     inverse_diagonal_noise=inverse_diagonal_noise,
                     covariate_matrix=covariate_matrix,
