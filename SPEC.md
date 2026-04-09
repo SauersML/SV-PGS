@@ -19,4 +19,5 @@
 - `# noqa` bypasses are never allowed. Fix the underlying issue instead of silencing the linter.
 - No holdout splits or cross-validation. The Bayesian prior is the regularizer — all samples train the model.
 - No unnecessary environment variables.
+- No hardcoded GPU sizes or device-specific constants. All GPU memory budgets, block sizes, and solver limits must be derived from the actual device memory at runtime. Code must work correctly on any NVIDIA GPU (T4, A100, H100, etc.).
 - One model, one inference pass. Every variant goes through the same Bayesian model with the same prior structure. No two-stage pipelines, no "background" models for some variants and "exact" models for others, no treating variant subsets differently at the algorithmic level. Computational shortcuts (working sets, stochastic blocks) are optimizations that must produce the same result as the full joint model — they are not license to use a different model for different variants.
