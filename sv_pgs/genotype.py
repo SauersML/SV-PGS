@@ -748,10 +748,11 @@ class _CupyInt8StandardizedCache:
         missing_mask = raw_chunk == np.int8(PLINK_MISSING_INT8)
         standardized -= means[None, :]
         standardized /= scales[None, :]
-        if hasattr(missing_mask, "any") and bool(missing_mask.any()):
+        has_missing = missing_mask.any()
+        if hasattr(has_missing, "get"):
+            has_missing = bool(has_missing.get())
+        if has_missing:
             standardized[missing_mask] = resolved_dtype(0.0)
-        elif np.asarray(missing_mask).any():
-            standardized[np.asarray(missing_mask)] = 0.0
         if hasattr(cp, "asarray"):
             return cp.asarray(standardized, dtype=resolved_dtype)
         standardized_np = np.asarray(standardized)
