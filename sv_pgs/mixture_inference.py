@@ -73,6 +73,7 @@ from sv_pgs._jax import gpu_compute_jax_dtype, gpu_compute_numpy_dtype
 from sv_pgs.config import ModelConfig, TraitType, VariantClass
 from sv_pgs.data import NESTED_PATH_DELIMITER, TieMap, VariantRecord
 from sv_pgs.genotype import (
+    DEFAULT_GENOTYPE_BATCH_SIZE,
     DenseRawGenotypeMatrix,
     RawGenotypeMatrix,
     StandardizedGenotypeMatrix,
@@ -216,6 +217,31 @@ def _gpu_exact_variant_inverse_diagonal(
             dtype=cupy.float64,
         )
     return inverse_diagonal_gpu
+
+
+def _synchronize_gpu_for_timing(cupy_module: Any | None) -> None:
+    if cupy_module is None:
+        return
+    cuda = getattr(cupy_module, "cuda", None)
+    if cuda is None:
+        raise RuntimeError("Timed GPU region requires cupy.cuda for device synchronization.")
+    device_factory = getattr(cuda, "Device", None)
+    if device_factory is None:
+        raise RuntimeError("Timed GPU region requires cupy.cuda.Device for device synchronization.")
+    try:
+        device_factory().synchronize()
+    except (AttributeError, OSError, RuntimeError, TypeError) as error:
+        raise RuntimeError("Timed GPU region failed to synchronize the active device.") from error
+
+
+def _timed_region_start(cupy_module: Any | None = None) -> float:
+    _synchronize_gpu_for_timing(cupy_module)
+    return time.monotonic()
+
+
+def _timed_region_seconds(start_time: float, cupy_module: Any | None = None) -> float:
+    _synchronize_gpu_for_timing(cupy_module)
+    return time.monotonic() - float(start_time)
 
 
 @dataclass(slots=True)
@@ -1057,6 +1083,8 @@ def fit_variational_em(
         f"reason={'matrix on GPU → working-set' if gpu_resident else 'streaming from mmap → stochastic blocks' if use_stochastic_updates else 'small variant count → collapsed'}"
     )
     beta_variance_state: np.ndarray | None = None
+    genetic_linear_predictor: np.ndarray | None = None
+    best_genetic_linear_predictor: np.ndarray | None = None
     restricted_posterior_warm_start = _RestrictedPosteriorWarmStart()
     if use_stochastic_updates:
         block_size = min(int(config.stochastic_variant_batch_size), int(genotype_matrix.shape[1]))
@@ -1144,6 +1172,31 @@ def fit_variational_em(
                 target_vector,
                 dtype=stochastic_epoch_compute_cp_dtype,
             )
+        genetic_linear_predictor = np.zeros(target_vector.shape[0], dtype=np.float64)
+        genetic_linear_predictor_gpu = None
+
+        def _rebuild_genetic_linear_predictor_state() -> None:
+            nonlocal genetic_linear_predictor, genetic_linear_predictor_gpu
+            if use_gpu_epoch_predictor_state:
+                assert stochastic_epoch_cupy is not None
+                assert stochastic_epoch_compute_cp_dtype is not None
+                genetic_linear_predictor_gpu = genotype_matrix.gpu_matmat(
+                    stochastic_epoch_cupy.asarray(beta_state, dtype=stochastic_epoch_compute_cp_dtype),
+                    batch_size=config.posterior_variance_batch_size,
+                    cupy=stochastic_epoch_cupy,
+                    dtype=stochastic_epoch_compute_cp_dtype,
+                )
+                genetic_linear_predictor = _cupy_array_to_numpy(genetic_linear_predictor_gpu, dtype=np.float64)
+                return
+            genetic_linear_predictor_gpu = None
+            genetic_linear_predictor = _genotype_matvec_result_numpy(
+                genotype_matrix,
+                beta_state,
+                batch_size=config.posterior_variance_batch_size,
+                dtype=np.float64,
+            )
+
+        _rebuild_genetic_linear_predictor_state()
         log(
             "  variational inference mode: stochastic variant-block updates "
             + f"(block_size={block_size}, blocks_per_epoch={block_count})"
@@ -1191,51 +1244,8 @@ def fit_variational_em(
                     config=config,
                 )
             )
-            # Recompute genetic_linear_predictor from scratch only when necessary:
-            # - first epoch (no cached predictor yet)
-            # - resuming from checkpoint mid-epoch
-            # - every 10 epochs for numerical consistency
-            # Otherwise, the block loop maintains it incrementally via delta updates.
-            _need_full_recompute = (
-                outer_iteration == start_iteration
-                or resuming_mid_epoch
-                or (outer_iteration - start_iteration) % 10 == 0
-            )
-            if _need_full_recompute:
-                genetic_linear_predictor_gpu = None
-                if use_gpu_epoch_predictor_state:
-                    assert stochastic_epoch_cupy is not None
-                    assert stochastic_epoch_compute_cp_dtype is not None
-                    genetic_linear_predictor_gpu = genotype_matrix.gpu_matmat(
-                        stochastic_epoch_cupy.asarray(beta_state, dtype=stochastic_epoch_compute_cp_dtype),
-                        batch_size=config.posterior_variance_batch_size,
-                        cupy=stochastic_epoch_cupy,
-                        dtype=stochastic_epoch_compute_cp_dtype,
-                    )
-                    genetic_linear_predictor = _cupy_array_to_numpy(genetic_linear_predictor_gpu, dtype=np.float64)
-                else:
-                    genetic_linear_predictor = np.array(
-                        genotype_matrix.matvec_numpy(beta_state, batch_size=config.posterior_variance_batch_size),
-                        dtype=np.float64,
-                        copy=True,
-                    )
-                if outer_iteration > start_iteration:
-                    log(f"    full X@beta recompute (consistency refresh)  mem={mem()}")
-            else:
-                # Reuse incrementally-maintained predictor from previous epoch.
-                # For GPU path, ensure genetic_linear_predictor_gpu is still set from
-                # the previous epoch's block loop updates.
-                if use_gpu_epoch_predictor_state and genetic_linear_predictor_gpu is None:
-                    # Fallback: recompute if GPU state was lost
-                    assert stochastic_epoch_cupy is not None
-                    assert stochastic_epoch_compute_cp_dtype is not None
-                    genetic_linear_predictor_gpu = genotype_matrix.gpu_matmat(
-                        stochastic_epoch_cupy.asarray(beta_state, dtype=stochastic_epoch_compute_cp_dtype),
-                        batch_size=config.posterior_variance_batch_size,
-                        cupy=stochastic_epoch_cupy,
-                        dtype=stochastic_epoch_compute_cp_dtype,
-                    )
-                    genetic_linear_predictor = _cupy_array_to_numpy(genetic_linear_predictor_gpu, dtype=np.float64)
+            if use_gpu_epoch_predictor_state and genetic_linear_predictor_gpu is None:
+                _rebuild_genetic_linear_predictor_state()
             if not resuming_mid_epoch:
                 if config.trait_type == TraitType.BINARY:
                     alpha_state = _fit_binary_alpha_with_offset(
@@ -1405,8 +1415,10 @@ def fit_variational_em(
                         dtype=np.float64,
                     )
                 else:
-                    block_linear_predictor_previous = np.asarray(
-                        block_genotypes.matvec_numpy(block_beta_previous, batch_size=config.posterior_variance_batch_size),
+                    block_linear_predictor_previous = _genotype_matvec_result_numpy(
+                        block_genotypes,
+                        block_beta_previous,
+                        batch_size=config.posterior_variance_batch_size,
                         dtype=np.float64,
                     )
                     predictor_offset = (
@@ -1515,8 +1527,10 @@ def fit_variational_em(
                             dtype=stochastic_epoch_compute_cp_dtype,
                         )
                     else:
-                        genetic_linear_predictor += np.asarray(
-                            block_genotypes.matvec_numpy(beta_delta, batch_size=config.posterior_variance_batch_size),
+                        genetic_linear_predictor += _genotype_matvec_result_numpy(
+                            block_genotypes,
+                            beta_delta,
+                            batch_size=config.posterior_variance_batch_size,
                             dtype=np.float64,
                         )
                     beta_state[block_indices] = block_beta_updated
@@ -1677,6 +1691,7 @@ def fit_variational_em(
                         best_alpha = alpha_state.copy()
                         best_beta = beta_state.copy()
                         best_beta_variance = beta_variance_state.copy()
+                        best_genetic_linear_predictor = genetic_linear_predictor.copy()
                         best_local_scale = local_scale.copy()
                         best_theta = _pack_theta(global_scale, scale_model_coefficients)
                         best_sigma_error2 = float(sigma_error2)
@@ -1935,6 +1950,10 @@ def fit_variational_em(
         global_scale, scale_model_coefficients = _unpack_theta(best_theta)
         tpb_shape_a_vector = best_tpb_shape_a_vector
         tpb_shape_b_vector = best_tpb_shape_b_vector
+        if use_stochastic_updates:
+            if best_genetic_linear_predictor is None:
+                raise RuntimeError("best validation stochastic predictor snapshot is missing")
+            genetic_linear_predictor = best_genetic_linear_predictor.copy()
 
     final_metadata_baseline_scales = _metadata_baseline_scales_from_coefficients(
         scale_model_coefficients,
@@ -1973,9 +1992,15 @@ def fit_variational_em(
         if beta_variance_state is None:
             beta_variance_state = np.maximum(final_reduced_prior_variances, 1e-8)
         final_linear_predictor = predictor_offset_array + np.asarray(covariate_matrix @ alpha_state, dtype=np.float64)
-        if genotype_matrix.shape[1] > 0:
-            final_linear_predictor = final_linear_predictor + np.asarray(
-                genotype_matrix.matvec_numpy(beta_state, batch_size=config.posterior_variance_batch_size),
+        if use_stochastic_updates:
+            if genetic_linear_predictor is None:
+                raise RuntimeError("stochastic predictor cache is missing at final state assembly")
+            final_linear_predictor = final_linear_predictor + np.asarray(genetic_linear_predictor, dtype=np.float64)
+        elif genotype_matrix.shape[1] > 0:
+            final_linear_predictor = final_linear_predictor + _genotype_matvec_result_numpy(
+                genotype_matrix,
+                beta_state,
+                batch_size=config.posterior_variance_batch_size,
                 dtype=np.float64,
             )
         final_state = PosteriorState(
@@ -2497,6 +2522,30 @@ def _cupy_array_to_numpy(array, *, dtype: np.dtype | type[np.floating[Any]]) -> 
     return np.asarray(host_array, dtype=dtype)
 
 
+def _genotype_matvec_result_numpy(
+    genotype_matrix: StandardizedGenotypeMatrix,
+    coefficients: np.ndarray | jnp.ndarray,
+    *,
+    batch_size: int,
+    dtype: np.dtype | type[np.floating[Any]],
+) -> np.ndarray:
+    if genotype_matrix.supports_jax_dense_ops():
+        return np.asarray(genotype_matrix.matvec(coefficients, batch_size=batch_size), dtype=dtype)
+    return np.asarray(genotype_matrix.matvec_numpy(coefficients, batch_size=batch_size), dtype=dtype)
+
+
+def _genotype_transpose_matvec_result_numpy(
+    genotype_matrix: StandardizedGenotypeMatrix,
+    vector: np.ndarray | jnp.ndarray,
+    *,
+    batch_size: int,
+    dtype: np.dtype | type[np.floating[Any]],
+) -> np.ndarray:
+    if genotype_matrix.supports_jax_dense_ops():
+        return np.asarray(genotype_matrix.transpose_matvec(vector, batch_size=batch_size), dtype=dtype)
+    return np.asarray(genotype_matrix.transpose_matvec_numpy(vector, batch_size=batch_size), dtype=dtype)
+
+
 def _softplus_cupy(cp, values_gpu, *, dtype):
     positive_branch = values_gpu >= dtype(0.0)
     return cp.where(
@@ -2694,7 +2743,7 @@ def _binary_posterior_state(
         )
     else:
         log(f"      computing initial linear predictor...  mem={mem()}")
-        _init_pred_t0 = time.monotonic()
+        _init_pred_t0 = _timed_region_start(cupy if gpu_binary_backend else None)
         if gpu_binary_backend:
             assert cupy is not None
             current_linear_predictor_gpu = (
@@ -2719,9 +2768,11 @@ def _binary_posterior_state(
         else:
             current_linear_predictor = predictor_offset_array + np.asarray(
                 covariate_matrix_f64 @ parameters[:covariate_count]
-                + standardized_genotypes.matvec_numpy(
+                + _genotype_matvec_result_numpy(
+                    standardized_genotypes,
                     parameters[covariate_count:],
                     batch_size=posterior_variance_batch_size,
+                    dtype=np.float64,
                 ),
                 dtype=np.float64,
             )
@@ -2731,7 +2782,7 @@ def _binary_posterior_state(
                 prior_precision=prior_precision,
                 beta=parameters[covariate_count:],
             )
-        _init_pred_seconds = time.monotonic() - _init_pred_t0
+        _init_pred_seconds = _timed_region_seconds(_init_pred_t0, cupy if gpu_binary_backend else None)
         log(f"      initial predictor computed in {_init_pred_seconds:.1f}s  obj={current_objective:.4f}  mem={mem()}")
         best_objective = current_objective
         best_parameters = parameters.copy()
@@ -2744,13 +2795,16 @@ def _binary_posterior_state(
     )
     final_weights = _binary_expected_polya_gamma_weights(current_linear_predictor, minimum_weight)
     best_weights = _binary_expected_polya_gamma_weights(best_linear_predictor, minimum_weight)
-    # Fast path: when max_iterations==1 and we need beta_variance, skip the
-    # mean-only Newton solve and go directly to the full solve.  This avoids
-    # solving the linear system twice (once mean-only, once full).
+    # Fast path: stochastic late-epoch binary block updates often run a single
+    # Newton step with variance refresh enabled. In that shape, a mean-only
+    # solve followed by a full solve duplicates the same expensive factorization,
+    # so go straight to the full solve once and reuse it as the final posterior.
     _one_solve_fast_path = (
         max_iterations == 1
         and resume_completed_iterations == 0
         and compute_beta_variance
+        and not compute_logdet
+        and update_blend_weight is not None
     )
     _binary_newton_iters_used = resume_completed_iterations
     if _one_solve_fast_path:
@@ -2758,6 +2812,7 @@ def _binary_posterior_state(
         _binary_newton_iters_used = 1
         # Use current weights for the single full solve
         final_weights = _binary_expected_polya_gamma_weights(current_linear_predictor, minimum_weight)
+    timing_cupy = cupy if cupy is not None else (_try_import_cupy() if _newton_gpu_available else None)
     for iteration_index in range(resume_completed_iterations, max_iterations if not _one_solve_fast_path else 0):
         _binary_newton_iters_used = iteration_index + 1
         iteration_start = time.monotonic()
@@ -2773,7 +2828,7 @@ def _binary_posterior_state(
         else:
             current_weights = _binary_expected_polya_gamma_weights(current_linear_predictor, minimum_weight)
         pseudo_response = kappa / current_weights - predictor_offset_array
-        solve_start = time.monotonic()
+        solve_start = _timed_region_start(timing_cupy)
         updated_alpha, updated_beta, _projected_targets, updated_fitted_response, _restricted_quadratic = (
             _solve_restricted_mean_only(
                 genotype_matrix=standardized_genotypes,
@@ -2798,7 +2853,7 @@ def _binary_posterior_state(
                 allow_gpu_exact_variant=allow_gpu_exact_variant,
             )
         )
-        solve_seconds = time.monotonic() - solve_start
+        solve_seconds = _timed_region_seconds(solve_start, timing_cupy)
         updated_parameters = np.concatenate([updated_alpha, updated_beta], axis=0).astype(np.float64, copy=False)
         updated_linear_predictor = predictor_offset_array + np.asarray(updated_fitted_response, dtype=np.float64)
         if gpu_binary_backend:
@@ -3110,6 +3165,17 @@ def _sample_space_diagonal_preconditioner(
     diagonal_noise: np.ndarray,
     batch_size: int,
 ) -> np.ndarray:
+    if genotype_matrix.supports_jax_dense_ops():
+        compute_dtype = gpu_compute_jax_dtype()
+        genotype_cache_jax = genotype_matrix._ensure_jax_cache()
+        prior_variances_jax = jnp.asarray(prior_variances, dtype=compute_dtype)
+        diagonal_noise_jax = jnp.asarray(diagonal_noise, dtype=compute_dtype)
+        diagonal_jax = diagonal_noise_jax + jnp.sum(
+            jnp.square(genotype_cache_jax) * prior_variances_jax[None, :],
+            axis=1,
+            dtype=compute_dtype,
+        )
+        return np.maximum(np.asarray(diagonal_jax, dtype=np.float64), 1e-8)
     if genotype_matrix._cupy_cache is not None:
         import cupy as cp
         compute_cp_dtype = _cupy_compute_dtype(cp)
@@ -4623,7 +4689,7 @@ def _solve_sample_space_rhs_gpu_inner(
     search_direction_gpu = preconditioned_residual_gpu
     residual_dot = _gpu_to_f64(cp.sum(residual_gpu * preconditioned_residual_gpu, axis=0, dtype=cp.float64))
     iterations_used = 0
-    _cg_t0 = time.monotonic()
+    _cg_t0 = _timed_region_start(cp)
     _cg_log_interval = max(max_iterations // 10, 1)
     for iteration_index in range(max_iterations):
         iterations_used = iteration_index + 1
@@ -4633,7 +4699,11 @@ def _solve_sample_space_rhs_gpu_inner(
         if iteration_index % _cg_log_interval == 0 or iteration_index == max_iterations - 1:
             pct_converged = int(100 * (n_rhs - active_columns.size) / max(n_rhs, 1))
             max_residual = float(np.max(residual_norm_sq[active_columns])) if active_columns.size > 0 else 0.0
-            log(f"       CG iter {iteration_index+1}/{max_iterations}: {pct_converged}% converged  residual={max_residual:.2e}  ({time.monotonic()-_cg_t0:.1f}s)")
+            log(
+                f"       CG iter {iteration_index+1}/{max_iterations}: "
+                + f"{pct_converged}% converged  residual={max_residual:.2e}  "
+                + f"({_timed_region_seconds(_cg_t0, cp):.1f}s)"
+            )
         masked_search_gpu = search_direction_gpu[:, active_columns]
         operator_search_gpu = apply_operator(masked_search_gpu)
         step_denom = _gpu_to_f64(cp.sum(masked_search_gpu * operator_search_gpu, axis=0, dtype=cp.float64))
@@ -4651,9 +4721,13 @@ def _solve_sample_space_rhs_gpu_inner(
         residual_gpu[:, active_columns] -= operator_search_gpu * step_scale_gpu[None, :]
         if (iteration_index + 1) % residual_refresh_interval == 0:
             residual_gpu[:, active_columns] = rhs_gpu[:, active_columns] - apply_operator(solution_gpu[:, active_columns])
-        residual_norm_sq[active_columns] = cp.sum(
-            residual_gpu[:, active_columns] * residual_gpu[:, active_columns], axis=0, dtype=cp.float64,
-        ).get().astype(np.float64)
+        residual_norm_sq[active_columns] = _gpu_to_f64(
+            cp.sum(
+                residual_gpu[:, active_columns] * residual_gpu[:, active_columns],
+                axis=0,
+                dtype=cp.float64,
+            )
+        )
         converged = residual_norm_sq <= convergence_threshold_sq
         limit_reached_active = (iteration_index + 1) >= resolved_iteration_limits[active_columns]
         if np.any(limit_reached_active):
@@ -4667,9 +4741,13 @@ def _solve_sample_space_rhs_gpu_inner(
             break
         refreshed_residual_gpu = residual_gpu[:, active_columns]
         refreshed_preconditioned_gpu = preconditioner(refreshed_residual_gpu)
-        updated_residual_dot_active = cp.sum(
-            refreshed_residual_gpu * refreshed_preconditioned_gpu, axis=0, dtype=cp.float64,
-        ).get().astype(np.float64)
+        updated_residual_dot_active = _gpu_to_f64(
+            cp.sum(
+                refreshed_residual_gpu * refreshed_preconditioned_gpu,
+                axis=0,
+                dtype=cp.float64,
+            )
+        )
         beta_active = updated_residual_dot_active / np.maximum(residual_dot[active_columns], 1e-30)
         _record_sample_space_cg_lanczos_beta(
             lanczos_recorder,
@@ -4691,7 +4769,7 @@ def _solve_sample_space_rhs_gpu_inner(
         else np.empty(0, dtype=np.int32),
         iteration_count=min(iterations_used, max_iterations),
     )
-    log(f"       GPU CG done: {iterations_used} iterations in {time.monotonic()-_cg_t0:.1f}s  mem={mem()}")
+    log(f"       GPU CG done: {iterations_used} iterations in {_timed_region_seconds(_cg_t0, cp):.1f}s  mem={mem()}")
     required_residual = residual_norm_sq[required_mask]
     required_threshold = convergence_threshold_sq[required_mask]
     final_required_residual = float(np.max(required_residual)) if required_residual.size > 0 else 0.0
@@ -5620,6 +5698,17 @@ def _restricted_variant_space_diagonal_preconditioner(
     cross = np.asarray(weighted_covariate_projection.T, dtype=compute_np_dtype)
     correction = _cholesky_solve(covariate_precision_cholesky, cross)
     diag_correction = np.sum(cross * correction, axis=0)
+    if genotype_matrix.supports_jax_dense_ops():
+        compute_dtype = gpu_compute_jax_dtype()
+        genotype_cache_jax = genotype_matrix._ensure_jax_cache()
+        inverse_diagonal_noise_jax = jnp.asarray(inverse_diagonal_noise, dtype=compute_dtype)
+        raw_diag_jax = jnp.sum(
+            jnp.square(genotype_cache_jax) * inverse_diagonal_noise_jax[:, None],
+            axis=0,
+            dtype=compute_dtype,
+        )
+        raw_diag_np = np.asarray(raw_diag_jax, dtype=compute_np_dtype)
+        return np.maximum(prior_precision + raw_diag_np - diag_correction, 1e-8)
     if genotype_matrix._cupy_cache is not None:
         import cupy as cp
         inv_d = cp.asarray(inverse_diagonal_noise, dtype=cp.float64)
@@ -6087,6 +6176,254 @@ def _restricted_posterior_result_without_diagnostics(
     )
 
 
+def _solve_restricted_exact_variant_space(
+    *,
+    genotype_matrix: StandardizedGenotypeMatrix,
+    covariate_matrix: np.ndarray,
+    targets: np.ndarray,
+    prior_precision: np.ndarray,
+    inverse_diagonal_noise: np.ndarray,
+    covariate_precision_cholesky: np.ndarray,
+    apply_projector: Callable[[np.ndarray], np.ndarray],
+    posterior_variance_batch_size: int,
+    compute_beta_variance: bool,
+    compute_logdet: bool,
+    warm_start: _RestrictedPosteriorWarmStart | None,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, float]:
+    from sv_pgs.progress import log, mem
+
+    sample_count = genotype_matrix.shape[0]
+    variant_count = genotype_matrix.shape[1]
+    covariate_count = covariate_matrix.shape[1]
+    if genotype_matrix._cupy_cache is not None:
+        import cupy as cp
+
+        cp_solve_triangular = _resolve_gpu_solve_triangular()
+        cache_is_int8_standardized = _cupy_cache_is_int8_standardized(genotype_matrix._cupy_cache)
+        use_full_gpu_exact = _gpu_exact_variant_full_matrix_fits(
+            cp,
+            sample_count=sample_count,
+            variant_count=variant_count,
+            covariate_count=covariate_count,
+            cache_is_int8_standardized=cache_is_int8_standardized,
+        )
+        tiled_exact_batch_size = 0 if use_full_gpu_exact else _gpu_exact_variant_tile_size(
+            cp,
+            sample_count=sample_count,
+            variant_count=variant_count,
+            covariate_count=covariate_count,
+        )
+        if not use_full_gpu_exact and tiled_exact_batch_size <= 0:
+            raise RuntimeError(
+                "GPU exact variant-space solve was selected without enough tile workspace."
+            )
+        projector_bundle_gpu = _build_restricted_projector_gpu_bundle(
+            inverse_diagonal_noise=inverse_diagonal_noise,
+            covariate_matrix=covariate_matrix,
+            covariate_precision_cholesky=covariate_precision_cholesky,
+            cp=cp,
+            dtype=cp.float64,
+        )
+        projected_targets_gpu = _apply_restricted_projector_gpu(
+            cp.asarray(targets, dtype=cp.float64),
+            projector_bundle_gpu,
+            cp=cp,
+            solve_triangular_gpu=cp_solve_triangular,
+        )
+        diagonal_index = cp.arange(variant_count)
+        inverse_diagonal_noise_gpu = cp.asarray(inverse_diagonal_noise, dtype=cp.float64)
+        if use_full_gpu_exact:
+            cached_standardized_gpu = _cupy_cache_standardized_columns(
+                genotype_matrix._cupy_cache,
+                slice(None),
+                cupy=cp,
+                dtype=cp.float64,
+            )
+            X_gpu_compute = cp.empty(cached_standardized_gpu.shape, dtype=cp.float64, order="F")
+            X_gpu_compute[...] = cp.asarray(cached_standardized_gpu, dtype=cp.float64)
+            _gram_t0 = _timed_region_start(cp)
+            log(f"    building X^T W X (p={variant_count}, n={sample_count}, float64 exact GEMM)...  mem={mem()}")
+            variant_precision_gpu = cp.zeros((variant_count, variant_count), dtype=cp.float64)
+            col_chunk = min(_GPU_EXACT_VARIANT_TILE_MAX_VARIANTS, variant_count)
+            n_col_chunks = (variant_count + col_chunk - 1) // col_chunk
+            for col_idx, col_start in enumerate(range(0, variant_count, col_chunk)):
+                col_end = min(col_start + col_chunk, variant_count)
+                weighted_chunk = inverse_diagonal_noise_gpu[:, None] * X_gpu_compute[:, col_start:col_end]
+                variant_precision_gpu[:, col_start:col_end] = X_gpu_compute.T @ weighted_chunk
+                del weighted_chunk
+                if (col_idx + 1) % max(n_col_chunks // 4, 1) == 0 or col_idx == n_col_chunks - 1:
+                    log(
+                        f"      Gram matrix: {col_end:,}/{variant_count:,} cols "
+                        + f"({100*col_end/variant_count:.0f}%)  "
+                        + f"{_timed_region_seconds(_gram_t0, cp):.1f}s"
+                    )
+            variant_precision_gpu = 0.5 * (variant_precision_gpu + variant_precision_gpu.T)
+            log(f"    X^T W X built in {_timed_region_seconds(_gram_t0, cp):.1f}s  mem={mem()}")
+            rhs_setup_t0 = _timed_region_start(cp)
+            variant_rhs_gpu = genotype_matrix.gpu_transpose_matmat(
+                projected_targets_gpu,
+                batch_size=variant_count,
+                cupy=cp,
+                dtype=cp.float64,
+            )
+            exact_gpu_matmul_batch_size = variant_count
+        else:
+            _gram_t0 = _timed_region_start(cp)
+            log(
+                "    building X^T W X "
+                + f"(p={variant_count}, n={sample_count}, tiled exact GPU batches={tiled_exact_batch_size})...  mem={mem()}"
+            )
+            variant_precision_gpu = cp.zeros((variant_count, variant_count), dtype=cp.float64)
+            row_starts = range(0, variant_count, tiled_exact_batch_size)
+            n_row_tiles = (variant_count + tiled_exact_batch_size - 1) // tiled_exact_batch_size
+            for row_idx, row_start in enumerate(row_starts):
+                row_end = min(row_start + tiled_exact_batch_size, variant_count)
+                row_batch_gpu = _cupy_cache_standardized_columns(
+                    genotype_matrix._cupy_cache,
+                    slice(row_start, row_end),
+                    cupy=cp,
+                    dtype=cp.float64,
+                )
+                for col_start in range(row_start, variant_count, tiled_exact_batch_size):
+                    col_end = min(col_start + tiled_exact_batch_size, variant_count)
+                    col_batch_gpu = _cupy_cache_standardized_columns(
+                        genotype_matrix._cupy_cache,
+                        slice(col_start, col_end),
+                        cupy=cp,
+                        dtype=cp.float64,
+                    )
+                    col_batch_gpu *= inverse_diagonal_noise_gpu[:, None]
+                    block_precision_gpu = row_batch_gpu.T @ col_batch_gpu
+                    variant_precision_gpu[row_start:row_end, col_start:col_end] = block_precision_gpu
+                    if row_start != col_start:
+                        variant_precision_gpu[col_start:col_end, row_start:row_end] = block_precision_gpu.T
+                    del col_batch_gpu, block_precision_gpu
+                del row_batch_gpu
+                if (row_idx + 1) % max(n_row_tiles // 4, 1) == 0 or row_idx == n_row_tiles - 1:
+                    log(
+                        f"      Gram matrix: {row_end:,}/{variant_count:,} rows "
+                        + f"({100*row_end/variant_count:.0f}%)  "
+                        + f"{_timed_region_seconds(_gram_t0, cp):.1f}s"
+                    )
+            log(f"    X^T W X built in {_timed_region_seconds(_gram_t0, cp):.1f}s  mem={mem()}")
+            rhs_setup_t0 = _timed_region_start(cp)
+            variant_rhs_gpu = genotype_matrix.gpu_transpose_matmat(
+                projected_targets_gpu,
+                batch_size=tiled_exact_batch_size,
+                cupy=cp,
+                dtype=cp.float64,
+            )
+            exact_gpu_matmul_batch_size = tiled_exact_batch_size
+        if covariate_count > 0:
+            CtWX_gpu = _cached_weighted_covariate_projection(
+                genotype_matrix=genotype_matrix,
+                covariate_matrix=covariate_matrix,
+                inverse_diagonal_noise=inverse_diagonal_noise,
+                batch_size=posterior_variance_batch_size,
+                warm_start=warm_start,
+                return_gpu=True,
+                cupy=cp,
+            )
+            correction_coeff_gpu = _gpu_cholesky_solve(
+                CtWX_gpu.T,
+                projector_bundle_gpu[3],
+                cp_solve_triangular,
+            )
+            correction_gpu = cp.asarray(CtWX_gpu @ correction_coeff_gpu, dtype=cp.float64)
+            variant_precision_gpu -= correction_gpu
+        variant_precision_gpu[diagonal_index, diagonal_index] += cp.asarray(prior_precision, dtype=cp.float64)
+        variant_precision_gpu[diagonal_index, diagonal_index] += 1e-8
+        log(f"    rhs/correction prepared in {_timed_region_seconds(rhs_setup_t0, cp):.1f}s  mem={mem()}")
+        _cholesky_t0 = _timed_region_start(cp)
+        log(f"    Cholesky factorization ({variant_count}×{variant_count} float64)...  mem={mem()}")
+        variant_precision_cholesky_gpu = cp.linalg.cholesky(variant_precision_gpu)
+        log(f"    Cholesky done in {_timed_region_seconds(_cholesky_t0, cp):.1f}s, solving...  mem={mem()}")
+
+        def solve_variant_rhs_gpu(right_hand_side):
+            return _gpu_cholesky_solve(
+                right_hand_side,
+                variant_precision_cholesky_gpu,
+                cp_solve_triangular,
+            )
+
+        _solve_t0 = _timed_region_start(cp)
+        beta_gpu = solve_variant_rhs_gpu(variant_rhs_gpu)
+        log(f"    exact variant-space solve done in {_timed_region_seconds(_solve_t0, cp):.1f}s  mem={mem()}")
+        beta = _cupy_array_to_numpy(beta_gpu, dtype=np.float64)
+        beta_variance = (
+            np.maximum(
+                _cupy_array_to_numpy(
+                    _gpu_exact_variant_inverse_diagonal(
+                        variant_precision_cholesky_gpu,
+                        solve_triangular_gpu=cp_solve_triangular,
+                        cupy=cp,
+                    ),
+                    dtype=np.float64,
+                ),
+                1e-8,
+            )
+            if compute_beta_variance
+            else np.zeros(variant_count, dtype=np.float64)
+        )
+        logdet_A = (
+            2.0
+            * float(
+                np.sum(
+                    np.log(
+                        np.maximum(
+                            _cupy_array_to_numpy(
+                                variant_precision_cholesky_gpu[
+                                    diagonal_index,
+                                    diagonal_index,
+                                ],
+                                dtype=np.float64,
+                            ),
+                            1e-12,
+                        )
+                    )
+                )
+            )
+            if compute_logdet
+            else 0.0
+        )
+        if use_full_gpu_exact:
+            genetic_linear_predictor_gpu = X_gpu_compute @ cp.asarray(beta_gpu, dtype=cp.float64)
+        else:
+            genetic_linear_predictor_gpu = genotype_matrix.gpu_matmat(
+                cp.asarray(beta_gpu, dtype=cp.float64),
+                batch_size=exact_gpu_matmul_batch_size,
+                cupy=cp,
+                dtype=cp.float64,
+            )
+        genetic_linear_predictor = _cupy_array_to_numpy(genetic_linear_predictor_gpu, dtype=np.float64)
+        return beta, genetic_linear_predictor, beta_variance, logdet_A
+
+    dense_genotypes = np.asarray(genotype_matrix.materialize(batch_size=posterior_variance_batch_size), dtype=np.float64)
+    projected_genotypes = apply_projector(dense_genotypes)
+    variant_rhs = dense_genotypes.T @ apply_projector(targets)
+    variant_precision_matrix = np.diag(prior_precision) + dense_genotypes.T @ projected_genotypes
+    variant_precision_matrix += np.eye(variant_count, dtype=np.float64) * 1e-8
+    variant_precision_cholesky = np.linalg.cholesky(variant_precision_matrix)
+
+    def solve_variant_rhs(right_hand_side: np.ndarray) -> np.ndarray:
+        return _cholesky_solve(variant_precision_cholesky, np.asarray(right_hand_side, dtype=np.float64))
+
+    beta = np.asarray(solve_variant_rhs(variant_rhs), dtype=np.float64)
+    beta_variance = (
+        np.maximum(np.diag(solve_variant_rhs(np.eye(variant_count, dtype=np.float64))), 1e-8)
+        if compute_beta_variance
+        else np.zeros(variant_count, dtype=np.float64)
+    )
+    logdet_A = 2.0 * float(np.sum(np.log(np.diag(variant_precision_cholesky)))) if compute_logdet else 0.0
+    genetic_linear_predictor = _genotype_matvec_result_numpy(
+        genotype_matrix,
+        beta,
+        batch_size=posterior_variance_batch_size,
+        dtype=np.float64,
+    )
+    return beta, genetic_linear_predictor, beta_variance, logdet_A
+
+
 def _solve_restricted_mean_only(
     genotype_matrix: StandardizedGenotypeMatrix,
     covariate_matrix: np.ndarray,
@@ -6173,11 +6510,19 @@ def _solve_restricted_mean_only(
             dtype=np.float64,
         )
         beta = np.asarray(
-            prior_variances * np.asarray(genotype_matrix.transpose_matvec_numpy(projected_targets), dtype=np.float64),
+            prior_variances
+            * _genotype_transpose_matvec_result_numpy(
+                genotype_matrix,
+                projected_targets,
+                batch_size=posterior_variance_batch_size,
+                dtype=np.float64,
+            ),
             dtype=np.float64,
         )
-        linear_predictor = covariate_matrix @ alpha + np.asarray(
-            genotype_matrix.matvec_numpy(beta, batch_size=posterior_variance_batch_size),
+        linear_predictor = covariate_matrix @ alpha + _genotype_matvec_result_numpy(
+            genotype_matrix,
+            beta,
+            batch_size=posterior_variance_batch_size,
             dtype=np.float64,
         )
         restricted_quadratic = float(np.dot(targets, projected_targets))
@@ -6257,179 +6602,23 @@ def _solve_restricted_mean_only(
             )
         if use_exact_variant or use_gpu_exact_variant:
             log(f"    restricted mean: exact variant-space Cholesky (p={variant_count}, n={sample_count})  mem={mem()}")
-            if genotype_matrix._cupy_cache is not None:
-                import cupy as cp
-
-                cp_solve_triangular = _resolve_gpu_solve_triangular()
-                covariate_count = covariate_matrix.shape[1]
-                cache_is_int8_standardized = _cupy_cache_is_int8_standardized(genotype_matrix._cupy_cache)
-                use_full_gpu_exact = _gpu_exact_variant_full_matrix_fits(
-                    cp,
-                    sample_count=sample_count,
-                    variant_count=variant_count,
-                    covariate_count=covariate_count,
-                    cache_is_int8_standardized=cache_is_int8_standardized,
-                )
-                tiled_exact_batch_size = 0 if use_full_gpu_exact else _gpu_exact_variant_tile_size(
-                    cp,
-                    sample_count=sample_count,
-                    variant_count=variant_count,
-                    covariate_count=covariate_count,
-                )
-                if not use_full_gpu_exact and tiled_exact_batch_size <= 0:
-                    raise RuntimeError(
-                        "GPU exact variant-space solve was selected without enough tile workspace."
-                    )
-                projector_bundle_gpu = _build_restricted_projector_gpu_bundle(
-                    inverse_diagonal_noise=inverse_diagonal_noise,
-                    covariate_matrix=covariate_matrix,
-                    covariate_precision_cholesky=covariate_precision_cholesky,
-                    cp=cp,
-                    dtype=cp.float64,
-                )
-                projected_targets_gpu = _apply_restricted_projector_gpu(
-                    cp.asarray(targets, dtype=cp.float64),
-                    projector_bundle_gpu,
-                    cp=cp,
-                    solve_triangular_gpu=cp_solve_triangular,
-                )
-                diagonal_index = cp.arange(variant_count)
-                inverse_diagonal_noise_gpu = cp.asarray(inverse_diagonal_noise, dtype=cp.float64)
-                if use_full_gpu_exact:
-                    cached_standardized_gpu = _cupy_cache_standardized_columns(
-                        genotype_matrix._cupy_cache,
-                        slice(None),
-                        cupy=cp,
-                        dtype=cp.float64,
-                    )
-                    X_gpu_compute = cp.empty(cached_standardized_gpu.shape, dtype=cp.float64, order="F")
-                    X_gpu_compute[...] = cp.asarray(cached_standardized_gpu, dtype=cp.float64)
-                    _gram_t0 = time.monotonic()
-                    log(f"    building X^T W X (p={variant_count}, n={sample_count}, float64 exact GEMM)...  mem={mem()}")
-                    variant_precision_gpu = cp.zeros((variant_count, variant_count), dtype=cp.float64)
-                    col_chunk = min(_GPU_EXACT_VARIANT_TILE_MAX_VARIANTS, variant_count)
-                    n_col_chunks = (variant_count + col_chunk - 1) // col_chunk
-                    for col_idx, col_start in enumerate(range(0, variant_count, col_chunk)):
-                        col_end = min(col_start + col_chunk, variant_count)
-                        weighted_chunk = inverse_diagonal_noise_gpu[:, None] * X_gpu_compute[:, col_start:col_end]
-                        variant_precision_gpu[:, col_start:col_end] = X_gpu_compute.T @ weighted_chunk
-                        del weighted_chunk
-                        if (col_idx + 1) % max(n_col_chunks // 4, 1) == 0 or col_idx == n_col_chunks - 1:
-                            log(f"      Gram matrix: {col_end:,}/{variant_count:,} cols ({100*col_end/variant_count:.0f}%)  {time.monotonic()-_gram_t0:.1f}s")
-                    variant_precision_gpu = 0.5 * (variant_precision_gpu + variant_precision_gpu.T)
-                    cp.cuda.Device().synchronize()
-                    log(f"    X^T W X built in {time.monotonic()-_gram_t0:.1f}s  mem={mem()}")
-                    variant_rhs_gpu = genotype_matrix.gpu_transpose_matmat(
-                        projected_targets_gpu,
-                        batch_size=variant_count,
-                        cupy=cp,
-                        dtype=cp.float64,
-                    )
-                    exact_gpu_matmul_batch_size = variant_count
-                else:
-                    _gram_t0 = time.monotonic()
-                    log(
-                        "    building X^T W X "
-                        + f"(p={variant_count}, n={sample_count}, tiled exact GPU batches={tiled_exact_batch_size})...  mem={mem()}"
-                    )
-                    variant_precision_gpu = cp.zeros((variant_count, variant_count), dtype=cp.float64)
-                    row_starts = range(0, variant_count, tiled_exact_batch_size)
-                    n_row_tiles = (variant_count + tiled_exact_batch_size - 1) // tiled_exact_batch_size
-                    for row_idx, row_start in enumerate(row_starts):
-                        row_end = min(row_start + tiled_exact_batch_size, variant_count)
-                        row_batch_gpu = _cupy_cache_standardized_columns(
-                            genotype_matrix._cupy_cache,
-                            slice(row_start, row_end),
-                            cupy=cp,
-                            dtype=cp.float64,
-                        )
-                        for col_start in range(row_start, variant_count, tiled_exact_batch_size):
-                            col_end = min(col_start + tiled_exact_batch_size, variant_count)
-                            col_batch_gpu = _cupy_cache_standardized_columns(
-                                genotype_matrix._cupy_cache,
-                                slice(col_start, col_end),
-                                cupy=cp,
-                                dtype=cp.float64,
-                            )
-                            col_batch_gpu *= inverse_diagonal_noise_gpu[:, None]
-                            block_precision_gpu = row_batch_gpu.T @ col_batch_gpu
-                            variant_precision_gpu[row_start:row_end, col_start:col_end] = block_precision_gpu
-                            if row_start != col_start:
-                                variant_precision_gpu[col_start:col_end, row_start:row_end] = block_precision_gpu.T
-                            del col_batch_gpu, block_precision_gpu
-                        del row_batch_gpu
-                        if (row_idx + 1) % max(n_row_tiles // 4, 1) == 0 or row_idx == n_row_tiles - 1:
-                            log(f"      Gram matrix: {row_end:,}/{variant_count:,} rows ({100*row_end/variant_count:.0f}%)  {time.monotonic()-_gram_t0:.1f}s")
-                    cp.cuda.Device().synchronize()
-                    log(f"    X^T W X built in {time.monotonic()-_gram_t0:.1f}s  mem={mem()}")
-                    variant_rhs_gpu = genotype_matrix.gpu_transpose_matmat(
-                        projected_targets_gpu,
-                        batch_size=tiled_exact_batch_size,
-                        cupy=cp,
-                        dtype=cp.float64,
-                    )
-                    exact_gpu_matmul_batch_size = tiled_exact_batch_size
-                if covariate_count > 0:
-                    CtWX_gpu = _cached_weighted_covariate_projection(
-                        genotype_matrix=genotype_matrix,
-                        covariate_matrix=covariate_matrix,
-                        inverse_diagonal_noise=inverse_diagonal_noise,
-                        batch_size=posterior_variance_batch_size,
-                        warm_start=warm_start,
-                        return_gpu=True,
-                        cupy=cp,
-                    )
-                    correction_coeff_gpu = _gpu_cholesky_solve(
-                        CtWX_gpu.T,
-                        projector_bundle_gpu[3],
-                        cp_solve_triangular,
-                    )
-                    correction_gpu = cp.asarray(CtWX_gpu @ correction_coeff_gpu, dtype=cp.float64)
-                    variant_precision_gpu -= correction_gpu
-                variant_precision_gpu[diagonal_index, diagonal_index] += cp.asarray(prior_precision, dtype=cp.float64)
-            else:
-                dense_genotypes = np.asarray(genotype_matrix.materialize(batch_size=posterior_variance_batch_size), dtype=np.float64)
-                projected_genotypes = apply_projector(dense_genotypes)
-                XtPX = dense_genotypes.T @ projected_genotypes
-                variant_rhs = dense_genotypes.T @ apply_projector(targets)
-                variant_precision_matrix = np.diag(prior_precision) + XtPX
-                variant_precision_matrix += np.eye(variant_count, dtype=np.float64) * 1e-8
-                variant_precision_cholesky = np.linalg.cholesky(variant_precision_matrix)
-
-                def solve_variant_rhs(right_hand_side: np.ndarray) -> np.ndarray:
-                    return _cholesky_solve(variant_precision_cholesky, np.asarray(right_hand_side, dtype=np.float64))
-
-                beta = np.asarray(solve_variant_rhs(variant_rhs), dtype=np.float64)
-            if genotype_matrix._cupy_cache is not None:
-                variant_precision_gpu[diagonal_index, diagonal_index] += 1e-8
-                log(f"    Cholesky factorization ({variant_count}×{variant_count} float64)...  mem={mem()}")
-                variant_precision_cholesky_gpu = cp.linalg.cholesky(variant_precision_gpu)
-                log(f"    Cholesky done, solving...  mem={mem()}")
-
-                def solve_variant_rhs_gpu(right_hand_side):
-                    return _gpu_cholesky_solve(
-                        right_hand_side,
-                        variant_precision_cholesky_gpu,
-                        cp_solve_triangular,
-                    )
-
-                beta_gpu = solve_variant_rhs_gpu(variant_rhs_gpu)
-                if use_full_gpu_exact:
-                    genetic_linear_predictor_gpu = X_gpu_compute @ cp.asarray(beta_gpu, dtype=cp.float64)
-                else:
-                    genetic_linear_predictor_gpu = genotype_matrix.gpu_matmat(
-                        cp.asarray(beta_gpu, dtype=cp.float64),
-                        batch_size=exact_gpu_matmul_batch_size,
-                        cupy=cp,
-                        dtype=cp.float64,
-                    )
-                genetic_linear_predictor = _cupy_array_to_numpy(genetic_linear_predictor_gpu, dtype=np.float64)
-                beta = _cupy_array_to_numpy(beta_gpu, dtype=np.float64)
-            else:
-                genetic_linear_predictor = np.asarray(genotype_matrix.matvec_numpy(beta), dtype=np.float64)
+            beta, genetic_linear_predictor, _beta_variance_unused, _logdet_unused = _solve_restricted_exact_variant_space(
+                genotype_matrix=genotype_matrix,
+                covariate_matrix=covariate_matrix,
+                targets=targets,
+                prior_precision=prior_precision,
+                inverse_diagonal_noise=inverse_diagonal_noise,
+                covariate_precision_cholesky=covariate_precision_cholesky,
+                apply_projector=apply_projector,
+                posterior_variance_batch_size=posterior_variance_batch_size,
+                compute_beta_variance=False,
+                compute_logdet=False,
+                warm_start=warm_start,
+            )
         else:
             log(f"    restricted mean: PCG variant-space solve (p={variant_count}, n={sample_count})  mem={mem()}")
-            _t0 = time.monotonic()
+            variant_space_timing_cupy = _try_import_cupy() if genotype_matrix._cupy_cache is not None else None
+            _t0 = _timed_region_start(variant_space_timing_cupy)
             variant_operator = _restricted_variant_space_operator(
                 genotype_matrix=genotype_matrix,
                 prior_precision=prior_precision,
@@ -6438,8 +6627,8 @@ def _solve_restricted_mean_only(
                 covariate_precision_cholesky=covariate_precision_cholesky,
                 batch_size=posterior_variance_batch_size,
             )
-            log(f"      operator setup: {time.monotonic() - _t0:.1f}s  mem={mem()}")
-            _t0 = time.monotonic()
+            log(f"      operator setup: {_timed_region_seconds(_t0, variant_space_timing_cupy):.1f}s  mem={mem()}")
+            _t0 = _timed_region_start(variant_space_timing_cupy)
             variant_preconditioner = _restricted_variant_space_diagonal_preconditioner(
                 genotype_matrix=genotype_matrix,
                 covariate_matrix=covariate_matrix,
@@ -6449,17 +6638,16 @@ def _solve_restricted_mean_only(
                 batch_size=posterior_variance_batch_size,
                 warm_start=warm_start,
             )
-            log(f"      preconditioner: {time.monotonic() - _t0:.1f}s  mem={mem()}")
-            _t0 = time.monotonic()
+            log(f"      preconditioner: {_timed_region_seconds(_t0, variant_space_timing_cupy):.1f}s  mem={mem()}")
+            _t0 = _timed_region_start(variant_space_timing_cupy)
             restricted_targets = apply_projector_jax(targets)
-            variant_rhs = np.asarray(
-                genotype_matrix.transpose_matvec_numpy(
-                    restricted_targets,
-                    batch_size=posterior_variance_batch_size,
-                ),
+            variant_rhs = _genotype_transpose_matvec_result_numpy(
+                genotype_matrix,
+                restricted_targets,
+                batch_size=posterior_variance_batch_size,
                 dtype=np.float64,
             )
-            log(f"      rhs: {time.monotonic() - _t0:.1f}s  mem={mem()}")
+            log(f"      rhs: {_timed_region_seconds(_t0, variant_space_timing_cupy):.1f}s  mem={mem()}")
             beta = np.asarray(
                 solve_spd_system(
                     variant_operator,
@@ -6471,8 +6659,10 @@ def _solve_restricted_mean_only(
                 ),
                 dtype=np.float64,
             )
-            genetic_linear_predictor = np.asarray(
-                genotype_matrix.matvec_numpy(beta, batch_size=posterior_variance_batch_size),
+            genetic_linear_predictor = _genotype_matvec_result_numpy(
+                genotype_matrix,
+                beta,
+                batch_size=posterior_variance_batch_size,
                 dtype=compute_np_dtype,
             )
 
@@ -6512,11 +6702,12 @@ def _solve_restricted_mean_only(
     )
     if sample_space_gpu_enabled:
         gpu_source = "full-cache" if genotype_matrix._cupy_cache is not None else "streaming"
+        timing_cupy = _try_import_cupy()
         log(
             "    restricted mean: GPU block-CG sample-space solve "
             + f"(p={variant_count}, n={sample_count}, source={gpu_source})"
         )
-        _t0 = time.monotonic()
+        _t0 = _timed_region_start(timing_cupy)
         log("      building preconditioner...")
         sample_space_preconditioner_gpu, sample_space_preconditioner_cache_entry = _get_cached_sample_space_gpu_preconditioner(
             genotype_matrix=genotype_matrix,
@@ -6527,14 +6718,14 @@ def _solve_restricted_mean_only(
             random_seed=random_seed,
             warm_start=warm_start,
         )
-        log(f"      preconditioner ready ({time.monotonic()-_t0:.1f}s)  mem={mem()}")
+        log(f"      preconditioner ready ({_timed_region_seconds(_t0, timing_cupy):.1f}s)  mem={mem()}")
 
         def solve_rhs_iterative(
             right_hand_side: np.ndarray,
             *,
             initial_guess: np.ndarray | None = None,
         ) -> np.ndarray:
-            _solve_t0 = time.monotonic()
+            _solve_t0 = _timed_region_start(timing_cupy)
             log(f"      GPU CG solve starting: rhs_cols={right_hand_side.shape[1] if right_hand_side.ndim > 1 else 1}")
             solve_result = _solve_sample_space_rhs_gpu(
                 genotype_matrix=genotype_matrix,
@@ -6556,7 +6747,7 @@ def _solve_restricted_mean_only(
                 sample_space_preconditioner_cache_entry,
                 iterations_used,
             )
-            log(f"      GPU CG done: {iterations_used} iterations in {time.monotonic()-_solve_t0:.1f}s  mem={mem()}")
+            log(f"      GPU CG done: {iterations_used} iterations in {_timed_region_seconds(_solve_t0, timing_cupy):.1f}s  mem={mem()}")
             return solved_rhs
     else:
         log(
@@ -6683,6 +6874,7 @@ def _solve_restricted_mean_only(
         inverse_covariance_rhs[:, 1 : 1 + covariate_matrix.shape[1]],
         dtype=np.float64,
     )
+    postprocess_timing_cupy = _try_import_cupy() if genotype_matrix._cupy_cache is not None else None
     gls_normal_matrix = covariate_matrix.T @ inverse_covariance_covariates + np.eye(covariate_matrix.shape[1]) * 1e-8
     gls_cholesky = np.linalg.cholesky(gls_normal_matrix)
     alpha = np.asarray(
@@ -6693,20 +6885,28 @@ def _solve_restricted_mean_only(
         inverse_covariance_targets - inverse_covariance_covariates @ alpha,
         dtype=np.float64,
     )
-    _t0 = time.monotonic()
+    _t0 = _timed_region_start(postprocess_timing_cupy)
     log(f"    computing beta: X^T @ projected_targets ({variant_count:,} variants)...")
     beta = np.asarray(
-        prior_variances * np.asarray(genotype_matrix.transpose_matvec_numpy(projected_targets), dtype=compute_np_dtype),
+        prior_variances
+        * _genotype_transpose_matvec_result_numpy(
+            genotype_matrix,
+            projected_targets,
+            batch_size=posterior_variance_batch_size,
+            dtype=compute_np_dtype,
+        ),
         dtype=compute_np_dtype,
     )
-    log(f"    beta computed in {time.monotonic()-_t0:.1f}s  mem={mem()}")
-    _t0 = time.monotonic()
+    log(f"    beta computed in {_timed_region_seconds(_t0, postprocess_timing_cupy):.1f}s  mem={mem()}")
+    _t0 = _timed_region_start(postprocess_timing_cupy)
     log(f"    computing linear predictor: X @ beta ({variant_count:,} variants)...")
-    linear_predictor = covariate_matrix @ alpha + np.asarray(
-        genotype_matrix.matvec_numpy(beta, batch_size=posterior_variance_batch_size),
+    linear_predictor = covariate_matrix @ alpha + _genotype_matvec_result_numpy(
+        genotype_matrix,
+        beta,
+        batch_size=posterior_variance_batch_size,
         dtype=compute_np_dtype,
     )
-    log(f"    linear predictor computed in {time.monotonic()-_t0:.1f}s  mem={mem()}")
+    log(f"    linear predictor computed in {_timed_region_seconds(_t0, postprocess_timing_cupy):.1f}s  mem={mem()}")
     restricted_quadratic = float(np.dot(targets, projected_targets))
     log(
         "    restricted mean done: "
@@ -6872,16 +7072,16 @@ def _restricted_posterior_state_posterior_working_set(
         # The first global pass now doubles as KKT certification. That removes
         # the cold-start screening pass and lets later EM iterations reuse the
         # last certified score ordering instead of rebuilding it from scratch.
-        _ws_kkt_t0 = time.monotonic()
+        kkt_timing_cupy = _try_import_cupy() if genotype_matrix._cupy_cache is not None else None
+        _ws_kkt_t0 = _timed_region_start(kkt_timing_cupy)
         log(f"    KKT check: computing gradient on all {variant_count:,} variants...  mem={mem()}")
-        candidate_gradient = np.asarray(
-            genotype_matrix.transpose_matvec_numpy(
-                projected_targets,
-                batch_size=posterior_variance_batch_size,
-            ),
+        candidate_gradient = _genotype_transpose_matvec_result_numpy(
+            genotype_matrix,
+            projected_targets,
+            batch_size=posterior_variance_batch_size,
             dtype=np.float64,
         ) - prior_precision * candidate_beta
-        _ws_kkt_seconds = time.monotonic() - _ws_kkt_t0
+        _ws_kkt_seconds = _timed_region_seconds(_ws_kkt_t0, kkt_timing_cupy)
         log(f"    KKT gradient computed in {_ws_kkt_seconds:.1f}s  mem={mem()}")
         candidate_score = _working_set_screening_score(candidate_gradient, candidate_beta, prior_variances)
         current_screening_score = candidate_score
@@ -7120,7 +7320,13 @@ def _solve_restricted_full(
             dtype=np.float64,
         )
         beta = np.asarray(
-            prior_variances * np.asarray(genotype_matrix.transpose_matvec_numpy(projected_targets), dtype=np.float64),
+            prior_variances
+            * _genotype_transpose_matvec_result_numpy(
+                genotype_matrix,
+                projected_targets,
+                batch_size=posterior_variance_batch_size,
+                dtype=np.float64,
+            ),
             dtype=np.float64,
         )
         if compute_beta_variance:
@@ -7136,8 +7342,10 @@ def _solve_restricted_full(
             beta_variance = np.maximum(prior_variances - (prior_variances * prior_variances) * leverage_diagonal, 1e-8)
         else:
             beta_variance = np.zeros_like(prior_variances, dtype=np.float64)
-        linear_predictor = covariate_matrix @ alpha + np.asarray(
-            genotype_matrix.matvec_numpy(beta, batch_size=posterior_variance_batch_size),
+        linear_predictor = covariate_matrix @ alpha + _genotype_matvec_result_numpy(
+            genotype_matrix,
+            beta,
+            batch_size=posterior_variance_batch_size,
             dtype=np.float64,
         )
         sign_gls, logdet_gls = np.linalg.slogdet(gls_normal_matrix)
@@ -7210,239 +7418,23 @@ def _solve_restricted_full(
             )
         if use_exact_variant or use_gpu_exact_variant:
             log(f"    restricted posterior: exact variant-space Cholesky (p={variant_count}, n={sample_count})  mem={mem()}")
-            if genotype_matrix._cupy_cache is not None:
-                import cupy as cp
-                cp_solve_triangular = _resolve_gpu_solve_triangular()
-                covariate_count = covariate_matrix.shape[1]
-                cache_is_int8_standardized = _cupy_cache_is_int8_standardized(genotype_matrix._cupy_cache)
-                use_full_gpu_exact = _gpu_exact_variant_full_matrix_fits(
-                    cp,
-                    sample_count=sample_count,
-                    variant_count=variant_count,
-                    covariate_count=covariate_count,
-                    cache_is_int8_standardized=cache_is_int8_standardized,
-                )
-                tiled_exact_batch_size = 0 if use_full_gpu_exact else _gpu_exact_variant_tile_size(
-                    cp,
-                    sample_count=sample_count,
-                    variant_count=variant_count,
-                    covariate_count=covariate_count,
-                )
-                if not use_full_gpu_exact and tiled_exact_batch_size <= 0:
-                    raise RuntimeError(
-                        "GPU exact variant-space solve was selected without enough tile workspace."
-                    )
-                projector_bundle_gpu = _build_restricted_projector_gpu_bundle(
-                    inverse_diagonal_noise=inverse_diagonal_noise,
-                    covariate_matrix=covariate_matrix,
-                    covariate_precision_cholesky=covariate_precision_cholesky,
-                    cp=cp,
-                    dtype=cp.float64,
-                )
-                projected_targets_gpu = _apply_restricted_projector_gpu(
-                    cp.asarray(targets, dtype=cp.float64),
-                    projector_bundle_gpu,
-                    cp=cp,
-                    solve_triangular_gpu=cp_solve_triangular,
-                )
-                diagonal_index = cp.arange(variant_count)
-                inverse_diagonal_noise_gpu = cp.asarray(inverse_diagonal_noise, dtype=cp.float64)
-                if use_full_gpu_exact:
-                    cached_standardized_gpu = _cupy_cache_standardized_columns(
-                        genotype_matrix._cupy_cache,
-                        slice(None),
-                        cupy=cp,
-                        dtype=cp.float64,
-                    )
-                    X_gpu_compute = cp.empty(cached_standardized_gpu.shape, dtype=cp.float64, order="F")
-                    X_gpu_compute[...] = cp.asarray(cached_standardized_gpu, dtype=cp.float64)
-                    _gram_t0 = time.monotonic()
-                    log(f"    building X^T W X (p={variant_count}, n={sample_count}, float64 exact GEMM)...  mem={mem()}")
-                    variant_precision_gpu = cp.zeros((variant_count, variant_count), dtype=cp.float64)
-                    col_chunk = min(_GPU_EXACT_VARIANT_TILE_MAX_VARIANTS, variant_count)
-                    n_col_chunks = (variant_count + col_chunk - 1) // col_chunk
-                    for col_idx, col_start in enumerate(range(0, variant_count, col_chunk)):
-                        col_end = min(col_start + col_chunk, variant_count)
-                        weighted_chunk = inverse_diagonal_noise_gpu[:, None] * X_gpu_compute[:, col_start:col_end]
-                        variant_precision_gpu[:, col_start:col_end] = X_gpu_compute.T @ weighted_chunk
-                        del weighted_chunk
-                        if (col_idx + 1) % max(n_col_chunks // 4, 1) == 0 or col_idx == n_col_chunks - 1:
-                            log(f"      Gram matrix: {col_end:,}/{variant_count:,} cols ({100*col_end/variant_count:.0f}%)  {time.monotonic()-_gram_t0:.1f}s")
-                    variant_precision_gpu = 0.5 * (variant_precision_gpu + variant_precision_gpu.T)
-                    cp.cuda.Device().synchronize()
-                    log(f"    X^T W X built in {time.monotonic()-_gram_t0:.1f}s  mem={mem()}")
-                    variant_rhs_gpu = genotype_matrix.gpu_transpose_matmat(
-                        projected_targets_gpu,
-                        batch_size=variant_count,
-                        cupy=cp,
-                        dtype=cp.float64,
-                    )
-                    exact_gpu_matmul_batch_size = variant_count
-                else:
-                    _gram_t0 = time.monotonic()
-                    log(
-                        "    building X^T W X "
-                        + f"(p={variant_count}, n={sample_count}, tiled exact GPU batches={tiled_exact_batch_size})...  mem={mem()}"
-                    )
-                    variant_precision_gpu = cp.zeros((variant_count, variant_count), dtype=cp.float64)
-                    row_starts = range(0, variant_count, tiled_exact_batch_size)
-                    n_row_tiles = (variant_count + tiled_exact_batch_size - 1) // tiled_exact_batch_size
-                    for row_idx, row_start in enumerate(row_starts):
-                        row_end = min(row_start + tiled_exact_batch_size, variant_count)
-                        row_batch_gpu = _cupy_cache_standardized_columns(
-                            genotype_matrix._cupy_cache,
-                            slice(row_start, row_end),
-                            cupy=cp,
-                            dtype=cp.float64,
-                        )
-                        for col_start in range(row_start, variant_count, tiled_exact_batch_size):
-                            col_end = min(col_start + tiled_exact_batch_size, variant_count)
-                            col_batch_gpu = _cupy_cache_standardized_columns(
-                                genotype_matrix._cupy_cache,
-                                slice(col_start, col_end),
-                                cupy=cp,
-                                dtype=cp.float64,
-                            )
-                            col_batch_gpu *= inverse_diagonal_noise_gpu[:, None]
-                            block_precision_gpu = row_batch_gpu.T @ col_batch_gpu
-                            variant_precision_gpu[row_start:row_end, col_start:col_end] = block_precision_gpu
-                            if row_start != col_start:
-                                variant_precision_gpu[col_start:col_end, row_start:row_end] = block_precision_gpu.T
-                            del col_batch_gpu, block_precision_gpu
-                        del row_batch_gpu
-                        if (row_idx + 1) % max(n_row_tiles // 4, 1) == 0 or row_idx == n_row_tiles - 1:
-                            log(f"      Gram matrix: {row_end:,}/{variant_count:,} rows ({100*row_end/variant_count:.0f}%)  {time.monotonic()-_gram_t0:.1f}s")
-                    cp.cuda.Device().synchronize()
-                    log(f"    X^T W X built in {time.monotonic()-_gram_t0:.1f}s  mem={mem()}")
-                    variant_rhs_gpu = genotype_matrix.gpu_transpose_matmat(
-                        projected_targets_gpu,
-                        batch_size=tiled_exact_batch_size,
-                        cupy=cp,
-                        dtype=cp.float64,
-                    )
-                    exact_gpu_matmul_batch_size = tiled_exact_batch_size
-                if covariate_count > 0:
-                    CtWX_gpu = _cached_weighted_covariate_projection(
-                        genotype_matrix=genotype_matrix,
-                        covariate_matrix=covariate_matrix,
-                        inverse_diagonal_noise=inverse_diagonal_noise,
-                        batch_size=posterior_variance_batch_size,
-                        warm_start=warm_start,
-                        return_gpu=True,
-                        cupy=cp,
-                    )
-                    correction_coeff_gpu = _gpu_cholesky_solve(
-                        CtWX_gpu.T,
-                        projector_bundle_gpu[3],
-                        cp_solve_triangular,
-                    )
-                    correction_gpu = cp.asarray(CtWX_gpu @ correction_coeff_gpu, dtype=cp.float64)
-                    variant_precision_gpu -= correction_gpu
-                variant_precision_gpu[diagonal_index, diagonal_index] += cp.asarray(prior_precision, dtype=cp.float64)
-            else:
-                dense_genotypes = np.asarray(genotype_matrix.materialize(batch_size=posterior_variance_batch_size), dtype=np.float64)
-                projected_genotypes = apply_projector(dense_genotypes)
-                XtPX = dense_genotypes.T @ projected_genotypes
-                variant_rhs = dense_genotypes.T @ apply_projector(targets)
-                variant_precision_matrix = np.diag(prior_precision) + XtPX
-                # Standard small regularization for numerical stability.
-                variant_precision_matrix += np.eye(variant_count, dtype=np.float64) * 1e-8
-                variant_precision_cholesky = np.linalg.cholesky(variant_precision_matrix)
-
-                def solve_variant_rhs(right_hand_side: np.ndarray) -> np.ndarray:
-                    return _cholesky_solve(variant_precision_cholesky, np.asarray(right_hand_side, dtype=np.float64))
-
-                beta = np.asarray(solve_variant_rhs(variant_rhs), dtype=np.float64)
-            if genotype_matrix._cupy_cache is not None:
-                variant_precision_gpu[diagonal_index, diagonal_index] += 1e-8
-                log(f"    Cholesky factorization ({variant_count}×{variant_count} float64)...  mem={mem()}")
-                variant_precision_cholesky_gpu = cp.linalg.cholesky(variant_precision_gpu)
-                log(f"    Cholesky done, solving...  mem={mem()}")
-
-                def solve_variant_rhs_gpu(right_hand_side):
-                    return _gpu_cholesky_solve(
-                        right_hand_side,
-                        variant_precision_cholesky_gpu,
-                        cp_solve_triangular,
-                    )
-
-                def solve_variant_rhs(right_hand_side: np.ndarray) -> np.ndarray:
-                    return _cupy_array_to_numpy(
-                        solve_variant_rhs_gpu(right_hand_side),
-                        dtype=np.float64,
-                    )
-
-                beta_gpu = solve_variant_rhs_gpu(variant_rhs_gpu)
-            if genotype_matrix._cupy_cache is not None:
-                beta_variance = (
-                    np.maximum(
-                        _cupy_array_to_numpy(
-                            _gpu_exact_variant_inverse_diagonal(
-                                variant_precision_cholesky_gpu,
-                                solve_triangular_gpu=cp_solve_triangular,
-                                cupy=cp,
-                            ),
-                            dtype=np.float64,
-                        ),
-                        1e-8,
-                    )
-                    if compute_beta_variance
-                    else np.zeros(variant_count, dtype=np.float64)
-                )
-            else:
-                beta_variance = (
-                    np.maximum(np.diag(solve_variant_rhs(np.eye(variant_count, dtype=np.float64))), 1e-8)
-                    if compute_beta_variance and variant_count <= exact_solver_matrix_limit
-                    else (
-                        _posterior_variance_low_rank_residual_diagonal(
-                            solve_variant_rhs=solve_variant_rhs,
-                            dimension=variant_count,
-                            probe_count=posterior_variance_probe_count,
-                            random_seed=random_seed,
-                        )
-                        if compute_beta_variance
-                        else np.zeros(variant_count, dtype=np.float64)
-                    )
-                )
-            if genotype_matrix._cupy_cache is not None:
-                logdet_A = (
-                    2.0
-                    * float(
-                        np.sum(
-                            np.log(
-                                np.maximum(
-                                    _cupy_array_to_numpy(
-                                        variant_precision_cholesky_gpu[
-                                            diagonal_index,
-                                            diagonal_index,
-                                        ],
-                                        dtype=np.float64,
-                                    ),
-                                    1e-12,
-                                )
-                            )
-                        )
-                    )
-                    if compute_logdet
-                    else 0.0
-                )
-                if use_full_gpu_exact:
-                    genetic_linear_predictor_gpu = X_gpu_compute @ cp.asarray(beta_gpu, dtype=cp.float64)
-                else:
-                    genetic_linear_predictor_gpu = genotype_matrix.gpu_matmat(
-                        cp.asarray(beta_gpu, dtype=cp.float64),
-                        batch_size=exact_gpu_matmul_batch_size,
-                        cupy=cp,
-                        dtype=cp.float64,
-                    )
-                genetic_linear_predictor = _cupy_array_to_numpy(genetic_linear_predictor_gpu, dtype=np.float64)
-                beta = _cupy_array_to_numpy(beta_gpu, dtype=np.float64)
-            else:
-                logdet_A = 2.0 * float(np.sum(np.log(np.diag(variant_precision_cholesky)))) if compute_logdet else 0.0
-                genetic_linear_predictor = np.asarray(genotype_matrix.matvec_numpy(beta), dtype=np.float64)
+            beta, genetic_linear_predictor, beta_variance, logdet_A = _solve_restricted_exact_variant_space(
+                genotype_matrix=genotype_matrix,
+                covariate_matrix=covariate_matrix,
+                targets=targets,
+                prior_precision=prior_precision,
+                inverse_diagonal_noise=inverse_diagonal_noise,
+                covariate_precision_cholesky=covariate_precision_cholesky,
+                apply_projector=apply_projector,
+                posterior_variance_batch_size=posterior_variance_batch_size,
+                compute_beta_variance=compute_beta_variance,
+                compute_logdet=compute_logdet,
+                warm_start=warm_start,
+            )
         else:
             log(f"    restricted posterior: PCG variant-space solve (p={variant_count}, n={sample_count})  mem={mem()}")
-            _t0 = time.monotonic()
+            variant_space_timing_cupy = _try_import_cupy() if genotype_matrix._cupy_cache is not None else None
+            _t0 = _timed_region_start(variant_space_timing_cupy)
             variant_operator = _restricted_variant_space_operator(
                 genotype_matrix=genotype_matrix,
                 prior_precision=prior_precision,
@@ -7451,8 +7443,8 @@ def _solve_restricted_full(
                 covariate_precision_cholesky=covariate_precision_cholesky,
                 batch_size=posterior_variance_batch_size,
             )
-            log(f"      operator setup: {time.monotonic() - _t0:.1f}s  mem={mem()}")
-            _t0 = time.monotonic()
+            log(f"      operator setup: {_timed_region_seconds(_t0, variant_space_timing_cupy):.1f}s  mem={mem()}")
+            _t0 = _timed_region_start(variant_space_timing_cupy)
             variant_preconditioner = _restricted_variant_space_diagonal_preconditioner(
                 genotype_matrix=genotype_matrix,
                 covariate_matrix=covariate_matrix,
@@ -7462,17 +7454,16 @@ def _solve_restricted_full(
                 batch_size=posterior_variance_batch_size,
                 warm_start=warm_start,
             )
-            log(f"      preconditioner: {time.monotonic() - _t0:.1f}s  mem={mem()}")
-            _t0 = time.monotonic()
+            log(f"      preconditioner: {_timed_region_seconds(_t0, variant_space_timing_cupy):.1f}s  mem={mem()}")
+            _t0 = _timed_region_start(variant_space_timing_cupy)
             restricted_targets = apply_projector_jax(targets)
-            variant_rhs = np.asarray(
-                genotype_matrix.transpose_matvec_numpy(
-                    restricted_targets,
-                    batch_size=posterior_variance_batch_size,
-                ),
+            variant_rhs = _genotype_transpose_matvec_result_numpy(
+                genotype_matrix,
+                restricted_targets,
+                batch_size=posterior_variance_batch_size,
                 dtype=np.float64,
             )
-            log(f"      rhs: {time.monotonic() - _t0:.1f}s  mem={mem()}")
+            log(f"      rhs: {_timed_region_seconds(_t0, variant_space_timing_cupy):.1f}s  mem={mem()}")
 
             def solve_variant_rhs(right_hand_side: np.ndarray) -> np.ndarray:
                 rhs_array = np.asarray(right_hand_side, dtype=np.float64)
@@ -7507,8 +7498,10 @@ def _solve_restricted_full(
                 if compute_logdet
                 else 0.0
             )
-            genetic_linear_predictor = np.asarray(
-                genotype_matrix.matvec_numpy(beta, batch_size=posterior_variance_batch_size),
+            genetic_linear_predictor = _genotype_matvec_result_numpy(
+                genotype_matrix,
+                beta,
+                batch_size=posterior_variance_batch_size,
                 dtype=compute_np_dtype,
             )
 
@@ -7555,11 +7548,12 @@ def _solve_restricted_full(
     )
     if sample_space_gpu_enabled:
         gpu_source = "full-cache" if genotype_matrix._cupy_cache is not None else "streaming"
+        timing_cupy = _try_import_cupy()
         log(
             "    restricted posterior: GPU block-CG sample-space solve "
             + f"(p={variant_count}, n={sample_count}, source={gpu_source})"
         )
-        _t0 = time.monotonic()
+        _t0 = _timed_region_start(timing_cupy)
         log("      building preconditioner...")
         sample_space_preconditioner_gpu, sample_space_preconditioner_cache_entry = _get_cached_sample_space_gpu_preconditioner(
             genotype_matrix=genotype_matrix,
@@ -7570,7 +7564,7 @@ def _solve_restricted_full(
             random_seed=random_seed,
             warm_start=warm_start,
         )
-        log(f"      preconditioner ready ({time.monotonic()-_t0:.1f}s)  mem={mem()}")
+        log(f"      preconditioner ready ({_timed_region_seconds(_t0, timing_cupy):.1f}s)  mem={mem()}")
 
         def solve_rhs_iterative(
             right_hand_side: np.ndarray,
@@ -7581,7 +7575,7 @@ def _solve_restricted_full(
             lanczos_recorder: _SampleSpaceCGLanczosRecorder | None = None,
             preconditioner_override=None,
         ) -> np.ndarray:
-            _solve_t0 = time.monotonic()
+            _solve_t0 = _timed_region_start(timing_cupy)
             log(f"      GPU CG solve starting: rhs_cols={right_hand_side.shape[1] if right_hand_side.ndim > 1 else 1}")
             solve_result = _solve_sample_space_rhs_gpu(
                 genotype_matrix=genotype_matrix,
@@ -7606,7 +7600,7 @@ def _solve_restricted_full(
                 sample_space_preconditioner_cache_entry,
                 iterations_used,
             )
-            log(f"      GPU CG done: {iterations_used} iterations in {time.monotonic()-_solve_t0:.1f}s  mem={mem()}")
+            log(f"      GPU CG done: {iterations_used} iterations in {_timed_region_seconds(_solve_t0, timing_cupy):.1f}s  mem={mem()}")
             return solved_rhs
     else:
         log(
@@ -7967,6 +7961,7 @@ def _solve_restricted_full(
         inverse_covariance_rhs[:, 1 : 1 + covariate_matrix.shape[1]],
         dtype=np.float64,
     )
+    postprocess_timing_cupy = _try_import_cupy() if genotype_matrix._cupy_cache is not None else None
     low_rank_probe_rhs_stop = covariate_rhs_stop + low_rank_variance_probe_count
     probe_rhs_stop = low_rank_probe_rhs_stop + stochastic_variance_probe_count
     inverse_covariance_low_rank_probe_matrix = (
@@ -8105,21 +8100,29 @@ def _solve_restricted_full(
         )
         beta_variance = np.maximum(prior_variances - (prior_variances * prior_variances) * leverage_diagonal, 1e-8)
     else:
-        _t0 = time.monotonic()
+        _t0 = _timed_region_start(postprocess_timing_cupy)
         log(f"    computing beta: X^T @ projected_targets ({variant_count:,} variants)...")
         beta = np.asarray(
-            prior_variances * np.asarray(genotype_matrix.transpose_matvec_numpy(projected_targets), dtype=compute_np_dtype),
+            prior_variances
+            * _genotype_transpose_matvec_result_numpy(
+                genotype_matrix,
+                projected_targets,
+                batch_size=posterior_variance_batch_size,
+                dtype=compute_np_dtype,
+            ),
             dtype=compute_np_dtype,
         )
-        log(f"    beta computed in {time.monotonic()-_t0:.1f}s  mem={mem()}")
+        log(f"    beta computed in {_timed_region_seconds(_t0, postprocess_timing_cupy):.1f}s  mem={mem()}")
         beta_variance = np.zeros_like(prior_variances, dtype=np.float64)
-    _t0 = time.monotonic()
+    _t0 = _timed_region_start(postprocess_timing_cupy)
     log(f"    computing linear predictor: X @ beta ({variant_count:,} variants)...")
-    linear_predictor = covariate_matrix @ alpha + np.asarray(
-        genotype_matrix.matvec_numpy(beta, batch_size=posterior_variance_batch_size),
+    linear_predictor = covariate_matrix @ alpha + _genotype_matvec_result_numpy(
+        genotype_matrix,
+        beta,
+        batch_size=posterior_variance_batch_size,
         dtype=compute_np_dtype,
     )
-    log(f"    linear predictor computed in {time.monotonic()-_t0:.1f}s  mem={mem()}")
+    log(f"    linear predictor computed in {_timed_region_seconds(_t0, postprocess_timing_cupy):.1f}s  mem={mem()}")
     sign_gls, logdet_gls = np.linalg.slogdet(gls_normal_matrix)
     if sign_gls <= 0.0:
         raise RuntimeError("Restricted GLS normal matrix is not positive definite.")
@@ -9375,7 +9378,12 @@ def _validation_metric(
         else np.asarray(predictor_offset, dtype=np.float64).reshape(-1)
     )
     if isinstance(genotype_matrix, StandardizedGenotypeMatrix):
-        genotype_component = np.asarray(genotype_matrix.matvec_numpy(beta), dtype=np.float64)
+        genotype_component = _genotype_matvec_result_numpy(
+            genotype_matrix,
+            beta,
+            batch_size=DEFAULT_GENOTYPE_BATCH_SIZE,
+            dtype=np.float64,
+        )
     else:
         genotype_component = np.asarray(genotype_matrix @ beta, dtype=np.float64)
     linear_predictor = offset + genotype_component + covariate_matrix @ alpha

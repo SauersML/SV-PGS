@@ -1498,23 +1498,33 @@ class StandardizedGenotypeMatrix:
                 log(f"    uploading raw int8 genotypes to GPU ({nbytes / 1e9:.1f} GB incl. scales)  mem={mem()}")
                 raw_int8 = cast(Int8BatchCapable, self.raw)
                 gpu_int8_dtype = cupy.int8 if hasattr(cupy, "int8") else np.int8
-                # Fast path: if the entire int8 matrix fits easily, do one H2D copy
-                # instead of iterating column batches.  The working memory is just
-                # the int8 matrix itself (~1 byte per element).
+                # Fast path: if the entire int8 block fits easily, prefer a single
+                # contiguous raw read plus one H2D copy over CPU-oriented batch
+                # iteration. This is especially important for stochastic blocks,
+                # which arrive as contiguous local slices.
                 int8_total_bytes = int(self.shape[0]) * int(self.shape[1])
                 if int8_total_bytes < budget_bytes * 0.5:
-                    # Single contiguous upload
-                    all_batches = list(raw_int8.iter_column_batches_i8(self.variant_indices, batch_size=self.shape[1]))
-                    if len(all_batches) == 1:
-                        gpu_matrix = cupy.asarray(all_batches[0].values, dtype=gpu_int8_dtype)
+                    full_int8_block = _read_int8_columns_one_shot(raw_int8, self.variant_indices)
+                    if full_int8_block is not None:
+                        log(
+                            "    raw int8 block fits one-shot upload budget; "
+                            + f"uploading {self.shape[1]} variants in one H2D copy  mem={mem()}"
+                        )
+                        gpu_matrix = cupy.asarray(full_int8_block, dtype=gpu_int8_dtype)
                         if not gpu_matrix.flags.f_contiguous:
-                            gpu_matrix = cupy.asfortranarray(gpu_matrix)
+                            if hasattr(cupy, "asfortranarray"):
+                                gpu_matrix = cupy.asfortranarray(gpu_matrix)
+                            else:
+                                gpu_matrix = np.asfortranarray(np.asarray(gpu_matrix, dtype=gpu_int8_dtype))
                     else:
-                        # Multiple batches returned despite large batch_size; concatenate then upload
-                        full_cpu = np.concatenate([b.values for b in all_batches], axis=1)
-                        gpu_matrix = cupy.asarray(np.asfortranarray(full_cpu), dtype=gpu_int8_dtype)
-                        del full_cpu
-                    del all_batches
+                        gpu_matrix = cupy.empty(self.shape, dtype=gpu_int8_dtype, order="F")
+                        upload_batch_size = auto_batch_size_i8(self.shape[0])
+                        local_start = 0
+                        for raw_batch in raw_int8.iter_column_batches_i8(self.variant_indices, batch_size=upload_batch_size):
+                            batch_width = raw_batch.values.shape[1]
+                            local_stop = local_start + batch_width
+                            gpu_matrix[:, local_start:local_stop] = cupy.asarray(raw_batch.values, dtype=gpu_int8_dtype)
+                            local_start = local_stop
                 else:
                     gpu_matrix = cupy.empty(self.shape, dtype=gpu_int8_dtype, order="F")
                     upload_batch_size = auto_batch_size_i8(self.shape[0])
@@ -2584,6 +2594,23 @@ def _contiguous_index_or_slice(indices: np.ndarray) -> slice | np.ndarray:
     if np.all(deltas == 1):
         return slice(int(resolved_indices[0]), int(resolved_indices[-1]) + 1, 1)
     return np.ascontiguousarray(resolved_indices, dtype=np.intp)
+
+
+def _read_int8_columns_one_shot(
+    raw: RawGenotypeMatrix,
+    variant_indices: np.ndarray,
+) -> np.ndarray | None:
+    resolved_indices = np.asarray(variant_indices, dtype=np.int32)
+    if resolved_indices.ndim != 1:
+        raise ValueError("variant_indices must be 1D.")
+    if resolved_indices.size == 0:
+        return np.empty((raw.shape[0], 0), dtype=np.int8, order="F")
+    if isinstance(raw, Int8RawGenotypeMatrix):
+        return np.asfortranarray(raw.matrix[:, resolved_indices], dtype=np.int8)
+    if isinstance(raw, PlinkRawGenotypeMatrix):
+        reader = raw._bed_reader()
+        return np.asfortranarray(raw._read_batch_i8(reader, resolved_indices), dtype=np.int8)
+    return None
 
 
 def _standardize_batch(batch: np.ndarray, means: np.ndarray, scales: np.ndarray) -> np.ndarray:

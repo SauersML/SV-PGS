@@ -865,6 +865,68 @@ def test_try_materialize_gpu_uses_int8_batch_size_for_plink_like_backends(monkey
     assert raw.i8_batch_sizes == [7]
 
 
+def test_try_materialize_gpu_uses_one_shot_int8_upload_for_contiguous_subset(monkeypatch: pytest.MonkeyPatch):
+    class _FakeCudaRuntime:
+        @staticmethod
+        def memGetInfo():
+            return (8_000_000_000, 16_000_000_000)
+
+    class _FakeDevice:
+        def synchronize(self) -> None:
+            return None
+
+    class _FakeCuda:
+        runtime = _FakeCudaRuntime()
+
+        @staticmethod
+        def Device():
+            return _FakeDevice()
+
+    class _FakeCupy:
+        float32 = np.float32
+        int8 = np.int8
+        cuda = _FakeCuda()
+
+        @staticmethod
+        def asarray(array, dtype=None):
+            return np.asarray(array, dtype=dtype)
+
+        @staticmethod
+        def asfortranarray(array):
+            return np.asfortranarray(array)
+
+        @staticmethod
+        def empty(shape, dtype=None, order=None):
+            raise AssertionError("contiguous one-shot int8 upload should not allocate batched GPU staging")
+
+        @staticmethod
+        def isnan(array):
+            return np.isnan(array)
+
+    raw_i8 = np.arange(48, dtype=np.int8).reshape(6, 8, order="F")
+    standardized = Int8RawGenotypeMatrix(raw_i8).standardized(
+        means=np.zeros(raw_i8.shape[1], dtype=np.float32),
+        scales=np.ones(raw_i8.shape[1], dtype=np.float32),
+    ).subset(np.array([2, 3, 4, 5], dtype=np.int32))
+
+    monkeypatch.setattr(genotype_module, "_try_import_cupy", lambda: _FakeCupy())
+    monkeypatch.setattr(genotype_module, "_gpu_materialization_budget_bytes", lambda cupy: 1_000_000_000)
+    monkeypatch.setattr(
+        Int8RawGenotypeMatrix,
+        "iter_column_batches_i8",
+        lambda self, variant_indices=None, batch_size=1024: (_ for _ in ()).throw(
+            AssertionError("contiguous one-shot int8 upload should bypass iter_column_batches_i8")
+        ),
+    )
+
+    assert standardized.try_materialize_gpu() is True
+    assert standardized._cupy_cache is not None
+    np.testing.assert_array_equal(
+        np.asarray(cast(Any, standardized._cupy_cache.raw_values)),
+        raw_i8[:, 2:6],
+    )
+
+
 def test_int8_gpu_cache_supports_linear_algebra(monkeypatch: pytest.MonkeyPatch):
     class _FakeCudaRuntime:
         @staticmethod
