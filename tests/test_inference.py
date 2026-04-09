@@ -1791,7 +1791,7 @@ def test_stochastic_sample_space_preconditioner_rank_scales_with_blend_weight():
 
 def test_gpu_exact_variant_tile_size_adapts_to_live_gpu_workspace(monkeypatch: pytest.MonkeyPatch):
     sentinel_cupy = object()
-    monkeypatch.setattr(mixture_inference, "_gpu_free_bytes", lambda _cupy: 2_000_000_000)
+    monkeypatch.setattr(mixture_inference, "_gpu_total_bytes", lambda _cupy: 6_000_000_000)
 
     assert not _gpu_exact_variant_full_matrix_fits(
         sentinel_cupy,
