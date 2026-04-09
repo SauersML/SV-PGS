@@ -1898,6 +1898,31 @@ def test_binary_posterior_state_forwards_allow_gpu_exact_variant(monkeypatch: py
     assert forwarded_flags == [False, False]
 
 
+def test_sample_space_preconditioner_reuse_ignores_single_weight_outlier():
+    element_count = 256
+    cache_entry = mixture_inference._SampleSpacePreconditionerCacheEntry(
+        batch_size=1024,
+        rank=256,
+        random_seed=0,
+        prior_variances=np.ones(element_count, dtype=np.float64),
+        diagonal_noise=np.ones(element_count, dtype=np.float64),
+        diagonal_preconditioner=np.ones(element_count, dtype=np.float64),
+        preconditioner=lambda rhs: rhs,
+    )
+
+    diagonal_noise = np.ones(element_count, dtype=np.float64)
+    diagonal_noise[0] = 4.0
+
+    assert mixture_inference._can_reuse_sample_space_preconditioner(
+        cache_entry,
+        batch_size=1024,
+        rank=256,
+        random_seed=17,
+        prior_variances=np.ones(element_count, dtype=np.float64),
+        diagonal_noise=diagonal_noise,
+    )
+
+
 def test_sample_space_preconditioner_matches_exact_covariance_inverse_at_full_rank():
     genotype_matrix = np.array(
         [

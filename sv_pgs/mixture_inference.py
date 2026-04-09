@@ -2909,7 +2909,12 @@ def _relative_array_change(current: np.ndarray, previous: np.ndarray) -> float:
     if current_array.shape != previous_array.shape:
         return np.inf
     denominator = np.maximum(np.abs(previous_array), 1e-8)
-    return float(np.max(np.abs(current_array - previous_array) / denominator))
+    relative_change = np.abs(current_array - previous_array) / denominator
+    # Preconditioner quality depends on the overall operator drift, not on the
+    # single most volatile entry. Polya-Gamma weights routinely produce a few
+    # outliers that should not force a full rebuild when the bulk of the system
+    # is still well approximated by the cached preconditioner.
+    return float(np.quantile(relative_change, 0.95))
 
 
 def _sample_space_preconditioner_stale(cache_entry: _SampleSpacePreconditionerCacheEntry) -> bool:

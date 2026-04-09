@@ -50,8 +50,13 @@ def runtime_training_policy_for_fit(
         max(int(cacheable_dense_variants * 0.9), 1),
     )
     max_gpu_preconditioner_rank = max(1, min(cacheable_dense_variants, preconditioner_rank_limit))
+    recommended_preconditioner_rank = (
+        min(T4_GPU_PRECONDITIONER_RANK_LIMIT, max_gpu_preconditioner_rank)
+        if t4_fast_math_enabled()
+        else int(config.sample_space_preconditioner_rank)
+    )
     tuned_preconditioner_rank = min(
-        int(config.sample_space_preconditioner_rank),
+        max(int(config.sample_space_preconditioner_rank), recommended_preconditioner_rank),
         max_gpu_preconditioner_rank,
     )
     # Use up to 75% of GPU budget for stochastic blocks — larger blocks mean
