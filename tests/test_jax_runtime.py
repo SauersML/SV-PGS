@@ -21,10 +21,9 @@ def test_turing_gpu_disables_dense_jax_linear_algebra_preference(monkeypatch) ->
     assert not jax_module.jax_dense_linear_algebra_preferred()
 
 
-def test_turing_gpu_enables_fast_math_only_with_cupy_runtime(monkeypatch) -> None:
-    monkeypatch.setattr(jax_module, "turing_workarounds_enabled", lambda: True)
+def test_gpu_float32_compute_enabled_with_cupy(monkeypatch) -> None:
     monkeypatch.setattr(jax_module, "_cupy_runtime_status", lambda: (True, "cupy_devices=1"))
-    assert jax_module.t4_fast_math_enabled()
+    assert jax_module.gpu_float32_compute_enabled()
 
     monkeypatch.setattr(jax_module, "_cupy_runtime_status", lambda: (False, "cupy_unavailable"))
-    assert not jax_module.t4_fast_math_enabled()
+    assert not jax_module.gpu_float32_compute_enabled()

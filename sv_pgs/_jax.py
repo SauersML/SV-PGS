@@ -96,11 +96,16 @@ def _cupy_runtime_status() -> tuple[bool, str]:
     return True, f"cupy_devices={device_count}"
 
 
-def t4_fast_math_enabled() -> bool:
-    # Keep x64 available for numerically sensitive outer-loop work, but only
-    # enable the mixed-precision T4 path when a real CuPy CUDA runtime exists.
+def gpu_float32_compute_enabled() -> bool:
+    """Use float32 for GPU matmul on any GPU with CuPy available.
+
+    Float32 is correct for genotype matmul on all GPUs — the Gram matrix
+    accumulates results in float64, and Cholesky always runs in float64.
+    Float64 matmul is catastrophically slow on P4 (~0.1 TFLOPS) and T4
+    (~0.25 TFLOPS) with no accuracy benefit for this workload.
+    """
     cupy_ok, _ = _cupy_runtime_status()
-    return turing_workarounds_enabled() and cupy_ok
+    return cupy_ok
 
 
 def jax_dense_linear_algebra_preferred() -> bool:
@@ -109,8 +114,8 @@ def jax_dense_linear_algebra_preferred() -> bool:
 
 
 def gpu_compute_numpy_dtype() -> np.dtype:
-    return np.dtype(np.float32 if t4_fast_math_enabled() else np.float64)
+    return np.dtype(np.float32 if gpu_float32_compute_enabled() else np.float64)
 
 
 def gpu_compute_jax_dtype():
-    return jnp.float32 if t4_fast_math_enabled() else jnp.float64
+    return jnp.float32 if gpu_float32_compute_enabled() else jnp.float64
