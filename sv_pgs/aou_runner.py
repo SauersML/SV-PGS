@@ -128,7 +128,7 @@ def _download_gcs_object_if_missing(remote_path: str, local_path: Path) -> None:
     try:
         _gsutil_cp(remote_path, str(partial_path))
         partial_path.replace(local_path)
-    except Exception:
+    except (OSError, subprocess.SubprocessError, RuntimeError):
         partial_path.unlink(missing_ok=True)
         raise
 
@@ -190,7 +190,7 @@ def release_process_memory() -> None:
         clear_caches = getattr(jax, "clear_caches", None)
         if callable(clear_caches):
             clear_caches()
-    except Exception:
+    except (ImportError, RuntimeError):
         pass
     try:
         import cupy as cp
@@ -198,7 +198,7 @@ def release_process_memory() -> None:
         cp.cuda.Device().synchronize()
         cp.get_default_memory_pool().free_all_blocks()
         cp.get_default_pinned_memory_pool().free_all_blocks()
-    except Exception:
+    except (ImportError, OSError, RuntimeError):
         pass
 
 
@@ -415,7 +415,7 @@ def _info_best_numeric(info: Any, candidate_keys: tuple[str, ...]) -> float | No
     for key in candidate_keys:
         try:
             raw_value = info.get(key)
-        except Exception:
+        except (AttributeError, TypeError, KeyError):
             raw_value = None
         numeric_value = _info_float(raw_value)
         if numeric_value is not None:
@@ -521,7 +521,7 @@ def build_aou_sv_variant_metadata(
             ):
                 log(f"  variant metadata already up to date: {output_path}")
                 return output_path
-        except Exception:
+        except (OSError, KeyError, ValueError, json.JSONDecodeError):
             pass
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -795,7 +795,7 @@ def run_all_of_us(
                         if variants:
                             chr_val = str(getattr(variants[0], "chromosome", "")).replace("chr", "")
                             old_chr_to_key[chr_val] = old_k
-                    except Exception:
+                    except (OSError, _pickle.UnpicklingError, ValueError, EOFError, AttributeError):
                         continue
                 # Symlink old files under NEW key names
                 migrated_chrs = 0
@@ -914,7 +914,7 @@ def run_all_of_us(
         from sv_pgs.io import precache_vcfs_parallel
         try:
             precache_vcfs_parallel(vcf_paths, config)
-        except Exception as exc:
+        except (OSError, RuntimeError, ValueError) as exc:
             raise RuntimeError("parallel VCF precache failed") from exc
 
         log("=== STEP 3.6: Build variant metadata priors ===")

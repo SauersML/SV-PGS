@@ -52,7 +52,7 @@ def _query_nvidia_smi(field: str) -> tuple[str, ...]:
             timeout=2.0,
             check=False,
         )
-    except Exception:
+    except (OSError, subprocess.SubprocessError):
         return ()
     if result.returncode != 0:
         return ()
@@ -74,22 +74,22 @@ if turing_workarounds_enabled():
             _xla_flags = f"{_xla_flags} {flag}".strip()
     os.environ["XLA_FLAGS"] = _xla_flags
 
-from jax import config as jax_config  # noqa: E402
+from jax import config as jax_config  # must follow XLA env-var setup above
 
 # Enable 64-bit precision (required for Bayesian inference numerics).
 jax_config.update("jax_enable_x64", True)
 
-import jax.numpy as jnp  # noqa: E402
+import jax.numpy as jnp  # must follow jax_config.update above
 
 
 def _cupy_runtime_status() -> tuple[bool, str]:
     try:
         import cupy as cp
-    except Exception as exc:
+    except (ImportError, OSError, RuntimeError) as exc:
         return False, f"cupy_unavailable={type(exc).__name__}: {exc}"
     try:
         device_count = int(cp.cuda.runtime.getDeviceCount())
-    except Exception as exc:
+    except (OSError, RuntimeError) as exc:
         return False, f"cupy_cuda_error={type(exc).__name__}: {exc}"
     if device_count < 1:
         return False, "cupy_devices=0"
@@ -101,8 +101,9 @@ def gpu_float32_compute_enabled() -> bool:
 
     Float32 is correct for genotype matmul on all GPUs — the Gram matrix
     accumulates results in float64, and Cholesky always runs in float64.
-    Float64 matmul is catastrophically slow on P4 (~0.1 TFLOPS) and T4
-    (~0.25 TFLOPS) with no accuracy benefit for this workload.
+    Float64 matmul is catastrophically slow on consumer/datacenter GPUs
+    (P4 ~0.1 TFLOPS, T4 ~0.25 TFLOPS, V100 ~7 TFLOPS vs 14 TFLOPS float32)
+    with no accuracy benefit for this workload.
     """
     cupy_ok, _ = _cupy_runtime_status()
     return cupy_ok

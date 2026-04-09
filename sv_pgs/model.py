@@ -9,7 +9,8 @@ from typing import Sequence
 
 import numpy as np
 
-import sv_pgs._jax  # noqa: F401
+import sv_pgs._jax as _jax_side_effects  # side-effect: configures JAX/XLA env
+del _jax_side_effects
 
 from sv_pgs.artifact import ModelArtifact, load_artifact, save_artifact
 from sv_pgs.config import ModelConfig, TraitType
@@ -267,7 +268,7 @@ def _save_fit_stage_variant_stats_cache(
             + f"{cache_path.parent.name}/{cache_path.name} "
             + f"({variant_stats.means.shape[0]} variants)"
         )
-    except Exception as exc:
+    except (OSError, ValueError) as exc:
         tmp_path.unlink(missing_ok=True)
         log(f"fit-stage variant stats cache save failed ({exc}); continuing without durable cohort stats")
 
@@ -315,7 +316,7 @@ def _try_load_fit_stage_variant_stats_cache(
             allele_frequencies=allele_frequencies,
             support_counts=support_counts,
         )
-    except Exception as exc:
+    except (OSError, ValueError, EOFError, KeyError) as exc:
         log(f"fit-stage variant stats cache load failed ({exc}); recomputing cohort stats")
         cache_path.unlink(missing_ok=True)
         return None
@@ -398,7 +399,7 @@ def _try_restore_sample_space_basis_cache(
             + f"(rank={basis_array.shape[1]})"
         )
         return True
-    except Exception as exc:
+    except (OSError, ValueError, EOFError) as exc:
         log(f"sample-space basis cache load failed ({exc}); rebuilding")
         basis_path.unlink(missing_ok=True)
         return False
@@ -430,7 +431,7 @@ def _save_sample_space_basis_cache(
             + f"(rank={basis_array.shape[1]})"
         )
         return True
-    except Exception as exc:
+    except (OSError, ValueError) as exc:
         tmp_path.unlink(missing_ok=True)
         tmp_path.with_suffix(tmp_path.suffix + ".npy").unlink(missing_ok=True)
         log(f"sample-space basis cache save failed ({exc}); continuing without durable solver cache")
@@ -493,7 +494,7 @@ def _try_load_fit_stage_cache(
             return active_variant_indices, reduced_tie_map, reduced_genotypes, True
         log(f"fit-stage structure cache hit — loading from {cache_paths.cache_dir.name}/{cache_paths.key}.*")
         return active_variant_indices, reduced_tie_map, standardized_genotypes.subset(combined_indices), False
-    except Exception as exc:
+    except (OSError, ValueError, EOFError, KeyError) as exc:
         log(f"fit-stage cache load failed ({exc}), rebuilding")
         _invalidate_fit_stage_cache(cache_paths)
         return None
@@ -509,12 +510,12 @@ def _invalidate_fit_stage_cache(cache_paths: _FitStageCachePaths) -> None:
     ):
         try:
             path.unlink(missing_ok=True)
-        except Exception:
+        except OSError:
             pass
     try:
         for basis_path in cache_paths.cache_dir.glob(f"{cache_paths.key}.sample_space_basis.r*.seed*.npy"):
             basis_path.unlink(missing_ok=True)
-    except Exception:
+    except OSError:
         pass
 
 
@@ -533,7 +534,7 @@ def _save_variational_checkpoint(
             + f"{cache_paths.cache_dir.name}/{cache_paths.key}.em.pkl "
             + f"(completed_iterations={checkpoint.completed_iterations})"
         )
-    except Exception as exc:
+    except (OSError, pickle.PicklingError) as exc:
         if checkpoint_tmp.exists():
             checkpoint_tmp.unlink()
         log(f"variational checkpoint save failed ({exc}); continuing without durable resume state")
@@ -555,7 +556,7 @@ def _try_load_variational_checkpoint(
             + f"(completed_iterations={checkpoint.completed_iterations})"
         )
         return checkpoint
-    except Exception as exc:
+    except (OSError, pickle.UnpicklingError, ValueError, EOFError, AttributeError) as exc:
         log(f"variational checkpoint load failed ({exc}); discarding stale checkpoint")
         _clear_variational_checkpoint(cache_paths)
         return None

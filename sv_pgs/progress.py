@@ -19,7 +19,7 @@ def set_log_file(path: str | os.PathLike) -> None:
     if _log_file is not None:
         try:
             _log_file.close()
-        except Exception:
+        except OSError:
             pass
     _log_file = open(path, "a", encoding="utf-8", buffering=1)  # line-buffered
 
@@ -64,7 +64,7 @@ def log(message: str) -> None:
         try:
             _log_file.write(line + "\n")
             _log_file.flush()
-        except Exception:
+        except OSError:
             pass
 
 
@@ -84,11 +84,11 @@ def _format_bytes(value: object) -> str:
 def gpu_memory_snapshot() -> str:
     try:
         import jax
-    except Exception as error:
+    except (ImportError, RuntimeError) as error:
         return f"jax_unavailable={error}"
     try:
         devices = jax.devices()
-    except Exception as error:
+    except RuntimeError as error:
         return f"device_query_failed={error}"
     if not devices:
         return "devices=[]"
@@ -105,7 +105,7 @@ def gpu_memory_snapshot() -> str:
                         stat_parts.append(f"{key}={_format_bytes(stats[key])}")
                 if stat_parts:
                     part += "[" + ",".join(stat_parts) + "]"
-            except Exception as error:
+            except (RuntimeError, KeyError) as error:
                 part += f"[memory_stats_error={error}]"
         parts.append(part)
     return "devices=" + "; ".join(parts)
@@ -127,7 +127,7 @@ def nvidia_smi_snapshot() -> str:
             timeout=2.0,
             check=False,
         )
-    except Exception as error:
+    except (OSError, subprocess.SubprocessError) as error:
         return f"nvidia-smi_error={error}"
     if result.returncode != 0:
         stderr = result.stderr.strip().replace("\n", " | ")
@@ -160,5 +160,5 @@ def jax_runtime_snapshot() -> str:
         if not device_summary:
             device_summary = "<none>"
         return f"{version_summary} devices=[{device_summary}] env=[{env_summary}]"
-    except Exception as error:
+    except (ImportError, RuntimeError) as error:
         return f"jax_runtime_error={error} env=[{env_summary}]"

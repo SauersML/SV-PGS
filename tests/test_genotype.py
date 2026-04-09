@@ -1012,7 +1012,7 @@ def test_streaming_linear_algebra_uses_gpu_batches_when_available(monkeypatch: p
     )
 
 
-def test_streaming_linear_algebra_uses_float32_gpu_batches_on_t4(monkeypatch: pytest.MonkeyPatch):
+def test_streaming_linear_algebra_uses_float32_gpu_batches(monkeypatch: pytest.MonkeyPatch):
     gpu_batch_dtypes: list[object] = []
     original_iter_standardized_gpu_batches = genotype_module._iter_standardized_gpu_batches
 

@@ -972,7 +972,7 @@ def _cleanup_stale_vcf_cache_temps(cache_dir: Path, key: str) -> None:
             continue
         try:
             stale_path.unlink()
-        except Exception:
+        except OSError:
             pass
     for stale_dir in cache_dir.glob(f"{key}.bundle.*"):
         if not stale_dir.is_dir():
@@ -981,7 +981,7 @@ def _cleanup_stale_vcf_cache_temps(cache_dir: Path, key: str) -> None:
             for child in stale_dir.iterdir():
                 child.unlink(missing_ok=True)
             stale_dir.rmdir()
-        except Exception:
+        except OSError:
             pass
 
 
@@ -990,7 +990,7 @@ def _load_vcf_cache_manifest(manifest_path: Path) -> dict[str, Any] | None:
         return None
     try:
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-    except Exception:
+    except (OSError, json.JSONDecodeError, ValueError):
         return None
     if int(manifest.get("manifest_version", 0)) != _VCF_CACHE_MANIFEST_VERSION:
         return None
@@ -1265,7 +1265,7 @@ def _load_vcf_from_cache(
         genotype_matrix = _ensure_vcf_cache_matrix_fast(paths, genotype_matrix)
         log(f"  cached matrix {genotype_matrix.shape}, {len(variants)} variants")
         return genotype_matrix, variants, variant_stats
-    except Exception as exc:
+    except (OSError, ValueError, KeyError, EOFError) as exc:
         log(f"VCF cache load failed ({exc}), will re-parse")
         return None
 
@@ -1856,14 +1856,14 @@ def _load_vcf_incremental(
             for chunk_path in chunk_paths[metadata_chunk_count:]:
                 chunk_path.unlink(missing_ok=True)
             log(f"  incremental cache: resuming from {n_cached} variants ({metadata_chunk_count} metadata chunks)")
-        except Exception as exc:
+        except (OSError, ValueError, EOFError) as exc:
             log(f"  incremental cache progress corrupt ({exc}), starting fresh")
             n_cached = 0
             metadata_chunk_count = 0
             for p in (geno_bin, stats_bin, progress_file, *_iter_incremental_variant_chunk_paths(cache_dir, key)):
                 try:
                     p.unlink(missing_ok=True)
-                except Exception:
+                except OSError:
                     pass
     else:
         for p in (geno_bin, stats_bin, progress_file, *_iter_incremental_variant_chunk_paths(cache_dir, key)):
@@ -2090,7 +2090,7 @@ def _load_vcf_incremental(
     for p in (geno_bin, stats_bin, progress_file, *metadata_chunk_paths):
         try:
             p.unlink(missing_ok=True)
-        except Exception:
+        except OSError:
             pass
 
     cached = _load_vcf_from_cache(
@@ -2188,7 +2188,7 @@ def _save_vcf_to_cache(
             + paths.manifest_path.stat().st_size
         ) / 1e6
         log(f"VCF cache saved ({total_mb:.1f} MB) → {paths.cache_dir.name}/{paths.key}.*")
-    except Exception as exc:
+    except (OSError, ValueError) as exc:
         log(f"VCF cache save failed ({exc}), continuing without cache")
         _cleanup_stale_vcf_cache_temps(paths.cache_dir, paths.key)
 

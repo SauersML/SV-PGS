@@ -7,7 +7,8 @@ from typing import Hashable, Iterator, Sequence, TypeVar, cast
 
 import numpy as np
 
-import sv_pgs._jax  # noqa: F401
+import sv_pgs._jax as _jax_side_effects  # side-effect: configures JAX/XLA env
+del _jax_side_effects
 import jax
 import jax.numpy as jnp
 

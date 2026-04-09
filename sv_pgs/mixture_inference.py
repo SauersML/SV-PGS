@@ -59,7 +59,8 @@ import json
 import time
 from typing import Any, Callable, Sequence, cast
 
-import sv_pgs._jax  # noqa: F401
+import sv_pgs._jax as _jax_side_effects  # side-effect: configures JAX/XLA env
+del _jax_side_effects
 import jax.numpy as jnp
 from jax.scipy.linalg import solve_triangular as jax_solve_triangular
 from jax.scipy.special import digamma as jax_digamma

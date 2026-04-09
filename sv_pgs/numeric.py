@@ -1,7 +1,8 @@
 """Shared numerical utilities."""
 from __future__ import annotations
 
-import sv_pgs._jax  # noqa: F401
+import sv_pgs._jax as _jax_side_effects  # side-effect: configures JAX/XLA env
+del _jax_side_effects
 
 import jax.numpy as jnp
 

@@ -10,7 +10,8 @@ import shutil
 import tempfile
 from typing import Any, Iterator, Protocol, Sequence, TypeGuard, cast
 
-import sv_pgs._jax  # noqa: F401
+import sv_pgs._jax as _jax_side_effects  # side-effect: configures JAX/XLA env
+del _jax_side_effects
 import jax
 from jax import core as jax_core
 import jax.numpy as jnp
@@ -498,7 +499,7 @@ def _try_import_cupy() -> Any | None:
         if cupy.cuda.runtime.getDeviceCount() > 0:
             _cupy_module = cupy
             return cupy
-    except Exception:
+    except (ImportError, OSError, RuntimeError):
         pass
     _cupy_module = None
     return None
@@ -528,7 +529,7 @@ def require_gpu() -> Any:
                 capture_output=True, text=True, timeout=5.0, check=False,
             )
             has_gpu_hardware = result.returncode == 0 and bool(result.stdout.strip())
-        except Exception:
+        except (OSError, subprocess.SubprocessError):
             pass
     if not has_gpu_hardware:
         log("  no NVIDIA GPU detected — running CPU-only (this will be slow)")
@@ -691,7 +692,7 @@ def _gpu_free_bytes(cupy) -> int:
     try:
         free, _ = cupy.cuda.runtime.memGetInfo()
         return int(free)
-    except Exception:
+    except (OSError, RuntimeError):
         return 0
 
 
@@ -700,7 +701,7 @@ def _gpu_total_bytes(cupy) -> int:
     try:
         _, total = cupy.cuda.runtime.memGetInfo()
         return int(total)
-    except Exception:
+    except (OSError, RuntimeError):
         return 0
 
 
@@ -1251,7 +1252,7 @@ class StandardizedGenotypeMatrix:
     Missing values (NaN) are imputed to the mean (producing 0 after centering).
 
     GPU acceleration uses CuPy (cuBLAS) for matmul, bypassing JAX/XLA which
-    has known segfault bugs on Turing GPUs.  Falls back to numpy BLAS on CPU.
+    has known compilation bugs on some GPU architectures.  Falls back to numpy BLAS on CPU.
     """
     raw: RawGenotypeMatrix | None
     means: np.ndarray       # per-variant mean from training data
@@ -1543,7 +1544,7 @@ class StandardizedGenotypeMatrix:
             gc.collect()
             log(f"    CuPy GPU matrix ready ({_cupy_cache_nbytes(self._cupy_cache) / 1e9:.1f} GB)  mem={mem()}")
             return True
-        except Exception as exc:
+        except (MemoryError, OSError, RuntimeError) as exc:
             log(f"    CuPy GPU upload failed ({exc})  mem={mem()}")
             self._cupy_cache = None
             return False
@@ -1618,7 +1619,7 @@ class StandardizedGenotypeMatrix:
                 + f"({resolved_local_indices.shape[0]} variants, {nbytes / 1e9:.1f} GB)  mem={mem()}"
             )
             return self._cupy_subset_cache
-        except Exception as exc:
+        except (MemoryError, OSError, RuntimeError) as exc:
             log(f"    CuPy GPU subset upload failed ({exc})  mem={mem()}")
             self._cupy_subset_cache = None
             self._cupy_subset_cache_local_indices = None
@@ -1719,7 +1720,7 @@ class StandardizedGenotypeMatrix:
             self._enable_hybrid_backend = False  # GPU streaming handles everything
             log("    local int8 cache ready  mem=" + mem())
             return True
-        except Exception as exc:
+        except (OSError, RuntimeError, ValueError) as exc:
             cache_directory.cleanup()
             log(f"    local int8 cache failed ({exc})  mem={mem()}")
             return False
@@ -1778,7 +1779,7 @@ class StandardizedGenotypeMatrix:
             self._enable_hybrid_backend = False
             log("    persistent int8 cache ready  mem=" + mem())
             return True
-        except Exception as exc:
+        except (OSError, RuntimeError, ValueError) as exc:
             log(f"    persistent int8 cache failed ({exc})  mem={mem()}")
             return False
         finally:
