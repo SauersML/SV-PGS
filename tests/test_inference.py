@@ -34,6 +34,9 @@ from sv_pgs.mixture_inference import (
     _sample_space_preconditioner,
     _solve_sample_space_rhs_gpu,
     _solve_sample_space_rhs_cpu,
+    _stochastic_binary_newton_iterations,
+    _stochastic_gpu_exact_variant_solve_limit,
+    _stochastic_sample_space_preconditioner_rank,
     _stochastic_restricted_cross_leverage_diagonal,
     _restricted_variant_space_operator,
     _sample_space_operator,
@@ -512,6 +515,58 @@ def test_fit_variational_em_ignores_incompatible_resume_checkpoint(random_genera
     assert np.all(np.isfinite(result.beta_reduced))
 
 
+def test_variational_fit_checkpoint_accepts_legacy_pickle_state():
+    checkpoint = VariationalFitCheckpoint(
+        config_signature="config",
+        prior_design_signature="design",
+        validation_enabled=False,
+        completed_iterations=1,
+        alpha_state=np.array([1.0], dtype=np.float64),
+        beta_state=np.array([2.0], dtype=np.float64),
+        local_scale=np.array([3.0], dtype=np.float64),
+        auxiliary_delta=np.array([4.0], dtype=np.float64),
+        sigma_error2=1.5,
+        global_scale=2.5,
+        scale_model_coefficients=np.array([5.0], dtype=np.float64),
+        tpb_shape_a_vector=np.array([6.0], dtype=np.float64),
+        tpb_shape_b_vector=np.array([7.0], dtype=np.float64),
+        objective_history=[8.0],
+        validation_history=[],
+        previous_alpha=None,
+        previous_beta=None,
+        previous_local_scale=None,
+        previous_theta=None,
+        previous_tpb_shape_a_vector=None,
+        previous_tpb_shape_b_vector=None,
+        best_validation_metric=None,
+        best_alpha=None,
+        best_beta=None,
+        best_beta_variance=None,
+        best_local_scale=None,
+        best_theta=None,
+        best_sigma_error2=None,
+        best_tpb_shape_a_vector=None,
+        best_tpb_shape_b_vector=None,
+        completed_blocks_in_iteration=0,
+        beta_variance_state=np.array([0.25], dtype=np.float64),
+        reduced_second_moment=np.array([0.5], dtype=np.float64),
+        epoch_reduced_prior_variances=np.array([0.75], dtype=np.float64),
+        binary_block_resume_state={
+            "block_indices": np.array([0], dtype=np.int32),
+            "solver_state": {"completed_iterations": 1},
+        },
+    )
+    legacy_state = checkpoint.__getstate__()
+    legacy_state.pop("binary_block_resume_state")
+
+    restored = object.__new__(VariationalFitCheckpoint)
+    restored.__setstate__((None, legacy_state))
+
+    assert restored.binary_block_resume_state is None
+    np.testing.assert_allclose(restored.alpha_state, checkpoint.alpha_state)
+    np.testing.assert_allclose(restored.beta_state, checkpoint.beta_state)
+
+
 def test_fit_variational_em_ignores_resume_checkpoint_when_validation_is_present(random_generator):
     sample_count, variant_count = 24, 5
     genotype_matrix = random_generator.normal(size=(sample_count, variant_count)).astype(np.float32)
@@ -702,6 +757,130 @@ def test_fit_variational_em_resumes_mid_stochastic_epoch(monkeypatch):
     )
 
     assert processed_blocks == [2]
+    np.testing.assert_allclose(result.beta_reduced, np.array([1.0, 1.0, 1.5, 1.5], dtype=np.float32))
+
+
+def test_fit_variational_em_resumes_mid_binary_stochastic_block(monkeypatch):
+    sample_count, variant_count = 12, 4
+    genotype_matrix = np.array(
+        [
+            [0.2, -0.1, 0.4, 0.0],
+            [0.0, 0.3, -0.2, 0.5],
+            [0.1, 0.0, 0.2, -0.4],
+            [-0.3, 0.2, 0.0, 0.1],
+            [0.4, -0.2, 0.1, 0.0],
+            [0.3, 0.1, -0.1, 0.2],
+            [-0.2, 0.4, 0.3, -0.1],
+            [0.5, -0.3, 0.0, 0.4],
+            [0.0, 0.2, -0.4, 0.3],
+            [0.1, -0.4, 0.5, 0.2],
+            [-0.1, 0.5, 0.2, -0.3],
+            [0.2, 0.0, 0.1, 0.4],
+        ],
+        dtype=np.float32,
+    )
+    covariate_matrix = np.ones((sample_count, 1), dtype=np.float32)
+    target_vector = np.array([0, 1] * (sample_count // 2), dtype=np.float32)
+    records = make_variant_records(variant_count)
+    config = ModelConfig(
+        trait_type=TraitType.BINARY,
+        max_outer_iterations=1,
+        update_hyperparameters=False,
+        final_posterior_refinement=False,
+        stochastic_variational_updates=True,
+        stochastic_min_variant_count=1,
+        stochastic_variant_batch_size=2,
+        stochastic_step_offset=0.0,
+        stochastic_step_exponent=1.0,
+        minimum_minor_allele_frequency=0.0,
+    )
+    tie_map = build_tie_map(genotype_matrix, records, config)
+    block_sequence = [
+        np.array([0, 1], dtype=np.int32),
+        np.array([2, 3], dtype=np.int32),
+    ]
+    binary_resume_states: list[dict[str, object] | None] = []
+    partial_block_emitted = False
+
+    monkeypatch.setattr(
+        mixture_inference,
+        "_stochastic_variant_blocks",
+        lambda variant_count, block_size, random_generator: [block.copy() for block in block_sequence],
+    )
+
+    def fake_binary_posterior_state(**kwargs):
+        nonlocal partial_block_emitted
+        block_indices = np.asarray(kwargs["genotype_matrix"].variant_indices, dtype=np.int32)
+        resume_state = kwargs.get("resume_state")
+        binary_resume_states.append(resume_state)
+        if not partial_block_emitted and resume_state is None:
+            partial_block_emitted = True
+            kwargs["progress_callback"](
+                {
+                    "completed_iterations": 1,
+                    "parameters": np.array([0.0, 0.5, -0.25], dtype=np.float64),
+                    "current_linear_predictor": np.full(sample_count, 0.1, dtype=np.float64),
+                    "current_objective": -12.0,
+                    "best_parameters": np.array([0.0, 0.5, -0.25], dtype=np.float64),
+                    "best_linear_predictor": np.full(sample_count, 0.1, dtype=np.float64),
+                    "best_objective": -12.0,
+                    "stall_count": 0,
+                }
+            )
+            raise RuntimeError("stop-mid-binary-block")
+        block_beta = np.full(block_indices.shape[0], float(block_indices[0] + 1), dtype=np.float64)
+        return (
+            np.zeros(kwargs["covariate_matrix"].shape[1], dtype=np.float64),
+            block_beta,
+            np.full(block_indices.shape[0], 0.25, dtype=np.float64),
+            np.zeros(kwargs["targets"].shape[0], dtype=np.float64),
+            float(block_indices[0]),
+            int(resume_state["completed_iterations"]) + 1 if resume_state is not None else 1,
+        )
+
+    monkeypatch.setattr(mixture_inference, "_binary_posterior_state", fake_binary_posterior_state)
+
+    saved_checkpoints: list[VariationalFitCheckpoint] = []
+
+    def stop_mid_block(checkpoint: VariationalFitCheckpoint) -> None:
+        saved_checkpoints.append(checkpoint)
+        raise RuntimeError("stop-mid-binary-block")
+
+    with pytest.raises(RuntimeError, match="stop-mid-binary-block"):
+        fit_variational_em(
+            genotypes=genotype_matrix,
+            covariates=covariate_matrix,
+            targets=target_vector,
+            records=records,
+            config=config,
+            tie_map=tie_map,
+            checkpoint_callback=stop_mid_block,
+        )
+
+    assert len(saved_checkpoints) == 1
+    assert saved_checkpoints[0].completed_iterations == 0
+    assert saved_checkpoints[0].completed_blocks_in_iteration == 0
+    assert saved_checkpoints[0].binary_block_resume_state is not None
+    np.testing.assert_array_equal(
+        saved_checkpoints[0].binary_block_resume_state["block_indices"],
+        np.array([0, 1], dtype=np.int32),
+    )
+    assert binary_resume_states == [None]
+
+    binary_resume_states.clear()
+    result = fit_variational_em(
+        genotypes=genotype_matrix,
+        covariates=covariate_matrix,
+        targets=target_vector,
+        records=records,
+        config=config,
+        tie_map=tie_map,
+        resume_checkpoint=saved_checkpoints[0],
+    )
+
+    assert binary_resume_states[0] is not None
+    assert int(binary_resume_states[0]["completed_iterations"]) == 1
+    assert binary_resume_states[1] is None
     np.testing.assert_allclose(result.beta_reduced, np.array([1.0, 1.0, 1.5, 1.5], dtype=np.float32))
 
 
@@ -1569,6 +1748,119 @@ def test_binary_newton_solver_controls_relax_large_problem_settings():
 
     assert tolerance == 5e-3
     assert max_iterations == 96
+
+
+def test_binary_newton_solver_controls_relax_small_blend_updates_more_aggressively():
+    standardized = as_raw_genotype_matrix(np.zeros((1, 1), dtype=np.float32)).standardized(
+        means=np.zeros(1, dtype=np.float32),
+        scales=np.ones(1, dtype=np.float32),
+    )
+    standardized._n_samples = 20_000
+    standardized.variant_indices = np.arange(40_000, dtype=np.int32)
+    standardized.means = np.zeros(40_000, dtype=np.float32)
+    standardized.scales = np.ones(40_000, dtype=np.float32)
+
+    tolerance, max_iterations = _binary_newton_solver_controls(
+        standardized,
+        solver_tolerance=1e-6,
+        maximum_linear_solver_iterations=1024,
+        gpu_enabled=True,
+        update_blend_weight=0.05,
+    )
+
+    assert tolerance == 1e-2
+    assert max_iterations == 128
+
+
+def test_stochastic_binary_newton_iterations_scale_with_blend_weight():
+    assert _stochastic_binary_newton_iterations(maximum_iterations=8, step_size=0.27) == 6
+    assert _stochastic_binary_newton_iterations(maximum_iterations=8, step_size=0.10) == 2
+    assert _stochastic_binary_newton_iterations(maximum_iterations=8, step_size=0.05) == 1
+    assert _stochastic_binary_newton_iterations(maximum_iterations=2, step_size=0.27) == 2
+
+
+def test_stochastic_sample_space_preconditioner_rank_scales_with_blend_weight():
+    assert _stochastic_sample_space_preconditioner_rank(requested_rank=384, step_size=0.27) == 384
+    assert _stochastic_sample_space_preconditioner_rank(requested_rank=384, step_size=0.10) == 183
+    assert _stochastic_sample_space_preconditioner_rank(requested_rank=384, step_size=0.05) == 109
+    assert _stochastic_sample_space_preconditioner_rank(requested_rank=64, step_size=0.05) == 64
+    assert _stochastic_sample_space_preconditioner_rank(requested_rank=0, step_size=0.05) == 0
+
+
+def test_stochastic_gpu_exact_variant_solve_limit_scales_from_exact_budget():
+    assert _stochastic_gpu_exact_variant_solve_limit(9_000) == 2_250
+    assert _stochastic_gpu_exact_variant_solve_limit(20_000) == 5_000
+    assert _stochastic_gpu_exact_variant_solve_limit(2_000) == 1_024
+
+
+def test_binary_posterior_state_uses_blended_step_for_convergence(monkeypatch: pytest.MonkeyPatch):
+    sample_count, variant_count = 8, 3
+    genotype_values = np.zeros((sample_count, variant_count), dtype=np.float32)
+    standardized = as_raw_genotype_matrix(genotype_values).standardized(
+        means=np.zeros(variant_count, dtype=np.float32),
+        scales=np.ones(variant_count, dtype=np.float32),
+    )
+    standardized._dense_cache = standardized.materialize()
+    covariate_matrix = np.ones((sample_count, 1), dtype=np.float32)
+    targets = np.array([1.0, 0.0] * (sample_count // 2), dtype=np.float32)
+    prior_variances = np.ones(variant_count, dtype=np.float64)
+    restricted_call_count = 0
+
+    def fake_restricted_posterior_state(
+        genotype_matrix,
+        covariate_matrix,
+        targets,
+        prior_variances,
+        diagonal_noise,
+        solver_tolerance,
+        maximum_linear_solver_iterations,
+        logdet_probe_count,
+        logdet_lanczos_steps,
+        exact_solver_matrix_limit,
+        posterior_variance_batch_size,
+        posterior_variance_probe_count,
+        random_seed,
+        compute_logdet,
+        compute_beta_variance=True,
+        initial_beta_guess=None,
+        sample_space_preconditioner_rank=256,
+        warm_start=None,
+        **_kwargs,
+    ):
+        nonlocal restricted_call_count
+        restricted_call_count += 1
+        alpha = np.zeros(covariate_matrix.shape[1], dtype=np.float64)
+        beta = np.full(prior_variances.shape[0], 1e-2, dtype=np.float64)
+        fitted = np.full(targets.shape[0], 1e-2, dtype=np.float64)
+        return (
+            alpha,
+            beta,
+            np.zeros_like(beta),
+            np.zeros(targets.shape[0], dtype=np.float64),
+            fitted,
+            0.0,
+            0.0,
+            0.0,
+        )
+
+    monkeypatch.setattr(mixture_inference, "_restricted_posterior_state", fake_restricted_posterior_state)
+
+    _binary_posterior_state(
+        genotype_matrix=standardized,
+        covariate_matrix=covariate_matrix,
+        targets=targets,
+        prior_variances=prior_variances,
+        alpha_init=np.zeros(1, dtype=np.float32),
+        beta_init=np.zeros(variant_count, dtype=np.float32),
+        minimum_weight=1e-4,
+        max_iterations=5,
+        gradient_tolerance=1e-4,
+        update_blend_weight=1e-2,
+        compute_logdet=False,
+        compute_beta_variance=False,
+    )
+
+    assert restricted_call_count == 1
 
 
 def test_collapsed_posterior_solver_controls_relax_large_em_updates_and_keep_final_polish():

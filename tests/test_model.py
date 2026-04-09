@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import pickle
 from pathlib import Path
 from typing import cast
 
@@ -138,7 +139,7 @@ def test_binary_model_fit_roundtrip_and_keeps_all_variants(tmp_path):
     )
 
 
-def test_runtime_tuned_config_for_t4_uses_budget_driven_solver_limit(monkeypatch):
+def test_runtime_tuned_config_for_gpu_uses_budget_driven_solver_limit(monkeypatch):
     raw_genotypes = ShapeOnlyRawGenotypeMatrix(sample_count=1_000, variant_count=50_000)
     config = ModelConfig(
         trait_type=TraitType.BINARY,
@@ -153,16 +154,15 @@ def test_runtime_tuned_config_for_t4_uses_budget_driven_solver_limit(monkeypatch
         "_gpu_materialization_budget_bytes",
         lambda _cupy: 1_000 * 4 * 10_000,
     )
-    monkeypatch.setattr(runtime_policy_module, "t4_fast_math_enabled", lambda: True)
 
     tuned_config, summary = _runtime_tuned_config_for_fit(config, raw_genotypes)
 
     assert tuned_config.exact_solver_matrix_limit == 9_000
-    assert tuned_config.sample_space_preconditioner_rank == 384
-    assert tuned_config.stochastic_variant_batch_size == 7_500
+    assert tuned_config.sample_space_preconditioner_rank == 400
+    assert tuned_config.stochastic_variant_batch_size == 8_500
     assert tuned_config.final_posterior_refinement is False
     assert summary is not None
-    assert "t4_profile=on" in summary
+    assert "gpu_profile=budget-driven" in summary
 
 
 def test_fit_stage_structure_cache_key_is_shared_across_traits(monkeypatch):
@@ -593,6 +593,76 @@ def test_fit_checkpoint_persists_basis_cache_during_interrupted_run(tmp_path, mo
     assert basis_path.exists()
     restored_basis = np.load(basis_path)
     assert restored_basis.shape[1] == 3
+
+
+def test_try_load_variational_checkpoint_accepts_legacy_checkpoint_pickle(tmp_path):
+    cache_paths = _FitStageCachePaths(
+        key="legacy-checkpoint-test",
+        cache_dir=tmp_path,
+        manifest_path=tmp_path / "legacy-checkpoint-test.manifest.json",
+        active_indices_path=tmp_path / "legacy-checkpoint-test.active.npy",
+        tie_map_path=tmp_path / "legacy-checkpoint-test.tie.pkl",
+        reduced_raw_i8_path=tmp_path / "legacy-checkpoint-test.reduced_raw_i8.npy",
+        em_checkpoint_path=tmp_path / "legacy-checkpoint-test.em.pkl",
+    )
+    checkpoint = VariationalFitCheckpoint(
+        config_signature="legacy-config",
+        prior_design_signature="legacy-design",
+        validation_enabled=False,
+        completed_iterations=1,
+        alpha_state=np.array([1.0, -0.5], dtype=np.float64),
+        beta_state=np.array([0.25, -0.75], dtype=np.float64),
+        local_scale=np.array([1.0, 1.0], dtype=np.float64),
+        auxiliary_delta=np.array([0.5, 0.5], dtype=np.float64),
+        sigma_error2=1.0,
+        global_scale=0.8,
+        scale_model_coefficients=np.array([0.0], dtype=np.float64),
+        tpb_shape_a_vector=np.array([1.0], dtype=np.float64),
+        tpb_shape_b_vector=np.array([0.5], dtype=np.float64),
+        objective_history=[-1.0],
+        validation_history=[],
+        previous_alpha=None,
+        previous_beta=None,
+        previous_local_scale=None,
+        previous_theta=None,
+        previous_tpb_shape_a_vector=None,
+        previous_tpb_shape_b_vector=None,
+        best_validation_metric=None,
+        best_alpha=None,
+        best_beta=None,
+        best_beta_variance=None,
+        best_local_scale=None,
+        best_theta=None,
+        best_sigma_error2=None,
+        best_tpb_shape_a_vector=None,
+        best_tpb_shape_b_vector=None,
+        completed_blocks_in_iteration=1,
+        beta_variance_state=np.array([0.4, 0.6], dtype=np.float64),
+        reduced_second_moment=np.array([0.5, 0.7], dtype=np.float64),
+        epoch_reduced_prior_variances=np.array([0.9, 1.1], dtype=np.float64),
+        binary_block_resume_state={
+            "block_indices": np.array([0, 1], dtype=np.int32),
+            "solver_state": {"completed_iterations": 1},
+        },
+    )
+    legacy_state = checkpoint.__getstate__()
+    legacy_state.pop("binary_block_resume_state")
+
+    class _LegacyCheckpointPayload:
+        def __reduce__(self):
+            return (object.__new__, (VariationalFitCheckpoint,), (None, legacy_state))
+
+    cache_paths.cache_dir.mkdir(parents=True, exist_ok=True)
+    with cache_paths.em_checkpoint_path.open("wb") as handle:
+        pickle.dump(_LegacyCheckpointPayload(), handle, protocol=pickle.HIGHEST_PROTOCOL)
+
+    restored = model_module._try_load_variational_checkpoint(cache_paths)
+
+    assert restored is not None
+    assert restored.binary_block_resume_state is None
+    np.testing.assert_allclose(restored.alpha_state, checkpoint.alpha_state)
+    np.testing.assert_allclose(restored.beta_state, checkpoint.beta_state)
+    assert cache_paths.em_checkpoint_path.exists()
 
 
 def test_corrupt_variational_checkpoint_is_ignored(tmp_path, monkeypatch):

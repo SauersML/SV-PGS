@@ -2,7 +2,6 @@ from __future__ import annotations
 
 from dataclasses import dataclass, replace
 
-from sv_pgs._jax import t4_fast_math_enabled
 from sv_pgs.config import ModelConfig
 from sv_pgs.genotype import RawGenotypeMatrix, _gpu_materialization_budget_bytes, _try_import_cupy
 
@@ -10,7 +9,9 @@ from sv_pgs.genotype import RawGenotypeMatrix, _gpu_materialization_budget_bytes
 # The exact solver limit caps dense Cholesky factorizations on GPU to avoid
 # excessive O(p^3) cost. The preconditioner rank bounds the Nyström approximation.
 GPU_FINAL_REFINEMENT_VARIANT_MULTIPLIER = 2
-T4_GPU_PRECONDITIONER_RANK_LIMIT = 384
+GPU_PRECONDITIONER_RANK_FLOOR = 128
+GPU_PRECONDITIONER_RANK_CEILING = 512
+GPU_PRECONDITIONER_RANK_FRACTION = 0.04
 
 
 @dataclass(frozen=True, slots=True)
@@ -18,6 +19,20 @@ class RuntimeTrainingPolicy:
     tuned_config: ModelConfig
     gpu_budget_bytes: int | None
     cacheable_dense_variants: int | None
+
+
+def _recommended_gpu_preconditioner_rank(cacheable_dense_variants: int) -> int:
+    if cacheable_dense_variants < 1:
+        return GPU_PRECONDITIONER_RANK_FLOOR
+    budget_scaled_rank = int(round(float(cacheable_dense_variants) * GPU_PRECONDITIONER_RANK_FRACTION))
+    return max(
+        GPU_PRECONDITIONER_RANK_FLOOR,
+        min(
+            GPU_PRECONDITIONER_RANK_CEILING,
+            int(cacheable_dense_variants),
+            budget_scaled_rank,
+        ),
+    )
 
 
 def runtime_training_policy_for_fit(
@@ -40,32 +55,23 @@ def runtime_training_policy_for_fit(
         )
     gpu_budget_bytes = _gpu_materialization_budget_bytes(cupy)
     cacheable_dense_variants = max(int(gpu_budget_bytes // max(sample_count * 4, 1)), 1)
-    preconditioner_rank_limit = (
-        T4_GPU_PRECONDITIONER_RANK_LIMIT
-        if t4_fast_math_enabled()
-        else cacheable_dense_variants
-    )
     tuned_exact_solver_limit = min(
         int(config.exact_solver_matrix_limit),
         max(int(cacheable_dense_variants * 0.9), 1),
     )
-    max_gpu_preconditioner_rank = max(1, min(cacheable_dense_variants, preconditioner_rank_limit))
-    recommended_preconditioner_rank = (
-        min(T4_GPU_PRECONDITIONER_RANK_LIMIT, max_gpu_preconditioner_rank)
-        if t4_fast_math_enabled()
-        else int(config.sample_space_preconditioner_rank)
-    )
+    max_gpu_preconditioner_rank = max(1, int(cacheable_dense_variants))
+    recommended_preconditioner_rank = _recommended_gpu_preconditioner_rank(cacheable_dense_variants)
     tuned_preconditioner_rank = min(
         max(int(config.sample_space_preconditioner_rank), recommended_preconditioner_rank),
         max_gpu_preconditioner_rank,
     )
-    # Use up to 75% of GPU budget for stochastic blocks — larger blocks mean
+    # Use up to 85% of GPU budget for stochastic blocks — larger blocks mean
     # fewer blocks per epoch, fewer preconditioner builds, better convergence.
     # On GPU we want stochastic blocks large enough to amortize upload,
     # preconditioner, and CG startup costs. The static default (8,192) is too
-    # conservative on T4-class cards once the block solver is iterative.
+    # conservative on modern GPUs once the block solver is iterative.
     tuned_stochastic_batch_size = max(
-        max(int(config.stochastic_variant_batch_size), max(int(cacheable_dense_variants * 0.75), 256)),
+        max(int(config.stochastic_variant_batch_size), max(int(cacheable_dense_variants * 0.85), 256)),
         256,
     )
     tuned_final_posterior_refinement = (
@@ -99,14 +105,14 @@ def runtime_training_policy_summary(policy: RuntimeTrainingPolicy, original_conf
             "GPU runtime profile active: "
             + f"gpu_budget={policy.gpu_budget_bytes / 1e9:.1f} GB "
             + f"cacheable_dense_variants~{policy.cacheable_dense_variants} "
-            + f"t4_profile={'on' if t4_fast_math_enabled() else 'off'} "
+            + "gpu_profile=budget-driven "
             + "(user config already fits GPU profile)"
         )
     return (
         "GPU runtime profile active: "
         + f"gpu_budget={policy.gpu_budget_bytes / 1e9:.1f} GB "
         + f"cacheable_dense_variants~{policy.cacheable_dense_variants} "
-        + f"t4_profile={'on' if t4_fast_math_enabled() else 'off'} "
+        + "gpu_profile=budget-driven "
         + f"exact_solver_matrix_limit={original_config.exact_solver_matrix_limit}->{tuned_config.exact_solver_matrix_limit} "
         + f"sample_space_preconditioner_rank={original_config.sample_space_preconditioner_rank}->{tuned_config.sample_space_preconditioner_rank} "
         + f"stochastic_variant_batch_size={original_config.stochastic_variant_batch_size}->{tuned_config.stochastic_variant_batch_size} "

@@ -52,7 +52,7 @@ The algorithm iterates three steps until convergence:
 
 from __future__ import annotations
 
-from dataclasses import dataclass, fields as dataclass_fields
+from dataclasses import MISSING, dataclass, fields as dataclass_fields, replace as dataclass_replace
 import gc
 import hashlib
 import json
@@ -239,6 +239,34 @@ class VariationalFitCheckpoint:
     beta_variance_state: np.ndarray | None = None
     reduced_second_moment: np.ndarray | None = None
     epoch_reduced_prior_variances: np.ndarray | None = None
+    binary_block_resume_state: dict[str, object] | None = None
+
+    def __getstate__(self) -> dict[str, object]:
+        return {
+            field.name: getattr(self, field.name)
+            for field in dataclass_fields(type(self))
+        }
+
+    def __setstate__(self, state: object) -> None:
+        if isinstance(state, tuple):
+            state_dict: dict[str, object] = {}
+            for item in state:
+                if isinstance(item, dict):
+                    state_dict.update(item)
+        elif isinstance(state, dict):
+            state_dict = dict(state)
+        else:
+            raise TypeError(f"Unsupported VariationalFitCheckpoint pickle state: {type(state)!r}")
+        for field in dataclass_fields(type(self)):
+            if field.name in state_dict:
+                value = state_dict[field.name]
+            elif field.default is not MISSING:
+                value = field.default
+            elif field.default_factory is not MISSING:
+                value = field.default_factory()
+            else:
+                raise TypeError(f"Missing required checkpoint field: {field.name}")
+            object.__setattr__(self, field.name, value)
 
 
 @dataclass(slots=True)
@@ -510,6 +538,55 @@ def _stochastic_step_size(config: ModelConfig, step_index: int) -> float:
     return float((config.stochastic_step_offset + float(step_index)) ** (-config.stochastic_step_exponent))
 
 
+def _stochastic_binary_newton_iterations(
+    *,
+    maximum_iterations: int,
+    step_size: float,
+) -> int:
+    if maximum_iterations < 1:
+        raise ValueError("maximum_iterations must be positive.")
+    # The stochastic outer update only applies a blend-weighted fraction of the
+    # block solution. One Newton step already gives the Fisher-scoring direction;
+    # additional refinements should therefore scale with the outer blend weight.
+    reference_step = 0.27
+    scheduled_iterations = max(1, int(np.floor(6.0 * max(float(step_size), 0.0) / reference_step + 0.5)))
+    return min(int(maximum_iterations), scheduled_iterations)
+
+
+def _stochastic_sample_space_preconditioner_rank(
+    *,
+    requested_rank: int,
+    step_size: float,
+) -> int:
+    if requested_rank < 0:
+        raise ValueError("requested_rank must be non-negative.")
+    if requested_rank == 0:
+        return 0
+    reference_step = 0.27
+    scaled_fraction = min(max(float(step_size), 0.0) / reference_step, 1.0)
+    # The outer stochastic blend damps preconditioner error linearly in step_size,
+    # while CG iteration counts depend roughly on the square root of the residual
+    # conditioning. Scale the retained low-rank spectrum sublinearly so late,
+    # low-weight blocks use cheaper preconditioners without changing the solved
+    # linear system.
+    rank_fraction = scaled_fraction ** 0.75
+    minimum_rank = min(int(requested_rank), 96)
+    scheduled_rank = int(np.ceil(int(requested_rank) * rank_fraction))
+    return max(minimum_rank, min(int(requested_rank), scheduled_rank))
+
+
+def _stochastic_gpu_exact_variant_solve_limit(exact_solver_matrix_limit: int) -> int:
+    if exact_solver_matrix_limit < 1:
+        raise ValueError("exact_solver_matrix_limit must be positive.")
+    # The stochastic block path should reserve dense exact Cholesky for blocks
+    # that are comfortably below the full-memory exact-solver budget, because
+    # the cubic factorization cost grows much faster than the streaming CG path.
+    return min(
+        int(exact_solver_matrix_limit),
+        max(int(np.floor(int(exact_solver_matrix_limit) * 0.25)), 1_024),
+    )
+
+
 def _stochastic_variant_blocks(
     variant_count: int,
     block_size: int,
@@ -691,6 +768,27 @@ def fit_variational_em(
     def _copy_optional(array: np.ndarray | None) -> np.ndarray | None:
         return None if array is None else np.asarray(array, dtype=np.float64).copy()
 
+    def _copy_resume_state_value(value: object) -> object:
+        if isinstance(value, np.ndarray):
+            return value.copy()
+        if isinstance(value, np.generic):
+            return value.item()
+        if isinstance(value, dict):
+            return {
+                str(key): _copy_resume_state_value(item)
+                for key, item in value.items()
+            }
+        if isinstance(value, list):
+            return [_copy_resume_state_value(item) for item in value]
+        if isinstance(value, tuple):
+            return tuple(_copy_resume_state_value(item) for item in value)
+        return value
+
+    def _copy_binary_block_resume_state(
+        state: dict[str, object] | None,
+    ) -> dict[str, object] | None:
+        return None if state is None else cast(dict[str, object], _copy_resume_state_value(state))
+
     def _build_checkpoint(
         completed_iterations: int,
         *,
@@ -698,6 +796,7 @@ def fit_variational_em(
         beta_variance_state_override: np.ndarray | None = None,
         reduced_second_moment_override: np.ndarray | None = None,
         epoch_reduced_prior_variances_override: np.ndarray | None = None,
+        binary_block_resume_state_override: dict[str, object] | None = None,
     ) -> VariationalFitCheckpoint:
         return VariationalFitCheckpoint(
             config_signature=config_signature,
@@ -735,6 +834,7 @@ def fit_variational_em(
             beta_variance_state=_copy_optional(beta_variance_state_override),
             reduced_second_moment=_copy_optional(reduced_second_moment_override),
             epoch_reduced_prior_variances=_copy_optional(epoch_reduced_prior_variances_override),
+            binary_block_resume_state=_copy_binary_block_resume_state(binary_block_resume_state_override),
         )
 
     def _initialize_em_state() -> None:
@@ -874,7 +974,12 @@ def fit_variational_em(
         resume_beta_variance_state = None
         resume_reduced_second_moment = None
         resume_epoch_reduced_prior_variances = None
-        if resume_completed_blocks_in_iteration > 0:
+        resume_binary_block_state = (
+            None
+            if resume_checkpoint is None
+            else _copy_binary_block_resume_state(resume_checkpoint.binary_block_resume_state)
+        )
+        if resume_completed_blocks_in_iteration > 0 or resume_binary_block_state is not None:
             if resume_checkpoint is None:
                 raise ValueError("resume checkpoint block progress requires checkpoint state.")
             if resume_checkpoint.beta_variance_state is None or resume_checkpoint.reduced_second_moment is None:
@@ -927,7 +1032,13 @@ def fit_variational_em(
             log(f"  variational EM epoch {outer_iteration + 1}/{config.max_outer_iterations} start  sigma_e2={sigma_error2:.6f}  global_scale={global_scale:.6f}  mem={mem()}")
             epoch_wall_t0 = time.monotonic()
             epoch_total_newton_iters = 0
-            resuming_mid_epoch = outer_iteration == start_iteration and resume_completed_blocks_in_iteration > 0
+            resuming_mid_epoch = (
+                outer_iteration == start_iteration
+                and (
+                    resume_completed_blocks_in_iteration > 0
+                    or resume_binary_block_state is not None
+                )
+            )
             refresh_beta_variance = _should_refresh_beta_variance(
                 outer_iteration,
                 refresh_interval=config.beta_variance_update_interval,
@@ -997,6 +1108,27 @@ def fit_variational_em(
                 step_index += 1
                 block_count += 1
                 step_size = _stochastic_step_size(config, step_index)
+                active_binary_resume_state: dict[str, object] | None = None
+                if resume_binary_block_state is not None:
+                    expected_block_indices = np.asarray(
+                        resume_binary_block_state.get("block_indices"),
+                        dtype=np.int32,
+                    ).reshape(-1)
+                    if expected_block_indices.shape == block_indices.shape and np.array_equal(expected_block_indices, block_indices):
+                        solver_state = resume_binary_block_state.get("solver_state")
+                        if not isinstance(solver_state, dict):
+                            raise ValueError("resume checkpoint binary block state is missing solver_state.")
+                        active_binary_resume_state = cast(dict[str, object], _copy_resume_state_value(solver_state))
+                        log(
+                            "    resuming binary block from cached Newton state "
+                            + f"at block {block_count}/{n_blocks}  mem={mem()}"
+                        )
+                    else:
+                        log(
+                            "    discarding stale binary block resume state "
+                            + f"(expected block size {expected_block_indices.size}, got {block_indices.size})"
+                        )
+                    resume_binary_block_state = None
                 block_genotypes = genotype_matrix.subset(block_indices)
                 # Upload block to GPU — fits easily in GPU budget.
                 # Without this, every CG iteration streams from mmap (40s vs 2s).
@@ -1004,6 +1136,18 @@ def fit_variational_em(
                 if block_count <= 3 or block_count % max(n_blocks // 10, 1) == 0 or block_count == n_blocks:
                     log(f"    block {block_count}/{n_blocks}  variants={len(block_indices)}  step_size={step_size:.4f}  gpu={'yes' if block_genotypes._cupy_cache is not None else 'no'}  mem={mem()}")
                 block_prior_variances = np.asarray(reduced_prior_variances[block_indices], dtype=np.float64)
+                allow_small_block_gpu_exact_variant = len(block_indices) <= min(
+                    int(config.exact_solver_matrix_limit),
+                    _stochastic_gpu_exact_variant_solve_limit(int(config.exact_solver_matrix_limit)),
+                )
+                block_sample_space_preconditioner_rank = _stochastic_sample_space_preconditioner_rank(
+                    requested_rank=int(config.sample_space_preconditioner_rank),
+                    step_size=step_size,
+                )
+                block_config = dataclass_replace(
+                    config,
+                    sample_space_preconditioner_rank=block_sample_space_preconditioner_rank,
+                )
                 block_beta_previous = np.asarray(beta_state[block_indices], dtype=np.float64).copy()
                 block_linear_predictor_previous = np.asarray(
                     block_genotypes.matvec(block_beta_previous, batch_size=config.posterior_variance_batch_size),
@@ -1011,6 +1155,23 @@ def fit_variational_em(
                 )
                 predictor_offset = predictor_offset_array + covariate_linear_predictor + genetic_linear_predictor - block_linear_predictor_previous
                 if config.trait_type == TraitType.BINARY:
+                    def _save_partial_binary_block(binary_state: dict[str, object]) -> None:
+                        if checkpoint_callback is None:
+                            return
+                        checkpoint_callback(
+                            _build_checkpoint(
+                                outer_iteration,
+                                completed_blocks_in_iteration=block_count - 1,
+                                beta_variance_state_override=beta_variance_state,
+                                reduced_second_moment_override=reduced_second_moment,
+                                epoch_reduced_prior_variances_override=reduced_prior_variances,
+                                binary_block_resume_state_override={
+                                    "block_indices": np.asarray(block_indices, dtype=np.int32).copy(),
+                                    "solver_state": binary_state,
+                                },
+                            )
+                        )
+
                     block_state = _binary_posterior_state(
                         genotype_matrix=block_genotypes,
                         covariate_matrix=empty_covariates,
@@ -1019,11 +1180,13 @@ def fit_variational_em(
                         alpha_init=np.zeros(0, dtype=np.float64),
                         beta_init=block_beta_previous,
                         minimum_weight=config.polya_gamma_minimum_weight,
-                        # Newton precision should match blending weight: with step_size=0.07,
-                        # the block solution is damped by 93%, so extra Newton iterations
-                        # improve the global state by <0.05%. Use more steps early (large
-                        # step_size) where block precision matters, fewer later.
-                        max_iterations=min(config.max_inner_newton_iterations, max(2, int(8 * step_size / 0.27 + 0.5))),
+                        # Inner Newton work should scale with the stochastic blend
+                        # weight: later low-step updates only need a coarse local
+                        # optimum because the global state receives a damped move.
+                        max_iterations=_stochastic_binary_newton_iterations(
+                            maximum_iterations=config.max_inner_newton_iterations,
+                            step_size=step_size,
+                        ),
                         gradient_tolerance=max(config.newton_gradient_tolerance, 1e-4),
                         solver_tolerance=config.linear_solver_tolerance,
                         maximum_linear_solver_iterations=config.maximum_linear_solver_iterations,
@@ -1035,9 +1198,12 @@ def fit_variational_em(
                         random_seed=config.random_seed + step_index,
                         compute_logdet=False,
                         compute_beta_variance=refresh_beta_variance,
-                        sample_space_preconditioner_rank=config.sample_space_preconditioner_rank,
+                        sample_space_preconditioner_rank=block_sample_space_preconditioner_rank,
                         predictor_offset=predictor_offset,
-                        allow_gpu_exact_variant=False,
+                        update_blend_weight=step_size,
+                        resume_state=active_binary_resume_state,
+                        progress_callback=_save_partial_binary_block if checkpoint_callback is not None else None,
+                        allow_gpu_exact_variant=allow_small_block_gpu_exact_variant,
                     )
                     block_beta_candidate = np.asarray(block_state[1], dtype=np.float64)
                     block_beta_variance = (
@@ -1056,7 +1222,7 @@ def fit_variational_em(
                         alpha_init=np.zeros(0, dtype=np.float64),
                         beta_init=block_beta_previous,
                         trait_type=TraitType.QUANTITATIVE,
-                        config=config,
+                        config=block_config,
                         compute_logdet=False,
                         compute_beta_variance=refresh_beta_variance,
                         stale_beta_variance=None if beta_variance_state is None else beta_variance_state[block_indices],
@@ -1064,7 +1230,7 @@ def fit_variational_em(
                         em_iteration_index=outer_iteration,
                         total_em_iterations=config.max_outer_iterations,
                         update_blend_weight=step_size,
-                        allow_gpu_exact_variant=False,
+                        allow_gpu_exact_variant=allow_small_block_gpu_exact_variant,
                     )
                     block_beta_candidate = np.asarray(collapsed_block_state.beta, dtype=np.float64)
                     block_beta_variance = np.asarray(collapsed_block_state.beta_variance, dtype=np.float64)
@@ -1133,6 +1299,7 @@ def fit_variational_em(
             resume_beta_variance_state = None
             resume_reduced_second_moment = None
             resume_epoch_reduced_prior_variances = None
+            resume_binary_block_state = None
 
             epoch_wall_seconds = time.monotonic() - epoch_wall_t0
             n_nonzero_beta = int(np.sum(beta_state != 0.0))
@@ -1738,6 +1905,7 @@ def _fit_collapsed_posterior(
             posterior_working_set_coefficient_tolerance=config.posterior_working_set_coefficient_tolerance,
             stale_beta_variance=stale_beta_variance,
             restricted_posterior_warm_start=restricted_posterior_warm_start,
+            update_blend_weight=update_blend_weight,
             allow_gpu_exact_variant=allow_gpu_exact_variant,
         )
         beta_variance = _effective_beta_variance_state(
@@ -1895,9 +2063,25 @@ def _binary_newton_solver_controls(
     solver_tolerance: float,
     maximum_linear_solver_iterations: int,
     gpu_enabled: bool = False,
+    update_blend_weight: float | None = None,
 ) -> tuple[float, int]:
     if genotype_matrix.shape[0] < 16_384 and genotype_matrix.shape[1] < 16_384:
         return solver_tolerance, maximum_linear_solver_iterations
+    if update_blend_weight is not None:
+        blend_weight = float(np.clip(update_blend_weight, 0.0, 1.0))
+        if blend_weight < 0.08:
+            relaxed_tolerance = max(float(solver_tolerance), 1e-2)
+            iteration_cap = 128 if gpu_enabled else 64
+        elif blend_weight < 0.20:
+            relaxed_tolerance = max(float(solver_tolerance), 5e-3)
+            iteration_cap = 192 if gpu_enabled else 96
+        else:
+            relaxed_tolerance = max(float(solver_tolerance), 2e-3)
+            iteration_cap = 256 if gpu_enabled else 128
+        if genotype_matrix.shape[1] > genotype_matrix.shape[0]:
+            relaxed_tolerance = max(relaxed_tolerance, 5e-3)
+            iteration_cap = min(iteration_cap, 160 if gpu_enabled else 80)
+        return relaxed_tolerance, max(min(int(maximum_linear_solver_iterations), iteration_cap), 16)
     relaxed_tolerance = max(float(solver_tolerance), 1e-3)
     # GPU CG iterations are cheap (~30ms each with cached data), so allow more
     # iterations before declaring convergence failure on large blocks.
@@ -2120,6 +2304,9 @@ def _binary_posterior_state(
     posterior_working_set_max_passes: int = 6,
     posterior_working_set_coefficient_tolerance: float = 1e-4,
     restricted_posterior_warm_start: _RestrictedPosteriorWarmStart | None = None,
+    update_blend_weight: float | None = None,
+    resume_state: dict[str, object] | None = None,
+    progress_callback: Callable[[dict[str, object]], None] | None = None,
     allow_gpu_exact_variant: bool = True,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, float, int]:
     standardized_genotypes = _as_standardized_genotype_matrix(genotype_matrix)
@@ -2141,6 +2328,8 @@ def _binary_posterior_state(
         if restricted_posterior_warm_start is None
         else restricted_posterior_warm_start
     )
+    current_linear_predictor_gpu = None
+    best_linear_predictor_gpu = None
     log(f"      binary setup: {standardized_genotypes.shape[1]} variants, {standardized_genotypes.shape[0]} samples  mem={mem()}")
     cupy = None
     streaming_gpu_binary_backend = (
@@ -2170,60 +2359,121 @@ def _binary_posterior_state(
         solver_tolerance=solver_tolerance,
         maximum_linear_solver_iterations=maximum_linear_solver_iterations,
         gpu_enabled=_newton_gpu_available,
+        update_blend_weight=update_blend_weight,
     )
     import time as _time
-    log(f"      computing initial linear predictor...  mem={mem()}")
-    _init_pred_t0 = _time.monotonic()
-    if streaming_gpu_binary_backend:
-        assert cupy is not None
-        current_linear_predictor_gpu = (
-            predictor_offset_gpu
-            + covariate_matrix_gpu @ cupy.asarray(parameters[:covariate_count], dtype=compute_cp_dtype)
-            + _streaming_gpu_genotype_matvec(
-                standardized_genotypes,
-                cupy.asarray(parameters[covariate_count:], dtype=compute_cp_dtype),
-                batch_size=posterior_variance_batch_size,
-                cp=cupy,
-                dtype=compute_cp_dtype,
-            )
-        )
-        current_linear_predictor = _cupy_array_to_numpy(current_linear_predictor_gpu, dtype=np.float64)
-        current_objective = _binary_penalized_log_posterior_cupy(
-            cupy,
-            current_linear_predictor_gpu,
-            target_array_gpu,
-            prior_precision_gpu,
-            cupy.asarray(parameters[covariate_count:], dtype=compute_cp_dtype),
-            dtype=compute_cp_dtype,
+
+    def _build_resume_snapshot(
+        *,
+        completed_iterations: int,
+        parameters_state: np.ndarray,
+        current_linear_predictor_state: np.ndarray,
+        current_objective_state: float,
+        best_parameters_state: np.ndarray,
+        best_linear_predictor_state: np.ndarray,
+        best_objective_state: float,
+        stall_count_state: int,
+    ) -> dict[str, object]:
+        return {
+            "completed_iterations": int(completed_iterations),
+            "parameters": np.asarray(parameters_state, dtype=np.float64).copy(),
+            "current_linear_predictor": np.asarray(current_linear_predictor_state, dtype=np.float64).copy(),
+            "current_objective": float(current_objective_state),
+            "best_parameters": np.asarray(best_parameters_state, dtype=np.float64).copy(),
+            "best_linear_predictor": np.asarray(best_linear_predictor_state, dtype=np.float64).copy(),
+            "best_objective": float(best_objective_state),
+            "stall_count": int(stall_count_state),
+        }
+
+    resume_completed_iterations = 0
+    if resume_state is not None:
+        resume_completed_iterations = int(resume_state.get("completed_iterations", 0))
+        if resume_completed_iterations < 0 or resume_completed_iterations > max_iterations:
+            raise ValueError("binary resume_state completed_iterations is out of range.")
+        parameters = np.asarray(resume_state["parameters"], dtype=np.float64).copy()
+        current_linear_predictor = np.asarray(
+            resume_state["current_linear_predictor"],
+            dtype=np.float64,
+        ).copy()
+        current_objective = float(resume_state["current_objective"])
+        best_parameters = np.asarray(
+            resume_state.get("best_parameters", parameters),
+            dtype=np.float64,
+        ).copy()
+        best_linear_predictor = np.asarray(
+            resume_state.get("best_linear_predictor", current_linear_predictor),
+            dtype=np.float64,
+        ).copy()
+        best_objective = float(resume_state.get("best_objective", current_objective))
+        stall_count = int(resume_state.get("stall_count", 0))
+        if parameters.shape != (covariate_count + standardized_genotypes.shape[1],):
+            raise ValueError("binary resume_state parameters shape does not match the block.")
+        if current_linear_predictor.shape != (standardized_genotypes.shape[0],):
+            raise ValueError("binary resume_state current_linear_predictor shape does not match samples.")
+        if best_parameters.shape != parameters.shape:
+            raise ValueError("binary resume_state best_parameters shape does not match parameters.")
+        if best_linear_predictor.shape != current_linear_predictor.shape:
+            raise ValueError("binary resume_state best_linear_predictor shape does not match samples.")
+        if streaming_gpu_binary_backend:
+            assert cupy is not None
+            current_linear_predictor_gpu = cupy.asarray(current_linear_predictor, dtype=compute_cp_dtype)
+            best_linear_predictor_gpu = cupy.asarray(best_linear_predictor, dtype=compute_cp_dtype)
+        log(
+            "      resuming binary PG updates "
+            + f"from iter {resume_completed_iterations + 1}/{max_iterations}  mem={mem()}"
         )
     else:
-        current_linear_predictor = predictor_offset_array + np.asarray(
-            covariate_matrix_f64 @ parameters[:covariate_count]
-            + standardized_genotypes.matvec(parameters[covariate_count:], batch_size=posterior_variance_batch_size),
-            dtype=np.float64,
-        )
-        current_objective = _binary_penalized_log_posterior(
-            linear_predictor=current_linear_predictor,
-            targets=target_array,
-            prior_precision=prior_precision,
-            beta=parameters[covariate_count:],
-        )
-    _init_pred_seconds = _time.monotonic() - _init_pred_t0
-    log(f"      initial predictor computed in {_init_pred_seconds:.1f}s  obj={current_objective:.4f}  mem={mem()}")
+        log(f"      computing initial linear predictor...  mem={mem()}")
+        _init_pred_t0 = _time.monotonic()
+        if streaming_gpu_binary_backend:
+            assert cupy is not None
+            current_linear_predictor_gpu = (
+                predictor_offset_gpu
+                + covariate_matrix_gpu @ cupy.asarray(parameters[:covariate_count], dtype=compute_cp_dtype)
+                + _streaming_gpu_genotype_matvec(
+                    standardized_genotypes,
+                    cupy.asarray(parameters[covariate_count:], dtype=compute_cp_dtype),
+                    batch_size=posterior_variance_batch_size,
+                    cp=cupy,
+                    dtype=compute_cp_dtype,
+                )
+            )
+            current_linear_predictor = _cupy_array_to_numpy(current_linear_predictor_gpu, dtype=np.float64)
+            current_objective = _binary_penalized_log_posterior_cupy(
+                cupy,
+                current_linear_predictor_gpu,
+                target_array_gpu,
+                prior_precision_gpu,
+                cupy.asarray(parameters[covariate_count:], dtype=compute_cp_dtype),
+                dtype=compute_cp_dtype,
+            )
+        else:
+            current_linear_predictor = predictor_offset_array + np.asarray(
+                covariate_matrix_f64 @ parameters[:covariate_count]
+                + standardized_genotypes.matvec(parameters[covariate_count:], batch_size=posterior_variance_batch_size),
+                dtype=np.float64,
+            )
+            current_objective = _binary_penalized_log_posterior(
+                linear_predictor=current_linear_predictor,
+                targets=target_array,
+                prior_precision=prior_precision,
+                beta=parameters[covariate_count:],
+            )
+        _init_pred_seconds = _time.monotonic() - _init_pred_t0
+        log(f"      initial predictor computed in {_init_pred_seconds:.1f}s  obj={current_objective:.4f}  mem={mem()}")
+        best_objective = current_objective
+        best_parameters = parameters.copy()
+        best_linear_predictor = current_linear_predictor.copy()
+        best_linear_predictor_gpu = current_linear_predictor_gpu if streaming_gpu_binary_backend else None
+        stall_count = 0
     log(
         f"      binary PG updates: {standardized_genotypes.shape[1]} variants, "
         + f"max_iter={max_iterations}  mem={mem()}"
     )
     final_weights = _binary_expected_polya_gamma_weights(current_linear_predictor, minimum_weight)
-    # Best-objective tracking for stall detection.
-    best_objective = current_objective
-    best_parameters = parameters.copy()
-    best_linear_predictor = current_linear_predictor.copy()
-    best_linear_predictor_gpu = current_linear_predictor_gpu if streaming_gpu_binary_backend else None
-    best_weights = final_weights.copy()
-    stall_count = 0
-    _binary_newton_iters_used = 0
-    for iteration_index in range(max_iterations):
+    best_weights = _binary_expected_polya_gamma_weights(best_linear_predictor, minimum_weight)
+    _binary_newton_iters_used = resume_completed_iterations
+    for iteration_index in range(resume_completed_iterations, max_iterations):
         _binary_newton_iters_used = iteration_index + 1
         iteration_start = _time.monotonic()
         if streaming_gpu_binary_backend:
@@ -2297,12 +2547,20 @@ def _binary_posterior_state(
             float(np.linalg.norm(current_linear_predictor)),
             max(np.sqrt(float(updated_linear_predictor.shape[0])), 1.0),
         )
+        effective_update_scale = (
+            float(np.clip(update_blend_weight, 0.0, 1.0))
+            if update_blend_weight is not None
+            else 1.0
+        )
+        effective_parameter_step = effective_update_scale * relative_parameter_step
+        effective_predictor_step = effective_update_scale * relative_predictor_step
         objective_gain = updated_objective - current_objective
         total_seconds = _time.monotonic() - iteration_start
         log(
             f"      binary iter {iteration_index + 1}/{max_iterations}: "
             + f"obj={updated_objective:.4f} gain={objective_gain:.2e} "
             + f"param_step={relative_parameter_step:.2e} predictor_step={relative_predictor_step:.2e} "
+            + f"applied_predictor_step={effective_predictor_step:.2e} "
             + f"mean_omega={float(np.mean(current_weights)):.3e} "
             + f"[solve={solve_seconds:.1f}s total={total_seconds:.1f}s]  mem={mem()}"
         )
@@ -2336,10 +2594,27 @@ def _binary_posterior_state(
                 current_objective = best_objective
                 final_weights = best_weights
                 break
-        if relative_predictor_step <= gradient_tolerance or max(relative_parameter_step, relative_predictor_step) <= gradient_tolerance:
+        if progress_callback is not None:
+            progress_callback(
+                _build_resume_snapshot(
+                    completed_iterations=iteration_index + 1,
+                    parameters_state=parameters,
+                    current_linear_predictor_state=current_linear_predictor,
+                    current_objective_state=current_objective,
+                    best_parameters_state=best_parameters,
+                    best_linear_predictor_state=best_linear_predictor,
+                    best_objective_state=best_objective,
+                    stall_count_state=stall_count,
+                )
+            )
+        if (
+            effective_predictor_step <= gradient_tolerance
+            or max(effective_parameter_step, effective_predictor_step) <= gradient_tolerance
+        ):
             log(
                 f"      binary converged at iter {iteration_index + 1}: "
                 + f"param_step={relative_parameter_step:.2e} predictor_step={relative_predictor_step:.2e} "
+                + f"applied_predictor_step={effective_predictor_step:.2e} "
                 + f"tol={gradient_tolerance:.2e}"
             )
             break
