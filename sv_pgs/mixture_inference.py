@@ -3545,11 +3545,19 @@ def _solve_sample_space_rhs_gpu_inner(
     search_direction_gpu = preconditioned_residual_gpu
     residual_dot = _gpu_to_f64(cp.sum(residual_gpu * preconditioned_residual_gpu, axis=0, dtype=cp.float64))
     iterations_used = 0
+    import time as _cg_time
+    _cg_t0 = _cg_time.monotonic()
+    _cg_log_interval = max(max_iterations // 10, 1)
+    n_rhs = int(rhs_gpu.shape[1])
     for iteration_index in range(max_iterations):
         iterations_used = iteration_index + 1
         active_columns = np.flatnonzero(~converged).astype(np.int32, copy=False)
         if active_columns.size == 0:
             break
+        if iteration_index % _cg_log_interval == 0 or iteration_index == max_iterations - 1:
+            pct_converged = int(100 * (n_rhs - active_columns.size) / max(n_rhs, 1))
+            max_residual = float(np.max(residual_norm_sq[active_columns])) if active_columns.size > 0 else 0.0
+            log(f"       CG iter {iteration_index+1}/{max_iterations}: {pct_converged}% converged  residual={max_residual:.2e}  ({_cg_time.monotonic()-_cg_t0:.1f}s)")
         masked_search_gpu = search_direction_gpu[:, active_columns]
         operator_search_gpu = apply_operator(masked_search_gpu)
         step_denom = _gpu_to_f64(cp.sum(masked_search_gpu * operator_search_gpu, axis=0, dtype=cp.float64))
@@ -3580,6 +3588,7 @@ def _solve_sample_space_rhs_gpu_inner(
             search_direction_gpu[:, active_columns] * beta_active_gpu[None, :]
         )
         residual_dot[active_columns] = updated_residual_dot_active
+    log(f"       GPU CG done: {iterations_used} iterations in {_cg_time.monotonic()-_cg_t0:.1f}s  mem={mem()}")
     solution = cp.asarray(solution_gpu, dtype=cp.float64)
     return (solution[:, 0] if vector_input else solution), iterations_used
 
