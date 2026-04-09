@@ -1037,6 +1037,7 @@ def fit_variational_em(
                         compute_beta_variance=refresh_beta_variance,
                         sample_space_preconditioner_rank=config.sample_space_preconditioner_rank,
                         predictor_offset=predictor_offset,
+                        allow_gpu_exact_variant=False,
                     )
                     block_beta_candidate = np.asarray(block_state[1], dtype=np.float64)
                     block_beta_variance = (
@@ -1063,6 +1064,7 @@ def fit_variational_em(
                         em_iteration_index=outer_iteration,
                         total_em_iterations=config.max_outer_iterations,
                         update_blend_weight=step_size,
+                        allow_gpu_exact_variant=False,
                     )
                     block_beta_candidate = np.asarray(collapsed_block_state.beta, dtype=np.float64)
                     block_beta_variance = np.asarray(collapsed_block_state.beta_variance, dtype=np.float64)
@@ -1681,6 +1683,7 @@ def _fit_collapsed_posterior(
     em_iteration_index: int | None = None,
     total_em_iterations: int | None = None,
     update_blend_weight: float | None = None,
+    allow_gpu_exact_variant: bool = True,
 ) -> PosteriorState:
     log(f"    collapsed posterior: trait={trait_type.value}  n_variants={genotype_matrix.shape[1]}  n_samples={genotype_matrix.shape[0]}  sigma_e2={sigma_error2:.6f}  mem={mem()}")
     prior_variances = np.maximum(np.asarray(reduced_prior_variances, dtype=np.float64), 1e-8)
@@ -1735,6 +1738,7 @@ def _fit_collapsed_posterior(
             posterior_working_set_coefficient_tolerance=config.posterior_working_set_coefficient_tolerance,
             stale_beta_variance=stale_beta_variance,
             restricted_posterior_warm_start=restricted_posterior_warm_start,
+            allow_gpu_exact_variant=allow_gpu_exact_variant,
         )
         beta_variance = _effective_beta_variance_state(
             compute_beta_variance=compute_beta_variance,
@@ -1773,6 +1777,7 @@ def _fit_collapsed_posterior(
             posterior_working_set_max_passes=config.posterior_working_set_max_passes,
             posterior_working_set_coefficient_tolerance=config.posterior_working_set_coefficient_tolerance,
             restricted_posterior_warm_start=restricted_posterior_warm_start,
+            allow_gpu_exact_variant=allow_gpu_exact_variant,
         )
         beta_variance = _effective_beta_variance_state(
             compute_beta_variance=compute_beta_variance,
@@ -1826,6 +1831,7 @@ def _quantitative_posterior_state(
     posterior_working_set_coefficient_tolerance: float = 1e-4,
     stale_beta_variance: np.ndarray | None = None,
     restricted_posterior_warm_start: _RestrictedPosteriorWarmStart | None = None,
+    allow_gpu_exact_variant: bool = True,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, float, float]:
     standardized_genotypes = _as_standardized_genotype_matrix(genotype_matrix)
     sample_count = standardized_genotypes.shape[0]
@@ -1854,6 +1860,7 @@ def _quantitative_posterior_state(
             posterior_working_set_max_passes=posterior_working_set_max_passes,
             posterior_working_set_coefficient_tolerance=posterior_working_set_coefficient_tolerance,
             warm_start=restricted_posterior_warm_start,
+            allow_gpu_exact_variant=allow_gpu_exact_variant,
         )
     )
     # Re-estimate noise variance.  Naive approach (just use residuals) would
@@ -2113,6 +2120,7 @@ def _binary_posterior_state(
     posterior_working_set_max_passes: int = 6,
     posterior_working_set_coefficient_tolerance: float = 1e-4,
     restricted_posterior_warm_start: _RestrictedPosteriorWarmStart | None = None,
+    allow_gpu_exact_variant: bool = True,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, float, int]:
     standardized_genotypes = _as_standardized_genotype_matrix(genotype_matrix)
     prior_precision = np.asarray(1.0 / np.maximum(prior_variances, 1e-8), dtype=np.float64)
@@ -2257,6 +2265,7 @@ def _binary_posterior_state(
                 posterior_working_set_max_passes=posterior_working_set_max_passes,
                 posterior_working_set_coefficient_tolerance=posterior_working_set_coefficient_tolerance,
                 warm_start=warm_start,
+                allow_gpu_exact_variant=allow_gpu_exact_variant,
             )
         )
         solve_seconds = _time.monotonic() - solve_start
@@ -2375,6 +2384,7 @@ def _binary_posterior_state(
                     posterior_working_set_max_passes=posterior_working_set_max_passes,
                     posterior_working_set_coefficient_tolerance=posterior_working_set_coefficient_tolerance,
                     warm_start=warm_start,
+                    allow_gpu_exact_variant=allow_gpu_exact_variant,
                 )
             )
         except RuntimeError as exc:
@@ -4673,6 +4683,7 @@ def _restricted_posterior_state_posterior_working_set(
     posterior_working_set_max_passes: int,
     posterior_working_set_coefficient_tolerance: float,
     warm_start: _RestrictedPosteriorWarmStart | None,
+    allow_gpu_exact_variant: bool,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, float, float, float]:
     variant_count = genotype_matrix.shape[1]
     _reset_posterior_working_set_warm_start(warm_start, genotype_matrix, variant_count)
@@ -4764,6 +4775,7 @@ def _restricted_posterior_state_posterior_working_set(
             sample_space_preconditioner_rank=sample_space_preconditioner_rank,
             posterior_working_sets=False,
             allow_working_set=False,
+            allow_gpu_exact_variant=allow_gpu_exact_variant,
         )
         # Extract genetic prediction from subset result — avoids one full forward
         # matvec on all variants.  The subset solve returns linear_predictor =
@@ -4904,6 +4916,7 @@ def _restricted_posterior_state_posterior_working_set(
         warm_start=warm_start,
         posterior_working_sets=False,
         allow_working_set=False,
+        allow_gpu_exact_variant=allow_gpu_exact_variant,
     )
     if warm_start is not None:
         warm_start.posterior_working_set_ever_active = _ordered_unique_indices(
@@ -4945,6 +4958,7 @@ def _restricted_posterior_state(
     posterior_working_set_max_passes: int = 6,
     posterior_working_set_coefficient_tolerance: float = 1e-4,
     allow_working_set: bool = True,
+    allow_gpu_exact_variant: bool = True,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, float, float, float]:
     from sv_pgs.progress import log, mem
     compute_jax_dtype = gpu_compute_jax_dtype()
@@ -4959,7 +4973,7 @@ def _restricted_posterior_state(
     variant_count = genotype_matrix.shape[1]
     use_exact_sample = sample_count <= exact_solver_matrix_limit
     use_exact_variant = variant_count <= exact_solver_matrix_limit
-    use_gpu_exact_variant = _use_gpu_exact_variant_solve(
+    use_gpu_exact_variant = allow_gpu_exact_variant and _use_gpu_exact_variant_solve(
         genotype_matrix=genotype_matrix,
         variant_count=variant_count,
         exact_solver_matrix_limit=exact_solver_matrix_limit,
@@ -5090,6 +5104,7 @@ def _restricted_posterior_state(
             posterior_working_set_max_passes=posterior_working_set_max_passes,
             posterior_working_set_coefficient_tolerance=posterior_working_set_coefficient_tolerance,
             warm_start=warm_start,
+            allow_gpu_exact_variant=allow_gpu_exact_variant,
         )
 
     if use_variant_space:

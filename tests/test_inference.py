@@ -1855,6 +1855,49 @@ def test_binary_posterior_uses_inexact_solver_controls_before_final_solve(monkey
     assert solver_settings[1] == (1e-6, 1024, True, True)
 
 
+def test_binary_posterior_state_forwards_allow_gpu_exact_variant(monkeypatch: pytest.MonkeyPatch):
+    sample_count, variant_count = 8, 4
+    standardized = as_raw_genotype_matrix(np.zeros((sample_count, variant_count), dtype=np.float32)).standardized(
+        means=np.zeros(variant_count, dtype=np.float32),
+        scales=np.ones(variant_count, dtype=np.float32),
+    )
+    standardized._dense_cache = standardized.materialize()
+    forwarded_flags: list[bool] = []
+
+    def fake_restricted_posterior_state(**kwargs):
+        forwarded_flags.append(bool(kwargs["allow_gpu_exact_variant"]))
+        sample_dim = kwargs["targets"].shape[0]
+        covariate_dim = kwargs["covariate_matrix"].shape[1]
+        beta = np.zeros(kwargs["prior_variances"].shape[0], dtype=np.float64)
+        return (
+            np.zeros(covariate_dim, dtype=np.float64),
+            beta,
+            np.zeros_like(beta),
+            np.zeros(sample_dim, dtype=np.float64),
+            np.zeros(sample_dim, dtype=np.float64),
+            0.0,
+            0.0,
+            0.0,
+        )
+
+    monkeypatch.setattr(mixture_inference, "_restricted_posterior_state", fake_restricted_posterior_state)
+
+    mixture_inference._binary_posterior_state(
+        genotype_matrix=standardized,
+        covariate_matrix=np.ones((sample_count, 1), dtype=np.float64),
+        targets=np.array([1, 0, 1, 0, 1, 0, 1, 0], dtype=np.float64),
+        prior_variances=np.ones(variant_count, dtype=np.float64),
+        alpha_init=np.zeros(1, dtype=np.float64),
+        beta_init=np.zeros(variant_count, dtype=np.float64),
+        minimum_weight=1e-4,
+        max_iterations=1,
+        gradient_tolerance=1e-8,
+        allow_gpu_exact_variant=False,
+    )
+
+    assert forwarded_flags == [False, False]
+
+
 def test_sample_space_preconditioner_matches_exact_covariance_inverse_at_full_rank():
     genotype_matrix = np.array(
         [
@@ -3694,6 +3737,49 @@ def test_fit_collapsed_posterior_uses_prior_variance_when_refresh_is_skipped_wit
     )
 
     np.testing.assert_allclose(posterior_state.beta_variance, prior_variances)
+
+
+def test_fit_collapsed_posterior_forwards_allow_gpu_exact_variant_to_binary(monkeypatch: pytest.MonkeyPatch):
+    forwarded: list[bool] = []
+
+    def fake_binary_posterior_state(**kwargs):
+        forwarded.append(bool(kwargs["allow_gpu_exact_variant"]))
+        prior_variances = np.asarray(kwargs["prior_variances"], dtype=np.float64)
+        return (
+            np.zeros(kwargs["covariate_matrix"].shape[1], dtype=np.float64),
+            np.zeros_like(prior_variances),
+            np.zeros_like(prior_variances),
+            np.zeros(kwargs["targets"].shape[0], dtype=np.float64),
+            0.0,
+            1,
+        )
+
+    monkeypatch.setattr(mixture_inference, "_binary_posterior_state", fake_binary_posterior_state)
+
+    config = ModelConfig(
+        trait_type=TraitType.BINARY,
+        update_hyperparameters=False,
+    )
+    standardized = as_raw_genotype_matrix(np.zeros((6, 2), dtype=np.float32)).standardized(
+        means=np.zeros(2, dtype=np.float32),
+        scales=np.ones(2, dtype=np.float32),
+    )
+    mixture_inference._fit_collapsed_posterior(
+        genotype_matrix=standardized,
+        covariate_matrix=np.ones((6, 1), dtype=np.float64),
+        targets=np.array([1, 0, 1, 0, 1, 0], dtype=np.float64),
+        reduced_prior_variances=np.array([0.3, 0.8], dtype=np.float64),
+        sigma_error2=1.0,
+        alpha_init=np.zeros(1, dtype=np.float64),
+        beta_init=np.zeros(2, dtype=np.float64),
+        trait_type=TraitType.BINARY,
+        config=config,
+        compute_logdet=False,
+        compute_beta_variance=False,
+        allow_gpu_exact_variant=False,
+    )
+
+    assert forwarded == [False]
 
 
 def test_fit_collapsed_posterior_rejects_mismatched_stale_beta_variance(monkeypatch: pytest.MonkeyPatch):

@@ -56,8 +56,11 @@ def runtime_training_policy_for_fit(
     )
     # Use up to 75% of GPU budget for stochastic blocks — larger blocks mean
     # fewer blocks per epoch, fewer preconditioner builds, better convergence.
+    # On GPU we want stochastic blocks large enough to amortize upload,
+    # preconditioner, and CG startup costs. The static default (8,192) is too
+    # conservative on T4-class cards once the block solver is iterative.
     tuned_stochastic_batch_size = max(
-        min(int(config.stochastic_variant_batch_size), max(int(cacheable_dense_variants * 0.75), 256)),
+        max(int(config.stochastic_variant_batch_size), max(int(cacheable_dense_variants * 0.75), 256)),
         256,
     )
     tuned_final_posterior_refinement = (

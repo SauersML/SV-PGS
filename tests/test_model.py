@@ -144,6 +144,7 @@ def test_runtime_tuned_config_for_t4_uses_budget_driven_solver_limit(monkeypatch
         trait_type=TraitType.BINARY,
         exact_solver_matrix_limit=20_000,
         sample_space_preconditioner_rank=20_000,
+        stochastic_variant_batch_size=2_048,
     )
 
     monkeypatch.setattr(runtime_policy_module, "_try_import_cupy", lambda: object())
@@ -158,6 +159,7 @@ def test_runtime_tuned_config_for_t4_uses_budget_driven_solver_limit(monkeypatch
 
     assert tuned_config.exact_solver_matrix_limit == 9_000
     assert tuned_config.sample_space_preconditioner_rank == 384
+    assert tuned_config.stochastic_variant_batch_size == 7_500
     assert tuned_config.final_posterior_refinement is False
     assert summary is not None
     assert "t4_profile=on" in summary
