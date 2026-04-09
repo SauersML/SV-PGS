@@ -361,6 +361,116 @@ def test_fit_stage_cache_survives_cache_backed_memmap_mtime_changes(tmp_path: Pa
     assert build_tie_map_calls == 1
 
 
+def test_fit_stage_cache_persists_cohort_artifacts_for_repeated_fits(tmp_path: Path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(genotype_module, "require_gpu", lambda: None)
+    monkeypatch.setattr(genotype_module.StandardizedGenotypeMatrix, "try_materialize_gpu", lambda self: False)
+    cache_backed_path = tmp_path / ".sv_pgs_cache" / "synthetic.genotypes.npy"
+    cache_backed_path.parent.mkdir(parents=True, exist_ok=True)
+    genotype_matrix = np.array(
+        [
+            [0, 1, 1, 0],
+            [1, 0, 1, 1],
+            [0, 1, 1, 0],
+            [1, 0, 1, 1],
+            [0, 1, 1, 0],
+            [1, 0, 1, 1],
+        ],
+        dtype=np.int8,
+    )
+    covariate_matrix = np.zeros((genotype_matrix.shape[0], 1), dtype=np.float32)
+    target_vector = np.array([0.0, 1.0, 0.0, 1.0, 0.0, 1.0], dtype=np.float32)
+    variant_records = [
+        VariantRecord("variant_0", VariantClass.SNV, "1", 100, allele_frequency=0.25),
+        VariantRecord("variant_1", VariantClass.SNV, "1", 101, allele_frequency=0.25),
+        VariantRecord("variant_2", VariantClass.SNV, "1", 102, allele_frequency=0.5),
+        VariantRecord("variant_3", VariantClass.SNV, "1", 103, allele_frequency=0.25),
+    ]
+    np.save(cache_backed_path, genotype_matrix)
+
+    raw_genotypes = as_raw_genotype_matrix(np.load(cache_backed_path, mmap_mode="r"))
+    original_compute_variant_statistics = model_module.compute_variant_statistics
+    original_build_tie_map = model_module.build_tie_map
+    compute_variant_statistics_calls = 0
+    build_tie_map_calls = 0
+
+    def counting_compute_variant_statistics(*args, **kwargs):
+        nonlocal compute_variant_statistics_calls
+        compute_variant_statistics_calls += 1
+        return original_compute_variant_statistics(*args, **kwargs)
+
+    def counting_build_tie_map(genotypes, records, config):
+        nonlocal build_tie_map_calls
+        build_tie_map_calls += 1
+        return original_build_tie_map(genotypes, records, config)
+
+    def fake_fit_variational_em(
+        genotypes,
+        covariates,
+        targets,
+        records,
+        tie_map,
+        config,
+        validation_data,
+        resume_checkpoint=None,
+        checkpoint_callback=None,
+        predictor_offset=None,
+        validation_offset=None,
+    ):
+        return VariationalFitResult(
+            alpha=np.zeros(covariates.shape[1], dtype=np.float32),
+            beta_reduced=np.zeros(genotypes.shape[1], dtype=np.float32),
+            beta_variance=np.ones(genotypes.shape[1], dtype=np.float32),
+            prior_scales=np.ones(len(records), dtype=np.float32),
+            global_scale=1.0,
+            class_tpb_shape_a={VariantClass.SNV: 1.0},
+            class_tpb_shape_b={VariantClass.SNV: 0.5},
+            scale_model_coefficients=np.zeros(1, dtype=np.float32),
+            scale_model_feature_names=["intercept"],
+            sigma_error2=1.0,
+            objective_history=[0.0],
+            validation_history=[],
+            member_prior_variances=np.ones(len(records), dtype=np.float32),
+        )
+
+    monkeypatch.setattr(model_module, "compute_variant_statistics", counting_compute_variant_statistics)
+    monkeypatch.setattr(model_module, "build_tie_map", counting_build_tie_map)
+    monkeypatch.setattr(model_module, "fit_variational_em", fake_fit_variational_em)
+
+    config = ModelConfig(
+        trait_type=TraitType.BINARY,
+        max_outer_iterations=1,
+        minimum_minor_allele_frequency=0.0,
+        sample_space_preconditioner_rank=0,
+        final_posterior_refinement=False,
+        stochastic_variational_updates=False,
+    )
+
+    first_model = BayesianPGS(config).fit(
+        raw_genotypes,
+        covariate_matrix,
+        target_vector,
+        variant_records,
+    )
+    assert first_model.state is not None
+    fit_stage_dir = tmp_path / ".sv_pgs_cache" / "fit_stage"
+    assert len(list(fit_stage_dir.glob("*.variant_stats.npz"))) == 1
+    assert len(list(fit_stage_dir.glob("*.reduced_raw_i8.npy"))) == 1
+    assert compute_variant_statistics_calls == 1
+    assert build_tie_map_calls == 1
+
+    second_raw_genotypes = as_raw_genotype_matrix(np.load(cache_backed_path, mmap_mode="r"))
+    second_model = BayesianPGS(config).fit(
+        second_raw_genotypes,
+        covariate_matrix,
+        target_vector,
+        variant_records,
+    )
+    assert second_model.state is not None
+    assert compute_variant_statistics_calls == 1
+    assert build_tie_map_calls == 1
+
+
 def test_sample_space_basis_cache_round_trip(tmp_path):
     genotype_matrix, covariate_matrix, target_vector, variant_records = _synthetic_binary_dataset()
     raw_genotypes = as_raw_genotype_matrix(genotype_matrix)

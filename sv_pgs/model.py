@@ -112,6 +112,25 @@ class _FitStageCachePaths:
             self.fit_key = self.key
 
 
+def _fit_stage_cache_dir() -> Path:
+    return Path.cwd() / _FIT_STAGE_CACHE_DIRNAME / _FIT_STAGE_CACHE_SUBDIR
+
+
+def _fit_stage_variant_stats_cache_path(
+    genotype_matrix: RawGenotypeMatrix,
+    config: ModelConfig,
+) -> Path | None:
+    raw_signature = _persistent_raw_signature(genotype_matrix)
+    if raw_signature is None:
+        return None
+    stats_hasher = hashlib.sha256()
+    stats_hasher.update(f"fit-stage-stats-v{_FIT_STAGE_CACHE_VERSION}".encode("utf-8"))
+    stats_hasher.update(raw_signature.encode("utf-8"))
+    stats_hasher.update(np.asarray([config.minimum_scale], dtype=np.float64).tobytes())
+    stats_key = stats_hasher.hexdigest()[:24]
+    return _fit_stage_cache_dir() / f"{stats_key}.variant_stats.npz"
+
+
 def _validate_fit_inputs(
     genotype_matrix: RawGenotypeMatrix,
     covariates: np.ndarray,
@@ -180,7 +199,7 @@ def _fit_stage_cache_paths(
     _update_hash_with_array_bytes(fit_hasher, np.asarray(covariates, dtype=np.float32))
     _update_hash_with_array_bytes(fit_hasher, np.asarray(targets, dtype=np.float32))
     fit_key = fit_hasher.hexdigest()[:24]
-    cache_dir = Path.cwd() / _FIT_STAGE_CACHE_DIRNAME / _FIT_STAGE_CACHE_SUBDIR
+    cache_dir = _fit_stage_cache_dir()
     return _FitStageCachePaths(
         key=structure_key,
         cache_dir=cache_dir,
@@ -226,6 +245,80 @@ def _persistent_raw_signature(genotype_matrix: RawGenotypeMatrix) -> str | None:
                 return f"memmap-cache:{backing_path}:{stat.st_size}:{backing_matrix.shape}:{backing_matrix.dtype}"
             return f"memmap:{backing_path}:{stat.st_size}:{backing_matrix.shape}:{backing_matrix.dtype}"
     return None
+
+
+def _save_fit_stage_variant_stats_cache(
+    cache_path: Path,
+    variant_stats: VariantStatistics,
+) -> None:
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = cache_path.parent / f"{cache_path.name}.tmp.npz"
+    try:
+        np.savez_compressed(
+            tmp_path,
+            means=np.asarray(variant_stats.means, dtype=np.float32),
+            scales=np.asarray(variant_stats.scales, dtype=np.float32),
+            allele_frequencies=np.asarray(variant_stats.allele_frequencies, dtype=np.float32),
+            support_counts=np.asarray(variant_stats.support_counts, dtype=np.int32),
+        )
+        tmp_path.replace(cache_path)
+        log(
+            "fit-stage variant stats cache saved: "
+            + f"{cache_path.parent.name}/{cache_path.name} "
+            + f"({variant_stats.means.shape[0]} variants)"
+        )
+    except Exception as exc:
+        tmp_path.unlink(missing_ok=True)
+        log(f"fit-stage variant stats cache save failed ({exc}); continuing without durable cohort stats")
+
+
+def _try_load_fit_stage_variant_stats_cache(
+    cache_path: Path,
+    *,
+    variant_count: int,
+) -> VariantStatistics | None:
+    if not cache_path.exists():
+        return None
+    try:
+        cached_arrays = np.load(cache_path, allow_pickle=False)
+        means = np.asarray(cached_arrays["means"], dtype=np.float32)
+        scales = np.asarray(cached_arrays["scales"], dtype=np.float32)
+        allele_frequencies = np.asarray(cached_arrays["allele_frequencies"], dtype=np.float32)
+        support_counts = np.asarray(cached_arrays["support_counts"], dtype=np.int32)
+        expected_shape = (int(variant_count),)
+        if (
+            means.shape != expected_shape
+            or scales.shape != expected_shape
+            or allele_frequencies.shape != expected_shape
+            or support_counts.shape != expected_shape
+        ):
+            raise ValueError("cached variant stats shape mismatch")
+        if not np.all(np.isfinite(means)):
+            raise ValueError("cached variant means must be finite")
+        if not np.all(np.isfinite(scales)) or np.any(scales <= 0.0):
+            raise ValueError("cached variant scales must be finite and positive")
+        if (
+            not np.all(np.isfinite(allele_frequencies))
+            or np.any(allele_frequencies < 0.0)
+            or np.any(allele_frequencies > 1.0)
+        ):
+            raise ValueError("cached allele frequencies must lie in [0.0, 1.0]")
+        if np.any(support_counts < 0):
+            raise ValueError("cached support counts must be non-negative")
+        log(
+            "fit-stage variant stats cache hit — loading from "
+            + f"{cache_path.parent.name}/{cache_path.name}"
+        )
+        return VariantStatistics(
+            means=means,
+            scales=scales,
+            allele_frequencies=allele_frequencies,
+            support_counts=support_counts,
+        )
+    except Exception as exc:
+        log(f"fit-stage variant stats cache load failed ({exc}); recomputing cohort stats")
+        cache_path.unlink(missing_ok=True)
+        return None
 
 
 def _save_fit_stage_structure_cache(
@@ -527,17 +620,31 @@ class BayesianPGS:
         covariate_matrix = self._with_intercept(covariates)
         total_variant_count = len(variant_records)
         log(f"normalized full variant records: {total_variant_count:,}  mem={mem()}")
+        fit_stage_variant_stats_cache_path = _fit_stage_variant_stats_cache_path(
+            raw_genotype_matrix,
+            self.config,
+        )
 
         # Use pre-computed stats if available (saves 3 full data passes)
         if variant_stats is not None:
             log("using pre-computed variant statistics (means, scales, support) [NO DATA PASSES]")
+            if fit_stage_variant_stats_cache_path is not None and not fit_stage_variant_stats_cache_path.exists():
+                _save_fit_stage_variant_stats_cache(fit_stage_variant_stats_cache_path, variant_stats)
             prepared_arrays = fit_preprocessor_from_stats(variant_stats, covariate_matrix, targets)
         else:
-            log("computing variant statistics in-fit so support/standardization share one pass...")
-            variant_stats = compute_variant_statistics(
-                raw_genotypes=raw_genotype_matrix,
-                config=self.config,
-            )
+            if fit_stage_variant_stats_cache_path is not None:
+                variant_stats = _try_load_fit_stage_variant_stats_cache(
+                    fit_stage_variant_stats_cache_path,
+                    variant_count=raw_genotype_matrix.shape[1],
+                )
+            if variant_stats is None:
+                log("computing variant statistics in-fit so support/standardization share one pass...")
+                variant_stats = compute_variant_statistics(
+                    raw_genotypes=raw_genotype_matrix,
+                    config=self.config,
+                )
+                if fit_stage_variant_stats_cache_path is not None:
+                    _save_fit_stage_variant_stats_cache(fit_stage_variant_stats_cache_path, variant_stats)
             prepared_arrays = fit_preprocessor_from_stats(variant_stats, covariate_matrix, targets)
         preprocessor = Preprocessor(means=prepared_arrays.means, scales=prepared_arrays.scales)
         log(f"preprocessor ready  {total_variant_count} variants  mem={mem()}")
@@ -706,20 +813,27 @@ class BayesianPGS:
             in_memory = reduced_genotypes.try_materialize()
             if in_memory:
                 log(f"  RAM materialization succeeded  mem={mem()}")
+        persistent_reduced_cache = (
+            fit_stage_cache_paths is not None
+            and fit_stage_cache_paths.reduced_raw_i8_path.exists()
+        )
+        if fit_stage_cache_paths is not None and not persistent_reduced_cache:
+            log("  persisting reduced int8 genotypes for cohort cache reuse...")
+            persistent_reduced_cache = reduced_genotypes.try_cache_persistently(
+                fit_stage_cache_paths.reduced_raw_i8_path,
+            )
+            if persistent_reduced_cache:
+                log(f"  persistent int8 cohort cache saved  mem={mem()}")
+                _write_fit_stage_cache_manifest(
+                    cache_paths=fit_stage_cache_paths,
+                    active_variant_count=int(active_variant_indices.shape[0]),
+                    reduced_variant_count=int(reduced_tie_map.kept_indices.shape[0]),
+                    has_reduced_raw_i8=True,
+                )
         if in_memory:
             reduced_genotypes.release_raw_storage()
         else:
-            if not local_cache and fit_stage_cache_paths is not None:
-                log("  persisting reduced int8 genotypes to disk...")
-                local_cache = reduced_genotypes.try_cache_persistently(fit_stage_cache_paths.reduced_raw_i8_path)
-                if local_cache:
-                    log(f"  persistent int8 cache saved  mem={mem()}")
-                    _write_fit_stage_cache_manifest(
-                        cache_paths=fit_stage_cache_paths,
-                        active_variant_count=int(active_variant_indices.shape[0]),
-                        reduced_variant_count=int(reduced_tie_map.kept_indices.shape[0]),
-                        has_reduced_raw_i8=True,
-                    )
+            local_cache = local_cache or persistent_reduced_cache
             if not local_cache:
                 local_cache = reduced_genotypes.try_cache_locally()
                 if local_cache:
@@ -738,7 +852,7 @@ class BayesianPGS:
         log(
             f"starting variational EM  max_iterations={self.config.max_outer_iterations}  "
             f"reduced_matrix={reduced_genotypes.shape}  in_memory={in_memory}  "
-            f"local_cache={local_cache}  "
+            f"local_cache={local_cache or persistent_reduced_cache}  "
             f"on_gpu={reduced_genotypes._cupy_cache is not None}  "
             f"mem={mem()}"
         )

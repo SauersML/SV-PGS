@@ -22,18 +22,19 @@ from sv_pgs.genotype import Int8RawGenotypeMatrix
 from sv_pgs.io import (
     _VariantDefaults,
     _inspect_delimited_table,
-    _resolve_sample_id_column,
-    _vcf_cache_key,
     _load_vcf_from_cache,
+    _resolve_sample_id_column,
     _save_vcf_to_cache,
+    _vcf_cache_key,
     load_dataset_from_files,
     load_multi_vcf_dataset_from_files,
-    run_training_pipeline,
 )
 import sv_pgs.genotype as genotype_module
 import sv_pgs.io as io_module
 import sv_pgs.model as model_module
+import sv_pgs.pipeline as pipeline_module
 from sv_pgs.plink import to_bed
+from sv_pgs.pipeline import run_training_pipeline
 
 
 def _run_cli_without_gpu_runtime(argv: list[str]) -> int:
@@ -1311,7 +1312,7 @@ def test_run_training_pipeline_fits_full_cohort_once(tmp_path: Path, monkeypatch
                 np.full(sample_count, 0.1, dtype=np.float32),
             )
 
-    monkeypatch.setattr(io_module, "BayesianPGS", FakeBayesianPGS)
+    monkeypatch.setattr(pipeline_module, "BayesianPGS", FakeBayesianPGS)
 
     dataset = io_module.LoadedDataset(
         sample_ids=[f"sample_{index}" for index in range(8)],
@@ -1384,7 +1385,7 @@ def test_write_predictions_and_summary_binary_uses_single_decision_pass(tmp_path
     model = FakeBinaryModel()
     predictions_path = tmp_path / "predictions.tsv"
 
-    summary = io_module._write_predictions_and_summary(
+    summary = pipeline_module._write_predictions_and_summary(
         predictions_path=predictions_path,
         dataset=dataset,
         model=cast(BayesianPGS, model),
@@ -1429,7 +1430,7 @@ def test_write_predictions_and_summary_quantitative_uses_single_decision_pass(tm
     model = FakeQuantitativeModel()
     predictions_path = tmp_path / "predictions.tsv"
 
-    summary = io_module._write_predictions_and_summary(
+    summary = pipeline_module._write_predictions_and_summary(
         predictions_path=predictions_path,
         dataset=dataset,
         model=cast(BayesianPGS, model),
@@ -1465,7 +1466,7 @@ def test_write_predictions_and_summary_uses_cached_training_scores_without_resco
     )
     predictions_path = tmp_path / "predictions.tsv"
 
-    io_module._write_predictions_and_summary(
+    pipeline_module._write_predictions_and_summary(
         predictions_path=predictions_path,
         dataset=dataset,
         model=cast(BayesianPGS, FakeCachedModel()),

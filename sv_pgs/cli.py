@@ -11,7 +11,8 @@ from pathlib import Path
 from sv_pgs.all_of_us import AllOfUsDiseaseRequest, available_disease_names, prepare_all_of_us_disease_sample_table
 from sv_pgs.aou_runner import run_all_of_us
 from sv_pgs.config import ModelConfig, TraitType
-from sv_pgs.io import load_dataset_from_files, run_training_pipeline
+from sv_pgs.io import load_dataset_from_files
+from sv_pgs.pipeline import run_training_pipeline
 from sv_pgs.progress import gpu_memory_snapshot, jax_runtime_snapshot, log, nvidia_smi_snapshot
 
 

@@ -597,6 +597,11 @@ def _to_cupy_compute(array):
     return _to_cupy_float64(array)
 
 
+def _cupy_to_numpy(array, *, dtype) -> np.ndarray:
+    host_array = array.get() if hasattr(array, "get") else array
+    return np.asarray(host_array, dtype=dtype)
+
+
 def _standardize_batch_cupy(
     batch_values: np.ndarray,
     means,
@@ -1268,6 +1273,7 @@ class StandardizedGenotypeMatrix:
     _sample_space_nystrom_basis_cpu_cache: dict[tuple[int, int], np.ndarray] = field(init=False, default_factory=dict, repr=False)
     _sample_space_nystrom_basis_gpu_cache: dict[tuple[int, int], Any] = field(init=False, default_factory=dict, repr=False)
     _sample_space_probe_projection_cache: dict[tuple[int, int], np.ndarray] = field(init=False, default_factory=dict, repr=False)
+    _sample_space_probe_projection_gpu_cache: dict[tuple[int, int], Any] = field(init=False, default_factory=dict, repr=False)
     _sample_space_cpu_preconditioner_cache: Any | None = field(init=False, default=None, repr=False)
     _sample_space_gpu_preconditioner_cache: Any | None = field(init=False, default=None, repr=False)
     _n_samples: int = field(init=False, default=0, repr=False)
@@ -1453,6 +1459,7 @@ class StandardizedGenotypeMatrix:
         self._sample_space_nystrom_basis_cpu_cache.clear()
         self._sample_space_nystrom_basis_gpu_cache.clear()
         self._sample_space_probe_projection_cache.clear()
+        self._sample_space_probe_projection_gpu_cache.clear()
         self._sample_space_cpu_preconditioner_cache = None
         self._sample_space_gpu_preconditioner_cache = None
         self._cupy_subset_cache = None
@@ -1719,7 +1726,7 @@ class StandardizedGenotypeMatrix:
 
     def try_cache_persistently(self, cache_path: Path) -> bool:
         """Persist a reduced raw int8 cache to a stable path for reuse across runs."""
-        if self.raw is None or self._dense_cache is not None or self._cupy_cache is not None:
+        if self.raw is None:
             return False
         if not _supports_int8_batches(self.raw):
             return False
@@ -1918,6 +1925,187 @@ class StandardizedGenotypeMatrix:
             requested_batch_size=batch_size,
         )
 
+    def _gpu_variant_matmul(
+        self,
+        matrix,
+        *,
+        batch_size: int,
+        cupy,
+        dtype=None,
+        local_variant_indices: np.ndarray | None = None,
+        progress_label: str | None = None,
+    ):
+        resolved_dtype = _cupy_compute_dtype(cupy) if dtype is None else dtype
+        matrix_gpu = cupy.asarray(matrix, dtype=resolved_dtype)
+        if matrix_gpu.ndim == 1:
+            matrix_gpu = matrix_gpu[:, None]
+            vector_input = True
+        elif matrix_gpu.ndim == 2:
+            vector_input = False
+        else:
+            raise ValueError("GPU genotype matmul expects a vector or matrix right-hand side.")
+        resolved_local_indices = (
+            np.arange(self.shape[1], dtype=np.int32)
+            if local_variant_indices is None
+            else np.asarray(local_variant_indices, dtype=np.int32)
+        )
+        if resolved_local_indices.ndim != 1:
+            raise ValueError("local_variant_indices must be 1D.")
+        if matrix_gpu.shape[0] != resolved_local_indices.shape[0]:
+            raise ValueError("GPU genotype matmul right-hand side row count must match the selected variant count.")
+        if resolved_local_indices.size == 0:
+            result_gpu = cupy.zeros((self.shape[0], matrix_gpu.shape[1]), dtype=resolved_dtype)
+            return result_gpu[:, 0] if vector_input else result_gpu
+        if self._cupy_cache is not None:
+            cache = (
+                self._cupy_cache
+                if local_variant_indices is None
+                else _cupy_cache_subset_columns(self._cupy_cache, resolved_local_indices)
+            )
+            if _cupy_cache_is_int8_standardized(cache):
+                result_gpu = cupy.zeros((self.shape[0], matrix_gpu.shape[1]), dtype=resolved_dtype)
+                for batch_slice, standardized_batch in _iter_cupy_cache_standardized_batches(
+                    cache,
+                    sample_count=self.shape[0],
+                    batch_size=batch_size,
+                    cupy=cupy,
+                    dtype=resolved_dtype,
+                ):
+                    result_gpu += standardized_batch @ matrix_gpu[batch_slice, :]
+            else:
+                result_gpu = cache.astype(resolved_dtype, copy=False) @ matrix_gpu
+            return result_gpu[:, 0] if vector_input else result_gpu
+        streaming_cupy, streaming_batch_size = self._streaming_gpu_context(batch_size)
+        if streaming_cupy is None or streaming_batch_size is None or self.raw is None:
+            raise RuntimeError("GPU genotype matmul requires a GPU cache or a streaming raw backend.")
+        active_variant_indices = self.variant_indices[resolved_local_indices]
+        result_gpu = cupy.zeros((self.shape[0], matrix_gpu.shape[1]), dtype=resolved_dtype)
+        raw_matrix = cast(RawGenotypeMatrix, self.raw)
+        total_variants = int(resolved_local_indices.shape[0])
+        completed_variants = 0
+        last_logged_variants = 0
+        log_interval = max(total_variants // 10, 1)
+        for batch_slice, standardized_batch in _iter_standardized_gpu_batches(
+            raw_matrix,
+            active_variant_indices,
+            self.means,
+            self.scales,
+            batch_size=streaming_batch_size,
+            cupy=cupy,
+            dtype=resolved_dtype,
+        ):
+            result_gpu += standardized_batch @ matrix_gpu[batch_slice, :]
+            if progress_label is not None:
+                completed_variants = (
+                    batch_slice.stop
+                    if isinstance(batch_slice, slice)
+                    else completed_variants + standardized_batch.shape[1]
+                )
+                if completed_variants - last_logged_variants >= log_interval:
+                    last_logged_variants = completed_variants
+                    log(f"        {progress_label}: {completed_variants:,}/{total_variants:,} ({100*completed_variants/total_variants:.0f}%)  mem={mem()}")
+        return result_gpu[:, 0] if vector_input else result_gpu
+
+    def _gpu_transpose_matmul(
+        self,
+        matrix,
+        *,
+        batch_size: int,
+        cupy,
+        dtype=None,
+        progress_label: str | None = None,
+    ):
+        resolved_dtype = _cupy_compute_dtype(cupy) if dtype is None else dtype
+        matrix_gpu = cupy.asarray(matrix, dtype=resolved_dtype)
+        if matrix_gpu.ndim == 1:
+            matrix_gpu = matrix_gpu[:, None]
+            vector_input = True
+        elif matrix_gpu.ndim == 2:
+            vector_input = False
+        else:
+            raise ValueError("GPU genotype transpose matmul expects a vector or matrix right-hand side.")
+        if matrix_gpu.shape[0] != self.shape[0]:
+            raise ValueError("GPU genotype transpose matmul right-hand side row count must match the sample count.")
+        if self._cupy_cache is not None:
+            if _cupy_cache_is_int8_standardized(self._cupy_cache):
+                result_gpu = cupy.empty((self.shape[1], matrix_gpu.shape[1]), dtype=resolved_dtype)
+                for batch_slice, standardized_batch in _iter_cupy_cache_standardized_batches(
+                    self._cupy_cache,
+                    sample_count=self.shape[0],
+                    batch_size=batch_size,
+                    cupy=cupy,
+                    dtype=resolved_dtype,
+                ):
+                    result_gpu[batch_slice, :] = standardized_batch.T @ matrix_gpu
+            else:
+                result_gpu = self._cupy_cache.astype(resolved_dtype, copy=False).T @ matrix_gpu
+            return result_gpu[:, 0] if vector_input else result_gpu
+        streaming_cupy, streaming_batch_size = self._streaming_gpu_context(batch_size)
+        if streaming_cupy is None or streaming_batch_size is None or self.raw is None:
+            raise RuntimeError("GPU genotype transpose matmul requires a GPU cache or a streaming raw backend.")
+        result_gpu = cupy.empty((self.shape[1], matrix_gpu.shape[1]), dtype=resolved_dtype)
+        raw_matrix = cast(RawGenotypeMatrix, self.raw)
+        total_variants = self.shape[1]
+        completed_variants = 0
+        last_logged_variants = 0
+        log_interval = max(total_variants // 10, 1)
+        for batch_slice, standardized_batch in _iter_standardized_gpu_batches(
+            raw_matrix,
+            self.variant_indices,
+            self.means,
+            self.scales,
+            batch_size=streaming_batch_size,
+            cupy=cupy,
+            dtype=resolved_dtype,
+        ):
+            result_gpu[batch_slice, :] = standardized_batch.T @ matrix_gpu
+            if progress_label is not None:
+                completed_variants = (
+                    batch_slice.stop
+                    if isinstance(batch_slice, slice)
+                    else completed_variants + standardized_batch.shape[1]
+                )
+                if completed_variants - last_logged_variants >= log_interval:
+                    last_logged_variants = completed_variants
+                    log(f"        {progress_label}: {completed_variants:,}/{total_variants:,} ({100*completed_variants/total_variants:.0f}%)  mem={mem()}")
+        return result_gpu[:, 0] if vector_input else result_gpu
+
+    def gpu_matmat(
+        self,
+        matrix,
+        *,
+        batch_size: int = DEFAULT_GENOTYPE_BATCH_SIZE,
+        cupy=None,
+        dtype=None,
+    ):
+        resolved_cupy = _try_import_cupy() if cupy is None else cupy
+        if resolved_cupy is None:
+            raise RuntimeError("GPU genotype matmul requires CuPy.")
+        return self._gpu_variant_matmul(
+            matrix,
+            batch_size=batch_size,
+            cupy=resolved_cupy,
+            dtype=dtype,
+        )
+
+    def gpu_transpose_matmat(
+        self,
+        matrix,
+        *,
+        batch_size: int = DEFAULT_GENOTYPE_BATCH_SIZE,
+        cupy=None,
+        dtype=None,
+    ):
+        resolved_cupy = _try_import_cupy() if cupy is None else cupy
+        if resolved_cupy is None:
+            raise RuntimeError("GPU genotype transpose matmul requires CuPy.")
+        return self._gpu_transpose_matmul(
+            matrix,
+            batch_size=batch_size,
+            cupy=resolved_cupy,
+            dtype=dtype,
+        )
+
     def _iter_selected_column_batches(
         self,
         local_variant_indices: np.ndarray,
@@ -1997,19 +2185,7 @@ class StandardizedGenotypeMatrix:
             )
             local_start = local_stop
 
-    def matvec(self, coefficients: np.ndarray | jnp.ndarray, batch_size: int = DEFAULT_GENOTYPE_BATCH_SIZE) -> jnp.ndarray:
-        """Compute X_std @ beta (genotype matrix times coefficient vector).
-
-        When CuPy GPU-cached: cuBLAS matmul. Otherwise: batched numpy on CPU.
-        """
-        if self.supports_jax_dense_ops():
-            coeff_jax = _normalize_jax_vector_operand(
-                coefficients,
-                expected_length=self.shape[1],
-                shape_error="coefficient vector must match genotype column count.",
-                finite_name="coefficient vector",
-            )
-            return self._ensure_jax_cache() @ coeff_jax
+    def matvec_numpy(self, coefficients: np.ndarray | jnp.ndarray, batch_size: int = DEFAULT_GENOTYPE_BATCH_SIZE) -> np.ndarray:
         coeff_np = _normalize_numpy_vector_operand(
             coefficients,
             expected_length=self.shape[1],
@@ -2018,57 +2194,37 @@ class StandardizedGenotypeMatrix:
         )
         active_local_indices = _active_vector_local_indices(coeff_np)
         if active_local_indices.size == 0:
-            return _as_gpu_compute_jax(np.zeros(self.shape[0], dtype=coeff_np.dtype))
+            return np.zeros(self.shape[0], dtype=coeff_np.dtype)
         if self._cupy_cache is not None:
             cupy = _try_import_cupy()
             if cupy is None:
                 if _cupy_cache_is_int8_standardized(self._cupy_cache):
                     raise RuntimeError("CuPy int8 cache requires CuPy runtime.")
                 dense_cache = np.asarray(self._cupy_cache[:, active_local_indices], dtype=coeff_np.dtype)
-                result = dense_cache @ coeff_np[active_local_indices]
-                return _as_gpu_compute_jax(result)
-            compute_cp_dtype = _cupy_compute_dtype(cupy)
-            coeff_cupy = _to_cupy_compute(coeff_np[active_local_indices])
-            if _cupy_cache_is_int8_standardized(self._cupy_cache):
-                active_cache = _cupy_cache_subset_columns(self._cupy_cache, active_local_indices)
-                result = cupy.zeros(self.shape[0], dtype=compute_cp_dtype)
-                for batch_slice, standardized_batch in _iter_cupy_cache_standardized_batches(
-                    active_cache,
-                    sample_count=self.shape[0],
+                return np.asarray(dense_cache @ coeff_np[active_local_indices], dtype=coeff_np.dtype)
+            return _cupy_to_numpy(
+                self._gpu_variant_matmul(
+                    coeff_np[active_local_indices],
                     batch_size=batch_size,
                     cupy=cupy,
-                    dtype=compute_cp_dtype,
-                ):
-                    result += standardized_batch @ coeff_cupy[batch_slice]
-            else:
-                result = self._cupy_cache[:, active_local_indices].astype(compute_cp_dtype, copy=False) @ coeff_cupy
-            return _cupy_to_jax(result)
+                    dtype=_cupy_compute_dtype(cupy),
+                    local_variant_indices=active_local_indices,
+                ),
+                dtype=coeff_np.dtype,
+            )
         cupy, streaming_batch_size = self._streaming_gpu_context(batch_size)
         if cupy is not None and streaming_batch_size is not None:
-            compute_cp_dtype = _cupy_compute_dtype(cupy)
-            active_variant_indices = self.variant_indices[active_local_indices]
-            coeff_gpu = _to_cupy_compute(coeff_np[active_local_indices])
-            result_gpu = cupy.zeros(self.shape[0], dtype=compute_cp_dtype)
-            raw_matrix = cast(RawGenotypeMatrix, self.raw)
-            _tv = int(active_local_indices.shape[0])
-            _cv = 0
-            _lv = 0
-            _li = max(_tv // 10, 1)
-            for batch_slice, standardized_batch in _iter_standardized_gpu_batches(
-                raw_matrix,
-                active_variant_indices,
-                self.means,
-                self.scales,
-                batch_size=streaming_batch_size,
-                cupy=cupy,
-                dtype=compute_cp_dtype,
-            ):
-                result_gpu += standardized_batch @ coeff_gpu[batch_slice]
-                _cv = batch_slice.stop if isinstance(batch_slice, slice) else _cv + standardized_batch.shape[1]
-                if _cv - _lv >= _li:
-                    _lv = _cv
-                    log(f"        GPU matvec: {_cv:,}/{_tv:,} ({100*_cv/_tv:.0f}%)  mem={mem()}")
-            return _cupy_to_jax(result_gpu)
+            return _cupy_to_numpy(
+                self._gpu_variant_matmul(
+                    coeff_np[active_local_indices],
+                    batch_size=streaming_batch_size,
+                    cupy=cupy,
+                    dtype=_cupy_compute_dtype(cupy),
+                    local_variant_indices=active_local_indices,
+                    progress_label="GPU matvec",
+                ),
+                dtype=coeff_np.dtype,
+            )
         if self._uses_hybrid_backend():
             sparse_parent_local_indices, dense_parent_local_indices = self._hybrid_parent_local_indices()
             result = np.zeros(self.shape[0], dtype=coeff_np.dtype)
@@ -2079,11 +2235,8 @@ class StandardizedGenotypeMatrix:
             if dense_parent_local_indices.size > 0:
                 if self._dense_backend is None:
                     raise RuntimeError("hybrid dense backend is not configured.")
-                result += np.asarray(
-                    self._dense_backend.matvec(coeff_np[dense_parent_local_indices], batch_size=batch_size),
-                    dtype=coeff_np.dtype,
-                )
-            return _as_gpu_compute_jax(result)
+                result += self._dense_backend.matvec_numpy(coeff_np[dense_parent_local_indices], batch_size=batch_size)
+            return np.asarray(result, dtype=coeff_np.dtype)
         result = np.zeros(self.shape[0], dtype=coeff_np.dtype)
         _total_variants = int(active_local_indices.shape[0])
         _completed_variants = 0
@@ -2096,18 +2249,24 @@ class StandardizedGenotypeMatrix:
             if _completed_variants - _last_log_variants >= _log_interval:
                 _last_log_variants = _completed_variants
                 log(f"        matvec: {_completed_variants:,}/{_total_variants:,} ({100*_completed_variants/_total_variants:.0f}%)  mem={mem()}")
-        return _as_gpu_compute_jax(result)
+        return result
 
-    def matmat(self, matrix: np.ndarray | jnp.ndarray, batch_size: int = DEFAULT_GENOTYPE_BATCH_SIZE) -> jnp.ndarray:
-        """Compute X_std @ M. When CuPy GPU-cached: cuBLAS matmul. Otherwise: batched numpy."""
+    def matvec_jax(self, coefficients: np.ndarray | jnp.ndarray, batch_size: int = DEFAULT_GENOTYPE_BATCH_SIZE) -> jnp.ndarray:
         if self.supports_jax_dense_ops():
-            matrix_jax = _normalize_jax_matrix_operand(
-                matrix,
-                expected_rows=self.shape[1],
-                shape_error="variant matrix must match genotype column count.",
-                finite_name="variant matrix",
+            coeff_jax = _normalize_jax_vector_operand(
+                coefficients,
+                expected_length=self.shape[1],
+                shape_error="coefficient vector must match genotype column count.",
+                finite_name="coefficient vector",
             )
-            return self._ensure_jax_cache() @ matrix_jax
+            return self._ensure_jax_cache() @ coeff_jax
+        return _as_gpu_compute_jax(self.matvec_numpy(coefficients, batch_size=batch_size))
+
+    def matvec(self, coefficients: np.ndarray | jnp.ndarray, batch_size: int = DEFAULT_GENOTYPE_BATCH_SIZE) -> jnp.ndarray:
+        """Compute X_std @ beta with JAX as the public return type."""
+        return self.matvec_jax(coefficients, batch_size=batch_size)
+
+    def matmat_numpy(self, matrix: np.ndarray | jnp.ndarray, batch_size: int = DEFAULT_GENOTYPE_BATCH_SIZE) -> np.ndarray:
         m_np = _normalize_numpy_matrix_operand(
             matrix,
             expected_rows=self.shape[1],
@@ -2116,49 +2275,36 @@ class StandardizedGenotypeMatrix:
         )
         active_local_indices = _active_matrix_row_local_indices(m_np)
         if active_local_indices.size == 0:
-            return _as_gpu_compute_jax(np.zeros((self.shape[0], m_np.shape[1]), dtype=m_np.dtype))
+            return np.zeros((self.shape[0], m_np.shape[1]), dtype=m_np.dtype)
         if self._cupy_cache is not None:
             cupy = _try_import_cupy()
             if cupy is None:
                 if _cupy_cache_is_int8_standardized(self._cupy_cache):
                     raise RuntimeError("CuPy int8 cache requires CuPy runtime.")
                 dense_cache = np.asarray(self._cupy_cache[:, active_local_indices], dtype=m_np.dtype)
-                result = dense_cache @ m_np[active_local_indices, :]
-                return _as_gpu_compute_jax(result)
-            compute_cp_dtype = _cupy_compute_dtype(cupy)
-            matrix_cupy = _to_cupy_compute(m_np[active_local_indices, :])
-            if _cupy_cache_is_int8_standardized(self._cupy_cache):
-                active_cache = _cupy_cache_subset_columns(self._cupy_cache, active_local_indices)
-                result = cupy.zeros((self.shape[0], m_np.shape[1]), dtype=compute_cp_dtype)
-                for batch_slice, standardized_batch in _iter_cupy_cache_standardized_batches(
-                    active_cache,
-                    sample_count=self.shape[0],
+                return np.asarray(dense_cache @ m_np[active_local_indices, :], dtype=m_np.dtype)
+            return _cupy_to_numpy(
+                self._gpu_variant_matmul(
+                    m_np[active_local_indices, :],
                     batch_size=batch_size,
                     cupy=cupy,
-                    dtype=compute_cp_dtype,
-                ):
-                    result += standardized_batch @ matrix_cupy[batch_slice, :]
-            else:
-                result = self._cupy_cache[:, active_local_indices].astype(compute_cp_dtype, copy=False) @ matrix_cupy
-            return _cupy_to_jax(result)
+                    dtype=_cupy_compute_dtype(cupy),
+                    local_variant_indices=active_local_indices,
+                ),
+                dtype=m_np.dtype,
+            )
         cupy, streaming_batch_size = self._streaming_gpu_context(batch_size)
         if cupy is not None and streaming_batch_size is not None:
-            compute_cp_dtype = _cupy_compute_dtype(cupy)
-            active_variant_indices = self.variant_indices[active_local_indices]
-            matrix_gpu = _to_cupy_compute(m_np[active_local_indices, :])
-            result_gpu = cupy.zeros((self.shape[0], m_np.shape[1]), dtype=compute_cp_dtype)
-            raw_matrix = cast(RawGenotypeMatrix, self.raw)
-            for batch_slice, standardized_batch in _iter_standardized_gpu_batches(
-                raw_matrix,
-                active_variant_indices,
-                self.means,
-                self.scales,
-                batch_size=streaming_batch_size,
-                cupy=cupy,
-                dtype=compute_cp_dtype,
-            ):
-                result_gpu += standardized_batch @ matrix_gpu[batch_slice, :]
-            return _cupy_to_jax(result_gpu)
+            return _cupy_to_numpy(
+                self._gpu_variant_matmul(
+                    m_np[active_local_indices, :],
+                    batch_size=streaming_batch_size,
+                    cupy=cupy,
+                    dtype=_cupy_compute_dtype(cupy),
+                    local_variant_indices=active_local_indices,
+                ),
+                dtype=m_np.dtype,
+            )
         if self._uses_hybrid_backend():
             sparse_parent_local_indices, dense_parent_local_indices = self._hybrid_parent_local_indices()
             output = np.zeros((self.shape[0], m_np.shape[1]), dtype=m_np.dtype)
@@ -2169,27 +2315,30 @@ class StandardizedGenotypeMatrix:
             if dense_parent_local_indices.size > 0:
                 if self._dense_backend is None:
                     raise RuntimeError("hybrid dense backend is not configured.")
-                output += np.asarray(
-                    self._dense_backend.matmat(m_np[dense_parent_local_indices, :], batch_size=batch_size),
-                    dtype=m_np.dtype,
-                )
-            return _as_gpu_compute_jax(output)
+                output += self._dense_backend.matmat_numpy(m_np[dense_parent_local_indices, :], batch_size=batch_size)
+            return output
         output = np.zeros((self.shape[0], m_np.shape[1]), dtype=m_np.dtype)
         for batch in self._iter_selected_column_batches(active_local_indices, batch_size=batch_size):
             batch_values = np.asarray(batch.values, dtype=output.dtype)
             output += batch_values @ m_np[batch.variant_indices, :]
-        return _as_gpu_compute_jax(output)
+        return output
 
-    def transpose_matvec(self, vector: np.ndarray | jnp.ndarray, batch_size: int = DEFAULT_GENOTYPE_BATCH_SIZE) -> jnp.ndarray:
-        """Compute X_std^T @ v. When CuPy GPU-cached: cuBLAS matmul. Otherwise: batched numpy."""
+    def matmat_jax(self, matrix: np.ndarray | jnp.ndarray, batch_size: int = DEFAULT_GENOTYPE_BATCH_SIZE) -> jnp.ndarray:
         if self.supports_jax_dense_ops():
-            vector_jax = _normalize_jax_vector_operand(
-                vector,
-                expected_length=self.shape[0],
-                shape_error="sample vector must match genotype row count.",
-                finite_name="sample vector",
+            matrix_jax = _normalize_jax_matrix_operand(
+                matrix,
+                expected_rows=self.shape[1],
+                shape_error="variant matrix must match genotype column count.",
+                finite_name="variant matrix",
             )
-            return self._ensure_jax_cache().T @ vector_jax
+            return self._ensure_jax_cache() @ matrix_jax
+        return _as_gpu_compute_jax(self.matmat_numpy(matrix, batch_size=batch_size))
+
+    def matmat(self, matrix: np.ndarray | jnp.ndarray, batch_size: int = DEFAULT_GENOTYPE_BATCH_SIZE) -> jnp.ndarray:
+        """Compute X_std @ M with JAX as the public return type."""
+        return self.matmat_jax(matrix, batch_size=batch_size)
+
+    def transpose_matvec_numpy(self, vector: np.ndarray | jnp.ndarray, batch_size: int = DEFAULT_GENOTYPE_BATCH_SIZE) -> np.ndarray:
         v_np = _normalize_numpy_vector_operand(
             vector,
             expected_length=self.shape[0],
@@ -2197,54 +2346,34 @@ class StandardizedGenotypeMatrix:
             finite_name="sample vector",
         )
         if not np.any(v_np):
-            return _as_gpu_compute_jax(np.zeros(self.shape[1], dtype=v_np.dtype))
+            return np.zeros(self.shape[1], dtype=v_np.dtype)
         if self._cupy_cache is not None:
             cupy = _try_import_cupy()
             if cupy is None:
                 if _cupy_cache_is_int8_standardized(self._cupy_cache):
                     raise RuntimeError("CuPy int8 cache requires CuPy runtime.")
-                result = np.asarray(self._cupy_cache, dtype=v_np.dtype).T @ v_np
-                return _as_gpu_compute_jax(result)
-            compute_cp_dtype = _cupy_compute_dtype(cupy)
-            vector_cupy = _to_cupy_compute(v_np)
-            if _cupy_cache_is_int8_standardized(self._cupy_cache):
-                result = cupy.empty(self.shape[1], dtype=compute_cp_dtype)
-                for batch_slice, standardized_batch in _iter_cupy_cache_standardized_batches(
-                    self._cupy_cache,
-                    sample_count=self.shape[0],
+                return np.asarray(np.asarray(self._cupy_cache, dtype=v_np.dtype).T @ v_np, dtype=v_np.dtype)
+            return _cupy_to_numpy(
+                self._gpu_transpose_matmul(
+                    v_np,
                     batch_size=batch_size,
                     cupy=cupy,
-                    dtype=compute_cp_dtype,
-                ):
-                    result[batch_slice] = standardized_batch.T @ vector_cupy
-            else:
-                result = self._cupy_cache.astype(compute_cp_dtype, copy=False).T @ vector_cupy
-            return _cupy_to_jax(result)
+                    dtype=_cupy_compute_dtype(cupy),
+                ),
+                dtype=v_np.dtype,
+            )
         cupy, streaming_batch_size = self._streaming_gpu_context(batch_size)
         if cupy is not None and streaming_batch_size is not None:
-            compute_cp_dtype = _cupy_compute_dtype(cupy)
-            vector_gpu = _to_cupy_compute(v_np)
-            output_gpu = cupy.empty(self.shape[1], dtype=compute_cp_dtype)
-            raw_matrix = cast(RawGenotypeMatrix, self.raw)
-            _tv = self.shape[1]
-            _cv = 0
-            _lv = 0
-            _li = max(_tv // 10, 1)
-            for batch_slice, standardized_batch in _iter_standardized_gpu_batches(
-                raw_matrix,
-                self.variant_indices,
-                self.means,
-                self.scales,
-                batch_size=streaming_batch_size,
-                cupy=cupy,
-                dtype=compute_cp_dtype,
-            ):
-                output_gpu[batch_slice] = standardized_batch.T @ vector_gpu
-                _cv = batch_slice.stop if isinstance(batch_slice, slice) else _cv + standardized_batch.shape[1]
-                if _cv - _lv >= _li:
-                    _lv = _cv
-                    log(f"        GPU transpose_matvec: {_cv:,}/{_tv:,} ({100*_cv/_tv:.0f}%)  mem={mem()}")
-            return _cupy_to_jax(output_gpu)
+            return _cupy_to_numpy(
+                self._gpu_transpose_matmul(
+                    v_np,
+                    batch_size=streaming_batch_size,
+                    cupy=cupy,
+                    dtype=_cupy_compute_dtype(cupy),
+                    progress_label="GPU transpose_matvec",
+                ),
+                dtype=v_np.dtype,
+            )
         if self._uses_hybrid_backend():
             sparse_parent_local_indices, dense_parent_local_indices = self._hybrid_parent_local_indices()
             output = np.empty(self.shape[1], dtype=v_np.dtype)
@@ -2255,11 +2384,8 @@ class StandardizedGenotypeMatrix:
             if dense_parent_local_indices.size > 0:
                 if self._dense_backend is None:
                     raise RuntimeError("hybrid dense backend is not configured.")
-                output[dense_parent_local_indices] = np.asarray(
-                    self._dense_backend.transpose_matvec(v_np, batch_size=batch_size),
-                    dtype=v_np.dtype,
-                )
-            return _as_gpu_compute_jax(output)
+                output[dense_parent_local_indices] = self._dense_backend.transpose_matvec_numpy(v_np, batch_size=batch_size)
+            return output
         output = np.empty(self.shape[1], dtype=v_np.dtype)
         _total_variants = self.shape[1]
         _completed_variants = 0
@@ -2271,18 +2397,24 @@ class StandardizedGenotypeMatrix:
             if _completed_variants - _last_log_variants >= _log_interval:
                 _last_log_variants = _completed_variants
                 log(f"        transpose_matvec: {_completed_variants:,}/{_total_variants:,} ({100*_completed_variants/_total_variants:.0f}%)  mem={mem()}")
-        return _as_gpu_compute_jax(output)
+        return output
 
-    def transpose_matmat(self, matrix: np.ndarray | jnp.ndarray, batch_size: int = DEFAULT_GENOTYPE_BATCH_SIZE) -> jnp.ndarray:
-        """Compute X_std^T @ M. When CuPy GPU-cached: cuBLAS matmul. Otherwise: batched numpy."""
+    def transpose_matvec_jax(self, vector: np.ndarray | jnp.ndarray, batch_size: int = DEFAULT_GENOTYPE_BATCH_SIZE) -> jnp.ndarray:
         if self.supports_jax_dense_ops():
-            matrix_jax = _normalize_jax_matrix_operand(
-                matrix,
-                expected_rows=self.shape[0],
-                shape_error="sample matrix must match genotype row count.",
-                finite_name="sample matrix",
+            vector_jax = _normalize_jax_vector_operand(
+                vector,
+                expected_length=self.shape[0],
+                shape_error="sample vector must match genotype row count.",
+                finite_name="sample vector",
             )
-            return self._ensure_jax_cache().T @ matrix_jax
+            return self._ensure_jax_cache().T @ vector_jax
+        return _as_gpu_compute_jax(self.transpose_matvec_numpy(vector, batch_size=batch_size))
+
+    def transpose_matvec(self, vector: np.ndarray | jnp.ndarray, batch_size: int = DEFAULT_GENOTYPE_BATCH_SIZE) -> jnp.ndarray:
+        """Compute X_std^T @ v with JAX as the public return type."""
+        return self.transpose_matvec_jax(vector, batch_size=batch_size)
+
+    def transpose_matmat_numpy(self, matrix: np.ndarray | jnp.ndarray, batch_size: int = DEFAULT_GENOTYPE_BATCH_SIZE) -> np.ndarray:
         m_np = _normalize_numpy_matrix_operand(
             matrix,
             expected_rows=self.shape[0],
@@ -2290,46 +2422,33 @@ class StandardizedGenotypeMatrix:
             finite_name="sample matrix",
         )
         if not np.any(m_np):
-            return _as_gpu_compute_jax(np.zeros((self.shape[1], m_np.shape[1]), dtype=m_np.dtype))
+            return np.zeros((self.shape[1], m_np.shape[1]), dtype=m_np.dtype)
         if self._cupy_cache is not None:
             cupy = _try_import_cupy()
             if cupy is None:
                 if _cupy_cache_is_int8_standardized(self._cupy_cache):
                     raise RuntimeError("CuPy int8 cache requires CuPy runtime.")
-                result = np.asarray(self._cupy_cache, dtype=m_np.dtype).T @ m_np
-                return _as_gpu_compute_jax(result)
-            compute_cp_dtype = _cupy_compute_dtype(cupy)
-            matrix_cupy = _to_cupy_compute(m_np)
-            if _cupy_cache_is_int8_standardized(self._cupy_cache):
-                result = cupy.empty((self.shape[1], m_np.shape[1]), dtype=compute_cp_dtype)
-                for batch_slice, standardized_batch in _iter_cupy_cache_standardized_batches(
-                    self._cupy_cache,
-                    sample_count=self.shape[0],
+                return np.asarray(np.asarray(self._cupy_cache, dtype=m_np.dtype).T @ m_np, dtype=m_np.dtype)
+            return _cupy_to_numpy(
+                self._gpu_transpose_matmul(
+                    m_np,
                     batch_size=batch_size,
                     cupy=cupy,
-                    dtype=compute_cp_dtype,
-                ):
-                    result[batch_slice, :] = standardized_batch.T @ matrix_cupy
-            else:
-                result = self._cupy_cache.astype(compute_cp_dtype, copy=False).T @ matrix_cupy
-            return _cupy_to_jax(result)
+                    dtype=_cupy_compute_dtype(cupy),
+                ),
+                dtype=m_np.dtype,
+            )
         cupy, streaming_batch_size = self._streaming_gpu_context(batch_size)
         if cupy is not None and streaming_batch_size is not None:
-            compute_cp_dtype = _cupy_compute_dtype(cupy)
-            matrix_gpu = _to_cupy_compute(m_np)
-            output_gpu = cupy.empty((self.shape[1], m_np.shape[1]), dtype=compute_cp_dtype)
-            raw_matrix = cast(RawGenotypeMatrix, self.raw)
-            for batch_slice, standardized_batch in _iter_standardized_gpu_batches(
-                raw_matrix,
-                self.variant_indices,
-                self.means,
-                self.scales,
-                batch_size=streaming_batch_size,
-                cupy=cupy,
-                dtype=compute_cp_dtype,
-            ):
-                output_gpu[batch_slice, :] = standardized_batch.T @ matrix_gpu
-            return _cupy_to_jax(output_gpu)
+            return _cupy_to_numpy(
+                self._gpu_transpose_matmul(
+                    m_np,
+                    batch_size=streaming_batch_size,
+                    cupy=cupy,
+                    dtype=_cupy_compute_dtype(cupy),
+                ),
+                dtype=m_np.dtype,
+            )
         if self._uses_hybrid_backend():
             sparse_parent_local_indices, dense_parent_local_indices = self._hybrid_parent_local_indices()
             output = np.empty((self.shape[1], m_np.shape[1]), dtype=m_np.dtype)
@@ -2340,15 +2459,27 @@ class StandardizedGenotypeMatrix:
             if dense_parent_local_indices.size > 0:
                 if self._dense_backend is None:
                     raise RuntimeError("hybrid dense backend is not configured.")
-                output[dense_parent_local_indices, :] = np.asarray(
-                    self._dense_backend.transpose_matmat(m_np, batch_size=batch_size),
-                    dtype=m_np.dtype,
-                )
-            return _as_gpu_compute_jax(output)
+                output[dense_parent_local_indices, :] = self._dense_backend.transpose_matmat_numpy(m_np, batch_size=batch_size)
+            return output
         output = np.empty((self.shape[1], m_np.shape[1]), dtype=m_np.dtype)
         for batch in self.iter_column_batches(batch_size=batch_size):
             output[batch.variant_indices, :] = np.asarray(batch.values, dtype=output.dtype).T @ m_np
-        return _as_gpu_compute_jax(output)
+        return output
+
+    def transpose_matmat_jax(self, matrix: np.ndarray | jnp.ndarray, batch_size: int = DEFAULT_GENOTYPE_BATCH_SIZE) -> jnp.ndarray:
+        if self.supports_jax_dense_ops():
+            matrix_jax = _normalize_jax_matrix_operand(
+                matrix,
+                expected_rows=self.shape[0],
+                shape_error="sample matrix must match genotype row count.",
+                finite_name="sample matrix",
+            )
+            return self._ensure_jax_cache().T @ matrix_jax
+        return _as_gpu_compute_jax(self.transpose_matmat_numpy(matrix, batch_size=batch_size))
+
+    def transpose_matmat(self, matrix: np.ndarray | jnp.ndarray, batch_size: int = DEFAULT_GENOTYPE_BATCH_SIZE) -> jnp.ndarray:
+        """Compute X_std^T @ M with JAX as the public return type."""
+        return self.transpose_matmat_jax(matrix, batch_size=batch_size)
 
 
 def _resolve_variant_indices(

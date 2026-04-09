@@ -152,8 +152,16 @@ def test_streaming_standardized_linear_algebra_matches_dense_path():
         np.asarray(dense.matvec(coefficients, batch_size=2), dtype=np.float64),
     )
     np.testing.assert_allclose(
+        streaming.matvec_numpy(coefficients, batch_size=2),
+        dense.matvec_numpy(coefficients, batch_size=2),
+    )
+    np.testing.assert_allclose(
         np.asarray(streaming.transpose_matvec(sample_vector, batch_size=2), dtype=np.float64),
         np.asarray(dense.transpose_matvec(sample_vector, batch_size=2), dtype=np.float64),
+    )
+    np.testing.assert_allclose(
+        streaming.transpose_matvec_numpy(sample_vector, batch_size=2),
+        dense.transpose_matvec_numpy(sample_vector, batch_size=2),
     )
     np.testing.assert_allclose(
         np.asarray(streaming.transpose_matmat(sample_matrix, batch_size=2), dtype=np.float64),
@@ -1142,6 +1150,60 @@ def test_dense_gpu_cache_linear_algebra_respects_gpu_compute_dtype(monkeypatch: 
     )
 
 
+def test_gpu_native_linear_algebra_matches_dense_reference(monkeypatch: pytest.MonkeyPatch):
+    class _FakeCupy:
+        float32 = np.float32
+        float64 = np.float64
+
+        @staticmethod
+        def asarray(array, dtype=None):
+            return np.asarray(array, dtype=dtype)
+
+        @staticmethod
+        def zeros(shape, dtype=None):
+            return np.zeros(shape, dtype=dtype)
+
+        @staticmethod
+        def empty(shape, dtype=None, order=None):
+            return np.empty(shape, dtype=dtype, order="C" if order is None else order)
+
+    raw_matrix = np.array(
+        [
+            [0.0, 1.0, np.nan, 0.0],
+            [1.0, 0.0, 2.0, 1.0],
+            [2.0, 1.0, 1.0, 0.0],
+            [np.nan, 2.0, 0.0, 1.0],
+        ],
+        dtype=np.float32,
+    )
+    means = np.array([1.0, 1.0, 1.0, 0.5], dtype=np.float32)
+    scales = np.array([0.5, 1.0, 1.0, 0.5], dtype=np.float32)
+    variant_matrix = np.column_stack(
+        [
+            np.array([0.25, -0.75, 0.5, 1.25], dtype=np.float64),
+            np.array([1.0, -0.5, 0.25, 2.0], dtype=np.float64),
+        ]
+    )
+    sample_matrix = np.column_stack(
+        [
+            np.array([1.0, -0.5, 0.25, 2.0], dtype=np.float64),
+            np.array([-1.5, 0.0, 1.0, 0.5], dtype=np.float64),
+        ]
+    )
+    standardized = as_raw_genotype_matrix(raw_matrix).standardized(means, scales)
+    dense_matrix = standardized.materialize().astype(np.float64, copy=False)
+    standardized._cupy_cache = standardized.materialize().astype(np.float32, copy=False)
+    standardized._dense_cache = None
+
+    monkeypatch.setattr(genotype_module, "_try_import_cupy", lambda: _FakeCupy())
+
+    gpu_matmat_result = standardized.gpu_matmat(variant_matrix, cupy=_FakeCupy(), dtype=np.float64)
+    gpu_transpose_result = standardized.gpu_transpose_matmat(sample_matrix, cupy=_FakeCupy(), dtype=np.float64)
+
+    np.testing.assert_allclose(np.asarray(gpu_matmat_result, dtype=np.float64), dense_matrix @ variant_matrix)
+    np.testing.assert_allclose(np.asarray(gpu_transpose_result, dtype=np.float64), dense_matrix.T @ sample_matrix)
+
+
 def test_dense_gpu_cache_prefers_jax_dense_ops_without_cupy_bridge(monkeypatch: pytest.MonkeyPatch):
     raw_matrix = np.array(
         [
@@ -1276,8 +1338,8 @@ def test_dense_materialized_genotype_ops_are_jax_traceable():
     coefficient_vector = jnp.asarray([1.0, -2.0, 0.5], dtype=jnp.float64)
     sample_vector = jnp.asarray([0.5, -1.0, 2.0], dtype=jnp.float64)
 
-    jit_matvec = jax.jit(lambda beta: standardized.matvec(beta))
-    jit_transpose_matvec = jax.jit(lambda vector: standardized.transpose_matvec(vector))
+    jit_matvec = jax.jit(lambda beta: standardized.matvec_jax(beta))
+    jit_transpose_matvec = jax.jit(lambda vector: standardized.transpose_matvec_jax(vector))
 
     np.testing.assert_allclose(
         np.asarray(jit_matvec(coefficient_vector), dtype=np.float64),
@@ -1287,6 +1349,31 @@ def test_dense_materialized_genotype_ops_are_jax_traceable():
         np.asarray(jit_transpose_matvec(sample_vector), dtype=np.float64),
         np.asarray(standardized.materialize(), dtype=np.float64).T @ np.asarray(sample_vector, dtype=np.float64),
     )
+
+
+def test_explicit_numpy_backend_ops_return_numpy_arrays():
+    raw_matrix = np.array(
+        [
+            [0.0, 1.0, 2.0],
+            [1.0, 2.0, 3.0],
+            [2.0, 3.0, 4.0],
+        ],
+        dtype=np.float32,
+    )
+    standardized = as_raw_genotype_matrix(raw_matrix).standardized(
+        means=np.array([1.0, 2.0, 3.0], dtype=np.float32),
+        scales=np.ones(3, dtype=np.float32),
+    )
+    coefficients = np.array([1.0, -2.0, 0.5], dtype=np.float64)
+    sample_vector = np.array([0.5, -1.0, 2.0], dtype=np.float64)
+
+    matvec_result = standardized.matvec_numpy(coefficients)
+    transpose_result = standardized.transpose_matvec_numpy(sample_vector)
+
+    assert isinstance(matvec_result, np.ndarray)
+    assert isinstance(transpose_result, np.ndarray)
+    np.testing.assert_allclose(matvec_result, standardized.materialize() @ coefficients)
+    np.testing.assert_allclose(transpose_result, standardized.materialize().T @ sample_vector)
 
 
 def test_hybrid_standardized_operator_matches_dense_reference(monkeypatch: pytest.MonkeyPatch):

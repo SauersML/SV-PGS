@@ -20,7 +20,8 @@ import pandas as pd
 from sv_pgs.all_of_us import AllOfUsDiseaseRequest, prepare_all_of_us_disease_sample_table, resolve_disease_definition
 from sv_pgs.config import ModelConfig, TraitType, VariantClass
 from sv_pgs.data import NESTED_PATH_DELIMITER
-from sv_pgs.io import load_multi_vcf_dataset_from_files, run_training_pipeline
+from sv_pgs.io import load_multi_vcf_dataset_from_files
+from sv_pgs.pipeline import run_training_pipeline
 from sv_pgs.progress import log, mem
 
 _LOCAL_CACHE_DIRNAME = ".sv_pgs_cache"
@@ -924,11 +925,11 @@ def run_all_of_us(
             if _load_cached_variant_metadata(vcf_paths, config, variant_metadata_path):
                 log(f"  variant metadata assembled from VCF precache: {variant_metadata_path}")
             else:
-                # Don't re-read VCFs — core factor features (copy_number, repeat,
-                # maf_bucket) are computed from cached variant_class + allele_frequency.
-                # INFO annotations are optional enrichment for future cache rebuilds.
-                log("  no cached metadata — using variant-class priors (copy_number, repeat, maf_bucket computed from cached data)")
-                variant_metadata_path = None
+                log(f"  building variant metadata from source VCFs: {variant_metadata_path}")
+                build_aou_sv_variant_metadata(
+                    vcf_paths=vcf_paths,
+                    output_path=variant_metadata_path,
+                )
 
         log("=== STEP 4: Load unified genome-wide dataset ===")
         dataset = load_multi_vcf_dataset_from_files(
