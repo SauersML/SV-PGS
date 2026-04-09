@@ -2,13 +2,14 @@ from __future__ import annotations
 
 from dataclasses import dataclass, replace
 
-from sv_pgs.config import ModelConfig
+from sv_pgs.config import ModelConfig, TraitType
 from sv_pgs.genotype import RawGenotypeMatrix, _gpu_materialization_budget_bytes, _try_import_cupy
 
 # Algorithmic limits — not GPU-memory-dependent.
 # The exact solver limit caps dense Cholesky factorizations on GPU to avoid
 # excessive O(p^3) cost. The preconditioner rank bounds the Nyström approximation.
 GPU_FINAL_REFINEMENT_VARIANT_MULTIPLIER = 2
+GPU_BINARY_STOCHASTIC_BATCH_EXACT_LIMIT_MULTIPLIER = 2
 GPU_PRECONDITIONER_RANK_FLOOR = 128
 GPU_PRECONDITIONER_RANK_CEILING = 512
 GPU_PRECONDITIONER_RANK_FRACTION = 0.04
@@ -85,6 +86,14 @@ def runtime_training_policy_for_fit(
         ),
         256,
     )
+    if config.trait_type == TraitType.BINARY:
+        tuned_stochastic_batch_size = min(
+            tuned_stochastic_batch_size,
+            max(
+                int(tuned_exact_solver_limit) * GPU_BINARY_STOCHASTIC_BATCH_EXACT_LIMIT_MULTIPLIER,
+                256,
+            ),
+        )
     tuned_final_posterior_refinement = (
         bool(config.final_posterior_refinement)
         and int(genotype_matrix.shape[1])
