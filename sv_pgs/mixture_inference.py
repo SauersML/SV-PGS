@@ -101,16 +101,14 @@ _GPU_EXACT_VARIANT_SOLVE_LIMIT_FALLBACK = 10_000  # conservative CPU-only defaul
 def _gpu_exact_variant_solve_limit(cupy, sample_count: int) -> int:
     """Max variants for GPU exact Cholesky based on actual GPU VRAM.
 
-    GPU exact Cholesky needs roughly 3x the matrix memory for intermediates:
-      - n x p float32 matrix (X):          4 * n * p bytes
-      - n x p float32 weighted copy:       4 * n * p bytes
-      - p x p float64 Gram matrix (X^TWX): 8 * p * p bytes
-    We budget 40% of free GPU memory for this.
+    Peak GPU memory for exact Cholesky (chunked float64 Gram matrix):
+      - n x p float32 genotype matrix (X):     4 * n * p bytes
+      - p x p float64 Gram matrix (X^T W X):   8 * p * p bytes
+      - n x 1024 float64 weighted chunk:        ~8 MB (negligible)
+    We budget 50% of free GPU memory.
 
-    Solving for p_max given a memory budget B and n samples:
-      B = 2 * 4 * n * p + 8 * p^2
-    Using the quadratic formula (keeping the positive root):
-      p_max = (-8n + sqrt(64n^2 + 32B)) / 16
+    Solving for p_max: 4*n*p + 8*p^2 <= budget
+      p_max = (-4n + sqrt(16n^2 + 32*budget)) / 16
     """
     if cupy is None:
         return _GPU_EXACT_VARIANT_SOLVE_LIMIT_FALLBACK
@@ -121,13 +119,13 @@ def _gpu_exact_variant_solve_limit(cupy, sample_count: int) -> int:
     if free <= 0:
         return _GPU_EXACT_VARIANT_SOLVE_LIMIT_FALLBACK
 
-    budget = free * 0.4
+    budget = free * 0.5
     n = max(sample_count, 1)
-    # Solve: 8*n*p + 8*p^2 <= budget  (two n×p float32 matrices = 8*n*p bytes)
-    # 8*p^2 + 8*n*p - budget = 0  →  p = (-8n + sqrt(64n^2 + 32*budget)) / 16
+    # Solve: 4*n*p + 8*p^2 <= budget  (one n×p float32 matrix + p×p float64 Gram)
+    # 8*p^2 + 4*n*p - budget = 0  →  p = (-4n + sqrt(16n^2 + 32*budget)) / 16
     import math
-    discriminant = 64.0 * n * n + 32.0 * budget
-    p_max = (-8.0 * n + math.sqrt(discriminant)) / 16.0
+    discriminant = 16.0 * n * n + 32.0 * budget
+    p_max = (-4.0 * n + math.sqrt(discriminant)) / 16.0
     p_max = max(int(p_max), 0)
     # Floor at fallback for very large GPUs (no reason to go below the old limit)
     return max(p_max, _GPU_EXACT_VARIANT_SOLVE_LIMIT_FALLBACK) if p_max > 0 else _GPU_EXACT_VARIANT_SOLVE_LIMIT_FALLBACK
@@ -5118,25 +5116,21 @@ def _restricted_posterior_state(
                 # precision loss over ~97K samples that previously required
                 # a jitter hack for Cholesky stability.
                 inv_d_cp = cp.asarray(inverse_diagonal_noise, dtype=cp.float64)
-                # Pre-compute X^T in float64 once; shape (p, n) — same memory
-                # as X_gpu_compute but in float64.  Freed after the loop.
-                X_gpu_T_f64 = cp.asarray(X_gpu_compute.T, dtype=cp.float64)
-                xtdx_gpu = cp.empty((variant_count, variant_count), dtype=cp.float64)
-                xtdx_gpu[...] = 0.0
+                # Build X^T W X in float64 chunk-by-chunk. Each chunk computes
+                # X^T @ (W * X[:, chunk]) where the weighted chunk is float64.
+                # We avoid allocating a full p×n float64 transpose (6.2 GB for
+                # 8K×97K) by doing the matmul per output-column-block.
+                # Peak extra memory: ~750 MB per chunk (n × chunk_size × 8 bytes).
+                xtdx_gpu = cp.zeros((variant_count, variant_count), dtype=cp.float64)
                 chunk = min(1024, variant_count)
-                chunk_cache_gpu = cp.empty(
-                    (sample_count, chunk),
-                    dtype=compute_cp_dtype,
-                )
                 for start in range(0, variant_count, chunk):
                     end = min(start + chunk, variant_count)
-                    chunk_values_gpu = chunk_cache_gpu[:, : end - start]
-                    chunk_values_gpu[...] = X_gpu_compute[:, start:end]
-                    # weighted_chunk is (n, chunk) in float64 — ~750 MB for
-                    # chunk=1024, n=97K, fits comfortably in GPU memory.
-                    weighted_chunk = inv_d_cp[:, None] * cp.asarray(chunk_values_gpu, dtype=cp.float64)
-                    xtdx_gpu[:, start:end] = X_gpu_T_f64 @ weighted_chunk
-                del X_gpu_T_f64
+                    # weighted_chunk: (n, chunk) float64
+                    weighted_chunk = inv_d_cp[:, None] * cp.asarray(X_gpu_compute[:, start:end], dtype=cp.float64)
+                    # X_gpu_compute is (n, p) float32. X^T @ weighted_chunk does
+                    # float32 × float64 — CuPy promotes to float64 for the matmul.
+                    xtdx_gpu[:, start:end] = X_gpu_compute.T @ weighted_chunk
+                    del weighted_chunk
                 projector_bundle_gpu = _build_restricted_projector_gpu_bundle(
                     inverse_diagonal_noise=inverse_diagonal_noise,
                     covariate_matrix=covariate_matrix,
