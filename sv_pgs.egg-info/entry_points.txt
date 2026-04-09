@@ -1,2 +1,0 @@
-[console_scripts]
-sv-pgs = sv_pgs.cli:main
