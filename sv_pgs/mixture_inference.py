@@ -575,17 +575,6 @@ def _stochastic_sample_space_preconditioner_rank(
     return max(minimum_rank, min(int(requested_rank), scheduled_rank))
 
 
-def _stochastic_gpu_exact_variant_solve_limit(exact_solver_matrix_limit: int) -> int:
-    if exact_solver_matrix_limit < 1:
-        raise ValueError("exact_solver_matrix_limit must be positive.")
-    # The stochastic block path should reserve dense exact Cholesky for blocks
-    # that are comfortably below the full-memory exact-solver budget, because
-    # the cubic factorization cost grows much faster than the streaming CG path.
-    return min(
-        int(exact_solver_matrix_limit),
-        max(int(np.floor(int(exact_solver_matrix_limit) * 0.25)), 1_024),
-    )
-
 
 def _stochastic_variant_blocks(
     variant_count: int,
@@ -1136,10 +1125,9 @@ def fit_variational_em(
                 if block_count <= 3 or block_count % max(n_blocks // 10, 1) == 0 or block_count == n_blocks:
                     log(f"    block {block_count}/{n_blocks}  variants={len(block_indices)}  step_size={step_size:.4f}  gpu={'yes' if block_genotypes._cupy_cache is not None else 'no'}  mem={mem()}")
                 block_prior_variances = np.asarray(reduced_prior_variances[block_indices], dtype=np.float64)
-                allow_small_block_gpu_exact_variant = len(block_indices) <= min(
-                    int(config.exact_solver_matrix_limit),
-                    _stochastic_gpu_exact_variant_solve_limit(int(config.exact_solver_matrix_limit)),
-                )
+                # Always allow GPU exact Cholesky — the dynamic
+                # _gpu_exact_variant_solve_limit handles the memory budget.
+                allow_small_block_gpu_exact_variant = True
                 block_sample_space_preconditioner_rank = _stochastic_sample_space_preconditioner_rank(
                     requested_rank=int(config.sample_space_preconditioner_rank),
                     step_size=step_size,
