@@ -700,17 +700,13 @@ def _gpu_total_bytes(cupy) -> int:
 
 
 def _gpu_materialization_budget_bytes(cupy) -> int:
-    """GPU cache budget based on total device memory (not free).
+    """GPU cache budget: 40% of total device memory.
 
-    Using total memory avoids dependence on JAX/XLA pre-allocation state,
-    which varies with import order and environment variables.  We reserve
-    4 GB for solver workspace, JAX scratch, and OS overhead, then allow
-    up to 50% of the remainder for genotype caching.
+    Uses total memory (not free) to avoid dependence on JAX/XLA
+    pre-allocation state. 40% leaves room for solver workspace,
+    JAX scratch, and OS overhead on any GPU size.
     """
-    total_bytes = _gpu_total_bytes(cupy)
-    reserved_bytes = 4_000_000_000
-    usable_bytes = max(total_bytes - reserved_bytes, 0)
-    return int(usable_bytes * 0.5)
+    return int(_gpu_total_bytes(cupy) * 0.4)
 
 
 @dataclass(slots=True)

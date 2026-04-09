@@ -120,8 +120,7 @@ def _gpu_exact_variant_full_matrix_fits(
     # Use total GPU memory minus a fixed reserve, not free memory.
     # Free memory depends on JAX pre-allocation state which varies.
     total_bytes = _gpu_total_bytes(cupy)
-    reserved_bytes = 4_000_000_000
-    usable_bytes = int(max(total_bytes - reserved_bytes, 0) * _GPU_EXACT_VARIANT_MEMORY_UTILIZATION)
+    usable_bytes = int(total_bytes * _GPU_EXACT_VARIANT_MEMORY_UTILIZATION)
     standardized_bytes = 4 * int(sample_count) * int(variant_count) if cache_is_int8_standardized else 0
     weighted_chunk_bytes = 4 * int(sample_count) * min(int(variant_count), _GPU_EXACT_VARIANT_TILE_MAX_VARIANTS)
     required_bytes = _gpu_exact_variant_base_bytes(int(variant_count), int(covariate_count)) + standardized_bytes + weighted_chunk_bytes
@@ -136,8 +135,7 @@ def _gpu_exact_variant_tile_size(
     covariate_count: int,
 ) -> int:
     total_bytes = _gpu_total_bytes(cupy)
-    reserved_bytes = 4_000_000_000
-    usable_bytes = int(max(total_bytes - reserved_bytes, 0) * _GPU_EXACT_VARIANT_MEMORY_UTILIZATION)
+    usable_bytes = int(total_bytes * _GPU_EXACT_VARIANT_MEMORY_UTILIZATION)
     fixed_bytes = _gpu_exact_variant_base_bytes(int(variant_count), int(covariate_count))
     if usable_bytes <= fixed_bytes:
         return 0
