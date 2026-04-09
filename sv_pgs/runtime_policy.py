@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, replace
 
-from sv_pgs.config import ModelConfig
+from sv_pgs.config import ModelConfig, TraitType
 from sv_pgs.genotype import RawGenotypeMatrix, _gpu_materialization_budget_bytes, _try_import_cupy
 
 # Algorithmic limits — not GPU-memory-dependent.
@@ -33,6 +33,28 @@ def _recommended_gpu_preconditioner_rank(cacheable_dense_variants: int) -> int:
             budget_scaled_rank,
         ),
     )
+
+
+def _recommended_gpu_stochastic_batch_size(
+    *,
+    cacheable_dense_variants: int,
+    exact_solver_matrix_limit: int,
+    trait_type: TraitType,
+) -> int:
+    if cacheable_dense_variants < 1:
+        return 256
+    budget_target = max(int(cacheable_dense_variants * 0.85), 256)
+    if trait_type == TraitType.BINARY:
+        # On smaller GPUs, very large binary blocks push the sample-space CG
+        # system into a hard regime where iterative refinement can fail before
+        # the Newton update is useful. Keep binary blocks within a modest
+        # multiple of the exact-solver limit so the stochastic path stays in the
+        # well-conditioned regime for the available GPU memory.
+        budget_target = min(
+            budget_target,
+            max(int(exact_solver_matrix_limit) * 2, 256),
+        )
+    return max(budget_target, 256)
 
 
 def runtime_training_policy_for_fit(
@@ -71,7 +93,11 @@ def runtime_training_policy_for_fit(
     # preconditioner, and CG startup costs. The static default (8,192) is too
     # conservative on modern GPUs once the block solver is iterative.
     tuned_stochastic_batch_size = max(
-        max(int(config.stochastic_variant_batch_size), max(int(cacheable_dense_variants * 0.85), 256)),
+        _recommended_gpu_stochastic_batch_size(
+            cacheable_dense_variants=cacheable_dense_variants,
+            exact_solver_matrix_limit=tuned_exact_solver_limit,
+            trait_type=config.trait_type,
+        ),
         256,
     )
     tuned_final_posterior_refinement = (
