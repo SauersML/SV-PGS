@@ -75,10 +75,12 @@ from sv_pgs.genotype import (
     DenseRawGenotypeMatrix,
     RawGenotypeMatrix,
     StandardizedGenotypeMatrix,
+    _cupy_cache_is_int8_standardized,
     _cupy_cache_standardized_columns,
     _iter_cupy_cache_standardized_batches,
     _cupy_compute_dtype,
     _gpu_free_bytes,
+    _gpu_total_bytes,
     _iter_standardized_gpu_batches,
     _try_import_cupy,
     _cupy_to_jax,
@@ -93,42 +95,66 @@ from sv_pgs.progress import log, mem
 # GPU exact variant-space Cholesky: form X^T W X via cuBLAS + Cholesky.
 # Cost: O(n p²) matmul + O(p³) Cholesky. This is 10-20x faster than
 # sample-space CG and gives exact solutions with no convergence issues.
-# The maximum number of variants is determined dynamically from the actual
-# GPU memory available (see _gpu_exact_variant_solve_limit).
-_GPU_EXACT_VARIANT_SOLVE_LIMIT_FALLBACK = 10_000  # conservative CPU-only default
+# The implementation now uses either a full standardized matrix or a tiled
+# exact build depending on the live GPU working set.
+_GPU_EXACT_VARIANT_MEMORY_UTILIZATION = 0.8
+_GPU_EXACT_VARIANT_TILE_MAX_VARIANTS = 1_024
+_GPU_EXACT_VARIANT_TILE_MIN_VARIANTS = 256
 
 
-def _gpu_exact_variant_solve_limit(cupy, sample_count: int) -> int:
-    """Max variants for GPU exact Cholesky based on actual GPU VRAM.
+def _gpu_exact_variant_base_bytes(variant_count: int, covariate_count: int) -> int:
+    precision_matrix_bytes = 8 * int(variant_count) * int(variant_count)
+    covariate_correction_bytes = precision_matrix_bytes if covariate_count > 0 else 0
+    rhs_bytes = 8 * int(variant_count)
+    return int(precision_matrix_bytes + covariate_correction_bytes + rhs_bytes)
 
-    Peak GPU memory for exact Cholesky (chunked float64 Gram matrix):
-      - n x p float32 genotype matrix (X):     4 * n * p bytes
-      - p x p float64 Gram matrix (X^T W X):   8 * p * p bytes
-      - n x 1024 float32 weighted chunk:        ~8 MB (negligible)
-    We budget 50% of free GPU memory.
 
-    Solving for p_max: 4*n*p + 8*p^2 <= budget
-      p_max = (-4n + sqrt(16n^2 + 32*budget)) / 16
-    """
-    if cupy is None:
-        return _GPU_EXACT_VARIANT_SOLVE_LIMIT_FALLBACK
-    try:
-        free = _gpu_free_bytes(cupy)
-    except Exception:
-        return _GPU_EXACT_VARIANT_SOLVE_LIMIT_FALLBACK
-    if free <= 0:
-        return _GPU_EXACT_VARIANT_SOLVE_LIMIT_FALLBACK
+def _gpu_exact_variant_full_matrix_fits(
+    cupy,
+    *,
+    sample_count: int,
+    variant_count: int,
+    covariate_count: int,
+    cache_is_int8_standardized: bool,
+) -> bool:
+    # Use total GPU memory minus a fixed reserve, not free memory.
+    # Free memory depends on JAX pre-allocation state which varies.
+    total_bytes = _gpu_total_bytes(cupy)
+    reserved_bytes = 4_000_000_000
+    usable_bytes = int(max(total_bytes - reserved_bytes, 0) * _GPU_EXACT_VARIANT_MEMORY_UTILIZATION)
+    standardized_bytes = 4 * int(sample_count) * int(variant_count) if cache_is_int8_standardized else 0
+    weighted_chunk_bytes = 4 * int(sample_count) * min(int(variant_count), _GPU_EXACT_VARIANT_TILE_MAX_VARIANTS)
+    required_bytes = _gpu_exact_variant_base_bytes(int(variant_count), int(covariate_count)) + standardized_bytes + weighted_chunk_bytes
+    return required_bytes <= usable_bytes
 
-    budget = free * 0.5
-    n = max(sample_count, 1)
-    # Solve: 4*n*p + 8*p^2 <= budget  (one n×p float32 matrix + p×p float64 Gram)
-    # 8*p^2 + 4*n*p - budget = 0  →  p = (-4n + sqrt(16n^2 + 32*budget)) / 16
-    import math
-    discriminant = 16.0 * n * n + 32.0 * budget
-    p_max = (-4.0 * n + math.sqrt(discriminant)) / 16.0
-    p_max = max(int(p_max), 0)
-    # Floor at fallback for very large GPUs (no reason to go below the old limit)
-    return max(p_max, _GPU_EXACT_VARIANT_SOLVE_LIMIT_FALLBACK) if p_max > 0 else _GPU_EXACT_VARIANT_SOLVE_LIMIT_FALLBACK
+
+def _gpu_exact_variant_tile_size(
+    cupy,
+    *,
+    sample_count: int,
+    variant_count: int,
+    covariate_count: int,
+) -> int:
+    total_bytes = _gpu_total_bytes(cupy)
+    reserved_bytes = 4_000_000_000
+    usable_bytes = int(max(total_bytes - reserved_bytes, 0) * _GPU_EXACT_VARIANT_MEMORY_UTILIZATION)
+    fixed_bytes = _gpu_exact_variant_base_bytes(int(variant_count), int(covariate_count))
+    if usable_bytes <= fixed_bytes:
+        return 0
+    # One row tile stays resident while a second tile and its missing-value mask
+    # are materialized for the current Gram block.
+    bytes_per_variant = int(sample_count) * (2 * 4 + 1)
+    if bytes_per_variant <= 0:
+        return 0
+    tile_variants = min(
+        int(variant_count),
+        _GPU_EXACT_VARIANT_TILE_MAX_VARIANTS,
+        int((usable_bytes - fixed_bytes) // bytes_per_variant),
+    )
+    minimum_required = min(int(variant_count), _GPU_EXACT_VARIANT_TILE_MIN_VARIANTS)
+    if tile_variants < minimum_required:
+        return 0
+    return max(tile_variants, 0)
 
 
 @dataclass(slots=True)
@@ -1125,9 +1151,9 @@ def fit_variational_em(
                 if block_count <= 3 or block_count % max(n_blocks // 10, 1) == 0 or block_count == n_blocks:
                     log(f"    block {block_count}/{n_blocks}  variants={len(block_indices)}  step_size={step_size:.4f}  gpu={'yes' if block_genotypes._cupy_cache is not None else 'no'}  mem={mem()}")
                 block_prior_variances = np.asarray(reduced_prior_variances[block_indices], dtype=np.float64)
-                # Always allow GPU exact Cholesky — the dynamic
-                # _gpu_exact_variant_solve_limit handles the memory budget.
-                allow_small_block_gpu_exact_variant = True
+                # Let the restricted posterior choose between full-matrix exact,
+                # tiled exact, and sample-space CG from the live GPU working set.
+                allow_gpu_exact_variant_for_block = True
                 block_sample_space_preconditioner_rank = _stochastic_sample_space_preconditioner_rank(
                     requested_rank=int(config.sample_space_preconditioner_rank),
                     step_size=step_size,
@@ -1191,7 +1217,7 @@ def fit_variational_em(
                         update_blend_weight=step_size,
                         resume_state=active_binary_resume_state,
                         progress_callback=_save_partial_binary_block if checkpoint_callback is not None else None,
-                        allow_gpu_exact_variant=allow_small_block_gpu_exact_variant,
+                        allow_gpu_exact_variant=allow_gpu_exact_variant_for_block,
                     )
                     block_beta_candidate = np.asarray(block_state[1], dtype=np.float64)
                     block_beta_variance = (
@@ -1218,7 +1244,7 @@ def fit_variational_em(
                         em_iteration_index=outer_iteration,
                         total_em_iterations=config.max_outer_iterations,
                         update_blend_weight=step_size,
-                        allow_gpu_exact_variant=allow_small_block_gpu_exact_variant,
+                        allow_gpu_exact_variant=allow_gpu_exact_variant_for_block,
                     )
                     block_beta_candidate = np.asarray(collapsed_block_state.beta, dtype=np.float64)
                     block_beta_variance = np.asarray(collapsed_block_state.beta_variance, dtype=np.float64)
@@ -4802,15 +4828,31 @@ def _use_gpu_exact_variant_solve(
     genotype_matrix: StandardizedGenotypeMatrix,
     variant_count: int,
     exact_solver_matrix_limit: int,
+    covariate_count: int,
 ) -> bool:
     if genotype_matrix._cupy_cache is None:
         return False
     if variant_count <= exact_solver_matrix_limit:
         return False
     cupy = _try_import_cupy()
+    if cupy is None:
+        return False
     sample_count = genotype_matrix.shape[0]
-    limit = _gpu_exact_variant_solve_limit(cupy, sample_count)
-    return variant_count <= limit
+    cache_is_int8_standardized = _cupy_cache_is_int8_standardized(genotype_matrix._cupy_cache)
+    if _gpu_exact_variant_full_matrix_fits(
+        cupy,
+        sample_count=sample_count,
+        variant_count=variant_count,
+        covariate_count=covariate_count,
+        cache_is_int8_standardized=cache_is_int8_standardized,
+    ):
+        return True
+    return _gpu_exact_variant_tile_size(
+        cupy,
+        sample_count=sample_count,
+        variant_count=variant_count,
+        covariate_count=covariate_count,
+    ) > 0
 
 
 def _should_use_posterior_working_set(
@@ -5240,6 +5282,7 @@ def _restricted_posterior_state(
         genotype_matrix=genotype_matrix,
         variant_count=variant_count,
         exact_solver_matrix_limit=exact_solver_matrix_limit,
+        covariate_count=covariate_matrix.shape[1],
     )
     # GPU availability: cached (uploaded to GPU memory) or streaming (mmap→GPU batches)
     gpu_available = (
@@ -5383,42 +5426,25 @@ def _restricted_posterior_state(
                 cp_solve_triangular = _resolve_gpu_solve_triangular()
 
                 compute_cp_dtype = _cupy_compute_dtype(cp)
-                X_gpu_compute = _cupy_cache_standardized_columns(
-                    genotype_matrix._cupy_cache,
-                    slice(None),
-                    cupy=cp,
-                    dtype=compute_cp_dtype,
+                covariate_count = covariate_matrix.shape[1]
+                cache_is_int8_standardized = _cupy_cache_is_int8_standardized(genotype_matrix._cupy_cache)
+                use_full_gpu_exact = _gpu_exact_variant_full_matrix_fits(
+                    cp,
+                    sample_count=sample_count,
+                    variant_count=variant_count,
+                    covariate_count=covariate_count,
+                    cache_is_int8_standardized=cache_is_int8_standardized,
                 )
-                # Build X^T diag(W) X on GPU in float64 precision, chunked to
-                # avoid allocating a second full-size (n, p) intermediate.
-                # Keeping X_gpu_compute in float32 for the genotype cache,
-                # but computing the Gram matrix in float64 to prevent
-                # precision loss over ~97K samples that previously required
-                # a jitter hack for Cholesky stability.
-                # Build X^T diag(W) X via chunked float32 GEMM with float64
-                # accumulation of the result.  Each column-chunk does one big
-                # cuBLAS SGEMM (~0.2s on T4 for 8K×97K × 97K×1024) instead of
-                # 24 tiny float64 GEMMs.  The float32 inner product over 97K
-                # samples has ~0.002% relative error — negligible vs the prior
-                # precision (865+) on the diagonal.
-                _gram_t0 = time.monotonic()
-                log(f"    building X^T W X (p={variant_count}, n={sample_count}, float32 GEMM + float64 accum)...  mem={mem()}")
-                inv_d_f32 = cp.asarray(inverse_diagonal_noise, dtype=compute_cp_dtype)
-                xtdx_gpu = cp.zeros((variant_count, variant_count), dtype=cp.float64)
-                col_chunk = min(1024, variant_count)
-                n_col_chunks = (variant_count + col_chunk - 1) // col_chunk
-                for col_idx, col_start in enumerate(range(0, variant_count, col_chunk)):
-                    col_end = min(col_start + col_chunk, variant_count)
-                    # (n, chunk) float32 — ~380 MB for chunk=1024, n=97K
-                    weighted_chunk = inv_d_f32[:, None] * X_gpu_compute[:, col_start:col_end]
-                    # One big cuBLAS SGEMM: (p, n) × (n, chunk) → (p, chunk) float32
-                    chunk_result = X_gpu_compute.T @ weighted_chunk
-                    # Cast small result (p × chunk × 4 = 32 MB) to float64
-                    xtdx_gpu[:, col_start:col_end] = chunk_result.astype(cp.float64)
-                    del weighted_chunk, chunk_result
-                    if (col_idx + 1) % max(n_col_chunks // 4, 1) == 0 or col_idx == n_col_chunks - 1:
-                        log(f"      Gram matrix: {col_end:,}/{variant_count:,} cols ({100*col_end/variant_count:.0f}%)  {time.monotonic()-_gram_t0:.1f}s")
-                log(f"    X^T W X built in {time.monotonic()-_gram_t0:.1f}s  mem={mem()}")
+                tiled_exact_batch_size = 0 if use_full_gpu_exact else _gpu_exact_variant_tile_size(
+                    cp,
+                    sample_count=sample_count,
+                    variant_count=variant_count,
+                    covariate_count=covariate_count,
+                )
+                if not use_full_gpu_exact and tiled_exact_batch_size <= 0:
+                    raise RuntimeError(
+                        "GPU exact variant-space solve was selected without enough tile workspace."
+                    )
                 projector_bundle_gpu = _build_restricted_projector_gpu_bundle(
                     inverse_diagonal_noise=inverse_diagonal_noise,
                     covariate_matrix=covariate_matrix,
@@ -5426,7 +5452,82 @@ def _restricted_posterior_state(
                     cp=cp,
                     dtype=compute_cp_dtype,
                 )
-                covariate_count = covariate_matrix.shape[1]
+                projected_targets_gpu = _apply_restricted_projector_gpu(
+                    cp.asarray(targets, dtype=compute_cp_dtype),
+                    projector_bundle_gpu,
+                    cp=cp,
+                    solve_triangular_gpu=cp_solve_triangular,
+                )
+                diagonal_index = cp.arange(variant_count)
+                inv_d_f32 = cp.asarray(inverse_diagonal_noise, dtype=compute_cp_dtype)
+                if use_full_gpu_exact:
+                    X_gpu_compute = _cupy_cache_standardized_columns(
+                        genotype_matrix._cupy_cache,
+                        slice(None),
+                        cupy=cp,
+                        dtype=compute_cp_dtype,
+                    )
+                    _gram_t0 = time.monotonic()
+                    log(f"    building X^T W X (p={variant_count}, n={sample_count}, float32 GEMM + float64 accum)...  mem={mem()}")
+                    variant_precision_gpu = cp.zeros((variant_count, variant_count), dtype=cp.float64)
+                    col_chunk = min(_GPU_EXACT_VARIANT_TILE_MAX_VARIANTS, variant_count)
+                    n_col_chunks = (variant_count + col_chunk - 1) // col_chunk
+                    for col_idx, col_start in enumerate(range(0, variant_count, col_chunk)):
+                        col_end = min(col_start + col_chunk, variant_count)
+                        weighted_chunk = inv_d_f32[:, None] * X_gpu_compute[:, col_start:col_end]
+                        chunk_result = X_gpu_compute.T @ weighted_chunk
+                        variant_precision_gpu[:, col_start:col_end] = chunk_result.astype(cp.float64)
+                        del weighted_chunk, chunk_result
+                        if (col_idx + 1) % max(n_col_chunks // 4, 1) == 0 or col_idx == n_col_chunks - 1:
+                            log(f"      Gram matrix: {col_end:,}/{variant_count:,} cols ({100*col_end/variant_count:.0f}%)  {time.monotonic()-_gram_t0:.1f}s")
+                    variant_precision_gpu = 0.5 * (variant_precision_gpu + variant_precision_gpu.T)
+                    log(f"    X^T W X built in {time.monotonic()-_gram_t0:.1f}s  mem={mem()}")
+                    variant_rhs_gpu = X_gpu_compute.T @ projected_targets_gpu
+                    exact_gpu_matmul_batch_size = variant_count
+                else:
+                    _gram_t0 = time.monotonic()
+                    log(
+                        "    building X^T W X "
+                        + f"(p={variant_count}, n={sample_count}, tiled exact GPU batches={tiled_exact_batch_size})...  mem={mem()}"
+                    )
+                    variant_precision_gpu = cp.zeros((variant_count, variant_count), dtype=cp.float64)
+                    row_starts = range(0, variant_count, tiled_exact_batch_size)
+                    n_row_tiles = (variant_count + tiled_exact_batch_size - 1) // tiled_exact_batch_size
+                    for row_idx, row_start in enumerate(row_starts):
+                        row_end = min(row_start + tiled_exact_batch_size, variant_count)
+                        row_batch_gpu = _cupy_cache_standardized_columns(
+                            genotype_matrix._cupy_cache,
+                            slice(row_start, row_end),
+                            cupy=cp,
+                            dtype=compute_cp_dtype,
+                        )
+                        for col_start in range(row_start, variant_count, tiled_exact_batch_size):
+                            col_end = min(col_start + tiled_exact_batch_size, variant_count)
+                            col_batch_gpu = _cupy_cache_standardized_columns(
+                                genotype_matrix._cupy_cache,
+                                slice(col_start, col_end),
+                                cupy=cp,
+                                dtype=compute_cp_dtype,
+                            )
+                            col_batch_gpu *= inv_d_f32[:, None]
+                            block_precision_gpu = row_batch_gpu.T @ col_batch_gpu
+                            block_precision_gpu64 = block_precision_gpu.astype(cp.float64)
+                            variant_precision_gpu[row_start:row_end, col_start:col_end] = block_precision_gpu64
+                            if row_start != col_start:
+                                variant_precision_gpu[col_start:col_end, row_start:row_end] = block_precision_gpu64.T
+                            del col_batch_gpu, block_precision_gpu, block_precision_gpu64
+                        del row_batch_gpu
+                        if (row_idx + 1) % max(n_row_tiles // 4, 1) == 0 or row_idx == n_row_tiles - 1:
+                            log(f"      Gram matrix: {row_end:,}/{variant_count:,} rows ({100*row_end/variant_count:.0f}%)  {time.monotonic()-_gram_t0:.1f}s")
+                    log(f"    X^T W X built in {time.monotonic()-_gram_t0:.1f}s  mem={mem()}")
+                    variant_rhs_gpu = _gpu_genotype_transpose_matmul(
+                        genotype_matrix,
+                        projected_targets_gpu,
+                        batch_size=tiled_exact_batch_size,
+                        cp=cp,
+                        dtype=compute_cp_dtype,
+                    )
+                    exact_gpu_matmul_batch_size = tiled_exact_batch_size
                 if covariate_count > 0:
                     CtWX_gpu = _cached_weighted_covariate_projection(
                         genotype_matrix=genotype_matrix,
@@ -5443,17 +5544,7 @@ def _restricted_posterior_state(
                         cp_solve_triangular,
                     )
                     correction_gpu = cp.asarray(CtWX_gpu @ correction_coeff_gpu, dtype=cp.float64)
-                    xtdx_gpu -= correction_gpu
-                XtPX_gpu = 0.5 * (xtdx_gpu + xtdx_gpu.T)
-                projected_targets_gpu = _apply_restricted_projector_gpu(
-                    cp.asarray(targets, dtype=compute_cp_dtype),
-                    projector_bundle_gpu,
-                    cp=cp,
-                    solve_triangular_gpu=cp_solve_triangular,
-                )
-                variant_rhs_gpu = X_gpu_compute.T @ projected_targets_gpu
-                variant_precision_gpu = XtPX_gpu  # already float64
-                diagonal_index = cp.arange(variant_count)
+                    variant_precision_gpu -= correction_gpu
                 variant_precision_gpu[diagonal_index, diagonal_index] += cp.asarray(prior_precision, dtype=cp.float64)
             else:
                 dense_genotypes = np.asarray(genotype_matrix.materialize(batch_size=posterior_variance_batch_size), dtype=np.float64)
@@ -5535,7 +5626,16 @@ def _restricted_posterior_state(
                     if compute_logdet
                     else 0.0
                 )
-                genetic_linear_predictor_gpu = X_gpu_compute @ cp.asarray(beta_gpu, dtype=compute_cp_dtype)
+                if use_full_gpu_exact:
+                    genetic_linear_predictor_gpu = X_gpu_compute @ cp.asarray(beta_gpu, dtype=compute_cp_dtype)
+                else:
+                    genetic_linear_predictor_gpu = _gpu_genotype_matmul(
+                        genotype_matrix,
+                        cp.asarray(beta_gpu, dtype=compute_cp_dtype),
+                        batch_size=exact_gpu_matmul_batch_size,
+                        cp=cp,
+                        dtype=compute_cp_dtype,
+                    )
                 genetic_linear_predictor = _cupy_array_to_numpy(genetic_linear_predictor_gpu, dtype=np.float64)
                 beta = _cupy_array_to_numpy(beta_gpu, dtype=np.float64)
             else:

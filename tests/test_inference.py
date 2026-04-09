@@ -35,12 +35,14 @@ from sv_pgs.mixture_inference import (
     _solve_sample_space_rhs_gpu,
     _solve_sample_space_rhs_cpu,
     _stochastic_binary_newton_iterations,
-    _stochastic_gpu_exact_variant_solve_limit,
     _stochastic_sample_space_preconditioner_rank,
     _stochastic_restricted_cross_leverage_diagonal,
+    _gpu_exact_variant_full_matrix_fits,
+    _gpu_exact_variant_tile_size,
     _restricted_variant_space_operator,
     _sample_space_operator,
     _update_local_scales,
+    _use_gpu_exact_variant_solve,
     _update_tpb_shape_vectors,
 )
 import sv_pgs.mixture_inference as mixture_inference
@@ -1787,10 +1789,43 @@ def test_stochastic_sample_space_preconditioner_rank_scales_with_blend_weight():
     assert _stochastic_sample_space_preconditioner_rank(requested_rank=0, step_size=0.05) == 0
 
 
-def test_stochastic_gpu_exact_variant_solve_limit_scales_from_exact_budget():
-    assert _stochastic_gpu_exact_variant_solve_limit(9_000) == 2_250
-    assert _stochastic_gpu_exact_variant_solve_limit(20_000) == 5_000
-    assert _stochastic_gpu_exact_variant_solve_limit(2_000) == 1_024
+def test_gpu_exact_variant_tile_size_adapts_to_live_gpu_workspace(monkeypatch: pytest.MonkeyPatch):
+    sentinel_cupy = object()
+    monkeypatch.setattr(mixture_inference, "_gpu_free_bytes", lambda _cupy: 2_000_000_000)
+
+    assert not _gpu_exact_variant_full_matrix_fits(
+        sentinel_cupy,
+        sample_count=97_061,
+        variant_count=4_096,
+        covariate_count=0,
+        cache_is_int8_standardized=True,
+    )
+    assert _gpu_exact_variant_tile_size(
+        sentinel_cupy,
+        sample_count=97_061,
+        variant_count=4_096,
+        covariate_count=0,
+    ) == 1_024
+
+
+def test_use_gpu_exact_variant_solve_accepts_tiled_exact_path(monkeypatch: pytest.MonkeyPatch):
+    genotype_values = np.zeros((16, 4_096), dtype=np.float32)
+    standardized = as_raw_genotype_matrix(genotype_values).standardized(
+        means=np.zeros(4_096, dtype=np.float32),
+        scales=np.ones(4_096, dtype=np.float32),
+    )
+    standardized._cupy_cache = object()
+
+    monkeypatch.setattr(mixture_inference, "_try_import_cupy", lambda: object())
+    monkeypatch.setattr(mixture_inference, "_gpu_exact_variant_full_matrix_fits", lambda *args, **kwargs: False)
+    monkeypatch.setattr(mixture_inference, "_gpu_exact_variant_tile_size", lambda *args, **kwargs: 512)
+
+    assert _use_gpu_exact_variant_solve(
+        genotype_matrix=standardized,
+        variant_count=4_096,
+        exact_solver_matrix_limit=2_048,
+        covariate_count=0,
+    )
 
 
 def test_binary_posterior_state_uses_blended_step_for_convergence(monkeypatch: pytest.MonkeyPatch):

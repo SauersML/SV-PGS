@@ -690,15 +690,27 @@ def _gpu_free_bytes(cupy) -> int:
         return 0
 
 
-def _gpu_materialization_budget_bytes(cupy) -> int:
-    """Conservative GPU cache budget for a single-device training run.
+def _gpu_total_bytes(cupy) -> int:
+    """Return total GPU device memory in bytes, or 0 if unavailable."""
+    try:
+        _, total = cupy.cuda.runtime.memGetInfo()
+        return int(total)
+    except Exception:
+        return 0
 
-    Returns 50% of currently free device memory. This leaves room for the
-    cached genotype matrix plus iterative solver workspace and other GPU
-    allocations.
+
+def _gpu_materialization_budget_bytes(cupy) -> int:
+    """GPU cache budget based on total device memory (not free).
+
+    Using total memory avoids dependence on JAX/XLA pre-allocation state,
+    which varies with import order and environment variables.  We reserve
+    4 GB for solver workspace, JAX scratch, and OS overhead, then allow
+    up to 50% of the remainder for genotype caching.
     """
-    free_bytes = _gpu_free_bytes(cupy)
-    return int(free_bytes * 0.5)
+    total_bytes = _gpu_total_bytes(cupy)
+    reserved_bytes = 4_000_000_000
+    usable_bytes = max(total_bytes - reserved_bytes, 0)
+    return int(usable_bytes * 0.5)
 
 
 @dataclass(slots=True)
@@ -737,12 +749,16 @@ class _CupyInt8StandardizedCache:
         standardized = raw_chunk.astype(resolved_dtype, copy=False)
         means = self.means[local_variant_indices].astype(resolved_dtype, copy=False)
         scales = self.scales[local_variant_indices].astype(resolved_dtype, copy=False)
-        standardized = (standardized - means[None, :]) / scales[None, :]
         missing_mask = raw_chunk == np.int8(PLINK_MISSING_INT8)
-        if hasattr(cp, "where"):
-            return cp.where(missing_mask, resolved_dtype(0.0), standardized)
+        standardized -= means[None, :]
+        standardized /= scales[None, :]
+        if hasattr(missing_mask, "any") and bool(missing_mask.any()):
+            standardized[missing_mask] = resolved_dtype(0.0)
+        elif np.asarray(missing_mask).any():
+            standardized[np.asarray(missing_mask)] = 0.0
+        if hasattr(cp, "asarray"):
+            return cp.asarray(standardized, dtype=resolved_dtype)
         standardized_np = np.asarray(standardized)
-        standardized_np[np.asarray(missing_mask)] = 0.0
         return standardized_np
 
     def __array__(self, dtype: np.dtype | type | None = None) -> np.ndarray:
