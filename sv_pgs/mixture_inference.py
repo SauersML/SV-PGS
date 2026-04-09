@@ -539,11 +539,15 @@ def _should_use_stochastic_variational_updates(
     variant_count = int(genotype_matrix.shape[1])
     if not config.stochastic_variational_updates:
         return False
-    # When working-set screening is enabled and the variant count is large
-    # enough, use the collapsed posterior path instead.  Each EM iteration
-    # does a full solve via gradient-based screening + KKT certification,
-    # converging in 5-10 iterations vs 15-20 stochastic epochs.
-    if config.posterior_working_sets and variant_count >= config.posterior_working_set_min_variants:
+    # Working-set path (collapsed posterior + KKT certification) is better when
+    # the full matrix is GPU-resident — each matvec is ~0.1s instead of ~2.5 min.
+    # When the matrix streams from mmap, each full gradient costs 2.5 min and the
+    # working-set path needs 3-6 per EM iteration.  Stochastic blocks need only 1
+    # full matvec per epoch and each block solve runs on GPU.
+    #
+    # Route: use working-set only if matrix is on GPU.  Otherwise stochastic blocks.
+    if genotype_matrix._cupy_cache is not None:
+        # Matrix fits on GPU — working-set path is optimal
         return False
     if variant_count < max(int(config.stochastic_min_variant_count), 1):
         return False
@@ -848,6 +852,14 @@ def fit_variational_em(
 
     log(f"  variational EM: {genotype_matrix.shape[1]} reduced variants, {covariate_matrix.shape[1]} covariates, {target_vector.shape[0]} samples, max_iter={config.max_outer_iterations}")
     use_stochastic_updates = _should_use_stochastic_variational_updates(genotype_matrix, config)
+    gpu_resident = genotype_matrix._cupy_cache is not None
+    matrix_bytes = int(genotype_matrix.shape[0]) * int(genotype_matrix.shape[1])
+    log(
+        f"  solver routing: gpu_resident={gpu_resident}  "
+        f"matrix={matrix_bytes/1e9:.1f} GB int8  "
+        f"stochastic={'yes' if use_stochastic_updates else 'no'}  "
+        f"reason={'matrix on GPU → working-set' if gpu_resident else 'streaming from mmap → stochastic blocks' if use_stochastic_updates else 'small variant count → collapsed'}"
+    )
     beta_variance_state: np.ndarray | None = None
     restricted_posterior_warm_start = _RestrictedPosteriorWarmStart()
     if use_stochastic_updates:
