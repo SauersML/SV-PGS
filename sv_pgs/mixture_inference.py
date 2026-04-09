@@ -5124,23 +5124,28 @@ def _restricted_posterior_state(
                 # chunk over BOTH column blocks (output columns of X^T W X) and
                 # row blocks (samples), keeping float64 intermediates small.
                 # Peak extra memory: row_chunk × col_chunk × 8 bytes ≈ 256 MB.
+                import time as _gram_time
+                _gram_t0 = _gram_time.monotonic()
+                log(f"    building X^T W X (p={variant_count}, n={sample_count}, float64 double-chunked)...  mem={mem()}")
                 xtdx_gpu = cp.zeros((variant_count, variant_count), dtype=cp.float64)
                 col_chunk = min(1024, variant_count)
                 row_chunk = min(4096, sample_count)
-                for row_start in range(0, sample_count, row_chunk):
+                n_row_chunks = (sample_count + row_chunk - 1) // row_chunk
+                for row_idx, row_start in enumerate(range(0, sample_count, row_chunk)):
                     row_end = min(row_start + row_chunk, sample_count)
-                    # (p, row_chunk) float64 — ~256 MB for p=8K, row_chunk=4K
                     x_rows_f64 = cp.asarray(X_gpu_compute[row_start:row_end, :].T, dtype=cp.float64)
                     w_rows = inv_d_cp[row_start:row_end]
                     for col_start in range(0, variant_count, col_chunk):
                         col_end = min(col_start + col_chunk, variant_count)
-                        # (row_chunk, col_chunk) float64
                         weighted_col = w_rows[:, None] * cp.asarray(
                             X_gpu_compute[row_start:row_end, col_start:col_end], dtype=cp.float64
                         )
                         xtdx_gpu[:, col_start:col_end] += x_rows_f64 @ weighted_col
                         del weighted_col
                     del x_rows_f64
+                    if (row_idx + 1) % max(n_row_chunks // 5, 1) == 0 or row_idx == n_row_chunks - 1:
+                        log(f"      Gram matrix: {row_end:,}/{sample_count:,} samples ({100*row_end/sample_count:.0f}%)  {_gram_time.monotonic()-_gram_t0:.1f}s")
+                log(f"    X^T W X built in {_gram_time.monotonic()-_gram_t0:.1f}s  mem={mem()}")
                 projector_bundle_gpu = _build_restricted_projector_gpu_bundle(
                     inverse_diagonal_noise=inverse_diagonal_noise,
                     covariate_matrix=covariate_matrix,
@@ -5192,10 +5197,10 @@ def _restricted_posterior_state(
 
                 beta = np.asarray(solve_variant_rhs(variant_rhs), dtype=np.float64)
             if genotype_matrix._cupy_cache is not None:
-                # Standard small regularization — float64 Gram matrix
-                # accumulation ensures this is sufficient for Cholesky.
                 variant_precision_gpu[diagonal_index, diagonal_index] += 1e-8
+                log(f"    Cholesky factorization ({variant_count}×{variant_count} float64)...  mem={mem()}")
                 variant_precision_cholesky_gpu = cp.linalg.cholesky(variant_precision_gpu)
+                log(f"    Cholesky done, solving...  mem={mem()}")
 
                 def solve_variant_rhs_gpu(right_hand_side):
                     return _gpu_cholesky_solve(
