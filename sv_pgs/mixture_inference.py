@@ -104,7 +104,7 @@ def _gpu_exact_variant_solve_limit(cupy, sample_count: int) -> int:
     Peak GPU memory for exact Cholesky (chunked float64 Gram matrix):
       - n x p float32 genotype matrix (X):     4 * n * p bytes
       - p x p float64 Gram matrix (X^T W X):   8 * p * p bytes
-      - n x 1024 float64 weighted chunk:        ~8 MB (negligible)
+      - n x 1024 float32 weighted chunk:        ~8 MB (negligible)
     We budget 50% of free GPU memory.
 
     Solving for p_max: 4*n*p + 8*p^2 <= budget
@@ -2349,8 +2349,6 @@ def _binary_posterior_state(
         gpu_enabled=_newton_gpu_available,
         update_blend_weight=update_blend_weight,
     )
-    import time as _time
-
     def _build_resume_snapshot(
         *,
         completed_iterations: int,
@@ -2412,7 +2410,7 @@ def _binary_posterior_state(
         )
     else:
         log(f"      computing initial linear predictor...  mem={mem()}")
-        _init_pred_t0 = _time.monotonic()
+        _init_pred_t0 = time.monotonic()
         if streaming_gpu_binary_backend:
             assert cupy is not None
             current_linear_predictor_gpu = (
@@ -2447,7 +2445,7 @@ def _binary_posterior_state(
                 prior_precision=prior_precision,
                 beta=parameters[covariate_count:],
             )
-        _init_pred_seconds = _time.monotonic() - _init_pred_t0
+        _init_pred_seconds = time.monotonic() - _init_pred_t0
         log(f"      initial predictor computed in {_init_pred_seconds:.1f}s  obj={current_objective:.4f}  mem={mem()}")
         best_objective = current_objective
         best_parameters = parameters.copy()
@@ -2463,7 +2461,7 @@ def _binary_posterior_state(
     _binary_newton_iters_used = resume_completed_iterations
     for iteration_index in range(resume_completed_iterations, max_iterations):
         _binary_newton_iters_used = iteration_index + 1
-        iteration_start = _time.monotonic()
+        iteration_start = time.monotonic()
         if streaming_gpu_binary_backend:
             assert cupy is not None
             current_weights_gpu = _binary_expected_polya_gamma_weights_cupy(
@@ -2476,7 +2474,7 @@ def _binary_posterior_state(
         else:
             current_weights = _binary_expected_polya_gamma_weights(current_linear_predictor, minimum_weight)
         pseudo_response = kappa / current_weights - predictor_offset_array
-        solve_start = _time.monotonic()
+        solve_start = time.monotonic()
         updated_alpha, updated_beta, _, _projected_targets, updated_fitted_response, _restricted_quadratic, _logdet_covariance, _logdet_gls = (
             _restricted_posterior_state(
                 genotype_matrix=standardized_genotypes,
@@ -2506,7 +2504,7 @@ def _binary_posterior_state(
                 allow_gpu_exact_variant=allow_gpu_exact_variant,
             )
         )
-        solve_seconds = _time.monotonic() - solve_start
+        solve_seconds = time.monotonic() - solve_start
         updated_parameters = np.concatenate([updated_alpha, updated_beta], axis=0).astype(np.float64, copy=False)
         updated_linear_predictor = predictor_offset_array + np.asarray(updated_fitted_response, dtype=np.float64)
         if streaming_gpu_binary_backend:
@@ -2543,7 +2541,7 @@ def _binary_posterior_state(
         effective_parameter_step = effective_update_scale * relative_parameter_step
         effective_predictor_step = effective_update_scale * relative_predictor_step
         objective_gain = updated_objective - current_objective
-        total_seconds = _time.monotonic() - iteration_start
+        total_seconds = time.monotonic() - iteration_start
         log(
             f"      binary iter {iteration_index + 1}/{max_iterations}: "
             + f"obj={updated_objective:.4f} gain={objective_gain:.2e} "
@@ -3833,8 +3831,7 @@ def _solve_sample_space_rhs_gpu_inner(
     search_direction_gpu = preconditioned_residual_gpu
     residual_dot = _gpu_to_f64(cp.sum(residual_gpu * preconditioned_residual_gpu, axis=0, dtype=cp.float64))
     iterations_used = 0
-    import time as _cg_time
-    _cg_t0 = _cg_time.monotonic()
+    _cg_t0 = time.monotonic()
     _cg_log_interval = max(max_iterations // 10, 1)
     n_rhs = int(rhs_gpu.shape[1])
     for iteration_index in range(max_iterations):
@@ -3845,7 +3842,7 @@ def _solve_sample_space_rhs_gpu_inner(
         if iteration_index % _cg_log_interval == 0 or iteration_index == max_iterations - 1:
             pct_converged = int(100 * (n_rhs - active_columns.size) / max(n_rhs, 1))
             max_residual = float(np.max(residual_norm_sq[active_columns])) if active_columns.size > 0 else 0.0
-            log(f"       CG iter {iteration_index+1}/{max_iterations}: {pct_converged}% converged  residual={max_residual:.2e}  ({_cg_time.monotonic()-_cg_t0:.1f}s)")
+            log(f"       CG iter {iteration_index+1}/{max_iterations}: {pct_converged}% converged  residual={max_residual:.2e}  ({time.monotonic()-_cg_t0:.1f}s)")
         masked_search_gpu = search_direction_gpu[:, active_columns]
         operator_search_gpu = apply_operator(masked_search_gpu)
         step_denom = _gpu_to_f64(cp.sum(masked_search_gpu * operator_search_gpu, axis=0, dtype=cp.float64))
@@ -3876,7 +3873,7 @@ def _solve_sample_space_rhs_gpu_inner(
             search_direction_gpu[:, active_columns] * beta_active_gpu[None, :]
         )
         residual_dot[active_columns] = updated_residual_dot_active
-    log(f"       GPU CG done: {iterations_used} iterations in {_cg_time.monotonic()-_cg_t0:.1f}s  mem={mem()}")
+    log(f"       GPU CG done: {iterations_used} iterations in {time.monotonic()-_cg_t0:.1f}s  mem={mem()}")
     solution = cp.asarray(solution_gpu, dtype=cp.float64)
     return (solution[:, 0] if vector_input else solution), iterations_used
 
@@ -4979,8 +4976,7 @@ def _restricted_posterior_state_posterior_working_set(
         ) - prior_precision * beta_vector
         return genetic_linear_predictor, projected_residual, gradient
 
-    import time as _ws_time
-    _ws_init_t0 = _ws_time.monotonic()
+    _ws_init_t0 = time.monotonic()
     # When beta is all zeros (cold start), skip the forward matvec entirely —
     # X @ 0 = 0, saving one full mmap scan (~70s for 222K variants).
     if not np.any(current_beta):
@@ -4996,7 +4992,7 @@ def _restricted_posterior_state_posterior_working_set(
     else:
         log(f"    computing initial gradient on all {variant_count:,} variants (2 matvecs)...  mem={mem()}")
         _genetic_linear_predictor, _projected_residual, current_gradient = _projected_residual_and_gradient(current_beta)
-    log(f"    initial gradient computed in {_ws_time.monotonic() - _ws_init_t0:.1f}s  mem={mem()}")
+    log(f"    initial gradient computed in {time.monotonic() - _ws_init_t0:.1f}s  mem={mem()}")
     ever_active_indices = _ordered_unique_indices(
         [
             warm_start.posterior_working_set_ever_active if warm_start is not None else None,
@@ -5012,8 +5008,7 @@ def _restricted_posterior_state_posterior_working_set(
     )
 
     for working_pass in range(max(int(posterior_working_set_max_passes), 1)):
-        import time as _ws_time
-        _ws_pass_t0 = _ws_time.monotonic()
+        _ws_pass_t0 = time.monotonic()
         log(
             "    posterior working-set pass "
             + f"{working_pass + 1}/{int(posterior_working_set_max_passes)} "
@@ -5065,7 +5060,7 @@ def _restricted_posterior_state_posterior_working_set(
         )
         # Incremental gradient: use subset's fitted response for forward prediction,
         # only do one full transpose matvec for gradient (saves ~12s per pass).
-        _ws_kkt_t0 = _ws_time.monotonic()
+        _ws_kkt_t0 = time.monotonic()
         log(f"    KKT check: computing gradient on all {variant_count:,} variants...  mem={mem()}")
         genetic_linear_predictor = np.asarray(
             subset_fitted - covariate_matrix @ subset_alpha,
@@ -5080,7 +5075,7 @@ def _restricted_posterior_state_posterior_working_set(
             ),
             dtype=np.float64,
         ) - prior_precision * candidate_beta
-        _ws_kkt_seconds = _ws_time.monotonic() - _ws_kkt_t0
+        _ws_kkt_seconds = time.monotonic() - _ws_kkt_t0
         log(f"    KKT gradient computed in {_ws_kkt_seconds:.1f}s  mem={mem()}")
         candidate_score = _working_set_screening_score(candidate_gradient, candidate_beta, prior_variances)
         candidate_update_score = _working_set_posterior_update_score(candidate_gradient, prior_variances)
@@ -5104,7 +5099,7 @@ def _restricted_posterior_state_posterior_working_set(
             )
             linear_predictor = covariate_matrix @ alpha + genetic_linear_predictor
             restricted_quadratic = float(np.dot(targets, projected_targets))
-            _ws_pass_seconds = _ws_time.monotonic() - _ws_pass_t0
+            _ws_pass_seconds = time.monotonic() - _ws_pass_t0
             log(
                 "    KKT CERTIFIED — working set accepted "
                 + f"(size={working_indices.shape[0]}/{variant_count}, ever_active={ever_active_indices.shape[0]}, "
@@ -5406,8 +5401,7 @@ def _restricted_posterior_state(
                 # 24 tiny float64 GEMMs.  The float32 inner product over 97K
                 # samples has ~0.002% relative error — negligible vs the prior
                 # precision (865+) on the diagonal.
-                import time as _gram_time
-                _gram_t0 = _gram_time.monotonic()
+                _gram_t0 = time.monotonic()
                 log(f"    building X^T W X (p={variant_count}, n={sample_count}, float32 GEMM + float64 accum)...  mem={mem()}")
                 inv_d_f32 = cp.asarray(inverse_diagonal_noise, dtype=compute_cp_dtype)
                 xtdx_gpu = cp.zeros((variant_count, variant_count), dtype=cp.float64)
@@ -5423,8 +5417,8 @@ def _restricted_posterior_state(
                     xtdx_gpu[:, col_start:col_end] = chunk_result.astype(cp.float64)
                     del weighted_chunk, chunk_result
                     if (col_idx + 1) % max(n_col_chunks // 4, 1) == 0 or col_idx == n_col_chunks - 1:
-                        log(f"      Gram matrix: {col_end:,}/{variant_count:,} cols ({100*col_end/variant_count:.0f}%)  {_gram_time.monotonic()-_gram_t0:.1f}s")
-                log(f"    X^T W X built in {_gram_time.monotonic()-_gram_t0:.1f}s  mem={mem()}")
+                        log(f"      Gram matrix: {col_end:,}/{variant_count:,} cols ({100*col_end/variant_count:.0f}%)  {time.monotonic()-_gram_t0:.1f}s")
+                log(f"    X^T W X built in {time.monotonic()-_gram_t0:.1f}s  mem={mem()}")
                 projector_bundle_gpu = _build_restricted_projector_gpu_bundle(
                     inverse_diagonal_noise=inverse_diagonal_noise,
                     covariate_matrix=covariate_matrix,
@@ -5548,9 +5542,8 @@ def _restricted_posterior_state(
                 logdet_A = 2.0 * float(np.sum(np.log(np.diag(variant_precision_cholesky)))) if compute_logdet else 0.0
                 genetic_linear_predictor = np.asarray(genotype_matrix.matvec(beta), dtype=np.float64)
         else:
-            import time as _time
             log(f"    restricted posterior: PCG variant-space solve (p={variant_count}, n={sample_count})  mem={mem()}")
-            _t0 = _time.monotonic()
+            _t0 = time.monotonic()
             variant_operator = _restricted_variant_space_operator(
                 genotype_matrix=genotype_matrix,
                 prior_precision=prior_precision,
@@ -5559,8 +5552,8 @@ def _restricted_posterior_state(
                 covariate_precision_cholesky=covariate_precision_cholesky,
                 batch_size=posterior_variance_batch_size,
             )
-            log(f"      operator setup: {_time.monotonic() - _t0:.1f}s  mem={mem()}")
-            _t0 = _time.monotonic()
+            log(f"      operator setup: {time.monotonic() - _t0:.1f}s  mem={mem()}")
+            _t0 = time.monotonic()
             variant_preconditioner = _restricted_variant_space_diagonal_preconditioner(
                 genotype_matrix=genotype_matrix,
                 covariate_matrix=covariate_matrix,
@@ -5570,8 +5563,8 @@ def _restricted_posterior_state(
                 batch_size=posterior_variance_batch_size,
                 warm_start=warm_start,
             )
-            log(f"      preconditioner: {_time.monotonic() - _t0:.1f}s  mem={mem()}")
-            _t0 = _time.monotonic()
+            log(f"      preconditioner: {time.monotonic() - _t0:.1f}s  mem={mem()}")
+            _t0 = time.monotonic()
             restricted_targets = apply_projector_jax(targets)
             variant_rhs = np.asarray(
                 genotype_matrix.transpose_matvec(
@@ -5580,7 +5573,7 @@ def _restricted_posterior_state(
                 ),
                 dtype=np.float64,
             )
-            log(f"      rhs: {_time.monotonic() - _t0:.1f}s  mem={mem()}")
+            log(f"      rhs: {time.monotonic() - _t0:.1f}s  mem={mem()}")
 
             def solve_variant_rhs(right_hand_side: np.ndarray) -> np.ndarray:
                 rhs_array = np.asarray(right_hand_side, dtype=np.float64)
@@ -5662,13 +5655,12 @@ def _restricted_posterior_state(
         and _try_import_cupy() is not None
     )
     if sample_space_gpu_enabled:
-        import time as _time
         gpu_source = "full-cache" if genotype_matrix._cupy_cache is not None else "streaming"
         log(
             "    restricted posterior: GPU block-CG sample-space solve "
             + f"(p={variant_count}, n={sample_count}, source={gpu_source})"
         )
-        _t0 = _time.monotonic()
+        _t0 = time.monotonic()
         log("      building preconditioner...")
         sample_space_preconditioner_gpu, sample_space_preconditioner_cache_entry = _get_cached_sample_space_gpu_preconditioner(
             genotype_matrix=genotype_matrix,
@@ -5678,10 +5670,10 @@ def _restricted_posterior_state(
             rank=effective_sample_space_preconditioner_rank,
             random_seed=random_seed,
         )
-        log(f"      preconditioner ready ({_time.monotonic()-_t0:.1f}s)  mem={mem()}")
+        log(f"      preconditioner ready ({time.monotonic()-_t0:.1f}s)  mem={mem()}")
 
         def solve_rhs_iterative(right_hand_side: np.ndarray, *, initial_guess: np.ndarray | None = None) -> np.ndarray:
-            _solve_t0 = _time.monotonic()
+            _solve_t0 = time.monotonic()
             log(f"      GPU CG solve starting: rhs_cols={right_hand_side.shape[1] if right_hand_side.ndim > 1 else 1}")
             solve_result = _solve_sample_space_rhs_gpu(
                 genotype_matrix=genotype_matrix,
@@ -5703,7 +5695,7 @@ def _restricted_posterior_state(
                 sample_space_preconditioner_cache_entry,
                 iterations_used,
             )
-            log(f"      GPU CG done: {iterations_used} iterations in {_time.monotonic()-_solve_t0:.1f}s  mem={mem()}")
+            log(f"      GPU CG done: {iterations_used} iterations in {time.monotonic()-_solve_t0:.1f}s  mem={mem()}")
             return solved_rhs
     else:
         log(
@@ -6006,23 +5998,21 @@ def _restricted_posterior_state(
         )
         beta_variance = np.maximum(prior_variances - (prior_variances * prior_variances) * leverage_diagonal, 1e-8)
     else:
-        import time as _time
-        _t0 = _time.monotonic()
+        _t0 = time.monotonic()
         log(f"    computing beta: X^T @ projected_targets ({variant_count:,} variants)...")
         beta = np.asarray(
             prior_variances * np.asarray(genotype_matrix.transpose_matvec(projected_targets), dtype=compute_np_dtype),
             dtype=compute_np_dtype,
         )
-        log(f"    beta computed in {_time.monotonic()-_t0:.1f}s  mem={mem()}")
+        log(f"    beta computed in {time.monotonic()-_t0:.1f}s  mem={mem()}")
         beta_variance = np.zeros_like(prior_variances, dtype=np.float64)
-    import time as _time
-    _t0 = _time.monotonic()
+    _t0 = time.monotonic()
     log(f"    computing linear predictor: X @ beta ({variant_count:,} variants)...")
     linear_predictor = covariate_matrix @ alpha + np.asarray(
         genotype_matrix.matvec(beta, batch_size=posterior_variance_batch_size),
         dtype=compute_np_dtype,
     )
-    log(f"    linear predictor computed in {_time.monotonic()-_t0:.1f}s  mem={mem()}")
+    log(f"    linear predictor computed in {time.monotonic()-_t0:.1f}s  mem={mem()}")
     sign_gls, logdet_gls = np.linalg.slogdet(gls_normal_matrix)
     if sign_gls <= 0.0:
         raise RuntimeError("Restricted GLS normal matrix is not positive definite.")

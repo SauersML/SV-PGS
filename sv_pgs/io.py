@@ -6,7 +6,8 @@ import hashlib
 import json
 import os
 import tempfile
-from dataclasses import dataclass, replace
+import time
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, BinaryIO, Iterable, Iterator, Literal, Sequence
 
@@ -679,14 +680,13 @@ def load_multi_vcf_dataset_from_files(
         raise RuntimeError(f"VCF sample IDs do not match: {source_paths[0]}")
     log(f"  sample IDs verified. skip_subset={skip_subset}. loading {n_chromosomes} chromosomes...")
 
-    import time as _time_mod
-    _t_start = _time_mod.monotonic()
+    _t_start = time.monotonic()
     raw_matrices: list[RawGenotypeMatrix] = []
     default_variants: list[_VariantDefaults] = []
     variant_stats_parts: list[VariantStatistics] = []
     total_variants = 0
     for chr_idx, source_path in enumerate(source_paths):
-        _t_chr = _time_mod.monotonic()
+        _t_chr = time.monotonic()
         genotype_matrix, chromosome_variants, chromosome_stats = _load_vcf_with_cache(
             source_path, config=config, mmap_mode="r",
         )
@@ -696,14 +696,14 @@ def load_multi_vcf_dataset_from_files(
         default_variants.extend(chromosome_variants)
         variant_stats_parts.append(chromosome_stats)
         total_variants += len(chromosome_variants)
-        _elapsed = _time_mod.monotonic() - _t_start
-        _chr_time = _time_mod.monotonic() - _t_chr
+        _elapsed = time.monotonic() - _t_start
+        _chr_time = time.monotonic() - _t_chr
         log(
             f"  [{chr_idx+1}/{n_chromosomes}] {source_path.name}: "
             f"{len(chromosome_variants):,} variants in {_chr_time:.1f}s  "
             f"total={total_variants:,}  {_elapsed:.0f}s elapsed  mem={mem()}"
         )
-    _elapsed = _time_mod.monotonic() - _t_start
+    _elapsed = time.monotonic() - _t_start
     log(f"  all {n_chromosomes} chromosomes loaded: {total_variants:,} total variants in {_elapsed:.0f}s")
 
     raw_genotypes: RawGenotypeMatrix = ConcatenatedRawGenotypeMatrix(tuple(raw_matrices))
@@ -757,10 +757,9 @@ def run_training_pipeline(
 ) -> PipelineOutputs:
     destination = Path(output_dir)
     destination.mkdir(parents=True, exist_ok=True)
-    import time as _time_mod
     from sv_pgs.progress import set_log_file, _log_file
     if _log_file is None:
-        set_log_file(destination / f"training.{_time_mod.strftime('%Y%m%d_%H%M%S')}.log")
+        set_log_file(destination / f"training.{time.strftime('%Y%m%d_%H%M%S')}.log")
     log(f"=== TRAINING PIPELINE START ===  samples={len(dataset.sample_ids)}  variants={dataset.genotypes.shape[1]}  trait={config.trait_type.value}  mem={mem()}")
 
     if dataset.variant_stats is not None:
@@ -779,71 +778,14 @@ def run_training_pipeline(
         "validation_sample_count": 0,
         "validation_history": [],
     }
-    fit_config = config
-    validation_dataset = _pipeline_validation_split(dataset=dataset, config=config)
-    if validation_dataset is None:
-        log("fitting Bayesian PGS model...")
-        model = BayesianPGS(config).fit(
-            dataset.genotypes,
-            dataset.covariates,
-            dataset.targets,
-            dataset.variant_records,
-            variant_stats=dataset.variant_stats,
-        )
-    else:
-        tuning_dataset, held_out_dataset = validation_dataset
-        log(
-            "fitting tuning model with held-out validation split..."
-            + f" tuning={tuning_dataset.genotypes.shape[0]} validation={held_out_dataset.genotypes.shape[0]}"
-        )
-        tuning_model = BayesianPGS(config).fit(
-            tuning_dataset.genotypes,
-            tuning_dataset.covariates,
-            tuning_dataset.targets,
-            tuning_dataset.variant_records,
-            validation_data=(
-                held_out_dataset.genotypes,
-                held_out_dataset.covariates,
-                held_out_dataset.targets,
-            ),
-            variant_stats=None,
-        )
-        tuning_state = tuning_model.state
-        if tuning_state is None:
-            raise RuntimeError("tuning model fit completed without state.")
-        selected_iteration_count = int(
-            getattr(
-                tuning_state.fit_result,
-                "selected_iteration_count",
-                config.max_outer_iterations,
-            )
-        )
-        fit_config = replace(config, max_outer_iterations=selected_iteration_count)
-        summary_payload.update(
-            {
-                "validation_enabled": True,
-                "tuning_sample_count": int(tuning_dataset.genotypes.shape[0]),
-                "validation_sample_count": int(held_out_dataset.genotypes.shape[0]),
-                "validation_history": [
-                    float(value)
-                    for value in getattr(tuning_state.fit_result, "validation_history", [])
-                ],
-            }
-        )
-        summary_payload.update(
-            _validation_summary(
-                dataset=held_out_dataset,
-                model=tuning_model,
-            )
-        )
-        log("refitting Bayesian PGS model on the full cohort with selected iteration count...")
-        model = BayesianPGS(fit_config).fit(
-            dataset.genotypes,
-            dataset.covariates,
-            dataset.targets,
-            dataset.variant_records,
-            variant_stats=dataset.variant_stats,
-        )
+    log("fitting Bayesian PGS model...")
+    model = BayesianPGS(config).fit(
+        dataset.genotypes,
+        dataset.covariates,
+        dataset.targets,
+        dataset.variant_records,
+        variant_stats=dataset.variant_stats,
+    )
     log(f"model fitted  mem={mem()}")
 
     log("exporting model artifacts...")
@@ -909,107 +851,6 @@ def run_training_pipeline(
         predictions_path=predictions_path,
         coefficients_path=coefficients_path,
     )
-
-
-def _pipeline_validation_split(
-    dataset: LoadedDataset,
-    config: ModelConfig,
-) -> tuple[LoadedDataset, LoadedDataset] | None:
-    validation_fraction = float(config.pipeline_validation_fraction)
-    minimum_validation_samples = int(config.pipeline_validation_min_samples)
-    if validation_fraction <= 0.0:
-        return None
-    sample_count = int(dataset.genotypes.shape[0])
-    validation_count = int(np.floor(sample_count * validation_fraction))
-    validation_count = max(validation_count, minimum_validation_samples)
-    if validation_count <= 0 or validation_count >= sample_count:
-        return None
-    tuning_count = sample_count - validation_count
-    if tuning_count <= 0:
-        return None
-
-    random_generator = np.random.default_rng(int(config.random_seed))
-    validation_indices = _validation_split_indices(
-        targets=np.asarray(dataset.targets, dtype=np.float32),
-        validation_count=validation_count,
-        trait_type=config.trait_type,
-        random_generator=random_generator,
-    )
-    tuning_mask = np.ones(sample_count, dtype=bool)
-    tuning_mask[validation_indices] = False
-    tuning_indices = np.flatnonzero(tuning_mask)
-    return (
-        _subset_loaded_dataset(dataset=dataset, sample_indices=tuning_indices, use_variant_stats=False),
-        _subset_loaded_dataset(dataset=dataset, sample_indices=validation_indices, use_variant_stats=False),
-    )
-
-
-def _validation_split_indices(
-    targets: np.ndarray,
-    validation_count: int,
-    trait_type: TraitType,
-    random_generator: np.random.Generator,
-) -> np.ndarray:
-    sample_count = int(targets.shape[0])
-    if trait_type != TraitType.BINARY:
-        return np.sort(random_generator.permutation(sample_count)[:validation_count].astype(np.int32))
-    unique_targets = np.unique(targets)
-    if unique_targets.shape[0] < 2:
-        return np.sort(random_generator.permutation(sample_count)[:validation_count].astype(np.int32))
-    selected_indices: list[int] = []
-    for target_value in unique_targets:
-        target_indices = np.flatnonzero(targets == target_value)
-        if target_indices.size == 0:
-            continue
-        selected_indices.append(int(random_generator.choice(target_indices)))
-    remaining_count = validation_count - len(selected_indices)
-    if remaining_count > 0:
-        remaining_pool = np.setdiff1d(np.arange(sample_count, dtype=np.int32), np.asarray(selected_indices, dtype=np.int32), assume_unique=False)
-        selected_indices.extend(random_generator.permutation(remaining_pool)[:remaining_count].tolist())
-    return np.sort(np.asarray(selected_indices[:validation_count], dtype=np.int32))
-
-
-def _subset_loaded_dataset(
-    dataset: LoadedDataset,
-    sample_indices: np.ndarray,
-    use_variant_stats: bool,
-) -> LoadedDataset:
-    resolved_indices = np.asarray(sample_indices, dtype=np.int32)
-    raw_genotypes = as_raw_genotype_matrix(dataset.genotypes)
-    subset_genotypes = raw_genotypes.materialize()[resolved_indices, :]
-    return LoadedDataset(
-        sample_ids=[dataset.sample_ids[int(index)] for index in resolved_indices],
-        genotypes=np.asarray(subset_genotypes, dtype=np.float32),
-        covariates=np.asarray(dataset.covariates[resolved_indices, :], dtype=np.float32),
-        targets=np.asarray(dataset.targets[resolved_indices], dtype=np.float32),
-        variant_records=list(dataset.variant_records),
-        variant_stats=dataset.variant_stats if use_variant_stats else None,
-        variant_stats_minimum_scale=dataset.variant_stats_minimum_scale if use_variant_stats else None,
-    )
-
-
-def _validation_summary(
-    dataset: LoadedDataset,
-    model: BayesianPGS,
-) -> dict[str, Any]:
-    genetic_score, covariate_score = model.decision_components(dataset.genotypes, dataset.covariates)
-    linear_predictor = np.asarray(genetic_score + covariate_score, dtype=np.float32)
-    if model.config.trait_type == TraitType.BINARY:
-        probabilities = np.asarray(stable_sigmoid(linear_predictor), dtype=np.float32)
-        predicted_labels = (probabilities >= 0.5).astype(np.int32)
-        unique_targets = np.unique(dataset.targets)
-        validation_auc = None if unique_targets.shape[0] < 2 else float(roc_auc_score(dataset.targets, probabilities))
-        return {
-            "validation_auc": validation_auc,
-            "validation_log_loss": float(log_loss(dataset.targets, probabilities, labels=[0.0, 1.0])),
-            "validation_accuracy": float(np.mean(predicted_labels == dataset.targets)),
-        }
-    residuals = dataset.targets - linear_predictor
-    return {
-        "validation_r2": float(r2_score(dataset.targets, linear_predictor)),
-        "validation_rmse": float(np.sqrt(np.mean(residuals * residuals))),
-    }
-
 
 
 def _build_sample_table(
@@ -1476,10 +1317,9 @@ def _load_vcf_from_cache(
         effective_mmap_mode: Literal["r", "r+", "w+", "c"] = "r" if mmap_mode is None else mmap_mode
         manifest = _load_vcf_cache_manifest(paths.manifest_path)
         # Legacy caches may not have manifests — infer from matrix shape
-        import time as _time_mod
-        _t0 = _time_mod.monotonic()
+        _t0 = time.monotonic()
         genotype_matrix = np.load(paths.geno_path, mmap_mode=effective_mmap_mode)
-        log(f"  mmap ready: {genotype_matrix.shape} {genotype_matrix.dtype} ({_time_mod.monotonic()-_t0:.1f}s)")
+        log(f"  mmap ready: {genotype_matrix.shape} {genotype_matrix.dtype} ({time.monotonic()-_t0:.1f}s)")
         if manifest is not None:
             expected_sample_count = int(manifest["sample_count"])
             expected_variant_count = int(manifest["variant_count"])
@@ -1498,7 +1338,7 @@ def _load_vcf_from_cache(
                         break
         if not stats_path.exists():
             raise ValueError(f"stats file not found: tried {stats_path.name}")
-        _t1 = _time_mod.monotonic()
+        _t1 = time.monotonic()
         # Support both .variants.npz (new) and .variants.pkl (legacy)
         var_path = paths.var_path
         if not var_path.exists():
@@ -1506,10 +1346,10 @@ def _load_vcf_from_cache(
             if legacy_var.exists():
                 var_path = legacy_var
         variants = _load_variant_metadata(var_path)
-        log(f"  variants loaded: {len(variants)} ({_time_mod.monotonic()-_t1:.1f}s)")
-        _t2 = _time_mod.monotonic()
+        log(f"  variants loaded: {len(variants)} ({time.monotonic()-_t1:.1f}s)")
+        _t2 = time.monotonic()
         variant_stats = _load_vcf_cache_stats(stats_path)
-        log(f"  stats loaded ({_time_mod.monotonic()-_t2:.1f}s)")
+        log(f"  stats loaded ({time.monotonic()-_t2:.1f}s)")
         if genotype_matrix.shape[0] != expected_sample_count:
             raise ValueError(f"cached sample count mismatch: {genotype_matrix.shape[0]} != {expected_sample_count}")
         if genotype_matrix.shape[1] != expected_variant_count:
