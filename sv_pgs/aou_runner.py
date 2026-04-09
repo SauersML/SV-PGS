@@ -930,16 +930,15 @@ def run_all_of_us(
         if variant_metadata_path.exists():
             log(f"  variant metadata already exists: {variant_metadata_path}")
         else:
-            # Try assembling from precache side-effect metadata files
             from sv_pgs.io import _load_cached_variant_metadata
             if _load_cached_variant_metadata(vcf_paths, config, variant_metadata_path):
                 log(f"  variant metadata assembled from VCF precache: {variant_metadata_path}")
             else:
-                log("  cached metadata not available for all chromosomes; building from VCFs...")
-                build_aou_sv_variant_metadata(
-                    vcf_paths=vcf_paths,
-                    output_path=variant_metadata_path,
-                )
+                # Don't re-read VCFs — core factor features (copy_number, repeat,
+                # maf_bucket) are computed from cached variant_class + allele_frequency.
+                # INFO annotations are optional enrichment for future cache rebuilds.
+                log("  no cached metadata — using variant-class priors (copy_number, repeat, maf_bucket computed from cached data)")
+                variant_metadata_path = None
 
         log("=== STEP 4: Load unified genome-wide dataset ===")
         dataset = load_multi_vcf_dataset_from_files(
