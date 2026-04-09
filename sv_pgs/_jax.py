@@ -9,8 +9,11 @@ import numpy as np
 # Do not let JAX reserve nearly all VRAM up front.  The training pipeline keeps
 # large genotype matrices resident on device, and the compiler also needs its
 # own scratch space during the first dense-kernel builds.
+# Do not let JAX/XLA pre-allocate a large GPU memory pool.  CuPy manages
+# GPU memory for genotype matrices and linear algebra.  JAX only needs
+# scratch space for element-wise ops and XLA compilation.
 os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
-os.environ.setdefault("XLA_PYTHON_CLIENT_MEM_FRACTION", "0.7")
+os.environ.setdefault("XLA_PYTHON_CLIENT_MEM_FRACTION", "0.1")
 
 # Work around XLA compilation segfaults on Turing GPUs (T4).  These flags make
 # JAX materially slower on newer GPUs, so only enable them when a Turing-class
