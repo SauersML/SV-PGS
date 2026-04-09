@@ -3824,6 +3824,8 @@ def _apply_restricted_projector_gpu(
         weighted_rhs = inverse_diagonal_noise_gpu[:, None] * rhs_gpu
     else:
         raise ValueError("restricted projector expects a vector or matrix right-hand side.")
+    if covariate_matrix_gpu.shape[1] == 0:
+        return weighted_rhs
     correction_rhs = covariate_matrix_gpu.T @ weighted_rhs
     correction = _gpu_cholesky_solve(
         correction_rhs,
@@ -5138,23 +5140,25 @@ def _restricted_posterior_state(
                     cp=cp,
                     dtype=compute_cp_dtype,
                 )
-                CtWX_gpu = _cached_weighted_covariate_projection(
-                    genotype_matrix=genotype_matrix,
-                    covariate_matrix=covariate_matrix,
-                    inverse_diagonal_noise=inverse_diagonal_noise,
-                    batch_size=posterior_variance_batch_size,
-                    warm_start=warm_start,
-                    return_gpu=True,
-                    cupy=cp,
-                )
-                correction_coeff_gpu = _gpu_cholesky_solve(
-                    CtWX_gpu.T,
-                    projector_bundle_gpu[3],
-                    cp_solve_triangular,
-                )
-                correction_gpu = cp.asarray(CtWX_gpu @ correction_coeff_gpu, dtype=cp.float64)
-                XtPX_gpu = xtdx_gpu - correction_gpu
-                XtPX_gpu = 0.5 * (XtPX_gpu + XtPX_gpu.T)
+                covariate_count = covariate_matrix.shape[1]
+                if covariate_count > 0:
+                    CtWX_gpu = _cached_weighted_covariate_projection(
+                        genotype_matrix=genotype_matrix,
+                        covariate_matrix=covariate_matrix,
+                        inverse_diagonal_noise=inverse_diagonal_noise,
+                        batch_size=posterior_variance_batch_size,
+                        warm_start=warm_start,
+                        return_gpu=True,
+                        cupy=cp,
+                    )
+                    correction_coeff_gpu = _gpu_cholesky_solve(
+                        CtWX_gpu.T,
+                        projector_bundle_gpu[3],
+                        cp_solve_triangular,
+                    )
+                    correction_gpu = cp.asarray(CtWX_gpu @ correction_coeff_gpu, dtype=cp.float64)
+                    xtdx_gpu -= correction_gpu
+                XtPX_gpu = 0.5 * (xtdx_gpu + xtdx_gpu.T)
                 projected_targets_gpu = _apply_restricted_projector_gpu(
                     cp.asarray(targets, dtype=compute_cp_dtype),
                     projector_bundle_gpu,
