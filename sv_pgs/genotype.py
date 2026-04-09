@@ -1498,14 +1498,32 @@ class StandardizedGenotypeMatrix:
                 log(f"    uploading raw int8 genotypes to GPU ({nbytes / 1e9:.1f} GB incl. scales)  mem={mem()}")
                 raw_int8 = cast(Int8BatchCapable, self.raw)
                 gpu_int8_dtype = cupy.int8 if hasattr(cupy, "int8") else np.int8
-                gpu_matrix = cupy.empty(self.shape, dtype=gpu_int8_dtype, order="F")
-                upload_batch_size = auto_batch_size_i8(self.shape[0])
-                local_start = 0
-                for raw_batch in raw_int8.iter_column_batches_i8(self.variant_indices, batch_size=upload_batch_size):
-                    batch_width = raw_batch.values.shape[1]
-                    local_stop = local_start + batch_width
-                    gpu_matrix[:, local_start:local_stop] = cupy.asarray(raw_batch.values, dtype=gpu_int8_dtype)
-                    local_start = local_stop
+                # Fast path: if the entire int8 matrix fits easily, do one H2D copy
+                # instead of iterating column batches.  The working memory is just
+                # the int8 matrix itself (~1 byte per element).
+                int8_total_bytes = int(self.shape[0]) * int(self.shape[1])
+                if int8_total_bytes < budget_bytes * 0.5:
+                    # Single contiguous upload
+                    all_batches = list(raw_int8.iter_column_batches_i8(self.variant_indices, batch_size=self.shape[1]))
+                    if len(all_batches) == 1:
+                        gpu_matrix = cupy.asarray(all_batches[0].values, dtype=gpu_int8_dtype)
+                        if not gpu_matrix.flags.f_contiguous:
+                            gpu_matrix = cupy.asfortranarray(gpu_matrix)
+                    else:
+                        # Multiple batches returned despite large batch_size; concatenate then upload
+                        full_cpu = np.concatenate([b.values for b in all_batches], axis=1)
+                        gpu_matrix = cupy.asarray(np.asfortranarray(full_cpu), dtype=gpu_int8_dtype)
+                        del full_cpu
+                    del all_batches
+                else:
+                    gpu_matrix = cupy.empty(self.shape, dtype=gpu_int8_dtype, order="F")
+                    upload_batch_size = auto_batch_size_i8(self.shape[0])
+                    local_start = 0
+                    for raw_batch in raw_int8.iter_column_batches_i8(self.variant_indices, batch_size=upload_batch_size):
+                        batch_width = raw_batch.values.shape[1]
+                        local_stop = local_start + batch_width
+                        gpu_matrix[:, local_start:local_stop] = cupy.asarray(raw_batch.values, dtype=gpu_int8_dtype)
+                        local_start = local_stop
                 self._cupy_cache = _CupyInt8StandardizedCache(
                     raw_values=gpu_matrix,
                     means=cupy.asarray(self.means[self.variant_indices], dtype=cupy.float32),

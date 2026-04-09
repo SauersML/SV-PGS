@@ -1191,23 +1191,51 @@ def fit_variational_em(
                     config=config,
                 )
             )
-            genetic_linear_predictor_gpu = None
-            if use_gpu_epoch_predictor_state:
-                assert stochastic_epoch_cupy is not None
-                assert stochastic_epoch_compute_cp_dtype is not None
-                genetic_linear_predictor_gpu = genotype_matrix.gpu_matmat(
-                    stochastic_epoch_cupy.asarray(beta_state, dtype=stochastic_epoch_compute_cp_dtype),
-                    batch_size=config.posterior_variance_batch_size,
-                    cupy=stochastic_epoch_cupy,
-                    dtype=stochastic_epoch_compute_cp_dtype,
-                )
-                genetic_linear_predictor = _cupy_array_to_numpy(genetic_linear_predictor_gpu, dtype=np.float64)
+            # Recompute genetic_linear_predictor from scratch only when necessary:
+            # - first epoch (no cached predictor yet)
+            # - resuming from checkpoint mid-epoch
+            # - every 10 epochs for numerical consistency
+            # Otherwise, the block loop maintains it incrementally via delta updates.
+            _need_full_recompute = (
+                outer_iteration == start_iteration
+                or resuming_mid_epoch
+                or (outer_iteration - start_iteration) % 10 == 0
+            )
+            if _need_full_recompute:
+                genetic_linear_predictor_gpu = None
+                if use_gpu_epoch_predictor_state:
+                    assert stochastic_epoch_cupy is not None
+                    assert stochastic_epoch_compute_cp_dtype is not None
+                    genetic_linear_predictor_gpu = genotype_matrix.gpu_matmat(
+                        stochastic_epoch_cupy.asarray(beta_state, dtype=stochastic_epoch_compute_cp_dtype),
+                        batch_size=config.posterior_variance_batch_size,
+                        cupy=stochastic_epoch_cupy,
+                        dtype=stochastic_epoch_compute_cp_dtype,
+                    )
+                    genetic_linear_predictor = _cupy_array_to_numpy(genetic_linear_predictor_gpu, dtype=np.float64)
+                else:
+                    genetic_linear_predictor = np.array(
+                        genotype_matrix.matvec_numpy(beta_state, batch_size=config.posterior_variance_batch_size),
+                        dtype=np.float64,
+                        copy=True,
+                    )
+                if outer_iteration > start_iteration:
+                    log(f"    full X@beta recompute (consistency refresh)  mem={mem()}")
             else:
-                genetic_linear_predictor = np.array(
-                    genotype_matrix.matvec_numpy(beta_state, batch_size=config.posterior_variance_batch_size),
-                    dtype=np.float64,
-                    copy=True,
-                )
+                # Reuse incrementally-maintained predictor from previous epoch.
+                # For GPU path, ensure genetic_linear_predictor_gpu is still set from
+                # the previous epoch's block loop updates.
+                if use_gpu_epoch_predictor_state and genetic_linear_predictor_gpu is None:
+                    # Fallback: recompute if GPU state was lost
+                    assert stochastic_epoch_cupy is not None
+                    assert stochastic_epoch_compute_cp_dtype is not None
+                    genetic_linear_predictor_gpu = genotype_matrix.gpu_matmat(
+                        stochastic_epoch_cupy.asarray(beta_state, dtype=stochastic_epoch_compute_cp_dtype),
+                        batch_size=config.posterior_variance_batch_size,
+                        cupy=stochastic_epoch_cupy,
+                        dtype=stochastic_epoch_compute_cp_dtype,
+                    )
+                    genetic_linear_predictor = _cupy_array_to_numpy(genetic_linear_predictor_gpu, dtype=np.float64)
             if not resuming_mid_epoch:
                 if config.trait_type == TraitType.BINARY:
                     alpha_state = _fit_binary_alpha_with_offset(
@@ -2716,8 +2744,21 @@ def _binary_posterior_state(
     )
     final_weights = _binary_expected_polya_gamma_weights(current_linear_predictor, minimum_weight)
     best_weights = _binary_expected_polya_gamma_weights(best_linear_predictor, minimum_weight)
+    # Fast path: when max_iterations==1 and we need beta_variance, skip the
+    # mean-only Newton solve and go directly to the full solve.  This avoids
+    # solving the linear system twice (once mean-only, once full).
+    _one_solve_fast_path = (
+        max_iterations == 1
+        and resume_completed_iterations == 0
+        and compute_beta_variance
+    )
     _binary_newton_iters_used = resume_completed_iterations
-    for iteration_index in range(resume_completed_iterations, max_iterations):
+    if _one_solve_fast_path:
+        log("      one-solve fast path: max_iter=1 + beta_variance, skipping mean-only solve")
+        _binary_newton_iters_used = 1
+        # Use current weights for the single full solve
+        final_weights = _binary_expected_polya_gamma_weights(current_linear_predictor, minimum_weight)
+    for iteration_index in range(resume_completed_iterations, max_iterations if not _one_solve_fast_path else 0):
         _binary_newton_iters_used = iteration_index + 1
         iteration_start = time.monotonic()
         if gpu_binary_backend:
@@ -6276,6 +6317,7 @@ def _solve_restricted_mean_only(
                         if (col_idx + 1) % max(n_col_chunks // 4, 1) == 0 or col_idx == n_col_chunks - 1:
                             log(f"      Gram matrix: {col_end:,}/{variant_count:,} cols ({100*col_end/variant_count:.0f}%)  {time.monotonic()-_gram_t0:.1f}s")
                     variant_precision_gpu = 0.5 * (variant_precision_gpu + variant_precision_gpu.T)
+                    cp.cuda.Device().synchronize()
                     log(f"    X^T W X built in {time.monotonic()-_gram_t0:.1f}s  mem={mem()}")
                     variant_rhs_gpu = genotype_matrix.gpu_transpose_matmat(
                         projected_targets_gpu,
@@ -6318,6 +6360,7 @@ def _solve_restricted_mean_only(
                         del row_batch_gpu
                         if (row_idx + 1) % max(n_row_tiles // 4, 1) == 0 or row_idx == n_row_tiles - 1:
                             log(f"      Gram matrix: {row_end:,}/{variant_count:,} rows ({100*row_end/variant_count:.0f}%)  {time.monotonic()-_gram_t0:.1f}s")
+                    cp.cuda.Device().synchronize()
                     log(f"    X^T W X built in {time.monotonic()-_gram_t0:.1f}s  mem={mem()}")
                     variant_rhs_gpu = genotype_matrix.gpu_transpose_matmat(
                         projected_targets_gpu,
@@ -7226,6 +7269,7 @@ def _solve_restricted_full(
                         if (col_idx + 1) % max(n_col_chunks // 4, 1) == 0 or col_idx == n_col_chunks - 1:
                             log(f"      Gram matrix: {col_end:,}/{variant_count:,} cols ({100*col_end/variant_count:.0f}%)  {time.monotonic()-_gram_t0:.1f}s")
                     variant_precision_gpu = 0.5 * (variant_precision_gpu + variant_precision_gpu.T)
+                    cp.cuda.Device().synchronize()
                     log(f"    X^T W X built in {time.monotonic()-_gram_t0:.1f}s  mem={mem()}")
                     variant_rhs_gpu = genotype_matrix.gpu_transpose_matmat(
                         projected_targets_gpu,
@@ -7268,6 +7312,7 @@ def _solve_restricted_full(
                         del row_batch_gpu
                         if (row_idx + 1) % max(n_row_tiles // 4, 1) == 0 or row_idx == n_row_tiles - 1:
                             log(f"      Gram matrix: {row_end:,}/{variant_count:,} rows ({100*row_end/variant_count:.0f}%)  {time.monotonic()-_gram_t0:.1f}s")
+                    cp.cuda.Device().synchronize()
                     log(f"    X^T W X built in {time.monotonic()-_gram_t0:.1f}s  mem={mem()}")
                     variant_rhs_gpu = genotype_matrix.gpu_transpose_matmat(
                         projected_targets_gpu,
