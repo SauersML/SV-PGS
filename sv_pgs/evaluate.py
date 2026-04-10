@@ -26,20 +26,46 @@ from sklearn.metrics import roc_auc_score
 from sv_pgs.progress import log
 
 
-def _build_survey_hypertension_sql() -> str:
+def _get_cdr_dataset() -> str:
     import os
     dataset = os.environ.get("WORKSPACE_CDR", "")
     if not dataset:
         raise RuntimeError("WORKSPACE_CDR environment variable required for survey query")
-    # AoU Personal Medical History survey asks "Heart and blood conditions:
-    # Has a doctor or health care provider ever told you that you have...?"
-    # Hypertension is an ANSWER option, not the question itself.
+    return dataset
+
+
+def _build_survey_hypertension_sql(dataset: str) -> str:
+    # AoU Personal Medical History: hypertension may appear in the answer
+    # column as "Hypertension", "High blood pressure", or similar text.
+    # Also try matching on question text containing blood pressure.
     return f"""
 SELECT DISTINCT
   CAST(person_id AS STRING) AS person_id
 FROM `{dataset}.ds_survey`
 WHERE LOWER(answer) LIKE '%hypertension%'
    OR LOWER(answer) LIKE '%high blood pressure%'
+   OR (LOWER(question) LIKE '%blood pressure%' AND LOWER(answer) = 'yes')
+""".strip()
+
+
+def _build_survey_diagnostic_sql(dataset: str) -> str:
+    """Discovery query to find blood-pressure-related rows in ds_survey."""
+    return f"""
+SELECT
+  survey,
+  question_concept_id,
+  SUBSTR(question, 1, 120) AS question_prefix,
+  answer_concept_id,
+  answer,
+  COUNT(DISTINCT person_id) AS n_people
+FROM `{dataset}.ds_survey`
+WHERE LOWER(question) LIKE '%blood%'
+   OR LOWER(question) LIKE '%hypertension%'
+   OR LOWER(answer) LIKE '%hypertension%'
+   OR LOWER(answer) LIKE '%blood pressure%'
+GROUP BY 1, 2, 3, 4, 5
+ORDER BY n_people DESC
+LIMIT 30
 """.strip()
 
 
@@ -52,17 +78,43 @@ def _fetch_survey_self_report(disease: str) -> set[str]:
     except ImportError:
         log("  google-cloud-bigquery not available — skipping survey validation")
         return set()
-    sql = _build_survey_hypertension_sql()
+    try:
+        dataset = _get_cdr_dataset()
+    except RuntimeError as exc:
+        log(f"  {exc}")
+        return set()
+
+    client = bigquery.Client()
+
+    # First try the main query
+    sql = _build_survey_hypertension_sql(dataset)
     log("  querying BigQuery for survey self-reported hypertension...")
     try:
-        client = bigquery.Client()
         rows = client.query(sql).result()
         positive_ids = {str(row.person_id) for row in rows}
-        log(f"  {len(positive_ids):,} people self-reported hypertension in survey")
-        return positive_ids
-    except (OSError, RuntimeError, ValueError) as exc:
-        log(f"  BigQuery survey query failed: {exc}")
-        return set()
+        if positive_ids:
+            log(f"  {len(positive_ids):,} people self-reported hypertension in survey")
+            return positive_ids
+        log("  main query returned 0 — running diagnostic query to discover table schema...")
+    except Exception as exc:
+        log(f"  main query failed: {exc} — running diagnostic...")
+
+    # Diagnostic: show what blood-pressure-related data actually exists
+    try:
+        diag_sql = _build_survey_diagnostic_sql(dataset)
+        diag_rows = list(client.query(diag_sql).result())
+        if diag_rows:
+            log(f"  found {len(diag_rows)} blood-pressure-related row patterns in ds_survey:")
+            for row in diag_rows[:15]:
+                log(f"    survey={row.survey}  q_id={row.question_concept_id}  "
+                    f"q={row.question_prefix!r}  a_id={row.answer_concept_id}  "
+                    f"a={row.answer!r}  n={row.n_people:,}")
+        else:
+            log("  diagnostic also returned 0 — ds_survey may not contain blood pressure data")
+    except Exception as exc:
+        log(f"  diagnostic query failed: {exc}")
+
+    return set()
 
 
 def _load_ancestry_labels(ancestry_path: Path) -> dict[str, str]:
