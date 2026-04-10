@@ -129,10 +129,21 @@ def load_summary(model_dir: Path) -> dict:
 # Plot helpers
 # ---------------------------------------------------------------------------
 
+def _print_figure_to_terminal(path: Path):
+    """Print a PNG to the terminal using iTerm2/JupyterLab inline image protocol."""
+    import base64
+    with open(path, "rb") as f:
+        b64 = base64.b64encode(f.read()).decode("ascii")
+    # iTerm2 inline image protocol (also supported by JupyterLab terminal)
+    sys.stdout.write(f"\033]1337;File=inline=1;width=auto;preserveAspectRatio=1:{b64}\a\n")
+    sys.stdout.flush()
+
+
 def _save(fig, path: Path, dpi: int = 180):
     fig.savefig(path, dpi=dpi, bbox_inches="tight", facecolor="white")
     plt.close(fig)
     print(f"  wrote {path}")
+    _print_figure_to_terminal(path)
 
 
 def _styled_fig(*args, **kwargs):
@@ -901,66 +912,7 @@ def main():
     plot_af_vs_effect(rows, out_dir)
     plot_summary_dashboard(rows, summary, out_dir)
 
-    # Build HTML report with all plots embedded
-    print("\nBuilding HTML report...")
-    _build_html_report(out_dir)
     print("\nDone! All plots generated.")
-
-
-def _build_html_report(out_dir: Path):
-    import base64
-
-    plot_files = [
-        ("model_summary_dashboard.png", "Model Summary Dashboard"),
-        ("manhattan_sv.png", "Genome-Wide Distribution of Structural Variant Effect Sizes"),
-        ("effect_size_distribution.png", "Effect Size Distribution"),
-        ("effect_size_by_variant_type.png", "Effect Size by Structural Variant Type (Box Plot)"),
-        ("effect_size_violin_by_variant_type.png", "Effect Size by Structural Variant Type (Violin)"),
-        ("effect_size_per_variant_type.png", "Effect Size Distributions per Variant Type"),
-        ("variant_type_per_chromosome.png", "Structural Variant Type Composition per Chromosome"),
-        ("effect_size_per_chromosome.png", "Effect Size and Count per Chromosome"),
-        ("effect_size_rank_by_type.png", "Effect Size Rank Plot"),
-        ("cumulative_variance_contribution.png", "Cumulative Variance Contribution"),
-        ("top_variants.png", "Top 50 Structural Variants by Absolute Effect Size"),
-        ("mean_effect_and_count_by_type.png", "Mean Effect Size and Count by Variant Type"),
-        ("length_distribution_by_type.png", "Length Distribution by Structural Variant Type"),
-        ("length_vs_effect_size.png", "Structural Variant Length vs. Effect Size"),
-        ("site_frequency_spectrum_by_type.png", "Site Frequency Spectrum by Structural Variant Type"),
-        ("allele_frequency_vs_effect_size.png", "Allele Frequency vs. Effect Size"),
-    ]
-
-    sections = []
-    for filename, title in plot_files:
-        path = out_dir / filename
-        if not path.exists():
-            continue
-        with open(path, "rb") as f:
-            b64 = base64.b64encode(f.read()).decode("ascii")
-        sections.append(
-            f'<h2>{title}</h2>\n'
-            f'<img src="data:image/png;base64,{b64}" style="max-width:100%;height:auto;">\n'
-            f'<hr>'
-        )
-
-    html = f"""<!DOCTYPE html>
-<html><head>
-<title>SV-PGS Model Analysis</title>
-<style>
-  body {{ font-family: Arial, sans-serif; max-width: 1200px; margin: 0 auto; padding: 20px; background: #fff; }}
-  h1 {{ text-align: center; }}
-  h2 {{ color: #333; margin-top: 40px; }}
-  img {{ display: block; margin: 10px auto; border: 1px solid #ddd; }}
-  hr {{ border: none; border-top: 1px solid #eee; margin: 30px 0; }}
-</style>
-</head><body>
-<h1>Bayesian Polygenic Score Model — Structural Variant Analysis</h1>
-{''.join(sections)}
-</body></html>"""
-
-    report_path = out_dir / "report.html"
-    with open(report_path, "w") as f:
-        f.write(html)
-    print(f"  wrote {report_path}")
 
 
 if __name__ == "__main__":
