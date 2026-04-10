@@ -16,6 +16,7 @@ dependencies = [
     "cyvcf2>=0.31.4",
     "google-cloud-bigquery>=3.40.1",
     "pandas>=1.5",
+    "matplotlib>=3.7",
 ]
 
 [project.optional-dependencies]
