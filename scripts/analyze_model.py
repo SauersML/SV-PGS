@@ -129,21 +129,9 @@ def load_summary(model_dir: Path) -> dict:
 # Plot helpers
 # ---------------------------------------------------------------------------
 
-def _print_figure_to_terminal(path: Path):
-    """Print a PNG to the terminal using iTerm2/JupyterLab inline image protocol."""
-    import base64
-    with open(path, "rb") as f:
-        b64 = base64.b64encode(f.read()).decode("ascii")
-    # iTerm2 inline image protocol (also supported by JupyterLab terminal)
-    sys.stdout.write(f"\033]1337;File=inline=1;width=auto;preserveAspectRatio=1:{b64}\a\n")
-    sys.stdout.flush()
-
-
 def _save(fig, path: Path, dpi: int = 180):
     fig.savefig(path, dpi=dpi, bbox_inches="tight", facecolor="white")
     plt.close(fig)
-    print(f"  wrote {path}")
-    _print_figure_to_terminal(path)
 
 
 def _styled_fig(*args, **kwargs):
@@ -868,11 +856,193 @@ def plot_summary_dashboard(rows: list[dict], summary: dict, out: Path):
 
 
 # ---------------------------------------------------------------------------
+# Text report
+# ---------------------------------------------------------------------------
+
+def _bar(value: float, max_value: float, width: int = 40) -> str:
+    """Simple ASCII horizontal bar."""
+    if max_value <= 0:
+        return ""
+    filled = int(round(value / max_value * width))
+    return "\u2588" * filled + "\u2591" * (width - filled)
+
+
+def _print_text_report(rows: list[dict], summary: dict):
+    """Print a complete text-based analysis report to the terminal."""
+    W = 80  # report width
+
+    def header(title: str):
+        print()
+        print("=" * W)
+        print(f"  {title}")
+        print("=" * W)
+
+    def subheader(title: str):
+        print()
+        print(f"--- {title} {'-' * max(0, W - len(title) - 5)}")
+
+    # ── Model overview ──────────────────────────────────────────────────
+    header("MODEL OVERVIEW")
+    total_v = summary.get("variant_count", "?")
+    active_v = summary.get("active_variant_count", len(rows))
+    samples = summary.get("sample_count", "?")
+    auc = summary.get("training_auc", None)
+    iters = summary.get("selected_iteration_count", "?")
+    trait = summary.get("trait_type", "?")
+
+    print(f"  Samples:                {samples:>12,}")
+    print(f"  Total variants:         {total_v:>12,}")
+    print(f"  Active (non-zero):      {active_v:>12,}")
+    if isinstance(total_v, int) and total_v > 0:
+        print(f"  Sparsity:               {100*(1 - active_v/total_v):>11.1f}%")
+    print(f"  Trait type:             {trait:>12}")
+    print(f"  Training iterations:    {iters:>12}")
+    if auc is not None:
+        print(f"  Training AUC:           {auc:>12.6f}")
+
+    # ── Effect sizes by structural variant type ─────────────────────────
+    header("EFFECT SIZES BY STRUCTURAL VARIANT TYPE")
+
+    by_class: dict[str, list[float]] = defaultdict(list)
+    by_class_signed: dict[str, list[float]] = defaultdict(list)
+    for r in rows:
+        by_class[r["variant_class"]].append(r["abs_beta"])
+        by_class_signed[r["variant_class"]].append(r["beta_float"])
+
+    classes = [c for c in SV_CLASS_ORDER if c in by_class]
+    max_count = max(len(by_class[c]) for c in classes) if classes else 1
+    max_mean = max(np.mean(by_class[c]) for c in classes) if classes else 1
+
+    # Table header
+    print()
+    print(f"  {'Structural Variant Type':<35} {'Count':>8}  {'Mean |Effect|':>13}  {'Median':>10}  {'Max':>10}")
+    print(f"  {'-'*35} {'-'*8}  {'-'*13}  {'-'*10}  {'-'*10}")
+    for cls in classes:
+        vals = np.array(by_class[cls])
+        label = _label_short(cls)
+        print(f"  {label:<35} {len(vals):>8,}  {np.mean(vals):>13.6f}  {np.median(vals):>10.6f}  {np.max(vals):>10.6f}")
+
+    # ASCII bar chart of counts
+    subheader("Variant Count by Type")
+    for cls in classes:
+        n = len(by_class[cls])
+        bar = _bar(n, max_count, 40)
+        print(f"  {_label_short(cls):<35} {bar} {n:>8,}")
+
+    # ASCII bar chart of mean effect
+    subheader("Mean Absolute Effect Size by Type")
+    for cls in classes:
+        m = np.mean(by_class[cls])
+        bar = _bar(m, max_mean, 40)
+        print(f"  {_label_short(cls):<35} {bar} {m:.6f}")
+
+    # ── Per-chromosome breakdown ────────────────────────────────────────
+    header("PER-CHROMOSOME BREAKDOWN")
+
+    by_chrom: dict[int, list[float]] = defaultdict(list)
+    for r in rows:
+        c = r["chromosome"]
+        if c is not None:
+            by_chrom[c].append(r["abs_beta"])
+
+    chroms = sorted(by_chrom.keys())
+    max_chrom_count = max(len(by_chrom[c]) for c in chroms) if chroms else 1
+
+    print()
+    print(f"  {'Chr':>4}  {'Count':>8}  {'Mean |Effect|':>13}  {'Distribution'}")
+    print(f"  {'-'*4}  {'-'*8}  {'-'*13}  {'-'*40}")
+    for c in chroms:
+        vals = np.array(by_chrom[c])
+        bar = _bar(len(vals), max_chrom_count, 30)
+        print(f"  {c:>4}  {len(vals):>8,}  {np.mean(vals):>13.6f}  {bar}")
+
+    # ── Cumulative variance ─────────────────────────────────────────────
+    header("CUMULATIVE VARIANCE CONTRIBUTION")
+
+    abs_betas = np.array(sorted([r["abs_beta"] for r in rows], reverse=True))
+    beta_sq = abs_betas ** 2
+    cumsum = np.cumsum(beta_sq)
+    total = cumsum[-1]
+
+    for pct in (0.25, 0.50, 0.75, 0.90, 0.95, 0.99):
+        idx = int(np.searchsorted(cumsum / total, pct))
+        print(f"  {pct*100:>5.0f}% of total squared effect captured by top {idx+1:>7,} variants ({100*(idx+1)/len(rows):>5.1f}% of active)")
+
+    # ── Top 20 variants ─────────────────────────────────────────────────
+    header("TOP 20 VARIANTS BY ABSOLUTE EFFECT SIZE")
+
+    sorted_rows = sorted(rows, key=lambda r: r["abs_beta"], reverse=True)[:20]
+    print()
+    print(f"  {'Rank':>4}  {'Variant ID':<40} {'Type':<30} {'Effect':>10}")
+    print(f"  {'-'*4}  {'-'*40} {'-'*30} {'-'*10}")
+    for i, r in enumerate(sorted_rows):
+        vid = r["variant_id"].replace("AoUSVPhase2.", "")
+        print(f"  {i+1:>4}  {vid:<40} {_label_short(r['variant_class']):<30} {r['beta_float']:>+10.6f}")
+
+    # ── Effect size distribution summary ────────────────────────────────
+    header("EFFECT SIZE DISTRIBUTION")
+
+    all_betas = np.array([r["beta_float"] for r in rows])
+    all_abs = np.array([r["abs_beta"] for r in rows])
+
+    print(f"  Total active variants:  {len(all_betas):>12,}")
+    print(f"  Mean effect:            {np.mean(all_betas):>12.7f}")
+    print(f"  Mean |effect|:          {np.mean(all_abs):>12.7f}")
+    print(f"  Median |effect|:        {np.median(all_abs):>12.7f}")
+    print(f"  Std dev:                {np.std(all_betas):>12.7f}")
+    print(f"  Min:                    {np.min(all_betas):>12.7f}")
+    print(f"  Max:                    {np.max(all_betas):>12.7f}")
+
+    subheader("Percentiles of Absolute Effect Size")
+    for p in (1, 5, 10, 25, 50, 75, 90, 95, 99):
+        val = np.percentile(all_abs, p)
+        print(f"  {p:>5}th percentile:     {val:>12.7f}")
+
+    # ── Length distribution (if available) ──────────────────────────────
+    if any("length_float" in r for r in rows):
+        header("LENGTH DISTRIBUTION BY STRUCTURAL VARIANT TYPE")
+
+        for cls in classes:
+            lengths = np.array([r["length_float"] for r in rows if r["variant_class"] == cls and "length_float" in r and r["length_float"] > 0])
+            if len(lengths) == 0:
+                continue
+            median = np.median(lengths)
+            if median >= 1_000_000:
+                med_str = f"{median/1_000_000:.1f} Mb"
+            elif median >= 1_000:
+                med_str = f"{median/1_000:.1f} kb"
+            else:
+                med_str = f"{median:.0f} bp"
+            print(f"  {_label_short(cls):<35} n={len(lengths):>8,}  median={med_str:>10}  range={np.min(lengths):.0f}-{np.max(lengths):.0f} bp")
+
+    # ── Site frequency spectrum (if available) ──────────────────────────
+    if any("af_float" in r for r in rows):
+        header("ALLELE FREQUENCY BY STRUCTURAL VARIANT TYPE")
+
+        print()
+        print(f"  {'Structural Variant Type':<35} {'Count':>8}  {'Median AF':>10}  {'Rare (<1%)':>10}  {'Common (>5%)':>12}")
+        print(f"  {'-'*35} {'-'*8}  {'-'*10}  {'-'*10}  {'-'*12}")
+        for cls in classes:
+            afs = np.array([r["af_float"] for r in rows if r["variant_class"] == cls and "af_float" in r and r["af_float"] > 0])
+            if len(afs) == 0:
+                continue
+            n_rare = int(np.sum(afs < 0.01))
+            n_common = int(np.sum(afs >= 0.05))
+            print(f"  {_label_short(cls):<35} {len(afs):>8,}  {np.median(afs):>10.5f}  {n_rare:>10,}  {n_common:>12,}")
+
+    # ── Footer ──────────────────────────────────────────────────────────
+    print()
+    print("=" * W)
+    print("  END OF REPORT")
+    print("=" * W)
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
 def main():
-    parser = argparse.ArgumentParser(description="Generate analysis plots for SV-PGS model results.")
+    parser = argparse.ArgumentParser(description="Analyze SV-PGS model results: print text report and save plots.")
     parser.add_argument("--model-dir", required=True, help="Directory containing coefficients.tsv.gz and summary.json")
     parser.add_argument("--output-dir", default=None, help="Output directory for plots (default: same as model-dir)")
     args = parser.parse_args()
@@ -886,15 +1056,14 @@ def main():
         print(f"Error: {coeff_path} not found", file=sys.stderr)
         sys.exit(1)
 
-    print(f"Loading coefficients from {coeff_path}...")
     rows = load_coefficients(coeff_path)
-    print(f"  {len(rows):,} active variants loaded")
-
     summary = load_summary(model_dir)
-    if summary:
-        print(f"  summary loaded: {summary.get('sample_count', '?')} samples, {summary.get('variant_count', '?')} total variants")
 
-    print(f"\nGenerating plots in {out_dir}/...")
+    # Print text report to terminal
+    _print_text_report(rows, summary)
+
+    # Save plots silently to disk
+    print(f"\nSaving plots to {out_dir}/...")
     plot_manhattan(rows, out_dir)
     plot_effect_size_distribution(rows, out_dir)
     plot_effect_by_class_boxplot(rows, out_dir)
@@ -911,8 +1080,7 @@ def main():
     plot_allele_frequency_spectrum(rows, out_dir)
     plot_af_vs_effect(rows, out_dir)
     plot_summary_dashboard(rows, summary, out_dir)
-
-    print("\nDone! All plots generated.")
+    print("Plots saved.")
 
 
 if __name__ == "__main__":
