@@ -35,16 +35,16 @@ def _get_cdr_dataset() -> str:
 
 
 def _build_survey_hypertension_sql(dataset: str) -> str:
-    # AoU Personal Medical History: hypertension may appear in the answer
-    # column as "Hypertension", "High blood pressure", or similar text.
-    # Also try matching on question text containing blood pressure.
+    # AoU Personal and Family Health History (PFHH) survey structure:
+    #   question: "Including yourself, who in your family has had ...high blood pressure..."
+    #   answer: "... - Self" means the participant themselves reported it.
+    # Pattern discovered from SauersML/ferromic phewas/extra/family.py
     return f"""
 SELECT DISTINCT
   CAST(person_id AS STRING) AS person_id
 FROM `{dataset}.ds_survey`
-WHERE LOWER(answer) LIKE '%hypertension%'
-   OR LOWER(answer) LIKE '%high blood pressure%'
-   OR (LOWER(question) LIKE '%blood pressure%' AND LOWER(answer) = 'yes')
+WHERE (LOWER(question) LIKE '%blood pressure%' OR LOWER(question) LIKE '%hypertension%')
+  AND LOWER(answer) LIKE '%self%'
 """.strip()
 
 
