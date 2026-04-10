@@ -1105,6 +1105,10 @@ class BayesianPGS:
                 "variant_id": fitted_state.full_variant_records[int(row_index)].variant_id,
                 "variant_class": fitted_state.full_variant_records[int(row_index)].variant_class.value,
                 "beta": float(fitted_state.full_coefficients[int(row_index)]),
+                "chromosome": fitted_state.full_variant_records[int(row_index)].chromosome,
+                "position": int(fitted_state.full_variant_records[int(row_index)].position),
+                "length": float(fitted_state.full_variant_records[int(row_index)].length),
+                "allele_frequency": float(fitted_state.full_variant_records[int(row_index)].allele_frequency),
             }
             for row_index in row_indices
         ]

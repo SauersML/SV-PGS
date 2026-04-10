@@ -97,10 +97,17 @@ def load_coefficients(path: Path) -> list[dict]:
     rows = []
     with gzip.open(path, "rt") as f:
         reader = csv.DictReader(f, delimiter="\t")
+        columns = reader.fieldnames or []
+        has_length = "length" in columns
+        has_af = "allele_frequency" in columns
         for row in reader:
             row["beta_float"] = float(row["beta"])
             row["abs_beta"] = abs(row["beta_float"])
             row["chromosome"] = _extract_chromosome(row["variant_id"])
+            if has_length:
+                row["length_float"] = float(row["length"])
+            if has_af:
+                row["af_float"] = float(row["allele_frequency"])
             rows.append(row)
     return rows
 
@@ -518,13 +525,13 @@ def plot_mean_effect_by_class(rows: list[dict], out: Path):
     colors = [_color(c) for c in classes]
     labels = [_label(c) for c in classes]
 
-    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(16, 6))
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(18, 7))
 
     # Mean effect
     x = np.arange(len(classes))
     ax1.bar(x, means, color=colors, width=0.6)
     ax1.set_xticks(x)
-    ax1.set_xticklabels(labels, fontsize=9)
+    ax1.set_xticklabels(labels, fontsize=8, ha="center")
     ax1.set_ylabel("Mean Absolute Effect Size", fontsize=11)
     ax1.set_title("Mean Absolute Effect Size\nby Structural Variant Type", fontsize=13, fontweight="bold")
     ax1.spines["top"].set_visible(False)
@@ -533,7 +540,7 @@ def plot_mean_effect_by_class(rows: list[dict], out: Path):
     # Count
     ax2.bar(x, counts, color=colors, width=0.6)
     ax2.set_xticks(x)
-    ax2.set_xticklabels(labels, fontsize=9)
+    ax2.set_xticklabels(labels, fontsize=8, ha="center")
     ax2.set_ylabel("Number of Active Variants", fontsize=11)
     ax2.set_title("Active Variant Count\nby Structural Variant Type", fontsize=13, fontweight="bold")
     ax2.spines["top"].set_visible(False)
@@ -542,6 +549,204 @@ def plot_mean_effect_by_class(rows: list[dict], out: Path):
 
     fig.tight_layout()
     _save(fig, out / "mean_effect_and_count_by_type.png")
+
+
+def plot_length_distribution(rows: list[dict], out: Path):
+    """Length distribution per structural variant type (log-scale histograms)."""
+    if not any("length_float" in r for r in rows):
+        print("  skipping length distribution (no length data in coefficients)")
+        return
+
+    by_class: dict[str, list[float]] = defaultdict(list)
+    for r in rows:
+        length = r.get("length_float", None)
+        if length is not None and length > 0:
+            by_class[r["variant_class"]].append(length)
+
+    classes = [c for c in SV_CLASS_ORDER if c in by_class and len(by_class[c]) > 10]
+    if not classes:
+        print("  skipping length distribution (insufficient length data)")
+        return
+
+    n = len(classes)
+    fig, axes = plt.subplots(n, 1, figsize=(12, 3 * n), sharex=True)
+    if n == 1:
+        axes = [axes]
+
+    for ax, cls in zip(axes, classes):
+        lengths = np.array(by_class[cls])
+        log_lengths = np.log10(lengths[lengths > 0])
+        ax.hist(log_lengths, bins=100, color=_color(cls), alpha=0.8, edgecolor="none")
+        median_len = np.median(lengths)
+        ax.axvline(np.log10(median_len), color="black", linestyle="--", linewidth=1, alpha=0.7)
+
+        # Format title with human-readable median
+        if median_len >= 1_000_000:
+            median_str = f"{median_len/1_000_000:.1f} Mb"
+        elif median_len >= 1_000:
+            median_str = f"{median_len/1_000:.1f} kb"
+        else:
+            median_str = f"{median_len:.0f} bp"
+
+        ax.set_ylabel("Number of\nVariants", fontsize=10)
+        ax.set_title(
+            f"{_label_short(cls)}  (n = {len(lengths):,},  median length = {median_str})",
+            fontsize=11, fontweight="bold", loc="left",
+        )
+        ax.spines["top"].set_visible(False)
+        ax.spines["right"].set_visible(False)
+
+    # Custom x-axis ticks in human units
+    axes[-1].set_xlabel("Structural Variant Length", fontsize=12)
+    tick_values = [0, 1, 2, 3, 4, 5, 6, 7]  # 1bp, 10bp, ..., 10Mb
+    tick_labels_text = ["1 bp", "10 bp", "100 bp", "1 kb", "10 kb", "100 kb", "1 Mb", "10 Mb"]
+    valid = [(v, l) for v, l in zip(tick_values, tick_labels_text) if v >= axes[-1].get_xlim()[0] and v <= axes[-1].get_xlim()[1]]
+    if valid:
+        axes[-1].set_xticks([v for v, _ in valid])
+        axes[-1].set_xticklabels([l for _, l in valid], fontsize=10)
+
+    fig.suptitle(
+        "Length Distribution by Structural Variant Type",
+        fontsize=14, fontweight="bold", y=1.01,
+    )
+    fig.tight_layout()
+    _save(fig, out / "length_distribution_by_type.png")
+
+
+def plot_length_vs_effect(rows: list[dict], out: Path):
+    """Scatter: SV length vs absolute effect size, per type."""
+    if not any("length_float" in r for r in rows):
+        print("  skipping length vs effect (no length data)")
+        return
+
+    by_class: dict[str, tuple[list[float], list[float]]] = defaultdict(lambda: ([], []))
+    for r in rows:
+        length = r.get("length_float", None)
+        if length is not None and length > 0:
+            by_class[r["variant_class"]][0].append(length)
+            by_class[r["variant_class"]][1].append(r["abs_beta"])
+
+    classes = [c for c in SV_CLASS_ORDER if c in by_class and len(by_class[c][0]) > 10]
+    if not classes:
+        return
+
+    fig, ax = plt.subplots(figsize=(12, 7))
+    for cls in classes:
+        lengths, effects = by_class[cls]
+        ax.scatter(
+            lengths, effects, s=2, alpha=0.15, color=_color(cls),
+            label=_label_short(cls), rasterized=True, edgecolors="none",
+        )
+
+    ax.set_xscale("log")
+    ax.set_yscale("log")
+    ax.set_xlabel("Structural Variant Length (base pairs)", fontsize=12)
+    ax.set_ylabel("Absolute Effect Size", fontsize=12)
+    ax.set_title(
+        "Structural Variant Length vs. Effect Size",
+        fontsize=14, fontweight="bold",
+    )
+    ax.legend(fontsize=8, markerscale=5, loc="upper right", framealpha=0.9)
+    ax.spines["top"].set_visible(False)
+    ax.spines["right"].set_visible(False)
+    fig.tight_layout()
+    _save(fig, out / "length_vs_effect_size.png")
+
+
+def plot_allele_frequency_spectrum(rows: list[dict], out: Path):
+    """Site frequency spectrum per structural variant type."""
+    if not any("af_float" in r for r in rows):
+        print("  skipping allele frequency spectrum (no AF data in coefficients)")
+        return
+
+    by_class: dict[str, list[float]] = defaultdict(list)
+    for r in rows:
+        af = r.get("af_float", None)
+        if af is not None and af > 0:
+            by_class[r["variant_class"]].append(af)
+
+    classes = [c for c in SV_CLASS_ORDER if c in by_class and len(by_class[c]) > 10]
+    if not classes:
+        print("  skipping allele frequency spectrum (insufficient AF data)")
+        return
+
+    n = len(classes)
+    fig, axes = plt.subplots(n, 1, figsize=(12, 3 * n), sharex=True)
+    if n == 1:
+        axes = [axes]
+
+    for ax, cls in zip(axes, classes):
+        afs = np.array(by_class[cls])
+        # Use log-scale bins for better visualization of rare variants
+        log_afs = np.log10(afs[afs > 0])
+        ax.hist(log_afs, bins=100, color=_color(cls), alpha=0.8, edgecolor="none")
+        median_af = np.median(afs)
+        ax.axvline(np.log10(median_af), color="black", linestyle="--", linewidth=1, alpha=0.7)
+
+        n_rare = np.sum(afs < 0.01)
+        n_common = np.sum(afs >= 0.05)
+        ax.set_ylabel("Number of\nVariants", fontsize=10)
+        ax.set_title(
+            f"{_label_short(cls)}  (n = {len(afs):,},  "
+            f"rare [< 1%]: {n_rare:,},  common [\u2265 5%]: {n_common:,})",
+            fontsize=11, fontweight="bold", loc="left",
+        )
+        ax.spines["top"].set_visible(False)
+        ax.spines["right"].set_visible(False)
+
+    # Custom x-axis ticks as percentages
+    tick_values = [-4, -3, -2, -1, np.log10(0.5)]
+    tick_labels_text = ["0.01%", "0.1%", "1%", "10%", "50%"]
+    axes[-1].set_xticks(tick_values)
+    axes[-1].set_xticklabels(tick_labels_text, fontsize=10)
+    axes[-1].set_xlabel("Allele Frequency", fontsize=12)
+
+    fig.suptitle(
+        "Site Frequency Spectrum by Structural Variant Type",
+        fontsize=14, fontweight="bold", y=1.01,
+    )
+    fig.tight_layout()
+    _save(fig, out / "site_frequency_spectrum_by_type.png")
+
+
+def plot_af_vs_effect(rows: list[dict], out: Path):
+    """Scatter: allele frequency vs absolute effect size."""
+    if not any("af_float" in r for r in rows):
+        print("  skipping AF vs effect (no AF data)")
+        return
+
+    by_class: dict[str, tuple[list[float], list[float]]] = defaultdict(lambda: ([], []))
+    for r in rows:
+        af = r.get("af_float", None)
+        if af is not None and af > 0:
+            by_class[r["variant_class"]][0].append(af)
+            by_class[r["variant_class"]][1].append(r["abs_beta"])
+
+    classes = [c for c in SV_CLASS_ORDER if c in by_class and len(by_class[c][0]) > 10]
+    if not classes:
+        return
+
+    fig, ax = plt.subplots(figsize=(12, 7))
+    for cls in classes:
+        afs, effects = by_class[cls]
+        ax.scatter(
+            afs, effects, s=2, alpha=0.15, color=_color(cls),
+            label=_label_short(cls), rasterized=True, edgecolors="none",
+        )
+
+    ax.set_xscale("log")
+    ax.set_yscale("log")
+    ax.set_xlabel("Allele Frequency", fontsize=12)
+    ax.set_ylabel("Absolute Effect Size", fontsize=12)
+    ax.set_title(
+        "Allele Frequency vs. Effect Size by Structural Variant Type",
+        fontsize=14, fontweight="bold",
+    )
+    ax.legend(fontsize=8, markerscale=5, loc="upper right", framealpha=0.9)
+    ax.spines["top"].set_visible(False)
+    ax.spines["right"].set_visible(False)
+    fig.tight_layout()
+    _save(fig, out / "allele_frequency_vs_effect_size.png")
 
 
 def plot_summary_dashboard(rows: list[dict], summary: dict, out: Path):
@@ -690,6 +895,10 @@ def main():
     plot_cumulative_variance(rows, out_dir)
     plot_top_variants(rows, out_dir)
     plot_mean_effect_by_class(rows, out_dir)
+    plot_length_distribution(rows, out_dir)
+    plot_length_vs_effect(rows, out_dir)
+    plot_allele_frequency_spectrum(rows, out_dir)
+    plot_af_vs_effect(rows, out_dir)
     plot_summary_dashboard(rows, summary, out_dir)
 
     print("\nDone! All plots generated.")

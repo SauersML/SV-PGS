@@ -31,15 +31,15 @@ def _build_survey_hypertension_sql() -> str:
     dataset = os.environ.get("WORKSPACE_CDR", "")
     if not dataset:
         raise RuntimeError("WORKSPACE_CDR environment variable required for survey query")
-    # AoU Personal and Family Health History survey uses concept_id 43529063
-    # for "Has anyone in your family ever had high blood pressure / hypertension?"
-    # Answer "Self" (or answer_concept_id 43529090) means the person self-reported it.
+    # AoU Personal Medical History survey asks "Heart and blood conditions:
+    # Has a doctor or health care provider ever told you that you have...?"
+    # Hypertension is an ANSWER option, not the question itself.
     return f"""
 SELECT DISTINCT
   CAST(person_id AS STRING) AS person_id
 FROM `{dataset}.ds_survey`
-WHERE question_concept_id = 43529063
-  AND (LOWER(answer) LIKE '%self%' OR answer_concept_id = 43529090)
+WHERE LOWER(answer) LIKE '%hypertension%'
+   OR LOWER(answer) LIKE '%high blood pressure%'
 """.strip()
 
 
