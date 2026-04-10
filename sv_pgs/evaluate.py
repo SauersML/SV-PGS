@@ -9,6 +9,8 @@ Two tests that use signal the model never saw during training:
 2. Survey self-report: among controls/missing, can the genetic score
    distinguish people who self-reported the condition in the AoU survey
    from those who did not? Survey data was never used in training.
+
+Both tests are run on the full cohort and also restricted to EUR ancestry.
 """
 
 from __future__ import annotations
@@ -25,7 +27,6 @@ from sv_pgs.progress import log
 
 
 def _build_survey_hypertension_sql() -> str:
-    """BigQuery SQL to extract self-reported hypertension from AoU surveys."""
     import os
     dataset = os.environ.get("WORKSPACE_CDR", "")
     if not dataset:
@@ -45,7 +46,6 @@ GROUP BY person.person_id
 
 
 def _fetch_survey_self_report(disease: str) -> set[str]:
-    """Query BigQuery for survey self-reported cases. Returns set of person_ids."""
     if disease != "hypertension":
         log(f"  survey validation not yet implemented for disease: {disease}")
         return set()
@@ -62,158 +62,187 @@ def _fetch_survey_self_report(disease: str) -> set[str]:
         positive_ids = {str(row.person_id) for row in rows}
         log(f"  {len(positive_ids):,} people self-reported hypertension in survey")
         return positive_ids
-    except Exception as exc:
+    except (OSError, RuntimeError, ValueError) as exc:
         log(f"  BigQuery survey query failed: {exc}")
         return set()
+
+
+def _load_ancestry_labels(ancestry_path: Path) -> dict[str, str]:
+    """Load ancestry predictions. Returns {person_id: ancestry_label}."""
+    labels: dict[str, str] = {}
+    if not ancestry_path.exists():
+        return labels
+    with open(ancestry_path, encoding="utf-8") as handle:
+        reader = csv.DictReader(handle, delimiter="\t")
+        id_col = None
+        for candidate in ("research_id", "person_id", "sample_id"):
+            if candidate in (reader.fieldnames or []):
+                id_col = candidate
+                break
+        if id_col is None or "ancestry_pred" not in (reader.fieldnames or []):
+            return labels
+        for row in reader:
+            sid = row.get(id_col, "").strip()
+            ancestry = row.get("ancestry_pred", "").strip()
+            if sid and ancestry:
+                labels[sid] = ancestry
+    return labels
+
+
+def _compute_auc_safe(labels: np.ndarray, preds: np.ndarray) -> float | None:
+    if len(labels) < 20 or len(np.unique(labels)) < 2:
+        return None
+    return float(roc_auc_score(labels, preds))
+
+
+def _run_auc_test(
+    name: str,
+    neg_scores: np.ndarray,
+    pos_scores: np.ndarray,
+    results: dict[str, object],
+    key_prefix: str,
+) -> None:
+    if neg_scores.size < 10 or pos_scores.size < 10:
+        log(f"  {name}: insufficient data (neg={neg_scores.size}, pos={pos_scores.size})")
+        return
+    labels = np.concatenate([np.zeros(len(neg_scores)), np.ones(len(pos_scores))])
+    preds = np.concatenate([neg_scores, pos_scores])
+    auc = _compute_auc_safe(labels, preds)
+    if auc is None:
+        log(f"  {name}: could not compute AUC")
+        return
+    log(f"  {name}:")
+    log(f"    negative: n={len(neg_scores):,}  mean={neg_scores.mean():.6f}")
+    log(f"    positive: n={len(pos_scores):,}  mean={pos_scores.mean():.6f}")
+    log(f"    diff={pos_scores.mean() - neg_scores.mean():.6f}  >>> AUC={auc:.4f} <<<")
+    results[f"{key_prefix}_auc"] = auc
+    results[f"{key_prefix}_n_neg"] = len(neg_scores)
+    results[f"{key_prefix}_n_pos"] = len(pos_scores)
+    results[f"{key_prefix}_mean_neg"] = float(neg_scores.mean())
+    results[f"{key_prefix}_mean_pos"] = float(pos_scores.mean())
 
 
 def evaluate_all_of_us(
     output_dir: Path,
     disease: str,
 ) -> dict[str, object]:
-    """Run quasi-holdout evaluation on a completed AoU run."""
     work_dir = Path(output_dir)
 
-    # Find predictions and sample table
-    predictions_candidates = [
-        work_dir / "predictions.tsv.gz",
-        work_dir.parent / "hypertension_result" / "predictions.tsv.gz",
-    ]
+    # Find predictions
     predictions_path = None
-    for candidate in predictions_candidates:
+    for candidate in [work_dir / "predictions.tsv.gz", work_dir.parent / "hypertension_result" / "predictions.tsv.gz"]:
         if candidate.exists():
             predictions_path = candidate
             break
     if predictions_path is None:
         raise FileNotFoundError(f"No predictions.tsv.gz found in {work_dir}")
 
-    sample_table_path = work_dir / f"{disease}.samples.tsv"
-    if not sample_table_path.exists():
-        # Try parent
-        for parent in [work_dir, work_dir.parent / "hypertension_results"]:
-            candidate = parent / f"{disease}.samples.tsv"
-            if candidate.exists():
-                sample_table_path = candidate
-                break
-    if not sample_table_path.exists():
+    # Find sample table
+    sample_table_path = None
+    for parent in [work_dir, work_dir.parent / "hypertension_results"]:
+        candidate = parent / f"{disease}.samples.tsv"
+        if candidate.exists():
+            sample_table_path = candidate
+            break
+    if sample_table_path is None:
         raise FileNotFoundError(f"No {disease}.samples.tsv found")
+
+    # Find ancestry file
+    ancestry_path = None
+    for parent in [work_dir, work_dir.parent / "hypertension_results"]:
+        candidate = parent / "ancestry_preds.tsv"
+        if candidate.exists():
+            ancestry_path = candidate
+            break
 
     log("=== QUASI-HOLDOUT EVALUATION ===")
     log(f"  disease: {disease}")
     log(f"  predictions: {predictions_path}")
     log(f"  sample table: {sample_table_path}")
+    log(f"  ancestry: {ancestry_path or 'not found'}")
 
-    # Load predictions
+    # Load predictions — auto-detect score column
     scores: dict[str, float] = {}
     with gzip.open(predictions_path, "rt") as handle:
-        for row in csv.DictReader(handle, delimiter="\t"):
-            scores[row["sample_id"]] = float(row["predicted_probability"])
+        reader = csv.DictReader(handle, delimiter="\t")
+        columns = reader.fieldnames or []
+        score_col = None
+        for candidate in ("probability", "predicted_probability", "genetic_score", "linear_predictor"):
+            if candidate in columns:
+                score_col = candidate
+                break
+        if score_col is None:
+            raise ValueError(f"No score column found in predictions. Columns: {columns}")
+        log(f"  using score column: {score_col}")
+        for row in reader:
+            scores[row["sample_id"]] = float(row[score_col])
     log(f"  loaded {len(scores):,} predicted scores")
 
     # Load sample table
     observation_counts: dict[str, int] = {}
     with open(sample_table_path, encoding="utf-8") as handle:
         for row in csv.DictReader(handle, delimiter="\t"):
-            sid = row["sample_id"]
-            cnt = int(row["phenotype_occurrence_count"])
-            observation_counts[sid] = cnt
+            observation_counts[row["sample_id"]] = int(row["phenotype_occurrence_count"])
+
+    # Load ancestry
+    ancestry_labels: dict[str, str] = {}
+    if ancestry_path is not None:
+        ancestry_labels = _load_ancestry_labels(ancestry_path)
+        if ancestry_labels:
+            eur_count = sum(1 for v in ancestry_labels.values() if v.lower() in ("eur", "european"))
+            log(f"  ancestry labels: {len(ancestry_labels):,} total, {eur_count:,} EUR")
+
+    eur_ids = {sid for sid, anc in ancestry_labels.items() if anc.lower() in ("eur", "european")} if ancestry_labels else set()
 
     # Group by observation count
-    groups: dict[int, list[float]] = {}
-    missing_from_predictions: list[str] = []
+    groups: dict[int, list[tuple[str, float]]] = {}
     for sid, cnt in observation_counts.items():
         if sid in scores:
-            groups.setdefault(cnt, []).append(scores[sid])
-        else:
-            missing_from_predictions.append(sid)
-
-    if missing_from_predictions:
-        log(f"  {len(missing_from_predictions):,} sample table entries missing from predictions (dropped during training)")
+            groups.setdefault(cnt, []).append((sid, scores[sid]))
 
     results: dict[str, object] = {"disease": disease}
 
     # === Test 1: ICD code stratification ===
     log("")
     log("=== TEST 1: ICD Code Stratification (0-code vs 1-code) ===")
-    log("  The model trained both groups as target=0.")
-    log("  If it learned real biology, 1-code people should score higher.")
+    log("  Both groups were target=0 during training.")
 
-    zero_scores = np.array(groups.get(0, []))
-    one_scores = np.array(groups.get(1, []))
+    zero_items = groups.get(0, [])
+    one_items = groups.get(1, [])
+    zero_scores_arr = np.array([s for _, s in zero_items])
+    one_scores_arr = np.array([s for _, s in one_items])
 
-    if zero_scores.size > 10 and one_scores.size > 10:
-        labels_01 = np.concatenate([np.zeros(len(zero_scores)), np.ones(len(one_scores))])
-        preds_01 = np.concatenate([zero_scores, one_scores])
-        auc_01 = float(roc_auc_score(labels_01, preds_01))
+    _run_auc_test("ALL", zero_scores_arr, one_scores_arr, results, "test1_all")
 
-        log(f"  0-code: n={len(zero_scores):,}  mean_score={zero_scores.mean():.6f}  std={zero_scores.std():.6f}")
-        log(f"  1-code: n={len(one_scores):,}  mean_score={one_scores.mean():.6f}  std={one_scores.std():.6f}")
-        log(f"  difference: {one_scores.mean() - zero_scores.mean():.6f}")
-        log(f"  >>> AUC (0 vs 1): {auc_01:.4f} <<<")
-        if auc_01 > 0.52:
-            log("  interpretation: model captures hypertension risk beyond training labels")
-        elif auc_01 > 0.50:
-            log("  interpretation: weak signal, possibly noise")
-        else:
-            log("  interpretation: no signal — model may be overfitting training labels")
-
-        results["test1_auc"] = auc_01
-        results["test1_n_zero"] = len(zero_scores)
-        results["test1_n_one"] = len(one_scores)
-        results["test1_mean_zero"] = float(zero_scores.mean())
-        results["test1_mean_one"] = float(one_scores.mean())
-    else:
-        log("  insufficient data for 0-vs-1 test")
+    if eur_ids:
+        zero_eur = np.array([s for sid, s in zero_items if sid in eur_ids])
+        one_eur = np.array([s for sid, s in one_items if sid in eur_ids])
+        _run_auc_test("EUR only", zero_eur, one_eur, results, "test1_eur")
 
     # === Test 2: Survey self-report ===
     log("")
     log("=== TEST 2: Survey Self-Report Validation ===")
-    log("  Among controls (0-1 ICD codes) and people missing from EHR,")
-    log("  compare genetic scores for survey-positive vs survey-negative.")
+    log("  Among controls (0-1 codes) + missing: survey-positive vs survey-negative.")
 
     survey_positive = _fetch_survey_self_report(disease)
 
     if survey_positive:
-        # Controls + missing people
-        control_or_missing = {
-            sid for sid, cnt in observation_counts.items()
-            if cnt <= 1 and sid in scores
-        }
-        # Also include people in predictions but not in observation_counts
-        # (people in VCF without EHR — if any)
-        all_scored = set(scores.keys())
-        missing_ehr = all_scored - set(observation_counts.keys())
+        control_or_missing = {sid for sid, cnt in observation_counts.items() if cnt <= 1 and sid in scores}
+        missing_ehr = set(scores.keys()) - set(observation_counts.keys())
         eval_pool = control_or_missing | missing_ehr
 
-        survey_pos = eval_pool & survey_positive
-        survey_neg = eval_pool - survey_positive
+        survey_pos_ids = eval_pool & survey_positive
+        survey_neg_ids = eval_pool - survey_positive
 
-        pos_scores = np.array([scores[sid] for sid in survey_pos])
-        neg_scores = np.array([scores[sid] for sid in survey_neg])
+        pos_arr = np.array([scores[sid] for sid in survey_pos_ids])
+        neg_arr = np.array([scores[sid] for sid in survey_neg_ids])
 
-        if pos_scores.size > 10 and neg_scores.size > 10:
-            labels_survey = np.concatenate([np.zeros(len(neg_scores)), np.ones(len(pos_scores))])
-            preds_survey = np.concatenate([neg_scores, pos_scores])
-            auc_survey = float(roc_auc_score(labels_survey, preds_survey))
+        _run_auc_test("ALL", neg_arr, pos_arr, results, "test2_all")
 
-            log(f"  survey-negative controls: n={len(neg_scores):,}  mean_score={neg_scores.mean():.6f}")
-            log(f"  survey-positive controls: n={len(pos_scores):,}  mean_score={pos_scores.mean():.6f}")
-            log(f"  difference: {pos_scores.mean() - neg_scores.mean():.6f}")
-            log(f"  >>> AUC (survey-neg vs survey-pos): {auc_survey:.4f} <<<")
-            if auc_survey > 0.55:
-                log("  interpretation: strong evidence the model learned real hypertension biology")
-            elif auc_survey > 0.52:
-                log("  interpretation: moderate evidence of real signal")
-            else:
-                log("  interpretation: weak or no signal from survey validation")
-
-            results["test2_auc"] = auc_survey
-            results["test2_n_pos"] = len(pos_scores)
-            results["test2_n_neg"] = len(neg_scores)
-            results["test2_mean_pos"] = float(pos_scores.mean())
-            results["test2_mean_neg"] = float(neg_scores.mean())
-        else:
-            log(f"  insufficient survey overlap: {pos_scores.size} positive, {neg_scores.size} negative")
+        if eur_ids:
+            pos_eur = np.array([scores[sid] for sid in survey_pos_ids if sid in eur_ids])
+            neg_eur = np.array([scores[sid] for sid in survey_neg_ids if sid in eur_ids])
+            _run_auc_test("EUR only", neg_eur, pos_eur, results, "test2_eur")
     else:
         log("  no survey data available")
 
@@ -221,11 +250,12 @@ def evaluate_all_of_us(
     log("")
     log("=== DOSE-RESPONSE (score vs observation count) ===")
     for cnt in sorted(groups.keys()):
-        g = np.array(groups[cnt])
+        items = groups[cnt]
+        g = np.array([s for _, s in items])
         if cnt <= 5 or cnt in (10, 20, 50, 100) or cnt == max(groups.keys()):
             log(f"  {cnt:>3} codes: n={len(g):>6,}  mean_score={g.mean():.6f}")
 
-    # Save results
+    # Save
     eval_output = work_dir / f"{disease}.evaluation.json"
     with open(eval_output, "w", encoding="utf-8") as handle:
         json.dump(results, handle, indent=2)
