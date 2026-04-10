@@ -86,6 +86,14 @@ def build_parser() -> argparse.ArgumentParser:
     run_parser.add_argument("--output-dir", required=True, help="Directory for artifact and result tables.")
     run_parser.add_argument("--max-outer-iterations", type=int, default=30)
     run_parser.add_argument("--random-seed", type=int, default=0)
+
+    eval_parser = subparsers.add_parser(
+        "evaluate-all-of-us",
+        help="Quasi-holdout evaluation using ICD code stratification and survey self-report.",
+    )
+    eval_parser.add_argument("--output-dir", required=True, help="Output directory from a completed run-all-of-us.")
+    eval_parser.add_argument("--disease", required=True, help="Disease name (must match the training run).")
+
     return parser
 
 
@@ -128,6 +136,14 @@ def main(argv: list[str] | None = None) -> int:
             n_pcs=args.n_pcs,
             max_outer_iterations=args.max_outer_iterations,
             random_seed=args.random_seed,
+        )
+        return 0
+
+    if args.command == "evaluate-all-of-us":
+        from sv_pgs.evaluate import evaluate_all_of_us
+        evaluate_all_of_us(
+            output_dir=Path(args.output_dir),
+            disease=args.disease,
         )
         return 0
 
