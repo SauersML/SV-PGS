@@ -95,19 +95,18 @@ class TestMetadataScaleModel:
         assert config.type_offset_penalty > 0.0
 
 
-    def test_quality_allele_frequency_and_support_enter_scale_design(self):
+    def test_vcf_fields_do_not_enter_scale_design_as_annotations(self):
         records = [
             VariantRecord("sv_a", VariantClass.DELETION_SHORT, "chr1", 100, quality=0.95, allele_frequency=0.20),
             VariantRecord("sv_b", VariantClass.DELETION_SHORT, "chr1", 101, quality=0.50, allele_frequency=0.05, training_support=8),
             VariantRecord("sv_c", VariantClass.DELETION_SHORT, "chr1", 102, quality=0.25, allele_frequency=0.01, training_support=3),
         ]
         prior_design = _build_prior_design(records)
-        assert "continuous_spline::quality::basis_0" in prior_design.feature_names
-        assert "continuous_spline_interaction::quality::deletion_short::basis_0" in prior_design.feature_names
-        assert "continuous_spline_interaction::logit_allele_frequency::deletion_short::basis_0" in prior_design.feature_names
-        assert "continuous_spline_interaction::log_training_support::deletion_short::basis_0" in prior_design.feature_names
+        assert all("quality" not in feature_name for feature_name in prior_design.feature_names)
+        assert all("allele_frequency" not in feature_name for feature_name in prior_design.feature_names)
+        assert all("training_support" not in feature_name for feature_name in prior_design.feature_names)
 
-    def test_annotation_binary_features_and_frequency_bins_enter_scale_design(self):
+    def test_annotation_binary_features_enter_scale_design(self):
         records = [
             VariantRecord(
                 "sv_a",
@@ -151,9 +150,6 @@ class TestMetadataScaleModel:
         assert "factor_level::coding_annotation::true" in prior_design.feature_names
         assert "factor_interaction::coding_annotation::true::deletion_short" in prior_design.feature_names
         assert "continuous_spline::constraint_score::basis_0" in prior_design.feature_names
-        assert "factor_level::maf_bucket::ultra_rare" in prior_design.feature_names
-        assert "factor_interaction::maf_bucket::rare::deletion_short" in prior_design.feature_names
-        assert "factor_interaction::maf_bucket::low_frequency::deletion_short" in prior_design.feature_names
 
         coefficients = np.zeros(len(prior_design.feature_names), dtype=np.float64)
         coefficients[prior_design.feature_names.index("factor_level::coding_annotation::true")] = 0.3
@@ -210,19 +206,16 @@ class TestMetadataScaleModel:
 
         np.testing.assert_allclose(design_matrix, prior_design.design_matrix)
 
-    def test_structural_annotations_still_affect_prior_scale(self):
+    def test_vcf_structural_fields_do_not_enter_scale_design_as_annotations(self):
         records = [
             VariantRecord("sv_a", VariantClass.DELETION_SHORT, "chr1", 100, length=100.0, is_copy_number=False),
             VariantRecord("sv_b", VariantClass.DELETION_SHORT, "chr1", 101, length=2_000.0, is_copy_number=True),
             VariantRecord("sv_c", VariantClass.DELETION_SHORT, "chr1", 102, length=6_000.0, is_repeat=True),
         ]
         prior_design = _build_prior_design(records)
-        coefficients = np.zeros(len(prior_design.feature_names), dtype=np.float64)
-        coefficients[prior_design.feature_names.index("continuous_spline_interaction::log_length::deletion_short::basis_0")] = 0.5
-        coefficients[prior_design.feature_names.index("factor_level::copy_number_indicator::true")] = 0.5
-        coefficients[prior_design.feature_names.index("factor_level::repeat_indicator::true")] = -0.5
-        baseline_scales = _metadata_baseline_scales_from_coefficients(coefficients, prior_design.design_matrix, ModelConfig())
-        assert np.unique(np.round(baseline_scales, 6)).shape[0] > 1
+        assert all("log_length" not in feature_name for feature_name in prior_design.feature_names)
+        assert all("copy_number" not in feature_name for feature_name in prior_design.feature_names)
+        assert all("repeat" not in feature_name for feature_name in prior_design.feature_names)
 
     def test_custom_continuous_features_enter_scale_design_and_affect_prior_scale(self):
         records = [
@@ -302,15 +295,15 @@ class TestMetadataScaleModel:
 
         assert np.unique(np.round(baseline_scales, 6)).shape[0] > 1
 
-    def test_custom_continuous_features_cannot_override_reserved_names(self):
-        with pytest.raises(ValueError, match="built-in features: log_length"):
-            VariantRecord(
-                "sv_a",
-                VariantClass.DELETION_SHORT,
-                "chr1",
-                100,
-                prior_continuous_features={"log_length": 1.0},
-            )
+    def test_user_annotation_names_are_not_reserved_by_old_built_ins(self):
+        record = VariantRecord(
+            "sv_a",
+            VariantClass.DELETION_SHORT,
+            "chr1",
+            100,
+            prior_continuous_features={"log_length": 1.0},
+        )
+        assert record.prior_continuous_features == {"log_length": 1.0}
 
     def test_custom_continuous_features_cannot_contain_feature_delimiter(self):
         with pytest.raises(ValueError, match="cannot contain '::'"):

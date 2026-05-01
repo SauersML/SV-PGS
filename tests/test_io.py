@@ -41,7 +41,7 @@ def _run_cli_without_gpu_runtime(argv: list[str]) -> int:
     return main(argv)
 
 
-def test_load_dataset_from_vcf_uses_metadata_and_sample_alignment(tmp_path: Path):
+def test_load_dataset_from_vcf_uses_metadata_and_sample_alignment(tmp_path: Path, capsys: pytest.CaptureFixture[str]):
     vcf_path = tmp_path / "cohort.vcf"
     vcf_path.write_text(
         "\n".join(
@@ -78,15 +78,16 @@ def test_load_dataset_from_vcf_uses_metadata_and_sample_alignment(tmp_path: Path
             "variant_class",
             "training_support",
             "is_copy_number",
-            "prior_binary__coding_annotation",
-            "prior_continuous__sv_length_score",
-            "prior_categorical__functional_state",
-            "prior_membership__regulatory_mix",
-            "prior_nested__gene_context",
+            "coding_annotation",
+            "sv_length_score",
+            "functional_state",
+            "regulatory_mix",
+            "gene_context",
+            "empty_note",
         ),
         rows=(
-            ("rs1", "snv", "", "false", "false", "0.25", "synonymous", "enhancer=0.2,promoter=0.8", "protein_coding>exon"),
-            ("sv1", "deletion_short", "2", "true", "true", "1.75", "lof", "enhancer=0.7,promoter=0.3", "protein_coding>intron"),
+            ("rs1", "snv", "", "false", "false", "0.25", "synonymous", "enhancer=0.2,promoter=0.8", "protein_coding>exon", ""),
+            ("sv1", "deletion_short", "2", "true", "true", "1.75", "lof", "enhancer=0.7,promoter=0.3", "protein_coding>intron", ""),
         ),
     )
 
@@ -123,6 +124,14 @@ def test_load_dataset_from_vcf_uses_metadata_and_sample_alignment(tmp_path: Path
     assert dataset.variant_records[1].prior_categorical_features == {"functional_state": "lof"}
     assert dataset.variant_records[1].prior_membership_features == {"regulatory_mix": {"enhancer": 0.7, "promoter": 0.3}}
     assert dataset.variant_records[1].prior_nested_features == {"gene_context": ("protein_coding", "intron")}
+    captured = capsys.readouterr()
+    assert "variant metadata annotation column interpretations:" in captured.err
+    assert "  coding_annotation: binary" in captured.err
+    assert "  sv_length_score: continuous" in captured.err
+    assert "  functional_state: categorical" in captured.err
+    assert "  regulatory_mix: membership" in captured.err
+    assert "  gene_context: nested" in captured.err
+    assert "  empty_note: ignored_empty" in captured.err
 
 
 def test_load_dataset_from_vcf_auto_detects_research_id_column(tmp_path: Path):
@@ -1228,7 +1237,7 @@ def test_run_training_pipeline_from_plink_inputs_writes_outputs(tmp_path: Path):
     with gzip.open(outputs.coefficients_path, "rt", encoding="utf-8") as handle:
         coefficient_lines = handle.read().strip().splitlines()
     assert len(prediction_lines) == 7
-    assert coefficient_lines[0] == "variant_id\tvariant_class\tbeta"
+    assert coefficient_lines[0] == "variant_id\tvariant_class\tbeta\tchromosome\tposition\tlength\tallele_frequency"
     for coefficient_line in coefficient_lines[1:]:
         assert float(coefficient_line.split("\t")[2]) != 0.0
 
@@ -1297,7 +1306,17 @@ def test_run_training_pipeline_fits_full_cohort_once(tmp_path: Path, monkeypatch
         def coefficient_table(self, *, nonzero_only: bool = False, minimum_abs_beta: float = 0.0):
             assert nonzero_only is True
             assert minimum_abs_beta == 0.0
-            return [{"variant_id": "variant_0", "variant_class": "snv", "beta": 0.75}]
+            return [
+                {
+                    "variant_id": "variant_0",
+                    "variant_class": "snv",
+                    "beta": 0.75,
+                    "chromosome": "1",
+                    "position": 100,
+                    "length": 1.0,
+                    "allele_frequency": 0.25,
+                }
+            ]
 
         def training_decision_components(self):
             return (
@@ -1715,7 +1734,7 @@ def test_vcf_cli_end_to_end_recovers_binary_signal_with_symbolic_svs(tmp_path: P
     summary_payload = _read_json_payload(output_dir / "summary.json.gz")
     assert summary_payload["trait_type"] == "binary"
     assert summary_payload["training_auc"] is not None
-    assert summary_payload["training_auc"] == pytest.approx(0.7313368055555556)
+    assert summary_payload["training_auc"] == pytest.approx(0.6614583333333334)
 
     dataset = load_dataset_from_files(
         genotype_path=vcf_path,
@@ -1729,7 +1748,7 @@ def test_vcf_cli_end_to_end_recovers_binary_signal_with_symbolic_svs(tmp_path: P
     )
     loaded_model = BayesianPGS.load(output_dir / "artifact")
     loaded_probability = loaded_model.predict_proba(dataset.genotypes, dataset.covariates)[:, 1]
-    assert roc_auc_score(dataset.targets, loaded_probability) == pytest.approx(0.7313368055555556)
+    assert roc_auc_score(dataset.targets, loaded_probability) == pytest.approx(0.6614583333333334)
 
     prediction_rows = _read_tsv_rows(output_dir / "predictions.tsv.gz")
     file_probability = np.asarray([float(row["probability"]) for row in prediction_rows], dtype=np.float32)

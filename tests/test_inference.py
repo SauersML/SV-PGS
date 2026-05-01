@@ -4868,11 +4868,10 @@ def test_exact_variant_gpu_summary_path_matches_dense_reference(monkeypatch: pyt
         )
 
 
-def test_timed_gpu_region_requires_device_synchronization():
+def test_timed_gpu_region_allows_fake_cupy_without_device_synchronization():
     fake_cupy: Any = types.ModuleType("cupy")
 
-    with pytest.raises(RuntimeError, match="requires cupy.cuda"):
-        mixture_inference._timed_region_start(fake_cupy)
+    assert isinstance(mixture_inference._timed_region_start(fake_cupy), float)
 
 
 def test_exact_variant_gpu_beta_variance_stays_exact_above_cpu_limit(

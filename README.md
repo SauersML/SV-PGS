@@ -24,7 +24,7 @@ That single command:
 3. Queries BigQuery for the disease phenotype (ICD-9/10 codes built-in)
 4. Concatenates the requested chromosome VCFs into one genome-wide training dataset
 5. Fits one Bayesian PGS model on GPU across all requested chromosomes
-6. Deletes downloaded chromosome VCFs after the fit completes
+6. Uses `--variant-metadata` annotations when supplied; it does not derive annotations from VCF INFO
 7. Reuses an existing fit only when the full AoU run configuration matches
 8. Covariates: age, age^2, sex at birth, race, ethnicity, PC1-PC10
 
@@ -62,19 +62,18 @@ uv run sv-pgs run \
   --output-dir results
 ```
 
-`--variant-metadata` is keyed by `variant_id` and drives the schema-based prior hypermodel. Supported annotation columns are:
+`--variant-metadata` is keyed by `variant_id` and drives the schema-based prior hypermodel. Apart from reserved model columns (`variant_id`, `variant_class`, `chromosome`, `position`, `length`, `allele_frequency`, `quality`, `training_support`, `is_repeat`, `is_copy_number`, `prior_class_members`, `prior_class_membership`), every column is treated as a user annotation. Column types are inferred from the values:
 
-- `prior_binary__NAME`: boolean feature
-- `prior_continuous__NAME`: numeric feature
-- `prior_categorical__NAME`: single categorical level
-- `prior_membership__NAME`: weighted levels like `enhancer=0.7,promoter=0.3`
-- `prior_nested__NAME`: hierarchical path like `protein_coding>exon`
-- `prior_nested_membership__NAME`: weighted hierarchical paths like `protein_coding>exon=0.5,protein_coding>intron=0.5`
+- boolean values (`true`, `false`, `1`, `0`, `yes`, `no`) become binary annotations
+- numeric values become continuous annotations
+- `level=weight` lists become weighted membership annotations
+- `parent>child` values become nested annotations
+- other strings become categorical annotations
 
 Example:
 
 ```tsv
-variant_id	prior_binary__coding	prior_continuous__constraint	prior_categorical__functional_state	prior_membership__regulatory_mix	prior_nested__gene_context
+variant_id	coding	constraint	functional_state	regulatory_mix	gene_context
 sv1	1	0.82	lof	enhancer=0.7,promoter=0.3	protein_coding>exon
 sv2	0	0.15	missense	enhancer=0.2,promoter=0.8	protein_coding>intron
 ```

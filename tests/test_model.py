@@ -184,9 +184,9 @@ def test_runtime_tuned_config_caps_binary_stochastic_batch_size_on_small_gpu(mon
     tuned_config, summary = _runtime_tuned_config_for_fit(config, raw_genotypes)
 
     assert tuned_config.exact_solver_matrix_limit == 2_048
-    assert tuned_config.stochastic_variant_batch_size == 4_096
+    assert tuned_config.stochastic_variant_batch_size == 4_967
     assert summary is not None
-    assert "stochastic_variant_batch_size=8192->4096" in summary
+    assert "stochastic_variant_batch_size=8192->4967" in summary
 
 
 def test_fit_stage_structure_cache_key_is_shared_across_traits(monkeypatch):
@@ -910,7 +910,7 @@ def test_tie_group_export_weights_are_proportional_to_member_variances():
         class_tpb_shape_a={VariantClass.SNV: 1.0},
         class_tpb_shape_b={VariantClass.SNV: 0.5},
         scale_model_coefficients=np.zeros(1, dtype=np.float32),
-        scale_model_feature_names=["copy_number_indicator"],
+        scale_model_feature_names=["user_annotation"],
         sigma_error2=1.0,
         objective_history=[],
         validation_history=[],

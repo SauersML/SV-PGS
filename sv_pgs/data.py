@@ -9,24 +9,6 @@ from sv_pgs.config import VariantClass
 
 
 NESTED_PATH_DELIMITER = ">"
-RESERVED_PRIOR_CONTINUOUS_FEATURE_NAMES = frozenset(
-    {
-        "log_length",
-        "logit_allele_frequency",
-        "quality",
-        "log_training_support",
-    }
-)
-RESERVED_PRIOR_FACTOR_FEATURE_NAMES = frozenset(
-    {
-        "repeat_indicator",
-        "copy_number_indicator",
-        "maf_bucket",
-    }
-)
-RESERVED_PRIOR_FEATURE_NAMES = frozenset(
-    set(RESERVED_PRIOR_CONTINUOUS_FEATURE_NAMES) | set(RESERVED_PRIOR_FACTOR_FEATURE_NAMES)
-)
 
 
 def _validate_prior_feature_name(feature_name: str, field_name: str) -> None:
@@ -34,10 +16,6 @@ def _validate_prior_feature_name(feature_name: str, field_name: str) -> None:
         raise ValueError(field_name + " keys cannot be empty.")
     if "::" in feature_name:
         raise ValueError(field_name + " keys cannot contain '::'.")
-    if feature_name in RESERVED_PRIOR_FEATURE_NAMES:
-        raise ValueError(
-            field_name + " keys cannot override built-in features: " + feature_name
-        )
 
 
 def _normalize_nested_path(path_value: Any, field_name: str) -> tuple[str, ...]:

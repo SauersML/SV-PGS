@@ -46,6 +46,10 @@ def build_parser() -> argparse.ArgumentParser:
     aou_run_parser.add_argument("--disease", required=True, help="Disease name (e.g. hypertension, type2_diabetes).")
     aou_run_parser.add_argument("--chromosomes", default="1-22", help="Chromosome range (default: 1-22).")
     aou_run_parser.add_argument("--output-dir", required=True, help="Base output directory.")
+    aou_run_parser.add_argument(
+        "--variant-metadata",
+        help="Optional CSV or TSV keyed by variant_id. Every non-reserved column is used as a prior annotation.",
+    )
     aou_run_parser.add_argument("--n-pcs", type=int, default=10, help="Number of genomic PCs to include (default: 10).")
     aou_run_parser.add_argument("--max-outer-iterations", type=int, default=30)
     aou_run_parser.add_argument("--random-seed", type=int, default=0)
@@ -78,9 +82,8 @@ def build_parser() -> argparse.ArgumentParser:
     run_parser.add_argument(
         "--variant-metadata",
         help=(
-            "Optional CSV or TSV keyed by variant_id. Supports prior_binary__, "
-            "prior_continuous__, prior_categorical__, prior_membership__, "
-            "prior_nested__, and prior_nested_membership__ annotation columns."
+            "Optional CSV or TSV keyed by variant_id. Every non-reserved column is inferred "
+            "as a binary, numeric, categorical, weighted-membership, or nested annotation."
         ),
     )
     run_parser.add_argument("--output-dir", required=True, help="Directory for artifact and result tables.")
@@ -133,6 +136,7 @@ def main(argv: list[str] | None = None) -> int:
             disease=args.disease,
             chromosomes=chromosomes,
             output_base=args.output_dir,
+            variant_metadata_path=args.variant_metadata,
             n_pcs=args.n_pcs,
             max_outer_iterations=args.max_outer_iterations,
             random_seed=args.random_seed,

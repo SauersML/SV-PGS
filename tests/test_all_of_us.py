@@ -23,13 +23,6 @@ from sv_pgs.config import ModelConfig
 from sv_pgs.io import load_multi_vcf_dataset_from_files
 
 
-def _write_aou_variant_metadata_stub(path: Path) -> Path:
-    with gzip.open(path, "wt", encoding="utf-8", newline="") as handle:
-        writer = csv.writer(handle, delimiter="\t")
-        writer.writerow(("variant_id", "variant_class"))
-    return path
-
-
 class _FakeQueryJob:
     def __init__(self, rows: list[dict[str, object]]) -> None:
         self._rows = rows
@@ -367,6 +360,7 @@ def test_cli_run_all_of_us_forwards_core_settings(monkeypatch, tmp_path: Path):
         "disease": "heart_failure",
         "chromosomes": [1, 2],
         "output_base": str(tmp_path),
+        "variant_metadata_path": None,
         "n_pcs": 10,
         "max_outer_iterations": 30,
         "random_seed": 0,
@@ -697,15 +691,10 @@ def test_run_all_of_us_runs_single_unified_fit_and_reuses_cached_downloads(monke
     monkeypatch.setattr(aou_runner, "merge_pcs_into_sample_table", fake_merge)
     monkeypatch.setattr(aou_runner, "download_sv_vcf", fake_download_sv_vcf)
     monkeypatch.setattr("sv_pgs.io.precache_vcfs_parallel", lambda vcf_paths, config: None)
-    monkeypatch.setattr(
-        aou_runner,
-        "build_aou_sv_variant_metadata",
-        lambda *, vcf_paths, output_path: _write_aou_variant_metadata_stub(output_path),
-    )
     monkeypatch.setattr(aou_runner, "release_process_memory", lambda: release_calls.append("released"))
     def fake_load_multi_vcf_dataset_from_files(**kwargs):
         loader_calls.append([str(path) for path in kwargs["genotype_paths"]])
-        assert kwargs["variant_metadata_path"] == tmp_path / "variant_metadata.tsv.gz"
+        assert kwargs["variant_metadata_path"] is None
         return _Dataset()
 
     def fake_run_training_pipeline(**kwargs):
@@ -755,7 +744,7 @@ def test_run_all_of_us_rejects_duplicate_or_invalid_chromosomes(tmp_path: Path):
         )
 
 
-def test_build_aou_sv_variant_metadata_extracts_prior_annotation_features(tmp_path: Path):
+def test_load_multi_vcf_dataset_uses_user_supplied_generic_annotations(tmp_path: Path):
     vcf_path = tmp_path / "annotated_sv.vcf"
     vcf_path.write_text(
         "\n".join(
@@ -765,42 +754,24 @@ def test_build_aou_sv_variant_metadata_extracts_prior_annotation_features(tmp_pa
                 "##INFO=<ID=AF,Number=A,Type=Float,Description=\"Allele frequency\">",
                 "##INFO=<ID=SVTYPE,Number=1,Type=String,Description=\"SV type\">",
                 "##INFO=<ID=SVLEN,Number=1,Type=Integer,Description=\"SV length\">",
-                "##INFO=<ID=ALGORITHMS,Number=.,Type=String,Description=\"Calling algorithms\">",
-                "##INFO=<ID=PREDICTED_LOF,Number=.,Type=String,Description=\"Predicted LOF genes\">",
-                "##INFO=<ID=PREDICTED_NONCODING_SPAN,Number=.,Type=String,Description=\"Noncoding span annotations\">",
-                "##INFO=<ID=CNQ,Number=1,Type=Float,Description=\"Copy number quality\">",
-                "##INFO=<ID=LOEUF,Number=1,Type=Float,Description=\"Constraint score\">",
-                "##INFO=<ID=PHYLOP,Number=1,Type=Float,Description=\"Conservation score\">",
-                "##INFO=<ID=REPEATMASKER,Number=1,Type=String,Description=\"Repeat annotation\">",
-                "##INFO=<ID=PREDICTED_PROMOTER,Number=.,Type=String,Description=\"Promoter overlaps\">",
                 "##FORMAT=<ID=GT,Number=1,Type=String,Description=\"Genotype\">",
                 "#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\ts1",
-                "1\t100\tsv_lof\tN\t<DEL>\t80\tPASS\tAF=0.01;SVTYPE=DEL;SVLEN=-1200;ALGORITHMS=MANTA,WHAM;PREDICTED_LOF=GENE1,GENE2;PREDICTED_NONCODING_SPAN=enhancer,promoter;CNQ=42;LOEUF=0.12;PHYLOP=1.5\tGT\t0/1",
-                "1\t300\tsv_repeat\tN\t<DUP>\t50\tPASS\tAF=0.05;SVTYPE=DUP;SVLEN=600;ALGORITHMS=DEPTH;PREDICTED_PROMOTER=GENE3;REPEATMASKER=LINE\tGT\t0/1",
+                "1\t100\tsv_lof\tN\t<DEL>\t80\tPASS\tAF=0.01;SVTYPE=DEL;SVLEN=-1200\tGT\t0/1",
+                "1\t300\tsv_repeat\tN\t<DUP>\t50\tPASS\tAF=0.05;SVTYPE=DUP;SVLEN=600\tGT\t0/1",
                 "",
             ]
         ),
         encoding="utf-8",
     )
-
-    metadata_path = aou_runner.build_aou_sv_variant_metadata(
-        vcf_paths=[vcf_path],
-        output_path=tmp_path / "variant_metadata.tsv.gz",
+    metadata_path = tmp_path / "variant_metadata.tsv"
+    _write_table(
+        metadata_path,
+        header=("variant_id", "functional_state", "constraint_score", "regulatory_mix", "gene_context"),
+        rows=(
+            ("sv_lof", "lof", "0.12", "enhancer=0.5,promoter=0.5", "genic>loss_of_function"),
+            ("sv_repeat", "promoter", "0.35", "enhancer=0.2,promoter=0.8", "regulatory>promoter"),
+        ),
     )
-
-    rows = _read_tsv_rows(metadata_path)
-    assert [row["variant_id"] for row in rows] == ["sv_lof", "sv_repeat"]
-    assert rows[0]["prior_binary__predicted_lof"] == "true"
-    assert rows[0]["prior_continuous__lof_gene_count"] == "2"
-    assert rows[0]["prior_membership__calling_algorithms"] == "manta=0.5,wham=0.5"
-    assert rows[0]["prior_membership__noncoding_span"] == "enhancer=0.5,promoter=0.5"
-    assert rows[0]["prior_categorical__strongest_effect"] == "lof"
-    assert rows[0]["prior_nested__functional_context"] == "genic>loss_of_function"
-    assert rows[0]["prior_continuous__constraint_score"] == "0.12"
-    assert rows[0]["prior_continuous__conservation_score"] == "1.5"
-    assert rows[1]["prior_binary__is_repeat"] == "true"
-    assert rows[1]["prior_binary__predicted_promoter"] == "true"
-    assert rows[1]["prior_categorical__strongest_effect"] == "promoter"
 
     sample_table_path = tmp_path / "samples.tsv"
     sample_table_path.write_text("sample_id\ttarget\ns1\t1\n", encoding="utf-8")
@@ -813,10 +784,10 @@ def test_build_aou_sv_variant_metadata_extracts_prior_annotation_features(tmp_pa
         covariate_columns=(),
         variant_metadata_path=metadata_path,
     )
-    assert dataset.variant_records[0].prior_binary_features["predicted_lof"] is True
-    assert dataset.variant_records[0].prior_membership_features["calling_algorithms"] == {"manta": 0.5, "wham": 0.5}
-    assert dataset.variant_records[0].prior_categorical_features["strongest_effect"] == "lof"
-    assert dataset.variant_records[0].prior_nested_features["functional_context"] == ("genic", "loss_of_function")
+    assert dataset.variant_records[0].prior_categorical_features["functional_state"] == "lof"
+    assert dataset.variant_records[0].prior_continuous_features["constraint_score"] == 0.12
+    assert dataset.variant_records[0].prior_membership_features["regulatory_mix"] == {"enhancer": 0.5, "promoter": 0.5}
+    assert dataset.variant_records[0].prior_nested_features["gene_context"] == ("genic", "loss_of_function")
 
 
 def test_run_all_of_us_skips_existing_fit_only_when_run_metadata_matches(monkeypatch, tmp_path: Path):
@@ -843,7 +814,7 @@ def test_run_all_of_us_skips_existing_fit_only_when_run_metadata_matches(monkeyp
                 covariates=covariates,
                 max_outer_iterations=30,
                 random_seed=0,
-                variant_metadata_schema_version=aou_runner._AOU_VARIANT_METADATA_SCHEMA_VERSION,
+                variant_metadata_path=None,
             ),
             indent=2,
         ),
@@ -908,7 +879,7 @@ def test_run_all_of_us_reruns_when_existing_fit_metadata_differs(monkeypatch, tm
                 covariates=aou_runner.DEFAULT_COVARIATES + ["PC1", "PC2"],
                 max_outer_iterations=30,
                 random_seed=0,
-                variant_metadata_schema_version=aou_runner._AOU_VARIANT_METADATA_SCHEMA_VERSION,
+                variant_metadata_path=None,
             ),
             indent=2,
         ),
@@ -936,15 +907,10 @@ def test_run_all_of_us_reruns_when_existing_fit_metadata_differs(monkeypatch, tm
     monkeypatch.setattr(aou_runner, "merge_pcs_into_sample_table", fake_merge)
     monkeypatch.setattr(aou_runner, "download_sv_vcf", fake_download_sv_vcf)
     monkeypatch.setattr("sv_pgs.io.precache_vcfs_parallel", lambda vcf_paths, config: None)
-    monkeypatch.setattr(
-        aou_runner,
-        "build_aou_sv_variant_metadata",
-        lambda *, vcf_paths, output_path: _write_aou_variant_metadata_stub(output_path),
-    )
     monkeypatch.setattr(aou_runner, "release_process_memory", lambda: None)
     def fake_load_multi_vcf_dataset_from_files(**kwargs):
         loader_calls.append([str(path) for path in kwargs["genotype_paths"]])
-        assert kwargs["variant_metadata_path"] == tmp_path / "variant_metadata.tsv.gz"
+        assert kwargs["variant_metadata_path"] is None
         return _Dataset()
 
     def fake_run_training_pipeline(**kwargs):
@@ -997,11 +963,6 @@ def test_run_all_of_us_raises_when_parallel_precache_fails(monkeypatch, tmp_path
     monkeypatch.setattr(
         "sv_pgs.io.precache_vcfs_parallel",
         lambda vcf_paths, config: (_ for _ in ()).throw(ValueError("boom")),
-    )
-    monkeypatch.setattr(
-        aou_runner,
-        "build_aou_sv_variant_metadata",
-        lambda *, vcf_paths, output_path: (_ for _ in ()).throw(AssertionError("metadata build should not run")),
     )
     monkeypatch.setattr(
         aou_runner,

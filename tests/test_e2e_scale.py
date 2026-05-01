@@ -203,7 +203,7 @@ def test_large_scale_binary_end_to_end_roundtrip(tmp_path: Path):
     assert model.state is not None
     assert model.state.tie_map.original_to_reduced[0] == model.state.tie_map.original_to_reduced[1]
     assert model.state.tie_map.original_to_reduced[0] == model.state.tie_map.original_to_reduced[2]
-    assert model.state.tie_map.original_to_reduced[30] >= 0
+    assert model.state.tie_map.original_to_reduced[30] == -1
 
     test_probability = model.predict_proba(genotype_matrix[train_stop:], covariate_matrix[train_stop:])[:, 1]
     assert np.all(np.isfinite(test_probability))
@@ -332,7 +332,7 @@ def test_artifact_roundtrip_preserves_full_variant_metadata(tmp_path: Path):
         class_tpb_shape_a={VariantClass.OTHER_COMPLEX_SV: 1.0},
         class_tpb_shape_b={VariantClass.OTHER_COMPLEX_SV: 0.5},
         scale_model_coefficients=np.zeros(3, dtype=np.float32),
-        scale_model_feature_names=["type_offset::snv", "repeat_indicator", "copy_number_indicator"],
+        scale_model_feature_names=["type_offset::snv", "user_annotation", "another_user_annotation"],
         objective_history=[-10.0, -9.0],
         validation_history=[0.7],
     )

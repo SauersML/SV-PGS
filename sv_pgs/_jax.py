@@ -89,7 +89,7 @@ def _cupy_runtime_status() -> tuple[bool, str]:
         return False, f"cupy_unavailable={type(exc).__name__}: {exc}"
     try:
         device_count = int(cp.cuda.runtime.getDeviceCount())
-    except (OSError, RuntimeError) as exc:
+    except (AttributeError, OSError, RuntimeError) as exc:
         return False, f"cupy_cuda_error={type(exc).__name__}: {exc}"
     if device_count < 1:
         return False, "cupy_devices=0"

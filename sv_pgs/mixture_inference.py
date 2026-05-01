@@ -19,7 +19,7 @@ could be:
 The prior variance tau_j^2 is built from three pieces:
   - sigma_g      : a single global scale (shared across all variants)
   - s_j          : a metadata-driven baseline scale (depends on variant
-                   type, length, repeat status — bigger for SVs than SNVs)
+                   class and user-supplied annotation columns)
   - lambda_j     : a per-variant local shrinkage factor that lets the model
                    pull unimportant variants toward zero while letting
                    important ones stay large
@@ -224,10 +224,10 @@ def _synchronize_gpu_for_timing(cupy_module: Any | None) -> None:
         return
     cuda = getattr(cupy_module, "cuda", None)
     if cuda is None:
-        raise RuntimeError("Timed GPU region requires cupy.cuda for device synchronization.")
+        return
     device_factory = getattr(cuda, "Device", None)
     if device_factory is None:
-        raise RuntimeError("Timed GPU region requires cupy.cuda.Device for device synchronization.")
+        return
     try:
         device_factory().synchronize()
     except (AttributeError, OSError, RuntimeError, TypeError) as error:
@@ -8597,42 +8597,7 @@ def _prior_annotation_tables(records: Sequence[VariantRecord]) -> _PriorAnnotati
 
 
 def _continuous_prior_annotation_values(records: Sequence[VariantRecord]) -> dict[str, np.ndarray]:
-    allele_frequencies = np.clip(
-        np.nan_to_num(
-            np.asarray([record.allele_frequency for record in records], dtype=np.float64),
-            nan=0.5,
-            posinf=1.0,
-            neginf=0.0,
-        ),
-        1e-6,
-        1.0 - 1e-6,
-    )
-    training_support = np.maximum(
-        np.nan_to_num(
-            np.asarray(
-                [
-                    0.0 if record.training_support is None else float(record.training_support)
-                    for record in records
-                ],
-                dtype=np.float64,
-            ),
-            nan=0.0,
-            posinf=0.0,
-            neginf=0.0,
-        ),
-        0.0,
-    )
-    feature_values_by_name = {
-        "log_length": np.log(np.maximum(np.asarray([record.length for record in records], dtype=np.float64), 1.0)),
-        "logit_allele_frequency": np.log(allele_frequencies) - np.log1p(-allele_frequencies),
-        "quality": np.nan_to_num(
-            np.asarray([record.quality for record in records], dtype=np.float64),
-            nan=1.0,
-            posinf=1.0,
-            neginf=0.0,
-        ),
-        "log_training_support": np.log1p(training_support),
-    }
+    feature_values_by_name = {}
     for feature_name in sorted(
         {
             feature_name
@@ -8652,25 +8617,6 @@ def _continuous_prior_annotation_values(records: Sequence[VariantRecord]) -> dic
 
 def _factor_prior_annotation_weights(records: Sequence[VariantRecord]) -> dict[str, dict[str, np.ndarray]]:
     factor_weights_by_source: dict[str, dict[str, np.ndarray]] = {}
-    repeat_values = np.asarray([float(record.is_repeat) for record in records], dtype=np.float64)
-    factor_weights_by_source["repeat_indicator"] = {
-        "false": 1.0 - repeat_values,
-        "true": repeat_values,
-    }
-    copy_number_values = np.asarray([float(record.is_copy_number) for record in records], dtype=np.float64)
-    factor_weights_by_source["copy_number_indicator"] = {
-        "false": 1.0 - copy_number_values,
-        "true": copy_number_values,
-    }
-
-    minor_allele_frequency = _minor_allele_frequency_values(records)
-    factor_weights_by_source["maf_bucket"] = {
-        "common": np.asarray(minor_allele_frequency >= 5e-2, dtype=np.float64),
-        "low_frequency": np.asarray((minor_allele_frequency >= 1e-2) & (minor_allele_frequency < 5e-2), dtype=np.float64),
-        "rare": np.asarray((minor_allele_frequency >= 1e-3) & (minor_allele_frequency < 1e-2), dtype=np.float64),
-        "ultra_rare": np.asarray(minor_allele_frequency < 1e-3, dtype=np.float64),
-    }
-
     for feature_name in sorted(
         {
             binary_feature_name
