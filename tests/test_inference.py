@@ -28,6 +28,8 @@ from sv_pgs.mixture_inference import (
     _orthogonal_probe_matrix,
     _prefer_iterative_variant_space,
     _quantitative_posterior_state,
+    _should_checkpoint_stochastic_block,
+    _should_log_stochastic_block,
     _should_use_posterior_working_set,
     _solve_restricted_full,
     _restricted_precision_projector,
@@ -46,6 +48,7 @@ from sv_pgs.mixture_inference import (
     _use_exact_sample_space_solve,
     _use_gpu_exact_variant_solve,
     _update_tpb_shape_vectors,
+    _tie_map_is_identity,
 )
 import sv_pgs.mixture_inference as mixture_inference
 from sv_pgs.preprocessing import build_tie_map
@@ -102,6 +105,27 @@ def test_binary_inference_runs(random_generator):
     assert result.sigma_error2 == 1.0
     assert len(result.class_tpb_shape_a) == 1
     assert len(result.class_tpb_shape_b) == 1
+
+
+def test_tie_map_is_identity_rejects_collapsed_groups():
+    identity_tie_map = TieMap(
+        kept_indices=np.array([0, 1], dtype=np.int32),
+        original_to_reduced=np.array([0, 1], dtype=np.int32),
+        reduced_to_group=[
+            TieGroup(0, np.array([0], dtype=np.int32), np.array([1.0], dtype=np.float32)),
+            TieGroup(1, np.array([1], dtype=np.int32), np.array([1.0], dtype=np.float32)),
+        ],
+    )
+    tied_map = TieMap(
+        kept_indices=np.array([0], dtype=np.int32),
+        original_to_reduced=np.array([0, 0], dtype=np.int32),
+        reduced_to_group=[
+            TieGroup(0, np.array([0, 1], dtype=np.int32), np.array([1.0, 1.0], dtype=np.float32)),
+        ],
+    )
+
+    assert _tie_map_is_identity(identity_tie_map, member_count=2)
+    assert not _tie_map_is_identity(tied_map, member_count=2)
 
 
 def test_quantitative_inference_runs_with_stochastic_variant_updates(random_generator):
@@ -2334,6 +2358,45 @@ def test_stochastic_sample_space_preconditioner_rank_scales_with_blend_weight():
     assert _stochastic_sample_space_preconditioner_rank(requested_rank=0, step_size=0.05) == 0
 
 
+def test_stochastic_checkpoint_throttle_skips_first_large_epoch_block():
+    assert not _should_checkpoint_stochastic_block(
+        block_count=1,
+        total_blocks=100,
+        last_checkpoint_block=0,
+        last_checkpoint_time=-float("inf"),
+        current_time=0.0,
+    )
+    assert _should_checkpoint_stochastic_block(
+        block_count=5,
+        total_blocks=100,
+        last_checkpoint_block=0,
+        last_checkpoint_time=-float("inf"),
+        current_time=0.0,
+    )
+    assert not _should_checkpoint_stochastic_block(
+        block_count=10,
+        total_blocks=100,
+        last_checkpoint_block=5,
+        last_checkpoint_time=0.0,
+        current_time=30.0,
+    )
+    assert _should_checkpoint_stochastic_block(
+        block_count=100,
+        total_blocks=100,
+        last_checkpoint_block=95,
+        last_checkpoint_time=0.0,
+        current_time=1.0,
+    )
+
+
+def test_stochastic_block_logging_is_sampled_for_large_epochs():
+    assert _should_log_stochastic_block(1, 100)
+    assert _should_log_stochastic_block(3, 100)
+    assert not _should_log_stochastic_block(4, 100)
+    assert _should_log_stochastic_block(10, 100)
+    assert _should_log_stochastic_block(100, 100)
+
+
 def test_gpu_exact_variant_tile_size_adapts_to_live_gpu_workspace(monkeypatch: pytest.MonkeyPatch):
     sentinel_cupy = object()
     monkeypatch.setattr(mixture_inference, "_gpu_total_bytes", lambda _cupy: 6_000_000_000)
@@ -2345,12 +2408,55 @@ def test_gpu_exact_variant_tile_size_adapts_to_live_gpu_workspace(monkeypatch: p
         covariate_count=0,
         cache_is_int8_standardized=True,
     )
+    monkeypatch.setattr(mixture_inference, "_gpu_total_bytes", lambda _cupy: 7_000_000_000)
+    assert _gpu_exact_variant_full_matrix_fits(
+        sentinel_cupy,
+        sample_count=97_061,
+        variant_count=4_096,
+        covariate_count=0,
+        cache_is_int8_standardized=True,
+        matrix_itemsize=4,
+    )
+    monkeypatch.setattr(mixture_inference, "_gpu_total_bytes", lambda _cupy: 6_000_000_000)
     assert _gpu_exact_variant_tile_size(
         sentinel_cupy,
         sample_count=97_061,
         variant_count=4_096,
         covariate_count=0,
     ) == 1_024
+
+
+def test_gpu_exact_variant_tile_max_floors_on_small_gpus(monkeypatch: pytest.MonkeyPatch):
+    """Small / mocked devices keep the historical 1024 floor so existing
+    callers and tests see no change."""
+    sentinel_cupy = object()
+    monkeypatch.setattr(mixture_inference, "_gpu_total_bytes", lambda _cupy: 6_000_000_000)
+    assert mixture_inference._gpu_exact_variant_tile_max_variants(
+        sentinel_cupy, sample_count=400_000
+    ) == 1_024
+
+
+def test_gpu_exact_variant_tile_max_scales_with_device_memory(monkeypatch: pytest.MonkeyPatch):
+    """On an 80 GB device the per-iteration GEMM tile cap grows beyond the
+    1024 floor so cuBLAS launches amortize over more variants."""
+    sentinel_cupy = object()
+    monkeypatch.setattr(mixture_inference, "_gpu_total_bytes", lambda _cupy: 80_000_000_000)
+    tile_max = mixture_inference._gpu_exact_variant_tile_max_variants(
+        sentinel_cupy, sample_count=400_000
+    )
+    assert tile_max > 1_024
+    assert tile_max <= 16_384
+
+
+def test_gpu_exact_variant_tile_max_ceiling(monkeypatch: pytest.MonkeyPatch):
+    """An unrealistically huge device is capped at the safety ceiling so
+    GEMM launches stay within a tile size where cuBLAS is already saturated."""
+    sentinel_cupy = object()
+    monkeypatch.setattr(mixture_inference, "_gpu_total_bytes", lambda _cupy: 10**13)
+    tile_max = mixture_inference._gpu_exact_variant_tile_max_variants(
+        sentinel_cupy, sample_count=1_000
+    )
+    assert tile_max == 16_384
 
 
 def test_use_gpu_exact_variant_solve_accepts_tiled_exact_path(monkeypatch: pytest.MonkeyPatch):
@@ -4857,7 +4963,11 @@ def test_exact_variant_gpu_summary_path_matches_dense_reference(monkeypatch: pyt
         posterior_variance_batch_size=3,
     )
 
-    assert np.float64 in empty_dtypes
+    # Mixed-precision path: Gram, precision matrix, and Cholesky factor all
+    # live at the GPU compute dtype (here patched to float32). Final results
+    # are still cast to float64 at the numpy boundary, and the numerical check
+    # below verifies agreement with the float64 reference within rtol=1e-5.
+    assert np.float32 in empty_dtypes
     assert len(timing_sync_calls) >= 4
     for gpu_value, dense_value in zip(gpu_result, dense_result):
         np.testing.assert_allclose(
@@ -4866,6 +4976,49 @@ def test_exact_variant_gpu_summary_path_matches_dense_reference(monkeypatch: pyt
             rtol=1e-5,
             atol=1e-5,
         )
+
+
+def test_exact_variant_full_matrix_gpu_cache_reuses_expanded_block(monkeypatch: pytest.MonkeyPatch, random_generator):
+    sample_count, variant_count = 6, 4
+    genotype_values = random_generator.normal(size=(sample_count, variant_count)).astype(np.float32)
+    standardized = as_raw_genotype_matrix(genotype_values).standardized(
+        means=np.zeros(variant_count, dtype=np.float32),
+        scales=np.ones(variant_count, dtype=np.float32),
+    )
+    standardized._cupy_cache = standardized.materialize().astype(np.float32, copy=False)
+    warm_start = mixture_inference._RestrictedPosteriorWarmStart()
+    warm_start.exact_variant_full_matrix_cache_enabled = True
+    expansion_calls = 0
+
+    def counted_standardized_columns(cache, local_variant_indices, *, cupy, dtype=None):
+        nonlocal expansion_calls
+        expansion_calls += 1
+        return np.asarray(cache[:, local_variant_indices], dtype=dtype)
+
+    fake_cupy: Any = types.ModuleType("cupy")
+    fake_cupy.float64 = np.float64
+    fake_cupy.asarray = lambda array, dtype=None: np.asarray(array, dtype=dtype)
+    fake_cupy.empty = np.empty
+    monkeypatch.setattr(mixture_inference, "_cupy_cache_standardized_columns", counted_standardized_columns)
+
+    first = mixture_inference._cached_exact_variant_full_matrix_gpu(
+        genotype_matrix=standardized,
+        warm_start=warm_start,
+        cupy=fake_cupy,
+        dtype=fake_cupy.float64,
+    )
+    second = mixture_inference._cached_exact_variant_full_matrix_gpu(
+        genotype_matrix=standardized,
+        warm_start=warm_start,
+        cupy=fake_cupy,
+        dtype=fake_cupy.float64,
+    )
+
+    assert first is second
+    assert expansion_calls == 1
+    mixture_inference._clear_exact_variant_full_matrix_gpu_cache(warm_start)
+    assert warm_start.exact_variant_full_matrix_gpu is None
+    assert not warm_start.exact_variant_full_matrix_cache_enabled
 
 
 def test_timed_gpu_region_allows_fake_cupy_without_device_synchronization():
@@ -4942,11 +5095,15 @@ def test_exact_variant_gpu_beta_variance_stays_exact_above_cpu_limit(
         posterior_variance_batch_size=3,
     )
 
+    # Mixed-precision GPU path: agreement is bounded by the float32 noise
+    # floor on the Gram + Cholesky (~1e-6 relative). The fit-quality contract
+    # is far above this — convergence_tolerance is 1e-4 by default — so the
+    # FP32 path produces the same posterior to within EM convergence.
     np.testing.assert_allclose(
         np.asarray(gpu_result[2], dtype=np.float64),
         np.asarray(dense_result[2], dtype=np.float64),
-        rtol=1e-8,
-        atol=1e-8,
+        rtol=1e-5,
+        atol=1e-5,
     )
 
 

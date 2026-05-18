@@ -57,7 +57,7 @@ import gc
 import hashlib
 import json
 import time
-from typing import Any, Callable, Sequence, cast
+from typing import Any, Callable, Iterable, Sequence, cast
 
 import sv_pgs._jax as _jax_side_effects  # side-effect: configures JAX/XLA env
 del _jax_side_effects
@@ -100,16 +100,66 @@ from sv_pgs.progress import log, mem
 # The implementation now uses either a full standardized matrix or a tiled
 # exact build depending on the live GPU working set.
 _GPU_EXACT_VARIANT_MEMORY_UTILIZATION = 0.8
-_GPU_EXACT_VARIANT_TILE_MAX_VARIANTS = 1_024
+# Floor / ceiling on tile size, in variants. The actual tile cap is derived
+# at runtime from device memory so bigger GPUs (A100 80GB, H100) issue larger
+# GEMM launches and amortize per-launch overhead.
+_GPU_EXACT_VARIANT_TILE_FLOOR_VARIANTS = 1_024
+_GPU_EXACT_VARIANT_TILE_CEILING_VARIANTS = 16_384
 _GPU_EXACT_VARIANT_TILE_MIN_VARIANTS = 256
 _GPU_EXACT_VARIANT_ALWAYS_FULL_MAX_VARIANTS = 64
 _GPU_EXACT_VARIANT_FULL_MATRIX_HEADROOM = 2.0
+# Fraction of total GPU bytes the *per-iteration* weighted-tile + result-tile
+# pair is allowed to consume. Two float64 buffers of shape (sample_count, T):
+#   2 * 8 bytes/element * sample_count * T  <=  TILE_BUDGET_FRACTION * total_bytes
+# This is the rule that lets T scale with device memory while leaving room
+# for the resident genotype cache and the p×p precision workspace.
+_GPU_EXACT_VARIANT_TILE_BUDGET_FRACTION = 0.10
+_STOCHASTIC_CHECKPOINT_MIN_SECONDS = 60.0
+_STOCHASTIC_CHECKPOINT_TARGETS_PER_EPOCH = 20
+_STOCHASTIC_BLOCK_LOG_TARGETS_PER_EPOCH = 10
+_STOCHASTIC_BLOCK_GC_INTERVAL = 20
+_GPU_INVERSE_DIAGONAL_WORKSPACE_FRACTION = 0.01
+_GPU_INVERSE_DIAGONAL_MAX_BLOCK = 4_096
 
 
-def _gpu_exact_variant_base_bytes(variant_count: int, covariate_count: int) -> int:
-    precision_matrix_bytes = 8 * int(variant_count) * int(variant_count)
+def _gpu_exact_variant_tile_max_variants(
+    cupy,
+    sample_count: int,
+    *,
+    matrix_itemsize: int = 8,
+) -> int:
+    """Largest variant tile that fits within the per-tile GPU-memory budget.
+
+    Floors at ``_GPU_EXACT_VARIANT_TILE_FLOOR_VARIANTS`` so T4-class devices
+    (16 GB) preserve their previous behaviour; ceilings at
+    ``_GPU_EXACT_VARIANT_TILE_CEILING_VARIANTS`` so cuBLAS Gram launches do
+    not balloon to sizes where the launch is already saturated.
+    """
+    if int(sample_count) <= 0:
+        return _GPU_EXACT_VARIANT_TILE_FLOOR_VARIANTS
+    total_bytes = _gpu_total_bytes(cupy)
+    if total_bytes <= 0:
+        return _GPU_EXACT_VARIANT_TILE_FLOOR_VARIANTS
+    bytes_per_tile_variant = 2 * int(matrix_itemsize) * int(sample_count)
+    budget = int(float(total_bytes) * _GPU_EXACT_VARIANT_TILE_BUDGET_FRACTION)
+    raw = budget // max(bytes_per_tile_variant, 1)
+    return int(
+        min(
+            _GPU_EXACT_VARIANT_TILE_CEILING_VARIANTS,
+            max(_GPU_EXACT_VARIANT_TILE_FLOOR_VARIANTS, raw),
+        )
+    )
+
+
+def _gpu_exact_variant_base_bytes(
+    variant_count: int,
+    covariate_count: int,
+    *,
+    matrix_itemsize: int = 8,
+) -> int:
+    precision_matrix_bytes = int(matrix_itemsize) * int(variant_count) * int(variant_count)
     covariate_correction_bytes = precision_matrix_bytes if covariate_count > 0 else 0
-    rhs_bytes = 8 * int(variant_count)
+    rhs_bytes = int(matrix_itemsize) * int(variant_count)
     inverse_diagonal_workspace_bytes = 8 * int(variant_count) * min(
         int(variant_count),
         _GPU_EXACT_VARIANT_TILE_MIN_VARIANTS,
@@ -124,22 +174,33 @@ def _gpu_exact_variant_base_bytes(variant_count: int, covariate_count: int) -> i
 
 def _gpu_exact_variant_full_matrix_required_bytes(
     *,
+    cupy,
     sample_count: int,
     variant_count: int,
     covariate_count: int,
     cache_is_int8_standardized: bool,
+    matrix_itemsize: int = 8,
 ) -> int:
-    expanded_matrix_bytes = 8 * int(sample_count) * int(variant_count)
+    expanded_matrix_bytes = int(matrix_itemsize) * int(sample_count) * int(variant_count)
     resident_cache_bytes = int(sample_count) * int(variant_count) if cache_is_int8_standardized else (
         4 * int(sample_count) * int(variant_count)
     )
-    weighted_chunk_bytes = 8 * int(sample_count) * min(int(variant_count), _GPU_EXACT_VARIANT_TILE_MAX_VARIANTS)
-    precision_workspace_bytes = 8 * int(variant_count) * int(variant_count)
+    tile_max_variants = _gpu_exact_variant_tile_max_variants(
+        cupy,
+        sample_count=int(sample_count),
+        matrix_itemsize=int(matrix_itemsize),
+    )
+    weighted_chunk_bytes = int(matrix_itemsize) * int(sample_count) * min(int(variant_count), tile_max_variants)
+    precision_workspace_bytes = int(matrix_itemsize) * int(variant_count) * int(variant_count)
     return int(
         resident_cache_bytes
         + expanded_matrix_bytes
         + weighted_chunk_bytes
-        + _gpu_exact_variant_base_bytes(int(variant_count), int(covariate_count))
+        + _gpu_exact_variant_base_bytes(
+            int(variant_count),
+            int(covariate_count),
+            matrix_itemsize=int(matrix_itemsize),
+        )
         + precision_workspace_bytes
     )
 
@@ -151,6 +212,7 @@ def _gpu_exact_variant_full_matrix_fits(
     variant_count: int,
     covariate_count: int,
     cache_is_int8_standardized: bool,
+    matrix_itemsize: int = 8,
 ) -> bool:
     if int(variant_count) <= _GPU_EXACT_VARIANT_ALWAYS_FULL_MAX_VARIANTS:
         return True
@@ -159,10 +221,12 @@ def _gpu_exact_variant_full_matrix_fits(
     total_bytes = _gpu_total_bytes(cupy)
     usable_bytes = int(total_bytes * _GPU_EXACT_VARIANT_MEMORY_UTILIZATION)
     required_bytes = _gpu_exact_variant_full_matrix_required_bytes(
+        cupy=cupy,
         sample_count=int(sample_count),
         variant_count=int(variant_count),
         covariate_count=int(covariate_count),
         cache_is_int8_standardized=cache_is_int8_standardized,
+        matrix_itemsize=int(matrix_itemsize),
     )
     return int(required_bytes * _GPU_EXACT_VARIANT_FULL_MATRIX_HEADROOM) <= usable_bytes
 
@@ -173,20 +237,30 @@ def _gpu_exact_variant_tile_size(
     sample_count: int,
     variant_count: int,
     covariate_count: int,
+    matrix_itemsize: int = 8,
 ) -> int:
     total_bytes = _gpu_total_bytes(cupy)
     usable_bytes = int(total_bytes * _GPU_EXACT_VARIANT_MEMORY_UTILIZATION)
-    fixed_bytes = _gpu_exact_variant_base_bytes(int(variant_count), int(covariate_count))
+    fixed_bytes = _gpu_exact_variant_base_bytes(
+        int(variant_count),
+        int(covariate_count),
+        matrix_itemsize=int(matrix_itemsize),
+    )
     if usable_bytes <= fixed_bytes:
         return 0
-    # One float64 row tile stays resident while a second float64 tile is
+    # One row tile stays resident while a second tile is
     # materialized and weighted for the current Gram block.
-    bytes_per_variant = int(sample_count) * (2 * 8 + 1)
+    bytes_per_variant = int(sample_count) * (2 * int(matrix_itemsize) + 1)
     if bytes_per_variant <= 0:
         return 0
+    tile_max_variants = _gpu_exact_variant_tile_max_variants(
+        cupy,
+        sample_count=int(sample_count),
+        matrix_itemsize=int(matrix_itemsize),
+    )
     tile_variants = min(
         int(variant_count),
-        _GPU_EXACT_VARIANT_TILE_MAX_VARIANTS,
+        tile_max_variants,
         int((usable_bytes - fixed_bytes) // bytes_per_variant),
     )
     minimum_required = min(int(variant_count), _GPU_EXACT_VARIANT_TILE_MIN_VARIANTS)
@@ -204,7 +278,17 @@ def _gpu_exact_variant_inverse_diagonal(
     dimension = int(cholesky_factor_gpu.shape[0])
     if dimension < 1:
         return cupy.zeros(0, dtype=cupy.float64)
-    block_size = min(dimension, _GPU_EXACT_VARIANT_TILE_MIN_VARIANTS)
+    total_bytes = _gpu_total_bytes(cupy)
+    memory_scaled_block = (
+        int(total_bytes * _GPU_INVERSE_DIAGONAL_WORKSPACE_FRACTION) // max(8 * dimension, 1)
+        if total_bytes > 0
+        else _GPU_EXACT_VARIANT_TILE_MIN_VARIANTS
+    )
+    block_size = min(
+        dimension,
+        _GPU_INVERSE_DIAGONAL_MAX_BLOCK,
+        max(_GPU_EXACT_VARIANT_TILE_MIN_VARIANTS, memory_scaled_block),
+    )
     inverse_diagonal_gpu = cupy.empty(dimension, dtype=cupy.float64)
     for start in range(0, dimension, block_size):
         stop = min(start + block_size, dimension)
@@ -298,6 +382,16 @@ class _PriorAnnotationTables:
     continuous_values_by_source: dict[str, np.ndarray]
     factor_weights_by_source: dict[str, dict[str, np.ndarray]]
     nested_weights_by_source: dict[str, dict[int, dict[str, np.ndarray]]]
+
+
+@dataclass(slots=True)
+class _PriorAnnotationFeatureNames:
+    continuous: set[str]
+    binary: set[str]
+    categorical: set[str]
+    membership: set[str]
+    nested: set[str]
+    nested_membership: set[str]
 
 
 @dataclass(slots=True)
@@ -423,6 +517,11 @@ class _RestrictedPosteriorWarmStart:
     weighted_covariate_projection_signature: str | None = None
     weighted_covariate_projection: np.ndarray | None = None
     weighted_covariate_projection_gpu: Any = None
+    exact_variant_full_matrix_cache_enabled: bool = False
+    exact_variant_full_matrix_token: int | None = None
+    exact_variant_full_matrix_shape: tuple[int, int] | None = None
+    exact_variant_full_matrix_dtype: Any = None
+    exact_variant_full_matrix_gpu: Any = None
 
 
 @dataclass(slots=True)
@@ -753,6 +852,62 @@ def _should_use_stochastic_variational_updates(
     return variant_count > int(config.stochastic_variant_batch_size)
 
 
+def _stochastic_blocks_use_exact_variant_path(
+    *,
+    sample_count: int,
+    block_size: int,
+    exact_solver_matrix_limit: int,
+) -> bool:
+    if int(block_size) <= int(exact_solver_matrix_limit):
+        return True
+    cupy = _try_import_cupy()
+    if cupy is None:
+        return False
+    return _gpu_exact_variant_full_matrix_fits(
+        cupy,
+        sample_count=int(sample_count),
+        variant_count=int(block_size),
+        covariate_count=0,
+        cache_is_int8_standardized=True,
+    ) or _gpu_exact_variant_tile_size(
+        cupy,
+        sample_count=int(sample_count),
+        variant_count=int(block_size),
+        covariate_count=0,
+    ) > 0
+
+
+def _should_checkpoint_stochastic_block(
+    *,
+    block_count: int,
+    total_blocks: int,
+    last_checkpoint_block: int,
+    last_checkpoint_time: float,
+    current_time: float,
+) -> bool:
+    if block_count <= 0:
+        return False
+    if block_count == total_blocks:
+        return True
+    block_interval = max(
+        int(total_blocks) // _STOCHASTIC_CHECKPOINT_TARGETS_PER_EPOCH,
+        1,
+    )
+    if block_count - last_checkpoint_block < block_interval:
+        return False
+    return current_time - last_checkpoint_time >= _STOCHASTIC_CHECKPOINT_MIN_SECONDS
+
+
+def _should_log_stochastic_block(block_count: int, total_blocks: int) -> bool:
+    if block_count <= 3 or block_count == total_blocks:
+        return True
+    block_interval = max(
+        int(total_blocks) // _STOCHASTIC_BLOCK_LOG_TARGETS_PER_EPOCH,
+        1,
+    )
+    return block_count % block_interval == 0
+
+
 def _stochastic_epoch_objective(
     trait_type: TraitType,
     targets: np.ndarray,
@@ -824,7 +979,7 @@ def fit_variational_em(
         if validation_offset is None
         else np.asarray(validation_offset, dtype=np.float64).reshape(-1)
     )
-    member_records = list(records)
+    member_records = records if isinstance(records, list) else list(records)
     if genotype_matrix.shape[1] != len(tie_map.reduced_to_group):
         raise ValueError("Reduced genotype columns must match tie-map group count.")
     if len(member_records) != tie_map.original_to_reduced.shape[0]:
@@ -1273,12 +1428,21 @@ def fit_variational_em(
                     dtype=stochastic_epoch_compute_cp_dtype,
                 )
             )
-            background_preconditioner_rank = _effective_sample_space_preconditioner_rank(
-                genotype_matrix=genotype_matrix,
+            blocks_use_exact_variant_path = _stochastic_blocks_use_exact_variant_path(
                 sample_count=genotype_matrix.shape[0],
-                variant_count=genotype_matrix.shape[1],
-                requested_rank=config.sample_space_preconditioner_rank,
+                block_size=block_size,
+                exact_solver_matrix_limit=config.exact_solver_matrix_limit,
             )
+            if blocks_use_exact_variant_path:
+                background_preconditioner_rank = 0
+                log("  stochastic blocks route to exact variant-space solves; skipping sample-space background preconditioner")
+            else:
+                background_preconditioner_rank = _effective_sample_space_preconditioner_rank(
+                    genotype_matrix=genotype_matrix,
+                    sample_count=genotype_matrix.shape[0],
+                    variant_count=genotype_matrix.shape[1],
+                    requested_rank=config.sample_space_preconditioner_rank,
+                )
             if background_preconditioner_rank > 0:
                 if config.trait_type == TraitType.BINARY:
                     if use_gpu_epoch_predictor_state:
@@ -1342,6 +1506,8 @@ def fit_variational_em(
             epoch_blocks = _stochastic_variant_blocks(genotype_matrix.shape[1], block_size, epoch_rng)
             n_blocks = len(epoch_blocks)
             block_count = 0 if not resuming_mid_epoch else resume_completed_blocks_in_iteration
+            last_stochastic_checkpoint_block = block_count
+            last_stochastic_checkpoint_time = -float("inf")
             if resuming_mid_epoch:
                 log(
                     "  variational EM: resuming stochastic epoch "
@@ -1376,7 +1542,8 @@ def fit_variational_em(
                 # Upload block to GPU — fits easily in GPU budget.
                 # Without this, every CG iteration streams from mmap (40s vs 2s).
                 block_genotypes.try_materialize_gpu()
-                if block_count <= 3 or block_count % max(n_blocks // 10, 1) == 0 or block_count == n_blocks:
+                log_this_block = _should_log_stochastic_block(block_count, n_blocks)
+                if log_this_block:
                     log(f"    block {block_count}/{n_blocks}  variants={len(block_indices)}  step_size={step_size:.4f}  gpu={'yes' if block_genotypes._cupy_cache is not None else 'no'}  mem={mem()}")
                 block_prior_variances = np.asarray(reduced_prior_variances[block_indices], dtype=np.float64)
                 # Let the restricted posterior choose between full-matrix exact,
@@ -1565,11 +1732,18 @@ def fit_variational_em(
                 # Free GPU memory for this block before next iteration
                 block_genotypes._cupy_cache = None
                 del block_genotypes
-                # Periodic GC to reclaim any cyclic garbage built up over blocks.
-                if block_count % 5 == 0:
+                if block_count % _STOCHASTIC_BLOCK_GC_INTERVAL == 0:
                     gc.collect()
-                log(f"    block {block_count}/{n_blocks} done  mem={mem()}")
-                if checkpoint_callback is not None:
+                if log_this_block:
+                    log(f"    block {block_count}/{n_blocks} done  mem={mem()}")
+                checkpoint_now = time.monotonic()
+                if checkpoint_callback is not None and _should_checkpoint_stochastic_block(
+                    block_count=block_count,
+                    total_blocks=n_blocks,
+                    last_checkpoint_block=last_stochastic_checkpoint_block,
+                    last_checkpoint_time=last_stochastic_checkpoint_time,
+                    current_time=checkpoint_now,
+                ):
                     checkpoint_callback(
                         _build_checkpoint(
                             outer_iteration,
@@ -1579,6 +1753,8 @@ def fit_variational_em(
                             epoch_reduced_prior_variances_override=reduced_prior_variances,
                         )
                     )
+                    last_stochastic_checkpoint_block = block_count
+                    last_stochastic_checkpoint_time = checkpoint_now
             resume_completed_blocks_in_iteration = 0
             resume_beta_variance_state = None
             resume_reduced_second_moment = None
@@ -2017,14 +2193,18 @@ def fit_variational_em(
                 targets=target_vector,
             )
         log("  final posterior refinement skipped; returning current variational state  mem=" + mem())
-    final_member_prior_variances = _member_prior_variances_from_reduced_state(
-        member_records=member_records,
-        tie_map=tie_map,
-        scale_model_coefficients=scale_model_coefficients,
-        scale_model_feature_specs=prior_design.feature_specs,
-        global_scale=float(global_scale),
-        local_scale=local_scale,
-        config=config,
+    final_member_prior_variances = (
+        np.asarray(final_reduced_prior_variances, dtype=np.float64)
+        if _tie_map_is_identity(tie_map, member_count=len(member_records))
+        else _member_prior_variances_from_reduced_state(
+            member_records=member_records,
+            tie_map=tie_map,
+            scale_model_coefficients=scale_model_coefficients,
+            scale_model_feature_specs=prior_design.feature_specs,
+            global_scale=float(global_scale),
+            local_scale=local_scale,
+            config=config,
+        )
     )
     local_shape_a = prior_design.class_membership_matrix @ tpb_shape_a_vector
     local_shape_b = prior_design.class_membership_matrix @ tpb_shape_b_vector
@@ -2650,6 +2830,11 @@ def _binary_posterior_state(
         if restricted_posterior_warm_start is None
         else restricted_posterior_warm_start
     )
+    warm_start.exact_variant_full_matrix_cache_enabled = True
+    warm_start.exact_variant_full_matrix_token = None
+    warm_start.exact_variant_full_matrix_shape = None
+    warm_start.exact_variant_full_matrix_dtype = None
+    warm_start.exact_variant_full_matrix_gpu = None
     current_linear_predictor_gpu = None
     best_linear_predictor_gpu = None
     log(f"      binary setup: {standardized_genotypes.shape[1]} variants, {standardized_genotypes.shape[0]} samples  mem={mem()}")
@@ -3045,6 +3230,7 @@ def _binary_posterior_state(
     )
     laplace_objective = final_objective - 0.5 * logdet_hessian
     log(f"      binary posterior done: laplace_obj={laplace_objective:.4f}  final_obj={final_objective:.4f}  logdet_hessian={logdet_hessian:.4f}  mem={mem()}")
+    _clear_exact_variant_full_matrix_gpu_cache(warm_start)
     return (
         final_parameters[:covariate_count],
         final_parameters[covariate_count:],
@@ -4993,6 +5179,51 @@ def _weighted_covariate_projection_signature(
     return hasher.hexdigest()
 
 
+def _clear_exact_variant_full_matrix_gpu_cache(warm_start: _RestrictedPosteriorWarmStart | None) -> None:
+    if warm_start is None:
+        return
+    warm_start.exact_variant_full_matrix_cache_enabled = False
+    warm_start.exact_variant_full_matrix_token = None
+    warm_start.exact_variant_full_matrix_shape = None
+    warm_start.exact_variant_full_matrix_dtype = None
+    warm_start.exact_variant_full_matrix_gpu = None
+
+
+def _cached_exact_variant_full_matrix_gpu(
+    *,
+    genotype_matrix: StandardizedGenotypeMatrix,
+    warm_start: _RestrictedPosteriorWarmStart | None,
+    cupy,
+    dtype,
+):
+    matrix_token = id(genotype_matrix)
+    matrix_shape = (int(genotype_matrix.shape[0]), int(genotype_matrix.shape[1]))
+    cache_enabled = warm_start is not None and warm_start.exact_variant_full_matrix_cache_enabled
+    if (
+        cache_enabled
+        and warm_start is not None
+        and warm_start.exact_variant_full_matrix_token == matrix_token
+        and warm_start.exact_variant_full_matrix_shape == matrix_shape
+        and warm_start.exact_variant_full_matrix_dtype == dtype
+        and warm_start.exact_variant_full_matrix_gpu is not None
+    ):
+        return warm_start.exact_variant_full_matrix_gpu
+    cached_standardized_gpu = _cupy_cache_standardized_columns(
+        genotype_matrix._cupy_cache,
+        slice(None),
+        cupy=cupy,
+        dtype=dtype,
+    )
+    full_matrix_gpu = cupy.empty(cached_standardized_gpu.shape, dtype=dtype, order="F")
+    full_matrix_gpu[...] = cupy.asarray(cached_standardized_gpu, dtype=dtype)
+    if cache_enabled and warm_start is not None:
+        warm_start.exact_variant_full_matrix_token = matrix_token
+        warm_start.exact_variant_full_matrix_shape = matrix_shape
+        warm_start.exact_variant_full_matrix_dtype = dtype
+        warm_start.exact_variant_full_matrix_gpu = full_matrix_gpu
+    return full_matrix_gpu
+
+
 def _cached_weighted_covariate_projection(
     genotype_matrix: StandardizedGenotypeMatrix,
     covariate_matrix: np.ndarray,
@@ -6198,6 +6429,16 @@ def _solve_restricted_exact_variant_space(
     if genotype_matrix._cupy_cache is not None:
         import cupy as cp
 
+        # Compute dtype: float32 on any real GPU (TF32 tensor cores active on
+        # Ampere+, plain fp32 elsewhere), float64 only in CPU-mocked tests.
+        # Float32 GEMM is 4-30x faster than float64 across the GPU lineup, and
+        # for standardized-genotype inputs the float32 noise floor sits well
+        # below the prior-precision jitter we add to the diagonal — see
+        # gram_jitter below.
+        compute_dtype = _cupy_compute_dtype(cp)
+        is_mixed_precision = compute_dtype == cp.float32
+        compute_itemsize = 4 if is_mixed_precision else 8
+        gram_jitter = 1e-6 if is_mixed_precision else 1e-8
         cp_solve_triangular = _resolve_gpu_solve_triangular()
         cache_is_int8_standardized = _cupy_cache_is_int8_standardized(genotype_matrix._cupy_cache)
         use_full_gpu_exact = _gpu_exact_variant_full_matrix_fits(
@@ -6206,12 +6447,14 @@ def _solve_restricted_exact_variant_space(
             variant_count=variant_count,
             covariate_count=covariate_count,
             cache_is_int8_standardized=cache_is_int8_standardized,
+            matrix_itemsize=compute_itemsize,
         )
         tiled_exact_batch_size = 0 if use_full_gpu_exact else _gpu_exact_variant_tile_size(
             cp,
             sample_count=sample_count,
             variant_count=variant_count,
             covariate_count=covariate_count,
+            matrix_itemsize=compute_itemsize,
         )
         if not use_full_gpu_exact and tiled_exact_batch_size <= 0:
             raise RuntimeError(
@@ -6222,29 +6465,37 @@ def _solve_restricted_exact_variant_space(
             covariate_matrix=covariate_matrix,
             covariate_precision_cholesky=covariate_precision_cholesky,
             cp=cp,
-            dtype=cp.float64,
+            dtype=compute_dtype,
         )
         projected_targets_gpu = _apply_restricted_projector_gpu(
-            cp.asarray(targets, dtype=cp.float64),
+            cp.asarray(targets, dtype=compute_dtype),
             projector_bundle_gpu,
             cp=cp,
             solve_triangular_gpu=cp_solve_triangular,
         )
         diagonal_index = cp.arange(variant_count)
-        inverse_diagonal_noise_gpu = cp.asarray(inverse_diagonal_noise, dtype=cp.float64)
+        inverse_diagonal_noise_gpu = cp.asarray(inverse_diagonal_noise, dtype=compute_dtype)
         if use_full_gpu_exact:
-            cached_standardized_gpu = _cupy_cache_standardized_columns(
-                genotype_matrix._cupy_cache,
-                slice(None),
+            X_gpu_compute = _cached_exact_variant_full_matrix_gpu(
+                genotype_matrix=genotype_matrix,
+                warm_start=warm_start,
                 cupy=cp,
-                dtype=cp.float64,
+                dtype=compute_dtype,
             )
-            X_gpu_compute = cp.empty(cached_standardized_gpu.shape, dtype=cp.float64, order="F")
-            X_gpu_compute[...] = cp.asarray(cached_standardized_gpu, dtype=cp.float64)
             _gram_t0 = _timed_region_start(cp)
-            log(f"    building X^T W X (p={variant_count}, n={sample_count}, float64 exact GEMM)...  mem={mem()}")
-            variant_precision_gpu = cp.zeros((variant_count, variant_count), dtype=cp.float64)
-            col_chunk = min(_GPU_EXACT_VARIANT_TILE_MAX_VARIANTS, variant_count)
+            log(
+                f"    building X^T W X (p={variant_count}, n={sample_count}, "
+                + f"{'mixed-precision (fp32 GEMM, fp64 jitter)' if is_mixed_precision else 'float64'} exact GEMM)...  mem={mem()}"
+            )
+            variant_precision_gpu = cp.zeros((variant_count, variant_count), dtype=compute_dtype)
+            col_chunk = min(
+                _gpu_exact_variant_tile_max_variants(
+                    cp,
+                    sample_count=sample_count,
+                    matrix_itemsize=compute_itemsize,
+                ),
+                variant_count,
+            )
             n_col_chunks = (variant_count + col_chunk - 1) // col_chunk
             for col_idx, col_start in enumerate(range(0, variant_count, col_chunk)):
                 col_end = min(col_start + col_chunk, variant_count)
@@ -6257,23 +6508,18 @@ def _solve_restricted_exact_variant_space(
                         + f"({100*col_end/variant_count:.0f}%)  "
                         + f"{_timed_region_seconds(_gram_t0, cp):.1f}s"
                     )
-            variant_precision_gpu = 0.5 * (variant_precision_gpu + variant_precision_gpu.T)
             log(f"    X^T W X built in {_timed_region_seconds(_gram_t0, cp):.1f}s  mem={mem()}")
             rhs_setup_t0 = _timed_region_start(cp)
-            variant_rhs_gpu = genotype_matrix.gpu_transpose_matmat(
-                projected_targets_gpu,
-                batch_size=variant_count,
-                cupy=cp,
-                dtype=cp.float64,
-            )
+            variant_rhs_gpu = X_gpu_compute.T @ projected_targets_gpu
             exact_gpu_matmul_batch_size = variant_count
         else:
             _gram_t0 = _timed_region_start(cp)
             log(
                 "    building X^T W X "
-                + f"(p={variant_count}, n={sample_count}, tiled exact GPU batches={tiled_exact_batch_size})...  mem={mem()}"
+                + f"(p={variant_count}, n={sample_count}, tiled exact GPU batches={tiled_exact_batch_size}, "
+                + f"{'fp32' if is_mixed_precision else 'fp64'} GEMM)...  mem={mem()}"
             )
-            variant_precision_gpu = cp.zeros((variant_count, variant_count), dtype=cp.float64)
+            variant_precision_gpu = cp.zeros((variant_count, variant_count), dtype=compute_dtype)
             row_starts = range(0, variant_count, tiled_exact_batch_size)
             n_row_tiles = (variant_count + tiled_exact_batch_size - 1) // tiled_exact_batch_size
             for row_idx, row_start in enumerate(row_starts):
@@ -6282,17 +6528,20 @@ def _solve_restricted_exact_variant_space(
                     genotype_matrix._cupy_cache,
                     slice(row_start, row_end),
                     cupy=cp,
-                    dtype=cp.float64,
+                    dtype=compute_dtype,
                 )
                 for col_start in range(row_start, variant_count, tiled_exact_batch_size):
                     col_end = min(col_start + tiled_exact_batch_size, variant_count)
-                    col_batch_gpu = _cupy_cache_standardized_columns(
-                        genotype_matrix._cupy_cache,
-                        slice(col_start, col_end),
-                        cupy=cp,
-                        dtype=cp.float64,
-                    )
-                    col_batch_gpu *= inverse_diagonal_noise_gpu[:, None]
+                    if col_start == row_start:
+                        col_batch_gpu = row_batch_gpu * inverse_diagonal_noise_gpu[:, None]
+                    else:
+                        col_batch_gpu = _cupy_cache_standardized_columns(
+                            genotype_matrix._cupy_cache,
+                            slice(col_start, col_end),
+                            cupy=cp,
+                            dtype=compute_dtype,
+                        )
+                        col_batch_gpu *= inverse_diagonal_noise_gpu[:, None]
                     block_precision_gpu = row_batch_gpu.T @ col_batch_gpu
                     variant_precision_gpu[row_start:row_end, col_start:col_end] = block_precision_gpu
                     if row_start != col_start:
@@ -6311,31 +6560,41 @@ def _solve_restricted_exact_variant_space(
                 projected_targets_gpu,
                 batch_size=tiled_exact_batch_size,
                 cupy=cp,
-                dtype=cp.float64,
+                dtype=compute_dtype,
             )
             exact_gpu_matmul_batch_size = tiled_exact_batch_size
         if covariate_count > 0:
-            CtWX_gpu = _cached_weighted_covariate_projection(
-                genotype_matrix=genotype_matrix,
-                covariate_matrix=covariate_matrix,
-                inverse_diagonal_noise=inverse_diagonal_noise,
-                batch_size=posterior_variance_batch_size,
-                warm_start=warm_start,
-                return_gpu=True,
-                cupy=cp,
+            CtWX_gpu = (
+                X_gpu_compute.T @ projector_bundle_gpu[2]
+                if use_full_gpu_exact
+                else cp.asarray(
+                    _cached_weighted_covariate_projection(
+                        genotype_matrix=genotype_matrix,
+                        covariate_matrix=covariate_matrix,
+                        inverse_diagonal_noise=inverse_diagonal_noise,
+                        batch_size=posterior_variance_batch_size,
+                        warm_start=warm_start,
+                        return_gpu=True,
+                        cupy=cp,
+                    ),
+                    dtype=compute_dtype,
+                )
             )
             correction_coeff_gpu = _gpu_cholesky_solve(
                 CtWX_gpu.T,
                 projector_bundle_gpu[3],
                 cp_solve_triangular,
             )
-            correction_gpu = cp.asarray(CtWX_gpu @ correction_coeff_gpu, dtype=cp.float64)
+            correction_gpu = cp.asarray(CtWX_gpu @ correction_coeff_gpu, dtype=compute_dtype)
             variant_precision_gpu -= correction_gpu
-        variant_precision_gpu[diagonal_index, diagonal_index] += cp.asarray(prior_precision, dtype=cp.float64)
-        variant_precision_gpu[diagonal_index, diagonal_index] += 1e-8
+        variant_precision_gpu[diagonal_index, diagonal_index] += cp.asarray(prior_precision, dtype=compute_dtype)
+        variant_precision_gpu[diagonal_index, diagonal_index] += gram_jitter
         log(f"    rhs/correction prepared in {_timed_region_seconds(rhs_setup_t0, cp):.1f}s  mem={mem()}")
         _cholesky_t0 = _timed_region_start(cp)
-        log(f"    Cholesky factorization ({variant_count}×{variant_count} float64)...  mem={mem()}")
+        log(
+            f"    Cholesky factorization ({variant_count}×{variant_count} "
+            + f"{'fp32' if is_mixed_precision else 'fp64'})...  mem={mem()}"
+        )
         variant_precision_cholesky_gpu = cp.linalg.cholesky(variant_precision_gpu)
         log(f"    Cholesky done in {_timed_region_seconds(_cholesky_t0, cp):.1f}s, solving...  mem={mem()}")
 
@@ -6387,13 +6646,13 @@ def _solve_restricted_exact_variant_space(
             else 0.0
         )
         if use_full_gpu_exact:
-            genetic_linear_predictor_gpu = X_gpu_compute @ cp.asarray(beta_gpu, dtype=cp.float64)
+            genetic_linear_predictor_gpu = X_gpu_compute @ cp.asarray(beta_gpu, dtype=compute_dtype)
         else:
             genetic_linear_predictor_gpu = genotype_matrix.gpu_matmat(
-                cp.asarray(beta_gpu, dtype=cp.float64),
+                cp.asarray(beta_gpu, dtype=compute_dtype),
                 batch_size=exact_gpu_matmul_batch_size,
                 cupy=cp,
-                dtype=cp.float64,
+                dtype=compute_dtype,
             )
         genetic_linear_predictor = _cupy_array_to_numpy(genetic_linear_predictor_gpu, dtype=np.float64)
         return beta, genetic_linear_predictor, beta_variance, logdet_A
@@ -8337,7 +8596,12 @@ def _build_prior_design(records: Sequence[VariantRecord]) -> PriorDesign:
         class_membership_by_class=class_membership_by_class,
     )
     feature_names = [_feature_name_from_spec(feature_spec) for feature_spec in feature_specs]
-    design_matrix = _design_matrix_for_feature_specs(records=records, feature_specs=feature_specs)
+    design_matrix = _design_matrix_for_feature_specs(
+        records=records,
+        feature_specs=feature_specs,
+        annotation_tables=annotation_tables,
+        class_membership_by_class=class_membership_by_class,
+    )
     return PriorDesign(
         design_matrix=design_matrix,
         feature_names=feature_names,
@@ -8442,20 +8706,11 @@ def _compile_prior_feature_specs(
 def _design_matrix_for_feature_specs(
     records: Sequence[VariantRecord],
     feature_specs: Sequence[ScaleModelFeatureSpec],
+    annotation_tables: _PriorAnnotationTables,
+    class_membership_by_class: dict[VariantClass, np.ndarray],
 ) -> np.ndarray:
     if len(feature_specs) == 0:
         return np.zeros((len(records), 0), dtype=np.float64)
-    class_membership_by_class = {
-        variant_class: np.asarray(
-            [
-                _class_membership_weight(record, variant_class)
-                for record in records
-            ],
-            dtype=np.float64,
-        )
-        for variant_class in VariantClass
-    }
-    annotation_tables = _prior_annotation_tables(records)
     design_columns = [
         _center_design_column(
             _column_for_feature_spec(
@@ -8588,23 +8843,61 @@ def _class_membership_weight(record: VariantRecord, variant_class: VariantClass)
     return 0.0
 
 
+def _class_membership_by_class(
+    records: Sequence[VariantRecord],
+    variant_classes: Iterable[VariantClass],
+) -> dict[VariantClass, np.ndarray]:
+    return {
+        variant_class: np.asarray(
+            [_class_membership_weight(record, variant_class) for record in records],
+            dtype=np.float64,
+        )
+        for variant_class in variant_classes
+    }
+
+
 def _prior_annotation_tables(records: Sequence[VariantRecord]) -> _PriorAnnotationTables:
+    feature_names = _prior_annotation_feature_names(records)
     return _PriorAnnotationTables(
-        continuous_values_by_source=_continuous_prior_annotation_values(records),
-        factor_weights_by_source=_factor_prior_annotation_weights(records),
-        nested_weights_by_source=_nested_prior_annotation_weights(records),
+        continuous_values_by_source=_continuous_prior_annotation_values(records, feature_names.continuous),
+        factor_weights_by_source=_factor_prior_annotation_weights(
+            records,
+            binary_feature_names=feature_names.binary,
+            categorical_feature_names=feature_names.categorical,
+            membership_feature_names=feature_names.membership,
+        ),
+        nested_weights_by_source=_nested_prior_annotation_weights(
+            records,
+            nested_feature_names=feature_names.nested | feature_names.nested_membership,
+        ),
     )
 
 
-def _continuous_prior_annotation_values(records: Sequence[VariantRecord]) -> dict[str, np.ndarray]:
+def _prior_annotation_feature_names(records: Sequence[VariantRecord]) -> _PriorAnnotationFeatureNames:
+    feature_names = _PriorAnnotationFeatureNames(
+        continuous=set(),
+        binary=set(),
+        categorical=set(),
+        membership=set(),
+        nested=set(),
+        nested_membership=set(),
+    )
+    for record in records:
+        feature_names.continuous.update(record.prior_continuous_features)
+        feature_names.binary.update(record.prior_binary_features)
+        feature_names.categorical.update(record.prior_categorical_features)
+        feature_names.membership.update(record.prior_membership_features)
+        feature_names.nested.update(record.prior_nested_features)
+        feature_names.nested_membership.update(record.prior_nested_membership_features)
+    return feature_names
+
+
+def _continuous_prior_annotation_values(
+    records: Sequence[VariantRecord],
+    feature_names: set[str],
+) -> dict[str, np.ndarray]:
     feature_values_by_name = {}
-    for feature_name in sorted(
-        {
-            feature_name
-            for record in records
-            for feature_name in record.prior_continuous_features
-        }
-    ):
+    for feature_name in sorted(feature_names):
         feature_values_by_name[feature_name] = np.asarray(
             [
                 record.prior_continuous_features.get(feature_name, 0.0)
@@ -8615,15 +8908,15 @@ def _continuous_prior_annotation_values(records: Sequence[VariantRecord]) -> dic
     return feature_values_by_name
 
 
-def _factor_prior_annotation_weights(records: Sequence[VariantRecord]) -> dict[str, dict[str, np.ndarray]]:
+def _factor_prior_annotation_weights(
+    records: Sequence[VariantRecord],
+    *,
+    binary_feature_names: set[str],
+    categorical_feature_names: set[str],
+    membership_feature_names: set[str],
+) -> dict[str, dict[str, np.ndarray]]:
     factor_weights_by_source: dict[str, dict[str, np.ndarray]] = {}
-    for feature_name in sorted(
-        {
-            binary_feature_name
-            for record in records
-            for binary_feature_name in record.prior_binary_features
-        }
-    ):
+    for feature_name in sorted(binary_feature_names):
         true_values = np.asarray(
             [float(record.prior_binary_features.get(feature_name, False)) for record in records],
             dtype=np.float64,
@@ -8633,13 +8926,7 @@ def _factor_prior_annotation_weights(records: Sequence[VariantRecord]) -> dict[s
             "true": true_values,
         }
 
-    for feature_name in sorted(
-        {
-            categorical_feature_name
-            for record in records
-            for categorical_feature_name in record.prior_categorical_features
-        }
-    ):
+    for feature_name in sorted(categorical_feature_names):
         levels = sorted(
             {
                 record.prior_categorical_features[feature_name]
@@ -8658,13 +8945,7 @@ def _factor_prior_annotation_weights(records: Sequence[VariantRecord]) -> dict[s
             for level_name in levels
         }
 
-    for feature_name in sorted(
-        {
-            membership_feature_name
-            for record in records
-            for membership_feature_name in record.prior_membership_features
-        }
-    ):
+    for feature_name in sorted(membership_feature_names):
         levels = sorted(
             {
                 level_name
@@ -8685,21 +8966,13 @@ def _factor_prior_annotation_weights(records: Sequence[VariantRecord]) -> dict[s
     return factor_weights_by_source
 
 
-def _nested_prior_annotation_weights(records: Sequence[VariantRecord]) -> dict[str, dict[int, dict[str, np.ndarray]]]:
+def _nested_prior_annotation_weights(
+    records: Sequence[VariantRecord],
+    *,
+    nested_feature_names: set[str],
+) -> dict[str, dict[int, dict[str, np.ndarray]]]:
     nested_weights_by_source: dict[str, dict[int, dict[str, np.ndarray]]] = {}
-    nested_feature_names = sorted(
-        {
-            feature_name
-            for record in records
-            for feature_name in record.prior_nested_features
-        }
-        | {
-            feature_name
-            for record in records
-            for feature_name in record.prior_nested_membership_features
-        }
-    )
-    for feature_name in nested_feature_names:
+    for feature_name in sorted(nested_feature_names):
         source_nested_weights: dict[int, dict[str, np.ndarray]] = {}
         for record_index, record in enumerate(records):
             path_weights: dict[str, float] = {}
@@ -9241,9 +9514,16 @@ def _member_prior_variances_from_reduced_state(
     local_scale: np.ndarray,
     config: ModelConfig,
 ) -> np.ndarray:
+    feature_variant_classes = {
+        feature_spec.variant_class
+        for feature_spec in scale_model_feature_specs
+        if feature_spec.variant_class is not None
+    }
     member_design_matrix = _design_matrix_for_feature_specs(
         records=member_records,
         feature_specs=scale_model_feature_specs,
+        annotation_tables=_prior_annotation_tables(member_records),
+        class_membership_by_class=_class_membership_by_class(member_records, feature_variant_classes),
     )
     member_baseline_scales = _metadata_baseline_scales_from_coefficients(
         scale_model_coefficients=np.asarray(scale_model_coefficients, dtype=np.float64),
@@ -9260,6 +9540,20 @@ def _member_prior_variances_from_reduced_state(
         local_scale=member_local_scale,
         config=config,
     )
+
+
+def _tie_map_is_identity(tie_map: TieMap, *, member_count: int) -> bool:
+    if (
+        tie_map.kept_indices.shape != (int(member_count),)
+        or tie_map.original_to_reduced.shape != (int(member_count),)
+        or len(tie_map.reduced_to_group) != int(member_count)
+    ):
+        return False
+    if not np.array_equal(tie_map.kept_indices, np.arange(int(member_count), dtype=np.int32)):
+        return False
+    if not np.array_equal(tie_map.original_to_reduced, np.arange(int(member_count), dtype=np.int32)):
+        return False
+    return True
 
 
 def _expand_group_values_to_members(

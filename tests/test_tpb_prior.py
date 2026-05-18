@@ -20,8 +20,10 @@ from sv_pgs.config import (
 from sv_pgs.data import VariantRecord
 from sv_pgs.mixture_inference import (
     _build_prior_design,
+    _class_membership_by_class,
     _design_matrix_for_feature_specs,
     _metadata_baseline_scales_from_coefficients,
+    _prior_annotation_tables,
 )
 
 
@@ -202,7 +204,19 @@ class TestMetadataScaleModel:
             ),
         ]
         prior_design = _build_prior_design(records)
-        design_matrix = _design_matrix_for_feature_specs(records, prior_design.feature_specs)
+        design_matrix = _design_matrix_for_feature_specs(
+            records=records,
+            feature_specs=prior_design.feature_specs,
+            annotation_tables=_prior_annotation_tables(records),
+            class_membership_by_class=_class_membership_by_class(
+                records,
+                {
+                    feature_spec.variant_class
+                    for feature_spec in prior_design.feature_specs
+                    if feature_spec.variant_class is not None
+                },
+            ),
+        )
 
         np.testing.assert_allclose(design_matrix, prior_design.design_matrix)
 

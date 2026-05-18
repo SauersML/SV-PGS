@@ -27,11 +27,14 @@ from sv_pgs.genotype import RawGenotypeBatch, RawGenotypeMatrix, as_raw_genotype
 from sv_pgs.inference import VariationalFitCheckpoint, VariationalFitResult
 from sv_pgs.model import (
     _FitStageCachePaths,
+    _active_indices_cover_original,
     _fit_stage_cache_paths,
     _persistent_raw_signature,
     _raw_standardized_subset_matvec,
     _runtime_tuned_config_for_fit,
+    _normalize_variant_records,
     _tie_group_export_weights,
+    _tie_map_keeps_all_active_variants,
     _training_records_from_stats,
 )
 from sv_pgs.preprocessing import compute_variant_statistics
@@ -187,6 +190,29 @@ def test_runtime_tuned_config_caps_binary_stochastic_batch_size_on_small_gpu(mon
     assert tuned_config.stochastic_variant_batch_size == 4_967
     assert summary is not None
     assert "stochastic_variant_batch_size=8192->4967" in summary
+
+
+def test_runtime_tuned_config_caps_stochastic_batch_work_on_large_cohort(monkeypatch):
+    raw_genotypes = ShapeOnlyRawGenotypeMatrix(sample_count=245_000, variant_count=1_700_000)
+    config = ModelConfig(
+        trait_type=TraitType.BINARY,
+        exact_solver_matrix_limit=2_048,
+        sample_space_preconditioner_rank=256,
+        stochastic_variant_batch_size=8_192,
+    )
+
+    monkeypatch.setattr(runtime_policy_module, "_try_import_cupy", lambda: object())
+    monkeypatch.setattr(
+        runtime_policy_module,
+        "_gpu_materialization_budget_bytes",
+        lambda _cupy: 245_000 * 4 * 40_000,
+    )
+
+    tuned_config, summary = _runtime_tuned_config_for_fit(config, raw_genotypes)
+
+    assert tuned_config.stochastic_variant_batch_size == 2_474
+    assert summary is not None
+    assert "stochastic_variant_batch_size=8192->2474" in summary
 
 
 def test_fit_stage_structure_cache_key_is_shared_across_traits(monkeypatch):
@@ -948,6 +974,7 @@ def test_training_records_from_stats_preserve_prior_continuous_features():
                 "support_counts": np.array([7], dtype=np.int32),
             },
         )(),
+        variant_indices=np.array([0], dtype=np.int32),
     )
 
     assert training_records[0].training_support == 7
@@ -957,6 +984,43 @@ def test_training_records_from_stats_preserve_prior_continuous_features():
     assert training_records[0].prior_categorical_features == {"functional_state": "lof"}
     assert training_records[0].prior_membership_features == {"regulatory_mix": {"enhancer": 0.75, "promoter": 0.25}}
     assert training_records[0].prior_nested_features == {"gene_context": ("protein_coding", "exon")}
+    assert training_records[0].prior_continuous_features is records[0].prior_continuous_features
+
+
+def test_normalize_variant_records_reuses_already_normalized_list():
+    records = [
+        VariantRecord("variant_0", VariantClass.SNV, "1", 100),
+        VariantRecord("variant_1", VariantClass.DELETION_SHORT, "1", 101),
+    ]
+
+    normalized = _normalize_variant_records(records)
+
+    assert normalized is records
+
+
+def test_tie_map_keeps_all_active_variants_detects_identity_kept_indices():
+    identity_tie_map = TieMap(
+        kept_indices=np.array([0, 1, 2], dtype=np.int32),
+        original_to_reduced=np.array([0, 1, 2], dtype=np.int32),
+        reduced_to_group=[
+            TieGroup(0, np.array([0], dtype=np.int32), np.array([1.0], dtype=np.float32)),
+            TieGroup(1, np.array([1], dtype=np.int32), np.array([1.0], dtype=np.float32)),
+            TieGroup(2, np.array([2], dtype=np.int32), np.array([1.0], dtype=np.float32)),
+        ],
+    )
+    skipped_tie_map = TieMap(
+        kept_indices=np.array([0, 2], dtype=np.int32),
+        original_to_reduced=np.array([0, -1, 1], dtype=np.int32),
+        reduced_to_group=[],
+    )
+
+    assert _tie_map_keeps_all_active_variants(identity_tie_map, 3)
+    assert not _tie_map_keeps_all_active_variants(skipped_tie_map, 3)
+
+
+def test_active_indices_cover_original_detects_identity_indices():
+    assert _active_indices_cover_original(np.array([0, 1, 2], dtype=np.int32), 3)
+    assert not _active_indices_cover_original(np.array([0, 2], dtype=np.int32), 3)
 
 
 def test_fit_uses_cohort_allele_frequencies_for_maf_filter(monkeypatch):

@@ -697,11 +697,16 @@ def _gpu_free_bytes(cupy) -> int:
 
 
 def _gpu_total_bytes(cupy) -> int:
-    """Return total GPU device memory in bytes, or 0 if unavailable."""
+    """Return total GPU device memory in bytes, or 0 if unavailable.
+
+    Returns 0 on mocked / partial CuPy stand-ins (used by unit tests that
+    don't have a real CUDA runtime) so callers fall back to their static
+    defaults instead of crashing.
+    """
     try:
         _, total = cupy.cuda.runtime.memGetInfo()
         return int(total)
-    except (OSError, RuntimeError):
+    except (AttributeError, OSError, RuntimeError):
         return 0
 
 

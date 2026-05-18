@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 from dataclasses import dataclass
 from functools import lru_cache
+from pathlib import Path
 from typing import Hashable, Iterator, Sequence, TypeVar, cast
 
 import numpy as np
@@ -249,13 +250,101 @@ def fit_preprocessor(
     )
 
 
+# ---------------------------------------------------------------------------
+# Content-keyed disk cache for the MAF filter and the tie map.
+#
+# Both `select_active_variant_indices` and `build_tie_map` produce deterministic
+# outputs that take minutes on biobank-scale inputs. Persisting the result keyed
+# by a content hash makes the second run near-instant. The cache is opt-in via
+# a `cache_dir` parameter (no environment variable, per SPEC.md). A missing
+# cache file is treated as a cold miss; a corrupt or mismatched cache file is
+# treated as a hard error (per SPEC.md: never silently swallow failures).
+# ---------------------------------------------------------------------------
+
+_PREPROCESSING_CACHE_VERSION = 1
+_MAF_CACHE_FILE_PREFIX = "maf_filter"
+_TIE_CACHE_FILE_PREFIX = "tie_map"
+
+
+def _hash_variant_records_for_maf(variant_records: Sequence[VariantRecord]) -> bytes:
+    """Stable digest of the fields `select_active_variant_indices` reads."""
+    hasher = hashlib.sha256()
+    hasher.update(f"variant_records:{len(variant_records)}:".encode("utf-8"))
+    # Pack allele_frequency into a numpy array so the bytes are well-defined.
+    allele_frequencies = np.asarray(
+        [float(record.allele_frequency) for record in variant_records],
+        dtype=np.float64,
+    )
+    hasher.update(allele_frequencies.tobytes())
+    # Variant identity (variant_id) anchors the digest to the specific dataset
+    # so that two datasets with the same allele frequencies do not collide.
+    variant_id_blob = "\x00".join(str(record.variant_id) for record in variant_records).encode("utf-8")
+    hasher.update(hashlib.sha256(variant_id_blob).digest())
+    return hasher.digest()
+
+
+def _maf_cache_key(
+    variant_records: Sequence[VariantRecord],
+    config: ModelConfig,
+) -> str:
+    hasher = hashlib.sha256()
+    hasher.update(f"v{_PREPROCESSING_CACHE_VERSION}:maf:".encode("utf-8"))
+    hasher.update(_hash_variant_records_for_maf(variant_records))
+    hasher.update(
+        f"min_maf={config.minimum_minor_allele_frequency:.17g}".encode("utf-8")
+    )
+    return hasher.hexdigest()[:24]
+
+
+def _maf_cache_path(cache_dir: Path, cache_key: str) -> Path:
+    return Path(cache_dir) / f"{_MAF_CACHE_FILE_PREFIX}.{cache_key}.npz"
+
+
+def _load_maf_filter_from_cache(cache_path: Path) -> np.ndarray | None:
+    if not cache_path.exists():
+        return None
+    with np.load(cache_path, allow_pickle=False) as cached_arrays:
+        cached_indices = np.asarray(cached_arrays["active_variant_indices"], dtype=np.int32)
+    if cached_indices.ndim != 1:
+        raise ValueError(
+            f"MAF filter cache at {cache_path} is corrupt: indices must be 1D, got shape {cached_indices.shape}"
+        )
+    return cached_indices
+
+
+def _save_maf_filter_to_cache(cache_path: Path, active_variant_indices: np.ndarray) -> None:
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    # np.savez appends `.npz` if the filename lacks it, so the temp file must
+    # end in `.npz` to land where we expect.
+    tmp_path = cache_path.with_name(cache_path.name + ".tmp.npz")
+    np.savez(
+        tmp_path,
+        active_variant_indices=np.asarray(active_variant_indices, dtype=np.int32),
+    )
+    tmp_path.replace(cache_path)
+
+
 def select_active_variant_indices(
     variant_records: Sequence[VariantRecord],
     config: ModelConfig,
+    *,
+    cache_dir: Path | None = None,
 ) -> np.ndarray:
     n_total = len(variant_records)
     if n_total == 0:
         return np.zeros(0, dtype=np.int32)
+
+    cache_path: Path | None = None
+    if cache_dir is not None:
+        cache_key = _maf_cache_key(variant_records, config)
+        cache_path = _maf_cache_path(Path(cache_dir), cache_key)
+        cached_indices = _load_maf_filter_from_cache(cache_path)
+        if cached_indices is not None:
+            log(
+                f"  active variants: {cached_indices.shape[0]}/{n_total} restored from MAF cache "
+                + f"(min_maf={config.minimum_minor_allele_frequency:.6f}, key={cache_key})"
+            )
+            return cached_indices
 
     maf_kept = np.asarray(
         [
@@ -270,12 +359,15 @@ def select_active_variant_indices(
             f"  active variants: 0/{n_total} kept after MAF filter "
             + f"(min_maf={config.minimum_minor_allele_frequency:.6f})"
         )
-        return maf_kept
+    else:
+        log(
+            f"  active variants: {maf_kept.shape[0]}/{n_total} kept after MAF filter "
+            + f"(min_maf={config.minimum_minor_allele_frequency:.6f})"
+        )
 
-    log(
-        f"  active variants: {maf_kept.shape[0]}/{n_total} kept after MAF filter "
-        + f"(min_maf={config.minimum_minor_allele_frequency:.6f})"
-    )
+    if cache_path is not None:
+        _save_maf_filter_to_cache(cache_path, maf_kept)
+
     return maf_kept
 
 
@@ -486,15 +578,184 @@ def _build_tie_map_windowed(
     )
 
 
+def _hash_standardized_genotypes_for_tie_map(
+    standardized_genotypes: StandardizedGenotypeMatrix,
+) -> bytes:
+    """Digest the per-variant view of a standardized matrix.
+
+    The tie map depends on (a) which raw columns are selected, (b) the
+    standardization parameters that turn raw columns into standardized
+    columns, and (c) the sample count. All three are captured by the small
+    per-variant arrays carried on the StandardizedGenotypeMatrix; the raw
+    sample-by-variant array is not hashed because it would be prohibitively
+    large and the per-variant statistics are themselves derived from it.
+    """
+    hasher = hashlib.sha256()
+    sample_count, variant_count = standardized_genotypes.shape
+    hasher.update(f"std:{sample_count}x{variant_count}:".encode("utf-8"))
+    variant_indices = np.asarray(standardized_genotypes.variant_indices, dtype=np.int64)
+    hasher.update(variant_indices.tobytes())
+    means = np.asarray(standardized_genotypes.means, dtype=np.float32)
+    scales = np.asarray(standardized_genotypes.scales, dtype=np.float32)
+    hasher.update(means.tobytes())
+    hasher.update(scales.tobytes())
+    support_counts = standardized_genotypes.support_counts
+    if support_counts is None:
+        hasher.update(b"support=none")
+    else:
+        support_array = np.asarray(support_counts, dtype=np.int32)
+        hasher.update(b"support=")
+        hasher.update(support_array.tobytes())
+    return hasher.digest()
+
+
+def _hash_records_for_tie_map(records: Sequence[VariantRecord]) -> bytes:
+    """Digest the record fields the windowed tie-map pre-filter reads."""
+    hasher = hashlib.sha256()
+    hasher.update(f"records:{len(records)}:".encode("utf-8"))
+    chromosomes_blob = "\x00".join(str(record.chromosome) for record in records).encode("utf-8")
+    hasher.update(hashlib.sha256(chromosomes_blob).digest())
+    positions = np.asarray([int(record.position) for record in records], dtype=np.int64)
+    hasher.update(positions.tobytes())
+    variant_id_blob = "\x00".join(str(record.variant_id) for record in records).encode("utf-8")
+    hasher.update(hashlib.sha256(variant_id_blob).digest())
+    return hasher.digest()
+
+
+def _tie_map_cache_key(
+    standardized_genotypes: StandardizedGenotypeMatrix,
+    records: Sequence[VariantRecord],
+    config: ModelConfig,
+) -> str:
+    hasher = hashlib.sha256()
+    hasher.update(f"v{_PREPROCESSING_CACHE_VERSION}:tie:".encode("utf-8"))
+    hasher.update(_hash_standardized_genotypes_for_tie_map(standardized_genotypes))
+    hasher.update(_hash_records_for_tie_map(records))
+    hasher.update(
+        f"min_maf={config.minimum_minor_allele_frequency:.17g}|"
+        f"min_scale={config.minimum_scale:.17g}|"
+        f"tie_window={_TIE_MAP_POSITION_WINDOW}".encode("utf-8")
+    )
+    return hasher.hexdigest()[:24]
+
+
+def _tie_map_cache_path(cache_dir: Path, cache_key: str) -> Path:
+    return Path(cache_dir) / f"{_TIE_CACHE_FILE_PREFIX}.{cache_key}.npz"
+
+
+def _serialize_tie_map(tie_map: TieMap) -> dict[str, np.ndarray]:
+    group_count = len(tie_map.reduced_to_group)
+    representative_indices = np.asarray(
+        [int(group.representative_index) for group in tie_map.reduced_to_group],
+        dtype=np.int32,
+    )
+    member_lengths = np.asarray(
+        [int(group.member_indices.shape[0]) for group in tie_map.reduced_to_group],
+        dtype=np.int32,
+    )
+    group_starts = np.zeros(group_count + 1, dtype=np.int64)
+    if group_count > 0:
+        np.cumsum(member_lengths.astype(np.int64), out=group_starts[1:])
+    flat_size = int(group_starts[-1]) if group_count > 0 else 0
+    flat_member_indices = np.empty(flat_size, dtype=np.int32)
+    flat_signs = np.empty(flat_size, dtype=np.float32)
+    for group_index, group in enumerate(tie_map.reduced_to_group):
+        start = int(group_starts[group_index])
+        stop = int(group_starts[group_index + 1])
+        flat_member_indices[start:stop] = np.asarray(group.member_indices, dtype=np.int32)
+        flat_signs[start:stop] = np.asarray(group.signs, dtype=np.float32)
+    return {
+        "kept_indices": np.asarray(tie_map.kept_indices, dtype=np.int32),
+        "original_to_reduced": np.asarray(tie_map.original_to_reduced, dtype=np.int32),
+        "representative_indices": representative_indices,
+        "group_starts": group_starts,
+        "flat_member_indices": flat_member_indices,
+        "flat_signs": flat_signs,
+    }
+
+
+def _deserialize_tie_map(cached_arrays: dict[str, np.ndarray] | "np.lib.npyio.NpzFile") -> TieMap:
+    kept_indices = np.asarray(cached_arrays["kept_indices"], dtype=np.int32)
+    original_to_reduced = np.asarray(cached_arrays["original_to_reduced"], dtype=np.int32)
+    representative_indices = np.asarray(cached_arrays["representative_indices"], dtype=np.int32)
+    group_starts = np.asarray(cached_arrays["group_starts"], dtype=np.int64)
+    flat_member_indices = np.asarray(cached_arrays["flat_member_indices"], dtype=np.int32)
+    flat_signs = np.asarray(cached_arrays["flat_signs"], dtype=np.float32)
+    group_count = representative_indices.shape[0]
+    if group_starts.shape[0] != group_count + 1:
+        raise ValueError(
+            f"tie map cache is corrupt: group_starts length {group_starts.shape[0]} "
+            f"does not match representative count {group_count} + 1"
+        )
+    reduced_to_group: list[TieGroup] = []
+    for group_index in range(group_count):
+        start = int(group_starts[group_index])
+        stop = int(group_starts[group_index + 1])
+        reduced_to_group.append(
+            TieGroup(
+                representative_index=int(representative_indices[group_index]),
+                member_indices=flat_member_indices[start:stop].copy(),
+                signs=flat_signs[start:stop].copy(),
+            )
+        )
+    return TieMap(
+        kept_indices=kept_indices,
+        original_to_reduced=original_to_reduced,
+        reduced_to_group=reduced_to_group,
+    )
+
+
+def _load_tie_map_from_cache(cache_path: Path) -> TieMap | None:
+    if not cache_path.exists():
+        return None
+    with np.load(cache_path, allow_pickle=False) as cached_arrays:
+        return _deserialize_tie_map(cached_arrays)
+
+
+def _save_tie_map_to_cache(cache_path: Path, tie_map: TieMap) -> None:
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = cache_path.with_name(cache_path.name + ".tmp.npz")
+    np.savez(tmp_path, **_serialize_tie_map(tie_map))
+    tmp_path.replace(cache_path)
+
+
 def build_tie_map(
     genotypes: StandardizedGenotypeMatrix | np.ndarray,
     records: Sequence[VariantRecord],
     config: ModelConfig,
+    *,
+    cache_dir: Path | None = None,
 ) -> TieMap:
     """Collapse exact and sign-flipped duplicate genotype columns."""
     standardized_genotypes = _as_standardized_genotypes(genotypes)
     if standardized_genotypes.shape[1] != len(records):
         raise ValueError("genotypes and records length mismatch.")
+    n_total = standardized_genotypes.shape[1]
+
+    cache_path: Path | None = None
+    if cache_dir is not None:
+        cache_key = _tie_map_cache_key(standardized_genotypes, records, config)
+        cache_path = _tie_map_cache_path(Path(cache_dir), cache_key)
+        cached_tie_map = _load_tie_map_from_cache(cache_path)
+        if cached_tie_map is not None:
+            log(
+                f"  tie map restored from cache: "
+                f"{n_total} -> {len(cached_tie_map.kept_indices)} unique (key={cache_key})"
+            )
+            return cached_tie_map
+
+    tie_map = _build_tie_map_uncached(standardized_genotypes, records)
+
+    if cache_path is not None:
+        _save_tie_map_to_cache(cache_path, tie_map)
+
+    return tie_map
+
+
+def _build_tie_map_uncached(
+    standardized_genotypes: StandardizedGenotypeMatrix,
+    records: Sequence[VariantRecord],
+) -> TieMap:
     n_total = standardized_genotypes.shape[1]
     log(f"  building tie map over {n_total} variants...")
 
@@ -1049,9 +1310,21 @@ def collapse_tie_groups(
     tie_map: TieMap,
 ) -> list[VariantRecord]:
     """Create one merged record per tie group for use in the reduced model."""
+    if len(tie_map.reduced_to_group) == len(records):
+        record_indices = np.arange(len(records), dtype=np.int32)
+        if (
+            np.array_equal(tie_map.kept_indices, record_indices)
+            and np.array_equal(tie_map.original_to_reduced, record_indices)
+        ):
+            return records if isinstance(records, list) else list(records)
+
     collapsed_records: list[VariantRecord] = []
     for tie_group in tie_map.reduced_to_group:
-        member_records = [records[int(member_index)] for member_index in tie_group.member_indices]
+        member_indices = tie_group.member_indices
+        if member_indices.shape[0] == 1:
+            collapsed_records.append(records[int(member_indices[0])])
+            continue
+        member_records = [records[int(member_index)] for member_index in member_indices]
         unique_variant_classes, class_membership = _class_membership(member_records)
         latent_variant_class = unique_variant_classes[0] if len(unique_variant_classes) == 1 else VariantClass.OTHER_COMPLEX_SV
         support_values = [

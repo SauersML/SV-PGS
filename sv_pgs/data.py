@@ -236,32 +236,7 @@ def _coerce_variant_class(value: Any) -> VariantClass:
 
 def normalize_variant_record(record: VariantRecord | dict[str, Any]) -> VariantRecord:
     if isinstance(record, VariantRecord):
-        return VariantRecord(
-            variant_id=record.variant_id,
-            variant_class=record.variant_class,
-            chromosome=record.chromosome,
-            position=record.position,
-            length=record.length,
-            allele_frequency=record.allele_frequency,
-            quality=record.quality,
-            training_support=record.training_support,
-            is_repeat=record.is_repeat,
-            is_copy_number=record.is_copy_number,
-            prior_binary_features=dict(record.prior_binary_features),
-            prior_continuous_features=dict(record.prior_continuous_features),
-            prior_categorical_features=dict(record.prior_categorical_features),
-            prior_membership_features={
-                feature_name: dict(feature_memberships)
-                for feature_name, feature_memberships in record.prior_membership_features.items()
-            },
-            prior_nested_features=dict(record.prior_nested_features),
-            prior_nested_membership_features={
-                feature_name: dict(feature_memberships)
-                for feature_name, feature_memberships in record.prior_nested_membership_features.items()
-            },
-            prior_class_members=record.prior_class_members,
-            prior_class_membership=record.prior_class_membership,
-        )
+        return record
     return VariantRecord(
         variant_id=str(record["variant_id"]),
         variant_class=_coerce_variant_class(record["variant_class"]),

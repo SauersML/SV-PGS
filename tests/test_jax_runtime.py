@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import sv_pgs._jax as jax_module
-from sv_pgs._jax import _is_turing_gpu
+from sv_pgs._jax import _is_ampere_or_newer, _is_hopper_or_newer, _is_turing_gpu
 
 
 def test_turing_detection_uses_compute_capability() -> None:
@@ -27,3 +27,21 @@ def test_gpu_float32_compute_enabled_with_cupy(monkeypatch) -> None:
 
     monkeypatch.setattr(jax_module, "_cupy_runtime_status", lambda: (False, "cupy_unavailable"))
     assert not jax_module.gpu_float32_compute_enabled()
+
+
+def test_ampere_detection_recognises_a100_and_h100() -> None:
+    assert _is_ampere_or_newer(("8.0",))
+    assert _is_ampere_or_newer(("8.6",))
+    assert _is_ampere_or_newer(("9.0",))
+
+
+def test_ampere_detection_rejects_turing_and_volta() -> None:
+    assert not _is_ampere_or_newer(("7.5",))
+    assert not _is_ampere_or_newer(("7.0",))
+    assert not _is_ampere_or_newer(())
+
+
+def test_hopper_detection() -> None:
+    assert _is_hopper_or_newer(("9.0",))
+    assert not _is_hopper_or_newer(("8.0",))
+    assert not _is_hopper_or_newer(("7.5",))

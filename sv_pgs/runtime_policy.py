@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass, replace
 
 from sv_pgs.config import ModelConfig
@@ -12,6 +13,7 @@ GPU_FINAL_REFINEMENT_VARIANT_MULTIPLIER = 2
 GPU_PRECONDITIONER_RANK_FLOOR = 128
 GPU_PRECONDITIONER_RANK_CEILING = 512
 GPU_PRECONDITIONER_RANK_FRACTION = 0.04
+GPU_STOCHASTIC_EXACT_GRAM_WORK_TARGET = 1_500_000_000_000.0
 
 
 @dataclass(frozen=True, slots=True)
@@ -38,10 +40,18 @@ def _recommended_gpu_preconditioner_rank(cacheable_dense_variants: int) -> int:
 def _recommended_gpu_stochastic_batch_size(
     *,
     cacheable_dense_variants: int,
+    sample_count: int,
 ) -> int:
     if cacheable_dense_variants < 1:
         return 256
-    return max(int(cacheable_dense_variants * 0.85), 256)
+    dense_budget_batch_size = int(cacheable_dense_variants * 0.85)
+    exact_gpu_work_batch_size = int(
+        math.sqrt(
+            GPU_STOCHASTIC_EXACT_GRAM_WORK_TARGET
+            / max(float(sample_count), 1.0)
+        )
+    )
+    return max(min(dense_budget_batch_size, exact_gpu_work_batch_size), 256)
 
 
 def runtime_training_policy_for_fit(
@@ -74,14 +84,13 @@ def runtime_training_policy_for_fit(
         max(int(config.sample_space_preconditioner_rank), recommended_preconditioner_rank),
         max_gpu_preconditioner_rank,
     )
-    # Use up to 85% of GPU budget for stochastic blocks — larger blocks mean
-    # fewer blocks per epoch, fewer preconditioner builds, better convergence.
-    # On GPU we want stochastic blocks large enough to amortize upload,
-    # preconditioner, and CG startup costs. The static default (8,192) is too
-    # conservative on modern GPUs once the block solver is iterative.
+    # Use as much dense GPU budget as the exact variant-space Gram build can
+    # use efficiently. On very large cohorts, this keeps stochastic blocks in
+    # the exact-GPU solve regime instead of drifting into slower sample-space CG.
     tuned_stochastic_batch_size = max(
         _recommended_gpu_stochastic_batch_size(
             cacheable_dense_variants=cacheable_dense_variants,
+            sample_count=sample_count,
         ),
         256,
     )

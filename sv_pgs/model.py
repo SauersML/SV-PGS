@@ -5,7 +5,7 @@ import hashlib
 import json
 from pathlib import Path
 import pickle
-from typing import Sequence
+from typing import Sequence, cast
 
 import numpy as np
 
@@ -610,7 +610,7 @@ class BayesianPGS:
             variant_records=variant_records,
             variant_stats=variant_stats,
         )
-        full_variant_records = [normalize_variant_record(record) for record in variant_records]
+        full_variant_records = _normalize_variant_records(variant_records)
         tuned_config, tuning_summary = _runtime_tuned_config_for_fit(
             config=self.config,
             genotype_matrix=raw_genotype_matrix,
@@ -744,17 +744,11 @@ class BayesianPGS:
         # Create VariantRecord objects ONLY for active variants (not all 1.68M)
         # This saves ~840 MB of Python object overhead
         log(f"creating training records for {len(active_variant_indices)} active variants...")
-        active_stats = VariantStatistics(
-            means=variant_stats.means[active_variant_indices],
-            scales=variant_stats.scales[active_variant_indices],
-            allele_frequencies=variant_stats.allele_frequencies[active_variant_indices],
-            support_counts=variant_stats.support_counts[active_variant_indices],
-        )
         active_records = _training_records_from_stats(
-            [full_variant_records[int(i)] for i in active_variant_indices],
-            active_stats,
+            full_variant_records,
+            variant_stats,
+            active_variant_indices,
         )
-        del active_stats
         import gc
         gc.collect()
         log(f"active training records created: {len(active_records)}  mem={mem()}")
@@ -768,8 +762,11 @@ class BayesianPGS:
                     active_variant_indices=active_variant_indices,
                     reduced_tie_map=reduced_tie_map,
                 )
-            combined_indices = active_variant_indices[reduced_tie_map.kept_indices]
-            reduced_genotypes = standardized_genotypes.subset(combined_indices)
+            if _tie_map_keeps_all_active_variants(reduced_tie_map, active_variant_indices.shape[0]):
+                reduced_genotypes = active_genotypes
+            else:
+                combined_indices = active_variant_indices[reduced_tie_map.kept_indices]
+                reduced_genotypes = standardized_genotypes.subset(combined_indices)
             local_cache = False
         else:
             active_genotypes = None
@@ -1229,6 +1226,8 @@ def _project_tie_map_to_original_space(
     active_variant_indices: np.ndarray,
     original_variant_count: int,
 ) -> TieMap:
+    if _active_indices_cover_original(active_variant_indices, original_variant_count):
+        return reduced_tie_map
     kept_indices = active_variant_indices[reduced_tie_map.kept_indices]
     original_to_reduced = np.full(original_variant_count, -1, dtype=np.int32)
     original_to_reduced[active_variant_indices] = reduced_tie_map.original_to_reduced
@@ -1245,6 +1244,13 @@ def _project_tie_map_to_original_space(
         kept_indices=kept_indices.astype(np.int32),
         original_to_reduced=original_to_reduced,
         reduced_to_group=original_groups,
+    )
+
+
+def _active_indices_cover_original(active_variant_indices: np.ndarray, original_variant_count: int) -> bool:
+    return (
+        active_variant_indices.shape == (int(original_variant_count),)
+        and np.array_equal(active_variant_indices, np.arange(int(original_variant_count), dtype=np.int32))
     )
 
 
@@ -1270,40 +1276,69 @@ def _tie_group_export_weights(
 def _training_records_from_stats(
     records: Sequence[VariantRecord],
     variant_stats: VariantStatistics,
+    variant_indices: np.ndarray,
 ) -> list[VariantRecord]:
     """Build training records using cohort-derived training statistics."""
-    training_records: list[VariantRecord] = []
-    for variant_index, record in enumerate(records):
+    structural_variant_classes = ModelConfig.structural_variant_classes()
+    allele_frequencies = variant_stats.allele_frequencies
+    support_counts = variant_stats.support_counts
+    training_records = cast(list[VariantRecord], [None] * int(len(variant_indices)))
+    for output_index, variant_index in enumerate(variant_indices):
+        variant_index_int = int(variant_index)
+        record = records[variant_index_int]
         support = record.training_support
-        if support is None and record.variant_class in ModelConfig.structural_variant_classes():
-            support = int(variant_stats.support_counts[variant_index])
-        training_records.append(
-            VariantRecord(
-                variant_id=record.variant_id,
-                variant_class=record.variant_class,
-                chromosome=record.chromosome,
-                position=record.position,
-                length=record.length,
-                allele_frequency=float(variant_stats.allele_frequencies[variant_index]),
-                quality=record.quality,
+        if support is None and record.variant_class in structural_variant_classes:
+            support = int(support_counts[variant_index_int])
+        training_records[output_index] = (
+            _training_record_with_stats(
+                record,
+                allele_frequency=float(allele_frequencies[variant_index_int]),
                 training_support=support,
-                is_repeat=record.is_repeat,
-                is_copy_number=record.is_copy_number,
-                prior_binary_features=dict(record.prior_binary_features),
-                prior_continuous_features=dict(record.prior_continuous_features),
-                prior_categorical_features=dict(record.prior_categorical_features),
-                prior_membership_features={
-                    feature_name: dict(feature_memberships)
-                    for feature_name, feature_memberships in record.prior_membership_features.items()
-                },
-                prior_nested_features=dict(record.prior_nested_features),
-                prior_nested_membership_features={
-                    feature_name: dict(feature_memberships)
-                    for feature_name, feature_memberships in record.prior_nested_membership_features.items()
-                },
-                prior_class_members=record.prior_class_members,
-                prior_class_membership=record.prior_class_membership,
             )
         )
     log(f"  training records from stats: {len(training_records)} records [NO DATA PASS]")
     return training_records
+
+
+def _training_record_with_stats(
+    record: VariantRecord,
+    *,
+    allele_frequency: float,
+    training_support: int | None,
+) -> VariantRecord:
+    training_record = object.__new__(VariantRecord)
+    training_record.variant_id = record.variant_id
+    training_record.variant_class = record.variant_class
+    training_record.chromosome = record.chromosome
+    training_record.position = record.position
+    training_record.length = record.length
+    training_record.allele_frequency = allele_frequency
+    training_record.quality = record.quality
+    training_record.training_support = training_support
+    training_record.is_repeat = record.is_repeat
+    training_record.is_copy_number = record.is_copy_number
+    training_record.prior_binary_features = record.prior_binary_features
+    training_record.prior_continuous_features = record.prior_continuous_features
+    training_record.prior_categorical_features = record.prior_categorical_features
+    training_record.prior_membership_features = record.prior_membership_features
+    training_record.prior_nested_features = record.prior_nested_features
+    training_record.prior_nested_membership_features = record.prior_nested_membership_features
+    training_record.prior_class_members = record.prior_class_members
+    training_record.prior_class_membership = record.prior_class_membership
+    return training_record
+
+
+def _normalize_variant_records(records: Sequence[VariantRecord | dict]) -> list[VariantRecord]:
+    if isinstance(records, list) and (not records or isinstance(records[0], VariantRecord)):
+        return cast(list[VariantRecord], records)
+    return [normalize_variant_record(record) for record in records]
+
+
+def _tie_map_keeps_all_active_variants(tie_map: TieMap, active_variant_count: int) -> bool:
+    return (
+        tie_map.kept_indices.shape == (int(active_variant_count),)
+        and tie_map.original_to_reduced.shape == (int(active_variant_count),)
+        and len(tie_map.reduced_to_group) == int(active_variant_count)
+        and np.array_equal(tie_map.kept_indices, np.arange(int(active_variant_count), dtype=np.int32))
+        and np.array_equal(tie_map.original_to_reduced, np.arange(int(active_variant_count), dtype=np.int32))
+    )

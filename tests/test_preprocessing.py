@@ -2,7 +2,7 @@ import numpy as np
 import pytest
 
 from sv_pgs.config import ModelConfig, VariantClass
-from sv_pgs.data import VariantRecord
+from sv_pgs.data import TieGroup, TieMap, VariantRecord
 from sv_pgs.genotype import as_raw_genotype_matrix
 from sv_pgs.plink import PLINK_MISSING_INT8
 import sv_pgs.preprocessing as preprocessing_module
@@ -68,6 +68,7 @@ def test_mixed_class_tie_group_uses_symmetric_latent_class():
 
     assert tie_map.kept_indices.tolist() == [0, 2]
     assert collapsed_records[0].variant_class == VariantClass.OTHER_COMPLEX_SV
+    assert collapsed_records[1] is variant_records[2]
     assert collapsed_records[0].position == 100
     assert collapsed_records[0].is_repeat is False
     assert collapsed_records[0].prior_class_members == (
@@ -75,6 +76,33 @@ def test_mixed_class_tie_group_uses_symmetric_latent_class():
         VariantClass.SNV,
     )
     np.testing.assert_allclose(collapsed_records[0].prior_class_membership, [0.5, 0.5])
+
+
+def test_collapse_tie_groups_reuses_records_when_there_are_no_ties():
+    variant_records = [
+        VariantRecord("variant_0", VariantClass.SNV, "1", 100),
+        VariantRecord("variant_1", VariantClass.DELETION_SHORT, "1", 101),
+    ]
+    tie_map = TieMap(
+        kept_indices=np.array([0, 1], dtype=np.int32),
+        original_to_reduced=np.array([0, 1], dtype=np.int32),
+        reduced_to_group=[
+            TieGroup(
+                representative_index=0,
+                member_indices=np.array([0], dtype=np.int32),
+                signs=np.array([1.0], dtype=np.float32),
+            ),
+            TieGroup(
+                representative_index=1,
+                member_indices=np.array([1], dtype=np.int32),
+                signs=np.array([1.0], dtype=np.float32),
+            ),
+        ],
+    )
+
+    collapsed_records = collapse_tie_groups(variant_records, tie_map)
+
+    assert collapsed_records is variant_records
 
 
 def test_exact_ties_require_exact_float32_equality():
@@ -518,3 +546,172 @@ def test_collapse_tie_groups_preserves_support_and_continuous_features():
         "protein_coding>exon": 0.5,
         "protein_coding>intron": 0.5,
     }
+    assert collapsed_records[1] is variant_records[2]
+
+
+def _make_cache_test_dataset() -> tuple[np.ndarray, list[VariantRecord]]:
+    """Synthetic dataset with rare variants, ties, and sign-flipped duplicates."""
+    raw_genotype_matrix = np.array(
+        [
+            [0, 1, 1, 0, 2],
+            [1, 0, 1, 1, 2],
+            [0, 1, 1, 0, 2],
+            [1, 0, 1, 1, 2],
+            [2, 1, 1, 2, 2],
+            [0, 1, 1, 0, 2],
+        ],
+        dtype=np.int8,
+    )
+    variant_records = [
+        VariantRecord("rare_drop", VariantClass.SNV, "1", 100, allele_frequency=0.0001),
+        VariantRecord("common_keep_a", VariantClass.SNV, "1", 101, allele_frequency=0.30),
+        VariantRecord("common_keep_b", VariantClass.SNV, "1", 102, allele_frequency=0.30),
+        VariantRecord("common_keep_c", VariantClass.SNV, "1", 103, allele_frequency=0.30),
+        VariantRecord("rare_drop_2", VariantClass.SNV, "1", 104, allele_frequency=0.0001),
+    ]
+    return raw_genotype_matrix, variant_records
+
+
+def test_select_active_variant_indices_disk_cache_cold_equals_warm(tmp_path):
+    _, variant_records = _make_cache_test_dataset()
+    config = ModelConfig(minimum_minor_allele_frequency=0.001)
+
+    cold_indices = select_active_variant_indices(
+        variant_records=variant_records,
+        config=config,
+        cache_dir=tmp_path,
+    )
+    cache_files_after_cold = sorted(tmp_path.glob("maf_filter.*.npz"))
+    assert len(cache_files_after_cold) == 1
+
+    warm_indices = select_active_variant_indices(
+        variant_records=variant_records,
+        config=config,
+        cache_dir=tmp_path,
+    )
+
+    np.testing.assert_array_equal(cold_indices, warm_indices)
+    assert cold_indices.dtype == warm_indices.dtype
+
+
+def test_select_active_variant_indices_disk_cache_changes_key_when_threshold_changes(tmp_path):
+    _, variant_records = _make_cache_test_dataset()
+
+    strict_indices = select_active_variant_indices(
+        variant_records=variant_records,
+        config=ModelConfig(minimum_minor_allele_frequency=0.001),
+        cache_dir=tmp_path,
+    )
+    permissive_indices = select_active_variant_indices(
+        variant_records=variant_records,
+        config=ModelConfig(minimum_minor_allele_frequency=0.0),
+        cache_dir=tmp_path,
+    )
+
+    assert strict_indices.tolist() != permissive_indices.tolist()
+    cache_files = sorted(tmp_path.glob("maf_filter.*.npz"))
+    assert len(cache_files) == 2
+
+
+def test_select_active_variant_indices_disk_cache_corrupt_file_fails_loud(tmp_path):
+    _, variant_records = _make_cache_test_dataset()
+    config = ModelConfig(minimum_minor_allele_frequency=0.001)
+
+    select_active_variant_indices(
+        variant_records=variant_records,
+        config=config,
+        cache_dir=tmp_path,
+    )
+    cache_files = list(tmp_path.glob("maf_filter.*.npz"))
+    assert len(cache_files) == 1
+    cache_files[0].write_bytes(b"this is not a valid npz file")
+
+    with pytest.raises(Exception):
+        select_active_variant_indices(
+            variant_records=variant_records,
+            config=config,
+            cache_dir=tmp_path,
+        )
+
+
+def test_build_tie_map_disk_cache_cold_equals_warm(tmp_path):
+    raw_genotype_matrix, variant_records = _make_cache_test_dataset()
+    covariate_matrix = np.zeros((raw_genotype_matrix.shape[0], 1), dtype=np.float32)
+    target_vector = np.array([0.0, 1.0, 0.0, 1.0, 0.0, 1.0], dtype=np.float32)
+    raw_genotypes = as_raw_genotype_matrix(raw_genotype_matrix)
+    config = ModelConfig()
+    prepared_arrays = fit_preprocessor(raw_genotypes, covariate_matrix, target_vector, config)
+    standardized_genotypes = raw_genotypes.standardized(
+        prepared_arrays.means,
+        prepared_arrays.scales,
+        support_counts=prepared_arrays.support_counts,
+    )
+
+    cold_tie_map = build_tie_map(
+        standardized_genotypes,
+        variant_records,
+        config,
+        cache_dir=tmp_path,
+    )
+    cache_files_after_cold = sorted(tmp_path.glob("tie_map.*.npz"))
+    assert len(cache_files_after_cold) == 1
+
+    warm_tie_map = build_tie_map(
+        standardized_genotypes,
+        variant_records,
+        config,
+        cache_dir=tmp_path,
+    )
+
+    np.testing.assert_array_equal(cold_tie_map.kept_indices, warm_tie_map.kept_indices)
+    np.testing.assert_array_equal(cold_tie_map.original_to_reduced, warm_tie_map.original_to_reduced)
+    assert len(cold_tie_map.reduced_to_group) == len(warm_tie_map.reduced_to_group)
+    for cold_group, warm_group in zip(cold_tie_map.reduced_to_group, warm_tie_map.reduced_to_group, strict=True):
+        assert int(cold_group.representative_index) == int(warm_group.representative_index)
+        np.testing.assert_array_equal(cold_group.member_indices, warm_group.member_indices)
+        np.testing.assert_array_equal(cold_group.signs, warm_group.signs)
+
+
+def test_build_tie_map_disk_cache_key_changes_with_variant_subset(tmp_path):
+    raw_genotype_matrix, variant_records = _make_cache_test_dataset()
+    covariate_matrix = np.zeros((raw_genotype_matrix.shape[0], 1), dtype=np.float32)
+    target_vector = np.array([0.0, 1.0, 0.0, 1.0, 0.0, 1.0], dtype=np.float32)
+    raw_genotypes = as_raw_genotype_matrix(raw_genotype_matrix)
+    config = ModelConfig()
+    prepared_arrays = fit_preprocessor(raw_genotypes, covariate_matrix, target_vector, config)
+    standardized_full = raw_genotypes.standardized(
+        prepared_arrays.means,
+        prepared_arrays.scales,
+        support_counts=prepared_arrays.support_counts,
+    )
+    full_subset_indices = np.array([1, 2, 3], dtype=np.int32)
+    standardized_subset = standardized_full.subset(full_subset_indices)
+    subset_records = [variant_records[int(i)] for i in full_subset_indices]
+
+    build_tie_map(standardized_full, variant_records, config, cache_dir=tmp_path)
+    build_tie_map(standardized_subset, subset_records, config, cache_dir=tmp_path)
+
+    cache_files = sorted(tmp_path.glob("tie_map.*.npz"))
+    assert len(cache_files) == 2
+
+
+def test_build_tie_map_disk_cache_corrupt_file_fails_loud(tmp_path):
+    raw_genotype_matrix, variant_records = _make_cache_test_dataset()
+    covariate_matrix = np.zeros((raw_genotype_matrix.shape[0], 1), dtype=np.float32)
+    target_vector = np.array([0.0, 1.0, 0.0, 1.0, 0.0, 1.0], dtype=np.float32)
+    raw_genotypes = as_raw_genotype_matrix(raw_genotype_matrix)
+    config = ModelConfig()
+    prepared_arrays = fit_preprocessor(raw_genotypes, covariate_matrix, target_vector, config)
+    standardized_genotypes = raw_genotypes.standardized(
+        prepared_arrays.means,
+        prepared_arrays.scales,
+        support_counts=prepared_arrays.support_counts,
+    )
+
+    build_tie_map(standardized_genotypes, variant_records, config, cache_dir=tmp_path)
+    cache_files = list(tmp_path.glob("tie_map.*.npz"))
+    assert len(cache_files) == 1
+    cache_files[0].write_bytes(b"this is not a valid npz file")
+
+    with pytest.raises(Exception):
+        build_tie_map(standardized_genotypes, variant_records, config, cache_dir=tmp_path)
