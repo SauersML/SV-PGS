@@ -1420,6 +1420,9 @@ def fit_variational_em(
                         trait_type=TraitType.QUANTITATIVE,
                     )
             covariate_linear_predictor = np.asarray(covariate_matrix @ alpha_state, dtype=np.float64)
+            if use_gpu_epoch_predictor_state:
+                assert stochastic_epoch_cupy is not None
+                assert stochastic_epoch_compute_cp_dtype is not None
             covariate_linear_predictor_gpu = (
                 None
                 if not use_gpu_epoch_predictor_state
@@ -1654,11 +1657,17 @@ def fit_variational_em(
                     )
                     epoch_total_newton_iters += int(block_state[5])
                 else:
+                    if use_gpu_epoch_predictor_state:
+                        assert target_vector_gpu is not None
+                        assert predictor_offset_gpu_block is not None
                     collapsed_block_state = _fit_collapsed_posterior(
                         genotype_matrix=block_genotypes,
                         covariate_matrix=empty_covariates,
                         targets=(
-                            _cupy_array_to_numpy(target_vector_gpu - predictor_offset_gpu_block, dtype=np.float64)
+                            _cupy_array_to_numpy(
+                                target_vector_gpu - predictor_offset_gpu_block,
+                                dtype=np.float64,
+                            )
                             if use_gpu_epoch_predictor_state
                             else target_vector - predictor_offset
                         ),
@@ -2891,7 +2900,7 @@ def _binary_posterior_state(
 
     resume_completed_iterations = 0
     if resume_state is not None:
-        resume_completed_iterations = int(resume_state.get("completed_iterations", 0))
+        resume_completed_iterations = int(str(resume_state.get("completed_iterations", 0)))
         if resume_completed_iterations < 0 or resume_completed_iterations > max_iterations:
             raise ValueError("binary resume_state completed_iterations is out of range.")
         parameters = np.asarray(resume_state["parameters"], dtype=np.float64).copy()
@@ -2899,7 +2908,7 @@ def _binary_posterior_state(
             resume_state["current_linear_predictor"],
             dtype=np.float64,
         ).copy()
-        current_objective = float(resume_state["current_objective"])
+        current_objective = float(str(resume_state["current_objective"]))
         best_parameters = np.asarray(
             resume_state.get("best_parameters", parameters),
             dtype=np.float64,
@@ -2908,8 +2917,8 @@ def _binary_posterior_state(
             resume_state.get("best_linear_predictor", current_linear_predictor),
             dtype=np.float64,
         ).copy()
-        best_objective = float(resume_state.get("best_objective", current_objective))
-        stall_count = int(resume_state.get("stall_count", 0))
+        best_objective = float(str(resume_state.get("best_objective", current_objective)))
+        stall_count = int(str(resume_state.get("stall_count", 0)))
         if parameters.shape != (covariate_count + standardized_genotypes.shape[1],):
             raise ValueError("binary resume_state parameters shape does not match the block.")
         if current_linear_predictor.shape != (standardized_genotypes.shape[0],):
@@ -3933,6 +3942,8 @@ def _get_or_build_background_sample_space_cpu_preconditioner(
         rank=rank,
         prior_variances=prior_variances,
     )
+    nystrom_basis_cpu: np.ndarray | None
+    nystrom_factor_cpu: np.ndarray | None
     if reuse_nystrom and cache_entry is not None and cache_entry.nystrom_factor_cpu is not None:
         preconditioner = _sample_space_cpu_preconditioner_from_factor(
             low_rank_factor=cache_entry.nystrom_factor_cpu,
@@ -4464,6 +4475,8 @@ def _get_cached_sample_space_cpu_preconditioner(
         rank=rank,
         prior_variances=prior_variances,
     )
+    nystrom_basis_cpu: np.ndarray | None
+    nystrom_factor_cpu: np.ndarray | None
     if reuse_nystrom and cache_entry is not None and cache_entry.nystrom_factor_cpu is not None:
         preconditioner = _sample_space_cpu_preconditioner_from_factor(
             low_rank_factor=cache_entry.nystrom_factor_cpu,
@@ -7975,12 +7988,13 @@ def _solve_restricted_full(
         maximum_steps=logdet_lanczos_steps,
     )
 
+    mixed_preconditioner: Callable[[Any], Any] | None = None
     if logdet_probe_rhs is not None:
         if sample_space_gpu_enabled:
             cp_preconditioner = _try_import_cupy()
             assert cp_preconditioner is not None
 
-            def _mixed_preconditioner(matrix):
+            def _gpu_mixed_preconditioner(matrix: Any) -> Any:
                 matrix_gpu = cp_preconditioner.asarray(matrix)
                 matrix_was_vector = matrix_gpu.ndim == 1
                 if matrix_was_vector:
@@ -7998,8 +8012,9 @@ def _solve_restricted_full(
                         matrix_gpu[:, logdet_column_indices] / diagonal_gpu[:, None]
                     )
                 return preconditioned_matrix[:, 0] if matrix_was_vector else preconditioned_matrix
+            mixed_preconditioner = _gpu_mixed_preconditioner
         else:
-            def _mixed_preconditioner(matrix: np.ndarray) -> np.ndarray:
+            def _cpu_mixed_preconditioner(matrix: Any) -> np.ndarray:
                 matrix_array = np.asarray(matrix, dtype=np.float64)
                 matrix_was_vector = matrix_array.ndim == 1
                 if matrix_was_vector:
@@ -8018,8 +8033,7 @@ def _solve_restricted_full(
                         / np.maximum(diagonal_control_variate[:, None], 1e-12)
                     )
                 return preconditioned_matrix[:, 0] if matrix_was_vector else preconditioned_matrix
-    else:
-        _mixed_preconditioner = None
+            mixed_preconditioner = _cpu_mixed_preconditioner
 
     inverse_covariance_rhs = solve_rhs_iterative(
         solve_rhs_matrix,
@@ -8045,7 +8059,7 @@ def _solve_restricted_full(
             else None
         ),
         lanczos_recorder=logdet_recorder,
-        preconditioner_override=_mixed_preconditioner,
+        preconditioner_override=mixed_preconditioner,
     )
     cupy_module = _try_import_cupy() if sample_space_gpu_enabled else None
     gpu_postprocess_enabled = (
@@ -8170,7 +8184,7 @@ def _solve_restricted_full(
         )
         logdet_covariance = (
             _sample_space_logdet_from_cg_lanczos(
-                logdet_recorder,
+                _require_logdet_recorder(logdet_recorder),
                 dimension=sample_count,
                 baseline_logdet=baseline_logdet,
             )
@@ -8241,7 +8255,7 @@ def _solve_restricted_full(
     )
     logdet_covariance = (
         _sample_space_logdet_from_cg_lanczos(
-            logdet_recorder,
+            _require_logdet_recorder(logdet_recorder),
             dimension=sample_count,
             baseline_logdet=baseline_logdet,
         )

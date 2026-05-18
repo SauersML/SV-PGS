@@ -505,6 +505,154 @@ def _try_import_cupy() -> Any | None:
     return None
 
 
+# Cache of (stream_a, stream_b) keyed by the id of the cupy module so that
+# tests with mocked cupy instances each get their own pair, while real runs
+# create the two non-default streams exactly once per process.
+_cuda_upload_streams_cache: dict[int, tuple[Any, Any]] = {}
+
+
+def _cuda_upload_stream_pair(cupy) -> tuple[Any, Any]:
+    """Return two non-default CUDA streams used to overlap H2D copies with CPU work.
+
+    Created once per (cupy module) and reused across every materialization.
+    """
+    cache_key = id(cupy)
+    cached = _cuda_upload_streams_cache.get(cache_key)
+    if cached is not None:
+        return cached
+    stream_a = cupy.cuda.Stream(non_blocking=True)
+    stream_b = cupy.cuda.Stream(non_blocking=True)
+    pair = (stream_a, stream_b)
+    _cuda_upload_streams_cache[cache_key] = pair
+    return pair
+
+
+def _pinned_int8_host_buffer(
+    cupy,
+    sample_count: int,
+    max_tile_variants: int,
+) -> tuple[np.ndarray, np.ndarray, Any]:
+    """Allocate a pair of reusable page-locked int8 host buffers (one per stream).
+
+    Returns ``(buffer_a, buffer_b, pinned_memory_owner)``; each buffer is shaped
+    ``(sample_count, max_tile_variants)``. The two buffers share a single
+    ``cupy.cuda.alloc_pinned_memory`` allocation so they live as long as the
+    returned owner reference. Raises ``MemoryError``/``RuntimeError`` loudly if
+    the CUDA driver cannot pin host memory — there is no silent fallback.
+    """
+    if int(sample_count) <= 0 or int(max_tile_variants) <= 0:
+        raise ValueError(
+            "pinned int8 host buffer requires positive sample_count and max_tile_variants; "
+            f"got sample_count={sample_count}, max_tile_variants={max_tile_variants}."
+        )
+    slot_shape = (int(sample_count), int(max_tile_variants))
+    slot_element_count = slot_shape[0] * slot_shape[1]
+    total_nbytes = slot_element_count * 2 * np.dtype(np.int8).itemsize
+    pinned_memory = cupy.cuda.alloc_pinned_memory(total_nbytes)
+    flat_view = np.frombuffer(pinned_memory, dtype=np.int8, count=slot_element_count * 2)
+    buffer_a = flat_view[:slot_element_count].reshape(slot_shape)
+    buffer_b = flat_view[slot_element_count:].reshape(slot_shape)
+    return buffer_a, buffer_b, pinned_memory
+
+
+def _upload_standardized_int8_tiles_overlapped(
+    *,
+    cupy,
+    raw_int8: "Int8BatchCapable",
+    variant_indices: np.ndarray,
+    means: np.ndarray,
+    scales: np.ndarray,
+    gpu_destination,
+    sample_count: int,
+    upload_batch_size: int,
+    standardized_dtype,
+) -> None:
+    """Upload + standardize int8 tiles into a float GPU strip with overlapped H2D.
+
+    Mirrors ``_upload_int8_tiles_overlapped`` but additionally casts each tile to
+    ``standardized_dtype`` on the GPU and applies ``(x - mean) / scale`` with the
+    PLINK missing-int8 sentinel zeroed out, matching ``_standardize_batch_cupy``
+    bit-for-bit while keeping the work on the upload stream so it overlaps the
+    next tile's BED-reader pass.
+    """
+    stream_pair = _cuda_upload_stream_pair(cupy)
+    pinned_buffer_a, pinned_buffer_b, _pinned_owner = _pinned_int8_host_buffer(
+        cupy, sample_count=sample_count, max_tile_variants=int(upload_batch_size)
+    )
+    pinned_slots = (pinned_buffer_a, pinned_buffer_b)
+    in_flight_events: list[Any] = [None, None]
+    selected_means_gpu = cupy.asarray(means[variant_indices], dtype=standardized_dtype)
+    selected_scales_gpu = cupy.asarray(scales[variant_indices], dtype=standardized_dtype)
+    missing_sentinel = int(PLINK_MISSING_INT8)
+    local_start = 0
+    for tile_index, raw_batch in enumerate(
+        raw_int8.iter_column_batches_i8(variant_indices, batch_size=upload_batch_size)
+    ):
+        slot_index = tile_index % 2
+        previous_event = in_flight_events[slot_index]
+        if previous_event is not None:
+            previous_event.synchronize()
+        batch_width = raw_batch.values.shape[1]
+        pinned_slot = pinned_slots[slot_index]
+        pinned_slot[:, :batch_width] = raw_batch.values
+        local_stop = local_start + batch_width
+        stream = stream_pair[slot_index]
+        with stream:
+            staged_int8 = cupy.asarray(pinned_slot[:, :batch_width])
+            standardized_tile = staged_int8.astype(standardized_dtype)
+            missing_mask = staged_int8 == missing_sentinel
+            standardized_tile -= selected_means_gpu[local_start:local_stop][None, :]
+            standardized_tile /= selected_scales_gpu[local_start:local_stop][None, :]
+            standardized_tile[missing_mask] = 0.0
+            gpu_destination[:, local_start:local_stop] = standardized_tile
+        in_flight_events[slot_index] = stream.record()
+        local_start = local_stop
+
+
+def _upload_int8_tiles_overlapped(
+    *,
+    cupy,
+    raw_int8: "Int8BatchCapable",
+    variant_indices: np.ndarray,
+    gpu_destination,
+    sample_count: int,
+    upload_batch_size: int,
+    gpu_int8_dtype,
+) -> None:
+    """Upload int8 column tiles into ``gpu_destination`` with overlapped H2D copies.
+
+    Issues each tile's async H2D copy on one of two CUDA streams, double-buffered
+    through a pair of pinned int8 host buffers so the next tile's BED-reader
+    CPU work runs concurrently with the previous tile's H2D transfer. The math
+    is bit identical to a serial pageable ``cupy.asarray`` upload — this is a
+    pure scheduling change.
+    """
+    stream_pair = _cuda_upload_stream_pair(cupy)
+    pinned_buffer_a, pinned_buffer_b, _pinned_owner = _pinned_int8_host_buffer(
+        cupy, sample_count=sample_count, max_tile_variants=int(upload_batch_size)
+    )
+    pinned_slots = (pinned_buffer_a, pinned_buffer_b)
+    in_flight_events: list[Any] = [None, None]
+    local_start = 0
+    for tile_index, raw_batch in enumerate(
+        raw_int8.iter_column_batches_i8(variant_indices, batch_size=upload_batch_size)
+    ):
+        slot_index = tile_index % 2
+        previous_event = in_flight_events[slot_index]
+        if previous_event is not None:
+            previous_event.synchronize()
+        batch_width = raw_batch.values.shape[1]
+        pinned_slot = pinned_slots[slot_index]
+        pinned_slot[:, :batch_width] = raw_batch.values
+        local_stop = local_start + batch_width
+        stream = stream_pair[slot_index]
+        with stream:
+            staged_tile = cupy.asarray(pinned_slot[:, :batch_width], dtype=gpu_int8_dtype)
+            gpu_destination[:, local_start:local_stop] = staged_tile
+        in_flight_events[slot_index] = stream.record()
+        local_start = local_stop
+
+
 _gpu_verified = False
 
 
@@ -1501,7 +1649,10 @@ class StandardizedGenotypeMatrix:
                 del dense_ref
             elif use_int8_gpu_cache:
                 log(f"    uploading raw int8 genotypes to GPU ({nbytes / 1e9:.1f} GB incl. scales)  mem={mem()}")
-                raw_int8 = cast(Int8BatchCapable, self.raw)
+                raw_matrix = self.raw
+                if raw_matrix is None:
+                    raise RuntimeError("raw int8 GPU cache requires raw backing storage.")
+                raw_int8 = cast(Int8BatchCapable, raw_matrix)
                 gpu_int8_dtype = cupy.int8 if hasattr(cupy, "int8") else np.int8
                 # Fast path: if the entire int8 block fits easily, prefer a single
                 # contiguous raw read plus one H2D copy over CPU-oriented batch
@@ -1509,7 +1660,7 @@ class StandardizedGenotypeMatrix:
                 # which arrive as contiguous local slices.
                 int8_total_bytes = int(self.shape[0]) * int(self.shape[1])
                 if int8_total_bytes < budget_bytes * 0.5:
-                    full_int8_block = _read_int8_columns_one_shot(raw_int8, self.variant_indices)
+                    full_int8_block = _read_int8_columns_one_shot(raw_matrix, self.variant_indices)
                     if full_int8_block is not None:
                         log(
                             "    raw int8 block fits one-shot upload budget; "
@@ -1523,22 +1674,26 @@ class StandardizedGenotypeMatrix:
                                 gpu_matrix = np.asfortranarray(np.asarray(gpu_matrix, dtype=gpu_int8_dtype))
                     else:
                         gpu_matrix = cupy.empty(self.shape, dtype=gpu_int8_dtype, order="F")
-                        upload_batch_size = auto_batch_size_i8(self.shape[0])
-                        local_start = 0
-                        for raw_batch in raw_int8.iter_column_batches_i8(self.variant_indices, batch_size=upload_batch_size):
-                            batch_width = raw_batch.values.shape[1]
-                            local_stop = local_start + batch_width
-                            gpu_matrix[:, local_start:local_stop] = cupy.asarray(raw_batch.values, dtype=gpu_int8_dtype)
-                            local_start = local_stop
+                        _upload_int8_tiles_overlapped(
+                            cupy=cupy,
+                            raw_int8=raw_int8,
+                            variant_indices=self.variant_indices,
+                            gpu_destination=gpu_matrix,
+                            sample_count=int(self.shape[0]),
+                            upload_batch_size=auto_batch_size_i8(self.shape[0]),
+                            gpu_int8_dtype=gpu_int8_dtype,
+                        )
                 else:
                     gpu_matrix = cupy.empty(self.shape, dtype=gpu_int8_dtype, order="F")
-                    upload_batch_size = auto_batch_size_i8(self.shape[0])
-                    local_start = 0
-                    for raw_batch in raw_int8.iter_column_batches_i8(self.variant_indices, batch_size=upload_batch_size):
-                        batch_width = raw_batch.values.shape[1]
-                        local_stop = local_start + batch_width
-                        gpu_matrix[:, local_start:local_stop] = cupy.asarray(raw_batch.values, dtype=gpu_int8_dtype)
-                        local_start = local_stop
+                    _upload_int8_tiles_overlapped(
+                        cupy=cupy,
+                        raw_int8=raw_int8,
+                        variant_indices=self.variant_indices,
+                        gpu_destination=gpu_matrix,
+                        sample_count=int(self.shape[0]),
+                        upload_batch_size=auto_batch_size_i8(self.shape[0]),
+                        gpu_int8_dtype=gpu_int8_dtype,
+                    )
                 self._cupy_cache = _CupyInt8StandardizedCache(
                     raw_values=gpu_matrix,
                     means=cupy.asarray(self.means[self.variant_indices], dtype=cupy.float32),
@@ -1688,11 +1843,11 @@ class StandardizedGenotypeMatrix:
             cache_source = self._dense_cache
             jax_cache = jnp.asarray(cache_source, dtype=gpu_compute_jax_dtype())
         elif _dense_array_cache_available(self._cupy_cache):
-            cache_source = self._cupy_cache
-            if hasattr(cache_source, "__dlpack__"):
-                jax_cache = jax_dlpack.from_dlpack(cache_source).astype(gpu_compute_jax_dtype())
+            cupy_cache_source = self._cupy_cache
+            if hasattr(cupy_cache_source, "__dlpack__"):
+                jax_cache = jax_dlpack.from_dlpack(cupy_cache_source).astype(gpu_compute_jax_dtype())
             else:
-                jax_cache = jnp.asarray(np.asarray(cache_source), dtype=gpu_compute_jax_dtype())
+                jax_cache = jnp.asarray(np.asarray(cupy_cache_source), dtype=gpu_compute_jax_dtype())
         else:
             raise RuntimeError("JAX cache requires a dense materialized genotype matrix.")
         if isinstance(jax_cache, jax_core.Tracer):
