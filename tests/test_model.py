@@ -949,6 +949,23 @@ def test_tie_group_export_weights_are_proportional_to_member_variances():
     )
 
     np.testing.assert_allclose(weights[0], np.array([0.9, 0.1], dtype=np.float32))
+
+
+def test_compact_identity_tie_map_expands_coefficients_without_group_objects():
+    tie_map = TieMap(
+        kept_indices=np.array([0, 1, 2], dtype=np.int32),
+        original_to_reduced=np.array([0, 1, 2], dtype=np.int32),
+        reduced_to_group=[],
+    )
+
+    expanded = tie_map.expand_coefficients(
+        np.array([0.1, -0.2, 0.3], dtype=np.float32),
+        group_weights=[],
+    )
+
+    np.testing.assert_allclose(expanded, np.array([0.1, -0.2, 0.3], dtype=np.float32))
+
+
 def test_training_records_from_stats_preserve_prior_continuous_features():
     records = [
         VariantRecord(

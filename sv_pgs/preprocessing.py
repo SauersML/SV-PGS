@@ -388,6 +388,15 @@ def _empty_tie_map(original_variant_count: int) -> TieMap:
     )
 
 
+def _compact_identity_tie_map(variant_count: int) -> TieMap:
+    identity_indices = np.arange(int(variant_count), dtype=np.int32)
+    return TieMap(
+        kept_indices=identity_indices,
+        original_to_reduced=identity_indices.copy(),
+        reduced_to_group=[],
+    )
+
+
 def _build_tie_map_windowed(
     standardized_genotypes: StandardizedGenotypeMatrix,
     records: Sequence[VariantRecord],
@@ -462,18 +471,7 @@ def _build_tie_map_windowed(
 
     if not candidate_pairs:
         # No candidates — every variant is unique
-        return TieMap(
-            kept_indices=np.arange(n_total, dtype=np.int32),
-            original_to_reduced=np.arange(n_total, dtype=np.int32),
-            reduced_to_group=[
-                TieGroup(
-                    representative_index=i,
-                    member_indices=np.array([i], dtype=np.int32),
-                    signs=np.array([1.0], dtype=np.float32),
-                )
-                for i in range(n_total)
-            ],
-        )
+        return _compact_identity_tie_map(n_total)
 
     # Read genotype columns ONLY for candidates and compare
     raw_int8 = standardized_genotypes.raw
@@ -545,6 +543,9 @@ def _build_tie_map_windowed(
                     ties_found += 1
 
     log(f"  tie map: {ties_found} ties found among {len(candidate_pairs)} candidates")
+    if ties_found == 0:
+        log(f"  tie map done: {n_total} -> {n_total} unique  (0 ties collapsed)  mem={mem()}")
+        return _compact_identity_tie_map(n_total)
 
     # Build TieMap from union-find
     group_map: dict[int, list[tuple[int, float]]] = defaultdict(list)
@@ -858,6 +859,11 @@ def _build_tie_map_uncached(
             )
 
     log(f"  tie map done: {n_total} -> {len(kept_variant_indices)} unique representatives  mem={mem()}")
+    if len(kept_variant_indices) == n_total and np.array_equal(
+        original_to_reduced,
+        np.arange(n_total, dtype=np.int32),
+    ):
+        return _compact_identity_tie_map(n_total)
     return TieMap(
         kept_indices=np.asarray(kept_variant_indices, dtype=np.int32),
         original_to_reduced=original_to_reduced,
@@ -1310,6 +1316,11 @@ def collapse_tie_groups(
     tie_map: TieMap,
 ) -> list[VariantRecord]:
     """Create one merged record per tie group for use in the reduced model."""
+    if not tie_map.reduced_to_group:
+        kept_indices = np.asarray(tie_map.kept_indices, dtype=np.int32)
+        if kept_indices.shape[0] == len(records) and np.array_equal(kept_indices, np.arange(len(records), dtype=np.int32)):
+            return records if isinstance(records, list) else list(records)
+        return [records[int(record_index)] for record_index in kept_indices]
     if len(tie_map.reduced_to_group) == len(records):
         record_indices = np.arange(len(records), dtype=np.int32)
         if (

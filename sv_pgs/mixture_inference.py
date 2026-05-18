@@ -980,7 +980,7 @@ def fit_variational_em(
         else np.asarray(validation_offset, dtype=np.float64).reshape(-1)
     )
     member_records = records if isinstance(records, list) else list(records)
-    if genotype_matrix.shape[1] != len(tie_map.reduced_to_group):
+    if genotype_matrix.shape[1] != tie_map.kept_indices.shape[0]:
         raise ValueError("Reduced genotype columns must match tie-map group count.")
     if len(member_records) != tie_map.original_to_reduced.shape[0]:
         raise ValueError("records must align with tie_map member space.")
@@ -9546,7 +9546,6 @@ def _tie_map_is_identity(tie_map: TieMap, *, member_count: int) -> bool:
     if (
         tie_map.kept_indices.shape != (int(member_count),)
         or tie_map.original_to_reduced.shape != (int(member_count),)
-        or len(tie_map.reduced_to_group) != int(member_count)
     ):
         return False
     if not np.array_equal(tie_map.kept_indices, np.arange(int(member_count), dtype=np.int32)):
@@ -9560,6 +9559,13 @@ def _expand_group_values_to_members(
     reduced_values: np.ndarray,
     tie_map: TieMap,
 ) -> np.ndarray:
+    reduced_array = np.asarray(reduced_values, dtype=np.float64)
+    if not tie_map.reduced_to_group:
+        member_values = np.zeros(tie_map.original_to_reduced.shape[0], dtype=np.float64)
+        if tie_map.kept_indices.shape[0] != reduced_array.shape[0]:
+            raise ValueError("reduced_values must align with compact tie-map representatives.")
+        member_values[np.asarray(tie_map.kept_indices, dtype=np.int32)] = reduced_array
+        return member_values
     member_values = np.zeros(tie_map.original_to_reduced.shape[0], dtype=np.float64)
     for reduced_index, tie_group in enumerate(tie_map.reduced_to_group):
         member_values[tie_group.member_indices] = float(reduced_values[reduced_index])

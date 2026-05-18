@@ -473,7 +473,10 @@ def _try_load_fit_stage_cache(
             raise ValueError("tie-map kept indices are out of bounds for cached active variants.")
         if reduced_tie_map.original_to_reduced.shape != (active_variant_indices.shape[0],):
             raise ValueError("cached tie-map original_to_reduced shape does not match cached active variants.")
-        if len(reduced_tie_map.reduced_to_group) != reduced_tie_map.kept_indices.shape[0]:
+        if (
+            reduced_tie_map.reduced_to_group
+            and len(reduced_tie_map.reduced_to_group) != reduced_tie_map.kept_indices.shape[0]
+        ):
             raise ValueError("cached tie-map group count does not match kept indices.")
         combined_indices = np.asarray(active_variant_indices[reduced_tie_map.kept_indices], dtype=np.int32)
         if cache_paths.reduced_raw_i8_path.exists():
@@ -1264,6 +1267,8 @@ def _tie_group_export_weights(
     tie_map: TieMap,
     fit_result: VariationalFitResult,
 ) -> list[np.ndarray]:
+    if not tie_map.reduced_to_group:
+        return []
     member_prior_variances = np.asarray(fit_result.member_prior_variances, dtype=np.float32)
     group_weights: list[np.ndarray] = []
     for tie_group in tie_map.reduced_to_group:
@@ -1338,7 +1343,6 @@ def _tie_map_keeps_all_active_variants(tie_map: TieMap, active_variant_count: in
     return (
         tie_map.kept_indices.shape == (int(active_variant_count),)
         and tie_map.original_to_reduced.shape == (int(active_variant_count),)
-        and len(tie_map.reduced_to_group) == int(active_variant_count)
         and np.array_equal(tie_map.kept_indices, np.arange(int(active_variant_count), dtype=np.int32))
         and np.array_equal(tie_map.original_to_reduced, np.arange(int(active_variant_count), dtype=np.int32))
     )

@@ -203,7 +203,8 @@ class TieMap:
 
     kept_indices: which original variants were kept as representatives
     original_to_reduced: for each original variant, its reduced-space index (-1 if not active)
-    reduced_to_group: for each reduced variant, the full group of tied members
+    reduced_to_group: for each reduced variant, the full group of tied members.
+        Empty when kept_indices/original_to_reduced encode a compact no-ties map.
     """
     kept_indices: np.ndarray
     original_to_reduced: np.ndarray
@@ -219,6 +220,13 @@ class TieMap:
         Each member gets: beta_member = beta_group * weight_member * sign_member
         where weights are proportional to prior variance and signs handle negation.
         """
+        reduced_beta_array = np.asarray(reduced_beta, dtype=np.float32)
+        if not self.reduced_to_group:
+            expanded_coefficients = np.zeros(self.original_to_reduced.shape[0], dtype=np.float32)
+            if self.kept_indices.shape[0] != reduced_beta_array.shape[0]:
+                raise ValueError("reduced_beta must align with compact tie-map representatives.")
+            expanded_coefficients[np.asarray(self.kept_indices, dtype=np.int32)] = reduced_beta_array
+            return expanded_coefficients
         expanded_coefficients = np.zeros(self.original_to_reduced.shape[0], dtype=np.float32)
         for reduced_index, tie_group in enumerate(self.reduced_to_group):
             group_weight_vector = np.asarray(group_weights[reduced_index], dtype=np.float32)

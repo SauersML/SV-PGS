@@ -3,7 +3,7 @@ import pytest
 
 from sv_pgs.config import ModelConfig, VariantClass
 from sv_pgs.data import TieGroup, TieMap, VariantRecord
-from sv_pgs.genotype import as_raw_genotype_matrix
+from sv_pgs.genotype import Int8RawGenotypeMatrix, as_raw_genotype_matrix
 from sv_pgs.plink import PLINK_MISSING_INT8
 import sv_pgs.preprocessing as preprocessing_module
 from sv_pgs.preprocessing import (
@@ -103,6 +103,33 @@ def test_collapse_tie_groups_reuses_records_when_there_are_no_ties():
     collapsed_records = collapse_tie_groups(variant_records, tie_map)
 
     assert collapsed_records is variant_records
+
+
+def test_build_tie_map_uses_compact_identity_when_no_candidates():
+    genotype_matrix = np.array(
+        [
+            [0, 0],
+            [1, 1],
+            [2, 2],
+        ],
+        dtype=np.int8,
+    )
+    variant_records = [
+        VariantRecord("variant_0", VariantClass.SNV, "1", 100),
+        VariantRecord("variant_1", VariantClass.SNV, "1", 1_000_000),
+    ]
+    raw_genotypes = Int8RawGenotypeMatrix(genotype_matrix)
+    standardized = raw_genotypes.standardized(
+        means=np.zeros(2, dtype=np.float32),
+        scales=np.ones(2, dtype=np.float32),
+        support_counts=np.array([2, 2], dtype=np.int32),
+    )
+
+    tie_map = build_tie_map(standardized, variant_records, ModelConfig())
+
+    np.testing.assert_array_equal(tie_map.kept_indices, np.array([0, 1], dtype=np.int32))
+    np.testing.assert_array_equal(tie_map.original_to_reduced, np.array([0, 1], dtype=np.int32))
+    assert tie_map.reduced_to_group == []
 
 
 def test_exact_ties_require_exact_float32_equality():
