@@ -1716,16 +1716,29 @@ class StandardizedGenotypeMatrix:
                     upload_batch_size = auto_batch_size_i8(self.shape[0])
                 else:
                     upload_batch_size = auto_batch_size(self.shape[0])
-                raw_matrix = cast(RawGenotypeMatrix, self.raw)
-                for batch_slice, standardized_batch in _iter_standardized_gpu_batches(
-                    raw_matrix,
-                    self.variant_indices,
-                    self.means,
-                    self.scales,
-                    batch_size=upload_batch_size,
-                    cupy=cupy,
-                ):
-                    gpu_matrix[:, batch_slice] = standardized_batch
+                if _supports_int8_batches(self.raw):
+                    _upload_standardized_int8_tiles_overlapped(
+                        cupy=cupy,
+                        raw_int8=cast(Int8BatchCapable, self.raw),
+                        variant_indices=self.variant_indices,
+                        means=self.means,
+                        scales=self.scales,
+                        gpu_destination=gpu_matrix,
+                        sample_count=int(self.shape[0]),
+                        upload_batch_size=int(upload_batch_size),
+                        standardized_dtype=cupy.float32,
+                    )
+                else:
+                    raw_matrix = cast(RawGenotypeMatrix, self.raw)
+                    for batch_slice, standardized_batch in _iter_standardized_gpu_batches(
+                        raw_matrix,
+                        self.variant_indices,
+                        self.means,
+                        self.scales,
+                        batch_size=upload_batch_size,
+                        cupy=cupy,
+                    ):
+                        gpu_matrix[:, batch_slice] = standardized_batch
                 self._cupy_cache = gpu_matrix
             cupy.cuda.Device().synchronize()
             import gc
