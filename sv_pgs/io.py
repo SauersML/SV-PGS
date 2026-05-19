@@ -1475,12 +1475,14 @@ def precache_vcfs_parallel(
 
     total_size = sum(v[2] for v in vcf_info.values())
 
-    # Allocate workers proportional to file size
-    # Each VCF gets at least 1, large VCFs get more if CPUs available
+    # Allocate workers proportional to file size, oversplitting ~2x relative
+    # to CPU count so the pool has small enough tasks to keep every core busy
+    # while the longest-running region drains at the tail.
     allocation: dict[Path, int] = {}
+    oversplit_factor = 2
     for vcf_path, (chrom, chrom_length, file_size) in vcf_info.items():
         share = file_size / max(total_size, 1)
-        n_workers = max(1, round(share * total_cpus))
+        n_workers = max(1, round(share * total_cpus * oversplit_factor))
         # Can't split if we don't know the contig length
         if chrom_length <= 0:
             n_workers = 1
@@ -2318,24 +2320,36 @@ def _vcf_variant_key(record: Any) -> str:
 
 
 def _variant_defaults_from_vcf_record(record: Any) -> _VariantDefaults:
+    # Each cyvcf2 property access crosses Python<->C, so pull every field we
+    # need into a local exactly once before branching.
+    chrom = str(record.CHROM)
+    pos = int(record.POS)
+    ref = record.REF
     alt = str(record.ALT[0])
     info = record.INFO
     record_id = record.ID
-    variant_id = _vcf_variant_key(record) if record_id is None or str(record_id) == "." else str(record_id)
+    is_snp = record.is_snp
+    variant_id = (
+        f"{chrom}:{pos}:{ref}:{alt}"
+        if record_id is None or str(record_id) == "."
+        else str(record_id)
+    )
     svlen_value = info.get("SVLEN")
     if svlen_value is not None:
         if isinstance(svlen_value, (tuple, list)):
             length = float(abs(float(svlen_value[0])))
         else:
             length = float(abs(float(svlen_value)))
-    elif record.is_snp:
+    elif is_snp:
         length = 1.0
-    elif record.end is not None and int(record.end) >= int(record.POS):
-        length = float(int(record.end) - int(record.POS) + 1)
     else:
-        length = float(max(len(record.REF), len(alt)))
+        record_end = record.end
+        if record_end is not None and int(record_end) >= pos:
+            length = float(int(record_end) - pos + 1)
+        else:
+            length = float(max(len(ref), len(alt)))
 
-    if record.is_snp:
+    if is_snp:
         variant_class = VariantClass.SNV
     elif record.is_indel and not record.is_sv:
         variant_class = VariantClass.SMALL_INDEL
@@ -2359,8 +2373,8 @@ def _variant_defaults_from_vcf_record(record: Any) -> _VariantDefaults:
     return _VariantDefaults(
         variant_id=variant_id,
         variant_class=variant_class,
-        chromosome=str(record.CHROM),
-        position=int(record.POS),
+        chromosome=chrom,
+        position=pos,
         length=length,
         allele_frequency=allele_frequency,
         quality=_normalize_quality(record.QUAL),
