@@ -933,14 +933,35 @@ def _gpu_total_bytes(cupy) -> int:
         return 0
 
 
-def _gpu_materialization_budget_bytes(cupy) -> int:
-    """GPU cache budget: 40% of total device memory.
+_GPU_RESERVED_OVERHEAD_BYTES = 1_500_000_000  # 1.5 GB
+_GPU_BUDGET_TOTAL_FRACTION_CEILING = 0.90
 
-    Uses total memory (not free) to avoid dependence on JAX/XLA
-    pre-allocation state. 40% leaves room for solver workspace,
-    JAX scratch, and OS overhead on any GPU size.
+
+def _gpu_materialization_budget_bytes(cupy) -> int:
+    """GPU cache budget: total device memory minus a fixed overhead margin.
+
+    Uses total memory (not free) to avoid dependence on JAX/XLA pre-allocation
+    state — JAX is already constrained via XLA_PYTHON_CLIENT_MEM_FRACTION in
+    _jax.py, so its peak footprint is bounded independently of this budget.
+
+    The 1.5 GB reserve covers the CUDA context (~500 MB), cuSOLVER workspace
+    for typical Cholesky/Gram operations (~256 MB peak), the JAX/XLA reserved
+    fraction (~10% of device memory), and a safety margin. The 90% ceiling
+    prevents the budget from ever consuming the entire device on very large
+    GPUs where 1.5 GB reserve would still leave too thin a margin.
+
+    The earlier "40% of total" heuristic was a conservative defensive value
+    chosen before JAX preallocation was constrained. It is too tight on
+    common 16 GB GPUs: a 14 GB standardized matrix is rejected, falling back
+    to a per-block streaming SVI path that is ~25× slower and does not
+    converge under the existing Robbins-Monro schedule.
     """
-    return int(_gpu_total_bytes(cupy) * 0.4)
+    total = _gpu_total_bytes(cupy)
+    if total <= 0:
+        return 0
+    reserved = min(_GPU_RESERVED_OVERHEAD_BYTES, int(total * (1.0 - _GPU_BUDGET_TOTAL_FRACTION_CEILING)))
+    budget = max(total - _GPU_RESERVED_OVERHEAD_BYTES, int(total * 0.5))
+    return min(budget, int(total * _GPU_BUDGET_TOTAL_FRACTION_CEILING), total - reserved)
 
 
 @dataclass(slots=True)

@@ -136,8 +136,8 @@ class ModelConfig:
     stochastic_variational_updates: bool = True
     stochastic_min_variant_count: int = 4096
     stochastic_variant_batch_size: int = 8192
-    stochastic_step_offset: float = 8.0
-    stochastic_step_exponent: float = 0.6
+    stochastic_step_offset: float = 0.0
+    stochastic_step_exponent: float = 0.0
     final_posterior_refinement: bool = True
     posterior_working_sets: bool = True
     posterior_working_set_min_variants: int = 65_536
@@ -210,8 +210,8 @@ class ModelConfig:
             raise ValueError("stochastic_variant_batch_size must be positive.")
         if self.stochastic_step_offset < 0.0:
             raise ValueError("stochastic_step_offset must be non-negative.")
-        if not 0.0 < self.stochastic_step_exponent <= 1.0:
-            raise ValueError("stochastic_step_exponent must lie in (0.0, 1.0].")
+        if not 0.0 <= self.stochastic_step_exponent <= 1.0:
+            raise ValueError("stochastic_step_exponent must lie in [0.0, 1.0].")
         if self.posterior_working_set_min_variants < 0:
             raise ValueError("posterior_working_set_min_variants must be non-negative.")
         if self.posterior_working_set_initial_size < 1:

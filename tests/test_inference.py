@@ -1012,7 +1012,7 @@ def test_fit_variational_em_reuses_stochastic_epoch_predictor_between_epochs(mon
     monkeypatch.setattr(
         mixture_inference,
         "_stochastic_variant_blocks",
-        lambda variant_count, block_size, random_generator: [block.copy() for block in block_sequence],
+        lambda variant_count, block_size: [block.copy() for block in block_sequence],
     )
     monkeypatch.setattr(mixture_inference, "_streaming_cupy_backend_available", lambda genotype_matrix: False)
 
@@ -1240,7 +1240,7 @@ def test_fit_variational_em_resumes_mid_stochastic_epoch(monkeypatch):
     monkeypatch.setattr(
         mixture_inference,
         "_stochastic_variant_blocks",
-        lambda variant_count, block_size, random_generator: [block.copy() for block in block_sequence],
+        lambda variant_count, block_size: [block.copy() for block in block_sequence],
     )
 
     def fake_fit_collapsed_posterior(
@@ -1355,7 +1355,7 @@ def test_fit_variational_em_resumes_mid_binary_stochastic_block(monkeypatch):
     monkeypatch.setattr(
         mixture_inference,
         "_stochastic_variant_blocks",
-        lambda variant_count, block_size, random_generator: [block.copy() for block in block_sequence],
+        lambda variant_count, block_size: [block.copy() for block in block_sequence],
     )
 
     def fake_binary_posterior_state(**kwargs):
@@ -2344,10 +2344,33 @@ def test_binary_newton_solver_controls_relax_small_blend_updates_more_aggressive
 
 
 def test_stochastic_binary_newton_iterations_scale_with_blend_weight():
-    assert _stochastic_binary_newton_iterations(maximum_iterations=8, step_size=0.27) == 6
-    assert _stochastic_binary_newton_iterations(maximum_iterations=8, step_size=0.10) == 2
+    assert _stochastic_binary_newton_iterations(maximum_iterations=8, step_size=1.00) == 1
+    assert _stochastic_binary_newton_iterations(maximum_iterations=8, step_size=0.27) == 1
+    assert _stochastic_binary_newton_iterations(maximum_iterations=8, step_size=0.10) == 1
     assert _stochastic_binary_newton_iterations(maximum_iterations=8, step_size=0.05) == 1
-    assert _stochastic_binary_newton_iterations(maximum_iterations=2, step_size=0.27) == 2
+    assert _stochastic_binary_newton_iterations(maximum_iterations=2, step_size=0.27) == 1
+
+
+def test_default_stochastic_step_size_uses_full_sweeps():
+    assert mixture_inference._stochastic_step_size(ModelConfig(), 1) == 1.0
+    decayed_config = ModelConfig(stochastic_step_offset=0.0, stochastic_step_exponent=1.0)
+    assert mixture_inference._stochastic_step_size(decayed_config, 4) == 0.25
+
+
+def test_hyperparameter_updates_skip_final_iteration():
+    config = ModelConfig(max_outer_iterations=8, update_hyperparameters=True, final_posterior_refinement=False)
+    assert mixture_inference._should_update_hyperparameters_this_iteration(4, config, allow_final_iteration=False)
+    assert not mixture_inference._should_update_hyperparameters_this_iteration(8, config, allow_final_iteration=False)
+    assert mixture_inference._should_update_hyperparameters_this_iteration(
+        6,
+        ModelConfig(max_outer_iterations=6),
+        allow_final_iteration=True,
+    )
+    assert mixture_inference._should_update_hyperparameters_this_iteration(
+        4,
+        ModelConfig(max_outer_iterations=4),
+        allow_final_iteration=True,
+    )
 
 
 def test_stochastic_sample_space_preconditioner_rank_scales_with_blend_weight():

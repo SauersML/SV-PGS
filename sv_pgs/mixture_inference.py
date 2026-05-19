@@ -809,10 +809,15 @@ def _should_update_hyperparameters_this_iteration(
     return (
         config.update_hyperparameters
         and int(iteration_number) >= 4
-        and int(iteration_number) % 4 == 0
         and (
-            int(iteration_number) < int(config.max_outer_iterations)
-            or bool(allow_final_iteration)
+            (
+                int(iteration_number) < int(config.max_outer_iterations)
+                and int(iteration_number) % 4 == 0
+            )
+            or (
+                int(iteration_number) == int(config.max_outer_iterations)
+                and bool(allow_final_iteration)
+            )
         )
     )
 
@@ -1314,7 +1319,18 @@ def fit_variational_em(
                 resume_checkpoint.epoch_reduced_prior_variances,
                 dtype=np.float64,
             ).copy()
-        step_index = start_iteration * block_count + resume_completed_blocks_in_iteration
+        # Robbins-Monro step index counts EPOCHS, not blocks. Blocks within an
+        # epoch are disjoint deterministic partitions of variants (see
+        # _stochastic_variant_blocks above), not random subsamples — so each
+        # block contributes a coordinate update over its own disjoint variant
+        # set rather than a noisy unbiased gradient estimate over all variants.
+        # The right damping is therefore per-epoch (one RM step per pass over
+        # all variants), not per-block (which would mechanically decay step
+        # size to ~1e-2 after ~30 epochs with ~40 blocks, preventing
+        # convergence). The previous per-block scheme was the dominant cause
+        # of the "stochastic variational updates never converged" failure on
+        # large biobank cohorts.
+        step_index = start_iteration
         empty_covariates = np.zeros((target_vector.shape[0], 0), dtype=np.float64)
         metadata_baseline_scales = _metadata_baseline_scales_from_coefficients(
             scale_model_coefficients,
@@ -1548,10 +1564,10 @@ def fit_variational_em(
                     "  variational EM: resuming stochastic epoch "
                     + f"{outer_iteration + 1}/{config.max_outer_iterations} at block {resume_completed_blocks_in_iteration + 1}/{n_blocks}  mem={mem()}"
                 )
+            epoch_step_size = _stochastic_step_size(config, step_index + 1)
             for block_indices in epoch_blocks[resume_completed_blocks_in_iteration:]:
-                step_index += 1
                 block_count += 1
-                step_size = _stochastic_step_size(config, step_index)
+                step_size = epoch_step_size
                 active_binary_resume_state: dict[str, object] | None = None
                 if resume_binary_block_state is not None:
                     expected_block_indices = np.asarray(
@@ -1801,6 +1817,8 @@ def fit_variational_em(
             resume_epoch_reduced_prior_variances = None
             resume_binary_block_state = None
 
+            # One Robbins-Monro tick per epoch (full sweep over disjoint blocks).
+            step_index += 1
             epoch_wall_seconds = time.monotonic() - epoch_wall_t0
             n_nonzero_beta = int(np.sum(beta_state != 0.0))
             avg_newton = epoch_total_newton_iters / max(block_count, 1)
