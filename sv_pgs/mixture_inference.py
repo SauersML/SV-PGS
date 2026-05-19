@@ -419,6 +419,8 @@ class VariationalFitResult:
     member_prior_variances: np.ndarray
     linear_predictor: np.ndarray | None = None
     selected_iteration_count: int | None = None
+    converged: bool = False
+    final_parameter_change: float | None = None
 
 
 @dataclass(slots=True)
@@ -733,6 +735,8 @@ def _covariates_only_fit_result(
         member_prior_variances=np.zeros(0, dtype=np.float32),
         linear_predictor=np.asarray(linear_predictor, dtype=np.float32),
         selected_iteration_count=1,
+        converged=True,
+        final_parameter_change=0.0,
     )
 
 def _fit_binary_alpha_with_offset(
@@ -777,6 +781,8 @@ def _fit_binary_alpha_with_offset(
 def _stochastic_step_size(config: ModelConfig, step_index: int) -> float:
     if step_index < 1:
         raise ValueError("step_index must be positive.")
+    if float(config.stochastic_step_exponent) == 0.0:
+        return 1.0
     return float((config.stochastic_step_offset + float(step_index)) ** (-config.stochastic_step_exponent))
 
 
@@ -787,12 +793,28 @@ def _stochastic_binary_newton_iterations(
 ) -> int:
     if maximum_iterations < 1:
         raise ValueError("maximum_iterations must be positive.")
-    # The stochastic outer update only applies a blend-weighted fraction of the
-    # block solution. One Newton step already gives the Fisher-scoring direction;
-    # additional refinements should therefore scale with the outer blend weight.
-    reference_step = 0.27
-    scheduled_iterations = max(1, int(np.floor(6.0 * max(float(step_size), 0.0) / reference_step + 0.5)))
-    return min(int(maximum_iterations), scheduled_iterations)
+    # Stochastic sweeps revisit every block next epoch, so one Fisher-scoring
+    # solve gives the fastest global progress per GPU upload. Extra Newton
+    # refinements spend more time polishing stale block conditionals than they
+    # save in outer epochs.
+    return 1
+
+
+def _should_update_hyperparameters_this_iteration(
+    iteration_number: int,
+    config: ModelConfig,
+    *,
+    allow_final_iteration: bool,
+) -> bool:
+    return (
+        config.update_hyperparameters
+        and int(iteration_number) >= 4
+        and int(iteration_number) % 4 == 0
+        and (
+            int(iteration_number) < int(config.max_outer_iterations)
+            or bool(allow_final_iteration)
+        )
+    )
 
 
 def _stochastic_sample_space_preconditioner_rank(
@@ -821,13 +843,11 @@ def _stochastic_sample_space_preconditioner_rank(
 def _stochastic_variant_blocks(
     variant_count: int,
     block_size: int,
-    random_generator: np.random.Generator,
 ) -> list[np.ndarray]:
     if variant_count < 1:
         return []
     safe_block_size = max(int(block_size), 1)
     block_starts = np.arange(0, variant_count, safe_block_size, dtype=np.int32)
-    random_generator.shuffle(block_starts)
     return [
         np.arange(
             int(block_start),
@@ -971,6 +991,11 @@ def fit_variational_em(
     checkpoint_callback: Callable[[VariationalFitCheckpoint], None] | None = None,
     predictor_offset: np.ndarray | None = None,
     validation_offset: np.ndarray | None = None,
+    # Optional hook for per-epoch monitoring. Fired exactly once at the end
+    # of every outer iteration with a snapshot dict so callers (e.g. the
+    # AoU pipeline) can compute richer metrics on a held-out cohort without
+    # the early-stopping or best-tracking side effects of validation_data.
+    per_epoch_eval_callback: Callable[[dict[str, Any]], None] | None = None,
 ) -> VariationalFitResult:
     genotype_matrix = _as_standardized_genotype_matrix(genotypes)
     covariate_matrix = np.asarray(covariates, dtype=np.float64)
@@ -1249,6 +1274,8 @@ def fit_variational_em(
     genetic_linear_predictor: np.ndarray | None = None
     best_genetic_linear_predictor: np.ndarray | None = None
     restricted_posterior_warm_start = _RestrictedPosteriorWarmStart()
+    fit_converged = False
+    final_parameter_change: float | None = None
     if use_stochastic_updates:
         block_size = min(int(config.stochastic_variant_batch_size), int(genotype_matrix.shape[1]))
         block_count = max((int(genotype_matrix.shape[1]) + block_size - 1) // block_size, 1)
@@ -1389,7 +1416,6 @@ def fit_variational_em(
                 global_scale=float(global_scale),
                 scale_model_coefficients=scale_model_coefficients,
             )
-            epoch_rng = np.random.default_rng(config.random_seed + outer_iteration)
             local_shape_a = prior_design.class_membership_matrix @ tpb_shape_a_vector
             local_shape_b = prior_design.class_membership_matrix @ tpb_shape_b_vector
             metadata_baseline_scales = _metadata_baseline_scales_from_coefficients(
@@ -1512,7 +1538,7 @@ def fit_variational_em(
                         warm_start=restricted_posterior_warm_start,
                     )
 
-            epoch_blocks = _stochastic_variant_blocks(genotype_matrix.shape[1], block_size, epoch_rng)
+            epoch_blocks = _stochastic_variant_blocks(genotype_matrix.shape[1], block_size)
             n_blocks = len(epoch_blocks)
             block_count = 0 if not resuming_mid_epoch else resume_completed_blocks_in_iteration
             last_stochastic_checkpoint_block = block_count
@@ -1800,10 +1826,10 @@ def fit_variational_em(
                         targets=target_vector - predictor_offset_array - genetic_linear_predictor,
                         trait_type=TraitType.QUANTITATIVE,
                     )
-            should_update_hyperparameters = (
-                config.update_hyperparameters
-                and (outer_iteration + 1 >= 4)
-                and ((outer_iteration + 1) % 4 == 0 or outer_iteration + 1 == config.max_outer_iterations)
+            should_update_hyperparameters = _should_update_hyperparameters_this_iteration(
+                outer_iteration + 1,
+                config,
+                allow_final_iteration=bool(config.final_posterior_refinement),
             )
             if should_update_hyperparameters:
                 global_scale, scale_model_coefficients = _update_scale_model(
@@ -1902,6 +1928,7 @@ def fit_variational_em(
                 current_tpb_shape_b_vector=tpb_shape_b_vector,
                 previous_tpb_shape_b_vector=previous_tpb_shape_b_vector,
             )
+            final_parameter_change = parameter_change
             previous_alpha = alpha_state.copy()
             previous_beta = beta_state.copy()
             previous_local_scale = local_scale.copy()
@@ -1915,6 +1942,55 @@ def fit_variational_em(
             variance_str = "  [beta_var]" if refresh_beta_variance else "  [beta_var=reuse]"
             nonzero_beta = int(np.count_nonzero(np.abs(beta_state) > 1e-8))
             log(f"  SVI epoch {iter_num}/{config.max_outer_iterations}  obj={obj_str}  delta={parameter_change:.2e}  sigma_e2={sigma_error2:.4f}  g_scale={float(global_scale):.4f}  nz_beta={nonzero_beta}{val_str}{hyper_str}{variance_str}  mem={mem()}")
+            if per_epoch_eval_callback is not None:
+                # Snapshot the state the caller needs to compute held-out
+                # metrics. alpha is O(covariates), beta is O(reduced variants)
+                # — both already on host RAM. We copy to keep the callback
+                # safe from racing the next epoch's mutation.
+                #
+                # If validation_data is wired in, also compute the linear
+                # predictor on the reduced validation matrix HERE (where the
+                # tie-collapsed standardized genotype matrix is in scope) so
+                # the callback can derive richer metrics like AUC / accuracy
+                # from probabilities without re-touching genotype storage.
+                _epoch_snapshot: dict[str, Any] = {
+                    "epoch": iter_num,
+                    "total_epochs": int(config.max_outer_iterations),
+                    "objective": float(objective_history[-1]) if objective_history else None,
+                    "parameter_change": float(parameter_change),
+                    "sigma_error2": float(sigma_error2),
+                    "global_scale": float(global_scale),
+                    "nonzero_beta": nonzero_beta,
+                    "validation_metric": (
+                        float(validation_history[-1]) if validation_history else None
+                    ),
+                    "alpha_reduced": np.asarray(alpha_state, dtype=np.float64).copy(),
+                    "beta_reduced": np.asarray(beta_state, dtype=np.float64).copy(),
+                }
+                if validation_payload is not None:
+                    _val_geno = validation_payload[0]
+                    _val_cov = validation_payload[1]
+                    _val_targets = validation_payload[2]
+                    if isinstance(_val_geno, StandardizedGenotypeMatrix):
+                        _val_gen_component = _genotype_matvec_result_numpy(
+                            _val_geno,
+                            beta_state,
+                            batch_size=DEFAULT_GENOTYPE_BATCH_SIZE,
+                            dtype=np.float64,
+                        )
+                    else:
+                        _val_gen_component = np.asarray(_val_geno @ beta_state, dtype=np.float64)
+                    _val_offset = (
+                        np.zeros(_val_targets.shape[0], dtype=np.float64)
+                        if validation_offset_array is None
+                        else validation_offset_array
+                    )
+                    _val_linear_predictor = _val_offset + _val_gen_component + _val_cov @ alpha_state
+                    _epoch_snapshot["validation_linear_predictor"] = np.asarray(
+                        _val_linear_predictor, dtype=np.float64
+                    )
+                    _epoch_snapshot["validation_targets"] = np.asarray(_val_targets, dtype=np.float64)
+                per_epoch_eval_callback(_epoch_snapshot)
             if checkpoint_callback is not None:
                 checkpoint_callback(_build_checkpoint(iter_num))
             if validation_history:
@@ -1922,9 +1998,11 @@ def fit_variational_em(
                     validation_delta = abs(validation_history[-1] - validation_history[-2])
                     if parameter_change < config.convergence_tolerance and validation_delta < config.convergence_tolerance:
                         log(f"  stochastic variational updates converged on epoch {outer_iteration + 1} with parameter_change={parameter_change:.3e} validation_delta={validation_delta:.3e}")
+                        fit_converged = True
                         break
             elif parameter_change < config.convergence_tolerance:
                 log(f"  stochastic variational updates converged on epoch {outer_iteration + 1} with parameter_change={parameter_change:.3e}")
+                fit_converged = True
                 break
     else:
         if (
@@ -2050,10 +2128,10 @@ def fit_variational_em(
                 auxiliary_delta=auxiliary_delta,
                 config=config,
             )
-            should_update_hyperparameters = (
-                config.update_hyperparameters
-                and (outer_iteration + 1 >= 4)
-                and ((outer_iteration + 1) % 4 == 0 or outer_iteration + 1 == config.max_outer_iterations)
+            should_update_hyperparameters = _should_update_hyperparameters_this_iteration(
+                outer_iteration + 1,
+                config,
+                allow_final_iteration=True,
             )
             if should_update_hyperparameters:
                 global_scale, scale_model_coefficients = _update_scale_model(
@@ -2092,6 +2170,7 @@ def fit_variational_em(
                 current_tpb_shape_b_vector=tpb_shape_b_vector,
                 previous_tpb_shape_b_vector=previous_tpb_shape_b_vector,
             )
+            final_parameter_change = parameter_change
             previous_alpha = alpha_state.copy()
             previous_beta = beta_state.copy()
             previous_local_scale = local_scale.copy()
@@ -2107,6 +2186,21 @@ def fit_variational_em(
             nonzero_beta = int(np.count_nonzero(np.abs(beta_state) > 1e-8))
             iter_wall_seconds = time.monotonic() - iter_wall_t0
             log(f"  EM iter {iter_num}/{config.max_outer_iterations}  obj={obj_str}  delta={parameter_change:.2e}  sigma_e2={sigma_error2:.4f}  g_scale={float(global_scale):.4f}  nz_beta={nonzero_beta}  wall={iter_wall_seconds:.1f}s{val_str}{hyper_str}{variance_str}  mem={mem()}")
+            if per_epoch_eval_callback is not None:
+                per_epoch_eval_callback({
+                    "epoch": iter_num,
+                    "total_epochs": int(config.max_outer_iterations),
+                    "objective": float(objective_history[-1]) if objective_history else None,
+                    "parameter_change": float(parameter_change),
+                    "sigma_error2": float(sigma_error2),
+                    "global_scale": float(global_scale),
+                    "nonzero_beta": nonzero_beta,
+                    "validation_metric": (
+                        float(validation_history[-1]) if validation_history else None
+                    ),
+                    "alpha_reduced": np.asarray(alpha_state, dtype=np.float64).copy(),
+                    "beta_reduced": np.asarray(beta_state, dtype=np.float64).copy(),
+                })
             if checkpoint_callback is not None:
                 checkpoint_callback(_build_checkpoint(iter_num))
 
@@ -2115,10 +2209,19 @@ def fit_variational_em(
                     validation_delta = abs(validation_history[-1] - validation_history[-2])
                     if parameter_change < config.convergence_tolerance and validation_delta < config.convergence_tolerance:
                         log(f"  variational EM converged on iteration {outer_iteration + 1} with parameter_change={parameter_change:.3e} validation_delta={validation_delta:.3e}")
+                        fit_converged = True
                         break
             elif parameter_change < config.convergence_tolerance:
                 log(f"  variational EM converged on iteration {outer_iteration + 1} with parameter_change={parameter_change:.3e}")
+                fit_converged = True
                 break
+
+    if not fit_converged:
+        delta_str = "N/A" if final_parameter_change is None else f"{final_parameter_change:.3e}"
+        log(
+            "  variational EM reached max iterations without convergence "
+            + f"(delta={delta_str}, tol={config.convergence_tolerance:.3e})"
+        )
 
     if best_validation_metric is not None:
         if (
@@ -2249,6 +2352,8 @@ def fit_variational_em(
             if best_validation_iteration is not None
             else int(len(objective_history))
         ),
+        converged=fit_converged,
+        final_parameter_change=final_parameter_change,
     )
 
 

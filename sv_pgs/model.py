@@ -5,7 +5,7 @@ import hashlib
 import json
 from pathlib import Path
 import pickle
-from typing import Sequence, cast
+from typing import Any, Callable, Sequence, cast
 
 import numpy as np
 
@@ -601,6 +601,7 @@ class BayesianPGS:
         variant_records: Sequence[VariantRecord | dict],
         validation_data: tuple[RawGenotypeMatrix | np.ndarray, np.ndarray, np.ndarray] | None = None,
         variant_stats: VariantStatistics | None = None,
+        per_epoch_eval_callback: Callable[[dict[str, Any]], None] | None = None,
     ) -> BayesianPGS:
         from sv_pgs.genotype import require_gpu
         require_gpu()
@@ -895,6 +896,7 @@ class BayesianPGS:
             checkpoint_callback=checkpoint_callback,
             predictor_offset=None,
             validation_offset=None,
+            per_epoch_eval_callback=per_epoch_eval_callback,
         )
         if fit_stage_cache_paths is not None:
             _clear_variational_checkpoint(fit_stage_cache_paths)
@@ -905,10 +907,23 @@ class BayesianPGS:
                     rank=int(self.config.sample_space_preconditioner_rank),
                     random_seed=int(self.config.random_seed),
                 )
-        log(
-            f"variational EM converged in {len(fit_result.objective_history)} iterations  "
-            f"final_obj={fit_result.objective_history[-1]:.4f}  mem={mem()}"
-        )
+        final_obj = fit_result.objective_history[-1]
+        if fit_result.converged:
+            log(
+                f"variational EM converged in {len(fit_result.objective_history)} iterations  "
+                f"final_obj={final_obj:.4f}  mem={mem()}"
+            )
+        else:
+            delta_str = (
+                "N/A"
+                if fit_result.final_parameter_change is None
+                else f"{fit_result.final_parameter_change:.3e}"
+            )
+            log(
+                f"variational EM stopped after {len(fit_result.objective_history)} iterations "
+                f"without convergence  final_obj={final_obj:.4f}  "
+                f"delta={delta_str}  tol={self.config.convergence_tolerance:.3e}  mem={mem()}"
+            )
 
         log("expanding coefficients from reduced to full space...")
         tie_group_weights = _tie_group_export_weights(
