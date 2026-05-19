@@ -1001,6 +1001,12 @@ def fit_variational_em(
     # AoU pipeline) can compute richer metrics on a held-out cohort without
     # the early-stopping or best-tracking side effects of validation_data.
     per_epoch_eval_callback: Callable[[dict[str, Any]], None] | None = None,
+    # When True, validation_data is used PURELY for monitoring — its
+    # per-epoch metric is recorded in validation_history but never drives
+    # best-parameter selection or early-stopping. Set this when the caller
+    # is using validation_data as a HELD-OUT TEST set (so the reported
+    # held-out metric stays unbiased by model selection).
+    validation_is_holdout_only: bool = False,
 ) -> VariationalFitResult:
     genotype_matrix = _as_standardized_genotype_matrix(genotypes)
     covariate_matrix = np.asarray(covariates, dtype=np.float64)
@@ -1919,7 +1925,13 @@ def fit_variational_em(
                         predictor_offset=validation_offset_array,
                     )
                     validation_history.append(validation_metric)
-                    if best_validation_metric is None or validation_metric < best_validation_metric:
+                    # `validation_is_holdout_only` means the caller is using
+                    # validation_data as a true held-out test set, so we must
+                    # NOT use it to pick best-epoch parameters — that would
+                    # leak the test set into model selection.
+                    if not validation_is_holdout_only and (
+                        best_validation_metric is None or validation_metric < best_validation_metric
+                    ):
                         best_validation_metric = validation_metric
                         best_validation_iteration = outer_iteration + 1
                         best_alpha = alpha_state.copy()
@@ -2011,17 +2023,24 @@ def fit_variational_em(
                 per_epoch_eval_callback(_epoch_snapshot)
             if checkpoint_callback is not None:
                 checkpoint_callback(_build_checkpoint(iter_num))
-            if validation_history:
-                if len(validation_history) >= 2:
+            # Early-stop criterion:
+            #   - parameter_change must be below tolerance (always required), AND
+            #   - if validation_data drives model selection (NOT holdout-only),
+            #     the validation_metric delta must also be below tolerance.
+            # Held-out validation_data is monitoring-only and must not gate
+            # convergence; treat it as if no validation set was passed.
+            validation_gates_convergence = bool(validation_history) and not validation_is_holdout_only
+            if parameter_change < config.convergence_tolerance:
+                if validation_gates_convergence and len(validation_history) >= 2:
                     validation_delta = abs(validation_history[-1] - validation_history[-2])
-                    if parameter_change < config.convergence_tolerance and validation_delta < config.convergence_tolerance:
+                    if validation_delta < config.convergence_tolerance:
                         log(f"  stochastic variational updates converged on epoch {outer_iteration + 1} with parameter_change={parameter_change:.3e} validation_delta={validation_delta:.3e}")
                         fit_converged = True
                         break
-            elif parameter_change < config.convergence_tolerance:
-                log(f"  stochastic variational updates converged on epoch {outer_iteration + 1} with parameter_change={parameter_change:.3e}")
-                fit_converged = True
-                break
+                elif not validation_gates_convergence:
+                    log(f"  stochastic variational updates converged on epoch {outer_iteration + 1} with parameter_change={parameter_change:.3e}")
+                    fit_converged = True
+                    break
     else:
         if (
             config.posterior_working_sets
@@ -2125,7 +2144,11 @@ def fit_variational_em(
                         predictor_offset=validation_offset_array,
                     )
                     validation_history.append(validation_metric)
-                    if best_validation_metric is None or validation_metric < best_validation_metric:
+                    # See SVI-path counterpart: don't let a true held-out
+                    # test set drive best-epoch parameter selection.
+                    if not validation_is_holdout_only and (
+                        best_validation_metric is None or validation_metric < best_validation_metric
+                    ):
                         best_validation_metric = validation_metric
                         best_validation_iteration = outer_iteration + 1
                         best_alpha = alpha_state.copy()
@@ -2222,17 +2245,20 @@ def fit_variational_em(
             if checkpoint_callback is not None:
                 checkpoint_callback(_build_checkpoint(iter_num))
 
-            if validation_history:
-                if len(validation_history) >= 2:
+            # Symmetric with the SVI path: held-out validation is monitoring-
+            # only and must not gate convergence.
+            validation_gates_convergence = bool(validation_history) and not validation_is_holdout_only
+            if parameter_change < config.convergence_tolerance:
+                if validation_gates_convergence and len(validation_history) >= 2:
                     validation_delta = abs(validation_history[-1] - validation_history[-2])
-                    if parameter_change < config.convergence_tolerance and validation_delta < config.convergence_tolerance:
+                    if validation_delta < config.convergence_tolerance:
                         log(f"  variational EM converged on iteration {outer_iteration + 1} with parameter_change={parameter_change:.3e} validation_delta={validation_delta:.3e}")
                         fit_converged = True
                         break
-            elif parameter_change < config.convergence_tolerance:
-                log(f"  variational EM converged on iteration {outer_iteration + 1} with parameter_change={parameter_change:.3e}")
-                fit_converged = True
-                break
+                elif not validation_gates_convergence:
+                    log(f"  variational EM converged on iteration {outer_iteration + 1} with parameter_change={parameter_change:.3e}")
+                    fit_converged = True
+                    break
 
     if not fit_converged:
         delta_str = "N/A" if final_parameter_change is None else f"{final_parameter_change:.3e}"

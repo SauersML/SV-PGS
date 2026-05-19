@@ -95,6 +95,12 @@ def run_training_pipeline(
             variant_stats=dataset.variant_stats,
             validation_data=validation_data,
             per_epoch_eval_callback=_per_epoch_callback,
+            # Marking the held-out test set as holdout-only keeps the test
+            # cross-entropy out of best-epoch parameter selection and out of
+            # the early-stopping gate. Without this flag, the model would
+            # pick the epoch with the lowest test cross-entropy as its final
+            # parameters and the reported test AUC would be biased upward.
+            validation_is_holdout_only=validation_data is not None,
         )
     finally:
         _close_history()

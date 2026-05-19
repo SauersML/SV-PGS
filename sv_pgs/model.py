@@ -602,6 +602,7 @@ class BayesianPGS:
         validation_data: tuple[RawGenotypeMatrix | np.ndarray, np.ndarray, np.ndarray] | None = None,
         variant_stats: VariantStatistics | None = None,
         per_epoch_eval_callback: Callable[[dict[str, Any]], None] | None = None,
+        validation_is_holdout_only: bool = False,
     ) -> BayesianPGS:
         from sv_pgs.genotype import require_gpu
         require_gpu()
@@ -897,6 +898,7 @@ class BayesianPGS:
             predictor_offset=None,
             validation_offset=None,
             per_epoch_eval_callback=per_epoch_eval_callback,
+            validation_is_holdout_only=validation_is_holdout_only,
         )
         if fit_stage_cache_paths is not None:
             _clear_variational_checkpoint(fit_stage_cache_paths)
