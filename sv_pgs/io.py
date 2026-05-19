@@ -1302,6 +1302,23 @@ def _record_gt_types_to_int8(
     return gt_map[selected_gt_types]
 
 
+def _fast_int8_dosage_stats(col: np.ndarray) -> tuple[int, int, int, int]:
+    """Per-variant (sum, sum_sq, n_observed, n_nonzero) for an int8 dosage column.
+
+    Values are {0, 1, 2, PLINK_MISSING_INT8}. Counting each non-missing value
+    once is cheaper than masking + astype(int64) + four reductions because each
+    `(col == k).sum()` is a single fused int8 pass.
+    """
+    count_1 = int(np.count_nonzero(col == 1))
+    count_2 = int(np.count_nonzero(col == 2))
+    count_0 = int(np.count_nonzero(col == 0))
+    n_observed = count_0 + count_1 + count_2
+    dosage_sum = count_1 + 2 * count_2
+    dosage_sum_sq = count_1 + 4 * count_2
+    n_nonzero = count_1 + count_2
+    return dosage_sum, dosage_sum_sq, n_observed, n_nonzero
+
+
 def _region_output_complete(output_prefix: str | Path) -> bool:
     prefix = Path(output_prefix)
     return (
@@ -1370,6 +1387,20 @@ def _region_parse_worker(args: tuple) -> tuple[int, str]:
     stats_fh = open(f"{output_prefix}.stats", "wb")
     variants: list[_VariantDefaults] = []
 
+    # Buffer writes so we issue one large write per ~1024 records instead of
+    # two small writes per record. Cuts syscall + python overhead noticeably.
+    geno_buffer = bytearray()
+    stats_buffer = bytearray()
+    flush_every = 1024
+
+    def _flush_buffers() -> None:
+        if geno_buffer:
+            geno_fh.write(bytes(geno_buffer))
+            geno_buffer.clear()
+        if stats_buffer:
+            stats_fh.write(bytes(stats_buffer))
+            stats_buffer.clear()
+
     count = 0
     t_start = time.monotonic()
     last_log = t_start
@@ -1378,25 +1409,22 @@ def _region_parse_worker(args: tuple) -> tuple[int, str]:
         if len(record.ALT) != 1:
             continue
         col = _record_gt_types_to_int8(record.gt_types, gt_map, keep_selector)
-        geno_fh.write(col.tobytes())
-        observed = col[col >= 0]
-        observed_i64 = observed.astype(np.int64, copy=False)
-        stats_fh.write(stats_pack.pack(
-            int(np.sum(observed_i64, dtype=np.int64)),
-            int(np.sum(observed_i64 * observed_i64, dtype=np.int64)),
-            int(observed.shape[0]),
-            int(np.count_nonzero(observed > 0)),
-        ))
+        geno_buffer.extend(col.tobytes())
+        dosage_sum, dosage_sum_sq, n_observed, n_nonzero = _fast_int8_dosage_stats(col)
+        stats_buffer.extend(stats_pack.pack(dosage_sum, dosage_sum_sq, n_observed, n_nonzero))
         variant_defaults = _variant_defaults_from_vcf_record(record)
         variants.append(variant_defaults)
 
         count += 1
+        if count % flush_every == 0:
+            _flush_buffers()
         now = time.monotonic()
         if now - last_log >= 10.0:
             rate = count / max(now - t_start, 0.01)
             print(f"  [worker] {vcf_name}: {count} variants ({rate:.0f}/s)", file=sys.stderr, flush=True)
             last_log = now
 
+    _flush_buffers()
     geno_fh.close()
     stats_fh.close()
     reader.close()
@@ -1788,14 +1816,7 @@ def _load_vcf_incremental(
         # Write genotype column to disk immediately
         geno_fh.write(int8_col.tobytes())
 
-        # Compute per-variant stats
-        observed = int8_col[int8_col >= 0]
-        dosage_sum = int(np.sum(observed, dtype=np.int64))
-        observed_i64 = observed.astype(np.int64, copy=False)
-        dosage_sum_sq = int(np.sum(observed_i64 * observed_i64, dtype=np.int64))
-        n_valid = observed.shape[0]
-        support = int(np.count_nonzero(observed > 0))
-
+        dosage_sum, dosage_sum_sq, n_valid, support = _fast_int8_dosage_stats(int8_col)
         stats_fh.write(struct.pack("<qqii", dosage_sum, dosage_sum_sq, n_valid, support))
         vd = _variant_defaults_from_vcf_record(record)
         buffered_variants.append(vd)
