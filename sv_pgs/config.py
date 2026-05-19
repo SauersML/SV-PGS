@@ -97,8 +97,8 @@ class ModelConfig:
     Variational Bayes: prior scales, TPB shapes, linear algebra, working sets
     """
     trait_type: TraitType = TraitType.BINARY       # binary (case/control) or quantitative
-    max_outer_iterations: int = 20                 # EM iterations (usually converges in 10-15, step size negligible beyond 20)
-    convergence_tolerance: float = 1e-5            # stop when parameters change < this
+    max_outer_iterations: int = 40                 # EM iterations (CAVI converges in 10-20; SVI fallback needs more headroom)
+    convergence_tolerance: float = 1e-4            # stop when parameters change < this (realistic variational floor)
     minimum_scale: float = 1e-6                    # variants with std < this are treated as monomorphic
     polya_gamma_minimum_weight: float = 1e-4       # floor on IRLS weights to prevent division by ~zero
     sigma_error_floor: float = 1e-3                # noise variance can't go below this
@@ -127,11 +127,11 @@ class ModelConfig:
     exact_solver_matrix_limit: int = 2048  # below this: direct solve; above: Woodbury or CG
     posterior_variance_batch_size: int = 1024
     posterior_variance_probe_count: int = 24
-    beta_variance_update_interval: int = 4
-    minimum_minor_allele_frequency: float = 5e-3
+    beta_variance_update_interval: int = 2
+    minimum_minor_allele_frequency: float = 1e-2
 
     sample_space_preconditioner_rank: int = 256
-    validation_interval: int = 2
+    validation_interval: int = 1
     binary_intercept_calibration: bool = True
     stochastic_variational_updates: bool = True
     stochastic_min_variant_count: int = 4096

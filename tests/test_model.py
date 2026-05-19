@@ -335,6 +335,7 @@ def test_fit_stage_cache_survives_cache_backed_memmap_mtime_changes(tmp_path: Pa
         checkpoint_callback=None,
         predictor_offset=None,
         validation_offset=None,
+        **_kwargs,
     ):
         return VariationalFitResult(
             alpha=np.zeros(covariates.shape[1], dtype=np.float32),
@@ -442,6 +443,7 @@ def test_fit_stage_cache_persists_cohort_artifacts_for_repeated_fits(tmp_path: P
         checkpoint_callback=None,
         predictor_offset=None,
         validation_offset=None,
+        **_kwargs,
     ):
         return VariationalFitResult(
             alpha=np.zeros(covariates.shape[1], dtype=np.float32),
@@ -581,6 +583,7 @@ def test_fit_resumes_from_variational_checkpoint(tmp_path, monkeypatch):
         checkpoint_callback=None,
         predictor_offset=None,
         validation_offset=None,
+        **_kwargs,
     ):
         completed_iterations = None if resume_checkpoint is None else resume_checkpoint.completed_iterations
         call_log.append(completed_iterations)
@@ -690,6 +693,7 @@ def test_fit_checkpoint_persists_basis_cache_during_interrupted_run(tmp_path, mo
         checkpoint_callback=None,
         predictor_offset=None,
         validation_offset=None,
+        **_kwargs,
     ):
         reduced_records = mixture_module.collapse_tie_groups(list(records), tie_map)
         prior_design = mixture_module._build_prior_design(reduced_records)
@@ -853,6 +857,7 @@ def test_corrupt_variational_checkpoint_is_ignored(tmp_path, monkeypatch):
         checkpoint_callback=None,
         predictor_offset=None,
         validation_offset=None,
+        **_kwargs,
     ):
         observed_resume_values.append(resume_checkpoint)
         return VariationalFitResult(
@@ -1078,6 +1083,7 @@ def test_fit_uses_cohort_allele_frequencies_for_maf_filter(monkeypatch):
         checkpoint_callback=None,
         predictor_offset=None,
         validation_offset=None,
+        **_kwargs,
     ):
         reduced_count = genotypes.shape[1]
         active_count = len(records)
@@ -1154,6 +1160,7 @@ def test_coefficient_table_preserves_full_variant_alignment_after_filtering(tmp_
         checkpoint_callback=None,
         predictor_offset=None,
         validation_offset=None,
+        **_kwargs,
     ):
         assert [record.variant_id for record in records] == ["common_keep_1", "common_keep_2"]
         return VariationalFitResult(

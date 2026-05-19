@@ -1307,7 +1307,11 @@ def test_fit_variational_em_resumes_mid_stochastic_epoch(monkeypatch):
     )
 
     assert processed_blocks == [2]
-    np.testing.assert_allclose(result.beta_reduced, np.array([1.0, 1.0, 1.5, 1.5], dtype=np.float32))
+    # Per-epoch Robbins-Monro: every block in epoch 1 uses step_size =
+    # (offset + 1)^(-exponent) = 1.0, so block 2's contribution is the full
+    # value (first_variant + 1 = 3), not the half-step 1.5 the old per-block
+    # scheme produced.
+    np.testing.assert_allclose(result.beta_reduced, np.array([1.0, 1.0, 3.0, 3.0], dtype=np.float32))
 
 
 def test_fit_variational_em_resumes_mid_binary_stochastic_block(monkeypatch):
@@ -1431,7 +1435,7 @@ def test_fit_variational_em_resumes_mid_binary_stochastic_block(monkeypatch):
     assert binary_resume_states[0] is not None
     assert int(binary_resume_states[0]["completed_iterations"]) == 1
     assert binary_resume_states[1] is None
-    np.testing.assert_allclose(result.beta_reduced, np.array([1.0, 1.0, 1.5, 1.5], dtype=np.float32))
+    np.testing.assert_allclose(result.beta_reduced, np.array([1.0, 1.0, 3.0, 3.0], dtype=np.float32))
 
 
 def test_variational_em_supports_covariates_only_mode():

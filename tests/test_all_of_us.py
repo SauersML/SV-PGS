@@ -362,8 +362,10 @@ def test_cli_run_all_of_us_forwards_core_settings(monkeypatch, tmp_path: Path):
         "output_base": str(tmp_path),
         "variant_metadata_path": None,
         "n_pcs": 10,
-        "max_outer_iterations": 30,
+        "max_outer_iterations": 40,
         "random_seed": 0,
+        "variants": "snp+sv",
+        "test_fraction": 0.2,
     }
 
 
@@ -425,8 +427,8 @@ def test_cli_run_builds_config(monkeypatch, tmp_path: Path):
     assert exit_code == 0
     load_config = cast(ModelConfig, captured["load_config"])
     pipeline_config = cast(ModelConfig, captured["pipeline_config"])
-    assert load_config.max_outer_iterations == 30
-    assert pipeline_config.max_outer_iterations == 30
+    assert load_config.max_outer_iterations == 40
+    assert pipeline_config.max_outer_iterations == 40
     assert pipeline_config.trait_type == aou_runner.TraitType.BINARY
     assert captured["output_dir"] == tmp_path / "out"
 
@@ -816,7 +818,7 @@ def test_run_all_of_us_skips_existing_fit_only_when_run_metadata_matches(monkeyp
                 n_pcs=2,
                 pc_cols=pc_cols,
                 covariates=covariates,
-                max_outer_iterations=30,
+                max_outer_iterations=40,
                 random_seed=0,
                 variant_metadata_path=None,
                 variants="sv",
@@ -884,7 +886,7 @@ def test_run_all_of_us_reruns_when_existing_fit_metadata_differs(monkeypatch, tm
                 n_pcs=2,
                 pc_cols=["PC1", "PC2"],
                 covariates=aou_runner.DEFAULT_COVARIATES + ["PC1", "PC2"],
-                max_outer_iterations=30,
+                max_outer_iterations=40,
                 random_seed=0,
                 variant_metadata_path=None,
                 variants="sv",

@@ -1295,6 +1295,7 @@ def test_run_training_pipeline_fits_full_cohort_once(tmp_path: Path, monkeypatch
             variant_records,
             validation_data=None,
             variant_stats=None,
+            **_kwargs,
         ):
             fit_calls.append(
                 {
@@ -1562,6 +1563,7 @@ def test_run_training_pipeline_keeps_full_coefficient_alignment_after_filtering(
         checkpoint_callback=None,
         predictor_offset=None,
         validation_offset=None,
+        **_kwargs,
     ):
         assert [record.variant_id for record in records] == ["common_keep_1", "common_keep_2"]
         return model_module.VariationalFitResult(
@@ -1747,7 +1749,7 @@ def test_vcf_cli_end_to_end_recovers_binary_signal_with_symbolic_svs(tmp_path: P
     summary_payload = _read_json_payload(output_dir / "summary.json.gz")
     assert summary_payload["trait_type"] == "binary"
     assert summary_payload["training_auc"] is not None
-    assert summary_payload["training_auc"] == pytest.approx(0.6614583333333334)
+    assert summary_payload["training_auc"] == pytest.approx(0.8485243055555555)
 
     dataset = load_dataset_from_files(
         genotype_path=vcf_path,
@@ -1761,7 +1763,7 @@ def test_vcf_cli_end_to_end_recovers_binary_signal_with_symbolic_svs(tmp_path: P
     )
     loaded_model = BayesianPGS.load(output_dir / "artifact")
     loaded_probability = loaded_model.predict_proba(dataset.genotypes, dataset.covariates)[:, 1]
-    assert roc_auc_score(dataset.targets, loaded_probability) == pytest.approx(0.6614583333333334)
+    assert roc_auc_score(dataset.targets, loaded_probability) == pytest.approx(0.8485243055555555)
 
     prediction_rows = _read_tsv_rows(output_dir / "predictions.tsv.gz")
     file_probability = np.asarray([float(row["probability"]) for row in prediction_rows], dtype=np.float32)
