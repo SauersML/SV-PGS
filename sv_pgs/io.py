@@ -1366,29 +1366,214 @@ def _split_into_regions(chrom: str, chrom_length: int, n_regions: int) -> list[s
     return regions
 
 
+_BCFTOOLS_QUERY_FORMAT = (
+    r"%CHROM" "\t" r"%POS" "\t" r"%ID" "\t" r"%REF" "\t" r"%ALT" "\t"
+    r"%QUAL" "\t" r"%INFO/SVTYPE" "\t" r"%INFO/SVLEN" "\t" r"%INFO/AF" "\t"
+    r"%INFO/END" "\t" r"[%GT,]" "\n"
+)
+
+
+def _bcftools_executable() -> str:
+    """Return the bcftools binary, hard-failing if it is not on PATH.
+
+    The fast parser depends on bcftools query for genotype decoding; there is
+    no cyvcf2 fallback path. Make the missing-dependency error obvious so the
+    AoU image can be patched rather than silently regressing to ~15 variants/s.
+    """
+    import shutil
+
+    path = shutil.which("bcftools")
+    if path is None:
+        raise RuntimeError(
+            "bcftools is required for the VCF precache fast path but was not "
+            "found on PATH. Install bcftools (e.g. `apt-get install bcftools` "
+            "or `conda install -c bioconda bcftools`) and retry."
+        )
+    return path
+
+
+def _parse_optional_bcftools_float(field: bytes) -> float | None:
+    if not field or field == b".":
+        return None
+    if b"," in field:
+        field = field.split(b",", 1)[0]
+        if field == b".":
+            return None
+    return float(field)
+
+
+def _parse_optional_bcftools_int(field: bytes) -> int | None:
+    if not field or field == b".":
+        return None
+    if b"," in field:
+        field = field.split(b",", 1)[0]
+        if field == b".":
+            return None
+    return int(field)
+
+
+_BCFTOOLS_VALID_BASES = frozenset("ACGTNacgtn")
+
+
+def _alt_is_symbolic_or_bnd(alt: str) -> bool:
+    return bool(alt) and (alt[0] == "<" or "[" in alt or "]" in alt)
+
+
+def _is_atcgn_only(value: str) -> bool:
+    return bool(value) and all(ch in _BCFTOOLS_VALID_BASES for ch in value)
+
+
+def _variant_defaults_from_bcftools_fields(
+    chrom: str,
+    pos: int,
+    record_id_field: bytes,
+    ref: str,
+    alt: str,
+    qual_field: bytes,
+    svtype_field: bytes,
+    svlen_field: bytes,
+    af_field: bytes,
+    end_field: bytes,
+) -> _VariantDefaults:
+    """Build _VariantDefaults from one bcftools query line.
+
+    Mirrors _variant_defaults_from_vcf_record exactly: same classification
+    branches, same length-derivation fallback chain, same AF/quality defaults.
+    """
+    record_id_text = record_id_field.decode("utf-8") if record_id_field else ""
+    variant_id = (
+        f"{chrom}:{pos}:{ref}:{alt}"
+        if not record_id_text or record_id_text == "."
+        else record_id_text
+    )
+
+    alt_is_sv = _alt_is_symbolic_or_bnd(alt)
+    ref_atcgn = _is_atcgn_only(ref)
+    alt_atcgn = (not alt_is_sv) and _is_atcgn_only(alt)
+    is_snp = len(ref) == 1 and len(alt) == 1 and ref_atcgn and alt_atcgn
+    is_indel = (
+        not is_snp
+        and not alt_is_sv
+        and ref_atcgn
+        and alt_atcgn
+        and len(ref) != len(alt)
+    )
+
+    svlen_value = _parse_optional_bcftools_float(svlen_field)
+    if svlen_value is not None:
+        length = float(abs(svlen_value))
+    elif is_snp:
+        length = 1.0
+    else:
+        end_value = _parse_optional_bcftools_int(end_field)
+        if end_value is not None and end_value >= pos:
+            length = float(end_value - pos + 1)
+        else:
+            length = float(max(len(ref), len(alt)))
+
+    if is_snp:
+        variant_class = VariantClass.SNV
+    elif is_indel:
+        variant_class = VariantClass.SMALL_INDEL
+    else:
+        svtype_text = svtype_field.decode("utf-8") if svtype_field else ""
+        variant_token = (
+            _normalize_variant_token(svtype_text)
+            if svtype_text and svtype_text != "."
+            else None
+        )
+        if variant_token is None:
+            variant_token = _normalize_variant_token(alt)
+        if variant_token is None:
+            variant_class = VariantClass.OTHER_COMPLEX_SV
+        else:
+            variant_class = _structural_variant_class_from_token(variant_token, length)
+
+    allele_frequency = _parse_optional_bcftools_float(af_field)
+    if allele_frequency is None:
+        allele_frequency = -1.0
+
+    quality_value = _parse_optional_bcftools_float(qual_field)
+    quality = _normalize_quality(quality_value)
+
+    return _VariantDefaults(
+        variant_id=variant_id,
+        variant_class=variant_class,
+        chromosome=chrom,
+        position=pos,
+        length=length,
+        allele_frequency=allele_frequency,
+        quality=quality,
+    )
+
+
+def _parse_gt_block_to_int8(gt_block: bytes, sample_count: int) -> np.ndarray:
+    """Vectorized decode of a bcftools `[%GT,]` block to int8 dosages.
+
+    The format string emits exactly 4 bytes per sample: a 3-character diploid
+    GT (e.g. "0/0", "0|1", "./.") followed by ','. For biallelic single-digit
+    alleles (which we have already filtered down to) the layout is regular, so
+    a single np.frombuffer + slicing pass turns 250k samples into an int8
+    dosage column in microseconds.
+
+    Missing alleles ('.' in either position) collapse to PLINK_MISSING_INT8.
+    Phasing characters at the middle byte are not read, so '/' and '|' are
+    handled identically.
+    """
+    expected = sample_count * 4
+    if len(gt_block) != expected:
+        raise ValueError(
+            "bcftools GT block has unexpected length: "
+            f"got {len(gt_block)} bytes, expected {expected} "
+            f"({sample_count} samples * 4 bytes each). This usually means a "
+            "haploid record, multi-digit alleles, or a multi-allelic record "
+            "slipped past the biallelic filter."
+        )
+    buf = np.frombuffer(gt_block, dtype=np.uint8)
+    first_allele = buf[0::4]
+    second_allele = buf[2::4]
+    # 46 = ord('.'), 48 = ord('0')
+    missing_mask = (first_allele == 46) | (second_allele == 46)
+    dosage_i16 = (first_allele.astype(np.int16) - 48) + (second_allele.astype(np.int16) - 48)
+    dosage = dosage_i16.astype(np.int8)
+    dosage[missing_mask] = PLINK_MISSING_INT8
+    return dosage
+
+
 def _region_parse_worker(args: tuple) -> tuple[int, str]:
-    """Worker: parse one region of one VCF, write raw binary output files.
-    Runs in a separate process. Returns (variant_count, output_prefix).
+    """Worker: stream one region of one VCF through bcftools query, write
+    raw binary output files. Runs in a separate process. Returns
+    (variant_count, output_prefix).
+
+    bcftools query decodes genotypes in C at ~10x the cyvcf2 record-iterator
+    rate on AoU SVs. We then vectorize the resulting ASCII GT block with
+    numpy slicing — no Python-level per-sample loop.
     """
     import struct
+    import subprocess
     import sys
+    import tempfile
     import time
-    vcf_path_str, region, keep_indices_list, output_prefix, threads_per_reader = args
-    keep_indices = np.array(keep_indices_list, dtype=np.intp) if keep_indices_list is not None else None
-    vcf_name = Path(vcf_path_str).name
 
-    reader = _open_vcf_reader(Path(vcf_path_str))
-    reader.set_threads(max(int(threads_per_reader), 1))
-    keep_selector = _prepare_keep_sample_selector(keep_indices, len(reader.samples))
+    vcf_path_str, region, _keep_indices_list, output_prefix, threads_per_reader = args
+    vcf_path = Path(vcf_path_str)
+    vcf_name = vcf_path.name
 
-    gt_map = np.array([0, 1, PLINK_MISSING_INT8, 2], dtype=np.int8)
+    # One-time header read for sample count. cyvcf2 here is fine — it doesn't
+    # iterate any records, just parses the header (~tens of ms).
+    sample_count = len(_read_vcf_sample_ids(vcf_path))
+
+    bcftools = _bcftools_executable()
+    cmd = [bcftools, "query", "--threads", str(max(int(threads_per_reader), 1)), "-f", _BCFTOOLS_QUERY_FORMAT]
+    if region:
+        cmd += ["-r", region]
+    cmd += [str(vcf_path)]
+
     stats_pack = struct.Struct("<qqii")
     geno_fh = open(f"{output_prefix}.geno", "wb")
     stats_fh = open(f"{output_prefix}.stats", "wb")
     variants: list[_VariantDefaults] = []
 
-    # Buffer writes so we issue one large write per ~1024 records instead of
-    # two small writes per record. Cuts syscall + python overhead noticeably.
     geno_buffer = bytearray()
     stats_buffer = bytearray()
     flush_every = 1024
@@ -1404,30 +1589,83 @@ def _region_parse_worker(args: tuple) -> tuple[int, str]:
     count = 0
     t_start = time.monotonic()
     last_log = t_start
-    iterator = reader(region) if region else reader
-    for record in iterator:
-        if len(record.ALT) != 1:
-            continue
-        col = _record_gt_types_to_int8(record.gt_types, gt_map, keep_selector)
-        geno_buffer.extend(col.tobytes())
-        dosage_sum, dosage_sum_sq, n_observed, n_nonzero = _fast_int8_dosage_stats(col)
-        stats_buffer.extend(stats_pack.pack(dosage_sum, dosage_sum_sq, n_observed, n_nonzero))
-        variant_defaults = _variant_defaults_from_vcf_record(record)
-        variants.append(variant_defaults)
 
-        count += 1
-        if count % flush_every == 0:
-            _flush_buffers()
-        now = time.monotonic()
-        if now - last_log >= 10.0:
-            rate = count / max(now - t_start, 0.01)
-            print(f"  [worker] {vcf_name}: {count} variants ({rate:.0f}/s)", file=sys.stderr, flush=True)
-            last_log = now
+    stderr_tmp = tempfile.TemporaryFile()
+    proc = subprocess.Popen(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=stderr_tmp,
+        bufsize=1 << 20,
+    )
+    assert proc.stdout is not None
+    try:
+        for raw_line in proc.stdout:
+            line = raw_line[:-1] if raw_line.endswith(b"\n") else raw_line
+            fields = line.split(b"\t", 10)
+            if len(fields) != 11:
+                continue
+            alt_field = fields[4]
+            # Multi-allelic records are skipped (matches the legacy
+            # `len(record.ALT) != 1` filter).
+            if b"," in alt_field:
+                continue
+
+            col = _parse_gt_block_to_int8(fields[10], sample_count)
+            geno_buffer.extend(col.tobytes())
+            dosage_sum, dosage_sum_sq, n_observed, n_nonzero = _fast_int8_dosage_stats(col)
+            stats_buffer.extend(stats_pack.pack(dosage_sum, dosage_sum_sq, n_observed, n_nonzero))
+
+            chrom = fields[0].decode("utf-8")
+            pos = int(fields[1])
+            ref = fields[3].decode("utf-8")
+            alt = alt_field.decode("utf-8")
+            variants.append(
+                _variant_defaults_from_bcftools_fields(
+                    chrom=chrom,
+                    pos=pos,
+                    record_id_field=fields[2],
+                    ref=ref,
+                    alt=alt,
+                    qual_field=fields[5],
+                    svtype_field=fields[6],
+                    svlen_field=fields[7],
+                    af_field=fields[8],
+                    end_field=fields[9],
+                )
+            )
+
+            count += 1
+            if count % flush_every == 0:
+                _flush_buffers()
+            now = time.monotonic()
+            if now - last_log >= 10.0:
+                rate = count / max(now - t_start, 0.01)
+                print(f"  [worker] {vcf_name}: {count} variants ({rate:.0f}/s)", file=sys.stderr, flush=True)
+                last_log = now
+
+        proc.wait()
+        if proc.returncode != 0:
+            stderr_tmp.seek(0)
+            stderr_text = stderr_tmp.read().decode("utf-8", errors="replace")
+            raise RuntimeError(
+                f"bcftools query failed (exit {proc.returncode}) on {vcf_name}"
+                + (f" region {region}" if region else "")
+                + f": {stderr_text.strip()}"
+            )
+    except BaseException:
+        proc.kill()
+        proc.wait()
+        raise
+    finally:
+        try:
+            proc.stdout.close()
+        except OSError:
+            pass
+        stderr_tmp.close()
 
     _flush_buffers()
     geno_fh.close()
     stats_fh.close()
-    reader.close()
     _write_variant_metadata(Path(f"{output_prefix}.variants.npz"), variants)
     elapsed = time.monotonic() - t_start
     print(f"  [worker] {vcf_name}: DONE {count} variants in {elapsed:.0f}s", file=sys.stderr, flush=True)
