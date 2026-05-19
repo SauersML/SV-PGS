@@ -53,6 +53,16 @@ def build_parser() -> argparse.ArgumentParser:
     aou_run_parser.add_argument("--n-pcs", type=int, default=10, help="Number of genomic PCs to include (default: 10).")
     aou_run_parser.add_argument("--max-outer-iterations", type=int, default=30)
     aou_run_parser.add_argument("--random-seed", type=int, default=0)
+    aou_run_parser.add_argument(
+        "--variants",
+        default="sv",
+        choices=("sv", "snp", "snp+sv"),
+        help=(
+            "Genotype sources for the model. 'sv' (default) uses AoU srWGS SV "
+            "VCFs only (97k samples). 'snp' uses the AoU microarray PLINK trio "
+            "(447k samples). 'snp+sv' uses both, intersected to the SV cohort."
+        ),
+    )
 
     run_parser = subparsers.add_parser("run", help="Load genotype files, fit the Bayesian model, and write outputs.")
     run_parser.add_argument("--genotypes", required=True, help="Path to a VCF/BCF file or PLINK 1 .bed file.")
@@ -140,6 +150,7 @@ def main(argv: list[str] | None = None) -> int:
             n_pcs=args.n_pcs,
             max_outer_iterations=args.max_outer_iterations,
             random_seed=args.random_seed,
+            variants=args.variants,
         )
         return 0
 

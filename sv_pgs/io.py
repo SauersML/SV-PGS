@@ -786,6 +786,185 @@ def _dedupe_cross_source_variants(
     return new_matrices, new_variants, new_stats
 
 
+def load_multi_source_dataset_from_files(
+    *,
+    sources: Sequence[tuple[str, str | Path]],
+    config: ModelConfig,
+    sample_table_path: str | Path,
+    target_column: str,
+    covariate_columns: Sequence[str],
+    sample_id_column: str = "auto",
+    variant_metadata_path: str | Path | None = None,
+) -> LoadedDataset:
+    """Load a heterogeneous list of (kind, path) genotype sources.
+
+    `sources` is a list of `(kind, path)` tuples where `kind` is `"vcf"` or
+    `"plink1"`. Each source contributes its own variants and is exposed as a
+    child of the resulting ConcatenatedRawGenotypeMatrix. The unified sample
+    set is the intersection of sample IDs across sources (in the first
+    source's order), so it's safe to mix the AoU SV cohort (97k) with the
+    microarray cohort (447k) — the result is the 97k-sample intersection.
+
+    Cross-source variant duplicates are dropped by the same first-occurrence
+    rule as load_multi_vcf_dataset_from_files.
+    """
+    log(f"=== LOAD MULTI-SOURCE DATASET START === sources={len(sources)} mem={mem()}")
+    if not sources:
+        raise ValueError("sources cannot be empty.")
+    source_specs: list[tuple[str, Path]] = [(str(kind), Path(path)) for kind, path in sources]
+    for kind, _ in source_specs:
+        if kind not in ("vcf", "plink1"):
+            raise ValueError(f"Unsupported source kind: {kind!r}; expected 'vcf' or 'plink1'.")
+    if len({path.resolve() for _, path in source_specs}) != len(source_specs):
+        raise ValueError("source paths must be unique.")
+
+    # Phase 1: read each source's native sample list. PLINK uses .fam,
+    # VCF uses the header — both are cheap (no genotype data touched).
+    per_source_sample_ids: list[list[str]] = []
+    for kind, path in source_specs:
+        log(f"  reading sample IDs from {kind} source: {path.name}")
+        if kind == "vcf":
+            ids = _read_vcf_sample_ids(path)
+        else:
+            ids = list(_load_plink1_metadata(path).sample_ids)
+        log(f"    {len(ids):,} samples")
+        per_source_sample_ids.append(ids)
+
+    # Phase 2: intersect to samples present in every source. Preserve the
+    # first source's order so subsequent runs see a stable sample ordering
+    # (downstream caching keys off that order).
+    common_set = set(per_source_sample_ids[0])
+    for ids in per_source_sample_ids[1:]:
+        common_set &= set(ids)
+    common_ordered = [sid for sid in per_source_sample_ids[0] if sid in common_set]
+    log(f"  sample intersection across {len(source_specs)} sources: {len(common_ordered):,} samples")
+    if not common_ordered:
+        raise RuntimeError("No samples in common across genotype sources.")
+
+    # Phase 3: build the filtered sample table against the intersection.
+    log(f"reading sample table header: {sample_table_path}")
+    sample_table_spec = _inspect_delimited_table(sample_table_path)
+    resolved_sample_id_column = _resolve_sample_id_column(
+        table_spec=sample_table_spec,
+        requested_sample_id_column=sample_id_column,
+        available_sample_ids=common_ordered,
+    )
+    log(f"sample ID column: '{resolved_sample_id_column}'")
+    log("building filtered sample table on intersected samples...")
+    sample_table, total_sample_rows, unmatched_sample_rows = _build_sample_table(
+        table_spec=sample_table_spec,
+        sample_id_column=resolved_sample_id_column,
+        target_column=target_column,
+        covariate_columns=covariate_columns,
+        available_sample_ids=common_ordered,
+    )
+    n_cases = int(np.sum(np.asarray(sample_table.targets) == 1.0))
+    n_controls = int(np.sum(np.asarray(sample_table.targets) == 0.0))
+    log(
+        "sample table: "
+        + f"{len(sample_table.sample_ids):,} matched rows kept from {total_sample_rows:,}, "
+        + f"{unmatched_sample_rows} dropped, {sample_table.covariates.shape[1]} covariates"
+    )
+    log(f"  target distribution: {n_cases:,} cases, {n_controls:,} controls")
+
+    # Phase 4: per-source alignment — each source needs indices into its
+    # OWN native sample order that produce the unified sample table order.
+    per_source_keep_indices: list[np.ndarray] = []
+    for (kind, path), source_ids in zip(source_specs, per_source_sample_ids):
+        aligned = _align_sample_ids(
+            expected_sample_ids=sample_table.sample_ids,
+            available_sample_ids=source_ids,
+            context=f"{kind} source {path.name}",
+        )
+        per_source_keep_indices.append(np.asarray(aligned, dtype=np.intp))
+
+    # Phase 5: build a RawGenotypeMatrix + variants + stats for each source.
+    # VCF sources go through the bcftools cache; PLINK reads lazily via
+    # PlinkRawGenotypeMatrix and computes stats in one streaming pass.
+    raw_matrices: list[RawGenotypeMatrix] = []
+    per_source_variants: list[list[_VariantDefaults]] = []
+    per_source_stats: list[VariantStatistics] = []
+    total_variants = 0
+    _t_start = time.monotonic()
+    for src_idx, ((kind, path), source_ids, keep_indices) in enumerate(
+        zip(source_specs, per_source_sample_ids, per_source_keep_indices)
+    ):
+        _t_src = time.monotonic()
+        if kind == "vcf":
+            genotype_matrix, variants, stats = _load_vcf_with_cache(path, config=config, mmap_mode="r")
+            n_native = len(source_ids)
+            skip_subset = (
+                len(keep_indices) == n_native
+                and np.array_equal(keep_indices, np.arange(n_native, dtype=np.intp))
+            )
+            if not skip_subset:
+                genotype_matrix = _fast_mmap_row_reindex(genotype_matrix, keep_indices)
+            raw: RawGenotypeMatrix = as_raw_genotype_matrix(genotype_matrix)
+            variants_list = list(variants)
+        else:
+            meta = _load_plink1_metadata(path)
+            raw = PlinkRawGenotypeMatrix(
+                bed_path=path,
+                sample_indices=keep_indices,
+                variant_count=meta.variant_count,
+                total_sample_count=len(meta.sample_ids),
+            )
+            log(f"  computing variant statistics for {path.name} (single PLINK streaming pass)...")
+            stats = compute_variant_statistics(raw, config=config)
+            variants_list = _build_plink_variant_defaults_from_stats(path, stats)
+        raw_matrices.append(raw)
+        per_source_variants.append(variants_list)
+        per_source_stats.append(stats)
+        total_variants += len(variants_list)
+        _t = time.monotonic() - _t_src
+        _elapsed = time.monotonic() - _t_start
+        log(
+            f"  [{src_idx+1}/{len(source_specs)}] {kind} {path.name}: "
+            f"{len(variants_list):,} variants in {_t:.1f}s  "
+            f"total={total_variants:,}  {_elapsed:.0f}s elapsed  mem={mem()}"
+        )
+    log(f"  all {len(source_specs)} sources loaded: {total_variants:,} total variants in {time.monotonic() - _t_start:.0f}s")
+
+    # Phase 6: cross-source variant dedup (same first-occurrence rule used
+    # by the multi-VCF path).
+    raw_matrices, per_source_variants, per_source_stats = _dedupe_cross_source_variants(
+        raw_matrices=raw_matrices,
+        per_chr_variants=per_source_variants,
+        per_chr_stats=per_source_stats,
+        source_paths=[path for _, path in source_specs],
+    )
+
+    # Phase 7: concat + emit a LoadedDataset (same shape the rest of the
+    # pipeline already consumes).
+    default_variants: list[_VariantDefaults] = [variant for chunk in per_source_variants for variant in chunk]
+    raw_genotypes: RawGenotypeMatrix = ConcatenatedRawGenotypeMatrix(tuple(raw_matrices))
+    variant_stats = VariantStatistics(
+        means=np.concatenate([stats.means for stats in per_source_stats]).astype(np.float32, copy=False),
+        scales=np.concatenate([stats.scales for stats in per_source_stats]).astype(np.float32, copy=False),
+        allele_frequencies=np.concatenate([stats.allele_frequencies for stats in per_source_stats]).astype(np.float32, copy=False),
+        support_counts=np.concatenate([stats.support_counts for stats in per_source_stats]).astype(np.int32, copy=False),
+    )
+    log("building variant records from defaults + optional metadata...")
+    variant_records = _build_variant_records(
+        default_variants=default_variants,
+        variant_metadata_path=variant_metadata_path,
+    )
+    sv_count = sum(1 for vr in variant_records if vr.variant_class.value not in ("snv", "small_indel"))
+    snv_count = sum(1 for vr in variant_records if vr.variant_class.value == "snv")
+    log(f"variant records: {len(variant_records):,} total ({snv_count:,} SNVs, {sv_count:,} structural variants)")
+
+    log(f"=== LOAD MULTI-SOURCE DATASET DONE === final shape={raw_genotypes.shape}  mem={mem()}")
+    return LoadedDataset(
+        sample_ids=list(sample_table.sample_ids),
+        genotypes=raw_genotypes,
+        covariates=np.asarray(sample_table.covariates, dtype=np.float32),
+        targets=np.asarray(sample_table.targets, dtype=np.float32),
+        variant_records=variant_records,
+        variant_stats=variant_stats,
+        variant_stats_minimum_scale=float(config.minimum_scale),
+    )
+
+
 def _build_sample_table(
     table_spec: _DelimitedTableSpec,
     sample_id_column: str,

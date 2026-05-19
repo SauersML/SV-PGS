@@ -692,8 +692,10 @@ def test_run_all_of_us_runs_single_unified_fit_and_reuses_cached_downloads(monke
     monkeypatch.setattr(aou_runner, "download_sv_vcf", fake_download_sv_vcf)
     monkeypatch.setattr("sv_pgs.io.precache_vcfs_parallel", lambda vcf_paths, config: None)
     monkeypatch.setattr(aou_runner, "release_process_memory", lambda: release_calls.append("released"))
-    def fake_load_multi_vcf_dataset_from_files(**kwargs):
-        loader_calls.append([str(path) for path in kwargs["genotype_paths"]])
+    def fake_load_multi_source_dataset_from_files(**kwargs):
+        # aou_runner now hands the loader a list of (kind, path) tuples;
+        # extract just the VCF paths so existing assertions keep working.
+        loader_calls.append([str(path) for kind, path in kwargs["sources"] if kind == "vcf"])
         assert kwargs["variant_metadata_path"] is None
         return _Dataset()
 
@@ -706,7 +708,7 @@ def test_run_all_of_us_runs_single_unified_fit_and_reuses_cached_downloads(monke
         )
         return None
 
-    monkeypatch.setattr(aou_runner, "load_multi_vcf_dataset_from_files", fake_load_multi_vcf_dataset_from_files)
+    monkeypatch.setattr(aou_runner, "load_multi_source_dataset_from_files", fake_load_multi_source_dataset_from_files)
     monkeypatch.setattr(aou_runner, "run_training_pipeline", fake_run_training_pipeline)
 
     aou_runner.run_all_of_us(
@@ -815,6 +817,7 @@ def test_run_all_of_us_skips_existing_fit_only_when_run_metadata_matches(monkeyp
                 max_outer_iterations=30,
                 random_seed=0,
                 variant_metadata_path=None,
+                variants="sv",
             ),
             indent=2,
         ),
@@ -837,7 +840,7 @@ def test_run_all_of_us_skips_existing_fit_only_when_run_metadata_matches(monkeyp
     )
     monkeypatch.setattr(
         aou_runner,
-        "load_multi_vcf_dataset_from_files",
+        "load_multi_source_dataset_from_files",
         lambda **kwargs: (_ for _ in ()).throw(AssertionError("dataset loading should not run")),
     )
     monkeypatch.setattr(
@@ -880,6 +883,7 @@ def test_run_all_of_us_reruns_when_existing_fit_metadata_differs(monkeypatch, tm
                 max_outer_iterations=30,
                 random_seed=0,
                 variant_metadata_path=None,
+                variants="sv",
             ),
             indent=2,
         ),
@@ -908,8 +912,10 @@ def test_run_all_of_us_reruns_when_existing_fit_metadata_differs(monkeypatch, tm
     monkeypatch.setattr(aou_runner, "download_sv_vcf", fake_download_sv_vcf)
     monkeypatch.setattr("sv_pgs.io.precache_vcfs_parallel", lambda vcf_paths, config: None)
     monkeypatch.setattr(aou_runner, "release_process_memory", lambda: None)
-    def fake_load_multi_vcf_dataset_from_files(**kwargs):
-        loader_calls.append([str(path) for path in kwargs["genotype_paths"]])
+    def fake_load_multi_source_dataset_from_files(**kwargs):
+        # aou_runner now hands the loader a list of (kind, path) tuples;
+        # extract just the VCF paths so existing assertions keep working.
+        loader_calls.append([str(path) for kind, path in kwargs["sources"] if kind == "vcf"])
         assert kwargs["variant_metadata_path"] is None
         return _Dataset()
 
@@ -917,7 +923,7 @@ def test_run_all_of_us_reruns_when_existing_fit_metadata_differs(monkeypatch, tm
         pipeline_calls.append(Path(kwargs["output_dir"]))
         return None
 
-    monkeypatch.setattr(aou_runner, "load_multi_vcf_dataset_from_files", fake_load_multi_vcf_dataset_from_files)
+    monkeypatch.setattr(aou_runner, "load_multi_source_dataset_from_files", fake_load_multi_source_dataset_from_files)
     monkeypatch.setattr(aou_runner, "run_training_pipeline", fake_run_training_pipeline)
 
     aou_runner.run_all_of_us(
@@ -966,7 +972,7 @@ def test_run_all_of_us_raises_when_parallel_precache_fails(monkeypatch, tmp_path
     )
     monkeypatch.setattr(
         aou_runner,
-        "load_multi_vcf_dataset_from_files",
+        "load_multi_source_dataset_from_files",
         lambda **kwargs: (_ for _ in ()).throw(AssertionError("dataset loading should not run")),
     )
     monkeypatch.setattr(

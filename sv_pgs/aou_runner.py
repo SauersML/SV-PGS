@@ -14,18 +14,91 @@ import pandas as pd
 
 from sv_pgs.all_of_us import AllOfUsDiseaseRequest, prepare_all_of_us_disease_sample_table, resolve_disease_definition
 from sv_pgs.config import ModelConfig, TraitType
-from sv_pgs.io import load_multi_vcf_dataset_from_files
+from sv_pgs.io import load_multi_source_dataset_from_files
 from sv_pgs.pipeline import run_training_pipeline
 from sv_pgs.progress import log, mem
 
+# Local on-workbench mirror of remote AoU buckets. We download each VCF once
+# into work_dir.parent/.sv_pgs_cache/<subdir>/ and reuse it across runs; the
+# bcftools precache step then writes an int8 .npy + variants/stats sidecar
+# next to each downloaded VCF.
 _LOCAL_CACHE_DIRNAME = ".sv_pgs_cache"
 _AOU_SV_VCF_CACHE_SUBDIR = "aou_sv_vcfs"
+# Microarray PLINK trio lives in its own subdir so that running --variants snp
+# alongside --variants sv doesn't interleave files in one place. The trio is
+# small enough (~80 GB across .bed + .bim + .fam) that we hold all three files
+# locally without per-chromosome sharding.
+_AOU_ARRAY_PLINK_CACHE_SUBDIR = "aou_array_plink"
+# AoU's microarray PLINK files are emitted with the literal prefix "arrays".
+# i.e. arrays.bed / arrays.bim / arrays.fam under .../microarray/plink/.
+_AOU_ARRAY_PLINK_PREFIX = "arrays"
 
 # ---------------------------------------------------------------------------
 # AoU paths
+#
+# Everything lives under CDR_STORAGE_PATH (= gs://fc-aou-datasets-controlled/v8
+# at the current Controlled Tier release). The workbench predefines a handful
+# of env vars pointing at canonical assets; the source of truth is the
+# "Controlled CDR Directory" article in the AoU User Support hub.
+#
+# Cohorts:
+#   srWGS SNP & Indel : 414,830 participants
+#   srWGS SVs         :  97,061 participants  (strict subset of the above)
+#   genotyping array  : 447,278 participants
+# Joint SV+SNP runs are capped at the 97,061 SV samples; the loader's
+# _align_sample_ids does the intersection.
+#
+# srWGS Structural Variants (currently the only source we wire into the
+# pipeline). One bgzipped .vcf.gz per autosome.
+#   gs://.../v8/wgs/short_read/structural_variants/vcf/full/
+#       AoU_srWGS_SV.v8.chr{N}.vcf.gz   (+ .tbi)
+#
+# srWGS SNP/Indel callsets (available, not yet wired). Same data in five
+# formats; pick the one whose shape matches the downstream tool.
+#   gs://.../v8/wgs/short_read/snpindel/
+#     vds/hail.vds                                  WGS_VDS_PATH
+#         Full sparse joint callset (Hail VDS), ~1B sites. Hail-only.
+#     acaf_threshold/                               (AF>1% OR AC>100 / ancestry)
+#       multiMT/hail.mt                             WGS_ACAF_THRESHOLD_MULTI_HAIL_PATH
+#       splitMT/hail.mt                             WGS_ACAF_THRESHOLD_SPLIT_HAIL_PATH
+#       vcf/                                        WGS_ACAF_THRESHOLD_VCF_PATH
+#           Many .vcf.bgz shards per chromosome — enumerate with `gsutil ls`.
+#       plink_bed/  bgen/  pgen/  bed/              (.bed/.bim/.fam etc.)
+#         ACAF totals: 57M sites / 116M variants / 414,830 samples.
+#     exome/                                        (Gencode v42 exons + 15 bp)
+#       multiMT/hail.mt / splitMT/hail.mt           WGS_EXOME_MULTI/SPLIT_HAIL_PATH
+#       vcf/                                        WGS_EXOME_VCF_PATH
+#       plink_bed/  bgen/  pgen/  bed/
+#         Exome totals: 38M sites / 46M variants / 414,830 samples.
+#     clinvar/                                      (all ClinVar variants)
+#       multiMT/hail.mt / splitMT/hail.mt           WGS_CLINVAR_MULTI/SPLIT_HAIL_PATH
+#       vcf/                                        WGS_CLINVAR_VCF_PATH
+#       plink_bed/  bgen/  pgen/  bed/
+#         ClinVar totals: 1.5M sites / 2.2M variants / 414,830 samples.
+#     cmrg/                                         WGS_CMRG_VCF_PATH
+#         Challenging Medically Relevant Genes (33 genes) called against a
+#         masked hg38 reference. Do NOT intersect with the other callsets.
+#
+# Auxiliary files we use today (the only path we touch outside the SV VCFs):
+#   gs://.../v8/wgs/short_read/snpindel/aux/ancestry/ancestry_preds.tsv
+#       Predicted continental ancestry + 16-dim PCA features per participant.
+# Other aux directories that exist but we don't read:
+#   vat/ (variant annotations), admixture_estimates/, pgx/ (PharmGKB stars),
+#   phasing/, relatedness/ (kinship .tsvs), qc/ (sample QC flags + metrics).
+#
+# Other CDR roots, for reference:
+#   gs://.../v8/wgs/cram/manifest.csv                           WGS_CRAM_MANIFEST_PATH
+#   gs://.../v8/microarray/vcf/manifest.csv                     MICROARRAY_VCF_MANIFEST_PATH
+#   gs://.../v8/microarray/hail.mt                              MICROARRAY_HAIL_STORAGE_PATH
+#   gs://.../v8/microarray/plink/arrays.*                       (PLINK bed for array data)
+#   gs://.../v8/microarray/idat/manifest.csv                    MICROARRAY_IDAT_MANIFEST_PATH
+#   gs://.../v8/wgs/long_read/manifest.csv                      (lrWGS per-sample manifest)
+#   gs://.../v8/known_issues/                                   (issue-specific sample lists)
 # ---------------------------------------------------------------------------
 
 def _cdr_storage_path() -> str:
+    # gs://fc-aou-datasets-controlled/v8 on the current Controlled Tier; the
+    # workbench sets this env var for every notebook + container.
     value = os.environ.get("CDR_STORAGE_PATH")
     if not value:
         raise RuntimeError("CDR_STORAGE_PATH is not set. Are you on an All of Us workbench?")
@@ -33,6 +106,8 @@ def _cdr_storage_path() -> str:
 
 
 def _google_project() -> str:
+    # Required as the gsutil -u billing project for any CDR egress (AoU does
+    # not absorb bucket-read costs; the call fails without it).
     value = os.environ.get("GOOGLE_PROJECT")
     if not value:
         raise RuntimeError("GOOGLE_PROJECT is not set. Are you on an All of Us workbench?")
@@ -40,27 +115,58 @@ def _google_project() -> str:
 
 
 def sv_vcf_dir() -> str:
+    # SV VCFs live under structural_variants/vcf/full — one .vcf.gz per
+    # autosome (no env var; the path is documented in the Controlled CDR
+    # Directory but not exposed via WGS_*_VCF_PATH).
     return f"{_cdr_storage_path()}/wgs/short_read/structural_variants/vcf/full"
 
 
 def resolve_ancestry_predictions_path() -> str:
+    # Per-participant ancestry predictions + PC features (.tsv keyed by
+    # research_id). Same file is reused as the source of the 16 covariate PCs
+    # the pipeline merges into the sample table.
     return f"{_cdr_storage_path()}/wgs/short_read/snpindel/aux/ancestry/ancestry_preds.tsv"
 
 
 def local_ancestry_predictions_path(work_dir: Path) -> Path:
+    # Downloaded copy inside the run's work_dir, so reruns reuse the file
+    # without another gsutil cp.
     return work_dir / "ancestry_preds.tsv"
 
 
 def sv_vcf_name(chromosome: int) -> str:
+    # AoU's canonical SV VCF filename, hard-coded against the v8 release.
+    # Bump the version literal when AoU rolls a new SV callset.
     return f"AoU_srWGS_SV.v8.chr{chromosome}.vcf.gz"
 
 
 def local_sv_vcf_cache_dir(work_dir: Path) -> Path:
+    # We park the SV VCF mirror one level above work_dir so multiple disease
+    # runs (each with its own work_dir) share the same downloaded VCFs.
     return work_dir.parent / _LOCAL_CACHE_DIRNAME / _AOU_SV_VCF_CACHE_SUBDIR
 
 
 def local_sv_vcf_path(chromosome: int, work_dir: Path) -> Path:
     return local_sv_vcf_cache_dir(work_dir) / sv_vcf_name(chromosome)
+
+
+def array_plink_dir() -> str:
+    # AoU's microarray PLINK 1 trio lives at .../microarray/plink/arrays.{bed,bim,fam}.
+    # Single set (NOT chromosome-sharded), ~447,278 samples × ~700k SNPs,
+    # lifted over to hg38 from the original genotyping-array calls. Used here
+    # as the SNP source for joint SV+SNP runs because the file shape matches
+    # PlinkRawGenotypeMatrix natively and the total size (~80 GB) fits a
+    # standard workbench disk — unlike the ACAF SNP/indel callset at ~12 TB.
+    return f"{_cdr_storage_path()}/microarray/plink"
+
+
+def local_array_plink_cache_dir(work_dir: Path) -> Path:
+    return work_dir.parent / _LOCAL_CACHE_DIRNAME / _AOU_ARRAY_PLINK_CACHE_SUBDIR
+
+
+def local_array_plink_path(work_dir: Path) -> Path:
+    # Returns the .bed path; the sibling .bim and .fam live in the same dir.
+    return local_array_plink_cache_dir(work_dir) / f"{_AOU_ARRAY_PLINK_PREFIX}.bed"
 
 
 # ---------------------------------------------------------------------------
@@ -148,6 +254,41 @@ def download_sv_vcf(chromosome: int, work_dir: Path) -> Path:
     for remote, local_path, _ in missing_downloads:
         _download_gcs_object_if_missing(remote, local_path)
     return local_vcf
+
+
+def download_array_plink(work_dir: Path) -> Path:
+    """Download the AoU microarray PLINK 1 trio and return the local .bed path.
+
+    The trio is a single file set (no chromosome sharding) covering all 447k
+    array participants. After the first run the files stay on disk under
+    work_dir.parent/.sv_pgs_cache/aou_array_plink/; subsequent runs reuse them.
+    """
+    remote_dir = array_plink_dir()
+    cache_dir = local_array_plink_cache_dir(work_dir)
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    local_bed = local_array_plink_path(work_dir)
+
+    missing_downloads: list[tuple[str, Path, str]] = []
+    for extension in ("bed", "bim", "fam"):
+        local_path = cache_dir / f"{_AOU_ARRAY_PLINK_PREFIX}.{extension}"
+        if not local_path.exists():
+            remote_path = f"{remote_dir}/{_AOU_ARRAY_PLINK_PREFIX}.{extension}"
+            missing_downloads.append((remote_path, local_path, extension))
+
+    if not missing_downloads:
+        log("  microarray: PLINK trio already present in local cache")
+        return local_bed
+
+    required_bytes = sum(_gsutil_size(remote) for remote, _, _ in missing_downloads)
+    _check_disk_space(cache_dir, required_bytes)
+    missing_labels = " + ".join(label for _, _, label in missing_downloads)
+    log(
+        f"  microarray: downloading missing {missing_labels} into cache "
+        + f"{cache_dir} ({required_bytes/1e9:.1f} GB)"
+    )
+    for remote, local_path, _ in missing_downloads:
+        _download_gcs_object_if_missing(remote, local_path)
+    return local_bed
 
 
 # ---------------------------------------------------------------------------
@@ -359,6 +500,7 @@ def _build_aou_run_metadata(
     max_outer_iterations: int,
     random_seed: int,
     variant_metadata_path: str | None,
+    variants: str,
 ) -> dict[str, object]:
     return {
         "disease": disease,
@@ -369,7 +511,39 @@ def _build_aou_run_metadata(
         "max_outer_iterations": max_outer_iterations,
         "random_seed": random_seed,
         "variant_metadata_path": variant_metadata_path,
+        # Different --variants choices fit different models. Including this
+        # in the run metadata makes existing-result-reuse skip a cached fit
+        # when the source mix changes.
+        "variants": variants,
     }
+
+
+# Set of valid --variants choices. Mirrored in the CLI argparse `choices=`.
+_AOU_VARIANT_CHOICES = ("sv", "snp", "snp+sv")
+
+
+def _normalize_variants_choice(variants: str) -> str:
+    if variants not in _AOU_VARIANT_CHOICES:
+        raise ValueError(
+            f"variants must be one of {_AOU_VARIANT_CHOICES}; got {variants!r}"
+        )
+    return variants
+
+
+def _aou_metadata_equivalent(existing: dict[str, object], current: dict[str, object]) -> bool:
+    """Compare run-metadata dicts with one back-compat tweak.
+
+    Older runs were written before the "variants" key existed; treat absence
+    of that key in the existing metadata as the historical default ("sv") so
+    we don't pointlessly invalidate prior SV-only result directories.
+    """
+    if existing == current:
+        return True
+    existing = dict(existing)
+    current = dict(current)
+    if "variants" not in existing:
+        existing["variants"] = "sv"
+    return existing == current
 
 DEFAULT_COVARIATES = [
     "age_at_observation_start",
@@ -388,8 +562,16 @@ def run_all_of_us(
     n_pcs: int = 10,
     max_outer_iterations: int = 30,
     random_seed: int = 0,
+    variants: str = "sv",
 ) -> None:
-    """Full AoU pipeline: download requested chromosomes, merge them, and run one fit."""
+    """Full AoU pipeline: download requested chromosomes, merge them, and run one fit.
+
+    `variants` selects the genotype sources fed into the joint model:
+      "sv"      — AoU srWGS SV VCFs only (the historical default, 97k samples).
+      "snp"     — AoU microarray PLINK only (447k samples).
+      "snp+sv"  — both, intersected to the SV cohort (97k samples).
+    """
+    variants = _normalize_variants_choice(variants)
     chromosomes = _validate_aou_chromosomes(chromosomes)
 
     import os
@@ -554,34 +736,50 @@ def run_all_of_us(
         max_outer_iterations=max_outer_iterations,
         random_seed=random_seed,
         variant_metadata_path=str(resolved_variant_metadata_path) if resolved_variant_metadata_path is not None else None,
+        variants=variants,
     )
     if summary_path.exists():
         if run_metadata_path.exists():
             existing_run_metadata = json.loads(run_metadata_path.read_text(encoding="utf-8"))
-            if existing_run_metadata == run_metadata:
+            if _aou_metadata_equivalent(existing_run_metadata, run_metadata):
                 log(f"  unified fit already exists with matching configuration: {summary_path}")
                 return
             log("  existing unified fit configuration differs; rerunning and overwriting outputs")
         else:
             log("  unified fit exists without run metadata; rerunning and overwriting outputs")
 
-    log("=== STEP 3: Download chromosome VCFs ===")
+    log(f"=== STEP 3: Download genotype sources (variants={variants}) ===")
+    # `sources` is the ordered list of (kind, local_path) tuples handed to the
+    # multi-source loader. SV VCFs come first (matching the historical sample
+    # order); the microarray PLINK trio, if requested, is appended as the
+    # single PLINK source.
+    sources: list[tuple[str, Path]] = []
     vcf_paths: list[Path] = []
     dataset = None
     try:
-        for chrom in chromosomes:
-            vcf_paths.append(download_sv_vcf(chrom, work_dir))
+        if variants in ("sv", "snp+sv"):
+            for chrom in chromosomes:
+                local_vcf = download_sv_vcf(chrom, work_dir)
+                vcf_paths.append(local_vcf)
+                sources.append(("vcf", local_vcf))
+        if variants in ("snp", "snp+sv"):
+            log("  downloading microarray PLINK trio...")
+            array_bed = download_array_plink(work_dir)
+            sources.append(("plink1", array_bed))
 
-        log("=== STEP 3.5: Parallel VCF precache ===")
-        from sv_pgs.io import precache_vcfs_parallel
-        try:
-            precache_vcfs_parallel(vcf_paths, config)
-        except (OSError, RuntimeError, ValueError) as exc:
-            raise RuntimeError("parallel VCF precache failed") from exc
+        if vcf_paths:
+            log("=== STEP 3.5: Parallel VCF precache ===")
+            from sv_pgs.io import precache_vcfs_parallel
+            try:
+                precache_vcfs_parallel(vcf_paths, config)
+            except (OSError, RuntimeError, ValueError) as exc:
+                raise RuntimeError("parallel VCF precache failed") from exc
+        else:
+            log("=== STEP 3.5: skipping VCF precache (no VCF sources) ===")
 
         log("=== STEP 4: Load unified genome-wide dataset ===")
-        dataset = load_multi_vcf_dataset_from_files(
-            genotype_paths=vcf_paths,
+        dataset = load_multi_source_dataset_from_files(
+            sources=[(kind, str(path)) for kind, path in sources],
             config=config,
             sample_table_path=str(merged_path),
             sample_id_column="auto",
