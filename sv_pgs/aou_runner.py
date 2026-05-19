@@ -643,7 +643,7 @@ def run_all_of_us(
     output_base: str,
     variant_metadata_path: str | Path | None = None,
     n_pcs: int = 10,
-    max_outer_iterations: int = 30,
+    max_outer_iterations: int = 40,
     random_seed: int = 0,
     variants: str = "snp+sv",
     test_fraction: float = 0.2,

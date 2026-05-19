@@ -51,7 +51,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="Optional CSV or TSV keyed by variant_id. Every non-reserved column is used as a prior annotation.",
     )
     aou_run_parser.add_argument("--n-pcs", type=int, default=10, help="Number of genomic PCs to include (default: 10).")
-    aou_run_parser.add_argument("--max-outer-iterations", type=int, default=30)
+    aou_run_parser.add_argument("--max-outer-iterations", type=int, default=40)
     aou_run_parser.add_argument("--random-seed", type=int, default=0)
     aou_run_parser.add_argument(
         "--test-fraction",
@@ -118,7 +118,7 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     run_parser.add_argument("--output-dir", required=True, help="Directory for artifact and result tables.")
-    run_parser.add_argument("--max-outer-iterations", type=int, default=30)
+    run_parser.add_argument("--max-outer-iterations", type=int, default=40)
     run_parser.add_argument("--random-seed", type=int, default=0)
 
     eval_parser = subparsers.add_parser(
