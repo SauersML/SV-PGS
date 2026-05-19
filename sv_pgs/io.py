@@ -1475,14 +1475,14 @@ def precache_vcfs_parallel(
 
     total_size = sum(v[2] for v in vcf_info.values())
 
-    # Allocate workers proportional to file size, oversplitting ~2x relative
-    # to CPU count so the pool has small enough tasks to keep every core busy
-    # while the longest-running region drains at the tail.
+    # Allocate workers proportional to file size. We deliberately do NOT
+    # oversplit relative to CPU count: cyvcf2's tabix region iteration carries
+    # a per-record bounds-check cost that streaming the whole file avoids, so
+    # extra regions slow each worker down instead of adding throughput.
     allocation: dict[Path, int] = {}
-    oversplit_factor = 2
     for vcf_path, (chrom, chrom_length, file_size) in vcf_info.items():
         share = file_size / max(total_size, 1)
-        n_workers = max(1, round(share * total_cpus * oversplit_factor))
+        n_workers = max(1, round(share * total_cpus))
         # Can't split if we don't know the contig length
         if chrom_length <= 0:
             n_workers = 1
