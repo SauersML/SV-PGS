@@ -1803,15 +1803,28 @@ class StandardizedGenotypeMatrix:
                     if _supports_int8_batches(self.raw)
                     else auto_batch_size(self.shape[0])
                 )
-                for batch_slice, standardized_batch in _iter_standardized_gpu_batches(
-                    self.raw,
-                    selected_variant_indices,
-                    self.means,
-                    self.scales,
-                    batch_size=subset_batch_size,
-                    cupy=cupy,
-                ):
-                    gpu_subset[:, batch_slice] = standardized_batch
+                if _supports_int8_batches(self.raw):
+                    _upload_standardized_int8_tiles_overlapped(
+                        cupy=cupy,
+                        raw_int8=cast(Int8BatchCapable, self.raw),
+                        variant_indices=selected_variant_indices,
+                        means=self.means,
+                        scales=self.scales,
+                        gpu_destination=gpu_subset,
+                        sample_count=int(self.shape[0]),
+                        upload_batch_size=int(subset_batch_size),
+                        standardized_dtype=cupy.float32,
+                    )
+                else:
+                    for batch_slice, standardized_batch in _iter_standardized_gpu_batches(
+                        self.raw,
+                        selected_variant_indices,
+                        self.means,
+                        self.scales,
+                        batch_size=subset_batch_size,
+                        cupy=cupy,
+                    ):
+                        gpu_subset[:, batch_slice] = standardized_batch
             cupy.cuda.Device().synchronize()
             self._cupy_subset_cache = gpu_subset
             self._cupy_subset_cache_local_indices = resolved_local_indices.copy()

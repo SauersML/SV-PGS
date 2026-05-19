@@ -84,9 +84,9 @@ def run_training_pipeline(
                 str(coefficient_row["variant_class"]),
                 _format_float(_coerce_float(coefficient_row["beta"])),
                 str(coefficient_row["chromosome"]),
-                str(int(coefficient_row["position"])),
-                _format_float(float(coefficient_row["length"])),
-                _format_float(float(coefficient_row["allele_frequency"])),
+                str(int(_coerce_float(coefficient_row["position"]))),
+                _format_float(_coerce_float(coefficient_row["length"])),
+                _format_float(_coerce_float(coefficient_row["allele_frequency"])),
             )
             for coefficient_row in coefficient_rows
         ),

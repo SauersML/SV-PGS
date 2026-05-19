@@ -466,15 +466,15 @@ def run_all_of_us(
                     if not vcf_path.exists():
                         continue
                     new_key = _vcf_cache_key(vcf_path, config)
-                    old_k = old_chr_to_key.get(str(chrom))
-                    if old_k is None:
+                    old_key_for_chrom = old_chr_to_key.get(str(chrom))
+                    if old_key_for_chrom is None:
                         continue
                     # Check if new key already has a complete cache
                     new_geno = new_cache_dir / f"{new_key}.genotypes.npy"
                     if new_geno.exists():
                         continue
                     for suffix in (".genotypes.npy", ".variants.pkl", ".stats.npy", ".stats.npz", ".manifest.json"):
-                        src = old_cache_dir / f"{old_k}{suffix}"
+                        src = old_cache_dir / f"{old_key_for_chrom}{suffix}"
                         dst = new_cache_dir / f"{new_key}{suffix}"
                         if src.exists() and not dst.exists():
                             try:

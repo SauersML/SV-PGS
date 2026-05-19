@@ -275,12 +275,20 @@ def _gpu_exact_variant_inverse_diagonal(
     solve_triangular_gpu,
     cupy,
 ) -> Any:
+    # Inherit dtype from the Cholesky factor (float32 on real GPUs, float64
+    # in mocked tests). Allocating the RHS at a different dtype would force
+    # cuSOLVER's solve_triangular to upcast one operand, eating the matmul
+    # speedup. The squared-sum reduction lands above the 1e-8 floor the
+    # caller applies, which sits well above the float32 noise floor for the
+    # standardized-genotype Cholesky factor.
+    dtype = cholesky_factor_gpu.dtype
+    itemsize = int(getattr(dtype, "itemsize", 8))
     dimension = int(cholesky_factor_gpu.shape[0])
     if dimension < 1:
-        return cupy.zeros(0, dtype=cupy.float64)
+        return cupy.zeros(0, dtype=dtype)
     total_bytes = _gpu_total_bytes(cupy)
     memory_scaled_block = (
-        int(total_bytes * _GPU_INVERSE_DIAGONAL_WORKSPACE_FRACTION) // max(8 * dimension, 1)
+        int(total_bytes * _GPU_INVERSE_DIAGONAL_WORKSPACE_FRACTION) // max(itemsize * dimension, 1)
         if total_bytes > 0
         else _GPU_EXACT_VARIANT_TILE_MIN_VARIANTS
     )
@@ -289,16 +297,16 @@ def _gpu_exact_variant_inverse_diagonal(
         _GPU_INVERSE_DIAGONAL_MAX_BLOCK,
         max(_GPU_EXACT_VARIANT_TILE_MIN_VARIANTS, memory_scaled_block),
     )
-    inverse_diagonal_gpu = cupy.empty(dimension, dtype=cupy.float64)
+    inverse_diagonal_gpu = cupy.empty(dimension, dtype=dtype)
     for start in range(0, dimension, block_size):
         stop = min(start + block_size, dimension)
         block_width = stop - start
-        rhs_gpu = cupy.zeros((dimension, block_width), dtype=cupy.float64)
-        rhs_gpu[start:stop, :] = cupy.eye(block_width, dtype=cupy.float64)
+        rhs_gpu = cupy.zeros((dimension, block_width), dtype=dtype)
+        rhs_gpu[start:stop, :] = cupy.eye(block_width, dtype=dtype)
         inverse_cholesky_block_gpu = solve_triangular_gpu(cholesky_factor_gpu, rhs_gpu, lower=True)
         inverse_diagonal_gpu[start:stop] = (inverse_cholesky_block_gpu * inverse_cholesky_block_gpu).sum(
             axis=0,
-            dtype=cupy.float64,
+            dtype=dtype,
         )
     return inverse_diagonal_gpu
 
@@ -1423,14 +1431,12 @@ def fit_variational_em(
             if use_gpu_epoch_predictor_state:
                 assert stochastic_epoch_cupy is not None
                 assert stochastic_epoch_compute_cp_dtype is not None
-            covariate_linear_predictor_gpu = (
-                None
-                if not use_gpu_epoch_predictor_state
-                else stochastic_epoch_cupy.asarray(
+                covariate_linear_predictor_gpu = stochastic_epoch_cupy.asarray(
                     covariate_linear_predictor,
                     dtype=stochastic_epoch_compute_cp_dtype,
                 )
-            )
+            else:
+                covariate_linear_predictor_gpu = None
             blocks_use_exact_variant_path = _stochastic_blocks_use_exact_variant_path(
                 sample_count=genotype_matrix.shape[0],
                 block_size=block_size,
@@ -1660,17 +1666,16 @@ def fit_variational_em(
                     if use_gpu_epoch_predictor_state:
                         assert target_vector_gpu is not None
                         assert predictor_offset_gpu_block is not None
+                        block_targets = _cupy_array_to_numpy(
+                            target_vector_gpu - predictor_offset_gpu_block,
+                            dtype=np.float64,
+                        )
+                    else:
+                        block_targets = target_vector - predictor_offset
                     collapsed_block_state = _fit_collapsed_posterior(
                         genotype_matrix=block_genotypes,
                         covariate_matrix=empty_covariates,
-                        targets=(
-                            _cupy_array_to_numpy(
-                                target_vector_gpu - predictor_offset_gpu_block,
-                                dtype=np.float64,
-                            )
-                            if use_gpu_epoch_predictor_state
-                            else target_vector - predictor_offset
-                        ),
+                        targets=block_targets,
                         reduced_prior_variances=block_prior_variances,
                         sigma_error2=sigma_error2,
                         alpha_init=np.zeros(0, dtype=np.float64),
@@ -5110,6 +5115,14 @@ def _sample_space_logdet_from_cg_lanczos(
     if not estimates:
         raise RuntimeError("Sample-space CG logdet recorder did not capture any valid Lanczos estimates.")
     return float(baseline_logdet + int(dimension) * float(np.mean(np.asarray(estimates, dtype=np.float64))))
+
+
+def _require_logdet_recorder(
+    recorder: _SampleSpaceCGLanczosRecorder | None,
+) -> _SampleSpaceCGLanczosRecorder:
+    if recorder is None:
+        raise RuntimeError("sample-space logdet was requested without monitored Lanczos probes.")
+    return recorder
 
 
 def _effective_sample_space_preconditioner_rank(

@@ -217,9 +217,9 @@ def evaluate_all_of_us(
         reader = csv.DictReader(handle, delimiter="\t")
         columns = reader.fieldnames or []
         score_col = None
-        for candidate in ("probability", "predicted_probability", "genetic_score", "linear_predictor"):
-            if candidate in columns:
-                score_col = candidate
+        for score_candidate in ("probability", "predicted_probability", "genetic_score", "linear_predictor"):
+            if score_candidate in columns:
+                score_col = score_candidate
                 break
         if score_col is None:
             raise ValueError(f"No score column found in predictions. Columns: {columns}")

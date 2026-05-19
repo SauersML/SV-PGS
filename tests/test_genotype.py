@@ -11,6 +11,48 @@ import sv_pgs.genotype as genotype_module
 from sv_pgs.genotype import ConcatenatedRawGenotypeMatrix, Int8RawGenotypeMatrix, RawGenotypeBatch, RawGenotypeMatrix, as_raw_genotype_matrix
 
 
+class _FakeCupyEvent:
+    def __init__(self) -> None:
+        self.synchronized = False
+
+    def synchronize(self) -> None:
+        self.synchronized = True
+
+
+class _FakeCupyStream:
+    def __init__(self) -> None:
+        self.recorded_events: list[_FakeCupyEvent] = []
+        self.enter_count = 0
+
+    def __enter__(self) -> "_FakeCupyStream":
+        self.enter_count += 1
+        return self
+
+    def __exit__(self, _exc_type, _exc_value, _traceback) -> None:
+        return None
+
+    def record(self) -> _FakeCupyEvent:
+        event = _FakeCupyEvent()
+        self.recorded_events.append(event)
+        return event
+
+
+def _install_fake_pinned_and_streams(fake_cupy_cls, *, stream_factory=None) -> None:
+    """Attach a pinned-memory allocator and ``Stream`` factory onto a fake CuPy class."""
+    if not hasattr(fake_cupy_cls, "cuda"):
+        raise AssertionError("fake cupy class must expose a cuda attribute before installing CUDA shims")
+
+    def _alloc_pinned_memory(nbytes: int) -> Any:
+        return bytearray(int(nbytes))
+
+    def _default_stream_factory(*_args, **_kwargs) -> _FakeCupyStream:
+        return _FakeCupyStream()
+
+    setattr(fake_cupy_cls.cuda, "alloc_pinned_memory", staticmethod(_alloc_pinned_memory))
+    resolved_factory = stream_factory if stream_factory is not None else _default_stream_factory
+    setattr(fake_cupy_cls.cuda, "Stream", staticmethod(resolved_factory))
+
+
 class _StreamingRawGenotypeMatrix(RawGenotypeMatrix):
     def __init__(self, matrix: np.ndarray) -> None:
         self.matrix = np.asarray(matrix, dtype=np.float32)
@@ -701,6 +743,7 @@ def test_try_materialize_gpu_standardizes_batches_directly_on_gpu(monkeypatch: p
     expected = as_raw_genotype_matrix(raw_matrix).standardized(means, scales).materialize()
     standardized = as_raw_genotype_matrix(raw_matrix).standardized(means, scales)
 
+    _install_fake_pinned_and_streams(_FakeCupy)
     monkeypatch.setattr(genotype_module, "_try_import_cupy", lambda: _FakeCupy())
 
     assert standardized.try_materialize_gpu() is True
@@ -762,6 +805,7 @@ def test_try_materialize_gpu_prefers_int8_batches_when_available(monkeypatch: py
         dtype=np.float32,
     )
 
+    _install_fake_pinned_and_streams(_FakeCupy)
     monkeypatch.setattr(genotype_module, "_try_import_cupy", lambda: _FakeCupy())
 
     assert standardized.try_materialize_gpu() is True
@@ -857,6 +901,7 @@ def test_try_materialize_gpu_uses_int8_batch_size_for_plink_like_backends(monkey
         np.ones(8, dtype=np.float32),
     )
 
+    _install_fake_pinned_and_streams(_FakeCupy)
     monkeypatch.setattr(genotype_module, "_try_import_cupy", lambda: _FakeCupy())
     monkeypatch.setattr(genotype_module, "auto_batch_size", lambda sample_count: 3)
     monkeypatch.setattr(genotype_module, "auto_batch_size_i8", lambda sample_count: 7)

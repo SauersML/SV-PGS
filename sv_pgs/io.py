@@ -550,10 +550,12 @@ def _fast_mmap_row_reindex(matrix: np.ndarray, row_indices: np.ndarray) -> np.nd
     output_bytes = int(n_rows_out) * int(n_cols) * int(matrix.dtype.itemsize)
     log(f"    reindexing {matrix.shape[0]:,} → {n_rows_out:,} samples ({output_bytes / 1e9:.1f} GB)...")
     # Use a temporary mmap file for large outputs to avoid OOM.
+    result: np.ndarray
     if output_bytes > 1_000_000_000:
         tmp_fd, tmp_path = tempfile.mkstemp(suffix=".reindex.npy")
         os.close(tmp_fd)
-        result = np.memmap(tmp_path, dtype=matrix.dtype, mode="w+", shape=(n_rows_out, n_cols), order="F")
+        mmap_result = np.memmap(tmp_path, dtype=matrix.dtype, mode="w+", shape=(n_rows_out, n_cols), order="F")
+        result = mmap_result
         log(f"    using temp mmap: {tmp_path}")
     else:
         tmp_path = None
@@ -567,7 +569,7 @@ def _fast_mmap_row_reindex(matrix: np.ndarray, row_indices: np.ndarray) -> np.nd
         result[:, start:end] = col_batch[resolved_row_indices, :]
         if batch_idx % 10 == 0 or batch_idx == n_batches - 1:
             log(f"    reindexing: {end:,}/{n_cols:,} columns ({100*end/n_cols:.0f}%)  mem={mem()}")
-    if tmp_path is not None:
+    if isinstance(result, np.memmap):
         result.flush()
     return result
 
@@ -1042,10 +1044,10 @@ def _load_variant_metadata(path: Path) -> list[_VariantDefaults]:
                 variant_id=str(_legacy_field(rec, "variant_id", "")),
                 variant_class=_classify_variant_from_record(rec),
                 chromosome=str(_legacy_field(rec, "chromosome", "")),
-                position=int(_legacy_field(rec, "position", 0)),
-                length=float(_legacy_field(rec, "length", 0.0)),
-                allele_frequency=float(_legacy_field(rec, "allele_frequency", 0.0)),
-                quality=float(_legacy_field(rec, "quality", 0.0)),
+                position=int(str(_legacy_field(rec, "position", 0))),
+                length=float(str(_legacy_field(rec, "length", 0.0))),
+                allele_frequency=float(str(_legacy_field(rec, "allele_frequency", 0.0))),
+                quality=float(str(_legacy_field(rec, "quality", 0.0))),
             )
             for rec in legacy_variants
         ]
@@ -2065,7 +2067,7 @@ def _build_variant_records(
             metadata_rows_by_id[variant_id] = row
         if not saw_rows:
             raise ValueError("Variant metadata file is empty: " + str(variant_metadata_path))
-        annotation_kinds = _infer_annotation_column_kinds(metadata_rows_by_id.values())
+        annotation_kinds = _infer_annotation_column_kinds(list(metadata_rows_by_id.values()))
         _log_annotation_column_kinds(table_spec.columns, annotation_kinds)
 
     records: list[VariantRecord] = []

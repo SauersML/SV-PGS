@@ -1155,13 +1155,14 @@ def _training_linear_predictor_cache(
         return np.asarray(fit_result.linear_predictor, dtype=np.float32)
     training_linear_predictor = np.asarray(covariate_matrix @ fit_result.alpha, dtype=np.float32)
     if reduced_genotypes is not None and fit_result.beta_reduced.shape[0] > 0:
-        training_linear_predictor = training_linear_predictor + np.asarray(
-            reduced_genotypes.matvec(
+        if isinstance(reduced_genotypes, StandardizedGenotypeMatrix):
+            genetic_score = reduced_genotypes.matvec(
                 fit_result.beta_reduced,
                 batch_size=auto_batch_size(covariate_matrix.shape[0]),
-            ),
-            dtype=np.float32,
-        )
+            )
+        else:
+            genetic_score = np.asarray(reduced_genotypes, dtype=np.float32) @ fit_result.beta_reduced
+        training_linear_predictor = training_linear_predictor + np.asarray(genetic_score, dtype=np.float32)
     return np.asarray(training_linear_predictor, dtype=np.float32)
 
 
