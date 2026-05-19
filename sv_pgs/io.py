@@ -1567,15 +1567,48 @@ def _parse_gt_block_to_int8(gt_block: bytes, sample_count: int) -> np.ndarray:
     )
 
 
+_REGION_CHECKPOINT_BYTE_INTERVAL = 64 * 1024 * 1024  # flush after 64 MB of genotype bytes
+_REGION_CHECKPOINT_TIME_SECONDS = 20.0
+
+
+def _region_variant_chunk_paths(output_prefix: str) -> list[Path]:
+    """Return sorted list of intermediate variant-metadata chunks for one region."""
+    prefix_path = Path(output_prefix)
+    parent = prefix_path.parent
+    glob_pattern = f"{prefix_path.name}.variants.[0-9][0-9][0-9][0-9][0-9][0-9].npz"
+    return sorted(parent.glob(glob_pattern))
+
+
+def _parse_region_string(region: str) -> tuple[str, int, int] | None:
+    """Parse 'chr:start-end' into (chrom, start, end). Returns None on any
+    deviation from that exact shape — caller falls back to a full re-parse.
+    """
+    if ":" not in region or "-" not in region:
+        return None
+    try:
+        chrom_part, range_part = region.split(":", 1)
+        start_text, end_text = range_part.split("-", 1)
+        return chrom_part, int(start_text), int(end_text)
+    except (ValueError, IndexError):
+        return None
+
+
 def _region_parse_worker(args: tuple) -> tuple[int, str]:
     """Worker: stream one region of one VCF through bcftools query, write
     raw binary output files. Runs in a separate process. Returns
     (variant_count, output_prefix).
 
-    bcftools query decodes genotypes in C at ~10x the cyvcf2 record-iterator
-    rate on AoU SVs. We then vectorize the resulting ASCII GT block with
-    numpy slicing — no Python-level per-sample loop.
+    Resumable: every ~64 MB of genotype output (or every 20 s, whichever
+    comes first) we flush the genotype/stats binary streams, write the
+    pending variant metadata to its own chunk file, and atomically rewrite
+    a small progress.json. If the worker is killed and re-launched, we
+    truncate any partial trailing writes and restart bcftools from the
+    record after the last checkpointed position via `-r chr:N+1-end`, so
+    we only ever lose the records written since the last checkpoint
+    (seconds of work, not the entire region).
     """
+    import json
+    import os
     import struct
     import subprocess
     import sys
@@ -1590,41 +1623,162 @@ def _region_parse_worker(args: tuple) -> tuple[int, str]:
     # iterate any records, just parses the header (~tens of ms).
     sample_count = len(_read_vcf_sample_ids(vcf_path))
 
+    geno_path = Path(f"{output_prefix}.geno")
+    stats_path = Path(f"{output_prefix}.stats")
+    progress_path = Path(f"{output_prefix}.progress.json")
+    final_variants_path = Path(f"{output_prefix}.variants.npz")
+
+    # If a prior run completed this region cleanly, the final .variants.npz
+    # exists and progress.json is gone — nothing to do.
+    if final_variants_path.exists() and not progress_path.exists():
+        return 0, output_prefix
+
+    # Attempt to resume from a previous checkpoint. Resume requires a region
+    # string (so we can rewind bcftools via -r) and a progress.json whose
+    # metadata matches this task.
+    resume_count = 0
+    resume_chunks = 0
+    resume_chrom: str | None = None
+    resume_pos: int | None = None
+    if progress_path.exists() and region is not None:
+        resumed = False
+        try:
+            state = json.loads(progress_path.read_text(encoding="utf-8"))
+            if (
+                int(state.get("sample_count", -1)) == sample_count
+                and state.get("region") == region
+            ):
+                candidate_count = int(state["count"])
+                candidate_chunks = int(state["chunk_count"])
+                expected_geno_bytes = candidate_count * sample_count
+                expected_stats_bytes = candidate_count * 24
+                # Trim any trailing partial bytes from a write that crashed
+                # mid-record. We only ever wrote whole records, so the
+                # tail past expected_* is junk.
+                if geno_path.exists() and geno_path.stat().st_size > expected_geno_bytes:
+                    with open(geno_path, "r+b") as fh:
+                        fh.truncate(expected_geno_bytes)
+                if stats_path.exists() and stats_path.stat().st_size > expected_stats_bytes:
+                    with open(stats_path, "r+b") as fh:
+                        fh.truncate(expected_stats_bytes)
+                geno_size = geno_path.stat().st_size if geno_path.exists() else 0
+                stats_size = stats_path.stat().st_size if stats_path.exists() else 0
+                if geno_size != expected_geno_bytes or stats_size != expected_stats_bytes:
+                    raise ValueError(
+                        f"size mismatch after truncate: geno={geno_size} stats={stats_size} "
+                        f"expected geno={expected_geno_bytes} stats={expected_stats_bytes}"
+                    )
+                chunk_paths = _region_variant_chunk_paths(output_prefix)
+                if len(chunk_paths) < candidate_chunks:
+                    raise ValueError(
+                        f"missing variant chunks: have {len(chunk_paths)}, "
+                        f"progress says {candidate_chunks}"
+                    )
+                # Drop any chunks past the checkpointed count (incomplete tail).
+                for extra in chunk_paths[candidate_chunks:]:
+                    extra.unlink(missing_ok=True)
+                resume_count = candidate_count
+                resume_chunks = candidate_chunks
+                resume_chrom = state.get("last_chrom")
+                resume_pos = state.get("last_pos")
+                resumed = True
+        except (OSError, ValueError, KeyError, json.JSONDecodeError) as exc:
+            print(
+                f"  [worker] {vcf_name}: progress checkpoint unusable ({exc}); restarting region",
+                file=sys.stderr,
+                flush=True,
+            )
+        if not resumed:
+            geno_path.unlink(missing_ok=True)
+            stats_path.unlink(missing_ok=True)
+            progress_path.unlink(missing_ok=True)
+            for chunk in _region_variant_chunk_paths(output_prefix):
+                chunk.unlink(missing_ok=True)
+
+    # Compute the bcftools region for this invocation. If we're resuming,
+    # narrow the start to (last checkpointed pos + 1).
+    effective_region = region
+    if region is not None and resume_pos is not None and resume_chrom is not None:
+        parsed = _parse_region_string(region)
+        if parsed is not None:
+            chrom_part, _orig_start, end_part = parsed
+            if chrom_part == resume_chrom:
+                effective_region = f"{chrom_part}:{int(resume_pos) + 1}-{end_part}"
+
     bcftools = _bcftools_executable()
-    # Split the work across two bcftools processes connected by a pipe:
-    #   view -Ou: BGZF decompress + VCF->BCF parse (accepts --threads on every
-    #             bcftools build we've encountered, including AoU's older one)
-    #   query  : read uncompressed BCF on stdin, extract fields, emit ASCII
-    # The OS runs both stages concurrently on separate cores, which roughly
-    # doubles throughput vs `query` reading the BGZF file directly (where
-    # decompression and ASCII formatting serialize inside one process).
     view_threads = max(int(threads_per_reader), 1)
     view_cmd = [bcftools, "view", "--threads", str(view_threads), "-Ou"]
-    if region:
-        view_cmd += ["-r", region]
+    if effective_region:
+        view_cmd += ["-r", effective_region]
     view_cmd += [str(vcf_path)]
     query_cmd = [bcftools, "query", "-f", _BCFTOOLS_QUERY_FORMAT, "-"]
 
     stats_pack = struct.Struct("<qqii")
-    geno_fh = open(f"{output_prefix}.geno", "wb")
-    stats_fh = open(f"{output_prefix}.stats", "wb")
-    variants: list[_VariantDefaults] = []
+    geno_fh = open(geno_path, "ab")
+    stats_fh = open(stats_path, "ab")
 
+    buffered_variants: list[_VariantDefaults] = []
     geno_buffer = bytearray()
     stats_buffer = bytearray()
-    flush_every = 1024
 
-    def _flush_buffers() -> None:
+    count = resume_count
+    chunk_index = resume_chunks
+    last_chrom: str | None = resume_chrom
+    last_pos: int | None = resume_pos
+    last_checkpoint_time = time.monotonic()
+    bytes_since_checkpoint = 0
+    t_start = time.monotonic()
+    last_log = t_start
+
+    def _atomic_write_progress() -> None:
+        tmp = progress_path.with_name(progress_path.name + ".tmp")
+        tmp.write_text(
+            json.dumps(
+                {
+                    "count": count,
+                    "chunk_count": chunk_index,
+                    "sample_count": sample_count,
+                    "region": region,
+                    "last_chrom": last_chrom,
+                    "last_pos": last_pos,
+                }
+            ),
+            encoding="utf-8",
+        )
+        tmp.replace(progress_path)
+
+    def _checkpoint(force: bool = False) -> None:
+        nonlocal chunk_index, last_checkpoint_time, bytes_since_checkpoint
+        if not force:
+            elapsed = time.monotonic() - last_checkpoint_time
+            if (
+                bytes_since_checkpoint < _REGION_CHECKPOINT_BYTE_INTERVAL
+                and elapsed < _REGION_CHECKPOINT_TIME_SECONDS
+            ):
+                return
         if geno_buffer:
             geno_fh.write(bytes(geno_buffer))
             geno_buffer.clear()
         if stats_buffer:
             stats_fh.write(bytes(stats_buffer))
             stats_buffer.clear()
+        geno_fh.flush()
+        stats_fh.flush()
+        if buffered_variants:
+            chunk_path = Path(f"{output_prefix}.variants.{chunk_index:06d}.npz")
+            tmp_chunk = chunk_path.with_name(chunk_path.name + ".tmp")
+            _write_variant_metadata(tmp_chunk, buffered_variants)
+            tmp_chunk.replace(chunk_path)
+            buffered_variants.clear()
+            chunk_index += 1
+        _atomic_write_progress()
+        last_checkpoint_time = time.monotonic()
+        bytes_since_checkpoint = 0
 
-    count = 0
-    t_start = time.monotonic()
-    last_log = t_start
+    # If we resumed cleanly, persist a fresh progress.json immediately so a
+    # second crash before the first new record still leaves a valid state.
+    if resume_count > 0:
+        _atomic_write_progress()
 
     view_stderr_tmp = tempfile.TemporaryFile()
     query_stderr_tmp = tempfile.TemporaryFile()
@@ -1642,7 +1796,6 @@ def _region_parse_worker(args: tuple) -> tuple[int, str]:
         stderr=query_stderr_tmp,
         bufsize=1 << 20,
     )
-    # Close our copy of the read end so view receives SIGPIPE if query exits.
     view_proc.stdout.close()
     assert proc.stdout is not None
     try:
@@ -1652,13 +1805,12 @@ def _region_parse_worker(args: tuple) -> tuple[int, str]:
             if len(fields) != 11:
                 continue
             alt_field = fields[4]
-            # Multi-allelic records are skipped (matches the legacy
-            # `len(record.ALT) != 1` filter).
             if b"," in alt_field:
                 continue
 
             col = _parse_gt_block_to_int8(fields[10], sample_count)
-            geno_buffer.extend(col.tobytes())
+            geno_bytes = col.tobytes()
+            geno_buffer.extend(geno_bytes)
             dosage_sum, dosage_sum_sq, n_observed, n_nonzero = _fast_int8_dosage_stats(col)
             stats_buffer.extend(stats_pack.pack(dosage_sum, dosage_sum_sq, n_observed, n_nonzero))
 
@@ -1666,7 +1818,7 @@ def _region_parse_worker(args: tuple) -> tuple[int, str]:
             pos = int(fields[1])
             ref = fields[3].decode("utf-8")
             alt = alt_field.decode("utf-8")
-            variants.append(
+            buffered_variants.append(
                 _variant_defaults_from_bcftools_fields(
                     chrom=chrom,
                     pos=pos,
@@ -1682,11 +1834,14 @@ def _region_parse_worker(args: tuple) -> tuple[int, str]:
             )
 
             count += 1
-            if count % flush_every == 0:
-                _flush_buffers()
+            last_chrom = chrom
+            last_pos = pos
+            bytes_since_checkpoint += len(geno_bytes) + 24
+            _checkpoint(force=False)
+
             now = time.monotonic()
             if now - last_log >= 10.0:
-                rate = count / max(now - t_start, 0.01)
+                rate = (count - resume_count) / max(now - t_start, 0.01)
                 print(f"  [worker] {vcf_name}: {count} variants ({rate:.0f}/s)", file=sys.stderr, flush=True)
                 last_log = now
 
@@ -1699,11 +1854,17 @@ def _region_parse_worker(args: tuple) -> tuple[int, str]:
             query_err = query_stderr_tmp.read().decode("utf-8", errors="replace").strip()
             raise RuntimeError(
                 f"bcftools pipeline failed on {vcf_name}"
-                + (f" region {region}" if region else "")
+                + (f" region {effective_region}" if effective_region else "")
                 + f" (view exit {view_proc.returncode}, query exit {proc.returncode}). "
                 + f"view stderr: {view_err}  query stderr: {query_err}"
             )
     except BaseException:
+        # On any error path, persist whatever we have so the next launch can
+        # resume from this point rather than redoing the entire region.
+        try:
+            _checkpoint(force=True)
+        except Exception:
+            pass
         for sub in (proc, view_proc):
             try:
                 sub.kill()
@@ -1719,10 +1880,25 @@ def _region_parse_worker(args: tuple) -> tuple[int, str]:
         view_stderr_tmp.close()
         query_stderr_tmp.close()
 
-    _flush_buffers()
+    # Final flush + chunk write so all remaining records are durable.
+    _checkpoint(force=True)
     geno_fh.close()
     stats_fh.close()
-    _write_variant_metadata(Path(f"{output_prefix}.variants.npz"), variants)
+
+    # Consolidate all variant-metadata chunks into the single .variants.npz
+    # file the merge step expects. Atomic rename so a crash here can't
+    # leave a half-written final file.
+    chunk_paths = _region_variant_chunk_paths(output_prefix)
+    all_variants: list[_VariantDefaults] = []
+    for chunk_path in chunk_paths:
+        all_variants.extend(_load_variant_metadata(chunk_path))
+    tmp_final = final_variants_path.with_name(final_variants_path.name + ".tmp")
+    _write_variant_metadata(tmp_final, all_variants)
+    tmp_final.replace(final_variants_path)
+    for chunk_path in chunk_paths:
+        chunk_path.unlink(missing_ok=True)
+    progress_path.unlink(missing_ok=True)
+
     elapsed = time.monotonic() - t_start
     print(f"  [worker] {vcf_name}: DONE {count} variants in {elapsed:.0f}s", file=sys.stderr, flush=True)
     return count, output_prefix
