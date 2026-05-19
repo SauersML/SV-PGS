@@ -937,6 +937,12 @@ def run_all_of_us(
             # multi-source loader's intersection logic will further restrict
             # to samples present in every source — for SV-only that's a no-op,
             # for SV+microarray that's the SV ∩ array intersection.
+            # Pass train's variant_stats + variant_records straight through so
+            # the test load skips its own ~10-110 min PLINK variant-stats
+            # streaming pass entirely. The downstream pipeline only consumes
+            # test_dataset.{genotypes, covariates, targets, sample_ids}; stats
+            # and records are kept consistent with train so any consumer that
+            # reads them sees one model, one standardization.
             test_dataset = load_multi_source_dataset_from_files(
                 sources=[(kind, str(path)) for kind, path in sources],
                 config=config,
@@ -945,17 +951,9 @@ def run_all_of_us(
                 target_column="target",
                 covariate_columns=covariates,
                 variant_metadata_path=resolved_variant_metadata_path,
+                precomputed_variant_stats=dataset.variant_stats,
+                precomputed_variant_records=dataset.variant_records,
             )
-            # For PLINK sources the variant-statistics (means/scales used to
-            # standardize the matrix) come from whichever sample subset got
-            # loaded — train and test would otherwise disagree. The model
-            # internalizes its own train-set stats during fit, but pin the
-            # test dataset's exposed stats to the train values too so any
-            # downstream consumer that reads dataset.variant_stats stays
-            # consistent. VCF sources cache cohort-wide stats so this is a
-            # no-op for them.
-            import dataclasses
-            test_dataset = dataclasses.replace(test_dataset, variant_stats=dataset.variant_stats)
         inferred_trait = TraitType.BINARY if len(np.unique(dataset.targets)) <= 2 else TraitType.QUANTITATIVE
         config.trait_type = inferred_trait
 

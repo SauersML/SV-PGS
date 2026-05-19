@@ -775,6 +775,8 @@ def load_multi_source_dataset_from_files(
     covariate_columns: Sequence[str],
     sample_id_column: str = "auto",
     variant_metadata_path: str | Path | None = None,
+    precomputed_variant_stats: VariantStatistics | None = None,
+    precomputed_variant_records: Sequence[VariantRecord] | None = None,
 ) -> LoadedDataset:
     """Load a heterogeneous list of (kind, path) genotype sources.
 
@@ -787,6 +789,14 @@ def load_multi_source_dataset_from_files(
 
     Cross-source variant duplicates are dropped by the same first-occurrence
     rule as load_multi_vcf_dataset_from_files.
+
+    If `precomputed_variant_stats` is supplied, the PLINK source skips its
+    own ~10-110 min variant-stats streaming pass and uses the supplied
+    values directly. The AoU runner uses this to load the held-out test
+    cohort: stats from the test cohort would be computed-and-immediately-
+    overwritten by the train stats anyway (the model expects a single
+    consistent standardization between train and test), so skipping the
+    test pass saves an entire bed-file scan on every run.
     """
     log(f"=== LOAD MULTI-SOURCE DATASET START === sources={len(sources)} mem={mem()}")
     if not sources:
@@ -897,14 +907,30 @@ def load_multi_source_dataset_from_files(
                 variant_count=meta.variant_count,
                 total_sample_count=len(meta.sample_ids),
             )
-            log(f"  computing variant statistics for {path.name} (single PLINK streaming pass; disk-cached)...")
-            stats = compute_plink_variant_statistics_cached(
-                raw,
-                bed_path=path,
-                sample_indices=keep_indices,
-                config=config,
-            )
-            variants_list = _build_plink_variant_defaults_from_stats(path, stats)
+            if precomputed_variant_stats is not None:
+                # Caller already has variant_stats and variant_records from a
+                # prior load on the same source set (typically: train cohort
+                # supplying values for the test load). Skip the bed-file
+                # streaming pass and use placeholder per-source stats; the
+                # final dataset replaces these with the precomputed values
+                # below.
+                log(f"  reusing precomputed variant statistics for {path.name} (skipping PLINK streaming pass)")
+                stats = VariantStatistics(
+                    means=np.empty(0, dtype=np.float32),
+                    scales=np.empty(0, dtype=np.float32),
+                    allele_frequencies=np.empty(0, dtype=np.float32),
+                    support_counts=np.empty(0, dtype=np.int32),
+                )
+                variants_list = []
+            else:
+                log(f"  computing variant statistics for {path.name} (single PLINK streaming pass; disk-cached)...")
+                stats = compute_plink_variant_statistics_cached(
+                    raw,
+                    bed_path=path,
+                    sample_indices=keep_indices,
+                    config=config,
+                )
+                variants_list = _build_plink_variant_defaults_from_stats(path, stats)
         raw_matrices.append(raw)
         per_source_variants.append(variants_list)
         per_source_stats.append(stats)
@@ -931,17 +957,37 @@ def load_multi_source_dataset_from_files(
     # pipeline already consumes).
     default_variants: list[_VariantDefaults] = [variant for chunk in per_source_variants for variant in chunk]
     raw_genotypes: RawGenotypeMatrix = ConcatenatedRawGenotypeMatrix(tuple(raw_matrices))
-    variant_stats = VariantStatistics(
-        means=np.concatenate([stats.means for stats in per_source_stats]).astype(np.float32, copy=False),
-        scales=np.concatenate([stats.scales for stats in per_source_stats]).astype(np.float32, copy=False),
-        allele_frequencies=np.concatenate([stats.allele_frequencies for stats in per_source_stats]).astype(np.float32, copy=False),
-        support_counts=np.concatenate([stats.support_counts for stats in per_source_stats]).astype(np.int32, copy=False),
-    )
-    log("building variant records from defaults + optional metadata...")
-    variant_records = _build_variant_records(
-        default_variants=default_variants,
-        variant_metadata_path=variant_metadata_path,
-    )
+    if precomputed_variant_stats is not None:
+        expected_variants = int(raw_genotypes.shape[1])
+        provided_variants = int(precomputed_variant_stats.means.shape[0])
+        if expected_variants != provided_variants:
+            raise ValueError(
+                f"precomputed_variant_stats has {provided_variants} variants but the "
+                f"loaded genotype matrix has {expected_variants} columns. The two loads "
+                "must be over the same source set (same VCFs, same .bed) so dedup "
+                "produces identical variant counts; otherwise stats and columns won't align."
+            )
+        variant_stats = precomputed_variant_stats
+        log(
+            f"reusing precomputed variant_stats ({variant_stats.means.shape[0]:,} variants) "
+            "— skipping concatenation + variant-record rebuild"
+        )
+    else:
+        variant_stats = VariantStatistics(
+            means=np.concatenate([stats.means for stats in per_source_stats]).astype(np.float32, copy=False),
+            scales=np.concatenate([stats.scales for stats in per_source_stats]).astype(np.float32, copy=False),
+            allele_frequencies=np.concatenate([stats.allele_frequencies for stats in per_source_stats]).astype(np.float32, copy=False),
+            support_counts=np.concatenate([stats.support_counts for stats in per_source_stats]).astype(np.int32, copy=False),
+        )
+    if precomputed_variant_records is not None:
+        variant_records = list(precomputed_variant_records)
+        log(f"reusing {len(variant_records):,} precomputed variant_records (skipping metadata join)")
+    else:
+        log("building variant records from defaults + optional metadata...")
+        variant_records = _build_variant_records(
+            default_variants=default_variants,
+            variant_metadata_path=variant_metadata_path,
+        )
     sv_count = sum(1 for vr in variant_records if vr.variant_class.value not in ("snv", "small_indel"))
     snv_count = sum(1 for vr in variant_records if vr.variant_class.value == "snv")
     log(f"variant records: {len(variant_records):,} total ({snv_count:,} SNVs, {sv_count:,} structural variants)")
