@@ -271,6 +271,81 @@ class Int8RawGenotypeMatrix(RawGenotypeMatrix):
 
 
 @dataclass(slots=True)
+class IndexedRawGenotypeMatrix(RawGenotypeMatrix):
+    """Expose only a selected subset of a child matrix's columns.
+
+    Used by the multi-VCF dataset loader to drop cross-source duplicate
+    variants without rewriting on-disk caches: the wrapper advertises
+    shape (n_samples, len(selected_columns)) and routes column i to the
+    child's column selected_columns[i]. Yielded batch.variant_indices stay
+    in the wrapper's local coordinate space so downstream consumers can
+    index back into us directly.
+    """
+    child: RawGenotypeMatrix
+    selected_columns: np.ndarray
+
+    def __post_init__(self) -> None:
+        indices = np.asarray(self.selected_columns, dtype=np.int64)
+        if indices.ndim != 1:
+            raise ValueError("selected_columns must be 1D.")
+        child_variant_count = int(self.child.shape[1])
+        if indices.size and (indices.min() < 0 or indices.max() >= child_variant_count):
+            raise ValueError("selected_columns contains an out-of-range index.")
+        self.selected_columns = indices
+
+    @property
+    def shape(self) -> tuple[int, int]:
+        return int(self.child.shape[0]), int(self.selected_columns.shape[0])
+
+    def _child_columns(self, local_indices: np.ndarray) -> np.ndarray:
+        return self.selected_columns[local_indices].astype(np.int32, copy=False)
+
+    def iter_column_batches(
+        self,
+        variant_indices: Sequence[int] | np.ndarray | None = None,
+        batch_size: int = DEFAULT_GENOTYPE_BATCH_SIZE,
+    ) -> Iterator[RawGenotypeBatch]:
+        resolved_indices = _resolve_variant_indices(self.shape[1], variant_indices)
+        safe_batch_size = max(int(batch_size), 1)
+        for start_index in range(0, resolved_indices.shape[0], safe_batch_size):
+            local_batch = resolved_indices[start_index : start_index + safe_batch_size]
+            yield RawGenotypeBatch(
+                variant_indices=local_batch,
+                values=self.child.materialize(self._child_columns(local_batch)),
+            )
+
+    def iter_column_batches_i8(
+        self,
+        variant_indices: Sequence[int] | np.ndarray | None = None,
+        batch_size: int = DEFAULT_GENOTYPE_BATCH_SIZE,
+    ) -> Iterator[RawGenotypeBatch]:
+        if not _supports_int8_batches(self.child):
+            raise RuntimeError("int8 batch iteration requires the wrapped child to support iter_column_batches_i8.")
+        resolved_indices = _resolve_variant_indices(self.shape[1], variant_indices)
+        safe_batch_size = max(int(batch_size), 1)
+        child = cast(Int8BatchCapable, self.child)
+        for start_index in range(0, resolved_indices.shape[0], safe_batch_size):
+            local_batch = resolved_indices[start_index : start_index + safe_batch_size]
+            child_batch_indices = self._child_columns(local_batch)
+            # Read the entire local batch as one child request so columns come
+            # back in our coordinate order — no concat or reordering needed.
+            child_batch = next(child.iter_column_batches_i8(
+                child_batch_indices, batch_size=max(child_batch_indices.shape[0], 1),
+            ))
+            yield RawGenotypeBatch(
+                variant_indices=local_batch,
+                values=np.asarray(child_batch.values, dtype=np.int8),
+            )
+
+    def materialize(
+        self,
+        variant_indices: Sequence[int] | np.ndarray | None = None,
+    ) -> np.ndarray:
+        resolved_indices = _resolve_variant_indices(self.shape[1], variant_indices)
+        return self.child.materialize(self._child_columns(resolved_indices))
+
+
+@dataclass(slots=True)
 class PlinkRawGenotypeMatrix(RawGenotypeMatrix):
     bed_path: Path
     sample_indices: np.ndarray

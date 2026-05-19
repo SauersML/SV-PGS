@@ -281,7 +281,14 @@ def test_load_multi_vcf_dataset_from_files_rejects_duplicate_paths(tmp_path: Pat
         )
 
 
-def test_load_multi_vcf_dataset_from_files_rejects_duplicate_variant_keys(tmp_path: Path):
+def test_load_multi_vcf_dataset_from_files_dedupes_cross_source_variants(tmp_path: Path):
+    """Cross-source (chr,pos,id) duplicates are dropped (first occurrence wins).
+
+    Past worker bugs occasionally left chromosome N's cache with a few records
+    that also live in chromosome M's cache. Rather than fail the load and force
+    a multi-minute re-parse, the assembly path keeps the first copy and slices
+    the second source's matrix to expose only its remaining columns.
+    """
     vcf1_path = tmp_path / "chr1_a.vcf"
     vcf1_path.write_text(
         "\n".join(
@@ -307,6 +314,7 @@ def test_load_multi_vcf_dataset_from_files_rejects_duplicate_variant_keys(tmp_pa
                 "##FORMAT=<ID=GT,Number=1,Type=String,Description=\"Genotype\">",
                 "#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\ts1",
                 "1\t100\tdup\tA\tC\t50\tPASS\tAF=0.25\tGT\t0/1",
+                "1\t200\tunique\tA\tG\t50\tPASS\tAF=0.1\tGT\t1/1",
                 "",
             ]
         ),
@@ -319,15 +327,20 @@ def test_load_multi_vcf_dataset_from_files_rejects_duplicate_variant_keys(tmp_pa
         rows=(("s1", "1", "42"),),
     )
 
-    with pytest.raises(ValueError, match="duplicate variants detected across genotype_paths"):
-        load_multi_vcf_dataset_from_files(
-            genotype_paths=[vcf1_path, vcf2_path],
-            config=ModelConfig(),
-            sample_table_path=sample_table_path,
-            sample_id_column="sample_id",
-            target_column="target",
-            covariate_columns=("age",),
-        )
+    dataset = load_multi_vcf_dataset_from_files(
+        genotype_paths=[vcf1_path, vcf2_path],
+        config=ModelConfig(),
+        sample_table_path=sample_table_path,
+        sample_id_column="sample_id",
+        target_column="target",
+        covariate_columns=("age",),
+    )
+
+    variant_keys = [(record.chromosome, record.position, record.variant_id) for record in dataset.variant_records]
+    assert variant_keys == [("1", 100, "dup"), ("1", 200, "unique")]
+    assert dataset.genotypes.shape == (1, 2)
+    assert dataset.variant_stats is not None
+    assert dataset.variant_stats.means.shape == (2,)
 
 
 def test_load_dataset_from_vcf_auto_detects_sample_id_column_after_first_1000_rows(tmp_path: Path):

@@ -18,6 +18,7 @@ from sv_pgs.data import NESTED_PATH_DELIMITER, VariantRecord, VariantStatistics
 from sv_pgs.genotype import (
     PLINK_MISSING_INT8,
     ConcatenatedRawGenotypeMatrix,
+    IndexedRawGenotypeMatrix,
     PlinkRawGenotypeMatrix,
     RawGenotypeMatrix,
     as_raw_genotype_matrix,
@@ -652,8 +653,8 @@ def load_multi_vcf_dataset_from_files(
 
     _t_start = time.monotonic()
     raw_matrices: list[RawGenotypeMatrix] = []
-    default_variants: list[_VariantDefaults] = []
-    variant_stats_parts: list[VariantStatistics] = []
+    per_chr_variants: list[list[_VariantDefaults]] = []
+    per_chr_stats: list[VariantStatistics] = []
     total_variants = 0
     for chr_idx, source_path in enumerate(source_paths):
         _t_chr = time.monotonic()
@@ -663,8 +664,8 @@ def load_multi_vcf_dataset_from_files(
         if not skip_subset:
             genotype_matrix = _fast_mmap_row_reindex(genotype_matrix, keep_sample_indices)
         raw_matrices.append(as_raw_genotype_matrix(genotype_matrix))
-        default_variants.extend(chromosome_variants)
-        variant_stats_parts.append(chromosome_stats)
+        per_chr_variants.append(list(chromosome_variants))
+        per_chr_stats.append(chromosome_stats)
         total_variants += len(chromosome_variants)
         _elapsed = time.monotonic() - _t_start
         _chr_time = time.monotonic() - _t_chr
@@ -676,14 +677,21 @@ def load_multi_vcf_dataset_from_files(
     _elapsed = time.monotonic() - _t_start
     log(f"  all {n_chromosomes} chromosomes loaded: {total_variants:,} total variants in {_elapsed:.0f}s")
 
+    raw_matrices, per_chr_variants, per_chr_stats = _dedupe_cross_source_variants(
+        raw_matrices=raw_matrices,
+        per_chr_variants=per_chr_variants,
+        per_chr_stats=per_chr_stats,
+        source_paths=source_paths,
+    )
+
+    default_variants: list[_VariantDefaults] = [variant for chrom in per_chr_variants for variant in chrom]
     raw_genotypes: RawGenotypeMatrix = ConcatenatedRawGenotypeMatrix(tuple(raw_matrices))
     variant_stats = VariantStatistics(
-        means=np.concatenate([stats.means for stats in variant_stats_parts]).astype(np.float32, copy=False),
-        scales=np.concatenate([stats.scales for stats in variant_stats_parts]).astype(np.float32, copy=False),
-        allele_frequencies=np.concatenate([stats.allele_frequencies for stats in variant_stats_parts]).astype(np.float32, copy=False),
-        support_counts=np.concatenate([stats.support_counts for stats in variant_stats_parts]).astype(np.int32, copy=False),
+        means=np.concatenate([stats.means for stats in per_chr_stats]).astype(np.float32, copy=False),
+        scales=np.concatenate([stats.scales for stats in per_chr_stats]).astype(np.float32, copy=False),
+        allele_frequencies=np.concatenate([stats.allele_frequencies for stats in per_chr_stats]).astype(np.float32, copy=False),
+        support_counts=np.concatenate([stats.support_counts for stats in per_chr_stats]).astype(np.int32, copy=False),
     )
-    _validate_multi_vcf_variant_keys(default_variants)
 
     log("building variant records from defaults + optional metadata...")
     variant_records = _build_variant_records(
@@ -706,18 +714,76 @@ def load_multi_vcf_dataset_from_files(
     )
 
 
-def _validate_multi_vcf_variant_keys(default_variants: Sequence[_VariantDefaults]) -> None:
+def _dedupe_cross_source_variants(
+    *,
+    raw_matrices: list[RawGenotypeMatrix],
+    per_chr_variants: list[list[_VariantDefaults]],
+    per_chr_stats: list[VariantStatistics],
+    source_paths: Sequence[Path],
+) -> tuple[list[RawGenotypeMatrix], list[list[_VariantDefaults]], list[VariantStatistics]]:
+    """Drop variants whose (chr, pos, variant_id) already appeared in an earlier source.
+
+    Past worker bugs occasionally produced cache bundles where a few records
+    from one chromosome ended up duplicated inside another chromosome's cache
+    (the per-cache audit cannot detect this because each cache passes its own
+    chromosome and variant-id checks). Rather than invalidating those caches
+    and forcing a multi-minute re-parse, we reconcile here: the first source
+    to claim a key wins, and later sources expose only their remaining columns
+    via IndexedRawGenotypeMatrix wrappers — zero-copy, no on-disk rewrite.
+    """
     seen_keys: set[tuple[str, int, str]] = set()
-    duplicate_keys: list[tuple[str, int, str]] = []
-    for variant in default_variants:
-        variant_key = (str(variant.chromosome), int(variant.position), str(variant.variant_id))
-        if variant_key in seen_keys:
-            duplicate_keys.append(variant_key)
-        else:
+    preview_duplicates: list[tuple[str, int, str, str]] = []
+    dropped_per_source: list[int] = []
+    new_matrices: list[RawGenotypeMatrix] = []
+    new_variants: list[list[_VariantDefaults]] = []
+    new_stats: list[VariantStatistics] = []
+
+    for chr_idx, chromosome_variants in enumerate(per_chr_variants):
+        keep_positions: list[int] = []
+        for local_idx, variant in enumerate(chromosome_variants):
+            variant_key = (str(variant.chromosome), int(variant.position), str(variant.variant_id))
+            if variant_key in seen_keys:
+                if len(preview_duplicates) < 3:
+                    preview_duplicates.append((*variant_key, source_paths[chr_idx].name))
+                continue
             seen_keys.add(variant_key)
-    if duplicate_keys:
-        preview = ", ".join(f"{chrom}:{position}:{variant_id}" for chrom, position, variant_id in duplicate_keys[:3])
-        raise ValueError(f"duplicate variants detected across genotype_paths: {preview}")
+            keep_positions.append(local_idx)
+        dropped = len(chromosome_variants) - len(keep_positions)
+        dropped_per_source.append(dropped)
+        child = raw_matrices[chr_idx]
+        stats = per_chr_stats[chr_idx]
+        if dropped == 0:
+            new_matrices.append(child)
+            new_variants.append(chromosome_variants)
+            new_stats.append(stats)
+            continue
+        keep_index = np.asarray(keep_positions, dtype=np.int64)
+        new_matrices.append(IndexedRawGenotypeMatrix(child=child, selected_columns=keep_index))
+        new_variants.append([chromosome_variants[i] for i in keep_positions])
+        new_stats.append(VariantStatistics(
+            means=np.ascontiguousarray(stats.means[keep_index]),
+            scales=np.ascontiguousarray(stats.scales[keep_index]),
+            allele_frequencies=np.ascontiguousarray(stats.allele_frequencies[keep_index]),
+            support_counts=np.ascontiguousarray(stats.support_counts[keep_index]),
+        ))
+
+    total_dropped = sum(dropped_per_source)
+    if total_dropped > 0:
+        per_source_summary = ", ".join(
+            f"{source_paths[i].name}:-{dropped_per_source[i]}"
+            for i in range(len(source_paths))
+            if dropped_per_source[i] > 0
+        )
+        preview = ", ".join(
+            f"{chrom}:{position}:{variant_id} (in {source_name})"
+            for chrom, position, variant_id, source_name in preview_duplicates
+        )
+        log(
+            f"  dropped {total_dropped} cross-source duplicate variants "
+            f"(first occurrence kept). per-source: {per_source_summary}. "
+            f"examples: {preview}"
+        )
+    return new_matrices, new_variants, new_stats
 
 
 def _build_sample_table(
@@ -2065,12 +2131,12 @@ def precache_vcfs_parallel(
 
     total_cpus = os.cpu_count() or 4
 
-    # Audit existing caches before deciding what to skip. Past worker bugs
-    # could have left cache files that look complete but contain variants
-    # from a different chromosome, or duplicate variant_ids within a single
-    # file. We try to repair duplicate-only damage in place (seconds per
-    # cache); only invalidate-and-re-parse when the damage is structural
-    # (chromosome contamination, unreadable metadata).
+    # Audit existing caches and surface anything suspicious. We *never*
+    # invalidate a complete cache here: the multi-VCF load path runs a
+    # global (chr, pos, variant_id) dedup that resolves any residual
+    # within-cache or cross-cache duplicates without re-parsing. The only
+    # repair we still run is the in-place dedupe-and-rewrite — that just
+    # normalizes a cache, no re-parsing, no data lost.
     for vcf_path in vcf_paths:
         cache_paths = _vcf_cache_paths(vcf_path, config)
         if not _is_vcf_cache_bundle_complete(cache_paths):
@@ -2082,11 +2148,16 @@ def precache_vcfs_parallel(
             try:
                 removed = _repair_vcf_cache_duplicates(vcf_path, cache_paths, config)
                 log(f"  deduped cache for {vcf_path.name}: removed {removed} duplicate rows in place")
-                continue
             except (OSError, RuntimeError, ValueError) as exc:
-                log(f"  in-place dedupe failed for {vcf_path.name} ({exc}); falling back to re-parse")
-        log(f"  invalidating cache for {vcf_path.name}: {reason}")
-        _invalidate_vcf_cache(cache_paths)
+                log(
+                    f"  in-place dedupe failed for {vcf_path.name} ({exc}); "
+                    "load-time cross-source dedup will reconcile it"
+                )
+            continue
+        log(
+            f"  audit note for {vcf_path.name}: {reason} "
+            "(cache left in place; load-time dedup will reconcile duplicates)"
+        )
 
     # Skip already-cached VCFs under the current cache key only.
     uncached: list[Path] = []
