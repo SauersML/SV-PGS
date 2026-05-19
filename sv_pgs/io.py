@@ -1510,33 +1510,88 @@ def _variant_defaults_from_bcftools_fields(
 def _parse_gt_block_to_int8(gt_block: bytes, sample_count: int) -> np.ndarray:
     """Vectorized decode of a bcftools `[%GT,]` block to int8 dosages.
 
-    The format string emits exactly 4 bytes per sample: a 3-character diploid
-    GT (e.g. "0/0", "0|1", "./.") followed by ','. For biallelic single-digit
-    alleles (which we have already filtered down to) the layout is regular, so
-    a single np.frombuffer + slicing pass turns 250k samples into an int8
-    dosage column in microseconds.
+    Handles both diploid (`"X/X,"` = 4 bytes/sample) and haploid (`"X,"` =
+    2 bytes/sample) layouts. AoU SV VCFs mix the two: most records are
+    diploid biallelic, but some sites are emitted with haploid GTs (often
+    when a sample has no call, producing `".,"`). We detect the layout from
+    the comma positions per record rather than assuming a fixed width.
 
-    Missing alleles ('.' in either position) collapse to PLINK_MISSING_INT8.
-    Phasing characters at the middle byte are not read, so '/' and '|' are
-    handled identically.
+    Missing alleles ('.' in any position) collapse to PLINK_MISSING_INT8.
+    Phasing characters ('/' vs '|') at the middle byte of a diploid GT are
+    not read, so phased and unphased records decode identically.
     """
-    expected = sample_count * 4
-    if len(gt_block) != expected:
-        raise ValueError(
-            "bcftools GT block has unexpected length: "
-            f"got {len(gt_block)} bytes, expected {expected} "
-            f"({sample_count} samples * 4 bytes each). This usually means a "
-            "haploid record, multi-digit alleles, or a multi-allelic record "
-            "slipped past the biallelic filter."
-        )
     buf = np.frombuffer(gt_block, dtype=np.uint8)
-    first_allele = buf[0::4]
-    second_allele = buf[2::4]
+    # ord(',') = 44
+    comma_positions = np.flatnonzero(buf == 44)
+    if comma_positions.shape[0] != sample_count:
+        raise ValueError(
+            "bcftools GT block has unexpected comma count: "
+            f"got {comma_positions.shape[0]} commas, expected {sample_count} "
+            f"(one trailing comma per sample). Block length: {len(gt_block)} bytes."
+        )
+    # Each sample's GT spans [start, end) where start is the byte after the
+    # previous comma (or 0 for the first sample) and end is the comma index.
+    starts = np.empty(sample_count, dtype=np.int64)
+    starts[0] = 0
+    starts[1:] = comma_positions[:-1] + 1
+    lengths = comma_positions - starts
+
     # 46 = ord('.'), 48 = ord('0')
-    missing_mask = (first_allele == 46) | (second_allele == 46)
-    dosage_i16 = (first_allele.astype(np.int16) - 48) + (second_allele.astype(np.int16) - 48)
-    dosage = dosage_i16.astype(np.int8)
-    dosage[missing_mask] = PLINK_MISSING_INT8
+    if bool(np.all(lengths == 3)):
+        # Diploid: "X/X" or "X|X" or "./." etc.
+        first_allele = buf[starts]
+        second_allele = buf[starts + 2]
+        missing_mask = (first_allele == 46) | (second_allele == 46)
+        dosage_i16 = (
+            (first_allele.astype(np.int16) - 48)
+            + (second_allele.astype(np.int16) - 48)
+        )
+        dosage = dosage_i16.astype(np.int8)
+        dosage[missing_mask] = PLINK_MISSING_INT8
+        return dosage
+    if bool(np.all(lengths == 1)):
+        # Haploid: "X" or "." per sample. Treat the allele count directly as
+        # dosage (0 -> 0, 1 -> 1) and any '.' as missing.
+        allele = buf[starts]
+        missing_mask = allele == 46
+        dosage = (allele.astype(np.int16) - 48).astype(np.int8)
+        dosage[missing_mask] = PLINK_MISSING_INT8
+        return dosage
+
+    # Mixed widths within a single record (some samples diploid, some haploid)
+    # are extremely rare. Handle correctly via a per-sample Python loop on the
+    # offending block — slow but only triggers on truly heterogeneous records.
+    return _parse_gt_block_mixed_widths(buf, starts.tolist(), lengths.tolist())
+
+
+def _parse_gt_block_mixed_widths(
+    buf: np.ndarray, starts: list[int], lengths: list[int]
+) -> np.ndarray:
+    """Fallback parser for records whose per-sample GTs are not all the same
+    width. Slow Python loop, only used as an escape hatch.
+    """
+    sample_count = len(starts)
+    dosage = np.empty(sample_count, dtype=np.int8)
+    raw = bytes(buf)
+    for i in range(sample_count):
+        start = starts[i]
+        length = lengths[i]
+        if length == 0:
+            dosage[i] = PLINK_MISSING_INT8
+            continue
+        gt = raw[start : start + length]
+        if b"." in gt:
+            dosage[i] = PLINK_MISSING_INT8
+            continue
+        # Sum allele digits, ignoring '/' (47) and '|' (124).
+        total = 0
+        for byte_value in gt:
+            if 48 <= byte_value <= 57:
+                total += byte_value - 48
+        if total > 127:
+            dosage[i] = 127
+        else:
+            dosage[i] = total
     return dosage
 
 
