@@ -1124,6 +1124,81 @@ def _write_vcf_cache_stats(stats_path: Path, variant_stats: VariantStatistics) -
     np.save(stats_path, stats_matrix, allow_pickle=False)
 
 
+def _vcf_cache_audit_reason(vcf_path: Path, paths: _VcfCachePaths) -> str | None:
+    """Cheap content audit on an existing cache bundle.
+
+    Returns None if the cache looks healthy, or a short human-readable reason
+    string if it should be invalidated and re-parsed. Detects two failure
+    modes that previously slipped through the per-region merge check:
+
+    - The cached variant_ids contain duplicates within a single VCF cache.
+    - The cached chromosomes do not match the chromosome the source VCF
+      actually covers (cross-contamination — e.g. chr13's cache file ends
+      up with chr1 records).
+
+    We only inspect the variants metadata file (~few MB) — no VCF record
+    iteration — so this is cheap even when called on every VCF at startup.
+    """
+    variants_path = paths.var_path
+    if not variants_path.exists():
+        legacy = paths.cache_dir / f"{paths.key}.variants.pkl"
+        if not legacy.exists():
+            return None  # Bundle isn't complete; the normal check will skip it.
+        variants_path = legacy
+    try:
+        if variants_path.suffix == ".npz":
+            with np.load(variants_path, allow_pickle=False) as data:
+                variant_ids = np.asarray(data["variant_ids"]).astype(str, copy=False)
+                chromosomes = np.asarray(data["chromosomes"]).astype(str, copy=False)
+        else:
+            variants = _load_variant_metadata(variants_path)
+            variant_ids = np.asarray([v.variant_id for v in variants], dtype=object)
+            chromosomes = np.asarray([v.chromosome for v in variants], dtype=object)
+    except (OSError, ValueError, KeyError, EOFError) as exc:
+        return f"variant metadata unreadable ({exc})"
+
+    if variant_ids.shape[0] == 0:
+        return "variant metadata is empty"
+
+    if np.unique(variant_ids).shape[0] != variant_ids.shape[0]:
+        return f"variant_ids contain duplicates within the cache ({variant_ids.shape[0] - np.unique(variant_ids).shape[0]} duplicate rows)"
+
+    info = _vcf_contig_info(vcf_path)
+    if info is not None:
+        expected_chrom = str(info[0])
+        unique_chroms = set(chromosomes.tolist())
+        if unique_chroms != {expected_chrom}:
+            preview = sorted(unique_chroms - {expected_chrom})[:3]
+            return (
+                f"cached chromosomes {sorted(unique_chroms)} do not match "
+                f"VCF contig {expected_chrom!r} (extras: {preview})"
+            )
+
+    return None
+
+
+def _invalidate_vcf_cache(paths: _VcfCachePaths) -> None:
+    """Remove every file that makes up a VCF cache bundle.
+
+    Walks both current (.npz/.npy) and legacy (.pkl) naming so a stale cache
+    written by an older code version still gets cleaned up properly.
+    """
+    candidates = [
+        paths.geno_path,
+        paths.var_path,
+        paths.stats_path,
+        paths.manifest_path,
+        paths.cache_dir / f"{paths.key}.variants.pkl",
+        paths.cache_dir / f"{paths.key}.stats.npy",
+        paths.cache_dir / f"{paths.key}.stats.npz",
+    ]
+    for candidate in candidates:
+        try:
+            candidate.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
 def _is_vcf_cache_bundle_complete(paths: _VcfCachePaths) -> bool:
     if not paths.geno_path.exists():
         return False
@@ -1928,6 +2003,22 @@ def precache_vcfs_parallel(
     import shutil
 
     total_cpus = os.cpu_count() or 4
+
+    # Audit existing caches before deciding what to skip. Past worker bugs
+    # could have left cache files that look complete but contain variants
+    # from a different chromosome, or duplicate variant_ids within a single
+    # file. Catching that here means the failing path triggers a clean
+    # re-parse of just the affected VCF instead of a downstream
+    # "duplicate variants detected across genotype_paths" error that
+    # forces the user to nuke every cache.
+    for vcf_path in vcf_paths:
+        cache_paths = _vcf_cache_paths(vcf_path, config)
+        if not _is_vcf_cache_bundle_complete(cache_paths):
+            continue
+        reason = _vcf_cache_audit_reason(vcf_path, cache_paths)
+        if reason is not None:
+            log(f"  invalidating cache for {vcf_path.name}: {reason}")
+            _invalidate_vcf_cache(cache_paths)
 
     # Skip already-cached VCFs under the current cache key only.
     uncached: list[Path] = []
