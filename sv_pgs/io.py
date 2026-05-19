@@ -1591,14 +1591,19 @@ def _region_parse_worker(args: tuple) -> tuple[int, str]:
     sample_count = len(_read_vcf_sample_ids(vcf_path))
 
     bcftools = _bcftools_executable()
-    # `bcftools query` on older builds (incl. the AoU image) does not accept
-    # --threads; the decompression is single-threaded inside query regardless.
-    # We rely on the multiprocessing pool, not intra-process threads, for fan-out.
-    _ = threads_per_reader
-    cmd = [bcftools, "query", "-f", _BCFTOOLS_QUERY_FORMAT]
+    # Split the work across two bcftools processes connected by a pipe:
+    #   view -Ou: BGZF decompress + VCF->BCF parse (accepts --threads on every
+    #             bcftools build we've encountered, including AoU's older one)
+    #   query  : read uncompressed BCF on stdin, extract fields, emit ASCII
+    # The OS runs both stages concurrently on separate cores, which roughly
+    # doubles throughput vs `query` reading the BGZF file directly (where
+    # decompression and ASCII formatting serialize inside one process).
+    view_threads = max(int(threads_per_reader), 1)
+    view_cmd = [bcftools, "view", "--threads", str(view_threads), "-Ou"]
     if region:
-        cmd += ["-r", region]
-    cmd += [str(vcf_path)]
+        view_cmd += ["-r", region]
+    view_cmd += [str(vcf_path)]
+    query_cmd = [bcftools, "query", "-f", _BCFTOOLS_QUERY_FORMAT, "-"]
 
     stats_pack = struct.Struct("<qqii")
     geno_fh = open(f"{output_prefix}.geno", "wb")
@@ -1621,13 +1626,24 @@ def _region_parse_worker(args: tuple) -> tuple[int, str]:
     t_start = time.monotonic()
     last_log = t_start
 
-    stderr_tmp = tempfile.TemporaryFile()
-    proc = subprocess.Popen(
-        cmd,
+    view_stderr_tmp = tempfile.TemporaryFile()
+    query_stderr_tmp = tempfile.TemporaryFile()
+    view_proc = subprocess.Popen(
+        view_cmd,
         stdout=subprocess.PIPE,
-        stderr=stderr_tmp,
+        stderr=view_stderr_tmp,
         bufsize=1 << 20,
     )
+    assert view_proc.stdout is not None
+    proc = subprocess.Popen(
+        query_cmd,
+        stdin=view_proc.stdout,
+        stdout=subprocess.PIPE,
+        stderr=query_stderr_tmp,
+        bufsize=1 << 20,
+    )
+    # Close our copy of the read end so view receives SIGPIPE if query exits.
+    view_proc.stdout.close()
     assert proc.stdout is not None
     try:
         for raw_line in proc.stdout:
@@ -1675,24 +1691,33 @@ def _region_parse_worker(args: tuple) -> tuple[int, str]:
                 last_log = now
 
         proc.wait()
-        if proc.returncode != 0:
-            stderr_tmp.seek(0)
-            stderr_text = stderr_tmp.read().decode("utf-8", errors="replace")
+        view_proc.wait()
+        if proc.returncode != 0 or view_proc.returncode != 0:
+            view_stderr_tmp.seek(0)
+            query_stderr_tmp.seek(0)
+            view_err = view_stderr_tmp.read().decode("utf-8", errors="replace").strip()
+            query_err = query_stderr_tmp.read().decode("utf-8", errors="replace").strip()
             raise RuntimeError(
-                f"bcftools query failed (exit {proc.returncode}) on {vcf_name}"
+                f"bcftools pipeline failed on {vcf_name}"
                 + (f" region {region}" if region else "")
-                + f": {stderr_text.strip()}"
+                + f" (view exit {view_proc.returncode}, query exit {proc.returncode}). "
+                + f"view stderr: {view_err}  query stderr: {query_err}"
             )
     except BaseException:
-        proc.kill()
-        proc.wait()
+        for sub in (proc, view_proc):
+            try:
+                sub.kill()
+            except OSError:
+                pass
+            sub.wait()
         raise
     finally:
         try:
             proc.stdout.close()
         except OSError:
             pass
-        stderr_tmp.close()
+        view_stderr_tmp.close()
+        query_stderr_tmp.close()
 
     _flush_buffers()
     geno_fh.close()
