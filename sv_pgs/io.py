@@ -832,11 +832,19 @@ def load_multi_source_dataset_from_files(
 
     # Phase 2: intersect to samples present in every source. Preserve the
     # first source's order so subsequent runs see a stable sample ordering
-    # (downstream caching keys off that order).
+    # (downstream caching keys off that order). De-dupe defensively — sample
+    # IDs *should* be unique in every source, but a malformed VCF header or
+    # corrupt .fam could leak a duplicate which would otherwise propagate
+    # silently into the sample table.
     common_set = set(per_source_sample_ids[0])
     for ids in per_source_sample_ids[1:]:
         common_set &= set(ids)
-    common_ordered = [sid for sid in per_source_sample_ids[0] if sid in common_set]
+    seen_common: set[str] = set()
+    common_ordered: list[str] = []
+    for sid in per_source_sample_ids[0]:
+        if sid in common_set and sid not in seen_common:
+            seen_common.add(sid)
+            common_ordered.append(sid)
     log(f"  sample intersection across {len(source_specs)} sources: {len(common_ordered):,} samples")
     if not common_ordered:
         raise RuntimeError("No samples in common across genotype sources.")

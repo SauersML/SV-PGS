@@ -518,16 +518,36 @@ def _build_aou_run_metadata(
     }
 
 
-# Set of valid --variants choices. Mirrored in the CLI argparse `choices=`.
+# Canonical --variants choices. The CLI exposes a few aliases on top of these
+# ("snv" for "snp", "sv+snp"/"snv+sv"/"sv+snv" for "snp+sv") which
+# _normalize_variants_choice folds back into one of these three tokens. Keeping
+# the canonical set tight means downstream branches stay easy to reason about.
 _AOU_VARIANT_CHOICES = ("sv", "snp", "snp+sv")
+_AOU_VARIANT_ALIASES: dict[str, str] = {
+    "sv": "sv",
+    "snp": "snp",
+    "snv": "snp",
+    "snp+sv": "snp+sv",
+    "snv+sv": "snp+sv",
+    "sv+snp": "snp+sv",
+    "sv+snv": "snp+sv",
+}
 
 
 def _normalize_variants_choice(variants: str) -> str:
-    if variants not in _AOU_VARIANT_CHOICES:
+    """Map a user-facing --variants token to one of the three canonical choices.
+
+    Accepts the technical-term variation "snv" wherever "snp" is meaningful,
+    and both orderings of the +-separated joint form. Raises if the token is
+    none of those — argparse already filters at the CLI boundary but the
+    Python entrypoint is also reachable from tests and notebooks.
+    """
+    canonical = _AOU_VARIANT_ALIASES.get(variants)
+    if canonical is None:
         raise ValueError(
-            f"variants must be one of {_AOU_VARIANT_CHOICES}; got {variants!r}"
+            f"variants must be one of {sorted(_AOU_VARIANT_ALIASES)}; got {variants!r}"
         )
-    return variants
+    return canonical
 
 
 def _aou_metadata_equivalent(existing: dict[str, object], current: dict[str, object]) -> bool:
@@ -562,14 +582,19 @@ def run_all_of_us(
     n_pcs: int = 10,
     max_outer_iterations: int = 30,
     random_seed: int = 0,
-    variants: str = "sv",
+    variants: str = "snp+sv",
 ) -> None:
     """Full AoU pipeline: download requested chromosomes, merge them, and run one fit.
 
     `variants` selects the genotype sources fed into the joint model:
-      "sv"      — AoU srWGS SV VCFs only (the historical default, 97k samples).
-      "snp"     — AoU microarray PLINK only (447k samples).
-      "snp+sv"  — both, intersected to the SV cohort (97k samples).
+      "snp+sv"  — joint (default): AoU srWGS SV VCFs + AoU microarray PLINK,
+                  intersected to the 97k-sample SV cohort.
+      "sv"      — AoU srWGS SV VCFs only (97k samples).
+      "snp"     — AoU microarray PLINK only (~447k samples).
+
+    "snv" is accepted as an alias for "snp" and the joint form may be
+    written in either order ("sv+snp", "snv+sv", etc.); the metadata file
+    always records the canonical form.
     """
     variants = _normalize_variants_choice(variants)
     chromosomes = _validate_aou_chromosomes(chromosomes)
@@ -693,8 +718,22 @@ def run_all_of_us(
             uncached_chrs.append(f"chr{chrom}(parallel-partial)")
         else:
             uncached_chrs.append(f"chr{chrom}")
-    log(f"  VCF cached ({len(cached_chrs)}): {', '.join(cached_chrs) if cached_chrs else 'none'}")
-    log(f"  VCF needed ({len(uncached_chrs)}): {', '.join(uncached_chrs) if uncached_chrs else 'none — all cached!'}")
+    # Skip SV-VCF status lines when running --variants snp, since we won't
+    # download or precache them at all.
+    if variants in ("sv", "snp+sv"):
+        log(f"  SV VCF cached ({len(cached_chrs)}): {', '.join(cached_chrs) if cached_chrs else 'none'}")
+        log(f"  SV VCF needed ({len(uncached_chrs)}): {', '.join(uncached_chrs) if uncached_chrs else 'none — all cached!'}")
+    if variants in ("snp", "snp+sv"):
+        # Microarray PLINK is one trio; either all three files are local or
+        # we re-download. Report the aggregate state once instead of three
+        # confusing lines.
+        array_bed = local_array_plink_path(work_dir)
+        array_present = all(
+            array_bed.with_suffix(f".{extension}").exists()
+            for extension in ("bed", "bim", "fam")
+        )
+        log(f"  microarray PLINK trio: {'DONE' if array_present else 'NEEDED'}")
+    log(f"  variants source: {variants}")
     summary_path = work_dir / "summary.json.gz"
     log(f"  model fitted:    {'DONE' if summary_path.exists() else 'NEEDED'}")
     log("===================")

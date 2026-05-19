@@ -55,12 +55,22 @@ def build_parser() -> argparse.ArgumentParser:
     aou_run_parser.add_argument("--random-seed", type=int, default=0)
     aou_run_parser.add_argument(
         "--variants",
-        default="sv",
-        choices=("sv", "snp", "snp+sv"),
+        # Default is the joint model — array SNPs typically add the most
+        # explained variance to a PGS and SVs sharpen tagged-region effects;
+        # restricting to either alone is an opt-out, not the common case.
+        default="snp+sv",
+        # "snv" is accepted as an alias for "snp" since SNVs and SNPs are
+        # used interchangeably in much of the polygenic-score literature.
+        # _normalize_variants_choice() canonicalizes it back to "snp" so the
+        # rest of the pipeline only ever sees the three canonical choices.
+        choices=("sv", "snp", "snv", "snp+sv", "snv+sv", "sv+snp", "sv+snv"),
         help=(
-            "Genotype sources for the model. 'sv' (default) uses AoU srWGS SV "
-            "VCFs only (97k samples). 'snp' uses the AoU microarray PLINK trio "
-            "(447k samples). 'snp+sv' uses both, intersected to the SV cohort."
+            "Genotype sources for the model. 'snp+sv' (default) is the joint "
+            "model: AoU microarray PLINK SNPs (447k samples, ~700k variants) "
+            "PLUS AoU srWGS SV VCFs (97k samples, ~1.7M variants), intersected "
+            "to the SV cohort. 'sv' restricts to SVs only. 'snp' (alias 'snv') "
+            "restricts to microarray SNPs only. The +-separated forms accept "
+            "either ordering."
         ),
     )
 

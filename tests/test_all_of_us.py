@@ -715,6 +715,7 @@ def test_run_all_of_us_runs_single_unified_fit_and_reuses_cached_downloads(monke
         disease="heart_failure",
         chromosomes=[1, 2],
         output_base=str(tmp_path),
+        variants="sv",
     )
 
     cache_dir = aou_runner.local_sv_vcf_cache_dir(tmp_path)
@@ -854,6 +855,7 @@ def test_run_all_of_us_skips_existing_fit_only_when_run_metadata_matches(monkeyp
         chromosomes=[1, 2],
         output_base=str(tmp_path),
         n_pcs=2,
+        variants="sv",
     )
 
 
@@ -931,6 +933,7 @@ def test_run_all_of_us_reruns_when_existing_fit_metadata_differs(monkeypatch, tm
         chromosomes=[1, 2],
         output_base=str(tmp_path),
         n_pcs=3,
+        variants="sv",
     )
 
     cache_dir = aou_runner.local_sv_vcf_cache_dir(tmp_path)
@@ -942,6 +945,7 @@ def test_run_all_of_us_reruns_when_existing_fit_metadata_differs(monkeypatch, tm
     rerun_metadata = json.loads(aou_runner._aou_run_metadata_path(tmp_path).read_text(encoding="utf-8"))
     assert rerun_metadata["requested_n_pcs"] == 3
     assert rerun_metadata["effective_pc_columns"] == ["PC1", "PC2", "PC3"]
+    assert rerun_metadata["variants"] == "sv"
 
 
 def test_run_all_of_us_raises_when_parallel_precache_fails(monkeypatch, tmp_path: Path):
@@ -987,6 +991,7 @@ def test_run_all_of_us_raises_when_parallel_precache_fails(monkeypatch, tmp_path
             chromosomes=[1],
             output_base=str(tmp_path),
             n_pcs=2,
+            variants="sv",
         )
 
 def _read_tsv_rows(path: Path) -> list[dict[str, str]]:
