@@ -179,6 +179,65 @@ def compute_variant_statistics(
     )
 
 
+def compute_marginal_z_scores(
+    standardized_genotypes: StandardizedGenotypeMatrix,
+    active_variant_indices: np.ndarray,
+    covariate_matrix: np.ndarray,
+    target_vector: np.ndarray,
+) -> np.ndarray:
+    """Marginal univariate z-scores, residualized on covariates.
+
+    For each active variant j:
+        beta_marg_j = X_j_std^T y_resid / n
+        z_j = X_j_std^T y_resid / sqrt(n * sigma2_resid)
+    where y_resid is the residual of y after the OLS projection onto the
+    covariate columns. Under the null hypothesis of no marginal association
+    (after covariate adjustment) and well-behaved standardization, z_j is
+    approximately N(0, 1). For binary y the linearized z is a Rao-score-style
+    statistic with the same asymptotic null distribution.
+
+    The returned array is aligned with `active_variant_indices` (one z-score
+    per active variant). Used by the budget-aware variant cap to drop noise
+    variants that would otherwise force the slow stochastic-block fallback.
+    """
+    target_f64 = np.asarray(target_vector, dtype=np.float64).reshape(-1)
+    n = target_f64.shape[0]
+    if active_variant_indices.size == 0 or n == 0:
+        return np.zeros(active_variant_indices.shape[0], dtype=np.float32)
+
+    covariate_f64 = np.asarray(covariate_matrix, dtype=np.float64)
+    if covariate_f64.ndim != 2 or covariate_f64.shape[0] != n:
+        raise ValueError(
+            f"covariate_matrix must have shape ({n}, _); got {covariate_f64.shape}"
+        )
+
+    if covariate_f64.shape[1] == 0:
+        y_resid = target_f64 - float(target_f64.mean())
+    else:
+        # Solve the small covariate OLS problem (n × p_cov, p_cov is typically
+        # < 30). lstsq handles rank-deficient designs (e.g., redundant
+        # intercept) gracefully.
+        alpha_cov, _, _, _ = np.linalg.lstsq(covariate_f64, target_f64, rcond=None)
+        y_resid = target_f64 - covariate_f64 @ alpha_cov
+
+    sigma2_resid = float(np.dot(y_resid, y_resid) / max(n, 1))
+    if sigma2_resid <= 0.0:
+        return np.zeros(active_variant_indices.shape[0], dtype=np.float32)
+
+    # X_std^T y_resid over the active variants only — one streaming pass via
+    # the existing transpose_matvec infrastructure.
+    active_subset = standardized_genotypes.subset(np.asarray(active_variant_indices, dtype=np.int32))
+    sum_xy = np.asarray(
+        active_subset.transpose_matvec_numpy(y_resid.astype(np.float32)),
+        dtype=np.float64,
+    ).reshape(-1)
+
+    z_denominator = float(np.sqrt(float(n) * sigma2_resid))
+    if z_denominator <= 0.0:
+        return np.zeros(active_variant_indices.shape[0], dtype=np.float32)
+    return (sum_xy / z_denominator).astype(np.float32)
+
+
 def _allele_frequencies_from_means(
     means: np.ndarray,
     dosage_like: np.ndarray,

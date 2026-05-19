@@ -54,6 +54,19 @@ def build_parser() -> argparse.ArgumentParser:
     aou_run_parser.add_argument("--max-outer-iterations", type=int, default=40)
     aou_run_parser.add_argument("--random-seed", type=int, default=0)
     aou_run_parser.add_argument(
+        "--marginal-screen-min-abs-z",
+        type=float,
+        default=1.0,
+        help=(
+            "Univariate |z| pre-screen threshold (residualized on covariates; "
+            "null distribution ~ N(0, 1)). After the MAF filter, variants below "
+            "this threshold are dropped before the joint Bayesian fit. Default "
+            "1.0 cuts the noise tail in half on biobank-scale data so the joint "
+            "matrix fits on a 16 GB GPU and the deterministic CAVI path runs. "
+            "Set to 0 to disable, 1.5 or 2.0 for tighter screening."
+        ),
+    )
+    aou_run_parser.add_argument(
         "--test-fraction",
         type=float,
         default=0.2,
@@ -120,6 +133,15 @@ def build_parser() -> argparse.ArgumentParser:
     run_parser.add_argument("--output-dir", required=True, help="Directory for artifact and result tables.")
     run_parser.add_argument("--max-outer-iterations", type=int, default=40)
     run_parser.add_argument("--random-seed", type=int, default=0)
+    run_parser.add_argument(
+        "--marginal-screen-min-abs-z",
+        type=float,
+        default=0.0,
+        help=(
+            "Univariate |z| pre-screen threshold (residualized on covariates). "
+            "0.0 disables. See run-all-of-us --marginal-screen-min-abs-z for details."
+        ),
+    )
 
     eval_parser = subparsers.add_parser(
         "evaluate-all-of-us",
@@ -173,6 +195,7 @@ def main(argv: list[str] | None = None) -> int:
             random_seed=args.random_seed,
             variants=args.variants,
             test_fraction=args.test_fraction,
+            marginal_screen_min_abs_z=args.marginal_screen_min_abs_z,
         )
         return 0
 
@@ -214,6 +237,7 @@ def main(argv: list[str] | None = None) -> int:
     config = ModelConfig(
         max_outer_iterations=args.max_outer_iterations,
         random_seed=args.random_seed,
+        marginal_screen_min_abs_z=args.marginal_screen_min_abs_z,
     )
     dataset = load_dataset_from_files(
         genotype_path=args.genotypes,

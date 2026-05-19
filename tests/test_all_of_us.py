@@ -366,6 +366,7 @@ def test_cli_run_all_of_us_forwards_core_settings(monkeypatch, tmp_path: Path):
         "random_seed": 0,
         "variants": "snp+sv",
         "test_fraction": 0.2,
+        "marginal_screen_min_abs_z": 1.0,
     }
 
 
@@ -860,6 +861,7 @@ def test_run_all_of_us_skips_existing_fit_only_when_run_metadata_matches(monkeyp
         n_pcs=2,
         variants="sv",
         test_fraction=0.0,
+        marginal_screen_min_abs_z=0.0,
     )
 
 

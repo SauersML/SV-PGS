@@ -31,6 +31,7 @@ from sv_pgs.numeric import stable_sigmoid
 from sv_pgs.preprocessing import (
     Preprocessor,
     build_tie_map,
+    compute_marginal_z_scores,
     compute_variant_statistics,
     fit_preprocessor_from_stats,
 )
@@ -192,6 +193,11 @@ def _fit_stage_cache_paths(
     _update_hash_with_array_bytes(structure_hasher, np.asarray(allele_frequencies, dtype=np.float32))
     _update_hash_with_array_bytes(structure_hasher, np.asarray(means, dtype=np.float32))
     _update_hash_with_array_bytes(structure_hasher, np.asarray(scales, dtype=np.float32))
+    # marginal_screen_min_abs_z changes the active-variant set, so it must
+    # participate in the structure-cache key. covariates/targets are folded
+    # into the fit-stage key below; together they form the unique seed for
+    # the prescreen output.
+    structure_hasher.update(np.asarray([config.marginal_screen_min_abs_z], dtype=np.float64).tobytes())
     structure_key = structure_hasher.hexdigest()[:24]
     fit_hasher = hashlib.sha256()
     fit_hasher.update(f"fit-stage-fit-v{_FIT_STAGE_CACHE_VERSION}".encode("utf-8"))
@@ -693,6 +699,33 @@ class BayesianPGS:
                 minimum_minor_allele_frequency=self.config.minimum_minor_allele_frequency,
             )
             log(f"active variants: {len(active_variant_indices)} / {total_variant_count} ({100.0*len(active_variant_indices)/max(total_variant_count,1):.1f}%)")
+            if self.config.marginal_screen_min_abs_z > 0.0 and active_variant_indices.size > 0:
+                log(
+                    f"applying marginal pre-screen at |z| >= {self.config.marginal_screen_min_abs_z:.2f}  "
+                    f"(residualized on {prepared_arrays.covariates.shape[1]} covariates)..."
+                )
+                pre_screen_count = int(active_variant_indices.size)
+                marginal_z_scores = compute_marginal_z_scores(
+                    standardized_genotypes=standardized_genotypes,
+                    active_variant_indices=active_variant_indices,
+                    covariate_matrix=prepared_arrays.covariates,
+                    target_vector=prepared_arrays.targets,
+                )
+                z_pass_mask = np.abs(marginal_z_scores) >= self.config.marginal_screen_min_abs_z
+                kept_count = int(np.sum(z_pass_mask))
+                if kept_count == 0:
+                    log(
+                        "  marginal pre-screen kept 0 variants — disabling screen to avoid "
+                        "fitting a covariates-only model on a poorly calibrated z-score."
+                    )
+                else:
+                    active_variant_indices = np.asarray(
+                        active_variant_indices[z_pass_mask], dtype=np.int32
+                    )
+                    log(
+                        f"  marginal pre-screen kept {kept_count} of {pre_screen_count} variants  "
+                        f"({100.0 * kept_count / pre_screen_count:.1f}% of post-MAF)"
+                    )
         else:
             active_variant_indices, reduced_tie_map, reduced_genotypes, local_cache = cached_fit_stage
             log(

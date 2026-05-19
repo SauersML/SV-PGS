@@ -129,6 +129,18 @@ class ModelConfig:
     posterior_variance_probe_count: int = 24
     beta_variance_update_interval: int = 2
     minimum_minor_allele_frequency: float = 1e-2
+    # Marginal-univariate |z| pre-screen threshold. After the MAF filter,
+    # variants with |z_j| (residualized on covariates, normalized so null ~
+    # N(0,1)) below this value are dropped before joint fitting. 0.0 disables
+    # the screen (default — no behavior change for existing callers).
+    # Recommended values:
+    #   1.5  — drops ~87% of pure-noise variants (Φ⁻¹(0.13)); a common PRS
+    #          marginal-then-joint-fit practice.
+    #   2.0  — drops ~95% of nulls (~p<0.05 per variant) — aggressive; risks
+    #          losing small-effect signal.
+    # Set on the runner / CLI when the joint matrix would otherwise exceed
+    # the GPU budget; below the budget the fast deterministic CAVI path runs.
+    marginal_screen_min_abs_z: float = 0.0
 
     sample_space_preconditioner_rank: int = 256
     validation_interval: int = 1
@@ -200,6 +212,8 @@ class ModelConfig:
             raise ValueError("beta_variance_update_interval must be positive.")
         if not 0.0 <= self.minimum_minor_allele_frequency < 0.5:
             raise ValueError("minimum_minor_allele_frequency must lie in [0.0, 0.5).")
+        if self.marginal_screen_min_abs_z < 0.0:
+            raise ValueError("marginal_screen_min_abs_z must be non-negative.")
         if self.sample_space_preconditioner_rank < 0:
             raise ValueError("sample_space_preconditioner_rank must be non-negative.")
         if self.validation_interval < 1:

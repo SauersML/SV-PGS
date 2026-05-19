@@ -748,15 +748,16 @@ def test_precache_vcfs_parallel_reuses_completed_region_outputs(monkeypatch: pyt
             for task in tasks:
                 scheduled_tasks.append(task)
                 _vcf_path_str, _region, _keep_list, output_prefix, _threads = task
+                region_index = int(Path(output_prefix).name.split("_")[1])
                 Path(f"{output_prefix}.geno").write_bytes(np.array([2, 0], dtype=np.int8).tobytes())
                 io_module._write_variant_metadata(
                     Path(f"{output_prefix}.variants.npz"),
                     [
                         _VariantDefaults(
-                            variant_id="var1",
+                            variant_id=f"var{region_index}",
                             variant_class=VariantClass.SNV,
                             chromosome="1",
-                            position=200,
+                            position=100 * (region_index + 1),
                             length=1.0,
                             allele_frequency=0.50,
                             quality=40.0,
@@ -784,19 +785,31 @@ def test_precache_vcfs_parallel_reuses_completed_region_outputs(monkeypatch: pyt
 
     io_module.precache_vcfs_parallel([vcf_path], config)
 
-    assert len(scheduled_tasks) == 1
-    assert scheduled_tasks[0][3] == str(region1_prefix)
-    assert scheduled_tasks[0][4] == 2
+    assert len(scheduled_tasks) == 5
+    assert [task[3] for task in scheduled_tasks] == [
+        str(region1_prefix),
+        str(tmp_dir / "region_2"),
+        str(tmp_dir / "region_3"),
+        str(tmp_dir / "region_4"),
+        str(tmp_dir / "region_5"),
+    ]
+    assert all(task[4] == 1 for task in scheduled_tasks)
 
     cached = _load_vcf_from_cache(vcf_path=vcf_path, config=config)
     assert cached is not None
     genotype_matrix, variants, variant_stats = cached
     np.testing.assert_array_equal(
         np.asarray(genotype_matrix),
-        np.array([[0, 2], [1, 0]], dtype=np.int8),
+        np.array(
+            [
+                [0, 2, 2, 2, 2, 2],
+                [1, 0, 0, 0, 0, 0],
+            ],
+            dtype=np.int8,
+        ),
     )
-    assert [variant.variant_id for variant in variants] == ["var0", "var1"]
-    np.testing.assert_allclose(variant_stats.means, np.array([0.5, 1.0], dtype=np.float32))
+    assert [variant.variant_id for variant in variants] == ["var0", "var1", "var2", "var3", "var4", "var5"]
+    np.testing.assert_allclose(variant_stats.means, np.array([0.5, 1.0, 1.0, 1.0, 1.0, 1.0], dtype=np.float32))
 
 
 def test_load_dataset_from_plink_auto_detects_person_id_column(tmp_path: Path):

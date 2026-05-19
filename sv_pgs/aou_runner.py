@@ -502,6 +502,7 @@ def _build_aou_run_metadata(
     variant_metadata_path: str | None,
     variants: str,
     test_fraction: float = 0.0,
+    marginal_screen_min_abs_z: float = 0.0,
 ) -> dict[str, object]:
     return {
         "disease": disease,
@@ -520,6 +521,9 @@ def _build_aou_run_metadata(
         # to 0.1 triggers a re-fit. Stored at 6-digit precision to keep the
         # JSON canonical across host float formatting differences.
         "test_fraction": round(float(test_fraction), 6),
+        # |z| pre-screen threshold changes the active-variant set; if a user
+        # tightens or loosens the screen, the cached fit no longer matches.
+        "marginal_screen_min_abs_z": round(float(marginal_screen_min_abs_z), 6),
     }
 
 
@@ -560,6 +564,8 @@ def _aou_metadata_equivalent(existing: dict[str, object], current: dict[str, obj
 
     - Older runs predate the "variants" key; assume the historical SV default.
     - Older runs predate the "test_fraction" key; assume 0 (no holdout).
+    - Older runs predate the "marginal_screen_min_abs_z" key; assume 0 (no screen),
+      which is also the global ModelConfig default.
     Filling in those defaults stops a default-flip from spuriously invalidating
     every previously-produced result directory.
     """
@@ -571,6 +577,8 @@ def _aou_metadata_equivalent(existing: dict[str, object], current: dict[str, obj
         existing["variants"] = "sv"
     if "test_fraction" not in existing:
         existing["test_fraction"] = 0.0
+    if "marginal_screen_min_abs_z" not in existing:
+        existing["marginal_screen_min_abs_z"] = 0.0
     return existing == current
 
 
@@ -647,6 +655,7 @@ def run_all_of_us(
     random_seed: int = 0,
     variants: str = "snp+sv",
     test_fraction: float = 0.2,
+    marginal_screen_min_abs_z: float = 1.0,
 ) -> None:
     """Full AoU pipeline: download requested chromosomes, merge them, and run one fit.
 
@@ -665,6 +674,15 @@ def run_all_of_us(
     Pass 0.0 to train on every available sample and skip the held-out AUC.
     The split is deterministic per seed so reruns reproduce the same
     train/test assignment.
+
+    `marginal_screen_min_abs_z` is a univariate marginal-|z| floor applied
+    after the MAF filter and before the joint Bayesian fit. Variants with
+    |z| below this threshold (residualized on covariates; null distribution
+    ~ N(0,1)) are dropped. The default 1.0 drops ~32% of pure-noise variants
+    on biobank-scale data, typically cutting the joint matrix to fit a 16 GB
+    GPU so the deterministic CAVI path runs (≈ 10× faster than the
+    stochastic-block fallback) and removing noise that hurts held-out AUC.
+    Set to 0.0 to disable; 1.5 or 2.0 for tighter screening.
     """
     variants = _normalize_variants_choice(variants)
     chromosomes = _validate_aou_chromosomes(chromosomes)
@@ -694,6 +712,7 @@ def run_all_of_us(
     config = ModelConfig(
         max_outer_iterations=max_outer_iterations,
         random_seed=random_seed,
+        marginal_screen_min_abs_z=marginal_screen_min_abs_z,
     )
 
     # Status summary: what's done vs what's left
@@ -849,6 +868,7 @@ def run_all_of_us(
         variant_metadata_path=str(resolved_variant_metadata_path) if resolved_variant_metadata_path is not None else None,
         variants=variants,
         test_fraction=test_fraction,
+        marginal_screen_min_abs_z=marginal_screen_min_abs_z,
     )
     if summary_path.exists():
         if run_metadata_path.exists():
