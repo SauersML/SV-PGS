@@ -1769,14 +1769,18 @@ def precache_vcfs_parallel(
 
     total_size = sum(v[2] for v in vcf_info.values())
 
-    # Allocate workers proportional to file size. We deliberately do NOT
-    # oversplit relative to CPU count: cyvcf2's tabix region iteration carries
-    # a per-record bounds-check cost that streaming the whole file avoids, so
-    # extra regions slow each worker down instead of adding throughput.
+    # Allocate workers proportional to file size. With the bcftools backend
+    # `view -r chr:start-end` jumps directly to the requested BGZF blocks via
+    # the .tbi index, so per-record overhead is minimal — unlike cyvcf2's
+    # region iterator. We oversplit ~3x relative to CPU count so the pool has
+    # small tasks: better tail-latency, better load balancing, and a kill
+    # mid-run only loses the records since the last region boundary instead
+    # of the whole chromosome.
     allocation: dict[Path, int] = {}
+    oversplit_factor = 3
     for vcf_path, (chrom, chrom_length, file_size) in vcf_info.items():
         share = file_size / max(total_size, 1)
-        n_workers = max(1, round(share * total_cpus))
+        n_workers = max(1, round(share * total_cpus * oversplit_factor))
         # Can't split if we don't know the contig length
         if chrom_length <= 0:
             n_workers = 1
