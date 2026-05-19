@@ -2131,33 +2131,27 @@ def precache_vcfs_parallel(
 
     total_cpus = os.cpu_count() or 4
 
-    # Audit existing caches and surface anything suspicious. We *never*
-    # invalidate a complete cache here: the multi-VCF load path runs a
-    # global (chr, pos, variant_id) dedup that resolves any residual
-    # within-cache or cross-cache duplicates without re-parsing. The only
-    # repair we still run is the in-place dedupe-and-rewrite — that just
-    # normalizes a cache, no re-parsing, no data lost.
+    # Audit existing caches and surface anything suspicious — but never touch
+    # the bytes on disk. The load path runs a global (chr, pos, variant_id)
+    # dedup that reconciles within-cache and cross-cache duplicates in memory,
+    # so rewriting the cache here would burn ~5 min per chromosome (a 14 GB
+    # rewrite per file) for no behavioral change.
+    audited = 0
+    suspicious = 0
     for vcf_path in vcf_paths:
         cache_paths = _vcf_cache_paths(vcf_path, config)
         if not _is_vcf_cache_bundle_complete(cache_paths):
             continue
+        audited += 1
         reason = _vcf_cache_audit_reason(vcf_path, cache_paths)
         if reason is None:
             continue
-        if reason.startswith("variant_ids contain duplicates"):
-            try:
-                removed = _repair_vcf_cache_duplicates(vcf_path, cache_paths, config)
-                log(f"  deduped cache for {vcf_path.name}: removed {removed} duplicate rows in place")
-            except (OSError, RuntimeError, ValueError) as exc:
-                log(
-                    f"  in-place dedupe failed for {vcf_path.name} ({exc}); "
-                    "load-time cross-source dedup will reconcile it"
-                )
-            continue
+        suspicious += 1
         log(
             f"  audit note for {vcf_path.name}: {reason} "
-            "(cache left in place; load-time dedup will reconcile duplicates)"
+            "(cache left in place; load-time dedup will drop residual duplicates)"
         )
+    log(f"  audit complete: {audited} caches checked, {suspicious} flagged (none rewritten)")
 
     # Skip already-cached VCFs under the current cache key only.
     uncached: list[Path] = []
