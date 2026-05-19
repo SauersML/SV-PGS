@@ -502,9 +502,11 @@ def load_dataset_from_files(
             variant_count=plink_metadata.variant_count,
             total_sample_count=total_fam_samples,
         )
-        log("computing variant statistics (single pass, JAX)...")
-        variant_stats = compute_variant_statistics(
+        log("computing variant statistics (single pass, JAX; disk-cached)...")
+        variant_stats = compute_plink_variant_statistics_cached(
             raw_genotypes,
+            bed_path=source_path,
+            sample_indices=aligned_sample_indices,
             config=config,
         )
         log("building PLINK variant defaults from pre-computed allele frequencies...")
@@ -895,8 +897,13 @@ def load_multi_source_dataset_from_files(
                 variant_count=meta.variant_count,
                 total_sample_count=len(meta.sample_ids),
             )
-            log(f"  computing variant statistics for {path.name} (single PLINK streaming pass)...")
-            stats = compute_variant_statistics(raw, config=config)
+            log(f"  computing variant statistics for {path.name} (single PLINK streaming pass; disk-cached)...")
+            stats = compute_plink_variant_statistics_cached(
+                raw,
+                bed_path=path,
+                sample_indices=keep_indices,
+                config=config,
+            )
             variants_list = _build_plink_variant_defaults_from_stats(path, stats)
         raw_matrices.append(raw)
         per_source_variants.append(variants_list)
@@ -1353,6 +1360,92 @@ def _write_vcf_cache_stats(stats_path: Path, variant_stats: VariantStatistics) -
     stats_matrix["allele_frequencies"] = np.asarray(variant_stats.allele_frequencies, dtype=np.float32)
     stats_matrix["support_counts"] = np.asarray(variant_stats.support_counts, dtype=np.int32)
     np.save(stats_path, stats_matrix, allow_pickle=False)
+
+
+def _plink_stats_cache_key(
+    bed_path: Path,
+    sample_indices: np.ndarray,
+    config: ModelConfig,
+) -> str:
+    """Stable hex digest identifying a PLINK variant-stats computation.
+
+    Stats depend on the .bed contents, which samples we compute over, and
+    the minimum_scale floor used in _scales_from_centered_sum_squares — but
+    nothing else. The sample-subset goes into the hash so train/test splits
+    keyed off the sample table produce distinct cache entries; the bed
+    fingerprint goes in so re-downloaded bytes never reuse stale stats.
+    """
+    h = hashlib.sha256()
+    h.update(f"plink-stats-v{_CACHE_VERSION}:".encode())
+    h.update(str(bed_path.resolve()).encode())
+    h.update(_cache_file_fingerprint(bed_path))
+    h.update(f"minimum_scale={config.minimum_scale:.17g}".encode())
+    sample_array = np.ascontiguousarray(np.asarray(sample_indices, dtype=np.int64))
+    h.update(f"sample_count={sample_array.shape[0]}".encode())
+    h.update(sample_array.tobytes())
+    return h.hexdigest()[:24]
+
+
+def _plink_stats_cache_path(
+    bed_path: Path,
+    sample_indices: np.ndarray,
+    config: ModelConfig,
+) -> Path:
+    cache_dir = _vcf_cache_dir(bed_path)
+    key = _plink_stats_cache_key(bed_path, sample_indices, config)
+    return cache_dir / f"plink_stats_{key}.npy"
+
+
+def _load_plink_stats_from_cache(stats_path: Path) -> VariantStatistics | None:
+    if not stats_path.exists():
+        return None
+    try:
+        return _load_vcf_cache_stats(stats_path)
+    except (OSError, ValueError, KeyError) as exc:
+        log(f"  PLINK stats cache at {stats_path.name} unreadable ({exc!r}); recomputing")
+        return None
+
+
+def _write_plink_stats_cache(stats_path: Path, variant_stats: VariantStatistics) -> None:
+    """Write atomically: build .tmp.npy then rename so interrupted runs
+    never leave a half-written file the next run would read as a cache
+    hit. The .tmp prefix sits BEFORE the .npy extension because np.save
+    auto-appends '.npy' to any path that doesn't already end in it.
+    """
+    stats_path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = stats_path.with_suffix(".tmp.npy")
+    _write_vcf_cache_stats(tmp_path, variant_stats)
+    tmp_path.replace(stats_path)
+
+
+def compute_plink_variant_statistics_cached(
+    raw_genotypes: PlinkRawGenotypeMatrix,
+    bed_path: Path,
+    sample_indices: np.ndarray,
+    config: ModelConfig,
+) -> VariantStatistics:
+    """compute_variant_statistics on a PLINK source, with disk caching.
+
+    The cache lives next to the .bed file in `.sv_pgs_cache/` so it
+    persists across runs the same way the SV VCF int8/stats caches do.
+    A miss runs the normal one-pass JAX streaming computation (typically
+    ~10 min on a 16-core VM with the parallel-decode plink reader) and
+    writes the result atomically; a hit loads ~30 MB of numpy in a few
+    milliseconds.
+    """
+    stats_path = _plink_stats_cache_path(bed_path, sample_indices, config)
+    cached = _load_plink_stats_from_cache(stats_path)
+    if cached is not None:
+        log(f"  PLINK stats cache hit: {stats_path.name} ({cached.means.shape[0]:,} variants)  mem={mem()}")
+        return cached
+    log(f"  PLINK stats cache miss: computing fresh and writing to {stats_path.name}")
+    variant_stats = compute_variant_statistics(raw_genotypes, config=config)
+    try:
+        _write_plink_stats_cache(stats_path, variant_stats)
+        log(f"  PLINK stats cache saved ({stats_path.stat().st_size / 1e6:.1f} MB)  mem={mem()}")
+    except OSError as exc:
+        log(f"  PLINK stats cache write failed ({exc!r}); continuing without cache")
+    return variant_stats
 
 
 def _vcf_cache_audit_reason(vcf_path: Path, paths: _VcfCachePaths) -> str | None:
