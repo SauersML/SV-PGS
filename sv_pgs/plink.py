@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import os
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal
@@ -13,6 +15,17 @@ PLINK_MISSING_INT8 = np.int8(-127)
 _DECODE_LOOKUP_A1 = np.array([2, PLINK_MISSING_INT8, 1, 0], dtype=np.int8)
 _DECODE_LOOKUP_A2 = np.array([0, PLINK_MISSING_INT8, 1, 2], dtype=np.int8)
 _ENCODE_LOOKUP_A1 = np.array([0b11, 0b10, 0b00], dtype=np.uint8)
+
+# Minimum batch variant count to bother launching the thread pool; below this
+# the GIL-acquire and chunk-split overhead beats the parallel decode itself.
+_DECODE_PARALLEL_THRESHOLD = 256
+# Smallest per-thread chunk. Below this each worker spends more time on
+# allocation/free of the codes table than on real decode work.
+_DECODE_MIN_CHUNK = 64
+# Workers cap. More than ~16 hits diminishing returns because the decode is
+# memory-bandwidth bound past that point; this also keeps the per-call thread
+# allocation cheap.
+_DECODE_MAX_WORKERS = 16
 
 
 def to_bed(
@@ -218,13 +231,56 @@ def _decode_payload(
     raw_bytes = np.frombuffer(payload, dtype=np.uint8)
     if raw_bytes.size != variant_count * bytes_per_variant:
         raise ValueError("Unexpected PLINK 1 .bed payload length.")
+    lookup = _DECODE_LOOKUP_A1 if count_a1 else _DECODE_LOOKUP_A2
+
+    # Multi-threaded chunked decode for large batches: the per-variant work is
+    # pure-numpy bit manipulation that releases the GIL, so a thread pool
+    # gives near-linear speed-up. With one batch's intermediates running ~3-7
+    # GB (codes table + lookup result), chunking also keeps the working set
+    # closer to last-level cache size and reduces allocator pressure.
+    # AoU PLINK array: variant_count≈6,435 → 16 chunks of ~400 variants each
+    # decode in parallel; per-batch wall drops from ~25 s single-threaded to a
+    # few seconds on a 16-core VM. The threshold below avoids thread overhead
+    # on the per-variant read path (variant_count==1 hit by the gather branch
+    # of _read_int8_matrix).
+    if variant_count >= _DECODE_PARALLEL_THRESHOLD:
+        n_workers = min(os.cpu_count() or 1, _DECODE_MAX_WORKERS)
+        if n_workers > 1:
+            chunk_size = max((variant_count + n_workers - 1) // n_workers, _DECODE_MIN_CHUNK)
+            chunk_starts = list(range(0, variant_count, chunk_size))
+            chunks = [
+                (start, min(start + chunk_size, variant_count))
+                for start in chunk_starts
+            ]
+            output = np.empty((iid_count, variant_count), dtype=np.int8)
+
+            def _decode_chunk(span: tuple[int, int]) -> None:
+                start, end = span
+                chunk_packed = raw_bytes[
+                    start * bytes_per_variant : end * bytes_per_variant
+                ].reshape(end - start, bytes_per_variant)
+                chunk_codes = np.empty(
+                    (end - start, bytes_per_variant * 4), dtype=np.uint8
+                )
+                chunk_codes[:, 0::4] = chunk_packed & 0b11
+                chunk_codes[:, 1::4] = (chunk_packed >> 2) & 0b11
+                chunk_codes[:, 2::4] = (chunk_packed >> 4) & 0b11
+                chunk_codes[:, 3::4] = (chunk_packed >> 6) & 0b11
+                output[:, start:end] = lookup[chunk_codes][:, :iid_count].T
+
+            with ThreadPoolExecutor(max_workers=n_workers) as executor:
+                # Force the iterator to exhaust so all futures run + propagate
+                # exceptions (executor.map is lazy).
+                for _ in executor.map(_decode_chunk, chunks):
+                    pass
+            return output
+
     packed = raw_bytes.reshape(variant_count, bytes_per_variant)
     codes = np.empty((variant_count, bytes_per_variant * 4), dtype=np.uint8)
     codes[:, 0::4] = packed & 0b11
     codes[:, 1::4] = (packed >> 2) & 0b11
     codes[:, 2::4] = (packed >> 4) & 0b11
     codes[:, 3::4] = (packed >> 6) & 0b11
-    lookup = _DECODE_LOOKUP_A1 if count_a1 else _DECODE_LOOKUP_A2
     return lookup[codes][:, :iid_count].T
 
 
