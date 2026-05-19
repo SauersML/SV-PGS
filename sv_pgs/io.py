@@ -1558,41 +1558,13 @@ def _parse_gt_block_to_int8(gt_block: bytes, sample_count: int) -> np.ndarray:
         dosage[missing_mask] = PLINK_MISSING_INT8
         return dosage
 
-    # Mixed widths within a single record (some samples diploid, some haploid)
-    # are extremely rare. Handle correctly via a per-sample Python loop on the
-    # offending block — slow but only triggers on truly heterogeneous records.
-    return _parse_gt_block_mixed_widths(buf, starts.tolist(), lengths.tolist())
-
-
-def _parse_gt_block_mixed_widths(
-    buf: np.ndarray, starts: list[int], lengths: list[int]
-) -> np.ndarray:
-    """Fallback parser for records whose per-sample GTs are not all the same
-    width. Slow Python loop, only used as an escape hatch.
-    """
-    sample_count = len(starts)
-    dosage = np.empty(sample_count, dtype=np.int8)
-    raw = bytes(buf)
-    for i in range(sample_count):
-        start = starts[i]
-        length = lengths[i]
-        if length == 0:
-            dosage[i] = PLINK_MISSING_INT8
-            continue
-        gt = raw[start : start + length]
-        if b"." in gt:
-            dosage[i] = PLINK_MISSING_INT8
-            continue
-        # Sum allele digits, ignoring '/' (47) and '|' (124).
-        total = 0
-        for byte_value in gt:
-            if 48 <= byte_value <= 57:
-                total += byte_value - 48
-        if total > 127:
-            dosage[i] = 127
-        else:
-            dosage[i] = total
-    return dosage
+    unique_widths = sorted({int(value) for value in np.unique(lengths).tolist()})
+    raise ValueError(
+        "bcftools GT block has mixed per-sample widths within a single record: "
+        f"observed widths {unique_widths}. All samples at a site must share "
+        "the same ploidy; this VCF record violates that. Investigate the "
+        "source file rather than papering over it."
+    )
 
 
 def _region_parse_worker(args: tuple) -> tuple[int, str]:
