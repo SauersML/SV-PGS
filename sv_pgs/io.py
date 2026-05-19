@@ -1640,8 +1640,8 @@ def _region_parse_worker(args: tuple) -> tuple[int, str]:
     resume_chunks = 0
     resume_chrom: str | None = None
     resume_pos: int | None = None
+    resumed = False
     if progress_path.exists() and region is not None:
-        resumed = False
         try:
             state = json.loads(progress_path.read_text(encoding="utf-8"))
             if (
@@ -1688,12 +1688,18 @@ def _region_parse_worker(args: tuple) -> tuple[int, str]:
                 file=sys.stderr,
                 flush=True,
             )
-        if not resumed:
-            geno_path.unlink(missing_ok=True)
-            stats_path.unlink(missing_ok=True)
-            progress_path.unlink(missing_ok=True)
-            for chunk in _region_variant_chunk_paths(output_prefix):
-                chunk.unlink(missing_ok=True)
+
+    # Always clear stale .geno/.stats/chunks if we are NOT resuming. A prior
+    # worker version (or a crash before the first checkpoint) can leave
+    # partial binary files on disk without a matching progress.json; opening
+    # them in append mode would silently concatenate stale bytes onto fresh
+    # output and produce a cache where matrix col count > variant count.
+    if not resumed:
+        geno_path.unlink(missing_ok=True)
+        stats_path.unlink(missing_ok=True)
+        progress_path.unlink(missing_ok=True)
+        for chunk in _region_variant_chunk_paths(output_prefix):
+            chunk.unlink(missing_ok=True)
 
     # Compute the bcftools region for this invocation. If we're resuming,
     # narrow the start to (last checkpointed pos + 1).
@@ -2070,6 +2076,18 @@ def precache_vcfs_parallel(
         inc_variants: list[_VariantDefaults] = []
         for region_variant_path in region_variant_paths:
             inc_variants.extend(_load_variant_metadata(region_variant_path))
+
+        # The .stats file (n_total rows) and the consolidated variant metadata
+        # must describe the same records. A mismatch means a region worker
+        # left .geno/.stats out of sync with its variants.npz — write nothing
+        # rather than persist a cache the loader can't trust.
+        if len(inc_variants) != n_total:
+            raise RuntimeError(
+                f"region cache merge inconsistency for {vcf_path.name}: "
+                f".stats has {n_total} rows but variant metadata has "
+                f"{len(inc_variants)} rows. Delete "
+                f"{cache_dir / f'{key}.tmp_parallel'} and re-run."
+            )
 
         # Load stats via structured dtype
         stats_dtype = np.dtype([("sum", "<i8"), ("sum_sq", "<i8"), ("n_valid", "<i4"), ("support", "<i4")])
