@@ -346,6 +346,79 @@ class IndexedRawGenotypeMatrix(RawGenotypeMatrix):
 
 
 @dataclass(slots=True)
+class RowSubsetRawGenotypeMatrix(RawGenotypeMatrix):
+    """Lazily expose a row-subset (sample-subset) of a child matrix.
+
+    Replaces the upfront write-temp-mmap reindex path that the multi-VCF /
+    multi-source dataset loader previously used. The earlier approach
+    materialized a brand-new (n_kept_samples, n_variants) int8 mmap on disk
+    per chromosome — for the 80/20 split on the 97k-sample AoU SV cohort
+    this writes ~11 GB to /tmp per chromosome × 22+ chromosomes, dominating
+    end-to-end wall time (>1 hour just on row reindex) and creating page-
+    cache pressure visible as a 25 GB host-RSS spike.
+
+    This wrapper instead holds the original full-sample child + a row index
+    array and applies the row selection at iteration time. Downstream uses
+    `iter_column_batches[_i8]` exclusively — each batch fetches its
+    columns from the child once (memory-mapped) and applies the row
+    indexing in a single fancy-indexed numpy slice on the resulting
+    contiguous block. No intermediate disk write, no page-cache pressure.
+
+    For repeated passes the kernel page cache covers the hot columns
+    naturally, so the lazy form is as fast or faster than the eager form
+    on any storage tier where the temp mmap is not faster than the source
+    cache. On AoU/GCP they live on the same disk, so this is always a win.
+    """
+    child: RawGenotypeMatrix
+    row_indices: np.ndarray
+
+    def __post_init__(self) -> None:
+        indices = np.asarray(self.row_indices, dtype=np.intp)
+        if indices.ndim != 1:
+            raise ValueError("row_indices must be 1D.")
+        child_row_count = int(self.child.shape[0])
+        if indices.size and (indices.min() < 0 or indices.max() >= child_row_count):
+            raise ValueError("row_indices contains an out-of-range row.")
+        self.row_indices = indices
+
+    @property
+    def shape(self) -> tuple[int, int]:
+        return int(self.row_indices.shape[0]), int(self.child.shape[1])
+
+    def iter_column_batches(
+        self,
+        variant_indices: Sequence[int] | np.ndarray | None = None,
+        batch_size: int = DEFAULT_GENOTYPE_BATCH_SIZE,
+    ) -> Iterator[RawGenotypeBatch]:
+        for batch in self.child.iter_column_batches(variant_indices=variant_indices, batch_size=batch_size):
+            yield RawGenotypeBatch(
+                variant_indices=batch.variant_indices,
+                values=np.ascontiguousarray(batch.values[self.row_indices, :]),
+            )
+
+    def iter_column_batches_i8(
+        self,
+        variant_indices: Sequence[int] | np.ndarray | None = None,
+        batch_size: int = DEFAULT_GENOTYPE_BATCH_SIZE,
+    ) -> Iterator[RawGenotypeBatch]:
+        if not _supports_int8_batches(self.child):
+            raise RuntimeError("int8 batch iteration requires the wrapped child to support iter_column_batches_i8.")
+        child = cast(Int8BatchCapable, self.child)
+        for batch in child.iter_column_batches_i8(variant_indices=variant_indices, batch_size=batch_size):
+            yield RawGenotypeBatch(
+                variant_indices=batch.variant_indices,
+                values=np.ascontiguousarray(batch.values[self.row_indices, :]),
+            )
+
+    def materialize(
+        self,
+        variant_indices: Sequence[int] | np.ndarray | None = None,
+    ) -> np.ndarray:
+        full = self.child.materialize(variant_indices)
+        return np.ascontiguousarray(full[self.row_indices, :])
+
+
+@dataclass(slots=True)
 class PlinkRawGenotypeMatrix(RawGenotypeMatrix):
     bed_path: Path
     sample_indices: np.ndarray

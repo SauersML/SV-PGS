@@ -21,6 +21,7 @@ from sv_pgs.genotype import (
     IndexedRawGenotypeMatrix,
     PlinkRawGenotypeMatrix,
     RawGenotypeMatrix,
+    RowSubsetRawGenotypeMatrix,
     as_raw_genotype_matrix,
 )
 from sv_pgs.preprocessing import compute_variant_statistics
@@ -420,7 +421,9 @@ def load_dataset_from_files(
             config=config,
             mmap_mode="r",
         )
-        genotype_matrix = _fast_mmap_row_reindex(genotype_matrix, keep_indices)
+        # Lazy row subset: wrap the mmap'd matrix instead of writing a temp
+        # mmap with the row-permuted copy. See RowSubsetRawGenotypeMatrix.
+        genotype_matrix = _lazy_row_subset(genotype_matrix, keep_indices)
 
         log(f"VCF loaded: {genotype_matrix.shape[0]} samples x {len(default_variants)} variants  mem={mem()}")
         plink_metadata = None
@@ -529,50 +532,25 @@ def load_dataset_from_files(
     )
 
 
-def _fast_mmap_row_reindex(matrix: np.ndarray, row_indices: np.ndarray) -> np.ndarray:
-    """Reindex rows of a (possibly mmap'd, column-major) matrix efficiently.
+def _lazy_row_subset(
+    matrix: np.ndarray | RawGenotypeMatrix,
+    row_indices: np.ndarray,
+) -> RawGenotypeMatrix:
+    """Apply a row subset lazily via RowSubsetRawGenotypeMatrix.
 
-    If all rows are kept in identity order, skip reindexing entirely.
-
-    If a true subset is needed, write to a temporary mmap file (not RAM)
-    and read columns in batches to avoid catastrophic random disk access
-    on column-major mmaps.  The temp-mmap approach prevents OOM when the
-    output matrix is large (e.g. 97K × 142K int8 = 13 GB).
+    Identity-row case is a pure passthrough (no wrapper). Otherwise wraps
+    the source matrix and defers the row-permutation to per-batch fetches,
+    eliminating the per-chromosome 11 GB temp-mmap write that dominated
+    AoU-scale load time.
     """
-    import tempfile
     resolved_row_indices = np.asarray(row_indices, dtype=np.intp)
-    n_rows_out = len(row_indices)
-    n_cols = matrix.shape[1]
-    if n_rows_out == matrix.shape[0] and np.array_equal(
+    source: RawGenotypeMatrix = as_raw_genotype_matrix(matrix)
+    if resolved_row_indices.shape[0] == int(source.shape[0]) and np.array_equal(
         resolved_row_indices,
-        np.arange(matrix.shape[0], dtype=np.intp),
+        np.arange(int(source.shape[0]), dtype=np.intp),
     ):
-        return matrix
-    output_bytes = int(n_rows_out) * int(n_cols) * int(matrix.dtype.itemsize)
-    log(f"    reindexing {matrix.shape[0]:,} → {n_rows_out:,} samples ({output_bytes / 1e9:.1f} GB)...")
-    # Use a temporary mmap file for large outputs to avoid OOM.
-    result: np.ndarray
-    if output_bytes > 1_000_000_000:
-        tmp_fd, tmp_path = tempfile.mkstemp(suffix=".reindex.npy")
-        os.close(tmp_fd)
-        mmap_result = np.memmap(tmp_path, dtype=matrix.dtype, mode="w+", shape=(n_rows_out, n_cols), order="F")
-        result = mmap_result
-        log(f"    using temp mmap: {tmp_path}")
-    else:
-        tmp_path = None
-        result = np.empty((n_rows_out, n_cols), dtype=matrix.dtype, order="F")
-    batch_size = 4096
-    n_batches = (n_cols + batch_size - 1) // batch_size
-    for batch_idx in range(n_batches):
-        start = batch_idx * batch_size
-        end = min(start + batch_size, n_cols)
-        col_batch = np.array(matrix[:, start:end])
-        result[:, start:end] = col_batch[resolved_row_indices, :]
-        if batch_idx % 10 == 0 or batch_idx == n_batches - 1:
-            log(f"    reindexing: {end:,}/{n_cols:,} columns ({100*end/n_cols:.0f}%)  mem={mem()}")
-    if isinstance(result, np.memmap):
-        result.flush()
-    return result
+        return source
+    return RowSubsetRawGenotypeMatrix(child=source, row_indices=resolved_row_indices)
 
 
 def load_multi_vcf_dataset_from_files(
@@ -662,7 +640,7 @@ def load_multi_vcf_dataset_from_files(
             source_path, config=config, mmap_mode="r",
         )
         if not skip_subset:
-            genotype_matrix = _fast_mmap_row_reindex(genotype_matrix, keep_sample_indices)
+            genotype_matrix = _lazy_row_subset(genotype_matrix, keep_sample_indices)
         raw_matrices.append(as_raw_genotype_matrix(genotype_matrix))
         per_chr_variants.append(list(chromosome_variants))
         per_chr_stats.append(chromosome_stats)
@@ -906,7 +884,7 @@ def load_multi_source_dataset_from_files(
                 and np.array_equal(keep_indices, np.arange(n_native, dtype=np.intp))
             )
             if not skip_subset:
-                genotype_matrix = _fast_mmap_row_reindex(genotype_matrix, keep_indices)
+                genotype_matrix = _lazy_row_subset(genotype_matrix, keep_indices)
             raw: RawGenotypeMatrix = as_raw_genotype_matrix(genotype_matrix)
             variants_list = list(variants)
         else:
