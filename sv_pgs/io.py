@@ -1564,7 +1564,11 @@ def _region_parse_worker(args: tuple) -> tuple[int, str]:
     sample_count = len(_read_vcf_sample_ids(vcf_path))
 
     bcftools = _bcftools_executable()
-    cmd = [bcftools, "query", "--threads", str(max(int(threads_per_reader), 1)), "-f", _BCFTOOLS_QUERY_FORMAT]
+    # `bcftools query` on older builds (incl. the AoU image) does not accept
+    # --threads; the decompression is single-threaded inside query regardless.
+    # We rely on the multiprocessing pool, not intra-process threads, for fan-out.
+    _ = threads_per_reader
+    cmd = [bcftools, "query", "-f", _BCFTOOLS_QUERY_FORMAT]
     if region:
         cmd += ["-r", region]
     cmd += [str(vcf_path)]
