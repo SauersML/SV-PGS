@@ -1177,6 +1177,67 @@ def _vcf_cache_audit_reason(vcf_path: Path, paths: _VcfCachePaths) -> str | None
     return None
 
 
+def _repair_vcf_cache_duplicates(
+    vcf_path: Path,
+    paths: _VcfCachePaths,
+    config: ModelConfig,
+) -> int:
+    """In-place dedupe of a cache that has duplicate variant_ids.
+
+    Keeps the first occurrence of each variant_id and rewrites all three
+    artifacts (matrix, stats, variants) consistently. Returns the number of
+    duplicate rows removed, or 0 if there was nothing to fix.
+
+    This is the fast repair for caches damaged by the older append-bug
+    (where stale .geno bytes from a killed worker got concatenated under
+    a re-parse, producing a handful of duplicate variant_ids per file).
+    Re-parsing the full VCF takes ~5 min per chromosome; dedupe is seconds.
+    """
+    variants = _load_variant_metadata(paths.var_path)
+    seen: set[str] = set()
+    keep_positions: list[int] = []
+    for index, variant in enumerate(variants):
+        if variant.variant_id not in seen:
+            seen.add(variant.variant_id)
+            keep_positions.append(index)
+    removed = len(variants) - len(keep_positions)
+    if removed == 0:
+        return 0
+
+    keep_index = np.asarray(keep_positions, dtype=np.int64)
+    matrix = np.load(paths.geno_path, mmap_mode="r")
+    if matrix.ndim != 2 or matrix.shape[1] != len(variants):
+        raise RuntimeError(
+            "matrix shape does not match variant count "
+            f"({matrix.shape} vs {len(variants)} variants); cannot dedupe safely."
+        )
+    deduped_matrix = np.ascontiguousarray(np.asarray(matrix[:, keep_index], dtype=np.int8))
+
+    stats = _load_vcf_cache_stats(paths.stats_path)
+    if stats.means.shape[0] != len(variants):
+        raise RuntimeError(
+            f"stats length ({stats.means.shape[0]}) does not match variant "
+            f"count ({len(variants)}); cannot dedupe safely."
+        )
+    deduped_stats = VariantStatistics(
+        means=np.ascontiguousarray(stats.means[keep_index]),
+        scales=np.ascontiguousarray(stats.scales[keep_index]),
+        allele_frequencies=np.ascontiguousarray(stats.allele_frequencies[keep_index]),
+        support_counts=np.ascontiguousarray(stats.support_counts[keep_index]),
+    )
+
+    deduped_variants = [variants[i] for i in keep_positions]
+    _save_vcf_to_cache(
+        vcf_path,
+        deduped_matrix,
+        deduped_variants,
+        deduped_stats,
+        config=config,
+        cache_paths=paths,
+    )
+    return removed
+
+
 def _invalidate_vcf_cache(paths: _VcfCachePaths) -> None:
     """Remove every file that makes up a VCF cache bundle.
 
@@ -2007,18 +2068,25 @@ def precache_vcfs_parallel(
     # Audit existing caches before deciding what to skip. Past worker bugs
     # could have left cache files that look complete but contain variants
     # from a different chromosome, or duplicate variant_ids within a single
-    # file. Catching that here means the failing path triggers a clean
-    # re-parse of just the affected VCF instead of a downstream
-    # "duplicate variants detected across genotype_paths" error that
-    # forces the user to nuke every cache.
+    # file. We try to repair duplicate-only damage in place (seconds per
+    # cache); only invalidate-and-re-parse when the damage is structural
+    # (chromosome contamination, unreadable metadata).
     for vcf_path in vcf_paths:
         cache_paths = _vcf_cache_paths(vcf_path, config)
         if not _is_vcf_cache_bundle_complete(cache_paths):
             continue
         reason = _vcf_cache_audit_reason(vcf_path, cache_paths)
-        if reason is not None:
-            log(f"  invalidating cache for {vcf_path.name}: {reason}")
-            _invalidate_vcf_cache(cache_paths)
+        if reason is None:
+            continue
+        if reason.startswith("variant_ids contain duplicates"):
+            try:
+                removed = _repair_vcf_cache_duplicates(vcf_path, cache_paths, config)
+                log(f"  deduped cache for {vcf_path.name}: removed {removed} duplicate rows in place")
+                continue
+            except (OSError, RuntimeError, ValueError) as exc:
+                log(f"  in-place dedupe failed for {vcf_path.name} ({exc}); falling back to re-parse")
+        log(f"  invalidating cache for {vcf_path.name}: {reason}")
+        _invalidate_vcf_cache(cache_paths)
 
     # Skip already-cached VCFs under the current cache key only.
     uncached: list[Path] = []
