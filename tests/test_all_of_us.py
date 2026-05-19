@@ -716,6 +716,7 @@ def test_run_all_of_us_runs_single_unified_fit_and_reuses_cached_downloads(monke
         chromosomes=[1, 2],
         output_base=str(tmp_path),
         variants="sv",
+        test_fraction=0.0,
     )
 
     cache_dir = aou_runner.local_sv_vcf_cache_dir(tmp_path)
@@ -856,6 +857,7 @@ def test_run_all_of_us_skips_existing_fit_only_when_run_metadata_matches(monkeyp
         output_base=str(tmp_path),
         n_pcs=2,
         variants="sv",
+        test_fraction=0.0,
     )
 
 
@@ -934,6 +936,7 @@ def test_run_all_of_us_reruns_when_existing_fit_metadata_differs(monkeypatch, tm
         output_base=str(tmp_path),
         n_pcs=3,
         variants="sv",
+        test_fraction=0.0,
     )
 
     cache_dir = aou_runner.local_sv_vcf_cache_dir(tmp_path)
@@ -992,6 +995,7 @@ def test_run_all_of_us_raises_when_parallel_precache_fails(monkeypatch, tmp_path
             output_base=str(tmp_path),
             n_pcs=2,
             variants="sv",
+            test_fraction=0.0,
         )
 
 def _read_tsv_rows(path: Path) -> list[dict[str, str]]:

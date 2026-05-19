@@ -501,6 +501,7 @@ def _build_aou_run_metadata(
     random_seed: int,
     variant_metadata_path: str | None,
     variants: str,
+    test_fraction: float = 0.0,
 ) -> dict[str, object]:
     return {
         "disease": disease,
@@ -515,6 +516,10 @@ def _build_aou_run_metadata(
         # in the run metadata makes existing-result-reuse skip a cached fit
         # when the source mix changes.
         "variants": variants,
+        # Float so resuming a 0.2-test run picks up the cached fit but a flip
+        # to 0.1 triggers a re-fit. Stored at 6-digit precision to keep the
+        # JSON canonical across host float formatting differences.
+        "test_fraction": round(float(test_fraction), 6),
     }
 
 
@@ -551,11 +556,12 @@ def _normalize_variants_choice(variants: str) -> str:
 
 
 def _aou_metadata_equivalent(existing: dict[str, object], current: dict[str, object]) -> bool:
-    """Compare run-metadata dicts with one back-compat tweak.
+    """Compare run-metadata dicts with two back-compat tweaks.
 
-    Older runs were written before the "variants" key existed; treat absence
-    of that key in the existing metadata as the historical default ("sv") so
-    we don't pointlessly invalidate prior SV-only result directories.
+    - Older runs predate the "variants" key; assume the historical SV default.
+    - Older runs predate the "test_fraction" key; assume 0 (no holdout).
+    Filling in those defaults stops a default-flip from spuriously invalidating
+    every previously-produced result directory.
     """
     if existing == current:
         return True
@@ -563,7 +569,64 @@ def _aou_metadata_equivalent(existing: dict[str, object], current: dict[str, obj
     current = dict(current)
     if "variants" not in existing:
         existing["variants"] = "sv"
+    if "test_fraction" not in existing:
+        existing["test_fraction"] = 0.0
     return existing == current
+
+
+def _split_merged_sample_table(
+    merged_path: Path,
+    *,
+    test_fraction: float,
+    random_seed: int,
+) -> tuple[Path, Path | None]:
+    """Split the merged sample table into train + held-out test rows.
+
+    Splitting is deterministic in `(random_seed, sample_id)`: a SHA-256 hash
+    maps each row's sample_id into [0, 1); rows below `test_fraction` go to
+    the test partition, everyone else to train. This way reruns with the same
+    seed produce the same split, and adding/removing rows only moves the few
+    affected rows (not the whole assignment).
+
+    Returns (train_path, test_path). test_path is None when test_fraction is
+    zero, in which case the original file is used unchanged.
+    """
+    if not (0.0 <= test_fraction < 1.0):
+        raise ValueError(f"test_fraction must be in [0, 1); got {test_fraction!r}")
+    if test_fraction == 0.0:
+        return merged_path, None
+
+    import hashlib
+
+    base_name = merged_path.name
+    train_path = merged_path.with_name(base_name.replace(".tsv", ".train.tsv", 1))
+    test_path = merged_path.with_name(base_name.replace(".tsv", ".test.tsv", 1))
+    salt = f"sv-pgs/split/seed={random_seed}".encode()
+
+    train_lines: list[str] = []
+    test_lines: list[str] = []
+    with merged_path.open("rt", encoding="utf-8") as handle:
+        header = handle.readline()
+        train_lines.append(header)
+        test_lines.append(header)
+        for raw_line in handle:
+            if not raw_line.strip():
+                continue
+            # sample_id is always column 0 (merge_pcs_into_sample_table emits
+            # it as the leading column); slicing rather than full csv parse
+            # keeps this O(bytes-in-row) for the 100k-row biobank case.
+            sample_id = raw_line.split("\t", 1)[0]
+            digest = hashlib.sha256(salt + b"|" + sample_id.encode()).digest()
+            bucket = int.from_bytes(digest[:8], "big") / float(1 << 64)
+            (test_lines if bucket < test_fraction else train_lines).append(raw_line)
+
+    train_path.write_text("".join(train_lines), encoding="utf-8")
+    test_path.write_text("".join(test_lines), encoding="utf-8")
+    log(
+        f"  train/test split (seed={random_seed}, test_fraction={test_fraction}): "
+        f"{len(train_lines) - 1:,} train rows, {len(test_lines) - 1:,} test rows"
+    )
+    return train_path, test_path
 
 DEFAULT_COVARIATES = [
     "age_at_observation_start",
@@ -583,6 +646,7 @@ def run_all_of_us(
     max_outer_iterations: int = 30,
     random_seed: int = 0,
     variants: str = "snp+sv",
+    test_fraction: float = 0.2,
 ) -> None:
     """Full AoU pipeline: download requested chromosomes, merge them, and run one fit.
 
@@ -595,9 +659,17 @@ def run_all_of_us(
     "snv" is accepted as an alias for "snp" and the joint form may be
     written in either order ("sv+snp", "snv+sv", etc.); the metadata file
     always records the canonical form.
+
+    `test_fraction` carves a held-out evaluation set off the sample table by
+    hashing sample_id with random_seed; defaults to 0.2 (80/20 train/test).
+    Pass 0.0 to train on every available sample and skip the held-out AUC.
+    The split is deterministic per seed so reruns reproduce the same
+    train/test assignment.
     """
     variants = _normalize_variants_choice(variants)
     chromosomes = _validate_aou_chromosomes(chromosomes)
+    if not (0.0 <= test_fraction < 1.0):
+        raise ValueError(f"test_fraction must be in [0, 1); got {test_fraction!r}")
 
     import os
 
@@ -776,6 +848,7 @@ def run_all_of_us(
         random_seed=random_seed,
         variant_metadata_path=str(resolved_variant_metadata_path) if resolved_variant_metadata_path is not None else None,
         variants=variants,
+        test_fraction=test_fraction,
     )
     if summary_path.exists():
         if run_metadata_path.exists():
@@ -795,6 +868,7 @@ def run_all_of_us(
     sources: list[tuple[str, Path]] = []
     vcf_paths: list[Path] = []
     dataset = None
+    test_dataset = None
     try:
         if variants in ("sv", "snp+sv"):
             for chrom in chromosomes:
@@ -816,16 +890,52 @@ def run_all_of_us(
         else:
             log("=== STEP 3.5: skipping VCF precache (no VCF sources) ===")
 
-        log("=== STEP 4: Load unified genome-wide dataset ===")
+        # Carve a deterministic held-out test partition off the merged sample
+        # table BEFORE we load genotypes. The split uses sample_id+seed so
+        # reruns are reproducible — and so two sibling runs (e.g. SV-only vs
+        # SV+SNP) keep the same train/test assignment, which makes their
+        # held-out AUCs comparable.
+        train_table_path, test_table_path = _split_merged_sample_table(
+            merged_path=merged_path,
+            test_fraction=test_fraction,
+            random_seed=random_seed,
+        )
+
+        log("=== STEP 4: Load unified genome-wide TRAIN dataset ===")
         dataset = load_multi_source_dataset_from_files(
             sources=[(kind, str(path)) for kind, path in sources],
             config=config,
-            sample_table_path=str(merged_path),
+            sample_table_path=str(train_table_path),
             sample_id_column="auto",
             target_column="target",
             covariate_columns=covariates,
             variant_metadata_path=resolved_variant_metadata_path,
         )
+        if test_table_path is not None:
+            log("=== STEP 4b: Load held-out TEST dataset ===")
+            # Same sources, same variant order, different sample subset. The
+            # multi-source loader's intersection logic will further restrict
+            # to samples present in every source — for SV-only that's a no-op,
+            # for SV+microarray that's the SV ∩ array intersection.
+            test_dataset = load_multi_source_dataset_from_files(
+                sources=[(kind, str(path)) for kind, path in sources],
+                config=config,
+                sample_table_path=str(test_table_path),
+                sample_id_column="auto",
+                target_column="target",
+                covariate_columns=covariates,
+                variant_metadata_path=resolved_variant_metadata_path,
+            )
+            # For PLINK sources the variant-statistics (means/scales used to
+            # standardize the matrix) come from whichever sample subset got
+            # loaded — train and test would otherwise disagree. The model
+            # internalizes its own train-set stats during fit, but pin the
+            # test dataset's exposed stats to the train values too so any
+            # downstream consumer that reads dataset.variant_stats stays
+            # consistent. VCF sources cache cohort-wide stats so this is a
+            # no-op for them.
+            import dataclasses
+            test_dataset = dataclasses.replace(test_dataset, variant_stats=dataset.variant_stats)
         inferred_trait = TraitType.BINARY if len(np.unique(dataset.targets)) <= 2 else TraitType.QUANTITATIVE
         config.trait_type = inferred_trait
 
@@ -839,11 +949,14 @@ def run_all_of_us(
             dataset=dataset,
             config=config,
             output_dir=work_dir,
+            test_dataset=test_dataset,
         )
         run_metadata_path.write_text(json.dumps(run_metadata, indent=2), encoding="utf-8")
     finally:
         if dataset is not None:
             del dataset
+        if test_dataset is not None:
+            del test_dataset
         # Keep VCFs on disk for cache / reruns (do NOT delete)
         release_process_memory()
         log("=== UNIFIED FIT CLEANUP DONE ===")

@@ -29,6 +29,7 @@ def run_training_pipeline(
     dataset: LoadedDataset,
     config: ModelConfig,
     output_dir: str | Path,
+    test_dataset: LoadedDataset | None = None,
 ) -> PipelineOutputs:
     destination = Path(output_dir)
     destination.mkdir(parents=True, exist_ok=True)
@@ -124,6 +125,43 @@ def run_training_pipeline(
         }
     )
     log(f"predictions written: {active_count} active variants out of {dataset.genotypes.shape[1]}")
+
+    if test_dataset is not None and len(test_dataset.sample_ids) > 0:
+        # Held-out evaluation: predict with the same model on samples that were
+        # excluded from the fit and report the metrics. The model already
+        # internalizes the standardization it was trained with, so prediction
+        # against a different-cohort dataset is consistent as long as the
+        # variant order matches (the multi-source loader guarantees that).
+        log(f"=== HELD-OUT TEST EVALUATION ===  test_samples={len(test_dataset.sample_ids)}  mem={mem()}")
+        test_predictions_path = destination / "test_predictions.tsv.gz"
+        raw_test_metrics = _write_predictions_and_summary(
+            predictions_path=test_predictions_path,
+            dataset=test_dataset,
+            model=model,
+        )
+        # _write_predictions_and_summary prefixes metrics with "training_" since
+        # that's the only call site it knew about historically; relabel them
+        # here so the summary JSON disambiguates train vs test.
+        test_metrics = {
+            ("test_" + key[len("training_"):] if key.startswith("training_") else "test_" + key): value
+            for key, value in raw_test_metrics.items()
+        }
+        summary_payload["test_sample_count"] = int(len(test_dataset.sample_ids))
+        summary_payload["test_predictions_path"] = test_predictions_path.name
+        summary_payload.update(test_metrics)
+        # Loud one-line summary so anybody skimming the log can find the number.
+        if config.trait_type == TraitType.BINARY:
+            log(
+                "  >>> TEST AUC="
+                + f"{test_metrics.get('test_auc')}  log_loss={test_metrics.get('test_log_loss'):.4f}"
+                + f"  accuracy={test_metrics.get('test_accuracy'):.4f}  n={len(test_dataset.sample_ids)} <<<"
+            )
+        else:
+            log(
+                "  >>> TEST R2="
+                + f"{test_metrics.get('test_r2'):.4f}  RMSE={test_metrics.get('test_rmse'):.4f}"
+                + f"  n={len(test_dataset.sample_ids)} <<<"
+            )
 
     log("writing summary JSON...")
     summary_path = destination / "summary.json.gz"

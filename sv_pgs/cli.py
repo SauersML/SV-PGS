@@ -54,6 +54,17 @@ def build_parser() -> argparse.ArgumentParser:
     aou_run_parser.add_argument("--max-outer-iterations", type=int, default=30)
     aou_run_parser.add_argument("--random-seed", type=int, default=0)
     aou_run_parser.add_argument(
+        "--test-fraction",
+        type=float,
+        default=0.2,
+        help=(
+            "Fraction of samples (in [0, 1)) to hold out for a deterministic "
+            "test split. Default 0.2 (80/20 train/test). Pass 0 to train on "
+            "every sample and skip the held-out AUC. Splitting is keyed off "
+            "sample_id+random_seed so reruns reproduce the assignment."
+        ),
+    )
+    aou_run_parser.add_argument(
         "--variants",
         # Default is the joint model — array SNPs typically add the most
         # explained variance to a PGS and SVs sharpen tagged-region effects;
@@ -161,6 +172,7 @@ def main(argv: list[str] | None = None) -> int:
             max_outer_iterations=args.max_outer_iterations,
             random_seed=args.random_seed,
             variants=args.variants,
+            test_fraction=args.test_fraction,
         )
         return 0
 
