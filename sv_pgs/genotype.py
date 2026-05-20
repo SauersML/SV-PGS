@@ -998,26 +998,38 @@ def _standardize_batch_cupy(
     missing_sentinel: int | None = None,
     dtype=None,
 ):
-    """Standardize a raw batch directly on GPU."""
+    """Standardize a raw batch directly on GPU.
+
+    Memory-sensitive: boolean-mask scatter (``standardized[missing] = 0``) is
+    implemented in CuPy via a prefix-sum scan that allocates a batch-sized
+    scratch buffer, and ``cupy.where`` allocates a second batch-sized float
+    buffer; either OOMs on wide AoU batches. The two missing-value paths each
+    use an allocation-free in-place primitive instead.
+    """
     resolved_dtype = cupy.float32 if dtype is None else dtype
     standardized = cupy.asarray(batch_values, dtype=resolved_dtype)
-    # Build the *valid* (non-missing) mask directly — never materialize its
-    # inverse. Boolean scatter (standardized[missing] = 0) triggers a prefix-sum
-    # scan, and cupy.where / ~mask each allocate another batch-sized buffer;
-    # any of those OOM on wide AoU batches. Multiply by valid_mask is
-    # elementwise and reuses the existing buffer.
     if missing_sentinel is None:
-        if hasattr(cupy, "isnan"):
-            valid_mask = ~cupy.isnan(standardized)
+        # Raw float source: missing entries arrive as NaN and propagate as NaN
+        # through center/scale. ``NaN * 0 == NaN`` (IEEE 754), so a multiply-by-
+        # mask would not clear them — use in-place nan_to_num instead, which
+        # also scrubs ±inf from zero-scale columns at no extra cost.
+        standardized -= means[None, :]
+        standardized /= scales[None, :]
+        nan_to_num = getattr(cupy, "nan_to_num", None)
+        if nan_to_num is not None:
+            nan_to_num(standardized, copy=False, nan=0.0, posinf=0.0, neginf=0.0)
         else:
-            valid_mask = ~np.isnan(np.asarray(standardized))
-    else:
-        valid_mask = standardized != float(missing_sentinel)
+            host = np.asarray(standardized)
+            np.nan_to_num(host, copy=False, nan=0.0, posinf=0.0, neginf=0.0)
+            standardized = cupy.asarray(host, dtype=resolved_dtype)
+        return standardized
+    # Integer sentinel (PLINK int8): build the *valid* mask directly to skip
+    # an inversion buffer, then zero missing entries with an in-place multiply.
+    # Sentinel-derived garbage post-standardization is finite, so the multiply
+    # is safe (finite * 0 == 0).
+    valid_mask = standardized != float(missing_sentinel)
     standardized -= means[None, :]
     standardized /= scales[None, :]
-    if missing_sentinel is None:
-        standardized[~valid_mask] = 0.0
-        return standardized
     multiply = getattr(cupy, "multiply", np.multiply)
     multiply(standardized, valid_mask, out=standardized)
     del valid_mask
