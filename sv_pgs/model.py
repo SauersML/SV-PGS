@@ -1,17 +1,19 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
 import hashlib
 import json
-from pathlib import Path
 import pickle
+from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Callable, Sequence, cast
 
 import numpy as np
 
-import sv_pgs._jax as _jax_side_effects  # side-effect: configures JAX/XLA env
-del _jax_side_effects
-
+# Importing sv_pgs._jax has the side-effect of configuring XLA env vars
+# before any other module imports jax. It must come before sv_pgs.artifact,
+# sv_pgs.genotype, sv_pgs.inference, etc., which transitively import jax.
+# Sorted alphabetically it naturally lands first among sv_pgs.* imports.
+from sv_pgs import _jax as _jax_side_effects
 from sv_pgs.artifact import ModelArtifact, load_artifact, save_artifact
 from sv_pgs.config import ModelConfig, TraitType
 from sv_pgs.data import TieGroup, TieMap, VariantRecord, VariantStatistics, normalize_variant_record
@@ -37,6 +39,9 @@ from sv_pgs.preprocessing import (
 )
 from sv_pgs.progress import log, mem
 from sv_pgs.runtime_policy import runtime_training_policy_for_fit, runtime_training_policy_summary
+
+del _jax_side_effects
+
 
 def _select_active_variant_indices_fast(
     allele_frequencies: np.ndarray,
@@ -908,7 +913,6 @@ class BayesianPGS:
             f"on_gpu={reduced_genotypes._cupy_cache is not None}  "
             f"mem={mem()}"
         )
-        checkpoint_callback = None
         log("  checking for EM checkpoint to resume from...")
         resume_checkpoint = (
             None
@@ -916,23 +920,30 @@ class BayesianPGS:
             else _try_load_variational_checkpoint(fit_stage_cache_paths)
         )
         log(f"  EM checkpoint: {'found — resuming' if resume_checkpoint else 'none — starting fresh'}")
+        checkpoint_callback: Callable[[VariationalFitCheckpoint], None] | None
         if fit_stage_cache_paths is not None:
-            def checkpoint_callback(checkpoint: VariationalFitCheckpoint) -> None:
-                _save_variational_checkpoint(fit_stage_cache_paths, checkpoint)
+            cache_paths_for_callback = fit_stage_cache_paths
+
+            def _checkpoint_callback(checkpoint: VariationalFitCheckpoint) -> None:
+                _save_variational_checkpoint(cache_paths_for_callback, checkpoint)
                 if int(self.config.sample_space_preconditioner_rank) <= 0:
                     return
                 basis_path = _sample_space_basis_cache_path(
-                    fit_stage_cache_paths,
+                    cache_paths_for_callback,
                     rank=int(self.config.sample_space_preconditioner_rank),
                     random_seed=int(self.config.random_seed),
                 )
                 if not basis_path.exists():
                     _save_sample_space_basis_cache(
-                        cache_paths=fit_stage_cache_paths,
+                        cache_paths=cache_paths_for_callback,
                         genotype_matrix=reduced_genotypes,
                         rank=int(self.config.sample_space_preconditioner_rank),
                         random_seed=int(self.config.random_seed),
                     )
+
+            checkpoint_callback = _checkpoint_callback
+        else:
+            checkpoint_callback = None
 
         fit_result = fit_variational_em(
             genotypes=reduced_genotypes,

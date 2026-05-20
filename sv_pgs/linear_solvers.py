@@ -17,30 +17,41 @@ Two key algorithms:
 """
 from __future__ import annotations
 
+import importlib
 from dataclasses import dataclass
-from typing import Callable
+from typing import TYPE_CHECKING, Any, Callable
 
-import sv_pgs._jax as _jax_side_effects  # side-effect: configures JAX/XLA env
-del _jax_side_effects
-import jax.numpy as jnp
-from jax.scipy import sparse as jax_sparse
 import numpy as np
+
+# sv_pgs._jax MUST be imported before any direct import of jax so that the
+# XLA env-var setup runs first. We deliberately import jax via importlib so
+# the ordering survives static-analysis sorting passes.
+importlib.import_module("sv_pgs._jax")
+jnp = importlib.import_module("jax.numpy")
+jax_sparse = importlib.import_module("jax.scipy.sparse")
+
+if TYPE_CHECKING:
+    from jax import Array as JaxArray
+    from numpy import dtype as JaxDType
+else:
+    JaxArray = Any
+    JaxDType = Any
 
 
 @dataclass(slots=True)
 class LinearOperator:
     shape: tuple[int, int]
-    matvec: Callable[[jnp.ndarray], jnp.ndarray]
-    matmat: Callable[[jnp.ndarray], jnp.ndarray] | None = None
-    dtype: jnp.dtype | None = None
+    matvec: Callable[[JaxArray], JaxArray]
+    matmat: Callable[[JaxArray], JaxArray] | None = None
+    dtype: JaxDType | None = None
     jax_compatible: bool = False
 
 
 def build_linear_operator(
     shape: tuple[int, int],
-    matvec: Callable[[jnp.ndarray], jnp.ndarray],
-    matmat: Callable[[jnp.ndarray], jnp.ndarray] | None = None,
-    dtype: jnp.dtype | None = None,
+    matvec: Callable[[JaxArray], JaxArray],
+    matmat: Callable[[JaxArray], JaxArray] | None = None,
+    dtype: JaxDType | None = None,
     jax_compatible: bool = False,
 ) -> LinearOperator:
     return LinearOperator(
@@ -58,12 +69,12 @@ def build_linear_operator(
 # preconditioner or well-conditioned system.  Handles both single vectors
 # and matrices (solving column by column).
 def solve_spd_system(
-    operator: LinearOperator | np.ndarray | jnp.ndarray,
-    right_hand_side: np.ndarray | jnp.ndarray,
+    operator: LinearOperator | np.ndarray | JaxArray,
+    right_hand_side: np.ndarray | JaxArray,
     tolerance: float,
     max_iterations: int,
-    initial_guess: np.ndarray | jnp.ndarray | None = None,
-    preconditioner: Callable[[jnp.ndarray], jnp.ndarray] | np.ndarray | jnp.ndarray | None = None,
+    initial_guess: np.ndarray | JaxArray | None = None,
+    preconditioner: Callable[[JaxArray], JaxArray] | np.ndarray | JaxArray | None = None,
 ) -> np.ndarray:
     linear_operator = _as_linear_operator(operator)
     rhs_array = jnp.asarray(right_hand_side)
@@ -145,7 +156,7 @@ def solve_spd_system(
 # small matrix, and average.  Each probe gives a noisy estimate of
 # log(det); averaging over several probes reduces variance.
 def stochastic_logdet(
-    operator: LinearOperator | np.ndarray | jnp.ndarray,
+    operator: LinearOperator | np.ndarray | JaxArray,
     dimension: int,
     probe_count: int,
     lanczos_steps: int,
@@ -153,7 +164,7 @@ def stochastic_logdet(
     minimum_probe_count: int = 4,
     relative_error_tolerance: float = 0.05,
     absolute_error_tolerance: float = 0.0,
-    control_variate_diagonal: np.ndarray | jnp.ndarray | None = None,
+    control_variate_diagonal: np.ndarray | JaxArray | None = None,
 ) -> float:
     linear_operator = _as_linear_operator(operator)
     baseline_logdet = 0.0
@@ -168,12 +179,12 @@ def stochastic_logdet(
         baseline_logdet = float(np.sum(np.log(diagonal)))
         transformed_dtype = linear_operator.dtype or jnp.float64
 
-        def transformed_matvec(vector: jnp.ndarray) -> jnp.ndarray:
+        def transformed_matvec(vector: JaxArray) -> JaxArray:
             scaled_vector = inverse_sqrt_diagonal * np.asarray(vector, dtype=np.float64)
             applied = np.asarray(base_operator.matvec(jnp.asarray(scaled_vector, dtype=transformed_dtype)), dtype=np.float64)
             return jnp.asarray(inverse_sqrt_diagonal * applied, dtype=transformed_dtype)
 
-        def transformed_matmat(matrix: jnp.ndarray) -> jnp.ndarray:
+        def transformed_matmat(matrix: JaxArray) -> JaxArray:
             matrix_array = np.asarray(matrix, dtype=np.float64)
             scaled_matrix = inverse_sqrt_diagonal[:, None] * matrix_array
             if base_operator.matmat is not None:
@@ -277,9 +288,9 @@ def _normalized_rademacher_probe_block(
 
 def _apply_operator_block(
     linear_operator: LinearOperator,
-    block: jnp.ndarray,
-    operator_dtype: jnp.dtype,
-) -> jnp.ndarray:
+    block: JaxArray,
+    operator_dtype: JaxDType,
+) -> JaxArray:
     if block.ndim != 2:
         raise ValueError("operator block application expects a matrix input.")
     if block.shape[1] == 1:
@@ -294,7 +305,7 @@ def _apply_operator_block(
     )
 
 
-def _small_symmetric_eigh(matrix: np.ndarray | jnp.ndarray) -> tuple[np.ndarray, np.ndarray]:
+def _small_symmetric_eigh(matrix: np.ndarray | JaxArray) -> tuple[np.ndarray, np.ndarray]:
     # Tiny Lanczos tridiagonals should stay off GPU solver libraries entirely.
     matrix_np = np.asarray(matrix, dtype=np.float64)
     if matrix_np.ndim != 2 or matrix_np.shape[0] != matrix_np.shape[1]:
@@ -314,7 +325,7 @@ def _small_symmetric_eigh(matrix: np.ndarray | jnp.ndarray) -> tuple[np.ndarray,
     raise RuntimeError("small symmetric eigendecomposition failed after CPU retries.")
 
 
-def _as_linear_operator(operator: LinearOperator | np.ndarray | jnp.ndarray) -> LinearOperator:
+def _as_linear_operator(operator: LinearOperator | np.ndarray | JaxArray) -> LinearOperator:
     if isinstance(operator, LinearOperator):
         return operator
     matrix = jnp.asarray(operator)
@@ -331,12 +342,12 @@ def _as_linear_operator(operator: LinearOperator | np.ndarray | jnp.ndarray) -> 
 
 def _solve_spd_system_with_jax_cg(
     linear_operator: LinearOperator,
-    rhs: jnp.ndarray,
-    solver_dtype: jnp.dtype,
+    rhs: JaxArray,
+    solver_dtype: JaxDType,
     tolerance: float,
     max_iterations: int,
-    initial_guess: jnp.ndarray | None,
-    preconditioner: np.ndarray | jnp.ndarray | None,
+    initial_guess: JaxArray | None,
+    preconditioner: np.ndarray | JaxArray | None,
 ) -> np.ndarray:
     output_dtype = np.asarray(jnp.zeros((), dtype=solver_dtype)).dtype
     diagonal_preconditioner = None if preconditioner is None else jnp.asarray(preconditioner, dtype=solver_dtype)
@@ -344,10 +355,10 @@ def _solve_spd_system_with_jax_cg(
         raise ValueError("array preconditioner must be a diagonal vector.")
     safe_diagonal = None if diagonal_preconditioner is None else jnp.maximum(diagonal_preconditioner, 1e-12)
 
-    def apply_operator(vector: jnp.ndarray) -> jnp.ndarray:
+    def apply_operator(vector: JaxArray) -> JaxArray:
         return jnp.asarray(linear_operator.matvec(vector), dtype=solver_dtype)
 
-    def apply_preconditioner(vector: jnp.ndarray) -> jnp.ndarray:
+    def apply_preconditioner(vector: JaxArray) -> JaxArray:
         if safe_diagonal is None:
             return vector
         return vector / safe_diagonal
@@ -358,7 +369,7 @@ def _solve_spd_system_with_jax_cg(
     rhs_norm_for_threshold = float(jnp.linalg.norm(rhs)) if rhs.ndim == 1 else 0.0
     absolute_threshold = float(tolerance) * max(rhs_norm_for_threshold, 1.0)
 
-    def solve_one(rhs_vector: jnp.ndarray, x0_vector: jnp.ndarray | None) -> jnp.ndarray:
+    def solve_one(rhs_vector: JaxArray, x0_vector: JaxArray | None) -> JaxArray:
         local_rhs_norm = float(jnp.linalg.norm(rhs_vector))
         local_threshold = float(tolerance) * max(local_rhs_norm, 1.0)
         solution, _ = jax_sparse.linalg.cg(
@@ -417,13 +428,13 @@ def _solve_spd_system_with_jax_cg(
 
 
 def _as_preconditioner(
-    preconditioner: Callable[[jnp.ndarray], jnp.ndarray] | np.ndarray | jnp.ndarray | None,
-    solver_dtype: jnp.dtype,
-) -> Callable[[jnp.ndarray], jnp.ndarray] | None:
+    preconditioner: Callable[[JaxArray], JaxArray] | np.ndarray | JaxArray | None,
+    solver_dtype: JaxDType,
+) -> Callable[[JaxArray], JaxArray] | None:
     if preconditioner is None:
         return None
     if callable(preconditioner):
-        def apply_callable(vector: jnp.ndarray) -> jnp.ndarray:
+        def apply_callable(vector: JaxArray) -> JaxArray:
             array = jnp.asarray(vector, dtype=solver_dtype)
             if array.ndim == 1:
                 result = jnp.asarray(preconditioner(array), dtype=solver_dtype)
@@ -453,7 +464,7 @@ def _as_preconditioner(
         raise ValueError("array preconditioner must be a diagonal vector.")
     safe_diagonal = jnp.maximum(diagonal, 1e-12)
 
-    def apply_diagonal(vector: jnp.ndarray) -> jnp.ndarray:
+    def apply_diagonal(vector: JaxArray) -> JaxArray:
         array = jnp.asarray(vector, dtype=solver_dtype)
         if array.ndim == 1:
             return array / safe_diagonal
@@ -477,13 +488,13 @@ def _as_preconditioner(
 # Convergence is guaranteed for positive-definite A.
 def _solve_single_rhs(
     linear_operator: LinearOperator,
-    rhs: jnp.ndarray,
-    solver_dtype: jnp.dtype,
+    rhs: JaxArray,
+    solver_dtype: JaxDType,
     tolerance: float,
     max_iterations: int,
-    initial_guess: jnp.ndarray | None,
-    preconditioner: Callable[[jnp.ndarray], jnp.ndarray] | None,
-) -> jnp.ndarray:
+    initial_guess: JaxArray | None,
+    preconditioner: Callable[[JaxArray], JaxArray] | None,
+) -> JaxArray:
     import time
     import math
     from sv_pgs.progress import log
@@ -573,13 +584,13 @@ def _solve_single_rhs(
 
 def _solve_multiple_rhs(
     linear_operator: LinearOperator,
-    rhs: jnp.ndarray,
-    solver_dtype: jnp.dtype,
+    rhs: JaxArray,
+    solver_dtype: JaxDType,
     tolerance: float,
     max_iterations: int,
-    initial_guess: jnp.ndarray | None,
-    preconditioner: Callable[[jnp.ndarray], jnp.ndarray] | None,
-) -> jnp.ndarray:
+    initial_guess: JaxArray | None,
+    preconditioner: Callable[[JaxArray], JaxArray] | None,
+) -> JaxArray:
     import time
     from sv_pgs.progress import log
 
@@ -599,7 +610,7 @@ def _solve_multiple_rhs(
     if operator_matmat is None:
         raise ValueError("matrix solve requires an operator matmat implementation.")
 
-    def apply_operator_active(matrix: jnp.ndarray, active_columns: np.ndarray | None = None) -> jnp.ndarray:
+    def apply_operator_active(matrix: JaxArray, active_columns: np.ndarray | None = None) -> JaxArray:
         if active_columns is None:
             return jnp.asarray(operator_matmat(matrix), dtype=solver_dtype)
         if active_columns.size == 0:
@@ -718,13 +729,13 @@ def _solve_multiple_rhs(
 # instability where basis vectors slowly lose orthogonality.
 def _lanczos_tridiagonal(
     linear_operator: LinearOperator,
-    start_vector: jnp.ndarray,
+    start_vector: JaxArray,
     step_count: int,
-) -> jnp.ndarray:
+) -> JaxArray:
     operator_dtype = linear_operator.dtype or jnp.result_type(start_vector.dtype, jnp.float32)
     normalized_start = jnp.asarray(start_vector, dtype=operator_dtype)
     normalized_start /= jnp.maximum(jnp.linalg.norm(normalized_start), 1e-12)
-    basis_vectors: list[jnp.ndarray] = []
+    basis_vectors: list[JaxArray] = []
     alpha_values: list[float] = []
     beta_values: list[float] = []
     current_vector = normalized_start
@@ -768,7 +779,7 @@ def _lanczos_tridiagonal(
 
 def _lanczos_tridiagonal_block(
     linear_operator: LinearOperator,
-    start_matrix: jnp.ndarray,
+    start_matrix: JaxArray,
     step_count: int,
 ) -> tuple[np.ndarray, ...]:
     if start_matrix.ndim != 2:
@@ -779,7 +790,7 @@ def _lanczos_tridiagonal_block(
     current_block = jnp.asarray(start_matrix, dtype=operator_dtype)
     current_norms = jnp.maximum(jnp.linalg.norm(current_block, axis=0, keepdims=True), 1e-12)
     current_block = current_block / current_norms
-    basis_blocks: list[jnp.ndarray] = []
+    basis_blocks: list[JaxArray] = []
     alpha_rows: list[np.ndarray] = []
     beta_rows: list[np.ndarray] = []
     previous_block = jnp.zeros_like(current_block)

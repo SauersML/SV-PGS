@@ -108,7 +108,7 @@ def test_full_workflow_quantitative() -> None:
     # 2. Fit partially (4 epochs), capturing each checkpoint.
     partial_config = replace(config, max_outer_iterations=4)
     partial_snapshots, partial_callback = _capture_callback()
-    partial = fit_variational_em(
+    fit_variational_em(
         genotypes=genotype_matrix,
         covariates=covariate_matrix,
         targets=target_vector,

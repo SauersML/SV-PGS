@@ -60,9 +60,12 @@ def _madvise_willneed_array(array: np.ndarray) -> None:
         import mmap as _mmap_module
     except ImportError:
         return
-    base = array
+    base: object = array
     while getattr(base, "base", None) is not None:
-        base = base.base
+        next_base = getattr(base, "base", None)
+        if next_base is None:
+            break
+        base = next_base
         if isinstance(base, _mmap_module.mmap):
             break
     if not isinstance(base, _mmap_module.mmap):
@@ -196,6 +199,13 @@ class RawGenotypeMatrix(ABC):
 
 
 class Int8BatchCapable(Protocol):
+    @property
+    def shape(self) -> tuple[int, int]: ...
+    def iter_column_batches(
+        self,
+        variant_indices: Sequence[int] | np.ndarray | None = None,
+        batch_size: int = DEFAULT_GENOTYPE_BATCH_SIZE,
+    ) -> Iterator[RawGenotypeBatch]: ...
     def iter_column_batches_i8(
         self,
         variant_indices: Sequence[int] | np.ndarray | None = None,
@@ -1004,7 +1014,7 @@ def _standardize_batch_cupy(
 
 
 def _iter_standardized_gpu_batches(
-    raw: RawGenotypeMatrix,
+    raw: RawGenotypeMatrix | Int8BatchCapable,
     variant_indices: np.ndarray,
     means,
     scales,
@@ -1106,7 +1116,7 @@ def _iter_standardized_gpu_batches(
         executor.shutdown(wait=False)
 
 
-def _standardized_streaming_target_batch_bytes(raw: RawGenotypeMatrix) -> int:
+def _standardized_streaming_target_batch_bytes(raw: RawGenotypeMatrix | Int8BatchCapable) -> int:
     return (
         LOCAL_INT8_STANDARDIZED_STREAMING_TARGET_BATCH_BYTES
         if _supports_int8_batches(raw)
@@ -1115,7 +1125,7 @@ def _standardized_streaming_target_batch_bytes(raw: RawGenotypeMatrix) -> int:
 
 
 def _gpu_streaming_batch_size(
-    raw: RawGenotypeMatrix,
+    raw: RawGenotypeMatrix | Int8BatchCapable,
     *,
     sample_count: int,
     requested_batch_size: int,
@@ -1212,7 +1222,7 @@ class _CupyInt8StandardizedCache:
         local_variant_indices: np.ndarray | slice,
         *,
         dtype=None,
-    ):
+    ) -> Any:
         cp = self.cupy
         resolved_dtype = _cupy_compute_dtype(cp) if dtype is None else dtype
         raw_chunk = self.raw_values[:, local_variant_indices]
@@ -2211,7 +2221,7 @@ class StandardizedGenotypeMatrix:
         if isinstance(jax_cache, jax_core.Tracer):
             return jax_cache
         self._jax_cache = jax_cache
-        return self._jax_cache
+        return jax_cache
 
     def try_cache_locally(self) -> bool:
         """Rebase onto a local int8 memmap to avoid repeated upstream streaming passes."""
@@ -2463,11 +2473,12 @@ class StandardizedGenotypeMatrix:
             return self._dense_cache
         if self._cupy_cache is not None:
             if _cupy_cache_is_int8_standardized(self._cupy_cache):
-                self._dense_cache = np.asarray(self._cupy_cache, dtype=np.float32)
+                dense_from_cupy = np.asarray(self._cupy_cache, dtype=np.float32)
             else:
-                self._dense_cache = self._cupy_cache.get()  # cupy -> numpy
+                dense_from_cupy = self._cupy_cache.get()  # cupy -> numpy
+            self._dense_cache = dense_from_cupy
             self._jax_cache = None
-            return self._dense_cache
+            return dense_from_cupy
         matrix = np.empty(self.shape, dtype=np.float32)
         for batch in self.iter_column_batches(batch_size=batch_size):
             matrix[:, batch.variant_indices] = batch.values
@@ -3158,7 +3169,7 @@ def _contiguous_index_or_slice(indices: np.ndarray) -> slice | np.ndarray:
 
 
 def _read_int8_columns_one_shot(
-    raw: RawGenotypeMatrix,
+    raw: RawGenotypeMatrix | Int8BatchCapable,
     variant_indices: np.ndarray,
 ) -> np.ndarray | None:
     resolved_indices = np.asarray(variant_indices, dtype=np.int32)

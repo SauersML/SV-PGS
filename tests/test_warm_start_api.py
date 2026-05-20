@@ -8,7 +8,6 @@ helper, then resuming ``fit_variational_em`` from that checkpoint.
 from __future__ import annotations
 
 import numpy as np
-import pytest
 
 from sv_pgs.config import ModelConfig, TraitType, VariantClass
 from sv_pgs.data import VariantRecord

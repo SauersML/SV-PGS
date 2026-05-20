@@ -88,8 +88,12 @@ def unpack_em_hyperparameters(
     tpb_class_count: int,
 ) -> tuple[float, np.ndarray, np.ndarray, np.ndarray]:
     cursor = 0
-    log_global_scale = float(packed[cursor]); cursor += 1
-    scale_coefs = packed[cursor:cursor + scale_model_dim].copy(); cursor += scale_model_dim
-    log_a = packed[cursor:cursor + tpb_class_count].copy(); cursor += tpb_class_count
-    log_b = packed[cursor:cursor + tpb_class_count].copy(); cursor += tpb_class_count
+    log_global_scale = float(packed[cursor])
+    cursor += 1
+    scale_coefs = packed[cursor:cursor + scale_model_dim].copy()
+    cursor += scale_model_dim
+    log_a = packed[cursor:cursor + tpb_class_count].copy()
+    cursor += tpb_class_count
+    log_b = packed[cursor:cursor + tpb_class_count].copy()
+    cursor += tpb_class_count
     return log_global_scale, scale_coefs, log_a, log_b

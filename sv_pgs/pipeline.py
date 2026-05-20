@@ -152,6 +152,10 @@ def run_training_pipeline(
     )
     if selected_iteration_count is None:
         selected_iteration_count = model.config.max_outer_iterations
+    _final_parameter_change = getattr(fitted_state.fit_result, "final_parameter_change", None)
+    _final_predictor_change = getattr(fitted_state.fit_result, "final_predictor_change", None)
+    _final_objective_change = getattr(fitted_state.fit_result, "final_objective_change", None)
+    _final_hyperparameter_change = getattr(fitted_state.fit_result, "final_hyperparameter_change", None)
     summary_payload.update(
         {
             "sample_count": int(dataset.genotypes.shape[0]),
@@ -162,24 +166,16 @@ def run_training_pipeline(
             "selected_iteration_count": int(selected_iteration_count),
             "fit_converged": bool(getattr(fitted_state.fit_result, "converged", False)),
             "final_parameter_change": (
-                None
-                if getattr(fitted_state.fit_result, "final_parameter_change", None) is None
-                else float(fitted_state.fit_result.final_parameter_change)
+                None if _final_parameter_change is None else float(_final_parameter_change)
             ),
             "final_predictor_change": (
-                None
-                if getattr(fitted_state.fit_result, "final_predictor_change", None) is None
-                else float(fitted_state.fit_result.final_predictor_change)
+                None if _final_predictor_change is None else float(_final_predictor_change)
             ),
             "final_objective_change": (
-                None
-                if getattr(fitted_state.fit_result, "final_objective_change", None) is None
-                else float(fitted_state.fit_result.final_objective_change)
+                None if _final_objective_change is None else float(_final_objective_change)
             ),
             "final_hyperparameter_change": (
-                None
-                if getattr(fitted_state.fit_result, "final_hyperparameter_change", None) is None
-                else float(fitted_state.fit_result.final_hyperparameter_change)
+                None if _final_hyperparameter_change is None else float(_final_hyperparameter_change)
             ),
         }
     )
@@ -381,7 +377,8 @@ def _build_per_epoch_history_writer(
     handle.flush()
 
     start_seconds = _time.monotonic()
-    log(f"per-epoch history → {history_path}  (test_n={len(test_dataset.sample_ids) if has_test else 0})")
+    _test_n = len(test_dataset.sample_ids) if test_dataset is not None and has_test else 0
+    log(f"per-epoch history → {history_path}  (test_n={_test_n})")
 
     def _format(value) -> str:
         if value is None:

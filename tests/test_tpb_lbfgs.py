@@ -8,7 +8,6 @@ gradient ascent loop required.
 from __future__ import annotations
 
 import numpy as np
-import pytest
 
 from sv_pgs.config import ModelConfig, TraitType
 from sv_pgs.mixture_inference import _update_tpb_shape_vectors

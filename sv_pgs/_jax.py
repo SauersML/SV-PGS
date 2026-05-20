@@ -1,3 +1,4 @@
+import importlib
 import os
 import shutil
 import subprocess
@@ -122,7 +123,10 @@ if turing_workarounds_enabled():
 if tensor_core_matmul_enabled():
     os.environ.setdefault("CUPY_TF32", "1")
 
-from jax import config as jax_config  # must follow XLA env-var setup above
+# JAX must be imported AFTER the XLA env-var setup above (otherwise the JAX
+# runtime captures the wrong settings). Use importlib so static-analysis tools
+# don't flag these as misplaced top-of-file imports.
+jax_config = importlib.import_module("jax").config
 
 # Enable 64-bit precision (required for Bayesian inference numerics).
 jax_config.update("jax_enable_x64", True)
@@ -132,7 +136,8 @@ jax_config.update("jax_enable_x64", True)
 # request it unconditionally and rely on the JIT to fall back to plain fp32.
 jax_config.update("jax_default_matmul_precision", "tensorfloat32")
 
-import jax.numpy as jnp  # must follow jax_config.update above
+# jax.numpy must be imported AFTER jax_config.update above.
+jnp = importlib.import_module("jax.numpy")
 
 
 def _cupy_runtime_status() -> tuple[bool, str]:

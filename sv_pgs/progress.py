@@ -98,7 +98,8 @@ def gpu_memory_snapshot() -> str:
         memory_stats_getter = getattr(device, "memory_stats", None)
         if callable(memory_stats_getter):
             try:
-                stats = memory_stats_getter() or {}
+                raw_stats = memory_stats_getter() or {}
+                stats: dict[str, object] = dict(raw_stats) if isinstance(raw_stats, dict) else {}
                 stat_parts = []
                 for key in ("bytes_in_use", "peak_bytes_in_use", "bytes_limit"):
                     if key in stats:
@@ -152,7 +153,8 @@ def jax_runtime_snapshot() -> str:
         import jaxlib
         backend = jax.default_backend()
         devices = jax.devices()
-        version_summary = f"jax={jax.__version__} jaxlib={jaxlib.__version__} backend={backend}"
+        jaxlib_version = getattr(jaxlib, "__version__", "<unknown>")
+        version_summary = f"jax={jax.__version__} jaxlib={jaxlib_version} backend={backend}"
         device_summary = ", ".join(
             f"{device.platform}:{getattr(device, 'id', '?')}:{getattr(device, 'device_kind', 'unknown')}"
             for device in devices

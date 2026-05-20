@@ -22,7 +22,7 @@ from sv_pgs import (
     VariantRecord,
     run_benchmark_suite,
 )
-from sv_pgs.data import TieGroup, TieMap
+from sv_pgs.data import TieGroup, TieMap, VariantStatistics
 from sv_pgs.genotype import RawGenotypeBatch, RawGenotypeMatrix, as_raw_genotype_matrix
 from sv_pgs.inference import VariationalFitCheckpoint, VariationalFitResult
 from sv_pgs.model import (
@@ -95,10 +95,10 @@ class ShapeOnlyRawGenotypeMatrix(RawGenotypeMatrix):
     def shape(self) -> tuple[int, int]:
         return self._shape
 
-    def iter_column_batches(self, variant_indices=None, batch_size: int = 1024):
+    def iter_column_batches(self, _variant_indices=None, _batch_size: int = 1024):
         raise AssertionError("shape-only test double should not be iterated")
 
-    def materialize(self, variant_indices=None) -> np.ndarray:
+    def materialize(self, _variant_indices=None) -> np.ndarray:
         raise AssertionError("shape-only test double should not be materialized")
 
 
@@ -217,7 +217,7 @@ def test_runtime_tuned_config_caps_stochastic_batch_work_on_large_cohort(monkeyp
 def test_fit_stage_structure_cache_key_is_shared_across_traits(monkeypatch):
     genotype_matrix, covariate_matrix, target_vector, variant_records = _synthetic_binary_dataset()
     raw_genotypes = as_raw_genotype_matrix(genotype_matrix)
-    monkeypatch.setattr(model_module, "_persistent_raw_signature", lambda genotype_matrix: "synthetic-raw-signature")
+    monkeypatch.setattr(model_module, "_persistent_raw_signature", lambda _genotype_matrix: "synthetic-raw-signature")
     variant_stats = compute_variant_statistics(
         raw_genotypes=raw_genotypes,
         config=ModelConfig(
@@ -322,20 +322,7 @@ def test_fit_stage_cache_survives_cache_backed_memmap_mtime_changes(tmp_path: Pa
         build_tie_map_calls += 1
         return original_build_tie_map(genotypes, records, config)
 
-    def fake_fit_variational_em(
-        genotypes,
-        covariates,
-        targets,
-        records,
-        tie_map,
-        config,
-        validation_data,
-        resume_checkpoint=None,
-        checkpoint_callback=None,
-        predictor_offset=None,
-        validation_offset=None,
-        **_kwargs,
-    ):
+    def fake_fit_variational_em(genotypes, covariates, records, **_kwargs):
         return VariationalFitResult(
             alpha=np.zeros(covariates.shape[1], dtype=np.float32),
             beta_reduced=np.zeros(genotypes.shape[1], dtype=np.float32),
@@ -436,11 +423,8 @@ def test_fit_stage_cache_persists_cohort_artifacts_for_repeated_fits(tmp_path: P
         records,
         tie_map,
         config,
-        validation_data,
         resume_checkpoint=None,
         checkpoint_callback=None,
-        predictor_offset=None,
-        validation_offset=None,
         **_kwargs,
     ):
         return VariationalFitResult(
@@ -575,17 +559,15 @@ def test_fit_resumes_from_variational_checkpoint(tmp_path, monkeypatch):
         records,
         tie_map,
         config,
-        validation_data,
         resume_checkpoint=None,
         checkpoint_callback=None,
-        predictor_offset=None,
-        validation_offset=None,
         **_kwargs,
     ):
         completed_iterations = None if resume_checkpoint is None else resume_checkpoint.completed_iterations
         call_log.append(completed_iterations)
         reduced_records = mixture_module.collapse_tie_groups(list(records), tie_map)
         prior_design = mixture_module._build_prior_design(reduced_records)
+        assert checkpoint_callback is not None
         if resume_checkpoint is None:
             checkpoint_callback(
                 VariationalFitCheckpoint(
@@ -685,17 +667,15 @@ def test_fit_checkpoint_persists_basis_cache_during_interrupted_run(tmp_path, mo
         records,
         tie_map,
         config,
-        validation_data,
         resume_checkpoint=None,
         checkpoint_callback=None,
-        predictor_offset=None,
-        validation_offset=None,
         **_kwargs,
     ):
         reduced_records = mixture_module.collapse_tie_groups(list(records), tie_map)
         prior_design = mixture_module._build_prior_design(reduced_records)
         basis = np.arange(genotypes.shape[0] * 3, dtype=np.float64).reshape(genotypes.shape[0], 3)
         genotypes._sample_space_nystrom_basis_cpu_cache[(3, 19)] = basis
+        assert checkpoint_callback is not None
         checkpoint_callback(
             VariationalFitCheckpoint(
                 config_signature="runtime-basis-config",
@@ -851,11 +831,8 @@ def test_corrupt_variational_checkpoint_is_ignored(tmp_path, monkeypatch):
         records,
         tie_map,
         config,
-        validation_data,
         resume_checkpoint=None,
         checkpoint_callback=None,
-        predictor_offset=None,
-        validation_offset=None,
         **_kwargs,
     ):
         observed_resume_values.append(resume_checkpoint)
@@ -986,14 +963,12 @@ def test_training_records_from_stats_preserve_prior_continuous_features():
 
     training_records = _training_records_from_stats(
         records,
-        variant_stats=type(
-            "Stats",
-            (),
-            {
-                "allele_frequencies": np.array([0.2], dtype=np.float32),
-                "support_counts": np.array([7], dtype=np.int32),
-            },
-        )(),
+        variant_stats=VariantStatistics(
+            means=np.zeros(1, dtype=np.float32),
+            scales=np.ones(1, dtype=np.float32),
+            allele_frequencies=np.array([0.2], dtype=np.float32),
+            support_counts=np.array([7], dtype=np.int32),
+        ),
         variant_indices=np.array([0], dtype=np.int32),
     )
 
@@ -1076,11 +1051,8 @@ def test_fit_uses_cohort_allele_frequencies_for_maf_filter(monkeypatch):
         records,
         tie_map,
         config,
-        validation_data,
         resume_checkpoint=None,
         checkpoint_callback=None,
-        predictor_offset=None,
-        validation_offset=None,
         **_kwargs,
     ):
         reduced_count = genotypes.shape[1]
@@ -1153,11 +1125,8 @@ def test_coefficient_table_preserves_full_variant_alignment_after_filtering(tmp_
         records,
         tie_map,
         config,
-        validation_data,
         resume_checkpoint=None,
         checkpoint_callback=None,
-        predictor_offset=None,
-        validation_offset=None,
         **_kwargs,
     ):
         assert [record.variant_id for record in records] == ["common_keep_1", "common_keep_2"]
@@ -1278,16 +1247,12 @@ def test_fit_rejects_invalid_variant_stats_allele_frequencies():
             covariate_matrix,
             target_vector,
             variant_records,
-            variant_stats=type(
-                "Stats",
-                (),
-                {
-                    "means": np.zeros(genotype_matrix.shape[1], dtype=np.float32),
-                    "scales": np.ones(genotype_matrix.shape[1], dtype=np.float32),
-                    "allele_frequencies": np.array([0.2, 0.1, 1.2, 0.3, 0.4], dtype=np.float32),
-                    "support_counts": np.ones(genotype_matrix.shape[1], dtype=np.int32),
-                },
-            )(),
+            variant_stats=VariantStatistics(
+                means=np.zeros(genotype_matrix.shape[1], dtype=np.float32),
+                scales=np.ones(genotype_matrix.shape[1], dtype=np.float32),
+                allele_frequencies=np.array([0.2, 0.1, 1.2, 0.3, 0.4], dtype=np.float32),
+                support_counts=np.ones(genotype_matrix.shape[1], dtype=np.int32),
+            ),
         )
 
 
@@ -1305,16 +1270,12 @@ def test_fit_rejects_variant_stats_shape_mismatch():
             covariate_matrix,
             target_vector,
             variant_records,
-            variant_stats=type(
-                "Stats",
-                (),
-                {
-                    "means": np.zeros(genotype_matrix.shape[1] - 1, dtype=np.float32),
-                    "scales": np.ones(genotype_matrix.shape[1], dtype=np.float32),
-                    "allele_frequencies": np.zeros(genotype_matrix.shape[1], dtype=np.float32),
-                    "support_counts": np.ones(genotype_matrix.shape[1], dtype=np.int32),
-                },
-            )(),
+            variant_stats=VariantStatistics(
+                means=np.zeros(genotype_matrix.shape[1] - 1, dtype=np.float32),
+                scales=np.ones(genotype_matrix.shape[1], dtype=np.float32),
+                allele_frequencies=np.zeros(genotype_matrix.shape[1], dtype=np.float32),
+                support_counts=np.ones(genotype_matrix.shape[1], dtype=np.int32),
+            ),
         )
 
 

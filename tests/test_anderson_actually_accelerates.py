@@ -9,7 +9,6 @@ the number of completed iterations is no worse.
 from __future__ import annotations
 
 import numpy as np
-import pytest
 
 from sv_pgs.config import ModelConfig, TraitType
 from sv_pgs.inference import fit_variational_em

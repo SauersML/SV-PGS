@@ -13,6 +13,8 @@ order using a deterministic per-epoch RNG seeded by
 
 from __future__ import annotations
 
+from typing import Any
+
 import numpy as np
 
 from sv_pgs.config import ModelConfig, TraitType
@@ -42,8 +44,8 @@ def _make_data(seed: int = 0):
     return genotype_matrix, covariate_matrix, target_vector, records
 
 
-def _base_config(**overrides) -> ModelConfig:
-    kwargs = dict(
+def _base_config(**overrides: Any) -> ModelConfig:
+    kwargs: dict[str, Any] = dict(
         trait_type=TraitType.QUANTITATIVE,
         max_outer_iterations=3,
         stochastic_variational_updates=True,

@@ -374,9 +374,9 @@ class open_bed:
             with Path(self.path).open("rb") as bed_handle:
                 for output_index, bed_variant_index in enumerate(variant_index):
                     bed_handle.seek(PLINK1_HEADER_SIZE + int(bed_variant_index) * bytes_per_variant)
-                    payload = bed_handle.read(bytes_per_variant)
+                    payload_bytes = bed_handle.read(bytes_per_variant)
                     result[:, output_index] = _decode_payload_sample_indices(
-                        payload,
+                        payload_bytes,
                         iid_count=self.iid_count,
                         variant_count=1,
                         bytes_per_variant=bytes_per_variant,
@@ -397,9 +397,9 @@ class open_bed:
                         + int(bed_variant_index) * bytes_per_variant
                         + params.byte_start
                     )
-                    payload = bed_handle.read(params.byte_count)
+                    payload_bytes = bed_handle.read(params.byte_count)
                     result[:, output_index] = _decode_sample_window_payload(
-                        payload,
+                        payload_bytes,
                         variant_count=1,
                         byte_count=params.byte_count,
                         sample_count=params.sample_count,
@@ -412,9 +412,9 @@ class open_bed:
         with Path(self.path).open("rb") as bed_handle:
             for output_index, bed_variant_index in enumerate(variant_index):
                 bed_handle.seek(PLINK1_HEADER_SIZE + int(bed_variant_index) * bytes_per_variant)
-                payload = bed_handle.read(bytes_per_variant)
+                payload_bytes = bed_handle.read(bytes_per_variant)
                 result[:, output_index] = _decode_payload(
-                    payload,
+                    payload_bytes,
                     iid_count=self.iid_count,
                     variant_count=1,
                     bytes_per_variant=bytes_per_variant,

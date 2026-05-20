@@ -353,7 +353,7 @@ def _parse_pca_features_column(series: pd.Series, n_pcs: int) -> tuple[pd.DataFr
     log(f"  pca_features format preview (first row, truncated): {preview}")
 
     parsed = series.apply(_parse_row)
-    df = pd.DataFrame(parsed.tolist(), columns=pc_names, index=series.index)
+    df = pd.DataFrame(parsed.tolist(), columns=pd.Index(pc_names), index=series.index)
 
     n_total = len(series)
     n_parsed = n_total - n_failed
@@ -408,7 +408,10 @@ def merge_pcs_into_sample_table(
     # Extract PCs: either individual columns (PC1, PC2, ...) or a compound pca_features column
     if "pca_features" in ancestry.columns:
         log(f"  parsing compound pca_features column into PC1..PC{n_pcs}")
-        pc_df, pc_cols = _parse_pca_features_column(ancestry["pca_features"], n_pcs)
+        pca_features_col = ancestry["pca_features"]
+        if not isinstance(pca_features_col, pd.Series):
+            raise RuntimeError("Expected 'pca_features' to be a single column, got a DataFrame")
+        pc_df, pc_cols = _parse_pca_features_column(pca_features_col, n_pcs)
         for col in pc_cols:
             ancestry[col] = pc_df[col].values
     else:
@@ -454,7 +457,8 @@ def merge_pcs_into_sample_table(
     log(f"  merging on {merge_key} ({overlap_counts[merge_key]} matches)")
 
     ancestry_subset = ancestry[[id_col] + pc_cols].copy()
-    ancestry_subset = ancestry_subset.rename(columns={id_col: merge_key})
+    new_columns = [merge_key if column == id_col else column for column in ancestry_subset.columns]
+    ancestry_subset.columns = pd.Index(new_columns)
     merged = samples.merge(ancestry_subset, on=merge_key, how="left")
     n_with_pcs = int(merged[pc_cols[0]].notna().sum())
 
@@ -531,7 +535,6 @@ def _build_aou_run_metadata(
 # ("snv" for "snp", "sv+snp"/"snv+sv"/"sv+snv" for "snp+sv") which
 # _normalize_variants_choice folds back into one of these three tokens. Keeping
 # the canonical set tight means downstream branches stay easy to reason about.
-_AOU_VARIANT_CHOICES = ("sv", "snp", "snp+sv")
 _AOU_VARIANT_ALIASES: dict[str, str] = {
     "sv": "sv",
     "snp": "snp",

@@ -23,10 +23,8 @@ from sv_pgs.config import ModelConfig, TraitType
 from sv_pgs.inference import fit_variational_em
 from sv_pgs.mixture_inference import (
     VariationalFitCheckpoint,
-    _build_prior_design,
     _checkpoint_config_signature,
     _checkpoint_prior_design_signature,
-    collapse_tie_groups,
 )
 from sv_pgs.preprocessing import build_tie_map
 

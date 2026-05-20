@@ -17,7 +17,6 @@ import pickle
 import numpy as np
 import pytest
 
-from sv_pgs.anderson import AndersonState
 from sv_pgs.config import ModelConfig, TraitType
 from sv_pgs.inference import fit_variational_em
 from sv_pgs.mixture_inference import (

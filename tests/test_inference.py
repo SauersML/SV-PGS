@@ -428,7 +428,7 @@ def test_posterior_working_set_warm_start_reuses_cached_screening(random_generat
     )
     standardized._dense_cache = standardized.materialize()
     warm_start = mixture_inference._RestrictedPosteriorWarmStart()
-    solver_kwargs = dict(
+    solver_kwargs: dict[str, Any] = dict(
         genotype_matrix=standardized,
         covariate_matrix=np.ones((sample_count, 1), dtype=np.float64),
         targets=np.asarray(targets, dtype=np.float64),
@@ -4146,7 +4146,7 @@ def test_streaming_sample_space_operator_matmat_matches_dense_reference(random_g
         atol=1e-5,
     )
 def test_apply_sample_space_operator_gpu_dense_cache_uses_shared_gpu_matmuls(monkeypatch: pytest.MonkeyPatch):
-    sample_count, variant_count = 4, 5
+    variant_count = 5
     genotype_values = np.array(
         [
             [1.0, 0.0, 1.0, 0.0, 0.5],

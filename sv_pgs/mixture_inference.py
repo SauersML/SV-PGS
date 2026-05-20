@@ -59,22 +59,24 @@ import json
 import time
 from typing import Any, Callable, Iterable, Sequence, cast
 
-import sv_pgs._jax as _jax_side_effects  # side-effect: configures JAX/XLA env
-del _jax_side_effects
+# NOTE: `sv_pgs._jax` must be imported BEFORE `jax.numpy` etc., because importing
+# it has the side effect of configuring JAX/XLA environment variables.  We import
+# specific symbols from it on the first line to trigger module loading.
+from sv_pgs._jax import gpu_compute_jax_dtype, gpu_compute_numpy_dtype
 import jax.numpy as jnp
+import numpy as np
 from jax.scipy.linalg import solve_triangular as jax_solve_triangular
 from jax.scipy.special import digamma as jax_digamma
 from jax.scipy.special import gammaln as jax_gammaln
-import numpy as np
 from scipy.linalg import solve_triangular
 from scipy.optimize import minimize
 from scipy.special import kve as scipy_bessel_kve
 
-from sv_pgs._jax import gpu_compute_jax_dtype, gpu_compute_numpy_dtype
+from sv_pgs.anderson import AndersonState, anderson_step
 from sv_pgs.config import ModelConfig, TraitType, VariantClass
 from sv_pgs.data import NESTED_PATH_DELIMITER, TieMap, VariantRecord
-from sv_pgs.anderson import AndersonState, anderson_step
 from sv_pgs.elbo import compute_elbo
+from sv_pgs.forcing_sequence import forcing_tolerance, relaxed_iteration_cap
 from sv_pgs.genotype import (
     DEFAULT_GENOTYPE_BATCH_SIZE,
     DenseRawGenotypeMatrix,
@@ -82,22 +84,21 @@ from sv_pgs.genotype import (
     StandardizedGenotypeMatrix,
     _cupy_cache_is_int8_standardized,
     _cupy_cache_standardized_columns,
-    _iter_cupy_cache_standardized_batches,
     _cupy_compute_dtype,
+    _cupy_to_jax,
     _gpu_free_bytes,
     _gpu_total_bytes,
+    _iter_cupy_cache_standardized_batches,
     _iter_standardized_gpu_batches,
-    _try_import_cupy,
-    _cupy_to_jax,
     _to_cupy_compute,
     _to_cupy_float64,
+    _try_import_cupy,
 )
-from sv_pgs.forcing_sequence import forcing_tolerance, relaxed_iteration_cap
 from sv_pgs.linear_solvers import build_linear_operator, solve_spd_system, stochastic_logdet
 from sv_pgs.numeric import stable_sigmoid
-from sv_pgs.tr_newton import trust_region_newton_logistic
 from sv_pgs.preprocessing import collapse_tie_groups
 from sv_pgs.progress import log, mem
+from sv_pgs.tr_newton import trust_region_newton_logistic
 
 # GPU exact variant-space Cholesky: form X^T W X via cuBLAS + Cholesky.
 # Cost: O(n p²) matmul + O(p³) Cholesky. This is 10-20x faster than
@@ -2742,8 +2743,8 @@ def fit_variational_em(
                 elbo_history.append(float("nan"))
             log(f"  variational EM iteration {outer_iteration + 1}: objective={full_objective:.6f} sigma_e2={sigma_error2:.6f}")
 
-            validation_linear_predictor: np.ndarray | None = None
-            validation_metric_this_epoch: float | None = None
+            validation_linear_predictor = None
+            validation_metric_this_epoch = None
             if validation_payload is not None:
                 should_validate = (
                     outer_iteration == 0
@@ -3331,7 +3332,6 @@ def _fit_collapsed_posterior(
             compute_logdet=compute_logdet,
             compute_beta_variance=compute_beta_variance,
             sample_space_preconditioner_rank=config.sample_space_preconditioner_rank,
-            posterior_working_sets=True,
             posterior_working_set_min_variants=config.posterior_working_set_min_variants,
             posterior_working_set_initial_size=config.posterior_working_set_initial_size,
             posterior_working_set_growth=config.posterior_working_set_growth,
@@ -3373,7 +3373,6 @@ def _fit_collapsed_posterior(
             compute_beta_variance=compute_beta_variance,
             sample_space_preconditioner_rank=config.sample_space_preconditioner_rank,
             predictor_offset=predictor_offset_array,
-            posterior_working_sets=True,
             posterior_working_set_min_variants=config.posterior_working_set_min_variants,
             posterior_working_set_initial_size=config.posterior_working_set_initial_size,
             posterior_working_set_growth=config.posterior_working_set_growth,
@@ -3426,7 +3425,6 @@ def _quantitative_posterior_state(
     compute_logdet: bool = True,
     compute_beta_variance: bool = True,
     sample_space_preconditioner_rank: int = 256,
-    posterior_working_sets: bool = True,
     posterior_working_set_min_variants: int = 65_536,
     posterior_working_set_initial_size: int = 16_384,
     posterior_working_set_growth: int = 16_384,
@@ -3740,7 +3738,6 @@ def _binary_posterior_state_tr_newton(
     compute_beta_variance: bool,
     sample_space_preconditioner_rank: int,
     predictor_offset: np.ndarray | None,
-    posterior_working_sets: bool = True,
     posterior_working_set_min_variants: int = 65_536,
     posterior_working_set_initial_size: int,
     posterior_working_set_growth: int,
@@ -3925,7 +3922,6 @@ def _binary_posterior_state(
     compute_beta_variance: bool = True,
     sample_space_preconditioner_rank: int = 256,
     predictor_offset: np.ndarray | None = None,
-    posterior_working_sets: bool = True,
     posterior_working_set_min_variants: int = 65_536,
     posterior_working_set_initial_size: int = 16_384,
     posterior_working_set_growth: int = 16_384,
@@ -4858,7 +4854,6 @@ def _sample_space_nystrom_factor_gpu(
     cupy = _try_import_cupy()
     if cupy is None:
         return None
-    compute_cp_dtype = _cupy_compute_dtype(cupy)
     basis_gpu = _sample_space_nystrom_basis_gpu(
         genotype_matrix=genotype_matrix,
         batch_size=batch_size,
@@ -7962,7 +7957,6 @@ def _solve_restricted_mean_only(
     initial_beta_guess: np.ndarray | None = None,
     sample_space_preconditioner_rank: int = 256,
     warm_start: _RestrictedPosteriorWarmStart | None = None,
-    posterior_working_sets: bool = True,
     posterior_working_set_min_variants: int = 65_536,
     posterior_working_set_initial_size: int = 16_384,
     posterior_working_set_growth: int = 16_384,
@@ -8539,7 +8533,6 @@ def _restricted_posterior_state_posterior_working_set(
             random_seed=random_seed + working_pass,
             initial_beta_guess=current_beta[working_indices],
             sample_space_preconditioner_rank=sample_space_preconditioner_rank,
-            posterior_working_sets=False,
             allow_working_set=False,
             allow_gpu_exact_variant=allow_gpu_exact_variant,
         )
@@ -8711,7 +8704,6 @@ def _restricted_posterior_state_posterior_working_set(
         initial_beta_guess=current_beta,
         sample_space_preconditioner_rank=sample_space_preconditioner_rank,
         warm_start=warm_start,
-        posterior_working_sets=False,
         allow_working_set=False,
         allow_gpu_exact_variant=allow_gpu_exact_variant,
     )
@@ -8761,7 +8753,6 @@ def _solve_restricted_full(
     initial_beta_guess: np.ndarray | None = None,
     sample_space_preconditioner_rank: int = 256,
     warm_start: _RestrictedPosteriorWarmStart | None = None,
-    posterior_working_sets: bool = True,
     posterior_working_set_min_variants: int = 65_536,
     posterior_working_set_initial_size: int = 16_384,
     posterior_working_set_growth: int = 16_384,
@@ -10775,10 +10766,14 @@ def _unpack_anderson_hyperparameters(
     tpb_class_count: int,
 ) -> tuple[float, np.ndarray, np.ndarray, np.ndarray]:
     cursor = 0
-    log_g = float(packed[cursor]); cursor += 1
-    scale_coefs = packed[cursor:cursor + scale_model_dim].copy(); cursor += scale_model_dim
-    log_a = packed[cursor:cursor + tpb_class_count].copy(); cursor += tpb_class_count
-    log_b = packed[cursor:cursor + tpb_class_count].copy(); cursor += tpb_class_count
+    log_g = float(packed[cursor])
+    cursor += 1
+    scale_coefs = packed[cursor:cursor + scale_model_dim].copy()
+    cursor += scale_model_dim
+    log_a = packed[cursor:cursor + tpb_class_count].copy()
+    cursor += tpb_class_count
+    log_b = packed[cursor:cursor + tpb_class_count].copy()
+    cursor += tpb_class_count
     return log_g, scale_coefs, log_a, log_b
 
 

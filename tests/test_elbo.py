@@ -35,7 +35,6 @@ def test_quantitative_elbo_matches_marginal_loglik():
     tau2 = np.array([0.5, 1.5, 0.7])
     sigma2 = 0.4
     beta_true = rng.standard_normal(p) * np.sqrt(tau2)
-    y = X @ beta_true + rng.standard_normal(n) * np.sqrt(sigma2)
 
     # Off-diagonal of S is non-zero in general, so ELBO with diagonal q is
     # strictly less than log p(y). Use a diagonal design (orthogonal cols)

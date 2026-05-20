@@ -346,6 +346,8 @@ def _vcf_record_count_hint(reader: Any) -> int | None:
                 continue
         if value is None:
             continue
+        if not isinstance(value, (int, np.integer, float, np.floating, str)):
+            continue
         try:
             resolved_value = int(value)
         except (TypeError, ValueError):
@@ -431,9 +433,10 @@ def load_dataset_from_files(
         )
         # Lazy row subset: wrap the mmap'd matrix instead of writing a temp
         # mmap with the row-permuted copy. See RowSubsetRawGenotypeMatrix.
-        genotype_matrix = _lazy_row_subset(genotype_matrix, keep_indices)
+        vcf_raw_genotypes: RawGenotypeMatrix | None
+        vcf_raw_genotypes = _lazy_row_subset(genotype_matrix, keep_indices)
 
-        log(f"VCF loaded: {genotype_matrix.shape[0]} samples x {len(default_variants)} variants  mem={mem()}")
+        log(f"VCF loaded: {vcf_raw_genotypes.shape[0]} samples x {len(default_variants)} variants  mem={mem()}")
         plink_metadata = None
     elif resolved_format == "plink1":
         log("reading PLINK .fam/.bim metadata (no genotype data yet)...")
@@ -443,7 +446,7 @@ def load_dataset_from_files(
         bed_size = source_path.stat().st_size / 1e9
         full_matrix_gb = len(source_sample_ids) * plink_metadata.variant_count * 4 / 1e9
         log(f"  .bed file size: {bed_size:.2f} GB  |  full float32 matrix would be: {full_matrix_gb:.1f} GB")
-        genotype_matrix = None
+        vcf_raw_genotypes = None
         default_variants = None
     else:
         raise ValueError("Unsupported genotype format: " + resolved_format)
@@ -490,10 +493,10 @@ def load_dataset_from_files(
         log(f"aligned {len(aligned_sample_indices)} phenotype rows against {len(source_sample_ids)} genotype samples")
 
     if resolved_format == "vcf":
-        # genotype_matrix is already subsetted to aligned samples (int8 for VCF)
-        if genotype_matrix is None:
+        # vcf_raw_genotypes is already subsetted to aligned samples (int8 for VCF)
+        if vcf_raw_genotypes is None:
             raise RuntimeError("VCF genotype matrix was not initialized.")
-        raw_genotypes = as_raw_genotype_matrix(genotype_matrix)
+        raw_genotypes = as_raw_genotype_matrix(vcf_raw_genotypes)
         if default_variants is None:
             raise RuntimeError("VCF defaults were not initialized.")
         log(f"VCF matrix: {raw_genotypes.shape}  mem={mem()}")
@@ -658,9 +661,10 @@ def load_multi_vcf_dataset_from_files(
         genotype_matrix, chromosome_variants, chromosome_stats = _load_vcf_with_cache(
             source_path, config=config, mmap_mode="r",
         )
+        chromosome_raw: RawGenotypeMatrix = as_raw_genotype_matrix(genotype_matrix)
         if not skip_subset:
-            genotype_matrix = _lazy_row_subset(genotype_matrix, keep_sample_indices)
-        raw_matrices.append(as_raw_genotype_matrix(genotype_matrix))
+            chromosome_raw = _lazy_row_subset(chromosome_raw, keep_sample_indices)
+        raw_matrices.append(chromosome_raw)
         per_chr_variants.append(list(chromosome_variants))
         per_chr_stats.append(chromosome_stats)
         total_variants += len(chromosome_variants)
@@ -918,9 +922,9 @@ def load_multi_source_dataset_from_files(
                 len(keep_indices) == n_native
                 and np.array_equal(keep_indices, np.arange(n_native, dtype=np.intp))
             )
-            if not skip_subset:
-                genotype_matrix = _lazy_row_subset(genotype_matrix, keep_indices)
             raw: RawGenotypeMatrix = as_raw_genotype_matrix(genotype_matrix)
+            if not skip_subset:
+                raw = _lazy_row_subset(raw, keep_indices)
             variants_list = list(variants)
         else:
             meta = _load_plink1_metadata(path)
@@ -1524,30 +1528,6 @@ def _load_variant_metadata(path: Path) -> list[_VariantDefaults]:
     ]
 
 
-def _write_vcf_cache_manifest(
-    manifest_path: Path,
-    *,
-    sample_count: int,
-    variant_count: int,
-    stats_file: str,
-    source_signature: str,
-) -> None:
-    _atomic_write_text(
-        manifest_path,
-        json.dumps(
-            {
-                "manifest_version": _VCF_CACHE_MANIFEST_VERSION,
-                "sample_count": int(sample_count),
-                "variant_count": int(variant_count),
-                "dtype": "int8",
-                "fortran_order": True,
-                "stats_file": stats_file,
-                "source_signature": source_signature,
-            }
-        ),
-    )
-
-
 def _load_vcf_cache_stats(stats_path: Path) -> VariantStatistics:
     stats_payload = np.load(stats_path, mmap_mode="r")
     try:
@@ -1670,20 +1650,20 @@ def _madvise_willneed(array: np.ndarray) -> None:
     willneed = getattr(os, "POSIX_MADV_WILLNEED", None)
     if posix_madvise is None or willneed is None:
         return
-    base = array
-    while getattr(base, "base", None) is not None:
-        base = base.base
-    mmap_obj = base if hasattr(base, "size") and hasattr(base, "read") else None
     try:
         import mmap as _mmap_module
-        if isinstance(base, _mmap_module.mmap):
-            mmap_obj = base
     except ImportError:
         return
-    if mmap_obj is None:
+    base: object = array
+    while getattr(base, "base", None) is not None:
+        next_base = getattr(base, "base", None)
+        if next_base is None:
+            break
+        base = next_base
+    if not isinstance(base, _mmap_module.mmap):
         return
     try:
-        posix_madvise(mmap_obj, 0, len(mmap_obj), willneed)
+        posix_madvise(base, 0, len(base), willneed)
     except (OSError, ValueError):
         pass
 
@@ -1946,89 +1926,6 @@ def _vcf_cache_audit_reason(vcf_path: Path, paths: _VcfCachePaths) -> str | None
             )
 
     return None
-
-
-def _repair_vcf_cache_duplicates(
-    vcf_path: Path,
-    paths: _VcfCachePaths,
-    config: ModelConfig,
-) -> int:
-    """In-place dedupe of a cache that has duplicate variant_ids.
-
-    Keeps the first occurrence of each variant_id and rewrites all three
-    artifacts (matrix, stats, variants) consistently. Returns the number of
-    duplicate rows removed, or 0 if there was nothing to fix.
-
-    This is the fast repair for caches damaged by the older append-bug
-    (where stale .geno bytes from a killed worker got concatenated under
-    a re-parse, producing a handful of duplicate variant_ids per file).
-    Re-parsing the full VCF takes ~5 min per chromosome; dedupe is seconds.
-    """
-    variants = _load_variant_metadata(paths.var_path)
-    seen: set[str] = set()
-    keep_positions: list[int] = []
-    for index, variant in enumerate(variants):
-        if variant.variant_id not in seen:
-            seen.add(variant.variant_id)
-            keep_positions.append(index)
-    removed = len(variants) - len(keep_positions)
-    if removed == 0:
-        return 0
-
-    keep_index = np.asarray(keep_positions, dtype=np.int64)
-    matrix = np.load(paths.geno_path, mmap_mode="r")
-    if matrix.ndim != 2 or matrix.shape[1] != len(variants):
-        raise RuntimeError(
-            "matrix shape does not match variant count "
-            f"({matrix.shape} vs {len(variants)} variants); cannot dedupe safely."
-        )
-    deduped_matrix = np.ascontiguousarray(np.asarray(matrix[:, keep_index], dtype=np.int8))
-
-    stats = _load_vcf_cache_stats(paths.stats_path)
-    if stats.means.shape[0] != len(variants):
-        raise RuntimeError(
-            f"stats length ({stats.means.shape[0]}) does not match variant "
-            f"count ({len(variants)}); cannot dedupe safely."
-        )
-    deduped_stats = VariantStatistics(
-        means=np.ascontiguousarray(stats.means[keep_index]),
-        scales=np.ascontiguousarray(stats.scales[keep_index]),
-        allele_frequencies=np.ascontiguousarray(stats.allele_frequencies[keep_index]),
-        support_counts=np.ascontiguousarray(stats.support_counts[keep_index]),
-    )
-
-    deduped_variants = [variants[i] for i in keep_positions]
-    _save_vcf_to_cache(
-        vcf_path,
-        deduped_matrix,
-        deduped_variants,
-        deduped_stats,
-        config=config,
-        cache_paths=paths,
-    )
-    return removed
-
-
-def _invalidate_vcf_cache(paths: _VcfCachePaths) -> None:
-    """Remove every file that makes up a VCF cache bundle.
-
-    Walks both current (.npz/.npy) and legacy (.pkl) naming so a stale cache
-    written by an older code version still gets cleaned up properly.
-    """
-    candidates = [
-        paths.geno_path,
-        paths.var_path,
-        paths.stats_path,
-        paths.manifest_path,
-        paths.cache_dir / f"{paths.key}.variants.pkl",
-        paths.cache_dir / f"{paths.key}.stats.npy",
-        paths.cache_dir / f"{paths.key}.stats.npz",
-    ]
-    for candidate in candidates:
-        try:
-            candidate.unlink(missing_ok=True)
-        except OSError:
-            pass
 
 
 def _is_vcf_cache_bundle_complete(paths: _VcfCachePaths) -> bool:
@@ -2515,7 +2412,6 @@ def _region_parse_worker(args: tuple) -> tuple[int, str]:
     (seconds of work, not the entire region).
     """
     import json
-    import os
     import struct
     import subprocess
     import sys

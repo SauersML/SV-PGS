@@ -1,13 +1,21 @@
 """Shared numerical utilities."""
 from __future__ import annotations
 
-import sv_pgs._jax as _jax_side_effects  # side-effect: configures JAX/XLA env
-del _jax_side_effects
+import importlib
+from typing import TYPE_CHECKING
 
-import jax.numpy as jnp
+# Importing sv_pgs._jax configures XLA env vars before any direct jax import.
+# Use importlib so static-analysis tools don't reorder it past the jax import.
+importlib.import_module("sv_pgs._jax")
+jnp = importlib.import_module("jax.numpy")
+
+if TYPE_CHECKING:
+    from jax import Array as _JaxArray
+else:
+    _JaxArray = object
 
 
-def stable_sigmoid(values) -> jnp.ndarray:
+def stable_sigmoid(values) -> "_JaxArray":
     """Convert a real-valued score to a probability between 0 and 1.
 
     sigmoid(x) = 1 / (1 + exp(-x))

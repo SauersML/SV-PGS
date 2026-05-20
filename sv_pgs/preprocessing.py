@@ -1129,7 +1129,7 @@ def _iter_tie_map_batches(
     if standardized_genotypes.raw is not None and not _uses_identity_standardization(standardized_genotypes):
         local_start = 0
         raw = standardized_genotypes.raw
-        if hasattr(raw, "iter_column_batches_i8"):
+        if _supports_int8_batches(raw):
             batch_iter = raw.iter_column_batches_i8(
                 standardized_genotypes.variant_indices,
                 batch_size=batch_size,
@@ -1457,7 +1457,7 @@ def collapse_tie_groups(
     if not tie_map.reduced_to_group:
         kept_indices = np.asarray(tie_map.kept_indices, dtype=np.int32)
         if kept_indices.shape[0] == len(records) and np.array_equal(kept_indices, np.arange(len(records), dtype=np.int32)):
-            return records if isinstance(records, list) else list(records)
+            return cast(list[VariantRecord], records) if isinstance(records, list) else list(records)
         return [records[int(record_index)] for record_index in kept_indices]
     if len(tie_map.reduced_to_group) == len(records):
         record_indices = np.arange(len(records), dtype=np.int32)
@@ -1465,7 +1465,7 @@ def collapse_tie_groups(
             np.array_equal(tie_map.kept_indices, record_indices)
             and np.array_equal(tie_map.original_to_reduced, record_indices)
         ):
-            return records if isinstance(records, list) else list(records)
+            return cast(list[VariantRecord], records) if isinstance(records, list) else list(records)
 
     collapsed_records: list[VariantRecord] = []
     for tie_group in tie_map.reduced_to_group:

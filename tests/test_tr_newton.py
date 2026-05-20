@@ -1,8 +1,9 @@
 """Tests for trust-region Newton-CG penalized logistic solver."""
 from __future__ import annotations
 
+from typing import Any
+
 import numpy as np
-import pytest
 from scipy import optimize
 
 from sv_pgs.tr_newton import trust_region_newton_logistic
@@ -37,11 +38,11 @@ def _make_problem(
     }
 
 
-def _solver_kwargs(problem: dict, *, tau_sq: float = 100.0, **overrides) -> dict:
+def _solver_kwargs(problem: dict, *, tau_sq: float = 100.0, **overrides: Any) -> dict:
     n, p = problem["X"].shape
     q = problem["W"].shape[1]
     X = problem["X"]
-    kwargs = dict(
+    kwargs: dict[str, Any] = dict(
         matvec_design=lambda v: X @ v,
         matvec_design_transpose=lambda u: X.T @ u,
         covariate_matrix=problem["W"],
