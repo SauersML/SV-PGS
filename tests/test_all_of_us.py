@@ -678,7 +678,7 @@ def test_run_all_of_us_runs_single_unified_fit_and_reuses_cached_downloads(monke
 
     release_calls: list[str] = []
     loader_calls: list[list[str]] = []
-    pipeline_calls: list[tuple[int, Path, float, int]] = []
+    pipeline_calls: list[tuple[int, Path]] = []
 
     def fake_prepare(request, output_path, **kwargs):
         Path(output_path).write_text("sample_id\tperson_id\ttarget\tage_at_observation_start\tgender_concept_id\trace_concept_id\tethnicity_concept_id\n", encoding="utf-8")

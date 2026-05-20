@@ -206,7 +206,7 @@ def main(argv: list[str] | None = None) -> int:
         wants_all = bool(args.all_diseases) or normalized_disease in {"all", "top20"}
         if wants_all and args.all_diseases and disease_value is not None and normalized_disease not in {"all", "top20"}:
             raise ValueError("--all-diseases is mutually exclusive with --disease")
-        if not wants_all and disease_value is None:
+        if disease_value is None and not wants_all:
             raise ValueError("Either --disease or --all-diseases is required.")
         if wants_all:
             run_all_of_us_all_diseases(
@@ -221,6 +221,7 @@ def main(argv: list[str] | None = None) -> int:
                 marginal_screen_min_abs_z=args.marginal_screen_min_abs_z,
             )
             return 0
+        assert disease_value is not None
         run_all_of_us(
             disease=disease_value,
             chromosomes=chromosomes,
