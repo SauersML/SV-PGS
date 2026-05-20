@@ -1016,26 +1016,94 @@ def _iter_standardized_gpu_batches(
     resolved_dtype = cupy.float32 if dtype is None else dtype
     selected_means = cupy.asarray(means[variant_indices], dtype=resolved_dtype)
     selected_scales = cupy.asarray(scales[variant_indices], dtype=resolved_dtype)
-    local_start = 0
+    variant_indices_arr = np.asarray(variant_indices)
+    n = int(variant_indices_arr.shape[0])
+    if n == 0:
+        return
+    safe_batch_size = max(int(batch_size), 1)
+    sample_count = int(raw.shape[0])
+
     if _supports_int8_batches(raw):
-        batch_iter = raw.iter_column_batches_i8(variant_indices, batch_size=batch_size)
         missing_sentinel: int | None = int(PLINK_MISSING_INT8)
+        i8_raw = raw
+        def _read_chunk(chunk_indices: np.ndarray) -> np.ndarray:
+            for batch in i8_raw.iter_column_batches_i8(chunk_indices, batch_size=chunk_indices.shape[0]):
+                return np.asarray(batch.values)
+            return np.empty((sample_count, 0), dtype=np.int8)
     else:
-        batch_iter = raw.iter_column_batches(variant_indices, batch_size=batch_size)
         missing_sentinel = None
-    for raw_batch in batch_iter:
-        batch_width = raw_batch.values.shape[1]
-        local_stop = local_start + batch_width
-        batch_slice = slice(local_start, local_stop)
-        yield batch_slice, _standardize_batch_cupy(
-            raw_batch.values,
-            selected_means[batch_slice],
-            selected_scales[batch_slice],
-            cupy,
-            missing_sentinel=missing_sentinel,
-            dtype=resolved_dtype,
-        )
-        local_start = local_stop
+        float_raw = raw
+        def _read_chunk(chunk_indices: np.ndarray) -> np.ndarray:
+            for batch in float_raw.iter_column_batches(chunk_indices, batch_size=chunk_indices.shape[0]):
+                return np.asarray(batch.values)
+            return np.empty((sample_count, 0), dtype=np.float32)
+
+    chunk_starts = list(range(0, n, safe_batch_size))
+    chunks = [variant_indices_arr[s : s + safe_batch_size] for s in chunk_starts]
+
+    # Parallel disk reads: cloud SSDs (e.g., AoU GCP-PD) deliver multi-GB/s
+    # with several concurrent readers but only a few hundred MB/s with a
+    # single sequential reader. Submitting reads to a small thread pool with
+    # bounded in-flight depth saturates that parallel bandwidth without
+    # blowing host memory. NumPy fancy-indexing releases the GIL during the
+    # underlying memcpy, so the threads actually run concurrently on I/O.
+    num_io_workers = min(4, max(1, len(chunks)))
+    in_flight_limit = num_io_workers * 2
+    if num_io_workers <= 1 or len(chunks) <= 1:
+        local_start = 0
+        for chunk in chunks:
+            values = _read_chunk(chunk)
+            batch_width = values.shape[1]
+            local_stop = local_start + batch_width
+            batch_slice = slice(local_start, local_stop)
+            yield batch_slice, _standardize_batch_cupy(
+                values,
+                selected_means[batch_slice],
+                selected_scales[batch_slice],
+                cupy,
+                missing_sentinel=missing_sentinel,
+                dtype=resolved_dtype,
+            )
+            local_start = local_stop
+        return
+
+    from collections import deque as _deque
+    executor = ThreadPoolExecutor(
+        max_workers=num_io_workers,
+        thread_name_prefix="standardized-gpu-prefetch",
+    )
+    futures: _deque = _deque()
+    next_to_submit = 0
+
+    def _submit_more() -> None:
+        nonlocal next_to_submit
+        while next_to_submit < len(chunks) and len(futures) < in_flight_limit:
+            futures.append(executor.submit(_read_chunk, chunks[next_to_submit]))
+            next_to_submit += 1
+
+    try:
+        _submit_more()
+        local_start = 0
+        while futures:
+            future = futures.popleft()
+            values = future.result()
+            _submit_more()
+            batch_width = values.shape[1]
+            local_stop = local_start + batch_width
+            batch_slice = slice(local_start, local_stop)
+            yield batch_slice, _standardize_batch_cupy(
+                values,
+                selected_means[batch_slice],
+                selected_scales[batch_slice],
+                cupy,
+                missing_sentinel=missing_sentinel,
+                dtype=resolved_dtype,
+            )
+            local_start = local_stop
+    finally:
+        for pending in futures:
+            pending.cancel()
+        executor.shutdown(wait=False)
 
 
 def _standardized_streaming_target_batch_bytes(raw: RawGenotypeMatrix) -> int:
