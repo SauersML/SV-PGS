@@ -22,6 +22,8 @@ from sv_pgs.genotype import (
     PlinkRawGenotypeMatrix,
     RawGenotypeMatrix,
     RowSubsetRawGenotypeMatrix,
+    _has_sufficient_free_space_for_int8_npy,
+    _int8_npy_header_bytes,
     as_raw_genotype_matrix,
     auto_batch_size_i8,
 )
@@ -1176,6 +1178,70 @@ _VCF_CACHE_STATS_DTYPE = np.dtype(
         ("support_counts", "<i4"),
     ]
 )
+
+
+@dataclass(slots=True)
+class _StreamingInt8NpyWriter:
+    path: Path
+    shape: tuple[int, int]
+    fortran_order: bool
+    _handle: BinaryIO
+    _written_variants: int = 0
+    _closed: bool = False
+
+    @classmethod
+    def open(cls, path: Path, *, shape: tuple[int, int], fortran_order: bool) -> _StreamingInt8NpyWriter:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        handle = path.open("wb")
+        try:
+            handle.write(_int8_npy_header_bytes(shape, fortran_order=fortran_order))
+        except BaseException:
+            handle.close()
+            path.unlink(missing_ok=True)
+            raise
+        return cls(path=path, shape=shape, fortran_order=fortran_order, _handle=handle)
+
+    def write_columns(self, values: np.ndarray) -> None:
+        if self._closed:
+            raise ValueError("Cannot write to a closed int8 cache writer.")
+        batch = np.asarray(values, dtype=np.int8)
+        if batch.ndim != 2:
+            raise ValueError("PLINK int8 cache batches must be two-dimensional.")
+        if batch.shape[0] != self.shape[0]:
+            raise ValueError(
+                f"PLINK int8 cache batch sample count mismatch: {batch.shape[0]} != {self.shape[0]}"
+            )
+        next_written = self._written_variants + int(batch.shape[1])
+        if next_written > self.shape[1]:
+            raise ValueError(
+                f"PLINK int8 cache batch overruns expected variant count: {next_written} > {self.shape[1]}"
+            )
+        if self.fortran_order:
+            self._handle.write(np.asfortranarray(batch).tobytes(order="F"))
+        else:
+            self._handle.write(np.ascontiguousarray(batch).tobytes(order="C"))
+        self._written_variants = next_written
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        try:
+            if self._written_variants != self.shape[1]:
+                raise ValueError(
+                    "PLINK int8 cache variant count mismatch after streaming write: "
+                    + f"{self._written_variants} != {self.shape[1]}"
+                )
+            self._handle.flush()
+            os.fsync(self._handle.fileno())
+        finally:
+            self._closed = True
+            self._handle.close()
+
+    def abort(self) -> None:
+        if not self._closed:
+            self._closed = True
+            self._handle.close()
+        self.path.unlink(missing_ok=True)
 _VCF_CACHE_VARIANT_NUMERIC_DTYPE = np.dtype(
     [
         ("variant_class_code", "<u2"),
@@ -1564,45 +1630,54 @@ def compute_plink_variant_statistics_cached(
     # (test fixtures, toy datasets) don't benefit from the cache and would
     # complicate the calling tests that monkeypatch compute_variant_statistics.
     int8_eligible = n_samples * n_variants >= _PLINK_INT8_CACHE_MIN_CELLS
-    int8_cache: np.ndarray | None = None
+    int8_cache_writer: _StreamingInt8NpyWriter | None = None
     int8_tmp_path: Path | None = None
     if int8_eligible:
-        try:
-            int8_tmp_path = int8_path.with_suffix(".tmp.npy")
-            int8_path.parent.mkdir(parents=True, exist_ok=True)
-            int8_cache = np.lib.format.open_memmap(
-                int8_tmp_path,
-                mode="w+",
-                dtype=np.int8,
-                shape=(n_samples, n_variants),
-                fortran_order=True,
+        int8_tmp_path = int8_path.with_suffix(".tmp.npy")
+        int8_path.parent.mkdir(parents=True, exist_ok=True)
+        has_space, required_bytes, available_bytes = _has_sufficient_free_space_for_int8_npy(
+            int8_path.parent,
+            (n_samples, n_variants),
+            fortran_order=True,
+        )
+        if not has_space:
+            raise OSError(
+                "Insufficient free space for PLINK int8 cache: "
+                + f"need at least {required_bytes / 1e9:.1f} GB plus reserve, "
+                + f"free {available_bytes / 1e9:.1f} GB at {int8_path.parent}"
             )
-            expected_gb = n_samples * n_variants / 1e9
-            log(
-                f"  building PLINK int8 cache at {int8_tmp_path.name} "
-                f"({n_samples:,} × {n_variants:,} = {expected_gb:.1f} GB) — "
-                f"future passes will mmap-read this instead of re-decoding bed bytes"
-            )
-        except OSError as exc:
-            log(f"  could not allocate int8 cache ({exc!r}); continuing stats-only")
-            int8_cache = None
-            int8_tmp_path = None
+        int8_cache_writer = _StreamingInt8NpyWriter.open(
+            int8_tmp_path,
+            shape=(n_samples, n_variants),
+            fortran_order=True,
+        )
+        expected_gb = n_samples * n_variants / 1e9
+        log(
+            f"  building PLINK int8 cache at {int8_tmp_path.name} "
+            f"({n_samples:,} x {n_variants:,} = {expected_gb:.1f} GB) - "
+            f"future passes will stream-read this instead of re-decoding bed bytes"
+        )
 
-    variant_stats = _compute_variant_stats_teeing_int8(
-        raw_genotypes, config=config, int8_cache=int8_cache,
-    )
+    try:
+        variant_stats = _compute_variant_stats_teeing_int8(
+            raw_genotypes, config=config, int8_cache_writer=int8_cache_writer,
+        )
+    except BaseException:
+        if int8_cache_writer is not None:
+            int8_cache_writer.abort()
+        raise
 
-    if int8_cache is not None and int8_tmp_path is not None:
+    if int8_cache_writer is not None and int8_tmp_path is not None:
         try:
-            int8_cache.flush()
-            del int8_cache  # release mmap before rename on some platforms
+            int8_cache_writer.close()
             int8_tmp_path.replace(int8_path)
             log(
                 f"  PLINK int8 cache saved ({int8_path.stat().st_size / 1e9:.1f} GB) → "
                 f"{int8_path.name}  mem={mem()}"
             )
-        except OSError as exc:
-            log(f"  PLINK int8 cache finalize failed ({exc!r}); leaving tmp in place")
+        except (OSError, ValueError) as exc:
+            int8_cache_writer.abort()
+            raise OSError(f"PLINK int8 cache finalize failed: {exc!r}") from exc
     try:
         _write_plink_stats_cache(stats_path, variant_stats)
         log(f"  PLINK stats cache saved ({stats_path.stat().st_size / 1e6:.1f} MB)  mem={mem()}")
@@ -1615,14 +1690,15 @@ def _compute_variant_stats_teeing_int8(
     raw_genotypes: PlinkRawGenotypeMatrix,
     *,
     config: ModelConfig,
-    int8_cache: np.ndarray | None,
+    int8_cache_writer: _StreamingInt8NpyWriter | None,
 ) -> VariantStatistics:
-    """compute_variant_statistics + optional tee of each decoded batch to
-    the supplied int8 mmap. Single bed-file pass; the mmap write is
-    a sequential int8 block per batch and runs concurrently with the JAX
-    compute on the previous batch via the standard prefetcher.
+    """compute_variant_statistics + optional tee of each decoded batch.
+
+    The int8 cache is written through normal file writes, not a writable
+    mmap. A sparse writable mmap can SIGBUS the Python process if the
+    filesystem runs out of backing space during a page fault.
     """
-    if int8_cache is None:
+    if int8_cache_writer is None:
         return compute_variant_statistics(raw_genotypes, config=config)
     # Stream once, tee batches to the int8 cache, accumulate stats inline.
     # Mirrors the logic of compute_variant_statistics but without spinning
@@ -1660,10 +1736,12 @@ def _compute_variant_stats_teeing_int8(
         fetch_seconds = _time.monotonic() - fetch_start
         batch_number += 1
         batch_indices = np.asarray(batch.variant_indices, dtype=np.int64)
-        # Tee: write the decoded int8 batch to the cache mmap. F-order
-        # cache, F-order batch values → sequential write per column block.
+        # Tee: write the decoded int8 batch as a sequential column block.
         tee_start = _time.monotonic()
-        int8_cache[:, batch_indices[0]:batch_indices[-1] + 1] = batch.values
+        expected_start = variants_done
+        if int(batch_indices[0]) != expected_start or not np.all(np.diff(batch_indices) == 1):
+            raise ValueError("PLINK int8 cache tee requires contiguous variant batches.")
+        int8_cache_writer.write_columns(batch.values)
         tee_seconds = _time.monotonic() - tee_start
         # Stats compute on the JAX side.
         compute_start = _time.monotonic()

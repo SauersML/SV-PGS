@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-import mmap as _mmap
+import os
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Literal
@@ -110,9 +110,7 @@ class open_bed:
     properties: dict[str, Any] | None = None
     count_A1: bool = True
     num_threads: int | None = None
-    _mmap_bytes: np.ndarray | None = field(init=False, default=None, repr=False)
-    _raw_mmap: Any = field(init=False, default=None, repr=False)
-    _mmap_handle: Any = field(init=False, default=None, repr=False)
+    _bed_fd: int | None = field(init=False, default=None, repr=False)
 
     def __post_init__(self) -> None:
         self.path = Path(self.path)
@@ -134,35 +132,107 @@ class open_bed:
                 "PLINK 1 .bed size does not match iid_count/sid_count: "
                 + f"expected {expected_size} bytes, found {actual_size}"
             )
-
-    def _bytes_view(self) -> np.ndarray:
-        """Return a uint8 numpy view over the entire .bed file via mmap.
-
-        Lazy: built on first use, cached for the lifetime of this reader.
-        Avoids the per-batch open/seek/read(720 MB → bytes-copy) sequence
-        that used to allocate a fresh Python bytes object — and a numpy
-        wrapper for it — every batch.
-
-        Uses raw Python mmap so we can call madvise(MADV_SEQUENTIAL) — on
-        slow / networked storage (GCP persistent disk, NFS, etc.) this
-        hint tells the kernel to aggressively read-ahead and discard
-        already-read pages, often turning a multi-megabyte-per-second
-        sustained throughput into something close to the device's
-        bandwidth limit. Falls back gracefully on platforms that don't
-        expose madvise.
-        """
-        if self._mmap_bytes is None:
-            handle = Path(self.path).open("rb")
-            raw = _mmap.mmap(handle.fileno(), 0, access=_mmap.ACCESS_READ)
+        # Eager open so prefetch threads race-free; lifetime matches reader.
+        self._bed_fd = os.open(str(self.path), os.O_RDONLY)
+        fadvise = getattr(os, "posix_fadvise", None)
+        advice = getattr(os, "POSIX_FADV_RANDOM", None)
+        if fadvise is not None and advice is not None:
             try:
-                if hasattr(raw, "madvise") and hasattr(_mmap, "MADV_SEQUENTIAL"):
-                    raw.madvise(_mmap.MADV_SEQUENTIAL)
+                fadvise(self._bed_fd, 0, 0, advice)
             except OSError:
                 pass
-            self._mmap_handle = handle
-            self._raw_mmap = raw
-            self._mmap_bytes = np.frombuffer(raw, dtype=np.uint8)
-        return self._mmap_bytes
+
+    def _ensure_fd(self) -> int:
+        """Open the .bed file once and reuse the descriptor across threads.
+
+        We deliberately do NOT mmap. On networked / GCP persistent-disk
+        storage, mmap turns transient I/O failures into SIGBUS, which
+        terminates the process, instead of a recoverable OSError. We hit
+        exactly this under sustained multi-threaded prefetch: a worker
+        thread would page-fault into a previously-evicted region (the
+        MADV_SEQUENTIAL hint we used to set tells the kernel to drop
+        already-read pages aggressively, which is actively wrong when
+        multiple workers each read their own disjoint batch ranges) and
+        the kernel would raise SIGBUS instead of returning EIO.
+
+        os.pread is thread-safe (no shared file-offset state) and surfaces
+        I/O errors as OSError, which the prefetch executor can retry or
+        propagate cleanly.
+        """
+        if self._bed_fd is None:
+            raise RuntimeError("PLINK reader file descriptor is closed.")
+        return self._bed_fd
+
+    def _pread_payload(self, offset: int, length: int) -> np.ndarray:
+        """Positional read of `length` bytes at `offset` into a fresh uint8 array.
+
+        Loops over short reads (pread on some filesystems can return fewer
+        bytes than requested even mid-file). Returns a numpy-owned buffer
+        with no shared mmap pages and no SIGBUS exposure.
+        """
+        if length <= 0:
+            return np.empty((0,), dtype=np.uint8)
+        fd = self._ensure_fd()
+        buffer = np.empty((length,), dtype=np.uint8)
+        view = memoryview(buffer).cast("B")
+        bytes_read = 0
+        while bytes_read < length:
+            chunk = os.pread(fd, length - bytes_read, offset + bytes_read)
+            if not chunk:
+                raise OSError(
+                    f"Unexpected EOF reading PLINK .bed at offset {offset + bytes_read}: "
+                    f"requested {length - bytes_read} bytes, got 0"
+                )
+            chunk_len = len(chunk)
+            view[bytes_read : bytes_read + chunk_len] = chunk
+            bytes_read += chunk_len
+        return buffer
+
+    def _pread_sample_window_payload(
+        self,
+        *,
+        variant_start: int,
+        variant_count: int,
+        bytes_per_variant: int,
+        byte_start: int,
+        byte_count: int,
+    ) -> np.ndarray:
+        """Read only a contiguous sample byte window from each variant record."""
+        if variant_count <= 0 or byte_count <= 0:
+            return np.empty((0,), dtype=np.uint8)
+        if byte_start < 0 or byte_count < 0 or byte_start + byte_count > bytes_per_variant:
+            raise ValueError("PLINK sample byte window is out of bounds.")
+        fd = self._ensure_fd()
+        payload = np.empty((variant_count * byte_count,), dtype=np.uint8)
+        output = memoryview(payload).cast("B")
+        for local_variant_index in range(variant_count):
+            input_offset = (
+                PLINK1_HEADER_SIZE
+                + (variant_start + local_variant_index) * bytes_per_variant
+                + byte_start
+            )
+            output_offset = local_variant_index * byte_count
+            bytes_read = 0
+            while bytes_read < byte_count:
+                chunk = os.pread(fd, byte_count - bytes_read, input_offset + bytes_read)
+                if not chunk:
+                    raise OSError(
+                        f"Unexpected EOF reading PLINK .bed sample window at offset "
+                        f"{input_offset + bytes_read}: requested {byte_count - bytes_read} bytes, got 0"
+                    )
+                chunk_len = len(chunk)
+                output[output_offset + bytes_read : output_offset + bytes_read + chunk_len] = chunk
+                bytes_read += chunk_len
+        return payload
+
+    def __del__(self) -> None:
+        fd = getattr(self, "_bed_fd", None)
+        if fd is not None:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+            self._bed_fd = None
 
     def read(
         self,
@@ -208,23 +278,31 @@ class open_bed:
                     else int(np.asarray(resolved_sample_index, dtype=np.intp).shape[0])
                 )
                 return np.empty((sample_count, 0), dtype=np.int8)
-            # mmap-backed slice: zero-copy view of the relevant bytes. The
-            # decoder reads from this view directly (np.frombuffer wraps a
-            # numpy array as buffer for free). The previous open/seek/read
-            # path allocated a 720 MB Python `bytes` per batch on top of
-            # the same I/O the kernel was already going to do.
-            mmap_bytes = self._bytes_view()
-            start_offset = PLINK1_HEADER_SIZE + variant_index.start * bytes_per_variant
-            payload = mmap_bytes[start_offset : start_offset + variant_count * bytes_per_variant]
             if sample_slice is not None:
-                return _decode_payload_sample_slice(
-                    payload,
-                    iid_count=self.iid_count,
+                params = _sample_slice_parameters(sample_slice, self.iid_count)
+                if params.sample_count == 0:
+                    return np.empty((0, variant_count), dtype=np.int8)
+                payload = self._pread_sample_window_payload(
+                    variant_start=variant_index.start,
                     variant_count=variant_count,
                     bytes_per_variant=bytes_per_variant,
-                    sample_slice=sample_slice,
+                    byte_start=params.byte_start,
+                    byte_count=params.byte_count,
+                )
+                return _decode_sample_window_payload(
+                    payload,
+                    variant_count=variant_count,
+                    byte_count=params.byte_count,
+                    sample_count=params.sample_count,
+                    leading_sample_offset=params.leading_sample_offset,
                     count_a1=self.count_A1,
                 )
+            # pread the batch payload into a fresh, numpy-owned buffer.
+            # Avoids mmap (which raises SIGBUS on networked-storage I/O
+            # errors) and the shared-file-offset contention of seek+read
+            # under multi-threaded prefetch.
+            start_offset = PLINK1_HEADER_SIZE + variant_index.start * bytes_per_variant
+            payload = self._pread_payload(start_offset, variant_count * bytes_per_variant)
             if isinstance(resolved_sample_index, np.ndarray):
                 return _decode_payload_sample_indices(
                     payload,
@@ -399,37 +477,6 @@ def _decode_sample_window_payload(
     lut = _BYTE_DECODE_LUT_A1 if count_a1 else _BYTE_DECODE_LUT_A2
     decoded = lut[packed].reshape(variant_count, byte_count * 4)
     return decoded[:, leading_sample_offset : leading_sample_offset + sample_count].T
-
-
-def _decode_payload_sample_slice(
-    payload: bytes | np.ndarray,
-    *,
-    iid_count: int,
-    variant_count: int,
-    bytes_per_variant: int,
-    sample_slice: slice,
-    count_a1: bool,
-) -> np.ndarray:
-    params = _sample_slice_parameters(sample_slice, iid_count)
-    if params.sample_count == 0:
-        return np.empty((0, variant_count), dtype=np.int8)
-    if isinstance(payload, np.ndarray):
-        raw_bytes = np.asarray(payload, dtype=np.uint8)
-    else:
-        raw_bytes = np.frombuffer(payload, dtype=np.uint8)
-    if raw_bytes.size != variant_count * bytes_per_variant:
-        raise ValueError("Unexpected PLINK 1 .bed payload length.")
-    packed_window = raw_bytes.reshape(variant_count, bytes_per_variant)[
-        :, params.byte_start : params.byte_start + params.byte_count
-    ]
-    return _decode_sample_window_payload(
-        packed_window,
-        variant_count=variant_count,
-        byte_count=params.byte_count,
-        sample_count=params.sample_count,
-        leading_sample_offset=params.leading_sample_offset,
-        count_a1=count_a1,
-    )
 
 
 def _decode_payload_sample_indices(
