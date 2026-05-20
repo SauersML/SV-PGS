@@ -817,6 +817,14 @@ def _upload_standardized_int8_tiles_overlapped(
             gpu_destination[:, local_start:local_stop] = standardized_tile
         in_flight_events[slot_index] = stream.record()
         local_start = local_stop
+    # Synchronization invariant: after this function returns, the caller assigns
+    # ``gpu_destination`` to ``self._cupy_cache`` and downstream consumers will
+    # immediately read from it. We must therefore wait on every in-flight async
+    # H2D event — in particular the LAST tile's event, which would otherwise
+    # still be in flight when the loop body exits.
+    for in_flight_event in in_flight_events:
+        if in_flight_event is not None:
+            in_flight_event.synchronize()
 
 
 def _upload_int8_tiles_overlapped(
@@ -861,6 +869,14 @@ def _upload_int8_tiles_overlapped(
             gpu_destination[:, local_start:local_stop] = staged_tile
         in_flight_events[slot_index] = stream.record()
         local_start = local_stop
+    # Synchronization invariant: after this function returns, the caller assigns
+    # ``gpu_destination`` to ``self._cupy_cache`` and downstream consumers will
+    # immediately read from it. We must therefore wait on every in-flight async
+    # H2D event — in particular the LAST tile's event, which would otherwise
+    # still be in flight when the loop body exits.
+    for in_flight_event in in_flight_events:
+        if in_flight_event is not None:
+            in_flight_event.synchronize()
 
 
 _gpu_verified = False
@@ -1661,6 +1677,13 @@ class StandardizedGenotypeMatrix:
     _sample_space_probe_projection_gpu_cache: dict[tuple[int, int], Any] = field(init=False, default_factory=dict, repr=False)
     _sample_space_cpu_preconditioner_cache: Any | None = field(init=False, default=None, repr=False)
     _sample_space_gpu_preconditioner_cache: Any | None = field(init=False, default=None, repr=False)
+    # Parent-lifetime invariant: a GPU subset cache produced by ``subset()`` is a
+    # view/slice into the parent's underlying CuPy buffer (see
+    # ``_cupy_cache_subset_columns``). If the parent ``StandardizedGenotypeMatrix``
+    # is garbage-collected before the subset is consumed, that buffer is freed
+    # and the subset becomes a dangling GPU pointer. Holding a strong reference
+    # to the parent here keeps it alive for the subset's full lifetime.
+    _parent_genotype_matrix: StandardizedGenotypeMatrix | None = field(init=False, default=None, repr=False)
     _n_samples: int = field(init=False, default=0, repr=False)
 
     def __post_init__(self) -> None:
@@ -1925,6 +1948,11 @@ class StandardizedGenotypeMatrix:
                         upload_batch_size=auto_batch_size_i8(self.shape[0]),
                         gpu_int8_dtype=gpu_int8_dtype,
                     )
+                # Synchronization invariant: callers may read ``self._cupy_cache``
+                # immediately after ``try_materialize_gpu()`` returns, so make sure
+                # every async H2D copy issued above has completed before we publish
+                # the cache reference.
+                cupy.cuda.Device().synchronize()
                 self._cupy_cache = _CupyInt8StandardizedCache(
                     raw_values=gpu_matrix,
                     means=cupy.asarray(self.means[self.variant_indices], dtype=cupy.float32),
@@ -1970,6 +1998,11 @@ class StandardizedGenotypeMatrix:
                         cupy=cupy,
                     ):
                         gpu_matrix[:, batch_slice] = standardized_batch
+                # Synchronization invariant: callers may read ``self._cupy_cache``
+                # immediately after ``try_materialize_gpu()`` returns, so make sure
+                # every async H2D copy issued above has completed before we publish
+                # the cache reference.
+                cupy.cuda.Device().synchronize()
                 self._cupy_cache = gpu_matrix
             cupy.cuda.Device().synchronize()
             import gc
@@ -2276,6 +2309,13 @@ class StandardizedGenotypeMatrix:
                 subset._dense_local_lookup[dense_mask] = np.arange(dense_child_local_indices.shape[0], dtype=np.int32)
         if self._cupy_cache is not None:
             subset._cupy_cache = _cupy_cache_subset_columns(self._cupy_cache, resolved_local_indices)
+            # Parent-lifetime invariant: ``_cupy_cache_subset_columns`` returns a
+            # view/slice into ``self._cupy_cache``'s GPU buffer (no copy). If
+            # ``self`` is garbage-collected before ``subset`` is consumed, the
+            # underlying GPU memory is freed and ``subset._cupy_cache`` becomes a
+            # dangling pointer. Retain a strong reference to ``self`` so the
+            # parent's buffer outlives the subset.
+            subset._parent_genotype_matrix = self
         if self._jax_cache is not None:
             subset._jax_cache = self._jax_cache[:, resolved_local_indices]
         elif self._dense_cache is not None:

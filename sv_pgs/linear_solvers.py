@@ -223,8 +223,22 @@ def stochastic_logdet(
         )
         for tridiagonal in tridiagonal_blocks:
             eigenvalues, eigenvectors = _small_symmetric_eigh(tridiagonal)
-            clipped_eigenvalues = np.maximum(eigenvalues, 1e-12)
-            estimates.append(float(np.sum((eigenvectors[0, :] ** 2) * np.log(clipped_eigenvalues))))
+            # Filter out eigenvalues below a noise floor based on matrix norm:
+            # clipping numerical-noise (near-zero / negative) eigenvalues to a
+            # tiny positive constant would inflate log-det by ~27 nats each.
+            matrix_norm = float(np.linalg.norm(eigenvalues, ord=np.inf))
+            noise_floor = max(matrix_norm * 1e-12, 1e-14)
+            positive_mask = eigenvalues > noise_floor
+            if not np.any(positive_mask):
+                continue
+            filtered_eigenvalues = eigenvalues[positive_mask]
+            filtered_first_components = eigenvectors[0, positive_mask]
+            # Renormalize the squared components so they still sum to 1 over the retained set.
+            sum_sq = float(np.sum(filtered_first_components ** 2))
+            if sum_sq <= 1e-12:
+                continue
+            weights = (filtered_first_components ** 2) / sum_sq
+            estimates.append(float(np.sum(weights * np.log(filtered_eigenvalues))))
         probes_completed += current_block_size
         if probes_completed < minimum_required_probes or len(estimates) < 2:
             continue
@@ -243,6 +257,9 @@ def stochastic_logdet(
                 + f"threshold={error_threshold:.2e}"
             )
             break
+    if not estimates:
+        # No probe contributed (matrix appears effectively zero in the probed subspace).
+        return float(baseline_logdet)
     return float(baseline_logdet + dimension * np.mean(estimates))
 
 
@@ -335,13 +352,21 @@ def _solve_spd_system_with_jax_cg(
             return vector
         return vector / safe_diagonal
 
+    # Convention: `tolerance` is a RELATIVE tolerance applied to ||r|| / ||b||.
+    # The absolute residual threshold is tolerance * max(||b||, 1.0); using
+    # max(.., 1.0) avoids requiring subnormal residuals for tiny right-hand sides.
+    rhs_norm_for_threshold = float(jnp.linalg.norm(rhs)) if rhs.ndim == 1 else 0.0
+    absolute_threshold = float(tolerance) * max(rhs_norm_for_threshold, 1.0)
+
     def solve_one(rhs_vector: jnp.ndarray, x0_vector: jnp.ndarray | None) -> jnp.ndarray:
+        local_rhs_norm = float(jnp.linalg.norm(rhs_vector))
+        local_threshold = float(tolerance) * max(local_rhs_norm, 1.0)
         solution, _ = jax_sparse.linalg.cg(
             apply_operator,
             rhs_vector,
             x0=x0_vector,
-            tol=tolerance,
-            atol=tolerance,
+            tol=0.0,
+            atol=local_threshold,
             maxiter=max_iterations,
             M=None if safe_diagonal is None else apply_preconditioner,
         )
@@ -356,8 +381,7 @@ def _solve_spd_system_with_jax_cg(
         solution = solve_one(rhs, initial_vector)
         residual = rhs - apply_operator(solution)
         residual_norm = float(jnp.linalg.norm(residual))
-        rhs_norm = float(jnp.linalg.norm(rhs))
-        threshold = max(tolerance, tolerance * rhs_norm)
+        threshold = absolute_threshold
         if not np.isfinite(residual_norm) or residual_norm > threshold:
             raise RuntimeError(
                 "JAX conjugate-gradient solve failed to converge: "
@@ -464,6 +488,9 @@ def _solve_single_rhs(
     import math
     from sv_pgs.progress import log
     residual_refresh_interval = 32
+    # Convention: `tolerance` is RELATIVE: we require ||r|| <= tolerance * max(||b||, 1).
+    # We work with squared quantities throughout for efficiency: the equivalent
+    # squared check is ||r||^2 <= tolerance^2 * max(||b||^2, 1).
     tol_sq = tolerance * tolerance
     if initial_guess is None:
         if preconditioner is None:
@@ -477,10 +504,7 @@ def _solve_single_rhs(
     residual_norm_sq_jax = jnp.vdot(residual, residual)
     initial_residual = float(residual_norm_sq_jax)
     rhs_norm_sq = float(jnp.vdot(rhs, rhs))
-    convergence_threshold_sq = max(
-        tol_sq,
-        tol_sq * max(initial_residual, rhs_norm_sq),
-    )
+    convergence_threshold_sq = tol_sq * max(rhs_norm_sq, 1.0)
     if initial_residual <= convergence_threshold_sq:
         return jnp.asarray(solution, dtype=solver_dtype)
     preconditioned_residual = residual if preconditioner is None else preconditioner(residual)
@@ -560,6 +584,9 @@ def _solve_multiple_rhs(
     from sv_pgs.progress import log
 
     residual_refresh_interval = 32
+    # Convention: `tolerance` is RELATIVE per column: require
+    # ||r_i|| <= tolerance * max(||b_i||, 1), equivalently
+    # ||r_i||^2 <= tolerance^2 * max(||b_i||^2, 1).  We work in squared space.
     tol_sq = tolerance * tolerance
     if initial_guess is None:
         if preconditioner is None:
@@ -585,7 +612,7 @@ def _solve_multiple_rhs(
     residual = rhs - apply_operator_active(solution)
     residual_norm_sq = np.asarray(jnp.sum(residual * residual, axis=0), dtype=np.float64)
     rhs_norm_sq = np.asarray(jnp.sum(rhs * rhs, axis=0), dtype=np.float64)
-    convergence_threshold_sq = np.maximum(tol_sq, tol_sq * np.maximum(residual_norm_sq, rhs_norm_sq))
+    convergence_threshold_sq = tol_sq * np.maximum(rhs_norm_sq, 1.0)
     converged = residual_norm_sq <= convergence_threshold_sq
     if np.all(converged):
         return jnp.asarray(solution, dtype=solver_dtype)
@@ -724,8 +751,16 @@ def _lanczos_tridiagonal(
         current_vector = projected / beta_value
 
     tridiagonal = jnp.diag(jnp.asarray(alpha_values, dtype=operator_dtype))
-    if beta_values:
-        off_diagonal = jnp.asarray(beta_values[: max(len(alpha_values) - 1, 0)], dtype=operator_dtype)
+    required_off_diag_len = max(len(alpha_values) - 1, 0)
+    if required_off_diag_len > 0:
+        # Pad with zeros if Lanczos terminated early (beta < 1e-10): a zero
+        # off-diagonal block-decouples the tridiagonal at that point, which
+        # is the mathematically correct lock-out for the remaining subspace.
+        if len(beta_values) < required_off_diag_len:
+            padded = list(beta_values) + [0.0] * (required_off_diag_len - len(beta_values))
+            off_diagonal = jnp.asarray(padded, dtype=operator_dtype)
+        else:
+            off_diagonal = jnp.asarray(beta_values[:required_off_diag_len], dtype=operator_dtype)
         tridiagonal = tridiagonal.at[jnp.arange(off_diagonal.shape[0]), jnp.arange(1, off_diagonal.shape[0] + 1)].set(off_diagonal)
         tridiagonal = tridiagonal.at[jnp.arange(1, off_diagonal.shape[0] + 1), jnp.arange(off_diagonal.shape[0])].set(off_diagonal)
     return tridiagonal

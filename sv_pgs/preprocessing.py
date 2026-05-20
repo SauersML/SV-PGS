@@ -187,18 +187,14 @@ def compute_variant_statistics(
         f"compute_total={cumulative_compute_seconds:.1f}s)  mem={mem()}"
     )
 
-    means = np.divide(
-        sums,
-        np.maximum(non_missing_counts, 1),
-        out=np.zeros_like(sums),
-        where=non_missing_counts > 0,
-    ).astype(np.float32)
-    allele_frequencies = _allele_frequencies_from_means(means=means, dosage_like=dosage_like)
-    scales = _scales_from_centered_sum_squares(
+    means, scales = _means_and_scales_with_floor(
+        sums=sums,
+        non_missing_counts=non_missing_counts,
         centered_sum_squares=centered_sum_squares,
         sample_count=sample_count,
         minimum_scale=config.minimum_scale,
     )
+    allele_frequencies = _allele_frequencies_from_means(means=means, dosage_like=dosage_like)
     log(
         f"=== VARIANT STATISTICS DONE ===  mean_af={float(np.mean(allele_frequencies)):.4f}  "
         f"mean_scale={float(np.mean(scales)):.4f}  mean_support={float(np.mean(support_counts)):.0f}  mem={mem()}"
@@ -282,6 +278,46 @@ def _allele_frequencies_from_means(
         np.clip(mean_array / 2.0, 0.0, 1.0),
         np.float32(0.5),
     ).astype(np.float32, copy=False)
+
+
+def _means_and_scales_with_floor(
+    sums: np.ndarray,
+    non_missing_counts: np.ndarray,
+    centered_sum_squares: np.ndarray,
+    sample_count: int,
+    minimum_scale: float,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Compute per-variant (mean, scale) with a consistent low-variance mask.
+
+    For low-variance variants (centered std below `minimum_scale`) the scale is
+    floored to 1.0 to avoid divide-by-zero downstream. The matching mean is
+    held at the actual column mean (sums / non_missing_counts), so that for a
+    truly constant column with value `c`, standardization yields
+    `(c - c) / 1.0 = 0` for every sample (the desired zero-column behavior).
+
+    For all-missing columns (count == 0) the column mean is undefined; we set
+    mean=0 and scale=1 explicitly so the result is a deterministic zero column
+    rather than NaN-propagating from a 0/0 division. Missing entries themselves
+    are zeroed by `standardized_columns` further downstream.
+    """
+    sums_f64 = np.asarray(sums, dtype=np.float64)
+    counts_i32 = np.asarray(non_missing_counts, dtype=np.int32)
+    means = np.divide(
+        sums_f64,
+        np.maximum(counts_i32, 1),
+        out=np.zeros_like(sums_f64),
+        where=counts_i32 > 0,
+    )
+    scales = np.sqrt(
+        np.asarray(centered_sum_squares, dtype=np.float64) / max(int(sample_count), 1)
+    )
+    low_variance_mask = scales < float(minimum_scale)
+    scales = np.where(low_variance_mask, 1.0, scales)
+    # All-missing columns: deterministic zero output (mean=0, scale=1).
+    all_missing_mask = counts_i32 <= 0
+    means = np.where(all_missing_mask, 0.0, means)
+    scales = np.where(all_missing_mask, 1.0, scales)
+    return means.astype(np.float32), scales.astype(np.float32)
 
 
 def _scales_from_centered_sum_squares(
@@ -464,6 +500,12 @@ def select_active_variant_indices(
 
 
 def _minor_allele_frequency(allele_frequency: float) -> float:
+    # Guard against NaN/inf inputs: np.clip preserves NaN, and downstream
+    # comparisons against a MAF threshold silently fail with NaN. Treating
+    # an undefined allele frequency as 0 means the variant is monomorphic
+    # and will be filtered out by any positive MAF threshold.
+    if not np.isfinite(allele_frequency):
+        return 0.0
     normalized_frequency = float(np.clip(allele_frequency, 0.0, 1.0))
     return min(normalized_frequency, 1.0 - normalized_frequency)
 
@@ -626,7 +668,11 @@ def _build_tie_map_windowed(
             # For int8: missing = -1, so only compare non-missing
             if col_i.dtype == np.int8:
                 valid = (col_i != -1) & (col_j != -1)
-                if np.all(col_i[valid] == -col_j[valid]) and valid.sum() > 0:
+                # Order matters: check that there is at least one jointly-observed
+                # sample BEFORE calling np.all on the masked slice. np.all over an
+                # empty array returns True, which would otherwise mark two
+                # all-missing columns as a sign-flipped tie.
+                if valid.sum() > 0 and np.all(col_i[valid] == -col_j[valid]):
                     union(i, j, -1.0)
                     ties_found += 1
             else:

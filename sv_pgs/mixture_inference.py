@@ -67,6 +67,7 @@ from jax.scipy.special import digamma as jax_digamma
 from jax.scipy.special import gammaln as jax_gammaln
 import numpy as np
 from scipy.linalg import solve_triangular
+from scipy.optimize import minimize
 from scipy.special import kve as scipy_bessel_kve
 
 from sv_pgs._jax import gpu_compute_jax_dtype, gpu_compute_numpy_dtype
@@ -89,6 +90,7 @@ from sv_pgs.genotype import (
     _to_cupy_compute,
     _to_cupy_float64,
 )
+from sv_pgs.forcing_sequence import forcing_tolerance, relaxed_iteration_cap
 from sv_pgs.linear_solvers import build_linear_operator, solve_spd_system, stochastic_logdet
 from sv_pgs.numeric import stable_sigmoid
 from sv_pgs.preprocessing import collapse_tie_groups
@@ -2856,11 +2858,11 @@ def _quantitative_posterior_state(
         if compute_beta_variance or stale_beta_variance is None
         else np.asarray(stale_beta_variance, dtype=np.float64)
     )
-    leverage_weight = np.maximum(prior_variances - effective_beta_variance, 0.0) / np.maximum(prior_variances, 1e-12)
     residual_vector = targets - linear_predictor
     residual_sum_squares = float(np.dot(residual_vector, residual_vector))
-    posterior_fit_uncertainty = sigma_error2 * float(np.sum(leverage_weight))
-    sigma_error2_new = max((residual_sum_squares + posterior_fit_uncertainty) / sample_count, sigma_error_floor)
+    # Exact ELBO stationary point; leverage proxy was only correct at convergence.
+    trace_term = float(sample_count) * float(np.sum(np.maximum(effective_beta_variance, 0.0)))
+    sigma_error2_new = max((residual_sum_squares + trace_term) / sample_count, sigma_error_floor)
     # Restricted log-likelihood: measures how well the model explains the data
     # after accounting for model complexity (via log-determinant terms).
     # Higher (less negative) = better fit with appropriate complexity.
@@ -2898,14 +2900,11 @@ def _binary_newton_solver_controls(
             iteration_cap = min(iteration_cap, 160 if gpu_enabled else 80)
         return relaxed_tolerance, max(min(int(maximum_linear_solver_iterations), iteration_cap), 16)
     relaxed_tolerance = max(float(solver_tolerance), 1e-3)
-    # GPU CG iterations are cheap (~30ms each with cached data), so allow more
-    # iterations before declaring convergence failure on large blocks.
     iteration_cap = 512 if gpu_enabled else 128
     relaxed_maximum_iterations = min(int(maximum_linear_solver_iterations), iteration_cap)
     if genotype_matrix.shape[1] > genotype_matrix.shape[0]:
         relaxed_tolerance = max(relaxed_tolerance, 5e-3)
-        wide_cap = 384 if gpu_enabled else 96
-        relaxed_maximum_iterations = min(relaxed_maximum_iterations, wide_cap)
+        relaxed_maximum_iterations = min(relaxed_maximum_iterations, 384 if gpu_enabled else 96)
     return relaxed_tolerance, max(relaxed_maximum_iterations, 16)
 
 
@@ -2991,15 +2990,12 @@ def _binary_penalized_log_posterior(
     prior_precision: np.ndarray,
     beta: np.ndarray,
 ) -> float:
-    probabilities = np.asarray(stable_sigmoid(np.asarray(linear_predictor, dtype=np.float64)), dtype=np.float64)
+    predictor = np.asarray(linear_predictor, dtype=np.float64)
     target_array = np.asarray(targets, dtype=np.float64)
     beta_array = np.asarray(beta, dtype=np.float64)
     prior_precision_array = np.asarray(prior_precision, dtype=np.float64)
     return float(
-        np.sum(
-            target_array * np.log(probabilities + 1e-12)
-            + (1.0 - target_array) * np.log(1.0 - probabilities + 1e-12)
-        )
+        np.sum(target_array * predictor - np.logaddexp(0.0, predictor))
         - 0.5 * np.sum(prior_precision_array * beta_array * beta_array)
     )
 
@@ -9674,19 +9670,44 @@ def _update_tpb_shape_vectors(
         gradient = np.concatenate([gradient_a, gradient_b]).astype(np.float64)
         return objective_value, gradient
 
-    optimized_log_shape = initial_log_shape.copy()
-    for _iteration_index in range(config.maximum_tpb_shape_iterations):
-        _objective_value, gradient = objective_and_gradient(optimized_log_shape)
-        step = np.clip(config.tpb_shape_learning_rate * gradient, -0.25, 0.25)
-        updated_log_shape = np.clip(optimized_log_shape + step, lower_bound, upper_bound)
-        shape_relative_change = float(np.linalg.norm(updated_log_shape - optimized_log_shape)) / max(
-            float(np.linalg.norm(optimized_log_shape)),
-            1e-8,
-        )
-        if shape_relative_change < config.convergence_tolerance:
+    def neg_obj_and_grad(log_shape: np.ndarray) -> tuple[float, np.ndarray]:
+        val, grad = objective_and_gradient(np.asarray(log_shape, dtype=np.float64))
+        return -val, -grad
+
+    bounds = [(float(lower_bound), float(upper_bound))] * (2 * class_count)
+
+    result = minimize(
+        neg_obj_and_grad,
+        initial_log_shape.astype(np.float64),
+        method='L-BFGS-B',
+        jac=True,
+        bounds=bounds,
+        options={
+            'maxiter': int(config.maximum_tpb_shape_iterations),
+            'gtol': float(config.convergence_tolerance),
+            'ftol': float(config.convergence_tolerance),
+        },
+    )
+
+    if result.x is None or not np.all(np.isfinite(result.x)):
+        # Fallback: projected gradient ascent (preserved from the prior
+        # implementation) in case L-BFGS-B returns an invalid iterate.
+        optimized_log_shape = initial_log_shape.copy()
+        for _iteration_index in range(config.maximum_tpb_shape_iterations):
+            _objective_value, gradient = objective_and_gradient(optimized_log_shape)
+            step = np.clip(config.tpb_shape_learning_rate * gradient, -0.25, 0.25)
+            updated_log_shape = np.clip(optimized_log_shape + step, lower_bound, upper_bound)
+            shape_relative_change = float(np.linalg.norm(updated_log_shape - optimized_log_shape)) / max(
+                float(np.linalg.norm(optimized_log_shape)),
+                1e-8,
+            )
+            if shape_relative_change < config.convergence_tolerance:
+                optimized_log_shape = updated_log_shape
+                break
             optimized_log_shape = updated_log_shape
-            break
-        optimized_log_shape = updated_log_shape
+    else:
+        optimized_log_shape = np.asarray(result.x, dtype=np.float64)
+
     return (
         np.exp(optimized_log_shape[:class_count]).astype(np.float64),
         np.exp(optimized_log_shape[class_count:]).astype(np.float64),
@@ -9781,8 +9802,10 @@ def _local_scale_prior_objective(
 # Gaussian likelihood with a Gamma prior.  We compute its expected value
 # using modified Bessel functions (via TensorFlow Probability).
 #
-# We alternate between updating lambda and its auxiliary rate delta in a
-# fixed-point loop (typically converges in 2-3 iterations).
+# Under CAVI, the variational update for (lambda, delta) given beta^2 is
+# lambda from the GIG moment at the current auxiliary rate, followed by
+# delta = (a+b)/(1+lambda). Repeated calls by the outer EM loop converge the
+# joint fixed point without an expensive hidden inner loop.
 def _update_local_scales(
     coefficient_second_moment: np.ndarray,
     baseline_prior_variances: np.ndarray,
@@ -9797,36 +9820,21 @@ def _update_local_scales(
     )
     p_parameter = np.asarray(local_shape_a, dtype=np.float64) - 0.5
     current_auxiliary_delta = np.maximum(np.asarray(auxiliary_delta, dtype=np.float64), config.local_scale_floor)
-    current_local_scale = np.maximum(np.ones_like(current_auxiliary_delta), config.local_scale_floor)
-    updated_local_scale = current_local_scale.copy()
-    for _iteration_index in range(6):
-        psi = np.maximum(2.0 * current_auxiliary_delta, 1e-12)
-        expected_local_scale = _gig_moment(
+    psi = np.maximum(2.0 * current_auxiliary_delta, 1e-12)
+    updated_local_scale = np.maximum(
+        _gig_moment(
             p_parameter=p_parameter,
             chi=chi,
             psi=psi,
             moment_power=1.0,
-        )
-        updated_local_scale = np.maximum(expected_local_scale, config.local_scale_floor)
-        updated_auxiliary_delta = (local_shape_a + local_shape_b) / np.maximum(
-            1.0 + updated_local_scale,
-            config.local_scale_floor,
-        )
-        fixed_point_change = max(
-            float(np.linalg.norm(updated_auxiliary_delta - current_auxiliary_delta)) / max(
-                float(np.linalg.norm(current_auxiliary_delta)),
-                1e-8,
-            ),
-            float(np.linalg.norm(updated_local_scale - current_local_scale)) / max(
-                float(np.linalg.norm(current_local_scale)),
-                1e-8,
-            ),
-        )
-        current_auxiliary_delta = np.maximum(updated_auxiliary_delta, config.local_scale_floor)
-        current_local_scale = updated_local_scale
-        if fixed_point_change < config.convergence_tolerance:
-            break
-    return updated_local_scale, current_auxiliary_delta
+        ),
+        config.local_scale_floor,
+    )
+    updated_auxiliary_delta = np.maximum(
+        (local_shape_a + local_shape_b) / np.maximum(1.0 + updated_local_scale, config.local_scale_floor),
+        config.local_scale_floor,
+    )
+    return updated_local_scale, updated_auxiliary_delta
 
 
 # Compute the expected value of X^r where X ~ GIG(p, chi, psi).

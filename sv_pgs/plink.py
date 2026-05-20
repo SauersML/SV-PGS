@@ -38,6 +38,14 @@ def _build_byte_decode_lut(per_code_lookup: np.ndarray) -> np.ndarray:
 _BYTE_DECODE_LUT_A1 = _build_byte_decode_lut(_DECODE_LOOKUP_A1)
 _BYTE_DECODE_LUT_A2 = _build_byte_decode_lut(_DECODE_LOOKUP_A2)
 
+# Large contiguous sample-window reads are latency-bound if we issue one small
+# pread per variant. AoU-scale batches are faster when read as large contiguous
+# BED spans and sliced in memory, even though that reads extra bytes.
+_SAMPLE_WINDOW_STRIPED_MIN_VARIANTS = 512
+_SAMPLE_WINDOW_STRIPED_MIN_SPAN_BYTES = 64 * 1024 * 1024
+_SAMPLE_WINDOW_STRIPED_TARGET_CHUNK_BYTES = 256 * 1024 * 1024
+_SAMPLE_WINDOW_STRIPED_MAX_OVERREAD_RATIO = 32.0
+
 
 def to_bed(
     bed_path: str | Path,
@@ -145,19 +153,15 @@ class open_bed:
     def _ensure_fd(self) -> int:
         """Open the .bed file once and reuse the descriptor across threads.
 
-        We deliberately do NOT mmap. On networked / GCP persistent-disk
-        storage, mmap turns transient I/O failures into SIGBUS, which
-        terminates the process, instead of a recoverable OSError. We hit
-        exactly this under sustained multi-threaded prefetch: a worker
-        thread would page-fault into a previously-evicted region (the
-        MADV_SEQUENTIAL hint we used to set tells the kernel to drop
-        already-read pages aggressively, which is actively wrong when
-        multiple workers each read their own disjoint batch ranges) and
+        We deliberately do NOT mmap. mmap can turn storage I/O faults into
+        SIGBUS, which terminates the process instead of raising a recoverable
+        OSError. We hit exactly this under sustained multi-threaded prefetch:
+        a worker thread would page-fault into a previously-evicted region and
         the kernel would raise SIGBUS instead of returning EIO.
 
-        os.pread is thread-safe (no shared file-offset state) and surfaces
-        I/O errors as OSError, which the prefetch executor can retry or
-        propagate cleanly.
+        Positional reads are thread-safe (no shared file-offset state) and
+        surface I/O errors as OSError, which the prefetch executor can retry
+        or propagate cleanly.
         """
         if self._bed_fd is None:
             raise RuntimeError("PLINK reader file descriptor is closed.")
@@ -166,9 +170,9 @@ class open_bed:
     def _pread_payload(self, offset: int, length: int) -> np.ndarray:
         """Positional read of `length` bytes at `offset` into a fresh uint8 array.
 
-        Loops over short reads (pread on some filesystems can return fewer
-        bytes than requested even mid-file). Returns a numpy-owned buffer
-        with no shared mmap pages and no SIGBUS exposure.
+        Loops over short reads because filesystems can return fewer bytes than
+        requested even mid-file. Returns a numpy-owned buffer with no shared
+        mmap pages and no SIGBUS exposure.
         """
         if length <= 0:
             return np.empty((0,), dtype=np.uint8)
@@ -177,14 +181,12 @@ class open_bed:
         view = memoryview(buffer).cast("B")
         bytes_read = 0
         while bytes_read < length:
-            chunk = os.pread(fd, length - bytes_read, offset + bytes_read)
-            if not chunk:
+            chunk_len = os.preadv(fd, [view[bytes_read:]], offset + bytes_read)
+            if chunk_len == 0:
                 raise OSError(
                     f"Unexpected EOF reading PLINK .bed at offset {offset + bytes_read}: "
                     f"requested {length - bytes_read} bytes, got 0"
                 )
-            chunk_len = len(chunk)
-            view[bytes_read : bytes_read + chunk_len] = chunk
             bytes_read += chunk_len
         return buffer
 
@@ -224,6 +226,36 @@ class open_bed:
                 output[output_offset + bytes_read : output_offset + bytes_read + chunk_len] = chunk
                 bytes_read += chunk_len
         return payload
+
+    def _read_sample_window_striped(
+        self,
+        *,
+        variant_start: int,
+        variant_count: int,
+        bytes_per_variant: int,
+        byte_start: int,
+        byte_count: int,
+        sample_count: int,
+        leading_sample_offset: int,
+    ) -> np.ndarray:
+        result = np.empty((sample_count, variant_count), dtype=np.int8, order="F")
+        variants_per_chunk = max(1, _SAMPLE_WINDOW_STRIPED_TARGET_CHUNK_BYTES // bytes_per_variant)
+        for chunk_start in range(0, variant_count, variants_per_chunk):
+            chunk_variant_count = min(variants_per_chunk, variant_count - chunk_start)
+            input_offset = PLINK1_HEADER_SIZE + (variant_start + chunk_start) * bytes_per_variant
+            span = self._pread_payload(input_offset, chunk_variant_count * bytes_per_variant)
+            selected = span.reshape(chunk_variant_count, bytes_per_variant)[
+                :, byte_start : byte_start + byte_count
+            ]
+            result[:, chunk_start : chunk_start + chunk_variant_count] = _decode_sample_window_payload(
+                selected,
+                variant_count=chunk_variant_count,
+                byte_count=byte_count,
+                sample_count=sample_count,
+                leading_sample_offset=leading_sample_offset,
+                count_a1=self.count_A1,
+            )
+        return result
 
     def __del__(self) -> None:
         fd = getattr(self, "_bed_fd", None)
@@ -282,6 +314,20 @@ class open_bed:
                 params = _sample_slice_parameters(sample_slice, self.iid_count)
                 if params.sample_count == 0:
                     return np.empty((0, variant_count), dtype=np.int8)
+                if _use_striped_sample_window_reads(
+                    variant_count=variant_count,
+                    bytes_per_variant=bytes_per_variant,
+                    byte_count=params.byte_count,
+                ):
+                    return self._read_sample_window_striped(
+                        variant_start=variant_index.start,
+                        variant_count=variant_count,
+                        bytes_per_variant=bytes_per_variant,
+                        byte_start=params.byte_start,
+                        byte_count=params.byte_count,
+                        sample_count=params.sample_count,
+                        leading_sample_offset=params.leading_sample_offset,
+                    )
                 payload = self._pread_sample_window_payload(
                     variant_start=variant_index.start,
                     variant_count=variant_count,
@@ -297,10 +343,9 @@ class open_bed:
                     leading_sample_offset=params.leading_sample_offset,
                     count_a1=self.count_A1,
                 )
-            # pread the batch payload into a fresh, numpy-owned buffer.
-            # Avoids mmap (which raises SIGBUS on networked-storage I/O
-            # errors) and the shared-file-offset contention of seek+read
-            # under multi-threaded prefetch.
+            # pread the batch payload into a fresh, numpy-owned buffer. Avoids
+            # mmap SIGBUS failures and the shared-file-offset contention of
+            # seek+read under multi-threaded prefetch.
             start_offset = PLINK1_HEADER_SIZE + variant_index.start * bytes_per_variant
             payload = self._pread_payload(start_offset, variant_count * bytes_per_variant)
             if isinstance(resolved_sample_index, np.ndarray):
@@ -380,6 +425,23 @@ class open_bed:
 
 def _bytes_per_variant(sample_count: int) -> int:
     return (int(sample_count) + 3) // 4
+
+
+def _use_striped_sample_window_reads(
+    *,
+    variant_count: int,
+    bytes_per_variant: int,
+    byte_count: int,
+) -> bool:
+    if variant_count < _SAMPLE_WINDOW_STRIPED_MIN_VARIANTS:
+        return False
+    if bytes_per_variant <= 0 or byte_count <= 0:
+        return False
+    full_span_bytes = variant_count * bytes_per_variant
+    if full_span_bytes < _SAMPLE_WINDOW_STRIPED_MIN_SPAN_BYTES:
+        return False
+    overread_ratio = bytes_per_variant / byte_count
+    return overread_ratio <= _SAMPLE_WINDOW_STRIPED_MAX_OVERREAD_RATIO
 
 
 def _split_index(index: Any) -> tuple[Any, Any]:

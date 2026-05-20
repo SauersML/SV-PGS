@@ -34,6 +34,7 @@ import sv_pgs.genotype as genotype_module
 import sv_pgs.io as io_module
 import sv_pgs.model as model_module
 import sv_pgs.pipeline as pipeline_module
+import sv_pgs.plink as plink_module
 from sv_pgs.plink import open_bed, to_bed
 from sv_pgs.pipeline import run_training_pipeline
 
@@ -798,6 +799,68 @@ def test_plink_reader_reads_only_contiguous_sample_window(
         io_module.PLINK_MISSING_INT8,
         expected_float,
     ).astype(np.int8)
+    np.testing.assert_array_equal(observed, expected)
+
+
+def test_plink_reader_uses_striped_reads_for_large_sample_windows():
+    assert plink_module._use_striped_sample_window_reads(
+        variant_count=8192,
+        bytes_per_variant=111_820,
+        byte_count=4_843,
+    )
+    assert not plink_module._use_striped_sample_window_reads(
+        variant_count=4,
+        bytes_per_variant=2,
+        byte_count=1,
+    )
+    assert not plink_module._use_striped_sample_window_reads(
+        variant_count=8192,
+        bytes_per_variant=111_820,
+        byte_count=1_000,
+    )
+
+
+def test_plink_reader_striped_sample_window_matches_standard_decode(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    bed_path = tmp_path / "cohort.bed"
+    genotype_matrix = np.array(
+        [
+            [0.0, 1.0, 2.0, np.nan],
+            [1.0, 2.0, 0.0, 1.0],
+            [2.0, 0.0, 1.0, 2.0],
+            [np.nan, 1.0, 2.0, 0.0],
+            [0.0, np.nan, 1.0, 1.0],
+            [1.0, 0.0, np.nan, 2.0],
+            [2.0, 2.0, 0.0, np.nan],
+            [0.0, 1.0, 2.0, 0.0],
+        ],
+        dtype=np.float32,
+    )
+    to_bed(
+        bed_path,
+        genotype_matrix,
+        properties={
+            "fid": [f"f{i}" for i in range(genotype_matrix.shape[0])],
+            "iid": [f"s{i}" for i in range(genotype_matrix.shape[0])],
+            "sid": [f"v{i}" for i in range(genotype_matrix.shape[1])],
+        },
+    )
+    monkeypatch.setattr(plink_module, "_SAMPLE_WINDOW_STRIPED_MIN_VARIANTS", 1)
+    monkeypatch.setattr(plink_module, "_SAMPLE_WINDOW_STRIPED_MIN_SPAN_BYTES", 1)
+    monkeypatch.setattr(plink_module, "_SAMPLE_WINDOW_STRIPED_TARGET_CHUNK_BYTES", 4)
+    monkeypatch.setattr(plink_module, "_SAMPLE_WINDOW_STRIPED_MAX_OVERREAD_RATIO", 8.0)
+
+    reader = open_bed(bed_path, iid_count=genotype_matrix.shape[0], sid_count=genotype_matrix.shape[1])
+    observed = reader.read(index=(slice(2, 6), slice(0, 4)), dtype="int8", order="F")
+    expected_float = genotype_matrix[2:6, 0:4]
+    expected = np.where(
+        np.isnan(expected_float),
+        io_module.PLINK_MISSING_INT8,
+        expected_float,
+    ).astype(np.int8)
+
     np.testing.assert_array_equal(observed, expected)
 
 
