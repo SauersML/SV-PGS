@@ -933,18 +933,44 @@ def load_multi_source_dataset_from_files(
             if precomputed_variant_stats is not None:
                 # Caller already has variant_stats and variant_records from a
                 # prior load on the same source set (typically: train cohort
-                # supplying values for the test load). Skip the bed-file
-                # streaming pass and use placeholder per-source stats; the
-                # final dataset replaces these with the precomputed values
-                # below.
+                # supplying values for the test load). The final dataset
+                # replaces per-source stats with the precomputed values below,
+                # but we still want the int8 mmap built for THIS sample subset
+                # so downstream per-epoch validation passes can stream from a
+                # decoded mmap instead of re-decoding bed bytes every call.
                 #
-                # We still build variants_list from the .bim so cross-source
-                # dedup can identify PLINK variants that collide with VCF
-                # variant keys — otherwise the train pass (which has real
-                # variants_list) and the test pass (which wouldn't) produce
-                # off-by-N column counts and the precomputed-stats alignment
-                # check below trips.
-                log(f"  reusing precomputed variant statistics for {path.name} (skipping PLINK streaming pass)")
+                # If an int8 cache already exists for this (bed, sample_indices,
+                # minimum_scale) it's a no-op; otherwise we pay one streaming
+                # pass to build it. Either way the precomputed stats win at the
+                # concatenation step — the stats we compute here are discarded.
+                int8_path_existing = _plink_int8_cache_path(path, keep_indices, config)
+                plink_int8_cache_path: Path | None
+                if int8_path_existing.exists():
+                    log(
+                        f"  reusing precomputed variant statistics for {path.name} "
+                        f"(skipping PLINK streaming pass); int8 cache present"
+                    )
+                    plink_int8_cache_path = int8_path_existing
+                else:
+                    log(
+                        f"  reusing precomputed variant statistics for {path.name} "
+                        f"but building int8 mmap cache so per-epoch test passes can mmap instead of bed-decode..."
+                    )
+                    _, plink_int8_cache_path = compute_plink_variant_statistics_cached(
+                        raw,
+                        bed_path=path,
+                        sample_indices=keep_indices,
+                        config=config,
+                    )
+                if plink_int8_cache_path is not None:
+                    int8_view = _open_plink_int8_cache_for_read(plink_int8_cache_path)
+                    if int8_view is not None:
+                        log(
+                            f"  swapping PLINK source to int8 mmap "
+                            f"({int8_view.shape[0]:,} × {int8_view.shape[1]:,}) — "
+                            "downstream passes skip bed-decode entirely"
+                        )
+                        raw = as_raw_genotype_matrix(int8_view)
                 stats = VariantStatistics(
                     means=np.empty(0, dtype=np.float32),
                     scales=np.empty(0, dtype=np.float32),
