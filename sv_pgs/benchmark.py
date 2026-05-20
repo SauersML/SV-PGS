@@ -42,16 +42,10 @@ def run_benchmark_suite(
         record for record, is_snv in zip(normalized_records, snv_mask, strict=True) if is_snv
     ]
 
-    current_snv_config = _copy_config(shared_config, update_hyperparameters=False)
     snv_only_config = _copy_config(shared_config)
     joint_config = _copy_config(shared_config)
 
     model_specs: list[tuple[str, BayesianPGS, np.ndarray]] = [
-        (
-            "snv_only_without_hyperparameter_updates",
-            _fit_model(current_snv_config, train_genotypes[:, snv_mask], train_covariates, train_targets, snv_records),
-            test_genotypes[:, snv_mask],
-        ),
         (
             "snv_only_continuous",
             _fit_model(snv_only_config, train_genotypes[:, snv_mask], train_covariates, train_targets, snv_records),

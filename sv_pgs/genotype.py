@@ -2478,7 +2478,11 @@ class StandardizedGenotypeMatrix:
         total_variants = int(resolved_local_indices.shape[0])
         completed_variants = 0
         last_logged_variants = 0
-        log_interval = max(total_variants // 10, 1)
+        log_interval = max(total_variants // 50, 1)
+        import time as _time
+        _t_start = _time.monotonic()
+        if progress_label is not None:
+            log(f"        {progress_label}: start streaming {total_variants:,} variants (batch_size={streaming_batch_size})  mem={mem()}")
         for batch_slice, standardized_batch in _iter_standardized_gpu_batches(
             raw_matrix,
             active_variant_indices,
@@ -2497,7 +2501,17 @@ class StandardizedGenotypeMatrix:
                 )
                 if completed_variants - last_logged_variants >= log_interval:
                     last_logged_variants = completed_variants
-                    log(f"        {progress_label}: {completed_variants:,}/{total_variants:,} ({100*completed_variants/total_variants:.0f}%)  mem={mem()}")
+                    _elapsed = _time.monotonic() - _t_start
+                    _rate = completed_variants / max(_elapsed, 1e-6)
+                    _eta = (total_variants - completed_variants) / max(_rate, 1e-6)
+                    log(
+                        f"        {progress_label}: {completed_variants:,}/{total_variants:,} "
+                        f"({100*completed_variants/total_variants:.1f}%) "
+                        f"elapsed={_elapsed:.0f}s rate={_rate:,.0f}v/s eta={_eta:.0f}s  mem={mem()}"
+                    )
+        if progress_label is not None:
+            _elapsed = _time.monotonic() - _t_start
+            log(f"        {progress_label}: done {total_variants:,} variants in {_elapsed:.1f}s  mem={mem()}")
         return result_gpu[:, 0] if vector_input else result_gpu
 
     def _gpu_transpose_matmul(
@@ -2542,7 +2556,11 @@ class StandardizedGenotypeMatrix:
         total_variants = self.shape[1]
         completed_variants = 0
         last_logged_variants = 0
-        log_interval = max(total_variants // 10, 1)
+        log_interval = max(total_variants // 50, 1)
+        import time as _time
+        _t_start = _time.monotonic()
+        if progress_label is not None:
+            log(f"        {progress_label}: start streaming {total_variants:,} variants (batch_size={streaming_batch_size})  mem={mem()}")
         for batch_slice, standardized_batch in _iter_standardized_gpu_batches(
             raw_matrix,
             self.variant_indices,
@@ -2561,7 +2579,17 @@ class StandardizedGenotypeMatrix:
                 )
                 if completed_variants - last_logged_variants >= log_interval:
                     last_logged_variants = completed_variants
-                    log(f"        {progress_label}: {completed_variants:,}/{total_variants:,} ({100*completed_variants/total_variants:.0f}%)  mem={mem()}")
+                    _elapsed = _time.monotonic() - _t_start
+                    _rate = completed_variants / max(_elapsed, 1e-6)
+                    _eta = (total_variants - completed_variants) / max(_rate, 1e-6)
+                    log(
+                        f"        {progress_label}: {completed_variants:,}/{total_variants:,} "
+                        f"({100*completed_variants/total_variants:.1f}%) "
+                        f"elapsed={_elapsed:.0f}s rate={_rate:,.0f}v/s eta={_eta:.0f}s  mem={mem()}"
+                    )
+        if progress_label is not None:
+            _elapsed = _time.monotonic() - _t_start
+            log(f"        {progress_label}: done {total_variants:,} variants in {_elapsed:.1f}s  mem={mem()}")
         return result_gpu[:, 0] if vector_input else result_gpu
 
     def gpu_matmat(

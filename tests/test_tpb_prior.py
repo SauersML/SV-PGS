@@ -362,10 +362,6 @@ class TestConfigValidation:
         with pytest.raises(ValueError):
             ModelConfig(tpb_hierarchical_prior_variance=-1.0)
 
-    def test_tpb_shape_learning_rate_validated(self):
-        with pytest.raises(ValueError):
-            ModelConfig(tpb_shape_learning_rate=0.0)
-
     def test_active_solver_config_validated(self):
         with pytest.raises(ValueError):
             ModelConfig(max_inner_newton_iterations=0)

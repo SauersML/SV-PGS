@@ -113,7 +113,6 @@ class ModelConfig:
 
     tpb_hierarchical_prior_variance: float = 1.0
     maximum_tpb_shape_iterations: int = 8
-    tpb_shape_learning_rate: float = 0.5
     minimum_tpb_shape: float = 0.1
     maximum_tpb_shape: float = 10.0
 
@@ -144,21 +143,15 @@ class ModelConfig:
 
     sample_space_preconditioner_rank: int = 256
     validation_interval: int = 10
-    binary_intercept_calibration: bool = True
     stochastic_variational_updates: bool = True
     stochastic_min_variant_count: int = 4096
     stochastic_variant_batch_size: int = 8192
-    stochastic_step_offset: float = 0.0
-    stochastic_step_exponent: float = 0.0
-    final_posterior_refinement: bool = True
-    posterior_working_sets: bool = True
     posterior_working_set_min_variants: int = 65_536
     posterior_working_set_initial_size: int = 8_192
     posterior_working_set_growth: int = 8_192
     posterior_working_set_max_passes: int = 6
     posterior_working_set_coefficient_tolerance: float = 1e-4
 
-    update_hyperparameters: bool = True
     random_seed: int = 0
 
     def __post_init__(self) -> None:
@@ -188,8 +181,6 @@ class ModelConfig:
             raise ValueError("tpb_hierarchical_prior_variance must be positive.")
         if self.maximum_tpb_shape_iterations < 1:
             raise ValueError("maximum_tpb_shape_iterations must be positive.")
-        if self.tpb_shape_learning_rate <= 0.0:
-            raise ValueError("tpb_shape_learning_rate must be positive.")
         if self.max_inner_newton_iterations < 1:
             raise ValueError("max_inner_newton_iterations must be positive.")
         if self.newton_gradient_tolerance <= 0.0:
@@ -222,10 +213,6 @@ class ModelConfig:
             raise ValueError("stochastic_min_variant_count must be non-negative.")
         if self.stochastic_variant_batch_size < 1:
             raise ValueError("stochastic_variant_batch_size must be positive.")
-        if self.stochastic_step_offset < 0.0:
-            raise ValueError("stochastic_step_offset must be non-negative.")
-        if not 0.0 <= self.stochastic_step_exponent <= 1.0:
-            raise ValueError("stochastic_step_exponent must lie in [0.0, 1.0].")
         if self.posterior_working_set_min_variants < 0:
             raise ValueError("posterior_working_set_min_variants must be non-negative.")
         if self.posterior_working_set_initial_size < 1:

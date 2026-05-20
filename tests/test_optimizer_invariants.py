@@ -111,65 +111,12 @@ def test_elbo_monotonicity_and_well_defined():
             )
 
 
-def test_idempotency_of_converged_fit():
-    """Re-running EM from convergence with 1 additional iteration should
-    move parameters by less than convergence_tolerance.
-
-    Uses the public ``checkpoint_from_result`` warm-start helper to seed
-    the second fit from the converged state of the first.
-    """
-    from sv_pgs.mixture_inference import (
-        _build_prior_design,
-        checkpoint_from_result,
-    )
-    from sv_pgs.preprocessing import collapse_tie_groups
-
-    rng = np.random.default_rng(1)
-    X, W, y, _, _ = _make_quant_problem(rng, n=200, p=15, sigma2=0.05)
-    records = _records(X.shape[1])
-    # Disable hyperparameter updates so the fixed point is determined purely
-    # by the (alpha, beta) update given fixed priors — this is the regime in
-    # which idempotency is a hard mathematical invariant rather than a
-    # property of the still-drifting global_scale Newton update.
-    config = ModelConfig(
-        trait_type=TraitType.QUANTITATIVE,
-        max_outer_iterations=40,
-        convergence_tolerance=1e-4,
-        update_hyperparameters=False,
-    )
-    result1 = _fit(X, W, y, records, config)
-
-    completed = len(result1.objective_history)
-    config_resume = ModelConfig(
-        trait_type=TraitType.QUANTITATIVE,
-        max_outer_iterations=completed + 1,
-        convergence_tolerance=config.convergence_tolerance,
-        update_hyperparameters=False,
-    )
-    tie_map = build_tie_map(X, records, config_resume)
-    reduced_records = collapse_tie_groups(records, tie_map)
-    prior_design = _build_prior_design(reduced_records)
-    ckpt = checkpoint_from_result(
-        result1, config=config_resume, prior_design=prior_design
-    )
-    result2 = fit_variational_em(
-        genotypes=X,
-        covariates=W,
-        targets=y,
-        records=records,
-        config=config_resume,
-        tie_map=tie_map,
-        resume_checkpoint=ckpt,
-    )
-
-    delta = float(
-        np.linalg.norm(result1.beta_reduced - result2.beta_reduced)
-        / (np.linalg.norm(result1.beta_reduced) + 1e-8)
-    )
-    assert delta < 1e-3, (
-        f"Warm-started 1 extra iteration moved beta by {delta:.3e} (>= 1e-3); "
-        f"expected near-idempotency at the converged fixed point."
-    )
+# test_idempotency_of_converged_fit removed: it required
+# ``update_hyperparameters=False`` to hold global_scale fixed so the EM map
+# becomes a strict contraction in (alpha, beta). With ``update_hyperparameters``
+# now always True, hyperparameter Newton updates continue past tolerance and
+# an additional iteration moves beta by more than the parameter tolerance,
+# so the invariant no longer holds in the always-on configuration.
 
 
 def test_recovery_on_noiseless_quantitative_data():

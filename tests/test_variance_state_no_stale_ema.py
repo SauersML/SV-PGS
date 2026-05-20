@@ -55,17 +55,13 @@ def test_beta_variance_state_snaps_to_prior_on_no_refresh_epoch(
     # max_outer_iterations=2 with beta_variance_update_interval=2 means:
     #   epoch 0: (0+1) % 2 == 1  -> refresh_beta_variance = False
     #   epoch 1: (1+1) % 2 == 0  -> refresh_beta_variance = True
-    # final_posterior_refinement=False so force_final_refresh path does not
-    # short-circuit epoch 0.
     config = ModelConfig(
         trait_type=TraitType.QUANTITATIVE,
         max_outer_iterations=2,
-        update_hyperparameters=False,
         stochastic_variational_updates=True,
         stochastic_min_variant_count=1,
         stochastic_variant_batch_size=4,
         beta_variance_update_interval=2,
-        final_posterior_refinement=False,
     )
 
     # Force a checkpoint callback to fire after every stochastic block so we

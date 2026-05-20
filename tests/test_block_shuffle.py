@@ -46,7 +46,6 @@ def _base_config(**overrides) -> ModelConfig:
     kwargs = dict(
         trait_type=TraitType.QUANTITATIVE,
         max_outer_iterations=3,
-        update_hyperparameters=False,
         stochastic_variational_updates=True,
         stochastic_min_variant_count=1,
         stochastic_variant_batch_size=4,

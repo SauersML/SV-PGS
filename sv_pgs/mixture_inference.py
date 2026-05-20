@@ -649,7 +649,6 @@ class _SampleSpaceCGLanczosRecorder:
 _CHECKPOINT_EXCLUDED_CONFIG_FIELDS = frozenset({
     "beta_variance_update_interval",
     "exact_solver_matrix_limit",
-    "final_posterior_refinement",
     "linear_solver_tolerance",
     "logdet_lanczos_steps",
     "logdet_probe_count",
@@ -666,8 +665,6 @@ _CHECKPOINT_EXCLUDED_CONFIG_FIELDS = frozenset({
     "random_seed",
     "sample_space_preconditioner_rank",
     "stochastic_min_variant_count",
-    "stochastic_step_exponent",
-    "stochastic_step_offset",
     "stochastic_variant_batch_size",
     "validation_interval",
 })
@@ -931,7 +928,7 @@ def _covariates_only_fit_result(
     linear_predictor = np.asarray(offset + covariate_matrix @ alpha, dtype=np.float64)
     sigma_error2 = 1.0
     if trait_type == TraitType.BINARY:
-        if config.binary_intercept_calibration and alpha.size > 0:
+        if alpha.size > 0:
             intercept_shift = _calibrate_binary_intercept(linear_predictor=linear_predictor, targets=targets)
             alpha = alpha.copy()
             alpha[0] += intercept_shift
@@ -1023,9 +1020,7 @@ def _fit_binary_alpha_with_offset(
 def _stochastic_step_size(config: ModelConfig, step_index: int) -> float:
     if step_index < 1:
         raise ValueError("step_index must be positive.")
-    if float(config.stochastic_step_exponent) == 0.0:
-        return 1.0
-    return float((config.stochastic_step_offset + float(step_index)) ** (-config.stochastic_step_exponent))
+    return 1.0
 
 
 def _stochastic_binary_newton_iterations(
@@ -1048,8 +1043,7 @@ def _should_update_hyperparameters_this_iteration(
     config: ModelConfig,
 ) -> bool:
     return (
-        config.update_hyperparameters
-        and int(iteration_number) >= 2
+        int(iteration_number) >= 2
         and int(iteration_number) % 2 == 0
     )
 
@@ -1831,7 +1825,7 @@ def fit_variational_em(
                 outer_iteration,
                 refresh_interval=config.beta_variance_update_interval,
                 total_iterations=config.max_outer_iterations,
-                force_final_refresh=not config.final_posterior_refinement,
+                force_final_refresh=False,
                 trait_type=config.trait_type,
                 sample_count=genotype_matrix.shape[0],
                 variant_count=genotype_matrix.shape[1],
@@ -2542,10 +2536,7 @@ def fit_variational_em(
             # convergence; treat it as if no validation set was passed.
             validation_gates_convergence = bool(validation_history) and not validation_is_holdout_only
             convergence_change = max(parameter_change, hyperparameter_change)
-            hyperparameters_ready_for_convergence = (
-                not config.update_hyperparameters
-                or should_update_hyperparameters
-            )
+            hyperparameters_ready_for_convergence = should_update_hyperparameters
             if hyperparameters_ready_for_convergence and convergence_change < config.convergence_tolerance:
                 if validation_gates_convergence and validation_metric_this_epoch is not None and len(validation_history) >= 2:
                     validation_delta = abs(validation_history[-1] - validation_history[-2])
@@ -2565,10 +2556,7 @@ def fit_variational_em(
                     fit_converged = True
                     break
     else:
-        if (
-            config.posterior_working_sets
-            and genotype_matrix.shape[1] >= config.posterior_working_set_min_variants
-        ):
+        if genotype_matrix.shape[1] >= config.posterior_working_set_min_variants:
             log(
                 "  variational inference mode: posterior working sets "
                 + f"(total_variants={genotype_matrix.shape[1]}, "
@@ -2665,7 +2653,7 @@ def fit_variational_em(
                 outer_iteration,
                 refresh_interval=config.beta_variance_update_interval,
                 total_iterations=config.max_outer_iterations,
-                force_final_refresh=not config.final_posterior_refinement,
+                force_final_refresh=False,
                 trait_type=config.trait_type,
                 sample_count=genotype_matrix.shape[0],
                 variant_count=genotype_matrix.shape[1],
@@ -2703,7 +2691,7 @@ def fit_variational_em(
                 total_em_iterations=config.max_outer_iterations,
                 prior_precision_override=cavi_prior_precision_override,
             )
-            if config.trait_type == TraitType.BINARY and config.binary_intercept_calibration:
+            if config.trait_type == TraitType.BINARY:
                 posterior_state = _apply_binary_intercept_calibration(
                     posterior_state=posterior_state,
                     targets=target_vector,
@@ -3038,10 +3026,7 @@ def fit_variational_em(
             # only and must not gate convergence.
             validation_gates_convergence = bool(validation_history) and not validation_is_holdout_only
             convergence_change = max(parameter_change, hyperparameter_change)
-            hyperparameters_ready_for_convergence = (
-                not config.update_hyperparameters
-                or should_update_hyperparameters
-            )
+            hyperparameters_ready_for_convergence = should_update_hyperparameters
             if hyperparameters_ready_for_convergence and convergence_change < config.convergence_tolerance:
                 if validation_gates_convergence and validation_metric_this_epoch is not None and len(validation_history) >= 2:
                     validation_delta = abs(validation_history[-1] - validation_history[-2])
@@ -3109,71 +3094,41 @@ def fit_variational_em(
         local_scale=local_scale,
         config=config,
     )
-    if config.final_posterior_refinement:
-        log(f"  EM loop done after {len(objective_history)} iterations, computing final posterior...  mem={mem()}")
-        final_prior_precision_override: np.ndarray | None = None
-        if beta_variance_state is not None:
-            final_second_moment = np.asarray(
-                beta_state * beta_state + np.asarray(beta_variance_state, dtype=np.float64),
-                dtype=np.float64,
-            )
-            final_prior_precision_override = _build_cavi_correct_prior_precision(
-                reduced_second_moment=final_second_moment,
-                baseline_prior_variances=final_baseline_reduced_prior_variances,
-                local_shape_a=local_shape_a,
-                auxiliary_delta=auxiliary_delta,
-                config=config,
-            )
-        final_state = _fit_collapsed_posterior(
-            genotype_matrix=genotype_matrix,
-            covariate_matrix=covariate_matrix,
-            targets=target_vector,
-            reduced_prior_variances=final_reduced_prior_variances,
-            sigma_error2=sigma_error2,
-            alpha_init=alpha_state,
-            beta_init=beta_state,
-            trait_type=config.trait_type,
+    log(f"  EM loop done after {len(objective_history)} iterations, computing final posterior...  mem={mem()}")
+    final_prior_precision_override: np.ndarray | None = None
+    if beta_variance_state is not None:
+        final_second_moment = np.asarray(
+            beta_state * beta_state + np.asarray(beta_variance_state, dtype=np.float64),
+            dtype=np.float64,
+        )
+        final_prior_precision_override = _build_cavi_correct_prior_precision(
+            reduced_second_moment=final_second_moment,
+            baseline_prior_variances=final_baseline_reduced_prior_variances,
+            local_shape_a=local_shape_a,
+            auxiliary_delta=auxiliary_delta,
             config=config,
-            compute_logdet=True,
-            compute_beta_variance=True,
-            predictor_offset=predictor_offset_array,
-            prior_precision_override=final_prior_precision_override,
         )
-        if config.trait_type == TraitType.BINARY and config.binary_intercept_calibration:
-            final_state = _apply_binary_intercept_calibration(
-                posterior_state=final_state,
-                targets=target_vector,
-            )
-        log(f"  final posterior computed  obj={final_state.collapsed_objective:.6f}  sigma_e2={final_state.sigma_error2:.4f}  mem={mem()}")
-    else:
-        if beta_variance_state is None:
-            beta_variance_state = np.maximum(final_reduced_prior_variances, 1e-8)
-        final_linear_predictor = predictor_offset_array + np.asarray(covariate_matrix @ alpha_state, dtype=np.float64)
-        if use_stochastic_updates:
-            if genetic_linear_predictor is None:
-                raise RuntimeError("stochastic predictor cache is missing at final state assembly")
-            final_linear_predictor = final_linear_predictor + np.asarray(genetic_linear_predictor, dtype=np.float64)
-        elif genotype_matrix.shape[1] > 0:
-            final_linear_predictor = final_linear_predictor + _genotype_matvec_result_numpy(
-                genotype_matrix,
-                beta_state,
-                batch_size=config.posterior_variance_batch_size,
-                dtype=np.float64,
-            )
-        final_state = PosteriorState(
-            alpha=np.asarray(alpha_state, dtype=np.float64).copy(),
-            beta=np.asarray(beta_state, dtype=np.float64).copy(),
-            beta_variance=np.asarray(beta_variance_state, dtype=np.float64).copy(),
-            linear_predictor=np.asarray(final_linear_predictor, dtype=np.float64),
-            collapsed_objective=float(objective_history[-1]) if objective_history else 0.0,
-            sigma_error2=float(sigma_error2),
+    final_state = _fit_collapsed_posterior(
+        genotype_matrix=genotype_matrix,
+        covariate_matrix=covariate_matrix,
+        targets=target_vector,
+        reduced_prior_variances=final_reduced_prior_variances,
+        sigma_error2=sigma_error2,
+        alpha_init=alpha_state,
+        beta_init=beta_state,
+        trait_type=config.trait_type,
+        config=config,
+        compute_logdet=True,
+        compute_beta_variance=True,
+        predictor_offset=predictor_offset_array,
+        prior_precision_override=final_prior_precision_override,
+    )
+    if config.trait_type == TraitType.BINARY:
+        final_state = _apply_binary_intercept_calibration(
+            posterior_state=final_state,
+            targets=target_vector,
         )
-        if config.trait_type == TraitType.BINARY and config.binary_intercept_calibration:
-            final_state = _apply_binary_intercept_calibration(
-                posterior_state=final_state,
-                targets=target_vector,
-            )
-        log("  final posterior refinement skipped; returning current variational state  mem=" + mem())
+    log(f"  final posterior computed  obj={final_state.collapsed_objective:.6f}  sigma_e2={final_state.sigma_error2:.4f}  mem={mem()}")
     final_member_prior_variances = (
         np.asarray(final_reduced_prior_variances, dtype=np.float64)
         if _tie_map_is_identity(tie_map, member_count=len(member_records))
@@ -3376,7 +3331,7 @@ def _fit_collapsed_posterior(
             compute_logdet=compute_logdet,
             compute_beta_variance=compute_beta_variance,
             sample_space_preconditioner_rank=config.sample_space_preconditioner_rank,
-            posterior_working_sets=config.posterior_working_sets,
+            posterior_working_sets=True,
             posterior_working_set_min_variants=config.posterior_working_set_min_variants,
             posterior_working_set_initial_size=config.posterior_working_set_initial_size,
             posterior_working_set_growth=config.posterior_working_set_growth,
@@ -3418,7 +3373,7 @@ def _fit_collapsed_posterior(
             compute_beta_variance=compute_beta_variance,
             sample_space_preconditioner_rank=config.sample_space_preconditioner_rank,
             predictor_offset=predictor_offset_array,
-            posterior_working_sets=config.posterior_working_sets,
+            posterior_working_sets=True,
             posterior_working_set_min_variants=config.posterior_working_set_min_variants,
             posterior_working_set_initial_size=config.posterior_working_set_initial_size,
             posterior_working_set_growth=config.posterior_working_set_growth,
@@ -3501,7 +3456,6 @@ def _quantitative_posterior_state(
             posterior_variance_batch_size=posterior_variance_batch_size,
             random_seed=random_seed,
             sample_space_preconditioner_rank=sample_space_preconditioner_rank,
-            posterior_working_sets=posterior_working_sets,
             posterior_working_set_min_variants=posterior_working_set_min_variants,
             posterior_working_set_initial_size=posterior_working_set_initial_size,
             posterior_working_set_growth=posterior_working_set_growth,
@@ -3533,7 +3487,6 @@ def _quantitative_posterior_state(
                 compute_logdet=compute_logdet,
                 compute_beta_variance=compute_beta_variance,
                 sample_space_preconditioner_rank=sample_space_preconditioner_rank,
-                posterior_working_sets=posterior_working_sets,
                 posterior_working_set_min_variants=posterior_working_set_min_variants,
                 posterior_working_set_initial_size=posterior_working_set_initial_size,
                 posterior_working_set_growth=posterior_working_set_growth,
@@ -3787,8 +3740,8 @@ def _binary_posterior_state_tr_newton(
     compute_beta_variance: bool,
     sample_space_preconditioner_rank: int,
     predictor_offset: np.ndarray | None,
-    posterior_working_sets: bool,
-    posterior_working_set_min_variants: int,
+    posterior_working_sets: bool = True,
+    posterior_working_set_min_variants: int = 65_536,
     posterior_working_set_initial_size: int,
     posterior_working_set_growth: int,
     posterior_working_set_max_passes: int,
@@ -3898,7 +3851,6 @@ def _binary_posterior_state_tr_newton(
                 compute_beta_variance=compute_beta_variance,
                 initial_beta_guess=beta,
                 sample_space_preconditioner_rank=sample_space_preconditioner_rank,
-                posterior_working_sets=posterior_working_sets,
                 posterior_working_set_min_variants=posterior_working_set_min_variants,
                 posterior_working_set_initial_size=posterior_working_set_initial_size,
                 posterior_working_set_growth=posterior_working_set_growth,
@@ -4017,7 +3969,6 @@ def _binary_posterior_state(
             compute_beta_variance=compute_beta_variance,
             sample_space_preconditioner_rank=sample_space_preconditioner_rank,
             predictor_offset=predictor_offset,
-            posterior_working_sets=posterior_working_sets,
             posterior_working_set_min_variants=posterior_working_set_min_variants,
             posterior_working_set_initial_size=posterior_working_set_initial_size,
             posterior_working_set_growth=posterior_working_set_growth,
@@ -4232,7 +4183,6 @@ def _binary_posterior_state(
                 random_seed=random_seed + iteration_index,
                 initial_beta_guess=parameters[covariate_count:],
                 sample_space_preconditioner_rank=sample_space_preconditioner_rank,
-                posterior_working_sets=posterior_working_sets,
                 posterior_working_set_min_variants=posterior_working_set_min_variants,
                 posterior_working_set_initial_size=posterior_working_set_initial_size,
                 posterior_working_set_growth=posterior_working_set_growth,
@@ -4427,7 +4377,6 @@ def _binary_posterior_state(
                     compute_beta_variance=compute_beta_variance,
                     initial_beta_guess=parameters[covariate_count:],
                     sample_space_preconditioner_rank=sample_space_preconditioner_rank,
-                    posterior_working_sets=posterior_working_sets,
                     posterior_working_set_min_variants=posterior_working_set_min_variants,
                     posterior_working_set_initial_size=posterior_working_set_initial_size,
                     posterior_working_set_growth=posterior_working_set_growth,
@@ -7484,7 +7433,6 @@ def _should_use_posterior_working_set(
     variant_count: int,
     compute_logdet: bool,
     compute_beta_variance: bool,
-    posterior_working_sets: bool,
     posterior_working_set_min_variants: int,
     exact_solver_matrix_limit: int,
     use_exact_variant: bool,
@@ -7503,7 +7451,6 @@ def _should_use_posterior_working_set(
         )
     return (
         allow_working_set
-        and posterior_working_sets
         and not compute_logdet
         and not compute_beta_variance
         and variant_count >= max(promoted_min_variants, 0)
@@ -8137,7 +8084,6 @@ def _solve_restricted_mean_only(
         variant_count=variant_count,
         compute_logdet=False,
         compute_beta_variance=False,
-        posterior_working_sets=posterior_working_sets,
         posterior_working_set_min_variants=posterior_working_set_min_variants,
         exact_solver_matrix_limit=exact_solver_matrix_limit,
         use_exact_variant=use_exact_variant,
@@ -8969,7 +8915,6 @@ def _solve_restricted_full(
         variant_count=variant_count,
         compute_logdet=compute_logdet,
         compute_beta_variance=compute_beta_variance,
-        posterior_working_sets=posterior_working_sets,
         posterior_working_set_min_variants=posterior_working_set_min_variants,
         exact_solver_matrix_limit=exact_solver_matrix_limit,
         use_exact_variant=use_exact_variant,
@@ -10748,10 +10693,14 @@ def _update_tpb_shape_vectors(
         },
     )
 
+    # L-BFGS-B can ABNORMAL on tiny/ill-conditioned problems (degenerate first
+    # epoch with empty class membership). Fall back to the input shape rather
+    # than raising — the next outer EM iteration retries from updated state.
     if not result.success or result.x is None or not np.all(np.isfinite(result.x)):
-        raise RuntimeError(f"TPB shape L-BFGS-B optimization failed: {result.message}")
-
-    optimized_log_shape = np.asarray(result.x, dtype=np.float64)
+        log(f"  TPB shape L-BFGS-B did not converge ({result.message}); keeping previous shape")
+        optimized_log_shape = initial_log_shape.copy()
+    else:
+        optimized_log_shape = np.asarray(result.x, dtype=np.float64)
 
     return (
         np.exp(optimized_log_shape[:class_count]).astype(np.float64),

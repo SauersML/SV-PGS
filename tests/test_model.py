@@ -163,7 +163,6 @@ def test_runtime_tuned_config_for_gpu_uses_budget_driven_solver_limit(monkeypatc
     assert tuned_config.exact_solver_matrix_limit == 9_000
     assert tuned_config.sample_space_preconditioner_rank == 400
     assert tuned_config.stochastic_variant_batch_size == 8_500
-    assert tuned_config.final_posterior_refinement is False
     assert summary is not None
     assert "gpu_profile=budget-driven" in summary
 
@@ -361,7 +360,6 @@ def test_fit_stage_cache_survives_cache_backed_memmap_mtime_changes(tmp_path: Pa
         max_outer_iterations=1,
         minimum_minor_allele_frequency=0.0,
         sample_space_preconditioner_rank=0,
-        final_posterior_refinement=False,
         stochastic_variational_updates=False,
     )
 
@@ -470,7 +468,6 @@ def test_fit_stage_cache_persists_cohort_artifacts_for_repeated_fits(tmp_path: P
         max_outer_iterations=1,
         minimum_minor_allele_frequency=0.0,
         sample_space_preconditioner_rank=0,
-        final_posterior_refinement=False,
         stochastic_variational_updates=False,
     )
 
@@ -914,7 +911,6 @@ def test_benchmark_suite_runs_from_shared_trainer():
     )
 
     assert set(benchmark_metrics) == {
-        "snv_only_without_hyperparameter_updates",
         "snv_only_continuous",
         "joint_snv_sv_continuous",
     }
