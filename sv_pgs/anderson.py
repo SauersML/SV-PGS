@@ -128,6 +128,8 @@ def safeguarded_anderson(
     tolerance: float = 1e-6,
     regularization: float = 1e-10,
     safeguard_slack: float = 0.0,
+    relative_safeguard_slack: float = 0.0,
+    nonmonotone_window: int = 1,
     damping_fractions: Sequence[float] = (1.0, 0.5, 0.25),
 ) -> tuple[np.ndarray, list[float], bool]:
     """Run safeguarded Anderson(m).
@@ -135,6 +137,14 @@ def safeguarded_anderson(
     Returns ``(best_iterate, objective_history, converged)``. The history
     contains the objective value at each accepted iterate (including the
     initial one).
+
+    The safeguard is non-monotone (Grippo-Lampariello-Lucidi style): a
+    candidate is accepted if its objective is at least
+    ``max(last_k_objectives) - safeguard_slack - relative_safeguard_slack *
+    |reference|``. This admits short-term objective dips that Anderson
+    typically produces while still rejecting genuine divergence. Setting
+    ``nonmonotone_window=1`` and ``relative_safeguard_slack=0`` recovers the
+    strict monotone safeguard.
     """
     original_shape = np.asarray(initial_iterate).shape
     current = np.asarray(initial_iterate, dtype=np.float64).ravel().copy()
@@ -169,12 +179,28 @@ def safeguarded_anderson(
 
         accepted = mapped
         accepted_objective = plain_objective
+        # Non-monotone reference: best objective over the last window.
+        # Anderson candidates often dip transiently below the plain step's
+        # objective before recovering super-linearly; a strict monotone
+        # safeguard rejects every such candidate. Using max-over-window
+        # plus a relative slack admits useful Anderson steps while still
+        # catching genuine divergence (which produces unbounded drops).
+        window = max(1, int(nonmonotone_window))
+        recent_objectives = history[-window:] if history else []
+        if recent_objectives:
+            reference_objective = max(recent_objectives)
+        else:
+            reference_objective = plain_objective
+        # Plain step is always at least as good as the worst-case fallback.
+        reference_objective = max(reference_objective, plain_objective)
+        relative_tolerance = float(relative_safeguard_slack) * abs(reference_objective)
+        acceptance_threshold = reference_objective - float(safeguard_slack) - relative_tolerance
         for damping in damping_fractions:
             candidate = damping * accelerated + (1.0 - damping) * mapped
             if not np.all(np.isfinite(candidate)):
                 continue
             candidate_objective = _call_objective(candidate)
-            if candidate_objective >= plain_objective - safeguard_slack:
+            if candidate_objective >= acceptance_threshold:
                 accepted = candidate
                 accepted_objective = candidate_objective
                 break

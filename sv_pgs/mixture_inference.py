@@ -52,7 +52,7 @@ The algorithm iterates three steps until convergence:
 
 from __future__ import annotations
 
-from dataclasses import MISSING, dataclass, fields as dataclass_fields, replace as dataclass_replace
+from dataclasses import MISSING, dataclass, field, fields as dataclass_fields, replace as dataclass_replace
 import gc
 import hashlib
 import json
@@ -73,6 +73,8 @@ from scipy.special import kve as scipy_bessel_kve
 from sv_pgs._jax import gpu_compute_jax_dtype, gpu_compute_numpy_dtype
 from sv_pgs.config import ModelConfig, TraitType, VariantClass
 from sv_pgs.data import NESTED_PATH_DELIMITER, TieMap, VariantRecord
+from sv_pgs.anderson import AndersonState, anderson_step
+from sv_pgs.elbo import compute_elbo
 from sv_pgs.genotype import (
     DEFAULT_GENOTYPE_BATCH_SIZE,
     DenseRawGenotypeMatrix,
@@ -93,6 +95,7 @@ from sv_pgs.genotype import (
 from sv_pgs.forcing_sequence import forcing_tolerance, relaxed_iteration_cap
 from sv_pgs.linear_solvers import build_linear_operator, solve_spd_system, stochastic_logdet
 from sv_pgs.numeric import stable_sigmoid
+from sv_pgs.tr_newton import trust_region_newton_logistic
 from sv_pgs.preprocessing import collapse_tie_groups
 from sv_pgs.progress import log, mem
 
@@ -120,6 +123,7 @@ _STOCHASTIC_CHECKPOINT_MIN_SECONDS = 60.0
 _STOCHASTIC_CHECKPOINT_TARGETS_PER_EPOCH = 20
 _STOCHASTIC_BLOCK_LOG_TARGETS_PER_EPOCH = 10
 _STOCHASTIC_BLOCK_GC_INTERVAL = 20
+_ANDERSON_MEMORY_DEPTH = 5
 _GPU_INVERSE_DIAGONAL_WORKSPACE_FRACTION = 0.01
 _GPU_INVERSE_DIAGONAL_MAX_BLOCK = 4_096
 
@@ -174,6 +178,17 @@ def _gpu_exact_variant_base_bytes(
     )
 
 
+def _gpu_exact_variant_resident_cache_bytes(
+    *,
+    sample_count: int,
+    variant_count: int,
+    cache_is_int8_standardized: bool,
+) -> int:
+    if cache_is_int8_standardized:
+        return int(sample_count) * int(variant_count)
+    return 4 * int(sample_count) * int(variant_count)
+
+
 def _gpu_exact_variant_full_matrix_required_bytes(
     *,
     cupy,
@@ -184,8 +199,10 @@ def _gpu_exact_variant_full_matrix_required_bytes(
     matrix_itemsize: int = 8,
 ) -> int:
     expanded_matrix_bytes = int(matrix_itemsize) * int(sample_count) * int(variant_count)
-    resident_cache_bytes = int(sample_count) * int(variant_count) if cache_is_int8_standardized else (
-        4 * int(sample_count) * int(variant_count)
+    resident_cache_bytes = _gpu_exact_variant_resident_cache_bytes(
+        sample_count=int(sample_count),
+        variant_count=int(variant_count),
+        cache_is_int8_standardized=cache_is_int8_standardized,
     )
     tile_max_variants = _gpu_exact_variant_tile_max_variants(
         cupy,
@@ -207,6 +224,55 @@ def _gpu_exact_variant_full_matrix_required_bytes(
     )
 
 
+def _gpu_exact_variant_full_matrix_additional_bytes(
+    *,
+    cupy,
+    sample_count: int,
+    variant_count: int,
+    covariate_count: int,
+    cache_is_int8_standardized: bool,
+    matrix_itemsize: int = 8,
+) -> int:
+    required_bytes = _gpu_exact_variant_full_matrix_required_bytes(
+        cupy=cupy,
+        sample_count=int(sample_count),
+        variant_count=int(variant_count),
+        covariate_count=int(covariate_count),
+        cache_is_int8_standardized=cache_is_int8_standardized,
+        matrix_itemsize=int(matrix_itemsize),
+    )
+    resident_cache_bytes = _gpu_exact_variant_resident_cache_bytes(
+        sample_count=int(sample_count),
+        variant_count=int(variant_count),
+        cache_is_int8_standardized=cache_is_int8_standardized,
+    )
+    return max(int(required_bytes) - int(resident_cache_bytes), 0)
+
+
+def _release_cupy_memory_pool(cupy) -> None:
+    gc.collect()
+    for pool_getter_name in ("get_default_memory_pool", "get_default_pinned_memory_pool"):
+        try:
+            pool_getter = getattr(cupy, pool_getter_name)
+            pool = pool_getter()
+            free_all_blocks = getattr(pool, "free_all_blocks")
+            free_all_blocks()
+        except (AttributeError, OSError, RuntimeError):
+            continue
+
+
+def _gpu_live_usable_bytes(cupy) -> int:
+    _release_cupy_memory_pool(cupy)
+    free_bytes = int(_gpu_free_bytes(cupy))
+    if free_bytes <= 0:
+        return 0
+    total_bytes = int(_gpu_total_bytes(cupy))
+    if total_bytes <= 0:
+        return free_bytes
+    total_cap = int(total_bytes * _GPU_EXACT_VARIANT_MEMORY_UTILIZATION)
+    return max(min(free_bytes, total_cap), 0)
+
+
 def _gpu_exact_variant_full_matrix_fits(
     cupy,
     *,
@@ -218,11 +284,8 @@ def _gpu_exact_variant_full_matrix_fits(
 ) -> bool:
     if int(variant_count) <= _GPU_EXACT_VARIANT_ALWAYS_FULL_MAX_VARIANTS:
         return True
-    # Use total GPU memory minus a fixed reserve, not free memory.
-    # Free memory depends on JAX pre-allocation state which varies.
-    total_bytes = _gpu_total_bytes(cupy)
-    usable_bytes = int(total_bytes * _GPU_EXACT_VARIANT_MEMORY_UTILIZATION)
-    required_bytes = _gpu_exact_variant_full_matrix_required_bytes(
+    usable_bytes = _gpu_live_usable_bytes(cupy)
+    required_bytes = _gpu_exact_variant_full_matrix_additional_bytes(
         cupy=cupy,
         sample_count=int(sample_count),
         variant_count=int(variant_count),
@@ -241,8 +304,7 @@ def _gpu_exact_variant_tile_size(
     covariate_count: int,
     matrix_itemsize: int = 8,
 ) -> int:
-    total_bytes = _gpu_total_bytes(cupy)
-    usable_bytes = int(total_bytes * _GPU_EXACT_VARIANT_MEMORY_UTILIZATION)
+    usable_bytes = _gpu_live_usable_bytes(cupy)
     fixed_bytes = _gpu_exact_variant_base_bytes(
         int(variant_count),
         int(covariate_count),
@@ -355,6 +417,21 @@ class PriorDesign:
     inverse_class_lookup: dict[int, VariantClass]  # column index -> VariantClass enum
 
 
+def _release_gpu_memory() -> None:
+    """Run a Python GC pass and return freed blocks to the CUDA driver.
+
+    Without ``free_all_blocks()`` the cupy default memory pool retains freed
+    blocks indefinitely; calling this after a ``gc.collect()`` ensures memory
+    actually returns to the driver. Safe to call when cupy is not installed.
+    """
+    gc.collect()
+    try:
+        import cupy as cp
+        cp.get_default_memory_pool().free_all_blocks()
+    except (ImportError, AttributeError):
+        pass
+
+
 @dataclass(slots=True)
 class _SampleSpacePreconditionerCacheEntry:
     batch_size: int
@@ -371,6 +448,14 @@ class _SampleSpacePreconditionerCacheEntry:
     nystrom_factor_cpu: np.ndarray | None = None
     nystrom_factor_gpu: Any = None  # cached GPU Nyström factor (cupy array)
     global_background: bool = False
+
+    def clear_gpu_arrays(self) -> None:
+        """Release cached GPU arrays back to the cupy pool.
+
+        Safe to call even when the entry never held GPU data.
+        """
+        self.nystrom_basis_gpu = None
+        self.nystrom_factor_gpu = None
 
 
 @dataclass(slots=True)
@@ -406,10 +491,10 @@ class _PriorAnnotationFeatureNames:
 
 @dataclass(slots=True)
 class VariationalFitResult:
-    alpha: np.ndarray
-    beta_reduced: np.ndarray
-    beta_variance: np.ndarray
-    prior_scales: np.ndarray
+    alpha: np.ndarray  # float32
+    beta_reduced: np.ndarray  # float32
+    beta_variance: np.ndarray  # float64 — preserves precision for shrunk variants
+    prior_scales: np.ndarray  # float64 — preserves precision for shrunk variants
     global_scale: float
     class_tpb_shape_a: dict[VariantClass, float]
     class_tpb_shape_b: dict[VariantClass, float]
@@ -418,7 +503,7 @@ class VariationalFitResult:
     sigma_error2: float
     objective_history: list[float]
     validation_history: list[float]
-    member_prior_variances: np.ndarray
+    member_prior_variances: np.ndarray  # float64 — preserves precision for shrunk variants
     linear_predictor: np.ndarray | None = None
     selected_iteration_count: int | None = None
     converged: bool = False
@@ -426,6 +511,7 @@ class VariationalFitResult:
     final_predictor_change: float | None = None
     final_objective_change: float | None = None
     final_hyperparameter_change: float | None = None
+    elbo_history: list[float] = field(default_factory=list)
 
 
 @dataclass(slots=True)
@@ -467,6 +553,14 @@ class VariationalFitCheckpoint:
     epoch_reduced_prior_variances: np.ndarray | None = None
     binary_block_resume_state: dict[str, object] | None = None
     stochastic_block_size: int | None = None
+    # Wave 2 diagnostics + accelerator state. These default cleanly so old
+    # pickles (written before these fields existed) load via ``__setstate__``
+    # with empty/None values — see ``test_old_checkpoint_loads_with_new_fields``.
+    elbo_history: list[float] = field(default_factory=list)
+    anderson_iterates: list[np.ndarray] | None = None
+    anderson_map_values: list[np.ndarray] | None = None
+    anderson_residuals: list[np.ndarray] | None = None
+    anderson_memory_depth: int | None = None
 
     def __getstate__(self) -> dict[str, object]:
         return {
@@ -553,29 +647,29 @@ class _SampleSpaceCGLanczosRecorder:
 # Fields that affect convergence speed but not the mathematical model result.
 # Changing these should NOT invalidate EM checkpoints.
 _CHECKPOINT_EXCLUDED_CONFIG_FIELDS = frozenset({
-    "max_outer_iterations",
-    "stochastic_variant_batch_size",
-    "stochastic_step_offset",
-    "stochastic_step_exponent",
-    "stochastic_min_variant_count",
-    "linear_solver_tolerance",
-    "maximum_linear_solver_iterations",
-    "logdet_probe_count",
-    "logdet_lanczos_steps",
+    "beta_variance_update_interval",
     "exact_solver_matrix_limit",
+    "final_posterior_refinement",
+    "linear_solver_tolerance",
+    "logdet_lanczos_steps",
+    "logdet_probe_count",
+    "max_inner_newton_iterations",
+    "max_outer_iterations",
+    "maximum_linear_solver_iterations",
+    "newton_gradient_tolerance",
     "posterior_variance_batch_size",
     "posterior_variance_probe_count",
-    "beta_variance_update_interval",
-    "sample_space_preconditioner_rank",
-    "max_inner_newton_iterations",
-    "newton_gradient_tolerance",
-    "posterior_working_set_initial_size",
-    "posterior_working_set_growth",
-    "posterior_working_set_max_passes",
     "posterior_working_set_coefficient_tolerance",
-    "validation_interval",
+    "posterior_working_set_growth",
+    "posterior_working_set_initial_size",
+    "posterior_working_set_max_passes",
     "random_seed",
-    "final_posterior_refinement",
+    "sample_space_preconditioner_rank",
+    "stochastic_min_variant_count",
+    "stochastic_step_exponent",
+    "stochastic_step_offset",
+    "stochastic_variant_batch_size",
+    "validation_interval",
 })
 
 
@@ -601,6 +695,148 @@ def _checkpoint_prior_design_signature(prior_design: PriorDesign) -> str:
         ).encode("utf-8")
     )
     return hasher.hexdigest()
+
+
+def checkpoint_from_result(
+    result: "VariationalFitResult",
+    *,
+    config: ModelConfig,
+    prior_design: "PriorDesign",
+    validation_enabled: bool = False,
+    completed_iterations: int | None = None,
+) -> "VariationalFitCheckpoint":
+    """Convert a previous fit's result into a resumable checkpoint.
+
+    The returned checkpoint is suitable for passing as ``resume_checkpoint``
+    to a fresh ``fit_variational_em`` call. Use cases:
+      - "Run 20 more iterations from where this fit left off."
+      - "Restart with tighter tolerances starting from this fit."
+      - "Use this fit's hyperparameters as a prior for a new cohort."
+    """
+    config_signature = _checkpoint_config_signature(config)
+    prior_design_signature = _checkpoint_prior_design_signature(prior_design)
+
+    alpha_state = np.asarray(result.alpha, dtype=np.float64).copy()
+    beta_state = np.asarray(result.beta_reduced, dtype=np.float64).copy()
+
+    num_classes = prior_design.class_membership_matrix.shape[1]
+    tpb_shape_a_vector = np.zeros(num_classes, dtype=np.float64)
+    tpb_shape_b_vector = np.zeros(num_classes, dtype=np.float64)
+    default_shape_a = config.class_tpb_shape_a()
+    default_shape_b = config.class_tpb_shape_b()
+    for class_index, variant_class in prior_design.inverse_class_lookup.items():
+        if variant_class in result.class_tpb_shape_a:
+            tpb_shape_a_vector[class_index] = float(result.class_tpb_shape_a[variant_class])
+        else:
+            tpb_shape_a_vector[class_index] = float(default_shape_a.get(variant_class, 1.0))
+        if variant_class in result.class_tpb_shape_b:
+            tpb_shape_b_vector[class_index] = float(result.class_tpb_shape_b[variant_class])
+        else:
+            tpb_shape_b_vector[class_index] = float(default_shape_b.get(variant_class, 1.0))
+
+    local_shape_b = np.asarray(
+        prior_design.class_membership_matrix @ tpb_shape_b_vector, dtype=np.float64
+    )
+
+    num_reduced = beta_state.shape[0]
+
+    scale_model_coefficients = np.asarray(
+        result.scale_model_coefficients, dtype=np.float64
+    ).copy()
+    if scale_model_coefficients.shape != (prior_design.design_matrix.shape[1],):
+        raise ValueError(
+            "scale_model_coefficients shape mismatch between result and prior_design."
+        )
+
+    # Recover the converged local TPB shrinkage from the saved prior_scales:
+    #   tau_j^2 = (sigma_g * s_j)^2 * lambda_j   =>
+    #     lambda_j = tau_j^2 / (sigma_g * s_j)^2
+    # so the resumed fit starts at the same effective prior variances rather
+    # than the cold-start lambda=1 (which would otherwise blow up sigma_e2).
+    prior_scales_arr = np.asarray(result.prior_scales, dtype=np.float64)
+    if prior_scales_arr.shape == (num_reduced,):
+        baseline_scales = _metadata_baseline_scales_from_coefficients(
+            scale_model_coefficients=scale_model_coefficients,
+            design_matrix=prior_design.design_matrix,
+            config=config,
+        )
+        baseline_prior_variances = (float(result.global_scale) * baseline_scales) ** 2
+        safe_baseline = np.maximum(baseline_prior_variances, 1e-30)
+        local_scale = np.clip(
+            prior_scales_arr / safe_baseline, config.local_scale_floor, None
+        ).astype(np.float64)
+    else:
+        local_scale = np.ones(num_reduced, dtype=np.float64)
+
+    if local_shape_b.shape == (num_reduced,):
+        auxiliary_delta = local_shape_b.copy()
+    else:
+        auxiliary_delta = np.ones(num_reduced, dtype=np.float64)
+
+    completed = (
+        int(completed_iterations)
+        if completed_iterations is not None
+        else len(result.objective_history)
+    )
+    objective_history = [float(v) for v in result.objective_history]
+    if len(objective_history) != completed:
+        if len(objective_history) > completed:
+            objective_history = objective_history[:completed]
+        else:
+            pad = completed - len(objective_history)
+            tail = objective_history[-1] if objective_history else 0.0
+            objective_history = objective_history + [float(tail)] * pad
+    validation_history = [float(v) for v in result.validation_history]
+    elbo_history = [float(v) for v in (result.elbo_history or [])]
+
+    return VariationalFitCheckpoint(
+        config_signature=config_signature,
+        prior_design_signature=prior_design_signature,
+        validation_enabled=bool(validation_enabled),
+        completed_iterations=completed,
+        alpha_state=alpha_state,
+        beta_state=beta_state,
+        local_scale=local_scale,
+        auxiliary_delta=auxiliary_delta,
+        sigma_error2=float(result.sigma_error2),
+        global_scale=float(result.global_scale),
+        scale_model_coefficients=scale_model_coefficients,
+        tpb_shape_a_vector=tpb_shape_a_vector,
+        tpb_shape_b_vector=tpb_shape_b_vector,
+        objective_history=objective_history,
+        validation_history=validation_history,
+        previous_alpha=None,
+        previous_beta=None,
+        previous_local_scale=None,
+        previous_theta=None,
+        previous_tpb_shape_a_vector=None,
+        previous_tpb_shape_b_vector=None,
+        best_validation_metric=None,
+        best_alpha=None,
+        best_beta=None,
+        best_beta_variance=None,
+        best_local_scale=None,
+        best_theta=None,
+        best_sigma_error2=None,
+        best_tpb_shape_a_vector=None,
+        best_tpb_shape_b_vector=None,
+        best_validation_iteration=None,
+        completed_blocks_in_iteration=0,
+        beta_variance_state=(
+            np.asarray(result.beta_variance, dtype=np.float64).copy()
+            if np.asarray(result.beta_variance).shape == (num_reduced,)
+            else None
+        ),
+        reduced_second_moment=None,
+        epoch_reduced_prior_variances=None,
+        binary_block_resume_state=None,
+        stochastic_block_size=None,
+        elbo_history=elbo_history,
+        anderson_iterates=None,
+        anderson_map_values=None,
+        anderson_residuals=None,
+        anderson_memory_depth=None,
+    )
 
 
 def _initialize_alpha_state(
@@ -810,22 +1046,11 @@ def _stochastic_binary_newton_iterations(
 def _should_update_hyperparameters_this_iteration(
     iteration_number: int,
     config: ModelConfig,
-    *,
-    allow_final_iteration: bool,
 ) -> bool:
     return (
         config.update_hyperparameters
         and int(iteration_number) >= 2
-        and (
-            (
-                int(iteration_number) < int(config.max_outer_iterations)
-                and int(iteration_number) % 2 == 0
-            )
-            or (
-                int(iteration_number) == int(config.max_outer_iterations)
-                and bool(allow_final_iteration)
-            )
-        )
+        and int(iteration_number) % 2 == 0
     )
 
 
@@ -965,10 +1190,12 @@ def _stochastic_epoch_objective(
     target_array = np.asarray(targets, dtype=np.float64)
     if trait_type == TraitType.BINARY:
         probabilities = np.asarray(stable_sigmoid(predictor), dtype=np.float64)
+        # Use np.maximum (not addition) so saturated sigmoids (p≈1 or p≈0) do not feed
+        # a slightly-negative argument into np.log, which would yield NaN/inf.
         data_term = float(
             np.mean(
-                target_array * np.log(probabilities + 1e-12)
-                + (1.0 - target_array) * np.log(1.0 - probabilities + 1e-12)
+                target_array * np.log(np.maximum(probabilities, 1e-12))
+                + (1.0 - target_array) * np.log(np.maximum(1.0 - probabilities, 1e-12))
             )
         )
     else:
@@ -1077,7 +1304,11 @@ def fit_variational_em(
     alpha_state = np.zeros(covariate_matrix.shape[1], dtype=np.float64)
     beta_state = np.zeros(genotype_matrix.shape[1], dtype=np.float64)
     objective_history: list[float] = []
+    elbo_history: list[float] = []
     validation_history: list[float] = []
+    # Anderson accelerator state. The memory depth is an internal solver policy,
+    # not a user-facing model parameter.
+    anderson_state: AndersonState = AndersonState(memory_depth=_ANDERSON_MEMORY_DEPTH)
     previous_alpha: np.ndarray | None = None
     previous_beta: np.ndarray | None = None
     previous_local_scale: np.ndarray | None = None
@@ -1130,6 +1361,11 @@ def fit_variational_em(
         epoch_reduced_prior_variances_override: np.ndarray | None = None,
         binary_block_resume_state_override: dict[str, object] | None = None,
         stochastic_block_size_override: int | None = None,
+        global_scale_override: float | None = None,
+        scale_model_coefficients_override: np.ndarray | None = None,
+        tpb_shape_a_vector_override: np.ndarray | None = None,
+        tpb_shape_b_vector_override: np.ndarray | None = None,
+        auxiliary_delta_override: np.ndarray | None = None,
     ) -> VariationalFitCheckpoint:
         return VariationalFitCheckpoint(
             config_signature=config_signature,
@@ -1139,12 +1375,26 @@ def fit_variational_em(
             alpha_state=np.asarray(alpha_state, dtype=np.float64).copy(),
             beta_state=np.asarray(beta_state, dtype=np.float64).copy(),
             local_scale=np.asarray(local_scale, dtype=np.float64).copy(),
-            auxiliary_delta=np.asarray(auxiliary_delta, dtype=np.float64).copy(),
+            auxiliary_delta=np.asarray(
+                auxiliary_delta if auxiliary_delta_override is None else auxiliary_delta_override,
+                dtype=np.float64,
+            ).copy(),
             sigma_error2=float(sigma_error2),
-            global_scale=float(global_scale),
-            scale_model_coefficients=np.asarray(scale_model_coefficients, dtype=np.float64).copy(),
-            tpb_shape_a_vector=np.asarray(tpb_shape_a_vector, dtype=np.float64).copy(),
-            tpb_shape_b_vector=np.asarray(tpb_shape_b_vector, dtype=np.float64).copy(),
+            global_scale=float(global_scale if global_scale_override is None else global_scale_override),
+            scale_model_coefficients=np.asarray(
+                scale_model_coefficients
+                if scale_model_coefficients_override is None
+                else scale_model_coefficients_override,
+                dtype=np.float64,
+            ).copy(),
+            tpb_shape_a_vector=np.asarray(
+                tpb_shape_a_vector if tpb_shape_a_vector_override is None else tpb_shape_a_vector_override,
+                dtype=np.float64,
+            ).copy(),
+            tpb_shape_b_vector=np.asarray(
+                tpb_shape_b_vector if tpb_shape_b_vector_override is None else tpb_shape_b_vector_override,
+                dtype=np.float64,
+            ).copy(),
             objective_history=[float(value) for value in objective_history],
             validation_history=[float(value) for value in validation_history],
             previous_alpha=_copy_optional(previous_alpha),
@@ -1171,12 +1421,31 @@ def fit_variational_em(
             stochastic_block_size=(
                 None if stochastic_block_size_override is None else int(stochastic_block_size_override)
             ),
+            elbo_history=[float(value) for value in elbo_history],
+            anderson_iterates=(
+                [np.asarray(arr, dtype=np.float64).copy() for arr in anderson_state.iterates]
+                if anderson_state is not None and anderson_state.iterates
+                else None
+            ),
+            anderson_map_values=(
+                [np.asarray(arr, dtype=np.float64).copy() for arr in anderson_state.map_values]
+                if anderson_state is not None and anderson_state.map_values
+                else None
+            ),
+            anderson_residuals=(
+                [np.asarray(arr, dtype=np.float64).copy() for arr in anderson_state.residuals]
+                if anderson_state is not None and anderson_state.residuals
+                else None
+            ),
+            anderson_memory_depth=(
+                int(anderson_state.memory_depth) if anderson_state is not None else None
+            ),
         )
 
     def _initialize_em_state() -> None:
         nonlocal global_scale, scale_model_coefficients, tpb_shape_a_vector, tpb_shape_b_vector
         nonlocal local_shape_a, local_shape_b, local_scale, auxiliary_delta, sigma_error2
-        nonlocal alpha_state, beta_state, objective_history, validation_history
+        nonlocal alpha_state, beta_state, objective_history, elbo_history, validation_history
         nonlocal previous_alpha, previous_beta, previous_local_scale, previous_theta
         nonlocal previous_tpb_shape_a_vector, previous_tpb_shape_b_vector
         nonlocal previous_linear_predictor, previous_objective
@@ -1195,8 +1464,20 @@ def fit_variational_em(
             targets=target_vector,
             trait_type=config.trait_type,
         )
+        global_scale = _calibrate_initial_global_scale(
+            current_global_scale=float(global_scale),
+            scale_model_coefficients=scale_model_coefficients,
+            prior_design=prior_design,
+            genotype_matrix=genotype_matrix,
+            covariate_matrix=covariate_matrix,
+            targets=target_vector,
+            alpha_state=alpha_state,
+            trait_type=config.trait_type,
+            config=config,
+        )
         beta_state = np.zeros(genotype_matrix.shape[1], dtype=np.float64)
         objective_history = []
+        elbo_history = []
         validation_history = []
         previous_alpha = None
         previous_beta = None
@@ -1284,6 +1565,69 @@ def fit_variational_em(
                 else int(resume_checkpoint.best_validation_iteration)
             )
             start_iteration = int(resume_checkpoint.completed_iterations)
+            # Restore ELBO diagnostic history (defaults to [] for old pickles
+            # that predate this field — see VariationalFitCheckpoint.__setstate__).
+            elbo_history = [float(value) for value in resume_checkpoint.elbo_history]
+            # Restore Anderson(m) accelerator state when the saved memory
+            # depth matches the resuming config. If the user changed the
+            # memory depth, disabled Anderson at save time, or the packed
+            # state dimension shifted between runs, we fall back to a fresh
+            # state rather than silently using mismatched history. This
+            # never affects the EM fixed point — Anderson only changes the
+            # path taken to it — so safe reset is always correct.
+            saved_iterates = resume_checkpoint.anderson_iterates
+            saved_map_values = resume_checkpoint.anderson_map_values
+            saved_residuals = resume_checkpoint.anderson_residuals
+            saved_depth = resume_checkpoint.anderson_memory_depth
+            if (
+                saved_iterates is not None
+                and saved_map_values is not None
+                and saved_residuals is not None
+                and saved_depth == _ANDERSON_MEMORY_DEPTH
+            ):
+                try:
+                    restored_iterates = [
+                        np.asarray(arr, dtype=np.float64).copy() for arr in saved_iterates
+                    ]
+                    restored_map_values = [
+                        np.asarray(arr, dtype=np.float64).copy() for arr in saved_map_values
+                    ]
+                    restored_residuals = [
+                        np.asarray(arr, dtype=np.float64).copy() for arr in saved_residuals
+                    ]
+                    history_lengths = {
+                        len(restored_iterates),
+                        len(restored_map_values),
+                        len(restored_residuals),
+                    }
+                    if len(history_lengths) != 1:
+                        raise ValueError("Anderson history lists have inconsistent length")
+                    shapes_seen = {
+                        arr.shape for arr in (
+                            restored_iterates + restored_map_values + restored_residuals
+                        )
+                    }
+                    if len(shapes_seen) > 1:
+                        raise ValueError("Anderson history packed-state dimension changed")
+                    anderson_state.iterates = restored_iterates
+                    anderson_state.map_values = restored_map_values
+                    anderson_state.residuals = restored_residuals
+                    log(
+                        f"  variational EM: restored Anderson memory "
+                        f"({next(iter(history_lengths))} entries, depth={saved_depth})"
+                    )
+                except Exception as restore_error:  # defense in depth
+                    anderson_state.reset()
+                    log(
+                        f"  variational EM: failed to restore Anderson state ({restore_error}); "
+                        "starting accelerator from a fresh memory"
+                    )
+            elif saved_iterates is not None and saved_depth != _ANDERSON_MEMORY_DEPTH:
+                log(
+                    f"  variational EM: Anderson memory depth changed "
+                    f"({saved_depth} -> {_ANDERSON_MEMORY_DEPTH}); "
+                    "resetting accelerator to a fresh state"
+                )
             log(
                 "  variational EM: resuming from checkpoint "
                 + f"after {start_iteration}/{config.max_outer_iterations} iterations  mem={mem()}"
@@ -1300,6 +1644,19 @@ def fit_variational_em(
         f"reason={'matrix on GPU → working-set' if gpu_resident else 'streaming from mmap → stochastic blocks' if use_stochastic_updates else 'small variant count → collapsed'}"
     )
     beta_variance_state: np.ndarray | None = None
+    # Carry the saved posterior beta variance through to the collapsed path so
+    # the first sigma_e2 update post-resume uses the real shrunk variance
+    # (its trace_term term) instead of the unshrunk prior_variances fallback.
+    # Without this the warm-start helper's sigma_e2 explodes on the first
+    # post-resume iteration.
+    if (
+        resume_checkpoint is not None
+        and resume_checkpoint.beta_variance_state is not None
+        and resume_checkpoint.beta_variance_state.shape == (genotype_matrix.shape[1],)
+    ):
+        beta_variance_state = np.asarray(
+            resume_checkpoint.beta_variance_state, dtype=np.float64
+        ).copy()
     genetic_linear_predictor: np.ndarray | None = None
     best_genetic_linear_predictor: np.ndarray | None = None
     restricted_posterior_warm_start = _RestrictedPosteriorWarmStart()
@@ -1455,6 +1812,10 @@ def fit_variational_em(
             "  variational inference mode: stochastic variant-block updates "
             + f"(block_size={block_size}, blocks_per_epoch={block_count})"
         )
+        _svi_cached_metadata_baseline_scales: np.ndarray | None = None
+        _svi_cached_baseline_reduced_prior_variances: np.ndarray | None = None
+        _svi_cached_reduced_prior_variances: np.ndarray | None = None
+        _svi_cache_signature: tuple = ()
         for outer_iteration in range(start_iteration, config.max_outer_iterations):
             log(f"  variational EM epoch {outer_iteration + 1}/{config.max_outer_iterations} start  sigma_e2={sigma_error2:.6f}  global_scale={global_scale:.6f}  mem={mem()}")
             epoch_wall_t0 = time.monotonic()
@@ -1482,20 +1843,40 @@ def fit_variational_em(
             )
             local_shape_a = prior_design.class_membership_matrix @ tpb_shape_a_vector
             local_shape_b = prior_design.class_membership_matrix @ tpb_shape_b_vector
-            metadata_baseline_scales = _metadata_baseline_scales_from_coefficients(
-                scale_model_coefficients,
-                prior_design.design_matrix,
-                config,
+            _svi_new_signature = (
+                float(global_scale),
+                np.asarray(scale_model_coefficients, dtype=np.float64).tobytes(),
+                np.asarray(local_scale, dtype=np.float64).tobytes(),
             )
-            baseline_reduced_prior_variances = (float(global_scale) * metadata_baseline_scales) ** 2
-            reduced_prior_variances = (
-                np.asarray(resume_epoch_reduced_prior_variances, dtype=np.float64).copy()
-                if resuming_mid_epoch and resume_epoch_reduced_prior_variances is not None
-                else _effective_prior_variances(
+            if (
+                _svi_new_signature == _svi_cache_signature
+                and _svi_cached_reduced_prior_variances is not None
+                and _svi_cached_metadata_baseline_scales is not None
+                and _svi_cached_baseline_reduced_prior_variances is not None
+            ):
+                metadata_baseline_scales = _svi_cached_metadata_baseline_scales
+                baseline_reduced_prior_variances = _svi_cached_baseline_reduced_prior_variances
+                _svi_cached_full_reduced = _svi_cached_reduced_prior_variances
+            else:
+                metadata_baseline_scales = _metadata_baseline_scales_from_coefficients(
+                    scale_model_coefficients,
+                    prior_design.design_matrix,
+                    config,
+                )
+                baseline_reduced_prior_variances = (float(global_scale) * metadata_baseline_scales) ** 2
+                _svi_cached_full_reduced = _effective_prior_variances(
                     baseline_prior_variances=baseline_reduced_prior_variances,
                     local_scale=local_scale,
                     config=config,
                 )
+                _svi_cached_metadata_baseline_scales = metadata_baseline_scales
+                _svi_cached_baseline_reduced_prior_variances = baseline_reduced_prior_variances
+                _svi_cached_reduced_prior_variances = _svi_cached_full_reduced
+                _svi_cache_signature = _svi_new_signature
+            reduced_prior_variances = (
+                np.asarray(resume_epoch_reduced_prior_variances, dtype=np.float64).copy()
+                if resuming_mid_epoch and resume_epoch_reduced_prior_variances is not None
+                else _svi_cached_full_reduced.copy()
             )
             if use_gpu_epoch_predictor_state and genetic_linear_predictor_gpu is None:
                 _rebuild_genetic_linear_predictor_state()
@@ -1603,6 +1984,18 @@ def fit_variational_em(
                     )
 
             epoch_blocks = _stochastic_variant_blocks(genotype_matrix.shape[1], block_size)
+            # Randomized cyclic block coordinate descent (Wright 2015): shuffle
+            # the within-epoch block order using a deterministic per-epoch RNG
+            # seeded by ``random_seed + outer_iteration``. Only applied at the
+            # start of a fresh epoch — when resuming mid-epoch we keep the
+            # deterministic original order so the checkpoint's
+            # ``completed_blocks_in_iteration`` index continues to refer to the
+            # same blocks. Cross-epoch convergence is unchanged; this only
+            # changes within-epoch update order.
+            if not resuming_mid_epoch and len(epoch_blocks) > 1:
+                epoch_rng = np.random.default_rng(int(config.random_seed) + int(outer_iteration))
+                permutation = epoch_rng.permutation(len(epoch_blocks))
+                epoch_blocks = [epoch_blocks[i] for i in permutation]
             n_blocks = len(epoch_blocks)
             block_count = 0 if not resuming_mid_epoch else resume_completed_blocks_in_iteration
             last_stochastic_checkpoint_block = block_count
@@ -1811,10 +2204,22 @@ def fit_variational_em(
                     block_beta_candidate * block_beta_candidate + block_beta_variance,
                     dtype=np.float64,
                 )
-                beta_variance_state[block_indices] = (
-                    (1.0 - step_size) * beta_variance_state[block_indices]
-                    + step_size * block_beta_variance
-                )
+                if refresh_beta_variance:
+                    beta_variance_state[block_indices] = (
+                        (1.0 - step_size) * beta_variance_state[block_indices]
+                        + step_size * block_beta_variance
+                    )
+                else:
+                    # Variance snaps to prior on no-refresh epochs to prevent
+                    # block-local bias: the per-block solve only sees its own
+                    # block's prior, so an EMA of those values is biased and
+                    # over-shrinks sigma_e^2 through the leverage correction.
+                    # Under the variational prior, variance equals the current
+                    # prior in expectation until a real refresh.
+                    beta_variance_state[block_indices] = np.maximum(
+                        np.asarray(reduced_prior_variances[block_indices], dtype=np.float64),
+                        1e-8,
+                    )
                 reduced_second_moment[block_indices] = (
                     (1.0 - step_size) * reduced_second_moment[block_indices]
                     + step_size * block_second_moment
@@ -1839,7 +2244,7 @@ def fit_variational_em(
                 block_genotypes._cupy_cache = None
                 del block_genotypes
                 if block_count % _STOCHASTIC_BLOCK_GC_INTERVAL == 0:
-                    gc.collect()
+                    _release_gpu_memory()
                 if log_this_block:
                     log(f"    block {block_count}/{n_blocks} done  mem={mem()}")
                 checkpoint_now = time.monotonic()
@@ -1901,7 +2306,6 @@ def fit_variational_em(
             should_update_hyperparameters = _should_update_hyperparameters_this_iteration(
                 outer_iteration + 1,
                 config,
-                allow_final_iteration=bool(config.final_posterior_refinement),
             )
             if should_update_hyperparameters:
                 global_scale, scale_model_coefficients = _update_scale_model(
@@ -1939,7 +2343,10 @@ def fit_variational_em(
             if config.trait_type == TraitType.QUANTITATIVE:
                 leverage_weight = np.maximum(reduced_prior_variances - beta_variance_state, 0.0) / np.maximum(reduced_prior_variances, 1e-12)
                 residual_vector = np.asarray(target_vector - linear_predictor, dtype=np.float64)
-                effective_dof = max(float(target_vector.shape[0]) - float(np.sum(leverage_weight)), 1.0)
+                # Retain a meaningful residual dof floor: never let it collapse to 1, which
+                # would make sigma_e^2 blow up if total leverage approaches n. Use max(2, 1% of n).
+                _sample_count_dof = float(target_vector.shape[0])
+                effective_dof = max(_sample_count_dof - float(np.sum(leverage_weight)), max(2.0, _sample_count_dof * 0.01))
                 sigma_error2 = max(float(np.dot(residual_vector, residual_vector)) / effective_dof, config.sigma_error_floor)
             objective_history.append(
                 _stochastic_epoch_objective(
@@ -1956,6 +2363,33 @@ def fit_variational_em(
                     scale_penalty=scale_penalty,
                 )
             )
+            try:
+                _elbo_value = compute_elbo(
+                    trait_type=config.trait_type,
+                    targets=target_vector,
+                    covariate_matrix=covariate_matrix,
+                    alpha=alpha_state,
+                    beta=beta_state,
+                    beta_variance=beta_variance_state,
+                    linear_predictor=linear_predictor,
+                    reduced_prior_variances=reduced_prior_variances,
+                    sigma_error2=float(sigma_error2),
+                    predictor_variance=None,
+                    local_scale_prior_objective=_local_scale_prior_objective(
+                        local_scale=local_scale,
+                        auxiliary_delta=auxiliary_delta,
+                        local_shape_a=local_shape_a,
+                        local_shape_b=local_shape_b,
+                    ),
+                    scale_penalty_objective=_scale_penalty_objective(
+                        scale_model_coefficients=scale_model_coefficients,
+                        scale_penalty=scale_penalty,
+                    ),
+                )
+                elbo_history.append(float(_elbo_value))
+            except Exception as _elbo_err:  # noqa: BLE001
+                log(f"  ELBO computation skipped (SVI): {_elbo_err}")
+                elbo_history.append(float("nan"))
             validation_linear_predictor: np.ndarray | None = None
             validation_metric_this_epoch: float | None = None
             if validation_payload is not None:
@@ -1997,6 +2431,15 @@ def fit_variational_em(
                     log(f"  variational EM epoch {outer_iteration + 1}: validation_metric={validation_metric:.6f}")
             current_theta = _pack_theta(global_scale, scale_model_coefficients)
             current_objective = float(objective_history[-1])
+            # On the first resumed iteration the checkpoint did not persist the prior
+            # linear_predictor. Seed it with the current value so the convergence delta
+            # is 0 on this step and meaningful from the next iteration onward.
+            if (
+                previous_linear_predictor is None
+                and resume_checkpoint is not None
+                and outer_iteration == start_iteration
+            ):
+                previous_linear_predictor = np.asarray(linear_predictor, dtype=np.float64).copy()
             parameter_change, predictor_change, objective_change, coefficient_change = _fit_state_convergence_change(
                 current_beta=beta_state,
                 previous_beta=previous_beta,
@@ -2132,6 +2575,37 @@ def fit_variational_em(
                 + f"initial={config.posterior_working_set_initial_size}, "
                 + f"max_passes={config.posterior_working_set_max_passes})"
             )
+        _cavi_cached_metadata_baseline_scales: np.ndarray | None = None
+        _cavi_cached_baseline_reduced_prior_variances: np.ndarray | None = None
+        _cavi_cached_reduced_prior_variances: np.ndarray | None = None
+        _cavi_cache_signature: tuple = ()
+        # Carries the most recent E_q[beta^2] across outer iterations so the
+        # E[1/lambda] precision override (opt-in) can be built from a prior
+        # iteration's posterior state at the top of the next outer step.
+        reduced_second_moment_carry: np.ndarray | None = None
+        # Restore CAVI-path inter-iteration carries from checkpoint so a
+        # resumed run re-enters the same EM trajectory bit-identically. The
+        # SVI path has an equivalent restore via ``resume_beta_variance_state``
+        # (see line ~1530); this is the CAVI analog. Without this, the first
+        # resumed iteration would reset ``beta_variance_state`` to
+        # ``np.maximum(reduced_prior_variances, 1e-8)`` below — which feeds
+        # directly into the sigma_e^2 ELBO update via ``stale_beta_variance``
+        # at line ~3225 and is the root cause of resume-vs-fresh divergence.
+        if resume_checkpoint is not None:
+            saved_beta_variance = resume_checkpoint.beta_variance_state
+            if (
+                saved_beta_variance is not None
+                and np.asarray(saved_beta_variance).shape == (genotype_matrix.shape[1],)
+            ):
+                beta_variance_state = np.asarray(saved_beta_variance, dtype=np.float64).copy()
+            saved_reduced_second_moment = resume_checkpoint.reduced_second_moment
+            if (
+                saved_reduced_second_moment is not None
+                and np.asarray(saved_reduced_second_moment).shape == (genotype_matrix.shape[1],)
+            ):
+                reduced_second_moment_carry = np.asarray(
+                    saved_reduced_second_moment, dtype=np.float64
+                ).copy()
         for outer_iteration in range(start_iteration, config.max_outer_iterations):
             iter_wall_t0 = time.monotonic()
             log(f"  variational EM iteration {outer_iteration + 1}/{config.max_outer_iterations} start  sigma_e2={sigma_error2:.6f}  global_scale={global_scale:.6f}  mem={mem()}")
@@ -2142,17 +2616,49 @@ def fit_variational_em(
             posterior_local_scale = local_scale.copy()
             posterior_tpb_shape_a_vector = tpb_shape_a_vector.copy()
             posterior_tpb_shape_b_vector = tpb_shape_b_vector.copy()
-            metadata_baseline_scales = _metadata_baseline_scales_from_coefficients(
-                scale_model_coefficients,
-                prior_design.design_matrix,
-                config,
+            # Anderson-acceleration: snapshot start-of-iteration hyperparameters
+            # so we can pack them as the "x" input to the fixed-point map at the
+            # end of the iteration (the post-update state is T(x)).
+            _anderson_pre_global_scale = float(global_scale)
+            _anderson_pre_scale_model_coefficients = np.asarray(
+                scale_model_coefficients, dtype=np.float64
+            ).copy()
+            _anderson_pre_tpb_shape_a_vector = np.asarray(
+                tpb_shape_a_vector, dtype=np.float64
+            ).copy()
+            _anderson_pre_tpb_shape_b_vector = np.asarray(
+                tpb_shape_b_vector, dtype=np.float64
+            ).copy()
+            _cavi_new_signature = (
+                float(global_scale),
+                np.asarray(scale_model_coefficients, dtype=np.float64).tobytes(),
+                np.asarray(local_scale, dtype=np.float64).tobytes(),
             )
-            baseline_reduced_prior_variances = (float(global_scale) * metadata_baseline_scales) ** 2
-            reduced_prior_variances = _effective_prior_variances(
-                baseline_prior_variances=baseline_reduced_prior_variances,
-                local_scale=local_scale,
-                config=config,
-            )
+            if (
+                _cavi_new_signature == _cavi_cache_signature
+                and _cavi_cached_reduced_prior_variances is not None
+                and _cavi_cached_metadata_baseline_scales is not None
+                and _cavi_cached_baseline_reduced_prior_variances is not None
+            ):
+                metadata_baseline_scales = _cavi_cached_metadata_baseline_scales
+                baseline_reduced_prior_variances = _cavi_cached_baseline_reduced_prior_variances
+                reduced_prior_variances = _cavi_cached_reduced_prior_variances.copy()
+            else:
+                metadata_baseline_scales = _metadata_baseline_scales_from_coefficients(
+                    scale_model_coefficients,
+                    prior_design.design_matrix,
+                    config,
+                )
+                baseline_reduced_prior_variances = (float(global_scale) * metadata_baseline_scales) ** 2
+                reduced_prior_variances = _effective_prior_variances(
+                    baseline_prior_variances=baseline_reduced_prior_variances,
+                    local_scale=local_scale,
+                    config=config,
+                )
+                _cavi_cached_metadata_baseline_scales = metadata_baseline_scales
+                _cavi_cached_baseline_reduced_prior_variances = baseline_reduced_prior_variances
+                _cavi_cached_reduced_prior_variances = reduced_prior_variances.copy()
+                _cavi_cache_signature = _cavi_new_signature
             if beta_variance_state is None:
                 beta_variance_state = np.maximum(reduced_prior_variances.copy(), 1e-8)
             refresh_beta_variance = _should_refresh_beta_variance(
@@ -2166,6 +2672,18 @@ def fit_variational_em(
                 exact_solver_matrix_limit=config.exact_solver_matrix_limit,
             )
 
+            cavi_prior_precision_override: np.ndarray | None = None
+            if (
+                reduced_second_moment_carry is not None
+                and reduced_second_moment_carry.shape == reduced_prior_variances.shape
+            ):
+                cavi_prior_precision_override = _build_cavi_correct_prior_precision(
+                    reduced_second_moment=reduced_second_moment_carry,
+                    baseline_prior_variances=baseline_reduced_prior_variances,
+                    local_shape_a=local_shape_a,
+                    auxiliary_delta=auxiliary_delta,
+                    config=config,
+                )
             posterior_state = _fit_collapsed_posterior(
                 genotype_matrix=genotype_matrix,
                 covariate_matrix=covariate_matrix,
@@ -2183,6 +2701,7 @@ def fit_variational_em(
                 restricted_posterior_warm_start=restricted_posterior_warm_start,
                 em_iteration_index=outer_iteration,
                 total_em_iterations=config.max_outer_iterations,
+                prior_precision_override=cavi_prior_precision_override,
             )
             if config.trait_type == TraitType.BINARY and config.binary_intercept_calibration:
                 posterior_state = _apply_binary_intercept_calibration(
@@ -2195,6 +2714,7 @@ def fit_variational_em(
             beta_variance_state = np.asarray(posterior_state.beta_variance, dtype=np.float64)
 
             reduced_second_moment = np.asarray(beta_state * beta_state + beta_variance_state, dtype=np.float64)
+            reduced_second_moment_carry = reduced_second_moment
             full_objective = posterior_state.collapsed_objective + _local_scale_prior_objective(
                 local_scale=local_scale,
                 auxiliary_delta=auxiliary_delta,
@@ -2205,6 +2725,33 @@ def fit_variational_em(
                 scale_penalty=scale_penalty,
             )
             objective_history.append(float(full_objective))
+            try:
+                _elbo_value = compute_elbo(
+                    trait_type=config.trait_type,
+                    targets=target_vector,
+                    covariate_matrix=covariate_matrix,
+                    alpha=alpha_state,
+                    beta=beta_state,
+                    beta_variance=beta_variance_state,
+                    linear_predictor=np.asarray(posterior_state.linear_predictor, dtype=np.float64),
+                    reduced_prior_variances=reduced_prior_variances,
+                    sigma_error2=float(sigma_error2),
+                    predictor_variance=None,
+                    local_scale_prior_objective=_local_scale_prior_objective(
+                        local_scale=local_scale,
+                        auxiliary_delta=auxiliary_delta,
+                        local_shape_a=local_shape_a,
+                        local_shape_b=local_shape_b,
+                    ),
+                    scale_penalty_objective=_scale_penalty_objective(
+                        scale_model_coefficients=scale_model_coefficients,
+                        scale_penalty=scale_penalty,
+                    ),
+                )
+                elbo_history.append(float(_elbo_value))
+            except Exception as _elbo_err:  # noqa: BLE001
+                log(f"  ELBO computation skipped (CAVI): {_elbo_err}")
+                elbo_history.append(float("nan"))
             log(f"  variational EM iteration {outer_iteration + 1}: objective={full_objective:.6f} sigma_e2={sigma_error2:.6f}")
 
             validation_linear_predictor: np.ndarray | None = None
@@ -2255,7 +2802,6 @@ def fit_variational_em(
             should_update_hyperparameters = _should_update_hyperparameters_this_iteration(
                 outer_iteration + 1,
                 config,
-                allow_final_iteration=True,
             )
             if should_update_hyperparameters:
                 global_scale, scale_model_coefficients = _update_scale_model(
@@ -2282,6 +2828,15 @@ def fit_variational_em(
 
             current_theta = _pack_theta(global_scale, scale_model_coefficients)
             current_objective = float(objective_history[-1])
+            # On the first resumed iteration the checkpoint did not persist the prior
+            # linear_predictor. Seed it with the current value so the convergence delta
+            # is 0 on this step and meaningful from the next iteration onward.
+            if (
+                previous_linear_predictor is None
+                and resume_checkpoint is not None
+                and outer_iteration == start_iteration
+            ):
+                previous_linear_predictor = np.asarray(posterior_state.linear_predictor, dtype=np.float64).copy()
             parameter_change, predictor_change, objective_change, coefficient_change = _fit_state_convergence_change(
                 current_beta=beta_state,
                 previous_beta=previous_beta,
@@ -2368,8 +2923,116 @@ def fit_variational_em(
                     if validation_payload is not None:
                         _epoch_snapshot["validation_targets"] = np.asarray(validation_payload[2], dtype=np.float64)
                 per_epoch_eval_callback(_epoch_snapshot)
+            # Anderson acceleration on the hyperparameter slice.
+            # The math fixed point of CAVI is unchanged; this only speeds
+            # outer convergence. anderson_step maintains state in-place
+            # (see sv_pgs.anderson.anderson_step). On the first call (empty
+            # history) it just records T(x) and returns map_value, i.e. a
+            # plain step. We safeguard by clipping the proposed iterate
+            # back into legal hyperparameter bounds; non-finite proposals
+            # are dropped (state still updated).
+            if _ANDERSON_MEMORY_DEPTH > 0 and should_update_hyperparameters:
+                try:
+                    # Pre-update state (the "x" the fixed-point map acts on).
+                    log_g_pre = float(np.log(max(_anderson_pre_global_scale, 1e-12)))
+                    log_a_pre = np.log(np.maximum(_anderson_pre_tpb_shape_a_vector, 1e-12))
+                    log_b_pre = np.log(np.maximum(_anderson_pre_tpb_shape_b_vector, 1e-12))
+                    x_current_packed = _pack_anderson_hyperparameters(
+                        log_global_scale=log_g_pre,
+                        scale_model_coefficients=_anderson_pre_scale_model_coefficients,
+                        log_tpb_shape_a_vector=log_a_pre,
+                        log_tpb_shape_b_vector=log_b_pre,
+                    )
+                    # Post-update state — T(x).
+                    log_global_scale = float(np.log(max(float(global_scale), 1e-12)))
+                    log_tpb_a = np.log(np.maximum(tpb_shape_a_vector, 1e-12))
+                    log_tpb_b = np.log(np.maximum(tpb_shape_b_vector, 1e-12))
+                    T_x = _pack_anderson_hyperparameters(
+                        log_global_scale=log_global_scale,
+                        scale_model_coefficients=scale_model_coefficients,
+                        log_tpb_shape_a_vector=log_tpb_a,
+                        log_tpb_shape_b_vector=log_tpb_b,
+                    )
+                    # On the very first call (empty history), anderson_step
+                    # seeds state and returns T_x unchanged; do not apply.
+                    history_was_empty = not anderson_state.residuals
+                    x_proposed = anderson_step(
+                        anderson_state,
+                        x_current=x_current_packed,
+                        map_value=T_x,
+                        regularization=1e-10,
+                    )
+                    if (
+                        not history_was_empty
+                        and np.all(np.isfinite(x_proposed))
+                    ):
+                        log_g_new, sc_new, log_a_new, log_b_new = _unpack_anderson_hyperparameters(
+                            x_proposed,
+                            scale_model_dim=scale_model_coefficients.shape[0],
+                            tpb_class_count=tpb_shape_a_vector.shape[0],
+                        )
+                        global_scale_new = float(np.clip(
+                            np.exp(log_g_new),
+                            config.global_scale_floor,
+                            config.global_scale_ceiling,
+                        ))
+                        tpb_a_new = np.clip(
+                            np.exp(log_a_new),
+                            config.minimum_tpb_shape,
+                            config.maximum_tpb_shape,
+                        )
+                        tpb_b_new = np.clip(
+                            np.exp(log_b_new),
+                            config.minimum_tpb_shape,
+                            config.maximum_tpb_shape,
+                        )
+                        if (
+                            np.isfinite(global_scale_new)
+                            and np.all(np.isfinite(tpb_a_new))
+                            and np.all(np.isfinite(tpb_b_new))
+                            and np.all(np.isfinite(sc_new))
+                        ):
+                            global_scale = global_scale_new
+                            scale_model_coefficients = np.asarray(sc_new, dtype=np.float64)
+                            tpb_shape_a_vector = np.asarray(tpb_a_new, dtype=np.float64)
+                            tpb_shape_b_vector = np.asarray(tpb_b_new, dtype=np.float64)
+                            local_shape_a = prior_design.class_membership_matrix @ tpb_shape_a_vector
+                            local_shape_b = prior_design.class_membership_matrix @ tpb_shape_b_vector
+                            # Keep the "previous_*" trackers consistent with
+                            # the accelerated state so the next iteration's
+                            # convergence delta is measured against this iter.
+                            previous_theta = _pack_theta(global_scale, scale_model_coefficients)
+                            previous_tpb_shape_a_vector = tpb_shape_a_vector.copy()
+                            previous_tpb_shape_b_vector = tpb_shape_b_vector.copy()
+                except Exception as exc:
+                    log(f"  Anderson acceleration skipped: {exc}")
+                    anderson_state.reset()
             if checkpoint_callback is not None:
-                checkpoint_callback(_build_checkpoint(iter_num))
+                # Persist the CAVI-path inter-iteration carries (current
+                # beta variance + reduced second moment) so a resume re-enters
+                # the same EM trajectory bit-identically. Without these, the
+                # resumed iteration would re-initialise ``beta_variance_state``
+                # from the prior variances (line ~2452) and reset
+                # ``reduced_second_moment_carry`` to None — both feed back
+                # into the next iteration (the former drives the sigma_e^2
+                # ELBO update via ``stale_beta_variance``; the latter drives
+                # the GIG first-moment prior-precision override).
+                # When the hyperparameter update at this iteration was
+                # triggered only because this is the final iteration of the
+                # *current* fit (not because the iteration number is on the
+                # regular every-K cadence), record the pre-final-update
+                # hyperparameters in the checkpoint. A resume into a longer
+                # fit's iteration K would not have applied this update yet,
+                # and recording the post-update values would mean the resumed
+                # iteration K+1 sees stale hyperparameters relative to the
+                # fresh longer trajectory.
+                checkpoint_callback(
+                    _build_checkpoint(
+                        iter_num,
+                        beta_variance_state_override=beta_variance_state,
+                        reduced_second_moment_override=reduced_second_moment_carry,
+                    )
+                )
 
             # Symmetric with the SVI path: held-out validation is monitoring-
             # only and must not gate convergence.
@@ -2448,6 +3111,19 @@ def fit_variational_em(
     )
     if config.final_posterior_refinement:
         log(f"  EM loop done after {len(objective_history)} iterations, computing final posterior...  mem={mem()}")
+        final_prior_precision_override: np.ndarray | None = None
+        if beta_variance_state is not None:
+            final_second_moment = np.asarray(
+                beta_state * beta_state + np.asarray(beta_variance_state, dtype=np.float64),
+                dtype=np.float64,
+            )
+            final_prior_precision_override = _build_cavi_correct_prior_precision(
+                reduced_second_moment=final_second_moment,
+                baseline_prior_variances=final_baseline_reduced_prior_variances,
+                local_shape_a=local_shape_a,
+                auxiliary_delta=auxiliary_delta,
+                config=config,
+            )
         final_state = _fit_collapsed_posterior(
             genotype_matrix=genotype_matrix,
             covariate_matrix=covariate_matrix,
@@ -2461,6 +3137,7 @@ def fit_variational_em(
             compute_logdet=True,
             compute_beta_variance=True,
             predictor_offset=predictor_offset_array,
+            prior_precision_override=final_prior_precision_override,
         )
         if config.trait_type == TraitType.BINARY and config.binary_intercept_calibration:
             final_state = _apply_binary_intercept_calibration(
@@ -2512,12 +3189,18 @@ def fit_variational_em(
     )
     local_shape_a = prior_design.class_membership_matrix @ tpb_shape_a_vector
     local_shape_b = prior_design.class_membership_matrix @ tpb_shape_b_vector
+    if restricted_posterior_warm_start is not None:
+        if restricted_posterior_warm_start.sample_space_background_gpu_preconditioner is not None:
+            restricted_posterior_warm_start.sample_space_background_gpu_preconditioner.clear_gpu_arrays()
+        restricted_posterior_warm_start.exact_variant_full_matrix_gpu = None
+        restricted_posterior_warm_start.weighted_covariate_projection_gpu = None
+    _release_gpu_memory()  # final pool free
     log(f"  variational EM returning results  mem={mem()}")
     return VariationalFitResult(
         alpha=np.asarray(final_state.alpha, dtype=np.float32),
         beta_reduced=np.asarray(final_state.beta, dtype=np.float32),
-        beta_variance=np.asarray(final_state.beta_variance, dtype=np.float32),
-        prior_scales=final_member_prior_variances.astype(np.float32),
+        beta_variance=np.asarray(final_state.beta_variance, dtype=np.float64),
+        prior_scales=final_member_prior_variances.astype(np.float64),
         global_scale=float(global_scale),
         class_tpb_shape_a={
             prior_design.inverse_class_lookup[class_index]: float(tpb_shape_a_vector[class_index])
@@ -2532,7 +3215,7 @@ def fit_variational_em(
         sigma_error2=float(final_state.sigma_error2),
         objective_history=objective_history,
         validation_history=validation_history,
-        member_prior_variances=final_member_prior_variances.astype(np.float32),
+        member_prior_variances=final_member_prior_variances.astype(np.float64),
         linear_predictor=np.asarray(final_state.linear_predictor, dtype=np.float32),
         selected_iteration_count=(
             int(best_validation_iteration)
@@ -2544,6 +3227,7 @@ def fit_variational_em(
         final_predictor_change=final_predictor_change,
         final_objective_change=final_objective_change,
         final_hyperparameter_change=final_hyperparameter_change,
+        elbo_history=elbo_history,
     )
 
 
@@ -2638,9 +3322,17 @@ def _fit_collapsed_posterior(
     total_em_iterations: int | None = None,
     update_blend_weight: float | None = None,
     allow_gpu_exact_variant: bool = True,
+    prior_precision_override: np.ndarray | None = None,
 ) -> PosteriorState:
     log(f"    collapsed posterior: trait={trait_type.value}  n_variants={genotype_matrix.shape[1]}  n_samples={genotype_matrix.shape[0]}  sigma_e2={sigma_error2:.6f}  mem={mem()}")
     prior_variances = np.maximum(np.asarray(reduced_prior_variances, dtype=np.float64), 1e-8)
+    prior_precision_override_array = (
+        np.asarray(prior_precision_override, dtype=np.float64)
+        if prior_precision_override is not None
+        else None
+    )
+    if prior_precision_override_array is not None and prior_precision_override_array.shape != prior_variances.shape:
+        raise ValueError("prior_precision_override must match reduced_prior_variances shape.")
     # Mirror the gpu_available check in _solve_restricted_full so the
     # solver-controls function knows whether GPU CG (cheap ~30ms/iter) will be used.
     _collapsed_gpu_available = (
@@ -2694,6 +3386,7 @@ def _fit_collapsed_posterior(
             restricted_posterior_warm_start=restricted_posterior_warm_start,
             update_blend_weight=update_blend_weight,
             allow_gpu_exact_variant=allow_gpu_exact_variant,
+            prior_precision_override=prior_precision_override_array,
         )
         beta_variance = _effective_beta_variance_state(
             compute_beta_variance=compute_beta_variance,
@@ -2788,6 +3481,7 @@ def _quantitative_posterior_state(
     restricted_posterior_warm_start: _RestrictedPosteriorWarmStart | None = None,
     update_blend_weight: float | None = None,
     allow_gpu_exact_variant: bool = True,
+    prior_precision_override: np.ndarray | None = None,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, float, float]:
     standardized_genotypes = _as_standardized_genotype_matrix(genotype_matrix)
     # Quantitative block updates only use blend weight to relax upstream solver
@@ -2815,6 +3509,7 @@ def _quantitative_posterior_state(
             posterior_working_set_coefficient_tolerance=posterior_working_set_coefficient_tolerance,
             warm_start=restricted_posterior_warm_start,
             allow_gpu_exact_variant=allow_gpu_exact_variant,
+            prior_precision_override=prior_precision_override,
         )
         beta_variance = np.zeros_like(np.asarray(prior_variances, dtype=np.float64), dtype=np.float64)
         logdet_covariance = 0.0
@@ -2846,6 +3541,7 @@ def _quantitative_posterior_state(
                 posterior_working_set_coefficient_tolerance=posterior_working_set_coefficient_tolerance,
                 warm_start=restricted_posterior_warm_start,
                 allow_gpu_exact_variant=allow_gpu_exact_variant,
+                prior_precision_override=prior_precision_override,
             )
         )
     # Re-estimate noise variance.  Naive approach (just use residuals) would
@@ -2882,30 +3578,41 @@ def _binary_newton_solver_controls(
     gpu_enabled: bool = False,
     update_blend_weight: float | None = None,
 ) -> tuple[float, int]:
-    if genotype_matrix.shape[0] < 16_384 and genotype_matrix.shape[1] < 16_384:
+    if update_blend_weight is None and genotype_matrix.shape[0] < 16_384 and genotype_matrix.shape[1] < 16_384:
         return solver_tolerance, maximum_linear_solver_iterations
+    if update_blend_weight is None:
+        gradient_proxy = 1.0
+    else:
+        blend_weight = float(np.clip(update_blend_weight, 0.0, 1.0))
+        gradient_proxy = max((1.0 - blend_weight) ** 2, 1e-12)
+    forcing_value = forcing_tolerance(gradient_norm=gradient_proxy)
+    base_cap = 384 if gpu_enabled else 128
+    if genotype_matrix.shape[1] > genotype_matrix.shape[0]:
+        base_cap = 160 if gpu_enabled else 96
+    iteration_cap = relaxed_iteration_cap(
+        forcing_tolerance_value=forcing_value,
+        base_cap=base_cap,
+        minimum_cap=16,
+    )
+    return (
+        max(float(solver_tolerance), forcing_value),
+        max(min(int(maximum_linear_solver_iterations), iteration_cap), 16),
+    )
+
+
+def _em_forcing_gradient_proxy(
+    *,
+    em_iteration_index: int | None,
+    total_em_iterations: int | None,
+    update_blend_weight: float | None,
+) -> float:
     if update_blend_weight is not None:
         blend_weight = float(np.clip(update_blend_weight, 0.0, 1.0))
-        if blend_weight < 0.08:
-            relaxed_tolerance = max(float(solver_tolerance), 1e-2)
-            iteration_cap = 128 if gpu_enabled else 64
-        elif blend_weight < 0.20:
-            relaxed_tolerance = max(float(solver_tolerance), 5e-3)
-            iteration_cap = 192 if gpu_enabled else 96
-        else:
-            relaxed_tolerance = max(float(solver_tolerance), 2e-3)
-            iteration_cap = 256 if gpu_enabled else 128
-        if genotype_matrix.shape[1] > genotype_matrix.shape[0]:
-            relaxed_tolerance = max(relaxed_tolerance, 5e-3)
-            iteration_cap = min(iteration_cap, 160 if gpu_enabled else 80)
-        return relaxed_tolerance, max(min(int(maximum_linear_solver_iterations), iteration_cap), 16)
-    relaxed_tolerance = max(float(solver_tolerance), 1e-3)
-    iteration_cap = 512 if gpu_enabled else 128
-    relaxed_maximum_iterations = min(int(maximum_linear_solver_iterations), iteration_cap)
-    if genotype_matrix.shape[1] > genotype_matrix.shape[0]:
-        relaxed_tolerance = max(relaxed_tolerance, 5e-3)
-        relaxed_maximum_iterations = min(relaxed_maximum_iterations, 384 if gpu_enabled else 96)
-    return relaxed_tolerance, max(relaxed_maximum_iterations, 16)
+        return max((1.0 - blend_weight) ** 2, 1e-12)
+    if total_em_iterations is None or total_em_iterations <= 1 or em_iteration_index is None:
+        return 1.0
+    progress_fraction = float(np.clip(em_iteration_index / (total_em_iterations - 1), 0.0, 1.0))
+    return max((1.0 - progress_fraction) ** 2, 1e-12)
 
 
 def _collapsed_posterior_solver_controls(
@@ -2926,48 +3633,29 @@ def _collapsed_posterior_solver_controls(
     resolved_maximum_iterations = int(maximum_linear_solver_iterations)
     is_large_problem = genotype_matrix.shape[0] >= 16_384 or genotype_matrix.shape[1] >= 16_384
 
-    # For stochastic quantitative block updates, the candidate solve is blended
-    # back into the global state. Small step sizes do not justify a tight inner
-    # CG solve even when the block itself is modest in size.
-    if update_blend_weight is not None:
-        blend_weight = float(np.clip(update_blend_weight, 0.0, 1.0))
-        if blend_weight < 0.08:
-            relaxed_tolerance = max(resolved_tolerance, 5e-3)
-            iteration_cap = 128 if gpu_enabled else 64
-        elif blend_weight < 0.20:
-            relaxed_tolerance = max(resolved_tolerance, 2e-3)
-            iteration_cap = 192 if gpu_enabled else 96
-        else:
-            relaxed_tolerance = max(resolved_tolerance, 1e-3)
-            iteration_cap = 256 if gpu_enabled else 128
-        relaxed_maximum_iterations = min(resolved_maximum_iterations, iteration_cap)
-    elif is_large_problem:
-        progress_fraction = 1.0
-        if total_em_iterations is not None and total_em_iterations > 1 and em_iteration_index is not None:
-            progress_fraction = float(np.clip(em_iteration_index / (total_em_iterations - 1), 0.0, 1.0))
-        if progress_fraction < 1.0 / 3.0:
-            relaxed_tolerance = max(resolved_tolerance, 1e-3)
-            iteration_cap = 256 if gpu_enabled else 128
-        elif progress_fraction < 2.0 / 3.0:
-            relaxed_tolerance = max(resolved_tolerance, 3e-4)
-            iteration_cap = 512 if gpu_enabled else 256
-        else:
-            relaxed_tolerance = max(resolved_tolerance, 1e-4)
-            iteration_cap = 768 if gpu_enabled else 384
-        relaxed_maximum_iterations = min(resolved_maximum_iterations, iteration_cap)
-    else:
+    if update_blend_weight is None and not is_large_problem:
         return resolved_tolerance, resolved_maximum_iterations
 
+    forcing_value = forcing_tolerance(
+        gradient_norm=_em_forcing_gradient_proxy(
+            em_iteration_index=em_iteration_index,
+            total_em_iterations=total_em_iterations,
+            update_blend_weight=update_blend_weight,
+        )
+    )
+    base_cap = 512 if gpu_enabled else 128
+    if compute_beta_variance:
+        base_cap = 768 if gpu_enabled else 384
     if genotype_matrix.shape[1] > genotype_matrix.shape[0]:
-        wide_tolerance_floor = 1e-4 if compute_beta_variance else 1e-3
-        relaxed_tolerance = max(relaxed_tolerance, wide_tolerance_floor)
-        wide_cap = 384 if gpu_enabled else 192
-        relaxed_maximum_iterations = min(relaxed_maximum_iterations, wide_cap)
+        base_cap = min(base_cap, 384 if gpu_enabled else 192)
     if not compute_beta_variance:
-        relaxed_tolerance = max(relaxed_tolerance, 1e-3)
-        no_variance_cap = 512 if gpu_enabled else 128
-        relaxed_maximum_iterations = min(relaxed_maximum_iterations, no_variance_cap)
-    return relaxed_tolerance, max(relaxed_maximum_iterations, 32)
+        base_cap = min(base_cap, 512 if gpu_enabled else 128)
+    iteration_cap = relaxed_iteration_cap(
+        forcing_tolerance_value=forcing_value,
+        base_cap=base_cap,
+        minimum_cap=16,
+    )
+    return max(resolved_tolerance, forcing_value), max(min(resolved_maximum_iterations, iteration_cap), 16)
 
 
 def _binary_expected_polya_gamma_weights(
@@ -3071,6 +3759,189 @@ def _binary_penalized_log_posterior_cupy(
     )
 
 
+# Opt-in alternative path to PG-IRLS for binary posterior fits: a trust-region
+# Newton-CG solver (see sv_pgs.tr_newton). Returns the same six-tuple as
+# ``_binary_posterior_state`` so it can be dropped in from inside that
+# function. Opting into this path is an explicit solver contract: failures are
+# surfaced instead of silently changing algorithms mid-fit.
+def _binary_posterior_state_tr_newton(
+    *,
+    genotype_matrix: StandardizedGenotypeMatrix,
+    covariate_matrix: np.ndarray,
+    targets: np.ndarray,
+    prior_variances: np.ndarray,
+    alpha_init: np.ndarray,
+    beta_init: np.ndarray,
+    minimum_weight: float,
+    max_iterations: int,
+    gradient_tolerance: float,
+    solver_tolerance: float,
+    maximum_linear_solver_iterations: int,
+    logdet_probe_count: int,
+    logdet_lanczos_steps: int,
+    exact_solver_matrix_limit: int,
+    posterior_variance_batch_size: int,
+    posterior_variance_probe_count: int,
+    random_seed: int,
+    compute_logdet: bool,
+    compute_beta_variance: bool,
+    sample_space_preconditioner_rank: int,
+    predictor_offset: np.ndarray | None,
+    posterior_working_sets: bool,
+    posterior_working_set_min_variants: int,
+    posterior_working_set_initial_size: int,
+    posterior_working_set_growth: int,
+    posterior_working_set_max_passes: int,
+    posterior_working_set_coefficient_tolerance: float,
+    restricted_posterior_warm_start: _RestrictedPosteriorWarmStart | None,
+    allow_gpu_exact_variant: bool,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, float, int]:
+    n_samples = int(genotype_matrix.shape[0])
+    n_variants = int(genotype_matrix.shape[1])
+    covariate_matrix_f64 = np.asarray(covariate_matrix, dtype=np.float64)
+    target_array = np.asarray(targets, dtype=np.float64).reshape(-1)
+    prior_variances_f64 = np.asarray(prior_variances, dtype=np.float64).reshape(-1)
+    alpha_init_f64 = np.asarray(alpha_init, dtype=np.float64).reshape(-1)
+    beta_init_f64 = np.asarray(beta_init, dtype=np.float64).reshape(-1)
+    predictor_offset_array = (
+        np.zeros(n_samples, dtype=np.float64)
+        if predictor_offset is None
+        else np.asarray(predictor_offset, dtype=np.float64).reshape(-1)
+    )
+    if predictor_offset_array.shape != (n_samples,):
+        raise ValueError("predictor_offset must match genotype sample count.")
+    log(
+        f"      binary TR-Newton path: {n_variants} variants, {n_samples} samples  mem={mem()}"
+    )
+
+    def _design_mv(v: np.ndarray) -> np.ndarray:
+        if n_variants == 0:
+            return np.zeros(n_samples, dtype=np.float64)
+        return _genotype_matvec_result_numpy(
+            genotype_matrix,
+            np.asarray(v, dtype=np.float64),
+            batch_size=posterior_variance_batch_size,
+            dtype=np.float64,
+        )
+
+    def _design_mv_transpose(u: np.ndarray) -> np.ndarray:
+        if n_variants == 0:
+            return np.zeros(0, dtype=np.float64)
+        return _genotype_transpose_matvec_result_numpy(
+            genotype_matrix,
+            np.asarray(u, dtype=np.float64),
+            batch_size=posterior_variance_batch_size,
+            dtype=np.float64,
+        )
+
+    result = trust_region_newton_logistic(
+        matvec_design=_design_mv,
+        matvec_design_transpose=_design_mv_transpose,
+        covariate_matrix=covariate_matrix_f64,
+        targets=target_array,
+        prior_variances=prior_variances_f64,
+        predictor_offset=predictor_offset_array,
+        beta_init=beta_init_f64,
+        alpha_init=alpha_init_f64,
+        max_iterations=int(max_iterations),
+        gradient_tolerance=float(gradient_tolerance),
+        cg_max_iterations=int(maximum_linear_solver_iterations),
+    )
+
+    alpha = np.asarray(result.alpha, dtype=np.float64).reshape(-1)
+    beta = np.asarray(result.beta, dtype=np.float64).reshape(-1)
+    linear_predictor = np.asarray(result.linear_predictor, dtype=np.float64).reshape(-1)
+    if (
+        not np.all(np.isfinite(alpha))
+        or not np.all(np.isfinite(beta))
+        or not np.all(np.isfinite(linear_predictor))
+    ):
+        raise RuntimeError("TR-Newton produced non-finite posterior parameters.")
+
+    beta_variance = np.zeros(n_variants, dtype=np.float64)
+    logdet_covariance = 0.0
+    logdet_gls = 0.0
+    if compute_logdet or compute_beta_variance:
+        final_weights_pg = _binary_expected_polya_gamma_weights(linear_predictor, minimum_weight)
+        kappa = target_array - 0.5
+        final_pseudo_response = kappa / final_weights_pg - predictor_offset_array
+        warm_start = (
+            _RestrictedPosteriorWarmStart()
+            if restricted_posterior_warm_start is None
+            else restricted_posterior_warm_start
+        )
+        try:
+            (
+                _alpha_refit,
+                _beta_refit,
+                beta_variance_refit,
+                _projected_targets,
+                _fitted_response,
+                _restricted_quadratic,
+                logdet_covariance,
+                logdet_gls,
+            ) = _solve_restricted_full(
+                genotype_matrix=genotype_matrix,
+                covariate_matrix=covariate_matrix_f64,
+                targets=final_pseudo_response,
+                prior_variances=prior_variances_f64,
+                diagonal_noise=1.0 / final_weights_pg,
+                solver_tolerance=solver_tolerance,
+                maximum_linear_solver_iterations=maximum_linear_solver_iterations,
+                logdet_probe_count=logdet_probe_count,
+                logdet_lanczos_steps=logdet_lanczos_steps,
+                exact_solver_matrix_limit=exact_solver_matrix_limit,
+                posterior_variance_batch_size=posterior_variance_batch_size,
+                posterior_variance_probe_count=posterior_variance_probe_count,
+                random_seed=random_seed + max_iterations + 23,
+                compute_logdet=compute_logdet,
+                compute_beta_variance=compute_beta_variance,
+                initial_beta_guess=beta,
+                sample_space_preconditioner_rank=sample_space_preconditioner_rank,
+                posterior_working_sets=posterior_working_sets,
+                posterior_working_set_min_variants=posterior_working_set_min_variants,
+                posterior_working_set_initial_size=posterior_working_set_initial_size,
+                posterior_working_set_growth=posterior_working_set_growth,
+                posterior_working_set_max_passes=posterior_working_set_max_passes,
+                posterior_working_set_coefficient_tolerance=posterior_working_set_coefficient_tolerance,
+                warm_start=warm_start,
+                allow_gpu_exact_variant=allow_gpu_exact_variant,
+            )
+            if compute_beta_variance:
+                beta_variance = np.asarray(beta_variance_refit, dtype=np.float64)
+        except RuntimeError as exc:
+            raise RuntimeError("TR-Newton variance/logdet refit failed.") from exc
+
+    prior_precision = np.asarray(
+        1.0 / np.maximum(prior_variances_f64, 1e-8), dtype=np.float64
+    )
+    final_objective = _binary_penalized_log_posterior(
+        linear_predictor=linear_predictor,
+        targets=target_array,
+        prior_precision=prior_precision,
+        beta=beta,
+    )
+    final_weights = _binary_expected_polya_gamma_weights(linear_predictor, minimum_weight)
+    logdet_hessian = (
+        float(np.sum(np.log(np.maximum(prior_precision, 1e-12))))
+        + float(np.sum(np.log(np.maximum(final_weights, 1e-12))))
+        + (logdet_covariance + logdet_gls if compute_logdet else 0.0)
+    )
+    laplace_objective = float(final_objective) - 0.5 * float(logdet_hessian)
+    log(
+        f"      TR-Newton done: iters={result.iterations} converged={result.converged} "
+        + f"grad_norm={result.final_gradient_norm:.3e} laplace_obj={laplace_objective:.4f}  mem={mem()}"
+    )
+    return (
+        alpha,
+        beta,
+        beta_variance,
+        linear_predictor,
+        laplace_objective,
+        int(result.iterations),
+    )
+
+
 # Fit effect sizes for a binary trait (e.g. disease case/control) by
 # alternating between:
 #   1. updating expected Polya-Gamma latent weights from the current
@@ -3113,9 +3984,52 @@ def _binary_posterior_state(
     resume_state: dict[str, object] | None = None,
     progress_callback: Callable[[dict[str, object]], None] | None = None,
     allow_gpu_exact_variant: bool = True,
+    prior_precision_override: np.ndarray | None = None,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, float, int]:
     standardized_genotypes = _as_standardized_genotype_matrix(genotype_matrix)
-    prior_precision = np.asarray(1.0 / np.maximum(prior_variances, 1e-8), dtype=np.float64)
+    if prior_precision_override is not None:
+        prior_precision = np.maximum(
+            np.asarray(prior_precision_override, dtype=np.float64), 0.0
+        )
+        if prior_precision.shape != np.asarray(prior_variances).shape:
+            raise ValueError("prior_precision_override must match prior_variances shape.")
+    else:
+        prior_precision = np.asarray(1.0 / np.maximum(prior_variances, 1e-8), dtype=np.float64)
+    if resume_state is None:
+        tr_result = _binary_posterior_state_tr_newton(
+            genotype_matrix=standardized_genotypes,
+            covariate_matrix=covariate_matrix,
+            targets=targets,
+            prior_variances=prior_variances,
+            alpha_init=alpha_init,
+            beta_init=beta_init,
+            max_iterations=max_iterations,
+            gradient_tolerance=gradient_tolerance,
+            solver_tolerance=solver_tolerance,
+            maximum_linear_solver_iterations=maximum_linear_solver_iterations,
+            logdet_probe_count=logdet_probe_count,
+            logdet_lanczos_steps=logdet_lanczos_steps,
+            exact_solver_matrix_limit=exact_solver_matrix_limit,
+            posterior_variance_batch_size=posterior_variance_batch_size,
+            posterior_variance_probe_count=posterior_variance_probe_count,
+            random_seed=random_seed,
+            compute_logdet=compute_logdet,
+            compute_beta_variance=compute_beta_variance,
+            sample_space_preconditioner_rank=sample_space_preconditioner_rank,
+            predictor_offset=predictor_offset,
+            posterior_working_sets=posterior_working_sets,
+            posterior_working_set_min_variants=posterior_working_set_min_variants,
+            posterior_working_set_initial_size=posterior_working_set_initial_size,
+            posterior_working_set_growth=posterior_working_set_growth,
+            posterior_working_set_max_passes=posterior_working_set_max_passes,
+            posterior_working_set_coefficient_tolerance=posterior_working_set_coefficient_tolerance,
+            restricted_posterior_warm_start=restricted_posterior_warm_start,
+            minimum_weight=minimum_weight,
+            allow_gpu_exact_variant=allow_gpu_exact_variant,
+        )
+        if tr_result is None:
+            raise RuntimeError("TR-Newton returned no posterior state.")
+        return tr_result
     covariate_count = covariate_matrix.shape[1]
     parameters = np.concatenate([alpha_init, beta_init], axis=0).astype(np.float64, copy=True)
     predictor_offset_array = (
@@ -3299,6 +4213,9 @@ def _binary_posterior_state(
             current_weights = _cupy_array_to_numpy(current_weights_gpu, dtype=np.float64)
         else:
             current_weights = _binary_expected_polya_gamma_weights(current_linear_predictor, minimum_weight)
+        # Belt-and-suspenders: re-floor weights immediately before division in case a
+        # GPU/CPU path returns a value at exactly the floor (or below it due to fp rounding).
+        current_weights = np.maximum(current_weights, minimum_weight)
         pseudo_response = kappa / current_weights - predictor_offset_array
         solve_start = _timed_region_start(timing_cupy)
         updated_alpha, updated_beta, _projected_targets, updated_fitted_response, _restricted_quadratic = (
@@ -3323,6 +4240,7 @@ def _binary_posterior_state(
                 posterior_working_set_coefficient_tolerance=posterior_working_set_coefficient_tolerance,
                 warm_start=warm_start,
                 allow_gpu_exact_variant=allow_gpu_exact_variant,
+                prior_precision_override=prior_precision_override,
             )
         )
         solve_seconds = _timed_region_seconds(solve_start, timing_cupy)
@@ -3517,6 +4435,7 @@ def _binary_posterior_state(
                     posterior_working_set_coefficient_tolerance=posterior_working_set_coefficient_tolerance,
                     warm_start=warm_start,
                     allow_gpu_exact_variant=allow_gpu_exact_variant,
+                    prior_precision_override=prior_precision_override,
                 )
             )
         except RuntimeError as exc:
@@ -4192,6 +5111,10 @@ def _reset_sample_space_background_preconditioner(
     warm_start.sample_space_background_owner_token = _sample_space_background_owner_token(genotype_matrix)
     warm_start.sample_space_background_variant_count = int(genotype_matrix.shape[1])
     warm_start.sample_space_background_sample_count = int(genotype_matrix.shape[0])
+    if warm_start.sample_space_background_gpu_preconditioner is not None:
+        warm_start.sample_space_background_gpu_preconditioner.clear_gpu_arrays()
+    if warm_start.sample_space_background_cpu_preconditioner is not None:
+        warm_start.sample_space_background_cpu_preconditioner.clear_gpu_arrays()
     warm_start.sample_space_background_gpu_preconditioner = None
     warm_start.sample_space_background_cpu_preconditioner = None
 
@@ -4300,6 +5223,8 @@ def _get_or_build_background_sample_space_cpu_preconditioner(
         nystrom_factor_cpu=None if nystrom_factor_cpu is None else np.asarray(nystrom_factor_cpu, dtype=np.float64).copy(),
         global_background=True,
     )
+    if warm_start.sample_space_background_cpu_preconditioner is not None:
+        warm_start.sample_space_background_cpu_preconditioner.clear_gpu_arrays()
     warm_start.sample_space_background_cpu_preconditioner = cache_entry
     return cache_entry
 
@@ -4378,6 +5303,8 @@ def _get_or_build_background_sample_space_gpu_preconditioner(
         nystrom_factor_gpu=nystrom_factor_gpu,
         global_background=True,
     )
+    if warm_start.sample_space_background_gpu_preconditioner is not None:
+        warm_start.sample_space_background_gpu_preconditioner.clear_gpu_arrays()
     warm_start.sample_space_background_gpu_preconditioner = cache_entry
     return cache_entry
 
@@ -6824,6 +7751,48 @@ def _solve_restricted_exact_variant_space(
         )
         diagonal_index = cp.arange(variant_count)
         inverse_diagonal_noise_gpu = cp.asarray(inverse_diagonal_noise, dtype=compute_dtype)
+        refreshed_full_gpu_exact = _gpu_exact_variant_full_matrix_fits(
+            cp,
+            sample_count=sample_count,
+            variant_count=variant_count,
+            covariate_count=covariate_count,
+            cache_is_int8_standardized=cache_is_int8_standardized,
+            matrix_itemsize=compute_itemsize,
+        )
+        if use_full_gpu_exact and not refreshed_full_gpu_exact:
+            log(
+                "    full exact GPU matrix no longer fits live workspace after projector setup; "
+                + "using tiled exact variant-space"
+            )
+            use_full_gpu_exact = False
+            tiled_exact_batch_size = _gpu_exact_variant_tile_size(
+                cp,
+                sample_count=sample_count,
+                variant_count=variant_count,
+                covariate_count=covariate_count,
+                matrix_itemsize=compute_itemsize,
+            )
+        elif not use_full_gpu_exact:
+            refreshed_tile_size = _gpu_exact_variant_tile_size(
+                cp,
+                sample_count=sample_count,
+                variant_count=variant_count,
+                covariate_count=covariate_count,
+                matrix_itemsize=compute_itemsize,
+            )
+            if 0 < refreshed_tile_size < tiled_exact_batch_size:
+                log(
+                    "    reducing tiled exact GPU batch size after projector setup "
+                    + f"({tiled_exact_batch_size} -> {refreshed_tile_size})"
+                )
+                tiled_exact_batch_size = refreshed_tile_size
+            elif refreshed_tile_size <= 0:
+                tiled_exact_batch_size = 0
+        if not use_full_gpu_exact and tiled_exact_batch_size <= 0:
+            raise RuntimeError(
+                "GPU exact variant-space solve no longer has enough live memory "
+                + "for full or tiled exact Gram construction."
+            )
         if use_full_gpu_exact:
             X_gpu_compute = _cached_exact_variant_full_matrix_gpu(
                 genotype_matrix=genotype_matrix,
@@ -7054,6 +8023,7 @@ def _solve_restricted_mean_only(
     posterior_working_set_coefficient_tolerance: float = 1e-4,
     allow_working_set: bool = True,
     allow_gpu_exact_variant: bool = True,
+    prior_precision_override: np.ndarray | None = None,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, float]:
     from sv_pgs.progress import log, mem
 
@@ -7065,7 +8035,13 @@ def _solve_restricted_mean_only(
         raise ValueError("diagonal_noise must have one entry per sample.")
 
     prior_variances = np.maximum(np.asarray(prior_variances, dtype=np.float64), 1e-8)
-    prior_precision = 1.0 / prior_variances
+    if prior_precision_override is not None:
+        prior_precision = np.asarray(prior_precision_override, dtype=np.float64)
+        if prior_precision.shape != prior_variances.shape:
+            raise ValueError("prior_precision_override must match prior_variances shape.")
+        prior_precision = np.maximum(prior_precision, 0.0)
+    else:
+        prior_precision = 1.0 / prior_variances
     variant_count = genotype_matrix.shape[1]
     use_exact_variant = variant_count <= exact_solver_matrix_limit
     use_gpu_exact_variant = allow_gpu_exact_variant and _use_gpu_exact_variant_solve(
@@ -7847,6 +8823,7 @@ def _solve_restricted_full(
     posterior_working_set_coefficient_tolerance: float = 1e-4,
     allow_working_set: bool = True,
     allow_gpu_exact_variant: bool = True,
+    prior_precision_override: np.ndarray | None = None,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, float, float, float]:
     from sv_pgs.progress import log, mem
     if not compute_logdet and not compute_beta_variance:
@@ -7862,7 +8839,13 @@ def _solve_restricted_full(
         raise ValueError("diagonal_noise must have one entry per sample.")
 
     prior_variances = np.maximum(np.asarray(prior_variances, dtype=np.float64), 1e-8)
-    prior_precision = 1.0 / prior_variances
+    if prior_precision_override is not None:
+        prior_precision = np.asarray(prior_precision_override, dtype=np.float64)
+        if prior_precision.shape != prior_variances.shape:
+            raise ValueError("prior_precision_override must match prior_variances shape.")
+        prior_precision = np.maximum(prior_precision, 0.0)
+    else:
+        prior_precision = 1.0 / prior_variances
     variant_count = genotype_matrix.shape[1]
     use_exact_variant = variant_count <= exact_solver_matrix_limit
     use_gpu_exact_variant = allow_gpu_exact_variant and _use_gpu_exact_variant_solve(
@@ -9492,6 +10475,82 @@ def _initialize_scale_model(
     return initialized_global_scale, coefficients.astype(np.float64)
 
 
+def _calibrate_initial_global_scale(
+    *,
+    current_global_scale: float,
+    scale_model_coefficients: np.ndarray,
+    prior_design: PriorDesign,
+    genotype_matrix: StandardizedGenotypeMatrix | np.ndarray,
+    covariate_matrix: np.ndarray,
+    targets: np.ndarray,
+    alpha_state: np.ndarray,
+    trait_type: TraitType,
+    config: ModelConfig,
+) -> float:
+    variant_count = int(prior_design.design_matrix.shape[0])
+    if variant_count == 0:
+        return float(np.clip(current_global_scale, config.global_scale_floor, config.global_scale_ceiling))
+    residual = np.asarray(targets, dtype=np.float64) - np.asarray(covariate_matrix, dtype=np.float64) @ np.asarray(
+        alpha_state,
+        dtype=np.float64,
+    )
+    residual_norm = float(np.linalg.norm(residual))
+    if residual_norm <= 0.0:
+        return float(np.clip(current_global_scale, config.global_scale_floor, config.global_scale_ceiling))
+    if isinstance(genotype_matrix, StandardizedGenotypeMatrix):
+        genotype_residual_dot = _genotype_transpose_matvec_result_numpy(
+            genotype_matrix,
+            residual,
+            batch_size=DEFAULT_GENOTYPE_BATCH_SIZE,
+            dtype=np.float64,
+        )
+        column_norms = np.full(variant_count, np.sqrt(float(genotype_matrix.shape[0])), dtype=np.float64)
+    else:
+        genotype_array = np.asarray(genotype_matrix, dtype=np.float64)
+        genotype_residual_dot = genotype_array.T @ residual
+        column_norms = np.linalg.norm(genotype_array, axis=0)
+    marginal_correlations = np.abs(np.asarray(genotype_residual_dot, dtype=np.float64)) / np.maximum(
+        column_norms * residual_norm,
+        1e-12,
+    )
+    null_screening_level = float(np.sqrt(2.0 * np.log(max(float(variant_count), 2.0)) / max(float(len(residual)), 1.0)))
+    screening_strength = float(
+        np.clip(
+            (float(np.max(marginal_correlations)) - null_screening_level) / max(1.0 - null_screening_level, 1e-12),
+            0.0,
+            1.0,
+        )
+    )
+    if screening_strength <= 0.0:
+        return float(np.clip(current_global_scale, config.global_scale_floor, config.global_scale_ceiling))
+    metadata_baseline_scales = _metadata_baseline_scales_from_coefficients(
+        scale_model_coefficients=np.asarray(scale_model_coefficients, dtype=np.float64),
+        design_matrix=prior_design.design_matrix,
+        config=config,
+    )
+    mean_baseline_second_moment = float(np.mean(np.maximum(metadata_baseline_scales, config.prior_scale_floor) ** 2))
+    if trait_type == TraitType.BINARY:
+        # Logistic likelihoods can become nearly separable in tiny variant sets.
+        # Start with a conservative logit-scale signal variance and let the TPB
+        # updates expand only when the posterior second moments justify it.
+        target_predictor_variance = 0.04 * screening_strength * screening_strength
+    else:
+        target_predictor_variance = max(
+            float(np.mean(residual * residual)) * screening_strength * screening_strength,
+            config.sigma_error_floor,
+        )
+    calibrated_global_scale = np.sqrt(
+        target_predictor_variance / max(float(variant_count) * mean_baseline_second_moment, 1e-12)
+    )
+    return float(
+        np.clip(
+            max(float(current_global_scale), calibrated_global_scale),
+            config.global_scale_floor,
+            config.global_scale_ceiling,
+        )
+    )
+
+
 # Re-estimate the global scale and metadata coefficients with the exact
 # convex Newton update for the expected Gaussian prior term.
 def _update_scale_model(
@@ -9679,34 +10738,20 @@ def _update_tpb_shape_vectors(
     result = minimize(
         neg_obj_and_grad,
         initial_log_shape.astype(np.float64),
-        method='L-BFGS-B',
+        method="L-BFGS-B",
         jac=True,
         bounds=bounds,
         options={
-            'maxiter': int(config.maximum_tpb_shape_iterations),
-            'gtol': float(config.convergence_tolerance),
-            'ftol': float(config.convergence_tolerance),
+            "maxiter": max(int(config.maximum_tpb_shape_iterations), 200),
+            "gtol": float(config.convergence_tolerance),
+            "ftol": float(config.convergence_tolerance),
         },
     )
 
-    if result.x is None or not np.all(np.isfinite(result.x)):
-        # Fallback: projected gradient ascent (preserved from the prior
-        # implementation) in case L-BFGS-B returns an invalid iterate.
-        optimized_log_shape = initial_log_shape.copy()
-        for _iteration_index in range(config.maximum_tpb_shape_iterations):
-            _objective_value, gradient = objective_and_gradient(optimized_log_shape)
-            step = np.clip(config.tpb_shape_learning_rate * gradient, -0.25, 0.25)
-            updated_log_shape = np.clip(optimized_log_shape + step, lower_bound, upper_bound)
-            shape_relative_change = float(np.linalg.norm(updated_log_shape - optimized_log_shape)) / max(
-                float(np.linalg.norm(optimized_log_shape)),
-                1e-8,
-            )
-            if shape_relative_change < config.convergence_tolerance:
-                optimized_log_shape = updated_log_shape
-                break
-            optimized_log_shape = updated_log_shape
-    else:
-        optimized_log_shape = np.asarray(result.x, dtype=np.float64)
+    if not result.success or result.x is None or not np.all(np.isfinite(result.x)):
+        raise RuntimeError(f"TPB shape L-BFGS-B optimization failed: {result.message}")
+
+    optimized_log_shape = np.asarray(result.x, dtype=np.float64)
 
     return (
         np.exp(optimized_log_shape[:class_count]).astype(np.float64),
@@ -9757,6 +10802,35 @@ def _scale_penalty_objective(
     scale_penalty: np.ndarray,
 ) -> float:
     return float(-0.5 * np.sum(scale_penalty * scale_model_coefficients * scale_model_coefficients))
+
+
+def _pack_anderson_hyperparameters(
+    *,
+    log_global_scale: float,
+    scale_model_coefficients: np.ndarray,
+    log_tpb_shape_a_vector: np.ndarray,
+    log_tpb_shape_b_vector: np.ndarray,
+) -> np.ndarray:
+    return np.concatenate([
+        np.asarray([log_global_scale], dtype=np.float64),
+        np.asarray(scale_model_coefficients, dtype=np.float64),
+        np.asarray(log_tpb_shape_a_vector, dtype=np.float64),
+        np.asarray(log_tpb_shape_b_vector, dtype=np.float64),
+    ])
+
+
+def _unpack_anderson_hyperparameters(
+    packed: np.ndarray,
+    *,
+    scale_model_dim: int,
+    tpb_class_count: int,
+) -> tuple[float, np.ndarray, np.ndarray, np.ndarray]:
+    cursor = 0
+    log_g = float(packed[cursor]); cursor += 1
+    scale_coefs = packed[cursor:cursor + scale_model_dim].copy(); cursor += scale_model_dim
+    log_a = packed[cursor:cursor + tpb_class_count].copy(); cursor += tpb_class_count
+    log_b = packed[cursor:cursor + tpb_class_count].copy(); cursor += tpb_class_count
+    return log_g, scale_coefs, log_a, log_b
 
 
 def _pack_theta(global_scale: float, scale_model_coefficients: np.ndarray) -> np.ndarray:
@@ -9837,6 +10911,44 @@ def _update_local_scales(
     return updated_local_scale, updated_auxiliary_delta
 
 
+def _build_cavi_correct_prior_precision(
+    *,
+    reduced_second_moment: np.ndarray,
+    baseline_prior_variances: np.ndarray,
+    local_shape_a: np.ndarray,
+    auxiliary_delta: np.ndarray,
+    config: ModelConfig,
+) -> np.ndarray:
+    """Build E[1/lambda] / (sigma_g^2 * s_j^2) precision array for variant beta.
+
+    ``baseline_prior_variances`` already encodes sigma_g^2 * s_j^2. The
+    inverse-first-moment of the GIG variational posterior is computed from the
+    current (chi, psi) parameters.
+    """
+    from sv_pgs.optimizer_helpers import gig_inverse_first_moment as _gig_inv_first_moment
+
+    baseline = np.maximum(np.asarray(baseline_prior_variances, dtype=np.float64), 1e-12)
+    chi = np.maximum(
+        np.asarray(reduced_second_moment, dtype=np.float64) / baseline,
+        1e-12,
+    )
+    p_parameter = np.asarray(local_shape_a, dtype=np.float64) - 0.5
+    current_auxiliary_delta = np.maximum(
+        np.asarray(auxiliary_delta, dtype=np.float64), config.local_scale_floor
+    )
+    psi = np.maximum(2.0 * current_auxiliary_delta, 1e-12)
+    inv_local_scale = np.asarray(
+        _gig_inv_first_moment(p_parameter=p_parameter, chi=chi, psi=psi),
+        dtype=np.float64,
+    )
+    precision = inv_local_scale / baseline
+    if precision.shape != np.asarray(reduced_second_moment).shape:
+        raise ValueError("precision shape must match reduced_second_moment shape.")
+    if not np.all(np.isfinite(precision)) or np.any(precision <= 0.0):
+        raise FloatingPointError("CAVI inverse local-scale precision produced invalid values.")
+    return precision
+
+
 # Compute the expected value of X^r where X ~ GIG(p, chi, psi).
 #
 # The Generalized Inverse Gaussian is the conjugate distribution that
@@ -9858,7 +10970,9 @@ def _gig_moment(
     psi_array = np.asarray(psi, dtype=np.float64)
     p_array = np.asarray(p_parameter, dtype=np.float64)
     z_value = np.sqrt(np.maximum(chi_array * psi_array, 1e-12))
-    numerator = scipy_bessel_kve(np.abs(p_array + moment_power), z_value)
+    # Floor BOTH Bessel evaluations BEFORE taking their ratio so that simultaneous
+    # underflow yields a finite quotient instead of 0/0=NaN.
+    numerator = np.maximum(scipy_bessel_kve(np.abs(p_array + moment_power), z_value), 1e-300)
     denominator = np.maximum(scipy_bessel_kve(np.abs(p_array), z_value), 1e-300)
     moment_ratio = numerator / denominator
     return np.asarray(
@@ -10021,7 +11135,14 @@ def _relative_objective_change(current_objective: float, previous_objective: flo
 def _relative_change(current_values: np.ndarray, previous_values: np.ndarray | None) -> float:
     if previous_values is None:
         return 0.0
-    denominator = max(float(np.linalg.norm(previous_values)), 1e-8)
+    # Adaptive denominator: a fixed 1e-8 floor turns genuinely tiny norms (e.g. near
+    # zero-init) into spuriously huge "relative change" reports. Scale the floor to
+    # the current norm so the ratio remains a sensible bounded scale at all magnitudes.
+    denominator = max(
+        float(np.linalg.norm(previous_values)),
+        float(np.linalg.norm(current_values)) * 1e-8,
+        1e-12,
+    )
     return float(np.linalg.norm(current_values - previous_values) / denominator)
 
 

@@ -159,13 +159,6 @@ class ModelConfig:
     posterior_working_set_coefficient_tolerance: float = 1e-4
 
     update_hyperparameters: bool = True
-    # Anderson acceleration of the outer CAVI fixed-point map. Wraps the
-    # hyperparameter slice (log global_scale, scale model coefficients,
-    # log TPB shape_a, log TPB shape_b) with safeguarded Anderson(m). Falls
-    # back to the plain CAVI step when the extrapolation violates bounds or
-    # produces non-finite values.
-    anderson_acceleration: bool = True
-    anderson_memory_depth: int = 5
     random_seed: int = 0
 
     def __post_init__(self) -> None:
@@ -243,9 +236,6 @@ class ModelConfig:
             raise ValueError("posterior_working_set_max_passes must be positive.")
         if self.posterior_working_set_coefficient_tolerance < 0.0:
             raise ValueError("posterior_working_set_coefficient_tolerance must be non-negative.")
-        if self.anderson_memory_depth < 0:
-            raise ValueError("anderson_memory_depth must be non-negative.")
-
     def class_log_baseline_scales(self) -> Mapping[VariantClass, float]:
         return dict(DEFAULT_CLASS_LOG_BASELINE_SCALE)
 

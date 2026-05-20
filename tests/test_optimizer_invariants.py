@@ -81,7 +81,6 @@ def test_elbo_monotonicity_and_well_defined():
     result = _fit(X, W, y, records, config)
 
     # ELBO must be finite when computed externally.
-    n = X.shape[0]
     col_sq = np.sum(X.astype(np.float64) ** 2, axis=0)
     elbo = compute_elbo(
         trait_type=TraitType.QUANTITATIVE,
@@ -115,36 +114,62 @@ def test_elbo_monotonicity_and_well_defined():
 def test_idempotency_of_converged_fit():
     """Re-running EM from convergence with 1 additional iteration should
     move parameters by less than convergence_tolerance.
+
+    Uses the public ``checkpoint_from_result`` warm-start helper to seed
+    the second fit from the converged state of the first.
     """
+    from sv_pgs.mixture_inference import (
+        _build_prior_design,
+        checkpoint_from_result,
+    )
+    from sv_pgs.preprocessing import collapse_tie_groups
+
     rng = np.random.default_rng(1)
     X, W, y, _, _ = _make_quant_problem(rng, n=200, p=15, sigma2=0.05)
     records = _records(X.shape[1])
-    config = ModelConfig(trait_type=TraitType.QUANTITATIVE, max_outer_iterations=20)
+    # Disable hyperparameter updates so the fixed point is determined purely
+    # by the (alpha, beta) update given fixed priors — this is the regime in
+    # which idempotency is a hard mathematical invariant rather than a
+    # property of the still-drifting global_scale Newton update.
+    config = ModelConfig(
+        trait_type=TraitType.QUANTITATIVE,
+        max_outer_iterations=40,
+        convergence_tolerance=1e-4,
+        update_hyperparameters=False,
+    )
     result1 = _fit(X, W, y, records, config)
 
-    # Re-fit; we cannot supply alpha/beta directly to the public API so we
-    # instead run 1 more iteration on the same data — at a converged fixed
-    # point the parameters should barely move.
-    config_single = ModelConfig(
+    completed = len(result1.objective_history)
+    config_resume = ModelConfig(
         trait_type=TraitType.QUANTITATIVE,
-        max_outer_iterations=1,
+        max_outer_iterations=completed + 1,
         convergence_tolerance=config.convergence_tolerance,
+        update_hyperparameters=False,
     )
-    result2 = _fit(X, W, y, records, config_single)
+    tie_map = build_tie_map(X, records, config_resume)
+    reduced_records = collapse_tie_groups(records, tie_map)
+    prior_design = _build_prior_design(reduced_records)
+    ckpt = checkpoint_from_result(
+        result1, config=config_resume, prior_design=prior_design
+    )
+    result2 = fit_variational_em(
+        genotypes=X,
+        covariates=W,
+        targets=y,
+        records=records,
+        config=config_resume,
+        tie_map=tie_map,
+        resume_checkpoint=ckpt,
+    )
 
-    # Pre-existing failure check: the public API does not expose a way to
-    # warm-start with a fitted hyperparameter set, so this comparison runs
-    # one full fresh EM iteration and may diverge substantially from the
-    # converged fit.
     delta = float(
         np.linalg.norm(result1.beta_reduced - result2.beta_reduced)
         / (np.linalg.norm(result1.beta_reduced) + 1e-8)
     )
-    if delta >= config.convergence_tolerance:
-        pytest.xfail(
-            f"No warm-start hook exposed; relative beta change after 1 extra "
-            f"iteration = {delta:.3e} >= tol {config.convergence_tolerance:.3e}"
-        )
+    assert delta < 1e-3, (
+        f"Warm-started 1 extra iteration moved beta by {delta:.3e} (>= 1e-3); "
+        f"expected near-idempotency at the converged fixed point."
+    )
 
 
 def test_recovery_on_noiseless_quantitative_data():

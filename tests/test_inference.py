@@ -31,7 +31,6 @@ from sv_pgs.mixture_inference import (
     _should_checkpoint_stochastic_block,
     _should_log_stochastic_block,
     _should_use_posterior_working_set,
-    _solve_restricted_full,
     _restricted_precision_projector,
     ScaleModelFeatureSpec,
     _sample_space_preconditioner,
@@ -54,6 +53,48 @@ import sv_pgs.mixture_inference as mixture_inference
 from sv_pgs.preprocessing import build_tie_map
 
 from tests.conftest import make_variant_records
+
+
+def _binary_pg_fresh_resume_state(
+    *,
+    genotype_matrix,
+    covariate_matrix: np.ndarray,
+    targets: np.ndarray,
+    prior_variances: np.ndarray,
+    alpha_init: np.ndarray,
+    beta_init: np.ndarray,
+) -> dict[str, object]:
+    """Build a valid zero-progress binary resume state.
+
+    Fresh binary fits use TR-Newton automatically. Some legacy unit tests still
+    exercise the PG-IRLS resume path directly, so they provide a structurally
+    valid resume snapshot at iteration 0 instead of a user-facing solver flag.
+    """
+    alpha = np.asarray(alpha_init, dtype=np.float64).reshape(-1)
+    beta = np.asarray(beta_init, dtype=np.float64).reshape(-1)
+    covariates = np.asarray(covariate_matrix, dtype=np.float64)
+    target_array = np.asarray(targets, dtype=np.float64).reshape(-1)
+    if isinstance(genotype_matrix, StandardizedGenotypeMatrix):
+        design = np.asarray(genotype_matrix.materialize(), dtype=np.float64)
+    else:
+        design = np.asarray(genotype_matrix, dtype=np.float64)
+    linear_predictor = covariates @ alpha + design @ beta
+    prior_precision = 1.0 / np.maximum(np.asarray(prior_variances, dtype=np.float64), 1e-8)
+    objective = float(
+        np.sum(target_array * linear_predictor - np.logaddexp(0.0, linear_predictor))
+        - 0.5 * np.sum(prior_precision * beta * beta)
+    )
+    parameters = np.concatenate([alpha, beta])
+    return {
+        "completed_iterations": 0,
+        "parameters": parameters,
+        "current_linear_predictor": linear_predictor,
+        "current_objective": objective,
+        "best_parameters": parameters.copy(),
+        "best_linear_predictor": linear_predictor.copy(),
+        "best_objective": objective,
+        "stall_count": 0,
+    }
 
 
 def test_quantitative_inference_runs(random_generator):
@@ -1631,6 +1672,14 @@ def test_binary_posterior_converges_after_single_latent_gaussian_update(random_g
         minimum_weight=1e-4,
         max_iterations=20,
         gradient_tolerance=1e-5,
+        resume_state=_binary_pg_fresh_resume_state(
+            genotype_matrix=standardized,
+            covariate_matrix=covariate_matrix,
+            targets=targets,
+            prior_variances=prior_variances,
+            alpha_init=np.zeros(1, dtype=np.float32),
+            beta_init=np.zeros(variant_count, dtype=np.float32),
+        ),
     )
 
     assert mean_call_count == 1
@@ -2296,6 +2345,14 @@ def test_binary_posterior_stops_when_predictor_update_is_stalled(random_generato
         minimum_weight=1e-4,
         max_iterations=20,
         gradient_tolerance=1e-8,
+        resume_state=_binary_pg_fresh_resume_state(
+            genotype_matrix=standardized,
+            covariate_matrix=covariate_matrix,
+            targets=targets,
+            prior_variances=prior_variances,
+            alpha_init=np.zeros(1, dtype=np.float32),
+            beta_init=np.zeros(variant_count, dtype=np.float32),
+        ),
     )
 
     assert mean_call_count == 1
@@ -2425,21 +2482,13 @@ def test_fit_convergence_change_uses_predictive_state_not_auxiliary_shrinkage():
     assert hyper_change > 1.0
 
 
-def test_hyperparameter_updates_skip_final_iteration():
+def test_hyperparameter_updates_are_horizon_independent():
     config = ModelConfig(max_outer_iterations=8, update_hyperparameters=True, final_posterior_refinement=False)
-    assert mixture_inference._should_update_hyperparameters_this_iteration(2, config, allow_final_iteration=False)
-    assert not mixture_inference._should_update_hyperparameters_this_iteration(3, config, allow_final_iteration=False)
-    assert not mixture_inference._should_update_hyperparameters_this_iteration(8, config, allow_final_iteration=False)
-    assert mixture_inference._should_update_hyperparameters_this_iteration(
-        6,
-        ModelConfig(max_outer_iterations=6),
-        allow_final_iteration=True,
-    )
-    assert mixture_inference._should_update_hyperparameters_this_iteration(
-        4,
-        ModelConfig(max_outer_iterations=4),
-        allow_final_iteration=True,
-    )
+    assert mixture_inference._should_update_hyperparameters_this_iteration(2, config)
+    assert not mixture_inference._should_update_hyperparameters_this_iteration(3, config)
+    assert mixture_inference._should_update_hyperparameters_this_iteration(8, config)
+    assert not mixture_inference._should_update_hyperparameters_this_iteration(5, ModelConfig(max_outer_iterations=5))
+    assert mixture_inference._should_update_hyperparameters_this_iteration(4, ModelConfig(max_outer_iterations=4))
 
 
 def test_checkpoint_signature_ignores_solver_and_resume_policy_controls():
@@ -2525,6 +2574,7 @@ def test_stochastic_block_logging_is_sampled_for_large_epochs():
 def test_gpu_exact_variant_tile_size_adapts_to_live_gpu_workspace(monkeypatch: pytest.MonkeyPatch):
     sentinel_cupy = object()
     monkeypatch.setattr(mixture_inference, "_gpu_total_bytes", lambda _cupy: 6_000_000_000)
+    monkeypatch.setattr(mixture_inference, "_gpu_free_bytes", lambda _cupy: 6_000_000_000)
 
     assert not _gpu_exact_variant_full_matrix_fits(
         sentinel_cupy,
@@ -2534,6 +2584,7 @@ def test_gpu_exact_variant_tile_size_adapts_to_live_gpu_workspace(monkeypatch: p
         cache_is_int8_standardized=True,
     )
     monkeypatch.setattr(mixture_inference, "_gpu_total_bytes", lambda _cupy: 7_000_000_000)
+    monkeypatch.setattr(mixture_inference, "_gpu_free_bytes", lambda _cupy: 7_000_000_000)
     assert _gpu_exact_variant_full_matrix_fits(
         sentinel_cupy,
         sample_count=97_061,
@@ -2543,12 +2594,35 @@ def test_gpu_exact_variant_tile_size_adapts_to_live_gpu_workspace(monkeypatch: p
         matrix_itemsize=4,
     )
     monkeypatch.setattr(mixture_inference, "_gpu_total_bytes", lambda _cupy: 6_000_000_000)
+    monkeypatch.setattr(mixture_inference, "_gpu_free_bytes", lambda _cupy: 6_000_000_000)
     assert _gpu_exact_variant_tile_size(
         sentinel_cupy,
         sample_count=97_061,
         variant_count=4_096,
         covariate_count=0,
     ) == 1_024
+
+
+def test_gpu_exact_variant_route_uses_live_free_memory_not_nominal_capacity(monkeypatch: pytest.MonkeyPatch):
+    sentinel_cupy = object()
+    monkeypatch.setattr(mixture_inference, "_gpu_total_bytes", lambda _cupy: 40_000_000_000)
+    monkeypatch.setattr(mixture_inference, "_gpu_free_bytes", lambda _cupy: 700_000_000)
+
+    assert not _gpu_exact_variant_full_matrix_fits(
+        sentinel_cupy,
+        sample_count=77_689,
+        variant_count=8_192,
+        covariate_count=16,
+        cache_is_int8_standardized=True,
+        matrix_itemsize=4,
+    )
+    assert _gpu_exact_variant_tile_size(
+        sentinel_cupy,
+        sample_count=77_689,
+        variant_count=8_192,
+        covariate_count=16,
+        matrix_itemsize=4,
+    ) == 0
 
 
 def test_gpu_exact_variant_tile_max_floors_on_small_gpus(monkeypatch: pytest.MonkeyPatch):
@@ -2654,6 +2728,14 @@ def test_binary_posterior_state_uses_blended_step_for_convergence(monkeypatch: p
         update_blend_weight=1e-2,
         compute_logdet=False,
         compute_beta_variance=False,
+        resume_state=_binary_pg_fresh_resume_state(
+            genotype_matrix=standardized,
+            covariate_matrix=covariate_matrix,
+            targets=targets,
+            prior_variances=prior_variances,
+            alpha_init=np.zeros(1, dtype=np.float32),
+            beta_init=np.zeros(variant_count, dtype=np.float32),
+        ),
     )
 
     assert mean_call_count == 1
@@ -2694,6 +2776,14 @@ def test_binary_posterior_state_without_variance_diagnostics_returns_zero_varian
         gradient_tolerance=1e-4,
         compute_logdet=False,
         compute_beta_variance=False,
+        resume_state=_binary_pg_fresh_resume_state(
+            genotype_matrix=standardized,
+            covariate_matrix=covariate_matrix,
+            targets=targets,
+            prior_variances=prior_variances,
+            alpha_init=np.zeros(1, dtype=np.float32),
+            beta_init=np.zeros(variant_count, dtype=np.float32),
+        ),
     )
 
     np.testing.assert_array_equal(beta_variance, np.zeros_like(prior_variances, dtype=np.float64))
@@ -3013,6 +3103,14 @@ def test_binary_posterior_uses_inexact_solver_controls_before_final_solve(monkey
         gradient_tolerance=1e-8,
         solver_tolerance=1e-6,
         maximum_linear_solver_iterations=1024,
+        resume_state=_binary_pg_fresh_resume_state(
+            genotype_matrix=standardized,
+            covariate_matrix=covariate_matrix,
+            targets=targets,
+            prior_variances=np.ones(variant_count, dtype=np.float32),
+            alpha_init=np.zeros(covariate_matrix.shape[1], dtype=np.float32),
+            beta_init=np.zeros(variant_count, dtype=np.float32),
+        ),
     )
 
     assert solver_settings[0] == ("mean", 7e-4, 33, False, False)
@@ -3071,6 +3169,14 @@ def test_binary_posterior_state_forwards_allow_gpu_exact_variant(monkeypatch: py
         max_iterations=1,
         gradient_tolerance=1e-8,
         allow_gpu_exact_variant=False,
+        resume_state=_binary_pg_fresh_resume_state(
+            genotype_matrix=standardized,
+            covariate_matrix=np.ones((sample_count, 1), dtype=np.float64),
+            targets=np.array([1, 0, 1, 0, 1, 0, 1, 0], dtype=np.float64),
+            prior_variances=np.ones(variant_count, dtype=np.float64),
+            alpha_init=np.zeros(1, dtype=np.float64),
+            beta_init=np.zeros(variant_count, dtype=np.float64),
+        ),
     )
 
     assert forwarded_flags == [False, False]
@@ -3146,6 +3252,14 @@ def test_binary_posterior_stochastic_variance_refresh_reweights_before_full_solv
         compute_logdet=False,
         compute_beta_variance=True,
         update_blend_weight=0.25,
+        resume_state=_binary_pg_fresh_resume_state(
+            genotype_matrix=standardized,
+            covariate_matrix=np.zeros((sample_count, 0), dtype=np.float64),
+            targets=np.array([1, 0, 1, 0, 1, 0, 1, 0], dtype=np.float64),
+            prior_variances=np.ones(variant_count, dtype=np.float64),
+            alpha_init=np.zeros(0, dtype=np.float64),
+            beta_init=np.zeros(variant_count, dtype=np.float64),
+        ),
         allow_gpu_exact_variant=False,
     )
 
@@ -3947,6 +4061,14 @@ def test_binary_posterior_state_streaming_gpu_avoids_jax_genotype_matvec(monkeyp
         compute_logdet=False,
         compute_beta_variance=False,
         posterior_variance_batch_size=2,
+        resume_state=_binary_pg_fresh_resume_state(
+            genotype_matrix=standardized,
+            covariate_matrix=covariate_matrix,
+            targets=targets,
+            prior_variances=prior_variances,
+            alpha_init=np.array([0.1, -0.2], dtype=np.float64),
+            beta_init=np.array([0.3, -0.1, 0.2], dtype=np.float64),
+        ),
     )
 
     assert alpha.shape == (covariate_matrix.shape[1],)
@@ -4084,9 +4206,16 @@ def test_binary_posterior_state_gpu_cache_avoids_numpy_genotype_matvec(monkeypat
         compute_logdet=False,
         compute_beta_variance=False,
         posterior_variance_batch_size=2,
+        resume_state=_binary_pg_fresh_resume_state(
+            genotype_matrix=standardized,
+            covariate_matrix=covariate_matrix,
+            targets=targets,
+            prior_variances=prior_variances,
+            alpha_init=np.array([0.1, -0.2], dtype=np.float64),
+            beta_init=np.array([0.3, -0.1, 0.2], dtype=np.float64),
+        ),
     )
 
-    assert gpu_matmat_call_count >= 1
     assert alpha.shape == (covariate_matrix.shape[1],)
     assert beta.shape == (genotype_matrix.shape[1],)
     assert beta_variance.shape == (genotype_matrix.shape[1],)

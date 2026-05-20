@@ -1066,7 +1066,7 @@ def _gpu_free_bytes(cupy) -> int:
     try:
         free, _ = cupy.cuda.runtime.memGetInfo()
         return int(free)
-    except (OSError, RuntimeError):
+    except (AttributeError, OSError, RuntimeError):
         return 0
 
 
