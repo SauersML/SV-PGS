@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-import os
-from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Literal
@@ -16,16 +14,28 @@ _DECODE_LOOKUP_A1 = np.array([2, PLINK_MISSING_INT8, 1, 0], dtype=np.int8)
 _DECODE_LOOKUP_A2 = np.array([0, PLINK_MISSING_INT8, 1, 2], dtype=np.int8)
 _ENCODE_LOOKUP_A1 = np.array([0b11, 0b10, 0b00], dtype=np.uint8)
 
-# Minimum batch variant count to bother launching the thread pool; below this
-# the GIL-acquire and chunk-split overhead beats the parallel decode itself.
-_DECODE_PARALLEL_THRESHOLD = 256
-# Smallest per-thread chunk. Below this each worker spends more time on
-# allocation/free of the codes table than on real decode work.
-_DECODE_MIN_CHUNK = 64
-# Workers cap. More than ~16 hits diminishing returns because the decode is
-# memory-bandwidth bound past that point; this also keeps the per-call thread
-# allocation cheap.
-_DECODE_MAX_WORKERS = 16
+
+def _build_byte_decode_lut(per_code_lookup: np.ndarray) -> np.ndarray:
+    """Precompute a (256, 4) byte → 4-int8 unpacking table.
+
+    Each .bed byte packs 4 samples × 2 bits, low-bit-first. `lut[byte]`
+    returns the 4 decoded int8 values in sample order. Single numpy
+    advanced-indexing op `lut[packed]` then unpacks the entire batch in
+    one shot — one allocation, one indexing kernel — replacing the
+    earlier 4-bit-shift + advanced-index-on-2.88GB-codes-array approach
+    that allocated several large intermediates and broke up the work
+    across many numpy ops (each with its own kernel-call overhead).
+    """
+    lut = np.empty((256, 4), dtype=np.int8)
+    for byte_value in range(256):
+        for sample_offset in range(4):
+            two_bit_code = (byte_value >> (2 * sample_offset)) & 0b11
+            lut[byte_value, sample_offset] = per_code_lookup[two_bit_code]
+    return lut
+
+
+_BYTE_DECODE_LUT_A1 = _build_byte_decode_lut(_DECODE_LOOKUP_A1)
+_BYTE_DECODE_LUT_A2 = _build_byte_decode_lut(_DECODE_LOOKUP_A2)
 
 
 def to_bed(
@@ -248,74 +258,32 @@ def _decode_payload(
     bytes_per_variant: int,
     count_a1: bool,
 ) -> np.ndarray:
-    # Accept either a Python `bytes` object (legacy read() path, still used by
-    # the per-variant gather branch) or a uint8 numpy view (mmap zero-copy
-    # path). np.frombuffer handles both — for the mmap case it returns a
-    # zero-copy view of the same memory rather than triggering an alloc.
+    """Decode a .bed payload (variant_count × bytes_per_variant packed bytes)
+    into an (iid_count, variant_count) int8 array.
+
+    Implementation: single 256-entry byte→4×int8 lookup. The old approach
+    allocated a (variant_count, bytes_per_variant*4) uint8 codes table,
+    wrote into it 4× via bit-shift + mask + slice-stride, then did a
+    second advanced-indexing pass via the 4-entry code-to-int8 LUT — six
+    passes over multi-GB intermediates, GIL-released or not, plus an
+    optional thread-pool wrapper that on some hardware paid more overhead
+    than it saved. One LUT swap collapses all of it into a single numpy
+    indexing kernel that's strictly memory-bandwidth-bound.
+    """
     if isinstance(payload, np.ndarray):
         raw_bytes = np.ascontiguousarray(payload, dtype=np.uint8)
     else:
         raw_bytes = np.frombuffer(payload, dtype=np.uint8)
     if raw_bytes.size != variant_count * bytes_per_variant:
         raise ValueError("Unexpected PLINK 1 .bed payload length.")
-    lookup = _DECODE_LOOKUP_A1 if count_a1 else _DECODE_LOOKUP_A2
-
-    # Multi-threaded chunked decode for large batches: the per-variant work is
-    # pure-numpy bit manipulation that releases the GIL, so a thread pool
-    # gives near-linear speed-up. With one batch's intermediates running ~3-7
-    # GB (codes table + lookup result), chunking also keeps the working set
-    # closer to last-level cache size and reduces allocator pressure.
-    # AoU PLINK array: variant_count≈6,435 → 16 chunks of ~400 variants each
-    # decode in parallel; per-batch wall drops from ~25 s single-threaded to a
-    # few seconds on a 16-core VM. The threshold below avoids thread overhead
-    # on the per-variant read path (variant_count==1 hit by the gather branch
-    # of _read_int8_matrix).
-    if variant_count >= _DECODE_PARALLEL_THRESHOLD:
-        n_workers = min(os.cpu_count() or 1, _DECODE_MAX_WORKERS)
-        if n_workers > 1:
-            chunk_size = max((variant_count + n_workers - 1) // n_workers, _DECODE_MIN_CHUNK)
-            chunk_starts = list(range(0, variant_count, chunk_size))
-            chunks = [
-                (start, min(start + chunk_size, variant_count))
-                for start in chunk_starts
-            ]
-            # F-order matches the read.dtype="int8" order="F" contract that
-            # the caller eventually enforces via np.asfortranarray, AND lets
-            # each chunk's `.T`-of-C-order RHS land in a contiguous LHS
-            # column-slice — without it the slice assignment pays a stride
-            # transpose on every chunk (millions of cache-line-strided
-            # writes), which can dominate wall time when each chunk produces
-            # ~180 MB of output.
-            output = np.empty((iid_count, variant_count), dtype=np.int8, order="F")
-
-            def _decode_chunk(span: tuple[int, int]) -> None:
-                start, end = span
-                chunk_packed = raw_bytes[
-                    start * bytes_per_variant : end * bytes_per_variant
-                ].reshape(end - start, bytes_per_variant)
-                chunk_codes = np.empty(
-                    (end - start, bytes_per_variant * 4), dtype=np.uint8
-                )
-                chunk_codes[:, 0::4] = chunk_packed & 0b11
-                chunk_codes[:, 1::4] = (chunk_packed >> 2) & 0b11
-                chunk_codes[:, 2::4] = (chunk_packed >> 4) & 0b11
-                chunk_codes[:, 3::4] = (chunk_packed >> 6) & 0b11
-                output[:, start:end] = lookup[chunk_codes][:, :iid_count].T
-
-            with ThreadPoolExecutor(max_workers=n_workers) as executor:
-                # Force the iterator to exhaust so all futures run + propagate
-                # exceptions (executor.map is lazy).
-                for _ in executor.map(_decode_chunk, chunks):
-                    pass
-            return output
 
     packed = raw_bytes.reshape(variant_count, bytes_per_variant)
-    codes = np.empty((variant_count, bytes_per_variant * 4), dtype=np.uint8)
-    codes[:, 0::4] = packed & 0b11
-    codes[:, 1::4] = (packed >> 2) & 0b11
-    codes[:, 2::4] = (packed >> 4) & 0b11
-    codes[:, 3::4] = (packed >> 6) & 0b11
-    return lookup[codes][:, :iid_count].T
+    lut = _BYTE_DECODE_LUT_A1 if count_a1 else _BYTE_DECODE_LUT_A2
+    # lut[packed] → (variant_count, bytes_per_variant, 4) int8. One alloc,
+    # one indexing op. Reshape collapses the last two axes back into a flat
+    # padded-sample axis; the .T returns the F-order view the caller wants.
+    decoded = lut[packed]  # noqa: E501 — main allocation
+    return decoded.reshape(variant_count, bytes_per_variant * 4)[:, :iid_count].T
 
 
 def _encode_variant(column: np.ndarray, *, bytes_per_variant: int) -> bytes:
