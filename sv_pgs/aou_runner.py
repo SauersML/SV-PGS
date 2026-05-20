@@ -651,11 +651,11 @@ def run_all_of_us(
     output_base: str,
     variant_metadata_path: str | Path | None = None,
     n_pcs: int = 10,
-    max_outer_iterations: int = 40,
+    max_outer_iterations: int = 20,
     random_seed: int = 0,
     variants: str = "snp+sv",
     test_fraction: float = 0.2,
-    marginal_screen_min_abs_z: float = 1.0,
+    marginal_screen_min_abs_z: float = 1.5,
 ) -> None:
     """Full AoU pipeline: download requested chromosomes, merge them, and run one fit.
 
@@ -678,11 +678,10 @@ def run_all_of_us(
     `marginal_screen_min_abs_z` is a univariate marginal-|z| floor applied
     after the MAF filter and before the joint Bayesian fit. Variants with
     |z| below this threshold (residualized on covariates; null distribution
-    ~ N(0,1)) are dropped. The default 1.0 drops ~32% of pure-noise variants
-    on biobank-scale data, typically cutting the joint matrix to fit a 16 GB
-    GPU so the deterministic CAVI path runs (≈ 10× faster than the
-    stochastic-block fallback) and removing noise that hurts held-out AUC.
-    Set to 0.0 to disable; 1.5 or 2.0 for tighter screening.
+    ~ N(0,1)) are dropped. The default 1.5 drops most pure-noise variants
+    on biobank-scale data, often cutting the joint matrix enough to fit on
+    GPU and avoiding the stochastic-block fallback. Set to 0.0 to disable;
+    use 2.0 for an even tighter screen.
     """
     variants = _normalize_variants_choice(variants)
     chromosomes = _validate_aou_chromosomes(chromosomes)

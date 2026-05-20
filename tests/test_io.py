@@ -1262,6 +1262,14 @@ def test_multi_source_precomputed_stats_still_dedupes_plink_variants(
 ):
     vcf_path = tmp_path / "chr1.vcf.gz"
     bed_path = tmp_path / "arrays.bed"
+    # PLINK1 magic (6c 1b 01) + 2 variants × 1 byte/variant for 2 samples.
+    # Per-variant byte layout (LSB-first, 2 bits per sample, 00=homA, 11=homB).
+    # variant 0: s0=00 (homA), s1=11 (homB) → 0b00_00_11_00 = 0x0c
+    # variant 1: s0=11 (homB), s1=00 (homA) → 0b00_00_00_11 = 0x03
+    # The precomputed-stats branch ignores the decoded values (precomputed
+    # wins at concatenation), but io now also tees an int8 cache, which
+    # requires the .bed to actually exist and parse.
+    bed_path.write_bytes(bytes.fromhex("6c 1b 01 0c 03"))
     bed_path.with_suffix(".fam").write_text(
         "\n".join(
             [

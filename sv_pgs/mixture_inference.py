@@ -550,6 +550,7 @@ class _SampleSpaceCGLanczosRecorder:
 # Fields that affect convergence speed but not the mathematical model result.
 # Changing these should NOT invalidate EM checkpoints.
 _CHECKPOINT_EXCLUDED_CONFIG_FIELDS = frozenset({
+    "max_outer_iterations",
     "stochastic_variant_batch_size",
     "stochastic_step_offset",
     "stochastic_step_exponent",
@@ -710,17 +711,16 @@ def _covariates_only_fit_result(
 
     validation_history: list[float] = []
     if validation_data is not None:
-        validation_history.append(
-            _validation_metric(
-                trait_type=trait_type,
-                genotype_matrix=validation_data[0],
-                covariate_matrix=validation_data[1],
-                targets=validation_data[2],
-                alpha=alpha,
-                beta=beta,
-                predictor_offset=validation_offset,
-            )
+        validation_metric, _validation_linear_predictor_value = _validation_evaluation(
+            trait_type=trait_type,
+            genotype_matrix=validation_data[0],
+            covariate_matrix=validation_data[1],
+            targets=validation_data[2],
+            alpha=alpha,
+            beta=beta,
+            predictor_offset=validation_offset,
         )
+        validation_history.append(validation_metric)
 
     return VariationalFitResult(
         alpha=np.asarray(alpha, dtype=np.float32),
@@ -1921,6 +1921,8 @@ def fit_variational_em(
                     scale_penalty=scale_penalty,
                 )
             )
+            validation_linear_predictor: np.ndarray | None = None
+            validation_metric_this_epoch: float | None = None
             if validation_payload is not None:
                 should_validate = (
                     outer_iteration == 0
@@ -1928,7 +1930,7 @@ def fit_variational_em(
                     or outer_iteration + 1 == config.max_outer_iterations
                 )
                 if should_validate:
-                    validation_metric = _validation_metric(
+                    validation_metric, validation_linear_predictor = _validation_evaluation(
                         trait_type=config.trait_type,
                         genotype_matrix=validation_payload[0],
                         covariate_matrix=validation_payload[1],
@@ -1937,6 +1939,7 @@ def fit_variational_em(
                         beta=beta_state,
                         predictor_offset=validation_offset_array,
                     )
+                    validation_metric_this_epoch = float(validation_metric)
                     validation_history.append(validation_metric)
                     # `validation_is_holdout_only` means the caller is using
                     # validation_data as a true held-out test set, so we must
@@ -1997,7 +2000,7 @@ def fit_variational_em(
             previous_objective = current_objective
             iter_num = outer_iteration + 1
             obj_str = f"{objective_history[-1]:.6f}" if objective_history else "N/A"
-            val_str = f"  val={validation_history[-1]:.6f}" if validation_history else ""
+            val_str = f"  val={validation_metric_this_epoch:.6f}" if validation_metric_this_epoch is not None else ""
             hyper_str = "  [+hyper]" if should_update_hyperparameters else ""
             variance_str = "  [beta_var]" if refresh_beta_variance else "  [beta_var=reuse]"
             nonzero_beta = int(np.count_nonzero(np.abs(beta_state) > 1e-8))
@@ -2014,9 +2017,7 @@ def fit_variational_em(
                 # — both already on host RAM. We copy to keep the callback
                 # safe from racing the next epoch's mutation.
                 #
-                # If validation_data is wired in, also compute the linear
-                # predictor on the reduced validation matrix HERE (where the
-                # tie-collapsed standardized genotype matrix is in scope) so
+                # If this epoch ran validation, reuse that linear predictor so
                 # the callback can derive richer metrics like AUC / accuracy
                 # from probabilities without re-touching genotype storage.
                 _epoch_snapshot: dict[str, Any] = {
@@ -2031,35 +2032,17 @@ def fit_variational_em(
                     "sigma_error2": float(sigma_error2),
                     "global_scale": float(global_scale),
                     "nonzero_beta": nonzero_beta,
-                    "validation_metric": (
-                        float(validation_history[-1]) if validation_history else None
-                    ),
+                    "validation_metric": validation_metric_this_epoch,
                     "alpha_reduced": np.asarray(alpha_state, dtype=np.float64).copy(),
                     "beta_reduced": np.asarray(beta_state, dtype=np.float64).copy(),
                 }
-                if validation_payload is not None:
-                    _val_geno = validation_payload[0]
-                    _val_cov = validation_payload[1]
-                    _val_targets = validation_payload[2]
-                    if isinstance(_val_geno, StandardizedGenotypeMatrix):
-                        _val_gen_component = _genotype_matvec_result_numpy(
-                            _val_geno,
-                            beta_state,
-                            batch_size=DEFAULT_GENOTYPE_BATCH_SIZE,
-                            dtype=np.float64,
-                        )
-                    else:
-                        _val_gen_component = np.asarray(_val_geno @ beta_state, dtype=np.float64)
-                    _val_offset = (
-                        np.zeros(_val_targets.shape[0], dtype=np.float64)
-                        if validation_offset_array is None
-                        else validation_offset_array
-                    )
-                    _val_linear_predictor = _val_offset + _val_gen_component + _val_cov @ alpha_state
+                if validation_linear_predictor is not None:
+                    _val_targets = validation_payload[2] if validation_payload is not None else None
                     _epoch_snapshot["validation_linear_predictor"] = np.asarray(
-                        _val_linear_predictor, dtype=np.float64
+                        validation_linear_predictor, dtype=np.float64
                     )
-                    _epoch_snapshot["validation_targets"] = np.asarray(_val_targets, dtype=np.float64)
+                    if _val_targets is not None:
+                        _epoch_snapshot["validation_targets"] = np.asarray(_val_targets, dtype=np.float64)
                 per_epoch_eval_callback(_epoch_snapshot)
             if checkpoint_callback is not None:
                 checkpoint_callback(_build_checkpoint(iter_num))
@@ -2071,7 +2054,7 @@ def fit_variational_em(
             # convergence; treat it as if no validation set was passed.
             validation_gates_convergence = bool(validation_history) and not validation_is_holdout_only
             if parameter_change < config.convergence_tolerance:
-                if validation_gates_convergence and len(validation_history) >= 2:
+                if validation_gates_convergence and validation_metric_this_epoch is not None and len(validation_history) >= 2:
                     validation_delta = abs(validation_history[-1] - validation_history[-2])
                     if validation_delta < config.convergence_tolerance:
                         log(f"  stochastic variational updates converged on epoch {outer_iteration + 1} with parameter_change={parameter_change:.3e} validation_delta={validation_delta:.3e}")
@@ -2167,6 +2150,8 @@ def fit_variational_em(
             objective_history.append(float(full_objective))
             log(f"  variational EM iteration {outer_iteration + 1}: objective={full_objective:.6f} sigma_e2={sigma_error2:.6f}")
 
+            validation_linear_predictor: np.ndarray | None = None
+            validation_metric_this_epoch: float | None = None
             if validation_payload is not None:
                 should_validate = (
                     outer_iteration == 0
@@ -2174,7 +2159,7 @@ def fit_variational_em(
                     or outer_iteration + 1 == config.max_outer_iterations
                 )
                 if should_validate:
-                    validation_metric = _validation_metric(
+                    validation_metric, validation_linear_predictor = _validation_evaluation(
                         trait_type=config.trait_type,
                         genotype_matrix=validation_payload[0],
                         covariate_matrix=validation_payload[1],
@@ -2183,6 +2168,7 @@ def fit_variational_em(
                         beta=beta_state,
                         predictor_offset=validation_offset_array,
                     )
+                    validation_metric_this_epoch = float(validation_metric)
                     validation_history.append(validation_metric)
                     # See SVI-path counterpart: don't let a true held-out
                     # test set drive best-epoch parameter selection.
@@ -2278,7 +2264,7 @@ def fit_variational_em(
 
             iter_num = outer_iteration + 1
             obj_str = f"{objective_history[-1]:.6f}" if objective_history else "N/A"
-            val_str = f"  val={validation_history[-1]:.6f}" if validation_history else ""
+            val_str = f"  val={validation_metric_this_epoch:.6f}" if validation_metric_this_epoch is not None else ""
             hyper_str = "  [+hyper]" if should_update_hyperparameters else ""
             variance_str = "  [beta_var]" if refresh_beta_variance else "  [beta_var=reuse]"
             nonzero_beta = int(np.count_nonzero(np.abs(beta_state) > 1e-8))
@@ -2292,7 +2278,7 @@ def fit_variational_em(
                 f"{val_str}{hyper_str}{variance_str}  mem={mem()}"
             )
             if per_epoch_eval_callback is not None:
-                per_epoch_eval_callback({
+                _epoch_snapshot = {
                     "epoch": iter_num,
                     "total_epochs": int(config.max_outer_iterations),
                     "objective": float(objective_history[-1]) if objective_history else None,
@@ -2304,12 +2290,17 @@ def fit_variational_em(
                     "sigma_error2": float(sigma_error2),
                     "global_scale": float(global_scale),
                     "nonzero_beta": nonzero_beta,
-                    "validation_metric": (
-                        float(validation_history[-1]) if validation_history else None
-                    ),
+                    "validation_metric": validation_metric_this_epoch,
                     "alpha_reduced": np.asarray(alpha_state, dtype=np.float64).copy(),
                     "beta_reduced": np.asarray(beta_state, dtype=np.float64).copy(),
-                })
+                }
+                if validation_linear_predictor is not None:
+                    _epoch_snapshot["validation_linear_predictor"] = np.asarray(
+                        validation_linear_predictor, dtype=np.float64
+                    )
+                    if validation_payload is not None:
+                        _epoch_snapshot["validation_targets"] = np.asarray(validation_payload[2], dtype=np.float64)
+                per_epoch_eval_callback(_epoch_snapshot)
             if checkpoint_callback is not None:
                 checkpoint_callback(_build_checkpoint(iter_num))
 
@@ -2317,7 +2308,7 @@ def fit_variational_em(
             # only and must not gate convergence.
             validation_gates_convergence = bool(validation_history) and not validation_is_holdout_only
             if parameter_change < config.convergence_tolerance:
-                if validation_gates_convergence and len(validation_history) >= 2:
+                if validation_gates_convergence and validation_metric_this_epoch is not None and len(validation_history) >= 2:
                     validation_delta = abs(validation_history[-1] - validation_history[-2])
                     if validation_delta < config.convergence_tolerance:
                         log(f"  variational EM converged on iteration {outer_iteration + 1} with parameter_change={parameter_change:.3e} validation_delta={validation_delta:.3e}")
@@ -9908,20 +9899,16 @@ def _relative_change(current_values: np.ndarray, previous_values: np.ndarray | N
     return float(np.linalg.norm(current_values - previous_values) / denominator)
 
 
-# Evaluate model performance on held-out validation data.
-# For binary traits: mean cross-entropy loss (lower = better predictions).
-# For quantitative traits: mean squared error (lower = better predictions).
-def _validation_metric(
-    trait_type: TraitType,
+def _validation_linear_predictor(
     genotype_matrix: StandardizedGenotypeMatrix | np.ndarray,
     covariate_matrix: np.ndarray,
-    targets: np.ndarray,
     alpha: np.ndarray,
     beta: np.ndarray,
-    predictor_offset: np.ndarray | None = None,
-) -> float:
+    predictor_offset: np.ndarray | None,
+    target_count: int,
+) -> np.ndarray:
     offset = (
-        np.zeros(len(targets), dtype=np.float64)
+        np.zeros(target_count, dtype=np.float64)
         if predictor_offset is None
         else np.asarray(predictor_offset, dtype=np.float64).reshape(-1)
     )
@@ -9934,7 +9921,14 @@ def _validation_metric(
         )
     else:
         genotype_component = np.asarray(genotype_matrix @ beta, dtype=np.float64)
-    linear_predictor = offset + genotype_component + covariate_matrix @ alpha
+    return np.asarray(offset + genotype_component + covariate_matrix @ alpha, dtype=np.float64)
+
+
+def _validation_metric_from_linear_predictor(
+    trait_type: TraitType,
+    targets: np.ndarray,
+    linear_predictor: np.ndarray,
+) -> float:
     if trait_type == TraitType.BINARY:
         positive_probability = np.asarray(stable_sigmoid(linear_predictor), dtype=np.float64)
         return float(
@@ -9945,6 +9939,33 @@ def _validation_metric(
         )
     residual_vector = targets - linear_predictor
     return float(np.mean(residual_vector * residual_vector))
+
+
+def _validation_evaluation(
+    trait_type: TraitType,
+    genotype_matrix: StandardizedGenotypeMatrix | np.ndarray,
+    covariate_matrix: np.ndarray,
+    targets: np.ndarray,
+    alpha: np.ndarray,
+    beta: np.ndarray,
+    predictor_offset: np.ndarray | None = None,
+) -> tuple[float, np.ndarray]:
+    linear_predictor = _validation_linear_predictor(
+        genotype_matrix=genotype_matrix,
+        covariate_matrix=covariate_matrix,
+        alpha=alpha,
+        beta=beta,
+        predictor_offset=predictor_offset,
+        target_count=len(targets),
+    )
+    return (
+        _validation_metric_from_linear_predictor(
+            trait_type=trait_type,
+            targets=targets,
+            linear_predictor=linear_predictor,
+        ),
+        linear_predictor,
+    )
 
 
 # Adjust the intercept so that the model's average predicted prevalence

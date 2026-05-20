@@ -63,9 +63,9 @@ def run_training_pipeline(
     # When a test_dataset is provided we route it into model.fit() twice:
     #   - as validation_data: the EM loop already prepares a standardized,
     #     tie-collapsed reduced view of it and computes a cross-entropy /
-    #     MSE scalar per epoch (added to validation_history).
+    #     MSE scalar on validation epochs (added to validation_history).
     #   - via per_epoch_eval_callback: the EM loop ALSO passes us the raw
-    #     linear predictor on that same reduced view at every epoch boundary,
+    #     linear predictor on that same reduced view at validation epochs,
     #     so we can derive AUC / log-loss / accuracy / R² / RMSE and append
     #     a row to training_history.tsv as the fit progresses.
     #

@@ -876,6 +876,21 @@ class BayesianPGS:
                     log(f"  local tmpdir cache ready  mem={mem()}")
             if not local_cache:
                 log(f"  no materialization possible — streaming from mmap  mem={mem()}")
+        if reduced_validation is not None:
+            validation_genotype_matrix = reduced_validation[0]
+            if isinstance(validation_genotype_matrix, StandardizedGenotypeMatrix):
+                log(f"materializing validation genotype matrix ({validation_genotype_matrix.shape})...")
+                validation_in_memory = validation_genotype_matrix.try_materialize_gpu()
+                if validation_in_memory:
+                    log(f"  validation GPU materialization succeeded  mem={mem()}")
+                if not validation_in_memory:
+                    validation_in_memory = validation_genotype_matrix.try_materialize()
+                    if validation_in_memory:
+                        log(f"  validation RAM materialization succeeded  mem={mem()}")
+                if validation_in_memory:
+                    validation_genotype_matrix.release_raw_storage()
+                else:
+                    log(f"  validation matrix remains streaming  mem={mem()}")
         if fit_stage_cache_paths is not None and int(self.config.sample_space_preconditioner_rank) > 0:
             log("  restoring preconditioner basis cache...")
             _try_restore_sample_space_basis_cache(
@@ -887,6 +902,7 @@ class BayesianPGS:
             log(f"  preconditioner cache restored  mem={mem()}")
         log(
             f"starting variational EM  max_iterations={self.config.max_outer_iterations}  "
+            f"validation_interval={self.config.validation_interval}  "
             f"reduced_matrix={reduced_genotypes.shape}  in_memory={in_memory}  "
             f"local_cache={local_cache or persistent_reduced_cache}  "
             f"on_gpu={reduced_genotypes._cupy_cache is not None}  "

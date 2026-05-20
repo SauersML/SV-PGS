@@ -5422,11 +5422,11 @@ def test_validation_restores_best_iterate(monkeypatch: pytest.MonkeyPatch):
             sigma_error2=1.0,
         )
 
-    def fake_validation_metric(trait_type, genotype_matrix, covariate_matrix, targets, alpha, beta, predictor_offset=None):
-        return float(beta[0])
+    def fake_validation_evaluation(trait_type, genotype_matrix, covariate_matrix, targets, alpha, beta, predictor_offset=None):
+        return float(beta[0]), np.zeros(targets.shape[0], dtype=np.float64)
 
     monkeypatch.setattr(mixture_inference, "_fit_collapsed_posterior", fake_fit_collapsed_posterior)
-    monkeypatch.setattr(mixture_inference, "_validation_metric", fake_validation_metric)
+    monkeypatch.setattr(mixture_inference, "_validation_evaluation", fake_validation_evaluation)
 
     config = ModelConfig(
         trait_type=TraitType.QUANTITATIVE,
@@ -5488,12 +5488,12 @@ def test_binary_validation_uses_calibrated_intercept(monkeypatch: pytest.MonkeyP
             sigma_error2=1.0,
         )
 
-    def fake_validation_metric(trait_type, genotype_matrix, covariate_matrix, targets, alpha, beta, predictor_offset=None):
+    def fake_validation_evaluation(trait_type, genotype_matrix, covariate_matrix, targets, alpha, beta, predictor_offset=None):
         validation_alphas.append(np.asarray(alpha, dtype=np.float64).copy())
-        return 0.0
+        return 0.0, np.zeros(targets.shape[0], dtype=np.float64)
 
     monkeypatch.setattr(mixture_inference, "_fit_collapsed_posterior", fake_fit_collapsed_posterior)
-    monkeypatch.setattr(mixture_inference, "_validation_metric", fake_validation_metric)
+    monkeypatch.setattr(mixture_inference, "_validation_evaluation", fake_validation_evaluation)
 
     config = ModelConfig(
         trait_type=TraitType.BINARY,

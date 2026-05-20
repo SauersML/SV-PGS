@@ -44,6 +44,35 @@ HYBRID_SPARSE_MIN_VARIANT_COUNT = 64
 REDUCED_INT8_CACHE_FREE_SPACE_RESERVE_BYTES = 64 * 1024 * 1024
 
 
+def _madvise_willneed_array(array: np.ndarray) -> None:
+    """Best-effort posix_madvise(WILLNEED) on the mmap backing `array`.
+
+    Tells the kernel we'll touch the whole int8 cache soon and to retain
+    those pages. Without this, per-block "uploading raw int8 genotypes to
+    GPU" runs at disk speed instead of RAM speed when pages get evicted
+    between training blocks under memory pressure.
+    """
+    posix_madvise = getattr(os, "posix_madvise", None)
+    willneed = getattr(os, "POSIX_MADV_WILLNEED", None)
+    if posix_madvise is None or willneed is None:
+        return
+    try:
+        import mmap as _mmap_module
+    except ImportError:
+        return
+    base = array
+    while getattr(base, "base", None) is not None:
+        base = base.base
+        if isinstance(base, _mmap_module.mmap):
+            break
+    if not isinstance(base, _mmap_module.mmap):
+        return
+    try:
+        posix_madvise(base, 0, len(base), willneed)
+    except (OSError, ValueError):
+        pass
+
+
 def as_raw_genotype_matrix(genotypes: RawGenotypeMatrix | np.ndarray) -> RawGenotypeMatrix:
     if isinstance(genotypes, RawGenotypeMatrix):
         return genotypes
@@ -248,9 +277,10 @@ class Int8RawGenotypeMatrix(RawGenotypeMatrix):
         safe_batch_size = max(int(batch_size), 1)
         for start_index in range(0, resolved_indices.shape[0], safe_batch_size):
             batch_indices = resolved_indices[start_index : start_index + safe_batch_size]
+            column_index = _contiguous_index_or_slice(batch_indices)
             yield RawGenotypeBatch(
                 variant_indices=batch_indices,
-                values=np.asarray(self.matrix[:, batch_indices], dtype=np.int8),
+                values=np.asarray(self.matrix[:, column_index], dtype=np.int8),
             )
 
     def iter_column_batches(
@@ -269,7 +299,8 @@ class Int8RawGenotypeMatrix(RawGenotypeMatrix):
         variant_indices: Sequence[int] | np.ndarray | None = None,
     ) -> np.ndarray:
         resolved_indices = _resolve_variant_indices(self.shape[1], variant_indices)
-        return _int8_batch_to_float32(self.matrix[:, resolved_indices])
+        column_index = _contiguous_index_or_slice(resolved_indices)
+        return _int8_batch_to_float32(self.matrix[:, column_index])
 
 
 @dataclass(slots=True)
@@ -2088,6 +2119,10 @@ class StandardizedGenotypeMatrix:
         if not _supports_int8_batches(self.raw):
             return False
         if isinstance(self.raw, Int8RawGenotypeMatrix):
+            # Already mmap-backed int8 (e.g. swapped in by io.py from a
+            # persisted PLINK int8 cache). Hint the kernel to keep pages
+            # resident so per-block GPU uploads run at RAM speed.
+            _madvise_willneed_array(self.raw.matrix)
             return True
         batch_size = auto_batch_size_i8(self.shape[0])
         selected_variant_count = int(self.variant_indices.shape[0])
@@ -2120,7 +2155,9 @@ class StandardizedGenotypeMatrix:
                 column_batches=_column_batches(),
                 fortran_order=True,
             )
-            rebased_raw = Int8RawGenotypeMatrix(np.load(cache_path, mmap_mode="r"))
+            cache_mmap = np.load(cache_path, mmap_mode="r")
+            _madvise_willneed_array(cache_mmap)
+            rebased_raw = Int8RawGenotypeMatrix(cache_mmap)
             self.raw = rebased_raw
             self.means = np.asarray(self.means[self.variant_indices], dtype=np.float32)
             self.scales = np.asarray(self.scales[self.variant_indices], dtype=np.float32)
@@ -2178,7 +2215,9 @@ class StandardizedGenotypeMatrix:
                 fortran_order=True,
             )
             temp_path.replace(cache_path)
-            persisted_raw = Int8RawGenotypeMatrix(np.load(cache_path, mmap_mode="r"))
+            persisted_mmap = np.load(cache_path, mmap_mode="r")
+            _madvise_willneed_array(persisted_mmap)
+            persisted_raw = Int8RawGenotypeMatrix(persisted_mmap)
             self.raw = persisted_raw
             self.means = np.asarray(self.means[self.variant_indices], dtype=np.float32)
             self.scales = np.asarray(self.scales[self.variant_indices], dtype=np.float32)
@@ -2992,7 +3031,8 @@ def _read_int8_columns_one_shot(
     if resolved_indices.size == 0:
         return np.empty((raw.shape[0], 0), dtype=np.int8, order="F")
     if isinstance(raw, Int8RawGenotypeMatrix):
-        return np.asfortranarray(raw.matrix[:, resolved_indices], dtype=np.int8)
+        column_index = _contiguous_index_or_slice(resolved_indices)
+        return np.asfortranarray(raw.matrix[:, column_index], dtype=np.int8)
     if isinstance(raw, PlinkRawGenotypeMatrix):
         reader = raw._bed_reader()
         return np.asfortranarray(raw._read_batch_i8(reader, resolved_indices), dtype=np.int8)

@@ -210,9 +210,9 @@ def test_runtime_tuned_config_caps_stochastic_batch_work_on_large_cohort(monkeyp
 
     tuned_config, summary = _runtime_tuned_config_for_fit(config, raw_genotypes)
 
-    assert tuned_config.stochastic_variant_batch_size == 2_474
+    assert tuned_config.stochastic_variant_batch_size == 6_998
     assert summary is not None
-    assert "stochastic_variant_batch_size=8192->2474" in summary
+    assert "stochastic_variant_batch_size=8192->6998" in summary
 
 
 def test_fit_stage_structure_cache_key_is_shared_across_traits(monkeypatch):

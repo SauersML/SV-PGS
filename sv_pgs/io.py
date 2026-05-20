@@ -944,14 +944,32 @@ def load_multi_source_dataset_from_files(
                 # pass to build it. Either way the precomputed stats win at the
                 # concatenation step — the stats we compute here are discarded.
                 int8_path_existing = _plink_int8_cache_path(path, keep_indices, config)
-                plink_int8_cache_path: Path | None
+                plink_int8_cache_path: Path | None = None
+                int8_view: np.ndarray | None = None
+                # Try the existing cache first. exists() alone isn't enough —
+                # a prior aborted run can leave a present-but-unreadable file
+                # that silently fails open_memmap, which previously left the
+                # source as PlinkRawGenotypeMatrix and made every per-epoch
+                # validation pass re-decode the .bed (~14 min/epoch wasted).
+                # Now: if open fails, unlink the bad file and rebuild.
                 if int8_path_existing.exists():
-                    log(
-                        f"  reusing precomputed variant statistics for {path.name} "
-                        f"(skipping PLINK streaming pass); int8 cache present"
-                    )
-                    plink_int8_cache_path = int8_path_existing
-                else:
+                    int8_view = _open_plink_int8_cache_for_read(int8_path_existing)
+                    if int8_view is not None:
+                        log(
+                            f"  reusing precomputed variant statistics for {path.name} "
+                            f"(skipping PLINK streaming pass); int8 cache present"
+                        )
+                        plink_int8_cache_path = int8_path_existing
+                    else:
+                        log(
+                            f"  PLINK int8 cache at {int8_path_existing.name} present but "
+                            f"unreadable; removing and rebuilding for {path.name}"
+                        )
+                        try:
+                            int8_path_existing.unlink()
+                        except OSError as exc:
+                            log(f"  could not remove stale int8 cache ({exc!r}); will recompute anyway")
+                if int8_view is None:
                     log(
                         f"  reusing precomputed variant statistics for {path.name} "
                         f"but building int8 mmap cache so per-epoch test passes can mmap instead of bed-decode..."
@@ -962,15 +980,15 @@ def load_multi_source_dataset_from_files(
                         sample_indices=keep_indices,
                         config=config,
                     )
-                if plink_int8_cache_path is not None:
-                    int8_view = _open_plink_int8_cache_for_read(plink_int8_cache_path)
-                    if int8_view is not None:
-                        log(
-                            f"  swapping PLINK source to int8 mmap "
-                            f"({int8_view.shape[0]:,} × {int8_view.shape[1]:,}) — "
-                            "downstream passes skip bed-decode entirely"
-                        )
-                        raw = as_raw_genotype_matrix(int8_view)
+                    if plink_int8_cache_path is not None:
+                        int8_view = _open_plink_int8_cache_for_read(plink_int8_cache_path)
+                if int8_view is not None:
+                    log(
+                        f"  swapping PLINK source to int8 mmap "
+                        f"({int8_view.shape[0]:,} × {int8_view.shape[1]:,}) — "
+                        "downstream passes skip bed-decode entirely"
+                    )
+                    raw = as_raw_genotype_matrix(int8_view)
                 stats = VariantStatistics(
                     means=np.empty(0, dtype=np.float32),
                     scales=np.empty(0, dtype=np.float32),
@@ -1631,10 +1649,43 @@ def _open_plink_int8_cache_for_read(int8_path: Path) -> np.ndarray | None:
     if not int8_path.exists():
         return None
     try:
-        return np.lib.format.open_memmap(int8_path, mode="r")
+        view = np.lib.format.open_memmap(int8_path, mode="r")
     except (OSError, ValueError, EOFError) as exc:
         log(f"  PLINK int8 cache at {int8_path.name} unreadable ({exc!r}); will recompute")
         return None
+    # Hint the kernel to pre-fault and retain pages: avoids per-block 3s
+    # "upload" times that are really disk-read masquerading as H2D when
+    # mmap pages get evicted under memory pressure between training blocks.
+    _madvise_willneed(view)
+    return view
+
+
+def _madvise_willneed(array: np.ndarray) -> None:
+    """Best-effort posix_madvise(WILLNEED) on the backing mmap of `array`.
+
+    No-op on systems without posix_madvise or on non-mmap arrays. Failures
+    are silent — this is a hint, not a correctness requirement.
+    """
+    posix_madvise = getattr(os, "posix_madvise", None)
+    willneed = getattr(os, "POSIX_MADV_WILLNEED", None)
+    if posix_madvise is None or willneed is None:
+        return
+    base = array
+    while getattr(base, "base", None) is not None:
+        base = base.base
+    mmap_obj = base if hasattr(base, "size") and hasattr(base, "read") else None
+    try:
+        import mmap as _mmap_module
+        if isinstance(base, _mmap_module.mmap):
+            mmap_obj = base
+    except ImportError:
+        return
+    if mmap_obj is None:
+        return
+    try:
+        posix_madvise(mmap_obj, 0, len(mmap_obj), willneed)
+    except (OSError, ValueError):
+        pass
 
 
 def compute_plink_variant_statistics_cached(

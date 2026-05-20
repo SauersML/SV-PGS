@@ -51,19 +51,19 @@ def build_parser() -> argparse.ArgumentParser:
         help="Optional CSV or TSV keyed by variant_id. Every non-reserved column is used as a prior annotation.",
     )
     aou_run_parser.add_argument("--n-pcs", type=int, default=10, help="Number of genomic PCs to include (default: 10).")
-    aou_run_parser.add_argument("--max-outer-iterations", type=int, default=40)
+    aou_run_parser.add_argument("--max-outer-iterations", type=int, default=20)
     aou_run_parser.add_argument("--random-seed", type=int, default=0)
     aou_run_parser.add_argument(
         "--marginal-screen-min-abs-z",
         type=float,
-        default=1.0,
+        default=1.5,
         help=(
             "Univariate |z| pre-screen threshold (residualized on covariates; "
             "null distribution ~ N(0, 1)). After the MAF filter, variants below "
             "this threshold are dropped before the joint Bayesian fit. Default "
-            "1.0 cuts the noise tail in half on biobank-scale data so the joint "
-            "matrix fits on a 16 GB GPU and the deterministic CAVI path runs. "
-            "Set to 0 to disable, 1.5 or 2.0 for tighter screening."
+            "1.5 drops most null variants on biobank-scale data so the joint "
+            "matrix is much more likely to fit on GPU. "
+            "Set to 0 to disable, or 2.0 for tighter screening."
         ),
     )
     aou_run_parser.add_argument(
@@ -131,7 +131,7 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     run_parser.add_argument("--output-dir", required=True, help="Directory for artifact and result tables.")
-    run_parser.add_argument("--max-outer-iterations", type=int, default=40)
+    run_parser.add_argument("--max-outer-iterations", type=int, default=20)
     run_parser.add_argument("--random-seed", type=int, default=0)
     run_parser.add_argument(
         "--marginal-screen-min-abs-z",
