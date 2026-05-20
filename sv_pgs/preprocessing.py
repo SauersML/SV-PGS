@@ -62,15 +62,16 @@ _HARD_CALL_SIGN_FLIPPED_SIGNATURE_LUT = np.asarray(
 def _batch_all_stats_i8(batch_i8: jnp.ndarray) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray]:
     """Compute per-variant statistics from int8 genotypes."""
     mask = batch_i8 != PLINK_MISSING_INT8
-    values_f32 = jnp.where(mask, batch_i8.astype(jnp.float32), 0.0)
-    sums = jnp.sum(values_f32, axis=0, dtype=jnp.float64)
     counts = jnp.sum(mask, axis=0, dtype=jnp.int32)
-    support = jnp.sum(mask & (batch_i8 > 0), axis=0, dtype=jnp.int32)
-    safe_counts = jnp.maximum(counts, 1).astype(jnp.float32)
-    means_f32 = (sums / safe_counts.astype(jnp.float64)).astype(jnp.float32)
-    imputed = jnp.where(mask, values_f32, means_f32[None, :])
-    centered = imputed - means_f32[None, :]
-    css = jnp.sum(centered * centered, axis=0, dtype=jnp.float64)
+    heterozygous = jnp.sum(batch_i8 == 1, axis=0, dtype=jnp.int32)
+    alternate_homozygous = jnp.sum(batch_i8 == 2, axis=0, dtype=jnp.int32)
+    support = heterozygous + alternate_homozygous
+    sums_i32 = heterozygous + 2 * alternate_homozygous
+    sum_squares_i32 = heterozygous + 4 * alternate_homozygous
+    sums = sums_i32.astype(jnp.float64)
+    safe_counts = jnp.maximum(counts, 1).astype(jnp.float64)
+    css = sum_squares_i32.astype(jnp.float64) - (sums * sums / safe_counts)
+    css = jnp.where(counts > 0, jnp.maximum(css, 0.0), 0.0)
     return sums, counts, support, css
 
 

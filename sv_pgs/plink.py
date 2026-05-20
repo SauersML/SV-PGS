@@ -175,8 +175,7 @@ class open_bed:
         sample_index, variant_index = _split_index(index)
         resolved_samples = _normalize_index(sample_index, self.iid_count)
         resolved_variants = _normalize_index(variant_index, self.sid_count)
-        raw_i8 = self._read_int8_matrix(resolved_variants)
-        raw_i8 = raw_i8[resolved_samples, :]
+        raw_i8 = self._read_int8_matrix(resolved_variants, sample_index=resolved_samples)
 
         resolved_dtype = np.dtype(dtype)
         if resolved_dtype == np.dtype(np.int8):
@@ -188,12 +187,27 @@ class open_bed:
             return np.asfortranarray(result)
         return np.ascontiguousarray(result)
 
-    def _read_int8_matrix(self, variant_index: slice | np.ndarray) -> np.ndarray:
+    def _read_int8_matrix(
+        self,
+        variant_index: slice | np.ndarray,
+        *,
+        sample_index: slice | np.ndarray | None = None,
+    ) -> np.ndarray:
         bytes_per_variant = _bytes_per_variant(self.iid_count)
+        if sample_index is None:
+            resolved_sample_index: slice | np.ndarray = slice(0, self.iid_count, 1)
+        else:
+            resolved_sample_index = sample_index
+        sample_slice = resolved_sample_index if isinstance(resolved_sample_index, slice) else None
         if isinstance(variant_index, slice):
             variant_count = max(variant_index.stop - variant_index.start, 0)
             if variant_count == 0:
-                return np.empty((self.iid_count, 0), dtype=np.int8)
+                sample_count = (
+                    _sample_slice_parameters(sample_slice, self.iid_count).sample_count
+                    if sample_slice is not None
+                    else int(np.asarray(resolved_sample_index, dtype=np.intp).shape[0])
+                )
+                return np.empty((sample_count, 0), dtype=np.int8)
             # mmap-backed slice: zero-copy view of the relevant bytes. The
             # decoder reads from this view directly (np.frombuffer wraps a
             # numpy array as buffer for free). The previous open/seek/read
@@ -202,13 +216,74 @@ class open_bed:
             mmap_bytes = self._bytes_view()
             start_offset = PLINK1_HEADER_SIZE + variant_index.start * bytes_per_variant
             payload = mmap_bytes[start_offset : start_offset + variant_count * bytes_per_variant]
-            return _decode_payload(
+            if sample_slice is not None:
+                return _decode_payload_sample_slice(
+                    payload,
+                    iid_count=self.iid_count,
+                    variant_count=variant_count,
+                    bytes_per_variant=bytes_per_variant,
+                    sample_slice=sample_slice,
+                    count_a1=self.count_A1,
+                )
+            if isinstance(resolved_sample_index, np.ndarray):
+                return _decode_payload_sample_indices(
+                    payload,
+                    iid_count=self.iid_count,
+                    variant_count=variant_count,
+                    bytes_per_variant=bytes_per_variant,
+                    sample_indices=resolved_sample_index,
+                    count_a1=self.count_A1,
+                )
+            full = _decode_payload(
                 payload,
                 iid_count=self.iid_count,
                 variant_count=variant_count,
                 bytes_per_variant=bytes_per_variant,
                 count_a1=self.count_A1,
             )
+            return full[resolved_sample_index, :]
+
+        if isinstance(resolved_sample_index, np.ndarray):
+            sample_indices = np.asarray(resolved_sample_index, dtype=np.intp)
+            if sample_indices.size == 0:
+                return np.empty((0, variant_index.shape[0]), dtype=np.int8)
+            result = np.empty((sample_indices.shape[0], variant_index.shape[0]), dtype=np.int8)
+            with Path(self.path).open("rb") as bed_handle:
+                for output_index, bed_variant_index in enumerate(variant_index):
+                    bed_handle.seek(PLINK1_HEADER_SIZE + int(bed_variant_index) * bytes_per_variant)
+                    payload = bed_handle.read(bytes_per_variant)
+                    result[:, output_index] = _decode_payload_sample_indices(
+                        payload,
+                        iid_count=self.iid_count,
+                        variant_count=1,
+                        bytes_per_variant=bytes_per_variant,
+                        sample_indices=sample_indices,
+                        count_a1=self.count_A1,
+                    )[:, 0]
+            return result
+
+        if sample_slice is not None:
+            params = _sample_slice_parameters(sample_slice, self.iid_count)
+            if params.sample_count == 0:
+                return np.empty((0, variant_index.shape[0]), dtype=np.int8)
+            result = np.empty((params.sample_count, variant_index.shape[0]), dtype=np.int8)
+            with Path(self.path).open("rb") as bed_handle:
+                for output_index, bed_variant_index in enumerate(variant_index):
+                    bed_handle.seek(
+                        PLINK1_HEADER_SIZE
+                        + int(bed_variant_index) * bytes_per_variant
+                        + params.byte_start
+                    )
+                    payload = bed_handle.read(params.byte_count)
+                    result[:, output_index] = _decode_sample_window_payload(
+                        payload,
+                        variant_count=1,
+                        byte_count=params.byte_count,
+                        sample_count=params.sample_count,
+                        leading_sample_offset=params.leading_sample_offset,
+                        count_a1=self.count_A1,
+                    )[:, 0]
+            return result
 
         result = np.empty((self.iid_count, variant_index.shape[0]), dtype=np.int8)
         with Path(self.path).open("rb") as bed_handle:
@@ -222,7 +297,7 @@ class open_bed:
                     bytes_per_variant=bytes_per_variant,
                     count_a1=self.count_A1,
                 )[:, 0]
-        return result
+        return result[resolved_sample_index, :]
 
 
 def _bytes_per_variant(sample_count: int) -> int:
@@ -266,6 +341,132 @@ def _normalize_index(index: Any, limit: int) -> slice | np.ndarray:
     if np.any(normalized < 0) or np.any(normalized >= limit):
         raise IndexError("PLINK index out of bounds.")
     return np.ascontiguousarray(normalized, dtype=np.intp)
+
+
+@dataclass(frozen=True, slots=True)
+class _SampleSliceParameters:
+    sample_count: int
+    byte_start: int
+    byte_count: int
+    leading_sample_offset: int
+
+
+def _sample_slice_parameters(sample_slice: slice, iid_count: int) -> _SampleSliceParameters:
+    start, stop, step = sample_slice.indices(iid_count)
+    if step != 1:
+        raise ValueError("PLINK sample slices must have step=1.")
+    sample_count = max(stop - start, 0)
+    if sample_count == 0:
+        return _SampleSliceParameters(
+            sample_count=0,
+            byte_start=0,
+            byte_count=0,
+            leading_sample_offset=0,
+        )
+    byte_start = start // 4
+    byte_stop = (stop + 3) // 4
+    return _SampleSliceParameters(
+        sample_count=sample_count,
+        byte_start=byte_start,
+        byte_count=byte_stop - byte_start,
+        leading_sample_offset=start % 4,
+    )
+
+
+def _decode_sample_window_payload(
+    payload: bytes | np.ndarray,
+    *,
+    variant_count: int,
+    byte_count: int,
+    sample_count: int,
+    leading_sample_offset: int,
+    count_a1: bool,
+) -> np.ndarray:
+    if sample_count == 0:
+        return np.empty((0, variant_count), dtype=np.int8)
+    if byte_count < 1:
+        raise ValueError("PLINK sample byte window must contain at least one byte.")
+    if leading_sample_offset < 0 or leading_sample_offset > 3:
+        raise ValueError("PLINK leading sample offset must be in [0, 3].")
+    if isinstance(payload, np.ndarray):
+        raw_bytes = np.ascontiguousarray(payload, dtype=np.uint8)
+    else:
+        raw_bytes = np.frombuffer(payload, dtype=np.uint8)
+    if raw_bytes.size != variant_count * byte_count:
+        raise ValueError("Unexpected PLINK 1 .bed sample-window payload length.")
+
+    packed = raw_bytes.reshape(variant_count, byte_count)
+    lut = _BYTE_DECODE_LUT_A1 if count_a1 else _BYTE_DECODE_LUT_A2
+    decoded = lut[packed].reshape(variant_count, byte_count * 4)
+    return decoded[:, leading_sample_offset : leading_sample_offset + sample_count].T
+
+
+def _decode_payload_sample_slice(
+    payload: bytes | np.ndarray,
+    *,
+    iid_count: int,
+    variant_count: int,
+    bytes_per_variant: int,
+    sample_slice: slice,
+    count_a1: bool,
+) -> np.ndarray:
+    params = _sample_slice_parameters(sample_slice, iid_count)
+    if params.sample_count == 0:
+        return np.empty((0, variant_count), dtype=np.int8)
+    if isinstance(payload, np.ndarray):
+        raw_bytes = np.asarray(payload, dtype=np.uint8)
+    else:
+        raw_bytes = np.frombuffer(payload, dtype=np.uint8)
+    if raw_bytes.size != variant_count * bytes_per_variant:
+        raise ValueError("Unexpected PLINK 1 .bed payload length.")
+    packed_window = raw_bytes.reshape(variant_count, bytes_per_variant)[
+        :, params.byte_start : params.byte_start + params.byte_count
+    ]
+    return _decode_sample_window_payload(
+        packed_window,
+        variant_count=variant_count,
+        byte_count=params.byte_count,
+        sample_count=params.sample_count,
+        leading_sample_offset=params.leading_sample_offset,
+        count_a1=count_a1,
+    )
+
+
+def _decode_payload_sample_indices(
+    payload: bytes | np.ndarray,
+    *,
+    iid_count: int,
+    variant_count: int,
+    bytes_per_variant: int,
+    sample_indices: np.ndarray,
+    count_a1: bool,
+) -> np.ndarray:
+    samples = np.asarray(sample_indices, dtype=np.intp)
+    if samples.ndim != 1:
+        raise ValueError("PLINK sample indices must be 1D.")
+    if samples.size == 0:
+        return np.empty((0, variant_count), dtype=np.int8)
+    if np.any(samples < 0) or np.any(samples >= iid_count):
+        raise IndexError("PLINK sample index out of bounds.")
+    if isinstance(payload, np.ndarray):
+        raw_bytes = np.asarray(payload, dtype=np.uint8)
+    else:
+        raw_bytes = np.frombuffer(payload, dtype=np.uint8)
+    if raw_bytes.size != variant_count * bytes_per_variant:
+        raise ValueError("Unexpected PLINK 1 .bed payload length.")
+
+    byte_indices = samples // 4
+    sample_offsets = samples % 4
+    packed_matrix = raw_bytes.reshape(variant_count, bytes_per_variant)
+    lut = _BYTE_DECODE_LUT_A1 if count_a1 else _BYTE_DECODE_LUT_A2
+    result = np.empty((samples.shape[0], variant_count), dtype=np.int8)
+    for offset in range(4):
+        output_positions = np.flatnonzero(sample_offsets == offset)
+        if output_positions.size == 0:
+            continue
+        packed = packed_matrix[:, byte_indices[output_positions]]
+        result[output_positions, :] = lut[np.ascontiguousarray(packed, dtype=np.uint8), offset].T
+    return result
 
 
 def _decode_payload(

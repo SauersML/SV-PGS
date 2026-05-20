@@ -1619,7 +1619,7 @@ def _compute_variant_stats_teeing_int8(
 ) -> VariantStatistics:
     """compute_variant_statistics + optional tee of each decoded batch to
     the supplied int8 mmap. Single bed-file pass; the mmap write is
-    ~3 GB sequential per batch and runs concurrently with the JAX
+    a sequential int8 block per batch and runs concurrently with the JAX
     compute on the previous batch via the standard prefetcher.
     """
     if int8_cache is None:

@@ -33,7 +33,7 @@ import sv_pgs.genotype as genotype_module
 import sv_pgs.io as io_module
 import sv_pgs.model as model_module
 import sv_pgs.pipeline as pipeline_module
-from sv_pgs.plink import to_bed
+from sv_pgs.plink import open_bed, to_bed
 from sv_pgs.pipeline import run_training_pipeline
 
 
@@ -686,6 +686,74 @@ def test_prepare_keep_sample_selector_collapses_full_and_contiguous_ranges():
     scattered = io_module._prepare_keep_sample_selector(np.array([1, 3, 4], dtype=np.intp), total_sample_count=8)
     assert isinstance(scattered, np.ndarray)
     np.testing.assert_array_equal(scattered, np.array([1, 3, 4], dtype=np.intp))
+
+
+def test_plink_reader_decodes_only_requested_samples(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    bed_path = tmp_path / "cohort.bed"
+    genotype_matrix = np.array(
+        [
+            [0.0, 1.0, 2.0, np.nan, 0.0],
+            [1.0, 2.0, 0.0, 1.0, np.nan],
+            [2.0, 0.0, 1.0, 2.0, 1.0],
+            [np.nan, 1.0, 2.0, 0.0, 2.0],
+            [0.0, np.nan, 1.0, 1.0, 0.0],
+            [1.0, 0.0, np.nan, 2.0, 1.0],
+            [2.0, 2.0, 0.0, np.nan, 2.0],
+        ],
+        dtype=np.float32,
+    )
+    to_bed(
+        bed_path,
+        genotype_matrix,
+        properties={
+            "fid": [f"f{i}" for i in range(genotype_matrix.shape[0])],
+            "iid": [f"s{i}" for i in range(genotype_matrix.shape[0])],
+            "sid": [f"v{i}" for i in range(genotype_matrix.shape[1])],
+        },
+    )
+
+    def fail_full_decode(*args, **kwargs):
+        raise AssertionError("sample-subset reads should not decode all samples")
+
+    monkeypatch.setattr("sv_pgs.plink._decode_payload", fail_full_decode)
+    reader = open_bed(bed_path, iid_count=genotype_matrix.shape[0], sid_count=genotype_matrix.shape[1])
+
+    observed = reader.read(index=(slice(1, 6), slice(1, 5)), dtype="int8", order="F")
+    expected_float = genotype_matrix[1:6, 1:5]
+    expected = np.where(
+        np.isnan(expected_float),
+        io_module.PLINK_MISSING_INT8,
+        expected_float,
+    ).astype(np.int8)
+
+    np.testing.assert_array_equal(observed, expected)
+
+    sample_indices = np.array([6, 0, 3, 5], dtype=np.intp)
+    observed_scattered = reader.read(index=(sample_indices, slice(0, 4)), dtype="int8", order="F")
+    expected_scattered_float = genotype_matrix[sample_indices, 0:4]
+    expected_scattered = np.where(
+        np.isnan(expected_scattered_float),
+        io_module.PLINK_MISSING_INT8,
+        expected_scattered_float,
+    ).astype(np.int8)
+
+    np.testing.assert_array_equal(observed_scattered, expected_scattered)
+
+    observed_variant_gather = reader.read(
+        index=(sample_indices, np.array([4, 0, 2], dtype=np.intp)),
+        dtype="int8",
+        order="F",
+    )
+    expected_variant_gather_float = genotype_matrix[
+        np.ix_(sample_indices, np.array([4, 0, 2], dtype=np.intp))
+    ]
+    expected_variant_gather = np.where(
+        np.isnan(expected_variant_gather_float),
+        io_module.PLINK_MISSING_INT8,
+        expected_variant_gather_float,
+    ).astype(np.int8)
+
+    np.testing.assert_array_equal(observed_variant_gather, expected_variant_gather)
 
 
 def test_record_gt_types_to_int8_subsets_before_mapping():

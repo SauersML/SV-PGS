@@ -32,6 +32,8 @@ BED_READER_TARGET_BATCH_BYTES = 500_000_000
 MIN_BED_READER_BATCH_SIZE = 32  # always read at least this many variants
 STANDARDIZED_STREAMING_TARGET_BATCH_BYTES = 128_000_000
 LOCAL_INT8_STANDARDIZED_STREAMING_TARGET_BATCH_BYTES = 512_000_000
+PLINK_INT8_PREFETCH_TARGET_BYTES = 1_100_000_000
+PLINK_INT8_MAX_PREFETCH_DEPTH = 2
 
 # If the reduced genotype matrix (after tie-group dedup) is smaller than 4 GB,
 # cache it in RAM.  This avoids re-reading from disk on every EM iteration
@@ -492,19 +494,18 @@ class PlinkRawGenotypeMatrix(RawGenotypeMatrix):
             yield RawGenotypeBatch(variant_indices=resolved_indices, values=values)
             return
 
-        # Prefetch deeper than 1 batch. On slow / networked storage (GCP
-        # persistent disk, NFS, anywhere the IO latency dominates the
-        # decode), keeping multiple outstanding read+decode operations in
-        # flight lets the kernel's read-ahead and the device's own
-        # parallelism actually run, instead of paying full round-trip
-        # latency for every batch. Each in-flight batch costs ~3 GB of
-        # peak RSS, so cap at 4 to stay well under typical 32-64 GB VMs.
+        # Keep one extra batch in flight so CPU decode can overlap with JAX
+        # stats, but cap queued int8 output near 1 GiB. Deeper prefetch turns
+        # into memory-bandwidth contention on large AoU PLINK batches.
         from collections import deque
         batch_index_list = [
             resolved_indices[s : s + safe_batch_size]
             for s in range(0, total, safe_batch_size)
         ]
-        prefetch_depth = min(4, len(batch_index_list))
+        batch_bytes = max(int(self.shape[0]) * int(safe_batch_size), 1)
+        memory_capped_depth = max(1, PLINK_INT8_PREFETCH_TARGET_BYTES // batch_bytes)
+        prefetch_depth = min(PLINK_INT8_MAX_PREFETCH_DEPTH, int(memory_capped_depth), len(batch_index_list))
+        log(f"    int8 prefetch depth={prefetch_depth} (~{batch_mb * prefetch_depth:.0f} MB queued)  mem={mem()}")
         with ThreadPoolExecutor(max_workers=prefetch_depth) as executor:
             in_flight: deque = deque(
                 executor.submit(self._read_batch_i8, reader, batch_index_list[i])
