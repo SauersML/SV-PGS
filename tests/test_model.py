@@ -811,6 +811,7 @@ def test_try_load_variational_checkpoint_accepts_legacy_checkpoint_pickle(tmp_pa
     )
     legacy_state = checkpoint.__getstate__()
     legacy_state.pop("binary_block_resume_state")
+    legacy_state.pop("stochastic_block_size")
 
     class _LegacyCheckpointPayload:
         def __reduce__(self):
@@ -824,6 +825,7 @@ def test_try_load_variational_checkpoint_accepts_legacy_checkpoint_pickle(tmp_pa
 
     assert restored is not None
     assert restored.binary_block_resume_state is None
+    assert restored.stochastic_block_size is None
     np.testing.assert_allclose(restored.alpha_state, checkpoint.alpha_state)
     np.testing.assert_allclose(restored.beta_state, checkpoint.beta_state)
     assert cache_paths.em_checkpoint_path.exists()

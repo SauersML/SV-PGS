@@ -464,6 +464,7 @@ class VariationalFitCheckpoint:
     reduced_second_moment: np.ndarray | None = None
     epoch_reduced_prior_variances: np.ndarray | None = None
     binary_block_resume_state: dict[str, object] | None = None
+    stochastic_block_size: int | None = None
 
     def __getstate__(self) -> dict[str, object]:
         return {
@@ -793,13 +794,14 @@ def _stochastic_binary_newton_iterations(
     *,
     maximum_iterations: int,
     step_size: float,
+    compute_beta_variance: bool = False,
 ) -> int:
     if maximum_iterations < 1:
         raise ValueError("maximum_iterations must be positive.")
-    # Stochastic sweeps revisit every block next epoch, so one Fisher-scoring
-    # solve gives the fastest global progress per GPU upload. Extra Newton
-    # refinements spend more time polishing stale block conditionals than they
-    # save in outer epochs.
+    if compute_beta_variance:
+        return 1
+    if float(step_size) >= 0.75:
+        return min(int(maximum_iterations), 2)
     return 1
 
 
@@ -811,11 +813,11 @@ def _should_update_hyperparameters_this_iteration(
 ) -> bool:
     return (
         config.update_hyperparameters
-        and int(iteration_number) >= 4
+        and int(iteration_number) >= 2
         and (
             (
                 int(iteration_number) < int(config.max_outer_iterations)
-                and int(iteration_number) % 4 == 0
+                and int(iteration_number) % 2 == 0
             )
             or (
                 int(iteration_number) == int(config.max_outer_iterations)
@@ -1125,6 +1127,7 @@ def fit_variational_em(
         reduced_second_moment_override: np.ndarray | None = None,
         epoch_reduced_prior_variances_override: np.ndarray | None = None,
         binary_block_resume_state_override: dict[str, object] | None = None,
+        stochastic_block_size_override: int | None = None,
     ) -> VariationalFitCheckpoint:
         return VariationalFitCheckpoint(
             config_signature=config_signature,
@@ -1163,6 +1166,9 @@ def fit_variational_em(
             reduced_second_moment=_copy_optional(reduced_second_moment_override),
             epoch_reduced_prior_variances=_copy_optional(epoch_reduced_prior_variances_override),
             binary_block_resume_state=_copy_binary_block_resume_state(binary_block_resume_state_override),
+            stochastic_block_size=(
+                None if stochastic_block_size_override is None else int(stochastic_block_size_override)
+            ),
         )
 
     def _initialize_em_state() -> None:
@@ -1301,24 +1307,45 @@ def fit_variational_em(
     final_objective_change: float | None = None
     final_hyperparameter_change: float | None = None
     if use_stochastic_updates:
-        block_size = min(int(config.stochastic_variant_batch_size), int(genotype_matrix.shape[1]))
-        block_count = max((int(genotype_matrix.shape[1]) + block_size - 1) // block_size, 1)
+        configured_block_size = min(int(config.stochastic_variant_batch_size), int(genotype_matrix.shape[1]))
         resume_completed_blocks_in_iteration = (
             0
             if resume_checkpoint is None
             else int(resume_checkpoint.completed_blocks_in_iteration)
         )
-        if resume_completed_blocks_in_iteration < 0 or resume_completed_blocks_in_iteration >= block_count:
-            if not (resume_completed_blocks_in_iteration == 0 and block_count == 1):
-                raise ValueError("resume checkpoint completed_blocks_in_iteration is out of range.")
-        resume_beta_variance_state = None
-        resume_reduced_second_moment = None
-        resume_epoch_reduced_prior_variances = None
         resume_binary_block_state = (
             None
             if resume_checkpoint is None
             else _copy_binary_block_resume_state(resume_checkpoint.binary_block_resume_state)
         )
+        checkpoint_block_size = (
+            None if resume_checkpoint is None else resume_checkpoint.stochastic_block_size
+        )
+        block_size = configured_block_size
+        if (
+            resume_checkpoint is not None
+            and (resume_completed_blocks_in_iteration > 0 or resume_binary_block_state is not None)
+            and checkpoint_block_size is not None
+            and int(checkpoint_block_size) > 0
+            and int(checkpoint_block_size) != configured_block_size
+        ):
+            block_size = min(int(checkpoint_block_size), int(genotype_matrix.shape[1]))
+            log(
+                "  variational EM: resuming partial stochastic epoch with checkpoint block size "
+                + f"{block_size}; new block size {configured_block_size} will apply after this epoch"
+            )
+        block_count = max((int(genotype_matrix.shape[1]) + block_size - 1) // block_size, 1)
+        if resume_completed_blocks_in_iteration < 0 or resume_completed_blocks_in_iteration >= block_count:
+            if not (resume_completed_blocks_in_iteration == 0 and block_count == 1):
+                log(
+                    "  variational EM: checkpoint block progress is incompatible with current block policy; "
+                    "restarting the current stochastic epoch from block 1"
+                )
+                resume_completed_blocks_in_iteration = 0
+                resume_binary_block_state = None
+        resume_beta_variance_state = None
+        resume_reduced_second_moment = None
+        resume_epoch_reduced_prior_variances = None
         if resume_completed_blocks_in_iteration > 0 or resume_binary_block_state is not None:
             if resume_checkpoint is None:
                 raise ValueError("resume checkpoint block progress requires checkpoint state.")
@@ -1679,6 +1706,7 @@ def fit_variational_em(
                                     "block_indices": np.asarray(block_indices, dtype=np.int32).copy(),
                                     "solver_state": binary_state,
                                 },
+                                stochastic_block_size_override=block_size,
                             )
                         )
 
@@ -1696,6 +1724,7 @@ def fit_variational_em(
                         max_iterations=_stochastic_binary_newton_iterations(
                             maximum_iterations=config.max_inner_newton_iterations,
                             step_size=step_size,
+                            compute_beta_variance=refresh_beta_variance,
                         ),
                         gradient_tolerance=max(config.newton_gradient_tolerance, 1e-4),
                         solver_tolerance=config.linear_solver_tolerance,
@@ -1826,6 +1855,7 @@ def fit_variational_em(
                             beta_variance_state_override=beta_variance_state,
                             reduced_second_moment_override=reduced_second_moment,
                             epoch_reduced_prior_variances_override=reduced_prior_variances,
+                            stochastic_block_size_override=block_size,
                         )
                     )
                     last_stochastic_checkpoint_block = block_count
@@ -1835,6 +1865,9 @@ def fit_variational_em(
             resume_reduced_second_moment = None
             resume_epoch_reduced_prior_variances = None
             resume_binary_block_state = None
+            if block_size != configured_block_size:
+                block_size = configured_block_size
+                block_count = max((int(genotype_matrix.shape[1]) + block_size - 1) // block_size, 1)
 
             # One Robbins-Monro tick per epoch (full sweep over disjoint blocks).
             step_index += 1
@@ -1990,6 +2023,16 @@ def fit_variational_em(
             final_predictor_change = predictor_change
             final_objective_change = objective_change
             final_hyperparameter_change = hyperparameter_change
+            _require_finite_fit_values(
+                f"stochastic EM epoch {outer_iteration + 1}",
+                ("alpha", alpha_state),
+                ("beta", beta_state),
+                ("local_scale", local_scale),
+                ("auxiliary_delta", auxiliary_delta),
+                ("linear_predictor", linear_predictor),
+                ("objective", current_objective),
+                ("global_scale", global_scale),
+            )
             previous_alpha = alpha_state.copy()
             previous_beta = beta_state.copy()
             previous_local_scale = local_scale.copy()
@@ -2053,15 +2096,27 @@ def fit_variational_em(
             # Held-out validation_data is monitoring-only and must not gate
             # convergence; treat it as if no validation set was passed.
             validation_gates_convergence = bool(validation_history) and not validation_is_holdout_only
-            if parameter_change < config.convergence_tolerance:
+            convergence_change = max(parameter_change, hyperparameter_change)
+            hyperparameters_ready_for_convergence = (
+                not config.update_hyperparameters
+                or should_update_hyperparameters
+            )
+            if hyperparameters_ready_for_convergence and convergence_change < config.convergence_tolerance:
                 if validation_gates_convergence and validation_metric_this_epoch is not None and len(validation_history) >= 2:
                     validation_delta = abs(validation_history[-1] - validation_history[-2])
                     if validation_delta < config.convergence_tolerance:
-                        log(f"  stochastic variational updates converged on epoch {outer_iteration + 1} with parameter_change={parameter_change:.3e} validation_delta={validation_delta:.3e}")
+                        log(
+                            f"  stochastic variational updates converged on epoch {outer_iteration + 1} "
+                            f"with fit_change={parameter_change:.3e} hyper_change={hyperparameter_change:.3e} "
+                            f"validation_delta={validation_delta:.3e}"
+                        )
                         fit_converged = True
                         break
                 elif not validation_gates_convergence:
-                    log(f"  stochastic variational updates converged on epoch {outer_iteration + 1} with parameter_change={parameter_change:.3e}")
+                    log(
+                        f"  stochastic variational updates converged on epoch {outer_iteration + 1} "
+                        f"with fit_change={parameter_change:.3e} hyper_change={hyperparameter_change:.3e}"
+                    )
                     fit_converged = True
                     break
     else:
@@ -2253,6 +2308,16 @@ def fit_variational_em(
             final_predictor_change = predictor_change
             final_objective_change = objective_change
             final_hyperparameter_change = hyperparameter_change
+            _require_finite_fit_values(
+                f"EM iteration {outer_iteration + 1}",
+                ("alpha", alpha_state),
+                ("beta", beta_state),
+                ("local_scale", local_scale),
+                ("auxiliary_delta", auxiliary_delta),
+                ("linear_predictor", posterior_state.linear_predictor),
+                ("objective", current_objective),
+                ("global_scale", global_scale),
+            )
             previous_alpha = alpha_state.copy()
             previous_beta = beta_state.copy()
             previous_local_scale = local_scale.copy()
@@ -2307,15 +2372,27 @@ def fit_variational_em(
             # Symmetric with the SVI path: held-out validation is monitoring-
             # only and must not gate convergence.
             validation_gates_convergence = bool(validation_history) and not validation_is_holdout_only
-            if parameter_change < config.convergence_tolerance:
+            convergence_change = max(parameter_change, hyperparameter_change)
+            hyperparameters_ready_for_convergence = (
+                not config.update_hyperparameters
+                or should_update_hyperparameters
+            )
+            if hyperparameters_ready_for_convergence and convergence_change < config.convergence_tolerance:
                 if validation_gates_convergence and validation_metric_this_epoch is not None and len(validation_history) >= 2:
                     validation_delta = abs(validation_history[-1] - validation_history[-2])
                     if validation_delta < config.convergence_tolerance:
-                        log(f"  variational EM converged on iteration {outer_iteration + 1} with parameter_change={parameter_change:.3e} validation_delta={validation_delta:.3e}")
+                        log(
+                            f"  variational EM converged on iteration {outer_iteration + 1} "
+                            f"with fit_change={parameter_change:.3e} hyper_change={hyperparameter_change:.3e} "
+                            f"validation_delta={validation_delta:.3e}"
+                        )
                         fit_converged = True
                         break
                 elif not validation_gates_convergence:
-                    log(f"  variational EM converged on iteration {outer_iteration + 1} with parameter_change={parameter_change:.3e}")
+                    log(
+                        f"  variational EM converged on iteration {outer_iteration + 1} "
+                        f"with fit_change={parameter_change:.3e} hyper_change={hyperparameter_change:.3e}"
+                    )
                     fit_converged = True
                     break
 
@@ -3210,25 +3287,9 @@ def _binary_posterior_state(
     )
     final_weights = _binary_expected_polya_gamma_weights(current_linear_predictor, minimum_weight)
     best_weights = _binary_expected_polya_gamma_weights(best_linear_predictor, minimum_weight)
-    # Fast path: stochastic late-epoch binary block updates often run a single
-    # Newton step with variance refresh enabled. In that shape, a mean-only
-    # solve followed by a full solve duplicates the same expensive factorization,
-    # so go straight to the full solve once and reuse it as the final posterior.
-    _one_solve_fast_path = (
-        max_iterations == 1
-        and resume_completed_iterations == 0
-        and compute_beta_variance
-        and not compute_logdet
-        and update_blend_weight is not None
-    )
     _binary_newton_iters_used = resume_completed_iterations
-    if _one_solve_fast_path:
-        log("      one-solve fast path: max_iter=1 + beta_variance, skipping mean-only solve")
-        _binary_newton_iters_used = 1
-        # Use current weights for the single full solve
-        final_weights = _binary_expected_polya_gamma_weights(current_linear_predictor, minimum_weight)
     timing_cupy = cupy if cupy is not None else (_try_import_cupy() if _newton_gpu_available else None)
-    for iteration_index in range(resume_completed_iterations, max_iterations if not _one_solve_fast_path else 0):
+    for iteration_index in range(resume_completed_iterations, max_iterations):
         _binary_newton_iters_used = iteration_index + 1
         iteration_start = time.monotonic()
         if gpu_binary_backend:
@@ -3289,6 +3350,56 @@ def _binary_posterior_state(
                 prior_precision=prior_precision,
                 beta=updated_beta,
             )
+        if updated_objective < current_objective:
+            full_step_parameters = updated_parameters
+            full_step_linear_predictor = updated_linear_predictor
+            full_step_objective = float(updated_objective)
+            accepted_damped_step = False
+            for damping_fraction in (0.5, 0.25, 0.125, 0.0625):
+                trial_parameters = parameters + damping_fraction * (full_step_parameters - parameters)
+                trial_linear_predictor = current_linear_predictor + damping_fraction * (
+                    full_step_linear_predictor - current_linear_predictor
+                )
+                if gpu_binary_backend:
+                    assert cupy is not None
+                    trial_linear_predictor_gpu = cupy.asarray(trial_linear_predictor, dtype=compute_cp_dtype)
+                    trial_objective = _binary_penalized_log_posterior_cupy(
+                        cupy,
+                        trial_linear_predictor_gpu,
+                        target_array_gpu,
+                        prior_precision_gpu,
+                        cupy.asarray(trial_parameters[covariate_count:], dtype=compute_cp_dtype),
+                        dtype=compute_cp_dtype,
+                    )
+                else:
+                    trial_linear_predictor_gpu = None
+                    trial_objective = _binary_penalized_log_posterior(
+                        linear_predictor=trial_linear_predictor,
+                        targets=target_array,
+                        prior_precision=prior_precision,
+                        beta=trial_parameters[covariate_count:],
+                    )
+                if trial_objective >= current_objective:
+                    log(
+                        f"      binary damped iter {iteration_index + 1}: "
+                        + f"step={damping_fraction:.4f} obj={trial_objective:.4f} "
+                        + f"full_step_obj={full_step_objective:.4f}"
+                    )
+                    updated_parameters = trial_parameters
+                    updated_linear_predictor = trial_linear_predictor
+                    updated_linear_predictor_gpu = trial_linear_predictor_gpu
+                    updated_objective = float(trial_objective)
+                    accepted_damped_step = True
+                    break
+            if not accepted_damped_step:
+                log(
+                    f"      binary rejected iter {iteration_index + 1}: "
+                    + f"full_step_obj={full_step_objective:.4f} current_obj={current_objective:.4f}"
+                )
+                updated_parameters = parameters.copy()
+                updated_linear_predictor = current_linear_predictor.copy()
+                updated_linear_predictor_gpu = current_linear_predictor_gpu
+                updated_objective = current_objective
         relative_parameter_step = float(np.linalg.norm(updated_parameters - parameters)) / max(
             float(np.linalg.norm(parameters)),
             1e-8,
@@ -3319,7 +3430,7 @@ def _binary_posterior_state(
         if gpu_binary_backend:
             current_linear_predictor_gpu = updated_linear_predictor_gpu
         current_objective = updated_objective
-        final_weights = current_weights
+        final_weights = _binary_expected_polya_gamma_weights(current_linear_predictor, minimum_weight)
         # Stall detection: track whether the objective has improved.
         if updated_objective > best_objective:
             best_objective = updated_objective
@@ -9866,6 +9977,13 @@ def _fit_state_convergence_change(
         float(objective_change),
         float(coefficient_change),
     )
+
+
+def _require_finite_fit_values(context: str, *named_values: tuple[str, object]) -> None:
+    for name, value in named_values:
+        array = np.asarray(value, dtype=np.float64)
+        if not np.all(np.isfinite(array)):
+            raise FloatingPointError(f"{context} produced non-finite {name}.")
 
 
 def _scaled_rms_change(current_values: np.ndarray, previous_values: np.ndarray | None) -> float:

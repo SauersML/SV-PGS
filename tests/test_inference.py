@@ -1108,11 +1108,13 @@ def test_variational_fit_checkpoint_accepts_legacy_pickle_state():
     )
     legacy_state = checkpoint.__getstate__()
     legacy_state.pop("binary_block_resume_state")
+    legacy_state.pop("stochastic_block_size")
 
     restored = object.__new__(VariationalFitCheckpoint)
     restored.__setstate__((None, legacy_state))
 
     assert restored.binary_block_resume_state is None
+    assert restored.stochastic_block_size is None
     np.testing.assert_allclose(restored.alpha_state, checkpoint.alpha_state)
     np.testing.assert_allclose(restored.beta_state, checkpoint.beta_state)
 
@@ -2348,11 +2350,21 @@ def test_binary_newton_solver_controls_relax_small_blend_updates_more_aggressive
 
 
 def test_stochastic_binary_newton_iterations_scale_with_blend_weight():
-    assert _stochastic_binary_newton_iterations(maximum_iterations=8, step_size=1.00) == 1
+    assert _stochastic_binary_newton_iterations(maximum_iterations=8, step_size=1.00) == 2
+    assert _stochastic_binary_newton_iterations(maximum_iterations=8, step_size=0.75) == 2
     assert _stochastic_binary_newton_iterations(maximum_iterations=8, step_size=0.27) == 1
     assert _stochastic_binary_newton_iterations(maximum_iterations=8, step_size=0.10) == 1
     assert _stochastic_binary_newton_iterations(maximum_iterations=8, step_size=0.05) == 1
+    assert _stochastic_binary_newton_iterations(maximum_iterations=1, step_size=1.00) == 1
     assert _stochastic_binary_newton_iterations(maximum_iterations=2, step_size=0.27) == 1
+    assert (
+        _stochastic_binary_newton_iterations(
+            maximum_iterations=8,
+            step_size=1.00,
+            compute_beta_variance=True,
+        )
+        == 1
+    )
 
 
 def test_default_stochastic_step_size_uses_full_sweeps():
@@ -2402,7 +2414,8 @@ def test_fit_convergence_change_uses_predictive_state_not_auxiliary_shrinkage():
 
 def test_hyperparameter_updates_skip_final_iteration():
     config = ModelConfig(max_outer_iterations=8, update_hyperparameters=True, final_posterior_refinement=False)
-    assert mixture_inference._should_update_hyperparameters_this_iteration(4, config, allow_final_iteration=False)
+    assert mixture_inference._should_update_hyperparameters_this_iteration(2, config, allow_final_iteration=False)
+    assert not mixture_inference._should_update_hyperparameters_this_iteration(3, config, allow_final_iteration=False)
     assert not mixture_inference._should_update_hyperparameters_this_iteration(8, config, allow_final_iteration=False)
     assert mixture_inference._should_update_hyperparameters_this_iteration(
         6,
@@ -2414,6 +2427,39 @@ def test_hyperparameter_updates_skip_final_iteration():
         ModelConfig(max_outer_iterations=4),
         allow_final_iteration=True,
     )
+
+
+def test_checkpoint_signature_ignores_solver_and_resume_policy_controls():
+    base = ModelConfig(
+        max_outer_iterations=20,
+        stochastic_variant_batch_size=4_394,
+        stochastic_step_offset=0.0,
+        stochastic_step_exponent=0.0,
+        max_inner_newton_iterations=20,
+        linear_solver_tolerance=1e-6,
+        sample_space_preconditioner_rank=256,
+        validation_interval=10,
+    )
+    tuned = ModelConfig(
+        max_outer_iterations=40,
+        stochastic_variant_batch_size=8_192,
+        stochastic_step_offset=5.0,
+        stochastic_step_exponent=0.5,
+        max_inner_newton_iterations=8,
+        linear_solver_tolerance=1e-4,
+        sample_space_preconditioner_rank=512,
+        validation_interval=1,
+    )
+
+    assert mixture_inference._checkpoint_config_signature(base) == mixture_inference._checkpoint_config_signature(tuned)
+
+
+def test_require_finite_fit_values_rejects_nan():
+    with pytest.raises(FloatingPointError, match="non-finite beta"):
+        mixture_inference._require_finite_fit_values(
+            "test context",
+            ("beta", np.array([0.0, np.nan], dtype=np.float64)),
+        )
 
 
 def test_stochastic_sample_space_preconditioner_rank_scales_with_blend_weight():
@@ -2990,7 +3036,9 @@ def test_binary_posterior_state_forwards_allow_gpu_exact_variant(monkeypatch: py
     assert forwarded_flags == [False, False]
 
 
-def test_binary_posterior_stochastic_single_step_uses_one_full_solve(monkeypatch: pytest.MonkeyPatch):
+def test_binary_posterior_stochastic_variance_refresh_reweights_before_full_solve(
+    monkeypatch: pytest.MonkeyPatch,
+):
     sample_count, variant_count = 8, 4
     standardized = as_raw_genotype_matrix(np.zeros((sample_count, variant_count), dtype=np.float32)).standardized(
         means=np.zeros(variant_count, dtype=np.float32),
@@ -3008,7 +3056,16 @@ def test_binary_posterior_stochastic_single_step_uses_one_full_solve(monkeypatch
                 bool(kwargs["allow_gpu_exact_variant"]),
             )
         )
-        raise AssertionError("stochastic single-step variance refresh should not call mean-only solve")
+        sample_dim = kwargs["targets"].shape[0]
+        covariate_dim = kwargs["covariate_matrix"].shape[1]
+        beta = np.zeros(kwargs["prior_variances"].shape[0], dtype=np.float64)
+        return (
+            np.zeros(covariate_dim, dtype=np.float64),
+            beta,
+            np.zeros(sample_dim, dtype=np.float64),
+            np.zeros(sample_dim, dtype=np.float64),
+            0.0,
+        )
 
     def fake_solve_restricted_full(**kwargs):
         solver_calls.append(
@@ -3052,7 +3109,10 @@ def test_binary_posterior_stochastic_single_step_uses_one_full_solve(monkeypatch
         allow_gpu_exact_variant=False,
     )
 
-    assert solver_calls == [("full", False, True, False)]
+    assert solver_calls == [
+        ("mean", False, False, False),
+        ("full", False, True, False),
+    ]
     np.testing.assert_allclose(beta_variance, np.ones(variant_count, dtype=np.float64))
     assert newton_iterations == 1
 
