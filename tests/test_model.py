@@ -271,6 +271,55 @@ def test_fit_stage_structure_cache_key_is_shared_across_traits(monkeypatch):
     assert binary_paths.fit_key != quantitative_paths.fit_key
 
 
+def test_fit_stage_structure_cache_key_includes_targets_when_marginal_screening(monkeypatch):
+    genotype_matrix, covariate_matrix, target_vector, variant_records = _synthetic_binary_dataset()
+    raw_genotypes = as_raw_genotype_matrix(genotype_matrix)
+    monkeypatch.setattr(model_module, "_persistent_raw_signature", lambda _genotype_matrix: "synthetic-raw-signature")
+    variant_stats = compute_variant_statistics(
+        raw_genotypes=raw_genotypes,
+        config=ModelConfig(
+            trait_type=TraitType.BINARY,
+            max_outer_iterations=1,
+            minimum_minor_allele_frequency=0.0,
+        ),
+    )
+    covariates = np.column_stack(
+        [np.ones(covariate_matrix.shape[0], dtype=np.float32), covariate_matrix]
+    ).astype(np.float32)
+
+    first_paths = _fit_stage_cache_paths(
+        genotype_matrix=raw_genotypes,
+        allele_frequencies=np.asarray([record.allele_frequency for record in variant_records], dtype=np.float32),
+        means=variant_stats.means,
+        scales=variant_stats.scales,
+        covariates=covariates,
+        targets=target_vector,
+        config=ModelConfig(
+            trait_type=TraitType.BINARY,
+            minimum_minor_allele_frequency=0.0,
+            marginal_screen_min_abs_z=1.5,
+        ),
+    )
+    second_paths = _fit_stage_cache_paths(
+        genotype_matrix=raw_genotypes,
+        allele_frequencies=np.asarray([record.allele_frequency for record in variant_records], dtype=np.float32),
+        means=variant_stats.means,
+        scales=variant_stats.scales,
+        covariates=covariates,
+        targets=1.0 - target_vector,
+        config=ModelConfig(
+            trait_type=TraitType.BINARY,
+            minimum_minor_allele_frequency=0.0,
+            marginal_screen_min_abs_z=1.5,
+        ),
+    )
+
+    assert first_paths is not None
+    assert second_paths is not None
+    assert first_paths.key != second_paths.key
+    assert first_paths.active_indices_path != second_paths.active_indices_path
+
+
 def test_persistent_raw_signature_ignores_mtime_for_cache_backed_memmaps(tmp_path: Path):
     cache_backed_path = tmp_path / ".sv_pgs_cache" / "synthetic.genotypes.npy"
     cache_backed_path.parent.mkdir(parents=True, exist_ok=True)

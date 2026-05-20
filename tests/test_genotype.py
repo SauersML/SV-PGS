@@ -848,6 +848,55 @@ def test_streaming_gpu_context_uses_int8_budget_for_plink_like_backends(monkeypa
     assert streaming_batch_size == genotype_module.auto_batch_size_i8(standardized.shape[0])
 
 
+def test_streaming_gpu_context_caps_large_int8_standardized_tiles(monkeypatch: pytest.MonkeyPatch):
+    class _FakeCudaRuntime:
+        @staticmethod
+        def memGetInfo():
+            return (8_000_000_000, 16_000_000_000)
+
+    class _FakeDevice:
+        def synchronize(self) -> None:
+            return None
+
+    class _FakeCuda:
+        runtime = _FakeCudaRuntime()
+
+        @staticmethod
+        def Device():
+            return _FakeDevice()
+
+    class _FakeCupy:
+        float32 = np.float32
+        cuda = _FakeCuda()
+
+    class _ShapeOnlyInt8Raw(RawGenotypeMatrix):
+        @property
+        def shape(self) -> tuple[int, int]:
+            return 77_689, 1_106_883
+
+        def iter_column_batches_i8(self, variant_indices=None, batch_size: int = 1024):
+            raise AssertionError("shape-only test must not stream genotypes")
+
+        def iter_column_batches(self, variant_indices=None, batch_size: int = 1024):
+            raise AssertionError("shape-only test must not stream genotypes")
+
+        def materialize(self, variant_indices=None) -> np.ndarray:
+            raise AssertionError("shape-only test must not materialize genotypes")
+
+    monkeypatch.setattr(genotype_module, "_try_import_cupy", lambda: _FakeCupy())
+    raw = _ShapeOnlyInt8Raw()
+    standardized = raw.standardized(
+        np.zeros(raw.shape[1], dtype=np.float32),
+        np.ones(raw.shape[1], dtype=np.float32),
+    )
+
+    _, streaming_batch_size = standardized._streaming_gpu_context(batch_size=12_428)
+
+    expected = genotype_module.GPU_STANDARDIZED_STREAMING_TARGET_BATCH_BYTES // (raw.shape[0] * 4)
+    assert streaming_batch_size == expected
+    assert streaming_batch_size < genotype_module.auto_batch_size_i8(raw.shape[0])
+
+
 def test_try_materialize_gpu_uses_int8_batch_size_for_plink_like_backends(monkeypatch: pytest.MonkeyPatch):
     class _FakeCudaRuntime:
         @staticmethod

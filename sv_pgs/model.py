@@ -20,9 +20,11 @@ from sv_pgs.data import TieGroup, TieMap, VariantRecord, VariantStatistics, norm
 from sv_pgs.genotype import (
     ConcatenatedRawGenotypeMatrix,
     DenseRawGenotypeMatrix,
+    IndexedRawGenotypeMatrix,
     Int8RawGenotypeMatrix,
     PlinkRawGenotypeMatrix,
     RawGenotypeMatrix,
+    RowSubsetRawGenotypeMatrix,
     StandardizedGenotypeMatrix,
     _standardize_batch,
     as_raw_genotype_matrix,
@@ -100,7 +102,7 @@ class FittedState:
 
 _FIT_STAGE_CACHE_DIRNAME = ".sv_pgs_cache"
 _FIT_STAGE_CACHE_SUBDIR = "fit_stage"
-_FIT_STAGE_CACHE_VERSION = 3
+_FIT_STAGE_CACHE_VERSION = 4
 
 
 @dataclass(slots=True)
@@ -198,11 +200,11 @@ def _fit_stage_cache_paths(
     _update_hash_with_array_bytes(structure_hasher, np.asarray(allele_frequencies, dtype=np.float32))
     _update_hash_with_array_bytes(structure_hasher, np.asarray(means, dtype=np.float32))
     _update_hash_with_array_bytes(structure_hasher, np.asarray(scales, dtype=np.float32))
-    # marginal_screen_min_abs_z changes the active-variant set, so it must
-    # participate in the structure-cache key. covariates/targets are folded
-    # into the fit-stage key below; together they form the unique seed for
-    # the prescreen output.
-    structure_hasher.update(np.asarray([config.marginal_screen_min_abs_z], dtype=np.float64).tobytes())
+    marginal_screen_min_abs_z = float(config.marginal_screen_min_abs_z)
+    structure_hasher.update(np.asarray([marginal_screen_min_abs_z], dtype=np.float64).tobytes())
+    if marginal_screen_min_abs_z > 0.0:
+        _update_hash_with_array_bytes(structure_hasher, np.asarray(covariates, dtype=np.float32))
+        _update_hash_with_array_bytes(structure_hasher, np.asarray(targets, dtype=np.float32))
     structure_key = structure_hasher.hexdigest()[:24]
     fit_hasher = hashlib.sha256()
     fit_hasher.update(f"fit-stage-fit-v{_FIT_STAGE_CACHE_VERSION}".encode("utf-8"))
@@ -244,6 +246,22 @@ def _persistent_raw_signature(genotype_matrix: RawGenotypeMatrix) -> str | None:
         if any(signature is None for signature in child_signatures):
             return None
         return "concat:" + "|".join(str(signature) for signature in child_signatures)
+    if isinstance(genotype_matrix, RowSubsetRawGenotypeMatrix):
+        child_signature = _persistent_raw_signature(genotype_matrix.child)
+        if child_signature is None:
+            return None
+        row_hash = hashlib.sha256(
+            np.asarray(genotype_matrix.row_indices, dtype=np.int64).tobytes()
+        ).hexdigest()[:16]
+        return f"rowsubset:{child_signature}:n={int(genotype_matrix.row_indices.shape[0])}:{row_hash}"
+    if isinstance(genotype_matrix, IndexedRawGenotypeMatrix):
+        child_signature = _persistent_raw_signature(genotype_matrix.child)
+        if child_signature is None:
+            return None
+        col_hash = hashlib.sha256(
+            np.asarray(genotype_matrix.selected_columns, dtype=np.int64).tobytes()
+        ).hexdigest()[:16]
+        return f"indexed:{child_signature}:m={int(genotype_matrix.selected_columns.shape[0])}:{col_hash}"
     if isinstance(genotype_matrix, (Int8RawGenotypeMatrix, DenseRawGenotypeMatrix)):
         backing_matrix = np.asanyarray(genotype_matrix.matrix)
         if isinstance(backing_matrix, np.memmap):

@@ -32,6 +32,8 @@ BED_READER_TARGET_BATCH_BYTES = 500_000_000
 MIN_BED_READER_BATCH_SIZE = 32  # always read at least this many variants
 STANDARDIZED_STREAMING_TARGET_BATCH_BYTES = 1_024_000_000
 LOCAL_INT8_STANDARDIZED_STREAMING_TARGET_BATCH_BYTES = 4_096_000_000
+GPU_STANDARDIZED_STREAMING_TARGET_BATCH_BYTES = 512_000_000
+GPU_STANDARDIZED_PREFETCH_TARGET_BYTES = 1_024_000_000
 PLINK_INT8_PREFETCH_TARGET_BYTES = 1_100_000_000
 PLINK_INT8_MAX_PREFETCH_DEPTH = 2
 
@@ -1051,14 +1053,14 @@ def _iter_standardized_gpu_batches(
     chunk_starts = list(range(0, n, safe_batch_size))
     chunks = [variant_indices_arr[s : s + safe_batch_size] for s in chunk_starts]
 
-    # Parallel disk reads: cloud SSDs (e.g., AoU GCP-PD) deliver multi-GB/s
-    # with several concurrent readers but only a few hundred MB/s with a
-    # single sequential reader. Submitting reads to a small thread pool with
-    # bounded in-flight depth saturates that parallel bandwidth without
-    # blowing host memory. NumPy fancy-indexing releases the GIL during the
-    # underlying memcpy, so the threads actually run concurrently on I/O.
-    num_io_workers = min(4, max(1, len(chunks)))
-    in_flight_limit = num_io_workers * 2
+    # Parallel disk reads help on cloud SSDs, but large AoU row subsets make
+    # each chunk hundreds of MB. Bound both workers and queued chunks by bytes
+    # so prefetch does not evict the pages/GPU buffers the current matmul needs.
+    bytes_per_raw_value = np.dtype(np.int8 if _supports_int8_batches(raw) else np.float32).itemsize
+    chunk_bytes = max(sample_count * safe_batch_size * bytes_per_raw_value, 1)
+    memory_capped_in_flight = max(1, GPU_STANDARDIZED_PREFETCH_TARGET_BYTES // chunk_bytes)
+    num_io_workers = min(4, int(memory_capped_in_flight), max(1, len(chunks)))
+    in_flight_limit = min(num_io_workers * 2, int(memory_capped_in_flight), len(chunks))
     if num_io_workers <= 1 or len(chunks) <= 1:
         local_start = 0
         for chunk in chunks:
@@ -1135,7 +1137,7 @@ def _gpu_streaming_batch_size(
     return _effective_standardized_streaming_batch_size(
         sample_count,
         requested_batch_size,
-        target_batch_bytes=_standardized_streaming_target_batch_bytes(raw),
+        target_batch_bytes=GPU_STANDARDIZED_STREAMING_TARGET_BATCH_BYTES,
     )
 
 
