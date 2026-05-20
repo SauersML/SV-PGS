@@ -122,9 +122,25 @@ def compute_variant_statistics(
 
     variants_done = 0
     batch_number = 0
-    for batch in batch_iter:
+    cumulative_fetch_seconds = 0.0
+    cumulative_compute_seconds = 0.0
+    overall_start = _time.monotonic()
+    iter_handle = iter(batch_iter)
+    while True:
+        # Measure the fetch (next-batch) time separately from the compute
+        # time. The fetch path is where streaming-source bottlenecks
+        # (mmap page faults, bed decode, prefetch contention) show up;
+        # the compute path is JAX kernel + D2H copy. Without splitting
+        # them, a sudden disk stall and a JAX recompile look identical.
+        fetch_start = _time.monotonic()
+        try:
+            batch = next(iter_handle)
+        except StopIteration:
+            break
+        fetch_seconds = _time.monotonic() - fetch_start
+
+        compute_start = _time.monotonic()
         batch_number += 1
-        start_time = _time.monotonic()
         batch_indices = batch.variant_indices
         batch_jax = jnp.asarray(batch.values)
         if use_i8:
@@ -144,15 +160,31 @@ def compute_variant_statistics(
             )
             dosage_like[batch_indices] = bounded
         del batch_jax
+        compute_seconds = _time.monotonic() - compute_start
 
-        batch_seconds = _time.monotonic() - start_time
+        cumulative_fetch_seconds += fetch_seconds
+        cumulative_compute_seconds += compute_seconds
         variants_done += len(batch_indices)
-        if batch_number <= 3 or variants_done % max(variant_count // 10, 1) < len(batch_indices) or variants_done == variant_count:
-            estimated_total = batch_seconds * ((variant_count - variants_done) / max(len(batch_indices), 1)) if batch_number >= 2 else 0.0
-            log(
-                f"  {variants_done}/{variant_count} ({100 * variants_done // variant_count}%)  "
-                f"batch={batch_seconds:.1f}s  est_remaining={estimated_total / 60:.0f}min  mem={mem()}"
-            )
+        # Every batch logs now (was: every ~10%). Cheap and exposes
+        # per-batch I/O stalls that the periodic-only log would average
+        # away. The line stays short — one batch per line.
+        wall_seconds = fetch_seconds + compute_seconds
+        avg_wall = (cumulative_fetch_seconds + cumulative_compute_seconds) / max(batch_number, 1)
+        remaining_batches = max((variant_count - variants_done) + len(batch_indices) - 1, 0) // max(len(batch_indices), 1)
+        eta_seconds = avg_wall * remaining_batches
+        log(
+            f"  batch {batch_number} variants={variants_done}/{variant_count} "
+            f"({100 * variants_done // variant_count}%)  "
+            f"fetch={fetch_seconds:.2f}s compute={compute_seconds:.2f}s wall={wall_seconds:.2f}s  "
+            f"avg_wall={avg_wall:.2f}s  eta={eta_seconds/60:.1f}min  mem={mem()}"
+        )
+
+    total_seconds = _time.monotonic() - overall_start
+    log(
+        f"  variant-stats pass done: {batch_number} batches in {total_seconds:.1f}s  "
+        f"(fetch_total={cumulative_fetch_seconds:.1f}s, "
+        f"compute_total={cumulative_compute_seconds:.1f}s)  mem={mem()}"
+    )
 
     means = np.divide(
         sums,

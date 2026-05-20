@@ -445,12 +445,25 @@ class PlinkRawGenotypeMatrix(RawGenotypeMatrix):
 
     def _read_batch_i8(self, reader: Any, batch_indices: np.ndarray) -> np.ndarray:
         """Read one batch as raw int8 (0/1/2/PLINK_MISSING_INT8). No float conversion."""
+        import time as _time
         sample_index = _contiguous_index_or_slice(self.sample_indices)
         col_index = _contiguous_index_or_slice(batch_indices)
-        return np.asarray(
+        t0 = _time.monotonic()
+        result = np.asarray(
             reader.read(index=(sample_index, col_index), dtype="int8", order="F", num_threads=None),
             dtype=np.int8,
         )
+        elapsed = _time.monotonic() - t0
+        # Per-call timing: lets variant-stats logs distinguish bed-decode
+        # time from JAX-compute time. Log only when noticeably non-trivial
+        # so per-variant gather calls (variant_count == 1) don't spam.
+        if elapsed >= 0.5 or int(batch_indices.shape[0]) >= 256:
+            log(
+                f"      bed read: variants={int(batch_indices.shape[0])} "
+                f"samples={int(self.sample_indices.shape[0])}/{int(self.total_sample_count)}  "
+                f"elapsed={elapsed:.2f}s"
+            )
+        return result
 
     def iter_column_batches_i8(
         self,

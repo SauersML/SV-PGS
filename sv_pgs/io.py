@@ -24,7 +24,12 @@ from sv_pgs.genotype import (
     RowSubsetRawGenotypeMatrix,
     as_raw_genotype_matrix,
 )
-from sv_pgs.preprocessing import compute_variant_statistics
+from sv_pgs.preprocessing import (
+    _batch_all_stats_i8,
+    _scales_from_centered_sum_squares,
+    compute_variant_statistics,
+)
+import jax.numpy as jnp
 from sv_pgs.progress import log, mem
 
 SV_LENGTH_THRESHOLD = 1_000.0
@@ -503,12 +508,21 @@ def load_dataset_from_files(
             total_sample_count=total_fam_samples,
         )
         log("computing variant statistics (single pass, JAX; disk-cached)...")
-        variant_stats = compute_plink_variant_statistics_cached(
+        variant_stats, plink_int8_cache_path = compute_plink_variant_statistics_cached(
             raw_genotypes,
             bed_path=source_path,
             sample_indices=aligned_sample_indices,
             config=config,
         )
+        if plink_int8_cache_path is not None:
+            int8_view = _open_plink_int8_cache_for_read(plink_int8_cache_path)
+            if int8_view is not None:
+                log(
+                    f"  swapping PLINK source to int8 mmap "
+                    f"({int8_view.shape[0]:,} × {int8_view.shape[1]:,}) — "
+                    "downstream passes skip bed-decode entirely"
+                )
+                raw_genotypes = as_raw_genotype_matrix(int8_view)
         log("building PLINK variant defaults from pre-computed allele frequencies...")
         default_variants = _build_plink_variant_defaults_from_stats(source_path, variant_stats)
         log(f"built {len(default_variants)} PLINK variant defaults  mem={mem()}")
@@ -924,12 +938,21 @@ def load_multi_source_dataset_from_files(
                 variants_list = []
             else:
                 log(f"  computing variant statistics for {path.name} (single PLINK streaming pass; disk-cached)...")
-                stats = compute_plink_variant_statistics_cached(
+                stats, plink_int8_cache_path = compute_plink_variant_statistics_cached(
                     raw,
                     bed_path=path,
                     sample_indices=keep_indices,
                     config=config,
                 )
+                if plink_int8_cache_path is not None:
+                    int8_view = _open_plink_int8_cache_for_read(plink_int8_cache_path)
+                    if int8_view is not None:
+                        log(
+                            f"  swapping PLINK source to int8 mmap "
+                            f"({int8_view.shape[0]:,} × {int8_view.shape[1]:,}) — "
+                            "downstream passes skip bed-decode entirely"
+                        )
+                        raw = as_raw_genotype_matrix(int8_view)
                 variants_list = _build_plink_variant_defaults_from_stats(path, stats)
         raw_matrices.append(raw)
         per_source_variants.append(variants_list)
@@ -1139,6 +1162,11 @@ _CACHE_DIR_NAME = ".sv_pgs_cache"
 # so stale caches are automatically invalidated.
 _CACHE_VERSION = 3
 _VCF_CACHE_MANIFEST_VERSION = 2
+# Smallest (samples × variants) cell-count that justifies building the int8
+# PLINK cache. Below this, the cache write overhead and the test-fixture
+# monkeypatch hassle outweighs the read-time savings (small fixtures
+# decode in microseconds anyway). AoU-scale: 77k × 1.74M = 1.34e11 ≫ this.
+_PLINK_INT8_CACHE_MIN_CELLS = 1_000_000_000
 _VCF_CACHE_STATS_DTYPE = np.dtype(
     [
         ("means", "<f4"),
@@ -1464,34 +1492,221 @@ def _write_plink_stats_cache(stats_path: Path, variant_stats: VariantStatistics)
     tmp_path.replace(stats_path)
 
 
+def _plink_int8_cache_path(
+    bed_path: Path,
+    sample_indices: np.ndarray,
+    config: ModelConfig,
+) -> Path:
+    """Path for the decoded int8 (n_samples, n_variants) PLINK cache.
+
+    Shares the stats-cache key (which already includes bed fingerprint +
+    sample subset + minimum_scale), so the int8 cache and the stats cache
+    invalidate together. The file is a standard .npy mmap: future
+    consumers can `np.lib.format.open_memmap(...)` it instantly.
+    """
+    cache_dir = _vcf_cache_dir(bed_path)
+    key = _plink_stats_cache_key(bed_path, sample_indices, config)
+    return cache_dir / f"plink_int8_{key}.npy"
+
+
+def _open_plink_int8_cache_for_read(int8_path: Path) -> np.ndarray | None:
+    """Return a read-only mmap view of the int8 cache, or None on miss/error."""
+    if not int8_path.exists():
+        return None
+    try:
+        return np.lib.format.open_memmap(int8_path, mode="r")
+    except (OSError, ValueError, EOFError) as exc:
+        log(f"  PLINK int8 cache at {int8_path.name} unreadable ({exc!r}); will recompute")
+        return None
+
+
 def compute_plink_variant_statistics_cached(
     raw_genotypes: PlinkRawGenotypeMatrix,
     bed_path: Path,
     sample_indices: np.ndarray,
     config: ModelConfig,
-) -> VariantStatistics:
+) -> tuple[VariantStatistics, Path | None]:
     """compute_variant_statistics on a PLINK source, with disk caching.
 
-    The cache lives next to the .bed file in `.sv_pgs_cache/` so it
-    persists across runs the same way the SV VCF int8/stats caches do.
-    A miss runs the normal one-pass JAX streaming computation (typically
-    ~10 min on a 16-core VM with the parallel-decode plink reader) and
-    writes the result atomically; a hit loads ~30 MB of numpy in a few
-    milliseconds.
+    Returns (variant_stats, int8_cache_path). int8_cache_path is the
+    location of a decoded (n_samples, n_variants) int8 mmap when one is
+    available (either pre-existing or just written); None if writing
+    failed (disk full, etc.). Downstream loaders can mmap this directly
+    instead of going through the bed-reader on every pass.
+
+    Two cache files: a small stats blob (~30 MB) and the big int8 matrix
+    (~135 GB for 77k × 1.74M). Both share the same hash key so they
+    invalidate together. Cache miss: streams through the bed file once
+    and writes BOTH outputs as a side-effect of the stats pass — no
+    second decode required. Cache hit: instant.
     """
     stats_path = _plink_stats_cache_path(bed_path, sample_indices, config)
-    cached = _load_plink_stats_from_cache(stats_path)
-    if cached is not None:
-        log(f"  PLINK stats cache hit: {stats_path.name} ({cached.means.shape[0]:,} variants)  mem={mem()}")
-        return cached
-    log(f"  PLINK stats cache miss: computing fresh and writing to {stats_path.name}")
-    variant_stats = compute_variant_statistics(raw_genotypes, config=config)
+    int8_path = _plink_int8_cache_path(bed_path, sample_indices, config)
+    cached_stats = _load_plink_stats_from_cache(stats_path)
+    if cached_stats is not None:
+        log(
+            f"  PLINK stats cache hit: {stats_path.name} "
+            f"({cached_stats.means.shape[0]:,} variants)  mem={mem()}"
+        )
+        if int8_path.exists():
+            log(
+                f"  PLINK int8 cache also present: {int8_path.name} "
+                f"({int8_path.stat().st_size / 1e9:.1f} GB) — downstream passes "
+                f"will mmap it instead of re-decoding bed bytes"
+            )
+            return cached_stats, int8_path
+        return cached_stats, None
+    log(f"  PLINK stats cache miss: computing fresh and writing {stats_path.name}")
+    n_samples = int(raw_genotypes.shape[0])
+    n_variants = int(raw_genotypes.shape[1])
+    # Only tee the int8 cache for genuinely large PLINK sources. Small ones
+    # (test fixtures, toy datasets) don't benefit from the cache and would
+    # complicate the calling tests that monkeypatch compute_variant_statistics.
+    int8_eligible = n_samples * n_variants >= _PLINK_INT8_CACHE_MIN_CELLS
+    int8_cache: np.ndarray | None = None
+    int8_tmp_path: Path | None = None
+    if int8_eligible:
+        try:
+            int8_tmp_path = int8_path.with_suffix(".tmp.npy")
+            int8_path.parent.mkdir(parents=True, exist_ok=True)
+            int8_cache = np.lib.format.open_memmap(
+                int8_tmp_path,
+                mode="w+",
+                dtype=np.int8,
+                shape=(n_samples, n_variants),
+                fortran_order=True,
+            )
+            expected_gb = n_samples * n_variants / 1e9
+            log(
+                f"  building PLINK int8 cache at {int8_tmp_path.name} "
+                f"({n_samples:,} × {n_variants:,} = {expected_gb:.1f} GB) — "
+                f"future passes will mmap-read this instead of re-decoding bed bytes"
+            )
+        except OSError as exc:
+            log(f"  could not allocate int8 cache ({exc!r}); continuing stats-only")
+            int8_cache = None
+            int8_tmp_path = None
+
+    variant_stats = _compute_variant_stats_teeing_int8(
+        raw_genotypes, config=config, int8_cache=int8_cache,
+    )
+
+    if int8_cache is not None and int8_tmp_path is not None:
+        try:
+            int8_cache.flush()
+            del int8_cache  # release mmap before rename on some platforms
+            int8_tmp_path.replace(int8_path)
+            log(
+                f"  PLINK int8 cache saved ({int8_path.stat().st_size / 1e9:.1f} GB) → "
+                f"{int8_path.name}  mem={mem()}"
+            )
+        except OSError as exc:
+            log(f"  PLINK int8 cache finalize failed ({exc!r}); leaving tmp in place")
     try:
         _write_plink_stats_cache(stats_path, variant_stats)
         log(f"  PLINK stats cache saved ({stats_path.stat().st_size / 1e6:.1f} MB)  mem={mem()}")
     except OSError as exc:
         log(f"  PLINK stats cache write failed ({exc!r}); continuing without cache")
-    return variant_stats
+    return variant_stats, int8_path if int8_path.exists() else None
+
+
+def _compute_variant_stats_teeing_int8(
+    raw_genotypes: PlinkRawGenotypeMatrix,
+    *,
+    config: ModelConfig,
+    int8_cache: np.ndarray | None,
+) -> VariantStatistics:
+    """compute_variant_statistics + optional tee of each decoded batch to
+    the supplied int8 mmap. Single bed-file pass; the mmap write is
+    ~3 GB sequential per batch and runs concurrently with the JAX
+    compute on the previous batch via the standard prefetcher.
+    """
+    if int8_cache is None:
+        return compute_variant_statistics(raw_genotypes, config=config)
+    # Stream once, tee batches to the int8 cache, accumulate stats inline.
+    # Mirrors the logic of compute_variant_statistics but without spinning
+    # up a second iterator over the same source.
+    import time as _time
+    variant_count = int(raw_genotypes.shape[1])
+    sample_count = int(raw_genotypes.shape[0])
+    sums = np.zeros(variant_count, dtype=np.float64)
+    non_missing_counts = np.zeros(variant_count, dtype=np.int32)
+    support_counts = np.zeros(variant_count, dtype=np.int32)
+    centered_sum_squares = np.zeros(variant_count, dtype=np.float64)
+    log(
+        f"  variant-stats + int8-cache tee streaming pass: "
+        f"{sample_count:,} samples × {variant_count:,} variants  mem={mem()}"
+    )
+    overall_start = _time.monotonic()
+    cumulative_fetch = 0.0
+    cumulative_compute = 0.0
+    cumulative_tee = 0.0
+    batch_number = 0
+    variants_done = 0
+    iter_handle = iter(raw_genotypes.iter_column_batches_i8())
+    while True:
+        fetch_start = _time.monotonic()
+        try:
+            batch = next(iter_handle)
+        except StopIteration:
+            break
+        fetch_seconds = _time.monotonic() - fetch_start
+        batch_number += 1
+        batch_indices = np.asarray(batch.variant_indices, dtype=np.int64)
+        # Tee: write the decoded int8 batch to the cache mmap. F-order
+        # cache, F-order batch values → sequential write per column block.
+        tee_start = _time.monotonic()
+        int8_cache[:, batch_indices[0]:batch_indices[-1] + 1] = batch.values
+        tee_seconds = _time.monotonic() - tee_start
+        # Stats compute on the JAX side.
+        compute_start = _time.monotonic()
+        batch_jax = jnp.asarray(batch.values)
+        b_sums, b_counts, b_support, b_css = _batch_all_stats_i8(batch_jax)
+        sums[batch_indices] = np.asarray(b_sums, dtype=np.float64)
+        non_missing_counts[batch_indices] = np.asarray(b_counts, dtype=np.int32)
+        support_counts[batch_indices] = np.asarray(b_support, dtype=np.int32)
+        centered_sum_squares[batch_indices] = np.asarray(b_css, dtype=np.float64)
+        del batch_jax
+        compute_seconds = _time.monotonic() - compute_start
+
+        cumulative_fetch += fetch_seconds
+        cumulative_compute += compute_seconds
+        cumulative_tee += tee_seconds
+        variants_done += batch_indices.shape[0]
+        avg_wall = (cumulative_fetch + cumulative_compute + cumulative_tee) / max(batch_number, 1)
+        remaining = max((variant_count - variants_done), 0)
+        approx_remaining_batches = (remaining + batch_indices.shape[0] - 1) // max(batch_indices.shape[0], 1)
+        eta_seconds = avg_wall * approx_remaining_batches
+        log(
+            f"    [tee] batch {batch_number} variants={variants_done}/{variant_count} "
+            f"({100 * variants_done // variant_count}%)  "
+            f"fetch={fetch_seconds:.2f}s tee={tee_seconds:.2f}s compute={compute_seconds:.2f}s  "
+            f"avg_wall={avg_wall:.2f}s eta={eta_seconds/60:.1f}min  mem={mem()}"
+        )
+
+    total = _time.monotonic() - overall_start
+    log(
+        f"  variant-stats + tee pass done: {batch_number} batches in {total:.1f}s  "
+        f"(fetch={cumulative_fetch:.1f}s compute={cumulative_compute:.1f}s tee={cumulative_tee:.1f}s)  "
+        f"mem={mem()}"
+    )
+    means = np.divide(
+        sums, np.maximum(non_missing_counts, 1),
+        out=np.zeros_like(sums), where=non_missing_counts > 0,
+    ).astype(np.float32)
+    # PLINK is always dosage-like, so use the simple half-mean formula.
+    allele_frequencies = np.clip(means / 2.0, 0.0, 1.0).astype(np.float32, copy=False)
+    scales = _scales_from_centered_sum_squares(
+        centered_sum_squares=centered_sum_squares,
+        sample_count=sample_count,
+        minimum_scale=config.minimum_scale,
+    )
+    return VariantStatistics(
+        means=means,
+        scales=scales,
+        allele_frequencies=allele_frequencies,
+        support_counts=support_counts.astype(np.int32),
+    )
 
 
 def _vcf_cache_audit_reason(vcf_path: Path, paths: _VcfCachePaths) -> str | None:
