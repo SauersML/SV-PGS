@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import os
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Literal
 
@@ -99,6 +99,7 @@ class open_bed:
     properties: dict[str, Any] | None = None
     count_A1: bool = True
     num_threads: int | None = None
+    _mmap_bytes: np.ndarray | None = field(init=False, default=None, repr=False)
 
     def __post_init__(self) -> None:
         self.path = Path(self.path)
@@ -120,6 +121,20 @@ class open_bed:
                 "PLINK 1 .bed size does not match iid_count/sid_count: "
                 + f"expected {expected_size} bytes, found {actual_size}"
             )
+
+    def _bytes_view(self) -> np.ndarray:
+        """Return a uint8 numpy view over the entire .bed file via mmap.
+
+        Lazy: built on first use, cached for the lifetime of this reader.
+        Avoids the per-batch open/seek/read(720 MB → bytes-copy) sequence
+        that used to allocate a fresh Python bytes object — and a numpy
+        wrapper for it — every batch.
+        """
+        if self._mmap_bytes is None:
+            self._mmap_bytes = np.memmap(
+                Path(self.path), dtype=np.uint8, mode="r"
+            )
+        return self._mmap_bytes
 
     def read(
         self,
@@ -151,9 +166,14 @@ class open_bed:
             variant_count = max(variant_index.stop - variant_index.start, 0)
             if variant_count == 0:
                 return np.empty((self.iid_count, 0), dtype=np.int8)
-            with Path(self.path).open("rb") as bed_handle:
-                bed_handle.seek(PLINK1_HEADER_SIZE + variant_index.start * bytes_per_variant)
-                payload = bed_handle.read(variant_count * bytes_per_variant)
+            # mmap-backed slice: zero-copy view of the relevant bytes. The
+            # decoder reads from this view directly (np.frombuffer wraps a
+            # numpy array as buffer for free). The previous open/seek/read
+            # path allocated a 720 MB Python `bytes` per batch on top of
+            # the same I/O the kernel was already going to do.
+            mmap_bytes = self._bytes_view()
+            start_offset = PLINK1_HEADER_SIZE + variant_index.start * bytes_per_variant
+            payload = mmap_bytes[start_offset : start_offset + variant_count * bytes_per_variant]
             return _decode_payload(
                 payload,
                 iid_count=self.iid_count,
@@ -221,14 +241,21 @@ def _normalize_index(index: Any, limit: int) -> slice | np.ndarray:
 
 
 def _decode_payload(
-    payload: bytes,
+    payload: bytes | np.ndarray,
     *,
     iid_count: int,
     variant_count: int,
     bytes_per_variant: int,
     count_a1: bool,
 ) -> np.ndarray:
-    raw_bytes = np.frombuffer(payload, dtype=np.uint8)
+    # Accept either a Python `bytes` object (legacy read() path, still used by
+    # the per-variant gather branch) or a uint8 numpy view (mmap zero-copy
+    # path). np.frombuffer handles both — for the mmap case it returns a
+    # zero-copy view of the same memory rather than triggering an alloc.
+    if isinstance(payload, np.ndarray):
+        raw_bytes = np.ascontiguousarray(payload, dtype=np.uint8)
+    else:
+        raw_bytes = np.frombuffer(payload, dtype=np.uint8)
     if raw_bytes.size != variant_count * bytes_per_variant:
         raise ValueError("Unexpected PLINK 1 .bed payload length.")
     lookup = _DECODE_LOOKUP_A1 if count_a1 else _DECODE_LOOKUP_A2
@@ -252,7 +279,14 @@ def _decode_payload(
                 (start, min(start + chunk_size, variant_count))
                 for start in chunk_starts
             ]
-            output = np.empty((iid_count, variant_count), dtype=np.int8)
+            # F-order matches the read.dtype="int8" order="F" contract that
+            # the caller eventually enforces via np.asfortranarray, AND lets
+            # each chunk's `.T`-of-C-order RHS land in a contiguous LHS
+            # column-slice — without it the slice assignment pays a stride
+            # transpose on every chunk (millions of cache-line-strided
+            # writes), which can dominate wall time when each chunk produces
+            # ~180 MB of output.
+            output = np.empty((iid_count, variant_count), dtype=np.int8, order="F")
 
             def _decode_chunk(span: tuple[int, int]) -> None:
                 start, end = span
