@@ -757,12 +757,18 @@ def _dedupe_cross_source_variants(
         keep_index = np.asarray(keep_positions, dtype=np.int64)
         new_matrices.append(IndexedRawGenotypeMatrix(child=child, selected_columns=keep_index))
         new_variants.append([chromosome_variants[i] for i in keep_positions])
-        new_stats.append(VariantStatistics(
-            means=np.ascontiguousarray(stats.means[keep_index]),
-            scales=np.ascontiguousarray(stats.scales[keep_index]),
-            allele_frequencies=np.ascontiguousarray(stats.allele_frequencies[keep_index]),
-            support_counts=np.ascontiguousarray(stats.support_counts[keep_index]),
-        ))
+        # When the caller supplies precomputed_variant_stats, per-source stats
+        # are placeholder empties; preserve them as-is (the final dataset uses
+        # the precomputed values, not the per-source concat).
+        if stats.means.shape[0] == 0:
+            new_stats.append(stats)
+        else:
+            new_stats.append(VariantStatistics(
+                means=np.ascontiguousarray(stats.means[keep_index]),
+                scales=np.ascontiguousarray(stats.scales[keep_index]),
+                allele_frequencies=np.ascontiguousarray(stats.allele_frequencies[keep_index]),
+                support_counts=np.ascontiguousarray(stats.support_counts[keep_index]),
+            ))
 
     total_dropped = sum(dropped_per_source)
     if total_dropped > 0:
@@ -931,6 +937,13 @@ def load_multi_source_dataset_from_files(
                 # streaming pass and use placeholder per-source stats; the
                 # final dataset replaces these with the precomputed values
                 # below.
+                #
+                # We still build variants_list from the .bim so cross-source
+                # dedup can identify PLINK variants that collide with VCF
+                # variant keys — otherwise the train pass (which has real
+                # variants_list) and the test pass (which wouldn't) produce
+                # off-by-N column counts and the precomputed-stats alignment
+                # check below trips.
                 log(f"  reusing precomputed variant statistics for {path.name} (skipping PLINK streaming pass)")
                 stats = VariantStatistics(
                     means=np.empty(0, dtype=np.float32),
@@ -938,7 +951,18 @@ def load_multi_source_dataset_from_files(
                     allele_frequencies=np.empty(0, dtype=np.float32),
                     support_counts=np.empty(0, dtype=np.int32),
                 )
-                variants_list = []
+                variants_list = [
+                    _VariantDefaults(
+                        variant_id=bim_record.variant_id,
+                        variant_class=_infer_plink_variant_class(bim_record.allele_1, bim_record.allele_2),
+                        chromosome=bim_record.chromosome,
+                        position=bim_record.position,
+                        length=1.0,
+                        allele_frequency=0.0,
+                        quality=1.0,
+                    )
+                    for bim_record in _iter_plink_bim_records(path.with_suffix(".bim"))
+                ]
             else:
                 log(f"  computing variant statistics for {path.name} (single PLINK streaming pass; disk-cached)...")
                 stats, plink_int8_cache_path = compute_plink_variant_statistics_cached(
