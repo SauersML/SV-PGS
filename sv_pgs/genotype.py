@@ -492,17 +492,34 @@ class PlinkRawGenotypeMatrix(RawGenotypeMatrix):
             yield RawGenotypeBatch(variant_indices=resolved_indices, values=values)
             return
 
-        # Prefetch with background thread
+        # Prefetch deeper than 1 batch. On slow / networked storage (GCP
+        # persistent disk, NFS, anywhere the IO latency dominates the
+        # decode), keeping multiple outstanding read+decode operations in
+        # flight lets the kernel's read-ahead and the device's own
+        # parallelism actually run, instead of paying full round-trip
+        # latency for every batch. Each in-flight batch costs ~3 GB of
+        # peak RSS, so cap at 4 to stay well under typical 32-64 GB VMs.
+        from collections import deque
         batch_index_list = [
             resolved_indices[s : s + safe_batch_size]
             for s in range(0, total, safe_batch_size)
         ]
-        with ThreadPoolExecutor(max_workers=1) as executor:
-            future = executor.submit(self._read_batch_i8, reader, batch_index_list[0])
+        prefetch_depth = min(4, len(batch_index_list))
+        with ThreadPoolExecutor(max_workers=prefetch_depth) as executor:
+            in_flight: deque = deque(
+                executor.submit(self._read_batch_i8, reader, batch_index_list[i])
+                for i in range(prefetch_depth)
+            )
+            next_to_submit = prefetch_depth
             for i in range(len(batch_index_list)):
-                values = future.result()
-                if i + 1 < len(batch_index_list):
-                    future = executor.submit(self._read_batch_i8, reader, batch_index_list[i + 1])
+                values = in_flight.popleft().result()
+                if next_to_submit < len(batch_index_list):
+                    in_flight.append(
+                        executor.submit(
+                            self._read_batch_i8, reader, batch_index_list[next_to_submit]
+                        )
+                    )
+                    next_to_submit += 1
                 yield RawGenotypeBatch(variant_indices=batch_index_list[i], values=values)
 
     def iter_column_batches(

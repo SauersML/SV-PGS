@@ -23,6 +23,7 @@ from sv_pgs.genotype import (
     RawGenotypeMatrix,
     RowSubsetRawGenotypeMatrix,
     as_raw_genotype_matrix,
+    auto_batch_size_i8,
 )
 from sv_pgs.preprocessing import (
     _batch_all_stats_i8,
@@ -1643,7 +1644,13 @@ def _compute_variant_stats_teeing_int8(
     cumulative_tee = 0.0
     batch_number = 0
     variants_done = 0
-    iter_handle = iter(raw_genotypes.iter_column_batches_i8())
+    # Pass the IO-budget-tuned batch size, NOT the PlinkRawGenotypeMatrix
+    # default (which is the 1024-variant conservative fallback). For the AoU
+    # PLINK array (~78k samples) this picks 6,435 variants/batch — same as
+    # compute_variant_statistics would, so disk latency amortizes across a
+    # 500 MB read instead of an 80 MB one (6x fewer round-trips).
+    tuned_batch_size = auto_batch_size_i8(sample_count)
+    iter_handle = iter(raw_genotypes.iter_column_batches_i8(batch_size=tuned_batch_size))
     while True:
         fetch_start = _time.monotonic()
         try:

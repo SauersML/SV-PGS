@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import mmap as _mmap
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Literal
@@ -110,6 +111,8 @@ class open_bed:
     count_A1: bool = True
     num_threads: int | None = None
     _mmap_bytes: np.ndarray | None = field(init=False, default=None, repr=False)
+    _raw_mmap: Any = field(init=False, default=None, repr=False)
+    _mmap_handle: Any = field(init=False, default=None, repr=False)
 
     def __post_init__(self) -> None:
         self.path = Path(self.path)
@@ -139,11 +142,26 @@ class open_bed:
         Avoids the per-batch open/seek/read(720 MB → bytes-copy) sequence
         that used to allocate a fresh Python bytes object — and a numpy
         wrapper for it — every batch.
+
+        Uses raw Python mmap so we can call madvise(MADV_SEQUENTIAL) — on
+        slow / networked storage (GCP persistent disk, NFS, etc.) this
+        hint tells the kernel to aggressively read-ahead and discard
+        already-read pages, often turning a multi-megabyte-per-second
+        sustained throughput into something close to the device's
+        bandwidth limit. Falls back gracefully on platforms that don't
+        expose madvise.
         """
         if self._mmap_bytes is None:
-            self._mmap_bytes = np.memmap(
-                Path(self.path), dtype=np.uint8, mode="r"
-            )
+            handle = Path(self.path).open("rb")
+            raw = _mmap.mmap(handle.fileno(), 0, access=_mmap.ACCESS_READ)
+            try:
+                if hasattr(raw, "madvise") and hasattr(_mmap, "MADV_SEQUENTIAL"):
+                    raw.madvise(_mmap.MADV_SEQUENTIAL)
+            except OSError:
+                pass
+            self._mmap_handle = handle
+            self._raw_mmap = raw
+            self._mmap_bytes = np.frombuffer(raw, dtype=np.uint8)
         return self._mmap_bytes
 
     def read(
