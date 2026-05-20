@@ -1001,17 +1001,26 @@ def _standardize_batch_cupy(
     """Standardize a raw batch directly on GPU."""
     resolved_dtype = cupy.float32 if dtype is None else dtype
     standardized = cupy.asarray(batch_values, dtype=resolved_dtype)
+    # Build the *valid* (non-missing) mask directly — never materialize its
+    # inverse. Boolean scatter (standardized[missing] = 0) triggers a prefix-sum
+    # scan, and cupy.where / ~mask each allocate another batch-sized buffer;
+    # any of those OOM on wide AoU batches. Multiply by valid_mask is
+    # elementwise and reuses the existing buffer.
     if missing_sentinel is None:
-        missing_mask = (
-            cupy.isnan(standardized)
-            if hasattr(cupy, "isnan")
-            else np.isnan(np.asarray(standardized))
-        )
+        if hasattr(cupy, "isnan"):
+            valid_mask = ~cupy.isnan(standardized)
+        else:
+            valid_mask = ~np.isnan(np.asarray(standardized))
     else:
-        missing_mask = standardized == float(missing_sentinel)
+        valid_mask = standardized != float(missing_sentinel)
     standardized -= means[None, :]
     standardized /= scales[None, :]
-    standardized[missing_mask] = 0.0
+    if missing_sentinel is None:
+        standardized[~valid_mask] = 0.0
+        return standardized
+    multiply = getattr(cupy, "multiply", np.multiply)
+    multiply(standardized, valid_mask, out=standardized)
+    del valid_mask
     return standardized
 
 
@@ -1028,6 +1037,23 @@ def _iter_standardized_gpu_batches(
     resolved_dtype = cupy.float32 if dtype is None else dtype
     selected_means = cupy.asarray(means[variant_indices], dtype=resolved_dtype)
     selected_scales = cupy.asarray(scales[variant_indices], dtype=resolved_dtype)
+    for batch_slice, values in _iter_prefetched_raw_batches(raw, variant_indices, batch_size=batch_size):
+        yield batch_slice, _standardize_batch_cupy(
+            values,
+            selected_means[batch_slice],
+            selected_scales[batch_slice],
+            cupy,
+            missing_sentinel=int(PLINK_MISSING_INT8) if _supports_int8_batches(raw) else None,
+            dtype=resolved_dtype,
+        )
+
+
+def _iter_prefetched_raw_batches(
+    raw: RawGenotypeMatrix | Int8BatchCapable,
+    variant_indices: np.ndarray,
+    *,
+    batch_size: int,
+):
     variant_indices_arr = np.asarray(variant_indices)
     n = int(variant_indices_arr.shape[0])
     if n == 0:
@@ -1036,14 +1062,12 @@ def _iter_standardized_gpu_batches(
     sample_count = int(raw.shape[0])
 
     if _supports_int8_batches(raw):
-        missing_sentinel: int | None = int(PLINK_MISSING_INT8)
         i8_raw = raw
         def _read_chunk(chunk_indices: np.ndarray) -> np.ndarray:
             for batch in i8_raw.iter_column_batches_i8(chunk_indices, batch_size=chunk_indices.shape[0]):
                 return np.asarray(batch.values)
             return np.empty((sample_count, 0), dtype=np.int8)
     else:
-        missing_sentinel = None
         float_raw = raw
         def _read_chunk(chunk_indices: np.ndarray) -> np.ndarray:
             for batch in float_raw.iter_column_batches(chunk_indices, batch_size=chunk_indices.shape[0]):
@@ -1067,15 +1091,7 @@ def _iter_standardized_gpu_batches(
             values = _read_chunk(chunk)
             batch_width = values.shape[1]
             local_stop = local_start + batch_width
-            batch_slice = slice(local_start, local_stop)
-            yield batch_slice, _standardize_batch_cupy(
-                values,
-                selected_means[batch_slice],
-                selected_scales[batch_slice],
-                cupy,
-                missing_sentinel=missing_sentinel,
-                dtype=resolved_dtype,
-            )
+            yield slice(local_start, local_stop), values
             local_start = local_stop
         return
 
@@ -1102,15 +1118,7 @@ def _iter_standardized_gpu_batches(
             _submit_more()
             batch_width = values.shape[1]
             local_stop = local_start + batch_width
-            batch_slice = slice(local_start, local_stop)
-            yield batch_slice, _standardize_batch_cupy(
-                values,
-                selected_means[batch_slice],
-                selected_scales[batch_slice],
-                cupy,
-                missing_sentinel=missing_sentinel,
-                dtype=resolved_dtype,
-            )
+            yield slice(local_start, local_stop), values
             local_start = local_stop
     finally:
         for pending in futures:
@@ -1139,6 +1147,81 @@ def _gpu_streaming_batch_size(
         requested_batch_size,
         target_batch_bytes=GPU_STANDARDIZED_STREAMING_TARGET_BATCH_BYTES,
     )
+
+
+def _gpu_int8_transpose_matmul(
+    *,
+    raw_int8: Int8BatchCapable,
+    variant_indices: np.ndarray,
+    means: np.ndarray,
+    scales: np.ndarray,
+    support_counts: np.ndarray | None,
+    matrix_gpu,
+    batch_size: int,
+    cupy,
+    dtype,
+    progress_label: str | None,
+):
+    selected_variant_indices = np.asarray(variant_indices, dtype=np.int32)
+    selected_means_gpu = cupy.asarray(means[selected_variant_indices], dtype=dtype)
+    selected_scales_gpu = cupy.asarray(scales[selected_variant_indices], dtype=dtype)
+    selected_support_counts = (
+        None
+        if support_counts is None
+        else np.asarray(support_counts[selected_variant_indices], dtype=np.int64)
+    )
+    result_gpu = cupy.empty((selected_variant_indices.shape[0], matrix_gpu.shape[1]), dtype=dtype)
+    vector_sums_gpu = cupy.sum(matrix_gpu, axis=0)
+    total_variants = int(selected_variant_indices.shape[0])
+    completed_variants = 0
+    last_logged_variants = 0
+    log_interval = max(total_variants // 50, 1)
+    missing_sentinel = int(PLINK_MISSING_INT8)
+    import time as _time
+    t_start = _time.monotonic()
+    if progress_label is not None:
+        log(f"        {progress_label}: start streaming {total_variants:,} variants (batch_size={batch_size})  mem={mem()}")
+    for batch_slice, host_values in _iter_prefetched_raw_batches(
+        raw_int8,
+        selected_variant_indices,
+        batch_size=batch_size,
+    ):
+        int8_gpu = cupy.asarray(host_values, dtype=getattr(cupy, "int8", np.int8))
+        values_gpu = int8_gpu.astype(dtype)
+        means_gpu = selected_means_gpu[batch_slice]
+        scales_gpu = selected_scales_gpu[batch_slice]
+        if selected_support_counts is None:
+            has_missing = bool(np.any(host_values == missing_sentinel))
+        else:
+            has_missing = bool(np.any(selected_support_counts[batch_slice] < raw_int8.shape[0]))
+        if has_missing:
+            missing_gpu = int8_gpu == missing_sentinel
+            where = getattr(cupy, "where", np.where)
+            values_gpu = where(missing_gpu, 0.0, values_gpu)
+            nonmissing_vector_sums_gpu = vector_sums_gpu[None, :] - (
+                missing_gpu.astype(dtype).T @ matrix_gpu
+            )
+        else:
+            nonmissing_vector_sums_gpu = vector_sums_gpu[None, :]
+        result_gpu[batch_slice, :] = (
+            values_gpu.T @ matrix_gpu - means_gpu[:, None] * nonmissing_vector_sums_gpu
+        ) / scales_gpu[:, None]
+        if progress_label is not None:
+            completed_variants = batch_slice.stop
+            if completed_variants - last_logged_variants >= log_interval:
+                last_logged_variants = completed_variants
+                elapsed_seconds = _time.monotonic() - t_start
+                rate = completed_variants / max(elapsed_seconds, 1e-6)
+                eta = (total_variants - completed_variants) / max(rate, 1e-6)
+                log(
+                    f"        {progress_label}: {completed_variants:,}/{total_variants:,} "
+                    f"({100*completed_variants/total_variants:.1f}%) "
+                    f"elapsed={elapsed_seconds:.0f}s rate={rate:,.0f}v/s eta={eta:.0f}s  mem={mem()}"
+                )
+    if progress_label is not None:
+        elapsed_seconds = _time.monotonic() - t_start
+        log(f"        {progress_label}: done {total_variants:,} variants in {elapsed_seconds:.1f}s  mem={mem()}")
+    return result_gpu
 
 
 def _gpu_free_bytes(cupy) -> int:
@@ -2634,8 +2717,22 @@ class StandardizedGenotypeMatrix:
         streaming_cupy, streaming_batch_size = self._streaming_gpu_context(batch_size)
         if streaming_cupy is None or streaming_batch_size is None or self.raw is None:
             raise RuntimeError("GPU genotype transpose matmul requires a GPU cache or a streaming raw backend.")
-        result_gpu = cupy.empty((self.shape[1], matrix_gpu.shape[1]), dtype=resolved_dtype)
         raw_matrix = cast(RawGenotypeMatrix, self.raw)
+        if _supports_int8_batches(raw_matrix):
+            result_gpu = _gpu_int8_transpose_matmul(
+                raw_int8=cast(Int8BatchCapable, raw_matrix),
+                variant_indices=self.variant_indices,
+                means=self.means,
+                scales=self.scales,
+                support_counts=self.support_counts,
+                matrix_gpu=matrix_gpu,
+                batch_size=streaming_batch_size,
+                cupy=cupy,
+                dtype=resolved_dtype,
+                progress_label=progress_label,
+            )
+            return result_gpu[:, 0] if vector_input else result_gpu
+        result_gpu = cupy.empty((self.shape[1], matrix_gpu.shape[1]), dtype=resolved_dtype)
         total_variants = self.shape[1]
         completed_variants = 0
         last_logged_variants = 0

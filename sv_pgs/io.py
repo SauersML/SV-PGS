@@ -538,8 +538,7 @@ def load_dataset_from_files(
         default_variants=default_variants,
         variant_metadata_path=variant_metadata_path,
     )
-    sv_count = sum(1 for vr in variant_records if vr.variant_class.value not in ("snv", "small_indel"))
-    snv_count = sum(1 for vr in variant_records if vr.variant_class.value == "snv")
+    snv_count, sv_count = _count_variant_record_classes(variant_records)
     log(f"variant records: {len(variant_records)} total ({snv_count} SNVs, {sv_count} structural variants)")
 
     log(f"=== LOAD DATASET DONE === final shape={raw_genotypes.shape}  mem={mem()}")
@@ -699,8 +698,7 @@ def load_multi_vcf_dataset_from_files(
         default_variants=default_variants,
         variant_metadata_path=variant_metadata_path,
     )
-    sv_count = sum(1 for vr in variant_records if vr.variant_class.value not in ("snv", "small_indel"))
-    snv_count = sum(1 for vr in variant_records if vr.variant_class.value == "snv")
+    snv_count, sv_count = _count_variant_record_classes(variant_records)
     log(f"variant records: {len(variant_records)} total ({snv_count} SNVs, {sv_count} structural variants)")
 
     log(f"=== LOAD MULTI-VCF DATASET DONE === final shape={raw_genotypes.shape}  mem={mem()}")
@@ -1078,7 +1076,11 @@ def load_multi_source_dataset_from_files(
             support_counts=np.concatenate([stats.support_counts for stats in per_source_stats]).astype(np.int32, copy=False),
         )
     if precomputed_variant_records is not None:
-        variant_records = list(precomputed_variant_records)
+        variant_records = (
+            precomputed_variant_records
+            if isinstance(precomputed_variant_records, list)
+            else list(precomputed_variant_records)
+        )
         log(f"reusing {len(variant_records):,} precomputed variant_records (skipping metadata join)")
     else:
         log("building variant records from defaults + optional metadata...")
@@ -1086,8 +1088,7 @@ def load_multi_source_dataset_from_files(
             default_variants=default_variants,
             variant_metadata_path=variant_metadata_path,
         )
-    sv_count = sum(1 for vr in variant_records if vr.variant_class.value not in ("snv", "small_indel"))
-    snv_count = sum(1 for vr in variant_records if vr.variant_class.value == "snv")
+    snv_count, sv_count = _count_variant_record_classes(variant_records)
     log(f"variant records: {len(variant_records):,} total ({snv_count:,} SNVs, {sv_count:,} structural variants)")
 
     log(f"=== LOAD MULTI-SOURCE DATASET DONE === final shape={raw_genotypes.shape}  mem={mem()}")
@@ -3389,26 +3390,39 @@ def _build_variant_records(
     default_variants: Sequence[_VariantDefaults],
     variant_metadata_path: str | Path | None,
 ) -> list[VariantRecord]:
+    if variant_metadata_path is None:
+        return [
+            VariantRecord(
+                variant_id=variant.variant_id,
+                variant_class=variant.variant_class,
+                chromosome=variant.chromosome,
+                position=variant.position,
+                length=variant.length,
+                allele_frequency=variant.allele_frequency,
+                quality=variant.quality,
+            )
+            for variant in default_variants
+        ]
+
     metadata_rows_by_id: dict[str, dict[str, str]] = {}
     annotation_kinds: dict[str, str] = {}
-    if variant_metadata_path is not None:
-        table_spec = _inspect_delimited_table(variant_metadata_path)
-        if not table_spec.columns:
-            raise ValueError("Variant metadata file is empty: " + str(variant_metadata_path))
-        _require_columns(available_columns=table_spec.columns, required_columns=("variant_id",), context="variant metadata")
-        saw_rows = False
-        for row in _iter_delimited_rows(table_spec):
-            saw_rows = True
-            variant_id = str(row["variant_id"]).strip()
-            if not variant_id:
-                raise ValueError("Encountered blank variant_id in variant metadata.")
-            if variant_id in metadata_rows_by_id:
-                raise ValueError("Duplicate variant_id in variant metadata: " + variant_id)
-            metadata_rows_by_id[variant_id] = row
-        if not saw_rows:
-            raise ValueError("Variant metadata file is empty: " + str(variant_metadata_path))
-        annotation_kinds = _infer_annotation_column_kinds(list(metadata_rows_by_id.values()))
-        _log_annotation_column_kinds(table_spec.columns, annotation_kinds)
+    table_spec = _inspect_delimited_table(variant_metadata_path)
+    if not table_spec.columns:
+        raise ValueError("Variant metadata file is empty: " + str(variant_metadata_path))
+    _require_columns(available_columns=table_spec.columns, required_columns=("variant_id",), context="variant metadata")
+    saw_rows = False
+    for row in _iter_delimited_rows(table_spec):
+        saw_rows = True
+        variant_id = str(row["variant_id"]).strip()
+        if not variant_id:
+            raise ValueError("Encountered blank variant_id in variant metadata.")
+        if variant_id in metadata_rows_by_id:
+            raise ValueError("Duplicate variant_id in variant metadata: " + variant_id)
+        metadata_rows_by_id[variant_id] = row
+    if not saw_rows:
+        raise ValueError("Variant metadata file is empty: " + str(variant_metadata_path))
+    annotation_kinds = _infer_annotation_column_kinds(list(metadata_rows_by_id.values()))
+    _log_annotation_column_kinds(table_spec.columns, annotation_kinds)
 
     records: list[VariantRecord] = []
     seen_variant_ids: set[str] = set()
@@ -3426,6 +3440,18 @@ def _build_variant_records(
             + ", ".join(extra_variant_ids[:10])
         )
     return records
+
+
+def _count_variant_record_classes(variant_records: Sequence[VariantRecord]) -> tuple[int, int]:
+    snv_count = 0
+    sv_count = 0
+    for record in variant_records:
+        variant_class_value = record.variant_class.value
+        if variant_class_value == "snv":
+            snv_count += 1
+        elif variant_class_value != "small_indel":
+            sv_count += 1
+    return snv_count, sv_count
 
 
 def _log_annotation_column_kinds(columns: Sequence[str], annotation_kinds: dict[str, str]) -> None:

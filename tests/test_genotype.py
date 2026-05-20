@@ -897,6 +897,46 @@ def test_streaming_gpu_context_caps_large_int8_standardized_tiles(monkeypatch: p
     assert streaming_batch_size < genotype_module.auto_batch_size_i8(raw.shape[0])
 
 
+def test_gpu_int8_transpose_matvec_matches_standardized_cpu_path(monkeypatch: pytest.MonkeyPatch):
+    class _FakeCupy:
+        float32 = np.float32
+        float64 = np.float64
+        int8 = np.int8
+
+        @staticmethod
+        def asarray(array, dtype=None):
+            return np.asarray(array, dtype=dtype)
+
+        @staticmethod
+        def empty(shape, dtype=None):
+            return np.empty(shape, dtype=dtype)
+
+        @staticmethod
+        def sum(array, axis=None):
+            return np.sum(array, axis=axis)
+
+    raw_matrix = np.array(
+        [
+            [0, 1, -127, 2],
+            [1, 2, 0, -127],
+            [2, 0, 1, 1],
+            [0, -127, 2, 2],
+        ],
+        dtype=np.int8,
+    )
+    means = np.array([0.75, 1.0, 1.0, 1.25], dtype=np.float32)
+    scales = np.array([0.8, 0.9, 1.1, 1.2], dtype=np.float32)
+    vector = np.array([0.5, -1.0, 2.0, 0.25], dtype=np.float32)
+    standardized = Int8RawGenotypeMatrix(raw_matrix).standardized(means, scales)
+    expected = standardized.materialize().T @ vector
+
+    monkeypatch.setattr(genotype_module, "_try_import_cupy", lambda: _FakeCupy())
+
+    result = standardized.transpose_matvec_numpy(vector, batch_size=2)
+
+    np.testing.assert_allclose(result, expected, rtol=1e-6, atol=1e-6)
+
+
 def test_try_materialize_gpu_uses_int8_batch_size_for_plink_like_backends(monkeypatch: pytest.MonkeyPatch):
     class _FakeCudaRuntime:
         @staticmethod
