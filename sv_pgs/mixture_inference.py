@@ -2793,6 +2793,23 @@ def fit_variational_em(
                 config,
             )
             if should_update_hyperparameters:
+                # Save current hyperparameters so we can revert if the
+                # proposed update would decrease the ELBO. The Newton-based
+                # hyperparameter updates optimize their own local objectives,
+                # not the joint ELBO, so they can decrease it transiently.
+                saved_global_scale = float(global_scale)
+                saved_scale_model_coefficients = np.asarray(
+                    scale_model_coefficients, dtype=np.float64
+                ).copy()
+                saved_tpb_shape_a_vector = np.asarray(
+                    tpb_shape_a_vector, dtype=np.float64
+                ).copy()
+                saved_tpb_shape_b_vector = np.asarray(
+                    tpb_shape_b_vector, dtype=np.float64
+                ).copy()
+                saved_local_shape_a = np.asarray(local_shape_a, dtype=np.float64).copy()
+                saved_local_shape_b = np.asarray(local_shape_b, dtype=np.float64).copy()
+
                 global_scale, scale_model_coefficients = _update_scale_model(
                     reduced_second_moment=reduced_second_moment,
                     local_scale=updated_local_scale,
@@ -2812,6 +2829,72 @@ def fit_variational_em(
                 )
                 local_shape_a = prior_design.class_membership_matrix @ tpb_shape_a_vector
                 local_shape_b = prior_design.class_membership_matrix @ tpb_shape_b_vector
+
+                # Compute candidate ELBO under the proposed hyperparameters
+                # and revert if it would drop by more than a relative
+                # tolerance. Wrap in try/except so any compute failure
+                # falls through to accepting the update.
+                try:
+                    candidate_metadata_baseline_scales = _metadata_baseline_scales_from_coefficients(
+                        scale_model_coefficients,
+                        prior_design.design_matrix,
+                        config,
+                    )
+                    candidate_baseline_reduced_prior_variances = (
+                        float(global_scale) * candidate_metadata_baseline_scales
+                    ) ** 2
+                    candidate_reduced_prior_variances = _effective_prior_variances(
+                        baseline_prior_variances=candidate_baseline_reduced_prior_variances,
+                        local_scale=updated_local_scale,
+                        config=config,
+                    )
+                    candidate_elbo = compute_elbo(
+                        trait_type=config.trait_type,
+                        targets=target_vector,
+                        covariate_matrix=covariate_matrix,
+                        alpha=alpha_state,
+                        beta=beta_state,
+                        beta_variance=beta_variance_state,
+                        linear_predictor=np.asarray(
+                            posterior_state.linear_predictor, dtype=np.float64
+                        ),
+                        reduced_prior_variances=candidate_reduced_prior_variances,
+                        sigma_error2=float(sigma_error2),
+                        predictor_variance=None,
+                        local_scale_prior_objective=_local_scale_prior_objective(
+                            local_scale=updated_local_scale,
+                            auxiliary_delta=updated_auxiliary_delta,
+                            local_shape_a=local_shape_a,
+                            local_shape_b=local_shape_b,
+                        ),
+                        scale_penalty_objective=_scale_penalty_objective(
+                            scale_model_coefficients=scale_model_coefficients,
+                            scale_penalty=scale_penalty,
+                        ),
+                    )
+                    if elbo_history and len(elbo_history) >= 1:
+                        previous_elbo = float(elbo_history[-1])
+                        if (
+                            np.isfinite(previous_elbo)
+                            and np.isfinite(candidate_elbo)
+                            and candidate_elbo
+                            < previous_elbo - 1e-4 * max(1.0, abs(previous_elbo))
+                        ):
+                            log(
+                                f"  hyperparameter update rejected "
+                                f"(ELBO would drop by "
+                                f"{previous_elbo - float(candidate_elbo):.4e})"
+                            )
+                            global_scale = saved_global_scale
+                            scale_model_coefficients = saved_scale_model_coefficients
+                            tpb_shape_a_vector = saved_tpb_shape_a_vector
+                            tpb_shape_b_vector = saved_tpb_shape_b_vector
+                            local_shape_a = saved_local_shape_a
+                            local_shape_b = saved_local_shape_b
+                except Exception as _safeguard_err:
+                    log(
+                        f"  hyperparameter ELBO safeguard skipped: {_safeguard_err}"
+                    )
             local_scale = updated_local_scale
             auxiliary_delta = (local_shape_a + local_shape_b) / np.maximum(1.0 + local_scale, config.local_scale_floor)
 
@@ -2981,18 +3064,113 @@ def fit_variational_em(
                             and np.all(np.isfinite(tpb_b_new))
                             and np.all(np.isfinite(sc_new))
                         ):
+                            # Save pre-Anderson state so we can revert if the
+                            # accelerated proposal would decrease the ELBO.
+                            # Anderson extrapolates outside the line of safe
+                            # CAVI moves and can transiently degrade the ELBO.
+                            _pre_anderson_global_scale = float(global_scale)
+                            _pre_anderson_scale_model_coefficients = np.asarray(
+                                scale_model_coefficients, dtype=np.float64
+                            ).copy()
+                            _pre_anderson_tpb_shape_a_vector = np.asarray(
+                                tpb_shape_a_vector, dtype=np.float64
+                            ).copy()
+                            _pre_anderson_tpb_shape_b_vector = np.asarray(
+                                tpb_shape_b_vector, dtype=np.float64
+                            ).copy()
+                            _pre_anderson_local_shape_a = np.asarray(
+                                local_shape_a, dtype=np.float64
+                            ).copy()
+                            _pre_anderson_local_shape_b = np.asarray(
+                                local_shape_b, dtype=np.float64
+                            ).copy()
+
                             global_scale = global_scale_new
                             scale_model_coefficients = np.asarray(sc_new, dtype=np.float64)
                             tpb_shape_a_vector = np.asarray(tpb_a_new, dtype=np.float64)
                             tpb_shape_b_vector = np.asarray(tpb_b_new, dtype=np.float64)
                             local_shape_a = prior_design.class_membership_matrix @ tpb_shape_a_vector
                             local_shape_b = prior_design.class_membership_matrix @ tpb_shape_b_vector
-                            # Keep the "previous_*" trackers consistent with
-                            # the accelerated state so the next iteration's
-                            # convergence delta is measured against this iter.
-                            previous_theta = _pack_theta(global_scale, scale_model_coefficients)
-                            previous_tpb_shape_a_vector = tpb_shape_a_vector.copy()
-                            previous_tpb_shape_b_vector = tpb_shape_b_vector.copy()
+
+                            # ELBO safeguard: predict next-iter ELBO using the
+                            # current posterior (a lower bound on next iter's
+                            # actual ELBO since the next posterior solve only
+                            # increases ELBO) and revert if it would drop.
+                            _anderson_accepted = True
+                            try:
+                                _candidate_metadata_baseline_scales = _metadata_baseline_scales_from_coefficients(
+                                    scale_model_coefficients,
+                                    prior_design.design_matrix,
+                                    config,
+                                )
+                                _candidate_baseline_reduced_prior_variances = (
+                                    float(global_scale) * _candidate_metadata_baseline_scales
+                                ) ** 2
+                                _candidate_reduced_prior_variances = _effective_prior_variances(
+                                    baseline_prior_variances=_candidate_baseline_reduced_prior_variances,
+                                    local_scale=local_scale,
+                                    config=config,
+                                )
+                                _candidate_auxiliary_delta = (
+                                    local_shape_a + local_shape_b
+                                ) / np.maximum(1.0 + local_scale, config.local_scale_floor)
+                                _candidate_elbo = compute_elbo(
+                                    trait_type=config.trait_type,
+                                    targets=target_vector,
+                                    covariate_matrix=covariate_matrix,
+                                    alpha=alpha_state,
+                                    beta=beta_state,
+                                    beta_variance=beta_variance_state,
+                                    linear_predictor=np.asarray(
+                                        posterior_state.linear_predictor, dtype=np.float64
+                                    ),
+                                    reduced_prior_variances=_candidate_reduced_prior_variances,
+                                    sigma_error2=float(sigma_error2),
+                                    predictor_variance=None,
+                                    local_scale_prior_objective=_local_scale_prior_objective(
+                                        local_scale=local_scale,
+                                        auxiliary_delta=_candidate_auxiliary_delta,
+                                        local_shape_a=local_shape_a,
+                                        local_shape_b=local_shape_b,
+                                    ),
+                                    scale_penalty_objective=_scale_penalty_objective(
+                                        scale_model_coefficients=scale_model_coefficients,
+                                        scale_penalty=scale_penalty,
+                                    ),
+                                )
+                                if elbo_history and len(elbo_history) >= 1:
+                                    _previous_elbo = float(elbo_history[-1])
+                                    if (
+                                        np.isfinite(_previous_elbo)
+                                        and np.isfinite(_candidate_elbo)
+                                        and _candidate_elbo
+                                        < _previous_elbo - 1e-4 * max(1.0, abs(_previous_elbo))
+                                    ):
+                                        log(
+                                            f"  Anderson acceleration rejected "
+                                            f"(ELBO would drop by "
+                                            f"{_previous_elbo - float(_candidate_elbo):.4e})"
+                                        )
+                                        global_scale = _pre_anderson_global_scale
+                                        scale_model_coefficients = _pre_anderson_scale_model_coefficients
+                                        tpb_shape_a_vector = _pre_anderson_tpb_shape_a_vector
+                                        tpb_shape_b_vector = _pre_anderson_tpb_shape_b_vector
+                                        local_shape_a = _pre_anderson_local_shape_a
+                                        local_shape_b = _pre_anderson_local_shape_b
+                                        anderson_state.reset()
+                                        _anderson_accepted = False
+                            except Exception as _anderson_safeguard_err:
+                                log(
+                                    f"  Anderson ELBO safeguard skipped: {_anderson_safeguard_err}"
+                                )
+
+                            if _anderson_accepted:
+                                # Keep the "previous_*" trackers consistent with
+                                # the accelerated state so the next iteration's
+                                # convergence delta is measured against this iter.
+                                previous_theta = _pack_theta(global_scale, scale_model_coefficients)
+                                previous_tpb_shape_a_vector = tpb_shape_a_vector.copy()
+                                previous_tpb_shape_b_vector = tpb_shape_b_vector.copy()
                 except Exception as exc:
                     log(f"  Anderson acceleration skipped: {exc}")
                     anderson_state.reset()
@@ -10559,6 +10737,19 @@ def _update_scale_model(
         theta = candidate_theta
         if scale_change < config.convergence_tolerance:
             break
+
+    # Bounded contraction on the downward movement of the global log scale.
+    # On problems with few signal variants among many noise variants, the
+    # Newton step averages 1/p Sigma E[beta^2] / (s^2 lambda) over noise
+    # coordinates and collapses sigma_g toward the noise floor before the
+    # local-scale GIG updates can identify the signal. Clip the per-call
+    # log-decrease to ~22% so sigma_g can shrink at most 22% per outer EM
+    # iteration; upward movement is unaffected.
+    max_log_decrease_per_call = 0.25
+    final_log_global_scale = float(theta[0])
+    if final_log_global_scale < global_log_scale - max_log_decrease_per_call:
+        final_log_global_scale = global_log_scale - max_log_decrease_per_call
+    theta[0] = float(np.clip(final_log_global_scale, global_log_floor, global_log_ceiling))
 
     return float(np.exp(theta[0])), np.asarray(theta[1:], dtype=np.float64)
 
