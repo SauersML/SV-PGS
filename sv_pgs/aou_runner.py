@@ -12,7 +12,12 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-from sv_pgs.all_of_us import AllOfUsDiseaseRequest, prepare_all_of_us_disease_sample_table, resolve_disease_definition
+from sv_pgs.all_of_us import (
+    DISEASE_DEFINITIONS,
+    AllOfUsDiseaseRequest,
+    prepare_all_of_us_disease_sample_table,
+    resolve_disease_definition,
+)
 from sv_pgs.config import ModelConfig, TraitType
 from sv_pgs.io import load_multi_source_dataset_from_files
 from sv_pgs.pipeline import run_training_pipeline
@@ -709,7 +714,7 @@ def run_all_of_us(
         "=== ALL OF US PIPELINE ===  "
         + f"disease={disease_def.canonical_name}  chromosomes={chromosomes}  n_pcs={n_pcs}  cpus={os.cpu_count()}"
     )
-    log(f"  ICD-9: {disease_def.icd9_prefixes}  ICD-10: {disease_def.icd10_prefixes}")
+    log(f"  SNOMED root: {disease_def.snomed_code} ({disease_def.snomed_concept_name})")
     log(f"  output: {work_dir}")
     config = ModelConfig(
         max_outer_iterations=max_outer_iterations,
@@ -982,3 +987,48 @@ def run_all_of_us(
         log("=== UNIFIED FIT CLEANUP DONE ===")
 
     log("=== ALL OF US PIPELINE COMPLETE ===")
+
+
+def run_all_of_us_all_diseases(
+    chromosomes: list[int],
+    output_base: str,
+    variant_metadata_path: str | Path | None = None,
+    n_pcs: int = 10,
+    max_outer_iterations: int = 20,
+    random_seed: int = 0,
+    variants: str = "snp+sv",
+    test_fraction: float = 0.2,
+    marginal_screen_min_abs_z: float = 1.5,
+) -> None:
+    """Run the AoU pipeline for every disease in DISEASE_DEFINITIONS.
+
+    Each disease writes into its own subdirectory `<canonical_name>_results/`
+    under `output_base`. Diseases are processed sequentially so the SV VCF
+    and microarray PLINK caches built by the first disease are reused by all
+    subsequent diseases (the cache lives under `output_base/.sv_pgs_cache/`).
+    """
+    base_dir = Path(output_base)
+    base_dir.mkdir(parents=True, exist_ok=True)
+    failures: list[tuple[str, str]] = []
+    for disease_definition in DISEASE_DEFINITIONS:
+        disease_output_dir = base_dir / f"{disease_definition.canonical_name}_results"
+        log(f"=== TOP-20 LOOP: starting {disease_definition.canonical_name} -> {disease_output_dir} ===")
+        try:
+            run_all_of_us(
+                disease=disease_definition.canonical_name,
+                chromosomes=chromosomes,
+                output_base=str(disease_output_dir),
+                variant_metadata_path=variant_metadata_path,
+                n_pcs=n_pcs,
+                max_outer_iterations=max_outer_iterations,
+                random_seed=random_seed,
+                variants=variants,
+                test_fraction=test_fraction,
+                marginal_screen_min_abs_z=marginal_screen_min_abs_z,
+            )
+        except (RuntimeError, ValueError, OSError) as exc:
+            log(f"=== TOP-20 LOOP: {disease_definition.canonical_name} FAILED: {exc} ===")
+            failures.append((disease_definition.canonical_name, str(exc)))
+    if failures:
+        details = "; ".join(f"{name}: {msg}" for name, msg in failures)
+        raise RuntimeError(f"run_all_of_us_all_diseases: {len(failures)} disease(s) failed: {details}")

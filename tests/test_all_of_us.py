@@ -52,7 +52,7 @@ class _FakeBigQueryClient:
         return _FakeQueryJob(self.rows)
 
 
-def test_build_all_of_us_disease_sql_uses_workspace_cdr_and_prefix_filters(monkeypatch):
+def test_build_all_of_us_disease_sql_uses_workspace_cdr_and_snomed_concept_ancestor(monkeypatch):
     monkeypatch.setenv("WORKSPACE_CDR", "aou_workspace.cdr_dataset")
     disease_definition = resolve_disease_definition("heart_failure")
     sql = build_all_of_us_disease_sql(disease_definition)
@@ -61,16 +61,18 @@ def test_build_all_of_us_disease_sql_uses_workspace_cdr_and_prefix_filters(monke
     assert "`aou_workspace.cdr_dataset.condition_occurrence`" in sql
     assert "`aou_workspace.cdr_dataset.observation_period`" in sql
     assert "`aou_workspace.cdr_dataset.person`" in sql
-    assert "condition_source_concept_id" in sql
-    assert "vocabulary_id = 'ICD10CM'" in sql
-    assert "vocabulary_id = 'ICD9CM'" in sql
-    assert "FROM `aou_workspace.cdr_dataset.concept` AS concept" in sql
-    assert "JOIN `aou_workspace.cdr_dataset.concept_ancestor` AS concept_ancestor" in sql
+    assert "condition_concept_id" in sql
+    assert "vocabulary_id = 'SNOMED'" in sql
+    assert "standard_concept = 'S'" in sql
+    assert "FROM `aou_workspace.cdr_dataset.concept`" in sql
+    assert "`aou_workspace.cdr_dataset.concept_ancestor`" in sql
     assert "JOIN `aou_workspace.cdr_dataset.observation` AS observation" in sql
-    assert "STARTS_WITH(concept_code, icd10_prefix)" in sql
+    assert "concept_code = @snomed_code" in sql
     assert "primary_consent_date" in sql
+    # The snomed code must NOT be string-interpolated into the SQL itself.
+    assert disease_definition.snomed_code not in sql
     parameter_values = {parameter.name: parameter for parameter in query_config.query_parameters}
-    assert parameter_values["icd10_prefixes"].values == ["I50"]
+    assert parameter_values["snomed_code"].value == "84114007"
 
 
 def test_prepare_all_of_us_disease_sample_table_writes_outputs(tmp_path: Path, monkeypatch):
@@ -124,7 +126,7 @@ def test_prepare_all_of_us_disease_sample_table_writes_outputs(tmp_path: Path, m
     assert "heart_failure" not in fake_client.sql
     assert fake_client.job_config is not None
     parameter_values = {parameter.name: parameter for parameter in fake_client.job_config.query_parameters}
-    assert parameter_values["icd10_prefixes"].values == ["I50"]
+    assert parameter_values["snomed_code"].value == "84114007"
 
     rows = _read_tsv_rows(output_path)
     assert rows[0]["sample_id"] == "101"
@@ -134,7 +136,10 @@ def test_prepare_all_of_us_disease_sample_table_writes_outputs(tmp_path: Path, m
     metadata_payload = json.loads(outputs.metadata_path.read_text(encoding="utf-8"))
     assert metadata_payload["row_count"] == 2
     assert metadata_payload["disease"] == "heart_failure"
-    assert metadata_payload["icd10_prefixes"] == ["I50"]
+    assert metadata_payload["snomed_code"] == "84114007"
+    assert metadata_payload["snomed_concept_name"] == "Heart failure"
+    assert "icd10_prefixes" not in metadata_payload
+    assert "icd9_prefixes" not in metadata_payload
     assert metadata_payload["min_occurrences"] == 2
     assert metadata_payload["cdr_dataset"] == "aou_workspace.cdr_dataset"
 

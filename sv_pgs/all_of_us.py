@@ -18,83 +18,155 @@ class DiseaseDefinition:
     canonical_name: str
     aliases: tuple[str, ...]
     description: str
-    icd9_prefixes: tuple[str, ...]
-    icd10_prefixes: tuple[str, ...]
+    snomed_code: str
+    snomed_concept_name: str
 
 
+# Top-20 chronic disease phenotypes. Each is rooted at a single SNOMED CT
+# disease concept; the OMOP concept_id is resolved at query time via the
+# `concept` table (vocabulary_id='SNOMED', standard_concept='S'), and the
+# `concept_ancestor` join expands to every descendant disorder. This mirrors
+# the OHDSI Phenotype Library's canonical-cohort logic.
 DISEASE_DEFINITIONS: tuple[DiseaseDefinition, ...] = (
     DiseaseDefinition(
+        canonical_name="hypertension",
+        aliases=("htn", "high_blood_pressure", "high blood pressure", "essential_hypertension"),
+        description="Essential hypertension phenotype from EHR conditions.",
+        snomed_code="59621000",
+        snomed_concept_name="Essential hypertension",
+    ),
+    DiseaseDefinition(
         canonical_name="type2_diabetes",
-        aliases=("t2d", "type_2_diabetes", "type 2 diabetes", "diabetes_type_2"),
+        aliases=("t2d", "type_2_diabetes", "type 2 diabetes", "diabetes_type_2", "t2dm"),
         description="Type 2 diabetes mellitus phenotype from EHR conditions.",
-        # ICD-9 250.x0/250.x2 = T2D; 250.x1/250.x3 = T1D. Using broad prefix
-        # 250 captures some T1D but matches standard EHR phenotyping practice.
-        # ICD-10 E11 is specific to T2D.
-        icd9_prefixes=("250",),
-        icd10_prefixes=("E11",),
+        snomed_code="44054006",
+        snomed_concept_name="Diabetes mellitus type 2",
     ),
     DiseaseDefinition(
-        canonical_name="heart_failure",
-        aliases=("hf", "congestive_heart_failure", "chf", "heart failure"),
-        description="Heart failure phenotype from EHR conditions.",
-        icd9_prefixes=("428",),
-        icd10_prefixes=("I50",),
+        canonical_name="hyperlipidemia",
+        aliases=("dyslipidemia", "high_cholesterol", "hypercholesterolemia"),
+        description="Hyperlipidemia phenotype from EHR conditions.",
+        snomed_code="55822004",
+        snomed_concept_name="Hyperlipidemia",
     ),
     DiseaseDefinition(
-        canonical_name="atrial_fibrillation",
-        aliases=("af", "afib", "a_fib", "atrial fibrillation"),
-        description="Atrial fibrillation and flutter phenotype from EHR conditions.",
-        icd9_prefixes=("427.3",),
-        icd10_prefixes=("I48",),
+        canonical_name="obesity",
+        aliases=("obese", "morbid_obesity"),
+        description="Obesity phenotype from EHR conditions.",
+        snomed_code="414916001",
+        snomed_concept_name="Obesity",
     ),
     DiseaseDefinition(
         canonical_name="asthma",
         aliases=("asthma_chronic",),
         description="Asthma phenotype from EHR conditions.",
-        icd9_prefixes=("493",),
-        icd10_prefixes=("J45",),
+        snomed_code="195967001",
+        snomed_concept_name="Asthma",
     ),
     DiseaseDefinition(
-        canonical_name="copd",
-        aliases=("chronic_obstructive_pulmonary_disease", "chronic obstructive pulmonary disease"),
-        description="Chronic obstructive pulmonary disease phenotype from EHR conditions.",
-        icd9_prefixes=("490", "491", "492", "496"),
-        icd10_prefixes=("J40", "J41", "J42", "J43", "J44"),
+        canonical_name="depression",
+        aliases=("major_depression", "major depressive disorder", "mdd"),
+        description="Major depressive disorder phenotype from EHR conditions.",
+        snomed_code="370143000",
+        snomed_concept_name="Major depressive disorder",
+    ),
+    DiseaseDefinition(
+        canonical_name="anxiety",
+        aliases=("anxiety_disorder", "generalized_anxiety"),
+        description="Anxiety phenotype from EHR conditions.",
+        snomed_code="48694002",
+        snomed_concept_name="Anxiety",
+    ),
+    DiseaseDefinition(
+        canonical_name="gerd",
+        aliases=("reflux", "gastroesophageal_reflux", "gastroesophageal reflux disease"),
+        description="Gastroesophageal reflux disease phenotype from EHR conditions.",
+        snomed_code="235595009",
+        snomed_concept_name="Gastroesophageal reflux disease",
     ),
     DiseaseDefinition(
         canonical_name="chronic_kidney_disease",
         aliases=("ckd", "chronic kidney disease"),
         description="Chronic kidney disease phenotype from EHR conditions.",
-        icd9_prefixes=("585",),
-        icd10_prefixes=("N18",),
+        snomed_code="709044004",
+        snomed_concept_name="Chronic kidney disease",
     ),
     DiseaseDefinition(
         canonical_name="coronary_artery_disease",
-        aliases=("cad", "coronary artery disease", "ischemic_heart_disease"),
-        description="Coronary artery disease / ischemic heart disease phenotype from EHR conditions.",
-        icd9_prefixes=("410", "411", "412", "413", "414"),
-        icd10_prefixes=("I20", "I21", "I22", "I23", "I24", "I25"),
+        aliases=("cad", "coronary artery disease", "ischemic_heart_disease", "coronary_arteriosclerosis"),
+        description="Coronary artery disease / coronary arteriosclerosis phenotype from EHR conditions.",
+        snomed_code="53741008",
+        snomed_concept_name="Coronary arteriosclerosis",
+    ),
+    DiseaseDefinition(
+        canonical_name="heart_failure",
+        aliases=("hf", "congestive_heart_failure", "chf", "heart failure"),
+        description="Heart failure phenotype from EHR conditions.",
+        snomed_code="84114007",
+        snomed_concept_name="Heart failure",
+    ),
+    DiseaseDefinition(
+        canonical_name="atrial_fibrillation",
+        aliases=("af", "afib", "a_fib", "atrial fibrillation"),
+        description="Atrial fibrillation phenotype from EHR conditions.",
+        snomed_code="49436004",
+        snomed_concept_name="Atrial fibrillation",
+    ),
+    DiseaseDefinition(
+        canonical_name="osteoarthritis",
+        aliases=("oa", "degenerative_joint_disease"),
+        description="Osteoarthritis phenotype from EHR conditions.",
+        snomed_code="396275006",
+        snomed_concept_name="Osteoarthritis",
+    ),
+    DiseaseDefinition(
+        canonical_name="copd",
+        aliases=("chronic_obstructive_pulmonary_disease", "chronic obstructive pulmonary disease", "chronic_obstructive_lung_disease"),
+        description="Chronic obstructive lung disease phenotype from EHR conditions.",
+        snomed_code="13645005",
+        snomed_concept_name="Chronic obstructive lung disease",
     ),
     DiseaseDefinition(
         canonical_name="stroke",
-        aliases=("cerebrovascular_disease", "stroke_ischemic_or_hemorrhagic"),
-        description="Broad stroke phenotype from EHR conditions.",
-        icd9_prefixes=("430", "431", "432", "433", "434", "436"),
-        icd10_prefixes=("I60", "I61", "I62", "I63", "I64"),
+        aliases=("cerebrovascular_accident", "cva", "cerebrovascular_disease"),
+        description="Cerebrovascular accident (stroke) phenotype from EHR conditions.",
+        snomed_code="230690007",
+        snomed_concept_name="Cerebrovascular accident",
     ),
     DiseaseDefinition(
-        canonical_name="depression",
-        aliases=("major_depression", "major depressive disorder", "depression"),
-        description="Broad depression phenotype from EHR conditions.",
-        icd9_prefixes=("296.2", "296.3", "311"),
-        icd10_prefixes=("F32", "F33"),
+        canonical_name="hypothyroidism",
+        aliases=("underactive_thyroid", "low_thyroid"),
+        description="Hypothyroidism phenotype from EHR conditions.",
+        snomed_code="40930008",
+        snomed_concept_name="Hypothyroidism",
     ),
     DiseaseDefinition(
-        canonical_name="hypertension",
-        aliases=("htn", "high_blood_pressure", "high blood pressure"),
-        description="Broad hypertension phenotype from EHR conditions.",
-        icd9_prefixes=("401", "402", "403", "404", "405"),
-        icd10_prefixes=("I10", "I11", "I12", "I13", "I15"),
+        canonical_name="migraine",
+        aliases=("migraine_headache", "migraines"),
+        description="Migraine phenotype from EHR conditions.",
+        snomed_code="37796009",
+        snomed_concept_name="Migraine",
+    ),
+    DiseaseDefinition(
+        canonical_name="rheumatoid_arthritis",
+        aliases=("ra",),
+        description="Rheumatoid arthritis phenotype from EHR conditions.",
+        snomed_code="69896004",
+        snomed_concept_name="Rheumatoid arthritis",
+    ),
+    DiseaseDefinition(
+        canonical_name="atherosclerosis",
+        aliases=("ascvd", "atherosclerotic_disease"),
+        description="Atherosclerosis phenotype from EHR conditions.",
+        snomed_code="38716007",
+        snomed_concept_name="Atherosclerosis",
+    ),
+    DiseaseDefinition(
+        canonical_name="sleep_apnea",
+        aliases=("osa", "obstructive_sleep_apnea", "sleep apnea"),
+        description="Sleep apnea phenotype from EHR conditions.",
+        snomed_code="73430006",
+        snomed_concept_name="Sleep apnea",
     ),
 )
 
@@ -157,33 +229,25 @@ ehr_participants AS (
   FROM `{dataset}.observation_period`
   GROUP BY person_id
 ),
-source_icd_concepts AS (
+disease_root AS (
   SELECT concept_id
   FROM `{dataset}.concept`
-  WHERE (
-      vocabulary_id = 'ICD9CM'
-      AND EXISTS (
-        SELECT 1
-        FROM UNNEST(@icd9_prefixes) AS icd9_prefix
-        WHERE STARTS_WITH(concept_code, icd9_prefix)
-      )
-    )
-    OR (
-      vocabulary_id = 'ICD10CM'
-      AND EXISTS (
-        SELECT 1
-        FROM UNNEST(@icd10_prefixes) AS icd10_prefix
-        WHERE STARTS_WITH(concept_code, icd10_prefix)
-      )
-    )
+  WHERE vocabulary_id = 'SNOMED'
+    AND standard_concept = 'S'
+    AND concept_code = @snomed_code
+),
+disease_concepts AS (
+  SELECT DISTINCT concept_ancestor.descendant_concept_id AS concept_id
+  FROM `{dataset}.concept_ancestor` AS concept_ancestor
+  JOIN disease_root ON disease_root.concept_id = concept_ancestor.ancestor_concept_id
 ),
 matched_conditions AS (
   SELECT
     condition_occurrence.person_id,
     condition_occurrence.condition_start_date
   FROM `{dataset}.condition_occurrence` AS condition_occurrence
-  WHERE condition_occurrence.condition_source_concept_id IN (
-    SELECT concept_id FROM source_icd_concepts
+  WHERE condition_occurrence.condition_concept_id IN (
+    SELECT concept_id FROM disease_concepts
   )
 ),
 aggregated_conditions AS (
@@ -226,8 +290,7 @@ def build_all_of_us_disease_query_config(disease_definition: DiseaseDefinition):
 
     return bigquery.QueryJobConfig(
         query_parameters=[
-            bigquery.ArrayQueryParameter("icd9_prefixes", "STRING", list(disease_definition.icd9_prefixes)),
-            bigquery.ArrayQueryParameter("icd10_prefixes", "STRING", list(disease_definition.icd10_prefixes)),
+            bigquery.ScalarQueryParameter("snomed_code", "STRING", disease_definition.snomed_code),
         ]
     )
 
@@ -288,8 +351,8 @@ def prepare_all_of_us_disease_sample_table(
             {
                 "disease": disease_definition.canonical_name,
                 "description": disease_definition.description,
-                "icd9_prefixes": list(disease_definition.icd9_prefixes),
-                "icd10_prefixes": list(disease_definition.icd10_prefixes),
+                "snomed_code": disease_definition.snomed_code,
+                "snomed_concept_name": disease_definition.snomed_concept_name,
                 "min_occurrences": MIN_DISEASE_OCCURRENCES,
                 "billing_project_env": "GOOGLE_PROJECT",
                 "cdr_dataset_env": "WORKSPACE_CDR",

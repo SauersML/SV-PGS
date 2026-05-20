@@ -1816,8 +1816,9 @@ class StandardizedGenotypeMatrix:
             scales=self.scales,
             sample_count=self.shape[0],
         )
-        self._sparse_local_lookup = np.full(self.shape[1], -1, dtype=np.int32)
-        self._sparse_local_lookup[sparse_local_indices] = np.arange(sparse_local_indices.shape[0], dtype=np.int32)
+        sparse_lookup = np.full(self.shape[1], -1, dtype=np.int32)
+        sparse_lookup[sparse_local_indices] = np.arange(sparse_local_indices.shape[0], dtype=np.int32)
+        self._sparse_local_lookup = sparse_lookup
         if dense_local_indices.shape[0] > 0:
             dense_raw = cast(RawGenotypeMatrix, self.raw)
             self._dense_backend = StandardizedGenotypeMatrix(
@@ -1829,8 +1830,9 @@ class StandardizedGenotypeMatrix:
                 sample_count=self.shape[0],
                 _enable_hybrid_backend=False,
             )
-            self._dense_local_lookup = np.full(self.shape[1], -1, dtype=np.int32)
-            self._dense_local_lookup[dense_local_indices] = np.arange(dense_local_indices.shape[0], dtype=np.int32)
+            dense_lookup = np.full(self.shape[1], -1, dtype=np.int32)
+            dense_lookup[dense_local_indices] = np.arange(dense_local_indices.shape[0], dtype=np.int32)
+            self._dense_local_lookup = dense_lookup
         log(
             "    hybrid standardized operator: "
             + f"{sparse_local_indices.shape[0]} sparse variants + {dense_local_indices.shape[0]} dense variants  mem={mem()}"

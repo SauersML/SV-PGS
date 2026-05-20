@@ -9,7 +9,7 @@ import sys
 from pathlib import Path
 
 from sv_pgs.all_of_us import AllOfUsDiseaseRequest, available_disease_names, prepare_all_of_us_disease_sample_table
-from sv_pgs.aou_runner import run_all_of_us
+from sv_pgs.aou_runner import run_all_of_us, run_all_of_us_all_diseases
 from sv_pgs.config import ModelConfig, TraitType
 from sv_pgs.io import load_dataset_from_files
 from sv_pgs.pipeline import run_training_pipeline
@@ -42,7 +42,23 @@ def build_parser() -> argparse.ArgumentParser:
         "run-all-of-us",
         help="Full AoU pipeline: download VCFs, prepare phenotype, merge PCs, and fit one unified genome-wide Bayesian model.",
     )
-    aou_run_parser.add_argument("--disease", required=True, help="Disease name (e.g. hypertension, type2_diabetes).")
+    aou_run_parser.add_argument(
+        "--disease",
+        default=None,
+        help=(
+            "Disease name (e.g. hypertension, type2_diabetes). Pass 'all' or "
+            "'top20' to loop over every built-in disease. Mutually exclusive "
+            "with --all-diseases."
+        ),
+    )
+    aou_run_parser.add_argument(
+        "--all-diseases",
+        action="store_true",
+        help=(
+            "Run the AoU pipeline sequentially over every built-in disease, "
+            "writing per-disease outputs under <output-dir>/<canonical_name>_results/."
+        ),
+    )
     aou_run_parser.add_argument("--chromosomes", default="1-22", help="Chromosome range (default: 1-22).")
     aou_run_parser.add_argument("--output-dir", required=True, help="Base output directory.")
     aou_run_parser.add_argument(
@@ -184,8 +200,29 @@ def main(argv: list[str] | None = None) -> int:
             chromosomes = [int(chromosome.strip()) for chromosome in chromosome_text.split(",")]
         else:
             chromosomes = [int(chromosome_text)]
+
+        disease_value = args.disease
+        normalized_disease = disease_value.strip().lower() if isinstance(disease_value, str) else None
+        wants_all = bool(args.all_diseases) or normalized_disease in {"all", "top20"}
+        if wants_all and args.all_diseases and disease_value is not None and normalized_disease not in {"all", "top20"}:
+            raise ValueError("--all-diseases is mutually exclusive with --disease")
+        if not wants_all and disease_value is None:
+            raise ValueError("Either --disease or --all-diseases is required.")
+        if wants_all:
+            run_all_of_us_all_diseases(
+                chromosomes=chromosomes,
+                output_base=args.output_dir,
+                variant_metadata_path=args.variant_metadata,
+                n_pcs=args.n_pcs,
+                max_outer_iterations=args.max_outer_iterations,
+                random_seed=args.random_seed,
+                variants=args.variants,
+                test_fraction=args.test_fraction,
+                marginal_screen_min_abs_z=args.marginal_screen_min_abs_z,
+            )
+            return 0
         run_all_of_us(
-            disease=args.disease,
+            disease=disease_value,
             chromosomes=chromosomes,
             output_base=args.output_dir,
             variant_metadata_path=args.variant_metadata,
