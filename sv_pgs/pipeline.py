@@ -166,6 +166,21 @@ def run_training_pipeline(
                 if getattr(fitted_state.fit_result, "final_parameter_change", None) is None
                 else float(fitted_state.fit_result.final_parameter_change)
             ),
+            "final_predictor_change": (
+                None
+                if getattr(fitted_state.fit_result, "final_predictor_change", None) is None
+                else float(fitted_state.fit_result.final_predictor_change)
+            ),
+            "final_objective_change": (
+                None
+                if getattr(fitted_state.fit_result, "final_objective_change", None) is None
+                else float(fitted_state.fit_result.final_objective_change)
+            ),
+            "final_hyperparameter_change": (
+                None
+                if getattr(fitted_state.fit_result, "final_hyperparameter_change", None) is None
+                else float(fitted_state.fit_result.final_hyperparameter_change)
+            ),
         }
     )
     log(f"predictions written: {active_count} active variants out of {dataset.genotypes.shape[1]}")

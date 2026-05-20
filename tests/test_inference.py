@@ -2361,6 +2361,45 @@ def test_default_stochastic_step_size_uses_full_sweeps():
     assert mixture_inference._stochastic_step_size(decayed_config, 4) == 0.25
 
 
+def test_fit_convergence_change_uses_predictive_state_not_auxiliary_shrinkage():
+    beta = np.array([0.1, -0.2, 0.05], dtype=np.float64)
+    alpha = np.array([0.3], dtype=np.float64)
+    predictor = np.array([-0.2, 0.1, 0.4], dtype=np.float64)
+
+    fit_change, predictor_change, objective_change, coefficient_change = (
+        mixture_inference._fit_state_convergence_change(
+            current_beta=beta + np.array([1e-5, -2e-5, 1e-5], dtype=np.float64),
+            previous_beta=beta,
+            current_alpha=alpha + 1e-5,
+            previous_alpha=alpha,
+            current_linear_predictor=predictor + 2e-5,
+            previous_linear_predictor=predictor,
+            current_objective=-10.0004,
+            previous_objective=-10.0,
+        )
+    )
+    hyper_change = mixture_inference._hyperparameter_relative_change(
+        current_beta=beta,
+        previous_beta=beta,
+        current_alpha=alpha,
+        previous_alpha=alpha,
+        current_local_scale=np.array([10.0, 20.0, 30.0], dtype=np.float64),
+        previous_local_scale=np.array([1.0, 2.0, 3.0], dtype=np.float64),
+        current_theta=np.array([0.1], dtype=np.float64),
+        previous_theta=np.array([0.1], dtype=np.float64),
+        current_tpb_shape_a_vector=np.array([1.0], dtype=np.float64),
+        previous_tpb_shape_a_vector=np.array([1.0], dtype=np.float64),
+        current_tpb_shape_b_vector=np.array([1.0], dtype=np.float64),
+        previous_tpb_shape_b_vector=np.array([1.0], dtype=np.float64),
+    )
+
+    assert fit_change < 1e-4
+    assert predictor_change < 1e-4
+    assert objective_change < 1e-4
+    assert coefficient_change < 1e-4
+    assert hyper_change > 1.0
+
+
 def test_hyperparameter_updates_skip_final_iteration():
     config = ModelConfig(max_outer_iterations=8, update_hyperparameters=True, final_posterior_refinement=False)
     assert mixture_inference._should_update_hyperparameters_this_iteration(4, config, allow_final_iteration=False)

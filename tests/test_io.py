@@ -27,6 +27,7 @@ from sv_pgs.io import (
     _save_vcf_to_cache,
     _vcf_cache_key,
     load_dataset_from_files,
+    load_multi_source_dataset_from_files,
     load_multi_vcf_dataset_from_files,
 )
 import sv_pgs.genotype as genotype_module
@@ -756,6 +757,143 @@ def test_plink_reader_decodes_only_requested_samples(tmp_path: Path, monkeypatch
     np.testing.assert_array_equal(observed_variant_gather, expected_variant_gather)
 
 
+def test_plink_reader_reads_only_contiguous_sample_window(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    bed_path = tmp_path / "cohort.bed"
+    genotype_matrix = np.array(
+        [
+            [0.0, 1.0, 2.0, np.nan],
+            [1.0, 2.0, 0.0, 1.0],
+            [2.0, 0.0, 1.0, 2.0],
+            [np.nan, 1.0, 2.0, 0.0],
+            [0.0, np.nan, 1.0, 1.0],
+            [1.0, 0.0, np.nan, 2.0],
+            [2.0, 2.0, 0.0, np.nan],
+            [0.0, 1.0, 2.0, 0.0],
+        ],
+        dtype=np.float32,
+    )
+    to_bed(
+        bed_path,
+        genotype_matrix,
+        properties={
+            "fid": [f"f{i}" for i in range(genotype_matrix.shape[0])],
+            "iid": [f"s{i}" for i in range(genotype_matrix.shape[0])],
+            "sid": [f"v{i}" for i in range(genotype_matrix.shape[1])],
+        },
+    )
+
+    def fail_full_payload(self, offset, length):
+        raise AssertionError("contiguous sample subset should not read full variant payload")
+
+    monkeypatch.setattr(open_bed, "_pread_payload", fail_full_payload)
+    reader = open_bed(bed_path, iid_count=genotype_matrix.shape[0], sid_count=genotype_matrix.shape[1])
+
+    observed = reader.read(index=(slice(2, 6), slice(1, 4)), dtype="int8", order="F")
+    expected_float = genotype_matrix[2:6, 1:4]
+    expected = np.where(
+        np.isnan(expected_float),
+        io_module.PLINK_MISSING_INT8,
+        expected_float,
+    ).astype(np.int8)
+    np.testing.assert_array_equal(observed, expected)
+
+
+def test_plink_int8_cache_stream_writer_creates_loadable_npy(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    bed_path = tmp_path / "cohort.bed"
+    genotype_matrix = np.array(
+        [
+            [0.0, 1.0, 2.0],
+            [1.0, np.nan, 0.0],
+            [2.0, 1.0, 1.0],
+            [np.nan, 2.0, 0.0],
+        ],
+        dtype=np.float32,
+    )
+    to_bed(
+        bed_path,
+        genotype_matrix,
+        properties={
+            "fid": [f"f{i}" for i in range(genotype_matrix.shape[0])],
+            "iid": [f"s{i}" for i in range(genotype_matrix.shape[0])],
+            "sid": [f"v{i}" for i in range(genotype_matrix.shape[1])],
+        },
+    )
+    monkeypatch.setattr(io_module, "_PLINK_INT8_CACHE_MIN_CELLS", 0)
+    monkeypatch.setattr(
+        io_module,
+        "_has_sufficient_free_space_for_int8_npy",
+        lambda path, shape, *, fortran_order: (True, 0, 10**12),
+    )
+
+    sample_indices = np.arange(genotype_matrix.shape[0], dtype=np.intp)
+    raw = genotype_module.PlinkRawGenotypeMatrix(
+        bed_path=bed_path,
+        sample_indices=sample_indices,
+        variant_count=genotype_matrix.shape[1],
+        total_sample_count=genotype_matrix.shape[0],
+        batch_size=2,
+    )
+
+    stats, int8_cache_path = io_module.compute_plink_variant_statistics_cached(
+        raw,
+        bed_path,
+        sample_indices,
+        ModelConfig(),
+    )
+
+    assert int8_cache_path is not None
+    assert stats.means.shape == (genotype_matrix.shape[1],)
+    cached = np.load(int8_cache_path, mmap_mode="r")
+    expected = np.where(np.isnan(genotype_matrix), io_module.PLINK_MISSING_INT8, genotype_matrix).astype(np.int8)
+    np.testing.assert_array_equal(cached, expected)
+    assert cached.flags.f_contiguous
+
+
+def test_plink_int8_cache_requires_space_before_decoding(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    bed_path = tmp_path / "cohort.bed"
+    genotype_matrix = np.array([[0.0, 1.0], [2.0, 0.0]], dtype=np.float32)
+    to_bed(
+        bed_path,
+        genotype_matrix,
+        properties={
+            "fid": ["f0", "f1"],
+            "iid": ["s0", "s1"],
+            "sid": ["v0", "v1"],
+        },
+    )
+    monkeypatch.setattr(io_module, "_PLINK_INT8_CACHE_MIN_CELLS", 0)
+    monkeypatch.setattr(
+        io_module,
+        "_has_sufficient_free_space_for_int8_npy",
+        lambda path, shape, *, fortran_order: (False, 200_000_000_000, 1_000_000),
+    )
+
+    class UnreadablePlinkRaw(genotype_module.PlinkRawGenotypeMatrix):
+        def iter_column_batches_i8(self, *args, **kwargs):
+            raise AssertionError("PLINK decoding should not start without cache space")
+
+    sample_indices = np.arange(genotype_matrix.shape[0], dtype=np.intp)
+    raw = UnreadablePlinkRaw(
+        bed_path=bed_path,
+        sample_indices=sample_indices,
+        variant_count=genotype_matrix.shape[1],
+        total_sample_count=genotype_matrix.shape[0],
+        batch_size=2,
+    )
+
+    with pytest.raises(OSError, match="Insufficient free space for PLINK int8 cache"):
+        io_module.compute_plink_variant_statistics_cached(raw, bed_path, sample_indices, ModelConfig())
+
+
 def test_record_gt_types_to_int8_subsets_before_mapping():
     gt_map = np.array([0, 1, io_module.PLINK_MISSING_INT8, 2], dtype=np.int8)
     gt_types = np.array([0, 3, 2, 1, 0], dtype=np.int8)
@@ -1116,6 +1254,95 @@ def test_load_dataset_from_plink_filters_non_genotyped_sample_rows(tmp_path: Pat
     assert dataset.sample_ids == ["101", "102"]
     np.testing.assert_allclose(dataset.targets, np.array([0.0, 1.0], dtype=np.float32))
     np.testing.assert_allclose(dataset.covariates, np.array([[44.0], [55.0]], dtype=np.float32))
+
+
+def test_multi_source_precomputed_stats_still_dedupes_plink_variants(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    vcf_path = tmp_path / "chr1.vcf.gz"
+    bed_path = tmp_path / "arrays.bed"
+    bed_path.with_suffix(".fam").write_text(
+        "\n".join(
+            [
+                "f1 s1 0 0 0 -9",
+                "f2 s2 0 0 0 -9",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    bed_path.with_suffix(".bim").write_text(
+        "\n".join(
+            [
+                "1 dup_id 0 100 A C",
+                "1 plink_only 0 200 G T",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    sample_table_path = tmp_path / "samples.tsv"
+    _write_table(
+        sample_table_path,
+        header=("sample_id", "target"),
+        rows=(
+            ("s1", "0"),
+            ("s2", "1"),
+        ),
+    )
+
+    def fake_read_vcf_sample_ids(path: Path) -> list[str]:
+        assert path == vcf_path
+        return ["s1", "s2"]
+
+    def fake_load_vcf_with_cache(path: Path, *, config: ModelConfig, mmap_mode: str):
+        assert path == vcf_path
+        assert mmap_mode == "r"
+        return (
+            np.array([[0], [1]], dtype=np.int8),
+            [
+                _VariantDefaults(
+                    variant_id="dup_id",
+                    variant_class=VariantClass.SNV,
+                    chromosome="1",
+                    position=100,
+                    length=1.0,
+                    allele_frequency=0.25,
+                    quality=1.0,
+                )
+            ],
+            VariantStatistics(
+                means=np.array([0.5], dtype=np.float32),
+                scales=np.array([0.5], dtype=np.float32),
+                allele_frequencies=np.array([0.25], dtype=np.float32),
+                support_counts=np.array([2], dtype=np.int32),
+            ),
+        )
+
+    monkeypatch.setattr(io_module, "_read_vcf_sample_ids", fake_read_vcf_sample_ids)
+    monkeypatch.setattr(io_module, "_load_vcf_with_cache", fake_load_vcf_with_cache)
+    precomputed_stats = VariantStatistics(
+        means=np.array([0.5, 1.0], dtype=np.float32),
+        scales=np.array([0.5, 1.0], dtype=np.float32),
+        allele_frequencies=np.array([0.25, 0.5], dtype=np.float32),
+        support_counts=np.array([2, 2], dtype=np.int32),
+    )
+
+    dataset = load_multi_source_dataset_from_files(
+        sources=[("vcf", vcf_path), ("plink1", bed_path)],
+        config=ModelConfig(),
+        sample_table_path=sample_table_path,
+        sample_id_column="sample_id",
+        target_column="target",
+        covariate_columns=(),
+        precomputed_variant_stats=precomputed_stats,
+    )
+
+    assert dataset.genotypes.shape == (2, 2)
+    assert dataset.variant_stats is precomputed_stats
+    assert [record.variant_id for record in dataset.variant_records] == ["dup_id", "plink_only"]
 
 
 def test_load_dataset_from_plink_passes_user_config_to_variant_statistics(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):

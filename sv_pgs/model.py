@@ -954,10 +954,27 @@ class BayesianPGS:
                 if fit_result.final_parameter_change is None
                 else f"{fit_result.final_parameter_change:.3e}"
             )
+            predictor_delta_str = (
+                "N/A"
+                if fit_result.final_predictor_change is None
+                else f"{fit_result.final_predictor_change:.3e}"
+            )
+            objective_delta_str = (
+                "N/A"
+                if fit_result.final_objective_change is None
+                else f"{fit_result.final_objective_change:.3e}"
+            )
+            hyper_delta_str = (
+                "N/A"
+                if fit_result.final_hyperparameter_change is None
+                else f"{fit_result.final_hyperparameter_change:.3e}"
+            )
             log(
                 f"variational EM stopped after {len(fit_result.objective_history)} iterations "
                 f"without convergence  final_obj={final_obj:.4f}  "
-                f"delta={delta_str}  tol={self.config.convergence_tolerance:.3e}  mem={mem()}"
+                f"delta={delta_str}  pred_delta={predictor_delta_str}  "
+                f"obj_delta={objective_delta_str}  hyper_delta={hyper_delta_str}  "
+                f"tol={self.config.convergence_tolerance:.3e}  mem={mem()}"
             )
 
         log("expanding coefficients from reduced to full space...")

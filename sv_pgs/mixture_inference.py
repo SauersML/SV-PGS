@@ -421,6 +421,9 @@ class VariationalFitResult:
     selected_iteration_count: int | None = None
     converged: bool = False
     final_parameter_change: float | None = None
+    final_predictor_change: float | None = None
+    final_objective_change: float | None = None
+    final_hyperparameter_change: float | None = None
 
 
 @dataclass(slots=True)
@@ -1077,6 +1080,8 @@ def fit_variational_em(
     previous_theta: np.ndarray | None = None
     previous_tpb_shape_a_vector: np.ndarray | None = None
     previous_tpb_shape_b_vector: np.ndarray | None = None
+    previous_linear_predictor: np.ndarray | None = None
+    previous_objective: float | None = None
     best_validation_metric: float | None = None
     best_alpha: np.ndarray | None = None
     best_beta: np.ndarray | None = None
@@ -1166,6 +1171,7 @@ def fit_variational_em(
         nonlocal alpha_state, beta_state, objective_history, validation_history
         nonlocal previous_alpha, previous_beta, previous_local_scale, previous_theta
         nonlocal previous_tpb_shape_a_vector, previous_tpb_shape_b_vector
+        nonlocal previous_linear_predictor, previous_objective
         nonlocal best_validation_metric, best_alpha, best_beta, best_beta_variance, best_local_scale, best_theta
         nonlocal best_sigma_error2, best_tpb_shape_a_vector, best_tpb_shape_b_vector, best_validation_iteration, start_iteration
         global_scale, scale_model_coefficients = _initialize_scale_model(prior_design, config)
@@ -1190,6 +1196,8 @@ def fit_variational_em(
         previous_theta = None
         previous_tpb_shape_a_vector = None
         previous_tpb_shape_b_vector = None
+        previous_linear_predictor = None
+        previous_objective = None
         best_validation_metric = None
         best_alpha = None
         best_beta = None
@@ -1251,6 +1259,8 @@ def fit_variational_em(
             previous_theta = _copy_optional(resume_checkpoint.previous_theta)
             previous_tpb_shape_a_vector = _copy_optional(resume_checkpoint.previous_tpb_shape_a_vector)
             previous_tpb_shape_b_vector = _copy_optional(resume_checkpoint.previous_tpb_shape_b_vector)
+            previous_linear_predictor = None
+            previous_objective = objective_history[-1] if objective_history else None
             best_validation_metric = None if resume_checkpoint.best_validation_metric is None else float(resume_checkpoint.best_validation_metric)
             best_alpha = _copy_optional(resume_checkpoint.best_alpha)
             best_beta = _copy_optional(resume_checkpoint.best_beta)
@@ -1287,6 +1297,9 @@ def fit_variational_em(
     restricted_posterior_warm_start = _RestrictedPosteriorWarmStart()
     fit_converged = False
     final_parameter_change: float | None = None
+    final_predictor_change: float | None = None
+    final_objective_change: float | None = None
+    final_hyperparameter_change: float | None = None
     if use_stochastic_updates:
         block_size = min(int(config.stochastic_variant_batch_size), int(genotype_matrix.shape[1]))
         block_count = max((int(genotype_matrix.shape[1]) + block_size - 1) // block_size, 1)
@@ -1944,14 +1957,26 @@ def fit_variational_em(
                         best_tpb_shape_a_vector = tpb_shape_a_vector.copy()
                         best_tpb_shape_b_vector = tpb_shape_b_vector.copy()
                     log(f"  variational EM epoch {outer_iteration + 1}: validation_metric={validation_metric:.6f}")
-            parameter_change = _relative_parameter_change(
+            current_theta = _pack_theta(global_scale, scale_model_coefficients)
+            current_objective = float(objective_history[-1])
+            parameter_change, predictor_change, objective_change, coefficient_change = _fit_state_convergence_change(
+                current_beta=beta_state,
+                previous_beta=previous_beta,
+                current_alpha=alpha_state,
+                previous_alpha=previous_alpha,
+                current_linear_predictor=linear_predictor,
+                previous_linear_predictor=previous_linear_predictor,
+                current_objective=current_objective,
+                previous_objective=previous_objective,
+            )
+            hyperparameter_change = _hyperparameter_relative_change(
                 current_beta=beta_state,
                 previous_beta=previous_beta,
                 current_alpha=alpha_state,
                 previous_alpha=previous_alpha,
                 current_local_scale=local_scale,
                 previous_local_scale=previous_local_scale,
-                current_theta=_pack_theta(global_scale, scale_model_coefficients),
+                current_theta=current_theta,
                 previous_theta=previous_theta,
                 current_tpb_shape_a_vector=tpb_shape_a_vector,
                 previous_tpb_shape_a_vector=previous_tpb_shape_a_vector,
@@ -1959,19 +1984,30 @@ def fit_variational_em(
                 previous_tpb_shape_b_vector=previous_tpb_shape_b_vector,
             )
             final_parameter_change = parameter_change
+            final_predictor_change = predictor_change
+            final_objective_change = objective_change
+            final_hyperparameter_change = hyperparameter_change
             previous_alpha = alpha_state.copy()
             previous_beta = beta_state.copy()
             previous_local_scale = local_scale.copy()
-            previous_theta = _pack_theta(global_scale, scale_model_coefficients)
+            previous_theta = current_theta
             previous_tpb_shape_a_vector = tpb_shape_a_vector.copy()
             previous_tpb_shape_b_vector = tpb_shape_b_vector.copy()
+            previous_linear_predictor = np.asarray(linear_predictor, dtype=np.float64).copy()
+            previous_objective = current_objective
             iter_num = outer_iteration + 1
             obj_str = f"{objective_history[-1]:.6f}" if objective_history else "N/A"
             val_str = f"  val={validation_history[-1]:.6f}" if validation_history else ""
             hyper_str = "  [+hyper]" if should_update_hyperparameters else ""
             variance_str = "  [beta_var]" if refresh_beta_variance else "  [beta_var=reuse]"
             nonzero_beta = int(np.count_nonzero(np.abs(beta_state) > 1e-8))
-            log(f"  SVI epoch {iter_num}/{config.max_outer_iterations}  obj={obj_str}  delta={parameter_change:.2e}  sigma_e2={sigma_error2:.4f}  g_scale={float(global_scale):.4f}  nz_beta={nonzero_beta}{val_str}{hyper_str}{variance_str}  mem={mem()}")
+            log(
+                f"  SVI epoch {iter_num}/{config.max_outer_iterations}  obj={obj_str}  "
+                f"delta={parameter_change:.2e}  pred_delta={predictor_change:.2e}  "
+                f"obj_delta={objective_change:.2e}  coef_delta={coefficient_change:.2e}  "
+                f"hyper_delta={hyperparameter_change:.2e}  sigma_e2={sigma_error2:.4f}  "
+                f"g_scale={float(global_scale):.4f}  nz_beta={nonzero_beta}{val_str}{hyper_str}{variance_str}  mem={mem()}"
+            )
             if per_epoch_eval_callback is not None:
                 # Snapshot the state the caller needs to compute held-out
                 # metrics. alpha is O(covariates), beta is O(reduced variants)
@@ -1988,6 +2024,10 @@ def fit_variational_em(
                     "total_epochs": int(config.max_outer_iterations),
                     "objective": float(objective_history[-1]) if objective_history else None,
                     "parameter_change": float(parameter_change),
+                    "predictor_change": float(predictor_change),
+                    "objective_change": float(objective_change),
+                    "coefficient_change": float(coefficient_change),
+                    "hyperparameter_change": float(hyperparameter_change),
                     "sigma_error2": float(sigma_error2),
                     "global_scale": float(global_scale),
                     "nonzero_beta": nonzero_beta,
@@ -2197,14 +2237,26 @@ def fit_variational_em(
             local_scale = updated_local_scale
             auxiliary_delta = (local_shape_a + local_shape_b) / np.maximum(1.0 + local_scale, config.local_scale_floor)
 
-            parameter_change = _relative_parameter_change(
+            current_theta = _pack_theta(global_scale, scale_model_coefficients)
+            current_objective = float(objective_history[-1])
+            parameter_change, predictor_change, objective_change, coefficient_change = _fit_state_convergence_change(
+                current_beta=beta_state,
+                previous_beta=previous_beta,
+                current_alpha=alpha_state,
+                previous_alpha=previous_alpha,
+                current_linear_predictor=posterior_state.linear_predictor,
+                previous_linear_predictor=previous_linear_predictor,
+                current_objective=current_objective,
+                previous_objective=previous_objective,
+            )
+            hyperparameter_change = _hyperparameter_relative_change(
                 current_beta=beta_state,
                 previous_beta=previous_beta,
                 current_alpha=alpha_state,
                 previous_alpha=previous_alpha,
                 current_local_scale=local_scale,
                 previous_local_scale=previous_local_scale,
-                current_theta=_pack_theta(global_scale, scale_model_coefficients),
+                current_theta=current_theta,
                 previous_theta=previous_theta,
                 current_tpb_shape_a_vector=tpb_shape_a_vector,
                 previous_tpb_shape_a_vector=previous_tpb_shape_a_vector,
@@ -2212,12 +2264,17 @@ def fit_variational_em(
                 previous_tpb_shape_b_vector=previous_tpb_shape_b_vector,
             )
             final_parameter_change = parameter_change
+            final_predictor_change = predictor_change
+            final_objective_change = objective_change
+            final_hyperparameter_change = hyperparameter_change
             previous_alpha = alpha_state.copy()
             previous_beta = beta_state.copy()
             previous_local_scale = local_scale.copy()
-            previous_theta = _pack_theta(global_scale, scale_model_coefficients)
+            previous_theta = current_theta
             previous_tpb_shape_a_vector = tpb_shape_a_vector.copy()
             previous_tpb_shape_b_vector = tpb_shape_b_vector.copy()
+            previous_linear_predictor = np.asarray(posterior_state.linear_predictor, dtype=np.float64).copy()
+            previous_objective = current_objective
 
             iter_num = outer_iteration + 1
             obj_str = f"{objective_history[-1]:.6f}" if objective_history else "N/A"
@@ -2226,13 +2283,24 @@ def fit_variational_em(
             variance_str = "  [beta_var]" if refresh_beta_variance else "  [beta_var=reuse]"
             nonzero_beta = int(np.count_nonzero(np.abs(beta_state) > 1e-8))
             iter_wall_seconds = time.monotonic() - iter_wall_t0
-            log(f"  EM iter {iter_num}/{config.max_outer_iterations}  obj={obj_str}  delta={parameter_change:.2e}  sigma_e2={sigma_error2:.4f}  g_scale={float(global_scale):.4f}  nz_beta={nonzero_beta}  wall={iter_wall_seconds:.1f}s{val_str}{hyper_str}{variance_str}  mem={mem()}")
+            log(
+                f"  EM iter {iter_num}/{config.max_outer_iterations}  obj={obj_str}  "
+                f"delta={parameter_change:.2e}  pred_delta={predictor_change:.2e}  "
+                f"obj_delta={objective_change:.2e}  coef_delta={coefficient_change:.2e}  "
+                f"hyper_delta={hyperparameter_change:.2e}  sigma_e2={sigma_error2:.4f}  "
+                f"g_scale={float(global_scale):.4f}  nz_beta={nonzero_beta}  wall={iter_wall_seconds:.1f}s"
+                f"{val_str}{hyper_str}{variance_str}  mem={mem()}"
+            )
             if per_epoch_eval_callback is not None:
                 per_epoch_eval_callback({
                     "epoch": iter_num,
                     "total_epochs": int(config.max_outer_iterations),
                     "objective": float(objective_history[-1]) if objective_history else None,
                     "parameter_change": float(parameter_change),
+                    "predictor_change": float(predictor_change),
+                    "objective_change": float(objective_change),
+                    "coefficient_change": float(coefficient_change),
+                    "hyperparameter_change": float(hyperparameter_change),
                     "sigma_error2": float(sigma_error2),
                     "global_scale": float(global_scale),
                     "nonzero_beta": nonzero_beta,
@@ -2262,9 +2330,14 @@ def fit_variational_em(
 
     if not fit_converged:
         delta_str = "N/A" if final_parameter_change is None else f"{final_parameter_change:.3e}"
+        predictor_delta_str = "N/A" if final_predictor_change is None else f"{final_predictor_change:.3e}"
+        objective_delta_str = "N/A" if final_objective_change is None else f"{final_objective_change:.3e}"
+        hyper_delta_str = "N/A" if final_hyperparameter_change is None else f"{final_hyperparameter_change:.3e}"
         log(
             "  variational EM reached max iterations without convergence "
-            + f"(delta={delta_str}, tol={config.convergence_tolerance:.3e})"
+            + f"(delta={delta_str}, pred_delta={predictor_delta_str}, "
+            + f"obj_delta={objective_delta_str}, hyper_delta={hyper_delta_str}, "
+            + f"tol={config.convergence_tolerance:.3e})"
         )
 
     if best_validation_metric is not None:
@@ -2398,6 +2471,9 @@ def fit_variational_em(
         ),
         converged=fit_converged,
         final_parameter_change=final_parameter_change,
+        final_predictor_change=final_predictor_change,
+        final_objective_change=final_objective_change,
+        final_hyperparameter_change=final_hyperparameter_change,
     )
 
 
@@ -9748,7 +9824,7 @@ def _expand_group_values_to_members(
     return member_values
 
 
-def _relative_parameter_change(
+def _hyperparameter_relative_change(
     current_beta: np.ndarray,
     previous_beta: np.ndarray | None,
     current_alpha: np.ndarray,
@@ -9773,6 +9849,56 @@ def _relative_parameter_change(
         _relative_change(current_tpb_shape_b_vector, previous_tpb_shape_b_vector),
     ]
     return float(max(changes))
+
+
+def _fit_state_convergence_change(
+    *,
+    current_beta: np.ndarray,
+    previous_beta: np.ndarray | None,
+    current_alpha: np.ndarray,
+    previous_alpha: np.ndarray | None,
+    current_linear_predictor: np.ndarray,
+    previous_linear_predictor: np.ndarray | None,
+    current_objective: float,
+    previous_objective: float | None,
+) -> tuple[float, float, float, float]:
+    coefficient_change = max(
+        _scaled_rms_change(current_beta, previous_beta),
+        _scaled_rms_change(current_alpha, previous_alpha),
+    )
+    predictor_change = _scaled_rms_change(current_linear_predictor, previous_linear_predictor)
+    objective_change = _relative_objective_change(current_objective, previous_objective)
+    fit_change = max(coefficient_change, predictor_change, objective_change)
+    return (
+        float(fit_change),
+        float(predictor_change),
+        float(objective_change),
+        float(coefficient_change),
+    )
+
+
+def _scaled_rms_change(current_values: np.ndarray, previous_values: np.ndarray | None) -> float:
+    if previous_values is None:
+        return float("inf")
+    current_array = np.asarray(current_values, dtype=np.float64).reshape(-1)
+    previous_array = np.asarray(previous_values, dtype=np.float64).reshape(-1)
+    if current_array.shape != previous_array.shape:
+        return float("inf")
+    if current_array.size == 0:
+        return 0.0
+    rms_delta = float(np.linalg.norm(current_array - previous_array) / np.sqrt(current_array.size))
+    previous_rms = float(np.linalg.norm(previous_array) / np.sqrt(previous_array.size))
+    return rms_delta / max(1.0, previous_rms)
+
+
+def _relative_objective_change(current_objective: float, previous_objective: float | None) -> float:
+    if previous_objective is None:
+        return float("inf")
+    current_value = float(current_objective)
+    previous_value = float(previous_objective)
+    if not np.isfinite(current_value) or not np.isfinite(previous_value):
+        return float("inf")
+    return abs(current_value - previous_value) / max(1.0, abs(previous_value))
 
 
 def _relative_change(current_values: np.ndarray, previous_values: np.ndarray | None) -> float:
