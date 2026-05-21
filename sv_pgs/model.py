@@ -849,8 +849,10 @@ class BayesianPGS:
 
         reduced_validation = None
         if validation_data is not None:
+            log("  building combined validation indices...")
             validation_genotypes, validation_covariates, validation_targets = validation_data
             combined_validation_indices = active_variant_indices[reduced_tie_map.kept_indices]
+            log(f"  combined validation indices ready: {combined_validation_indices.shape[0]} variants  mem={mem()}")
             validation_t0 = time.monotonic()
             log(
                 "preparing reduced validation genotype view "
