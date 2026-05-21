@@ -30,57 +30,67 @@ fi
 
 BASE_SNP="$HOME/sv_pgs_results_snp"
 BASE_JOINT="$HOME/sv_pgs_results_snp_sv"
-SHARED_CACHE="$HOME/.sv_pgs_shared_cache"
+# Single canonical cache dir. ~/.sv_pgs_cache is where every previous AoU run
+# already wrote, since aou_runner uses work_dir.parent/.sv_pgs_cache and the
+# historical work_dir lived directly under $HOME (e.g. ~/hypertension_results
+# → cache at ~/.sv_pgs_cache). Reusing this avoids any re-download.
+SHARED_CACHE="$HOME/.sv_pgs_cache"
 mkdir -p "$BASE_SNP" "$BASE_JOINT" "$SHARED_CACHE"
 
-# Consolidate VCF / PLINK / int8 caches across every run into one shared dir
-# so the SNP-only and SNP+SV passes don't each re-download ~135 GB of data.
-# Migrate any pre-existing per-base cache contents, then symlink each base's
-# .sv_pgs_cache at the shared dir. Idempotent — safe to rerun.
-migrate_cache_into_shared() {
-  local legacy="$1"
-  [ -d "$legacy" ] || return 0
-  [ -L "$legacy" ] && return 0
+# If a previous version of this script created ~/.sv_pgs_shared_cache, fold it
+# into the canonical dir. Anything that already exists in the canonical cache
+# wins (it's the trusted full copy); duplicates from the stray dir get dropped
+# since they may be partial-download fragments.
+PRIOR_BAD_SHARED="$HOME/.sv_pgs_shared_cache"
+if [ -d "$PRIOR_BAD_SHARED" ] && [ ! -L "$PRIOR_BAD_SHARED" ]; then
+  echo "  cache: folding stray $PRIOR_BAD_SHARED into $SHARED_CACHE"
   shopt -s nullglob
-  for subdir in "$legacy"/*; do
-    local base_name target
-    base_name="$(basename "$subdir")"
-    target="$SHARED_CACHE/$base_name"
+  for subdir in "$PRIOR_BAD_SHARED"/*; do
+    name="$(basename "$subdir")"
+    target="$SHARED_CACHE/$name"
     if [ -e "$target" ]; then
-      echo "  cache: $target already in shared dir, leaving $subdir in place"
+      echo "    dropping duplicate: $subdir (canonical exists at $target)"
+      rm -rf "$subdir"
     else
-      echo "  cache: migrating $subdir -> $target"
+      echo "    moving: $subdir -> $target"
       mv "$subdir" "$target"
     fi
   done
   shopt -u nullglob
-  rmdir "$legacy" 2>/dev/null || true
-}
+  rmdir "$PRIOR_BAD_SHARED" 2>/dev/null || true
+fi
 
+# Point each per-variant base's cache dir at the canonical shared cache.
+# Idempotent: if the link is already correct, return; if it points elsewhere
+# replace it; if it's a real directory, migrate its contents (dropping
+# duplicates that already exist in the shared dir) and replace with a symlink.
 link_cache_to_shared() {
   local link="$1"
   if [ -L "$link" ]; then
-    return 0
-  fi
-  if [ -d "$link" ]; then
-    migrate_cache_into_shared "$link"
-    if [ -d "$link" ]; then
-      # Anything left here conflicts with the shared cache. The per-base
-      # cache only ever contains state from this very run, so leftovers
-      # are partial downloads — drop them so the symlink wins.
-      echo "  cache: clearing partial leftovers at $link"
-      rm -rf "$link"
+    if [ "$(readlink "$link")" = "$SHARED_CACHE" ]; then
+      return 0
     fi
+    echo "  cache: relinking $link -> $SHARED_CACHE"
+    rm "$link"
+  elif [ -d "$link" ]; then
+    echo "  cache: folding $link into $SHARED_CACHE"
+    shopt -s nullglob
+    for subdir in "$link"/*; do
+      name="$(basename "$subdir")"
+      target="$SHARED_CACHE/$name"
+      if [ -e "$target" ]; then
+        echo "    dropping duplicate: $subdir (canonical exists at $target)"
+        rm -rf "$subdir"
+      else
+        echo "    moving: $subdir -> $target"
+        mv "$subdir" "$target"
+      fi
+    done
+    shopt -u nullglob
+    rm -rf "$link"
   fi
   ln -sfn "$SHARED_CACHE" "$link"
 }
-
-# Pull in legacy caches from older single-disease output dirs (e.g.
-# ~/hypertension_results/.sv_pgs_cache from before the SNP/SV split).
-for legacy_dir in "$HOME"/*_results/.sv_pgs_cache; do
-  [ -e "$legacy_dir" ] || continue
-  migrate_cache_into_shared "$legacy_dir"
-done
 
 link_cache_to_shared "$BASE_SNP/.sv_pgs_cache"
 link_cache_to_shared "$BASE_JOINT/.sv_pgs_cache"
