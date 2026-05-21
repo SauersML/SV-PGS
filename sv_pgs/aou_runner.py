@@ -780,15 +780,17 @@ def _start_plink_cache_warmup(
     executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="aou-plink-cache")
     future = executor.submit(_compute_plink_cache)
 
+    warmup_config = config
+
     def _compute_or_wait(
         raw_genotypes: Any,
         bed_path: Path,
         sample_indices: np.ndarray,
-        call_config: ModelConfig,
+        config: ModelConfig,
     ) -> tuple[Any, Path | None]:
         if (
             Path(bed_path).resolve() == plink_path.resolve()
-            and float(call_config.minimum_scale) == float(config.minimum_scale)
+            and float(config.minimum_scale) == float(warmup_config.minimum_scale)
             and np.array_equal(np.asarray(sample_indices, dtype=np.intp), plink_sample_indices)
         ):
             log("  unified loader reached PLINK source; waiting for background stats/int8 cache warmup")
@@ -797,7 +799,7 @@ def _start_plink_cache_warmup(
             raw_genotypes,
             bed_path=bed_path,
             sample_indices=sample_indices,
-            config=call_config,
+            config=config,
         )
 
     _io.compute_plink_variant_statistics_cached = _compute_or_wait
