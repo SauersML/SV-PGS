@@ -978,6 +978,62 @@ def test_cupy_int8_cache_batches_shrink_when_gpu_free_memory_is_low():
     assert widths == [5, 5, 2]
 
 
+def test_cupy_int8_cache_subset_is_zero_copy_view():
+    """``subset`` must never duplicate the (large) raw_values buffer on the device.
+
+    This is the OOM-prevention invariant on memory-constrained GPUs: a
+    non-contiguous selection that touches most of the cache used to allocate a
+    second full-size copy via fancy indexing, OOMing the device. The fix routes
+    fancy selections through a view that shares ``raw_values`` with the parent;
+    contiguous selections take a zero-copy slice. Both paths must leave the
+    parent buffer object untouched.
+    """
+
+    class _FakeCupy:
+        float32 = np.float32
+        int8 = np.int8
+
+        @staticmethod
+        def asarray(array, dtype=None):
+            return np.asarray(array, dtype=dtype)
+
+    raw_values = np.arange(8 * 6, dtype=np.int8).reshape(8, 6)
+    means = np.zeros(6, dtype=np.float32)
+    scales = np.ones(6, dtype=np.float32)
+    cache = genotype_module._CupyInt8StandardizedCache(
+        raw_values=raw_values,
+        means=means,
+        scales=scales,
+        cupy=_FakeCupy,
+    )
+
+    # Non-contiguous fancy selection: deferred-gather view.
+    fancy_view = cache.subset(np.array([5, 1, 3], dtype=np.int32))
+    assert fancy_view.column_indices is not None
+    assert fancy_view.raw_values is raw_values, "fancy subset must share raw_values"
+    assert fancy_view.shape == (8, 3)
+    np.testing.assert_array_equal(np.asarray(fancy_view.column_indices), np.array([5, 1, 3]))
+
+    # Contiguous selection on a root cache: zero-copy slice view.
+    contig_view = cache.subset(np.array([2, 3, 4], dtype=np.int32))
+    assert contig_view.column_indices is None
+    assert np.shares_memory(contig_view.raw_values, raw_values), "contiguous subset must be a slice view"
+    assert contig_view.shape == (8, 3)
+
+    # Identity selection: returns the same cache instance.
+    assert cache.subset(np.arange(6, dtype=np.int32)) is cache
+
+    # View-of-view contiguous subset: slices the parent's index array, still no copy.
+    composed = fancy_view.subset(np.array([0, 1], dtype=np.int32))
+    assert composed.column_indices is not None
+    assert composed.raw_values is raw_values
+    np.testing.assert_array_equal(np.asarray(composed.column_indices), np.array([5, 1]))
+
+    # nbytes reports the logical view footprint, not the shared parent buffer.
+    assert fancy_view.nbytes < cache.nbytes
+    assert fancy_view.nbytes >= 8 * 3 * raw_values.dtype.itemsize
+
+
 def test_gpu_cached_matvec_with_all_active_coefficients_reuses_cache(monkeypatch: pytest.MonkeyPatch):
     class _FakeCudaRuntime:
         @staticmethod
