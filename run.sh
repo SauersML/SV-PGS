@@ -13,6 +13,15 @@ fi
 export PATH="$HOME/.local/bin:$PATH"
 
 cd "$REPO_DIR"
+if [ -d .git ] && [ -z "${SV_PGS_SKIP_PULL:-}" ]; then
+  if git diff --quiet && git diff --cached --quiet; then
+    branch="$(git rev-parse --abbrev-ref HEAD)"
+    echo "updating code: git pull --ff-only origin ${branch}"
+    git pull --ff-only origin "$branch" || echo "  (git pull failed — continuing with local code)"
+  else
+    echo "skipping git pull: working tree has local changes"
+  fi
+fi
 if [ ! -x ".venv/bin/python" ]; then
   uv sync --python 3.12 --extra gpu
 fi
