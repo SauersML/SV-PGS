@@ -2656,6 +2656,10 @@ class StandardizedGenotypeMatrix:
             vector_input = False
         else:
             raise ValueError("GPU genotype matmul expects a vector or matrix right-hand side.")
+        any_fn = getattr(cupy, "any", np.any)
+        if not bool(any_fn(matrix_gpu)):
+            result_gpu = cupy.zeros((self.shape[0], matrix_gpu.shape[1]), dtype=resolved_dtype)
+            return result_gpu[:, 0] if vector_input else result_gpu
         resolved_local_indices = (
             np.arange(self.shape[1], dtype=np.int32)
             if local_variant_indices is None

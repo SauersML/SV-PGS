@@ -1392,6 +1392,125 @@ def test_validation_path_keeps_raw_genotypes_streaming():
     assert validation_genotypes.materialize_calls == 0
 
 
+def test_validation_reduction_does_not_build_full_width_hybrid_backend(monkeypatch):
+    class SpyInt8ValidationMatrix(RawGenotypeMatrix):
+        def __init__(self, matrix: np.ndarray) -> None:
+            self.matrix = np.asarray(matrix, dtype=np.int8)
+            self.i8_requests: list[list[int]] = []
+
+        @property
+        def shape(self) -> tuple[int, int]:
+            return int(self.matrix.shape[0]), int(self.matrix.shape[1])
+
+        def iter_column_batches_i8(self, variant_indices=None, batch_size: int = 1024):
+            resolved_indices = (
+                np.arange(self.matrix.shape[1], dtype=np.int32)
+                if variant_indices is None
+                else np.asarray(variant_indices, dtype=np.int32)
+            )
+            self.i8_requests.append(resolved_indices.tolist())
+            for start_index in range(0, resolved_indices.shape[0], max(int(batch_size), 1)):
+                batch_indices = resolved_indices[start_index : start_index + batch_size]
+                yield RawGenotypeBatch(
+                    variant_indices=batch_indices,
+                    values=np.asarray(self.matrix[:, batch_indices], dtype=np.int8),
+                )
+
+        def iter_column_batches(self, variant_indices=None, batch_size: int = 1024):
+            raise AssertionError("validation reduction should not use float raw batches")
+
+        def materialize(self, variant_indices=None) -> np.ndarray:
+            resolved_indices = (
+                np.arange(self.matrix.shape[1], dtype=np.int32)
+                if variant_indices is None
+                else np.asarray(variant_indices, dtype=np.int32)
+            )
+            return np.asarray(self.matrix[:, resolved_indices], dtype=np.float32)
+
+    sample_count = 8
+    variant_count = 80
+    active_indices = np.array([2, 17, 61], dtype=np.int32)
+    rng = np.random.default_rng(123)
+    train_genotypes = rng.integers(0, 3, size=(sample_count, variant_count)).astype(np.float32)
+    covariate_matrix = np.zeros((sample_count, 1), dtype=np.float32)
+    target_vector = np.linspace(0.0, 1.0, sample_count, dtype=np.float32)
+    variant_records = [
+        VariantRecord(f"variant_{index}", VariantClass.SNV, "1", 100 + index)
+        for index in range(variant_count)
+    ]
+    allele_frequencies = np.full(variant_count, 0.001, dtype=np.float32)
+    allele_frequencies[active_indices] = 0.25
+    variant_stats = VariantStatistics(
+        means=np.zeros(variant_count, dtype=np.float32),
+        scales=np.ones(variant_count, dtype=np.float32),
+        allele_frequencies=allele_frequencies,
+        support_counts=np.ones(variant_count, dtype=np.int32),
+    )
+    validation_genotypes = SpyInt8ValidationMatrix(train_genotypes.astype(np.int8))
+
+    monkeypatch.setattr(genotype_module, "require_gpu", lambda: None)
+    monkeypatch.setattr(
+        model_module,
+        "build_tie_map",
+        lambda _genotypes, _records, _config: TieMap(
+            kept_indices=np.arange(active_indices.shape[0], dtype=np.int32),
+            original_to_reduced=np.arange(active_indices.shape[0], dtype=np.int32),
+            reduced_to_group=[],
+        ),
+    )
+    monkeypatch.setattr(
+        genotype_module.StandardizedGenotypeMatrix,
+        "try_materialize_gpu",
+        lambda self: False,
+    )
+    monkeypatch.setattr(
+        genotype_module.StandardizedGenotypeMatrix,
+        "try_materialize",
+        lambda self: False,
+    )
+
+    def fake_fit_variational_em(**kwargs):
+        reduced_variant_count = int(kwargs["genotypes"].shape[1])
+        return VariationalFitResult(
+            alpha=np.zeros(covariate_matrix.shape[1] + 1, dtype=np.float32),
+            beta_reduced=np.zeros(reduced_variant_count, dtype=np.float32),
+            beta_variance=np.ones(reduced_variant_count, dtype=np.float64),
+            prior_scales=np.ones(reduced_variant_count, dtype=np.float64),
+            global_scale=1.0,
+            class_tpb_shape_a={VariantClass.SNV: 1.0},
+            class_tpb_shape_b={VariantClass.SNV: 1.0},
+            scale_model_coefficients=np.zeros(1, dtype=np.float64),
+            scale_model_feature_names=["intercept"],
+            sigma_error2=1.0,
+            objective_history=[0.0],
+            validation_history=[],
+            member_prior_variances=np.ones(reduced_variant_count, dtype=np.float64),
+            linear_predictor=np.zeros(sample_count, dtype=np.float32),
+            selected_iteration_count=1,
+            converged=True,
+        )
+
+    monkeypatch.setattr(model_module, "fit_variational_em", fake_fit_variational_em)
+
+    model = BayesianPGS(
+        ModelConfig(
+            trait_type=TraitType.QUANTITATIVE,
+            max_outer_iterations=1,
+            minimum_minor_allele_frequency=0.05,
+        )
+    ).fit(
+        train_genotypes,
+        covariate_matrix,
+        target_vector,
+        variant_records,
+        validation_data=(validation_genotypes, covariate_matrix, target_vector),
+        variant_stats=variant_stats,
+    )
+
+    assert model.state is not None
+    assert validation_genotypes.i8_requests == []
+
+
 def test_model_fit_keeps_streaming_when_materialization_is_skipped(monkeypatch):
     genotype_matrix, covariate_matrix, target_vector, variant_records = _synthetic_binary_dataset()
 

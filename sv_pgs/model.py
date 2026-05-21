@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import pickle
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Sequence, cast
@@ -483,7 +484,13 @@ def _try_load_fit_stage_cache(
         if int(manifest_payload.get("version", -1)) != _FIT_STAGE_CACHE_VERSION:
             log(f"fit-stage cache version mismatch (key={cache_paths.key}), rebuilding")
             return None
-        active_variant_indices = np.load(cache_paths.active_indices_path, mmap_mode="r").astype(np.int32, copy=False)
+        # Materialize to RAM (no mmap_mode). Downstream code fancy-indexes this
+        # array repeatedly (incl. inside the per-tie-group Python loop), and a
+        # memmap-backed array can stall for minutes under disk pressure.
+        active_variant_indices = np.ascontiguousarray(
+            np.load(cache_paths.active_indices_path),
+            dtype=np.int32,
+        )
         with cache_paths.tie_map_path.open("rb") as handle:
             reduced_tie_map = pickle.load(handle)
         expected_active_variant_count = int(manifest_payload.get("active_variant_count", -1))
@@ -831,26 +838,42 @@ class BayesianPGS:
             local_cache = False
         else:
             active_genotypes = None
+        log("  projecting tie map to original variant space...")
         original_space_tie_map = _project_tie_map_to_original_space(
             reduced_tie_map=reduced_tie_map,
             active_variant_indices=active_variant_indices,
             original_variant_count=total_variant_count,
         )
+        log(f"  tie map projected  mem={mem()}")
         log(f"tie map: {len(active_variant_indices)} active -> {len(reduced_tie_map.kept_indices)} unique ({len(reduced_tie_map.reduced_to_group)} groups)  mem={mem()}")
 
         reduced_validation = None
         if validation_data is not None:
             validation_genotypes, validation_covariates, validation_targets = validation_data
-            standardized_validation = as_raw_genotype_matrix(validation_genotypes).standardized(
-                prepared_arrays.means,
-                prepared_arrays.scales,
-                support_counts=prepared_arrays.support_counts,
-            )
             combined_validation_indices = active_variant_indices[reduced_tie_map.kept_indices]
+            validation_t0 = time.monotonic()
+            log(
+                "preparing reduced validation genotype view "
+                + f"({len(validation_targets)} samples x {combined_validation_indices.shape[0]} variants)  mem={mem()}"
+            )
+            validation_raw_genotypes = as_raw_genotype_matrix(validation_genotypes)
+            standardized_validation = StandardizedGenotypeMatrix(
+                raw=validation_raw_genotypes,
+                means=prepared_arrays.means,
+                scales=prepared_arrays.scales,
+                variant_indices=np.asarray(combined_validation_indices, dtype=np.int32),
+                support_counts=prepared_arrays.support_counts,
+                sample_count=validation_raw_genotypes.shape[0],
+                _enable_hybrid_backend=False,
+            )
             reduced_validation = (
-                standardized_validation.subset(combined_validation_indices),
+                standardized_validation,
                 self._with_intercept(np.asarray(validation_covariates, dtype=np.float32)),
                 np.asarray(validation_targets, dtype=np.float32),
+            )
+            log(
+                "  reduced validation view ready "
+                + f"in {time.monotonic() - validation_t0:.1f}s  mem={mem()}"
             )
 
         # Free original mmap'd chromosome data BEFORE materialization/persistence.
@@ -1344,20 +1367,41 @@ def _project_tie_map_to_original_space(
 ) -> TieMap:
     if _active_indices_cover_original(active_variant_indices, original_variant_count):
         return reduced_tie_map
-    kept_indices = active_variant_indices[reduced_tie_map.kept_indices]
+    # Force the inputs into contiguous in-memory int32 arrays. The caller may
+    # pass a numpy memmap (cache load path), and random fancy-indexing into a
+    # memmap inside the per-group Python loop below can stall for minutes
+    # under disk pressure. One bulk read here is fast.
+    active_indices_array = np.ascontiguousarray(active_variant_indices, dtype=np.int32)
+    kept_indices = active_indices_array[np.asarray(reduced_tie_map.kept_indices, dtype=np.int64)]
     original_to_reduced = np.full(original_variant_count, -1, dtype=np.int32)
-    original_to_reduced[active_variant_indices] = reduced_tie_map.original_to_reduced
+    original_to_reduced[active_indices_array] = reduced_tie_map.original_to_reduced
     original_groups: list[TieGroup] = []
-    for tie_group in reduced_tie_map.reduced_to_group:
-        original_groups.append(
-            TieGroup(
-                representative_index=int(active_variant_indices[tie_group.representative_index]),
-                member_indices=active_variant_indices[tie_group.member_indices].astype(np.int32),
-                signs=tie_group.signs.astype(np.float32),
-            )
+    if reduced_tie_map.reduced_to_group:
+        # Hoist the per-group Python-level work out of the hot loop. For each
+        # tie group we just want active_indices_array[group.member_indices]
+        # and active_indices_array[group.representative_index]. Bulk-resolve
+        # representatives across all groups in one vectorized gather, and only
+        # the (small, variable-length) member arrays remain inside the loop.
+        representative_indices = np.fromiter(
+            (int(tie_group.representative_index) for tie_group in reduced_tie_map.reduced_to_group),
+            dtype=np.int64,
+            count=len(reduced_tie_map.reduced_to_group),
         )
+        representative_originals = active_indices_array[representative_indices]
+        for tie_group, representative_original in zip(
+            reduced_tie_map.reduced_to_group,
+            representative_originals,
+        ):
+            member_indices_local = np.asarray(tie_group.member_indices, dtype=np.int64)
+            original_groups.append(
+                TieGroup(
+                    representative_index=int(representative_original),
+                    member_indices=active_indices_array[member_indices_local].astype(np.int32, copy=False),
+                    signs=np.asarray(tie_group.signs, dtype=np.float32),
+                )
+            )
     return TieMap(
-        kept_indices=kept_indices.astype(np.int32),
+        kept_indices=kept_indices.astype(np.int32, copy=False),
         original_to_reduced=original_to_reduced,
         reduced_to_group=original_groups,
     )

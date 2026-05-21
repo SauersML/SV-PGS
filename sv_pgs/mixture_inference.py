@@ -1783,9 +1783,30 @@ def fit_variational_em(
 
         def _rebuild_genetic_linear_predictor_state() -> None:
             nonlocal genetic_linear_predictor, genetic_linear_predictor_gpu
+            predictor_t0 = time.monotonic()
+            if not np.any(beta_state):
+                genetic_linear_predictor = np.zeros(target_vector.shape[0], dtype=np.float64)
+                if use_gpu_epoch_predictor_state:
+                    assert stochastic_epoch_cupy is not None
+                    assert stochastic_epoch_compute_cp_dtype is not None
+                    genetic_linear_predictor_gpu = stochastic_epoch_cupy.asarray(
+                        genetic_linear_predictor,
+                        dtype=stochastic_epoch_compute_cp_dtype,
+                    )
+                else:
+                    genetic_linear_predictor_gpu = None
+                log(
+                    "  genetic predictor rebuild: beta is all zero; skipped genotype pass "
+                    + f"in {time.monotonic() - predictor_t0:.1f}s  mem={mem()}"
+                )
+                return
             if use_gpu_epoch_predictor_state:
                 assert stochastic_epoch_cupy is not None
                 assert stochastic_epoch_compute_cp_dtype is not None
+                log(
+                    "  genetic predictor rebuild: GPU genotype matmul "
+                    + f"samples={genotype_matrix.shape[0]} variants={genotype_matrix.shape[1]}  mem={mem()}"
+                )
                 genetic_linear_predictor_gpu = genotype_matrix.gpu_matmat(
                     stochastic_epoch_cupy.asarray(beta_state, dtype=stochastic_epoch_compute_cp_dtype),
                     batch_size=config.posterior_variance_batch_size,
@@ -1793,13 +1814,25 @@ def fit_variational_em(
                     dtype=stochastic_epoch_compute_cp_dtype,
                 )
                 genetic_linear_predictor = _cupy_array_to_numpy(genetic_linear_predictor_gpu, dtype=np.float64)
+                log(
+                    "  genetic predictor rebuild done "
+                    + f"in {time.monotonic() - predictor_t0:.1f}s  mem={mem()}"
+                )
                 return
             genetic_linear_predictor_gpu = None
+            log(
+                "  genetic predictor rebuild: CPU genotype matvec "
+                + f"samples={genotype_matrix.shape[0]} variants={genotype_matrix.shape[1]}  mem={mem()}"
+            )
             genetic_linear_predictor = _genotype_matvec_result_numpy(
                 genotype_matrix,
                 beta_state,
                 batch_size=config.posterior_variance_batch_size,
                 dtype=np.float64,
+            )
+            log(
+                "  genetic predictor rebuild done "
+                + f"in {time.monotonic() - predictor_t0:.1f}s  mem={mem()}"
             )
 
         _rebuild_genetic_linear_predictor_state()

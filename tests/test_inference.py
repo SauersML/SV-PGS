@@ -745,7 +745,7 @@ def test_stochastic_variant_updates_keep_epoch_predictor_updates_on_gpu(monkeypa
         tie_map=tie_map,
     )
     assert result.objective_history
-    assert gpu_matmat_call_count >= 5
+    assert gpu_matmat_call_count >= 4
     assert matvec_call_count == 0
 def test_fit_variational_em_ignores_incompatible_resume_checkpoint(random_generator):
     sample_count, variant_count = 24, 5
