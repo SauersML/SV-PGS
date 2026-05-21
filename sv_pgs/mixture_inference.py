@@ -882,9 +882,29 @@ def _apply_binary_intercept_calibration(
 def _gpu_cholesky_solve(right_hand_side, cholesky_factor_gpu, solve_triangular_gpu):
     import cupy as cp
 
-    rhs_gpu = cp.asarray(right_hand_side, dtype=cholesky_factor_gpu.dtype)
-    lower_solution = solve_triangular_gpu(cholesky_factor_gpu, rhs_gpu, lower=True)
-    return solve_triangular_gpu(cholesky_factor_gpu.T, lower_solution, lower=False)
+    factor_gpu = cp.asarray(cholesky_factor_gpu)
+    if factor_gpu.ndim != 2 or factor_gpu.shape[0] != factor_gpu.shape[1]:
+        raise ValueError("GPU Cholesky solve requires a square factor.")
+    rhs_gpu = cp.asarray(right_hand_side, dtype=factor_gpu.dtype)
+    rhs_was_vector = rhs_gpu.ndim == 1
+    if rhs_was_vector:
+        rhs_gpu = rhs_gpu[:, None]
+    if rhs_gpu.ndim != 2:
+        raise ValueError("GPU Cholesky solve expects a vector or matrix right-hand side.")
+    if rhs_gpu.shape[0] != factor_gpu.shape[0]:
+        raise ValueError("GPU Cholesky solve right-hand side has incompatible shape.")
+    if hasattr(cp, "asfortranarray"):
+        factor_gpu = cp.asfortranarray(factor_gpu)
+        rhs_gpu = cp.asfortranarray(rhs_gpu)
+    lower_solution = solve_triangular_gpu(factor_gpu, rhs_gpu, lower=True, check_finite=False)
+    solution = solve_triangular_gpu(
+        factor_gpu,
+        lower_solution,
+        lower=True,
+        trans="T",
+        check_finite=False,
+    )
+    return solution[:, 0] if rhs_was_vector else solution
 
 
 def _resolve_gpu_solve_triangular():
@@ -2422,7 +2442,7 @@ def fit_variational_em(
             validation_metric_this_epoch: float | None = None
             if validation_payload is not None:
                 should_validate = (
-                    outer_iteration == 0
+                    (config.validate_first_iteration and outer_iteration == 0)
                     or ((outer_iteration + 1) % config.validation_interval == 0)
                     or outer_iteration + 1 == config.max_outer_iterations
                 )
@@ -2780,7 +2800,7 @@ def fit_variational_em(
             validation_metric_this_epoch = None
             if validation_payload is not None:
                 should_validate = (
-                    outer_iteration == 0
+                    (config.validate_first_iteration and outer_iteration == 0)
                     or ((outer_iteration + 1) % config.validation_interval == 0)
                     or outer_iteration + 1 == config.max_outer_iterations
                 )
@@ -3306,9 +3326,12 @@ def fit_variational_em(
         local_scale=local_scale,
         config=config,
     )
-    log(f"  EM loop done after {len(objective_history)} iterations, computing final posterior...  mem={mem()}")
+    if config.final_posterior_diagnostics:
+        log(f"  EM loop done after {len(objective_history)} iterations, computing final posterior diagnostics...  mem={mem()}")
+    else:
+        log(f"  EM loop done after {len(objective_history)} iterations, computing final point estimates only...  mem={mem()}")
     final_prior_precision_override: np.ndarray | None = None
-    if beta_variance_state is not None:
+    if config.final_posterior_diagnostics and beta_variance_state is not None:
         final_second_moment = np.asarray(
             beta_state * beta_state + np.asarray(beta_variance_state, dtype=np.float64),
             dtype=np.float64,
@@ -3330,8 +3353,8 @@ def fit_variational_em(
         beta_init=beta_state,
         trait_type=config.trait_type,
         config=config,
-        compute_logdet=True,
-        compute_beta_variance=True,
+        compute_logdet=bool(config.final_posterior_diagnostics),
+        compute_beta_variance=bool(config.final_posterior_diagnostics),
         predictor_offset=predictor_offset_array,
         prior_precision_override=final_prior_precision_override,
     )
@@ -3437,6 +3460,8 @@ def _should_refresh_beta_variance(
         return True
     if force_final_refresh and iteration_index + 1 == max(int(total_iterations), 1):
         return True
+    if int(refresh_interval) <= 0:
+        return False
     return ((iteration_index + 1) % max(int(refresh_interval), 1)) == 0
 
 
@@ -4999,11 +5024,40 @@ def _sample_space_nystrom_basis_gpu(
         basis_gpu, triangular_gpu = cupy.linalg.qr(sketch_response_gpu, mode="reduced")
     except TypeError:
         basis_gpu, triangular_gpu = cupy.linalg.qr(sketch_response_gpu)
+    # QR returns fresh Q (basis_gpu) and R (triangular_gpu); the inputs are
+    # no longer needed. At AoU sketch dimensions probes+response together pin
+    # ~1.2 GB on-device, so release them before any further allocation. With
+    # the int8 training+validation caches resident the device is otherwise
+    # too full to grow safely for the truncated copy + D2H below.
+    del sketch_probes_gpu, sketch_response_gpu
     diagonal = _cupy_array_to_numpy(cupy.abs(cupy.diag(triangular_gpu)), dtype=np.float64)
+    del triangular_gpu
+    try:
+        cupy.get_default_memory_pool().free_all_blocks()
+    except AttributeError:
+        pass
     effective_rank = min(requested_rank, int(np.sum(diagonal > 1e-10)))
     if effective_rank <= 0:
+        del basis_gpu
+        try:
+            cupy.get_default_memory_pool().free_all_blocks()
+        except AttributeError:
+            pass
         return None
-    basis_gpu = cupy.asarray(basis_gpu[:, :effective_rank], dtype=compute_cp_dtype)
+    # Allocate a fresh C-contiguous rank-truncated copy. We briefly hold both
+    # (full-rank Q + truncated copy); then drop Q so .get() on a contiguous
+    # source skips the internal ascontiguousarray() shadow allocation that
+    # would otherwise be the OOM trigger here under tight GPU memory.
+    if hasattr(cupy, "ascontiguousarray"):
+        basis_truncated_gpu = cupy.ascontiguousarray(basis_gpu[:, :effective_rank], dtype=compute_cp_dtype)
+    else:
+        basis_truncated_gpu = cupy.asarray(basis_gpu[:, :effective_rank], dtype=compute_cp_dtype)
+    del basis_gpu
+    try:
+        cupy.get_default_memory_pool().free_all_blocks()
+    except AttributeError:
+        pass
+    basis_gpu = basis_truncated_gpu
     basis_cpu = np.asarray(basis_gpu.get() if hasattr(basis_gpu, "get") else basis_gpu, dtype=np.float64)
     genotype_matrix._sample_space_nystrom_basis_cpu_cache[(effective_rank, int(random_seed))] = basis_cpu
     genotype_matrix._sample_space_nystrom_basis_gpu_cache[(effective_rank, int(random_seed))] = basis_gpu

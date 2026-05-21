@@ -46,6 +46,8 @@ MATERIALIZE_THRESHOLD_BYTES = 4_000_000_000  # 4 GB
 HYBRID_SPARSE_SUPPORT_THRESHOLD = 4_096
 HYBRID_SPARSE_MIN_VARIANT_COUNT = 64
 REDUCED_INT8_CACHE_FREE_SPACE_RESERVE_BYTES = 64 * 1024 * 1024
+INT8_ONE_SHOT_GPU_BUDGET_FRACTION = 0.90
+ROW_SUBSET_ONE_SHOT_MAX_SAMPLE_RATIO = 8.0
 
 
 def _madvise_willneed_array(array: np.ndarray) -> None:
@@ -840,6 +842,128 @@ def _upload_standardized_int8_tiles_overlapped(
     for in_flight_event in in_flight_events:
         if in_flight_event is not None:
             in_flight_event.synchronize()
+
+
+def _try_upload_int8_parallel_memmap(
+    *,
+    cupy,
+    raw: object,
+    variant_indices: np.ndarray,
+    gpu_destination,
+    sample_count: int,
+    n_workers: int = 8,
+) -> bool:
+    """Fast parallel-memmap upload path for an F-order int8 numpy memmap leaf.
+
+    Bypasses the per-batch iterator chain: allocates one big pinned host buffer,
+    splits variant_indices into ``n_workers`` column stripes, then for each stripe
+    a worker thread (a) reads the memmap slice into its stripe of the pinned
+    buffer — letting the kernel issue parallel disk I/O across worker threads —
+    and (b) issues an async H2D copy on its own non-blocking CUDA stream into the
+    matching GPU column range. Returns True on success; False if the source isn't
+    eligible (no memmap leaf, wrong dtype/order, or non-contiguous indices).
+
+    Bit-identical to ``_upload_int8_tiles_overlapped`` byte-for-byte: same raw
+    int8 bytes get DMA'd to the same GPU offsets.
+    """
+    if not isinstance(raw, Int8RawGenotypeMatrix):
+        return False
+    matrix = raw.matrix
+    if not isinstance(matrix, np.memmap):
+        return False
+    if matrix.dtype != np.int8:
+        return False
+    if matrix.ndim != 2:
+        return False
+    if not matrix.flags.f_contiguous:
+        return False
+    if int(matrix.shape[0]) != int(sample_count):
+        return False
+    n_variants = int(variant_indices.shape[0])
+    if n_variants == 0:
+        return True
+    vi = np.asarray(variant_indices, dtype=np.int64)
+    if vi.size > 1:
+        if not np.all(np.diff(vi) == 1):
+            return False
+    src_col_start = int(vi[0])
+    src_col_end = src_col_start + n_variants
+    if src_col_start < 0 or src_col_end > int(matrix.shape[1]):
+        return False
+
+    total_bytes = int(sample_count) * n_variants
+    try:
+        pinned_owner = cupy.cuda.alloc_pinned_memory(total_bytes)
+    except (MemoryError, RuntimeError) as exc:
+        log(f"    parallel-pread upload: pinned alloc failed ({exc}); falling back")
+        return False
+    flat = np.frombuffer(pinned_owner, dtype=np.int8, count=total_bytes)
+    pinned_buf = flat.reshape((n_variants, sample_count)).T
+    if not pinned_buf.flags.f_contiguous:
+        return False
+
+    try:
+        if matrix.filename:
+            with open(matrix.filename, "rb") as fadvise_handle:
+                file_offset = int(getattr(matrix, "offset", 0)) + src_col_start * int(sample_count)
+                try:
+                    os.posix_fadvise(
+                        fadvise_handle.fileno(),
+                        file_offset,
+                        total_bytes,
+                        os.POSIX_FADV_WILLNEED,
+                    )
+                except (AttributeError, OSError):
+                    pass
+    except (AttributeError, OSError):
+        pass
+
+    effective_workers = max(1, min(int(n_workers), n_variants))
+    stripe_size = (n_variants + effective_workers - 1) // effective_workers
+    stripes: list[tuple[int, int]] = []
+    for worker_idx in range(effective_workers):
+        s = worker_idx * stripe_size
+        e = min(s + stripe_size, n_variants)
+        if s < e:
+            stripes.append((s, e))
+    effective_workers = len(stripes)
+
+    streams = [cupy.cuda.Stream(non_blocking=True) for _ in range(effective_workers)]
+    events: list[Any] = [None] * effective_workers
+    errors: list[BaseException] = []
+
+    def worker(worker_idx: int, col_start: int, col_end: int) -> None:
+        try:
+            src_view = matrix[:, src_col_start + col_start : src_col_start + col_end]
+            # Forces parallel page faults + memcpy from page cache → pinned buffer.
+            # numpy releases the GIL for this memcpy, so workers fan out across cores.
+            pinned_buf[:, col_start:col_end] = src_view
+            stream = streams[worker_idx]
+            with stream:
+                gpu_int8_dtype = getattr(cupy, "int8", np.int8)
+                staged_tile = cupy.asarray(pinned_buf[:, col_start:col_end], dtype=gpu_int8_dtype)
+                gpu_destination[:, col_start:col_end] = staged_tile
+            events[worker_idx] = stream.record()
+        except BaseException as exc:  # noqa: BLE001 - reraised on main thread
+            errors.append(exc)
+
+    log(
+        "    parallel-pread upload: "
+        + f"{n_variants} variants x {sample_count} samples ({total_bytes / 1e9:.1f} GB) "
+        + f"across {effective_workers} workers/streams  mem={mem()}"
+    )
+    with ThreadPoolExecutor(max_workers=effective_workers, thread_name_prefix="i8-pread") as executor:
+        futures = [executor.submit(worker, i, s, e) for i, (s, e) in enumerate(stripes)]
+        for future in futures:
+            future.result()
+
+    if errors:
+        raise errors[0]
+
+    for event in events:
+        if event is not None:
+            event.synchronize()
+    return True
 
 
 def _upload_int8_tiles_overlapped(
@@ -2261,12 +2385,43 @@ class StandardizedGenotypeMatrix:
                     raise RuntimeError("raw int8 GPU cache requires raw backing storage.")
                 raw_int8 = cast(Int8BatchCapable, raw_matrix)
                 gpu_int8_dtype = cupy.int8 if hasattr(cupy, "int8") else np.int8
-                # Fast path: if the entire int8 block fits easily, prefer a single
-                # contiguous raw read plus one H2D copy over CPU-oriented batch
-                # iteration. This is especially important for stochastic blocks,
-                # which arrive as contiguous local slices.
+                if isinstance(raw_matrix, Int8RawGenotypeMatrix):
+                    _madvise_willneed_array(raw_matrix.matrix)
+                # Fastest path: if the leaf is a single F-order int8 numpy memmap
+                # (the typical state after ``try_cache_persistently``), upload it
+                # via N parallel pinned-buffer reads + N async H2D streams. This
+                # bypasses the per-batch iterator and saturates disk queue depth
+                # + PCIe simultaneously. Bit-identical to the tiled path.
+                if isinstance(raw_matrix, Int8RawGenotypeMatrix) and isinstance(raw_matrix.matrix, np.memmap):
+                    parallel_dst = cupy.empty(self.shape, dtype=gpu_int8_dtype, order="F")
+                    if _try_upload_int8_parallel_memmap(
+                        cupy=cupy,
+                        raw=raw_matrix,
+                        variant_indices=self.variant_indices,
+                        gpu_destination=parallel_dst,
+                        sample_count=int(self.shape[0]),
+                    ):
+                        gpu_matrix = parallel_dst
+                        cupy.cuda.Device().synchronize()
+                        self._cupy_cache = _CupyInt8StandardizedCache(
+                            raw_values=gpu_matrix,
+                            means=cupy.asarray(self.means[self.variant_indices], dtype=cupy.float32),
+                            scales=cupy.asarray(self.scales[self.variant_indices], dtype=cupy.float32),
+                            cupy=cupy,
+                        )
+                        cupy.cuda.Device().synchronize()
+                        import gc
+                        gc.collect()
+                        log(f"    CuPy GPU matrix ready ({_cupy_cache_nbytes(self._cupy_cache) / 1e9:.1f} GB)  mem={mem()}")
+                        return True
+                    del parallel_dst
+                # Fast path: if the entire int8 block fits inside the GPU cache
+                # budget, prefer one contiguous raw read plus one H2D copy over
+                # Python tile iteration. AoU fit-stage caches are Fortran-order
+                # int8 mmaps, so this turns a minutes-long tiled upload into one
+                # sequential mmap pass and one device allocation.
                 int8_total_bytes = int(self.shape[0]) * int(self.shape[1])
-                if int8_total_bytes < budget_bytes * 0.5:
+                if int8_total_bytes <= int(budget_bytes * INT8_ONE_SHOT_GPU_BUDGET_FRACTION):
                     full_int8_block = _read_int8_columns_one_shot(raw_matrix, self.variant_indices)
                     if full_int8_block is not None:
                         log(
@@ -2570,8 +2725,30 @@ class StandardizedGenotypeMatrix:
             return False
         cache_path = Path(cache_path)
         cache_path.parent.mkdir(parents=True, exist_ok=True)
-        batch_size = auto_batch_size_i8(self.shape[0])
         selected_variant_count = int(self.variant_indices.shape[0])
+        # Short-circuit if a previous run already wrote this exact cache. Just rebase
+        # onto the existing F-order int8 memmap; no rewrite, no double-build.
+        if cache_path.exists():
+            try:
+                existing_mmap = np.load(cache_path, mmap_mode="r")
+                if existing_mmap.shape == self.shape and existing_mmap.dtype == np.int8:
+                    _madvise_willneed_array(existing_mmap)
+                    self.raw = Int8RawGenotypeMatrix(existing_mmap)
+                    self.means = np.asarray(self.means[self.variant_indices], dtype=np.float32)
+                    self.scales = np.asarray(self.scales[self.variant_indices], dtype=np.float32)
+                    if self.support_counts is not None:
+                        self.support_counts = np.asarray(self.support_counts[self.variant_indices], dtype=np.int32)
+                    self.variant_indices = np.arange(selected_variant_count, dtype=np.int32)
+                    self.clear_sample_space_nystrom_cache()
+                    self._local_cache_directory = None
+                    self._cupy_subset_cache = None
+                    self._cupy_subset_cache_local_indices = None
+                    self._enable_hybrid_backend = False
+                    log(f"    persistent int8 cache reused from {cache_path}  mem={mem()}")
+                    return True
+            except (OSError, ValueError) as exc:
+                log(f"    existing persistent int8 cache unreadable ({exc}); rebuilding")
+        batch_size = auto_batch_size_i8(self.shape[0])
         temp_directory = Path(tempfile.mkdtemp(prefix=f"{cache_path.name}.tmp.", dir=cache_path.parent))
         temp_path = temp_directory / cache_path.name
         log(
@@ -3495,6 +3672,38 @@ def _read_int8_columns_one_shot(
     if isinstance(raw, PlinkRawGenotypeMatrix):
         reader = raw._bed_reader()
         return np.asfortranarray(raw._read_batch_i8(reader, resolved_indices), dtype=np.int8)
+    if isinstance(raw, IndexedRawGenotypeMatrix) and _supports_int8_batches(raw.child):
+        child_block = _read_int8_columns_one_shot(
+            cast(Int8BatchCapable, raw.child),
+            raw._child_columns(resolved_indices),
+        )
+        return None if child_block is None else np.asfortranarray(child_block, dtype=np.int8)
+    if isinstance(raw, RowSubsetRawGenotypeMatrix) and _supports_int8_batches(raw.child):
+        child_sample_count = max(int(raw.child.shape[0]), 1)
+        subset_sample_count = max(int(raw.shape[0]), 1)
+        if child_sample_count > int(subset_sample_count * ROW_SUBSET_ONE_SHOT_MAX_SAMPLE_RATIO):
+            return None
+        child_block = _read_int8_columns_one_shot(
+            cast(Int8BatchCapable, raw.child),
+            resolved_indices,
+        )
+        if child_block is None:
+            return None
+        return np.asfortranarray(child_block[raw.row_indices, :], dtype=np.int8)
+    if isinstance(raw, ConcatenatedRawGenotypeMatrix) and all(_supports_int8_batches(child) for child in raw.children):
+        child_ids = np.searchsorted(raw._variant_offsets[1:], resolved_indices, side="right")
+        result = np.empty((raw.shape[0], resolved_indices.shape[0]), dtype=np.int8, order="F")
+        for child_index in np.unique(child_ids):
+            child_positions = np.nonzero(child_ids == child_index)[0]
+            child_variant_indices = resolved_indices[child_positions] - int(raw._variant_offsets[child_index])
+            child_block = _read_int8_columns_one_shot(
+                cast(Int8BatchCapable, raw.children[int(child_index)]),
+                child_variant_indices,
+            )
+            if child_block is None:
+                return None
+            result[:, child_positions] = child_block
+        return result
     return None
 
 

@@ -1318,6 +1318,104 @@ def test_try_materialize_gpu_uses_one_shot_int8_upload_for_contiguous_subset(mon
     )
 
 
+def test_try_materialize_gpu_uses_one_shot_int8_upload_near_budget(monkeypatch: pytest.MonkeyPatch):
+    class _FakeDevice:
+        def synchronize(self) -> None:
+            return None
+
+    class _FakeCuda:
+        @staticmethod
+        def Device():
+            return _FakeDevice()
+
+    class _FakeCupy:
+        float32 = np.float32
+        int8 = np.int8
+        cuda = _FakeCuda()
+
+        @staticmethod
+        def asarray(array, dtype=None):
+            return np.asarray(array, dtype=dtype)
+
+        @staticmethod
+        def asfortranarray(array):
+            return np.asfortranarray(array)
+
+        @staticmethod
+        def empty(shape, dtype=None, order=None):
+            raise AssertionError("near-budget one-shot int8 upload should not allocate batched GPU staging")
+
+        @staticmethod
+        def isnan(array):
+            return np.isnan(array)
+
+    raw_i8 = np.arange(10_000, dtype=np.int16).reshape(100, 100, order="F").astype(np.int8, copy=False)
+    standardized = Int8RawGenotypeMatrix(raw_i8).standardized(
+        means=np.zeros(raw_i8.shape[1], dtype=np.float32),
+        scales=np.ones(raw_i8.shape[1], dtype=np.float32),
+    )
+
+    monkeypatch.setattr(genotype_module, "_try_import_cupy", lambda: _FakeCupy())
+    monkeypatch.setattr(genotype_module, "_gpu_materialization_budget_bytes", lambda cupy: 12_000)
+    monkeypatch.setattr(
+        Int8RawGenotypeMatrix,
+        "iter_column_batches_i8",
+        lambda self, variant_indices=None, batch_size=1024: (_ for _ in ()).throw(
+            AssertionError("near-budget one-shot int8 upload should bypass iter_column_batches_i8")
+        ),
+    )
+
+    assert standardized.try_materialize_gpu() is True
+    assert standardized._cupy_cache is not None
+    np.testing.assert_array_equal(
+        np.asarray(cast(Any, standardized._cupy_cache.raw_values)),
+        raw_i8,
+    )
+
+
+def test_read_int8_columns_one_shot_handles_wrapped_raw_matrices():
+    left = np.arange(24, dtype=np.int8).reshape(4, 6, order="F")
+    right = (100 + np.arange(20, dtype=np.int8)).reshape(4, 5, order="F")
+    concatenated = ConcatenatedRawGenotypeMatrix(
+        (
+            Int8RawGenotypeMatrix(left),
+            Int8RawGenotypeMatrix(right),
+        )
+    )
+    row_subset = genotype_module.RowSubsetRawGenotypeMatrix(
+        concatenated,
+        np.array([3, 1], dtype=np.int32),
+    )
+    indexed = genotype_module.IndexedRawGenotypeMatrix(
+        row_subset,
+        np.array([0, 5, 6, 8, 10], dtype=np.int32),
+    )
+
+    actual = genotype_module._read_int8_columns_one_shot(
+        indexed,
+        np.array([1, 2, 4], dtype=np.int32),
+    )
+    expected_full = np.concatenate([left, right], axis=1)
+    expected = expected_full[np.array([3, 1])[:, None], np.array([5, 6, 10])[None, :]]
+    assert actual is not None
+    assert actual.flags.f_contiguous
+    np.testing.assert_array_equal(actual, expected)
+
+
+def test_read_int8_columns_one_shot_rejects_excessive_row_subset_expansion():
+    raw_i8 = np.arange(200, dtype=np.int16).reshape(20, 10, order="F").astype(np.int8, copy=False)
+    row_subset = genotype_module.RowSubsetRawGenotypeMatrix(
+        Int8RawGenotypeMatrix(raw_i8),
+        np.array([0, 2], dtype=np.int32),
+    )
+
+    actual = genotype_module._read_int8_columns_one_shot(
+        row_subset,
+        np.array([1, 2, 3], dtype=np.int32),
+    )
+    assert actual is None
+
+
 def test_int8_gpu_cache_supports_linear_algebra(monkeypatch: pytest.MonkeyPatch):
     class _FakeCudaRuntime:
         @staticmethod
@@ -1909,3 +2007,148 @@ def test_hybrid_standardized_operator_matches_dense_reference(monkeypatch: pytes
         atol=1e-5,
     )
     assert raw.float_requests == []
+
+
+def test_try_upload_int8_parallel_memmap_bit_identical_to_source(tmp_path, monkeypatch):
+    """Parallel-pread fast path must reproduce source bytes exactly.
+
+    Builds an F-order int8 numpy memmap on disk, wraps it as an
+    Int8RawGenotypeMatrix leaf, invokes ``_try_upload_int8_parallel_memmap``
+    under a fake CuPy module, and verifies the resulting GPU destination
+    buffer matches the source matrix byte-for-byte. The path is also
+    asserted to *not* fall back to the iterator on memmap inputs.
+    """
+    rng = np.random.default_rng(2026)
+    n_samples = 128
+    n_variants_total = 64
+    src = rng.integers(-1, 3, size=(n_samples, n_variants_total), dtype=np.int8)
+    src_fortran = np.asfortranarray(src)
+    cache_path = tmp_path / "raw_i8.npy"
+    np.save(cache_path, src_fortran)
+    mmap_array = np.load(cache_path, mmap_mode="r")
+    assert isinstance(mmap_array, np.memmap)
+    assert mmap_array.flags.f_contiguous
+
+    raw = Int8RawGenotypeMatrix(mmap_array)
+
+    class _FakeCuda:
+        @staticmethod
+        def alloc_pinned_memory(nbytes: int) -> Any:
+            return bytearray(int(nbytes))
+
+        @staticmethod
+        def Device():
+            class _Dev:
+                def synchronize(self) -> None:
+                    return None
+
+            return _Dev()
+
+        @staticmethod
+        def Stream(non_blocking: bool = False) -> _FakeCupyStream:
+            return _FakeCupyStream()
+
+    class _FakeCupy:
+        int8 = np.int8
+        cuda = _FakeCuda()
+
+        @staticmethod
+        def asarray(array, dtype=None):
+            return np.asarray(array, dtype=dtype)
+
+        @staticmethod
+        def empty(shape, dtype=None, order=None):
+            return np.empty(shape, dtype=dtype, order="F" if order is None else order)
+
+    # Fail loudly if the iterator chain is invoked — proves the parallel path
+    # is the one doing the work, not a silent fallback.
+    monkeypatch.setattr(
+        Int8RawGenotypeMatrix,
+        "iter_column_batches_i8",
+        lambda self, variant_indices=None, batch_size=1024: (_ for _ in ()).throw(
+            AssertionError("parallel-memmap path must not fall back to iter_column_batches_i8")
+        ),
+    )
+
+    variant_indices = np.arange(n_variants_total, dtype=np.int32)
+    gpu_dst = _FakeCupy.empty((n_samples, n_variants_total), dtype=np.int8, order="F")
+    assert genotype_module._try_upload_int8_parallel_memmap(
+        cupy=_FakeCupy(),
+        raw=raw,
+        variant_indices=variant_indices,
+        gpu_destination=gpu_dst,
+        sample_count=n_samples,
+        n_workers=4,
+    ) is True
+    np.testing.assert_array_equal(np.asarray(gpu_dst), src_fortran)
+
+    # Contiguous subset (not anchored at 0) must also work and stay bit-identical.
+    sub_indices = np.arange(8, 8 + 24, dtype=np.int32)
+    sub_dst = _FakeCupy.empty((n_samples, sub_indices.shape[0]), dtype=np.int8, order="F")
+    assert genotype_module._try_upload_int8_parallel_memmap(
+        cupy=_FakeCupy(),
+        raw=raw,
+        variant_indices=sub_indices,
+        gpu_destination=sub_dst,
+        sample_count=n_samples,
+        n_workers=8,
+    ) is True
+    np.testing.assert_array_equal(np.asarray(sub_dst), src_fortran[:, 8:32])
+
+
+def test_try_upload_int8_parallel_memmap_rejects_non_memmap_and_noncontiguous(tmp_path):
+    """The fast path must return False (no upload) for inputs it can't handle.
+
+    Eligibility gates: leaf must be an F-order int8 numpy memmap, variant
+    indices must form a contiguous range, sample count must match. Anything
+    else returns False so the caller falls back to the tiled iterator path.
+    """
+
+    class _FakeCuda:
+        @staticmethod
+        def alloc_pinned_memory(nbytes: int) -> Any:
+            return bytearray(int(nbytes))
+
+        @staticmethod
+        def Stream(non_blocking: bool = False) -> _FakeCupyStream:
+            return _FakeCupyStream()
+
+    class _FakeCupy:
+        int8 = np.int8
+        cuda = _FakeCuda()
+
+        @staticmethod
+        def asarray(array, dtype=None):
+            return np.asarray(array, dtype=dtype)
+
+        @staticmethod
+        def empty(shape, dtype=None, order=None):
+            return np.empty(shape, dtype=dtype, order="F" if order is None else order)
+
+    # In-memory (non-memmap) int8 matrix → must skip.
+    in_memory_raw = Int8RawGenotypeMatrix(
+        np.asfortranarray(np.zeros((16, 8), dtype=np.int8))
+    )
+    dst = _FakeCupy.empty((16, 8), dtype=np.int8, order="F")
+    assert genotype_module._try_upload_int8_parallel_memmap(
+        cupy=_FakeCupy(),
+        raw=in_memory_raw,
+        variant_indices=np.arange(8, dtype=np.int32),
+        gpu_destination=dst,
+        sample_count=16,
+    ) is False
+
+    # F-order memmap but non-contiguous variant indices → must skip.
+    src = np.asfortranarray(np.arange(16 * 8, dtype=np.int8).reshape(16, 8))
+    cache_path = tmp_path / "mm.npy"
+    np.save(cache_path, src)
+    mmap_array = np.load(cache_path, mmap_mode="r")
+    raw = Int8RawGenotypeMatrix(mmap_array)
+    dst2 = _FakeCupy.empty((16, 4), dtype=np.int8, order="F")
+    assert genotype_module._try_upload_int8_parallel_memmap(
+        cupy=_FakeCupy(),
+        raw=raw,
+        variant_indices=np.array([0, 2, 4, 6], dtype=np.int32),
+        gpu_destination=dst2,
+        sample_count=16,
+    ) is False

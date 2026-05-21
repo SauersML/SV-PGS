@@ -927,18 +927,62 @@ class BayesianPGS:
         if reduced_validation is not None:
             validation_genotype_matrix = reduced_validation[0]
             if isinstance(validation_genotype_matrix, StandardizedGenotypeMatrix):
-                log(f"materializing validation genotype matrix ({validation_genotype_matrix.shape})...")
-                validation_in_memory = validation_genotype_matrix.try_materialize_gpu()
-                if validation_in_memory:
-                    log(f"  validation GPU materialization succeeded  mem={mem()}")
-                if not validation_in_memory:
-                    validation_in_memory = validation_genotype_matrix.try_materialize()
+                # Persist a validation-side int8 cache analogous to the training
+                # reduced_raw_i8 cache. Without this, every run re-reads sparse
+                # columns through the per-chromosome Concatenated→Indexed→Int8
+                # wrapper chain — minutes of wall-clock for ~3 GB of data. With
+                # the cache present, the validation upload reuses the fast
+                # parallel-pread GPU materialization path.
+                if (
+                    fit_stage_cache_paths is not None
+                    and isinstance(validation_genotype_matrix.raw, RawGenotypeMatrix)
+                ):
+                    validation_raw_signature = _persistent_raw_signature(
+                        cast(RawGenotypeMatrix, validation_genotype_matrix.raw)
+                    )
+                    if validation_raw_signature is not None:
+                        val_hasher = hashlib.sha256()
+                        val_hasher.update(
+                            f"fit-stage-val-i8-v{_FIT_STAGE_CACHE_VERSION}".encode("utf-8")
+                        )
+                        val_hasher.update(validation_raw_signature.encode("utf-8"))
+                        _update_hash_with_array_bytes(
+                            val_hasher,
+                            np.asarray(validation_genotype_matrix.variant_indices, dtype=np.int64),
+                        )
+                        val_subkey = val_hasher.hexdigest()[:24]
+                        validation_int8_cache_path = (
+                            fit_stage_cache_paths.cache_dir
+                            / f"{fit_stage_cache_paths.key}.val_{val_subkey}.reduced_raw_i8.npy"
+                        )
+                        if validation_int8_cache_path.exists():
+                            log(
+                                "  validation int8 cache hit — rebinding to "
+                                + f"{validation_int8_cache_path.name}  mem={mem()}"
+                            )
+                        else:
+                            log("  persisting validation int8 cache (one-time cost; future runs reuse it)...")
+                        validation_genotype_matrix.try_cache_persistently(validation_int8_cache_path)
+                materialize_validation = (
+                    not validation_is_holdout_only
+                    or bool(self.config.validate_first_iteration)
+                    or int(self.config.validation_interval) < int(self.config.max_outer_iterations)
+                )
+                if materialize_validation:
+                    log(f"materializing validation genotype matrix ({validation_genotype_matrix.shape})...")
+                    validation_in_memory = validation_genotype_matrix.try_materialize_gpu()
                     if validation_in_memory:
-                        log(f"  validation RAM materialization succeeded  mem={mem()}")
-                if validation_in_memory:
-                    validation_genotype_matrix.release_raw_storage()
+                        log(f"  validation GPU materialization succeeded  mem={mem()}")
+                    if not validation_in_memory:
+                        validation_in_memory = validation_genotype_matrix.try_materialize()
+                        if validation_in_memory:
+                            log(f"  validation RAM materialization succeeded  mem={mem()}")
+                    if validation_in_memory:
+                        validation_genotype_matrix.release_raw_storage()
+                    else:
+                        log(f"  validation matrix remains streaming  mem={mem()}")
                 else:
-                    log(f"  validation matrix remains streaming  mem={mem()}")
+                    log("  held-out validation matrix remains streaming until final evaluation  mem=" + mem())
         if fit_stage_cache_paths is not None and int(self.config.sample_space_preconditioner_rank) > 0:
             log("  restoring preconditioner basis cache...")
             _try_restore_sample_space_basis_cache(
