@@ -1627,6 +1627,80 @@ def test_streaming_linear_algebra_uses_float32_gpu_batches(monkeypatch: pytest.M
     assert set(gpu_batch_dtypes) == {np.float32}
 
 
+def test_gpu_streaming_batch_size_uses_live_free_memory(monkeypatch: pytest.MonkeyPatch):
+    class _FakeCupy:
+        pass
+
+    raw_matrix = _StreamingRawGenotypeMatrix(np.zeros((1000, 500), dtype=np.float32))
+
+    monkeypatch.setattr(genotype_module, "_gpu_free_bytes", lambda _cupy: 20_000_000)
+
+    batch_size = genotype_module._gpu_streaming_batch_size(
+        raw_matrix,
+        sample_count=1000,
+        requested_batch_size=1024,
+        cupy=_FakeCupy(),
+        dtype=np.float32,
+    )
+
+    assert batch_size == 100
+
+
+def test_gpu_materialization_budget_respects_live_free_memory(monkeypatch: pytest.MonkeyPatch):
+    class _FakeCupy:
+        pass
+
+    monkeypatch.setattr(genotype_module, "_gpu_total_bytes", lambda _cupy: 16_000_000_000)
+    monkeypatch.setattr(genotype_module, "_gpu_free_bytes", lambda _cupy: 200_000_000)
+
+    assert genotype_module._gpu_materialization_budget_bytes(_FakeCupy()) == 100_000_000
+
+
+def test_gpu_standardized_batches_split_after_cupy_oom(monkeypatch: pytest.MonkeyPatch):
+    class _FakeCupyOutOfMemoryError(RuntimeError):
+        pass
+
+    class _FakeCupy:
+        float32 = np.float32
+
+        @staticmethod
+        def asarray(array, dtype=None):
+            return np.asarray(array, dtype=dtype)
+
+    def _flaky_standardize(values, means, scales, cupy, *, missing_sentinel=None, dtype=None):
+        if values.shape[1] > 2:
+            raise _FakeCupyOutOfMemoryError("Out of memory allocating test batch")
+        standardized = np.asarray(values, dtype=dtype)
+        standardized -= np.asarray(means, dtype=dtype)[None, :]
+        standardized /= np.asarray(scales, dtype=dtype)[None, :]
+        return standardized
+
+    raw_matrix = _StreamingRawGenotypeMatrix(
+        np.arange(20, dtype=np.float32).reshape(5, 4)
+    )
+    means = np.zeros(4, dtype=np.float32)
+    scales = np.ones(4, dtype=np.float32)
+    monkeypatch.setattr(genotype_module, "_standardize_batch_cupy", _flaky_standardize)
+
+    batches = list(
+        genotype_module._iter_standardized_gpu_batches(
+            raw_matrix,
+            np.arange(4, dtype=np.int32),
+            means,
+            scales,
+            batch_size=4,
+            cupy=_FakeCupy(),
+            dtype=np.float32,
+        )
+    )
+
+    assert [batch_slice for batch_slice, _ in batches] == [slice(0, 2), slice(2, 4)]
+    np.testing.assert_allclose(
+        np.concatenate([np.asarray(batch) for _, batch in batches], axis=1),
+        raw_matrix.matrix,
+    )
+
+
 def test_dense_gpu_cache_linear_algebra_respects_gpu_compute_dtype(monkeypatch: pytest.MonkeyPatch):
     class _FakeCupy:
         float32 = np.float32

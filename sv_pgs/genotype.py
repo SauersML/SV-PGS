@@ -1255,13 +1255,76 @@ def _iter_standardized_gpu_batches(
     selected_means = cupy.asarray(means[variant_indices], dtype=resolved_dtype)
     selected_scales = cupy.asarray(scales[variant_indices], dtype=resolved_dtype)
     for batch_slice, values in _iter_prefetched_raw_batches(raw, variant_indices, batch_size=batch_size):
-        yield batch_slice, _standardize_batch_cupy(
+        for relative_slice, standardized_batch in _iter_standardized_gpu_subbatches(
             values,
             selected_means[batch_slice],
             selected_scales[batch_slice],
             cupy,
             missing_sentinel=int(PLINK_MISSING_INT8) if _supports_int8_batches(raw) else None,
             dtype=resolved_dtype,
+        ):
+            yield (
+                slice(
+                    int(batch_slice.start or 0) + int(relative_slice.start or 0),
+                    int(batch_slice.start or 0) + int(relative_slice.stop or 0),
+                ),
+                standardized_batch,
+            )
+
+
+def _iter_standardized_gpu_subbatches(
+    values: np.ndarray,
+    means,
+    scales,
+    cupy,
+    *,
+    missing_sentinel: int | None,
+    dtype,
+):
+    try:
+        yield slice(0, int(values.shape[1])), _standardize_batch_cupy(
+            values,
+            means,
+            scales,
+            cupy,
+            missing_sentinel=missing_sentinel,
+            dtype=dtype,
+        )
+        return
+    except Exception as exc:
+        if not _is_cupy_out_of_memory(exc) or int(values.shape[1]) <= 1:
+            raise
+        _release_cupy_cached_memory(cupy)
+
+    split_at = max(int(values.shape[1]) // 2, 1)
+    log(
+        "        CuPy OOM while standardizing "
+        + f"{int(values.shape[1]):,} variants; retrying as {split_at:,}"
+        + f" + {int(values.shape[1]) - split_at:,} variants  mem={mem()}"
+    )
+    for child_slice, standardized_batch in _iter_standardized_gpu_subbatches(
+        values[:, :split_at],
+        means[:split_at],
+        scales[:split_at],
+        cupy,
+        missing_sentinel=missing_sentinel,
+        dtype=dtype,
+    ):
+        yield child_slice, standardized_batch
+    for child_slice, standardized_batch in _iter_standardized_gpu_subbatches(
+        values[:, split_at:],
+        means[split_at:],
+        scales[split_at:],
+        cupy,
+        missing_sentinel=missing_sentinel,
+        dtype=dtype,
+    ):
+        yield (
+            slice(
+                split_at + int(child_slice.start or 0),
+                split_at + int(child_slice.stop or 0),
+            ),
+            standardized_batch,
         )
 
 
@@ -1356,13 +1419,24 @@ def _gpu_streaming_batch_size(
     *,
     sample_count: int,
     requested_batch_size: int,
+    cupy=None,
+    dtype=None,
 ) -> int:
     if _supports_int8_batches(raw):
         requested_batch_size = max(int(requested_batch_size), auto_batch_size_i8(sample_count))
-    return _effective_standardized_streaming_batch_size(
-        sample_count,
-        requested_batch_size,
-        target_batch_bytes=GPU_STANDARDIZED_STREAMING_TARGET_BATCH_BYTES,
+    resolved_cupy = _try_import_cupy() if cupy is None else cupy
+    if resolved_cupy is not None:
+        target_batch_bytes = _gpu_dynamic_standardized_target_batch_bytes(
+            resolved_cupy,
+            static_target_batch_bytes=GPU_STANDARDIZED_STREAMING_TARGET_BATCH_BYTES,
+        )
+    else:
+        target_batch_bytes = GPU_STANDARDIZED_STREAMING_TARGET_BATCH_BYTES
+    return _effective_gpu_standardized_streaming_batch_size(
+        sample_count=sample_count,
+        requested_batch_size=requested_batch_size,
+        target_batch_bytes=target_batch_bytes,
+        dtype=dtype,
     )
 
 
@@ -1459,6 +1533,49 @@ def _gpu_dynamic_standardized_target_batch_bytes(cupy, *, static_target_batch_by
     return max(1, min(int(static_target_batch_bytes), dynamic_target))
 
 
+def _is_cupy_out_of_memory(exc: BaseException) -> bool:
+    exc_name = exc.__class__.__name__.lower()
+    exc_message = str(exc).lower()
+    return (
+        "outofmemory" in exc_name
+        or "out of memory" in exc_message
+        or "cuda_error_out_of_memory" in exc_message
+    )
+
+
+def _release_cupy_cached_memory(cupy) -> None:
+    """Best-effort release of CuPy pool blocks after a failed allocation."""
+    try:
+        pool = cupy.get_default_memory_pool()
+        pool.free_all_blocks()
+    except (AttributeError, OSError, RuntimeError):
+        pass
+    try:
+        pinned_pool = cupy.get_default_pinned_memory_pool()
+        pinned_pool.free_all_blocks()
+    except (AttributeError, OSError, RuntimeError):
+        pass
+
+
+def _effective_gpu_standardized_streaming_batch_size(
+    *,
+    sample_count: int,
+    requested_batch_size: int,
+    target_batch_bytes: int,
+    dtype,
+) -> int:
+    if sample_count < 1:
+        raise ValueError("sample_count must be positive.")
+    if requested_batch_size < 1:
+        raise ValueError("requested_batch_size must be positive.")
+    if target_batch_bytes < 1:
+        raise ValueError("target_batch_bytes must be positive.")
+    resolved_dtype = _cupy_dtype_to_numpy_dtype(np.float32 if dtype is None else dtype)
+    bytes_per_variant = sample_count * resolved_dtype.itemsize
+    memory_capped_batch_size = max(target_batch_bytes // max(bytes_per_variant, 1), 1)
+    return max(1, min(int(requested_batch_size), int(memory_capped_batch_size)))
+
+
 _GPU_RESERVED_OVERHEAD_BYTES = 1_500_000_000  # 1.5 GB
 _GPU_BUDGET_TOTAL_FRACTION_CEILING = 0.90
 
@@ -1487,7 +1604,16 @@ def _gpu_materialization_budget_bytes(cupy) -> int:
         return 0
     reserved = min(_GPU_RESERVED_OVERHEAD_BYTES, int(total * (1.0 - _GPU_BUDGET_TOTAL_FRACTION_CEILING)))
     budget = max(total - _GPU_RESERVED_OVERHEAD_BYTES, int(total * 0.5))
-    return min(budget, int(total * _GPU_BUDGET_TOTAL_FRACTION_CEILING), total - reserved)
+    budget = min(budget, int(total * _GPU_BUDGET_TOTAL_FRACTION_CEILING), total - reserved)
+    # Cap by actual *free* memory so co-tenant processes holding the bulk of
+    # the device don't lead us to size allocations as if the GPU were empty.
+    # Without this, runtime policy reports e.g. 14.1 GB on a 16 GB T4 even
+    # when only ~200 MB is free, then downstream allocations instantly OOM.
+    free = _gpu_free_bytes(cupy)
+    if free > 0:
+        free_budget = max(free - _GPU_RESERVED_OVERHEAD_BYTES, int(free * 0.5))
+        budget = min(budget, free_budget)
+    return max(budget, 0)
 
 
 @dataclass(slots=True)
@@ -2976,16 +3102,18 @@ class StandardizedGenotypeMatrix:
         self._jax_cache = None
         return matrix
 
-    def _streaming_gpu_context(self, batch_size: int):
+    def _streaming_gpu_context(self, batch_size: int, *, cupy=None, dtype=None):
         if self._cupy_cache is not None or self.supports_jax_dense_ops() or self.raw is None or self._uses_hybrid_backend():
             return None, None
-        cupy = _try_import_cupy()
-        if cupy is None:
+        resolved_cupy = _try_import_cupy() if cupy is None else cupy
+        if resolved_cupy is None:
             return None, None
-        return cupy, _gpu_streaming_batch_size(
+        return resolved_cupy, _gpu_streaming_batch_size(
             self.raw,
             sample_count=self.shape[0],
             requested_batch_size=batch_size,
+            cupy=resolved_cupy,
+            dtype=dtype,
         )
 
     def _gpu_variant_matmul(
@@ -3050,7 +3178,11 @@ class StandardizedGenotypeMatrix:
                 ):
                     result_gpu += standardized_batch @ matrix_gpu[operand_slice, :]
             return result_gpu[:, 0] if vector_input else result_gpu
-        streaming_cupy, streaming_batch_size = self._streaming_gpu_context(batch_size)
+        streaming_cupy, streaming_batch_size = self._streaming_gpu_context(
+            batch_size,
+            cupy=cupy,
+            dtype=resolved_dtype,
+        )
         if streaming_cupy is None or streaming_batch_size is None or self.raw is None:
             raise RuntimeError("GPU genotype matmul requires a GPU cache or a streaming raw backend.")
         active_variant_indices = self.variant_indices[resolved_local_indices]
@@ -3129,7 +3261,11 @@ class StandardizedGenotypeMatrix:
             else:
                 result_gpu = self._cupy_cache.astype(resolved_dtype, copy=False).T @ matrix_gpu
             return result_gpu[:, 0] if vector_input else result_gpu
-        streaming_cupy, streaming_batch_size = self._streaming_gpu_context(batch_size)
+        streaming_cupy, streaming_batch_size = self._streaming_gpu_context(
+            batch_size,
+            cupy=cupy,
+            dtype=resolved_dtype,
+        )
         if streaming_cupy is None or streaming_batch_size is None or self.raw is None:
             raise RuntimeError("GPU genotype transpose matmul requires a GPU cache or a streaming raw backend.")
         raw_matrix = cast(RawGenotypeMatrix, self.raw)
@@ -3334,14 +3470,20 @@ class StandardizedGenotypeMatrix:
                 ),
                 dtype=coeff_np.dtype,
             )
-        cupy, streaming_batch_size = self._streaming_gpu_context(batch_size)
+        cupy = _try_import_cupy()
+        streaming_dtype = None if cupy is None else _cupy_compute_dtype(cupy)
+        cupy, streaming_batch_size = self._streaming_gpu_context(
+            batch_size,
+            cupy=cupy,
+            dtype=streaming_dtype,
+        )
         if cupy is not None and streaming_batch_size is not None:
             return _cupy_to_numpy(
                 self._gpu_variant_matmul(
                     selected_coefficients,
                     batch_size=streaming_batch_size,
                     cupy=cupy,
-                    dtype=_cupy_compute_dtype(cupy),
+                    dtype=streaming_dtype,
                     local_variant_indices=selected_local_indices,
                     progress_label="GPU matvec",
                 ),
@@ -3421,14 +3563,20 @@ class StandardizedGenotypeMatrix:
                 ),
                 dtype=m_np.dtype,
             )
-        cupy, streaming_batch_size = self._streaming_gpu_context(batch_size)
+        cupy = _try_import_cupy()
+        streaming_dtype = None if cupy is None else _cupy_compute_dtype(cupy)
+        cupy, streaming_batch_size = self._streaming_gpu_context(
+            batch_size,
+            cupy=cupy,
+            dtype=streaming_dtype,
+        )
         if cupy is not None and streaming_batch_size is not None:
             return _cupy_to_numpy(
                 self._gpu_variant_matmul(
                     selected_matrix,
                     batch_size=streaming_batch_size,
                     cupy=cupy,
-                    dtype=_cupy_compute_dtype(cupy),
+                    dtype=streaming_dtype,
                     local_variant_indices=selected_local_indices,
                 ),
                 dtype=m_np.dtype,
@@ -3490,14 +3638,20 @@ class StandardizedGenotypeMatrix:
                 ),
                 dtype=v_np.dtype,
             )
-        cupy, streaming_batch_size = self._streaming_gpu_context(batch_size)
+        cupy = _try_import_cupy()
+        streaming_dtype = None if cupy is None else _cupy_compute_dtype(cupy)
+        cupy, streaming_batch_size = self._streaming_gpu_context(
+            batch_size,
+            cupy=cupy,
+            dtype=streaming_dtype,
+        )
         if cupy is not None and streaming_batch_size is not None:
             return _cupy_to_numpy(
                 self._gpu_transpose_matmul(
                     v_np,
                     batch_size=streaming_batch_size,
                     cupy=cupy,
-                    dtype=_cupy_compute_dtype(cupy),
+                    dtype=streaming_dtype,
                     progress_label="GPU transpose_matvec",
                 ),
                 dtype=v_np.dtype,
@@ -3566,14 +3720,20 @@ class StandardizedGenotypeMatrix:
                 ),
                 dtype=m_np.dtype,
             )
-        cupy, streaming_batch_size = self._streaming_gpu_context(batch_size)
+        cupy = _try_import_cupy()
+        streaming_dtype = None if cupy is None else _cupy_compute_dtype(cupy)
+        cupy, streaming_batch_size = self._streaming_gpu_context(
+            batch_size,
+            cupy=cupy,
+            dtype=streaming_dtype,
+        )
         if cupy is not None and streaming_batch_size is not None:
             return _cupy_to_numpy(
                 self._gpu_transpose_matmul(
                     m_np,
                     batch_size=streaming_batch_size,
                     cupy=cupy,
-                    dtype=_cupy_compute_dtype(cupy),
+                    dtype=streaming_dtype,
                 ),
                 dtype=m_np.dtype,
             )
