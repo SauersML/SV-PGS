@@ -95,6 +95,81 @@ link_cache_to_shared() {
 link_cache_to_shared "$BASE_SNP/.sv_pgs_cache"
 link_cache_to_shared "$BASE_JOINT/.sv_pgs_cache"
 
+echo
+echo "=== CACHE DIAGNOSTICS ==="
+echo "  disk usage:"
+df -h "$HOME" 2>/dev/null | sed 's/^/    /'
+echo
+echo "  canonical shared cache ($SHARED_CACHE):"
+if [ -d "$SHARED_CACHE" ]; then
+  ls -lah "$SHARED_CACHE" 2>/dev/null | sed 's/^/    /'
+  echo "  shared cache top-level sizes:"
+  du -sh "$SHARED_CACHE"/* 2>/dev/null | sed 's/^/    /'
+else
+  echo "    (missing)"
+fi
+echo
+echo "  PLINK trio dir ($SHARED_CACHE/aou_array_plink):"
+plink_dir="$SHARED_CACHE/aou_array_plink"
+if [ -d "$plink_dir" ]; then
+  ls -lah "$plink_dir" 2>/dev/null | sed 's/^/    /'
+  for ext in bed bim fam; do
+    f="$plink_dir/arrays.$ext"
+    if [ -f "$f" ]; then
+      sz=$(stat -c%s "$f" 2>/dev/null || stat -f%z "$f" 2>/dev/null)
+      echo "    OK : arrays.$ext  (${sz} bytes)"
+    else
+      echo "    MISSING: arrays.$ext"
+    fi
+  done
+else
+  echo "    (missing — full PLINK trio download would be required)"
+fi
+echo
+echo "  PLINK int8 / stats caches at shared root:"
+ls -lah "$SHARED_CACHE"/plink_int8_*.npy "$SHARED_CACHE"/plink_stats_*.npy 2>/dev/null | sed 's/^/    /' || \
+  echo "    (none)"
+echo
+echo "  symlinks resolve to:"
+for link in "$BASE_SNP/.sv_pgs_cache" "$BASE_JOINT/.sv_pgs_cache"; do
+  if [ -L "$link" ]; then
+    echo "    $link -> $(readlink -f "$link" 2>/dev/null || readlink "$link")"
+  elif [ -d "$link" ]; then
+    echo "    $link (real directory)"
+  else
+    echo "    $link (missing)"
+  fi
+done
+echo
+echo "  legacy single-disease cache (~/<disease>_results/.sv_pgs_cache):"
+shopt -s nullglob
+legacy_found=0
+for legacy in "$HOME"/*_results/.sv_pgs_cache; do
+  [ -e "$legacy" ] || continue
+  legacy_found=1
+  echo "    $legacy"
+  ls -lah "$legacy" 2>/dev/null | sed 's/^/      /'
+done
+shopt -u nullglob
+[ "$legacy_found" = "0" ] && echo "    (none)"
+echo "=== END DIAGNOSTICS ==="
+echo
+
+# Abort early if the PLINK trio would trigger a re-download — the user has
+# already downloaded this and the workspace doesn't have headroom for it.
+plink_dir="$SHARED_CACHE/aou_array_plink"
+missing_plink=()
+for ext in bed bim fam; do
+  [ -f "$plink_dir/arrays.$ext" ] || missing_plink+=("arrays.$ext")
+done
+if [ "${#missing_plink[@]}" -gt 0 ]; then
+  echo "ABORT: canonical PLINK trio at $plink_dir is incomplete (missing: ${missing_plink[*]})."
+  echo "       run.sh refuses to download — find or restore the missing files first."
+  echo "       hint: search for stray copies on disk:"
+  echo "         find $HOME -maxdepth 6 -name 'arrays.bed' -o -name 'arrays.bim' -o -name 'arrays.fam' 2>/dev/null"
+  exit 2
+fi
+
 is_all() {
   [ "$DISEASE" = "all" ] || [ "$DISEASE" = "top20" ]
 }
