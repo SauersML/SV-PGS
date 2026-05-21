@@ -66,32 +66,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="Optional CSV or TSV keyed by variant_id. Every non-reserved column is used as a prior annotation.",
     )
     aou_run_parser.add_argument("--n-pcs", type=int, default=10, help="Number of genomic PCs to include (default: 10).")
-    aou_run_parser.add_argument("--max-outer-iterations", type=int, default=20)
     aou_run_parser.add_argument("--random-seed", type=int, default=0)
-    aou_run_parser.add_argument(
-        "--marginal-screen-min-abs-z",
-        type=float,
-        default=1.5,
-        help=(
-            "Univariate |z| pre-screen threshold (residualized on covariates; "
-            "null distribution ~ N(0, 1)). After the MAF filter, variants below "
-            "this threshold are dropped before the joint Bayesian fit. Default "
-            "1.5 drops most null variants on biobank-scale data so the joint "
-            "matrix is much more likely to fit on GPU. "
-            "Set to 0 to disable, or 2.0 for tighter screening."
-        ),
-    )
-    aou_run_parser.add_argument(
-        "--test-fraction",
-        type=float,
-        default=0.2,
-        help=(
-            "Fraction of samples (in [0, 1)) to hold out for a deterministic "
-            "test split. Default 0.2 (80/20 train/test). Pass 0 to train on "
-            "every sample and skip the held-out AUC. Splitting is keyed off "
-            "sample_id+random_seed so reruns reproduce the assignment."
-        ),
-    )
     aou_run_parser.add_argument(
         "--variants",
         # Default is the joint model — array SNPs typically add the most
@@ -154,7 +129,7 @@ def build_parser() -> argparse.ArgumentParser:
         default=0.0,
         help=(
             "Univariate |z| pre-screen threshold (residualized on covariates). "
-            "0.0 disables. See run-all-of-us --marginal-screen-min-abs-z for details."
+            "0.0 disables."
         ),
     )
 
@@ -214,11 +189,8 @@ def main(argv: list[str] | None = None) -> int:
                 output_base=args.output_dir,
                 variant_metadata_path=args.variant_metadata,
                 n_pcs=args.n_pcs,
-                max_outer_iterations=args.max_outer_iterations,
                 random_seed=args.random_seed,
                 variants=args.variants,
-                test_fraction=args.test_fraction,
-                marginal_screen_min_abs_z=args.marginal_screen_min_abs_z,
             )
             return 0
         assert disease_value is not None
@@ -228,11 +200,8 @@ def main(argv: list[str] | None = None) -> int:
             output_base=args.output_dir,
             variant_metadata_path=args.variant_metadata,
             n_pcs=args.n_pcs,
-            max_outer_iterations=args.max_outer_iterations,
             random_seed=args.random_seed,
             variants=args.variants,
-            test_fraction=args.test_fraction,
-            marginal_screen_min_abs_z=args.marginal_screen_min_abs_z,
         )
         return 0
 

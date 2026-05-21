@@ -88,6 +88,62 @@ def _binary_pg_fresh_resume_state(
         "best_objective": objective,
         "stall_count": 0,
     }
+
+
+def test_gpu_cholesky_solve_uses_transpose_flag_not_transposed_factor(monkeypatch: pytest.MonkeyPatch):
+    fake_cupy: Any = types.ModuleType("cupy")
+    fake_cupy.asarray = lambda array, dtype=None: np.asarray(array, dtype=dtype)
+    fake_cupy.asfortranarray = lambda array, dtype=None: np.asfortranarray(array, dtype=dtype)
+    monkeypatch.setitem(sys.modules, "cupy", fake_cupy)
+
+    factor = np.linalg.cholesky(
+        np.array(
+            [
+                [5.0, 1.0, 0.5],
+                [1.0, 4.0, 0.25],
+                [0.5, 0.25, 3.0],
+            ],
+            dtype=np.float64,
+        )
+    )
+    right_hand_side = np.array([1.0, 2.0, 3.0], dtype=np.float64)
+    calls: list[dict[str, object]] = []
+
+    def tracking_solve_triangular(matrix, rhs, **kwargs):
+        calls.append(
+            {
+                "matrix": matrix,
+                "rhs_shape": np.asarray(rhs).shape,
+                "lower": kwargs.get("lower"),
+                "trans": kwargs.get("trans"),
+                "fortran": bool(np.asarray(matrix).flags.f_contiguous),
+            }
+        )
+        return scipy_solve_triangular(matrix, rhs, **kwargs)
+
+    actual = mixture_inference._gpu_cholesky_solve(
+        right_hand_side,
+        factor,
+        tracking_solve_triangular,
+    )
+    expected = scipy_solve_triangular(
+        factor,
+        scipy_solve_triangular(factor, right_hand_side, lower=True, check_finite=False),
+        lower=True,
+        trans="T",
+        check_finite=False,
+    )
+    np.testing.assert_allclose(actual, expected, rtol=1e-12, atol=1e-12)
+    assert actual.shape == right_hand_side.shape
+    assert len(calls) == 2
+    assert calls[0]["lower"] is True
+    assert calls[0]["trans"] is None
+    assert calls[1]["lower"] is True
+    assert calls[1]["trans"] == "T"
+    assert calls[0]["matrix"] is calls[1]["matrix"]
+    assert calls[0]["fortran"] is True
+    assert calls[1]["fortran"] is True
+    assert calls[0]["rhs_shape"] == (3, 1)
 def test_quantitative_inference_runs(random_generator):
     sample_count, variant_count = 80, 10
     genotype_matrix = random_generator.standard_normal((sample_count, variant_count)).astype(np.float32)

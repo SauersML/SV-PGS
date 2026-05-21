@@ -127,6 +127,7 @@ class ModelConfig:
     posterior_variance_batch_size: int = 1024
     posterior_variance_probe_count: int = 24
     beta_variance_update_interval: int = 2
+    final_posterior_diagnostics: bool = True
     minimum_minor_allele_frequency: float = 1e-2
     # Marginal-univariate |z| pre-screen threshold. After the MAF filter,
     # variants with |z_j| (residualized on covariates, normalized so null ~
@@ -143,6 +144,7 @@ class ModelConfig:
 
     sample_space_preconditioner_rank: int = 256
     validation_interval: int = 10
+    validate_first_iteration: bool = True
     stochastic_variational_updates: bool = True
     stochastic_min_variant_count: int = 4096
     stochastic_variant_batch_size: int = 8192
@@ -199,8 +201,8 @@ class ModelConfig:
             raise ValueError("posterior_variance_batch_size must be positive.")
         if self.posterior_variance_probe_count < 1:
             raise ValueError("posterior_variance_probe_count must be positive.")
-        if self.beta_variance_update_interval < 1:
-            raise ValueError("beta_variance_update_interval must be positive.")
+        if self.beta_variance_update_interval < 0:
+            raise ValueError("beta_variance_update_interval must be non-negative.")
         if not 0.0 <= self.minimum_minor_allele_frequency < 0.5:
             raise ValueError("minimum_minor_allele_frequency must lie in [0.0, 0.5).")
         if self.marginal_screen_min_abs_z < 0.0:

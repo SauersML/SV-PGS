@@ -167,6 +167,31 @@ def test_runtime_tuned_config_for_gpu_uses_budget_driven_solver_limit(monkeypatc
     assert "gpu_profile=budget-driven" in summary
 
 
+def test_runtime_tuned_config_preserves_disabled_sample_space_preconditioner(monkeypatch):
+    raw_genotypes = ShapeOnlyRawGenotypeMatrix(sample_count=1_000, variant_count=50_000)
+    config = ModelConfig(
+        trait_type=TraitType.BINARY,
+        exact_solver_matrix_limit=20_000,
+        sample_space_preconditioner_rank=0,
+        stochastic_variant_batch_size=2_048,
+    )
+
+    monkeypatch.setattr(runtime_policy_module, "_try_import_cupy", lambda: object())
+    monkeypatch.setattr(
+        runtime_policy_module,
+        "_gpu_materialization_budget_bytes",
+        lambda _cupy: 1_000 * 4 * 10_000,
+    )
+
+    tuned_config, summary = _runtime_tuned_config_for_fit(config, raw_genotypes)
+
+    assert tuned_config.exact_solver_matrix_limit == 9_000
+    assert tuned_config.sample_space_preconditioner_rank == 0
+    assert tuned_config.stochastic_variant_batch_size == 8_500
+    assert summary is not None
+    assert "sample_space_preconditioner_rank=0->0" in summary
+
+
 def test_runtime_tuned_config_caps_binary_stochastic_batch_size_on_small_gpu(monkeypatch):
     raw_genotypes = ShapeOnlyRawGenotypeMatrix(sample_count=1_000, variant_count=50_000)
     config = ModelConfig(

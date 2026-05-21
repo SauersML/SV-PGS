@@ -2,6 +2,9 @@
 set -euo pipefail
 
 DISEASE="${1:-hypertension}"
+if [ "$#" -gt 0 ]; then
+  shift
+fi
 REPO_DIR="$HOME/SV-PGS"
 
 if ! command -v uv >/dev/null 2>&1; then
@@ -9,11 +12,8 @@ if ! command -v uv >/dev/null 2>&1; then
 fi
 export PATH="$HOME/.local/bin:$PATH"
 
-if [ ! -d "$REPO_DIR/.git" ]; then
-  git clone https://github.com/SauersML/SV-PGS.git "$REPO_DIR"
-fi
-
 cd "$REPO_DIR"
-git pull
-uv sync --python 3.12 --extra gpu
-uv run sv-pgs run-all-of-us --disease "$DISEASE" --output-dir "$HOME/${DISEASE}_results"
+if [ ! -x ".venv/bin/python" ]; then
+  uv sync --python 3.12 --extra gpu
+fi
+uv run sv-pgs run-all-of-us --disease "$DISEASE" --output-dir "$HOME/${DISEASE}_results" "$@"

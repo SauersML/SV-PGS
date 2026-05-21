@@ -79,6 +79,7 @@ def test_gpu_low_rank_preconditioner_avoids_cached_weighted_factor(monkeypatch, 
         eye=np.eye,
         float32=np.float32,
         float64=np.float64,
+        asfortranarray=np.asfortranarray,
         linalg=np.linalg,
         maximum=np.maximum,
     )
@@ -99,8 +100,11 @@ def test_gpu_low_rank_preconditioner_avoids_cached_weighted_factor(monkeypatch, 
 
     assert len(bundle) == 3
 
-    def solve_triangular_numpy(matrix, right_hand_side, *, lower):
-        return np.linalg.solve(np.tril(matrix) if lower else np.triu(matrix), right_hand_side)
+    def solve_triangular_numpy(matrix, right_hand_side, *, lower, trans=0, check_finite=True):
+        triangular = np.tril(matrix) if lower else np.triu(matrix)
+        if trans in {"T", "C", 1, 2}:
+            triangular = triangular.T
+        return np.linalg.solve(triangular, right_hand_side)
 
     actual = _apply_sample_space_low_rank_preconditioner_gpu(
         rhs,

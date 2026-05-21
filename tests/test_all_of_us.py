@@ -367,11 +367,8 @@ def test_cli_run_all_of_us_forwards_core_settings(monkeypatch, tmp_path: Path):
         "output_base": str(tmp_path),
         "variant_metadata_path": None,
         "n_pcs": 10,
-        "max_outer_iterations": 20,
         "random_seed": 0,
         "variants": "snp+sv",
-        "test_fraction": 0.2,
-        "marginal_screen_min_abs_z": 1.5,
     }
 
 
@@ -708,6 +705,12 @@ def test_run_all_of_us_runs_single_unified_fit_and_reuses_cached_downloads(monke
         return _Dataset()
 
     def fake_run_training_pipeline(**kwargs):
+        config = kwargs["config"]
+        assert config.beta_variance_update_interval == 0
+        assert config.final_posterior_diagnostics is False
+        assert config.validation_interval == config.max_outer_iterations
+        assert config.validate_first_iteration is False
+        assert config.sample_space_preconditioner_rank == 0
         pipeline_calls.append(
             (
                 kwargs["dataset"].targets.shape[0],
@@ -724,7 +727,6 @@ def test_run_all_of_us_runs_single_unified_fit_and_reuses_cached_downloads(monke
         chromosomes=[1, 2],
         output_base=str(tmp_path),
         variants="sv",
-        test_fraction=0.0,
     )
 
     cache_dir = aou_runner.local_sv_vcf_cache_dir(tmp_path)
@@ -828,6 +830,13 @@ def test_run_all_of_us_skips_existing_fit_only_when_run_metadata_matches(monkeyp
                 random_seed=0,
                 variant_metadata_path=None,
                 variants="sv",
+                beta_variance_update_interval=0,
+                final_posterior_diagnostics=False,
+                validation_interval=20,
+                validate_first_iteration=False,
+                sample_space_preconditioner_rank=0,
+                test_fraction=0.0,
+                marginal_screen_min_abs_z=1.5,
             ),
             indent=2,
         ),
@@ -865,8 +874,6 @@ def test_run_all_of_us_skips_existing_fit_only_when_run_metadata_matches(monkeyp
         output_base=str(tmp_path),
         n_pcs=2,
         variants="sv",
-        test_fraction=0.0,
-        marginal_screen_min_abs_z=0.0,
     )
 
 
@@ -897,6 +904,13 @@ def test_run_all_of_us_reruns_when_existing_fit_metadata_differs(monkeypatch, tm
                 random_seed=0,
                 variant_metadata_path=None,
                 variants="sv",
+                beta_variance_update_interval=0,
+                final_posterior_diagnostics=False,
+                validation_interval=40,
+                validate_first_iteration=False,
+                sample_space_preconditioner_rank=0,
+                test_fraction=0.0,
+                marginal_screen_min_abs_z=1.5,
             ),
             indent=2,
         ),
@@ -945,7 +959,6 @@ def test_run_all_of_us_reruns_when_existing_fit_metadata_differs(monkeypatch, tm
         output_base=str(tmp_path),
         n_pcs=3,
         variants="sv",
-        test_fraction=0.0,
     )
 
     cache_dir = aou_runner.local_sv_vcf_cache_dir(tmp_path)
@@ -1004,7 +1017,6 @@ def test_run_all_of_us_raises_when_parallel_precache_fails(monkeypatch, tmp_path
             output_base=str(tmp_path),
             n_pcs=2,
             variants="sv",
-            test_fraction=0.0,
         )
 
 def _read_tsv_rows(path: Path) -> list[dict[str, str]]:

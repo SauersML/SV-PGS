@@ -510,6 +510,11 @@ def _build_aou_run_metadata(
     random_seed: int,
     variant_metadata_path: str | None,
     variants: str,
+    beta_variance_update_interval: int,
+    final_posterior_diagnostics: bool,
+    validation_interval: int,
+    validate_first_iteration: bool,
+    sample_space_preconditioner_rank: int,
     test_fraction: float = 0.0,
     marginal_screen_min_abs_z: float = 0.0,
 ) -> dict[str, object]:
@@ -526,6 +531,11 @@ def _build_aou_run_metadata(
         # in the run metadata makes existing-result-reuse skip a cached fit
         # when the source mix changes.
         "variants": variants,
+        "beta_variance_update_interval": int(beta_variance_update_interval),
+        "final_posterior_diagnostics": bool(final_posterior_diagnostics),
+        "validation_interval": int(validation_interval),
+        "validate_first_iteration": bool(validate_first_iteration),
+        "sample_space_preconditioner_rank": int(sample_space_preconditioner_rank),
         # Float so resuming a 0.2-test run picks up the cached fit but a flip
         # to 0.1 triggers a re-fit. Stored at 6-digit precision to keep the
         # JSON canonical across host float formatting differences.
@@ -568,14 +578,16 @@ def _normalize_variants_choice(variants: str) -> str:
 
 
 def _aou_metadata_equivalent(existing: dict[str, object], current: dict[str, object]) -> bool:
-    """Compare run-metadata dicts with two back-compat tweaks.
+    """Compare run-metadata dicts with legacy defaults for source/split fields.
 
     - Older runs predate the "variants" key; assume the historical SV default.
     - Older runs predate the "test_fraction" key; assume 0 (no holdout).
     - Older runs predate the "marginal_screen_min_abs_z" key; assume 0 (no screen),
       which is also the global ModelConfig default.
-    Filling in those defaults stops a default-flip from spuriously invalidating
-    every previously-produced result directory.
+
+    Solver and posterior-diagnostic fields intentionally have no
+    compatibility defaults: a missing value means the fit was produced under
+    materially different settings and should be rerun.
     """
     if existing == current:
         return True
@@ -653,17 +665,23 @@ DEFAULT_COVARIATES = [
 ]
 
 
+AOU_MAX_OUTER_ITERATIONS = 20
+AOU_TEST_FRACTION = 0.0
+AOU_MARGINAL_SCREEN_MIN_ABS_Z = 1.5
+AOU_BETA_VARIANCE_UPDATE_INTERVAL = 0
+AOU_FINAL_POSTERIOR_DIAGNOSTICS = False
+AOU_VALIDATE_FIRST_ITERATION = False
+AOU_SAMPLE_SPACE_PRECONDITIONER_RANK = 0
+
+
 def run_all_of_us(
     disease: str,
     chromosomes: list[int],
     output_base: str,
     variant_metadata_path: str | Path | None = None,
     n_pcs: int = 10,
-    max_outer_iterations: int = 20,
     random_seed: int = 0,
     variants: str = "snp+sv",
-    test_fraction: float = 0.2,
-    marginal_screen_min_abs_z: float = 1.5,
 ) -> None:
     """Full AoU pipeline: download requested chromosomes, merge them, and run one fit.
 
@@ -677,24 +695,23 @@ def run_all_of_us(
     written in either order ("sv+snp", "snv+sv", etc.); the metadata file
     always records the canonical form.
 
-    `test_fraction` carves a held-out evaluation set off the sample table by
-    hashing sample_id with random_seed; defaults to 0.2 (80/20 train/test).
-    Pass 0.0 to train on every available sample and skip the held-out AUC.
-    The split is deterministic per seed so reruns reproduce the same
-    train/test assignment.
-
     `marginal_screen_min_abs_z` is a univariate marginal-|z| floor applied
     after the MAF filter and before the joint Bayesian fit. Variants with
     |z| below this threshold (residualized on covariates; null distribution
-    ~ N(0,1)) are dropped. The default 1.5 drops most pure-noise variants
-    on biobank-scale data, often cutting the joint matrix enough to fit on
-    GPU and avoiding the stochastic-block fallback. Set to 0.0 to disable;
-    use 2.0 for an even tighter screen.
+    ~ N(0,1)) are dropped. AoU runs use |z| >= 1.5 and 20 EM iterations for a
+    high-quality point-estimate fit, while skipping posterior variance
+    diagnostics so T4-sized GPUs avoid sample-space preconditioner OOMs.
     """
+    max_outer_iterations = AOU_MAX_OUTER_ITERATIONS
+    test_fraction = AOU_TEST_FRACTION
+    marginal_screen_min_abs_z = AOU_MARGINAL_SCREEN_MIN_ABS_Z
+    beta_variance_update_interval = AOU_BETA_VARIANCE_UPDATE_INTERVAL
+    final_posterior_diagnostics = AOU_FINAL_POSTERIOR_DIAGNOSTICS
+    validate_first_iteration = AOU_VALIDATE_FIRST_ITERATION
+    sample_space_preconditioner_rank = AOU_SAMPLE_SPACE_PRECONDITIONER_RANK
+    validation_interval = max_outer_iterations
     variants = _normalize_variants_choice(variants)
     chromosomes = _validate_aou_chromosomes(chromosomes)
-    if not (0.0 <= test_fraction < 1.0):
-        raise ValueError(f"test_fraction must be in [0, 1); got {test_fraction!r}")
 
     import os
 
@@ -724,6 +741,18 @@ def run_all_of_us(
         max_outer_iterations=max_outer_iterations,
         random_seed=random_seed,
         marginal_screen_min_abs_z=marginal_screen_min_abs_z,
+        beta_variance_update_interval=beta_variance_update_interval,
+        final_posterior_diagnostics=final_posterior_diagnostics,
+        validation_interval=validation_interval,
+        validate_first_iteration=validate_first_iteration,
+        sample_space_preconditioner_rank=sample_space_preconditioner_rank,
+    )
+    log(
+        "  AoU fit policy: "
+        + f"max_iter={max_outer_iterations}  test_fraction={test_fraction:g}  "
+        + f"screen=|z|>={marginal_screen_min_abs_z:g}  beta_var_interval={beta_variance_update_interval}  "
+        + f"final_diagnostics={final_posterior_diagnostics}  "
+        + f"sample_space_preconditioner_rank={sample_space_preconditioner_rank}"
     )
 
     # Status summary: what's done vs what's left
@@ -878,6 +907,11 @@ def run_all_of_us(
         random_seed=random_seed,
         variant_metadata_path=str(resolved_variant_metadata_path) if resolved_variant_metadata_path is not None else None,
         variants=variants,
+        beta_variance_update_interval=beta_variance_update_interval,
+        final_posterior_diagnostics=final_posterior_diagnostics,
+        validation_interval=validation_interval,
+        validate_first_iteration=validate_first_iteration,
+        sample_space_preconditioner_rank=sample_space_preconditioner_rank,
         test_fraction=test_fraction,
         marginal_screen_min_abs_z=marginal_screen_min_abs_z,
     )
@@ -998,11 +1032,8 @@ def run_all_of_us_all_diseases(
     output_base: str,
     variant_metadata_path: str | Path | None = None,
     n_pcs: int = 10,
-    max_outer_iterations: int = 20,
     random_seed: int = 0,
     variants: str = "snp+sv",
-    test_fraction: float = 0.2,
-    marginal_screen_min_abs_z: float = 1.5,
 ) -> None:
     """Run the AoU pipeline for every disease in DISEASE_DEFINITIONS.
 
@@ -1024,11 +1055,8 @@ def run_all_of_us_all_diseases(
                 output_base=str(disease_output_dir),
                 variant_metadata_path=variant_metadata_path,
                 n_pcs=n_pcs,
-                max_outer_iterations=max_outer_iterations,
                 random_seed=random_seed,
                 variants=variants,
-                test_fraction=test_fraction,
-                marginal_screen_min_abs_z=marginal_screen_min_abs_z,
             )
         except (RuntimeError, ValueError, OSError) as exc:
             log(f"=== TOP-20 LOOP: {disease_definition.canonical_name} FAILED: {exc} ===")

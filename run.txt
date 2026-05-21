@@ -1,1 +1,1 @@
-cd ~/SV-PGS && git pull && uv sync --python 3.12 --extra gpu && uv run sv-pgs run-all-of-us --disease hypertension --output-dir ~/hypertension_results
+cd ~/SV-PGS && ./run.sh hypertension

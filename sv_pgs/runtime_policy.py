@@ -77,12 +77,15 @@ def runtime_training_policy_for_fit(
         int(config.exact_solver_matrix_limit),
         max(int(cacheable_dense_variants * 0.9), 1),
     )
-    max_gpu_preconditioner_rank = max(1, int(cacheable_dense_variants))
-    recommended_preconditioner_rank = _recommended_gpu_preconditioner_rank(cacheable_dense_variants)
-    tuned_preconditioner_rank = min(
-        max(int(config.sample_space_preconditioner_rank), recommended_preconditioner_rank),
-        max_gpu_preconditioner_rank,
-    )
+    if int(config.sample_space_preconditioner_rank) <= 0:
+        tuned_preconditioner_rank = 0
+    else:
+        max_gpu_preconditioner_rank = max(1, int(cacheable_dense_variants))
+        recommended_preconditioner_rank = _recommended_gpu_preconditioner_rank(cacheable_dense_variants)
+        tuned_preconditioner_rank = min(
+            max(int(config.sample_space_preconditioner_rank), recommended_preconditioner_rank),
+            max_gpu_preconditioner_rank,
+        )
     # Use as much dense GPU budget as the exact variant-space Gram build can
     # use efficiently. On very large cohorts, this keeps stochastic blocks in
     # the exact-GPU solve regime instead of drifting into slower sample-space CG.
