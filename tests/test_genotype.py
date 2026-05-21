@@ -897,6 +897,87 @@ def test_streaming_gpu_context_caps_large_int8_standardized_tiles(monkeypatch: p
     assert streaming_batch_size < genotype_module.auto_batch_size_i8(raw.shape[0])
 
 
+def test_int8_cupy_standardization_uses_elementwise_kernel():
+    calls: list[str] = []
+
+    class _FakeCupy:
+        float32 = np.float32
+        int8 = np.int8
+
+        @staticmethod
+        def asarray(array, dtype=None):
+            return np.asarray(array, dtype=dtype)
+
+        @staticmethod
+        def ElementwiseKernel(_inputs, _outputs, _operation, name):
+            calls.append(name)
+
+            def _kernel(raw, means, scales, missing):
+                raw_array = np.asarray(raw, dtype=np.int8)
+                return np.where(
+                    raw_array == np.int8(missing),
+                    np.float32(0.0),
+                    (raw_array.astype(np.float32) - means) / scales,
+                ).astype(np.float32)
+
+            return _kernel
+
+    raw_values = np.array([[0, -127], [2, 1]], dtype=np.int8)
+    result = genotype_module._standardize_batch_cupy(
+        raw_values,
+        np.array([1.0, 1.0], dtype=np.float32),
+        np.array([2.0, 1.0], dtype=np.float32),
+        _FakeCupy,
+        missing_sentinel=-127,
+        dtype=np.float32,
+    )
+
+    assert calls == ["sv_pgs_standardize_int8_missing_zero"]
+    np.testing.assert_allclose(
+        result,
+        np.array([[-0.5, 0.0], [0.5, 0.0]], dtype=np.float32),
+    )
+
+
+def test_cupy_int8_cache_batches_shrink_when_gpu_free_memory_is_low():
+    class _FakeCudaRuntime:
+        @staticmethod
+        def memGetInfo():
+            return (1_000_000, 16_000_000_000)
+
+    class _FakeCuda:
+        runtime = _FakeCudaRuntime()
+
+    class _FakeCupy:
+        float32 = np.float32
+        cuda = _FakeCuda()
+
+        @staticmethod
+        def asarray(array, dtype=None):
+            return np.asarray(array, dtype=dtype)
+
+    sample_count = 1_000
+    cache = genotype_module._CupyInt8StandardizedCache(
+        raw_values=np.zeros((sample_count, 12), dtype=np.int8),
+        means=np.zeros(12, dtype=np.float32),
+        scales=np.ones(12, dtype=np.float32),
+        cupy=_FakeCupy,
+    )
+
+    batches = list(
+        genotype_module._iter_cupy_cache_standardized_batches(
+            cache,
+            sample_count=sample_count,
+            batch_size=12,
+            cupy=_FakeCupy,
+            dtype=np.float32,
+        )
+    )
+
+    widths = [batch_slice.stop - batch_slice.start for batch_slice, _batch in batches]
+    assert widths == [5, 5, 2]
+
+
 def test_gpu_int8_transpose_matvec_matches_standardized_cpu_path(monkeypatch: pytest.MonkeyPatch):
     class _FakeCupy:
         float32 = np.float32

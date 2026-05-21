@@ -34,6 +34,8 @@ STANDARDIZED_STREAMING_TARGET_BATCH_BYTES = 1_024_000_000
 LOCAL_INT8_STANDARDIZED_STREAMING_TARGET_BATCH_BYTES = 4_096_000_000
 GPU_STANDARDIZED_STREAMING_TARGET_BATCH_BYTES = 512_000_000
 GPU_STANDARDIZED_PREFETCH_TARGET_BYTES = 1_024_000_000
+GPU_STANDARDIZED_DYNAMIC_FREE_FRACTION = 0.20
+GPU_STANDARDIZED_DYNAMIC_RESERVE_BYTES = 512_000_000
 PLINK_INT8_PREFETCH_TARGET_BYTES = 1_100_000_000
 PLINK_INT8_MAX_PREFETCH_DEPTH = 2
 
@@ -805,7 +807,6 @@ def _upload_standardized_int8_tiles_overlapped(
     in_flight_events: list[Any] = [None, None]
     selected_means_gpu = cupy.asarray(means[variant_indices], dtype=standardized_dtype)
     selected_scales_gpu = cupy.asarray(scales[variant_indices], dtype=standardized_dtype)
-    missing_sentinel = int(PLINK_MISSING_INT8)
     local_start = 0
     for tile_index, raw_batch in enumerate(
         raw_int8.iter_column_batches_i8(variant_indices, batch_size=upload_batch_size)
@@ -821,11 +822,13 @@ def _upload_standardized_int8_tiles_overlapped(
         stream = stream_pair[slot_index]
         with stream:
             staged_int8 = cupy.asarray(pinned_slot[:, :batch_width])
-            standardized_tile = staged_int8.astype(standardized_dtype)
-            missing_mask = staged_int8 == missing_sentinel
-            standardized_tile -= selected_means_gpu[local_start:local_stop][None, :]
-            standardized_tile /= selected_scales_gpu[local_start:local_stop][None, :]
-            standardized_tile[missing_mask] = 0.0
+            standardized_tile = _standardize_int8_cupy(
+                staged_int8,
+                selected_means_gpu[local_start:local_stop],
+                selected_scales_gpu[local_start:local_stop],
+                cupy,
+                dtype=standardized_dtype,
+            )
             gpu_destination[:, local_start:local_stop] = standardized_tile
         in_flight_events[slot_index] = stream.record()
         local_start = local_stop
@@ -974,6 +977,43 @@ def _cupy_compute_dtype(cupy):
     return cupy.float32 if gpu_compute_numpy_dtype() == np.dtype(np.float32) else cupy.float64
 
 
+def _cupy_dtype_to_numpy_dtype(dtype) -> np.dtype:
+    try:
+        return np.dtype(dtype)
+    except TypeError:
+        return np.dtype(np.float32)
+
+
+def _standardize_int8_cupy(raw_values, means, scales, cupy, *, dtype):
+    """Standardize int8 genotypes on GPU without materializing a mask buffer."""
+    resolved_dtype = cupy.float32 if dtype is None else dtype
+    elementwise_kernel = getattr(cupy, "ElementwiseKernel", None)
+    if elementwise_kernel is not None:
+        kernel_cache = getattr(_standardize_int8_cupy, "_kernel_cache", None)
+        if kernel_cache is None:
+            kernel_cache = {}
+            setattr(_standardize_int8_cupy, "_kernel_cache", kernel_cache)
+        cache_key = id(elementwise_kernel)
+        kernel = kernel_cache.get(cache_key)
+        if kernel is None:
+            kernel = elementwise_kernel(
+                "int8 raw, T means, T scales, int8 missing",
+                "T out",
+                "out = (raw == missing) ? (T)0 : (((T)raw - means) / scales)",
+                "sv_pgs_standardize_int8_missing_zero",
+            )
+            kernel_cache[cache_key] = kernel
+        return kernel(raw_values, means[None, :], scales[None, :], np.int8(PLINK_MISSING_INT8))
+
+    standardized = raw_values.astype(resolved_dtype, copy=False)
+    valid_mask = standardized != float(PLINK_MISSING_INT8)
+    standardized -= means[None, :]
+    standardized /= scales[None, :]
+    multiply = getattr(cupy, "multiply", np.multiply)
+    multiply(standardized, valid_mask, out=standardized)
+    return standardized
+
+
 def _to_cupy_compute(array):
     cupy = _try_import_cupy()
     if cupy is None:
@@ -1003,36 +1043,28 @@ def _standardize_batch_cupy(
     Memory-sensitive: boolean-mask scatter (``standardized[missing] = 0``) is
     implemented in CuPy via a prefix-sum scan that allocates a batch-sized
     scratch buffer, and ``cupy.where`` allocates a second batch-sized float
-    buffer; either OOMs on wide AoU batches. The two missing-value paths each
-    use an allocation-free in-place primitive instead.
+    buffer; either OOMs on wide AoU batches. The int8 path uses a fused
+    elementwise kernel; the float path uses in-place NaN scrubbing.
     """
     resolved_dtype = cupy.float32 if dtype is None else dtype
+    if missing_sentinel is not None:
+        raw_gpu = cupy.asarray(batch_values, dtype=getattr(cupy, "int8", np.int8))
+        return _standardize_int8_cupy(raw_gpu, means, scales, cupy, dtype=resolved_dtype)
+
     standardized = cupy.asarray(batch_values, dtype=resolved_dtype)
-    if missing_sentinel is None:
-        # Raw float source: missing entries arrive as NaN and propagate as NaN
-        # through center/scale. ``NaN * 0 == NaN`` (IEEE 754), so a multiply-by-
-        # mask would not clear them — use in-place nan_to_num instead, which
-        # also scrubs ±inf from zero-scale columns at no extra cost.
-        standardized -= means[None, :]
-        standardized /= scales[None, :]
-        nan_to_num = getattr(cupy, "nan_to_num", None)
-        if nan_to_num is not None:
-            nan_to_num(standardized, copy=False, nan=0.0, posinf=0.0, neginf=0.0)
-        else:
-            host = np.asarray(standardized)
-            np.nan_to_num(host, copy=False, nan=0.0, posinf=0.0, neginf=0.0)
-            standardized = cupy.asarray(host, dtype=resolved_dtype)
-        return standardized
-    # Integer sentinel (PLINK int8): build the *valid* mask directly to skip
-    # an inversion buffer, then zero missing entries with an in-place multiply.
-    # Sentinel-derived garbage post-standardization is finite, so the multiply
-    # is safe (finite * 0 == 0).
-    valid_mask = standardized != float(missing_sentinel)
+    # Raw float source: missing entries arrive as NaN and propagate as NaN
+    # through center/scale. ``NaN * 0 == NaN`` (IEEE 754), so a multiply-by-
+    # mask would not clear them — use in-place nan_to_num instead, which
+    # also scrubs ±inf from zero-scale columns at no extra cost.
     standardized -= means[None, :]
     standardized /= scales[None, :]
-    multiply = getattr(cupy, "multiply", np.multiply)
-    multiply(standardized, valid_mask, out=standardized)
-    del valid_mask
+    nan_to_num = getattr(cupy, "nan_to_num", None)
+    if nan_to_num is not None:
+        nan_to_num(standardized, copy=False, nan=0.0, posinf=0.0, neginf=0.0)
+    else:
+        host = np.asarray(standardized)
+        np.nan_to_num(host, copy=False, nan=0.0, posinf=0.0, neginf=0.0)
+        standardized = cupy.asarray(host, dtype=resolved_dtype)
     return standardized
 
 
@@ -1167,7 +1199,6 @@ def _gpu_int8_transpose_matmul(
     variant_indices: np.ndarray,
     means: np.ndarray,
     scales: np.ndarray,
-    support_counts: np.ndarray | None,
     matrix_gpu,
     batch_size: int,
     cupy,
@@ -1177,18 +1208,11 @@ def _gpu_int8_transpose_matmul(
     selected_variant_indices = np.asarray(variant_indices, dtype=np.int32)
     selected_means_gpu = cupy.asarray(means[selected_variant_indices], dtype=dtype)
     selected_scales_gpu = cupy.asarray(scales[selected_variant_indices], dtype=dtype)
-    selected_support_counts = (
-        None
-        if support_counts is None
-        else np.asarray(support_counts[selected_variant_indices], dtype=np.int64)
-    )
     result_gpu = cupy.empty((selected_variant_indices.shape[0], matrix_gpu.shape[1]), dtype=dtype)
-    vector_sums_gpu = cupy.sum(matrix_gpu, axis=0)
     total_variants = int(selected_variant_indices.shape[0])
     completed_variants = 0
     last_logged_variants = 0
     log_interval = max(total_variants // 50, 1)
-    missing_sentinel = int(PLINK_MISSING_INT8)
     import time as _time
     t_start = _time.monotonic()
     if progress_label is not None:
@@ -1199,25 +1223,16 @@ def _gpu_int8_transpose_matmul(
         batch_size=batch_size,
     ):
         int8_gpu = cupy.asarray(host_values, dtype=getattr(cupy, "int8", np.int8))
-        values_gpu = int8_gpu.astype(dtype)
         means_gpu = selected_means_gpu[batch_slice]
         scales_gpu = selected_scales_gpu[batch_slice]
-        if selected_support_counts is None:
-            has_missing = bool(np.any(host_values == missing_sentinel))
-        else:
-            has_missing = bool(np.any(selected_support_counts[batch_slice] < raw_int8.shape[0]))
-        if has_missing:
-            missing_gpu = int8_gpu == missing_sentinel
-            where = getattr(cupy, "where", np.where)
-            values_gpu = where(missing_gpu, 0.0, values_gpu)
-            nonmissing_vector_sums_gpu = vector_sums_gpu[None, :] - (
-                missing_gpu.astype(dtype).T @ matrix_gpu
-            )
-        else:
-            nonmissing_vector_sums_gpu = vector_sums_gpu[None, :]
-        result_gpu[batch_slice, :] = (
-            values_gpu.T @ matrix_gpu - means_gpu[:, None] * nonmissing_vector_sums_gpu
-        ) / scales_gpu[:, None]
+        standardized_gpu = _standardize_int8_cupy(
+            int8_gpu,
+            means_gpu,
+            scales_gpu,
+            cupy,
+            dtype=dtype,
+        )
+        result_gpu[batch_slice, :] = standardized_gpu.T @ matrix_gpu
         if progress_label is not None:
             completed_variants = batch_slice.stop
             if completed_variants - last_logged_variants >= log_interval:
@@ -1257,6 +1272,18 @@ def _gpu_total_bytes(cupy) -> int:
         return int(total)
     except (AttributeError, OSError, RuntimeError):
         return 0
+
+
+def _gpu_dynamic_standardized_target_batch_bytes(cupy, *, static_target_batch_bytes: int) -> int:
+    free_bytes = _gpu_free_bytes(cupy)
+    if free_bytes <= 0:
+        return int(static_target_batch_bytes)
+    usable_bytes = max(
+        free_bytes - GPU_STANDARDIZED_DYNAMIC_RESERVE_BYTES,
+        int(free_bytes * 0.10),
+    )
+    dynamic_target = max(int(usable_bytes * GPU_STANDARDIZED_DYNAMIC_FREE_FRACTION), 1)
+    return max(1, min(int(static_target_batch_bytes), dynamic_target))
 
 
 _GPU_RESERVED_OVERHEAD_BYTES = 1_500_000_000  # 1.5 GB
@@ -1323,17 +1350,15 @@ class _CupyInt8StandardizedCache:
         cp = self.cupy
         resolved_dtype = _cupy_compute_dtype(cp) if dtype is None else dtype
         raw_chunk = self.raw_values[:, local_variant_indices]
-        standardized = raw_chunk.astype(resolved_dtype, copy=False)
         means = self.means[local_variant_indices].astype(resolved_dtype, copy=False)
         scales = self.scales[local_variant_indices].astype(resolved_dtype, copy=False)
-        missing_mask = raw_chunk == np.int8(PLINK_MISSING_INT8)
-        standardized -= means[None, :]
-        standardized /= scales[None, :]
-        has_missing = missing_mask.any()
-        if hasattr(has_missing, "get"):
-            has_missing = bool(has_missing.get())
-        if has_missing:
-            standardized[missing_mask] = resolved_dtype(0.0)
+        standardized = _standardize_int8_cupy(
+            raw_chunk,
+            means,
+            scales,
+            cp,
+            dtype=resolved_dtype,
+        )
         if hasattr(cp, "asarray"):
             return cp.asarray(standardized, dtype=resolved_dtype)
         standardized_np = np.asarray(standardized)
@@ -1393,15 +1418,19 @@ def _iter_cupy_cache_standardized_batches(
     dtype=None,
 ):
     variant_count = _cupy_cache_shape(cache)[1]
-    resolved_dtype = np.dtype(np.float32 if dtype is None else dtype)
-    target_batch_bytes = (
+    resolved_dtype = _cupy_dtype_to_numpy_dtype(np.float32 if dtype is None else dtype)
+    static_target_batch_bytes = (
         LOCAL_INT8_STANDARDIZED_STREAMING_TARGET_BATCH_BYTES
         if _cupy_cache_is_int8_standardized(cache)
         else STANDARDIZED_STREAMING_TARGET_BATCH_BYTES
     )
+    target_batch_bytes = _gpu_dynamic_standardized_target_batch_bytes(
+        cupy,
+        static_target_batch_bytes=static_target_batch_bytes,
+    )
     bytes_per_variant = sample_count * resolved_dtype.itemsize
     memory_capped_batch_size = max(target_batch_bytes // max(bytes_per_variant, 1), 1)
-    safe_batch_size = max(1, min(max(int(batch_size), 1), max(memory_capped_batch_size, MIN_BED_READER_BATCH_SIZE)))
+    safe_batch_size = max(1, min(max(int(batch_size), 1), memory_capped_batch_size))
     for start_index in range(0, variant_count, safe_batch_size):
         stop_index = min(start_index + safe_batch_size, variant_count)
         batch_slice = slice(start_index, stop_index)
@@ -2736,7 +2765,6 @@ class StandardizedGenotypeMatrix:
                 variant_indices=self.variant_indices,
                 means=self.means,
                 scales=self.scales,
-                support_counts=self.support_counts,
                 matrix_gpu=matrix_gpu,
                 batch_size=streaming_batch_size,
                 cupy=cupy,
