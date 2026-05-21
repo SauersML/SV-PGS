@@ -934,6 +934,17 @@ def require_gpu() -> Any:
         )
     free_bytes, total_bytes = cupy.cuda.runtime.memGetInfo()
     log(f"  GPU verified: {total_bytes / 1e9:.1f} GB total, {free_bytes / 1e9:.1f} GB free")
+    # If another process is pinning most of the device, the training pipeline
+    # will silently fall back to slow streaming paths and may still OOM on the
+    # remaining residual. Surface it once, at entry, so the user can kill stale
+    # kernels before burning hours on a degraded run.
+    if total_bytes > 0 and free_bytes < total_bytes * 0.5:
+        held_bytes = total_bytes - free_bytes
+        log(
+            f"  WARNING: only {free_bytes / 1e9:.1f} GB of {total_bytes / 1e9:.1f} GB free "
+            f"({held_bytes / 1e9:.1f} GB held by other processes). "
+            f"Run `nvidia-smi` and kill stale GPU processes to avoid OOM / slow streaming fallbacks."
+        )
     _gpu_verified = True
     return cupy
 
