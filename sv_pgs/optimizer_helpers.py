@@ -7,6 +7,7 @@ existing Newton was wasted work along that direction.
 
 from __future__ import annotations
 import numpy as np
+from scipy.special import gammaln as scipy_gammaln
 from scipy.special import kve as scipy_bessel_kve
 
 
@@ -50,7 +51,7 @@ def gig_inverse_first_moment(
     """E[1/X] for X ~ GIG(p, chi, psi) - used in the beta precision when we collapse lambda.
 
     Formula:  E[1/X] = sqrt(psi/chi) * K_{p-1}(sqrt(chi*psi)) / K_p(sqrt(chi*psi))   (when chi > 0)
-            = (2 p / chi) * (mean^-1 correction)   (when psi = 0 limit, Gamma case)
+            = -2p / chi                             (when psi -> 0 and p < 0)
 
     Uses exponentially-scaled kve for numerical stability.
     """
@@ -59,11 +60,55 @@ def gig_inverse_first_moment(
     p_arr = np.asarray(p_parameter, dtype=np.float64)
     z = np.sqrt(np.maximum(chi_arr * psi_arr, 1e-300))
     safe_chi = np.maximum(chi_arr, 1e-300)
-    # Use ratio identity: E[1/X] = (sqrt(psi/chi)) K_{p-1}/K_p
-    # K_{p-1}(z) / K_p(z), via kve which is K_v(z) * exp(z):
-    numerator = scipy_bessel_kve(np.abs(p_arr - 1.0), z)
-    denominator = np.maximum(scipy_bessel_kve(np.abs(p_arr), z), 1e-300)
-    return np.sqrt(np.maximum(psi_arr / safe_chi, 1e-300)) * (numerator / denominator)
+    safe_psi = np.maximum(psi_arr, 1e-300)
+
+    # Use ratio identity: E[1/X] = sqrt(psi/chi) * K_{p-1}(z) / K_p(z).
+    # For tiny z, direct Bessel calls can overflow to inf and produce inf/inf.
+    # The psi -> 0 limit is common in the optimizer and is exact for p < 0.
+    result = np.empty(np.broadcast_shapes(p_arr.shape, chi_arr.shape, psi_arr.shape), dtype=np.float64)
+    p_b, chi_b, psi_b, z_b = np.broadcast_arrays(p_arr, safe_chi, safe_psi, z)
+    small_z = z_b < 1e-8
+
+    inverse_gamma_limit = small_z & (p_b < 0.0)
+    result[inverse_gamma_limit] = -2.0 * p_b[inverse_gamma_limit] / chi_b[inverse_gamma_limit]
+
+    positive_small = small_z & ~inverse_gamma_limit
+    if np.any(positive_small):
+        p_small = p_b[positive_small]
+        chi_small = chi_b[positive_small]
+        psi_small = psi_b[positive_small]
+        z_small = z_b[positive_small]
+        small_result = np.empty_like(p_small, dtype=np.float64)
+
+        near_one = np.isclose(p_small, 1.0, rtol=0.0, atol=1e-8)
+        small_result[near_one] = psi_small[near_one] * np.maximum(
+            -np.log(np.maximum(z_small[near_one] * 0.5, 1e-300)) - np.euler_gamma,
+            0.0,
+        )
+
+        greater_than_one = (p_small > 1.0) & ~near_one
+        small_result[greater_than_one] = psi_small[greater_than_one] / (2.0 * (p_small[greater_than_one] - 1.0))
+
+        between_zero_and_one = ~(near_one | greater_than_one)
+        if np.any(between_zero_and_one):
+            p_mid = np.maximum(p_small[between_zero_and_one], 1e-12)
+            log_value = (
+                scipy_gammaln(1.0 - p_mid)
+                - scipy_gammaln(p_mid)
+                + p_mid * np.log(psi_small[between_zero_and_one])
+                + (p_mid - 1.0) * np.log(chi_small[between_zero_and_one])
+                - (2.0 * p_mid - 1.0) * np.log(2.0)
+            )
+            small_result[between_zero_and_one] = np.exp(np.clip(log_value, -745.0, 709.0))
+        result[positive_small] = small_result
+
+    regular = ~small_z
+    if np.any(regular):
+        numerator = scipy_bessel_kve(np.abs(p_b[regular] - 1.0), z_b[regular])
+        denominator = scipy_bessel_kve(np.abs(p_b[regular]), z_b[regular])
+        result[regular] = np.sqrt(psi_b[regular] / chi_b[regular]) * (numerator / denominator)
+
+    return np.maximum(result, np.finfo(np.float64).tiny)
 
 
 def pack_em_hyperparameters(

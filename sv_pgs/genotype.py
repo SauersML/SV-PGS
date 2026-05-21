@@ -36,8 +36,9 @@ GPU_STANDARDIZED_STREAMING_TARGET_BATCH_BYTES = 512_000_000
 GPU_STANDARDIZED_PREFETCH_TARGET_BYTES = 1_024_000_000
 GPU_STANDARDIZED_DYNAMIC_FREE_FRACTION = 0.20
 GPU_STANDARDIZED_DYNAMIC_RESERVE_BYTES = 512_000_000
-PLINK_INT8_PREFETCH_TARGET_BYTES = 1_100_000_000
-PLINK_INT8_MAX_PREFETCH_DEPTH = 2
+PLINK_INT8_TARGET_BATCH_BYTES = 1_024_000_000
+PLINK_INT8_MAX_PREFETCH_DEPTH = 1
+PLINK_BED_READER_NUM_THREADS = min(16, max(1, os.cpu_count() or 1))
 
 # If the reduced genotype matrix (after tie-group dedup) is smaller than 4 GB,
 # cache it in RAM.  This avoids re-reading from disk on every EM iteration
@@ -499,7 +500,12 @@ class PlinkRawGenotypeMatrix(RawGenotypeMatrix):
         col_index = _contiguous_index_or_slice(batch_indices)
         t0 = _time.monotonic()
         result = np.asarray(
-            reader.read(index=(sample_index, col_index), dtype="int8", order="F", num_threads=None),
+            reader.read(
+                index=(sample_index, col_index),
+                dtype="int8",
+                order="F",
+                num_threads=PLINK_BED_READER_NUM_THREADS,
+            ),
             dtype=np.int8,
         )
         elapsed = _time.monotonic() - t0
@@ -525,10 +531,14 @@ class PlinkRawGenotypeMatrix(RawGenotypeMatrix):
         """
         resolved_indices = _resolve_variant_indices(self.variant_count, variant_indices)
         # int8 reads are 4x smaller than float32, but JAX kernels still expand to
-        # float32 intermediates (~10 bytes/element peak), so do NOT inflate batch size.
+        # float32 intermediates (~10 bytes/element peak), so keep decoded batches
+        # near 1 GB rather than using the generic float32 reader cap.
         requested = max(int(self.batch_size if batch_size is None else batch_size), 1)
         bytes_per_variant = self.shape[0]  # 1 byte per sample for int8
-        max_variants = max(BED_READER_TARGET_BATCH_BYTES // max(bytes_per_variant, 1), MIN_BED_READER_BATCH_SIZE)
+        max_variants = max(
+            PLINK_INT8_TARGET_BATCH_BYTES // max(bytes_per_variant, 1),
+            MIN_BED_READER_BATCH_SIZE,
+        )
         safe_batch_size = min(requested, max_variants)
         reader = self._bed_reader()
         total = resolved_indices.shape[0]
@@ -541,17 +551,16 @@ class PlinkRawGenotypeMatrix(RawGenotypeMatrix):
             yield RawGenotypeBatch(variant_indices=resolved_indices, values=values)
             return
 
-        # Keep one extra batch in flight so CPU decode can overlap with JAX
-        # stats, but cap queued int8 output near 1 GiB. Deeper prefetch turns
-        # into memory-bandwidth contention on large AoU PLINK batches.
+        # Keep one read in flight so CPU decode can overlap with JAX stats.
+        # Deeper prefetch would launch multiple large PLINK decodes at once,
+        # which competes with the reader's own worker threads and doubles
+        # decoded-batch memory pressure.
         from collections import deque
         batch_index_list = [
             resolved_indices[s : s + safe_batch_size]
             for s in range(0, total, safe_batch_size)
         ]
-        batch_bytes = max(int(self.shape[0]) * int(safe_batch_size), 1)
-        memory_capped_depth = max(1, PLINK_INT8_PREFETCH_TARGET_BYTES // batch_bytes)
-        prefetch_depth = min(PLINK_INT8_MAX_PREFETCH_DEPTH, int(memory_capped_depth), len(batch_index_list))
+        prefetch_depth = min(PLINK_INT8_MAX_PREFETCH_DEPTH, len(batch_index_list))
         log(f"    int8 prefetch depth={prefetch_depth} (~{batch_mb * prefetch_depth:.0f} MB queued)  mem={mem()}")
         with ThreadPoolExecutor(max_workers=prefetch_depth) as executor:
             in_flight: deque = deque(
@@ -3627,12 +3636,15 @@ def auto_batch_size(sample_count: int) -> int:
 
 
 def auto_batch_size_i8(sample_count: int) -> int:
-    """Pick an int8-native batch size that fits the same IO budget."""
+    """Pick an int8-native batch size that fits the int8 decode budget."""
     if sample_count < 1:
         return DEFAULT_GENOTYPE_BATCH_SIZE
     bytes_per_variant = sample_count  # int8
-    memory_capped = max(BED_READER_TARGET_BATCH_BYTES // max(bytes_per_variant, 1), 1)
-    return max(MIN_BED_READER_BATCH_SIZE, min(int(memory_capped), 8 * DEFAULT_GENOTYPE_BATCH_SIZE))
+    memory_capped = max(PLINK_INT8_TARGET_BATCH_BYTES // max(bytes_per_variant, 1), 1)
+    return max(
+        MIN_BED_READER_BATCH_SIZE,
+        min(int(memory_capped), 16 * DEFAULT_GENOTYPE_BATCH_SIZE),
+    )
 
 
 def _effective_standardized_streaming_batch_size(

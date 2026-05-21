@@ -1785,6 +1785,9 @@ def _compute_variant_stats_teeing_int8(
     # Stream once, tee batches to the int8 cache, accumulate stats inline.
     # Mirrors the logic of compute_variant_statistics but without spinning
     # up a second iterator over the same source.
+    from collections import deque
+    from concurrent.futures import Future, ThreadPoolExecutor
+
     import time as _time
     variant_count = int(raw_genotypes.shape[1])
     sample_count = int(raw_genotypes.shape[0])
@@ -1809,52 +1812,75 @@ def _compute_variant_stats_teeing_int8(
     # 500 MB read instead of an 80 MB one (6x fewer round-trips).
     tuned_batch_size = auto_batch_size_i8(sample_count)
     iter_handle = iter(raw_genotypes.iter_column_batches_i8(batch_size=tuned_batch_size))
-    while True:
-        fetch_start = _time.monotonic()
-        try:
-            batch = next(iter_handle)
-        except StopIteration:
-            break
-        fetch_seconds = _time.monotonic() - fetch_start
-        batch_number += 1
-        batch_indices = np.asarray(batch.variant_indices, dtype=np.int64)
-        # Tee: write the decoded int8 batch as a sequential column block.
-        tee_start = _time.monotonic()
-        expected_start = variants_done
-        if int(batch_indices[0]) != expected_start or not np.all(np.diff(batch_indices) == 1):
-            raise ValueError("PLINK int8 cache tee requires contiguous variant batches.")
-        int8_cache_writer.write_columns(batch.values)
-        tee_seconds = _time.monotonic() - tee_start
-        # Stats compute on the JAX side.
-        compute_start = _time.monotonic()
-        batch_jax = jnp.asarray(batch.values)
-        b_sums, b_counts, b_support, b_css = _batch_all_stats_i8(batch_jax)
-        sums[batch_indices] = np.asarray(b_sums, dtype=np.float64)
-        non_missing_counts[batch_indices] = np.asarray(b_counts, dtype=np.int32)
-        support_counts[batch_indices] = np.asarray(b_support, dtype=np.int32)
-        centered_sum_squares[batch_indices] = np.asarray(b_css, dtype=np.float64)
-        del batch_jax
-        compute_seconds = _time.monotonic() - compute_start
+    max_in_flight_writes = 2
+    in_flight_writes: deque[Future[None]] = deque()
 
-        cumulative_fetch += fetch_seconds
-        cumulative_compute += compute_seconds
-        cumulative_tee += tee_seconds
-        variants_done += batch_indices.shape[0]
-        avg_wall = (cumulative_fetch + cumulative_compute + cumulative_tee) / max(batch_number, 1)
-        remaining = max((variant_count - variants_done), 0)
-        approx_remaining_batches = (remaining + batch_indices.shape[0] - 1) // max(batch_indices.shape[0], 1)
-        eta_seconds = avg_wall * approx_remaining_batches
-        log(
-            f"    [tee] batch {batch_number} variants={variants_done}/{variant_count} "
-            f"({100 * variants_done // variant_count}%)  "
-            f"fetch={fetch_seconds:.2f}s tee={tee_seconds:.2f}s compute={compute_seconds:.2f}s  "
-            f"avg_wall={avg_wall:.2f}s eta={eta_seconds/60:.1f}min  mem={mem()}"
-        )
+    def wait_for_oldest_write() -> float:
+        wait_start = _time.monotonic()
+        in_flight_writes.popleft().result()
+        return _time.monotonic() - wait_start
+
+    def collect_finished_writes() -> None:
+        while in_flight_writes and in_flight_writes[0].done():
+            wait_for_oldest_write()
+
+    with ThreadPoolExecutor(max_workers=1) as write_executor:
+        try:
+            while True:
+                fetch_start = _time.monotonic()
+                try:
+                    batch = next(iter_handle)
+                except StopIteration:
+                    break
+                fetch_seconds = _time.monotonic() - fetch_start
+                batch_number += 1
+                batch_indices = np.asarray(batch.variant_indices, dtype=np.int64)
+                # Tee: enqueue the decoded int8 batch as a sequential column block.
+                tee_start = _time.monotonic()
+                expected_start = variants_done
+                if int(batch_indices[0]) != expected_start or not np.all(np.diff(batch_indices) == 1):
+                    raise ValueError("PLINK int8 cache tee requires contiguous variant batches.")
+                collect_finished_writes()
+                if len(in_flight_writes) >= max_in_flight_writes:
+                    wait_for_oldest_write()
+                in_flight_writes.append(write_executor.submit(int8_cache_writer.write_columns, batch.values))
+                tee_seconds = _time.monotonic() - tee_start
+                # Stats compute on the JAX side.
+                compute_start = _time.monotonic()
+                batch_jax = jnp.asarray(batch.values)
+                b_sums, b_counts, b_support, b_css = _batch_all_stats_i8(batch_jax)
+                sums[batch_indices] = np.asarray(b_sums, dtype=np.float64)
+                non_missing_counts[batch_indices] = np.asarray(b_counts, dtype=np.int32)
+                support_counts[batch_indices] = np.asarray(b_support, dtype=np.int32)
+                centered_sum_squares[batch_indices] = np.asarray(b_css, dtype=np.float64)
+                del batch_jax
+                compute_seconds = _time.monotonic() - compute_start
+
+                cumulative_fetch += fetch_seconds
+                cumulative_compute += compute_seconds
+                cumulative_tee += tee_seconds
+                variants_done += batch_indices.shape[0]
+                avg_wall = (cumulative_fetch + cumulative_compute + cumulative_tee) / max(batch_number, 1)
+                remaining = max((variant_count - variants_done), 0)
+                approx_remaining_batches = (remaining + batch_indices.shape[0] - 1) // max(batch_indices.shape[0], 1)
+                eta_seconds = avg_wall * approx_remaining_batches
+                log(
+                    f"    [tee] batch {batch_number} variants={variants_done}/{variant_count} "
+                    f"({100 * variants_done // variant_count}%)  "
+                    f"fetch={fetch_seconds:.2f}s tee_wait={tee_seconds:.2f}s compute={compute_seconds:.2f}s  "
+                    f"avg_wall={avg_wall:.2f}s eta={eta_seconds/60:.1f}min  mem={mem()}"
+                )
+            while in_flight_writes:
+                cumulative_tee += wait_for_oldest_write()
+        except BaseException:
+            for write_future in in_flight_writes:
+                write_future.cancel()
+            raise
 
     total = _time.monotonic() - overall_start
     log(
         f"  variant-stats + tee pass done: {batch_number} batches in {total:.1f}s  "
-        f"(fetch={cumulative_fetch:.1f}s compute={cumulative_compute:.1f}s tee={cumulative_tee:.1f}s)  "
+        f"(fetch={cumulative_fetch:.1f}s compute={cumulative_compute:.1f}s tee_wait={cumulative_tee:.1f}s)  "
         f"mem={mem()}"
     )
     means = np.divide(

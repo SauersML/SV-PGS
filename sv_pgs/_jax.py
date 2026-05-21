@@ -131,10 +131,10 @@ jax_config = importlib.import_module("jax").config
 # Enable 64-bit precision (required for Bayesian inference numerics).
 jax_config.update("jax_enable_x64", True)
 
-# On Ampere+ also let JAX/XLA pick the TF32 tensor-core kernel for float32
-# matmul. On Turing/Volta this is a no-op (no TF32 hardware) so we still
-# request it unconditionally and rely on the JIT to fall back to plain fp32.
-jax_config.update("jax_default_matmul_precision", "tensorfloat32")
+# Prefer full float32 matmul precision in JAX. T4/Turing has no TF32 hardware,
+# so this is speed-neutral there; on newer GPUs it avoids silently using TF32 in
+# JAX code paths that affect optimizer state.
+jax_config.update("jax_default_matmul_precision", "highest")
 
 # jax.numpy must be imported AFTER jax_config.update above.
 jnp = importlib.import_module("jax.numpy")

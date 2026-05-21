@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Literal
@@ -273,11 +274,16 @@ class open_bed:
         order: Literal["F", "C"] = "F",
         num_threads: int | None = None,
     ) -> np.ndarray:
-        del num_threads
         sample_index, variant_index = _split_index(index)
         resolved_samples = _normalize_index(sample_index, self.iid_count)
         resolved_variants = _normalize_index(variant_index, self.sid_count)
-        raw_i8 = self._read_int8_matrix(resolved_variants, sample_index=resolved_samples)
+        raw_i8 = self._read_int8_matrix(
+            resolved_variants,
+            sample_index=resolved_samples,
+            num_threads=_resolve_num_threads(
+                self.num_threads if num_threads is None else num_threads
+            ),
+        )
 
         resolved_dtype = np.dtype(dtype)
         if resolved_dtype == np.dtype(np.int8):
@@ -294,6 +300,7 @@ class open_bed:
         variant_index: slice | np.ndarray,
         *,
         sample_index: slice | np.ndarray | None = None,
+        num_threads: int = 1,
     ) -> np.ndarray:
         bytes_per_variant = _bytes_per_variant(self.iid_count)
         if sample_index is None:
@@ -349,20 +356,22 @@ class open_bed:
             start_offset = PLINK1_HEADER_SIZE + variant_index.start * bytes_per_variant
             payload = self._pread_payload(start_offset, variant_count * bytes_per_variant)
             if isinstance(resolved_sample_index, np.ndarray):
-                return _decode_payload_sample_indices(
+                return _decode_payload_sample_indices_parallel(
                     payload,
                     iid_count=self.iid_count,
                     variant_count=variant_count,
                     bytes_per_variant=bytes_per_variant,
                     sample_indices=resolved_sample_index,
                     count_a1=self.count_A1,
+                    num_threads=num_threads,
                 )
-            full = _decode_payload(
+            full = _decode_payload_parallel(
                 payload,
                 iid_count=self.iid_count,
                 variant_count=variant_count,
                 bytes_per_variant=bytes_per_variant,
                 count_a1=self.count_A1,
+                num_threads=num_threads,
             )
             return full[resolved_sample_index, :]
 
@@ -425,6 +434,26 @@ class open_bed:
 
 def _bytes_per_variant(sample_count: int) -> int:
     return (int(sample_count) + 3) // 4
+
+
+def _resolve_num_threads(num_threads: int | None) -> int:
+    if num_threads is None:
+        return min(os.cpu_count() or 8, 16)
+    resolved = int(num_threads)
+    if resolved < 1:
+        raise ValueError("num_threads must be at least 1.")
+    return resolved
+
+
+def _variant_chunks(variant_count: int, num_threads: int) -> list[tuple[int, int]]:
+    if variant_count <= 0:
+        return []
+    thread_count = min(num_threads, variant_count)
+    chunk_size = (variant_count + thread_count - 1) // thread_count
+    return [
+        (chunk_start, min(chunk_start + chunk_size, variant_count))
+        for chunk_start in range(0, variant_count, chunk_size)
+    ]
 
 
 def _use_striped_sample_window_reads(
@@ -578,6 +607,63 @@ def _decode_payload_sample_indices(
     return result
 
 
+def _decode_payload_sample_indices_parallel(
+    payload: bytes | np.ndarray,
+    *,
+    iid_count: int,
+    variant_count: int,
+    bytes_per_variant: int,
+    sample_indices: np.ndarray,
+    count_a1: bool,
+    num_threads: int,
+) -> np.ndarray:
+    if num_threads <= 1 or variant_count <= 1:
+        return _decode_payload_sample_indices(
+            payload,
+            iid_count=iid_count,
+            variant_count=variant_count,
+            bytes_per_variant=bytes_per_variant,
+            sample_indices=sample_indices,
+            count_a1=count_a1,
+        )
+    samples = np.asarray(sample_indices, dtype=np.intp)
+    if samples.ndim != 1:
+        raise ValueError("PLINK sample indices must be 1D.")
+    if samples.size == 0:
+        return np.empty((0, variant_count), dtype=np.int8)
+    if np.any(samples < 0) or np.any(samples >= iid_count):
+        raise IndexError("PLINK sample index out of bounds.")
+    if isinstance(payload, np.ndarray):
+        raw_bytes = np.ascontiguousarray(payload, dtype=np.uint8)
+    else:
+        raw_bytes = np.frombuffer(payload, dtype=np.uint8)
+    if raw_bytes.size != variant_count * bytes_per_variant:
+        raise ValueError("Unexpected PLINK 1 .bed payload length.")
+
+    result = np.empty((samples.shape[0], variant_count), dtype=np.int8)
+    packed_matrix = raw_bytes.reshape(variant_count, bytes_per_variant)
+
+    def decode_chunk(chunk_start: int, chunk_stop: int) -> None:
+        chunk_payload = packed_matrix[chunk_start:chunk_stop, :].reshape(-1)
+        result[:, chunk_start:chunk_stop] = _decode_payload_sample_indices(
+            chunk_payload,
+            iid_count=iid_count,
+            variant_count=chunk_stop - chunk_start,
+            bytes_per_variant=bytes_per_variant,
+            sample_indices=samples,
+            count_a1=count_a1,
+        )
+
+    with ThreadPoolExecutor(max_workers=min(num_threads, variant_count)) as executor:
+        futures = [
+            executor.submit(decode_chunk, chunk_start, chunk_stop)
+            for chunk_start, chunk_stop in _variant_chunks(variant_count, num_threads)
+        ]
+        for future in futures:
+            future.result()
+    return result
+
+
 def _decode_payload(
     payload: bytes | np.ndarray,
     *,
@@ -612,6 +698,51 @@ def _decode_payload(
     # padded-sample axis; the .T returns the F-order view the caller wants.
     decoded = lut[packed]  # noqa: E501 — main allocation
     return decoded.reshape(variant_count, bytes_per_variant * 4)[:, :iid_count].T
+
+
+def _decode_payload_parallel(
+    payload: bytes | np.ndarray,
+    *,
+    iid_count: int,
+    variant_count: int,
+    bytes_per_variant: int,
+    count_a1: bool,
+    num_threads: int,
+) -> np.ndarray:
+    if num_threads <= 1 or variant_count <= 1:
+        return _decode_payload(
+            payload,
+            iid_count=iid_count,
+            variant_count=variant_count,
+            bytes_per_variant=bytes_per_variant,
+            count_a1=count_a1,
+        )
+    if isinstance(payload, np.ndarray):
+        raw_bytes = np.ascontiguousarray(payload, dtype=np.uint8)
+    else:
+        raw_bytes = np.frombuffer(payload, dtype=np.uint8)
+    if raw_bytes.size != variant_count * bytes_per_variant:
+        raise ValueError("Unexpected PLINK 1 .bed payload length.")
+
+    decoded_matrix = np.empty((variant_count, bytes_per_variant * 4), dtype=np.int8)
+    packed_matrix = raw_bytes.reshape(variant_count, bytes_per_variant)
+    lut = _BYTE_DECODE_LUT_A1 if count_a1 else _BYTE_DECODE_LUT_A2
+
+    def decode_chunk(chunk_start: int, chunk_stop: int) -> None:
+        packed = packed_matrix[chunk_start:chunk_stop, :]
+        decoded_matrix[chunk_start:chunk_stop, :] = lut[packed].reshape(
+            chunk_stop - chunk_start,
+            bytes_per_variant * 4,
+        )
+
+    with ThreadPoolExecutor(max_workers=min(num_threads, variant_count)) as executor:
+        futures = [
+            executor.submit(decode_chunk, chunk_start, chunk_stop)
+            for chunk_start, chunk_stop in _variant_chunks(variant_count, num_threads)
+        ]
+        for future in futures:
+            future.result()
+    return decoded_matrix[:, :iid_count].T
 
 
 def _encode_variant(column: np.ndarray, *, bytes_per_variant: int) -> bytes:

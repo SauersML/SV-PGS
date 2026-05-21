@@ -21,7 +21,6 @@ import json
 from pathlib import Path
 
 import numpy as np
-from sklearn.metrics import roc_auc_score
 
 from sv_pgs.progress import log
 
@@ -140,9 +139,32 @@ def _load_ancestry_labels(ancestry_path: Path) -> dict[str, str]:
 
 
 def _compute_auc_safe(labels: np.ndarray, preds: np.ndarray) -> float | None:
+    labels = np.asarray(labels, dtype=np.int8).reshape(-1)
+    preds = np.asarray(preds, dtype=np.float64).reshape(-1)
+    finite = np.isfinite(preds)
+    labels = labels[finite]
+    preds = preds[finite]
     if len(labels) < 20 or len(np.unique(labels)) < 2:
         return None
-    return float(roc_auc_score(labels, preds))
+    n_pos = int(np.sum(labels == 1))
+    n_neg = int(np.sum(labels == 0))
+    if n_pos == 0 or n_neg == 0:
+        return None
+
+    order = np.argsort(preds, kind="mergesort")
+    sorted_preds = preds[order]
+    ranks = np.empty_like(preds, dtype=np.float64)
+    start = 0
+    while start < sorted_preds.size:
+        end = start + 1
+        while end < sorted_preds.size and sorted_preds[end] == sorted_preds[start]:
+            end += 1
+        ranks[order[start:end]] = 0.5 * (start + end - 1) + 1.0
+        start = end
+
+    positive_rank_sum = float(np.sum(ranks[labels == 1]))
+    auc = (positive_rank_sum - n_pos * (n_pos + 1) * 0.5) / (n_pos * n_neg)
+    return float(np.clip(auc, 0.0, 1.0))
 
 
 def _run_auc_test(
@@ -152,6 +174,15 @@ def _run_auc_test(
     results: dict[str, object],
     key_prefix: str,
 ) -> None:
+    neg_scores = np.asarray(neg_scores, dtype=np.float64).reshape(-1)
+    pos_scores = np.asarray(pos_scores, dtype=np.float64).reshape(-1)
+    original_neg_size = int(neg_scores.size)
+    original_pos_size = int(pos_scores.size)
+    neg_scores = neg_scores[np.isfinite(neg_scores)]
+    pos_scores = pos_scores[np.isfinite(pos_scores)]
+    dropped = (original_neg_size - int(neg_scores.size)) + (original_pos_size - int(pos_scores.size))
+    if dropped > 0:
+        log(f"  {name}: dropped {dropped:,} non-finite scores before AUC")
     if neg_scores.size < 10 or pos_scores.size < 10:
         log(f"  {name}: insufficient data (neg={neg_scores.size}, pos={pos_scores.size})")
         return

@@ -2169,7 +2169,7 @@ def fit_variational_em(
                             step_size=step_size,
                             compute_beta_variance=refresh_beta_variance,
                         ),
-                        gradient_tolerance=max(config.newton_gradient_tolerance, 1e-4),
+                        gradient_tolerance=config.newton_gradient_tolerance,
                         solver_tolerance=config.linear_solver_tolerance,
                         maximum_linear_solver_iterations=config.maximum_linear_solver_iterations,
                         logdet_probe_count=config.logdet_probe_count,
@@ -3905,12 +3905,8 @@ def _genotype_transpose_matvec_result_numpy(
 
 
 def _softplus_cupy(cp, values_gpu, *, dtype):
-    positive_branch = values_gpu >= dtype(0.0)
-    return cp.where(
-        positive_branch,
-        values_gpu + cp.log1p(cp.exp(-values_gpu)),
-        cp.log1p(cp.exp(values_gpu)),
-    )
+    values_gpu = cp.asarray(values_gpu, dtype=dtype)
+    return cp.maximum(values_gpu, dtype(0.0)) + cp.log1p(cp.exp(-cp.abs(values_gpu)))
 
 
 def _binary_expected_polya_gamma_weights_cupy(
@@ -6353,7 +6349,7 @@ def _solve_sample_space_rhs_gpu_inner(
     residual_gpu = rhs_gpu - apply_operator(solution_gpu)
     residual_norm_sq = _gpu_to_f64(cp.sum(residual_gpu * residual_gpu, axis=0, dtype=cp.float64))
     rhs_norm_sq = _gpu_to_f64(cp.sum(rhs_gpu * rhs_gpu, axis=0, dtype=cp.float64))
-    convergence_threshold_sq = np.maximum(tol_sq, tol_sq * np.maximum(residual_norm_sq, rhs_norm_sq))
+    convergence_threshold_sq = tol_sq * np.maximum(rhs_norm_sq, 1.0)
     converged = residual_norm_sq <= convergence_threshold_sq
     done = converged | (resolved_iteration_limits <= 0)
     if np.all(done):
@@ -7165,7 +7161,7 @@ def _solve_sample_space_rhs_cpu(
     residual_norm_sq = np.sum(residual * residual, axis=0, dtype=np.float64)
     initial_residual_norm_sq = residual_norm_sq.copy()
     rhs_norm_sq = np.sum(rhs * rhs, axis=0, dtype=np.float64)
-    convergence_threshold_sq = np.maximum(tol_sq, tol_sq * np.maximum(residual_norm_sq, rhs_norm_sq))
+    convergence_threshold_sq = tol_sq * np.maximum(rhs_norm_sq, 1.0)
     converged = residual_norm_sq <= convergence_threshold_sq
     done = converged | (resolved_iteration_limits <= 0)
     if np.all(done):
