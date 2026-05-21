@@ -703,9 +703,13 @@ def run_all_of_us(
     work_dir = Path(output_base)
     work_dir.mkdir(parents=True, exist_ok=True)
 
-    from sv_pgs.progress import set_log_file
+    from sv_pgs.progress import set_log_file, start_heartbeat
     log_path = work_dir / f"{disease_def.canonical_name}.{time.strftime('%Y%m%d_%H%M%S')}.log"
     set_log_file(log_path)
+
+    # Background sampler: emits a periodic main-thread stack + CPU/GPU/mem
+    # snapshot so a stall in the main thread is no longer silent.
+    start_heartbeat(60.0)
 
     from sv_pgs.genotype import require_gpu
     require_gpu()

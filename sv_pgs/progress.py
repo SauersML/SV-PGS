@@ -7,10 +7,21 @@ import resource
 import shutil
 import subprocess
 import sys
+import threading
 import time
+import traceback
 
 _start_time: float = time.monotonic()
 _log_file = None
+
+_heartbeat_thread: threading.Thread | None = None
+_heartbeat_stop: threading.Event | None = None
+# Track CPU usage between heartbeats so we can report a delta-utilization
+# instead of a meaningless cumulative number.
+_heartbeat_last_wall: float | None = None
+_heartbeat_last_cpu: float | None = None
+_heartbeat_last_nvidia_smi: float = 0.0
+_heartbeat_last_nvidia_smi_value: str = "nvidia-smi=not-yet-sampled"
 
 
 def set_log_file(path: str | os.PathLike) -> None:
@@ -164,3 +175,175 @@ def jax_runtime_snapshot() -> str:
         return f"{version_summary} devices=[{device_summary}] env=[{env_summary}]"
     except (ImportError, RuntimeError) as error:
         return f"jax_runtime_error={error} env=[{env_summary}]"
+
+
+# -- Heartbeat / stack sampler --------------------------------------------
+#
+# Background thread that emits a periodic "where am I now" snapshot so a stall
+# in the main thread is no longer invisible. Each heartbeat reports:
+#   * Top-of-stack frames for the main thread (file:line:func)
+#   * Process CPU% over the heartbeat interval
+#   * Resident memory
+#   * Active OS thread count and Python thread count
+#   * GPU: nvidia-smi util/mem (sampled at most every 30 s; it shells out)
+#   * Cupy default mempool used/total bytes (cheap; in-process)
+#
+# Designed to be lightweight and crash-resistant: any exception inside the
+# heartbeat is caught and logged, so a transient failure (e.g. cupy not
+# initialized yet) cannot kill the run.
+
+
+def _format_thread_frame(frame) -> list[str]:
+    """Return the deepest ~6 frames of `frame` as 'file:line:func' strings."""
+    if frame is None:
+        return ["<no frame>"]
+    frames: list[str] = []
+    cursor = frame
+    while cursor is not None and len(frames) < 6:
+        code = cursor.f_code
+        filename = os.path.basename(code.co_filename) or code.co_filename
+        frames.append(f"{filename}:{cursor.f_lineno}:{code.co_name}")
+        cursor = cursor.f_back
+    return frames
+
+
+def _process_cpu_seconds() -> float:
+    """Return cumulative user+system CPU seconds for this process."""
+    rusage = resource.getrusage(resource.RUSAGE_SELF)
+    return float(rusage.ru_utime) + float(rusage.ru_stime)
+
+
+def _cupy_mempool_snapshot() -> str:
+    try:
+        import cupy  # type: ignore[import-not-found]
+    except ImportError:
+        return "cupy=unavailable"
+    try:
+        pool = cupy.get_default_memory_pool()
+        used = int(pool.used_bytes())
+        total = int(pool.total_bytes())
+        pinned = cupy.get_default_pinned_memory_pool()
+        pinned_used = int(pinned.n_free_blocks())
+        return (
+            f"cupy_used={_format_bytes(used)} "
+            + f"cupy_pool={_format_bytes(total)} "
+            + f"cupy_pinned_free_blocks={pinned_used}"
+        )
+    except (RuntimeError, AttributeError) as error:
+        return f"cupy_mempool_error={error}"
+
+
+def _maybe_refresh_nvidia_smi(now: float) -> str:
+    """Sample nvidia-smi at most every 30 seconds (shelling out is expensive)."""
+    global _heartbeat_last_nvidia_smi, _heartbeat_last_nvidia_smi_value
+    if now - _heartbeat_last_nvidia_smi > 30.0:
+        _heartbeat_last_nvidia_smi_value = nvidia_smi_snapshot()
+        _heartbeat_last_nvidia_smi = now
+    return _heartbeat_last_nvidia_smi_value
+
+
+def _loadavg_snapshot() -> str:
+    try:
+        one, five, fifteen = os.getloadavg()
+        return f"load1={one:.2f} load5={five:.2f} load15={fifteen:.2f}"
+    except (OSError, AttributeError):
+        return "load=unknown"
+
+
+def _heartbeat_tick(interval_seconds: float, main_thread_id: int) -> None:
+    """Emit one heartbeat. Designed to never raise."""
+    global _heartbeat_last_wall, _heartbeat_last_cpu
+    try:
+        now = time.monotonic()
+        # CPU utilization since last tick.
+        cpu_now = _process_cpu_seconds()
+        if _heartbeat_last_wall is None or _heartbeat_last_cpu is None:
+            cpu_pct_str = "cpu=warming"
+        else:
+            wall_delta = max(now - _heartbeat_last_wall, 1e-6)
+            cpu_delta = cpu_now - _heartbeat_last_cpu
+            cpu_pct = 100.0 * cpu_delta / wall_delta
+            cpu_pct_str = f"cpu={cpu_pct:.0f}% ({cpu_delta:.1f}s in {wall_delta:.1f}s)"
+        _heartbeat_last_wall = now
+        _heartbeat_last_cpu = cpu_now
+
+        frames = sys._current_frames()
+        main_frame = frames.get(main_thread_id)
+        stack_lines = _format_thread_frame(main_frame)
+        # Other threads that are not the main one and not the heartbeat itself.
+        self_ident = threading.get_ident()
+        background_threads = [
+            tid for tid in frames if tid != main_thread_id and tid != self_ident
+        ]
+
+        nvidia = _maybe_refresh_nvidia_smi(now)
+        cupy_info = _cupy_mempool_snapshot()
+        loadavg = _loadavg_snapshot()
+        thread_count = threading.active_count()
+
+        # Print in a single contiguous block so it's easy to grep.
+        log(
+            "HEARTBEAT @ "
+            + f"interval={interval_seconds:.0f}s  {cpu_pct_str}  mem={mem()}  "
+            + f"threads={thread_count} (bg={len(background_threads)})  {loadavg}"
+        )
+        log("  main-thread stack (deepest first):")
+        for frame_line in stack_lines:
+            log(f"    {frame_line}")
+        log(f"  gpu: {nvidia}")
+        log(f"  gpu_mempool: {cupy_info}")
+    except (OSError, RuntimeError, ValueError) as error:
+        # Never crash the heartbeat thread.
+        try:
+            log(f"HEARTBEAT error: {error}")
+        except OSError:
+            pass
+
+
+def _heartbeat_loop(interval_seconds: float, main_thread_id: int) -> None:
+    assert _heartbeat_stop is not None
+    while not _heartbeat_stop.is_set():
+        _heartbeat_tick(interval_seconds, main_thread_id)
+        # Wait up to interval_seconds, but break early if stop is set.
+        _heartbeat_stop.wait(interval_seconds)
+
+
+def start_heartbeat(interval_seconds: float = 60.0) -> None:
+    """Start a background thread that emits periodic stack/CPU/GPU snapshots.
+
+    Safe to call more than once; subsequent calls are no-ops.
+    """
+    global _heartbeat_thread, _heartbeat_stop
+    global _heartbeat_last_wall, _heartbeat_last_cpu
+    if _heartbeat_thread is not None and _heartbeat_thread.is_alive():
+        return
+    _heartbeat_stop = threading.Event()
+    _heartbeat_last_wall = None
+    _heartbeat_last_cpu = None
+    main_thread_id = threading.main_thread().ident
+    assert main_thread_id is not None
+    thread = threading.Thread(
+        target=_heartbeat_loop,
+        args=(float(interval_seconds), int(main_thread_id)),
+        name="sv-pgs-heartbeat",
+        daemon=True,
+    )
+    _heartbeat_thread = thread
+    thread.start()
+    log(f"heartbeat sampler started (every {interval_seconds:.0f}s)")
+
+
+def stop_heartbeat() -> None:
+    """Stop the background heartbeat thread (best-effort)."""
+    global _heartbeat_thread, _heartbeat_stop
+    if _heartbeat_stop is not None:
+        _heartbeat_stop.set()
+    if _heartbeat_thread is not None:
+        _heartbeat_thread.join(timeout=2.0)
+    _heartbeat_thread = None
+    _heartbeat_stop = None
+
+
+# Keep `traceback` import used in case future variants want a full formatted
+# traceback string. Reference it so static analyzers don't flag it as unused.
+_ = traceback
