@@ -1334,23 +1334,63 @@ class _CupyInt8StandardizedCache:
     means: Any
     scales: Any
     cupy: Any = field(repr=False)
+    # When set, this cache is a view over ``raw_values``: the i-th logical
+    # column maps to ``raw_values[:, column_indices[i]]``. ``means`` / ``scales``
+    # are always pre-subset to logical column order, so they are indexed
+    # directly with logical positions.
+    column_indices: Any | None = None
 
     @property
     def shape(self) -> tuple[int, int]:
-        return int(self.raw_values.shape[0]), int(self.raw_values.shape[1])
+        rows = int(self.raw_values.shape[0])
+        if self.column_indices is None:
+            return rows, int(self.raw_values.shape[1])
+        return rows, int(self.column_indices.shape[0])
 
     @property
     def nbytes(self) -> int:
-        return int(self.raw_values.nbytes) + int(self.means.nbytes) + int(self.scales.nbytes)
+        total = int(self.raw_values.nbytes) + int(self.means.nbytes) + int(self.scales.nbytes)
+        if self.column_indices is not None:
+            total += int(self.column_indices.nbytes)
+        return total
 
     def subset(self, local_variant_indices: np.ndarray) -> _CupyInt8StandardizedCache:
         resolved_local_indices = np.asarray(local_variant_indices, dtype=np.int32)
-        return _CupyInt8StandardizedCache(
-            raw_values=self.raw_values[:, resolved_local_indices],
-            means=self.means[resolved_local_indices],
-            scales=self.scales[resolved_local_indices],
-            cupy=self.cupy,
+        if _local_indices_select_all(resolved_local_indices, self.shape[1]):
+            return self
+        cp = self.cupy
+        # Means/scales are tiny per-variant arrays; subset eagerly so the
+        # view always indexes them with logical positions.
+        local_slice = _local_indices_as_slice(resolved_local_indices)
+        if local_slice is not None:
+            means = self.means[local_slice]
+            scales = self.scales[local_slice]
+        else:
+            means = self.means[resolved_local_indices]
+            scales = self.scales[resolved_local_indices]
+        # Defer the (large) raw_values gather: keep the parent buffer shared
+        # and store the resolved column ids on the device. This turns
+        # ``subset`` from O(samples x selected) device bytes into O(selected)
+        # device bytes; critical when ``selected`` covers most of the cache
+        # and would otherwise OOM by duplicating it. The per-batch gather in
+        # ``standardized_columns`` produces only the working chunk.
+        device_indices = cp.asarray(resolved_local_indices)
+        composed_indices = (
+            device_indices if self.column_indices is None else self.column_indices[device_indices]
         )
+        return _CupyInt8StandardizedCache(
+            raw_values=self.raw_values,
+            means=means,
+            scales=scales,
+            cupy=cp,
+            column_indices=composed_indices,
+        )
+
+    def _resolve_raw_selector(self, sel):
+        """Map a logical column selector onto the underlying ``raw_values``."""
+        if self.column_indices is None:
+            return sel
+        return self.column_indices[sel]
 
     def standardized_columns(
         self,
@@ -1360,7 +1400,7 @@ class _CupyInt8StandardizedCache:
     ) -> Any:
         cp = self.cupy
         resolved_dtype = _cupy_compute_dtype(cp) if dtype is None else dtype
-        raw_chunk = self.raw_values[:, local_variant_indices]
+        raw_chunk = self.raw_values[:, self._resolve_raw_selector(local_variant_indices)]
         means = self.means[local_variant_indices].astype(resolved_dtype, copy=False)
         scales = self.scales[local_variant_indices].astype(resolved_dtype, copy=False)
         standardized = _standardize_int8_cupy(
@@ -1398,9 +1438,15 @@ def _cupy_cache_nbytes(cache: Any) -> int:
 
 
 def _cupy_cache_subset_columns(cache: Any, local_variant_indices: np.ndarray) -> Any:
+    resolved_local_indices = np.asarray(local_variant_indices, dtype=np.int32)
     if _cupy_cache_is_int8_standardized(cache):
-        return cache.subset(local_variant_indices)
-    return cache[:, local_variant_indices]
+        return cache.subset(resolved_local_indices)
+    if _local_indices_select_all(resolved_local_indices, int(cache.shape[1])):
+        return cache
+    local_slice = _local_indices_as_slice(resolved_local_indices)
+    if local_slice is not None:
+        return cache[:, local_slice]
+    return cache[:, resolved_local_indices]
 
 
 def _cupy_cache_standardized_columns(
@@ -1448,6 +1494,44 @@ def _iter_cupy_cache_standardized_batches(
         yield batch_slice, _cupy_cache_standardized_columns(
             cache,
             batch_slice,
+            cupy=cupy,
+            dtype=dtype,
+        )
+
+
+def _iter_selected_cupy_cache_standardized_batches(
+    cache: Any,
+    local_variant_indices: np.ndarray,
+    *,
+    sample_count: int,
+    batch_size: int,
+    cupy,
+    dtype=None,
+):
+    selected_variant_count = int(local_variant_indices.shape[0])
+    resolved_dtype = _cupy_dtype_to_numpy_dtype(np.float32 if dtype is None else dtype)
+    static_target_batch_bytes = (
+        LOCAL_INT8_STANDARDIZED_STREAMING_TARGET_BATCH_BYTES
+        if _cupy_cache_is_int8_standardized(cache)
+        else STANDARDIZED_STREAMING_TARGET_BATCH_BYTES
+    )
+    target_batch_bytes = _gpu_dynamic_standardized_target_batch_bytes(
+        cupy,
+        static_target_batch_bytes=static_target_batch_bytes,
+    )
+    bytes_per_variant = sample_count * resolved_dtype.itemsize
+    memory_capped_batch_size = max(target_batch_bytes // max(bytes_per_variant, 1), 1)
+    safe_batch_size = max(1, min(max(int(batch_size), 1), memory_capped_batch_size))
+    for start_index in range(0, selected_variant_count, safe_batch_size):
+        stop_index = min(start_index + safe_batch_size, selected_variant_count)
+        operand_slice = slice(start_index, stop_index)
+        selected_indices = local_variant_indices[operand_slice]
+        local_selection = _local_indices_as_slice(selected_indices)
+        if local_selection is None:
+            local_selection = selected_indices
+        yield operand_slice, _cupy_cache_standardized_columns(
+            cache,
+            local_selection,
             cupy=cupy,
             dtype=dtype,
         )
@@ -1521,6 +1605,36 @@ def _active_vector_local_indices(vector: np.ndarray) -> np.ndarray:
 
 def _active_matrix_row_local_indices(matrix: np.ndarray) -> np.ndarray:
     return np.flatnonzero(np.any(matrix != 0, axis=1)).astype(np.int32, copy=False)
+
+
+def _local_indices_select_all(local_variant_indices: np.ndarray, variant_count: int) -> bool:
+    if local_variant_indices.shape[0] != variant_count:
+        return False
+    if variant_count == 0:
+        return True
+    return bool(
+        local_variant_indices[0] == 0
+        and local_variant_indices[-1] == variant_count - 1
+        and np.all(local_variant_indices == np.arange(variant_count, dtype=local_variant_indices.dtype))
+    )
+
+
+def _local_indices_as_slice(local_variant_indices: np.ndarray) -> slice | None:
+    if local_variant_indices.size == 0:
+        return slice(0, 0)
+    start = int(local_variant_indices[0])
+    stop = int(local_variant_indices[-1]) + 1
+    if stop < start:
+        return None
+    if stop - start != int(local_variant_indices.size):
+        return None
+    if bool(np.all(local_variant_indices == np.arange(start, stop, dtype=local_variant_indices.dtype))):
+        return slice(start, stop)
+    return None
+
+
+def _selected_or_all_local_indices(local_variant_indices: np.ndarray, variant_count: int) -> np.ndarray | None:
+    return None if _local_indices_select_all(local_variant_indices, variant_count) else local_variant_indices
 
 
 @dataclass(slots=True)
@@ -2673,23 +2787,31 @@ class StandardizedGenotypeMatrix:
             result_gpu = cupy.zeros((self.shape[0], matrix_gpu.shape[1]), dtype=resolved_dtype)
             return result_gpu[:, 0] if vector_input else result_gpu
         if self._cupy_cache is not None:
-            cache = (
-                self._cupy_cache
-                if local_variant_indices is None
-                else _cupy_cache_subset_columns(self._cupy_cache, resolved_local_indices)
-            )
-            if _cupy_cache_is_int8_standardized(cache):
+            if local_variant_indices is None:
+                cache = self._cupy_cache
+                if _cupy_cache_is_int8_standardized(cache):
+                    result_gpu = cupy.zeros((self.shape[0], matrix_gpu.shape[1]), dtype=resolved_dtype)
+                    for batch_slice, standardized_batch in _iter_cupy_cache_standardized_batches(
+                        cache,
+                        sample_count=self.shape[0],
+                        batch_size=batch_size,
+                        cupy=cupy,
+                        dtype=resolved_dtype,
+                    ):
+                        result_gpu += standardized_batch @ matrix_gpu[batch_slice, :]
+                else:
+                    result_gpu = cache.astype(resolved_dtype, copy=False) @ matrix_gpu
+            else:
                 result_gpu = cupy.zeros((self.shape[0], matrix_gpu.shape[1]), dtype=resolved_dtype)
-                for batch_slice, standardized_batch in _iter_cupy_cache_standardized_batches(
-                    cache,
+                for operand_slice, standardized_batch in _iter_selected_cupy_cache_standardized_batches(
+                    self._cupy_cache,
+                    resolved_local_indices,
                     sample_count=self.shape[0],
                     batch_size=batch_size,
                     cupy=cupy,
                     dtype=resolved_dtype,
                 ):
-                    result_gpu += standardized_batch @ matrix_gpu[batch_slice, :]
-            else:
-                result_gpu = cache.astype(resolved_dtype, copy=False) @ matrix_gpu
+                    result_gpu += standardized_batch @ matrix_gpu[operand_slice, :]
             return result_gpu[:, 0] if vector_input else result_gpu
         streaming_cupy, streaming_batch_size = self._streaming_gpu_context(batch_size)
         if streaming_cupy is None or streaming_batch_size is None or self.raw is None:
@@ -2952,20 +3074,26 @@ class StandardizedGenotypeMatrix:
         active_local_indices = _active_vector_local_indices(coeff_np)
         if active_local_indices.size == 0:
             return np.zeros(self.shape[0], dtype=coeff_np.dtype)
+        selected_local_indices = _selected_or_all_local_indices(active_local_indices, self.shape[1])
+        selected_coefficients = coeff_np if selected_local_indices is None else coeff_np[active_local_indices]
         if self._cupy_cache is not None:
             cupy = _try_import_cupy()
             if cupy is None:
                 if _cupy_cache_is_int8_standardized(self._cupy_cache):
                     raise RuntimeError("CuPy int8 cache requires CuPy runtime.")
-                dense_cache = np.asarray(self._cupy_cache[:, active_local_indices], dtype=coeff_np.dtype)
-                return np.asarray(dense_cache @ coeff_np[active_local_indices], dtype=coeff_np.dtype)
+                dense_cache = (
+                    np.asarray(self._cupy_cache, dtype=coeff_np.dtype)
+                    if selected_local_indices is None
+                    else np.asarray(self._cupy_cache[:, selected_local_indices], dtype=coeff_np.dtype)
+                )
+                return np.asarray(dense_cache @ selected_coefficients, dtype=coeff_np.dtype)
             return _cupy_to_numpy(
                 self._gpu_variant_matmul(
-                    coeff_np[active_local_indices],
+                    selected_coefficients,
                     batch_size=batch_size,
                     cupy=cupy,
                     dtype=_cupy_compute_dtype(cupy),
-                    local_variant_indices=active_local_indices,
+                    local_variant_indices=selected_local_indices,
                 ),
                 dtype=coeff_np.dtype,
             )
@@ -2973,11 +3101,11 @@ class StandardizedGenotypeMatrix:
         if cupy is not None and streaming_batch_size is not None:
             return _cupy_to_numpy(
                 self._gpu_variant_matmul(
-                    coeff_np[active_local_indices],
+                    selected_coefficients,
                     batch_size=streaming_batch_size,
                     cupy=cupy,
                     dtype=_cupy_compute_dtype(cupy),
-                    local_variant_indices=active_local_indices,
+                    local_variant_indices=selected_local_indices,
                     progress_label="GPU matvec",
                 ),
                 dtype=coeff_np.dtype,
@@ -3033,20 +3161,26 @@ class StandardizedGenotypeMatrix:
         active_local_indices = _active_matrix_row_local_indices(m_np)
         if active_local_indices.size == 0:
             return np.zeros((self.shape[0], m_np.shape[1]), dtype=m_np.dtype)
+        selected_local_indices = _selected_or_all_local_indices(active_local_indices, self.shape[1])
+        selected_matrix = m_np if selected_local_indices is None else m_np[active_local_indices, :]
         if self._cupy_cache is not None:
             cupy = _try_import_cupy()
             if cupy is None:
                 if _cupy_cache_is_int8_standardized(self._cupy_cache):
                     raise RuntimeError("CuPy int8 cache requires CuPy runtime.")
-                dense_cache = np.asarray(self._cupy_cache[:, active_local_indices], dtype=m_np.dtype)
-                return np.asarray(dense_cache @ m_np[active_local_indices, :], dtype=m_np.dtype)
+                dense_cache = (
+                    np.asarray(self._cupy_cache, dtype=m_np.dtype)
+                    if selected_local_indices is None
+                    else np.asarray(self._cupy_cache[:, selected_local_indices], dtype=m_np.dtype)
+                )
+                return np.asarray(dense_cache @ selected_matrix, dtype=m_np.dtype)
             return _cupy_to_numpy(
                 self._gpu_variant_matmul(
-                    m_np[active_local_indices, :],
+                    selected_matrix,
                     batch_size=batch_size,
                     cupy=cupy,
                     dtype=_cupy_compute_dtype(cupy),
-                    local_variant_indices=active_local_indices,
+                    local_variant_indices=selected_local_indices,
                 ),
                 dtype=m_np.dtype,
             )
@@ -3054,11 +3188,11 @@ class StandardizedGenotypeMatrix:
         if cupy is not None and streaming_batch_size is not None:
             return _cupy_to_numpy(
                 self._gpu_variant_matmul(
-                    m_np[active_local_indices, :],
+                    selected_matrix,
                     batch_size=streaming_batch_size,
                     cupy=cupy,
                     dtype=_cupy_compute_dtype(cupy),
-                    local_variant_indices=active_local_indices,
+                    local_variant_indices=selected_local_indices,
                 ),
                 dtype=m_np.dtype,
             )

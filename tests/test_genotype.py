@@ -978,6 +978,126 @@ def test_cupy_int8_cache_batches_shrink_when_gpu_free_memory_is_low():
     assert widths == [5, 5, 2]
 
 
+def test_gpu_cached_matvec_with_all_active_coefficients_reuses_cache(monkeypatch: pytest.MonkeyPatch):
+    class _FakeCudaRuntime:
+        @staticmethod
+        def memGetInfo():
+            return (8_000_000_000, 16_000_000_000)
+
+    class _FakeCuda:
+        runtime = _FakeCudaRuntime()
+
+    class _FakeCupy:
+        float32 = np.float32
+        float64 = np.float64
+        cuda = _FakeCuda()
+
+        @staticmethod
+        def asarray(array, dtype=None):
+            return np.asarray(array, dtype=dtype)
+
+        @staticmethod
+        def any(array):
+            return np.any(array)
+
+        @staticmethod
+        def zeros(shape, dtype=None):
+            return np.zeros(shape, dtype=dtype)
+
+        @staticmethod
+        def multiply(left, right, out=None):
+            return np.multiply(left, right, out=out)
+
+    raw_values = np.array(
+        [
+            [0, 1, 2],
+            [1, 2, 0],
+            [2, 0, 1],
+        ],
+        dtype=np.int8,
+    )
+    means = np.array([1.0, 1.0, 1.0], dtype=np.float32)
+    scales = np.array([0.5, 1.0, 2.0], dtype=np.float32)
+    coefficients = np.array([0.25, -1.5, 2.0], dtype=np.float32)
+    standardized = Int8RawGenotypeMatrix(raw_values).standardized(means, scales)
+    standardized._cupy_cache = genotype_module._CupyInt8StandardizedCache(
+        raw_values=raw_values,
+        means=means,
+        scales=scales,
+        cupy=_FakeCupy,
+    )
+
+    def _unexpected_subset(*_args, **_kwargs):
+        raise AssertionError("full active matvec must not allocate a subset cache")
+
+    monkeypatch.setattr(genotype_module, "_try_import_cupy", lambda: _FakeCupy())
+    monkeypatch.setattr(genotype_module, "_cupy_cache_subset_columns", _unexpected_subset)
+
+    result = standardized.matvec_numpy(coefficients, batch_size=2)
+
+    np.testing.assert_allclose(result, standardized.materialize() @ coefficients, rtol=1e-6, atol=1e-6)
+
+
+def test_gpu_cached_partial_matvec_streams_selected_columns(monkeypatch: pytest.MonkeyPatch):
+    class _FakeCudaRuntime:
+        @staticmethod
+        def memGetInfo():
+            return (8_000_000_000, 16_000_000_000)
+
+    class _FakeCuda:
+        runtime = _FakeCudaRuntime()
+
+    class _FakeCupy:
+        float32 = np.float32
+        float64 = np.float64
+        cuda = _FakeCuda()
+
+        @staticmethod
+        def asarray(array, dtype=None):
+            return np.asarray(array, dtype=dtype)
+
+        @staticmethod
+        def any(array):
+            return np.any(array)
+
+        @staticmethod
+        def zeros(shape, dtype=None):
+            return np.zeros(shape, dtype=dtype)
+
+        @staticmethod
+        def multiply(left, right, out=None):
+            return np.multiply(left, right, out=out)
+
+    raw_values = np.array(
+        [
+            [0, 1, 2, 0],
+            [1, 2, 0, 1],
+            [2, 0, 1, 2],
+        ],
+        dtype=np.int8,
+    )
+    means = np.array([1.0, 1.0, 1.0, 1.0], dtype=np.float32)
+    scales = np.array([0.5, 1.0, 2.0, 0.25], dtype=np.float32)
+    coefficients = np.array([0.0, -1.5, 0.0, 2.0], dtype=np.float32)
+    standardized = Int8RawGenotypeMatrix(raw_values).standardized(means, scales)
+    standardized._cupy_cache = genotype_module._CupyInt8StandardizedCache(
+        raw_values=raw_values,
+        means=means,
+        scales=scales,
+        cupy=_FakeCupy,
+    )
+
+    def _unexpected_subset(*_args, **_kwargs):
+        raise AssertionError("partial active matvec must stream selected cache columns")
+
+    monkeypatch.setattr(genotype_module, "_try_import_cupy", lambda: _FakeCupy())
+    monkeypatch.setattr(genotype_module, "_cupy_cache_subset_columns", _unexpected_subset)
+
+    result = standardized.matvec_numpy(coefficients, batch_size=1)
+
+    np.testing.assert_allclose(result, standardized.materialize() @ coefficients, rtol=1e-6, atol=1e-6)
+
+
 def test_gpu_int8_transpose_matvec_matches_standardized_cpu_path(monkeypatch: pytest.MonkeyPatch):
     class _FakeCupy:
         float32 = np.float32
