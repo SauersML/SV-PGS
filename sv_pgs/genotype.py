@@ -1349,31 +1349,53 @@ class _CupyInt8StandardizedCache:
 
     @property
     def nbytes(self) -> int:
-        total = int(self.raw_values.nbytes) + int(self.means.nbytes) + int(self.scales.nbytes)
-        if self.column_indices is not None:
-            total += int(self.column_indices.nbytes)
-        return total
+        # Report the *logical* footprint so callers (budget logs, materialization
+        # accounting) see the view's effective size rather than the shared parent
+        # buffer. Root caches (column_indices is None) report the true allocation.
+        means_bytes = int(self.means.nbytes)
+        scales_bytes = int(self.scales.nbytes)
+        if self.column_indices is None:
+            return int(self.raw_values.nbytes) + means_bytes + scales_bytes
+        sample_count = int(self.raw_values.shape[0])
+        view_columns = int(self.column_indices.shape[0])
+        itemsize = int(self.raw_values.dtype.itemsize)
+        return sample_count * view_columns * itemsize + means_bytes + scales_bytes + int(self.column_indices.nbytes)
 
     def subset(self, local_variant_indices: np.ndarray) -> _CupyInt8StandardizedCache:
         resolved_local_indices = np.asarray(local_variant_indices, dtype=np.int32)
         if _local_indices_select_all(resolved_local_indices, self.shape[1]):
             return self
         cp = self.cupy
-        # Means/scales are tiny per-variant arrays; subset eagerly so the
-        # view always indexes them with logical positions.
         local_slice = _local_indices_as_slice(resolved_local_indices)
         if local_slice is not None:
+            # Contiguous selection: subset means/scales by slice (cheap) and
+            # either keep a zero-copy slice view of raw_values (root cache) or
+            # slice the parent's column-index array (view-of-view). Both paths
+            # avoid materializing a fresh genotype copy on the device.
             means = self.means[local_slice]
             scales = self.scales[local_slice]
-        else:
-            means = self.means[resolved_local_indices]
-            scales = self.scales[resolved_local_indices]
-        # Defer the (large) raw_values gather: keep the parent buffer shared
-        # and store the resolved column ids on the device. This turns
-        # ``subset`` from O(samples x selected) device bytes into O(selected)
-        # device bytes; critical when ``selected`` covers most of the cache
-        # and would otherwise OOM by duplicating it. The per-batch gather in
-        # ``standardized_columns`` produces only the working chunk.
+            if self.column_indices is None:
+                return _CupyInt8StandardizedCache(
+                    raw_values=self.raw_values[:, local_slice],
+                    means=means,
+                    scales=scales,
+                    cupy=cp,
+                )
+            return _CupyInt8StandardizedCache(
+                raw_values=self.raw_values,
+                means=means,
+                scales=scales,
+                cupy=cp,
+                column_indices=self.column_indices[local_slice],
+            )
+        # Non-contiguous fancy selection: defer the raw_values gather. Keep
+        # the parent buffer shared and store the resolved column ids on the
+        # device, turning ``subset`` from O(samples x selected) device bytes
+        # into O(selected) device bytes; critical when ``selected`` covers
+        # most of the cache and would otherwise OOM by duplicating it.
+        # ``standardized_columns`` gathers each working batch on demand.
+        means = self.means[resolved_local_indices]
+        scales = self.scales[resolved_local_indices]
         device_indices = cp.asarray(resolved_local_indices)
         composed_indices = (
             device_indices if self.column_indices is None else self.column_indices[device_indices]
