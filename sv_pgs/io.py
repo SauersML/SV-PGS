@@ -2013,16 +2013,23 @@ def compute_plink_variant_statistics_cached(
                 fortran_order=True,
             )
             if not has_space:
-                raise OSError(
-                    "Insufficient free space for PLINK int8 cache: "
-                    + f"need at least {required_bytes / 1e9:.1f} GB plus reserve, "
-                    + f"free {available_bytes / 1e9:.1f} GB at {int8_path.parent}"
+                # On constrained workspaces (e.g. AoU running --variants snp
+                # over the full ~332k-sample microarray cohort) the int8 mmap
+                # would exceed disk. Skip the cache; downstream passes stream
+                # from .bed instead. Slower per epoch but no longer fatal.
+                log(
+                    "  PLINK int8 cache skipped: would need "
+                    f"{required_bytes / 1e9:.1f} GB but only "
+                    f"{available_bytes / 1e9:.1f} GB free at {int8_path.parent}; "
+                    "continuing with on-the-fly bed decode (slower per epoch)"
                 )
-            int8_cache_writer = _StreamingInt8NpyWriter.open(
-                int8_tmp_path,
-                shape=(n_samples, n_variants),
-                fortran_order=True,
-            )
+                int8_eligible = False
+            else:
+                int8_cache_writer = _StreamingInt8NpyWriter.open(
+                    int8_tmp_path,
+                    shape=(n_samples, n_variants),
+                    fortran_order=True,
+                )
         else:
             int8_cache_writer = _StreamingInt8NpyWriter.resume(
                 int8_tmp_path,
