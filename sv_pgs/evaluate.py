@@ -336,6 +336,133 @@ def evaluate_all_of_us(
         if cnt <= 5 or cnt in (10, 20, 50, 100) or cnt == max(groups.keys()):
             log(f"  {cnt:>3} codes: n={len(g):>6,}  mean_score={g.mean():.6f}")
 
+    # === TRUE 20% held-out test set ===
+    # The fit pipeline holds out a deterministic 20% of samples (SHA-256 of
+    # sample_id) and writes their predictions to test_predictions.tsv.gz. These
+    # samples were *never* shown to the EM. Print the full battery on them.
+    test_predictions_path = work_dir / "test_predictions.tsv.gz"
+    if test_predictions_path.exists():
+        log("")
+        log("=== TRUE 20% HELD-OUT TEST SET ===")
+        log(f"  predictions: {test_predictions_path}")
+
+        test_rows: list[tuple[str, int, float, float, float]] = []
+        with gzip.open(test_predictions_path, "rt") as handle:
+            reader = csv.DictReader(handle, delimiter="\t")
+            cols = reader.fieldnames or []
+            score_col = next(
+                (c for c in ("probability", "predicted_probability", "genetic_score", "linear_predictor") if c in cols),
+                None,
+            )
+            if score_col is None:
+                log(f"  no score column in {test_predictions_path}; columns={cols}")
+            else:
+                log(f"  using score column: {score_col}")
+                for row in reader:
+                    sid = row["sample_id"]
+                    target = int(float(row["target"])) if "target" in row else -1
+                    score = float(row[score_col])
+                    genetic = float(row.get("genetic_score", "nan"))
+                    covariate = float(row.get("covariate_score", "nan"))
+                    test_rows.append((sid, target, score, genetic, covariate))
+
+        if test_rows:
+            test_ids = np.array([r[0] for r in test_rows])
+            y = np.array([r[1] for r in test_rows], dtype=np.int8)
+            p = np.array([r[2] for r in test_rows], dtype=np.float64)
+            g = np.array([r[3] for r in test_rows], dtype=np.float64)
+            c = np.array([r[4] for r in test_rows], dtype=np.float64)
+
+            n_total = int(y.size)
+            n_pos = int((y == 1).sum())
+            n_neg = int((y == 0).sum())
+            log(f"  test samples: {n_total:,}  cases={n_pos:,}  controls={n_neg:,}")
+
+            mean_pos = float(p[y == 1].mean()) if n_pos else float("nan")
+            mean_neg = float(p[y == 0].mean()) if n_neg else float("nan")
+            log(f"  mean score: cases={mean_pos:.6f}  controls={mean_neg:.6f}  diff={mean_pos - mean_neg:.6f}")
+            if np.isfinite(g).all():
+                log(f"  mean genetic_score:   cases={float(g[y==1].mean()):.6f}  controls={float(g[y==0].mean()):.6f}")
+            if np.isfinite(c).all():
+                log(f"  mean covariate_score: cases={float(c[y==1].mean()):.6f}  controls={float(c[y==0].mean()):.6f}")
+
+            auc_overall = _compute_auc_safe(y, p)
+            log(f"  ALL:           AUC={auc_overall if auc_overall is None else f'{auc_overall:.4f}'}  n={n_total:,}")
+            results["test_holdout_auc_all"] = auc_overall
+            results["test_holdout_n"] = n_total
+            results["test_holdout_n_pos"] = n_pos
+            results["test_holdout_n_neg"] = n_neg
+            results["test_holdout_mean_score_cases"] = mean_pos
+            results["test_holdout_mean_score_controls"] = mean_neg
+
+            if np.isfinite(g).all():
+                auc_genetic_only = _compute_auc_safe(y, g)
+                log(f"  ALL (genetic-only):   AUC={auc_genetic_only if auc_genetic_only is None else f'{auc_genetic_only:.4f}'}")
+                results["test_holdout_auc_genetic_only"] = auc_genetic_only
+            if np.isfinite(c).all():
+                auc_covariate_only = _compute_auc_safe(y, c)
+                log(f"  ALL (covariate-only): AUC={auc_covariate_only if auc_covariate_only is None else f'{auc_covariate_only:.4f}'}")
+                results["test_holdout_auc_covariate_only"] = auc_covariate_only
+
+            if eur_ids:
+                eur_mask = np.array([sid in eur_ids for sid in test_ids])
+                if eur_mask.any():
+                    auc_eur = _compute_auc_safe(y[eur_mask], p[eur_mask])
+                    log(
+                        f"  EUR only:      AUC={auc_eur if auc_eur is None else f'{auc_eur:.4f}'}  "
+                        f"n={int(eur_mask.sum()):,}  cases={int((y[eur_mask]==1).sum()):,}  "
+                        f"controls={int((y[eur_mask]==0).sum()):,}"
+                    )
+                    results["test_holdout_auc_eur"] = auc_eur
+                    results["test_holdout_n_eur"] = int(eur_mask.sum())
+
+            # Dose-response on the held-out set
+            test_scores_by_id = {sid: score for sid, _, score, _, _ in test_rows}
+            test_groups: dict[int, list[float]] = {}
+            for sid, score in test_scores_by_id.items():
+                cnt = observation_counts.get(sid)
+                if cnt is not None:
+                    test_groups.setdefault(cnt, []).append(score)
+            if test_groups:
+                log("  dose-response on held-out (score vs observation count):")
+                max_cnt_test = max(test_groups.keys())
+                for cnt in sorted(test_groups.keys()):
+                    arr = np.asarray(test_groups[cnt])
+                    if cnt <= 5 or cnt in (10, 20, 50, 100) or cnt == max_cnt_test:
+                        log(f"    {cnt:>3} codes: n={len(arr):>6,}  mean_score={arr.mean():.6f}")
+
+            # ICD stratification on held-out: 0-code vs 1-code (both target=0)
+            zero_h = np.array([test_scores_by_id[sid] for sid in test_ids if observation_counts.get(sid) == 0 and sid in test_scores_by_id])
+            one_h = np.array([test_scores_by_id[sid] for sid in test_ids if observation_counts.get(sid) == 1 and sid in test_scores_by_id])
+            if zero_h.size >= 10 and one_h.size >= 10:
+                log("  ICD 0-code vs 1-code (held-out):")
+                _run_auc_test("ALL", zero_h, one_h, results, "test_holdout_icd01_all")
+                if eur_ids:
+                    zero_h_eur = np.array([test_scores_by_id[sid] for sid in test_ids if observation_counts.get(sid) == 0 and sid in eur_ids and sid in test_scores_by_id])
+                    one_h_eur = np.array([test_scores_by_id[sid] for sid in test_ids if observation_counts.get(sid) == 1 and sid in eur_ids and sid in test_scores_by_id])
+                    _run_auc_test("EUR only", zero_h_eur, one_h_eur, results, "test_holdout_icd01_eur")
+
+            # Survey self-report on held-out
+            if survey_positive:
+                test_id_set = set(test_ids.tolist())
+                controls_or_missing_h = {sid for sid in test_id_set if observation_counts.get(sid, 0) <= 1}
+                missing_ehr_h = test_id_set - set(observation_counts.keys())
+                pool_h = controls_or_missing_h | missing_ehr_h
+                pos_ids_h = pool_h & survey_positive
+                neg_ids_h = pool_h - survey_positive
+                pos_arr_h = np.array([test_scores_by_id[sid] for sid in pos_ids_h if sid in test_scores_by_id])
+                neg_arr_h = np.array([test_scores_by_id[sid] for sid in neg_ids_h if sid in test_scores_by_id])
+                if pos_arr_h.size >= 10 and neg_arr_h.size >= 10:
+                    log("  Survey self-report (held-out):")
+                    _run_auc_test("ALL", neg_arr_h, pos_arr_h, results, "test_holdout_survey_all")
+                    if eur_ids:
+                        pos_eur_h = np.array([test_scores_by_id[sid] for sid in pos_ids_h if sid in eur_ids and sid in test_scores_by_id])
+                        neg_eur_h = np.array([test_scores_by_id[sid] for sid in neg_ids_h if sid in eur_ids and sid in test_scores_by_id])
+                        _run_auc_test("EUR only", neg_eur_h, pos_eur_h, results, "test_holdout_survey_eur")
+    else:
+        log("")
+        log(f"  (no test_predictions.tsv.gz found at {test_predictions_path} — held-out battery skipped)")
+
     # Save
     eval_output = work_dir / f"{disease}.evaluation.json"
     with open(eval_output, "w", encoding="utf-8") as handle:
