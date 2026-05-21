@@ -932,17 +932,46 @@ def _try_upload_int8_parallel_memmap(
     events: list[Any] = [None] * effective_workers
     errors: list[BaseException] = []
 
+    runtime = getattr(getattr(cupy, "cuda", None), "runtime", None)
+    memcpy_async = getattr(runtime, "memcpyAsync", None) if runtime is not None else None
+    memcpy_h2d_kind = getattr(runtime, "memcpyHostToDevice", None) if runtime is not None else None
+    direct_h2d_supported = (
+        memcpy_async is not None
+        and memcpy_h2d_kind is not None
+        and hasattr(gpu_destination, "data")
+        and hasattr(getattr(gpu_destination, "data", None), "ptr")
+    )
+
     def worker(worker_idx: int, col_start: int, col_end: int) -> None:
         try:
             src_view = matrix[:, src_col_start + col_start : src_col_start + col_end]
             # Forces parallel page faults + memcpy from page cache → pinned buffer.
             # numpy releases the GIL for this memcpy, so workers fan out across cores.
             pinned_buf[:, col_start:col_end] = src_view
+            stripe_bytes = int(sample_count) * (col_end - col_start)
             stream = streams[worker_idx]
-            with stream:
-                gpu_int8_dtype = getattr(cupy, "int8", np.int8)
-                staged_tile = cupy.asarray(pinned_buf[:, col_start:col_end], dtype=gpu_int8_dtype)
-                gpu_destination[:, col_start:col_end] = staged_tile
+            if direct_h2d_supported:
+                # Direct async H2D into the pre-allocated GPU destination slice.
+                # The naïve ``cupy.asarray(pinned_slice)`` route would allocate
+                # ``stripe_bytes`` of GPU staging per worker — at AoU sizes that
+                # is ~1.5 GB × 8 workers ≈ 12 GB on top of the 11.8 GB
+                # destination, OOM'ing a 15 GB T4. ``memcpyAsync`` writes
+                # straight into the F-order destination view: zero extra GPU
+                # allocation, identical bytes on-device.
+                gpu_view = gpu_destination[:, col_start:col_end]
+                host_slice = pinned_buf[:, col_start:col_end]
+                memcpy_async(
+                    int(gpu_view.data.ptr),
+                    int(host_slice.ctypes.data),
+                    int(stripe_bytes),
+                    memcpy_h2d_kind,
+                    int(stream.ptr),
+                )
+            else:
+                with stream:
+                    gpu_int8_dtype = getattr(cupy, "int8", np.int8)
+                    staged_tile = cupy.asarray(pinned_buf[:, col_start:col_end], dtype=gpu_int8_dtype)
+                    gpu_destination[:, col_start:col_end] = staged_tile
             events[worker_idx] = stream.record()
         except BaseException as exc:  # noqa: BLE001 - reraised on main thread
             errors.append(exc)

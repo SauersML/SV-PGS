@@ -2152,3 +2152,126 @@ def test_try_upload_int8_parallel_memmap_rejects_non_memmap_and_noncontiguous(tm
         gpu_destination=dst2,
         sample_count=16,
     ) is False
+
+
+def test_try_upload_int8_parallel_memmap_uses_direct_h2d_no_staging(tmp_path):
+    """Verify the OOM-avoiding direct H2D path.
+
+    When ``cupy.cuda.runtime.memcpyAsync`` is available, the fast upload must
+    write straight into the pre-allocated GPU destination slice instead of
+    allocating an intermediate ``staged_tile = cupy.asarray(pinned)`` per
+    worker. The naïve staging path peaks at ``n_workers × stripe_bytes`` of
+    GPU memory on top of the destination — at AoU sizes that's ~12 GB extra,
+    which OOMs a T4. This test fails loudly (via an explicit raise) if the
+    worker ever takes the ``cupy.asarray(pinned)`` fallback when memcpyAsync
+    is available.
+    """
+    rng = np.random.default_rng(31337)
+    n_samples = 96
+    n_variants = 48
+    src = np.asfortranarray(rng.integers(-1, 3, size=(n_samples, n_variants), dtype=np.int8))
+    cache_path = tmp_path / "raw_i8.npy"
+    np.save(cache_path, src)
+    mmap_array = np.load(cache_path, mmap_mode="r")
+    raw = Int8RawGenotypeMatrix(mmap_array)
+
+    class _FakeGpuArray:
+        """Minimal cupy-like ndarray backed by numpy bytes + a pointer to them."""
+        def __init__(self, np_array: np.ndarray) -> None:
+            self._arr = np.ascontiguousarray(np_array, dtype=np.int8) if not np_array.flags.f_contiguous else np_array
+            class _Data:
+                def __init__(self, arr: np.ndarray) -> None:
+                    self.ptr = arr.ctypes.data
+            self.data = _Data(self._arr)
+            self.shape = self._arr.shape
+            self.dtype = self._arr.dtype
+            self.flags = self._arr.flags
+
+        def __getitem__(self, key):
+            view = self._arr[key]
+            wrapped = _FakeGpuArray.__new__(_FakeGpuArray)
+            wrapped._arr = view
+            class _Data:
+                def __init__(self, arr: np.ndarray) -> None:
+                    self.ptr = arr.ctypes.data
+            wrapped.data = _Data(view)
+            wrapped.shape = view.shape
+            wrapped.dtype = view.dtype
+            wrapped.flags = view.flags
+            return wrapped
+
+    fake_gpu_dst_np = np.zeros((n_samples, n_variants), dtype=np.int8, order="F")
+    fake_gpu_dst = _FakeGpuArray(fake_gpu_dst_np)
+
+    memcpy_calls: list[tuple[int, int]] = []
+
+    def _memcpy_async(dst_ptr: int, src_ptr: int, size: int, kind: int, stream_ptr: int) -> None:
+        memcpy_calls.append((int(dst_ptr), int(size)))
+        # Emulate the device copy: copy ``size`` bytes from src to dst host pointers.
+        import ctypes
+        ctypes.memmove(int(dst_ptr), int(src_ptr), int(size))
+
+    class _FakeRuntime:
+        memcpyHostToDevice = 1
+        memcpyAsync = staticmethod(_memcpy_async)
+
+    class _FakeStream:
+        def __init__(self) -> None:
+            self.ptr = 0
+        def __enter__(self) -> "_FakeStream":
+            return self
+        def __exit__(self, *args) -> None:
+            return None
+        def record(self):
+            class _Evt:
+                def synchronize(self) -> None:
+                    return None
+            return _Evt()
+
+    class _FakeCuda:
+        runtime = _FakeRuntime()
+
+        @staticmethod
+        def alloc_pinned_memory(nbytes: int) -> Any:
+            return bytearray(int(nbytes))
+
+        @staticmethod
+        def Device():
+            class _Dev:
+                def synchronize(self) -> None:
+                    return None
+            return _Dev()
+
+        @staticmethod
+        def Stream(non_blocking: bool = False) -> _FakeStream:
+            return _FakeStream()
+
+    class _FakeCupy:
+        int8 = np.int8
+        cuda = _FakeCuda()
+
+        @staticmethod
+        def asarray(array, dtype=None):
+            raise AssertionError(
+                "direct memcpyAsync path must not call cupy.asarray(pinned_slice) — "
+                "the staging-buffer fallback would peak at n_workers × stripe_bytes "
+                "of extra GPU memory and OOM the device."
+            )
+
+        @staticmethod
+        def empty(shape, dtype=None, order=None):
+            return _FakeGpuArray(np.zeros(shape, dtype=dtype, order="F" if order is None else order))
+
+    assert genotype_module._try_upload_int8_parallel_memmap(
+        cupy=_FakeCupy(),
+        raw=raw,
+        variant_indices=np.arange(n_variants, dtype=np.int32),
+        gpu_destination=fake_gpu_dst,
+        sample_count=n_samples,
+        n_workers=4,
+    ) is True
+    # Direct H2D path executed exactly once per worker, with the full stripe
+    # bytes going straight into the destination slice — no staging buffer.
+    assert len(memcpy_calls) == 4
+    assert sum(size for _, size in memcpy_calls) == n_samples * n_variants
+    np.testing.assert_array_equal(fake_gpu_dst_np, src)

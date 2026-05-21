@@ -965,7 +965,7 @@ class BayesianPGS:
                         validation_genotype_matrix.try_cache_persistently(validation_int8_cache_path)
                 materialize_validation = (
                     not validation_is_holdout_only
-                    or bool(self.config.validate_first_iteration)
+                    or bool(getattr(self.config, "validate_first_iteration", True))
                     or int(self.config.validation_interval) < int(self.config.max_outer_iterations)
                 )
                 if materialize_validation:
