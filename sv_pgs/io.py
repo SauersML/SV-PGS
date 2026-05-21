@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import base64
+import binascii
 import csv
 import gzip
 import hashlib
@@ -1251,6 +1253,16 @@ _VCF_CACHE_STATS_DTYPE = np.dtype(
         ("support_counts", "<i4"),
     ]
 )
+_PLINK_INT8_PROGRESS_SCHEMA = 1
+
+
+@dataclass(slots=True)
+class _PlinkInt8ResumeState:
+    variants_committed: int
+    sums: np.ndarray
+    non_missing_counts: np.ndarray
+    support_counts: np.ndarray
+    centered_sum_squares: np.ndarray
 
 
 @dataclass(slots=True)
@@ -1267,12 +1279,45 @@ class _StreamingInt8NpyWriter:
         path.parent.mkdir(parents=True, exist_ok=True)
         handle = path.open("wb")
         try:
-            handle.write(_int8_npy_header_bytes(shape, fortran_order=fortran_order))
+            header = _int8_npy_header_bytes(shape, fortran_order=fortran_order)
+            handle.write(header)
+            handle.truncate(len(header) + int(np.prod(shape, dtype=np.int64)))
         except BaseException:
             handle.close()
             path.unlink(missing_ok=True)
             raise
         return cls(path=path, shape=shape, fortran_order=fortran_order, _handle=handle)
+
+    @classmethod
+    def resume(
+        cls,
+        path: Path,
+        *,
+        shape: tuple[int, int],
+        fortran_order: bool,
+        written_variants: int,
+    ) -> _StreamingInt8NpyWriter:
+        if not fortran_order:
+            raise ValueError("PLINK int8 cache resume requires Fortran-order layout.")
+        header = _int8_npy_header_bytes(shape, fortran_order=fortran_order)
+        expected_offset = len(header) + int(written_variants) * int(shape[0])
+        handle = path.open("r+b")
+        try:
+            if handle.read(len(header)) != header:
+                raise ValueError("PLINK int8 cache temp header does not match progress manifest.")
+            if path.stat().st_size < expected_offset:
+                raise ValueError("PLINK int8 cache temp is shorter than committed progress.")
+            handle.seek(expected_offset)
+        except BaseException:
+            handle.close()
+            raise
+        return cls(
+            path=path,
+            shape=shape,
+            fortran_order=fortran_order,
+            _handle=handle,
+            _written_variants=int(written_variants),
+        )
 
     def write_columns(self, values: np.ndarray) -> None:
         if self._closed:
@@ -1295,6 +1340,12 @@ class _StreamingInt8NpyWriter:
             self._handle.write(np.ascontiguousarray(batch).tobytes(order="C"))
         self._written_variants = next_written
 
+    def flush(self) -> None:
+        if self._closed:
+            raise ValueError("Cannot flush a closed int8 cache writer.")
+        self._handle.flush()
+        os.fsync(self._handle.fileno())
+
     def close(self) -> None:
         if self._closed:
             return
@@ -1315,6 +1366,211 @@ class _StreamingInt8NpyWriter:
             self._closed = True
             self._handle.close()
         self.path.unlink(missing_ok=True)
+
+    def preserve_partial(self) -> None:
+        if not self._closed:
+            self._closed = True
+            self._handle.close()
+
+
+def _plink_int8_progress_path(int8_path: Path) -> Path:
+    return int8_path.with_suffix(".progress.json")
+
+
+def _plink_int8_cache_key_from_path(int8_path: Path) -> str:
+    return int8_path.stem.removeprefix("plink_int8_")
+
+
+def _encode_plink_progress_array(values: np.ndarray, *, dtype: np.dtype, count: int) -> dict[str, Any]:
+    array = np.ascontiguousarray(np.asarray(values[:count], dtype=dtype))
+    return {
+        "dtype": array.dtype.str,
+        "shape": [int(array.shape[0])],
+        "data": base64.b64encode(array.tobytes(order="C")).decode("ascii"),
+    }
+
+
+def _decode_plink_progress_array(payload: object, *, dtype: np.dtype, count: int) -> np.ndarray:
+    if not isinstance(payload, dict):
+        raise ValueError("progress array payload must be an object.")
+    expected_dtype = np.dtype(dtype)
+    if payload.get("dtype") != expected_dtype.str:
+        raise ValueError("progress array dtype mismatch.")
+    if payload.get("shape") != [int(count)]:
+        raise ValueError("progress array shape mismatch.")
+    raw_data = payload.get("data")
+    if not isinstance(raw_data, str):
+        raise ValueError("progress array data must be a string.")
+    try:
+        decoded = base64.b64decode(raw_data.encode("ascii"), validate=True)
+    except (binascii.Error, ValueError) as exc:
+        raise ValueError("progress array data is not valid base64.") from exc
+    array = np.frombuffer(decoded, dtype=expected_dtype)
+    if array.shape[0] != int(count):
+        raise ValueError("progress array byte length mismatch.")
+    return array.copy()
+
+
+def _fsync_parent_dir(path: Path) -> None:
+    try:
+        dir_fd = os.open(path.parent, os.O_RDONLY)
+    except OSError:
+        return
+    try:
+        os.fsync(dir_fd)
+    finally:
+        os.close(dir_fd)
+
+
+def _write_plink_int8_progress(
+    progress_path: Path,
+    *,
+    cache_key: str,
+    n_samples: int,
+    n_variants: int,
+    fortran_order: bool,
+    variants_committed: int,
+    sums: np.ndarray,
+    non_missing_counts: np.ndarray,
+    support_counts: np.ndarray,
+    centered_sum_squares: np.ndarray,
+) -> None:
+    count = int(variants_committed)
+    progress_path.parent.mkdir(parents=True, exist_ok=True)
+    manifest = {
+        "schema": _PLINK_INT8_PROGRESS_SCHEMA,
+        "cache_key": cache_key,
+        "dtype": "int8",
+        "n_samples": int(n_samples),
+        "n_variants": int(n_variants),
+        "fortran_order": bool(fortran_order),
+        "variants_committed": count,
+        "partial_stats": {
+            "sums": _encode_plink_progress_array(sums, dtype=np.dtype(np.float64), count=count),
+            "non_missing_counts": _encode_plink_progress_array(
+                non_missing_counts, dtype=np.dtype(np.int32), count=count,
+            ),
+            "support_counts": _encode_plink_progress_array(support_counts, dtype=np.dtype(np.int32), count=count),
+            "centered_sum_squares": _encode_plink_progress_array(
+                centered_sum_squares, dtype=np.dtype(np.float64), count=count,
+            ),
+        },
+    }
+    tmp_path = progress_path.with_name(progress_path.name + ".tmp")
+    with tmp_path.open("w", encoding="utf-8") as handle:
+        json.dump(manifest, handle, separators=(",", ":"))
+        handle.write("\n")
+        handle.flush()
+        os.fsync(handle.fileno())
+    tmp_path.replace(progress_path)
+    _fsync_parent_dir(progress_path)
+
+
+def _load_plink_int8_progress(
+    progress_path: Path,
+    int8_tmp_path: Path,
+    *,
+    cache_key: str,
+    n_samples: int,
+    n_variants: int,
+    fortran_order: bool,
+) -> _PlinkInt8ResumeState:
+    manifest = json.loads(progress_path.read_text(encoding="utf-8"))
+    if not isinstance(manifest, dict):
+        raise ValueError("progress manifest must be an object.")
+    if manifest.get("schema") != _PLINK_INT8_PROGRESS_SCHEMA:
+        raise ValueError("progress manifest schema mismatch.")
+    if manifest.get("cache_key") != cache_key:
+        raise ValueError("progress manifest cache key mismatch.")
+    if manifest.get("dtype") != "int8":
+        raise ValueError("progress manifest dtype mismatch.")
+    if int(manifest.get("n_samples", -1)) != int(n_samples):
+        raise ValueError("progress manifest sample count mismatch.")
+    if int(manifest.get("n_variants", -1)) != int(n_variants):
+        raise ValueError("progress manifest variant count mismatch.")
+    if manifest.get("fortran_order") is not bool(fortran_order):
+        raise ValueError("progress manifest layout mismatch.")
+    variants_committed = int(manifest.get("variants_committed", -1))
+    if variants_committed < 0 or variants_committed > int(n_variants):
+        raise ValueError("progress manifest committed variant count is out of range.")
+    header = _int8_npy_header_bytes((int(n_samples), int(n_variants)), fortran_order=fortran_order)
+    expected_size = len(header) + variants_committed * int(n_samples)
+    if not int8_tmp_path.exists():
+        raise ValueError("progress manifest has no matching temp int8 cache.")
+    if int8_tmp_path.stat().st_size < expected_size:
+        raise ValueError("temp int8 cache is shorter than committed progress.")
+    with int8_tmp_path.open("rb") as handle:
+        if handle.read(len(header)) != header:
+            raise ValueError("temp int8 cache header mismatch.")
+    partial_stats = manifest.get("partial_stats")
+    if not isinstance(partial_stats, dict):
+        raise ValueError("progress manifest partial_stats missing.")
+    return _PlinkInt8ResumeState(
+        variants_committed=variants_committed,
+        sums=_decode_plink_progress_array(
+            partial_stats.get("sums"), dtype=np.dtype(np.float64), count=variants_committed,
+        ),
+        non_missing_counts=_decode_plink_progress_array(
+            partial_stats.get("non_missing_counts"), dtype=np.dtype(np.int32), count=variants_committed,
+        ),
+        support_counts=_decode_plink_progress_array(
+            partial_stats.get("support_counts"), dtype=np.dtype(np.int32), count=variants_committed,
+        ),
+        centered_sum_squares=_decode_plink_progress_array(
+            partial_stats.get("centered_sum_squares"), dtype=np.dtype(np.float64), count=variants_committed,
+        ),
+    )
+
+
+def _discard_plink_int8_progress(int8_tmp_path: Path, progress_path: Path) -> None:
+    int8_tmp_path.unlink(missing_ok=True)
+    progress_path.unlink(missing_ok=True)
+    progress_path.with_name(progress_path.name + ".tmp").unlink(missing_ok=True)
+
+
+def _try_finalize_completed_plink_int8_progress(
+    int8_path: Path,
+    int8_tmp_path: Path,
+    progress_path: Path,
+    *,
+    cache_key: str,
+    n_samples: int,
+    n_variants: int,
+    fortran_order: bool,
+) -> bool:
+    try:
+        resume_state = _load_plink_int8_progress(
+            progress_path,
+            int8_tmp_path,
+            cache_key=cache_key,
+            n_samples=n_samples,
+            n_variants=n_variants,
+            fortran_order=fortran_order,
+        )
+        if resume_state.variants_committed != int(n_variants):
+            return False
+        writer = _StreamingInt8NpyWriter.resume(
+            int8_tmp_path,
+            shape=(int(n_samples), int(n_variants)),
+            fortran_order=fortran_order,
+            written_variants=resume_state.variants_committed,
+        )
+        writer.close()
+        int8_tmp_path.replace(int8_path)
+        progress_path.unlink(missing_ok=True)
+        progress_path.with_name(progress_path.name + ".tmp").unlink(missing_ok=True)
+        _fsync_parent_dir(int8_path)
+        log(
+            f"  PLINK int8 cache finalized from completed progress "
+            f"({int8_path.stat().st_size / 1e9:.1f} GB) → {int8_path.name}  mem={mem()}"
+        )
+        return True
+    except (OSError, ValueError, KeyError, TypeError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        log(f"  PLINK int8 cache progress unusable ({exc!r}); restarting int8 cache build")
+        _discard_plink_int8_progress(int8_tmp_path, progress_path)
+        return False
+
+
 _VCF_CACHE_VARIANT_NUMERIC_DTYPE = np.dtype(
     [
         ("variant_class_code", "<u2"),
@@ -1691,6 +1947,15 @@ def compute_plink_variant_statistics_cached(
     """
     stats_path = _plink_stats_cache_path(bed_path, sample_indices, config)
     int8_path = _plink_int8_cache_path(bed_path, sample_indices, config)
+    int8_tmp_path = int8_path.with_suffix(".tmp.npy")
+    progress_path = _plink_int8_progress_path(int8_path)
+    cache_key = _plink_int8_cache_key_from_path(int8_path)
+    n_samples = int(raw_genotypes.shape[0])
+    n_variants = int(raw_genotypes.shape[1])
+    # Only tee the int8 cache for genuinely large PLINK sources. Small ones
+    # (test fixtures, toy datasets) don't benefit from the cache and would
+    # complicate the calling tests that monkeypatch compute_variant_statistics.
+    int8_eligible = n_samples * n_variants >= _PLINK_INT8_CACHE_MIN_CELLS
     cached_stats = _load_plink_stats_from_cache(stats_path)
     if cached_stats is not None:
         log(
@@ -1698,41 +1963,77 @@ def compute_plink_variant_statistics_cached(
             f"({cached_stats.means.shape[0]:,} variants)  mem={mem()}"
         )
         if int8_path.exists():
+            _discard_plink_int8_progress(int8_tmp_path, progress_path)
             log(
                 f"  PLINK int8 cache also present: {int8_path.name} "
                 f"({int8_path.stat().st_size / 1e9:.1f} GB) — downstream passes "
                 f"will mmap it instead of re-decoding bed bytes"
             )
             return cached_stats, int8_path
-        return cached_stats, None
-    log(f"  PLINK stats cache miss: computing fresh and writing {stats_path.name}")
-    n_samples = int(raw_genotypes.shape[0])
-    n_variants = int(raw_genotypes.shape[1])
-    # Only tee the int8 cache for genuinely large PLINK sources. Small ones
-    # (test fixtures, toy datasets) don't benefit from the cache and would
-    # complicate the calling tests that monkeypatch compute_variant_statistics.
-    int8_eligible = n_samples * n_variants >= _PLINK_INT8_CACHE_MIN_CELLS
+        if int8_eligible and progress_path.exists():
+            if _try_finalize_completed_plink_int8_progress(
+                int8_path,
+                int8_tmp_path,
+                progress_path,
+                cache_key=cache_key,
+                n_samples=n_samples,
+                n_variants=n_variants,
+                fortran_order=True,
+            ):
+                return cached_stats, int8_path
+            if progress_path.exists():
+                log("  PLINK stats cache hit but int8 cache progress is incomplete; resuming int8 build")
+            else:
+                log("  PLINK stats cache hit but int8 cache progress was unusable; rebuilding int8 cache")
+        else:
+            return cached_stats, None
+    else:
+        log(f"  PLINK stats cache miss: computing fresh and writing {stats_path.name}")
+    resume_state: _PlinkInt8ResumeState | None = None
     int8_cache_writer: _StreamingInt8NpyWriter | None = None
-    int8_tmp_path: Path | None = None
     if int8_eligible:
-        int8_tmp_path = int8_path.with_suffix(".tmp.npy")
         int8_path.parent.mkdir(parents=True, exist_ok=True)
-        has_space, required_bytes, available_bytes = _has_sufficient_free_space_for_int8_npy(
-            int8_path.parent,
-            (n_samples, n_variants),
-            fortran_order=True,
-        )
-        if not has_space:
-            raise OSError(
-                "Insufficient free space for PLINK int8 cache: "
-                + f"need at least {required_bytes / 1e9:.1f} GB plus reserve, "
-                + f"free {available_bytes / 1e9:.1f} GB at {int8_path.parent}"
+        if progress_path.exists():
+            try:
+                resume_state = _load_plink_int8_progress(
+                    progress_path,
+                    int8_tmp_path,
+                    cache_key=cache_key,
+                    n_samples=n_samples,
+                    n_variants=n_variants,
+                    fortran_order=True,
+                )
+            except (OSError, ValueError, KeyError, TypeError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+                log(f"  PLINK int8 cache progress unusable ({exc!r}); restarting int8 cache build")
+                _discard_plink_int8_progress(int8_tmp_path, progress_path)
+        if resume_state is None:
+            has_space, required_bytes, available_bytes = _has_sufficient_free_space_for_int8_npy(
+                int8_path.parent,
+                (n_samples, n_variants),
+                fortran_order=True,
             )
-        int8_cache_writer = _StreamingInt8NpyWriter.open(
-            int8_tmp_path,
-            shape=(n_samples, n_variants),
-            fortran_order=True,
-        )
+            if not has_space:
+                raise OSError(
+                    "Insufficient free space for PLINK int8 cache: "
+                    + f"need at least {required_bytes / 1e9:.1f} GB plus reserve, "
+                    + f"free {available_bytes / 1e9:.1f} GB at {int8_path.parent}"
+                )
+            int8_cache_writer = _StreamingInt8NpyWriter.open(
+                int8_tmp_path,
+                shape=(n_samples, n_variants),
+                fortran_order=True,
+            )
+        else:
+            int8_cache_writer = _StreamingInt8NpyWriter.resume(
+                int8_tmp_path,
+                shape=(n_samples, n_variants),
+                fortran_order=True,
+                written_variants=resume_state.variants_committed,
+            )
+            log(
+                f"  resuming PLINK int8 cache at {int8_tmp_path.name}: "
+                f"{resume_state.variants_committed:,}/{n_variants:,} variants committed"
+            )
         expected_gb = n_samples * n_variants / 1e9
         log(
             f"  building PLINK int8 cache at {int8_tmp_path.name} "
@@ -1742,21 +2043,21 @@ def compute_plink_variant_statistics_cached(
 
     try:
         variant_stats = _compute_variant_stats_teeing_int8(
-            raw_genotypes, config=config, int8_cache_writer=int8_cache_writer,
+            raw_genotypes,
+            config=config,
+            int8_cache_writer=int8_cache_writer,
+            resume_state=resume_state,
+            progress_path=progress_path if int8_cache_writer is not None else None,
+            cache_key=cache_key,
         )
     except BaseException:
         if int8_cache_writer is not None:
-            int8_cache_writer.abort()
+            int8_cache_writer.preserve_partial()
         raise
 
-    if int8_cache_writer is not None and int8_tmp_path is not None:
+    if int8_cache_writer is not None:
         try:
             int8_cache_writer.close()
-            int8_tmp_path.replace(int8_path)
-            log(
-                f"  PLINK int8 cache saved ({int8_path.stat().st_size / 1e9:.1f} GB) → "
-                f"{int8_path.name}  mem={mem()}"
-            )
         except (OSError, ValueError) as exc:
             int8_cache_writer.abort()
             raise OSError(f"PLINK int8 cache finalize failed: {exc!r}") from exc
@@ -1765,6 +2066,21 @@ def compute_plink_variant_statistics_cached(
         log(f"  PLINK stats cache saved ({stats_path.stat().st_size / 1e6:.1f} MB)  mem={mem()}")
     except OSError as exc:
         log(f"  PLINK stats cache write failed ({exc!r}); continuing without cache")
+    if int8_cache_writer is not None:
+        if stats_path.exists():
+            try:
+                int8_tmp_path.replace(int8_path)
+                progress_path.unlink(missing_ok=True)
+                progress_path.with_name(progress_path.name + ".tmp").unlink(missing_ok=True)
+                _fsync_parent_dir(int8_path)
+                log(
+                    f"  PLINK int8 cache saved ({int8_path.stat().st_size / 1e9:.1f} GB) → "
+                    f"{int8_path.name}  mem={mem()}"
+                )
+            except OSError as exc:
+                raise OSError(f"PLINK int8 cache finalize failed: {exc!r}") from exc
+        else:
+            log("  PLINK int8 cache left resumable because stats cache was not saved")
     return variant_stats, int8_path if int8_path.exists() else None
 
 
@@ -1773,6 +2089,9 @@ def _compute_variant_stats_teeing_int8(
     *,
     config: ModelConfig,
     int8_cache_writer: _StreamingInt8NpyWriter | None,
+    resume_state: _PlinkInt8ResumeState | None = None,
+    progress_path: Path | None = None,
+    cache_key: str | None = None,
 ) -> VariantStatistics:
     """compute_variant_statistics + optional tee of each decoded batch.
 
@@ -1795,24 +2114,37 @@ def _compute_variant_stats_teeing_int8(
     non_missing_counts = np.zeros(variant_count, dtype=np.int32)
     support_counts = np.zeros(variant_count, dtype=np.int32)
     centered_sum_squares = np.zeros(variant_count, dtype=np.float64)
+    variants_done = 0
+    if resume_state is not None:
+        variants_done = int(resume_state.variants_committed)
+        sums[:variants_done] = resume_state.sums
+        non_missing_counts[:variants_done] = resume_state.non_missing_counts
+        support_counts[:variants_done] = resume_state.support_counts
+        centered_sum_squares[:variants_done] = resume_state.centered_sum_squares
     log(
         f"  variant-stats + int8-cache tee streaming pass: "
-        f"{sample_count:,} samples × {variant_count:,} variants  mem={mem()}"
+        f"{sample_count:,} samples × {variant_count:,} variants "
+        f"(starting at {variants_done:,})  mem={mem()}"
     )
     overall_start = _time.monotonic()
     cumulative_fetch = 0.0
     cumulative_compute = 0.0
     cumulative_tee = 0.0
     batch_number = 0
-    variants_done = 0
     # Pass the IO-budget-tuned batch size, NOT the PlinkRawGenotypeMatrix
     # default (which is the 1024-variant conservative fallback). For the AoU
     # PLINK array (~78k samples) this picks 6,435 variants/batch — same as
     # compute_variant_statistics would, so disk latency amortizes across a
     # 500 MB read instead of an 80 MB one (6x fewer round-trips).
     tuned_batch_size = auto_batch_size_i8(sample_count)
-    iter_handle = iter(raw_genotypes.iter_column_batches_i8(batch_size=tuned_batch_size))
-    max_in_flight_writes = 2
+    remaining_variant_indices = np.arange(variants_done, variant_count, dtype=np.int32)
+    if remaining_variant_indices.size == 0:
+        iter_handle = iter(())
+    else:
+        iter_handle = iter(raw_genotypes.iter_column_batches_i8(
+            remaining_variant_indices,
+            batch_size=tuned_batch_size,
+        ))
     in_flight_writes: deque[Future[None]] = deque()
 
     def wait_for_oldest_write() -> float:
@@ -1820,9 +2152,22 @@ def _compute_variant_stats_teeing_int8(
         in_flight_writes.popleft().result()
         return _time.monotonic() - wait_start
 
-    def collect_finished_writes() -> None:
-        while in_flight_writes and in_flight_writes[0].done():
-            wait_for_oldest_write()
+    def commit_progress() -> None:
+        if progress_path is None or cache_key is None:
+            return
+        int8_cache_writer.flush()
+        _write_plink_int8_progress(
+            progress_path,
+            cache_key=cache_key,
+            n_samples=sample_count,
+            n_variants=variant_count,
+            fortran_order=int8_cache_writer.fortran_order,
+            variants_committed=variants_done,
+            sums=sums,
+            non_missing_counts=non_missing_counts,
+            support_counts=support_counts,
+            centered_sum_squares=centered_sum_squares,
+        )
 
     with ThreadPoolExecutor(max_workers=1) as write_executor:
         try:
@@ -1840,9 +2185,6 @@ def _compute_variant_stats_teeing_int8(
                 expected_start = variants_done
                 if int(batch_indices[0]) != expected_start or not np.all(np.diff(batch_indices) == 1):
                     raise ValueError("PLINK int8 cache tee requires contiguous variant batches.")
-                collect_finished_writes()
-                if len(in_flight_writes) >= max_in_flight_writes:
-                    wait_for_oldest_write()
                 in_flight_writes.append(write_executor.submit(int8_cache_writer.write_columns, batch.values))
                 tee_seconds = _time.monotonic() - tee_start
                 # Stats compute on the JAX side.
@@ -1856,10 +2198,15 @@ def _compute_variant_stats_teeing_int8(
                 del batch_jax
                 compute_seconds = _time.monotonic() - compute_start
 
+                tee_wait_start = _time.monotonic()
+                while in_flight_writes:
+                    wait_for_oldest_write()
+                variants_done += batch_indices.shape[0]
+                commit_progress()
+                tee_seconds += _time.monotonic() - tee_wait_start
                 cumulative_fetch += fetch_seconds
                 cumulative_compute += compute_seconds
                 cumulative_tee += tee_seconds
-                variants_done += batch_indices.shape[0]
                 avg_wall = (cumulative_fetch + cumulative_compute + cumulative_tee) / max(batch_number, 1)
                 remaining = max((variant_count - variants_done), 0)
                 approx_remaining_batches = (remaining + batch_indices.shape[0] - 1) // max(batch_indices.shape[0], 1)

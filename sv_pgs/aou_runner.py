@@ -23,6 +23,7 @@ from sv_pgs.all_of_us import (
 )
 from sv_pgs.config import ModelConfig, TraitType
 from sv_pgs.io import load_multi_source_dataset_from_files
+from sv_pgs.model import register_fit_checkpoint_path
 from sv_pgs.pipeline import run_training_pipeline
 from sv_pgs.progress import log, mem
 
@@ -879,6 +880,9 @@ def run_all_of_us(
     )
     log(f"  SNOMED root: {disease_def.snomed_code} ({disease_def.snomed_concept_name})")
     log(f"  output: {work_dir}")
+    fit_checkpoint_path = work_dir / "fit_checkpoint.npz"
+    if fit_checkpoint_path.exists():
+        log(f"  warm-start checkpoint found: {fit_checkpoint_path} (will resume if compatible)")
     config = ModelConfig(
         max_outer_iterations=max_outer_iterations,
         random_seed=random_seed,
@@ -1166,6 +1170,7 @@ def run_all_of_us(
         # will re-create training records from variant_stats inside fit()
         gc.collect()
         log(f"  memory after gc: {mem()}")
+        register_fit_checkpoint_path(config, fit_checkpoint_path)
         run_training_pipeline(
             dataset=dataset,
             config=config,

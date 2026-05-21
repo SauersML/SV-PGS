@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import pickle
 import time
 from dataclasses import dataclass
@@ -104,6 +105,16 @@ class FittedState:
 _FIT_STAGE_CACHE_DIRNAME = ".sv_pgs_cache"
 _FIT_STAGE_CACHE_SUBDIR = "fit_stage"
 _FIT_STAGE_CACHE_VERSION = 4
+_FIT_CHECKPOINT_VERSION = 1
+_REGISTERED_FIT_CHECKPOINT_PATHS: dict[int, Path] = {}
+
+
+def register_fit_checkpoint_path(config: ModelConfig, checkpoint_path: str | Path) -> None:
+    _REGISTERED_FIT_CHECKPOINT_PATHS[id(config)] = Path(checkpoint_path)
+
+
+def _pop_registered_fit_checkpoint_path(config: ModelConfig) -> Path | None:
+    return _REGISTERED_FIT_CHECKPOINT_PATHS.pop(id(config), None)
 
 
 @dataclass(slots=True)
@@ -606,6 +617,148 @@ def _clear_variational_checkpoint(cache_paths: _FitStageCachePaths) -> None:
         cache_paths.em_checkpoint_path.unlink()
 
 
+def _fit_checkpoint_tmp_path(checkpoint_path: Path) -> Path:
+    return checkpoint_path.with_name(f"{checkpoint_path.stem}.tmp{checkpoint_path.suffix}")
+
+
+def _fit_checkpoint_config_hash(
+    *,
+    genotype_matrix: RawGenotypeMatrix,
+    covariates: np.ndarray,
+    targets: np.ndarray,
+    variant_records: Sequence[VariantRecord],
+    config: ModelConfig,
+) -> str:
+    hasher = hashlib.sha256()
+    hasher.update(f"fit-checkpoint-v{_FIT_CHECKPOINT_VERSION}".encode("utf-8"))
+    hasher.update(np.asarray(genotype_matrix.shape, dtype=np.int64).tobytes())
+    variant_hasher = hashlib.sha256()
+    for record in variant_records:
+        variant_payload = {
+            "id": record.variant_id,
+            "class": record.variant_class.value,
+            "chromosome": record.chromosome,
+            "position": int(record.position),
+            "length": float(record.length),
+            "allele_frequency": float(record.allele_frequency),
+            "quality": float(record.quality),
+            "training_support": None if record.training_support is None else int(record.training_support),
+            "is_repeat": bool(record.is_repeat),
+            "is_copy_number": bool(record.is_copy_number),
+            "prior_binary_features": record.prior_binary_features,
+            "prior_continuous_features": record.prior_continuous_features,
+            "prior_categorical_features": record.prior_categorical_features,
+            "prior_membership_features": record.prior_membership_features,
+            "prior_nested_features": record.prior_nested_features,
+            "prior_nested_membership_features": record.prior_nested_membership_features,
+            "prior_class_members": [member.value for member in record.prior_class_members],
+            "prior_class_membership": [float(weight) for weight in record.prior_class_membership],
+        }
+        variant_hasher.update(json.dumps(variant_payload, sort_keys=True).encode("utf-8"))
+        variant_hasher.update(b"\n")
+    hasher.update(variant_hasher.hexdigest().encode("utf-8"))
+    _update_hash_with_array_bytes(hasher, np.asarray(covariates, dtype=np.float32))
+    _update_hash_with_array_bytes(hasher, np.asarray(targets, dtype=np.float32).reshape(-1))
+    config_payload = {
+        "trait_type": config.trait_type.value,
+        "max_outer_iterations": int(config.max_outer_iterations),
+        "convergence_tolerance": float(config.convergence_tolerance),
+        "max_inner_newton_iterations": int(config.max_inner_newton_iterations),
+        "newton_gradient_tolerance": float(config.newton_gradient_tolerance),
+        "linear_solver_tolerance": float(config.linear_solver_tolerance),
+        "maximum_linear_solver_iterations": int(config.maximum_linear_solver_iterations),
+        "beta_variance_update_interval": int(config.beta_variance_update_interval),
+        "minimum_minor_allele_frequency": float(config.minimum_minor_allele_frequency),
+        "marginal_screen_min_abs_z": float(config.marginal_screen_min_abs_z),
+        "stochastic_variational_updates": bool(config.stochastic_variational_updates),
+        "stochastic_min_variant_count": int(config.stochastic_min_variant_count),
+        "stochastic_variant_batch_size": int(config.stochastic_variant_batch_size),
+        "posterior_working_set_min_variants": int(config.posterior_working_set_min_variants),
+        "posterior_working_set_initial_size": int(config.posterior_working_set_initial_size),
+        "posterior_working_set_growth": int(config.posterior_working_set_growth),
+        "posterior_working_set_max_passes": int(config.posterior_working_set_max_passes),
+        "posterior_working_set_coefficient_tolerance": float(config.posterior_working_set_coefficient_tolerance),
+        "sample_space_preconditioner_rank": int(config.sample_space_preconditioner_rank),
+        "random_seed": int(config.random_seed),
+    }
+    hasher.update(json.dumps(config_payload, sort_keys=True).encode("utf-8"))
+    return hasher.hexdigest()
+
+
+def _save_fit_checkpoint(
+    checkpoint_path: Path,
+    checkpoint: VariationalFitCheckpoint,
+    *,
+    config_hash: str,
+) -> None:
+    checkpoint_tmp = _fit_checkpoint_tmp_path(checkpoint_path)
+    try:
+        checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
+        checkpoint_bytes = np.frombuffer(
+            pickle.dumps(checkpoint, protocol=pickle.HIGHEST_PROTOCOL),
+            dtype=np.uint8,
+        )
+        np.savez(
+            checkpoint_tmp,
+            version=np.asarray([_FIT_CHECKPOINT_VERSION], dtype=np.int32),
+            iter=np.asarray([int(checkpoint.completed_iterations)], dtype=np.int32),
+            beta=np.asarray(checkpoint.beta_state, dtype=np.float64),
+            checkpoint_pickle=checkpoint_bytes,
+            config_hash=np.asarray(config_hash),
+        )
+        os.rename(checkpoint_tmp, checkpoint_path)
+        log(
+            "fit checkpoint saved: "
+            + f"{checkpoint_path} (completed_iterations={checkpoint.completed_iterations})"
+        )
+    except (OSError, pickle.PicklingError, ValueError) as exc:
+        try:
+            checkpoint_tmp.unlink(missing_ok=True)
+        except OSError:
+            pass
+        log(f"fit checkpoint save failed ({exc}); continuing without durable resume state")
+
+
+def _try_load_fit_checkpoint(
+    checkpoint_path: Path,
+    *,
+    config_hash: str,
+) -> VariationalFitCheckpoint | None:
+    if not checkpoint_path.exists():
+        return None
+    try:
+        with np.load(checkpoint_path, allow_pickle=False) as payload:
+            stored_hash = str(payload["config_hash"].item())
+            if stored_hash != config_hash:
+                log(f"fit checkpoint ignored: config hash mismatch at {checkpoint_path}")
+                return None
+            checkpoint_bytes = np.asarray(payload["checkpoint_pickle"], dtype=np.uint8).tobytes()
+        checkpoint = pickle.loads(checkpoint_bytes)
+        if not isinstance(checkpoint, VariationalFitCheckpoint):
+            raise ValueError("fit checkpoint has unexpected type.")
+        log(
+            "fit checkpoint restored: "
+            + f"{checkpoint_path} (completed_iterations={checkpoint.completed_iterations})"
+        )
+        return checkpoint
+    except (OSError, pickle.UnpicklingError, ValueError, EOFError, AttributeError, KeyError) as exc:
+        log(f"fit checkpoint load failed ({exc}); discarding stale checkpoint")
+        try:
+            checkpoint_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+        return None
+
+
+def _clear_fit_checkpoint(checkpoint_path: Path | None) -> None:
+    if checkpoint_path is None:
+        return
+    try:
+        checkpoint_path.unlink(missing_ok=True)
+    except OSError:
+        pass
+
+
 class BayesianPGS:
     """Main entry point for fitting and applying a Bayesian Polygenic Score.
 
@@ -639,9 +792,14 @@ class BayesianPGS:
         variant_stats: VariantStatistics | None = None,
         per_epoch_eval_callback: Callable[[dict[str, Any]], None] | None = None,
         validation_is_holdout_only: bool = False,
+        fit_checkpoint_path: str | Path | None = None,
     ) -> BayesianPGS:
         from sv_pgs.genotype import require_gpu
         require_gpu()
+        registered_fit_checkpoint_path = _pop_registered_fit_checkpoint_path(self.config)
+        if fit_checkpoint_path is None:
+            fit_checkpoint_path = registered_fit_checkpoint_path
+        durable_fit_checkpoint_path = None if fit_checkpoint_path is None else Path(fit_checkpoint_path)
         log(f"=== MODEL FIT START ===  genotypes={genotypes.shape}  covariates={covariates.shape}  targets={targets.shape}  pre_computed_stats={'YES' if variant_stats else 'NO'}")
         raw_genotype_matrix = as_raw_genotype_matrix(genotypes)
         _validate_fit_inputs(
@@ -661,6 +819,15 @@ class BayesianPGS:
             log(tuning_summary)
         covariate_matrix = self._with_intercept(covariates)
         total_variant_count = len(variant_records)
+        fit_checkpoint_config_hash = None
+        if durable_fit_checkpoint_path is not None:
+            fit_checkpoint_config_hash = _fit_checkpoint_config_hash(
+                genotype_matrix=raw_genotype_matrix,
+                covariates=covariate_matrix,
+                targets=np.asarray(targets, dtype=np.float32).reshape(-1),
+                variant_records=full_variant_records,
+                config=self.config,
+            )
         log(f"normalized full variant records: {total_variant_count:,}  mem={mem()}")
         fit_stage_variant_stats_cache_path = _fit_stage_variant_stats_cache_path(
             raw_genotype_matrix,
@@ -805,6 +972,7 @@ class BayesianPGS:
             )
             if fit_stage_cache_paths is not None:
                 _clear_variational_checkpoint(fit_stage_cache_paths)
+            _clear_fit_checkpoint(durable_fit_checkpoint_path)
             log(f"coefficients: 0 non-zero out of {total_variant_count} total")
             log(f"=== MODEL FIT DONE ===  mem={mem()}")
             return self
@@ -1000,20 +1168,56 @@ class BayesianPGS:
             f"on_gpu={reduced_genotypes._cupy_cache is not None}  "
             f"mem={mem()}"
         )
+        em_validation_data = reduced_validation
+        em_per_epoch_eval_callback = per_epoch_eval_callback
+        em_validation_is_holdout_only = validation_is_holdout_only
+        if durable_fit_checkpoint_path is not None and reduced_validation is not None:
+            if validation_is_holdout_only:
+                log(
+                    "  fit checkpoint enabled; held-out validation monitoring is disabled during EM "
+                    "so checkpoint/resume remains active"
+                )
+                em_validation_data = None
+                em_per_epoch_eval_callback = None
+                em_validation_is_holdout_only = False
+            else:
+                log("  fit checkpoint disabled because validation data drives EM model selection")
+                durable_fit_checkpoint_path = None
+                fit_checkpoint_config_hash = None
         log("  checking for EM checkpoint to resume from...")
-        resume_checkpoint = (
-            None
-            if fit_stage_cache_paths is None
-            else _try_load_variational_checkpoint(fit_stage_cache_paths)
-        )
+        resume_checkpoint = None
+        if durable_fit_checkpoint_path is not None and fit_checkpoint_config_hash is not None:
+            resume_checkpoint = _try_load_fit_checkpoint(
+                durable_fit_checkpoint_path,
+                config_hash=fit_checkpoint_config_hash,
+            )
+        if resume_checkpoint is None and durable_fit_checkpoint_path is None:
+            resume_checkpoint = (
+                None
+                if fit_stage_cache_paths is None
+                else _try_load_variational_checkpoint(fit_stage_cache_paths)
+            )
         log(f"  EM checkpoint: {'found — resuming' if resume_checkpoint else 'none — starting fresh'}")
         checkpoint_callback: Callable[[VariationalFitCheckpoint], None] | None
-        if fit_stage_cache_paths is not None:
+        if fit_stage_cache_paths is not None or (
+            durable_fit_checkpoint_path is not None and fit_checkpoint_config_hash is not None
+        ):
             cache_paths_for_callback = fit_stage_cache_paths
+            checkpoint_path_for_callback = durable_fit_checkpoint_path
+            checkpoint_hash_for_callback = fit_checkpoint_config_hash
 
             def _checkpoint_callback(checkpoint: VariationalFitCheckpoint) -> None:
-                _save_variational_checkpoint(cache_paths_for_callback, checkpoint)
+                if checkpoint_path_for_callback is not None and checkpoint_hash_for_callback is not None:
+                    _save_fit_checkpoint(
+                        checkpoint_path_for_callback,
+                        checkpoint,
+                        config_hash=checkpoint_hash_for_callback,
+                    )
+                if cache_paths_for_callback is not None:
+                    _save_variational_checkpoint(cache_paths_for_callback, checkpoint)
                 if int(self.config.sample_space_preconditioner_rank) <= 0:
+                    return
+                if cache_paths_for_callback is None:
                     return
                 basis_path = _sample_space_basis_cache_path(
                     cache_paths_for_callback,
@@ -1039,13 +1243,13 @@ class BayesianPGS:
             records=active_records,
             tie_map=reduced_tie_map,
             config=self.config,
-            validation_data=reduced_validation,
+            validation_data=em_validation_data,
             resume_checkpoint=resume_checkpoint,
             checkpoint_callback=checkpoint_callback,
             predictor_offset=None,
             validation_offset=None,
-            per_epoch_eval_callback=per_epoch_eval_callback,
-            validation_is_holdout_only=validation_is_holdout_only,
+            per_epoch_eval_callback=em_per_epoch_eval_callback,
+            validation_is_holdout_only=em_validation_is_holdout_only,
         )
         if fit_stage_cache_paths is not None:
             _clear_variational_checkpoint(fit_stage_cache_paths)
@@ -1056,6 +1260,9 @@ class BayesianPGS:
                     rank=int(self.config.sample_space_preconditioner_rank),
                     random_seed=int(self.config.random_seed),
                 )
+        # Final artifacts are the durable completion marker; remove iteration
+        # state so the next identical run starts from completed outputs.
+        _clear_fit_checkpoint(durable_fit_checkpoint_path)
         final_obj = fit_result.objective_history[-1]
         if fit_result.converged:
             log(
