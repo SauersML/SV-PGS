@@ -16,4 +16,6 @@ cd "$REPO_DIR"
 if [ ! -x ".venv/bin/python" ]; then
   uv sync --python 3.12 --extra gpu
 fi
-uv run sv-pgs run-all-of-us --disease "$DISEASE" --output-dir "$HOME/${DISEASE}_results" "$@"
+OUTPUT_DIR="$HOME/${DISEASE}_results"
+uv run sv-pgs run-all-of-us --disease "$DISEASE" --output-dir "$OUTPUT_DIR" "$@"
+uv run sv-pgs evaluate-all-of-us --disease "$DISEASE" --output-dir "$OUTPUT_DIR"
