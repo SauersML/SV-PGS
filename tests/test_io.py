@@ -741,6 +741,18 @@ def test_plink_reader_decodes_only_requested_samples(tmp_path: Path, monkeypatch
 
     np.testing.assert_array_equal(observed_scattered, expected_scattered)
 
+    decoded_variant_counts: list[int] = []
+    original_parallel_sample_decoder = plink_module._decode_payload_sample_indices_parallel
+
+    def record_parallel_sample_decode(*args, **kwargs):
+        decoded_variant_counts.append(int(kwargs["variant_count"]))
+        return original_parallel_sample_decoder(*args, **kwargs)
+
+    monkeypatch.setattr(
+        plink_module,
+        "_decode_payload_sample_indices_parallel",
+        record_parallel_sample_decode,
+    )
     observed_variant_gather = reader.read(
         index=(sample_indices, np.array([4, 0, 2], dtype=np.intp)),
         dtype="int8",
@@ -756,6 +768,8 @@ def test_plink_reader_decodes_only_requested_samples(tmp_path: Path, monkeypatch
     ).astype(np.int8)
 
     np.testing.assert_array_equal(observed_variant_gather, expected_variant_gather)
+    assert decoded_variant_counts == [3]
+    assert observed_variant_gather.flags.f_contiguous
 
 
 def test_plink_reader_reads_only_contiguous_sample_window(

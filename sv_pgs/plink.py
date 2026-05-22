@@ -230,6 +230,54 @@ class open_bed:
                 bytes_read += chunk_len
         return payload
 
+    def _pread_indexed_variant_payload(
+        self,
+        variant_indices: NDArray,
+        *,
+        bytes_per_variant: int,
+    ) -> U8Array:
+        """Read arbitrary variant records into one contiguous payload buffer."""
+        indices = np.asarray(variant_indices, dtype=np.int64)
+        if indices.ndim != 1:
+            raise ValueError("PLINK variant indices must be 1D.")
+        if indices.size == 0:
+            return np.empty((0,), dtype=np.uint8)
+        if bytes_per_variant <= 0:
+            raise ValueError("bytes_per_variant must be positive.")
+
+        fd = self._ensure_fd()
+        payload = np.empty((int(indices.size) * bytes_per_variant,), dtype=np.uint8)
+        output = memoryview(payload).cast("B")
+        cursor = 0
+        while cursor < int(indices.size):
+            run_start = cursor
+            first_variant = int(indices[cursor])
+            run_length = 1
+            while (
+                cursor + run_length < int(indices.size)
+                and int(indices[cursor + run_length]) == first_variant + run_length
+            ):
+                run_length += 1
+
+            input_offset = PLINK1_HEADER_SIZE + first_variant * bytes_per_variant
+            output_offset = run_start * bytes_per_variant
+            byte_count = run_length * bytes_per_variant
+            bytes_read = 0
+            while bytes_read < byte_count:
+                chunk_len = os.preadv(
+                    fd,
+                    [output[output_offset + bytes_read : output_offset + byte_count]],
+                    input_offset + bytes_read,
+                )
+                if chunk_len == 0:
+                    raise OSError(
+                        f"Unexpected EOF reading PLINK .bed at offset {input_offset + bytes_read}: "
+                        f"requested {byte_count - bytes_read} bytes, got 0"
+                    )
+                bytes_read += chunk_len
+            cursor += run_length
+        return payload
+
     def _read_sample_window_striped(
         self,
         *,
@@ -381,20 +429,20 @@ class open_bed:
             sample_indices = np.asarray(resolved_sample_index, dtype=np.intp)
             if sample_indices.size == 0:
                 return np.empty((0, variant_index.shape[0]), dtype=np.int8)
-            result = np.empty((sample_indices.shape[0], variant_index.shape[0]), dtype=np.int8)
-            with Path(self.path).open("rb") as bed_handle:
-                for output_index, bed_variant_index in enumerate(variant_index):
-                    bed_handle.seek(PLINK1_HEADER_SIZE + int(bed_variant_index) * bytes_per_variant)
-                    payload_bytes = bed_handle.read(bytes_per_variant)
-                    result[:, output_index] = _decode_payload_sample_indices(
-                        payload_bytes,
-                        iid_count=self.iid_count,
-                        variant_count=1,
-                        bytes_per_variant=bytes_per_variant,
-                        sample_indices=sample_indices,
-                        count_a1=self.count_A1,
-                    )[:, 0]
-            return result
+            n_variants = int(variant_index.shape[0])
+            payload = self._pread_indexed_variant_payload(
+                variant_index,
+                bytes_per_variant=bytes_per_variant,
+            )
+            return _decode_payload_sample_indices_parallel(
+                payload,
+                iid_count=self.iid_count,
+                variant_count=n_variants,
+                bytes_per_variant=bytes_per_variant,
+                sample_indices=sample_indices,
+                count_a1=self.count_A1,
+                num_threads=num_threads,
+            )
 
         if sample_slice is not None:
             params = _sample_slice_parameters(sample_slice, self.iid_count)
@@ -419,18 +467,18 @@ class open_bed:
                     )[:, 0]
             return result
 
-        result = np.empty((self.iid_count, variant_index.shape[0]), dtype=np.int8)
-        with Path(self.path).open("rb") as bed_handle:
-            for output_index, bed_variant_index in enumerate(variant_index):
-                bed_handle.seek(PLINK1_HEADER_SIZE + int(bed_variant_index) * bytes_per_variant)
-                payload_bytes = bed_handle.read(bytes_per_variant)
-                result[:, output_index] = _decode_payload(
-                    payload_bytes,
-                    iid_count=self.iid_count,
-                    variant_count=1,
-                    bytes_per_variant=bytes_per_variant,
-                    count_a1=self.count_A1,
-                )[:, 0]
+        payload = self._pread_indexed_variant_payload(
+            variant_index,
+            bytes_per_variant=bytes_per_variant,
+        )
+        result = _decode_payload_parallel(
+            payload,
+            iid_count=self.iid_count,
+            variant_count=int(variant_index.shape[0]),
+            bytes_per_variant=bytes_per_variant,
+            count_a1=self.count_A1,
+            num_threads=num_threads,
+        )
         return result[resolved_sample_index, :]
 
 
@@ -600,7 +648,7 @@ def _decode_payload_sample_indices(
     sample_offsets = samples % 4
     packed_matrix = raw_bytes.reshape(variant_count, bytes_per_variant)
     lut = _BYTE_DECODE_LUT_A1 if count_a1 else _BYTE_DECODE_LUT_A2
-    result = np.empty((samples.shape[0], variant_count), dtype=np.int8)
+    result = np.empty((samples.shape[0], variant_count), dtype=np.int8, order="F")
     for offset in range(4):
         output_positions = np.flatnonzero(sample_offsets == offset)
         if output_positions.size == 0:
@@ -643,7 +691,7 @@ def _decode_payload_sample_indices_parallel(
     if raw_bytes.size != variant_count * bytes_per_variant:
         raise ValueError("Unexpected PLINK 1 .bed payload length.")
 
-    result = np.empty((samples.shape[0], variant_count), dtype=np.int8)
+    result = np.empty((samples.shape[0], variant_count), dtype=np.int8, order="F")
     packed_matrix = raw_bytes.reshape(variant_count, bytes_per_variant)
 
     def decode_chunk(chunk_start: int, chunk_stop: int) -> None:

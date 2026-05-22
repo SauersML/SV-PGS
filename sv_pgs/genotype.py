@@ -40,7 +40,7 @@ GPU_STANDARDIZED_DYNAMIC_FREE_FRACTION = 0.20
 GPU_STANDARDIZED_DYNAMIC_RESERVE_BYTES = 512_000_000
 PLINK_INT8_TARGET_BATCH_BYTES = 1_024_000_000
 PLINK_INT8_MAX_PREFETCH_DEPTH = 1
-PLINK_BED_READER_NUM_THREADS = min(16, max(1, os.cpu_count() or 1))
+PLINK_BED_READER_NUM_THREADS = max(1, os.cpu_count() or 1)
 
 # If the reduced genotype matrix (after tie-group dedup) is smaller than 4 GB,
 # cache it in RAM.  This avoids re-reading from disk on every EM iteration
