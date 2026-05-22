@@ -285,7 +285,7 @@ ORDER BY ehr_participants.person_id
 """.strip()
 
 
-def build_all_of_us_disease_query_config(disease_definition: DiseaseDefinition):
+def build_all_of_us_disease_query_config(disease_definition: DiseaseDefinition) -> "bigquery.QueryJobConfig":
     from google.cloud import bigquery
 
     return bigquery.QueryJobConfig(

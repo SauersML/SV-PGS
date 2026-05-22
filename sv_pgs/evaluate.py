@@ -22,6 +22,7 @@ from pathlib import Path
 
 import numpy as np
 
+from sv_pgs._typing import NDArray
 from sv_pgs.progress import log
 
 
@@ -138,7 +139,7 @@ def _load_ancestry_labels(ancestry_path: Path) -> dict[str, str]:
     return labels
 
 
-def _compute_auc_safe(labels: np.ndarray, preds: np.ndarray) -> float | None:
+def _compute_auc_safe(labels: NDArray, preds: NDArray) -> float | None:
     labels = np.asarray(labels, dtype=np.int8).reshape(-1)
     preds = np.asarray(preds, dtype=np.float64).reshape(-1)
     finite = np.isfinite(preds)
@@ -169,8 +170,8 @@ def _compute_auc_safe(labels: np.ndarray, preds: np.ndarray) -> float | None:
 
 def _run_auc_test(
     name: str,
-    neg_scores: np.ndarray,
-    pos_scores: np.ndarray,
+    neg_scores: NDArray,
+    pos_scores: NDArray,
     results: dict[str, object],
     key_prefix: str,
 ) -> None:

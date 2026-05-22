@@ -26,6 +26,7 @@ from sv_pgs.io import load_multi_source_dataset_from_files
 from sv_pgs.model import register_fit_checkpoint_path
 from sv_pgs.pipeline import run_training_pipeline
 from sv_pgs.progress import log, mem
+from sv_pgs._typing import NDArray
 
 # Local on-workbench mirror of remote AoU buckets. We download each VCF once
 # into work_dir.parent/.sv_pgs_cache/<subdir>/ and reuse it across runs; the
@@ -785,7 +786,7 @@ def _start_plink_cache_warmup(
     def _compute_or_wait(
         raw_genotypes: Any,
         bed_path: Path,
-        sample_indices: np.ndarray,
+        sample_indices: NDArray,
         config: ModelConfig,
     ) -> tuple[Any, Path | None]:
         if (

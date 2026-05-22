@@ -5,7 +5,7 @@ import json
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Iterable, Sequence
+from typing import Any, Callable, Iterable, Sequence
 
 import numpy as np
 from sklearn.metrics import log_loss, r2_score, roc_auc_score
@@ -339,7 +339,7 @@ def _build_per_epoch_history_writer(
     history_path: Path,
     config: ModelConfig,
     test_dataset: "LoadedDataset | None",
-):
+) -> tuple[Callable[[dict[str, Any]], None], Callable[[], None]]:
     """Return (callback, close_fn) that streams per-epoch metrics to `history_path`.
 
     The callback signature matches what mixture_inference.fit_variational_em
@@ -380,7 +380,7 @@ def _build_per_epoch_history_writer(
     _test_n = len(test_dataset.sample_ids) if test_dataset is not None and has_test else 0
     log(f"per-epoch history → {history_path}  (test_n={_test_n})")
 
-    def _format(value) -> str:
+    def _format(value: object) -> str:
         if value is None:
             return ""
         if isinstance(value, float):
@@ -389,7 +389,7 @@ def _build_per_epoch_history_writer(
             return f"{value:.6g}"
         return str(value)
 
-    def callback(snapshot: dict) -> None:
+    def callback(snapshot: dict[str, Any]) -> None:
         wall_seconds = _time.monotonic() - start_seconds
         row: list[str] = [
             _format(snapshot.get("epoch")),

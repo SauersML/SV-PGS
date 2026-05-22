@@ -7,6 +7,7 @@ import os
 import platform
 import sys
 from pathlib import Path
+from typing import Iterable
 
 from sv_pgs.all_of_us import AllOfUsDiseaseRequest, available_disease_names, prepare_all_of_us_disease_sample_table
 from sv_pgs.aou_runner import run_all_of_us, run_all_of_us_all_diseases
@@ -273,7 +274,7 @@ def main(argv: list[str] | None = None) -> int:
     return 0
 
 
-def _infer_trait_type(targets) -> TraitType:
+def _infer_trait_type(targets: Iterable[float]) -> TraitType:
     unique_targets = sorted({float(value) for value in targets})
     if all(target_value in {0.0, 1.0} for target_value in unique_targets):
         return TraitType.BINARY

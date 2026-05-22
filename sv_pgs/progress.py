@@ -9,10 +9,11 @@ import subprocess
 import sys
 import threading
 import time
-import traceback
+import types
+from typing import IO
 
 _start_time: float = time.monotonic()
-_log_file = None
+_log_file: IO[str] | None = None
 
 _heartbeat_thread: threading.Thread | None = None
 _heartbeat_stop: threading.Event | None = None
@@ -24,7 +25,7 @@ _heartbeat_last_nvidia_smi: float = 0.0
 _heartbeat_last_nvidia_smi_value: str = "nvidia-smi=not-yet-sampled"
 
 
-def set_log_file(path: str | os.PathLike) -> None:
+def set_log_file(path: str | os.PathLike[str]) -> None:
     """Set a file path where all log() output is mirrored."""
     global _log_file
     if _log_file is not None:
@@ -193,12 +194,12 @@ def jax_runtime_snapshot() -> str:
 # initialized yet) cannot kill the run.
 
 
-def _format_thread_frame(frame) -> list[str]:
+def _format_thread_frame(frame: types.FrameType | None) -> list[str]:
     """Return the deepest ~6 frames of `frame` as 'file:line:func' strings."""
     if frame is None:
         return ["<no frame>"]
     frames: list[str] = []
-    cursor = frame
+    cursor: types.FrameType | None = frame
     while cursor is not None and len(frames) < 6:
         code = cursor.f_code
         filename = os.path.basename(code.co_filename) or code.co_filename
@@ -344,6 +345,3 @@ def stop_heartbeat() -> None:
     _heartbeat_stop = None
 
 
-# Keep `traceback` import used in case future variants want a full formatted
-# traceback string. Reference it so static analyzers don't flag it as unused.
-_ = traceback
