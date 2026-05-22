@@ -11,6 +11,8 @@ from typing import Any, Callable, Sequence, cast
 
 import numpy as np
 
+from sv_pgs._typing import F32Array, I32Array, NDArray
+
 # Importing sv_pgs._jax has the side-effect of configuring XLA env vars
 # before any other module imports jax. It must come before sv_pgs.artifact,
 # sv_pgs.genotype, sv_pgs.inference, etc., which transitively import jax.
@@ -18,7 +20,7 @@ import numpy as np
 from sv_pgs import _jax as _jax_side_effects
 from sv_pgs.artifact import ModelArtifact, load_artifact, save_artifact
 from sv_pgs.config import ModelConfig, TraitType
-from sv_pgs.data import TieGroup, TieMap, VariantRecord, VariantStatistics, normalize_variant_record
+from sv_pgs.data import PreparedArrays, TieGroup, TieMap, VariantRecord, VariantStatistics, normalize_variant_record
 from sv_pgs.genotype import (
     ConcatenatedRawGenotypeMatrix,
     DenseRawGenotypeMatrix,
@@ -48,9 +50,9 @@ del _jax_side_effects
 
 
 def _select_active_variant_indices_fast(
-    allele_frequencies: np.ndarray,
+    allele_frequencies: NDArray,
     minimum_minor_allele_frequency: float,
-) -> np.ndarray:
+) -> I32Array:
     """Vectorized MAF filter — avoids creating 1.68M VariantRecord objects."""
     af = np.asarray(allele_frequencies, dtype=np.float32)
     maf = np.minimum(af, 1.0 - af)
@@ -61,18 +63,18 @@ def _select_active_variant_indices_fast(
 class FittedState:
     variant_records: list[VariantRecord]
     full_variant_records: list[VariantRecord]
-    active_variant_indices: np.ndarray
+    active_variant_indices: I32Array
     preprocessor: Preprocessor
     tie_map: TieMap
     fit_result: VariationalFitResult
-    full_coefficients: np.ndarray
-    nonzero_coefficient_indices: np.ndarray
-    nonzero_coefficients: np.ndarray
-    nonzero_means: np.ndarray
-    nonzero_scales: np.ndarray
-    training_genetic_score: np.ndarray | None = None
-    training_covariate_score: np.ndarray | None = None
-    training_linear_predictor: np.ndarray | None = None
+    full_coefficients: F32Array
+    nonzero_coefficient_indices: I32Array
+    nonzero_coefficients: F32Array
+    nonzero_means: F32Array
+    nonzero_scales: F32Array
+    training_genetic_score: F32Array | None = None
+    training_covariate_score: F32Array | None = None
+    training_linear_predictor: F32Array | None = None
 
     def __post_init__(self) -> None:
         variant_count = len(self.full_variant_records)
@@ -154,9 +156,9 @@ def _fit_stage_variant_stats_cache_path(
 
 def _validate_fit_inputs(
     genotype_matrix: RawGenotypeMatrix,
-    covariates: np.ndarray,
-    targets: np.ndarray,
-    variant_records: Sequence[VariantRecord | dict],
+    covariates: NDArray,
+    targets: NDArray,
+    variant_records: Sequence[VariantRecord | dict[str, Any]],
     variant_stats: VariantStatistics | None,
 ) -> None:
     sample_count, variant_count = genotype_matrix.shape
@@ -195,11 +197,11 @@ def _validate_fit_inputs(
 
 def _fit_stage_cache_paths(
     genotype_matrix: RawGenotypeMatrix,
-    allele_frequencies: np.ndarray,
-    means: np.ndarray,
-    scales: np.ndarray,
-    covariates: np.ndarray,
-    targets: np.ndarray,
+    allele_frequencies: NDArray,
+    means: NDArray,
+    scales: NDArray,
+    covariates: NDArray,
+    targets: NDArray,
     config: ModelConfig,
 ) -> _FitStageCachePaths | None:
     raw_signature = _persistent_raw_signature(genotype_matrix)
@@ -238,7 +240,7 @@ def _fit_stage_cache_paths(
     )
 
 
-def _update_hash_with_array_bytes(hasher, array: np.ndarray) -> None:
+def _update_hash_with_array_bytes(hasher: "hashlib._Hash", array: NDArray) -> None:
     contiguous = np.ascontiguousarray(array)
     hasher.update(str(contiguous.dtype).encode("utf-8"))
     hasher.update(np.asarray(contiguous.shape, dtype=np.int64).tobytes())
@@ -365,7 +367,7 @@ def _try_load_fit_stage_variant_stats_cache(
 
 def _save_fit_stage_structure_cache(
     cache_paths: _FitStageCachePaths,
-    active_variant_indices: np.ndarray,
+    active_variant_indices: NDArray,
     reduced_tie_map: TieMap,
 ) -> None:
     cache_paths.cache_dir.mkdir(parents=True, exist_ok=True)
@@ -481,9 +483,9 @@ def _save_sample_space_basis_cache(
 
 def _try_load_fit_stage_cache(
     cache_paths: _FitStageCachePaths,
-    prepared_arrays,
+    prepared_arrays: PreparedArrays,
     standardized_genotypes: StandardizedGenotypeMatrix,
-) -> tuple[np.ndarray, TieMap, StandardizedGenotypeMatrix, bool] | None:
+) -> tuple[I32Array, TieMap, StandardizedGenotypeMatrix, bool] | None:
     if not cache_paths.manifest_path.exists():
         log(f"fit-stage cache miss (key={cache_paths.key})")
         return None
@@ -624,8 +626,8 @@ def _fit_checkpoint_tmp_path(checkpoint_path: Path) -> Path:
 def _fit_checkpoint_config_hash(
     *,
     genotype_matrix: RawGenotypeMatrix,
-    covariates: np.ndarray,
-    targets: np.ndarray,
+    covariates: NDArray,
+    targets: NDArray,
     variant_records: Sequence[VariantRecord],
     config: ModelConfig,
 ) -> str:
@@ -784,11 +786,11 @@ class BayesianPGS:
 
     def fit(
         self,
-        genotypes: RawGenotypeMatrix | np.ndarray,
-        covariates: np.ndarray,
-        targets: np.ndarray,
-        variant_records: Sequence[VariantRecord | dict],
-        validation_data: tuple[RawGenotypeMatrix | np.ndarray, np.ndarray, np.ndarray] | None = None,
+        genotypes: RawGenotypeMatrix | NDArray,
+        covariates: NDArray,
+        targets: NDArray,
+        variant_records: Sequence[VariantRecord | dict[str, Any]],
+        validation_data: tuple[RawGenotypeMatrix | NDArray, NDArray, NDArray] | None = None,
         variant_stats: VariantStatistics | None = None,
         per_epoch_eval_callback: Callable[[dict[str, Any]], None] | None = None,
         validation_is_holdout_only: bool = False,
@@ -931,7 +933,7 @@ class BayesianPGS:
             )
         if active_variant_indices.size == 0:
             log("no active variants remain after filtering; fitting covariates-only model...")
-            reduced_validation_dense: tuple[np.ndarray, np.ndarray, np.ndarray] | None = None
+            reduced_validation_dense: tuple[F32Array, F32Array, F32Array] | None = None
             if validation_data is not None:
                 _, validation_covariates, validation_targets = validation_data
                 reduced_validation_dense = (
@@ -1341,7 +1343,7 @@ class BayesianPGS:
         log(f"=== MODEL FIT DONE ===  mem={mem()}")
         return self
 
-    def decision_function(self, genotypes: RawGenotypeMatrix | np.ndarray, covariates: np.ndarray) -> np.ndarray:
+    def decision_function(self, genotypes: RawGenotypeMatrix | NDArray, covariates: NDArray) -> F32Array:
         """Compute the raw linear predictor (before sigmoid for binary traits).
 
         For each individual: score = sum_j(beta_j * standardized_genotype_j) + covariates @ alpha.
@@ -1349,13 +1351,13 @@ class BayesianPGS:
         making prediction fast even on huge genotype files.
         """
         genotype_component, covariate_component = self.decision_components(genotypes, covariates)
-        return genotype_component + covariate_component
+        return np.asarray(genotype_component + covariate_component, dtype=np.float32)
 
     def decision_components(
         self,
-        genotypes: RawGenotypeMatrix | np.ndarray,
-        covariates: np.ndarray,
-    ) -> tuple[np.ndarray, np.ndarray]:
+        genotypes: RawGenotypeMatrix | NDArray,
+        covariates: NDArray,
+    ) -> tuple[F32Array, F32Array]:
         """Return the separate genetic and covariate contributions to the predictor."""
         fitted_state = self._require_state()
         covariate_matrix = self._with_intercept(np.asarray(covariates, dtype=np.float32))
@@ -1380,14 +1382,14 @@ class BayesianPGS:
         log(f"  decision_function done  mem={mem()}")
         return np.asarray(genotype_component, dtype=np.float32), covariate_component
 
-    def predict_proba(self, genotypes: RawGenotypeMatrix | np.ndarray, covariates: np.ndarray) -> np.ndarray:
+    def predict_proba(self, genotypes: RawGenotypeMatrix | NDArray, covariates: NDArray) -> F32Array:
         if self.config.trait_type != TraitType.BINARY:
             raise ValueError("predict_proba is only available for binary traits.")
         linear_predictor = self.decision_function(genotypes, covariates)
         positive_probability = np.asarray(stable_sigmoid(linear_predictor), dtype=np.float32)
         return np.column_stack([1.0 - positive_probability, positive_probability])
 
-    def predict(self, genotypes: RawGenotypeMatrix | np.ndarray, covariates: np.ndarray) -> np.ndarray:
+    def predict(self, genotypes: RawGenotypeMatrix | NDArray, covariates: NDArray) -> NDArray:
         linear_predictor = self.decision_function(genotypes, covariates)
         if self.config.trait_type == TraitType.BINARY:
             return (np.asarray(stable_sigmoid(linear_predictor), dtype=np.float32) >= 0.5).astype(np.int32)
@@ -1455,7 +1457,7 @@ class BayesianPGS:
         )
         return loaded_model
 
-    def training_decision_components(self) -> tuple[np.ndarray, np.ndarray] | None:
+    def training_decision_components(self) -> tuple[F32Array, F32Array] | None:
         fitted_state = self._require_state()
         if (
             fitted_state.training_genetic_score is None
@@ -1507,7 +1509,7 @@ class BayesianPGS:
         return self.state
 
     @staticmethod
-    def _with_intercept(covariates: np.ndarray) -> np.ndarray:
+    def _with_intercept(covariates: NDArray) -> F32Array:
         covariate_matrix = np.asarray(covariates, dtype=np.float32)
         if covariate_matrix.ndim != 2:
             raise ValueError("covariates must be 2D.")
@@ -1528,7 +1530,7 @@ def _runtime_tuned_config_for_fit(
     return policy.tuned_config, runtime_training_policy_summary(policy, config)
 
 
-def _nonzero_coefficient_cache(coefficients: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+def _nonzero_coefficient_cache(coefficients: NDArray) -> tuple[I32Array, F32Array]:
     coefficient_array = np.asarray(coefficients, dtype=np.float32)
     nonzero_indices = np.flatnonzero(np.abs(coefficient_array) > 0.0).astype(np.int32)
     return nonzero_indices, np.asarray(coefficient_array[nonzero_indices], dtype=np.float32)
@@ -1536,9 +1538,9 @@ def _nonzero_coefficient_cache(coefficients: np.ndarray) -> tuple[np.ndarray, np
 
 def _training_linear_predictor_cache(
     fit_result: VariationalFitResult,
-    covariate_matrix: np.ndarray,
-    reduced_genotypes: StandardizedGenotypeMatrix | np.ndarray | None,
-) -> np.ndarray:
+    covariate_matrix: NDArray,
+    reduced_genotypes: StandardizedGenotypeMatrix | NDArray | None,
+) -> F32Array:
     if fit_result.linear_predictor is not None:
         return np.asarray(fit_result.linear_predictor, dtype=np.float32)
     training_linear_predictor = np.asarray(covariate_matrix @ fit_result.alpha, dtype=np.float32)
@@ -1563,12 +1565,12 @@ def _empty_tie_map(original_variant_count: int) -> TieMap:
 
 
 def _fit_without_active_variants(
-    covariates: np.ndarray,
-    targets: np.ndarray,
+    covariates: NDArray,
+    targets: NDArray,
     config: ModelConfig,
-    validation_data: tuple[np.ndarray, np.ndarray, np.ndarray] | None,
-    predictor_offset: np.ndarray | None = None,
-    validation_offset: np.ndarray | None = None,
+    validation_data: tuple[NDArray, NDArray, NDArray] | None,
+    predictor_offset: NDArray | None = None,
+    validation_offset: NDArray | None = None,
 ) -> VariationalFitResult:
     return fit_variational_em(
         genotypes=np.empty((covariates.shape[0], 0), dtype=np.float32),
@@ -1590,12 +1592,12 @@ def _fit_without_active_variants(
 # This is the inner loop of prediction and is I/O-bound for PLINK files.
 def _raw_standardized_subset_matvec(
     raw_genotypes: RawGenotypeMatrix,
-    variant_indices: np.ndarray,
-    means: np.ndarray,
-    scales: np.ndarray,
-    coefficients: np.ndarray,
+    variant_indices: NDArray,
+    means: NDArray,
+    scales: NDArray,
+    coefficients: NDArray,
     batch_size: int,
-) -> np.ndarray:
+) -> F32Array:
     if variant_indices.shape[0] == 0:
         return np.zeros(raw_genotypes.shape[0], dtype=np.float32)
     result = np.zeros(raw_genotypes.shape[0], dtype=np.float32)
@@ -1615,7 +1617,7 @@ def _raw_standardized_subset_matvec(
 # original variant ordering.
 def _project_tie_map_to_original_space(
     reduced_tie_map: TieMap,
-    active_variant_indices: np.ndarray,
+    active_variant_indices: NDArray,
     original_variant_count: int,
 ) -> TieMap:
     if _active_indices_cover_original(active_variant_indices, original_variant_count):
@@ -1660,7 +1662,7 @@ def _project_tie_map_to_original_space(
     )
 
 
-def _active_indices_cover_original(active_variant_indices: np.ndarray, original_variant_count: int) -> bool:
+def _active_indices_cover_original(active_variant_indices: NDArray, original_variant_count: int) -> bool:
     return (
         active_variant_indices.shape == (int(original_variant_count),)
         and np.array_equal(active_variant_indices, np.arange(int(original_variant_count), dtype=np.int32))
@@ -1676,11 +1678,11 @@ def _active_indices_cover_original(active_variant_indices: np.ndarray, original_
 def _tie_group_export_weights(
     tie_map: TieMap,
     fit_result: VariationalFitResult,
-) -> list[np.ndarray]:
+) -> list[F32Array]:
     if not tie_map.reduced_to_group:
         return []
     member_prior_variances = np.asarray(fit_result.member_prior_variances, dtype=np.float32)
-    group_weights: list[np.ndarray] = []
+    group_weights: list[F32Array] = []
     for tie_group in tie_map.reduced_to_group:
         member_variances = np.asarray(member_prior_variances[tie_group.member_indices], dtype=np.float32)
         normalized_weights = member_variances / np.maximum(np.sum(member_variances), 1e-12)
@@ -1691,7 +1693,7 @@ def _tie_group_export_weights(
 def _training_records_from_stats(
     records: Sequence[VariantRecord],
     variant_stats: VariantStatistics,
-    variant_indices: np.ndarray,
+    variant_indices: NDArray,
 ) -> list[VariantRecord]:
     """Build training records using cohort-derived training statistics."""
     structural_variant_classes = ModelConfig.structural_variant_classes()
@@ -1743,7 +1745,7 @@ def _training_record_with_stats(
     return training_record
 
 
-def _normalize_variant_records(records: Sequence[VariantRecord | dict]) -> list[VariantRecord]:
+def _normalize_variant_records(records: Sequence[VariantRecord | dict[str, Any]]) -> list[VariantRecord]:
     if isinstance(records, list) and (not records or isinstance(records[0], VariantRecord)):
         return cast(list[VariantRecord], records)
     return [normalize_variant_record(record) for record in records]
