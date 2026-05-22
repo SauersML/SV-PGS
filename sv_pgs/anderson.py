@@ -12,6 +12,8 @@ from typing import Callable, Sequence
 
 import numpy as np
 
+from sv_pgs._typing import F64Array
+
 
 _CONDITION_LIMIT = 1.0e12
 
@@ -21,9 +23,9 @@ class AndersonState:
     """Rolling history for Anderson(m). Newest entry is index 0."""
 
     memory_depth: int
-    iterates: list[np.ndarray] = field(default_factory=list)
-    map_values: list[np.ndarray] = field(default_factory=list)
-    residuals: list[np.ndarray] = field(default_factory=list)
+    iterates: list[F64Array] = field(default_factory=list)
+    map_values: list[F64Array] = field(default_factory=list)
+    residuals: list[F64Array] = field(default_factory=list)
     fallback_count: int = 0
 
     def reset(self) -> None:
@@ -33,7 +35,7 @@ class AndersonState:
         self.fallback_count = 0
 
 
-def _push(history: list[np.ndarray], value: np.ndarray, depth: int) -> None:
+def _push(history: list[F64Array], value: F64Array, depth: int) -> None:
     history.insert(0, value)
     if len(history) > depth:
         history.pop()
@@ -42,10 +44,10 @@ def _push(history: list[np.ndarray], value: np.ndarray, depth: int) -> None:
 def anderson_step(
     state: AndersonState,
     *,
-    x_current: np.ndarray,
-    map_value: np.ndarray,
+    x_current: F64Array,
+    map_value: F64Array,
     regularization: float = 1e-10,
-) -> np.ndarray:
+) -> F64Array:
     """Return the proposed accelerated iterate; update state in place.
 
     On the first call (empty history) returns ``map_value`` (plain step).
@@ -120,9 +122,9 @@ def anderson_step(
 
 def safeguarded_anderson(
     *,
-    initial_iterate: np.ndarray,
-    fixed_point_map: Callable[[np.ndarray], np.ndarray],
-    objective: Callable[[np.ndarray], float],
+    initial_iterate: F64Array,
+    fixed_point_map: Callable[[F64Array], F64Array],
+    objective: Callable[[F64Array], float],
     memory_depth: int = 5,
     max_iterations: int = 200,
     tolerance: float = 1e-6,
@@ -131,7 +133,7 @@ def safeguarded_anderson(
     relative_safeguard_slack: float = 0.0,
     nonmonotone_window: int = 1,
     damping_fractions: Sequence[float] = (1.0, 0.5, 0.25),
-) -> tuple[np.ndarray, list[float], bool]:
+) -> tuple[F64Array, list[float], bool]:
     """Run safeguarded Anderson(m).
 
     Returns ``(best_iterate, objective_history, converged)``. The history
@@ -149,11 +151,11 @@ def safeguarded_anderson(
     original_shape = np.asarray(initial_iterate).shape
     current = np.asarray(initial_iterate, dtype=np.float64).ravel().copy()
 
-    def _call_map(vector: np.ndarray) -> np.ndarray:
+    def _call_map(vector: F64Array) -> F64Array:
         result = fixed_point_map(vector.reshape(original_shape))
         return np.asarray(result, dtype=np.float64).ravel()
 
-    def _call_objective(vector: np.ndarray) -> float:
+    def _call_objective(vector: F64Array) -> float:
         return float(objective(vector.reshape(original_shape)))
 
     state = AndersonState(memory_depth=memory_depth)

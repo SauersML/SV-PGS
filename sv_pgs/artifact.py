@@ -7,6 +7,7 @@ from typing import Any
 
 import numpy as np
 
+from sv_pgs._typing import F32Array
 from sv_pgs.config import ModelConfig, TraitType, VariantClass
 from sv_pgs.data import VariantRecord, TieGroup, TieMap, normalize_variant_records
 
@@ -15,19 +16,19 @@ from sv_pgs.data import VariantRecord, TieGroup, TieMap, normalize_variant_recor
 class ModelArtifact:
     config: ModelConfig
     records: list[VariantRecord]
-    means: np.ndarray
-    scales: np.ndarray
-    alpha: np.ndarray
-    beta_reduced: np.ndarray
-    beta_full: np.ndarray
-    beta_variance: np.ndarray
+    means: F32Array
+    scales: F32Array
+    alpha: F32Array
+    beta_reduced: F32Array
+    beta_full: F32Array
+    beta_variance: F32Array
     tie_map: TieMap
     sigma_e2: float
-    prior_scales: np.ndarray
+    prior_scales: F32Array
     global_scale: float
     class_tpb_shape_a: dict[VariantClass, float]
     class_tpb_shape_b: dict[VariantClass, float]
-    scale_model_coefficients: np.ndarray
+    scale_model_coefficients: F32Array
     scale_model_feature_names: list[str]
     objective_history: list[float]
     validation_history: list[float]

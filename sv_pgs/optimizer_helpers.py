@@ -10,12 +10,14 @@ import numpy as np
 from scipy.special import gammaln as scipy_gammaln
 from scipy.special import kve as scipy_bessel_kve
 
+from sv_pgs._typing import F64Array
+
 
 def closed_form_global_scale(
     *,
-    coefficient_second_moment: np.ndarray,   # E_q[beta_j^2]
-    metadata_baseline_scales: np.ndarray,    # s_j (exp of design @ theta excluding intercept)
-    local_scale: np.ndarray,                 # lambda_j
+    coefficient_second_moment: F64Array,   # E_q[beta_j^2]
+    metadata_baseline_scales: F64Array,    # s_j (exp of design @ theta excluding intercept)
+    local_scale: F64Array,                 # lambda_j
     prior_shape: float = 0.0,                # inverse-gamma alpha (use 0 for flat)
     prior_rate: float = 0.0,                 # inverse-gamma beta (use 0 for flat)
     floor: float = 1e-8,
@@ -44,10 +46,10 @@ def closed_form_global_scale(
 
 def gig_inverse_first_moment(
     *,
-    p_parameter: np.ndarray,
-    chi: np.ndarray,
-    psi: np.ndarray,
-) -> np.ndarray:
+    p_parameter: F64Array,
+    chi: F64Array,
+    psi: F64Array,
+) -> F64Array:
     """E[1/X] for X ~ GIG(p, chi, psi) - used in the beta precision when we collapse lambda.
 
     Formula:  E[1/X] = sqrt(psi/chi) * K_{p-1}(sqrt(chi*psi)) / K_p(sqrt(chi*psi))   (when chi > 0)
@@ -114,10 +116,10 @@ def gig_inverse_first_moment(
 def pack_em_hyperparameters(
     *,
     log_global_scale: float,
-    scale_model_coefficients: np.ndarray,
-    log_tpb_shape_a_vector: np.ndarray,
-    log_tpb_shape_b_vector: np.ndarray,
-) -> np.ndarray:
+    scale_model_coefficients: F64Array,
+    log_tpb_shape_a_vector: F64Array,
+    log_tpb_shape_b_vector: F64Array,
+) -> F64Array:
     return np.concatenate([
         np.asarray([log_global_scale], dtype=np.float64),
         np.asarray(scale_model_coefficients, dtype=np.float64),
@@ -127,11 +129,11 @@ def pack_em_hyperparameters(
 
 
 def unpack_em_hyperparameters(
-    packed: np.ndarray,
+    packed: F64Array,
     *,
     scale_model_dim: int,
     tpb_class_count: int,
-) -> tuple[float, np.ndarray, np.ndarray, np.ndarray]:
+) -> tuple[float, F64Array, F64Array, F64Array]:
     cursor = 0
     log_global_scale = float(packed[cursor])
     cursor += 1
