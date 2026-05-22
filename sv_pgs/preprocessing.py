@@ -13,6 +13,15 @@ del _jax_side_effects
 import jax
 import jax.numpy as jnp
 
+from sv_pgs._typing import (
+    BoolArray,
+    F32Array,
+    F64Array,
+    I8Array,
+    I32Array,
+    JaxArray,
+    NDArray,
+)
 from sv_pgs.config import ModelConfig, VariantClass
 from sv_pgs.data import PreparedArrays, TieGroup, TieMap, VariantRecord, VariantStatistics
 from sv_pgs.genotype import (
@@ -23,7 +32,6 @@ from sv_pgs.genotype import (
     StandardizedGenotypeMatrix,
     _supports_int8_batches,
     _standardize_batch,
-    as_raw_genotype_matrix,
     auto_batch_size,
     auto_batch_size_i8,
 )
@@ -59,7 +67,7 @@ _HARD_CALL_SIGN_FLIPPED_SIGNATURE_LUT = np.asarray(
 )
 
 @jax.jit
-def _batch_all_stats_i8(batch_i8: jnp.ndarray) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray]:
+def _batch_all_stats_i8(batch_i8: JaxArray) -> tuple[JaxArray, JaxArray, JaxArray, JaxArray]:
     """Compute per-variant statistics from int8 genotypes."""
     mask = batch_i8 != PLINK_MISSING_INT8
     counts = jnp.sum(mask, axis=0, dtype=jnp.int32)
@@ -76,7 +84,7 @@ def _batch_all_stats_i8(batch_i8: jnp.ndarray) -> tuple[jnp.ndarray, jnp.ndarray
 
 
 @jax.jit
-def _batch_all_stats(batch_values: jnp.ndarray) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray]:
+def _batch_all_stats(batch_values: JaxArray) -> tuple[JaxArray, JaxArray, JaxArray, JaxArray]:
     """Compute per-variant statistics from float32 genotypes."""
     mask = ~jnp.isnan(batch_values)
     observed = jnp.where(mask, batch_values, 0.0)
@@ -210,10 +218,10 @@ def compute_variant_statistics(
 
 def compute_marginal_z_scores(
     standardized_genotypes: StandardizedGenotypeMatrix,
-    active_variant_indices: np.ndarray,
-    covariate_matrix: np.ndarray,
-    target_vector: np.ndarray,
-) -> np.ndarray:
+    active_variant_indices: NDArray,
+    covariate_matrix: NDArray,
+    target_vector: NDArray,
+) -> F32Array:
     """Marginal univariate z-scores, residualized on covariates.
 
     For each active variant j:
@@ -264,29 +272,30 @@ def compute_marginal_z_scores(
     z_denominator = float(np.sqrt(float(n) * sigma2_resid))
     if z_denominator <= 0.0:
         return np.zeros(active_variant_indices.shape[0], dtype=np.float32)
-    return (sum_xy / z_denominator).astype(np.float32)
+    return np.asarray(sum_xy / z_denominator, dtype=np.float32)
 
 
 def _allele_frequencies_from_means(
-    means: np.ndarray,
-    dosage_like: np.ndarray,
-) -> np.ndarray:
+    means: NDArray,
+    dosage_like: NDArray,
+) -> F32Array:
     mean_array = np.asarray(means, dtype=np.float32)
     dosage_mask = np.asarray(dosage_like, dtype=bool)
-    return np.where(
+    result = np.where(
         dosage_mask,
         np.clip(mean_array / 2.0, 0.0, 1.0),
         np.float32(0.5),
     ).astype(np.float32, copy=False)
+    return np.asarray(result, dtype=np.float32)
 
 
 def _means_and_scales_with_floor(
-    sums: np.ndarray,
-    non_missing_counts: np.ndarray,
-    centered_sum_squares: np.ndarray,
+    sums: NDArray,
+    non_missing_counts: NDArray,
+    centered_sum_squares: NDArray,
     sample_count: int,
     minimum_scale: float,
-) -> tuple[np.ndarray, np.ndarray]:
+) -> tuple[F32Array, F32Array]:
     """Compute per-variant (mean, scale) with a consistent low-variance mask.
 
     For low-variance variants (centered std below `minimum_scale`) the scale is
@@ -321,10 +330,10 @@ def _means_and_scales_with_floor(
 
 
 def _scales_from_centered_sum_squares(
-    centered_sum_squares: np.ndarray,
+    centered_sum_squares: NDArray,
     sample_count: int,
     minimum_scale: float,
-) -> np.ndarray:
+) -> F32Array:
     scales = np.sqrt(np.asarray(centered_sum_squares, dtype=np.float64) / max(int(sample_count), 1))
     return np.where(scales < minimum_scale, 1.0, scales).astype(np.float32)
 
@@ -333,21 +342,14 @@ def _scales_from_centered_sum_squares(
 class Preprocessor:
     """Stores per-variant mean and standard deviation learned during training."""
 
-    means: np.ndarray
-    scales: np.ndarray
-
-    def transform(self, genotypes: RawGenotypeMatrix | np.ndarray) -> StandardizedGenotypeMatrix | np.ndarray:
-        raw_genotypes = as_raw_genotype_matrix(genotypes)
-        standardized = raw_genotypes.standardized(self.means, self.scales)
-        if isinstance(genotypes, np.ndarray):
-            return standardized.materialize()
-        return standardized
+    means: F32Array
+    scales: F32Array
 
 
 def fit_preprocessor_from_stats(
     variant_stats: VariantStatistics,
-    covariates: np.ndarray,
-    targets: np.ndarray,
+    covariates: NDArray,
+    targets: NDArray,
 ) -> PreparedArrays:
     """Build PreparedArrays from pre-computed variant statistics (no data passes)."""
     covariate_matrix = np.asarray(covariates, dtype=np.float32)
@@ -360,21 +362,6 @@ def fit_preprocessor_from_stats(
         means=np.asarray(variant_stats.means, dtype=np.float32),
         scales=np.asarray(variant_stats.scales, dtype=np.float32),
         support_counts=np.asarray(variant_stats.support_counts, dtype=np.int32),
-    )
-
-
-def fit_preprocessor(
-    genotypes: RawGenotypeMatrix | np.ndarray,
-    covariates: np.ndarray,
-    targets: np.ndarray,
-    config: ModelConfig,
-) -> PreparedArrays:
-    raw_genotypes = as_raw_genotype_matrix(genotypes)
-    variant_stats = compute_variant_statistics(raw_genotypes=raw_genotypes, config=config)
-    return fit_preprocessor_from_stats(
-        variant_stats=variant_stats,
-        covariates=covariates,
-        targets=targets,
     )
 
 
@@ -428,7 +415,7 @@ def _maf_cache_path(cache_dir: Path, cache_key: str) -> Path:
     return Path(cache_dir) / f"{_MAF_CACHE_FILE_PREFIX}.{cache_key}.npz"
 
 
-def _load_maf_filter_from_cache(cache_path: Path) -> np.ndarray | None:
+def _load_maf_filter_from_cache(cache_path: Path) -> I32Array | None:
     if not cache_path.exists():
         return None
     with np.load(cache_path, allow_pickle=False) as cached_arrays:
@@ -440,7 +427,7 @@ def _load_maf_filter_from_cache(cache_path: Path) -> np.ndarray | None:
     return cached_indices
 
 
-def _save_maf_filter_to_cache(cache_path: Path, active_variant_indices: np.ndarray) -> None:
+def _save_maf_filter_to_cache(cache_path: Path, active_variant_indices: NDArray) -> None:
     cache_path.parent.mkdir(parents=True, exist_ok=True)
     # np.savez appends `.npz` if the filename lacks it, so the temp file must
     # end in `.npz` to land where we expect.
@@ -457,7 +444,7 @@ def select_active_variant_indices(
     config: ModelConfig,
     *,
     cache_dir: Path | None = None,
-) -> np.ndarray:
+) -> I32Array:
     n_total = len(variant_records)
     if n_total == 0:
         return np.zeros(0, dtype=np.int32)
@@ -612,7 +599,7 @@ def _build_tie_map_windowed(
     has_int8_batches = raw_int8 is not None and _supports_int8_batches(raw_int8)
     # Collect unique variant indices we need to read
     needed_local_indices = sorted({i for pair in candidate_pairs for i in (pair[0], pair[1])})
-    column_cache: dict[int, np.ndarray] = {}
+    column_cache: dict[int, NDArray] = {}
     if has_int8_batches:
         raw_typed = raw_int8
         raw_variant_indices = np.asarray([int(variant_indices[i]) for i in needed_local_indices], dtype=np.int32)
@@ -781,7 +768,7 @@ def _tie_map_cache_path(cache_dir: Path, cache_key: str) -> Path:
     return Path(cache_dir) / f"{_TIE_CACHE_FILE_PREFIX}.{cache_key}.npz"
 
 
-def _serialize_tie_map(tie_map: TieMap) -> dict[str, np.ndarray]:
+def _serialize_tie_map(tie_map: TieMap) -> dict[str, NDArray]:
     group_count = len(tie_map.reduced_to_group)
     representative_indices = np.asarray(
         [int(group.representative_index) for group in tie_map.reduced_to_group],
@@ -812,7 +799,7 @@ def _serialize_tie_map(tie_map: TieMap) -> dict[str, np.ndarray]:
     }
 
 
-def _deserialize_tie_map(cached_arrays: dict[str, np.ndarray] | "np.lib.npyio.NpzFile") -> TieMap:
+def _deserialize_tie_map(cached_arrays: dict[str, NDArray] | "np.lib.npyio.NpzFile") -> TieMap:
     kept_indices = np.asarray(cached_arrays["kept_indices"], dtype=np.int32)
     original_to_reduced = np.asarray(cached_arrays["original_to_reduced"], dtype=np.int32)
     representative_indices = np.asarray(cached_arrays["representative_indices"], dtype=np.int32)
@@ -858,7 +845,7 @@ def _save_tie_map_to_cache(cache_path: Path, tie_map: TieMap) -> None:
 
 
 def build_tie_map(
-    genotypes: StandardizedGenotypeMatrix | np.ndarray,
+    genotypes: StandardizedGenotypeMatrix | NDArray,
     records: Sequence[VariantRecord],
     config: ModelConfig,
     *,
@@ -1123,7 +1110,7 @@ def _build_tie_map_from_hardcall_int8(
 
 def _iter_tie_map_batches(
     standardized_genotypes: StandardizedGenotypeMatrix,
-) -> Iterator[tuple[RawGenotypeBatch, np.ndarray]]:
+) -> Iterator[tuple[RawGenotypeBatch, BoolArray]]:
     batch_size = auto_batch_size(standardized_genotypes.shape[0])
     if standardized_genotypes.raw is not None and not _uses_identity_standardization(standardized_genotypes):
         local_start = 0
@@ -1166,16 +1153,17 @@ def _uses_identity_standardization(standardized_genotypes: StandardizedGenotypeM
     )
 
 
-def _normalize_signed_zeros(values: np.ndarray) -> np.ndarray:
+def _normalize_signed_zeros(values: NDArray) -> F32Array:
     array = np.asarray(values, dtype=np.float32)
-    return np.where(array == 0.0, np.float32(0.0), array).astype(np.float32, copy=False)
+    normalized = np.where(array == 0.0, np.float32(0.0), array).astype(np.float32, copy=False)
+    return np.asarray(normalized, dtype=np.float32)
 
 
 def _standardize_tie_column_from_raw(
     standardized_genotypes: StandardizedGenotypeMatrix,
-    raw_column: np.ndarray,
+    raw_column: NDArray,
     local_variant_index: int,
-) -> np.ndarray:
+) -> F32Array:
     raw_variant_index = int(standardized_genotypes.variant_indices[local_variant_index])
     standardized_column = _standardize_batch(
         np.asarray(raw_column, dtype=np.float32).reshape(-1, 1),
@@ -1186,9 +1174,9 @@ def _standardize_tie_column_from_raw(
 
 
 def _canonicalize_tie_column(
-    column: np.ndarray,
-    missing_mask: np.ndarray,
-) -> np.ndarray:
+    column: NDArray,
+    missing_mask: NDArray,
+) -> NDArray:
     values = np.asarray(column)
     mask = np.asarray(missing_mask, dtype=bool)
 
@@ -1208,8 +1196,8 @@ def _canonicalize_tie_column(
 
 
 def _should_use_rank_canonicalization(
-    column: np.ndarray,
-    missing_mask: np.ndarray,
+    column: NDArray,
+    missing_mask: NDArray,
 ) -> bool:
     values = np.asarray(column)
     mask = np.asarray(missing_mask, dtype=bool)
@@ -1217,38 +1205,39 @@ def _should_use_rank_canonicalization(
     if observed.size == 0:
         return True
     if values.dtype == np.int8:
-        return np.unique(observed).shape[0] <= 3
+        return bool(np.unique(observed).shape[0] <= 3)
     observed_f32 = _normalize_signed_zeros(np.asarray(observed, dtype=np.float32))
     rounded = np.rint(observed_f32)
     if not np.array_equal(observed_f32, rounded.astype(np.float32, copy=False)):
         return False
-    return np.unique(rounded.astype(np.int32, copy=False)).shape[0] <= 3
+    return bool(np.unique(rounded.astype(np.int32, copy=False)).shape[0] <= 3)
 
 
-def _sign_flip_canonical_tie_column(canonical_column: np.ndarray) -> np.ndarray:
+def _sign_flip_canonical_tie_column(canonical_column: NDArray) -> NDArray:
     canonical = np.asarray(canonical_column)
     if np.issubdtype(canonical.dtype, np.integer):
-        flipped = canonical.copy()
-        observed = canonical >= 0
-        if not np.any(observed):
-            return flipped
-        highest_rank = int(np.max(canonical[observed]))
-        flipped[observed] = highest_rank - canonical[observed]
-        return flipped
-    flipped = np.asarray(canonical, dtype=np.float32).copy()
+        flipped_int: NDArray = canonical.copy()
+        observed_int = canonical >= 0
+        if not np.any(observed_int):
+            return flipped_int
+        highest_rank = int(np.max(canonical[observed_int]))
+        flipped_int[observed_int] = highest_rank - canonical[observed_int]
+        return flipped_int
+    flipped: F32Array = np.asarray(canonical, dtype=np.float32).copy()
     observed = np.isfinite(flipped)
     flipped[observed] = _normalize_signed_zeros(-flipped[observed])
     return flipped
 
 
-def _hardcall_state_masks(batch_values: np.ndarray) -> np.ndarray:
+def _hardcall_state_masks(batch_values: NDArray) -> NDArray:
     values = np.asarray(batch_values, dtype=np.int8)
     observed = values != PLINK_MISSING_INT8
-    return (
+    result = (
         np.any(observed & (values == 0), axis=0).astype(np.uint8)
         + (2 * np.any(observed & (values == 1), axis=0).astype(np.uint8))
         + (4 * np.any(observed & (values == 2), axis=0).astype(np.uint8))
     )
+    return np.asarray(result, dtype=np.uint8)
 
 
 def _hardcall_tie_signature_batch_size(
@@ -1265,9 +1254,9 @@ def _hardcall_tie_signature_batch_size(
 
 
 def _canonicalize_hardcall_tie_columns_i8(
-    batch_values: np.ndarray,
-    state_masks: np.ndarray,
-) -> tuple[np.ndarray, np.ndarray]:
+    batch_values: NDArray,
+    state_masks: NDArray,
+) -> tuple[I8Array, I8Array]:
     values = np.asarray(batch_values, dtype=np.int8)
     masks = np.asarray(state_masks, dtype=np.uint8).reshape(-1)
     if values.ndim != 2:
@@ -1284,7 +1273,7 @@ def _canonicalize_hardcall_tie_columns_i8(
     return canonical.astype(np.int8, copy=False), sign_flipped.astype(np.int8, copy=False)
 
 
-def _pack_hardcall_tie_columns_i8(canonical_columns: np.ndarray) -> np.ndarray:
+def _pack_hardcall_tie_columns_i8(canonical_columns: NDArray) -> NDArray:
     columns = np.asarray(canonical_columns, dtype=np.uint8)
     if columns.ndim != 2:
         raise ValueError("canonical_columns must be 2D.")
@@ -1302,7 +1291,7 @@ def _pack_hardcall_tie_columns_i8(canonical_columns: np.ndarray) -> np.ndarray:
 
 
 @lru_cache(maxsize=None)
-def _hardcall_signature_hash_parameters(word_count: int) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+def _hardcall_signature_hash_parameters(word_count: int) -> tuple[NDArray, NDArray, NDArray]:
     if word_count < 1:
         raise ValueError("word_count must be positive.")
     index = np.arange(word_count, dtype=np.uint64) + np.uint64(1)
@@ -1312,7 +1301,7 @@ def _hardcall_signature_hash_parameters(word_count: int) -> tuple[np.ndarray, np
     return multiplier_one, multiplier_two, mix_multiplier
 
 
-def _hashed_tie_signatures_i8(canonical_columns: np.ndarray) -> list[tuple[int, int]]:
+def _hashed_tie_signatures_i8(canonical_columns: NDArray) -> list[tuple[int, int]]:
     packed_columns = _pack_hardcall_tie_columns_i8(canonical_columns)
     byte_padding = (-packed_columns.shape[1]) % np.dtype(np.uint64).itemsize
     if byte_padding:
@@ -1326,8 +1315,8 @@ def _hashed_tie_signatures_i8(canonical_columns: np.ndarray) -> list[tuple[int, 
 
 
 def _hashed_tie_signature(
-    standardized_column: np.ndarray,
-    missing_mask: np.ndarray,
+    standardized_column: NDArray,
+    missing_mask: NDArray,
 ) -> tuple[bytes, bytes]:
     value_hasher = hashlib.blake2b(digest_size=8, person=b"svpgs_value")
     value_hasher.update(np.ascontiguousarray(standardized_column).view(np.uint8))
@@ -1366,7 +1355,7 @@ def _matching_hardcall_tie_group_index(
     standardized_genotypes: StandardizedGenotypeMatrix,
     candidate_group_indices: Sequence[int],
     representative_member_indices: Sequence[list[int]],
-    tie_column: np.ndarray,
+    tie_column: NDArray,
     sign: float,
 ) -> int | None:
     for reduced_index in candidate_group_indices:
@@ -1384,8 +1373,8 @@ def _matching_tie_group_index(
     standardized_genotypes: StandardizedGenotypeMatrix,
     candidate_group_indices: Sequence[int],
     representative_member_indices: Sequence[list[int]],
-    tie_column: np.ndarray,
-    missing_mask: np.ndarray,
+    tie_column: NDArray,
+    missing_mask: NDArray,
     sign: float,
     use_rank_canonicalization: bool,
 ) -> int | None:
@@ -1410,7 +1399,7 @@ def _matching_tie_group_index(
 def _load_hardcall_tie_columns(
     standardized_genotypes: StandardizedGenotypeMatrix,
     local_variant_index: int,
-) -> tuple[np.ndarray, np.ndarray]:
+) -> tuple[I8Array, I8Array]:
     if standardized_genotypes.raw is None or not _supports_int8_batches(standardized_genotypes.raw):
         raise RuntimeError("hardcall tie loading requires int8 raw backing storage.")
     raw_int8 = standardized_genotypes.raw
@@ -1428,7 +1417,7 @@ def _load_tie_column_with_missingness(
     local_variant_index: int,
     *,
     use_rank_canonicalization: bool,
-) -> tuple[np.ndarray, np.ndarray]:
+) -> tuple[NDArray, BoolArray]:
     if standardized_genotypes.raw is not None:
         raw_variant_index = int(standardized_genotypes.variant_indices[local_variant_index])
         raw_column = standardized_genotypes.raw.materialize([raw_variant_index]).reshape(-1)
@@ -1651,7 +1640,7 @@ def _average_weighted_feature_dicts(
     return averaged_features
 
 
-def _class_membership(member_records: Sequence[VariantRecord]) -> tuple[list[VariantClass], np.ndarray]:
+def _class_membership(member_records: Sequence[VariantRecord]) -> tuple[list[VariantClass], F64Array]:
     class_counts: dict[VariantClass, int] = {}
     for member_record in member_records:
         class_counts[member_record.variant_class] = class_counts.get(member_record.variant_class, 0) + 1
@@ -1665,7 +1654,7 @@ def _class_membership(member_records: Sequence[VariantRecord]) -> tuple[list[Var
 
 
 def _as_standardized_genotypes(
-    genotypes: StandardizedGenotypeMatrix | np.ndarray,
+    genotypes: StandardizedGenotypeMatrix | NDArray,
 ) -> StandardizedGenotypeMatrix:
     if isinstance(genotypes, StandardizedGenotypeMatrix):
         return genotypes
