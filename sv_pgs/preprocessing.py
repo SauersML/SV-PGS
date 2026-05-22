@@ -32,6 +32,7 @@ from sv_pgs.genotype import (
     StandardizedGenotypeMatrix,
     _supports_int8_batches,
     _standardize_batch,
+    as_raw_genotype_matrix,
     auto_batch_size,
     auto_batch_size_i8,
 )
@@ -362,6 +363,22 @@ def fit_preprocessor_from_stats(
         means=np.asarray(variant_stats.means, dtype=np.float32),
         scales=np.asarray(variant_stats.scales, dtype=np.float32),
         support_counts=np.asarray(variant_stats.support_counts, dtype=np.int32),
+    )
+
+
+def fit_preprocessor(
+    genotypes: RawGenotypeMatrix | NDArray,
+    covariates: NDArray,
+    targets: NDArray,
+    config: ModelConfig,
+) -> PreparedArrays:
+    """Build PreparedArrays in one pass over the genotype data."""
+    raw_genotypes = as_raw_genotype_matrix(genotypes)
+    variant_stats = compute_variant_statistics(raw_genotypes=raw_genotypes, config=config)
+    return fit_preprocessor_from_stats(
+        variant_stats=variant_stats,
+        covariates=covariates,
+        targets=targets,
     )
 
 
