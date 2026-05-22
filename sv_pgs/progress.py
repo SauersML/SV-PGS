@@ -195,12 +195,12 @@ def jax_runtime_snapshot() -> str:
 
 
 def _format_thread_frame(frame: types.FrameType | None) -> list[str]:
-    """Return the deepest ~6 frames of `frame` as 'file:line:func' strings."""
+    """Return the deepest ~20 frames of `frame` as 'file:line:func' strings."""
     if frame is None:
         return ["<no frame>"]
     frames: list[str] = []
     cursor: types.FrameType | None = frame
-    while cursor is not None and len(frames) < 6:
+    while cursor is not None and len(frames) < 20:
         code = cursor.f_code
         filename = os.path.basename(code.co_filename) or code.co_filename
         frames.append(f"{filename}:{cursor.f_lineno}:{code.co_name}")

@@ -1366,7 +1366,8 @@ def _iter_prefetched_raw_batches(
     bytes_per_raw_value = np.dtype(np.int8 if _supports_int8_batches(raw) else np.float32).itemsize
     chunk_bytes = max(sample_count * safe_batch_size * bytes_per_raw_value, 1)
     memory_capped_in_flight = max(1, GPU_STANDARDIZED_PREFETCH_TARGET_BYTES // chunk_bytes)
-    num_io_workers = min(4, int(memory_capped_in_flight), max(1, len(chunks)))
+    cpu_cap = max(1, os.cpu_count() or 4)
+    num_io_workers = min(cpu_cap, int(memory_capped_in_flight), max(1, len(chunks)))
     in_flight_limit = min(num_io_workers * 2, int(memory_capped_in_flight), len(chunks))
     if num_io_workers <= 1 or len(chunks) <= 1:
         local_start = 0
