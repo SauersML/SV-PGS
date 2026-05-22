@@ -182,10 +182,49 @@ list_diseases() {
   fi
 }
 
+sweep_zombie_gpu_procs() {
+  # Reclaim GPU memory held by stale CUDA contexts from prior killed runs.
+  # Only kills processes owned by the current user that are NOT ancestors of
+  # this shell — so we never SIGKILL ourselves, our parent shell, sshd, etc.
+  command -v nvidia-smi >/dev/null 2>&1 || return 0
+  local self_pid=$$
+  local skip_pids=" $self_pid "
+  local p="$self_pid"
+  while [ -n "$p" ] && [ "$p" != "1" ] && [ "$p" != "0" ]; do
+    p=$(ps -o ppid= -p "$p" 2>/dev/null | tr -d ' ' || true)
+    [ -n "$p" ] && skip_pids+="$p "
+  done
+  local me
+  me=$(id -un)
+  local raw_pids
+  raw_pids=$(nvidia-smi --query-compute-apps=pid --format=csv,noheader 2>/dev/null | tr -d ' ')
+  [ -z "$raw_pids" ] && return 0
+  local killed=0
+  for pid in $raw_pids; do
+    [ -z "$pid" ] && continue
+    case "$skip_pids" in *" $pid "*) continue ;; esac
+    local owner
+    owner=$(ps -o user= -p "$pid" 2>/dev/null | tr -d ' ' || true)
+    [ "$owner" = "$me" ] || continue
+    local cmd
+    cmd=$(ps -o args= -p "$pid" 2>/dev/null | head -c 100 || true)
+    echo "  GPU sweep: killing stale GPU process pid=$pid user=$owner cmd=$cmd"
+    kill -9 "$pid" 2>/dev/null || true
+    killed=1
+  done
+  if [ "$killed" = "1" ]; then
+    # Driver needs a moment to reclaim the memory.
+    sleep 3
+    echo "  GPU sweep: state after reclaim:"
+    nvidia-smi --query-gpu=memory.used,memory.free --format=csv,noheader 2>/dev/null | sed 's/^/    /'
+  fi
+}
+
 run_variant_pass() {
   local variants="$1"
   local base="$2"
   echo "=== FIT PASS: variants=${variants}  base=${base} ==="
+  sweep_zombie_gpu_procs
   if is_all; then
     uv run sv-pgs run-all-of-us --all-diseases --variants "$variants" --output-dir "$base"
   else
