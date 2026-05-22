@@ -20,29 +20,31 @@ from typing import Callable
 
 import numpy as np
 
+from sv_pgs._typing import F64Array
 from sv_pgs.numeric import stable_sigmoid as _jax_stable_sigmoid
 
 
-def _sigmoid(values: np.ndarray) -> np.ndarray:
+def _sigmoid(values: F64Array) -> F64Array:
     """Numerically stable σ(x) returning a numpy array.
 
     We reuse the project's stable_sigmoid (JAX-backed) for consistency, then
     cast back to numpy so the rest of the solver stays in numpy.
     """
-    result = np.asarray(_jax_stable_sigmoid(values), dtype=np.float64)
+    result: F64Array = np.asarray(_jax_stable_sigmoid(values), dtype=np.float64)
     return result
 
 
-def _log1p_exp(values: np.ndarray) -> np.ndarray:
+def _log1p_exp(values: F64Array) -> F64Array:
     """Stable log(1 + exp(x)) = logaddexp(0, x)."""
-    return np.logaddexp(0.0, values)
+    result: F64Array = np.logaddexp(0.0, values)
+    return result
 
 
 @dataclass(slots=True)
 class TrustRegionResult:
-    beta: np.ndarray
-    alpha: np.ndarray
-    linear_predictor: np.ndarray
+    beta: F64Array
+    alpha: F64Array
+    linear_predictor: F64Array
     objective: float
     iterations: int
     converged: bool
@@ -51,12 +53,12 @@ class TrustRegionResult:
 
 def _steihaug_cg(
     *,
-    gradient: np.ndarray,
-    hvp: Callable[[np.ndarray], np.ndarray],
+    gradient: F64Array,
+    hvp: Callable[[F64Array], F64Array],
     radius: float,
     tolerance: float,
     max_iterations: int,
-) -> tuple[np.ndarray, bool]:
+) -> tuple[F64Array, bool]:
     """Steihaug-Toint truncated CG for the TR subproblem.
 
     Returns (step, hit_boundary).
@@ -96,7 +98,7 @@ def _steihaug_cg(
     return p, False
 
 
-def _to_boundary(p: np.ndarray, d: np.ndarray, radius: float) -> float:
+def _to_boundary(p: F64Array, d: F64Array, radius: float) -> float:
     """Solve ‖p + τ d‖ = radius for τ > 0."""
     a = float(d @ d)
     b = 2.0 * float(p @ d)
@@ -104,19 +106,19 @@ def _to_boundary(p: np.ndarray, d: np.ndarray, radius: float) -> float:
     discriminant = b * b - 4.0 * a * c
     # Clamp tiny negative discriminant from roundoff.
     discriminant = max(discriminant, 0.0)
-    return (-b + np.sqrt(discriminant)) / (2.0 * a)
+    return float((-b + np.sqrt(discriminant)) / (2.0 * a))
 
 
 def trust_region_newton_logistic(
     *,
-    matvec_design: Callable[[np.ndarray], np.ndarray],
-    matvec_design_transpose: Callable[[np.ndarray], np.ndarray],
-    covariate_matrix: np.ndarray,
-    targets: np.ndarray,
-    prior_variances: np.ndarray,
-    predictor_offset: np.ndarray,
-    beta_init: np.ndarray,
-    alpha_init: np.ndarray,
+    matvec_design: Callable[[F64Array], F64Array],
+    matvec_design_transpose: Callable[[F64Array], F64Array],
+    covariate_matrix: F64Array,
+    targets: F64Array,
+    prior_variances: F64Array,
+    predictor_offset: F64Array,
+    beta_init: F64Array,
+    alpha_init: F64Array,
     max_iterations: int = 30,
     initial_radius: float = 1.0,
     radius_max: float = 100.0,
@@ -167,48 +169,50 @@ def trust_region_newton_logistic(
     safe_tau = np.where(tau_sq > 0.0, tau_sq, np.finfo(np.float64).tiny)
     d_inv = 1.0 / safe_tau
 
-    def design_mv(v: np.ndarray) -> np.ndarray:
+    def design_mv(v: F64Array) -> F64Array:
         if p_dim == 0:
             return np.zeros(n_samples, dtype=np.float64)
-        return np.asarray(matvec_design(v), dtype=np.float64).ravel()
+        result: F64Array = np.asarray(matvec_design(v), dtype=np.float64).ravel()
+        return result
 
-    def design_mv_t(u: np.ndarray) -> np.ndarray:
+    def design_mv_t(u: F64Array) -> F64Array:
         if p_dim == 0:
             return np.zeros(0, dtype=np.float64)
-        return np.asarray(matvec_design_transpose(u), dtype=np.float64).ravel()
+        result: F64Array = np.asarray(matvec_design_transpose(u), dtype=np.float64).ravel()
+        return result
 
-    def linear_predictor(beta_vec: np.ndarray, alpha_vec: np.ndarray) -> np.ndarray:
-        eta = offset.copy()
+    def linear_predictor(beta_vec: F64Array, alpha_vec: F64Array) -> F64Array:
+        eta: F64Array = offset.copy()
         if p_dim > 0:
             eta = eta + design_mv(beta_vec)
         if q_dim > 0:
             eta = eta + W @ alpha_vec
         return eta
 
-    def negative_objective(eta: np.ndarray, beta_vec: np.ndarray) -> float:
+    def negative_objective(eta: F64Array, beta_vec: F64Array) -> float:
         # -f = -Σ[y η - log1pexp(η)] + 1/2 βᵀ D⁻¹ β
         data_term = float(np.sum(_log1p_exp(eta) - y * eta))
         prior_term = 0.5 * float(beta_vec @ (d_inv * beta_vec)) if p_dim > 0 else 0.0
         return data_term + prior_term
 
-    def joint_gradient(eta: np.ndarray, beta_vec: np.ndarray) -> np.ndarray:
+    def joint_gradient(eta: F64Array, beta_vec: F64Array) -> F64Array:
         residual = _sigmoid(eta) - y  # ∇η (-f) at the data term
-        grad = np.empty(p_dim + q_dim, dtype=np.float64)
+        grad: F64Array = np.empty(p_dim + q_dim, dtype=np.float64)
         if p_dim > 0:
             grad[:p_dim] = design_mv_t(residual) + d_inv * beta_vec
         if q_dim > 0:
             grad[p_dim:] = W.T @ residual
         return grad
 
-    def hvp_factory(eta: np.ndarray) -> Callable[[np.ndarray], np.ndarray]:
+    def hvp_factory(eta: F64Array) -> Callable[[F64Array], F64Array]:
         sig = _sigmoid(eta)
         s_diag = sig * (1.0 - sig)
         # Floor S slightly so saturated η don't make H singular along data dirs;
         # the prior D⁻¹ still keeps the β block PD on its own when τ² < ∞.
         s_diag = np.maximum(s_diag, 0.0)
 
-        def hvp(v: np.ndarray) -> np.ndarray:
-            out = np.empty_like(v)
+        def hvp(v: F64Array) -> F64Array:
+            out: F64Array = np.empty_like(v)
             v_beta = v[:p_dim]
             v_alpha = v[p_dim:]
             # η-space tangent direction
