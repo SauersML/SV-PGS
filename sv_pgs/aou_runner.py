@@ -820,6 +820,164 @@ def _finish_plink_cache_warmup(warmup: _PlinkCacheWarmup | None) -> None:
     warmup.executor.shutdown(wait=True, cancel_futures=True)
 
 
+def _format_metric(value: object) -> str:
+    if value is None:
+        return "None"
+    if isinstance(value, bool):
+        return str(value)
+    if isinstance(value, float):
+        return f"{value:.6g}"
+    return str(value)
+
+
+def _emit_loud_test_banner(metrics: dict[str, object], *, label: str, source: str) -> None:
+    """One-line `>>> TEST ... <<<` banner, matching pipeline.py's end-of-fit format.
+
+    Trait family is inferred from which metric keys are present: test_auc =>
+    binary, test_r2 => quantitative. Both prefixes coexist with the same
+    `grep '>>> TEST'` recipe operators already use on live runs.
+    """
+    n = metrics.get("test_n", metrics.get("test_sample_count"))
+    if "test_auc" in metrics or "test_log_loss" in metrics or "test_accuracy" in metrics:
+        log(
+            f"  >>> TEST [{label} | {source}] AUC={_format_metric(metrics.get('test_auc'))}  "
+            f"log_loss={_format_metric(metrics.get('test_log_loss'))}  "
+            f"accuracy={_format_metric(metrics.get('test_accuracy'))}  "
+            f"n={_format_metric(n)} <<<"
+        )
+    elif "test_r2" in metrics or "test_rmse" in metrics or "test_mse" in metrics:
+        log(
+            f"  >>> TEST [{label} | {source}] R2={_format_metric(metrics.get('test_r2'))}  "
+            f"RMSE={_format_metric(metrics.get('test_rmse'))}  "
+            f"MSE={_format_metric(metrics.get('test_mse'))}  "
+            f"n={_format_metric(n)} <<<"
+        )
+
+
+def _log_cached_test_evals_from_summary(work_dir: Path, *, label: str) -> bool:
+    """Log every test_* metric from a cached summary.json.gz, if one exists."""
+    summary_path = work_dir / "summary.json.gz"
+    if not summary_path.exists():
+        return False
+    from sv_pgs.io import _open_text_file
+
+    try:
+        with _open_text_file(summary_path, "rt") as handle:
+            payload = json.loads(handle.read())
+    except (OSError, ValueError) as exc:
+        log(f"  CACHED RESULT [{label}]: failed to read {summary_path.name}: {exc}")
+        return False
+    if not isinstance(payload, dict):
+        log(f"  CACHED RESULT [{label}]: {summary_path.name} is not a JSON object")
+        return False
+    test_items = sorted(
+        (key, value) for key, value in payload.items() if key.startswith("test_")
+    )
+    log(f"=== CACHED RESULT TEST EVALS [{label}] from {summary_path.name} ===")
+    if not test_items:
+        log("  (summary has no test_* metrics — fit likely ran without a held-out test set)")
+        return True
+    for key, value in test_items:
+        log(f"  {key} = {_format_metric(value)}")
+    _emit_loud_test_banner(dict(test_items), label=label, source="cached summary")
+    return True
+
+
+def _log_cached_test_evals_from_history(work_dir: Path, *, label: str) -> bool:
+    """If only a partial CACHED FIT exists, surface the latest per-epoch test row.
+
+    `training_history.tsv` is appended row-by-row during EM (one row per
+    validation epoch) with columns documented in
+    `_build_per_epoch_history_writer`. Even mid-fit / interrupted runs leave
+    a usable last row, so reporting it at job start lets the operator see
+    how far the previous run got without rereading the log.
+    """
+    history_path = work_dir / "training_history.tsv"
+    if not history_path.exists():
+        return False
+    try:
+        with history_path.open("r", encoding="utf-8", newline="") as handle:
+            import csv as _csv
+
+            reader = _csv.DictReader(handle, delimiter="\t")
+            last_row: dict[str, str] | None = None
+            for row in reader:
+                last_row = row
+    except OSError as exc:
+        log(f"  CACHED FIT [{label}]: failed to read {history_path.name}: {exc}")
+        return False
+    if last_row is None:
+        return False
+
+    def _coerce(raw: str | None) -> float | int | str | None:
+        if raw is None or raw == "":
+            return None
+        try:
+            ivalue = int(raw)
+            if str(ivalue) == raw:
+                return ivalue
+        except ValueError:
+            pass
+        try:
+            return float(raw)
+        except ValueError:
+            return raw
+
+    parsed: dict[str, object] = {key: _coerce(value) for key, value in last_row.items()}
+    log(
+        f"=== CACHED FIT TEST EVALS [{label}] from {history_path.name} "
+        f"(epoch {parsed.get('epoch')}, no summary.json.gz yet) ==="
+    )
+    test_items = sorted(
+        (key, value)
+        for key, value in parsed.items()
+        if key.startswith("test_") and value is not None
+    )
+    if not test_items:
+        log("  (history has no test_* values yet — first validation epoch not reached)")
+        return True
+    for key, value in test_items:
+        log(f"  {key} = {_format_metric(value)}")
+    _emit_loud_test_banner(dict(test_items), label=label, source=f"history epoch {parsed.get('epoch')}")
+    return True
+
+
+def _log_cached_test_evals(work_dir: Path, *, label: str | None = None) -> bool:
+    """Surface any cached test set numbers for `work_dir` at the very start of a job.
+
+    Preference order:
+      1) summary.json.gz (CACHED result, fit fully completed) — strongest signal.
+      2) training_history.tsv (CACHED fit, possibly mid-EM) — best partial signal.
+
+    Returns True iff something was logged. The two sources are not mutually
+    exclusive on disk, but we only print the strongest one to avoid noise.
+    """
+    resolved_label = label if label is not None else work_dir.name
+    if _log_cached_test_evals_from_summary(work_dir, label=resolved_label):
+        return True
+    if _log_cached_test_evals_from_history(work_dir, label=resolved_label):
+        return True
+    return False
+
+
+def _log_all_cached_test_evals(base_dir: Path) -> None:
+    """Scan base_dir for cached per-disease results and dump every test eval upfront."""
+    if not base_dir.exists():
+        return
+    candidates = sorted(
+        candidate
+        for candidate in base_dir.glob("*_results")
+        if candidate.is_dir()
+        and ((candidate / "summary.json.gz").exists() or (candidate / "training_history.tsv").exists())
+    )
+    if not candidates:
+        return
+    log(f"=== SWEEP PRE-FLIGHT: {len(candidates)} CACHED JOB(S) FOUND IN {base_dir} ===")
+    for candidate in candidates:
+        _log_cached_test_evals(candidate, label=candidate.name)
+    log("=== SWEEP PRE-FLIGHT: end of cached-result summary ===")
+
+
 def run_all_of_us(
     disease: str,
     chromosomes: list[int],
@@ -869,6 +1027,11 @@ def run_all_of_us(
     from sv_pgs.progress import set_log_file, start_heartbeat
     log_path = work_dir / f"{disease_def.canonical_name}.{time.strftime('%Y%m%d_%H%M%S')}.log"
     set_log_file(log_path)
+
+    # Dump any cached held-out test evals at the very start so a `tail -f` on
+    # the log shows the already-known numbers before the (potentially long)
+    # cache-validation / rerun work begins.
+    _log_cached_test_evals(work_dir, label=disease_def.canonical_name)
 
     # Background sampler: emits a periodic main-thread stack + CPU/GPU/mem
     # snapshot so a stall in the main thread is no longer silent.
@@ -1211,6 +1374,10 @@ def run_all_of_us_all_diseases(
     """
     base_dir = Path(output_base)
     base_dir.mkdir(parents=True, exist_ok=True)
+    # Print every already-cached test set eval up front so operators see the
+    # known numbers immediately even if the sweep is about to spend hours on
+    # remaining diseases or cache re-validation.
+    _log_all_cached_test_evals(base_dir)
     failures: list[tuple[str, str]] = []
     for disease_definition in DISEASE_DEFINITIONS:
         disease_output_dir = base_dir / f"{disease_definition.canonical_name}_results"
