@@ -820,6 +820,13 @@ def _finish_plink_cache_warmup(warmup: _PlinkCacheWarmup | None) -> None:
     warmup.executor.shutdown(wait=True, cancel_futures=True)
 
 
+# Process-level dedupe so `_log_cached_test_evals(...)` emits each cached
+# work_dir at most once per Python process. Without this, a sweep over 19
+# diseases would re-print every sibling's cached numbers 20 times (once in
+# the upfront scan, once per per-disease entry that re-scans the parent).
+_LOGGED_CACHED_EVALS: set[str] = set()
+
+
 def _format_metric(value: object) -> str:
     if value is None:
         return "None"
@@ -949,21 +956,38 @@ def _log_cached_test_evals(work_dir: Path, *, label: str | None = None) -> bool:
       1) summary.json.gz (CACHED result, fit fully completed) — strongest signal.
       2) training_history.tsv (CACHED fit, possibly mid-EM) — best partial signal.
 
-    Returns True iff something was logged. The two sources are not mutually
-    exclusive on disk, but we only print the strongest one to avoid noise.
+    Dedupes via `_LOGGED_CACHED_EVALS`: each resolved work_dir is logged at
+    most once per Python process so single-disease + sweep entry points don't
+    spam the same numbers repeatedly. Returns True iff something was logged
+    *on this call* (so callers can decide whether to follow up with extra
+    framing); a duplicate-suppressed call returns False.
     """
+    try:
+        key = str(work_dir.resolve())
+    except OSError:
+        key = str(work_dir)
+    if key in _LOGGED_CACHED_EVALS:
+        return False
     resolved_label = label if label is not None else work_dir.name
-    if _log_cached_test_evals_from_summary(work_dir, label=resolved_label):
-        return True
-    if _log_cached_test_evals_from_history(work_dir, label=resolved_label):
-        return True
-    return False
+    logged = (
+        _log_cached_test_evals_from_summary(work_dir, label=resolved_label)
+        or _log_cached_test_evals_from_history(work_dir, label=resolved_label)
+    )
+    if logged:
+        _LOGGED_CACHED_EVALS.add(key)
+    return logged
 
 
-def _log_all_cached_test_evals(base_dir: Path) -> None:
-    """Scan base_dir for cached per-disease results and dump every test eval upfront."""
+def _log_all_cached_test_evals(base_dir: Path, *, header: str = "PRE-FLIGHT") -> int:
+    """Scan base_dir for cached per-job results and dump every test eval upfront.
+
+    Returns the number of cached jobs found (whether or not each one was
+    actually re-emitted — duplicates are silently suppressed by
+    `_log_cached_test_evals`). `header` is a short tag so the framing reads
+    sensibly whether this is the sweep pre-flight or a single-disease entry.
+    """
     if not base_dir.exists():
-        return
+        return 0
     candidates = sorted(
         candidate
         for candidate in base_dir.glob("*_results")
@@ -971,11 +995,28 @@ def _log_all_cached_test_evals(base_dir: Path) -> None:
         and ((candidate / "summary.json.gz").exists() or (candidate / "training_history.tsv").exists())
     )
     if not candidates:
-        return
-    log(f"=== SWEEP PRE-FLIGHT: {len(candidates)} CACHED JOB(S) FOUND IN {base_dir} ===")
-    for candidate in candidates:
+        return 0
+    unlogged = [
+        candidate
+        for candidate in candidates
+        if str(_safe_resolve(candidate)) not in _LOGGED_CACHED_EVALS
+    ]
+    if not unlogged:
+        # Everything we'd print has already been emitted earlier in this
+        # process — stay quiet rather than print an empty banner.
+        return len(candidates)
+    log(f"=== {header}: {len(unlogged)} CACHED JOB(S) FOUND IN {base_dir} ===")
+    for candidate in unlogged:
         _log_cached_test_evals(candidate, label=candidate.name)
-    log("=== SWEEP PRE-FLIGHT: end of cached-result summary ===")
+    log(f"=== {header}: end of cached-result summary ===")
+    return len(candidates)
+
+
+def _safe_resolve(path: Path) -> Path:
+    try:
+        return path.resolve()
+    except OSError:
+        return path
 
 
 def run_all_of_us(
@@ -1028,10 +1069,20 @@ def run_all_of_us(
     log_path = work_dir / f"{disease_def.canonical_name}.{time.strftime('%Y%m%d_%H%M%S')}.log"
     set_log_file(log_path)
 
-    # Dump any cached held-out test evals at the very start so a `tail -f` on
-    # the log shows the already-known numbers before the (potentially long)
-    # cache-validation / rerun work begins.
-    _log_cached_test_evals(work_dir, label=disease_def.canonical_name)
+    # Dump any cached held-out test evals at the very start so a `tail -f`
+    # on the log shows the already-known numbers before the (potentially
+    # long) cache-validation / rerun work begins. We scan the parent base
+    # dir so single-disease invocations (e.g. `./run.sh hypertension`)
+    # still surface every *sibling* disease's cached numbers, not just
+    # this one's. The dedupe set keeps the sweep entry point's earlier
+    # upfront scan from being re-emitted here.
+    base_for_scan = work_dir.parent if work_dir.parent != work_dir else work_dir
+    found = _log_all_cached_test_evals(base_for_scan, header=f"JOB START [{disease_def.canonical_name}]")
+    if found == 0:
+        # Nothing in parent — fall back to just this disease's work_dir on
+        # the off-chance it exists and parent didn't match the *_results
+        # glob (e.g. an output dir whose name doesn't end in _results).
+        _log_cached_test_evals(work_dir, label=disease_def.canonical_name)
 
     # Background sampler: emits a periodic main-thread stack + CPU/GPU/mem
     # snapshot so a stall in the main thread is no longer silent.
@@ -1377,7 +1428,7 @@ def run_all_of_us_all_diseases(
     # Print every already-cached test set eval up front so operators see the
     # known numbers immediately even if the sweep is about to spend hours on
     # remaining diseases or cache re-validation.
-    _log_all_cached_test_evals(base_dir)
+    _log_all_cached_test_evals(base_dir, header="SWEEP PRE-FLIGHT")
     failures: list[tuple[str, str]] = []
     for disease_definition in DISEASE_DEFINITIONS:
         disease_output_dir = base_dir / f"{disease_definition.canonical_name}_results"
