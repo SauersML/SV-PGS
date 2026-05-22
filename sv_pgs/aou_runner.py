@@ -978,6 +978,38 @@ def _log_cached_test_evals(work_dir: Path, *, label: str | None = None) -> bool:
     return logged
 
 
+def _has_loggable_test_evals(work_dir: Path) -> bool:
+    """Cheap predicate: would `_log_cached_test_evals` actually print anything?
+
+    A header-only `training_history.tsv` (created by a prior run that was
+    interrupted before the first validation epoch) is technically present
+    on disk but has no test values to surface; treating it as a hit would
+    print empty `JOB START` banners. Same logic for a summary.json.gz that
+    we can't parse — the inner call will report the read error itself, but
+    we want the outer banner to be true.
+    """
+    summary_path = work_dir / "summary.json.gz"
+    if summary_path.exists():
+        return True
+    history_path = work_dir / "training_history.tsv"
+    if history_path.exists():
+        try:
+            with history_path.open("r", encoding="utf-8", newline="") as handle:
+                import csv as _csv
+
+                reader = _csv.DictReader(handle, delimiter="\t")
+                for row in reader:
+                    # Any non-empty test_* cell makes this row worth surfacing.
+                    if any(
+                        key.startswith("test_") and value not in (None, "")
+                        for key, value in row.items()
+                    ):
+                        return True
+        except OSError:
+            return False
+    return False
+
+
 def _log_all_cached_test_evals(base_dir: Path, *, header: str = "PRE-FLIGHT") -> int:
     """Scan base_dir for cached per-job results and dump every test eval upfront.
 
@@ -985,14 +1017,17 @@ def _log_all_cached_test_evals(base_dir: Path, *, header: str = "PRE-FLIGHT") ->
     actually re-emitted — duplicates are silently suppressed by
     `_log_cached_test_evals`). `header` is a short tag so the framing reads
     sensibly whether this is the sweep pre-flight or a single-disease entry.
+
+    A candidate dir only counts if it actually has test eval content to
+    surface; a stale header-only training_history.tsv from a prior
+    interrupted run no longer trips an empty banner.
     """
     if not base_dir.exists():
         return 0
     candidates = sorted(
         candidate
         for candidate in base_dir.glob("*_results")
-        if candidate.is_dir()
-        and ((candidate / "summary.json.gz").exists() or (candidate / "training_history.tsv").exists())
+        if candidate.is_dir() and _has_loggable_test_evals(candidate)
     )
     if not candidates:
         return 0
