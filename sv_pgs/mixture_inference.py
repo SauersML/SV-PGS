@@ -97,6 +97,10 @@ from sv_pgs.genotype import (
 from sv_pgs.linear_solvers import build_linear_operator, solve_spd_system, stochastic_logdet
 from sv_pgs.numeric import stable_sigmoid
 from sv_pgs.preprocessing import collapse_tie_groups
+from sv_pgs._typing import (
+    JaxArray,
+    NDArray,
+)
 from sv_pgs.progress import log, mem
 from sv_pgs.tr_newton import trust_region_newton_logistic
 
@@ -130,7 +134,7 @@ _GPU_INVERSE_DIAGONAL_MAX_BLOCK = 4_096
 
 
 def _gpu_exact_variant_tile_max_variants(
-    cupy,
+    cupy: Any,
     sample_count: int,
     *,
     matrix_itemsize: int = 8,
@@ -192,7 +196,7 @@ def _gpu_exact_variant_resident_cache_bytes(
 
 def _gpu_exact_variant_full_matrix_required_bytes(
     *,
-    cupy,
+    cupy: Any,
     sample_count: int,
     variant_count: int,
     covariate_count: int,
@@ -227,7 +231,7 @@ def _gpu_exact_variant_full_matrix_required_bytes(
 
 def _gpu_exact_variant_full_matrix_additional_bytes(
     *,
-    cupy,
+    cupy: Any,
     sample_count: int,
     variant_count: int,
     covariate_count: int,
@@ -250,7 +254,7 @@ def _gpu_exact_variant_full_matrix_additional_bytes(
     return max(int(required_bytes) - int(resident_cache_bytes), 0)
 
 
-def _release_cupy_memory_pool(cupy) -> None:
+def _release_cupy_memory_pool(cupy: Any) -> None:
     gc.collect()
     for pool_getter_name in ("get_default_memory_pool", "get_default_pinned_memory_pool"):
         try:
@@ -262,7 +266,7 @@ def _release_cupy_memory_pool(cupy) -> None:
             continue
 
 
-def _gpu_live_usable_bytes(cupy) -> int:
+def _gpu_live_usable_bytes(cupy: Any) -> int:
     _release_cupy_memory_pool(cupy)
     free_bytes = int(_gpu_free_bytes(cupy))
     if free_bytes <= 0:
@@ -275,7 +279,7 @@ def _gpu_live_usable_bytes(cupy) -> int:
 
 
 def _gpu_exact_variant_full_matrix_fits(
-    cupy,
+    cupy: Any,
     *,
     sample_count: int,
     variant_count: int,
@@ -298,7 +302,7 @@ def _gpu_exact_variant_full_matrix_fits(
 
 
 def _gpu_exact_variant_tile_size(
-    cupy,
+    cupy: Any,
     *,
     sample_count: int,
     variant_count: int,
@@ -335,10 +339,10 @@ def _gpu_exact_variant_tile_size(
 
 
 def _gpu_exact_variant_inverse_diagonal(
-    cholesky_factor_gpu,
+    cholesky_factor_gpu: Any,
     *,
-    solve_triangular_gpu,
-    cupy,
+    solve_triangular_gpu: Callable[..., Any],
+    cupy: Any,
 ) -> Any:
     # Inherit dtype from the Cholesky factor (float32 on real GPUs, float64
     # in mocked tests). Allocating the RHS at a different dtype would force
@@ -411,10 +415,10 @@ class PriorDesign:
     encode those relationships so the model can learn how metadata
     predicts effect magnitude.
     """
-    design_matrix: np.ndarray           # each row = one variant's metadata features
+    design_matrix: NDArray           # each row = one variant's metadata features
     feature_names: list[str]            # human-readable names for each feature column
     feature_specs: tuple[ScaleModelFeatureSpec, ...]  # compiled feature descriptors for fast reuse
-    class_membership_matrix: np.ndarray # which variant class(es) each variant belongs to
+    class_membership_matrix: NDArray # which variant class(es) each variant belongs to
     inverse_class_lookup: dict[int, VariantClass]  # column index -> VariantClass enum
 
 
@@ -438,15 +442,15 @@ class _SampleSpacePreconditionerCacheEntry:
     batch_size: int
     rank: int
     random_seed: int
-    prior_variances: np.ndarray
-    diagonal_noise: np.ndarray
-    diagonal_preconditioner: np.ndarray
+    prior_variances: NDArray
+    diagonal_noise: NDArray
+    diagonal_preconditioner: NDArray
     preconditioner: Any
     previous_iterations: int | None = None
     last_iterations: int | None = None
-    nystrom_basis_cpu: np.ndarray | None = None
+    nystrom_basis_cpu: NDArray | None = None
     nystrom_basis_gpu: Any = None  # cached GPU Nyström basis (cupy array)
-    nystrom_factor_cpu: np.ndarray | None = None
+    nystrom_factor_cpu: NDArray | None = None
     nystrom_factor_gpu: Any = None  # cached GPU Nyström factor (cupy array)
     global_background: bool = False
 
@@ -475,9 +479,9 @@ class ScaleModelFeatureSpec:
 
 @dataclass(slots=True)
 class _PriorAnnotationTables:
-    continuous_values_by_source: dict[str, np.ndarray]
-    factor_weights_by_source: dict[str, dict[str, np.ndarray]]
-    nested_weights_by_source: dict[str, dict[int, dict[str, np.ndarray]]]
+    continuous_values_by_source: dict[str, NDArray]
+    factor_weights_by_source: dict[str, dict[str, NDArray]]
+    nested_weights_by_source: dict[str, dict[int, dict[str, NDArray]]]
 
 
 @dataclass(slots=True)
@@ -492,20 +496,20 @@ class _PriorAnnotationFeatureNames:
 
 @dataclass(slots=True)
 class VariationalFitResult:
-    alpha: np.ndarray  # float32
-    beta_reduced: np.ndarray  # float32
-    beta_variance: np.ndarray  # float64 — preserves precision for shrunk variants
-    prior_scales: np.ndarray  # float64 — preserves precision for shrunk variants
+    alpha: NDArray  # float32
+    beta_reduced: NDArray  # float32
+    beta_variance: NDArray  # float64 — preserves precision for shrunk variants
+    prior_scales: NDArray  # float64 — preserves precision for shrunk variants
     global_scale: float
     class_tpb_shape_a: dict[VariantClass, float]
     class_tpb_shape_b: dict[VariantClass, float]
-    scale_model_coefficients: np.ndarray
+    scale_model_coefficients: NDArray
     scale_model_feature_names: list[str]
     sigma_error2: float
     objective_history: list[float]
     validation_history: list[float]
-    member_prior_variances: np.ndarray  # float64 — preserves precision for shrunk variants
-    linear_predictor: np.ndarray | None = None
+    member_prior_variances: NDArray  # float64 — preserves precision for shrunk variants
+    linear_predictor: NDArray | None = None
     selected_iteration_count: int | None = None
     converged: bool = False
     final_parameter_change: float | None = None
@@ -521,46 +525,46 @@ class VariationalFitCheckpoint:
     prior_design_signature: str
     validation_enabled: bool
     completed_iterations: int
-    alpha_state: np.ndarray
-    beta_state: np.ndarray
-    local_scale: np.ndarray
-    auxiliary_delta: np.ndarray
+    alpha_state: NDArray
+    beta_state: NDArray
+    local_scale: NDArray
+    auxiliary_delta: NDArray
     sigma_error2: float
     global_scale: float
-    scale_model_coefficients: np.ndarray
-    tpb_shape_a_vector: np.ndarray
-    tpb_shape_b_vector: np.ndarray
+    scale_model_coefficients: NDArray
+    tpb_shape_a_vector: NDArray
+    tpb_shape_b_vector: NDArray
     objective_history: list[float]
     validation_history: list[float]
-    previous_alpha: np.ndarray | None
-    previous_beta: np.ndarray | None
-    previous_local_scale: np.ndarray | None
-    previous_theta: np.ndarray | None
-    previous_tpb_shape_a_vector: np.ndarray | None
-    previous_tpb_shape_b_vector: np.ndarray | None
+    previous_alpha: NDArray | None
+    previous_beta: NDArray | None
+    previous_local_scale: NDArray | None
+    previous_theta: NDArray | None
+    previous_tpb_shape_a_vector: NDArray | None
+    previous_tpb_shape_b_vector: NDArray | None
     best_validation_metric: float | None
-    best_alpha: np.ndarray | None
-    best_beta: np.ndarray | None
-    best_beta_variance: np.ndarray | None
-    best_local_scale: np.ndarray | None
-    best_theta: np.ndarray | None
+    best_alpha: NDArray | None
+    best_beta: NDArray | None
+    best_beta_variance: NDArray | None
+    best_local_scale: NDArray | None
+    best_theta: NDArray | None
     best_sigma_error2: float | None
-    best_tpb_shape_a_vector: np.ndarray | None
-    best_tpb_shape_b_vector: np.ndarray | None
+    best_tpb_shape_a_vector: NDArray | None
+    best_tpb_shape_b_vector: NDArray | None
     best_validation_iteration: int | None = None
     completed_blocks_in_iteration: int = 0
-    beta_variance_state: np.ndarray | None = None
-    reduced_second_moment: np.ndarray | None = None
-    epoch_reduced_prior_variances: np.ndarray | None = None
+    beta_variance_state: NDArray | None = None
+    reduced_second_moment: NDArray | None = None
+    epoch_reduced_prior_variances: NDArray | None = None
     binary_block_resume_state: dict[str, object] | None = None
     stochastic_block_size: int | None = None
     # Wave 2 diagnostics + accelerator state. These default cleanly so old
     # pickles (written before these fields existed) load via ``__setstate__``
     # with empty/None values — see ``test_old_checkpoint_loads_with_new_fields``.
     elbo_history: list[float] = field(default_factory=list)
-    anderson_iterates: list[np.ndarray] | None = None
-    anderson_map_values: list[np.ndarray] | None = None
-    anderson_residuals: list[np.ndarray] | None = None
+    anderson_iterates: list[NDArray] | None = None
+    anderson_map_values: list[NDArray] | None = None
+    anderson_residuals: list[NDArray] | None = None
     anderson_memory_depth: int | None = None
 
     def __getstate__(self) -> dict[str, object]:
@@ -602,10 +606,10 @@ class PosteriorState:
     alpha captures non-genetic effects (age, sex, PCs, intercept).
     beta captures each variant's estimated effect on the trait.
     """
-    alpha: np.ndarray          # covariate coefficients (intercept, age, sex, PCs ...)
-    beta: np.ndarray           # estimated effect size per variant (reduced/unique set)
-    beta_variance: np.ndarray  # uncertainty in each beta (larger = less confident)
-    linear_predictor: np.ndarray  # full predicted values for each sample
+    alpha: NDArray          # covariate coefficients (intercept, age, sex, PCs ...)
+    beta: NDArray           # estimated effect size per variant (reduced/unique set)
+    beta_variance: NDArray  # uncertainty in each beta (larger = less confident)
+    linear_predictor: NDArray  # full predicted values for each sample
     collapsed_objective: float    # model quality score (higher = better fit)
     sigma_error2: float           # unexplained noise variance (fixed at 1.0 for binary)
 
@@ -621,12 +625,12 @@ class _RestrictedPosteriorWarmStart:
     sample_space_background_cpu_preconditioner: _SampleSpacePreconditionerCacheEntry | None = None
     posterior_working_set_variant_count: int | None = None
     posterior_working_set_matrix_token: int | None = None
-    posterior_working_set_ever_active: np.ndarray | None = None
-    posterior_working_set_screening_score: np.ndarray | None = None
+    posterior_working_set_ever_active: NDArray | None = None
+    posterior_working_set_screening_score: NDArray | None = None
     posterior_working_set_target_size: int | None = None
     weighted_covariate_projection_matrix_token: int | None = None
     weighted_covariate_projection_signature: str | None = None
-    weighted_covariate_projection: np.ndarray | None = None
+    weighted_covariate_projection: NDArray | None = None
     weighted_covariate_projection_gpu: Any = None
     exact_variant_full_matrix_cache_enabled: bool = False
     exact_variant_full_matrix_token: int | None = None
@@ -637,12 +641,12 @@ class _RestrictedPosteriorWarmStart:
 
 @dataclass(slots=True)
 class _SampleSpaceCGLanczosRecorder:
-    monitored_columns: np.ndarray
+    monitored_columns: NDArray
     maximum_steps: int
-    alpha_history: np.ndarray
-    beta_history: np.ndarray
-    step_lengths: np.ndarray
-    column_to_slot: np.ndarray
+    alpha_history: NDArray
+    beta_history: NDArray
+    step_lengths: NDArray
+    column_to_slot: NDArray
 
 
 # Fields that affect convergence speed but not the mathematical model result.
@@ -838,10 +842,10 @@ def checkpoint_from_result(
 
 
 def _initialize_alpha_state(
-    covariate_matrix: np.ndarray,
-    targets: np.ndarray,
+    covariate_matrix: NDArray,
+    targets: NDArray,
     trait_type: TraitType,
-) -> np.ndarray:
+) -> NDArray:
     covariates = np.asarray(covariate_matrix, dtype=np.float64)
     target_array = np.asarray(targets, dtype=np.float64)
     if covariates.ndim != 2:
@@ -860,7 +864,7 @@ def _initialize_alpha_state(
 
 def _apply_binary_intercept_calibration(
     posterior_state: PosteriorState,
-    targets: np.ndarray,
+    targets: NDArray,
 ) -> PosteriorState:
     intercept_shift = np.float64(
         _calibrate_binary_intercept(
@@ -879,7 +883,7 @@ def _apply_binary_intercept_calibration(
         sigma_error2=float(posterior_state.sigma_error2),
     )
 
-def _gpu_cholesky_solve(right_hand_side, cholesky_factor_gpu, solve_triangular_gpu):
+def _gpu_cholesky_solve(right_hand_side: Any, cholesky_factor_gpu: Any, solve_triangular_gpu: Callable[..., Any]) -> Any:
     import cupy as cp
 
     factor_gpu = cp.asarray(cholesky_factor_gpu)
@@ -907,22 +911,22 @@ def _gpu_cholesky_solve(right_hand_side, cholesky_factor_gpu, solve_triangular_g
     return solution[:, 0] if rhs_was_vector else solution
 
 
-def _resolve_gpu_solve_triangular():
+def _resolve_gpu_solve_triangular() -> Callable[..., Any]:
     try:
         from cupyx.scipy.linalg import solve_triangular as cp_solve_triangular
     except ModuleNotFoundError:
         cp_solve_triangular = solve_triangular
-    return cp_solve_triangular
+    return cast(Callable[..., Any], cp_solve_triangular)
 
 
 def _covariates_only_fit_result(
-    covariate_matrix: np.ndarray,
-    targets: np.ndarray,
+    covariate_matrix: NDArray,
+    targets: NDArray,
     trait_type: TraitType,
     config: ModelConfig,
-    validation_data: tuple[StandardizedGenotypeMatrix | np.ndarray, np.ndarray, np.ndarray] | None,
-    predictor_offset: np.ndarray | None = None,
-    validation_offset: np.ndarray | None = None,
+    validation_data: tuple[StandardizedGenotypeMatrix | NDArray, NDArray, NDArray] | None,
+    predictor_offset: NDArray | None = None,
+    validation_offset: NDArray | None = None,
 ) -> VariationalFitResult:
     offset = (
         np.zeros(len(targets), dtype=np.float64)
@@ -1000,14 +1004,14 @@ def _covariates_only_fit_result(
     )
 
 def _fit_binary_alpha_with_offset(
-    covariate_matrix: np.ndarray,
-    targets: np.ndarray,
-    predictor_offset: np.ndarray,
+    covariate_matrix: NDArray,
+    targets: NDArray,
+    predictor_offset: NDArray,
     minimum_weight: float,
     max_iterations: int,
     gradient_tolerance: float,
-    alpha_init: np.ndarray | None = None,
-) -> np.ndarray:
+    alpha_init: NDArray | None = None,
+) -> NDArray:
     covariates = np.asarray(covariate_matrix, dtype=np.float64)
     target_array = np.asarray(targets, dtype=np.float64)
     offset = np.asarray(predictor_offset, dtype=np.float64).reshape(-1)
@@ -1095,7 +1099,7 @@ def _stochastic_sample_space_preconditioner_rank(
 def _stochastic_variant_blocks(
     variant_count: int,
     block_size: int,
-) -> list[np.ndarray]:
+) -> list[NDArray]:
     if variant_count < 1:
         return []
     safe_block_size = max(int(block_size), 1)
@@ -1190,16 +1194,16 @@ def _should_log_stochastic_block(block_count: int, total_blocks: int) -> bool:
 
 def _stochastic_epoch_objective(
     trait_type: TraitType,
-    targets: np.ndarray,
-    linear_predictor: np.ndarray,
-    beta: np.ndarray,
-    reduced_prior_variances: np.ndarray,
-    local_scale: np.ndarray,
-    auxiliary_delta: np.ndarray,
-    local_shape_a: np.ndarray,
-    local_shape_b: np.ndarray,
-    scale_model_coefficients: np.ndarray,
-    scale_penalty: np.ndarray,
+    targets: NDArray,
+    linear_predictor: NDArray,
+    beta: NDArray,
+    reduced_prior_variances: NDArray,
+    local_scale: NDArray,
+    auxiliary_delta: NDArray,
+    local_shape_a: NDArray,
+    local_shape_b: NDArray,
+    scale_model_coefficients: NDArray,
+    scale_penalty: NDArray,
 ) -> float:
     predictor = np.asarray(linear_predictor, dtype=np.float64)
     target_array = np.asarray(targets, dtype=np.float64)
@@ -1234,17 +1238,17 @@ def _stochastic_epoch_objective(
 
 
 def fit_variational_em(
-    genotypes: StandardizedGenotypeMatrix | np.ndarray,
-    covariates: np.ndarray,
-    targets: np.ndarray,
+    genotypes: StandardizedGenotypeMatrix | NDArray,
+    covariates: NDArray,
+    targets: NDArray,
     records: Sequence[VariantRecord],
     config: ModelConfig,
     tie_map: TieMap,
-    validation_data: tuple[StandardizedGenotypeMatrix | np.ndarray, np.ndarray, np.ndarray] | None = None,
+    validation_data: tuple[StandardizedGenotypeMatrix | NDArray, NDArray, NDArray] | None = None,
     resume_checkpoint: VariationalFitCheckpoint | None = None,
     checkpoint_callback: Callable[[VariationalFitCheckpoint], None] | None = None,
-    predictor_offset: np.ndarray | None = None,
-    validation_offset: np.ndarray | None = None,
+    predictor_offset: NDArray | None = None,
+    validation_offset: NDArray | None = None,
     # Optional hook for per-epoch monitoring. Fired exactly once at the end
     # of every outer iteration with a snapshot dict so callers (e.g. the
     # AoU pipeline) can compute richer metrics on a held-out cohort without
@@ -1324,26 +1328,26 @@ def fit_variational_em(
     # Anderson accelerator state. The memory depth is an internal solver policy,
     # not a user-facing model parameter.
     anderson_state: AndersonState = AndersonState(memory_depth=_ANDERSON_MEMORY_DEPTH)
-    previous_alpha: np.ndarray | None = None
-    previous_beta: np.ndarray | None = None
-    previous_local_scale: np.ndarray | None = None
-    previous_theta: np.ndarray | None = None
-    previous_tpb_shape_a_vector: np.ndarray | None = None
-    previous_tpb_shape_b_vector: np.ndarray | None = None
-    previous_linear_predictor: np.ndarray | None = None
+    previous_alpha: NDArray | None = None
+    previous_beta: NDArray | None = None
+    previous_local_scale: NDArray | None = None
+    previous_theta: NDArray | None = None
+    previous_tpb_shape_a_vector: NDArray | None = None
+    previous_tpb_shape_b_vector: NDArray | None = None
+    previous_linear_predictor: NDArray | None = None
     previous_objective: float | None = None
     best_validation_metric: float | None = None
-    best_alpha: np.ndarray | None = None
-    best_beta: np.ndarray | None = None
-    best_beta_variance: np.ndarray | None = None
-    best_local_scale: np.ndarray | None = None
-    best_theta: np.ndarray | None = None
+    best_alpha: NDArray | None = None
+    best_beta: NDArray | None = None
+    best_beta_variance: NDArray | None = None
+    best_local_scale: NDArray | None = None
+    best_theta: NDArray | None = None
     best_sigma_error2: float | None = None
-    best_tpb_shape_a_vector: np.ndarray | None = None
-    best_tpb_shape_b_vector: np.ndarray | None = None
+    best_tpb_shape_a_vector: NDArray | None = None
+    best_tpb_shape_b_vector: NDArray | None = None
     start_iteration = 0
 
-    def _copy_optional(array: np.ndarray | None) -> np.ndarray | None:
+    def _copy_optional(array: NDArray | None) -> NDArray | None:
         return None if array is None else np.asarray(array, dtype=np.float64).copy()
 
     def _copy_resume_state_value(value: object) -> object:
@@ -1371,16 +1375,16 @@ def fit_variational_em(
         completed_iterations: int,
         *,
         completed_blocks_in_iteration: int = 0,
-        beta_variance_state_override: np.ndarray | None = None,
-        reduced_second_moment_override: np.ndarray | None = None,
-        epoch_reduced_prior_variances_override: np.ndarray | None = None,
+        beta_variance_state_override: NDArray | None = None,
+        reduced_second_moment_override: NDArray | None = None,
+        epoch_reduced_prior_variances_override: NDArray | None = None,
         binary_block_resume_state_override: dict[str, object] | None = None,
         stochastic_block_size_override: int | None = None,
         global_scale_override: float | None = None,
-        scale_model_coefficients_override: np.ndarray | None = None,
-        tpb_shape_a_vector_override: np.ndarray | None = None,
-        tpb_shape_b_vector_override: np.ndarray | None = None,
-        auxiliary_delta_override: np.ndarray | None = None,
+        scale_model_coefficients_override: NDArray | None = None,
+        tpb_shape_a_vector_override: NDArray | None = None,
+        tpb_shape_b_vector_override: NDArray | None = None,
+        auxiliary_delta_override: NDArray | None = None,
     ) -> VariationalFitCheckpoint:
         return VariationalFitCheckpoint(
             config_signature=config_signature,
@@ -1658,7 +1662,7 @@ def fit_variational_em(
         f"stochastic={'yes' if use_stochastic_updates else 'no'}  "
         f"reason={'matrix on GPU → working-set' if gpu_resident else 'streaming from mmap → stochastic blocks' if use_stochastic_updates else 'small variant count → collapsed'}"
     )
-    beta_variance_state: np.ndarray | None = None
+    beta_variance_state: NDArray | None = None
     # Carry the saved posterior beta variance through to the collapsed path so
     # the first sigma_e2 update post-resume uses the real shrunk variance
     # (its trace_term term) instead of the unshrunk prior_variances fallback.
@@ -1672,8 +1676,8 @@ def fit_variational_em(
         beta_variance_state = np.asarray(
             resume_checkpoint.beta_variance_state, dtype=np.float64
         ).copy()
-    genetic_linear_predictor: np.ndarray | None = None
-    best_genetic_linear_predictor: np.ndarray | None = None
+    genetic_linear_predictor: NDArray | None = None
+    best_genetic_linear_predictor: NDArray | None = None
     restricted_posterior_warm_start = _RestrictedPosteriorWarmStart()
     fit_converged = False
     final_parameter_change: float | None = None
@@ -1860,10 +1864,10 @@ def fit_variational_em(
             "  variational inference mode: stochastic variant-block updates "
             + f"(block_size={block_size}, blocks_per_epoch={block_count})"
         )
-        _svi_cached_metadata_baseline_scales: np.ndarray | None = None
-        _svi_cached_baseline_reduced_prior_variances: np.ndarray | None = None
-        _svi_cached_reduced_prior_variances: np.ndarray | None = None
-        _svi_cache_signature: tuple = ()
+        _svi_cached_metadata_baseline_scales: NDArray | None = None
+        _svi_cached_baseline_reduced_prior_variances: NDArray | None = None
+        _svi_cached_reduced_prior_variances: NDArray | None = None
+        _svi_cache_signature: tuple[object, ...] = ()
         for outer_iteration in range(start_iteration, config.max_outer_iterations):
             log(f"  variational EM epoch {outer_iteration + 1}/{config.max_outer_iterations} start  sigma_e2={sigma_error2:.6f}  global_scale={global_scale:.6f}  mem={mem()}")
             epoch_wall_t0 = time.monotonic()
@@ -2438,7 +2442,7 @@ def fit_variational_em(
             except Exception as _elbo_err:  # noqa: BLE001
                 log(f"  ELBO computation skipped (SVI): {_elbo_err}")
                 elbo_history.append(float("nan"))
-            validation_linear_predictor: np.ndarray | None = None
+            validation_linear_predictor: NDArray | None = None
             validation_metric_this_epoch: float | None = None
             if validation_payload is not None:
                 should_validate = (
@@ -2617,14 +2621,14 @@ def fit_variational_em(
                 + f"initial={config.posterior_working_set_initial_size}, "
                 + f"max_passes={config.posterior_working_set_max_passes})"
             )
-        _cavi_cached_metadata_baseline_scales: np.ndarray | None = None
-        _cavi_cached_baseline_reduced_prior_variances: np.ndarray | None = None
-        _cavi_cached_reduced_prior_variances: np.ndarray | None = None
-        _cavi_cache_signature: tuple = ()
+        _cavi_cached_metadata_baseline_scales: NDArray | None = None
+        _cavi_cached_baseline_reduced_prior_variances: NDArray | None = None
+        _cavi_cached_reduced_prior_variances: NDArray | None = None
+        _cavi_cache_signature: tuple[object, ...] = ()
         # Carries the most recent E_q[beta^2] across outer iterations so the
         # E[1/lambda] precision override (opt-in) can be built from a prior
         # iteration's posterior state at the top of the next outer step.
-        reduced_second_moment_carry: np.ndarray | None = None
+        reduced_second_moment_carry: NDArray | None = None
         # Restore CAVI-path inter-iteration carries from checkpoint so a
         # resumed run re-enters the same EM trajectory bit-identically. The
         # SVI path has an equivalent restore via ``resume_beta_variance_state``
@@ -2714,7 +2718,7 @@ def fit_variational_em(
                 exact_solver_matrix_limit=config.exact_solver_matrix_limit,
             )
 
-            cavi_prior_precision_override: np.ndarray | None = None
+            cavi_prior_precision_override: NDArray | None = None
             if (
                 reduced_second_moment_carry is not None
                 and reduced_second_moment_carry.shape == reduced_prior_variances.shape
@@ -3330,7 +3334,7 @@ def fit_variational_em(
         log(f"  EM loop done after {len(objective_history)} iterations, computing final posterior diagnostics...  mem={mem()}")
     else:
         log(f"  EM loop done after {len(objective_history)} iterations, computing final point estimates only...  mem={mem()}")
-    final_prior_precision_override: np.ndarray | None = None
+    final_prior_precision_override: NDArray | None = None
     if config.final_posterior_diagnostics and beta_variance_state is not None:
         final_second_moment = np.asarray(
             beta_state * beta_state + np.asarray(beta_variance_state, dtype=np.float64),
@@ -3422,8 +3426,8 @@ def fit_variational_em(
 
 
 def _prepare_validation(
-    validation_data: tuple[StandardizedGenotypeMatrix | np.ndarray, np.ndarray, np.ndarray] | None,
-) -> tuple[StandardizedGenotypeMatrix | np.ndarray, np.ndarray, np.ndarray] | None:
+    validation_data: tuple[StandardizedGenotypeMatrix | NDArray, NDArray, NDArray] | None,
+) -> tuple[StandardizedGenotypeMatrix | NDArray, NDArray, NDArray] | None:
     if validation_data is None:
         return None
     validation_genotypes, validation_covariates, validation_targets = validation_data
@@ -3466,7 +3470,7 @@ def _should_refresh_beta_variance(
 
 
 def _as_standardized_genotype_matrix(
-    genotypes: StandardizedGenotypeMatrix | np.ndarray,
+    genotypes: StandardizedGenotypeMatrix | NDArray,
 ) -> StandardizedGenotypeMatrix:
     if isinstance(genotypes, StandardizedGenotypeMatrix):
         return genotypes
@@ -3480,10 +3484,10 @@ def _as_standardized_genotype_matrix(
 def _effective_beta_variance_state(
     *,
     compute_beta_variance: bool,
-    beta_variance: np.ndarray,
-    stale_beta_variance: np.ndarray | None,
-    prior_variances: np.ndarray,
-) -> np.ndarray:
+    beta_variance: NDArray,
+    stale_beta_variance: NDArray | None,
+    prior_variances: NDArray,
+) -> NDArray:
     if compute_beta_variance:
         resolved = np.asarray(beta_variance, dtype=np.float64)
     elif stale_beta_variance is not None:
@@ -3497,24 +3501,24 @@ def _effective_beta_variance_state(
 
 def _fit_collapsed_posterior(
     genotype_matrix: StandardizedGenotypeMatrix,
-    covariate_matrix: np.ndarray,
-    targets: np.ndarray,
-    reduced_prior_variances: np.ndarray,
+    covariate_matrix: NDArray,
+    targets: NDArray,
+    reduced_prior_variances: NDArray,
     sigma_error2: float,
-    alpha_init: np.ndarray,
-    beta_init: np.ndarray,
+    alpha_init: NDArray,
+    beta_init: NDArray,
     trait_type: TraitType,
     config: ModelConfig,
     compute_logdet: bool = True,
     compute_beta_variance: bool = True,
-    predictor_offset: np.ndarray | None = None,
-    stale_beta_variance: np.ndarray | None = None,
+    predictor_offset: NDArray | None = None,
+    stale_beta_variance: NDArray | None = None,
     restricted_posterior_warm_start: _RestrictedPosteriorWarmStart | None = None,
     em_iteration_index: int | None = None,
     total_em_iterations: int | None = None,
     update_blend_weight: float | None = None,
     allow_gpu_exact_variant: bool = True,
-    prior_precision_override: np.ndarray | None = None,
+    prior_precision_override: NDArray | None = None,
 ) -> PosteriorState:
     log(f"    collapsed posterior: trait={trait_type.value}  n_variants={genotype_matrix.shape[1]}  n_samples={genotype_matrix.shape[0]}  sigma_e2={sigma_error2:.6f}  mem={mem()}")
     prior_variances = np.maximum(np.asarray(reduced_prior_variances, dtype=np.float64), 1e-8)
@@ -3644,10 +3648,10 @@ def _fit_collapsed_posterior(
 # (leverage — variants the model is very confident about get less weight in
 # the noise estimate, to avoid double-counting).
 def _quantitative_posterior_state(
-    genotype_matrix: StandardizedGenotypeMatrix | np.ndarray,
-    covariate_matrix: np.ndarray,
-    targets: np.ndarray,
-    prior_variances: np.ndarray,
+    genotype_matrix: StandardizedGenotypeMatrix | NDArray,
+    covariate_matrix: NDArray,
+    targets: NDArray,
+    prior_variances: NDArray,
     sigma_error2: float,
     sigma_error_floor: float,
     solver_tolerance: float = 1e-6,
@@ -3666,12 +3670,12 @@ def _quantitative_posterior_state(
     posterior_working_set_growth: int = 16_384,
     posterior_working_set_max_passes: int = 6,
     posterior_working_set_coefficient_tolerance: float = 1e-4,
-    stale_beta_variance: np.ndarray | None = None,
+    stale_beta_variance: NDArray | None = None,
     restricted_posterior_warm_start: _RestrictedPosteriorWarmStart | None = None,
     update_blend_weight: float | None = None,
     allow_gpu_exact_variant: bool = True,
-    prior_precision_override: np.ndarray | None = None,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, float, float]:
+    prior_precision_override: NDArray | None = None,
+) -> tuple[NDArray, NDArray, NDArray, NDArray, float, float]:
     standardized_genotypes = _as_standardized_genotype_matrix(genotype_matrix)
     # Quantitative block updates only use blend weight to relax upstream solver
     # controls; the restricted solve itself still computes a full posterior.
@@ -3846,9 +3850,9 @@ def _collapsed_posterior_solver_controls(
 
 
 def _binary_expected_polya_gamma_weights(
-    linear_predictor: np.ndarray,
+    linear_predictor: NDArray,
     minimum_weight: float,
-) -> np.ndarray:
+) -> NDArray:
     absolute_predictor = np.abs(np.asarray(linear_predictor, dtype=np.float64))
     weights = np.empty_like(absolute_predictor, dtype=np.float64)
     tiny_mask = absolute_predictor < 1e-6
@@ -3860,10 +3864,10 @@ def _binary_expected_polya_gamma_weights(
 
 
 def _binary_penalized_log_posterior(
-    linear_predictor: np.ndarray,
-    targets: np.ndarray,
-    prior_precision: np.ndarray,
-    beta: np.ndarray,
+    linear_predictor: NDArray,
+    targets: NDArray,
+    prior_precision: NDArray,
+    beta: NDArray,
 ) -> float:
     predictor = np.asarray(linear_predictor, dtype=np.float64)
     target_array = np.asarray(targets, dtype=np.float64)
@@ -3875,18 +3879,18 @@ def _binary_penalized_log_posterior(
     )
 
 
-def _cupy_array_to_numpy(array, *, dtype: np.dtype | type[np.floating[Any]]) -> np.ndarray:
+def _cupy_array_to_numpy(array: Any, *, dtype: np.dtype[Any] | type[np.floating[Any]]) -> NDArray:
     host_array = array.get() if hasattr(array, "get") else array
     return np.asarray(host_array, dtype=dtype)
 
 
 def _genotype_matvec_result_numpy(
     genotype_matrix: StandardizedGenotypeMatrix,
-    coefficients: np.ndarray | jnp.ndarray,
+    coefficients: NDArray | JaxArray,
     *,
     batch_size: int,
-    dtype: np.dtype | type[np.floating[Any]],
-) -> np.ndarray:
+    dtype: np.dtype[Any] | type[np.floating[Any]],
+) -> NDArray:
     if genotype_matrix.supports_jax_dense_ops():
         return np.asarray(genotype_matrix.matvec(coefficients, batch_size=batch_size), dtype=dtype)
     return np.asarray(genotype_matrix.matvec_numpy(coefficients, batch_size=batch_size), dtype=dtype)
@@ -3894,28 +3898,28 @@ def _genotype_matvec_result_numpy(
 
 def _genotype_transpose_matvec_result_numpy(
     genotype_matrix: StandardizedGenotypeMatrix,
-    vector: np.ndarray | jnp.ndarray,
+    vector: NDArray | JaxArray,
     *,
     batch_size: int,
-    dtype: np.dtype | type[np.floating[Any]],
-) -> np.ndarray:
+    dtype: np.dtype[Any] | type[np.floating[Any]],
+) -> NDArray:
     if genotype_matrix.supports_jax_dense_ops():
         return np.asarray(genotype_matrix.transpose_matvec(vector, batch_size=batch_size), dtype=dtype)
     return np.asarray(genotype_matrix.transpose_matvec_numpy(vector, batch_size=batch_size), dtype=dtype)
 
 
-def _softplus_cupy(cp, values_gpu, *, dtype):
+def _softplus_cupy(cp: Any, values_gpu: Any, *, dtype: Any) -> Any:
     values_gpu = cp.asarray(values_gpu, dtype=dtype)
     return cp.maximum(values_gpu, dtype(0.0)) + cp.log1p(cp.exp(-cp.abs(values_gpu)))
 
 
 def _binary_expected_polya_gamma_weights_cupy(
-    cp,
-    linear_predictor_gpu,
+    cp: Any,
+    linear_predictor_gpu: Any,
     minimum_weight: float,
     *,
-    dtype,
-):
+    dtype: Any,
+) -> Any:
     absolute_predictor = cp.abs(linear_predictor_gpu)
     tiny_mask = absolute_predictor < dtype(1e-6)
     safe_predictor = cp.where(tiny_mask, dtype(1.0), absolute_predictor)
@@ -3925,13 +3929,13 @@ def _binary_expected_polya_gamma_weights_cupy(
 
 
 def _binary_penalized_log_posterior_cupy(
-    cp,
-    linear_predictor_gpu,
-    targets_gpu,
-    prior_precision_gpu,
-    beta_gpu,
+    cp: Any,
+    linear_predictor_gpu: Any,
+    targets_gpu: Any,
+    prior_precision_gpu: Any,
+    beta_gpu: Any,
     *,
-    dtype,
+    dtype: Any,
 ) -> float:
     return float(
         cp.sum(
@@ -3950,11 +3954,11 @@ def _binary_penalized_log_posterior_cupy(
 def _binary_posterior_state_tr_newton(
     *,
     genotype_matrix: StandardizedGenotypeMatrix,
-    covariate_matrix: np.ndarray,
-    targets: np.ndarray,
-    prior_variances: np.ndarray,
-    alpha_init: np.ndarray,
-    beta_init: np.ndarray,
+    covariate_matrix: NDArray,
+    targets: NDArray,
+    prior_variances: NDArray,
+    alpha_init: NDArray,
+    beta_init: NDArray,
     minimum_weight: float,
     max_iterations: int,
     gradient_tolerance: float,
@@ -3969,7 +3973,7 @@ def _binary_posterior_state_tr_newton(
     compute_logdet: bool,
     compute_beta_variance: bool,
     sample_space_preconditioner_rank: int,
-    predictor_offset: np.ndarray | None,
+    predictor_offset: NDArray | None,
     posterior_working_set_min_variants: int = 65_536,
     posterior_working_set_initial_size: int,
     posterior_working_set_growth: int,
@@ -3977,7 +3981,7 @@ def _binary_posterior_state_tr_newton(
     posterior_working_set_coefficient_tolerance: float,
     restricted_posterior_warm_start: _RestrictedPosteriorWarmStart | None,
     allow_gpu_exact_variant: bool,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, float, int]:
+) -> tuple[NDArray, NDArray, NDArray, NDArray, float, int]:
     n_samples = int(genotype_matrix.shape[0])
     n_variants = int(genotype_matrix.shape[1])
     covariate_matrix_f64 = np.asarray(covariate_matrix, dtype=np.float64)
@@ -3996,7 +4000,7 @@ def _binary_posterior_state_tr_newton(
         f"      binary TR-Newton path: {n_variants} variants, {n_samples} samples  mem={mem()}"
     )
 
-    def _design_mv(v: np.ndarray) -> np.ndarray:
+    def _design_mv(v: NDArray) -> NDArray:
         if n_variants == 0:
             return np.zeros(n_samples, dtype=np.float64)
         return _genotype_matvec_result_numpy(
@@ -4006,7 +4010,7 @@ def _binary_posterior_state_tr_newton(
             dtype=np.float64,
         )
 
-    def _design_mv_transpose(u: np.ndarray) -> np.ndarray:
+    def _design_mv_transpose(u: NDArray) -> NDArray:
         if n_variants == 0:
             return np.zeros(0, dtype=np.float64)
         return _genotype_transpose_matvec_result_numpy(
@@ -4133,12 +4137,12 @@ def _binary_posterior_state_tr_newton(
 # This avoids trust-region accept/reject loops and turns each binary
 # iteration into one posterior solve plus one weight refresh.
 def _binary_posterior_state(
-    genotype_matrix: StandardizedGenotypeMatrix | np.ndarray,
-    covariate_matrix: np.ndarray,
-    targets: np.ndarray,
-    prior_variances: np.ndarray,
-    alpha_init: np.ndarray,
-    beta_init: np.ndarray,
+    genotype_matrix: StandardizedGenotypeMatrix | NDArray,
+    covariate_matrix: NDArray,
+    targets: NDArray,
+    prior_variances: NDArray,
+    alpha_init: NDArray,
+    beta_init: NDArray,
     minimum_weight: float,
     max_iterations: int,
     gradient_tolerance: float,
@@ -4153,7 +4157,7 @@ def _binary_posterior_state(
     compute_logdet: bool = True,
     compute_beta_variance: bool = True,
     sample_space_preconditioner_rank: int = 256,
-    predictor_offset: np.ndarray | None = None,
+    predictor_offset: NDArray | None = None,
     posterior_working_set_min_variants: int = 65_536,
     posterior_working_set_initial_size: int = 16_384,
     posterior_working_set_growth: int = 16_384,
@@ -4164,8 +4168,8 @@ def _binary_posterior_state(
     resume_state: dict[str, object] | None = None,
     progress_callback: Callable[[dict[str, object]], None] | None = None,
     allow_gpu_exact_variant: bool = True,
-    prior_precision_override: np.ndarray | None = None,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, float, int]:
+    prior_precision_override: NDArray | None = None,
+) -> tuple[NDArray, NDArray, NDArray, NDArray, float, int]:
     standardized_genotypes = _as_standardized_genotype_matrix(genotype_matrix)
     if prior_precision_override is not None:
         prior_precision = np.maximum(
@@ -4266,11 +4270,11 @@ def _binary_posterior_state(
     def _build_resume_snapshot(
         *,
         completed_iterations: int,
-        parameters_state: np.ndarray,
-        current_linear_predictor_state: np.ndarray,
+        parameters_state: NDArray,
+        current_linear_predictor_state: NDArray,
         current_objective_state: float,
-        best_parameters_state: np.ndarray,
-        best_linear_predictor_state: np.ndarray,
+        best_parameters_state: NDArray,
+        best_linear_predictor_state: NDArray,
         best_objective_state: float,
         stall_count_state: int,
     ) -> dict[str, object]:
@@ -4681,10 +4685,10 @@ def _binary_posterior_state(
 # (conjugate gradient) without ever storing the full matrix.
 def _sample_space_operator(
     genotype_matrix: StandardizedGenotypeMatrix,
-    prior_variances: np.ndarray,
-    diagonal_noise: np.ndarray,
+    prior_variances: NDArray,
+    diagonal_noise: NDArray,
     batch_size: int = 1024,
-):
+) -> Any:
     compute_dtype = gpu_compute_jax_dtype()
     diag_noise_jax = jnp.asarray(diagonal_noise, dtype=compute_dtype)
     prior_var_jax = jnp.asarray(prior_variances, dtype=compute_dtype)
@@ -4700,7 +4704,7 @@ def _sample_space_operator(
         diag_noise_gpu = cupy.asarray(diagonal_noise, dtype=compute_cp_dtype)
         prior_var_gpu = cupy.asarray(prior_variances, dtype=compute_cp_dtype)
 
-    def matvec(vector) -> jnp.ndarray:
+    def matvec(vector: JaxArray) -> JaxArray:
         v = jnp.asarray(vector, dtype=compute_dtype)
         if streaming_gpu_enabled:
             assert cupy is not None
@@ -4733,7 +4737,7 @@ def _sample_space_operator(
         projected = genotype_matrix.transpose_matvec(v)
         return diag_noise_jax * v + genotype_matrix.matvec(prior_var_jax * projected)
 
-    def matmat(matrix) -> jnp.ndarray:
+    def matmat(matrix: JaxArray) -> JaxArray:
         matrix_jax = jnp.asarray(matrix, dtype=compute_dtype)
         if streaming_gpu_enabled:
             assert cupy is not None
@@ -4780,10 +4784,10 @@ def _sample_space_operator(
 
 def _sample_space_diagonal_preconditioner(
     genotype_matrix: StandardizedGenotypeMatrix,
-    prior_variances: np.ndarray,
-    diagonal_noise: np.ndarray,
+    prior_variances: NDArray,
+    diagonal_noise: NDArray,
     batch_size: int,
-) -> np.ndarray:
+) -> NDArray:
     if genotype_matrix.supports_jax_dense_ops():
         compute_dtype = gpu_compute_jax_dtype()
         genotype_cache_jax = genotype_matrix._ensure_jax_cache()
@@ -4851,7 +4855,7 @@ def _sample_space_nystrom_rank(rank: int, sample_count: int) -> int:
     return min(sample_count, resolved_rank + oversampling)
 
 
-def _positive_semidefinite_factor(matrix: np.ndarray) -> np.ndarray | None:
+def _positive_semidefinite_factor(matrix: NDArray) -> NDArray | None:
     symmetric_matrix = np.asarray(matrix, dtype=np.float64)
     symmetric_matrix = (symmetric_matrix + symmetric_matrix.T) * 0.5
     if symmetric_matrix.size == 0:
@@ -4870,11 +4874,11 @@ def _positive_semidefinite_factor(matrix: np.ndarray) -> np.ndarray | None:
 
 def _sample_space_kernel_matmat_cpu(
     genotype_matrix: StandardizedGenotypeMatrix,
-    prior_variances: np.ndarray,
-    matrix: np.ndarray,
+    prior_variances: NDArray,
+    matrix: NDArray,
     *,
     batch_size: int,
-) -> np.ndarray:
+) -> NDArray:
     rhs = np.asarray(matrix, dtype=np.float64)
     vector_input = rhs.ndim == 1
     if vector_input:
@@ -4892,10 +4896,10 @@ def _sample_space_kernel_matmat_cpu(
 
 def _sample_space_genotype_gram_matmat_cpu(
     genotype_matrix: StandardizedGenotypeMatrix,
-    matrix: np.ndarray,
+    matrix: NDArray,
     *,
     batch_size: int,
-) -> np.ndarray:
+) -> NDArray:
     rhs = np.asarray(matrix, dtype=np.float64)
     vector_input = rhs.ndim == 1
     if vector_input:
@@ -4914,7 +4918,7 @@ def _cached_sample_space_basis(
     *,
     requested_rank: int,
     random_seed: int,
-):
+) -> Any | None:
     matching_basis: Any | None = None
     matching_width: int | None = None
     for (_cached_rank, cached_seed), cached_basis in basis_cache.items():
@@ -4934,7 +4938,7 @@ def _sample_space_nystrom_basis_cpu(
     batch_size: int,
     rank: int,
     random_seed: int,
-) -> np.ndarray | None:
+) -> NDArray | None:
     requested_rank = min(max(int(rank), 0), int(genotype_matrix.shape[0]))
     if requested_rank <= 0:
         return None
@@ -4972,7 +4976,7 @@ def _sample_space_nystrom_basis_gpu(
     batch_size: int,
     rank: int,
     random_seed: int,
-):
+) -> Any | None:
     cupy = _try_import_cupy()
     if cupy is None:
         return None
@@ -5062,11 +5066,11 @@ def _sample_space_nystrom_basis_gpu(
 
 def _sample_space_nystrom_factor_cpu(
     genotype_matrix: StandardizedGenotypeMatrix,
-    prior_variances: np.ndarray,
+    prior_variances: NDArray,
     batch_size: int,
     rank: int,
     random_seed: int,
-) -> np.ndarray | None:
+) -> NDArray | None:
     basis_matrix = _sample_space_nystrom_basis_cpu(
         genotype_matrix=genotype_matrix,
         batch_size=batch_size,
@@ -5083,11 +5087,11 @@ def _sample_space_nystrom_factor_cpu(
 
 def _sample_space_nystrom_factor_cpu_from_basis(
     genotype_matrix: StandardizedGenotypeMatrix,
-    prior_variances: np.ndarray,
-    basis_matrix: np.ndarray | None,
+    prior_variances: NDArray,
+    basis_matrix: NDArray | None,
     *,
     batch_size: int,
-) -> np.ndarray | None:
+) -> NDArray | None:
     if basis_matrix is None:
         return None
     basis_matrix = np.asarray(basis_matrix, dtype=np.float64)
@@ -5107,11 +5111,11 @@ def _sample_space_nystrom_factor_cpu_from_basis(
 
 def _sample_space_nystrom_factor_gpu(
     genotype_matrix: StandardizedGenotypeMatrix,
-    prior_variances: np.ndarray,
+    prior_variances: NDArray,
     batch_size: int,
     rank: int,
     random_seed: int,
-):
+) -> Any | None:
     cupy = _try_import_cupy()
     if cupy is None:
         return None
@@ -5131,11 +5135,11 @@ def _sample_space_nystrom_factor_gpu(
 
 def _sample_space_nystrom_factor_gpu_from_basis(
     genotype_matrix: StandardizedGenotypeMatrix,
-    prior_variances: np.ndarray,
-    basis_gpu,
+    prior_variances: NDArray,
+    basis_gpu: Any,
     *,
     batch_size: int,
-):
+) -> Any | None:
     cupy = _try_import_cupy()
     if cupy is None:
         return None
@@ -5161,12 +5165,12 @@ def _sample_space_nystrom_factor_gpu_from_basis(
 
 
 def _build_sample_space_low_rank_bundle_gpu(
-    low_rank_factor_gpu,
-    diagonal_preconditioner_gpu,
+    low_rank_factor_gpu: Any,
+    diagonal_preconditioner_gpu: Any,
     *,
-    cp,
-    bundle_dtype,
-):
+    cp: Any,
+    bundle_dtype: Any,
+) -> tuple[Any, Any, Any]:
     effective_rank = int(low_rank_factor_gpu.shape[1])
     weighted_selected_genotypes = cp.asarray(low_rank_factor_gpu, dtype=bundle_dtype)
     diagonal_vector = cp.asarray(diagonal_preconditioner_gpu, dtype=bundle_dtype)
@@ -5194,12 +5198,12 @@ def _build_sample_space_low_rank_bundle_gpu(
 
 
 def _apply_sample_space_low_rank_preconditioner_gpu(
-    right_hand_side_gpu,
-    bundle,
+    right_hand_side_gpu: Any,
+    bundle: tuple[Any, Any, Any],
     *,
-    cp,
-    solve_triangular_gpu,
-):
+    cp: Any,
+    solve_triangular_gpu: Callable[..., Any],
+) -> Any:
     weighted_selected_genotypes, inverse_base_diagonal, low_rank_cholesky = bundle
     right_hand_side_gpu = cp.asarray(right_hand_side_gpu, dtype=low_rank_cholesky.dtype)
     if right_hand_side_gpu.ndim not in (1, 2):
@@ -5223,7 +5227,7 @@ def _apply_sample_space_low_rank_preconditioner_gpu(
     return weighted_rhs - correction
 
 
-def _relative_array_change(current: np.ndarray, previous: np.ndarray) -> float:
+def _relative_array_change(current: NDArray, previous: NDArray) -> float:
     current_array = np.asarray(current, dtype=np.float64)
     previous_array = np.asarray(previous, dtype=np.float64)
     if current_array.shape != previous_array.shape:
@@ -5251,8 +5255,8 @@ def _can_reuse_sample_space_preconditioner(
     batch_size: int,
     rank: int,
     random_seed: int,
-    prior_variances: np.ndarray,
-    diagonal_noise: np.ndarray,
+    prior_variances: NDArray,
+    diagonal_noise: NDArray,
 ) -> bool:
     if cache_entry is None:
         return False
@@ -5279,7 +5283,7 @@ def _can_reuse_nystrom_factor(
     *,
     batch_size: int,
     rank: int,
-    prior_variances: np.ndarray,
+    prior_variances: NDArray,
 ) -> bool:
     """Check if the cached Nyström factor can be reused.
 
@@ -5339,7 +5343,7 @@ def _reset_sample_space_background_preconditioner(
 def _background_sample_space_preconditioner_entry_for_subset(
     warm_start: _RestrictedPosteriorWarmStart | None,
     genotype_matrix: StandardizedGenotypeMatrix,
-    diagonal_noise: np.ndarray,
+    diagonal_noise: NDArray,
     *,
     use_gpu: bool,
 ) -> _SampleSpacePreconditionerCacheEntry | None:
@@ -5371,8 +5375,8 @@ def _background_sample_space_preconditioner_entry_for_subset(
 def _get_or_build_background_sample_space_cpu_preconditioner(
     genotype_matrix: StandardizedGenotypeMatrix,
     *,
-    prior_variances: np.ndarray,
-    diagonal_noise: np.ndarray,
+    prior_variances: NDArray,
+    diagonal_noise: NDArray,
     batch_size: int,
     rank: int,
     random_seed: int,
@@ -5410,8 +5414,8 @@ def _get_or_build_background_sample_space_cpu_preconditioner(
         rank=rank,
         prior_variances=prior_variances,
     )
-    nystrom_basis_cpu: np.ndarray | None
-    nystrom_factor_cpu: np.ndarray | None
+    nystrom_basis_cpu: NDArray | None
+    nystrom_factor_cpu: NDArray | None
     if reuse_nystrom and cache_entry is not None and cache_entry.nystrom_factor_cpu is not None:
         preconditioner = _sample_space_cpu_preconditioner_from_factor(
             low_rank_factor=cache_entry.nystrom_factor_cpu,
@@ -5449,8 +5453,8 @@ def _get_or_build_background_sample_space_cpu_preconditioner(
 def _get_or_build_background_sample_space_gpu_preconditioner(
     genotype_matrix: StandardizedGenotypeMatrix,
     *,
-    prior_variances: np.ndarray,
-    diagonal_noise: np.ndarray,
+    prior_variances: NDArray,
+    diagonal_noise: NDArray,
     batch_size: int,
     rank: int,
     random_seed: int,
@@ -5528,9 +5532,9 @@ def _get_or_build_background_sample_space_gpu_preconditioner(
 
 def _sample_space_cpu_preconditioner_from_factor(
     *,
-    low_rank_factor: np.ndarray,
-    diagonal_preconditioner: np.ndarray,
-) -> Callable[[jnp.ndarray], jnp.ndarray] | np.ndarray:
+    low_rank_factor: NDArray,
+    diagonal_preconditioner: NDArray,
+) -> Callable[[JaxArray], JaxArray] | NDArray:
     diagonal_preconditioner = np.asarray(diagonal_preconditioner, dtype=np.float64)
     if low_rank_factor.size == 0 or low_rank_factor.shape[1] == 0:
         return diagonal_preconditioner
@@ -5543,7 +5547,7 @@ def _sample_space_cpu_preconditioner_from_factor(
     low_rank_precision = np.eye(effective_rank, dtype=np.float64) + weighted_selected_genotypes.T @ weighted_inverse_selected
     low_rank_cholesky = np.linalg.cholesky(low_rank_precision + np.eye(effective_rank, dtype=np.float64) * 1e-8)
 
-    def apply_preconditioner_cpu(right_hand_side: jnp.ndarray) -> jnp.ndarray:
+    def apply_preconditioner_cpu(right_hand_side: JaxArray) -> JaxArray:
         right_hand_side_array = np.asarray(right_hand_side, dtype=np.float64)
         weighted_rhs = (
             inverse_base_diagonal[:, None] * right_hand_side_array
@@ -5562,12 +5566,12 @@ def _sample_space_cpu_preconditioner_from_factor(
 
 def _sample_space_cpu_preconditioner_with_factor(
     genotype_matrix: StandardizedGenotypeMatrix,
-    prior_variances: np.ndarray,
+    prior_variances: NDArray,
     batch_size: int,
     rank: int,
     random_seed: int = 0,
-    diagonal_preconditioner: np.ndarray | None = None,
-) -> tuple[Callable[[jnp.ndarray], jnp.ndarray] | np.ndarray, np.ndarray | None, np.ndarray | None]:
+    diagonal_preconditioner: NDArray | None = None,
+) -> tuple[Callable[[JaxArray], JaxArray] | NDArray, NDArray | None, NDArray | None]:
     if diagonal_preconditioner is None:
         raise ValueError("diagonal_preconditioner is required for CPU preconditioner construction.")
     if rank <= 0:
@@ -5605,8 +5609,8 @@ def _adapt_background_sample_space_preconditioner_for_subset(
     genotype_matrix: StandardizedGenotypeMatrix,
     background_entry: _SampleSpacePreconditionerCacheEntry,
     *,
-    prior_variances: np.ndarray,
-    diagonal_noise: np.ndarray,
+    prior_variances: NDArray,
+    diagonal_noise: NDArray,
     batch_size: int,
     rank: int,
     use_gpu: bool,
@@ -5690,14 +5694,14 @@ def _adapt_background_sample_space_preconditioner_for_subset(
 
 def _cached_sample_probe_projection(
     genotype_matrix: StandardizedGenotypeMatrix,
-    sample_probes: np.ndarray,
+    sample_probes: NDArray,
     *,
     batch_size: int,
     probe_count: int,
     random_seed: int,
     return_gpu: bool = False,
-    cupy=None,
-) -> np.ndarray:
+    cupy: Any = None,
+) -> Any:
     cache_key = (int(probe_count), int(random_seed))
     cached_projection = genotype_matrix._sample_space_probe_projection_cache.get(cache_key)
     cached_projection_gpu = genotype_matrix._sample_space_probe_projection_gpu_cache.get(cache_key)
@@ -5727,13 +5731,13 @@ def _cached_sample_probe_projection(
 
 def _sample_space_preconditioner(
     genotype_matrix: StandardizedGenotypeMatrix,
-    prior_variances: np.ndarray,
-    diagonal_noise: np.ndarray,
+    prior_variances: NDArray,
+    diagonal_noise: NDArray,
     batch_size: int,
     rank: int,
     random_seed: int = 0,
-    diagonal_preconditioner: np.ndarray | None = None,
-) -> Callable[[jnp.ndarray], jnp.ndarray] | np.ndarray | jnp.ndarray:
+    diagonal_preconditioner: NDArray | None = None,
+) -> Callable[[JaxArray], JaxArray] | NDArray | JaxArray:
     if diagonal_preconditioner is None:
         diagonal_preconditioner = _sample_space_diagonal_preconditioner(
             genotype_matrix=genotype_matrix,
@@ -5771,7 +5775,7 @@ def _sample_space_preconditioner(
         )
         float64_bundle = None
 
-        def apply_preconditioner_gpu(right_hand_side: jnp.ndarray) -> jnp.ndarray:
+        def apply_preconditioner_gpu(right_hand_side: JaxArray) -> JaxArray:
             nonlocal float64_bundle
             right_hand_side_array = np.asarray(right_hand_side)
             use_float64_bundle = compute_cp_dtype != cp.float64 and right_hand_side_array.dtype == np.float64
@@ -5817,13 +5821,13 @@ def _sample_space_preconditioner(
 
 def _sample_space_gpu_preconditioner(
     genotype_matrix: StandardizedGenotypeMatrix,
-    prior_variances: np.ndarray,
-    diagonal_noise: np.ndarray,
+    prior_variances: NDArray,
+    diagonal_noise: NDArray,
     batch_size: int,
     rank: int,
     random_seed: int = 0,
-    diagonal_preconditioner: np.ndarray | None = None,
-):
+    diagonal_preconditioner: NDArray | None = None,
+) -> Callable[[Any], Any]:
     import cupy as cp
     cp_solve_triangular = _resolve_gpu_solve_triangular()
 
@@ -5838,7 +5842,7 @@ def _sample_space_gpu_preconditioner(
     diagonal_preconditioner = np.asarray(diagonal_preconditioner, dtype=np.float64)
     diagonal_preconditioner_gpu = cp.asarray(diagonal_preconditioner, dtype=compute_cp_dtype)
 
-    def apply_diagonal(right_hand_side_gpu):
+    def apply_diagonal(right_hand_side_gpu: Any) -> Any:
         rhs_dtype = getattr(right_hand_side_gpu, "dtype", compute_cp_dtype)
         resolved_dtype = cp.float64 if compute_cp_dtype != cp.float64 and rhs_dtype == cp.float64 else compute_cp_dtype
         right_hand_side_gpu = cp.asarray(right_hand_side_gpu, dtype=resolved_dtype)
@@ -5873,7 +5877,7 @@ def _sample_space_gpu_preconditioner(
     )
     float64_bundle = None
 
-    def apply_low_rank(right_hand_side_gpu):
+    def apply_low_rank(right_hand_side_gpu: Any) -> Any:
         nonlocal float64_bundle
         rhs_dtype = getattr(right_hand_side_gpu, "dtype", compute_cp_dtype)
         if compute_cp_dtype != cp.float64 and rhs_dtype == cp.float64:
@@ -5900,13 +5904,13 @@ def _sample_space_gpu_preconditioner(
 def _get_cached_sample_space_cpu_preconditioner(
     genotype_matrix: StandardizedGenotypeMatrix,
     *,
-    prior_variances: np.ndarray,
-    diagonal_noise: np.ndarray,
+    prior_variances: NDArray,
+    diagonal_noise: NDArray,
     batch_size: int,
     rank: int,
     random_seed: int,
     warm_start: _RestrictedPosteriorWarmStart | None = None,
-):
+) -> tuple[Any, Any]:
     cache_entry = cast(_SampleSpacePreconditionerCacheEntry | None, genotype_matrix._sample_space_cpu_preconditioner_cache)
     if _can_reuse_sample_space_preconditioner(
         cache_entry,
@@ -5947,8 +5951,8 @@ def _get_cached_sample_space_cpu_preconditioner(
         rank=rank,
         prior_variances=prior_variances,
     )
-    nystrom_basis_cpu: np.ndarray | None
-    nystrom_factor_cpu: np.ndarray | None
+    nystrom_basis_cpu: NDArray | None
+    nystrom_factor_cpu: NDArray | None
     if reuse_nystrom and cache_entry is not None and cache_entry.nystrom_factor_cpu is not None:
         preconditioner = _sample_space_cpu_preconditioner_from_factor(
             low_rank_factor=cache_entry.nystrom_factor_cpu,
@@ -5982,9 +5986,9 @@ def _get_cached_sample_space_cpu_preconditioner(
 
 def _sample_space_gpu_preconditioner_from_factor(
     genotype_matrix: StandardizedGenotypeMatrix,
-    nystrom_factor_gpu,
-    diagonal_preconditioner: np.ndarray,
-):
+    nystrom_factor_gpu: Any,
+    diagonal_preconditioner: NDArray,
+) -> Callable[[Any], Any]:
     """Build a GPU preconditioner from a pre-computed Nyström factor.
 
     This is the fast path: skip the expensive Nyström factor computation (~3s)
@@ -6008,7 +6012,7 @@ def _sample_space_gpu_preconditioner_from_factor(
     )
     float64_bundle = None
 
-    def apply_low_rank(right_hand_side_gpu):
+    def apply_low_rank(right_hand_side_gpu: Any) -> Any:
         nonlocal float64_bundle
         rhs_dtype = getattr(right_hand_side_gpu, "dtype", compute_cp_dtype)
         if compute_cp_dtype != cp.float64 and rhs_dtype == cp.float64:
@@ -6034,13 +6038,13 @@ def _sample_space_gpu_preconditioner_from_factor(
 
 def _sample_space_gpu_preconditioner_with_factor(
     genotype_matrix: StandardizedGenotypeMatrix,
-    prior_variances: np.ndarray,
-    diagonal_noise: np.ndarray,
+    prior_variances: NDArray,
+    diagonal_noise: NDArray,
     batch_size: int,
     rank: int,
     random_seed: int = 0,
-    diagonal_preconditioner: np.ndarray | None = None,
-):
+    diagonal_preconditioner: NDArray | None = None,
+) -> tuple[Callable[[Any], Any], Any | None, Any | None]:
     """Build GPU preconditioner and return both the preconditioner and the Nyström factor.
 
     Returns (preconditioner_callable, nystrom_factor_gpu_or_None, nystrom_basis_gpu_or_None).
@@ -6059,7 +6063,7 @@ def _sample_space_gpu_preconditioner_with_factor(
     diagonal_preconditioner = np.asarray(diagonal_preconditioner, dtype=np.float64)
     diagonal_preconditioner_gpu = cp.asarray(diagonal_preconditioner, dtype=compute_cp_dtype)
 
-    def apply_diagonal(right_hand_side_gpu):
+    def apply_diagonal(right_hand_side_gpu: Any) -> Any:
         rhs_dtype = getattr(right_hand_side_gpu, "dtype", compute_cp_dtype)
         resolved_dtype = cp.float64 if compute_cp_dtype != cp.float64 and rhs_dtype == cp.float64 else compute_cp_dtype
         right_hand_side_gpu = cp.asarray(right_hand_side_gpu, dtype=resolved_dtype)
@@ -6099,7 +6103,7 @@ def _sample_space_gpu_preconditioner_with_factor(
     )
     float64_bundle = None
 
-    def apply_low_rank(right_hand_side_gpu):
+    def apply_low_rank(right_hand_side_gpu: Any) -> Any:
         nonlocal float64_bundle
         rhs_dtype = getattr(right_hand_side_gpu, "dtype", compute_cp_dtype)
         if compute_cp_dtype != cp.float64 and rhs_dtype == cp.float64:
@@ -6126,13 +6130,13 @@ def _sample_space_gpu_preconditioner_with_factor(
 def _get_cached_sample_space_gpu_preconditioner(
     genotype_matrix: StandardizedGenotypeMatrix,
     *,
-    prior_variances: np.ndarray,
-    diagonal_noise: np.ndarray,
+    prior_variances: NDArray,
+    diagonal_noise: NDArray,
     batch_size: int,
     rank: int,
     random_seed: int,
     warm_start: _RestrictedPosteriorWarmStart | None = None,
-):
+) -> tuple[Any, Any]:
     cache_entry = cast(_SampleSpacePreconditionerCacheEntry | None, genotype_matrix._sample_space_gpu_preconditioner_cache)
     if _can_reuse_sample_space_preconditioner(
         cache_entry,
@@ -6220,15 +6224,15 @@ def _get_cached_sample_space_gpu_preconditioner(
 
 def _apply_sample_space_operator_gpu(
     genotype_matrix: StandardizedGenotypeMatrix,
-    prior_variances,
-    diagonal_noise,
-    matrix_gpu,
+    prior_variances: Any,
+    diagonal_noise: Any,
+    matrix_gpu: Any,
     *,
     batch_size: int,
-    cp,
-    dtype,
+    cp: Any,
+    dtype: Any,
     _already_on_gpu: bool = False,
-):
+) -> Any:
     input_gpu = cp.asarray(matrix_gpu, dtype=dtype)
     diagonal_noise_gpu = diagonal_noise if _already_on_gpu else cp.asarray(diagonal_noise, dtype=dtype)
     prior_variances_gpu = prior_variances if _already_on_gpu else cp.asarray(prior_variances, dtype=dtype)
@@ -6282,18 +6286,18 @@ def _apply_sample_space_operator_gpu(
 
 def _solve_sample_space_rhs_gpu_inner(
     genotype_matrix: StandardizedGenotypeMatrix,
-    prior_variances: np.ndarray,
-    diagonal_noise: np.ndarray,
-    right_hand_side_gpu,
-    initial_guess_gpu,
+    prior_variances: NDArray,
+    diagonal_noise: NDArray,
+    right_hand_side_gpu: Any,
+    initial_guess_gpu: Any,
     tolerance: float,
     max_iterations: int,
-    preconditioner,
+    preconditioner: Callable[[Any], Any],
     batch_size: int,
-    cp,
-    compute_cp_dtype,
-    column_iteration_limits: np.ndarray | None = None,
-    required_columns: np.ndarray | None = None,
+    cp: Any,
+    compute_cp_dtype: Any,
+    column_iteration_limits: NDArray | None = None,
+    required_columns: NDArray | None = None,
     lanczos_recorder: _SampleSpaceCGLanczosRecorder | None = None,
 ) -> tuple[Any, int]:
     rhs_gpu = cp.asarray(right_hand_side_gpu, dtype=compute_cp_dtype)
@@ -6320,11 +6324,11 @@ def _solve_sample_space_rhs_gpu_inner(
     _diagonal_noise_gpu = cp.asarray(diagonal_noise, dtype=compute_cp_dtype)
     _prior_variances_gpu = cp.asarray(prior_variances, dtype=compute_cp_dtype)
 
-    def _gpu_to_f64(arr):
+    def _gpu_to_f64(arr: Any) -> NDArray:
         """Safe GPU→CPU transfer that works with both real CuPy and mocked numpy."""
         return arr.get().astype(np.float64) if hasattr(arr, "get") else np.asarray(arr, dtype=np.float64)
 
-    def apply_operator(matrix_gpu):
+    def apply_operator(matrix_gpu: Any) -> Any:
         return _apply_sample_space_operator_gpu(
             genotype_matrix=genotype_matrix,
             prior_variances=_prior_variances_gpu,
@@ -6455,7 +6459,7 @@ def _solve_sample_space_rhs_gpu_inner(
     return (solution[:, 0] if vector_input else solution), iterations_used
 
 
-def _resolve_sample_space_solve_result(result, *, fallback_iterations: int) -> tuple[Any, int]:
+def _resolve_sample_space_solve_result(result: Any, *, fallback_iterations: int) -> tuple[Any, int]:
     resolved_result = result
     total_iterations = 0
     while isinstance(resolved_result, tuple) and len(resolved_result) == 2 and isinstance(resolved_result[1], (int, np.integer)):
@@ -6469,7 +6473,7 @@ def _resolve_sample_space_solve_result(result, *, fallback_iterations: int) -> t
 def _build_sample_space_cg_lanczos_recorder(
     *,
     total_rhs_count: int,
-    monitored_columns: np.ndarray,
+    monitored_columns: NDArray,
     maximum_steps: int,
 ) -> _SampleSpaceCGLanczosRecorder | None:
     monitored = np.asarray(monitored_columns, dtype=np.int32).reshape(-1)
@@ -6493,8 +6497,8 @@ def _record_sample_space_cg_lanczos_alpha(
     recorder: _SampleSpaceCGLanczosRecorder | None,
     *,
     iteration_index: int,
-    active_columns: np.ndarray,
-    step_scale: np.ndarray,
+    active_columns: NDArray,
+    step_scale: NDArray,
 ) -> None:
     if recorder is None or iteration_index >= recorder.maximum_steps:
         return
@@ -6512,8 +6516,8 @@ def _record_sample_space_cg_lanczos_beta(
     recorder: _SampleSpaceCGLanczosRecorder | None,
     *,
     iteration_index: int,
-    active_columns: np.ndarray,
-    beta_value: np.ndarray,
+    active_columns: NDArray,
+    beta_value: NDArray,
 ) -> None:
     if recorder is None or iteration_index >= recorder.maximum_steps - 1:
         return
@@ -6530,7 +6534,7 @@ def _record_sample_space_cg_lanczos_beta(
 def _finalize_sample_space_cg_lanczos_steps(
     recorder: _SampleSpaceCGLanczosRecorder | None,
     *,
-    completed_columns: np.ndarray,
+    completed_columns: NDArray,
     iteration_count: int,
 ) -> None:
     if recorder is None:
@@ -6620,7 +6624,7 @@ def _prefer_iterative_variant_space(
     *,
     compute_beta_variance: bool,
     compute_logdet: bool,
-    initial_beta_guess: np.ndarray | None,
+    initial_beta_guess: NDArray | None,
 ) -> bool:
     if _streaming_cupy_backend_available(genotype_matrix):
         return False
@@ -6661,8 +6665,8 @@ def _use_exact_sample_space_solve(
 
 
 def _weighted_covariate_projection_signature(
-    inverse_diagonal_noise: np.ndarray,
-    covariate_matrix: np.ndarray,
+    inverse_diagonal_noise: NDArray,
+    covariate_matrix: NDArray,
 ) -> str:
     hasher = hashlib.sha256()
     hasher.update(np.ascontiguousarray(np.asarray(inverse_diagonal_noise, dtype=np.float64)).view(np.uint8).tobytes())
@@ -6686,9 +6690,9 @@ def _cached_exact_variant_full_matrix_gpu(
     *,
     genotype_matrix: StandardizedGenotypeMatrix,
     warm_start: _RestrictedPosteriorWarmStart | None,
-    cupy,
-    dtype,
-):
+    cupy: Any,
+    dtype: Any,
+) -> Any:
     matrix_token = id(genotype_matrix)
     matrix_shape = (int(genotype_matrix.shape[0]), int(genotype_matrix.shape[1]))
     cache_enabled = warm_start is not None and warm_start.exact_variant_full_matrix_cache_enabled
@@ -6719,14 +6723,14 @@ def _cached_exact_variant_full_matrix_gpu(
 
 def _cached_weighted_covariate_projection(
     genotype_matrix: StandardizedGenotypeMatrix,
-    covariate_matrix: np.ndarray,
-    inverse_diagonal_noise: np.ndarray,
+    covariate_matrix: NDArray,
+    inverse_diagonal_noise: NDArray,
     batch_size: int,
     warm_start: _RestrictedPosteriorWarmStart | None,
     *,
     return_gpu: bool = False,
-    cupy=None,
-):
+    cupy: Any = None,
+) -> Any:
     variant_count = genotype_matrix.shape[1]
     covariate_count = int(covariate_matrix.shape[1])
     if covariate_count == 0:
@@ -6829,13 +6833,13 @@ def _cached_weighted_covariate_projection(
 
 
 def _build_restricted_projector_gpu_bundle(
-    inverse_diagonal_noise: np.ndarray,
-    covariate_matrix: np.ndarray,
-    covariate_precision_cholesky: np.ndarray,
+    inverse_diagonal_noise: NDArray,
+    covariate_matrix: NDArray,
+    covariate_precision_cholesky: NDArray,
     *,
-    cp,
-    dtype,
-):
+    cp: Any,
+    dtype: Any,
+) -> tuple[Any, Any, Any, Any]:
     inverse_diagonal_noise_gpu = cp.asarray(inverse_diagonal_noise, dtype=dtype)
     covariate_matrix_gpu = cp.asarray(covariate_matrix, dtype=dtype)
     covariate_precision_cholesky_gpu = cp.asarray(covariate_precision_cholesky, dtype=dtype)
@@ -6849,12 +6853,12 @@ def _build_restricted_projector_gpu_bundle(
 
 
 def _apply_restricted_projector_gpu(
-    right_hand_side_gpu,
-    projector_bundle,
+    right_hand_side_gpu: Any,
+    projector_bundle: tuple[Any, Any, Any, Any],
     *,
-    cp,
-    solve_triangular_gpu,
-):
+    cp: Any,
+    solve_triangular_gpu: Callable[..., Any],
+) -> Any:
     inverse_diagonal_noise_gpu, covariate_matrix_gpu, weighted_covariates_gpu, covariate_precision_cholesky_gpu = (
         projector_bundle
     )
@@ -6878,19 +6882,19 @@ def _apply_restricted_projector_gpu(
 
 def _solve_sample_space_rhs_gpu(
     genotype_matrix: StandardizedGenotypeMatrix,
-    prior_variances: np.ndarray,
-    diagonal_noise: np.ndarray,
-    right_hand_side: np.ndarray,
-    initial_guess: np.ndarray | None,
+    prior_variances: NDArray,
+    diagonal_noise: NDArray,
+    right_hand_side: NDArray,
+    initial_guess: NDArray | None,
     tolerance: float,
     max_iterations: int,
-    preconditioner,
+    preconditioner: Callable[[Any], Any],
     batch_size: int,
     return_iterations: bool = False,
-    column_iteration_limits: np.ndarray | None = None,
-    required_columns: np.ndarray | None = None,
+    column_iteration_limits: NDArray | None = None,
+    required_columns: NDArray | None = None,
     lanczos_recorder: _SampleSpaceCGLanczosRecorder | None = None,
-) -> np.ndarray | tuple[np.ndarray, int]:
+) -> NDArray | tuple[NDArray, int]:
     import cupy as cp
 
     cupy = _try_import_cupy()
@@ -6933,7 +6937,7 @@ def _solve_sample_space_rhs_gpu(
     mixed_precision_failure: RuntimeError | None = None
     total_iterations_used = 0
 
-    def true_residual(solution_gpu):
+    def true_residual(solution_gpu: Any) -> Any:
         residual_gpu64 = right_hand_side_gpu64 - _apply_sample_space_operator_gpu(
             genotype_matrix=genotype_matrix,
             prior_variances=prior_variances,
@@ -7090,19 +7094,19 @@ def _solve_sample_space_rhs_gpu(
 
 def _solve_sample_space_rhs_cpu(
     genotype_matrix: StandardizedGenotypeMatrix,
-    prior_variances: np.ndarray,
-    diagonal_noise: np.ndarray,
-    right_hand_side: np.ndarray,
-    initial_guess: np.ndarray | None,
+    prior_variances: NDArray,
+    diagonal_noise: NDArray,
+    right_hand_side: NDArray,
+    initial_guess: NDArray | None,
     tolerance: float,
     max_iterations: int,
-    preconditioner: Callable[[np.ndarray], np.ndarray | jnp.ndarray] | Callable[[jnp.ndarray], np.ndarray | jnp.ndarray] | np.ndarray | jnp.ndarray,
+    preconditioner: Callable[[NDArray], NDArray | JaxArray] | Callable[[JaxArray], NDArray | JaxArray] | NDArray | JaxArray,
     batch_size: int,
     return_iterations: bool = False,
-    column_iteration_limits: np.ndarray | None = None,
-    required_columns: np.ndarray | None = None,
+    column_iteration_limits: NDArray | None = None,
+    required_columns: NDArray | None = None,
     lanczos_recorder: _SampleSpaceCGLanczosRecorder | None = None,
-) -> np.ndarray | tuple[np.ndarray, int]:
+) -> NDArray | tuple[NDArray, int]:
     import time
 
     rhs = np.asarray(right_hand_side, dtype=np.float64)
@@ -7128,7 +7132,7 @@ def _solve_sample_space_rhs_cpu(
     diagonal_noise_stream = np.asarray(diagonal_noise, dtype=np.float32)
     prior_variances_stream = np.asarray(prior_variances, dtype=np.float32)
 
-    def apply_operator(matrix: np.ndarray) -> np.ndarray:
+    def apply_operator(matrix: NDArray) -> NDArray:
         matrix_array = np.asarray(matrix, dtype=np.float32)
         if matrix_array.ndim != 2:
             raise ValueError("CPU sample-space operator expects a matrix right-hand side.")
@@ -7144,7 +7148,7 @@ def _solve_sample_space_rhs_cpu(
 
     residual_refresh_interval = 32
     tol_sq = float(tolerance) * float(tolerance)
-    apply_preconditioner = cast(Callable[[np.ndarray], np.ndarray | jnp.ndarray], preconditioner) if callable(preconditioner) else None
+    apply_preconditioner = cast(Callable[[NDArray], NDArray | JaxArray], preconditioner) if callable(preconditioner) else None
     if initial_guess is not None:
         solution = np.array(initial_guess, dtype=np.float64, copy=True)
         if solution.ndim == 1:
@@ -7300,9 +7304,9 @@ def _solve_sample_space_rhs_cpu(
 
 
 def _restricted_precision_projector(
-    covariate_matrix: np.ndarray,
-    diagonal_noise: np.ndarray,
-) -> tuple[np.ndarray, np.ndarray, float, Callable[[np.ndarray], np.ndarray]]:
+    covariate_matrix: NDArray,
+    diagonal_noise: NDArray,
+) -> tuple[NDArray, NDArray, float, Callable[[NDArray], NDArray]]:
     compute_np_dtype = gpu_compute_numpy_dtype()
     inverse_diagonal_noise = 1.0 / np.maximum(np.asarray(diagonal_noise, dtype=compute_np_dtype), 1e-12)
     weighted_covariates = inverse_diagonal_noise[:, None] * covariate_matrix
@@ -7310,7 +7314,7 @@ def _restricted_precision_projector(
     covariate_precision_cholesky = np.linalg.cholesky(covariate_precision)
     covariate_precision_logdet = 2.0 * float(np.sum(np.log(np.diag(covariate_precision_cholesky))))
 
-    def apply_projector(right_hand_side: np.ndarray) -> np.ndarray:
+    def apply_projector(right_hand_side: NDArray) -> NDArray:
         rhs = np.asarray(right_hand_side, dtype=compute_np_dtype)
         weighted_rhs = inverse_diagonal_noise[:, None] * rhs if rhs.ndim == 2 else inverse_diagonal_noise * rhs
         correction = weighted_covariates @ _cholesky_solve(
@@ -7324,12 +7328,12 @@ def _restricted_precision_projector(
 
 def _restricted_variant_space_operator(
     genotype_matrix: StandardizedGenotypeMatrix,
-    prior_precision: np.ndarray,
-    inverse_diagonal_noise: np.ndarray,
-    covariate_matrix: np.ndarray,
-    covariate_precision_cholesky: np.ndarray,
+    prior_precision: NDArray,
+    inverse_diagonal_noise: NDArray,
+    covariate_matrix: NDArray,
+    covariate_precision_cholesky: NDArray,
     batch_size: int,
-):
+) -> Any:
     compute_dtype = gpu_compute_jax_dtype()
     prior_precision_jax = jnp.asarray(prior_precision, dtype=compute_dtype)
     apply_projector = _build_restricted_projector_jax(
@@ -7339,7 +7343,7 @@ def _restricted_variant_space_operator(
         compute_dtype=compute_dtype,
     )
 
-    def matvec(vector) -> jnp.ndarray:
+    def matvec(vector: JaxArray) -> JaxArray:
         coefficients = jnp.asarray(vector, dtype=compute_dtype)
         genotype_projection = genotype_matrix.matvec(coefficients, batch_size=batch_size)
         restricted_projection = apply_projector(genotype_projection)
@@ -7348,7 +7352,7 @@ def _restricted_variant_space_operator(
             batch_size=batch_size,
         )
 
-    def matmat(matrix) -> jnp.ndarray:
+    def matmat(matrix: JaxArray) -> JaxArray:
         coefficients = jnp.asarray(matrix, dtype=compute_dtype)
         genotype_projection = genotype_matrix.matmat(coefficients, batch_size=batch_size)
         restricted_projection = apply_projector(genotype_projection)
@@ -7367,17 +7371,17 @@ def _restricted_variant_space_operator(
 
 
 def _build_restricted_projector_jax(
-    inverse_diagonal_noise: np.ndarray,
-    covariate_matrix: np.ndarray,
-    covariate_precision_cholesky: np.ndarray,
-    compute_dtype,
-):
+    inverse_diagonal_noise: NDArray,
+    covariate_matrix: NDArray,
+    covariate_precision_cholesky: NDArray,
+    compute_dtype: Any,
+) -> Callable[[JaxArray], JaxArray]:
     inverse_diagonal_noise_jax = jnp.asarray(inverse_diagonal_noise, dtype=compute_dtype)
     covariate_matrix_jax = jnp.asarray(covariate_matrix, dtype=compute_dtype)
     covariate_precision_cholesky_jax = jnp.asarray(covariate_precision_cholesky, dtype=compute_dtype)
     weighted_covariates_jax = inverse_diagonal_noise_jax[:, None] * covariate_matrix_jax
 
-    def apply_projector(right_hand_side: np.ndarray | jnp.ndarray) -> jnp.ndarray:
+    def apply_projector(right_hand_side: NDArray | JaxArray) -> JaxArray:
         rhs = jnp.asarray(right_hand_side, dtype=compute_dtype)
         if rhs.ndim not in (1, 2):
             raise ValueError("restricted projector expects a vector or matrix right-hand side.")
@@ -7404,13 +7408,13 @@ def _build_restricted_projector_jax(
 
 def _restricted_variant_space_diagonal_preconditioner(
     genotype_matrix: StandardizedGenotypeMatrix,
-    covariate_matrix: np.ndarray,
-    inverse_diagonal_noise: np.ndarray,
-    covariate_precision_cholesky: np.ndarray,
-    prior_precision: np.ndarray,
+    covariate_matrix: NDArray,
+    inverse_diagonal_noise: NDArray,
+    covariate_precision_cholesky: NDArray,
+    prior_precision: NDArray,
     batch_size: int,
     warm_start: _RestrictedPosteriorWarmStart | None = None,
-) -> np.ndarray:
+) -> NDArray:
     compute_np_dtype = gpu_compute_numpy_dtype()
     weighted_covariate_projection = _cached_weighted_covariate_projection(
         genotype_matrix=genotype_matrix,
@@ -7432,7 +7436,7 @@ def _restricted_variant_space_diagonal_preconditioner(
             dtype=compute_dtype,
         )
         raw_diag_np = np.asarray(raw_diag_jax, dtype=compute_np_dtype)
-        return np.maximum(prior_precision + raw_diag_np - diag_correction, 1e-8)
+        return np.asarray(np.maximum(prior_precision + raw_diag_np - diag_correction, 1e-8), dtype=np.float64)
     if genotype_matrix._cupy_cache is not None:
         import cupy as cp
         inv_d = cp.asarray(inverse_diagonal_noise, dtype=cp.float64)
@@ -7448,7 +7452,7 @@ def _restricted_variant_space_diagonal_preconditioner(
             weighted_batch = inv_d[:, None] * standardized_batch
             raw_diag[batch_slice] = cp.sum(standardized_batch * weighted_batch, axis=0)
         raw_diag_np = raw_diag.get().astype(compute_np_dtype)
-        return np.maximum(prior_precision + raw_diag_np - diag_correction, 1e-8)
+        return np.asarray(np.maximum(prior_precision + raw_diag_np - diag_correction, 1e-8), dtype=np.float64)
     if _streaming_cupy_backend_available(genotype_matrix):
         cupy = _try_import_cupy()
         if cupy is not None:
@@ -7467,7 +7471,7 @@ def _restricted_variant_space_diagonal_preconditioner(
                 weighted_batch = inv_d_gpu[:, None] * standardized_batch
                 raw_diag_gpu[batch_slice] = cupy.sum(standardized_batch * weighted_batch, axis=0)
             raw_diag_np = raw_diag_gpu.get().astype(compute_np_dtype)
-            return np.maximum(prior_precision + raw_diag_np - diag_correction, 1e-8)
+            return np.asarray(np.maximum(prior_precision + raw_diag_np - diag_correction, 1e-8), dtype=np.float64)
     diagonal = np.asarray(prior_precision, dtype=compute_np_dtype).copy()
     for batch in genotype_matrix.iter_column_batches(batch_size=batch_size):
         genotype_batch = np.asarray(batch.values, dtype=compute_np_dtype)
@@ -7478,11 +7482,11 @@ def _restricted_variant_space_diagonal_preconditioner(
 
 
 def _posterior_variance_low_rank_residual_diagonal(
-    solve_variant_rhs: Callable[[np.ndarray], np.ndarray],
+    solve_variant_rhs: Callable[[NDArray], NDArray],
     dimension: int,
     probe_count: int,
     random_seed: int,
-) -> np.ndarray:
+) -> NDArray:
     """Estimate diag(A^{-1}) from one batched solve via low-rank + residual probes."""
     if probe_count < 1:
         raise ValueError("probe_count must be positive.")
@@ -7493,7 +7497,7 @@ def _posterior_variance_low_rank_residual_diagonal(
             random_seed=random_seed,
         )
         solutions = np.asarray(solve_variant_rhs(probes), dtype=np.float64)
-        return np.maximum(np.mean(probes * solutions, axis=1), 1e-8)
+        return np.asarray(np.maximum(np.mean(probes * solutions, axis=1), 1e-8), dtype=np.float64)
 
     sketch_probe_count = min(max(1, probe_count // 2), dimension)
     residual_probe_count = max(probe_count - sketch_probe_count, 0)
@@ -7528,7 +7532,7 @@ def _posterior_variance_low_rank_residual_diagonal(
     low_rank_weighted_solutions = sketch_solutions @ sketch_gram_inverse
     low_rank_diagonal = np.sum(low_rank_weighted_solutions * sketch_solutions, axis=1)
     if residual_probe_count == 0 or residual_probes is None:
-        return np.maximum(low_rank_diagonal, 1e-8)
+        return np.asarray(np.maximum(low_rank_diagonal, 1e-8), dtype=np.float64)
     residual_solutions = np.asarray(all_solutions[:, sketch_probe_count:], dtype=np.float64)
     low_rank_residual_projection = sketch_solutions @ (
         sketch_gram_inverse @ (sketch_solutions.T @ residual_probes)
@@ -7537,20 +7541,20 @@ def _posterior_variance_low_rank_residual_diagonal(
         residual_probes * (residual_solutions - low_rank_residual_projection),
         axis=1,
     )
-    return np.maximum(low_rank_diagonal + residual_diagonal, 1e-8)
+    return np.asarray(np.maximum(low_rank_diagonal + residual_diagonal, 1e-8), dtype=np.float64)
 
 
 def _orthogonal_probe_matrix(
     dimension: int,
     probe_count: int,
     random_seed: int,
-) -> np.ndarray:
+) -> NDArray:
     if dimension < 1:
         raise ValueError("dimension must be positive.")
     if probe_count < 1:
         raise ValueError("probe_count must be positive.")
     random_generator = np.random.default_rng(random_seed)
-    probe_blocks: list[np.ndarray] = []
+    probe_blocks: list[NDArray] = []
     probes_remaining = int(probe_count)
     while probes_remaining > 0:
         block_probe_count = min(probes_remaining, dimension)
@@ -7569,8 +7573,8 @@ def _orthogonal_probe_matrix_in_complement(
     dimension: int,
     probe_count: int,
     random_seed: int,
-    orthonormal_basis: np.ndarray | None,
-) -> np.ndarray:
+    orthonormal_basis: NDArray | None,
+) -> NDArray:
     if orthonormal_basis is None or orthonormal_basis.size == 0:
         return _orthogonal_probe_matrix(
             dimension=dimension,
@@ -7596,7 +7600,7 @@ def _orthogonal_probe_matrix_in_complement(
     if residual_dimension <= 0:
         return np.zeros((int(dimension), 0), dtype=np.float64)
     random_generator = np.random.default_rng(random_seed)
-    probe_blocks: list[np.ndarray] = []
+    probe_blocks: list[NDArray] = []
     probes_remaining = int(probe_count)
     while probes_remaining > 0:
         block_probe_count = min(probes_remaining, residual_dimension)
@@ -7621,7 +7625,7 @@ def _sample_space_variance_probe_plan(
     probe_count: int,
     random_seed: int,
     sample_space_preconditioner_cache_entry: _SampleSpacePreconditionerCacheEntry | None,
-) -> tuple[np.ndarray | None, np.ndarray | None, np.ndarray | None]:
+) -> tuple[NDArray | None, NDArray | None, NDArray | None]:
     if probe_count <= 0:
         return None, None, None
     deflation_basis = None
@@ -7727,27 +7731,27 @@ def _should_use_posterior_working_set(
 
 
 def _working_set_screening_score(
-    gradient: np.ndarray,
-    beta: np.ndarray,
-    prior_variances: np.ndarray,
-) -> np.ndarray:
+    gradient: NDArray,
+    beta: NDArray,
+    prior_variances: NDArray,
+) -> NDArray:
     coefficient_scale_violation = np.abs(np.asarray(prior_variances, dtype=np.float64) * np.asarray(gradient, dtype=np.float64))
     return np.maximum(coefficient_scale_violation, np.abs(np.asarray(beta, dtype=np.float64)))
 
 
 def _working_set_posterior_update_score(
-    gradient: np.ndarray,
-    prior_variances: np.ndarray,
-) -> np.ndarray:
-    return np.abs(np.asarray(prior_variances, dtype=np.float64) * np.asarray(gradient, dtype=np.float64))
+    gradient: NDArray,
+    prior_variances: NDArray,
+) -> NDArray:
+    return np.asarray(np.abs(np.asarray(prior_variances, dtype=np.float64) * np.asarray(gradient, dtype=np.float64)), dtype=np.float64)
 
 
 def _ordered_unique_indices(
-    index_blocks: Sequence[np.ndarray | None],
+    index_blocks: Sequence[NDArray | None],
     variant_count: int,
-) -> np.ndarray:
+) -> NDArray:
     seen = np.zeros(max(int(variant_count), 0), dtype=bool)
-    ordered_blocks: list[np.ndarray] = []
+    ordered_blocks: list[NDArray] = []
     for block in index_blocks:
         if block is None:
             continue
@@ -7769,18 +7773,18 @@ def _ordered_unique_indices(
 
 
 def _active_working_set_indices(
-    beta: np.ndarray,
+    beta: NDArray,
     coefficient_tolerance: float,
-) -> np.ndarray:
+) -> NDArray:
     active_threshold = max(float(coefficient_tolerance), 1e-10)
     return np.flatnonzero(np.abs(np.asarray(beta, dtype=np.float64)) > active_threshold).astype(np.int32, copy=False)
 
 
 def _posterior_working_set_indices(
-    screening_score: np.ndarray,
-    ever_active_indices: np.ndarray,
+    screening_score: NDArray,
+    ever_active_indices: NDArray,
     target_size: int,
-) -> np.ndarray:
+) -> NDArray:
     total_variants = int(np.asarray(screening_score).shape[0])
     mandatory = _ordered_unique_indices([ever_active_indices], total_variants)
     if mandatory.shape[0] >= total_variants:
@@ -7823,11 +7827,11 @@ def _reset_posterior_working_set_warm_start(
 
 def _posterior_working_set_seed_score(
     *,
-    beta: np.ndarray,
-    prior_variances: np.ndarray,
+    beta: NDArray,
+    prior_variances: NDArray,
     warm_start: _RestrictedPosteriorWarmStart | None,
     variant_count: int,
-) -> np.ndarray:
+) -> NDArray:
     beta_score = np.abs(np.asarray(beta, dtype=np.float64))
     if beta_score.shape != (variant_count,):
         raise ValueError("beta must match variant count for posterior working sets.")
@@ -7862,8 +7866,8 @@ def _posterior_working_set_target_size(
 def _update_posterior_working_set_warm_start(
     *,
     warm_start: _RestrictedPosteriorWarmStart | None,
-    ever_active_indices: np.ndarray,
-    screening_score: np.ndarray,
+    ever_active_indices: NDArray,
+    screening_score: NDArray,
     target_size: int,
     variant_count: int,
 ) -> None:
@@ -7879,13 +7883,13 @@ def _update_posterior_working_set_warm_start(
 
 def _restricted_posterior_result_without_diagnostics(
     *,
-    alpha: np.ndarray,
-    beta: np.ndarray,
-    prior_variances: np.ndarray,
-    projected_targets: np.ndarray,
-    linear_predictor: np.ndarray,
+    alpha: NDArray,
+    beta: NDArray,
+    prior_variances: NDArray,
+    projected_targets: NDArray,
+    linear_predictor: NDArray,
     restricted_quadratic: float,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, float, float, float]:
+) -> tuple[NDArray, NDArray, NDArray, NDArray, NDArray, float, float, float]:
     return (
         np.asarray(alpha, dtype=np.float64),
         np.asarray(beta, dtype=np.float64),
@@ -7901,17 +7905,17 @@ def _restricted_posterior_result_without_diagnostics(
 def _solve_restricted_exact_variant_space(
     *,
     genotype_matrix: StandardizedGenotypeMatrix,
-    covariate_matrix: np.ndarray,
-    targets: np.ndarray,
-    prior_precision: np.ndarray,
-    inverse_diagonal_noise: np.ndarray,
-    covariate_precision_cholesky: np.ndarray,
-    apply_projector: Callable[[np.ndarray], np.ndarray],
+    covariate_matrix: NDArray,
+    targets: NDArray,
+    prior_precision: NDArray,
+    inverse_diagonal_noise: NDArray,
+    covariate_precision_cholesky: NDArray,
+    apply_projector: Callable[[NDArray], NDArray],
     posterior_variance_batch_size: int,
     compute_beta_variance: bool,
     compute_logdet: bool,
     warm_start: _RestrictedPosteriorWarmStart | None,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray, float]:
+) -> tuple[NDArray, NDArray, NDArray, float]:
     from sv_pgs.progress import log, mem
 
     sample_count = genotype_matrix.shape[0]
@@ -8131,7 +8135,7 @@ def _solve_restricted_exact_variant_space(
         variant_precision_cholesky_gpu = cp.linalg.cholesky(variant_precision_gpu)
         log(f"    Cholesky done in {_timed_region_seconds(_cholesky_t0, cp):.1f}s, solving...  mem={mem()}")
 
-        def solve_variant_rhs_gpu(right_hand_side):
+        def solve_variant_rhs_gpu(right_hand_side: Any) -> Any:
             return _gpu_cholesky_solve(
                 right_hand_side,
                 variant_precision_cholesky_gpu,
@@ -8197,7 +8201,7 @@ def _solve_restricted_exact_variant_space(
     variant_precision_matrix += np.eye(variant_count, dtype=np.float64) * 1e-8
     variant_precision_cholesky = np.linalg.cholesky(variant_precision_matrix)
 
-    def solve_variant_rhs(right_hand_side: np.ndarray) -> np.ndarray:
+    def solve_variant_rhs(right_hand_side: NDArray) -> NDArray:
         return _cholesky_solve(variant_precision_cholesky, np.asarray(right_hand_side, dtype=np.float64))
 
     beta = np.asarray(solve_variant_rhs(variant_rhs), dtype=np.float64)
@@ -8218,16 +8222,16 @@ def _solve_restricted_exact_variant_space(
 
 def _solve_restricted_mean_only(
     genotype_matrix: StandardizedGenotypeMatrix,
-    covariate_matrix: np.ndarray,
-    targets: np.ndarray,
-    prior_variances: np.ndarray,
-    diagonal_noise: np.ndarray,
+    covariate_matrix: NDArray,
+    targets: NDArray,
+    prior_variances: NDArray,
+    diagonal_noise: NDArray,
     solver_tolerance: float,
     maximum_linear_solver_iterations: int,
     exact_solver_matrix_limit: int,
     posterior_variance_batch_size: int,
     random_seed: int,
-    initial_beta_guess: np.ndarray | None = None,
+    initial_beta_guess: NDArray | None = None,
     sample_space_preconditioner_rank: int = 256,
     warm_start: _RestrictedPosteriorWarmStart | None = None,
     posterior_working_set_min_variants: int = 65_536,
@@ -8237,8 +8241,8 @@ def _solve_restricted_mean_only(
     posterior_working_set_coefficient_tolerance: float = 1e-4,
     allow_working_set: bool = True,
     allow_gpu_exact_variant: bool = True,
-    prior_precision_override: np.ndarray | None = None,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, float]:
+    prior_precision_override: NDArray | None = None,
+) -> tuple[NDArray, NDArray, NDArray, NDArray, float]:
     from sv_pgs.progress import log, mem
 
     compute_jax_dtype = gpu_compute_jax_dtype()
@@ -8289,7 +8293,7 @@ def _solve_restricted_mean_only(
         covariance_matrix += np.eye(sample_count, dtype=np.float64) * 1e-8
         cholesky_factor = np.linalg.cholesky(covariance_matrix)
 
-        def solve_rhs(right_hand_side: np.ndarray) -> np.ndarray:
+        def solve_rhs(right_hand_side: NDArray) -> NDArray:
             return _cholesky_solve(cholesky_factor, np.asarray(right_hand_side, dtype=np.float64))
 
         inverse_covariance_rhs = solve_rhs(
@@ -8518,10 +8522,10 @@ def _solve_restricted_mean_only(
         log(f"      preconditioner ready ({_timed_region_seconds(_t0, timing_cupy):.1f}s)  mem={mem()}")
 
         def solve_rhs_iterative(
-            right_hand_side: np.ndarray,
+            right_hand_side: NDArray,
             *,
-            initial_guess: np.ndarray | None = None,
-        ) -> np.ndarray:
+            initial_guess: NDArray | None = None,
+        ) -> NDArray:
             _solve_t0 = _timed_region_start(timing_cupy)
             log(f"      GPU CG solve starting: rhs_cols={right_hand_side.shape[1] if right_hand_side.ndim > 1 else 1}")
             solve_result = _solve_sample_space_rhs_gpu(
@@ -8545,7 +8549,7 @@ def _solve_restricted_mean_only(
                 iterations_used,
             )
             log(f"      GPU CG done: {iterations_used} iterations in {_timed_region_seconds(_solve_t0, timing_cupy):.1f}s  mem={mem()}")
-            return solved_rhs
+            return np.asarray(solved_rhs, dtype=np.float64)
     else:
         log(
             "    restricted mean: CPU block-PCG sample-space solve "
@@ -8562,10 +8566,10 @@ def _solve_restricted_mean_only(
         )
 
         def solve_rhs_iterative(
-            right_hand_side: np.ndarray,
+            right_hand_side: NDArray,
             *,
-            initial_guess: np.ndarray | None = None,
-        ) -> np.ndarray:
+            initial_guess: NDArray | None = None,
+        ) -> NDArray:
             solve_result = _solve_sample_space_rhs_cpu(
                 genotype_matrix=genotype_matrix,
                 prior_variances=prior_variances,
@@ -8721,28 +8725,28 @@ def _solve_restricted_mean_only(
 
 def _restricted_posterior_state_posterior_working_set(
     genotype_matrix: StandardizedGenotypeMatrix,
-    covariate_matrix: np.ndarray,
-    targets: np.ndarray,
-    prior_variances: np.ndarray,
-    prior_precision: np.ndarray,
-    inverse_diagonal_noise: np.ndarray,
-    covariate_precision_cholesky: np.ndarray,
+    covariate_matrix: NDArray,
+    targets: NDArray,
+    prior_variances: NDArray,
+    prior_precision: NDArray,
+    inverse_diagonal_noise: NDArray,
+    covariate_precision_cholesky: NDArray,
     covariate_precision_logdet: float,
-    apply_projector: Callable[[np.ndarray], np.ndarray],
+    apply_projector: Callable[[NDArray], NDArray],
     solver_tolerance: float,
     maximum_linear_solver_iterations: int,
     exact_solver_matrix_limit: int,
     posterior_variance_batch_size: int,
     random_seed: int,
     sample_space_preconditioner_rank: int,
-    initial_beta_guess: np.ndarray | None,
+    initial_beta_guess: NDArray | None,
     posterior_working_set_initial_size: int,
     posterior_working_set_growth: int,
     posterior_working_set_max_passes: int,
     posterior_working_set_coefficient_tolerance: float,
     warm_start: _RestrictedPosteriorWarmStart | None,
     allow_gpu_exact_variant: bool,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, float, float, float]:
+) -> tuple[NDArray, NDArray, NDArray, NDArray, NDArray, float, float, float]:
     variant_count = genotype_matrix.shape[1]
     _reset_posterior_working_set_warm_start(warm_start, genotype_matrix, variant_count)
     current_beta = (
@@ -9009,10 +9013,10 @@ def _restricted_posterior_state_posterior_working_set(
 
 def _solve_restricted_full(
     genotype_matrix: StandardizedGenotypeMatrix,
-    covariate_matrix: np.ndarray,
-    targets: np.ndarray,
-    prior_variances: np.ndarray,
-    diagonal_noise: np.ndarray,
+    covariate_matrix: NDArray,
+    targets: NDArray,
+    prior_variances: NDArray,
+    diagonal_noise: NDArray,
     solver_tolerance: float,
     maximum_linear_solver_iterations: int,
     logdet_probe_count: int,
@@ -9023,7 +9027,7 @@ def _solve_restricted_full(
     random_seed: int,
     compute_logdet: bool,
     compute_beta_variance: bool = True,
-    initial_beta_guess: np.ndarray | None = None,
+    initial_beta_guess: NDArray | None = None,
     sample_space_preconditioner_rank: int = 256,
     warm_start: _RestrictedPosteriorWarmStart | None = None,
     posterior_working_set_min_variants: int = 65_536,
@@ -9033,8 +9037,8 @@ def _solve_restricted_full(
     posterior_working_set_coefficient_tolerance: float = 1e-4,
     allow_working_set: bool = True,
     allow_gpu_exact_variant: bool = True,
-    prior_precision_override: np.ndarray | None = None,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, float, float, float]:
+    prior_precision_override: NDArray | None = None,
+) -> tuple[NDArray, NDArray, NDArray, NDArray, NDArray, float, float, float]:
     from sv_pgs.progress import log, mem
     if not compute_logdet and not compute_beta_variance:
         raise ValueError(
@@ -9101,7 +9105,7 @@ def _solve_restricted_full(
         covariance_matrix += np.eye(sample_count, dtype=np.float64) * 1e-8
         cholesky_factor = np.linalg.cholesky(covariance_matrix)
 
-        def solve_rhs(right_hand_side: np.ndarray) -> np.ndarray:
+        def solve_rhs(right_hand_side: NDArray) -> NDArray:
             return _cholesky_solve(cholesky_factor, np.asarray(right_hand_side, dtype=np.float64))
 
         inverse_covariance_rhs = solve_rhs(
@@ -9265,7 +9269,7 @@ def _solve_restricted_full(
             )
             log(f"      rhs: {_timed_region_seconds(_t0, variant_space_timing_cupy):.1f}s  mem={mem()}")
 
-            def solve_variant_rhs(right_hand_side: np.ndarray) -> np.ndarray:
+            def solve_variant_rhs(right_hand_side: NDArray) -> NDArray:
                 rhs_array = np.asarray(right_hand_side, dtype=np.float64)
                 return solve_spd_system(
                     variant_operator,
@@ -9367,14 +9371,14 @@ def _solve_restricted_full(
         log(f"      preconditioner ready ({_timed_region_seconds(_t0, timing_cupy):.1f}s)  mem={mem()}")
 
         def solve_rhs_iterative(
-            right_hand_side: np.ndarray,
+            right_hand_side: NDArray,
             *,
-            initial_guess: np.ndarray | None = None,
-            column_iteration_limits: np.ndarray | None = None,
-            required_columns: np.ndarray | None = None,
+            initial_guess: NDArray | None = None,
+            column_iteration_limits: NDArray | None = None,
+            required_columns: NDArray | None = None,
             lanczos_recorder: _SampleSpaceCGLanczosRecorder | None = None,
-            preconditioner_override=None,
-        ) -> np.ndarray:
+            preconditioner_override: Callable[[Any], Any] | None = None,
+        ) -> NDArray:
             _solve_t0 = _timed_region_start(timing_cupy)
             log(f"      GPU CG solve starting: rhs_cols={right_hand_side.shape[1] if right_hand_side.ndim > 1 else 1}")
             solve_result = _solve_sample_space_rhs_gpu(
@@ -9401,7 +9405,7 @@ def _solve_restricted_full(
                 iterations_used,
             )
             log(f"      GPU CG done: {iterations_used} iterations in {_timed_region_seconds(_solve_t0, timing_cupy):.1f}s  mem={mem()}")
-            return solved_rhs
+            return np.asarray(solved_rhs, dtype=np.float64)
     else:
         log(
             "    restricted posterior: CPU block-PCG sample-space solve "
@@ -9418,14 +9422,14 @@ def _solve_restricted_full(
         )
 
         def solve_rhs_iterative(
-            right_hand_side: np.ndarray,
+            right_hand_side: NDArray,
             *,
-            initial_guess: np.ndarray | None = None,
-            column_iteration_limits: np.ndarray | None = None,
-            required_columns: np.ndarray | None = None,
+            initial_guess: NDArray | None = None,
+            column_iteration_limits: NDArray | None = None,
+            required_columns: NDArray | None = None,
             lanczos_recorder: _SampleSpaceCGLanczosRecorder | None = None,
-            preconditioner_override=None,
-        ) -> np.ndarray:
+            preconditioner_override: Callable[[Any], Any] | None = None,
+        ) -> NDArray:
             solve_result = _solve_sample_space_rhs_cpu(
                 genotype_matrix=genotype_matrix,
                 prior_variances=prior_variances,
@@ -9542,7 +9546,7 @@ def _solve_restricted_full(
                 return preconditioned_matrix[:, 0] if matrix_was_vector else preconditioned_matrix
             mixed_preconditioner = _gpu_mixed_preconditioner
         else:
-            def _cpu_mixed_preconditioner(matrix: Any) -> np.ndarray:
+            def _cpu_mixed_preconditioner(matrix: Any) -> NDArray:
                 matrix_array = np.asarray(matrix, dtype=np.float64)
                 matrix_was_vector = matrix_array.ndim == 1
                 if matrix_was_vector:
@@ -9948,12 +9952,12 @@ def _solve_restricted_full(
 # where h_j is the leverage.  Computed in batches to limit memory usage.
 def _restricted_cross_leverage_diagonal(
     genotype_matrix: StandardizedGenotypeMatrix,
-    covariate_matrix: np.ndarray,
-    solve_rhs,
-    inverse_covariance_covariates: np.ndarray,
-    gls_cholesky: np.ndarray,
+    covariate_matrix: NDArray,
+    solve_rhs: Callable[..., NDArray],
+    inverse_covariance_covariates: NDArray,
+    gls_cholesky: NDArray,
     batch_size: int,
-) -> np.ndarray:
+) -> NDArray:
     from sv_pgs.progress import log, mem
     variant_count = genotype_matrix.shape[1]
     leverage_diagonal = np.zeros(variant_count, dtype=np.float64)
@@ -9961,7 +9965,7 @@ def _restricted_cross_leverage_diagonal(
     for batch in genotype_matrix.iter_column_batches(batch_size=batch_size):
         genotype_batch = np.asarray(batch.values, dtype=np.float64)
         inverse_covariance_genotype_batch = solve_rhs(genotype_batch)
-        restricted_batch = inverse_covariance_genotype_batch - inverse_covariance_covariates @ _cholesky_solve(
+        restricted_batch: NDArray = inverse_covariance_genotype_batch - inverse_covariance_covariates @ _cholesky_solve(
             gls_cholesky,
             covariate_matrix.T @ inverse_covariance_genotype_batch,
         )
@@ -9977,20 +9981,20 @@ def _restricted_cross_leverage_diagonal(
 
 def _stochastic_restricted_cross_leverage_diagonal(
     genotype_matrix: StandardizedGenotypeMatrix,
-    covariate_matrix: np.ndarray,
-    solve_rhs,
-    inverse_covariance_covariates: np.ndarray,
-    gls_cholesky: np.ndarray,
+    covariate_matrix: NDArray,
+    solve_rhs: Callable[..., NDArray],
+    inverse_covariance_covariates: NDArray,
+    gls_cholesky: NDArray,
     batch_size: int,
     probe_count: int,
     random_seed: int,
-    sample_probes: np.ndarray | None = None,
-    inverse_covariance_probe_matrix: np.ndarray | None = None,
-    probe_projection_matrix: np.ndarray | None = None,
-    restricted_probe_projection_matrix: np.ndarray | None = None,
-    low_rank_probe_projection_matrix: np.ndarray | None = None,
-    restricted_low_rank_probe_projection_matrix: np.ndarray | None = None,
-) -> np.ndarray:
+    sample_probes: NDArray | None = None,
+    inverse_covariance_probe_matrix: NDArray | None = None,
+    probe_projection_matrix: NDArray | None = None,
+    restricted_probe_projection_matrix: NDArray | None = None,
+    low_rank_probe_projection_matrix: NDArray | None = None,
+    restricted_low_rank_probe_projection_matrix: NDArray | None = None,
+) -> NDArray:
     low_rank_diagonal = np.zeros(genotype_matrix.shape[1], dtype=np.float64)
     if low_rank_probe_projection_matrix is not None or restricted_low_rank_probe_projection_matrix is not None:
         if low_rank_probe_projection_matrix is None or restricted_low_rank_probe_projection_matrix is None:
@@ -10009,7 +10013,7 @@ def _stochastic_restricted_cross_leverage_diagonal(
         )
     if sample_probes is None:
         if probe_count <= 0:
-            return np.maximum(low_rank_diagonal, 1e-8)
+            return np.asarray(np.maximum(low_rank_diagonal, 1e-8), dtype=np.float64)
         sample_probes = _orthogonal_probe_matrix(
             dimension=genotype_matrix.shape[0],
             probe_count=probe_count,
@@ -10024,7 +10028,7 @@ def _stochastic_restricted_cross_leverage_diagonal(
         inverse_covariance_probe_matrix = np.asarray(inverse_covariance_probe_matrix, dtype=np.float64)
         if inverse_covariance_probe_matrix.shape != sample_probes.shape:
             raise ValueError("inverse_covariance_probe_matrix shape does not match sample_probes.")
-    restricted_probe_matrix = inverse_covariance_probe_matrix - inverse_covariance_covariates @ _cholesky_solve(
+    restricted_probe_matrix: NDArray = inverse_covariance_probe_matrix - inverse_covariance_covariates @ _cholesky_solve(
         gls_cholesky,
         covariate_matrix.T @ inverse_covariance_probe_matrix,
     )
@@ -10050,22 +10054,22 @@ def _stochastic_restricted_cross_leverage_diagonal(
         if restricted_probe_projection_matrix.shape != (genotype_matrix.shape[1], probe_count):
             raise ValueError("restricted_probe_projection_matrix shape does not match variant_count/probe_count.")
     residual_diagonal = np.mean(probe_projection_matrix * restricted_probe_projection_matrix, axis=1)
-    return np.maximum(low_rank_diagonal + residual_diagonal, 1e-8)
+    return np.asarray(np.maximum(low_rank_diagonal + residual_diagonal, 1e-8), dtype=np.float64)
 
 
 def _stochastic_restricted_cross_leverage_diagonal_gpu(
     genotype_matrix: StandardizedGenotypeMatrix,
     *,
-    covariate_matrix_gpu,
-    inverse_covariance_covariates_gpu,
-    gls_cholesky_gpu,
-    inverse_covariance_probe_matrix_gpu,
-    probe_projection_matrix_gpu,
+    covariate_matrix_gpu: Any,
+    inverse_covariance_covariates_gpu: Any,
+    gls_cholesky_gpu: Any,
+    inverse_covariance_probe_matrix_gpu: Any,
+    probe_projection_matrix_gpu: Any,
     batch_size: int,
-    cp,
-    solve_triangular_gpu,
-    low_rank_probe_projection_matrix_gpu=None,
-    restricted_low_rank_probe_projection_matrix_gpu=None,
+    cp: Any,
+    solve_triangular_gpu: Callable[..., Any],
+    low_rank_probe_projection_matrix_gpu: Any = None,
+    restricted_low_rank_probe_projection_matrix_gpu: Any = None,
 ) -> Any:
     leverage_diagonal_gpu = cp.zeros(genotype_matrix.shape[1], dtype=cp.float64)
     if low_rank_probe_projection_matrix_gpu is not None or restricted_low_rank_probe_projection_matrix_gpu is not None:
@@ -10155,7 +10159,7 @@ def _build_prior_design(records: Sequence[VariantRecord]) -> PriorDesign:
 
 def _compile_prior_feature_specs(
     annotation_tables: _PriorAnnotationTables,
-    class_membership_by_class: dict[VariantClass, np.ndarray],
+    class_membership_by_class: dict[VariantClass, NDArray],
 ) -> tuple[ScaleModelFeatureSpec, ...]:
     feature_specs: list[ScaleModelFeatureSpec] = []
     class_totals = {
@@ -10249,8 +10253,8 @@ def _design_matrix_for_feature_specs(
     records: Sequence[VariantRecord],
     feature_specs: Sequence[ScaleModelFeatureSpec],
     annotation_tables: _PriorAnnotationTables,
-    class_membership_by_class: dict[VariantClass, np.ndarray],
-) -> np.ndarray:
+    class_membership_by_class: dict[VariantClass, NDArray],
+) -> NDArray:
     if len(feature_specs) == 0:
         return np.zeros((len(records), 0), dtype=np.float64)
     design_columns = [
@@ -10269,8 +10273,8 @@ def _design_matrix_for_feature_specs(
 def _column_for_feature_spec(
     feature_spec: ScaleModelFeatureSpec,
     annotation_tables: _PriorAnnotationTables,
-    class_membership_by_class: dict[VariantClass, np.ndarray],
-) -> np.ndarray:
+    class_membership_by_class: dict[VariantClass, NDArray],
+) -> NDArray:
     if feature_spec.kind == "type_offset":
         if feature_spec.variant_class is None:
             raise ValueError("Scale-model feature spec is missing variant_class.")
@@ -10388,7 +10392,7 @@ def _class_membership_weight(record: VariantRecord, variant_class: VariantClass)
 def _class_membership_by_class(
     records: Sequence[VariantRecord],
     variant_classes: Iterable[VariantClass],
-) -> dict[VariantClass, np.ndarray]:
+) -> dict[VariantClass, NDArray]:
     return {
         variant_class: np.asarray(
             [_class_membership_weight(record, variant_class) for record in records],
@@ -10437,7 +10441,7 @@ def _prior_annotation_feature_names(records: Sequence[VariantRecord]) -> _PriorA
 def _continuous_prior_annotation_values(
     records: Sequence[VariantRecord],
     feature_names: set[str],
-) -> dict[str, np.ndarray]:
+) -> dict[str, NDArray]:
     feature_values_by_name = {}
     for feature_name in sorted(feature_names):
         feature_values_by_name[feature_name] = np.asarray(
@@ -10456,8 +10460,8 @@ def _factor_prior_annotation_weights(
     binary_feature_names: set[str],
     categorical_feature_names: set[str],
     membership_feature_names: set[str],
-) -> dict[str, dict[str, np.ndarray]]:
-    factor_weights_by_source: dict[str, dict[str, np.ndarray]] = {}
+) -> dict[str, dict[str, NDArray]]:
+    factor_weights_by_source: dict[str, dict[str, NDArray]] = {}
     for feature_name in sorted(binary_feature_names):
         true_values = np.asarray(
             [float(record.prior_binary_features.get(feature_name, False)) for record in records],
@@ -10512,10 +10516,10 @@ def _nested_prior_annotation_weights(
     records: Sequence[VariantRecord],
     *,
     nested_feature_names: set[str],
-) -> dict[str, dict[int, dict[str, np.ndarray]]]:
-    nested_weights_by_source: dict[str, dict[int, dict[str, np.ndarray]]] = {}
+) -> dict[str, dict[int, dict[str, NDArray]]]:
+    nested_weights_by_source: dict[str, dict[int, dict[str, NDArray]]] = {}
     for feature_name in sorted(nested_feature_names):
-        source_nested_weights: dict[int, dict[str, np.ndarray]] = {}
+        source_nested_weights: dict[int, dict[str, NDArray]] = {}
         for record_index, record in enumerate(records):
             path_weights: dict[str, float] = {}
             if feature_name in record.prior_nested_features:
@@ -10536,7 +10540,7 @@ def _nested_prior_annotation_weights(
     return nested_weights_by_source
 
 
-def _factor_levels_to_encode(level_weights_by_name: dict[str, np.ndarray]) -> tuple[str, ...]:
+def _factor_levels_to_encode(level_weights_by_name: dict[str, NDArray]) -> tuple[str, ...]:
     if len(level_weights_by_name) <= 1:
         return ()
     reference_level = max(
@@ -10548,7 +10552,7 @@ def _factor_levels_to_encode(level_weights_by_name: dict[str, np.ndarray]) -> tu
 
 def _continuous_spline_feature_specs(
     source_name: str,
-    raw_values: np.ndarray,
+    raw_values: NDArray,
 ) -> tuple[ScaleModelFeatureSpec, ...]:
     mean_value = float(np.mean(raw_values))
     scale_value = float(np.std(raw_values))
@@ -10580,7 +10584,7 @@ def _continuous_spline_feature_specs(
     return tuple(feature_specs)
 
 
-def _continuous_spline_knots(standardized_values: np.ndarray) -> tuple[float, ...]:
+def _continuous_spline_knots(standardized_values: NDArray) -> tuple[float, ...]:
     if np.unique(np.round(standardized_values, 12)).shape[0] < 3:
         return ()
     candidate_knots = np.quantile(standardized_values, [0.25, 0.5, 0.75])
@@ -10598,9 +10602,9 @@ def _continuous_spline_knots(standardized_values: np.ndarray) -> tuple[float, ..
 
 
 def _continuous_spline_basis_column(
-    raw_values: np.ndarray,
+    raw_values: NDArray,
     feature_spec: ScaleModelFeatureSpec,
-) -> np.ndarray:
+) -> NDArray:
     if feature_spec.standardize_mean is None or feature_spec.standardize_scale is None:
         raise ValueError("Continuous spline feature spec is missing standardization parameters.")
     standardized_values = (
@@ -10615,37 +10619,26 @@ def _continuous_spline_basis_column(
     raise ValueError("Unsupported continuous spline basis kind: " + str(feature_spec.basis_kind))
 
 
-def _minor_allele_frequency_values(records: Sequence[VariantRecord]) -> np.ndarray:
-    allele_frequencies = np.clip(
-        np.nan_to_num(
-            np.asarray([record.allele_frequency for record in records], dtype=np.float64),
-            nan=0.5,
-            posinf=1.0,
-            neginf=0.0,
-        ),
-        0.0,
-        1.0,
-    )
-    return np.minimum(allele_frequencies, 1.0 - allele_frequencies)
-
-
-def _cholesky_solve(cholesky_factor: np.ndarray, right_hand_side: np.ndarray) -> np.ndarray:
+def _cholesky_solve(cholesky_factor: NDArray, right_hand_side: NDArray) -> NDArray:
     lower_solution = solve_triangular(
         cholesky_factor,
         right_hand_side,
         lower=True,
         check_finite=False,
     )
-    return solve_triangular(
-        cholesky_factor,
-        lower_solution,
-        lower=True,
-        trans="T",
-        check_finite=False,
+    return np.asarray(
+        solve_triangular(
+            cholesky_factor,
+            lower_solution,
+            lower=True,
+            trans="T",
+            check_finite=False,
+        ),
+        dtype=np.float64,
     )
 
 
-def _center_design_column(values: np.ndarray) -> np.ndarray:
+def _center_design_column(values: NDArray) -> NDArray:
     centered = np.asarray(values, dtype=np.float64) - float(np.mean(values))
     if np.max(np.abs(centered)) < 1e-10:
         return np.zeros_like(centered)
@@ -10655,7 +10648,7 @@ def _center_design_column(values: np.ndarray) -> np.ndarray:
 def _initialize_scale_model(
     prior_design: PriorDesign,
     config: ModelConfig,
-) -> tuple[float, np.ndarray]:
+) -> tuple[float, NDArray]:
     default_log_scales = config.class_log_baseline_scales()
     class_log_scale_vector = np.asarray(
         [
@@ -10687,12 +10680,12 @@ def _initialize_scale_model(
 def _calibrate_initial_global_scale(
     *,
     current_global_scale: float,
-    scale_model_coefficients: np.ndarray,
+    scale_model_coefficients: NDArray,
     prior_design: PriorDesign,
-    genotype_matrix: StandardizedGenotypeMatrix | np.ndarray,
-    covariate_matrix: np.ndarray,
-    targets: np.ndarray,
-    alpha_state: np.ndarray,
+    genotype_matrix: StandardizedGenotypeMatrix | NDArray,
+    covariate_matrix: NDArray,
+    targets: NDArray,
+    alpha_state: NDArray,
     trait_type: TraitType,
     config: ModelConfig,
 ) -> float:
@@ -10763,14 +10756,14 @@ def _calibrate_initial_global_scale(
 # Re-estimate the global scale and metadata coefficients with the exact
 # convex Newton update for the expected Gaussian prior term.
 def _update_scale_model(
-    reduced_second_moment: np.ndarray,
-    local_scale: np.ndarray,
+    reduced_second_moment: NDArray,
+    local_scale: NDArray,
     prior_design: PriorDesign,
-    scale_penalty: np.ndarray,
+    scale_penalty: NDArray,
     current_global_scale: float,
-    current_scale_model_coefficients: np.ndarray,
+    current_scale_model_coefficients: NDArray,
     config: ModelConfig,
-) -> tuple[float, np.ndarray]:
+) -> tuple[float, NDArray]:
     expected_scale = np.maximum(
         np.asarray(reduced_second_moment, dtype=np.float64) / np.maximum(local_scale, config.local_scale_floor),
         config.prior_scale_floor**2,
@@ -10803,7 +10796,7 @@ def _update_scale_model(
     penalty_vector = np.concatenate([np.zeros(1, dtype=np.float64), penalty])
     theta = np.concatenate([[global_log_scale], coefficients]).astype(np.float64, copy=False)
 
-    def objective(theta_value: np.ndarray) -> float:
+    def objective(theta_value: NDArray) -> float:
         linear_predictor = augmented_design @ theta_value
         return float(
             0.5 * np.sum(expected_scale * np.exp(-2.0 * linear_predictor) + 2.0 * linear_predictor)
@@ -10852,7 +10845,7 @@ def _update_scale_model(
 def _initialize_tpb_shape_a_vector(
     prior_design: PriorDesign,
     config: ModelConfig,
-) -> np.ndarray:
+) -> NDArray:
     default_shape_a = config.class_tpb_shape_a()
     return np.asarray(
         [
@@ -10866,7 +10859,7 @@ def _initialize_tpb_shape_a_vector(
 def _initialize_tpb_shape_b_vector(
     prior_design: PriorDesign,
     config: ModelConfig,
-) -> np.ndarray:
+) -> NDArray:
     default_shape_b = config.class_tpb_shape_b()
     return np.asarray(
         [
@@ -10888,13 +10881,13 @@ def _initialize_tpb_shape_b_vector(
 # ascent on the marginal likelihood of the local scales, with a
 # hierarchical penalty that keeps classes from diverging too much.
 def _update_tpb_shape_vectors(
-    class_membership_matrix: np.ndarray,
-    current_shape_a_vector: np.ndarray,
-    current_shape_b_vector: np.ndarray,
-    local_scale: np.ndarray,
-    auxiliary_delta: np.ndarray,
+    class_membership_matrix: NDArray,
+    current_shape_a_vector: NDArray,
+    current_shape_b_vector: NDArray,
+    local_scale: NDArray,
+    auxiliary_delta: NDArray,
     config: ModelConfig,
-) -> tuple[np.ndarray, np.ndarray]:
+) -> tuple[NDArray, NDArray]:
     class_count = current_shape_a_vector.shape[0]
     if class_count == 0:
         return current_shape_a_vector, current_shape_b_vector
@@ -10910,7 +10903,7 @@ def _update_tpb_shape_vectors(
         ]
     )
 
-    def objective_and_gradient(log_shape_vector: np.ndarray) -> tuple[float, np.ndarray]:
+    def objective_and_gradient(log_shape_vector: NDArray) -> tuple[float, NDArray]:
         log_shape_a = log_shape_vector[:class_count]
         log_shape_b = log_shape_vector[class_count:]
         shape_a_vector = np.exp(log_shape_a)
@@ -10951,7 +10944,7 @@ def _update_tpb_shape_vectors(
         gradient = np.concatenate([gradient_a, gradient_b]).astype(np.float64)
         return objective_value, gradient
 
-    def neg_obj_and_grad(log_shape: np.ndarray) -> tuple[float, np.ndarray]:
+    def neg_obj_and_grad(log_shape: NDArray) -> tuple[float, NDArray]:
         val, grad = objective_and_gradient(np.asarray(log_shape, dtype=np.float64))
         return -val, -grad
 
@@ -10986,10 +10979,10 @@ def _update_tpb_shape_vectors(
 
 
 def _metadata_baseline_scales_from_coefficients(
-    scale_model_coefficients: np.ndarray,
-    design_matrix: np.ndarray,
+    scale_model_coefficients: NDArray,
+    design_matrix: NDArray,
     config: ModelConfig,
-) -> np.ndarray:
+) -> NDArray:
     if design_matrix.shape[1] == 0:
         return np.ones(design_matrix.shape[0], dtype=np.float64)
     linear_prediction = design_matrix @ scale_model_coefficients
@@ -11002,20 +10995,23 @@ def _metadata_baseline_scales_from_coefficients(
 
 
 def _effective_prior_variances(
-    baseline_prior_variances: np.ndarray,
-    local_scale: np.ndarray,
+    baseline_prior_variances: NDArray,
+    local_scale: NDArray,
     config: ModelConfig,
-) -> np.ndarray:
-    return np.maximum(
-        baseline_prior_variances * np.maximum(local_scale, config.local_scale_floor),
-        1e-8,
+) -> NDArray:
+    return np.asarray(
+        np.maximum(
+            baseline_prior_variances * np.maximum(local_scale, config.local_scale_floor),
+            1e-8,
+        ),
+        dtype=np.float64,
     )
 
 
 def _scale_model_penalty(
     feature_names: Sequence[str],
     config: ModelConfig,
-) -> np.ndarray:
+) -> NDArray:
     penalty_values = np.full(len(feature_names), config.scale_model_ridge_penalty, dtype=np.float64)
     for feature_index, feature_name in enumerate(feature_names):
         if feature_name.startswith("type_offset::"):
@@ -11024,8 +11020,8 @@ def _scale_model_penalty(
 
 
 def _scale_penalty_objective(
-    scale_model_coefficients: np.ndarray,
-    scale_penalty: np.ndarray,
+    scale_model_coefficients: NDArray,
+    scale_penalty: NDArray,
 ) -> float:
     return float(-0.5 * np.sum(scale_penalty * scale_model_coefficients * scale_model_coefficients))
 
@@ -11033,10 +11029,10 @@ def _scale_penalty_objective(
 def _pack_anderson_hyperparameters(
     *,
     log_global_scale: float,
-    scale_model_coefficients: np.ndarray,
-    log_tpb_shape_a_vector: np.ndarray,
-    log_tpb_shape_b_vector: np.ndarray,
-) -> np.ndarray:
+    scale_model_coefficients: NDArray,
+    log_tpb_shape_a_vector: NDArray,
+    log_tpb_shape_b_vector: NDArray,
+) -> NDArray:
     return np.concatenate([
         np.asarray([log_global_scale], dtype=np.float64),
         np.asarray(scale_model_coefficients, dtype=np.float64),
@@ -11046,11 +11042,11 @@ def _pack_anderson_hyperparameters(
 
 
 def _unpack_anderson_hyperparameters(
-    packed: np.ndarray,
+    packed: NDArray,
     *,
     scale_model_dim: int,
     tpb_class_count: int,
-) -> tuple[float, np.ndarray, np.ndarray, np.ndarray]:
+) -> tuple[float, NDArray, NDArray, NDArray]:
     cursor = 0
     log_g = float(packed[cursor])
     cursor += 1
@@ -11063,14 +11059,14 @@ def _unpack_anderson_hyperparameters(
     return log_g, scale_coefs, log_a, log_b
 
 
-def _pack_theta(global_scale: float, scale_model_coefficients: np.ndarray) -> np.ndarray:
+def _pack_theta(global_scale: float, scale_model_coefficients: NDArray) -> NDArray:
     return np.concatenate([
         np.asarray([np.log(np.maximum(global_scale, 1e-8))], dtype=np.float64),
         np.asarray(scale_model_coefficients, dtype=np.float64),
     ])
 
 
-def _unpack_theta(theta: np.ndarray) -> tuple[float, np.ndarray]:
+def _unpack_theta(theta: NDArray) -> tuple[float, NDArray]:
     return float(np.exp(theta[0])), np.asarray(theta[1:], dtype=np.float64)
 
 
@@ -11079,10 +11075,10 @@ def _unpack_theta(theta: np.ndarray) -> tuple[float, np.ndarray]:
 # it penalizes implausibly large or small local scales, with the penalty
 # shape determined by the class-specific (a, b) parameters.
 def _local_scale_prior_objective(
-    local_scale: np.ndarray,
-    auxiliary_delta: np.ndarray,
-    local_shape_a: np.ndarray,
-    local_shape_b: np.ndarray,
+    local_scale: NDArray,
+    auxiliary_delta: NDArray,
+    local_shape_a: NDArray,
+    local_shape_b: NDArray,
 ) -> float:
     gammaln_a = np.asarray(jax_gammaln(jnp.asarray(local_shape_a, dtype=jnp.float64)), dtype=np.float64)
     gammaln_b = np.asarray(jax_gammaln(jnp.asarray(local_shape_b, dtype=jnp.float64)), dtype=np.float64)
@@ -11111,13 +11107,13 @@ def _local_scale_prior_objective(
 # delta = (a+b)/(1+lambda). Repeated calls by the outer EM loop converge the
 # joint fixed point without an expensive hidden inner loop.
 def _update_local_scales(
-    coefficient_second_moment: np.ndarray,
-    baseline_prior_variances: np.ndarray,
-    local_shape_a: np.ndarray,
-    local_shape_b: np.ndarray,
-    auxiliary_delta: np.ndarray,
+    coefficient_second_moment: NDArray,
+    baseline_prior_variances: NDArray,
+    local_shape_a: NDArray,
+    local_shape_b: NDArray,
+    auxiliary_delta: NDArray,
     config: ModelConfig,
-) -> tuple[np.ndarray, np.ndarray]:
+) -> tuple[NDArray, NDArray]:
     chi = np.maximum(
         coefficient_second_moment / np.maximum(baseline_prior_variances, 1e-12),
         1e-12,
@@ -11143,12 +11139,12 @@ def _update_local_scales(
 
 def _build_cavi_correct_prior_precision(
     *,
-    reduced_second_moment: np.ndarray,
-    baseline_prior_variances: np.ndarray,
-    local_shape_a: np.ndarray,
-    auxiliary_delta: np.ndarray,
+    reduced_second_moment: NDArray,
+    baseline_prior_variances: NDArray,
+    local_shape_a: NDArray,
+    auxiliary_delta: NDArray,
     config: ModelConfig,
-) -> np.ndarray:
+) -> NDArray:
     """Build E[1/lambda] / (sigma_g^2 * s_j^2) precision array for variant beta.
 
     ``baseline_prior_variances`` already encodes sigma_g^2 * s_j^2. The
@@ -11176,7 +11172,7 @@ def _build_cavi_correct_prior_precision(
         raise ValueError("precision shape must match reduced_second_moment shape.")
     if not np.all(np.isfinite(precision)) or np.any(precision <= 0.0):
         raise FloatingPointError("CAVI inverse local-scale precision produced invalid values.")
-    return precision
+    return np.asarray(precision, dtype=np.float64)
 
 
 # Compute the expected value of X^r where X ~ GIG(p, chi, psi).
@@ -11191,11 +11187,11 @@ def _build_cavi_correct_prior_precision(
 # psi = 2 * delta.  The result E[lambda] tells us how much to shrink
 # each variant.
 def _gig_moment(
-    p_parameter: np.ndarray,
-    chi: np.ndarray,
-    psi: np.ndarray,
+    p_parameter: NDArray,
+    chi: NDArray,
+    psi: NDArray,
     moment_power: float,
-) -> np.ndarray:
+) -> NDArray:
     chi_array = np.asarray(chi, dtype=np.float64)
     psi_array = np.asarray(psi, dtype=np.float64)
     p_array = np.asarray(p_parameter, dtype=np.float64)
@@ -11214,12 +11210,12 @@ def _gig_moment(
 def _member_prior_variances_from_reduced_state(
     member_records: Sequence[VariantRecord],
     tie_map: TieMap,
-    scale_model_coefficients: np.ndarray,
+    scale_model_coefficients: NDArray,
     scale_model_feature_specs: Sequence[ScaleModelFeatureSpec],
     global_scale: float,
-    local_scale: np.ndarray,
+    local_scale: NDArray,
     config: ModelConfig,
-) -> np.ndarray:
+) -> NDArray:
     feature_variant_classes = {
         feature_spec.variant_class
         for feature_spec in scale_model_feature_specs
@@ -11262,9 +11258,9 @@ def _tie_map_is_identity(tie_map: TieMap, *, member_count: int) -> bool:
 
 
 def _expand_group_values_to_members(
-    reduced_values: np.ndarray,
+    reduced_values: NDArray,
     tie_map: TieMap,
-) -> np.ndarray:
+) -> NDArray:
     reduced_array = np.asarray(reduced_values, dtype=np.float64)
     if not tie_map.reduced_to_group:
         member_values = np.zeros(tie_map.original_to_reduced.shape[0], dtype=np.float64)
@@ -11279,18 +11275,18 @@ def _expand_group_values_to_members(
 
 
 def _hyperparameter_relative_change(
-    current_beta: np.ndarray,
-    previous_beta: np.ndarray | None,
-    current_alpha: np.ndarray,
-    previous_alpha: np.ndarray | None,
-    current_local_scale: np.ndarray,
-    previous_local_scale: np.ndarray | None,
-    current_theta: np.ndarray,
-    previous_theta: np.ndarray | None,
-    current_tpb_shape_a_vector: np.ndarray,
-    previous_tpb_shape_a_vector: np.ndarray | None,
-    current_tpb_shape_b_vector: np.ndarray,
-    previous_tpb_shape_b_vector: np.ndarray | None,
+    current_beta: NDArray,
+    previous_beta: NDArray | None,
+    current_alpha: NDArray,
+    previous_alpha: NDArray | None,
+    current_local_scale: NDArray,
+    previous_local_scale: NDArray | None,
+    current_theta: NDArray,
+    previous_theta: NDArray | None,
+    current_tpb_shape_a_vector: NDArray,
+    previous_tpb_shape_a_vector: NDArray | None,
+    current_tpb_shape_b_vector: NDArray,
+    previous_tpb_shape_b_vector: NDArray | None,
 ) -> float:
     if previous_beta is None:
         return float("inf")
@@ -11307,12 +11303,12 @@ def _hyperparameter_relative_change(
 
 def _fit_state_convergence_change(
     *,
-    current_beta: np.ndarray,
-    previous_beta: np.ndarray | None,
-    current_alpha: np.ndarray,
-    previous_alpha: np.ndarray | None,
-    current_linear_predictor: np.ndarray,
-    previous_linear_predictor: np.ndarray | None,
+    current_beta: NDArray,
+    previous_beta: NDArray | None,
+    current_alpha: NDArray,
+    previous_alpha: NDArray | None,
+    current_linear_predictor: NDArray,
+    previous_linear_predictor: NDArray | None,
     current_objective: float,
     previous_objective: float | None,
 ) -> tuple[float, float, float, float]:
@@ -11338,7 +11334,7 @@ def _require_finite_fit_values(context: str, *named_values: tuple[str, object]) 
             raise FloatingPointError(f"{context} produced non-finite {name}.")
 
 
-def _scaled_rms_change(current_values: np.ndarray, previous_values: np.ndarray | None) -> float:
+def _scaled_rms_change(current_values: NDArray, previous_values: NDArray | None) -> float:
     if previous_values is None:
         return float("inf")
     current_array = np.asarray(current_values, dtype=np.float64).reshape(-1)
@@ -11362,7 +11358,7 @@ def _relative_objective_change(current_objective: float, previous_objective: flo
     return abs(current_value - previous_value) / max(1.0, abs(previous_value))
 
 
-def _relative_change(current_values: np.ndarray, previous_values: np.ndarray | None) -> float:
+def _relative_change(current_values: NDArray, previous_values: NDArray | None) -> float:
     if previous_values is None:
         return 0.0
     # Adaptive denominator: a fixed 1e-8 floor turns genuinely tiny norms (e.g. near
@@ -11377,13 +11373,13 @@ def _relative_change(current_values: np.ndarray, previous_values: np.ndarray | N
 
 
 def _validation_linear_predictor(
-    genotype_matrix: StandardizedGenotypeMatrix | np.ndarray,
-    covariate_matrix: np.ndarray,
-    alpha: np.ndarray,
-    beta: np.ndarray,
-    predictor_offset: np.ndarray | None,
+    genotype_matrix: StandardizedGenotypeMatrix | NDArray,
+    covariate_matrix: NDArray,
+    alpha: NDArray,
+    beta: NDArray,
+    predictor_offset: NDArray | None,
     target_count: int,
-) -> np.ndarray:
+) -> NDArray:
     offset = (
         np.zeros(target_count, dtype=np.float64)
         if predictor_offset is None
@@ -11403,8 +11399,8 @@ def _validation_linear_predictor(
 
 def _validation_metric_from_linear_predictor(
     trait_type: TraitType,
-    targets: np.ndarray,
-    linear_predictor: np.ndarray,
+    targets: NDArray,
+    linear_predictor: NDArray,
 ) -> float:
     if trait_type == TraitType.BINARY:
         positive_probability = np.asarray(stable_sigmoid(linear_predictor), dtype=np.float64)
@@ -11420,13 +11416,13 @@ def _validation_metric_from_linear_predictor(
 
 def _validation_evaluation(
     trait_type: TraitType,
-    genotype_matrix: StandardizedGenotypeMatrix | np.ndarray,
-    covariate_matrix: np.ndarray,
-    targets: np.ndarray,
-    alpha: np.ndarray,
-    beta: np.ndarray,
-    predictor_offset: np.ndarray | None = None,
-) -> tuple[float, np.ndarray]:
+    genotype_matrix: StandardizedGenotypeMatrix | NDArray,
+    covariate_matrix: NDArray,
+    targets: NDArray,
+    alpha: NDArray,
+    beta: NDArray,
+    predictor_offset: NDArray | None = None,
+) -> tuple[float, NDArray]:
     linear_predictor = _validation_linear_predictor(
         genotype_matrix=genotype_matrix,
         covariate_matrix=covariate_matrix,
@@ -11450,8 +11446,8 @@ def _validation_evaluation(
 # Newton-Raphson steps on the logistic likelihood with respect to the
 # intercept only — fast because it's a 1D optimization.
 def _calibrate_binary_intercept(
-    linear_predictor: np.ndarray,
-    targets: np.ndarray,
+    linear_predictor: NDArray,
+    targets: NDArray,
 ) -> float:
     target_array = np.asarray(targets, dtype=np.float64)
     base_linear_predictor = np.asarray(linear_predictor, dtype=np.float64)
