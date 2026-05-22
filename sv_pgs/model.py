@@ -1106,7 +1106,7 @@ class BayesianPGS:
                     and isinstance(validation_genotype_matrix.raw, RawGenotypeMatrix)
                 ):
                     validation_raw_signature = _persistent_raw_signature(
-                        cast(RawGenotypeMatrix, validation_genotype_matrix.raw)
+                        validation_genotype_matrix.raw
                     )
                     if validation_raw_signature is not None:
                         val_hasher = hashlib.sha256()

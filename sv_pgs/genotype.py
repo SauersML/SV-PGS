@@ -373,7 +373,7 @@ class IndexedRawGenotypeMatrix(RawGenotypeMatrix):
             raise RuntimeError("int8 batch iteration requires the wrapped child to support iter_column_batches_i8.")
         resolved_indices = _resolve_variant_indices(self.shape[1], variant_indices)
         safe_batch_size = max(int(batch_size), 1)
-        child = cast(Int8BatchCapable, self.child)
+        child = self.child
         for start_index in range(0, resolved_indices.shape[0], safe_batch_size):
             local_batch = resolved_indices[start_index : start_index + safe_batch_size]
             child_batch_indices = self._child_columns(local_batch)
@@ -453,7 +453,7 @@ class RowSubsetRawGenotypeMatrix(RawGenotypeMatrix):
     ) -> Iterator[RawGenotypeBatch]:
         if not _supports_int8_batches(self.child):
             raise RuntimeError("int8 batch iteration requires the wrapped child to support iter_column_batches_i8.")
-        child = cast(Int8BatchCapable, self.child)
+        child = self.child
         for batch in child.iter_column_batches_i8(variant_indices=variant_indices, batch_size=batch_size):
             yield RawGenotypeBatch(
                 variant_indices=batch.variant_indices,
@@ -915,15 +915,14 @@ def _try_upload_int8_parallel_memmap(
         if matrix.filename:
             with open(matrix.filename, "rb") as fadvise_handle:
                 file_offset = int(getattr(matrix, "offset", 0)) + src_col_start * int(sample_count)
-                try:
-                    os.posix_fadvise(
-                        fadvise_handle.fileno(),
-                        file_offset,
-                        total_bytes,
-                        os.POSIX_FADV_WILLNEED,
-                    )
-                except (AttributeError, OSError):
-                    pass
+                # posix_fadvise is Linux-only; fall through cleanly on macOS/Windows.
+                posix_fadvise = getattr(os, "posix_fadvise", None)
+                willneed = getattr(os, "POSIX_FADV_WILLNEED", None)
+                if posix_fadvise is not None and willneed is not None:
+                    try:
+                        posix_fadvise(fadvise_handle.fileno(), file_offset, total_bytes, willneed)
+                    except OSError:
+                        pass
     except (AttributeError, OSError):
         pass
 
@@ -967,6 +966,7 @@ def _try_upload_int8_parallel_memmap(
                 # destination, OOM'ing a 15 GB T4. ``memcpyAsync`` writes
                 # straight into the F-order destination view: zero extra GPU
                 # allocation, identical bytes on-device.
+                assert memcpy_async is not None and memcpy_h2d_kind is not None
                 gpu_view = gpu_destination[:, col_start:col_end]
                 host_slice = pinned_buf[:, col_start:col_end]
                 memcpy_async(
@@ -1836,9 +1836,8 @@ def _iter_selected_cupy_cache_standardized_batches(
         stop_index = min(start_index + safe_batch_size, selected_variant_count)
         operand_slice = slice(start_index, stop_index)
         selected_indices = local_variant_indices[operand_slice]
-        local_selection = _local_indices_as_slice(selected_indices)
-        if local_selection is None:
-            local_selection = selected_indices
+        maybe_slice = _local_indices_as_slice(selected_indices)
+        local_selection: np.ndarray | slice = maybe_slice if maybe_slice is not None else selected_indices
         yield operand_slice, _cupy_cache_standardized_columns(
             cache,
             local_selection,
@@ -2371,7 +2370,7 @@ class StandardizedGenotypeMatrix:
         dense_mask[sparse_local_indices] = False
         dense_local_indices = np.flatnonzero(dense_mask).astype(np.int32)
         self._sparse_backend = _build_sparse_backend(
-            raw=cast(Int8BatchCapable, self.raw),
+            raw=self.raw,
             raw_variant_indices=self.variant_indices[sparse_local_indices],
             means=self.means,
             scales=self.scales,
@@ -2650,7 +2649,7 @@ class StandardizedGenotypeMatrix:
                 if _supports_int8_batches(self.raw):
                     _upload_standardized_int8_tiles_overlapped(
                         cupy=cupy,
-                        raw_int8=cast(Int8BatchCapable, self.raw),
+                        raw_int8=self.raw,
                         variant_indices=self.variant_indices,
                         means=self.means,
                         scales=self.scales,
@@ -2742,7 +2741,7 @@ class StandardizedGenotypeMatrix:
                 if _supports_int8_batches(self.raw):
                     _upload_standardized_int8_tiles_overlapped(
                         cupy=cupy,
-                        raw_int8=cast(Int8BatchCapable, self.raw),
+                        raw_int8=self.raw,
                         variant_indices=selected_variant_indices,
                         means=self.means,
                         scales=self.scales,
@@ -2850,7 +2849,7 @@ class StandardizedGenotypeMatrix:
                 )
                 cache_directory.cleanup()
                 return False
-            raw_int8 = cast(Int8BatchCapable, self.raw)
+            raw_int8 = self.raw
             def _column_batches() -> Iterator[np.ndarray]:
                 for raw_batch in raw_int8.iter_column_batches_i8(self.variant_indices, batch_size=batch_size):
                     yield raw_batch.values
@@ -2931,7 +2930,7 @@ class StandardizedGenotypeMatrix:
                     + f"(need~{required_bytes / 1e9:.1f} GB, free~{available_bytes / 1e9:.1f} GB)  mem={mem()}"
                 )
                 return False
-            raw_int8 = cast(Int8BatchCapable, self.raw)
+            raw_int8 = self.raw
             def _column_batches() -> Iterator[np.ndarray]:
                 for raw_batch in raw_int8.iter_column_batches_i8(self.variant_indices, batch_size=batch_size):
                     yield raw_batch.values
@@ -3057,7 +3056,7 @@ class StandardizedGenotypeMatrix:
         )
         local_start = 0
         if _supports_int8_batches(self.raw):
-            raw_int8 = cast(Int8BatchCapable, self.raw)
+            raw_int8 = self.raw
             for raw_batch in raw_int8.iter_column_batches_i8(self.variant_indices, batch_size=safe_batch_size):
                 local_stop = local_start + raw_batch.variant_indices.shape[0]
                 local_indices = np.arange(local_start, local_stop, dtype=np.int32)
@@ -3187,7 +3186,7 @@ class StandardizedGenotypeMatrix:
             raise RuntimeError("GPU genotype matmul requires a GPU cache or a streaming raw backend.")
         active_variant_indices = self.variant_indices[resolved_local_indices]
         result_gpu = cupy.zeros((self.shape[0], matrix_gpu.shape[1]), dtype=resolved_dtype)
-        raw_matrix = cast(RawGenotypeMatrix, self.raw)
+        raw_matrix = self.raw
         total_variants = int(resolved_local_indices.shape[0])
         completed_variants = 0
         last_logged_variants = 0
@@ -3268,10 +3267,10 @@ class StandardizedGenotypeMatrix:
         )
         if streaming_cupy is None or streaming_batch_size is None or self.raw is None:
             raise RuntimeError("GPU genotype transpose matmul requires a GPU cache or a streaming raw backend.")
-        raw_matrix = cast(RawGenotypeMatrix, self.raw)
+        raw_matrix = self.raw
         if _supports_int8_batches(raw_matrix):
             result_gpu = _gpu_int8_transpose_matmul(
-                raw_int8=cast(Int8BatchCapable, raw_matrix),
+                raw_int8=raw_matrix,
                 variant_indices=self.variant_indices,
                 means=self.means,
                 scales=self.scales,
@@ -3408,7 +3407,7 @@ class StandardizedGenotypeMatrix:
         selected_scales = np.asarray(self.scales[selected_variant_indices], dtype=np.float32)
         local_start = 0
         if _supports_int8_batches(self.raw):
-            raw_int8 = cast(Int8BatchCapable, self.raw)
+            raw_int8 = self.raw
             for raw_batch in raw_int8.iter_column_batches_i8(selected_variant_indices, batch_size=safe_batch_size):
                 batch_width = raw_batch.variant_indices.shape[0]
                 local_stop = local_start + batch_width
@@ -3875,7 +3874,7 @@ def _read_int8_columns_one_shot(
         return np.asfortranarray(raw._read_batch_i8(reader, resolved_indices), dtype=np.int8)
     if isinstance(raw, IndexedRawGenotypeMatrix) and _supports_int8_batches(raw.child):
         child_block = _read_int8_columns_one_shot(
-            cast(Int8BatchCapable, raw.child),
+            raw.child,
             raw._child_columns(resolved_indices),
         )
         return None if child_block is None else np.asfortranarray(child_block, dtype=np.int8)
@@ -3885,7 +3884,7 @@ def _read_int8_columns_one_shot(
         if child_sample_count > int(subset_sample_count * ROW_SUBSET_ONE_SHOT_MAX_SAMPLE_RATIO):
             return None
         child_block = _read_int8_columns_one_shot(
-            cast(Int8BatchCapable, raw.child),
+            raw.child,
             resolved_indices,
         )
         if child_block is None:

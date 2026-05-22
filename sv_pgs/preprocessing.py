@@ -614,8 +614,7 @@ def _build_tie_map_windowed(
     needed_local_indices = sorted({i for pair in candidate_pairs for i in (pair[0], pair[1])})
     column_cache: dict[int, np.ndarray] = {}
     if has_int8_batches:
-        from typing import cast as _cast
-        raw_typed = _cast(Int8BatchCapable, raw_int8)
+        raw_typed = raw_int8
         raw_variant_indices = np.asarray([int(variant_indices[i]) for i in needed_local_indices], dtype=np.int32)
         batch_size = max(min(len(raw_variant_indices), 512), 1)
         col_idx = 0
@@ -1414,7 +1413,7 @@ def _load_hardcall_tie_columns(
 ) -> tuple[np.ndarray, np.ndarray]:
     if standardized_genotypes.raw is None or not _supports_int8_batches(standardized_genotypes.raw):
         raise RuntimeError("hardcall tie loading requires int8 raw backing storage.")
-    raw_int8 = cast(Int8BatchCapable, standardized_genotypes.raw)
+    raw_int8 = standardized_genotypes.raw
     raw_variant_index = int(standardized_genotypes.variant_indices[local_variant_index])
     raw_batch = next(raw_int8.iter_column_batches_i8([raw_variant_index], batch_size=1))
     exact_column, sign_flipped_column = _canonicalize_hardcall_tie_columns_i8(

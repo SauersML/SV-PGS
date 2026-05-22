@@ -17,11 +17,12 @@ import numpy as np
 
 from sv_pgs.config import ModelConfig, VariantClass
 from sv_pgs.data import NESTED_PATH_DELIMITER, VariantRecord, VariantStatistics
+from sv_pgs.plink import PLINK_MISSING_INT8
 from sv_pgs.genotype import (
-    PLINK_MISSING_INT8,
     ConcatenatedRawGenotypeMatrix,
     IndexedRawGenotypeMatrix,
     PlinkRawGenotypeMatrix,
+    RawGenotypeBatch,
     RawGenotypeMatrix,
     RowSubsetRawGenotypeMatrix,
     _has_sufficient_free_space_for_int8_npy,
@@ -2145,6 +2146,7 @@ def _compute_variant_stats_teeing_int8(
     # 500 MB read instead of an 80 MB one (6x fewer round-trips).
     tuned_batch_size = auto_batch_size_i8(sample_count)
     remaining_variant_indices = np.arange(variants_done, variant_count, dtype=np.int32)
+    iter_handle: Iterator[RawGenotypeBatch]
     if remaining_variant_indices.size == 0:
         iter_handle = iter(())
     else:

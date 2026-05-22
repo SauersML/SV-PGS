@@ -420,9 +420,9 @@ def evaluate_all_of_us(
             test_scores_by_id = {sid: score for sid, _, score, _, _ in test_rows}
             test_groups: dict[int, list[float]] = {}
             for sid, score in test_scores_by_id.items():
-                cnt = observation_counts.get(sid)
-                if cnt is not None:
-                    test_groups.setdefault(cnt, []).append(score)
+                sid_cnt = observation_counts.get(sid)
+                if sid_cnt is not None:
+                    test_groups.setdefault(sid_cnt, []).append(score)
             if test_groups:
                 log("  dose-response on held-out (score vs observation count):")
                 max_cnt_test = max(test_groups.keys())

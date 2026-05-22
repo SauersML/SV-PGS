@@ -215,7 +215,7 @@ def _process_cpu_seconds() -> float:
 
 def _cupy_mempool_snapshot() -> str:
     try:
-        import cupy  # type: ignore[import-not-found]
+        import cupy
     except ImportError:
         return "cupy=unavailable"
     try:
