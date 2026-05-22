@@ -56,6 +56,7 @@ from dataclasses import MISSING, dataclass, field, fields as dataclass_fields, r
 import gc
 import hashlib
 import json
+import os
 import time
 from typing import Any, Callable, Iterable, Sequence, cast
 
@@ -118,6 +119,8 @@ _GPU_EXACT_VARIANT_TILE_CEILING_VARIANTS = 16_384
 _GPU_EXACT_VARIANT_TILE_MIN_VARIANTS = 256
 _GPU_EXACT_VARIANT_ALWAYS_FULL_MAX_VARIANTS = 64
 _GPU_EXACT_VARIANT_FULL_MATRIX_HEADROOM = 2.0
+_STOCHASTIC_BLOCK_GPU_CACHE_UTILIZATION = 0.50
+_STOCHASTIC_BLOCK_HOST_BUFFER_UTILIZATION = 0.35
 # Fraction of total GPU bytes the *per-iteration* weighted-tile + result-tile
 # pair is allowed to consume. Two float64 buffers of shape (sample_count, T):
 #   2 * 8 bytes/element * sample_count * T  <=  TILE_BUDGET_FRACTION * total_bytes
@@ -276,6 +279,60 @@ def _gpu_live_usable_bytes(cupy: Any) -> int:
         return free_bytes
     total_cap = int(total_bytes * _GPU_EXACT_VARIANT_MEMORY_UTILIZATION)
     return max(min(free_bytes, total_cap), 0)
+
+
+def _host_available_memory_bytes() -> int:
+    try:
+        with open("/proc/meminfo", encoding="utf-8") as meminfo:
+            for line in meminfo:
+                if line.startswith("MemAvailable:"):
+                    parts = line.split()
+                    if len(parts) >= 2:
+                        return int(parts[1]) * 1024
+    except (OSError, ValueError):
+        pass
+    try:
+        pages = os.sysconf("SC_AVPHYS_PAGES")
+        page_size = os.sysconf("SC_PAGE_SIZE")
+        if int(pages) > 0 and int(page_size) > 0:
+            return int(pages) * int(page_size)
+    except (AttributeError, OSError, ValueError):
+        pass
+    return 0
+
+
+def _adaptive_stochastic_variant_block_size(
+    genotype_matrix: StandardizedGenotypeMatrix,
+    configured_block_size: int,
+) -> int:
+    variant_count = int(genotype_matrix.shape[1])
+    if variant_count < 1:
+        return 1
+    configured = min(max(int(configured_block_size), 1), variant_count)
+    cupy = _try_import_cupy()
+    if cupy is None:
+        return configured
+
+    sample_count = max(int(genotype_matrix.shape[0]), 1)
+    live_gpu_bytes = int(_gpu_live_usable_bytes(cupy))
+    if live_gpu_bytes <= 0:
+        return configured
+
+    # A stochastic block keeps raw int8 genotypes resident on device, while
+    # standardized float working tiles, solver vectors, and backend workspaces
+    # share the remaining memory. Size from measured free memory, not GPU names.
+    gpu_cache_budget = int(live_gpu_bytes * _STOCHASTIC_BLOCK_GPU_CACHE_UTILIZATION)
+    max_by_gpu = max(gpu_cache_budget // sample_count, 1)
+
+    host_available = _host_available_memory_bytes()
+    if host_available > 0:
+        host_buffer_budget = int(host_available * _STOCHASTIC_BLOCK_HOST_BUFFER_UTILIZATION)
+        max_by_host = max(host_buffer_budget // sample_count, 1)
+        max_fit = min(max_by_gpu, max_by_host)
+    else:
+        max_fit = max_by_gpu
+
+    return min(variant_count, max(1, int(max_fit)))
 
 
 def _gpu_exact_variant_full_matrix_fits(
@@ -1685,7 +1742,17 @@ def fit_variational_em(
     final_objective_change: float | None = None
     final_hyperparameter_change: float | None = None
     if use_stochastic_updates:
-        configured_block_size = min(int(config.stochastic_variant_batch_size), int(genotype_matrix.shape[1]))
+        requested_block_size = min(int(config.stochastic_variant_batch_size), int(genotype_matrix.shape[1]))
+        configured_block_size = _adaptive_stochastic_variant_block_size(
+            genotype_matrix,
+            requested_block_size,
+        )
+        if configured_block_size != requested_block_size:
+            log(
+                "  variational EM: adaptive stochastic block size "
+                + f"{requested_block_size}->{configured_block_size} "
+                + "(sized from live GPU/host memory)"
+            )
         resume_completed_blocks_in_iteration = (
             0
             if resume_checkpoint is None

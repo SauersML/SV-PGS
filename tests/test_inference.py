@@ -2257,6 +2257,21 @@ def test_checkpoint_signature_ignores_solver_and_resume_policy_controls():
         validation_interval=1,
     )
     assert mixture_inference._checkpoint_config_signature(base) == mixture_inference._checkpoint_config_signature(tuned)
+
+
+def test_adaptive_stochastic_block_size_uses_live_memory(monkeypatch):
+    matrix = types.SimpleNamespace(shape=(100, 1_000))
+    fake_cupy = object()
+    monkeypatch.setattr(mixture_inference, "_try_import_cupy", lambda: fake_cupy)
+    monkeypatch.setattr(mixture_inference, "_host_available_memory_bytes", lambda: 1_000_000_000)
+
+    monkeypatch.setattr(mixture_inference, "_gpu_live_usable_bytes", lambda cupy: 20_000)
+    assert mixture_inference._adaptive_stochastic_variant_block_size(matrix, 200) == 100
+
+    monkeypatch.setattr(mixture_inference, "_gpu_live_usable_bytes", lambda cupy: 400_000)
+    assert mixture_inference._adaptive_stochastic_variant_block_size(matrix, 200) == 1_000
+
+
 def test_require_finite_fit_values_rejects_nan():
     with pytest.raises(FloatingPointError, match="non-finite beta"):
         mixture_inference._require_finite_fit_values(
