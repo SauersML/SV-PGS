@@ -71,6 +71,26 @@ class VariantRecord:
     prior_class_membership: tuple[float, ...] = ()
 
     def __post_init__(self) -> None:
+        # Fast path: at AoU scale we construct ~3.4M VariantRecord objects with
+        # no per-variant annotations (no variant_metadata file supplied), so
+        # every feature dict is the default-empty one. Skipping the
+        # normalize/validate work in that case turns a ~60s post-init pass into
+        # a ~5s one for the default --variants snp+sv pipeline.
+        if not (
+            self.prior_binary_features
+            or self.prior_continuous_features
+            or self.prior_categorical_features
+            or self.prior_membership_features
+            or self.prior_nested_features
+            or self.prior_nested_membership_features
+        ):
+            if not self.prior_class_members and not self.prior_class_membership:
+                self.prior_class_members = (self.variant_class,)
+                self.prior_class_membership = (1.0,)
+            elif len(self.prior_class_members) != len(self.prior_class_membership):
+                raise ValueError("prior_class_members and prior_class_membership must have the same length.")
+            return
+
         self.prior_binary_features = {
             str(feature_name): bool(feature_value)
             for feature_name, feature_value in self.prior_binary_features.items()
