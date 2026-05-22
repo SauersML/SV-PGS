@@ -184,8 +184,16 @@ list_diseases() {
 
 sweep_zombie_gpu_procs() {
   # Reclaim GPU memory held by stale CUDA contexts from prior killed runs.
-  # Only kills processes owned by the current user that are NOT ancestors of
-  # this shell — so we never SIGKILL ourselves, our parent shell, sshd, etc.
+  # A process is killed only if ALL of these hold:
+  #   * it owns GPU memory now (nvidia-smi reports it)
+  #   * it belongs to the current user
+  #   * it is NOT an ancestor of this shell (so we never SIGKILL sshd / jupyter)
+  #   * it is EITHER orphaned (ppid==1) — its launching shell died, leaving
+  #     a stuck CUDA context — OR its cmdline clearly belongs to this project
+  #     (matches sv-pgs / run-all-of-us / this repo's .venv path).
+  # That last clause is the important one for shared boxes: another notebook
+  # or another GPU job that the same user legitimately launched will not be
+  # touched.
   command -v nvidia-smi >/dev/null 2>&1 || return 0
   local self_pid=$$
   local skip_pids=" $self_pid "
@@ -199,16 +207,27 @@ sweep_zombie_gpu_procs() {
   local raw_pids
   raw_pids=$(nvidia-smi --query-compute-apps=pid --format=csv,noheader 2>/dev/null | tr -d ' ')
   [ -z "$raw_pids" ] && return 0
+  local repo_marker="${REPO_DIR}/.venv"
   local killed=0
+  local skipped_other=0
   for pid in $raw_pids; do
     [ -z "$pid" ] && continue
     case "$skip_pids" in *" $pid "*) continue ;; esac
-    local owner
+    local owner ppid cmd reason=""
     owner=$(ps -o user= -p "$pid" 2>/dev/null | tr -d ' ' || true)
     [ "$owner" = "$me" ] || continue
-    local cmd
-    cmd=$(ps -o args= -p "$pid" 2>/dev/null | head -c 100 || true)
-    echo "  GPU sweep: killing stale GPU process pid=$pid user=$owner cmd=$cmd"
+    ppid=$(ps -o ppid= -p "$pid" 2>/dev/null | tr -d ' ' || true)
+    cmd=$(ps -o args= -p "$pid" 2>/dev/null || true)
+    if [ "$ppid" = "1" ]; then
+      reason="orphaned (ppid=1)"
+    elif printf '%s' "$cmd" | grep -qE "sv-pgs|run-all-of-us|${repo_marker}"; then
+      reason="matches sv-pgs cmdline"
+    else
+      echo "  GPU sweep: leaving pid=$pid alone (foreign GPU job: $(printf '%s' "$cmd" | head -c 80))"
+      skipped_other=1
+      continue
+    fi
+    echo "  GPU sweep: killing stale GPU process pid=$pid reason='$reason' cmd=$(printf '%s' "$cmd" | head -c 80)"
     kill -9 "$pid" 2>/dev/null || true
     killed=1
   done
@@ -217,6 +236,9 @@ sweep_zombie_gpu_procs() {
     sleep 3
     echo "  GPU sweep: state after reclaim:"
     nvidia-smi --query-gpu=memory.used,memory.free --format=csv,noheader 2>/dev/null | sed 's/^/    /'
+  fi
+  if [ "$skipped_other" = "1" ]; then
+    echo "  GPU sweep: at least one foreign GPU process remains; expect reduced GPU memory budget."
   fi
 }
 
