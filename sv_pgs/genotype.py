@@ -1,7 +1,8 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from concurrent.futures import ThreadPoolExecutor
+from collections import deque
+from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, field
 import io
 import os
@@ -18,6 +19,7 @@ import jax.numpy as jnp
 from jax import dlpack as jax_dlpack
 import numpy as np
 from sv_pgs._jax import gpu_compute_jax_dtype, gpu_compute_numpy_dtype, jax_dense_linear_algebra_preferred
+from sv_pgs._typing import JaxArray, NDArray
 from sv_pgs.plink import PLINK_MISSING_INT8, open_bed
 from sv_pgs.progress import log, mem
 
@@ -51,7 +53,7 @@ INT8_ONE_SHOT_GPU_BUDGET_FRACTION = 0.90
 ROW_SUBSET_ONE_SHOT_MAX_SAMPLE_RATIO = 8.0
 
 
-def _madvise_willneed_array(array: np.ndarray) -> None:
+def _madvise_willneed_array(array: NDArray) -> None:
     """Best-effort posix_madvise(WILLNEED) on the mmap backing `array`.
 
     Tells the kernel we'll touch the whole int8 cache soon and to retain
@@ -83,7 +85,7 @@ def _madvise_willneed_array(array: np.ndarray) -> None:
         pass
 
 
-def as_raw_genotype_matrix(genotypes: RawGenotypeMatrix | np.ndarray) -> RawGenotypeMatrix:
+def as_raw_genotype_matrix(genotypes: RawGenotypeMatrix | NDArray) -> RawGenotypeMatrix:
     if isinstance(genotypes, RawGenotypeMatrix):
         return genotypes
     array = np.asanyarray(genotypes)
@@ -94,10 +96,12 @@ def as_raw_genotype_matrix(genotypes: RawGenotypeMatrix | np.ndarray) -> RawGeno
 
 def _int8_npy_header_bytes(shape: tuple[int, int], *, fortran_order: bool) -> bytes:
     header_buffer = io.BytesIO()
-    np.lib.format.write_array_header_2_0(
+    write_header: Any = np.lib.format.write_array_header_2_0
+    dtype_to_descr: Any = np.lib.format.dtype_to_descr
+    write_header(
         header_buffer,
         {
-            "descr": np.lib.format.dtype_to_descr(np.dtype(np.int8)),
+            "descr": dtype_to_descr(np.dtype(np.int8)),
             "fortran_order": bool(fortran_order),
             "shape": tuple(int(dimension) for dimension in shape),
         },
@@ -120,7 +124,7 @@ def _stream_write_int8_npy(
     path: Path,
     *,
     shape: tuple[int, int],
-    column_batches: Iterator[np.ndarray],
+    column_batches: Iterator[NDArray],
     fortran_order: bool,
 ) -> None:
     expected_sample_count = int(shape[0])
@@ -149,8 +153,8 @@ def _stream_write_int8_npy(
 
 @dataclass(slots=True)
 class RawGenotypeBatch:
-    variant_indices: np.ndarray
-    values: np.ndarray
+    variant_indices: NDArray
+    values: NDArray
 
 
 class RawGenotypeMatrix(ABC):
@@ -172,7 +176,7 @@ class RawGenotypeMatrix(ABC):
     @abstractmethod
     def iter_column_batches(
         self,
-        variant_indices: Sequence[int] | np.ndarray | None = None,
+        variant_indices: Sequence[int] | NDArray | None = None,
         batch_size: int = DEFAULT_GENOTYPE_BATCH_SIZE,
     ) -> Iterator[RawGenotypeBatch]:
         raise NotImplementedError
@@ -180,15 +184,15 @@ class RawGenotypeMatrix(ABC):
     @abstractmethod
     def materialize(
         self,
-        variant_indices: Sequence[int] | np.ndarray | None = None,
-    ) -> np.ndarray:
+        variant_indices: Sequence[int] | NDArray | None = None,
+    ) -> NDArray:
         raise NotImplementedError
 
     def standardized(
         self,
-        means: np.ndarray,
-        scales: np.ndarray,
-        support_counts: np.ndarray | None = None,
+        means: NDArray,
+        scales: NDArray,
+        support_counts: NDArray | None = None,
     ) -> StandardizedGenotypeMatrix:
         return StandardizedGenotypeMatrix(
             raw=self,
@@ -198,7 +202,7 @@ class RawGenotypeMatrix(ABC):
             support_counts=None if support_counts is None else np.asarray(support_counts, dtype=np.int32),
         )
 
-    def __array__(self, dtype: np.dtype | type | None = None) -> np.ndarray:
+    def __array__(self, dtype: np.dtype[Any] | type | None = None) -> NDArray:
         matrix = self.materialize()
         if dtype is None:
             return matrix
@@ -210,12 +214,12 @@ class Int8BatchCapable(Protocol):
     def shape(self) -> tuple[int, int]: ...
     def iter_column_batches(
         self,
-        variant_indices: Sequence[int] | np.ndarray | None = None,
+        variant_indices: Sequence[int] | NDArray | None = None,
         batch_size: int = DEFAULT_GENOTYPE_BATCH_SIZE,
     ) -> Iterator[RawGenotypeBatch]: ...
     def iter_column_batches_i8(
         self,
-        variant_indices: Sequence[int] | np.ndarray | None = None,
+        variant_indices: Sequence[int] | NDArray | None = None,
         batch_size: int = DEFAULT_GENOTYPE_BATCH_SIZE,
     ) -> Iterator[RawGenotypeBatch]: ...
 
@@ -226,7 +230,7 @@ def _supports_int8_batches(matrix: object) -> TypeGuard[Int8BatchCapable]:
 
 @dataclass(slots=True)
 class DenseRawGenotypeMatrix(RawGenotypeMatrix):
-    matrix: np.ndarray
+    matrix: NDArray
 
     def __post_init__(self) -> None:
         matrix_array = np.asanyarray(self.matrix)
@@ -237,7 +241,7 @@ class DenseRawGenotypeMatrix(RawGenotypeMatrix):
         if self.matrix.ndim != 2:
             raise ValueError("genotypes must be 2D.")
 
-    def _to_float32(self, batch: np.ndarray) -> np.ndarray:
+    def _to_float32(self, batch: NDArray) -> NDArray:
         """Convert a column slice to float32, replacing missing sentinels with NaN."""
         if self.matrix.dtype == np.int8:
             result = batch.astype(np.float32)
@@ -251,7 +255,7 @@ class DenseRawGenotypeMatrix(RawGenotypeMatrix):
 
     def iter_column_batches(
         self,
-        variant_indices: Sequence[int] | np.ndarray | None = None,
+        variant_indices: Sequence[int] | NDArray | None = None,
         batch_size: int = DEFAULT_GENOTYPE_BATCH_SIZE,
     ) -> Iterator[RawGenotypeBatch]:
         resolved_indices = _resolve_variant_indices(self.shape[1], variant_indices)
@@ -265,15 +269,15 @@ class DenseRawGenotypeMatrix(RawGenotypeMatrix):
 
     def materialize(
         self,
-        variant_indices: Sequence[int] | np.ndarray | None = None,
-    ) -> np.ndarray:
+        variant_indices: Sequence[int] | NDArray | None = None,
+    ) -> NDArray:
         resolved_indices = _resolve_variant_indices(self.shape[1], variant_indices)
         return self._to_float32(self.matrix[:, resolved_indices])
 
 
 @dataclass(slots=True)
 class Int8RawGenotypeMatrix(RawGenotypeMatrix):
-    matrix: np.ndarray
+    matrix: NDArray
 
     def __post_init__(self) -> None:
         matrix_array = np.asanyarray(self.matrix)
@@ -287,7 +291,7 @@ class Int8RawGenotypeMatrix(RawGenotypeMatrix):
 
     def iter_column_batches_i8(
         self,
-        variant_indices: Sequence[int] | np.ndarray | None = None,
+        variant_indices: Sequence[int] | NDArray | None = None,
         batch_size: int = DEFAULT_GENOTYPE_BATCH_SIZE,
     ) -> Iterator[RawGenotypeBatch]:
         resolved_indices = _resolve_variant_indices(self.shape[1], variant_indices)
@@ -302,7 +306,7 @@ class Int8RawGenotypeMatrix(RawGenotypeMatrix):
 
     def iter_column_batches(
         self,
-        variant_indices: Sequence[int] | np.ndarray | None = None,
+        variant_indices: Sequence[int] | NDArray | None = None,
         batch_size: int = DEFAULT_GENOTYPE_BATCH_SIZE,
     ) -> Iterator[RawGenotypeBatch]:
         for batch in self.iter_column_batches_i8(variant_indices, batch_size=batch_size):
@@ -313,8 +317,8 @@ class Int8RawGenotypeMatrix(RawGenotypeMatrix):
 
     def materialize(
         self,
-        variant_indices: Sequence[int] | np.ndarray | None = None,
-    ) -> np.ndarray:
+        variant_indices: Sequence[int] | NDArray | None = None,
+    ) -> NDArray:
         resolved_indices = _resolve_variant_indices(self.shape[1], variant_indices)
         column_index = _contiguous_index_or_slice(resolved_indices)
         return _int8_batch_to_float32(self.matrix[:, column_index])
@@ -332,7 +336,7 @@ class IndexedRawGenotypeMatrix(RawGenotypeMatrix):
     index back into us directly.
     """
     child: RawGenotypeMatrix
-    selected_columns: np.ndarray
+    selected_columns: NDArray
 
     def __post_init__(self) -> None:
         indices = np.asarray(self.selected_columns, dtype=np.int64)
@@ -347,12 +351,12 @@ class IndexedRawGenotypeMatrix(RawGenotypeMatrix):
     def shape(self) -> tuple[int, int]:
         return int(self.child.shape[0]), int(self.selected_columns.shape[0])
 
-    def _child_columns(self, local_indices: np.ndarray) -> np.ndarray:
+    def _child_columns(self, local_indices: NDArray) -> NDArray:
         return self.selected_columns[local_indices].astype(np.int32, copy=False)
 
     def iter_column_batches(
         self,
-        variant_indices: Sequence[int] | np.ndarray | None = None,
+        variant_indices: Sequence[int] | NDArray | None = None,
         batch_size: int = DEFAULT_GENOTYPE_BATCH_SIZE,
     ) -> Iterator[RawGenotypeBatch]:
         resolved_indices = _resolve_variant_indices(self.shape[1], variant_indices)
@@ -366,7 +370,7 @@ class IndexedRawGenotypeMatrix(RawGenotypeMatrix):
 
     def iter_column_batches_i8(
         self,
-        variant_indices: Sequence[int] | np.ndarray | None = None,
+        variant_indices: Sequence[int] | NDArray | None = None,
         batch_size: int = DEFAULT_GENOTYPE_BATCH_SIZE,
     ) -> Iterator[RawGenotypeBatch]:
         if not _supports_int8_batches(self.child):
@@ -389,8 +393,8 @@ class IndexedRawGenotypeMatrix(RawGenotypeMatrix):
 
     def materialize(
         self,
-        variant_indices: Sequence[int] | np.ndarray | None = None,
-    ) -> np.ndarray:
+        variant_indices: Sequence[int] | NDArray | None = None,
+    ) -> NDArray:
         resolved_indices = _resolve_variant_indices(self.shape[1], variant_indices)
         return self.child.materialize(self._child_columns(resolved_indices))
 
@@ -420,7 +424,7 @@ class RowSubsetRawGenotypeMatrix(RawGenotypeMatrix):
     cache. On AoU/GCP they live on the same disk, so this is always a win.
     """
     child: RawGenotypeMatrix
-    row_indices: np.ndarray
+    row_indices: NDArray
 
     def __post_init__(self) -> None:
         indices = np.asarray(self.row_indices, dtype=np.intp)
@@ -437,7 +441,7 @@ class RowSubsetRawGenotypeMatrix(RawGenotypeMatrix):
 
     def iter_column_batches(
         self,
-        variant_indices: Sequence[int] | np.ndarray | None = None,
+        variant_indices: Sequence[int] | NDArray | None = None,
         batch_size: int = DEFAULT_GENOTYPE_BATCH_SIZE,
     ) -> Iterator[RawGenotypeBatch]:
         for batch in self.child.iter_column_batches(variant_indices=variant_indices, batch_size=batch_size):
@@ -448,7 +452,7 @@ class RowSubsetRawGenotypeMatrix(RawGenotypeMatrix):
 
     def iter_column_batches_i8(
         self,
-        variant_indices: Sequence[int] | np.ndarray | None = None,
+        variant_indices: Sequence[int] | NDArray | None = None,
         batch_size: int = DEFAULT_GENOTYPE_BATCH_SIZE,
     ) -> Iterator[RawGenotypeBatch]:
         if not _supports_int8_batches(self.child):
@@ -462,8 +466,8 @@ class RowSubsetRawGenotypeMatrix(RawGenotypeMatrix):
 
     def materialize(
         self,
-        variant_indices: Sequence[int] | np.ndarray | None = None,
-    ) -> np.ndarray:
+        variant_indices: Sequence[int] | NDArray | None = None,
+    ) -> NDArray:
         full = self.child.materialize(variant_indices)
         return np.ascontiguousarray(full[self.row_indices, :])
 
@@ -471,7 +475,7 @@ class RowSubsetRawGenotypeMatrix(RawGenotypeMatrix):
 @dataclass(slots=True)
 class PlinkRawGenotypeMatrix(RawGenotypeMatrix):
     bed_path: Path
-    sample_indices: np.ndarray
+    sample_indices: NDArray
     variant_count: int
     total_sample_count: int
     batch_size: int = DEFAULT_GENOTYPE_BATCH_SIZE
@@ -486,14 +490,14 @@ class PlinkRawGenotypeMatrix(RawGenotypeMatrix):
     def shape(self) -> tuple[int, int]:
         return int(self.sample_indices.shape[0]), int(self.variant_count)
 
-    def _read_batch(self, reader: Any, batch_indices: np.ndarray) -> np.ndarray:
+    def _read_batch(self, reader: Any, batch_indices: NDArray) -> NDArray:
         """Read one batch as int8, convert to float32 with NaN for missing."""
         raw_i8 = self._read_batch_i8(reader, batch_indices)
         result = np.asarray(raw_i8, dtype=np.float32)
         result[raw_i8 == PLINK_MISSING_INT8] = np.nan
         return result
 
-    def _read_batch_i8(self, reader: Any, batch_indices: np.ndarray) -> np.ndarray:
+    def _read_batch_i8(self, reader: Any, batch_indices: NDArray) -> NDArray:
         """Read one batch as raw int8 (0/1/2/PLINK_MISSING_INT8). No float conversion."""
         import time as _time
         sample_index = _contiguous_index_or_slice(self.sample_indices)
@@ -522,7 +526,7 @@ class PlinkRawGenotypeMatrix(RawGenotypeMatrix):
 
     def iter_column_batches_i8(
         self,
-        variant_indices: Sequence[int] | np.ndarray | None = None,
+        variant_indices: Sequence[int] | NDArray | None = None,
         batch_size: int | None = None,
     ) -> Iterator[RawGenotypeBatch]:
         """Iterate as int8 batches (4x less memory, no float conversion).
@@ -555,7 +559,6 @@ class PlinkRawGenotypeMatrix(RawGenotypeMatrix):
         # Deeper prefetch would launch multiple large PLINK decodes at once,
         # which competes with the reader's own worker threads and doubles
         # decoded-batch memory pressure.
-        from collections import deque
         batch_index_list = [
             resolved_indices[s : s + safe_batch_size]
             for s in range(0, total, safe_batch_size)
@@ -563,7 +566,7 @@ class PlinkRawGenotypeMatrix(RawGenotypeMatrix):
         prefetch_depth = min(PLINK_INT8_MAX_PREFETCH_DEPTH, len(batch_index_list))
         log(f"    int8 prefetch depth={prefetch_depth} (~{batch_mb * prefetch_depth:.0f} MB queued)  mem={mem()}")
         with ThreadPoolExecutor(max_workers=prefetch_depth) as executor:
-            in_flight: deque = deque(
+            in_flight: deque[Future[NDArray]] = deque(
                 executor.submit(self._read_batch_i8, reader, batch_index_list[i])
                 for i in range(prefetch_depth)
             )
@@ -581,7 +584,7 @@ class PlinkRawGenotypeMatrix(RawGenotypeMatrix):
 
     def iter_column_batches(
         self,
-        variant_indices: Sequence[int] | np.ndarray | None = None,
+        variant_indices: Sequence[int] | NDArray | None = None,
         batch_size: int | None = None,
     ) -> Iterator[RawGenotypeBatch]:
         resolved_indices = _resolve_variant_indices(self.variant_count, variant_indices)
@@ -594,7 +597,7 @@ class PlinkRawGenotypeMatrix(RawGenotypeMatrix):
         total = resolved_indices.shape[0]
 
         # Build list of batch index arrays
-        batch_index_list: list[np.ndarray] = []
+        batch_index_list: list[NDArray] = []
         for start_index in range(0, total, safe_batch_size):
             batch_index_list.append(resolved_indices[start_index : start_index + safe_batch_size])
 
@@ -619,8 +622,8 @@ class PlinkRawGenotypeMatrix(RawGenotypeMatrix):
 
     def materialize(
         self,
-        variant_indices: Sequence[int] | np.ndarray | None = None,
-    ) -> np.ndarray:
+        variant_indices: Sequence[int] | NDArray | None = None,
+    ) -> NDArray:
         resolved_indices = _resolve_variant_indices(self.variant_count, variant_indices)
         reader = self._bed_reader()
         return self._read_batch(reader, resolved_indices)
@@ -643,7 +646,7 @@ class PlinkRawGenotypeMatrix(RawGenotypeMatrix):
 class ConcatenatedRawGenotypeMatrix(RawGenotypeMatrix):
     children: tuple[RawGenotypeMatrix, ...]
     _sample_count: int = field(init=False, repr=False)
-    _variant_offsets: np.ndarray = field(init=False, repr=False)
+    _variant_offsets: NDArray = field(init=False, repr=False)
 
     def __post_init__(self) -> None:
         if not self.children:
@@ -662,7 +665,7 @@ class ConcatenatedRawGenotypeMatrix(RawGenotypeMatrix):
 
     def iter_column_batches(
         self,
-        variant_indices: Sequence[int] | np.ndarray | None = None,
+        variant_indices: Sequence[int] | NDArray | None = None,
         batch_size: int = DEFAULT_GENOTYPE_BATCH_SIZE,
     ) -> Iterator[RawGenotypeBatch]:
         resolved_indices = _resolve_variant_indices(self.shape[1], variant_indices)
@@ -682,7 +685,7 @@ class ConcatenatedRawGenotypeMatrix(RawGenotypeMatrix):
 
     def iter_column_batches_i8(
         self,
-        variant_indices: Sequence[int] | np.ndarray | None = None,
+        variant_indices: Sequence[int] | NDArray | None = None,
         batch_size: int = DEFAULT_GENOTYPE_BATCH_SIZE,
     ) -> Iterator[RawGenotypeBatch]:
         if not all(_supports_int8_batches(child) for child in self.children):
@@ -707,8 +710,8 @@ class ConcatenatedRawGenotypeMatrix(RawGenotypeMatrix):
 
     def materialize(
         self,
-        variant_indices: Sequence[int] | np.ndarray | None = None,
-    ) -> np.ndarray:
+        variant_indices: Sequence[int] | NDArray | None = None,
+    ) -> NDArray:
         resolved_indices = _resolve_variant_indices(self.shape[1], variant_indices)
         child_ids = np.searchsorted(self._variant_offsets[1:], resolved_indices, side="right")
         matrix = np.empty((self.shape[0], resolved_indices.shape[0]), dtype=np.float32)
@@ -746,7 +749,7 @@ def _try_import_cupy() -> Any | None:
 _cuda_upload_streams_cache: dict[int, tuple[Any, Any]] = {}
 
 
-def _cuda_upload_stream_pair(cupy) -> tuple[Any, Any]:
+def _cuda_upload_stream_pair(cupy: Any) -> tuple[Any, Any]:
     """Return two non-default CUDA streams used to overlap H2D copies with CPU work.
 
     Created once per (cupy module) and reused across every materialization.
@@ -763,10 +766,10 @@ def _cuda_upload_stream_pair(cupy) -> tuple[Any, Any]:
 
 
 def _pinned_int8_host_buffer(
-    cupy,
+    cupy: Any,
     sample_count: int,
     max_tile_variants: int,
-) -> tuple[np.ndarray, np.ndarray, Any]:
+) -> tuple[NDArray, NDArray, Any]:
     """Allocate a pair of reusable page-locked int8 host buffers (one per stream).
 
     Returns ``(buffer_a, buffer_b, pinned_memory_owner)``; each buffer is shaped
@@ -792,15 +795,15 @@ def _pinned_int8_host_buffer(
 
 def _upload_standardized_int8_tiles_overlapped(
     *,
-    cupy,
+    cupy: Any,
     raw_int8: "Int8BatchCapable",
-    variant_indices: np.ndarray,
-    means: np.ndarray,
-    scales: np.ndarray,
-    gpu_destination,
+    variant_indices: NDArray,
+    means: NDArray,
+    scales: NDArray,
+    gpu_destination: Any,
     sample_count: int,
     upload_batch_size: int,
-    standardized_dtype,
+    standardized_dtype: Any,
 ) -> None:
     """Upload + standardize int8 tiles into a float GPU strip with overlapped H2D.
 
@@ -855,10 +858,10 @@ def _upload_standardized_int8_tiles_overlapped(
 
 def _try_upload_int8_parallel_memmap(
     *,
-    cupy,
+    cupy: Any,
     raw: object,
-    variant_indices: np.ndarray,
-    gpu_destination,
+    variant_indices: NDArray,
+    gpu_destination: Any,
     sample_count: int,
     n_workers: int = 8,
 ) -> bool:
@@ -1006,13 +1009,13 @@ def _try_upload_int8_parallel_memmap(
 
 def _upload_int8_tiles_overlapped(
     *,
-    cupy,
+    cupy: Any,
     raw_int8: "Int8BatchCapable",
-    variant_indices: np.ndarray,
-    gpu_destination,
+    variant_indices: NDArray,
+    gpu_destination: Any,
     sample_count: int,
     upload_batch_size: int,
-    gpu_int8_dtype,
+    gpu_int8_dtype: Any,
 ) -> None:
     """Upload int8 column tiles into ``gpu_destination`` with overlapped H2D copies.
 
@@ -1111,18 +1114,18 @@ def require_gpu() -> Any:
     return cupy
 
 
-def _as_gpu_compute_jax(array) -> jnp.ndarray:
+def _as_gpu_compute_jax(array: Any) -> JaxArray:
     return jnp.asarray(array, dtype=gpu_compute_jax_dtype())
 
 
-def _cupy_to_jax(array) -> jnp.ndarray:
+def _cupy_to_jax(array: Any) -> JaxArray:
     """Convert CuPy result to JAX, preferring zero-copy DLPack interop."""
     if hasattr(array, "__dlpack__"):
         return jax_dlpack.from_dlpack(array).astype(gpu_compute_jax_dtype())
     return jnp.asarray(array.get(), dtype=gpu_compute_jax_dtype())
 
 
-def _to_cupy_float32(array):
+def _to_cupy_float32(array: Any) -> Any:
     """Convert JAX/numpy array to CuPy float32 for CuPy matmul."""
     cupy = _try_import_cupy()
     if cupy is None:
@@ -1134,7 +1137,7 @@ def _to_cupy_float32(array):
     return cupy.asarray(np.asarray(array, dtype=np.float32))
 
 
-def _to_cupy_float64(array):
+def _to_cupy_float64(array: Any) -> Any:
     """Convert JAX/numpy array to CuPy float64 for numerically sensitive GPU solves."""
     cupy = _try_import_cupy()
     if cupy is None:
@@ -1146,18 +1149,18 @@ def _to_cupy_float64(array):
     return cupy.asarray(np.asarray(array, dtype=np.float64))
 
 
-def _cupy_compute_dtype(cupy):
+def _cupy_compute_dtype(cupy: Any) -> Any:
     return cupy.float32 if gpu_compute_numpy_dtype() == np.dtype(np.float32) else cupy.float64
 
 
-def _cupy_dtype_to_numpy_dtype(dtype) -> np.dtype:
+def _cupy_dtype_to_numpy_dtype(dtype: Any) -> np.dtype[Any]:
     try:
         return np.dtype(dtype)
     except TypeError:
         return np.dtype(np.float32)
 
 
-def _standardize_int8_cupy(raw_values, means, scales, cupy, *, dtype):
+def _standardize_int8_cupy(raw_values: Any, means: Any, scales: Any, cupy: Any, *, dtype: Any) -> Any:
     """Standardize int8 genotypes on GPU without materializing a mask buffer."""
     resolved_dtype = cupy.float32 if dtype is None else dtype
     elementwise_kernel = getattr(cupy, "ElementwiseKernel", None)
@@ -1187,7 +1190,7 @@ def _standardize_int8_cupy(raw_values, means, scales, cupy, *, dtype):
     return standardized
 
 
-def _to_cupy_compute(array):
+def _to_cupy_compute(array: Any) -> Any:
     cupy = _try_import_cupy()
     if cupy is None:
         raise RuntimeError("CuPy is not available.")
@@ -1197,20 +1200,20 @@ def _to_cupy_compute(array):
     return _to_cupy_float64(array)
 
 
-def _cupy_to_numpy(array, *, dtype) -> np.ndarray:
+def _cupy_to_numpy(array: Any, *, dtype: Any) -> NDArray:
     host_array = array.get() if hasattr(array, "get") else array
     return np.asarray(host_array, dtype=dtype)
 
 
 def _standardize_batch_cupy(
-    batch_values: np.ndarray,
-    means,
-    scales,
-    cupy,
+    batch_values: NDArray,
+    means: Any,
+    scales: Any,
+    cupy: Any,
     *,
     missing_sentinel: int | None = None,
-    dtype=None,
-):
+    dtype: Any = None,
+) -> Any:
     """Standardize a raw batch directly on GPU.
 
     Memory-sensitive: boolean-mask scatter (``standardized[missing] = 0``) is
@@ -1243,14 +1246,14 @@ def _standardize_batch_cupy(
 
 def _iter_standardized_gpu_batches(
     raw: RawGenotypeMatrix | Int8BatchCapable,
-    variant_indices: np.ndarray,
-    means,
-    scales,
+    variant_indices: NDArray,
+    means: Any,
+    scales: Any,
     *,
     batch_size: int,
-    cupy,
-    dtype=None,
-):
+    cupy: Any,
+    dtype: Any = None,
+) -> Iterator[tuple[slice, Any]]:
     resolved_dtype = cupy.float32 if dtype is None else dtype
     selected_means = cupy.asarray(means[variant_indices], dtype=resolved_dtype)
     selected_scales = cupy.asarray(scales[variant_indices], dtype=resolved_dtype)
@@ -1273,14 +1276,14 @@ def _iter_standardized_gpu_batches(
 
 
 def _iter_standardized_gpu_subbatches(
-    values: np.ndarray,
-    means,
-    scales,
-    cupy,
+    values: NDArray,
+    means: Any,
+    scales: Any,
+    cupy: Any,
     *,
     missing_sentinel: int | None,
-    dtype,
-):
+    dtype: Any,
+) -> Iterator[tuple[slice, Any]]:
     try:
         yield slice(0, int(values.shape[1])), _standardize_batch_cupy(
             values,
@@ -1330,10 +1333,10 @@ def _iter_standardized_gpu_subbatches(
 
 def _iter_prefetched_raw_batches(
     raw: RawGenotypeMatrix | Int8BatchCapable,
-    variant_indices: np.ndarray,
+    variant_indices: NDArray,
     *,
     batch_size: int,
-):
+) -> Iterator[tuple[slice, NDArray]]:
     variant_indices_arr = np.asarray(variant_indices)
     n = int(variant_indices_arr.shape[0])
     if n == 0:
@@ -1343,13 +1346,13 @@ def _iter_prefetched_raw_batches(
 
     if _supports_int8_batches(raw):
         i8_raw = raw
-        def _read_chunk(chunk_indices: np.ndarray) -> np.ndarray:
+        def _read_chunk(chunk_indices: NDArray) -> NDArray:
             for batch in i8_raw.iter_column_batches_i8(chunk_indices, batch_size=chunk_indices.shape[0]):
                 return np.asarray(batch.values)
             return np.empty((sample_count, 0), dtype=np.int8)
     else:
         float_raw = raw
-        def _read_chunk(chunk_indices: np.ndarray) -> np.ndarray:
+        def _read_chunk(chunk_indices: NDArray) -> NDArray:
             for batch in float_raw.iter_column_batches(chunk_indices, batch_size=chunk_indices.shape[0]):
                 return np.asarray(batch.values)
             return np.empty((sample_count, 0), dtype=np.float32)
@@ -1375,12 +1378,11 @@ def _iter_prefetched_raw_batches(
             local_start = local_stop
         return
 
-    from collections import deque as _deque
     executor = ThreadPoolExecutor(
         max_workers=num_io_workers,
         thread_name_prefix="standardized-gpu-prefetch",
     )
-    futures: _deque = _deque()
+    futures: deque[Future[Any]] = deque()
     next_to_submit = 0
 
     def _submit_more() -> None:
@@ -1406,21 +1408,13 @@ def _iter_prefetched_raw_batches(
         executor.shutdown(wait=False)
 
 
-def _standardized_streaming_target_batch_bytes(raw: RawGenotypeMatrix | Int8BatchCapable) -> int:
-    return (
-        LOCAL_INT8_STANDARDIZED_STREAMING_TARGET_BATCH_BYTES
-        if _supports_int8_batches(raw)
-        else STANDARDIZED_STREAMING_TARGET_BATCH_BYTES
-    )
-
-
 def _gpu_streaming_batch_size(
     raw: RawGenotypeMatrix | Int8BatchCapable,
     *,
     sample_count: int,
     requested_batch_size: int,
-    cupy=None,
-    dtype=None,
+    cupy: Any = None,
+    dtype: Any = None,
 ) -> int:
     if _supports_int8_batches(raw):
         requested_batch_size = max(int(requested_batch_size), auto_batch_size_i8(sample_count))
@@ -1443,15 +1437,15 @@ def _gpu_streaming_batch_size(
 def _gpu_int8_transpose_matmul(
     *,
     raw_int8: Int8BatchCapable,
-    variant_indices: np.ndarray,
-    means: np.ndarray,
-    scales: np.ndarray,
-    matrix_gpu,
+    variant_indices: NDArray,
+    means: NDArray,
+    scales: NDArray,
+    matrix_gpu: Any,
     batch_size: int,
-    cupy,
-    dtype,
+    cupy: Any,
+    dtype: Any,
     progress_label: str | None,
-):
+) -> Any:
     selected_variant_indices = np.asarray(variant_indices, dtype=np.int32)
     selected_means_gpu = cupy.asarray(means[selected_variant_indices], dtype=dtype)
     selected_scales_gpu = cupy.asarray(scales[selected_variant_indices], dtype=dtype)
@@ -1498,7 +1492,7 @@ def _gpu_int8_transpose_matmul(
     return result_gpu
 
 
-def _gpu_free_bytes(cupy) -> int:
+def _gpu_free_bytes(cupy: Any) -> int:
     """Return free GPU device memory in bytes, or 0 if unavailable."""
     try:
         free, _ = cupy.cuda.runtime.memGetInfo()
@@ -1507,7 +1501,7 @@ def _gpu_free_bytes(cupy) -> int:
         return 0
 
 
-def _gpu_total_bytes(cupy) -> int:
+def _gpu_total_bytes(cupy: Any) -> int:
     """Return total GPU device memory in bytes, or 0 if unavailable.
 
     Returns 0 on mocked / partial CuPy stand-ins (used by unit tests that
@@ -1521,7 +1515,7 @@ def _gpu_total_bytes(cupy) -> int:
         return 0
 
 
-def _gpu_dynamic_standardized_target_batch_bytes(cupy, *, static_target_batch_bytes: int) -> int:
+def _gpu_dynamic_standardized_target_batch_bytes(cupy: Any, *, static_target_batch_bytes: int) -> int:
     free_bytes = _gpu_free_bytes(cupy)
     if free_bytes <= 0:
         return int(static_target_batch_bytes)
@@ -1543,7 +1537,7 @@ def _is_cupy_out_of_memory(exc: BaseException) -> bool:
     )
 
 
-def _release_cupy_cached_memory(cupy) -> None:
+def _release_cupy_cached_memory(cupy: Any) -> None:
     """Best-effort release of CuPy pool blocks after a failed allocation."""
     try:
         pool = cupy.get_default_memory_pool()
@@ -1562,7 +1556,7 @@ def _effective_gpu_standardized_streaming_batch_size(
     sample_count: int,
     requested_batch_size: int,
     target_batch_bytes: int,
-    dtype,
+    dtype: Any,
 ) -> int:
     if sample_count < 1:
         raise ValueError("sample_count must be positive.")
@@ -1580,7 +1574,7 @@ _GPU_RESERVED_OVERHEAD_BYTES = 1_500_000_000  # 1.5 GB
 _GPU_BUDGET_TOTAL_FRACTION_CEILING = 0.90
 
 
-def _gpu_materialization_budget_bytes(cupy) -> int:
+def _gpu_materialization_budget_bytes(cupy: Any) -> int:
     """GPU cache budget: total device memory minus a fixed overhead margin.
 
     Uses total memory (not free) to avoid dependence on JAX/XLA pre-allocation
@@ -1649,7 +1643,7 @@ class _CupyInt8StandardizedCache:
         itemsize = int(self.raw_values.dtype.itemsize)
         return sample_count * view_columns * itemsize + means_bytes + scales_bytes + int(self.column_indices.nbytes)
 
-    def subset(self, local_variant_indices: np.ndarray) -> _CupyInt8StandardizedCache:
+    def subset(self, local_variant_indices: NDArray) -> _CupyInt8StandardizedCache:
         resolved_local_indices = np.asarray(local_variant_indices, dtype=np.int32)
         if _local_indices_select_all(resolved_local_indices, self.shape[1]):
             return self
@@ -1696,7 +1690,7 @@ class _CupyInt8StandardizedCache:
             column_indices=composed_indices,
         )
 
-    def _resolve_raw_selector(self, sel):
+    def _resolve_raw_selector(self, sel: Any) -> Any:
         """Map a logical column selector onto the underlying ``raw_values``."""
         if self.column_indices is None:
             return sel
@@ -1704,9 +1698,9 @@ class _CupyInt8StandardizedCache:
 
     def standardized_columns(
         self,
-        local_variant_indices: np.ndarray | slice,
+        local_variant_indices: NDArray | slice,
         *,
-        dtype=None,
+        dtype: Any = None,
     ) -> Any:
         cp = self.cupy
         resolved_dtype = _cupy_compute_dtype(cp) if dtype is None else dtype
@@ -1725,7 +1719,7 @@ class _CupyInt8StandardizedCache:
         standardized_np = np.asarray(standardized)
         return standardized_np
 
-    def __array__(self, dtype: np.dtype | type | None = None) -> np.ndarray:
+    def __array__(self, dtype: np.dtype[Any] | type | None = None) -> NDArray:
         standardized = self.standardized_columns(slice(None), dtype=np.float32)
         host = standardized.get() if hasattr(standardized, "get") else standardized
         return np.asarray(host, dtype=np.float32 if dtype is None else dtype)
@@ -1747,7 +1741,7 @@ def _cupy_cache_nbytes(cache: Any) -> int:
     return int(cache.nbytes)
 
 
-def _cupy_cache_subset_columns(cache: Any, local_variant_indices: np.ndarray) -> Any:
+def _cupy_cache_subset_columns(cache: Any, local_variant_indices: NDArray) -> Any:
     resolved_local_indices = np.asarray(local_variant_indices, dtype=np.int32)
     if _cupy_cache_is_int8_standardized(cache):
         return cache.subset(resolved_local_indices)
@@ -1761,11 +1755,11 @@ def _cupy_cache_subset_columns(cache: Any, local_variant_indices: np.ndarray) ->
 
 def _cupy_cache_standardized_columns(
     cache: Any,
-    local_variant_indices: np.ndarray | slice,
+    local_variant_indices: NDArray | slice,
     *,
-    cupy,
-    dtype=None,
-):
+    cupy: Any,
+    dtype: Any = None,
+) -> Any:
     if _cupy_cache_is_int8_standardized(cache):
         return cache.standardized_columns(local_variant_indices, dtype=dtype)
     resolved_dtype = _cupy_compute_dtype(cupy) if dtype is None else dtype
@@ -1781,9 +1775,9 @@ def _iter_cupy_cache_standardized_batches(
     *,
     sample_count: int,
     batch_size: int,
-    cupy,
-    dtype=None,
-):
+    cupy: Any,
+    dtype: Any = None,
+) -> Iterator[tuple[slice, Any]]:
     variant_count = _cupy_cache_shape(cache)[1]
     resolved_dtype = _cupy_dtype_to_numpy_dtype(np.float32 if dtype is None else dtype)
     static_target_batch_bytes = (
@@ -1811,13 +1805,13 @@ def _iter_cupy_cache_standardized_batches(
 
 def _iter_selected_cupy_cache_standardized_batches(
     cache: Any,
-    local_variant_indices: np.ndarray,
+    local_variant_indices: NDArray,
     *,
     sample_count: int,
     batch_size: int,
-    cupy,
-    dtype=None,
-):
+    cupy: Any,
+    dtype: Any = None,
+) -> Iterator[tuple[slice, Any]]:
     selected_variant_count = int(local_variant_indices.shape[0])
     resolved_dtype = _cupy_dtype_to_numpy_dtype(np.float32 if dtype is None else dtype)
     static_target_batch_bytes = (
@@ -1837,7 +1831,7 @@ def _iter_selected_cupy_cache_standardized_batches(
         operand_slice = slice(start_index, stop_index)
         selected_indices = local_variant_indices[operand_slice]
         maybe_slice = _local_indices_as_slice(selected_indices)
-        local_selection: np.ndarray | slice = maybe_slice if maybe_slice is not None else selected_indices
+        local_selection: NDArray | slice = maybe_slice if maybe_slice is not None else selected_indices
         yield operand_slice, _cupy_cache_standardized_columns(
             cache,
             local_selection,
@@ -1847,12 +1841,12 @@ def _iter_selected_cupy_cache_standardized_batches(
 
 
 def _normalize_numpy_vector_operand(
-    operand: np.ndarray | jnp.ndarray,
+    operand: NDArray | JaxArray,
     *,
     expected_length: int,
     shape_error: str,
     finite_name: str,
-) -> np.ndarray:
+) -> NDArray:
     vector = np.asarray(operand, dtype=gpu_compute_numpy_dtype()).reshape(-1)
     if vector.shape[0] != expected_length:
         raise ValueError(shape_error)
@@ -1862,12 +1856,12 @@ def _normalize_numpy_vector_operand(
 
 
 def _normalize_numpy_matrix_operand(
-    operand: np.ndarray | jnp.ndarray,
+    operand: NDArray | JaxArray,
     *,
     expected_rows: int,
     shape_error: str,
     finite_name: str,
-) -> np.ndarray:
+) -> NDArray:
     matrix = np.asarray(operand, dtype=gpu_compute_numpy_dtype())
     if matrix.ndim != 2 or matrix.shape[0] != expected_rows:
         raise ValueError(shape_error)
@@ -1877,7 +1871,7 @@ def _normalize_numpy_matrix_operand(
 
 
 def _normalize_jax_vector_operand(
-    operand: np.ndarray | jnp.ndarray,
+    operand: NDArray | JaxArray,
     *,
     expected_length: int,
     shape_error: str,
@@ -1893,7 +1887,7 @@ def _normalize_jax_vector_operand(
 
 
 def _normalize_jax_matrix_operand(
-    operand: np.ndarray | jnp.ndarray,
+    operand: NDArray | JaxArray,
     *,
     expected_rows: int,
     shape_error: str,
@@ -1908,15 +1902,15 @@ def _normalize_jax_matrix_operand(
     return matrix
 
 
-def _active_vector_local_indices(vector: np.ndarray) -> np.ndarray:
+def _active_vector_local_indices(vector: NDArray) -> NDArray:
     return np.flatnonzero(vector != 0).astype(np.int32, copy=False)
 
 
-def _active_matrix_row_local_indices(matrix: np.ndarray) -> np.ndarray:
+def _active_matrix_row_local_indices(matrix: NDArray) -> NDArray:
     return np.flatnonzero(np.any(matrix != 0, axis=1)).astype(np.int32, copy=False)
 
 
-def _local_indices_select_all(local_variant_indices: np.ndarray, variant_count: int) -> bool:
+def _local_indices_select_all(local_variant_indices: NDArray, variant_count: int) -> bool:
     if local_variant_indices.shape[0] != variant_count:
         return False
     if variant_count == 0:
@@ -1928,7 +1922,7 @@ def _local_indices_select_all(local_variant_indices: np.ndarray, variant_count: 
     )
 
 
-def _local_indices_as_slice(local_variant_indices: np.ndarray) -> slice | None:
+def _local_indices_as_slice(local_variant_indices: NDArray) -> slice | None:
     if local_variant_indices.size == 0:
         return slice(0, 0)
     start = int(local_variant_indices[0])
@@ -1942,31 +1936,31 @@ def _local_indices_as_slice(local_variant_indices: np.ndarray) -> slice | None:
     return None
 
 
-def _selected_or_all_local_indices(local_variant_indices: np.ndarray, variant_count: int) -> np.ndarray | None:
+def _selected_or_all_local_indices(local_variant_indices: NDArray, variant_count: int) -> NDArray | None:
     return None if _local_indices_select_all(local_variant_indices, variant_count) else local_variant_indices
 
 
 @dataclass(slots=True)
 class _SparseCarrierBackend:
     sample_count: int
-    means: np.ndarray
-    scales: np.ndarray
-    variant_ptr: np.ndarray
-    variant_sample_indices: np.ndarray
-    variant_dosages: np.ndarray
-    missing_variant_ptr: np.ndarray
-    missing_variant_sample_indices: np.ndarray
-    sample_ptr: np.ndarray
-    sample_variant_indices: np.ndarray
-    sample_dosages: np.ndarray
-    sample_missing_ptr: np.ndarray
-    sample_missing_variant_indices: np.ndarray
+    means: NDArray
+    scales: NDArray
+    variant_ptr: NDArray
+    variant_sample_indices: NDArray
+    variant_dosages: NDArray
+    missing_variant_ptr: NDArray
+    missing_variant_sample_indices: NDArray
+    sample_ptr: NDArray
+    sample_variant_indices: NDArray
+    sample_dosages: NDArray
+    sample_missing_ptr: NDArray
+    sample_missing_variant_indices: NDArray
 
     @property
     def shape(self) -> tuple[int, int]:
         return self.sample_count, int(self.means.shape[0])
 
-    def materialize_columns(self, local_variant_indices: np.ndarray) -> np.ndarray:
+    def materialize_columns(self, local_variant_indices: NDArray) -> NDArray:
         resolved_local_indices = np.asarray(local_variant_indices, dtype=np.int32)
         if resolved_local_indices.ndim != 1:
             raise ValueError("local_variant_indices must be 1D.")
@@ -1987,7 +1981,7 @@ class _SparseCarrierBackend:
             output[:, output_column] = column
         return output
 
-    def matvec(self, coefficients: np.ndarray) -> np.ndarray:
+    def matvec(self, coefficients: NDArray) -> NDArray:
         coefficient_array = np.asarray(coefficients, dtype=gpu_compute_numpy_dtype()).reshape(-1)
         if coefficient_array.shape[0] != self.shape[1]:
             raise ValueError("coefficient vector must match sparse variant count.")
@@ -2016,7 +2010,7 @@ class _SparseCarrierBackend:
                 result[nonempty_missing] += np.add.reduceat(missing_weights, starts)
         return result
 
-    def matmat(self, matrix: np.ndarray) -> np.ndarray:
+    def matmat(self, matrix: NDArray) -> NDArray:
         matrix_array = np.asarray(matrix, dtype=gpu_compute_numpy_dtype())
         if matrix_array.ndim != 2 or matrix_array.shape[0] != self.shape[1]:
             raise ValueError("variant matrix must match sparse variant count.")
@@ -2044,7 +2038,7 @@ class _SparseCarrierBackend:
                 output[nonempty_missing, :] += np.add.reduceat(missing_weights, starts, axis=0)
         return output
 
-    def transpose_matvec(self, vector: np.ndarray) -> np.ndarray:
+    def transpose_matvec(self, vector: NDArray) -> NDArray:
         vector_array = np.asarray(vector, dtype=gpu_compute_numpy_dtype()).reshape(-1)
         if vector_array.shape[0] != self.sample_count:
             raise ValueError("sample vector must match sparse sample count.")
@@ -2069,7 +2063,7 @@ class _SparseCarrierBackend:
         output /= np.asarray(self.scales, dtype=vector_array.dtype)
         return output
 
-    def transpose_matmat(self, matrix: np.ndarray) -> np.ndarray:
+    def transpose_matmat(self, matrix: NDArray) -> NDArray:
         matrix_array = np.asarray(matrix, dtype=gpu_compute_numpy_dtype())
         if matrix_array.ndim != 2 or matrix_array.shape[0] != self.sample_count:
             raise ValueError("sample matrix must match sparse sample count.")
@@ -2094,7 +2088,7 @@ class _SparseCarrierBackend:
         output /= np.asarray(self.scales, dtype=matrix_array.dtype)[:, None]
         return output
 
-    def subset(self, local_variant_indices: np.ndarray) -> _SparseCarrierBackend:
+    def subset(self, local_variant_indices: NDArray) -> _SparseCarrierBackend:
         resolved_local_indices = np.asarray(local_variant_indices, dtype=np.int32)
         if resolved_local_indices.ndim != 1:
             raise ValueError("local_variant_indices must be 1D.")
@@ -2118,10 +2112,10 @@ class _SparseCarrierBackend:
             )
         old_to_new = np.full(self.shape[1], -1, dtype=np.int32)
         old_to_new[resolved_local_indices] = np.arange(resolved_local_indices.shape[0], dtype=np.int32)
-        selected_variant_sample_indices: list[np.ndarray] = []
-        selected_variant_dosages: list[np.ndarray] = []
+        selected_variant_sample_indices: list[NDArray] = []
+        selected_variant_dosages: list[NDArray] = []
         variant_counts = np.zeros(resolved_local_indices.shape[0], dtype=np.int64)
-        selected_missing_sample_indices: list[np.ndarray] = []
+        selected_missing_sample_indices: list[NDArray] = []
         missing_counts = np.zeros(resolved_local_indices.shape[0], dtype=np.int64)
         for new_variant_index, old_variant_index in enumerate(resolved_local_indices.tolist()):
             carrier_start = int(self.variant_ptr[old_variant_index])
@@ -2193,16 +2187,16 @@ class _SparseCarrierBackend:
 
 def _build_sparse_backend(
     raw: Int8BatchCapable,
-    raw_variant_indices: np.ndarray,
-    means: np.ndarray,
-    scales: np.ndarray,
+    raw_variant_indices: NDArray,
+    means: NDArray,
+    scales: NDArray,
     sample_count: int,
 ) -> _SparseCarrierBackend:
     resolved_variant_indices = np.asarray(raw_variant_indices, dtype=np.int32)
-    carrier_sample_chunks: list[np.ndarray] = []
-    carrier_dosage_chunks: list[np.ndarray] = []
+    carrier_sample_chunks: list[NDArray] = []
+    carrier_dosage_chunks: list[NDArray] = []
     carrier_counts = np.zeros(resolved_variant_indices.shape[0], dtype=np.int64)
-    missing_sample_chunks: list[np.ndarray] = []
+    missing_sample_chunks: list[NDArray] = []
     missing_counts = np.zeros(resolved_variant_indices.shape[0], dtype=np.int64)
     local_start = 0
     batch_size = max(auto_batch_size_i8(sample_count), 1)
@@ -2293,25 +2287,25 @@ class StandardizedGenotypeMatrix:
     has known compilation bugs on some GPU architectures.  Falls back to numpy BLAS on CPU.
     """
     raw: RawGenotypeMatrix | None
-    means: np.ndarray       # per-variant mean from training data
-    scales: np.ndarray      # per-variant std dev from training data
-    variant_indices: np.ndarray  # which columns of raw to use (for subsetting)
-    support_counts: np.ndarray | None = None  # non-zero dosage count per source variant
+    means: NDArray       # per-variant mean from training data
+    scales: NDArray      # per-variant std dev from training data
+    variant_indices: NDArray  # which columns of raw to use (for subsetting)
+    support_counts: NDArray | None = None  # non-zero dosage count per source variant
     sample_count: int | None = field(default=None, repr=False)
     _enable_hybrid_backend: bool = field(default=True, repr=False)
-    _dense_cache: np.ndarray | None = field(init=False, default=None, repr=False)
+    _dense_cache: NDArray | None = field(init=False, default=None, repr=False)
     _cupy_cache: Any | None = field(init=False, default=None, repr=False)  # cupy.ndarray
     _jax_cache: jax.Array | None = field(init=False, default=None, repr=False)
     _cupy_subset_cache: Any | None = field(init=False, default=None, repr=False)
-    _cupy_subset_cache_local_indices: np.ndarray | None = field(init=False, default=None, repr=False)
+    _cupy_subset_cache_local_indices: NDArray | None = field(init=False, default=None, repr=False)
     _local_cache_directory: tempfile.TemporaryDirectory[str] | None = field(init=False, default=None, repr=False)
     _dense_backend: StandardizedGenotypeMatrix | None = field(init=False, default=None, repr=False)
     _sparse_backend: _SparseCarrierBackend | None = field(init=False, default=None, repr=False)
-    _dense_local_lookup: np.ndarray | None = field(init=False, default=None, repr=False)
-    _sparse_local_lookup: np.ndarray | None = field(init=False, default=None, repr=False)
-    _sample_space_nystrom_basis_cpu_cache: dict[tuple[int, int], np.ndarray] = field(init=False, default_factory=dict, repr=False)
+    _dense_local_lookup: NDArray | None = field(init=False, default=None, repr=False)
+    _sparse_local_lookup: NDArray | None = field(init=False, default=None, repr=False)
+    _sample_space_nystrom_basis_cpu_cache: dict[tuple[int, int], NDArray] = field(init=False, default_factory=dict, repr=False)
     _sample_space_nystrom_basis_gpu_cache: dict[tuple[int, int], Any] = field(init=False, default_factory=dict, repr=False)
-    _sample_space_probe_projection_cache: dict[tuple[int, int], np.ndarray] = field(init=False, default_factory=dict, repr=False)
+    _sample_space_probe_projection_cache: dict[tuple[int, int], NDArray] = field(init=False, default_factory=dict, repr=False)
     _sample_space_probe_projection_gpu_cache: dict[tuple[int, int], Any] = field(init=False, default_factory=dict, repr=False)
     _sample_space_cpu_preconditioner_cache: Any | None = field(init=False, default=None, repr=False)
     _sample_space_gpu_preconditioner_cache: Any | None = field(init=False, default=None, repr=False)
@@ -2403,8 +2397,8 @@ class StandardizedGenotypeMatrix:
 
     def _hybrid_local_components(
         self,
-        local_variant_indices: np.ndarray,
-    ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+        local_variant_indices: NDArray,
+    ) -> tuple[NDArray, NDArray, NDArray, NDArray]:
         resolved_local_indices = np.asarray(local_variant_indices, dtype=np.int32)
         if resolved_local_indices.ndim != 1:
             raise ValueError("local_variant_indices must be 1D.")
@@ -2435,7 +2429,7 @@ class StandardizedGenotypeMatrix:
             dense_child_local_indices[dense_mask].astype(np.int32, copy=False),
         )
 
-    def _hybrid_parent_local_indices(self) -> tuple[np.ndarray, np.ndarray]:
+    def _hybrid_parent_local_indices(self) -> tuple[NDArray, NDArray]:
         if not self._uses_hybrid_backend():
             return np.zeros(0, dtype=np.int32), np.zeros(0, dtype=np.int32)
         sparse_parent_local_indices = (
@@ -2452,10 +2446,10 @@ class StandardizedGenotypeMatrix:
 
     def _materialize_hybrid_columns(
         self,
-        local_variant_indices: np.ndarray,
+        local_variant_indices: NDArray,
         *,
         batch_size: int,
-    ) -> np.ndarray:
+    ) -> NDArray:
         resolved_local_indices = np.asarray(local_variant_indices, dtype=np.int32)
         if resolved_local_indices.ndim != 1:
             raise ValueError("local_variant_indices must be 1D.")
@@ -2687,7 +2681,7 @@ class StandardizedGenotypeMatrix:
 
     def try_materialize_gpu_subset(
         self,
-        local_variant_indices: Sequence[int] | np.ndarray,
+        local_variant_indices: Sequence[int] | NDArray,
     ) -> Any | None:
         """Materialize a selected standardized column subset onto GPU memory when possible."""
         resolved_local_indices = np.asarray(local_variant_indices, dtype=np.int32)
@@ -2850,7 +2844,7 @@ class StandardizedGenotypeMatrix:
                 cache_directory.cleanup()
                 return False
             raw_int8 = self.raw
-            def _column_batches() -> Iterator[np.ndarray]:
+            def _column_batches() -> Iterator[NDArray]:
                 for raw_batch in raw_int8.iter_column_batches_i8(self.variant_indices, batch_size=batch_size):
                     yield raw_batch.values
             _stream_write_int8_npy(
@@ -2931,7 +2925,7 @@ class StandardizedGenotypeMatrix:
                 )
                 return False
             raw_int8 = self.raw
-            def _column_batches() -> Iterator[np.ndarray]:
+            def _column_batches() -> Iterator[NDArray]:
                 for raw_batch in raw_int8.iter_column_batches_i8(self.variant_indices, batch_size=batch_size):
                     yield raw_batch.values
             _stream_write_int8_npy(
@@ -2967,7 +2961,7 @@ class StandardizedGenotypeMatrix:
                     child.unlink(missing_ok=True)
                 temp_directory.rmdir()
 
-    def subset(self, local_variant_indices: Sequence[int] | np.ndarray) -> StandardizedGenotypeMatrix:
+    def subset(self, local_variant_indices: Sequence[int] | NDArray) -> StandardizedGenotypeMatrix:
         resolved_local_indices = np.asarray(local_variant_indices, dtype=np.int32)
         preserve_hybrid = (
             self._uses_hybrid_backend()
@@ -3083,7 +3077,7 @@ class StandardizedGenotypeMatrix:
             )
             local_start = local_stop
 
-    def materialize(self, batch_size: int = DEFAULT_GENOTYPE_BATCH_SIZE) -> np.ndarray:
+    def materialize(self, batch_size: int = DEFAULT_GENOTYPE_BATCH_SIZE) -> NDArray:
         if self._dense_cache is not None:
             return self._dense_cache
         if self._cupy_cache is not None:
@@ -3101,7 +3095,9 @@ class StandardizedGenotypeMatrix:
         self._jax_cache = None
         return matrix
 
-    def _streaming_gpu_context(self, batch_size: int, *, cupy=None, dtype=None):
+    def _streaming_gpu_context(
+        self, batch_size: int, *, cupy: Any = None, dtype: Any = None
+    ) -> tuple[Any, int | None]:
         if self._cupy_cache is not None or self.supports_jax_dense_ops() or self.raw is None or self._uses_hybrid_backend():
             return None, None
         resolved_cupy = _try_import_cupy() if cupy is None else cupy
@@ -3117,14 +3113,14 @@ class StandardizedGenotypeMatrix:
 
     def _gpu_variant_matmul(
         self,
-        matrix,
+        matrix: Any,
         *,
         batch_size: int,
-        cupy,
-        dtype=None,
-        local_variant_indices: np.ndarray | None = None,
+        cupy: Any,
+        dtype: Any = None,
+        local_variant_indices: NDArray | None = None,
         progress_label: str | None = None,
-    ):
+    ) -> Any:
         resolved_dtype = _cupy_compute_dtype(cupy) if dtype is None else dtype
         matrix_gpu = cupy.asarray(matrix, dtype=resolved_dtype)
         if matrix_gpu.ndim == 1:
@@ -3228,13 +3224,13 @@ class StandardizedGenotypeMatrix:
 
     def _gpu_transpose_matmul(
         self,
-        matrix,
+        matrix: Any,
         *,
         batch_size: int,
-        cupy,
-        dtype=None,
+        cupy: Any,
+        dtype: Any = None,
         progress_label: str | None = None,
-    ):
+    ) -> Any:
         resolved_dtype = _cupy_compute_dtype(cupy) if dtype is None else dtype
         matrix_gpu = cupy.asarray(matrix, dtype=resolved_dtype)
         if matrix_gpu.ndim == 1:
@@ -3323,12 +3319,12 @@ class StandardizedGenotypeMatrix:
 
     def gpu_matmat(
         self,
-        matrix,
+        matrix: Any,
         *,
         batch_size: int = DEFAULT_GENOTYPE_BATCH_SIZE,
-        cupy=None,
-        dtype=None,
-    ):
+        cupy: Any = None,
+        dtype: Any = None,
+    ) -> Any:
         resolved_cupy = _try_import_cupy() if cupy is None else cupy
         if resolved_cupy is None:
             raise RuntimeError("GPU genotype matmul requires CuPy.")
@@ -3341,12 +3337,12 @@ class StandardizedGenotypeMatrix:
 
     def gpu_transpose_matmat(
         self,
-        matrix,
+        matrix: Any,
         *,
         batch_size: int = DEFAULT_GENOTYPE_BATCH_SIZE,
-        cupy=None,
-        dtype=None,
-    ):
+        cupy: Any = None,
+        dtype: Any = None,
+    ) -> Any:
         resolved_cupy = _try_import_cupy() if cupy is None else cupy
         if resolved_cupy is None:
             raise RuntimeError("GPU genotype transpose matmul requires CuPy.")
@@ -3359,7 +3355,7 @@ class StandardizedGenotypeMatrix:
 
     def _iter_selected_column_batches(
         self,
-        local_variant_indices: np.ndarray,
+        local_variant_indices: NDArray,
         *,
         batch_size: int,
     ) -> Iterator[RawGenotypeBatch]:
@@ -3436,7 +3432,7 @@ class StandardizedGenotypeMatrix:
             )
             local_start = local_stop
 
-    def matvec_numpy(self, coefficients: np.ndarray | jnp.ndarray, batch_size: int = DEFAULT_GENOTYPE_BATCH_SIZE) -> np.ndarray:
+    def matvec_numpy(self, coefficients: NDArray | JaxArray, batch_size: int = DEFAULT_GENOTYPE_BATCH_SIZE) -> NDArray:
         coeff_np = _normalize_numpy_vector_operand(
             coefficients,
             expected_length=self.shape[1],
@@ -3514,7 +3510,7 @@ class StandardizedGenotypeMatrix:
                 log(f"        matvec: {_completed_variants:,}/{_total_variants:,} ({100*_completed_variants/_total_variants:.0f}%)  mem={mem()}")
         return result
 
-    def matvec_jax(self, coefficients: np.ndarray | jnp.ndarray, batch_size: int = DEFAULT_GENOTYPE_BATCH_SIZE) -> jnp.ndarray:
+    def matvec_jax(self, coefficients: NDArray | JaxArray, batch_size: int = DEFAULT_GENOTYPE_BATCH_SIZE) -> JaxArray:
         if self.supports_jax_dense_ops():
             coeff_jax = _normalize_jax_vector_operand(
                 coefficients,
@@ -3525,11 +3521,11 @@ class StandardizedGenotypeMatrix:
             return self._ensure_jax_cache() @ coeff_jax
         return _as_gpu_compute_jax(self.matvec_numpy(coefficients, batch_size=batch_size))
 
-    def matvec(self, coefficients: np.ndarray | jnp.ndarray, batch_size: int = DEFAULT_GENOTYPE_BATCH_SIZE) -> jnp.ndarray:
+    def matvec(self, coefficients: NDArray | JaxArray, batch_size: int = DEFAULT_GENOTYPE_BATCH_SIZE) -> JaxArray:
         """Compute X_std @ beta with JAX as the public return type."""
         return self.matvec_jax(coefficients, batch_size=batch_size)
 
-    def matmat_numpy(self, matrix: np.ndarray | jnp.ndarray, batch_size: int = DEFAULT_GENOTYPE_BATCH_SIZE) -> np.ndarray:
+    def matmat_numpy(self, matrix: NDArray | JaxArray, batch_size: int = DEFAULT_GENOTYPE_BATCH_SIZE) -> NDArray:
         m_np = _normalize_numpy_matrix_operand(
             matrix,
             expected_rows=self.shape[1],
@@ -3598,7 +3594,7 @@ class StandardizedGenotypeMatrix:
             output += batch_values @ m_np[batch.variant_indices, :]
         return output
 
-    def matmat_jax(self, matrix: np.ndarray | jnp.ndarray, batch_size: int = DEFAULT_GENOTYPE_BATCH_SIZE) -> jnp.ndarray:
+    def matmat_jax(self, matrix: NDArray | JaxArray, batch_size: int = DEFAULT_GENOTYPE_BATCH_SIZE) -> JaxArray:
         if self.supports_jax_dense_ops():
             matrix_jax = _normalize_jax_matrix_operand(
                 matrix,
@@ -3609,11 +3605,11 @@ class StandardizedGenotypeMatrix:
             return self._ensure_jax_cache() @ matrix_jax
         return _as_gpu_compute_jax(self.matmat_numpy(matrix, batch_size=batch_size))
 
-    def matmat(self, matrix: np.ndarray | jnp.ndarray, batch_size: int = DEFAULT_GENOTYPE_BATCH_SIZE) -> jnp.ndarray:
+    def matmat(self, matrix: NDArray | JaxArray, batch_size: int = DEFAULT_GENOTYPE_BATCH_SIZE) -> JaxArray:
         """Compute X_std @ M with JAX as the public return type."""
         return self.matmat_jax(matrix, batch_size=batch_size)
 
-    def transpose_matvec_numpy(self, vector: np.ndarray | jnp.ndarray, batch_size: int = DEFAULT_GENOTYPE_BATCH_SIZE) -> np.ndarray:
+    def transpose_matvec_numpy(self, vector: NDArray | JaxArray, batch_size: int = DEFAULT_GENOTYPE_BATCH_SIZE) -> NDArray:
         v_np = _normalize_numpy_vector_operand(
             vector,
             expected_length=self.shape[0],
@@ -3680,7 +3676,7 @@ class StandardizedGenotypeMatrix:
                 log(f"        transpose_matvec: {_completed_variants:,}/{_total_variants:,} ({100*_completed_variants/_total_variants:.0f}%)  mem={mem()}")
         return output
 
-    def transpose_matvec_jax(self, vector: np.ndarray | jnp.ndarray, batch_size: int = DEFAULT_GENOTYPE_BATCH_SIZE) -> jnp.ndarray:
+    def transpose_matvec_jax(self, vector: NDArray | JaxArray, batch_size: int = DEFAULT_GENOTYPE_BATCH_SIZE) -> JaxArray:
         if self.supports_jax_dense_ops():
             vector_jax = _normalize_jax_vector_operand(
                 vector,
@@ -3691,11 +3687,11 @@ class StandardizedGenotypeMatrix:
             return self._ensure_jax_cache().T @ vector_jax
         return _as_gpu_compute_jax(self.transpose_matvec_numpy(vector, batch_size=batch_size))
 
-    def transpose_matvec(self, vector: np.ndarray | jnp.ndarray, batch_size: int = DEFAULT_GENOTYPE_BATCH_SIZE) -> jnp.ndarray:
+    def transpose_matvec(self, vector: NDArray | JaxArray, batch_size: int = DEFAULT_GENOTYPE_BATCH_SIZE) -> JaxArray:
         """Compute X_std^T @ v with JAX as the public return type."""
         return self.transpose_matvec_jax(vector, batch_size=batch_size)
 
-    def transpose_matmat_numpy(self, matrix: np.ndarray | jnp.ndarray, batch_size: int = DEFAULT_GENOTYPE_BATCH_SIZE) -> np.ndarray:
+    def transpose_matmat_numpy(self, matrix: NDArray | JaxArray, batch_size: int = DEFAULT_GENOTYPE_BATCH_SIZE) -> NDArray:
         m_np = _normalize_numpy_matrix_operand(
             matrix,
             expected_rows=self.shape[0],
@@ -3753,7 +3749,7 @@ class StandardizedGenotypeMatrix:
             output[batch.variant_indices, :] = np.asarray(batch.values, dtype=output.dtype).T @ m_np
         return output
 
-    def transpose_matmat_jax(self, matrix: np.ndarray | jnp.ndarray, batch_size: int = DEFAULT_GENOTYPE_BATCH_SIZE) -> jnp.ndarray:
+    def transpose_matmat_jax(self, matrix: NDArray | JaxArray, batch_size: int = DEFAULT_GENOTYPE_BATCH_SIZE) -> JaxArray:
         if self.supports_jax_dense_ops():
             matrix_jax = _normalize_jax_matrix_operand(
                 matrix,
@@ -3764,15 +3760,15 @@ class StandardizedGenotypeMatrix:
             return self._ensure_jax_cache().T @ matrix_jax
         return _as_gpu_compute_jax(self.transpose_matmat_numpy(matrix, batch_size=batch_size))
 
-    def transpose_matmat(self, matrix: np.ndarray | jnp.ndarray, batch_size: int = DEFAULT_GENOTYPE_BATCH_SIZE) -> jnp.ndarray:
+    def transpose_matmat(self, matrix: NDArray | JaxArray, batch_size: int = DEFAULT_GENOTYPE_BATCH_SIZE) -> JaxArray:
         """Compute X_std^T @ M with JAX as the public return type."""
         return self.transpose_matmat_jax(matrix, batch_size=batch_size)
 
 
 def _resolve_variant_indices(
     variant_count: int,
-    variant_indices: Sequence[int] | np.ndarray | None,
-) -> np.ndarray:
+    variant_indices: Sequence[int] | NDArray | None,
+) -> NDArray:
     if variant_indices is None:
         return np.arange(variant_count, dtype=np.int32)
     resolved_indices = np.asarray(variant_indices, dtype=np.int32)
@@ -3842,7 +3838,7 @@ def _effective_bed_reader_batch_size(
 # Optimization: if the requested variant indices are consecutive (e.g. [5,6,7,8]),
 # convert to a slice (5:9) which the PLINK reader can read much faster (sequential disk I/O)
 # than random-access indexing.  Falls back to an index array for non-contiguous indices.
-def _contiguous_index_or_slice(indices: np.ndarray) -> slice | np.ndarray:
+def _contiguous_index_or_slice(indices: NDArray) -> slice | NDArray:
     resolved_indices = np.asarray(indices, dtype=np.intp)
     if resolved_indices.ndim != 1:
         raise ValueError("indices must be 1D.")
@@ -3859,8 +3855,8 @@ def _contiguous_index_or_slice(indices: np.ndarray) -> slice | np.ndarray:
 
 def _read_int8_columns_one_shot(
     raw: RawGenotypeMatrix | Int8BatchCapable,
-    variant_indices: np.ndarray,
-) -> np.ndarray | None:
+    variant_indices: NDArray,
+) -> NDArray | None:
     resolved_indices = np.asarray(variant_indices, dtype=np.int32)
     if resolved_indices.ndim != 1:
         raise ValueError("variant_indices must be 1D.")
@@ -3907,7 +3903,7 @@ def _read_int8_columns_one_shot(
     return None
 
 
-def _standardize_batch(batch: np.ndarray, means: np.ndarray, scales: np.ndarray) -> np.ndarray:
+def _standardize_batch(batch: NDArray, means: NDArray, scales: NDArray) -> NDArray:
     batch_f32 = np.asarray(batch, dtype=np.float32)
     means_f32 = np.asarray(means, dtype=np.float32)
     scales_f32 = np.asarray(scales, dtype=np.float32)
@@ -3917,14 +3913,14 @@ def _standardize_batch(batch: np.ndarray, means: np.ndarray, scales: np.ndarray)
     return standardized.astype(np.float32, copy=False)
 
 
-def _int8_batch_to_float32(batch: np.ndarray) -> np.ndarray:
+def _int8_batch_to_float32(batch: NDArray) -> NDArray:
     batch_i8 = np.asarray(batch, dtype=np.int8)
     batch_f32 = batch_i8.astype(np.float32)
     batch_f32[batch_i8 == PLINK_MISSING_INT8] = np.nan
     return batch_f32
 
 
-def _standardize_batch_i8(batch: np.ndarray, means: np.ndarray, scales: np.ndarray) -> np.ndarray:
+def _standardize_batch_i8(batch: NDArray, means: NDArray, scales: NDArray) -> NDArray:
     batch_i8 = np.asarray(batch, dtype=np.int8)
     means_f32 = np.asarray(means, dtype=np.float32)
     scales_f32 = np.asarray(scales, dtype=np.float32)
