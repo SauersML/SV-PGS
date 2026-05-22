@@ -221,6 +221,8 @@ class Int8BatchCapable(Protocol):
         self,
         variant_indices: Sequence[int] | NDArray | None = None,
         batch_size: int = DEFAULT_GENOTYPE_BATCH_SIZE,
+        *,
+        num_threads: int | None = None,
     ) -> Iterator[RawGenotypeBatch]: ...
 
 
@@ -293,7 +295,10 @@ class Int8RawGenotypeMatrix(RawGenotypeMatrix):
         self,
         variant_indices: Sequence[int] | NDArray | None = None,
         batch_size: int = DEFAULT_GENOTYPE_BATCH_SIZE,
+        *,
+        num_threads: int | None = None,
     ) -> Iterator[RawGenotypeBatch]:
+        del num_threads  # in-memory matrix; no decode threads to budget
         resolved_indices = _resolve_variant_indices(self.shape[1], variant_indices)
         safe_batch_size = max(int(batch_size), 1)
         for start_index in range(0, resolved_indices.shape[0], safe_batch_size):
@@ -372,6 +377,8 @@ class IndexedRawGenotypeMatrix(RawGenotypeMatrix):
         self,
         variant_indices: Sequence[int] | NDArray | None = None,
         batch_size: int = DEFAULT_GENOTYPE_BATCH_SIZE,
+        *,
+        num_threads: int | None = None,
     ) -> Iterator[RawGenotypeBatch]:
         if not _supports_int8_batches(self.child):
             raise RuntimeError("int8 batch iteration requires the wrapped child to support iter_column_batches_i8.")
@@ -384,7 +391,9 @@ class IndexedRawGenotypeMatrix(RawGenotypeMatrix):
             # Read the entire local batch as one child request so columns come
             # back in our coordinate order — no concat or reordering needed.
             child_batch = next(child.iter_column_batches_i8(
-                child_batch_indices, batch_size=max(child_batch_indices.shape[0], 1),
+                child_batch_indices,
+                batch_size=max(child_batch_indices.shape[0], 1),
+                num_threads=num_threads,
             ))
             yield RawGenotypeBatch(
                 variant_indices=local_batch,
@@ -454,11 +463,17 @@ class RowSubsetRawGenotypeMatrix(RawGenotypeMatrix):
         self,
         variant_indices: Sequence[int] | NDArray | None = None,
         batch_size: int = DEFAULT_GENOTYPE_BATCH_SIZE,
+        *,
+        num_threads: int | None = None,
     ) -> Iterator[RawGenotypeBatch]:
         if not _supports_int8_batches(self.child):
             raise RuntimeError("int8 batch iteration requires the wrapped child to support iter_column_batches_i8.")
         child = self.child
-        for batch in child.iter_column_batches_i8(variant_indices=variant_indices, batch_size=batch_size):
+        for batch in child.iter_column_batches_i8(
+            variant_indices=variant_indices,
+            batch_size=batch_size,
+            num_threads=num_threads,
+        ):
             yield RawGenotypeBatch(
                 variant_indices=batch.variant_indices,
                 values=np.ascontiguousarray(batch.values[self.row_indices, :]),
@@ -497,18 +512,33 @@ class PlinkRawGenotypeMatrix(RawGenotypeMatrix):
         result[raw_i8 == PLINK_MISSING_INT8] = np.nan
         return result
 
-    def _read_batch_i8(self, reader: Any, batch_indices: NDArray) -> NDArray:
-        """Read one batch as raw int8 (0/1/2/PLINK_MISSING_INT8). No float conversion."""
+    def _read_batch_i8(
+        self,
+        reader: Any,
+        batch_indices: NDArray,
+        *,
+        num_threads: int | None = None,
+    ) -> NDArray:
+        """Read one batch as raw int8 (0/1/2/PLINK_MISSING_INT8). No float conversion.
+
+        ``num_threads`` overrides the default ``PLINK_BED_READER_NUM_THREADS``;
+        callers running inside a prefetch executor pass a smaller value so the
+        total CPU work (pipeline_depth * decode_threads) does not exceed
+        ``os.cpu_count()``.
+        """
         import time as _time
         sample_index = _contiguous_index_or_slice(self.sample_indices)
         col_index = _contiguous_index_or_slice(batch_indices)
+        resolved_threads = (
+            PLINK_BED_READER_NUM_THREADS if num_threads is None else max(1, int(num_threads))
+        )
         t0 = _time.monotonic()
         result = np.asarray(
             reader.read(
                 index=(sample_index, col_index),
                 dtype="int8",
                 order="F",
-                num_threads=PLINK_BED_READER_NUM_THREADS,
+                num_threads=resolved_threads,
             ),
             dtype=np.int8,
         )
@@ -528,6 +558,8 @@ class PlinkRawGenotypeMatrix(RawGenotypeMatrix):
         self,
         variant_indices: Sequence[int] | NDArray | None = None,
         batch_size: int | None = None,
+        *,
+        num_threads: int | None = None,
     ) -> Iterator[RawGenotypeBatch]:
         """Iterate as int8 batches (4x less memory, no float conversion).
 
@@ -551,7 +583,7 @@ class PlinkRawGenotypeMatrix(RawGenotypeMatrix):
         log(f"    int8 batch: {safe_batch_size} variants x {self.shape[0]} samples = {batch_mb:.0f} MB/batch, {n_batches} batches  mem={mem()}")
 
         if total <= safe_batch_size:
-            values = self._read_batch_i8(reader, resolved_indices)
+            values = self._read_batch_i8(reader, resolved_indices, num_threads=num_threads)
             yield RawGenotypeBatch(variant_indices=resolved_indices, values=values)
             return
 
@@ -565,9 +597,20 @@ class PlinkRawGenotypeMatrix(RawGenotypeMatrix):
         ]
         prefetch_depth = min(PLINK_INT8_MAX_PREFETCH_DEPTH, len(batch_index_list))
         log(f"    int8 prefetch depth={prefetch_depth} (~{batch_mb * prefetch_depth:.0f} MB queued)  mem={mem()}")
+        # Split CPU budget between pipeline depth and per-read decode threads so
+        # workers * threads_per_worker <= cpu_count and they don't oversubscribe.
+        cpu_budget = max(1, os.cpu_count() or 1)
+        per_worker_threads = (
+            max(1, cpu_budget // prefetch_depth) if num_threads is None else int(num_threads)
+        )
         with ThreadPoolExecutor(max_workers=prefetch_depth) as executor:
             in_flight: deque[Future[NDArray]] = deque(
-                executor.submit(self._read_batch_i8, reader, batch_index_list[i])
+                executor.submit(
+                    self._read_batch_i8,
+                    reader,
+                    batch_index_list[i],
+                    num_threads=per_worker_threads,
+                )
                 for i in range(prefetch_depth)
             )
             next_to_submit = prefetch_depth
@@ -576,7 +619,10 @@ class PlinkRawGenotypeMatrix(RawGenotypeMatrix):
                 if next_to_submit < len(batch_index_list):
                     in_flight.append(
                         executor.submit(
-                            self._read_batch_i8, reader, batch_index_list[next_to_submit]
+                            self._read_batch_i8,
+                            reader,
+                            batch_index_list[next_to_submit],
+                            num_threads=per_worker_threads,
                         )
                     )
                     next_to_submit += 1
@@ -687,6 +733,8 @@ class ConcatenatedRawGenotypeMatrix(RawGenotypeMatrix):
         self,
         variant_indices: Sequence[int] | NDArray | None = None,
         batch_size: int = DEFAULT_GENOTYPE_BATCH_SIZE,
+        *,
+        num_threads: int | None = None,
     ) -> Iterator[RawGenotypeBatch]:
         if not all(_supports_int8_batches(child) for child in self.children):
             raise RuntimeError("int8 batch iteration requires every concatenated child to support iter_column_batches_i8.")
@@ -700,7 +748,11 @@ class ConcatenatedRawGenotypeMatrix(RawGenotypeMatrix):
                 child_positions = np.nonzero(child_ids == child_index)[0]
                 child_variant_indices = batch_indices[child_positions] - int(self._variant_offsets[child_index])
                 child = cast(Int8BatchCapable, self.children[int(child_index)])
-                child_batch_iter = child.iter_column_batches_i8(child_variant_indices, batch_size=max(child_variant_indices.shape[0], 1))
+                child_batch_iter = child.iter_column_batches_i8(
+                    child_variant_indices,
+                    batch_size=max(child_variant_indices.shape[0], 1),
+                    num_threads=num_threads,
+                )
                 child_batch = next(child_batch_iter)
                 batch_values[:, child_positions] = np.asarray(child_batch.values, dtype=np.int8)
             yield RawGenotypeBatch(
@@ -1344,19 +1396,6 @@ def _iter_prefetched_raw_batches(
     safe_batch_size = max(int(batch_size), 1)
     sample_count = int(raw.shape[0])
 
-    if _supports_int8_batches(raw):
-        i8_raw = raw
-        def _read_chunk(chunk_indices: NDArray) -> NDArray:
-            for batch in i8_raw.iter_column_batches_i8(chunk_indices, batch_size=chunk_indices.shape[0]):
-                return np.asarray(batch.values)
-            return np.empty((sample_count, 0), dtype=np.int8)
-    else:
-        float_raw = raw
-        def _read_chunk(chunk_indices: NDArray) -> NDArray:
-            for batch in float_raw.iter_column_batches(chunk_indices, batch_size=chunk_indices.shape[0]):
-                return np.asarray(batch.values)
-            return np.empty((sample_count, 0), dtype=np.float32)
-
     chunk_starts = list(range(0, n, safe_batch_size))
     chunks = [variant_indices_arr[s : s + safe_batch_size] for s in chunk_starts]
 
@@ -1369,6 +1408,28 @@ def _iter_prefetched_raw_batches(
     cpu_cap = max(1, os.cpu_count() or 4)
     num_io_workers = min(cpu_cap, int(memory_capped_in_flight), max(1, len(chunks)))
     in_flight_limit = min(num_io_workers * 2, int(memory_capped_in_flight), len(chunks))
+    # Split the CPU budget between pipeline depth and per-read decode fan-out.
+    # The pipeline executor *is* the parallelism; fanning out further inside
+    # each read would oversubscribe (workers * threads_per_worker > cpu_count)
+    # and pile up per-thread numpy scratch until the process swaps.
+    per_worker_decode_threads = max(1, cpu_cap // max(1, num_io_workers))
+
+    if _supports_int8_batches(raw):
+        i8_raw = raw
+        def _read_chunk(chunk_indices: NDArray) -> NDArray:
+            for batch in i8_raw.iter_column_batches_i8(
+                chunk_indices,
+                batch_size=chunk_indices.shape[0],
+                num_threads=per_worker_decode_threads,
+            ):
+                return np.asarray(batch.values)
+            return np.empty((sample_count, 0), dtype=np.int8)
+    else:
+        float_raw = raw
+        def _read_chunk(chunk_indices: NDArray) -> NDArray:
+            for batch in float_raw.iter_column_batches(chunk_indices, batch_size=chunk_indices.shape[0]):
+                return np.asarray(batch.values)
+            return np.empty((sample_count, 0), dtype=np.float32)
     if num_io_workers <= 1 or len(chunks) <= 1:
         local_start = 0
         for chunk in chunks:
