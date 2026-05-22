@@ -3350,6 +3350,8 @@ def test_gpu_sample_space_block_cg_matches_dense_solution(monkeypatch: pytest.Mo
     fake_cupy.maximum = np.maximum
     fake_cupy.eye = np.eye
     fake_cupy.zeros = np.zeros
+    fake_cupy.einsum = np.einsum
+    fake_cupy.dtype = np.dtype
     fake_cupy.linalg = types.SimpleNamespace(cholesky=np.linalg.cholesky, qr=np.linalg.qr)
     fake_cupy.cuda = types.SimpleNamespace(
         runtime=types.SimpleNamespace(getDeviceCount=lambda: 1),
@@ -3431,6 +3433,8 @@ def test_gpu_sample_space_block_cg_mixed_precision_refinement_matches_dense_solu
     fake_cupy.maximum = np.maximum
     fake_cupy.eye = np.eye
     fake_cupy.zeros = np.zeros
+    fake_cupy.einsum = np.einsum
+    fake_cupy.dtype = np.dtype
     fake_cupy.linalg = types.SimpleNamespace(cholesky=np.linalg.cholesky, qr=np.linalg.qr)
     fake_cupyx: Any = types.ModuleType("cupyx")
     fake_cupyx_scipy: Any = types.ModuleType("cupyx.scipy")

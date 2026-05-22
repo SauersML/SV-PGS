@@ -346,6 +346,15 @@ class Preprocessor:
     means: F32Array
     scales: F32Array
 
+    def transform(
+        self, genotypes: RawGenotypeMatrix | NDArray
+    ) -> StandardizedGenotypeMatrix | NDArray:
+        raw_genotypes = as_raw_genotype_matrix(genotypes)
+        standardized = raw_genotypes.standardized(self.means, self.scales)
+        if isinstance(genotypes, np.ndarray):
+            return standardized.materialize()
+        return standardized
+
 
 def fit_preprocessor_from_stats(
     variant_stats: VariantStatistics,

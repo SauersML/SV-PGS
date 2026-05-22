@@ -940,12 +940,8 @@ def test_plink_int8_cache_requires_space_before_decoding(
         lambda path, shape, *, fortran_order: (False, 200_000_000_000, 1_000_000),
     )
 
-    class UnreadablePlinkRaw(genotype_module.PlinkRawGenotypeMatrix):
-        def iter_column_batches_i8(self, *args, **kwargs):
-            raise AssertionError("PLINK decoding should not start without cache space")
-
     sample_indices = np.arange(genotype_matrix.shape[0], dtype=np.intp)
-    raw = UnreadablePlinkRaw(
+    raw = genotype_module.PlinkRawGenotypeMatrix(
         bed_path=bed_path,
         sample_indices=sample_indices,
         variant_count=genotype_matrix.shape[1],
@@ -953,8 +949,15 @@ def test_plink_int8_cache_requires_space_before_decoding(
         batch_size=2,
     )
 
-    with pytest.raises(OSError, match="Insufficient free space for PLINK int8 cache"):
-        io_module.compute_plink_variant_statistics_cached(raw, bed_path, sample_indices, ModelConfig())
+    # When disk space is insufficient the helper now falls back to streaming
+    # from .bed (slower but non-fatal) instead of raising. Verify: stats are
+    # still produced, but the int8 cache path is None (cache skipped).
+    stats, int8_path = io_module.compute_plink_variant_statistics_cached(
+        raw, bed_path, sample_indices, ModelConfig()
+    )
+    assert int8_path is None
+    assert stats.means.shape == (genotype_matrix.shape[1],)
+    assert stats.scales.shape == (genotype_matrix.shape[1],)
 
 
 def test_record_gt_types_to_int8_subsets_before_mapping():
@@ -1016,7 +1019,7 @@ def test_precache_vcfs_parallel_reuses_completed_region_outputs(monkeypatch: pyt
         def imap_unordered(self, _func, tasks):
             for task in tasks:
                 scheduled_tasks.append(task)
-                _vcf_path_str, _region, _keep_list, output_prefix, _threads = task
+                _vcf_path_str, _region, output_prefix, _threads = task
                 region_index = int(Path(output_prefix).name.split("_")[1])
                 Path(f"{output_prefix}.geno").write_bytes(np.array([2, 0], dtype=np.int8).tobytes())
                 io_module._write_variant_metadata(
@@ -1055,14 +1058,14 @@ def test_precache_vcfs_parallel_reuses_completed_region_outputs(monkeypatch: pyt
     io_module.precache_vcfs_parallel([vcf_path], config)
 
     assert len(scheduled_tasks) == 5
-    assert [task[3] for task in scheduled_tasks] == [
+    assert [task[2] for task in scheduled_tasks] == [
         str(region1_prefix),
         str(tmp_dir / "region_2"),
         str(tmp_dir / "region_3"),
         str(tmp_dir / "region_4"),
         str(tmp_dir / "region_5"),
     ]
-    assert all(task[4] == 1 for task in scheduled_tasks)
+    assert all(task[3] == 1 for task in scheduled_tasks)
 
     cached = _load_vcf_from_cache(vcf_path=vcf_path, config=config)
     assert cached is not None
