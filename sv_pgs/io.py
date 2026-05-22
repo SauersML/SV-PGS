@@ -11,10 +11,11 @@ import tempfile
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, BinaryIO, Iterator, Literal, Sequence
+from typing import Any, BinaryIO, Iterator, Literal, Sequence, cast
 
 import numpy as np
 
+from sv_pgs._typing import F32Array, F64Array, I8Array, I32Array, NDArray
 from sv_pgs.config import ModelConfig, VariantClass
 from sv_pgs.data import NESTED_PATH_DELIMITER, VariantRecord, VariantStatistics
 from sv_pgs.plink import PLINK_MISSING_INT8
@@ -62,8 +63,8 @@ VARIANT_METADATA_BASE_COLUMNS = frozenset(
 class LoadedDataset:
     sample_ids: list[str]
     genotypes: RawGenotypeMatrix
-    covariates: np.ndarray
-    targets: np.ndarray
+    covariates: F32Array
+    targets: F32Array
     variant_records: list[VariantRecord]
     variant_stats: VariantStatistics | None = None
     variant_stats_minimum_scale: float | None = None
@@ -73,8 +74,8 @@ class LoadedDataset:
 @dataclass(slots=True)
 class _SampleTable:
     sample_ids: list[str]
-    covariates: np.ndarray
-    targets: np.ndarray
+    covariates: F32Array
+    targets: F32Array
 
 
 @dataclass(slots=True)
@@ -113,7 +114,7 @@ class _TextVcfRecord:
     ALT: tuple[str, ...]
     QUAL: float | None
     INFO: dict[str, Any]
-    gt_types: np.ndarray
+    gt_types: I8Array
     end: int | None
 
     @property
@@ -291,7 +292,7 @@ def _parse_vcf_scalar(value: str) -> Any:
         return value
 
 
-def _parse_vcf_gt_types(format_field: str, sample_fields: Sequence[str]) -> np.ndarray:
+def _parse_vcf_gt_types(format_field: str, sample_fields: Sequence[str]) -> I8Array:
     format_tokens = format_field.split(":")
     try:
         gt_index = format_tokens.index("GT")
@@ -557,8 +558,8 @@ def load_dataset_from_files(
 
 
 def _lazy_row_subset(
-    matrix: np.ndarray | RawGenotypeMatrix,
-    row_indices: np.ndarray,
+    matrix: NDArray | RawGenotypeMatrix,
+    row_indices: NDArray,
 ) -> RawGenotypeMatrix:
     """Apply a row subset lazily via RowSubsetRawGenotypeMatrix.
 
@@ -895,7 +896,7 @@ def load_multi_source_dataset_from_files(
 
     # Phase 4: per-source alignment — each source needs indices into its
     # OWN native sample order that produce the unified sample table order.
-    per_source_keep_indices: list[np.ndarray] = []
+    per_source_keep_indices: list[NDArray] = []
     for (kind, path), source_ids in zip(source_specs, per_source_sample_ids):
         aligned = _align_sample_ids(
             expected_sample_ids=sample_table.sample_ids,
@@ -950,7 +951,7 @@ def load_multi_source_dataset_from_files(
                 # concatenation step — the stats we compute here are discarded.
                 int8_path_existing = _plink_int8_cache_path(path, keep_indices, config)
                 plink_int8_cache_path: Path | None = None
-                int8_view: np.ndarray | None = None
+                int8_view: I8Array | None = None
                 # Try the existing cache first. exists() alone isn't enough —
                 # a prior aborted run can leave a present-but-unreadable file
                 # that silently fails open_memmap, which previously left the
@@ -1260,10 +1261,10 @@ _PLINK_INT8_PROGRESS_SCHEMA = 1
 @dataclass(slots=True)
 class _PlinkInt8ResumeState:
     variants_committed: int
-    sums: np.ndarray
-    non_missing_counts: np.ndarray
-    support_counts: np.ndarray
-    centered_sum_squares: np.ndarray
+    sums: F64Array
+    non_missing_counts: I32Array
+    support_counts: I32Array
+    centered_sum_squares: F64Array
 
 
 @dataclass(slots=True)
@@ -1320,7 +1321,7 @@ class _StreamingInt8NpyWriter:
             _written_variants=int(written_variants),
         )
 
-    def write_columns(self, values: np.ndarray) -> None:
+    def write_columns(self, values: NDArray) -> None:
         if self._closed:
             raise ValueError("Cannot write to a closed int8 cache writer.")
         batch = np.asarray(values, dtype=np.int8)
@@ -1382,7 +1383,7 @@ def _plink_int8_cache_key_from_path(int8_path: Path) -> str:
     return int8_path.stem.removeprefix("plink_int8_")
 
 
-def _encode_plink_progress_array(values: np.ndarray, *, dtype: np.dtype, count: int) -> dict[str, Any]:
+def _encode_plink_progress_array(values: NDArray, *, dtype: np.dtype[Any], count: int) -> dict[str, Any]:
     array = np.ascontiguousarray(np.asarray(values[:count], dtype=dtype))
     return {
         "dtype": array.dtype.str,
@@ -1391,7 +1392,7 @@ def _encode_plink_progress_array(values: np.ndarray, *, dtype: np.dtype, count: 
     }
 
 
-def _decode_plink_progress_array(payload: object, *, dtype: np.dtype, count: int) -> np.ndarray:
+def _decode_plink_progress_array(payload: object, *, dtype: np.dtype[Any], count: int) -> NDArray:
     if not isinstance(payload, dict):
         raise ValueError("progress array payload must be an object.")
     expected_dtype = np.dtype(dtype)
@@ -1431,10 +1432,10 @@ def _write_plink_int8_progress(
     n_variants: int,
     fortran_order: bool,
     variants_committed: int,
-    sums: np.ndarray,
-    non_missing_counts: np.ndarray,
-    support_counts: np.ndarray,
-    centered_sum_squares: np.ndarray,
+    sums: F64Array,
+    non_missing_counts: I32Array,
+    support_counts: I32Array,
+    centered_sum_squares: F64Array,
 ) -> None:
     count = int(variants_committed)
     progress_path.parent.mkdir(parents=True, exist_ok=True)
@@ -1681,14 +1682,16 @@ def _load_vcf_cache_manifest(manifest_path: Path) -> dict[str, Any] | None:
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError, ValueError):
         return None
+    if not isinstance(manifest, dict):
+        return None
     if int(manifest.get("manifest_version", 0)) != _VCF_CACHE_MANIFEST_VERSION:
         return None
-    return manifest
+    return {str(key): value for key, value in manifest.items()}
 
 
 def _variants_to_metadata_arrays(
     variants: Sequence[_VariantDefaults],
-) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+) -> tuple[NDArray, NDArray, NDArray]:
     variant_ids = np.asarray(
         [variant.variant_id for variant in variants],
         dtype=f"<U{max((len(variant.variant_id) for variant in variants), default=1)}",
@@ -1811,7 +1814,7 @@ def _write_vcf_cache_stats(stats_path: Path, variant_stats: VariantStatistics) -
 
 def _plink_stats_cache_key(
     bed_path: Path,
-    sample_indices: np.ndarray,
+    sample_indices: NDArray,
     config: ModelConfig,
 ) -> str:
     """Stable hex digest identifying a PLINK variant-stats computation.
@@ -1835,7 +1838,7 @@ def _plink_stats_cache_key(
 
 def _plink_stats_cache_path(
     bed_path: Path,
-    sample_indices: np.ndarray,
+    sample_indices: NDArray,
     config: ModelConfig,
 ) -> Path:
     cache_dir = _vcf_cache_dir(bed_path)
@@ -1867,7 +1870,7 @@ def _write_plink_stats_cache(stats_path: Path, variant_stats: VariantStatistics)
 
 def _plink_int8_cache_path(
     bed_path: Path,
-    sample_indices: np.ndarray,
+    sample_indices: NDArray,
     config: ModelConfig,
 ) -> Path:
     """Path for the decoded int8 (n_samples, n_variants) PLINK cache.
@@ -1882,12 +1885,30 @@ def _plink_int8_cache_path(
     return cache_dir / f"plink_int8_{key}.npy"
 
 
-def _open_plink_int8_cache_for_read(int8_path: Path) -> np.ndarray | None:
+def _open_int8_memmap(
+    path: Path,
+    *,
+    mode: Literal["r", "r+", "w+", "c"],
+    shape: tuple[int, ...] | None = None,
+    fortran_order: bool = False,
+) -> np.memmap[Any, np.dtype[np.int8]]:
+    """Strict-mypy-safe wrapper around the untyped ``np.lib.format.open_memmap``."""
+    open_memmap = cast(Any, np.lib.format.open_memmap)
+    if mode == "w+":
+        if shape is None:
+            raise ValueError("shape is required for write-mode memmap")
+        result = open_memmap(path, mode=mode, dtype=np.int8, shape=shape, fortran_order=fortran_order)
+    else:
+        result = open_memmap(path, mode=mode)
+    return cast("np.memmap[Any, np.dtype[np.int8]]", result)
+
+
+def _open_plink_int8_cache_for_read(int8_path: Path) -> I8Array | None:
     """Return a read-only mmap view of the int8 cache, or None on miss/error."""
     if not int8_path.exists():
         return None
     try:
-        view = np.lib.format.open_memmap(int8_path, mode="r")
+        view: np.memmap[Any, np.dtype[np.int8]] = _open_int8_memmap(int8_path, mode="r")
     except (OSError, ValueError, EOFError) as exc:
         log(f"  PLINK int8 cache at {int8_path.name} unreadable ({exc!r}); will recompute")
         return None
@@ -1898,7 +1919,7 @@ def _open_plink_int8_cache_for_read(int8_path: Path) -> np.ndarray | None:
     return view
 
 
-def _madvise_willneed(array: np.ndarray) -> None:
+def _madvise_willneed(array: NDArray) -> None:
     """Best-effort posix_madvise(WILLNEED) on the backing mmap of `array`.
 
     No-op on systems without posix_madvise or on non-mmap arrays. Failures
@@ -1929,7 +1950,7 @@ def _madvise_willneed(array: np.ndarray) -> None:
 def compute_plink_variant_statistics_cached(
     raw_genotypes: PlinkRawGenotypeMatrix,
     bed_path: Path,
-    sample_indices: np.ndarray,
+    sample_indices: NDArray,
     config: ModelConfig,
 ) -> tuple[VariantStatistics, Path | None]:
     """compute_variant_statistics on a PLINK source, with disk caching.
@@ -2335,7 +2356,7 @@ def _is_vcf_cache_bundle_complete(paths: _VcfCachePaths) -> bool:
     return legacy_stats_npy.exists() or legacy_stats_npz.exists()
 
 
-def _ensure_vcf_cache_matrix_fast(paths: _VcfCachePaths, genotype_matrix: np.ndarray) -> np.ndarray:
+def _ensure_vcf_cache_matrix_fast(paths: _VcfCachePaths, genotype_matrix: I8Array) -> I8Array:
     if genotype_matrix.flags.f_contiguous and not genotype_matrix.flags.c_contiguous:
         return genotype_matrix
     variants = _load_variant_metadata(paths.var_path)
@@ -2347,7 +2368,7 @@ def _ensure_vcf_cache_matrix_fast(paths: _VcfCachePaths, genotype_matrix: np.nda
         variant_stats=variant_stats,
         cache_paths=paths,
     )
-    return np.load(paths.geno_path, mmap_mode="r")
+    return np.asarray(np.load(paths.geno_path, mmap_mode="r"), dtype=np.int8)
 
 
 def _load_vcf_from_cache(
@@ -2355,7 +2376,7 @@ def _load_vcf_from_cache(
     config: ModelConfig,
     *,
     mmap_mode: Literal["r", "r+", "w+", "c"] | None = None,
-) -> tuple[np.ndarray, list[_VariantDefaults], VariantStatistics] | None:
+) -> tuple[I8Array, list[_VariantDefaults], VariantStatistics] | None:
     """Try to load cached VCF parse results. Returns None on miss."""
     paths = _vcf_cache_paths(vcf_path, config)
     if not paths.cache_dir.exists():
@@ -2458,9 +2479,9 @@ def _iter_incremental_variant_chunk_paths(cache_dir: Path, key: str) -> list[Pat
 
 
 def _prepare_keep_sample_selector(
-    keep_sample_indices: np.ndarray | Sequence[int] | None,
+    keep_sample_indices: NDArray | Sequence[int] | None,
     total_sample_count: int,
-) -> slice | np.ndarray | None:
+) -> slice | NDArray | None:
     if keep_sample_indices is None:
         return None
     indices = np.asarray(keep_sample_indices, dtype=np.intp)
@@ -2481,15 +2502,15 @@ def _prepare_keep_sample_selector(
 
 
 def _record_gt_types_to_int8(
-    gt_types: np.ndarray,
-    gt_map: np.ndarray,
-    keep_selector: slice | np.ndarray | None,
-) -> np.ndarray:
+    gt_types: I8Array,
+    gt_map: I8Array,
+    keep_selector: slice | NDArray | None,
+) -> I8Array:
     selected_gt_types = gt_types if keep_selector is None else gt_types[keep_selector]
-    return gt_map[selected_gt_types]
+    return np.asarray(gt_map[selected_gt_types], dtype=np.int8)
 
 
-def _fast_int8_dosage_stats(col: np.ndarray) -> tuple[int, int, int, int]:
+def _fast_int8_dosage_stats(col: I8Array) -> tuple[int, int, int, int]:
     """Per-variant (sum, sum_sq, n_observed, n_nonzero) for an int8 dosage column.
 
     Values are {0, 1, 2, PLINK_MISSING_INT8}. Counting each non-missing value
@@ -2694,7 +2715,7 @@ def _variant_defaults_from_bcftools_fields(
     )
 
 
-def _parse_gt_block_to_int8(gt_block: bytes, sample_count: int) -> np.ndarray:
+def _parse_gt_block_to_int8(gt_block: bytes, sample_count: int) -> I8Array:
     """Vectorized decode of a bcftools `[%GT,]` block to int8 dosages.
 
     Handles both diploid (`"X/X,"` = 4 bytes/sample) and haploid (`"X,"` =
@@ -2735,7 +2756,7 @@ def _parse_gt_block_to_int8(gt_block: bytes, sample_count: int) -> np.ndarray:
         )
         dosage = dosage_i16.astype(np.int8)
         dosage[missing_mask] = PLINK_MISSING_INT8
-        return dosage
+        return np.asarray(dosage, dtype=np.int8)
     if bool(np.all(lengths == 1)):
         # Haploid: "X" or "." per sample. Treat the allele count directly as
         # dosage (0 -> 0, 1 -> 1) and any '.' as missing.
@@ -2780,7 +2801,7 @@ def _parse_region_string(region: str) -> tuple[str, int, int] | None:
         return None
 
 
-def _region_parse_worker(args: tuple) -> tuple[int, str]:
+def _region_parse_worker(args: tuple[str, str | None, str, int]) -> tuple[int, str]:
     """Worker: stream one region of one VCF through bcftools query, write
     raw binary output files. Runs in a separate process. Returns
     (variant_count, output_prefix).
@@ -2801,7 +2822,7 @@ def _region_parse_worker(args: tuple) -> tuple[int, str]:
     import tempfile
     import time
 
-    vcf_path_str, region, _keep_indices_list, output_prefix, threads_per_reader = args
+    vcf_path_str, region, output_prefix, threads_per_reader = args
     vcf_path = Path(vcf_path_str)
     vcf_name = vcf_path.name
 
@@ -2893,7 +2914,7 @@ def _region_parse_worker(args: tuple) -> tuple[int, str]:
     if region is not None and resume_pos is not None and resume_chrom is not None:
         parsed = _parse_region_string(region)
         if parsed is not None:
-            chrom_part, _orig_start, end_part = parsed
+            chrom_part, _, end_part = parsed
             if chrom_part == resume_chrom:
                 effective_region = f"{chrom_part}:{int(resume_pos) + 1}-{end_part}"
 
@@ -3177,7 +3198,7 @@ def precache_vcfs_parallel(
         allocation[vcf_path] = n_workers
 
     # Build task list — cache stores ALL samples; no keep_sample_indices filtering
-    tasks: list[tuple] = []
+    tasks: list[tuple[str, str | None, str, int]] = []
     completed_regions_by_vcf: dict[Path, int] = {}
     total_regions_by_vcf: dict[Path, int] = {}
     for vcf_path, n_workers in allocation.items():
@@ -3196,7 +3217,7 @@ def precache_vcfs_parallel(
                 completed_regions_by_vcf[vcf_path] = 1
             else:
                 completed_regions_by_vcf[vcf_path] = 0
-                tasks.append((str(vcf_path), None, None, str(region_prefix), 1))
+                tasks.append((str(vcf_path), None, str(region_prefix), 1))
         else:
             regions = _split_into_regions(chrom, chrom_length, n_workers)
             total_regions_by_vcf[vcf_path] = len(regions)
@@ -3206,15 +3227,15 @@ def precache_vcfs_parallel(
                 if _region_output_complete(region_prefix):
                     completed_count += 1
                     continue
-                tasks.append((str(vcf_path), region, None, str(region_prefix), 1))
+                tasks.append((str(vcf_path), region, str(region_prefix), 1))
             completed_regions_by_vcf[vcf_path] = completed_count
 
     process_count = min(total_cpus, max(len(tasks), 1))
     threads_per_worker = max(total_cpus // max(process_count, 1), 1)
     if threads_per_worker > 1:
         tasks = [
-            (vcf_path_str, region, keep_list_arg, output_prefix, threads_per_worker)
-            for vcf_path_str, region, keep_list_arg, output_prefix, _ in tasks
+            (vcf_path_str, region, output_prefix, threads_per_worker)
+            for vcf_path_str, region, output_prefix, _ in tasks
         ]
 
     log(
@@ -3328,7 +3349,7 @@ def _load_vcf_with_cache(
     config: ModelConfig,
     *,
     mmap_mode: Literal["r", "r+", "w+", "c"] | None,
-) -> tuple[np.ndarray, list[_VariantDefaults], VariantStatistics]:
+) -> tuple[I8Array, list[_VariantDefaults], VariantStatistics]:
     effective_mmap_mode: Literal["r", "r+", "w+", "c"] = "r" if mmap_mode is None else mmap_mode
     # Check for completed cache first (full genotype matrix, all samples)
     cached = _load_vcf_from_cache(
@@ -3351,13 +3372,13 @@ def _load_vcf_with_cache(
 
 def _load_vcf_incremental(
     vcf_path: Path,
-    keep_sample_indices: np.ndarray | None,
+    keep_sample_indices: NDArray | None,
     cache_dir: Path,
     key: str,
     *,
     config: ModelConfig,
     mmap_mode: Literal["r", "r+", "w+", "c"],
-) -> tuple[np.ndarray, list[_VariantDefaults], VariantStatistics]:
+) -> tuple[I8Array, list[_VariantDefaults], VariantStatistics]:
     """Parse VCF with incremental checkpointing. Resumes from last checkpoint if interrupted."""
     import os
     import struct
@@ -3645,7 +3666,7 @@ def _atomic_write_text(path: Path, text: str) -> None:
 
 def _save_vcf_to_cache(
     vcf_path: Path,
-    genotype_matrix: np.ndarray,
+    genotype_matrix: I8Array,
     variants: list[_VariantDefaults],
     variant_stats: VariantStatistics,
     config: ModelConfig | None = None,
@@ -3679,10 +3700,9 @@ def _save_vcf_to_cache(
         stats_tmp = bundle_dir / paths.stats_path.name
         manifest_tmp = bundle_dir / paths.manifest_path.name
         copy_batch_size = max(1, min(variant_count, 500_000_000 // max(sample_count, 1)))
-        genotype_memmap = np.lib.format.open_memmap(
+        genotype_memmap: np.memmap[Any, np.dtype[np.int8]] = _open_int8_memmap(
             geno_tmp,
             mode="w+",
-            dtype=np.int8,
             shape=(sample_count, variant_count),
             fortran_order=True,
         )
@@ -4006,7 +4026,7 @@ def _align_sample_ids(
     expected_sample_ids: Sequence[str],
     available_sample_ids: Sequence[str],
     context: str,
-) -> np.ndarray:
+) -> I32Array:
     sample_index_by_id: dict[str, int] = {}
     for sample_index, sample_id in enumerate(available_sample_ids):
         if sample_id in sample_index_by_id:
@@ -4026,8 +4046,8 @@ def _align_sample_ids(
 
 def _reorder_sample_table_by_source_index(
     sample_table: _SampleTable,
-    source_indices: np.ndarray,
-) -> tuple[_SampleTable, np.ndarray, bool]:
+    source_indices: I32Array,
+) -> tuple[_SampleTable, I32Array, bool]:
     sort_order = np.argsort(source_indices, kind="stable")
     if np.array_equal(sort_order, np.arange(sort_order.shape[0], dtype=sort_order.dtype)):
         return sample_table, np.asarray(source_indices, dtype=np.int32), False
