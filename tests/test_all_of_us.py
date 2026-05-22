@@ -669,6 +669,9 @@ def test_run_all_of_us_runs_single_unified_fit_and_reuses_cached_downloads(monke
     class _Dataset:
         def __init__(self) -> None:
             self.targets = np.array([0.0, 1.0], dtype=np.float32)
+            self.variant_stats = None
+            self.variant_records: list = []
+            self.variant_stats_minimum_scale: float | None = None
 
     ancestry_path = tmp_path / "ancestry_preds.tsv"
     ancestry_path.write_text("research_id\tpca_features\n1\t[0.1,0.2]\n", encoding="utf-8")
@@ -734,10 +737,13 @@ def test_run_all_of_us_runs_single_unified_fit_and_reuses_cached_downloads(monke
     assert (cache_dir / "AoU_srWGS_SV.v8.chr1.vcf.gz.tbi").exists()
     assert (cache_dir / "AoU_srWGS_SV.v8.chr2.vcf.gz").exists()
     assert (cache_dir / "AoU_srWGS_SV.v8.chr2.vcf.gz.tbi").exists()
-    assert loader_calls == [[
+    # Loader is called twice now: once for the train sample set, once for the
+    # 20% held-out test set (Step 4b in run_all_of_us).
+    expected_vcfs = [
         str(cache_dir / "AoU_srWGS_SV.v8.chr1.vcf.gz"),
         str(cache_dir / "AoU_srWGS_SV.v8.chr2.vcf.gz"),
-    ]]
+    ]
+    assert loader_calls == [expected_vcfs, expected_vcfs]
     assert pipeline_calls == [(2, tmp_path)]
     assert release_calls == ["released"]
 
@@ -835,7 +841,7 @@ def test_run_all_of_us_skips_existing_fit_only_when_run_metadata_matches(monkeyp
                 validation_interval=20,
                 validate_first_iteration=False,
                 sample_space_preconditioner_rank=0,
-                test_fraction=0.0,
+                test_fraction=aou_runner.AOU_TEST_FRACTION,
                 marginal_screen_min_abs_z=1.5,
             ),
             indent=2,
@@ -881,6 +887,9 @@ def test_run_all_of_us_reruns_when_existing_fit_metadata_differs(monkeypatch, tm
     class _Dataset:
         def __init__(self) -> None:
             self.targets = np.array([0.0, 1.0], dtype=np.float32)
+            self.variant_stats = None
+            self.variant_records: list = []
+            self.variant_stats_minimum_scale: float | None = None
 
     disease = "heart_failure"
     sample_table_path = tmp_path / f"{disease}.samples.tsv"
@@ -962,10 +971,12 @@ def test_run_all_of_us_reruns_when_existing_fit_metadata_differs(monkeypatch, tm
     )
 
     cache_dir = aou_runner.local_sv_vcf_cache_dir(tmp_path)
-    assert loader_calls == [[
+    expected_vcfs = [
         str(cache_dir / "AoU_srWGS_SV.v8.chr1.vcf.gz"),
         str(cache_dir / "AoU_srWGS_SV.v8.chr2.vcf.gz"),
-    ]]
+    ]
+    # Train + test loads under the 20% holdout default.
+    assert loader_calls == [expected_vcfs, expected_vcfs]
     assert pipeline_calls == [tmp_path]
     rerun_metadata = json.loads(aou_runner._aou_run_metadata_path(tmp_path).read_text(encoding="utf-8"))
     assert rerun_metadata["requested_n_pcs"] == 3
