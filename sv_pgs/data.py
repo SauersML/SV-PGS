@@ -5,6 +5,7 @@ from typing import Any, Sequence
 
 import numpy as np
 
+from sv_pgs._typing import F32Array, I32Array
 from sv_pgs.config import VariantClass
 
 
@@ -164,19 +165,19 @@ class VariantRecord:
 @dataclass(slots=True)
 class VariantStatistics:
     """Pre-computed per-variant statistics from a single streaming pass."""
-    means: np.ndarray
-    scales: np.ndarray
-    allele_frequencies: np.ndarray
-    support_counts: np.ndarray  # int32, non-zero dosage count per variant
+    means: F32Array
+    scales: F32Array
+    allele_frequencies: F32Array
+    support_counts: I32Array  # non-zero dosage count per variant
 
 
 @dataclass(slots=True)
 class PreparedArrays:
-    covariates: np.ndarray
-    targets: np.ndarray
-    means: np.ndarray
-    scales: np.ndarray
-    support_counts: np.ndarray
+    covariates: F32Array
+    targets: F32Array
+    means: F32Array
+    scales: F32Array
+    support_counts: I32Array
 
 
 @dataclass(slots=True)
@@ -188,8 +189,8 @@ class TieGroup:
     signs: +1 if a member's column matches the representative, -1 if negated
     """
     representative_index: int
-    member_indices: np.ndarray
-    signs: np.ndarray
+    member_indices: I32Array
+    signs: F32Array
 
 
 @dataclass(slots=True)
@@ -206,15 +207,15 @@ class TieMap:
     reduced_to_group: for each reduced variant, the full group of tied members.
         Empty when kept_indices/original_to_reduced encode a compact no-ties map.
     """
-    kept_indices: np.ndarray
-    original_to_reduced: np.ndarray
+    kept_indices: I32Array
+    original_to_reduced: I32Array
     reduced_to_group: list[TieGroup]
 
     def expand_coefficients(
         self,
-        reduced_beta: np.ndarray,
-        group_weights: Sequence[np.ndarray],
-    ) -> np.ndarray:
+        reduced_beta: F32Array,
+        group_weights: Sequence[F32Array],
+    ) -> F32Array:
         """Distribute each group's single fitted effect back to all its members.
 
         Each member gets: beta_member = beta_group * weight_member * sign_member

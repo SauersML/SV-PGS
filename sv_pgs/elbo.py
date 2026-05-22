@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import numpy as np
 
+from sv_pgs._typing import F64Array, NDArray
 from sv_pgs.config import TraitType
 
 
@@ -16,7 +17,7 @@ _LOG_2PI = float(np.log(2.0 * np.pi))
 _LOG_2PI_E = float(np.log(2.0 * np.pi) + 1.0)
 
 
-def _jj_lambda(xi: np.ndarray) -> np.ndarray:
+def _jj_lambda(xi: F64Array) -> F64Array:
     """Jaakkola-Jordan λ(ξ) = tanh(ξ/2) / (4 ξ), with safe limit 1/8 at ξ → 0."""
     xi = np.asarray(xi, dtype=np.float64)
     out = np.empty_like(xi)
@@ -28,7 +29,7 @@ def _jj_lambda(xi: np.ndarray) -> np.ndarray:
     return out
 
 
-def _log_sigmoid(x: np.ndarray) -> np.ndarray:
+def _log_sigmoid(x: F64Array) -> F64Array:
     """Numerically stable log σ(x) = -softplus(-x)."""
     x = np.asarray(x, dtype=np.float64)
     # log σ(x) = -log(1 + exp(-x)); use -softplus(-x) trick
@@ -38,16 +39,16 @@ def _log_sigmoid(x: np.ndarray) -> np.ndarray:
 def compute_elbo(
     *,
     trait_type: TraitType,
-    targets: np.ndarray,
-    covariate_matrix: np.ndarray,
-    alpha: np.ndarray,
-    beta: np.ndarray,
-    beta_variance: np.ndarray,
-    linear_predictor: np.ndarray,
-    reduced_prior_variances: np.ndarray,
+    targets: NDArray,
+    covariate_matrix: NDArray,
+    alpha: NDArray,
+    beta: NDArray,
+    beta_variance: NDArray,
+    linear_predictor: NDArray,
+    reduced_prior_variances: NDArray,
     sigma_error2: float,
-    column_norms_sq: np.ndarray | None = None,
-    predictor_variance: np.ndarray | None = None,
+    column_norms_sq: NDArray | None = None,
+    predictor_variance: NDArray | None = None,
     local_scale_prior_objective: float = 0.0,
     scale_penalty_objective: float = 0.0,
 ) -> float:

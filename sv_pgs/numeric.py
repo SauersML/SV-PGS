@@ -2,20 +2,17 @@
 from __future__ import annotations
 
 import importlib
-from typing import TYPE_CHECKING
+from typing import Any
+
+from sv_pgs._typing import JaxArray
 
 # Importing sv_pgs._jax configures XLA env vars before any direct jax import.
 # Use importlib so static-analysis tools don't reorder it past the jax import.
 importlib.import_module("sv_pgs._jax")
 jnp = importlib.import_module("jax.numpy")
 
-if TYPE_CHECKING:
-    from jax import Array as _JaxArray
-else:
-    _JaxArray = object
 
-
-def stable_sigmoid(values) -> "_JaxArray":
+def stable_sigmoid(values: Any) -> JaxArray:
     """Convert a real-valued score to a probability between 0 and 1.
 
     sigmoid(x) = 1 / (1 + exp(-x))

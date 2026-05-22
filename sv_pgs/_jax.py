@@ -4,6 +4,7 @@ import shutil
 import subprocess
 from collections.abc import Sequence
 from functools import lru_cache
+from typing import Any
 
 import numpy as np
 
@@ -102,12 +103,6 @@ def tensor_core_matmul_enabled() -> bool:
     return _is_ampere_or_newer(_compute_capabilities())
 
 
-@lru_cache(maxsize=1)
-def hopper_or_newer_enabled() -> bool:
-    """True on Hopper (SM 9.0) and newer."""
-    return _is_hopper_or_newer(_compute_capabilities())
-
-
 if turing_workarounds_enabled():
     _xla_flags = os.environ.get("XLA_FLAGS", "")
     for flag in _TURING_WORKAROUND_FLAGS:
@@ -172,9 +167,9 @@ def jax_dense_linear_algebra_preferred() -> bool:
     return not turing_workarounds_enabled()
 
 
-def gpu_compute_numpy_dtype() -> np.dtype:
+def gpu_compute_numpy_dtype() -> np.dtype[np.floating[Any]]:
     return np.dtype(np.float32 if gpu_float32_compute_enabled() else np.float64)
 
 
-def gpu_compute_jax_dtype():
+def gpu_compute_jax_dtype() -> Any:
     return jnp.float32 if gpu_float32_compute_enabled() else jnp.float64
