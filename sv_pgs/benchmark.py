@@ -1,11 +1,12 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, fields
-from typing import Sequence
+from typing import Any, Sequence
 
 import numpy as np
 from sklearn.metrics import average_precision_score, log_loss, r2_score, roc_auc_score
 
+from sv_pgs._typing import NDArray
 from sv_pgs.config import BenchmarkConfig, ModelConfig, TraitType
 from sv_pgs.data import VariantRecord, normalize_variant_records
 from sv_pgs.model import BayesianPGS
@@ -22,13 +23,13 @@ class BenchmarkMetrics:
 
 
 def run_benchmark_suite(
-    train_genotypes: np.ndarray,
-    train_covariates: np.ndarray,
-    train_targets: np.ndarray,
-    test_genotypes: np.ndarray,
-    test_covariates: np.ndarray,
-    test_targets: np.ndarray,
-    records: Sequence[VariantRecord | dict],
+    train_genotypes: NDArray,
+    train_covariates: NDArray,
+    train_targets: NDArray,
+    test_genotypes: NDArray,
+    test_covariates: NDArray,
+    test_targets: NDArray,
+    records: Sequence[VariantRecord | dict[str, Any]],
     benchmark_config: BenchmarkConfig,
 ) -> dict[str, BenchmarkMetrics]:
     shared_config = benchmark_config.shared_config
@@ -45,7 +46,7 @@ def run_benchmark_suite(
     snv_only_config = _copy_config(shared_config)
     joint_config = _copy_config(shared_config)
 
-    model_specs: list[tuple[str, BayesianPGS, np.ndarray]] = [
+    model_specs: list[tuple[str, BayesianPGS, NDArray]] = [
         (
             "snv_only_continuous",
             _fit_model(snv_only_config, train_genotypes[:, snv_mask], train_covariates, train_targets, snv_records),
@@ -70,7 +71,7 @@ def run_benchmark_suite(
     }
 
 
-def _copy_config(config: ModelConfig, **overrides) -> ModelConfig:
+def _copy_config(config: ModelConfig, **overrides: Any) -> ModelConfig:
     payload = {config_field.name: getattr(config, config_field.name) for config_field in fields(config)}
     payload.update(overrides)
     return ModelConfig(**payload)
@@ -78,9 +79,9 @@ def _copy_config(config: ModelConfig, **overrides) -> ModelConfig:
 
 def _fit_model(
     config: ModelConfig,
-    genotypes: np.ndarray,
-    covariates: np.ndarray,
-    targets: np.ndarray,
+    genotypes: NDArray,
+    covariates: NDArray,
+    targets: NDArray,
     records: Sequence[VariantRecord],
 ) -> BayesianPGS:
     model = BayesianPGS(config)
@@ -90,9 +91,9 @@ def _fit_model(
 
 def _compute_metrics(
     model: BayesianPGS,
-    genotypes: np.ndarray,
-    covariates: np.ndarray,
-    targets: np.ndarray,
+    genotypes: NDArray,
+    covariates: NDArray,
+    targets: NDArray,
     benchmark_config: BenchmarkConfig,
 ) -> BenchmarkMetrics:
     scores = model.decision_function(genotypes, covariates)
@@ -129,8 +130,8 @@ def _compute_metrics(
     )
 
 def _top_tail_enrichment(
-    scores: np.ndarray,
-    targets: np.ndarray,
+    scores: NDArray,
+    targets: NDArray,
     fraction: float,
     trait_type: TraitType,
 ) -> float:

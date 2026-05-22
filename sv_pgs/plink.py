@@ -8,6 +8,8 @@ from typing import Any, Literal
 
 import numpy as np
 
+from sv_pgs._typing import I8Array, NDArray, U8Array
+
 PLINK1_MAGIC = b"\x6c\x1b\x01"
 PLINK1_HEADER_SIZE = 3
 PLINK_MISSING_INT8 = np.int8(-127)
@@ -17,7 +19,7 @@ _DECODE_LOOKUP_A2 = np.array([0, PLINK_MISSING_INT8, 1, 2], dtype=np.int8)
 _ENCODE_LOOKUP_A1 = np.array([0b11, 0b10, 0b00], dtype=np.uint8)
 
 
-def _build_byte_decode_lut(per_code_lookup: np.ndarray) -> np.ndarray:
+def _build_byte_decode_lut(per_code_lookup: I8Array) -> I8Array:
     """Precompute a (256, 4) byte → 4-int8 unpacking table.
 
     Each .bed byte packs 4 samples × 2 bits, low-bit-first. `lut[byte]`
@@ -50,7 +52,7 @@ _SAMPLE_WINDOW_STRIPED_MAX_OVERREAD_RATIO = 32.0
 
 def to_bed(
     bed_path: str | Path,
-    values: np.ndarray,
+    values: NDArray,
     properties: dict[str, list[Any]],
 ) -> None:
     resolved_path = Path(bed_path)
@@ -168,7 +170,7 @@ class open_bed:
             raise RuntimeError("PLINK reader file descriptor is closed.")
         return self._bed_fd
 
-    def _pread_payload(self, offset: int, length: int) -> np.ndarray:
+    def _pread_payload(self, offset: int, length: int) -> U8Array:
         """Positional read of `length` bytes at `offset` into a fresh uint8 array.
 
         Loops over short reads because filesystems can return fewer bytes than
@@ -199,7 +201,7 @@ class open_bed:
         bytes_per_variant: int,
         byte_start: int,
         byte_count: int,
-    ) -> np.ndarray:
+    ) -> U8Array:
         """Read only a contiguous sample byte window from each variant record."""
         if variant_count <= 0 or byte_count <= 0:
             return np.empty((0,), dtype=np.uint8)
@@ -238,7 +240,7 @@ class open_bed:
         byte_count: int,
         sample_count: int,
         leading_sample_offset: int,
-    ) -> np.ndarray:
+    ) -> I8Array:
         result = np.empty((sample_count, variant_count), dtype=np.int8, order="F")
         variants_per_chunk = max(1, _SAMPLE_WINDOW_STRIPED_TARGET_CHUNK_BYTES // bytes_per_variant)
         for chunk_start in range(0, variant_count, variants_per_chunk):
@@ -269,11 +271,11 @@ class open_bed:
 
     def read(
         self,
-        index=None,
-        dtype: str | np.dtype = "float32",
+        index: Any = None,
+        dtype: str | np.dtype[Any] = "float32",
         order: Literal["F", "C"] = "F",
         num_threads: int | None = None,
-    ) -> np.ndarray:
+    ) -> NDArray:
         sample_index, variant_index = _split_index(index)
         resolved_samples = _normalize_index(sample_index, self.iid_count)
         resolved_variants = _normalize_index(variant_index, self.sid_count)
@@ -297,14 +299,14 @@ class open_bed:
 
     def _read_int8_matrix(
         self,
-        variant_index: slice | np.ndarray,
+        variant_index: slice | NDArray,
         *,
-        sample_index: slice | np.ndarray | None = None,
+        sample_index: slice | NDArray | None = None,
         num_threads: int = 1,
-    ) -> np.ndarray:
+    ) -> I8Array:
         bytes_per_variant = _bytes_per_variant(self.iid_count)
         if sample_index is None:
-            resolved_sample_index: slice | np.ndarray = slice(0, self.iid_count, 1)
+            resolved_sample_index: slice | NDArray = slice(0, self.iid_count, 1)
         else:
             resolved_sample_index = sample_index
         sample_slice = resolved_sample_index if isinstance(resolved_sample_index, slice) else None
@@ -481,7 +483,7 @@ def _split_index(index: Any) -> tuple[Any, Any]:
     return index
 
 
-def _normalize_index(index: Any, limit: int) -> slice | np.ndarray:
+def _normalize_index(index: Any, limit: int) -> slice | NDArray:
     if index is None:
         return slice(0, limit, 1)
     if isinstance(index, slice):
@@ -543,14 +545,14 @@ def _sample_slice_parameters(sample_slice: slice, iid_count: int) -> _SampleSlic
 
 
 def _decode_sample_window_payload(
-    payload: bytes | np.ndarray,
+    payload: bytes | NDArray,
     *,
     variant_count: int,
     byte_count: int,
     sample_count: int,
     leading_sample_offset: int,
     count_a1: bool,
-) -> np.ndarray:
+) -> I8Array:
     if sample_count == 0:
         return np.empty((0, variant_count), dtype=np.int8)
     if byte_count < 1:
@@ -567,18 +569,19 @@ def _decode_sample_window_payload(
     packed = raw_bytes.reshape(variant_count, byte_count)
     lut = _BYTE_DECODE_LUT_A1 if count_a1 else _BYTE_DECODE_LUT_A2
     decoded = lut[packed].reshape(variant_count, byte_count * 4)
-    return decoded[:, leading_sample_offset : leading_sample_offset + sample_count].T
+    sliced: I8Array = decoded[:, leading_sample_offset : leading_sample_offset + sample_count].T
+    return sliced
 
 
 def _decode_payload_sample_indices(
-    payload: bytes | np.ndarray,
+    payload: bytes | NDArray,
     *,
     iid_count: int,
     variant_count: int,
     bytes_per_variant: int,
-    sample_indices: np.ndarray,
+    sample_indices: NDArray,
     count_a1: bool,
-) -> np.ndarray:
+) -> I8Array:
     samples = np.asarray(sample_indices, dtype=np.intp)
     if samples.ndim != 1:
         raise ValueError("PLINK sample indices must be 1D.")
@@ -608,15 +611,15 @@ def _decode_payload_sample_indices(
 
 
 def _decode_payload_sample_indices_parallel(
-    payload: bytes | np.ndarray,
+    payload: bytes | NDArray,
     *,
     iid_count: int,
     variant_count: int,
     bytes_per_variant: int,
-    sample_indices: np.ndarray,
+    sample_indices: NDArray,
     count_a1: bool,
     num_threads: int,
-) -> np.ndarray:
+) -> I8Array:
     if num_threads <= 1 or variant_count <= 1:
         return _decode_payload_sample_indices(
             payload,
@@ -665,13 +668,13 @@ def _decode_payload_sample_indices_parallel(
 
 
 def _decode_payload(
-    payload: bytes | np.ndarray,
+    payload: bytes | NDArray,
     *,
     iid_count: int,
     variant_count: int,
     bytes_per_variant: int,
     count_a1: bool,
-) -> np.ndarray:
+) -> I8Array:
     """Decode a .bed payload (variant_count × bytes_per_variant packed bytes)
     into an (iid_count, variant_count) int8 array.
 
@@ -697,18 +700,19 @@ def _decode_payload(
     # one indexing op. Reshape collapses the last two axes back into a flat
     # padded-sample axis; the .T returns the F-order view the caller wants.
     decoded = lut[packed]  # noqa: E501 — main allocation
-    return decoded.reshape(variant_count, bytes_per_variant * 4)[:, :iid_count].T
+    result: I8Array = decoded.reshape(variant_count, bytes_per_variant * 4)[:, :iid_count].T
+    return result
 
 
 def _decode_payload_parallel(
-    payload: bytes | np.ndarray,
+    payload: bytes | NDArray,
     *,
     iid_count: int,
     variant_count: int,
     bytes_per_variant: int,
     count_a1: bool,
     num_threads: int,
-) -> np.ndarray:
+) -> I8Array:
     if num_threads <= 1 or variant_count <= 1:
         return _decode_payload(
             payload,
@@ -745,7 +749,7 @@ def _decode_payload_parallel(
     return decoded_matrix[:, :iid_count].T
 
 
-def _encode_variant(column: np.ndarray, *, bytes_per_variant: int) -> bytes:
+def _encode_variant(column: NDArray, *, bytes_per_variant: int) -> bytes:
     observed = ~np.isnan(column)
     rounded = np.rint(column[observed])
     if not np.all(np.isclose(column[observed], rounded)):
