@@ -100,6 +100,41 @@ echo "=== CACHE DIAGNOSTICS ==="
 echo "  disk usage:"
 df -h "$HOME" 2>/dev/null | sed 's/^/    /'
 echo
+echo "  block device backing \$HOME:"
+home_src="$(df --output=source "$HOME" 2>/dev/null | tail -1)"
+home_dev="$(basename "$home_src" 2>/dev/null)"
+if [ -n "$home_dev" ]; then
+  # Trim partition suffix (sdb1 -> sdb, nvme0n1p1 -> nvme0n1) so /sys/block lookup works.
+  case "$home_dev" in
+    nvme*p*) home_block="${home_dev%p*}" ;;
+    *[0-9])  home_block="$(echo "$home_dev" | sed 's/[0-9]*$//')" ;;
+    *)       home_block="$home_dev" ;;
+  esac
+  echo "    $home_src  (block device: /dev/$home_block)"
+  if command -v lsblk >/dev/null 2>&1; then
+    lsblk -d -o NAME,ROTA,SIZE,MODEL,TYPE --nodeps "/dev/$home_block" 2>/dev/null | sed 's/^/    /' || true
+  fi
+  rota_path="/sys/block/$home_block/queue/rotational"
+  if [ -r "$rota_path" ]; then
+    rota=$(cat "$rota_path" 2>/dev/null || echo "?")
+    case "$rota" in
+      0) media="SSD-backed (rotational=0)" ;;
+      1) media="HDD-backed (rotational=1)" ;;
+      *) media="rotational=$rota" ;;
+    esac
+    echo "    media: $media"
+  fi
+  # Local NVMe shows up as /dev/nvme*; PDs show up as /dev/sd* with MODEL=PersistentDisk.
+  # The MODEL string is the cheap test: local SSDs read "EphemeralDisk" / "nvme_card" /
+  # "Local-SSD"; persistent disks read "PersistentDisk".
+  model="$(lsblk -dn -o MODEL "/dev/$home_block" 2>/dev/null | tr -d ' ' || true)"
+  case "$model" in
+    *PersistentDisk*) echo "    interpretation: GCE persistent disk (NETWORK-ATTACHED; throughput scales with provisioned size)" ;;
+    *EphemeralDisk*|*Local-SSD*|*nvme_card*) echo "    interpretation: local NVMe / local SSD (direct-attached, non-persistent)" ;;
+    *) [ -n "$model" ] && echo "    interpretation: unrecognized model='$model'" ;;
+  esac
+fi
+echo
 echo "  canonical shared cache ($SHARED_CACHE):"
 if [ -d "$SHARED_CACHE" ]; then
   ls -lah "$SHARED_CACHE" 2>/dev/null | sed 's/^/    /'
