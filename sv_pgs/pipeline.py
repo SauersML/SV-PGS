@@ -10,9 +10,11 @@ from typing import Any, Callable, Iterable, Sequence
 import numpy as np
 from sklearn.metrics import log_loss, r2_score, roc_auc_score
 
+from sv_pgs.artifact import try_load_artifact_if_fingerprint_matches
 from sv_pgs.config import ModelConfig, TraitType
+from sv_pgs.genotype import as_raw_genotype_matrix
 from sv_pgs.io import LoadedDataset, _coerce_float, _format_float, _open_text_file
-from sv_pgs.model import BayesianPGS
+from sv_pgs.model import BayesianPGS, _fit_checkpoint_config_hash
 from sv_pgs.numeric import stable_sigmoid
 from sv_pgs.progress import log, mem
 
@@ -85,31 +87,62 @@ def run_training_pipeline(
             test_dataset.targets,
         )
 
-    log("fitting Bayesian PGS model...")
-    try:
-        model = BayesianPGS(config).fit(
-            dataset.genotypes,
-            dataset.covariates,
-            dataset.targets,
-            dataset.variant_records,
-            variant_stats=dataset.variant_stats,
-            validation_data=validation_data,
-            per_epoch_eval_callback=_per_epoch_callback,
-            # Marking the held-out test set as holdout-only keeps the test
-            # cross-entropy out of best-epoch parameter selection and out of
-            # the early-stopping gate. Without this flag, the model would
-            # pick the epoch with the lowest test cross-entropy as its final
-            # parameters and the reported test AUC would be biased upward.
-            validation_is_holdout_only=validation_data is not None,
-        )
-    finally:
-        _close_history()
-    log(f"model fitted  mem={mem()}")
-
-    log("exporting model artifacts...")
+    # Auto-reuse a prior run's completed artifact when the inputs match.
+    # ``_fit_checkpoint_config_hash`` covers (genotype shape, variant records,
+    # covariates, targets, convergence-affecting config fields), which is the
+    # same signature the durable EM checkpoint uses to gate resume — so an
+    # artifact whose fingerprint matches is guaranteed-equivalent to the fit
+    # this run would produce. On a match we skip the (multi-minute to multi-
+    # hour) EM and reuse the saved coefficients verbatim; downstream outputs
+    # (predictions, coefficients TSV, summary, per-epoch history) are
+    # regenerated below from the loaded model so callers see the same files.
     artifact_dir = destination / "artifact"
-    model.export(artifact_dir)
-    log(f"artifacts written to {artifact_dir}")
+    raw_genotype_matrix = as_raw_genotype_matrix(dataset.genotypes)
+    fit_fingerprint = _fit_checkpoint_config_hash(
+        genotype_matrix=raw_genotype_matrix,
+        covariates=dataset.covariates,
+        targets=dataset.targets,
+        variant_records=dataset.variant_records,
+        config=config,
+    )
+    reused_artifact = try_load_artifact_if_fingerprint_matches(artifact_dir, fit_fingerprint)
+    if reused_artifact is not None:
+        log(
+            f"reusing prior fit artifact at {artifact_dir} "
+            + f"(fit_fingerprint matches; skipping EM)  mem={mem()}"
+        )
+        _close_history()
+        model = BayesianPGS.load(artifact_dir)
+        # Re-export so the on-disk fingerprint and arrays are byte-identical
+        # to what this run would have written. This is a no-op for the data
+        # but keeps the freshness mtime current — useful for the cached-eval
+        # surfacing logic in aou_runner that scans by directory age.
+        model.export(artifact_dir, fit_fingerprint=fit_fingerprint)
+    else:
+        log("fitting Bayesian PGS model...")
+        try:
+            model = BayesianPGS(config).fit(
+                dataset.genotypes,
+                dataset.covariates,
+                dataset.targets,
+                dataset.variant_records,
+                variant_stats=dataset.variant_stats,
+                validation_data=validation_data,
+                per_epoch_eval_callback=_per_epoch_callback,
+                # Marking the held-out test set as holdout-only keeps the test
+                # cross-entropy out of best-epoch parameter selection and out of
+                # the early-stopping gate. Without this flag, the model would
+                # pick the epoch with the lowest test cross-entropy as its final
+                # parameters and the reported test AUC would be biased upward.
+                validation_is_holdout_only=validation_data is not None,
+            )
+        finally:
+            _close_history()
+        log(f"model fitted  mem={mem()}")
+
+        log("exporting model artifacts...")
+        model.export(artifact_dir, fit_fingerprint=fit_fingerprint)
+        log(f"artifacts written to {artifact_dir}")
 
     log("writing coefficients table...")
     coefficients_path = destination / "coefficients.tsv.gz"

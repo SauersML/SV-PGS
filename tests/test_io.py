@@ -1710,7 +1710,7 @@ def test_run_training_pipeline_fits_full_cohort_once(tmp_path: Path, monkeypatch
             )
             return self
 
-        def export(self, path: Path) -> None:
+        def export(self, path: Path, *, fit_fingerprint: str = "") -> None:
             path.mkdir(parents=True, exist_ok=True)
 
         def coefficient_table(self, *, nonzero_only: bool = False, minimum_abs_beta: float = 0.0):
@@ -1783,6 +1783,240 @@ def test_run_training_pipeline_fits_full_cohort_once(tmp_path: Path, monkeypatch
     assert summary_payload["selected_iteration_count"] == 9
     assert summary_payload["fit_max_outer_iterations"] == 9
     assert summary_payload["validation_history"] == []
+
+
+def test_run_training_pipeline_reuses_artifact_across_runs(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    """Second run with identical inputs must skip the fit and reuse the artifact.
+
+    Mechanism: the first call writes ``artifact/`` carrying the fit fingerprint;
+    the second call computes the same fingerprint, matches, and short-circuits
+    EM. Without this, every re-run of the AoU pipeline pays the full multi-
+    minute fit cost even when the prior result is byte-identical to what it
+    would produce. The fingerprint is computed from genotypes/covariates/
+    targets/records/config, so any input change invalidates reuse correctly
+    (covered by the artifact-level fingerprint tests in test_e2e_scale.py).
+    """
+    from sv_pgs.artifact import ModelArtifact, save_artifact
+    from sv_pgs.config import VariantClass
+    from sv_pgs.data import TieMap, TieGroup
+
+    fit_calls: list[str] = []
+    load_calls: list[str] = []
+
+    class FakeBayesianPGS:
+        def __init__(self, config: ModelConfig) -> None:
+            self.config = config
+            self.state = None
+
+        @classmethod
+        def load(cls, path: Path) -> "FakeBayesianPGS":
+            load_calls.append(str(path))
+            instance = cls(ModelConfig(trait_type=TraitType.BINARY, max_outer_iterations=3))
+            instance.state = SimpleNamespace(
+                active_variant_indices=np.array([0], dtype=np.int32),
+                fit_result=SimpleNamespace(
+                    validation_history=[],
+                    selected_iteration_count=int(instance.config.max_outer_iterations),
+                ),
+            )
+            return instance
+
+        def fit(self, genotypes, covariates, targets, variant_records, **_kwargs):
+            fit_calls.append("fit")
+            self.state = SimpleNamespace(
+                active_variant_indices=np.array([0], dtype=np.int32),
+                fit_result=SimpleNamespace(
+                    validation_history=[],
+                    selected_iteration_count=int(self.config.max_outer_iterations),
+                ),
+            )
+            return self
+
+        def export(self, path: Path, *, fit_fingerprint: str = "") -> None:
+            # Write a real artifact so the next call can detect+reuse it.
+            artifact = ModelArtifact(
+                config=self.config,
+                records=[
+                    VariantRecord(
+                        variant_id="variant_0",
+                        variant_class=VariantClass.SNV,
+                        chromosome="1",
+                        position=100,
+                    )
+                ],
+                means=np.zeros(1, dtype=np.float32),
+                scales=np.ones(1, dtype=np.float32),
+                alpha=np.zeros(0, dtype=np.float32),
+                beta_reduced=np.zeros(1, dtype=np.float32),
+                beta_full=np.zeros(1, dtype=np.float32),
+                beta_variance=np.ones(1, dtype=np.float32),
+                tie_map=TieMap(
+                    kept_indices=np.array([0], dtype=np.int32),
+                    original_to_reduced=np.array([0], dtype=np.int32),
+                    reduced_to_group=[
+                        TieGroup(
+                            representative_index=0,
+                            member_indices=np.array([0], dtype=np.int32),
+                            signs=np.array([1.0], dtype=np.float32),
+                        )
+                    ],
+                ),
+                sigma_e2=1.0,
+                prior_scales=np.ones(1, dtype=np.float32),
+                global_scale=1.0,
+                class_tpb_shape_a={VariantClass.SNV: 1.0},
+                class_tpb_shape_b={VariantClass.SNV: 0.5},
+                scale_model_coefficients=np.zeros(1, dtype=np.float32),
+                scale_model_feature_names=["type_offset::snv"],
+                objective_history=[-1.0],
+                validation_history=[],
+                fit_fingerprint=fit_fingerprint,
+            )
+            save_artifact(path, artifact)
+
+        def coefficient_table(self, *, nonzero_only: bool = False, minimum_abs_beta: float = 0.0):
+            return []
+
+        def training_decision_components(self):
+            return (
+                np.full(8, 0.2, dtype=np.float32),
+                np.full(8, 0.1, dtype=np.float32),
+            )
+
+        def decision_components(self, genotypes, covariates):
+            sample_count = int(genotypes.shape[0])
+            return (
+                np.full(sample_count, 0.2, dtype=np.float32),
+                np.full(sample_count, 0.1, dtype=np.float32),
+            )
+
+    monkeypatch.setattr(pipeline_module, "BayesianPGS", FakeBayesianPGS)
+
+    dataset = io_module.LoadedDataset(
+        sample_ids=[f"sample_{index}" for index in range(8)],
+        genotypes=np.zeros((8, 1), dtype=np.float32),
+        covariates=np.zeros((8, 0), dtype=np.float32),
+        targets=np.array([0.0, 1.0, 0.0, 1.0, 0.0, 1.0, 0.0, 1.0], dtype=np.float32),
+        variant_records=[VariantRecord("variant_0", VariantClass.SNV, "1", 100)],
+        variant_stats=VariantStatistics(
+            means=np.zeros(1, dtype=np.float32),
+            scales=np.ones(1, dtype=np.float32),
+            allele_frequencies=np.array([0.25], dtype=np.float32),
+            support_counts=np.full(1, 8, dtype=np.int32),
+        ),
+        variant_stats_minimum_scale=ModelConfig().minimum_scale,
+    )
+    config = ModelConfig(trait_type=TraitType.BINARY, max_outer_iterations=3)
+    output_dir = tmp_path / "run"
+
+    # First call: fit runs.
+    run_training_pipeline(dataset=dataset, config=config, output_dir=output_dir)
+    assert fit_calls == ["fit"], "first call must fit"
+    assert (output_dir / "artifact" / "arrays.npz").exists()
+
+    # Second call: artifact already there, fit must be skipped.
+    run_training_pipeline(dataset=dataset, config=config, output_dir=output_dir)
+    assert fit_calls == ["fit"], "second call with identical inputs must reuse the artifact and skip fit"
+    assert load_calls, "second call must have invoked BayesianPGS.load"
+
+
+def test_run_training_pipeline_does_not_reuse_artifact_when_config_differs(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """Changing a fingerprint-relevant config field must invalidate reuse."""
+    from sv_pgs.artifact import ModelArtifact, save_artifact
+    from sv_pgs.config import VariantClass
+    from sv_pgs.data import TieMap, TieGroup
+
+    fit_calls: list[str] = []
+
+    class FakeBayesianPGS:
+        def __init__(self, config: ModelConfig) -> None:
+            self.config = config
+            self.state = None
+
+        def fit(self, genotypes, covariates, targets, variant_records, **_kwargs):
+            fit_calls.append("fit")
+            self.state = SimpleNamespace(
+                active_variant_indices=np.array([0], dtype=np.int32),
+                fit_result=SimpleNamespace(
+                    validation_history=[],
+                    selected_iteration_count=int(self.config.max_outer_iterations),
+                ),
+            )
+            return self
+
+        def export(self, path: Path, *, fit_fingerprint: str = "") -> None:
+            save_artifact(path, ModelArtifact(
+                config=self.config,
+                records=[VariantRecord("variant_0", VariantClass.SNV, "1", 100)],
+                means=np.zeros(1, dtype=np.float32),
+                scales=np.ones(1, dtype=np.float32),
+                alpha=np.zeros(0, dtype=np.float32),
+                beta_reduced=np.zeros(1, dtype=np.float32),
+                beta_full=np.zeros(1, dtype=np.float32),
+                beta_variance=np.ones(1, dtype=np.float32),
+                tie_map=TieMap(
+                    kept_indices=np.array([0], dtype=np.int32),
+                    original_to_reduced=np.array([0], dtype=np.int32),
+                    reduced_to_group=[TieGroup(
+                        representative_index=0,
+                        member_indices=np.array([0], dtype=np.int32),
+                        signs=np.array([1.0], dtype=np.float32),
+                    )],
+                ),
+                sigma_e2=1.0,
+                prior_scales=np.ones(1, dtype=np.float32),
+                global_scale=1.0,
+                class_tpb_shape_a={VariantClass.SNV: 1.0},
+                class_tpb_shape_b={VariantClass.SNV: 0.5},
+                scale_model_coefficients=np.zeros(1, dtype=np.float32),
+                scale_model_feature_names=["type_offset::snv"],
+                objective_history=[-1.0],
+                validation_history=[],
+                fit_fingerprint=fit_fingerprint,
+            ))
+
+        def coefficient_table(self, *, nonzero_only: bool = False, minimum_abs_beta: float = 0.0):
+            return []
+
+        def training_decision_components(self):
+            return (np.zeros(8, dtype=np.float32), np.zeros(8, dtype=np.float32))
+
+        def decision_components(self, genotypes, covariates):
+            n = int(genotypes.shape[0])
+            return (np.zeros(n, dtype=np.float32), np.zeros(n, dtype=np.float32))
+
+    monkeypatch.setattr(pipeline_module, "BayesianPGS", FakeBayesianPGS)
+
+    dataset = io_module.LoadedDataset(
+        sample_ids=[f"sample_{index}" for index in range(8)],
+        genotypes=np.zeros((8, 1), dtype=np.float32),
+        covariates=np.zeros((8, 0), dtype=np.float32),
+        targets=np.array([0.0, 1.0, 0.0, 1.0, 0.0, 1.0, 0.0, 1.0], dtype=np.float32),
+        variant_records=[VariantRecord("variant_0", VariantClass.SNV, "1", 100)],
+        variant_stats=VariantStatistics(
+            means=np.zeros(1, dtype=np.float32),
+            scales=np.ones(1, dtype=np.float32),
+            allele_frequencies=np.array([0.25], dtype=np.float32),
+            support_counts=np.full(1, 8, dtype=np.int32),
+        ),
+        variant_stats_minimum_scale=ModelConfig().minimum_scale,
+    )
+    output_dir = tmp_path / "run"
+
+    run_training_pipeline(
+        dataset=dataset,
+        config=ModelConfig(trait_type=TraitType.BINARY, max_outer_iterations=3),
+        output_dir=output_dir,
+    )
+    # Different convergence_tolerance → different fingerprint → must refit.
+    run_training_pipeline(
+        dataset=dataset,
+        config=ModelConfig(trait_type=TraitType.BINARY, max_outer_iterations=3, convergence_tolerance=5e-5),
+        output_dir=output_dir,
+    )
+    assert fit_calls == ["fit", "fit"], "config change must invalidate fingerprint reuse"
 
 
 def test_write_predictions_and_summary_binary_uses_single_decision_pass(tmp_path: Path):

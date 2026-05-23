@@ -32,6 +32,11 @@ class ModelArtifact:
     scale_model_feature_names: list[str]
     objective_history: list[float]
     validation_history: list[float]
+    # SHA-256 of (genotype shape, variant records, covariates, targets, config)
+    # captured at fit time. Empty string means "unknown / legacy artifact" —
+    # auto-reuse paths must treat that as a miss. Populated via
+    # ``BayesianPGS.export(..., fit_fingerprint=...)``.
+    fit_fingerprint: str = ""
 
     def __post_init__(self) -> None:
         self.records = normalize_variant_records(self.records)
@@ -118,6 +123,7 @@ def save_artifact(path: str | Path, artifact: ModelArtifact) -> None:
         "scale_model_feature_names": artifact.scale_model_feature_names,
         "objective_history": artifact.objective_history,
         "validation_history": artifact.validation_history,
+        "fit_fingerprint": artifact.fit_fingerprint,
     }
     (root / "metadata.json").write_text(json.dumps(payload, indent=2), encoding="utf-8")
 
@@ -164,7 +170,32 @@ def load_artifact(path: str | Path) -> ModelArtifact:
         scale_model_feature_names=[str(feature_name) for feature_name in payload["scale_model_feature_names"]],
         objective_history=[float(value) for value in payload["objective_history"]],
         validation_history=[float(value) for value in payload["validation_history"]],
+        fit_fingerprint=str(payload.get("fit_fingerprint", "")),
     )
+
+
+def try_load_artifact_if_fingerprint_matches(
+    path: str | Path,
+    expected_fingerprint: str,
+) -> ModelArtifact | None:
+    """Return the artifact at ``path`` iff its ``fit_fingerprint`` matches.
+
+    Returns ``None`` when the artifact is absent, malformed, missing a
+    fingerprint, or the fingerprint differs. Callers use this to decide
+    whether to skip a refit and reuse a prior run's outputs.
+    """
+    root = Path(path)
+    if not (root / "arrays.npz").exists() or not (root / "metadata.json").exists():
+        return None
+    if not expected_fingerprint:
+        return None
+    try:
+        artifact = load_artifact(root)
+    except (OSError, ValueError, KeyError):
+        return None
+    if not artifact.fit_fingerprint or artifact.fit_fingerprint != expected_fingerprint:
+        return None
+    return artifact
 
 
 def _config_to_json(config: ModelConfig) -> dict[str, Any]:

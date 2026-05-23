@@ -1395,7 +1395,7 @@ class BayesianPGS:
             return (np.asarray(stable_sigmoid(linear_predictor), dtype=np.float32) >= 0.5).astype(np.int32)
         return linear_predictor
 
-    def export(self, path: str | Path) -> None:
+    def export(self, path: str | Path, *, fit_fingerprint: str = "") -> None:
         fitted_state = self._require_state()
         artifact = ModelArtifact(
             config=self.config,
@@ -1416,6 +1416,7 @@ class BayesianPGS:
             scale_model_feature_names=fitted_state.fit_result.scale_model_feature_names,
             objective_history=fitted_state.fit_result.objective_history,
             validation_history=fitted_state.fit_result.validation_history,
+            fit_fingerprint=fit_fingerprint,
         )
         save_artifact(path, artifact)
 

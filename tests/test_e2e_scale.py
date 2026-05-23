@@ -5,7 +5,12 @@ from pathlib import Path
 import numpy as np
 from sklearn.metrics import r2_score, roc_auc_score
 
-from sv_pgs.artifact import ModelArtifact, load_artifact, save_artifact
+from sv_pgs.artifact import (
+    ModelArtifact,
+    load_artifact,
+    save_artifact,
+    try_load_artifact_if_fingerprint_matches,
+)
 from sv_pgs.benchmark import run_benchmark_suite
 from sv_pgs.config import BenchmarkConfig, ModelConfig, TraitType, VariantClass
 from sv_pgs.data import TieGroup, TieMap, VariantRecord
@@ -352,3 +357,69 @@ def test_artifact_roundtrip_preserves_full_variant_metadata(tmp_path: Path):
         "regulatory_mix": {"enhancer": 0.25, "promoter": 0.75}
     }
     assert restored_artifact.records[1].prior_continuous_features == {"constraint_score": 0.8}
+
+
+def _minimal_artifact(fingerprint: str = "") -> ModelArtifact:
+    return ModelArtifact(
+        config=ModelConfig(),
+        records=[VariantRecord(variant_id="v0", variant_class=VariantClass.SNV, chromosome="1", position=1)],
+        means=np.zeros(1, dtype=np.float32),
+        scales=np.ones(1, dtype=np.float32),
+        alpha=np.zeros(1, dtype=np.float32),
+        beta_reduced=np.zeros(1, dtype=np.float32),
+        beta_full=np.zeros(1, dtype=np.float32),
+        beta_variance=np.ones(1, dtype=np.float32),
+        tie_map=TieMap(
+            kept_indices=np.array([0], dtype=np.int32),
+            original_to_reduced=np.array([0], dtype=np.int32),
+            reduced_to_group=[
+                TieGroup(
+                    representative_index=0,
+                    member_indices=np.array([0], dtype=np.int32),
+                    signs=np.array([1.0], dtype=np.float32),
+                )
+            ],
+        ),
+        sigma_e2=1.0,
+        prior_scales=np.ones(1, dtype=np.float32),
+        global_scale=1.0,
+        class_tpb_shape_a={VariantClass.SNV: 1.0},
+        class_tpb_shape_b={VariantClass.SNV: 0.5},
+        scale_model_coefficients=np.zeros(1, dtype=np.float32),
+        scale_model_feature_names=["type_offset::snv"],
+        objective_history=[-1.0],
+        validation_history=[],
+        fit_fingerprint=fingerprint,
+    )
+
+
+def test_artifact_fit_fingerprint_roundtrips_via_metadata(tmp_path: Path):
+    artifact = _minimal_artifact(fingerprint="cafebabe1234")
+    save_artifact(tmp_path / "art", artifact)
+    restored = load_artifact(tmp_path / "art")
+    assert restored.fit_fingerprint == "cafebabe1234"
+
+
+def test_try_load_artifact_if_fingerprint_matches_returns_artifact_on_match(tmp_path: Path):
+    save_artifact(tmp_path / "art", _minimal_artifact(fingerprint="abc123"))
+    assert try_load_artifact_if_fingerprint_matches(tmp_path / "art", "abc123") is not None
+
+
+def test_try_load_artifact_if_fingerprint_matches_rejects_mismatch(tmp_path: Path):
+    save_artifact(tmp_path / "art", _minimal_artifact(fingerprint="abc123"))
+    assert try_load_artifact_if_fingerprint_matches(tmp_path / "art", "different") is None
+
+
+def test_try_load_artifact_if_fingerprint_matches_rejects_empty_fingerprints(tmp_path: Path):
+    # Empty fingerprint on either side must miss — otherwise legacy artifacts
+    # (saved before the fingerprint field existed) would falsely match any
+    # caller passing an empty expected value, silently reusing a stale fit.
+    save_artifact(tmp_path / "art_empty", _minimal_artifact(fingerprint=""))
+    assert try_load_artifact_if_fingerprint_matches(tmp_path / "art_empty", "") is None
+    assert try_load_artifact_if_fingerprint_matches(tmp_path / "art_empty", "abc") is None
+    save_artifact(tmp_path / "art_named", _minimal_artifact(fingerprint="abc"))
+    assert try_load_artifact_if_fingerprint_matches(tmp_path / "art_named", "") is None
+
+
+def test_try_load_artifact_if_fingerprint_matches_returns_none_when_missing(tmp_path: Path):
+    assert try_load_artifact_if_fingerprint_matches(tmp_path / "nope", "anything") is None

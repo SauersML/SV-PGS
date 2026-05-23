@@ -1736,6 +1736,12 @@ def fit_variational_em(
     genetic_linear_predictor: NDArray | None = None
     best_genetic_linear_predictor: NDArray | None = None
     restricted_posterior_warm_start = _RestrictedPosteriorWarmStart()
+    # Keep the exact-variant full GPU matrix cache enabled for the entire
+    # outer EM loop so it can be reused across blocks and across iterations
+    # whenever the genotype matrix object identity matches. The cache is
+    # token-keyed on id(genotype_matrix), so it self-invalidates for block
+    # subsets without needing explicit clears.
+    restricted_posterior_warm_start.exact_variant_full_matrix_cache_enabled = True
     fit_converged = False
     final_parameter_change: float | None = None
     final_predictor_change: float | None = None
@@ -4298,10 +4304,6 @@ def _binary_posterior_state(
         else restricted_posterior_warm_start
     )
     warm_start.exact_variant_full_matrix_cache_enabled = True
-    warm_start.exact_variant_full_matrix_token = None
-    warm_start.exact_variant_full_matrix_shape = None
-    warm_start.exact_variant_full_matrix_dtype = None
-    warm_start.exact_variant_full_matrix_gpu = None
     current_linear_predictor_gpu = None
     best_linear_predictor_gpu = None
     log(f"      binary setup: {standardized_genotypes.shape[1]} variants, {standardized_genotypes.shape[0]} samples  mem={mem()}")
@@ -4734,7 +4736,6 @@ def _binary_posterior_state(
     )
     laplace_objective = final_objective - 0.5 * logdet_hessian
     log(f"      binary posterior done: laplace_obj={laplace_objective:.4f}  final_obj={final_objective:.4f}  logdet_hessian={logdet_hessian:.4f}  mem={mem()}")
-    _clear_exact_variant_full_matrix_gpu_cache(warm_start)
     return (
         final_parameters[:covariate_count],
         final_parameters[covariate_count:],
@@ -6772,6 +6773,15 @@ def _cached_exact_variant_full_matrix_gpu(
         and warm_start.exact_variant_full_matrix_gpu is not None
     ):
         return warm_start.exact_variant_full_matrix_gpu
+    # Cache miss with caching enabled: drop the stale slot BEFORE allocating
+    # the replacement, so we don't double-buffer ~n_samples*block_size*4 bytes
+    # of GPU memory during the overlap. On T4 with AoU-sized blocks each
+    # full-X is ~8GB, so holding both would OOM.
+    if cache_enabled and warm_start is not None and warm_start.exact_variant_full_matrix_gpu is not None:
+        warm_start.exact_variant_full_matrix_gpu = None
+        warm_start.exact_variant_full_matrix_token = None
+        warm_start.exact_variant_full_matrix_shape = None
+        warm_start.exact_variant_full_matrix_dtype = None
     cached_standardized_gpu = _cupy_cache_standardized_columns(
         genotype_matrix._cupy_cache,
         slice(None),
@@ -8104,8 +8114,19 @@ def _solve_restricted_exact_variant_space(
             for col_idx, col_start in enumerate(range(0, variant_count, col_chunk)):
                 col_end = min(col_start + col_chunk, variant_count)
                 weighted_chunk = inverse_diagonal_noise_gpu[:, None] * X_gpu_compute[:, col_start:col_end]
-                variant_precision_gpu[:, col_start:col_end] = X_gpu_compute.T @ weighted_chunk
-                del weighted_chunk
+                # Symmetric optimization: X^T W X is symmetric, so compute only
+                # the lower-triangle slab (rows col_start..variant_count) and
+                # mirror to the upper triangle from already-written entries.
+                # Halves the GEMM flops for this loop vs. computing the full
+                # p × col_chunk slab — matches the strategy the tiled path at
+                # line ~8137 already uses.
+                lower_slab = X_gpu_compute[:, col_start:].T @ weighted_chunk
+                variant_precision_gpu[col_start:, col_start:col_end] = lower_slab
+                if col_start > 0:
+                    variant_precision_gpu[:col_start, col_start:col_end] = (
+                        variant_precision_gpu[col_start:col_end, :col_start].T
+                    )
+                del weighted_chunk, lower_slab
                 if (col_idx + 1) % max(n_col_chunks // 4, 1) == 0 or col_idx == n_col_chunks - 1:
                     log(
                         f"      Gram matrix: {col_end:,}/{variant_count:,} cols "
