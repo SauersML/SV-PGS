@@ -1844,6 +1844,82 @@ def test_gpu_native_linear_algebra_matches_dense_reference(monkeypatch: pytest.M
     np.testing.assert_allclose(np.asarray(gpu_transpose_result, dtype=np.float64), dense_matrix.T @ sample_matrix)
 
 
+def test_multi_gpu_sharded_cache_linear_algebra_matches_dense_reference():
+    class _FakeCupy:
+        float32 = np.float32
+        float64 = np.float64
+
+        @staticmethod
+        def asarray(array, dtype=None):
+            return np.asarray(array, dtype=dtype)
+
+        @staticmethod
+        def zeros(shape, dtype=None):
+            return np.zeros(shape, dtype=dtype)
+
+        @staticmethod
+        def empty(shape, dtype=None, order=None):
+            return np.empty(shape, dtype=dtype, order="C" if order is None else order)
+
+        @staticmethod
+        def concatenate(arrays, axis=0):
+            return np.concatenate(arrays, axis=axis)
+
+        @staticmethod
+        def any(array):
+            return np.any(array)
+
+    raw_matrix = np.array(
+        [
+            [0.0, 1.0, np.nan, 0.0],
+            [1.0, 0.0, 2.0, 1.0],
+            [2.0, 1.0, 1.0, 0.0],
+            [np.nan, 2.0, 0.0, 1.0],
+        ],
+        dtype=np.float32,
+    )
+    means = np.array([1.0, 1.0, 1.0, 0.5], dtype=np.float32)
+    scales = np.array([0.5, 1.0, 1.0, 0.5], dtype=np.float32)
+    standardized = as_raw_genotype_matrix(raw_matrix).standardized(means, scales)
+    dense_matrix = standardized.materialize().astype(np.float64, copy=False)
+    fake_cupy = _FakeCupy()
+    standardized._cupy_cache = genotype_module._CupyShardedStandardizedCache(
+        (
+            genotype_module._CupyDeviceCacheShard(
+                device_id=0,
+                column_start=0,
+                cache=dense_matrix[:, :2].astype(np.float32, copy=False),
+            ),
+            genotype_module._CupyDeviceCacheShard(
+                device_id=1,
+                column_start=2,
+                cache=dense_matrix[:, 2:].astype(np.float32, copy=False),
+            ),
+        ),
+        cupy=fake_cupy,
+    )
+    standardized._dense_cache = None
+
+    variant_matrix = np.column_stack(
+        [
+            np.array([0.25, 0.0, 0.0, 1.25], dtype=np.float64),
+            np.array([1.0, -0.5, 0.25, 2.0], dtype=np.float64),
+        ]
+    )
+    sample_matrix = np.column_stack(
+        [
+            np.array([1.0, -0.5, 0.25, 2.0], dtype=np.float64),
+            np.array([-1.5, 0.0, 1.0, 0.5], dtype=np.float64),
+        ]
+    )
+
+    gpu_matmat_result = standardized.gpu_matmat(variant_matrix, cupy=fake_cupy, dtype=np.float64)
+    gpu_transpose_result = standardized.gpu_transpose_matmat(sample_matrix, cupy=fake_cupy, dtype=np.float64)
+
+    np.testing.assert_allclose(np.asarray(gpu_matmat_result, dtype=np.float64), dense_matrix @ variant_matrix)
+    np.testing.assert_allclose(np.asarray(gpu_transpose_result, dtype=np.float64), dense_matrix.T @ sample_matrix)
+
+
 def test_dense_gpu_cache_prefers_jax_dense_ops_without_cupy_bridge(monkeypatch: pytest.MonkeyPatch):
     raw_matrix = np.array(
         [

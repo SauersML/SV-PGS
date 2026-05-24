@@ -762,7 +762,7 @@ def _decode_payload(
     # lut[packed] → (variant_count, bytes_per_variant, 4) int8. One alloc,
     # one indexing op. Reshape collapses the last two axes back into a flat
     # padded-sample axis; the .T returns the F-order view the caller wants.
-    decoded = lut[packed]  # noqa: E501 — main allocation
+    decoded = lut[packed]
     result: I8Array = decoded.reshape(variant_count, bytes_per_variant * 4)[:, :iid_count].T
     return result
 

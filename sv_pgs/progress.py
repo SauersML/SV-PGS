@@ -135,6 +135,8 @@ def log_autotune_banner() -> None:
     state = _snapshot_autotune_state()
     parts = [
         f"cpu_count={state['cpu_count']}",
+        f"cuda_devices={state['cuda_device_count']}",
+        f"multi_gpu_sharding={'enabled' if state['cuda_device_count'] >= 2 else 'disabled'}",
         f"host_ram_free={_format_bytes(state['host_ram_available_bytes'])}",
         f"gpu_free={_format_bytes(state['gpu_free_bytes'])}",
         f"bed_batch_bytes={_format_bytes(state['bed_reader_target_batch_bytes'])}",
@@ -148,7 +150,7 @@ def log_autotune_banner() -> None:
     if SELECTED_CUDA_DEVICE is not None:
         device_id, free_bytes, total_bytes = SELECTED_CUDA_DEVICE
         parts.append(
-            f"cuda_pinned=device{device_id}({_format_bytes(free_bytes)}_free/"
+            f"cuda_most_free=device{device_id}({_format_bytes(free_bytes)}_free/"
             f"{_format_bytes(total_bytes)})"
         )
     log("auto-tune: " + " ".join(parts))
@@ -277,8 +279,11 @@ def _process_cpu_seconds() -> float:
 
 def _cupy_mempool_snapshot() -> str:
     try:
-        import cupy
+        from sv_pgs.genotype import _cupy_runtime_error_classes, _try_import_cupy
     except ImportError:
+        return "cupy=unavailable"
+    cupy = _try_import_cupy()
+    if cupy is None:
         return "cupy=unavailable"
     try:
         pool = cupy.get_default_memory_pool()
@@ -291,7 +296,7 @@ def _cupy_mempool_snapshot() -> str:
             + f"cupy_pool={_format_bytes(total)} "
             + f"cupy_pinned_free_blocks={pinned_used}"
         )
-    except (RuntimeError, AttributeError) as error:
+    except _cupy_runtime_error_classes(cupy) as error:
         return f"cupy_mempool_error={error}"
 
 
@@ -301,6 +306,9 @@ def _pynvml_snapshot() -> str | None:
         import pynvml  # type: ignore[import-not-found]
     except ImportError:
         return None
+    nvml_error = getattr(pynvml, "NVMLError", RuntimeError)
+    if not isinstance(nvml_error, type):
+        nvml_error = RuntimeError
     try:
         pynvml.nvmlInit()
         try:
@@ -323,9 +331,9 @@ def _pynvml_snapshot() -> str | None:
         finally:
             try:
                 pynvml.nvmlShutdown()
-            except Exception:  # noqa: BLE001
+            except (AttributeError, RuntimeError, nvml_error):
                 pass
-    except Exception as error:  # noqa: BLE001 -- pynvml raises its own NVMLError
+    except (AttributeError, RuntimeError, nvml_error) as error:
         return f"pynvml_error={error}"
 
 
@@ -473,4 +481,3 @@ def start_heartbeat(interval_seconds: float = 60.0) -> None:
     _heartbeat_thread = thread
     thread.start()
     log(f"heartbeat sampler started (every {interval_seconds:.0f}s)")
-

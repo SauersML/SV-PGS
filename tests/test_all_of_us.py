@@ -466,12 +466,10 @@ def test_download_ancestry_preds_uses_documented_remote_path(monkeypatch, tmp_pa
     assert local_path == aou_runner.local_ancestry_predictions_path(work_dir)
     assert local_path.parent == tmp_path / ".sv_pgs_cache" / "aou_ancestry"
     assert local_path.exists()
-    assert copied == [
-        (
-            "gs://bucket/cdr/wgs/short_read/snpindel/aux/ancestry/ancestry_preds.tsv",
-            str(local_path) + ".partial",
-        )
+    assert [src for src, _dst in copied] == [
+        "gs://bucket/cdr/wgs/short_read/snpindel/aux/ancestry/ancestry_preds.tsv"
     ]
+    _assert_unique_partial_path(copied[0][1], local_path)
 
 
 def test_merge_pcs_into_sample_table_recomputes_existing_output_for_requested_n_pcs(tmp_path: Path):
@@ -559,16 +557,12 @@ def test_download_sv_vcf_downloads_one_chromosome_at_a_time(monkeypatch, tmp_pat
     local_vcf = aou_runner.download_sv_vcf(22, work_dir)
 
     assert local_vcf == cache_dir / "AoU_srWGS_SV.v8.chr22.vcf.gz"
-    assert copied == [
-        (
-            "gs://bucket/cdr/wgs/short_read/structural_variants/vcf/full/AoU_srWGS_SV.v8.chr22.vcf.gz",
-            str(cache_dir / "AoU_srWGS_SV.v8.chr22.vcf.gz.partial"),
-        ),
-        (
-            "gs://bucket/cdr/wgs/short_read/structural_variants/vcf/full/AoU_srWGS_SV.v8.chr22.vcf.gz.tbi",
-            str(cache_dir / "AoU_srWGS_SV.v8.chr22.vcf.gz.tbi.partial"),
-        ),
+    assert [src for src, _dst in copied] == [
+        "gs://bucket/cdr/wgs/short_read/structural_variants/vcf/full/AoU_srWGS_SV.v8.chr22.vcf.gz",
+        "gs://bucket/cdr/wgs/short_read/structural_variants/vcf/full/AoU_srWGS_SV.v8.chr22.vcf.gz.tbi",
     ]
+    _assert_unique_partial_path(copied[0][1], cache_dir / "AoU_srWGS_SV.v8.chr22.vcf.gz")
+    _assert_unique_partial_path(copied[1][1], cache_dir / "AoU_srWGS_SV.v8.chr22.vcf.gz.tbi")
     assert local_vcf.exists()
     assert Path(f"{local_vcf}.tbi").exists()
 
@@ -604,12 +598,10 @@ def test_download_sv_vcf_downloads_missing_index_for_existing_vcf(monkeypatch, t
     assert sized == [
         "gs://bucket/cdr/wgs/short_read/structural_variants/vcf/full/AoU_srWGS_SV.v8.chr22.vcf.gz.tbi"
     ]
-    assert copied == [
-        (
-            "gs://bucket/cdr/wgs/short_read/structural_variants/vcf/full/AoU_srWGS_SV.v8.chr22.vcf.gz.tbi",
-            str(cache_dir / "AoU_srWGS_SV.v8.chr22.vcf.gz.tbi.partial"),
-        )
+    assert [src for src, _dst in copied] == [
+        "gs://bucket/cdr/wgs/short_read/structural_variants/vcf/full/AoU_srWGS_SV.v8.chr22.vcf.gz.tbi"
     ]
+    _assert_unique_partial_path(copied[0][1], cache_dir / "AoU_srWGS_SV.v8.chr22.vcf.gz.tbi")
 
 
 def test_merge_pcs_into_sample_table_raises_when_ids_do_not_overlap(tmp_path: Path):
@@ -824,6 +816,7 @@ def test_run_all_of_us_skips_existing_fit_only_when_run_metadata_matches(monkeyp
         "sample_id\tperson_id\ttarget\tage_at_observation_start\tgender_concept_id\trace_concept_id\tethnicity_concept_id\n",
         encoding="utf-8",
     )
+    _write_sample_metadata_sidecar(sample_table_path)
     ancestry_path = tmp_path / "ancestry_preds.tsv"
     ancestry_path.write_text("research_id\tpca_features\n1\t[0.1,0.2]\n", encoding="utf-8")
     with gzip.open(tmp_path / "summary.json.gz", "wt", encoding="utf-8") as handle:
@@ -904,6 +897,7 @@ def test_run_all_of_us_reruns_when_existing_fit_metadata_differs(monkeypatch, tm
         "sample_id\tperson_id\ttarget\tage_at_observation_start\tgender_concept_id\trace_concept_id\tethnicity_concept_id\n",
         encoding="utf-8",
     )
+    _write_sample_metadata_sidecar(sample_table_path)
     ancestry_path = tmp_path / "ancestry_preds.tsv"
     ancestry_path.write_text("research_id\tpca_features\n1\t[0.1,0.2,0.3]\n", encoding="utf-8")
     with gzip.open(tmp_path / "summary.json.gz", "wt", encoding="utf-8") as handle:
@@ -998,6 +992,7 @@ def test_run_all_of_us_raises_when_parallel_precache_fails(monkeypatch, tmp_path
         "sample_id\tperson_id\ttarget\tage_at_observation_start\tgender_concept_id\trace_concept_id\tethnicity_concept_id\n",
         encoding="utf-8",
     )
+    _write_sample_metadata_sidecar(sample_table_path)
     ancestry_path = tmp_path / "ancestry_preds.tsv"
     ancestry_path.write_text("research_id\tpca_features\n1\t[0.1,0.2]\n", encoding="utf-8")
     vcf_path = tmp_path / "AoU_srWGS_SV.v8.chr1.vcf.gz"
@@ -1042,6 +1037,19 @@ def _read_tsv_rows(path: Path) -> list[dict[str, str]]:
     with opener(path, "rt", encoding="utf-8", newline="") as handle:
         reader = csv.DictReader(handle, delimiter="\t")
         return [{str(key): "" if value is None else str(value) for key, value in row.items()} for row in reader]
+
+
+def _assert_unique_partial_path(actual: str, final_path: Path) -> None:
+    assert Path(actual).parent == final_path.parent
+    assert Path(actual).name.startswith(final_path.name + ".partial.")
+    assert Path(actual).name != final_path.name + ".partial"
+
+
+def _write_sample_metadata_sidecar(sample_table_path: Path) -> None:
+    sample_table_path.with_suffix(sample_table_path.suffix + ".metadata.json").write_text(
+        "{}\n",
+        encoding="utf-8",
+    )
 
 
 def _write_table(path: Path, header: tuple[str, ...], rows: tuple[tuple[str, ...], ...]) -> None:

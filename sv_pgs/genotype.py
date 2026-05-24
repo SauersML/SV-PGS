@@ -70,6 +70,28 @@ def _detect_available_host_ram_bytes() -> int:
     return _AUTO_TUNE_HOST_RAM_FALLBACK_BYTES
 
 
+def _cupy_runtime_error_classes(cupy: Any) -> tuple[type[BaseException], ...]:
+    runtime = getattr(getattr(cupy, "cuda", None), "runtime", None)
+    cuda_error = getattr(runtime, "CUDARuntimeError", None)
+    classes: list[type[BaseException]] = [
+        AttributeError,
+        OSError,
+        RuntimeError,
+        TypeError,
+        ValueError,
+    ]
+    if isinstance(cuda_error, type) and issubclass(cuda_error, BaseException) and cuda_error not in classes:
+        classes.append(cuda_error)
+    return tuple(classes)
+
+
+def _cupy_runtime_usable(cupy: Any) -> bool:
+    try:
+        return int(cupy.cuda.runtime.getDeviceCount()) > 0
+    except _cupy_runtime_error_classes(cupy):
+        return False
+
+
 def _detect_gpu_free_bytes() -> int:
     """Best-effort GPU free-memory probe via CuPy. Returns 0 if no GPU."""
     try:
@@ -79,7 +101,19 @@ def _detect_gpu_free_bytes() -> int:
     try:
         free, _total = cupy.cuda.runtime.memGetInfo()
         return int(free)
-    except (AttributeError, OSError, RuntimeError):
+    except _cupy_runtime_error_classes(cupy):
+        return 0
+
+
+def _detect_cuda_device_count() -> int:
+    """Best-effort CUDA device count via CuPy. Returns 0 if no GPU."""
+    try:
+        import cupy  # type: ignore[import-not-found]
+    except (ImportError, OSError, RuntimeError):
+        return 0
+    try:
+        return max(int(cupy.cuda.runtime.getDeviceCount()), 0)
+    except _cupy_runtime_error_classes(cupy):
         return 0
 
 
@@ -144,6 +178,7 @@ def _snapshot_autotune_state() -> dict[str, int]:
     """Return current auto-tune detection snapshot for diagnostic logging."""
     host_ram = _detect_available_host_ram_bytes()
     gpu_free = _detect_gpu_free_bytes()
+    cuda_device_count = _detect_cuda_device_count()
     cpu_count = max(1, os.cpu_count() or 1)
     bed_bytes = compute_bed_reader_target_batch_bytes(
         host_ram_bytes=host_ram,
@@ -157,6 +192,7 @@ def _snapshot_autotune_state() -> dict[str, int]:
     )
     return {
         "cpu_count": cpu_count,
+        "cuda_device_count": int(cuda_device_count),
         "host_ram_available_bytes": int(host_ram),
         "gpu_free_bytes": int(gpu_free),
         "bed_reader_target_batch_bytes": int(bed_bytes),
@@ -1013,7 +1049,7 @@ def _try_import_cupy() -> Any | None:
     _cupy_checked = True
     try:
         import cupy
-        if cupy.cuda.runtime.getDeviceCount() > 0:
+        if _cupy_runtime_usable(cupy):
             _cupy_module = cupy
             return cupy
     except (ImportError, OSError, RuntimeError):
@@ -1025,7 +1061,7 @@ def _try_import_cupy() -> Any | None:
 def _cupy_device_count(cupy: Any) -> int:
     try:
         return max(int(cupy.cuda.runtime.getDeviceCount()), 0)
-    except (AttributeError, OSError, RuntimeError, TypeError, ValueError):
+    except _cupy_runtime_error_classes(cupy):
         return 1
 
 
@@ -1043,19 +1079,24 @@ def _cupy_device_context(cupy: Any, device_id: int) -> Iterator[None]:
         device = device_factory(int(device_id))
     except TypeError:
         device = device_factory()
-    try:
-        with device:
-            yield
-    except TypeError:
+    enter = getattr(device, "__enter__", None)
+    exit_method = getattr(device, "__exit__", None)
+    if enter is None or exit_method is None:
         device.use()
         yield
+        return
+    enter()
+    try:
+        yield
+    finally:
+        exit_method(None, None, None)
 
 
 def _cupy_device_synchronize(cupy: Any, device_id: int) -> None:
     with _cupy_device_context(cupy, device_id):
         try:
             cupy.cuda.Device().synchronize()
-        except (AttributeError, OSError, RuntimeError, TypeError):
+        except _cupy_runtime_error_classes(cupy):
             pass
 
 
@@ -1065,7 +1106,7 @@ def _cupy_current_device_id(cupy: Any) -> int:
         return 0
     try:
         return int(device_factory().id)
-    except (AttributeError, OSError, RuntimeError, TypeError, ValueError):
+    except _cupy_runtime_error_classes(cupy):
         return 0
 
 
@@ -1331,7 +1372,7 @@ def _try_upload_int8_parallel_memmap(
                     staged_tile = cupy.asarray(pinned_buf[:, col_start:col_end], dtype=gpu_int8_dtype)
                     gpu_destination[:, col_start:col_end] = staged_tile
             events[worker_idx] = stream.record()
-        except BaseException as exc:  # noqa: BLE001 - reraised on main thread
+        except BaseException as exc:
             errors.append(exc)
 
     log(
@@ -1900,7 +1941,7 @@ def _gpu_free_bytes(cupy: Any) -> int:
     try:
         free, _ = cupy.cuda.runtime.memGetInfo()
         return int(free)
-    except (AttributeError, OSError, RuntimeError):
+    except _cupy_runtime_error_classes(cupy):
         return 0
 
 
@@ -1914,7 +1955,7 @@ def _gpu_total_bytes(cupy: Any) -> int:
     try:
         _, total = cupy.cuda.runtime.memGetInfo()
         return int(total)
-    except (AttributeError, OSError, RuntimeError):
+    except _cupy_runtime_error_classes(cupy):
         return 0
 
 
@@ -1931,7 +1972,7 @@ def _gpu_effective_free_bytes(cupy: Any) -> int:
     try:
         pool = cupy.get_default_memory_pool()
         pool_free = int(pool.free_bytes())
-    except (AttributeError, OSError, RuntimeError):
+    except _cupy_runtime_error_classes(cupy):
         pool_free = 0
     return max(0, free + pool_free)
 
@@ -1963,12 +2004,12 @@ def _release_cupy_cached_memory(cupy: Any) -> None:
     try:
         pool = cupy.get_default_memory_pool()
         pool.free_all_blocks()
-    except (AttributeError, OSError, RuntimeError):
+    except _cupy_runtime_error_classes(cupy):
         pass
     try:
         pinned_pool = cupy.get_default_pinned_memory_pool()
         pinned_pool.free_all_blocks()
-    except (AttributeError, OSError, RuntimeError):
+    except _cupy_runtime_error_classes(cupy):
         pass
 
 

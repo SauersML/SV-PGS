@@ -21,19 +21,7 @@ os.environ["XLA_PYTHON_CLIENT_MEM_FRACTION"] = "0.1"
 
 
 def _most_free_cuda_device() -> tuple[int, int, int] | None:
-    """Pick the CUDA device with the most free VRAM and pin to it.
-
-    SPEC.md hard rule: "No multi-GPU support." On a multi-GPU box we must
-    not double-count VRAM (budget helpers like ``_gpu_total_bytes``
-    operate on the current device) or land on a busy GPU. Strategy:
-      1. Probe device count via CuPy.
-      2. Pick the device with the most free memory.
-      3. If count > 1, pin via ``CUDA_VISIBLE_DEVICES`` so JAX (imported
-         below) and CuPy both only see the chosen device — and call
-         ``_cupy.cuda.Device(0).use()`` as a belt-and-braces pin.
-    Honours an existing ``CUDA_VISIBLE_DEVICES`` to respect explicit
-    operator overrides.
-    """
+    """Return the currently most-free CUDA device without hiding other GPUs."""
     if "CUDA_VISIBLE_DEVICES" in os.environ:
         return None
     try:
@@ -61,12 +49,6 @@ def _most_free_cuda_device() -> tuple[int, int, int] | None:
             best_id = device_id
     if best_free < 0:
         return None
-    if device_count > 1:
-        os.environ["CUDA_VISIBLE_DEVICES"] = str(best_id)
-        try:
-            _cupy.cuda.Device(0).use()  # post-pin, chosen becomes index 0
-        except (AttributeError, OSError, RuntimeError):
-            pass
     return best_id, best_free, best_total
 
 

@@ -15,7 +15,7 @@ from sv_pgs.config import ModelConfig, TraitType
 from sv_pgs.evaluate import evaluate_all_of_us
 from sv_pgs.io import load_dataset_from_files
 from sv_pgs.pipeline import run_training_pipeline
-from sv_pgs.progress import gpu_memory_snapshot, jax_runtime_snapshot, log, nvidia_smi_snapshot
+from sv_pgs.progress import gpu_memory_snapshot, jax_runtime_snapshot, log, log_autotune_banner, nvidia_smi_snapshot
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -69,6 +69,17 @@ def build_parser() -> argparse.ArgumentParser:
     )
     aou_run_parser.add_argument("--n-pcs", type=int, default=10, help="Number of genomic PCs to include (default: 10).")
     aou_run_parser.add_argument("--random-seed", type=int, default=0)
+    aou_run_parser.add_argument(
+        "--max-parallel-gpus",
+        type=int,
+        default=None,
+        help=(
+            "For --all-diseases / --disease all, explicitly run multiple "
+            "diseases concurrently by pinning each subprocess to one GPU. "
+            "Default runs one disease at a time with all visible GPUs available "
+            "to the fit."
+        ),
+    )
     aou_run_parser.add_argument(
         "--variants",
         # Default is the joint model — array SNPs typically add the most
@@ -200,15 +211,17 @@ def main(argv: list[str] | None = None) -> int:
         if disease_value is None and not wants_all:
             raise ValueError("Either --disease or --all-diseases is required.")
         if wants_all:
-            run_all_of_us_all_diseases(
+            # Propagate the sweep's non-zero exit code so CI surfaces any
+            # per-disease subprocess failure instead of silently swallowing it.
+            return int(run_all_of_us_all_diseases(
                 chromosomes=chromosomes,
                 output_base=args.output_dir,
                 variant_metadata_path=args.variant_metadata,
                 n_pcs=args.n_pcs,
                 random_seed=args.random_seed,
                 variants=args.variants,
-            )
-            return 0
+                max_parallel_gpus=args.max_parallel_gpus,
+            ) or 0)
         assert disease_value is not None
         run_all_of_us(
             disease=disease_value,
@@ -247,6 +260,7 @@ def main(argv: list[str] | None = None) -> int:
     log(f"jax runtime: {jax_runtime_snapshot()}")
     log(f"gpu memory: {gpu_memory_snapshot()}")
     log(f"nvidia-smi: {nvidia_smi_snapshot()}")
+    log_autotune_banner()
     log(f"genotypes={args.genotypes} sample_table={args.sample_table} output_dir={args.output_dir}")
     log(f"genotype_format={args.genotype_format} sample_id_column={args.sample_id_column} target_column={args.target_column}")
     log(

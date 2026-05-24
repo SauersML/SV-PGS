@@ -1,4 +1,4 @@
-"""SV-PGS: single-device joint empirical-Bayes GLM for polygenic scoring with structural variants."""
+"""SV-PGS: multi-GPU joint empirical-Bayes GLM for polygenic scoring with structural variants."""
 
 from __future__ import annotations
 

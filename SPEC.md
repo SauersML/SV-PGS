@@ -10,7 +10,7 @@
 - Never silently fall back if a dependency is missing. Crash immediately.
 - Never silently swallow errors with bare `except Exception: pass`. If something fails, let it fail loud.
 - Only use UV, never pip.
-- No multi-GPU support.
+- Multi-GPU support is required. All visible CUDA devices must share resident genotype matmul work by column sharding.
 - Fully and unconditionally use JAX.
 - Do not restrict or cap the number of variants included arbitrarily.
 - Do not restrict or cap the number of samples included.

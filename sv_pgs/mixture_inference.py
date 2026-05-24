@@ -86,6 +86,7 @@ from sv_pgs.genotype import (
     StandardizedGenotypeMatrix,
     _call_gpu_materialization_budget_bytes,
     _cupy_cache_is_int8_standardized,
+    _cupy_cache_is_sharded,
     _cupy_cache_standardized_columns,
     _cupy_compute_dtype,
     _cupy_to_jax,
@@ -8496,6 +8497,13 @@ def _use_gpu_exact_variant_solve(
         return False
     sample_count = genotype_matrix.shape[0]
     cache_is_int8_standardized = _cupy_cache_is_int8_standardized(genotype_matrix._cupy_cache)
+    if _cupy_cache_is_sharded(genotype_matrix._cupy_cache):
+        return _gpu_exact_variant_tile_size(
+            cupy,
+            sample_count=sample_count,
+            variant_count=variant_count,
+            covariate_count=covariate_count,
+        ) > 0
     if _gpu_exact_variant_full_matrix_fits(
         cupy,
         sample_count=sample_count,
@@ -8749,14 +8757,16 @@ def _solve_restricted_exact_variant_space(
         gram_jitter = 1e-6 if is_mixed_precision else 1e-8
         cp_solve_triangular = _resolve_gpu_solve_triangular()
         cache_is_int8_standardized = _cupy_cache_is_int8_standardized(genotype_matrix._cupy_cache)
-        use_full_gpu_exact = _gpu_exact_variant_full_matrix_fits(
-            cp,
-            sample_count=sample_count,
-            variant_count=variant_count,
-            covariate_count=covariate_count,
-            cache_is_int8_standardized=cache_is_int8_standardized,
-            matrix_itemsize=compute_itemsize,
-        )
+        use_full_gpu_exact = False
+        if not _cupy_cache_is_sharded(genotype_matrix._cupy_cache):
+            use_full_gpu_exact = _gpu_exact_variant_full_matrix_fits(
+                cp,
+                sample_count=sample_count,
+                variant_count=variant_count,
+                covariate_count=covariate_count,
+                cache_is_int8_standardized=cache_is_int8_standardized,
+                matrix_itemsize=compute_itemsize,
+            )
         tiled_exact_batch_size = 0 if use_full_gpu_exact else _gpu_exact_variant_tile_size(
             cp,
             sample_count=sample_count,

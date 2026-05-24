@@ -1,6 +1,6 @@
 # SV-PGS
 
-Bayesian polygenic scoring for structural variants. Fits a joint empirical-Bayes GLM on GPU via CuPy (cuBLAS) with JAX for element-wise ops.
+Bayesian polygenic scoring for structural variants. Fits a joint empirical-Bayes GLM on all visible GPUs via CuPy (cuBLAS) with JAX for element-wise ops.
 
 ## All of Us Quickstart
 
@@ -37,7 +37,7 @@ That single command (with the default `--variants snp+sv`):
 4. Concatenates the requested chromosome data into one genome-wide training
    dataset, intersecting samples across the SNP and SV sources when both are
    loaded
-5. Fits one Bayesian PGS model on GPU across all requested chromosomes
+5. Fits one Bayesian PGS model across all visible GPUs and requested chromosomes
 6. Uses `--variant-metadata` annotations when supplied; it does not derive
    annotations from VCF INFO
 7. Reuses an existing fit only when the full AoU run configuration (including
@@ -100,6 +100,11 @@ sv2	0	0.15	missense	enhancer=0.2,promoter=0.8	protein_coding>intron
 uv run python -c "import jax; print('backend', jax.default_backend()); print('devices', jax.devices())"
 uv run python -c "import cupy as cp; print('cupy_devices', cp.cuda.runtime.getDeviceCount())"
 ```
+
+When two or more CUDA devices are visible, SV-PGS shards the resident genotype
+cache by variant columns and runs CuPy matmul shards concurrently across the
+devices. With two comparable GPUs, genotype matmul-heavy phases should approach
+2x single-GPU throughput once the cache is resident.
 
 ## Data
 

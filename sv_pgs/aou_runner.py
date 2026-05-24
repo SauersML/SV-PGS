@@ -1607,6 +1607,131 @@ def run_all_of_us(
     log("=== ALL OF US PIPELINE COMPLETE ===")
 
 
+def _detect_gpu_count() -> int:
+    """Best-effort GPU count via CuPy runtime.
+
+    Returns 0 when CuPy is missing, the CUDA driver/runtime isn't loadable,
+    or the host has no GPUs. Caller treats 0 as a signal to fall back to a
+    single sequential CPU run. We intentionally do NOT consult JAX here —
+    this orchestrator only needs the device count; JAX initialization (which
+    binds to a device) happens inside each per-disease subprocess.
+    """
+    try:
+        import cupy  # type: ignore[import-not-found]
+    except (ImportError, OSError, RuntimeError):
+        return 0
+    cupy_runtime_error = getattr(getattr(cupy, "cuda", None), "runtime", None)
+    cupy_runtime_error = getattr(cupy_runtime_error, "CUDARuntimeError", RuntimeError)
+    if not isinstance(cupy_runtime_error, type):
+        cupy_runtime_error = RuntimeError
+    try:
+        device_count = cupy.cuda.runtime.getDeviceCount()
+        return int(device_count) if device_count > 0 else 0
+    except (AttributeError, OSError, RuntimeError, TypeError, ValueError, cupy_runtime_error):
+        return 0
+
+
+def _build_disease_subprocess_cmd(
+    *,
+    disease: str,
+    chromosomes: list[int],
+    disease_output_dir: Path,
+    variant_metadata_path: str | Path | None,
+    n_pcs: int,
+    random_seed: int,
+    variants: str,
+) -> list[str]:
+    """Construct the argv for a single-disease subprocess.
+
+    Each child reinvokes the same Python interpreter via `python -m sv_pgs`
+    with the existing single-disease `run-all-of-us` flags, so the child's
+    code path is unchanged from a normal single-disease run.
+    """
+    import sys as _sys
+
+    # Normalize chromosomes to the canonical comma-separated form the CLI
+    # accepts (it also takes "1-22" / "5" but the comma form is the
+    # widest-coverage choice and lossless for arbitrary subsets).
+    chromosomes_arg = ",".join(str(c) for c in chromosomes)
+    cmd = [
+        _sys.executable,
+        "-m",
+        "sv_pgs",
+        "run-all-of-us",
+        "--disease",
+        disease,
+        "--chromosomes",
+        chromosomes_arg,
+        "--output-dir",
+        str(disease_output_dir),
+        "--n-pcs",
+        str(int(n_pcs)),
+        "--random-seed",
+        str(int(random_seed)),
+        "--variants",
+        variants,
+    ]
+    if variant_metadata_path is not None:
+        cmd.extend(["--variant-metadata", str(variant_metadata_path)])
+    return cmd
+
+
+def _run_disease_subprocess(
+    *,
+    disease: str,
+    cmd: list[str],
+    gpu_id: int | None,
+) -> tuple[str, int, str]:
+    """Spawn one disease subprocess and wait for it.
+
+    Returns (disease, returncode, stderr_tail). When `gpu_id` is None the
+    child inherits the parent's GPU environment unchanged, so one fit can use
+    every visible CUDA device through the sharded genotype cache.
+    """
+    env = dict(os.environ)
+    if gpu_id is not None:
+        env["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
+    log(
+        f"  [scheduler] spawning disease={disease} pid_parent={os.getpid()} "
+        f"CUDA_VISIBLE_DEVICES={env.get('CUDA_VISIBLE_DEVICES', '<inherit>')}"
+    )
+    # Capture stderr so we can include the tail in the per-disease failure
+    # log; let stdout stream through to the parent's stdout so `tail -f`
+    # still surfaces the child's STEP banners + per-epoch test rows.
+    proc = subprocess.Popen(
+        cmd,
+        env=env,
+        stdout=None,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    stderr_tail = ""
+    try:
+        _, stderr_out = proc.communicate()
+        if stderr_out:
+            # Echo full stderr through so the parent log preserves it, but
+            # keep a short tail for the structured failure summary.
+            for line in stderr_out.splitlines():
+                log(f"  [{disease} stderr] {line}")
+            tail_lines = stderr_out.splitlines()[-20:]
+            stderr_tail = "\n".join(tail_lines)
+    except BaseException:
+        # Parent received a signal (e.g. Ctrl-C); SIGTERM the child, give it
+        # a moment to shut down cleanly, then SIGKILL stragglers. This keeps
+        # GPU memory from being held by a zombie when the user aborts a sweep.
+        try:
+            proc.terminate()
+            try:
+                proc.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait(timeout=5)
+        except OSError:
+            pass
+        raise
+    return disease, int(proc.returncode), stderr_tail
+
+
 def run_all_of_us_all_diseases(
     chromosomes: list[int],
     output_base: str,
@@ -1614,13 +1739,24 @@ def run_all_of_us_all_diseases(
     n_pcs: int = 10,
     random_seed: int = 0,
     variants: str = "snp+sv",
-) -> None:
+    max_parallel_gpus: int | None = None,
+) -> int:
     """Run the AoU pipeline for every disease in DISEASE_DEFINITIONS.
 
     Each disease writes into its own subdirectory `<canonical_name>_results/`
-    under `output_base`. Diseases are processed sequentially so the SV VCF
-    and microarray PLINK caches built by the first disease are reused by all
-    subsequent diseases (the cache lives under `output_base/.sv_pgs_cache/`).
+    under `output_base`. By default the sweep runs one disease at a time and
+    each fit sees all visible GPUs, so the model-level multi-GPU sharded
+    genotype operator accelerates the fit itself.
+
+    Pool sizing:
+      - `max_parallel_gpus=None` (default) runs sequentially with all visible
+        GPUs available to each fit.
+      - `max_parallel_gpus=1` also runs sequentially.
+      - `max_parallel_gpus>1` explicitly trades per-fit multi-GPU for
+        per-disease concurrency by pinning each subprocess to one GPU.
+
+    Returns the process exit code: 0 on full success, 1 if any disease
+    subprocess failed (the sweep still finishes the rest before returning).
     """
     base_dir = Path(output_base)
     base_dir.mkdir(parents=True, exist_ok=True)
@@ -1628,23 +1764,123 @@ def run_all_of_us_all_diseases(
     # known numbers immediately even if the sweep is about to spend hours on
     # remaining diseases or cache re-validation.
     _log_all_cached_test_evals(base_dir, header="SWEEP PRE-FLIGHT")
+
+    diseases = list(DISEASE_DEFINITIONS)
+    n_diseases = len(diseases)
+
+    detected_gpus = _detect_gpu_count()
+    if max_parallel_gpus is None:
+        pool_size = 1
+        if detected_gpus > 0:
+            scheduling_source = f"auto-detect ({detected_gpus} GPU(s); each fit uses all visible GPUs)"
+        else:
+            scheduling_source = "auto-detect (no GPUs visible; sequential)"
+    elif detected_gpus <= 0:
+        pool_size = 1
+        scheduling_source = "user override ignored for no-GPU host; sequential"
+    else:
+        requested = max(1, int(max_parallel_gpus))
+        pool_size = max(1, min(requested, detected_gpus, n_diseases))
+        scheduling_source = f"user override (--max-parallel-gpus={max_parallel_gpus})"
+
+    waves = (n_diseases + pool_size - 1) // pool_size
+    log(
+        f"multi-GPU scheduling: {scheduling_source}, sweeping {n_diseases} "
+        f"diseases -> {pool_size} concurrent fit(s) ({waves} wave(s))"
+    )
+
+    # When pool_size==1, fall back to in-process sequential execution to
+    # preserve the historical behavior (avoids the subprocess overhead and
+    # keeps the existing logs/heartbeat in one process tree). Multi-GPU
+    # parallelism only kicks in when pool_size > 1.
     failures: list[tuple[str, str]] = []
-    for disease_definition in DISEASE_DEFINITIONS:
-        disease_output_dir = base_dir / f"{disease_definition.canonical_name}_results"
-        log(f"=== TOP-20 LOOP: starting {disease_definition.canonical_name} -> {disease_output_dir} ===")
-        try:
-            run_all_of_us(
+    if pool_size == 1:
+        for disease_definition in diseases:
+            disease_output_dir = base_dir / f"{disease_definition.canonical_name}_results"
+            log(
+                f"=== TOP-20 LOOP: starting {disease_definition.canonical_name} -> {disease_output_dir} ==="
+            )
+            try:
+                run_all_of_us(
+                    disease=disease_definition.canonical_name,
+                    chromosomes=chromosomes,
+                    output_base=str(disease_output_dir),
+                    variant_metadata_path=variant_metadata_path,
+                    n_pcs=n_pcs,
+                    random_seed=random_seed,
+                    variants=variants,
+                )
+            except (RuntimeError, ValueError, OSError) as exc:
+                log(
+                    f"=== TOP-20 LOOP: {disease_definition.canonical_name} FAILED: {exc} ==="
+                )
+                failures.append((disease_definition.canonical_name, str(exc)))
+        if failures:
+            details = "; ".join(f"{name}: {msg}" for name, msg in failures)
+            log(f"run_all_of_us_all_diseases: {len(failures)} disease(s) failed: {details}")
+            return 1
+        return 0
+
+    # Explicit subprocess fan-out. Process diseases in waves of `pool_size`,
+    # round-robin assigning each disease to a GPU id in [0, pool_size). This is
+    # only used when the caller explicitly asks to run multiple diseases at
+    # once; the default path above keeps all GPUs available to each single fit.
+    from concurrent.futures import ThreadPoolExecutor as _TPE, as_completed as _as_completed
+
+    pending = list(enumerate(diseases))
+    with _TPE(max_workers=pool_size, thread_name_prefix="aou-disease-sched") as executor:
+        future_to_disease: dict = {}
+        for submission_index, disease_definition in pending:
+            gpu_id = submission_index % pool_size if detected_gpus > 0 else None
+            disease_output_dir = base_dir / f"{disease_definition.canonical_name}_results"
+            cmd = _build_disease_subprocess_cmd(
                 disease=disease_definition.canonical_name,
                 chromosomes=chromosomes,
-                output_base=str(disease_output_dir),
+                disease_output_dir=disease_output_dir,
                 variant_metadata_path=variant_metadata_path,
                 n_pcs=n_pcs,
                 random_seed=random_seed,
                 variants=variants,
             )
-        except (RuntimeError, ValueError, OSError) as exc:
-            log(f"=== TOP-20 LOOP: {disease_definition.canonical_name} FAILED: {exc} ===")
-            failures.append((disease_definition.canonical_name, str(exc)))
+            log(
+                f"=== TOP-20 LOOP: queued {disease_definition.canonical_name} "
+                f"CUDA_VISIBLE_DEVICES={gpu_id if gpu_id is not None else '<inherit>'} "
+                f"-> {disease_output_dir} ==="
+            )
+            future = executor.submit(
+                _run_disease_subprocess,
+                disease=disease_definition.canonical_name,
+                cmd=cmd,
+                gpu_id=gpu_id,
+            )
+            future_to_disease[future] = disease_definition.canonical_name
+
+        try:
+            for future in _as_completed(future_to_disease):
+                disease_name = future_to_disease[future]
+                try:
+                    name, returncode, stderr_tail = future.result()
+                except (OSError, subprocess.SubprocessError) as exc:
+                    log(f"=== TOP-20 LOOP: {disease_name} subprocess error: {exc} ===")
+                    failures.append((disease_name, f"subprocess error: {exc}"))
+                    continue
+                if returncode != 0:
+                    log(
+                        f"=== TOP-20 LOOP: {name} FAILED (exit {returncode}); stderr tail:\n{stderr_tail} ==="
+                    )
+                    failures.append((name, f"exit {returncode}: {stderr_tail[-500:]}"))
+                else:
+                    log(f"=== TOP-20 LOOP: {name} completed successfully ===")
+        except BaseException:
+            # Cancel anything that hasn't started yet so a Ctrl-C doesn't
+            # leave the executor draining a backlog of new spawns. Running
+            # subprocesses are signalled inside _run_disease_subprocess.
+            for future in future_to_disease:
+                future.cancel()
+            raise
+
     if failures:
         details = "; ".join(f"{name}: {msg}" for name, msg in failures)
-        raise RuntimeError(f"run_all_of_us_all_diseases: {len(failures)} disease(s) failed: {details}")
+        log(f"run_all_of_us_all_diseases: {len(failures)} disease(s) failed: {details}")
+        return 1
+    return 0
