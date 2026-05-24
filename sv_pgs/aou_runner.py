@@ -107,13 +107,32 @@ _AOU_ARRAY_PLINK_PREFIX = "arrays"
 #   gs://.../v8/known_issues/                                   (issue-specific sample lists)
 # ---------------------------------------------------------------------------
 
+# The two env vars below are interpolated into gsutil command arguments
+# (CDR_STORAGE_PATH builds the `gs://.../...` source URI; GOOGLE_PROJECT is
+# passed via `-u <project>`). subprocess uses list-form invocation so a shell
+# can't reinterpret embedded metacharacters, but a value starting with '-'
+# would be parsed by gsutil itself as an option flag (argument injection).
+# Reject anything that looks suspicious so a typo or hostile env never turns
+# into a command-line option.
+import re as _re
+
+_GSUTIL_PROJECT_RE = _re.compile(r"^[A-Za-z0-9][A-Za-z0-9_\-.:]*$")
+_GSUTIL_GS_URI_RE = _re.compile(r"^gs://[A-Za-z0-9_\-][A-Za-z0-9_\-./]*$")
+
+
 def _cdr_storage_path() -> str:
     # gs://fc-aou-datasets-controlled/v8 on the current Controlled Tier; the
     # workbench sets this env var for every notebook + container.
     value = os.environ.get("CDR_STORAGE_PATH")
     if not value:
         raise RuntimeError("CDR_STORAGE_PATH is not set. Are you on an All of Us workbench?")
-    return value
+    stripped = value.strip()
+    if not _GSUTIL_GS_URI_RE.match(stripped):
+        raise RuntimeError(
+            f"Refusing to use CDR_STORAGE_PATH={stripped!r}: must be a gs:// URI "
+            "composed of alphanumerics, underscore, hyphen, dot, and slash."
+        )
+    return stripped
 
 
 def _google_project() -> str:
@@ -122,7 +141,14 @@ def _google_project() -> str:
     value = os.environ.get("GOOGLE_PROJECT")
     if not value:
         raise RuntimeError("GOOGLE_PROJECT is not set. Are you on an All of Us workbench?")
-    return value
+    stripped = value.strip()
+    if not _GSUTIL_PROJECT_RE.match(stripped):
+        raise RuntimeError(
+            f"Refusing to use GOOGLE_PROJECT={stripped!r}: GCP project IDs may "
+            "start with an alphanumeric and contain only letters, digits, "
+            "underscore, hyphen, dot, or colon."
+        )
+    return stripped
 
 
 def sv_vcf_dir() -> str:
@@ -200,6 +226,15 @@ def _check_disk_space(path: Path, required_bytes: int) -> None:
 
 def _gsutil_cp(src: str, dst: str) -> None:
     """Download with gsutil, showing real-time progress via -m flag."""
+    # Defense in depth: even though `src` is always built from our own constants
+    # plus a validated CDR_STORAGE_PATH, refuse a value that gsutil would
+    # interpret as an option flag (anything starting with '-'). The remote URI
+    # must be a gs:// URI; reject the unlikely but dangerous case where it
+    # somehow isn't.
+    if not src.startswith("gs://") or src.startswith("-"):
+        raise RuntimeError(f"Refusing to gsutil cp from non-gs:// source: {src!r}")
+    if dst.startswith("-"):
+        raise RuntimeError(f"Refusing to gsutil cp to suspicious destination: {dst!r}")
     cmd = ["gsutil", "-u", _google_project(), "-m", "cp", src, dst]
     log(f"  downloading {src}")
     # Stream output in real time so user sees progress
@@ -216,9 +251,19 @@ def _gsutil_cp(src: str, dst: str) -> None:
 
 def _gsutil_size(path: str) -> int:
     """Get the size of a remote GCS object in bytes."""
+    if not path.startswith("gs://") or path.startswith("-"):
+        raise RuntimeError(f"Refusing to gsutil du on non-gs:// path: {path!r}")
     cmd = ["gsutil", "-u", _google_project(), "du", "-s", path]
     result = subprocess.run(cmd, capture_output=True, text=True, check=True)
-    return int(result.stdout.strip().split()[0])
+    raw_first = result.stdout.strip().split()
+    if not raw_first:
+        raise RuntimeError(f"gsutil du returned empty output for {path}")
+    try:
+        return int(raw_first[0])
+    except ValueError as exc:
+        raise RuntimeError(
+            f"gsutil du returned non-integer size for {path}: {raw_first[0]!r}"
+        ) from exc
 
 
 def _download_gcs_object_if_missing(remote_path: str, local_path: Path) -> None:
@@ -370,19 +415,33 @@ def _parse_pca_features_column(series: pd.Series, n_pcs: int) -> tuple[pd.DataFr
     pc_names = [f"PC{i+1}" for i in range(n_pcs)]
     n_failed = 0
 
+    # AoU PCA-feature strings are short (e.g. 16 floats ≈ 250 bytes). Cap the
+    # per-row length so a malformed ancestry file with a multi-megabyte JSON
+    # blob in one row can't blow up worker memory while we parse the table.
+    _PCA_FEATURES_MAX_LEN = 8 * 1024
+
     def _parse_row(val: str) -> list[float]:
         nonlocal n_failed
         if not isinstance(val, str) or not val.strip():
             n_failed += 1
             return [float("nan")] * n_pcs
         cleaned = val.strip()
+        if len(cleaned) > _PCA_FEATURES_MAX_LEN:
+            n_failed += 1
+            return [float("nan")] * n_pcs
         try:
             if cleaned.startswith("["):
                 values = json.loads(cleaned)
+                # Reject anything that isn't a flat list of scalars; a nested
+                # structure (or a dict) would otherwise propagate weird types
+                # straight into the downstream float() conversion or fail with
+                # an unrelated TypeError.
+                if not isinstance(values, list) or len(values) > 4 * n_pcs:
+                    raise ValueError("pca_features must be a flat list of numbers")
             else:
                 values = [float(x.strip()) for x in cleaned.split(",") if x.strip()]
             return [float(values[i]) if i < len(values) else float("nan") for i in range(n_pcs)]
-        except (json.JSONDecodeError, ValueError, IndexError):
+        except (json.JSONDecodeError, ValueError, TypeError, IndexError):
             n_failed += 1
             return [float("nan")] * n_pcs
 

@@ -4,6 +4,7 @@ import csv
 import json
 import logging
 import os
+import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -415,11 +416,32 @@ def _normalize_name(value: str) -> str:
     return value.strip().lower().replace("-", "_").replace(" ", "_")
 
 
+# BigQuery project IDs and dataset IDs must match a restrictive identifier
+# grammar (letters, digits, underscores, hyphens; dataset IDs additionally
+# allow a single dot for project.dataset qualification). Validating the
+# WORKSPACE_CDR env var here closes a SQL-injection vector: the value is
+# interpolated unescaped into the GoogleSQL inside backticks (e.g.
+# `{dataset}.concept`), so a hostile WORKSPACE_CDR like
+# `proj.dset`.foo`; DROP TABLE x; --` could otherwise break out of the
+# identifier. AoU workbenches set this to something like
+# `fc-aou-cdr-prod.R2024Q3R3`, which matches the regex; anything that
+# doesn't match is rejected loudly.
+_BQ_QUALIFIED_NAME_RE = re.compile(r"^[A-Za-z0-9_\-]+(?:\.[A-Za-z0-9_\-]+)*$")
+
+
 def _require_env(name: str) -> str:
     value = os.environ.get(name)
     if value is None or not value.strip():
         raise ValueError("Missing required All of Us environment variable: " + name)
-    return value.strip()
+    stripped = value.strip()
+    if name in ("WORKSPACE_CDR", "GOOGLE_PROJECT"):
+        if not _BQ_QUALIFIED_NAME_RE.match(stripped):
+            raise ValueError(
+                f"Refusing to use {name}={stripped!r}: BigQuery project / dataset "
+                "identifiers may contain only letters, digits, underscore, hyphen, "
+                "and a single '.' separator."
+            )
+    return stripped
 
 
 def _resolve_billing_project(client: bigquery.Client | None) -> str:

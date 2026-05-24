@@ -218,9 +218,20 @@ def _parse_contig_header(line: str) -> tuple[str | None, int]:
 def _parse_vcf_region(region: str | None) -> tuple[str, int, int | None] | None:
     if region is None:
         return None
+    # Region strings are routinely passed into shell-out commands (bcftools -r)
+    # and into cache directory globs. A chromosome name like ``../../etc`` or
+    # one containing a NUL byte could escape the intended scope; reject up
+    # front. The VCF spec allows letters, digits, underscore, dot, hyphen,
+    # asterisk, plus (and colon as the chrom:pos separator we already split).
+    if "\x00" in region or any(ch in region for ch in ("/", "\\", "\n", "\r", "\t", " ")):
+        raise ValueError(f"Refusing VCF region with disallowed characters: {region!r}")
     if ":" not in region:
+        if region == "" or region == "." or region == "..":
+            raise ValueError(f"Invalid VCF region: {region!r}")
         return region, 1, None
     chrom, coordinates = region.split(":", 1)
+    if chrom in ("", ".", "..") or not chrom:
+        raise ValueError(f"Invalid VCF region chromosome: {region!r}")
     if "-" not in coordinates:
         return chrom, int(coordinates), int(coordinates)
     start_text, end_text = coordinates.split("-", 1)
@@ -240,15 +251,37 @@ def _text_vcf_record_in_region(record: _TextVcfRecord, region_filter: tuple[str,
 
 def _parse_text_vcf_record(line: str, *, sample_names: tuple[str, ...]) -> _TextVcfRecord:
     fields = line.rstrip("\n").split("\t")
+    # VCF spec mandates at least 8 fixed columns (CHROM..INFO); plus FORMAT
+    # (1) when any genotypes are present. Without this check, the loop below
+    # would raise an obscure IndexError on a truncated/garbled line.
+    min_fields = 9 if sample_names else 8
+    if len(fields) < min_fields:
+        raise ValueError(
+            f"Malformed VCF record: expected at least {min_fields} tab-separated "
+            f"fields, got {len(fields)}: {line[:200]!r}"
+        )
     chrom = fields[0]
-    pos = int(fields[1])
+    try:
+        pos = int(fields[1])
+    except ValueError as exc:
+        raise ValueError(f"Malformed VCF POS field {fields[1]!r}: {exc}") from exc
     record_id = None if fields[2] == "." else fields[2]
     ref = fields[3]
     alt_field = fields[4]
     alt = () if alt_field == "." else tuple(alt_field.split(","))
-    qual = None if fields[5] == "." else float(fields[5])
+    if fields[5] == ".":
+        qual = None
+    else:
+        try:
+            qual = float(fields[5])
+        except ValueError as exc:
+            raise ValueError(f"Malformed VCF QUAL field {fields[5]!r}: {exc}") from exc
     info = _parse_vcf_info(fields[7])
-    gt_types = _parse_vcf_gt_types(fields[8], fields[9:9 + len(sample_names)])
+    gt_types = (
+        _parse_vcf_gt_types(fields[8], fields[9:9 + len(sample_names)])
+        if sample_names
+        else np.empty(0, dtype=np.int8)
+    )
     end = info.get("END")
     return _TextVcfRecord(
         CHROM=chrom,
@@ -4388,10 +4421,17 @@ def _iter_plink_bim_records(bim_path: Path) -> Iterator[_PlinkBimRecord]:
             fields = stripped_line.split()
             if len(fields) < 6:
                 raise ValueError(f"Malformed PLINK .bim row at line {line_number}: expected 6 columns.")
+            try:
+                position_value = int(fields[3])
+            except ValueError as exc:
+                raise ValueError(
+                    f"Malformed PLINK .bim row at line {line_number}: "
+                    f"non-integer position {fields[3]!r}"
+                ) from exc
             yield _PlinkBimRecord(
                 chromosome=fields[0],
                 variant_id=fields[1],
-                position=int(fields[3]),
+                position=position_value,
                 allele_1=fields[4],
                 allele_2=fields[5],
             )
