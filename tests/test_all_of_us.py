@@ -459,11 +459,18 @@ def test_download_ancestry_preds_uses_documented_remote_path(monkeypatch, tmp_pa
 
     monkeypatch.setattr(aou_runner, "_gsutil_cp", fake_cp)
 
-    local_path = aou_runner.download_ancestry_preds(tmp_path)
+    work_dir = tmp_path / "disease_run"
+    work_dir.mkdir()
+    local_path = aou_runner.download_ancestry_preds(work_dir)
 
-    assert local_path == tmp_path / "ancestry_preds.tsv"
+    assert local_path == aou_runner.local_ancestry_predictions_path(work_dir)
+    assert local_path.parent == tmp_path / ".sv_pgs_cache" / "aou_ancestry"
+    assert local_path.exists()
     assert copied == [
-        ("gs://bucket/cdr/wgs/short_read/snpindel/aux/ancestry/ancestry_preds.tsv", str(local_path))
+        (
+            "gs://bucket/cdr/wgs/short_read/snpindel/aux/ancestry/ancestry_preds.tsv",
+            str(local_path) + ".partial",
+        )
     ]
 
 

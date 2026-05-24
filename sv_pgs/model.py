@@ -1512,26 +1512,66 @@ class BayesianPGS:
 
     def export(self, path: str | Path, *, fit_fingerprint: str = "") -> None:
         fitted_state = self._require_state()
+        fit_result = fitted_state.fit_result
+        if not fit_result.converged and not bool(
+            getattr(self.config, "allow_nonconverged_export", False)
+        ):
+            param_delta = (
+                "N/A"
+                if fit_result.final_parameter_change is None
+                else f"{fit_result.final_parameter_change:.3e}"
+            )
+            predictor_delta = (
+                "N/A"
+                if fit_result.final_predictor_change is None
+                else f"{fit_result.final_predictor_change:.3e}"
+            )
+            objective_delta = (
+                "N/A"
+                if fit_result.final_objective_change is None
+                else f"{fit_result.final_objective_change:.3e}"
+            )
+            hyper_delta = (
+                "N/A"
+                if fit_result.final_hyperparameter_change is None
+                else f"{fit_result.final_hyperparameter_change:.3e}"
+            )
+            raise RuntimeError(
+                "Fit did not converge (final params/objective changes: "
+                f"param={param_delta}, predictor={predictor_delta}, "
+                f"objective={objective_delta}, hyperparameter={hyper_delta}); "
+                "refusing final artifact export. "
+                "Set config.allow_nonconverged_export=True to override."
+            )
         artifact = ModelArtifact(
             config=self.config,
             records=fitted_state.full_variant_records,
             means=fitted_state.preprocessor.means,
             scales=fitted_state.preprocessor.scales,
-            alpha=fitted_state.fit_result.alpha,
-            beta_reduced=fitted_state.fit_result.beta_reduced,
+            alpha=fit_result.alpha,
+            beta_reduced=fit_result.beta_reduced,
             beta_full=fitted_state.full_coefficients,
-            beta_variance=fitted_state.fit_result.beta_variance,
+            beta_variance=fit_result.beta_variance,
             tie_map=fitted_state.tie_map,
-            sigma_e2=fitted_state.fit_result.sigma_error2,
-            prior_scales=fitted_state.fit_result.prior_scales,
-            global_scale=fitted_state.fit_result.global_scale,
-            class_tpb_shape_a=fitted_state.fit_result.class_tpb_shape_a,
-            class_tpb_shape_b=fitted_state.fit_result.class_tpb_shape_b,
-            scale_model_coefficients=fitted_state.fit_result.scale_model_coefficients,
-            scale_model_feature_names=fitted_state.fit_result.scale_model_feature_names,
-            objective_history=fitted_state.fit_result.objective_history,
-            validation_history=fitted_state.fit_result.validation_history,
+            sigma_e2=fit_result.sigma_error2,
+            prior_scales=fit_result.prior_scales,
+            global_scale=fit_result.global_scale,
+            class_tpb_shape_a=fit_result.class_tpb_shape_a,
+            class_tpb_shape_b=fit_result.class_tpb_shape_b,
+            scale_model_coefficients=fit_result.scale_model_coefficients,
+            scale_model_feature_names=fit_result.scale_model_feature_names,
+            objective_history=fit_result.objective_history,
+            validation_history=fit_result.validation_history,
             fit_fingerprint=fit_fingerprint,
+            converged=bool(fit_result.converged),
+            selected_iteration_count=int(
+                getattr(fit_result, "selected_iteration_count", len(fit_result.objective_history))
+                or len(fit_result.objective_history)
+            ),
+            final_parameter_change=fit_result.final_parameter_change,
+            final_predictor_change=fit_result.final_predictor_change,
+            final_objective_change=fit_result.final_objective_change,
+            final_hyperparameter_change=fit_result.final_hyperparameter_change,
         )
         save_artifact(path, artifact)
 
@@ -1564,15 +1604,19 @@ class BayesianPGS:
                 member_prior_variances=artifact.prior_scales,
                 linear_predictor=None,
                 selected_iteration_count=(
-                    artifact.selected_iteration_count
-                    if artifact.selected_iteration_count
-                    else len(artifact.objective_history)
+                    int(getattr(artifact, "selected_iteration_count", 0) or 0)
+                    or len(artifact.objective_history)
                 ),
-                converged=artifact.converged,
-                final_parameter_change=artifact.final_parameter_change,
-                final_predictor_change=artifact.final_predictor_change,
-                final_objective_change=artifact.final_objective_change,
-                final_hyperparameter_change=artifact.final_hyperparameter_change,
+                # Use the saved converged flag instead of hardcoding False
+                # (older bug). Default to False only when reading legacy
+                # artifacts that predate the convergence metadata fields.
+                converged=bool(getattr(artifact, "converged", False)),
+                final_parameter_change=getattr(artifact, "final_parameter_change", None),
+                final_predictor_change=getattr(artifact, "final_predictor_change", None),
+                final_objective_change=getattr(artifact, "final_objective_change", None),
+                final_hyperparameter_change=getattr(
+                    artifact, "final_hyperparameter_change", None
+                ),
             ),
             full_coefficients=artifact.beta_full,
             nonzero_coefficient_indices=nonzero_coefficient_indices,

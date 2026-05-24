@@ -2202,39 +2202,111 @@ def fit_variational_em(
                             + f"(expected block size {expected_block_indices.size}, got {block_indices.size})"
                         )
                     resume_binary_block_state = None
-                block_genotypes = genotype_matrix.subset(block_indices)
-                # Upload block to GPU — fits easily in GPU budget.
-                # Without this, every CG iteration streams from mmap (40s vs 2s).
-                block_genotypes.try_materialize_gpu()
-                # For binary TR-Newton blocks, GPU residency is mandatory: silently
-                # falling back to mmap streaming inside Newton-CG turns each HVP
-                # into a multi-second disk read and stalls the run.  Halve the
-                # block once and retry; if that still fails, raise so the user
-                # can lower the configured batch size or free GPU memory.
-                if (
+                # Build the list of (indices, genotypes) tuples to process for
+                # this block.  For TR-Newton binary blocks, GPU residency is
+                # mandatory: silently falling back to mmap streaming inside
+                # Newton-CG turns each HVP into a multi-second disk read and
+                # stalls the run for 9+ hours.  If GPU upload fails, we halve
+                # the block up to twice and process EACH resulting sub-block
+                # in original index order — a previous version of this code
+                # truncated ``block_indices`` to the first half, silently
+                # dropping the second half's variants from this epoch.  The
+                # non-TR-Newton binary path is OK to stream from BED — it
+                # never builds HVPs — so it only gets a warning.
+                _block_is_tr_newton = (
                     config.trait_type == TraitType.BINARY
-                    and block_genotypes._cupy_cache is None
-                    and getattr(config, "tr_newton_shrink_block_on_oom", True)
-                ):
-                    shrunk_size = max(1, len(block_indices) // 2)
-                    if shrunk_size < len(block_indices):
-                        log(
-                            "    binary block did not fit GPU; retrying with half size "
-                            + f"{shrunk_size} (was {len(block_indices)})  mem={mem()}"
-                        )
-                        block_indices = block_indices[:shrunk_size]
-                        block_genotypes = genotype_matrix.subset(block_indices)
-                        block_genotypes.try_materialize_gpu()
-                if (
-                    config.trait_type == TraitType.BINARY
-                    and block_genotypes._cupy_cache is None
-                ):
-                    raise RuntimeError(
-                        "TR-Newton block was not GPU-resident; refusing mmap "
-                        "streaming inside Newton-CG. Reduce "
-                        "stochastic_variant_batch_size or free GPU memory."
+                    and bool(getattr(config, "use_tr_newton_binary", False))
+                )
+                _original_block_size = int(len(block_indices))
+
+                def _release_gpu_pools_after_failed_upload() -> None:
+                    try:
+                        import cupy as _cp_free
+                        _cp_free.cuda.Device().synchronize()
+                        _cp_free.get_default_memory_pool().free_all_blocks()
+                        _cp_free.get_default_pinned_memory_pool().free_all_blocks()
+                    except (ImportError, AttributeError, RuntimeError, OSError):
+                        pass
+
+                def _build_tr_newton_sub_blocks(indices, depth):
+                    """Probe GPU upload; if it fails, recursively halve up to
+                    twice (max 4 sub-blocks) and return a flat list of
+                    (indices, genotypes) tuples in original index order.  Each
+                    returned genotypes object has been through try_materialize_gpu;
+                    callers must still check ``_cupy_cache`` for residency.
+                    """
+                    g = genotype_matrix.subset(indices)
+                    g.try_materialize_gpu()
+                    if g._cupy_cache is not None or depth >= 2 or len(indices) <= 1:
+                        return [(indices, g)]
+                    _half = max(1, len(indices) // 2)
+                    log(
+                        "    WARNING: GPU materialization failed for TR-Newton block "
+                        + f"(size={len(indices)}); halving into sub-blocks of "
+                        + f"{_half} and {len(indices) - _half} and retrying  mem={mem()}"
                     )
-                log_this_block = _should_log_stochastic_block(block_count, n_blocks)
+                    # Free the failed materialization before retrying smaller pieces.
+                    g._cupy_cache = None
+                    del g
+                    _release_gpu_pools_after_failed_upload()
+                    left = _build_tr_newton_sub_blocks(indices[:_half], depth + 1)
+                    right = _build_tr_newton_sub_blocks(indices[_half:], depth + 1)
+                    return left + right
+
+                if _block_is_tr_newton:
+                    sub_blocks = _build_tr_newton_sub_blocks(block_indices, 0)
+                else:
+                    _bg = genotype_matrix.subset(block_indices)
+                    _bg.try_materialize_gpu()
+                    sub_blocks = [(block_indices, _bg)]
+
+                # Resume state was captured for the original (un-split)
+                # block_indices; if the probe produced sub-blocks, the cached
+                # Newton state cannot apply.  Drop it so each sub-block starts
+                # cold; the existing in-loop checkpoint path will reseed.
+                if len(sub_blocks) > 1 and active_binary_resume_state is not None:
+                    log(
+                        "    discarding cached binary block resume state because "
+                        + f"block was split into {len(sub_blocks)} sub-blocks for GPU fit"
+                    )
+                    active_binary_resume_state = None
+
+                # Original block_indices is preserved for any downstream use
+                # (e.g. the resume-mismatch logging on the next epoch); the
+                # loop body rebinds block_indices to each sub-block in turn.
+                _original_block_indices_for_epoch = block_indices
+                for _sub_idx, (block_indices, block_genotypes) in enumerate(sub_blocks):
+                    if block_genotypes._cupy_cache is None:
+                        if _block_is_tr_newton:
+                            try:
+                                _cp_for_budget = _try_import_cupy()
+                                _budget_bytes = (
+                                    int(_gpu_live_usable_bytes(_cp_for_budget))
+                                    if _cp_for_budget is not None
+                                    else -1
+                                )
+                            except Exception:
+                                _budget_bytes = -1
+                            if _TR_NEWTON_REQUIRES_GPU:
+                                raise RuntimeError(
+                                    "TR-Newton block was not GPU-resident; refusing mmap "
+                                    "streaming inside Newton-CG. Reduce "
+                                    "stochastic_variant_batch_size or free GPU memory. "
+                                    f"(original block size={_original_block_size}, "
+                                    f"final sub-block size={len(block_indices)}, "
+                                    f"gpu_budget_bytes={_budget_bytes})"
+                                )
+                            log(
+                                "    WARNING: GPU materialization failed for sub-block; "
+                                "HVPs will stream from BED (this is the 9+ hour failure mode). "
+                                f"block_size={len(block_indices)} gpu_budget_bytes={_budget_bytes}  mem={mem()}"
+                            )
+                        elif config.trait_type == TraitType.BINARY:
+                            log(
+                                "    WARNING: GPU materialization failed for binary block; "
+                                f"falling back to host path  block_size={len(block_indices)}  mem={mem()}"
+                            )
+                    log_this_block = _should_log_stochastic_block(block_count, n_blocks)
                 if log_this_block:
                     log(f"    block {block_count}/{n_blocks}  variants={len(block_indices)}  step_size={step_size:.4f}  gpu={'yes' if block_genotypes._cupy_cache is not None else 'no'}  mem={mem()}")
                 block_prior_variances = np.asarray(reduced_prior_variances[block_indices], dtype=np.float64)
@@ -2448,6 +2520,15 @@ def fit_variational_em(
                 # Free GPU memory for this block before next iteration
                 block_genotypes._cupy_cache = None
                 del block_genotypes
+                # Reclaim pool blocks + pinned-host pool immediately so the next
+                # block's try_materialize_gpu sees the actual free budget.
+                try:
+                    import cupy as _cp
+                    _cp.cuda.Device().synchronize()
+                    _cp.get_default_memory_pool().free_all_blocks()
+                    _cp.get_default_pinned_memory_pool().free_all_blocks()
+                except (ImportError, AttributeError, RuntimeError, OSError):
+                    pass
                 if block_count % _STOCHASTIC_BLOCK_GC_INTERVAL == 0:
                     _release_gpu_memory()
                 if log_this_block:
@@ -4425,25 +4506,89 @@ def _binary_posterior_state_tr_newton(
             dtype=np.float64,
         )
 
-    result = trust_region_newton_logistic(
-        matvec_design=_design_mv,
-        matvec_design_transpose=_design_mv_transpose,
-        covariate_matrix=covariate_matrix_f64,
-        targets=target_array,
-        prior_variances=effective_prior_variances_for_tr_newton,
-        predictor_offset=predictor_offset_array,
-        beta_init=beta_init_f64,
-        alpha_init=alpha_init_f64,
-        max_iterations=int(max_iterations),
-        gradient_tolerance=float(gradient_tolerance),
-        cg_max_iterations=int(maximum_linear_solver_iterations),
-    )
+    # Dispatch: GPU-resident block -> GPU-native TR-Newton (no host round-trips
+    # in the inner CG loop).  CPU-resident block -> NumPy solver.
+    _gpu_resident = genotype_matrix._cupy_cache is not None
+    _tr_newton_cupy = _try_import_cupy() if _gpu_resident else None
+    try:
+        if _gpu_resident and _tr_newton_cupy is not None:
+            cp = _tr_newton_cupy
+            _gpu_dtype = cp.float64
+
+            def _design_mv_gpu(v_gpu: Any) -> Any:
+                if n_variants == 0:
+                    return cp.zeros(n_samples, dtype=_gpu_dtype)
+                return genotype_matrix.gpu_matmat(
+                    v_gpu,
+                    batch_size=posterior_variance_batch_size,
+                    cupy=cp,
+                    dtype=_gpu_dtype,
+                )
+
+            def _design_mv_transpose_gpu(u_gpu: Any) -> Any:
+                if n_variants == 0:
+                    return cp.zeros(0, dtype=_gpu_dtype)
+                return genotype_matrix.gpu_transpose_matmat(
+                    u_gpu,
+                    batch_size=posterior_variance_batch_size,
+                    cupy=cp,
+                    dtype=_gpu_dtype,
+                )
+
+            log(f"      TR-Newton dispatch: GPU-native (block GPU-resident)  mem={mem()}")
+            result = trust_region_newton_logistic_gpu(
+                cupy=cp,
+                matvec_design=_design_mv_gpu,
+                matvec_design_transpose=_design_mv_transpose_gpu,
+                covariate_matrix=covariate_matrix_f64,
+                targets=target_array,
+                prior_variances=effective_prior_variances_for_tr_newton,
+                predictor_offset=predictor_offset_array,
+                beta_init=beta_init_f64,
+                alpha_init=alpha_init_f64,
+                max_iterations=int(max_iterations),
+                gradient_tolerance=float(gradient_tolerance),
+                cg_max_iterations=int(maximum_linear_solver_iterations),
+                compute_dtype=_gpu_dtype,
+            )
+        else:
+            log(f"      TR-Newton dispatch: NumPy (block CPU-resident)  mem={mem()}")
+            result = trust_region_newton_logistic(
+                matvec_design=_design_mv,
+                matvec_design_transpose=_design_mv_transpose,
+                covariate_matrix=covariate_matrix_f64,
+                targets=target_array,
+                prior_variances=effective_prior_variances_for_tr_newton,
+                predictor_offset=predictor_offset_array,
+                beta_init=beta_init_f64,
+                alpha_init=alpha_init_f64,
+                max_iterations=int(max_iterations),
+                gradient_tolerance=float(gradient_tolerance),
+                cg_max_iterations=int(maximum_linear_solver_iterations),
+            )
+    except (TRNewtonNonConvergence, TRNewtonTimeout) as _exc:
+        # Surface as the canonical type so _binary_posterior_state's
+        # PG-IRLS fallback (or require-convergence raise) takes over.
+        raise _BinaryTRNewtonNotConverged(str(_exc)) from _exc
     if not _trust_region_result_converged(result):
+        _nc_iters = getattr(result, "iterations", -1)
+        _nc_grad = getattr(result, "final_gradient_norm", float("nan"))
+        _nc_status = _trust_region_result_status_label(result)
+        log(
+            "      WARNING: TR-Newton did not converge "
+            + f"(status={_nc_status}, iters={_nc_iters}, grad_norm={_nc_grad:.3e})  mem={mem()}"
+        )
+        if _TR_NEWTON_RAISE_ON_NONCONVERGENCE:
+            raise RuntimeError(
+                f"TR-Newton failed to converge after {_nc_iters} iterations "
+                + f"(grad_norm={_nc_grad:.3e}, status={_nc_status}). "
+                + "Refusing to return a non-converged posterior."
+            )
+        # Gate disabled — fall back to legacy behavior (signal to caller for
+        # PG-IRLS fallback).
         raise _BinaryTRNewtonNotConverged(
             "TR-Newton did not converge "
-            + f"(status={_trust_region_result_status_label(result)}, "
-            + f"iters={getattr(result, 'iterations', '?')}, "
-            + f"grad_norm={getattr(result, 'final_gradient_norm', float('nan'))})"
+            + f"(status={_nc_status}, iters={_nc_iters}, grad_norm={_nc_grad})"
         )
 
     alpha = np.asarray(result.alpha, dtype=np.float64).reshape(-1)
@@ -4583,8 +4728,10 @@ def _binary_posterior_state(
     update_blend_weight: float | None = None,
     resume_state: dict[str, object] | None = None,
     progress_callback: Callable[[dict[str, object]], None] | None = None,
+    progress_checkpoint_seconds: float = _BINARY_INNER_CHECKPOINT_DEFAULT_SECONDS,
     allow_gpu_exact_variant: bool = True,
     prior_precision_override: NDArray | None = None,
+    use_tr_newton_binary: bool = False,
 ) -> tuple[NDArray, NDArray, NDArray, NDArray, float, int]:
     standardized_genotypes = _as_standardized_genotype_matrix(genotype_matrix)
     if prior_precision_override is not None:
@@ -4595,41 +4742,56 @@ def _binary_posterior_state(
             raise ValueError("prior_precision_override must match prior_variances shape.")
     else:
         prior_precision = np.asarray(1.0 / np.maximum(prior_variances, 1e-8), dtype=np.float64)
-    if resume_state is None:
-        tr_result = _binary_posterior_state_tr_newton(
-            genotype_matrix=standardized_genotypes,
-            covariate_matrix=covariate_matrix,
-            targets=targets,
-            prior_variances=prior_variances,
-            alpha_init=alpha_init,
-            beta_init=beta_init,
-            max_iterations=max_iterations,
-            gradient_tolerance=gradient_tolerance,
-            solver_tolerance=solver_tolerance,
-            maximum_linear_solver_iterations=maximum_linear_solver_iterations,
-            logdet_probe_count=logdet_probe_count,
-            logdet_lanczos_steps=logdet_lanczos_steps,
-            exact_solver_matrix_limit=exact_solver_matrix_limit,
-            posterior_variance_batch_size=posterior_variance_batch_size,
-            posterior_variance_probe_count=posterior_variance_probe_count,
-            random_seed=random_seed,
-            compute_logdet=compute_logdet,
-            compute_beta_variance=compute_beta_variance,
-            sample_space_preconditioner_rank=sample_space_preconditioner_rank,
-            predictor_offset=predictor_offset,
-            posterior_working_set_min_variants=posterior_working_set_min_variants,
-            posterior_working_set_initial_size=posterior_working_set_initial_size,
-            posterior_working_set_growth=posterior_working_set_growth,
-            posterior_working_set_max_passes=posterior_working_set_max_passes,
-            posterior_working_set_coefficient_tolerance=posterior_working_set_coefficient_tolerance,
-            restricted_posterior_warm_start=restricted_posterior_warm_start,
-            minimum_weight=minimum_weight,
-            allow_gpu_exact_variant=allow_gpu_exact_variant,
-            prior_precision_override=prior_precision_override,
-        )
-        if tr_result is None:
-            raise RuntimeError("TR-Newton returned no posterior state.")
-        return tr_result
+    if resume_state is None and use_tr_newton_binary:
+        try:
+            tr_result = _binary_posterior_state_tr_newton(
+                genotype_matrix=standardized_genotypes,
+                covariate_matrix=covariate_matrix,
+                targets=targets,
+                prior_variances=prior_variances,
+                alpha_init=alpha_init,
+                beta_init=beta_init,
+                max_iterations=max_iterations,
+                gradient_tolerance=gradient_tolerance,
+                solver_tolerance=solver_tolerance,
+                maximum_linear_solver_iterations=maximum_linear_solver_iterations,
+                logdet_probe_count=logdet_probe_count,
+                logdet_lanczos_steps=logdet_lanczos_steps,
+                exact_solver_matrix_limit=exact_solver_matrix_limit,
+                posterior_variance_batch_size=posterior_variance_batch_size,
+                posterior_variance_probe_count=posterior_variance_probe_count,
+                random_seed=random_seed,
+                compute_logdet=compute_logdet,
+                compute_beta_variance=compute_beta_variance,
+                sample_space_preconditioner_rank=sample_space_preconditioner_rank,
+                predictor_offset=predictor_offset,
+                posterior_working_set_min_variants=posterior_working_set_min_variants,
+                posterior_working_set_initial_size=posterior_working_set_initial_size,
+                posterior_working_set_growth=posterior_working_set_growth,
+                posterior_working_set_max_passes=posterior_working_set_max_passes,
+                posterior_working_set_coefficient_tolerance=posterior_working_set_coefficient_tolerance,
+                restricted_posterior_warm_start=restricted_posterior_warm_start,
+                minimum_weight=minimum_weight,
+                allow_gpu_exact_variant=allow_gpu_exact_variant,
+                prior_precision_override=prior_precision_override,
+            )
+            if tr_result is None:
+                raise RuntimeError("TR-Newton returned no posterior state.")
+            return tr_result
+        except (TRNewtonNonConvergence, TRNewtonTimeout, _BinaryTRNewtonNotConverged) as exc:
+            log(
+                "      binary TR-Newton non-converged; falling back to PG-IRLS "
+                + f"(reason={exc})"
+            )
+            if tr_newton_require_convergence:
+                raise
+    elif resume_state is None:
+        # Fresh binary runs intentionally enter the same PG-IRLS path used by
+        # resumed block solves. The previous branch defaulted fresh fits into
+        # TR-Newton while resumes used PG-IRLS, reversing the safer solver
+        # choice documented above and exposing fresh runs to TR accept/reject
+        # stalls.
+        log("      binary PG-IRLS default path active (TR-Newton opt-in disabled)")
     covariate_count = covariate_matrix.shape[1]
     parameters = np.concatenate([alpha_init, beta_init], axis=0).astype(np.float64, copy=True)
     predictor_offset_array = (
@@ -4693,10 +4855,13 @@ def _binary_posterior_state(
     ) -> dict[str, object]:
         return {
             "completed_iterations": int(completed_iterations),
+            "inner_iteration": int(completed_iterations),
             "parameters": np.asarray(parameters_state, dtype=np.float64).copy(),
+            "beta": np.asarray(parameters_state[covariate_count:], dtype=np.float64).copy(),
             "current_linear_predictor": np.asarray(current_linear_predictor_state, dtype=np.float64).copy(),
             "current_objective": float(current_objective_state),
             "best_parameters": np.asarray(best_parameters_state, dtype=np.float64).copy(),
+            "best_beta": np.asarray(best_parameters_state[covariate_count:], dtype=np.float64).copy(),
             "best_linear_predictor": np.asarray(best_linear_predictor_state, dtype=np.float64).copy(),
             "best_objective": float(best_objective_state),
             "stall_count": int(stall_count_state),
@@ -4795,6 +4960,7 @@ def _binary_posterior_state(
     best_weights = _binary_expected_polya_gamma_weights(best_linear_predictor, minimum_weight)
     _binary_newton_iters_used = resume_completed_iterations
     timing_cupy = cupy if cupy is not None else (_try_import_cupy() if _newton_gpu_available else None)
+    last_progress_checkpoint_time = time.monotonic()
     for iteration_index in range(resume_completed_iterations, max_iterations):
         _binary_newton_iters_used = iteration_index + 1
         iteration_start = time.monotonic()
@@ -4964,7 +5130,16 @@ def _binary_posterior_state(
                 current_objective = best_objective
                 final_weights = best_weights
                 break
+        should_save_progress = False
         if progress_callback is not None:
+            checkpoint_interval_seconds = max(float(progress_checkpoint_seconds), 0.0)
+            now_for_progress = time.monotonic()
+            should_save_progress = (
+                iteration_index + 1 >= max_iterations
+                or checkpoint_interval_seconds <= 0.0
+                or now_for_progress - last_progress_checkpoint_time >= checkpoint_interval_seconds
+            )
+        if progress_callback is not None and should_save_progress:
             progress_callback(
                 _build_resume_snapshot(
                     completed_iterations=iteration_index + 1,
@@ -4977,6 +5152,7 @@ def _binary_posterior_state(
                     stall_count_state=stall_count,
                 )
             )
+            last_progress_checkpoint_time = time.monotonic()
         if (
             effective_predictor_step <= gradient_tolerance
             or max(effective_parameter_step, effective_predictor_step) <= gradient_tolerance
@@ -9285,6 +9461,15 @@ def _restricted_posterior_state_posterior_working_set(
         # Free GPU memory after extracting what we need
         working_set_genotypes._cupy_cache = None
         del working_set_genotypes
+        # Reclaim pool blocks + pinned-host pool immediately so the next pass's
+        # try_materialize_gpu sees the actual free budget.
+        try:
+            import cupy as _cp
+            _cp.cuda.Device().synchronize()
+            _cp.get_default_memory_pool().free_all_blocks()
+            _cp.get_default_pinned_memory_pool().free_all_blocks()
+        except (ImportError, AttributeError, RuntimeError, OSError):
+            pass
         candidate_beta = np.zeros(variant_count, dtype=np.float64)
         candidate_beta[working_indices] = np.asarray(subset_beta, dtype=np.float64)
         ever_active_indices = _ordered_unique_indices(

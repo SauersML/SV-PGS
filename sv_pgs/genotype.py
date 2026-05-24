@@ -1287,6 +1287,36 @@ def _standardize_int8_cupy(raw_values: Any, means: Any, scales: Any, cupy: Any, 
     return standardized
 
 
+def _standardize_int8_cupy_into(raw_values: Any, means: Any, scales: Any, output: Any, cupy: Any, *, dtype: Any) -> Any:
+    """Standardize int8 genotypes into a caller-owned fp staging buffer."""
+    resolved_dtype = cupy.float32 if dtype is None else dtype
+    elementwise_kernel = getattr(cupy, "ElementwiseKernel", None)
+    if elementwise_kernel is not None:
+        kernel_cache = getattr(_standardize_int8_cupy_into, "_kernel_cache", None)
+        if kernel_cache is None:
+            kernel_cache = {}
+            setattr(_standardize_int8_cupy_into, "_kernel_cache", kernel_cache)
+        cache_key = id(elementwise_kernel)
+        kernel = kernel_cache.get(cache_key)
+        if kernel is None:
+            kernel = elementwise_kernel(
+                "int8 raw, T means, T scales, int8 missing",
+                "T out",
+                "out = (raw == missing) ? (T)0 : (((T)raw - means) / scales)",
+                "sv_pgs_standardize_int8_missing_zero_into",
+            )
+            kernel_cache[cache_key] = kernel
+        return kernel(raw_values, means[None, :], scales[None, :], np.int8(PLINK_MISSING_INT8), output)
+
+    output[...] = raw_values
+    valid_mask = output != float(PLINK_MISSING_INT8)
+    output -= means[None, :]
+    output /= scales[None, :]
+    multiply = getattr(cupy, "multiply", np.multiply)
+    multiply(output, valid_mask, out=output)
+    return output
+
+
 def _to_cupy_compute(array: Any) -> Any:
     cupy = _try_import_cupy()
     if cupy is None:
@@ -1704,45 +1734,194 @@ _GPU_RESERVED_OVERHEAD_BYTES = 1_500_000_000  # 1.5 GB
 _GPU_BUDGET_TOTAL_FRACTION_CEILING = 0.90
 
 
-def _gpu_materialization_budget_bytes(cupy: Any) -> int:
-    """GPU cache budget: total device memory minus a fixed overhead margin.
+@dataclass(frozen=True, slots=True)
+class _GpuMaterializationMemoryPlan:
+    n_rows: int
+    n_cols: int
+    dtype_name: str
+    backend: str
+    storage_bytes: int
+    metadata_bytes: int
+    staging_bytes: int
+    result_vector_bytes: int
+    safety_margin_bytes: int
+    required_bytes: int
+    solver_headroom_bytes: int
+    budget_bytes: int
+    free_bytes: int
+    total_bytes: int
+    chunk_rows: int
 
-    Uses total memory (not free) to avoid dependence on JAX/XLA pre-allocation
-    state — JAX is already constrained via XLA_PYTHON_CLIENT_MEM_FRACTION in
-    _jax.py, so its peak footprint is bounded independently of this budget.
+    @property
+    def fits(self) -> bool:
+        return self.required_bytes <= self.budget_bytes
 
-    The 1.5 GB reserve covers the CUDA context (~500 MB), cuSOLVER workspace
-    for typical Cholesky/Gram operations (~256 MB peak), the JAX/XLA reserved
-    fraction (~10% of device memory), and a safety margin. The 90% ceiling
-    prevents the budget from ever consuming the entire device on very large
-    GPUs where 1.5 GB reserve would still leave too thin a margin.
 
-    The earlier "40% of total" heuristic was a conservative defensive value
-    chosen before JAX preallocation was constrained. It is too tight on
-    common 16 GB GPUs: a 14 GB standardized matrix is rejected, falling back
-    to a per-block streaming SVI path that is ~25× slower and does not
-    converge under the existing Robbins-Monro schedule.
+def _bytes_gb(value: int) -> str:
+    return f"{int(value) / 1e9:.2f} GB"
+
+
+def _gpu_solver_headroom_bytes(
+    *,
+    n_rows: int,
+    n_cols: int,
+    dtype: Any,
+    backend: str,
+    chunk_rows: int,
+    result_vector_count: int,
+    safety_margin_bytes: int,
+) -> tuple[int, int, int]:
+    """Return staging, result-vector, and safety headroom for GPU solves.
+
+    Terms:
+    - int8 staging buffer: row-chunked int8-resident matvec promotes only
+      ``chunk_rows x n_cols`` values into a reusable fp32/fp64 staging slab.
+    - result vectors: sample-space and variant-space vectors that stay live
+      during matvec/HVP/TR-Newton iterations.
+    - safety margin: CuPy pool fragmentation, CUDA/cuBLAS workspaces, and
+      TR-Newton/HVP temporaries not owned by the genotype cache.
+    """
+    resolved_dtype = _cupy_dtype_to_numpy_dtype(np.float32 if dtype is None else dtype)
+    compute_itemsize = max(int(resolved_dtype.itemsize), np.dtype(np.float32).itemsize)
+    safe_chunk_rows = max(1, min(int(chunk_rows), max(int(n_rows), 1)))
+    staging_bytes = 0
+    if "int8" in backend:
+        staging_bytes = safe_chunk_rows * int(n_cols) * compute_itemsize
+    vector_count = max(int(result_vector_count), 1)
+    result_vector_bytes = vector_count * (int(n_rows) + int(n_cols)) * compute_itemsize
+    safety_bytes = max(int(safety_margin_bytes), 0)
+    return int(staging_bytes), int(result_vector_bytes), int(safety_bytes)
+
+
+def _gpu_materialization_budget_bytes(
+    cupy: Any,
+    *,
+    n_rows: int = 0,
+    n_cols: int = 0,
+    dtype: Any = np.float32,
+    backend: str = "unknown",
+    chunk_rows: int = GPU_INT8_MATMUL_STAGING_ROWS,
+    result_vector_count: int = 2,
+    safety_margin_bytes: int = _GPU_RESERVED_OVERHEAD_BYTES,
+) -> int:
+    """GPU cache bytes available after live-memory and solver headroom.
+
+    Start with ``total_mem * 0.9`` capped by allocatable free memory. Then
+    subtract solver headroom: int8 fp32 staging, live result vectors, and a
+    1.5 GB safety margin for TR-Newton/HVP temporaries plus CuPy pool
+    fragmentation. Cached CuPy pool blocks are released before measuring free
+    bytes; live CuPy/JAX allocations remain counted against ``free``.
     """
     total = _gpu_total_bytes(cupy)
     if total <= 0:
         return 0
-    reserved = min(_GPU_RESERVED_OVERHEAD_BYTES, int(total * (1.0 - _GPU_BUDGET_TOTAL_FRACTION_CEILING)))
-    budget = max(total - _GPU_RESERVED_OVERHEAD_BYTES, int(total * 0.5))
-    budget = min(budget, int(total * _GPU_BUDGET_TOTAL_FRACTION_CEILING), total - reserved)
-    # Cap by actual *effective free* memory (CUDA-free + pool-free, after pool
-    # reclaim) so co-tenant processes holding the bulk of the device don't
-    # lead us to size allocations as if the GPU were empty, while still
-    # crediting blocks that CuPy's pool is caching as available.
     try:
         cupy.cuda.Device().synchronize()
     except (AttributeError, OSError, RuntimeError):
         pass
     _release_cupy_cached_memory(cupy)
     free = _gpu_effective_free_bytes(cupy)
+    capped_available = int(total * _GPU_BUDGET_TOTAL_FRACTION_CEILING)
     if free > 0:
-        free_budget = max(free - _GPU_RESERVED_OVERHEAD_BYTES, int(free * 0.5))
-        budget = min(budget, free_budget)
-    return max(budget, 0)
+        capped_available = min(capped_available, int(free))
+    staging_bytes, result_vector_bytes, safety_bytes = _gpu_solver_headroom_bytes(
+        n_rows=max(int(n_rows), 0),
+        n_cols=max(int(n_cols), 0),
+        dtype=dtype,
+        backend=backend,
+        chunk_rows=chunk_rows,
+        result_vector_count=result_vector_count,
+        safety_margin_bytes=safety_margin_bytes,
+    )
+    return max(capped_available - staging_bytes - result_vector_bytes - safety_bytes, 0)
+
+
+def _call_gpu_materialization_budget_bytes(cupy: Any, **kwargs: Any) -> int:
+    try:
+        return _gpu_materialization_budget_bytes(cupy, **kwargs)
+    except TypeError:
+        return _gpu_materialization_budget_bytes(cupy)
+
+
+def _estimate_gpu_materialization_memory_plan(
+    *,
+    n_rows: int,
+    n_cols: int,
+    dtype: Any,
+    backend: str,
+    cupy: Any,
+    metadata_bytes: int = 0,
+    chunk_rows: int = GPU_INT8_MATMUL_STAGING_ROWS,
+    result_vector_count: int = 2,
+    safety_margin_bytes: int = _GPU_RESERVED_OVERHEAD_BYTES,
+) -> _GpuMaterializationMemoryPlan:
+    resolved_dtype = _cupy_dtype_to_numpy_dtype(dtype)
+    rows = max(int(n_rows), 0)
+    cols = max(int(n_cols), 0)
+    storage_bytes = rows * cols * int(resolved_dtype.itemsize)
+    staging_bytes, result_vector_bytes, safety_bytes = _gpu_solver_headroom_bytes(
+        n_rows=rows,
+        n_cols=cols,
+        dtype=dtype,
+        backend=backend,
+        chunk_rows=chunk_rows,
+        result_vector_count=result_vector_count,
+        safety_margin_bytes=safety_margin_bytes,
+    )
+    budget_bytes = _call_gpu_materialization_budget_bytes(
+        cupy,
+        n_rows=rows,
+        n_cols=cols,
+        dtype=dtype,
+        backend=backend,
+        chunk_rows=chunk_rows,
+        result_vector_count=result_vector_count,
+        safety_margin_bytes=safety_margin_bytes,
+    )
+    return _GpuMaterializationMemoryPlan(
+        n_rows=rows,
+        n_cols=cols,
+        dtype_name=resolved_dtype.name,
+        backend=backend,
+        storage_bytes=int(storage_bytes),
+        metadata_bytes=int(metadata_bytes),
+        staging_bytes=int(staging_bytes),
+        result_vector_bytes=int(result_vector_bytes),
+        safety_margin_bytes=int(safety_bytes),
+        required_bytes=int(storage_bytes + metadata_bytes),
+        solver_headroom_bytes=int(staging_bytes + result_vector_bytes + safety_bytes),
+        budget_bytes=int(budget_bytes),
+        free_bytes=_gpu_effective_free_bytes(cupy),
+        total_bytes=_gpu_total_bytes(cupy),
+        chunk_rows=max(1, min(int(chunk_rows), max(rows, 1))),
+    )
+
+
+def _log_gpu_materialization_memory_plan(plan: _GpuMaterializationMemoryPlan) -> None:
+    log(
+        "    GPU materialization plan: "
+        + f"backend={plan.backend} dtype={plan.dtype_name} shape={plan.n_rows}x{plan.n_cols} "
+        + f"storage={_bytes_gb(plan.storage_bytes)} metadata={_bytes_gb(plan.metadata_bytes)} "
+        + f"staging={_bytes_gb(plan.staging_bytes)}({plan.chunk_rows} rows) "
+        + f"result_vectors={_bytes_gb(plan.result_vector_bytes)} "
+        + f"safety={_bytes_gb(plan.safety_margin_bytes)} "
+        + f"headroom={_bytes_gb(plan.solver_headroom_bytes)} "
+        + f"budget={_bytes_gb(plan.budget_bytes)} free={_bytes_gb(plan.free_bytes)} "
+        + f"total={_bytes_gb(plan.total_bytes)}  mem={mem()}"
+    )
+
+
+def _warn_gpu_materialization_unavailable(reason: str, plan: _GpuMaterializationMemoryPlan) -> None:
+    log(
+        "    WARNING: GPU materialization unavailable; streaming will be used. "
+        + f"reason={reason}; backend={plan.backend} dtype={plan.dtype_name} "
+        + f"required={_bytes_gb(plan.required_bytes)} budget={_bytes_gb(plan.budget_bytes)} "
+        + f"storage={_bytes_gb(plan.storage_bytes)} metadata={_bytes_gb(plan.metadata_bytes)} "
+        + f"headroom={_bytes_gb(plan.solver_headroom_bytes)} "
+        + f"staging={_bytes_gb(plan.staging_bytes)} result_vectors={_bytes_gb(plan.result_vector_bytes)} "
+        + f"safety={_bytes_gb(plan.safety_margin_bytes)} free={_bytes_gb(plan.free_bytes)} "
+        + f"total={_bytes_gb(plan.total_bytes)}  mem={mem()}"
+    )
 
 
 @dataclass(slots=True)
@@ -1901,8 +2080,101 @@ def _cupy_cache_standardized_columns(
     return cache[:, local_variant_indices].astype(resolved_dtype, copy=False)
 
 
+def _cupy_cache_is_fp16_resident(cache: Any | None) -> bool:
+    if cache is None or _cupy_cache_is_int8_standardized(cache):
+        return False
+    try:
+        return np.dtype(cache.dtype) == np.dtype(np.float16)
+    except (AttributeError, TypeError):
+        return False
+
+
 def _dense_array_cache_available(cache: Any | None) -> bool:
-    return cache is not None and not _cupy_cache_is_int8_standardized(cache)
+    return cache is not None and not _cupy_cache_is_int8_standardized(cache) and not _cupy_cache_is_fp16_resident(cache)
+
+
+def _gpu_int8_cache_variant_matmul(
+    cache: _CupyInt8StandardizedCache,
+    matrix_gpu: Any,
+    *,
+    local_variant_indices: NDArray | None,
+    cupy: Any,
+    dtype: Any,
+) -> Any:
+    selected_count = int(matrix_gpu.shape[0])
+    if selected_count == 0:
+        return cupy.zeros((cache.shape[0], matrix_gpu.shape[1]), dtype=dtype)
+    if local_variant_indices is None:
+        selector: Any = slice(None)
+        means = cache.means.astype(dtype, copy=False)
+        scales = cache.scales.astype(dtype, copy=False)
+    else:
+        selector = np.asarray(local_variant_indices, dtype=np.int32)
+        means = cache.means[selector].astype(dtype, copy=False)
+        scales = cache.scales[selector].astype(dtype, copy=False)
+    raw_selector = cache._resolve_raw_selector(selector)
+    chunk_rows = max(1, min(GPU_INT8_MATMUL_STAGING_ROWS, int(cache.shape[0])))
+    empty_fn = getattr(cupy, "empty", np.empty)
+    staging = empty_fn((chunk_rows, selected_count), dtype=dtype)
+    result_gpu = empty_fn((cache.shape[0], matrix_gpu.shape[1]), dtype=dtype)
+    for row_start in range(0, cache.shape[0], chunk_rows):
+        row_stop = min(row_start + chunk_rows, cache.shape[0])
+        row_slice = slice(row_start, row_stop)
+        active_rows = row_stop - row_start
+        staging_chunk = staging[:active_rows, :]
+        raw_chunk = cache.raw_values[row_slice, raw_selector]
+        _standardize_int8_cupy_into(raw_chunk, means, scales, staging_chunk, cupy, dtype=dtype)
+        result_gpu[row_slice, :] = staging_chunk @ matrix_gpu
+    return result_gpu
+
+
+def _gpu_int8_cache_transpose_matmul(
+    cache: _CupyInt8StandardizedCache,
+    matrix_gpu: Any,
+    *,
+    cupy: Any,
+    dtype: Any,
+) -> Any:
+    variant_count = int(cache.shape[1])
+    if variant_count == 0:
+        return cupy.zeros((0, matrix_gpu.shape[1]), dtype=dtype)
+    means = cache.means.astype(dtype, copy=False)
+    scales = cache.scales.astype(dtype, copy=False)
+    raw_selector = cache._resolve_raw_selector(slice(None))
+    chunk_rows = max(1, min(GPU_INT8_MATMUL_STAGING_ROWS, int(cache.shape[0])))
+    empty_fn = getattr(cupy, "empty", np.empty)
+    zeros_fn = getattr(cupy, "zeros", np.zeros)
+    staging = empty_fn((chunk_rows, variant_count), dtype=dtype)
+    result_gpu = zeros_fn((variant_count, matrix_gpu.shape[1]), dtype=dtype)
+    for row_start in range(0, cache.shape[0], chunk_rows):
+        row_stop = min(row_start + chunk_rows, cache.shape[0])
+        row_slice = slice(row_start, row_stop)
+        active_rows = row_stop - row_start
+        staging_chunk = staging[:active_rows, :]
+        raw_chunk = cache.raw_values[row_slice, raw_selector]
+        _standardize_int8_cupy_into(raw_chunk, means, scales, staging_chunk, cupy, dtype=dtype)
+        result_gpu += staging_chunk.T @ matrix_gpu[row_slice, :]
+    return result_gpu
+
+
+def _gpu_fp16_cache_variant_matmul(
+    cache: Any,
+    matrix_gpu: Any,
+    *,
+    local_variant_indices: NDArray | None,
+    cupy: Any,
+    dtype: Any,
+) -> Any:
+    fp16_dtype = getattr(cupy, "float16", np.float16)
+    rhs = matrix_gpu.astype(fp16_dtype, copy=False)
+    lhs = cache if local_variant_indices is None else cache[:, np.asarray(local_variant_indices, dtype=np.int32)]
+    return (lhs @ rhs).astype(dtype, copy=False)
+
+
+def _gpu_fp16_cache_transpose_matmul(cache: Any, matrix_gpu: Any, *, cupy: Any, dtype: Any) -> Any:
+    fp16_dtype = getattr(cupy, "float16", np.float16)
+    rhs = matrix_gpu.astype(fp16_dtype, copy=False)
+    return (cache.T @ rhs).astype(dtype, copy=False)
 
 
 def _iter_cupy_cache_standardized_batches(
@@ -2649,64 +2921,110 @@ class StandardizedGenotypeMatrix:
         cupy = _try_import_cupy()
         if cupy is None:
             return False
+        active_plan: _GpuMaterializationMemoryPlan | None = None
         try:
             use_int8_gpu_cache = self._dense_cache is None and self.raw is not None and _supports_int8_batches(self.raw)
-            nbytes = (
-                int(self.shape[0]) * int(self.shape[1])
-                + int(self.shape[1]) * np.dtype(np.float32).itemsize * 2
-                if use_int8_gpu_cache
-                else self.dense_bytes()
-            )
-            budget_bytes = _gpu_materialization_budget_bytes(cupy)
-            if use_int8_gpu_cache:
-                # int8 caches are 1 byte/element; the conservative float32-oriented
-                # budget rejects feasible allocations (e.g. 4.6 GB cache on a 16 GB
-                # T4), forcing the slow mmap-streaming path. Free pool blocks and
-                # decide against actual free memory + a small workspace reserve;
-                # the surrounding try/except still catches OutOfMemoryError.
-                workspace_reserve = _int8_gpu_workspace_bytes()
-                _release_cupy_cached_memory(cupy)
-                free_after_release = _gpu_free_bytes(cupy)
-                log(
-                    f"    int8 GPU materialization attempt: nbytes={nbytes / 1e9:.2f} GB "
-                    f"free={free_after_release / 1e9:.2f} GB "
-                    f"workspace_reserve={workspace_reserve / 1e9:.2f} GB "
-                    f"budget={budget_bytes / 1e9:.2f} GB (advisory)  mem={mem()}"
+            metadata_bytes = int(self.shape[1]) * np.dtype(np.float32).itemsize * 2
+            if self._dense_cache is not None:
+                active_plan = _estimate_gpu_materialization_memory_plan(
+                    n_rows=self.shape[0],
+                    n_cols=self.shape[1],
+                    dtype=np.float32,
+                    backend="fp32-resident",
+                    cupy=cupy,
                 )
-                if free_after_release > 0 and nbytes + workspace_reserve > free_after_release:
-                    log(
-                        f"    skipping int8 GPU materialization: need {nbytes / 1e9:.2f} GB "
-                        f"+ {workspace_reserve / 1e9:.2f} GB workspace > "
-                        f"{free_after_release / 1e9:.2f} GB free  mem={mem()}"
-                    )
+                _log_gpu_materialization_memory_plan(active_plan)
+                if not active_plan.fits:
+                    _warn_gpu_materialization_unavailable("fp32 cache exceeds budget", active_plan)
                     return False
-            elif nbytes > budget_bytes:
-                log(
-                    f"    GPU materialization exceeds budget: need {nbytes / 1e9:.1f} GB, "
-                    f"budget is {budget_bytes / 1e9:.1f} GB (float32); reclaiming CuPy pool  mem={mem()}"
+                nbytes = active_plan.required_bytes
+            elif use_int8_gpu_cache:
+                fp16_dtype = getattr(cupy, "float16", None)
+                if (
+                    GPU_FP16_RESIDENT_CACHE_ENABLED
+                    and fp16_dtype is not None
+                    and _cupy_compute_dtype(cupy) == cupy.float32
+                ):
+                    fp16_plan = _estimate_gpu_materialization_memory_plan(
+                        n_rows=self.shape[0],
+                        n_cols=self.shape[1],
+                        dtype=fp16_dtype,
+                        backend="fp16-resident",
+                        cupy=cupy,
+                    )
+                    _log_gpu_materialization_memory_plan(fp16_plan)
+                    if fp16_plan.fits:
+                        active_plan = fp16_plan
+                        nbytes = active_plan.required_bytes
+                    else:
+                        log("    fp16 GPU materialization plan does not fit; evaluating int8-resident cache")
+                        active_plan = None
+                if active_plan is None:
+                    active_plan = _estimate_gpu_materialization_memory_plan(
+                        n_rows=self.shape[0],
+                        n_cols=self.shape[1],
+                        dtype=np.int8,
+                        backend="int8-resident",
+                        cupy=cupy,
+                        metadata_bytes=metadata_bytes,
+                    )
+                    _log_gpu_materialization_memory_plan(active_plan)
+                    if not active_plan.fits:
+                        _warn_gpu_materialization_unavailable("int8 cache exceeds budget", active_plan)
+                        return False
+                    nbytes = active_plan.required_bytes
+            else:
+                active_plan = _estimate_gpu_materialization_memory_plan(
+                    n_rows=self.shape[0],
+                    n_cols=self.shape[1],
+                    dtype=np.float32,
+                    backend="fp32-resident",
+                    cupy=cupy,
                 )
-                _release_cupy_cached_memory(cupy)
-                try:
-                    cupy.cuda.Device().synchronize()
-                except (AttributeError, OSError, RuntimeError):
-                    pass
-                budget_bytes = _gpu_materialization_budget_bytes(cupy)
-                if nbytes > budget_bytes:
-                    log(
-                        f"    GPU materialization still exceeds budget: need {nbytes / 1e9:.1f} GB, "
-                        f"budget is {budget_bytes / 1e9:.1f} GB; attempting upload anyway (OOM-driven)  mem={mem()}"
-                    )
-                else:
-                    log(
-                        f"    GPU materialization fits after CuPy pool reclaim "
-                        f"(budget={budget_bytes / 1e9:.1f} GB)  mem={mem()}"
-                    )
+                _log_gpu_materialization_memory_plan(active_plan)
+                if not active_plan.fits:
+                    _warn_gpu_materialization_unavailable("fp32 cache exceeds budget", active_plan)
+                    return False
+                nbytes = active_plan.required_bytes
+            budget_bytes = active_plan.budget_bytes
             if self._dense_cache is not None:
                 log(f"    uploading RAM-resident matrix to GPU ({nbytes / 1e9:.1f} GB)  mem={mem()}")
-                self._cupy_cache = cupy.asarray(self._dense_cache)
+                # Defer-and-restore on OOM: keep ``self._dense_cache`` populated
+                # until *after* the async H2D copy has been synchronized. If the
+                # device-side allocation or copy raises an out-of-memory error
+                # (which can surface asynchronously at synchronize time), we
+                # restore the host cache so callers can still fall back to
+                # host-resident computation instead of being left with neither
+                # a GPU nor a dense cache.
                 dense_ref = self._dense_cache
+                try:
+                    self._cupy_cache = cupy.asarray(dense_ref)
+                    cupy.cuda.Device().synchronize()
+                except BaseException:
+                    self._cupy_cache = None
+                    self._dense_cache = dense_ref
+                    raise
                 self._dense_cache = None
                 del dense_ref
+            elif use_int8_gpu_cache and active_plan.backend == "fp16-resident":
+                log(f"    uploading standardized genotypes to GPU fp16 cache ({nbytes / 1e9:.1f} GB)  mem={mem()}")
+                raw_matrix = self.raw
+                if raw_matrix is None:
+                    raise RuntimeError("fp16 GPU cache requires raw backing storage.")
+                gpu_matrix = cupy.empty(self.shape, dtype=cupy.float16, order="F")
+                _upload_standardized_int8_tiles_overlapped(
+                    cupy=cupy,
+                    raw_int8=cast(Int8BatchCapable, raw_matrix),
+                    variant_indices=self.variant_indices,
+                    means=self.means,
+                    scales=self.scales,
+                    gpu_destination=gpu_matrix,
+                    sample_count=int(self.shape[0]),
+                    upload_batch_size=auto_batch_size_i8(self.shape[0]),
+                    standardized_dtype=cupy.float16,
+                )
+                cupy.cuda.Device().synchronize()
+                self._cupy_cache = gpu_matrix
             elif use_int8_gpu_cache:
                 log(f"    uploading raw int8 genotypes to GPU ({nbytes / 1e9:.1f} GB incl. scales)  mem={mem()}")
                 raw_matrix = self.raw
@@ -2852,6 +3170,8 @@ class StandardizedGenotypeMatrix:
                 raise
             _release_cupy_cached_memory(cupy)
             log(f"    CuPy GPU upload failed ({exc})  mem={mem()}")
+            if active_plan is not None:
+                _warn_gpu_materialization_unavailable(f"allocation failed: {exc}", active_plan)
             return False
 
     def try_materialize_gpu_subset(
@@ -2886,13 +3206,17 @@ class StandardizedGenotypeMatrix:
         cupy = _try_import_cupy()
         if cupy is None:
             return None
-        nbytes = int(self.shape[0]) * int(resolved_local_indices.shape[0]) * 4
-        budget_bytes = _gpu_materialization_budget_bytes(cupy)
-        if nbytes > budget_bytes:
-            log(
-                f"    skipping GPU subset materialization: need {nbytes / 1e9:.1f} GB, "
-                f"budget is {budget_bytes / 1e9:.1f} GB  mem={mem()}"
-            )
+        subset_plan = _estimate_gpu_materialization_memory_plan(
+            n_rows=self.shape[0],
+            n_cols=int(resolved_local_indices.shape[0]),
+            dtype=np.float32,
+            backend="fp32-subset",
+            cupy=cupy,
+        )
+        _log_gpu_materialization_memory_plan(subset_plan)
+        nbytes = subset_plan.required_bytes
+        if not subset_plan.fits:
+            _warn_gpu_materialization_unavailable("GPU subset exceeds budget", subset_plan)
             return None
         try:
             if self._dense_cache is not None:
@@ -2944,6 +3268,7 @@ class StandardizedGenotypeMatrix:
                 raise
             _release_cupy_cached_memory(cupy)
             log(f"    CuPy GPU subset upload failed ({exc})  mem={mem()}")
+            _warn_gpu_materialization_unavailable(f"subset allocation failed: {exc}", subset_plan)
             return None
 
     def try_materialize(self) -> bool:
@@ -3345,28 +3670,52 @@ class StandardizedGenotypeMatrix:
             if local_variant_indices is None:
                 cache = self._cupy_cache
                 if _cupy_cache_is_int8_standardized(cache):
-                    result_gpu = cupy.zeros((self.shape[0], matrix_gpu.shape[1]), dtype=resolved_dtype)
-                    for batch_slice, standardized_batch in _iter_cupy_cache_standardized_batches(
+                    result_gpu = _gpu_int8_cache_variant_matmul(
                         cache,
+                        matrix_gpu,
+                        local_variant_indices=None,
+                        cupy=cupy,
+                        dtype=resolved_dtype,
+                    )
+                elif _cupy_cache_is_fp16_resident(cache):
+                    result_gpu = _gpu_fp16_cache_variant_matmul(
+                        cache,
+                        matrix_gpu,
+                        local_variant_indices=None,
+                        cupy=cupy,
+                        dtype=resolved_dtype,
+                    )
+                else:
+                    result_gpu = cache.astype(resolved_dtype, copy=False) @ matrix_gpu
+            else:
+                cache = self._cupy_cache
+                if _cupy_cache_is_int8_standardized(cache):
+                    result_gpu = _gpu_int8_cache_variant_matmul(
+                        cache,
+                        matrix_gpu,
+                        local_variant_indices=resolved_local_indices,
+                        cupy=cupy,
+                        dtype=resolved_dtype,
+                    )
+                elif _cupy_cache_is_fp16_resident(cache):
+                    result_gpu = _gpu_fp16_cache_variant_matmul(
+                        cache,
+                        matrix_gpu,
+                        local_variant_indices=resolved_local_indices,
+                        cupy=cupy,
+                        dtype=resolved_dtype,
+                    )
+                else:
+                    result_gpu = cupy.zeros((self.shape[0], matrix_gpu.shape[1]), dtype=resolved_dtype)
+                    for operand_slice, standardized_batch in _iter_selected_cupy_cache_standardized_batches(
+                        cache,
+                        resolved_local_indices,
                         sample_count=self.shape[0],
                         batch_size=batch_size,
                         cupy=cupy,
                         dtype=resolved_dtype,
                     ):
-                        result_gpu += standardized_batch @ matrix_gpu[batch_slice, :]
-                else:
-                    result_gpu = cache.astype(resolved_dtype, copy=False) @ matrix_gpu
-            else:
-                result_gpu = cupy.zeros((self.shape[0], matrix_gpu.shape[1]), dtype=resolved_dtype)
-                for operand_slice, standardized_batch in _iter_selected_cupy_cache_standardized_batches(
-                    self._cupy_cache,
-                    resolved_local_indices,
-                    sample_count=self.shape[0],
-                    batch_size=batch_size,
-                    cupy=cupy,
-                    dtype=resolved_dtype,
-                ):
-                    result_gpu += standardized_batch @ matrix_gpu[operand_slice, :]
+                        result_gpu += standardized_batch @ matrix_gpu[operand_slice, :]
             return result_gpu[:, 0] if vector_input else result_gpu
         streaming_cupy, streaming_batch_size = self._streaming_gpu_context(
             batch_size,
@@ -3439,15 +3788,19 @@ class StandardizedGenotypeMatrix:
             raise ValueError("GPU genotype transpose matmul right-hand side row count must match the sample count.")
         if self._cupy_cache is not None:
             if _cupy_cache_is_int8_standardized(self._cupy_cache):
-                result_gpu = cupy.empty((self.shape[1], matrix_gpu.shape[1]), dtype=resolved_dtype)
-                for batch_slice, standardized_batch in _iter_cupy_cache_standardized_batches(
+                result_gpu = _gpu_int8_cache_transpose_matmul(
                     self._cupy_cache,
-                    sample_count=self.shape[0],
-                    batch_size=batch_size,
+                    matrix_gpu,
                     cupy=cupy,
                     dtype=resolved_dtype,
-                ):
-                    result_gpu[batch_slice, :] = standardized_batch.T @ matrix_gpu
+                )
+            elif _cupy_cache_is_fp16_resident(self._cupy_cache):
+                result_gpu = _gpu_fp16_cache_transpose_matmul(
+                    self._cupy_cache,
+                    matrix_gpu,
+                    cupy=cupy,
+                    dtype=resolved_dtype,
+                )
             else:
                 result_gpu = self._cupy_cache.astype(resolved_dtype, copy=False).T @ matrix_gpu
             return result_gpu[:, 0] if vector_input else result_gpu

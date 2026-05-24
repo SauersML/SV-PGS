@@ -856,6 +856,15 @@ def _solve_single_rhs(
     initial_residual = float(residual_norm_sq_jax)
     rhs_norm_sq = float(jnp.vdot(rhs, rhs))
     convergence_threshold_sq = tol_sq * max(rhs_norm_sq, 1.0)
+    if not np.isfinite(initial_residual):
+        return LinearSolveResult(
+            solution=np.asarray(best_solution, dtype=np.asarray(jnp.zeros((), dtype=solver_dtype)).dtype),
+            status=LinearSolveStatus.NUMERICAL_FAILURE,
+            iterations=0,
+            residual_norm=float("nan"),
+            matvec_count=matvec_count,
+            elapsed_seconds=time.monotonic() - t_start,
+        )
     if initial_residual <= convergence_threshold_sq:
         return LinearSolveResult(
             solution=np.asarray(solution, dtype=np.asarray(jnp.zeros((), dtype=solver_dtype)).dtype),
@@ -933,6 +942,25 @@ def _solve_single_rhs(
             best_residual_dot = updated_residual_dot
             best_solution = jnp.asarray(solution, dtype=solver_dtype)
         residual_norm = math.sqrt(max(updated_residual_dot, 0.0))
+        if not np.isfinite(updated_residual_dot):
+            _maybe_emit_cg_progress(
+                callback=progress_callback,
+                progress_interval=progress_interval,
+                iteration=iteration,
+                max_iterations=max_iterations,
+                started_at=t_start,
+                residual_norm=residual_norm,
+                matvec_count=matvec_count,
+                status=LinearSolveStatus.NUMERICAL_FAILURE,
+            )
+            return LinearSolveResult(
+                solution=np.asarray(best_solution, dtype=np.asarray(jnp.zeros((), dtype=solver_dtype)).dtype),
+                status=LinearSolveStatus.NUMERICAL_FAILURE,
+                iterations=iteration,
+                residual_norm=residual_norm,
+                matvec_count=matvec_count,
+                elapsed_seconds=time.monotonic() - t_start,
+            )
         _maybe_emit_cg_progress(
             callback=progress_callback,
             progress_interval=progress_interval,
@@ -1041,6 +1069,15 @@ def _solve_multiple_rhs(
     converged = residual_norm_sq <= convergence_threshold_sq
     best_solution = jnp.asarray(solution, dtype=solver_dtype)
     best_residual_norm_sq = float(np.max(residual_norm_sq))
+    if not np.isfinite(best_residual_norm_sq):
+        return LinearSolveResult(
+            solution=np.asarray(best_solution, dtype=output_dtype),
+            status=LinearSolveStatus.NUMERICAL_FAILURE,
+            iterations=0,
+            residual_norm=float("nan"),
+            matvec_count=matvec_count,
+            elapsed_seconds=time.monotonic() - t_start,
+        )
     if np.all(converged):
         return LinearSolveResult(
             solution=np.asarray(solution, dtype=output_dtype),
@@ -1129,6 +1166,26 @@ def _solve_multiple_rhs(
         converged = residual_norm_sq <= convergence_threshold_sq
         new_active_count = int(np.sum(~converged))
         residual_summary = float(np.max(residual_norm_sq))
+        if not np.isfinite(residual_summary):
+            _maybe_emit_cg_progress(
+                callback=progress_callback,
+                progress_interval=progress_interval,
+                iteration=iteration,
+                max_iterations=max_iterations,
+                started_at=t_start,
+                residual_norm=float("nan"),
+                matvec_count=matvec_count,
+                active_rhs=new_active_count,
+                status=LinearSolveStatus.NUMERICAL_FAILURE,
+            )
+            return LinearSolveResult(
+                solution=np.asarray(best_solution, dtype=output_dtype),
+                status=LinearSolveStatus.NUMERICAL_FAILURE,
+                iterations=iteration,
+                residual_norm=float("nan"),
+                matvec_count=matvec_count,
+                elapsed_seconds=time.monotonic() - t_start,
+            )
         if residual_summary < best_residual_norm_sq:
             best_residual_norm_sq = residual_summary
             best_solution = jnp.asarray(solution, dtype=solver_dtype)

@@ -133,6 +133,15 @@ def build_parser() -> argparse.ArgumentParser:
             "0.0 disables."
         ),
     )
+    run_parser.add_argument(
+        "--allow-nonconverged-export",
+        action="store_true",
+        help=(
+            "Export an artifact even when the variational fit reports "
+            "converged=False. Off by default to avoid shipping a PGS from "
+            "a non-converged posterior."
+        ),
+    )
 
     eval_parser = subparsers.add_parser(
         "evaluate-all-of-us",
@@ -245,6 +254,7 @@ def main(argv: list[str] | None = None) -> int:
         max_outer_iterations=args.max_outer_iterations,
         random_seed=args.random_seed,
         marginal_screen_min_abs_z=args.marginal_screen_min_abs_z,
+        allow_nonconverged_export=args.allow_nonconverged_export,
     )
     dataset = load_dataset_from_files(
         genotype_path=args.genotypes,

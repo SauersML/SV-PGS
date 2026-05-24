@@ -130,6 +130,12 @@ class ModelConfig:
     # calibration and non-identifiability until the final posterior pass.
     beta_variance_update_interval: int = 2
     final_posterior_diagnostics: bool = True
+    # When the variational fit reports converged=False, the model/pipeline
+    # refuses to export an artifact by default (to avoid shipping a PGS
+    # built from a non-converged posterior). Set True to override and export
+    # anyway — useful for debugging or for runs where partial progress is
+    # still informative.
+    allow_nonconverged_export: bool = False
     use_tr_newton_binary: bool = False
     cg_progress_interval: int = 5
     solver_wall_clock_budget_s: float = 600.0

@@ -211,6 +211,7 @@ def trust_region_newton_logistic(
     cg_max_iterations: int = 200,
     wall_clock_budget_s: float = 600.0,
     cg_progress_interval: int = 25,
+    raise_on_nonconvergence: bool = False,
 ) -> TrustRegionResult:
     """Trust-region Newton-CG for the penalized logistic posterior.
 
@@ -439,6 +440,11 @@ def trust_region_newton_logistic(
 # ---------------------------------------------------------------------------
 # GPU-native variant
 # ---------------------------------------------------------------------------
+#
+# Capability flag for call-sites that want to feature-detect the GPU path
+# without importing CuPy themselves.  True => the body below is a full
+# implementation (not a NotImplementedError stub).
+_TR_NEWTON_GPU_IMPLEMENTED: bool = True
 #
 # trust_region_newton_logistic_gpu mirrors the NumPy solver above but keeps
 # beta, alpha, eta, gradients, CG vectors and HVPs as CuPy arrays end-to-end.

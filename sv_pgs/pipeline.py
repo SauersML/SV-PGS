@@ -307,19 +307,42 @@ def _write_predictions_and_summary(
     is_training_dataset: bool = False,
 ) -> dict[str, Any]:
     log(f"computing predictions for {len(dataset.sample_ids)} samples, trait={model.config.trait_type.value}  mem={mem()}")
-    # Only reuse the model's cached training decision components when the
-    # caller explicitly asserts that `dataset` IS the training dataset.
-    # Matching shapes alone is not sufficient: a held-out cohort with the
-    # same sample count would silently borrow training scores otherwise.
+    # Only reuse the model's cached training decision components when we can
+    # prove this dataset IS the training cohort. Two guards must hold:
+    #   1) The caller explicitly asserts `is_training_dataset=True`.
+    #   2) The fitted state exposes `training_sample_ids` AND they match
+    #      `dataset.sample_ids` exactly (order included).
+    # Shape match alone is unsafe: a held-out cohort with the same sample
+    # count would silently borrow training scores. If `training_sample_ids`
+    # is not tracked on FittedState yet, we recompute. A small perf cost is
+    # preferable to silently emitting wrong predictions.
+    # NOTE: FittedState in sv_pgs/model.py (line ~86) does not yet carry a
+    # `training_sample_ids: Sequence[str] | None = None` field. Until that
+    # field is added (and populated by the trainer), the cache is never
+    # taken on this path. Adding it would let the cache fast-path engage.
     cached_components = None
     if is_training_dataset:
-        training_components_getter = getattr(model, "training_decision_components", None)
-        cached_components = None if training_components_getter is None else training_components_getter()
-    if (
-        cached_components is not None
-        and cached_components[0].shape == (len(dataset.sample_ids),)
-        and cached_components[1].shape == (len(dataset.sample_ids),)
-    ):
+        fitted_state = getattr(model, "state", None)
+        training_sample_ids = getattr(fitted_state, "training_sample_ids", None) if fitted_state is not None else None
+        if training_sample_ids is not None:
+            try:
+                ids_match = (
+                    len(training_sample_ids) == len(dataset.sample_ids)
+                    and list(training_sample_ids) == list(dataset.sample_ids)
+                )
+            except Exception:
+                ids_match = False
+            if ids_match:
+                training_components_getter = getattr(model, "training_decision_components", None)
+                if training_components_getter is not None:
+                    candidate = training_components_getter()
+                    if (
+                        candidate is not None
+                        and candidate[0].shape == (len(dataset.sample_ids),)
+                        and candidate[1].shape == (len(dataset.sample_ids),)
+                    ):
+                        cached_components = candidate
+    if cached_components is not None:
         genetic_score, covariate_score = cached_components
     else:
         genetic_score, covariate_score = model.decision_components(dataset.genotypes, dataset.covariates)

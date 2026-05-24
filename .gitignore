@@ -1,4 +1,11 @@
 __pycache__/
-.sv_pgs_cache/
-sv_pgs.egg-info/
 .DS_Store
+.sv_pgs_cache/
+*.log
+diagnose_runs*.txt
+falsify.txt
+inspect_runs.txt
+probe_*.txt
+sv_pgs.egg-info/
+swarm_findings/
+verify_fix.txt
