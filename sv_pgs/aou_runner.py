@@ -7,6 +7,7 @@ import os
 import shutil
 import subprocess
 import time
+import uuid
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
@@ -224,10 +225,22 @@ def _download_gcs_object_if_missing(remote_path: str, local_path: Path) -> None:
     if local_path.exists():
         return
     local_path.parent.mkdir(parents=True, exist_ok=True)
-    partial_path = local_path.with_name(local_path.name + ".partial")
-    partial_path.unlink(missing_ok=True)
+    # Use a per-process, per-call unique partial name so concurrent disease
+    # sweeps (multiple PIDs racing to fetch the same shared file) never share
+    # the same staging path. The losing racer's atomic replace still wins
+    # safely; the local_path.exists() recheck below short-circuits redundant
+    # downloads on subsequent calls.
+    partial_path = local_path.with_name(
+        f"{local_path.name}.partial.{os.getpid()}.{uuid.uuid4().hex}"
+    )
     try:
         _gsutil_cp(remote_path, str(partial_path))
+        if local_path.exists():
+            # Another concurrent fetcher won the race and atomically published
+            # the final file. Discard our staging copy.
+            partial_path.unlink(missing_ok=True)
+            return
+        # os.replace (Path.replace) is atomic on POSIX and overwrites cleanly.
         partial_path.replace(local_path)
     except (OSError, subprocess.SubprocessError, RuntimeError):
         partial_path.unlink(missing_ok=True)

@@ -88,17 +88,17 @@ def _log_int8_batch_throttled(
 
 
 def _madvise_willneed_array(array: NDArray) -> None:
-    """Best-effort posix_madvise(WILLNEED) on the mmap backing `array`.
+    """Best-effort MADV_WILLNEED on the mmap backing ``array``.
 
     Tells the kernel we'll touch the whole int8 cache soon and to retain
     those pages. Without this, per-block "uploading raw int8 genotypes to
     GPU" runs at disk speed instead of RAM speed when pages get evicted
     between training blocks under memory pressure.
+
+    Prefers ``mmap.mmap.madvise`` (works on Linux AND macOS in CPython
+    3.8+) and falls back to ``os.posix_madvise`` (Linux-only; missing on
+    darwin). No-op on systems without madvise support.
     """
-    posix_madvise = getattr(os, "posix_madvise", None)
-    willneed = getattr(os, "POSIX_MADV_WILLNEED", None)
-    if posix_madvise is None or willneed is None:
-        return
     try:
         import mmap as _mmap_module
     except ImportError:
@@ -112,6 +112,25 @@ def _madvise_willneed_array(array: NDArray) -> None:
         if isinstance(base, _mmap_module.mmap):
             break
     if not isinstance(base, _mmap_module.mmap):
+        return
+
+    # Preferred path: mmap.mmap.madvise(MADV_WILLNEED). Available on Linux
+    # and macOS; reaches the kernel hint directly without a syscall wrapper
+    # mismatch.
+    mmap_madvise = getattr(base, "madvise", None)
+    mmap_willneed = getattr(_mmap_module, "MADV_WILLNEED", None)
+    if mmap_madvise is not None and mmap_willneed is not None:
+        try:
+            mmap_madvise(mmap_willneed)
+            return
+        except (OSError, ValueError):
+            pass  # fall through to posix_madvise fallback
+
+    # Fallback for older/non-standard runtimes: os.posix_madvise (Linux only;
+    # absent on darwin, so it is genuinely a fallback rather than primary).
+    posix_madvise = getattr(os, "posix_madvise", None)
+    willneed = getattr(os, "POSIX_MADV_WILLNEED", None)
+    if posix_madvise is None or willneed is None:
         return
     try:
         posix_madvise(base, 0, len(base), willneed)

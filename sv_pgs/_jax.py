@@ -105,6 +105,20 @@ def tensor_core_matmul_enabled() -> bool:
     return _is_ampere_or_newer(_compute_capabilities())
 
 
+@lru_cache(maxsize=1)
+def hopper_or_newer_gpu_present() -> bool:
+    """True when at least one Hopper-class (SM 9.0+) GPU is visible.
+
+    Wired as a public hook so downstream tuning code (preconditioner ranks,
+    Gram-tile work targets, batch sizes) can opt into H100-friendly defaults
+    without re-querying nvidia-smi. Currently used to lift the CuPy memory
+    pool's growth-release log threshold on devices large enough that the T4
+    sized constant is noise, and reserved for future SM90 fp16-mma kernel
+    enablement.
+    """
+    return _is_hopper_or_newer(_compute_capabilities())
+
+
 if turing_workarounds_enabled():
     _xla_flags = os.environ.get("XLA_FLAGS", "")
     for flag in _TURING_WORKAROUND_FLAGS:

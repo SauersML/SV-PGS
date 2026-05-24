@@ -364,17 +364,44 @@ def _recommended_gpu_preconditioner_rank(cacheable_dense_variants: int) -> int:
     )
 
 
+def _device_scaled_exact_gram_work_target(total_gpu_bytes: int | None) -> float:
+    """Scale the per-iteration exact-Gram FLOPs target with device capability.
+
+    The baseline target is tuned for T4-class GPUs (~16 GB, ~8 TFLOPs fp32).
+    On larger devices, fp32 throughput scales roughly linearly with
+    HBM/SRAM-driven occupancy, so use device memory as a cheap proxy for
+    arithmetic capability without hardcoding a TFLOPs lookup table:
+
+      - 16 GB (T4):  1.0x   = 12 TFLOPs target
+      - 40 GB (A100-40): ~3x = 36 TFLOPs target
+      - 80 GB (A100-80/H100): ~5x+ = 60+ TFLOPs target
+
+    This keeps stochastic blocks in the exact-GPU regime on large devices
+    instead of fragmenting into many small batches and undersaturating the
+    SMs. Bytes are converted to fraction-of-T4-memory so the heuristic is
+    device-agnostic.
+    """
+    baseline = float(GPU_STOCHASTIC_EXACT_GRAM_WORK_TARGET)
+    if total_gpu_bytes is None or total_gpu_bytes <= 0:
+        return baseline
+    t4_reference_bytes = 16.0 * 1e9
+    scale = max(1.0, float(total_gpu_bytes) / t4_reference_bytes)
+    return baseline * scale
+
+
 def _recommended_gpu_stochastic_batch_size(
     *,
     cacheable_dense_variants: int,
     sample_count: int,
+    total_gpu_bytes: int | None = None,
 ) -> int:
     if cacheable_dense_variants < 1:
         return 256
     dense_budget_batch_size = int(cacheable_dense_variants * 0.85)
+    scaled_work_target = _device_scaled_exact_gram_work_target(total_gpu_bytes)
     exact_gpu_work_batch_size = int(
         math.sqrt(
-            GPU_STOCHASTIC_EXACT_GRAM_WORK_TARGET
+            scaled_work_target
             / max(float(sample_count), 1.0)
         )
     )
@@ -428,9 +455,11 @@ def runtime_training_policy_for_fit(
     # the exact-GPU solve regime instead of drifting into slower sample-space CG.
     # Do not re-floor at 256 here — the helper already caps the floor by the
     # dense budget so tight-GPU runs can return a smaller (but feasible) value.
+    _, total_gpu_bytes = _gpu_memory_info(cupy)
     tuned_stochastic_batch_size = _recommended_gpu_stochastic_batch_size(
         cacheable_dense_variants=cacheable_dense_variants,
         sample_count=sample_count,
+        total_gpu_bytes=total_gpu_bytes,
     )
     tuned_config = replace(
         config,
