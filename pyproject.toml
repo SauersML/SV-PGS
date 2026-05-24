@@ -29,6 +29,9 @@ sv-pgs = "sv_pgs.cli:main"
 [tool.setuptools.packages.find]
 include = ["sv_pgs*"]
 
+[tool.setuptools.package-data]
+sv_pgs = ["_data/*.tsv"]
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 
