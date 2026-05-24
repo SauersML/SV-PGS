@@ -1557,6 +1557,112 @@ def test_model_fit_keeps_streaming_when_materialization_is_skipped(monkeypatch):
 
     assert model.state is not None
 
+
+def test_aou_scale_fit_skips_full_active_set_materialization():
+    matrix = type("ShapeOnly", (), {"shape": (331_945, 695_875)})()
+    config = ModelConfig(
+        trait_type=TraitType.BINARY,
+        stochastic_variant_batch_size=6_185,
+    )
+
+    assert model_module._skip_full_matrix_materialization_for_blocks(
+        matrix,
+        config,
+        label="training",
+    )
+
+
+def test_small_fit_allows_full_materialization():
+    matrix = type("ShapeOnly", (), {"shape": (16, 24)})()
+    config = ModelConfig(
+        trait_type=TraitType.BINARY,
+        stochastic_variant_batch_size=8,
+    )
+
+    assert not model_module._skip_full_matrix_materialization_for_blocks(
+        matrix,
+        config,
+        label="training",
+    )
+
+
+def test_large_stochastic_fit_skips_full_active_set_materialization(monkeypatch):
+    sample_count = 16
+    variant_count = 24
+    rng = np.random.default_rng(456)
+    genotype_matrix = rng.integers(0, 3, size=(sample_count, variant_count)).astype(np.float32)
+    covariate_matrix = np.zeros((sample_count, 1), dtype=np.float32)
+    target_vector = rng.binomial(1, 0.5, size=sample_count).astype(np.float32)
+    variant_records = [
+        VariantRecord(f"variant_{index}", VariantClass.SNV, "1", 100 + index)
+        for index in range(variant_count)
+    ]
+    variant_stats = VariantStatistics(
+        means=np.zeros(variant_count, dtype=np.float32),
+        scales=np.ones(variant_count, dtype=np.float32),
+        allele_frequencies=np.full(variant_count, 0.25, dtype=np.float32),
+        support_counts=np.ones(variant_count, dtype=np.int32),
+    )
+
+    def forbid_full_cache(self):
+        if int(self.shape[1]) > 8:
+            raise AssertionError("full active-set materialization should be skipped")
+        return False
+
+    monkeypatch.setattr(genotype_module.StandardizedGenotypeMatrix, "try_materialize_gpu", forbid_full_cache)
+    monkeypatch.setattr(genotype_module.StandardizedGenotypeMatrix, "try_materialize", forbid_full_cache)
+    monkeypatch.setattr(genotype_module.StandardizedGenotypeMatrix, "try_cache_locally", forbid_full_cache)
+    monkeypatch.setattr(
+        model_module,
+        "_skip_full_matrix_materialization_for_blocks",
+        lambda *args, **kwargs: True,
+    )
+
+    captured_shape: tuple[int, int] | None = None
+
+    def fake_fit_variational_em(**kwargs):
+        nonlocal captured_shape
+        captured_shape = tuple(kwargs["genotypes"].shape)
+        return VariationalFitResult(
+            alpha=np.zeros(covariate_matrix.shape[1] + 1, dtype=np.float32),
+            beta_reduced=np.zeros(variant_count, dtype=np.float32),
+            beta_variance=np.ones(variant_count, dtype=np.float64),
+            prior_scales=np.ones(variant_count, dtype=np.float64),
+            global_scale=1.0,
+            class_tpb_shape_a={VariantClass.SNV: 1.0},
+            class_tpb_shape_b={VariantClass.SNV: 1.0},
+            scale_model_coefficients=np.zeros(1, dtype=np.float64),
+            scale_model_feature_names=["intercept"],
+            sigma_error2=1.0,
+            objective_history=[0.0],
+            validation_history=[],
+            member_prior_variances=np.ones(variant_count, dtype=np.float64),
+            linear_predictor=np.zeros(sample_count, dtype=np.float32),
+            selected_iteration_count=1,
+            converged=True,
+        )
+
+    monkeypatch.setattr(model_module, "fit_variational_em", fake_fit_variational_em)
+
+    model = BayesianPGS(
+        ModelConfig(
+            trait_type=TraitType.BINARY,
+            max_outer_iterations=1,
+            minimum_minor_allele_frequency=0.0,
+            stochastic_variant_batch_size=8,
+        )
+    ).fit(
+        genotype_matrix,
+        covariate_matrix,
+        target_vector,
+        variant_records,
+        variant_stats=variant_stats,
+    )
+
+    assert model.state is not None
+    assert captured_shape == (sample_count, variant_count)
+
+
 def test_raw_standardized_subset_matvec_reads_only_requested_columns():
     class SpyRawGenotypeMatrix(RawGenotypeMatrix):
         def __init__(self, matrix: np.ndarray) -> None:

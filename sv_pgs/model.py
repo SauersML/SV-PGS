@@ -83,6 +83,36 @@ def _select_active_variant_indices_fast(
     return np.flatnonzero(maf >= minimum_minor_allele_frequency).astype(np.int32)
 
 
+def _gb(value: int) -> str:
+    return f"{int(value) / 1e9:.1f} GB"
+
+
+def _skip_full_matrix_materialization_for_blocks(
+    genotype_matrix: StandardizedGenotypeMatrix,
+    config: ModelConfig,
+    *,
+    label: str,
+) -> bool:
+    rows, cols = genotype_matrix.shape
+    block_cols = min(max(int(config.stochastic_variant_batch_size), 1), int(cols))
+    if block_cols >= int(cols):
+        return False
+    full_int8_bytes = int(rows) * int(cols)
+    block_int8_bytes = int(rows) * int(block_cols)
+    if full_int8_bytes < 32_000_000_000:
+        return False
+    if full_int8_bytes < block_int8_bytes * 4:
+        return False
+    log(
+        f"skipping full {label} genotype materialization: "
+        + f"full matrix would require {_gb(full_int8_bytes)} as int8 "
+        + f"({_gb(full_int8_bytes * 4)} as fp32), while block EM uses LD/variant "
+        + f"{block_cols:,}-variant blocks (~{_gb(block_int8_bytes)} int8 each). "
+        + f"Using block streaming/GPU kernels instead.  mem={mem()}"
+    )
+    return True
+
+
 @dataclass(slots=True)
 class FittedState:
     variant_records: list[VariantRecord]
@@ -1211,20 +1241,26 @@ class BayesianPGS:
         gc.collect()
         log(f"  freed. mem={mem()}")
 
-        # Materialize the reduced genotype matrix (RAM or GPU via CuPy).
-        log(f"materializing reduced genotype matrix ({reduced_genotypes.shape})...")
-        in_memory = reduced_genotypes.try_materialize_gpu()
-        if in_memory:
-            log(f"  GPU materialization succeeded  mem={mem()}")
-        if not in_memory:
-            in_memory = reduced_genotypes.try_materialize()
+        allow_full_reduced_cache = not _skip_full_matrix_materialization_for_blocks(
+            reduced_genotypes,
+            self.config,
+            label="training",
+        )
+        in_memory = False
+        if allow_full_reduced_cache:
+            log(f"materializing reduced genotype matrix ({reduced_genotypes.shape})...")
+            in_memory = reduced_genotypes.try_materialize_gpu()
             if in_memory:
-                log(f"  RAM materialization succeeded  mem={mem()}")
+                log(f"  GPU materialization succeeded  mem={mem()}")
+            if not in_memory:
+                in_memory = reduced_genotypes.try_materialize()
+                if in_memory:
+                    log(f"  RAM materialization succeeded  mem={mem()}")
         persistent_reduced_cache = (
             fit_stage_cache_paths is not None
             and fit_stage_cache_paths.reduced_raw_i8_path.exists()
         )
-        if fit_stage_cache_paths is not None and not persistent_reduced_cache:
+        if fit_stage_cache_paths is not None and not persistent_reduced_cache and allow_full_reduced_cache:
             log("  persisting reduced int8 genotypes for cohort cache reuse...")
             persistent_reduced_cache = reduced_genotypes.try_cache_persistently(
                 fit_stage_cache_paths.reduced_raw_i8_path,
@@ -1241,7 +1277,7 @@ class BayesianPGS:
             reduced_genotypes.release_raw_storage()
         else:
             local_cache = local_cache or persistent_reduced_cache
-            if not local_cache:
+            if not local_cache and allow_full_reduced_cache:
                 local_cache = reduced_genotypes.try_cache_locally()
                 if local_cache:
                     log(f"  local tmpdir cache ready  mem={mem()}")
@@ -1255,10 +1291,17 @@ class BayesianPGS:
                         "No GPU/RAM/local int8 cache available for binary TR-Newton fit. "
                         "Free disk or reduce block size; refusing full mmap streaming inside Newton-CG."
                     )
-                log(f"  no materialization possible — streaming from mmap  mem={mem()}")
+                log(f"  full-matrix cache unavailable; block worksets will stream/cache from raw genotypes  mem={mem()}")
         if reduced_validation is not None:
             validation_genotype_matrix = reduced_validation[0]
             if isinstance(validation_genotype_matrix, StandardizedGenotypeMatrix):
+                allow_validation_full_cache = not (
+                    _skip_full_matrix_materialization_for_blocks(
+                        validation_genotype_matrix,
+                        self.config,
+                        label="validation",
+                    )
+                )
                 # Persist a validation-side int8 cache analogous to the training
                 # reduced_raw_i8 cache. Without this, every run re-reads sparse
                 # columns through the per-chromosome Concatenated→Indexed→Int8
@@ -1287,20 +1330,21 @@ class BayesianPGS:
                             fit_stage_cache_paths.cache_dir
                             / f"{fit_stage_cache_paths.key}.val_{val_subkey}.reduced_raw_i8.npy"
                         )
-                        if validation_int8_cache_path.exists():
+                        if validation_int8_cache_path.exists() and allow_validation_full_cache:
                             log(
                                 "  validation int8 cache hit — rebinding to "
                                 + f"{validation_int8_cache_path.name}  mem={mem()}"
                             )
-                        else:
+                        elif allow_validation_full_cache:
                             log("  persisting validation int8 cache (one-time cost; future runs reuse it)...")
-                        validation_genotype_matrix.try_cache_persistently(validation_int8_cache_path)
+                        if allow_validation_full_cache:
+                            validation_genotype_matrix.try_cache_persistently(validation_int8_cache_path)
                 materialize_validation = (
                     not validation_is_holdout_only
                     or bool(getattr(self.config, "validate_first_iteration", True))
                     or int(self.config.validation_interval) < int(self.config.max_outer_iterations)
                 )
-                if materialize_validation:
+                if materialize_validation and allow_validation_full_cache:
                     log(f"materializing validation genotype matrix ({validation_genotype_matrix.shape})...")
                     validation_in_memory = validation_genotype_matrix.try_materialize_gpu()
                     if validation_in_memory:
@@ -1313,6 +1357,8 @@ class BayesianPGS:
                         validation_genotype_matrix.release_raw_storage()
                     else:
                         log(f"  validation matrix remains streaming  mem={mem()}")
+                elif materialize_validation:
+                    log(f"  validation matrix will stream by variant block  mem={mem()}")
                 else:
                     log("  held-out validation matrix remains streaming until final evaluation  mem=" + mem())
         if fit_stage_cache_paths is not None and int(self.config.sample_space_preconditioner_rank) > 0:

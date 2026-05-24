@@ -895,7 +895,13 @@ def test_streaming_gpu_context_caps_large_int8_standardized_tiles(monkeypatch: p
 
     _, streaming_batch_size = standardized._streaming_gpu_context(batch_size=12_428)
 
-    expected = genotype_module.GPU_STANDARDIZED_STREAMING_TARGET_BATCH_BYTES // (raw.shape[0] * 4)
+    usable_gpu_bytes = max(
+        8_000_000_000 - genotype_module.GPU_STANDARDIZED_DYNAMIC_RESERVE_BYTES,
+        int(8_000_000_000 * 0.10),
+    )
+    dynamic_target_bytes = int(usable_gpu_bytes * genotype_module.GPU_INT8_STANDARDIZED_DYNAMIC_FREE_FRACTION)
+    target_bytes = min(genotype_module.GPU_INT8_STANDARDIZED_STREAMING_TARGET_BATCH_BYTES, dynamic_target_bytes)
+    expected = target_bytes // (raw.shape[0] * 4)
     assert streaming_batch_size == expected
     assert streaming_batch_size < genotype_module.auto_batch_size_i8(raw.shape[0])
 
@@ -1653,6 +1659,40 @@ def test_gpu_streaming_batch_size_uses_live_free_memory(monkeypatch: pytest.Monk
     )
 
     assert batch_size == 100
+
+
+def test_gpu_int8_streaming_batch_size_uses_wide_v100_tiles():
+    class _FakeCudaRuntime:
+        @staticmethod
+        def memGetInfo():
+            return (16_605_741_056, 16_945_512_448)
+
+    class _FakeCuda:
+        runtime = _FakeCudaRuntime()
+
+    class _FakePool:
+        @staticmethod
+        def free_bytes() -> int:
+            return 0
+
+    class _FakeCupy:
+        cuda = _FakeCuda()
+
+        @staticmethod
+        def get_default_memory_pool() -> _FakePool:
+            return _FakePool()
+
+    raw_matrix = _SpyInt8StreamingRawGenotypeMatrix(np.zeros((331_945, 16), dtype=np.int8))
+
+    batch_size = genotype_module._gpu_streaming_batch_size(
+        raw_matrix,
+        sample_count=331_945,
+        requested_batch_size=1024,
+        cupy=_FakeCupy(),
+        dtype=np.float32,
+    )
+
+    assert batch_size == 3084
 
 
 def test_gpu_materialization_budget_respects_live_free_memory(monkeypatch: pytest.MonkeyPatch):

@@ -271,8 +271,10 @@ MIN_BED_READER_BATCH_SIZE = 32  # always read at least this many variants
 STANDARDIZED_STREAMING_TARGET_BATCH_BYTES = 1_024_000_000
 LOCAL_INT8_STANDARDIZED_STREAMING_TARGET_BATCH_BYTES = 4_096_000_000
 GPU_STANDARDIZED_STREAMING_TARGET_BATCH_BYTES = 512_000_000
+GPU_INT8_STANDARDIZED_STREAMING_TARGET_BATCH_BYTES = 4_096_000_000
 GPU_STANDARDIZED_PREFETCH_TARGET_BYTES = 4_096_000_000
 GPU_STANDARDIZED_DYNAMIC_FREE_FRACTION = 0.20
+GPU_INT8_STANDARDIZED_DYNAMIC_FREE_FRACTION = 0.35
 GPU_STANDARDIZED_DYNAMIC_RESERVE_BYTES = 512_000_000
 PLINK_INT8_TARGET_BATCH_BYTES = 1_024_000_000
 # Auto-tuned: scales with cpu_count and available host RAM.
@@ -1813,6 +1815,7 @@ def _iter_prefetched_raw_batches(
     variant_indices: NDArray,
     *,
     batch_size: int,
+    io_worker_limit: int | None = None,
 ) -> Iterator[tuple[slice, NDArray]]:
     variant_indices_arr = np.asarray(variant_indices)
     n = int(variant_indices_arr.shape[0])
@@ -1836,7 +1839,8 @@ def _iter_prefetched_raw_batches(
     # the AoU 16-core T4 box left the CUDA driver thread fighting prefetch
     # workers for CPU time and starving the GPU.
     cpu_cap = max(1, (os.cpu_count() or 4) - 2)
-    num_io_workers = min(cpu_cap, int(memory_capped_in_flight), max(1, len(chunks)))
+    worker_cap = cpu_cap if io_worker_limit is None else max(1, min(cpu_cap, int(io_worker_limit)))
+    num_io_workers = min(worker_cap, int(memory_capped_in_flight), max(1, len(chunks)))
     # Allow up to 4x as many decoded chunks in flight as we have workers so the
     # GPU never waits for a decode to finish; the byte-budget cap above still
     # bounds the total queued bytes.
@@ -1916,16 +1920,27 @@ def _gpu_streaming_batch_size(
     cupy: Any = None,
     dtype: Any = None,
 ) -> int:
-    if _supports_int8_batches(raw):
+    supports_int8 = _supports_int8_batches(raw)
+    if supports_int8:
         requested_batch_size = max(int(requested_batch_size), auto_batch_size_i8(sample_count))
     resolved_cupy = _try_import_cupy() if cupy is None else cupy
+    static_target_batch_bytes = (
+        GPU_INT8_STANDARDIZED_STREAMING_TARGET_BATCH_BYTES
+        if supports_int8
+        else GPU_STANDARDIZED_STREAMING_TARGET_BATCH_BYTES
+    )
     if resolved_cupy is not None:
         target_batch_bytes = _gpu_dynamic_standardized_target_batch_bytes(
             resolved_cupy,
-            static_target_batch_bytes=GPU_STANDARDIZED_STREAMING_TARGET_BATCH_BYTES,
+            static_target_batch_bytes=static_target_batch_bytes,
+            free_fraction=(
+                GPU_INT8_STANDARDIZED_DYNAMIC_FREE_FRACTION
+                if supports_int8
+                else GPU_STANDARDIZED_DYNAMIC_FREE_FRACTION
+            ),
         )
     else:
-        target_batch_bytes = GPU_STANDARDIZED_STREAMING_TARGET_BATCH_BYTES
+        target_batch_bytes = static_target_batch_bytes
     return _effective_gpu_standardized_streaming_batch_size(
         sample_count=sample_count,
         requested_batch_size=requested_batch_size,
@@ -1947,6 +1962,48 @@ def _gpu_int8_transpose_matmul(
     progress_label: str | None,
 ) -> Any:
     selected_variant_indices = np.asarray(variant_indices, dtype=np.int32)
+    device_ids = _cupy_device_ids(cupy)
+    if len(device_ids) >= 2 and int(selected_variant_indices.shape[0]) >= len(device_ids):
+        return _gpu_int8_transpose_matmul_sharded(
+            raw_int8=raw_int8,
+            selected_variant_indices=selected_variant_indices,
+            means=means,
+            scales=scales,
+            matrix_gpu=matrix_gpu,
+            batch_size=batch_size,
+            cupy=cupy,
+            dtype=dtype,
+            progress_label=progress_label,
+            device_ids=device_ids,
+        )
+    return _gpu_int8_transpose_matmul_single_device(
+        raw_int8=raw_int8,
+        selected_variant_indices=selected_variant_indices,
+        means=means,
+        scales=scales,
+        matrix_gpu=matrix_gpu,
+        batch_size=batch_size,
+        cupy=cupy,
+        dtype=dtype,
+        progress_label=progress_label,
+        io_worker_limit=None,
+    )
+
+
+def _gpu_int8_transpose_matmul_single_device(
+    *,
+    raw_int8: Int8BatchCapable,
+    selected_variant_indices: NDArray,
+    means: NDArray,
+    scales: NDArray,
+    matrix_gpu: Any,
+    batch_size: int,
+    cupy: Any,
+    dtype: Any,
+    progress_label: str | None,
+    io_worker_limit: int | None,
+) -> Any:
+    selected_variant_indices = np.asarray(selected_variant_indices, dtype=np.int32)
     selected_means_gpu = cupy.asarray(means[selected_variant_indices], dtype=dtype)
     selected_scales_gpu = cupy.asarray(scales[selected_variant_indices], dtype=dtype)
     result_gpu = cupy.empty((selected_variant_indices.shape[0], matrix_gpu.shape[1]), dtype=dtype)
@@ -1962,6 +2019,7 @@ def _gpu_int8_transpose_matmul(
         raw_int8,
         selected_variant_indices,
         batch_size=batch_size,
+        io_worker_limit=io_worker_limit,
     ):
         int8_gpu = cupy.asarray(host_values, dtype=getattr(cupy, "int8", np.int8))
         means_gpu = selected_means_gpu[batch_slice]
@@ -1989,6 +2047,97 @@ def _gpu_int8_transpose_matmul(
     if progress_label is not None:
         elapsed_seconds = _time.monotonic() - t_start
         log(f"        {progress_label}: done {total_variants:,} variants in {elapsed_seconds:.1f}s  mem={mem()}")
+    return result_gpu
+
+
+def _cupy_asnumpy(cupy: Any, values: Any) -> NDArray:
+    asnumpy = getattr(cupy, "asnumpy", None)
+    if callable(asnumpy):
+        return np.asarray(asnumpy(values))
+    return np.asarray(values)
+
+
+def _gpu_int8_transpose_matmul_sharded(
+    *,
+    raw_int8: Int8BatchCapable,
+    selected_variant_indices: NDArray,
+    means: NDArray,
+    scales: NDArray,
+    matrix_gpu: Any,
+    batch_size: int,
+    cupy: Any,
+    dtype: Any,
+    progress_label: str | None,
+    device_ids: Sequence[int],
+) -> Any:
+    total_variants = int(selected_variant_indices.shape[0])
+    splits = _split_contiguous_columns(total_variants, device_ids)
+    if len(splits) <= 1:
+        return _gpu_int8_transpose_matmul_single_device(
+            raw_int8=raw_int8,
+            selected_variant_indices=selected_variant_indices,
+            means=means,
+            scales=scales,
+            matrix_gpu=matrix_gpu,
+            batch_size=batch_size,
+            cupy=cupy,
+            dtype=dtype,
+            progress_label=progress_label,
+            io_worker_limit=None,
+        )
+    import time as _time
+
+    t_start = _time.monotonic()
+    primary_device_id = _cupy_current_device_id(cupy)
+    matrix_host = _cupy_asnumpy(cupy, matrix_gpu)
+    cpu_count = max(1, os.cpu_count() or 1)
+    per_device_io_workers = max(1, (cpu_count - 2) // max(1, len(splits)))
+    if progress_label is not None:
+        split_desc = ", ".join(f"gpu{device_id}:{stop - start:,}" for device_id, start, stop in splits)
+        log(
+            f"        {progress_label}: start multi-GPU streaming {total_variants:,} variants "
+            f"across {len(splits)} GPUs ({split_desc}; batch_size={batch_size})  mem={mem()}"
+        )
+
+    def _compute_shard(device_id: int, start: int, stop: int) -> tuple[int, int, NDArray]:
+        shard_indices = selected_variant_indices[start:stop]
+        shard_label = f"{progress_label} gpu{device_id}" if progress_label is not None else None
+        with _cupy_device_context(cupy, device_id):
+            shard_matrix_gpu = cupy.asarray(matrix_host, dtype=dtype)
+            shard_result_gpu = _gpu_int8_transpose_matmul_single_device(
+                raw_int8=raw_int8,
+                selected_variant_indices=shard_indices,
+                means=means,
+                scales=scales,
+                matrix_gpu=shard_matrix_gpu,
+                batch_size=batch_size,
+                cupy=cupy,
+                dtype=dtype,
+                progress_label=shard_label,
+                io_worker_limit=per_device_io_workers,
+            )
+            _cupy_device_synchronize(cupy, device_id)
+            shard_result_host = _cupy_asnumpy(cupy, shard_result_gpu)
+        return start, stop, shard_result_host
+
+    pieces: list[tuple[int, int, NDArray]] = []
+    with ThreadPoolExecutor(max_workers=len(splits), thread_name_prefix="gpu-int8-transpose") as executor:
+        futures = [executor.submit(_compute_shard, device_id, start, stop) for device_id, start, stop in splits]
+        for future in futures:
+            pieces.append(future.result())
+    pieces.sort(key=lambda item: item[0])
+
+    with _cupy_device_context(cupy, primary_device_id):
+        result_gpu = cupy.empty((total_variants, matrix_gpu.shape[1]), dtype=dtype)
+        for start, stop, shard_result_host in pieces:
+            result_gpu[start:stop, :] = cupy.asarray(shard_result_host, dtype=dtype)
+    if progress_label is not None:
+        elapsed_seconds = _time.monotonic() - t_start
+        rate = total_variants / max(elapsed_seconds, 1e-6)
+        log(
+            f"        {progress_label}: multi-GPU streaming done {total_variants:,} variants "
+            f"in {elapsed_seconds:.1f}s rate={rate:,.0f}v/s  mem={mem()}"
+        )
     return result_gpu
 
 
@@ -2033,7 +2182,12 @@ def _gpu_effective_free_bytes(cupy: Any) -> int:
     return max(0, free + pool_free)
 
 
-def _gpu_dynamic_standardized_target_batch_bytes(cupy: Any, *, static_target_batch_bytes: int) -> int:
+def _gpu_dynamic_standardized_target_batch_bytes(
+    cupy: Any,
+    *,
+    static_target_batch_bytes: int,
+    free_fraction: float = GPU_STANDARDIZED_DYNAMIC_FREE_FRACTION,
+) -> int:
     free_bytes = _gpu_effective_free_bytes(cupy)
     if free_bytes <= 0:
         return int(static_target_batch_bytes)
@@ -2041,7 +2195,7 @@ def _gpu_dynamic_standardized_target_batch_bytes(cupy: Any, *, static_target_bat
         free_bytes - GPU_STANDARDIZED_DYNAMIC_RESERVE_BYTES,
         int(free_bytes * 0.10),
     )
-    dynamic_target = max(int(usable_bytes * GPU_STANDARDIZED_DYNAMIC_FREE_FRACTION), 1)
+    dynamic_target = max(int(usable_bytes * float(free_fraction)), 1)
     return max(1, min(int(static_target_batch_bytes), dynamic_target))
 
 
