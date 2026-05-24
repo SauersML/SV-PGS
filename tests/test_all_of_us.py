@@ -716,11 +716,11 @@ def test_run_all_of_us_runs_single_unified_fit_and_reuses_cached_downloads(monke
 
     def fake_run_training_pipeline(**kwargs):
         config = kwargs["config"]
-        assert config.beta_variance_update_interval == 0
+        assert config.beta_variance_update_interval == aou_runner.AOU_BETA_VARIANCE_UPDATE_INTERVAL
         assert config.final_posterior_diagnostics is False
-        assert config.validation_interval == config.max_outer_iterations
-        assert config.validate_first_iteration is False
-        assert config.sample_space_preconditioner_rank == 0
+        assert config.validation_interval == aou_runner.AOU_VALIDATION_INTERVAL
+        assert config.validate_first_iteration is True
+        assert config.sample_space_preconditioner_rank == aou_runner.AOU_SAMPLE_SPACE_PRECONDITIONER_RANK
         pipeline_calls.append(
             (
                 kwargs["dataset"].targets.shape[0],
@@ -843,11 +843,11 @@ def test_run_all_of_us_skips_existing_fit_only_when_run_metadata_matches(monkeyp
                 random_seed=0,
                 variant_metadata_path=None,
                 variants="sv",
-                beta_variance_update_interval=0,
+                beta_variance_update_interval=aou_runner.AOU_BETA_VARIANCE_UPDATE_INTERVAL,
                 final_posterior_diagnostics=False,
-                validation_interval=20,
-                validate_first_iteration=False,
-                sample_space_preconditioner_rank=0,
+                validation_interval=aou_runner.AOU_VALIDATION_INTERVAL,
+                validate_first_iteration=True,
+                sample_space_preconditioner_rank=aou_runner.AOU_SAMPLE_SPACE_PRECONDITIONER_RANK,
                 test_fraction=aou_runner.AOU_TEST_FRACTION,
                 marginal_screen_min_abs_z=1.5,
             ),
@@ -920,11 +920,11 @@ def test_run_all_of_us_reruns_when_existing_fit_metadata_differs(monkeypatch, tm
                 random_seed=0,
                 variant_metadata_path=None,
                 variants="sv",
-                beta_variance_update_interval=0,
+                beta_variance_update_interval=aou_runner.AOU_BETA_VARIANCE_UPDATE_INTERVAL,
                 final_posterior_diagnostics=False,
-                validation_interval=40,
-                validate_first_iteration=False,
-                sample_space_preconditioner_rank=0,
+                validation_interval=aou_runner.AOU_VALIDATION_INTERVAL,
+                validate_first_iteration=True,
+                sample_space_preconditioner_rank=aou_runner.AOU_SAMPLE_SPACE_PRECONDITIONER_RANK,
                 test_fraction=0.0,
                 marginal_screen_min_abs_z=1.5,
             ),

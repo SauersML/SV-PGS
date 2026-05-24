@@ -3889,9 +3889,10 @@ def _should_refresh_beta_variance(
         return True
     if force_final_refresh and iteration_index + 1 == max(int(total_iterations), 1):
         return True
-    if int(refresh_interval) <= 0:
-        return False
-    return ((iteration_index + 1) % max(int(refresh_interval), 1)) == 0
+    interval = int(refresh_interval)
+    if interval < 1:
+        raise ValueError("refresh_interval must be positive.")
+    return ((iteration_index + 1) % interval) == 0
 
 
 def _as_standardized_genotype_matrix(

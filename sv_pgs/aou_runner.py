@@ -773,7 +773,9 @@ DEFAULT_COVARIATES = [
 AOU_MAX_OUTER_ITERATIONS = 20
 AOU_TEST_FRACTION = 0.2
 AOU_MARGINAL_SCREEN_MIN_ABS_Z = 1.5
-AOU_BETA_VARIANCE_UPDATE_INTERVAL = 0
+# Keep scheduled beta-variance refreshes outside the default AoU fit window;
+# final posterior diagnostics are disabled below for the same memory budget.
+AOU_BETA_VARIANCE_UPDATE_INTERVAL = AOU_MAX_OUTER_ITERATIONS + 1
 AOU_FINAL_POSTERIOR_DIAGNOSTICS = False
 AOU_VALIDATE_FIRST_ITERATION = True
 # TODO: tune at runtime based on cohort size / GPU budget. Use a small
