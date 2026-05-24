@@ -66,12 +66,7 @@ def _use_coalesced_indexed_variant_reads(indices: NDArray) -> bool:
     deltas = np.diff(resolved)
     if not np.all(deltas > 0):
         return False
-    span_variant_count = int(resolved[-1] - resolved[0] + 1)
-    if span_variant_count == int(resolved.size):
-        return False
-    return span_variant_count <= int(
-        np.ceil(float(resolved.size) * _INDEXED_VARIANT_COALESCE_MAX_OVERREAD_RATIO)
-    )
+    return not np.all(deltas == 1)
 
 
 def to_bed(

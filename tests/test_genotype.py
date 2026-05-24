@@ -2092,6 +2092,17 @@ def test_explicit_numpy_backend_ops_return_numpy_arrays():
     np.testing.assert_allclose(transpose_result, standardized.materialize().T @ sample_vector)
 
 
+def test_require_gpu_allows_cpu_only_runtime(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setattr(genotype_module, "_gpu_verified", False)
+    monkeypatch.setattr(genotype_module, "_cupy_module", None)
+    monkeypatch.setattr(genotype_module, "_try_import_cupy", lambda: None)
+    monkeypatch.setattr(genotype_module, "_cupy_runtime_diagnostic", lambda: "cupy unavailable")
+    monkeypatch.setattr(genotype_module, "_nvidia_driver_diagnostic", lambda: "nvidia unavailable")
+
+    assert genotype_module.require_gpu() is None
+    assert genotype_module._gpu_verified is True
+
+
 def test_hybrid_standardized_operator_matches_dense_reference(monkeypatch: pytest.MonkeyPatch):
     raw_i8 = np.array(
         [
