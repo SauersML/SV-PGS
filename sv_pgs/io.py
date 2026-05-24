@@ -2124,6 +2124,16 @@ def _build_plink_int8_cache_only(
         except Exception:
             pass
         return None
+    except BaseException:
+        # KeyboardInterrupt / RuntimeError / etc must not leak the writer's
+        # file descriptor and partial temp file. Abort the writer (close the
+        # fd and unlink the temp), then re-raise so the caller's cancellation
+        # semantics are preserved.
+        try:
+            writer.abort()
+        except Exception:
+            pass
+        raise
 
     try:
         int8_tmp_path.replace(int8_path)
@@ -3254,7 +3264,11 @@ def _region_parse_worker(args: tuple[str, str | None, str, int]) -> tuple[int, s
         _atomic_write_progress()
 
     view_stderr_tmp = tempfile.TemporaryFile()
-    query_stderr_tmp = tempfile.TemporaryFile()
+    try:
+        query_stderr_tmp = tempfile.TemporaryFile()
+    except BaseException:
+        view_stderr_tmp.close()
+        raise
     view_proc = subprocess.Popen(
         view_cmd,
         stdout=subprocess.PIPE,
@@ -3353,10 +3367,20 @@ def _region_parse_worker(args: tuple[str, str | None, str, int]) -> tuple[int, s
         view_stderr_tmp.close()
         query_stderr_tmp.close()
 
-    # Final flush + chunk write so all remaining records are durable.
-    _checkpoint(force=True)
-    geno_fh.close()
-    stats_fh.close()
+    # Final flush + chunk write so all remaining records are durable. Wrap so
+    # an exception in ``_checkpoint`` (e.g. disk full on the final write) can't
+    # leak the genotype/stats binary file descriptors.
+    try:
+        _checkpoint(force=True)
+    finally:
+        try:
+            geno_fh.close()
+        except OSError:
+            pass
+        try:
+            stats_fh.close()
+        except OSError:
+            pass
 
     # Consolidate all variant-metadata chunks into the single .variants.npz
     # file the merge step expects. Atomic rename so a crash here can't
@@ -3786,52 +3810,70 @@ def _load_vcf_incremental(
         bytes_since_checkpoint = 0
         checkpoint_started_at = _monotonic()
 
-    # Parse remaining variants
-    for record in reader:
-        if len(record.ALT) != 1:
-            _abort_incremental_load(
-                "Only biallelic VCF records are supported. Normalize multiallelic records before loading: "
-                + _vcf_variant_key(record)
+    # Parse remaining variants. Wrap so that an unexpected exception during
+    # reader iteration (e.g. cyvcf2 hits a malformed record, decode raises,
+    # or a KeyboardInterrupt during a multi-hour parse) cannot leak the
+    # genotype/stats binary fds and the VCF reader. ``_abort_incremental_load``
+    # already closes these for one specific control path; this finally block
+    # is the general-case safety net.
+    parse_succeeded = False
+    try:
+        for record in reader:
+            if len(record.ALT) != 1:
+                _abort_incremental_load(
+                    "Only biallelic VCF records are supported. Normalize multiallelic records before loading: "
+                    + _vcf_variant_key(record)
+                )
+
+            int8_col = _record_gt_types_to_int8(record.gt_types, _gt_to_i8, keep_selector)
+
+            # Write genotype column to disk immediately
+            geno_fh.write(int8_col.tobytes())
+
+            dosage_sum, dosage_sum_sq, n_valid, support = _fast_int8_dosage_stats(int8_col)
+            stats_fh.write(struct.pack("<qqii", dosage_sum, dosage_sum_sq, n_valid, support))
+            vd = _variant_defaults_from_vcf_record(record)
+            buffered_variants.append(vd)
+            last_record_coordinates = (str(record.CHROM), int(record.POS))
+
+            variant_index += 1
+            bytes_since_checkpoint += int(
+                int8_col.nbytes
+                + 24
+                + len(vd.variant_id.encode("utf-8"))
+                + len(vd.chromosome.encode("utf-8"))
+                + 32
             )
+            _flush_incremental_checkpoint()
 
-        int8_col = _record_gt_types_to_int8(record.gt_types, _gt_to_i8, keep_selector)
+            # Progress log
+            now = _monotonic()
+            chrom = str(record.CHROM)
+            if chrom != last_chrom:
+                if last_chrom is not None:
+                    log(f"  chromosome {last_chrom} done — {variant_index} variants so far  mem={mem()}")
+                last_chrom = chrom
+                last_log_time = now
+            elif now - last_log_time >= 5.0:
+                rate = (variant_index - n_cached) / max(now - t_start, 0.01)
+                log(f"  {variant_index} variants loaded ({rate:.0f} variants/s, {chrom})  mem={mem()}")
+                last_log_time = now
 
-        # Write genotype column to disk immediately
-        geno_fh.write(int8_col.tobytes())
-
-        dosage_sum, dosage_sum_sq, n_valid, support = _fast_int8_dosage_stats(int8_col)
-        stats_fh.write(struct.pack("<qqii", dosage_sum, dosage_sum_sq, n_valid, support))
-        vd = _variant_defaults_from_vcf_record(record)
-        buffered_variants.append(vd)
-        last_record_coordinates = (str(record.CHROM), int(record.POS))
-
-        variant_index += 1
-        bytes_since_checkpoint += int(
-            int8_col.nbytes
-            + 24
-            + len(vd.variant_id.encode("utf-8"))
-            + len(vd.chromosome.encode("utf-8"))
-            + 32
-        )
-        _flush_incremental_checkpoint()
-
-        # Progress log
-        now = _monotonic()
-        chrom = str(record.CHROM)
-        if chrom != last_chrom:
-            if last_chrom is not None:
-                log(f"  chromosome {last_chrom} done — {variant_index} variants so far  mem={mem()}")
-            last_chrom = chrom
-            last_log_time = now
-        elif now - last_log_time >= 5.0:
-            rate = (variant_index - n_cached) / max(now - t_start, 0.01)
-            log(f"  {variant_index} variants loaded ({rate:.0f} variants/s, {chrom})  mem={mem()}")
-            last_log_time = now
-
-    # Final flush
-    _flush_incremental_checkpoint(force=True)
-    geno_fh.flush()
-    stats_fh.flush()
+        # Final flush
+        _flush_incremental_checkpoint(force=True)
+        geno_fh.flush()
+        stats_fh.flush()
+        parse_succeeded = True
+    finally:
+        # If parse_succeeded is True we still need these closes; if False we
+        # need them more (resource leak prevention). Either way close here so
+        # the success path no longer needs the duplicate close trio below.
+        if not parse_succeeded:
+            for closer in (geno_fh.close, stats_fh.close, reader.close):
+                try:
+                    closer()
+                except (OSError, ValueError):
+                    pass
     geno_fh.close()
     stats_fh.close()
     reader.close()
