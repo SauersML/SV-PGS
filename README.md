@@ -18,14 +18,30 @@ cd ~ && rm -rf SV-PGS && git clone https://github.com/SauersML/SV-PGS.git && cd 
 cd ~/SV-PGS && uv run sv-pgs run-all-of-us --disease hypertension --output-dir hypertension_results
 ```
 
-That single command:
-1. Downloads all 22 chromosome SV VCFs from the controlled-tier bucket (skips existing)
+That single command defaults to `--variants snp+sv`, which fits one joint
+model on BOTH genotype sources:
+- AoU microarray PLINK SNPs (447k samples, ~700k variants) from the
+  controlled-tier microarray PLINK trio (`.bed` / `.bim` / `.fam`)
+- AoU srWGS structural variant VCFs (97k samples, ~1.7M variants) from the
+  controlled-tier `structural_variants/vcf/full/` bucket
+
+To restrict to one source pass `--variants sv` (SV VCFs only) or
+`--variants snp` (microarray PLINK SNPs only).
+
+That single command (with the default `--variants snp+sv`):
+1. Downloads the microarray PLINK trio AND all 22 chromosome SV VCFs from the
+   controlled-tier buckets (skips existing files); `--variants sv` skips the
+   PLINK trio and `--variants snp` skips the SV VCFs
 2. Downloads ancestry predictions and merges top 10 genomic PCs
 3. Queries BigQuery for the disease phenotype (ICD-9/10 codes built-in)
-4. Concatenates the requested chromosome VCFs into one genome-wide training dataset
+4. Concatenates the requested chromosome data into one genome-wide training
+   dataset, intersecting samples across the SNP and SV sources when both are
+   loaded
 5. Fits one Bayesian PGS model on GPU across all requested chromosomes
-6. Uses `--variant-metadata` annotations when supplied; it does not derive annotations from VCF INFO
-7. Reuses an existing fit only when the full AoU run configuration matches
+6. Uses `--variant-metadata` annotations when supplied; it does not derive
+   annotations from VCF INFO
+7. Reuses an existing fit only when the full AoU run configuration (including
+   the `--variants` choice) matches
 8. Covariates: age, age^2, sex at birth, race, ethnicity, PC1-PC10
 
 **Available diseases:**

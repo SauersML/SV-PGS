@@ -12,6 +12,7 @@ from typing import Iterable
 from sv_pgs.all_of_us import AllOfUsDiseaseRequest, available_disease_names, prepare_all_of_us_disease_sample_table
 from sv_pgs.aou_runner import run_all_of_us, run_all_of_us_all_diseases
 from sv_pgs.config import ModelConfig, TraitType
+from sv_pgs.evaluate import evaluate_all_of_us
 from sv_pgs.io import load_dataset_from_files
 from sv_pgs.pipeline import run_training_pipeline
 from sv_pgs.progress import gpu_memory_snapshot, jax_runtime_snapshot, log, nvidia_smi_snapshot
@@ -137,9 +138,14 @@ def build_parser() -> argparse.ArgumentParser:
         "--allow-nonconverged-export",
         action="store_true",
         help=(
-            "Export an artifact even when the variational fit reports "
-            "converged=False. Off by default to avoid shipping a PGS from "
-            "a non-converged posterior."
+            "Suppress the audit-trail marker emitted when exporting a fit "
+            "that reports converged=False. The artifact is ALWAYS written "
+            "regardless of this flag — when converged=False a clear WARNING "
+            "is logged with the four final_*_change deltas "
+            "(parameter/predictor/objective/hyperparameter). Setting this "
+            "flag acknowledges the non-convergence so the warning is not "
+            "tagged as an unacknowledged override. Callers that need strict "
+            "gating should introspect fit_result.converged directly."
         ),
     )
 
@@ -216,7 +222,6 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     if args.command == "evaluate-all-of-us":
-        from sv_pgs.evaluate import evaluate_all_of_us
         evaluate_all_of_us(
             output_dir=Path(args.output_dir),
             disease=args.disease,

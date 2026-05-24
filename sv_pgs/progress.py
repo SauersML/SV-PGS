@@ -14,6 +14,8 @@ from typing import IO
 
 _start_time: float = time.monotonic()
 _log_file: IO[str] | None = None
+_log_file_path: str | None = None
+_log_file_warned: bool = False
 
 _heartbeat_thread: threading.Thread | None = None
 _heartbeat_stop: threading.Event | None = None
@@ -36,13 +38,15 @@ _NVIDIA_SMI_DISABLED: bool | None = None
 
 def set_log_file(path: str | os.PathLike[str]) -> None:
     """Set a file path where all log() output is mirrored."""
-    global _log_file
+    global _log_file, _log_file_path, _log_file_warned
     if _log_file is not None:
         try:
             _log_file.close()
         except OSError:
             pass
     _log_file = open(path, "a", encoding="utf-8", buffering=1)  # line-buffered
+    _log_file_path = os.fspath(path)
+    _log_file_warned = False
 
 
 def mem() -> str:
@@ -78,6 +82,7 @@ def elapsed() -> str:
 
 def log(message: str) -> None:
     """Print a timestamped progress message to stderr and log file."""
+    global _log_file, _log_file_warned
     ts = time.strftime("%Y-%m-%d %H:%M:%S")
     line = f"[{ts} | {elapsed()} | {mem()}] {message}"
     print(line, file=sys.stderr, flush=True)
@@ -85,8 +90,20 @@ def log(message: str) -> None:
         try:
             _log_file.write(line + "\n")
             _log_file.flush()
-        except OSError:
-            pass
+        except (OSError, ValueError) as error:
+            if not _log_file_warned:
+                _log_file_warned = True
+                print(
+                    "WARNING: progress log file sink failed; disabling mirror. "
+                    f"path={_log_file_path!r} error={error!r}",
+                    file=sys.stderr,
+                    flush=True,
+                )
+            try:
+                _log_file.close()
+            except OSError:
+                pass
+            _log_file = None
 
 
 def _format_bytes(value: object) -> str:

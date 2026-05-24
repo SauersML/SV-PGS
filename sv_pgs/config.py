@@ -130,11 +130,14 @@ class ModelConfig:
     # calibration and non-identifiability until the final posterior pass.
     beta_variance_update_interval: int = 2
     final_posterior_diagnostics: bool = True
-    # When the variational fit reports converged=False, the model/pipeline
-    # refuses to export an artifact by default (to avoid shipping a PGS
-    # built from a non-converged posterior). Set True to override and export
-    # anyway — useful for debugging or for runs where partial progress is
-    # still informative.
+    # When the variational fit reports converged=False, the artifact is
+    # still written (a hard block broke legitimate small-N / short-iteration
+    # runs whose partial-but-coherent fit is still useful) but a clear
+    # WARNING is emitted with the four final_*_change deltas
+    # (parameter/predictor/objective/hyperparameter). Set True to suppress
+    # the warning's audit-trail "unacknowledged override" marker; callers
+    # that need strict gating should introspect ``fit_result.converged``
+    # directly rather than relying on export() to raise.
     allow_nonconverged_export: bool = False
     use_tr_newton_binary: bool = False
     cg_progress_interval: int = 5

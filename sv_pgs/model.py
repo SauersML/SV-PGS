@@ -132,11 +132,15 @@ _FIT_STAGE_CACHE_DIRNAME = ".sv_pgs_cache"
 _FIT_STAGE_CACHE_SUBDIR = "fit_stage"
 _FIT_STAGE_CACHE_VERSION = 4
 _FIT_CHECKPOINT_VERSION = 1
-# Refuse to silently fall back to mmap streaming for binary TR-Newton fits when
-# no GPU/RAM/local int8 cache is available. The streaming path is catastrophically
-# slow inside Newton-CG and was responsible for the overfit run that motivated
-# this guard. Flip to False (or set config.allow_mmap_streaming_for_binary=True)
-# to override.
+# Strict-mode guard for binary TR-Newton fits that would otherwise fall back to
+# the mmap-streaming path when no GPU/RAM/local int8 cache is available. Default
+# is False because the PG-IRLS solver handles the streaming path safely and
+# blocking the fallback made legitimate small-N runs (and any environment
+# without a warm int8 cache) unrunnable. Flip to True to opt into a stricter
+# sanity-check mode for debugging — useful when you specifically want a fit to
+# fail loudly rather than silently take the slower streaming path. The
+# per-config override ``config.allow_mmap_streaming_for_binary=True`` can still
+# unblock the fallback even when this constant is True.
 _REFUSE_BINARY_TR_NEWTON_NO_CACHE = False
 _REGISTERED_FIT_CHECKPOINT_PATHS: dict[int, Path] = {}
 
@@ -937,6 +941,7 @@ class BayesianPGS:
         covariates: NDArray,
         targets: NDArray,
         variant_records: Sequence[VariantRecord | dict[str, Any]],
+        *,
         validation_data: tuple[RawGenotypeMatrix | NDArray, NDArray, NDArray] | None = None,
         variant_stats: VariantStatistics | None = None,
         per_epoch_eval_callback: Callable[[dict[str, Any]], None] | None = None,
