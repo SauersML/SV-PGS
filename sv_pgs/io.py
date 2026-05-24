@@ -647,11 +647,34 @@ def load_multi_vcf_dataset_from_files(
         len(keep_sample_indices) == len(source_sample_ids)
         and np.array_equal(keep_sample_indices, expected_source_order)
     )
-    # Verify sample IDs match for first chromosome only
-    log(f"  verifying sample IDs for {source_paths[0].name}...")
-    first_sample_ids = _read_vcf_sample_ids(source_paths[0])
-    if first_sample_ids != source_sample_ids:
-        raise RuntimeError(f"VCF sample IDs do not match: {source_paths[0]}")
+    # Verify sample IDs match for every chromosome. Different VCFs in the
+    # same dataset can list the same cohort in a different order; trusting
+    # source_paths[0] would silently misalign genotypes against phenotypes.
+    log(f"  verifying sample IDs for all {n_chromosomes} chromosomes against {source_paths[0].name}...")
+    per_source_align_indices: list[NDArray | None] = [None] * n_chromosomes
+    for chr_idx, source_path in enumerate(source_paths):
+        chr_sample_ids = _read_vcf_sample_ids(source_path)
+        if chr_sample_ids == source_sample_ids:
+            continue
+        # Different order (or different membership) — derive an explicit
+        # per-source alignment from the phenotype sample table.
+        if sorted(chr_sample_ids) != sorted(source_sample_ids):
+            raise RuntimeError(
+                f"VCF sample IDs do not match the reference VCF: {source_path} "
+                f"(reference: {source_paths[0]})"
+            )
+        per_source_align_indices[chr_idx] = np.asarray(
+            _align_sample_ids(
+                expected_sample_ids=sample_table.sample_ids,
+                available_sample_ids=chr_sample_ids,
+                context=f"genotype source {source_path.name}",
+            ),
+            dtype=np.intp,
+        )
+        log(
+            f"  {source_path.name}: sample order differs from reference VCF; "
+            f"applying per-source alignment"
+        )
     log(f"  sample IDs verified. skip_subset={skip_subset}. loading {n_chromosomes} chromosomes...")
 
     _t_start = time.monotonic()
@@ -665,7 +688,10 @@ def load_multi_vcf_dataset_from_files(
             source_path, config=config, mmap_mode="r",
         )
         chromosome_raw: RawGenotypeMatrix = as_raw_genotype_matrix(genotype_matrix)
-        if not skip_subset:
+        source_specific_indices = per_source_align_indices[chr_idx]
+        if source_specific_indices is not None:
+            chromosome_raw = _lazy_row_subset(chromosome_raw, source_specific_indices)
+        elif not skip_subset:
             chromosome_raw = _lazy_row_subset(chromosome_raw, keep_sample_indices)
         raw_matrices.append(chromosome_raw)
         per_chr_variants.append(list(chromosome_variants))
@@ -1920,15 +1946,15 @@ def _open_plink_int8_cache_for_read(int8_path: Path) -> I8Array | None:
 
 
 def _madvise_willneed(array: NDArray) -> None:
-    """Best-effort posix_madvise(WILLNEED) on the backing mmap of `array`.
+    """Best-effort MADV_WILLNEED on the backing mmap of `array`.
 
-    No-op on systems without posix_madvise or on non-mmap arrays. Failures
-    are silent — this is a hint, not a correctness requirement.
+    Prefers ``mmap.mmap.madvise`` (available on all platforms where
+    ``mmap`` supports madvise, including macOS) and falls back to
+    ``os.posix_madvise`` (Linux-only on CPython; missing on darwin).
+
+    No-op on systems without madvise support or on non-mmap arrays.
+    Failures are silent — this is a hint, not a correctness requirement.
     """
-    posix_madvise = getattr(os, "posix_madvise", None)
-    willneed = getattr(os, "POSIX_MADV_WILLNEED", None)
-    if posix_madvise is None or willneed is None:
-        return
     try:
         import mmap as _mmap_module
     except ImportError:
@@ -1941,10 +1967,126 @@ def _madvise_willneed(array: NDArray) -> None:
         base = next_base
     if not isinstance(base, _mmap_module.mmap):
         return
+
+    # Preferred path: mmap.mmap.madvise(MADV_WILLNEED). Exists on Linux and
+    # macOS in CPython 3.8+ and reliably reaches the kernel hint.
+    mmap_madvise = getattr(base, "madvise", None)
+    mmap_willneed = getattr(_mmap_module, "MADV_WILLNEED", None)
+    if mmap_madvise is not None and mmap_willneed is not None:
+        try:
+            mmap_madvise(mmap_willneed)
+            return
+        except (OSError, ValueError):
+            pass  # fall through to posix_madvise fallback
+
+    # Fallback for older / non-standard runtimes: os.posix_madvise. This is
+    # absent on darwin, so it is genuinely a fallback rather than the
+    # primary path.
+    posix_madvise = getattr(os, "posix_madvise", None)
+    willneed = getattr(os, "POSIX_MADV_WILLNEED", None)
+    if posix_madvise is None or willneed is None:
+        return
     try:
         posix_madvise(base, 0, len(base), willneed)
     except (OSError, ValueError):
         pass
+
+
+def _build_plink_int8_cache_only(
+    raw_genotypes: PlinkRawGenotypeMatrix,
+    *,
+    int8_path: Path,
+    int8_tmp_path: Path,
+    progress_path: Path,
+    cache_key: str,
+    n_samples: int,
+    n_variants: int,
+) -> Path | None:
+    """Stream the .bed once and write the int8 cache, without recomputing stats.
+
+    Used when the variant-stats cache is already on disk but the int8
+    decoded-matrix cache is not. Returns the finalized int8 path on
+    success, or None if disk space is insufficient / a write fails.
+    """
+    int8_path.parent.mkdir(parents=True, exist_ok=True)
+    has_space, required_bytes, available_bytes = _has_sufficient_free_space_for_int8_npy(
+        int8_path.parent,
+        (n_samples, n_variants),
+        fortran_order=True,
+    )
+    if not has_space:
+        log(
+            "  PLINK int8 cache (post-stats build) skipped: would need "
+            f"{required_bytes / 1e9:.1f} GB but only "
+            f"{available_bytes / 1e9:.1f} GB free at {int8_path.parent}; "
+            "continuing with on-the-fly bed decode"
+        )
+        return None
+    writer = _StreamingInt8NpyWriter.open(
+        int8_tmp_path,
+        shape=(n_samples, n_variants),
+        fortran_order=True,
+    )
+    try:
+        variant_count = int(n_variants)
+        tuned_batch_size = auto_batch_size_i8(int(n_samples))
+        all_indices = np.arange(variant_count, dtype=np.int32)
+        log(
+            f"  building PLINK int8 cache at {int8_tmp_path.name} "
+            f"({n_samples:,} x {n_variants:,} = {n_samples * n_variants / 1e9:.1f} GB) "
+            f"— dedicated int8-only pass"
+        )
+        from collections import deque
+        from concurrent.futures import Future, ThreadPoolExecutor
+        in_flight_writes: deque[Future[None]] = deque()
+        variants_written = 0
+        batch_number = 0
+        with ThreadPoolExecutor(max_workers=1) as write_executor:
+            try:
+                for batch in raw_genotypes.iter_column_batches_i8(
+                    all_indices, batch_size=tuned_batch_size,
+                ):
+                    batch_indices = np.asarray(batch.variant_indices, dtype=np.int64)
+                    if int(batch_indices[0]) != variants_written or not np.all(np.diff(batch_indices) == 1):
+                        raise ValueError(
+                            "PLINK int8 cache build requires contiguous variant batches."
+                        )
+                    in_flight_writes.append(
+                        write_executor.submit(writer.write_columns, batch.values)
+                    )
+                    # Bound queue depth so peak RAM stays small.
+                    while len(in_flight_writes) > 2:
+                        in_flight_writes.popleft().result()
+                    variants_written += int(batch_indices.shape[0])
+                    batch_number += 1
+                while in_flight_writes:
+                    in_flight_writes.popleft().result()
+            except BaseException:
+                for fut in in_flight_writes:
+                    fut.cancel()
+                raise
+        writer.close()
+    except (OSError, ValueError) as exc:
+        log(f"  PLINK int8 cache (post-stats build) failed ({exc!r}); leaving stats-only")
+        try:
+            writer.abort()
+        except Exception:
+            pass
+        return None
+
+    try:
+        int8_tmp_path.replace(int8_path)
+        progress_path.unlink(missing_ok=True)
+        progress_path.with_name(progress_path.name + ".tmp").unlink(missing_ok=True)
+        _fsync_parent_dir(int8_path)
+        log(
+            f"  PLINK int8 cache saved ({int8_path.stat().st_size / 1e9:.1f} GB) → "
+            f"{int8_path.name}"
+        )
+    except OSError as exc:
+        log(f"  PLINK int8 cache finalize failed ({exc!r}); leaving stats-only")
+        return None
+    return int8_path
 
 
 def compute_plink_variant_statistics_cached(
@@ -2007,6 +2149,26 @@ def compute_plink_variant_statistics_cached(
                 log("  PLINK stats cache hit but int8 cache progress is incomplete; resuming int8 build")
             else:
                 log("  PLINK stats cache hit but int8 cache progress was unusable; rebuilding int8 cache")
+        elif int8_eligible:
+            # Stats cache hit, but int8 cache and progress are both absent.
+            # Without int8 cache, downstream EM re-decodes the .bed file on
+            # every pass — pathological for AoU (~135 GB matrix). Build the
+            # int8 cache now in a dedicated one-pass stream, keeping the
+            # cached stats unchanged.
+            log(
+                "  PLINK stats cache hit but int8 cache absent; building int8 "
+                "cache in a dedicated one-pass stream to avoid per-epoch bed decode"
+            )
+            built_int8_path = _build_plink_int8_cache_only(
+                raw_genotypes,
+                int8_path=int8_path,
+                int8_tmp_path=int8_tmp_path,
+                progress_path=progress_path,
+                cache_key=cache_key,
+                n_samples=n_samples,
+                n_variants=n_variants,
+            )
+            return cached_stats, built_int8_path
         else:
             return cached_stats, None
     else:
@@ -2176,15 +2338,39 @@ def _compute_variant_stats_teeing_int8(
             batch_size=tuned_batch_size,
         ))
     in_flight_writes: deque[Future[None]] = deque()
+    # Bound writer queue depth so memory stays modest, but don't force a
+    # full drain every batch — that serializes I/O behind compute.
+    max_in_flight_writes = 4
 
     def wait_for_oldest_write() -> float:
         wait_start = _time.monotonic()
         in_flight_writes.popleft().result()
         return _time.monotonic() - wait_start
 
-    def commit_progress() -> None:
+    # Progress is fsync'd + JSON-rewritten with base64 copies of every
+    # committed partial-stat array. That's O(variants_committed) bytes per
+    # commit, so calling it every batch costs O(V * B) total. Gate the
+    # commit by elapsed time and bytes-written-since-last-commit instead;
+    # progress remains crash-recoverable to within ~the interval.
+    progress_commit_interval_seconds = 30.0
+    progress_commit_interval_bytes = 4 * 1024 * 1024 * 1024  # 4 GiB
+    last_commit_time = _time.monotonic()
+    last_commit_variants = variants_done
+
+    def commit_progress(*, force: bool = False) -> None:
+        nonlocal last_commit_time, last_commit_variants
         if progress_path is None or cache_key is None:
             return
+        if not force:
+            elapsed = _time.monotonic() - last_commit_time
+            variants_since = variants_done - last_commit_variants
+            bytes_since = int(variants_since) * int(sample_count)
+            if elapsed < progress_commit_interval_seconds and bytes_since < progress_commit_interval_bytes:
+                return
+        # Drain in-flight writes so the on-disk int8 file reflects every
+        # variant we are about to mark as committed in the progress JSON.
+        while in_flight_writes:
+            wait_for_oldest_write()
         int8_cache_writer.flush()
         _write_plink_int8_progress(
             progress_path,
@@ -2198,6 +2384,8 @@ def _compute_variant_stats_teeing_int8(
             support_counts=support_counts,
             centered_sum_squares=centered_sum_squares,
         )
+        last_commit_time = _time.monotonic()
+        last_commit_variants = variants_done
 
     with ThreadPoolExecutor(max_workers=1) as write_executor:
         try:
@@ -2228,8 +2416,12 @@ def _compute_variant_stats_teeing_int8(
                 del batch_jax
                 compute_seconds = _time.monotonic() - compute_start
 
+                # Keep writer queue ahead of compute: only drain when it
+                # would otherwise grow past the cap. The previous code
+                # drained every batch, which fully serialized disk I/O
+                # behind the (very fast) JAX stats compute.
                 tee_wait_start = _time.monotonic()
-                while in_flight_writes:
+                while len(in_flight_writes) > max_in_flight_writes:
                     wait_for_oldest_write()
                 variants_done += batch_indices.shape[0]
                 commit_progress()
@@ -2249,6 +2441,9 @@ def _compute_variant_stats_teeing_int8(
                 )
             while in_flight_writes:
                 cumulative_tee += wait_for_oldest_write()
+            # Final forced progress commit so resume manifests reflect the
+            # full set of variants written, not just the last interval mark.
+            commit_progress(force=True)
         except BaseException:
             for write_future in in_flight_writes:
                 write_future.cancel()

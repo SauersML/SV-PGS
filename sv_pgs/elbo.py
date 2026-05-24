@@ -149,12 +149,15 @@ def compute_elbo(
         if pvar.shape[0] != n:
             raise ValueError("predictor_variance must have length n")
         mu = eta
-        # Tightest JJ bound at ξ_i = μ_i; the (μ² - ξ²) cancels, leaving -λ(ξ)·Var[η].
-        xi = mu
-        lam = _jj_lambda(xi)
+        # Tightest JJ bound at ξ_i² = E_q[η_i²] = μ_i² + Var_q[η_i]; with this
+        # choice the (μ² + Var[η] − ξ²) term vanishes identically, leaving
+        # log σ(ξ) + κ·μ − ξ/2. Using ξ = μ (i.e. ignoring Var_q[η]) would
+        # yield a strictly looser bound whenever Var_q[η] > 0.
+        second_moment = mu * mu + pvar
+        xi = np.sqrt(np.maximum(second_moment, 0.0))
         kappa = y - 0.5
         expected_loglik = float(
-            np.sum(_log_sigmoid(xi) + kappa * mu - xi / 2.0 - lam * pvar)
+            np.sum(_log_sigmoid(xi) + kappa * mu - xi / 2.0)
         )
 
     elbo = (

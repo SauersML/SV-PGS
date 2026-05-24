@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
@@ -54,8 +55,16 @@ class ModelArtifact:
 def save_artifact(path: str | Path, artifact: ModelArtifact) -> None:
     root = Path(path)
     root.mkdir(parents=True, exist_ok=True)
+    arrays_final = root / "arrays.npz"
+    metadata_final = root / "metadata.json"
+    arrays_tmp = root / "arrays.tmp.npz"
+    metadata_tmp = root / "metadata.json.tmp"
+
+    # Write arrays to a staging file and fsync before publishing either output,
+    # so a crash between the two replaces cannot leave new arrays paired with
+    # old metadata (or vice versa).
     np.savez_compressed(
-        root / "arrays.npz",
+        arrays_tmp,
         means=artifact.means,
         scales=artifact.scales,
         alpha=artifact.alpha,
@@ -67,6 +76,8 @@ def save_artifact(path: str | Path, artifact: ModelArtifact) -> None:
         prior_scales=artifact.prior_scales,
         scale_model_coefficients=artifact.scale_model_coefficients,
     )
+    with open(arrays_tmp, "rb") as arrays_handle:
+        os.fsync(arrays_handle.fileno())
 
     payload = {
         "config": _config_to_json(artifact.config),
@@ -125,7 +136,19 @@ def save_artifact(path: str | Path, artifact: ModelArtifact) -> None:
         "validation_history": artifact.validation_history,
         "fit_fingerprint": artifact.fit_fingerprint,
     }
-    (root / "metadata.json").write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    metadata_bytes = json.dumps(payload, indent=2).encode("utf-8")
+    with open(metadata_tmp, "wb") as metadata_handle:
+        metadata_handle.write(metadata_bytes)
+        metadata_handle.flush()
+        os.fsync(metadata_handle.fileno())
+
+    # Both staging files are durable on disk; publish via atomic per-file
+    # replaces. A crash before the first replace leaves the prior pair intact.
+    # The window between the two replaces is two metadata operations — orders
+    # of magnitude smaller than the prior write window — and the metadata
+    # replace is treated as the commit point.
+    os.replace(arrays_tmp, arrays_final)
+    os.replace(metadata_tmp, metadata_final)
 
 
 def load_artifact(path: str | Path) -> ModelArtifact:

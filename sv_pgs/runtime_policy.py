@@ -50,7 +50,14 @@ def _recommended_gpu_stochastic_batch_size(
             / max(float(sample_count), 1.0)
         )
     )
-    return max(min(dense_budget_batch_size, exact_gpu_work_batch_size), 256)
+    # Pick the smaller of dense-budget vs exact-Gram work limit. Do NOT floor
+    # at 256 unconditionally: when the GPU can only hold a handful of dense
+    # variants, forcing 256 exceeds the measured budget and OOMs the block.
+    # Apply the 256 floor only if budget permits.
+    budget_capped = min(dense_budget_batch_size, exact_gpu_work_batch_size)
+    if budget_capped >= 256:
+        return budget_capped
+    return max(budget_capped, 1)
 
 
 def runtime_training_policy_for_fit(
@@ -89,12 +96,11 @@ def runtime_training_policy_for_fit(
     # Use as much dense GPU budget as the exact variant-space Gram build can
     # use efficiently. On very large cohorts, this keeps stochastic blocks in
     # the exact-GPU solve regime instead of drifting into slower sample-space CG.
-    tuned_stochastic_batch_size = max(
-        _recommended_gpu_stochastic_batch_size(
-            cacheable_dense_variants=cacheable_dense_variants,
-            sample_count=sample_count,
-        ),
-        256,
+    # Do not re-floor at 256 here — the helper already caps the floor by the
+    # dense budget so tight-GPU runs can return a smaller (but feasible) value.
+    tuned_stochastic_batch_size = _recommended_gpu_stochastic_batch_size(
+        cacheable_dense_variants=cacheable_dense_variants,
+        sample_count=sample_count,
     )
     tuned_config = replace(
         config,

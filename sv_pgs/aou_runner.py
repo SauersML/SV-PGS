@@ -139,9 +139,11 @@ def resolve_ancestry_predictions_path() -> str:
 
 
 def local_ancestry_predictions_path(work_dir: Path) -> Path:
-    # Downloaded copy inside the run's work_dir, so reruns reuse the file
-    # without another gsutil cp.
-    return work_dir / "ancestry_preds.tsv"
+    # Park the ancestry predictions one level above work_dir (alongside the
+    # SV VCF and microarray PLINK caches) so an all-diseases sweep shares the
+    # single ~3 GB download across every disease's run instead of refetching
+    # it into each disease-specific work_dir.
+    return work_dir.parent / _LOCAL_CACHE_DIRNAME / "aou_ancestry" / "ancestry_preds.tsv"
 
 
 def sv_vcf_name(chromosome: int) -> str:
@@ -312,8 +314,22 @@ def download_ancestry_preds(work_dir: Path) -> Path:
     if local.exists():
         log(f"  ancestry predictions already present: {local.name}")
         return local
+    # Migrate from the previous per-disease location (work_dir/ancestry_preds.tsv)
+    # so existing runs don't have to re-download into the new shared cache.
+    legacy_local = work_dir / "ancestry_preds.tsv"
+    if legacy_local.exists():
+        local.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            legacy_local.replace(local)
+            log(f"  migrated legacy ancestry cache: {legacy_local} -> {local}")
+            return local
+        except OSError:
+            pass
     log(f"  downloading ancestry predictions: {remote}")
-    _gsutil_cp(remote, str(local))
+    # Route through the temp-and-replace helper so an interrupted/failed
+    # gsutil cp leaves a `.partial` file we discard, rather than a truncated
+    # `ancestry_preds.tsv` that future runs would silently reuse.
+    _download_gcs_object_if_missing(remote, local)
     return local
 
 def release_process_memory() -> None:
@@ -1157,7 +1173,11 @@ def run_all_of_us(
     log("=== STATUS CHECK ===")
     sample_table_path = work_dir / f"{disease_def.canonical_name}.samples.tsv"
     merged_path = work_dir / f"{disease_def.canonical_name}.samples.with_pcs.tsv"
-    log(f"  phenotype table: {'DONE' if sample_table_path.exists() else 'NEEDED'}")
+    _sample_metadata_path = sample_table_path.with_suffix(sample_table_path.suffix + ".metadata.json")
+    log(
+        "  phenotype table: "
+        + ("DONE" if (sample_table_path.exists() and _sample_metadata_path.exists()) else "NEEDED")
+    )
     log(f"  PC-merged table: {'DONE' if merged_path.exists() else 'NEEDED'}")
     ancestry_local = local_ancestry_predictions_path(work_dir)
     resolved_variant_metadata_path = Path(variant_metadata_path) if variant_metadata_path is not None else None
@@ -1189,9 +1209,9 @@ def run_all_of_us(
                         continue
                     try:
                         with open(var_pkl, "rb") as fh:
-                            variants = _pickle.load(fh)
-                        if variants:
-                            chr_val = str(getattr(variants[0], "chromosome", "")).replace("chr", "")
+                            cached_variant_records = _pickle.load(fh)
+                        if cached_variant_records:
+                            chr_val = str(getattr(cached_variant_records[0], "chromosome", "")).replace("chr", "")
                             old_chr_to_key[chr_val] = old_k
                     except (OSError, _pickle.UnpicklingError, ValueError, EOFError, AttributeError):
                         continue
@@ -1270,7 +1290,23 @@ def run_all_of_us(
     # Step 1: Prepare phenotype
     log("=== STEP 1: Prepare phenotype ===")
     sample_table_path = work_dir / f"{disease_def.canonical_name}.samples.tsv"
-    if not sample_table_path.exists():
+    # The writer in prepare_all_of_us_disease_sample_table emits the TSV
+    # first and the .sql / .metadata.json sidecars second. An interrupted
+    # run therefore leaves a partial TSV without sidecars on disk. Treat
+    # the metadata sidecar (written last) as the completion marker so
+    # truncated TSVs are rewritten instead of silently reused.
+    sample_metadata_path = sample_table_path.with_suffix(
+        sample_table_path.suffix + ".metadata.json"
+    )
+    if not sample_table_path.exists() or not sample_metadata_path.exists():
+        if sample_table_path.exists() and not sample_metadata_path.exists():
+            log(
+                f"  existing sample table missing metadata sidecar; rewriting: {sample_table_path}"
+            )
+            try:
+                sample_table_path.unlink()
+            except OSError:
+                pass
         prepare_all_of_us_disease_sample_table(
             request=AllOfUsDiseaseRequest(disease=disease),
             output_path=sample_table_path,

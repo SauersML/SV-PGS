@@ -249,8 +249,15 @@ def compute_marginal_z_scores(
             f"covariate_matrix must have shape ({n}, _); got {covariate_f64.shape}"
         )
 
+    active_indices_i32 = np.asarray(active_variant_indices, dtype=np.int32)
+    active_subset = standardized_genotypes.subset(active_indices_i32)
+    m_active = int(active_indices_i32.shape[0])
+
     if covariate_f64.shape[1] == 0:
         y_resid = target_f64 - float(target_f64.mean())
+        # No covariate projection — null variance is sigma2 * ||x_j||^2.
+        cprime_x = np.zeros((0, m_active), dtype=np.float64)
+        ctc_inv = None
     else:
         # Solve the small covariate OLS problem (n × p_cov, p_cov is typically
         # < 30). lstsq handles rank-deficient designs (e.g., redundant
@@ -258,22 +265,56 @@ def compute_marginal_z_scores(
         alpha_cov, _, _, _ = np.linalg.lstsq(covariate_f64, target_f64, rcond=None)
         y_resid = target_f64 - covariate_f64 @ alpha_cov
 
+        # Per-variant null variance under covariate adjustment:
+        #     Var(x_j^T y_resid) = sigma2 * x_j' P x_j
+        # with P = I - C (C'C)^{-1} C'. Compute C'X by calling
+        # transpose_matvec once per covariate column (p_cov is small).
+        p_cov = int(covariate_f64.shape[1])
+        cprime_x = np.empty((p_cov, m_active), dtype=np.float64)
+        for k in range(p_cov):
+            cprime_x[k, :] = np.asarray(
+                active_subset.transpose_matvec_numpy(
+                    np.ascontiguousarray(covariate_f64[:, k], dtype=np.float32)
+                ),
+                dtype=np.float64,
+            ).reshape(-1)
+        ctc = covariate_f64.T @ covariate_f64
+        # Use pinv to tolerate rank-deficient covariate designs (mirrors the
+        # rank-tolerant lstsq above).
+        ctc_inv = np.linalg.pinv(ctc)
+
     sigma2_resid = float(np.dot(y_resid, y_resid) / max(n, 1))
     if sigma2_resid <= 0.0:
-        return np.zeros(active_variant_indices.shape[0], dtype=np.float32)
+        return np.zeros(m_active, dtype=np.float32)
 
     # X_std^T y_resid over the active variants only — one streaming pass via
     # the existing transpose_matvec infrastructure.
-    active_subset = standardized_genotypes.subset(np.asarray(active_variant_indices, dtype=np.int32))
     sum_xy = np.asarray(
         active_subset.transpose_matvec_numpy(y_resid.astype(np.float32)),
         dtype=np.float64,
     ).reshape(-1)
 
-    z_denominator = float(np.sqrt(float(n) * sigma2_resid))
-    if z_denominator <= 0.0:
-        return np.zeros(active_variant_indices.shape[0], dtype=np.float32)
-    return np.asarray(sum_xy / z_denominator, dtype=np.float32)
+    # Per-variant ||x_j||^2. Standardization uses ddof=0 (scale = sqrt(css/n)),
+    # so for non-floored columns ||x_j||^2 == n exactly (missing entries are
+    # imputed to the mean and contribute zero after centering). For columns
+    # whose raw variance fell below `minimum_scale` the scale was floored to
+    # 1.0 and ||x_j||^2 may be < n; approximating it by n in that degenerate
+    # case only deflates z (conservative), and such variants are typically
+    # uninformative anyway.
+    xpx_diag = np.full(m_active, float(n), dtype=np.float64)
+    if ctc_inv is not None and cprime_x.shape[0] > 0:
+        # Subtract the C-projection: x_j' C (C'C)^{-1} C' x_j  per column.
+        proj_diag = np.einsum("ki,kl,li->i", cprime_x, ctc_inv, cprime_x)
+        xpx_diag = xpx_diag - proj_diag
+    # Numerical floor: a column that is exactly in the span of C has xpx == 0;
+    # its marginal z is undefined, so return 0 (no signal beyond covariates).
+    xpx_diag = np.maximum(xpx_diag, 0.0)
+
+    denom = np.sqrt(sigma2_resid * xpx_diag)
+    z = np.zeros(m_active, dtype=np.float64)
+    safe = denom > 0.0
+    z[safe] = sum_xy[safe] / denom[safe]
+    return np.asarray(z, dtype=np.float32)
 
 
 def _allele_frequencies_from_means(
@@ -676,15 +717,25 @@ def _build_tie_map_windowed(
                 union(i, j, 1.0)
                 ties_found += 1
         else:
-            # Check if col_i == -col_j (with missing values handled)
-            # For int8: missing = -1, so only compare non-missing
+            # Check if col_i and col_j are sign-flipped duplicates (with
+            # missing values handled).
+            # For int8 hardcalls (0/1/2 with missing=-1) the allele-flip is the
+            # arithmetic complement 2 - x, NOT arithmetic negation. After
+            # standardization the complement-coded column equals -1 * the
+            # original standardized column, so we union with sign = -1.0.
+            # Missingness must also match: a sample missing on one side cannot
+            # be "complementary" to an observed value on the other.
             if col_i.dtype == np.int8:
-                valid = (col_i != -1) & (col_j != -1)
+                missing_i = col_i == -1
+                missing_j = col_j == -1
+                if not np.array_equal(missing_i, missing_j):
+                    continue
+                valid = ~missing_i
                 # Order matters: check that there is at least one jointly-observed
                 # sample BEFORE calling np.all on the masked slice. np.all over an
                 # empty array returns True, which would otherwise mark two
                 # all-missing columns as a sign-flipped tie.
-                if valid.sum() > 0 and np.all(col_i[valid] == -col_j[valid]):
+                if valid.sum() > 0 and np.all(col_i[valid] == (2 - col_j[valid])):
                     union(i, j, -1.0)
                     ties_found += 1
             else:

@@ -249,7 +249,14 @@ def evaluate_all_of_us(
         reader = csv.DictReader(handle, delimiter="\t")
         columns = reader.fieldnames or []
         score_col = None
-        for score_candidate in ("probability", "predicted_probability", "genetic_score", "linear_predictor"):
+        # For quasi-holdout genetic validation we want the *genetic* signal
+        # alone. `probability` and `linear_predictor` include the covariate
+        # contribution and adding covariate terms is not a monotone transform
+        # of `genetic_score`, so AUC computed on them measures covariate-
+        # adjusted disease risk, not genetic separation. Prefer genetic_score
+        # (or the raw linear_predictor as a fallback only if genetic_score is
+        # absent) ahead of the covariate-mixed columns.
+        for score_candidate in ("genetic_score", "linear_predictor", "probability", "predicted_probability"):
             if score_candidate in columns:
                 score_col = score_candidate
                 break

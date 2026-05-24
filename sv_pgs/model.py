@@ -49,6 +49,29 @@ from sv_pgs.runtime_policy import runtime_training_policy_for_fit, runtime_train
 del _jax_side_effects
 
 
+def _release_gpu_memory_pools() -> None:
+    """Free CuPy memory pools after a fit completes.
+
+    Reduced genotype matrices and validation matrices may live on device
+    during fitting. After we copy fit results back to host (numpy), the device
+    buffers are unreferenced but pooled — repeated fits in one process would
+    otherwise gradually starve the GPU. Guarded because cupy may not import in
+    CPU-only environments.
+    """
+    try:
+        import cupy as cp
+    except (ImportError, OSError, RuntimeError):
+        return
+    try:
+        cp.get_default_memory_pool().free_all_blocks()
+    except (AttributeError, RuntimeError):
+        pass
+    try:
+        cp.get_default_pinned_memory_pool().free_all_blocks()
+    except (AttributeError, RuntimeError):
+        pass
+
+
 def _select_active_variant_indices_fast(
     allele_frequencies: NDArray,
     minimum_minor_allele_frequency: float,
@@ -976,6 +999,7 @@ class BayesianPGS:
                 _clear_variational_checkpoint(fit_stage_cache_paths)
             _clear_fit_checkpoint(durable_fit_checkpoint_path)
             log(f"coefficients: 0 non-zero out of {total_variant_count} total")
+            _release_gpu_memory_pools()
             log(f"=== MODEL FIT DONE ===  mem={mem()}")
             return self
 
@@ -1340,6 +1364,13 @@ class BayesianPGS:
             training_covariate_score=training_covariate_score,
             training_linear_predictor=training_linear_predictor,
         )
+        # Drop device-backed references before flushing CuPy pools so the next
+        # fit in this process starts with a clean GPU. All FittedState arrays
+        # above are forced through np.asarray(...) to host-side float32.
+        reduced_genotypes = None  # type: ignore[assignment]
+        if "validation_genotype_matrix" in locals():
+            validation_genotype_matrix = None  # type: ignore[assignment]
+        _release_gpu_memory_pools()
         log(f"=== MODEL FIT DONE ===  mem={mem()}")
         return self
 

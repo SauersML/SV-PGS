@@ -2929,6 +2929,12 @@ class StandardizedGenotypeMatrix:
             self._cupy_subset_cache = None
             self._cupy_subset_cache_local_indices = None
             self._enable_hybrid_backend = False  # GPU streaming handles everything
+            # Clear any pre-existing hybrid backend so _uses_hybrid_backend()
+            # returns False and _streaming_gpu_context() can take the GPU path.
+            self._sparse_backend = None
+            self._dense_backend = None
+            self._sparse_local_lookup = None
+            self._dense_local_lookup = None
             log("    local int8 cache ready  mem=" + mem())
             return True
         except (OSError, RuntimeError, ValueError) as exc:
@@ -2963,6 +2969,11 @@ class StandardizedGenotypeMatrix:
                     self._cupy_subset_cache = None
                     self._cupy_subset_cache_local_indices = None
                     self._enable_hybrid_backend = False
+                    # Clear stale hybrid backend so GPU streaming is reachable.
+                    self._sparse_backend = None
+                    self._dense_backend = None
+                    self._sparse_local_lookup = None
+                    self._dense_local_lookup = None
                     log(f"    persistent int8 cache reused from {cache_path}  mem={mem()}")
                     return True
             except (OSError, ValueError) as exc:
@@ -3012,6 +3023,12 @@ class StandardizedGenotypeMatrix:
             self._cupy_subset_cache_local_indices = None
             # Don't rebuild hybrid backend — GPU streaming handles everything
             self._enable_hybrid_backend = False
+            # Clear any pre-existing hybrid backend so _uses_hybrid_backend()
+            # returns False and _streaming_gpu_context() can take the GPU path.
+            self._sparse_backend = None
+            self._dense_backend = None
+            self._sparse_local_lookup = None
+            self._dense_local_lookup = None
             log("    persistent int8 cache ready  mem=" + mem())
             return True
         except (OSError, RuntimeError, ValueError) as exc:

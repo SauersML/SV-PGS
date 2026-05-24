@@ -78,21 +78,40 @@ def test_sign_flipped_tie_check_skips_all_missing_int8_columns():
     without the ``valid.sum() > 0`` guard ordered first the pair would
     be (falsely) collapsed as a sign-flipped tie. Reordering ensures the
     short-circuit kicks in before ``np.all`` runs on the empty slice.
+
+    Note: "sign-flipped" for int8 hardcalls (0/1/2 with missing=-1)
+    means the arithmetic *complement* ``2 - x``, not arithmetic
+    negation — that is the encoding that, after centering and
+    scaling, becomes the standardized column's negation.
     """
     sample_count = 8
     col_i = np.full(sample_count, -1, dtype=np.int8)
     col_j = np.full(sample_count, -1, dtype=np.int8)
-    valid = (col_i != -1) & (col_j != -1)
+    missing_i = col_i == -1
+    missing_j = col_j == -1
+    same_missing = np.array_equal(missing_i, missing_j)
+    valid = ~missing_i
 
-    # This is the exact reordered expression from preprocessing.py.
-    is_tie = bool(valid.sum() > 0 and np.all(col_i[valid] == -col_j[valid]))
+    # Mirrors the reordered expression from preprocessing.py.
+    is_tie = bool(
+        same_missing
+        and valid.sum() > 0
+        and np.all(col_i[valid] == (2 - col_j[valid]))
+    )
     assert is_tie is False
 
-    # And a genuine sign-flipped pair still detects correctly.
+    # And a genuine complement-flipped pair still detects correctly.
     col_i2 = np.array([0, 1, 2, 0, 1, 2, -1, 0], dtype=np.int8)
-    col_j2 = np.array([0, -1, -2, 0, -1, -2, -1, 0], dtype=np.int8)
-    valid2 = (col_i2 != -1) & (col_j2 != -1)
-    is_tie2 = bool(valid2.sum() > 0 and np.all(col_i2[valid2] == -col_j2[valid2]))
+    col_j2 = np.array([2, 1, 0, 2, 1, 0, -1, 2], dtype=np.int8)
+    missing_i2 = col_i2 == -1
+    missing_j2 = col_j2 == -1
+    same_missing2 = np.array_equal(missing_i2, missing_j2)
+    valid2 = ~missing_i2
+    is_tie2 = bool(
+        same_missing2
+        and valid2.sum() > 0
+        and np.all(col_i2[valid2] == (2 - col_j2[valid2]))
+    )
     assert is_tie2 is True
 
 

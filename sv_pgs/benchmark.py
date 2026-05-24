@@ -100,9 +100,15 @@ def _compute_metrics(
     trait_type = model.config.trait_type
     if trait_type == TraitType.BINARY:
         probabilities = stable_sigmoid(scores)
-        auc = float(roc_auc_score(targets, probabilities))
-        pr_auc = float(average_precision_score(targets, probabilities))
-        loss = float(log_loss(targets, probabilities))
+        has_both_classes = np.unique(targets).size > 1
+        if has_both_classes:
+            auc = float(roc_auc_score(targets, probabilities))
+            pr_auc = float(average_precision_score(targets, probabilities))
+            loss = float(log_loss(targets, probabilities, labels=[0, 1]))
+        else:
+            auc = None
+            pr_auc = None
+            loss = None
         return BenchmarkMetrics(
             auc=auc,
             log_loss=loss,

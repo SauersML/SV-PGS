@@ -2094,7 +2094,13 @@ def fit_variational_em(
                         diagonal_noise=background_diagonal_noise,
                         batch_size=config.posterior_variance_batch_size,
                         rank=background_preconditioner_rank,
-                        random_seed=config.random_seed + outer_iteration,
+                        # Stable seed across epochs so the cached Nyström basis
+                        # (depends only on (X, rank, seed), not prior_variances)
+                        # is reused; otherwise the cache misses every epoch and
+                        # the basis is rebuilt at full cost. The downstream
+                        # preconditioner factor still rebuilds with the current
+                        # prior_variances/diagonal_noise.
+                        random_seed=int(config.random_seed),
                         warm_start=restricted_posterior_warm_start,
                     )
                 else:
@@ -2104,7 +2110,13 @@ def fit_variational_em(
                         diagonal_noise=background_diagonal_noise,
                         batch_size=config.posterior_variance_batch_size,
                         rank=background_preconditioner_rank,
-                        random_seed=config.random_seed + outer_iteration,
+                        # Stable seed across epochs so the cached Nyström basis
+                        # (depends only on (X, rank, seed), not prior_variances)
+                        # is reused; otherwise the cache misses every epoch and
+                        # the basis is rebuilt at full cost. The downstream
+                        # preconditioner factor still rebuilds with the current
+                        # prior_variances/diagonal_noise.
+                        random_seed=int(config.random_seed),
                         warm_start=restricted_posterior_warm_start,
                     )
 
@@ -2465,6 +2477,17 @@ def fit_variational_em(
             covariate_linear_predictor = np.asarray(covariate_matrix @ alpha_state, dtype=np.float64)
             linear_predictor = predictor_offset_array + covariate_linear_predictor + genetic_linear_predictor
             beta_variance_state = np.maximum(reduced_second_moment - beta_state * beta_state, 1e-8)
+            if not refresh_beta_variance:
+                # Preserve the per-block no-refresh policy (variance snaps to
+                # the prior) at the epoch level. ``reduced_second_moment`` was
+                # accumulated using actual block_beta_variance regardless of
+                # refresh, so reconstructing variance from it here would defeat
+                # the policy that prevents block-local bias in the leverage
+                # correction. Mirror the per-block assignment used above.
+                beta_variance_state = np.maximum(
+                    np.asarray(reduced_prior_variances, dtype=np.float64),
+                    1e-8,
+                )
             if config.trait_type == TraitType.QUANTITATIVE:
                 leverage_weight = np.maximum(reduced_prior_variances - beta_variance_state, 0.0) / np.maximum(reduced_prior_variances, 1e-12)
                 residual_vector = np.asarray(target_vector - linear_predictor, dtype=np.float64)
@@ -2489,6 +2512,13 @@ def fit_variational_em(
                 )
             )
             try:
+                _svi_predictor_variance: NDArray | None = None
+                if config.trait_type == TraitType.BINARY:
+                    _svi_predictor_variance = _binary_elbo_predictor_variance(
+                        genotype_matrix,
+                        beta_variance_state,
+                        batch_size=config.posterior_variance_batch_size,
+                    )
                 _elbo_value = compute_elbo(
                     trait_type=config.trait_type,
                     targets=target_vector,
@@ -2499,7 +2529,7 @@ def fit_variational_em(
                     linear_predictor=linear_predictor,
                     reduced_prior_variances=reduced_prior_variances,
                     sigma_error2=float(sigma_error2),
-                    predictor_variance=None,
+                    predictor_variance=_svi_predictor_variance,
                     local_scale_prior_objective=_local_scale_prior_objective(
                         local_scale=local_scale,
                         auxiliary_delta=auxiliary_delta,
@@ -2512,7 +2542,7 @@ def fit_variational_em(
                     ),
                 )
                 elbo_history.append(float(_elbo_value))
-            except Exception as _elbo_err:  # noqa: BLE001
+            except (ValueError, RuntimeError, FloatingPointError, np.linalg.LinAlgError) as _elbo_err:
                 log(f"  ELBO computation skipped (SVI): {_elbo_err}")
                 elbo_history.append(float("nan"))
             validation_linear_predictor: NDArray | None = None
@@ -2845,6 +2875,13 @@ def fit_variational_em(
             )
             objective_history.append(float(full_objective))
             try:
+                _cavi_predictor_variance: NDArray | None = None
+                if config.trait_type == TraitType.BINARY:
+                    _cavi_predictor_variance = _binary_elbo_predictor_variance(
+                        genotype_matrix,
+                        beta_variance_state,
+                        batch_size=config.posterior_variance_batch_size,
+                    )
                 _elbo_value = compute_elbo(
                     trait_type=config.trait_type,
                     targets=target_vector,
@@ -2855,7 +2892,7 @@ def fit_variational_em(
                     linear_predictor=np.asarray(posterior_state.linear_predictor, dtype=np.float64),
                     reduced_prior_variances=reduced_prior_variances,
                     sigma_error2=float(sigma_error2),
-                    predictor_variance=None,
+                    predictor_variance=_cavi_predictor_variance,
                     local_scale_prior_objective=_local_scale_prior_objective(
                         local_scale=local_scale,
                         auxiliary_delta=auxiliary_delta,
@@ -2868,7 +2905,7 @@ def fit_variational_em(
                     ),
                 )
                 elbo_history.append(float(_elbo_value))
-            except Exception as _elbo_err:  # noqa: BLE001
+            except (ValueError, RuntimeError, FloatingPointError, np.linalg.LinAlgError) as _elbo_err:
                 log(f"  ELBO computation skipped (CAVI): {_elbo_err}")
                 elbo_history.append(float("nan"))
             log(f"  variational EM iteration {outer_iteration + 1}: objective={full_objective:.6f} sigma_e2={sigma_error2:.6f}")
@@ -3214,6 +3251,9 @@ def fit_variational_em(
                             _pre_anderson_local_shape_b = np.asarray(
                                 local_shape_b, dtype=np.float64
                             ).copy()
+                            _pre_anderson_auxiliary_delta = np.asarray(
+                                auxiliary_delta, dtype=np.float64
+                            ).copy()
 
                             global_scale = global_scale_new
                             scale_model_coefficients = np.asarray(sc_new, dtype=np.float64)
@@ -3244,6 +3284,13 @@ def fit_variational_em(
                                 _candidate_auxiliary_delta = (
                                     local_shape_a + local_shape_b
                                 ) / np.maximum(1.0 + local_scale, config.local_scale_floor)
+                                # Commit the recomputed auxiliary_delta synchronously with the
+                                # accepted shapes so downstream consumers (CAVI precision
+                                # override, next iter's TPB update) see a consistent (a, b, delta)
+                                # triple. Revert in the safeguard branch below if rejected.
+                                auxiliary_delta = np.asarray(
+                                    _candidate_auxiliary_delta, dtype=np.float64
+                                )
                                 _candidate_elbo = compute_elbo(
                                     trait_type=config.trait_type,
                                     targets=target_vector,
@@ -3287,6 +3334,7 @@ def fit_variational_em(
                                         tpb_shape_b_vector = _pre_anderson_tpb_shape_b_vector
                                         local_shape_a = _pre_anderson_local_shape_a
                                         local_shape_b = _pre_anderson_local_shape_b
+                                        auxiliary_delta = _pre_anderson_auxiliary_delta
                                         anderson_state.reset()
                                         _anderson_accepted = False
                             except Exception as _anderson_safeguard_err:
@@ -3461,6 +3509,14 @@ def fit_variational_em(
             restricted_posterior_warm_start.sample_space_background_gpu_preconditioner.clear_gpu_arrays()
         restricted_posterior_warm_start.exact_variant_full_matrix_gpu = None
         restricted_posterior_warm_start.weighted_covariate_projection_gpu = None
+    # Drop cached Nyström bases and probe projections held directly on the
+    # genotype matrix; ``clear_gpu_arrays`` above only clears the warm-start
+    # cache entries. Without this, the per-(rank, seed) GPU basis dictionary
+    # survives the EM call and can leak across fits.
+    try:
+        genotype_matrix.clear_sample_space_nystrom_cache()
+    except AttributeError:
+        pass
     _release_gpu_memory()  # final pool free
     log(f"  variational EM returning results  mem={mem()}")
     return VariationalFitResult(
@@ -3967,6 +4023,36 @@ def _genotype_matvec_result_numpy(
     if genotype_matrix.supports_jax_dense_ops():
         return np.asarray(genotype_matrix.matvec(coefficients, batch_size=batch_size), dtype=dtype)
     return np.asarray(genotype_matrix.matvec_numpy(coefficients, batch_size=batch_size), dtype=dtype)
+
+
+def _binary_elbo_predictor_variance(
+    genotype_matrix: StandardizedGenotypeMatrix,
+    beta_variance: NDArray,
+    *,
+    batch_size: int,
+) -> NDArray:
+    """Compute per-sample predictor variance Var_q(eta_i) = sum_j X_ij^2 * Sigma_beta,jj.
+
+    Needed by the Jaakkola/Polya-Gamma binary ELBO bound. Iterates standardized
+    genotype columns and accumulates squared contributions weighted by the
+    coefficient variance, matching the convention used elsewhere in the file
+    (col_squared treats genotype matrix entries as the standardized values).
+    """
+    sample_count = int(genotype_matrix.shape[0])
+    if int(genotype_matrix.shape[1]) == 0:
+        return np.zeros(sample_count, dtype=np.float64)
+    beta_variance_array = np.asarray(beta_variance, dtype=np.float64).reshape(-1)
+    if beta_variance_array.shape[0] != int(genotype_matrix.shape[1]):
+        raise ValueError(
+            "beta_variance length must match genotype variant count for predictor variance."
+        )
+    accumulator = np.zeros(sample_count, dtype=np.float64)
+    for batch in genotype_matrix.iter_column_batches(batch_size=batch_size):
+        values = np.asarray(batch.values, dtype=np.float64)
+        block_indices = np.asarray(batch.variant_indices, dtype=np.int64)
+        block_variance = beta_variance_array[block_indices]
+        accumulator += (values * values) @ block_variance
+    return accumulator
 
 
 def _genotype_transpose_matvec_result_numpy(
@@ -6473,10 +6559,16 @@ def _solve_sample_space_rhs_gpu_inner(
         )
         converged = residual_norm_sq <= convergence_threshold_sq
         limit_reached_active = (iteration_index + 1) >= resolved_iteration_limits[active_columns]
-        if np.any(limit_reached_active):
+        # Finalize Lanczos step counts for newly-converged active columns so
+        # their alpha/beta history (now ends at iteration_index+1) is not later
+        # paired with NaNs at indices >= step_length, which would discard the
+        # logdet probe via the isfinite check in the consumer.
+        newly_converged_active = converged[active_columns] & ~done[active_columns]
+        columns_to_finalize_mask = newly_converged_active | limit_reached_active
+        if np.any(columns_to_finalize_mask):
             _finalize_sample_space_cg_lanczos_steps(
                 lanczos_recorder,
-                completed_columns=active_columns[limit_reached_active],
+                completed_columns=active_columns[columns_to_finalize_mask],
                 iteration_count=iteration_index + 1,
             )
         done = converged | ((iteration_index + 1) >= resolved_iteration_limits)
@@ -6640,7 +6732,10 @@ def _sample_space_logdet_from_cg_lanczos(
             beta = np.asarray(recorder.beta_history[: step_length - 1, slot_index], dtype=np.float64)
             if np.any(~np.isfinite(beta)) or np.any(beta < 0.0):
                 continue
-            diagonal[1:] = 1.0 / alpha[1:] + beta[:-1] / np.maximum(alpha[:-1], 1e-30)
+            # Jacobi-from-CG: T[i,i] = 1/alpha_i + beta_{i-1}/alpha_{i-1} for i>=1.
+            # With step_length=k, alpha has k entries and beta has k-1 entries
+            # (beta[0..k-2] = beta_{i-1} for i=1..k-1). Use full beta, not beta[:-1].
+            diagonal[1:] = 1.0 / alpha[1:] + beta / np.maximum(alpha[:-1], 1e-30)
             off_diagonal = np.sqrt(beta) / np.maximum(alpha[:-1], 1e-30)
         else:
             off_diagonal = np.empty(0, dtype=np.float64)
@@ -7292,10 +7387,15 @@ def _solve_sample_space_rhs_cpu(
         )
         converged = residual_norm_sq <= convergence_threshold_sq
         limit_reached_active = (iteration_index + 1) >= resolved_iteration_limits[active_columns]
-        if np.any(limit_reached_active):
+        # Finalize Lanczos step counts for newly-converged active columns so
+        # their alpha/beta history is not later paired with NaNs at indices
+        # >= step_length, which would discard the logdet probe.
+        newly_converged_active = converged[active_columns] & ~done[active_columns]
+        columns_to_finalize_mask = newly_converged_active | limit_reached_active
+        if np.any(columns_to_finalize_mask):
             _finalize_sample_space_cg_lanczos_steps(
                 lanczos_recorder,
-                completed_columns=active_columns[limit_reached_active],
+                completed_columns=active_columns[columns_to_finalize_mask],
                 iteration_count=iteration_index + 1,
             )
         done = converged | ((iteration_index + 1) >= resolved_iteration_limits)
@@ -10875,6 +10975,15 @@ def _update_scale_model(
                 global_log_floor,
                 global_log_ceiling,
             )
+        )
+        # Apply the same bounded-contraction cap used by the multi-feature
+        # Newton path so the zero-feature fixed-point cannot collapse sigma_g
+        # by more than ~22% per outer EM iteration. Upward moves unaffected.
+        max_log_decrease_per_call = 0.25
+        if updated_global_log_scale < global_log_scale - max_log_decrease_per_call:
+            updated_global_log_scale = global_log_scale - max_log_decrease_per_call
+        updated_global_log_scale = float(
+            np.clip(updated_global_log_scale, global_log_floor, global_log_ceiling)
         )
         return float(np.exp(updated_global_log_scale)), np.zeros(0, dtype=np.float64)
 

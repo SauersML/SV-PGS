@@ -308,14 +308,29 @@ class open_bed:
             )
         return result
 
-    def __del__(self) -> None:
+    def close(self) -> None:
+        """Release the .bed file descriptor. Idempotent and safe to call twice.
+
+        Long-running pipelines construct many readers; relying solely on
+        ``__del__`` leaks fds until garbage collection runs, which on AoU-scale
+        jobs can exhaust the per-process fd limit before GC catches up.
+        """
         fd = getattr(self, "_bed_fd", None)
         if fd is not None:
+            self._bed_fd = None
             try:
                 os.close(fd)
             except OSError:
                 pass
-            self._bed_fd = None
+
+    def __enter__(self) -> "open_bed":
+        return self
+
+    def __exit__(self, exc_type: Any, exc_value: Any, traceback: Any) -> None:
+        self.close()
+
+    def __del__(self) -> None:
+        self.close()
 
     def read(
         self,

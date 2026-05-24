@@ -74,11 +74,6 @@ def run_training_pipeline(
     # The TSV is opened in append mode + flushed per row so a `tail -f` on
     # the workbench shows the per-epoch metric trajectory live.
     history_path = destination / "training_history.tsv"
-    _per_epoch_callback, _close_history = _build_per_epoch_history_writer(
-        history_path=history_path,
-        config=config,
-        test_dataset=test_dataset,
-    )
     validation_data = None
     if test_dataset is not None and len(test_dataset.sample_ids) > 0:
         validation_data = (
@@ -96,6 +91,12 @@ def run_training_pipeline(
     # hour) EM and reuse the saved coefficients verbatim; downstream outputs
     # (predictions, coefficients TSV, summary, per-epoch history) are
     # regenerated below from the loaded model so callers see the same files.
+    #
+    # The artifact-reuse check runs BEFORE opening the per-epoch history
+    # writer, because that writer opens ``training_history.tsv`` in
+    # truncating "w" mode — opening it on a reuse path (where we then skip
+    # EM and never write any rows) would destroy the prior run's epoch
+    # history, leaving behind a header-only file.
     artifact_dir = destination / "artifact"
     raw_genotype_matrix = as_raw_genotype_matrix(dataset.genotypes)
     fit_fingerprint = _fit_checkpoint_config_hash(
@@ -111,7 +112,6 @@ def run_training_pipeline(
             f"reusing prior fit artifact at {artifact_dir} "
             + f"(fit_fingerprint matches; skipping EM)  mem={mem()}"
         )
-        _close_history()
         model = BayesianPGS.load(artifact_dir)
         # Re-export so the on-disk fingerprint and arrays are byte-identical
         # to what this run would have written. This is a no-op for the data
@@ -119,6 +119,14 @@ def run_training_pipeline(
         # surfacing logic in aou_runner that scans by directory age.
         model.export(artifact_dir, fit_fingerprint=fit_fingerprint)
     else:
+        # Only open the truncating per-epoch history writer once we know we
+        # are actually going to fit; otherwise we would wipe the prior run's
+        # ``training_history.tsv`` to a header-only file on every reuse.
+        _per_epoch_callback, _close_history = _build_per_epoch_history_writer(
+            history_path=history_path,
+            config=config,
+            test_dataset=test_dataset,
+        )
         log("fitting Bayesian PGS model...")
         try:
             model = BayesianPGS(config).fit(
