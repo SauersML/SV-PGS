@@ -1507,7 +1507,7 @@ _gpu_verified = False
 
 
 def require_gpu() -> Any:
-    """Probe GPU+CuPy at pipeline entry and log the selected runtime."""
+    """Validate GPU+CuPy at pipeline entry; AoU production runs require CUDA."""
     global _gpu_verified
     if _gpu_verified:
         return _cupy_module
@@ -1517,9 +1517,12 @@ def require_gpu() -> Any:
     if cupy is None:
         log("  CUDA runtime diagnostic: " + _cupy_runtime_diagnostic())
         log("  NVIDIA driver diagnostic: " + _nvidia_driver_diagnostic())
-        log("  no usable NVIDIA GPU detected — running CPU-only (this will be slow)")
-        _gpu_verified = True
-        return None
+        raise RuntimeError(
+            "AoU fitting requires a working NVIDIA CUDA runtime, but CuPy cannot see a usable GPU. "
+            + _cupy_runtime_diagnostic()
+            + " | "
+            + _nvidia_driver_diagnostic()
+        )
     # Reclaim any pool blocks before sampling free memory so the warning
     # below reflects real availability rather than blocks the CuPy pool
     # is merely caching.
