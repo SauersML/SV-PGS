@@ -56,6 +56,7 @@ _SAMPLE_WINDOW_STRIPED_MAX_OVERREAD_RATIO = 32.0
 _INDEXED_VARIANT_COALESCE_MIN_VARIANTS = 64
 _INDEXED_VARIANT_COALESCE_TARGET_CHUNK_BYTES = 256 * 1024 * 1024
 _INDEXED_VARIANT_COALESCE_MAX_OVERREAD_RATIO = 4.0
+_DENSE_SAMPLE_INDEX_DECODE_MIN_FRACTION = 0.70
 
 
 def _use_coalesced_indexed_variant_reads(indices: NDArray) -> bool:
@@ -67,6 +68,14 @@ def _use_coalesced_indexed_variant_reads(indices: NDArray) -> bool:
     if not np.all(deltas > 0):
         return False
     return not np.all(deltas == 1)
+
+
+def _use_dense_sample_index_decode(sample_indices: NDArray, iid_count: int) -> bool:
+    """Prefer full-row decode when an arbitrary sample index covers most rows."""
+    samples = np.asarray(sample_indices, dtype=np.intp)
+    if samples.ndim != 1 or iid_count <= 0:
+        return False
+    return samples.size >= int(np.ceil(iid_count * _DENSE_SAMPLE_INDEX_DECODE_MIN_FRACTION))
 
 
 def to_bed(
@@ -498,6 +507,16 @@ class open_bed:
             start_offset = PLINK1_HEADER_SIZE + variant_index.start * bytes_per_variant
             payload = self._pread_payload(start_offset, variant_count * bytes_per_variant)
             if isinstance(resolved_sample_index, np.ndarray):
+                if _use_dense_sample_index_decode(resolved_sample_index, self.iid_count):
+                    full = _decode_payload_parallel(
+                        payload,
+                        iid_count=self.iid_count,
+                        variant_count=variant_count,
+                        bytes_per_variant=bytes_per_variant,
+                        count_a1=self.count_A1,
+                        num_threads=num_threads,
+                    )
+                    return full[resolved_sample_index, :]
                 return _decode_payload_sample_indices_parallel(
                     payload,
                     iid_count=self.iid_count,
@@ -526,6 +545,16 @@ class open_bed:
                 variant_index,
                 bytes_per_variant=bytes_per_variant,
             )
+            if _use_dense_sample_index_decode(sample_indices, self.iid_count):
+                full = _decode_payload_parallel(
+                    payload,
+                    iid_count=self.iid_count,
+                    variant_count=n_variants,
+                    bytes_per_variant=bytes_per_variant,
+                    count_a1=self.count_A1,
+                    num_threads=num_threads,
+                )
+                return full[sample_indices, :]
             return _decode_payload_sample_indices_parallel(
                 payload,
                 iid_count=self.iid_count,

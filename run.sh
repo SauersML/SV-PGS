@@ -78,26 +78,6 @@ except BaseException as exc:
 PYEOF
 echo "=== END GPU RUNTIME DIAGNOSTICS ==="
 
-if ! .venv/bin/python - <<'PYEOF' >/dev/null 2>&1
-import cupy
-
-try:
-    raise SystemExit(0 if int(cupy.cuda.runtime.getDeviceCount()) > 0 else 1)
-except BaseException:
-    raise SystemExit(1)
-PYEOF
-then
-  echo
-  echo "ABORT: no usable NVIDIA CUDA GPU is visible inside this runtime."
-  echo "       /dev/nvidia* is missing or the container driver/runtime is incompatible."
-  echo "       Fix the host/container first, then rerun:"
-  echo "         - launch this notebook/container with GPU acceleration enabled"
-  echo "         - for Docker, run with NVIDIA Container Toolkit and --gpus all"
-  echo "         - install/activate an NVIDIA driver new enough for CUDA 12 wheels"
-  echo "       SV-PGS will not run AoU fitting on CPU."
-  exit 42
-fi
-
 BASE_SNP="$HOME/sv_pgs_results_snp"
 BASE_JOINT="$HOME/sv_pgs_results_snp_sv"
 # Single canonical cache dir. ~/.sv_pgs_cache is where every previous AoU run

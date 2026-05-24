@@ -772,6 +772,77 @@ def test_plink_reader_decodes_only_requested_samples(tmp_path: Path, monkeypatch
     assert observed_variant_gather.flags.f_contiguous
 
 
+def test_plink_reader_uses_dense_decode_for_high_coverage_sample_indices(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    bed_path = tmp_path / "cohort.bed"
+    genotype_matrix = np.array(
+        [
+            [0.0, 1.0, 2.0, np.nan],
+            [1.0, 2.0, 0.0, 1.0],
+            [2.0, 0.0, 1.0, 2.0],
+            [np.nan, 1.0, 2.0, 0.0],
+            [0.0, np.nan, 1.0, 1.0],
+            [1.0, 0.0, np.nan, 2.0],
+            [2.0, 2.0, 0.0, np.nan],
+            [0.0, 1.0, 2.0, 0.0],
+        ],
+        dtype=np.float32,
+    )
+    to_bed(
+        bed_path,
+        genotype_matrix,
+        properties={
+            "fid": [f"f{i}" for i in range(genotype_matrix.shape[0])],
+            "iid": [f"s{i}" for i in range(genotype_matrix.shape[0])],
+            "sid": [f"v{i}" for i in range(genotype_matrix.shape[1])],
+        },
+    )
+    sample_indices = np.array([7, 0, 3, 5, 2, 1], dtype=np.intp)
+    variant_indices = np.array([3, 0, 2], dtype=np.intp)
+    dense_decode_calls: list[int] = []
+
+    def fail_sample_index_decode(*args, **kwargs):
+        raise AssertionError("dense sample subsets should use full-row decode")
+
+    original_dense_decode = plink_module._decode_payload_parallel
+
+    def record_dense_decode(*args, **kwargs):
+        dense_decode_calls.append(int(kwargs["variant_count"]))
+        return original_dense_decode(*args, **kwargs)
+
+    monkeypatch.setattr(plink_module, "_DENSE_SAMPLE_INDEX_DECODE_MIN_FRACTION", 0.70)
+    monkeypatch.setattr(plink_module, "_decode_payload_sample_indices_parallel", fail_sample_index_decode)
+    monkeypatch.setattr(plink_module, "_decode_payload_parallel", record_dense_decode)
+    reader = open_bed(bed_path, iid_count=genotype_matrix.shape[0], sid_count=genotype_matrix.shape[1])
+
+    observed_contiguous = reader.read(index=(sample_indices, slice(0, 4)), dtype="int8", order="F")
+    observed_indexed = reader.read(index=(sample_indices, variant_indices), dtype="int8", order="F")
+
+    expected_contiguous_float = genotype_matrix[sample_indices, 0:4]
+    expected_indexed_float = genotype_matrix[np.ix_(sample_indices, variant_indices)]
+    np.testing.assert_array_equal(
+        observed_contiguous,
+        np.where(
+            np.isnan(expected_contiguous_float),
+            io_module.PLINK_MISSING_INT8,
+            expected_contiguous_float,
+        ).astype(np.int8),
+    )
+    np.testing.assert_array_equal(
+        observed_indexed,
+        np.where(
+            np.isnan(expected_indexed_float),
+            io_module.PLINK_MISSING_INT8,
+            expected_indexed_float,
+        ).astype(np.int8),
+    )
+    assert dense_decode_calls == [4, 3]
+    assert observed_contiguous.flags.f_contiguous
+    assert observed_indexed.flags.f_contiguous
+
+
 def test_plink_reader_reads_only_contiguous_sample_window(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

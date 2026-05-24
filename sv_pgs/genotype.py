@@ -1507,7 +1507,7 @@ _gpu_verified = False
 
 
 def require_gpu() -> Any:
-    """Validate GPU+CuPy at pipeline entry; AoU production runs require CUDA."""
+    """Probe GPU+CuPy at pipeline entry and log the selected runtime."""
     global _gpu_verified
     if _gpu_verified:
         return _cupy_module
@@ -1517,12 +1517,9 @@ def require_gpu() -> Any:
     if cupy is None:
         log("  CUDA runtime diagnostic: " + _cupy_runtime_diagnostic())
         log("  NVIDIA driver diagnostic: " + _nvidia_driver_diagnostic())
-        raise RuntimeError(
-            "AoU fitting requires a working NVIDIA CUDA runtime, but CuPy cannot see a usable GPU. "
-            + _cupy_runtime_diagnostic()
-            + " | "
-            + _nvidia_driver_diagnostic()
-        )
+        log("  no usable NVIDIA GPU detected — running CPU-only (this will be slow)")
+        _gpu_verified = True
+        return None
     # Reclaim any pool blocks before sampling free memory so the warning
     # below reflects real availability rather than blocks the CuPy pool
     # is merely caching.
@@ -1537,9 +1534,16 @@ def require_gpu() -> Any:
         free_bytes += int(device_free)
         total_bytes += int(device_total)
         per_device.append(f"device{device_id}={int(device_free) / 1e9:.1f}/{int(device_total) / 1e9:.1f}GB")
+    try:
+        from sv_pgs._jax import SELECTED_CUDA_DEVICE as _selected_cuda_device
+    except (ImportError, RuntimeError):
+        _selected_cuda_device = None
+    pinned_suffix = ""
+    if _selected_cuda_device is not None:
+        pinned_suffix = f" pinned={_selected_cuda_device[0]}"
     log(
         "  GPU verified: "
-        + f"cuda_devices={device_count} aggregate={total_bytes / 1e9:.1f} GB total, {free_bytes / 1e9:.1f} GB free "
+        + f"cuda_devices={device_count}{pinned_suffix} aggregate={total_bytes / 1e9:.1f} GB total, {free_bytes / 1e9:.1f} GB free "
         + "(" + ", ".join(per_device) + ")"
     )
     # If another process is pinning most of the device, the training pipeline
