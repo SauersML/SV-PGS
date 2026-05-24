@@ -44,13 +44,23 @@ fi
 echo
 echo "=== GPU RUNTIME DIAGNOSTICS ==="
 echo "  device files:"
-ls -l /dev/nvidia* 2>/dev/null | sed 's/^/    /' || echo "    (none)"
+ls -l /dev/nvidia* /dev/nvidiactl /dev/nvidia-uvm 2>&1 | sed 's/^/    /' | head -20
+echo "  lspci (nvidia):"
+lspci 2>/dev/null | grep -i nvidia | sed 's/^/    /' || echo "    (no lspci output)"
+echo "  /proc/driver/nvidia/version:"
+cat /proc/driver/nvidia/version 2>/dev/null | sed 's/^/    /' || echo "    not loaded"
+echo "  nvidia-smi locations on disk:"
+find /usr /opt -maxdepth 6 -name "nvidia-smi" 2>/dev/null | sed 's/^/    /' || true
+echo "  libcuda.so locations:"
+find /usr /opt -maxdepth 6 -name "libcuda.so*" 2>/dev/null | sed 's/^/    /' || true
+echo "  nvidia/cuda packages installed:"
+dpkg -l 2>/dev/null | grep -iE "nvidia|cuda" | awk '{print "    "$1, $2, $3}' | head -20
 echo "  nvidia-smi:"
 if command -v nvidia-smi >/dev/null 2>&1; then
   nvidia-smi -L 2>&1 | sed 's/^/    /' || true
   nvidia-smi --query-gpu=index,name,driver_version,memory.total,memory.free --format=csv,noheader,nounits 2>&1 | sed 's/^/    /' || true
 else
-  echo "    unavailable"
+  echo "    unavailable (not on PATH)"
 fi
 echo "  python CUDA runtimes:"
 .venv/bin/python - <<'PYEOF' 2>&1 | sed 's/^/    /'
