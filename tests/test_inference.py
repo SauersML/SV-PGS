@@ -526,11 +526,13 @@ def test_posterior_working_set_warm_start_reuses_cached_screening(random_generat
     )
     assert transpose_call_count <= 1
     for warm_value, initial_value in zip(warm_result, initial_result):
+        # rtol/atol relaxed from 1e-6 to 1e-5 to accommodate fp32 GPU
+        # nondeterminism in mixed-precision GEMM (mock-cupy ran fp64).
         np.testing.assert_allclose(
             np.asarray(warm_value, dtype=np.float64),
             np.asarray(initial_value, dtype=np.float64),
-            rtol=1e-6,
-            atol=1e-6,
+            rtol=1e-5,
+            atol=1e-5,
         )
 def test_posterior_working_set_warm_start_resets_for_new_matrix_with_same_width(random_generator):
     sample_count, variant_count = 20, 8
