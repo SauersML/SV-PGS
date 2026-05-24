@@ -6682,18 +6682,41 @@ def _sample_space_gpu_preconditioner_with_factor(
     selected_rank = min(int(rank), int(genotype_matrix.shape[0]))
     if selected_rank <= 0:
         return apply_diagonal, None, None
-    basis_gpu = _sample_space_nystrom_basis_gpu(
-        genotype_matrix=genotype_matrix,
-        batch_size=batch_size,
-        rank=selected_rank,
-        random_seed=random_seed,
-    )
-    low_rank_factor_gpu = _sample_space_nystrom_factor_gpu_from_basis(
-        genotype_matrix=genotype_matrix,
-        prior_variances=prior_variances,
-        basis_gpu=basis_gpu,
-        batch_size=batch_size,
-    )
+    # The Nyström basis build (sketch_rank matvecs over the full variant set)
+    # and the subsequent factor build (basis-rank kernel matvecs) both route
+    # through ``_apply_sample_space_operator_gpu``. Without a resident int8
+    # cache each matvec re-decodes every column from PLINK BED — at AoU
+    # scale (~696k variants on T4/V100 16GB cohorts) that streaming dominates
+    # preconditioner construction time. Promote the FULL variant set into a
+    # GPU-resident int8 cache for the bundle's lifetime so both phases reuse
+    # cached columns. Re-entrancy: skip install if an outer caller (e.g. the
+    # CG inner loop) already owns ``_cupy_cache``. The budget check inside
+    # ``_try_install_cg_workset_resident_cache`` will refuse when the full
+    # variant matrix exceeds the configured int8-resident headroom, so this
+    # wrap is a no-op (streaming fallback preserved) on cohorts that cannot
+    # fit the full int8 matrix on device.
+    _owned_precond_cache = False
+    if genotype_matrix._cupy_cache is None:
+        _owned_precond_cache = _try_install_cg_workset_resident_cache(
+            genotype_matrix,
+            cupy=cp,
+        )
+    try:
+        basis_gpu = _sample_space_nystrom_basis_gpu(
+            genotype_matrix=genotype_matrix,
+            batch_size=batch_size,
+            rank=selected_rank,
+            random_seed=random_seed,
+        )
+        low_rank_factor_gpu = _sample_space_nystrom_factor_gpu_from_basis(
+            genotype_matrix=genotype_matrix,
+            prior_variances=prior_variances,
+            basis_gpu=basis_gpu,
+            batch_size=batch_size,
+        )
+    finally:
+        if _owned_precond_cache:
+            _release_cg_workset_resident_cache(genotype_matrix, cupy=cp)
     if low_rank_factor_gpu is None:
         return apply_diagonal, None, basis_gpu
 
