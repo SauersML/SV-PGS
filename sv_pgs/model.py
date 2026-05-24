@@ -653,7 +653,15 @@ def _try_load_variational_checkpoint(
             checkpoint = pickle.load(handle)
         if not isinstance(checkpoint, VariationalFitCheckpoint):
             raise ValueError("variational checkpoint has unexpected type.")
-        if int(getattr(checkpoint, "completed_iterations", 0)) <= 0:
+        # Mirror the save-side carve-out: an iter=0 checkpoint is resumable
+        # iff it carries mid-epoch partial progress (completed blocks or a
+        # binary-block solver state). Without that, it would replay a zero-
+        # beta "resume" state.
+        has_partial_progress = (
+            int(getattr(checkpoint, "completed_blocks_in_iteration", 0) or 0) > 0
+            or getattr(checkpoint, "binary_block_resume_state", None) is not None
+        )
+        if int(getattr(checkpoint, "completed_iterations", 0)) <= 0 and not has_partial_progress:
             log(
                 "variational checkpoint ignored: stale iter=0 at "
                 + f"{cache_paths.cache_dir.name}/{cache_paths.key}.em.pkl; "
@@ -759,7 +767,13 @@ def _save_fit_checkpoint(
         completed_iterations = int(checkpoint.completed_iterations)
     except (TypeError, ValueError):
         completed_iterations = 0
-    if completed_iterations <= 0:
+    # An iter=0 checkpoint is still resumable when mid-epoch partial
+    # progress is present (matches _save_variational_checkpoint's carve-out).
+    has_partial_progress = (
+        int(getattr(checkpoint, "completed_blocks_in_iteration", 0) or 0) > 0
+        or getattr(checkpoint, "binary_block_resume_state", None) is not None
+    )
+    if completed_iterations <= 0 and not has_partial_progress:
         log(
             "fit checkpoint skipped: "
             + f"{checkpoint_path} "
@@ -807,29 +821,18 @@ def _try_load_fit_checkpoint(
             if stored_hash != config_hash:
                 log(f"fit checkpoint ignored: config hash mismatch at {checkpoint_path}")
                 return None
-            # Cheap pre-flight: if the file records iter=0 there is nothing
-            # to resume from. Treat it as absent and clear it so we start
-            # fresh rather than replaying a zero-beta "resume" state.
-            try:
-                stored_iter = int(np.asarray(payload["iter"]).reshape(-1)[0])
-            except (KeyError, ValueError, IndexError):
-                stored_iter = 0
-            stale_iter_zero = stored_iter <= 0
-            if stale_iter_zero:
-                checkpoint_bytes = None
-            else:
-                checkpoint_bytes = np.asarray(payload["checkpoint_pickle"], dtype=np.uint8).tobytes()
-        if stale_iter_zero:
-            log(
-                "fit checkpoint ignored: stale iter=0 at "
-                + f"{checkpoint_path}; treating as absent and starting fresh"
-            )
-            _clear_fit_checkpoint(checkpoint_path)
-            return None
+            checkpoint_bytes = np.asarray(payload["checkpoint_pickle"], dtype=np.uint8).tobytes()
         checkpoint = pickle.loads(checkpoint_bytes)
         if not isinstance(checkpoint, VariationalFitCheckpoint):
             raise ValueError("fit checkpoint has unexpected type.")
-        if int(getattr(checkpoint, "completed_iterations", 0)) <= 0:
+        # Mirror the save-side carve-out: iter=0 is still resumable when
+        # mid-epoch partial progress is present (completed blocks or a
+        # binary-block solver state).
+        has_partial_progress = (
+            int(getattr(checkpoint, "completed_blocks_in_iteration", 0) or 0) > 0
+            or getattr(checkpoint, "binary_block_resume_state", None) is not None
+        )
+        if int(getattr(checkpoint, "completed_iterations", 0)) <= 0 and not has_partial_progress:
             log(
                 "fit checkpoint ignored: stale iter=0 at "
                 + f"{checkpoint_path}; treating as absent and starting fresh"
