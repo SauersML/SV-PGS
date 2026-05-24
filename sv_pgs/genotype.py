@@ -37,13 +37,30 @@ MIN_BED_READER_BATCH_SIZE = 32  # always read at least this many variants
 STANDARDIZED_STREAMING_TARGET_BATCH_BYTES = 1_024_000_000
 LOCAL_INT8_STANDARDIZED_STREAMING_TARGET_BATCH_BYTES = 4_096_000_000
 GPU_STANDARDIZED_STREAMING_TARGET_BATCH_BYTES = 512_000_000
-GPU_STANDARDIZED_PREFETCH_TARGET_BYTES = 1_024_000_000
+GPU_STANDARDIZED_PREFETCH_TARGET_BYTES = 4_096_000_000
 GPU_STANDARDIZED_DYNAMIC_FREE_FRACTION = 0.20
 GPU_STANDARDIZED_DYNAMIC_RESERVE_BYTES = 512_000_000
 PLINK_INT8_TARGET_BATCH_BYTES = 1_024_000_000
-PLINK_INT8_MAX_PREFETCH_DEPTH = 1
+# Allow multiple decoded batches in flight so PLINK bed decode can fully
+# overlap with the GPU matmul/standardize kernels. 1 forced full serialization
+# of disk read and GPU work, leaving the V100/T4 idle while CPU decoded.
+PLINK_INT8_MAX_PREFETCH_DEPTH = 3
 PLINK_BED_READER_NUM_THREADS = max(1, os.cpu_count() or 1)
-GPU_INT8_MATMUL_STAGING_ROWS = 1024
+# Cap on rows promoted per int8 matmul staging chunk. With ~695k AoU variants
+# this slab is ``chunk_rows x n_cols x 4 bytes`` (fp32 promotion); 4096 rows is
+# ~11 GB on AoU and is intentionally too big to default to — the adaptive
+# planner picks the chunk that actually fits in free VRAM (capped here).
+GPU_INT8_MATMUL_STAGING_ROWS = 4096
+# Hard upper bound on the adaptive chunk size — protects against pathological
+# free-memory readings from blowing the staging slab past a sane size.
+GPU_INT8_MATMUL_STAGING_ROWS_MAX = 8192
+# Adaptive staging may consume up to this fraction of currently-free VRAM. The
+# rest is reserved for the int8 cache, sample/variant result vectors, and the
+# 1.5 GB TR-Newton/HVP safety margin.
+GPU_INT8_MATMUL_STAGING_FREE_FRACTION = 0.40
+# Absolute ceiling for the adaptive staging slab. Keeps the slab bounded even
+# on very-high-memory GPUs (H100 80 GB) where 40% of free could be excessive.
+GPU_INT8_MATMUL_STAGING_MAX_BYTES = 6_000_000_000
 GPU_FP16_RESIDENT_CACHE_ENABLED = True
 
 # If the reduced genotype matrix (after tie-group dedup) is smaller than 4 GB,
@@ -1499,9 +1516,17 @@ def _iter_prefetched_raw_batches(
     bytes_per_raw_value = np.dtype(np.int8 if _supports_int8_batches(raw) else np.float32).itemsize
     chunk_bytes = max(sample_count * safe_batch_size * bytes_per_raw_value, 1)
     memory_capped_in_flight = max(1, GPU_STANDARDIZED_PREFETCH_TARGET_BYTES // chunk_bytes)
-    cpu_cap = max(1, os.cpu_count() or 4)
+    # Reserve 2 cores: one for the main consumer thread and one for the CUDA
+    # host driver / GPU command submission. The remaining cores fan out across
+    # the prefetch executor. Previously the cap was the raw cpu_count, which on
+    # the AoU 16-core T4 box left the CUDA driver thread fighting prefetch
+    # workers for CPU time and starving the GPU.
+    cpu_cap = max(1, (os.cpu_count() or 4) - 2)
     num_io_workers = min(cpu_cap, int(memory_capped_in_flight), max(1, len(chunks)))
-    in_flight_limit = min(num_io_workers * 2, int(memory_capped_in_flight), len(chunks))
+    # Allow up to 4x as many decoded chunks in flight as we have workers so the
+    # GPU never waits for a decode to finish; the byte-budget cap above still
+    # bounds the total queued bytes.
+    in_flight_limit = min(num_io_workers * 4, int(memory_capped_in_flight), len(chunks))
     # Split the CPU budget between pipeline depth and per-read decode fan-out.
     # The pipeline executor *is* the parallelism; fanning out further inside
     # each read would oversubscribe (workers * threads_per_worker > cpu_count)
@@ -1780,6 +1805,38 @@ def _bytes_gb(value: int) -> str:
     return f"{int(value) / 1e9:.2f} GB"
 
 
+def _adaptive_int8_staging_chunk_rows(
+    *,
+    n_cols: int,
+    dtype: Any,
+    free_bytes: int,
+    cap: int = GPU_INT8_MATMUL_STAGING_ROWS_MAX,
+    floor: int = GPU_INT8_MATMUL_STAGING_ROWS,
+) -> int:
+    """Pick the largest staging chunk that fits the configured free-VRAM slice.
+
+    Returns ``floor`` when free memory is unknown (e.g. mocked CuPy in tests)
+    so behavior matches the legacy fixed-default code path. When real free
+    memory is available, scales the chunk up to ``cap`` rows as long as the
+    fp32-promoted staging slab stays under both the free-fraction budget and
+    the absolute ``GPU_INT8_MATMUL_STAGING_MAX_BYTES`` ceiling.
+    """
+    resolved_dtype = _cupy_dtype_to_numpy_dtype(np.float32 if dtype is None else dtype)
+    compute_itemsize = max(int(resolved_dtype.itemsize), np.dtype(np.float32).itemsize)
+    cols = max(int(n_cols), 1)
+    bytes_per_row = cols * compute_itemsize
+    if free_bytes <= 0 or bytes_per_row <= 0:
+        return max(1, int(floor))
+    budget_bytes = min(
+        int(free_bytes * GPU_INT8_MATMUL_STAGING_FREE_FRACTION),
+        int(GPU_INT8_MATMUL_STAGING_MAX_BYTES),
+    )
+    if budget_bytes < bytes_per_row:
+        return max(1, int(floor))
+    fits = budget_bytes // bytes_per_row
+    return int(max(1, min(int(cap), max(int(floor), int(fits)))))
+
+
 def _gpu_solver_headroom_bytes(
     *,
     n_rows: int,
@@ -1878,12 +1935,28 @@ def _estimate_gpu_materialization_memory_plan(
     rows = max(int(n_rows), 0)
     cols = max(int(n_cols), 0)
     storage_bytes = rows * cols * int(resolved_dtype.itemsize)
+    # Resolve the staging chunk adaptively: scale up to fit free VRAM when the
+    # caller passed the default, but respect any explicit override (callers
+    # that need to plan with a specific chunk size — e.g. matmul code paths
+    # that have already allocated the slab — pass their own value).
+    effective_chunk_rows = int(chunk_rows)
+    if "int8" in backend and effective_chunk_rows <= GPU_INT8_MATMUL_STAGING_ROWS:
+        try:
+            free_bytes_for_chunk = _gpu_effective_free_bytes(cupy)
+        except (AttributeError, OSError, RuntimeError):
+            free_bytes_for_chunk = 0
+        if free_bytes_for_chunk > 0:
+            effective_chunk_rows = _adaptive_int8_staging_chunk_rows(
+                n_cols=cols,
+                dtype=dtype,
+                free_bytes=free_bytes_for_chunk,
+            )
     staging_bytes, result_vector_bytes, safety_bytes = _gpu_solver_headroom_bytes(
         n_rows=rows,
         n_cols=cols,
         dtype=dtype,
         backend=backend,
-        chunk_rows=chunk_rows,
+        chunk_rows=effective_chunk_rows,
         result_vector_count=result_vector_count,
         safety_margin_bytes=safety_margin_bytes,
     )
@@ -1893,7 +1966,7 @@ def _estimate_gpu_materialization_memory_plan(
         n_cols=cols,
         dtype=dtype,
         backend=backend,
-        chunk_rows=chunk_rows,
+        chunk_rows=effective_chunk_rows,
         result_vector_count=result_vector_count,
         safety_margin_bytes=safety_margin_bytes,
     )
@@ -1912,7 +1985,7 @@ def _estimate_gpu_materialization_memory_plan(
         budget_bytes=int(budget_bytes),
         free_bytes=_gpu_effective_free_bytes(cupy),
         total_bytes=_gpu_total_bytes(cupy),
-        chunk_rows=max(1, min(int(chunk_rows), max(rows, 1))),
+        chunk_rows=max(1, min(int(effective_chunk_rows), max(rows, 1))),
     )
 
 
