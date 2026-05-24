@@ -174,6 +174,23 @@ class ModelConfig:
 
     random_seed: int = 0
 
+    # ------------------------------------------------------------------
+    # LD-block / N-GPU rewrite (Phase 4) wiring flags.
+    #
+    # ``use_ld_blocks`` is opt-in: when True the sample-space matvec is
+    # decomposed into per-LD-block matmuls and dispatched across all
+    # visible CUDA devices via :class:`sv_pgs.gpu_scheduler.GPUScheduler`.
+    # When False (default) the existing single-monolithic-matmul path
+    # remains in force for every entry point — only the AoU runner flips
+    # this to True until the new code path has been verified on every
+    # other entry point.
+    # ------------------------------------------------------------------
+    use_ld_blocks: bool = False
+    ld_block_population: str = "EUR"
+    ld_block_build: str = "hg38"
+    ld_block_singleton_chunk_size: int = 256
+    ld_block_pipeline_depth: int = 2
+
     def __post_init__(self) -> None:
         if self.max_outer_iterations < 1:
             raise ValueError("max_outer_iterations must be positive.")
@@ -247,6 +264,20 @@ class ModelConfig:
             raise ValueError("posterior_working_set_max_passes must be positive.")
         if self.posterior_working_set_coefficient_tolerance < 0.0:
             raise ValueError("posterior_working_set_coefficient_tolerance must be non-negative.")
+        if self.ld_block_population.upper() not in {"EUR", "AFR", "EAS", "AMR"}:
+            raise ValueError(
+                "ld_block_population must be one of 'EUR', 'AFR', 'EAS', 'AMR'; "
+                + f"got {self.ld_block_population!r}"
+            )
+        if self.ld_block_build.lower() not in {"hg19", "grch37", "hg38", "grch38"}:
+            raise ValueError(
+                "ld_block_build must be one of 'hg19', 'hg38' (or 'grch37'/'grch38'); "
+                + f"got {self.ld_block_build!r}"
+            )
+        if self.ld_block_singleton_chunk_size < 1:
+            raise ValueError("ld_block_singleton_chunk_size must be positive.")
+        if self.ld_block_pipeline_depth < 1:
+            raise ValueError("ld_block_pipeline_depth must be positive.")
     def class_log_baseline_scales(self) -> Mapping[VariantClass, float]:
         return dict(DEFAULT_CLASS_LOG_BASELINE_SCALE)
 

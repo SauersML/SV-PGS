@@ -160,7 +160,7 @@ class FittedState:
 
 _FIT_STAGE_CACHE_DIRNAME = ".sv_pgs_cache"
 _FIT_STAGE_CACHE_SUBDIR = "fit_stage"
-_FIT_STAGE_CACHE_VERSION = 4
+_FIT_STAGE_CACHE_VERSION = 5
 _FIT_CHECKPOINT_VERSION = 1
 # Strict-mode guard for binary TR-Newton fits that would otherwise fall back to
 # the mmap-streaming path when no GPU/RAM/local int8 cache is available. Default
@@ -193,10 +193,20 @@ class _FitStageCachePaths:
     reduced_raw_i8_path: Path
     em_checkpoint_path: Path
     fit_key: str | None = None
+    # Phase 4: persisted LD-block partition (block_ids only — the inverted
+    # ``{block_id: indices}`` mapping is rebuilt cheaply via
+    # :func:`sv_pgs.ld_blocks.block_partition` on load). The path is filled
+    # for every cache key but the file itself is written only when the
+    # caller opts in via ``config.use_ld_blocks=True``.
+    ld_block_partition_path: Path | None = None
 
     def __post_init__(self) -> None:
         if self.fit_key is None:
             self.fit_key = self.key
+        if self.ld_block_partition_path is None:
+            self.ld_block_partition_path = (
+                self.cache_dir / f"{self.key}.ld_block_partition.npz"
+            )
 
 
 def _fit_stage_cache_dir() -> Path:
@@ -283,6 +293,30 @@ def _fit_stage_cache_paths(
     if marginal_screen_min_abs_z > 0.0:
         _update_hash_with_array_bytes(structure_hasher, np.asarray(covariates, dtype=np.float32))
         _update_hash_with_array_bytes(structure_hasher, np.asarray(targets, dtype=np.float32))
+    # Phase 4 LD-block wiring: bake the partition opt-in flag plus the loaded
+    # Berisa-Pickrell table SHA-256 into the structure key so flipping
+    # ``use_ld_blocks`` (or swapping population/build) invalidates the cached
+    # active-variant ordering instead of being silently reused with the
+    # wrong block topology.
+    structure_hasher.update(b"ld-block-wiring:")
+    structure_hasher.update(b"on" if bool(getattr(config, "use_ld_blocks", False)) else b"off")
+    structure_hasher.update(b":pop=")
+    structure_hasher.update(str(getattr(config, "ld_block_population", "EUR")).upper().encode("ascii"))
+    structure_hasher.update(b":build=")
+    structure_hasher.update(str(getattr(config, "ld_block_build", "hg38")).lower().encode("ascii"))
+    if bool(getattr(config, "use_ld_blocks", False)):
+        try:
+            from importlib import resources as _resources
+            _pkg = _resources.files("sv_pgs").joinpath("_data").joinpath("EUR_hg38.tsv")
+            with _pkg.open("rb") as _ld_fh:
+                _ld_sha = hashlib.sha256(_ld_fh.read()).hexdigest()
+            structure_hasher.update(b":tsv_sha=")
+            structure_hasher.update(_ld_sha.encode("ascii"))
+        except (OSError, ModuleNotFoundError, FileNotFoundError):
+            # Best-effort: if the bundled TSV isn't reachable we still hash
+            # the on/off + (population, build) tuple — better to miss a
+            # cache than to crash the cache-key builder.
+            structure_hasher.update(b":tsv_sha=unknown")
     structure_key = structure_hasher.hexdigest()[:24]
     fit_hasher = hashlib.sha256()
     fit_hasher.update(f"fit-stage-fit-v{_FIT_STAGE_CACHE_VERSION}".encode("utf-8"))
@@ -649,6 +683,79 @@ def _try_load_fit_stage_cache(
         return None
 
 
+def _save_ld_block_partition_cache(
+    cache_paths: _FitStageCachePaths,
+    partition: "LdBlockPartition",
+) -> None:
+    """Persist the Phase 4 LD-block partition next to the structure cache."""
+    if cache_paths.ld_block_partition_path is None:
+        return
+    cache_paths.cache_dir.mkdir(parents=True, exist_ok=True)
+    tmp_path = cache_paths.cache_dir / (
+        f"{cache_paths.key}.ld_block_partition.tmp.{os.getpid()}.{uuid.uuid4().hex}.npz"
+    )
+    try:
+        np.savez_compressed(
+            tmp_path,
+            block_ids=np.ascontiguousarray(partition.block_ids, dtype=np.int64),
+            population=np.asarray(partition.population),
+            build=np.asarray(partition.build),
+        )
+        tmp_path.replace(cache_paths.ld_block_partition_path)
+        log(
+            "ld-block partition cache saved: "
+            + f"{cache_paths.cache_dir.name}/{cache_paths.ld_block_partition_path.name} "
+            + f"(n_variants={int(partition.block_ids.shape[0])}, "
+            + f"n_blocks={partition.block_count})"
+        )
+    except (OSError, ValueError) as exc:
+        try:
+            tmp_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+        log(f"ld-block partition cache save failed ({exc}); continuing without durable partition cache")
+
+
+def _try_load_ld_block_partition_cache(
+    cache_paths: _FitStageCachePaths,
+    *,
+    n_variants: int,
+) -> "LdBlockPartition | None":
+    if cache_paths.ld_block_partition_path is None or not cache_paths.ld_block_partition_path.exists():
+        return None
+    try:
+        from sv_pgs.ld_blocks import block_partition as _block_partition
+        from sv_pgs.ld_block_partition import LdBlockPartition
+
+        with np.load(cache_paths.ld_block_partition_path, allow_pickle=False) as npz:
+            block_ids = np.asarray(npz["block_ids"], dtype=np.int64)
+            population = str(npz["population"].item()) if "population" in npz.files else "EUR"
+            build = str(npz["build"].item()) if "build" in npz.files else "hg38"
+        if block_ids.shape != (int(n_variants),):
+            raise ValueError(
+                f"ld-block partition shape {block_ids.shape} != (n_variants={n_variants},)"
+            )
+        partition = _block_partition(block_ids)
+        log(
+            "ld-block partition cache restored: "
+            + f"{cache_paths.cache_dir.name}/{cache_paths.ld_block_partition_path.name} "
+            + f"({len(partition)} blocks)"
+        )
+        return LdBlockPartition(
+            block_ids=block_ids,
+            partition=partition,
+            population=population,
+            build=build,
+        )
+    except (OSError, ValueError, EOFError, KeyError) as exc:
+        log(f"ld-block partition cache load failed ({exc}); rebuilding")
+        try:
+            cache_paths.ld_block_partition_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+        return None
+
+
 def _invalidate_fit_stage_cache(cache_paths: _FitStageCachePaths) -> None:
     for path in (
         cache_paths.manifest_path,
@@ -656,7 +763,10 @@ def _invalidate_fit_stage_cache(cache_paths: _FitStageCachePaths) -> None:
         cache_paths.tie_map_path,
         cache_paths.reduced_raw_i8_path,
         cache_paths.em_checkpoint_path,
+        cache_paths.ld_block_partition_path,
     ):
+        if path is None:
+            continue
         try:
             path.unlink(missing_ok=True)
         except OSError:
@@ -1200,6 +1310,69 @@ class BayesianPGS:
         log(f"  tie map projected  mem={mem()}")
         log(f"tie map: {len(active_variant_indices)} active -> {len(reduced_tie_map.kept_indices)} unique ({len(reduced_tie_map.reduced_to_group)} groups)  mem={mem()}")
 
+        # ------------------------------------------------------------------
+        # Phase 4 LD-block / N-GPU wiring (opt-in via config.use_ld_blocks).
+        # Assign an :class:`LdBlockPartition` over the variants that survive
+        # MAF/tie-map filtering, then stash it on the reduced genotype matrix
+        # as ``_ld_block_partition`` so the matvec hot path (mixture_inference)
+        # can dispatch per-block matmuls across visible CUDA devices via
+        # :class:`sv_pgs.gpu_scheduler.GPUScheduler`.
+        # ------------------------------------------------------------------
+        if bool(getattr(self.config, "use_ld_blocks", False)):
+            from sv_pgs.ld_block_partition import (
+                LdBlockPartition,
+                build_ld_block_partition,
+            )
+
+            combined_indices_for_ld = active_variant_indices[reduced_tie_map.kept_indices]
+            n_reduced_variants = int(combined_indices_for_ld.shape[0])
+            cached_partition: LdBlockPartition | None = None
+            if fit_stage_cache_paths is not None:
+                cached_partition = _try_load_ld_block_partition_cache(
+                    fit_stage_cache_paths,
+                    n_variants=n_reduced_variants,
+                )
+            if cached_partition is None:
+                log(
+                    "building LD-block partition "
+                    + f"(population={self.config.ld_block_population}, "
+                    + f"build={self.config.ld_block_build}) for "
+                    + f"{n_reduced_variants} reduced variants..."
+                )
+                reduced_variant_records = [
+                    full_variant_records[i] for i in combined_indices_for_ld.tolist()
+                ]
+                ld_block_partition_obj = build_ld_block_partition(
+                    reduced_variant_records,
+                    population=self.config.ld_block_population,
+                    build=self.config.ld_block_build,
+                )
+                log(
+                    "  LD-block partition built: "
+                    + f"n_blocks={ld_block_partition_obj.block_count}  mem={mem()}"
+                )
+                if fit_stage_cache_paths is not None:
+                    _save_ld_block_partition_cache(
+                        fit_stage_cache_paths, ld_block_partition_obj
+                    )
+            else:
+                ld_block_partition_obj = cached_partition
+            reduced_genotypes._ld_block_partition = ld_block_partition_obj
+            try:
+                from sv_pgs.gpu_scheduler import GPUScheduler
+
+                _ld_block_scheduler = GPUScheduler.detect()
+                reduced_genotypes._ld_block_scheduler = _ld_block_scheduler
+                log(
+                    "auto-tune: use_ld_blocks=True "
+                    + f"ld_blocks={ld_block_partition_obj.block_count} "
+                    + f"gpu_scheduler_devices={_ld_block_scheduler.device_count} "
+                    + ("(cpu-fallback)" if _ld_block_scheduler.is_cpu_fallback else "")
+                )
+            except (ImportError, RuntimeError) as _sched_err:
+                reduced_genotypes._ld_block_scheduler = None
+                log(f"auto-tune: use_ld_blocks=True ld_blocks={ld_block_partition_obj.block_count} (scheduler init failed: {_sched_err})")
+
         reduced_validation = None
         if validation_data is not None:
             log("  building combined validation indices...")
@@ -1221,6 +1394,14 @@ class BayesianPGS:
                 sample_count=validation_raw_genotypes.shape[0],
                 _enable_hybrid_backend=False,
             )
+            # Phase 4: share the training partition with the validation view
+            # (same column set, same block IDs).
+            _train_partition = getattr(reduced_genotypes, "_ld_block_partition", None)
+            if _train_partition is not None:
+                standardized_validation._ld_block_partition = _train_partition
+                standardized_validation._ld_block_scheduler = getattr(
+                    reduced_genotypes, "_ld_block_scheduler", None
+                )
             reduced_validation = (
                 standardized_validation,
                 self._with_intercept(np.asarray(validation_covariates, dtype=np.float32)),

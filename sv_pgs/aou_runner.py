@@ -1268,6 +1268,12 @@ def run_all_of_us(
         # forcing a PG-IRLS restart and wasting ~10 min per outer iter. Give
         # TR-Newton an hour to actually finish iter 1.
         solver_wall_clock_budget_s=3600.0,
+        # Phase 4 LD-block / N-GPU rewrite: AoU runs route the sample-space
+        # matvec through per-LD-block per-GPU dispatch via
+        # :class:`sv_pgs.gpu_scheduler.GPUScheduler`. Other entry points keep
+        # the legacy single-monolithic matmul path (default ``False``) until
+        # the new path has been end-to-end verified there too.
+        use_ld_blocks=True,
     )
     log(
         "  AoU fit policy: "

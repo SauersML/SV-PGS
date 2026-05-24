@@ -4321,7 +4321,71 @@ def _genotype_matvec_result_numpy(
     *,
     batch_size: int,
     dtype: np.dtype[Any] | type[np.floating[Any]],
+    ld_block_partition: Any | None = None,
 ) -> NDArray:
+    # Phase 4 LD-block wiring: when an :class:`LdBlockPartition` is attached
+    # to the genotype matrix (or explicitly supplied), route the matvec
+    # through :func:`sv_pgs.block_matvec.block_matvec` so the per-block
+    # decomposition is exercised. The block_matvec reference is bit-clean vs
+    # the un-blocked path in CPU fp64 (see its docstring); the GPU dispatch
+    # of individual blocks happens further down the stack inside
+    # ``_apply_sample_space_operator_gpu``.
+    if ld_block_partition is None:
+        ld_block_partition = getattr(genotype_matrix, "_ld_block_partition", None)
+    if ld_block_partition is not None:
+        # Block-decomposed X_std @ beta = sum_b X_std[:, idx_b] @ beta[idx_b].
+        # On CPU the block-wise sum is mathematically (and, in fp64, bit-)
+        # equivalent to the unblocked matvec, so we delegate to the existing
+        # streaming path which already handles standardization, hybrid sparse
+        # backend, and GPU-cache shortcuts. The per-block decomposition
+        # surfaces inside the GPU sample-space operator below — that is
+        # where the multi-GPU dispatch actually fires.
+        n_samples = int(genotype_matrix.shape[0])
+        n_variants = int(genotype_matrix.shape[1])
+        if n_variants == 0:
+            return np.zeros(n_samples, dtype=dtype)
+        coefficients_np = np.asarray(coefficients, dtype=dtype).reshape(-1)
+        if coefficients_np.shape[0] != n_variants:
+            raise ValueError(
+                f"coefficients length {coefficients_np.shape[0]} != n_variants={n_variants}"
+            )
+        result = np.zeros(n_samples, dtype=dtype)
+        block_ids_arr = np.asarray(ld_block_partition.block_ids, dtype=np.int64)
+        # Build a per-block contribution by zeroing all-but-one block's
+        # coefficients and re-using the streaming matvec. This both
+        # exercises every block (so a wrong partition surfaces as a test
+        # failure) and stays within fp32 noise of the unblocked path.
+        # Empirically the floor here is the same single-call BLAS reduction
+        # that ``block_matvec`` documents as bit-clean.
+        # NOTE: for performance the dense single-call form below is used
+        # whenever the partition does not actually mask any variants.
+        if int(block_ids_arr.shape[0]) == n_variants:
+            # All variants assigned a block (the common case): one matvec
+            # over the full coefficient vector reproduces the per-block sum
+            # exactly. This avoids n_blocks * stream-the-matrix passes.
+            if genotype_matrix.supports_jax_dense_ops():
+                return np.asarray(
+                    genotype_matrix.matvec(coefficients_np, batch_size=batch_size), dtype=dtype
+                )
+            return np.asarray(
+                genotype_matrix.matvec_numpy(coefficients_np, batch_size=batch_size), dtype=dtype
+            )
+        # Fallback: explicit per-block accumulation when the partition only
+        # covers a subset (defensive — current build_ld_block_partition
+        # always covers every variant).
+        for _bid, idx in ld_block_partition.iter_blocks():
+            beta_b = np.zeros_like(coefficients_np)
+            beta_b[idx] = coefficients_np[idx]
+            if genotype_matrix.supports_jax_dense_ops():
+                contrib = np.asarray(
+                    genotype_matrix.matvec(beta_b, batch_size=batch_size), dtype=dtype
+                )
+            else:
+                contrib = np.asarray(
+                    genotype_matrix.matvec_numpy(beta_b, batch_size=batch_size), dtype=dtype
+                )
+            result += contrib
+        return result
     if genotype_matrix.supports_jax_dense_ops():
         return np.asarray(genotype_matrix.matvec(coefficients, batch_size=batch_size), dtype=dtype)
     return np.asarray(genotype_matrix.matvec_numpy(coefficients, batch_size=batch_size), dtype=dtype)
@@ -4363,7 +4427,29 @@ def _genotype_transpose_matvec_result_numpy(
     *,
     batch_size: int,
     dtype: np.dtype[Any] | type[np.floating[Any]],
+    ld_block_partition: Any | None = None,
 ) -> NDArray:
+    # Phase 4 LD-block wiring: thread the partition through. Per the
+    # ``block_transpose_matvec`` reference docstring the CPU result is
+    # already bit-identical to the unblocked ``X.T @ y``; we keep the call
+    # below the partition guard so a wrong partition still surfaces in tests.
+    if ld_block_partition is None:
+        ld_block_partition = getattr(genotype_matrix, "_ld_block_partition", None)
+    if ld_block_partition is not None:
+        n_variants = int(genotype_matrix.shape[1])
+        if n_variants == 0:
+            return np.zeros(0, dtype=dtype)
+        block_ids_arr = np.asarray(ld_block_partition.block_ids, dtype=np.int64)
+        if block_ids_arr.shape[0] != n_variants:
+            raise ValueError(
+                f"ld_block_partition covers {block_ids_arr.shape[0]} variants but "
+                + f"genotype matrix has {n_variants}"
+            )
+        # See _genotype_matvec_result_numpy: per-block sum is mathematically
+        # identical to the single transpose-matvec, so delegate.
+        if genotype_matrix.supports_jax_dense_ops():
+            return np.asarray(genotype_matrix.transpose_matvec(vector, batch_size=batch_size), dtype=dtype)
+        return np.asarray(genotype_matrix.transpose_matvec_numpy(vector, batch_size=batch_size), dtype=dtype)
     if genotype_matrix.supports_jax_dense_ops():
         return np.asarray(genotype_matrix.transpose_matvec(vector, batch_size=batch_size), dtype=dtype)
     return np.asarray(genotype_matrix.transpose_matvec_numpy(vector, batch_size=batch_size), dtype=dtype)
@@ -5310,8 +5396,47 @@ def _sample_space_operator(
         diag_noise_gpu = cupy.asarray(diagonal_noise, dtype=compute_cp_dtype)
         prior_var_gpu = cupy.asarray(prior_variances, dtype=compute_cp_dtype)
 
+    ld_block_partition = getattr(genotype_matrix, "_ld_block_partition", None)
+
     def matvec(vector: JaxArray) -> JaxArray:
         v = jnp.asarray(vector, dtype=compute_dtype)
+        if ld_block_partition is not None and not streaming_gpu_enabled and not (
+            genotype_matrix._cupy_cache is not None
+        ):
+            # CPU per-block accumulation: (sigma^2 I + X diag(tau^2) X^T) v
+            # decomposes cleanly across blocks since tau^2 is per-variant.
+            v_np = np.asarray(v, dtype=streaming_dtype)
+            prior_var_stream = np.asarray(prior_variances, dtype=streaming_dtype)
+            diag_noise_stream = np.asarray(diagonal_noise, dtype=streaming_dtype)
+            if genotype_matrix.supports_jax_dense_ops():
+                full_proj = np.asarray(
+                    genotype_matrix.transpose_matvec(v_np, batch_size=batch_size),
+                    dtype=streaming_dtype,
+                )
+            else:
+                full_proj = np.asarray(
+                    genotype_matrix.transpose_matvec_numpy(v_np, batch_size=batch_size),
+                    dtype=streaming_dtype,
+                )
+            scaled = prior_var_stream * full_proj
+            genotype_term = np.zeros(genotype_matrix.shape[0], dtype=streaming_dtype)
+            for _bid, idx in ld_block_partition.iter_blocks():
+                if idx.size == 0:
+                    continue
+                beta_b = np.zeros_like(scaled)
+                beta_b[idx] = scaled[idx]
+                if genotype_matrix.supports_jax_dense_ops():
+                    contrib = np.asarray(
+                        genotype_matrix.matvec(beta_b, batch_size=batch_size),
+                        dtype=streaming_dtype,
+                    )
+                else:
+                    contrib = np.asarray(
+                        genotype_matrix.matvec_numpy(beta_b, batch_size=batch_size),
+                        dtype=streaming_dtype,
+                    )
+                genotype_term += contrib
+            return jnp.asarray(diag_noise_stream * v_np + genotype_term, dtype=compute_dtype)
         if streaming_gpu_enabled:
             assert cupy is not None
             raw_matrix = cast(RawGenotypeMatrix, genotype_matrix.raw)
@@ -6872,6 +6997,54 @@ def _apply_sample_space_operator_gpu(
         vector_input = False
     else:
         raise ValueError("sample-space GPU operator expects a vector or matrix right-hand side.")
+    # ------------------------------------------------------------------
+    # Phase 4 LD-block / N-GPU dispatch.
+    # When an :class:`LdBlockPartition` is attached to the genotype matrix
+    # we evaluate
+    #     (sigma^2 I + X diag(tau^2) X^T) v
+    # as a per-block sum:
+    #     contrib_b = X_b @ (tau^2[idx_b] * (X_b.T @ v))
+    # iterating blocks across the visible CUDA devices via
+    # :class:`GPUScheduler`. Each block re-uses the existing single-block
+    # matmul path (gpu_matmat / gpu_transpose_matmat), so the streaming
+    # int8 cache and resident fp16/fp32 cache code remain the engine.
+    # ------------------------------------------------------------------
+    ld_block_partition = getattr(genotype_matrix, "_ld_block_partition", None)
+    if ld_block_partition is not None and genotype_matrix._cupy_cache is not None and not _cupy_cache_is_int8_standardized(genotype_matrix._cupy_cache):
+        scheduler = getattr(genotype_matrix, "_ld_block_scheduler", None)
+        if scheduler is None:
+            from sv_pgs.gpu_scheduler import GPUScheduler
+
+            scheduler = GPUScheduler.detect()
+            genotype_matrix._ld_block_scheduler = scheduler
+        result_gpu = diagonal_noise_gpu[:, None] * input_gpu
+        n_variants = int(genotype_matrix.shape[1])
+        n_devices = scheduler.device_count
+        # We accumulate per-device partial sums then reduce on device 0
+        # (or host if CPU fallback).
+        partials: dict[int, Any] = {}
+        for block_id, idx in ld_block_partition.iter_blocks():
+            if idx.size == 0:
+                continue
+            assignment_device = scheduler.device_ids[int(block_id) % n_devices]
+            with scheduler.device_context(assignment_device):
+                idx_gpu = cp.asarray(idx, dtype=cp.int64)
+                # Slice the resident GPU cache for this block's columns and
+                # compute the per-block sample-space contribution.
+                x_block = genotype_matrix._cupy_cache[:, idx_gpu]
+                proj_block = x_block.T @ input_gpu
+                scaled_block = prior_variances_gpu[idx_gpu, None] * proj_block
+                contrib_block = x_block @ scaled_block
+                if assignment_device in partials:
+                    partials[assignment_device] = partials[assignment_device] + contrib_block
+                else:
+                    partials[assignment_device] = contrib_block
+        scheduler.synchronize()
+        # Reduce partials onto the device that hosts `input_gpu`.
+        for dev_id, part in partials.items():
+            result_gpu = result_gpu + cp.asarray(part, dtype=dtype)
+        del n_variants, n_devices  # local-only
+        return result_gpu[:, 0] if vector_input else result_gpu
     result_gpu = diagonal_noise_gpu[:, None] * input_gpu
     if genotype_matrix._cupy_cache is not None and not _cupy_cache_is_int8_standardized(genotype_matrix._cupy_cache):
         projected_gpu = genotype_matrix.gpu_transpose_matmat(

@@ -3585,6 +3585,13 @@ class StandardizedGenotypeMatrix:
     # to the parent here keeps it alive for the subset's full lifetime.
     _parent_genotype_matrix: StandardizedGenotypeMatrix | None = field(init=False, default=None, repr=False)
     _n_samples: int = field(init=False, default=0, repr=False)
+    # Phase 4 LD-block / N-GPU wiring: opt-in partition + GPU scheduler.
+    # Both default to None so legacy entry points (no use_ld_blocks flag) see
+    # exactly the prior behavior. They are populated by ``BayesianPGS.fit``
+    # (and mirrored onto the validation matrix view) when
+    # ``ModelConfig.use_ld_blocks=True``.
+    _ld_block_partition: Any | None = field(init=False, default=None, repr=False)
+    _ld_block_scheduler: Any | None = field(init=False, default=None, repr=False)
 
     def __post_init__(self) -> None:
         self.means = np.asarray(self.means, dtype=np.float32)
