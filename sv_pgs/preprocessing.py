@@ -259,26 +259,48 @@ def compute_marginal_z_scores(
         cprime_x = np.zeros((0, m_active), dtype=np.float64)
         ctc_inv = None
     else:
+        # Augment the covariate matrix with an explicit intercept column when
+        # one isn't already present. Standardization centers each variant
+        # (x_j_std has mean 0), so a variant that lies entirely in the
+        # AFFINE span of C (e.g. C[:,0] itself with non-zero mean) still has
+        # a non-zero projection onto C only after we add a constant column.
+        # Without this augmentation, x_j_std for a perfectly collinear
+        # variant produces a non-zero numerator (signal) but the denominator
+        # forgets to subtract the mean-removal projection, inflating z.
+        constant_column = np.ones((n, 1), dtype=np.float64)
+        has_constant = False
+        for k in range(covariate_f64.shape[1]):
+            col = covariate_f64[:, k]
+            if np.allclose(col, col[0], atol=1e-12) and abs(col[0]) > 1e-12:
+                has_constant = True
+                break
+        if has_constant:
+            projection_cov = covariate_f64
+        else:
+            projection_cov = np.concatenate(
+                [constant_column, covariate_f64], axis=1
+            )
+
         # Solve the small covariate OLS problem (n × p_cov, p_cov is typically
         # < 30). lstsq handles rank-deficient designs (e.g., redundant
         # intercept) gracefully.
-        alpha_cov, _, _, _ = np.linalg.lstsq(covariate_f64, target_f64, rcond=None)
-        y_resid = target_f64 - covariate_f64 @ alpha_cov
+        alpha_cov, _, _, _ = np.linalg.lstsq(projection_cov, target_f64, rcond=None)
+        y_resid = target_f64 - projection_cov @ alpha_cov
 
         # Per-variant null variance under covariate adjustment:
         #     Var(x_j^T y_resid) = sigma2 * x_j' P x_j
         # with P = I - C (C'C)^{-1} C'. Compute C'X by calling
         # transpose_matvec once per covariate column (p_cov is small).
-        p_cov = int(covariate_f64.shape[1])
+        p_cov = int(projection_cov.shape[1])
         cprime_x = np.empty((p_cov, m_active), dtype=np.float64)
         for k in range(p_cov):
             cprime_x[k, :] = np.asarray(
                 active_subset.transpose_matvec_numpy(
-                    np.ascontiguousarray(covariate_f64[:, k], dtype=np.float32)
+                    np.ascontiguousarray(projection_cov[:, k], dtype=np.float32)
                 ),
                 dtype=np.float64,
             ).reshape(-1)
-        ctc = covariate_f64.T @ covariate_f64
+        ctc = projection_cov.T @ projection_cov
         # Use pinv to tolerate rank-deficient covariate designs (mirrors the
         # rank-tolerant lstsq above).
         ctc_inv = np.linalg.pinv(ctc)

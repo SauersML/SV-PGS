@@ -1553,8 +1553,10 @@ class BayesianPGS:
             # need strict gating can introspect ``fit_result.converged``.
             log(
                 "WARNING: exporting non-converged fit "
-                f"(param={param_delta}, predictor={predictor_delta}, "
-                f"objective={objective_delta}, hyperparameter={hyper_delta})."
+                f"(final_parameter_change={param_delta}, "
+                f"final_predictor_change={predictor_delta}, "
+                f"final_objective_change={objective_delta}, "
+                f"final_hyperparameter_change={hyper_delta})."
             )
         artifact = ModelArtifact(
             config=self.config,

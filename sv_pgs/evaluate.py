@@ -188,10 +188,15 @@ def _select_score_column(
     if score_col is None:
         raise ValueError(f"No score column found for {context}. Columns: {columns}")
     if evaluation_purpose == "genetic_only" and score_col in ("probability", "predicted_probability"):
-        log(
+        message = (
             f"  WARNING: genetic_only requested for {context}, but no genetic_score or "
             f"linear_predictor column is available; falling back to {score_col}"
         )
+        log(message)
+        # Mirror to stdout so capsys / non-stderr log collectors also see
+        # this degradation — the AUC reported under this fallback measures
+        # the full-model probability, not the genetic component alone.
+        print(message, flush=True)
     return score_col
 
 

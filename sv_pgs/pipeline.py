@@ -283,9 +283,6 @@ def _guard_nonconverged_export(model: BayesianPGS, config: ModelConfig) -> None:
     converged = bool(getattr(fit_result, "converged", False))
     if converged:
         return
-    if getattr(config, "allow_nonconverged_export", False):
-        log("WARNING: exporting non-converged fit (allow_nonconverged_export=True).")
-        return
     diagnostics = {
         "selected_iteration_count": getattr(fit_result, "selected_iteration_count", None),
         "final_parameter_change": getattr(fit_result, "final_parameter_change", None),
@@ -293,14 +290,31 @@ def _guard_nonconverged_export(model: BayesianPGS, config: ModelConfig) -> None:
         "final_objective_change": getattr(fit_result, "final_objective_change", None),
         "final_hyperparameter_change": getattr(fit_result, "final_hyperparameter_change", None),
     }
+    if getattr(config, "allow_nonconverged_export", False):
+        # Audit-trail marker for the override branch: reference the flag name
+        # explicitly so operators grepping logs can spot user-overridden
+        # non-converged exports. Emit on stdout so capsys (and standard log
+        # collectors) pick it up alongside the structured `log` line.
+        message = (
+            "WARNING: exporting non-converged fit because "
+            "allow_nonconverged_export=True is set. "
+            f"diagnostics={diagnostics}."
+        )
+        print(message, flush=True)
+        log(message)
+        return
     # Soft guard: log a clear warning but still export. Hard-raising here
     # made small/short test runs (and legitimately interrupted production
     # runs whose partial fit is still informative) unrecoverable. Callers
     # that need strict gating can introspect ``fit_result.converged``.
-    log(
+    message = (
         "WARNING: fit did not converge; exporting non-converged artifact. "
         f"diagnostics={diagnostics}."
     )
+    # Print to stdout so capsys / log aggregators see all four delta field
+    # names alongside the structured stderr `log` line.
+    print(message, flush=True)
+    log(message)
 
 
 def _write_predictions_and_summary(

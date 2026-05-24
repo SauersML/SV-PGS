@@ -60,9 +60,15 @@ def gig_inverse_first_moment(
     chi_arr = np.asarray(chi, dtype=np.float64)
     psi_arr = np.asarray(psi, dtype=np.float64)
     p_arr = np.asarray(p_parameter, dtype=np.float64)
-    z = np.sqrt(np.maximum(chi_arr * psi_arr, 1e-300))
     safe_chi = np.maximum(chi_arr, 1e-300)
     safe_psi = np.maximum(psi_arr, 1e-300)
+    # Compute z = sqrt(chi * psi) WITHOUT forming chi*psi explicitly: that
+    # product overflows to +inf for inputs near 1e154, feeding +inf to kve
+    # and producing NaN. Factor the sqrt to keep each operand in range.
+    z = np.sqrt(safe_chi) * np.sqrt(safe_psi)
+    # Stable sqrt(psi/chi) via log-space: avoids underflow when both are
+    # tiny and overflow when psi >> chi.
+    sqrt_psi_over_chi = np.exp(0.5 * (np.log(safe_psi) - np.log(safe_chi)))
 
     # Use ratio identity: E[1/X] = sqrt(psi/chi) * K_{p-1}(z) / K_p(z).
     # For tiny z, direct Bessel calls can overflow to inf and produce inf/inf.
@@ -104,12 +110,32 @@ def gig_inverse_first_moment(
             small_result[between_zero_and_one] = np.exp(np.clip(log_value, -745.0, 709.0))
         result[positive_small] = small_result
 
+    sqrt_ratio_b = np.broadcast_to(sqrt_psi_over_chi, result.shape)
     regular = ~small_z
     if np.any(regular):
-        numerator = scipy_bessel_kve(np.abs(p_b[regular] - 1.0), z_b[regular])
-        denominator = scipy_bessel_kve(np.abs(p_b[regular]), z_b[regular])
-        result[regular] = np.sqrt(psi_b[regular] / chi_b[regular]) * (numerator / denominator)
+        # For very large z the Bessel ratio K_{|p-1|}(z) / K_{|p|}(z) -> 1
+        # (uniform asymptotic), but feeding z >= ~7e2 to kve under-/overflows
+        # numerically. Short-circuit to the asymptotic limit E[1/X] ->
+        # sqrt(psi/chi) so we never produce inf/inf or 0/0 NaNs.
+        large_z_mask = regular & (z_b > 1e8)
+        finite_z_mask = regular & ~large_z_mask
+        if np.any(large_z_mask):
+            result[large_z_mask] = sqrt_ratio_b[large_z_mask]
+        if np.any(finite_z_mask):
+            numerator = scipy_bessel_kve(
+                np.abs(p_b[finite_z_mask] - 1.0), z_b[finite_z_mask]
+            )
+            denominator = scipy_bessel_kve(
+                np.abs(p_b[finite_z_mask]), z_b[finite_z_mask]
+            )
+            ratio = np.where(
+                (denominator > 0.0) & np.isfinite(numerator) & np.isfinite(denominator),
+                numerator / np.maximum(denominator, np.finfo(np.float64).tiny),
+                1.0,
+            )
+            result[finite_z_mask] = sqrt_ratio_b[finite_z_mask] * ratio
 
+    result = np.where(np.isfinite(result), result, sqrt_ratio_b)
     return np.maximum(result, np.finfo(np.float64).tiny)
 
 
