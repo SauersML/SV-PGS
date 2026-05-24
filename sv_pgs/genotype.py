@@ -1833,8 +1833,12 @@ def _adaptive_int8_staging_chunk_rows(
     )
     if budget_bytes < bytes_per_row:
         return max(1, int(floor))
-    fits = budget_bytes // bytes_per_row
-    return int(max(1, min(int(cap), max(int(floor), int(fits)))))
+    fits = int(budget_bytes // bytes_per_row)
+    # Clamp to [1, cap] using the budget-derived ``fits``. ``floor`` is a soft
+    # preference: if ``fits`` falls short of it (very wide cohort, very tight
+    # free memory), we still honor ``fits`` rather than blowing past the budget
+    # back to ``floor`` and pushing the planner into a forced-streaming path.
+    return int(max(1, min(int(cap), fits)))
 
 
 def _gpu_solver_headroom_bytes(
