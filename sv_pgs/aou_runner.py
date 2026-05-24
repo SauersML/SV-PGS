@@ -237,14 +237,26 @@ def _gsutil_cp(src: str, dst: str) -> None:
         raise RuntimeError(f"Refusing to gsutil cp to suspicious destination: {dst!r}")
     cmd = ["gsutil", "-u", _google_project(), "-m", "cp", src, dst]
     log(f"  downloading {src}")
-    # Stream output in real time so user sees progress
-    process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
-    if process.stdout is not None:
-        for line in process.stdout:
-            stripped = line.strip()
-            if stripped:
-                log(f"    {stripped}")
-    process.wait()
+    # Stream output in real time so user sees progress.
+    # ``with`` ensures the process and its stdout pipe are reaped even when an
+    # exception (e.g. KeyboardInterrupt, or a logging failure mid-iteration)
+    # interrupts the read loop — otherwise the gsutil child would orphan and
+    # the read end of the pipe would leak a file descriptor.
+    with subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True) as process:
+        try:
+            if process.stdout is not None:
+                for line in process.stdout:
+                    stripped = line.strip()
+                    if stripped:
+                        log(f"    {stripped}")
+            process.wait()
+        except BaseException:
+            # Kill the child so we don't leave a long-running gsutil orphaned.
+            try:
+                process.kill()
+            except OSError:
+                pass
+            raise
     if process.returncode != 0:
         raise RuntimeError(f"gsutil cp failed (exit {process.returncode}): {src}")
 
@@ -874,7 +886,13 @@ def _start_plink_cache_warmup(
         )
 
     executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="aou-plink-cache")
-    future = executor.submit(_compute_plink_cache)
+    try:
+        future = executor.submit(_compute_plink_cache)
+    except BaseException:
+        # If submission itself fails (e.g. interpreter shutting down), shut the
+        # pool down rather than leaking the worker thread.
+        executor.shutdown(wait=False, cancel_futures=True)
+        raise
 
     warmup_config = config
 

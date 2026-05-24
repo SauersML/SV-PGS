@@ -838,7 +838,10 @@ def _save_fit_checkpoint(
             checkpoint_pickle=checkpoint_bytes,
             config_hash=np.asarray(config_hash),
         )
-        os.rename(checkpoint_tmp, checkpoint_path)
+        # os.replace overwrites cleanly across platforms; os.rename fails
+        # on Windows when the destination already exists, which would leak
+        # a per-pid `.tmp` orphan on every successful checkpoint refresh.
+        os.replace(checkpoint_tmp, checkpoint_path)
         log(
             "fit checkpoint saved: "
             + f"{checkpoint_path} (completed_iterations={checkpoint.completed_iterations})"

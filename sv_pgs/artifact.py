@@ -234,49 +234,55 @@ def save_artifact(path: str | Path, artifact: ModelArtifact) -> None:
 
 def load_artifact(path: str | Path) -> ModelArtifact:
     root = Path(path)
-    arrays = np.load(root / "arrays.npz", allow_pickle=False)
-    payload = json.loads((root / "metadata.json").read_text(encoding="utf-8"))
+    # ``np.load`` on an .npz returns an NpzFile that keeps the underlying
+    # ZipFile open until ``close()``. Without an explicit close, the file
+    # descriptor lingers until GC — on long-running pipelines that load many
+    # artifacts (e.g. sweeping across diseases) this can exhaust the per-process
+    # fd limit. Use ``with`` so the zip handle is released deterministically
+    # even when key lookups or ``astype`` raise mid-construction.
+    with np.load(root / "arrays.npz", allow_pickle=False) as arrays:
+        payload = json.loads((root / "metadata.json").read_text(encoding="utf-8"))
 
-    tie_map = TieMap(
-        kept_indices=arrays["tie_kept_indices"].astype(np.int32),
-        original_to_reduced=arrays["tie_original_to_reduced"].astype(np.int32),
-        reduced_to_group=[
-            TieGroup(
-                representative_index=int(group["representative_index"]),
-                member_indices=np.asarray(group["member_indices"], dtype=np.int32),
-                signs=np.asarray(group["signs"], dtype=np.float32),
-            )
-            for group in payload["tie_groups"]
-        ],
-    )
-    return ModelArtifact(
-        config=_config_from_json(payload["config"]),
-        records=payload["records"],
-        means=arrays["means"].astype(np.float32),
-        scales=arrays["scales"].astype(np.float32),
-        alpha=arrays["alpha"].astype(np.float32),
-        beta_reduced=arrays["beta_reduced"].astype(np.float32),
-        beta_full=arrays["beta_full"].astype(np.float32),
-        beta_variance=arrays["beta_variance"].astype(np.float32),
-        tie_map=tie_map,
-        sigma_e2=float(payload["sigma_e2"]),
-        prior_scales=arrays["prior_scales"].astype(np.float32),
-        global_scale=float(payload["global_scale"]),
-        class_tpb_shape_a={
-            VariantClass(key): float(value)
-            for key, value in payload["class_tpb_shape_a"].items()
-        },
-        class_tpb_shape_b={
-            VariantClass(key): float(value)
-            for key, value in payload["class_tpb_shape_b"].items()
-        },
-        scale_model_coefficients=arrays["scale_model_coefficients"].astype(np.float32),
-        scale_model_feature_names=[str(feature_name) for feature_name in payload["scale_model_feature_names"]],
-        objective_history=[float(value) for value in payload["objective_history"]],
-        validation_history=[float(value) for value in payload["validation_history"]],
-        fit_fingerprint=str(payload.get("fit_fingerprint", "")),
-        **_load_diagnostics(payload),
-    )
+        tie_map = TieMap(
+            kept_indices=arrays["tie_kept_indices"].astype(np.int32),
+            original_to_reduced=arrays["tie_original_to_reduced"].astype(np.int32),
+            reduced_to_group=[
+                TieGroup(
+                    representative_index=int(group["representative_index"]),
+                    member_indices=np.asarray(group["member_indices"], dtype=np.int32),
+                    signs=np.asarray(group["signs"], dtype=np.float32),
+                )
+                for group in payload["tie_groups"]
+            ],
+        )
+        return ModelArtifact(
+            config=_config_from_json(payload["config"]),
+            records=payload["records"],
+            means=arrays["means"].astype(np.float32),
+            scales=arrays["scales"].astype(np.float32),
+            alpha=arrays["alpha"].astype(np.float32),
+            beta_reduced=arrays["beta_reduced"].astype(np.float32),
+            beta_full=arrays["beta_full"].astype(np.float32),
+            beta_variance=arrays["beta_variance"].astype(np.float32),
+            tie_map=tie_map,
+            sigma_e2=float(payload["sigma_e2"]),
+            prior_scales=arrays["prior_scales"].astype(np.float32),
+            global_scale=float(payload["global_scale"]),
+            class_tpb_shape_a={
+                VariantClass(key): float(value)
+                for key, value in payload["class_tpb_shape_a"].items()
+            },
+            class_tpb_shape_b={
+                VariantClass(key): float(value)
+                for key, value in payload["class_tpb_shape_b"].items()
+            },
+            scale_model_coefficients=arrays["scale_model_coefficients"].astype(np.float32),
+            scale_model_feature_names=[str(feature_name) for feature_name in payload["scale_model_feature_names"]],
+            objective_history=[float(value) for value in payload["objective_history"]],
+            validation_history=[float(value) for value in payload["validation_history"]],
+            fit_fingerprint=str(payload.get("fit_fingerprint", "")),
+            **_load_diagnostics(payload),
+        )
 
 
 def _load_diagnostics(payload: dict[str, Any]) -> dict[str, Any]:
