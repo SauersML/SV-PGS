@@ -136,7 +136,7 @@ _FIT_CHECKPOINT_VERSION = 1
 # slow inside Newton-CG and was responsible for the overfit run that motivated
 # this guard. Flip to False (or set config.allow_mmap_streaming_for_binary=True)
 # to override.
-_REFUSE_BINARY_TR_NEWTON_NO_CACHE = True
+_REFUSE_BINARY_TR_NEWTON_NO_CACHE = False
 _REGISTERED_FIT_CHECKPOINT_PATHS: dict[int, Path] = {}
 
 
