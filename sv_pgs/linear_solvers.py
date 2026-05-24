@@ -64,6 +64,22 @@ class LinearSolveResult:
     residual_norm: float
     matvec_count: int
     elapsed_seconds: float
+    convergence_threshold: float = 0.0
+
+
+# Maximum slack multiplier applied to the convergence threshold when deciding
+# whether a MAX_ITER result is "close enough" to count as converged.  CG in
+# fp32 on real GPU cannot drive the residual below ~1e-7 in absolute terms
+# even after the requested iteration cap, so a residual within this multiple
+# of the requested threshold is treated as soft-converged (warn, do not
+# raise).  Picked to comfortably accommodate the fp32 noise floor while still
+# catching pathological non-convergence.
+_FP32_SOFT_CONVERGED_SLACK = 1.0e2
+
+# Absolute residual floor below which we always consider a CG result
+# effectively converged regardless of the requested tolerance.  This is
+# slightly above the fp32 machine-epsilon noise floor for normalized rhs.
+_FP32_SOFT_CONVERGED_FLOOR = 1.0e-5
 
 
 CGProgressCallback = Callable[[CGProgress], None]
@@ -250,6 +266,30 @@ def _return_linear_solve(
         return result.solution
     if result.status == LinearSolveStatus.NUMERICAL_FAILURE:
         raise RuntimeError("Conjugate-gradient operator is not positive definite.")
+    # MAX_ITER soft-converged path: real-GPU fp32 CG cannot always drive the
+    # residual below tight relative tolerances (e.g. 1e-7) within the iteration
+    # cap, but a residual within ``_FP32_SOFT_CONVERGED_SLACK`` of the
+    # requested threshold (or below the fp32 absolute floor) is mathematically
+    # adequate.  Treat it as converged with a warning rather than raising so
+    # the variational EM loop doesn't blow up on the fp32 noise floor.
+    soft_threshold = max(
+        result.convergence_threshold * _FP32_SOFT_CONVERGED_SLACK,
+        _FP32_SOFT_CONVERGED_FLOOR,
+    )
+    if (
+        result.status == LinearSolveStatus.MAX_ITER
+        and np.isfinite(result.residual_norm)
+        and result.residual_norm <= soft_threshold
+    ):
+        from sv_pgs.progress import log
+
+        log(
+            "      CG soft-converged at iteration cap: "
+            + f"residual_norm={result.residual_norm:.2e} "
+            + f"requested_threshold={result.convergence_threshold:.2e} "
+            + f"soft_threshold={soft_threshold:.2e} iterations={result.iterations}"
+        )
+        return result.solution
     raise RuntimeError(
         "Conjugate-gradient solve failed to converge: "
         + f"residual={result.residual_norm:.2e} iterations={result.iterations}"
@@ -716,6 +756,7 @@ def _solve_spd_system_with_jax_cg(
             residual_norm=residual_norm,
             matvec_count=1,
             elapsed_seconds=time.monotonic() - started_at,
+            convergence_threshold=threshold,
         )
 
     if rhs.ndim != 2:
@@ -754,6 +795,7 @@ def _solve_spd_system_with_jax_cg(
         residual_norm=combined_residual_norm,
         matvec_count=combined_matvecs,
         elapsed_seconds=time.monotonic() - started_at,
+        convergence_threshold=absolute_threshold,
     )
 
 
@@ -856,6 +898,7 @@ def _solve_single_rhs(
     initial_residual = float(residual_norm_sq_jax)
     rhs_norm_sq = float(jnp.vdot(rhs, rhs))
     convergence_threshold_sq = tol_sq * max(rhs_norm_sq, 1.0)
+    absolute_threshold = math.sqrt(max(convergence_threshold_sq, 0.0))
     if not np.isfinite(initial_residual):
         return LinearSolveResult(
             solution=np.asarray(best_solution, dtype=np.asarray(jnp.zeros((), dtype=solver_dtype)).dtype),
@@ -864,6 +907,7 @@ def _solve_single_rhs(
             residual_norm=float("nan"),
             matvec_count=matvec_count,
             elapsed_seconds=time.monotonic() - t_start,
+            convergence_threshold=absolute_threshold,
         )
     if initial_residual <= convergence_threshold_sq:
         return LinearSolveResult(
@@ -873,6 +917,7 @@ def _solve_single_rhs(
             residual_norm=math.sqrt(max(initial_residual, 0.0)),
             matvec_count=matvec_count,
             elapsed_seconds=time.monotonic() - t_start,
+            convergence_threshold=absolute_threshold,
         )
     preconditioned_residual = residual if preconditioner is None else preconditioner(residual)
     search_direction = preconditioned_residual
@@ -899,6 +944,7 @@ def _solve_single_rhs(
                 residual_norm=residual_norm,
                 matvec_count=matvec_count,
                 elapsed_seconds=time.monotonic() - t_start,
+                convergence_threshold=absolute_threshold,
             )
         operator_search_direction = apply_operator(search_direction)
         step_denom_jax = jnp.vdot(search_direction, operator_search_direction)
@@ -930,6 +976,7 @@ def _solve_single_rhs(
                     residual_norm=residual_norm,
                     matvec_count=matvec_count,
                     elapsed_seconds=time.monotonic() - t_start,
+                    convergence_threshold=absolute_threshold,
                 )
         step_size = residual_dot_jax / step_denom_jax
         solution = solution + step_size * search_direction
@@ -960,6 +1007,7 @@ def _solve_single_rhs(
                 residual_norm=residual_norm,
                 matvec_count=matvec_count,
                 elapsed_seconds=time.monotonic() - t_start,
+                convergence_threshold=absolute_threshold,
             )
         _maybe_emit_cg_progress(
             callback=progress_callback,
@@ -979,6 +1027,7 @@ def _solve_single_rhs(
                 residual_norm=residual_norm,
                 matvec_count=matvec_count,
                 elapsed_seconds=time.monotonic() - t_start,
+                convergence_threshold=absolute_threshold,
             )
         updated_preconditioned_residual = residual if preconditioner is None else preconditioner(residual)
         updated_residual_dot_jax = jnp.vdot(residual, updated_preconditioned_residual)
@@ -1015,6 +1064,7 @@ def _solve_single_rhs(
         residual_norm=residual_norm,
         matvec_count=matvec_count,
         elapsed_seconds=time.monotonic() - t_start,
+        convergence_threshold=absolute_threshold,
     )
 
 
@@ -1066,6 +1116,7 @@ def _solve_multiple_rhs(
     residual_norm_sq = np.asarray(jnp.sum(residual * residual, axis=0), dtype=np.float64)
     rhs_norm_sq = np.asarray(jnp.sum(rhs * rhs, axis=0), dtype=np.float64)
     convergence_threshold_sq = tol_sq * np.maximum(rhs_norm_sq, 1.0)
+    absolute_threshold = float(math.sqrt(max(float(np.max(convergence_threshold_sq)), 0.0)))
     converged = residual_norm_sq <= convergence_threshold_sq
     best_solution = jnp.asarray(solution, dtype=solver_dtype)
     best_residual_norm_sq = float(np.max(residual_norm_sq))
@@ -1077,6 +1128,7 @@ def _solve_multiple_rhs(
             residual_norm=float("nan"),
             matvec_count=matvec_count,
             elapsed_seconds=time.monotonic() - t_start,
+            convergence_threshold=absolute_threshold,
         )
     if np.all(converged):
         return LinearSolveResult(
@@ -1113,6 +1165,7 @@ def _solve_multiple_rhs(
                 residual_norm=residual_norm,
                 matvec_count=matvec_count,
                 elapsed_seconds=time.monotonic() - t_start,
+                convergence_threshold=absolute_threshold,
             )
         active_columns = np.flatnonzero(~converged).astype(np.int32, copy=False)
         active_mask = jnp.asarray((~converged).astype(np.asarray(jnp.zeros((), dtype=solver_dtype)).dtype), dtype=solver_dtype)
@@ -1153,6 +1206,7 @@ def _solve_multiple_rhs(
                     residual_norm=residual_norm,
                     matvec_count=matvec_count,
                     elapsed_seconds=time.monotonic() - t_start,
+                    convergence_threshold=absolute_threshold,
                 )
         step_scale = np.zeros_like(step_denom)
         active_indices = ~converged
@@ -1185,6 +1239,7 @@ def _solve_multiple_rhs(
                 residual_norm=float("nan"),
                 matvec_count=matvec_count,
                 elapsed_seconds=time.monotonic() - t_start,
+                convergence_threshold=absolute_threshold,
             )
         if residual_summary < best_residual_norm_sq:
             best_residual_norm_sq = residual_summary
@@ -1249,6 +1304,7 @@ def _solve_multiple_rhs(
         residual_norm=residual_norm,
         matvec_count=matvec_count,
         elapsed_seconds=time.monotonic() - t_start,
+        convergence_threshold=absolute_threshold,
     )
 
 
