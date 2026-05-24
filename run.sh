@@ -337,10 +337,51 @@ sweep_zombie_gpu_procs() {
   fi
 }
 
+sweep_zombie_sv_pgs_procs() {
+  # Reclaim host RAM held by stale sv-pgs / project Python processes from
+  # earlier killed runs. Applies the same safety rules as the GPU sweep:
+  # never kill an ancestor of this shell, never touch foreign processes.
+  # A process is targeted only if it is owned by the current user, not an
+  # ancestor of this shell, and its cmdline matches sv-pgs / run-all-of-us
+  # / this repo's .venv path. We do NOT use the "orphaned (ppid=1)" rule
+  # here because jupyter spawns project workers with ppid=1 legitimately.
+  local self_pid=$$
+  local skip_pids=" $self_pid "
+  local p="$self_pid"
+  while [ -n "$p" ] && [ "$p" != "1" ] && [ "$p" != "0" ]; do
+    p=$(ps -o ppid= -p "$p" 2>/dev/null | tr -d ' ' || true)
+    [ -n "$p" ] && skip_pids+="$p "
+  done
+  local me
+  me=$(id -un)
+  local repo_marker="${REPO_DIR}/.venv"
+  local candidates
+  candidates=$(pgrep -u "$me" -f "sv-pgs|run-all-of-us|${repo_marker}" 2>/dev/null || true)
+  [ -z "$candidates" ] && return 0
+  local killed=0
+  for pid in $candidates; do
+    [ -z "$pid" ] && continue
+    case "$skip_pids" in *" $pid "*) continue ;; esac
+    local cmd rss_kb
+    cmd=$(ps -o args= -p "$pid" 2>/dev/null || true)
+    rss_kb=$(ps -o rss= -p "$pid" 2>/dev/null | tr -d ' ' || echo 0)
+    [ -z "$cmd" ] && continue
+    echo "  RAM sweep: killing stale sv-pgs pid=$pid rss=${rss_kb}kB cmd=$(printf '%s' "$cmd" | head -c 80)"
+    kill -9 "$pid" 2>/dev/null || true
+    killed=1
+  done
+  if [ "$killed" = "1" ]; then
+    sleep 2
+    echo "  RAM sweep: meminfo after reclaim:"
+    awk '/^MemAvailable:|^MemFree:/ {print "    "$0}' /proc/meminfo 2>/dev/null
+  fi
+}
+
 run_variant_pass() {
   local variants="$1"
   local base="$2"
   echo "=== FIT PASS: variants=${variants}  base=${base} ==="
+  sweep_zombie_sv_pgs_procs
   sweep_zombie_gpu_procs
   if is_all; then
     uv run sv-pgs run-all-of-us --all-diseases --variants "$variants" --output-dir "$base"
