@@ -1473,9 +1473,9 @@ def test_multi_source_precomputed_stats_still_dedupes_plink_variants(
     # Per-variant byte layout (LSB-first, 2 bits per sample, 00=homA, 11=homB).
     # variant 0: s0=00 (homA), s1=11 (homB) → 0b00_00_11_00 = 0x0c
     # variant 1: s0=11 (homB), s1=00 (homA) → 0b00_00_00_11 = 0x03
-    # The precomputed-stats branch ignores the decoded values (precomputed
-    # wins at concatenation), but io now also tees an int8 cache, which
-    # requires the .bed to actually exist and parse.
+    # The precomputed-stats branch ignores decoded PLINK values: precomputed
+    # stats win at concatenation, and the loader must not build a fresh
+    # full-genome validation int8 cache before fitting starts.
     bed_path.write_bytes(bytes.fromhex("6c 1b 01 0c 03"))
     bed_path.with_suffix(".fam").write_text(
         "\n".join(
@@ -1543,6 +1543,13 @@ def test_multi_source_precomputed_stats_still_dedupes_plink_variants(
         scales=np.array([0.5, 1.0], dtype=np.float32),
         allele_frequencies=np.array([0.25, 0.5], dtype=np.float32),
         support_counts=np.array([2, 2], dtype=np.int32),
+    )
+    monkeypatch.setattr(
+        io_module,
+        "compute_plink_variant_statistics_cached",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("precomputed-stats validation load must not build PLINK int8 cache")
+        ),
     )
 
     dataset = load_multi_source_dataset_from_files(

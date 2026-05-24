@@ -49,23 +49,73 @@ _AUTO_TUNE_HOST_RAM_INFLIGHT_FRACTION = 0.25  # ≤ 25% free RAM in flight
 _AUTO_TUNE_GPU_BATCH_FRACTION = 0.40  # one batch fits in 40% of GPU free
 
 
+def _parse_proc_meminfo() -> dict[str, int]:
+    """Parse ``/proc/meminfo`` into a {key: bytes} mapping.
+
+    Returns an empty dict on any error (e.g. non-Linux, unreadable file).
+    """
+    result: dict[str, int] = {}
+    try:
+        with open("/proc/meminfo", "r") as meminfo:
+            for line in meminfo:
+                parts = line.split()
+                if len(parts) < 2:
+                    continue
+                key = parts[0].rstrip(":")
+                try:
+                    value_kb = int(parts[1])
+                except ValueError:
+                    continue
+                # /proc/meminfo reports kB (i.e. KiB) for memory rows.
+                unit = parts[2].lower() if len(parts) >= 3 else "kb"
+                if unit == "kb":
+                    result[key] = value_kb * 1024
+                else:
+                    result[key] = value_kb
+    except OSError:
+        return {}
+    return result
+
+
 def _detect_available_host_ram_bytes() -> int:
-    """Return available host RAM in bytes (stdlib-only)."""
+    """Return available host RAM in bytes.
+
+    Precedence:
+        1. ``/proc/meminfo:MemAvailable`` (Linux 3.14+; authoritative)
+        2. ``MemFree + Cached + SReclaimable`` from ``/proc/meminfo``
+           (manual MemAvailable approximation for ancient kernels)
+        3. ``psutil.virtual_memory().available`` if psutil is importable
+        4. ``SC_AVPHYS_PAGES * SC_PAGE_SIZE`` (MemFree-equivalent; pessimistic)
+        5. 4 GB hardcoded floor
+    """
+    meminfo = _parse_proc_meminfo()
+    if "MemAvailable" in meminfo and meminfo["MemAvailable"] > 0:
+        return int(meminfo["MemAvailable"])
+    if meminfo:
+        approx = (
+            meminfo.get("MemFree", 0)
+            + meminfo.get("Cached", 0)
+            + meminfo.get("SReclaimable", 0)
+        )
+        if approx > 0:
+            return int(approx)
+    try:
+        import psutil  # type: ignore[import-not-found]
+    except ImportError:
+        psutil = None  # type: ignore[assignment]
+    if psutil is not None:
+        try:
+            available = int(psutil.virtual_memory().available)
+            if available > 0:
+                return available
+        except (AttributeError, OSError, RuntimeError, ValueError):
+            pass
     try:
         page_size = os.sysconf("SC_PAGE_SIZE")
         avail_pages = os.sysconf("SC_AVPHYS_PAGES")
         if page_size > 0 and avail_pages > 0:
             return int(page_size) * int(avail_pages)
     except (AttributeError, ValueError, OSError):
-        pass
-    try:
-        with open("/proc/meminfo", "r") as meminfo:
-            for line in meminfo:
-                if line.startswith("MemAvailable:"):
-                    parts = line.split()
-                    if len(parts) >= 2:
-                        return int(parts[1]) * 1024
-    except OSError:
         pass
     return _AUTO_TUNE_HOST_RAM_FALLBACK_BYTES
 

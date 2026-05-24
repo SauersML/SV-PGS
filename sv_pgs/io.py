@@ -999,25 +999,13 @@ def load_multi_source_dataset_from_files(
             if precomputed_variant_stats is not None:
                 # Caller already has variant_stats and variant_records from a
                 # prior load on the same source set (typically: train cohort
-                # supplying values for the test load). The final dataset
-                # replaces per-source stats with the precomputed values below,
-                # but we still want the int8 mmap built for THIS sample subset
-                # so downstream per-epoch validation passes can stream from a
-                # decoded mmap instead of re-decoding bed bytes every call.
-                #
-                # If an int8 cache already exists for this (bed, sample_indices,
-                # minimum_scale) it's a no-op; otherwise we pay one streaming
-                # pass to build it. Either way the precomputed stats win at the
-                # concatenation step — the stats we compute here are discarded.
+                # supplying values for the test load). Reuse an existing int8
+                # cache if one is already available, but never build a fresh
+                # full-genome cache here: on AoU that is a 144 GB validation
+                # side quest before fitting starts, while the solver now works
+                # on active LD/variant blocks.
                 int8_path_existing = _plink_int8_cache_path(path, keep_indices, config)
-                plink_int8_cache_path: Path | None = None
                 int8_view: I8Array | None = None
-                # Try the existing cache first. exists() alone isn't enough —
-                # a prior aborted run can leave a present-but-unreadable file
-                # that silently fails open_memmap, which previously left the
-                # source as PlinkRawGenotypeMatrix and made every per-epoch
-                # validation pass re-decode the .bed (~14 min/epoch wasted).
-                # Now: if open fails, unlink the bad file and rebuild.
                 if int8_path_existing.exists():
                     int8_view = _open_plink_int8_cache_for_read(int8_path_existing)
                     if int8_view is not None:
@@ -1025,29 +1013,21 @@ def load_multi_source_dataset_from_files(
                             f"  reusing precomputed variant statistics for {path.name} "
                             f"(skipping PLINK streaming pass); int8 cache present"
                         )
-                        plink_int8_cache_path = int8_path_existing
                     else:
                         log(
                             f"  PLINK int8 cache at {int8_path_existing.name} present but "
-                            f"unreadable; removing and rebuilding for {path.name}"
+                            f"unreadable; removing it and continuing without eager rebuild"
                         )
                         try:
                             int8_path_existing.unlink()
                         except OSError as exc:
-                            log(f"  could not remove stale int8 cache ({exc!r}); will recompute anyway")
+                            log(f"  could not remove stale int8 cache ({exc!r}); ignoring it")
                 if int8_view is None:
                     log(
                         f"  reusing precomputed variant statistics for {path.name} "
-                        f"but building int8 mmap cache so per-epoch test passes can mmap instead of bed-decode..."
+                        "without building a full validation int8 cache; "
+                        "active block kernels will stream from PLINK as needed"
                     )
-                    _, plink_int8_cache_path = compute_plink_variant_statistics_cached(
-                        raw,
-                        bed_path=path,
-                        sample_indices=keep_indices,
-                        config=config,
-                    )
-                    if plink_int8_cache_path is not None:
-                        int8_view = _open_plink_int8_cache_for_read(plink_int8_cache_path)
                 if int8_view is not None:
                     log(
                         f"  swapping PLINK source to int8 mmap "
