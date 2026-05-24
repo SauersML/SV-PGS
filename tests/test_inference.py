@@ -675,6 +675,30 @@ def test_restricted_mean_sample_space_rhs_warm_start_respects_matrix_token(monke
         "_solve_sample_space_rhs_cpu",
         fake_solve_sample_space_rhs_cpu,
     )
+    # On real-GPU boxes the dispatch routes through the GPU block-CG variant
+    # instead of the CPU function; stub both so the warm-start matrix-token
+    # invalidation is observed regardless of backend.
+    def fake_solve_sample_space_rhs_gpu(
+        genotype_matrix,
+        prior_variances,
+        diagonal_noise,
+        right_hand_side,
+        initial_guess,
+        tolerance,
+        max_iterations,
+        preconditioner,
+        batch_size,
+        return_iterations=False,
+        **kwargs,
+    ):
+        seen_initial_guesses.append(None if initial_guess is None else np.asarray(initial_guess, dtype=np.float64).copy())
+        rhs = np.asarray(right_hand_side, dtype=np.float64)
+        return (rhs, 3) if return_iterations else rhs
+    monkeypatch.setattr(
+        mixture_inference,
+        "_solve_sample_space_rhs_gpu",
+        fake_solve_sample_space_rhs_gpu,
+    )
     mixture_inference._solve_restricted_mean_only(
         genotype_matrix=second_subset,
         covariate_matrix=covariate_matrix,
@@ -1160,6 +1184,15 @@ def test_fit_variational_em_resumes_mid_stochastic_epoch(monkeypatch):
         "_stochastic_variant_blocks",
         lambda variant_count, block_size: [block.copy() for block in block_sequence],
     )
+    # On real-GPU boxes the adaptive sizer bumps the configured block size,
+    # which makes the resumed run rebuild its block schedule and restart from
+    # block 1 ("checkpoint block progress is incompatible with current block
+    # policy").  Pin the size so the resume-mid-epoch invariant is exercised.
+    monkeypatch.setattr(
+        mixture_inference,
+        "_adaptive_stochastic_variant_block_size",
+        lambda genotype_matrix, requested_block_size: requested_block_size,
+    )
     def fake_fit_collapsed_posterior(
         genotype_matrix,
         covariate_matrix,
@@ -1629,6 +1662,9 @@ def test_restricted_posterior_sample_space_merges_probe_rhs(monkeypatch: pytest.
         solve_rhs_shapes.append(rhs.shape)
         return (rhs, 3) if return_iterations else rhs
     monkeypatch.setattr(mixture_inference, "_solve_sample_space_rhs_cpu", fake_solve_sample_space_rhs_cpu)
+    # Real-GPU dispatch routes to the GPU block-CG path; stub both so the
+    # probe-RHS merging shape is recorded regardless of backend.
+    monkeypatch.setattr(mixture_inference, "_solve_sample_space_rhs_gpu", fake_solve_sample_space_rhs_cpu)
     alpha, beta, beta_variance, projected_targets, linear_predictor, *_ = mixture_inference._solve_restricted_full(
         genotype_matrix=standardized,
         covariate_matrix=covariate_matrix,
