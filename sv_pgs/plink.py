@@ -49,6 +49,30 @@ _SAMPLE_WINDOW_STRIPED_MIN_SPAN_BYTES = 64 * 1024 * 1024
 _SAMPLE_WINDOW_STRIPED_TARGET_CHUNK_BYTES = 256 * 1024 * 1024
 _SAMPLE_WINDOW_STRIPED_MAX_OVERREAD_RATIO = 32.0
 
+# Sparse-but-sorted variant gathers (for example active post-screening SNPs)
+# otherwise issue one pread per short contiguous run. At AoU scale that becomes
+# seek latency dominated. Coalesce nearby records into bounded sequential spans,
+# then scatter only the requested records into the payload passed to the decoder.
+_INDEXED_VARIANT_COALESCE_MIN_VARIANTS = 64
+_INDEXED_VARIANT_COALESCE_TARGET_CHUNK_BYTES = 256 * 1024 * 1024
+_INDEXED_VARIANT_COALESCE_MAX_OVERREAD_RATIO = 4.0
+
+
+def _use_coalesced_indexed_variant_reads(indices: NDArray) -> bool:
+    """Return True when a variant gather can benefit from sequential spans."""
+    resolved = np.asarray(indices, dtype=np.int64)
+    if resolved.ndim != 1 or resolved.size < _INDEXED_VARIANT_COALESCE_MIN_VARIANTS:
+        return False
+    deltas = np.diff(resolved)
+    if not np.all(deltas > 0):
+        return False
+    span_variant_count = int(resolved[-1] - resolved[0] + 1)
+    if span_variant_count == int(resolved.size):
+        return False
+    return span_variant_count <= int(
+        np.ceil(float(resolved.size) * _INDEXED_VARIANT_COALESCE_MAX_OVERREAD_RATIO)
+    )
+
 
 def to_bed(
     bed_path: str | Path,
@@ -248,6 +272,64 @@ class open_bed:
         fd = self._ensure_fd()
         payload = np.empty((int(indices.size) * bytes_per_variant,), dtype=np.uint8)
         output = memoryview(payload).cast("B")
+        if _use_coalesced_indexed_variant_reads(indices):
+            cursor = 0
+            while cursor < int(indices.size):
+                first_variant = int(indices[cursor])
+                chunk_end = cursor + 1
+                last_variant = first_variant
+                while chunk_end < int(indices.size):
+                    candidate_last = int(indices[chunk_end])
+                    span_variant_count = candidate_last - first_variant + 1
+                    selected_variant_count = chunk_end - cursor + 1
+                    span_bytes = span_variant_count * bytes_per_variant
+                    if (
+                        span_bytes > _INDEXED_VARIANT_COALESCE_TARGET_CHUNK_BYTES
+                        and selected_variant_count > 1
+                    ):
+                        break
+                    if (
+                        span_variant_count
+                        > selected_variant_count * _INDEXED_VARIANT_COALESCE_MAX_OVERREAD_RATIO
+                    ):
+                        break
+                    last_variant = candidate_last
+                    chunk_end += 1
+
+                selected_variant_count = chunk_end - cursor
+                span_variant_count = last_variant - first_variant + 1
+                output_offset = cursor * bytes_per_variant
+                if span_variant_count == selected_variant_count:
+                    input_offset = PLINK1_HEADER_SIZE + first_variant * bytes_per_variant
+                    byte_count = selected_variant_count * bytes_per_variant
+                    bytes_read = 0
+                    while bytes_read < byte_count:
+                        chunk_len = os.preadv(
+                            fd,
+                            [output[output_offset + bytes_read : output_offset + byte_count]],
+                            input_offset + bytes_read,
+                        )
+                        if chunk_len == 0:
+                            raise OSError(
+                                f"Unexpected EOF reading PLINK .bed at offset {input_offset + bytes_read}: "
+                                f"requested {byte_count - bytes_read} bytes, got 0"
+                            )
+                        bytes_read += chunk_len
+                else:
+                    input_offset = PLINK1_HEADER_SIZE + first_variant * bytes_per_variant
+                    span = self._pread_payload(input_offset, span_variant_count * bytes_per_variant)
+                    selected_variants = indices[cursor:chunk_end]
+                    for output_index, variant_index in enumerate(selected_variants):
+                        relative_variant = int(variant_index) - first_variant
+                        source_start = relative_variant * bytes_per_variant
+                        source_stop = source_start + bytes_per_variant
+                        destination_start = output_offset + output_index * bytes_per_variant
+                        output[
+                            destination_start : destination_start + bytes_per_variant
+                        ] = span[source_start:source_stop]
+                cursor = chunk_end
+            return payload
+
         cursor = 0
         while cursor < int(indices.size):
             run_start = cursor

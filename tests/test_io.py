@@ -834,6 +834,62 @@ def test_plink_reader_uses_striped_reads_for_large_sample_windows():
     )
 
 
+def test_plink_reader_coalesces_sorted_indexed_variant_reads(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    bed_path = tmp_path / "cohort.bed"
+    genotype_matrix = np.array(
+        [
+            [0.0, 1.0, 2.0, np.nan, 0.0, 1.0, 2.0, 0.0],
+            [1.0, 2.0, 0.0, 1.0, np.nan, 2.0, 0.0, 1.0],
+            [2.0, 0.0, 1.0, 2.0, 1.0, np.nan, 1.0, 2.0],
+            [np.nan, 1.0, 2.0, 0.0, 2.0, 1.0, 0.0, np.nan],
+            [0.0, np.nan, 1.0, 1.0, 0.0, 2.0, np.nan, 1.0],
+            [1.0, 0.0, np.nan, 2.0, 1.0, 0.0, 2.0, 2.0],
+            [2.0, 2.0, 0.0, np.nan, 2.0, 1.0, 1.0, 0.0],
+            [0.0, 1.0, 2.0, 0.0, np.nan, 2.0, 0.0, 1.0],
+        ],
+        dtype=np.float32,
+    )
+    to_bed(
+        bed_path,
+        genotype_matrix,
+        properties={
+            "fid": [f"f{i}" for i in range(genotype_matrix.shape[0])],
+            "iid": [f"s{i}" for i in range(genotype_matrix.shape[0])],
+            "sid": [f"v{i}" for i in range(genotype_matrix.shape[1])],
+        },
+    )
+    monkeypatch.setattr(plink_module, "_INDEXED_VARIANT_COALESCE_MIN_VARIANTS", 1)
+    monkeypatch.setattr(plink_module, "_INDEXED_VARIANT_COALESCE_TARGET_CHUNK_BYTES", 1_000_000)
+    monkeypatch.setattr(plink_module, "_INDEXED_VARIANT_COALESCE_MAX_OVERREAD_RATIO", 4.0)
+
+    payload_reads: list[tuple[int, int]] = []
+    original_pread_payload = plink_module.open_bed._pread_payload
+
+    def record_pread_payload(self, offset, length):
+        payload_reads.append((int(offset), int(length)))
+        return original_pread_payload(self, offset, length)
+
+    monkeypatch.setattr(plink_module.open_bed, "_pread_payload", record_pread_payload)
+    reader = open_bed(bed_path, iid_count=genotype_matrix.shape[0], sid_count=genotype_matrix.shape[1])
+
+    sample_indices = np.array([7, 0, 3], dtype=np.intp)
+    variant_indices = np.array([0, 2, 3, 5], dtype=np.intp)
+    observed = reader.read(index=(sample_indices, variant_indices), dtype="int8", order="F")
+
+    expected_float = genotype_matrix[np.ix_(sample_indices, variant_indices)]
+    expected = np.where(
+        np.isnan(expected_float),
+        io_module.PLINK_MISSING_INT8,
+        expected_float,
+    ).astype(np.int8)
+    np.testing.assert_array_equal(observed, expected)
+    assert payload_reads == [(plink_module.PLINK1_HEADER_SIZE, 12)]
+    assert observed.flags.f_contiguous
+
+
 def test_plink_reader_striped_sample_window_matches_standard_decode(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
