@@ -52,7 +52,63 @@ def _most_free_cuda_device() -> tuple[int, int, int] | None:
     return best_id, best_free, best_total
 
 
-SELECTED_CUDA_DEVICE: tuple[int, int, int] | None = _most_free_cuda_device()
+def _self_pin_cuda_visible_device() -> tuple[int, int, int] | None:
+    """Pin this process to the most-free CUDA device by setting
+    ``CUDA_VISIBLE_DEVICES`` BEFORE jax (and cupy) initialize.
+
+    No-op when ``CUDA_VISIBLE_DEVICES`` is already set (caller — typically
+    ``aou_runner`` subprocess orchestration — has already pinned), or when
+    fewer than 2 devices are visible (single-GPU box doesn't need it).
+
+    Returns the ``(device_id, free_bytes, total_bytes)`` triple of the chosen
+    device so callers (banner / ``require_gpu``) can report it; returns
+    ``None`` when no self-pin occurred or no GPU is usable.
+    """
+    if "CUDA_VISIBLE_DEVICES" in os.environ:
+        return _most_free_cuda_device()
+    try:
+        import cupy as _cupy  # type: ignore[import-not-found]
+    except (ImportError, OSError, RuntimeError):
+        return None
+    try:
+        device_count = int(_cupy.cuda.runtime.getDeviceCount())
+    except (AttributeError, OSError, RuntimeError):
+        return None
+    if device_count < 2:
+        # Single-GPU (or no-GPU) box: pinning gives nothing and would only
+        # add a surprising env mutation. Just probe and return.
+        return _most_free_cuda_device()
+    probed = _most_free_cuda_device()
+    if probed is None:
+        return None
+    device_id, free_bytes, total_bytes = probed
+    os.environ["CUDA_VISIBLE_DEVICES"] = str(device_id)
+    # Race-safety: re-probe to confirm cupy now sees exactly one device.
+    # CuPy/CUDA driver init may have already cached the device list before
+    # this env mutation; if so, log a warning so operators can restart with
+    # the env pre-set if it actually misbehaves on this host.
+    try:
+        post_count = int(_cupy.cuda.runtime.getDeviceCount())
+    except (AttributeError, OSError, RuntimeError):
+        post_count = -1
+    print(
+        f"GPU pin: selected device {device_id} of {device_count} "
+        f"(free={free_bytes / 1e9:.1f}/{total_bytes / 1e9:.1f} GB) "
+        f"→ CUDA_VISIBLE_DEVICES={device_id}",
+        flush=True,
+    )
+    if post_count not in (-1, 1):
+        print(
+            f"GPU pin: WARNING post-pin cupy reports {post_count} devices "
+            f"(expected 1); CUDA may have initialized before pin took effect. "
+            f"Re-run with CUDA_VISIBLE_DEVICES={device_id} set in the parent "
+            f"environment to force pinning before any CUDA init.",
+            flush=True,
+        )
+    return device_id, free_bytes, total_bytes
+
+
+SELECTED_CUDA_DEVICE: tuple[int, int, int] | None = _self_pin_cuda_visible_device()
 
 # Work around XLA compilation segfaults on Turing GPUs (T4).  These flags make
 # JAX materially slower on newer GPUs, so only enable them when a Turing-class
