@@ -1611,24 +1611,12 @@ def _detect_gpu_count() -> int:
     """Best-effort GPU count via CuPy runtime.
 
     Returns 0 when CuPy is missing, the CUDA driver/runtime isn't loadable,
-    or the host has no GPUs. Caller treats 0 as a signal to fall back to a
-    single sequential CPU run. We intentionally do NOT consult JAX here —
-    this orchestrator only needs the device count; JAX initialization (which
-    binds to a device) happens inside each per-disease subprocess.
+    or the host has no GPUs. Single-disease subprocesses still enforce CUDA
+    at pipeline entry and fail loudly instead of fitting on CPU.
     """
-    try:
-        import cupy  # type: ignore[import-not-found]
-    except (ImportError, OSError, RuntimeError):
-        return 0
-    cupy_runtime_error = getattr(getattr(cupy, "cuda", None), "runtime", None)
-    cupy_runtime_error = getattr(cupy_runtime_error, "CUDARuntimeError", RuntimeError)
-    if not isinstance(cupy_runtime_error, type):
-        cupy_runtime_error = RuntimeError
-    try:
-        device_count = cupy.cuda.runtime.getDeviceCount()
-        return int(device_count) if device_count > 0 else 0
-    except (AttributeError, OSError, RuntimeError, TypeError, ValueError, cupy_runtime_error):
-        return 0
+    from sv_pgs.genotype import _detect_cuda_device_count
+
+    return _detect_cuda_device_count()
 
 
 def _build_disease_subprocess_cmd(

@@ -23,6 +23,11 @@ from sv_pgs.config import ModelConfig
 from sv_pgs.io import load_multi_vcf_dataset_from_files
 
 
+@pytest.fixture(autouse=True)
+def _disable_aou_gpu_gate_for_unit_tests(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr("sv_pgs.genotype.require_gpu", lambda: None)
+
+
 class _FakeQueryJob:
     def __init__(self, rows: list[dict[str, object]]) -> None:
         self._rows = rows

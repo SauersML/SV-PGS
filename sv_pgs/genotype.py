@@ -117,6 +117,63 @@ def _detect_cuda_device_count() -> int:
         return 0
 
 
+def _cupy_runtime_diagnostic() -> str:
+    try:
+        import cupy  # type: ignore[import-not-found]
+    except (ImportError, OSError, RuntimeError) as exc:
+        return f"cupy_import_error={exc.__class__.__name__}: {exc}"
+    parts = [f"cupy={getattr(cupy, '__version__', '<unknown>')}"]
+    try:
+        device_count = max(int(cupy.cuda.runtime.getDeviceCount()), 0)
+    except _cupy_runtime_error_classes(cupy) as exc:
+        return " ".join(parts + [f"cupy_runtime_error={exc.__class__.__name__}: {exc}"])
+    parts.append(f"cupy_cuda_devices={device_count}")
+    for device_id in range(device_count):
+        try:
+            with cupy.cuda.Device(device_id):
+                free, total = cupy.cuda.runtime.memGetInfo()
+            parts.append(
+                f"device{device_id}={free / 1e9:.1f}GB_free/{total / 1e9:.1f}GB_total"
+            )
+        except _cupy_runtime_error_classes(cupy) as exc:
+            parts.append(f"device{device_id}_error={exc.__class__.__name__}: {exc}")
+    return " ".join(parts)
+
+
+def _nvidia_driver_diagnostic() -> str:
+    command = shutil.which("nvidia-smi")
+    if command is None:
+        driver_version = Path("/proc/driver/nvidia/version")
+        if driver_version.exists():
+            try:
+                return "nvidia-smi=missing " + driver_version.read_text(encoding="utf-8").strip().replace("\n", " | ")
+            except OSError as exc:
+                return f"nvidia-smi=missing nvidia_proc_version_error={exc}"
+        device_files = sorted(str(path) for path in Path("/dev").glob("nvidia*"))
+        return "nvidia-smi=missing /dev=" + (",".join(device_files) if device_files else "<none>")
+    import subprocess
+
+    try:
+        result = subprocess.run(
+            [
+                command,
+                "--query-gpu=index,name,driver_version,memory.total,memory.free",
+                "--format=csv,noheader,nounits",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=5.0,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        return f"nvidia-smi_error={exc}"
+    if result.returncode != 0:
+        stderr = result.stderr.strip().replace("\n", " | ")
+        return f"nvidia-smi_rc={result.returncode} stderr={stderr}"
+    lines = " | ".join(line.strip() for line in result.stdout.splitlines() if line.strip())
+    return "nvidia-smi=" + (lines if lines else "no_visible_gpus")
+
+
 def compute_bed_reader_target_batch_bytes(
     *,
     host_ram_bytes: int | None = None,
@@ -1450,46 +1507,41 @@ _gpu_verified = False
 
 
 def require_gpu() -> Any:
-    """Validate GPU+CuPy at pipeline entry. Crash loudly if GPU exists but CuPy fails.
-
-    Returns the CuPy module if available, None if no GPU hardware at all.
-    Skips re-verification after first successful call.
-    """
+    """Validate GPU+CuPy at pipeline entry; AoU production runs require CUDA."""
     global _gpu_verified
     if _gpu_verified:
         return _cupy_module
     from sv_pgs.progress import log
-    import shutil
-    import subprocess
-    nvidia_smi = shutil.which("nvidia-smi")
-    has_gpu_hardware = False
-    if nvidia_smi is not None:
-        try:
-            result = subprocess.run(
-                [nvidia_smi, "--query-gpu=name", "--format=csv,noheader"],
-                capture_output=True, text=True, timeout=5.0, check=False,
-            )
-            has_gpu_hardware = result.returncode == 0 and bool(result.stdout.strip())
-        except (OSError, subprocess.SubprocessError):
-            pass
-    if not has_gpu_hardware:
-        log("  no NVIDIA GPU detected — running CPU-only (this will be slow)")
-        return None
-    # GPU exists — CuPy MUST work
+
     cupy = _try_import_cupy()
     if cupy is None:
+        log("  CUDA runtime diagnostic: " + _cupy_runtime_diagnostic())
+        log("  NVIDIA driver diagnostic: " + _nvidia_driver_diagnostic())
         raise RuntimeError(
-            "NVIDIA GPU detected but CuPy is not working. "
-            "Install with: uv pip install cupy-cuda12x  "
-            "(or cupy-cuda11x for CUDA 11). "
-            "Verify: python -c 'import cupy; print(cupy.cuda.runtime.memGetInfo())'"
+            "AoU fitting requires a working NVIDIA CUDA runtime, but CuPy cannot see a usable GPU. "
+            + _cupy_runtime_diagnostic()
+            + " | "
+            + _nvidia_driver_diagnostic()
         )
     # Reclaim any pool blocks before sampling free memory so the warning
     # below reflects real availability rather than blocks the CuPy pool
     # is merely caching.
     _release_cupy_cached_memory(cupy)
-    free_bytes, total_bytes = cupy.cuda.runtime.memGetInfo()
-    log(f"  GPU verified: {total_bytes / 1e9:.1f} GB total, {free_bytes / 1e9:.1f} GB free")
+    device_count = max(_cupy_device_count(cupy), 1)
+    free_bytes = 0
+    total_bytes = 0
+    per_device = []
+    for device_id in range(device_count):
+        with _cupy_device_context(cupy, device_id):
+            device_free, device_total = cupy.cuda.runtime.memGetInfo()
+        free_bytes += int(device_free)
+        total_bytes += int(device_total)
+        per_device.append(f"device{device_id}={int(device_free) / 1e9:.1f}/{int(device_total) / 1e9:.1f}GB")
+    log(
+        "  GPU verified: "
+        + f"cuda_devices={device_count} aggregate={total_bytes / 1e9:.1f} GB total, {free_bytes / 1e9:.1f} GB free "
+        + "(" + ", ".join(per_device) + ")"
+    )
     # If another process is pinning most of the device, the training pipeline
     # will silently fall back to slow streaming paths and may still OOM on the
     # remaining residual. Surface it once, at entry, so the user can kill stale

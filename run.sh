@@ -24,18 +24,44 @@ if [ -d .git ] && [ -z "${SV_PGS_SKIP_PULL:-}" ]; then
     echo "skipping git pull: working tree has local changes"
   fi
 fi
-if [ ! -x ".venv/bin/python" ]; then
-  uv sync --python 3.12 --extra gpu
+uv sync --python 3.12 --extra gpu
+
+echo
+echo "=== GPU RUNTIME DIAGNOSTICS ==="
+echo "  device files:"
+ls -l /dev/nvidia* 2>/dev/null | sed 's/^/    /' || echo "    (none)"
+echo "  nvidia-smi:"
+if command -v nvidia-smi >/dev/null 2>&1; then
+  nvidia-smi -L 2>&1 | sed 's/^/    /' || true
+  nvidia-smi --query-gpu=index,name,driver_version,memory.total,memory.free --format=csv,noheader,nounits 2>&1 | sed 's/^/    /' || true
+else
+  echo "    unavailable"
 fi
-# Always ensure GPU extras are present when a GPU is visible — handles the case
-# where the venv was first created CPU-only (then cupy/jax-cuda never get
-# installed on later runs and the pipeline silently falls back to CPU).
-if command -v nvidia-smi >/dev/null 2>&1 && nvidia-smi -L >/dev/null 2>&1; then
-  if ! .venv/bin/python -c "import cupy" >/dev/null 2>&1; then
-    echo "GPU detected but cupy missing — installing GPU extras..."
-    uv sync --python 3.12 --extra gpu
-  fi
-fi
+echo "  python CUDA runtimes:"
+.venv/bin/python - <<'PYEOF' 2>&1 | sed 's/^/    /'
+try:
+    import cupy
+    print(f"cupy={cupy.__version__}")
+    try:
+        count = int(cupy.cuda.runtime.getDeviceCount())
+        print(f"cupy_cuda_devices={count}")
+        for device_id in range(count):
+            with cupy.cuda.Device(device_id):
+                free, total = cupy.cuda.runtime.memGetInfo()
+            print(f"cupy_device{device_id}_memory={free}/{total}")
+    except BaseException as exc:
+        print(f"cupy_runtime_error={exc.__class__.__name__}: {exc}")
+except BaseException as exc:
+    print(f"cupy_import_error={exc.__class__.__name__}: {exc}")
+try:
+    import jax
+    import jaxlib
+    print(f"jax={jax.__version__} jaxlib={jaxlib.__version__} backend={jax.default_backend()}")
+    print("jax_devices=" + ", ".join(f"{d.platform}:{getattr(d, 'id', '?')}:{getattr(d, 'device_kind', '?')}" for d in jax.devices()))
+except BaseException as exc:
+    print(f"jax_runtime_error={exc.__class__.__name__}: {exc}")
+PYEOF
+echo "=== END GPU RUNTIME DIAGNOSTICS ==="
 
 BASE_SNP="$HOME/sv_pgs_results_snp"
 BASE_JOINT="$HOME/sv_pgs_results_snp_sv"
