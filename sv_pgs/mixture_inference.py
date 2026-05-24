@@ -84,6 +84,7 @@ from sv_pgs.genotype import (
     DenseRawGenotypeMatrix,
     RawGenotypeMatrix,
     StandardizedGenotypeMatrix,
+    _call_gpu_materialization_budget_bytes,
     _cupy_cache_is_int8_standardized,
     _cupy_cache_standardized_columns,
     _cupy_compute_dtype,
@@ -92,6 +93,7 @@ from sv_pgs.genotype import (
     _gpu_total_bytes,
     _iter_cupy_cache_standardized_batches,
     _iter_standardized_gpu_batches,
+    _release_cupy_cached_memory,
     _to_cupy_compute,
     _to_cupy_float64,
     _try_import_cupy,
@@ -7501,6 +7503,89 @@ def _apply_restricted_projector_gpu(
     return weighted_rhs - weighted_covariates_gpu @ correction
 
 
+def _try_install_cg_workset_resident_cache(
+    genotype_matrix: StandardizedGenotypeMatrix,
+    *,
+    cupy: Any,
+) -> bool:
+    """Attempt to materialize the working-set columns into a GPU-resident int8 cache.
+
+    Returns True when the caller now owns the freshly installed
+    ``_cupy_cache`` (and is responsible for releasing it on exit). Returns
+    False on any failure path; the caller continues with the existing
+    streaming behaviour.
+
+    Sized against ``_gpu_materialization_budget_bytes`` with the standard
+    int8-resident solver headroom; the heavy lifting is delegated to
+    ``StandardizedGenotypeMatrix.try_materialize_gpu()``, which already
+    handles plan-vs-budget gating, OOM rollback, and upload strategy.
+    """
+    if cupy is None:
+        return False
+    if genotype_matrix._cupy_cache is not None:
+        return False
+    if genotype_matrix.raw is None:
+        return False
+    try_materialize_gpu_subset = getattr(genotype_matrix, "try_materialize_gpu_subset", None)
+    if try_materialize_gpu_subset is None:
+        # Defensive: if the API isn't present, fall back to streaming.
+        return False
+    n_rows = int(genotype_matrix.shape[0])
+    n_cols = int(genotype_matrix.shape[1])
+    if n_rows <= 0 or n_cols <= 0:
+        return False
+    required_bytes = n_rows * n_cols  # int8 storage for the working-set columns
+    try:
+        budget_bytes = _call_gpu_materialization_budget_bytes(
+            cupy,
+            n_rows=n_rows,
+            n_cols=n_cols,
+            dtype=np.int8,
+            backend="int8-resident",
+        )
+    except (AttributeError, RuntimeError, OSError):
+        return False
+    if budget_bytes <= 0 or required_bytes > budget_bytes:
+        return False
+    try:
+        materialized = genotype_matrix.try_materialize_gpu()
+    except (MemoryError, OSError, RuntimeError) as exc:
+        try:
+            _release_cupy_cached_memory(cupy)
+        except (AttributeError, RuntimeError, OSError):
+            pass
+        log(f"      CG working-set GPU cache install skipped ({exc})")
+        return False
+    if not materialized or genotype_matrix._cupy_cache is None:
+        return False
+    log(
+        "      CG working-set GPU cache installed: "
+        + f"{n_cols} variants x {n_rows} samples (~{required_bytes / 1e9:.1f} GB int8)"
+    )
+    return True
+
+
+def _release_cg_workset_resident_cache(
+    genotype_matrix: StandardizedGenotypeMatrix,
+    *,
+    cupy: Any,
+) -> None:
+    """Drop the working-set GPU cache installed by ``_try_install_cg_workset_resident_cache``."""
+    if genotype_matrix._cupy_cache is None:
+        return
+    genotype_matrix._cupy_cache = None
+    if cupy is None:
+        return
+    try:
+        cupy.cuda.Device().synchronize()
+    except (AttributeError, OSError, RuntimeError):
+        pass
+    try:
+        _release_cupy_cached_memory(cupy)
+    except (AttributeError, RuntimeError, OSError):
+        pass
+
+
 def _solve_sample_space_rhs_gpu(
     genotype_matrix: StandardizedGenotypeMatrix,
     prior_variances: NDArray,
@@ -7521,6 +7606,59 @@ def _solve_sample_space_rhs_gpu(
     cupy = _try_import_cupy()
     if cupy is None:
         raise RuntimeError("GPU sample-space solve requires CuPy.")
+    # CG inner loop hammers matvec/transpose-matvec on the SAME working-set
+    # columns dozens of times. When the genotype matrix is streaming from
+    # PLINK BED (e.g. inside the posterior working-set pass), promote the
+    # working set to a GPU-resident int8 cache once so subsequent matvec
+    # calls reuse it instead of re-decoding from BED on every iteration.
+    # The cache is released in the finally block below.
+    _owned_cg_workset_cache = False
+    if genotype_matrix._cupy_cache is None:
+        _owned_cg_workset_cache = _try_install_cg_workset_resident_cache(
+            genotype_matrix,
+            cupy=cupy,
+        )
+    try:
+        return _solve_sample_space_rhs_gpu_with_optional_workset_cache(
+            cp=cp,
+            cupy=cupy,
+            genotype_matrix=genotype_matrix,
+            prior_variances=prior_variances,
+            diagonal_noise=diagonal_noise,
+            right_hand_side=right_hand_side,
+            initial_guess=initial_guess,
+            tolerance=tolerance,
+            max_iterations=max_iterations,
+            preconditioner=preconditioner,
+            batch_size=batch_size,
+            return_iterations=return_iterations,
+            column_iteration_limits=column_iteration_limits,
+            required_columns=required_columns,
+            lanczos_recorder=lanczos_recorder,
+        )
+    finally:
+        if _owned_cg_workset_cache:
+            _release_cg_workset_resident_cache(genotype_matrix, cupy=cupy)
+
+
+def _solve_sample_space_rhs_gpu_with_optional_workset_cache(
+    *,
+    cp: Any,
+    cupy: Any,
+    genotype_matrix: StandardizedGenotypeMatrix,
+    prior_variances: NDArray,
+    diagonal_noise: NDArray,
+    right_hand_side: NDArray,
+    initial_guess: NDArray | None,
+    tolerance: float,
+    max_iterations: int,
+    preconditioner: Callable[[Any], Any],
+    batch_size: int,
+    return_iterations: bool,
+    column_iteration_limits: NDArray | None,
+    required_columns: NDArray | None,
+    lanczos_recorder: _SampleSpaceCGLanczosRecorder | None,
+) -> NDArray | tuple[NDArray, int]:
     streaming_gpu_enabled = genotype_matrix._cupy_cache is None and genotype_matrix.raw is not None and not genotype_matrix.supports_jax_dense_ops()
     if genotype_matrix._cupy_cache is None and not streaming_gpu_enabled:
         raise RuntimeError("GPU sample-space solve requires a CuPy-resident matrix or GPU-streamable raw storage.")

@@ -1263,6 +1263,11 @@ def run_all_of_us(
         validation_interval=validation_interval,
         validate_first_iteration=validate_first_iteration,
         sample_space_preconditioner_rank=sample_space_preconditioner_rank,
+        # AoU outer iterations dominate runtime; the default 10-minute solver
+        # budget was tripping TR-Newton mid-iter on the 695k-variant problem,
+        # forcing a PG-IRLS restart and wasting ~10 min per outer iter. Give
+        # TR-Newton an hour to actually finish iter 1.
+        solver_wall_clock_budget_s=3600.0,
     )
     log(
         "  AoU fit policy: "
