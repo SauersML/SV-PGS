@@ -1548,7 +1548,21 @@ def run_all_of_us(
             output_dir=work_dir,
             test_dataset=test_dataset,
         )
-        run_metadata_path.write_text(json.dumps(run_metadata, indent=2), encoding="utf-8")
+        # Atomic publish so a crash mid-write (or a concurrent disease
+        # sweep racing on the same path) never leaves a truncated metadata
+        # JSON that downstream tools would mis-parse as the run record.
+        _run_metadata_tmp = run_metadata_path.with_name(
+            f"{run_metadata_path.name}.tmp.{os.getpid()}.{uuid.uuid4().hex}"
+        )
+        try:
+            _run_metadata_tmp.write_text(json.dumps(run_metadata, indent=2), encoding="utf-8")
+            os.replace(_run_metadata_tmp, run_metadata_path)
+        except BaseException:
+            try:
+                _run_metadata_tmp.unlink(missing_ok=True)
+            except OSError:
+                pass
+            raise
     finally:
         _finish_plink_cache_warmup(plink_cache_warmup)
         if dataset is not None:

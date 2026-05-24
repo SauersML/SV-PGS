@@ -5,6 +5,7 @@ import json
 import os
 import pickle
 import time
+import uuid
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Sequence, cast
@@ -325,7 +326,10 @@ def _save_fit_stage_variant_stats_cache(
     variant_stats: VariantStatistics,
 ) -> None:
     cache_path.parent.mkdir(parents=True, exist_ok=True)
-    tmp_path = cache_path.parent / f"{cache_path.name}.tmp.npz"
+    # Per-process unique temp so a concurrent disease sweep that lands on
+    # the same cache key cannot truncate our staging file mid-write. The
+    # atomic replace at the end still publishes a complete payload.
+    tmp_path = cache_path.parent / f"{cache_path.name}.tmp.{os.getpid()}.{uuid.uuid4().hex}.npz"
     try:
         np.savez_compressed(
             tmp_path,
@@ -400,13 +404,30 @@ def _save_fit_stage_structure_cache(
     reduced_tie_map: TieMap,
 ) -> None:
     cache_paths.cache_dir.mkdir(parents=True, exist_ok=True)
-    active_tmp = cache_paths.cache_dir / f"{cache_paths.key}.active.tmp.npy"
-    tie_tmp = cache_paths.cache_dir / f"{cache_paths.key}.tie.tmp.pkl"
-    np.save(active_tmp, np.asarray(active_variant_indices, dtype=np.int32))
-    with tie_tmp.open("wb") as handle:
-        pickle.dump(reduced_tie_map, handle, protocol=pickle.HIGHEST_PROTOCOL)
-    active_tmp.replace(cache_paths.active_indices_path)
-    tie_tmp.replace(cache_paths.tie_map_path)
+    # Per-process unique temp names so concurrent disease sweeps that hit
+    # the same cache key cannot stomp each other's staging files; the
+    # atomic replace at the end still publishes a complete pair.
+    unique_tag = f"{os.getpid()}.{uuid.uuid4().hex}"
+    # np.save auto-appends .npy if missing; keep .npy at the end so the
+    # produced file is exactly `<unique_tag>.npy`, not `<unique_tag>.npy.npy`.
+    active_tmp = cache_paths.cache_dir / f"{cache_paths.key}.active.tmp.{unique_tag}.npy"
+    tie_tmp = cache_paths.cache_dir / f"{cache_paths.key}.tie.tmp.{unique_tag}.pkl"
+    try:
+        np.save(active_tmp, np.asarray(active_variant_indices, dtype=np.int32))
+        with tie_tmp.open("wb") as handle:
+            pickle.dump(reduced_tie_map, handle, protocol=pickle.HIGHEST_PROTOCOL)
+        active_tmp.replace(cache_paths.active_indices_path)
+        tie_tmp.replace(cache_paths.tie_map_path)
+    except BaseException:
+        # Don't leak per-pid staging files on the failure path; without
+        # this an OOM mid-pickle would silently fill the cache directory
+        # with `.tmp.<pid>.<uuid>.pkl` orphans on every retry.
+        for orphan in (active_tmp, tie_tmp):
+            try:
+                orphan.unlink(missing_ok=True)
+            except OSError:
+                pass
+        raise
     _write_fit_stage_cache_manifest(
         cache_paths=cache_paths,
         active_variant_count=int(np.asarray(active_variant_indices).shape[0]),
@@ -427,15 +448,24 @@ def _write_fit_stage_cache_manifest(
     reduced_variant_count: int,
     has_reduced_raw_i8: bool,
 ) -> None:
-    manifest_tmp = cache_paths.cache_dir / f"{cache_paths.key}.manifest.tmp.json"
+    manifest_tmp = cache_paths.cache_dir / (
+        f"{cache_paths.key}.manifest.tmp.{os.getpid()}.{uuid.uuid4().hex}.json"
+    )
     manifest_payload = {
         "version": _FIT_STAGE_CACHE_VERSION,
         "active_variant_count": int(active_variant_count),
         "reduced_variant_count": int(reduced_variant_count),
         "has_reduced_raw_i8": bool(has_reduced_raw_i8),
     }
-    manifest_tmp.write_text(json.dumps(manifest_payload, indent=2), encoding="utf-8")
-    manifest_tmp.replace(cache_paths.manifest_path)
+    try:
+        manifest_tmp.write_text(json.dumps(manifest_payload, indent=2), encoding="utf-8")
+        manifest_tmp.replace(cache_paths.manifest_path)
+    except BaseException:
+        try:
+            manifest_tmp.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise
 
 
 def _sample_space_basis_cache_path(
@@ -492,11 +522,13 @@ def _save_sample_space_basis_cache(
     if basis_array.ndim != 2 or basis_array.shape[0] != genotype_matrix.shape[0]:
         return False
     cache_paths.cache_dir.mkdir(parents=True, exist_ok=True)
-    tmp_path = cache_paths.cache_dir / f"{basis_path.name}.tmp"
+    # Per-process unique temp ending in .npy so np.save doesn't auto-append
+    # a second .npy suffix (which forced the historical two-path cleanup
+    # below) and so a concurrent writer cannot truncate our staging file.
+    tmp_path = cache_paths.cache_dir / f"{basis_path.name}.tmp.{os.getpid()}.{uuid.uuid4().hex}.npy"
     try:
         np.save(tmp_path, basis_array)
-        tmp_npy = tmp_path if tmp_path.suffix == ".npy" else tmp_path.with_suffix(tmp_path.suffix + ".npy")
-        tmp_npy.replace(basis_path)
+        tmp_path.replace(basis_path)
         log(
             "sample-space basis cache saved: "
             + f"{cache_paths.cache_dir.name}/{basis_path.name} "
@@ -504,8 +536,10 @@ def _save_sample_space_basis_cache(
         )
         return True
     except (OSError, ValueError) as exc:
-        tmp_path.unlink(missing_ok=True)
-        tmp_path.with_suffix(tmp_path.suffix + ".npy").unlink(missing_ok=True)
+        try:
+            tmp_path.unlink(missing_ok=True)
+        except OSError:
+            pass
         log(f"sample-space basis cache save failed ({exc}); continuing without durable solver cache")
         return False
 
@@ -626,7 +660,9 @@ def _save_variational_checkpoint(
             + f"(completed_iterations={completed_iterations}; nothing to resume)"
         )
         return
-    checkpoint_tmp = cache_paths.cache_dir / f"{cache_paths.key}.em.tmp.pkl"
+    checkpoint_tmp = cache_paths.cache_dir / (
+        f"{cache_paths.key}.em.tmp.{os.getpid()}.{uuid.uuid4().hex}.pkl"
+    )
     try:
         cache_paths.cache_dir.mkdir(parents=True, exist_ok=True)
         with checkpoint_tmp.open("wb") as handle:
@@ -687,7 +723,14 @@ def _clear_variational_checkpoint(cache_paths: _FitStageCachePaths) -> None:
 
 
 def _fit_checkpoint_tmp_path(checkpoint_path: Path) -> Path:
-    return checkpoint_path.with_name(f"{checkpoint_path.stem}.tmp{checkpoint_path.suffix}")
+    # Per-process unique staging name so two concurrent fit drivers writing
+    # to the same checkpoint path (a disease sweep that re-enters the same
+    # work_dir, or a debug retry while a prior run is still flushing) cannot
+    # corrupt one another's staging file. The published `checkpoint_path` is
+    # still produced via an atomic os.rename below.
+    return checkpoint_path.with_name(
+        f"{checkpoint_path.stem}.tmp.{os.getpid()}.{uuid.uuid4().hex}{checkpoint_path.suffix}"
+    )
 
 
 def _fit_checkpoint_config_hash(

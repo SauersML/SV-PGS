@@ -18,6 +18,8 @@ from __future__ import annotations
 import csv
 import gzip
 import json
+import os
+import uuid
 from pathlib import Path
 from typing import Literal
 
@@ -585,10 +587,23 @@ def evaluate_all_of_us(
         log("")
         log(f"  (no test_predictions.tsv.gz found at {test_predictions_path} — held-out battery skipped)")
 
-    # Save
+    # Save atomically via per-process temp + replace, so an interrupted
+    # evaluation never publishes a half-written evaluation.json that a
+    # downstream reader would fail to parse.
     eval_output = work_dir / f"{disease}.evaluation.json"
-    with open(eval_output, "w", encoding="utf-8") as handle:
-        json.dump(results, handle, indent=2)
+    eval_tmp = eval_output.with_name(
+        f"{eval_output.name}.tmp.{os.getpid()}.{uuid.uuid4().hex}"
+    )
+    try:
+        with open(eval_tmp, "w", encoding="utf-8") as handle:
+            json.dump(results, handle, indent=2)
+        os.replace(eval_tmp, eval_output)
+    except BaseException:
+        try:
+            eval_tmp.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise
     log(f"\n  results saved to {eval_output}")
     log("=== EVALUATION COMPLETE ===")
     return results

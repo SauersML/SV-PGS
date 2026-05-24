@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import hashlib
+import os
+import uuid
 from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
@@ -519,13 +521,24 @@ def _load_maf_filter_from_cache(cache_path: Path) -> I32Array | None:
 def _save_maf_filter_to_cache(cache_path: Path, active_variant_indices: NDArray) -> None:
     cache_path.parent.mkdir(parents=True, exist_ok=True)
     # np.savez appends `.npz` if the filename lacks it, so the temp file must
-    # end in `.npz` to land where we expect.
-    tmp_path = cache_path.with_name(cache_path.name + ".tmp.npz")
-    np.savez(
-        tmp_path,
-        active_variant_indices=np.asarray(active_variant_indices, dtype=np.int32),
+    # end in `.npz` to land where we expect. Per-process unique infix so
+    # concurrent disease sweeps cannot stomp each other's staging file; the
+    # atomic replace at the end still publishes a complete payload.
+    tmp_path = cache_path.with_name(
+        cache_path.name + f".tmp.{os.getpid()}.{uuid.uuid4().hex}.npz"
     )
-    tmp_path.replace(cache_path)
+    try:
+        np.savez(
+            tmp_path,
+            active_variant_indices=np.asarray(active_variant_indices, dtype=np.int32),
+        )
+        tmp_path.replace(cache_path)
+    except BaseException:
+        try:
+            tmp_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise
 
 
 def select_active_variant_indices(
@@ -938,9 +951,18 @@ def _load_tie_map_from_cache(cache_path: Path) -> TieMap | None:
 
 def _save_tie_map_to_cache(cache_path: Path, tie_map: TieMap) -> None:
     cache_path.parent.mkdir(parents=True, exist_ok=True)
-    tmp_path = cache_path.with_name(cache_path.name + ".tmp.npz")
-    np.savez(tmp_path, **_serialize_tie_map(tie_map))
-    tmp_path.replace(cache_path)
+    tmp_path = cache_path.with_name(
+        cache_path.name + f".tmp.{os.getpid()}.{uuid.uuid4().hex}.npz"
+    )
+    try:
+        np.savez(tmp_path, **_serialize_tie_map(tie_map))
+        tmp_path.replace(cache_path)
+    except BaseException:
+        try:
+            tmp_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise
 
 
 def build_tie_map(

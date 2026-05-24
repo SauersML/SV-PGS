@@ -3,11 +3,35 @@ from __future__ import annotations
 import json
 import logging
 import os
+import uuid
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
 
 import numpy as np
+
+
+def _fsync_parent_dir(path: Path) -> None:
+    """Best-effort fsync of `path.parent` so an atomic rename survives a crash.
+
+    Atomic rename guarantees the file's new name is visible OR the old one
+    is, but durability of the directory entry update itself requires fsync
+    on the parent directory FD. Silent no-op on platforms that don't
+    support directory fsync (e.g. Windows).
+    """
+    try:
+        dir_fd = os.open(str(path.parent), os.O_RDONLY)
+    except OSError:
+        return
+    try:
+        os.fsync(dir_fd)
+    except OSError:
+        pass
+    finally:
+        try:
+            os.close(dir_fd)
+        except OSError:
+            pass
 
 _LEGACY_DIAGNOSTICS_LOGGED = False
 _logger = logging.getLogger(__name__)
@@ -70,27 +94,41 @@ def save_artifact(path: str | Path, artifact: ModelArtifact) -> None:
     root.mkdir(parents=True, exist_ok=True)
     arrays_final = root / "arrays.npz"
     metadata_final = root / "metadata.json"
-    arrays_tmp = root / "arrays.tmp.npz"
-    metadata_tmp = root / "metadata.json.tmp"
+    # Per-process unique temp names so two concurrent save_artifact() calls
+    # targeting the same output dir cannot clobber each other's staging
+    # files mid-write. The replace at the end is still atomic per file.
+    unique_tag = f"{os.getpid()}.{uuid.uuid4().hex}"
+    arrays_tmp = root / f"arrays.tmp.{unique_tag}.npz"
+    metadata_tmp = root / f"metadata.json.tmp.{unique_tag}"
 
     # Write arrays to a staging file and fsync before publishing either output,
     # so a crash between the two replaces cannot leave new arrays paired with
     # old metadata (or vice versa).
-    np.savez_compressed(
-        arrays_tmp,
-        means=artifact.means,
-        scales=artifact.scales,
-        alpha=artifact.alpha,
-        beta_reduced=artifact.beta_reduced,
-        beta_full=artifact.beta_full,
-        beta_variance=artifact.beta_variance,
-        tie_kept_indices=artifact.tie_map.kept_indices,
-        tie_original_to_reduced=artifact.tie_map.original_to_reduced,
-        prior_scales=artifact.prior_scales,
-        scale_model_coefficients=artifact.scale_model_coefficients,
-    )
-    with open(arrays_tmp, "rb") as arrays_handle:
-        os.fsync(arrays_handle.fileno())
+    try:
+        np.savez_compressed(
+            arrays_tmp,
+            means=artifact.means,
+            scales=artifact.scales,
+            alpha=artifact.alpha,
+            beta_reduced=artifact.beta_reduced,
+            beta_full=artifact.beta_full,
+            beta_variance=artifact.beta_variance,
+            tie_kept_indices=artifact.tie_map.kept_indices,
+            tie_original_to_reduced=artifact.tie_map.original_to_reduced,
+            prior_scales=artifact.prior_scales,
+            scale_model_coefficients=artifact.scale_model_coefficients,
+        )
+        # Reopen read-write so the fsync flushes dirty pages of THIS handle's
+        # cache (read-mode fsync on a fresh fd was a no-op in practice).
+        with open(arrays_tmp, "r+b") as arrays_handle:
+            os.fsync(arrays_handle.fileno())
+    except BaseException:
+        # Don't leak per-pid staging files when serialization fails.
+        try:
+            Path(arrays_tmp).unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise
 
     payload = {
         "config": _config_to_json(artifact.config),
@@ -166,10 +204,21 @@ def save_artifact(path: str | Path, artifact: ModelArtifact) -> None:
         ),
     }
     metadata_bytes = json.dumps(payload, indent=2).encode("utf-8")
-    with open(metadata_tmp, "wb") as metadata_handle:
-        metadata_handle.write(metadata_bytes)
-        metadata_handle.flush()
-        os.fsync(metadata_handle.fileno())
+    try:
+        with open(metadata_tmp, "wb") as metadata_handle:
+            metadata_handle.write(metadata_bytes)
+            metadata_handle.flush()
+            os.fsync(metadata_handle.fileno())
+    except BaseException:
+        try:
+            Path(metadata_tmp).unlink(missing_ok=True)
+        except OSError:
+            pass
+        try:
+            Path(arrays_tmp).unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise
 
     # Both staging files are durable on disk; publish via atomic per-file
     # replaces. A crash before the first replace leaves the prior pair intact.
@@ -178,6 +227,9 @@ def save_artifact(path: str | Path, artifact: ModelArtifact) -> None:
     # replace is treated as the commit point.
     os.replace(arrays_tmp, arrays_final)
     os.replace(metadata_tmp, metadata_final)
+    # fsync the directory so the rename itself is durable across a crash;
+    # without this the rename can be lost even though the files survive.
+    _fsync_parent_dir(arrays_final)
 
 
 def load_artifact(path: str | Path) -> ModelArtifact:

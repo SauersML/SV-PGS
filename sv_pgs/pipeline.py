@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import csv
 import json
+import os
 import time
+import uuid
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Iterable, Sequence
@@ -264,8 +266,24 @@ def run_training_pipeline(
 
     log("writing summary JSON...")
     summary_path = destination / "summary.json.gz"
-    with _open_text_file(summary_path, "wt") as handle:
-        handle.write(json.dumps(summary_payload, indent=2))
+    # Write to a per-process unique temp path then atomically replace, so a
+    # crash mid-write cannot leave a truncated summary.json.gz that future
+    # `_log_cached_test_evals_from_summary` calls would mis-parse, and so
+    # concurrent disease sweeps writing into sibling output dirs cannot
+    # clobber each other's staging file.
+    tmp_summary_path = summary_path.with_name(
+        f"{summary_path.name}.tmp.{os.getpid()}.{uuid.uuid4().hex}"
+    )
+    try:
+        with _open_text_file(tmp_summary_path, "wt") as handle:
+            handle.write(json.dumps(summary_payload, indent=2))
+        os.replace(tmp_summary_path, summary_path)
+    except BaseException:
+        try:
+            tmp_summary_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise
     log(f"=== TRAINING PIPELINE DONE ===  mem={mem()}")
     return PipelineOutputs(
         artifact_dir=artifact_dir,

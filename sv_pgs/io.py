@@ -9,6 +9,7 @@ import json
 import os
 import tempfile
 import time
+import uuid
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, BinaryIO, Iterator, Literal, Sequence, cast
@@ -1915,15 +1916,24 @@ def _load_plink_stats_from_cache(stats_path: Path) -> VariantStatistics | None:
 
 
 def _write_plink_stats_cache(stats_path: Path, variant_stats: VariantStatistics) -> None:
-    """Write atomically: build .tmp.npy then rename so interrupted runs
-    never leave a half-written file the next run would read as a cache
-    hit. The .tmp prefix sits BEFORE the .npy extension because np.save
-    auto-appends '.npy' to any path that doesn't already end in it.
+    """Write atomically: build a per-process .tmp.npy then rename so
+    interrupted runs (or concurrent disease sweeps racing on the same
+    cache key) never leave a half-written file the next run would read
+    as a cache hit. The .tmp infix sits BEFORE the .npy extension
+    because np.save auto-appends '.npy' to any path that doesn't already
+    end in it.
     """
     stats_path.parent.mkdir(parents=True, exist_ok=True)
-    tmp_path = stats_path.with_suffix(".tmp.npy")
-    _write_vcf_cache_stats(tmp_path, variant_stats)
-    tmp_path.replace(stats_path)
+    tmp_path = stats_path.with_suffix(f".tmp.{os.getpid()}.{uuid.uuid4().hex}.npy")
+    try:
+        _write_vcf_cache_stats(tmp_path, variant_stats)
+        tmp_path.replace(stats_path)
+    except BaseException:
+        try:
+            tmp_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise
 
 
 def _plink_int8_cache_path(
@@ -3908,10 +3918,23 @@ def _load_vcf_incremental(
 
 
 def _atomic_write_text(path: Path, text: str) -> None:
-    """Write text atomically via temp file + rename."""
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    tmp.write_text(text)
-    tmp.rename(path)
+    """Write text atomically via per-process temp file + rename.
+
+    Uses a per-process, per-call unique temp name so two concurrent writers
+    racing on the same `path` cannot truncate or overwrite each other's
+    staging files; the rename winner publishes a complete file. The loser
+    leaves its temp behind on the failure path, which is cleaned below.
+    """
+    tmp = path.with_suffix(path.suffix + f".tmp.{os.getpid()}.{uuid.uuid4().hex}")
+    try:
+        tmp.write_text(text)
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            tmp.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise
 
 
 def _save_vcf_to_cache(
