@@ -246,13 +246,15 @@ class TieMap:
             expanded_coefficients = np.zeros(self.original_to_reduced.shape[0], dtype=np.float32)
             if self.kept_indices.shape[0] != reduced_beta_array.shape[0]:
                 raise ValueError("reduced_beta must align with compact tie-map representatives.")
-            expanded_coefficients[np.asarray(self.kept_indices, dtype=np.int32)] = reduced_beta_array
+            # self.kept_indices is already int32 (dataclass invariant via callers);
+            # use it directly to avoid an unnecessary np.asarray copy.
+            expanded_coefficients[self.kept_indices] = reduced_beta_array
             return expanded_coefficients
         expanded_coefficients = np.zeros(self.original_to_reduced.shape[0], dtype=np.float32)
         for reduced_index, tie_group in enumerate(self.reduced_to_group):
             group_weight_vector = np.asarray(group_weights[reduced_index], dtype=np.float32)
             expanded_coefficients[tie_group.member_indices] = (
-                reduced_beta[reduced_index] * group_weight_vector * tie_group.signs
+                reduced_beta_array[reduced_index] * group_weight_vector * tie_group.signs
             )
         return expanded_coefficients
 

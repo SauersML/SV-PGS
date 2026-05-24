@@ -67,18 +67,26 @@ def anderson_step(
     prev_residuals = state.residuals
     prev_map_values = state.map_values
     num_columns = len(prev_residuals)
-    delta_residuals = np.empty((x_flat.size, num_columns), dtype=np.float64)
-    delta_map_values = np.empty((x_flat.size, num_columns), dtype=np.float64)
-    # newest column: residual - prev_residuals[0]
-    delta_residuals[:, 0] = residual - prev_residuals[0]
-    delta_map_values[:, 0] = t_flat - prev_map_values[0]
-    for column_index in range(1, num_columns):
-        delta_residuals[:, column_index] = (
-            prev_residuals[column_index - 1] - prev_residuals[column_index]
-        )
-        delta_map_values[:, column_index] = (
-            prev_map_values[column_index - 1] - prev_map_values[column_index]
-        )
+    # Build the difference matrices by stacking [current, *prev] and taking
+    # the per-row diff along the history axis. This replaces a Python loop
+    # over history depth with a single C-level np.diff.
+    if num_columns == 1:
+        delta_residuals = (residual - prev_residuals[0]).reshape(-1, 1)
+        delta_map_values = (t_flat - prev_map_values[0]).reshape(-1, 1)
+    else:
+        stacked_residuals = np.empty((x_flat.size, num_columns + 1), dtype=np.float64)
+        stacked_map_values = np.empty((x_flat.size, num_columns + 1), dtype=np.float64)
+        stacked_residuals[:, 0] = residual
+        stacked_map_values[:, 0] = t_flat
+        # np.column_stack would allocate twice; copy directly into the buffer.
+        for column_index, (prev_r, prev_t) in enumerate(
+            zip(prev_residuals, prev_map_values, strict=True), start=1
+        ):
+            stacked_residuals[:, column_index] = prev_r
+            stacked_map_values[:, column_index] = prev_t
+        # We want column k = stacked[:, k] - stacked[:, k+1] (negated np.diff).
+        delta_residuals = -np.diff(stacked_residuals, axis=1)
+        delta_map_values = -np.diff(stacked_map_values, axis=1)
 
     proposal = t_flat.copy()
     use_fallback = False

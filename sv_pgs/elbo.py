@@ -120,24 +120,28 @@ def compute_elbo(
     bvar_safe = np.maximum(beta_var, 1e-300)
 
     # ----- E_q[log p(β | τ²)] -----
+    # Combine beta^2 + beta_var without an intermediate, and divide once.
+    second_moments = np.square(beta)
+    second_moments += beta_var
     log_prior_beta = (
         -0.5 * p * _LOG_2PI
-        - 0.5 * np.sum(np.log(tau2_safe))
-        - 0.5 * np.sum((beta * beta + beta_var) / tau2_safe)
+        - 0.5 * float(np.sum(np.log(tau2_safe)))
+        - 0.5 * float(np.sum(second_moments / tau2_safe))
     )
 
     # ----- H[q(β)] -----
-    entropy_beta = 0.5 * np.sum(np.log(bvar_safe)) + 0.5 * p * _LOG_2PI_E
+    entropy_beta = 0.5 * float(np.sum(np.log(bvar_safe))) + 0.5 * p * _LOG_2PI_E
 
     # ----- E_q[log p(y | ·)] -----
     if trait_type == TraitType.QUANTITATIVE:
         sigma2 = float(sigma_error2)
+        sigma2_safe = max(sigma2, 1e-300)
         residual = y - eta
         # tr(X Σ_β Xᵀ) = Σ_j ‖X[:,j]‖² · Σ_β,jj
-        trace_term = float(np.sum(col_sq * beta_var))
+        trace_term = float(np.dot(col_sq, beta_var))
         expected_loglik = (
-            -0.5 * n * (_LOG_2PI + np.log(max(sigma2, 1e-300)))
-            - 0.5 / max(sigma2, 1e-300) * (float(residual @ residual) + trace_term)
+            -0.5 * n * (_LOG_2PI + np.log(sigma2_safe))
+            - 0.5 / sigma2_safe * (float(residual @ residual) + trace_term)
         )
     else:
         assert trait_type == TraitType.BINARY
@@ -153,11 +157,12 @@ def compute_elbo(
         # choice the (μ² + Var[η] − ξ²) term vanishes identically, leaving
         # log σ(ξ) + κ·μ − ξ/2. Using ξ = μ (i.e. ignoring Var_q[η]) would
         # yield a strictly looser bound whenever Var_q[η] > 0.
-        second_moment = mu * mu + pvar
-        xi = np.sqrt(np.maximum(second_moment, 0.0))
+        second_moment = np.square(mu)
+        second_moment += pvar
+        xi = np.sqrt(np.maximum(second_moment, 0.0, out=second_moment))
         kappa = y - 0.5
         expected_loglik = float(
-            np.sum(_log_sigmoid(xi) + kappa * mu - xi / 2.0)
+            np.sum(_log_sigmoid(xi) + kappa * mu - 0.5 * xi)
         )
 
     elbo = (

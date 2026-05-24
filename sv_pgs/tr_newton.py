@@ -158,15 +158,17 @@ def _steihaug_cg(
             tau = _to_boundary(p, d, radius)
             return p + tau * d, True
 
-        r_next = r + alpha_step * Hd
-        r_next_dot = float(r_next @ r_next)
+        # r_next = r + alpha_step * Hd (in-place via existing r buffer).
+        r += alpha_step * Hd
+        r_next_dot = float(r @ r)
         if np.sqrt(r_next_dot) <= tolerance:
             return p_next, False
 
         beta_cg = r_next_dot / r_dot_r
-        d = -r_next + beta_cg * d
+        # d := -r + beta_cg * d  (fused, in-place on d).
+        d *= beta_cg
+        d -= r
         p = p_next
-        r = r_next
         r_dot_r = r_next_dot
         if progress_interval > 0 and cg_iteration % progress_interval == 0:
             _LOG.info(
@@ -275,9 +277,9 @@ def trust_region_newton_logistic(
     def linear_predictor(beta_vec: F64Array, alpha_vec: F64Array) -> F64Array:
         eta: F64Array = offset.copy()
         if p_dim > 0:
-            eta = eta + design_mv(beta_vec)
+            eta += design_mv(beta_vec)
         if q_dim > 0:
-            eta = eta + W @ alpha_vec
+            eta += W @ alpha_vec
         return eta
 
     def negative_objective(eta: F64Array, beta_vec: F64Array) -> float:
@@ -660,14 +662,16 @@ def trust_region_newton_logistic_gpu(
             if vec_norm(p_next) >= radius_val:
                 tau = to_boundary(p_gpu, d_gpu, radius_val)
                 return p_gpu + tau * d_gpu, True
-            r_next = r_gpu + alpha_step * Hd
-            r_next_dot = float(cp.dot(r_next, r_next))
+            # r += alpha_step * Hd (in-place on owned r_gpu buffer).
+            r_gpu += alpha_step * Hd
+            r_next_dot = float(cp.dot(r_gpu, r_gpu))
             if np.sqrt(r_next_dot) <= tolerance:
                 return p_next, False
             beta_cg = r_next_dot / r_dot_r
-            d_gpu = -r_next + beta_cg * d_gpu
+            # d := -r + beta_cg * d  (fused in-place).
+            d_gpu *= beta_cg
+            d_gpu -= r_gpu
             p_gpu = p_next
-            r_gpu = r_next
             r_dot_r = r_next_dot
             if cg_progress_interval > 0 and cg_iteration % cg_progress_interval == 0:
                 _LOG.info(

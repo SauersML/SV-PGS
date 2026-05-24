@@ -155,16 +155,22 @@ def _compute_auc_safe(labels: NDArray, preds: NDArray) -> float | None:
     if n_pos == 0 or n_neg == 0:
         return None
 
+    # Vectorized tie-aware ranking. For each unique value, all positions
+    # sharing that value receive the average of their ordinal ranks. The
+    # nested Python while-loop becomes one np.unique + scatter.
     order = np.argsort(preds, kind="mergesort")
     sorted_preds = preds[order]
-    ranks = np.empty_like(preds, dtype=np.float64)
-    start = 0
-    while start < sorted_preds.size:
-        end = start + 1
-        while end < sorted_preds.size and sorted_preds[end] == sorted_preds[start]:
-            end += 1
-        ranks[order[start:end]] = 0.5 * (start + end - 1) + 1.0
-        start = end
+    n = sorted_preds.size
+    _unique_vals, group_starts, group_counts = np.unique(
+        sorted_preds, return_index=True, return_counts=True
+    )
+    # Average ordinal rank within each tie group: start (0-indexed) + (count-1)/2 + 1.
+    group_avg_ranks = group_starts.astype(np.float64) + 0.5 * (group_counts - 1) + 1.0
+    # Broadcast the group rank back to every position in the sorted order.
+    group_id_per_position = np.repeat(np.arange(group_starts.size), group_counts)
+    ranks_sorted = group_avg_ranks[group_id_per_position]
+    ranks = np.empty(n, dtype=np.float64)
+    ranks[order] = ranks_sorted
 
     positive_rank_sum = float(np.sum(ranks[labels == 1]))
     auc = (positive_rank_sum - n_pos * (n_pos + 1) * 0.5) / (n_pos * n_neg)
