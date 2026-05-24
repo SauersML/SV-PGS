@@ -131,6 +131,12 @@ _FIT_STAGE_CACHE_DIRNAME = ".sv_pgs_cache"
 _FIT_STAGE_CACHE_SUBDIR = "fit_stage"
 _FIT_STAGE_CACHE_VERSION = 4
 _FIT_CHECKPOINT_VERSION = 1
+# Refuse to silently fall back to mmap streaming for binary TR-Newton fits when
+# no GPU/RAM/local int8 cache is available. The streaming path is catastrophically
+# slow inside Newton-CG and was responsible for the overfit run that motivated
+# this guard. Flip to False (or set config.allow_mmap_streaming_for_binary=True)
+# to override.
+_REFUSE_BINARY_TR_NEWTON_NO_CACHE = True
 _REGISTERED_FIT_CHECKPOINT_PATHS: dict[int, Path] = {}
 
 
@@ -598,6 +604,20 @@ def _save_variational_checkpoint(
     cache_paths: _FitStageCachePaths,
     checkpoint: VariationalFitCheckpoint,
 ) -> None:
+    # Refuse to persist a no-progress checkpoint (see _save_fit_checkpoint
+    # for rationale): an iter=0 file has nothing to resume from and risks
+    # poisoning a subsequent run with a zero-beta "resume" state.
+    try:
+        completed_iterations = int(checkpoint.completed_iterations)
+    except (TypeError, ValueError):
+        completed_iterations = 0
+    if completed_iterations <= 0:
+        log(
+            "variational checkpoint skipped: "
+            + f"{cache_paths.cache_dir.name}/{cache_paths.key}.em.pkl "
+            + f"(completed_iterations={completed_iterations}; nothing to resume)"
+        )
+        return
     checkpoint_tmp = cache_paths.cache_dir / f"{cache_paths.key}.em.tmp.pkl"
     try:
         cache_paths.cache_dir.mkdir(parents=True, exist_ok=True)
@@ -625,6 +645,14 @@ def _try_load_variational_checkpoint(
             checkpoint = pickle.load(handle)
         if not isinstance(checkpoint, VariationalFitCheckpoint):
             raise ValueError("variational checkpoint has unexpected type.")
+        if int(getattr(checkpoint, "completed_iterations", 0)) <= 0:
+            log(
+                "variational checkpoint ignored: stale iter=0 at "
+                + f"{cache_paths.cache_dir.name}/{cache_paths.key}.em.pkl; "
+                + "treating as absent and starting fresh"
+            )
+            _clear_variational_checkpoint(cache_paths)
+            return None
         log(
             "variational checkpoint restored: "
             + f"{cache_paths.cache_dir.name}/{cache_paths.key}.em.pkl "
@@ -716,6 +744,20 @@ def _save_fit_checkpoint(
     *,
     config_hash: str,
 ) -> None:
+    # Refuse to persist a no-progress checkpoint: an iter=0 file has nothing
+    # to resume from and risks poisoning a subsequent run with a zero-beta
+    # "resume" state. See _save_variational_checkpoint for the same guard.
+    try:
+        completed_iterations = int(checkpoint.completed_iterations)
+    except (TypeError, ValueError):
+        completed_iterations = 0
+    if completed_iterations <= 0:
+        log(
+            "fit checkpoint skipped: "
+            + f"{checkpoint_path} "
+            + f"(completed_iterations={completed_iterations}; nothing to resume)"
+        )
+        return
     checkpoint_tmp = _fit_checkpoint_tmp_path(checkpoint_path)
     try:
         checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
@@ -757,10 +799,35 @@ def _try_load_fit_checkpoint(
             if stored_hash != config_hash:
                 log(f"fit checkpoint ignored: config hash mismatch at {checkpoint_path}")
                 return None
-            checkpoint_bytes = np.asarray(payload["checkpoint_pickle"], dtype=np.uint8).tobytes()
+            # Cheap pre-flight: if the file records iter=0 there is nothing
+            # to resume from. Treat it as absent and clear it so we start
+            # fresh rather than replaying a zero-beta "resume" state.
+            try:
+                stored_iter = int(np.asarray(payload["iter"]).reshape(-1)[0])
+            except (KeyError, ValueError, IndexError):
+                stored_iter = 0
+            stale_iter_zero = stored_iter <= 0
+            if stale_iter_zero:
+                checkpoint_bytes = None
+            else:
+                checkpoint_bytes = np.asarray(payload["checkpoint_pickle"], dtype=np.uint8).tobytes()
+        if stale_iter_zero:
+            log(
+                "fit checkpoint ignored: stale iter=0 at "
+                + f"{checkpoint_path}; treating as absent and starting fresh"
+            )
+            _clear_fit_checkpoint(checkpoint_path)
+            return None
         checkpoint = pickle.loads(checkpoint_bytes)
         if not isinstance(checkpoint, VariationalFitCheckpoint):
             raise ValueError("fit checkpoint has unexpected type.")
+        if int(getattr(checkpoint, "completed_iterations", 0)) <= 0:
+            log(
+                "fit checkpoint ignored: stale iter=0 at "
+                + f"{checkpoint_path}; treating as absent and starting fresh"
+            )
+            _clear_fit_checkpoint(checkpoint_path)
+            return None
         log(
             "fit checkpoint restored: "
             + f"{checkpoint_path} (completed_iterations={checkpoint.completed_iterations})"
@@ -1117,6 +1184,15 @@ class BayesianPGS:
                 if local_cache:
                     log(f"  local tmpdir cache ready  mem={mem()}")
             if not local_cache:
+                if (
+                    _REFUSE_BINARY_TR_NEWTON_NO_CACHE
+                    and self.config.trait_type == TraitType.BINARY
+                    and not bool(getattr(self.config, "allow_mmap_streaming_for_binary", False))
+                ):
+                    raise RuntimeError(
+                        "No GPU/RAM/local int8 cache available for binary TR-Newton fit. "
+                        "Free disk or reduce block size; refusing full mmap streaming inside Newton-CG."
+                    )
                 log(f"  no materialization possible — streaming from mmap  mem={mem()}")
         if reduced_validation is not None:
             validation_genotype_matrix = reduced_validation[0]
@@ -1200,12 +1276,16 @@ class BayesianPGS:
         if durable_fit_checkpoint_path is not None and reduced_validation is not None:
             if validation_is_holdout_only:
                 log(
-                    "  fit checkpoint enabled; held-out validation monitoring is disabled during EM "
-                    "so checkpoint/resume remains active"
+                    "  fit checkpoint enabled; held-out validation is used for monitoring only "
+                    "(not model selection) so checkpoint/resume remains active"
                 )
+                # Decouple monitoring from model selection: keep the per-epoch
+                # callback so training_history.tsv receives holdout metrics each
+                # epoch, but clear em_validation_data so EM does not use holdout
+                # for best-epoch selection.
                 em_validation_data = None
-                em_per_epoch_eval_callback = None
-                em_validation_is_holdout_only = False
+                em_per_epoch_eval_callback = per_epoch_eval_callback
+                em_validation_is_holdout_only = True
             else:
                 log("  fit checkpoint disabled because validation data drives EM model selection")
                 durable_fit_checkpoint_path = None
@@ -1231,6 +1311,10 @@ class BayesianPGS:
             cache_paths_for_callback = fit_stage_cache_paths
             checkpoint_path_for_callback = durable_fit_checkpoint_path
             checkpoint_hash_for_callback = fit_checkpoint_config_hash
+            # Bind a non-None alias for the closure: `reduced_genotypes` is later
+            # reassigned to None for GC, but at this point it is guaranteed
+            # populated (validated by the early-exit covariate-only branch above).
+            reduced_genotypes_for_callback: StandardizedGenotypeMatrix = reduced_genotypes
 
             def _checkpoint_callback(checkpoint: VariationalFitCheckpoint) -> None:
                 if checkpoint_path_for_callback is not None and checkpoint_hash_for_callback is not None:
@@ -1253,7 +1337,7 @@ class BayesianPGS:
                 if not basis_path.exists():
                     _save_sample_space_basis_cache(
                         cache_paths=cache_paths_for_callback,
-                        genotype_matrix=reduced_genotypes,
+                        genotype_matrix=reduced_genotypes_for_callback,
                         rank=int(self.config.sample_space_preconditioner_rank),
                         random_seed=int(self.config.random_seed),
                     )
@@ -1479,7 +1563,16 @@ class BayesianPGS:
                 validation_history=artifact.validation_history,
                 member_prior_variances=artifact.prior_scales,
                 linear_predictor=None,
-                selected_iteration_count=len(artifact.objective_history),
+                selected_iteration_count=(
+                    artifact.selected_iteration_count
+                    if artifact.selected_iteration_count
+                    else len(artifact.objective_history)
+                ),
+                converged=artifact.converged,
+                final_parameter_change=artifact.final_parameter_change,
+                final_predictor_change=artifact.final_predictor_change,
+                final_objective_change=artifact.final_objective_change,
+                final_hyperparameter_change=artifact.final_hyperparameter_change,
             ),
             full_coefficients=artifact.beta_full,
             nonzero_coefficient_indices=nonzero_coefficient_indices,

@@ -149,6 +149,7 @@ def run_training_pipeline(
         log(f"model fitted  mem={mem()}")
 
         log("exporting model artifacts...")
+        _guard_nonconverged_export(model, config)
         model.export(artifact_dir, fit_fingerprint=fit_fingerprint)
         log(f"artifacts written to {artifact_dir}")
 
@@ -180,6 +181,7 @@ def run_training_pipeline(
             predictions_path=predictions_path,
             dataset=dataset,
             model=model,
+            is_training_dataset=True,
         )
     )
     fitted_state = model.state
@@ -234,6 +236,7 @@ def run_training_pipeline(
             predictions_path=test_predictions_path,
             dataset=test_dataset,
             model=model,
+            is_training_dataset=False,
         )
         # _write_predictions_and_summary prefixes metrics with "training_" since
         # that's the only call site it knew about historically; relabel them
@@ -272,14 +275,46 @@ def run_training_pipeline(
     )
 
 
+def _guard_nonconverged_export(model: BayesianPGS, config: ModelConfig) -> None:
+    fitted_state = model.state
+    if fitted_state is None:
+        return
+    fit_result = fitted_state.fit_result
+    converged = bool(getattr(fit_result, "converged", False))
+    if converged:
+        return
+    if getattr(config, "allow_nonconverged_export", False):
+        log("WARNING: exporting non-converged fit (allow_nonconverged_export=True).")
+        return
+    diagnostics = {
+        "selected_iteration_count": getattr(fit_result, "selected_iteration_count", None),
+        "final_parameter_change": getattr(fit_result, "final_parameter_change", None),
+        "final_predictor_change": getattr(fit_result, "final_predictor_change", None),
+        "final_objective_change": getattr(fit_result, "final_objective_change", None),
+        "final_hyperparameter_change": getattr(fit_result, "final_hyperparameter_change", None),
+    }
+    raise RuntimeError(
+        "Fit did not converge; refusing final artifact export. "
+        f"diagnostics={diagnostics}. "
+        "Set config.allow_nonconverged_export=True to override."
+    )
+
+
 def _write_predictions_and_summary(
     predictions_path: Path,
     dataset: LoadedDataset,
     model: BayesianPGS,
+    is_training_dataset: bool = False,
 ) -> dict[str, Any]:
     log(f"computing predictions for {len(dataset.sample_ids)} samples, trait={model.config.trait_type.value}  mem={mem()}")
-    training_components_getter = getattr(model, "training_decision_components", None)
-    cached_components = None if training_components_getter is None else training_components_getter()
+    # Only reuse the model's cached training decision components when the
+    # caller explicitly asserts that `dataset` IS the training dataset.
+    # Matching shapes alone is not sufficient: a held-out cohort with the
+    # same sample count would silently borrow training scores otherwise.
+    cached_components = None
+    if is_training_dataset:
+        training_components_getter = getattr(model, "training_decision_components", None)
+        cached_components = None if training_components_getter is None else training_components_getter()
     if (
         cached_components is not None
         and cached_components[0].shape == (len(dataset.sample_ids),)

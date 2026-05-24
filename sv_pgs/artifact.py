@@ -1,12 +1,16 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
 
 import numpy as np
+
+_LEGACY_DIAGNOSTICS_LOGGED = False
+_logger = logging.getLogger(__name__)
 
 from sv_pgs._typing import F32Array
 from sv_pgs.config import ModelConfig, TraitType, VariantClass
@@ -38,6 +42,15 @@ class ModelArtifact:
     # auto-reuse paths must treat that as a miss. Populated via
     # ``BayesianPGS.export(..., fit_fingerprint=...)``.
     fit_fingerprint: str = ""
+    # Convergence diagnostics persisted from the variational fit. Older
+    # artifacts predate these fields; load_artifact() back-fills them with
+    # defaults (converged=False, others None) and emits a one-shot warning.
+    converged: bool = False
+    selected_iteration_count: int = 0
+    final_parameter_change: float | None = None
+    final_predictor_change: float | None = None
+    final_objective_change: float | None = None
+    final_hyperparameter_change: float | None = None
 
     def __post_init__(self) -> None:
         self.records = normalize_variant_records(self.records)
@@ -135,6 +148,22 @@ def save_artifact(path: str | Path, artifact: ModelArtifact) -> None:
         "objective_history": artifact.objective_history,
         "validation_history": artifact.validation_history,
         "fit_fingerprint": artifact.fit_fingerprint,
+        "converged": bool(artifact.converged),
+        "selected_iteration_count": int(artifact.selected_iteration_count),
+        "final_parameter_change": (
+            None if artifact.final_parameter_change is None else float(artifact.final_parameter_change)
+        ),
+        "final_predictor_change": (
+            None if artifact.final_predictor_change is None else float(artifact.final_predictor_change)
+        ),
+        "final_objective_change": (
+            None if artifact.final_objective_change is None else float(artifact.final_objective_change)
+        ),
+        "final_hyperparameter_change": (
+            None
+            if artifact.final_hyperparameter_change is None
+            else float(artifact.final_hyperparameter_change)
+        ),
     }
     metadata_bytes = json.dumps(payload, indent=2).encode("utf-8")
     with open(metadata_tmp, "wb") as metadata_handle:
@@ -194,7 +223,31 @@ def load_artifact(path: str | Path) -> ModelArtifact:
         objective_history=[float(value) for value in payload["objective_history"]],
         validation_history=[float(value) for value in payload["validation_history"]],
         fit_fingerprint=str(payload.get("fit_fingerprint", "")),
+        **_load_diagnostics(payload),
     )
+
+
+def _load_diagnostics(payload: dict[str, Any]) -> dict[str, Any]:
+    global _LEGACY_DIAGNOSTICS_LOGGED
+    if "converged" not in payload and not _LEGACY_DIAGNOSTICS_LOGGED:
+        _logger.warning(
+            "Loading legacy artifact without convergence diagnostics; "
+            "defaulting converged=False and final_*_change=None."
+        )
+        _LEGACY_DIAGNOSTICS_LOGGED = True
+
+    def _opt_float(key: str) -> float | None:
+        value = payload.get(key)
+        return None if value is None else float(value)
+
+    return {
+        "converged": bool(payload.get("converged", False)),
+        "selected_iteration_count": int(payload.get("selected_iteration_count", 0)),
+        "final_parameter_change": _opt_float("final_parameter_change"),
+        "final_predictor_change": _opt_float("final_predictor_change"),
+        "final_objective_change": _opt_float("final_objective_change"),
+        "final_hyperparameter_change": _opt_float("final_hyperparameter_change"),
+    }
 
 
 def try_load_artifact_if_fingerprint_matches(

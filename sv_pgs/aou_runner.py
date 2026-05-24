@@ -691,8 +691,14 @@ AOU_TEST_FRACTION = 0.2
 AOU_MARGINAL_SCREEN_MIN_ABS_Z = 1.5
 AOU_BETA_VARIANCE_UPDATE_INTERVAL = 0
 AOU_FINAL_POSTERIOR_DIAGNOSTICS = False
-AOU_VALIDATE_FIRST_ITERATION = False
-AOU_SAMPLE_SPACE_PRECONDITIONER_RANK = 0
+AOU_VALIDATE_FIRST_ITERATION = True
+# TODO: tune at runtime based on cohort size / GPU budget. Use a small
+# non-zero default so the sample-space preconditioner is active and the
+# first validation iteration produces useful early signal.
+AOU_SAMPLE_SPACE_PRECONDITIONER_RANK = 32
+# Per-epoch monitoring cadence (holdout metrics only; not used for model
+# selection). Default 1 so training_history.tsv gets a row every epoch.
+AOU_VALIDATION_INTERVAL = 1
 
 
 @dataclass(slots=True)
@@ -726,6 +732,7 @@ def _start_plink_cache_warmup(
 
     import sv_pgs.io as _io
     from sv_pgs.genotype import PlinkRawGenotypeMatrix
+    from sv_pgs.io import VariantStatistics
 
     source_sample_ids: list[list[str]] = []
     plink_metadata = None
@@ -776,7 +783,7 @@ def _start_plink_cache_warmup(
     )
     original_compute = _io.compute_plink_variant_statistics_cached
 
-    def _compute_plink_cache() -> tuple[Any, Path | None]:
+    def _compute_plink_cache() -> tuple[VariantStatistics, Path | None]:
         raw = PlinkRawGenotypeMatrix(
             bed_path=plink_path,
             sample_indices=plink_sample_indices,
@@ -800,11 +807,11 @@ def _start_plink_cache_warmup(
     warmup_config = config
 
     def _compute_or_wait(
-        raw_genotypes: Any,
+        raw_genotypes: PlinkRawGenotypeMatrix,
         bed_path: Path,
         sample_indices: NDArray,
         config: ModelConfig,
-    ) -> tuple[Any, Path | None]:
+    ) -> tuple[VariantStatistics, Path | None]:
         if (
             Path(bed_path).resolve() == plink_path.resolve()
             and float(config.minimum_scale) == float(warmup_config.minimum_scale)
@@ -1105,7 +1112,11 @@ def run_all_of_us(
     final_posterior_diagnostics = AOU_FINAL_POSTERIOR_DIAGNOSTICS
     validate_first_iteration = AOU_VALIDATE_FIRST_ITERATION
     sample_space_preconditioner_rank = AOU_SAMPLE_SPACE_PRECONDITIONER_RANK
-    validation_interval = max_outer_iterations
+    # Holdout monitoring cadence; users override via the module constant.
+    # ModelConfig itself has no `aou_validation_interval` field so we fall back
+    # to the AOU_VALIDATION_INTERVAL module default. Default produces a row
+    # every epoch in training_history.tsv (monitoring only, not model selection).
+    validation_interval = max(1, int(AOU_VALIDATION_INTERVAL))
     variants = _normalize_variants_choice(variants)
     chromosomes = _validate_aou_chromosomes(chromosomes)
 

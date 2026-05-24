@@ -23,6 +23,15 @@ _heartbeat_last_wall: float | None = None
 _heartbeat_last_cpu: float | None = None
 _heartbeat_last_nvidia_smi: float = 0.0
 _heartbeat_last_nvidia_smi_value: str = "nvidia-smi=not-yet-sampled"
+# Exponential-backoff state for nvidia-smi probes. A wedged driver costs us a
+# 2s subprocess timeout per probe; backing off avoids spending 57 such stalls
+# over an 8h run when the driver is unresponsive.
+_NVIDIA_SMI_FAIL_STREAK: int = 0
+_NVIDIA_SMI_NEXT_PROBE_AT_MONOTONIC: float = 0.0
+_NVIDIA_SMI_BASE_INTERVAL_S: float = 30.0
+_NVIDIA_SMI_MAX_INTERVAL_S: float = 900.0
+# Lazily initialized from SV_PGS_DISABLE_NVIDIA_SMI_HEARTBEAT on first call.
+_NVIDIA_SMI_DISABLED: bool | None = None
 
 
 def set_log_file(path: str | os.PathLike[str]) -> None:
@@ -234,12 +243,68 @@ def _cupy_mempool_snapshot() -> str:
         return f"cupy_mempool_error={error}"
 
 
+def _pynvml_snapshot() -> str | None:
+    """Try NVML bindings; return None if pynvml is unavailable/unusable."""
+    try:
+        import pynvml  # type: ignore[import-not-found]
+    except ImportError:
+        return None
+    try:
+        pynvml.nvmlInit()
+        try:
+            count = pynvml.nvmlDeviceGetCount()
+            if count == 0:
+                return "nvidia-smi=no_visible_gpus"
+            parts: list[str] = []
+            for idx in range(count):
+                handle = pynvml.nvmlDeviceGetHandleByIndex(idx)
+                name = pynvml.nvmlDeviceGetName(handle)
+                if isinstance(name, bytes):
+                    name = name.decode("utf-8", "replace")
+                mem_info = pynvml.nvmlDeviceGetMemoryInfo(handle)
+                util = pynvml.nvmlDeviceGetUtilizationRates(handle)
+                parts.append(
+                    f"{idx}, {name}, mem_used={_format_bytes(mem_info.used)}, "
+                    f"mem_total={_format_bytes(mem_info.total)}, gpu_util={util.gpu}%"
+                )
+            return " | ".join(parts)
+        finally:
+            try:
+                pynvml.nvmlShutdown()
+            except Exception:  # noqa: BLE001
+                pass
+    except Exception as error:  # noqa: BLE001 -- pynvml raises its own NVMLError
+        return f"pynvml_error={error}"
+
+
 def _maybe_refresh_nvidia_smi(now: float) -> str:
-    """Sample nvidia-smi at most every 30 seconds (shelling out is expensive)."""
+    """Sample GPU at most every 30s; back off exponentially on failure.
+
+    Honors SV_PGS_DISABLE_NVIDIA_SMI_HEARTBEAT=1 to skip the probe entirely.
+    Prefers pynvml (in-process) over the nvidia-smi subprocess when available.
+    """
     global _heartbeat_last_nvidia_smi, _heartbeat_last_nvidia_smi_value
-    if now - _heartbeat_last_nvidia_smi > 30.0:
-        _heartbeat_last_nvidia_smi_value = nvidia_smi_snapshot()
-        _heartbeat_last_nvidia_smi = now
+    global _heartbeat_nvidia_smi_failures
+    if os.environ.get("SV_PGS_DISABLE_NVIDIA_SMI_HEARTBEAT") == "1":
+        return "nvidia-smi=disabled (SV_PGS_DISABLE_NVIDIA_SMI_HEARTBEAT=1)"
+    base_interval = 30.0
+    backoff = min(base_interval * (2 ** _heartbeat_nvidia_smi_failures), 900.0)
+    if now - _heartbeat_last_nvidia_smi <= backoff:
+        return _heartbeat_last_nvidia_smi_value
+    value = _pynvml_snapshot()
+    if value is None:
+        value = nvidia_smi_snapshot()
+    failed = (
+        "error" in value
+        or value.startswith("nvidia-smi_rc=")
+        or value == "nvidia-smi=unavailable"
+    )
+    if failed:
+        _heartbeat_nvidia_smi_failures = min(_heartbeat_nvidia_smi_failures + 1, 5)
+    else:
+        _heartbeat_nvidia_smi_failures = 0
+    _heartbeat_last_nvidia_smi_value = value
+    _heartbeat_last_nvidia_smi = now
     return _heartbeat_last_nvidia_smi_value
 
 
@@ -332,16 +397,5 @@ def start_heartbeat(interval_seconds: float = 60.0) -> None:
     _heartbeat_thread = thread
     thread.start()
     log(f"heartbeat sampler started (every {interval_seconds:.0f}s)")
-
-
-def stop_heartbeat() -> None:
-    """Stop the background heartbeat thread (best-effort)."""
-    global _heartbeat_thread, _heartbeat_stop
-    if _heartbeat_stop is not None:
-        _heartbeat_stop.set()
-    if _heartbeat_thread is not None:
-        _heartbeat_thread.join(timeout=2.0)
-    _heartbeat_thread = None
-    _heartbeat_stop = None
 
 

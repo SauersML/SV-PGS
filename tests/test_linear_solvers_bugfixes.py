@@ -97,6 +97,48 @@ def test_logdet_eigenvalue_filtering_removes_clipping_bias():
     assert logdet_estimate > true_positive_logdet - 15.0
 
 
+def test_logdet_spd_mode_keeps_small_real_eigenvalues():
+    # Strict-SPD operator with one genuinely small eigenvalue (1e-13)
+    # and one O(1) eigenvalue.  In rank-deficient mode the small one
+    # would be dropped as numerical noise and the estimate would be ~0;
+    # in SPD mode it must contribute log(1e-13) ~ -29.93 nats.
+    eigenvalues = np.array([1e-13, 1.0], dtype=np.float64)
+    spd_matrix = np.diag(eigenvalues)
+    operator = _dense_operator_from_matrix(spd_matrix)
+    true_logdet = float(np.sum(np.log(eigenvalues)))  # ~ -29.93
+
+    # Rank-deficient mode (default) drops the small eigenvalue.
+    biased_estimate = stochastic_logdet(
+        operator=operator,
+        dimension=2,
+        probe_count=16,
+        lanczos_steps=2,
+        random_seed=3,
+        minimum_probe_count=16,
+        relative_error_tolerance=0.0,
+        absolute_error_tolerance=0.0,
+    )
+    assert np.isfinite(biased_estimate)
+    # The dropped small eigenvalue means the estimate is far from truth.
+    assert abs(biased_estimate - true_logdet) > 20.0
+
+    # SPD mode must pick up the small eigenvalue's contribution.
+    spd_estimate = stochastic_logdet(
+        operator=operator,
+        dimension=2,
+        probe_count=16,
+        lanczos_steps=2,
+        random_seed=3,
+        minimum_probe_count=16,
+        relative_error_tolerance=0.0,
+        absolute_error_tolerance=0.0,
+        treat_as_rank_deficient=False,
+    )
+    assert np.isfinite(spd_estimate)
+    # Should land within a few nats of the true logdet ~ -29.93.
+    assert abs(spd_estimate - true_logdet) < 3.0
+
+
 def test_cg_with_tiny_rhs_converges_with_relative_tolerance():
     # Construct a well-conditioned SPD matrix.
     dimension = 32

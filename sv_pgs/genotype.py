@@ -9,6 +9,8 @@ import os
 from pathlib import Path
 import shutil
 import tempfile
+import threading
+import time as _time_module
 from typing import Any, Iterator, Protocol, Sequence, TypeGuard, cast
 
 import sv_pgs._jax as _jax_side_effects  # side-effect: configures JAX/XLA env
@@ -41,6 +43,8 @@ GPU_STANDARDIZED_DYNAMIC_RESERVE_BYTES = 512_000_000
 PLINK_INT8_TARGET_BATCH_BYTES = 1_024_000_000
 PLINK_INT8_MAX_PREFETCH_DEPTH = 1
 PLINK_BED_READER_NUM_THREADS = max(1, os.cpu_count() or 1)
+GPU_INT8_MATMUL_STAGING_ROWS = 1024
+GPU_FP16_RESIDENT_CACHE_ENABLED = True
 
 # If the reduced genotype matrix (after tie-group dedup) is smaller than 4 GB,
 # cache it in RAM.  This avoids re-reading from disk on every EM iteration
@@ -51,6 +55,36 @@ HYBRID_SPARSE_MIN_VARIANT_COUNT = 64
 REDUCED_INT8_CACHE_FREE_SPACE_RESERVE_BYTES = 64 * 1024 * 1024
 INT8_ONE_SHOT_GPU_BUDGET_FRACTION = 0.90
 ROW_SUBSET_ONE_SHOT_MAX_SAMPLE_RATIO = 8.0
+
+# Throttle for the per-batch "int8 batch:" log line. Each entry maps a
+# (matrix_id, cache_key, batch_size) tuple to the monotonic time it last
+# emitted; we re-log at most once per _INT8_BATCH_LOG_MIN_INTERVAL_SEC per key.
+_INT8_BATCH_LOG_MIN_INTERVAL_SEC = 30.0
+_int8_batch_log_last: dict[tuple[int, Any, int], float] = {}
+_int8_batch_log_lock = threading.Lock()
+
+
+def _log_int8_batch_throttled(
+    *,
+    matrix_id: int,
+    cache_key: Any,
+    batch_size: int,
+    sample_count: int,
+    batch_mb: float,
+    n_batches: int,
+) -> None:
+    """Emit the per-batch int8 log line at most once per key per interval."""
+    key = (matrix_id, cache_key, batch_size)
+    now = _time_module.monotonic()
+    with _int8_batch_log_lock:
+        last = _int8_batch_log_last.get(key)
+        if last is not None and (now - last) < _INT8_BATCH_LOG_MIN_INTERVAL_SEC:
+            return
+        _int8_batch_log_last[key] = now
+    log(
+        f"    int8 batch: {batch_size} variants x {sample_count} samples = "
+        f"{batch_mb:.0f} MB/batch, {n_batches} batches  mem={mem()}"
+    )
 
 
 def _madvise_willneed_array(array: NDArray) -> None:
@@ -580,7 +614,14 @@ class PlinkRawGenotypeMatrix(RawGenotypeMatrix):
         total = resolved_indices.shape[0]
         batch_mb = self.shape[0] * safe_batch_size / (1024 * 1024)
         n_batches = (total + safe_batch_size - 1) // safe_batch_size
-        log(f"    int8 batch: {safe_batch_size} variants x {self.shape[0]} samples = {batch_mb:.0f} MB/batch, {n_batches} batches  mem={mem()}")
+        _log_int8_batch_throttled(
+            matrix_id=id(self),
+            cache_key=str(self.bed_path),
+            batch_size=int(safe_batch_size),
+            sample_count=int(self.shape[0]),
+            batch_mb=batch_mb,
+            n_batches=int(n_batches),
+        )
 
         if total <= safe_batch_size:
             values = self._read_batch_i8(reader, resolved_indices, num_threads=num_threads)
@@ -1149,6 +1190,10 @@ def require_gpu() -> Any:
             "(or cupy-cuda11x for CUDA 11). "
             "Verify: python -c 'import cupy; print(cupy.cuda.runtime.memGetInfo())'"
         )
+    # Reclaim any pool blocks before sampling free memory so the warning
+    # below reflects real availability rather than blocks the CuPy pool
+    # is merely caching.
+    _release_cupy_cached_memory(cupy)
     free_bytes, total_bytes = cupy.cuda.runtime.memGetInfo()
     log(f"  GPU verified: {total_bytes / 1e9:.1f} GB total, {free_bytes / 1e9:.1f} GB free")
     # If another process is pinning most of the device, the training pipeline
@@ -1463,11 +1508,16 @@ def _iter_prefetched_raw_batches(
             batch_width = values.shape[1]
             local_stop = local_start + batch_width
             yield slice(local_start, local_stop), values
+            del values
             local_start = local_stop
     finally:
+        # wait=True so worker threads finish releasing the large decoded arrays
+        # they hold before this generator returns; wait=False was leaking
+        # workers across iterations and pinning their per-thread allocations.
         for pending in futures:
             pending.cancel()
-        executor.shutdown(wait=False)
+        futures.clear()
+        executor.shutdown(wait=True, cancel_futures=True)
 
 
 def _gpu_streaming_batch_size(
@@ -1577,8 +1627,26 @@ def _gpu_total_bytes(cupy: Any) -> int:
         return 0
 
 
+def _gpu_effective_free_bytes(cupy: Any) -> int:
+    """Free bytes allocatable by this process: CUDA-free plus CuPy-pool-free blocks.
+
+    ``cupy.cuda.runtime.memGetInfo()`` only sees driver-free memory and does
+    NOT count blocks the CuPy memory pool is holding as cached/free. After
+    dropping a large ``_cupy_cache``, the pool retains those blocks and
+    ``memGetInfo`` can falsely report the GPU as nearly full, causing
+    sizing decisions to reject feasible allocations. Sum both.
+    """
+    free = _gpu_free_bytes(cupy)
+    try:
+        pool = cupy.get_default_memory_pool()
+        pool_free = int(pool.free_bytes())
+    except (AttributeError, OSError, RuntimeError):
+        pool_free = 0
+    return max(0, free + pool_free)
+
+
 def _gpu_dynamic_standardized_target_batch_bytes(cupy: Any, *, static_target_batch_bytes: int) -> int:
-    free_bytes = _gpu_free_bytes(cupy)
+    free_bytes = _gpu_effective_free_bytes(cupy)
     if free_bytes <= 0:
         return int(static_target_batch_bytes)
     usable_bytes = max(
@@ -1661,11 +1729,16 @@ def _gpu_materialization_budget_bytes(cupy: Any) -> int:
     reserved = min(_GPU_RESERVED_OVERHEAD_BYTES, int(total * (1.0 - _GPU_BUDGET_TOTAL_FRACTION_CEILING)))
     budget = max(total - _GPU_RESERVED_OVERHEAD_BYTES, int(total * 0.5))
     budget = min(budget, int(total * _GPU_BUDGET_TOTAL_FRACTION_CEILING), total - reserved)
-    # Cap by actual *free* memory so co-tenant processes holding the bulk of
-    # the device don't lead us to size allocations as if the GPU were empty.
-    # Without this, runtime policy reports e.g. 14.1 GB on a 16 GB T4 even
-    # when only ~200 MB is free, then downstream allocations instantly OOM.
-    free = _gpu_free_bytes(cupy)
+    # Cap by actual *effective free* memory (CUDA-free + pool-free, after pool
+    # reclaim) so co-tenant processes holding the bulk of the device don't
+    # lead us to size allocations as if the GPU were empty, while still
+    # crediting blocks that CuPy's pool is caching as available.
+    try:
+        cupy.cuda.Device().synchronize()
+    except (AttributeError, OSError, RuntimeError):
+        pass
+    _release_cupy_cached_memory(cupy)
+    free = _gpu_effective_free_bytes(cupy)
     if free > 0:
         free_budget = max(free - _GPU_RESERVED_OVERHEAD_BYTES, int(free * 0.5))
         budget = min(budget, free_budget)
@@ -2585,12 +2658,49 @@ class StandardizedGenotypeMatrix:
                 else self.dense_bytes()
             )
             budget_bytes = _gpu_materialization_budget_bytes(cupy)
-            if nbytes > budget_bytes:
+            if use_int8_gpu_cache:
+                # int8 caches are 1 byte/element; the conservative float32-oriented
+                # budget rejects feasible allocations (e.g. 4.6 GB cache on a 16 GB
+                # T4), forcing the slow mmap-streaming path. Free pool blocks and
+                # decide against actual free memory + a small workspace reserve;
+                # the surrounding try/except still catches OutOfMemoryError.
+                workspace_reserve = _int8_gpu_workspace_bytes()
+                _release_cupy_cached_memory(cupy)
+                free_after_release = _gpu_free_bytes(cupy)
                 log(
-                    f"    skipping GPU materialization: need {nbytes / 1e9:.1f} GB, "
-                    f"budget is {budget_bytes / 1e9:.1f} GB  mem={mem()}"
+                    f"    int8 GPU materialization attempt: nbytes={nbytes / 1e9:.2f} GB "
+                    f"free={free_after_release / 1e9:.2f} GB "
+                    f"workspace_reserve={workspace_reserve / 1e9:.2f} GB "
+                    f"budget={budget_bytes / 1e9:.2f} GB (advisory)  mem={mem()}"
                 )
-                return False
+                if free_after_release > 0 and nbytes + workspace_reserve > free_after_release:
+                    log(
+                        f"    skipping int8 GPU materialization: need {nbytes / 1e9:.2f} GB "
+                        f"+ {workspace_reserve / 1e9:.2f} GB workspace > "
+                        f"{free_after_release / 1e9:.2f} GB free  mem={mem()}"
+                    )
+                    return False
+            elif nbytes > budget_bytes:
+                log(
+                    f"    GPU materialization exceeds budget: need {nbytes / 1e9:.1f} GB, "
+                    f"budget is {budget_bytes / 1e9:.1f} GB (float32); reclaiming CuPy pool  mem={mem()}"
+                )
+                _release_cupy_cached_memory(cupy)
+                try:
+                    cupy.cuda.Device().synchronize()
+                except (AttributeError, OSError, RuntimeError):
+                    pass
+                budget_bytes = _gpu_materialization_budget_bytes(cupy)
+                if nbytes > budget_bytes:
+                    log(
+                        f"    GPU materialization still exceeds budget: need {nbytes / 1e9:.1f} GB, "
+                        f"budget is {budget_bytes / 1e9:.1f} GB; attempting upload anyway (OOM-driven)  mem={mem()}"
+                    )
+                else:
+                    log(
+                        f"    GPU materialization fits after CuPy pool reclaim "
+                        f"(budget={budget_bytes / 1e9:.1f} GB)  mem={mem()}"
+                    )
             if self._dense_cache is not None:
                 log(f"    uploading RAM-resident matrix to GPU ({nbytes / 1e9:.1f} GB)  mem={mem()}")
                 self._cupy_cache = cupy.asarray(self._dense_cache)
@@ -2737,8 +2847,11 @@ class StandardizedGenotypeMatrix:
             log(f"    CuPy GPU matrix ready ({_cupy_cache_nbytes(self._cupy_cache) / 1e9:.1f} GB)  mem={mem()}")
             return True
         except (MemoryError, OSError, RuntimeError) as exc:
-            log(f"    CuPy GPU upload failed ({exc})  mem={mem()}")
             self._cupy_cache = None
+            if not _is_cupy_out_of_memory(exc):
+                raise
+            _release_cupy_cached_memory(cupy)
+            log(f"    CuPy GPU upload failed ({exc})  mem={mem()}")
             return False
 
     def try_materialize_gpu_subset(
@@ -2825,9 +2938,12 @@ class StandardizedGenotypeMatrix:
             )
             return self._cupy_subset_cache
         except (MemoryError, OSError, RuntimeError) as exc:
-            log(f"    CuPy GPU subset upload failed ({exc})  mem={mem()}")
             self._cupy_subset_cache = None
             self._cupy_subset_cache_local_indices = None
+            if not _is_cupy_out_of_memory(exc):
+                raise
+            _release_cupy_cached_memory(cupy)
+            log(f"    CuPy GPU subset upload failed ({exc})  mem={mem()}")
             return None
 
     def try_materialize(self) -> bool:

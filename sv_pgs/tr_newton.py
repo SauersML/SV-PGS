@@ -11,17 +11,26 @@ single PG-IRLS weight build.
 
 This module is a pure addition intended to replace PG-IRLS for binary traits
 in a later integration step.
+
+Non-convergence contract: if the solver exhausts its iteration budget with a
+gradient norm above ``gradient_tolerance``, it raises
+``TRNewtonNonConvergence`` instead of returning a non-converged posterior
+state.  If the wall-clock budget is exceeded, it raises ``TRNewtonTimeout``.
 """
 
 from __future__ import annotations
 
+import logging
+import time
 from dataclasses import dataclass
-from typing import Callable
+from typing import Any, Callable
 
 import numpy as np
 
 from sv_pgs._typing import F64Array
 from sv_pgs.numeric import stable_sigmoid as _jax_stable_sigmoid
+
+_LOG = logging.getLogger(__name__)
 
 
 def _sigmoid(values: F64Array) -> F64Array:
@@ -51,6 +60,60 @@ class TrustRegionResult:
     final_gradient_norm: float
 
 
+class TRNewtonNonConvergence(RuntimeError):
+    """Raised when TR-Newton exits above the requested gradient tolerance."""
+
+    def __init__(self, result: TrustRegionResult, gradient_tolerance: float) -> None:
+        self.result = result
+        self.gradient_tolerance = float(gradient_tolerance)
+        super().__init__(
+            "TR-Newton failed to converge "
+            f"after {result.iterations} iterations "
+            f"(grad_norm={result.final_gradient_norm:.6g}, "
+            f"tolerance={self.gradient_tolerance:.6g})"
+        )
+
+
+class TRNewtonTimeout(TimeoutError):
+    """Raised when TR-Newton exceeds its wall-clock budget."""
+
+    def __init__(
+        self,
+        *,
+        elapsed_s: float,
+        wall_clock_budget_s: float,
+        iterations: int,
+        grad_norm: float,
+    ) -> None:
+        self.elapsed_s = float(elapsed_s)
+        self.wall_clock_budget_s = float(wall_clock_budget_s)
+        self.iterations = int(iterations)
+        self.grad_norm = float(grad_norm)
+        super().__init__(
+            "TR-Newton exceeded wall-clock budget "
+            f"(elapsed_s={self.elapsed_s:.3f}, "
+            f"budget_s={self.wall_clock_budget_s:.3f}, "
+            f"iter={self.iterations}, grad_norm={self.grad_norm:.6g})"
+        )
+
+
+def _raise_if_timed_out(
+    *,
+    started_at: float,
+    wall_clock_budget_s: float,
+    iterations: int,
+    grad_norm: float,
+) -> None:
+    elapsed_s = time.monotonic() - started_at
+    if elapsed_s > wall_clock_budget_s:
+        raise TRNewtonTimeout(
+            elapsed_s=elapsed_s,
+            wall_clock_budget_s=wall_clock_budget_s,
+            iterations=iterations,
+            grad_norm=grad_norm,
+        )
+
+
 def _steihaug_cg(
     *,
     gradient: F64Array,
@@ -58,6 +121,11 @@ def _steihaug_cg(
     radius: float,
     tolerance: float,
     max_iterations: int,
+    progress_interval: int,
+    outer_iteration: int,
+    outer_gradient_norm: float,
+    started_at: float,
+    wall_clock_budget_s: float,
 ) -> tuple[F64Array, bool]:
     """Steihaug-Toint truncated CG for the TR subproblem.
 
@@ -70,7 +138,13 @@ def _steihaug_cg(
     if np.sqrt(r_dot_r) <= tolerance:
         return p, False
 
-    for _ in range(max_iterations):
+    for cg_iteration in range(1, max_iterations + 1):
+        _raise_if_timed_out(
+            started_at=started_at,
+            wall_clock_budget_s=wall_clock_budget_s,
+            iterations=outer_iteration,
+            grad_norm=outer_gradient_norm,
+        )
         Hd = hvp(d)
         d_H_d = float(d @ Hd)
         if d_H_d <= 0.0:
@@ -94,6 +168,15 @@ def _steihaug_cg(
         p = p_next
         r = r_next
         r_dot_r = r_next_dot
+        if progress_interval > 0 and cg_iteration % progress_interval == 0:
+            _LOG.info(
+                "TR-Newton CG progress iter=%d grad_norm=%.6g step_norm=%.6g elapsed_s=%.3f tr_iter=%d",
+                cg_iteration,
+                outer_gradient_norm,
+                float(np.linalg.norm(p)),
+                time.monotonic() - started_at,
+                outer_iteration,
+            )
 
     return p, False
 
@@ -126,6 +209,8 @@ def trust_region_newton_logistic(
     gradient_tolerance: float = 1e-6,
     forcing_exponent: float = 0.5,
     cg_max_iterations: int = 200,
+    wall_clock_budget_s: float = 600.0,
+    cg_progress_interval: int = 25,
 ) -> TrustRegionResult:
     """Trust-region Newton-CG for the penalized logistic posterior.
 
@@ -133,6 +218,7 @@ def trust_region_newton_logistic(
     transpose perform X v and Xᵀ u with the variant design matrix X
     (n × p).  ``covariate_matrix`` is a dense n × q matrix W.
     """
+    started_at = time.monotonic()
     y = np.asarray(targets, dtype=np.float64).ravel()
     W = np.asarray(covariate_matrix, dtype=np.float64)
     offset = np.asarray(predictor_offset, dtype=np.float64).ravel()
@@ -164,6 +250,10 @@ def trust_region_newton_logistic(
         raise ValueError(
             f"covariate_matrix cols ({W.shape[1]}) must match alpha_init ({q_dim})"
         )
+    if cg_max_iterations < 1:
+        raise ValueError("cg_max_iterations must be positive")
+    if wall_clock_budget_s <= 0.0:
+        raise ValueError("wall_clock_budget_s must be positive")
 
     # Pre-compute D⁻¹; guard against zero entries.
     safe_tau = np.where(tau_sq > 0.0, tau_sq, np.finfo(np.float64).tiny)
@@ -237,6 +327,7 @@ def trust_region_newton_logistic(
     f_val = negative_objective(eta, beta)
     grad = joint_gradient(eta, beta)
     grad_norm = float(np.linalg.norm(grad))
+    consecutive_rejections = 0
 
     n_unknowns = p_dim + q_dim
     if n_unknowns == 0:
@@ -252,6 +343,12 @@ def trust_region_newton_logistic(
 
     for k in range(1, max_iterations + 1):
         iterations = k
+        _raise_if_timed_out(
+            started_at=started_at,
+            wall_clock_budget_s=wall_clock_budget_s,
+            iterations=iterations,
+            grad_norm=grad_norm,
+        )
         if grad_norm <= gradient_tolerance:
             converged = True
             break
@@ -267,6 +364,17 @@ def trust_region_newton_logistic(
             radius=radius,
             tolerance=cg_tol,
             max_iterations=cg_max_iterations,
+            progress_interval=cg_progress_interval,
+            outer_iteration=k,
+            outer_gradient_norm=grad_norm,
+            started_at=started_at,
+            wall_clock_budget_s=wall_clock_budget_s,
+        )
+        _raise_if_timed_out(
+            started_at=started_at,
+            wall_clock_budget_s=wall_clock_budget_s,
+            iterations=iterations,
+            grad_norm=grad_norm,
         )
 
         # Trial point.
@@ -295,12 +403,17 @@ def trust_region_newton_logistic(
             radius = min(2.0 * radius, radius_max)
 
         if rho > eta_accept:
+            consecutive_rejections = 0
             beta = beta_trial
             alpha = alpha_trial
             eta = eta_trial
             f_val = f_trial
             grad = joint_gradient(eta, beta)
             grad_norm = float(np.linalg.norm(grad))
+        else:
+            consecutive_rejections += 1
+            if consecutive_rejections >= 2:
+                radius = max(0.1 * radius, 1e-12)
 
         # Guard against pathologically small radius.
         if radius < 1e-14 and step_norm < 1e-14:
@@ -309,7 +422,7 @@ def trust_region_newton_logistic(
     if grad_norm <= gradient_tolerance:
         converged = True
 
-    return TrustRegionResult(
+    result = TrustRegionResult(
         beta=beta,
         alpha=alpha,
         linear_predictor=eta,
@@ -318,3 +431,351 @@ def trust_region_newton_logistic(
         converged=converged,
         final_gradient_norm=grad_norm,
     )
+    if not converged and grad_norm > gradient_tolerance:
+        raise TRNewtonNonConvergence(result, gradient_tolerance)
+    return result
+
+
+# ---------------------------------------------------------------------------
+# GPU-native variant
+# ---------------------------------------------------------------------------
+#
+# trust_region_newton_logistic_gpu mirrors the NumPy solver above but keeps
+# beta, alpha, eta, gradients, CG vectors and HVPs as CuPy arrays end-to-end.
+# Conversion to NumPy happens only at the return boundary so the per-CG-step
+# host/device round-trips that plagued the NumPy path on AoU disappear.
+#
+# Contract:
+#   - ``matvec_design`` / ``matvec_design_transpose`` MUST accept a CuPy
+#     array and return a CuPy array.  The caller is responsible for choosing
+#     matvecs that stay on-device (e.g. via genotype_matrix.gpu_matmat /
+#     gpu_transpose_matmat against a GPU-resident block).
+#   - ``covariate_matrix`` may be NumPy or CuPy; it is uploaded once.
+#   - The returned TrustRegionResult fields are NumPy arrays so downstream
+#     code (Laplace refit / posterior reporting) is unchanged.
+
+
+def _is_cupy_array(cp: Any, obj: Any) -> bool:
+    ndarray_cls = getattr(cp, "ndarray", None)
+    return ndarray_cls is not None and isinstance(obj, ndarray_cls)
+
+
+def _sigmoid_cupy(cp: Any, values_gpu: Any, *, dtype: Any) -> Any:
+    """Numerically stable sigmoid on-device (no host round-trip)."""
+    abs_x = cp.abs(values_gpu)
+    e = cp.exp(-abs_x)
+    pos = dtype(1.0) / (dtype(1.0) + e)
+    neg = e / (dtype(1.0) + e)
+    return cp.where(values_gpu >= dtype(0.0), pos, neg)
+
+
+def trust_region_newton_logistic_gpu(
+    *,
+    cupy: Any,
+    matvec_design: Callable[[Any], Any],
+    matvec_design_transpose: Callable[[Any], Any],
+    covariate_matrix: Any,
+    targets: Any,
+    prior_variances: Any,
+    predictor_offset: Any,
+    beta_init: Any,
+    alpha_init: Any,
+    max_iterations: int = 30,
+    initial_radius: float = 1.0,
+    radius_max: float = 100.0,
+    eta_accept: float = 0.1,
+    gradient_tolerance: float = 1e-6,
+    forcing_exponent: float = 0.5,
+    cg_max_iterations: int = 200,
+    wall_clock_budget_s: float = 600.0,
+    cg_progress_interval: int = 25,
+    compute_dtype: Any = None,
+) -> TrustRegionResult:
+    """GPU-native trust-region Newton-CG.
+
+    Mirrors :func:`trust_region_newton_logistic` exactly in algorithm, but
+    keeps the inner state on-device.  ``matvec_design`` and its transpose
+    must return CuPy arrays.
+    """
+    if cupy is None:
+        raise RuntimeError("trust_region_newton_logistic_gpu requires a CuPy module")
+    if cg_max_iterations < 1:
+        raise ValueError("cg_max_iterations must be positive")
+    if wall_clock_budget_s <= 0.0:
+        raise ValueError("wall_clock_budget_s must be positive")
+
+    started_at = time.monotonic()
+    cp = cupy
+    dtype = cp.float64 if compute_dtype is None else compute_dtype
+
+    y = cp.asarray(targets, dtype=dtype).ravel()
+    W = cp.asarray(covariate_matrix, dtype=dtype)
+    offset = cp.asarray(predictor_offset, dtype=dtype).ravel()
+    beta = cp.asarray(beta_init, dtype=dtype).ravel().copy()
+    alpha = cp.asarray(alpha_init, dtype=dtype).ravel().copy()
+    tau_sq = cp.asarray(prior_variances, dtype=dtype).ravel()
+
+    n_samples = int(y.shape[0])
+    if n_samples == 0:
+        raise ValueError("targets must be non-empty")
+    if W.ndim != 2:
+        raise ValueError(f"covariate_matrix must be 2-D, got shape {tuple(W.shape)}")
+    if int(W.shape[0]) != n_samples:
+        raise ValueError(
+            f"covariate_matrix rows ({int(W.shape[0])}) must match targets ({n_samples})"
+        )
+    if int(offset.shape[0]) != n_samples:
+        raise ValueError(
+            f"predictor_offset length ({int(offset.shape[0])}) must match targets ({n_samples})"
+        )
+    p_dim = int(beta.shape[0])
+    q_dim = int(alpha.shape[0])
+    if int(tau_sq.shape[0]) != p_dim:
+        raise ValueError(
+            f"prior_variances length ({int(tau_sq.shape[0])}) must match beta_init ({p_dim})"
+        )
+    if int(W.shape[1]) != q_dim:
+        raise ValueError(
+            f"covariate_matrix cols ({int(W.shape[1])}) must match alpha_init ({q_dim})"
+        )
+
+    tiny = float(np.finfo(np.float64).tiny)
+    safe_tau = cp.where(tau_sq > 0.0, tau_sq, dtype(tiny))
+    d_inv = (dtype(1.0) / safe_tau).astype(dtype, copy=False)
+
+    def _to_host_numpy(arr_gpu: Any) -> F64Array:
+        host = arr_gpu.get() if hasattr(arr_gpu, "get") else arr_gpu
+        return np.asarray(host, dtype=np.float64)
+
+    def design_mv(v_gpu: Any) -> Any:
+        if p_dim == 0:
+            return cp.zeros(n_samples, dtype=dtype)
+        out = matvec_design(v_gpu)
+        if not _is_cupy_array(cp, out):
+            out = cp.asarray(out, dtype=dtype)
+        return out.astype(dtype, copy=False).ravel()
+
+    def design_mv_t(u_gpu: Any) -> Any:
+        if p_dim == 0:
+            return cp.zeros(0, dtype=dtype)
+        out = matvec_design_transpose(u_gpu)
+        if not _is_cupy_array(cp, out):
+            out = cp.asarray(out, dtype=dtype)
+        return out.astype(dtype, copy=False).ravel()
+
+    def linear_predictor(beta_vec: Any, alpha_vec: Any) -> Any:
+        eta_gpu = offset.copy()
+        if p_dim > 0:
+            eta_gpu = eta_gpu + design_mv(beta_vec)
+        if q_dim > 0:
+            eta_gpu = eta_gpu + W @ alpha_vec
+        return eta_gpu
+
+    def neg_objective(eta_gpu: Any, beta_vec: Any) -> float:
+        data_term = cp.sum(cp.logaddexp(dtype(0.0), eta_gpu) - y * eta_gpu, dtype=cp.float64)
+        if p_dim > 0:
+            prior_term = dtype(0.5) * cp.sum(d_inv * beta_vec * beta_vec, dtype=cp.float64)
+        else:
+            prior_term = cp.asarray(0.0, dtype=cp.float64)
+        return float(data_term + prior_term)
+
+    def joint_gradient(eta_gpu: Any, beta_vec: Any) -> Any:
+        sig = _sigmoid_cupy(cp, eta_gpu, dtype=dtype)
+        residual = sig - y
+        grad_gpu = cp.empty(p_dim + q_dim, dtype=dtype)
+        if p_dim > 0:
+            grad_gpu[:p_dim] = design_mv_t(residual) + d_inv * beta_vec
+        if q_dim > 0:
+            grad_gpu[p_dim:] = W.T @ residual
+        return grad_gpu
+
+    def hvp_factory(eta_gpu: Any) -> Callable[[Any], Any]:
+        sig = _sigmoid_cupy(cp, eta_gpu, dtype=dtype)
+        s_diag = cp.maximum(sig * (dtype(1.0) - sig), dtype(0.0))
+
+        def hvp(v_gpu: Any) -> Any:
+            out = cp.empty_like(v_gpu)
+            v_beta = v_gpu[:p_dim]
+            v_alpha = v_gpu[p_dim:]
+            t = cp.zeros(n_samples, dtype=dtype)
+            if p_dim > 0:
+                t = t + design_mv(v_beta)
+            if q_dim > 0:
+                t = t + W @ v_alpha
+            St = s_diag * t
+            if p_dim > 0:
+                out[:p_dim] = design_mv_t(St) + d_inv * v_beta
+            if q_dim > 0:
+                out[p_dim:] = W.T @ St
+            return out
+
+        return hvp
+
+    def vec_norm(v_gpu: Any) -> float:
+        return float(cp.linalg.norm(v_gpu))
+
+    def to_boundary(p_gpu: Any, d_gpu: Any, radius_val: float) -> float:
+        a = float(cp.dot(d_gpu, d_gpu))
+        b = 2.0 * float(cp.dot(p_gpu, d_gpu))
+        c = float(cp.dot(p_gpu, p_gpu)) - radius_val * radius_val
+        disc = max(b * b - 4.0 * a * c, 0.0)
+        return float((-b + np.sqrt(disc)) / (2.0 * a))
+
+    def steihaug_cg(
+        gradient_gpu: Any,
+        hvp: Callable[[Any], Any],
+        radius_val: float,
+        tolerance: float,
+        max_iter: int,
+        outer_iter: int,
+        outer_grad_norm: float,
+    ) -> tuple[Any, bool]:
+        p_gpu = cp.zeros_like(gradient_gpu)
+        r_gpu = gradient_gpu.copy()
+        d_gpu = -r_gpu
+        r_dot_r = float(cp.dot(r_gpu, r_gpu))
+        if np.sqrt(r_dot_r) <= tolerance:
+            return p_gpu, False
+        for cg_iteration in range(1, max_iter + 1):
+            _raise_if_timed_out(
+                started_at=started_at,
+                wall_clock_budget_s=wall_clock_budget_s,
+                iterations=outer_iter,
+                grad_norm=outer_grad_norm,
+            )
+            Hd = hvp(d_gpu)
+            d_H_d = float(cp.dot(d_gpu, Hd))
+            if d_H_d <= 0.0:
+                tau = to_boundary(p_gpu, d_gpu, radius_val)
+                return p_gpu + tau * d_gpu, True
+            alpha_step = r_dot_r / d_H_d
+            p_next = p_gpu + alpha_step * d_gpu
+            if vec_norm(p_next) >= radius_val:
+                tau = to_boundary(p_gpu, d_gpu, radius_val)
+                return p_gpu + tau * d_gpu, True
+            r_next = r_gpu + alpha_step * Hd
+            r_next_dot = float(cp.dot(r_next, r_next))
+            if np.sqrt(r_next_dot) <= tolerance:
+                return p_next, False
+            beta_cg = r_next_dot / r_dot_r
+            d_gpu = -r_next + beta_cg * d_gpu
+            p_gpu = p_next
+            r_gpu = r_next
+            r_dot_r = r_next_dot
+            if cg_progress_interval > 0 and cg_iteration % cg_progress_interval == 0:
+                _LOG.info(
+                    "TR-Newton(GPU) CG progress iter=%d grad_norm=%.6g step_norm=%.6g elapsed_s=%.3f tr_iter=%d",
+                    cg_iteration,
+                    outer_grad_norm,
+                    vec_norm(p_gpu),
+                    time.monotonic() - started_at,
+                    outer_iter,
+                )
+        return p_gpu, False
+
+    radius = float(initial_radius)
+    converged = False
+    iterations = 0
+    eta = linear_predictor(beta, alpha)
+    f_val = neg_objective(eta, beta)
+    grad = joint_gradient(eta, beta)
+    grad_norm = vec_norm(grad)
+    consecutive_rejections = 0
+
+    n_unknowns = p_dim + q_dim
+    if n_unknowns == 0:
+        return TrustRegionResult(
+            beta=_to_host_numpy(beta),
+            alpha=_to_host_numpy(alpha),
+            linear_predictor=_to_host_numpy(eta),
+            objective=-f_val,
+            iterations=0,
+            converged=True,
+            final_gradient_norm=0.0,
+        )
+
+    for k in range(1, max_iterations + 1):
+        iterations = k
+        _raise_if_timed_out(
+            started_at=started_at,
+            wall_clock_budget_s=wall_clock_budget_s,
+            iterations=iterations,
+            grad_norm=grad_norm,
+        )
+        if grad_norm <= gradient_tolerance:
+            converged = True
+            break
+
+        eta_k = min(0.5, grad_norm ** forcing_exponent)
+        cg_tol = eta_k * grad_norm
+
+        hvp = hvp_factory(eta)
+        step, hit_boundary = steihaug_cg(
+            grad,
+            hvp,
+            radius,
+            cg_tol,
+            cg_max_iterations,
+            outer_iter=k,
+            outer_grad_norm=grad_norm,
+        )
+        _raise_if_timed_out(
+            started_at=started_at,
+            wall_clock_budget_s=wall_clock_budget_s,
+            iterations=iterations,
+            grad_norm=grad_norm,
+        )
+
+        step_beta = step[:p_dim]
+        step_alpha = step[p_dim:]
+        beta_trial = beta + step_beta
+        alpha_trial = alpha + step_alpha
+        eta_trial = linear_predictor(beta_trial, alpha_trial)
+        f_trial = neg_objective(eta_trial, beta_trial)
+
+        Hp = hvp(step)
+        predicted_reduction = -(float(cp.dot(grad, step)) + 0.5 * float(cp.dot(step, Hp)))
+        actual_reduction = f_val - f_trial
+
+        if predicted_reduction <= 0.0:
+            rho = -np.inf
+        else:
+            rho = actual_reduction / predicted_reduction
+
+        step_norm = vec_norm(step)
+        if rho < 0.25:
+            radius = max(0.25 * radius, 1e-12)
+        elif rho > 0.75 and hit_boundary:
+            radius = min(2.0 * radius, radius_max)
+
+        if rho > eta_accept:
+            consecutive_rejections = 0
+            beta = beta_trial
+            alpha = alpha_trial
+            eta = eta_trial
+            f_val = f_trial
+            grad = joint_gradient(eta, beta)
+            grad_norm = vec_norm(grad)
+        else:
+            consecutive_rejections += 1
+            if consecutive_rejections >= 2:
+                radius = max(0.1 * radius, 1e-12)
+
+        if radius < 1e-14 and step_norm < 1e-14:
+            break
+
+    if grad_norm <= gradient_tolerance:
+        converged = True
+
+    result = TrustRegionResult(
+        beta=_to_host_numpy(beta),
+        alpha=_to_host_numpy(alpha),
+        linear_predictor=_to_host_numpy(eta),
+        objective=-f_val,
+        iterations=iterations,
+        converged=converged,
+        final_gradient_norm=grad_norm,
+    )
+    if not converged and grad_norm > gradient_tolerance:
+        raise TRNewtonNonConvergence(result, gradient_tolerance)
+    return result

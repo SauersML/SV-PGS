@@ -19,11 +19,14 @@ import csv
 import gzip
 import json
 from pathlib import Path
+from typing import Literal
 
 import numpy as np
 
 from sv_pgs._typing import NDArray
 from sv_pgs.progress import log
+
+EvaluationPurpose = Literal["genetic_only", "full_model"]
 
 
 def _get_cdr_dataset() -> str:
@@ -168,13 +171,44 @@ def _compute_auc_safe(labels: NDArray, preds: NDArray) -> float | None:
     return float(np.clip(auc, 0.0, 1.0))
 
 
+def _score_column_priority(evaluation_purpose: EvaluationPurpose) -> tuple[str, ...]:
+    if evaluation_purpose == "genetic_only":
+        return ("genetic_score", "linear_predictor", "probability", "predicted_probability")
+    if evaluation_purpose == "full_model":
+        return ("probability", "predicted_probability", "genetic_score", "linear_predictor")
+    raise ValueError(f"Unknown evaluation_purpose: {evaluation_purpose!r}")
+
+
+def _select_score_column(
+    columns: list[str],
+    evaluation_purpose: EvaluationPurpose,
+    context: str,
+) -> str:
+    score_col = next((c for c in _score_column_priority(evaluation_purpose) if c in columns), None)
+    if score_col is None:
+        raise ValueError(f"No score column found for {context}. Columns: {columns}")
+    if evaluation_purpose == "genetic_only" and score_col in ("probability", "predicted_probability"):
+        log(
+            f"  WARNING: genetic_only requested for {context}, but no genetic_score or "
+            f"linear_predictor column is available; falling back to {score_col}"
+        )
+    return score_col
+
+
 def _run_auc_test(
     name: str,
     neg_scores: NDArray,
     pos_scores: NDArray,
     results: dict[str, object],
     key_prefix: str,
+    *,
+    evaluation_purpose: EvaluationPurpose = "full_model",
+    score_column: str | None = None,
 ) -> None:
+    if score_column is not None:
+        results[f"{key_prefix}_score_column"] = score_column
+    results[f"{key_prefix}_evaluation_purpose"] = evaluation_purpose
+
     neg_scores = np.asarray(neg_scores, dtype=np.float64).reshape(-1)
     pos_scores = np.asarray(pos_scores, dtype=np.float64).reshape(-1)
     original_neg_size = int(neg_scores.size)
@@ -207,8 +241,12 @@ def _run_auc_test(
 def evaluate_all_of_us(
     output_dir: Path,
     disease: str,
+    evaluation_purpose: EvaluationPurpose = "full_model",
 ) -> dict[str, object]:
     work_dir = Path(output_dir)
+    if evaluation_purpose not in ("genetic_only", "full_model"):
+        raise ValueError(f"Unknown evaluation_purpose: {evaluation_purpose!r}")
+    quasi_holdout_purpose: EvaluationPurpose = "genetic_only"
 
     # Find predictions
     predictions_path = None
@@ -243,26 +281,20 @@ def evaluate_all_of_us(
     log(f"  sample table: {sample_table_path}")
     log(f"  ancestry: {ancestry_path or 'not found'}")
 
-    # Load predictions — auto-detect score column
+    results: dict[str, object] = {
+        "disease": disease,
+        "evaluation_purpose": evaluation_purpose,
+        "quasi_holdout_evaluation_purpose": quasi_holdout_purpose,
+    }
+
+    # Load predictions for quasi-holdout genetic validation.
     scores: dict[str, float] = {}
     with gzip.open(predictions_path, "rt") as handle:
         reader = csv.DictReader(handle, delimiter="\t")
         columns = reader.fieldnames or []
-        score_col = None
-        # For quasi-holdout genetic validation we want the *genetic* signal
-        # alone. `probability` and `linear_predictor` include the covariate
-        # contribution and adding covariate terms is not a monotone transform
-        # of `genetic_score`, so AUC computed on them measures covariate-
-        # adjusted disease risk, not genetic separation. Prefer genetic_score
-        # (or the raw linear_predictor as a fallback only if genetic_score is
-        # absent) ahead of the covariate-mixed columns.
-        for score_candidate in ("genetic_score", "linear_predictor", "probability", "predicted_probability"):
-            if score_candidate in columns:
-                score_col = score_candidate
-                break
-        if score_col is None:
-            raise ValueError(f"No score column found in predictions. Columns: {columns}")
-        log(f"  using score column: {score_col}")
+        score_col = _select_score_column(columns, quasi_holdout_purpose, "quasi-holdout evaluation")
+        results["quasi_holdout_score_column"] = score_col
+        log(f"  using score column for quasi-holdout evaluation: {score_col}")
         for row in reader:
             scores[row["sample_id"]] = float(row[score_col])
     log(f"  loaded {len(scores):,} predicted scores")
@@ -289,8 +321,6 @@ def evaluate_all_of_us(
         if sid in scores:
             groups.setdefault(cnt, []).append((sid, scores[sid]))
 
-    results: dict[str, object] = {"disease": disease}
-
     # === Test 1: ICD code stratification ===
     log("")
     log("=== TEST 1: ICD Code Stratification (0-code vs 1-code) ===")
@@ -301,12 +331,28 @@ def evaluate_all_of_us(
     zero_scores_arr = np.array([s for _, s in zero_items])
     one_scores_arr = np.array([s for _, s in one_items])
 
-    _run_auc_test("ALL", zero_scores_arr, one_scores_arr, results, "test1_all")
+    _run_auc_test(
+        "ALL",
+        zero_scores_arr,
+        one_scores_arr,
+        results,
+        "test1_all",
+        evaluation_purpose=quasi_holdout_purpose,
+        score_column=score_col,
+    )
 
     if eur_ids:
         zero_eur = np.array([s for sid, s in zero_items if sid in eur_ids])
         one_eur = np.array([s for sid, s in one_items if sid in eur_ids])
-        _run_auc_test("EUR only", zero_eur, one_eur, results, "test1_eur")
+        _run_auc_test(
+            "EUR only",
+            zero_eur,
+            one_eur,
+            results,
+            "test1_eur",
+            evaluation_purpose=quasi_holdout_purpose,
+            score_column=score_col,
+        )
 
     # === Test 2: Survey self-report ===
     log("")
@@ -326,12 +372,28 @@ def evaluate_all_of_us(
         pos_arr = np.array([scores[sid] for sid in survey_pos_ids])
         neg_arr = np.array([scores[sid] for sid in survey_neg_ids])
 
-        _run_auc_test("ALL", neg_arr, pos_arr, results, "test2_all")
+        _run_auc_test(
+            "ALL",
+            neg_arr,
+            pos_arr,
+            results,
+            "test2_all",
+            evaluation_purpose=quasi_holdout_purpose,
+            score_column=score_col,
+        )
 
         if eur_ids:
             pos_eur = np.array([scores[sid] for sid in survey_pos_ids if sid in eur_ids])
             neg_eur = np.array([scores[sid] for sid in survey_neg_ids if sid in eur_ids])
-            _run_auc_test("EUR only", neg_eur, pos_eur, results, "test2_eur")
+            _run_auc_test(
+                "EUR only",
+                neg_eur,
+                pos_eur,
+                results,
+                "test2_eur",
+                evaluation_purpose=quasi_holdout_purpose,
+                score_column=score_col,
+            )
     else:
         log("  no survey data available")
 
@@ -354,32 +416,41 @@ def evaluate_all_of_us(
         log("=== TRUE 20% HELD-OUT TEST SET ===")
         log(f"  predictions: {test_predictions_path}")
 
-        test_rows: list[tuple[str, int, float, float, float]] = []
+        test_rows: list[tuple[str, int, float, float, float, float]] = []
         with gzip.open(test_predictions_path, "rt") as handle:
             reader = csv.DictReader(handle, delimiter="\t")
             cols = reader.fieldnames or []
-            score_col = next(
-                (c for c in ("probability", "predicted_probability", "genetic_score", "linear_predictor") if c in cols),
-                None,
-            )
-            if score_col is None:
-                log(f"  no score column in {test_predictions_path}; columns={cols}")
+            try:
+                test_score_col = _select_score_column(cols, evaluation_purpose, "held-out target evaluation")
+                test_quasi_score_col = _select_score_column(
+                    cols,
+                    quasi_holdout_purpose,
+                    "held-out ICD/survey validation",
+                )
+            except ValueError as exc:
+                log(f"  {exc}")
             else:
-                log(f"  using score column: {score_col}")
+                results["test_holdout_evaluation_purpose"] = evaluation_purpose
+                results["test_holdout_score_column"] = test_score_col
+                results["test_holdout_quasi_holdout_evaluation_purpose"] = quasi_holdout_purpose
+                results["test_holdout_quasi_holdout_score_column"] = test_quasi_score_col
+                log(f"  using score column for held-out target evaluation: {test_score_col}")
+                log(f"  using score column for held-out ICD/survey validation: {test_quasi_score_col}")
                 for row in reader:
                     sid = row["sample_id"]
                     target = int(float(row["target"])) if "target" in row else -1
-                    score = float(row[score_col])
+                    score = float(row[test_score_col])
+                    quasi_score = float(row[test_quasi_score_col])
                     genetic = float(row.get("genetic_score", "nan"))
                     covariate = float(row.get("covariate_score", "nan"))
-                    test_rows.append((sid, target, score, genetic, covariate))
+                    test_rows.append((sid, target, score, quasi_score, genetic, covariate))
 
         if test_rows:
             test_ids = np.array([r[0] for r in test_rows])
             y = np.array([r[1] for r in test_rows], dtype=np.int8)
             p = np.array([r[2] for r in test_rows], dtype=np.float64)
-            g = np.array([r[3] for r in test_rows], dtype=np.float64)
-            c = np.array([r[4] for r in test_rows], dtype=np.float64)
+            g = np.array([r[4] for r in test_rows], dtype=np.float64)
+            c = np.array([r[5] for r in test_rows], dtype=np.float64)
 
             n_total = int(y.size)
             n_pos = int((y == 1).sum())
@@ -425,14 +496,14 @@ def evaluate_all_of_us(
                     results["test_holdout_n_eur"] = int(eur_mask.sum())
 
             # Dose-response on the held-out set
-            test_scores_by_id = {sid: score for sid, _, score, _, _ in test_rows}
+            test_scores_by_id = {sid: quasi_score for sid, _, _, quasi_score, _, _ in test_rows}
             test_groups: dict[int, list[float]] = {}
             for sid, score in test_scores_by_id.items():
                 sid_cnt = observation_counts.get(sid)
                 if sid_cnt is not None:
                     test_groups.setdefault(sid_cnt, []).append(score)
             if test_groups:
-                log("  dose-response on held-out (score vs observation count):")
+                log("  dose-response on held-out (genetic-only score vs observation count):")
                 max_cnt_test = max(test_groups.keys())
                 for cnt in sorted(test_groups.keys()):
                     arr = np.asarray(test_groups[cnt])
@@ -444,11 +515,27 @@ def evaluate_all_of_us(
             one_h = np.array([test_scores_by_id[sid] for sid in test_ids if observation_counts.get(sid) == 1 and sid in test_scores_by_id])
             if zero_h.size >= 10 and one_h.size >= 10:
                 log("  ICD 0-code vs 1-code (held-out):")
-                _run_auc_test("ALL", zero_h, one_h, results, "test_holdout_icd01_all")
+                _run_auc_test(
+                    "ALL",
+                    zero_h,
+                    one_h,
+                    results,
+                    "test_holdout_icd01_all",
+                    evaluation_purpose=quasi_holdout_purpose,
+                    score_column=test_quasi_score_col,
+                )
                 if eur_ids:
                     zero_h_eur = np.array([test_scores_by_id[sid] for sid in test_ids if observation_counts.get(sid) == 0 and sid in eur_ids and sid in test_scores_by_id])
                     one_h_eur = np.array([test_scores_by_id[sid] for sid in test_ids if observation_counts.get(sid) == 1 and sid in eur_ids and sid in test_scores_by_id])
-                    _run_auc_test("EUR only", zero_h_eur, one_h_eur, results, "test_holdout_icd01_eur")
+                    _run_auc_test(
+                        "EUR only",
+                        zero_h_eur,
+                        one_h_eur,
+                        results,
+                        "test_holdout_icd01_eur",
+                        evaluation_purpose=quasi_holdout_purpose,
+                        score_column=test_quasi_score_col,
+                    )
 
             # Survey self-report on held-out
             if survey_positive:
@@ -462,11 +549,27 @@ def evaluate_all_of_us(
                 neg_arr_h = np.array([test_scores_by_id[sid] for sid in neg_ids_h if sid in test_scores_by_id])
                 if pos_arr_h.size >= 10 and neg_arr_h.size >= 10:
                     log("  Survey self-report (held-out):")
-                    _run_auc_test("ALL", neg_arr_h, pos_arr_h, results, "test_holdout_survey_all")
+                    _run_auc_test(
+                        "ALL",
+                        neg_arr_h,
+                        pos_arr_h,
+                        results,
+                        "test_holdout_survey_all",
+                        evaluation_purpose=quasi_holdout_purpose,
+                        score_column=test_quasi_score_col,
+                    )
                     if eur_ids:
                         pos_eur_h = np.array([test_scores_by_id[sid] for sid in pos_ids_h if sid in eur_ids and sid in test_scores_by_id])
                         neg_eur_h = np.array([test_scores_by_id[sid] for sid in neg_ids_h if sid in eur_ids and sid in test_scores_by_id])
-                        _run_auc_test("EUR only", neg_eur_h, pos_eur_h, results, "test_holdout_survey_eur")
+                        _run_auc_test(
+                            "EUR only",
+                            neg_eur_h,
+                            pos_eur_h,
+                            results,
+                            "test_holdout_survey_eur",
+                            evaluation_purpose=quasi_holdout_purpose,
+                            score_column=test_quasi_score_col,
+                        )
     else:
         log("")
         log(f"  (no test_predictions.tsv.gz found at {test_predictions_path} — held-out battery skipped)")

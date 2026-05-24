@@ -126,13 +126,21 @@ class ModelConfig:
     exact_solver_matrix_limit: int = 2048  # below this: direct solve; above: Woodbury or CG
     posterior_variance_batch_size: int = 1024
     posterior_variance_probe_count: int = 24
+    # Must be positive: skipping beta variance refreshes can hide unstable
+    # calibration and non-identifiability until the final posterior pass.
     beta_variance_update_interval: int = 2
     final_posterior_diagnostics: bool = True
+    use_tr_newton_binary: bool = False
+    cg_progress_interval: int = 5
+    solver_wall_clock_budget_s: float = 600.0
     minimum_minor_allele_frequency: float = 1e-2
     # Marginal-univariate |z| pre-screen threshold. After the MAF filter,
     # variants with |z_j| (residualized on covariates, normalized so null ~
     # N(0,1)) below this value are dropped before joint fitting. 0.0 disables
     # the screen (default — no behavior change for existing callers).
+    # When the experiment is supposed to test SV contribution, marginal
+    # screening is methodologically risky: rare SVs and correlated-region
+    # signals can have weak marginal z-scores but matter in the joint model.
     # Recommended values:
     #   1.5  — drops ~87% of pure-noise variants (Φ⁻¹(0.13)); a common PRS
     #          marginal-then-joint-fit practice.
@@ -141,6 +149,7 @@ class ModelConfig:
     # Set on the runner / CLI when the joint matrix would otherwise exceed
     # the GPU budget; below the budget the fast deterministic CAVI path runs.
     marginal_screen_min_abs_z: float = 0.0
+    marginal_screen_protect_sv: bool = True
 
     sample_space_preconditioner_rank: int = 256
     validation_interval: int = 10
@@ -201,8 +210,12 @@ class ModelConfig:
             raise ValueError("posterior_variance_batch_size must be positive.")
         if self.posterior_variance_probe_count < 1:
             raise ValueError("posterior_variance_probe_count must be positive.")
-        if self.beta_variance_update_interval < 0:
-            raise ValueError("beta_variance_update_interval must be non-negative.")
+        if self.beta_variance_update_interval < 1:
+            raise ValueError("beta_variance_update_interval must be positive.")
+        if self.cg_progress_interval < 1:
+            raise ValueError("cg_progress_interval must be positive.")
+        if self.solver_wall_clock_budget_s <= 0.0:
+            raise ValueError("solver_wall_clock_budget_s must be positive.")
         if not 0.0 <= self.minimum_minor_allele_frequency < 0.5:
             raise ValueError("minimum_minor_allele_frequency must lie in [0.0, 0.5).")
         if self.marginal_screen_min_abs_z < 0.0:

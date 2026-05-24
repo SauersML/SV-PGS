@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import csv
 import json
+import logging
 import os
 from dataclasses import dataclass
 from pathlib import Path
@@ -11,6 +12,12 @@ if TYPE_CHECKING:
     from google.cloud import bigquery
 
 MIN_DISEASE_OCCURRENCES = 2
+LOGGER = logging.getLogger(__name__)
+OMOP_CATEGORICAL_COVARIATES = (
+    "gender_concept_id",
+    "race_concept_id",
+    "ethnicity_concept_id",
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -229,6 +236,13 @@ ehr_participants AS (
   FROM `{dataset}.observation_period`
   GROUP BY person_id
 ),
+visit_counts AS (
+  SELECT
+    person_id,
+    COUNT(*) AS n_visits
+  FROM `{dataset}.visit_occurrence`
+  GROUP BY person_id
+),
 disease_root AS (
   SELECT concept_id
   FROM `{dataset}.concept`
@@ -261,7 +275,11 @@ aggregated_conditions AS (
 SELECT
   CAST(ehr_participants.person_id AS STRING) AS sample_id,
   CAST(ehr_participants.person_id AS STRING) AS person_id,
-  IF(COALESCE(aggregated_conditions.phenotype_occurrence_count, 0) >= {MIN_DISEASE_OCCURRENCES}, 1, 0) AS target,
+  CASE
+    WHEN COALESCE(aggregated_conditions.phenotype_occurrence_count, 0) >= {MIN_DISEASE_OCCURRENCES} THEN 1
+    WHEN COALESCE(aggregated_conditions.phenotype_occurrence_count, 0) = 0 THEN 0
+    ELSE NULL
+  END AS target,
   COALESCE(aggregated_conditions.phenotype_occurrence_count, 0) AS phenotype_occurrence_count,
   aggregated_conditions.first_condition_date,
   ehr_participants.observation_start_date,
@@ -271,12 +289,20 @@ SELECT
     WHEN person.year_of_birth IS NULL OR ehr_participants.observation_start_date IS NULL THEN NULL
     ELSE EXTRACT(YEAR FROM ehr_participants.observation_start_date) - person.year_of_birth
   END AS age_at_observation_start,
+  CASE
+    WHEN person.year_of_birth IS NULL OR ehr_participants.observation_start_date IS NULL THEN NULL
+    ELSE POW(EXTRACT(YEAR FROM ehr_participants.observation_start_date) - person.year_of_birth, 2)
+  END AS age_at_observation_start_squared,
+  DATE_DIFF(ehr_participants.observation_end_date, ehr_participants.observation_start_date, DAY) AS observation_duration_days,
+  LN(1 + COALESCE(visit_counts.n_visits, 0)) AS log1p_n_visits,
   person.gender_concept_id,
   person.race_concept_id,
   person.ethnicity_concept_id
 FROM ehr_participants
 JOIN `{dataset}.person` AS person
   ON person.person_id = ehr_participants.person_id
+LEFT JOIN visit_counts
+  ON visit_counts.person_id = ehr_participants.person_id
 LEFT JOIN aggregated_conditions
   ON aggregated_conditions.person_id = ehr_participants.person_id
 LEFT JOIN primary_consent
@@ -321,6 +347,13 @@ def prepare_all_of_us_disease_sample_table(
     billing_project = _resolve_billing_project(client)
     sample_table_path = Path(output_path)
     sample_table_path.parent.mkdir(parents=True, exist_ok=True)
+    training_rows, encoded_categorical_columns, phenotype_counts = _prepare_training_rows(rows)
+    LOGGER.info(
+        "Prepared All of Us phenotype rows: n_cases=%d n_controls=%d n_excluded_ambiguous=%d",
+        phenotype_counts["n_cases"],
+        phenotype_counts["n_controls"],
+        phenotype_counts["n_excluded_ambiguous"],
+    )
 
     header = (
         "sample_id",
@@ -332,14 +365,15 @@ def prepare_all_of_us_disease_sample_table(
         "observation_end_date",
         "primary_consent_date",
         "age_at_observation_start",
-        "gender_concept_id",
-        "race_concept_id",
-        "ethnicity_concept_id",
+        "age_at_observation_start_squared",
+        "observation_duration_days",
+        "log1p_n_visits",
+        *encoded_categorical_columns,
     )
     with sample_table_path.open("w", encoding="utf-8", newline="") as handle:
         writer = csv.writer(handle, delimiter="\t")
         writer.writerow(header)
-        for row in rows:
+        for row in training_rows:
             writer.writerow([_format_value(row.get(column_name)) for column_name in header])
 
     sql_path = sample_table_path.with_suffix(sample_table_path.suffix + ".sql")
@@ -358,7 +392,13 @@ def prepare_all_of_us_disease_sample_table(
                 "cdr_dataset_env": "WORKSPACE_CDR",
                 "billing_project": billing_project,
                 "cdr_dataset": _require_env("WORKSPACE_CDR"),
-                "row_count": len(rows),
+                "raw_row_count": len(rows),
+                "row_count": len(training_rows),
+                "n_cases": phenotype_counts["n_cases"],
+                "n_controls": phenotype_counts["n_controls"],
+                "n_excluded_ambiguous": phenotype_counts["n_excluded_ambiguous"],
+                "excluded_training_definition": "phenotype_occurrence_count == 1",
+                "encoded_categorical_covariates": encoded_categorical_columns,
             },
             indent=2,
         ),
@@ -388,6 +428,89 @@ def _resolve_billing_project(client: bigquery.Client | None) -> str:
         if isinstance(client_project, str) and client_project.strip():
             return client_project.strip()
     return _require_env("GOOGLE_PROJECT")
+
+
+def _prepare_training_rows(
+    rows: list[dict[str, Any]],
+) -> tuple[list[dict[str, Any]], tuple[str, ...], dict[str, int]]:
+    training_rows: list[dict[str, Any]] = []
+    n_cases = 0
+    n_controls = 0
+    n_excluded_ambiguous = 0
+
+    for row in rows:
+        phenotype_occurrence_count = _parse_phenotype_occurrence_count(row)
+        if phenotype_occurrence_count >= MIN_DISEASE_OCCURRENCES:
+            training_row = dict(row)
+            training_row["target"] = 1
+            training_rows.append(training_row)
+            n_cases += 1
+        elif phenotype_occurrence_count == 0:
+            training_row = dict(row)
+            training_row["target"] = 0
+            training_rows.append(training_row)
+            n_controls += 1
+        else:
+            # One-code participants are neither clean controls nor cases, so exclude
+            # them from training instead of diluting controls with ambiguous records.
+            n_excluded_ambiguous += 1
+
+    encoded_categorical_columns = _add_one_hot_omop_categorical_covariates(training_rows)
+    return (
+        training_rows,
+        encoded_categorical_columns,
+        {
+            "n_cases": n_cases,
+            "n_controls": n_controls,
+            "n_excluded_ambiguous": n_excluded_ambiguous,
+        },
+    )
+
+
+def _add_one_hot_omop_categorical_covariates(rows: list[dict[str, Any]]) -> tuple[str, ...]:
+    encoded_column_names: list[str] = []
+    for categorical_column in OMOP_CATEGORICAL_COVARIATES:
+        sorted_concept_ids = sorted(
+            {
+                _parse_concept_id(categorical_column, row.get(categorical_column))
+                for row in rows
+                if row.get(categorical_column) not in (None, "")
+            }
+        )
+        encoded_concept_ids = sorted_concept_ids[1:]
+        column_names = tuple(
+            f"{categorical_column}_{concept_id}"
+            for concept_id in encoded_concept_ids
+        )
+        encoded_column_names.extend(column_names)
+        for row in rows:
+            row_concept_id = row.get(categorical_column)
+            parsed_concept_id = (
+                _parse_concept_id(categorical_column, row_concept_id)
+                if row_concept_id not in (None, "")
+                else None
+            )
+            for concept_id, column_name in zip(encoded_concept_ids, column_names, strict=True):
+                row[column_name] = 1 if parsed_concept_id == concept_id else 0
+            row.pop(categorical_column, None)
+    return tuple(encoded_column_names)
+
+
+def _parse_phenotype_occurrence_count(row: dict[str, Any]) -> int:
+    value = row.get("phenotype_occurrence_count")
+    if value in (None, ""):
+        return 0
+    try:
+        return int(value)
+    except (TypeError, ValueError) as error:
+        raise ValueError("Invalid phenotype_occurrence_count: " + str(value)) from error
+
+
+def _parse_concept_id(column_name: str, value: Any) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError) as error:
+        raise ValueError("Invalid " + column_name + ": " + str(value)) from error
 
 
 def _format_value(value: Any) -> str:

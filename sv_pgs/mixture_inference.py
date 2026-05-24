@@ -57,6 +57,7 @@ import gc
 import hashlib
 import json
 import os
+from pathlib import Path
 import time
 from typing import Any, Callable, Iterable, Sequence, cast
 
@@ -103,7 +104,12 @@ from sv_pgs._typing import (
     NDArray,
 )
 from sv_pgs.progress import log, mem
-from sv_pgs.tr_newton import trust_region_newton_logistic
+from sv_pgs.tr_newton import (
+    TRNewtonNonConvergence,
+    TRNewtonTimeout,
+    trust_region_newton_logistic,
+    trust_region_newton_logistic_gpu,
+)
 
 # GPU exact variant-space Cholesky: form X^T W X via cuBLAS + Cholesky.
 # Cost: O(n p²) matmul + O(p³) Cholesky. This is 10-20x faster than
@@ -128,9 +134,19 @@ _STOCHASTIC_BLOCK_HOST_BUFFER_UTILIZATION = 0.35
 # for the resident genotype cache and the p×p precision workspace.
 _GPU_EXACT_VARIANT_TILE_BUDGET_FRACTION = 0.10
 _STOCHASTIC_CHECKPOINT_MIN_SECONDS = 60.0
+_BINARY_INNER_CHECKPOINT_DEFAULT_SECONDS = 15.0 * 60.0
 _STOCHASTIC_CHECKPOINT_TARGETS_PER_EPOCH = 20
 _STOCHASTIC_BLOCK_LOG_TARGETS_PER_EPOCH = 10
 _STOCHASTIC_BLOCK_GC_INTERVAL = 20
+# Operational gates for binary TR-Newton safety:
+#   * _TR_NEWTON_REQUIRES_GPU: when True, a TR-Newton stochastic block whose
+#     GPU upload fails (after retry/shrink attempts) raises instead of falling
+#     back to mmap streaming, which previously caused 9+ hour HVPs.
+#   * _TR_NEWTON_RAISE_ON_NONCONVERGENCE: when True, a non-converged TR-Newton
+#     result raises instead of silently returning a stale posterior tuple.
+# Flip either to False only as a temporary ops escape hatch.
+_TR_NEWTON_REQUIRES_GPU = True
+_TR_NEWTON_RAISE_ON_NONCONVERGENCE = True
 _ANDERSON_MEMORY_DEPTH = 5
 _GPU_INVERSE_DIAGONAL_WORKSPACE_FRACTION = 0.01
 _GPU_INVERSE_DIAGONAL_MAX_BLOCK = 4_096
@@ -1603,7 +1619,19 @@ def fit_variational_em(
                 raise ValueError("resume checkpoint TPB shape-b size does not match prior classes.")
             if resume_checkpoint.completed_iterations < 0 or resume_checkpoint.completed_iterations > config.max_outer_iterations:
                 raise ValueError("resume checkpoint completed_iterations is out of range.")
-            if len(resume_checkpoint.objective_history) != resume_checkpoint.completed_iterations:
+            checkpoint_has_partial_epoch = (
+                int(resume_checkpoint.completed_blocks_in_iteration) > 0
+                or resume_checkpoint.binary_block_resume_state is not None
+            )
+            expected_objective_history_length = (
+                int(resume_checkpoint.completed_iterations) - 1
+                if checkpoint_has_partial_epoch
+                else int(resume_checkpoint.completed_iterations)
+            )
+            if (
+                expected_objective_history_length < 0
+                or len(resume_checkpoint.objective_history) != expected_objective_history_length
+            ):
                 raise ValueError("resume checkpoint objective history length does not match completed iterations.")
             global_scale = float(resume_checkpoint.global_scale)
             scale_model_coefficients = np.asarray(resume_checkpoint.scale_model_coefficients, dtype=np.float64).copy()
@@ -1640,7 +1668,12 @@ def fit_variational_em(
                 if resume_checkpoint.best_validation_iteration is None
                 else int(resume_checkpoint.best_validation_iteration)
             )
-            start_iteration = int(resume_checkpoint.completed_iterations)
+            # A partial stochastic/binary block checkpoint marks the current
+            # in-progress epoch as ``completed_iterations`` so first-epoch
+            # checkpoints are positive and survive model-layer persistence.
+            # Resume it by rewinding one epoch; fully completed checkpoints
+            # still resume after their last finished epoch.
+            start_iteration = expected_objective_history_length
             # Restore ELBO diagnostic history (defaults to [] for old pickles
             # that predate this field — see VariationalFitCheckpoint.__setstate__).
             elbo_history = [float(value) for value in resume_checkpoint.elbo_history]
@@ -1719,6 +1752,8 @@ def fit_variational_em(
         f"stochastic={'yes' if use_stochastic_updates else 'no'}  "
         f"reason={'matrix on GPU → working-set' if gpu_resident else 'streaming from mmap → stochastic blocks' if use_stochastic_updates else 'small variant count → collapsed'}"
     )
+    fit_wall_t0 = time.monotonic()
+    first_epoch_test_banner_emitted = False
     beta_variance_state: NDArray | None = None
     # Carry the saved posterior beta variance through to the collapsed path so
     # the first sigma_e2 update post-resume uses the real shrunk variance
@@ -2171,6 +2206,34 @@ def fit_variational_em(
                 # Upload block to GPU — fits easily in GPU budget.
                 # Without this, every CG iteration streams from mmap (40s vs 2s).
                 block_genotypes.try_materialize_gpu()
+                # For binary TR-Newton blocks, GPU residency is mandatory: silently
+                # falling back to mmap streaming inside Newton-CG turns each HVP
+                # into a multi-second disk read and stalls the run.  Halve the
+                # block once and retry; if that still fails, raise so the user
+                # can lower the configured batch size or free GPU memory.
+                if (
+                    config.trait_type == TraitType.BINARY
+                    and block_genotypes._cupy_cache is None
+                    and getattr(config, "tr_newton_shrink_block_on_oom", True)
+                ):
+                    shrunk_size = max(1, len(block_indices) // 2)
+                    if shrunk_size < len(block_indices):
+                        log(
+                            "    binary block did not fit GPU; retrying with half size "
+                            + f"{shrunk_size} (was {len(block_indices)})  mem={mem()}"
+                        )
+                        block_indices = block_indices[:shrunk_size]
+                        block_genotypes = genotype_matrix.subset(block_indices)
+                        block_genotypes.try_materialize_gpu()
+                if (
+                    config.trait_type == TraitType.BINARY
+                    and block_genotypes._cupy_cache is None
+                ):
+                    raise RuntimeError(
+                        "TR-Newton block was not GPU-resident; refusing mmap "
+                        "streaming inside Newton-CG. Reduce "
+                        "stochastic_variant_batch_size or free GPU memory."
+                    )
                 log_this_block = _should_log_stochastic_block(block_count, n_blocks)
                 if log_this_block:
                     log(f"    block {block_count}/{n_blocks}  variants={len(block_indices)}  step_size={step_size:.4f}  gpu={'yes' if block_genotypes._cupy_cache is not None else 'no'}  mem={mem()}")
@@ -2229,7 +2292,7 @@ def fit_variational_em(
                             return
                         checkpoint_callback(
                             _build_checkpoint(
-                                outer_iteration,
+                                outer_iteration + 1,
                                 completed_blocks_in_iteration=block_count - 1,
                                 beta_variance_state_override=beta_variance_state,
                                 reduced_second_moment_override=reduced_second_moment,
@@ -2274,8 +2337,13 @@ def fit_variational_em(
                         update_blend_weight=step_size,
                         resume_state=active_binary_resume_state,
                         progress_callback=_save_partial_binary_block if checkpoint_callback is not None else None,
+                        progress_checkpoint_seconds=float(
+                            getattr(config, "binary_inner_checkpoint_minutes", 15.0)
+                        )
+                        * 60.0,
                         restricted_posterior_warm_start=restricted_posterior_warm_start,
                         allow_gpu_exact_variant=allow_gpu_exact_variant_for_block,
+                        use_tr_newton_binary=bool(getattr(config, "use_tr_newton_binary", False)),
                     )
                     block_beta_candidate = np.asarray(block_state[1], dtype=np.float64)
                     block_beta_variance = (
@@ -2394,7 +2462,7 @@ def fit_variational_em(
                 ):
                     checkpoint_callback(
                         _build_checkpoint(
-                            outer_iteration,
+                            outer_iteration + 1,
                             completed_blocks_in_iteration=block_count,
                             beta_variance_state_override=beta_variance_state,
                             reduced_second_moment_override=reduced_second_moment,
@@ -2647,6 +2715,31 @@ def fit_variational_em(
             hyper_str = "  [+hyper]" if should_update_hyperparameters else ""
             variance_str = "  [beta_var]" if refresh_beta_variance else "  [beta_var=reuse]"
             nonzero_beta = int(np.count_nonzero(np.abs(beta_state) > 1e-8))
+            validation_targets_for_metrics = (
+                None
+                if validation_payload is None or validation_linear_predictor is None
+                else np.asarray(validation_payload[2], dtype=np.float64)
+            )
+            epoch_metrics = _epoch_monitoring_metrics(
+                trait_type=config.trait_type,
+                targets=target_vector,
+                linear_predictor=linear_predictor,
+                validation_targets=validation_targets_for_metrics,
+                validation_linear_predictor=validation_linear_predictor,
+            )
+            fit_wall_seconds = time.monotonic() - fit_wall_t0
+            elbo_value_for_epoch = float(elbo_history[-1]) if elbo_history else None
+            _append_internal_training_history_row(
+                callback_is_handling_history=per_epoch_eval_callback is not None,
+                validation_enabled=validation_payload is not None,
+                epoch=iter_num,
+                elbo=elbo_value_for_epoch,
+                training_auc=epoch_metrics["training_auc"],
+                wall_seconds=fit_wall_seconds,
+                n_active=nonzero_beta,
+                val_auc=epoch_metrics["val_auc"],
+                val_log_loss=epoch_metrics["val_log_loss"],
+            )
             log(
                 f"  SVI epoch {iter_num}/{config.max_outer_iterations}  obj={obj_str}  "
                 f"delta={parameter_change:.2e}  pred_delta={predictor_change:.2e}  "
@@ -2654,6 +2747,38 @@ def fit_variational_em(
                 f"hyper_delta={hyperparameter_change:.2e}  sigma_e2={sigma_error2:.4f}  "
                 f"g_scale={float(global_scale):.4f}  nz_beta={nonzero_beta}{val_str}{hyper_str}{variance_str}  mem={mem()}"
             )
+            if iter_num == 1 and not first_epoch_test_banner_emitted:
+                if config.trait_type == TraitType.BINARY:
+                    if epoch_metrics["val_auc"] is not None or epoch_metrics["val_log_loss"] is not None:
+                        log(
+                            "  >>> TEST smoke epoch 1 "
+                            + f"val_auc={_format_epoch_metric(epoch_metrics['val_auc'])} "
+                            + f"val_log_loss={_format_epoch_metric(epoch_metrics['val_log_loss'])} "
+                            + f"n={0 if validation_targets_for_metrics is None else int(validation_targets_for_metrics.shape[0])} <<<"
+                        )
+                    else:
+                        log(
+                            "  >>> TEST smoke epoch 1 "
+                            + f"training_auc={_format_epoch_metric(epoch_metrics['training_auc'])} "
+                            + f"training_log_loss={_format_epoch_metric(epoch_metrics['training_log_loss'])} "
+                            + f"n={int(target_vector.shape[0])} <<<"
+                        )
+                else:
+                    if epoch_metrics["val_r2"] is not None or epoch_metrics["val_mse"] is not None:
+                        log(
+                            "  >>> TEST smoke epoch 1 "
+                            + f"val_r2={_format_epoch_metric(epoch_metrics['val_r2'])} "
+                            + f"val_mse={_format_epoch_metric(epoch_metrics['val_mse'])} "
+                            + f"n={0 if validation_targets_for_metrics is None else int(validation_targets_for_metrics.shape[0])} <<<"
+                        )
+                    else:
+                        log(
+                            "  >>> TEST smoke epoch 1 "
+                            + f"training_r2={_format_epoch_metric(epoch_metrics['training_r2'])} "
+                            + f"training_mse={_format_epoch_metric(epoch_metrics['training_mse'])} "
+                            + f"n={int(target_vector.shape[0])} <<<"
+                        )
+                first_epoch_test_banner_emitted = True
             if per_epoch_eval_callback is not None:
                 # Snapshot the state the caller needs to compute held-out
                 # metrics. alpha is O(covariates), beta is O(reduced variants)
@@ -2675,6 +2800,17 @@ def fit_variational_em(
                     "sigma_error2": float(sigma_error2),
                     "global_scale": float(global_scale),
                     "nonzero_beta": nonzero_beta,
+                    "n_active": nonzero_beta,
+                    "elbo": elbo_value_for_epoch,
+                    "wall_seconds": fit_wall_seconds,
+                    "training_auc": epoch_metrics["training_auc"],
+                    "training_log_loss": epoch_metrics["training_log_loss"],
+                    "training_r2": epoch_metrics["training_r2"],
+                    "training_mse": epoch_metrics["training_mse"],
+                    "val_auc": epoch_metrics["val_auc"],
+                    "val_log_loss": epoch_metrics["val_log_loss"],
+                    "val_r2": epoch_metrics["val_r2"],
+                    "val_mse": epoch_metrics["val_mse"],
                     "validation_metric": validation_metric_this_epoch,
                     "alpha_reduced": np.asarray(alpha_state, dtype=np.float64).copy(),
                     "beta_reduced": np.asarray(beta_state, dtype=np.float64).copy(),
@@ -3130,6 +3266,31 @@ def fit_variational_em(
             variance_str = "  [beta_var]" if refresh_beta_variance else "  [beta_var=reuse]"
             nonzero_beta = int(np.count_nonzero(np.abs(beta_state) > 1e-8))
             iter_wall_seconds = time.monotonic() - iter_wall_t0
+            validation_targets_for_metrics = (
+                None
+                if validation_payload is None or validation_linear_predictor is None
+                else np.asarray(validation_payload[2], dtype=np.float64)
+            )
+            epoch_metrics = _epoch_monitoring_metrics(
+                trait_type=config.trait_type,
+                targets=target_vector,
+                linear_predictor=posterior_state.linear_predictor,
+                validation_targets=validation_targets_for_metrics,
+                validation_linear_predictor=validation_linear_predictor,
+            )
+            fit_wall_seconds = time.monotonic() - fit_wall_t0
+            elbo_value_for_epoch = float(elbo_history[-1]) if elbo_history else None
+            _append_internal_training_history_row(
+                callback_is_handling_history=per_epoch_eval_callback is not None,
+                validation_enabled=validation_payload is not None,
+                epoch=iter_num,
+                elbo=elbo_value_for_epoch,
+                training_auc=epoch_metrics["training_auc"],
+                wall_seconds=fit_wall_seconds,
+                n_active=nonzero_beta,
+                val_auc=epoch_metrics["val_auc"],
+                val_log_loss=epoch_metrics["val_log_loss"],
+            )
             log(
                 f"  EM iter {iter_num}/{config.max_outer_iterations}  obj={obj_str}  "
                 f"delta={parameter_change:.2e}  pred_delta={predictor_change:.2e}  "
@@ -3138,6 +3299,38 @@ def fit_variational_em(
                 f"g_scale={float(global_scale):.4f}  nz_beta={nonzero_beta}  wall={iter_wall_seconds:.1f}s"
                 f"{val_str}{hyper_str}{variance_str}  mem={mem()}"
             )
+            if iter_num == 1 and not first_epoch_test_banner_emitted:
+                if config.trait_type == TraitType.BINARY:
+                    if epoch_metrics["val_auc"] is not None or epoch_metrics["val_log_loss"] is not None:
+                        log(
+                            "  >>> TEST smoke epoch 1 "
+                            + f"val_auc={_format_epoch_metric(epoch_metrics['val_auc'])} "
+                            + f"val_log_loss={_format_epoch_metric(epoch_metrics['val_log_loss'])} "
+                            + f"n={0 if validation_targets_for_metrics is None else int(validation_targets_for_metrics.shape[0])} <<<"
+                        )
+                    else:
+                        log(
+                            "  >>> TEST smoke epoch 1 "
+                            + f"training_auc={_format_epoch_metric(epoch_metrics['training_auc'])} "
+                            + f"training_log_loss={_format_epoch_metric(epoch_metrics['training_log_loss'])} "
+                            + f"n={int(target_vector.shape[0])} <<<"
+                        )
+                else:
+                    if epoch_metrics["val_r2"] is not None or epoch_metrics["val_mse"] is not None:
+                        log(
+                            "  >>> TEST smoke epoch 1 "
+                            + f"val_r2={_format_epoch_metric(epoch_metrics['val_r2'])} "
+                            + f"val_mse={_format_epoch_metric(epoch_metrics['val_mse'])} "
+                            + f"n={0 if validation_targets_for_metrics is None else int(validation_targets_for_metrics.shape[0])} <<<"
+                        )
+                    else:
+                        log(
+                            "  >>> TEST smoke epoch 1 "
+                            + f"training_r2={_format_epoch_metric(epoch_metrics['training_r2'])} "
+                            + f"training_mse={_format_epoch_metric(epoch_metrics['training_mse'])} "
+                            + f"n={int(target_vector.shape[0])} <<<"
+                        )
+                first_epoch_test_banner_emitted = True
             if per_epoch_eval_callback is not None:
                 _epoch_snapshot = {
                     "epoch": iter_num,
@@ -3151,6 +3344,17 @@ def fit_variational_em(
                     "sigma_error2": float(sigma_error2),
                     "global_scale": float(global_scale),
                     "nonzero_beta": nonzero_beta,
+                    "n_active": nonzero_beta,
+                    "elbo": elbo_value_for_epoch,
+                    "wall_seconds": fit_wall_seconds,
+                    "training_auc": epoch_metrics["training_auc"],
+                    "training_log_loss": epoch_metrics["training_log_loss"],
+                    "training_r2": epoch_metrics["training_r2"],
+                    "training_mse": epoch_metrics["training_mse"],
+                    "val_auc": epoch_metrics["val_auc"],
+                    "val_log_loss": epoch_metrics["val_log_loss"],
+                    "val_r2": epoch_metrics["val_r2"],
+                    "val_mse": epoch_metrics["val_mse"],
                     "validation_metric": validation_metric_this_epoch,
                     "alpha_reduced": np.asarray(alpha_state, dtype=np.float64).copy(),
                     "beta_reduced": np.asarray(beta_state, dtype=np.float64).copy(),
@@ -3749,6 +3953,8 @@ def _fit_collapsed_posterior(
             posterior_working_set_coefficient_tolerance=config.posterior_working_set_coefficient_tolerance,
             restricted_posterior_warm_start=restricted_posterior_warm_start,
             allow_gpu_exact_variant=allow_gpu_exact_variant,
+            prior_precision_override=prior_precision_override_array,
+            use_tr_newton_binary=bool(getattr(config, "use_tr_newton_binary", False)),
         )
         beta_variance = _effective_beta_variance_state(
             compute_beta_variance=compute_beta_variance,
@@ -4105,11 +4311,37 @@ def _binary_penalized_log_posterior_cupy(
     )
 
 
+class _BinaryTRNewtonNotConverged(RuntimeError):
+    pass
+
+
+def _trust_region_result_converged(result: object) -> bool:
+    status = getattr(result, "status", None)
+    if status is not None:
+        if isinstance(status, str):
+            return status.lower() in {"converged", "success", "solved"}
+        status_name = str(getattr(status, "name", status)).lower()
+        status_value = str(getattr(status, "value", "")).lower()
+        return status_name in {"converged", "success", "solved"} or status_value in {
+            "converged",
+            "success",
+            "solved",
+        }
+    return bool(getattr(result, "converged", False))
+
+
+def _trust_region_result_status_label(result: object) -> str:
+    status = getattr(result, "status", None)
+    if status is not None:
+        return str(getattr(status, "name", getattr(status, "value", status)))
+    return "converged" if bool(getattr(result, "converged", False)) else "not_converged"
+
+
 # Opt-in alternative path to PG-IRLS for binary posterior fits: a trust-region
 # Newton-CG solver (see sv_pgs.tr_newton). Returns the same six-tuple as
 # ``_binary_posterior_state`` so it can be dropped in from inside that
-# function. Opting into this path is an explicit solver contract: failures are
-# surfaced instead of silently changing algorithms mid-fit.
+# function. Non-convergence is reported to the caller so the default PG-IRLS
+# path can take over instead of accepting a rejected/stalled TR state.
 def _binary_posterior_state_tr_newton(
     *,
     genotype_matrix: StandardizedGenotypeMatrix,
@@ -4140,12 +4372,26 @@ def _binary_posterior_state_tr_newton(
     posterior_working_set_coefficient_tolerance: float,
     restricted_posterior_warm_start: _RestrictedPosteriorWarmStart | None,
     allow_gpu_exact_variant: bool,
+    prior_precision_override: NDArray | None = None,
 ) -> tuple[NDArray, NDArray, NDArray, NDArray, float, int]:
     n_samples = int(genotype_matrix.shape[0])
     n_variants = int(genotype_matrix.shape[1])
     covariate_matrix_f64 = np.asarray(covariate_matrix, dtype=np.float64)
     target_array = np.asarray(targets, dtype=np.float64).reshape(-1)
     prior_variances_f64 = np.asarray(prior_variances, dtype=np.float64).reshape(-1)
+    if prior_precision_override is not None:
+        prior_precision_override_array: NDArray | None = np.maximum(
+            np.asarray(prior_precision_override, dtype=np.float64).reshape(-1), 0.0
+        )
+        assert prior_precision_override_array is not None
+        if prior_precision_override_array.shape != prior_variances_f64.shape:
+            raise ValueError("prior_precision_override must match prior_variances shape.")
+        effective_prior_variances_for_tr_newton = 1.0 / np.maximum(
+            prior_precision_override_array, 1e-12
+        )
+    else:
+        prior_precision_override_array = None
+        effective_prior_variances_for_tr_newton = prior_variances_f64
     alpha_init_f64 = np.asarray(alpha_init, dtype=np.float64).reshape(-1)
     beta_init_f64 = np.asarray(beta_init, dtype=np.float64).reshape(-1)
     predictor_offset_array = (
@@ -4184,7 +4430,7 @@ def _binary_posterior_state_tr_newton(
         matvec_design_transpose=_design_mv_transpose,
         covariate_matrix=covariate_matrix_f64,
         targets=target_array,
-        prior_variances=prior_variances_f64,
+        prior_variances=effective_prior_variances_for_tr_newton,
         predictor_offset=predictor_offset_array,
         beta_init=beta_init_f64,
         alpha_init=alpha_init_f64,
@@ -4192,6 +4438,13 @@ def _binary_posterior_state_tr_newton(
         gradient_tolerance=float(gradient_tolerance),
         cg_max_iterations=int(maximum_linear_solver_iterations),
     )
+    if not _trust_region_result_converged(result):
+        raise _BinaryTRNewtonNotConverged(
+            "TR-Newton did not converge "
+            + f"(status={_trust_region_result_status_label(result)}, "
+            + f"iters={getattr(result, 'iterations', '?')}, "
+            + f"grad_norm={getattr(result, 'final_gradient_norm', float('nan'))})"
+        )
 
     alpha = np.asarray(result.alpha, dtype=np.float64).reshape(-1)
     beta = np.asarray(result.beta, dtype=np.float64).reshape(-1)
@@ -4250,15 +4503,19 @@ def _binary_posterior_state_tr_newton(
                 posterior_working_set_coefficient_tolerance=posterior_working_set_coefficient_tolerance,
                 warm_start=warm_start,
                 allow_gpu_exact_variant=allow_gpu_exact_variant,
+                prior_precision_override=prior_precision_override_array,
             )
             if compute_beta_variance:
                 beta_variance = np.asarray(beta_variance_refit, dtype=np.float64)
         except RuntimeError as exc:
             raise RuntimeError("TR-Newton variance/logdet refit failed.") from exc
 
-    prior_precision = np.asarray(
-        1.0 / np.maximum(prior_variances_f64, 1e-8), dtype=np.float64
-    )
+    if prior_precision_override_array is not None:
+        prior_precision = np.asarray(prior_precision_override_array, dtype=np.float64)
+    else:
+        prior_precision = np.asarray(
+            1.0 / np.maximum(prior_variances_f64, 1e-8), dtype=np.float64
+        )
     final_objective = _binary_penalized_log_posterior(
         linear_predictor=linear_predictor,
         targets=target_array,
@@ -4368,6 +4625,7 @@ def _binary_posterior_state(
             restricted_posterior_warm_start=restricted_posterior_warm_start,
             minimum_weight=minimum_weight,
             allow_gpu_exact_variant=allow_gpu_exact_variant,
+            prior_precision_override=prior_precision_override,
         )
         if tr_result is None:
             raise RuntimeError("TR-Newton returned no posterior state.")
@@ -7076,7 +7334,18 @@ def _solve_sample_space_rhs_gpu(
     if genotype_matrix._cupy_cache is None and not streaming_gpu_enabled:
         raise RuntimeError("GPU sample-space solve requires a CuPy-resident matrix or GPU-streamable raw storage.")
     compute_cp_dtype = _cupy_compute_dtype(cp)
-    right_hand_side_gpu64 = cp.asarray(right_hand_side, dtype=cp.float64)
+    # F9 perf: accept device-resident (cupy) inputs without forcing a host
+    # round-trip. cp.asarray on a cupy array of matching dtype is already a
+    # no-op, but make the passthrough explicit so callers that already hold a
+    # device array (e.g. stochastic block loop with use_gpu_epoch_predictor_state)
+    # never trigger an incidental host copy. Bitwise-identical for numpy inputs.
+    if isinstance(right_hand_side, cp.ndarray):
+        right_hand_side_gpu64 = (
+            right_hand_side if right_hand_side.dtype == cp.float64
+            else right_hand_side.astype(cp.float64)
+        )
+    else:
+        right_hand_side_gpu64 = cp.asarray(right_hand_side, dtype=cp.float64)
     vector_input = right_hand_side_gpu64.ndim == 1
     if vector_input:
         right_hand_side_gpu64 = right_hand_side_gpu64[:, None]
@@ -7097,7 +7366,13 @@ def _solve_sample_space_rhs_gpu(
             raise ValueError("required_columns must match the number of rhs columns.")
     initial_solution_gpu64 = None
     if initial_guess is not None:
-        initial_solution_gpu64 = cp.asarray(initial_guess, dtype=cp.float64)
+        if isinstance(initial_guess, cp.ndarray):
+            initial_solution_gpu64 = (
+                initial_guess if initial_guess.dtype == cp.float64
+                else initial_guess.astype(cp.float64)
+            )
+        else:
+            initial_solution_gpu64 = cp.asarray(initial_guess, dtype=cp.float64)
         if initial_solution_gpu64.ndim == 1:
             initial_solution_gpu64 = initial_solution_gpu64[:, None]
         if initial_solution_gpu64.shape != right_hand_side_gpu64.shape:
@@ -9486,6 +9761,11 @@ def _solve_restricted_full(
                     lanczos_steps=logdet_lanczos_steps,
                     random_seed=random_seed,
                     control_variate_diagonal=variant_preconditioner,
+                    # REML operator = prior_scale_floor + diagonal_noise is
+                    # SPD by construction.  Genuinely small eigenvalues
+                    # must contribute their real log() to the estimate
+                    # rather than be dropped as "rank-deficient noise".
+                    treat_as_rank_deficient=False,
                 )
                 if compute_logdet
                 else 0.0
@@ -11609,6 +11889,187 @@ def _validation_metric_from_linear_predictor(
         )
     residual_vector = targets - linear_predictor
     return float(np.mean(residual_vector * residual_vector))
+
+
+def _binary_auc_from_scores(targets: NDArray, scores: NDArray) -> float | None:
+    target_array = np.asarray(targets, dtype=np.float64).reshape(-1)
+    score_array = np.asarray(scores, dtype=np.float64).reshape(-1)
+    if target_array.shape != score_array.shape or target_array.size == 0:
+        return None
+    positive_mask = target_array >= 0.5
+    negative_mask = ~positive_mask
+    n_positive = int(np.sum(positive_mask))
+    n_negative = int(np.sum(negative_mask))
+    if n_positive == 0 or n_negative == 0:
+        return None
+    order = np.argsort(score_array, kind="mergesort")
+    sorted_scores = score_array[order]
+    ranks = np.empty(score_array.shape[0], dtype=np.float64)
+    start = 0
+    while start < sorted_scores.shape[0]:
+        stop = start + 1
+        while stop < sorted_scores.shape[0] and sorted_scores[stop] == sorted_scores[start]:
+            stop += 1
+        average_rank = 0.5 * (start + 1 + stop)
+        ranks[order[start:stop]] = average_rank
+        start = stop
+    positive_rank_sum = float(np.sum(ranks[positive_mask]))
+    auc = (positive_rank_sum - n_positive * (n_positive + 1) / 2.0) / (
+        n_positive * n_negative
+    )
+    return float(np.clip(auc, 0.0, 1.0))
+
+
+def _binary_log_loss_from_linear_predictor(targets: NDArray, linear_predictor: NDArray) -> float:
+    target_array = np.asarray(targets, dtype=np.float64).reshape(-1)
+    probabilities = np.asarray(stable_sigmoid(linear_predictor), dtype=np.float64).reshape(-1)
+    probabilities = np.clip(probabilities, 1e-12, 1.0 - 1e-12)
+    return float(
+        -np.mean(
+            target_array * np.log(probabilities)
+            + (1.0 - target_array) * np.log(1.0 - probabilities)
+        )
+    )
+
+
+def _r2_from_linear_predictor(targets: NDArray, linear_predictor: NDArray) -> float | None:
+    target_array = np.asarray(targets, dtype=np.float64).reshape(-1)
+    prediction_array = np.asarray(linear_predictor, dtype=np.float64).reshape(-1)
+    if target_array.shape != prediction_array.shape or target_array.size == 0:
+        return None
+    residual_sum_squares = float(np.sum((target_array - prediction_array) ** 2))
+    total_sum_squares = float(np.sum((target_array - float(np.mean(target_array))) ** 2))
+    if total_sum_squares <= 0.0:
+        return None
+    return float(1.0 - residual_sum_squares / total_sum_squares)
+
+
+def _epoch_monitoring_metrics(
+    *,
+    trait_type: TraitType,
+    targets: NDArray,
+    linear_predictor: NDArray,
+    validation_targets: NDArray | None,
+    validation_linear_predictor: NDArray | None,
+) -> dict[str, float | None]:
+    metrics: dict[str, float | None] = {
+        "training_auc": None,
+        "training_log_loss": None,
+        "training_r2": None,
+        "training_mse": None,
+        "val_auc": None,
+        "val_log_loss": None,
+        "val_r2": None,
+        "val_mse": None,
+    }
+    if trait_type == TraitType.BINARY:
+        training_probabilities = np.asarray(stable_sigmoid(linear_predictor), dtype=np.float64)
+        metrics["training_auc"] = _binary_auc_from_scores(targets, training_probabilities)
+        metrics["training_log_loss"] = _binary_log_loss_from_linear_predictor(
+            targets,
+            linear_predictor,
+        )
+        if validation_targets is not None and validation_linear_predictor is not None:
+            validation_probabilities = np.asarray(
+                stable_sigmoid(validation_linear_predictor), dtype=np.float64
+            )
+            metrics["val_auc"] = _binary_auc_from_scores(
+                validation_targets,
+                validation_probabilities,
+            )
+            metrics["val_log_loss"] = _binary_log_loss_from_linear_predictor(
+                validation_targets,
+                validation_linear_predictor,
+            )
+        return metrics
+    residual = np.asarray(targets, dtype=np.float64).reshape(-1) - np.asarray(
+        linear_predictor,
+        dtype=np.float64,
+    ).reshape(-1)
+    metrics["training_mse"] = float(np.mean(residual * residual))
+    metrics["training_r2"] = _r2_from_linear_predictor(targets, linear_predictor)
+    if validation_targets is not None and validation_linear_predictor is not None:
+        validation_residual = np.asarray(validation_targets, dtype=np.float64).reshape(-1) - np.asarray(
+            validation_linear_predictor,
+            dtype=np.float64,
+        ).reshape(-1)
+        metrics["val_mse"] = float(np.mean(validation_residual * validation_residual))
+        metrics["val_r2"] = _r2_from_linear_predictor(
+            validation_targets,
+            validation_linear_predictor,
+        )
+    return metrics
+
+
+def _format_epoch_metric(value: object) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, (float, np.floating)):
+        return "" if not np.isfinite(float(value)) else f"{float(value):.6g}"
+    return str(value)
+
+
+def _internal_training_history_path() -> Path | None:
+    try:
+        from sv_pgs import progress as _progress
+    except ImportError:
+        return None
+    handle = getattr(_progress, "_log_file", None)
+    handle_name = getattr(handle, "name", None)
+    if not handle_name:
+        return None
+    try:
+        return Path(str(handle_name)).resolve().parent / "training_history.tsv"
+    except OSError:
+        return None
+
+
+def _append_internal_training_history_row(
+    *,
+    callback_is_handling_history: bool,
+    validation_enabled: bool,
+    epoch: int,
+    elbo: float | None,
+    training_auc: float | None,
+    wall_seconds: float,
+    n_active: int,
+    val_auc: float | None,
+    val_log_loss: float | None,
+) -> None:
+    if callback_is_handling_history:
+        return
+    history_path = _internal_training_history_path()
+    if history_path is None:
+        return
+    base_header = ["epoch", "elbo", "training_auc", "wall_seconds", "n_active"]
+    header = base_header + (["val_auc", "val_log_loss"] if validation_enabled else [])
+    row = [
+        str(int(epoch)),
+        _format_epoch_metric(elbo),
+        _format_epoch_metric(training_auc),
+        _format_epoch_metric(float(wall_seconds)),
+        str(int(n_active)),
+    ]
+    if validation_enabled:
+        row.extend([
+            _format_epoch_metric(val_auc),
+            _format_epoch_metric(val_log_loss),
+        ])
+    try:
+        history_path.parent.mkdir(parents=True, exist_ok=True)
+        rewrite_header = not history_path.exists() or history_path.stat().st_size == 0
+        if not rewrite_header:
+            existing_lines = history_path.read_text(encoding="utf-8").splitlines()
+            if len(existing_lines) <= 1 and existing_lines[:1] != ["\t".join(header)]:
+                rewrite_header = True
+        mode = "w" if rewrite_header else "a"
+        with history_path.open(mode, encoding="utf-8", newline="") as handle:
+            if rewrite_header:
+                handle.write("\t".join(header) + "\n")
+            handle.write("\t".join(row) + "\n")
+            handle.flush()
+    except OSError as exc:
+        log(f"  training history append skipped: {exc}")
 
 
 def _validation_evaluation(

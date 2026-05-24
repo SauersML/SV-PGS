@@ -1106,11 +1106,10 @@ def load_multi_source_dataset_from_files(
             support_counts=np.concatenate([stats.support_counts for stats in per_source_stats]).astype(np.int32, copy=False),
         )
     if precomputed_variant_records is not None:
-        variant_records = (
-            precomputed_variant_records
-            if isinstance(precomputed_variant_records, list)
-            else list(precomputed_variant_records)
-        )
+        if isinstance(precomputed_variant_records, list):
+            variant_records = precomputed_variant_records
+        else:
+            variant_records = list(precomputed_variant_records)
         log(f"reusing {len(variant_records):,} precomputed variant_records (skipping metadata join)")
     else:
         log("building variant records from defaults + optional metadata...")
@@ -2015,11 +2014,20 @@ def _build_plink_int8_cache_only(
         fortran_order=True,
     )
     if not has_space:
+        cells = int(n_samples) * int(n_variants)
+        reserve_bytes = max(64 * 1024 * 1024, required_bytes // 20)
+        deficit_bytes = (required_bytes + reserve_bytes) - available_bytes
         log(
-            "  PLINK int8 cache (post-stats build) skipped: would need "
-            f"{required_bytes / 1e9:.1f} GB but only "
-            f"{available_bytes / 1e9:.1f} GB free at {int8_path.parent}; "
-            "continuing with on-the-fly bed decode"
+            "  PLINK int8 cache (post-stats build) SKIPPED — insufficient disk:\n"
+            f"    target path      : {int8_path}\n"
+            f"    matrix shape     : {n_samples:,} samples x {n_variants:,} variants (dtype=int8, F-order)\n"
+            f"    cells x 1 byte   : {cells:,} B = {required_bytes / 1e9:.2f} GB ({required_bytes / (1024**3):.2f} GiB)\n"
+            f"    +5% reserve      : {reserve_bytes / 1e9:.2f} GB (min 64 MiB)\n"
+            f"    free at target   : {available_bytes / 1e9:.2f} GB ({available_bytes / (1024**3):.2f} GiB)\n"
+            f"    short by         : {deficit_bytes / 1e9:.2f} GB\n"
+            "    decision         : fall back to on-the-fly BED decode every epoch\n"
+            "    remediation      : free disk on this volume, or reduce variant count "
+            "(--variants subset); int8 cache is mmap-only and cannot be partially materialized"
         )
         return None
     writer = _StreamingInt8NpyWriter.open(
@@ -2201,11 +2209,25 @@ def compute_plink_variant_statistics_cached(
                 # over the full ~332k-sample microarray cohort) the int8 mmap
                 # would exceed disk. Skip the cache; downstream passes stream
                 # from .bed instead. Slower per epoch but no longer fatal.
+                cells = int(n_samples) * int(n_variants)
+                reserve_bytes = max(64 * 1024 * 1024, required_bytes // 20)
+                deficit_bytes = (required_bytes + reserve_bytes) - available_bytes
                 log(
-                    "  PLINK int8 cache skipped: would need "
-                    f"{required_bytes / 1e9:.1f} GB but only "
-                    f"{available_bytes / 1e9:.1f} GB free at {int8_path.parent}; "
-                    "continuing with on-the-fly bed decode (slower per epoch)"
+                    "  PLINK int8 cache SKIPPED — insufficient disk:\n"
+                    f"    target path      : {int8_path}\n"
+                    f"    matrix shape     : {n_samples:,} samples x {n_variants:,} variants "
+                    f"(dtype=int8, F-order, 1 byte/cell)\n"
+                    f"    cells x 1 byte   : {cells:,} B = {required_bytes / 1e9:.2f} GB "
+                    f"({required_bytes / (1024**3):.2f} GiB)\n"
+                    f"    +5% reserve      : {reserve_bytes / 1e9:.2f} GB (min 64 MiB)\n"
+                    f"    free at target   : {available_bytes / 1e9:.2f} GB "
+                    f"({available_bytes / (1024**3):.2f} GiB)\n"
+                    f"    short by         : {deficit_bytes / 1e9:.2f} GB\n"
+                    "    decision         : fall back to on-the-fly BED decode every epoch "
+                    "(stats cache still written; only the decoded-matrix mmap is skipped)\n"
+                    "    remediation      : free disk on this volume, or reduce variant count "
+                    "(--variants subset); int8 cache is a single mmap-able .npy and cannot "
+                    "be partially materialized"
                 )
                 int8_eligible = False
             else:

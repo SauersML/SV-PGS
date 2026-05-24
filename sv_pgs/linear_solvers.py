@@ -18,7 +18,10 @@ Two key algorithms:
 from __future__ import annotations
 
 import importlib
+import math
+import time
 from dataclasses import dataclass
+from enum import Enum
 from typing import Any, Callable
 
 import numpy as np
@@ -35,6 +38,37 @@ jax_sparse = importlib.import_module("jax.scipy.sparse")
 JaxDType = Any
 
 
+class LinearSolveStatus(Enum):
+    CONVERGED = "converged"
+    MAX_ITER = "max_iter"
+    TIME_BUDGET = "time_budget"
+    NUMERICAL_FAILURE = "numerical_failure"
+
+
+@dataclass(slots=True)
+class CGProgress:
+    iteration: int
+    max_iterations: int
+    elapsed_seconds: float
+    residual_norm: float
+    matvec_count: int
+    active_rhs: int | None = None
+    status: LinearSolveStatus | None = None
+
+
+@dataclass(slots=True)
+class LinearSolveResult:
+    solution: NDArray
+    status: LinearSolveStatus
+    iterations: int
+    residual_norm: float
+    matvec_count: int
+    elapsed_seconds: float
+
+
+CGProgressCallback = Callable[[CGProgress], None]
+
+
 @dataclass(slots=True)
 class LinearOperator:
     shape: tuple[int, int]
@@ -42,6 +76,8 @@ class LinearOperator:
     matmat: Callable[[JaxArray], JaxArray] | None = None
     dtype: JaxDType | None = None
     jax_compatible: bool = False
+    gpu_resident: bool | None = None
+    streaming_warning_emitted: bool = False
 
 
 def build_linear_operator(
@@ -50,6 +86,7 @@ def build_linear_operator(
     matmat: Callable[[JaxArray], JaxArray] | None = None,
     dtype: JaxDType | None = None,
     jax_compatible: bool = False,
+    gpu_resident: bool | None = None,
 ) -> LinearOperator:
     return LinearOperator(
         shape=shape,
@@ -57,7 +94,176 @@ def build_linear_operator(
         matmat=matmat,
         dtype=dtype,
         jax_compatible=jax_compatible,
+        gpu_resident=gpu_resident,
     )
+
+
+def _default_cg_progress_callback(progress: CGProgress) -> None:
+    from sv_pgs.progress import log
+
+    status_suffix = "" if progress.status is None else f" status={progress.status.name}"
+    active_suffix = "" if progress.active_rhs is None else f" active={progress.active_rhs}"
+    log(
+        f"      CG iter {progress.iteration}/{progress.max_iterations}: "
+        + f"elapsed={progress.elapsed_seconds:.1f}s residual_norm={progress.residual_norm:.2e} "
+        + f"matvecs={progress.matvec_count}{active_suffix}{status_suffix}"
+    )
+
+
+def _emit_cg_progress(
+    *,
+    callback: CGProgressCallback | None,
+    iteration: int,
+    max_iterations: int,
+    started_at: float,
+    residual_norm: float,
+    matvec_count: int,
+    active_rhs: int | None = None,
+    status: LinearSolveStatus | None = None,
+) -> None:
+    resolved_callback = _default_cg_progress_callback if callback is None else callback
+    resolved_callback(
+        CGProgress(
+            iteration=iteration,
+            max_iterations=max_iterations,
+            elapsed_seconds=time.monotonic() - started_at,
+            residual_norm=residual_norm,
+            matvec_count=matvec_count,
+            active_rhs=active_rhs,
+            status=status,
+        )
+    )
+
+
+def _maybe_emit_cg_progress(
+    *,
+    callback: CGProgressCallback | None,
+    progress_interval: int,
+    iteration: int,
+    max_iterations: int,
+    started_at: float,
+    residual_norm: float,
+    matvec_count: int,
+    active_rhs: int | None = None,
+    status: LinearSolveStatus | None = None,
+) -> None:
+    if progress_interval <= 0:
+        return
+    if iteration % progress_interval != 0 and status is None:
+        return
+    _emit_cg_progress(
+        callback=callback,
+        iteration=iteration,
+        max_iterations=max_iterations,
+        started_at=started_at,
+        residual_norm=residual_norm,
+        matvec_count=matvec_count,
+        active_rhs=active_rhs,
+        status=status,
+    )
+
+
+def _linear_solve_deadline(time_budget_seconds: float | None) -> float | None:
+    if time_budget_seconds is None:
+        return None
+    resolved_budget = float(time_budget_seconds)
+    if not np.isfinite(resolved_budget) or resolved_budget <= 0.0:
+        raise ValueError("time_budget_seconds must be positive when provided.")
+    return time.monotonic() + resolved_budget
+
+
+def _time_budget_exceeded(deadline: float | None) -> bool:
+    return deadline is not None and time.monotonic() >= deadline
+
+
+def _jax_backend_name() -> str:
+    try:
+        jax = importlib.import_module("jax")
+        return str(jax.default_backend())
+    except RuntimeError as error:
+        return f"unavailable:{error}"
+
+
+def _closure_values(function: Callable[..., Any]) -> tuple[Any, ...]:
+    closure = getattr(function, "__closure__", None)
+    if closure is None:
+        return ()
+    values: list[Any] = []
+    for cell in closure:
+        try:
+            values.append(cell.cell_contents)
+        except ValueError:
+            continue
+    return tuple(values)
+
+
+def _infer_gpu_resident(linear_operator: LinearOperator) -> bool | None:
+    if linear_operator.gpu_resident is not None:
+        return bool(linear_operator.gpu_resident)
+    if linear_operator.jax_compatible:
+        return True
+    for function in (linear_operator.matvec, linear_operator.matmat):
+        if function is None:
+            continue
+        for value in _closure_values(function):
+            if isinstance(value, LinearOperator):
+                nested = _infer_gpu_resident(value)
+                if nested is not None:
+                    return nested
+            if hasattr(value, "_cupy_cache"):
+                return getattr(value, "_cupy_cache") is not None
+    return None
+
+
+def _warn_if_streaming_operator(linear_operator: LinearOperator) -> None:
+    if linear_operator.streaming_warning_emitted:
+        return
+    gpu_resident = _infer_gpu_resident(linear_operator)
+    if gpu_resident is True:
+        return
+    linear_operator.streaming_warning_emitted = True
+    from sv_pgs.progress import log
+
+    log(
+        "WARNING: CG matvec is using a non-GPU-resident linear operator "
+        + f"shape={linear_operator.shape} backend={_jax_backend_name()} "
+        + "source=streaming-or-host"
+    )
+
+
+def _return_linear_solve(
+    result: LinearSolveResult,
+    *,
+    return_status: bool,
+) -> NDArray | LinearSolveResult:
+    if return_status:
+        return result
+    if result.status == LinearSolveStatus.CONVERGED:
+        return result.solution
+    if result.status == LinearSolveStatus.TIME_BUDGET:
+        from sv_pgs.progress import log
+
+        log(
+            "      CG time budget exceeded; returning best-so-far "
+            + f"residual_norm={result.residual_norm:.2e} matvecs={result.matvec_count}"
+        )
+        return result.solution
+    if result.status == LinearSolveStatus.NUMERICAL_FAILURE:
+        raise RuntimeError("Conjugate-gradient operator is not positive definite.")
+    raise RuntimeError(
+        "Conjugate-gradient solve failed to converge: "
+        + f"residual={result.residual_norm:.2e} iterations={result.iterations}"
+    )
+
+
+def _combine_status(current: LinearSolveStatus, new: LinearSolveStatus) -> LinearSolveStatus:
+    priority = {
+        LinearSolveStatus.CONVERGED: 0,
+        LinearSolveStatus.MAX_ITER: 1,
+        LinearSolveStatus.TIME_BUDGET: 2,
+        LinearSolveStatus.NUMERICAL_FAILURE: 3,
+    }
+    return new if priority[new] > priority[current] else current
 
 
 # Solve the linear system A @ x = b where A is symmetric positive-definite.
@@ -72,26 +278,39 @@ def solve_spd_system(
     max_iterations: int,
     initial_guess: NDArray | JaxArray | None = None,
     preconditioner: Callable[[JaxArray], JaxArray] | NDArray | JaxArray | None = None,
-) -> NDArray:
+    progress_callback: CGProgressCallback | None = None,
+    progress_interval: int = 5,
+    time_budget_seconds: float | None = None,
+    return_status: bool = False,
+) -> NDArray | LinearSolveResult:
     linear_operator = _as_linear_operator(operator)
     rhs_array = jnp.asarray(right_hand_side)
     operator_dtype = linear_operator.dtype or rhs_array.dtype
     solver_dtype = jnp.result_type(operator_dtype, rhs_array.dtype)
     rhs_array = rhs_array.astype(solver_dtype)
-    if linear_operator.jax_compatible and (preconditioner is None or not callable(preconditioner)):
-        return _solve_spd_system_with_jax_cg(
-            linear_operator=linear_operator,
-            rhs=rhs_array,
-            solver_dtype=solver_dtype,
-            tolerance=tolerance,
-            max_iterations=max_iterations,
-            initial_guess=None if initial_guess is None else jnp.asarray(initial_guess, dtype=solver_dtype),
-            preconditioner=preconditioner,
+    deadline = _linear_solve_deadline(time_budget_seconds)
+    if (
+        deadline is None
+        and progress_callback is None
+        and linear_operator.jax_compatible
+        and (preconditioner is None or not callable(preconditioner))
+    ):
+        return _return_linear_solve(
+            _solve_spd_system_with_jax_cg(
+                linear_operator=linear_operator,
+                rhs=rhs_array,
+                solver_dtype=solver_dtype,
+                tolerance=tolerance,
+                max_iterations=max_iterations,
+                initial_guess=None if initial_guess is None else jnp.asarray(initial_guess, dtype=solver_dtype),
+                preconditioner=preconditioner,
+            ),
+            return_status=return_status,
         )
     apply_preconditioner = _as_preconditioner(preconditioner, solver_dtype)
     output_dtype = np.asarray(jnp.zeros((), dtype=solver_dtype)).dtype
     if rhs_array.ndim == 1:
-        solution = _solve_single_rhs(
+        result = _solve_single_rhs(
             linear_operator=linear_operator,
             rhs=rhs_array,
             solver_dtype=solver_dtype,
@@ -99,8 +318,21 @@ def solve_spd_system(
             max_iterations=max_iterations,
             initial_guess=None if initial_guess is None else jnp.asarray(initial_guess, dtype=solver_dtype),
             preconditioner=apply_preconditioner,
+            progress_callback=progress_callback,
+            progress_interval=progress_interval,
+            deadline=deadline,
         )
-        return np.asarray(solution, dtype=output_dtype)
+        return _return_linear_solve(
+            LinearSolveResult(
+                solution=np.asarray(result.solution, dtype=output_dtype),
+                status=result.status,
+                iterations=result.iterations,
+                residual_norm=result.residual_norm,
+                matvec_count=result.matvec_count,
+                elapsed_seconds=result.elapsed_seconds,
+            ),
+            return_status=return_status,
+        )
 
     from sv_pgs.progress import log
     n_cols = rhs_array.shape[1]
@@ -118,28 +350,67 @@ def solve_spd_system(
             max_iterations=max_iterations,
             initial_guess=initial_matrix,
             preconditioner=apply_preconditioner,
+            progress_callback=progress_callback,
+            progress_interval=progress_interval,
+            deadline=deadline,
         )
-        return np.asarray(solution_matrix, dtype=output_dtype)
+        return _return_linear_solve(
+            LinearSolveResult(
+                solution=np.asarray(solution_matrix.solution, dtype=output_dtype),
+                status=solution_matrix.status,
+                iterations=solution_matrix.iterations,
+                residual_norm=solution_matrix.residual_norm,
+                matvec_count=solution_matrix.matvec_count,
+                elapsed_seconds=solution_matrix.elapsed_seconds,
+            ),
+            return_status=return_status,
+        )
 
     solution_columns: list[NDArray] = []
+    combined_status = LinearSolveStatus.CONVERGED
+    combined_iterations = 0
+    combined_matvecs = 0
+    combined_residual_norm = 0.0
+    column_solve_started_at = time.monotonic()
     for column_index in range(n_cols):
         if n_cols > 1:
             log(f"    CG solve: column {column_index+1}/{n_cols}")
-        solution_columns.append(
-            np.asarray(
-                _solve_single_rhs(
-                    linear_operator=linear_operator,
-                    rhs=rhs_array[:, column_index],
-                    solver_dtype=solver_dtype,
-                    tolerance=tolerance,
-                    max_iterations=max_iterations,
-                    initial_guess=None if initial_matrix is None else initial_matrix[:, column_index],
-                    preconditioner=apply_preconditioner,
-                ),
-                dtype=output_dtype,
-            )
+        column_result = _solve_single_rhs(
+            linear_operator=linear_operator,
+            rhs=rhs_array[:, column_index],
+            solver_dtype=solver_dtype,
+            tolerance=tolerance,
+            max_iterations=max_iterations,
+            initial_guess=None if initial_matrix is None else initial_matrix[:, column_index],
+            preconditioner=apply_preconditioner,
+            progress_callback=progress_callback,
+            progress_interval=progress_interval,
+            deadline=deadline,
         )
-    return np.column_stack(solution_columns).astype(output_dtype, copy=False)
+        solution_columns.append(np.asarray(column_result.solution, dtype=output_dtype))
+        combined_status = _combine_status(combined_status, column_result.status)
+        combined_iterations += column_result.iterations
+        combined_matvecs += column_result.matvec_count
+        combined_residual_norm = max(combined_residual_norm, column_result.residual_norm)
+        if column_result.status == LinearSolveStatus.TIME_BUDGET:
+            for remaining_column in range(column_index + 1, n_cols):
+                if initial_matrix is None:
+                    solution_columns.append(np.zeros(rhs_array.shape[0], dtype=output_dtype))
+                else:
+                    solution_columns.append(np.asarray(initial_matrix[:, remaining_column], dtype=output_dtype))
+            break
+    combined_solution = np.column_stack(solution_columns).astype(output_dtype, copy=False)
+    return _return_linear_solve(
+        LinearSolveResult(
+            solution=combined_solution,
+            status=combined_status,
+            iterations=combined_iterations,
+            residual_norm=combined_residual_norm,
+            matvec_count=combined_matvecs,
+            elapsed_seconds=time.monotonic() - column_solve_started_at,
+        ),
+        return_status=return_status,
+    )
 
 
 # Estimate log(determinant(A)) without computing the full eigendecomposition.
@@ -162,7 +433,29 @@ def stochastic_logdet(
     relative_error_tolerance: float = 0.05,
     absolute_error_tolerance: float = 0.0,
     control_variate_diagonal: NDArray | JaxArray | None = None,
+    treat_as_rank_deficient: bool = True,
 ) -> float:
+    """Estimate log-determinant via stochastic Lanczos quadrature.
+
+    The ``treat_as_rank_deficient`` flag controls how near-zero Ritz
+    eigenvalues are handled and is the key knob for the two semantics
+    this estimator can take on:
+
+    * ``True`` (default, pseudo-determinant semantics): drops Ritz
+      eigenvalues below ``max(matrix_norm * 1e-12, 1e-14)`` and
+      renormalizes the remaining quadrature weights.  This is the right
+      choice for SPSD/rank-deficient operators where exact-zero
+      eigenvalues should not contribute ``log(roundoff)`` noise to the
+      estimate (i.e. you actually want a pseudo-determinant over the
+      column-space).
+
+    * ``False`` (strict SPD semantics): includes every Ritz eigenvalue
+      that is strictly positive without renormalizing the weights.
+      This is the right choice when the operator is SPD by construction
+      (e.g. ``prior_scale_floor + diagonal_noise``) and a genuinely tiny
+      eigenvalue carries real ``log(eigenvalue)`` signal that must not
+      be dropped.
+    """
     linear_operator = _as_linear_operator(operator)
     baseline_logdet = 0.0
     if control_variate_diagonal is not None:
@@ -231,22 +524,41 @@ def stochastic_logdet(
         )
         for tridiagonal in tridiagonal_blocks:
             eigenvalues, eigenvectors = _small_symmetric_eigh(tridiagonal)
-            # Filter out eigenvalues below a noise floor based on matrix norm:
-            # clipping numerical-noise (near-zero / negative) eigenvalues to a
-            # tiny positive constant would inflate log-det by ~27 nats each.
-            matrix_norm = float(np.linalg.norm(eigenvalues, ord=np.inf))
-            noise_floor = max(matrix_norm * 1e-12, 1e-14)
-            positive_mask = eigenvalues > noise_floor
-            if not np.any(positive_mask):
-                continue
-            filtered_eigenvalues = eigenvalues[positive_mask]
-            filtered_first_components = eigenvectors[0, positive_mask]
-            # Renormalize the squared components so they still sum to 1 over the retained set.
-            sum_sq = float(np.sum(filtered_first_components ** 2))
-            if sum_sq <= 1e-12:
-                continue
-            weights = (filtered_first_components ** 2) / sum_sq
-            estimates.append(float(np.sum(weights * np.log(filtered_eigenvalues))))
+            if treat_as_rank_deficient:
+                # Pseudo-determinant semantics: drop eigenvalues below a
+                # noise floor based on matrix norm.  Clipping numerical-noise
+                # (near-zero / negative) eigenvalues to a tiny positive
+                # constant would inflate log-det by ~27 nats each, so we
+                # exclude them entirely and renormalize the weights over the
+                # retained subspace.
+                matrix_norm = float(np.linalg.norm(eigenvalues, ord=np.inf))
+                noise_floor = max(matrix_norm * 1e-12, 1e-14)
+                positive_mask = eigenvalues > noise_floor
+                if not np.any(positive_mask):
+                    continue
+                filtered_eigenvalues = eigenvalues[positive_mask]
+                filtered_first_components = eigenvectors[0, positive_mask]
+                # Renormalize squared components to sum to 1 over the retained set.
+                sum_sq = float(np.sum(filtered_first_components ** 2))
+                if sum_sq <= 1e-12:
+                    continue
+                weights = (filtered_first_components ** 2) / sum_sq
+                estimates.append(float(np.sum(weights * np.log(filtered_eigenvalues))))
+            else:
+                # Strict SPD semantics: include every strictly positive
+                # eigenvalue without renormalizing.  Genuinely small
+                # eigenvalues (e.g. 1e-13) contribute their real
+                # log(eigenvalue) to the estimate.  We still skip exactly
+                # zero / negative Ritz values (mathematically these cannot
+                # occur for SPD operators; if they do appear they are pure
+                # numerical noise and ``log`` would be undefined).
+                positive_mask = eigenvalues > 0.0
+                if not np.any(positive_mask):
+                    continue
+                filtered_eigenvalues = eigenvalues[positive_mask]
+                filtered_first_components = eigenvectors[0, positive_mask]
+                weights = filtered_first_components ** 2
+                estimates.append(float(np.sum(weights * np.log(filtered_eigenvalues))))
         probes_completed += current_block_size
         if probes_completed < minimum_required_probes or len(estimates) < 2:
             continue
@@ -346,7 +658,8 @@ def _solve_spd_system_with_jax_cg(
     max_iterations: int,
     initial_guess: JaxArray | None,
     preconditioner: NDArray | JaxArray | None,
-) -> NDArray:
+) -> LinearSolveResult:
+    started_at = time.monotonic()
     output_dtype = np.asarray(jnp.zeros((), dtype=solver_dtype)).dtype
     diagonal_preconditioner = None if preconditioner is None else jnp.asarray(preconditioner, dtype=solver_dtype)
     if diagonal_preconditioner is not None and diagonal_preconditioner.ndim != 1:
@@ -391,18 +704,28 @@ def _solve_spd_system_with_jax_cg(
         residual = rhs - apply_operator(solution)
         residual_norm = float(jnp.linalg.norm(residual))
         threshold = absolute_threshold
-        if not np.isfinite(residual_norm) or residual_norm > threshold:
-            raise RuntimeError(
-                "JAX conjugate-gradient solve failed to converge: "
-                + f"residual={residual_norm:.2e} threshold={threshold:.2e} iterations={max_iterations}"
-            )
-        return np.asarray(solution, dtype=output_dtype)
+        status = LinearSolveStatus.CONVERGED
+        if not np.isfinite(residual_norm):
+            status = LinearSolveStatus.NUMERICAL_FAILURE
+        elif residual_norm > threshold:
+            status = LinearSolveStatus.MAX_ITER
+        return LinearSolveResult(
+            solution=np.asarray(solution, dtype=output_dtype),
+            status=status,
+            iterations=max_iterations if status != LinearSolveStatus.CONVERGED else 0,
+            residual_norm=residual_norm,
+            matvec_count=1,
+            elapsed_seconds=time.monotonic() - started_at,
+        )
 
     if rhs.ndim != 2:
         raise ValueError("right_hand_side must be a vector or matrix.")
     if initial_guess is not None and initial_guess.shape != rhs.shape:
         raise ValueError("matrix initial_guess must have the same shape as right_hand_side.")
     solutions: list[NDArray] = []
+    combined_status = LinearSolveStatus.CONVERGED
+    combined_residual_norm = 0.0
+    combined_matvecs = 0
     for column_index in range(rhs.shape[1]):
         initial_vector = (
             None
@@ -411,18 +734,27 @@ def _solve_spd_system_with_jax_cg(
         )
         if initial_vector is None and safe_diagonal is not None:
             initial_vector = apply_preconditioner(rhs[:, column_index])
-        solutions.append(
-            _solve_spd_system_with_jax_cg(
-                linear_operator=linear_operator,
-                rhs=rhs[:, column_index],
-                solver_dtype=solver_dtype,
-                tolerance=tolerance,
-                max_iterations=max_iterations,
-                initial_guess=initial_vector,
-                preconditioner=None if safe_diagonal is None else np.asarray(safe_diagonal),
-            )
+        column_result = _solve_spd_system_with_jax_cg(
+            linear_operator=linear_operator,
+            rhs=rhs[:, column_index],
+            solver_dtype=solver_dtype,
+            tolerance=tolerance,
+            max_iterations=max_iterations,
+            initial_guess=initial_vector,
+            preconditioner=None if safe_diagonal is None else np.asarray(safe_diagonal),
         )
-    return np.column_stack(solutions).astype(output_dtype, copy=False)
+        solutions.append(column_result.solution)
+        combined_status = _combine_status(combined_status, column_result.status)
+        combined_residual_norm = max(combined_residual_norm, column_result.residual_norm)
+        combined_matvecs += column_result.matvec_count
+    return LinearSolveResult(
+        solution=np.column_stack(solutions).astype(output_dtype, copy=False),
+        status=combined_status,
+        iterations=max_iterations if combined_status != LinearSolveStatus.CONVERGED else 0,
+        residual_norm=combined_residual_norm,
+        matvec_count=combined_matvecs,
+        elapsed_seconds=time.monotonic() - started_at,
+    )
 
 
 def _as_preconditioner(
@@ -492,11 +824,20 @@ def _solve_single_rhs(
     max_iterations: int,
     initial_guess: JaxArray | None,
     preconditioner: Callable[[JaxArray], JaxArray] | None,
-) -> JaxArray:
-    import time
-    import math
-    from sv_pgs.progress import log
+    progress_callback: CGProgressCallback | None,
+    progress_interval: int,
+    deadline: float | None,
+) -> LinearSolveResult:
     residual_refresh_interval = 32
+    t_start = time.monotonic()
+    matvec_count = 0
+
+    def apply_operator(vector: JaxArray) -> JaxArray:
+        nonlocal matvec_count
+        _warn_if_streaming_operator(linear_operator)
+        matvec_count += 1
+        return jnp.asarray(linear_operator.matvec(vector), dtype=solver_dtype)
+
     # Convention: `tolerance` is RELATIVE: we require ||r|| <= tolerance * max(||b||, 1).
     # We work with squared quantities throughout for efficiency: the equivalent
     # squared check is ||r||^2 <= tolerance^2 * max(||b||^2, 1).
@@ -509,74 +850,143 @@ def _solve_single_rhs(
             solution = jnp.asarray(preconditioner(rhs), dtype=solver_dtype)
     else:
         solution = initial_guess
-    residual = rhs - jnp.asarray(linear_operator.matvec(solution), dtype=solver_dtype)
+    best_solution = jnp.asarray(solution, dtype=solver_dtype)
+    residual = rhs - apply_operator(solution)
     residual_norm_sq_jax = jnp.vdot(residual, residual)
     initial_residual = float(residual_norm_sq_jax)
     rhs_norm_sq = float(jnp.vdot(rhs, rhs))
     convergence_threshold_sq = tol_sq * max(rhs_norm_sq, 1.0)
     if initial_residual <= convergence_threshold_sq:
-        return jnp.asarray(solution, dtype=solver_dtype)
+        return LinearSolveResult(
+            solution=np.asarray(solution, dtype=np.asarray(jnp.zeros((), dtype=solver_dtype)).dtype),
+            status=LinearSolveStatus.CONVERGED,
+            iterations=0,
+            residual_norm=math.sqrt(max(initial_residual, 0.0)),
+            matvec_count=matvec_count,
+            elapsed_seconds=time.monotonic() - t_start,
+        )
     preconditioned_residual = residual if preconditioner is None else preconditioner(residual)
     search_direction = preconditioned_residual
     residual_dot_jax = jnp.vdot(residual, preconditioned_residual)
     best_residual_dot = float(residual_norm_sq_jax)
-    # Progress is measured in log-space: how far the residual has dropped
-    # from initial toward the tolerance.  E.g. if initial=1e0, tol=1e-6,
-    # and current=1e-3, we're 50% of the way (3 out of 6 orders of magnitude).
-    log_initial = math.log10(max(initial_residual, 1e-30))
-    log_target = math.log10(max(convergence_threshold_sq, 1e-30))
-    log_range = max(log_initial - log_target, 1e-6)
-    t_start = time.monotonic()
-    last_log = t_start
     for _iteration_index in range(max_iterations):
-        operator_search_direction = jnp.asarray(linear_operator.matvec(search_direction), dtype=solver_dtype)
+        iteration = _iteration_index + 1
+        if _time_budget_exceeded(deadline):
+            residual_norm = math.sqrt(max(best_residual_dot, 0.0))
+            _maybe_emit_cg_progress(
+                callback=progress_callback,
+                progress_interval=progress_interval,
+                iteration=_iteration_index,
+                max_iterations=max_iterations,
+                started_at=t_start,
+                residual_norm=residual_norm,
+                matvec_count=matvec_count,
+                status=LinearSolveStatus.TIME_BUDGET,
+            )
+            return LinearSolveResult(
+                solution=np.asarray(best_solution, dtype=np.asarray(jnp.zeros((), dtype=solver_dtype)).dtype),
+                status=LinearSolveStatus.TIME_BUDGET,
+                iterations=_iteration_index,
+                residual_norm=residual_norm,
+                matvec_count=matvec_count,
+                elapsed_seconds=time.monotonic() - t_start,
+            )
+        operator_search_direction = apply_operator(search_direction)
         step_denom_jax = jnp.vdot(search_direction, operator_search_direction)
         step_denom = float(step_denom_jax)
         if not np.isfinite(step_denom) or step_denom <= 0.0:
-            residual = rhs - jnp.asarray(linear_operator.matvec(solution), dtype=solver_dtype)
+            residual = rhs - apply_operator(solution)
             preconditioned_residual = residual if preconditioner is None else preconditioner(residual)
             search_direction = preconditioned_residual
             residual_dot_jax = jnp.vdot(residual, preconditioned_residual)
-            operator_search_direction = jnp.asarray(linear_operator.matvec(search_direction), dtype=solver_dtype)
+            operator_search_direction = apply_operator(search_direction)
             step_denom_jax = jnp.vdot(search_direction, operator_search_direction)
             step_denom = float(step_denom_jax)
             if not np.isfinite(step_denom) or step_denom <= 0.0:
-                raise RuntimeError("Conjugate-gradient operator is not positive definite.")
+                residual_norm = math.sqrt(max(best_residual_dot, 0.0))
+                _maybe_emit_cg_progress(
+                    callback=progress_callback,
+                    progress_interval=progress_interval,
+                    iteration=iteration,
+                    max_iterations=max_iterations,
+                    started_at=t_start,
+                    residual_norm=residual_norm,
+                    matvec_count=matvec_count,
+                    status=LinearSolveStatus.NUMERICAL_FAILURE,
+                )
+                return LinearSolveResult(
+                    solution=np.asarray(best_solution, dtype=np.asarray(jnp.zeros((), dtype=solver_dtype)).dtype),
+                    status=LinearSolveStatus.NUMERICAL_FAILURE,
+                    iterations=iteration,
+                    residual_norm=residual_norm,
+                    matvec_count=matvec_count,
+                    elapsed_seconds=time.monotonic() - t_start,
+                )
         step_size = residual_dot_jax / step_denom_jax
         solution = solution + step_size * search_direction
         residual = residual - step_size * operator_search_direction
         if (_iteration_index + 1) % residual_refresh_interval == 0:
-            residual = rhs - jnp.asarray(linear_operator.matvec(solution), dtype=solver_dtype)
+            residual = rhs - apply_operator(solution)
         updated_residual_norm_sq_jax = jnp.vdot(residual, residual)
         updated_residual_dot = float(updated_residual_norm_sq_jax)
-        best_residual_dot = min(best_residual_dot, updated_residual_dot)
-        now = time.monotonic()
-        if now - last_log >= 5.0 or updated_residual_dot <= convergence_threshold_sq:
-            log_current = math.log10(max(updated_residual_dot, 1e-30))
-            pct = min(100.0, max(0.0, 100.0 * (log_initial - log_current) / log_range))
-            log(f"      CG iter {_iteration_index+1}/{max_iterations}: {pct:.0f}% converged  residual={updated_residual_dot:.2e}  ({now - t_start:.1f}s)")
-            last_log = now
+        if updated_residual_dot < best_residual_dot:
+            best_residual_dot = updated_residual_dot
+            best_solution = jnp.asarray(solution, dtype=solver_dtype)
+        residual_norm = math.sqrt(max(updated_residual_dot, 0.0))
+        _maybe_emit_cg_progress(
+            callback=progress_callback,
+            progress_interval=progress_interval,
+            iteration=iteration,
+            max_iterations=max_iterations,
+            started_at=t_start,
+            residual_norm=residual_norm,
+            matvec_count=matvec_count,
+            status=LinearSolveStatus.CONVERGED if updated_residual_dot <= convergence_threshold_sq else None,
+        )
         if updated_residual_dot <= convergence_threshold_sq:
-            return jnp.asarray(solution, dtype=solver_dtype)
+            return LinearSolveResult(
+                solution=np.asarray(solution, dtype=np.asarray(jnp.zeros((), dtype=solver_dtype)).dtype),
+                status=LinearSolveStatus.CONVERGED,
+                iterations=iteration,
+                residual_norm=residual_norm,
+                matvec_count=matvec_count,
+                elapsed_seconds=time.monotonic() - t_start,
+            )
         updated_preconditioned_residual = residual if preconditioner is None else preconditioner(residual)
         updated_residual_dot_jax = jnp.vdot(residual, updated_preconditioned_residual)
         beta = updated_residual_dot_jax / residual_dot_jax
         beta_value = float(beta)
         if not np.isfinite(beta_value) or beta_value < 0.0:
-            residual = rhs - jnp.asarray(linear_operator.matvec(solution), dtype=solver_dtype)
+            residual = rhs - apply_operator(solution)
             search_direction = updated_preconditioned_residual
             updated_preconditioned_residual = residual if preconditioner is None else preconditioner(residual)
             updated_residual_dot_jax = jnp.vdot(residual, updated_preconditioned_residual)
             updated_residual_dot = float(jnp.vdot(residual, residual))
-            best_residual_dot = min(best_residual_dot, updated_residual_dot)
+            if updated_residual_dot < best_residual_dot:
+                best_residual_dot = updated_residual_dot
+                best_solution = jnp.asarray(solution, dtype=solver_dtype)
         else:
             search_direction = updated_preconditioned_residual + beta * search_direction
         residual_dot_jax = updated_residual_dot_jax
     final_residual = float(jnp.vdot(residual, residual))
-    raise RuntimeError(
-        "Conjugate-gradient solve failed to converge: "
-        + f"residual={final_residual:.2e} threshold={convergence_threshold_sq:.2e} "
-        + f"iterations={max_iterations}"
+    residual_norm = math.sqrt(max(min(final_residual, best_residual_dot), 0.0))
+    _maybe_emit_cg_progress(
+        callback=progress_callback,
+        progress_interval=progress_interval,
+        iteration=max_iterations,
+        max_iterations=max_iterations,
+        started_at=t_start,
+        residual_norm=residual_norm,
+        matvec_count=matvec_count,
+        status=LinearSolveStatus.MAX_ITER,
+    )
+    return LinearSolveResult(
+        solution=np.asarray(best_solution, dtype=np.asarray(jnp.zeros((), dtype=solver_dtype)).dtype),
+        status=LinearSolveStatus.MAX_ITER,
+        iterations=max_iterations,
+        residual_norm=residual_norm,
+        matvec_count=matvec_count,
+        elapsed_seconds=time.monotonic() - t_start,
     )
 
 
@@ -588,11 +998,14 @@ def _solve_multiple_rhs(
     max_iterations: int,
     initial_guess: JaxArray | None,
     preconditioner: Callable[[JaxArray], JaxArray] | None,
-) -> JaxArray:
-    import time
-    from sv_pgs.progress import log
-
+    progress_callback: CGProgressCallback | None,
+    progress_interval: int,
+    deadline: float | None,
+) -> LinearSolveResult:
     residual_refresh_interval = 32
+    t_start = time.monotonic()
+    output_dtype = np.asarray(jnp.zeros((), dtype=solver_dtype)).dtype
+    matvec_count = 0
     # Convention: `tolerance` is RELATIVE per column: require
     # ||r_i|| <= tolerance * max(||b_i||, 1), equivalently
     # ||r_i||^2 <= tolerance^2 * max(||b_i||^2, 1).  We work in squared space.
@@ -609,6 +1022,9 @@ def _solve_multiple_rhs(
         raise ValueError("matrix solve requires an operator matmat implementation.")
 
     def apply_operator_active(matrix: JaxArray, active_columns: NDArray | None = None) -> JaxArray:
+        nonlocal matvec_count
+        _warn_if_streaming_operator(linear_operator)
+        matvec_count += 1
         if active_columns is None:
             return jnp.asarray(operator_matmat(matrix), dtype=solver_dtype)
         if active_columns.size == 0:
@@ -623,19 +1039,44 @@ def _solve_multiple_rhs(
     rhs_norm_sq = np.asarray(jnp.sum(rhs * rhs, axis=0), dtype=np.float64)
     convergence_threshold_sq = tol_sq * np.maximum(rhs_norm_sq, 1.0)
     converged = residual_norm_sq <= convergence_threshold_sq
+    best_solution = jnp.asarray(solution, dtype=solver_dtype)
+    best_residual_norm_sq = float(np.max(residual_norm_sq))
     if np.all(converged):
-        return jnp.asarray(solution, dtype=solver_dtype)
+        return LinearSolveResult(
+            solution=np.asarray(solution, dtype=output_dtype),
+            status=LinearSolveStatus.CONVERGED,
+            iterations=0,
+            residual_norm=math.sqrt(max(best_residual_norm_sq, 0.0)),
+            matvec_count=matvec_count,
+            elapsed_seconds=time.monotonic() - t_start,
+        )
 
     preconditioned_residual = residual if preconditioner is None else preconditioner(residual)
     search_direction = preconditioned_residual
     residual_dot = np.asarray(jnp.sum(residual * preconditioned_residual, axis=0), dtype=np.float64)
-    log_initial = np.log10(np.maximum(residual_norm_sq, 1e-30))
-    log_target = np.log10(np.maximum(convergence_threshold_sq, 1e-30))
-    log_range = np.maximum(log_initial - log_target, 1e-6)
-    t_start = time.monotonic()
-    last_log = t_start
-    active_count = int(np.sum(~converged))
     for iteration_index in range(max_iterations):
+        iteration = iteration_index + 1
+        if _time_budget_exceeded(deadline):
+            residual_norm = math.sqrt(max(best_residual_norm_sq, 0.0))
+            _maybe_emit_cg_progress(
+                callback=progress_callback,
+                progress_interval=progress_interval,
+                iteration=iteration_index,
+                max_iterations=max_iterations,
+                started_at=t_start,
+                residual_norm=residual_norm,
+                matvec_count=matvec_count,
+                active_rhs=int(np.sum(~converged)),
+                status=LinearSolveStatus.TIME_BUDGET,
+            )
+            return LinearSolveResult(
+                solution=np.asarray(best_solution, dtype=output_dtype),
+                status=LinearSolveStatus.TIME_BUDGET,
+                iterations=iteration_index,
+                residual_norm=residual_norm,
+                matvec_count=matvec_count,
+                elapsed_seconds=time.monotonic() - t_start,
+            )
         active_columns = np.flatnonzero(~converged).astype(np.int32, copy=False)
         active_mask = jnp.asarray((~converged).astype(np.asarray(jnp.zeros((), dtype=solver_dtype)).dtype), dtype=solver_dtype)
         masked_search = search_direction * active_mask[None, :]
@@ -656,7 +1097,26 @@ def _solve_multiple_rhs(
             operator_search = apply_operator_active(masked_search, active_columns) * active_mask[None, :]
             step_denom = np.asarray(jnp.sum(masked_search * operator_search, axis=0), dtype=np.float64)
             if np.any((~converged) & (~np.isfinite(step_denom) | (step_denom <= 0.0))):
-                raise RuntimeError("Conjugate-gradient operator is not positive definite.")
+                residual_norm = math.sqrt(max(best_residual_norm_sq, 0.0))
+                _maybe_emit_cg_progress(
+                    callback=progress_callback,
+                    progress_interval=progress_interval,
+                    iteration=iteration,
+                    max_iterations=max_iterations,
+                    started_at=t_start,
+                    residual_norm=residual_norm,
+                    matvec_count=matvec_count,
+                    active_rhs=int(np.sum(~converged)),
+                    status=LinearSolveStatus.NUMERICAL_FAILURE,
+                )
+                return LinearSolveResult(
+                    solution=np.asarray(best_solution, dtype=output_dtype),
+                    status=LinearSolveStatus.NUMERICAL_FAILURE,
+                    iterations=iteration,
+                    residual_norm=residual_norm,
+                    matvec_count=matvec_count,
+                    elapsed_seconds=time.monotonic() - t_start,
+                )
         step_scale = np.zeros_like(step_denom)
         active_indices = ~converged
         step_scale[active_indices] = residual_dot[active_indices] / step_denom[active_indices]
@@ -667,28 +1127,31 @@ def _solve_multiple_rhs(
             residual = rhs - apply_operator_active(solution, active_columns)
         residual_norm_sq = np.asarray(jnp.sum(residual * residual, axis=0), dtype=np.float64)
         converged = residual_norm_sq <= convergence_threshold_sq
-        now = time.monotonic()
         new_active_count = int(np.sum(~converged))
-        if now - last_log >= 5.0 or new_active_count == 0:
-            if active_count > 0:
-                progress = np.zeros_like(residual_norm_sq)
-                progress[~converged] = np.clip(
-                    100.0 * (log_initial[~converged] - np.log10(np.maximum(residual_norm_sq[~converged], 1e-30))) / log_range[~converged],
-                    0.0,
-                    100.0,
-                )
-                progress[converged] = 100.0
-                mean_progress = float(np.mean(progress))
-            else:
-                mean_progress = 100.0
-            residual_summary = float(np.max(residual_norm_sq))
-            log(
-                f"      CG iter {iteration_index+1}/{max_iterations}: {mean_progress:.0f}% converged  "
-                + f"active={new_active_count}/{rhs.shape[1]}  residual={residual_summary:.2e}  ({now - t_start:.1f}s)"
-            )
-            last_log = now
+        residual_summary = float(np.max(residual_norm_sq))
+        if residual_summary < best_residual_norm_sq:
+            best_residual_norm_sq = residual_summary
+            best_solution = jnp.asarray(solution, dtype=solver_dtype)
+        _maybe_emit_cg_progress(
+            callback=progress_callback,
+            progress_interval=progress_interval,
+            iteration=iteration,
+            max_iterations=max_iterations,
+            started_at=t_start,
+            residual_norm=math.sqrt(max(residual_summary, 0.0)),
+            matvec_count=matvec_count,
+            active_rhs=new_active_count,
+            status=LinearSolveStatus.CONVERGED if new_active_count == 0 else None,
+        )
         if new_active_count == 0:
-            return jnp.asarray(solution, dtype=solver_dtype)
+            return LinearSolveResult(
+                solution=np.asarray(solution, dtype=output_dtype),
+                status=LinearSolveStatus.CONVERGED,
+                iterations=iteration,
+                residual_norm=math.sqrt(max(residual_summary, 0.0)),
+                matvec_count=matvec_count,
+                elapsed_seconds=time.monotonic() - t_start,
+            )
         updated_preconditioned = residual if preconditioner is None else preconditioner(residual)
         updated_residual_dot = np.asarray(jnp.sum(residual * updated_preconditioned, axis=0), dtype=np.float64)
         beta = np.zeros_like(updated_residual_dot)
@@ -701,17 +1164,34 @@ def _solve_multiple_rhs(
             updated_residual_dot = np.asarray(jnp.sum(residual * updated_preconditioned, axis=0), dtype=np.float64)
             search_direction = search_direction * (1.0 - invalid_beta_mask[None, :]) + updated_preconditioned * invalid_beta_mask[None, :]
             beta[invalid_beta] = 0.0
+            refreshed_summary = float(np.max(np.asarray(jnp.sum(residual * residual, axis=0), dtype=np.float64)))
+            if refreshed_summary < best_residual_norm_sq:
+                best_residual_norm_sq = refreshed_summary
+                best_solution = jnp.asarray(solution, dtype=solver_dtype)
         beta_jax = jnp.asarray(beta, dtype=solver_dtype)
         search_direction = updated_preconditioned + search_direction * beta_jax[None, :]
         search_direction = search_direction * jnp.asarray((~converged).astype(np.asarray(jnp.zeros((), dtype=solver_dtype)).dtype), dtype=solver_dtype)[None, :]
         residual_dot = updated_residual_dot
-        active_count = new_active_count
     final_residual = float(np.max(np.asarray(jnp.sum(residual * residual, axis=0), dtype=np.float64)))
-    final_threshold = float(np.max(convergence_threshold_sq))
-    raise RuntimeError(
-        "Conjugate-gradient solve failed to converge: "
-        + f"residual={final_residual:.2e} threshold={final_threshold:.2e} "
-        + f"iterations={max_iterations}"
+    residual_norm = math.sqrt(max(min(final_residual, best_residual_norm_sq), 0.0))
+    _maybe_emit_cg_progress(
+        callback=progress_callback,
+        progress_interval=progress_interval,
+        iteration=max_iterations,
+        max_iterations=max_iterations,
+        started_at=t_start,
+        residual_norm=residual_norm,
+        matvec_count=matvec_count,
+        active_rhs=int(np.sum(~converged)),
+        status=LinearSolveStatus.MAX_ITER,
+    )
+    return LinearSolveResult(
+        solution=np.asarray(best_solution, dtype=output_dtype),
+        status=LinearSolveStatus.MAX_ITER,
+        iterations=max_iterations,
+        residual_norm=residual_norm,
+        matvec_count=matvec_count,
+        elapsed_seconds=time.monotonic() - t_start,
     )
 
 
