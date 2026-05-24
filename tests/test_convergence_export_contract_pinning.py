@@ -57,16 +57,27 @@ def _make_stub_model(
     return types.SimpleNamespace(state=state)
 
 
-def test_nonconverged_export_warns_but_does_not_raise(caplog):
+def test_nonconverged_export_warns_but_does_not_raise(capsys):
     """SOFT guard: non-converged + allow_nonconverged_export=False must warn,
-    NOT raise. This pins the post-swarm relaxation."""
+    NOT raise. This pins the post-swarm relaxation. The warning text must
+    actually be emitted (otherwise this guard could silently disappear)."""
     config = ModelConfig(trait_type=TraitType.QUANTITATIVE)
     assert config.allow_nonconverged_export is False
     model = _make_stub_model(converged=False)
-    # The function logs via the pipeline's ``log`` helper — caplog won't see
-    # that, so capture via pytest's capsys-equivalent on stdout.
-    # We simply assert no exception is raised.
     pipeline_module._guard_nonconverged_export(model, config)
+    captured = capsys.readouterr()
+    combined = captured.out + captured.err
+    assert "WARNING" in combined, (
+        f"non-converged guard must emit a WARNING line; got: {combined!r}"
+    )
+    assert "non-converged" in combined.lower() or "did not converge" in combined.lower(), (
+        f"non-converged guard message must mention non-convergence; got: {combined!r}"
+    )
+    for field_name in _DELTA_FIELD_NAMES:
+        assert field_name in combined, (
+            f"non-converged guard must include {field_name} in its log line; "
+            f"got: {combined!r}"
+        )
 
 
 def test_nonconverged_guard_emits_all_four_delta_fields(capsys):

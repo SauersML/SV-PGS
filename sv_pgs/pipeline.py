@@ -271,8 +271,13 @@ def run_training_pipeline(
     # `_log_cached_test_evals_from_summary` calls would mis-parse, and so
     # concurrent disease sweeps writing into sibling output dirs cannot
     # clobber each other's staging file.
+    # Keep the trailing `.gz` so `_open_text_file`'s `path.suffix == ".gz"`
+    # branch still selects the gzip codec. Appending `.tmp.<pid>.<uuid>`
+    # AFTER `.gz` shifted `path.suffix` to `.<uuid>` and silently dropped
+    # gzip encoding — producing raw-JSON files renamed to `summary.json.gz`
+    # that readers reject with `gzip.BadGzipFile`.
     tmp_summary_path = summary_path.with_name(
-        f"{summary_path.name}.tmp.{os.getpid()}.{uuid.uuid4().hex}"
+        f"{summary_path.stem}.tmp.{os.getpid()}.{uuid.uuid4().hex}{summary_path.suffix}"
     )
     try:
         with _open_text_file(tmp_summary_path, "wt") as handle:
@@ -367,7 +372,13 @@ def _write_predictions_and_summary(
             candidate = None
             try:
                 candidate = training_components_getter()
-            except Exception:
+            except (AttributeError, RuntimeError, ValueError, TypeError) as exc:
+                log(
+                    "training_decision_components cache fast-path skipped: "
+                    f"exc_type={type(exc).__name__} exc={exc!r} "
+                    f"is_training_dataset={is_training_dataset} "
+                    f"sample_count={len(dataset.sample_ids)}"
+                )
                 candidate = None
             if (
                 candidate is not None
@@ -387,7 +398,13 @@ def _write_predictions_and_summary(
                             len(training_sample_ids) == len(dataset.sample_ids)
                             and list(training_sample_ids) == list(dataset.sample_ids)
                         )
-                    except Exception:
+                    except (TypeError, ValueError, AttributeError) as exc:
+                        log(
+                            "training_decision_components cache id-match skipped: "
+                            f"exc_type={type(exc).__name__} exc={exc!r} "
+                            f"is_training_dataset={is_training_dataset} "
+                            f"sample_count={len(dataset.sample_ids)}"
+                        )
                         ids_ok = False
                 if ids_ok:
                     cached_components = candidate

@@ -5211,10 +5211,22 @@ def _binary_posterior_state(
                 )
             )
         except RuntimeError as exc:
-            log(f"      final posterior solve failed ({exc}), using last Newton iteration result")
+            # Downstream artifacts must be able to distinguish a real zero
+            # posterior variance from a failed solve. Emit NaN so consumers
+            # can detect missing variance via np.isnan(...), and surface an
+            # ERROR-level diagnostic so this never goes unnoticed in logs.
+            log(
+                "      ERROR: final binary posterior solve failed "
+                f"({type(exc).__name__}: {exc}); exporting beta_variance=NaN "
+                "to signal missing uncertainty (downstream must check np.isnan)."
+            )
             final_alpha = parameters[:covariate_count]
             final_beta = parameters[covariate_count:]
-            beta_variance = np.zeros_like(np.asarray(prior_variances, dtype=np.float64), dtype=np.float64)
+            beta_variance = np.full_like(
+                np.asarray(prior_variances, dtype=np.float64),
+                np.nan,
+                dtype=np.float64,
+            )
             _fitted_response = current_linear_predictor - predictor_offset_array
             logdet_covariance = 0.0
             logdet_gls = 0.0

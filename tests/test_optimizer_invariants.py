@@ -163,10 +163,9 @@ def test_sigma_error_lower_bound_under_no_signal():
     config = ModelConfig(trait_type=TraitType.QUANTITATIVE, max_outer_iterations=15)
     result = _fit(X, W, y, records, config)
     sigma2_hat = float(result.sigma_error2)
-    if sigma2_hat < 0.5:
-        pytest.xfail(
-            f"sigma_e^2 collapsed under no-signal data: estimated {sigma2_hat:.4f} < 0.5"
-        )
+    assert sigma2_hat >= 0.5, (
+        f"sigma_e^2 collapsed: estimated {sigma2_hat:.4f} < 0.5"
+    )
 
 
 def test_zero_variant_fast_path():
@@ -226,10 +225,9 @@ def test_permutation_invariance():
     eta_a = np.asarray(result_a.linear_predictor, dtype=np.float64)
     eta_b = np.asarray(result_b.linear_predictor, dtype=np.float64)
     diff = float(np.linalg.norm(eta_a - eta_b) / (np.linalg.norm(eta_a) + 1e-8))
-    if diff > 1e-3:
-        pytest.xfail(
-            f"Linear predictor not permutation-invariant: rel L2 diff = {diff:.3e}"
-        )
+    assert diff <= 1e-3, (
+        f"Linear predictor not permutation-invariant: rel L2 diff = {diff:.3e}"
+    )
 
 
 def test_global_scale_ceiling_clamp():
@@ -285,5 +283,4 @@ def test_binary_trait_recovery_auc():
     n_neg = float(neg_scores.size)
     auc = (sum_ranks_pos - n_pos * (n_pos + 1) / 2.0) / (n_pos * n_neg)
 
-    if auc < 0.7:
-        pytest.xfail(f"Binary training AUC = {auc:.3f} < 0.7")
+    assert auc >= 0.7, f"Binary training AUC = {auc:.3f} < 0.7"

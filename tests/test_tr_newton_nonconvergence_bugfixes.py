@@ -47,25 +47,67 @@ def _make_fake_result(converged: bool, n_samples: int = 4, n_variants: int = 3) 
 
 
 def test_non_convergence_raises_runtime_error(monkeypatch):
-    """The convergence helper, hit with a non-converged result, must raise
-    a ``RuntimeError`` (or subclass) mentioning 'converge'."""
-    result = _make_fake_result(converged=False)
-    # Sanity: the converged-check helper agrees this is non-converged.
-    assert mi._trust_region_result_converged(result) is False
-
-    # Verify the production gate raises. We construct and raise the
-    # production exception class to lock in the contract; the integration
-    # path inside _binary_posterior_state_tr_newton raises the same type
-    # at the same point in the control flow.
+    """Drive the production wrapper ``_binary_posterior_state_tr_newton``
+    with a monkeypatched inner solver that returns a non-converged
+    ``result``. The wrapper must raise ``_BinaryTRNewtonNotConverged``
+    (a ``RuntimeError`` subclass)."""
     exc_cls = getattr(mi, "_BinaryTRNewtonNotConverged", None)
     if exc_cls is None:
         pytest.skip("waiting for fix: _BinaryTRNewtonNotConverged not defined")
     assert issubclass(exc_cls, RuntimeError)
 
-    with pytest.raises(RuntimeError, match=r"(?i)converge"):
-        raise exc_cls(
-            f"TR-Newton did not converge (status={result.status}, "
-            f"iters={result.iterations}, grad_norm={result.final_gradient_norm})"
+    n_samples = 4
+    n_variants = 0  # short-circuits the design matvec helpers entirely
+
+    # Fake genotype matrix: only ``.shape`` and ``._cupy_cache`` are read
+    # by ``_binary_posterior_state_tr_newton`` before the inner solver runs.
+    fake_genotype = types.SimpleNamespace(
+        shape=(n_samples, n_variants),
+        _cupy_cache=None,
+    )
+
+    def _fake_solver(**_kwargs: Any) -> Any:
+        return _make_fake_result(
+            converged=False, n_samples=n_samples, n_variants=n_variants
+        )
+
+    monkeypatch.setattr(mi, "trust_region_newton_logistic", _fake_solver)
+
+    covariate_matrix = np.ones((n_samples, 1), dtype=np.float64)
+    targets = np.array([0.0, 1.0, 0.0, 1.0], dtype=np.float64)
+    prior_variances = np.zeros(n_variants, dtype=np.float64)
+    alpha_init = np.zeros(n_samples + n_variants, dtype=np.float64)
+    beta_init = np.zeros(n_variants, dtype=np.float64)
+
+    with pytest.raises(exc_cls, match=r"(?i)converge"):
+        mi._binary_posterior_state_tr_newton(
+            genotype_matrix=fake_genotype,  # type: ignore[arg-type]
+            covariate_matrix=covariate_matrix,
+            targets=targets,
+            prior_variances=prior_variances,
+            alpha_init=alpha_init,
+            beta_init=beta_init,
+            minimum_weight=1e-6,
+            max_iterations=5,
+            gradient_tolerance=1e-6,
+            solver_tolerance=1e-6,
+            maximum_linear_solver_iterations=10,
+            logdet_probe_count=1,
+            logdet_lanczos_steps=1,
+            exact_solver_matrix_limit=1024,
+            posterior_variance_batch_size=64,
+            posterior_variance_probe_count=1,
+            random_seed=0,
+            compute_logdet=False,
+            compute_beta_variance=False,
+            sample_space_preconditioner_rank=0,
+            predictor_offset=None,
+            posterior_working_set_initial_size=1,
+            posterior_working_set_growth=2,
+            posterior_working_set_max_passes=1,
+            posterior_working_set_coefficient_tolerance=1e-4,
+            restricted_posterior_warm_start=None,
+            allow_gpu_exact_variant=False,
         )
 
 

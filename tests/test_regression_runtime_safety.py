@@ -208,9 +208,25 @@ def test_gpu_materialization_failure_aborts_or_shrinks(monkeypatch) -> None:
             "attempted. The fix must shrink-and-retry or raise."
         )
     else:
-        # A descriptive error is the other accepted contract.
-        text = str(raised)
+        # A descriptive error is the other accepted contract. The message
+        # must name the OOM/materialization path so an operator can
+        # disambiguate it from unrelated failures — a bare non-empty string
+        # is too loose and lets unrelated regressions pass.
+        text = str(raised).lower()
         assert text, "raised exception must carry a message"
+        expected_tokens = (
+            "materializ",  # materialization / materialize
+            "oom",
+            "out of memory",
+            "memory",
+            "refus",       # "refusing"
+            "shrink",
+            "stream",      # "mmap streaming"
+        )
+        assert any(tok in text for tok in expected_tokens), (
+            "GPU materialization OOM RuntimeError must name the failure "
+            f"path (one of {expected_tokens!r}); got: {raised!r}"
+        )
 
 
 # ---------------------------------------------------------------------------
