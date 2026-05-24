@@ -26,6 +26,21 @@ if [ -d .git ] && [ -z "${SV_PGS_SKIP_PULL:-}" ]; then
 fi
 uv sync --python 3.12 --extra gpu
 
+# If the host driver only speaks CUDA 11 (driver_version < 525), cupy-cuda12x
+# will refuse to run with cudaErrorInsufficientDriver. Detect that case and
+# swap in cupy-cuda11x so the GPU is actually usable.
+if command -v nvidia-smi >/dev/null 2>&1; then
+  drv=$(nvidia-smi --query-gpu=driver_version --format=csv,noheader,nounits 2>/dev/null | head -1 | tr -d '[:space:]')
+  if [ -n "$drv" ]; then
+    drv_major=$(echo "$drv" | cut -d. -f1)
+    if [ -n "$drv_major" ] && [ "$drv_major" -lt 525 ] 2>/dev/null; then
+      echo "host NVIDIA driver $drv supports CUDA 11 only — installing cupy-cuda11x..."
+      .venv/bin/python -m pip uninstall -y cupy-cuda12x >/dev/null 2>&1 || true
+      .venv/bin/python -m pip install --quiet "cupy-cuda11x>=13.0"
+    fi
+  fi
+fi
+
 echo
 echo "=== GPU RUNTIME DIAGNOSTICS ==="
 echo "  device files:"
