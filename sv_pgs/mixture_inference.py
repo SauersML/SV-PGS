@@ -1623,11 +1623,7 @@ def fit_variational_em(
                 int(resume_checkpoint.completed_blocks_in_iteration) > 0
                 or resume_checkpoint.binary_block_resume_state is not None
             )
-            expected_objective_history_length = (
-                int(resume_checkpoint.completed_iterations) - 1
-                if checkpoint_has_partial_epoch
-                else int(resume_checkpoint.completed_iterations)
-            )
+            expected_objective_history_length = int(resume_checkpoint.completed_iterations)
             if (
                 expected_objective_history_length < 0
                 or len(resume_checkpoint.objective_history) != expected_objective_history_length
@@ -2307,228 +2303,243 @@ def fit_variational_em(
                                 f"falling back to host path  block_size={len(block_indices)}  mem={mem()}"
                             )
                     log_this_block = _should_log_stochastic_block(block_count, n_blocks)
-                if log_this_block:
-                    log(f"    block {block_count}/{n_blocks}  variants={len(block_indices)}  step_size={step_size:.4f}  gpu={'yes' if block_genotypes._cupy_cache is not None else 'no'}  mem={mem()}")
-                block_prior_variances = np.asarray(reduced_prior_variances[block_indices], dtype=np.float64)
-                # Let the restricted posterior choose between full-matrix exact,
-                # tiled exact, and sample-space CG from the live GPU working set.
-                allow_gpu_exact_variant_for_block = True
-                block_sample_space_preconditioner_rank = _stochastic_sample_space_preconditioner_rank(
-                    requested_rank=int(config.sample_space_preconditioner_rank),
-                    step_size=step_size,
-                )
-                block_config = dataclass_replace(
-                    config,
-                    sample_space_preconditioner_rank=block_sample_space_preconditioner_rank,
-                )
-                block_beta_previous = np.asarray(beta_state[block_indices], dtype=np.float64).copy()
-                predictor_offset_gpu_block = None
-                if use_gpu_epoch_predictor_state:
-                    assert stochastic_epoch_cupy is not None
-                    assert stochastic_epoch_compute_cp_dtype is not None
-                    assert predictor_offset_gpu is not None
-                    assert covariate_linear_predictor_gpu is not None
-                    assert genetic_linear_predictor_gpu is not None
-                    block_linear_predictor_previous_gpu = block_genotypes.gpu_matmat(
-                        stochastic_epoch_cupy.asarray(block_beta_previous, dtype=stochastic_epoch_compute_cp_dtype),
-                        batch_size=config.posterior_variance_batch_size,
-                        cupy=stochastic_epoch_cupy,
-                        dtype=stochastic_epoch_compute_cp_dtype,
-                    )
-                    predictor_offset_gpu_block = (
-                        predictor_offset_gpu
-                        + covariate_linear_predictor_gpu
-                        + genetic_linear_predictor_gpu
-                        - block_linear_predictor_previous_gpu
-                    )
-                    predictor_offset = _cupy_array_to_numpy(
-                        predictor_offset_gpu_block,
-                        dtype=np.float64,
-                    )
-                else:
-                    block_linear_predictor_previous = _genotype_matvec_result_numpy(
-                        block_genotypes,
-                        block_beta_previous,
-                        batch_size=config.posterior_variance_batch_size,
-                        dtype=np.float64,
-                    )
-                    predictor_offset = (
-                        predictor_offset_array
-                        + covariate_linear_predictor
-                        + genetic_linear_predictor
-                        - block_linear_predictor_previous
-                    )
-                if config.trait_type == TraitType.BINARY:
-                    def _save_partial_binary_block(binary_state: dict[str, object]) -> None:
-                        if checkpoint_callback is None:
-                            return
-                        checkpoint_callback(
-                            _build_checkpoint(
-                                outer_iteration + 1,
-                                completed_blocks_in_iteration=block_count - 1,
-                                beta_variance_state_override=beta_variance_state,
-                                reduced_second_moment_override=reduced_second_moment,
-                                epoch_reduced_prior_variances_override=reduced_prior_variances,
-                                binary_block_resume_state_override={
-                                    "block_indices": np.asarray(block_indices, dtype=np.int32).copy(),
-                                    "solver_state": binary_state,
-                                },
-                                stochastic_block_size_override=block_size,
-                            )
+                    if log_this_block:
+                        _sub_block_suffix = (
+                            f" sub {_sub_idx + 1}/{len(sub_blocks)}"
+                            if len(sub_blocks) > 1
+                            else ""
                         )
-
-                    block_state = _binary_posterior_state(
-                        genotype_matrix=block_genotypes,
-                        covariate_matrix=empty_covariates,
-                        targets=target_vector,
-                        prior_variances=block_prior_variances,
-                        alpha_init=np.zeros(0, dtype=np.float64),
-                        beta_init=block_beta_previous,
-                        minimum_weight=config.polya_gamma_minimum_weight,
-                        # Inner Newton work should scale with the stochastic blend
-                        # weight: later low-step updates only need a coarse local
-                        # optimum because the global state receives a damped move.
-                        max_iterations=_stochastic_binary_newton_iterations(
-                            maximum_iterations=config.max_inner_newton_iterations,
-                            step_size=step_size,
-                            compute_beta_variance=refresh_beta_variance,
-                        ),
-                        gradient_tolerance=config.newton_gradient_tolerance,
-                        solver_tolerance=config.linear_solver_tolerance,
-                        maximum_linear_solver_iterations=config.maximum_linear_solver_iterations,
-                        logdet_probe_count=config.logdet_probe_count,
-                        logdet_lanczos_steps=config.logdet_lanczos_steps,
-                        exact_solver_matrix_limit=config.exact_solver_matrix_limit,
-                        posterior_variance_batch_size=config.posterior_variance_batch_size,
-                        posterior_variance_probe_count=config.posterior_variance_probe_count,
-                        random_seed=config.random_seed + step_index,
-                        compute_logdet=False,
-                        compute_beta_variance=refresh_beta_variance,
+                        log(f"    block {block_count}/{n_blocks}{_sub_block_suffix}  variants={len(block_indices)}  step_size={step_size:.4f}  gpu={'yes' if block_genotypes._cupy_cache is not None else 'no'}  mem={mem()}")
+                    block_prior_variances = np.asarray(reduced_prior_variances[block_indices], dtype=np.float64)
+                    # Let the restricted posterior choose between full-matrix exact,
+                    # tiled exact, and sample-space CG from the live GPU working set.
+                    allow_gpu_exact_variant_for_block = True
+                    block_sample_space_preconditioner_rank = _stochastic_sample_space_preconditioner_rank(
+                        requested_rank=int(config.sample_space_preconditioner_rank),
+                        step_size=step_size,
+                    )
+                    block_config = dataclass_replace(
+                        config,
                         sample_space_preconditioner_rank=block_sample_space_preconditioner_rank,
-                        predictor_offset=predictor_offset,
-                        update_blend_weight=step_size,
-                        resume_state=active_binary_resume_state,
-                        progress_callback=_save_partial_binary_block if checkpoint_callback is not None else None,
-                        progress_checkpoint_seconds=float(
-                            getattr(config, "binary_inner_checkpoint_minutes", 15.0)
-                        )
-                        * 60.0,
-                        restricted_posterior_warm_start=restricted_posterior_warm_start,
-                        allow_gpu_exact_variant=allow_gpu_exact_variant_for_block,
-                        use_tr_newton_binary=bool(getattr(config, "use_tr_newton_binary", False)),
                     )
-                    block_beta_candidate = np.asarray(block_state[1], dtype=np.float64)
-                    block_beta_variance = (
-                        np.asarray(block_state[2], dtype=np.float64)
-                        if refresh_beta_variance
-                        else np.asarray(beta_variance_state[block_indices], dtype=np.float64)
-                    )
-                    epoch_total_newton_iters += int(block_state[5])
-                else:
-                    if use_gpu_epoch_predictor_state:
-                        assert target_vector_gpu is not None
-                        assert predictor_offset_gpu_block is not None
-                        block_targets = _cupy_array_to_numpy(
-                            target_vector_gpu - predictor_offset_gpu_block,
-                            dtype=np.float64,
-                        )
-                    else:
-                        block_targets = target_vector - predictor_offset
-                    collapsed_block_state = _fit_collapsed_posterior(
-                        genotype_matrix=block_genotypes,
-                        covariate_matrix=empty_covariates,
-                        targets=block_targets,
-                        reduced_prior_variances=block_prior_variances,
-                        sigma_error2=sigma_error2,
-                        alpha_init=np.zeros(0, dtype=np.float64),
-                        beta_init=block_beta_previous,
-                        trait_type=TraitType.QUANTITATIVE,
-                        config=block_config,
-                        compute_logdet=False,
-                        compute_beta_variance=refresh_beta_variance,
-                        stale_beta_variance=None if beta_variance_state is None else beta_variance_state[block_indices],
-                        restricted_posterior_warm_start=restricted_posterior_warm_start,
-                        em_iteration_index=outer_iteration,
-                        total_em_iterations=config.max_outer_iterations,
-                        update_blend_weight=step_size,
-                        allow_gpu_exact_variant=allow_gpu_exact_variant_for_block,
-                    )
-                    block_beta_candidate = np.asarray(collapsed_block_state.beta, dtype=np.float64)
-                    block_beta_variance = np.asarray(collapsed_block_state.beta_variance, dtype=np.float64)
-                    epoch_total_newton_iters += 1
-                block_beta_updated = block_beta_previous + step_size * (block_beta_candidate - block_beta_previous)
-                beta_delta = block_beta_updated - block_beta_previous
-                if np.any(beta_delta):
+                    block_beta_previous = np.asarray(beta_state[block_indices], dtype=np.float64).copy()
+                    predictor_offset_gpu_block = None
                     if use_gpu_epoch_predictor_state:
                         assert stochastic_epoch_cupy is not None
                         assert stochastic_epoch_compute_cp_dtype is not None
+                        assert predictor_offset_gpu is not None
+                        assert covariate_linear_predictor_gpu is not None
                         assert genetic_linear_predictor_gpu is not None
-                        genetic_linear_predictor_gpu = genetic_linear_predictor_gpu + block_genotypes.gpu_matmat(
-                            stochastic_epoch_cupy.asarray(beta_delta, dtype=stochastic_epoch_compute_cp_dtype),
+                        block_linear_predictor_previous_gpu = block_genotypes.gpu_matmat(
+                            stochastic_epoch_cupy.asarray(block_beta_previous, dtype=stochastic_epoch_compute_cp_dtype),
                             batch_size=config.posterior_variance_batch_size,
                             cupy=stochastic_epoch_cupy,
                             dtype=stochastic_epoch_compute_cp_dtype,
                         )
+                        predictor_offset_gpu_block = (
+                            predictor_offset_gpu
+                            + covariate_linear_predictor_gpu
+                            + genetic_linear_predictor_gpu
+                            - block_linear_predictor_previous_gpu
+                        )
+                        predictor_offset = _cupy_array_to_numpy(
+                            predictor_offset_gpu_block,
+                            dtype=np.float64,
+                        )
                     else:
-                        genetic_linear_predictor += _genotype_matvec_result_numpy(
+                        block_linear_predictor_previous = _genotype_matvec_result_numpy(
                             block_genotypes,
-                            beta_delta,
+                            block_beta_previous,
                             batch_size=config.posterior_variance_batch_size,
                             dtype=np.float64,
                         )
-                    beta_state[block_indices] = block_beta_updated
-                block_second_moment = np.asarray(
-                    block_beta_candidate * block_beta_candidate + block_beta_variance,
-                    dtype=np.float64,
-                )
-                if refresh_beta_variance:
-                    beta_variance_state[block_indices] = (
-                        (1.0 - step_size) * beta_variance_state[block_indices]
-                        + step_size * block_beta_variance
+                        predictor_offset = (
+                            predictor_offset_array
+                            + covariate_linear_predictor
+                            + genetic_linear_predictor
+                            - block_linear_predictor_previous
+                        )
+                    if config.trait_type == TraitType.BINARY:
+                        # Bind current sub-block's indices into the checkpoint
+                        # closure so it serializes the correct variant set
+                        # even when block_indices is rebound by the next
+                        # sub-block iteration.
+                        _checkpoint_block_indices = block_indices
+
+                        def _save_partial_binary_block(binary_state: dict[str, object], _bi=_checkpoint_block_indices) -> None:
+                            if checkpoint_callback is None:
+                                return
+                            checkpoint_callback(
+                                _build_checkpoint(
+                                    outer_iteration,
+                                    completed_blocks_in_iteration=block_count - 1,
+                                    beta_variance_state_override=beta_variance_state,
+                                    reduced_second_moment_override=reduced_second_moment,
+                                    epoch_reduced_prior_variances_override=reduced_prior_variances,
+                                    binary_block_resume_state_override={
+                                        "block_indices": np.asarray(_bi, dtype=np.int32).copy(),
+                                        "solver_state": binary_state,
+                                    },
+                                    stochastic_block_size_override=block_size,
+                                )
+                            )
+
+                        block_state = _binary_posterior_state(
+                            genotype_matrix=block_genotypes,
+                            covariate_matrix=empty_covariates,
+                            targets=target_vector,
+                            prior_variances=block_prior_variances,
+                            alpha_init=np.zeros(0, dtype=np.float64),
+                            beta_init=block_beta_previous,
+                            minimum_weight=config.polya_gamma_minimum_weight,
+                            # Inner Newton work should scale with the stochastic blend
+                            # weight: later low-step updates only need a coarse local
+                            # optimum because the global state receives a damped move.
+                            max_iterations=_stochastic_binary_newton_iterations(
+                                maximum_iterations=config.max_inner_newton_iterations,
+                                step_size=step_size,
+                                compute_beta_variance=refresh_beta_variance,
+                            ),
+                            gradient_tolerance=config.newton_gradient_tolerance,
+                            solver_tolerance=config.linear_solver_tolerance,
+                            maximum_linear_solver_iterations=config.maximum_linear_solver_iterations,
+                            logdet_probe_count=config.logdet_probe_count,
+                            logdet_lanczos_steps=config.logdet_lanczos_steps,
+                            exact_solver_matrix_limit=config.exact_solver_matrix_limit,
+                            posterior_variance_batch_size=config.posterior_variance_batch_size,
+                            posterior_variance_probe_count=config.posterior_variance_probe_count,
+                            random_seed=config.random_seed + step_index,
+                            compute_logdet=False,
+                            compute_beta_variance=refresh_beta_variance,
+                            sample_space_preconditioner_rank=block_sample_space_preconditioner_rank,
+                            predictor_offset=predictor_offset,
+                            update_blend_weight=step_size,
+                            resume_state=active_binary_resume_state,
+                            progress_callback=_save_partial_binary_block if checkpoint_callback is not None else None,
+                            progress_checkpoint_seconds=float(
+                                getattr(config, "binary_inner_checkpoint_minutes", 15.0)
+                            )
+                            * 60.0,
+                            restricted_posterior_warm_start=restricted_posterior_warm_start,
+                            allow_gpu_exact_variant=allow_gpu_exact_variant_for_block,
+                            use_tr_newton_binary=bool(getattr(config, "use_tr_newton_binary", False)),
+                        )
+                        block_beta_candidate = np.asarray(block_state[1], dtype=np.float64)
+                        block_beta_variance = (
+                            np.asarray(block_state[2], dtype=np.float64)
+                            if refresh_beta_variance
+                            else np.asarray(beta_variance_state[block_indices], dtype=np.float64)
+                        )
+                        epoch_total_newton_iters += int(block_state[5])
+                    else:
+                        if use_gpu_epoch_predictor_state:
+                            assert target_vector_gpu is not None
+                            assert predictor_offset_gpu_block is not None
+                            block_targets = _cupy_array_to_numpy(
+                                target_vector_gpu - predictor_offset_gpu_block,
+                                dtype=np.float64,
+                            )
+                        else:
+                            block_targets = target_vector - predictor_offset
+                        collapsed_block_state = _fit_collapsed_posterior(
+                            genotype_matrix=block_genotypes,
+                            covariate_matrix=empty_covariates,
+                            targets=block_targets,
+                            reduced_prior_variances=block_prior_variances,
+                            sigma_error2=sigma_error2,
+                            alpha_init=np.zeros(0, dtype=np.float64),
+                            beta_init=block_beta_previous,
+                            trait_type=TraitType.QUANTITATIVE,
+                            config=block_config,
+                            compute_logdet=False,
+                            compute_beta_variance=refresh_beta_variance,
+                            stale_beta_variance=None if beta_variance_state is None else beta_variance_state[block_indices],
+                            restricted_posterior_warm_start=restricted_posterior_warm_start,
+                            em_iteration_index=outer_iteration,
+                            total_em_iterations=config.max_outer_iterations,
+                            update_blend_weight=step_size,
+                            allow_gpu_exact_variant=allow_gpu_exact_variant_for_block,
+                        )
+                        block_beta_candidate = np.asarray(collapsed_block_state.beta, dtype=np.float64)
+                        block_beta_variance = np.asarray(collapsed_block_state.beta_variance, dtype=np.float64)
+                        epoch_total_newton_iters += 1
+                    block_beta_updated = block_beta_previous + step_size * (block_beta_candidate - block_beta_previous)
+                    beta_delta = block_beta_updated - block_beta_previous
+                    if np.any(beta_delta):
+                        if use_gpu_epoch_predictor_state:
+                            assert stochastic_epoch_cupy is not None
+                            assert stochastic_epoch_compute_cp_dtype is not None
+                            assert genetic_linear_predictor_gpu is not None
+                            genetic_linear_predictor_gpu = genetic_linear_predictor_gpu + block_genotypes.gpu_matmat(
+                                stochastic_epoch_cupy.asarray(beta_delta, dtype=stochastic_epoch_compute_cp_dtype),
+                                batch_size=config.posterior_variance_batch_size,
+                                cupy=stochastic_epoch_cupy,
+                                dtype=stochastic_epoch_compute_cp_dtype,
+                            )
+                        else:
+                            genetic_linear_predictor += _genotype_matvec_result_numpy(
+                                block_genotypes,
+                                beta_delta,
+                                batch_size=config.posterior_variance_batch_size,
+                                dtype=np.float64,
+                            )
+                        beta_state[block_indices] = block_beta_updated
+                    block_second_moment = np.asarray(
+                        block_beta_candidate * block_beta_candidate + block_beta_variance,
+                        dtype=np.float64,
                     )
-                else:
-                    # Variance snaps to prior on no-refresh epochs to prevent
-                    # block-local bias: the per-block solve only sees its own
-                    # block's prior, so an EMA of those values is biased and
-                    # over-shrinks sigma_e^2 through the leverage correction.
-                    # Under the variational prior, variance equals the current
-                    # prior in expectation until a real refresh.
-                    beta_variance_state[block_indices] = np.maximum(
-                        np.asarray(reduced_prior_variances[block_indices], dtype=np.float64),
-                        1e-8,
+                    if refresh_beta_variance:
+                        beta_variance_state[block_indices] = (
+                            (1.0 - step_size) * beta_variance_state[block_indices]
+                            + step_size * block_beta_variance
+                        )
+                    else:
+                        # Variance snaps to prior on no-refresh epochs to prevent
+                        # block-local bias: the per-block solve only sees its own
+                        # block's prior, so an EMA of those values is biased and
+                        # over-shrinks sigma_e^2 through the leverage correction.
+                        # Under the variational prior, variance equals the current
+                        # prior in expectation until a real refresh.
+                        beta_variance_state[block_indices] = np.maximum(
+                            np.asarray(reduced_prior_variances[block_indices], dtype=np.float64),
+                            1e-8,
+                        )
+                    reduced_second_moment[block_indices] = (
+                        (1.0 - step_size) * reduced_second_moment[block_indices]
+                        + step_size * block_second_moment
                     )
-                reduced_second_moment[block_indices] = (
-                    (1.0 - step_size) * reduced_second_moment[block_indices]
-                    + step_size * block_second_moment
-                )
-                updated_local_scale_block, updated_auxiliary_delta_block = _update_local_scales(
-                    coefficient_second_moment=reduced_second_moment[block_indices],
-                    baseline_prior_variances=baseline_reduced_prior_variances[block_indices],
-                    local_shape_a=local_shape_a[block_indices],
-                    local_shape_b=local_shape_b[block_indices],
-                    auxiliary_delta=auxiliary_delta[block_indices],
-                    config=config,
-                )
-                local_scale[block_indices] = (
-                    (1.0 - step_size) * local_scale[block_indices]
-                    + step_size * updated_local_scale_block
-                )
-                auxiliary_delta[block_indices] = (
-                    (1.0 - step_size) * auxiliary_delta[block_indices]
-                    + step_size * updated_auxiliary_delta_block
-                )
-                # Free GPU memory for this block before next iteration
-                block_genotypes._cupy_cache = None
-                del block_genotypes
-                # Reclaim pool blocks + pinned-host pool immediately so the next
-                # block's try_materialize_gpu sees the actual free budget.
-                try:
-                    import cupy as _cp
-                    _cp.cuda.Device().synchronize()
-                    _cp.get_default_memory_pool().free_all_blocks()
-                    _cp.get_default_pinned_memory_pool().free_all_blocks()
-                except (ImportError, AttributeError, RuntimeError, OSError):
-                    pass
+                    updated_local_scale_block, updated_auxiliary_delta_block = _update_local_scales(
+                        coefficient_second_moment=reduced_second_moment[block_indices],
+                        baseline_prior_variances=baseline_reduced_prior_variances[block_indices],
+                        local_shape_a=local_shape_a[block_indices],
+                        local_shape_b=local_shape_b[block_indices],
+                        auxiliary_delta=auxiliary_delta[block_indices],
+                        config=config,
+                    )
+                    local_scale[block_indices] = (
+                        (1.0 - step_size) * local_scale[block_indices]
+                        + step_size * updated_local_scale_block
+                    )
+                    auxiliary_delta[block_indices] = (
+                        (1.0 - step_size) * auxiliary_delta[block_indices]
+                        + step_size * updated_auxiliary_delta_block
+                    )
+                    # Free GPU memory for this block before next iteration
+                    block_genotypes._cupy_cache = None
+                    del block_genotypes
+                    # Reclaim pool blocks + pinned-host pool immediately so the next
+                    # block's try_materialize_gpu sees the actual free budget.
+                    try:
+                        import cupy as _cp
+                        _cp.cuda.Device().synchronize()
+                        _cp.get_default_memory_pool().free_all_blocks()
+                        _cp.get_default_pinned_memory_pool().free_all_blocks()
+                    except (ImportError, AttributeError, RuntimeError, OSError):
+                        pass
+                # Restore block_indices to the original (un-split) value so any
+                # downstream logic that recorded against the epoch_blocks entry
+                # sees the same array shape it expected.
+                block_indices = _original_block_indices_for_epoch
                 if block_count % _STOCHASTIC_BLOCK_GC_INTERVAL == 0:
                     _release_gpu_memory()
                 if log_this_block:
@@ -2543,7 +2554,7 @@ def fit_variational_em(
                 ):
                     checkpoint_callback(
                         _build_checkpoint(
-                            outer_iteration + 1,
+                            outer_iteration,
                             completed_blocks_in_iteration=block_count,
                             beta_variance_state_override=beta_variance_state,
                             reduced_second_moment_override=reduced_second_moment,
@@ -4578,14 +4589,10 @@ def _binary_posterior_state_tr_newton(
             "      WARNING: TR-Newton did not converge "
             + f"(status={_nc_status}, iters={_nc_iters}, grad_norm={_nc_grad:.3e})  mem={mem()}"
         )
-        if _TR_NEWTON_RAISE_ON_NONCONVERGENCE:
-            raise RuntimeError(
-                f"TR-Newton failed to converge after {_nc_iters} iterations "
-                + f"(grad_norm={_nc_grad:.3e}, status={_nc_status}). "
-                + "Refusing to return a non-converged posterior."
-            )
-        # Gate disabled — fall back to legacy behavior (signal to caller for
-        # PG-IRLS fallback).
+        # Signal to caller for PG-IRLS fallback. Previously gated behind
+        # _TR_NEWTON_RAISE_ON_NONCONVERGENCE, but raising RuntimeError here
+        # bypassed the documented PG-IRLS safety net and crashed binary
+        # fits on benign accept/reject stalls.
         raise _BinaryTRNewtonNotConverged(
             "TR-Newton did not converge "
             + f"(status={_nc_status}, iters={_nc_iters}, grad_norm={_nc_grad})"
@@ -4742,7 +4749,7 @@ def _binary_posterior_state(
             raise ValueError("prior_precision_override must match prior_variances shape.")
     else:
         prior_precision = np.asarray(1.0 / np.maximum(prior_variances, 1e-8), dtype=np.float64)
-    if resume_state is None and use_tr_newton_binary:
+    if resume_state is None:
         try:
             tr_result = _binary_posterior_state_tr_newton(
                 genotype_matrix=standardized_genotypes,
@@ -4783,15 +4790,6 @@ def _binary_posterior_state(
                 "      binary TR-Newton non-converged; falling back to PG-IRLS "
                 + f"(reason={exc})"
             )
-            if tr_newton_require_convergence:
-                raise
-    elif resume_state is None:
-        # Fresh binary runs intentionally enter the same PG-IRLS path used by
-        # resumed block solves. The previous branch defaulted fresh fits into
-        # TR-Newton while resumes used PG-IRLS, reversing the safer solver
-        # choice documented above and exposing fresh runs to TR accept/reject
-        # stalls.
-        log("      binary PG-IRLS default path active (TR-Newton opt-in disabled)")
     covariate_count = covariate_matrix.shape[1]
     parameters = np.concatenate([alpha_init, beta_init], axis=0).astype(np.float64, copy=True)
     predictor_offset_array = (
@@ -7515,7 +7513,8 @@ def _solve_sample_space_rhs_gpu(
     # no-op, but make the passthrough explicit so callers that already hold a
     # device array (e.g. stochastic block loop with use_gpu_epoch_predictor_state)
     # never trigger an incidental host copy. Bitwise-identical for numpy inputs.
-    if isinstance(right_hand_side, cp.ndarray):
+    _cp_ndarray_cls = getattr(cp, "ndarray", None)
+    if _cp_ndarray_cls is not None and isinstance(right_hand_side, _cp_ndarray_cls):
         right_hand_side_gpu64 = (
             right_hand_side if right_hand_side.dtype == cp.float64
             else right_hand_side.astype(cp.float64)
@@ -7542,7 +7541,7 @@ def _solve_sample_space_rhs_gpu(
             raise ValueError("required_columns must match the number of rhs columns.")
     initial_solution_gpu64 = None
     if initial_guess is not None:
-        if isinstance(initial_guess, cp.ndarray):
+        if _cp_ndarray_cls is not None and isinstance(initial_guess, _cp_ndarray_cls):
             initial_solution_gpu64 = (
                 initial_guess if initial_guess.dtype == cp.float64
                 else initial_guess.astype(cp.float64)

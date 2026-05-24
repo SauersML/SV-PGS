@@ -432,7 +432,7 @@ def trust_region_newton_logistic(
         converged=converged,
         final_gradient_norm=grad_norm,
     )
-    if not converged and grad_norm > gradient_tolerance:
+    if raise_on_nonconvergence and not converged and grad_norm > gradient_tolerance:
         raise TRNewtonNonConvergence(result, gradient_tolerance)
     return result
 
@@ -496,6 +496,7 @@ def trust_region_newton_logistic_gpu(
     wall_clock_budget_s: float = 600.0,
     cg_progress_interval: int = 25,
     compute_dtype: Any = None,
+    raise_on_nonconvergence: bool = False,
 ) -> TrustRegionResult:
     """GPU-native trust-region Newton-CG.
 
@@ -782,6 +783,6 @@ def trust_region_newton_logistic_gpu(
         converged=converged,
         final_gradient_norm=grad_norm,
     )
-    if not converged and grad_norm > gradient_tolerance:
+    if raise_on_nonconvergence and not converged and grad_norm > gradient_tolerance:
         raise TRNewtonNonConvergence(result, gradient_tolerance)
     return result
