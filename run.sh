@@ -315,18 +315,61 @@ sweep_zombie_sv_pgs_procs() {
   done
 }
 
+postmortem_after_silent_death() {
+  # Called when uv run sv-pgs exits non-zero without a Python traceback
+  # surfacing in the terminal. Dumps everything that explains a silent
+  # death: exit/signal, kernel OOM-killer log, memory state, GPU state.
+  local rc="$1"
+  local signal_name=""
+  if [ "$rc" -gt 128 ]; then
+    signal_name=" (signal $((rc - 128))$(kill -l $((rc - 128)) 2>/dev/null | sed 's/^/=SIG/'))"
+  fi
+  echo
+  echo "=== POSTMORTEM: sv-pgs exited rc=${rc}${signal_name} ==="
+  echo "  --- memory state now ---"
+  awk '/^MemTotal|^MemFree|^MemAvailable|^Buffers|^Cached|^SwapTotal|^SwapFree/ {print "    "$0}' /proc/meminfo 2>/dev/null
+  echo "  --- top RSS processes (own user) ---"
+  ps -u "$(id -un)" -o pid,ppid,rss,vsz,stat,cmd --sort=-rss 2>/dev/null | head -10 | sed 's/^/    /'
+  echo "  --- kernel OOM-killer hits (last 200 dmesg lines) ---"
+  if dmesg -T 2>/dev/null | tail -200 | grep -iE "killed process|out of memory|oom-kill|invoked oom" | tail -20 | sed 's/^/    /'; then :; fi
+  echo "  --- journalctl kernel oom (last 200 lines) ---"
+  journalctl -k -n 200 --no-pager 2>/dev/null | grep -iE "killed|oom" | tail -20 | sed 's/^/    /' || echo "    (journalctl unavailable)"
+  echo "  --- GPU state now ---"
+  if command -v nvidia-smi >/dev/null 2>&1; then
+    nvidia-smi --query-gpu=index,memory.used,memory.free,utilization.gpu --format=csv,noheader 2>/dev/null | sed 's/^/    /'
+    nvidia-smi --query-compute-apps=pid,process_name,used_memory --format=csv,noheader 2>/dev/null | sed 's/^/    /' || true
+  fi
+  echo "  --- last 50 lines of fit checkpoint dir (if any artifacts written) ---"
+  if [ -n "${SV_PGS_LAST_OUTDIR:-}" ] && [ -d "${SV_PGS_LAST_OUTDIR}" ]; then
+    ls -laht "${SV_PGS_LAST_OUTDIR}" 2>/dev/null | head -10 | sed 's/^/    /'
+  fi
+  echo "=== END POSTMORTEM ==="
+}
+
 run_variant_pass() {
   local variants="$1"
   local base="$2"
   echo "=== FIT PASS: variants=${variants}  base=${base} ==="
   sweep_zombie_sv_pgs_procs
   sweep_zombie_gpu_procs
+  local rc=0
+  # Run unfaulted so we can inspect rc; restore -e immediately after.
+  set +e
   if is_all; then
+    export SV_PGS_LAST_OUTDIR="$base"
     uv run sv-pgs run-all-of-us --all-diseases --variants "$variants" --output-dir "$base"
+    rc=$?
   else
     local out="$base/${DISEASE}_results"
     mkdir -p "$out"
+    export SV_PGS_LAST_OUTDIR="$out"
     uv run sv-pgs run-all-of-us --disease "$DISEASE" --variants "$variants" --output-dir "$out"
+    rc=$?
+  fi
+  set -e
+  if [ "$rc" -ne 0 ]; then
+    postmortem_after_silent_death "$rc"
+    return "$rc"
   fi
 }
 
