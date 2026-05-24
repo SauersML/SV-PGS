@@ -27,6 +27,15 @@ fi
 if [ ! -x ".venv/bin/python" ]; then
   uv sync --python 3.12 --extra gpu
 fi
+# Always ensure GPU extras are present when a GPU is visible — handles the case
+# where the venv was first created CPU-only (then cupy/jax-cuda never get
+# installed on later runs and the pipeline silently falls back to CPU).
+if command -v nvidia-smi >/dev/null 2>&1 && nvidia-smi -L >/dev/null 2>&1; then
+  if ! .venv/bin/python -c "import cupy" >/dev/null 2>&1; then
+    echo "GPU detected but cupy missing — installing GPU extras..."
+    uv sync --python 3.12 --extra gpu
+  fi
+fi
 
 BASE_SNP="$HOME/sv_pgs_results_snp"
 BASE_JOINT="$HOME/sv_pgs_results_snp_sv"
