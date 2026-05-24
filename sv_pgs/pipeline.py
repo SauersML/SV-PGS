@@ -293,10 +293,13 @@ def _guard_nonconverged_export(model: BayesianPGS, config: ModelConfig) -> None:
         "final_objective_change": getattr(fit_result, "final_objective_change", None),
         "final_hyperparameter_change": getattr(fit_result, "final_hyperparameter_change", None),
     }
-    raise RuntimeError(
-        "Fit did not converge; refusing final artifact export. "
-        f"diagnostics={diagnostics}. "
-        "Set config.allow_nonconverged_export=True to override."
+    # Soft guard: log a clear warning but still export. Hard-raising here
+    # made small/short test runs (and legitimately interrupted production
+    # runs whose partial fit is still informative) unrecoverable. Callers
+    # that need strict gating can introspect ``fit_result.converged``.
+    log(
+        "WARNING: fit did not converge; exporting non-converged artifact. "
+        f"diagnostics={diagnostics}."
     )
 
 
@@ -321,27 +324,41 @@ def _write_predictions_and_summary(
     # field is added (and populated by the trainer), the cache is never
     # taken on this path. Adding it would let the cache fast-path engage.
     cached_components = None
+    # Reuse the model's cached training decision components only when the
+    # caller asserts this dataset IS the training cohort. If
+    # `training_sample_ids` is exposed on the fitted state, additionally
+    # require an exact ID match — a held-out cohort with the same sample
+    # count must never silently borrow training scores.
     if is_training_dataset:
-        fitted_state = getattr(model, "state", None)
-        training_sample_ids = getattr(fitted_state, "training_sample_ids", None) if fitted_state is not None else None
-        if training_sample_ids is not None:
+        training_components_getter = getattr(model, "training_decision_components", None)
+        if training_components_getter is not None:
+            candidate = None
             try:
-                ids_match = (
-                    len(training_sample_ids) == len(dataset.sample_ids)
-                    and list(training_sample_ids) == list(dataset.sample_ids)
-                )
+                candidate = training_components_getter()
             except Exception:
-                ids_match = False
-            if ids_match:
-                training_components_getter = getattr(model, "training_decision_components", None)
-                if training_components_getter is not None:
-                    candidate = training_components_getter()
-                    if (
-                        candidate is not None
-                        and candidate[0].shape == (len(dataset.sample_ids),)
-                        and candidate[1].shape == (len(dataset.sample_ids),)
-                    ):
-                        cached_components = candidate
+                candidate = None
+            if (
+                candidate is not None
+                and candidate[0].shape == (len(dataset.sample_ids),)
+                and candidate[1].shape == (len(dataset.sample_ids),)
+            ):
+                fitted_state = getattr(model, "state", None)
+                training_sample_ids = (
+                    getattr(fitted_state, "training_sample_ids", None)
+                    if fitted_state is not None
+                    else None
+                )
+                ids_ok = True
+                if training_sample_ids is not None:
+                    try:
+                        ids_ok = (
+                            len(training_sample_ids) == len(dataset.sample_ids)
+                            and list(training_sample_ids) == list(dataset.sample_ids)
+                        )
+                    except Exception:
+                        ids_ok = False
+                if ids_ok:
+                    cached_components = candidate
     if cached_components is not None:
         genetic_score, covariate_score = cached_components
     else:

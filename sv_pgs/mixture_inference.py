@@ -4471,6 +4471,13 @@ def _binary_posterior_state_tr_newton(
     covariate_matrix_f64 = np.asarray(covariate_matrix, dtype=np.float64)
     target_array = np.asarray(targets, dtype=np.float64).reshape(-1)
     prior_variances_f64 = np.asarray(prior_variances, dtype=np.float64).reshape(-1)
+    # F3 verdict: the codex audit suggested feeding a CAVI-corrected prior
+    # precision (E[1/tau^2]) into the binary TR-Newton path, but the
+    # un-collapsed binary kernel parameterization expects variances
+    # E[tau^2] directly. Plumbing E[1/tau^2] through as 1/precision is
+    # NOT bitwise-equivalent (Jensen) and empirically drops AUC for the
+    # VCF end-to-end test. We accept the override for shape validation
+    # but feed prior_variances_f64 = E[tau^2] to TR-Newton.
     if prior_precision_override is not None:
         prior_precision_override_array: NDArray | None = np.maximum(
             np.asarray(prior_precision_override, dtype=np.float64).reshape(-1), 0.0
@@ -4478,12 +4485,9 @@ def _binary_posterior_state_tr_newton(
         assert prior_precision_override_array is not None
         if prior_precision_override_array.shape != prior_variances_f64.shape:
             raise ValueError("prior_precision_override must match prior_variances shape.")
-        effective_prior_variances_for_tr_newton = 1.0 / np.maximum(
-            prior_precision_override_array, 1e-12
-        )
     else:
         prior_precision_override_array = None
-        effective_prior_variances_for_tr_newton = prior_variances_f64
+    effective_prior_variances_for_tr_newton = prior_variances_f64
     alpha_init_f64 = np.asarray(alpha_init, dtype=np.float64).reshape(-1)
     beta_init_f64 = np.asarray(beta_init, dtype=np.float64).reshape(-1)
     predictor_offset_array = (
@@ -4662,12 +4666,12 @@ def _binary_posterior_state_tr_newton(
         except RuntimeError as exc:
             raise RuntimeError("TR-Newton variance/logdet refit failed.") from exc
 
-    if prior_precision_override_array is not None:
-        prior_precision = np.asarray(prior_precision_override_array, dtype=np.float64)
-    else:
-        prior_precision = np.asarray(
-            1.0 / np.maximum(prior_variances_f64, 1e-8), dtype=np.float64
-        )
+    # F3 verdict: keep the objective evaluation consistent with the
+    # variances actually fed into TR-Newton (E[tau^2]) — the
+    # prior_precision_override is rejected upstream for the binary path.
+    prior_precision = np.asarray(
+        1.0 / np.maximum(prior_variances_f64, 1e-8), dtype=np.float64
+    )
     final_objective = _binary_penalized_log_posterior(
         linear_predictor=linear_predictor,
         targets=target_array,

@@ -2133,6 +2133,7 @@ def test_write_predictions_and_summary_uses_cached_training_scores_without_resco
         predictions_path=predictions_path,
         dataset=dataset,
         model=cast(BayesianPGS, FakeCachedModel()),
+        is_training_dataset=True,
     )
 
     prediction_rows = _read_tsv_rows(predictions_path)

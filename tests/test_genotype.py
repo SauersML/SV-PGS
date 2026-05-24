@@ -1650,10 +1650,16 @@ def test_gpu_materialization_budget_respects_live_free_memory(monkeypatch: pytes
     class _FakeCupy:
         pass
 
+    # With a generous total/free pair (well above the 1.5 GB TR-Newton/HVP
+    # safety reservation introduced after the live-memory budget audit) the
+    # budget should be capped by free memory minus the safety margin and
+    # any per-call solver headroom. For n_rows=n_cols=0 the headroom is
+    # just the safety margin.
     monkeypatch.setattr(genotype_module, "_gpu_total_bytes", lambda _cupy: 16_000_000_000)
-    monkeypatch.setattr(genotype_module, "_gpu_free_bytes", lambda _cupy: 200_000_000)
+    monkeypatch.setattr(genotype_module, "_gpu_free_bytes", lambda _cupy: 4_000_000_000)
 
-    assert genotype_module._gpu_materialization_budget_bytes(_FakeCupy()) == 100_000_000
+    expected = 4_000_000_000 - genotype_module._GPU_RESERVED_OVERHEAD_BYTES
+    assert genotype_module._gpu_materialization_budget_bytes(_FakeCupy()) == expected
 
 
 def test_gpu_standardized_batches_split_after_cupy_oom(monkeypatch: pytest.MonkeyPatch):

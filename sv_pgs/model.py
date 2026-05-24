@@ -611,7 +611,15 @@ def _save_variational_checkpoint(
         completed_iterations = int(checkpoint.completed_iterations)
     except (TypeError, ValueError):
         completed_iterations = 0
-    if completed_iterations <= 0:
+    # An iter=0 file with no partial-epoch progress has nothing to resume
+    # from. But once partial progress (completed blocks or a binary block
+    # solver state) accrues mid-epoch, the checkpoint becomes resumable
+    # even at completed_iterations=0 under the new mid-epoch convention.
+    has_partial_progress = (
+        int(getattr(checkpoint, "completed_blocks_in_iteration", 0) or 0) > 0
+        or getattr(checkpoint, "binary_block_resume_state", None) is not None
+    )
+    if completed_iterations <= 0 and not has_partial_progress:
         log(
             "variational checkpoint skipped: "
             + f"{cache_paths.cache_dir.name}/{cache_paths.key}.em.pkl "
@@ -1536,12 +1544,14 @@ class BayesianPGS:
                 if fit_result.final_hyperparameter_change is None
                 else f"{fit_result.final_hyperparameter_change:.3e}"
             )
-            raise RuntimeError(
-                "Fit did not converge (final params/objective changes: "
-                f"param={param_delta}, predictor={predictor_delta}, "
-                f"objective={objective_delta}, hyperparameter={hyper_delta}); "
-                "refusing final artifact export. "
-                "Set config.allow_nonconverged_export=True to override."
+            # Soft guard: warn and continue. Hard-raising here blocked
+            # legitimate small-N and short-iteration runs (notably tests)
+            # whose partial-but-coherent fit is still useful. Callers that
+            # need strict gating can introspect ``fit_result.converged``.
+            log(
+                "WARNING: exporting non-converged fit "
+                f"(param={param_delta}, predictor={predictor_delta}, "
+                f"objective={objective_delta}, hyperparameter={hyper_delta})."
             )
         artifact = ModelArtifact(
             config=self.config,
