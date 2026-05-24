@@ -131,7 +131,10 @@ class _SpyInt8StreamingRawGenotypeMatrix(RawGenotypeMatrix):
         self,
         variant_indices=None,
         batch_size: int = 1024,
+        *,
+        num_threads: int | None = None,
     ):
+        del num_threads  # spy ignores decode-thread budgeting
         resolved_indices = (
             np.arange(self.matrix.shape[1], dtype=np.int32)
             if variant_indices is None
@@ -1237,9 +1240,15 @@ def test_try_materialize_gpu_uses_int8_batch_size_for_plink_like_backends(monkey
             self,
             variant_indices=None,
             batch_size: int = 1024,
+            *,
+            num_threads: int | None = None,
         ):
             self.i8_batch_sizes.append(int(batch_size))
-            yield from super().iter_column_batches_i8(variant_indices=variant_indices, batch_size=batch_size)
+            yield from super().iter_column_batches_i8(
+                variant_indices=variant_indices,
+                batch_size=batch_size,
+                num_threads=num_threads,
+            )
 
     raw = _RecordingInt8Raw(np.zeros((32, 8), dtype=np.int8))
     standardized = raw.standardized(
