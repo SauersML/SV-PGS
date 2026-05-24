@@ -1279,6 +1279,12 @@ def run_all_of_us(
 
     # Status summary: what's done vs what's left
     log("=== STATUS CHECK ===")
+    try:
+        from sv_pgs.progress import log_autotune_banner
+
+        log_autotune_banner()
+    except (ImportError, RuntimeError) as _autotune_banner_error:
+        log(f"  auto-tune banner unavailable: {_autotune_banner_error}")
     sample_table_path = work_dir / f"{disease_def.canonical_name}.samples.tsv"
     merged_path = work_dir / f"{disease_def.canonical_name}.samples.with_pcs.tsv"
     _sample_metadata_path = sample_table_path.with_suffix(sample_table_path.suffix + ".metadata.json")

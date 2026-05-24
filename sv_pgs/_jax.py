@@ -19,6 +19,59 @@ import numpy as np
 os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
 os.environ["XLA_PYTHON_CLIENT_MEM_FRACTION"] = "0.1"
 
+
+def _most_free_cuda_device() -> tuple[int, int, int] | None:
+    """Pick the CUDA device with the most free VRAM and pin to it.
+
+    SPEC.md hard rule: "No multi-GPU support." On a multi-GPU box we must
+    not double-count VRAM (budget helpers like ``_gpu_total_bytes``
+    operate on the current device) or land on a busy GPU. Strategy:
+      1. Probe device count via CuPy.
+      2. Pick the device with the most free memory.
+      3. If count > 1, pin via ``CUDA_VISIBLE_DEVICES`` so JAX (imported
+         below) and CuPy both only see the chosen device — and call
+         ``_cupy.cuda.Device(0).use()`` as a belt-and-braces pin.
+    Honours an existing ``CUDA_VISIBLE_DEVICES`` to respect explicit
+    operator overrides.
+    """
+    if "CUDA_VISIBLE_DEVICES" in os.environ:
+        return None
+    try:
+        import cupy as _cupy  # type: ignore[import-not-found]
+    except (ImportError, OSError, RuntimeError):
+        return None
+    try:
+        device_count = int(_cupy.cuda.runtime.getDeviceCount())
+    except (AttributeError, OSError, RuntimeError):
+        return None
+    if device_count < 1:
+        return None
+    best_id = 0
+    best_free = -1
+    best_total = 0
+    for device_id in range(device_count):
+        try:
+            with _cupy.cuda.Device(device_id):
+                free, total = _cupy.cuda.runtime.memGetInfo()
+        except (AttributeError, OSError, RuntimeError):
+            continue
+        if int(free) > best_free:
+            best_free = int(free)
+            best_total = int(total)
+            best_id = device_id
+    if best_free < 0:
+        return None
+    if device_count > 1:
+        os.environ["CUDA_VISIBLE_DEVICES"] = str(best_id)
+        try:
+            _cupy.cuda.Device(0).use()  # post-pin, chosen becomes index 0
+        except (AttributeError, OSError, RuntimeError):
+            pass
+    return best_id, best_free, best_total
+
+
+SELECTED_CUDA_DEVICE: tuple[int, int, int] | None = _most_free_cuda_device()
+
 # Work around XLA compilation segfaults on Turing GPUs (T4).  These flags make
 # JAX materially slower on newer GPUs, so only enable them when a Turing-class
 # device is actually present.  See:

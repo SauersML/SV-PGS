@@ -119,6 +119,41 @@ def _format_bytes(value: object) -> str:
     return f"{size:.1f}{units[unit_index]}"
 
 
+def log_autotune_banner() -> None:
+    """Emit a single startup line with the detected auto-tune values.
+
+    Pulls from :func:`sv_pgs.genotype._snapshot_autotune_state` and
+    :data:`sv_pgs._jax.SELECTED_CUDA_DEVICE` so operators can see
+    immediately whether the per-batch budget and prefetch depth scale
+    to the box, and which GPU currently has the most free memory.
+    """
+    try:
+        from sv_pgs.genotype import _snapshot_autotune_state
+    except (ImportError, RuntimeError) as error:
+        log(f"auto-tune: snapshot unavailable ({error})")
+        return
+    state = _snapshot_autotune_state()
+    parts = [
+        f"cpu_count={state['cpu_count']}",
+        f"host_ram_free={_format_bytes(state['host_ram_available_bytes'])}",
+        f"gpu_free={_format_bytes(state['gpu_free_bytes'])}",
+        f"bed_batch_bytes={_format_bytes(state['bed_reader_target_batch_bytes'])}",
+        f"prefetch_depth={state['plink_int8_max_prefetch_depth']}",
+        f"per_worker_threads={state['per_worker_threads']}",
+    ]
+    try:
+        from sv_pgs._jax import SELECTED_CUDA_DEVICE
+    except (ImportError, RuntimeError):
+        SELECTED_CUDA_DEVICE = None
+    if SELECTED_CUDA_DEVICE is not None:
+        device_id, free_bytes, total_bytes = SELECTED_CUDA_DEVICE
+        parts.append(
+            f"cuda_pinned=device{device_id}({_format_bytes(free_bytes)}_free/"
+            f"{_format_bytes(total_bytes)})"
+        )
+    log("auto-tune: " + " ".join(parts))
+
+
 def gpu_memory_snapshot() -> str:
     try:
         import jax
@@ -438,5 +473,4 @@ def start_heartbeat(interval_seconds: float = 60.0) -> None:
     _heartbeat_thread = thread
     thread.start()
     log(f"heartbeat sampler started (every {interval_seconds:.0f}s)")
-
 

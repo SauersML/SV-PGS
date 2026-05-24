@@ -3,6 +3,7 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from collections import deque
 from concurrent.futures import Future, ThreadPoolExecutor
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 import io
 import os
@@ -27,12 +28,152 @@ from sv_pgs.progress import log, mem
 
 DEFAULT_GENOTYPE_BATCH_SIZE = 1024  # fallback when sample count is unknown
 
-# Memory cap per PLINK batch. PLINK .bed files store genotypes on disk
-# as 2 bits per sample, but we expand to int8 or float32 in memory. JAX
-# batch statistics and solver setup also create float32 intermediates.
-# This budget ensures each batch fits comfortably in GPU/CPU memory:
-#   500 MB / (447k samples * 4 bytes) ≈ 279 variants per batch
-BED_READER_TARGET_BATCH_BYTES = 500_000_000
+# ---------------------------------------------------------------------------
+# Runtime auto-tuning of memory/IO sizing.
+#
+# Historically these were hand-tuned constants (500 MB BED batches, prefetch
+# depth 3). That works well on the "blessed" T4/16-core box but starves a
+# 2-core/V100 box (prefetch eats the only available cores) and under-utilizes
+# a 64-core/H100 box (batches finish faster than disk can refill). The
+# helpers below detect available RAM/CPU/GPU at import time and pick values
+# that scale with the actual hardware. The constants themselves are still
+# set at import so existing callers that do
+# ``from sv_pgs.genotype import BED_READER_TARGET_BATCH_BYTES`` keep working.
+# ---------------------------------------------------------------------------
+
+_AUTO_TUNE_HOST_RAM_FALLBACK_BYTES = 4 * 1024 * 1024 * 1024  # 4 GB
+_AUTO_TUNE_BED_BATCH_HARD_CAP_BYTES = 8 * 1024 * 1024 * 1024  # 8 GB
+_AUTO_TUNE_BED_BATCH_FLOOR_BYTES = 128 * 1024 * 1024  # 128 MB
+_AUTO_TUNE_PREFETCH_DEPTH_HARD_CAP = 64
+_AUTO_TUNE_HOST_RAM_INFLIGHT_FRACTION = 0.25  # ≤ 25% free RAM in flight
+_AUTO_TUNE_GPU_BATCH_FRACTION = 0.40  # one batch fits in 40% of GPU free
+
+
+def _detect_available_host_ram_bytes() -> int:
+    """Return available host RAM in bytes (stdlib-only)."""
+    try:
+        page_size = os.sysconf("SC_PAGE_SIZE")
+        avail_pages = os.sysconf("SC_AVPHYS_PAGES")
+        if page_size > 0 and avail_pages > 0:
+            return int(page_size) * int(avail_pages)
+    except (AttributeError, ValueError, OSError):
+        pass
+    try:
+        with open("/proc/meminfo", "r") as meminfo:
+            for line in meminfo:
+                if line.startswith("MemAvailable:"):
+                    parts = line.split()
+                    if len(parts) >= 2:
+                        return int(parts[1]) * 1024
+    except OSError:
+        pass
+    return _AUTO_TUNE_HOST_RAM_FALLBACK_BYTES
+
+
+def _detect_gpu_free_bytes() -> int:
+    """Best-effort GPU free-memory probe via CuPy. Returns 0 if no GPU."""
+    try:
+        import cupy  # type: ignore[import-not-found]
+    except (ImportError, OSError, RuntimeError):
+        return 0
+    try:
+        free, _total = cupy.cuda.runtime.memGetInfo()
+        return int(free)
+    except (AttributeError, OSError, RuntimeError):
+        return 0
+
+
+def compute_bed_reader_target_batch_bytes(
+    *,
+    host_ram_bytes: int | None = None,
+    gpu_free_bytes: int | None = None,
+    prefetch_depth: int | None = None,
+) -> int:
+    """Auto-tune per-batch byte budget for the BED reader.
+
+    Final formula:
+        min(host_ram_free * 0.25 / prefetch_depth,
+            gpu_free * 0.40,
+            8 GB hard cap)
+    Clamped to >= 128 MB floor.
+    """
+    if host_ram_bytes is None:
+        host_ram_bytes = _detect_available_host_ram_bytes()
+    if gpu_free_bytes is None:
+        gpu_free_bytes = _detect_gpu_free_bytes()
+    if prefetch_depth is None or prefetch_depth < 1:
+        prefetch_depth = max(1, os.cpu_count() or 1)
+    host_share = int(host_ram_bytes * _AUTO_TUNE_HOST_RAM_INFLIGHT_FRACTION) // max(prefetch_depth, 1)
+    candidates: list[int] = []
+    if host_share > 0:
+        candidates.append(host_share)
+    if gpu_free_bytes > 0:
+        candidates.append(int(gpu_free_bytes * _AUTO_TUNE_GPU_BATCH_FRACTION))
+    candidates.append(_AUTO_TUNE_BED_BATCH_HARD_CAP_BYTES)
+    chosen = min(candidates) if candidates else 500_000_000
+    return max(chosen, _AUTO_TUNE_BED_BATCH_FLOOR_BYTES)
+
+
+def compute_plink_int8_max_prefetch_depth(
+    *,
+    cpu_count: int | None = None,
+    host_ram_bytes: int | None = None,
+    target_batch_bytes: int | None = None,
+) -> int:
+    """Auto-tune the int8 reader prefetch queue depth.
+
+    Scales with cpu_count, capped by how many in-flight batches actually
+    fit in the host RAM in-flight budget. Always returns at least 1.
+    """
+    if cpu_count is None:
+        cpu_count = max(1, os.cpu_count() or 1)
+    if host_ram_bytes is None:
+        host_ram_bytes = _detect_available_host_ram_bytes()
+    if target_batch_bytes is None:
+        target_batch_bytes = compute_bed_reader_target_batch_bytes(
+            host_ram_bytes=host_ram_bytes,
+            prefetch_depth=cpu_count,
+        )
+    inflight_budget = int(host_ram_bytes * _AUTO_TUNE_HOST_RAM_INFLIGHT_FRACTION)
+    ram_capped = max(1, inflight_budget // max(target_batch_bytes, 1))
+    depth = min(int(cpu_count), int(ram_capped), _AUTO_TUNE_PREFETCH_DEPTH_HARD_CAP)
+    return max(1, depth)
+
+
+def _snapshot_autotune_state() -> dict[str, int]:
+    """Return current auto-tune detection snapshot for diagnostic logging."""
+    host_ram = _detect_available_host_ram_bytes()
+    gpu_free = _detect_gpu_free_bytes()
+    cpu_count = max(1, os.cpu_count() or 1)
+    bed_bytes = compute_bed_reader_target_batch_bytes(
+        host_ram_bytes=host_ram,
+        gpu_free_bytes=gpu_free,
+        prefetch_depth=cpu_count,
+    )
+    depth = compute_plink_int8_max_prefetch_depth(
+        cpu_count=cpu_count,
+        host_ram_bytes=host_ram,
+        target_batch_bytes=bed_bytes,
+    )
+    return {
+        "cpu_count": cpu_count,
+        "host_ram_available_bytes": int(host_ram),
+        "gpu_free_bytes": int(gpu_free),
+        "bed_reader_target_batch_bytes": int(bed_bytes),
+        "plink_int8_max_prefetch_depth": int(depth),
+        "per_worker_threads": max(1, int(cpu_count) // max(int(depth), 1)),
+    }
+
+
+# Auto-tuned at import time. Override-able via env for benchmarking.
+_BED_BATCH_OVERRIDE = os.environ.get("SV_PGS_BED_READER_TARGET_BATCH_BYTES")
+if _BED_BATCH_OVERRIDE:
+    try:
+        BED_READER_TARGET_BATCH_BYTES = int(_BED_BATCH_OVERRIDE)
+    except ValueError:
+        BED_READER_TARGET_BATCH_BYTES = compute_bed_reader_target_batch_bytes()
+else:
+    BED_READER_TARGET_BATCH_BYTES = compute_bed_reader_target_batch_bytes()
 MIN_BED_READER_BATCH_SIZE = 32  # always read at least this many variants
 STANDARDIZED_STREAMING_TARGET_BATCH_BYTES = 1_024_000_000
 LOCAL_INT8_STANDARDIZED_STREAMING_TARGET_BATCH_BYTES = 4_096_000_000
@@ -41,10 +182,19 @@ GPU_STANDARDIZED_PREFETCH_TARGET_BYTES = 4_096_000_000
 GPU_STANDARDIZED_DYNAMIC_FREE_FRACTION = 0.20
 GPU_STANDARDIZED_DYNAMIC_RESERVE_BYTES = 512_000_000
 PLINK_INT8_TARGET_BATCH_BYTES = 1_024_000_000
-# Allow multiple decoded batches in flight so PLINK bed decode can fully
-# overlap with the GPU matmul/standardize kernels. 1 forced full serialization
-# of disk read and GPU work, leaving the V100/T4 idle while CPU decoded.
-PLINK_INT8_MAX_PREFETCH_DEPTH = 3
+# Auto-tuned: scales with cpu_count and available host RAM.
+_PREFETCH_DEPTH_OVERRIDE = os.environ.get("SV_PGS_PLINK_INT8_MAX_PREFETCH_DEPTH")
+if _PREFETCH_DEPTH_OVERRIDE:
+    try:
+        PLINK_INT8_MAX_PREFETCH_DEPTH = max(1, int(_PREFETCH_DEPTH_OVERRIDE))
+    except ValueError:
+        PLINK_INT8_MAX_PREFETCH_DEPTH = compute_plink_int8_max_prefetch_depth(
+            target_batch_bytes=BED_READER_TARGET_BATCH_BYTES,
+        )
+else:
+    PLINK_INT8_MAX_PREFETCH_DEPTH = compute_plink_int8_max_prefetch_depth(
+        target_batch_bytes=BED_READER_TARGET_BATCH_BYTES,
+    )
 PLINK_BED_READER_NUM_THREADS = max(1, os.cpu_count() or 1)
 # Cap on rows promoted per int8 matmul staging chunk. With ~695k AoU variants
 # this slab is ``chunk_rows x n_cols x 4 bytes`` (fp32 promotion); 4096 rows is
@@ -872,10 +1022,77 @@ def _try_import_cupy() -> Any | None:
     return None
 
 
+def _cupy_device_count(cupy: Any) -> int:
+    try:
+        return max(int(cupy.cuda.runtime.getDeviceCount()), 0)
+    except (AttributeError, OSError, RuntimeError, TypeError, ValueError):
+        return 1
+
+
+def _cupy_device_ids(cupy: Any) -> tuple[int, ...]:
+    return tuple(range(_cupy_device_count(cupy)))
+
+
+@contextmanager
+def _cupy_device_context(cupy: Any, device_id: int) -> Iterator[None]:
+    device_factory = getattr(getattr(cupy, "cuda", None), "Device", None)
+    if device_factory is None:
+        yield
+        return
+    try:
+        device = device_factory(int(device_id))
+    except TypeError:
+        device = device_factory()
+    try:
+        with device:
+            yield
+    except TypeError:
+        device.use()
+        yield
+
+
+def _cupy_device_synchronize(cupy: Any, device_id: int) -> None:
+    with _cupy_device_context(cupy, device_id):
+        try:
+            cupy.cuda.Device().synchronize()
+        except (AttributeError, OSError, RuntimeError, TypeError):
+            pass
+
+
+def _cupy_current_device_id(cupy: Any) -> int:
+    device_factory = getattr(getattr(cupy, "cuda", None), "Device", None)
+    if device_factory is None:
+        return 0
+    try:
+        return int(device_factory().id)
+    except (AttributeError, OSError, RuntimeError, TypeError, ValueError):
+        return 0
+
+
+def _split_contiguous_columns(total_columns: int, device_ids: Sequence[int]) -> tuple[tuple[int, int, int], ...]:
+    cols = int(total_columns)
+    if cols < 0:
+        raise ValueError("total_columns must be non-negative.")
+    active_devices = tuple(int(device_id) for device_id in device_ids)
+    if not active_devices:
+        return ()
+    shard_count = min(len(active_devices), cols) if cols > 0 else 1
+    splits: list[tuple[int, int, int]] = []
+    start = 0
+    for shard_index, device_id in enumerate(active_devices[:shard_count]):
+        remaining_columns = cols - start
+        remaining_shards = shard_count - shard_index
+        width = remaining_columns // remaining_shards
+        stop = start + width
+        splits.append((device_id, start, stop))
+        start = stop
+    return tuple(splits)
+
+
 # Cache of (stream_a, stream_b) keyed by the id of the cupy module so that
 # tests with mocked cupy instances each get their own pair, while real runs
 # create the two non-default streams exactly once per process.
-_cuda_upload_streams_cache: dict[int, tuple[Any, Any]] = {}
+_cuda_upload_streams_cache: dict[tuple[int, int], tuple[Any, Any]] = {}
 
 
 def _cuda_upload_stream_pair(cupy: Any) -> tuple[Any, Any]:
@@ -883,7 +1100,7 @@ def _cuda_upload_stream_pair(cupy: Any) -> tuple[Any, Any]:
 
     Created once per (cupy module) and reused across every materialization.
     """
-    cache_key = id(cupy)
+    cache_key = (id(cupy), _cupy_current_device_id(cupy))
     cached = _cuda_upload_streams_cache.get(cache_key)
     if cached is not None:
         return cached
@@ -2135,17 +2352,124 @@ class _CupyInt8StandardizedCache:
         return np.asarray(host, dtype=np.float32 if dtype is None else dtype)
 
 
+@dataclass(frozen=True, slots=True)
+class _CupyDeviceCacheShard:
+    device_id: int
+    column_start: int
+    cache: Any
+
+    @property
+    def column_stop(self) -> int:
+        return self.column_start + _cupy_cache_shape(self.cache)[1]
+
+
+@dataclass(frozen=True, slots=True)
+class _CupyShardedStandardizedCache:
+    shards: tuple[_CupyDeviceCacheShard, ...]
+    cupy: Any = field(repr=False)
+
+    @property
+    def shape(self) -> tuple[int, int]:
+        if not self.shards:
+            return 0, 0
+        rows = _cupy_cache_shape(self.shards[0].cache)[0]
+        columns = sum(_cupy_cache_shape(shard.cache)[1] for shard in self.shards)
+        return rows, int(columns)
+
+    @property
+    def nbytes(self) -> int:
+        return sum(_cupy_cache_nbytes(shard.cache) for shard in self.shards)
+
+    def subset(self, local_variant_indices: NDArray) -> _CupyShardedStandardizedCache:
+        resolved = np.asarray(local_variant_indices, dtype=np.int32)
+        if resolved.ndim != 1:
+            raise ValueError("local_variant_indices must be 1D.")
+        if resolved.size > 1 and np.any(np.diff(resolved) < 0):
+            raise ValueError("multi-GPU genotype cache subsets must be sorted by column.")
+        if _local_indices_select_all(resolved, self.shape[1]):
+            return self
+        next_shards: list[_CupyDeviceCacheShard] = []
+        next_column_start = 0
+        for shard in self.shards:
+            shard_start = int(shard.column_start)
+            shard_stop = int(shard.column_stop)
+            mask = (resolved >= shard_start) & (resolved < shard_stop)
+            if not bool(np.any(mask)):
+                continue
+            shard_indices = (resolved[mask] - shard_start).astype(np.int32, copy=False)
+            with _cupy_device_context(self.cupy, shard.device_id):
+                shard_cache = _cupy_cache_subset_columns(shard.cache, shard_indices)
+            next_shards.append(
+                _CupyDeviceCacheShard(
+                    device_id=shard.device_id,
+                    column_start=next_column_start,
+                    cache=shard_cache,
+                )
+            )
+            next_column_start += int(shard_indices.shape[0])
+        return _CupyShardedStandardizedCache(tuple(next_shards), cupy=self.cupy)
+
+    def standardized_columns(
+        self,
+        local_variant_indices: NDArray | slice,
+        *,
+        dtype: Any = None,
+        device_id: int = 0,
+    ) -> Any:
+        if isinstance(local_variant_indices, slice):
+            selected = np.arange(self.shape[1], dtype=np.int32)[local_variant_indices]
+        else:
+            selected = np.asarray(local_variant_indices, dtype=np.int32)
+        subset = self.subset(selected)
+        return subset.to_device_array(dtype=dtype, device_id=device_id)
+
+    def to_device_array(self, *, dtype: Any = None, device_id: int = 0) -> Any:
+        cp = self.cupy
+        if not self.shards:
+            with _cupy_device_context(cp, device_id):
+                resolved_dtype = _cupy_compute_dtype(cp) if dtype is None else dtype
+                return cp.empty((0, 0), dtype=resolved_dtype)
+        resolved_dtype = _cupy_compute_dtype(cp) if dtype is None else dtype
+        pieces: list[Any] = []
+        for shard in self.shards:
+            with _cupy_device_context(cp, shard.device_id):
+                piece = _cupy_cache_standardized_columns(
+                    shard.cache,
+                    slice(None),
+                    cupy=cp,
+                    dtype=resolved_dtype,
+                )
+            with _cupy_device_context(cp, device_id):
+                pieces.append(cp.asarray(piece, dtype=resolved_dtype))
+        with _cupy_device_context(cp, device_id):
+            concatenate = getattr(cp, "concatenate", np.concatenate)
+            return concatenate(pieces, axis=1)
+
+    def __array__(self, dtype: np.dtype[Any] | type | None = None) -> NDArray:
+        array = self.to_device_array(dtype=np.float32, device_id=0)
+        host = array.get() if hasattr(array, "get") else array
+        return np.asarray(host, dtype=np.float32 if dtype is None else dtype)
+
+
 def _cupy_cache_is_int8_standardized(cache: Any | None) -> TypeGuard[_CupyInt8StandardizedCache]:
     return isinstance(cache, _CupyInt8StandardizedCache)
 
 
+def _cupy_cache_is_sharded(cache: Any | None) -> TypeGuard[_CupyShardedStandardizedCache]:
+    return isinstance(cache, _CupyShardedStandardizedCache)
+
+
 def _cupy_cache_shape(cache: Any) -> tuple[int, int]:
+    if _cupy_cache_is_sharded(cache):
+        return cache.shape
     if _cupy_cache_is_int8_standardized(cache):
         return cache.shape
     return int(cache.shape[0]), int(cache.shape[1])
 
 
 def _cupy_cache_nbytes(cache: Any) -> int:
+    if _cupy_cache_is_sharded(cache):
+        return cache.nbytes
     if _cupy_cache_is_int8_standardized(cache):
         return cache.nbytes
     return int(cache.nbytes)
@@ -2153,6 +2477,8 @@ def _cupy_cache_nbytes(cache: Any) -> int:
 
 def _cupy_cache_subset_columns(cache: Any, local_variant_indices: NDArray) -> Any:
     resolved_local_indices = np.asarray(local_variant_indices, dtype=np.int32)
+    if _cupy_cache_is_sharded(cache):
+        return cache.subset(resolved_local_indices)
     if _cupy_cache_is_int8_standardized(cache):
         return cache.subset(resolved_local_indices)
     if _local_indices_select_all(resolved_local_indices, int(cache.shape[1])):
@@ -2170,6 +2496,12 @@ def _cupy_cache_standardized_columns(
     cupy: Any,
     dtype: Any = None,
 ) -> Any:
+    if _cupy_cache_is_sharded(cache):
+        return cache.standardized_columns(
+            local_variant_indices,
+            dtype=dtype,
+            device_id=_cupy_current_device_id(cupy),
+        )
     if _cupy_cache_is_int8_standardized(cache):
         return cache.standardized_columns(local_variant_indices, dtype=dtype)
     resolved_dtype = _cupy_compute_dtype(cupy) if dtype is None else dtype
@@ -2177,7 +2509,7 @@ def _cupy_cache_standardized_columns(
 
 
 def _cupy_cache_is_fp16_resident(cache: Any | None) -> bool:
-    if cache is None or _cupy_cache_is_int8_standardized(cache):
+    if cache is None or _cupy_cache_is_int8_standardized(cache) or _cupy_cache_is_sharded(cache):
         return False
     try:
         return np.dtype(cache.dtype) == np.dtype(np.float16)
@@ -2186,7 +2518,12 @@ def _cupy_cache_is_fp16_resident(cache: Any | None) -> bool:
 
 
 def _dense_array_cache_available(cache: Any | None) -> bool:
-    return cache is not None and not _cupy_cache_is_int8_standardized(cache) and not _cupy_cache_is_fp16_resident(cache)
+    return (
+        cache is not None
+        and not _cupy_cache_is_int8_standardized(cache)
+        and not _cupy_cache_is_sharded(cache)
+        and not _cupy_cache_is_fp16_resident(cache)
+    )
 
 
 def _gpu_int8_cache_variant_matmul(
@@ -2271,6 +2608,133 @@ def _gpu_fp16_cache_transpose_matmul(cache: Any, matrix_gpu: Any, *, cupy: Any, 
     fp16_dtype = getattr(cupy, "float16", np.float16)
     rhs = matrix_gpu.astype(fp16_dtype, copy=False)
     return (cache.T @ rhs).astype(dtype, copy=False)
+
+
+def _gpu_single_cache_variant_matmul(
+    cache: Any,
+    matrix_gpu: Any,
+    *,
+    local_variant_indices: NDArray | None,
+    cupy: Any,
+    dtype: Any,
+) -> Any:
+    if _cupy_cache_is_int8_standardized(cache):
+        return _gpu_int8_cache_variant_matmul(
+            cache,
+            matrix_gpu,
+            local_variant_indices=local_variant_indices,
+            cupy=cupy,
+            dtype=dtype,
+        )
+    if _cupy_cache_is_fp16_resident(cache):
+        return _gpu_fp16_cache_variant_matmul(
+            cache,
+            matrix_gpu,
+            local_variant_indices=local_variant_indices,
+            cupy=cupy,
+            dtype=dtype,
+        )
+    if local_variant_indices is None:
+        return cache.astype(dtype, copy=False) @ matrix_gpu
+    return cache[:, np.asarray(local_variant_indices, dtype=np.int32)].astype(dtype, copy=False) @ matrix_gpu
+
+
+def _gpu_single_cache_transpose_matmul(cache: Any, matrix_gpu: Any, *, cupy: Any, dtype: Any) -> Any:
+    if _cupy_cache_is_int8_standardized(cache):
+        return _gpu_int8_cache_transpose_matmul(cache, matrix_gpu, cupy=cupy, dtype=dtype)
+    if _cupy_cache_is_fp16_resident(cache):
+        return _gpu_fp16_cache_transpose_matmul(cache, matrix_gpu, cupy=cupy, dtype=dtype)
+    return cache.astype(dtype, copy=False).T @ matrix_gpu
+
+
+def _sharded_variant_groups(
+    cache: _CupyShardedStandardizedCache,
+    local_variant_indices: NDArray | None,
+) -> tuple[tuple[_CupyDeviceCacheShard, NDArray | None, NDArray | None], ...]:
+    if local_variant_indices is None:
+        return tuple((shard, None, None) for shard in cache.shards)
+    resolved = np.asarray(local_variant_indices, dtype=np.int32)
+    groups: list[tuple[_CupyDeviceCacheShard, NDArray | None, NDArray | None]] = []
+    for shard in cache.shards:
+        shard_start = int(shard.column_start)
+        shard_stop = int(shard.column_stop)
+        operand_positions = np.flatnonzero((resolved >= shard_start) & (resolved < shard_stop)).astype(np.int32)
+        if operand_positions.size == 0:
+            continue
+        shard_local_indices = (resolved[operand_positions] - shard_start).astype(np.int32, copy=False)
+        groups.append((shard, operand_positions, shard_local_indices))
+    return tuple(groups)
+
+
+def _gpu_sharded_cache_variant_matmul(
+    cache: _CupyShardedStandardizedCache,
+    matrix_gpu: Any,
+    *,
+    local_variant_indices: NDArray | None,
+    cupy: Any,
+    dtype: Any,
+) -> Any:
+    groups = _sharded_variant_groups(cache, local_variant_indices)
+    if not groups:
+        with _cupy_device_context(cupy, 0):
+            return cupy.zeros((cache.shape[0], matrix_gpu.shape[1]), dtype=dtype)
+
+    def compute(group: tuple[_CupyDeviceCacheShard, NDArray | None, NDArray | None]) -> Any:
+        shard, operand_positions, shard_local_indices = group
+        with _cupy_device_context(cupy, shard.device_id):
+            if operand_positions is None:
+                shard_matrix = cupy.asarray(
+                    matrix_gpu[shard.column_start:shard.column_stop, :],
+                    dtype=dtype,
+                )
+            else:
+                shard_matrix = cupy.asarray(matrix_gpu[operand_positions, :], dtype=dtype)
+            result = _gpu_single_cache_variant_matmul(
+                shard.cache,
+                shard_matrix,
+                local_variant_indices=shard_local_indices,
+                cupy=cupy,
+                dtype=dtype,
+            )
+            _cupy_device_synchronize(cupy, shard.device_id)
+            return result
+
+    primary_device_id = int(groups[0][0].device_id)
+    with _cupy_device_context(cupy, primary_device_id):
+        result_gpu = cupy.zeros((cache.shape[0], matrix_gpu.shape[1]), dtype=dtype)
+    with ThreadPoolExecutor(max_workers=len(groups)) as executor:
+        futures = [executor.submit(compute, group) for group in groups]
+        for future in futures:
+            partial = future.result()
+            with _cupy_device_context(cupy, primary_device_id):
+                result_gpu += cupy.asarray(partial, dtype=dtype)
+    return result_gpu
+
+
+def _gpu_sharded_cache_transpose_matmul(
+    cache: _CupyShardedStandardizedCache,
+    matrix_gpu: Any,
+    *,
+    cupy: Any,
+    dtype: Any,
+) -> Any:
+    if not cache.shards:
+        with _cupy_device_context(cupy, 0):
+            return cupy.zeros((0, matrix_gpu.shape[1]), dtype=dtype)
+
+    def compute(shard: _CupyDeviceCacheShard) -> Any:
+        with _cupy_device_context(cupy, shard.device_id):
+            shard_matrix = cupy.asarray(matrix_gpu, dtype=dtype)
+            result = _gpu_single_cache_transpose_matmul(shard.cache, shard_matrix, cupy=cupy, dtype=dtype)
+            _cupy_device_synchronize(cupy, shard.device_id)
+            return result
+
+    primary_device_id = int(cache.shards[0].device_id)
+    with ThreadPoolExecutor(max_workers=len(cache.shards)) as executor:
+        pieces = [future.result() for future in (executor.submit(compute, shard) for shard in cache.shards)]
+    with _cupy_device_context(cupy, primary_device_id):
+        concatenate = getattr(cupy, "concatenate", np.concatenate)
+        return concatenate([cupy.asarray(piece, dtype=dtype) for piece in pieces], axis=0)
 
 
 def _iter_cupy_cache_standardized_batches(
@@ -3010,6 +3474,204 @@ class StandardizedGenotypeMatrix:
         self._cupy_subset_cache = None
         self._cupy_subset_cache_local_indices = None
 
+    def _sharded_gpu_plans(
+        self,
+        *,
+        cupy: Any,
+        splits: Sequence[tuple[int, int, int]],
+        dtype: Any,
+        backend: str,
+        metadata_bytes_per_column: int = 0,
+    ) -> tuple[_GpuMaterializationMemoryPlan, ...] | None:
+        plans: list[_GpuMaterializationMemoryPlan] = []
+        for device_id, start, stop in splits:
+            width = int(stop) - int(start)
+            with _cupy_device_context(cupy, device_id):
+                plan = _estimate_gpu_materialization_memory_plan(
+                    n_rows=self.shape[0],
+                    n_cols=width,
+                    dtype=dtype,
+                    backend=backend,
+                    cupy=cupy,
+                    metadata_bytes=width * int(metadata_bytes_per_column),
+                )
+            _log_gpu_materialization_memory_plan(plan)
+            if not plan.fits:
+                _warn_gpu_materialization_unavailable(
+                    f"multi-GPU shard {device_id} {backend} cache exceeds budget",
+                    plan,
+                )
+                return None
+            plans.append(plan)
+        return tuple(plans)
+
+    def _try_materialize_gpu_sharded(
+        self,
+        *,
+        cupy: Any,
+        use_int8_gpu_cache: bool,
+    ) -> bool:
+        device_ids = _cupy_device_ids(cupy)
+        if len(device_ids) < 2 or self.shape[1] < 2:
+            return False
+        splits = _split_contiguous_columns(self.shape[1], device_ids)
+        if len(splits) < 2:
+            return False
+
+        backend: str | None = None
+        dtype: Any | None = None
+        plans: tuple[_GpuMaterializationMemoryPlan, ...] | None = None
+        metadata_bytes_per_column = 0
+        if self._dense_cache is not None:
+            backend = "fp32-resident"
+            dtype = np.float32
+            plans = self._sharded_gpu_plans(cupy=cupy, splits=splits, dtype=dtype, backend=backend)
+        elif use_int8_gpu_cache:
+            fp16_dtype = getattr(cupy, "float16", None)
+            if (
+                GPU_FP16_RESIDENT_CACHE_ENABLED
+                and fp16_dtype is not None
+                and _cupy_compute_dtype(cupy) == cupy.float32
+            ):
+                plans = self._sharded_gpu_plans(
+                    cupy=cupy,
+                    splits=splits,
+                    dtype=fp16_dtype,
+                    backend="fp16-resident",
+                )
+                if plans is not None:
+                    backend = "fp16-resident"
+                    dtype = fp16_dtype
+            if plans is None:
+                metadata_bytes_per_column = np.dtype(np.float32).itemsize * 2
+                plans = self._sharded_gpu_plans(
+                    cupy=cupy,
+                    splits=splits,
+                    dtype=np.int8,
+                    backend="int8-resident",
+                    metadata_bytes_per_column=metadata_bytes_per_column,
+                )
+                if plans is not None:
+                    backend = "int8-resident"
+                    dtype = np.int8
+        else:
+            backend = "fp32-resident"
+            dtype = np.float32
+            plans = self._sharded_gpu_plans(cupy=cupy, splits=splits, dtype=dtype, backend=backend)
+
+        if plans is None or backend is None or dtype is None:
+            return False
+
+        log(
+            "    uploading standardized genotypes to multi-GPU sharded cache "
+            + f"({len(splits)} GPUs, backend={backend})  mem={mem()}"
+        )
+        shards: list[_CupyDeviceCacheShard] = []
+        raw_matrix = self.raw
+        dense_ref = self._dense_cache
+        try:
+            if backend == "fp32-resident" and dense_ref is not None:
+                for device_id, start, stop in splits:
+                    with _cupy_device_context(cupy, device_id):
+                        shard_cache = cupy.asarray(dense_ref[:, start:stop], dtype=cupy.float32)
+                        _cupy_device_synchronize(cupy, device_id)
+                    shards.append(_CupyDeviceCacheShard(device_id=device_id, column_start=start, cache=shard_cache))
+                self._dense_cache = None
+            elif backend == "fp16-resident":
+                if raw_matrix is None:
+                    raise RuntimeError("fp16 multi-GPU cache requires raw backing storage.")
+                raw_int8 = cast(Int8BatchCapable, raw_matrix)
+                for device_id, start, stop in splits:
+                    width = int(stop) - int(start)
+                    with _cupy_device_context(cupy, device_id):
+                        shard_cache = cupy.empty((self.shape[0], width), dtype=cupy.float16, order="F")
+                        _upload_standardized_int8_tiles_overlapped(
+                            cupy=cupy,
+                            raw_int8=raw_int8,
+                            variant_indices=self.variant_indices[start:stop],
+                            means=self.means,
+                            scales=self.scales,
+                            gpu_destination=shard_cache,
+                            sample_count=int(self.shape[0]),
+                            upload_batch_size=auto_batch_size_i8(self.shape[0]),
+                            standardized_dtype=cupy.float16,
+                        )
+                        _cupy_device_synchronize(cupy, device_id)
+                    shards.append(_CupyDeviceCacheShard(device_id=device_id, column_start=start, cache=shard_cache))
+            elif backend == "int8-resident":
+                if raw_matrix is None:
+                    raise RuntimeError("int8 multi-GPU cache requires raw backing storage.")
+                raw_int8 = cast(Int8BatchCapable, raw_matrix)
+                gpu_int8_dtype = cupy.int8 if hasattr(cupy, "int8") else np.int8
+                if isinstance(raw_matrix, Int8RawGenotypeMatrix):
+                    _madvise_willneed_array(raw_matrix.matrix)
+                for (device_id, start, stop), plan in zip(splits, plans, strict=True):
+                    width = int(stop) - int(start)
+                    shard_variant_indices = self.variant_indices[start:stop]
+                    with _cupy_device_context(cupy, device_id):
+                        full_int8_block = None
+                        int8_total_bytes = int(self.shape[0]) * width
+                        if int8_total_bytes <= int(plan.budget_bytes * INT8_ONE_SHOT_GPU_BUDGET_FRACTION):
+                            full_int8_block = _read_int8_columns_one_shot(raw_matrix, shard_variant_indices)
+                        if full_int8_block is not None:
+                            shard_raw = cupy.asarray(full_int8_block, dtype=gpu_int8_dtype)
+                            if not shard_raw.flags.f_contiguous:
+                                if hasattr(cupy, "asfortranarray"):
+                                    shard_raw = cupy.asfortranarray(shard_raw)
+                                else:
+                                    shard_raw = np.asfortranarray(np.asarray(shard_raw, dtype=gpu_int8_dtype))
+                        else:
+                            shard_raw = cupy.empty((self.shape[0], width), dtype=gpu_int8_dtype, order="F")
+                            _upload_int8_tiles_overlapped(
+                                cupy=cupy,
+                                raw_int8=raw_int8,
+                                variant_indices=shard_variant_indices,
+                                gpu_destination=shard_raw,
+                                sample_count=int(self.shape[0]),
+                                upload_batch_size=auto_batch_size_i8(self.shape[0]),
+                                gpu_int8_dtype=gpu_int8_dtype,
+                            )
+                        shard_cache = _CupyInt8StandardizedCache(
+                            raw_values=shard_raw,
+                            means=cupy.asarray(self.means[shard_variant_indices], dtype=cupy.float32),
+                            scales=cupy.asarray(self.scales[shard_variant_indices], dtype=cupy.float32),
+                            cupy=cupy,
+                        )
+                        _cupy_device_synchronize(cupy, device_id)
+                    shards.append(_CupyDeviceCacheShard(device_id=device_id, column_start=start, cache=shard_cache))
+            else:
+                if raw_matrix is None:
+                    raise RuntimeError("multi-GPU materialization requires raw backing storage or a dense cache.")
+                for device_id, start, stop in splits:
+                    width = int(stop) - int(start)
+                    with _cupy_device_context(cupy, device_id):
+                        shard_cache = cupy.empty((self.shape[0], width), dtype=cupy.float32, order="F")
+                        for batch_slice, standardized_batch in _iter_standardized_gpu_batches(
+                            raw_matrix,
+                            self.variant_indices[start:stop],
+                            self.means,
+                            self.scales,
+                            batch_size=auto_batch_size(self.shape[0]),
+                            cupy=cupy,
+                        ):
+                            shard_cache[:, batch_slice] = standardized_batch
+                        _cupy_device_synchronize(cupy, device_id)
+                    shards.append(_CupyDeviceCacheShard(device_id=device_id, column_start=start, cache=shard_cache))
+            self._cupy_cache = _CupyShardedStandardizedCache(tuple(shards), cupy=cupy)
+            log(
+                "    CuPy multi-GPU matrix ready "
+                + f"({len(shards)} shards, {_cupy_cache_nbytes(self._cupy_cache) / 1e9:.1f} GB)  mem={mem()}"
+            )
+            return True
+        except BaseException:
+            self._cupy_cache = None
+            if dense_ref is not None:
+                self._dense_cache = dense_ref
+            for device_id in device_ids:
+                with _cupy_device_context(cupy, device_id):
+                    _release_cupy_cached_memory(cupy)
+            raise
+
     def try_materialize_gpu(self) -> bool:
         """Materialize the standardized matrix onto GPU memory when possible."""
         if self._cupy_cache is not None:
@@ -3020,6 +3682,11 @@ class StandardizedGenotypeMatrix:
         active_plan: _GpuMaterializationMemoryPlan | None = None
         try:
             use_int8_gpu_cache = self._dense_cache is None and self.raw is not None and _supports_int8_batches(self.raw)
+            if len(_cupy_device_ids(cupy)) >= 2:
+                return self._try_materialize_gpu_sharded(
+                    cupy=cupy,
+                    use_int8_gpu_cache=use_int8_gpu_cache,
+                )
             metadata_bytes = int(self.shape[1]) * np.dtype(np.float32).itemsize * 2
             if self._dense_cache is not None:
                 active_plan = _estimate_gpu_materialization_memory_plan(
@@ -3284,7 +3951,7 @@ class StandardizedGenotypeMatrix:
             cupy = _try_import_cupy()
             if cupy is None:
                 raise RuntimeError("CuPy cache requires CuPy runtime.")
-            if _cupy_cache_is_int8_standardized(self._cupy_cache):
+            if _cupy_cache_is_int8_standardized(self._cupy_cache) or _cupy_cache_is_sharded(self._cupy_cache):
                 return _cupy_cache_standardized_columns(
                     self._cupy_cache,
                     resolved_local_indices,
@@ -3697,7 +4364,7 @@ class StandardizedGenotypeMatrix:
         if self._dense_cache is not None:
             return self._dense_cache
         if self._cupy_cache is not None:
-            if _cupy_cache_is_int8_standardized(self._cupy_cache):
+            if _cupy_cache_is_int8_standardized(self._cupy_cache) or _cupy_cache_is_sharded(self._cupy_cache):
                 dense_from_cupy = np.asarray(self._cupy_cache, dtype=np.float32)
             else:
                 dense_from_cupy = self._cupy_cache.get()  # cupy -> numpy
@@ -3765,16 +4432,8 @@ class StandardizedGenotypeMatrix:
         if self._cupy_cache is not None:
             if local_variant_indices is None:
                 cache = self._cupy_cache
-                if _cupy_cache_is_int8_standardized(cache):
-                    result_gpu = _gpu_int8_cache_variant_matmul(
-                        cache,
-                        matrix_gpu,
-                        local_variant_indices=None,
-                        cupy=cupy,
-                        dtype=resolved_dtype,
-                    )
-                elif _cupy_cache_is_fp16_resident(cache):
-                    result_gpu = _gpu_fp16_cache_variant_matmul(
+                if _cupy_cache_is_sharded(cache):
+                    result_gpu = _gpu_sharded_cache_variant_matmul(
                         cache,
                         matrix_gpu,
                         local_variant_indices=None,
@@ -3782,19 +4441,25 @@ class StandardizedGenotypeMatrix:
                         dtype=resolved_dtype,
                     )
                 else:
-                    result_gpu = cache.astype(resolved_dtype, copy=False) @ matrix_gpu
+                    result_gpu = _gpu_single_cache_variant_matmul(
+                        cache,
+                        matrix_gpu,
+                        local_variant_indices=None,
+                        cupy=cupy,
+                        dtype=resolved_dtype,
+                    )
             else:
                 cache = self._cupy_cache
-                if _cupy_cache_is_int8_standardized(cache):
-                    result_gpu = _gpu_int8_cache_variant_matmul(
+                if _cupy_cache_is_sharded(cache):
+                    result_gpu = _gpu_sharded_cache_variant_matmul(
                         cache,
                         matrix_gpu,
                         local_variant_indices=resolved_local_indices,
                         cupy=cupy,
                         dtype=resolved_dtype,
                     )
-                elif _cupy_cache_is_fp16_resident(cache):
-                    result_gpu = _gpu_fp16_cache_variant_matmul(
+                elif _cupy_cache_is_int8_standardized(cache) or _cupy_cache_is_fp16_resident(cache):
+                    result_gpu = _gpu_single_cache_variant_matmul(
                         cache,
                         matrix_gpu,
                         local_variant_indices=resolved_local_indices,
@@ -3883,22 +4548,20 @@ class StandardizedGenotypeMatrix:
         if matrix_gpu.shape[0] != self.shape[0]:
             raise ValueError("GPU genotype transpose matmul right-hand side row count must match the sample count.")
         if self._cupy_cache is not None:
-            if _cupy_cache_is_int8_standardized(self._cupy_cache):
-                result_gpu = _gpu_int8_cache_transpose_matmul(
-                    self._cupy_cache,
-                    matrix_gpu,
-                    cupy=cupy,
-                    dtype=resolved_dtype,
-                )
-            elif _cupy_cache_is_fp16_resident(self._cupy_cache):
-                result_gpu = _gpu_fp16_cache_transpose_matmul(
+            if _cupy_cache_is_sharded(self._cupy_cache):
+                result_gpu = _gpu_sharded_cache_transpose_matmul(
                     self._cupy_cache,
                     matrix_gpu,
                     cupy=cupy,
                     dtype=resolved_dtype,
                 )
             else:
-                result_gpu = self._cupy_cache.astype(resolved_dtype, copy=False).T @ matrix_gpu
+                result_gpu = _gpu_single_cache_transpose_matmul(
+                    self._cupy_cache,
+                    matrix_gpu,
+                    cupy=cupy,
+                    dtype=resolved_dtype,
+                )
             return result_gpu[:, 0] if vector_input else result_gpu
         streaming_cupy, streaming_batch_size = self._streaming_gpu_context(
             batch_size,
@@ -4091,12 +4754,12 @@ class StandardizedGenotypeMatrix:
         if self._cupy_cache is not None:
             cupy = _try_import_cupy()
             if cupy is None:
-                if _cupy_cache_is_int8_standardized(self._cupy_cache):
-                    raise RuntimeError("CuPy int8 cache requires CuPy runtime.")
+                if _cupy_cache_is_int8_standardized(self._cupy_cache) or _cupy_cache_is_sharded(self._cupy_cache):
+                    raise RuntimeError("CuPy cache requires CuPy runtime.")
                 dense_cache = (
                     np.asarray(self._cupy_cache, dtype=coeff_np.dtype)
                     if selected_local_indices is None
-                    else np.asarray(self._cupy_cache[:, selected_local_indices], dtype=coeff_np.dtype)
+                    else np.asarray(_cupy_cache_subset_columns(self._cupy_cache, selected_local_indices), dtype=coeff_np.dtype)
                 )
                 return np.asarray(dense_cache @ selected_coefficients, dtype=coeff_np.dtype)
             return _cupy_to_numpy(
@@ -4184,12 +4847,12 @@ class StandardizedGenotypeMatrix:
         if self._cupy_cache is not None:
             cupy = _try_import_cupy()
             if cupy is None:
-                if _cupy_cache_is_int8_standardized(self._cupy_cache):
-                    raise RuntimeError("CuPy int8 cache requires CuPy runtime.")
+                if _cupy_cache_is_int8_standardized(self._cupy_cache) or _cupy_cache_is_sharded(self._cupy_cache):
+                    raise RuntimeError("CuPy cache requires CuPy runtime.")
                 dense_cache = (
                     np.asarray(self._cupy_cache, dtype=m_np.dtype)
                     if selected_local_indices is None
-                    else np.asarray(self._cupy_cache[:, selected_local_indices], dtype=m_np.dtype)
+                    else np.asarray(_cupy_cache_subset_columns(self._cupy_cache, selected_local_indices), dtype=m_np.dtype)
                 )
                 return np.asarray(dense_cache @ selected_matrix, dtype=m_np.dtype)
             return _cupy_to_numpy(
@@ -4265,8 +4928,8 @@ class StandardizedGenotypeMatrix:
         if self._cupy_cache is not None:
             cupy = _try_import_cupy()
             if cupy is None:
-                if _cupy_cache_is_int8_standardized(self._cupy_cache):
-                    raise RuntimeError("CuPy int8 cache requires CuPy runtime.")
+                if _cupy_cache_is_int8_standardized(self._cupy_cache) or _cupy_cache_is_sharded(self._cupy_cache):
+                    raise RuntimeError("CuPy cache requires CuPy runtime.")
                 return np.asarray(np.asarray(self._cupy_cache, dtype=v_np.dtype).T @ v_np, dtype=v_np.dtype)
             return _cupy_to_numpy(
                 self._gpu_transpose_matmul(
@@ -4347,8 +5010,8 @@ class StandardizedGenotypeMatrix:
         if self._cupy_cache is not None:
             cupy = _try_import_cupy()
             if cupy is None:
-                if _cupy_cache_is_int8_standardized(self._cupy_cache):
-                    raise RuntimeError("CuPy int8 cache requires CuPy runtime.")
+                if _cupy_cache_is_int8_standardized(self._cupy_cache) or _cupy_cache_is_sharded(self._cupy_cache):
+                    raise RuntimeError("CuPy cache requires CuPy runtime.")
                 return np.asarray(np.asarray(self._cupy_cache, dtype=m_np.dtype).T @ m_np, dtype=m_np.dtype)
             return _cupy_to_numpy(
                 self._gpu_transpose_matmul(
