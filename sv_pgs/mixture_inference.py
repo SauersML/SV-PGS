@@ -7586,6 +7586,14 @@ def _release_cg_workset_resident_cache(
         pass
 
 
+# Generalized aliases: the install/release helpers are not CG-specific; any hot
+# matvec call site that hammers the full active variant set can use them to
+# avoid re-decoding from PLINK BED on every iteration. The CG-named originals
+# above remain for back-compat with the existing inner-loop install.
+_try_install_resident_int8_cache = _try_install_cg_workset_resident_cache
+_release_resident_int8_cache = _release_cg_workset_resident_cache
+
+
 def _solve_sample_space_rhs_gpu(
     genotype_matrix: StandardizedGenotypeMatrix,
     prior_variances: NDArray,
@@ -11507,12 +11515,29 @@ def _calibrate_initial_global_scale(
     if residual_norm <= 0.0:
         return float(np.clip(current_global_scale, config.global_scale_floor, config.global_scale_ceiling))
     if isinstance(genotype_matrix, StandardizedGenotypeMatrix):
-        genotype_residual_dot = _genotype_transpose_matvec_result_numpy(
-            genotype_matrix,
-            residual,
-            batch_size=DEFAULT_GENOTYPE_BATCH_SIZE,
-            dtype=np.float64,
-        )
+        # The single transpose-matvec below otherwise streams every variant
+        # from BED (~13 min for ~696k variants on T4). Promote the working
+        # set to a GPU-resident int8 cache for the duration of this one call
+        # so ``transpose_matvec_numpy`` routes through the cached path.
+        # Re-entrancy: skip install if a cache is already mounted by an
+        # outer caller.
+        _calibration_cupy = _try_import_cupy()
+        _owned_calibration_cache = False
+        if _calibration_cupy is not None and genotype_matrix._cupy_cache is None:
+            _owned_calibration_cache = _try_install_resident_int8_cache(
+                genotype_matrix,
+                cupy=_calibration_cupy,
+            )
+        try:
+            genotype_residual_dot = _genotype_transpose_matvec_result_numpy(
+                genotype_matrix,
+                residual,
+                batch_size=DEFAULT_GENOTYPE_BATCH_SIZE,
+                dtype=np.float64,
+            )
+        finally:
+            if _owned_calibration_cache:
+                _release_resident_int8_cache(genotype_matrix, cupy=_calibration_cupy)
         column_norms = np.full(variant_count, np.sqrt(float(genotype_matrix.shape[0])), dtype=np.float64)
     else:
         genotype_array = np.asarray(genotype_matrix, dtype=np.float64)
