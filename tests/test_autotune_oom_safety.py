@@ -86,13 +86,13 @@ def test_two_shard_total_inflight_fits_within_usable(monkeypatch: pytest.MonkeyP
     assert grand_total <= 16 * 1024**3
 
 
-def test_multi_gpu_runtime_prefetch_is_one_batch_per_shard() -> None:
-    """Runtime sharded GPU prefetch must not spend the full autotune depth per GPU.
+def test_multi_gpu_runtime_prefetch_caps_two_batches_per_shard() -> None:
+    """Runtime sharded GPU prefetch keeps at most 2 decoded batches per shard.
 
-    The 30 GB V100 AoU failure logged ``batch_size=3084`` and
-    ``prefetch_budget=11220 MB/device``. That allowed roughly 22 GB of decoded
-    PLINK batches across two shards before accounting for reader scratch. The
-    runtime budget is now exactly one decoded int8 batch per GPU shard.
+    Single-batch prefetch left both GPUs idle while the next decode ran;
+    fadvise(DONTNEED) on .bed now keeps the kernel page cache flat, so we can
+    afford a second in-flight batch per shard for pipeline overlap. Total
+    inflight across 2 shards stays under ~5 GB, well below the 30 GB cgroup.
     """
     sample_count = 331_945
     batch_size = 3_084
@@ -101,9 +101,11 @@ def test_multi_gpu_runtime_prefetch_is_one_batch_per_shard() -> None:
         sample_count=sample_count,
         batch_size=batch_size,
     )
-    assert budget == one_batch
-    assert budget < 1.1 * 1024**3
-    assert budget * 2 < 2.1 * 1024**3
+    assert budget == 2 * one_batch, budget
+    # Per-shard inflight cap: < 2 GiB (two ~1 GiB int8 batches).
+    assert budget < 2.1 * 1024**3
+    # Total across 2 shards: < 5 GiB, leaving ~25 GB free on AoU.
+    assert budget * 2 < 5.0 * 1024**3
 
 
 def test_snapshot_emits_new_fields(monkeypatch: pytest.MonkeyPatch) -> None:
