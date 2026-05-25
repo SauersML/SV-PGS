@@ -1941,6 +1941,7 @@ def _iter_prefetched_raw_batches(
     io_worker_limit: int | None = None,
     max_prefetch_bytes: int | None = None,
     decode_thread_limit: int | None = None,
+    read_semaphore: threading.Semaphore | None = None,
 ) -> Iterator[tuple[slice, NDArray]]:
     variant_indices_arr = np.asarray(variant_indices)
     n = int(variant_indices_arr.shape[0])
@@ -1987,18 +1988,32 @@ def _iter_prefetched_raw_batches(
     if _supports_int8_batches(raw):
         i8_raw = raw
         def _read_chunk(chunk_indices: NDArray) -> NDArray:
-            for batch in i8_raw.iter_column_batches_i8(
-                chunk_indices,
-                batch_size=chunk_indices.shape[0],
-                num_threads=per_worker_decode_threads,
-            ):
-                return np.asarray(batch.values)
+            if read_semaphore is None:
+                for batch in i8_raw.iter_column_batches_i8(
+                    chunk_indices,
+                    batch_size=chunk_indices.shape[0],
+                    num_threads=per_worker_decode_threads,
+                ):
+                    return np.asarray(batch.values)
+            else:
+                with read_semaphore:
+                    for batch in i8_raw.iter_column_batches_i8(
+                        chunk_indices,
+                        batch_size=chunk_indices.shape[0],
+                        num_threads=per_worker_decode_threads,
+                    ):
+                        return np.asarray(batch.values)
             return np.empty((sample_count, 0), dtype=np.int8)
     else:
         float_raw = raw
         def _read_chunk(chunk_indices: NDArray) -> NDArray:
-            for batch in float_raw.iter_column_batches(chunk_indices, batch_size=chunk_indices.shape[0]):
-                return np.asarray(batch.values)
+            if read_semaphore is None:
+                for batch in float_raw.iter_column_batches(chunk_indices, batch_size=chunk_indices.shape[0]):
+                    return np.asarray(batch.values)
+            else:
+                with read_semaphore:
+                    for batch in float_raw.iter_column_batches(chunk_indices, batch_size=chunk_indices.shape[0]):
+                        return np.asarray(batch.values)
             return np.empty((sample_count, 0), dtype=np.float32)
     if num_io_workers <= 1 or len(chunks) <= 1:
         local_start = 0
@@ -2007,6 +2022,7 @@ def _iter_prefetched_raw_batches(
             batch_width = values.shape[1]
             local_stop = local_start + batch_width
             yield slice(local_start, local_stop), values
+            del values
             local_start = local_stop
         return
 
@@ -2137,6 +2153,7 @@ def _gpu_int8_transpose_matmul_single_device(
     io_worker_limit: int | None,
     max_prefetch_bytes: int | None = None,
     decode_thread_limit: int | None = None,
+    read_semaphore: threading.Semaphore | None = None,
 ) -> Any:
     selected_variant_indices = np.asarray(selected_variant_indices, dtype=np.int32)
     selected_means_gpu = cupy.asarray(means[selected_variant_indices], dtype=dtype)
@@ -2157,8 +2174,10 @@ def _gpu_int8_transpose_matmul_single_device(
         io_worker_limit=io_worker_limit,
         max_prefetch_bytes=max_prefetch_bytes,
         decode_thread_limit=decode_thread_limit,
+        read_semaphore=read_semaphore,
     ):
         int8_gpu = cupy.asarray(host_values, dtype=getattr(cupy, "int8", np.int8))
+        del host_values
         means_gpu = selected_means_gpu[batch_slice]
         scales_gpu = selected_scales_gpu[batch_slice]
         standardized_gpu = _standardize_int8_cupy(
@@ -2169,6 +2188,7 @@ def _gpu_int8_transpose_matmul_single_device(
             dtype=dtype,
         )
         result_gpu[batch_slice, :] = standardized_gpu.T @ matrix_gpu
+        del int8_gpu, standardized_gpu
         if progress_label is not None:
             completed_variants = batch_slice.stop
             if completed_variants - last_logged_variants >= log_interval:
@@ -2247,12 +2267,14 @@ def _gpu_int8_transpose_matmul_sharded(
         sample_count=int(raw_int8.shape[0]),
         batch_size=int(batch_size),
     )
+    read_semaphore = threading.Semaphore(1)
     if progress_label is not None:
         split_desc = ", ".join(f"gpu{device_id}:{stop - start:,}" for device_id, start, stop in splits)
         log(
             f"        {progress_label}: start multi-GPU streaming {total_variants:,} variants "
             f"across {len(splits)} GPUs ({split_desc}; batch_size={batch_size}; "
-            f"prefetch_budget={per_device_prefetch_bytes / 1e6:.0f} MB/device)  mem={mem()}"
+            f"prefetch_budget={per_device_prefetch_bytes / 1e6:.0f} MB/device; "
+            f"plink_reads=serialized)  mem={mem()}"
         )
 
     def _compute_shard(device_id: int, start: int, stop: int) -> tuple[int, int, NDArray]:
@@ -2273,6 +2295,7 @@ def _gpu_int8_transpose_matmul_sharded(
                 io_worker_limit=per_device_io_workers,
                 max_prefetch_bytes=per_device_prefetch_bytes,
                 decode_thread_limit=1,
+                read_semaphore=read_semaphore,
             )
             _cupy_device_synchronize(cupy, device_id)
             shard_result_host = _cupy_asnumpy(cupy, shard_result_gpu)
