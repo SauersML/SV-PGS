@@ -12,21 +12,35 @@ SV_PGS_RUN_PGID="$$"
 
 _sv_pgs_run_cleanup() {
   local rc=$?
+  trap - EXIT INT TERM HUP
   # Send SIGTERM to the whole process group (negative pid = group), wait
   # briefly for graceful Python shutdown, then SIGKILL anything left.
   # Best-effort; cleanup must never fail the cleanup.
-  kill -- "-${SV_PGS_RUN_PGID}" 2>/dev/null || true
+  local pids pid
+  pids=$(pgrep -g "$SV_PGS_RUN_PGID" 2>/dev/null || true)
+  for pid in $pids; do
+    [ "$pid" = "$$" ] && continue
+    kill "$pid" 2>/dev/null || true
+  done
   local waited=0
   while [ "$waited" -lt 10 ]; do
-    if ! pgrep -g "$SV_PGS_RUN_PGID" >/dev/null 2>&1; then
+    local survivors=0
+    pids=$(pgrep -g "$SV_PGS_RUN_PGID" 2>/dev/null || true)
+    for pid in $pids; do
+      [ "$pid" = "$$" ] && continue
+      survivors=$((survivors + 1))
+    done
+    if [ "$survivors" -eq 0 ]; then
       break
     fi
     sleep 1
     waited=$((waited + 1))
   done
-  if pgrep -g "$SV_PGS_RUN_PGID" >/dev/null 2>&1; then
-    kill -SIGKILL -- "-${SV_PGS_RUN_PGID}" 2>/dev/null || true
-  fi
+  pids=$(pgrep -g "$SV_PGS_RUN_PGID" 2>/dev/null || true)
+  for pid in $pids; do
+    [ "$pid" = "$$" ] && continue
+    kill -SIGKILL "$pid" 2>/dev/null || true
+  done
   exit "$rc"
 }
 
@@ -78,10 +92,27 @@ if command -v nvidia-smi >/dev/null 2>&1; then
   fi
 fi
 
+has_nvidia_device_nodes() {
+  local nodes=()
+  local node
+  for node in /dev/nvidia[0-9]* /dev/nvidiactl /dev/nvidia-uvm; do
+    [ -e "$node" ] && nodes+=("$node")
+  done
+  [ "${#nodes[@]}" -gt 0 ]
+}
+
 echo
 echo "=== GPU RUNTIME DIAGNOSTICS ==="
 echo "  device files:"
-ls -l /dev/nvidia* /dev/nvidiactl /dev/nvidia-uvm 2>&1 | sed 's/^/    /' | head -20
+nvidia_nodes=()
+for nvidia_node in /dev/nvidia[0-9]* /dev/nvidiactl /dev/nvidia-uvm; do
+  [ -e "$nvidia_node" ] && nvidia_nodes+=("$nvidia_node")
+done
+if [ "${#nvidia_nodes[@]}" -gt 0 ]; then
+  ls -l "${nvidia_nodes[@]}" 2>&1 | sed 's/^/    /' | head -20 || true
+else
+  echo "    unavailable (no /dev/nvidia* device nodes mounted)"
+fi
 echo "  lspci (nvidia):"
 lspci 2>/dev/null | grep -i nvidia | sed 's/^/    /' || echo "    (no lspci output)"
 echo "  /proc/driver/nvidia/version:"
@@ -91,7 +122,7 @@ find /usr /opt -maxdepth 6 -name "nvidia-smi" 2>/dev/null | sed 's/^/    /' || t
 echo "  libcuda.so locations:"
 find /usr /opt -maxdepth 6 -name "libcuda.so*" 2>/dev/null | sed 's/^/    /' || true
 echo "  nvidia/cuda packages installed:"
-dpkg -l 2>/dev/null | grep -iE "nvidia|cuda" | awk '{print "    "$1, $2, $3}' | head -20
+dpkg -l 2>/dev/null | grep -iE "nvidia|cuda" | awk '{print "    "$1, $2, $3}' | head -20 || echo "    (none reported by dpkg)"
 echo "  nvidia-smi:"
 if command -v nvidia-smi >/dev/null 2>&1; then
   nvidia-smi -L 2>&1 | sed 's/^/    /' || true
@@ -100,7 +131,8 @@ else
   echo "    unavailable (not on PATH)"
 fi
 echo "  python CUDA runtimes:"
-.venv/bin/python - <<'PYEOF' 2>&1 | sed 's/^/    /'
+if has_nvidia_device_nodes; then
+  .venv/bin/python - <<'PYEOF' 2>&1 | sed 's/^/    /' || true
 try:
     import cupy
     print(f"cupy={cupy.__version__}")
@@ -123,6 +155,9 @@ try:
 except BaseException as exc:
     print(f"jax_runtime_error={exc.__class__.__name__}: {exc}")
 PYEOF
+else
+  echo "    skipped (no NVIDIA device nodes; importing CUDA runtimes can crash in this container state)"
+fi
 echo "=== END GPU RUNTIME DIAGNOSTICS ==="
 
 BASE_SNP="$HOME/sv_pgs_results_snp"
@@ -198,8 +233,11 @@ echo "  disk usage:"
 df -h "$HOME" 2>/dev/null | sed 's/^/    /'
 echo
 echo "  block device backing \$HOME:"
-home_src="$(df --output=source "$HOME" 2>/dev/null | tail -1)"
-home_dev="$(basename "$home_src" 2>/dev/null)"
+home_src="$(df --output=source "$HOME" 2>/dev/null | tail -1 || true)"
+home_dev=""
+if [ -n "$home_src" ]; then
+  home_dev="$(basename "$home_src" 2>/dev/null || true)"
+fi
 if [ -n "$home_dev" ]; then
   # Trim partition suffix (sdb1 -> sdb, nvme0n1p1 -> nvme0n1) so /sys/block lookup works.
   case "$home_dev" in
@@ -236,7 +274,14 @@ echo "  canonical shared cache ($SHARED_CACHE):"
 if [ -d "$SHARED_CACHE" ]; then
   ls -lah "$SHARED_CACHE" 2>/dev/null | sed 's/^/    /'
   echo "  shared cache top-level sizes:"
-  du -sh "$SHARED_CACHE"/* 2>/dev/null | sed 's/^/    /'
+  shopt -s nullglob
+  shared_cache_entries=("$SHARED_CACHE"/*)
+  shopt -u nullglob
+  if [ "${#shared_cache_entries[@]}" -gt 0 ]; then
+    du -sh "${shared_cache_entries[@]}" 2>/dev/null | sed 's/^/    /' || true
+  else
+    echo "    (empty)"
+  fi
 else
   echo "    (missing)"
 fi
