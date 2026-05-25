@@ -2361,10 +2361,18 @@ def _resolve_plink_pread_context(raw: Any) -> tuple[Any, NDArray, int, str] | No
     being declined).
     """
     sample_indices: NDArray | None = None
-    node = raw
     seen: set[int] = set()
     visited_kinds: list[str] = []
-    while node is not None and id(node) not in seen:
+    # DFS so we descend through both single-child wrappers (.child) AND
+    # multi-child concatenators (.children). On AoU the runtime wrapper tree
+    # is RowSubset(child=Concatenated(children=[Plink])) — the previous
+    # version followed only .child and stopped at the concatenator, silently
+    # falling back to the slow CPU path. Walk both.
+    stack: list[Any] = [raw]
+    while stack:
+        node = stack.pop()
+        if node is None or id(node) in seen:
+            continue
         seen.add(id(node))
         visited_kinds.append(type(node).__name__)
         if sample_indices is None and getattr(node, "row_indices", None) is not None:
@@ -2392,7 +2400,28 @@ def _resolve_plink_pread_context(raw: Any) -> tuple[Any, NDArray, int, str] | No
                 log(f"    GPU-decode skipped: total_sample_count={iid_count} on {type(node).__name__}")
                 return None
             return reader, sample_indices, iid_count, str(node.bed_path)
-        node = getattr(node, "child", None)
+        child = getattr(node, "child", None)
+        if child is not None:
+            stack.append(child)
+        children = getattr(node, "children", None)
+        if children is not None:
+            # If concatenator has multiple Plink leaves, the GPU-direct path
+            # can only handle ONE bed_path per call — bail out to the CPU
+            # path which already handles concatenation. Single-child
+            # concatenators (the common AoU shape) flow through normally.
+            children_list = list(children)
+            plink_children = [
+                c for c in children_list
+                if c is not None and getattr(c, "bed_path", None) is not None
+            ]
+            if len(plink_children) > 1:
+                log(
+                    f"    GPU-decode skipped: concatenator has {len(plink_children)} "
+                    f"Plink leaves; multi-source not yet supported in GPU-decode path"
+                )
+                return None
+            for sub in children_list:
+                stack.append(sub)
     log(
         f"    GPU-decode skipped: no bed_path in wrapper chain "
         f"[{' -> '.join(visited_kinds) if visited_kinds else '<empty>'}]; "

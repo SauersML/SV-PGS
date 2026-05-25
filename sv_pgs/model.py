@@ -809,17 +809,24 @@ def _save_marginal_z_cache(
     cache_paths: _FitStageCachePaths,
     z_scores: NDArray,
 ) -> None:
-    """Atomically persist the marginal pre-screen z-scores."""
+    """Atomically persist the marginal pre-screen z-scores.
+
+    Uses an explicit file handle to keep ``np.save`` from auto-appending
+    ``.npy`` to the .tmp filename and breaking the rename. Same fix as
+    ``_save_marginal_chunk``.
+    """
     path = cache_paths.marginal_z_path
     if path is None:
         return
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
-    except OSError:
+    except OSError as exc:
+        log(f"  marginal-z cache: mkdir failed ({exc}), continuing without cache")
         return
     tmp = path.with_suffix(path.suffix + ".tmp")
     try:
-        np.save(tmp, np.asarray(z_scores, dtype=np.float32))
+        with open(tmp, "wb") as fh:
+            np.save(fh, np.asarray(z_scores, dtype=np.float32), allow_pickle=False)
         os.replace(tmp, path)
     except OSError as exc:
         log(f"  marginal-z cache: save failed ({exc}), continuing without cache")
@@ -888,23 +895,35 @@ def _try_load_marginal_chunks(
 
 def _save_marginal_chunk(
     chunk_dir: Path, start: int, stop: int, z_slice: NDArray
-) -> None:
-    """Atomically persist one chunk of marginal z-scores."""
+) -> bool:
+    """Atomically persist one chunk of marginal z-scores. Returns True on success.
+
+    Uses an explicit file handle for ``np.save`` because ``np.save(path, ...)``
+    silently appends ``.npy`` to a filename that doesn't already end in
+    ``.npy`` — so writing to ``chunk_X.tmp`` actually creates
+    ``chunk_X.tmp.npy`` and the subsequent ``os.replace(chunk_X.tmp, ...)``
+    fails with ENOENT. Writing through an open handle bypasses that
+    auto-extension logic.
+    """
     try:
         chunk_dir.mkdir(parents=True, exist_ok=True)
-    except OSError:
-        return
+    except OSError as exc:
+        log(f"  marginal-z chunk cache: mkdir failed ({exc}), continuing")
+        return False
     path = chunk_dir / f"chunk_{start:09d}_{stop:09d}.npy"
-    tmp = path.with_suffix(".tmp")
+    tmp = chunk_dir / f"chunk_{start:09d}_{stop:09d}.npy.tmp"
     try:
-        np.save(tmp, np.asarray(z_slice, dtype=np.float32))
+        with open(tmp, "wb") as fh:
+            np.save(fh, np.asarray(z_slice, dtype=np.float32), allow_pickle=False)
         os.replace(tmp, path)
+        return True
     except OSError as exc:
         log(f"  marginal-z chunk cache: save failed ({exc}), continuing")
         try:
             tmp.unlink(missing_ok=True)
         except OSError:
             pass
+        return False
 
 
 def _invalidate_fit_stage_cache(cache_paths: _FitStageCachePaths) -> None:
@@ -1416,11 +1435,17 @@ class BayesianPGS:
                                     target_vector=prepared_arrays.targets,
                                 )
                                 z_scores[c_start:c_stop] = z_slice
-                                _save_marginal_chunk(chunk_dir, c_start, c_stop, z_slice)
-                                log(
-                                    f"  marginal-z chunk persisted: "
-                                    f"[{c_start:,}:{c_stop:,}) of {pre_screen_count:,}"
-                                )
+                                if _save_marginal_chunk(chunk_dir, c_start, c_stop, z_slice):
+                                    log(
+                                        f"  marginal-z chunk persisted: "
+                                        f"[{c_start:,}:{c_stop:,}) of {pre_screen_count:,}"
+                                    )
+                                else:
+                                    log(
+                                        f"  marginal-z chunk NOT persisted "
+                                        f"[{c_start:,}:{c_stop:,}); resume on rerun "
+                                        f"will recompute this chunk"
+                                    )
                         marginal_z_scores = z_scores
                         _save_marginal_z_cache(fit_stage_cache_paths, marginal_z_scores)
                         log(
