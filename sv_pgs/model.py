@@ -199,6 +199,13 @@ class _FitStageCachePaths:
     # for every cache key but the file itself is written only when the
     # caller opts in via ``config.use_ld_blocks=True``.
     ld_block_partition_path: Path | None = None
+    # Marginal pre-screen z-scores (one float32 per post-MAF active variant,
+    # in the order produced by _select_active_variant_indices_fast). Sized at
+    # ~4 MB for a 1M-variant genome-wide run, but cached because computing it
+    # requires a full transpose_matvec over all active variants — the longest
+    # single step in an AoU fit and the most likely place to lose progress
+    # to an OOM-kill or container restart.
+    marginal_z_path: Path | None = None
 
     def __post_init__(self) -> None:
         if self.fit_key is None:
@@ -206,6 +213,10 @@ class _FitStageCachePaths:
         if self.ld_block_partition_path is None:
             self.ld_block_partition_path = (
                 self.cache_dir / f"{self.key}.ld_block_partition.npz"
+            )
+        if self.marginal_z_path is None:
+            self.marginal_z_path = (
+                self.cache_dir / f"{self.key}.marginal_z.npy"
             )
 
 
@@ -756,6 +767,68 @@ def _try_load_ld_block_partition_cache(
         return None
 
 
+def _try_load_marginal_z_cache(
+    cache_paths: _FitStageCachePaths,
+    *,
+    expected_size: int,
+) -> NDArray | None:
+    """Return cached marginal z-scores, or ``None`` if absent/incompatible.
+
+    The marginal pre-screen is the longest single step on AoU (full
+    transpose_matvec over ~1M variants × ~330k samples ≈ 1.7 h on 2x V100)
+    and the only step that has historically been killed mid-flight. Caching
+    its output keyed by the fit-stage structure key means a subsequent run
+    skips it entirely when inputs are identical.
+    """
+    path = cache_paths.marginal_z_path
+    if path is None or not path.exists():
+        return None
+    try:
+        z = np.load(path, mmap_mode=None)
+    except (OSError, ValueError) as exc:
+        log(f"  marginal-z cache: load failed ({exc}), recomputing")
+        try:
+            path.unlink(missing_ok=True)
+        except OSError:
+            pass
+        return None
+    if z.ndim != 1 or z.shape[0] != int(expected_size) or z.dtype != np.float32:
+        log(
+            f"  marginal-z cache: shape/dtype mismatch "
+            f"(got {z.shape}/{z.dtype}, want ({expected_size},)/float32), recomputing"
+        )
+        try:
+            path.unlink(missing_ok=True)
+        except OSError:
+            pass
+        return None
+    return np.asarray(z, dtype=np.float32)
+
+
+def _save_marginal_z_cache(
+    cache_paths: _FitStageCachePaths,
+    z_scores: NDArray,
+) -> None:
+    """Atomically persist the marginal pre-screen z-scores."""
+    path = cache_paths.marginal_z_path
+    if path is None:
+        return
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        return
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    try:
+        np.save(tmp, np.asarray(z_scores, dtype=np.float32))
+        os.replace(tmp, path)
+    except OSError as exc:
+        log(f"  marginal-z cache: save failed ({exc}), continuing without cache")
+        try:
+            tmp.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
 def _invalidate_fit_stage_cache(cache_paths: _FitStageCachePaths) -> None:
     for path in (
         cache_paths.manifest_path,
@@ -764,6 +837,7 @@ def _invalidate_fit_stage_cache(cache_paths: _FitStageCachePaths) -> None:
         cache_paths.reduced_raw_i8_path,
         cache_paths.em_checkpoint_path,
         cache_paths.ld_block_partition_path,
+        cache_paths.marginal_z_path,
     ):
         if path is None:
             continue
@@ -1196,12 +1270,32 @@ class BayesianPGS:
                     f"(residualized on {prepared_arrays.covariates.shape[1]} covariates)..."
                 )
                 pre_screen_count = int(active_variant_indices.size)
-                marginal_z_scores = compute_marginal_z_scores(
-                    standardized_genotypes=standardized_genotypes,
-                    active_variant_indices=active_variant_indices,
-                    covariate_matrix=prepared_arrays.covariates,
-                    target_vector=prepared_arrays.targets,
+                marginal_z_scores = (
+                    None
+                    if fit_stage_cache_paths is None
+                    else _try_load_marginal_z_cache(
+                        fit_stage_cache_paths,
+                        expected_size=pre_screen_count,
+                    )
                 )
+                if marginal_z_scores is None:
+                    marginal_z_scores = compute_marginal_z_scores(
+                        standardized_genotypes=standardized_genotypes,
+                        active_variant_indices=active_variant_indices,
+                        covariate_matrix=prepared_arrays.covariates,
+                        target_vector=prepared_arrays.targets,
+                    )
+                    if fit_stage_cache_paths is not None:
+                        _save_marginal_z_cache(fit_stage_cache_paths, marginal_z_scores)
+                        log(
+                            f"  marginal-z cache: saved {pre_screen_count} z-scores → "
+                            f"{fit_stage_cache_paths.marginal_z_path.name}"
+                        )
+                else:
+                    log(
+                        f"  marginal-z cache hit: skipped recomputation of "
+                        f"{pre_screen_count} z-scores"
+                    )
                 z_pass_mask = np.abs(marginal_z_scores) >= self.config.marginal_screen_min_abs_z
                 kept_count = int(np.sum(z_pass_mask))
                 if kept_count == 0:
