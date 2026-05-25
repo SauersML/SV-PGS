@@ -1240,6 +1240,56 @@ def _try_import_cupy() -> Any | None:
     return None
 
 
+_libc_malloc_trim: Any = None
+_libc_malloc_trim_checked = False
+
+
+def _release_host_caches(cupy: Any | None) -> None:
+    """Return per-batch host scratch back to the OS.
+
+    Two pools retain large host allocations across PLINK batches and show up
+    as monotonically growing RSS on the 30 GB AoU box:
+
+    1. cupy's default ``PinnedMemoryPool`` holds the staging buffer used by
+       every ``cupy.asarray(numpy_array)`` H2D copy. Even with ``blocking=True``
+       the pool keeps the largest block per stream alive forever, which on a
+       sharded run means ``n_shards × bed_batch_bytes`` of pinned RSS that the
+       kernel cannot reclaim.
+    2. glibc's main arena does not auto-trim after large freed allocations.
+       ``malloc_trim(0)`` walks the arena and ``munmap``s freed pages.
+
+    Both calls are cheap and idempotent; we run them after each batch upload.
+    """
+    if cupy is not None:
+        try:
+            pinned_pool = cupy.get_default_pinned_memory_pool()
+        except (AttributeError, _cupy_runtime_error_classes(cupy)):
+            pinned_pool = None
+        if pinned_pool is not None:
+            try:
+                pinned_pool.free_all_blocks()
+            except _cupy_runtime_error_classes(cupy):
+                pass
+    global _libc_malloc_trim, _libc_malloc_trim_checked
+    if not _libc_malloc_trim_checked:
+        _libc_malloc_trim_checked = True
+        try:
+            import ctypes
+            libc = ctypes.CDLL("libc.so.6", use_errno=False)
+            trim = getattr(libc, "malloc_trim", None)
+            if trim is not None:
+                trim.argtypes = [ctypes.c_size_t]
+                trim.restype = ctypes.c_int
+                _libc_malloc_trim = trim
+        except (OSError, AttributeError):
+            _libc_malloc_trim = None
+    if _libc_malloc_trim is not None:
+        try:
+            _libc_malloc_trim(0)
+        except OSError:
+            pass
+
+
 def _cupy_device_count(cupy: Any) -> int:
     try:
         return max(int(cupy.cuda.runtime.getDeviceCount()), 0)
@@ -2189,6 +2239,10 @@ def _gpu_int8_transpose_matmul_single_device(
         )
         result_gpu[batch_slice, :] = standardized_gpu.T @ matrix_gpu
         del int8_gpu, standardized_gpu
+        # Return pinned staging + glibc heap back to the OS before the next
+        # PLINK decode allocates another batch; without this the cupy pinned
+        # pool grows to ~n_shards × bed_batch_bytes and OOMs the 30 GB box.
+        _release_host_caches(cupy)
         if progress_label is not None:
             completed_variants = batch_slice.stop
             if completed_variants - last_logged_variants >= log_interval:
