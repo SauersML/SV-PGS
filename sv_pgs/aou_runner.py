@@ -158,11 +158,41 @@ def sv_vcf_dir() -> str:
     return f"{_cdr_storage_path()}/wgs/short_read/structural_variants/vcf/full"
 
 
+# Candidate basenames for the ancestry predictions file. AoU has shipped this
+# under both names across CDR releases — newer drops prefix it with the model
+# version (e.g. echo_v4_r2.) while older drops used the bare name.
+_ANCESTRY_PREDS_BASENAMES = (
+    "echo_v4_r2.ancestry_preds.tsv",
+    "ancestry_preds.tsv",
+)
+
+
+def _ancestry_aux_dir() -> str:
+    return f"{_cdr_storage_path()}/wgs/short_read/snpindel/aux/ancestry"
+
+
+def _gsutil_object_exists(path: str) -> bool:
+    if not _GSUTIL_GS_URI_RE.match(path):
+        return False
+    cmd = ["gsutil", "-u", _google_project(), "-q", "stat", path]
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    return result.returncode == 0
+
+
 def resolve_ancestry_predictions_path() -> str:
     # Per-participant ancestry predictions + PC features (.tsv keyed by
     # research_id). Same file is reused as the source of the 16 covariate PCs
-    # the pipeline merges into the sample table.
-    return f"{_cdr_storage_path()}/wgs/short_read/snpindel/aux/ancestry/ancestry_preds.tsv"
+    # the pipeline merges into the sample table. Probe known basenames so a
+    # bucket-naming change (echo_v4_r2.* vs. bare) doesn't break the run.
+    aux_dir = _ancestry_aux_dir()
+    for basename in _ANCESTRY_PREDS_BASENAMES:
+        candidate = f"{aux_dir}/{basename}"
+        if _gsutil_object_exists(candidate):
+            return candidate
+    raise RuntimeError(
+        "Could not locate ancestry_preds.tsv under "
+        f"{aux_dir} (tried: {', '.join(_ANCESTRY_PREDS_BASENAMES)})."
+    )
 
 
 def local_ancestry_predictions_path(work_dir: Path) -> Path:
@@ -271,9 +301,13 @@ def _link_mounted_sv_vcf(chromosome: int, work_dir: Path) -> bool:
 
 
 def _link_mounted_ancestry_preds(work_dir: Path) -> bool:
-    mounted = _mounted_cdr_file(
-        "wgs/short_read/snpindel/aux/ancestry/ancestry_preds.tsv"
-    )
+    mounted = None
+    for basename in _ANCESTRY_PREDS_BASENAMES:
+        mounted = _mounted_cdr_file(
+            f"wgs/short_read/snpindel/aux/ancestry/{basename}"
+        )
+        if mounted is not None:
+            break
     if mounted is None:
         return False
     _link_mounted_file(mounted, local_ancestry_predictions_path(work_dir))
