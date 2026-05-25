@@ -1244,6 +1244,38 @@ _libc_malloc_trim: Any = None
 _libc_malloc_trim_checked = False
 
 
+def _collect_bed_paths(raw: Any) -> tuple[str, ...]:
+    """Walk wrapper genotype matrices to collect every underlying .bed path.
+
+    The standardized view used by the marginal screen is typically a
+    ``RowSubsetRawGenotypeMatrix(child=PlinkRawGenotypeMatrix(...))`` —
+    ``getattr(raw, "bed_path", None)`` on the wrapper returns None and the
+    fadvise(DONTNEED) silently no-ops, defeating the page-cache eviction
+    that keeps the AoU cgroup happy. Descend through ``.child`` and
+    ``.children`` to find every PlinkRawGenotypeMatrix in the tree.
+    """
+    seen: set[int] = set()
+    collected: list[str] = []
+    stack: list[Any] = [raw]
+    while stack:
+        node = stack.pop()
+        if node is None or id(node) in seen:
+            continue
+        seen.add(id(node))
+        bed_path = getattr(node, "bed_path", None)
+        if bed_path is not None:
+            collected.append(str(bed_path))
+            continue  # leaf
+        child = getattr(node, "child", None)
+        if child is not None:
+            stack.append(child)
+        children = getattr(node, "children", None)
+        if children is not None:
+            for sub in children:
+                stack.append(sub)
+    return tuple(collected)
+
+
 def _fadvise_dontneed(path: str | Path) -> None:
     """Tell the kernel to drop page-cache pages for ``path``.
 
@@ -2279,11 +2311,7 @@ def _gpu_int8_transpose_matmul_single_device(
         # cupy's pinned-host pool, glibc's untrimmed arena, and (dominantly)
         # the kernel page cache for bed-reader's mmap of arrays.bed — see
         # _release_host_caches for the full story.
-        fadvise_paths: tuple[str, ...] = ()
-        bed_path = getattr(raw_int8, "bed_path", None)
-        if bed_path is not None:
-            fadvise_paths = (str(bed_path),)
-        _release_host_caches(cupy, fadvise_paths=fadvise_paths)
+        _release_host_caches(cupy, fadvise_paths=_collect_bed_paths(raw_int8))
         if progress_label is not None:
             completed_variants = batch_slice.stop
             if completed_variants - last_logged_variants >= log_interval:
