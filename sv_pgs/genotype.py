@@ -44,8 +44,14 @@ DEFAULT_GENOTYPE_BATCH_SIZE = 1024  # fallback when sample count is unknown
 _AUTO_TUNE_HOST_RAM_FALLBACK_BYTES = 4 * 1024 * 1024 * 1024  # 4 GB
 _AUTO_TUNE_BED_BATCH_HARD_CAP_BYTES = 4 * 1024 * 1024 * 1024  # 4 GB
 _AUTO_TUNE_BED_BATCH_FLOOR_BYTES = 128 * 1024 * 1024  # 128 MB
-_AUTO_TUNE_PREFETCH_DEPTH_HARD_CAP = 64
-_AUTO_TUNE_HOST_RAM_INFLIGHT_FRACTION = 0.25  # ≤ 25% free RAM in flight
+_AUTO_TUNE_PREFETCH_DEPTH_HARD_CAP = 4  # I/O-bound BED reads (~3 s each) don't
+# benefit from >4 concurrent slots — more just balloons inflight RAM. The hard
+# cap is per-shard, so a 2-GPU box can still have 8 readers total.
+_AUTO_TUNE_HOST_RAM_INFLIGHT_FRACTION = 0.40  # ≤ 40% of usable RAM (after fit
+# reserve) may be tied up in prefetch buffers across all shards combined.
+# Higher than the prior 0.25 because the reserve already accounts for fit working
+# set; lower than 1.0 because cupy pool, Python heap, and OS overhead also need
+# room. On a 30 GB box: usable≈20 GB → inflight cap≈8 GB.
 _AUTO_TUNE_GPU_BATCH_FRACTION = 0.40  # one batch fits in 40% of GPU free
 # Reserved RAM for the fit working set itself (model params, accumulators,
 # Hessian-vector workspace, JAX/XLA scratch). Subtracted from MemAvailable
@@ -54,7 +60,11 @@ _AUTO_TUNE_GPU_BATCH_FRACTION = 0.40  # one batch fits in 40% of GPU free
 # observed AoU peak (T4/V100, 695k variants × 331k samples) plus headroom;
 # the May 2026 30 GB-container OOM (rc=137 RSS=11 GB) traced to prefetch
 # eating 8 GB while the fit needed ~3 GB working set + ~2 GB accumulators.
-_AUTO_TUNE_FIT_WORKING_MEM_RESERVE_BYTES = 4 * 1024 * 1024 * 1024  # 4 GB
+_AUTO_TUNE_FIT_WORKING_MEM_RESERVE_BYTES = 10 * 1024 * 1024 * 1024  # 10 GB
+# (was 4 GB — the May 2026 30 GB OOM at RSS=29 GB showed actual fit working
+# set + cupy pool + sharded-matmul accumulators + Python heap routinely
+# consumes 8-10 GB, not 4. The prefetch budget MUST exclude this or each
+# shard's inflight queue cumulatively pushes total RSS past MemAvailable.)
 _AUTO_TUNE_MIN_USABLE_PREFETCH_BYTES = 1 * 1024 * 1024 * 1024  # 1 GB floor
 # Cap a single batch at half of usable prefetch RAM so at least two batches
 # can be queued (otherwise prefetch_depth collapses to 1 and the GPU stalls).
@@ -1930,6 +1940,7 @@ def _iter_prefetched_raw_batches(
     batch_size: int,
     io_worker_limit: int | None = None,
     max_prefetch_bytes: int | None = None,
+    decode_thread_limit: int | None = None,
 ) -> Iterator[tuple[slice, NDArray]]:
     variant_indices_arr = np.asarray(variant_indices)
     n = int(variant_indices_arr.shape[0])
@@ -1968,7 +1979,10 @@ def _iter_prefetched_raw_batches(
     # The pipeline executor *is* the parallelism; fanning out further inside
     # each read would oversubscribe (workers * threads_per_worker > cpu_count)
     # and pile up per-thread numpy scratch until the process swaps.
-    per_worker_decode_threads = max(1, cpu_cap // max(1, num_io_workers))
+    if decode_thread_limit is None:
+        per_worker_decode_threads = max(1, cpu_cap // max(1, num_io_workers))
+    else:
+        per_worker_decode_threads = max(1, int(decode_thread_limit))
 
     if _supports_int8_batches(raw):
         i8_raw = raw
@@ -2122,6 +2136,7 @@ def _gpu_int8_transpose_matmul_single_device(
     progress_label: str | None,
     io_worker_limit: int | None,
     max_prefetch_bytes: int | None = None,
+    decode_thread_limit: int | None = None,
 ) -> Any:
     selected_variant_indices = np.asarray(selected_variant_indices, dtype=np.int32)
     selected_means_gpu = cupy.asarray(means[selected_variant_indices], dtype=dtype)
@@ -2141,6 +2156,7 @@ def _gpu_int8_transpose_matmul_single_device(
         batch_size=batch_size,
         io_worker_limit=io_worker_limit,
         max_prefetch_bytes=max_prefetch_bytes,
+        decode_thread_limit=decode_thread_limit,
     ):
         int8_gpu = cupy.asarray(host_values, dtype=getattr(cupy, "int8", np.int8))
         means_gpu = selected_means_gpu[batch_slice]
@@ -2178,6 +2194,18 @@ def _cupy_asnumpy(cupy: Any, values: Any) -> NDArray:
     return np.asarray(values)
 
 
+def _sharded_gpu_prefetch_budget_bytes(*, sample_count: int, batch_size: int) -> int:
+    """Return per-GPU host prefetch budget for multi-GPU PLINK streaming.
+
+    Each GPU shard owns an independent prefetch executor. Allowing the normal
+    per-shard depth here means total queued RAM is multiplied by the number of
+    GPUs, which OOMs the 30 GB AoU V100 runtime before the first marginal
+    screen finishes. Keep exactly one decoded int8 PLINK batch queued per GPU;
+    GPU overlap still comes from running one shard per visible GPU.
+    """
+    return max(1, int(sample_count) * max(1, int(batch_size)))
+
+
 def _gpu_int8_transpose_matmul_sharded(
     *,
     raw_int8: Int8BatchCapable,
@@ -2206,6 +2234,7 @@ def _gpu_int8_transpose_matmul_sharded(
             progress_label=progress_label,
             io_worker_limit=None,
             max_prefetch_bytes=None,
+            decode_thread_limit=None,
         )
     import time as _time
 
@@ -2214,25 +2243,9 @@ def _gpu_int8_transpose_matmul_sharded(
     matrix_host = _cupy_asnumpy(cupy, matrix_gpu)
     cpu_count = max(1, os.cpu_count() or 1)
     per_device_io_workers = max(1, (cpu_count - 2) // max(1, len(splits)))
-    # Respect the autotuned per-shard prefetch RAM cap so the SUM across
-    # shards (depth × batch_bytes × n_shards) never exceeds the post-reserve
-    # usable RAM budget. The legacy formula here (12% of MemAvailable then
-    # divided by n_shards) ignored the fit working set and caused the
-    # rc=137 OOM on the 30 GB AoU box in May 2026.
-    host_ram_for_prefetch = compute_usable_prefetch_ram_bytes()
-    per_shard_depth = compute_plink_int8_max_prefetch_depth(
-        cpu_count=cpu_count,
-        target_batch_bytes=BED_READER_TARGET_BATCH_BYTES,
-        n_shards=len(splits),
-    )
-    # Each shard's prefetch executor may hold up to `per_shard_depth` BED
-    # batches in flight. Honor that bound by passing the per-shard byte budget.
-    per_device_prefetch_bytes = max(
-        128_000_000,
-        min(
-            host_ram_for_prefetch // max(1, len(splits)),
-            BED_READER_TARGET_BATCH_BYTES * max(1, per_shard_depth),
-        ),
+    per_device_prefetch_bytes = _sharded_gpu_prefetch_budget_bytes(
+        sample_count=int(raw_int8.shape[0]),
+        batch_size=int(batch_size),
     )
     if progress_label is not None:
         split_desc = ", ".join(f"gpu{device_id}:{stop - start:,}" for device_id, start, stop in splits)
@@ -2259,6 +2272,7 @@ def _gpu_int8_transpose_matmul_sharded(
                 progress_label=shard_label,
                 io_worker_limit=per_device_io_workers,
                 max_prefetch_bytes=per_device_prefetch_bytes,
+                decode_thread_limit=1,
             )
             _cupy_device_synchronize(cupy, device_id)
             shard_result_host = _cupy_asnumpy(cupy, shard_result_gpu)

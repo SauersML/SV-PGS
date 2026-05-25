@@ -56,7 +56,7 @@ def test_usable_prefetch_reserves_fit_working_set(monkeypatch: pytest.MonkeyPatc
     """16 GB MemAvailable -> usable prefetch RAM = 16 - 4 reserve = 12 GB."""
     host_ram = 16 * 1024**3
     usable = genotype.compute_usable_prefetch_ram_bytes(host_ram)
-    assert usable == 12 * 1024**3
+    assert usable == (16 * 1024**3) - genotype._AUTO_TUNE_FIT_WORKING_MEM_RESERVE_BYTES
 
 
 def test_usable_prefetch_floor_on_tiny_box() -> None:
@@ -92,8 +92,8 @@ def test_snapshot_emits_new_fields(monkeypatch: pytest.MonkeyPatch) -> None:
     _patch_no_gpu_detection(monkeypatch, device_count=2)
     monkeypatch.setattr(genotype.os, "cpu_count", lambda: 22)
     state = genotype._snapshot_autotune_state()
-    assert state["fit_working_mem_reserve_bytes"] == 4 * 1024**3
-    assert state["usable_prefetch_ram_bytes"] == 12 * 1024**3
+    assert state["fit_working_mem_reserve_bytes"] == genotype._AUTO_TUNE_FIT_WORKING_MEM_RESERVE_BYTES
+    assert state["usable_prefetch_ram_bytes"] == (16 * 1024**3) - genotype._AUTO_TUNE_FIT_WORKING_MEM_RESERVE_BYTES
     assert state["n_shards"] == 2
     assert state["plink_int8_max_prefetch_depth_total"] == (
         state["plink_int8_max_prefetch_depth"] * state["n_shards"]
@@ -108,7 +108,7 @@ def test_production_256gb_box_fits(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(genotype.os, "cpu_count", lambda: 64)
 
     usable = genotype.compute_usable_prefetch_ram_bytes(host_ram)
-    assert usable == (256 - 4) * 1024**3
+    assert usable == host_ram - genotype._AUTO_TUNE_FIT_WORKING_MEM_RESERVE_BYTES
 
     bed_bytes = genotype.compute_bed_reader_target_batch_bytes(host_ram_bytes=host_ram, n_shards=2)
     depth = genotype.compute_plink_int8_max_prefetch_depth(
