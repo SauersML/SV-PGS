@@ -2312,13 +2312,13 @@ def _cupy_asnumpy(cupy: Any, values: Any) -> NDArray:
 def _sharded_gpu_prefetch_budget_bytes(*, sample_count: int, batch_size: int) -> int:
     """Return per-GPU host prefetch budget for multi-GPU PLINK streaming.
 
-    Each GPU shard owns an independent prefetch executor. Allowing the normal
-    per-shard depth here means total queued RAM is multiplied by the number of
-    GPUs, which OOMs the 30 GB AoU V100 runtime before the first marginal
-    screen finishes. Keep exactly one decoded int8 PLINK batch queued per GPU;
-    GPU overlap still comes from running one shard per visible GPU.
+    Sized to keep 2 decoded int8 batches queued per shard so the GPU has a
+    next batch ready while the kernel finishes the current one. With the
+    fadvise(DONTNEED) drain in _release_host_caches, the kernel page cache
+    no longer accumulates, so we can afford more than one in-flight batch
+    per shard without OOM-ing the 30 GB AoU box.
     """
-    return max(1, int(sample_count) * max(1, int(batch_size)))
+    return max(1, int(sample_count) * max(1, int(batch_size)) * 2)
 
 
 def _gpu_int8_transpose_matmul_sharded(
@@ -2362,14 +2362,19 @@ def _gpu_int8_transpose_matmul_sharded(
         sample_count=int(raw_int8.shape[0]),
         batch_size=int(batch_size),
     )
-    read_semaphore = threading.Semaphore(1)
+    # No read_semaphore: with fadvise(DONTNEED) on .bed after each batch the
+    # OOM rationale for serializing shard reads is gone, and the previous
+    # serialization halved decode throughput on the 2x V100 box (both GPUs
+    # spent the marginal screen at 0% utilization waiting for the single in-
+    # flight PLINK read). Concurrent decodes saturate the disk read pipeline
+    # and give each GPU its own decoder.
     if progress_label is not None:
         split_desc = ", ".join(f"gpu{device_id}:{stop - start:,}" for device_id, start, stop in splits)
         log(
             f"        {progress_label}: start multi-GPU streaming {total_variants:,} variants "
             f"across {len(splits)} GPUs ({split_desc}; batch_size={batch_size}; "
             f"prefetch_budget={per_device_prefetch_bytes / 1e6:.0f} MB/device; "
-            f"plink_reads=serialized)  mem={mem()}"
+            f"plink_reads=parallel)  mem={mem()}"
         )
 
     def _compute_shard(device_id: int, start: int, stop: int) -> tuple[int, int, NDArray]:
@@ -2389,8 +2394,8 @@ def _gpu_int8_transpose_matmul_sharded(
                 progress_label=shard_label,
                 io_worker_limit=per_device_io_workers,
                 max_prefetch_bytes=per_device_prefetch_bytes,
-                decode_thread_limit=1,
-                read_semaphore=read_semaphore,
+                decode_thread_limit=max(1, per_device_io_workers),
+                read_semaphore=None,
             )
             _cupy_device_synchronize(cupy, device_id)
             shard_result_host = _cupy_asnumpy(cupy, shard_result_gpu)
