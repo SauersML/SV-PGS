@@ -1679,7 +1679,10 @@ def _vcf_cache_source_signature(vcf_path: Path) -> str:
 
 
 def _vcf_cache_dir(vcf_path: Path) -> Path:
-    return vcf_path.resolve().parent / _CACHE_DIR_NAME
+    # Use the unresolved parent so caches land beside the path as referenced
+    # (typically a writable cache dir). Resolving would follow symlinks into
+    # read-only mounted dataset directories (e.g. AoU workspace mounts).
+    return Path(os.path.abspath(vcf_path)).parent / _CACHE_DIR_NAME
 
 
 def _vcf_cache_paths(vcf_path: Path, config: ModelConfig) -> _VcfCachePaths:
