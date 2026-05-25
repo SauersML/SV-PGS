@@ -1133,32 +1133,26 @@ class PlinkRawGenotypeMatrix(RawGenotypeMatrix):
         return self._reader
 
     def release_reader(self) -> None:
-        """Drop the cached bed-reader so its mmap is unmapped.
+        """Drop the cached PLINK reader so its fd/mmap can be reclaimed.
 
         Required between PLINK batches when the host runs under a cgroup
         memory limit: ``posix_fadvise(POSIX_FADV_DONTNEED)`` on the .bed
-        file cannot evict pages whose PTE map_count > 0 (i.e. pages held
-        by an active mmap), so as long as bed-reader keeps its mmap open
-        the kernel page cache grows monotonically with every read and
-        eventually OOMs the container even though the *anonymous* RSS
-        stays small.
+        file cannot evict pages whose PTE map_count > 0 (mmap'd readers)
+        or that are still referenced by an active fd's read-ahead state,
+        so we must drop our reference and let __del__ tear it down before
+        fadvise runs.
 
-        Idempotent and thread-safe in the sense that any in-flight read
-        on another thread holds its own local reference to the reader —
-        clearing ``self._reader`` only nullifies the *cache*, not any
-        existing live reader. Once the last reference is dropped, the
-        reader's __del__ unmaps the .bed and the kernel can evict.
+        Thread-safe: in-flight reads on another thread hold a *local*
+        reference to the reader (grabbed at the top of
+        :meth:`iter_column_batches_i8`), so clearing ``self._reader``
+        only nullifies the cache attribute. The active read continues
+        with its local handle. Once that local reference drops, refcount
+        hits zero and the reader's __del__ closes the fd. We deliberately
+        do NOT call ``.close()`` here — that would yank the fd out from
+        under any in-flight read and raise
+        ``RuntimeError: PLINK reader file descriptor is closed``.
         """
-        reader = self._reader
         self._reader = None
-        if reader is None:
-            return
-        close = getattr(reader, "close", None)
-        if callable(close):
-            try:
-                close()
-            except (OSError, AttributeError, RuntimeError):
-                pass
 
 
 @dataclass(slots=True)
