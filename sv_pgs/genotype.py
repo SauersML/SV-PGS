@@ -2264,7 +2264,7 @@ def _iter_prefetched_raw_batches(
 
 
 # =========================================================================
-# GPU-side PLINK BED 2-bit decoder (opt-in via SV_PGS_PLINK_GPU_DECODE=1).
+# GPU-side PLINK BED 2-bit decoder (default path for Plink-backed inputs).
 #
 # Replaces the CPU decode + 1 GB host int8 buffer per batch with:
 #   pread raw 2-bit bytes (~256 MB) -> small host transient
@@ -2382,10 +2382,6 @@ def _get_plink_gpu_decode_kernel(cupy: Any) -> Any:
             "plink_decode_a1_subset",
         )
     return _plink_gpu_decode_kernel_cache
-
-
-def _plink_gpu_decode_enabled() -> bool:
-    return os.environ.get("SV_PGS_PLINK_GPU_DECODE", "").strip().lower() in {"1", "true", "yes", "on"}
 
 
 def _gpu_plink_pread_transpose_matmul_direct(
@@ -2555,28 +2551,29 @@ def _gpu_int8_transpose_matmul(
 ) -> Any:
     selected_variant_indices = np.asarray(variant_indices, dtype=np.int32)
 
-    # Opt-in GPU-decode fast path. When enabled and the underlying matrix is
-    # Plink-backed via sv_pgs.plink.open_bed, route to the direct path that
-    # preads raw 2-bit bytes and unpacks on the GPU, eliminating the 1 GB
-    # host int8 transient that historically OOM'd the AoU 30 GB cgroup.
-    if _plink_gpu_decode_enabled():
-        ctx = _resolve_plink_pread_context(raw_int8)
-        if ctx is not None:
-            reader, sample_indices, iid_count, bed_path = ctx
-            return _gpu_plink_pread_transpose_matmul_direct(
-                reader=reader,
-                sample_indices=sample_indices,
-                iid_count=iid_count,
-                bed_path=bed_path,
-                selected_variant_indices=selected_variant_indices,
-                means=means,
-                scales=scales,
-                matrix_gpu=matrix_gpu,
-                batch_size=batch_size,
-                cupy=cupy,
-                dtype=dtype,
-                progress_label=progress_label,
-            )
+    # GPU-decode fast path: when the underlying matrix is Plink-backed via
+    # sv_pgs.plink.open_bed, pread raw 2-bit bytes and unpack on the GPU.
+    # Eliminates the 1 GB host int8 transient that historically OOM'd the
+    # AoU 30 GB cgroup and pushes 2-bit unpack from 3 CPU threads to V100
+    # where it's microseconds. Non-Plink matrices return ctx=None and fall
+    # through to the existing CPU-decode + standardize path.
+    ctx = _resolve_plink_pread_context(raw_int8)
+    if ctx is not None:
+        reader, sample_indices, iid_count, bed_path = ctx
+        return _gpu_plink_pread_transpose_matmul_direct(
+            reader=reader,
+            sample_indices=sample_indices,
+            iid_count=iid_count,
+            bed_path=bed_path,
+            selected_variant_indices=selected_variant_indices,
+            means=means,
+            scales=scales,
+            matrix_gpu=matrix_gpu,
+            batch_size=batch_size,
+            cupy=cupy,
+            dtype=dtype,
+            progress_label=progress_label,
+        )
 
     device_ids = _cupy_device_ids(cupy)
     if len(device_ids) >= 2 and int(selected_variant_indices.shape[0]) >= len(device_ids):

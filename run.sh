@@ -408,9 +408,8 @@ build_aou_env_args() {
     TMPDIR
     # uv cache reuse — without this uv re-resolves and re-installs every call.
     UV_CACHE_DIR
-    # Our own knobs — postmortem dir + sweep override + perf opt-ins.
+    # Our own knobs — postmortem dir + sweep override.
     SV_PGS_LAST_OUTDIR SV_PGS_SKIP_STARTUP_SWEEP SV_PGS_SKIP_PULL
-    SV_PGS_PLINK_GPU_DECODE SV_PGS_PLINK_INT8_MAX_PREFETCH_DEPTH
   )
   local env_args=()
   local name value
