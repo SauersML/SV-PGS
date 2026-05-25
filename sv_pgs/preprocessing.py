@@ -257,8 +257,7 @@ def compute_marginal_z_scores(
 
     if covariate_f64.shape[1] == 0:
         y_resid = target_f64 - float(target_f64.mean())
-        # No covariate projection — null variance is sigma2 * ||x_j||^2.
-        cprime_x = np.zeros((0, m_active), dtype=np.float64)
+        projection_cov = np.zeros((n, 0), dtype=np.float64)
         ctc_inv = None
     else:
         # Augment the covariate matrix with an explicit intercept column when
@@ -288,35 +287,35 @@ def compute_marginal_z_scores(
         # intercept) gracefully.
         alpha_cov, _, _, _ = np.linalg.lstsq(projection_cov, target_f64, rcond=None)
         y_resid = target_f64 - projection_cov @ alpha_cov
-
-        # Per-variant null variance under covariate adjustment:
-        #     Var(x_j^T y_resid) = sigma2 * x_j' P x_j
-        # with P = I - C (C'C)^{-1} C'. Compute C'X by calling
-        # transpose_matvec once per covariate column (p_cov is small).
-        p_cov = int(projection_cov.shape[1])
-        cprime_x = np.empty((p_cov, m_active), dtype=np.float64)
-        for k in range(p_cov):
-            cprime_x[k, :] = np.asarray(
-                active_subset.transpose_matvec_numpy(
-                    np.ascontiguousarray(projection_cov[:, k], dtype=np.float32)
-                ),
-                dtype=np.float64,
-            ).reshape(-1)
-        ctc = projection_cov.T @ projection_cov
         # Use pinv to tolerate rank-deficient covariate designs (mirrors the
         # rank-tolerant lstsq above).
-        ctc_inv = np.linalg.pinv(ctc)
+        ctc_inv = np.linalg.pinv(projection_cov.T @ projection_cov)
 
     sigma2_resid = float(np.dot(y_resid, y_resid) / max(n, 1))
     if sigma2_resid <= 0.0:
         return np.zeros(m_active, dtype=np.float32)
 
-    # X_std^T y_resid over the active variants only — one streaming pass via
-    # the existing transpose_matvec infrastructure.
-    sum_xy = np.asarray(
-        active_subset.transpose_matvec_numpy(y_resid.astype(np.float32)),
+    # ONE streaming pass: stack y_resid with the p_cov covariate columns into a
+    # single (n, p_cov + 1) right-hand-side and compute X_std^T @ rhs in one
+    # shot via transpose_matmat_numpy. Previous implementation called
+    # transpose_matvec_numpy once per covariate column (16 passes) plus once
+    # for y_resid (1 pass) = 17 full-genome decodes for the marginal screen.
+    # The single matmat pass is mathematically identical (just the matrix
+    # form of stacking 17 matvecs) but the decode work happens exactly once
+    # — ~17x wall-time speedup on AoU where decode dominates.
+    p_cov = int(projection_cov.shape[1])
+    rhs = np.empty((n, p_cov + 1), dtype=np.float32)
+    rhs[:, 0] = y_resid.astype(np.float32, copy=False)
+    if p_cov > 0:
+        rhs[:, 1:] = projection_cov.astype(np.float32, copy=False)
+    combined = np.asarray(
+        active_subset.transpose_matmat_numpy(rhs),
         dtype=np.float64,
-    ).reshape(-1)
+    )
+    sum_xy = combined[:, 0]
+    cprime_x = (
+        combined[:, 1:].T if p_cov > 0 else np.zeros((0, m_active), dtype=np.float64)
+    )
 
     # Per-variant ||x_j||^2. Standardization uses ddof=0 (scale = sqrt(css/n)),
     # so for non-floored columns ||x_j||^2 == n exactly (missing entries are

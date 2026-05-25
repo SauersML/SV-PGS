@@ -1120,17 +1120,27 @@ class PlinkRawGenotypeMatrix(RawGenotypeMatrix):
         return self._read_batch(reader, resolved_indices)
 
     def _bed_reader(self) -> Any:
-        if self._reader is None:
+        # Bind to a local FIRST so a concurrent ``release_reader`` (running on
+        # another thread between batches to drop the cached mmap so fadvise
+        # can evict page-cache bytes) can't null out ``self._reader`` between
+        # our open and our return. Previously returning ``self._reader``
+        # directly after assigning it raced with release_reader resetting the
+        # attribute to None and returned None to callers, which then crashed
+        # with ``'NoneType' object has no attribute 'read'`` on the next
+        # transpose_matvec pass of the marginal screen.
+        reader = self._reader
+        if reader is None:
             log(f"    opening PLINK reader (lazy, no metadata): iid_count={self.total_sample_count} sid_count={self.variant_count}  mem={mem()}")
-            self._reader = open_bed(
+            reader = open_bed(
                 self.bed_path,
                 iid_count=self.total_sample_count,
                 sid_count=self.variant_count,
                 properties={},
                 num_threads=None,
             )
+            self._reader = reader
             log(f"    PLINK reader opened  mem={mem()}")
-        return self._reader
+        return reader
 
     def release_reader(self) -> None:
         """Drop the cached PLINK reader so its fd/mmap can be reclaimed.
@@ -2343,31 +2353,51 @@ def _resolve_plink_pread_context(raw: Any) -> tuple[Any, NDArray, int, str] | No
     sample_indices; if none is present we use the leaf's own sample_indices
     (which for the streaming consumer always covers the kept sample set).
     Returns None for any non-Plink path so the caller can fall back.
+
+    Logs the specific failure mode whenever it returns None so we don't
+    silently fall back to the slow CPU-decode path without telling the user
+    why — historically this was a debugging black hole (the previous run
+    spent 38 min in the CPU path because no log told us the fast path was
+    being declined).
     """
     sample_indices: NDArray | None = None
     node = raw
     seen: set[int] = set()
+    visited_kinds: list[str] = []
     while node is not None and id(node) not in seen:
         seen.add(id(node))
+        visited_kinds.append(type(node).__name__)
         if sample_indices is None and getattr(node, "row_indices", None) is not None:
             sample_indices = np.asarray(node.row_indices, dtype=np.int64)
         if getattr(node, "bed_path", None) is not None:
             try:
                 reader = node._bed_reader()
-            except (OSError, AttributeError, RuntimeError):
+            except (OSError, AttributeError, RuntimeError) as exc:
+                log(f"    GPU-decode skipped: _bed_reader raised ({exc}) on {type(node).__name__}")
                 return None
             if not hasattr(reader, "_pread_indexed_variant_payload"):
+                log(
+                    f"    GPU-decode skipped: reader {type(reader).__name__} has no "
+                    f"_pread_indexed_variant_payload (need sv_pgs.plink.open_bed)"
+                )
                 return None
             if sample_indices is None:
                 leaf_samples = getattr(node, "sample_indices", None)
                 if leaf_samples is None:
+                    log(f"    GPU-decode skipped: leaf {type(node).__name__} has no sample_indices")
                     return None
                 sample_indices = np.asarray(leaf_samples, dtype=np.int64)
             iid_count = int(getattr(node, "total_sample_count", 0))
             if iid_count <= 0:
+                log(f"    GPU-decode skipped: total_sample_count={iid_count} on {type(node).__name__}")
                 return None
             return reader, sample_indices, iid_count, str(node.bed_path)
         node = getattr(node, "child", None)
+    log(
+        f"    GPU-decode skipped: no bed_path in wrapper chain "
+        f"[{' -> '.join(visited_kinds) if visited_kinds else '<empty>'}]; "
+        f"falling back to CPU-decode path"
+    )
     return None
 
 

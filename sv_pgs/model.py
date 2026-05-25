@@ -829,6 +829,84 @@ def _save_marginal_z_cache(
             pass
 
 
+_MARGINAL_CHUNK_SIZE = 50_000
+
+
+def _marginal_chunk_dir(cache_paths: _FitStageCachePaths) -> Path:
+    return cache_paths.cache_dir / f"{cache_paths.key}.marginal_chunks"
+
+
+def _try_load_marginal_chunks(
+    chunk_dir: Path, n_active: int
+) -> tuple[NDArray, NDArray]:
+    """Return (z_scores, completed_mask), both length n_active.
+
+    Reads ``chunk_<start>_<stop>.npy`` files written by prior runs and stitches
+    them into a per-variant z array + boolean coverage mask. Each chunk file is
+    a float32 1D array of length (stop - start). Corrupt / wrong-shape files
+    are skipped and unlinked so the chunk is recomputed.
+
+    Chunk keys are local positions in ``active_variant_indices``. The caller
+    must invalidate the chunk dir if ``active_variant_indices`` changes
+    (which happens iff the fit-stage structure_key changes — and the chunk
+    dir is namespaced by exactly that key).
+    """
+    z_scores = np.zeros(n_active, dtype=np.float32)
+    completed = np.zeros(n_active, dtype=bool)
+    if not chunk_dir.exists():
+        return z_scores, completed
+    for chunk_file in sorted(chunk_dir.glob("chunk_*.npy")):
+        stem = chunk_file.stem  # e.g. "chunk_000000000_000050000"
+        parts = stem.split("_")
+        if len(parts) != 3:
+            continue
+        try:
+            start = int(parts[1])
+            stop = int(parts[2])
+        except ValueError:
+            continue
+        if start < 0 or stop > n_active or start >= stop:
+            continue
+        try:
+            data = np.load(chunk_file)
+        except (OSError, ValueError):
+            try:
+                chunk_file.unlink(missing_ok=True)
+            except OSError:
+                pass
+            continue
+        if data.shape != (stop - start,) or data.dtype != np.float32:
+            try:
+                chunk_file.unlink(missing_ok=True)
+            except OSError:
+                pass
+            continue
+        z_scores[start:stop] = data
+        completed[start:stop] = True
+    return z_scores, completed
+
+
+def _save_marginal_chunk(
+    chunk_dir: Path, start: int, stop: int, z_slice: NDArray
+) -> None:
+    """Atomically persist one chunk of marginal z-scores."""
+    try:
+        chunk_dir.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        return
+    path = chunk_dir / f"chunk_{start:09d}_{stop:09d}.npy"
+    tmp = path.with_suffix(".tmp")
+    try:
+        np.save(tmp, np.asarray(z_slice, dtype=np.float32))
+        os.replace(tmp, path)
+    except OSError as exc:
+        log(f"  marginal-z chunk cache: save failed ({exc}), continuing")
+        try:
+            tmp.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
 def _invalidate_fit_stage_cache(cache_paths: _FitStageCachePaths) -> None:
     for path in (
         cache_paths.manifest_path,
@@ -845,6 +923,20 @@ def _invalidate_fit_stage_cache(cache_paths: _FitStageCachePaths) -> None:
             path.unlink(missing_ok=True)
         except OSError:
             pass
+    try:
+        chunk_dir = _marginal_chunk_dir(cache_paths)
+        if chunk_dir.exists():
+            for chunk_file in chunk_dir.glob("chunk_*.npy"):
+                try:
+                    chunk_file.unlink(missing_ok=True)
+                except OSError:
+                    pass
+            try:
+                chunk_dir.rmdir()
+            except OSError:
+                pass
+    except OSError:
+        pass
     try:
         for basis_path in cache_paths.cache_dir.glob(f"{cache_paths.key}.sample_space_basis.r*.seed*.npy"):
             basis_path.unlink(missing_ok=True)
@@ -1278,24 +1370,63 @@ class BayesianPGS:
                         expected_size=pre_screen_count,
                     )
                 )
-                if marginal_z_scores is None:
-                    marginal_z_scores = compute_marginal_z_scores(
-                        standardized_genotypes=standardized_genotypes,
-                        active_variant_indices=active_variant_indices,
-                        covariate_matrix=prepared_arrays.covariates,
-                        target_vector=prepared_arrays.targets,
-                    )
-                    if fit_stage_cache_paths is not None:
-                        _save_marginal_z_cache(fit_stage_cache_paths, marginal_z_scores)
-                        log(
-                            f"  marginal-z cache: saved {pre_screen_count} z-scores → "
-                            f"{fit_stage_cache_paths.marginal_z_path.name}"
-                        )
-                else:
+                if marginal_z_scores is not None:
                     log(
-                        f"  marginal-z cache hit: skipped recomputation of "
+                        f"  marginal-z cache hit (whole): skipped recomputation of "
                         f"{pre_screen_count} z-scores"
                     )
+                else:
+                    # Chunked computation + per-chunk persistence. A crash /
+                    # OOM mid-screen loses at most one chunk of work; rerun
+                    # picks up at the next incomplete chunk.
+                    if fit_stage_cache_paths is None:
+                        marginal_z_scores = compute_marginal_z_scores(
+                            standardized_genotypes=standardized_genotypes,
+                            active_variant_indices=active_variant_indices,
+                            covariate_matrix=prepared_arrays.covariates,
+                            target_vector=prepared_arrays.targets,
+                        )
+                    else:
+                        chunk_dir = _marginal_chunk_dir(fit_stage_cache_paths)
+                        z_scores, completed = _try_load_marginal_chunks(
+                            chunk_dir, pre_screen_count
+                        )
+                        already_done = int(completed.sum())
+                        if already_done == pre_screen_count:
+                            log(
+                                f"  marginal-z chunk cache hit: all "
+                                f"{pre_screen_count} variants present across chunk files"
+                            )
+                        else:
+                            n_chunks_total = (pre_screen_count + _MARGINAL_CHUNK_SIZE - 1) // _MARGINAL_CHUNK_SIZE
+                            log(
+                                f"  marginal-z chunk cache: "
+                                f"{already_done:,}/{pre_screen_count:,} variants already "
+                                f"computed, computing remaining in {_MARGINAL_CHUNK_SIZE:,}-"
+                                f"variant chunks ({n_chunks_total} total)"
+                            )
+                            for c_start in range(0, pre_screen_count, _MARGINAL_CHUNK_SIZE):
+                                c_stop = min(c_start + _MARGINAL_CHUNK_SIZE, pre_screen_count)
+                                if completed[c_start:c_stop].all():
+                                    continue
+                                z_slice = compute_marginal_z_scores(
+                                    standardized_genotypes=standardized_genotypes,
+                                    active_variant_indices=active_variant_indices[c_start:c_stop],
+                                    covariate_matrix=prepared_arrays.covariates,
+                                    target_vector=prepared_arrays.targets,
+                                )
+                                z_scores[c_start:c_stop] = z_slice
+                                _save_marginal_chunk(chunk_dir, c_start, c_stop, z_slice)
+                                log(
+                                    f"  marginal-z chunk persisted: "
+                                    f"[{c_start:,}:{c_stop:,}) of {pre_screen_count:,}"
+                                )
+                        marginal_z_scores = z_scores
+                        _save_marginal_z_cache(fit_stage_cache_paths, marginal_z_scores)
+                        log(
+                            f"  marginal-z cache: saved whole-array {pre_screen_count} "
+                            f"z-scores → {fit_stage_cache_paths.marginal_z_path.name}"
+                        )
                 z_pass_mask = np.abs(marginal_z_scores) >= self.config.marginal_screen_min_abs_z
                 kept_count = int(np.sum(z_pass_mask))
                 if kept_count == 0:
