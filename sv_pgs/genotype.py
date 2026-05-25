@@ -2610,12 +2610,27 @@ def _gpu_int8_transpose_matmul(
 ) -> Any:
     selected_variant_indices = np.asarray(variant_indices, dtype=np.int32)
 
-    # GPU-decode fast path: when the underlying matrix is Plink-backed via
-    # sv_pgs.plink.open_bed, pread raw 2-bit bytes and unpack on the GPU.
-    # Eliminates the 1 GB host int8 transient that historically OOM'd the
-    # AoU 30 GB cgroup and pushes 2-bit unpack from 3 CPU threads to V100
-    # where it's microseconds. Non-Plink matrices return ctx=None and fall
-    # through to the existing CPU-decode + standardize path.
+    # Multi-GPU sharded path comes FIRST. The sharded function checks the
+    # GPU-decode context per shard internally, so we get BOTH multi-GPU
+    # parallelism AND the GPU-decode fast path on each V100 at the same
+    # time. Previously the GPU-decode check came first and routed straight
+    # to the single-device direct path, leaving the second V100 idle for
+    # the entire marginal screen.
+    device_ids = _cupy_device_ids(cupy)
+    if len(device_ids) >= 2 and int(selected_variant_indices.shape[0]) >= len(device_ids):
+        return _gpu_int8_transpose_matmul_sharded(
+            raw_int8=raw_int8,
+            selected_variant_indices=selected_variant_indices,
+            means=means,
+            scales=scales,
+            matrix_gpu=matrix_gpu,
+            batch_size=batch_size,
+            cupy=cupy,
+            dtype=dtype,
+            progress_label=progress_label,
+            device_ids=device_ids,
+        )
+    # Single-GPU path: prefer GPU-decode when Plink-backed.
     ctx = _resolve_plink_pread_context(raw_int8)
     if ctx is not None:
         reader, sample_indices, iid_count, bed_path = ctx
@@ -2632,21 +2647,6 @@ def _gpu_int8_transpose_matmul(
             cupy=cupy,
             dtype=dtype,
             progress_label=progress_label,
-        )
-
-    device_ids = _cupy_device_ids(cupy)
-    if len(device_ids) >= 2 and int(selected_variant_indices.shape[0]) >= len(device_ids):
-        return _gpu_int8_transpose_matmul_sharded(
-            raw_int8=raw_int8,
-            selected_variant_indices=selected_variant_indices,
-            means=means,
-            scales=scales,
-            matrix_gpu=matrix_gpu,
-            batch_size=batch_size,
-            cupy=cupy,
-            dtype=dtype,
-            progress_label=progress_label,
-            device_ids=device_ids,
         )
     return _gpu_int8_transpose_matmul_single_device(
         raw_int8=raw_int8,
@@ -2827,26 +2827,51 @@ def _gpu_int8_transpose_matmul_sharded(
             f"plink_reads=parallel)  mem={mem()}"
         )
 
+    # Resolve the GPU-decode context ONCE (cheap walk) so each shard can
+    # use the pread-direct path on its own V100 instead of falling back to
+    # the slow CPU-decode + standardize streaming path. Concurrent pread()
+    # on the shared open_bed fd is safe (per-call offset, non-overlapping
+    # variant slices), and each shard owns its own GPU staging + decode
+    # kernel invocation.
+    shard_ctx = _resolve_plink_pread_context(raw_int8)
+
     def _compute_shard(device_id: int, start: int, stop: int) -> tuple[int, int, NDArray]:
         shard_indices = selected_variant_indices[start:stop]
         shard_label = f"{progress_label} gpu{device_id}" if progress_label is not None else None
         with _cupy_device_context(cupy, device_id):
             shard_matrix_gpu = cupy.asarray(matrix_host, dtype=dtype)
-            shard_result_gpu = _gpu_int8_transpose_matmul_single_device(
-                raw_int8=raw_int8,
-                selected_variant_indices=shard_indices,
-                means=means,
-                scales=scales,
-                matrix_gpu=shard_matrix_gpu,
-                batch_size=batch_size,
-                cupy=cupy,
-                dtype=dtype,
-                progress_label=shard_label,
-                io_worker_limit=per_device_io_workers,
-                max_prefetch_bytes=per_device_prefetch_bytes,
-                decode_thread_limit=max(1, per_device_io_workers),
-                read_semaphore=None,
-            )
+            if shard_ctx is not None:
+                reader, sample_indices, iid_count, bed_path = shard_ctx
+                shard_result_gpu = _gpu_plink_pread_transpose_matmul_direct(
+                    reader=reader,
+                    sample_indices=sample_indices,
+                    iid_count=iid_count,
+                    bed_path=bed_path,
+                    selected_variant_indices=shard_indices,
+                    means=means,
+                    scales=scales,
+                    matrix_gpu=shard_matrix_gpu,
+                    batch_size=batch_size,
+                    cupy=cupy,
+                    dtype=dtype,
+                    progress_label=shard_label,
+                )
+            else:
+                shard_result_gpu = _gpu_int8_transpose_matmul_single_device(
+                    raw_int8=raw_int8,
+                    selected_variant_indices=shard_indices,
+                    means=means,
+                    scales=scales,
+                    matrix_gpu=shard_matrix_gpu,
+                    batch_size=batch_size,
+                    cupy=cupy,
+                    dtype=dtype,
+                    progress_label=shard_label,
+                    io_worker_limit=per_device_io_workers,
+                    max_prefetch_bytes=per_device_prefetch_bytes,
+                    decode_thread_limit=max(1, per_device_io_workers),
+                    read_semaphore=None,
+                )
             _cupy_device_synchronize(cupy, device_id)
             shard_result_host = _cupy_asnumpy(cupy, shard_result_gpu)
         return start, stop, shard_result_host
