@@ -2263,6 +2263,247 @@ def _iter_prefetched_raw_batches(
         executor.shutdown(wait=True, cancel_futures=True)
 
 
+# =========================================================================
+# GPU-side PLINK BED 2-bit decoder (opt-in via SV_PGS_PLINK_GPU_DECODE=1).
+#
+# Replaces the CPU decode + 1 GB host int8 buffer per batch with:
+#   pread raw 2-bit bytes (~256 MB) -> small host transient
+#       -> cupy.asarray to GPU
+#       -> RawKernel unpacks 2-bit + applies sample subset
+#       -> int8 lives on GPU; downstream standardize+matmul unchanged
+#
+# Bit-exact equivalent of sv_pgs.plink._DECODE_LOOKUP_A1:
+#     code 00 -> 2 (hom A1), 01 -> -127 (missing), 10 -> 1 (het), 11 -> 0 (hom A2)
+#
+# Host transient = bytes_per_variant * batch_variants (~340 MB on AoU) instead
+# of 1 GB per batch. The 1 GB int8 array never exists on host. Combined with
+# fadvise(DONTNEED) on the .bed fd this makes host-side OOM structurally
+# impossible regardless of variant count, and the 2-bit unpack runs in
+# microseconds on V100 (vs ~15 s on 3 CPU threads), freeing both the GPU
+# and the CPU for other work.
+# =========================================================================
+
+_PLINK_GPU_DECODE_KERNEL_SRC = r"""
+extern "C" __global__ void plink_decode_a1_subset(
+    const unsigned char* __restrict__ packed,    // [n_variants, bytes_per_variant]
+    long long bytes_per_variant,
+    const long long* __restrict__ sample_indices, // [n_kept_samples]
+    long long n_kept_samples,
+    long long n_variants,
+    signed char* __restrict__ out_fortran        // [n_kept_samples, n_variants] F-order
+) {
+    long long s = (long long)blockIdx.x * (long long)blockDim.x + (long long)threadIdx.x;
+    long long v = (long long)blockIdx.y;
+    if (s >= n_kept_samples || v >= n_variants) return;
+    long long sample_id = sample_indices[s];
+    long long byte_idx  = sample_id >> 2;          // /4
+    int bit_offset      = ((int)(sample_id & 3LL)) << 1;  // (%4)*2
+    unsigned char byte  = packed[v * bytes_per_variant + byte_idx];
+    int code            = (byte >> bit_offset) & 3;
+    // _DECODE_LOOKUP_A1 = [2, -127, 1, 0]
+    signed char val;
+    if (code == 0)      val = (signed char)2;
+    else if (code == 1) val = (signed char)-127;
+    else if (code == 2) val = (signed char)1;
+    else                val = (signed char)0;
+    out_fortran[v * n_kept_samples + s] = val;
+}
+"""
+
+_PLINK_DECODE_LOOKUP_A1 = np.array([2, -127, 1, 0], dtype=np.int8)
+
+
+def _decode_packed_bytes_reference(
+    packed: NDArray,
+    *,
+    bytes_per_variant: int,
+    sample_indices: NDArray,
+    n_variants: int,
+) -> NDArray:
+    """CPU reference implementation of the GPU 2-bit decode.
+
+    Used by tests to verify bit-exact equivalence with the GPU kernel.
+    Returns an int8 F-order array of shape (n_kept_samples, n_variants).
+    """
+    packed_u8 = np.asarray(packed, dtype=np.uint8).reshape(int(n_variants), int(bytes_per_variant))
+    samples = np.asarray(sample_indices, dtype=np.int64)
+    byte_idx = samples >> 2
+    bit_offset = (samples & 3).astype(np.int64) << 1
+    bytes_sel = packed_u8[:, byte_idx]
+    codes = (bytes_sel >> bit_offset[None, :]) & 0x3
+    decoded = _PLINK_DECODE_LOOKUP_A1[codes]
+    return np.asfortranarray(decoded.T)
+
+
+def _resolve_plink_pread_context(raw: Any) -> tuple[Any, NDArray, int, str] | None:
+    """If ``raw`` is Plink-backed, return (reader, sample_indices, iid_count, bed_path).
+
+    Walks .child to find the leaf PlinkRawGenotypeMatrix. The first
+    RowSubsetRawGenotypeMatrix encountered along the way contributes
+    sample_indices; if none is present we use the leaf's own sample_indices
+    (which for the streaming consumer always covers the kept sample set).
+    Returns None for any non-Plink path so the caller can fall back.
+    """
+    sample_indices: NDArray | None = None
+    node = raw
+    seen: set[int] = set()
+    while node is not None and id(node) not in seen:
+        seen.add(id(node))
+        if sample_indices is None and getattr(node, "row_indices", None) is not None:
+            sample_indices = np.asarray(node.row_indices, dtype=np.int64)
+        if getattr(node, "bed_path", None) is not None:
+            try:
+                reader = node._bed_reader()
+            except (OSError, AttributeError, RuntimeError):
+                return None
+            if not hasattr(reader, "_pread_indexed_variant_payload"):
+                return None
+            if sample_indices is None:
+                leaf_samples = getattr(node, "sample_indices", None)
+                if leaf_samples is None:
+                    return None
+                sample_indices = np.asarray(leaf_samples, dtype=np.int64)
+            iid_count = int(getattr(node, "total_sample_count", 0))
+            if iid_count <= 0:
+                return None
+            return reader, sample_indices, iid_count, str(node.bed_path)
+        node = getattr(node, "child", None)
+    return None
+
+
+_plink_gpu_decode_kernel_cache: Any = None
+
+
+def _get_plink_gpu_decode_kernel(cupy: Any) -> Any:
+    global _plink_gpu_decode_kernel_cache
+    if _plink_gpu_decode_kernel_cache is None:
+        _plink_gpu_decode_kernel_cache = cupy.RawKernel(
+            _PLINK_GPU_DECODE_KERNEL_SRC,
+            "plink_decode_a1_subset",
+        )
+    return _plink_gpu_decode_kernel_cache
+
+
+def _plink_gpu_decode_enabled() -> bool:
+    return os.environ.get("SV_PGS_PLINK_GPU_DECODE", "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _gpu_plink_pread_transpose_matmul_direct(
+    *,
+    reader: Any,
+    sample_indices: NDArray,
+    iid_count: int,
+    bed_path: str,
+    selected_variant_indices: NDArray,
+    means: NDArray,
+    scales: NDArray,
+    matrix_gpu: Any,
+    batch_size: int,
+    cupy: Any,
+    dtype: Any,
+    progress_label: str | None,
+) -> Any:
+    """Direct pread -> GPU-decode -> standardize -> matmul.
+
+    Replaces the CPU decode path (which allocates a 1 GB int8 numpy array
+    per batch) with a small ~340 MB raw-bytes host transient + GPU unpack.
+    Host RAM stays bounded regardless of variant count.
+    """
+    import time as _time
+
+    n_variants_total = int(selected_variant_indices.shape[0])
+    n_kept_samples = int(sample_indices.shape[0])
+    bytes_per_variant = (int(iid_count) + 3) // 4
+    sample_indices_int64 = np.asarray(sample_indices, dtype=np.int64)
+    selected_variant_indices_int64 = np.asarray(selected_variant_indices, dtype=np.int64)
+
+    sample_indices_gpu = cupy.asarray(sample_indices_int64)
+    selected_means_gpu = cupy.asarray(means[selected_variant_indices], dtype=dtype)
+    selected_scales_gpu = cupy.asarray(scales[selected_variant_indices], dtype=dtype)
+    result_gpu = cupy.empty(
+        (n_variants_total, matrix_gpu.shape[1]), dtype=dtype
+    )
+    kernel = _get_plink_gpu_decode_kernel(cupy)
+
+    if progress_label is not None:
+        log(
+            f"        {progress_label}: GPU-decode path active "
+            f"(bytes/variant={bytes_per_variant:,}, kept_samples={n_kept_samples:,}, "
+            f"batch_size={batch_size}, host_xient~{bytes_per_variant * batch_size / 1e6:.0f} MB)  mem={mem()}"
+        )
+
+    completed = 0
+    last_logged = 0
+    log_interval = max(n_variants_total // 50, 1)
+    t_start = _time.monotonic()
+
+    block_dim = 128
+    for batch_start in range(0, n_variants_total, batch_size):
+        batch_stop = min(batch_start + batch_size, n_variants_total)
+        n_batch_vars = batch_stop - batch_start
+        batch_var_indices = selected_variant_indices_int64[batch_start:batch_stop]
+
+        payload = reader._pread_indexed_variant_payload(
+            batch_var_indices,
+            bytes_per_variant=bytes_per_variant,
+        )
+        packed_gpu = cupy.asarray(payload, blocking=True)
+        del payload
+
+        int8_gpu = cupy.empty((n_kept_samples, n_batch_vars), dtype=cupy.int8, order="F")
+        grid_x = (n_kept_samples + block_dim - 1) // block_dim
+        grid_y = n_batch_vars
+        kernel(
+            (grid_x, grid_y),
+            (block_dim,),
+            (
+                packed_gpu,
+                np.int64(bytes_per_variant),
+                sample_indices_gpu,
+                np.int64(n_kept_samples),
+                np.int64(n_batch_vars),
+                int8_gpu,
+            ),
+        )
+        del packed_gpu
+
+        means_slice = selected_means_gpu[batch_start:batch_stop]
+        scales_slice = selected_scales_gpu[batch_start:batch_stop]
+        standardized_gpu = _standardize_int8_cupy(
+            int8_gpu,
+            means_slice,
+            scales_slice,
+            cupy,
+            dtype=dtype,
+        )
+        result_gpu[batch_start:batch_stop, :] = standardized_gpu.T @ matrix_gpu
+        del int8_gpu, standardized_gpu
+
+        # Page-cache eviction on the pread fd. No mmap here so fadvise works
+        # cleanly without needing to drop any cached reader.
+        _release_host_caches(cupy, fadvise_paths=(bed_path,))
+
+        if progress_label is not None:
+            completed = batch_stop
+            if completed - last_logged >= log_interval:
+                last_logged = completed
+                elapsed = _time.monotonic() - t_start
+                rate = completed / max(elapsed, 1e-6)
+                eta = (n_variants_total - completed) / max(rate, 1e-6)
+                log(
+                    f"        {progress_label}: {completed:,}/{n_variants_total:,} "
+                    f"({100*completed/n_variants_total:.1f}%) "
+                    f"elapsed={elapsed:.0f}s rate={rate:,.0f}v/s eta={eta:.0f}s  mem={mem()}"
+                )
+    if progress_label is not None:
+        elapsed = _time.monotonic() - t_start
+        log(
+            f"        {progress_label}: GPU-decode done {n_variants_total:,} variants "
+            f"in {elapsed:.1f}s ({n_variants_total / max(elapsed, 1e-6):,.0f}v/s)  mem={mem()}"
+        )
+    return result_gpu
+
+
 def _gpu_streaming_batch_size(
     raw: RawGenotypeMatrix | Int8BatchCapable,
     *,
@@ -2313,6 +2554,30 @@ def _gpu_int8_transpose_matmul(
     progress_label: str | None,
 ) -> Any:
     selected_variant_indices = np.asarray(variant_indices, dtype=np.int32)
+
+    # Opt-in GPU-decode fast path. When enabled and the underlying matrix is
+    # Plink-backed via sv_pgs.plink.open_bed, route to the direct path that
+    # preads raw 2-bit bytes and unpacks on the GPU, eliminating the 1 GB
+    # host int8 transient that historically OOM'd the AoU 30 GB cgroup.
+    if _plink_gpu_decode_enabled():
+        ctx = _resolve_plink_pread_context(raw_int8)
+        if ctx is not None:
+            reader, sample_indices, iid_count, bed_path = ctx
+            return _gpu_plink_pread_transpose_matmul_direct(
+                reader=reader,
+                sample_indices=sample_indices,
+                iid_count=iid_count,
+                bed_path=bed_path,
+                selected_variant_indices=selected_variant_indices,
+                means=means,
+                scales=scales,
+                matrix_gpu=matrix_gpu,
+                batch_size=batch_size,
+                cupy=cupy,
+                dtype=dtype,
+                progress_label=progress_label,
+            )
+
     device_ids = _cupy_device_ids(cupy)
     if len(device_ids) >= 2 and int(selected_variant_indices.shape[0]) >= len(device_ids):
         return _gpu_int8_transpose_matmul_sharded(
