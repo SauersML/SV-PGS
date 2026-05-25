@@ -1244,6 +1244,26 @@ _libc_malloc_trim: Any = None
 _libc_malloc_trim_checked = False
 
 
+def _has_plink_backing(raw: Any) -> bool:
+    """True if ``raw`` (or any wrapped child/children) carries a bed_path."""
+    seen: set[int] = set()
+    stack: list[Any] = [raw]
+    while stack:
+        node = stack.pop()
+        if node is None or id(node) in seen:
+            continue
+        seen.add(id(node))
+        if getattr(node, "bed_path", None) is not None:
+            return True
+        child = getattr(node, "child", None)
+        if child is not None:
+            stack.append(child)
+        children = getattr(node, "children", None)
+        if children is not None:
+            stack.extend(children)
+    return False
+
+
 def _collect_bed_paths(raw: Any) -> tuple[str, ...]:
     """Walk wrapper genotype matrices to collect every underlying .bed path.
 
@@ -2283,8 +2303,23 @@ def _gpu_int8_transpose_matmul_single_device(
     log_interval = max(total_variants // 50, 1)
     import time as _time
     t_start = _time.monotonic()
+    resolved_fadvise_paths = _collect_bed_paths(raw_int8)
     if progress_label is not None:
-        log(f"        {progress_label}: start streaming {total_variants:,} variants (batch_size={batch_size})  mem={mem()}")
+        log(
+            f"        {progress_label}: start streaming {total_variants:,} variants "
+            f"(batch_size={batch_size}, fadvise_bed_files={len(resolved_fadvise_paths)})  "
+            f"mem={mem()}"
+        )
+        # If the underlying raw exposes a bed_path anywhere in its wrapper tree
+        # we expect to find it — silent failure here would mean the per-batch
+        # fadvise(DONTNEED) drain doesn't fire and the cgroup page cache grows
+        # unbounded, exactly the OOM we keep hitting on AoU.
+        if not resolved_fadvise_paths and _has_plink_backing(raw_int8):
+            log(
+                f"        {progress_label}: WARNING — Plink-backed matrix but "
+                f"no bed_path resolved via wrapper walk; per-batch page-cache "
+                f"eviction will be a no-op (OOM risk)"
+            )
     for batch_slice, host_values in _iter_prefetched_raw_batches(
         raw_int8,
         selected_variant_indices,
@@ -2311,7 +2346,7 @@ def _gpu_int8_transpose_matmul_single_device(
         # cupy's pinned-host pool, glibc's untrimmed arena, and (dominantly)
         # the kernel page cache for bed-reader's mmap of arrays.bed — see
         # _release_host_caches for the full story.
-        _release_host_caches(cupy, fadvise_paths=_collect_bed_paths(raw_int8))
+        _release_host_caches(cupy, fadvise_paths=resolved_fadvise_paths)
         if progress_label is not None:
             completed_variants = batch_slice.stop
             if completed_variants - last_logged_variants >= log_interval:
