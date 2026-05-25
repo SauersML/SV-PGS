@@ -213,7 +213,7 @@ def _install_graceful_shutdown_handlers() -> None:
             pass
 
 
-def main(argv: list[str] | None = None) -> int:
+def _main_impl(argv: list[str] | None = None) -> int:
     _install_graceful_shutdown_handlers()
     try:
         faulthandler.enable(file=sys.stderr, all_threads=True)
@@ -345,6 +345,19 @@ def main(argv: list[str] | None = None) -> int:
     print("predictions\t" + str(pipeline_outputs.predictions_path))
     print("coefficients\t" + str(pipeline_outputs.coefficients_path))
     return 0
+
+
+def main(argv: list[str] | None = None) -> int:
+    try:
+        return _main_impl(argv)
+    except KeyboardInterrupt as exc:
+        detail = str(exc).strip()
+        if detail:
+            sys.stderr.write(f"[sv-pgs] interrupted: {detail}\n")
+        else:
+            sys.stderr.write("[sv-pgs] interrupted\n")
+        sys.stderr.flush()
+        return 130
 
 
 def _infer_trait_type(targets: Iterable[float]) -> TraitType:

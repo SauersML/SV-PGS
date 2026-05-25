@@ -360,6 +360,10 @@ kill_stuck_or_running_sv_pgs() {
   # "ps + kill -9" loops. Now we SIGCONT-then-SIGKILL the prior run + its
   # entire process tree (uv run -> python -> any background readers), wait
   # briefly for the kernel to reap, and then start fresh.
+  if [ "${SV_PGS_SKIP_STARTUP_SWEEP:-}" = "1" ]; then
+    echo "  startup sweep skipped because SV_PGS_SKIP_STARTUP_SWEEP=1"
+    return 0
+  fi
   local me
   me=$(id -un)
   local candidates
@@ -412,6 +416,11 @@ kill_stuck_or_running_sv_pgs() {
   while [ "$waited" -lt 30 ]; do
     local still_alive=0
     for pid in "${all_pids[@]}"; do
+      local stat_now
+      stat_now=$(ps -o stat= -p "$pid" 2>/dev/null | tr -d ' ' || true)
+      case "$stat_now" in
+        ""|*Z*) continue ;;
+      esac
       kill -0 "$pid" 2>/dev/null && still_alive=$((still_alive + 1))
     done
     [ "$still_alive" -eq 0 ] && break
@@ -420,6 +429,11 @@ kill_stuck_or_running_sv_pgs() {
   done
   # Phase 3: anyone still alive after the grace window gets SIGKILL.
   for pid in "${all_pids[@]}"; do
+    local stat_now
+    stat_now=$(ps -o stat= -p "$pid" 2>/dev/null | tr -d ' ' || true)
+    case "$stat_now" in
+      ""|*Z*) continue ;;
+    esac
     if kill -0 "$pid" 2>/dev/null; then
       echo "  SIGKILL stale pid=$pid (did not exit within 30s of SIGTERM)"
       kill -SIGKILL "$pid" 2>/dev/null || true
@@ -430,6 +444,11 @@ kill_stuck_or_running_sv_pgs() {
   # kernel will reap on their next I/O return).
   local survivors=0
   for pid in "${all_pids[@]}"; do
+    local stat_now
+    stat_now=$(ps -o stat= -p "$pid" 2>/dev/null | tr -d ' ' || true)
+    case "$stat_now" in
+      ""|*Z*) continue ;;
+    esac
     kill -0 "$pid" 2>/dev/null && survivors=$((survivors + 1))
   done
   if [ "$survivors" -gt 0 ]; then

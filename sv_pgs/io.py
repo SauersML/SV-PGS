@@ -2048,9 +2048,9 @@ def _build_plink_int8_cache_only(
             f"    +5% reserve      : {reserve_bytes / 1e9:.2f} GB (min 64 MiB)\n"
             f"    free at target   : {available_bytes / 1e9:.2f} GB ({available_bytes / (1024**3):.2f} GiB)\n"
             f"    short by         : {deficit_bytes / 1e9:.2f} GB\n"
-            "    decision         : fall back to on-the-fly BED decode every epoch\n"
+            "    decision         : skip the full-source PLINK int8 mmap; fit-stage caches are handled after screening\n"
             "    remediation      : free disk on this volume, or reduce variant count "
-            "(--variants subset); int8 cache is mmap-only and cannot be partially materialized"
+            "(--variants subset) if you need the full-source decoded mmap"
         )
         return None
     writer = _StreamingInt8NpyWriter.open(
@@ -2256,11 +2256,10 @@ def compute_plink_variant_statistics_cached(
                     f"    free at target   : {available_bytes / 1e9:.2f} GB "
                     f"({available_bytes / (1024**3):.2f} GiB)\n"
                     f"    short by         : {deficit_bytes / 1e9:.2f} GB\n"
-                    "    decision         : fall back to on-the-fly BED decode every epoch "
-                    "(stats cache still written; only the decoded-matrix mmap is skipped)\n"
+                    "    decision         : skip the full-source PLINK int8 mmap "
+                    "(stats cache still written; fit-stage caches are handled after screening)\n"
                     "    remediation      : free disk on this volume, or reduce variant count "
-                    "(--variants subset); int8 cache is a single mmap-able .npy and cannot "
-                    "be partially materialized"
+                    "(--variants subset) if you need the full-source decoded mmap"
                 )
                 int8_eligible = False
             else:
