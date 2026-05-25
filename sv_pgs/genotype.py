@@ -564,13 +564,47 @@ def _stream_write_int8_npy(
     shape: tuple[int, int],
     column_batches: Iterator[NDArray],
     fortran_order: bool,
+    resume_from_variants: int = 0,
 ) -> None:
+    """Stream int8 column batches to an .npy file, resumable on kill.
+
+    Atomicity model: writes are aimed at ``path`` directly (no random temp
+    dir — the caller manages the final rename if needed). After each batch
+    the file is fsynced AND a sidecar file at ``str(path) + ".progress"``
+    is updated atomically with the variant-count completed so far. On a
+    subsequent invocation the caller can pass ``resume_from_variants=N``
+    to skip writing the first N variants (the iterator must already have
+    skipped those — see the matching caller plumbing in
+    ``try_cache_persistently``).
+
+    The header is written once at startup when ``resume_from_variants == 0``;
+    on resume the file is opened r+b and we seek straight to the resume
+    offset, so the existing header bytes stay valid.
+    """
     expected_sample_count = int(shape[0])
     expected_variant_count = int(shape[1])
-    written_variant_count = 0
+    if not 0 <= resume_from_variants <= expected_variant_count:
+        raise ValueError(
+            f"resume_from_variants={resume_from_variants} out of range "
+            f"[0, {expected_variant_count}]"
+        )
     header_bytes = _int8_npy_header_bytes(shape, fortran_order=fortran_order)
-    with path.open("wb") as handle:
+    header_size = len(header_bytes)
+    bytes_per_variant = expected_sample_count  # int8 = 1 byte per cell, F-order
+    progress_path = path.with_suffix(path.suffix + ".progress")
+
+    if resume_from_variants > 0:
+        # Resume: file must exist and be large enough to hold what we claim.
+        handle = path.open("r+b")
+        handle.seek(header_size + resume_from_variants * bytes_per_variant)
+    else:
+        handle = path.open("wb")
         handle.write(header_bytes)
+        handle.flush()
+        os.fsync(handle.fileno())
+
+    written_variant_count = resume_from_variants
+    try:
         for batch_values in column_batches:
             batch_array = np.asarray(batch_values, dtype=np.int8)
             if batch_array.ndim != 2:
@@ -580,13 +614,83 @@ def _stream_write_int8_npy(
                     f"int8 cache batch sample count mismatch: {batch_array.shape[0]} != {expected_sample_count}"
                 )
             handle.write(np.asfortranarray(batch_array).tobytes(order="F"))
+            handle.flush()
+            os.fsync(handle.fileno())
             written_variant_count += int(batch_array.shape[1])
-        handle.flush()
-        os.fsync(handle.fileno())
+            # Atomic per-batch progress write so kill-mid-write loses at
+            # most ONE batch's worth of work on the next resume.
+            progress_tmp = progress_path.with_suffix(".progress.tmp")
+            try:
+                progress_tmp.write_text(str(written_variant_count))
+                os.replace(progress_tmp, progress_path)
+            except OSError:
+                # Best-effort: if we can't write the sidecar (read-only fs,
+                # quota, etc.) the resume just won't be able to skip and
+                # will redo the work — still correct.
+                try:
+                    progress_tmp.unlink(missing_ok=True)
+                except OSError:
+                    pass
+    finally:
+        handle.close()
     if written_variant_count != expected_variant_count:
         raise ValueError(
             f"int8 cache variant count mismatch after streaming write: {written_variant_count} != {expected_variant_count}"
         )
+    # Final-success cleanup: progress sidecar no longer needed.
+    try:
+        progress_path.unlink(missing_ok=True)
+    except OSError:
+        pass
+
+
+def _scan_int8_npy_resume_point(
+    partial_path: Path,
+    *,
+    shape: tuple[int, int],
+    fortran_order: bool,
+) -> int:
+    """Return how many variants have already been streamed to ``partial_path``.
+
+    Returns 0 when ``partial_path`` doesn't exist, has the wrong header,
+    has no progress sidecar, or the sidecar disagrees with the file size.
+    A non-zero return guarantees the first N variants in the file are
+    valid bytes-on-disk that we can safely skip rewriting.
+    """
+    if not partial_path.exists():
+        return 0
+    progress_path = partial_path.with_suffix(partial_path.suffix + ".progress")
+    if not progress_path.exists():
+        return 0
+    try:
+        recorded = int(progress_path.read_text().strip())
+    except (OSError, ValueError):
+        return 0
+    expected_sample_count = int(shape[0])
+    expected_variant_count = int(shape[1])
+    if not 0 < recorded <= expected_variant_count:
+        return 0
+    try:
+        header_bytes = _int8_npy_header_bytes(shape, fortran_order=fortran_order)
+    except (ValueError, OSError):
+        return 0
+    expected_size = len(header_bytes) + recorded * expected_sample_count
+    try:
+        actual_size = partial_path.stat().st_size
+    except OSError:
+        return 0
+    if actual_size < expected_size:
+        return 0
+    # Verify the header on disk matches what we'd write — guards against a
+    # stale partial from a different shape / dtype / layout.
+    try:
+        with partial_path.open("rb") as handle:
+            on_disk_header = handle.read(len(header_bytes))
+    except OSError:
+        return 0
+    if on_disk_header != header_bytes:
+        return 0
+    return recorded
 
 
 @dataclass(slots=True)
@@ -5245,15 +5349,40 @@ class StandardizedGenotypeMatrix:
             except (OSError, ValueError) as exc:
                 log(f"    existing persistent int8 cache unreadable ({exc}); rebuilding")
         batch_size = auto_batch_size_i8(self.shape[0])
-        temp_directory = Path(tempfile.mkdtemp(prefix=f"{cache_path.name}.tmp.", dir=cache_path.parent))
-        temp_path = temp_directory / cache_path.name
-        log(
-            "    persisting reduced raw genotypes as int8 "
-            + f"({selected_variant_count} variants x {self.shape[0]} samples) → {cache_path}  mem={mem()}"
+        # Resumable write: a fixed sibling .partial file (NOT a random temp
+        # dir) so a kill mid-write is recoverable on next launch.
+        # ``_stream_write_int8_npy`` writes a sidecar ``.progress`` after
+        # every batch; ``_scan_int8_npy_resume_point`` reads it back to find
+        # the highest safely-written variant count.
+        partial_path = cache_path.with_suffix(cache_path.suffix + ".partial")
+        resume_from_variants = _scan_int8_npy_resume_point(
+            partial_path, shape=self.shape, fortran_order=True
         )
+        if resume_from_variants > 0:
+            log(
+                f"    persistent int8 cache RESUMING from variant {resume_from_variants:,}"
+                f"/{selected_variant_count:,} (sidecar progress file found)  mem={mem()}"
+            )
+        else:
+            log(
+                "    persisting reduced raw genotypes as int8 "
+                + f"({selected_variant_count} variants x {self.shape[0]} samples) → {cache_path}  mem={mem()}"
+            )
+            # If a stale .partial exists but the sidecar didn't validate,
+            # nuke it so we start fresh with a known-good header.
+            if partial_path.exists():
+                try:
+                    partial_path.unlink()
+                except OSError:
+                    pass
+                stale_progress = partial_path.with_suffix(partial_path.suffix + ".progress")
+                try:
+                    stale_progress.unlink(missing_ok=True)
+                except OSError:
+                    pass
         try:
             has_space, required_bytes, available_bytes = _has_sufficient_free_space_for_int8_npy(
-                temp_directory,
+                cache_path.parent,
                 self.shape,
                 fortran_order=True,
             )
@@ -5264,16 +5393,29 @@ class StandardizedGenotypeMatrix:
                 )
                 return False
             raw_int8 = self.raw
+            # Skip the first ``resume_from_variants`` of the variant index
+            # array so we don't re-read+re-decode what's already on disk.
+            # The iterator-side skip is critical — without it we'd pay the
+            # full PLINK read cost again even though the .partial file
+            # already has those bytes.
+            variants_to_stream = (
+                self.variant_indices[resume_from_variants:]
+                if resume_from_variants > 0
+                else self.variant_indices
+            )
+
             def _column_batches() -> Iterator[NDArray]:
-                for raw_batch in raw_int8.iter_column_batches_i8(self.variant_indices, batch_size=batch_size):
+                for raw_batch in raw_int8.iter_column_batches_i8(variants_to_stream, batch_size=batch_size):
                     yield raw_batch.values
+
             _stream_write_int8_npy(
-                temp_path,
+                partial_path,
                 shape=self.shape,
                 column_batches=_column_batches(),
                 fortran_order=True,
+                resume_from_variants=resume_from_variants,
             )
-            temp_path.replace(cache_path)
+            partial_path.replace(cache_path)
             persisted_mmap = np.load(cache_path, mmap_mode="r")
             _madvise_willneed_array(persisted_mmap)
             persisted_raw = Int8RawGenotypeMatrix(persisted_mmap)
@@ -5298,13 +5440,11 @@ class StandardizedGenotypeMatrix:
             log("    persistent int8 cache ready  mem=" + mem())
             return True
         except (OSError, RuntimeError, ValueError) as exc:
-            log(f"    persistent int8 cache failed ({exc})  mem={mem()}")
+            # IMPORTANT: do NOT delete partial_path here — a transient error
+            # (disk pressure, sigterm, network blip) should leave the partial
+            # bytes in place so the next run can resume rather than restart.
+            log(f"    persistent int8 cache failed ({exc}); .partial retained for next-run resume  mem={mem()}")
             return False
-        finally:
-            if temp_directory.exists():
-                for child in temp_directory.iterdir():
-                    child.unlink(missing_ok=True)
-                temp_directory.rmdir()
 
     def subset(self, local_variant_indices: Sequence[int] | NDArray) -> StandardizedGenotypeMatrix:
         resolved_local_indices = np.asarray(local_variant_indices, dtype=np.int32)
