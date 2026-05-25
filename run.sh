@@ -224,8 +224,48 @@ link_cache_to_shared() {
   ln -sfn "$SHARED_CACHE" "$link"
 }
 
+plink_triplet_exists() {
+  local prefix="$1"
+  [ -f "$prefix.bed" ] && [ -f "$prefix.bim" ] && [ -f "$prefix.fam" ]
+}
+
+mounted_array_plink_prefix() {
+  local prefix
+  prefix="$HOME/workspace/vwb-aou-datasets-controlled/v8/microarray/plink/arrays"
+  if plink_triplet_exists "$prefix"; then
+    printf '%s\n' "$prefix"
+    return 0
+  fi
+  return 1
+}
+
+link_mounted_array_plink() {
+  local prefix
+  if ! prefix="$(mounted_array_plink_prefix)"; then
+    return 1
+  fi
+  local plink_dir="$SHARED_CACHE/aou_array_plink"
+  mkdir -p "$plink_dir"
+  echo "  PLINK: using mounted workspace resource"
+  echo "    source: $prefix.{bed,bim,fam}"
+  echo "    cache:  $plink_dir/arrays.{bed,bim,fam}"
+  local ext target
+  for ext in bed bim fam; do
+    target="$plink_dir/arrays.$ext"
+    if [ -f "$target" ]; then
+      continue
+    fi
+    rm -f "$target"
+    ln -s "$prefix.$ext" "$target"
+  done
+  return 0
+}
+
 link_cache_to_shared "$BASE_SNP/.sv_pgs_cache"
 link_cache_to_shared "$BASE_JOINT/.sv_pgs_cache"
+if link_mounted_array_plink; then
+  :
+fi
 
 echo
 echo "=== CACHE DIAGNOSTICS ==="

@@ -208,6 +208,78 @@ def local_array_plink_path(work_dir: Path) -> Path:
     return local_array_plink_cache_dir(work_dir) / f"{_AOU_ARRAY_PLINK_PREFIX}.bed"
 
 
+def _mounted_cdr_roots() -> list[Path]:
+    roots = [Path.home() / "workspace" / "vwb-aou-datasets-controlled" / "v8"]
+    return [root for root in roots if root.exists()]
+
+
+def _mounted_cdr_file(relative_path: str) -> Path | None:
+    for root in _mounted_cdr_roots():
+        candidate = root / relative_path
+        if candidate.exists():
+            return candidate
+    return None
+
+
+def _link_mounted_file(source: Path, target: Path) -> None:
+    target.parent.mkdir(parents=True, exist_ok=True)
+    if target.exists():
+        try:
+            if target.samefile(source):
+                return
+        except OSError:
+            pass
+        return
+    target.unlink(missing_ok=True)
+    target.symlink_to(source)
+
+
+def _mounted_array_plink_prefix() -> Path | None:
+    for root in _mounted_cdr_roots():
+        prefix = root / "microarray" / "plink" / _AOU_ARRAY_PLINK_PREFIX
+        if all(
+            (prefix.parent / f"{prefix.name}.{ext}").exists()
+            for ext in ("bed", "bim", "fam")
+        ):
+            return prefix
+    return None
+
+
+def _link_mounted_array_plink(work_dir: Path) -> bool:
+    mounted_prefix = _mounted_array_plink_prefix()
+    if mounted_prefix is None:
+        return False
+    cache_dir = local_array_plink_cache_dir(work_dir)
+    for extension in ("bed", "bim", "fam"):
+        source = mounted_prefix.parent / f"{mounted_prefix.name}.{extension}"
+        target = cache_dir / f"{_AOU_ARRAY_PLINK_PREFIX}.{extension}"
+        _link_mounted_file(source, target)
+    return True
+
+
+def _link_mounted_sv_vcf(chromosome: int, work_dir: Path) -> bool:
+    name = sv_vcf_name(chromosome)
+    relative_vcf = f"wgs/short_read/structural_variants/vcf/full/{name}"
+    mounted_vcf = _mounted_cdr_file(relative_vcf)
+    mounted_tbi = _mounted_cdr_file(f"{relative_vcf}.tbi")
+    if mounted_vcf is None or mounted_tbi is None:
+        return False
+    local_vcf = local_sv_vcf_path(chromosome, work_dir)
+    _link_mounted_file(mounted_vcf, local_vcf)
+    _link_mounted_file(mounted_tbi, local_vcf.parent / f"{name}.tbi")
+    return True
+
+
+def _link_mounted_ancestry_preds(work_dir: Path) -> bool:
+    mounted = _mounted_cdr_file(
+        "wgs/short_read/snpindel/aux/ancestry/ancestry_preds.tsv"
+    )
+    if mounted is None:
+        return False
+    _link_mounted_file(mounted, local_ancestry_predictions_path(work_dir))
+    return True
+
+
 # ---------------------------------------------------------------------------
 # gsutil helpers
 # ---------------------------------------------------------------------------
@@ -306,23 +378,27 @@ def _download_gcs_object_if_missing(remote_path: str, local_path: Path) -> None:
 
 def download_sv_vcf(chromosome: int, work_dir: Path) -> Path:
     """Download one SV VCF + index when needed and return the local VCF path."""
-    remote_dir = sv_vcf_dir()
     name = sv_vcf_name(chromosome)
     local_vcf = local_sv_vcf_path(chromosome, work_dir)
     local_vcf.parent.mkdir(parents=True, exist_ok=True)
     local_tbi = local_vcf.parent / f"{name}.tbi"
+    if (
+        not local_vcf.exists() or not local_tbi.exists()
+    ) and _link_mounted_sv_vcf(chromosome, work_dir):
+        log(f"  chr{chromosome}: linked VCF + index from mounted workspace resource")
+
+    if local_vcf.exists() and local_tbi.exists():
+        log(f"  chr{chromosome}: VCF already present in local cache")
+        return local_vcf
+
+    remote_dir = sv_vcf_dir()
     vcf_remote = f"{remote_dir}/{name}"
     tbi_remote = f"{remote_dir}/{name}.tbi"
-
-    missing_downloads: list[tuple[str, Path, str]] = []
+    missing_downloads = []
     if not local_vcf.exists():
         missing_downloads.append((vcf_remote, local_vcf, "VCF"))
     if not local_tbi.exists():
         missing_downloads.append((tbi_remote, local_tbi, "index"))
-
-    if not missing_downloads:
-        log(f"  chr{chromosome}: VCF already present in local cache")
-        return local_vcf
 
     required_bytes = sum(_gsutil_size(remote) for remote, _, _ in missing_downloads)
     cache_dir = local_sv_vcf_cache_dir(work_dir)
@@ -345,21 +421,33 @@ def download_array_plink(work_dir: Path) -> Path:
     array participants. After the first run the files stay on disk under
     work_dir.parent/.sv_pgs_cache/aou_array_plink/; subsequent runs reuse them.
     """
-    remote_dir = array_plink_dir()
     cache_dir = local_array_plink_cache_dir(work_dir)
     cache_dir.mkdir(parents=True, exist_ok=True)
     local_bed = local_array_plink_path(work_dir)
+    if _link_mounted_array_plink(work_dir):
+        if all(
+            (cache_dir / f"{_AOU_ARRAY_PLINK_PREFIX}.{ext}").exists()
+            for ext in ("bed", "bim", "fam")
+        ):
+            log("  microarray: linked PLINK trio from mounted workspace resource")
+            return local_bed
 
-    missing_downloads: list[tuple[str, Path, str]] = []
+    missing_extensions = []
     for extension in ("bed", "bim", "fam"):
         local_path = cache_dir / f"{_AOU_ARRAY_PLINK_PREFIX}.{extension}"
         if not local_path.exists():
-            remote_path = f"{remote_dir}/{_AOU_ARRAY_PLINK_PREFIX}.{extension}"
-            missing_downloads.append((remote_path, local_path, extension))
+            missing_extensions.append(extension)
 
-    if not missing_downloads:
+    if not missing_extensions:
         log("  microarray: PLINK trio already present in local cache")
         return local_bed
+
+    remote_dir = array_plink_dir()
+    missing_downloads: list[tuple[str, Path, str]] = []
+    for extension in missing_extensions:
+        local_path = cache_dir / f"{_AOU_ARRAY_PLINK_PREFIX}.{extension}"
+        remote_path = f"{remote_dir}/{_AOU_ARRAY_PLINK_PREFIX}.{extension}"
+        missing_downloads.append((remote_path, local_path, extension))
 
     required_bytes = sum(_gsutil_size(remote) for remote, _, _ in missing_downloads)
     _check_disk_space(cache_dir, required_bytes)
@@ -379,7 +467,6 @@ def download_array_plink(work_dir: Path) -> Path:
 
 def download_ancestry_preds(work_dir: Path) -> Path:
     """Download the AoU ancestry predictions file (contains per-sample PCs)."""
-    remote = resolve_ancestry_predictions_path()
     local = local_ancestry_predictions_path(work_dir)
     if local.exists():
         log(f"  ancestry predictions already present: {local.name}")
@@ -395,6 +482,10 @@ def download_ancestry_preds(work_dir: Path) -> Path:
             return local
         except OSError:
             pass
+    if _link_mounted_ancestry_preds(work_dir):
+        log(f"  linked ancestry predictions from mounted workspace resource: {local.name}")
+        return local
+    remote = resolve_ancestry_predictions_path()
     log(f"  downloading ancestry predictions: {remote}")
     # Route through the temp-and-replace helper so an interrupted/failed
     # gsutil cp leaves a `.partial` file we discard, rather than a truncated
