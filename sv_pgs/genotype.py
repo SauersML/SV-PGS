@@ -1396,7 +1396,11 @@ def _fadvise_dontneed(path: str | Path) -> None:
             pass
 
 
-def _release_host_caches(cupy: Any | None, *, fadvise_paths: Sequence[str | Path] = ()) -> None:
+def _release_host_caches(
+    cupy: Any | None,
+    *,
+    fadvise_paths: Sequence[str | Path] = (),
+) -> None:
     """Return per-batch host scratch back to the OS.
 
     Three retention paths grow RSS monotonically across PLINK batches on the
@@ -1413,13 +1417,16 @@ def _release_host_caches(cupy: Any | None, *, fadvise_paths: Sequence[str | Path
        finishes. ``POSIX_FADV_DONTNEED`` on the .bed file evicts those pages.
 
     All three calls are cheap and idempotent.
+
+    NOTE: previously this also called ``gc.collect()`` to force bed-reader's
+    mmap to tear down before fadvise. That triggered JAX's
+    ``_xla_gc_callback`` which walks every device buffer in the process —
+    with a multi-GB CuPy pool the gc pass took minutes per batch. Killed
+    it. ``_release_plink_readers`` already nulls the cached reader
+    attribute; refcount-based teardown handles the rest. fadvise is
+    best-effort either way; if the kernel can't evict a few pages this
+    iteration it will next time pressure rises.
     """
-    # Force one synchronous GC pass *before* fadvise so any bed-reader that
-    # was just released via release_reader() (and any cycle-held numpy
-    # batches) hits __del__ now — otherwise their mmap stays alive and the
-    # fadvise that follows is a no-op against the still-mapped pages.
-    import gc as _gc
-    _gc.collect()
     for path in fadvise_paths:
         _fadvise_dontneed(path)
     if cupy is not None:
@@ -2492,76 +2499,105 @@ def _gpu_plink_pread_transpose_matmul_direct(
 
     block_dim = 128
     n_batches_total = (n_variants_total + batch_size - 1) // batch_size
-    for batch_index, batch_start in enumerate(range(0, n_variants_total, batch_size)):
-        batch_stop = min(batch_start + batch_size, n_variants_total)
-        n_batch_vars = batch_stop - batch_start
-        batch_var_indices = selected_variant_indices_int64[batch_start:batch_stop]
 
-        t_pread = _time.monotonic()
-        payload = reader._pread_indexed_variant_payload(
-            batch_var_indices,
+    # 1-deep prefetch: a background thread preads batch N+1 while the main
+    # thread is busy uploading + decoding + matmul'ing batch N on the GPU.
+    # Disk and GPU run concurrently — total wall-time ≈ max(disk, gpu)
+    # per batch instead of disk + gpu. On AoU the disk is slow enough that
+    # this nearly halves screen time even on one V100.
+    def _pread_batch(idx: int, start: int, stop: int) -> tuple[float, NDArray]:
+        t = _time.monotonic()
+        payload_bytes = reader._pread_indexed_variant_payload(
+            selected_variant_indices_int64[start:stop],
             bytes_per_variant=bytes_per_variant,
         )
-        pread_seconds = _time.monotonic() - t_pread
+        return _time.monotonic() - t, payload_bytes
 
-        t_upload = _time.monotonic()
-        packed_gpu = cupy.asarray(payload, blocking=True)
-        del payload
-        upload_seconds = _time.monotonic() - t_upload
+    prefetch_executor = ThreadPoolExecutor(
+        max_workers=1, thread_name_prefix="plink-pread-prefetch"
+    )
+    batch_ranges = [
+        (i, b_start, min(b_start + batch_size, n_variants_total))
+        for i, b_start in enumerate(range(0, n_variants_total, batch_size))
+    ]
+    # Submit the first batch's pread now so it can overlap with our setup.
+    pending: Future[tuple[float, NDArray]] | None = (
+        prefetch_executor.submit(_pread_batch, *batch_ranges[0])
+        if batch_ranges
+        else None
+    )
+    try:
+        for queue_pos, (batch_index, batch_start, batch_stop) in enumerate(batch_ranges):
+            assert pending is not None
+            pread_seconds, payload = pending.result()
+            # Immediately queue the NEXT batch's pread so the disk works
+            # while we do the GPU work for this batch.
+            if queue_pos + 1 < len(batch_ranges):
+                pending = prefetch_executor.submit(_pread_batch, *batch_ranges[queue_pos + 1])
+            else:
+                pending = None
 
-        t_gpu = _time.monotonic()
-        int8_gpu = cupy.empty((n_kept_samples, n_batch_vars), dtype=cupy.int8, order="F")
-        grid_x = (n_kept_samples + block_dim - 1) // block_dim
-        grid_y = n_batch_vars
-        kernel(
-            (grid_x, grid_y),
-            (block_dim,),
-            (
-                packed_gpu,
-                np.int64(bytes_per_variant),
-                sample_indices_gpu,
-                np.int64(n_kept_samples),
-                np.int64(n_batch_vars),
-                int8_gpu,
-            ),
-        )
-        del packed_gpu
+            n_batch_vars = batch_stop - batch_start
 
-        means_slice = selected_means_gpu[batch_start:batch_stop]
-        scales_slice = selected_scales_gpu[batch_start:batch_stop]
-        standardized_gpu = _standardize_int8_cupy(
-            int8_gpu,
-            means_slice,
-            scales_slice,
-            cupy,
-            dtype=dtype,
-        )
-        result_gpu[batch_start:batch_stop, :] = standardized_gpu.T @ matrix_gpu
-        del int8_gpu, standardized_gpu
-        gpu_seconds = _time.monotonic() - t_gpu
+            t_upload = _time.monotonic()
+            packed_gpu = cupy.asarray(payload, blocking=True)
+            del payload
+            upload_seconds = _time.monotonic() - t_upload
 
-        # Page-cache eviction on the pread fd. No mmap here so fadvise works
-        # cleanly without needing to drop any cached reader.
-        _release_host_caches(cupy, fadvise_paths=(bed_path,))
-
-        # Per-batch progress + timing breakdown. Previously we logged every
-        # ~6 batches via a variant-count threshold, which on AoU's slow disk
-        # (multi-minute preads per batch) meant the user saw zero progress
-        # for 40+ minutes and assumed it was hung. Log every batch so the
-        # heartbeat thread isn't the only sign of life.
-        if progress_label is not None:
-            completed = batch_stop
-            now = _time.monotonic()
-            elapsed = now - t_start
-            rate = completed / max(elapsed, 1e-6)
-            eta = (n_variants_total - completed) / max(rate, 1e-6)
-            log(
-                f"        {progress_label}: batch {batch_index + 1}/{n_batches_total} "
-                f"({completed:,}/{n_variants_total:,} = {100*completed/n_variants_total:.1f}%) "
-                f"pread={pread_seconds:.1f}s upload={upload_seconds:.2f}s gpu={gpu_seconds:.2f}s "
-                f"elapsed={elapsed:.0f}s rate={rate:,.0f}v/s eta={eta:.0f}s  mem={mem()}"
+            t_gpu = _time.monotonic()
+            int8_gpu = cupy.empty((n_kept_samples, n_batch_vars), dtype=cupy.int8, order="F")
+            grid_x = (n_kept_samples + block_dim - 1) // block_dim
+            grid_y = n_batch_vars
+            kernel(
+                (grid_x, grid_y),
+                (block_dim,),
+                (
+                    packed_gpu,
+                    np.int64(bytes_per_variant),
+                    sample_indices_gpu,
+                    np.int64(n_kept_samples),
+                    np.int64(n_batch_vars),
+                    int8_gpu,
+                ),
             )
-            last_log_time = now
+            del packed_gpu
+
+            means_slice = selected_means_gpu[batch_start:batch_stop]
+            scales_slice = selected_scales_gpu[batch_start:batch_stop]
+            standardized_gpu = _standardize_int8_cupy(
+                int8_gpu,
+                means_slice,
+                scales_slice,
+                cupy,
+                dtype=dtype,
+            )
+            result_gpu[batch_start:batch_stop, :] = standardized_gpu.T @ matrix_gpu
+            del int8_gpu, standardized_gpu
+            gpu_seconds = _time.monotonic() - t_gpu
+
+            # Page-cache eviction on the pread fd. No mmap here so fadvise
+            # works cleanly without needing to drop any cached reader.
+            _release_host_caches(cupy, fadvise_paths=(bed_path,))
+
+            if progress_label is not None:
+                completed = batch_stop
+                now = _time.monotonic()
+                elapsed = now - t_start
+                rate = completed / max(elapsed, 1e-6)
+                eta = (n_variants_total - completed) / max(rate, 1e-6)
+                log(
+                    f"        {progress_label}: batch {batch_index + 1}/{n_batches_total} "
+                    f"({completed:,}/{n_variants_total:,} = {100*completed/n_variants_total:.1f}%) "
+                    f"pread={pread_seconds:.1f}s upload={upload_seconds:.2f}s gpu={gpu_seconds:.2f}s "
+                    f"elapsed={elapsed:.0f}s rate={rate:,.0f}v/s eta={eta:.0f}s  mem={mem()}"
+                )
+                last_log_time = now
+    finally:
+        # Cancel any pending prefetch (if we exited the loop via exception)
+        # and shut down the executor so its worker thread joins cleanly.
+        if pending is not None:
+            pending.cancel()
+        prefetch_executor.shutdown(wait=True, cancel_futures=True)
     if progress_label is not None:
         elapsed = _time.monotonic() - t_start
         log(
