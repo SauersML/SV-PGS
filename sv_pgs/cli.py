@@ -9,17 +9,14 @@ import sys
 from pathlib import Path
 from typing import Iterable
 
-# Belt-and-suspenders: kill stale sv-pgs siblings BEFORE we import the
-# heavy modules below, so auto-tune downstream sees real free RAM and
-# we don't OOM racing against a zombie holding 10 GB of pre-allocated
-# numpy arrays. The bash-side sweep in run.sh is best-effort; this is
-# the authoritative pass.
-if os.environ.get("SV_PGS_SKIP_STARTUP_SWEEP", "").strip() not in ("1", "true", "True"):
-    try:
-        from sv_pgs._startup_sweep import kill_stale_sv_pgs_siblings
-        kill_stale_sv_pgs_siblings(verbose=True)
-    except Exception as _exc:  # noqa: BLE001 — sweep failure must never block startup
-        print(f"  startup sweep: skipped ({type(_exc).__name__}: {_exc})", file=sys.stderr)
+# Kill stale AoU fits before heavy imports allocate memory. The runner also
+# sweeps before launching, but this catches direct `sv-pgs run-all-of-us` calls.
+try:
+    from sv_pgs._startup_sweep import kill_stale_sv_pgs_siblings
+
+    kill_stale_sv_pgs_siblings(verbose=True)
+except Exception as _exc:  # noqa: BLE001
+    print(f"  startup sweep: skipped ({type(_exc).__name__}: {_exc})", file=sys.stderr)
 
 from sv_pgs.all_of_us import AllOfUsDiseaseRequest, available_disease_names, prepare_all_of_us_disease_sample_table
 from sv_pgs.aou_runner import run_all_of_us, run_all_of_us_all_diseases

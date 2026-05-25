@@ -15,10 +15,9 @@ import os
 import signal
 import sys
 import time
-from pathlib import Path
 
 
-_MARKERS = ("sv-pgs", "sv_pgs", "run-all-of-us")
+_PROTECTED_MARKERS = ("claude", "codex")
 
 
 def _read_cmdline(pid: int) -> str:
@@ -93,13 +92,15 @@ def _iter_pids() -> list[int]:
     return pids
 
 
-def _matches_marker(cmdline: str) -> bool:
+def _matches_aou_run(cmdline: str) -> bool:
     if not cmdline:
         return False
-    repo_venv = str(Path(__file__).resolve().parents[1] / ".venv")
-    if repo_venv in cmdline:
+    lowered = cmdline.lower()
+    if any(marker in lowered for marker in _PROTECTED_MARKERS):
+        return False
+    if "run-all-of-us" in cmdline:
         return True
-    return any(marker in cmdline for marker in _MARKERS)
+    return "sv-pgs" in cmdline and "run-all-of-us" in cmdline
 
 
 def kill_stale_sv_pgs_siblings(verbose: bool = True) -> int:
@@ -108,7 +109,8 @@ def kill_stale_sv_pgs_siblings(verbose: bool = True) -> int:
     Safety rules:
       - never kill self or any ancestor (would SIGKILL the shell / jupyter)
       - never kill a process owned by a different uid
-      - only kill processes whose cmdline matches sv-pgs / sv_pgs / repo .venv
+      - never kill Claude/Codex processes
+      - only kill stale AoU `sv-pgs run-all-of-us` processes
 
     Returns the number of processes killed. Best-effort: errors are swallowed
     so a hostile /proc layout never blocks startup.
@@ -128,7 +130,7 @@ def kill_stale_sv_pgs_siblings(verbose: bool = True) -> int:
         if _proc_uid(pid) != my_uid:
             continue
         cmd = _read_cmdline(pid)
-        if not _matches_marker(cmd):
+        if not _matches_aou_run(cmd):
             continue
         candidates.append((pid, _rss_kb(pid), cmd))
     if not candidates:

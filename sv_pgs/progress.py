@@ -133,14 +133,20 @@ def log_autotune_banner() -> None:
         log(f"auto-tune: snapshot unavailable ({error})")
         return
     state = _snapshot_autotune_state()
+    n_shards = int(state.get("n_shards", max(1, state["cuda_device_count"] or 1)))
+    per_shard_depth = int(state["plink_int8_max_prefetch_depth"])
+    total_depth = int(state.get("plink_int8_max_prefetch_depth_total", per_shard_depth * n_shards))
     parts = [
         f"cpu_count={state['cpu_count']}",
         f"cuda_devices={state['cuda_device_count']}",
         f"multi_gpu_sharding={'enabled' if state['cuda_device_count'] >= 2 else 'disabled'}",
         f"host_ram_free={_format_bytes(state['host_ram_available_bytes'])}",
+        f"fit_reserve={_format_bytes(state.get('fit_working_mem_reserve_bytes', 0))}",
+        f"usable_for_prefetch={_format_bytes(state.get('usable_prefetch_ram_bytes', 0))}",
         f"gpu_free={_format_bytes(state['gpu_free_bytes'])}",
         f"bed_batch_bytes={_format_bytes(state['bed_reader_target_batch_bytes'])}",
-        f"prefetch_depth={state['plink_int8_max_prefetch_depth']}",
+        f"prefetch_depth_per_shard={per_shard_depth}",
+        f"prefetch_depth_total={total_depth}({per_shard_depth}x{n_shards}shards)",
         f"per_worker_threads={state['per_worker_threads']}",
     ]
     try:
