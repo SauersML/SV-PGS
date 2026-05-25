@@ -829,7 +829,7 @@ def _save_marginal_z_cache(
             pass
 
 
-_MARGINAL_CHUNK_SIZE = 50_000
+_MARGINAL_CHUNK_SIZE = 2_000_000  # ~1 chunk per AoU-scale screen (under 1M actives → single pass)
 
 
 def _marginal_chunk_dir(cache_paths: _FitStageCachePaths) -> Path:
