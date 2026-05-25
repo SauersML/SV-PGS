@@ -894,6 +894,42 @@ DEFAULT_COVARIATES = [
     "ethnicity_concept_id",
 ]
 
+# Categorical OMOP fields that are one-hot expanded during phenotype
+# preparation (see all_of_us._add_one_hot_omop_categorical_covariates).
+# The raw column is popped from the sample table and replaced by one
+# `<name>_<concept_id>` column per observed level. The covariate list
+# must match the actual on-disk columns, so we expand each raw name back
+# into the set of one-hot columns by reading the sample table header.
+_OMOP_ONE_HOT_PREFIXES = (
+    "gender_concept_id",
+    "race_concept_id",
+    "ethnicity_concept_id",
+)
+
+
+def _expand_one_hot_covariates(
+    covariates: list[str], sample_table_path: Path
+) -> list[str]:
+    with sample_table_path.open("r", encoding="utf-8") as handle:
+        header = handle.readline().rstrip("\n").split("\t")
+    header_set = set(header)
+    expanded: list[str] = []
+    for name in covariates:
+        if name in _OMOP_ONE_HOT_PREFIXES and name not in header_set:
+            matches = [
+                col for col in header
+                if col.startswith(name + "_") and col[len(name) + 1:].isdigit()
+            ]
+            if not matches:
+                raise ValueError(
+                    f"covariate {name!r} is missing from {sample_table_path} "
+                    "and no one-hot expansion columns were found"
+                )
+            expanded.extend(matches)
+        else:
+            expanded.append(name)
+    return expanded
+
 
 AOU_MAX_OUTER_ITERATIONS = 20
 AOU_TEST_FRACTION = 0.2
@@ -1570,8 +1606,13 @@ def run_all_of_us(
         n_pcs=n_pcs,
     )
 
-    # Build covariate list
-    covariates = DEFAULT_COVARIATES + pc_cols
+    # Build covariate list. The phenotype preparation step one-hot encodes
+    # gender/race/ethnicity concept_ids into `<name>_<id>` columns and drops
+    # the raw column, so expand those entries against the merged table's
+    # header before passing the list to the loader.
+    covariates = _expand_one_hot_covariates(
+        DEFAULT_COVARIATES + pc_cols, merged_path
+    )
     log(f"  covariates ({len(covariates)}): {covariates}")
 
     summary_path = work_dir / "summary.json.gz"
