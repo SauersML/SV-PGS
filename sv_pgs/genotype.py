@@ -1132,6 +1132,34 @@ class PlinkRawGenotypeMatrix(RawGenotypeMatrix):
             log(f"    PLINK reader opened  mem={mem()}")
         return self._reader
 
+    def release_reader(self) -> None:
+        """Drop the cached bed-reader so its mmap is unmapped.
+
+        Required between PLINK batches when the host runs under a cgroup
+        memory limit: ``posix_fadvise(POSIX_FADV_DONTNEED)`` on the .bed
+        file cannot evict pages whose PTE map_count > 0 (i.e. pages held
+        by an active mmap), so as long as bed-reader keeps its mmap open
+        the kernel page cache grows monotonically with every read and
+        eventually OOMs the container even though the *anonymous* RSS
+        stays small.
+
+        Idempotent and thread-safe in the sense that any in-flight read
+        on another thread holds its own local reference to the reader —
+        clearing ``self._reader`` only nullifies the *cache*, not any
+        existing live reader. Once the last reference is dropped, the
+        reader's __del__ unmaps the .bed and the kernel can evict.
+        """
+        reader = self._reader
+        self._reader = None
+        if reader is None:
+            return
+        close = getattr(reader, "close", None)
+        if callable(close):
+            try:
+                close()
+            except (OSError, AttributeError, RuntimeError):
+                pass
+
 
 @dataclass(slots=True)
 class ConcatenatedRawGenotypeMatrix(RawGenotypeMatrix):
@@ -1244,6 +1272,42 @@ _libc_malloc_trim: Any = None
 _libc_malloc_trim_checked = False
 
 
+def _release_plink_readers(raw: Any) -> int:
+    """Call release_reader() on every PlinkRawGenotypeMatrix in the tree.
+
+    This is the only thing that lets ``posix_fadvise(POSIX_FADV_DONTNEED)``
+    actually evict bed pages from the page cache — fadvise skips pages whose
+    PTEs are still held by an active mmap, and bed-reader keeps its mmap
+    open for the lifetime of the Bed object. Dropping the cached reader
+    breaks the mmap and lets the kernel reclaim those pages.
+
+    Returns the number of readers released so the caller can log it.
+    """
+    released = 0
+    seen: set[int] = set()
+    stack: list[Any] = [raw]
+    while stack:
+        node = stack.pop()
+        if node is None or id(node) in seen:
+            continue
+        seen.add(id(node))
+        release = getattr(node, "release_reader", None)
+        if callable(release) and getattr(node, "bed_path", None) is not None:
+            try:
+                release()
+                released += 1
+            except (OSError, AttributeError, RuntimeError):
+                pass
+            continue
+        child = getattr(node, "child", None)
+        if child is not None:
+            stack.append(child)
+        children = getattr(node, "children", None)
+        if children is not None:
+            stack.extend(children)
+    return released
+
+
 def _has_plink_backing(raw: Any) -> bool:
     """True if ``raw`` (or any wrapped child/children) carries a bed_path."""
     seen: set[int] = set()
@@ -1346,6 +1410,12 @@ def _release_host_caches(cupy: Any | None, *, fadvise_paths: Sequence[str | Path
 
     All three calls are cheap and idempotent.
     """
+    # Force one synchronous GC pass *before* fadvise so any bed-reader that
+    # was just released via release_reader() (and any cycle-held numpy
+    # batches) hits __del__ now — otherwise their mmap stays alive and the
+    # fadvise that follows is a no-op against the still-mapped pages.
+    import gc as _gc
+    _gc.collect()
     for path in fadvise_paths:
         _fadvise_dontneed(path)
     if cupy is not None:
@@ -2342,10 +2412,12 @@ def _gpu_int8_transpose_matmul_single_device(
         )
         result_gpu[batch_slice, :] = standardized_gpu.T @ matrix_gpu
         del int8_gpu, standardized_gpu
-        # Three retention paths conspire to OOM the 30 GB AoU container:
-        # cupy's pinned-host pool, glibc's untrimmed arena, and (dominantly)
-        # the kernel page cache for bed-reader's mmap of arrays.bed — see
-        # _release_host_caches for the full story.
+        # Drop bed-reader's cached mmap before the fadvise pass — otherwise
+        # the page-cache eviction is a no-op because POSIX_FADV_DONTNEED
+        # skips pages whose PTE map_count > 0. With the mmap gone, gc
+        # forced inside _release_host_caches lets __del__ run and fadvise
+        # actually evicts the just-decoded bed pages.
+        _release_plink_readers(raw_int8)
         _release_host_caches(cupy, fadvise_paths=resolved_fadvise_paths)
         if progress_label is not None:
             completed_variants = batch_slice.stop
