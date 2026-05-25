@@ -298,21 +298,93 @@ sweep_zombie_gpu_procs() {
 }
 
 sweep_zombie_sv_pgs_procs() {
-  # Diagnostics only. Do not kill same-user Python processes; notebooks and
-  # agent sessions often use the same venv/cmdline markers as this run.
   local me
   me=$(id -un)
   local candidates
-  candidates=$(pgrep -u "$me" -f "sv-pgs|run-all-of-us" 2>/dev/null || true)
+  candidates=$(pgrep -u "$me" -f "run-all-of-us|sv-pgs run-all-of-us|/sv-pgs run-all-of-us" 2>/dev/null || true)
   [ -z "$candidates" ] && return 0
+
+  local protected_pids=" $$ ${BASHPID:-$$} "
+  local current_pgid
+  current_pgid=$(ps -o pgid= -p "$$" 2>/dev/null | tr -d ' ' || true)
+  local ppid="$PPID"
+  while [ -n "$ppid" ] && [ "$ppid" -gt 1 ] 2>/dev/null; do
+    protected_pids="${protected_pids}${ppid} "
+    ppid=$(ps -o ppid= -p "$ppid" 2>/dev/null | tr -d ' ' || true)
+  done
+
+  local kill_pids=""
+  local kill_pgroups=""
   for pid in $candidates; do
     [ -z "$pid" ] && continue
-    local cmd rss_kb stat
+    case "$protected_pids" in
+      *" $pid "*) continue ;;
+    esac
+    local cmd rss_kb stat pgid
     cmd=$(ps -o args= -p "$pid" 2>/dev/null || true)
     rss_kb=$(ps -o rss= -p "$pid" 2>/dev/null | tr -d ' ' || echo 0)
     stat=$(ps -o stat= -p "$pid" 2>/dev/null | tr -d ' ' || true)
+    pgid=$(ps -o pgid= -p "$pid" 2>/dev/null | tr -d ' ' || true)
     [ -z "$cmd" ] && continue
-    echo "  sv-pgs process present: pid=$pid rss=${rss_kb}kB stat=${stat:-?} cmd=$(printf '%s' "$cmd" | head -c 100)"
+    case "$cmd" in
+      *claude*|*Claude*|*codex*|*Codex*) continue ;;
+    esac
+    case "$cmd" in
+      *run-all-of-us*|*sv-pgs*) ;;
+      *) continue ;;
+    esac
+    if [ "${stat#Z}" != "$stat" ]; then
+      echo "  stale sv-pgs zombie present: pid=$pid rss=${rss_kb}kB cmd=$(printf '%s' "$cmd" | head -c 100)"
+      continue
+    fi
+    echo "  autokill stale sv-pgs: pid=$pid pgid=${pgid:-?} rss=${rss_kb}kB cmd=$(printf '%s' "$cmd" | head -c 100)"
+    kill_pids="${kill_pids}${pid} "
+    if [ -n "$pgid" ] && [ "$pgid" != "$current_pgid" ]; then
+      case " $kill_pgroups " in
+        *" $pgid "*) ;;
+        *) kill_pgroups="${kill_pgroups}${pgid} " ;;
+      esac
+    fi
+  done
+
+  [ -n "$kill_pids" ] || return 0
+
+  local pg
+  for pg in $kill_pgroups; do
+    kill -TERM "-$pg" 2>/dev/null || true
+  done
+  kill -TERM $kill_pids 2>/dev/null || true
+
+  local deadline=$((SECONDS + 8))
+  local survivors=""
+  while [ "$SECONDS" -lt "$deadline" ]; do
+    survivors=""
+    for pid in $kill_pids; do
+      if kill -0 "$pid" 2>/dev/null; then
+        stat=$(ps -o stat= -p "$pid" 2>/dev/null | tr -d ' ' || true)
+        [ "${stat#Z}" != "$stat" ] && continue
+        survivors="${survivors}${pid} "
+      fi
+    done
+    [ -z "$survivors" ] && break
+    sleep 1
+  done
+
+  if [ -n "$survivors" ]; then
+    echo "  autokill escalation: SIGKILL stale sv-pgs pids: $survivors"
+    for pg in $kill_pgroups; do
+      kill -KILL "-$pg" 2>/dev/null || true
+    done
+    kill -KILL $survivors 2>/dev/null || true
+  fi
+
+  sleep 1
+  for pid in $kill_pids; do
+    if kill -0 "$pid" 2>/dev/null; then
+      stat=$(ps -o stat= -p "$pid" 2>/dev/null | tr -d ' ' || true)
+      [ "${stat#Z}" != "$stat" ] && continue
+      echo "  WARNING: stale sv-pgs survived autokill: pid=$pid stat=${stat:-?}"
+    fi
   done
 }
 
