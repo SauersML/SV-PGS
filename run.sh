@@ -1,6 +1,43 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# Run every child in our own process group so a ^C / ^Z on this script
+# tears down every descendant (uv run, sv-pgs, decode threads, GPU
+# contexts) instead of leaving ghost processes pinned to the GPU and
+# blocking the next run. Without this, hitting Ctrl-C on the parent
+# leaves the foreground PG alive and the user has to manually find +
+# kill stuck pids.
+set -m
+SV_PGS_RUN_PGID="$$"
+
+_sv_pgs_run_cleanup() {
+  local rc=$?
+  # Send SIGTERM to the whole process group (negative pid = group), wait
+  # briefly for graceful Python shutdown, then SIGKILL anything left.
+  # Best-effort; cleanup must never fail the cleanup.
+  kill -- "-${SV_PGS_RUN_PGID}" 2>/dev/null || true
+  local waited=0
+  while [ "$waited" -lt 10 ]; do
+    if ! pgrep -g "$SV_PGS_RUN_PGID" >/dev/null 2>&1; then
+      break
+    fi
+    sleep 1
+    waited=$((waited + 1))
+  done
+  if pgrep -g "$SV_PGS_RUN_PGID" >/dev/null 2>&1; then
+    kill -SIGKILL -- "-${SV_PGS_RUN_PGID}" 2>/dev/null || true
+  fi
+  exit "$rc"
+}
+
+# EXIT covers normal completion + uncaught errors under `set -e`.
+# INT covers ^C. TERM covers external kill. HUP covers terminal close.
+# (^Z sends TSTP which suspends; we don't trap it because the user may
+# legitimately want to fg/bg the run later. The kill_stuck_or_running
+# function at start of run_variant_pass auto-resumes-and-kills any
+# stopped prior run.)
+trap _sv_pgs_run_cleanup EXIT INT TERM HUP
+
 # Usage:
 #   ./run.sh                 # all 19 SNOMED diseases, both SNP-only and SNP+SV
 #   ./run.sh hypertension    # one disease, both variant sets
@@ -316,39 +353,94 @@ sweep_zombie_sv_pgs_procs() {
   done
 }
 
-abort_if_sv_pgs_running() {
-  # Refuse overlap. A previous AoU fit can hold >10 GB RSS while this script
-  # starts a second run; on 30 GB hosts that makes the new process look like it
-  # "randomly" died with SIGKILL during the first GPU streaming pass.
+kill_stuck_or_running_sv_pgs() {
+  # Auto-tear-down: a prior AoU fit (running, stopped via ^Z, or stuck in
+  # uninterruptible disk wait) holds >10 GB RSS and full GPU contexts. We
+  # used to refuse to start when one was found; that left users stuck doing
+  # "ps + kill -9" loops. Now we SIGCONT-then-SIGKILL the prior run + its
+  # entire process tree (uv run -> python -> any background readers), wait
+  # briefly for the kernel to reap, and then start fresh.
   local me
   me=$(id -un)
   local candidates
   candidates=$(pgrep -u "$me" -f "sv-pgs|run-all-of-us" 2>/dev/null || true)
   [ -z "$candidates" ] && return 0
-  local found=0
+  local victims=()
   for pid in $candidates; do
     [ -z "$pid" ] && continue
     [ "$pid" = "$$" ] && continue
-    local cmd rss_kb stat
+    local cmd stat rss_kb
     cmd=$(ps -o args= -p "$pid" 2>/dev/null || true)
     stat=$(ps -o stat= -p "$pid" 2>/dev/null | tr -d ' ' || true)
     rss_kb=$(ps -o rss= -p "$pid" 2>/dev/null | tr -d ' ' || echo 0)
     [ -z "$cmd" ] && continue
     case "$stat" in
-      *Z*) continue ;;
+      *Z*) continue ;;  # zombie — kernel will reap when parent waits
     esac
     case "$cmd" in
-      *"sv-pgs run-all-of-us"*|*"run-all-of-us --"*)
-        found=1
-        echo "  blocking live sv-pgs run: pid=$pid rss=${rss_kb}kB stat=$stat cmd=$(printf '%s' "$cmd" | head -c 120)"
+      *"sv-pgs run-all-of-us"*|*"run-all-of-us --"*|*"sv-pgs"*"--disease"*)
+        victims+=("$pid")
+        echo "  killing stale sv-pgs: pid=$pid rss=${rss_kb}kB stat=$stat cmd=$(printf '%s' "$cmd" | head -c 120)"
         ;;
     esac
   done
-  if [ "$found" -ne 0 ]; then
-    echo "ERROR: another sv-pgs AoU fit is already running. Stop it or wait for it before starting a new run."
-    return 1
+  [ "${#victims[@]}" -eq 0 ] && return 0
+  # Phase 1: SIGCONT in case the process was ^Z-stopped (otherwise SIGTERM
+  # is queued but never delivered until it resumes). Then SIGTERM for a
+  # graceful Python shutdown (atexit handlers, GPU contexts, ThreadPool
+  # joins). Walk children/grandchildren too so we don't leave decode
+  # workers running on the GPU.
+  local all_pids=()
+  for pid in "${victims[@]}"; do
+    all_pids+=("$pid")
+    # Children + grandchildren via pgrep -P (BFS one level at a time).
+    local kids
+    kids=$(pgrep -P "$pid" 2>/dev/null || true)
+    for k in $kids; do
+      all_pids+=("$k")
+      local gk
+      gk=$(pgrep -P "$k" 2>/dev/null || true)
+      for g in $gk; do all_pids+=("$g"); done
+    done
+  done
+  for pid in "${all_pids[@]}"; do
+    kill -SIGCONT "$pid" 2>/dev/null || true
+    kill -SIGTERM "$pid" 2>/dev/null || true
+  done
+  # Phase 2: wait briefly for graceful shutdown.
+  local waited=0
+  while [ "$waited" -lt 30 ]; do
+    local still_alive=0
+    for pid in "${all_pids[@]}"; do
+      kill -0 "$pid" 2>/dev/null && still_alive=$((still_alive + 1))
+    done
+    [ "$still_alive" -eq 0 ] && break
+    sleep 1
+    waited=$((waited + 1))
+  done
+  # Phase 3: anyone still alive after the grace window gets SIGKILL.
+  for pid in "${all_pids[@]}"; do
+    if kill -0 "$pid" 2>/dev/null; then
+      echo "  SIGKILL stale pid=$pid (did not exit within 30s of SIGTERM)"
+      kill -SIGKILL "$pid" 2>/dev/null || true
+    fi
+  done
+  sleep 1
+  # Phase 4: report any holdouts (rare; usually disk-wait threads that the
+  # kernel will reap on their next I/O return).
+  local survivors=0
+  for pid in "${all_pids[@]}"; do
+    kill -0 "$pid" 2>/dev/null && survivors=$((survivors + 1))
+  done
+  if [ "$survivors" -gt 0 ]; then
+    echo "  WARNING: $survivors process(es) still alive after SIGKILL; continuing anyway"
   fi
   return 0
+}
+
+# Backwards-compatible alias so any external caller / cron still works.
+abort_if_sv_pgs_running() {
+  kill_stuck_or_running_sv_pgs
 }
 
 postmortem_after_silent_death() {

@@ -170,7 +170,51 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _install_graceful_shutdown_handlers() -> None:
+    """Convert SIGTERM/SIGHUP into KeyboardInterrupt so atexit + finally + GPU
+    teardown run instead of dying mid-write.
+
+    Default Python behavior: SIGINT (^C) raises KeyboardInterrupt which unwinds
+    cleanly (atexit fires, finally blocks run, ThreadPoolExecutor.shutdown is
+    called, CuPy contexts get released). SIGTERM/SIGHUP just kill the
+    interpreter with no cleanup, which leaves partial cache writes, orphaned
+    decode threads pinning the GPU, and tmp files lying around. Re-raise them
+    as KeyboardInterrupt so they unwind the same way.
+
+    Called once at startup of any long-running ``sv-pgs`` command. Without
+    this, ``run.sh``'s SIGTERM-on-cleanup tears down the bash side cleanly
+    but the Python child still skips its cache writes.
+    """
+    import signal
+
+    def _term_to_interrupt(signum: int, _frame: object) -> None:
+        try:
+            signame = signal.Signals(signum).name
+        except (ValueError, AttributeError):
+            signame = str(signum)
+        sys.stderr.write(
+            f"\n[sv-pgs] received {signame}; unwinding for graceful shutdown "
+            f"(atexit + GPU teardown + cache flush)\n"
+        )
+        sys.stderr.flush()
+        # Re-install the default disposition so a SECOND signal hard-kills
+        # if the graceful unwind ends up hanging on a syscall.
+        signal.signal(signum, signal.SIG_DFL)
+        raise KeyboardInterrupt(f"signal {signame}")
+
+    for sig_name in ("SIGTERM", "SIGHUP"):
+        sig = getattr(signal, sig_name, None)
+        if sig is None:
+            continue
+        try:
+            signal.signal(sig, _term_to_interrupt)
+        except (OSError, ValueError):
+            # Not the main thread, or platform doesn't support — accept silently.
+            pass
+
+
 def main(argv: list[str] | None = None) -> int:
+    _install_graceful_shutdown_handlers()
     try:
         faulthandler.enable(file=sys.stderr, all_threads=True)
     except io.UnsupportedOperation:
