@@ -1244,22 +1244,58 @@ _libc_malloc_trim: Any = None
 _libc_malloc_trim_checked = False
 
 
-def _release_host_caches(cupy: Any | None) -> None:
+def _fadvise_dontneed(path: str | Path) -> None:
+    """Tell the kernel to drop page-cache pages for ``path``.
+
+    bed-reader mmaps the .bed file and the kernel caches every page touched
+    by ``reader.read(...)`` in the page cache. On a 30 GB AoU container the
+    cgroup memory accounting includes file-backed cache, so a marginal screen
+    that walks the whole .bed (~107 GB of bit-packed bytes for 956 k variants
+    × 447 k samples) drives the cgroup OOM-killer long before the *anonymous*
+    process RSS would warrant it. ``POSIX_FADV_DONTNEED`` is the only way to
+    proactively evict those pages — they are shared with bed-reader's mmap,
+    and the kernel reclaims them lazily under pressure, but ``free_all_blocks``
+    and ``malloc_trim`` do nothing about them.
+    """
+    posix_fadvise = getattr(os, "posix_fadvise", None)
+    dontneed = getattr(os, "POSIX_FADV_DONTNEED", None)
+    if posix_fadvise is None or dontneed is None:
+        return
+    try:
+        fd = os.open(str(path), os.O_RDONLY)
+    except OSError:
+        return
+    try:
+        posix_fadvise(fd, 0, 0, dontneed)
+    except OSError:
+        pass
+    finally:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+
+
+def _release_host_caches(cupy: Any | None, *, fadvise_paths: Sequence[str | Path] = ()) -> None:
     """Return per-batch host scratch back to the OS.
 
-    Two pools retain large host allocations across PLINK batches and show up
-    as monotonically growing RSS on the 30 GB AoU box:
+    Three retention paths grow RSS monotonically across PLINK batches on the
+    30 GB AoU container and together push it past the cgroup limit:
 
     1. cupy's default ``PinnedMemoryPool`` holds the staging buffer used by
        every ``cupy.asarray(numpy_array)`` H2D copy. Even with ``blocking=True``
-       the pool keeps the largest block per stream alive forever, which on a
-       sharded run means ``n_shards × bed_batch_bytes`` of pinned RSS that the
-       kernel cannot reclaim.
+       the pool keeps the largest block per stream alive forever.
     2. glibc's main arena does not auto-trim after large freed allocations.
        ``malloc_trim(0)`` walks the arena and ``munmap``s freed pages.
+    3. **The dominant one on AoU.** bed-reader mmaps the .bed file and the
+       kernel page-caches every read. Cgroup memory accounting includes file
+       cache, so the marginal screen blows the limit before the screen
+       finishes. ``POSIX_FADV_DONTNEED`` on the .bed file evicts those pages.
 
-    Both calls are cheap and idempotent; we run them after each batch upload.
+    All three calls are cheap and idempotent.
     """
+    for path in fadvise_paths:
+        _fadvise_dontneed(path)
     if cupy is not None:
         try:
             pinned_pool = cupy.get_default_pinned_memory_pool()
@@ -2239,10 +2275,15 @@ def _gpu_int8_transpose_matmul_single_device(
         )
         result_gpu[batch_slice, :] = standardized_gpu.T @ matrix_gpu
         del int8_gpu, standardized_gpu
-        # Return pinned staging + glibc heap back to the OS before the next
-        # PLINK decode allocates another batch; without this the cupy pinned
-        # pool grows to ~n_shards × bed_batch_bytes and OOMs the 30 GB box.
-        _release_host_caches(cupy)
+        # Three retention paths conspire to OOM the 30 GB AoU container:
+        # cupy's pinned-host pool, glibc's untrimmed arena, and (dominantly)
+        # the kernel page cache for bed-reader's mmap of arrays.bed — see
+        # _release_host_caches for the full story.
+        fadvise_paths: tuple[str, ...] = ()
+        bed_path = getattr(raw_int8, "bed_path", None)
+        if bed_path is not None:
+            fadvise_paths = (str(bed_path),)
+        _release_host_caches(cupy, fadvise_paths=fadvise_paths)
         if progress_label is not None:
             completed_variants = batch_slice.stop
             if completed_variants - last_logged_variants >= log_interval:
