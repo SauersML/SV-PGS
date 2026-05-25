@@ -2487,24 +2487,29 @@ def _gpu_plink_pread_transpose_matmul_direct(
             f"batch_size={batch_size}, host_xient~{bytes_per_variant * batch_size / 1e6:.0f} MB)  mem={mem()}"
         )
 
-    completed = 0
-    last_logged = 0
-    log_interval = max(n_variants_total // 50, 1)
     t_start = _time.monotonic()
+    last_log_time = t_start
 
     block_dim = 128
-    for batch_start in range(0, n_variants_total, batch_size):
+    n_batches_total = (n_variants_total + batch_size - 1) // batch_size
+    for batch_index, batch_start in enumerate(range(0, n_variants_total, batch_size)):
         batch_stop = min(batch_start + batch_size, n_variants_total)
         n_batch_vars = batch_stop - batch_start
         batch_var_indices = selected_variant_indices_int64[batch_start:batch_stop]
 
+        t_pread = _time.monotonic()
         payload = reader._pread_indexed_variant_payload(
             batch_var_indices,
             bytes_per_variant=bytes_per_variant,
         )
+        pread_seconds = _time.monotonic() - t_pread
+
+        t_upload = _time.monotonic()
         packed_gpu = cupy.asarray(payload, blocking=True)
         del payload
+        upload_seconds = _time.monotonic() - t_upload
 
+        t_gpu = _time.monotonic()
         int8_gpu = cupy.empty((n_kept_samples, n_batch_vars), dtype=cupy.int8, order="F")
         grid_x = (n_kept_samples + block_dim - 1) // block_dim
         grid_y = n_batch_vars
@@ -2533,23 +2538,30 @@ def _gpu_plink_pread_transpose_matmul_direct(
         )
         result_gpu[batch_start:batch_stop, :] = standardized_gpu.T @ matrix_gpu
         del int8_gpu, standardized_gpu
+        gpu_seconds = _time.monotonic() - t_gpu
 
         # Page-cache eviction on the pread fd. No mmap here so fadvise works
         # cleanly without needing to drop any cached reader.
         _release_host_caches(cupy, fadvise_paths=(bed_path,))
 
+        # Per-batch progress + timing breakdown. Previously we logged every
+        # ~6 batches via a variant-count threshold, which on AoU's slow disk
+        # (multi-minute preads per batch) meant the user saw zero progress
+        # for 40+ minutes and assumed it was hung. Log every batch so the
+        # heartbeat thread isn't the only sign of life.
         if progress_label is not None:
             completed = batch_stop
-            if completed - last_logged >= log_interval:
-                last_logged = completed
-                elapsed = _time.monotonic() - t_start
-                rate = completed / max(elapsed, 1e-6)
-                eta = (n_variants_total - completed) / max(rate, 1e-6)
-                log(
-                    f"        {progress_label}: {completed:,}/{n_variants_total:,} "
-                    f"({100*completed/n_variants_total:.1f}%) "
-                    f"elapsed={elapsed:.0f}s rate={rate:,.0f}v/s eta={eta:.0f}s  mem={mem()}"
-                )
+            now = _time.monotonic()
+            elapsed = now - t_start
+            rate = completed / max(elapsed, 1e-6)
+            eta = (n_variants_total - completed) / max(rate, 1e-6)
+            log(
+                f"        {progress_label}: batch {batch_index + 1}/{n_batches_total} "
+                f"({completed:,}/{n_variants_total:,} = {100*completed/n_variants_total:.1f}%) "
+                f"pread={pread_seconds:.1f}s upload={upload_seconds:.2f}s gpu={gpu_seconds:.2f}s "
+                f"elapsed={elapsed:.0f}s rate={rate:,.0f}v/s eta={eta:.0f}s  mem={mem()}"
+            )
+            last_log_time = now
     if progress_label is not None:
         elapsed = _time.monotonic() - t_start
         log(
