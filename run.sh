@@ -307,12 +307,48 @@ sweep_zombie_sv_pgs_procs() {
   [ -z "$candidates" ] && return 0
   for pid in $candidates; do
     [ -z "$pid" ] && continue
-    local cmd rss_kb
+    local cmd rss_kb stat
     cmd=$(ps -o args= -p "$pid" 2>/dev/null || true)
     rss_kb=$(ps -o rss= -p "$pid" 2>/dev/null | tr -d ' ' || echo 0)
+    stat=$(ps -o stat= -p "$pid" 2>/dev/null | tr -d ' ' || true)
     [ -z "$cmd" ] && continue
-    echo "  sv-pgs process present: pid=$pid rss=${rss_kb}kB cmd=$(printf '%s' "$cmd" | head -c 100)"
+    echo "  sv-pgs process present: pid=$pid rss=${rss_kb}kB stat=${stat:-?} cmd=$(printf '%s' "$cmd" | head -c 100)"
   done
+}
+
+abort_if_sv_pgs_running() {
+  # Refuse overlap. A previous AoU fit can hold >10 GB RSS while this script
+  # starts a second run; on 30 GB hosts that makes the new process look like it
+  # "randomly" died with SIGKILL during the first GPU streaming pass.
+  local me
+  me=$(id -un)
+  local candidates
+  candidates=$(pgrep -u "$me" -f "sv-pgs|run-all-of-us" 2>/dev/null || true)
+  [ -z "$candidates" ] && return 0
+  local found=0
+  for pid in $candidates; do
+    [ -z "$pid" ] && continue
+    [ "$pid" = "$$" ] && continue
+    local cmd rss_kb stat
+    cmd=$(ps -o args= -p "$pid" 2>/dev/null || true)
+    stat=$(ps -o stat= -p "$pid" 2>/dev/null | tr -d ' ' || true)
+    rss_kb=$(ps -o rss= -p "$pid" 2>/dev/null | tr -d ' ' || echo 0)
+    [ -z "$cmd" ] && continue
+    case "$stat" in
+      *Z*) continue ;;
+    esac
+    case "$cmd" in
+      *"sv-pgs run-all-of-us"*|*"run-all-of-us --"*)
+        found=1
+        echo "  blocking live sv-pgs run: pid=$pid rss=${rss_kb}kB stat=$stat cmd=$(printf '%s' "$cmd" | head -c 120)"
+        ;;
+    esac
+  done
+  if [ "$found" -ne 0 ]; then
+    echo "ERROR: another sv-pgs AoU fit is already running. Stop it or wait for it before starting a new run."
+    return 1
+  fi
+  return 0
 }
 
 postmortem_after_silent_death() {
@@ -346,24 +382,70 @@ postmortem_after_silent_death() {
   echo "=== END POSTMORTEM ==="
 }
 
+build_aou_env_args() {
+  # Build an `env -i` argv that scrubs the inherited environment down to the
+  # minimum the AoU fit actually needs. Stale exports from prior runs (e.g.
+  # CUDA_VISIBLE_DEVICES=0 left over from a single-GPU pin, XLA_FLAGS that
+  # disabled tensor cores, MALLOC_ARENA_MAX=1 fragmenting allocator, half a
+  # JAX_PLATFORMS=cpu override forgotten in .bashrc) are the kind of thing
+  # that silently make a run slower or kill it. Whitelisting is far safer
+  # than blocklisting: if a future env var becomes load-bearing we'll see
+  # it missing immediately rather than rotting silently behind a leftover.
+  local keep=(
+    # Shell context — without these uv / python can't even find HOME or the user's name.
+    HOME USER LOGNAME SHELL TERM LANG LC_ALL LC_CTYPE TZ
+    # PATH must include the venv launcher dir + uv install dir + system bins + nvidia tools.
+    PATH
+    # CUDA / NVIDIA — let the driver, runtime, and CuPy find each other.
+    LD_LIBRARY_PATH CUDA_HOME CUDA_PATH NVIDIA_VISIBLE_DEVICES NVIDIA_DRIVER_CAPABILITIES
+    # AoU / GCP credentials and workspace — BigQuery + GCS access for phenotype + cohort.
+    GOOGLE_APPLICATION_CREDENTIALS GOOGLE_CLOUD_PROJECT GOOGLE_PROJECT
+    WORKSPACE_BUCKET WORKSPACE_CDR WORKSPACE_NAMESPACE WORKSPACE_ID
+    OWNER_EMAIL CLOUDSDK_CONFIG CLOUDSDK_CORE_PROJECT
+    # Temp dir override (keeps /tmp off the small root fs if user moved it).
+    TMPDIR
+    # uv cache reuse — without this uv re-resolves and re-installs every call.
+    UV_CACHE_DIR
+    # Our own knobs — postmortem dir + sweep override.
+    SV_PGS_LAST_OUTDIR SV_PGS_SKIP_STARTUP_SWEEP SV_PGS_SKIP_PULL
+  )
+  local env_args=()
+  local name value
+  for name in "${keep[@]}"; do
+    if [ -n "${!name+x}" ]; then
+      env_args+=("$name=${!name}")
+    fi
+  done
+  printf '%s\n' "${env_args[@]}"
+}
+
 run_variant_pass() {
   local variants="$1"
   local base="$2"
   echo "=== FIT PASS: variants=${variants}  base=${base} ==="
   sweep_zombie_sv_pgs_procs
   sweep_zombie_gpu_procs
+  abort_if_sv_pgs_running
   local rc=0
+  # Scrub env down to the AoU allowlist so inherited junk (stale CUDA_VISIBLE_DEVICES,
+  # forgotten XLA_FLAGS=..., MALLOC_ARENA_MAX, JAX_PLATFORMS=cpu, etc.) can't silently
+  # change the run. mapfile reads the allowlist; `env -i` clears, then re-sets only those.
+  local env_args=()
+  mapfile -t env_args < <(build_aou_env_args)
+  echo "  env scrub: passing ${#env_args[@]} whitelisted vars to sv-pgs (stripped $(env | wc -l) inherited)"
   # Run unfaulted so we can inspect rc; restore -e immediately after.
   set +e
   if is_all; then
     export SV_PGS_LAST_OUTDIR="$base"
-    uv run sv-pgs run-all-of-us --all-diseases --variants "$variants" --output-dir "$base"
+    env -i "${env_args[@]}" SV_PGS_LAST_OUTDIR="$base" \
+      uv run sv-pgs run-all-of-us --all-diseases --variants "$variants" --output-dir "$base"
     rc=$?
   else
     local out="$base/${DISEASE}_results"
     mkdir -p "$out"
     export SV_PGS_LAST_OUTDIR="$out"
-    uv run sv-pgs run-all-of-us --disease "$DISEASE" --variants "$variants" --output-dir "$out"
+    env -i "${env_args[@]}" SV_PGS_LAST_OUTDIR="$out" \
+      uv run sv-pgs run-all-of-us --disease "$DISEASE" --variants "$variants" --output-dir "$out"
     rc=$?
   fi
   set -e
