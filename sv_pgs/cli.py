@@ -9,15 +9,6 @@ import sys
 from pathlib import Path
 from typing import Iterable
 
-# Kill stale AoU fits before heavy imports allocate memory. The runner also
-# sweeps before launching, but this catches direct `sv-pgs run-all-of-us` calls.
-try:
-    from sv_pgs._startup_sweep import kill_stale_sv_pgs_siblings
-
-    kill_stale_sv_pgs_siblings(verbose=True)
-except Exception as _exc:  # noqa: BLE001
-    print(f"  startup sweep: skipped ({type(_exc).__name__}: {_exc})", file=sys.stderr)
-
 from sv_pgs.all_of_us import AllOfUsDiseaseRequest, available_disease_names, prepare_all_of_us_disease_sample_table
 from sv_pgs.aou_runner import run_all_of_us, run_all_of_us_all_diseases
 from sv_pgs.config import ModelConfig, TraitType

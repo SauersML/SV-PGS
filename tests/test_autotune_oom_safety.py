@@ -86,6 +86,26 @@ def test_two_shard_total_inflight_fits_within_usable(monkeypatch: pytest.MonkeyP
     assert grand_total <= 16 * 1024**3
 
 
+def test_multi_gpu_runtime_prefetch_is_one_batch_per_shard() -> None:
+    """Runtime sharded GPU prefetch must not spend the full autotune depth per GPU.
+
+    The 30 GB V100 AoU failure logged ``batch_size=3084`` and
+    ``prefetch_budget=11220 MB/device``. That allowed roughly 22 GB of decoded
+    PLINK batches across two shards before accounting for reader scratch. The
+    runtime budget is now exactly one decoded int8 batch per GPU shard.
+    """
+    sample_count = 331_945
+    batch_size = 3_084
+    one_batch = sample_count * batch_size
+    budget = genotype._sharded_gpu_prefetch_budget_bytes(
+        sample_count=sample_count,
+        batch_size=batch_size,
+    )
+    assert budget == one_batch
+    assert budget < 1.1 * 1024**3
+    assert budget * 2 < 2.1 * 1024**3
+
+
 def test_snapshot_emits_new_fields(monkeypatch: pytest.MonkeyPatch) -> None:
     """The autotune snapshot exposes fit reserve + usable + per-shard / total depth."""
     _patch_proc_meminfo(monkeypatch, 16 * 1024**3)
