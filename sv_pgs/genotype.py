@@ -2176,7 +2176,7 @@ def _gpu_int8_transpose_matmul_single_device(
         decode_thread_limit=decode_thread_limit,
         read_semaphore=read_semaphore,
     ):
-        int8_gpu = cupy.asarray(host_values, dtype=getattr(cupy, "int8", np.int8))
+        int8_gpu = cupy.asarray(host_values, dtype=getattr(cupy, "int8", np.int8), blocking=True)
         del host_values
         means_gpu = selected_means_gpu[batch_slice]
         scales_gpu = selected_scales_gpu[batch_slice]
