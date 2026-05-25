@@ -2282,12 +2282,13 @@ def compute_plink_variant_statistics_cached(
                 f"  resuming PLINK int8 cache at {int8_tmp_path.name}: "
                 f"{resume_state.variants_committed:,}/{n_variants:,} variants committed"
             )
-        expected_gb = n_samples * n_variants / 1e9
-        log(
-            f"  building PLINK int8 cache at {int8_tmp_path.name} "
-            f"({n_samples:,} x {n_variants:,} = {expected_gb:.1f} GB) - "
-            f"future passes will stream-read this instead of re-decoding bed bytes"
-        )
+        if int8_cache_writer is not None:
+            expected_gb = n_samples * n_variants / 1e9
+            log(
+                f"  building PLINK int8 cache at {int8_tmp_path.name} "
+                f"({n_samples:,} x {n_variants:,} = {expected_gb:.1f} GB) - "
+                f"future passes will stream-read this instead of re-decoding bed bytes"
+            )
 
     try:
         variant_stats = _compute_variant_stats_teeing_int8(

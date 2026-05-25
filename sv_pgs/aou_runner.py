@@ -280,10 +280,40 @@ def _link_mounted_array_plink(work_dir: Path) -> bool:
     if mounted_prefix is None:
         return False
     cache_dir = local_array_plink_cache_dir(work_dir)
-    for extension in ("bed", "bim", "fam"):
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    # Small sidecar files (.bim, .fam) are read once and benefit fine from
+    # gcsfuse's metadata cache, so symlink them. The .bed is read repeatedly
+    # in random-access batches by bed-reader; against a gcsfuse mount that
+    # pattern stalls (workers go to 0% CPU and never return). Copy it to
+    # local disk on first use so subsequent reads are fast and reliable.
+    for extension in ("bim", "fam"):
         source = mounted_prefix.parent / f"{mounted_prefix.name}.{extension}"
         target = cache_dir / f"{_AOU_ARRAY_PLINK_PREFIX}.{extension}"
         _link_mounted_file(source, target)
+    bed_source = mounted_prefix.parent / f"{mounted_prefix.name}.bed"
+    bed_target = cache_dir / f"{_AOU_ARRAY_PLINK_PREFIX}.bed"
+    # If a previous run symlinked the .bed into the read-only mount, replace
+    # the symlink with a real local copy.
+    if bed_target.is_symlink():
+        bed_target.unlink()
+    if bed_target.exists():
+        try:
+            same = bed_target.samefile(bed_source)
+        except OSError:
+            same = False
+        if same or bed_target.stat().st_size == bed_source.stat().st_size:
+            return True
+        bed_target.unlink()
+    required_bytes = bed_source.stat().st_size
+    _check_disk_space(cache_dir, required_bytes)
+    log(
+        f"  microarray: copying arrays.bed from mounted workspace to local cache "
+        f"({required_bytes / 1e9:.1f} GB) — random reads on gcsfuse stall"
+    )
+    tmp_target = bed_target.with_suffix(bed_target.suffix + ".tmp")
+    tmp_target.unlink(missing_ok=True)
+    shutil.copyfile(str(bed_source), str(tmp_target))
+    os.replace(str(tmp_target), str(bed_target))
     return True
 
 
