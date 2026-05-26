@@ -18,6 +18,7 @@ import hashlib
 import json
 import logging
 import os
+import threading
 import time
 import uuid
 from datetime import datetime, timezone
@@ -1068,6 +1069,66 @@ def _load_active_matrix_cache(
     )
 
 
+# Track in-flight background cache writer threads so callers can optionally
+# join them at process exit. daemon=True means we don't *need* to join, but
+# exposing the set lets process-exit hooks wait for clean cache completion if
+# they choose to.
+_ACTIVE_CACHE_WRITER_THREADS: set[threading.Thread] = set()
+_ACTIVE_CACHE_WRITER_LOCK = threading.Lock()
+
+
+def _background_cache_write(
+    cache_subdir: Path,
+    matrix: "BitpackedDeviceMatrix",
+    bed_path: Path,
+    content_hash: str,
+    count_a1: bool,
+    device_id: int,
+) -> None:
+    """Run ``_write_active_matrix_cache`` on a daemon thread.
+
+    The CuPy device context is thread-local, so this thread sets its device
+    before invoking the writer (which issues ``cp.asnumpy`` to pull the packed
+    buffer + mean/std off the GPU). Failures are logged as warnings but never
+    raise — an absent/incomplete cache simply forces the next run to MISS,
+    which is handled by ``verify_active_matrix_cache``.
+    """
+    try:
+        from sv_pgs.progress import log as _log
+    except ImportError:  # pragma: no cover
+        _log = None  # type: ignore[assignment]
+    t0 = time.monotonic()
+    try:
+        try:
+            import cupy as _cp  # local import; main thread already required it
+            _cp.cuda.Device(device_id).use()
+        except Exception:  # noqa: BLE001 - if cupy is gone we'll fail below anyway
+            pass
+        _write_active_matrix_cache(
+            cache_subdir,
+            matrix=matrix,
+            bed_path=bed_path,
+            content_hash=content_hash,
+            count_a1=count_a1,
+        )
+        elapsed = time.monotonic() - t0
+        if _log is not None:
+            _log(
+                f"bitpacked active-matrix cache write complete "
+                f"(background, {elapsed:.1f}s)"
+            )
+    except Exception as exc:  # noqa: BLE001 - cache write is best-effort
+        elapsed = time.monotonic() - t0
+        if _log is not None:
+            _log(
+                f"WARNING: bitpacked active-matrix cache background write "
+                f"FAILED after {elapsed:.1f}s ({exc!r}); next run will MISS"
+            )
+    finally:
+        with _ACTIVE_CACHE_WRITER_LOCK:
+            _ACTIVE_CACHE_WRITER_THREADS.discard(threading.current_thread())
+
+
 def load_bed_to_bitpacked_device_cached(
     bed_path: str | Path,
     n_samples: int,
@@ -1164,17 +1225,34 @@ def load_bed_to_bitpacked_device_cached(
         count_a1=count_a1,
         stream=stream,
     )
+    # Spawn cache write on a daemon background thread so the bitpacked matrix
+    # returns to the caller immediately. EM can start while the 7+ GB packed
+    # buffer is still being staged to disk. Manifest-last + .partial.* naming
+    # in `_write_active_matrix_cache` means a SIGKILL mid-write still leaves a
+    # cleanly-incomplete cache (next run MISS + stale-partial sweep above).
     try:
-        _write_active_matrix_cache(
-            cache_subdir,
-            matrix=matrix,
-            bed_path=bed_path,
-            content_hash=content_hash,
-            count_a1=count_a1,
+        device_id = int(matrix._packed.device.id)
+    except Exception:  # noqa: BLE001 - fall back to current device
+        device_id = 0
+    writer_thread = threading.Thread(
+        target=_background_cache_write,
+        kwargs={
+            "cache_subdir": cache_subdir,
+            "matrix": matrix,
+            "bed_path": bed_path,
+            "content_hash": content_hash,
+            "count_a1": count_a1,
+            "device_id": device_id,
+        },
+        name=f"bitpacked-cache-writer-{content_hash[:8]}",
+        daemon=True,
+    )
+    with _ACTIVE_CACHE_WRITER_LOCK:
+        _ACTIVE_CACHE_WRITER_THREADS.add(writer_thread)
+    writer_thread.start()
+    if _log is not None:
+        _log(
+            f"bitpacked active-matrix cache write dispatched to background "
+            f"thread: {cache_subdir}"
         )
-        if _log is not None:
-            _log(f"bitpacked active-matrix cache populated: {cache_subdir}")
-    except Exception as exc:  # noqa: BLE001 - cache write is best-effort
-        if _log is not None:
-            _log(f"bitpacked active-matrix cache write failed (continuing): {exc!r}")
     return matrix
