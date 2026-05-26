@@ -194,6 +194,23 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="sv_pgs.bitpacked.bench")
     parser.add_argument("--output", type=str, default=None, help="JSON report path")
     parser.add_argument("--quick", action="store_true", help="Run 2 scales for fast CI")
+    parser.add_argument(
+        "--baseline",
+        type=str,
+        default=None,
+        help=(
+            "Path to a prior --output JSON report. Each row in the new run is "
+            "compared to the same (op, n_samples, n_variants) row in the "
+            "baseline; exits non-zero if any throughput regresses by more than "
+            "--baseline-tolerance percent."
+        ),
+    )
+    parser.add_argument(
+        "--baseline-tolerance",
+        type=float,
+        default=5.0,
+        help="Allowed regression in percent before --baseline fails the run (default: 5).",
+    )
     args = parser.parse_args(argv)
 
     cp = _require_gpu()
@@ -240,7 +257,83 @@ def main(argv: list[str] | None = None) -> int:
         with open(args.output, "w", encoding="utf-8") as fh:
             json.dump(report, fh, indent=2)
         print(f"report written to {args.output}")
+
+    if args.baseline:
+        regress = _compare_to_baseline(
+            new_rows=[asdict(r) for r in all_rows],
+            baseline_path=args.baseline,
+            tolerance_pct=float(args.baseline_tolerance),
+        )
+        if regress:
+            print(
+                f"\nbaseline regression: {len(regress)} row(s) exceeded "
+                f"{args.baseline_tolerance:.1f}% drop:",
+                file=sys.stderr,
+            )
+            for line in regress:
+                print(f"  {line}", file=sys.stderr)
+            return 3
+        print(
+            f"\nbaseline check: all rows within {args.baseline_tolerance:.1f}% "
+            f"of {args.baseline}"
+        )
     return 0
+
+
+def _compare_to_baseline(
+    *,
+    new_rows: list[dict[str, Any]],
+    baseline_path: str,
+    tolerance_pct: float,
+) -> list[str]:
+    """Return human-readable strings describing each regressed row.
+
+    A row regresses when its throughput (GB/s for memory-bound ops, TFLOPS for
+    gemm_gram) is less than ``baseline * (1 - tolerance_pct/100)``. Rows whose
+    baseline entry is missing are skipped (not treated as regressions) so that
+    adding a new scale doesn't immediately fail the baseline check.
+    """
+    try:
+        with open(baseline_path, "r", encoding="utf-8") as fh:
+            baseline = json.load(fh)
+    except (OSError, ValueError) as exc:
+        print(
+            f"warning: could not read baseline {baseline_path}: {exc}",
+            file=sys.stderr,
+        )
+        return []
+    base_rows = {
+        (r.get("op"), int(r.get("n_samples", 0)), int(r.get("n_variants", 0))): r
+        for r in baseline.get("rows", [])
+    }
+    factor = max(0.0, 1.0 - float(tolerance_pct) / 100.0)
+    regressions: list[str] = []
+    for row in new_rows:
+        key = (row.get("op"), int(row.get("n_samples", 0)), int(row.get("n_variants", 0)))
+        base = base_rows.get(key)
+        if base is None:
+            continue
+        for metric in ("gbps", "tflops"):
+            new_val = row.get(metric)
+            base_val = base.get(metric)
+            if new_val is None or base_val is None:
+                continue
+            try:
+                new_f = float(new_val)
+                base_f = float(base_val)
+            except (TypeError, ValueError):
+                continue
+            if base_f <= 0:
+                continue
+            threshold = base_f * factor
+            if new_f < threshold:
+                drop = 100.0 * (1.0 - new_f / base_f)
+                regressions.append(
+                    f"{key[0]} n_samples={key[1]} n_variants={key[2]}: "
+                    f"{metric} {new_f:.2f} < threshold {threshold:.2f} "
+                    f"(baseline {base_f:.2f}, drop {drop:.1f}%)"
+                )
+    return regressions
 
 
 if __name__ == "__main__":

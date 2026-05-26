@@ -67,6 +67,11 @@ def _maybe_upgrade_to_bitpacked(dataset: LoadedDataset, config: ModelConfig) -> 
             load_bed_to_bitpacked_device_cached,
         )
         cache_dir_env = os.environ.get("SV_PGS_BITPACKED_ACTIVE_CACHE_DIR", "").strip()
+        # Allow operators (and the --no-cache CLI flag) to bypass the active
+        # matrix cache for debugging without unsetting the cache-dir env var.
+        if os.environ.get("SV_PGS_DISABLE_BITPACKED_ACTIVE_CACHE", "").strip() in {"1", "true", "yes"}:
+            log("bitpacked upgrade: active-matrix cache DISABLED via SV_PGS_DISABLE_BITPACKED_ACTIVE_CACHE")
+            cache_dir_env = ""
         if cache_dir_env:
             log(
                 f"bitpacked upgrade: loading BED {bed_path} -> device via active-matrix cache "

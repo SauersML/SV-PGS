@@ -58,8 +58,12 @@ trap _sv_pgs_run_cleanup EXIT INT TERM HUP
 #   ./run.sh all             # explicit "all"
 #   ./run.sh --smoke         # ONLY run the bitpacked end-to-end smoke check and exit
 SV_PGS_SMOKE_ONLY=0
+SV_PGS_VALIDATE_ONLY=0
 if [ "${1:-}" = "--smoke" ]; then
   SV_PGS_SMOKE_ONLY=1
+  shift || true
+elif [ "${1:-}" = "--validate" ]; then
+  SV_PGS_VALIDATE_ONLY=1
   shift || true
 fi
 DISEASE="${1:-all}"

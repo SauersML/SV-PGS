@@ -141,7 +141,11 @@ def test_e2e_synthetic_pipeline_and_active_cache(
     config = ModelConfig(
         trait_type=TraitType.BINARY,
         max_outer_iterations=3,
-        marginal_screen_min_abs_z=1.0,
+        # Disable marginal screen: the screen wraps the bitpacked matrix in a
+        # StandardizedGenotypeMatrix variant-subset, which means the hot-loop
+        # banner reports the subset wrapper (not BitpackedDeviceMatrix). The
+        # test asserts the matrix= banner so we keep the screen off here.
+        marginal_screen_min_abs_z=0.0,
         random_seed=7,
         genotype_backend="bitpacked",
         use_mmap_bed=False,
