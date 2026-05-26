@@ -930,8 +930,9 @@ def _dedupe_cross_source_variants(
             f"{chrom}:{position}:{variant_id} (in {source_name})"
             for chrom, position, variant_id, source_name in preview_duplicates
         )
+        qualifier = "cross-source " if len(source_paths) > 1 else ""
         log(
-            f"  dropped {total_dropped} cross-source duplicate variants "
+            f"  dropped {total_dropped} {qualifier}duplicate variants "
             f"(first occurrence kept). per-source: {per_source_summary}. "
             f"examples: {preview}"
         )
