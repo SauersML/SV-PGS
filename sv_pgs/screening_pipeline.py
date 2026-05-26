@@ -23,8 +23,10 @@ kernel package, so it imports cleanly in CPU-only environments.
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import os
+import shutil
 import warnings
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -47,6 +49,120 @@ _LOG = logging.getLogger(__name__)
 # number of variant rows to keep the screening kernel's row-per-block
 # layout simple.
 _DEFAULT_CHUNK_BYTES = 256 * 1024 * 1024
+
+# Below this size, the gcsfuse penalty for streaming through is small enough
+# that the staging copy isn't worth the wall-clock + disk-space hit.
+_STAGING_MIN_BYTES = 1 * 1024 * 1024 * 1024  # 1 GB
+# Require this much headroom on top of the BED size in the cache dir.
+_STAGING_FREE_SPACE_HEADROOM = 1.1
+# Subdir under the cache root for staged BEDs.
+_STAGED_BED_SUBDIR = "staged_bitpacked"
+
+
+def _resolve_staging_cache_dir() -> Path:
+    """Resolve the local cache directory used to host staged BED copies.
+
+    Honors ``SV_PGS_CACHE_DIR`` if set. Otherwise falls back to
+    ``$HOME/.sv_pgs_cache``. The returned directory is created if missing.
+    """
+    env = os.environ.get("SV_PGS_CACHE_DIR")
+    if env:
+        root = Path(env).expanduser()
+    else:
+        root = Path.home() / ".sv_pgs_cache"
+    staged = root / _STAGED_BED_SUBDIR
+    staged.mkdir(parents=True, exist_ok=True)
+    return staged
+
+
+def _staged_local_path_for(bed_path: Path, cache_dir: Path) -> Path:
+    """Return the deterministic local staging path for ``bed_path``.
+
+    The filename is keyed on a sha256 of the resolved (symlinks-followed)
+    source path so two distinct gcsfuse paths don't collide.
+    """
+    try:
+        resolved = Path(bed_path).resolve()
+    except (OSError, RuntimeError):
+        resolved = Path(bed_path)
+    digest = hashlib.sha256(str(resolved).encode("utf-8")).hexdigest()[:16]
+    return cache_dir / f"{resolved.stem}.{digest}.bed"
+
+
+def _maybe_stage_bed_to_local(bed_path: Path) -> Path:
+    """If ``bed_path`` lives on gcsfuse and is large, stage it to local NVMe.
+
+    Returns the path the caller should open for streaming. Falls back to
+    ``bed_path`` unchanged when:
+      * the path is not gcsfuse-backed,
+      * the file is below ``_STAGING_MIN_BYTES``,
+      * local disk does not have enough headroom,
+      * staging raises (we log and fall back to the slow gcsfuse stream).
+    """
+    try:
+        from sv_pgs.gcsfuse_staging import is_gcsfuse_path, stage_to_local_parallel
+    except Exception:  # pragma: no cover - import path
+        return bed_path
+
+    try:
+        resolved = Path(bed_path).resolve()
+    except (OSError, RuntimeError):
+        resolved = Path(bed_path)
+
+    try:
+        if not is_gcsfuse_path(resolved):
+            return bed_path
+    except Exception:  # noqa: BLE001
+        return bed_path
+
+    try:
+        size = resolved.stat().st_size
+    except OSError:
+        return bed_path
+    if size < _STAGING_MIN_BYTES:
+        return bed_path
+
+    cache_dir = _resolve_staging_cache_dir()
+    try:
+        usage = shutil.disk_usage(str(cache_dir))
+    except OSError as exc:
+        _LOG.warning(
+            "screening_pipeline: cannot check disk space at %s (%s); "
+            "falling back to slow gcsfuse stream for %s",
+            cache_dir, exc, bed_path,
+        )
+        return bed_path
+    required = int(size * _STAGING_FREE_SPACE_HEADROOM)
+    if usage.free < required:
+        _LOG.warning(
+            "screening_pipeline: BED on gcsfuse (%.1f GB) but cache dir %s "
+            "has only %.1f GB free (need %.1f GB); falling back to slow "
+            "gcsfuse stream.",
+            size / 1e9, cache_dir, usage.free / 1e9, required / 1e9,
+        )
+        return bed_path
+
+    local_path = _staged_local_path_for(resolved, cache_dir)
+    _LOG.warning(
+        "screening_pipeline: BED on gcsfuse: staging to local NVMe before "
+        "screening (%.1f GB -> %s)",
+        size / 1e9, local_path,
+    )
+    try:
+        staged = stage_to_local_parallel(
+            resolved,
+            local_path,
+            expected_size=size,
+            log_label=resolved.name,
+        )
+    except Exception as exc:  # noqa: BLE001
+        _LOG.warning(
+            "screening_pipeline: parallel staging failed for %s (%s: %s); "
+            "falling back to slow gcsfuse stream.",
+            bed_path, type(exc).__name__, exc,
+        )
+        return bed_path
+    return Path(staged)
 
 
 # ---------------------------------------------------------------------------
@@ -217,6 +333,15 @@ def _screen_one_path(
     import cupy as cp  # lazy
 
     from sv_pgs.bitpacked.screening import screen
+
+    # Auto-stage gcsfuse-backed BEDs to local NVMe before the streaming
+    # loop kicks in. _read_chunk_to_host issues seek+readinto per chunk; on
+    # gcsfuse that's an HTTP GET per chunk capped at ~100-200 MB/s. Staging
+    # via N parallel pread workers saturates the aggregate connection at
+    # ~1 GB/s, and subsequent chunk reads then come from local NVMe at GB/s
+    # rates. Falls back to the original path if the file is small, the
+    # local disk is short on space, or staging itself errors.
+    bed_path = _maybe_stage_bed_to_local(Path(bed_path))
 
     _verify_magic(bed_path)
 

@@ -41,6 +41,7 @@ __all__ = [
     "is_gcsfuse_path",
     "gcsfuse_mounts",
     "stage_to_local",
+    "stage_to_local_parallel",
     "stage_bed_trio_to_local",
     "open_for_sequential_read",
     "verify_local_cache",
@@ -668,6 +669,326 @@ def stage_to_local(
             md5=md5_hex if md5_hex is not None else expected_md5,
         )
 
+    return local_path
+
+
+# ---------------------------------------------------------------------------
+# Parallel staging (N-worker pread copy)
+# ---------------------------------------------------------------------------
+
+
+def _default_parallel_workers() -> int:
+    """Return ``min(os.cpu_count(), 8)`` clamped to >= 1."""
+    try:
+        cpu = int(os.cpu_count() or 1)
+    except Exception:  # noqa: BLE001
+        cpu = 1
+    return max(1, min(8, cpu))
+
+
+def _copy_and_publish_parallel(
+    source: Path,
+    destination: Path,
+    *,
+    n_workers: int,
+    source_was_gcsfuse: bool,
+    log_label: str | None = None,
+) -> int:
+    """Parallel copy of ``source`` into ``destination`` via N independent fds.
+
+    Each worker owns a contiguous byte range and ``os.pread`` / ``os.pwrite``
+    its slice from the gcsfuse source into the local partial file. The dest
+    file is pre-allocated with ``os.ftruncate(size)`` so workers can write
+    their non-overlapping ranges concurrently without lseek collisions.
+
+    Returns total bytes written. Performs ``fsync(dest)`` + ``os.replace`` +
+    ``fsync(parent_dir)`` for atomic publish.
+    """
+    import threading as _threading
+    import time as _time
+    from concurrent.futures import ThreadPoolExecutor
+
+    destination.parent.mkdir(parents=True, exist_ok=True)
+
+    src_size = source.stat().st_size
+    if src_size == 0:
+        # Edge case: empty source. Just touch the destination.
+        partial = _unique_partial_path(destination)
+        open(partial, "wb").close()
+        os.replace(str(partial), str(destination))
+        _fsync_dir(destination.parent)
+        return 0
+
+    partial = _unique_partial_path(destination)
+    label = log_label or source.name
+    total_gb = src_size / 1e9
+
+    _LOG.info(
+        "gcsfuse staging: %s -> %s (%.2f GB, %d parallel writers)",
+        source,
+        destination,
+        total_gb,
+        n_workers,
+    )
+
+    # Pre-size the destination so each worker pwrites into a fixed region.
+    dst_fd = os.open(
+        str(partial),
+        os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+        0o644,
+    )
+    try:
+        os.ftruncate(dst_fd, src_size)
+    except OSError:
+        os.close(dst_fd)
+        try:
+            partial.unlink()
+        except OSError:
+            pass
+        raise
+
+    chunk = (src_size + n_workers - 1) // n_workers
+    bytes_done = [0]
+    bytes_done_lock = _threading.Lock()
+    stop_event = _threading.Event()
+    t_start = _time.monotonic()
+    # 5 GB progress cadence per spec.
+    progress_step = 5 * 1024 * 1024 * 1024
+
+    def _emitter() -> None:
+        last_emitted_gb_bucket = 0
+        while not stop_event.wait(2.0):
+            with bytes_done_lock:
+                cur = bytes_done[0]
+            bucket = cur // progress_step
+            if bucket > last_emitted_gb_bucket and cur > 0:
+                elapsed = max(_time.monotonic() - t_start, 1e-6)
+                mb_per_sec = (cur / 1e6) / elapsed
+                remaining = max(src_size - cur, 0)
+                eta_min = (remaining / max(cur / elapsed, 1.0)) / 60.0
+                _LOG.info(
+                    "staging %s: %.1f/%.1f GB (%.0f MB/s, ETA %.1f min) "
+                    "[parallel x%d]",
+                    label,
+                    cur / 1e9,
+                    total_gb,
+                    mb_per_sec,
+                    eta_min,
+                    n_workers,
+                )
+                last_emitted_gb_bucket = bucket
+
+    src_fds: list[int] = []
+    emitter_thread = _threading.Thread(
+        target=_emitter, name="gcsfuse-stage-progress", daemon=True
+    )
+    bytes_copied_total = 0
+    try:
+        for _ in range(n_workers):
+            sfd = os.open(str(source), os.O_RDONLY | getattr(os, "O_CLOEXEC", 0))
+            _posix_fadvise_sequential(sfd, src_size)
+            src_fds.append(sfd)
+
+        def _worker(worker_idx: int) -> int:
+            start = worker_idx * chunk
+            stop = min(src_size, start + chunk)
+            if start >= stop:
+                return 0
+            sfd = src_fds[worker_idx]
+            sub = 64 * 1024 * 1024  # 64 MB sub-reads
+            cursor = start
+            worker_total = 0
+            while cursor < stop:
+                want = min(sub, stop - cursor)
+                buf = os.pread(sfd, want, cursor)
+                got = len(buf)
+                if got == 0:
+                    raise RuntimeError(
+                        f"pread returned 0 bytes at offset {cursor} "
+                        f"(worker={worker_idx}); source truncated?"
+                    )
+                # pwrite is thread-safe at the OS level on Linux; each worker
+                # writes a disjoint byte range, so there is no contention.
+                written = 0
+                while written < got:
+                    n = os.pwrite(dst_fd, buf[written:], cursor + written)
+                    if n <= 0:
+                        raise RuntimeError(
+                            f"pwrite returned {n} bytes at offset {cursor + written} "
+                            f"(worker={worker_idx})"
+                        )
+                    written += n
+                cursor += got
+                worker_total += got
+                with bytes_done_lock:
+                    bytes_done[0] += got
+            return worker_total
+
+        emitter_thread.start()
+        with ThreadPoolExecutor(max_workers=n_workers) as pool:
+            futures = [pool.submit(_worker, i) for i in range(n_workers)]
+            for f in futures:
+                bytes_copied_total += f.result()
+
+        try:
+            os.fsync(dst_fd)
+        except OSError:
+            pass
+    finally:
+        stop_event.set()
+        if emitter_thread.is_alive():
+            try:
+                emitter_thread.join(timeout=2.0)
+            except RuntimeError:
+                pass
+        try:
+            os.close(dst_fd)
+        except OSError:
+            pass
+        for sfd in src_fds:
+            try:
+                os.close(sfd)
+            except OSError:
+                pass
+
+    if bytes_copied_total != src_size:
+        # Clean up partial then raise.
+        try:
+            partial.unlink()
+        except OSError:
+            pass
+        raise RuntimeError(
+            f"stage_to_local_parallel: short copy "
+            f"({bytes_copied_total} != {src_size}) for {source}"
+        )
+
+    # Preserve mtime so legacy idempotency checks still work.
+    try:
+        pre_stat = source.stat()
+        os.utime(partial, ns=(pre_stat.st_atime_ns, pre_stat.st_mtime_ns))
+    except OSError:
+        pass
+
+    try:
+        os.replace(str(partial), str(destination))
+        _fsync_dir(destination.parent)
+    except Exception:
+        try:
+            partial.unlink()
+        except OSError:
+            pass
+        raise
+
+    elapsed = max(_time.monotonic() - t_start, 1e-6)
+    mb_per_sec = (src_size / 1e6) / elapsed
+    _LOG.info(
+        "gcsfuse staging: finished %s in %.1fs (%.0f MB/s) [parallel x%d]",
+        destination.name,
+        elapsed,
+        mb_per_sec,
+        n_workers,
+    )
+    return bytes_copied_total
+
+
+def stage_to_local_parallel(
+    source: Path,
+    local_path: Path,
+    *,
+    n_workers: int | None = None,
+    force: bool = False,
+    expected_size: int | None = None,
+    log_label: str | None = None,
+) -> Path:
+    """Stage ``source`` to ``local_path`` using N parallel pread/pwrite workers.
+
+    Like :func:`stage_to_local` but uses a multi-worker copy primitive that
+    issues independent ``os.pread`` calls on per-worker file descriptors. On
+    gcsfuse this saturates the aggregate per-connection bandwidth (typically
+    ~1 GB/s with 8 workers vs ~150 MB/s single-stream).
+
+    Behaviour matches :func:`stage_to_local`:
+      * Symlinks are resolved (we stat/read the underlying gcsfuse target).
+      * Cache hit (via manifest) returns early; otherwise the file is copied
+        into ``<local>.partial.<pid>.<uuid4>`` and atomically renamed after
+        ``fsync``.
+      * If ``source`` is not gcsfuse-backed and ``force`` is False, returns
+        ``source`` unchanged (no copy).
+
+    Progress is logged at ~5 GB granularity with MB/s + ETA.
+
+    Returns the path the caller should read from.
+    """
+    source = Path(source)
+    local_path = Path(local_path)
+
+    if not source.exists():
+        raise FileNotFoundError(
+            f"stage_to_local_parallel: source does not exist: {source}"
+        )
+
+    # Resolve the symlink: AoU runners often symlink local placeholders INTO
+    # the gcsfuse mount, so the link target is what we need to read from and
+    # what gcsfuse detection must inspect.
+    resolved_source = _resolve_safely(source)
+    source_was_gcsfuse = is_gcsfuse_path(resolved_source)
+    if not force and not source_was_gcsfuse:
+        return source
+
+    if n_workers is None:
+        n_workers = _default_parallel_workers()
+    n_workers = max(1, int(n_workers))
+
+    local_path.parent.mkdir(parents=True, exist_ok=True)
+
+    with _DestinationLock(local_path):
+        if not force and verify_local_cache(
+            local_path, expected_size=expected_size
+        ):
+            return local_path
+
+        if not force and _legacy_already_staged(resolved_source, local_path):
+            src_stat = resolved_source.stat()
+            _write_manifest(
+                local_path=local_path,
+                source_path=resolved_source,
+                source_size_bytes=src_stat.st_size,
+                source_mtime_ns=src_stat.st_mtime_ns,
+                source_was_gcsfuse=source_was_gcsfuse,
+                local_size_bytes=local_path.stat().st_size,
+                crc32c=None,
+                md5=None,
+            )
+            return local_path
+
+        # Drop stale manifest so a crashed prior attempt cannot be mistaken
+        # for a cache hit.
+        manifest_path = manifest_path_for(local_path)
+        try:
+            manifest_path.unlink()
+        except FileNotFoundError:
+            pass
+        except OSError:
+            pass
+
+        local_size = _copy_and_publish_parallel(
+            resolved_source,
+            local_path,
+            n_workers=n_workers,
+            source_was_gcsfuse=source_was_gcsfuse,
+            log_label=log_label,
+        )
+        src_stat = resolved_source.stat()
+        _write_manifest(
+            local_path=local_path,
+            source_path=resolved_source,
+            source_size_bytes=src_stat.st_size,
+            source_mtime_ns=src_stat.st_mtime_ns,
+            source_was_gcsfuse=source_was_gcsfuse,
+            local_size_bytes=local_size,
+            crc32c=None,
+            md5=None,
+        )
     return local_path
 
 
