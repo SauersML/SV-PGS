@@ -21,7 +21,7 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = ["pytest>=7.4"]
-gpu = ["jax[cuda12]>=0.4.20,<0.5", "cupy-cuda12x>=13.0"]
+gpu = ["jax[cuda12]>=0.4.20,<0.5", "cupy-cuda12x>=13.0", "nvidia-cuda-nvrtc-cu12"]
 
 [project.scripts]
 sv-pgs = "sv_pgs.cli:main"
@@ -67,4 +67,5 @@ ignore_missing_imports = true
 dev = [
     "mypy>=1.20.0",
     "vulture>=2.16",
+    "pytest>=8",
 ]
