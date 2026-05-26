@@ -38,6 +38,7 @@ def _write_synthetic_cohort(
 ) -> tuple[Path, Path, Path]:
     from sv_pgs.plink import to_bed
 
+    work_dir.mkdir(parents=True, exist_ok=True)
     rng = np.random.default_rng(seed)
     afs = rng.uniform(0.05, 0.45, size=n_variants).astype(np.float32)
     dosage = np.empty((n_samples, n_variants), dtype=np.float32)
