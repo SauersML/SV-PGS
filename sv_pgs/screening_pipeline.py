@@ -181,8 +181,13 @@ def _screen_one_path(
 ) -> dict[str, Any]:
     """Stream one BED file through the GPU screening kernel.
 
-    Returns a dict of cupy arrays (count, sum, sumsq, y_dot) of length
-    ``n_variants``. The caller concatenates across paths.
+    Returns a dict of cupy arrays (count, sum, sumsq, dosage_rhs,
+    observed_rhs) of length ``n_variants`` (with a trailing k-axis when
+    ``y_resid_dev`` is 2-D). The caller concatenates across paths.
+
+    Standardized inner product reconstruction (per-variant, per-rhs-column):
+
+        Z_v . rhs[:, j] = (dosage_rhs[v, j] - mean[v] * observed_rhs[v, j]) / scale[v]
     """
     import cupy as cp  # lazy
 
@@ -216,12 +221,31 @@ def _screen_one_path(
     # use the host buffers are unused — we still allocate small ones to
     # keep the control flow uniform.
     chunks = list(_iter_chunks(bed_path, n_samples, n_variants, chunk_bytes))
+    # rhs shape bookkeeping: kernel supports 1D (k=1) and 2D (k>1).
+    if y_resid_dev is not None:
+        rhs_shape_tail: tuple[int, ...] = (
+            () if y_resid_dev.ndim == 1 else (int(y_resid_dev.shape[1]),)
+        )
+    else:
+        rhs_shape_tail = ()
+
     if not chunks:
+        empty_drhs = (
+            cp.zeros((0,) + rhs_shape_tail, dtype=cp.float64)
+            if y_resid_dev is not None
+            else None
+        )
+        empty_orhs = (
+            cp.zeros((0,) + rhs_shape_tail, dtype=cp.float64)
+            if y_resid_dev is not None
+            else None
+        )
         return {
             "count": cp.zeros(0, dtype=cp.int32),
             "sum": cp.zeros(0, dtype=cp.float64),
             "sumsq": cp.zeros(0, dtype=cp.float64),
-            "y_dot": cp.zeros(0, dtype=cp.float64) if y_resid_dev is not None else None,
+            "dosage_rhs": empty_drhs,
+            "observed_rhs": empty_orhs,
         }
 
     max_rows = max(stop - start for start, stop in chunks)
@@ -244,7 +268,12 @@ def _screen_one_path(
     out_count = cp.zeros(n_variants, dtype=cp.int32)
     out_sum = cp.zeros(n_variants, dtype=cp.float64)
     out_sumsq = cp.zeros(n_variants, dtype=cp.float64)
-    out_y_dot = cp.zeros(n_variants, dtype=cp.float64) if y_resid_dev is not None else None
+    if y_resid_dev is not None:
+        out_dosage_rhs = cp.zeros((n_variants,) + rhs_shape_tail, dtype=cp.float64)
+        out_observed_rhs = cp.zeros((n_variants,) + rhs_shape_tail, dtype=cp.float64)
+    else:
+        out_dosage_rhs = None
+        out_observed_rhs = None
 
     # Two streams: copy (NVMe -> device) and compute (kernel).
     copy_stream = cp.cuda.Stream(non_blocking=True)
@@ -365,8 +394,13 @@ def _screen_one_path(
                 out_count[v_start:v_stop],
                 out_sum[v_start:v_stop],
                 out_sumsq[v_start:v_stop],
-                y_resid=y_resid_dev,
-                out_y_dot=(None if out_y_dot is None else out_y_dot[v_start:v_stop]),
+                rhs=y_resid_dev,
+                out_dosage_rhs=(
+                    None if out_dosage_rhs is None else out_dosage_rhs[v_start:v_stop]
+                ),
+                out_observed_rhs=(
+                    None if out_observed_rhs is None else out_observed_rhs[v_start:v_stop]
+                ),
                 count_a1=count_a1,
                 stream=compute_stream,
             )
@@ -388,7 +422,8 @@ def _screen_one_path(
         "count": out_count,
         "sum": out_sum,
         "sumsq": out_sumsq,
-        "y_dot": out_y_dot,
+        "dosage_rhs": out_dosage_rhs,
+        "observed_rhs": out_observed_rhs,
     }
 
 
@@ -432,9 +467,14 @@ def run_screening_pass(
         sample subset). If given, every chunk is decoded -> gathered ->
         re-encoded on the CPU before upload.
     y_resid
-        Optional length-``n_samples_out`` float vector. If given, the
-        screening kernel additionally computes ``G_v . y_resid`` per
+        Optional length-``n_samples_out`` float vector (1-D) or
+        ``(n_samples_out, k)`` matrix (2-D). If given, the screening
+        kernel additionally computes the missingness-aware partials
+        ``dosage_rhs[v, j] = sum_{i in obs} d_iv * y_resid[i, j]`` and
+        ``observed_rhs[v, j] = sum_{i in obs} y_resid[i, j]`` per
         variant. Uploaded to the device once and reused across shards.
+        The standardized inner product is reconstructed via
+        :func:`finalize_standardized_rhs`.
     count_a1
         PLINK count-A1 convention (default True, matches sv_pgs).
     stream
@@ -447,7 +487,14 @@ def run_screening_pass(
         ``count`` int32 (total_variants,)
         ``sum``   float64 (total_variants,)
         ``sumsq`` float64 (total_variants,)
-        ``y_dot`` float64 (total_variants,) or None
+        ``dosage_rhs``   float64 (total_variants, [k]) or None
+        ``observed_rhs`` float64 (total_variants, [k]) or None
+
+    To obtain the standardized inner product ``Z_v . y``, combine via::
+
+        Z_v . y = (dosage_rhs - mean * observed_rhs) / scale
+
+    See :func:`finalize_standardized_rhs`.
     """
     if len(bed_paths) != len(n_samples_per_path) or len(bed_paths) != len(
         n_variants_per_path
@@ -458,9 +505,15 @@ def run_screening_pass(
 
     import cupy as cp  # lazy
 
-    # Stage y_resid on the device once.
+    # Stage y_resid on the device once. Accept both 1-D (k=1) and 2-D
+    # (k>=1) inputs; the screening kernel handles both layouts.
     if y_resid is not None:
-        y_resid_dev = cp.asarray(np.asarray(y_resid, dtype=np.float64))
+        y_resid_np = np.ascontiguousarray(np.asarray(y_resid, dtype=np.float64))
+        if y_resid_np.ndim not in (1, 2):
+            raise ValueError(
+                f"y_resid must be 1-D or 2-D, got shape {y_resid_np.shape}"
+            )
+        y_resid_dev = cp.asarray(y_resid_np)
     else:
         y_resid_dev = None
 
@@ -487,7 +540,7 @@ def run_screening_pass(
 
     if y_resid_dev is not None and int(y_resid_dev.shape[0]) != n_samples_out:
         raise ValueError(
-            f"y_resid length {int(y_resid_dev.shape[0])} != effective n_samples "
+            f"y_resid leading dim {int(y_resid_dev.shape[0])} != effective n_samples "
             f"{n_samples_out}"
         )
 
@@ -511,14 +564,58 @@ def run_screening_pass(
     s = cp.concatenate([r["sum"] for r in per_path_results])
     ssq = cp.concatenate([r["sumsq"] for r in per_path_results])
     if y_resid_dev is not None:
-        ydot = cp.concatenate([r["y_dot"] for r in per_path_results])
-        ydot_host: Any = cp.asnumpy(ydot)
+        drhs = cp.concatenate([r["dosage_rhs"] for r in per_path_results], axis=0)
+        orhs = cp.concatenate([r["observed_rhs"] for r in per_path_results], axis=0)
+        drhs_host: Any = cp.asnumpy(drhs)
+        orhs_host: Any = cp.asnumpy(orhs)
     else:
-        ydot_host = None
+        drhs_host = None
+        orhs_host = None
 
     return {
         "count": cp.asnumpy(count),
         "sum": cp.asnumpy(s),
         "sumsq": cp.asnumpy(ssq),
-        "y_dot": ydot_host,
+        "dosage_rhs": drhs_host,
+        "observed_rhs": orhs_host,
     }
+
+
+def finalize_standardized_rhs(
+    dosage_rhs: np.ndarray,
+    observed_rhs: np.ndarray,
+    mean: np.ndarray,
+    scale: np.ndarray,
+) -> np.ndarray:
+    """Combine the screening partials into the standardized inner product.
+
+    Given per-variant accumulators ``dosage_rhs`` and ``observed_rhs``
+    returned by :func:`run_screening_pass` (or
+    :func:`sv_pgs.bitpacked.screening.screen`), plus the per-variant
+    ``mean`` and ``scale``, return::
+
+        Z_v . y = (dosage_rhs - mean * observed_rhs) / scale
+
+    Broadcasts over any trailing rhs-column axis (k).
+
+    Parameters
+    ----------
+    dosage_rhs, observed_rhs
+        Shape ``(n_variants,)`` or ``(n_variants, k)``, float64.
+    mean, scale
+        Shape ``(n_variants,)``, float. ``scale[v] == 0`` columns are
+        passed through as 0 (the screening kernel / preprocessing pipeline
+        imputes such variants to mean 0 / scale 1 upstream, so this is
+        only a defensive safety net).
+    """
+    mean_arr = np.asarray(mean, dtype=np.float64)
+    scale_arr = np.asarray(scale, dtype=np.float64)
+    drhs = np.asarray(dosage_rhs, dtype=np.float64)
+    orhs = np.asarray(observed_rhs, dtype=np.float64)
+    if drhs.ndim == 2:
+        numer = drhs - mean_arr[:, None] * orhs
+        safe_scale = np.where(scale_arr == 0.0, 1.0, scale_arr)[:, None]
+    else:
+        numer = drhs - mean_arr * orhs
+        safe_scale = np.where(scale_arr == 0.0, 1.0, scale_arr)
+    return numer / safe_scale

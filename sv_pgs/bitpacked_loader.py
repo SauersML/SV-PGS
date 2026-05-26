@@ -13,11 +13,15 @@ Implements ``load_bed_to_bitpacked_device`` per ``BITPACKED_SPEC.md``:
 
 from __future__ import annotations
 
+import logging
+import os
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 import numpy as np
 
+from sv_pgs.gcsfuse_staging import is_gcsfuse_path
+from sv_pgs.path_policy import assert_safe_for_purpose
 from sv_pgs.plink import (
     _BYTE_DECODE_LUT_A1,
     _BYTE_DECODE_LUT_A2,
@@ -26,12 +30,45 @@ from sv_pgs.plink import (
     open_bed,
 )
 
+_LOG = logging.getLogger(__name__)
+
 if TYPE_CHECKING:  # pragma: no cover - typing only
     from sv_pgs.bitpacked_matrix import BitpackedDeviceMatrix
 
 # Stream all-variant reads in chunks no larger than this many bytes to bound
 # host-side peak RSS when the BED is very large.
 _FULL_READ_CHUNK_BYTES: int = 256 * 1024 * 1024
+
+# Minimum chunk size when streaming from gcsfuse — large requests are essential
+# to saturate network bandwidth (~200 MB/s sustained). The default 256 MB cap
+# already exceeds this floor, but the floor protects against the small
+# ``bytes_per_variant`` chunked-variant integer-division path.
+_GCSFUSE_MIN_CHUNK_BYTES: int = 16 * 1024 * 1024
+
+
+def _fadvise_sequential(fd: int) -> None:
+    """Hint POSIX_FADV_SEQUENTIAL on ``fd``. Best-effort; Linux-only."""
+    fadvise = getattr(os, "posix_fadvise", None)
+    advice = getattr(os, "POSIX_FADV_SEQUENTIAL", None)
+    if fadvise is None or advice is None:
+        return
+    try:
+        fadvise(fd, 0, 0, advice)
+    except OSError:
+        pass
+
+
+def _fadvise_dontneed(fd: int) -> None:
+    """Hint POSIX_FADV_DONTNEED on ``fd`` so the page cache can be reclaimed
+    after a one-shot read (we already hold the data in HBM)."""
+    fadvise = getattr(os, "posix_fadvise", None)
+    advice = getattr(os, "POSIX_FADV_DONTNEED", None)
+    if fadvise is None or advice is None:
+        return
+    try:
+        fadvise(fd, 0, 0, advice)
+    except OSError:
+        pass
 
 
 def _require_cupy() -> Any:
@@ -91,14 +128,17 @@ def _read_all_packed(
     n_variants: int,
     bytes_per_variant: int,
     pinned_view: np.ndarray,
+    *,
+    chunk_bytes: int = _FULL_READ_CHUNK_BYTES,
 ) -> None:
-    """Stream all variants from the BED into ``pinned_view`` in 256 MB chunks."""
+    """Stream all variants from the BED into ``pinned_view`` in ``chunk_bytes``
+    chunks (default 256 MB)."""
     from sv_pgs.plink import PLINK1_HEADER_SIZE
 
     total_bytes = n_variants * bytes_per_variant
     if total_bytes == 0:
         return
-    chunk_variants = max(1, _FULL_READ_CHUNK_BYTES // max(1, bytes_per_variant))
+    chunk_variants = max(1, chunk_bytes // max(1, bytes_per_variant))
     cursor = 0
     while cursor < n_variants:
         stop = min(n_variants, cursor + chunk_variants)
@@ -270,6 +310,26 @@ def load_bed_to_bitpacked_device(
     if n_samples < 1 or n_variants < 1:
         raise ValueError("n_samples and n_variants must be positive.")
 
+    # The cold load is a single sequential sweep of the BED — accept a
+    # gcsfuse-backed source here (forcing a 194 GB local copy first is worse
+    # than streaming once at ~200 MB/s). assert_safe_for_purpose still rejects
+    # gs:// URIs, missing paths and NFS/SSHFS mounts.
+    assert_safe_for_purpose(
+        bed_path,
+        purpose="bitpacked_loader.load_bed_to_bitpacked_device",
+        allow_sequential_gcsfuse=True,
+    )
+    try:
+        source_on_gcsfuse = is_gcsfuse_path(bed_path)
+    except Exception:
+        source_on_gcsfuse = False
+    if source_on_gcsfuse:
+        _LOG.info(
+            "load_bed_to_bitpacked_device: streaming directly from gcsfuse "
+            "(sequential read, no local copy): %s",
+            bed_path,
+        )
+
     src_bpv = _bytes_per_variant(n_samples)
 
     # 1. Read packed bytes (all variants or coalesced gather).
@@ -281,25 +341,54 @@ def load_bed_to_bitpacked_device(
             sid_count=n_variants,
             count_A1=count_a1,
         )
+        # For the one-shot cold load we want SEQUENTIAL read-ahead, which
+        # overrides the RANDOM hint open_bed installs by default. On gcsfuse
+        # this is what lets the kernel issue large prefetches; on local NVMe
+        # it's a no-op-ish best-effort hint.
+        if reader._bed_fd is not None:
+            _fadvise_sequential(reader._bed_fd)
+        # On gcsfuse, force the read chunk above _GCSFUSE_MIN_CHUNK_BYTES so
+        # each HTTP GET to GCS is a fat request rather than a stream of small
+        # ones. (Default 256 MB already exceeds the 16 MB floor.)
+        chunk_bytes = (
+            max(_FULL_READ_CHUNK_BYTES, _GCSFUSE_MIN_CHUNK_BYTES)
+            if source_on_gcsfuse
+            else _FULL_READ_CHUNK_BYTES
+        )
         try:
             raw_total_bytes = gathered_n_variants * src_bpv
             # Read directly into pinned memory when no sample rebitpack is needed
             # to avoid an intermediate copy.
             if sample_indices is None:
                 pinned_mem, pinned_view = _allocate_pinned(cp, raw_total_bytes)
-                _read_all_packed(reader, gathered_n_variants, src_bpv, pinned_view)
+                _read_all_packed(
+                    reader,
+                    gathered_n_variants,
+                    src_bpv,
+                    pinned_view,
+                    chunk_bytes=chunk_bytes,
+                )
                 packed_for_upload = pinned_view
                 final_bpv = src_bpv
             else:
                 # Read into a plain numpy buffer; rebitpack will produce the
                 # final layout sized for the chosen samples.
                 raw = np.empty((raw_total_bytes,), dtype=np.uint8)
-                _read_all_packed(reader, gathered_n_variants, src_bpv, raw)
+                _read_all_packed(
+                    reader,
+                    gathered_n_variants,
+                    src_bpv,
+                    raw,
+                    chunk_bytes=chunk_bytes,
+                )
                 packed_for_upload = raw  # placeholder, replaced below
                 final_bpv = src_bpv
         finally:
             # open_bed currently has no explicit close; the fd is process-lived.
-            pass
+            # Hint POSIX_FADV_DONTNEED so the kernel can drop the BED pages from
+            # the page cache — we hold the bytes in HBM and won't re-read them.
+            if source_on_gcsfuse and reader._bed_fd is not None:
+                _fadvise_dontneed(reader._bed_fd)
     else:
         var_idx = np.ascontiguousarray(np.asarray(variant_indices, dtype=np.int64))
         if var_idx.ndim != 1:
@@ -313,6 +402,10 @@ def load_bed_to_bitpacked_device(
             sid_count=n_variants,
             count_A1=count_a1,
         )
+        # Indexed gather is still mostly-sequential thanks to the coalescer,
+        # and a one-shot cold load benefits from SEQUENTIAL read-ahead.
+        if reader._bed_fd is not None:
+            _fadvise_sequential(reader._bed_fd)
         payload = reader._pread_indexed_variant_payload(
             var_idx,
             bytes_per_variant=src_bpv,
@@ -326,6 +419,8 @@ def load_bed_to_bitpacked_device(
         else:
             packed_for_upload = payload
             final_bpv = src_bpv  # placeholder, replaced after rebitpack
+        if source_on_gcsfuse and reader._bed_fd is not None:
+            _fadvise_dontneed(reader._bed_fd)
 
     # 2. Optional CPU rebitpack onto the requested sample subset.
     if sample_indices is not None:

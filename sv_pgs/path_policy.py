@@ -25,6 +25,7 @@ __all__ = [
     "StorageClass",
     "classify_path",
     "assert_hot_local_path",
+    "assert_safe_for_purpose",
     "is_local_hot",
 ]
 
@@ -183,3 +184,35 @@ def assert_hot_local_path(path: str | Path, *, purpose: str) -> None:
         f"path={os.fspath(path)!r} classified as {cls.value}. "
         f"Remediation: {hint}."
     )
+
+
+def assert_safe_for_purpose(
+    path: str | Path,
+    *,
+    purpose: str,
+    allow_sequential_gcsfuse: bool = False,
+) -> None:
+    """Like :func:`assert_hot_local_path` but with an opt-in escape hatch for
+    one-shot sequential reads from a gcsfuse-backed path.
+
+    gcsfuse handles purely sequential reads acceptably (~200 MB/s with a large
+    chunked-read buffer); what destroys throughput is repeated random access
+    and mmap, where every page fault becomes an HTTP GET.
+
+    When ``allow_sequential_gcsfuse=True`` the function returns silently for a
+    gcsfuse-backed path. The caller is asserting it will read the file once,
+    sequentially, ideally with ``posix_fadvise(SEQUENTIAL)`` and a large
+    buffer. All other non-local classifications (gs:// URIs, nonexistent
+    paths, NFS/SSHFS/CIFS network mounts) are still rejected.
+
+    When ``allow_sequential_gcsfuse=False`` this is exactly equivalent to
+    :func:`assert_hot_local_path`.
+    """
+    cls = classify_path(path)
+    if cls is StorageClass.LOCAL_HOT:
+        return
+    if allow_sequential_gcsfuse and cls is StorageClass.GCSFUSE_MOUNT:
+        return
+    # Defer to the strict guard so callers get the same error/remediation text
+    # for every other case.
+    assert_hot_local_path(path, purpose=purpose)

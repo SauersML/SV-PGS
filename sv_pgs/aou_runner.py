@@ -24,7 +24,7 @@ from sv_pgs.all_of_us import (
 )
 from sv_pgs.gcsfuse_staging import is_gcsfuse_path
 from sv_pgs.aou_storage import stage_gcs_object, verify_local_cache
-from sv_pgs.path_policy import assert_hot_local_path
+from sv_pgs.path_policy import assert_hot_local_path, assert_safe_for_purpose
 from sv_pgs.preflight import (
     assert_preflight_ok,
     check_aou_preflight,
@@ -343,31 +343,19 @@ def _link_mounted_array_plink(work_dir: Path) -> bool:
                     candidate.unlink()
             except OSError:
                 candidate.unlink(missing_ok=True)
+    # Symlink the trio from the cache dir into the gcsfuse-mounted source.
+    # The .bed will be read ONCE, sequentially, by the bitpacked_loader (which
+    # accepts a gcsfuse path via assert_safe_for_purpose(..., allow_sequential
+    # _gcsfuse=True) and uses POSIX_FADV_SEQUENTIAL + large chunked reads).
+    # Forcing a ~194 GB hard copy here costs 90+ minutes at ~36 MB/s, which is
+    # strictly worse than streaming once at ~200 MB/s straight into HBM.
+    # The .bim/.fam siblings are tiny but get re-read by downstream code; that
+    # is still fine over gcsfuse because they are small and cached.
     if is_gcsfuse_path(bed_source):
-        # Hard COPY all three trio files to local NVMe — never symlink into
-        # the gcsfuse workspace because random-access BED reads stall there.
-        required_bytes = sum(
-            (mounted_prefix.parent / f"{mounted_prefix.name}.{ext}").stat().st_size
-            for ext in ("bed", "bim", "fam")
-        )
-        _check_disk_space(cache_dir, required_bytes)
         log(
-            f"  microarray: copying PLINK trio from gcsfuse workspace to local "
-            f"cache ({required_bytes / 1e9:.1f} GB) — random reads on gcsfuse stall"
+            "  microarray: symlinking PLINK trio from gcsfuse workspace "
+            "(BED streams directly into HBM via the bitpacked loader)"
         )
-        # Manifest-emitting atomic stage (aou_storage) — supersedes the bare
-        # stage_bed_trio_to_local copy. One stage_gcs_object per trio file so
-        # each gets its own .manifest.json sibling + content_kind tag.
-        for ext, kind in (
-            ("bed", "aou_array_plink_bed"),
-            ("bim", "aou_array_plink_bim"),
-            ("fam", "aou_array_plink_fam"),
-        ):
-            src = mounted_prefix.parent / f"{mounted_prefix.name}.{ext}"
-            dst = cache_dir / f"{_AOU_ARRAY_PLINK_PREFIX}.{ext}"
-            stage_gcs_object(str(src), dst, content_kind=kind)
-        return True
-    # Local (non-gcsfuse) source: symlinks are free and correct.
     for extension in ("bim", "fam"):
         source = mounted_prefix.parent / f"{mounted_prefix.name}.{extension}"
         target = cache_dir / f"{_AOU_ARRAY_PLINK_PREFIX}.{extension}"
@@ -585,7 +573,11 @@ def download_array_plink(work_dir: Path) -> Path:
             for ext in ("bed", "bim", "fam")
         ):
             log("  microarray: linked PLINK trio from mounted workspace resource")
-            assert_hot_local_path(local_bed, purpose="aou_array_plink_bed_read")
+            assert_safe_for_purpose(
+                local_bed,
+                purpose="aou_array_plink_bed_read",
+                allow_sequential_gcsfuse=True,
+            )
             return local_bed
 
     missing_extensions = []
@@ -596,7 +588,11 @@ def download_array_plink(work_dir: Path) -> Path:
 
     if not missing_extensions:
         log("  microarray: PLINK trio already present in local cache")
-        assert_hot_local_path(local_bed, purpose="aou_array_plink_bed_read")
+        assert_safe_for_purpose(
+            local_bed,
+            purpose="aou_array_plink_bed_read",
+            allow_sequential_gcsfuse=True,
+        )
         return local_bed
 
     remote_dir = array_plink_dir()
@@ -615,7 +611,11 @@ def download_array_plink(work_dir: Path) -> Path:
     )
     for remote, local_path, _ in missing_downloads:
         _download_gcs_object_if_missing(remote, local_path)
-    assert_hot_local_path(local_bed, purpose="aou_array_plink_bed_read")
+    assert_safe_for_purpose(
+        local_bed,
+        purpose="aou_array_plink_bed_read",
+        allow_sequential_gcsfuse=True,
+    )
     return local_bed
 
 

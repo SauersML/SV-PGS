@@ -22,15 +22,17 @@ Anything that does not fit one of these three classes is a bug.
 
 ## 3. The gcsfuse rule
 
-Verbatim from the external review:
+Verbatim from the external review, refined for the bitpacked HBM architecture:
 
-> No production AoU run may perform repeated genotype-matrix reads from a gcsfuse-mounted path.
+> No production AoU run may perform **repeated random-access** genotype-matrix reads from a gcsfuse-mounted path.
 
 This is the load-bearing invariant. Everything else in this spec exists to enforce it.
 
+The earlier strict reading ("no genotype reads at all") forced a hard local copy of the ~194 GB AoU microarray PLINK trio (`arrays.bed`) before training. At the observed gcsfuse-to-NVMe rate of ~36 MB/s that copy took 90+ minutes, after which `bitpacked_loader.load_bed_to_bitpacked_device` still spent another ~15 minutes streaming the bytes off NVMe into HBM. The bitpacked HBM architecture is explicit about its access pattern: BED bytes are read exactly **once**, sequentially, then live in HBM for the lifetime of the run. That pattern is the one case gcsfuse handles acceptably (~200 MB/s sustained with `POSIX_FADV_SEQUENTIAL` and large chunked reads). Forcing a prior local copy is doubly wasteful and trips the disk-space guard on small AoU workspace disks. This is the AoU pragmatic compromise: streaming the cold BED once through gcsfuse beats copying it first.
+
 **Forbidden uses of gcsfuse:**
 
-- PLINK `.bed` opened directly off a gcsfuse mount for matvec / rmatvec / screening.
+- PLINK `.bed` opened off a gcsfuse mount for matvec / rmatvec / screening (the *training loop*; these are by definition repeated random access).
 - Repeated `tabix` queries against `.vcf.gz` on a gcsfuse mount.
 - `mmap` of any genotype file living on a gcsfuse mount.
 - Checkpoint working directory on a gcsfuse mount.
@@ -40,9 +42,10 @@ This is the load-bearing invariant. Everything else in this spec exists to enfor
 
 - Small sidecar reads: `.fam`, `.bim`, `.psam`, ancestry preds, small TSVs (under a few MB), read once, copied to a local Python object.
 - One-shot sequential copy via `sv_pgs.aou_storage.stage_gcs_object` (or the equivalent `gsutil cp` shellout in early bootstrap) to land an object in `LOCAL_HOT_CACHE`.
+- **One-shot sequential cold load of the microarray PLINK `.bed` into HBM via `bitpacked_loader.load_bed_to_bitpacked_device`**, with `POSIX_FADV_SEQUENTIAL` on the source fd, 256 MB chunked reads, and `POSIX_FADV_DONTNEED` on close. The path-policy guard for this exact call site is `sv_pgs.path_policy.assert_safe_for_purpose(..., allow_sequential_gcsfuse=True)`. No other call site may set that flag.
 - Manifest-aware existence checks where the manifest is itself a tiny sidecar.
 
-If in doubt: it is forbidden.
+If in doubt: it is forbidden. `assert_hot_local_path` remains the default guard for every reader that is not the cold bitpacked load.
 
 ## 4. Cache manifest contract
 
