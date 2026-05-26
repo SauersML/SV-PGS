@@ -2214,14 +2214,35 @@ class BayesianPGS:
             return np.zeros(genotypes.shape[0], dtype=np.float32), covariate_component
 
         raw_genotypes = as_raw_genotype_matrix(genotypes)
-        genotype_component = _raw_standardized_subset_matvec(
+        # Fast path: when the backing matrix is a device-resident
+        # ``BitpackedDeviceMatrix`` we run one GPU ``matvec`` over the
+        # nonzero-coefficient subset instead of streaming host int8 batches.
+        # ``BitpackedDeviceMatrix.subset`` would carry through the matrix's
+        # OWN per-variant mean/std (built at load time from the cohort that
+        # populated this matrix), which would silently re-standardize the
+        # test cohort against itself. The training-time mean/std must be used
+        # for scoring, so we override the subset matrix's side-buffers with
+        # ``fitted_state.nonzero_means``/``nonzero_scales`` before the matvec.
+        genotype_component = _bitpacked_scoring_fast_path(
             raw_genotypes=raw_genotypes,
             variant_indices=nonzero_indices,
             means=fitted_state.nonzero_means,
             scales=fitted_state.nonzero_scales,
             coefficients=nonzero_coefficients,
-            batch_size=auto_batch_size(raw_genotypes.shape[0]),
         )
+        if genotype_component is None:
+            log(
+                f"scoring: matrix={type(raw_genotypes).__name__} (legacy iter_column_batches; "
+                f"k={len(nonzero_indices)} active variants, n={raw_genotypes.shape[0]} samples)"
+            )
+            genotype_component = _raw_standardized_subset_matvec(
+                raw_genotypes=raw_genotypes,
+                variant_indices=nonzero_indices,
+                means=fitted_state.nonzero_means,
+                scales=fitted_state.nonzero_scales,
+                coefficients=nonzero_coefficients,
+                batch_size=auto_batch_size(raw_genotypes.shape[0]),
+            )
         log(f"  decision_function done  mem={mem()}")
         return np.asarray(genotype_component, dtype=np.float32), covariate_component
 
@@ -2491,6 +2512,82 @@ def _fit_without_active_variants(
 # matrix — instead we read raw genotypes in batches, standardize each batch,
 # multiply by the corresponding coefficients, and accumulate the result.
 # This is the inner loop of prediction and is I/O-bound for PLINK files.
+def _bitpacked_scoring_fast_path(
+    raw_genotypes: RawGenotypeMatrix,
+    variant_indices: NDArray,
+    means: NDArray,
+    scales: NDArray,
+    coefficients: NDArray,
+) -> F32Array | None:
+    """Single-kernel ``matvec`` for ``BitpackedDeviceMatrix`` scoring.
+
+    Returns the genetic-score vector (n_samples,) float32 if the input is a
+    bitpacked device matrix, else ``None`` so the caller can fall back to
+    the legacy ``iter_column_batches`` path.
+
+    Equivalent kernel: ``out[i] = sum_j (G[i, variant_indices[j]] - means[j]) / scales[j] * coefficients[j]``.
+    The bitpacked path computes this as ``Z @ coefficients`` where ``Z`` is the
+    on-the-fly standardized subset; ``BitpackedDeviceMatrix.subset`` slices the
+    packed bytes (and would slice its OWN load-time mean/std), so we replace
+    the subset's mean/std with the supplied training-time values to ensure
+    the test cohort is standardized against the training cohort.
+    """
+    try:
+        from sv_pgs.bitpacked_matrix import BitpackedDeviceMatrix
+    except ImportError as exc:
+        log(
+            "scoring bitpacked fast path: SKIPPED "
+            f"(reason: BitpackedDeviceMatrix import failed: {exc})"
+        )
+        return None
+    if not isinstance(raw_genotypes, BitpackedDeviceMatrix):
+        return None
+    try:
+        import cupy as cp  # noqa: WPS433 - lazy by design
+    except ImportError as exc:
+        log(
+            "scoring bitpacked fast path: SKIPPED "
+            f"(reason: CuPy unavailable: {exc})"
+        )
+        return None
+
+    active_idx = np.asarray(variant_indices, dtype=np.int32).ravel()
+    k = int(active_idx.shape[0])
+    n_samples = int(raw_genotypes.shape[0])
+    if k == 0:
+        return np.zeros(n_samples, dtype=np.float32)
+
+    means_dev = cp.asarray(np.asarray(means, dtype=np.float32))
+    scales_dev = cp.asarray(np.asarray(scales, dtype=np.float32))
+    if means_dev.shape != (k,) or scales_dev.shape != (k,):
+        raise ValueError(
+            f"scoring bitpacked fast path: means/scales must align with variant_indices "
+            f"(k={k}); got means.shape={tuple(means_dev.shape)} "
+            f"scales.shape={tuple(scales_dev.shape)}"
+        )
+
+    subset = raw_genotypes.subset(active_idx)
+    # Override the subset's per-variant mean/std with the training-time values
+    # so the matvec standardizes the test cohort against the training mean/std
+    # (NOT against the test cohort's own statistics, which would be wrong).
+    subset._mean = means_dev
+    subset._std = scales_dev
+
+    coeffs_dev = cp.asarray(np.asarray(coefficients, dtype=np.float32))
+    if coeffs_dev.shape != (k,):
+        raise ValueError(
+            f"scoring bitpacked fast path: coefficients shape must be ({k},); "
+            f"got {tuple(coeffs_dev.shape)}"
+        )
+
+    log(
+        f"scoring: matrix=BitpackedDeviceMatrix (single GPU matvec; "
+        f"k={k} active variants, n_samples={n_samples})"
+    )
+    out_dev = subset.matvec(coeffs_dev)
+    return cp.asnumpy(out_dev).astype(np.float32, copy=False)
+
+
 def _raw_standardized_subset_matvec(
     raw_genotypes: RawGenotypeMatrix,
     variant_indices: NDArray,

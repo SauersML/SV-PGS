@@ -211,7 +211,14 @@ def _install_graceful_shutdown_handlers() -> None:
         signal.signal(signum, signal.SIG_DFL)
         raise KeyboardInterrupt(f"signal {signame}")
 
-    for sig_name in ("SIGTERM", "SIGHUP"):
+    # SIGTSTP is included because the AoU workbench Ctrl-Z's a backgrounded
+    # ``sv-pgs run`` and exits the parent shell, which delivers SIGTSTP (rc=148)
+    # to the Python child. Default SIGTSTP suspends the process and on parent
+    # exit it is reaped without unwinding atexit / finally / GPU teardown,
+    # leaving partial cache writes behind. Convert it to KeyboardInterrupt so
+    # the EM loop's per-iter checkpoint callback persists the in-flight state
+    # and the active-matrix cache publishes atomically before exit.
+    for sig_name in ("SIGTERM", "SIGHUP", "SIGTSTP"):
         sig = getattr(signal, sig_name, None)
         if sig is None:
             continue

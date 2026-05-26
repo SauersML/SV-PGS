@@ -106,6 +106,36 @@ cache by variant columns and runs CuPy matmul shards concurrently across the
 devices. With two comparable GPUs, genotype matmul-heavy phases should approach
 2x single-GPU throughput once the cache is resident.
 
+## Quickstart
+
+Once `uv sync --extra gpu` has finished, two short commands confirm that the
+GPU pipeline is wired end-to-end.
+
+```bash
+# 1) Smoke check: builds a tiny synthetic BED and exercises screening / matvec
+#    / rmatvec / gram_block against the CPU reference. Expects "BITPACKED
+#    PIPELINE OK" + exit 0. Takes <5s on V100/T4.
+uv run python -m sv_pgs.bitpacked.smoke
+
+# 2) Bench harness: detects the active GPU, prints HBM, runs gemv_nt /
+#    gemv_tn / gemm_gram / screen at three scales, emits a markdown table +
+#    optional JSON report. --quick runs two scales for sub-30s CI.
+uv run python -m sv_pgs.bitpacked.bench --output bench.json
+uv run python -m sv_pgs.bitpacked.bench --quick   # faster CI invocation
+```
+
+The bench output looks like::
+
+    === sv-pgs bitpacked benchmark on Tesla V100-SXM2-16GB sm_70 family=volta HBM=16.9 GB ===
+    HBM total: 16.9 GB, free at start: 16.6 GB
+
+    | Op        | n_samples | n_variants | bytes_GB | time_ms | GB/s   | TFLOPS |
+    |-----------|-----------|------------|----------|---------|--------|--------|
+    | gemv_nt   |     97000 |       4096 |    0.099 |    0.99 |  100.1 |      - |
+    | gemv_tn   |     97000 |       4096 |    0.099 |    0.75 |  132.4 |      - |
+    | gemm_gram |     97000 |       4096 |    0.099 |  344.25 |      - |   4.73 |
+    | screen    |     97000 |       4096 |    0.099 |    6.08 |   16.3 |      - |
+
 ## Data
 
 SV VCFs are sharded by chromosome under `${CDR_STORAGE_PATH}/wgs/short_read/structural_variants/vcf/full/`. Ancestry predictions with PCs are at `${CDR_STORAGE_PATH}/wgs/short_read/snpindel/aux/ancestry/ancestry_preds.tsv`. The `run-all-of-us` command handles all downloads automatically.
