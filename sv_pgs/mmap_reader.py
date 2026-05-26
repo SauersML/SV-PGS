@@ -208,14 +208,36 @@ class BedMmapReader:
             return np.empty((0, self._bpv), dtype=np.uint8)
         byte_offset = PLINK1_HEADER_SIZE + start_i * self._bpv
         byte_count = n * self._bpv
-        view = np.frombuffer(
-            mm,
-            dtype=np.uint8,
-            count=byte_count,
-            offset=byte_offset,
-        )
-        # Materialize into an owning buffer; see docstring.
-        return np.array(view, dtype=np.uint8, copy=True).reshape(n, self._bpv)
+        # Use os.pread against the cached fd rather than slicing the mmap.
+        # Under overlayfs (Docker overlay-on-overlay), mmap page faults are
+        # disproportionately expensive — each fault traverses overlay layers,
+        # capping sequential throughput at ~70 MB/s on local NVMe and bloating
+        # the page cache. Explicit pread saturates the underlying device and
+        # avoids the page-cache ballooning we see on AoU workspaces.
+        fd = self._fd
+        if fd is None:
+            raise RuntimeError("BedMmapReader is closed.")
+        # mm reference is retained above purely to honor _check_open() semantics
+        # (the mapping still backs read_all_packed). The bytes here are owned.
+        del mm
+        buf = bytearray(byte_count)
+        view_mv = memoryview(buf)
+        remaining = byte_count
+        offset = byte_offset
+        pos = 0
+        while remaining > 0:
+            chunk = os.pread(fd, remaining, offset)
+            if not chunk:
+                raise OSError(
+                    f"unexpected EOF reading BED payload at offset {offset} "
+                    f"(remaining={remaining}, byte_count={byte_count})"
+                )
+            n_read = len(chunk)
+            view_mv[pos : pos + n_read] = chunk
+            pos += n_read
+            offset += n_read
+            remaining -= n_read
+        return np.frombuffer(buf, dtype=np.uint8).reshape(n, self._bpv)
 
     def read_packed_indexed(self, indices: NDArray[np.integer]) -> NDArray[np.uint8]:
         """Gather variants by index.
