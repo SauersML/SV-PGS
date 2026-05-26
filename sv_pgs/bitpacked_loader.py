@@ -13,6 +13,7 @@ Implements ``load_bed_to_bitpacked_device`` per ``BITPACKED_SPEC.md``:
 
 from __future__ import annotations
 
+import concurrent.futures
 import hashlib
 import json
 import logging
@@ -144,6 +145,46 @@ def _parallel_workers() -> int:
     except Exception:  # noqa: BLE001
         cpu = 1
     return max(1, min(8, cpu))
+
+
+def _parallel_pread_chunk(
+    *,
+    bed_path: Path,
+    n_samples: int,
+    n_variants: int,
+    count_a1: bool,
+    chunk_idx: np.ndarray,
+    src_bpv: int,
+    dst_buf: np.ndarray,
+    dst_offset: int,
+) -> None:
+    """Worker: open own fd, indexed-coalesced gather one chunk into dst_buf.
+
+    Each worker opens its own ``open_bed`` so the underlying ``os.preadv`` does
+    not race on a shared file offset. The returned numpy gather payload is then
+    memcpy'd into the shared destination at ``dst_offset``. This is the right
+    primitive for the bitpacked cold-load indexed path: the coalescer in
+    ``_pread_indexed_variant_payload`` keeps each chunk read mostly sequential
+    while the per-worker fds let the kernel saturate the device.
+    """
+    chunk_reader = open_bed(
+        path=bed_path,
+        iid_count=n_samples,
+        sid_count=n_variants,
+        count_A1=count_a1,
+    )
+    try:
+        if chunk_reader._bed_fd is not None:
+            _fadvise_sequential(chunk_reader._bed_fd)
+        chunk_payload = chunk_reader._pread_indexed_variant_payload(
+            chunk_idx, bytes_per_variant=src_bpv,
+        )
+    finally:
+        # No explicit close on open_bed; the fd is process-lived. We just drop
+        # the reader reference here so the next loader-level fadvise on the
+        # parent reader is independent.
+        pass
+    dst_buf[dst_offset : dst_offset + chunk_payload.nbytes] = chunk_payload
 
 
 def _read_packed_parallel(
@@ -636,10 +677,56 @@ def load_bed_to_bitpacked_device(
         # and a one-shot cold load benefits from SEQUENTIAL read-ahead.
         if reader._bed_fd is not None:
             _fadvise_sequential(reader._bed_fd)
-        payload = reader._pread_indexed_variant_payload(
-            var_idx,
-            bytes_per_variant=src_bpv,
-        )
+        # Parallel indexed pread: split var_idx into N contiguous variant-order
+        # chunks, each worker opens its own fd and gathers its chunk via the
+        # coalesced indexed pread. Local NVMe under overlayfs sustains ~40 MB/s
+        # per-thread but ~5-8x that aggregate with parallel fds. Write each
+        # chunk into the pre-allocated payload buffer at its byte offset.
+        gather_workers = _parallel_workers()
+        gathered_bytes_total = int(var_idx.size) * src_bpv
+        payload = np.empty((gathered_bytes_total,), dtype=np.uint8)
+        if gather_workers <= 1 or int(var_idx.size) < 2048:
+            chunk_payload = reader._pread_indexed_variant_payload(
+                var_idx, bytes_per_variant=src_bpv,
+            )
+            payload[:] = chunk_payload
+            del chunk_payload
+        else:
+            chunk_size = (int(var_idx.size) + gather_workers - 1) // gather_workers
+            futures = []
+            with concurrent.futures.ThreadPoolExecutor(
+                max_workers=gather_workers
+            ) as pool:
+                for w in range(gather_workers):
+                    start = w * chunk_size
+                    if start >= int(var_idx.size):
+                        break
+                    stop = min(start + chunk_size, int(var_idx.size))
+                    chunk_idx = var_idx[start:stop]
+                    dst_offset = start * src_bpv
+                    futures.append(
+                        pool.submit(
+                            _parallel_pread_chunk,
+                            bed_path=bed_path,
+                            n_samples=n_samples,
+                            n_variants=n_variants,
+                            count_a1=count_a1,
+                            chunk_idx=chunk_idx,
+                            src_bpv=src_bpv,
+                            dst_buf=payload,
+                            dst_offset=dst_offset,
+                        )
+                    )
+                for fut in futures:
+                    fut.result()
+            try:
+                from sv_pgs.progress import log as _plog
+                _plog(
+                    f"BED stream: parallel indexed gather OK "
+                    f"workers={gather_workers} bytes={gathered_bytes_total / 1e9:.2f} GB"
+                )
+            except ImportError:  # pragma: no cover
+                pass
         if sample_indices is None:
             # Move the gather result into a pinned staging buffer.
             pinned_mem, pinned_view = _allocate_pinned(cp, payload.nbytes)
