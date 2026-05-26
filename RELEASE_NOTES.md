@@ -122,3 +122,34 @@ been superseded by the bitpacked stack. ~140 lines are GATED behind
 `_USE_INT8_NPY_CACHE=False` (default); ~2,400 lines of SHADOW code are
 still callable as the explicit int8 fallback. No code was deleted in
 iter 6 — the audit is the input to a future pruning pass.
+
+## Iters 7-N (consolidated follow-ups)
+
+- `sv-pgs version` — prints package version + git sha
+- `sv-pgs doctor` — env + GPU + CuPy/NVRTC + smoke status table,
+  greppable `[OK]/[WARN]/[FAIL]` prefixes, exit 1 only on FAIL
+- Per-iteration EM profile log: `iter K/N profile: matvec=X.Xs
+  rmatvec=Y.Ys gram=Z.Zs posterior=A.As loss=B.Bs total=C.Cs` plus
+  cumulative totals at end of fit
+- Parallel gcsfuse range reads: N-worker preadv with separate fds and
+  a single pinned host buffer, gated on `is_gcsfuse_path` + size > 1 GB
+- Edge case test sweep (7 tests): n_samples=3/32, n_variants=1,
+  all-missing, all-equal y, active set size 1, zero variants
+- SV joint loader e2e test: microarray BED + 2 chr SV BEDs through
+  `load_multi_source_dataset_from_files`, verifies sample
+  intersection + provenance + unified variant count
+- All tests landed: 566 passed, 17 skipped, 0 failures across the
+  bitpacked + integration test surface
+
+## Final state
+
+- 28 dedicated test files (~4500 lines test code)
+- 4 spec/doc files (~1037 lines)
+- Bitpacked GPU pipeline: 67 GPU tests passing on V100
+- Production hot path engaged: ENGAGED/SKIPPED banners at every layer
+- Cold-load: 15-min gcsfuse stream → 3-5s warm cache hit
+- Visibility: TIMING SUMMARY, per-iter EM profile, BED stream progress
+- Robustness: nvrtc env, preflight probes, smoke canary, memory
+  guardrail, atomic publish + manifests, SIGTSTP/SIGTERM checkpoint
+- Operability: `sv-pgs doctor`, `sv-pgs version`, `--dry-run`,
+  `run.sh --smoke`, `run.sh --validate`
