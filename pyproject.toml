@@ -34,6 +34,9 @@ sv_pgs = ["_data/*.tsv"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+markers = [
+    "slow: tests that take 30s+; can be deselected via -m 'not slow'",
+]
 
 [tool.mypy]
 python_version = "3.12"
