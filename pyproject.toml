@@ -17,6 +17,10 @@ dependencies = [
     "google-cloud-bigquery>=3.40.1",
     "pandas>=1.5",
     "matplotlib>=3.7",
+    # psutil powers the host-RAM gate that decides whether the bitpacked
+    # cold-load can fit before allocating; without it the gate silently
+    # fails open and a tight host RAM run risks OOM during cold-load.
+    "psutil>=5.9",
 ]
 
 [project.optional-dependencies]
