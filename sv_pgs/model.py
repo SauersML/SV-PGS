@@ -767,6 +767,92 @@ def _try_load_ld_block_partition_cache(
         return None
 
 
+def _compute_marginal_z_scores_bitpacked(
+    standardized_genotypes: StandardizedGenotypeMatrix,
+    active_variant_indices: NDArray,
+    covariate_matrix: NDArray,
+    target_vector: NDArray,
+) -> F32Array | None:
+    """Single-kernel marginal-z fast path for BitpackedDeviceMatrix backings.
+
+    When the underlying raw genotype matrix is a ``BitpackedDeviceMatrix``,
+    the per-variant numerator X_std^T @ y_resid can be produced in one GPU
+    ``rmatvec`` call instead of the host-chunked transpose_matmat decode.
+    Returns ``None`` if the raw matrix isn't a bitpacked device matrix, so
+    the caller can fall back to :func:`compute_marginal_z_scores`.
+
+    The denominator uses the ddof=0 standardization invariant ``||x_j||^2 == n``
+    (modulo floored-scale columns, where this is the conservative deflation
+    documented in :func:`compute_marginal_z_scores`). The covariate-projection
+    correction term is dropped on the fast path — it would require ``p_cov``
+    additional rmatvec calls and the residualization of ``y`` on covariates
+    is still done in float64 on the host, so the numerator is unbiased.
+    """
+    try:
+        from sv_pgs.bitpacked_matrix import BitpackedDeviceMatrix
+    except ImportError:
+        return None
+    raw_matrix = getattr(standardized_genotypes, "raw", None)
+    if not isinstance(raw_matrix, BitpackedDeviceMatrix):
+        return None
+    try:
+        import cupy as cp  # noqa: WPS433 - lazy by design
+    except ImportError:
+        return None
+
+    active_idx = np.asarray(active_variant_indices, dtype=np.int32).ravel()
+    m_active = int(active_idx.shape[0])
+    target_f64 = np.asarray(target_vector, dtype=np.float64).reshape(-1)
+    n = int(target_f64.shape[0])
+    if m_active == 0 or n == 0:
+        return np.zeros(m_active, dtype=np.float32)
+
+    covariate_f64 = np.asarray(covariate_matrix, dtype=np.float64)
+    if covariate_f64.ndim != 2 or covariate_f64.shape[0] != n:
+        raise ValueError(
+            f"covariate_matrix must have shape ({n}, _); got {covariate_f64.shape}"
+        )
+
+    # Residualize y on covariates (with augmented intercept) — mirrors the
+    # canonical path in :func:`compute_marginal_z_scores`.
+    if covariate_f64.shape[1] == 0:
+        y_resid = target_f64 - float(target_f64.mean())
+    else:
+        constant_column = np.ones((n, 1), dtype=np.float64)
+        has_constant = False
+        for k in range(covariate_f64.shape[1]):
+            col = covariate_f64[:, k]
+            if np.allclose(col, col[0], atol=1e-12) and abs(col[0]) > 1e-12:
+                has_constant = True
+                break
+        projection_cov = (
+            covariate_f64
+            if has_constant
+            else np.concatenate([constant_column, covariate_f64], axis=1)
+        )
+        alpha_cov, _, _, _ = np.linalg.lstsq(projection_cov, target_f64, rcond=None)
+        y_resid = target_f64 - projection_cov @ alpha_cov
+
+    sigma2_resid = float(np.dot(y_resid, y_resid) / max(n, 1))
+    if sigma2_resid <= 0.0:
+        return np.zeros(m_active, dtype=np.float32)
+
+    # Subset the bitpacked matrix to the active variants and run a single
+    # device-side rmatvec to get X_std^T @ y_resid in one kernel launch.
+    # ``BitpackedDeviceMatrix.subset`` carries through ``mean``/``std`` so the
+    # rmatvec output is exactly X_std^T @ y_resid over the active variants.
+    subset_matrix = raw_matrix.subset(active_idx)
+    y_dev = cp.asarray(y_resid, dtype=cp.float32)
+    sum_xy_dev = subset_matrix.rmatvec(y_dev)
+    sum_xy = cp.asnumpy(sum_xy_dev).astype(np.float64, copy=False)
+
+    xpx_diag = float(n)
+    denom = float(np.sqrt(sigma2_resid * xpx_diag))
+    if denom <= 0.0:
+        return np.zeros(m_active, dtype=np.float32)
+    return np.asarray(sum_xy / denom, dtype=np.float32)
+
+
 def _try_load_marginal_z_cache(
     cache_paths: _FitStageCachePaths,
     *,
@@ -1395,9 +1481,28 @@ class BayesianPGS:
                         f"{pre_screen_count} z-scores"
                     )
                 else:
-                    # Chunked computation + per-chunk persistence. A crash /
-                    # OOM mid-screen loses at most one chunk of work; rerun
-                    # picks up at the next incomplete chunk.
+                    # Bitpacked device-matrix fast path: one GPU rmatvec for
+                    # the numerator (the chunked CPU path is the fallback when
+                    # the raw matrix is int8/mmap).
+                    marginal_z_scores = _compute_marginal_z_scores_bitpacked(
+                        standardized_genotypes=standardized_genotypes,
+                        active_variant_indices=active_variant_indices,
+                        covariate_matrix=prepared_arrays.covariates,
+                        target_vector=prepared_arrays.targets,
+                    )
+                    if marginal_z_scores is not None:
+                        log(
+                            f"  marginal-z bitpacked fast path: one rmatvec over "
+                            f"{pre_screen_count} active variants"
+                        )
+                        if fit_stage_cache_paths is not None:
+                            _save_marginal_z_cache(
+                                fit_stage_cache_paths, marginal_z_scores
+                            )
+                # Chunked computation + per-chunk persistence. A crash /
+                # OOM mid-screen loses at most one chunk of work; rerun
+                # picks up at the next incomplete chunk.
+                if marginal_z_scores is None:
                     if fit_stage_cache_paths is None:
                         marginal_z_scores = compute_marginal_z_scores(
                             standardized_genotypes=standardized_genotypes,

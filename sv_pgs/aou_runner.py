@@ -22,6 +22,14 @@ from sv_pgs.all_of_us import (
     prepare_all_of_us_disease_sample_table,
     resolve_disease_definition,
 )
+from sv_pgs.gcsfuse_staging import is_gcsfuse_path
+from sv_pgs.aou_storage import stage_gcs_object, verify_local_cache
+from sv_pgs.path_policy import assert_hot_local_path
+from sv_pgs.preflight import (
+    assert_preflight_ok,
+    check_aou_preflight,
+    log_preflight,
+)
 from sv_pgs.config import ModelConfig, TraitType
 from sv_pgs.io import load_multi_source_dataset_from_files
 from sv_pgs.model import register_fit_checkpoint_path
@@ -43,6 +51,47 @@ _AOU_ARRAY_PLINK_CACHE_SUBDIR = "aou_array_plink"
 # AoU's microarray PLINK files are emitted with the literal prefix "arrays".
 # i.e. arrays.bed / arrays.bim / arrays.fam under .../microarray/plink/.
 _AOU_ARRAY_PLINK_PREFIX = "arrays"
+
+# Genotype backend for the downloaded SV cache: "bitpacked" emits a single
+# PLINK 1.9 BED trio via ``sv_pgs.sv_transcoder.transcode_sv_vcf_to_bed`` (the
+# format consumed by the bitpacked GPU pipeline — see BITPACKED_SPEC.md);
+# "int8" keeps the legacy host-side ``*.genotypes.npy`` + sidecar layout. The
+# default is bitpacked. Callers can override via ``AOU_GENOTYPE_BACKEND`` in
+# the environment without editing this module.
+_DEFAULT_GENOTYPE_BACKEND = "bitpacked"
+
+
+def aou_genotype_backend() -> str:
+    """Return the active SV-cache backend ("bitpacked" or "int8")."""
+    raw = os.environ.get("AOU_GENOTYPE_BACKEND", _DEFAULT_GENOTYPE_BACKEND)
+    value = (raw or _DEFAULT_GENOTYPE_BACKEND).strip().lower()
+    if value not in {"bitpacked", "int8"}:
+        raise RuntimeError(
+            f"AOU_GENOTYPE_BACKEND={raw!r} is invalid; expected 'bitpacked' or 'int8'."
+        )
+    return value
+
+
+def _warn_if_work_dir_on_gcsfuse(work_dir: Path) -> None:
+    """Surface a loud warning if the local cache dir resolves onto gcsfuse.
+
+    The cache under ``work_dir.parent/.sv_pgs_cache`` is supposed to be on
+    local NVMe — staging copies from the gcsfuse-mounted workspace into a
+    *gcsfuse* destination would defeat the entire point of the copy. We do
+    not silently relocate the cache (the user may have an intentional layout)
+    but a runtime warning makes the misconfiguration impossible to miss.
+    """
+    try:
+        if is_gcsfuse_path(work_dir):
+            from sv_pgs.progress import log as _log
+            _log(
+                f"  WARNING: cache work_dir {work_dir} appears to live on a "
+                "gcsfuse mount; staged BED/VCF reads will be network-bound. "
+                "Pass --cache-dir pointing at local NVMe to avoid this."
+            )
+    except Exception:
+        # Detection is best-effort; never block a run because of it.
+        pass
 
 # ---------------------------------------------------------------------------
 # AoU paths
@@ -281,39 +330,49 @@ def _link_mounted_array_plink(work_dir: Path) -> bool:
         return False
     cache_dir = local_array_plink_cache_dir(work_dir)
     cache_dir.mkdir(parents=True, exist_ok=True)
-    # Small sidecar files (.bim, .fam) are read once and benefit fine from
-    # gcsfuse's metadata cache, so symlink them. The .bed is read repeatedly
-    # in random-access batches by bed-reader; against a gcsfuse mount that
-    # pattern stalls (workers go to 0% CPU and never return). Copy it to
-    # local disk on first use so subsequent reads are fast and reliable.
+    _warn_if_work_dir_on_gcsfuse(cache_dir)
+    bed_source = mounted_prefix.parent / f"{mounted_prefix.name}.bed"
+    bed_target = cache_dir / f"{_AOU_ARRAY_PLINK_PREFIX}.bed"
+    # Replace any pre-existing symlink into the mount; gcsfuse-backed
+    # symlinks turn every random read into an HTTP GET against GCS.
+    for extension in ("bed", "bim", "fam"):
+        candidate = cache_dir / f"{_AOU_ARRAY_PLINK_PREFIX}.{extension}"
+        if candidate.is_symlink():
+            try:
+                if is_gcsfuse_path(candidate.resolve()):
+                    candidate.unlink()
+            except OSError:
+                candidate.unlink(missing_ok=True)
+    if is_gcsfuse_path(bed_source):
+        # Hard COPY all three trio files to local NVMe — never symlink into
+        # the gcsfuse workspace because random-access BED reads stall there.
+        required_bytes = sum(
+            (mounted_prefix.parent / f"{mounted_prefix.name}.{ext}").stat().st_size
+            for ext in ("bed", "bim", "fam")
+        )
+        _check_disk_space(cache_dir, required_bytes)
+        log(
+            f"  microarray: copying PLINK trio from gcsfuse workspace to local "
+            f"cache ({required_bytes / 1e9:.1f} GB) — random reads on gcsfuse stall"
+        )
+        # Manifest-emitting atomic stage (aou_storage) — supersedes the bare
+        # stage_bed_trio_to_local copy. One stage_gcs_object per trio file so
+        # each gets its own .manifest.json sibling + content_kind tag.
+        for ext, kind in (
+            ("bed", "aou_array_plink_bed"),
+            ("bim", "aou_array_plink_bim"),
+            ("fam", "aou_array_plink_fam"),
+        ):
+            src = mounted_prefix.parent / f"{mounted_prefix.name}.{ext}"
+            dst = cache_dir / f"{_AOU_ARRAY_PLINK_PREFIX}.{ext}"
+            stage_gcs_object(str(src), dst, content_kind=kind)
+        return True
+    # Local (non-gcsfuse) source: symlinks are free and correct.
     for extension in ("bim", "fam"):
         source = mounted_prefix.parent / f"{mounted_prefix.name}.{extension}"
         target = cache_dir / f"{_AOU_ARRAY_PLINK_PREFIX}.{extension}"
         _link_mounted_file(source, target)
-    bed_source = mounted_prefix.parent / f"{mounted_prefix.name}.bed"
-    bed_target = cache_dir / f"{_AOU_ARRAY_PLINK_PREFIX}.bed"
-    # If a previous run symlinked the .bed into the read-only mount, replace
-    # the symlink with a real local copy.
-    if bed_target.is_symlink():
-        bed_target.unlink()
-    if bed_target.exists():
-        try:
-            same = bed_target.samefile(bed_source)
-        except OSError:
-            same = False
-        if same or bed_target.stat().st_size == bed_source.stat().st_size:
-            return True
-        bed_target.unlink()
-    required_bytes = bed_source.stat().st_size
-    _check_disk_space(cache_dir, required_bytes)
-    log(
-        f"  microarray: copying arrays.bed from mounted workspace to local cache "
-        f"({required_bytes / 1e9:.1f} GB) — random reads on gcsfuse stall"
-    )
-    tmp_target = bed_target.with_suffix(bed_target.suffix + ".tmp")
-    tmp_target.unlink(missing_ok=True)
-    shutil.copyfile(str(bed_source), str(tmp_target))
-    os.replace(str(tmp_target), str(bed_target))
+    _link_mounted_file(bed_source, bed_target)
     return True
 
 
@@ -325,8 +384,33 @@ def _link_mounted_sv_vcf(chromosome: int, work_dir: Path) -> bool:
     if mounted_vcf is None or mounted_tbi is None:
         return False
     local_vcf = local_sv_vcf_path(chromosome, work_dir)
+    local_tbi = local_vcf.parent / f"{name}.tbi"
+    _warn_if_work_dir_on_gcsfuse(local_vcf.parent)
+    # If a prior run symlinked these into gcsfuse, drop the links so we can
+    # restage as a hard local copy. Symlinks pointed at local files are kept.
+    for candidate in (local_vcf, local_tbi):
+        if candidate.is_symlink():
+            try:
+                if is_gcsfuse_path(candidate.resolve()):
+                    candidate.unlink()
+            except OSError:
+                candidate.unlink(missing_ok=True)
+    if is_gcsfuse_path(mounted_vcf):
+        # Hard COPY both VCF and index to local NVMe; mmap/tabix random reads
+        # over gcsfuse turn into per-page HTTP GETs.
+        required_bytes = mounted_vcf.stat().st_size + mounted_tbi.stat().st_size
+        _check_disk_space(local_vcf.parent, required_bytes)
+        log(
+            f"  chr{chromosome}: copying SV VCF + index from gcsfuse workspace "
+            f"to local cache ({required_bytes / 1e9:.2f} GB)"
+        )
+        # Manifest-emitting atomic stage (aou_storage). The .tbi gets a
+        # distinct content_kind so cache invalidation can target it alone.
+        stage_gcs_object(str(mounted_vcf), local_vcf, content_kind="aou_sv_vcf")
+        stage_gcs_object(str(mounted_tbi), local_tbi, content_kind="aou_sv_vcf_tbi")
+        return True
     _link_mounted_file(mounted_vcf, local_vcf)
-    _link_mounted_file(mounted_tbi, local_vcf.parent / f"{name}.tbi")
+    _link_mounted_file(mounted_tbi, local_tbi)
     return True
 
 
@@ -446,22 +530,28 @@ def download_sv_vcf(chromosome: int, work_dir: Path) -> Path:
     local_vcf = local_sv_vcf_path(chromosome, work_dir)
     local_vcf.parent.mkdir(parents=True, exist_ok=True)
     local_tbi = local_vcf.parent / f"{name}.tbi"
-    if (
-        not local_vcf.exists() or not local_tbi.exists()
-    ) and _link_mounted_sv_vcf(chromosome, work_dir):
+    # ``verify_local_cache`` checks file presence AND a sibling manifest with
+    # ``complete=True`` + matching size, so a torn copy from a killed run no
+    # longer masquerades as a valid cache entry.
+    vcf_cached = verify_local_cache(local_vcf)
+    tbi_cached = verify_local_cache(local_tbi)
+    if (not vcf_cached or not tbi_cached) and _link_mounted_sv_vcf(chromosome, work_dir):
         log(f"  chr{chromosome}: linked VCF + index from mounted workspace resource")
+        vcf_cached = verify_local_cache(local_vcf)
+        tbi_cached = verify_local_cache(local_tbi)
 
-    if local_vcf.exists() and local_tbi.exists():
+    if vcf_cached and tbi_cached:
         log(f"  chr{chromosome}: VCF already present in local cache")
+        assert_hot_local_path(local_vcf, purpose="aou_sv_vcf_read")
         return local_vcf
 
     remote_dir = sv_vcf_dir()
     vcf_remote = f"{remote_dir}/{name}"
     tbi_remote = f"{remote_dir}/{name}.tbi"
     missing_downloads = []
-    if not local_vcf.exists():
+    if not vcf_cached:
         missing_downloads.append((vcf_remote, local_vcf, "VCF"))
-    if not local_tbi.exists():
+    if not tbi_cached:
         missing_downloads.append((tbi_remote, local_tbi, "index"))
 
     required_bytes = sum(_gsutil_size(remote) for remote, _, _ in missing_downloads)
@@ -475,6 +565,7 @@ def download_sv_vcf(chromosome: int, work_dir: Path) -> Path:
     )
     for remote, local_path, _ in missing_downloads:
         _download_gcs_object_if_missing(remote, local_path)
+    assert_hot_local_path(local_vcf, purpose="aou_sv_vcf_read")
     return local_vcf
 
 
@@ -490,20 +581,22 @@ def download_array_plink(work_dir: Path) -> Path:
     local_bed = local_array_plink_path(work_dir)
     if _link_mounted_array_plink(work_dir):
         if all(
-            (cache_dir / f"{_AOU_ARRAY_PLINK_PREFIX}.{ext}").exists()
+            verify_local_cache(cache_dir / f"{_AOU_ARRAY_PLINK_PREFIX}.{ext}")
             for ext in ("bed", "bim", "fam")
         ):
             log("  microarray: linked PLINK trio from mounted workspace resource")
+            assert_hot_local_path(local_bed, purpose="aou_array_plink_bed_read")
             return local_bed
 
     missing_extensions = []
     for extension in ("bed", "bim", "fam"):
         local_path = cache_dir / f"{_AOU_ARRAY_PLINK_PREFIX}.{extension}"
-        if not local_path.exists():
+        if not verify_local_cache(local_path):
             missing_extensions.append(extension)
 
     if not missing_extensions:
         log("  microarray: PLINK trio already present in local cache")
+        assert_hot_local_path(local_bed, purpose="aou_array_plink_bed_read")
         return local_bed
 
     remote_dir = array_plink_dir()
@@ -522,6 +615,7 @@ def download_array_plink(work_dir: Path) -> Path:
     )
     for remote, local_path, _ in missing_downloads:
         _download_gcs_object_if_missing(remote, local_path)
+    assert_hot_local_path(local_bed, purpose="aou_array_plink_bed_read")
     return local_bed
 
 
@@ -1413,6 +1507,15 @@ def run_all_of_us(
     from sv_pgs.progress import set_log_file, start_heartbeat
     log_path = work_dir / f"{disease_def.canonical_name}.{time.strftime('%Y%m%d_%H%M%S')}.log"
     set_log_file(log_path)
+
+    # Preflight: validate disk, gcsfuse layout, JAX/CuPy memory policy, GPU.
+    # Aborts loudly on any fatal_error so a misconfigured workbench fails fast
+    # instead of half-staging into a broken cache. The shared cache dir lives
+    # one level above per-disease work_dir, so that's what we preflight.
+    _preflight_cache_dir = work_dir.parent / _LOCAL_CACHE_DIRNAME
+    _preflight_report = check_aou_preflight(cache_dir=_preflight_cache_dir)
+    log_preflight(_preflight_report)
+    assert_preflight_ok(_preflight_report)
 
     # Dump any cached held-out test evals at the very start so a `tail -f`
     # on the log shows the already-known numbers before the (potentially

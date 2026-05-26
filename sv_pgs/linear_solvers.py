@@ -228,7 +228,26 @@ def _infer_gpu_resident(linear_operator: LinearOperator) -> bool | None:
                     return nested
             if hasattr(value, "_cupy_cache"):
                 return getattr(value, "_cupy_cache") is not None
+            if _is_bitpacked_device_matrix(value):
+                return True
     return None
+
+
+def _is_bitpacked_device_matrix(value: Any) -> bool:
+    """Return True if ``value`` is a device-resident bitpacked genotype matrix.
+
+    Detected by class name (avoids importing ``cupy`` / the bitpacked module
+    at import time) and additionally by the presence of a non-None ``_packed``
+    buffer, which is the BitpackedDeviceMatrix HBM byte array. Any caller
+    that wraps such a matrix in a LinearOperator closure is GPU-resident by
+    construction — ``matvec`` / ``rmatvec`` dispatch to the on-device
+    gemv_nt / gemv_tn kernels and never touch host memory in the hot path.
+    """
+    cls = type(value)
+    if cls.__name__ == "BitpackedDeviceMatrix":
+        packed = getattr(value, "_packed", None)
+        return packed is not None
+    return False
 
 
 def _warn_if_streaming_operator(linear_operator: LinearOperator) -> None:

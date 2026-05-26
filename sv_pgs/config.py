@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import Enum
-from typing import Mapping
+from typing import Literal, Mapping
 
 
 class TraitType(str, Enum):
@@ -190,6 +190,29 @@ class ModelConfig:
     ld_block_build: str = "hg38"
     ld_block_singleton_chunk_size: int = 256
     ld_block_pipeline_depth: int = 2
+
+    # ------------------------------------------------------------------
+    # Bitpacked GPU genotype pipeline (see BITPACKED_SPEC.md).
+    # ------------------------------------------------------------------
+    # Selects the genotype storage / kernel backend used during fitting.
+    # "bitpacked" (default, fast path) keeps PLINK 1.9 2-bits/sample packed
+    # bytes resident in GPU HBM and decodes via constant-memory LUTs inside
+    # custom CuPy RawKernels (forward/transpose GEMV, gram GEMM, screening).
+    # "int8" preserves the legacy host-int8 ``.npy`` cache + host-side LUT
+    # decode path for parity testing and CPU-only environments.
+    genotype_backend: Literal["bitpacked", "int8"] = "bitpacked"
+    # When True, sequential cold reads of PLINK BED trios are serviced via
+    # :class:`sv_pgs.mmap_reader.BedMmapReader` (mmap + ``MADV_SEQUENTIAL``
+    # / ``MADV_WILLNEED``) instead of the default ``preadv`` path. Opt-in
+    # because mmap on some filesystems (notably gcsfuse) can stall or raise
+    # SIGBUS; the reader falls back to ``preadv`` on error.
+    use_mmap_bed: bool = False
+    # When True, sv-pgs copies gcsfuse-mounted PLINK BED trios
+    # (``.bed`` / ``.bim`` / ``.fam``) to local NVMe before reading so that
+    # downstream readers (mmap, preadv, GPUDirect Storage) operate on a
+    # POSIX-real file. Set False to read directly from the gcsfuse mount
+    # (slower but avoids the local-disk copy and the extra space).
+    stage_gcsfuse_locally: bool = True
 
     def __post_init__(self) -> None:
         if self.max_outer_iterations < 1:

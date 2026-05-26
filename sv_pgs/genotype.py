@@ -871,6 +871,16 @@ class Int8RawGenotypeMatrix(RawGenotypeMatrix):
         return _int8_batch_to_float32(self.matrix[:, column_index])
 
 
+# Optional re-export of the device-resident bitpacked matrix. The import is
+# guarded so that hosts without ``cupy`` (or with a partially-installed CUDA
+# stack) can still ``import sv_pgs.genotype``. Callers should test
+# ``BitpackedDeviceMatrix is not None`` before using it.
+try:  # pragma: no cover - exercised only when cupy / bitpacked stack present
+    from sv_pgs.bitpacked_matrix import BitpackedDeviceMatrix  # noqa: F401
+except Exception:  # noqa: BLE001 - any import-time failure should degrade gracefully
+    BitpackedDeviceMatrix = None  # type: ignore[assignment,misc]
+
+
 @dataclass(slots=True)
 class IndexedRawGenotypeMatrix(RawGenotypeMatrix):
     """Expose only a selected subset of a child matrix's columns.
@@ -1353,6 +1363,59 @@ class ConcatenatedRawGenotypeMatrix(RawGenotypeMatrix):
             child_variant_indices = resolved_indices[child_positions] - int(self._variant_offsets[child_index])
             matrix[:, child_positions] = self.children[int(child_index)].materialize(child_variant_indices)
         return matrix
+
+    def _all_bitpacked(self) -> bool:
+        if BitpackedDeviceMatrix is None:
+            return False
+        return all(isinstance(child, BitpackedDeviceMatrix) for child in self.children)
+
+    def matvec_numpy(self, x_np: NDArray) -> NDArray:
+        """Dispatch G @ x to bitpacked child kernels when every child is bitpacked."""
+        if not self._all_bitpacked():
+            raise NotImplementedError("matvec_numpy requires all children to be BitpackedDeviceMatrix.")
+        x = np.asarray(x_np, dtype=np.float32).ravel()
+        if x.shape[0] != int(self._variant_offsets[-1]):
+            raise ValueError(f"matvec_numpy: x has shape {x.shape}, expected ({int(self._variant_offsets[-1])},).")
+        out = np.zeros((self._sample_count,), dtype=np.float32)
+        for child_index, child in enumerate(self.children):
+            start = int(self._variant_offsets[child_index])
+            stop = int(self._variant_offsets[child_index + 1])
+            out += child.matvec_numpy(x[start:stop])
+        return out
+
+    def rmatvec_numpy(self, y_np: NDArray) -> NDArray:
+        """Dispatch G.T @ y to bitpacked child kernels when every child is bitpacked."""
+        if not self._all_bitpacked():
+            raise NotImplementedError("rmatvec_numpy requires all children to be BitpackedDeviceMatrix.")
+        y = np.asarray(y_np, dtype=np.float32).ravel()
+        if y.shape[0] != self._sample_count:
+            raise ValueError(f"rmatvec_numpy: y has shape {y.shape}, expected ({self._sample_count},).")
+        out = np.empty((int(self._variant_offsets[-1]),), dtype=np.float32)
+        for child_index, child in enumerate(self.children):
+            start = int(self._variant_offsets[child_index])
+            stop = int(self._variant_offsets[child_index + 1])
+            out[start:stop] = child.rmatvec_numpy(y)
+        return out
+
+    def gram_block(self, variant_indices: NDArray) -> Any:
+        """Subset gram dispatched onto bitpacked children when uniform.
+
+        Falls back to ``NotImplementedError`` for mixed children; callers
+        should drop back to the int8 streaming path in that case.
+        """
+        if not self._all_bitpacked():
+            raise NotImplementedError("gram_block requires all children to be BitpackedDeviceMatrix.")
+        idx = np.asarray(variant_indices, dtype=np.int64).ravel()
+        child_ids = np.searchsorted(self._variant_offsets[1:], idx, side="right")
+        # If the requested subset falls entirely within one child, dispatch
+        # directly. Cross-child gram blocks aren't supported by per-child
+        # kernels alone, so fall back to NotImplementedError.
+        unique_ids = np.unique(child_ids)
+        if unique_ids.shape[0] != 1:
+            raise NotImplementedError("gram_block across multiple bitpacked children not supported.")
+        child_index = int(unique_ids[0])
+        local = idx - int(self._variant_offsets[child_index])
+        return self.children[child_index].gram_block(local)
 
 
 _cupy_module = None
@@ -6439,3 +6502,83 @@ def _standardize_batch_i8(batch: NDArray, means: NDArray, scales: NDArray) -> ND
     standardized[missing_mask] = 0.0
     standardized /= scales_f32[None, :]
     return standardized.astype(np.float32, copy=False)
+
+
+def make_dense_raw_genotype_matrix(
+    values: NDArray,
+    properties: dict[str, Any] | None = None,
+    *,
+    prefer: str = "bitpacked",
+) -> RawGenotypeMatrix:
+    """Build a dense in-memory ``RawGenotypeMatrix`` from a host dosage array.
+
+    When ``prefer == "bitpacked"`` and the bitpacked device backend is
+    importable AND CuPy is present, the dosage matrix is encoded with the
+    same PLINK 1.9 2-bit scheme as ``sv_pgs.plink._encode_variant`` and
+    uploaded to GPU HBM as a :class:`BitpackedDeviceMatrix`. Otherwise we
+    fall back to the host int8 ``Int8RawGenotypeMatrix``.
+
+    Parameters
+    ----------
+    values:
+        ``(n_samples, n_variants)`` host array of dosages (0/1/2/NaN) as
+        float32, float64, or int8 (with ``PLINK_MISSING_INT8`` as missing).
+    properties:
+        Optional metadata dict to attach to the returned matrix.
+    prefer:
+        ``"bitpacked"`` (default) or ``"int8"``.
+    """
+    arr = np.asarray(values)
+    if arr.ndim != 2:
+        raise ValueError("values must be 2D (n_samples, n_variants).")
+    if arr.dtype == np.int8:
+        host_i8 = arr
+    else:
+        host_f = np.asarray(arr, dtype=np.float32)
+        host_i8 = np.where(np.isnan(host_f), np.float32(PLINK_MISSING_INT8), host_f).astype(np.int8)
+
+    use_bitpacked = (
+        prefer == "bitpacked"
+        and BitpackedDeviceMatrix is not None
+        and _try_import_cupy() is not None
+    )
+    if not use_bitpacked:
+        return Int8RawGenotypeMatrix(matrix=host_i8)
+
+    from sv_pgs.plink import _encode_variant  # local import: heavy module
+    cp = _try_import_cupy()
+    assert cp is not None  # narrowed by use_bitpacked
+    n_samples, n_variants = int(host_i8.shape[0]), int(host_i8.shape[1])
+    bytes_per_variant = (n_samples + 3) // 4
+    packed_host = np.empty((n_variants, bytes_per_variant), dtype=np.uint8)
+    host_f = host_i8.astype(np.float32)
+    host_f[host_i8 == PLINK_MISSING_INT8] = np.nan
+    for v in range(n_variants):
+        packed_host[v] = np.frombuffer(
+            _encode_variant(host_f[:, v], bytes_per_variant=bytes_per_variant),
+            dtype=np.uint8,
+        )
+    # Per-variant mean/std over non-missing samples (mean-impute std==0 → 1).
+    mask = host_i8 != PLINK_MISSING_INT8
+    counts = mask.sum(axis=0).astype(np.float64)
+    safe_counts = np.where(counts > 0, counts, 1.0)
+    sums = np.where(mask, host_i8.astype(np.float64), 0.0).sum(axis=0)
+    means = sums / safe_counts
+    sqsums = np.where(mask, host_i8.astype(np.float64) ** 2, 0.0).sum(axis=0)
+    var = np.maximum(sqsums / safe_counts - means ** 2, 0.0)
+    stds = np.sqrt(var)
+    stds = np.where(stds > 0, stds, 1.0)
+    means_f32 = means.astype(np.float32)
+    stds_f32 = stds.astype(np.float32)
+
+    packed_dev = cp.asarray(packed_host)
+    mean_dev = cp.asarray(means_f32)
+    std_dev = cp.asarray(stds_f32)
+    return BitpackedDeviceMatrix(
+        packed_dev,
+        n_samples,
+        mean_dev,
+        std_dev,
+        count_a1=True,
+        properties=properties,
+    )

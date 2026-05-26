@@ -21,6 +21,63 @@ from sv_pgs.numeric import stable_sigmoid
 from sv_pgs.progress import log, mem
 
 
+def _maybe_upgrade_to_bitpacked(dataset: LoadedDataset, config: ModelConfig) -> LoadedDataset:
+    """Optionally swap dataset.genotypes for a device-resident BitpackedDeviceMatrix.
+
+    Fast path that activates only when ``config.genotype_backend == "bitpacked"``,
+    CuPy is importable, and the loaded genotype matrix is backed by a single
+    PLINK BED whose on-disk variant count matches the dataset's variant axis
+    (i.e. no variant-subset wrapper). The int8 path is left in place as the
+    fallback for every other case.
+    """
+    backend = getattr(config, "genotype_backend", None)
+    if backend != "bitpacked":
+        return dataset
+    try:
+        import cupy as _cp  # noqa: F401 - import probe
+    except ImportError as exc:
+        log(f"bitpacked backend requested but CuPy unavailable ({exc}); using int8 path")
+        return dataset
+    from sv_pgs.genotype import _resolve_plink_pread_context  # lazy
+    ctx = _resolve_plink_pread_context(dataset.genotypes)
+    if ctx is None:
+        log("bitpacked backend requested but no PLINK BED resolved; using int8 path")
+        return dataset
+    _reader, sample_indices, iid_count, bed_path = ctx
+    n_variants_axis = int(dataset.genotypes.shape[1])
+    sid_count = int(getattr(_reader, "sid_count", n_variants_axis) or n_variants_axis)
+    if sid_count != n_variants_axis:
+        log(
+            f"bitpacked backend skipped: variant subset present "
+            f"(sid_count={sid_count}, dataset variants={n_variants_axis})"
+        )
+        return dataset
+    try:
+        from sv_pgs.bitpacked_loader import load_bed_to_bitpacked_device
+        log(
+            f"bitpacked backend: loading BED {bed_path} -> device "
+            f"(n_samples={int(sample_indices.shape[0])}, n_variants={n_variants_axis})"
+        )
+        bp_matrix = load_bed_to_bitpacked_device(
+            bed_path=bed_path,
+            n_samples=int(iid_count),
+            n_variants=int(sid_count),
+            sample_indices=np.asarray(sample_indices, dtype=np.int64),
+        )
+    except Exception as exc:
+        log(f"bitpacked backend load failed ({type(exc).__name__}: {exc}); falling back to int8 path")
+        return dataset
+    return LoadedDataset(
+        sample_ids=dataset.sample_ids,
+        genotypes=bp_matrix,
+        covariates=dataset.covariates,
+        targets=dataset.targets,
+        variant_records=dataset.variant_records,
+        variant_stats=dataset.variant_stats,
+        variant_stats_minimum_scale=dataset.variant_stats_minimum_scale,
+    )
+
+
 @dataclass(slots=True)
 class PipelineOutputs:
     artifact_dir: Path
@@ -41,6 +98,13 @@ def run_training_pipeline(
 
     if _log_file is None:
         set_log_file(destination / f"training.{time.strftime('%Y%m%d_%H%M%S')}.log")
+    # Optional fast path: swap the int8 RawGenotypeMatrix for a device-resident
+    # BitpackedDeviceMatrix when the config requests it and CuPy is available.
+    # Falls through to the int8 path on any failure (missing CuPy, non-PLINK
+    # source, variant subset, loader error).
+    dataset = _maybe_upgrade_to_bitpacked(dataset, config)
+    if test_dataset is not None:
+        test_dataset = _maybe_upgrade_to_bitpacked(test_dataset, config)
     log(
         f"=== TRAINING PIPELINE START ===  samples={len(dataset.sample_ids)}  "
         + f"variants={dataset.genotypes.shape[1]}  trait={config.trait_type.value}  mem={mem()}"

@@ -598,6 +598,125 @@ def _minor_allele_frequency(allele_frequency: float) -> float:
     return min(normalized_frequency, 1.0 - normalized_frequency)
 
 
+# ---------------------------------------------------------------------------
+# Bitpacked-GPU fast paths.
+#
+# These helpers reuse the per-variant moments already produced by the
+# screening kernel inside ``BitpackedDeviceMatrix`` instead of a fresh
+# host-side streaming pass. They are intentionally additive: the existing
+# ``compute_variant_statistics`` / ``select_active_variant_indices`` /
+# ``_compute_means_and_scales`` / ``_compute_marginal_z_scores`` symbols
+# stay unchanged so non-bitpacked callers see identical behavior.
+# ---------------------------------------------------------------------------
+
+
+def compute_variant_stats_bitpacked(
+    matrix: "object",
+) -> tuple[I32Array, F32Array, F32Array]:
+    """Return (non_missing_counts, means, scales) from a BitpackedDeviceMatrix.
+
+    The matrix has already run the screening kernel at load time, so
+    column means and stds are sitting in device memory. This helper
+    just copies them to the host (as float32) and reconstructs the
+    per-variant non-missing counts from ``matrix.properties`` when the
+    loader recorded them; otherwise it falls back to the full sample
+    count (the screening kernel's mean/std are already valid under the
+    matrix's mean-imputation contract).
+    """
+    means = np.asarray(matrix.column_means(), dtype=np.float32)
+    scales = np.asarray(matrix.column_stds(), dtype=np.float32)
+    n_variants = int(means.shape[0])
+    n_samples = int(matrix.shape[0])
+    props = getattr(matrix, "properties", None) or {}
+    raw_counts = props.get("non_missing_counts")
+    if raw_counts is not None:
+        non_missing_counts = np.asarray(raw_counts, dtype=np.int32)
+        if non_missing_counts.shape != (n_variants,):
+            raise ValueError(
+                "matrix.properties['non_missing_counts'] has shape "
+                f"{non_missing_counts.shape}, expected ({n_variants},)"
+            )
+    else:
+        non_missing_counts = np.full(n_variants, n_samples, dtype=np.int32)
+    return non_missing_counts, means, scales
+
+
+def _bitpacked_maf_cache_key(
+    means: NDArray,
+    scales: NDArray,
+    non_missing_counts: NDArray,
+    config: ModelConfig,
+) -> str:
+    """Content-keyed digest for the bitpacked MAF filter cache."""
+    hasher = hashlib.sha256()
+    hasher.update(f"v{_PREPROCESSING_CACHE_VERSION}:maf_bitpacked:".encode("utf-8"))
+    hasher.update(np.ascontiguousarray(means, dtype=np.float32).tobytes())
+    hasher.update(np.ascontiguousarray(scales, dtype=np.float32).tobytes())
+    hasher.update(np.ascontiguousarray(non_missing_counts, dtype=np.int32).tobytes())
+    hasher.update(
+        f"min_maf={config.minimum_minor_allele_frequency:.17g}".encode("utf-8")
+    )
+    return hasher.hexdigest()[:24]
+
+
+def select_active_variant_indices_bitpacked(
+    matrix: "object",
+    config: ModelConfig,
+    *,
+    cache_dir: Path | None = None,
+) -> I32Array:
+    """MAF-filter the variants of a ``BitpackedDeviceMatrix``.
+
+    Uses the screening-kernel moments already attached to ``matrix``
+    (no second host pass). Applies the same ``min_maf`` threshold as
+    :func:`select_active_variant_indices` and reuses an
+    on-disk MAF cache keyed by the matrix's own (means, scales,
+    counts, threshold) content hash.
+    """
+    non_missing_counts, means, _scales = compute_variant_stats_bitpacked(matrix)
+    n_total = int(means.shape[0])
+    if n_total == 0:
+        return np.zeros(0, dtype=np.int32)
+
+    cache_path: Path | None = None
+    if cache_dir is not None:
+        cache_key = _bitpacked_maf_cache_key(means, _scales, non_missing_counts, config)
+        cache_path = _maf_cache_path(Path(cache_dir), cache_key)
+        cached_indices = _load_maf_filter_from_cache(cache_path)
+        if cached_indices is not None:
+            log(
+                f"  active variants: {cached_indices.shape[0]}/{n_total} restored from MAF cache "
+                + f"(min_maf={config.minimum_minor_allele_frequency:.6f}, key={cache_key})"
+            )
+            return cached_indices
+
+    # mean[v] is the per-variant sum/count of A1-coded dosage in {0,1,2},
+    # so allele_frequency = mean / 2. Variants whose moments are undefined
+    # (count == 0) get a MAF of 0 via the non-finite guard in
+    # ``_minor_allele_frequency`` so they are dropped by any positive threshold.
+    allele_frequencies = np.where(
+        non_missing_counts > 0,
+        np.asarray(means, dtype=np.float64) / 2.0,
+        np.nan,
+    )
+    threshold = float(config.minimum_minor_allele_frequency)
+    kept_mask = np.fromiter(
+        (_minor_allele_frequency(float(af)) >= threshold for af in allele_frequencies),
+        dtype=bool,
+        count=n_total,
+    )
+    maf_kept = np.nonzero(kept_mask)[0].astype(np.int32)
+    log(
+        f"  active variants: {maf_kept.shape[0]}/{n_total} kept after MAF filter "
+        + f"(min_maf={threshold:.6f}, bitpacked)"
+    )
+
+    if cache_path is not None:
+        _save_maf_filter_to_cache(cache_path, maf_kept)
+
+    return maf_kept
+
+
 _TIE_MAP_POSITION_WINDOW = 100_000  # 100 KB — duplicate SV calls are always nearby
 
 

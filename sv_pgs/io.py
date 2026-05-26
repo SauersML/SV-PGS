@@ -41,6 +41,12 @@ import jax.numpy as jnp
 from sv_pgs.progress import log, mem
 
 SV_LENGTH_THRESHOLD = 1_000.0
+# Runtime flag gating the legacy host-side int8 ``.npy`` decoded-matrix cache.
+# The bitpacked GPU pipeline (see :mod:`sv_pgs.bitpacked_loader`) reads PLINK
+# BED bytes directly into device HBM and decodes via on-GPU LUTs, so the int8
+# .npy cache is no longer needed for new runs. Flip back to True only when a
+# legacy host-side consumer is required.
+_USE_INT8_NPY_CACHE: bool = False
 DEFAULT_SAMPLE_ID_COLUMNS = ("sample_id", "research_id", "person_id")
 VARIANT_METADATA_BASE_COLUMNS = frozenset(
     {
@@ -774,6 +780,81 @@ def load_multi_vcf_dataset_from_files(
         variant_records=variant_records,
         variant_stats=variant_stats,
         variant_stats_minimum_scale=float(config.minimum_scale),
+    )
+
+
+def load_multi_vcf_dataset_as_bitpacked(
+    vcf_paths: Sequence[str | Path],
+    cache_dir: str | Path,
+    sample_ids: Sequence[str] | None = None,
+    *,
+    sample_id_order: Sequence[str] | None = None,
+    count_a1: bool = True,
+    stream: Any | None = None,
+) -> Any:
+    """Transcode SV VCFs to a single PLINK BED trio and return a bitpacked GPU matrix.
+
+    This is the bitpacked replacement for the historical int8 ``.npy`` cache
+    path. It one-time-transcodes the input VCFs to PLINK 1.9 BED bytes via
+    :func:`sv_pgs.sv_transcoder.transcode_sv_vcf_to_bed` (cached under
+    ``cache_dir`` as ``<key>.bed`` / ``.bim`` / ``.fam``) and then uploads the
+    bitpacked bytes to the GPU via
+    :func:`sv_pgs.bitpacked_loader.load_bed_to_bitpacked_device`.
+
+    Resume semantics: when the ``.bed`` / ``.bim`` / ``.fam`` trio already
+    exists under ``cache_dir`` we skip transcoding and only do the upload.
+    The legacy ``load_multi_vcf_dataset_from_files`` entry point is unchanged
+    and remains available for back-compat.
+    """
+    from sv_pgs.sv_transcoder import transcode_sv_vcf_to_bed  # lazy
+    from sv_pgs.bitpacked_loader import load_bed_to_bitpacked_device  # lazy
+
+    paths = [Path(p) for p in vcf_paths]
+    if not paths:
+        raise ValueError("vcf_paths cannot be empty.")
+    cache_dir_path = Path(cache_dir)
+    cache_dir_path.mkdir(parents=True, exist_ok=True)
+
+    # Stable per-cohort key: hash of resolved vcf paths + sample restriction.
+    fp = hashlib.sha256()
+    for path in paths:
+        fp.update(str(path.resolve()).encode("utf-8"))
+        fp.update(b"\0")
+    if sample_ids is not None:
+        for sid in sample_ids:
+            fp.update(str(sid).encode("utf-8"))
+            fp.update(b"\0")
+    fp.update(b"|order|")
+    if sample_id_order is not None:
+        for sid in sample_id_order:
+            fp.update(str(sid).encode("utf-8"))
+            fp.update(b"\0")
+    key = fp.hexdigest()[:16]
+    bed_path = cache_dir_path / f"{key}.bed"
+    bim_path = bed_path.with_suffix(".bim")
+    fam_path = bed_path.with_suffix(".fam")
+
+    if bed_path.exists() and bim_path.exists() and fam_path.exists():
+        log(f"  SV BED cache hit: reusing {bed_path.name}")
+        n_samples = sum(1 for _ in fam_path.open("r", encoding="utf-8"))
+        n_variants = sum(1 for _ in bim_path.open("r", encoding="utf-8"))
+    else:
+        log(f"  SV BED cache miss: transcoding {len(paths)} VCF(s) -> {bed_path.name}")
+        meta = transcode_sv_vcf_to_bed(
+            paths,
+            bed_path,
+            sample_ids=list(sample_ids) if sample_ids is not None else None,
+            sample_id_order=list(sample_id_order) if sample_id_order is not None else None,
+        )
+        n_samples = int(meta["n_samples"])
+        n_variants = int(meta["n_variants"])
+
+    return load_bed_to_bitpacked_device(
+        bed_path,
+        n_samples=n_samples,
+        n_variants=n_variants,
+        count_a1=count_a1,
+        stream=stream,
     )
 
 
@@ -2032,7 +2113,21 @@ def _build_plink_int8_cache_only(
     Used when the variant-stats cache is already on disk but the int8
     decoded-matrix cache is not. Returns the finalized int8 path on
     success, or None if disk space is insufficient / a write fails.
+
+    Gated behind ``_USE_INT8_NPY_CACHE`` (default ``False``). The
+    bitpacked path in :mod:`sv_pgs.bitpacked_loader` keeps genotypes in
+    PLINK BED form and decodes them on-GPU, so writing the multi-GB
+    int8 ``.npy`` mirror is wasted I/O for new runs. When the flag is
+    ``False`` we no-op and return ``None`` (the same return contract as
+    the disk-full skip path), leaving the existing stats-only cache in
+    place for any legacy consumer that still mmaps it.
     """
+    if not _USE_INT8_NPY_CACHE:
+        log(
+            "  PLINK int8 cache (post-stats build) SKIPPED — _USE_INT8_NPY_CACHE=False; "
+            "use sv_pgs.bitpacked_loader.load_bed_to_bitpacked_device for GPU loads"
+        )
+        return None
     int8_path.parent.mkdir(parents=True, exist_ok=True)
     has_space, required_bytes, available_bytes = _has_sufficient_free_space_for_int8_npy(
         int8_path.parent,

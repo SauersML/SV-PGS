@@ -1,12 +1,18 @@
 from __future__ import annotations
 
+import logging
 import os
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Literal
+from typing import TYPE_CHECKING, Any, Literal
 
 import numpy as np
+
+if TYPE_CHECKING:
+    from sv_pgs.mmap_reader import BedMmapReader
+
+_LOG = logging.getLogger(__name__)
 
 from sv_pgs._typing import I8Array, NDArray, U8Array
 
@@ -149,7 +155,9 @@ class open_bed:
     properties: dict[str, Any] | None = None
     count_A1: bool = True
     num_threads: int | None = None
+    use_mmap: bool = False
     _bed_fd: int | None = field(init=False, default=None, repr=False)
+    _mmap_reader: BedMmapReader | None = field(init=False, default=None, repr=False)
 
     def __post_init__(self) -> None:
         self.path = Path(self.path)
@@ -181,6 +189,39 @@ class open_bed:
             except OSError:
                 pass
 
+        if self.use_mmap:
+            # Disable mmap on gcsfuse: page faults become HTTP GETs.
+            try:
+                from sv_pgs.gcsfuse_staging import is_gcsfuse_path  # noqa: PLC0415
+
+                on_gcsfuse = is_gcsfuse_path(Path(self.path))
+            except Exception:
+                on_gcsfuse = False
+            if on_gcsfuse:
+                _LOG.warning(
+                    "open_bed: use_mmap=True but %s is on gcsfuse; "
+                    "disabling mmap and falling back to preadv.",
+                    self.path,
+                )
+            else:
+                try:
+                    from sv_pgs.mmap_reader import BedMmapReader  # noqa: PLC0415
+
+                    self._mmap_reader = BedMmapReader(
+                        self.path,
+                        n_samples=self.iid_count,
+                        n_variants=self.sid_count,
+                        count_a1=self.count_A1,
+                    )
+                except (OSError, ValueError) as exc:
+                    _LOG.warning(
+                        "open_bed: failed to open mmap reader for %s (%s); "
+                        "falling back to preadv.",
+                        self.path,
+                        exc,
+                    )
+                    self._mmap_reader = None
+
     def _ensure_fd(self) -> int:
         """Open the .bed file once and reuse the descriptor across threads.
 
@@ -207,6 +248,22 @@ class open_bed:
         """
         if length <= 0:
             return np.empty((0,), dtype=np.uint8)
+        if self._mmap_reader is not None:
+            bpv = self._mmap_reader.bytes_per_variant
+            payload_offset = offset - PLINK1_HEADER_SIZE
+            if (
+                payload_offset >= 0
+                and payload_offset % bpv == 0
+                and length % bpv == 0
+            ):
+                start = payload_offset // bpv
+                stop = start + length // bpv
+                if 0 <= start <= stop <= self._mmap_reader.n_variants:
+                    try:
+                        view = self._mmap_reader.read_packed_range(start, stop)
+                        return np.ascontiguousarray(view).reshape(length)
+                    except OSError:
+                        pass  # fall through to preadv
         fd = self._ensure_fd()
         buffer = np.empty((length,), dtype=np.uint8)
         view = memoryview(buffer).cast("B")
@@ -235,6 +292,18 @@ class open_bed:
             return np.empty((0,), dtype=np.uint8)
         if byte_start < 0 or byte_count < 0 or byte_start + byte_count > bytes_per_variant:
             raise ValueError("PLINK sample byte window is out of bounds.")
+        if (
+            self._mmap_reader is not None
+            and bytes_per_variant == self._mmap_reader.bytes_per_variant
+        ):
+            try:
+                rows = self._mmap_reader.read_packed_range(
+                    variant_start, variant_start + variant_count
+                )
+                window = rows[:, byte_start : byte_start + byte_count]
+                return np.ascontiguousarray(window).reshape(variant_count * byte_count)
+            except OSError:
+                pass  # fall through to preadv
         fd = self._ensure_fd()
         payload = np.empty((variant_count * byte_count,), dtype=np.uint8)
         output = memoryview(payload).cast("B")
@@ -272,6 +341,18 @@ class open_bed:
             return np.empty((0,), dtype=np.uint8)
         if bytes_per_variant <= 0:
             raise ValueError("bytes_per_variant must be positive.")
+
+        if (
+            self._mmap_reader is not None
+            and bytes_per_variant == self._mmap_reader.bytes_per_variant
+        ):
+            try:
+                gathered = self._mmap_reader.read_packed_indexed(indices)
+                return np.ascontiguousarray(gathered).reshape(
+                    int(indices.size) * bytes_per_variant
+                )
+            except OSError:
+                pass  # fall through to preadv
 
         fd = self._ensure_fd()
         payload = np.empty((int(indices.size) * bytes_per_variant,), dtype=np.uint8)
@@ -401,6 +482,13 @@ class open_bed:
         ``__del__`` leaks fds until garbage collection runs, which on AoU-scale
         jobs can exhaust the per-process fd limit before GC catches up.
         """
+        reader = getattr(self, "_mmap_reader", None)
+        if reader is not None:
+            self._mmap_reader = None
+            try:
+                reader.close()
+            except Exception:
+                pass
         fd = getattr(self, "_bed_fd", None)
         if fd is not None:
             self._bed_fd = None

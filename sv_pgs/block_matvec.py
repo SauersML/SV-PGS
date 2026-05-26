@@ -47,7 +47,15 @@ import numpy as np
 from numpy.typing import NDArray
 
 
-__all__ = ["block_matvec", "block_transpose_matvec", "iter_blocks"]
+__all__ = ["block_matvec", "block_transpose_matvec", "block_gram", "iter_blocks"]
+
+
+def _is_bitpacked_device_matrix(obj) -> bool:
+    """Lightweight type-name check so we never import cupy / bitpacked_matrix here."""
+    cls = type(obj)
+    if cls.__name__ != "BitpackedDeviceMatrix":
+        return False
+    return hasattr(obj, "gram_block") and hasattr(obj, "shape")
 
 
 def iter_blocks(block_ids: NDArray[np.integer]) -> Iterator[tuple[int, NDArray[np.intp]]]:
@@ -227,3 +235,51 @@ def block_transpose_matvec(
         out = (out - mask * means * y_sum) / scales_safe  # type: ignore[operator]
 
     return out.astype(out_dtype, copy=False)
+
+
+def block_gram(
+    X,
+    block_ids: NDArray[np.integer],
+    *,
+    means: NDArray | None = None,
+    scales: NDArray | None = None,
+):
+    """Compute the per-LD-block Gram matrices ``Z[:, idx_b].T @ Z[:, idx_b]``.
+
+    Yields ``(block_id, variant_indices, gram_block)`` for each non-empty block.
+
+    Fast path: when ``X`` is a :class:`BitpackedDeviceMatrix`, dispatch each
+    block to ``X.gram_block(idx)`` — the tensor-core / dp4a kernel that
+    standardises on-the-fly from the bitpacked HBM bytes (no int8 unpack,
+    no dense materialisation). The means/scales arguments are ignored in
+    this path because the matrix carries its own per-variant mean/std.
+
+    Fallback: dense / int8 numpy path — slice columns, optionally
+    standardise, and form the gram with a single BLAS call per block.
+    """
+    block_ids = np.asarray(block_ids)
+
+    if _is_bitpacked_device_matrix(X):
+        # Bitpacked GPU fast path. Trust the device kernel; means/scales
+        # baked into the matrix override any host-side override.
+        for bid, idx in iter_blocks(block_ids):
+            if idx.size == 0:
+                continue
+            yield bid, idx, X.gram_block(idx)
+        return
+
+    # Fallback: dense / int8 numpy path.
+    X_arr = np.asarray(X)
+    if means is not None:
+        means = np.asarray(means)
+    if scales is not None:
+        scales = np.asarray(scales)
+    _validate(X_arr, block_ids, means, scales)
+    standardise = means is not None
+    for bid, idx in iter_blocks(block_ids):
+        if idx.size == 0:
+            continue
+        cols = X_arr[:, idx].astype(np.float32, copy=False)
+        if standardise:
+            cols = (cols - means[idx]) / scales[idx]  # type: ignore[index]
+        yield bid, idx, cols.T @ cols
