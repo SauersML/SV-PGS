@@ -2117,7 +2117,11 @@ def _standardize_int8_cupy(raw_values: Any, means: Any, scales: Any, cupy: Any, 
             kernel = elementwise_kernel(
                 "int8 raw, T means, T scales, int8 missing",
                 "T out",
-                "out = (raw == missing) ? (T)0 : (((T)raw - means) / scales)",
+                # NVRTC can't pick between (T)0 (float16) and the rhs of the
+                # ternary (also T) when T is __half because __half ↔ float
+                # both have implicit conversions. Compute both arms as T
+                # explicitly with an intermediate, then select.
+                "T _val = ((T)raw - means) / scales; out = (raw == missing) ? (T)0 : _val",
                 "sv_pgs_standardize_int8_missing_zero",
             )
             kernel_cache[cache_key] = kernel
@@ -2147,7 +2151,11 @@ def _standardize_int8_cupy_into(raw_values: Any, means: Any, scales: Any, output
             kernel = elementwise_kernel(
                 "int8 raw, T means, T scales, int8 missing",
                 "T out",
-                "out = (raw == missing) ? (T)0 : (((T)raw - means) / scales)",
+                # NVRTC can't pick between (T)0 (float16) and the rhs of the
+                # ternary (also T) when T is __half because __half ↔ float
+                # both have implicit conversions. Compute both arms as T
+                # explicitly with an intermediate, then select.
+                "T _val = ((T)raw - means) / scales; out = (raw == missing) ? (T)0 : _val",
                 "sv_pgs_standardize_int8_missing_zero_into",
             )
             kernel_cache[cache_key] = kernel
