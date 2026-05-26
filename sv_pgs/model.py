@@ -2158,15 +2158,42 @@ class BayesianPGS:
                 )
                 if materialize_validation and allow_validation_full_cache:
                     log(f"materializing validation genotype matrix ({validation_genotype_matrix.shape})...")
-                    validation_in_memory = validation_genotype_matrix.try_materialize_gpu()
-                    if validation_in_memory:
-                        log(f"  validation GPU materialization succeeded  mem={mem()}")
-                    if not validation_in_memory:
-                        validation_in_memory = validation_genotype_matrix.try_materialize()
+                    # Try the same post-active bitpacked upgrade as training.
+                    # Validation is 79k × 91k = ~1.8 GB packed on device, fits
+                    # alongside the training matrix in HBM. Caches separately
+                    # (different sample_indices => different content_hash) so
+                    # subsequent runs on the same disease hit a cache.
+                    _val_bitpacked = _try_upgrade_reduced_to_bitpacked(
+                        reduced_genotypes=validation_genotype_matrix,
+                        combined_indices=np.asarray(
+                            validation_genotype_matrix.variant_indices, dtype=np.int64
+                        ),
+                        prepared_arrays=prepared_arrays,
+                    )
+                    if _val_bitpacked is not None:
+                        validation_genotype_matrix = _val_bitpacked
+                        # Rebind reduced_validation tuple so downstream code
+                        # (callback construction, eval) sees the upgraded matrix.
+                        reduced_validation = (
+                            _val_bitpacked,
+                            *reduced_validation[1:],
+                        )
+                        validation_in_memory = True
+                        log(f"  validation bitpacked upgrade ENGAGED  mem={mem()}")
+                    else:
+                        validation_in_memory = validation_genotype_matrix.try_materialize_gpu()
                         if validation_in_memory:
-                            log(f"  validation RAM materialization succeeded  mem={mem()}")
+                            log(f"  validation GPU materialization succeeded  mem={mem()}")
+                        if not validation_in_memory:
+                            validation_in_memory = validation_genotype_matrix.try_materialize()
+                            if validation_in_memory:
+                                log(f"  validation RAM materialization succeeded  mem={mem()}")
                     if validation_in_memory:
-                        validation_genotype_matrix.release_raw_storage()
+                        # Bitpacked-backed validation keeps its raw (the device
+                        # BitpackedDeviceMatrix IS the storage); release_raw_storage
+                        # on a SGM with no dense/cupy cache would raise.
+                        if _val_bitpacked is None:
+                            validation_genotype_matrix.release_raw_storage()
                     else:
                         log(f"  validation matrix remains streaming  mem={mem()}")
                 elif materialize_validation:
