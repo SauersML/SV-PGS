@@ -128,6 +128,97 @@ def _h2d_async(
     )
 
 
+def _parallel_workers() -> int:
+    """Resolve the worker count for parallel BED range reads.
+
+    Honors ``SV_PGS_BITPACKED_READ_WORKERS`` (int, >=1). Otherwise picks
+    ``min(os.cpu_count(), 8)``. Returns 1 to disable the parallel path.
+    """
+    env = os.environ.get("SV_PGS_BITPACKED_READ_WORKERS")
+    if env is not None:
+        try:
+            n = int(env)
+            if n >= 1:
+                return n
+        except ValueError:
+            pass
+    try:
+        cpu = int(os.cpu_count() or 1)
+    except Exception:  # noqa: BLE001
+        cpu = 1
+    return max(1, min(8, cpu))
+
+
+def _read_packed_parallel(
+    bed_path: Path,
+    *,
+    payload_offset: int,
+    total_bytes: int,
+    pinned_view: np.ndarray,
+    n_workers: int,
+) -> None:
+    """Range-read ``total_bytes`` from ``bed_path`` starting at ``payload_offset``
+    using ``n_workers`` independent fds via ``os.pread``.
+
+    Each worker handles a contiguous byte range and writes directly into the
+    matching slice of ``pinned_view``. ``os.pread`` is thread-safe at the OS
+    level and using separate fds avoids any kernel-side file-offset
+    serialization quirks (gcsfuse + multi-threaded readv specifically).
+    """
+    from concurrent.futures import ThreadPoolExecutor
+
+    if total_bytes <= 0 or n_workers <= 0:
+        return
+    if int(pinned_view.nbytes) < int(total_bytes):
+        raise ValueError(
+            f"pinned_view too small: {int(pinned_view.nbytes)} < {int(total_bytes)} bytes"
+        )
+
+    chunk = (total_bytes + n_workers - 1) // n_workers
+
+    # Open one fd per worker. Best-effort SEQUENTIAL hint per fd so gcsfuse can
+    # issue large prefetches on each stream independently.
+    fds: list[int] = []
+    try:
+        for _ in range(n_workers):
+            fd = os.open(str(bed_path), os.O_RDONLY | getattr(os, "O_CLOEXEC", 0))
+            _fadvise_sequential(fd)
+            fds.append(fd)
+
+        def _worker(worker_idx: int) -> None:
+            start = worker_idx * chunk
+            stop = min(total_bytes, start + chunk)
+            if start >= stop:
+                return
+            fd = fds[worker_idx]
+            cursor = start
+            # Read in sub-chunks of up to 64 MB so a single pread call doesn't
+            # block forever on a slow stream.
+            sub = 64 * 1024 * 1024
+            while cursor < stop:
+                want = min(sub, stop - cursor)
+                buf = os.pread(fd, want, payload_offset + cursor)
+                got = len(buf)
+                if got == 0:
+                    raise RuntimeError(
+                        f"pread returned 0 bytes at offset {payload_offset + cursor} "
+                        f"(worker={worker_idx}); BED truncated?"
+                    )
+                pinned_view[cursor : cursor + got] = np.frombuffer(buf, dtype=np.uint8)
+                cursor += got
+
+        with ThreadPoolExecutor(max_workers=n_workers) as pool:
+            futures = [pool.submit(_worker, i) for i in range(n_workers)]
+            for f in futures:
+                f.result()
+    finally:
+        for fd in fds:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+
+
 def _read_all_packed(
     reader: open_bed,
     n_variants: int,
@@ -394,13 +485,52 @@ def load_bed_to_bitpacked_device(
             # to avoid an intermediate copy.
             if sample_indices is None:
                 pinned_mem, pinned_view = _allocate_pinned(cp, raw_total_bytes)
-                _read_all_packed(
-                    reader,
-                    gathered_n_variants,
-                    src_bpv,
-                    pinned_view,
-                    chunk_bytes=chunk_bytes,
-                )
+                # Parallel range-read path: N independent fds, ``os.pread`` on
+                # each. Used when SV_PGS_BITPACKED_READ_WORKERS resolves to >1
+                # AND ``bed_path`` is openable on this host. Falls back to the
+                # sequential _read_all_packed path on any error.
+                n_workers = _parallel_workers()
+                used_parallel = False
+                if n_workers > 1 and raw_total_bytes > 0:
+                    from sv_pgs.plink import PLINK1_HEADER_SIZE
+                    try:
+                        _read_packed_parallel(
+                            bed_path,
+                            payload_offset=PLINK1_HEADER_SIZE,
+                            total_bytes=raw_total_bytes,
+                            pinned_view=pinned_view,
+                            n_workers=n_workers,
+                        )
+                        used_parallel = True
+                        try:
+                            from sv_pgs.progress import log as _plog
+                            _plog(
+                                f"BED stream: parallel range-read OK "
+                                f"workers={n_workers} bytes={raw_total_bytes / 1e9:.2f} GB"
+                            )
+                        except ImportError:  # pragma: no cover
+                            pass
+                    except Exception as _parallel_exc:  # noqa: BLE001
+                        # Best-effort fallback: log & retry via the sequential
+                        # streaming path so we never break a run on a parallel
+                        # I/O hiccup.
+                        try:
+                            from sv_pgs.progress import log as _plog
+                            _plog(
+                                f"BED stream: parallel range-read failed "
+                                f"({type(_parallel_exc).__name__}: {_parallel_exc}); "
+                                f"falling back to sequential"
+                            )
+                        except ImportError:  # pragma: no cover
+                            pass
+                if not used_parallel:
+                    _read_all_packed(
+                        reader,
+                        gathered_n_variants,
+                        src_bpv,
+                        pinned_view,
+                        chunk_bytes=chunk_bytes,
+                    )
                 packed_for_upload = pinned_view
                 final_bpv = src_bpv
             else:

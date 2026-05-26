@@ -1986,6 +1986,16 @@ class BayesianPGS:
                     f"(reduced matrix is {_matrix_type}). "
                     "Iter_column_batches will be the dominant cost."
                 )
+            else:
+                # When the bitpacked path engages, opt the per-iteration
+                # profiler into cupy deviceSynchronize() so the recorded
+                # timings reflect actual kernel runtime rather than just
+                # launch overhead.
+                try:
+                    from sv_pgs.bitpacked_profile import enable_cuda_sync as _enable_sync
+                    _enable_sync(True)
+                except ImportError:  # pragma: no cover - module always present
+                    pass
         except Exception as _banner_exc:  # noqa: BLE001 - banner is best-effort
             log(f"model fit hot loop: banner failed: {_banner_exc!r}")
         em_validation_data = reduced_validation

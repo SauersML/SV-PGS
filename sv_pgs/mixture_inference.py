@@ -2582,6 +2582,35 @@ def fit_variational_em(
             n_nonzero_beta = int(np.sum(beta_state != 0.0))
             avg_newton = epoch_total_newton_iters / max(block_count, 1)
             log(f"  variational EM epoch {outer_iteration + 1} done: blocks={block_count}  wall={epoch_wall_seconds:.1f}s  nonzero_beta={n_nonzero_beta}  avg_newton_iters={avg_newton:.1f}")
+            # Per-iteration bitpacked kernel breakdown (matvec/rmatvec/gram) so
+            # production logs reveal where each EM iteration spent time. The
+            # snapshot is empty whenever the bitpacked path is not engaged, in
+            # which case we silently skip — no log noise on the int8 path.
+            try:
+                from sv_pgs.bitpacked_profile import (
+                    snapshot_and_reset as _bp_snapshot,
+                    summary_line as _bp_summary,
+                )
+                _per_iter, _cumul = _bp_snapshot()
+                if _per_iter:
+                    log(
+                        "  "
+                        + _bp_summary(
+                            _per_iter,
+                            iter_index=outer_iteration + 1,
+                            n_iter_total=config.max_outer_iterations,
+                        )
+                    )
+                    # Cumulative is useful for the heartbeat to compare against
+                    # later but we also surface a compact running-total line so
+                    # operators don't need to sum the per-iter rows themselves.
+                    if _cumul:
+                        _cumul_line = " ".join(
+                            f"{k}={float(v):.1f}s" for k, v in _cumul.items()
+                        )
+                        log(f"  cumulative bitpacked: {_cumul_line}")
+            except ImportError:  # pragma: no cover - module always available
+                pass
             if use_gpu_epoch_predictor_state:
                 assert genetic_linear_predictor_gpu is not None
                 genetic_linear_predictor = _cupy_array_to_numpy(genetic_linear_predictor_gpu, dtype=np.float64)

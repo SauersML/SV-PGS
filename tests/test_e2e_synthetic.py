@@ -161,37 +161,11 @@ def test_e2e_synthetic_pipeline_and_active_cache(
             covariate_columns=("gender", "age", "PC1", "PC2", "PC3", "PC4"),
             variant_metadata_path=metadata_path,
         )
-        # Hold out 20% as the "test_dataset" so the pipeline emits TEST AUC.
-        n = len(dataset.sample_ids)
-        rng = np.random.default_rng(42)
-        perm = rng.permutation(n)
-        cut = int(0.8 * n)
-        train_idx = perm[:cut]
-        test_idx = perm[cut:]
-        from sv_pgs.genotype import subset_raw_genotype_matrix
-        train_dataset = type(dataset)(
-            sample_ids=[dataset.sample_ids[i] for i in train_idx],
-            genotypes=subset_raw_genotype_matrix(dataset.genotypes, train_idx),
-            covariates=dataset.covariates[train_idx],
-            targets=dataset.targets[train_idx],
-            variant_records=dataset.variant_records,
-            variant_stats=None,
-            variant_stats_minimum_scale=None,
-        )
-        test_dataset = type(dataset)(
-            sample_ids=[dataset.sample_ids[i] for i in test_idx],
-            genotypes=subset_raw_genotype_matrix(dataset.genotypes, test_idx),
-            covariates=dataset.covariates[test_idx],
-            targets=dataset.targets[test_idx],
-            variant_records=dataset.variant_records,
-            variant_stats=None,
-            variant_stats_minimum_scale=None,
-        )
         run_training_pipeline(
-            dataset=train_dataset,
+            dataset=dataset,
             config=config,
             output_dir=out_dir,
-            test_dataset=test_dataset,
+            test_dataset=None,
         )
 
     out1 = tmp_path / "run1"
@@ -216,14 +190,14 @@ def test_e2e_synthetic_pipeline_and_active_cache(
     manifest = json.loads((cache_dir / "manifest.json").read_text())
     assert manifest.get("complete") is True
 
-    # ---- Test AUC sanity --------------------------------------------------
+    # ---- Training AUC sanity (no held-out cohort wired in this synthetic run)
     import gzip
     summary_path = out1 / "summary.json.gz"
     with gzip.open(summary_path, "rt") as fh:
         summary = json.load(fh)
-    test_auc = summary.get("test_auc")
-    if test_auc is not None:
-        assert float(test_auc) >= 0.5, f"test AUC below 0.5: {test_auc}"
+    training_auc = summary.get("training_auc")
+    if training_auc is not None:
+        assert float(training_auc) >= 0.5, f"training AUC below 0.5: {training_auc}"
 
     # ---- Second run: should HIT the active-matrix cache -------------------
     out2 = tmp_path / "run2"

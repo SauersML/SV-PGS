@@ -361,6 +361,8 @@ class BitpackedDeviceMatrix(RawGenotypeMatrix):
     # ------------------------------------------------------------------
     def gram_block(self, variant_indices: NDArray | "cp.ndarray") -> "cp.ndarray":
         """Compute Z_S.T @ Z_S for the subset S of variants. Returns device float32."""
+        from sv_pgs.bitpacked_profile import record as _profile_record  # local import
+
         cp = _cupy()
         bp = _bitpacked()
         idx_dev = cp.asarray(variant_indices, dtype=cp.int64)
@@ -371,14 +373,15 @@ class BitpackedDeviceMatrix(RawGenotypeMatrix):
         sub_mean = cp.take(self._mean, idx_dev, axis=0)
         sub_std = cp.take(self._std, idx_dev, axis=0)
         out = cp.zeros((k, k), dtype=cp.float32)
-        bp.gemm_gram(
-            sub_packed,
-            self._n_samples,
-            sub_mean,
-            sub_std,
-            out,
-            count_a1=self._count_a1,
-        )
+        with _profile_record("gram"):
+            bp.gemm_gram(
+                sub_packed,
+                self._n_samples,
+                sub_mean,
+                sub_std,
+                out,
+                count_a1=self._count_a1,
+            )
         return out
 
     # ------------------------------------------------------------------
