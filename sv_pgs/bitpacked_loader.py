@@ -413,8 +413,7 @@ def _rebitpack_for_samples(
     row_decoded_bytes = max(1, src_bytes_per_variant * 4)
     chunk_rows = max(1, decode_chunk_bytes // row_decoded_bytes)
 
-    for row_start in range(0, n_variants, chunk_rows):
-        row_stop = min(n_variants, row_start + chunk_rows)
+    def _process_chunk(row_start: int, row_stop: int) -> None:
         packed_block = packed_matrix[row_start:row_stop, :]
         # Decode: (chunk_rows, src_bpv) -> (chunk_rows, src_bpv * 4) int8.
         decoded = lut[packed_block].reshape(row_stop - row_start, src_bytes_per_variant * 4)
@@ -425,7 +424,6 @@ def _rebitpack_for_samples(
         # A1 encoding LUT mapping {0,1,2} -> {0b11, 0b10, 0b00}.
         codes = np.zeros((row_stop - row_start, new_bpv * 4), dtype=np.uint8)
         observed = gathered != missing_i8
-        # Observed dosages are 0/1/2 ints (int8); index the encode LUT.
         dosages = np.where(observed, gathered, 0).astype(np.intp, copy=False)
         encoded_obs = _ENCODE_LOOKUP_A1[dosages]
         codes[:, :new_n_samples] = np.where(
@@ -440,6 +438,25 @@ def _rebitpack_for_samples(
             | (codes[:, 3::4] << 6)
         ).astype(np.uint8, copy=False)
         out[row_start:row_stop, :] = packed_rows
+
+    # Embarrassingly parallel over chunks: each chunk reads its own slice of
+    # packed_matrix and writes its own slice of out. NumPy LUT/gather/encode
+    # ops release the GIL, so ThreadPoolExecutor gives near-linear speedup
+    # across cores (saw ~10x on 12-core AoU workbench).
+    chunk_starts = list(range(0, n_variants, chunk_rows))
+    n_workers = _parallel_workers()
+    if n_workers <= 1 or len(chunk_starts) <= 1:
+        for row_start in chunk_starts:
+            row_stop = min(n_variants, row_start + chunk_rows)
+            _process_chunk(row_start, row_stop)
+    else:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=n_workers) as pool:
+            futures = [
+                pool.submit(_process_chunk, row_start, min(n_variants, row_start + chunk_rows))
+                for row_start in chunk_starts
+            ]
+            for fut in futures:
+                fut.result()
 
     return out.reshape(-1), new_bpv
 
