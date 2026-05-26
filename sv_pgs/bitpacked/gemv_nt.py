@@ -52,18 +52,20 @@ __global__ void bitpacked_gemv_nt_kernel(
         const float s0 = std[v + 0],  s1 = std[v + 1],  s2 = std[v + 2],  s3 = std[v + 3];
         const float x0 = x[v + 0],    x1 = x[v + 1],    x2 = x[v + 2],    x3 = x[v + 3];
 
-        const float z0 = (d0 == (signed char)-127) ? 0.0f : (((float)d0 - m0) / s0) * x0;
-        const float z1 = (d1 == (signed char)-127) ? 0.0f : (((float)d1 - m1) / s1) * x1;
-        const float z2 = (d2 == (signed char)-127) ? 0.0f : (((float)d2 - m2) / s2) * x2;
-        const float z3 = (d3 == (signed char)-127) ? 0.0f : (((float)d3 - m3) / s3) * x3;
+        // gate scale > 0 (also rejects NaN); zero-std columns contribute 0
+        const float z0 = ((d0 == (signed char)-127) || !(s0 > 0.0f)) ? 0.0f : (((float)d0 - m0) / s0) * x0;
+        const float z1 = ((d1 == (signed char)-127) || !(s1 > 0.0f)) ? 0.0f : (((float)d1 - m1) / s1) * x1;
+        const float z2 = ((d2 == (signed char)-127) || !(s2 > 0.0f)) ? 0.0f : (((float)d2 - m2) / s2) * x2;
+        const float z3 = ((d3 == (signed char)-127) || !(s3 > 0.0f)) ? 0.0f : (((float)d3 - m3) / s3) * x3;
 
         acc += z0 + z1 + z2 + z3;
     }
     for (; v < n_variants; ++v) {
         const unsigned char b = __ldg(packed + v * bytes_per_variant + byte_idx);
         const signed char d = BITPACKED_DECODE_LUT[((int)b << 3) + slot_off];
-        if (d != (signed char)-127) {
-            acc += (((float)d - mean[v]) / std[v]) * x[v];
+        const float s = std[v];
+        if (d != (signed char)-127 && (s > 0.0f)) {
+            acc += (((float)d - mean[v]) / s) * x[v];
         }
     }
 

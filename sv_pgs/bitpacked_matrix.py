@@ -140,6 +140,14 @@ class BitpackedDeviceMatrix(RawGenotypeMatrix):
         return (self._n_samples, self._n_variants)
 
     @property
+    def n_samples(self) -> int:
+        return self._n_samples
+
+    @property
+    def n_variants(self) -> int:
+        return self._n_variants
+
+    @property
     def dtype(self) -> Any:
         cp = _cupy()
         return cp.dtype("float32")

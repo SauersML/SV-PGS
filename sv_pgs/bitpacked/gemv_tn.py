@@ -83,7 +83,9 @@ __global__ void bitpacked_gemv_tn_kernel(
 
     const float mv = mean[v];
     const float sv = std[v];
-    const float inv_s = (sv > 0.0f) ? (1.0f / sv) : 0.0f;
+    // gate scale > 0 (also rejects NaN); zero-std columns contribute 0
+    const int scale_ok = !(!(sv > 0.0f));
+    const float inv_s = scale_ok ? (1.0f / sv) : 0.0f;
 
     const unsigned char* row = packed + (size_t)v * (size_t)bytes_per_variant;
 
