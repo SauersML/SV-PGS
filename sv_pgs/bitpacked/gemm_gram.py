@@ -854,7 +854,12 @@ def _get_kernel(name: str) -> Any:
 
 
 def _volta_v2_enabled() -> bool:
-    val = os.environ.get("SV_PGS_GEMM_GRAM_VOLTA_V2", "1").strip().lower()
+    # Default OFF: empirical V100 benchmarks at (97k samples, 512..8192 variants)
+    # show the double-buffered v2 kernel within 1-2% of v1 (both ~5 TFLOPS).
+    # The kernel is correctness-tested and ready, but the SMEM-load latency
+    # the double buffering would hide is not the binding bottleneck at this
+    # tile / dosage-decode complexity. Set the env var to "1" to opt in.
+    val = os.environ.get("SV_PGS_GEMM_GRAM_VOLTA_V2", "0").strip().lower()
     return val not in ("0", "false", "no", "off")
 
 
