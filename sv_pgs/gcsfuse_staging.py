@@ -32,6 +32,8 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
+from sv_pgs.diagnostics import region, update_bytes
+
 try:  # fcntl is POSIX-only; we degrade to no-op locking on platforms without it.
     import fcntl as _fcntl
 except ImportError:  # pragma: no cover - non-POSIX
@@ -783,6 +785,14 @@ def _copy_and_publish_parallel(
         target=_emitter, name="gcsfuse-stage-progress", daemon=True
     )
     bytes_copied_total = 0
+    _stage_region = region(
+        "gcsfuse.stage",
+        bytes_total=src_size,
+        source=source.name,
+        dest=destination.name,
+        n_workers=n_workers,
+    )
+    _stage_region.__enter__()
     try:
         for _ in range(n_workers):
             sfd = os.open(str(source), os.O_RDONLY | getattr(os, "O_CLOEXEC", 0))
@@ -822,6 +832,7 @@ def _copy_and_publish_parallel(
                 worker_total += got
                 with bytes_done_lock:
                     bytes_done[0] += got
+                    update_bytes("gcsfuse.stage", bytes_done[0])
             return worker_total
 
         emitter_thread.start()
@@ -850,6 +861,7 @@ def _copy_and_publish_parallel(
                 os.close(sfd)
             except OSError:
                 pass
+        _stage_region.__exit__(None, None, None)
 
     if bytes_copied_total != src_size:
         # Clean up partial then raise.
