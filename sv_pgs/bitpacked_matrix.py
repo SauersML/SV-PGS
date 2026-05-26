@@ -249,6 +249,8 @@ class BitpackedDeviceMatrix(RawGenotypeMatrix):
     # ------------------------------------------------------------------
     def matvec(self, x_dev: "cp.ndarray") -> "cp.ndarray":
         """Compute G @ x on device. Returns (n_samples,) float32."""
+        from sv_pgs.bitpacked_profile import record as _profile_record  # local import
+
         cp = _cupy()
         bp = _bitpacked()
         if self._n_variants == 0:
@@ -259,19 +261,22 @@ class BitpackedDeviceMatrix(RawGenotypeMatrix):
                 f"matvec: x has shape {tuple(x32.shape)}, expected ({self._n_variants},)."
             )
         out = cp.zeros((self._n_samples,), dtype=cp.float32)
-        bp.gemv_nt(
-            self._packed,
-            self._n_samples,
-            x32,
-            self._mean,
-            self._std,
-            out,
-            count_a1=self._count_a1,
-        )
+        with _profile_record("matvec"):
+            bp.gemv_nt(
+                self._packed,
+                self._n_samples,
+                x32,
+                self._mean,
+                self._std,
+                out,
+                count_a1=self._count_a1,
+            )
         return out
 
     def rmatvec(self, y_dev: "cp.ndarray") -> "cp.ndarray":
         """Compute G.T @ y on device. Returns (n_variants,) float32."""
+        from sv_pgs.bitpacked_profile import record as _profile_record  # local import
+
         cp = _cupy()
         bp = _bitpacked()
         if self._n_variants == 0:
@@ -282,15 +287,16 @@ class BitpackedDeviceMatrix(RawGenotypeMatrix):
                 f"rmatvec: y has shape {tuple(y32.shape)}, expected ({self._n_samples},)."
             )
         out = cp.zeros((self._n_variants,), dtype=cp.float32)
-        bp.gemv_tn(
-            self._packed,
-            self._n_samples,
-            y32,
-            self._mean,
-            self._std,
-            out,
-            count_a1=self._count_a1,
-        )
+        with _profile_record("rmatvec"):
+            bp.gemv_tn(
+                self._packed,
+                self._n_samples,
+                y32,
+                self._mean,
+                self._std,
+                out,
+                count_a1=self._count_a1,
+            )
         return out
 
     def matvec_numpy(self, x_np: NDArray) -> NDArray:

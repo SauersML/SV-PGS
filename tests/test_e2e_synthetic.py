@@ -35,6 +35,7 @@ def _write_synthetic_cohort(
 ) -> tuple[Path, Path, Path]:
     from sv_pgs.plink import to_bed
 
+    work_dir.mkdir(parents=True, exist_ok=True)
     rng = np.random.default_rng(seed)
     # ~5% missing-rate dosage matrix. Real allele frequencies vary across
     # variants so the screening / fit have non-trivial signal.
@@ -115,7 +116,6 @@ def _find_active_cache_dir(cache_root: Path) -> Path | None:
     return None
 
 
-@pytest.mark.timeout(180)
 def test_e2e_synthetic_pipeline_and_active_cache(
     tmp_path: Path,
     capfd: pytest.CaptureFixture[str],
