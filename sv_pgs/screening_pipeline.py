@@ -278,6 +278,10 @@ def _read_chunk_to_host(
     variant_start: int,
     variant_stop: int,
     host_buffer: np.ndarray,
+    *,
+    chunk_idx: int | None = None,
+    source: str | None = None,
+    bed_path: Any = None,
 ) -> np.ndarray:
     """Read a contiguous variant-range from an open BED file into host_buffer.
 
@@ -287,11 +291,24 @@ def _read_chunk_to_host(
     n_rows = variant_stop - variant_start
     n_bytes = n_rows * bpv
     offset = PLINK1_HEADER_SIZE + variant_start * bpv
-    fh.seek(offset)
-    view = host_buffer[:n_bytes]
-    mv = memoryview(view).cast("B")
-    fh.readinto(mv)
-    return view[:n_bytes].view(np.uint8).reshape(n_rows, bpv)
+    extra: dict[str, Any] = {}
+    if chunk_idx is not None:
+        extra["chunk_idx"] = chunk_idx
+    if source is not None:
+        extra["source"] = source
+    if bed_path is not None:
+        extra["bed"] = Path(bed_path).name
+    with region(
+        "screening.read_chunk",
+        bytes_total=n_bytes,
+        **extra,
+    ):
+        fh.seek(offset)
+        view = host_buffer[:n_bytes]
+        mv = memoryview(view).cast("B")
+        fh.readinto(mv)
+        update_bytes("screening.read_chunk", n_bytes)
+        return view[:n_bytes].view(np.uint8).reshape(n_rows, bpv)
 
 
 # ---------------------------------------------------------------------------
@@ -531,13 +548,24 @@ def _screen_one_path(
                 count_a1,
             )
 
-    path_total_bytes = int(n_variants) * int(bpv_src)
+    path_total_bytes = int(n_variants) * int(bpv_src) + PLINK1_HEADER_SIZE
     processed_bytes = 0
+    # Detect gcsfuse for heartbeat tagging (post-staging; if staging succeeded
+    # the path is local NVMe and this returns False).
+    _io_source = "local"
+    try:
+        from sv_pgs.gcsfuse_staging import is_gcsfuse_path as _is_gcsfuse_path
+
+        if _is_gcsfuse_path(bed_path):
+            _io_source = "gcsfuse"
+    except Exception:
+        pass
     _path_region_cm = region(
-        "screening.path",
+        "screening.path_total",
         bytes_total=path_total_bytes,
         bed=bed_path.name,
         n_chunks=len(chunks),
+        source=_io_source,
     )
     _path_region_cm.__enter__()
     try:
@@ -634,7 +662,14 @@ def _screen_one_path(
                             packed_host = None
                     if packed_host is None:
                         packed_host = _read_chunk_to_host(
-                            fh, n_samples, v_start, v_stop, host_bufs[slot]
+                            fh,
+                            n_samples,
+                            v_start,
+                            v_stop,
+                            host_bufs[slot],
+                            chunk_idx=idx,
+                            source=_io_source,
+                            bed_path=bed_path,
                         )
                     # GPU-gather path: upload raw bytes verbatim. The kernel
                     # consumes sample_intersect_dev and decodes inline.
@@ -667,7 +702,7 @@ def _screen_one_path(
             )
             compute_done[slot].record(compute_stream)
             processed_bytes += n_bytes_src
-            update_bytes("screening.path", processed_bytes)
+            update_bytes("screening.path_total", processed_bytes)
             _chunk_region_cm.__exit__(None, None, None)
     finally:
         try:
