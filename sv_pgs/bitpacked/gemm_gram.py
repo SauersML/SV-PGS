@@ -11,6 +11,8 @@ The DP4A / TF32 mma / FP16 mma fast paths can replace the kernel bodies later
 without changing the wrapper contract.
 
 Per-arch outer tile sizing decisions (matched in ``launch.gemm_gram_config``):
+  * Volta      (SM 7.0):  64 x 64 variants, k-tile = 16 samples,  ~4 KB shmem
+                           — uses WMMA fp16->fp32 mma (m16n16k16) for ~125 TFLOPS peak.
   * T4         (SM 7.5):  64 x 64 variants, k-tile = 32 samples, ~16 KB shmem.
   * Ampere     (SM 8.x):  128 x 128 variants, k-tile = 64 samples, ~64 KB shmem.
   * Hopper     (SM 9.x):  128 x 256 variants, k-tile = 64 samples, ~96 KB shmem.
@@ -256,7 +258,7 @@ _KERNEL_TAILS: dict[str, str] = {
         "DEFINE_GRAM_KERNEL(bitpacked_gemm_gram_dp4a_kernel,  64,  64, 32, 128, 16)\n"
         "}\n"
     ),
-    # fp32 fallback (Volta / unknown): identical params to the dp4a tile.
+    # fp32 fallback (any arch): identical params to the dp4a tile.
     "bitpacked_gemm_gram_fp32_kernel": (
         'extern "C" {\n'
         "DEFINE_GRAM_KERNEL(bitpacked_gemm_gram_fp32_kernel,  64,  64, 32, 128, 16)\n"
@@ -276,7 +278,234 @@ _KERNEL_TAILS: dict[str, str] = {
     ),
 }
 
+# Volta WMMA kernel is a standalone TU (does not use the DEFINE_GRAM_KERNEL
+# macro). It needs <mma.h> and a different shmem layout.
+_VOLTA_KERNEL_NAME = "bitpacked_gemm_gram_volta_mma_kernel"
+
 _GEMM_GRAM_PRELUDE = _GEMM_GRAM_SRC
+
+
+# ---------------------------------------------------------------------------
+# Volta WMMA kernel (sm_70). Uses fp16 inputs + fp32 accumulator with the
+# CUDA WMMA API (m16n16k16) for ~125 TFLOPS peak on V100. Compiles only
+# on sm_70+ devices that support the API.
+# ---------------------------------------------------------------------------
+
+_GEMM_GRAM_VOLTA_SRC = r"""
+#include <mma.h>
+#include <cuda_fp16.h>
+
+using namespace nvcuda;
+
+// Re-declare the dosage decoder here (separate TU from the fp32 prelude).
+__device__ __forceinline__ int volta_decode_dosage(int code, int count_a1) {
+    if (code == 0x1) return -1;
+    if (count_a1) {
+        if (code == 0x0) return 2;
+        if (code == 0x2) return 1;
+        return 0;
+    } else {
+        if (code == 0x0) return 0;
+        if (code == 0x2) return 1;
+        return 2;
+    }
+}
+
+// Compute fp32 standardized z for (variant v, sample i). Missing or
+// zero-scale returns 0.0f.
+__device__ __forceinline__ float volta_z_of(
+    const unsigned char* __restrict__ row,
+    int i,
+    int n_samples,
+    float m,
+    float s,
+    int count_a1)
+{
+    if (i >= n_samples) return 0.0f;
+    int byte_idx = i >> 2;
+    int slot = i & 0x3;
+    int code = (row[byte_idx] >> (slot * 2)) & 0x3;
+    int d = volta_decode_dosage(code, count_a1);
+    if (d < 0) return 0.0f;
+    if (!(s > 0.0f)) return 0.0f;
+    return ((float)d - m) / s;
+}
+
+// Tile parameters: 64x64 output via 4x4 grid of 16x16 WMMA fragments.
+// 4 warps (128 threads). Warp layout: warp_id = wy*2 + wx, with wy,wx in 0..1.
+// Each warp computes a 32x32 sub-tile = 2x2 WMMA fragments.
+//
+// SMEM: sA[64][16] half + sB[64][16] half = 2048 + 2048 = 4 KB.
+//   (Plus a +8 element padding per row to avoid bank conflicts: +16*2*64*2 = 2 KB,
+//    total ~6 KB — well under any per-block static SMEM limit.)
+//
+// k-tile = 16 samples per outer iteration.
+
+#define VOLTA_TILE_M 64
+#define VOLTA_TILE_N 64
+#define VOLTA_TILE_K 16
+#define VOLTA_WMMA_M 16
+#define VOLTA_WMMA_N 16
+#define VOLTA_WMMA_K 16
+#define VOLTA_NWARPS 4
+#define VOLTA_NTHREADS (VOLTA_NWARPS * 32)
+// SMEM column stride includes a small skew to avoid bank conflicts on
+// loads through wmma::load_matrix_sync (which reads 16-column strides).
+#define VOLTA_SMEM_K_STRIDE (VOLTA_TILE_K + 8)
+
+extern "C" __global__ void bitpacked_gemm_gram_volta_mma_kernel(
+    const unsigned char* __restrict__ packed,
+    int n_variants,
+    int n_samples,
+    int bytes_per_variant,
+    const float* __restrict__ mean,
+    const float* __restrict__ std_,
+    float* __restrict__ out,
+    int count_a1)
+{
+    const int bx = blockIdx.x;
+    const int by = blockIdx.y;
+    const int row0 = bx * VOLTA_TILE_M;
+    const int col0 = by * VOLTA_TILE_N;
+    if (row0 >= n_variants || col0 >= n_variants) return;
+    // Skip strictly-above-diagonal tiles.
+    if (row0 > col0 + VOLTA_TILE_N - 1) return;
+
+    const int tid = threadIdx.x;
+    const int warp_id = tid >> 5;          // 0..3
+    const int lane_id = tid & 31;
+    (void)lane_id;
+    const int wy = warp_id >> 1;           // 0..1
+    const int wx = warp_id & 1;            // 0..1
+
+    // SMEM tiles (row-major, leading dim = VOLTA_SMEM_K_STRIDE).
+    __shared__ __half sA[VOLTA_TILE_M * VOLTA_SMEM_K_STRIDE];
+    __shared__ __half sB[VOLTA_TILE_N * VOLTA_SMEM_K_STRIDE];
+
+    // Per-warp fragment accumulators: 2x2 grid of 16x16 fp32 frags.
+    wmma::fragment<wmma::accumulator, VOLTA_WMMA_M, VOLTA_WMMA_N, VOLTA_WMMA_K, float>
+        acc[2][2];
+    #pragma unroll
+    for (int i = 0; i < 2; ++i) {
+        #pragma unroll
+        for (int j = 0; j < 2; ++j) {
+            wmma::fill_fragment(acc[i][j], 0.0f);
+        }
+    }
+
+    for (int k0 = 0; k0 < n_samples; k0 += VOLTA_TILE_K) {
+        // Cooperative load of sA[VOLTA_TILE_M][VOLTA_TILE_K] (skewed leading dim).
+        // 128 threads, 64*16 = 1024 elements -> 8 per thread.
+        #pragma unroll
+        for (int idx = tid; idx < VOLTA_TILE_M * VOLTA_TILE_K; idx += VOLTA_NTHREADS) {
+            int rr = idx / VOLTA_TILE_K;
+            int kk = idx % VOLTA_TILE_K;
+            int v = row0 + rr;
+            int s_idx = k0 + kk;
+            float val = 0.0f;
+            if (v < n_variants && s_idx < n_samples) {
+                const unsigned char* row =
+                    packed + (size_t)v * (size_t)bytes_per_variant;
+                val = volta_z_of(row, s_idx, n_samples,
+                                 mean[v], std_[v], count_a1);
+            }
+            sA[rr * VOLTA_SMEM_K_STRIDE + kk] = __float2half(val);
+        }
+        // Cooperative load of sB[VOLTA_TILE_N][VOLTA_TILE_K].
+        #pragma unroll
+        for (int idx = tid; idx < VOLTA_TILE_N * VOLTA_TILE_K; idx += VOLTA_NTHREADS) {
+            int cc = idx / VOLTA_TILE_K;
+            int kk = idx % VOLTA_TILE_K;
+            int v = col0 + cc;
+            int s_idx = k0 + kk;
+            float val = 0.0f;
+            if (v < n_variants && s_idx < n_samples) {
+                const unsigned char* row =
+                    packed + (size_t)v * (size_t)bytes_per_variant;
+                val = volta_z_of(row, s_idx, n_samples,
+                                 mean[v], std_[v], count_a1);
+            }
+            sB[cc * VOLTA_SMEM_K_STRIDE + kk] = __float2half(val);
+        }
+        __syncthreads();
+
+        // Each warp loads its 2x2 fragment grid and accumulates.
+        // Row strip for this warp: rows wy*32 .. wy*32 + 31 within the tile.
+        // Col strip for this warp: cols wx*32 .. wx*32 + 31 within the tile.
+        wmma::fragment<wmma::matrix_a, VOLTA_WMMA_M, VOLTA_WMMA_N, VOLTA_WMMA_K,
+                       __half, wmma::row_major> a_frag[2];
+        wmma::fragment<wmma::matrix_b, VOLTA_WMMA_M, VOLTA_WMMA_N, VOLTA_WMMA_K,
+                       __half, wmma::col_major> b_frag[2];
+
+        #pragma unroll
+        for (int i = 0; i < 2; ++i) {
+            const __half* a_ptr =
+                sA + (wy * 32 + i * 16) * VOLTA_SMEM_K_STRIDE;
+            wmma::load_matrix_sync(a_frag[i], a_ptr, VOLTA_SMEM_K_STRIDE);
+        }
+        // sB is stored row-major as [variant_col][k]; for the gram we need
+        // B = Z[:, col_tile] (samples x cols). sB[cc][kk] already equals
+        // Z[k0+kk, col0+cc], which when interpreted as a matrix with K rows
+        // and N cols requires col-major fragment loading. The SMEM layout
+        // sB[cc*stride + kk] has cc varying slowest -> col-major across
+        // (K=kk fast, N=cc slow) is exactly sB itself.
+        #pragma unroll
+        for (int j = 0; j < 2; ++j) {
+            const __half* b_ptr =
+                sB + (wx * 32 + j * 16) * VOLTA_SMEM_K_STRIDE;
+            wmma::load_matrix_sync(b_frag[j], b_ptr, VOLTA_SMEM_K_STRIDE);
+        }
+
+        #pragma unroll
+        for (int i = 0; i < 2; ++i) {
+            #pragma unroll
+            for (int j = 0; j < 2; ++j) {
+                wmma::mma_sync(acc[i][j], a_frag[i], b_frag[j], acc[i][j]);
+            }
+        }
+        __syncthreads();
+    }
+
+    // Store each fragment to shared/staging then atomicAdd into out with
+    // diagonal mirroring. Use per-warp scratch fp32 buffer.
+    __shared__ float frag_scratch[VOLTA_NWARPS][VOLTA_WMMA_M * VOLTA_WMMA_N];
+
+    #pragma unroll
+    for (int i = 0; i < 2; ++i) {
+        #pragma unroll
+        for (int j = 0; j < 2; ++j) {
+            float* sptr = frag_scratch[warp_id];
+            wmma::store_matrix_sync(sptr, acc[i][j], VOLTA_WMMA_N,
+                                    wmma::mem_row_major);
+            // All 32 lanes of this warp now write 16*16 = 256 values; each
+            // lane handles 8 elements.
+            #pragma unroll
+            for (int e = (tid & 31); e < VOLTA_WMMA_M * VOLTA_WMMA_N; e += 32) {
+                int rr_in = e / VOLTA_WMMA_N;
+                int cc_in = e % VOLTA_WMMA_N;
+                int rr = wy * 32 + i * 16 + rr_in;
+                int cc = wx * 32 + j * 16 + cc_in;
+                int u = row0 + rr;
+                int w = col0 + cc;
+                if (u < n_variants && w < n_variants && rr < VOLTA_TILE_M
+                    && cc < VOLTA_TILE_N) {
+                    float val = sptr[e];
+                    if (u <= w) {
+                        atomicAdd(&out[(size_t)u * (size_t)n_variants + w],
+                                  val);
+                        if (u != w) {
+                            atomicAdd(
+                                &out[(size_t)w * (size_t)n_variants + u],
+                                val);
+                        }
+                    }
+                }
+            }
+            __syncthreads();
+        }
+    }
+}
+"""
 
 
 # ---------------------------------------------------------------------------
@@ -290,7 +519,7 @@ def _cupy() -> Any:
     return cp
 
 
-@lru_cache(maxsize=4)
+@lru_cache(maxsize=8)
 def _compiled_module_for(name: str) -> Any:
     """Compile a RawModule containing exactly ONE kernel entry point.
 
@@ -299,9 +528,12 @@ def _compiled_module_for(name: str) -> Any:
     static limit. Only the arch-matched kernel is compiled at first use.
     """
     cp = _cupy()
-    if name not in _KERNEL_TAILS:
+    if name == _VOLTA_KERNEL_NAME:
+        source = _GEMM_GRAM_VOLTA_SRC
+    elif name in _KERNEL_TAILS:
+        source = _GEMM_GRAM_PRELUDE + _KERNEL_TAILS[name]
+    else:
         raise KeyError(f"unknown gemm_gram kernel: {name}")
-    source = _GEMM_GRAM_PRELUDE + _KERNEL_TAILS[name]
     module = cp.RawModule(
         code=source,
         options=("-std=c++14",),
@@ -315,14 +547,19 @@ def _get_kernel(name: str) -> Any:
     return _compiled_module_for(name).get_function(name)
 
 
-def _kernel_for_arch(arch: str) -> tuple[str, int, int]:
-    """Return (kernel_name, tile_m, tile_n) for the given arch."""
+def _kernel_for_arch(arch: Any) -> tuple[str, int, int]:
+    """Return (kernel_name, tile_m, tile_n) for the given arch.
+
+    ``arch`` may be a ``launch.GpuArch`` dataclass or a legacy string.
+    """
     if arch == "hopper":
         return "bitpacked_gemm_gram_fp16_kernel", 128, 256
-    if arch == "ampere":
+    if arch == "ampere" or arch == "ada":
         return "bitpacked_gemm_gram_tf32_kernel", 128, 128
-    if arch == "t4":
+    if arch == "t4" or arch == "turing":
         return "bitpacked_gemm_gram_dp4a_kernel", 64, 64
+    if arch == "volta":
+        return _VOLTA_KERNEL_NAME, 64, 64
     return "bitpacked_gemm_gram_fp32_kernel", 64, 64
 
 
@@ -383,7 +620,17 @@ def gemm_gram(
     kernel_name, _tile_m, _tile_n = _kernel_for_arch(arch)
     cfg = _launch.gemm_gram_config(n_samples, n_variants, arch)
 
-    kernel = _get_kernel(kernel_name)
+    try:
+        kernel = _get_kernel(kernel_name)
+    except Exception:  # pragma: no cover — fallback path
+        # WMMA / tensor-core kernels may fail to compile on unexpected
+        # toolchains; fall back to the always-safe fp32 path.
+        if kernel_name != "bitpacked_gemm_gram_fp32_kernel":
+            kernel_name = "bitpacked_gemm_gram_fp32_kernel"
+            kernel = _get_kernel(kernel_name)
+            cfg = _launch.gemm_gram_config(n_samples, n_variants, "unknown")
+        else:
+            raise
 
     args = (
         packed,

@@ -10,17 +10,19 @@ from sv_pgs._jax import (
     _device_names,
 )
 
-Family = Literal["turing", "ampere", "ada", "hopper", "unknown"]
-LegacyFamily = Literal["t4", "ampere", "hopper", "unknown"]
+Family = Literal["volta", "turing", "ampere", "ada", "hopper", "unknown"]
+LegacyFamily = Literal["t4", "volta", "ampere", "hopper", "unknown"]
 
 _LEGACY_TO_FAMILY: dict[str, Family] = {
     "t4": "turing",
+    "volta": "volta",
     "ampere": "ampere",
     "hopper": "hopper",
     "unknown": "unknown",
 }
 
 _FAMILY_TO_LEGACY: dict[Family, LegacyFamily] = {
+    "volta": "volta",
     "turing": "t4",
     "ampere": "ampere",
     "ada": "ampere",
@@ -71,6 +73,8 @@ def _family_from_sm(sm: int) -> Family:
         return "ampere"
     if sm == 75:
         return "turing"
+    if sm == 70 or sm == 72:
+        return "volta"
     return "unknown"
 
 
@@ -174,11 +178,12 @@ def _resolve_arch(arch: ArchLike) -> tuple[Family, int]:
         token = arch.strip().lower()
         if token in _LEGACY_TO_FAMILY:
             family: Family = _LEGACY_TO_FAMILY[token]
-        elif token in ("turing", "ampere", "ada", "hopper", "unknown"):
+        elif token in ("volta", "turing", "ampere", "ada", "hopper", "unknown"):
             family = token  # type: ignore[assignment]
         else:
             family = "unknown"
         sm_default = {
+            "volta": 70,
             "turing": 75,
             "ampere": 80,
             "ada": 89,
@@ -207,6 +212,9 @@ def gemv_nt_config(n_samples: int, n_variants: int, arch: ArchLike) -> dict:
     elif family == "turing":
         block_x = 256
         shmem = 16 * 1024
+    elif family == "volta":
+        block_x = 256
+        shmem = 16 * 1024
     else:
         block_x = 256
         shmem = 16 * 1024
@@ -230,6 +238,9 @@ def gemv_tn_config(n_samples: int, n_variants: int, arch: ArchLike) -> dict:
         block_x = 256
         shmem = 32 * 1024
     elif family == "turing":
+        block_x = 256
+        shmem = 16 * 1024
+    elif family == "volta":
         block_x = 256
         shmem = 16 * 1024
     else:
@@ -261,6 +272,12 @@ def gemm_gram_config(n_samples: int, n_variants: int, arch: ArchLike) -> dict:
         tile_m, tile_n = 64, 64
         block_x = 128
         shmem = 16 * 1024
+    elif family == "volta":
+        # V100: 64x64 output tile, 128 threads (4 warps), ~16 KB shmem cap
+        # leaves room for the WMMA scratch buffer used in the volta_mma kernel.
+        tile_m, tile_n = 64, 64
+        block_x = 128
+        shmem = 16 * 1024
     else:
         tile_m, tile_n = 64, 64
         block_x = 128
@@ -288,6 +305,9 @@ def screening_config(n_samples: int, n_variants: int, arch: ArchLike) -> dict:
         block_x = 256
         shmem = 20 * 1024
     elif family == "turing":
+        block_x = 256
+        shmem = 12 * 1024
+    elif family == "volta":
         block_x = 256
         shmem = 12 * 1024
     else:
