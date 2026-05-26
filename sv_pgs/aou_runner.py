@@ -573,6 +573,11 @@ def _cleanup_stale_partials(cache_dir: Path, prefix: str) -> None:
     patterns = (f"{prefix}*.partial.*", f"{prefix}*.tmp")
     for pattern in patterns:
         for stale in cache_dir.glob(pattern):
+            # Preserve resumable partials (and their gcloud _.gstmp siblings)
+            # so a killed gcloud-storage-cp run can pick up where it left off.
+            name = stale.name
+            if ".resume.partial" in name or name.endswith("_.gstmp"):
+                continue
             try:
                 if stale.is_file() or stale.is_symlink():
                     log(f"  cleaning stale partial: {stale}")

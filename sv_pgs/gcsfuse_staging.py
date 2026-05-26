@@ -203,6 +203,17 @@ def _unique_partial_path(local_path: Path) -> Path:
     return local_path.with_name(local_path.name + suffix)
 
 
+def _resumable_partial_path(local_path: Path) -> Path:
+    """Return a deterministic per-destination partial path for resumable copies.
+
+    Unlike ``_unique_partial_path``, this path is stable across runs so that
+    ``gcloud storage cp`` can detect its prior ``<dest>_.gstmp`` sibling and
+    resume an interrupted download from the existing byte offset. Safe because
+    ``_DestinationLock`` already serializes concurrent stagers per-dest.
+    """
+    return local_path.with_suffix(local_path.suffix + ".resume.partial")
+
+
 # ---------------------------------------------------------------------------
 # Concurrency
 # ---------------------------------------------------------------------------
@@ -1021,8 +1032,58 @@ def _stage_via_gcloud_storage(
         return False
 
     local_dest.parent.mkdir(parents=True, exist_ok=True)
-    partial = _unique_partial_path(local_dest)
+    partial = _resumable_partial_path(local_dest)
     label = log_label or local_dest.name
+
+    # Detect stale partial from a different source (e.g. AoU re-released the
+    # file). gcloud's HTTP range check protects us when sizes are consistent,
+    # but a partial larger than the expected source size cannot possibly be
+    # the prefix of the current object — drop it before we start.
+    if expected_size is not None:
+        try:
+            cur_partial_size = partial.stat().st_size
+        except OSError:
+            cur_partial_size = None
+        if cur_partial_size is not None and cur_partial_size > expected_size:
+            _LOG.warning(
+                "staging %s: discarding stale resumable partial "
+                "(%.1f GB > expected %.1f GB)",
+                label, cur_partial_size / 1e9, expected_size / 1e9,
+            )
+            try:
+                partial.unlink()
+            except OSError:
+                pass
+            gstmp_sibling = partial.with_suffix(partial.suffix + "_.gstmp")
+            # gcloud actually writes to "<dest>_.gstmp" (underscore appended to
+            # the full name, not a real suffix). Cover both shapes defensively.
+            for sib in (
+                gstmp_sibling,
+                partial.with_name(partial.name + "_.gstmp"),
+            ):
+                try:
+                    sib.unlink()
+                except OSError:
+                    pass
+
+    # Log resume case so a user grepping logs sees we kept prior progress.
+    try:
+        if partial.exists():
+            sz = partial.stat().st_size
+            _LOG.info(
+                "staging %s: resuming from existing partial (%s, %.1f GB)",
+                label, partial, sz / 1e9,
+            )
+        else:
+            gstmp = partial.with_name(partial.name + "_.gstmp")
+            if gstmp.exists():
+                sz = gstmp.stat().st_size
+                _LOG.info(
+                    "staging %s: resuming from existing .gstmp (%s, %.1f GB)",
+                    label, gstmp, sz / 1e9,
+                )
+    except OSError:
+        pass
 
     if gcloud is not None:
         cmd = [gcloud, "storage", "cp"]
@@ -1158,11 +1219,10 @@ def _stage_via_gcloud_storage(
                 proc.kill()
             except OSError:
                 pass
-        try:
-            if partial.exists():
-                partial.unlink()
-        except OSError:
-            pass
+        # Intentionally DO NOT unlink the resumable partial (or its _.gstmp
+        # sibling) on failure: leaving them lets the next run resume from the
+        # offset already on disk. On success, os.replace above renamed the
+        # partial away, so there is nothing left to clean.
 
 
 def stage_to_local_parallel(
