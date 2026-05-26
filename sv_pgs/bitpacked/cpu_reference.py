@@ -197,7 +197,13 @@ def _standardize(
 ) -> np.ndarray:
     """Return float64 ``z`` matrix of shape ``(n_variants, n_samples)``.
 
-    Missing slots (-127) -> 0. Otherwise ``(raw - mean[v]) / scale[v]``.
+    Semantics:
+      - Missing slots (-127) -> 0 (mean-imputed contribution).
+      - Non-missing slots   -> ``(raw - mean[v]) / scale[v]``.
+      - Zero-scale columns (``scale[v] <= 0``) -> entire row 0, matching the
+        kernel contract (kernels skip these variants entirely). This avoids
+        inf/NaN propagation through downstream GEMV/GEMM accumulators.
+      - Any residual non-finite entries are coerced to 0 as a final safety net.
     """
     n_variants = decoded.shape[0]
     if mean.shape != (n_variants,):
@@ -206,8 +212,20 @@ def _standardize(
         raise ValueError(f"scale shape {scale.shape} != ({n_variants},)")
     missing_mask = decoded == _PLINK_MISSING_INT8
     raw = decoded.astype(np.float64)
-    z = (raw - mean.astype(np.float64)[:, None]) / scale.astype(np.float64)[:, None]
+    mean_f64 = mean.astype(np.float64)
+    scale_f64 = scale.astype(np.float64)
+    # Guard against scale[v] == 0 (or any non-positive value): the kernel
+    # contract is that such columns contribute 0. Substitute 1.0 to keep the
+    # division finite, then zero the affected rows explicitly below.
+    zero_scale_mask = scale_f64 <= 0.0
+    safe_scale = np.where(zero_scale_mask, 1.0, scale_f64)
+    z = (raw - mean_f64[:, None]) / safe_scale[:, None]
     z[missing_mask] = 0.0
+    if np.any(zero_scale_mask):
+        z[zero_scale_mask, :] = 0.0
+    # Final safety net: coerce any stray NaN/inf to 0 (matches kernel behavior).
+    if not np.all(np.isfinite(z)):
+        z = np.where(np.isfinite(z), z, 0.0)
     return z
 
 

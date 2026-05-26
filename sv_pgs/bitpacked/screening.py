@@ -40,16 +40,16 @@ from sv_pgs.bitpacked.launch import gpu_arch, screening_config
 _KERNEL_SRC = r"""
 extern "C" {
 
-// Decode LUT: indexed by [count_a1 (0/1)][byte (0..255)][sample (0..3)].
-// Missing slot encoded as -127 to match plink.py PLINK_MISSING_INT8.
-__constant__ signed char SCREEN_DECODE_LUT[2][256][4];
-
 #ifndef SCREEN_MAX_K
 #define SCREEN_MAX_K 8
 #endif
 
+// Decode LUT is passed as a device pointer (1024 signed bytes, laid out as
+// lut[byte * 4 + sample]). The wrapper picks the count_a1 vs count_a2 variant
+// before launch and caches it per (device, count_a1). Missing slot is -127.
 __global__ void bitpacked_screening_kernel(
     const unsigned char* __restrict__ packed,
+    const signed char* __restrict__ decode_lut,
     const double* __restrict__ rhs,         // (n_samples, k) row-major, may be null
     int* __restrict__ out_count,
     double* __restrict__ out_sum,
@@ -59,7 +59,6 @@ __global__ void bitpacked_screening_kernel(
     const int n_samples,
     const int n_variants,
     const int bytes_per_variant,
-    const int count_a1,
     const int k,
     const int has_rhs)
 {
@@ -67,7 +66,6 @@ __global__ void bitpacked_screening_kernel(
     if (v >= n_variants) return;
 
     const unsigned char* row = packed + (size_t)v * (size_t)bytes_per_variant;
-    const int lut_index = count_a1 ? 1 : 0;
 
     int    local_count = 0;
     double local_sum   = 0.0;
@@ -91,7 +89,7 @@ __global__ void bitpacked_screening_kernel(
         for (int s = 0; s < 4; ++s) {
             const int sample_idx = base_sample + s;
             if (sample_idx >= n_samples) break;  // trailing padding
-            const int dose = (int)SCREEN_DECODE_LUT[lut_index][byte_val][s];
+            const int dose = (int)decode_lut[byte_val * 4 + s];
             if (dose == -127) continue;  // missing
             const double d = (double)dose;
             local_count += 1;
@@ -181,14 +179,17 @@ __global__ void bitpacked_screening_kernel(
 SCREEN_MAX_K: int = 8
 
 _kernel_cache: dict[str, Any] = {}
-_lut_uploaded: dict[int, bool] = {}
+# Per-(device, count_a1) cached LUT device buffer.
+_lut_cache: dict[tuple[int, bool], Any] = {}
 
 
-def _build_decode_lut_bytes() -> bytes:
-    """Build the 2 x 256 x 4 int8 LUT as raw bytes for __constant__ upload.
+def _build_decode_lut_host(count_a1: bool) -> Any:
+    """Build the (256 * 4,) int8 LUT for the requested PLINK convention.
 
-    Layout: ``lut[count_a1_flag][byte][sample]`` where ``count_a1_flag``
-    0 -> A2 convention, 1 -> A1 convention.
+    Returned as a flat numpy ``int8`` array laid out so that
+    ``lut[byte * 4 + sample]`` is the decoded dosage for sample ``sample`` of
+    packed byte ``byte``. Missing slot encoded as -127 to match
+    ``plink.py`` ``PLINK_MISSING_INT8``.
     """
     import numpy as np
 
@@ -197,17 +198,17 @@ def _build_decode_lut_bytes() -> bytes:
     # A2 mapping: 00->0, 01->missing, 10->1, 11->2
     a1_map = {0: 2, 1: -127, 2: 1, 3: 0}
     a2_map = {0: 0, 1: -127, 2: 1, 3: 2}
-    lut = np.zeros((2, 256, 4), dtype=np.int8)
+    chosen = a1_map if count_a1 else a2_map
+    lut = np.zeros(256 * 4, dtype=np.int8)
     for byte_val in range(256):
         codes = [(byte_val >> (2 * k)) & 0b11 for k in range(4)]
         for s, c in enumerate(codes):
-            lut[0, byte_val, s] = a2_map[c]
-            lut[1, byte_val, s] = a1_map[c]
-    return lut.tobytes()
+            lut[byte_val * 4 + s] = chosen[c]
+    return lut
 
 
 def _get_module() -> Any:
-    """Compile (once) and return the CuPy RawModule with LUT uploaded."""
+    """Compile (once) and return the CuPy RawModule for the current device."""
     import cupy as cp  # lazy
 
     dev_id = int(cp.cuda.runtime.getDevice())
@@ -219,12 +220,22 @@ def _get_module() -> Any:
             options=("--std=c++14", f"-DSCREEN_MAX_K={SCREEN_MAX_K}"),
         )
         _kernel_cache[key] = module
-    if not _lut_uploaded.get(dev_id, False):
-        lut_bytes = _build_decode_lut_bytes()
-        const_ptr = module.get_global("SCREEN_DECODE_LUT")
-        const_ptr.copy_from_host(lut_bytes, len(lut_bytes))
-        _lut_uploaded[dev_id] = True
     return module
+
+
+def _get_decode_lut_device(count_a1: bool) -> Any:
+    """Return a cached device-resident decode LUT for the current device."""
+    import cupy as cp  # lazy
+
+    dev_id = int(cp.cuda.runtime.getDevice())
+    cache_key = (dev_id, bool(count_a1))
+    buf = _lut_cache.get(cache_key)
+    if buf is None:
+        host_lut = _build_decode_lut_host(count_a1)
+        # int8 / signed char on device. Contiguous by construction.
+        buf = cp.asarray(host_lut, dtype=cp.int8)
+        _lut_cache[cache_key] = buf
+    return buf
 
 
 def screen(
@@ -280,9 +291,10 @@ def screen(
     # ---- Deprecated alias handling -----------------------------------------
     if y_resid is not None or out_y_dot is not None:
         warnings.warn(
-            "`y_resid`/`out_y_dot` are deprecated; use `rhs`/`out_dosage_rhs` "
-            "and supply `out_observed_rhs` to enable correct missingness-aware "
-            "standardization.",
+            "`y_resid`/`out_y_dot` are deprecated; switch to "
+            "`rhs`/`out_dosage_rhs` and pass `out_observed_rhs` to enable "
+            "missingness-aware standardization via "
+            "`finalize_standardized_rhs`.",
             DeprecationWarning,
             stacklevel=2,
         )
@@ -292,13 +304,14 @@ def screen(
             )
         if y_resid is None or out_y_dot is None:
             raise ValueError("deprecated path requires BOTH y_resid and out_y_dot")
-        if out_observed_rhs is None:
-            raise ValueError(
-                "deprecated path still requires `out_observed_rhs` to be passed "
-                "(needed for correct standardization under missingness)"
-            )
         rhs = y_resid
         out_dosage_rhs = out_y_dot
+        # Auto-allocate observed_rhs when omitted in the deprecated path: the
+        # legacy API didn't expose it, so callers that haven't migrated still
+        # work. The buffer is computed but silently discarded.
+        if out_observed_rhs is None:
+            _n_v_dep = int(packed.shape[0])
+            out_observed_rhs = cp.zeros(_n_v_dep, dtype=cp.float64)
 
     # ---- Basic shape/dtype validation --------------------------------------
     if packed.dtype != cp.uint8:
@@ -403,8 +416,11 @@ def screen(
     module = _get_module()
     kernel = module.get_function("bitpacked_screening_kernel")
 
+    decode_lut_dev = _get_decode_lut_device(bool(count_a1))
+
     args = (
         packed,
+        decode_lut_dev,
         cp.uint64(rhs_ptr),
         out_count,
         out_sum,
@@ -414,7 +430,6 @@ def screen(
         cp.int32(int(n_samples)),
         cp.int32(n_variants),
         cp.int32(bytes_per_variant),
-        cp.int32(1 if count_a1 else 0),
         cp.int32(k),
         cp.int32(1 if has_rhs else 0),
     )

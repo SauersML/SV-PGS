@@ -119,7 +119,7 @@ __device__ __forceinline__ float z_of_flag(
 // CuPy RawKernels don't support C++ templates across modules robustly).
 // ---------------------------------------------------------------------------
 
-#define DEFINE_GRAM_KERNEL(NAME, TILE_M, TILE_N, TILE_K)                       \
+#define DEFINE_GRAM_KERNEL(NAME, TILE_M, TILE_N, TILE_K, NTHREADS, MTH_C)      \
 __global__ void NAME(                                                          \
     const unsigned char* __restrict__ packed,                                  \
     int n_variants,                                                            \
@@ -142,27 +142,29 @@ __global__ void NAME(                                                          \
     if (row0 > col0 + TILE_N - 1) return;                                      \
                                                                                \
     const int tid = threadIdx.x;                                               \
-    const int nthreads = blockDim.x;                                           \
+    const int nthreads = NTHREADS;                                             \
                                                                                \
     /* Shared mem layout: A[TILE_M][TILE_K] + B[TILE_N][TILE_K] fp32. */       \
     __shared__ float sA[TILE_M][TILE_K];                                       \
     __shared__ float sB[TILE_N][TILE_K];                                       \
                                                                                \
-    /* Per-thread output tile: each thread owns a strided subset of the      \
-       (TILE_M x TILE_N) outputs. Use 2D thread mapping: thread (tx, ty)     \
-       handles output indices (r, c) with r % MTH == tx, c % NTH == ty.      \
-       We linearize: tx = tid % MTH, ty = tid / MTH.                          \
-       MTH * NTH must equal nthreads. */                                       \
-    const int MTH = 16;                                                        \
-    const int NTH = nthreads / MTH;                                            \
+    /* Per-thread output tile: thread (tx, ty) covers output positions       \
+       (r, c) with tx = tid % MTH_C, ty = tid / MTH_C.                        \
+       NTH = NTHREADS / MTH_C. All compile-time. */                            \
+    const int MTH = MTH_C;                                                     \
+    const int NTH = NTHREADS / MTH_C;                                          \
     const int tx = tid % MTH;                                                  \
     const int ty = tid / MTH;                                                  \
                                                                                \
-    const int RPT = (TILE_M + MTH - 1) / MTH;  /* rows per thread */           \
-    const int CPT = (TILE_N + NTH - 1) / NTH;  /* cols per thread */           \
+    /* Compile-time row/col counts per thread. */                              \
+    constexpr int RPT_C = (TILE_M + MTH_C - 1) / MTH_C;                        \
+    constexpr int NTH_C = NTHREADS / MTH_C;                                    \
+    constexpr int CPT_C = (TILE_N + NTH_C - 1) / NTH_C;                        \
+    const int RPT = RPT_C;                                                     \
+    const int CPT = CPT_C;                                                     \
                                                                                \
-    float acc[((TILE_M + 15) / 16) * ((TILE_N + 15) / 16)];                    \
-    for (int q = 0; q < RPT * CPT; ++q) acc[q] = 0.0f;                         \
+    float acc[RPT_C * CPT_C];                                                  \
+    for (int q = 0; q < RPT_C * CPT_C; ++q) acc[q] = 0.0f;                     \
                                                                                \
     /* Loop over k-tiles. */                                                   \
     for (int k0 = 0; k0 < n_samples; k0 += TILE_K) {                           \
@@ -206,7 +208,7 @@ __global__ void NAME(                                                          \
                 int cc = ty + ci * NTH;                                        \
                 float s = 0.0f;                                                \
                 if (rr < TILE_M && cc < TILE_N) {                              \
-                    #pragma unroll 8                                           \
+                    _Pragma("unroll 8")                                        \
                     for (int kk = 0; kk < TILE_K; ++kk) {                      \
                         s += sA[rr][kk] * sB[cc][kk];                          \
                     }                                                          \
@@ -242,16 +244,16 @@ __global__ void NAME(                                                          \
     }                                                                          \
 }
 
-// T4 / Turing (SM 7.5): tile 64x64, k-tile 32. DP4A-named entry; fp32 body.
-DEFINE_GRAM_KERNEL(bitpacked_gemm_gram_dp4a_kernel,  64,  64, 32)
-// Also expose the explicit fp32 fallback name.
-DEFINE_GRAM_KERNEL(bitpacked_gemm_gram_fp32_kernel,  64,  64, 32)
+// T4 / Turing (SM 7.5): tile 64x64, k-tile 32, 128 threads, MTH=16 -> NTH=8.
+DEFINE_GRAM_KERNEL(bitpacked_gemm_gram_dp4a_kernel,  64,  64, 32, 128, 16)
+// Also expose the explicit fp32 fallback name with identical params.
+DEFINE_GRAM_KERNEL(bitpacked_gemm_gram_fp32_kernel,  64,  64, 32, 128, 16)
 
-// Ampere (SM 8.x): tile 128x128, k-tile 64. TF32-named; fp32 body for v1.
-DEFINE_GRAM_KERNEL(bitpacked_gemm_gram_tf32_kernel, 128, 128, 64)
+// Ampere (SM 8.x): tile 128x128, k-tile 64, 256 threads, MTH=16 -> NTH=16.
+DEFINE_GRAM_KERNEL(bitpacked_gemm_gram_tf32_kernel, 128, 128, 64, 256, 16)
 
-// Hopper (SM 9.x): tile 128x256, k-tile 64. FP16-named; fp32 body for v1.
-DEFINE_GRAM_KERNEL(bitpacked_gemm_gram_fp16_kernel, 128, 256, 64)
+// Hopper (SM 9.x): tile 128x256, k-tile 64, 256 threads, MTH=16 -> NTH=16.
+DEFINE_GRAM_KERNEL(bitpacked_gemm_gram_fp16_kernel, 128, 256, 64, 256, 16)
 
 }  // extern "C"
 """
