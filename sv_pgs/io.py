@@ -1147,10 +1147,17 @@ def load_multi_source_dataset_from_files(
                 # Diagnostic logs are retained so a fallback always says
                 # why.
                 log("  variant stats: attempting bitpacked GPU streaming path")
+                # ``n_samples`` must be the RAW on-disk BED iid_count
+                # (``PlinkRawGenotypeMatrix.total_sample_count``), NOT the
+                # post-intersect cohort size ``raw.shape[0]``. The screening
+                # kernel uses it to compute byte offsets into the BED and
+                # validates that ``sample_intersect`` indices fall inside
+                # [0, n_samples). Passing the post-intersect count rejects
+                # every index >= len(keep_indices).
                 bitpacked_stats: VariantStatistics | None = _try_bitpacked_plink_variant_stats(
                     bed_path=path,
                     sample_indices=keep_indices,
-                    n_samples=int(raw.shape[0]),
+                    n_samples=int(getattr(raw, "total_sample_count", raw.shape[0])),
                     n_variants=int(raw.shape[1]),
                     config=config,
                 )
