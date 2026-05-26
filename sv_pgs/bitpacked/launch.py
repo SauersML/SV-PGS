@@ -273,11 +273,12 @@ def gemm_gram_config(n_samples: int, n_variants: int, arch: ArchLike) -> dict:
         block_x = 128
         shmem = 16 * 1024
     elif family == "volta":
-        # V100: 64x64 output tile, 128 threads (4 warps), ~16 KB shmem cap
-        # leaves room for the WMMA scratch buffer used in the volta_mma kernel.
-        tile_m, tile_n = 64, 64
-        block_x = 128
-        shmem = 16 * 1024
+        # V100: 128x128 output tile, 256 threads (8 warps, 2x4 frags/warp),
+        # k-tile=32 samples. Static SMEM footprint ~28 KB (20 KB sA/sB +
+        # 8 KB writeback scratch). Cap reservation at 32 KB.
+        tile_m, tile_n = 128, 128
+        block_x = 256
+        shmem = 32 * 1024
     else:
         tile_m, tile_n = 64, 64
         block_x = 128

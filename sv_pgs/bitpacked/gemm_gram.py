@@ -11,8 +11,8 @@ The DP4A / TF32 mma / FP16 mma fast paths can replace the kernel bodies later
 without changing the wrapper contract.
 
 Per-arch outer tile sizing decisions (matched in ``launch.gemm_gram_config``):
-  * Volta      (SM 7.0):  64 x 64 variants, k-tile = 16 samples,  ~4 KB shmem
-                           — uses WMMA fp16->fp32 mma (m16n16k16) for ~125 TFLOPS peak.
+  * Volta      (SM 7.0):  128 x 128 variants, k-tile = 32 samples, ~28 KB shmem
+                           — 8 warps, 2x4 WMMA fp16->fp32 frags/warp (m16n16k16).
   * T4         (SM 7.5):  64 x 64 variants, k-tile = 32 samples, ~16 KB shmem.
   * Ampere     (SM 8.x):  128 x 128 variants, k-tile = 64 samples, ~64 KB shmem.
   * Hopper     (SM 9.x):  128 x 256 variants, k-tile = 64 samples, ~96 KB shmem.
@@ -331,26 +331,39 @@ __device__ __forceinline__ float volta_z_of(
     return ((float)d - m) / s;
 }
 
-// Tile parameters: 64x64 output via 4x4 grid of 16x16 WMMA fragments.
-// 4 warps (128 threads). Warp layout: warp_id = wy*2 + wx, with wy,wx in 0..1.
-// Each warp computes a 32x32 sub-tile = 2x2 WMMA fragments.
+// Tile parameters: 128x128 output via 8x8 grid of 16x16 WMMA fragments.
+// 8 warps (256 threads) arranged 4 row-warps x 2 col-warps:
+//     warp_id = wy*2 + wx, with wy in 0..3, wx in 0..1.
+// Each warp computes a 32x64 sub-tile = 2x4 WMMA fragments.
 //
-// SMEM: sA[64][16] half + sB[64][16] half = 2048 + 2048 = 4 KB.
-//   (Plus a +8 element padding per row to avoid bank conflicts: +16*2*64*2 = 2 KB,
-//    total ~6 KB — well under any per-block static SMEM limit.)
+// k-tile = 32 samples per outer iteration, sub-divided into 2 WMMA k-steps
+// of 16 each. a_frag/b_frag are reused across i/j to keep register
+// footprint manageable: outer loop over kp in [0,1] (the WMMA k-step),
+// loading 2 a-frags and 4 b-frags per kp, then 2*4=8 mma_sync.
+// Total mma_sync per outer k-tile per warp = 16 (=2*2*4).
 //
-// k-tile = 16 samples per outer iteration.
+// SMEM: sA[128][32+8 skew] half + sB[128][32+8 skew] half
+//     = 128 * 40 * 2 * 2 = 20480 B = 20 KB.
+// Plus frag_scratch[8 warps][16*16] float = 8 KB.
+// Total static SMEM ~28 KB (under the 48 KB static limit on sm_70).
 
-#define VOLTA_TILE_M 64
-#define VOLTA_TILE_N 64
-#define VOLTA_TILE_K 16
+#define VOLTA_TILE_M 128
+#define VOLTA_TILE_N 128
+#define VOLTA_TILE_K 32
 #define VOLTA_WMMA_M 16
 #define VOLTA_WMMA_N 16
 #define VOLTA_WMMA_K 16
-#define VOLTA_NWARPS 4
+#define VOLTA_NWARPS 8
 #define VOLTA_NTHREADS (VOLTA_NWARPS * 32)
+#define VOLTA_WY 4  /* row-warps */
+#define VOLTA_WX 2  /* col-warps */
+#define VOLTA_ROWS_PER_WARP (VOLTA_TILE_M / VOLTA_WY)  /* 32 */
+#define VOLTA_COLS_PER_WARP (VOLTA_TILE_N / VOLTA_WX)  /* 64 */
+#define VOLTA_FRAGS_M (VOLTA_ROWS_PER_WARP / VOLTA_WMMA_M)  /* 2 */
+#define VOLTA_FRAGS_N (VOLTA_COLS_PER_WARP / VOLTA_WMMA_N)  /* 4 */
+#define VOLTA_KSUB (VOLTA_TILE_K / VOLTA_WMMA_K)            /* 2 */
 // SMEM column stride includes a small skew to avoid bank conflicts on
-// loads through wmma::load_matrix_sync (which reads 16-column strides).
+// 16-element WMMA loads. (stride must be a multiple of 8 for fp16.)
 #define VOLTA_SMEM_K_STRIDE (VOLTA_TILE_K + 8)
 
 extern "C" __global__ void bitpacked_gemm_gram_volta_mma_kernel(
@@ -372,30 +385,28 @@ extern "C" __global__ void bitpacked_gemm_gram_volta_mma_kernel(
     if (row0 > col0 + VOLTA_TILE_N - 1) return;
 
     const int tid = threadIdx.x;
-    const int warp_id = tid >> 5;          // 0..3
-    const int lane_id = tid & 31;
-    (void)lane_id;
-    const int wy = warp_id >> 1;           // 0..1
-    const int wx = warp_id & 1;            // 0..1
+    const int warp_id = tid >> 5;                /* 0..7 */
+    const int wy = warp_id / VOLTA_WX;           /* 0..3 */
+    const int wx = warp_id % VOLTA_WX;           /* 0..1 */
 
     // SMEM tiles (row-major, leading dim = VOLTA_SMEM_K_STRIDE).
     __shared__ __half sA[VOLTA_TILE_M * VOLTA_SMEM_K_STRIDE];
     __shared__ __half sB[VOLTA_TILE_N * VOLTA_SMEM_K_STRIDE];
 
-    // Per-warp fragment accumulators: 2x2 grid of 16x16 fp32 frags.
+    // Per-warp fragment accumulators: 2x4 grid of 16x16 fp32 frags.
     wmma::fragment<wmma::accumulator, VOLTA_WMMA_M, VOLTA_WMMA_N, VOLTA_WMMA_K, float>
-        acc[2][2];
+        acc[VOLTA_FRAGS_M][VOLTA_FRAGS_N];
     #pragma unroll
-    for (int i = 0; i < 2; ++i) {
+    for (int i = 0; i < VOLTA_FRAGS_M; ++i) {
         #pragma unroll
-        for (int j = 0; j < 2; ++j) {
+        for (int j = 0; j < VOLTA_FRAGS_N; ++j) {
             wmma::fill_fragment(acc[i][j], 0.0f);
         }
     }
 
     for (int k0 = 0; k0 < n_samples; k0 += VOLTA_TILE_K) {
-        // Cooperative load of sA[VOLTA_TILE_M][VOLTA_TILE_K] (skewed leading dim).
-        // 128 threads, 64*16 = 1024 elements -> 8 per thread.
+        // Cooperative load of sA[VOLTA_TILE_M][VOLTA_TILE_K].
+        // 256 threads, 128*32 = 4096 elements -> 16 per thread.
         #pragma unroll
         for (int idx = tid; idx < VOLTA_TILE_M * VOLTA_TILE_K; idx += VOLTA_NTHREADS) {
             int rr = idx / VOLTA_TILE_K;
@@ -429,62 +440,64 @@ extern "C" __global__ void bitpacked_gemm_gram_volta_mma_kernel(
         }
         __syncthreads();
 
-        // Each warp loads its 2x2 fragment grid and accumulates.
-        // Row strip for this warp: rows wy*32 .. wy*32 + 31 within the tile.
-        // Col strip for this warp: cols wx*32 .. wx*32 + 31 within the tile.
+        // Compute: iterate two WMMA k-steps within the k-tile.
         wmma::fragment<wmma::matrix_a, VOLTA_WMMA_M, VOLTA_WMMA_N, VOLTA_WMMA_K,
-                       __half, wmma::row_major> a_frag[2];
+                       __half, wmma::row_major> a_frag[VOLTA_FRAGS_M];
         wmma::fragment<wmma::matrix_b, VOLTA_WMMA_M, VOLTA_WMMA_N, VOLTA_WMMA_K,
-                       __half, wmma::col_major> b_frag[2];
+                       __half, wmma::col_major> b_frag[VOLTA_FRAGS_N];
 
         #pragma unroll
-        for (int i = 0; i < 2; ++i) {
-            const __half* a_ptr =
-                sA + (wy * 32 + i * 16) * VOLTA_SMEM_K_STRIDE;
-            wmma::load_matrix_sync(a_frag[i], a_ptr, VOLTA_SMEM_K_STRIDE);
-        }
-        // sB is stored row-major as [variant_col][k]; for the gram we need
-        // B = Z[:, col_tile] (samples x cols). sB[cc][kk] already equals
-        // Z[k0+kk, col0+cc], which when interpreted as a matrix with K rows
-        // and N cols requires col-major fragment loading. The SMEM layout
-        // sB[cc*stride + kk] has cc varying slowest -> col-major across
-        // (K=kk fast, N=cc slow) is exactly sB itself.
-        #pragma unroll
-        for (int j = 0; j < 2; ++j) {
-            const __half* b_ptr =
-                sB + (wx * 32 + j * 16) * VOLTA_SMEM_K_STRIDE;
-            wmma::load_matrix_sync(b_frag[j], b_ptr, VOLTA_SMEM_K_STRIDE);
-        }
-
-        #pragma unroll
-        for (int i = 0; i < 2; ++i) {
+        for (int kp = 0; kp < VOLTA_KSUB; ++kp) {
+            int kp_off = kp * VOLTA_WMMA_K;
+            // Load this warp's 2 a-frags (rows wy*32 .. wy*32+31).
             #pragma unroll
-            for (int j = 0; j < 2; ++j) {
-                wmma::mma_sync(acc[i][j], a_frag[i], b_frag[j], acc[i][j]);
+            for (int i = 0; i < VOLTA_FRAGS_M; ++i) {
+                const __half* a_ptr =
+                    sA + (wy * VOLTA_ROWS_PER_WARP + i * VOLTA_WMMA_M)
+                        * VOLTA_SMEM_K_STRIDE
+                    + kp_off;
+                wmma::load_matrix_sync(a_frag[i], a_ptr, VOLTA_SMEM_K_STRIDE);
+            }
+            // Load this warp's 4 b-frags (cols wx*64 .. wx*64+63).
+            // sB is col-major from the fragment's POV (kk fast, cc slow).
+            #pragma unroll
+            for (int j = 0; j < VOLTA_FRAGS_N; ++j) {
+                const __half* b_ptr =
+                    sB + (wx * VOLTA_COLS_PER_WARP + j * VOLTA_WMMA_N)
+                        * VOLTA_SMEM_K_STRIDE
+                    + kp_off;
+                wmma::load_matrix_sync(b_frag[j], b_ptr, VOLTA_SMEM_K_STRIDE);
+            }
+            #pragma unroll
+            for (int i = 0; i < VOLTA_FRAGS_M; ++i) {
+                #pragma unroll
+                for (int j = 0; j < VOLTA_FRAGS_N; ++j) {
+                    wmma::mma_sync(acc[i][j], a_frag[i], b_frag[j], acc[i][j]);
+                }
             }
         }
         __syncthreads();
     }
 
-    // Store each fragment to shared/staging then atomicAdd into out with
-    // diagonal mirroring. Use per-warp scratch fp32 buffer.
+    // Store each fragment to per-warp fp32 scratch then atomicAdd into out
+    // with diagonal mirroring.
     __shared__ float frag_scratch[VOLTA_NWARPS][VOLTA_WMMA_M * VOLTA_WMMA_N];
+    const int lane_id = tid & 31;
 
     #pragma unroll
-    for (int i = 0; i < 2; ++i) {
+    for (int i = 0; i < VOLTA_FRAGS_M; ++i) {
         #pragma unroll
-        for (int j = 0; j < 2; ++j) {
+        for (int j = 0; j < VOLTA_FRAGS_N; ++j) {
             float* sptr = frag_scratch[warp_id];
             wmma::store_matrix_sync(sptr, acc[i][j], VOLTA_WMMA_N,
                                     wmma::mem_row_major);
-            // All 32 lanes of this warp now write 16*16 = 256 values; each
-            // lane handles 8 elements.
+            // 32 lanes write 16*16 = 256 values; each lane handles 8.
             #pragma unroll
-            for (int e = (tid & 31); e < VOLTA_WMMA_M * VOLTA_WMMA_N; e += 32) {
+            for (int e = lane_id; e < VOLTA_WMMA_M * VOLTA_WMMA_N; e += 32) {
                 int rr_in = e / VOLTA_WMMA_N;
                 int cc_in = e % VOLTA_WMMA_N;
-                int rr = wy * 32 + i * 16 + rr_in;
-                int cc = wx * 32 + j * 16 + cc_in;
+                int rr = wy * VOLTA_ROWS_PER_WARP + i * VOLTA_WMMA_M + rr_in;
+                int cc = wx * VOLTA_COLS_PER_WARP + j * VOLTA_WMMA_N + cc_in;
                 int u = row0 + rr;
                 int w = col0 + cc;
                 if (u < n_variants && w < n_variants && rr < VOLTA_TILE_M
@@ -559,7 +572,7 @@ def _kernel_for_arch(arch: Any) -> tuple[str, int, int]:
     if arch == "t4" or arch == "turing":
         return "bitpacked_gemm_gram_dp4a_kernel", 64, 64
     if arch == "volta":
-        return _VOLTA_KERNEL_NAME, 64, 64
+        return _VOLTA_KERNEL_NAME, 128, 128
     return "bitpacked_gemm_gram_fp32_kernel", 64, 64
 
 
