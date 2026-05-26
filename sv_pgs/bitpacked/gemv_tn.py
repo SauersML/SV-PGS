@@ -1,24 +1,30 @@
 """Transpose bitpacked GEMV: g[v] += sum_i Z[i,v] * y[i].
 
-This kernel uses a *variant-tile* design: each CUDA block owns ``VPB``
-contiguous variants (default 32) instead of just one. Inside a block, the
-``BLOCK = VPB * TPV`` threads are split into ``VPB`` variant-groups of
-``TPV`` threads. Each group walks the sample axis cooperatively in chunks
-of ``CHUNK_SAMPLES`` samples (default 256 = TPV * SAMPLES_PER_THREAD), with
-each thread issuing 4-byte (uint32) loads to amortize HBM access (4 bytes
-= 16 samples per load). The ``y`` tile is cooperatively staged into shared
-memory once per chunk and re-used by all 32 variants in the block. Per-
-group partials are reduced via 2 ``__shfl_xor_sync`` rounds (TPV = 4), and
-the leader of each group writes ``out[v] += partial`` (no atomics — each
-variant has exactly one block of writers).
+Design: variant-tile per block, warp per variant, per-variant 4-entry
+coefficient table cached in shared memory.
 
-Why this beats the one-block-per-variant design:
-- 32x fewer blocks → much lower scheduling / launch overhead per variant.
-- ``y`` reads are amortized 32x across variants in the same block (shared
-  memory tile + L1 hits across variant rows).
-- 4 threads per variant gives a 4x sample-axis parallel reduction without
-  inter-warp synchronization (the 4 threads always share a warp).
-- Decode uses the same ``__constant__`` LUT layout as ``gemv_nt``.
+Key insight: every standardized contribution is one of 4 values per variant
+(one per 2-bit code). Precomputing
+``coef[code] = (raw_dosage(code) - mean) / std`` (with the missing slot set
+to 0) means the inner loop becomes a single shared-memory lookup + FMA per
+sample, with NO branches and NO constant-memory thrash. This avoids:
+
+- Repeated constant-memory LUT lookups serialized across warp lanes (the
+  baseline's bottleneck on V100).
+- Branch-heavy missing-value handling inside the unrolled inner loop.
+- High register pressure from broad per-thread inner unrolls.
+
+Layout:
+- Each block owns ``VPB`` contiguous variants (default 8), one variant per
+  warp. Block = 256 threads.
+- The block's shared memory holds: (a) a CHUNK_S-float y tile, and (b) a
+  4-float coefficient table per warp (4 * VPB = 32 floats total).
+- Each warp's 32 lanes stride along the variant's packed-byte row at
+  warp-width stride; per outer iter each lane reads ``BPL = 4`` bytes,
+  giving 16 sample contributions per lane per iter and 512 samples per
+  warp per iter.
+- Per-thread accumulator -> warp ``__shfl_xor`` reduction -> lane 0 writes
+  ``out[v] += partial`` (no atomics, each variant is owned by one warp).
 """
 
 from __future__ import annotations
@@ -32,80 +38,103 @@ _KERNEL_NAME = "bitpacked_gemv_tn_kernel"
 
 _PLINK_MISSING_INT8 = -127
 
-# Tile parameters baked into the kernel. Keep in sync with the CUDA source.
-# VPB     : variants per block
-# TPV     : threads per variant (must divide warp size 32)
-# SPT     : sample bytes per thread per inner iter (multiple of 4 for u32 loads)
-# CHUNK_S : samples processed by the block per outer iter = TPV * SPT * 4
-_VPB = 32
-_TPV = 4
-_SPT_BYTES = 16  # 16 bytes = 64 samples per thread per inner unrolled iter
-_CHUNK_S = _TPV * _SPT_BYTES * 4  # 256 samples per outer iter
+# Tile parameters baked into the kernel via -D macros.
+_VPB = 8                 # variants per block, one warp each
+_BPL = 4                 # bytes per lane per outer iter (16 samples)
+_WARP = 32
+_BLOCK = _VPB * _WARP    # 256 threads
+_CHUNK_B = _BPL * _WARP  # 128 bytes per outer iter (per row)
+_CHUNK_S = _CHUNK_B * 4  # 512 samples per outer iter
 
 _CUDA_SOURCE = r"""
 extern "C" {
 
-__constant__ signed char BITPACKED_DECODE_LUT[256 * 8];
-
 #ifndef VPB
-#define VPB 32
+#define VPB 8
 #endif
-#ifndef TPV
-#define TPV 4
-#endif
-#ifndef SPT_BYTES
-#define SPT_BYTES 16
+#ifndef BPL
+#define BPL 4
 #endif
 
-// CHUNK_S = TPV * SPT_BYTES * 4  -- samples processed per block per outer iter.
-#define CHUNK_S (TPV * SPT_BYTES * 4)
-#define BLOCK (VPB * TPV)
+#define WARP 32
+#define BLOCK (VPB * WARP)
+#define CHUNK_B (BPL * WARP)
+#define CHUNK_S (CHUNK_B * 4)
+
+// Raw dosages per 2-bit code, per count_a1 setting (missing -> 0 placeholder;
+// we zero the coefficient explicitly so this constant is unused for code=1).
+//   count_a1=true : 00->2, 01->miss, 10->1, 11->0
+//   count_a1=false: 00->0, 01->miss, 10->1, 11->2
 
 __global__ void bitpacked_gemv_tn_kernel(
-    const unsigned char* __restrict__ packed,   // (n_variants, bytes_per_variant)
-    const float* __restrict__ y,                // (n_samples,)
-    const float* __restrict__ mean,             // (n_variants,)
-    const float* __restrict__ std,              // (n_variants,)
-    float* __restrict__ out,                    // (n_variants,) accumulated INTO
+    const unsigned char* __restrict__ packed,
+    const float* __restrict__ y,
+    const float* __restrict__ mean,
+    const float* __restrict__ std_,
+    float* __restrict__ out,
     const int n_samples,
     const int n_variants,
     const int bytes_per_variant,
     const int count_a1)
 {
-    // Variant assigned to this thread (TPV threads share one variant).
     const int tid = threadIdx.x;
-    const int v_local = tid / TPV;       // 0..VPB-1
-    const int sub     = tid % TPV;       // 0..TPV-1
-    const int v_global = blockIdx.x * VPB + v_local;
+    const int warp_id = tid >> 5;
+    const int lane = tid & 31;
+    const int v_global = blockIdx.x * VPB + warp_id;
+    const int v_valid = (v_global < n_variants);
 
-    const int lut_off = count_a1 ? 0 : 1;
-
-    // Shared y-tile (CHUNK_S floats) -- cooperatively loaded each outer iter.
     extern __shared__ float smem[];
-    float* y_tile = smem;  // size = CHUNK_S floats
+    // Layout: [CHUNK_S floats: y tile][VPB * 4 floats: per-warp coef table]
+    float* y_tile = smem;
+    float* coef_tbl = smem + CHUNK_S;  // size VPB * 4
 
-    // Per-variant constants (broadcast within the variant-group; threads in
-    // the same group all load the same value -- fine, it's a single fp32 op).
-    float mv = 0.0f;
-    float inv_s = 0.0f;
-    if (v_global < n_variants) {
-        mv = mean[v_global];
-        const float sv = std[v_global];
-        // gate scale > 0 (also rejects NaN); zero-std columns contribute 0.
-        inv_s = (sv > 0.0f) ? (__frcp_rn(sv)) : 0.0f;
+    // Per-warp coefficient table: lane 0..3 of each warp loads its variant's
+    // (raw_dosage(code) - mean) / std for code in 0..3, with code=1 (missing)
+    // explicitly zeroed.
+    if (lane < 4) {
+        float c = 0.0f;
+        if (v_valid) {
+            const float mv = mean[v_global];
+            const float sv = std_[v_global];
+            const float inv_s = (sv > 0.0f) ? __frcp_rn(sv) : 0.0f;
+            float raw = 0.0f;
+            // code -> raw dosage table
+            if (count_a1) {
+                if      (lane == 0) raw = 2.0f;
+                else if (lane == 2) raw = 1.0f;
+                else if (lane == 3) raw = 0.0f;
+                // lane == 1 -> missing -> handled below
+            } else {
+                if      (lane == 0) raw = 0.0f;
+                else if (lane == 2) raw = 1.0f;
+                else if (lane == 3) raw = 2.0f;
+            }
+            if (lane == 1) {
+                c = 0.0f;  // missing -> zero contribution
+            } else {
+                c = (raw - mv) * inv_s;
+            }
+        }
+        coef_tbl[warp_id * 4 + lane] = c;
     }
+    __syncthreads();
 
-    // Row base offset (in bytes) for this variant.
+    // Each warp loads its 4 coefficients into registers (broadcast through
+    // shmem within a warp is free for repeated identical addresses, but we
+    // pull them into registers so the inner loop is shmem-bank-conflict-free).
+    const float* my_coef = coef_tbl + warp_id * 4;
+    const float c0 = my_coef[0];
+    const float c1 = my_coef[1];
+    const float c2 = my_coef[2];
+    const float c3 = my_coef[3];
+
     const size_t row_off = (size_t)v_global * (size_t)bytes_per_variant;
+    const unsigned char* row = packed + row_off;
 
     float acc = 0.0f;
 
-    // Walk samples in CHUNK_S-sized blocks.
     for (int s0 = 0; s0 < n_samples; s0 += CHUNK_S) {
-        const int chunk = (s0 + CHUNK_S <= n_samples) ? CHUNK_S : (n_samples - s0);
-
-        // Cooperatively load y[s0 : s0+chunk] into shared memory.
-        // BLOCK threads, CHUNK_S floats -> CHUNK_S / BLOCK floats per thread.
+        // Cooperative y-tile load with zero-padding past n_samples.
         #pragma unroll
         for (int k = tid; k < CHUNK_S; k += BLOCK) {
             const int s = s0 + k;
@@ -113,57 +142,46 @@ __global__ void bitpacked_gemv_tn_kernel(
         }
         __syncthreads();
 
-        if (v_global < n_variants) {
-            // This thread's byte slab within the chunk:
-            //   bytes [sub*SPT_BYTES, sub*SPT_BYTES + SPT_BYTES)
-            //   covers samples [sub*SPT_BYTES*4, (sub+1)*SPT_BYTES*4)
-            const int byte_base_in_chunk = sub * SPT_BYTES;
-            const int sample_base_in_chunk = byte_base_in_chunk * 4;
-            const int global_byte_base = (s0 >> 2) + byte_base_in_chunk;
+        if (v_valid) {
+            const int byte_base = s0 >> 2;
+            const int valid_bytes = bytes_per_variant - byte_base;
+            const int chunk_b = (valid_bytes < CHUNK_B) ? valid_bytes : CHUNK_B;
 
-            // Read SPT_BYTES bytes for this variant. Use uint32 loads where
-            // alignment + range allow it (4 bytes = 16 samples per load).
-            // Each thread reads SPT_BYTES bytes = SPT_BYTES/4 uint32s.
-            // We guard the tail (last chunk may be partial).
-            const unsigned char* row_bytes = packed + row_off + global_byte_base;
-
-            #pragma unroll
-            for (int w = 0; w < SPT_BYTES; w += 4) {
-                // Local sample range covered by this 4-byte group:
-                //   samples [sample_base_in_chunk + w*4, sample_base_in_chunk + w*4 + 16)
-                const int s_local0 = sample_base_in_chunk + w * 4;
-
-                // Skip entirely if past chunk boundary.
-                if (s_local0 >= chunk) break;
-
-                // Load 4 packed bytes. Use __ldg for byte loads; the compiler
-                // emits 4 individual LDG.E.U8 instructions which the memory
-                // pipeline coalesces along the warp.
-                const int gbb = global_byte_base + w;
-                unsigned int b0 = 0, b1 = 0, b2 = 0, b3 = 0;
-                if (gbb + 0 < bytes_per_variant) b0 = (unsigned int)__ldg(row_bytes + w + 0);
-                if (gbb + 1 < bytes_per_variant) b1 = (unsigned int)__ldg(row_bytes + w + 1);
-                if (gbb + 2 < bytes_per_variant) b2 = (unsigned int)__ldg(row_bytes + w + 2);
-                if (gbb + 3 < bytes_per_variant) b3 = (unsigned int)__ldg(row_bytes + w + 3);
-
-                // Decode 16 samples (4 bytes x 4 slots) via the constant LUT.
-                // BITPACKED_DECODE_LUT layout: [byte*8 + slot*2 + lut_off].
-                // Each fused contribution: missing -> 0; else (d - mv) * inv_s * y[i].
+            if (chunk_b == CHUNK_B) {
+                // Hot path: full chunk, no per-iter branches.
                 #pragma unroll
-                for (int bidx = 0; bidx < 4; ++bidx) {
-                    const int byte_val = (bidx == 0) ? (int)b0
-                                       : (bidx == 1) ? (int)b1
-                                       : (bidx == 2) ? (int)b2 : (int)b3;
-                    const int s_local_byte = s_local0 + bidx * 4;
+                for (int j = 0; j < BPL; ++j) {
+                    const int local_b = lane + j * WARP;
+                    const int global_b = byte_base + local_b;
+                    const unsigned int bv = (unsigned int)__ldg(row + global_b);
+                    const int s_local_byte = local_b << 2;
+                    // 4 samples per byte. Coefficient via in-register select.
                     #pragma unroll
                     for (int slot = 0; slot < 4; ++slot) {
-                        const int s_local = s_local_byte + slot;
-                        if (s_local >= chunk) break;
-                        const signed char d = BITPACKED_DECODE_LUT[(byte_val << 3) + (slot << 1) + lut_off];
-                        if (d != (signed char)-127) {
-                            const float z = ((float)d - mv) * inv_s;
-                            acc += z * y_tile[s_local];
-                        }
+                        const unsigned int code = (bv >> (2 * slot)) & 0x3u;
+                        const float coef = (code == 0u) ? c0
+                                         : (code == 1u) ? c1
+                                         : (code == 2u) ? c2 : c3;
+                        acc += coef * y_tile[s_local_byte + slot];
+                    }
+                }
+            } else {
+                // Tail chunk: bound-check byte index; y_tile is already
+                // zero-padded past n_samples.
+                #pragma unroll
+                for (int j = 0; j < BPL; ++j) {
+                    const int local_b = lane + j * WARP;
+                    if (local_b >= chunk_b) break;
+                    const int global_b = byte_base + local_b;
+                    const unsigned int bv = (unsigned int)__ldg(row + global_b);
+                    const int s_local_byte = local_b << 2;
+                    #pragma unroll
+                    for (int slot = 0; slot < 4; ++slot) {
+                        const unsigned int code = (bv >> (2 * slot)) & 0x3u;
+                        const float coef = (code == 0u) ? c0
+                                         : (code == 1u) ? c1
+                                         : (code == 2u) ? c2 : c3;
+                        acc += coef * y_tile[s_local_byte + slot];
                     }
                 }
             }
@@ -172,16 +190,13 @@ __global__ void bitpacked_gemv_tn_kernel(
         __syncthreads();
     }
 
-    // Intra-variant reduction across TPV threads (all in same warp by
-    // construction: VPB * TPV = 128, TPV = 4, so each variant's 4 threads
-    // lie in consecutive lanes of one warp).
-    // We need to reduce across lanes (lane & (TPV-1)).
+    // Warp reduction.
     #pragma unroll
-    for (int offset = TPV >> 1; offset > 0; offset >>= 1) {
+    for (int offset = 16; offset > 0; offset >>= 1) {
         acc += __shfl_xor_sync(0xFFFFFFFFu, acc, offset);
     }
 
-    if (sub == 0 && v_global < n_variants) {
+    if (lane == 0 && v_valid) {
         out[v_global] += acc;
     }
 }
@@ -190,51 +205,17 @@ __global__ void bitpacked_gemv_tn_kernel(
 """
 
 
-def _build_decode_lut_bytes() -> bytes:
-    """Build the 256x8 int8 LUT (same layout as ``gemv_nt``).
-
-    Layout: ``table[byte * 8 + slot * 2 + lut_off]`` -> dosage in {-127, 0, 1, 2}.
-    ``lut_off = 0`` for count_a1, ``lut_off = 1`` for count_a2.
-    """
-    mapping_a1 = {0b00: 2, 0b01: _PLINK_MISSING_INT8, 0b10: 1, 0b11: 0}
-    mapping_a2 = {0b00: 0, 0b01: _PLINK_MISSING_INT8, 0b10: 1, 0b11: 2}
-    table = bytearray(256 * 8)
-    for byte in range(256):
-        for slot in range(4):
-            code = (byte >> (slot * 2)) & 0b11
-            v_a1 = mapping_a1[code] & 0xFF
-            v_a2 = mapping_a2[code] & 0xFF
-            table[byte * 8 + slot * 2 + 0] = v_a1
-            table[byte * 8 + slot * 2 + 1] = v_a2
-    return bytes(table)
-
-
 @functools.lru_cache(maxsize=4)
 def _get_kernel(_key: tuple[Any, ...]) -> Any:
-    import numpy as np
-
     import cupy as cp
 
     options = (
         "--std=c++14",
         f"-DVPB={_VPB}",
-        f"-DTPV={_TPV}",
-        f"-DSPT_BYTES={_SPT_BYTES}",
+        f"-DBPL={_BPL}",
     )
     module = cp.RawModule(code=_CUDA_SOURCE, options=options)
-    kernel = module.get_function("bitpacked_gemv_tn_kernel")
-    lut_bytes = _build_decode_lut_bytes()
-    lut_host_np = np.frombuffer(lut_bytes, dtype=np.int8)
-    lut_dev = cp.asarray(lut_host_np)
-    const_ptr = module.get_global("BITPACKED_DECODE_LUT")
-    dst_ptr = const_ptr.ptr if hasattr(const_ptr, "ptr") else int(const_ptr)
-    cp.cuda.runtime.memcpy(
-        int(dst_ptr),
-        int(lut_dev.data.ptr),
-        lut_dev.nbytes,
-        cp.cuda.runtime.memcpyDeviceToDevice,
-    )
-    return kernel
+    return module.get_function("bitpacked_gemv_tn_kernel")
 
 
 def gemv_tn(
@@ -292,17 +273,14 @@ def gemv_tn(
     if n_variants == 0 or n_samples == 0:
         return
 
-    # Probe arch (still consulted for future per-arch tuning, but the kernel
-    # itself is tile-size-fixed via -D macros at compile time).
     _ = gemv_tn_config(int(n_samples), int(n_variants), gpu_arch())
 
-    block_x = _VPB * _TPV  # 128
     grid_x = (n_variants + _VPB - 1) // _VPB
     grid = (grid_x, 1, 1)
-    block = (block_x, 1, 1)
-    shmem_bytes = _CHUNK_S * 4  # CHUNK_S floats for the y tile
+    block = (_BLOCK, 1, 1)
+    shmem_bytes = (_CHUNK_S + _VPB * 4) * 4  # y tile + per-warp coef table
 
-    kernel = _get_kernel(("v1", _VPB, _TPV, _SPT_BYTES))
+    kernel = _get_kernel(("v4", _VPB, _BPL))
 
     args = (
         packed,
