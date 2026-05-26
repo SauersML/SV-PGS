@@ -28,6 +28,7 @@ import re
 import shutil
 import subprocess
 import sys
+import threading
 import time
 import uuid
 from datetime import datetime, timezone
@@ -1059,6 +1060,29 @@ def _stage_via_gcloud_storage(
 
     proc: subprocess.Popen[str] | None = None
     last_bytes = 0
+    stop_poller = threading.Event()
+    poller_thread: threading.Thread | None = None
+
+    def _poll_partial_size() -> None:
+        nonlocal last_bytes
+        while not stop_poller.is_set():
+            if proc is not None and proc.poll() is not None:
+                break
+            try:
+                cur = partial.stat().st_size
+            except (FileNotFoundError, OSError):
+                if stop_poller.wait(2.0):
+                    break
+                continue
+            if cur >= last_bytes:
+                last_bytes = cur
+                try:
+                    update_bytes("gcsfuse.stage", cur)
+                except Exception:
+                    pass
+            if stop_poller.wait(2.0):
+                break
+
     try:
         proc = subprocess.Popen(
             cmd,
@@ -1068,6 +1092,10 @@ def _stage_via_gcloud_storage(
             bufsize=1,
         )
         assert proc.stdout is not None
+        poller_thread = threading.Thread(
+            target=_poll_partial_size, daemon=True
+        )
+        poller_thread.start()
         for line in proc.stdout:
             m = _GCLOUD_PROGRESS_RE.search(line)
             if m is not None:
@@ -1121,6 +1149,9 @@ def _stage_via_gcloud_storage(
         _LOG.warning("staging %s: %s failed: %s; falling back", label, tool, e)
         return False
     finally:
+        stop_poller.set()
+        if poller_thread is not None:
+            poller_thread.join(timeout=5.0)
         _stage_region.__exit__(None, None, None)
         if proc is not None and proc.poll() is None:
             try:
