@@ -27,6 +27,7 @@ def _stub_gpu_available(monkeypatch):
         preflight, "_probe_nvidia_smi", lambda: ["GPU 0: NVIDIA T4 (UUID: GPU-fake)"]
     )
     monkeypatch.setattr(preflight, "_probe_cupy", lambda: (True, 1, None))
+    monkeypatch.setattr(preflight, "_probe_cupy_nvrtc", lambda: None)
 
 
 def _stub_lots_of_disk(monkeypatch):
@@ -104,6 +105,28 @@ def test_preflight_gpu_required_but_absent_is_fatal(tmp_path, monkeypatch):
     joined = " | ".join(report.fatal_errors)
     assert "nvidia-smi" in joined
     assert "CuPy" in joined or "cupy" in joined
+
+
+def test_preflight_nvrtc_missing_is_fatal(tmp_path, monkeypatch):
+    _set_baseline_env(monkeypatch)
+    _stub_lots_of_disk(monkeypatch)
+    monkeypatch.setattr(preflight, "is_gcsfuse_path", lambda _p: False)
+    monkeypatch.setattr(
+        preflight, "_probe_nvidia_smi", lambda: ["GPU 0: NVIDIA A100 (UUID: GPU-fake)"]
+    )
+    monkeypatch.setattr(preflight, "_probe_cupy", lambda: (True, 1, None))
+    # Simulate the AoU container symptom: runtime ok, but NVRTC dlopen fails.
+    monkeypatch.setattr(
+        preflight,
+        "_probe_cupy_nvrtc",
+        lambda: "RuntimeError: CuPy failed to load libnvrtc.so.12",
+    )
+
+    report = check_aou_preflight(tmp_path, require_gpu=True)
+    assert not report.ok
+    joined = " | ".join(report.fatal_errors)
+    assert "NVRTC" in joined or "nvrtc" in joined
+    assert "LD_LIBRARY_PATH" in joined
 
 
 def test_assert_preflight_ok_raises_with_all_errors_listed(tmp_path, monkeypatch):

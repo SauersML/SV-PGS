@@ -170,6 +170,32 @@ def _probe_cupy() -> tuple[bool, int, str | None]:
     return True, count, None
 
 
+def _probe_cupy_nvrtc() -> str | None:
+    """Compile + launch a no-op CUDA kernel to validate the NVRTC dlopen path.
+
+    ``_probe_cupy`` only calls into the CUDA Runtime (libcudart). It will succeed
+    on AoU even when ``libnvrtc.so.12`` is missing — the first real kernel
+    compile in production then fails ~40 minutes into the run with
+    ``RuntimeError: CuPy failed to load libnvrtc.so.12``. This probe forces an
+    NVRTC compile up front so the failure surfaces at preflight time.
+
+    Returns ``None`` on success, or an error string describing the failure.
+    """
+
+    try:
+        import cupy  # type: ignore[import-not-found]
+    except Exception as exc:  # noqa: BLE001
+        return f"cupy import failed: {exc!r}"
+    try:
+        kernel = cupy.RawKernel(r'extern "C" __global__ void __sv_pgs_preflight_noop() {}',
+                                "__sv_pgs_preflight_noop")
+        kernel((1,), (1,), ())
+        cupy.cuda.Stream.null.synchronize()
+    except Exception as exc:  # noqa: BLE001
+        return f"{type(exc).__name__}: {exc}"
+    return None
+
+
 # ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
@@ -309,6 +335,21 @@ def check_aou_preflight(
         fatal_errors.append(
             "CuPy imported but reports 0 visible CUDA devices."
         )
+    elif require_gpu and cupy_available:
+        # NVRTC dlopen probe — catches the missing libnvrtc.so.12 case which
+        # the runtime-only ``_probe_cupy`` cannot detect. See module docs in
+        # ``_probe_cupy_nvrtc``.
+        nvrtc_err = _probe_cupy_nvrtc()
+        if nvrtc_err is not None:
+            hint = (
+                "  hint: prepend .venv/lib/python3.*/site-packages/nvidia/*/lib "
+                "to LD_LIBRARY_PATH before launching sv-pgs (run.sh now does this "
+                "automatically; if you launched python directly, source the env "
+                "augmentation or invoke via run.sh)."
+            )
+            fatal_errors.append(
+                f"CuPy NVRTC compile probe failed: {nvrtc_err}\n{hint}"
+            )
 
     return AouPreflightReport(
         cdr_storage_path=cdr_storage_path,

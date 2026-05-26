@@ -187,3 +187,31 @@ Twelve numbered tests, transcribed from the external review section "AoU operati
 12. The `--allow-remote-hot-path-i-know-this-will-be-slow-and-fragile` override disables only the gcsfuse-rule abort; preflight, manifests, atomic publish, and locking all still run.
 
 Anything less than twelve green is not a production run.
+
+## 14. Runtime library path (LD_LIBRARY_PATH) and bitpacked smoke
+
+### 14.1 LD_LIBRARY_PATH augmentation
+
+The AoU container ships `cuda-cudart-12-9` in `/usr/local/cuda/lib64` but does NOT ship `libnvrtc.so.12`. CuPy's runtime probe (`cupy.cuda.runtime.getDeviceCount`) goes through libcudart and succeeds; the first real `RawKernel` compile then fails with:
+
+```
+RuntimeError: CuPy failed to load libnvrtc.so.12:
+OSError: libnvrtc.so.12: cannot open shared object file: No such file or directory
+```
+
+This historically surfaced ~40 minutes into a production fit when `screening_pipeline.run_screening_pass` issued its first kernel. The bitpacked GPU path returned `None` and the pipeline silently fell back to the legacy int8 streaming pass.
+
+**Fix:** `nvidia-cuda-nvrtc-cu12` (and the other CUDA runtime wheels) are installed by `uv sync --extra gpu` under `.venv/lib/python3.*/site-packages/nvidia/*/lib`. `run.sh` MUST prepend every one of those directories to `LD_LIBRARY_PATH` before launching `sv-pgs`. If a user invokes Python directly, they MUST either source the same augmentation or launch via `run.sh`.
+
+`preflight.check_aou_preflight` now compiles a no-op `RawKernel` and surfaces the libnvrtc failure as a fatal error (with a remediation hint pointing at this section).
+
+### 14.2 Bitpacked end-to-end smoke
+
+`python -m sv_pgs.bitpacked.smoke` runs a fast (~5s) synthetic-BED end-to-end check that exercises:
+
+  1. cupy import + libnvrtc dlopen (`RawKernel` compile),
+  2. `screening_pipeline.run_screening_pass` parity vs `cpu_screen`,
+  3. `BitpackedDeviceMatrix` construction,
+  4. `gemv_nt` / `gemv_tn` / `gemm_gram` parity vs the CPU reference.
+
+`run.sh` invokes the smoke as a non-fatal canary after `uv sync` and before the production fit, and supports a `--smoke` flag that runs ONLY the smoke and exits with the smoke's return code. Operators MUST run `bash run.sh --smoke` before kicking off a 90-minute fit on a new VM image.

@@ -56,6 +56,12 @@ trap _sv_pgs_run_cleanup EXIT INT TERM HUP
 #   ./run.sh                 # all 19 SNOMED diseases, both SNP-only and SNP+SV
 #   ./run.sh hypertension    # one disease, both variant sets
 #   ./run.sh all             # explicit "all"
+#   ./run.sh --smoke         # ONLY run the bitpacked end-to-end smoke check and exit
+SV_PGS_SMOKE_ONLY=0
+if [ "${1:-}" = "--smoke" ]; then
+  SV_PGS_SMOKE_ONLY=1
+  shift || true
+fi
 DISEASE="${1:-all}"
 
 REPO_DIR="$HOME/SV-PGS"
@@ -91,6 +97,64 @@ if command -v nvidia-smi >/dev/null 2>&1; then
     fi
   fi
 fi
+
+# Make the CUDA shared libraries shipped by the nvidia-* wheels under .venv
+# discoverable by cupy's runtime dlopen. The AoU container has only
+# cuda-cudart-12-9 in /usr/local/cuda/lib64 — no libnvrtc.so.12 — so cupy
+# fails at first kernel compile with:
+#   RuntimeError: CuPy failed to load libnvrtc.so.12
+# The wheels install lib*.so.* into .venv/lib/python3.*/site-packages/nvidia/*/lib;
+# prepending those dirs to LD_LIBRARY_PATH (before /usr/local/cuda/lib64) fixes it
+# without bind-mounting anything into the container.
+nvidia_libs=""
+nvidia_lib_count=0
+for lib_dir in $(ls -d .venv/lib/python3.*/site-packages/nvidia/*/lib 2>/dev/null); do
+  abs_dir="$(cd "$lib_dir" 2>/dev/null && pwd)"
+  if [ -n "$abs_dir" ]; then
+    nvidia_libs="${abs_dir}:${nvidia_libs}"
+    nvidia_lib_count=$((nvidia_lib_count + 1))
+  fi
+done
+if [ "$nvidia_lib_count" -gt 0 ]; then
+  export LD_LIBRARY_PATH="${nvidia_libs}${LD_LIBRARY_PATH:-}"
+  echo "LD_LIBRARY_PATH augmented with .venv nvidia wheel libs: ${nvidia_lib_count} dirs"
+fi
+
+# Fast-fail bitpacked GPU smoke: catches libnvrtc / kernel-compile / kernel-
+# correctness / integration breakage in ~5s, BEFORE any 90-minute production
+# run. Skipped automatically when no /dev/nvidia* device nodes are present
+# (CI / cpu-only dev shells).
+run_bitpacked_smoke() {
+  local require="${1:-soft}"  # "soft" | "strict"
+  if [ "$require" != "strict" ]; then
+    # In normal run mode, skip silently if there is no GPU on the host.
+    for nvidia_node in /dev/nvidia[0-9]* /dev/nvidiactl /dev/nvidia-uvm; do
+      [ -e "$nvidia_node" ] && break || true
+    done
+    if ! ls /dev/nvidia[0-9]* /dev/nvidiactl /dev/nvidia-uvm >/dev/null 2>&1; then
+      echo "  bitpacked smoke: skipped (no /dev/nvidia* device nodes)"
+      return 0
+    fi
+  fi
+  echo "=== BITPACKED PIPELINE SMOKE ==="
+  if .venv/bin/python -m sv_pgs.bitpacked.smoke; then
+    echo "=== END BITPACKED PIPELINE SMOKE (OK) ==="
+    return 0
+  else
+    local rc=$?
+    echo "=== END BITPACKED PIPELINE SMOKE (FAIL rc=${rc}) ==="
+    return "$rc"
+  fi
+}
+
+if [ "$SV_PGS_SMOKE_ONLY" = "1" ]; then
+  run_bitpacked_smoke strict
+  exit $?
+fi
+# Run the smoke as a non-fatal canary before the heavy steps; if it fails
+# the operator gets a clear error in the log, but we still try to continue
+# so partial diagnostics (gpu info, cache state) get printed.
+run_bitpacked_smoke soft || echo "  WARNING: bitpacked smoke failed; production run may also fail"
 
 has_nvidia_device_nodes() {
   local nodes=()

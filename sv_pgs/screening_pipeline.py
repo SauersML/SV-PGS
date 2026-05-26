@@ -24,6 +24,7 @@ kernel package, so it imports cleanly in CPU-only environments.
 from __future__ import annotations
 
 import logging
+import os
 import warnings
 from pathlib import Path
 from typing import Any, Iterator
@@ -321,6 +322,18 @@ def _screen_one_path(
                 )
                 mmap_reader = None
         fh = open(bed_path, "rb", buffering=0)
+        # On local-hot files, hint POSIX_FADV_SEQUENTIAL so the kernel pre-
+        # reads the next chunk while we're DMAing the current one to HBM.
+        # No-op on gcsfuse (the warning above already told the user to stage
+        # locally). Best-effort: ignored where fadvise is unsupported.
+        if is_local:
+            _fadvise = getattr(os, "posix_fadvise", None)
+            _seq = getattr(os, "POSIX_FADV_SEQUENTIAL", None)
+            if _fadvise is not None and _seq is not None:
+                try:
+                    _fadvise(fh.fileno(), 0, 0, _seq)
+                except OSError:
+                    pass
 
     try:
         for idx, (v_start, v_stop) in enumerate(chunks):

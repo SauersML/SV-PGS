@@ -185,7 +185,16 @@ class BedMmapReader:
         return arr.reshape(self._n_variants, self._bpv)
 
     def read_packed_range(self, start: int, stop: int) -> NDArray[np.uint8]:
-        """Return ``packed[start:stop]`` as a zero-copy view."""
+        """Return ``packed[start:stop]`` as an OWNED, freshly-allocated array.
+
+        Historically this returned a zero-copy view over the mmap, which forced
+        every caller to keep this reader alive longer than the returned data —
+        and emitted noisy ``BedMmapReader.close: outstanding views ...`` stderr
+        chatter when callers (correctly) closed the reader before releasing
+        downstream consumers. We now ``.copy()`` out of the mapping so the
+        caller owns the buffer and ``close()`` is always clean. The cost is a
+        single memcpy per chunk (~256 MiB), small relative to NVMe -> HBM DMA.
+        """
         mm = self._check_open()
         start_i = int(start)
         stop_i = int(stop)
@@ -199,13 +208,14 @@ class BedMmapReader:
             return np.empty((0, self._bpv), dtype=np.uint8)
         byte_offset = PLINK1_HEADER_SIZE + start_i * self._bpv
         byte_count = n * self._bpv
-        arr = np.frombuffer(
+        view = np.frombuffer(
             mm,
             dtype=np.uint8,
             count=byte_count,
             offset=byte_offset,
         )
-        return arr.reshape(n, self._bpv)
+        # Materialize into an owning buffer; see docstring.
+        return np.array(view, dtype=np.uint8, copy=True).reshape(n, self._bpv)
 
     def read_packed_indexed(self, indices: NDArray[np.integer]) -> NDArray[np.uint8]:
         """Gather variants by index.

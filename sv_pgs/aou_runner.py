@@ -1847,6 +1847,22 @@ def run_all_of_us(
             array_bed = download_array_plink(work_dir)
             sources.append(("plink1", array_bed))
 
+        # Surface where each genotype source actually lives — gcsfuse paths
+        # read at network speed (~36 MB/s) whereas local NVMe hits ~3 GB/s,
+        # and historical runs have silently regressed by leaving a symlink
+        # pointing into the gcsfuse mount. One log line per source makes
+        # this immediately visible at run start.
+        for kind, src_path in sources:
+            try:
+                resolved = Path(src_path).resolve()
+            except OSError:
+                resolved = Path(src_path)
+            try:
+                where = "gcsfuse" if is_gcsfuse_path(resolved) else "local-hot"
+            except Exception:  # noqa: BLE001
+                where = "unknown"
+            log(f"  source storage: {kind:<7s} {src_path} -> {resolved} [{where}]")
+
         # Carve a deterministic held-out test partition off the merged sample
         # table before we load genotypes. The split uses sample_id+seed so
         # reruns are reproducible — and so two sibling runs (e.g. SV-only vs
