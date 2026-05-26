@@ -6537,12 +6537,29 @@ def make_dense_raw_genotype_matrix(
         host_f = np.asarray(arr, dtype=np.float32)
         host_i8 = np.where(np.isnan(host_f), np.float32(PLINK_MISSING_INT8), host_f).astype(np.int8)
 
+    from sv_pgs.progress import log as _log  # local: avoid circular import at module load
+    cupy_available = _try_import_cupy() is not None
     use_bitpacked = (
         prefer == "bitpacked"
         and BitpackedDeviceMatrix is not None
-        and _try_import_cupy() is not None
+        and cupy_available
     )
     if not use_bitpacked:
+        if prefer == "bitpacked":
+            reason = (
+                "BitpackedDeviceMatrix import failed"
+                if BitpackedDeviceMatrix is None
+                else "CuPy unavailable"
+            )
+            _log(
+                f"make_dense_raw_genotype_matrix: bitpacked upgrade: SKIPPED "
+                f"(reason: {reason})"
+            )
+        else:
+            _log(
+                f"make_dense_raw_genotype_matrix: bitpacked upgrade: SKIPPED "
+                f"(reason: prefer={prefer!r} is not 'bitpacked')"
+            )
         return Int8RawGenotypeMatrix(matrix=host_i8)
 
     from sv_pgs.plink import _encode_variant  # local import: heavy module
@@ -6574,7 +6591,7 @@ def make_dense_raw_genotype_matrix(
     packed_dev = cp.asarray(packed_host)
     mean_dev = cp.asarray(means_f32)
     std_dev = cp.asarray(stds_f32)
-    return BitpackedDeviceMatrix(
+    result = BitpackedDeviceMatrix(
         packed_dev,
         n_samples,
         mean_dev,
@@ -6582,3 +6599,18 @@ def make_dense_raw_genotype_matrix(
         count_a1=True,
         properties=properties,
     )
+    try:
+        packed_bytes = int(packed_dev.nbytes)
+        side_bytes = int(mean_dev.nbytes) + int(std_dev.nbytes)
+        _log(
+            f"make_dense_raw_genotype_matrix: bitpacked upgrade: ENGAGED "
+            f"(active={n_variants} variants, n_samples={n_samples}, "
+            f"packed_bytes={packed_bytes}, side_bytes={side_bytes}, "
+            f"HBM bytes={(packed_bytes + side_bytes) / 1e9:.3f} GB)"
+        )
+    except Exception as _exc:  # noqa: BLE001 - logging never blocks the fast path
+        _log(
+            f"make_dense_raw_genotype_matrix: bitpacked upgrade: ENGAGED "
+            f"(active={n_variants} variants; size log skipped: {_exc!r})"
+        )
+    return result

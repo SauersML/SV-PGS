@@ -1,5 +1,6 @@
 __pycache__/
 .DS_Store
+.claude/
 .sv_pgs_cache/
 *.log
 diagnose_runs*.txt

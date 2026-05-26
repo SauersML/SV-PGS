@@ -131,6 +131,31 @@ class BitpackedDeviceMatrix(RawGenotypeMatrix):
         self._std = std
         self._count_a1 = bool(count_a1)
         self._properties = dict(properties) if properties is not None else {}
+        # Loud size log at construction so every BitpackedDeviceMatrix that
+        # gets built leaves a greppable record of its HBM footprint. The
+        # ratio against ``memGetInfo`` lets operators verify the active
+        # matrix hasn't accidentally eaten the entire device budget.
+        try:
+            from sv_pgs.progress import log as _log
+            packed_bytes = int(packed.nbytes)
+            side_bytes = int(mean.nbytes) + int(std.nbytes)
+            total_bytes = packed_bytes + side_bytes
+            try:
+                free_bytes, total_dev_bytes = cp.cuda.runtime.memGetInfo()
+                hbm_field = (
+                    f"hbm_used={total_bytes / 1e9:.3f}/{total_dev_bytes / 1e9:.3f} GB "
+                    f"(free={free_bytes / 1e9:.3f} GB)"
+                )
+            except Exception as _exc:  # noqa: BLE001 - memGetInfo is best-effort
+                hbm_field = f"hbm_used={total_bytes / 1e9:.3f} GB (memGetInfo failed: {_exc!r})"
+            _log(
+                f"BitpackedDeviceMatrix: n_samples={self._n_samples}, "
+                f"n_variants={self._n_variants}, "
+                f"packed_bytes={packed_bytes}, side_bytes={side_bytes}, "
+                f"{hbm_field}"
+            )
+        except Exception:  # noqa: BLE001 - logging never blocks construction
+            pass
 
     # ------------------------------------------------------------------
     # RawGenotypeMatrix ABC surface

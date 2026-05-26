@@ -32,30 +32,39 @@ def _maybe_upgrade_to_bitpacked(dataset: LoadedDataset, config: ModelConfig) -> 
     """
     backend = getattr(config, "genotype_backend", None)
     if backend != "bitpacked":
+        log(
+            "bitpacked upgrade: SKIPPED (reason: "
+            f"config.genotype_backend={backend!r} is not 'bitpacked')"
+        )
         return dataset
     try:
         import cupy as _cp  # noqa: F401 - import probe
     except ImportError as exc:
-        log(f"bitpacked backend requested but CuPy unavailable ({exc}); using int8 path")
+        log(
+            f"bitpacked upgrade: SKIPPED (reason: CuPy unavailable: {type(exc).__name__}: {exc})"
+        )
         return dataset
     from sv_pgs.genotype import _resolve_plink_pread_context  # lazy
     ctx = _resolve_plink_pread_context(dataset.genotypes)
     if ctx is None:
-        log("bitpacked backend requested but no PLINK BED resolved; using int8 path")
+        log(
+            "bitpacked upgrade: SKIPPED (reason: dataset.genotypes is not "
+            f"backed by a single PLINK BED; type={type(dataset.genotypes).__name__})"
+        )
         return dataset
     _reader, sample_indices, iid_count, bed_path = ctx
     n_variants_axis = int(dataset.genotypes.shape[1])
     sid_count = int(getattr(_reader, "sid_count", n_variants_axis) or n_variants_axis)
     if sid_count != n_variants_axis:
         log(
-            f"bitpacked backend skipped: variant subset present "
-            f"(sid_count={sid_count}, dataset variants={n_variants_axis})"
+            "bitpacked upgrade: SKIPPED (reason: variant-subset wrapper present; "
+            f"sid_count={sid_count}, dataset variants={n_variants_axis})"
         )
         return dataset
     try:
         from sv_pgs.bitpacked_loader import load_bed_to_bitpacked_device
         log(
-            f"bitpacked backend: loading BED {bed_path} -> device "
+            f"bitpacked upgrade: loading BED {bed_path} -> device "
             f"(n_samples={int(sample_indices.shape[0])}, n_variants={n_variants_axis})"
         )
         bp_matrix = load_bed_to_bitpacked_device(
@@ -65,8 +74,25 @@ def _maybe_upgrade_to_bitpacked(dataset: LoadedDataset, config: ModelConfig) -> 
             sample_indices=np.asarray(sample_indices, dtype=np.int64),
         )
     except Exception as exc:
-        log(f"bitpacked backend load failed ({type(exc).__name__}: {exc}); falling back to int8 path")
+        log(
+            "bitpacked upgrade: SKIPPED (reason: loader failed: "
+            f"{type(exc).__name__}: {exc}); falling back to int8 path"
+        )
         return dataset
+    # Loud success log: report active variant count and HBM bytes consumed by
+    # the bitpacked matrix (packed bytes + mean/std side buffers) so production
+    # runs can confirm the fast path engaged from a `grep ENGAGED` over the log.
+    try:
+        packed_bytes = int(bp_matrix._packed.nbytes)
+        side_bytes = int(bp_matrix._mean.nbytes) + int(bp_matrix._std.nbytes)
+        hbm_gb = (packed_bytes + side_bytes) / 1e9
+        log(
+            f"bitpacked upgrade: ENGAGED (active={n_variants_axis} variants, "
+            f"packed_bytes={packed_bytes}, side_bytes={side_bytes}, "
+            f"HBM bytes={hbm_gb:.3f} GB)"
+        )
+    except Exception as _exc:  # noqa: BLE001 - logging never blocks the fast path
+        log(f"bitpacked upgrade: ENGAGED (active={n_variants_axis} variants; size log skipped: {_exc!r})")
     return LoadedDataset(
         sample_ids=dataset.sample_ids,
         genotypes=bp_matrix,

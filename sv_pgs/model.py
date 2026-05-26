@@ -790,14 +790,27 @@ def _compute_marginal_z_scores_bitpacked(
     """
     try:
         from sv_pgs.bitpacked_matrix import BitpackedDeviceMatrix
-    except ImportError:
+    except ImportError as exc:
+        log(
+            "marginal-z bitpacked fast path: SKIPPED "
+            f"(reason: BitpackedDeviceMatrix import failed: {exc})"
+        )
         return None
     raw_matrix = getattr(standardized_genotypes, "raw", None)
     if not isinstance(raw_matrix, BitpackedDeviceMatrix):
+        log(
+            "marginal-z bitpacked fast path: SKIPPED "
+            f"(reason: standardized_genotypes.raw is {type(raw_matrix).__name__}, "
+            "not BitpackedDeviceMatrix)"
+        )
         return None
     try:
         import cupy as cp  # noqa: WPS433 - lazy by design
-    except ImportError:
+    except ImportError as exc:
+        log(
+            "marginal-z bitpacked fast path: SKIPPED "
+            f"(reason: CuPy unavailable: {exc})"
+        )
         return None
 
     active_idx = np.asarray(active_variant_indices, dtype=np.int32).ravel()
@@ -1492,8 +1505,8 @@ class BayesianPGS:
                     )
                     if marginal_z_scores is not None:
                         log(
-                            f"  marginal-z bitpacked fast path: one rmatvec over "
-                            f"{pre_screen_count} active variants"
+                            "marginal-z bitpacked fast path: ENGAGED "
+                            f"(one rmatvec over {pre_screen_count} active variants)"
                         )
                         if fit_stage_cache_paths is not None:
                             _save_marginal_z_cache(

@@ -2577,6 +2577,69 @@ def compute_plink_variant_statistics_cached(
     return variant_stats, int8_path if int8_path.exists() else None
 
 
+def _available_host_memory_bytes() -> int | None:
+    """Return host MemAvailable bytes via psutil, falling back to /proc/meminfo.
+
+    Returns ``None`` only when no source is reachable (e.g. macOS without
+    psutil) so callers can degrade gracefully and skip the guardrail rather
+    than refusing on a missing probe.
+    """
+    try:
+        import psutil  # type: ignore[import-not-found]
+        return int(psutil.virtual_memory().available)
+    except ImportError:
+        pass
+    try:
+        with open("/proc/meminfo", "rt", encoding="utf-8") as handle:
+            for line in handle:
+                if line.startswith("MemAvailable:"):
+                    parts = line.split()
+                    # Format: "MemAvailable:    <kB> kB"
+                    return int(parts[1]) * 1024
+    except (OSError, ValueError, IndexError):
+        pass
+    return None
+
+
+def _legacy_int8_memory_guardrail(
+    *,
+    sample_count: int,
+    variant_count: int,
+    safety_bytes: int = 4 * 1024 * 1024 * 1024,
+) -> None:
+    """Refuse the legacy int8 stats tee if free RAM is insufficient.
+
+    The bitpacked GPU streaming path consumes ~zero host RAM beyond a small
+    pinned staging buffer. The legacy int8 tee, by contrast, allocates
+    ``prefetch_depth * batch_bytes`` in flight plus the in-place stats
+    accumulators. On AoU-scale runs (78k × 695k) this peaked at 40+ GB and
+    OOM'd 30 min into the pass. Fail fast with a pointer at the bitpacked
+    path rather than letting the kernel reap us mid-stream.
+
+    Threshold: ``(prefetch_depth * batch_bytes) + safety_bytes``.
+    """
+    available = _available_host_memory_bytes()
+    if available is None:
+        return
+    tuned_batch_size = auto_batch_size_i8(int(sample_count))
+    # Mirror the in-function ``max_in_flight_writes = 4`` and add one for the
+    # active compute batch — 5 batches resident in the worst case.
+    prefetch_depth = 5
+    batch_bytes = int(sample_count) * int(tuned_batch_size)  # int8 = 1 byte/elem
+    required = prefetch_depth * batch_bytes + safety_bytes
+    if available >= required:
+        return
+    raise RuntimeError(
+        "legacy int8 PLINK stats path would exceed available host RAM "
+        f"(available={available / 1e9:.2f} GB, required={required / 1e9:.2f} GB; "
+        f"prefetch_depth={prefetch_depth}, batch_bytes={batch_bytes / 1e9:.2f} GB, "
+        f"safety={safety_bytes / 1e9:.2f} GB). "
+        "Use the bitpacked GPU streaming path via "
+        "sv_pgs.io._try_bitpacked_plink_variant_stats / "
+        "sv_pgs.pipeline._maybe_upgrade_to_bitpacked instead."
+    )
+
+
 def _compute_variant_stats_teeing_int8(
     raw_genotypes: PlinkRawGenotypeMatrix,
     *,
@@ -2592,6 +2655,11 @@ def _compute_variant_stats_teeing_int8(
     mmap. A sparse writable mmap can SIGBUS the Python process if the
     filesystem runs out of backing space during a page fault.
     """
+    # Fail fast before either path commits to a 30-min stream that will OOM.
+    _legacy_int8_memory_guardrail(
+        sample_count=int(raw_genotypes.shape[0]),
+        variant_count=int(raw_genotypes.shape[1]),
+    )
     if int8_cache_writer is None:
         return compute_variant_statistics(raw_genotypes, config=config)
     # Stream once, tee batches to the int8 cache, accumulate stats inline.

@@ -134,12 +134,22 @@ def _read_all_packed(
     """Stream all variants from the BED into ``pinned_view`` in ``chunk_bytes``
     chunks (default 256 MB)."""
     from sv_pgs.plink import PLINK1_HEADER_SIZE
+    import time as _time
+    try:
+        from sv_pgs.progress import log as _log
+    except ImportError:  # pragma: no cover - tests with stubbed progress module
+        _log = None  # type: ignore[assignment]
 
     total_bytes = n_variants * bytes_per_variant
     if total_bytes == 0:
         return
     chunk_variants = max(1, chunk_bytes // max(1, bytes_per_variant))
     cursor = 0
+    bytes_read = 0
+    last_log_bytes = 0
+    log_every_bytes = 256 * 1024 * 1024  # 256 MB cadence per spec
+    t_start = _time.monotonic()
+    total_gb = total_bytes / 1e9
     while cursor < n_variants:
         stop = min(n_variants, cursor + chunk_variants)
         byte_offset = PLINK1_HEADER_SIZE + cursor * bytes_per_variant
@@ -148,6 +158,24 @@ def _read_all_packed(
         host_offset = cursor * bytes_per_variant
         pinned_view[host_offset : host_offset + byte_length] = payload
         cursor = stop
+        bytes_read += byte_length
+        if _log is not None and bytes_read - last_log_bytes >= log_every_bytes:
+            elapsed = max(_time.monotonic() - t_start, 1e-6)
+            mb_per_sec = (bytes_read / 1e6) / elapsed
+            remaining = max(total_bytes - bytes_read, 0)
+            eta_sec = remaining / max(bytes_read / elapsed, 1.0)
+            _log(
+                f"BED stream: {bytes_read / 1e9:.2f} / {total_gb:.2f} GB "
+                f"({mb_per_sec:.1f} MB/s, ETA {eta_sec / 60.0:.1f} min)"
+            )
+            last_log_bytes = bytes_read
+    if _log is not None and bytes_read > 0:
+        elapsed = max(_time.monotonic() - t_start, 1e-6)
+        mb_per_sec = (bytes_read / 1e6) / elapsed
+        _log(
+            f"BED stream: {bytes_read / 1e9:.2f} / {total_gb:.2f} GB "
+            f"DONE ({mb_per_sec:.1f} MB/s, elapsed {elapsed / 60.0:.1f} min)"
+        )
 
 
 def _rebitpack_for_samples(

@@ -1836,6 +1836,10 @@ def run_all_of_us(
     dataset = None
     test_dataset = None
     plink_cache_warmup: _PlinkCacheWarmup | None = None
+    # Wall-clock timing for the end-of-run TIMING SUMMARY. Each phase records
+    # ``perf_counter()`` at its boundary; the summary prints the deltas at the
+    # very end of run_all_of_us so a `grep "TIMING SUMMARY"` always finds it.
+    _phase_times: dict[str, float] = {"run_start": time.perf_counter()}
     try:
         if variants in ("sv", "snp+sv"):
             for chrom in chromosomes:
@@ -1894,6 +1898,7 @@ def run_all_of_us(
                 raise RuntimeError("parallel VCF precache failed") from exc
         else:
             log("=== STEP 3.5: skipping VCF precache (no VCF sources) ===")
+        _phase_times["download_done"] = time.perf_counter()
 
         log("=== STEP 4: Load unified genome-wide TRAIN dataset ===")
         try:
@@ -1934,6 +1939,7 @@ def run_all_of_us(
             )
         inferred_trait = TraitType.BINARY if len(np.unique(dataset.targets)) <= 2 else TraitType.QUANTITATIVE
         config.trait_type = inferred_trait
+        _phase_times["load_done"] = time.perf_counter()
 
         log("=== STEP 5: Fit unified genome-wide model ===")
         log(f"  freeing dataset overhead before fit...  mem={mem()}")
@@ -1948,6 +1954,7 @@ def run_all_of_us(
             output_dir=work_dir,
             test_dataset=test_dataset,
         )
+        _phase_times["fit_done"] = time.perf_counter()
         # Atomic publish so a crash mid-write (or a concurrent disease
         # sweep racing on the same path) never leaves a truncated metadata
         # JSON that downstream tools would mis-parse as the run record.
@@ -1973,6 +1980,27 @@ def run_all_of_us(
         release_process_memory()
         log("=== UNIFIED FIT CLEANUP DONE ===")
 
+    # End-of-run TIMING SUMMARY. Each phase pulls from _phase_times when set
+    # (a crash in an earlier phase skips its key, so the summary still emits
+    # for the partial run rather than silently disappearing).
+    def _fmt_seconds(seconds: float | None) -> str:
+        if seconds is None:
+            return "n/a"
+        minutes = int(seconds // 60)
+        return f"{minutes}m {seconds - minutes * 60:.1f}s"
+
+    def _phase_delta(start_key: str, end_key: str) -> float | None:
+        if start_key in _phase_times and end_key in _phase_times:
+            return _phase_times[end_key] - _phase_times[start_key]
+        return None
+
+    _now = time.perf_counter()
+    _total = _now - _phase_times["run_start"]
+    log("=== TIMING SUMMARY ===")
+    log(f"  total:           {_fmt_seconds(_total)}")
+    log(f"  download+stage:  {_fmt_seconds(_phase_delta('run_start', 'download_done'))}")
+    log(f"  load+stats:      {_fmt_seconds(_phase_delta('download_done', 'load_done'))}")
+    log(f"  fit (incl screen + hot loop): {_fmt_seconds(_phase_delta('load_done', 'fit_done'))}")
     log("=== ALL OF US PIPELINE COMPLETE ===")
 
 
