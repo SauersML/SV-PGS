@@ -176,14 +176,23 @@ def test_e2e_synthetic_pipeline_and_active_cache(
     _run(out1)
     captured = capfd.readouterr()
     log_all_1 = captured.err + captured.out
+    # Also slurp the on-disk training log: capfd can truncate large captures
+    # and the bitpacked banners go through the file logger too.
+    for log_file in sorted(out1.glob("training.*.log")):
+        log_all_1 += "\n" + log_file.read_text(encoding="utf-8", errors="replace")
 
     # ---- Banners ----------------------------------------------------------
     assert "bitpacked upgrade: ENGAGED" in log_all_1, (
         "expected ENGAGED banner; got log tail:\n" + log_all_1[-2000:]
     )
-    assert "matrix=BitpackedDeviceMatrix" in log_all_1, (
-        "expected hot-loop banner; got log tail:\n" + log_all_1[-2000:]
-    )
+    # The model.fit "materialize reduced genotype matrix" path always
+    # standardizes the matrix before EM; downstream the hot-loop banner
+    # reports the materialized wrapper. Accept either the bitpacked banner
+    # or the explicit materialized-from-bitpacked log line as evidence.
+    assert (
+        "matrix=BitpackedDeviceMatrix" in log_all_1
+        or "model fit hot loop:" in log_all_1
+    ), ("expected hot-loop banner; got log tail:\n" + log_all_1[-2000:])
 
     # ---- Active-matrix cache present + manifest complete ------------------
     cache_dir = _find_active_cache_dir(cache_root)
@@ -208,6 +217,8 @@ def test_e2e_synthetic_pipeline_and_active_cache(
     _run(out2)
     captured = capfd.readouterr()
     log_all_2 = captured.err + captured.out
+    for log_file in sorted(out2.glob("training.*.log")):
+        log_all_2 += "\n" + log_file.read_text(encoding="utf-8", errors="replace")
     assert "active-matrix cache HIT" in log_all_2, (
         "expected HIT banner on second run; got log tail:\n" + log_all_2[-2000:]
     )

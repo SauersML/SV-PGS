@@ -155,6 +155,20 @@ if [ "$SV_PGS_SMOKE_ONLY" = "1" ]; then
   run_bitpacked_smoke strict
   exit $?
 fi
+
+if [ "$SV_PGS_VALIDATE_ONLY" = "1" ]; then
+  echo "=== VALIDATE: bitpacked smoke + e2e equivalence ==="
+  run_bitpacked_smoke strict || { echo "validate: smoke FAILED"; exit 1; }
+  echo "--- e2e equivalence test ---"
+  if .venv/bin/python -m pytest -x -v tests/test_e2e_equivalence.py 2>&1; then
+    echo "=== VALIDATE OK ==="
+    exit 0
+  else
+    rc=$?
+    echo "=== VALIDATE FAILED rc=${rc} ==="
+    exit "$rc"
+  fi
+fi
 # Run the smoke as a non-fatal canary before the heavy steps; if it fails
 # the operator gets a clear error in the log, but we still try to continue
 # so partial diagnostics (gpu info, cache state) get printed.
