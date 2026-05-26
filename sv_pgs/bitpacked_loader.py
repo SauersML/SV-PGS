@@ -960,7 +960,10 @@ def _write_active_matrix_cache(
 
     try:
         with open(packed_partial, "wb") as fh:
-            fh.write(np.ascontiguousarray(packed_host).tobytes())
+            # .tofile writes the array buffer directly to the fd without
+            # materializing a 2nd copy via .tobytes(). For a 7.3 GB packed
+            # buffer this halves peak host RAM during the cache write.
+            np.ascontiguousarray(packed_host).tofile(fh)
             fh.flush()
             os.fsync(fh.fileno())
         # np.save appends ``.npy`` to a path lacking that extension; the
