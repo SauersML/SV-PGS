@@ -24,6 +24,9 @@ import hashlib
 import json
 import logging
 import os
+import re
+import shutil
+import subprocess
 import sys
 import time
 import uuid
@@ -903,6 +906,234 @@ def _copy_and_publish_parallel(
     return bytes_copied_total
 
 
+# ---------------------------------------------------------------------------
+# Fast path: gcloud storage cp / gsutil cp -m (bypass gcsfuse network cap)
+# ---------------------------------------------------------------------------
+
+
+def _gcs_uri_for_gcsfuse_path(path: Path) -> str | None:
+    """Map a gcsfuse-mounted local path to its underlying ``gs://`` URI.
+
+    Resolves symlinks first (AoU runners often symlink placeholders INTO the
+    gcsfuse mount). Returns None if the resolved path is not under any
+    gcsfuse mount, or if we cannot recover the source bucket from
+    ``/proc/mounts``.
+    """
+    if not _is_linux():
+        return None
+    resolved = _resolve_safely(Path(path))
+    try:
+        resolved_str = str(resolved)
+    except Exception:  # noqa: BLE001
+        return None
+
+    # Scan /proc/mounts for gcsfuse entries; longest matching mount_point wins.
+    best: tuple[Path, str] | None = None
+    for mount_point, source, fstype, options in _parse_proc_mounts():
+        if not fstype.startswith("fuse"):
+            continue
+        source_lc = source.lower()
+        options_lc = options.lower()
+        fstype_lc = fstype.lower()
+        is_gcsfuse = (
+            "gcsfuse" in source_lc
+            or "gcsfuse" in options_lc
+            or "fuse.gcsfuse" in options_lc
+            or "fsname=gcsfuse" in options_lc
+            or fstype_lc == "fuse.gcsfuse"
+        )
+        if not is_gcsfuse:
+            continue
+        try:
+            resolved.relative_to(mount_point)
+        except ValueError:
+            continue
+        if best is None or len(str(mount_point)) > len(str(best[0])):
+            best = (mount_point, source)
+
+    if best is None:
+        return None
+
+    mount_point, source = best
+    # The bucket name is the source string. gcsfuse may render it as just
+    # "<bucket>" or sometimes prefixed; strip any leading scheme just in case.
+    bucket = source
+    for prefix in ("gcsfuse#", "gs://"):
+        if bucket.startswith(prefix):
+            bucket = bucket[len(prefix):]
+    # Bucket may include a subdir mount (gcsfuse --only-dir). We can't easily
+    # disambiguate from /proc/mounts options without parsing them, so trust
+    # the source-as-bucket convention used by the AoU mounts.
+    try:
+        rel = resolved.relative_to(mount_point).as_posix()
+    except ValueError:
+        return None
+    if not bucket:
+        return None
+    return f"gs://{bucket}/{rel}"
+
+
+_GCLOUD_PROGRESS_RE = re.compile(
+    r"([\d.]+)\s*([KMGT]?i?B)\s*/\s*([\d.]+)\s*([KMGT]?i?B)",
+    re.IGNORECASE,
+)
+_UNIT_FACTORS = {
+    "B": 1,
+    "KB": 10**3, "KIB": 2**10,
+    "MB": 10**6, "MIB": 2**20,
+    "GB": 10**9, "GIB": 2**30,
+    "TB": 10**12, "TIB": 2**40,
+}
+
+
+def _parse_bytes(value: str, unit: str) -> int | None:
+    try:
+        v = float(value)
+    except ValueError:
+        return None
+    factor = _UNIT_FACTORS.get(unit.upper())
+    if factor is None:
+        return None
+    return int(v * factor)
+
+
+def _stage_via_gcloud_storage(
+    src_gs_uri: str,
+    local_dest: Path,
+    *,
+    billing_project: str | None,
+    expected_size: int | None,
+    log_label: str | None,
+) -> bool:
+    """Stream ``src_gs_uri`` to a ``local_dest`` partial via gcloud / gsutil.
+
+    Streams progress lines from stderr to ``update_bytes("gcsfuse.stage", ...)``
+    so the diagnostics region tracks live bytes. Atomic publish (fsync +
+    os.replace + parent fsync) is the caller's job after this returns True.
+
+    Returns True on success (partial fully written + renamed in place), False
+    if neither gcloud nor gsutil is available or the subprocess failed.
+    """
+    gcloud = shutil.which("gcloud")
+    gsutil = shutil.which("gsutil")
+    if gcloud is None and gsutil is None:
+        return False
+
+    local_dest.parent.mkdir(parents=True, exist_ok=True)
+    partial = _unique_partial_path(local_dest)
+    label = log_label or local_dest.name
+
+    if gcloud is not None:
+        cmd = [gcloud, "storage", "cp"]
+        if billing_project:
+            cmd.append(f"--billing-project={billing_project}")
+        cmd.extend([src_gs_uri, str(partial)])
+        tool = "gcloud storage cp"
+    else:
+        cmd = [
+            gsutil,
+            "-m",
+            "-o", "GSUtil:parallel_thread_count=16",
+            "-o", "GSUtil:parallel_process_count=4",
+        ]
+        if billing_project:
+            cmd.extend(["-u", billing_project])
+        cmd.extend(["cp", src_gs_uri, str(partial)])
+        tool = "gsutil -m cp"
+
+    _LOG.info(
+        "staging %s: using %s (%s -> %s)",
+        label, tool, src_gs_uri, local_dest,
+    )
+
+    t_start = time.monotonic()
+    _stage_region = region(
+        "gcsfuse.stage",
+        bytes_total=expected_size or 0,
+        source=src_gs_uri,
+        dest=local_dest.name,
+        n_workers=1,
+        tool=tool,
+    )
+    _stage_region.__enter__()
+
+    proc: subprocess.Popen[str] | None = None
+    last_bytes = 0
+    try:
+        proc = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            bufsize=1,
+        )
+        assert proc.stdout is not None
+        for line in proc.stdout:
+            m = _GCLOUD_PROGRESS_RE.search(line)
+            if m is not None:
+                cur = _parse_bytes(m.group(1), m.group(2))
+                if cur is not None and cur >= last_bytes:
+                    last_bytes = cur
+                    update_bytes("gcsfuse.stage", cur)
+        rc = proc.wait()
+        if rc != 0:
+            _LOG.warning(
+                "staging %s: %s exited with rc=%d; falling back",
+                label, tool, rc,
+            )
+            return False
+
+        # Verify size if known.
+        try:
+            actual = partial.stat().st_size
+        except OSError:
+            _LOG.warning("staging %s: partial missing after %s", label, tool)
+            return False
+        if expected_size is not None and actual != expected_size:
+            _LOG.warning(
+                "staging %s: size mismatch after %s (%d != %d); falling back",
+                label, tool, actual, expected_size,
+            )
+            return False
+
+        # fsync the file before rename so the publish survives a crash.
+        try:
+            fd = os.open(str(partial), os.O_RDONLY)
+            try:
+                os.fsync(fd)
+            finally:
+                os.close(fd)
+        except OSError:
+            pass
+
+        os.replace(str(partial), str(local_dest))
+        _fsync_dir(local_dest.parent)
+
+        elapsed = max(time.monotonic() - t_start, 1e-6)
+        mb_per_sec = (actual / 1e6) / elapsed
+        _LOG.info(
+            "staging %s: finished via %s in %.1fs (%.0f MB/s)",
+            label, tool, elapsed, mb_per_sec,
+        )
+        update_bytes("gcsfuse.stage", actual)
+        return True
+    except (OSError, subprocess.SubprocessError) as e:
+        _LOG.warning("staging %s: %s failed: %s; falling back", label, tool, e)
+        return False
+    finally:
+        _stage_region.__exit__(None, None, None)
+        if proc is not None and proc.poll() is None:
+            try:
+                proc.kill()
+            except OSError:
+                pass
+        try:
+            if partial.exists():
+                partial.unlink()
+        except OSError:
+            pass
+
+
 def stage_to_local_parallel(
     source: Path,
     local_path: Path,
@@ -983,13 +1214,65 @@ def stage_to_local_parallel(
         except OSError:
             pass
 
-        local_size = _copy_and_publish_parallel(
-            resolved_source,
-            local_path,
-            n_workers=n_workers,
-            source_was_gcsfuse=source_was_gcsfuse,
-            log_label=log_label,
-        )
+        # --- FAST PATH: gcloud storage cp against gs:// (bypasses gcsfuse) ---
+        # gcsfuse caps single-mount throughput at ~100-200 MB/s. Going direct
+        # to the GCS XML API via `gcloud storage cp` parallel multipart uses
+        # the full NIC, typically 500-1000 MB/s on AoU.
+        local_size: int | None = None
+        if source_was_gcsfuse:
+            gs_uri = _gcs_uri_for_gcsfuse_path(resolved_source)
+            billing_project = (
+                os.environ.get("GOOGLE_PROJECT")
+                or os.environ.get("GOOGLE_CLOUD_PROJECT")
+            )
+            try:
+                src_size_hint = resolved_source.stat().st_size
+            except OSError:
+                src_size_hint = expected_size
+            if gs_uri is not None and billing_project:
+                ok = _stage_via_gcloud_storage(
+                    gs_uri,
+                    local_path,
+                    billing_project=billing_project,
+                    expected_size=src_size_hint,
+                    log_label=log_label or resolved_source.name,
+                )
+                if ok:
+                    try:
+                        local_size = local_path.stat().st_size
+                    except OSError:
+                        local_size = None
+            elif gs_uri is None:
+                _LOG.info(
+                    "staging %s: could not resolve gs:// URI; "
+                    "falling back to parallel gcsfuse pread (slower)",
+                    log_label or resolved_source.name,
+                )
+            else:
+                _LOG.info(
+                    "staging %s: no GOOGLE_PROJECT/GOOGLE_CLOUD_PROJECT set; "
+                    "falling back to parallel gcsfuse pread (slower)",
+                    log_label or resolved_source.name,
+                )
+
+        if local_size is None:
+            if (
+                source_was_gcsfuse
+                and shutil.which("gcloud") is None
+                and shutil.which("gsutil") is None
+            ):
+                _LOG.info(
+                    "staging %s: gcloud not available; "
+                    "falling back to parallel gcsfuse pread (slower)",
+                    log_label or resolved_source.name,
+                )
+            local_size = _copy_and_publish_parallel(
+                resolved_source,
+                local_path,
+                n_workers=n_workers,
+                source_was_gcsfuse=source_was_gcsfuse,
+                log_label=log_label,
+            )
         src_stat = resolved_source.stat()
         _write_manifest(
             local_path=local_path,
