@@ -33,7 +33,9 @@ from sv_pgs.genotype import (
     auto_batch_size_i8,
 )
 from sv_pgs.preprocessing import (
+    _allele_frequencies_from_means,
     _batch_all_stats_i8,
+    _means_and_scales_with_floor,
     _scales_from_centered_sum_squares,
     compute_variant_statistics,
 )
@@ -1135,23 +1137,41 @@ def load_multi_source_dataset_from_files(
                     for bim_record in _iter_plink_bim_records(path.with_suffix(".bim"))
                 ]
             else:
-                log(f"  computing variant statistics for {path.name} (single PLINK streaming pass; disk-cached)...")
-                stats, plink_int8_cache_path = compute_plink_variant_statistics_cached(
-                    raw,
-                    bed_path=path,
-                    sample_indices=keep_indices,
-                    config=config,
-                )
-                if plink_int8_cache_path is not None:
-                    int8_view = _open_plink_int8_cache_for_read(plink_int8_cache_path)
-                    if int8_view is not None:
-                        log(
-                            f"  swapping PLINK source to int8 mmap "
-                            f"({int8_view.shape[0]:,} × {int8_view.shape[1]:,}) — "
-                            "downstream passes skip bed-decode entirely"
-                        )
-                        raw = as_raw_genotype_matrix(int8_view)
-                variants_list = _build_plink_variant_defaults_from_stats(path, stats)
+                # Bitpacked-backend fast path: stream BED bytes straight to the
+                # GPU via run_screening_pass (one-pass count/sum/sumsq kernel)
+                # and skip the int8 .npy materialization entirely. The legacy
+                # int8 streaming pass below is the fallback when the backend
+                # is "int8" or when the bitpacked imports / GPU probe fail.
+                bitpacked_stats: VariantStatistics | None = None
+                if getattr(config, "genotype_backend", None) == "bitpacked":
+                    bitpacked_stats = _try_bitpacked_plink_variant_stats(
+                        bed_path=path,
+                        sample_indices=keep_indices,
+                        n_samples=int(raw.shape[0]),
+                        n_variants=int(raw.shape[1]),
+                        config=config,
+                    )
+                if bitpacked_stats is not None:
+                    stats = bitpacked_stats
+                    variants_list = _build_plink_variant_defaults_from_stats(path, stats)
+                else:
+                    log(f"  computing variant statistics for {path.name} (single PLINK streaming pass; disk-cached)...")
+                    stats, plink_int8_cache_path = compute_plink_variant_statistics_cached(
+                        raw,
+                        bed_path=path,
+                        sample_indices=keep_indices,
+                        config=config,
+                    )
+                    if plink_int8_cache_path is not None:
+                        int8_view = _open_plink_int8_cache_for_read(plink_int8_cache_path)
+                        if int8_view is not None:
+                            log(
+                                f"  swapping PLINK source to int8 mmap "
+                                f"({int8_view.shape[0]:,} × {int8_view.shape[1]:,}) — "
+                                "downstream passes skip bed-decode entirely"
+                            )
+                            raw = as_raw_genotype_matrix(int8_view)
+                    variants_list = _build_plink_variant_defaults_from_stats(path, stats)
         raw_matrices.append(raw)
         per_source_variants.append(variants_list)
         per_source_stats.append(stats)
@@ -1998,6 +2018,108 @@ def _write_plink_stats_cache(stats_path: Path, variant_stats: VariantStatistics)
         except OSError:
             pass
         raise
+
+
+def _try_bitpacked_plink_variant_stats(
+    *,
+    bed_path: Path,
+    sample_indices: NDArray,
+    n_samples: int,
+    n_variants: int,
+    config: ModelConfig,
+) -> VariantStatistics | None:
+    """Compute PLINK per-variant stats via the bitpacked GPU streaming kernel.
+
+    Streams raw BED bytes straight from disk into GPU HBM and runs
+    :func:`sv_pgs.screening_pipeline.run_screening_pass`, which emits
+    per-variant ``count`` / ``sum`` / ``sumsq`` in a single pass. The raw
+    moments are then converted to the same ``VariantStatistics`` triple
+    the legacy int8 streaming path emits and persisted to the same
+    on-disk ``plink_stats_<key>.npy`` cache so future runs short-circuit
+    via the existing ``_load_plink_stats_from_cache`` path.
+
+    Returns ``None`` (no fallback side-effects) on any import / GPU
+    failure; the caller then drops back to the legacy int8 streaming
+    pass. The int8 ``.npy`` cache is never created on this path —
+    downstream EM consumes the bitpacked device matrix directly via
+    :func:`sv_pgs.pipeline._maybe_upgrade_to_bitpacked`.
+    """
+    stats_path = _plink_stats_cache_path(bed_path, sample_indices, config)
+    cached = _load_plink_stats_from_cache(stats_path)
+    if cached is not None:
+        log(
+            f"  variant stats: bitpacked GPU streaming path (cache hit @ {stats_path.name}, "
+            f"{cached.means.shape[0]:,} variants)"
+        )
+        return cached
+
+    log("  variant stats: bitpacked GPU streaming path (single pass)")
+    try:
+        from sv_pgs.screening_pipeline import run_screening_pass  # lazy
+    except ImportError as exc:
+        log(f"  bitpacked stats path unavailable (import failed: {exc!r}); falling back to int8 streaming pass")
+        return None
+
+    sample_intersect_arr = np.asarray(sample_indices, dtype=np.int64)
+    full_cohort = (
+        sample_intersect_arr.size == n_samples
+        and np.array_equal(
+            sample_intersect_arr,
+            np.arange(n_samples, dtype=sample_intersect_arr.dtype),
+        )
+    )
+    intersect_arg: NDArray | None = None if full_cohort else sample_intersect_arr
+    effective_n_samples = (
+        int(sample_intersect_arr.shape[0]) if intersect_arg is not None else int(n_samples)
+    )
+
+    try:
+        screening = run_screening_pass(
+            [Path(bed_path)],
+            [int(n_samples)],
+            [int(n_variants)],
+            sample_intersect=intersect_arg,
+            count_a1=True,
+        )
+    except Exception as exc:
+        log(f"  bitpacked screening pass failed ({type(exc).__name__}: {exc!r}); falling back to int8 streaming pass")
+        return None
+
+    counts = np.asarray(screening["count"], dtype=np.int32)
+    sums = np.asarray(screening["sum"], dtype=np.float64)
+    sumsq = np.asarray(screening["sumsq"], dtype=np.float64)
+    # centered_sum_squares = sum(d**2) - sum(d)**2 / count, with count==0
+    # guarded so we never divide by zero. Matches the per-batch identity
+    # accumulated by _batch_all_stats / _batch_all_stats_i8 (see
+    # preprocessing.py:_means_and_scales_with_floor for the consumer).
+    safe_counts = np.maximum(counts.astype(np.int64), 1)
+    centered_sum_squares = np.maximum(sumsq - (sums * sums) / safe_counts, 0.0)
+    dosage_like = np.ones(int(n_variants), dtype=bool)
+    means, scales = _means_and_scales_with_floor(
+        sums=sums,
+        non_missing_counts=counts,
+        centered_sum_squares=centered_sum_squares,
+        sample_count=effective_n_samples,
+        minimum_scale=float(config.minimum_scale),
+    )
+    allele_frequencies = _allele_frequencies_from_means(means=means, dosage_like=dosage_like)
+    # support_counts is the non-zero-dosage count in the legacy path. The
+    # screening kernel only emits non-missing count, which is an upper
+    # bound. The downstream sparse/dense routing in
+    # genotype.py:HYBRID_SPARSE_SUPPORT_THRESHOLD treats this conservatively
+    # (variants get the dense path; correctness is unchanged).
+    variant_stats = VariantStatistics(
+        means=np.asarray(means, dtype=np.float32),
+        scales=np.asarray(scales, dtype=np.float32),
+        allele_frequencies=np.asarray(allele_frequencies, dtype=np.float32),
+        support_counts=np.asarray(counts, dtype=np.int32),
+    )
+    try:
+        _write_plink_stats_cache(stats_path, variant_stats)
+        log(f"  PLINK stats cache saved via bitpacked path ({stats_path.stat().st_size / 1e6:.1f} MB)  mem={mem()}")
+    except OSError as exc:
+        log(f"  PLINK stats cache write failed ({exc!r}); continuing without cache")
+    return variant_stats
 
 
 def _plink_int8_cache_path(
