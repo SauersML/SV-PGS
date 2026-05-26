@@ -1033,6 +1033,19 @@ def load_bed_to_bitpacked_device_cached(
             f"bitpacked active-matrix cache MISS: streaming BED then populating "
             f"{cache_subdir} (content_hash={content_hash[:12]}...)"
         )
+    # Sweep stale .partial.<pid>.<uuid> files from a prior killed run in this
+    # cache subdir before re-attempting. The bitpacked active matrix is fully
+    # reconstructable from the BED + indices, so any leftover partials are
+    # garbage by definition (the manifest above already determined we missed).
+    try:
+        cache_subdir.mkdir(parents=True, exist_ok=True)
+        for stale in cache_subdir.glob("*.partial.*"):
+            try:
+                stale.unlink()
+            except OSError:
+                pass
+    except OSError:
+        pass
     matrix = load_bed_to_bitpacked_device(
         bed_path=bed_path,
         n_samples=n_samples,
