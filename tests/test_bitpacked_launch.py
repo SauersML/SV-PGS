@@ -12,7 +12,7 @@ from sv_pgs.bitpacked.launch import (  # noqa: E402
     screening_config,
 )
 
-_KNOWN_ARCHS = ("t4", "ampere", "hopper", "unknown")
+_KNOWN_ARCHS = ("t4", "volta", "ampere", "hopper", "unknown")
 _REQUIRED_KEYS = ("grid", "block", "shmem_bytes")
 _CONFIG_FNS = (
     gemv_nt_config,

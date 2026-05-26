@@ -139,3 +139,85 @@ The bench output looks like::
 ## Data
 
 SV VCFs are sharded by chromosome under `${CDR_STORAGE_PATH}/wgs/short_read/structural_variants/vcf/full/`. Ancestry predictions with PCs are at `${CDR_STORAGE_PATH}/wgs/short_read/snpindel/aux/ancestry/ancestry_preds.tsv`. The `run-all-of-us` command handles all downloads automatically.
+
+## Troubleshooting
+
+### "Bitpacked path SKIPPED in logs"
+
+The bitpacked GPU path is the fast path. If the training log shows
+`bitpacked upgrade: SKIPPED`, scan for the parenthetical reason:
+
+```
+bitpacked upgrade: SKIPPED (reason: ...)
+```
+
+Common reasons:
+- `config.genotype_backend=...` is not `'bitpacked'` — set it explicitly.
+- `CuPy unavailable` — run `uv sync --extra gpu` and retry.
+- `dataset.genotypes is not backed by a single PLINK BED` — only the AoU
+  PLINK SNP source is bitpacked-eligible today; SV VCFs still go through
+  the legacy int8 path.
+- `variant-subset wrapper present` — disable `--variants` filtering or
+  load the source without the wrapper.
+- `loader failed: ...` — the loader logged a Python exception; see the
+  lines immediately above the SKIPPED message for the traceback.
+
+### "CuPy failed to load libnvrtc.so.12"
+
+The NVIDIA `nvrtc` wheel is not on `LD_LIBRARY_PATH`. Fix:
+
+```bash
+uv sync --extra gpu
+```
+
+`run.sh` automatically prepends the `nvidia/*` wheel `lib` directories from
+the active `.venv` to `LD_LIBRARY_PATH` before launching the CLI, so a
+fresh `uv sync --extra gpu` followed by `bash run.sh ...` is enough.
+
+### "Cold load very slow (>20 min)"
+
+Cold PLINK loads can take 15-30 minutes on the AoU CDR trio. Watch for:
+
+- `BED stream:` progress lines in the log — these show streaming
+  throughput; a healthy load shows >100 MB/s sustained.
+- `bitpacked upgrade: loading BED ... -> device via active-matrix cache
+  (cache_dir=...)` — confirms the active-matrix cache is engaged. The
+  SECOND run with the same sample intersection and variant axis is
+  ~30 seconds (cache hit) instead of 20+ minutes.
+
+If `BED stream:` lines stall, the underlying file is most likely on
+gcsfuse and the workbench VM is IOPS-starved. Stage the BED to local
+disk before launching.
+
+### "EM iterations slow"
+
+Grep the log for `model fit: matrix=BitpackedDeviceMatrix`. If the banner
+shows a different type:
+
+```
+model fit: matrix=PlinkRawGenotypeMatrix ...
+```
+
+then the bitpacked upgrade was skipped — see the first troubleshooting
+section to find the reason. EM iterations on the legacy int8 path can be
+50-100x slower than the bitpacked GPU path at AoU scale (~10 minutes vs.
+~10 seconds per outer iteration).
+
+Same banner applies on the scoring path; iter 6 added `scoring:
+matrix=BitpackedDeviceMatrix (single GPU matvec; ...)`. If scoring shows
+`scoring: matrix=PlinkRawGenotypeMatrix (legacy iter_column_batches ...)`,
+holdout / test predictions are being computed via host-streamed decode
+and will be slow at AoU scale.
+
+### "Out of memory" / "memory guardrail tripped"
+
+The legacy int8 path materializes a (samples × variants) int8 mmap, which
+at AoU scale (~78k × 700k) is ~55 GB. The memory guardrail
+(`_legacy_int8_memory_guardrail` in `sv_pgs/io.py`) refuses to start a fit
+that would OOM. Two remediations:
+
+- Engage the bitpacked path (preferred): set `config.genotype_backend =
+  "bitpacked"`. The bitpacked active matrix uses ~22 GB HBM at AoU scale
+  (packed bytes plus per-variant mean/std side buffers).
+- Reduce the variant axis: pass `--variants sv` or `--variants snp` rather
+  than `snp+sv`, or supply a `--variants-file` subset.
