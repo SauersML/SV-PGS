@@ -92,6 +92,53 @@ def _maybe_upgrade_to_bitpacked(dataset: LoadedDataset, config: ModelConfig) -> 
             f"bitpacked upgrade: variant-subset mapping recovered "
             f"(kept {variant_indices.shape[0]}/{sid_count} source variants)"
         )
+    # GPU-budget gate. Packing every dataset variant only makes sense if the
+    # resulting matrix fits in HBM with room for the rest of the fit. For AoU
+    # microarray (1.7M variants x 319k samples x 1/4 byte ~= 139 GB packed)
+    # we cannot fit a 40 GB A100, so the loader would either OOM the host on
+    # the intermediate staging buffer or the GPU on the final allocation —
+    # both wasted work. Active-variant selection happens later inside
+    # model.fit, after which the int8/GPU-resident path uploads a much
+    # smaller block. Skip the upgrade here when the projection won't fit.
+    n_samples_eff = int(sample_indices.shape[0])
+    src_bpv = (int(iid_count) + 3) // 4
+    dst_bpv = (n_samples_eff + 3) // 4
+    packed_device_bytes = n_variants_axis * dst_bpv
+    src_packed_bytes = n_variants_axis * src_bpv
+    try:
+        import cupy as _cp_for_budget  # noqa: F401
+        gpu_free_bytes, gpu_total_bytes = _cp_for_budget.cuda.Device().mem_info
+    except Exception:  # noqa: BLE001
+        gpu_free_bytes, gpu_total_bytes = 0, 0
+    # Reserve ~25% of free HBM for downstream allocations (EM scratch,
+    # standardization side buffers, prefetch). If packed_device_bytes doesn't
+    # leave that headroom, skip — the int8 fit-stage path will load the
+    # post-active subset which is much smaller.
+    headroom_bytes = max(int(gpu_free_bytes * 0.25), 4 * 1024**3)
+    if gpu_free_bytes > 0 and packed_device_bytes + headroom_bytes > gpu_free_bytes:
+        log(
+            "bitpacked upgrade: SKIPPED (reason: packed matrix would not fit HBM; "
+            f"packed={packed_device_bytes/1e9:.1f} GB, gpu_free={gpu_free_bytes/1e9:.1f} GB, "
+            f"reserved_headroom={headroom_bytes/1e9:.1f} GB). "
+            "Active-variant selection in model.fit will load a smaller subset."
+        )
+        return dataset
+    # Host-RAM gate: the indexed cold-load currently allocates one numpy buffer
+    # of size n_variants * src_bpv (=194 GB on AoU) before rebitpacking down
+    # to the requested sample subset. Until that path is chunked, gate on
+    # available host RAM with a 1.5x safety factor.
+    try:
+        import psutil  # type: ignore
+        host_free_bytes = int(psutil.virtual_memory().available)
+    except ImportError:
+        host_free_bytes = 0
+    if host_free_bytes > 0 and src_packed_bytes * 3 // 2 > host_free_bytes:
+        log(
+            "bitpacked upgrade: SKIPPED (reason: cold-load staging buffer would "
+            f"exceed host RAM; need~{src_packed_bytes * 3 // 2 / 1e9:.1f} GB, "
+            f"host_free={host_free_bytes/1e9:.1f} GB)."
+        )
+        return dataset
     try:
         from sv_pgs.bitpacked_loader import (
             load_bed_to_bitpacked_device_cached,
