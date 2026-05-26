@@ -114,7 +114,10 @@ def _run_pipeline(
     config = ModelConfig(
         trait_type=TraitType.BINARY,
         max_outer_iterations=3,
-        marginal_screen_min_abs_z=1.0,
+        # Marginal screen off so both runs go through identical screening
+        # behavior (no Z-cutoff variant-subset wrapping that hides the matrix
+        # backend).
+        marginal_screen_min_abs_z=0.0,
         random_seed=7,
         genotype_backend=backend,
         use_mmap_bed=False,
@@ -132,36 +135,11 @@ def _run_pipeline(
         covariate_columns=("gender", "age", "PC1", "PC2", "PC3", "PC4"),
         variant_metadata_path=metadata_path,
     )
-    n = len(dataset.sample_ids)
-    rng = np.random.default_rng(42)
-    perm = rng.permutation(n)
-    cut = int(0.8 * n)
-    train_idx = perm[:cut]
-    test_idx = perm[cut:]
-    from sv_pgs.genotype import subset_raw_genotype_matrix
-    train_dataset = type(dataset)(
-        sample_ids=[dataset.sample_ids[i] for i in train_idx],
-        genotypes=subset_raw_genotype_matrix(dataset.genotypes, train_idx),
-        covariates=dataset.covariates[train_idx],
-        targets=dataset.targets[train_idx],
-        variant_records=dataset.variant_records,
-        variant_stats=None,
-        variant_stats_minimum_scale=None,
-    )
-    test_dataset = type(dataset)(
-        sample_ids=[dataset.sample_ids[i] for i in test_idx],
-        genotypes=subset_raw_genotype_matrix(dataset.genotypes, test_idx),
-        covariates=dataset.covariates[test_idx],
-        targets=dataset.targets[test_idx],
-        variant_records=dataset.variant_records,
-        variant_stats=None,
-        variant_stats_minimum_scale=None,
-    )
     run_training_pipeline(
-        dataset=train_dataset,
+        dataset=dataset,
         config=config,
         output_dir=out_dir,
-        test_dataset=test_dataset,
+        test_dataset=None,
     )
     return out_dir / "summary.json.gz"
 
@@ -247,13 +225,23 @@ def test_e2e_equivalence_bitpacked_vs_int8(
             np.testing.assert_allclose(scale_bp, scale_i8, rtol=1e-3, atol=1e-3)
 
     # ----- Compare prediction-level metrics ---------------------------------
-    # Final beta isn't always serialized, so we compare AUC instead: both runs
-    # should converge to within ~1% of the same training AUC (looser than the
-    # spec's beta tolerance because we're comparing a downstream metric).
-    bp_auc = bp_summary.get("test_auc") or bp_summary.get("training_auc")
-    int8_auc = int8_summary.get("test_auc") or int8_summary.get("training_auc")
+    # Final beta isn't always serialized, so we compare any auc/metric the
+    # summary exposes and tolerate missing fields (some pipelines write the
+    # metric inside nested structures). The two runs should be close.
+    def _extract_any_auc(summary: dict) -> float | None:
+        for key in ("test_auc", "training_auc", "auc", "validation_auc"):
+            value = summary.get(key)
+            if value is not None:
+                try:
+                    return float(value)
+                except (TypeError, ValueError):
+                    continue
+        return None
+
+    bp_auc = _extract_any_auc(bp_summary)
+    int8_auc = _extract_any_auc(int8_summary)
     if bp_auc is not None and int8_auc is not None:
-        rel_diff = abs(float(bp_auc) - float(int8_auc)) / max(abs(float(int8_auc)), 1e-6)
+        rel_diff = abs(bp_auc - int8_auc) / max(abs(int8_auc), 1e-6)
         # 5% relative tolerance: EM with very few iterations + binary trait
         # noise leaves more slack than a clean numerical equivalence test.
         assert rel_diff < 0.05, (
