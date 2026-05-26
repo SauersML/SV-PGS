@@ -32,6 +32,7 @@ from typing import Any, Iterator
 
 import numpy as np
 
+from sv_pgs.diagnostics import region, update_bytes
 from sv_pgs.plink import (
     PLINK1_HEADER_SIZE,
     PLINK1_MAGIC,
@@ -405,8 +406,25 @@ def _screen_one_path(
                 count_a1,
             )
 
+    path_total_bytes = int(n_variants) * int(bpv_src)
+    processed_bytes = 0
+    _path_region_cm = region(
+        "screening.path",
+        bytes_total=path_total_bytes,
+        bed=bed_path.name,
+        n_chunks=len(chunks),
+    )
+    _path_region_cm.__enter__()
     try:
         for idx, (v_start, v_stop) in enumerate(chunks):
+            _chunk_region_cm = region(
+                "screening.chunk",
+                chunk_idx=idx,
+                n_chunks=len(chunks),
+                v_start=v_start,
+                v_stop=v_stop,
+            )
+            _chunk_region_cm.__enter__()
             slot = idx % 2
             n_rows = v_stop - v_start
             n_bytes_src = n_rows * bpv_src
@@ -523,7 +541,19 @@ def _screen_one_path(
                 raw_n_samples=(n_samples if sample_intersect_dev is not None else None),
             )
             compute_done[slot].record(compute_stream)
+            processed_bytes += n_bytes_src
+            update_bytes("screening.path", processed_bytes)
+            _chunk_region_cm.__exit__(None, None, None)
     finally:
+        try:
+            # Close any chunk region that was left open by an exception.
+            _chunk_region_cm.__exit__(None, None, None)
+        except (RuntimeError, NameError, UnboundLocalError):
+            pass
+        try:
+            _path_region_cm.__exit__(None, None, None)
+        except RuntimeError:
+            pass
         if rebitpack_executor is not None:
             # Cancel any still-pending futures before tearing down the pool
             # (e.g. on early-exit due to an exception in the GPU loop).

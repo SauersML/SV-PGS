@@ -2757,7 +2757,18 @@ def _compute_variant_stats_teeing_int8(
         last_commit_time = _time.monotonic()
         last_commit_variants = variants_done
 
-    with ThreadPoolExecutor(max_workers=1) as write_executor:
+    # Approximate raw decoded bytes (1 byte/sample/variant for int8).
+    _legacy_total_bytes = int(sample_count) * int(variant_count)
+    _legacy_processed_bytes = int(sample_count) * int(variants_done)
+    from sv_pgs.diagnostics import region as _diag_region, update_bytes as _diag_update
+    with ThreadPoolExecutor(max_workers=1) as write_executor, _diag_region(
+        "legacy_int8_stats",
+        bytes_total=_legacy_total_bytes,
+        n_samples=sample_count,
+        n_variants=variant_count,
+        batch_size=tuned_batch_size,
+    ):
+        _diag_update("legacy_int8_stats", _legacy_processed_bytes)
         try:
             while True:
                 fetch_start = _time.monotonic()
@@ -2794,6 +2805,8 @@ def _compute_variant_stats_teeing_int8(
                 while len(in_flight_writes) > max_in_flight_writes:
                     wait_for_oldest_write()
                 variants_done += batch_indices.shape[0]
+                _legacy_processed_bytes = int(sample_count) * int(variants_done)
+                _diag_update("legacy_int8_stats", _legacy_processed_bytes)
                 commit_progress()
                 tee_seconds += _time.monotonic() - tee_wait_start
                 cumulative_fetch += fetch_seconds

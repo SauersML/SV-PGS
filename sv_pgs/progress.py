@@ -429,6 +429,19 @@ def _heartbeat_tick(interval_seconds: float, main_thread_id: int) -> None:
         log("  main-thread stack (deepest first):")
         for frame_line in stack_lines:
             log(f"    {frame_line}")
+        # Named-region snapshot: copy out under the diagnostics lock,
+        # then log outside it so heartbeat I/O never blocks region
+        # open/close on the main thread.
+        try:
+            from sv_pgs.diagnostics import format_region_line, snapshot
+
+            region_entries = snapshot()
+        except ImportError:
+            region_entries = []
+        if region_entries:
+            log(f"  active regions ({len(region_entries)}):")
+            for entry in region_entries:
+                log(f"    {format_region_line(entry)}")
         log(f"  gpu: {nvidia}")
         log(f"  gpu_mempool: {cupy_info}")
     except (OSError, RuntimeError, ValueError) as error:

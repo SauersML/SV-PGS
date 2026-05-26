@@ -290,6 +290,7 @@ def _read_all_packed(
         from sv_pgs.progress import log as _log
     except ImportError:  # pragma: no cover - tests with stubbed progress module
         _log = None  # type: ignore[assignment]
+    from sv_pgs.diagnostics import region as _diag_region, update_bytes as _diag_update
 
     total_bytes = n_variants * bytes_per_variant
     if total_bytes == 0:
@@ -301,7 +302,9 @@ def _read_all_packed(
     log_every_bytes = 256 * 1024 * 1024  # 256 MB cadence per spec
     t_start = _time.monotonic()
     total_gb = total_bytes / 1e9
-    while cursor < n_variants:
+    _source_repr = str(getattr(reader, "filepath", None) or getattr(reader, "_path", "?"))
+    with _diag_region("bed_stream", bytes_total=int(total_bytes), source=_source_repr):
+     while cursor < n_variants:
         stop = min(n_variants, cursor + chunk_variants)
         byte_offset = PLINK1_HEADER_SIZE + cursor * bytes_per_variant
         byte_length = (stop - cursor) * bytes_per_variant
@@ -310,6 +313,7 @@ def _read_all_packed(
         pinned_view[host_offset : host_offset + byte_length] = payload
         cursor = stop
         bytes_read += byte_length
+        _diag_update("bed_stream", bytes_read)
         if _log is not None and bytes_read - last_log_bytes >= log_every_bytes:
             elapsed = max(_time.monotonic() - t_start, 1e-6)
             mb_per_sec = (bytes_read / 1e6) / elapsed
