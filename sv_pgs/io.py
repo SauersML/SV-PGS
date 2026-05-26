@@ -1142,8 +1142,34 @@ def load_multi_source_dataset_from_files(
                 # and skip the int8 .npy materialization entirely. The legacy
                 # int8 streaming pass below is the fallback when the backend
                 # is "int8" or when the bitpacked imports / GPU probe fail.
+                #
+                # Gate diagnostics: emit one unconditional log line so a
+                # production run always shows which path was selected and
+                # WHY. Three knobs control the gate (highest precedence
+                # first):
+                #   1. ``SV_PGS_BITPACKED_STATS=1`` forces the bitpacked
+                #      stats path regardless of the config / other env vars.
+                #   2. ``SV_PGS_GENOTYPE_BACKEND`` (env) overrides the
+                #      config field — same value space as the config
+                #      ("bitpacked" / "int8"). Default "bitpacked".
+                #   3. ``config.genotype_backend`` field (default
+                #      "bitpacked" per sv_pgs/config.py).
+                config_backend = getattr(config, "genotype_backend", None)
+                env_backend = os.environ.get("SV_PGS_GENOTYPE_BACKEND")
+                force_bitpacked_stats = os.environ.get("SV_PGS_BITPACKED_STATS", "").strip() in ("1", "true", "TRUE", "yes", "on")
+                effective_backend = (
+                    "bitpacked" if force_bitpacked_stats
+                    else (env_backend.strip().lower() if env_backend else (config_backend or "bitpacked"))
+                )
+                log(
+                    f"  variant stats gate: config.genotype_backend={config_backend!r} "
+                    f"SV_PGS_GENOTYPE_BACKEND={env_backend!r} "
+                    f"SV_PGS_BITPACKED_STATS={force_bitpacked_stats} "
+                    f"-> effective={effective_backend!r}"
+                )
                 bitpacked_stats: VariantStatistics | None = None
-                if getattr(config, "genotype_backend", None) == "bitpacked":
+                if effective_backend == "bitpacked":
+                    log("  variant stats: attempting bitpacked GPU streaming path")
                     bitpacked_stats = _try_bitpacked_plink_variant_stats(
                         bed_path=path,
                         sample_indices=keep_indices,
@@ -1151,6 +1177,10 @@ def load_multi_source_dataset_from_files(
                         n_variants=int(raw.shape[1]),
                         config=config,
                     )
+                    if bitpacked_stats is None:
+                        log("  variant stats: bitpacked path returned None (see prior log); falling back to legacy int8 streaming pass")
+                else:
+                    log(f"  variant stats: bitpacked path NOT attempted (effective_backend={effective_backend!r}); using legacy int8 streaming pass")
                 if bitpacked_stats is not None:
                     stats = bitpacked_stats
                     variants_list = _build_plink_variant_defaults_from_stats(path, stats)
@@ -2054,10 +2084,16 @@ def _try_bitpacked_plink_variant_stats(
         return cached
 
     log("  variant stats: bitpacked GPU streaming path (single pass)")
+    # Broad except: a missing cupy build or a sv_pgs.bitpacked.* top-level
+    # error must NOT silently disable the fast path — log the concrete
+    # exception type + message so the next run shows the root cause.
     try:
         from sv_pgs.screening_pipeline import run_screening_pass  # lazy
-    except ImportError as exc:
-        log(f"  bitpacked stats path unavailable (import failed: {exc!r}); falling back to int8 streaming pass")
+    except Exception as exc:
+        log(
+            f"  variant stats: bitpacked path failed at screening_pipeline import "
+            f"({type(exc).__name__}: {exc}); falling back to legacy int8 streaming pass"
+        )
         return None
 
     sample_intersect_arr = np.asarray(sample_indices, dtype=np.int64)
@@ -2073,6 +2109,12 @@ def _try_bitpacked_plink_variant_stats(
         int(sample_intersect_arr.shape[0]) if intersect_arg is not None else int(n_samples)
     )
 
+    log(
+        f"  variant stats: invoking run_screening_pass(bed={bed_path.name}, "
+        f"n_samples={int(n_samples)}, n_variants={int(n_variants)}, "
+        f"effective_n_samples={effective_n_samples}, "
+        f"sample_intersect={'None' if intersect_arg is None else f'array[{intersect_arg.size}]'})"
+    )
     try:
         screening = run_screening_pass(
             [Path(bed_path)],
@@ -2082,7 +2124,10 @@ def _try_bitpacked_plink_variant_stats(
             count_a1=True,
         )
     except Exception as exc:
-        log(f"  bitpacked screening pass failed ({type(exc).__name__}: {exc!r}); falling back to int8 streaming pass")
+        log(
+            f"  variant stats: bitpacked path failed in run_screening_pass "
+            f"({type(exc).__name__}: {exc}); falling back to legacy int8 streaming pass"
+        )
         return None
 
     counts = np.asarray(screening["count"], dtype=np.int32)

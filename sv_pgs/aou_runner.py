@@ -557,6 +557,50 @@ def download_sv_vcf(chromosome: int, work_dir: Path) -> Path:
     return local_vcf
 
 
+def _is_valid_cache_entry(path: Path) -> bool:
+    """True if ``path`` is a usable cache entry.
+
+    A symlink whose target is a regular file counts as valid even when no
+    ``*.manifest.json`` sibling exists: manifests are emitted by
+    ``stage_gcs_object`` (a COPY into local cache), not by ``_link_mounted_*``
+    paths which symlink into the workspace mount. Gating symlinks on
+    ``verify_local_cache`` would force a 137 GB re-stage of a file we already
+    have a valid pointer to.
+    """
+    try:
+        if path.is_symlink():
+            try:
+                target = path.resolve()
+            except (OSError, RuntimeError):
+                return False
+            return target.is_file()
+    except OSError:
+        return False
+    return verify_local_cache(path)
+
+
+def _cleanup_stale_partials(cache_dir: Path, prefix: str) -> None:
+    """Unlink ``<prefix>*.partial.*`` and ``<prefix>*.tmp`` leftovers.
+
+    A run killed mid-copy leaves behind ``arrays.bed.partial.<pid>.<uuid>``
+    files (and matching ``.tmp`` siblings from the legacy gcsfuse_staging
+    path). They are never resumed — the next stage_gcs_object call writes a
+    fresh partial with its own pid+uuid suffix — so anything left over from
+    a dead previous run is pure dead weight (137 GB in the worst case).
+    """
+    if not cache_dir.exists():
+        return
+    patterns = (f"{prefix}*.partial.*", f"{prefix}*.tmp")
+    for pattern in patterns:
+        for stale in cache_dir.glob(pattern):
+            try:
+                if stale.is_file() or stale.is_symlink():
+                    log(f"  cleaning stale partial: {stale}")
+                    stale.unlink()
+            except OSError:
+                pass
+
+
 def download_array_plink(work_dir: Path) -> Path:
     """Download the AoU microarray PLINK 1 trio and return the local .bed path.
 
@@ -566,10 +610,14 @@ def download_array_plink(work_dir: Path) -> Path:
     """
     cache_dir = local_array_plink_cache_dir(work_dir)
     cache_dir.mkdir(parents=True, exist_ok=True)
+    # Wipe any *.partial.* / *.tmp from a killed previous run before we
+    # decide whether the cache is valid; otherwise verify_local_cache may
+    # treat a stale 137 GB partial as evidence the cache is in flux.
+    _cleanup_stale_partials(cache_dir, _AOU_ARRAY_PLINK_PREFIX)
     local_bed = local_array_plink_path(work_dir)
     if _link_mounted_array_plink(work_dir):
         if all(
-            verify_local_cache(cache_dir / f"{_AOU_ARRAY_PLINK_PREFIX}.{ext}")
+            _is_valid_cache_entry(cache_dir / f"{_AOU_ARRAY_PLINK_PREFIX}.{ext}")
             for ext in ("bed", "bim", "fam")
         ):
             log("  microarray: linked PLINK trio from mounted workspace resource")
@@ -583,7 +631,7 @@ def download_array_plink(work_dir: Path) -> Path:
     missing_extensions = []
     for extension in ("bed", "bim", "fam"):
         local_path = cache_dir / f"{_AOU_ARRAY_PLINK_PREFIX}.{extension}"
-        if not verify_local_cache(local_path):
+        if not _is_valid_cache_entry(local_path):
             missing_extensions.append(extension)
 
     if not missing_extensions:
