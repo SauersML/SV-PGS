@@ -155,8 +155,8 @@ def test_e2e_equivalence_bitpacked_vs_int8(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    n_samples = 400
-    n_variants = 2000
+    n_samples = 500
+    n_variants = 5000
     bed_path, sample_table_path, metadata_path = _write_synthetic_cohort(
         tmp_path / "data",
         n_samples=n_samples,
