@@ -1124,18 +1124,25 @@ def _stage_via_gcloud_storage(
     stop_poller = threading.Event()
     poller_thread: threading.Thread | None = None
 
+    # gcloud storage cp writes to "<dest>_.gstmp" until completion, then
+    # atomically renames to <dest>. gsutil writes to "<dest>" directly. Poll
+    # whichever exists; take the max size across both so we never regress.
+    gstmp_path = partial.with_name(partial.name + "_.gstmp")
+
     def _poll_partial_size() -> None:
         nonlocal last_bytes
         while not stop_poller.is_set():
             if proc is not None and proc.poll() is not None:
                 break
-            try:
-                cur = partial.stat().st_size
-            except (FileNotFoundError, OSError):
-                if stop_poller.wait(2.0):
-                    break
-                continue
-            if cur >= last_bytes:
+            cur = 0
+            for p in (gstmp_path, partial):
+                try:
+                    s = p.stat().st_size
+                    if s > cur:
+                        cur = s
+                except (FileNotFoundError, OSError):
+                    pass
+            if cur > last_bytes:
                 last_bytes = cur
                 try:
                     update_bytes("gcsfuse.stage", cur)
