@@ -381,15 +381,8 @@ def _snapshot_autotune_state() -> dict[str, int]:
     }
 
 
-# Auto-tuned at import time. Override-able via env for benchmarking.
-_BED_BATCH_OVERRIDE = os.environ.get("SV_PGS_BED_READER_TARGET_BATCH_BYTES")
-if _BED_BATCH_OVERRIDE:
-    try:
-        BED_READER_TARGET_BATCH_BYTES = int(_BED_BATCH_OVERRIDE)
-    except ValueError:
-        BED_READER_TARGET_BATCH_BYTES = compute_bed_reader_target_batch_bytes()
-else:
-    BED_READER_TARGET_BATCH_BYTES = compute_bed_reader_target_batch_bytes()
+# Auto-tuned at import time.
+BED_READER_TARGET_BATCH_BYTES = compute_bed_reader_target_batch_bytes()
 MIN_BED_READER_BATCH_SIZE = 32  # always read at least this many variants
 STANDARDIZED_STREAMING_TARGET_BATCH_BYTES = 1_024_000_000
 LOCAL_INT8_STANDARDIZED_STREAMING_TARGET_BATCH_BYTES = 4_096_000_000
@@ -401,18 +394,9 @@ GPU_INT8_STANDARDIZED_DYNAMIC_FREE_FRACTION = 0.35
 GPU_STANDARDIZED_DYNAMIC_RESERVE_BYTES = 512_000_000
 PLINK_INT8_TARGET_BATCH_BYTES = 1_024_000_000
 # Auto-tuned: scales with cpu_count and available host RAM.
-_PREFETCH_DEPTH_OVERRIDE = os.environ.get("SV_PGS_PLINK_INT8_MAX_PREFETCH_DEPTH")
-if _PREFETCH_DEPTH_OVERRIDE:
-    try:
-        PLINK_INT8_MAX_PREFETCH_DEPTH = max(1, int(_PREFETCH_DEPTH_OVERRIDE))
-    except ValueError:
-        PLINK_INT8_MAX_PREFETCH_DEPTH = compute_plink_int8_max_prefetch_depth(
-            target_batch_bytes=BED_READER_TARGET_BATCH_BYTES,
-        )
-else:
-    PLINK_INT8_MAX_PREFETCH_DEPTH = compute_plink_int8_max_prefetch_depth(
-        target_batch_bytes=BED_READER_TARGET_BATCH_BYTES,
-    )
+PLINK_INT8_MAX_PREFETCH_DEPTH = compute_plink_int8_max_prefetch_depth(
+    target_batch_bytes=BED_READER_TARGET_BATCH_BYTES,
+)
 PLINK_BED_READER_NUM_THREADS = max(1, os.cpu_count() or 1)
 # Cap on rows promoted per int8 matmul staging chunk. With ~695k AoU variants
 # this slab is ``chunk_rows x n_cols x 4 bytes`` (fp32 promotion); 4096 rows is

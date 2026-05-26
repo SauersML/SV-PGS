@@ -60,7 +60,9 @@ __global__ void bitpacked_screening_kernel(
     const int n_variants,
     const int bytes_per_variant,
     const int k,
-    const int has_rhs)
+    const int has_rhs,
+    const int* __restrict__ sample_intersect,  // (n_samples,) int32 indices, may be null
+    const int has_intersect)
 {
     const int v = blockIdx.x;
     if (v >= n_variants) return;
@@ -80,27 +82,52 @@ __global__ void bitpacked_screening_kernel(
     const int tid = threadIdx.x;
     const int bdim = blockDim.x;
 
-    // Walk packed bytes for this variant. Each byte covers 4 samples.
-    for (int b = tid; b < bytes_per_variant; b += bdim) {
-        const unsigned int byte_val = (unsigned int)row[b];
-        const int base_sample = b * 4;
-
-        #pragma unroll
-        for (int s = 0; s < 4; ++s) {
-            const int sample_idx = base_sample + s;
-            if (sample_idx >= n_samples) break;  // trailing padding
-            const int dose = (int)decode_lut[byte_val * 4 + s];
+    if (has_intersect) {
+        // Gather path: iterate over effective sample indices, fetch each
+        // sample's 2-bit slot from the raw packed row via the intersect table.
+        for (int i = tid; i < n_samples; i += bdim) {
+            const int src_idx = sample_intersect[i];
+            const int byte_offset = src_idx >> 2;       // src_idx / 4
+            const int slot       = src_idx & 3;         // src_idx % 4
+            const unsigned int byte_val = (unsigned int)row[byte_offset];
+            const int dose = (int)decode_lut[byte_val * 4 + slot];
             if (dose == -127) continue;  // missing
             const double d = (double)dose;
             local_count += 1;
             local_sum   += d;
             local_sumsq += d * d;
             if (has_rhs) {
-                const double* rhs_row = rhs + (size_t)sample_idx * (size_t)k;
+                const double* rhs_row = rhs + (size_t)i * (size_t)k;
                 for (int j = 0; j < k; ++j) {
                     const double yj = rhs_row[j];
                     local_drhs[j] += d * yj;
                     local_orhs[j] += yj;
+                }
+            }
+        }
+    } else {
+        // Walk packed bytes for this variant. Each byte covers 4 samples.
+        for (int b = tid; b < bytes_per_variant; b += bdim) {
+            const unsigned int byte_val = (unsigned int)row[b];
+            const int base_sample = b * 4;
+
+            #pragma unroll
+            for (int s = 0; s < 4; ++s) {
+                const int sample_idx = base_sample + s;
+                if (sample_idx >= n_samples) break;  // trailing padding
+                const int dose = (int)decode_lut[byte_val * 4 + s];
+                if (dose == -127) continue;  // missing
+                const double d = (double)dose;
+                local_count += 1;
+                local_sum   += d;
+                local_sumsq += d * d;
+                if (has_rhs) {
+                    const double* rhs_row = rhs + (size_t)sample_idx * (size_t)k;
+                    for (int j = 0; j < k; ++j) {
+                        const double yj = rhs_row[j];
+                        local_drhs[j] += d * yj;
+                        local_orhs[j] += yj;
+                    }
                 }
             }
         }
@@ -252,6 +279,8 @@ def screen(
     *,
     y_resid: Any | None = None,
     out_y_dot: Any | None = None,
+    sample_intersect: Any | None = None,
+    raw_n_samples: int | None = None,
 ) -> None:
     """Fused one-pass screening reduction.
 
@@ -319,11 +348,62 @@ def screen(
     if packed.ndim != 2:
         raise ValueError(f"packed must be 2D, got shape {packed.shape}")
     n_variants, bytes_per_variant = int(packed.shape[0]), int(packed.shape[1])
-    expected_bpv = (int(n_samples) + 3) // 4
+
+    # raw_n_samples drives bytes_per_variant; without an intersect it equals
+    # n_samples (the effective count == the on-disk stride).
+    if sample_intersect is None:
+        raw_n_samples_eff = int(n_samples) if raw_n_samples is None else int(raw_n_samples)
+        if raw_n_samples_eff != int(n_samples):
+            raise ValueError(
+                "raw_n_samples must equal n_samples when sample_intersect is None"
+            )
+    else:
+        if raw_n_samples is None:
+            raise ValueError(
+                "raw_n_samples is required when sample_intersect is provided"
+            )
+        raw_n_samples_eff = int(raw_n_samples)
+
+    expected_bpv = (raw_n_samples_eff + 3) // 4
     if bytes_per_variant < expected_bpv:
         raise ValueError(
-            f"bytes_per_variant={bytes_per_variant} too small for n_samples={n_samples}"
+            f"bytes_per_variant={bytes_per_variant} too small for "
+            f"raw_n_samples={raw_n_samples_eff}"
         )
+
+    # ---- sample_intersect validation --------------------------------------
+    sample_intersect_ptr = 0
+    has_intersect_flag = 0
+    if sample_intersect is not None:
+        if sample_intersect.ndim != 1:
+            raise ValueError(
+                f"sample_intersect must be 1D, got shape {sample_intersect.shape}"
+            )
+        if int(sample_intersect.shape[0]) == 0:
+            raise ValueError("sample_intersect must be non-empty")
+        if int(sample_intersect.shape[0]) != int(n_samples):
+            raise ValueError(
+                f"sample_intersect length {int(sample_intersect.shape[0])} != "
+                f"n_samples={int(n_samples)} (n_samples is the effective count)"
+            )
+        if sample_intersect.dtype != cp.int32:
+            raise TypeError(
+                f"sample_intersect must be int32, got {sample_intersect.dtype}"
+            )
+        if not sample_intersect.flags.c_contiguous:
+            sample_intersect = cp.ascontiguousarray(sample_intersect)
+        # Bounds check (host-side max). Cheap relative to a kernel launch.
+        # We cap at raw_n_samples_eff to ensure the kernel's byte_offset stays
+        # in-row.
+        max_idx = int(sample_intersect.max())
+        min_idx = int(sample_intersect.min())
+        if min_idx < 0 or max_idx >= raw_n_samples_eff:
+            raise ValueError(
+                f"sample_intersect indices must be in [0, {raw_n_samples_eff}); "
+                f"got [{min_idx}, {max_idx}]"
+            )
+        sample_intersect_ptr = int(sample_intersect.data.ptr)
+        has_intersect_flag = 1
 
     if out_count.dtype != cp.int32:
         raise TypeError(f"out_count must be int32, got {out_count.dtype}")
@@ -432,6 +512,8 @@ def screen(
         cp.int32(bytes_per_variant),
         cp.int32(k),
         cp.int32(1 if has_rhs else 0),
+        cp.uint64(sample_intersect_ptr),
+        cp.int32(has_intersect_flag),
     )
 
     if stream is None:

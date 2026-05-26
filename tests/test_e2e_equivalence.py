@@ -153,7 +153,6 @@ def _load_summary(summary_path: Path) -> dict:
 @pytest.mark.timeout(360)
 def test_e2e_equivalence_bitpacked_vs_int8(
     tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     n_samples = 500
     n_variants = 5000
@@ -164,11 +163,10 @@ def test_e2e_equivalence_bitpacked_vs_int8(
         seed=1234,
     )
 
-    # Use a per-run active-matrix cache so the two runs don't share state.
-    cache_root = tmp_path / "bp_cache"
-    cache_root.mkdir()
-    monkeypatch.setenv("SV_PGS_BITPACKED_ACTIVE_CACHE_DIR", str(cache_root))
-
+    # Active-matrix cache is per-bed (defaults to bed.parent/.sv_pgs_cache),
+    # so both runs against the same BED naturally share it; that's fine
+    # because the cache contents are content-addressed by BED + sample/variant
+    # selection.
     out_bp = tmp_path / "run_bp"
     summary_bp_path = _run_pipeline(
         bed_path=bed_path,
@@ -179,10 +177,8 @@ def test_e2e_equivalence_bitpacked_vs_int8(
     )
 
     out_int8 = tmp_path / "run_int8"
-    # Force the legacy int8 path by clearing the cache_dir env (so even if the
-    # int8 backend would otherwise short-circuit, we get an apples-to-apples
-    # second-run state) AND by setting genotype_backend="int8" below.
-    monkeypatch.setenv("SV_PGS_DISABLE_BITPACKED_ACTIVE_CACHE", "1")
+    # Legacy int8 path is selected by genotype_backend="int8" below; the
+    # bitpacked active-matrix cache is irrelevant to that backend.
     summary_int8_path = _run_pipeline(
         bed_path=bed_path,
         sample_table_path=sample_table_path,

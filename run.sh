@@ -8,7 +8,7 @@ set -euo pipefail
 # leaves the foreground PG alive and the user has to manually find +
 # kill stuck pids.
 set -m
-SV_PGS_RUN_PGID="$$"
+RUN_PGID="$$"
 
 _sv_pgs_run_cleanup() {
   local rc=$?
@@ -17,7 +17,7 @@ _sv_pgs_run_cleanup() {
   # briefly for graceful Python shutdown, then SIGKILL anything left.
   # Best-effort; cleanup must never fail the cleanup.
   local pids pid
-  pids=$(pgrep -g "$SV_PGS_RUN_PGID" 2>/dev/null || true)
+  pids=$(pgrep -g "$RUN_PGID" 2>/dev/null || true)
   for pid in $pids; do
     [ "$pid" = "$$" ] && continue
     kill "$pid" 2>/dev/null || true
@@ -25,7 +25,7 @@ _sv_pgs_run_cleanup() {
   local waited=0
   while [ "$waited" -lt 10 ]; do
     local survivors=0
-    pids=$(pgrep -g "$SV_PGS_RUN_PGID" 2>/dev/null || true)
+    pids=$(pgrep -g "$RUN_PGID" 2>/dev/null || true)
     for pid in $pids; do
       [ "$pid" = "$$" ] && continue
       survivors=$((survivors + 1))
@@ -36,7 +36,7 @@ _sv_pgs_run_cleanup() {
     sleep 1
     waited=$((waited + 1))
   done
-  pids=$(pgrep -g "$SV_PGS_RUN_PGID" 2>/dev/null || true)
+  pids=$(pgrep -g "$RUN_PGID" 2>/dev/null || true)
   for pid in $pids; do
     [ "$pid" = "$$" ] && continue
     kill -SIGKILL "$pid" 2>/dev/null || true
@@ -57,13 +57,13 @@ trap _sv_pgs_run_cleanup EXIT INT TERM HUP
 #   ./run.sh hypertension    # one disease, both variant sets
 #   ./run.sh all             # explicit "all"
 #   ./run.sh --smoke         # ONLY run the bitpacked end-to-end smoke check and exit
-SV_PGS_SMOKE_ONLY=0
-SV_PGS_VALIDATE_ONLY=0
+SMOKE_ONLY=0
+VALIDATE_ONLY=0
 if [ "${1:-}" = "--smoke" ]; then
-  SV_PGS_SMOKE_ONLY=1
+  SMOKE_ONLY=1
   shift || true
 elif [ "${1:-}" = "--validate" ]; then
-  SV_PGS_VALIDATE_ONLY=1
+  VALIDATE_ONLY=1
   shift || true
 fi
 DISEASE="${1:-all}"
@@ -76,7 +76,7 @@ fi
 export PATH="$HOME/.local/bin:$PATH"
 
 cd "$REPO_DIR"
-if [ -d .git ] && [ -z "${SV_PGS_SKIP_PULL:-}" ]; then
+if [ -d .git ]; then
   if git diff --quiet && git diff --cached --quiet; then
     branch="$(git rev-parse --abbrev-ref HEAD)"
     echo "updating code: git pull --ff-only origin ${branch}"
@@ -151,12 +151,12 @@ run_bitpacked_smoke() {
   fi
 }
 
-if [ "$SV_PGS_SMOKE_ONLY" = "1" ]; then
+if [ "$SMOKE_ONLY" = "1" ]; then
   run_bitpacked_smoke strict
   exit $?
 fi
 
-if [ "$SV_PGS_VALIDATE_ONLY" = "1" ]; then
+if [ "$VALIDATE_ONLY" = "1" ]; then
   echo "=== VALIDATE: bitpacked smoke + e2e equivalence ==="
   run_bitpacked_smoke strict || { echo "validate: smoke FAILED"; exit 1; }
   echo "--- e2e equivalence test ---"
@@ -527,10 +527,6 @@ kill_stuck_or_running_sv_pgs() {
   # "ps + kill -9" loops. Now we SIGCONT-then-SIGKILL the prior run + its
   # entire process tree (uv run -> python -> any background readers), wait
   # briefly for the kernel to reap, and then start fresh.
-  if [ "${SV_PGS_SKIP_STARTUP_SWEEP:-}" = "1" ]; then
-    echo "  startup sweep skipped because SV_PGS_SKIP_STARTUP_SWEEP=1"
-    return 0
-  fi
   local me
   me=$(id -un)
   local candidates
@@ -654,8 +650,8 @@ postmortem_after_silent_death() {
     nvidia-smi --query-compute-apps=pid,process_name,used_memory --format=csv,noheader 2>/dev/null | sed 's/^/    /' || true
   fi
   echo "  --- last 50 lines of fit checkpoint dir (if any artifacts written) ---"
-  if [ -n "${SV_PGS_LAST_OUTDIR:-}" ] && [ -d "${SV_PGS_LAST_OUTDIR}" ]; then
-    ls -laht "${SV_PGS_LAST_OUTDIR}" 2>/dev/null | head -10 | sed 's/^/    /'
+  if [ -n "${LAST_OUTDIR:-}" ] && [ -d "${LAST_OUTDIR}" ]; then
+    ls -laht "${LAST_OUTDIR}" 2>/dev/null | head -10 | sed 's/^/    /'
   fi
   echo "=== END POSTMORTEM ==="
 }
@@ -686,8 +682,8 @@ build_aou_env_args() {
     TMPDIR
     # uv cache reuse — without this uv re-resolves and re-installs every call.
     UV_CACHE_DIR
-    # Our own knobs — postmortem dir + sweep override.
-    SV_PGS_LAST_OUTDIR SV_PGS_SKIP_STARTUP_SWEEP SV_PGS_SKIP_PULL
+    # Our own knobs — postmortem dir.
+    LAST_OUTDIR
   )
   local env_args=()
   local name value
@@ -716,15 +712,15 @@ run_variant_pass() {
   # Run unfaulted so we can inspect rc; restore -e immediately after.
   set +e
   if is_all; then
-    export SV_PGS_LAST_OUTDIR="$base"
-    env -i "${env_args[@]}" SV_PGS_LAST_OUTDIR="$base" \
+    export LAST_OUTDIR="$base"
+    env -i "${env_args[@]}" LAST_OUTDIR="$base" \
       uv run sv-pgs run-all-of-us --all-diseases --variants "$variants" --output-dir "$base"
     rc=$?
   else
     local out="$base/${DISEASE}_results"
     mkdir -p "$out"
-    export SV_PGS_LAST_OUTDIR="$out"
-    env -i "${env_args[@]}" SV_PGS_LAST_OUTDIR="$out" \
+    export LAST_OUTDIR="$out"
+    env -i "${env_args[@]}" LAST_OUTDIR="$out" \
       uv run sv-pgs run-all-of-us --disease "$DISEASE" --variants "$variants" --output-dir "$out"
     rc=$?
   fi

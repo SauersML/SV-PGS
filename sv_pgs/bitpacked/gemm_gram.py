@@ -853,20 +853,14 @@ def _get_kernel(name: str) -> Any:
     return kernel
 
 
-def _volta_v2_enabled() -> bool:
-    # Default OFF: empirical V100 benchmarks at (97k samples, 512..8192 variants)
-    # show the double-buffered v2 kernel within 1-2% of v1 (both ~5 TFLOPS).
-    # The kernel is correctness-tested and ready, but the SMEM-load latency
-    # the double buffering would hide is not the binding bottleneck at this
-    # tile / dosage-decode complexity. Set the env var to "1" to opt in.
-    val = os.environ.get("SV_PGS_GEMM_GRAM_VOLTA_V2", "0").strip().lower()
-    return val not in ("0", "false", "no", "off")
-
-
 def _kernel_for_arch(arch: Any) -> tuple[str, int, int]:
     """Return (kernel_name, tile_m, tile_n) for the given arch.
 
     ``arch`` may be a ``launch.GpuArch`` dataclass or a legacy string.
+
+    Volta uses the v1 kernel: empirical V100 benchmarks at
+    (97k samples, 512..8192 variants) show the double-buffered v2 kernel
+    within 1-2% of v1 (both ~5 TFLOPS), so v1 is the production choice.
     """
     if arch == "hopper":
         return "bitpacked_gemm_gram_fp16_kernel", 128, 256
@@ -875,8 +869,6 @@ def _kernel_for_arch(arch: Any) -> tuple[str, int, int]:
     if arch == "t4" or arch == "turing":
         return "bitpacked_gemm_gram_dp4a_kernel", 64, 64
     if arch == "volta":
-        if _volta_v2_enabled():
-            return _VOLTA_V2_KERNEL_NAME, 128, 128
         return _VOLTA_KERNEL_NAME, 128, 128
     return "bitpacked_gemm_gram_fp32_kernel", 64, 64
 

@@ -32,8 +32,6 @@ _NVIDIA_SMI_FAIL_STREAK: int = 0
 _NVIDIA_SMI_NEXT_PROBE_AT_MONOTONIC: float = 0.0
 _NVIDIA_SMI_BASE_INTERVAL_S: float = 30.0
 _NVIDIA_SMI_MAX_INTERVAL_S: float = 900.0
-# Lazily initialized from SV_PGS_DISABLE_NVIDIA_SMI_HEARTBEAT on first call.
-_NVIDIA_SMI_DISABLED: bool | None = None
 
 
 def set_log_file(path: str | os.PathLike[str]) -> None:
@@ -346,8 +344,6 @@ def _pynvml_snapshot() -> str | None:
 def _maybe_refresh_nvidia_smi(now: float) -> str:
     """Sample GPU at most every 30s; back off exponentially on failure.
 
-    Honors SV_PGS_DISABLE_NVIDIA_SMI_HEARTBEAT=1 to skip the probe entirely
-    (cached on first call so we don't re-read the env every heartbeat).
     Prefers pynvml (in-process) over the nvidia-smi subprocess when available.
 
     Backoff schedule on consecutive probe failures (in seconds, capped at
@@ -357,19 +353,6 @@ def _maybe_refresh_nvidia_smi(now: float) -> str:
     """
     global _heartbeat_last_nvidia_smi, _heartbeat_last_nvidia_smi_value
     global _NVIDIA_SMI_FAIL_STREAK, _NVIDIA_SMI_NEXT_PROBE_AT_MONOTONIC
-    global _NVIDIA_SMI_DISABLED
-
-    if _NVIDIA_SMI_DISABLED is None:
-        _NVIDIA_SMI_DISABLED = (
-            os.environ.get("SV_PGS_DISABLE_NVIDIA_SMI_HEARTBEAT") == "1"
-        )
-        if _NVIDIA_SMI_DISABLED:
-            log("nvidia-smi heartbeat disabled via env")
-            _heartbeat_last_nvidia_smi_value = (
-                "nvidia-smi=disabled (SV_PGS_DISABLE_NVIDIA_SMI_HEARTBEAT=1)"
-            )
-    if _NVIDIA_SMI_DISABLED:
-        return _heartbeat_last_nvidia_smi_value
 
     if now < _NVIDIA_SMI_NEXT_PROBE_AT_MONOTONIC:
         return _heartbeat_last_nvidia_smi_value

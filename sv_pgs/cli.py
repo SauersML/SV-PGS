@@ -96,15 +96,6 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     aou_run_parser.add_argument(
-        "--no-cache",
-        action="store_true",
-        help=(
-            "Bypass the bitpacked active-matrix cache for this run. Useful "
-            "for debugging; the BED is fully re-streamed every iteration. "
-            "Sets SV_PGS_DISABLE_BITPACKED_ACTIVE_CACHE=1 for the process."
-        ),
-    )
-    aou_run_parser.add_argument(
         "--variants",
         # Default is the joint model — array SNPs typically add the most
         # explained variance to a PGS and SVs sharpen tagged-region effects;
@@ -312,9 +303,6 @@ def _main_impl(argv: list[str] | None = None) -> int:
         return 0
 
     if args.command == "run-all-of-us":
-        if getattr(args, "no_cache", False):
-            os.environ["SV_PGS_DISABLE_BITPACKED_ACTIVE_CACHE"] = "1"
-            log("CLI: --no-cache set; SV_PGS_DISABLE_BITPACKED_ACTIVE_CACHE=1 exported")
         chromosome_text = args.chromosomes
         if "-" in chromosome_text:
             low, high = chromosome_text.split("-", 1)

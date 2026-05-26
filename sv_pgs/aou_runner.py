@@ -52,26 +52,6 @@ _AOU_ARRAY_PLINK_CACHE_SUBDIR = "aou_array_plink"
 # i.e. arrays.bed / arrays.bim / arrays.fam under .../microarray/plink/.
 _AOU_ARRAY_PLINK_PREFIX = "arrays"
 
-# Genotype backend for the downloaded SV cache: "bitpacked" emits a single
-# PLINK 1.9 BED trio via ``sv_pgs.sv_transcoder.transcode_sv_vcf_to_bed`` (the
-# format consumed by the bitpacked GPU pipeline — see BITPACKED_SPEC.md);
-# "int8" keeps the legacy host-side ``*.genotypes.npy`` + sidecar layout. The
-# default is bitpacked. Callers can override via ``AOU_GENOTYPE_BACKEND`` in
-# the environment without editing this module.
-_DEFAULT_GENOTYPE_BACKEND = "bitpacked"
-
-
-def aou_genotype_backend() -> str:
-    """Return the active SV-cache backend ("bitpacked" or "int8")."""
-    raw = os.environ.get("AOU_GENOTYPE_BACKEND", _DEFAULT_GENOTYPE_BACKEND)
-    value = (raw or _DEFAULT_GENOTYPE_BACKEND).strip().lower()
-    if value not in {"bitpacked", "int8"}:
-        raise RuntimeError(
-            f"AOU_GENOTYPE_BACKEND={raw!r} is invalid; expected 'bitpacked' or 'int8'."
-        )
-    return value
-
-
 def _warn_if_work_dir_on_gcsfuse(work_dir: Path) -> None:
     """Surface a loud warning if the local cache dir resolves onto gcsfuse.
 

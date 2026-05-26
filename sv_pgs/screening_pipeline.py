@@ -26,6 +26,7 @@ from __future__ import annotations
 import logging
 import os
 import warnings
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any, Iterator
 
@@ -108,6 +109,27 @@ def _rebitpack_chunk(
         | (codes[:, :, 3] << 6)
     ).astype(np.uint8)
     return np.ascontiguousarray(out)
+
+
+def _read_and_rebitpack_via_mmap(
+    mmap_reader: Any,
+    v_start: int,
+    v_stop: int,
+    n_samples_src: int,
+    sample_intersect: np.ndarray,
+    count_a1: bool,
+) -> np.ndarray:
+    """Worker: mmap-read a variant range and rebitpack to the intersect stride.
+
+    Thread-safe relative to other workers: ``BedMmapReader.read_packed_range``
+    returns a freshly-allocated copy out of the read-only mmap, and
+    ``_rebitpack_chunk`` operates purely on numpy temporaries.
+    """
+    packed = mmap_reader.read_packed_range(v_start, v_stop)
+    n_rows = v_stop - v_start
+    bpv_src = _bytes_per_variant(n_samples_src)
+    packed = packed.reshape(n_rows, bpv_src)
+    return _rebitpack_chunk(packed, n_samples_src, sample_intersect, count_a1)
 
 
 # ---------------------------------------------------------------------------
@@ -197,13 +219,24 @@ def _screen_one_path(
 
     _verify_magic(bed_path)
 
-    # Sample stride that actually hits the GPU kernel.
+    # Sample stride that actually hits the GPU kernel. With sample_intersect
+    # we now do the gather inside the CUDA kernel itself, so the device
+    # staging buffer keeps the FULL on-disk stride (bpv_src), and the kernel
+    # reads via the intersect indices. This eliminates the CPU rebitpack
+    # bottleneck that previously dominated screening on big intersects.
     if sample_intersect is None:
         n_samples_eff = n_samples
+        bpv_eff = _bytes_per_variant(n_samples_eff)
     else:
         n_samples_eff = int(sample_intersect.shape[0])
+        # GPU-gather path: device buffer matches the raw on-disk row layout.
+        bpv_eff = _bytes_per_variant(n_samples)
     bpv_src = _bytes_per_variant(n_samples)
-    bpv_eff = _bytes_per_variant(n_samples_eff)
+
+    # Upload sample_intersect once per shard (small relative to genotypes).
+    sample_intersect_dev = None
+    if sample_intersect is not None:
+        sample_intersect_dev = cp.asarray(sample_intersect, dtype=cp.int32)
 
     # Try the GPUDirect Storage fast path; fall back to pinned-host staging.
     use_gds = False
@@ -335,6 +368,43 @@ def _screen_one_path(
                 except OSError:
                     pass
 
+    # Parallel rebitpack prefetch: when an intersect is in use and the
+    # mmap reader is available (thread-safe), pre-dispatch read+rebitpack
+    # for upcoming chunks across a thread pool. The chunk loop below
+    # awaits future[idx] in order, preserving variant ordering.
+    # GPU-gather path makes CPU rebitpack obsolete; never enable the
+    # parallel-rebitpack prefetcher when sample_intersect is in play.
+    parallel_rebitpack = False
+    rebitpack_executor: ThreadPoolExecutor | None = None
+    rebitpack_futures: dict[int, Any] = {}
+    rebitpack_window = 0
+    if parallel_rebitpack:
+        n_workers = min(os.cpu_count() or 1, 12)
+        rebitpack_window = max(2, n_workers + 2)
+        _LOG.info(
+            "screening: parallel rebitpack with N=%d workers "
+            "(n_variants_total=%d, chunk_size=%d)",
+            n_workers,
+            n_variants,
+            max_rows,
+        )
+        rebitpack_executor = ThreadPoolExecutor(
+            max_workers=n_workers,
+            thread_name_prefix="rebitpack",
+        )
+        # Prime the window.
+        for j in range(min(rebitpack_window, len(chunks))):
+            v_s, v_e = chunks[j]
+            rebitpack_futures[j] = rebitpack_executor.submit(
+                _read_and_rebitpack_via_mmap,
+                mmap_reader,
+                v_s,
+                v_e,
+                n_samples,
+                sample_intersect,
+                count_a1,
+            )
+
     try:
         for idx, (v_start, v_stop) in enumerate(chunks):
             slot = idx % 2
@@ -342,6 +412,21 @@ def _screen_one_path(
             n_bytes_src = n_rows * bpv_src
             n_bytes_eff = n_rows * bpv_eff
             offset = PLINK1_HEADER_SIZE + v_start * bpv_src
+
+            # Keep the prefetch window full.
+            if parallel_rebitpack and rebitpack_executor is not None:
+                next_idx = idx + rebitpack_window
+                if next_idx < len(chunks):
+                    v_s, v_e = chunks[next_idx]
+                    rebitpack_futures[next_idx] = rebitpack_executor.submit(
+                        _read_and_rebitpack_via_mmap,
+                        mmap_reader,
+                        v_s,
+                        v_e,
+                        n_samples,
+                        sample_intersect,
+                        count_a1,
+                    )
 
             # Make sure the previous iteration's compute on this slot has
             # finished before we overwrite the device staging buffer.
@@ -360,39 +445,56 @@ def _screen_one_path(
                 # NVMe -> pinned host -> device. Prefer the mmap reader on
                 # local files; fall back to the direct-open path on any
                 # read error.
-                packed_host = None
-                if mmap_reader is not None:
+                rebitpacked: np.ndarray | None = None
+                if parallel_rebitpack and idx in rebitpack_futures:
+                    # Pre-dispatched parallel rebitpack: await the future
+                    # for this exact chunk_id to preserve ordering.
                     try:
-                        mmap_view = mmap_reader.read_packed_range(v_start, v_stop)
-                        # Copy into the pinned host buffer so the existing
-                        # downstream code (which expects a writable, packed
-                        # flat view) works unchanged.
-                        host_view = host_bufs[slot][:n_bytes_src].reshape(
-                            n_rows, bpv_src
-                        )
-                        np.copyto(host_view, mmap_view)
-                        packed_host = host_view
+                        rebitpacked = rebitpack_futures.pop(idx).result()
                     except Exception as exc:
                         _LOG.warning(
-                            "screening_pipeline: mmap read failed for %s "
-                            "[%d:%d] (%s: %s); falling back to direct open.",
+                            "screening_pipeline: parallel rebitpack failed for %s "
+                            "[%d:%d] (%s: %s); falling back to serial path.",
                             bed_path,
                             v_start,
                             v_stop,
                             type(exc).__name__,
                             exc,
                         )
-                        packed_host = None
-                if packed_host is None:
-                    packed_host = _read_chunk_to_host(
-                        fh, n_samples, v_start, v_stop, host_bufs[slot]
-                    )
-                if sample_intersect is not None:
-                    rebitpacked = _rebitpack_chunk(
-                        packed_host, n_samples, sample_intersect, count_a1
-                    )
+                        rebitpacked = None
+
+                if rebitpacked is not None:
                     src_bytes = rebitpacked.reshape(-1).view(np.uint8)
                 else:
+                    packed_host = None
+                    if mmap_reader is not None:
+                        try:
+                            mmap_view = mmap_reader.read_packed_range(v_start, v_stop)
+                            # Copy into the pinned host buffer so the existing
+                            # downstream code (which expects a writable, packed
+                            # flat view) works unchanged.
+                            host_view = host_bufs[slot][:n_bytes_src].reshape(
+                                n_rows, bpv_src
+                            )
+                            np.copyto(host_view, mmap_view)
+                            packed_host = host_view
+                        except Exception as exc:
+                            _LOG.warning(
+                                "screening_pipeline: mmap read failed for %s "
+                                "[%d:%d] (%s: %s); falling back to direct open.",
+                                bed_path,
+                                v_start,
+                                v_stop,
+                                type(exc).__name__,
+                                exc,
+                            )
+                            packed_host = None
+                    if packed_host is None:
+                        packed_host = _read_chunk_to_host(
+                            fh, n_samples, v_start, v_stop, host_bufs[slot]
+                        )
+                    # GPU-gather path: upload raw bytes verbatim. The kernel
+                    # consumes sample_intersect_dev and decodes inline.
                     src_bytes = packed_host.reshape(-1).view(np.uint8)
                 assert src_bytes.shape[0] == n_bytes_eff
                 with copy_stream:
@@ -417,9 +519,17 @@ def _screen_one_path(
                 ),
                 count_a1=count_a1,
                 stream=compute_stream,
+                sample_intersect=sample_intersect_dev,
+                raw_n_samples=(n_samples if sample_intersect_dev is not None else None),
             )
             compute_done[slot].record(compute_stream)
     finally:
+        if rebitpack_executor is not None:
+            # Cancel any still-pending futures before tearing down the pool
+            # (e.g. on early-exit due to an exception in the GPU loop).
+            for fut in rebitpack_futures.values():
+                fut.cancel()
+            rebitpack_executor.shutdown(wait=True)
         if fh is not None:
             fh.close()
         if mmap_reader is not None:

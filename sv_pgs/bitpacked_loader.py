@@ -137,17 +137,8 @@ def _h2d_async(
 def _parallel_workers() -> int:
     """Resolve the worker count for parallel BED range reads.
 
-    Honors ``SV_PGS_BITPACKED_READ_WORKERS`` (int, >=1). Otherwise picks
-    ``min(os.cpu_count(), 8)``. Returns 1 to disable the parallel path.
+    Returns ``min(os.cpu_count(), 8)`` (clamped to >=1).
     """
-    env = os.environ.get("SV_PGS_BITPACKED_READ_WORKERS")
-    if env is not None:
-        try:
-            n = int(env)
-            if n >= 1:
-                return n
-        except ValueError:
-            pass
     try:
         cpu = int(os.cpu_count() or 1)
     except Exception:  # noqa: BLE001
@@ -550,9 +541,9 @@ def load_bed_to_bitpacked_device(
             if sample_indices is None:
                 pinned_mem, pinned_view = _allocate_pinned(cp, raw_total_bytes)
                 # Parallel range-read path: N independent fds, ``os.pread`` on
-                # each. Used when SV_PGS_BITPACKED_READ_WORKERS resolves to >1
-                # AND the BED is gcsfuse-backed AND total payload exceeds the
-                # 1 GB threshold. On local NVMe multiple workers just thrash
+                # each. Used when the worker count resolves to >1 AND the BED
+                # is gcsfuse-backed AND total payload exceeds the 1 GB
+                # threshold. On local NVMe multiple workers just thrash
                 # the page cache vs. a single sequential stream, so we skip.
                 # Falls back to the sequential ``_read_all_packed`` path on any
                 # error.

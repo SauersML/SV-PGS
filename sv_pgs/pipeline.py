@@ -63,39 +63,24 @@ def _maybe_upgrade_to_bitpacked(dataset: LoadedDataset, config: ModelConfig) -> 
         return dataset
     try:
         from sv_pgs.bitpacked_loader import (
-            load_bed_to_bitpacked_device,
             load_bed_to_bitpacked_device_cached,
         )
-        cache_dir_env = os.environ.get("SV_PGS_BITPACKED_ACTIVE_CACHE_DIR", "").strip()
-        # Allow operators (and the --no-cache CLI flag) to bypass the active
-        # matrix cache for debugging without unsetting the cache-dir env var.
-        if os.environ.get("SV_PGS_DISABLE_BITPACKED_ACTIVE_CACHE", "").strip() in {"1", "true", "yes"}:
-            log("bitpacked upgrade: active-matrix cache DISABLED via SV_PGS_DISABLE_BITPACKED_ACTIVE_CACHE")
-            cache_dir_env = ""
-        if cache_dir_env:
-            log(
-                f"bitpacked upgrade: loading BED {bed_path} -> device via active-matrix cache "
-                f"(cache_dir={cache_dir_env}, n_samples={int(sample_indices.shape[0])}, "
-                f"n_variants={n_variants_axis})"
-            )
-            bp_matrix = load_bed_to_bitpacked_device_cached(
-                bed_path=bed_path,
-                n_samples=int(iid_count),
-                n_variants=int(sid_count),
-                sample_indices=np.asarray(sample_indices, dtype=np.int64),
-                cache_dir=cache_dir_env,
-            )
-        else:
-            log(
-                f"bitpacked upgrade: loading BED {bed_path} -> device "
-                f"(n_samples={int(sample_indices.shape[0])}, n_variants={n_variants_axis})"
-            )
-            bp_matrix = load_bed_to_bitpacked_device(
-                bed_path=bed_path,
-                n_samples=int(iid_count),
-                n_variants=int(sid_count),
-                sample_indices=np.asarray(sample_indices, dtype=np.int64),
-            )
+        # Active-matrix cache is always on. Default location is a sibling
+        # ``.sv_pgs_cache`` next to the BED file, so repeated runs against
+        # the same downloaded BED reuse the packed device matrix on disk.
+        cache_dir = Path(bed_path).parent / ".sv_pgs_cache"
+        log(
+            f"bitpacked upgrade: loading BED {bed_path} -> device via active-matrix cache "
+            f"(cache_dir={cache_dir}, n_samples={int(sample_indices.shape[0])}, "
+            f"n_variants={n_variants_axis})"
+        )
+        bp_matrix = load_bed_to_bitpacked_device_cached(
+            bed_path=bed_path,
+            n_samples=int(iid_count),
+            n_variants=int(sid_count),
+            sample_indices=np.asarray(sample_indices, dtype=np.int64),
+            cache_dir=cache_dir,
+        )
     except Exception as exc:
         log(
             "bitpacked upgrade: SKIPPED (reason: loader failed: "

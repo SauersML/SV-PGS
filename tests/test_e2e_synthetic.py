@@ -119,7 +119,6 @@ def _find_active_cache_dir(cache_root: Path) -> Path | None:
 def test_e2e_synthetic_pipeline_and_active_cache(
     tmp_path: Path,
     capfd: pytest.CaptureFixture[str],
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     n_samples = 500
     n_variants = 5000
@@ -130,9 +129,8 @@ def test_e2e_synthetic_pipeline_and_active_cache(
         seed=1234,
     )
 
-    cache_root = tmp_path / "bp_cache"
-    cache_root.mkdir()
-    monkeypatch.setenv("SV_PGS_BITPACKED_ACTIVE_CACHE_DIR", str(cache_root))
+    # Active-matrix cache defaults to ``<bed_path.parent>/.sv_pgs_cache``.
+    cache_root = bed_path.parent / ".sv_pgs_cache"
 
     from sv_pgs.config import ModelConfig, TraitType
     from sv_pgs.io import load_dataset_from_files
