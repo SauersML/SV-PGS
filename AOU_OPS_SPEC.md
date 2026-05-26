@@ -215,3 +215,53 @@ This historically surfaced ~40 minutes into a production fit when `screening_pip
   4. `gemv_nt` / `gemv_tn` / `gemm_gram` parity vs the CPU reference.
 
 `run.sh` invokes the smoke as a non-fatal canary after `uv sync` and before the production fit, and supports a `--smoke` flag that runs ONLY the smoke and exits with the smoke's return code. Operators MUST run `bash run.sh --smoke` before kicking off a 90-minute fit on a new VM image.
+
+## 15. Bitpacked engagement and the active-matrix cache
+
+### 15.1 How to verify the bitpacked path is engaging
+
+The production log emits explicit ENGAGED / SKIPPED markers at every gateway where the bitpacked GPU path could silently degrade to int8 streaming. Grep for these in the run log:
+
+```
+bitpacked upgrade: ENGAGED                              # pipeline._maybe_upgrade_to_bitpacked
+bitpacked upgrade: SKIPPED (reason=...)
+marginal-z bitpacked fast path: ENGAGED                 # model.fit pre-screen
+marginal-z bitpacked fast path: SKIPPED (reason=...)
+model fit hot loop: matrix=BitpackedDeviceMatrix        # model.fit, just before EM
+```
+
+The hot-loop banner is the load-bearing one — a run that prints `matrix=BitpackedDeviceMatrix` engages gemv_nt/gemv_tn/gemm_gram for every matvec/rmatvec/gram_block call inside the EM and TR-Newton loops. A run that prints `matrix=Int8RawGenotypeMatrix` is on the slow streaming path; the follow-up log line `bitpacked path NOT engaged ... Iter_column_batches will be the dominant cost` is the alarm.
+
+### 15.2 Active-matrix cache: layout and warm-load contract
+
+`bitpacked_loader.load_bed_to_bitpacked_device_cached` writes a local-disk cache under `<cache_dir>/bitpacked_active/<content_hash>/`. Layout:
+
+```
+<cache_dir>/bitpacked_active/<content_hash>/
+  packed.bin          uint8 bitpacked, n_variants * bytes_per_variant
+  mean.npy            float32, shape (n_variants,)
+  scale.npy           float32, shape (n_variants,)
+  n_samples.txt       single decimal integer
+  manifest.json       schema_version, content_hash, n_samples, n_variants,
+                      packed_bytes, count_a1, created_utc, complete=true
+```
+
+`content_hash` is `sha256(bed_path stat + sample_intersect bytes + active_variant_indices bytes + count_a1)`. Any change in those inputs forces a fresh stream. `verify_active_matrix_cache` rejects entries missing the manifest, with `complete != True`, with a mismatched `schema_version`, or with a `packed.bin` size that disagrees with the manifest.
+
+Writes are atomic: each file goes to `<name>.partial.<pid>.<uuid>`, is fsynced, and renamed; the manifest is published LAST so a crash mid-write leaves an incomplete cache that `verify_active_matrix_cache` rejects (no half-loaded matrices).
+
+### 15.3 How to clear the active-matrix cache
+
+To force a full re-stream from gcsfuse on the next run:
+
+```bash
+rm -rf <cache_dir>/bitpacked_active/
+```
+
+This is safe at any time — sv-pgs treats the cache as advisory. To clear only a single content hash (e.g. after a known-bad partial write outside the atomic protocol), `rm -rf <cache_dir>/bitpacked_active/<content_hash>/`.
+
+### 15.4 What happens on retry
+
+- **Cold load (cache miss):** ~15 min stream of the 194 GB BED from gcsfuse, then the post-load cache write (~30 s of fsynced 24 GB write on local NVMe).
+- **Warm load (cache hit):** ~3-5 s. `packed.bin` is mmapped, copied into a pinned staging buffer, and uploaded H2D async (local NVMe → HBM ≈ 5-7 GB/s).
+- **Killed mid-write:** manifest absent or `complete != True` → cache rejected, next run re-streams. No corrupted-matrix risk.

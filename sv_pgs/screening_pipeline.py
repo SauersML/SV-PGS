@@ -556,6 +556,21 @@ def run_screening_pass(
         sample_intersect = np.asarray(sample_intersect, dtype=np.int64)
         if sample_intersect.ndim != 1:
             raise ValueError("sample_intersect must be 1D")
+        # sample_intersect is passed down to a CUDA kernel as int32 (signed),
+        # so any entry >= 2^31 silently truncates to a negative offset and
+        # reads garbage. Refuse at the gateway.
+        _INT32_MAX = (1 << 31) - 1
+        if sample_intersect.size and int(sample_intersect.max()) > _INT32_MAX:
+            raise ValueError(
+                "sample_intersect contains indices >= 2^31; CUDA kernels read "
+                "these as int32 and would silently truncate. Re-shard or "
+                "remap so every index fits in int32."
+            )
+        if sample_intersect.size > _INT32_MAX:
+            raise ValueError(
+                f"sample_intersect length {sample_intersect.size} exceeds "
+                "int32 capacity (2^31-1); CUDA kernel offsets cannot index it."
+            )
         for n_s in n_samples_per_path:
             if sample_intersect.size and (
                 int(sample_intersect.min()) < 0 or int(sample_intersect.max()) >= n_s

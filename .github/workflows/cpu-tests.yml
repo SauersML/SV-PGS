@@ -1,0 +1,61 @@
+name: cpu-tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  cpu-tests:
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v3
+
+      - name: Cache uv venv
+        uses: actions/cache@v4
+        with:
+          path: |
+            .venv
+            ~/.cache/uv
+          key: uv-${{ runner.os }}-py3.12-${{ hashFiles('pyproject.toml', 'uv.lock') }}
+          restore-keys: |
+            uv-${{ runner.os }}-py3.12-
+
+      - name: uv sync (CPU only; no GPU extra)
+        run: uv sync
+
+      - name: Run CPU test subset
+        id: tests
+        run: |
+          set -o pipefail
+          uv run pytest \
+            tests/test_bitpacked_lut.py \
+            tests/test_bitpacked_cpu_reference.py \
+            tests/test_bitpacked_launch.py \
+            tests/test_bitpacked_package_smoke.py \
+            tests/test_bitpacked_engagement.py \
+            tests/test_gds.py \
+            tests/test_mmap_reader.py \
+            tests/test_path_policy.py \
+            tests/test_preflight.py \
+            tests/test_aou_storage.py \
+            tests/test_sv_transcoder.py \
+            -v 2>&1 | tee pytest_output.txt
+
+      - name: Upload pytest output on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pytest-output
+          path: pytest_output.txt
+          retention-days: 14

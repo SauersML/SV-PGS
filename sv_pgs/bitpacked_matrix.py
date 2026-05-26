@@ -157,6 +157,30 @@ class BitpackedDeviceMatrix(RawGenotypeMatrix):
         except Exception:  # noqa: BLE001 - logging never blocks construction
             pass
 
+    def __repr__(self) -> str:
+        # HBM footprint reports packed + per-variant float side arrays. Wrapped
+        # in try/except because attributes may be cleared after ``close()`` and
+        # ``__repr__`` must never raise.
+        try:
+            packed = self._packed
+            mean = self._mean
+            std = self._std
+            if packed is None:
+                return (
+                    f"BitpackedDeviceMatrix(n_samples={self._n_samples}, "
+                    f"n_variants={self._n_variants}, closed=True)"
+                )
+            hbm_bytes = int(packed.nbytes) + int(mean.nbytes) + int(std.nbytes)
+            return (
+                f"BitpackedDeviceMatrix(n_samples={self._n_samples}, "
+                f"n_variants={self._n_variants}, hbm_gb={hbm_bytes / 1e9:.2f})"
+            )
+        except Exception:  # noqa: BLE001 - __repr__ must not raise
+            return (
+                f"BitpackedDeviceMatrix(n_samples={getattr(self, '_n_samples', '?')}, "
+                f"n_variants={getattr(self, '_n_variants', '?')})"
+            )
+
     # ------------------------------------------------------------------
     # RawGenotypeMatrix ABC surface
     # ------------------------------------------------------------------

@@ -13,8 +13,13 @@ Implements ``load_bed_to_bitpacked_device`` per ``BITPACKED_SPEC.md``:
 
 from __future__ import annotations
 
+import hashlib
+import json
 import logging
 import os
+import time
+import uuid
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -516,3 +521,327 @@ def load_bed_to_bitpacked_device(
         n_samples=effective_n_samples,
         count_a1=count_a1,
     )
+
+
+# ---------------------------------------------------------------------------
+# Persistent active-matrix cache
+# ---------------------------------------------------------------------------
+
+_ACTIVE_CACHE_SCHEMA_VERSION = 1
+
+
+def _active_cache_content_hash(
+    *,
+    bed_path: Path,
+    sample_indices: np.ndarray | None,
+    variant_indices: np.ndarray | None,
+    count_a1: bool,
+) -> str:
+    """Stable sha256 over the inputs that uniquely determine the cached matrix.
+
+    Includes bed_path stat (size + mtime), sample/variant index bytes, and the
+    count_a1 flag. We deliberately stat the BED rather than CRC the contents —
+    194 GB of CRC at cache-key time would defeat the purpose.
+    """
+    h = hashlib.sha256()
+    h.update(f"schema={_ACTIVE_CACHE_SCHEMA_VERSION}\n".encode("utf-8"))
+    h.update(f"count_a1={int(bool(count_a1))}\n".encode("utf-8"))
+    try:
+        st = bed_path.stat()
+        h.update(f"bed_size={st.st_size}\n".encode("utf-8"))
+        # ns precision so a one-second overwrite is still detected.
+        h.update(f"bed_mtime_ns={int(st.st_mtime_ns)}\n".encode("utf-8"))
+    except OSError:
+        h.update(f"bed_unstattable={bed_path!s}\n".encode("utf-8"))
+    if sample_indices is None:
+        h.update(b"sample_indices=None\n")
+    else:
+        s = np.ascontiguousarray(np.asarray(sample_indices, dtype=np.int64))
+        h.update(b"sample_indices=")
+        h.update(s.tobytes())
+        h.update(b"\n")
+    if variant_indices is None:
+        h.update(b"variant_indices=None\n")
+    else:
+        v = np.ascontiguousarray(np.asarray(variant_indices, dtype=np.int64))
+        h.update(b"variant_indices=")
+        h.update(v.tobytes())
+        h.update(b"\n")
+    return h.hexdigest()
+
+
+def _active_cache_dir(root: Path, content_hash: str) -> Path:
+    return Path(root) / "bitpacked_active" / content_hash
+
+
+def _active_cache_manifest_path(cache_dir: Path) -> Path:
+    return cache_dir / "manifest.json"
+
+
+def verify_active_matrix_cache(cache_dir: Path) -> bool:
+    """Return True iff ``cache_dir`` contains a complete, well-formed cache."""
+    cache_dir = Path(cache_dir)
+    manifest_path = _active_cache_manifest_path(cache_dir)
+    if not manifest_path.exists():
+        return False
+    try:
+        with open(manifest_path, "rb") as fh:
+            manifest = json.loads(fh.read().decode("utf-8"))
+    except (OSError, ValueError, UnicodeDecodeError):
+        return False
+    try:
+        if int(manifest.get("schema_version", -1)) != _ACTIVE_CACHE_SCHEMA_VERSION:
+            return False
+        if not bool(manifest.get("complete", False)):
+            return False
+        expected_packed = int(manifest.get("packed_bytes", -1))
+        n_samples = int(manifest.get("n_samples", -1))
+        n_variants = int(manifest.get("n_variants", -1))
+    except (TypeError, ValueError):
+        return False
+    if n_samples < 0 or n_variants < 0:
+        return False
+    packed = cache_dir / "packed.bin"
+    mean = cache_dir / "mean.npy"
+    scale = cache_dir / "scale.npy"
+    nsf = cache_dir / "n_samples.txt"
+    for required in (packed, mean, scale, nsf):
+        if not required.exists():
+            return False
+    try:
+        if packed.stat().st_size != expected_packed:
+            return False
+    except OSError:
+        return False
+    return True
+
+
+def _fsync_dir(path: Path) -> None:
+    try:
+        fd = os.open(str(path), os.O_RDONLY)
+    except OSError:
+        return
+    try:
+        os.fsync(fd)
+    except OSError:
+        pass
+    finally:
+        os.close(fd)
+
+
+def _write_active_matrix_cache(
+    cache_dir: Path,
+    *,
+    matrix: "BitpackedDeviceMatrix",
+    bed_path: Path,
+    content_hash: str,
+    count_a1: bool,
+) -> None:
+    """Atomically dump ``matrix`` (packed/mean/scale + n_samples + manifest).
+
+    Each large array is written to ``<name>.partial.<pid>.<uuid>`` then
+    fsync+renamed; the manifest with ``complete=true`` is published LAST so a
+    crash mid-write leaves a clearly-incomplete cache (manifest absent).
+    """
+    cp = _require_cupy()
+    cache_dir = Path(cache_dir)
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    suffix = f".partial.{os.getpid()}.{uuid.uuid4().hex[:8]}"
+
+    packed_host = cp.asnumpy(matrix._packed)
+    mean_host = cp.asnumpy(matrix._mean)
+    std_host = cp.asnumpy(matrix._std)
+
+    packed_partial = cache_dir / f"packed.bin{suffix}"
+    mean_partial = cache_dir / f"mean.npy{suffix}"
+    scale_partial = cache_dir / f"scale.npy{suffix}"
+    ns_partial = cache_dir / f"n_samples.txt{suffix}"
+
+    try:
+        with open(packed_partial, "wb") as fh:
+            fh.write(np.ascontiguousarray(packed_host).tobytes())
+            fh.flush()
+            os.fsync(fh.fileno())
+        # np.save appends ``.npy`` to a path lacking that extension; the
+        # ``.partial.<pid>.<uuid>`` suffix means we MUST disable that fixup or
+        # the actual on-disk filename diverges from what we rename. Use the
+        # ``arr.tofile``-equivalent via the lower-level numpy.format.
+        with open(mean_partial, "wb") as fh:
+            np.lib.format.write_array(
+                fh, np.ascontiguousarray(mean_host.astype(np.float32, copy=False))
+            )
+            fh.flush()
+            os.fsync(fh.fileno())
+        with open(scale_partial, "wb") as fh:
+            np.lib.format.write_array(
+                fh, np.ascontiguousarray(std_host.astype(np.float32, copy=False))
+            )
+            fh.flush()
+            os.fsync(fh.fileno())
+        with open(ns_partial, "w", encoding="utf-8") as fh:
+            fh.write(str(int(matrix._n_samples)) + "\n")
+            fh.flush()
+            os.fsync(fh.fileno())
+
+        os.replace(str(packed_partial), str(cache_dir / "packed.bin"))
+        os.replace(str(mean_partial), str(cache_dir / "mean.npy"))
+        os.replace(str(scale_partial), str(cache_dir / "scale.npy"))
+        os.replace(str(ns_partial), str(cache_dir / "n_samples.txt"))
+        _fsync_dir(cache_dir)
+
+        manifest = {
+            "schema_version": _ACTIVE_CACHE_SCHEMA_VERSION,
+            "content_hash": content_hash,
+            "source_bed_path": str(bed_path),
+            "n_samples": int(matrix._n_samples),
+            "n_variants": int(matrix._n_variants),
+            "packed_bytes": int(packed_host.nbytes),
+            "count_a1": bool(count_a1),
+            "created_utc": datetime.now(timezone.utc).isoformat(),
+            "complete": True,
+        }
+        manifest_partial = cache_dir / f"manifest.json{suffix}"
+        with open(manifest_partial, "w", encoding="utf-8") as fh:
+            json.dump(manifest, fh, indent=2, sort_keys=True)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(str(manifest_partial), str(_active_cache_manifest_path(cache_dir)))
+        _fsync_dir(cache_dir)
+    finally:
+        for p in (packed_partial, mean_partial, scale_partial, ns_partial):
+            try:
+                if p.exists():
+                    p.unlink()
+            except OSError:
+                pass
+
+
+def _load_active_matrix_cache(
+    cache_dir: Path,
+    *,
+    count_a1: bool,
+) -> "BitpackedDeviceMatrix":
+    """Load a verified cache directory into a fresh BitpackedDeviceMatrix.
+
+    Uses ``np.memmap`` for the packed buffer so the host-resident copy is
+    page-cache-backed; the device upload then goes through a pinned-pageable
+    DMA staging buffer (same as the cold load path).
+    """
+    cp = _require_cupy()
+    cache_dir = Path(cache_dir)
+    with open(cache_dir / "n_samples.txt", "r", encoding="utf-8") as fh:
+        n_samples = int(fh.read().strip())
+    mean_host = np.load(cache_dir / "mean.npy")
+    std_host = np.load(cache_dir / "scale.npy")
+    n_variants = int(mean_host.shape[0])
+    bpv = _bytes_per_variant(n_samples)
+    packed_size = n_variants * bpv
+    packed_host = np.memmap(
+        cache_dir / "packed.bin",
+        dtype=np.uint8,
+        mode="r",
+        shape=(packed_size,),
+    )
+    # Stage into pinned memory for a fast async H2D upload.
+    pinned_mem, pinned_view = _allocate_pinned(cp, packed_size)
+    pinned_view[:] = packed_host
+    del packed_host
+    device_packed = cp.empty((n_variants, bpv), dtype=cp.uint8)
+    cp_stream = _resolve_stream(cp, None)
+    _h2d_async(cp, device_packed, pinned_view, cp_stream)
+    device_mean = cp.asarray(mean_host.astype(np.float32, copy=False))
+    device_std = cp.asarray(std_host.astype(np.float32, copy=False))
+    cp_stream.synchronize()
+
+    from sv_pgs.bitpacked_matrix import BitpackedDeviceMatrix  # lazy
+
+    return BitpackedDeviceMatrix(
+        packed=device_packed,
+        mean=device_mean,
+        std=device_std,
+        n_samples=n_samples,
+        count_a1=count_a1,
+    )
+
+
+def load_bed_to_bitpacked_device_cached(
+    bed_path: str | Path,
+    n_samples: int,
+    n_variants: int,
+    *,
+    cache_dir: str | Path,
+    variant_indices: np.ndarray | None = None,
+    sample_indices: np.ndarray | None = None,
+    mean: np.ndarray | None = None,
+    std: np.ndarray | None = None,
+    count_a1: bool = True,
+    stream: Any | None = None,
+) -> "BitpackedDeviceMatrix":
+    """Cache-aware wrapper around :func:`load_bed_to_bitpacked_device`.
+
+    On cache HIT, mmaps ``<cache_dir>/bitpacked_active/<hash>/packed.bin`` and
+    uploads to HBM (≈3-5s for a 24 GB matrix on local NVMe). On cache MISS,
+    streams the BED and writes the cache atomically after the matrix is built.
+
+    The cache is keyed by the sha256 of (bed_path stat, sample_indices bytes,
+    variant_indices bytes, count_a1). Bumping any of those forces a re-load.
+    """
+    bed_path = Path(bed_path)
+    content_hash = _active_cache_content_hash(
+        bed_path=bed_path,
+        sample_indices=sample_indices,
+        variant_indices=variant_indices,
+        count_a1=count_a1,
+    )
+    cache_subdir = _active_cache_dir(Path(cache_dir), content_hash)
+    try:
+        from sv_pgs.progress import log as _log
+    except ImportError:  # pragma: no cover - progress should always exist
+        _log = None  # type: ignore[assignment]
+
+    if verify_active_matrix_cache(cache_subdir):
+        if _log is not None:
+            _log(
+                f"bitpacked active-matrix cache HIT: {cache_subdir} "
+                f"(content_hash={content_hash[:12]}...)"
+            )
+        t0 = time.monotonic()
+        matrix = _load_active_matrix_cache(cache_subdir, count_a1=count_a1)
+        elapsed = time.monotonic() - t0
+        if _log is not None:
+            _log(
+                f"bitpacked active-matrix cache load complete in {elapsed:.2f}s "
+                f"(n_samples={matrix._n_samples}, n_variants={matrix._n_variants})"
+            )
+        return matrix
+
+    if _log is not None:
+        _log(
+            f"bitpacked active-matrix cache MISS: streaming BED then populating "
+            f"{cache_subdir} (content_hash={content_hash[:12]}...)"
+        )
+    matrix = load_bed_to_bitpacked_device(
+        bed_path=bed_path,
+        n_samples=n_samples,
+        n_variants=n_variants,
+        variant_indices=variant_indices,
+        sample_indices=sample_indices,
+        mean=mean,
+        std=std,
+        count_a1=count_a1,
+        stream=stream,
+    )
+    try:
+        _write_active_matrix_cache(
+            cache_subdir,
+            matrix=matrix,
+            bed_path=bed_path,
+            content_hash=content_hash,
+            count_a1=count_a1,
+        )
+        if _log is not None:
+            _log(f"bitpacked active-matrix cache populated: {cache_subdir}")
+    except Exception as exc:  # noqa: BLE001 - cache write is best-effort
+        if _log is not None:
+            _log(f"bitpacked active-matrix cache write failed (continuing): {exc!r}")
+    return matrix

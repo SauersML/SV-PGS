@@ -321,6 +321,22 @@ def check_aou_preflight(
             "A GPU is required but none is visible."
         )
 
+    # 7b. CUDA_VISIBLE_DEVICES subset warning. nvidia-smi sees every physical
+    # device on the host even when CUDA_VISIBLE_DEVICES masks a subset; if the
+    # mask hides GPUs the operator probably didn't intend to drop, surface a
+    # non-fatal warning so the discrepancy is visible at preflight time.
+    cvd = os.environ.get("CUDA_VISIBLE_DEVICES")
+    if cvd is not None and cvd.strip() != "":
+        visible_count = sum(1 for tok in cvd.split(",") if tok.strip() != "")
+        physical_count = len(cuda_devices)
+        if physical_count > 0 and visible_count < physical_count:
+            warnings.append(
+                f"CUDA_VISIBLE_DEVICES={cvd!r} exposes {visible_count} GPU(s) but "
+                f"nvidia-smi sees {physical_count} physical device(s); the remaining "
+                f"{physical_count - visible_count} GPU(s) will NOT be used. Unset "
+                "CUDA_VISIBLE_DEVICES to use every GPU on the host."
+            )
+
     # 8. CuPy lazy probe -------------------------------------------------------
     cupy_available, cupy_devices, cupy_err = _probe_cupy()
     if not cupy_available:

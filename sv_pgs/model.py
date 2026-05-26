@@ -1927,6 +1927,67 @@ class BayesianPGS:
             f"on_gpu={reduced_genotypes._cupy_cache is not None}  "
             f"mem={mem()}"
         )
+        # ------------------------------------------------------------------
+        # Hot-loop matrix-lineage banner.
+        #
+        # The dispatch decisions inside the EM/TR-Newton hot loop branch on
+        # the concrete underlying ``raw`` matrix type:
+        #   - ``BitpackedDeviceMatrix``: device-resident; matvec/rmatvec/
+        #     gram_block route to gemv_nt/gemv_tn/gemm_gram. The hot loop
+        #     never decodes int8.
+        #   - ``Int8RawGenotypeMatrix`` with ``_cupy_cache``: int8 lives in
+        #     HBM; the standardize-on-the-fly elementwise kernel runs there.
+        #   - ``Int8RawGenotypeMatrix`` without ``_cupy_cache``: host int8
+        #     tiles stream through ``iter_column_batches_i8``. This is the
+        #     SLOW path the bitpacked upgrade is meant to displace.
+        #   - Anything else: ``iter_column_batches`` yields fp32 batches.
+        #
+        # We log a single greppable banner so the production log shows
+        # exactly which path the run took. Operators verifying that the
+        # bitpacked path engaged should grep for "model fit hot loop:
+        # matrix=BitpackedDeviceMatrix".
+        # ------------------------------------------------------------------
+        try:
+            _raw_for_banner = getattr(reduced_genotypes, "raw", None) or reduced_genotypes
+            _matrix_type = type(_raw_for_banner).__name__
+            _backing = "unknown"
+            _resident = ""
+            if _matrix_type == "BitpackedDeviceMatrix":
+                _backing = "cupy"
+                _packed = getattr(_raw_for_banner, "_packed", None)
+                _mean = getattr(_raw_for_banner, "_mean", None)
+                _std = getattr(_raw_for_banner, "_std", None)
+                if _packed is not None and _mean is not None and _std is not None:
+                    _hbm_gb = (int(_packed.nbytes) + int(_mean.nbytes) + int(_std.nbytes)) / 1e9
+                    _resident = f"  HBM={_hbm_gb:.2f} GB resident"
+            elif _matrix_type == "Int8RawGenotypeMatrix":
+                if getattr(_raw_for_banner, "_cupy_cache", None) is not None:
+                    _backing = "cupy"
+                    _resident = "  int8 HBM resident"
+                else:
+                    _matrix_obj = getattr(_raw_for_banner, "matrix", None)
+                    if _matrix_obj is not None and hasattr(_matrix_obj, "nbytes"):
+                        _host_gb = int(_matrix_obj.nbytes) / 1e9
+                        _backing = "numpy"
+                        _resident = f"  host={_host_gb:.2f} GB resident"
+                    else:
+                        _backing = "streaming"
+                        _resident = "  streaming via PLINK reader"
+            else:
+                _backing = "streaming"
+            log(
+                f"model fit hot loop: matrix={_matrix_type}  "
+                f"shape=({reduced_genotypes.shape[0]}, {reduced_genotypes.shape[1]})  "
+                f"backing={_backing}{_resident}"
+            )
+            if _matrix_type != "BitpackedDeviceMatrix":
+                log(
+                    "model fit hot loop: bitpacked path NOT engaged "
+                    f"(reduced matrix is {_matrix_type}). "
+                    "Iter_column_batches will be the dominant cost."
+                )
+        except Exception as _banner_exc:  # noqa: BLE001 - banner is best-effort
+            log(f"model fit hot loop: banner failed: {_banner_exc!r}")
         em_validation_data = reduced_validation
         em_per_epoch_eval_callback = per_epoch_eval_callback
         em_validation_is_holdout_only = validation_is_holdout_only
