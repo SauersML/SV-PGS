@@ -979,7 +979,11 @@ def _try_upgrade_reduced_to_bitpacked(
     src_bpv = (int(iid_count) + 3) // 4
     dst_bpv = (n_samples_eff + 3) // 4
     packed_device_bytes = k_active * dst_bpv
-    src_packed_bytes = sid_count * src_bpv
+    # Host cold-load buffer is sized to the GATHER (k_active * src_bpv) not
+    # the full BED — the indexed read in plink._pread_indexed_variant_payload
+    # allocates np.empty(indices.size * bpv) and a sibling pinned/rebitpacked
+    # buffer is k_active * dst_bpv. Total peak ~ k_active*(src_bpv + dst_bpv).
+    cold_load_peak_bytes = k_active * (src_bpv + dst_bpv)
 
     # GPU HBM gate: reserve 25% (or 4 GiB, whichever larger) for downstream
     # EM scratch, standardization side buffers, and prefetch.
@@ -999,20 +1003,19 @@ def _try_upgrade_reduced_to_bitpacked(
             f"active_variants={k_active}, n_samples={n_samples_eff})"
         )
         return None
-    # Host-RAM gate: the indexed cold-load currently allocates one numpy
-    # buffer of size sid_count * src_bpv before rebitpacking to the requested
-    # sample subset. Gate on available host RAM with a 1.5x safety factor.
+    # Host-RAM gate based on the actual cold-load peak (payload + rebitpacked
+    # + pinned) for the gather subset, with a 1.5x safety margin.
     try:
         import psutil  # type: ignore
         host_free_bytes = int(psutil.virtual_memory().available)
     except ImportError:
         host_free_bytes = 0
-    if host_free_bytes > 0 and src_packed_bytes * 3 // 2 > host_free_bytes:
+    if host_free_bytes > 0 and cold_load_peak_bytes * 3 // 2 > host_free_bytes:
         log(
             "bitpacked post-active upgrade: SKIPPED "
-            f"(reason: cold-load staging buffer would exceed host RAM; "
-            f"src_packed_bytes={src_packed_bytes} "
-            f"(~{src_packed_bytes * 3 // 2 / 1e9:.2f} GB w/ 1.5x), "
+            f"(reason: cold-load peak would exceed host RAM; "
+            f"cold_load_peak_bytes={cold_load_peak_bytes} "
+            f"(~{cold_load_peak_bytes * 3 // 2 / 1e9:.2f} GB w/ 1.5x), "
             f"host_free_bytes={host_free_bytes} ({host_free_bytes/1e9:.2f} GB))"
         )
         return None
