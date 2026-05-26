@@ -109,6 +109,8 @@ __device__ __forceinline__ float z_of_flag(
     int code = (row[byte_idx] >> (slot * 2)) & 0x3;
     int d = decode_dosage(code, count_a1);
     if (d < 0) return 0.0f;
+    // Zero-scale columns contribute 0 to the gram (mean-imputed constant column).
+    if (!(s > 0.0f)) return 0.0f;
     return ((float)d - m) / s;
 }
 

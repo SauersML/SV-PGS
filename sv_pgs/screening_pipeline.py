@@ -24,6 +24,7 @@ kernel package, so it imports cleanly in CPU-only environments.
 from __future__ import annotations
 
 import logging
+import warnings
 from pathlib import Path
 from typing import Any, Iterator
 
@@ -174,7 +175,7 @@ def _screen_one_path(
     n_variants: int,
     *,
     sample_intersect: np.ndarray | None,
-    y_resid_dev: Any | None,
+    rhs_dev: Any | None,
     count_a1: bool,
     stream: Any | None,
     chunk_bytes: int,
@@ -183,7 +184,7 @@ def _screen_one_path(
 
     Returns a dict of cupy arrays (count, sum, sumsq, dosage_rhs,
     observed_rhs) of length ``n_variants`` (with a trailing k-axis when
-    ``y_resid_dev`` is 2-D). The caller concatenates across paths.
+    ``rhs_dev`` is 2-D). The caller concatenates across paths.
 
     Standardized inner product reconstruction (per-variant, per-rhs-column):
 
@@ -222,9 +223,9 @@ def _screen_one_path(
     # keep the control flow uniform.
     chunks = list(_iter_chunks(bed_path, n_samples, n_variants, chunk_bytes))
     # rhs shape bookkeeping: kernel supports 1D (k=1) and 2D (k>1).
-    if y_resid_dev is not None:
+    if rhs_dev is not None:
         rhs_shape_tail: tuple[int, ...] = (
-            () if y_resid_dev.ndim == 1 else (int(y_resid_dev.shape[1]),)
+            () if rhs_dev.ndim == 1 else (int(rhs_dev.shape[1]),)
         )
     else:
         rhs_shape_tail = ()
@@ -232,12 +233,12 @@ def _screen_one_path(
     if not chunks:
         empty_drhs = (
             cp.zeros((0,) + rhs_shape_tail, dtype=cp.float64)
-            if y_resid_dev is not None
+            if rhs_dev is not None
             else None
         )
         empty_orhs = (
             cp.zeros((0,) + rhs_shape_tail, dtype=cp.float64)
-            if y_resid_dev is not None
+            if rhs_dev is not None
             else None
         )
         return {
@@ -268,7 +269,7 @@ def _screen_one_path(
     out_count = cp.zeros(n_variants, dtype=cp.int32)
     out_sum = cp.zeros(n_variants, dtype=cp.float64)
     out_sumsq = cp.zeros(n_variants, dtype=cp.float64)
-    if y_resid_dev is not None:
+    if rhs_dev is not None:
         out_dosage_rhs = cp.zeros((n_variants,) + rhs_shape_tail, dtype=cp.float64)
         out_observed_rhs = cp.zeros((n_variants,) + rhs_shape_tail, dtype=cp.float64)
     else:
@@ -394,7 +395,7 @@ def _screen_one_path(
                 out_count[v_start:v_stop],
                 out_sum[v_start:v_stop],
                 out_sumsq[v_start:v_stop],
-                rhs=y_resid_dev,
+                rhs=rhs_dev,
                 out_dosage_rhs=(
                     None if out_dosage_rhs is None else out_dosage_rhs[v_start:v_stop]
                 ),
@@ -447,9 +448,10 @@ def run_screening_pass(
     n_samples_per_path: list[int],
     n_variants_per_path: list[int],
     sample_intersect: np.ndarray | None = None,
-    y_resid: np.ndarray | None = None,
+    rhs: np.ndarray | None = None,
     count_a1: bool = True,
     stream: Any | None = None,
+    y_resid: np.ndarray | None = None,
 ) -> dict[str, Any]:
     """Stream every BED shard through the bitpacked screening kernel.
 
@@ -466,12 +468,12 @@ def run_screening_pass(
         intersect must apply to every shard — this is the cohort-level
         sample subset). If given, every chunk is decoded -> gathered ->
         re-encoded on the CPU before upload.
-    y_resid
+    rhs
         Optional length-``n_samples_out`` float vector (1-D) or
         ``(n_samples_out, k)`` matrix (2-D). If given, the screening
         kernel additionally computes the missingness-aware partials
-        ``dosage_rhs[v, j] = sum_{i in obs} d_iv * y_resid[i, j]`` and
-        ``observed_rhs[v, j] = sum_{i in obs} y_resid[i, j]`` per
+        ``dosage_rhs[v, j] = sum_{i in obs} d_iv * rhs[i, j]`` and
+        ``observed_rhs[v, j] = sum_{i in obs} rhs[i, j]`` per
         variant. Uploaded to the device once and reused across shards.
         The standardized inner product is reconstructed via
         :func:`finalize_standardized_rhs`.
@@ -480,6 +482,10 @@ def run_screening_pass(
     stream
         Optional caller-provided CuPy compute stream. If None, a new
         non-blocking stream is created per shard.
+    y_resid
+        Deprecated alias for ``rhs``. Emits ``DeprecationWarning`` and
+        will be removed in a future release. Mirrors the kernel-level
+        deprecation in :mod:`sv_pgs.bitpacked.screening`.
 
     Returns
     -------
@@ -505,17 +511,32 @@ def run_screening_pass(
 
     import cupy as cp  # lazy
 
-    # Stage y_resid on the device once. Accept both 1-D (k=1) and 2-D
-    # (k>=1) inputs; the screening kernel handles both layouts.
+    # Back-compat: accept the deprecated ``y_resid=`` alias. Mirrors the
+    # kernel-level deprecation in sv_pgs.bitpacked.screening.
     if y_resid is not None:
-        y_resid_np = np.ascontiguousarray(np.asarray(y_resid, dtype=np.float64))
-        if y_resid_np.ndim not in (1, 2):
-            raise ValueError(
-                f"y_resid must be 1-D or 2-D, got shape {y_resid_np.shape}"
+        if rhs is not None:
+            raise TypeError(
+                "run_screening_pass() received both `rhs` and the deprecated "
+                "alias `y_resid`; pass only `rhs`."
             )
-        y_resid_dev = cp.asarray(y_resid_np)
+        warnings.warn(
+            "run_screening_pass(y_resid=...) is deprecated; use rhs=... instead.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        rhs = y_resid
+
+    # Stage rhs on the device once. Accept both 1-D (k=1) and 2-D
+    # (k>=1) inputs; the screening kernel handles both layouts.
+    if rhs is not None:
+        rhs_np = np.ascontiguousarray(np.asarray(rhs, dtype=np.float64))
+        if rhs_np.ndim not in (1, 2):
+            raise ValueError(
+                f"rhs must be 1-D or 2-D, got shape {rhs_np.shape}"
+            )
+        rhs_dev = cp.asarray(rhs_np)
     else:
-        y_resid_dev = None
+        rhs_dev = None
 
     # Validate per-shard sample counts against the intersect (if any).
     if sample_intersect is not None:
@@ -538,9 +559,9 @@ def run_screening_pass(
                 "sample counts differ across shards; provide sample_intersect"
             )
 
-    if y_resid_dev is not None and int(y_resid_dev.shape[0]) != n_samples_out:
+    if rhs_dev is not None and int(rhs_dev.shape[0]) != n_samples_out:
         raise ValueError(
-            f"y_resid leading dim {int(y_resid_dev.shape[0])} != effective n_samples "
+            f"rhs leading dim {int(rhs_dev.shape[0])} != effective n_samples "
             f"{n_samples_out}"
         )
 
@@ -552,7 +573,7 @@ def run_screening_pass(
                 int(n_s),
                 int(n_v),
                 sample_intersect=sample_intersect,
-                y_resid_dev=y_resid_dev,
+                rhs_dev=rhs_dev,
                 count_a1=count_a1,
                 stream=stream,
                 chunk_bytes=_DEFAULT_CHUNK_BYTES,
@@ -563,7 +584,7 @@ def run_screening_pass(
     count = cp.concatenate([r["count"] for r in per_path_results])
     s = cp.concatenate([r["sum"] for r in per_path_results])
     ssq = cp.concatenate([r["sumsq"] for r in per_path_results])
-    if y_resid_dev is not None:
+    if rhs_dev is not None:
         drhs = cp.concatenate([r["dosage_rhs"] for r in per_path_results], axis=0)
         orhs = cp.concatenate([r["observed_rhs"] for r in per_path_results], axis=0)
         drhs_host: Any = cp.asnumpy(drhs)

@@ -30,11 +30,42 @@ def _cupy():
     return cp
 
 
-def _bitpacked():
-    """Lazy import of the bitpacked kernels package."""
-    from sv_pgs import bitpacked as _bp  # noqa: WPS433 - lazy by design
+class _BitpackedFns:
+    """Cached handle to the bitpacked kernel callables.
 
-    return _bp
+    We deliberately bind the concrete submodule functions here rather than
+    going through ``sv_pgs.bitpacked``'s package-level ``__getattr__``.
+    Importing any submodule has the side effect of binding the submodule
+    onto the package's ``__dict__``, after which ``bp.gemv_nt`` resolves to
+    the *module* (not the callable) and ``__getattr__`` is never invoked.
+    Binding the callables on this small object sidesteps that pitfall.
+    """
+
+    __slots__ = ("gemv_nt", "gemv_tn", "gemm_gram", "screen", "make_decode_lut")
+
+    def __init__(self) -> None:
+        from sv_pgs.bitpacked.gemv_nt import gemv_nt
+        from sv_pgs.bitpacked.gemv_tn import gemv_tn
+        from sv_pgs.bitpacked.gemm_gram import gemm_gram
+        from sv_pgs.bitpacked.screening import screen
+        from sv_pgs.bitpacked.lut import make_decode_lut
+
+        self.gemv_nt = gemv_nt
+        self.gemv_tn = gemv_tn
+        self.gemm_gram = gemm_gram
+        self.screen = screen
+        self.make_decode_lut = make_decode_lut
+
+
+_BITPACKED_FNS: _BitpackedFns | None = None
+
+
+def _bitpacked() -> _BitpackedFns:
+    """Lazy, cached handle to the bitpacked kernel callables."""
+    global _BITPACKED_FNS
+    if _BITPACKED_FNS is None:
+        _BITPACKED_FNS = _BitpackedFns()
+    return _BITPACKED_FNS
 
 
 def _bytes_per_variant(n_samples: int) -> int:
