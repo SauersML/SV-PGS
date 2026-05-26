@@ -55,12 +55,43 @@ def _maybe_upgrade_to_bitpacked(dataset: LoadedDataset, config: ModelConfig) -> 
     _reader, sample_indices, iid_count, bed_path = ctx
     n_variants_axis = int(dataset.genotypes.shape[1])
     sid_count = int(getattr(_reader, "sid_count", n_variants_axis) or n_variants_axis)
+    variant_indices: np.ndarray | None = None
     if sid_count != n_variants_axis:
+        # The dataset has fewer columns than the source BED — typically because
+        # the IO layer dropped within-source duplicate variants (AoU's arrays.bim
+        # has a small number of true duplicates like chr1:146066338:C:A). Walk
+        # the wrapper tree for an IndexedRawGenotypeMatrix.selected_columns that
+        # records the surviving source-BED column indices, and pass that as
+        # variant_indices so the bitpacked loader only packs the kept variants.
+        from sv_pgs.genotype import IndexedRawGenotypeMatrix  # lazy
+        stack: list[object] = [dataset.genotypes]
+        seen: set[int] = set()
+        while stack:
+            node = stack.pop()
+            if node is None or id(node) in seen:
+                continue
+            seen.add(id(node))
+            if isinstance(node, IndexedRawGenotypeMatrix):
+                variant_indices = np.asarray(node.selected_columns, dtype=np.int64)
+                break
+            child = getattr(node, "child", None)
+            if child is not None:
+                stack.append(child)
+            children = getattr(node, "children", None)
+            if children is not None:
+                stack.extend(children)
+        if variant_indices is None or variant_indices.shape[0] != n_variants_axis:
+            log(
+                "bitpacked upgrade: SKIPPED (reason: variant count mismatch and no "
+                f"recoverable mapping; sid_count={sid_count}, dataset variants="
+                f"{n_variants_axis}, found_indices="
+                f"{None if variant_indices is None else int(variant_indices.shape[0])})"
+            )
+            return dataset
         log(
-            "bitpacked upgrade: SKIPPED (reason: variant-subset wrapper present; "
-            f"sid_count={sid_count}, dataset variants={n_variants_axis})"
+            f"bitpacked upgrade: variant-subset mapping recovered "
+            f"(kept {variant_indices.shape[0]}/{sid_count} source variants)"
         )
-        return dataset
     try:
         from sv_pgs.bitpacked_loader import (
             load_bed_to_bitpacked_device_cached,
@@ -79,6 +110,7 @@ def _maybe_upgrade_to_bitpacked(dataset: LoadedDataset, config: ModelConfig) -> 
             n_samples=int(iid_count),
             n_variants=int(sid_count),
             sample_indices=np.asarray(sample_indices, dtype=np.int64),
+            variant_indices=variant_indices,
             cache_dir=cache_dir,
         )
     except Exception as exc:
