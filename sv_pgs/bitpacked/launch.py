@@ -273,11 +273,16 @@ def gemm_gram_config(n_samples: int, n_variants: int, arch: ArchLike) -> dict:
         block_x = 128
         shmem = 16 * 1024
     elif family == "volta":
-        # V100: 64x64 output tile, 128 threads (4 warps), ~16 KB shmem cap
-        # leaves room for the WMMA scratch buffer used in the volta_mma kernel.
+        # V100: 64x64 output tile, 128 threads (4 warps).
+        # The Volta WMMA kernel allocates ALL SMEM statically (sA/sB/frag_scratch
+        # are `__shared__` arrays, not `extern __shared__`). The launch must
+        # therefore request ZERO dynamic SMEM — otherwise the runtime adds the
+        # static + requested-dynamic amounts and may exceed the 48 KB per-block
+        # static limit on sm_70 (which was the cause of CUDA_ERROR_INVALID_VALUE
+        # when a 128x128 tile was attempted with shmem=32 KB requested).
         tile_m, tile_n = 64, 64
         block_x = 128
-        shmem = 16 * 1024
+        shmem = 0
     else:
         tile_m, tile_n = 64, 64
         block_x = 128
