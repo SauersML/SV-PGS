@@ -161,6 +161,28 @@ def gpu_arch() -> GpuArch:
     )
 
 
+def gpu_arch_summary() -> str:
+    """Return a single human-readable line summarizing the active GPU.
+
+    Example: ``V100 sm_70 family=volta HBM=15.7 GB``. Falls back gracefully
+    when CuPy / NVML are unavailable, returning ``unknown (no GPU detected)``.
+    """
+    arch = gpu_arch()
+    if arch.sm <= 0:
+        return "unknown (no GPU detected)"
+    name = arch.name or "GPU"
+    hbm_str = ""
+    try:
+        import cupy as cp
+
+        device = cp.cuda.Device(arch.device_id)
+        free, total = device.mem_info
+        hbm_str = f" HBM={total / 1e9:.1f} GB"
+    except Exception:  # noqa: BLE001 - HBM is best-effort
+        hbm_str = ""
+    return f"{name} sm_{arch.sm} family={arch.family}{hbm_str}"
+
+
 def gpu_arch_family() -> str:
     """Deprecated. Returns the legacy family string ("t4"|"ampere"|"hopper"|"unknown")."""
     warnings.warn(

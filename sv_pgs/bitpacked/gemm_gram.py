@@ -30,6 +30,7 @@ blocks above the diagonal mirror their results into out[v, u] as well.
 
 from __future__ import annotations
 
+import os
 from functools import lru_cache
 from typing import TYPE_CHECKING, Any
 
@@ -282,8 +283,279 @@ _KERNEL_TAILS: dict[str, str] = {
 # Volta WMMA kernel is a standalone TU (does not use the DEFINE_GRAM_KERNEL
 # macro). It needs <mma.h> and a different shmem layout.
 _VOLTA_KERNEL_NAME = "bitpacked_gemm_gram_volta_mma_kernel"
+_VOLTA_V2_KERNEL_NAME = "bitpacked_gemm_gram_volta_mma_v2_kernel"
 
 _GEMM_GRAM_PRELUDE = _GEMM_GRAM_SRC
+
+
+# ---------------------------------------------------------------------------
+# Volta WMMA v2 kernel (sm_70). Identical math to v1, but with software-
+# pipelined double-buffered SMEM loads: the next k-tile's bytes are issued
+# to SMEM BEFORE the current k-tile's FMAs, so the LSU + tensor-core
+# pipelines overlap. Volta has no cp.async, so the prefetch is just a
+# manually-scheduled set of ordinary global->shmem loads that the SM's
+# warp scheduler interleaves with the WMMA mma_sync calls.
+#
+# Total SMEM (per block):
+#   sA[2 * VOLTA_TILE_M * VOLTA_SMEM_K_STRIDE]  = 2 * 128 * 40 * 2 B = 20480 B
+#   sB[2 * VOLTA_TILE_N * VOLTA_SMEM_K_STRIDE]  = 2 * 128 * 40 * 2 B = 20480 B
+#   frag_scratch[VOLTA_NWARPS][16*16] float     = 8 * 256 * 4 B     =  8192 B
+#   Total ~48 KB — at Volta's static per-block limit. The wrapper sets the
+#   cudaFuncAttributeMaxDynamicSharedMemorySize attribute (Volta supports
+#   the 96 KB opt-in carveout) so the kernel can be launched safely.
+# ---------------------------------------------------------------------------
+
+_GEMM_GRAM_VOLTA_V2_SRC = r"""
+#include <mma.h>
+#include <cuda_fp16.h>
+
+using namespace nvcuda;
+
+__device__ __forceinline__ int volta2_decode_dosage(int code, int count_a1) {
+    if (code == 0x1) return -1;
+    if (count_a1) {
+        if (code == 0x0) return 2;
+        if (code == 0x2) return 1;
+        return 0;
+    } else {
+        if (code == 0x0) return 0;
+        if (code == 0x2) return 1;
+        return 2;
+    }
+}
+
+__device__ __forceinline__ float volta2_z_of(
+    const unsigned char* __restrict__ row,
+    int i,
+    int n_samples,
+    float m,
+    float s,
+    int count_a1)
+{
+    if (i >= n_samples) return 0.0f;
+    int byte_idx = i >> 2;
+    int slot = i & 0x3;
+    int code = (row[byte_idx] >> (slot * 2)) & 0x3;
+    int d = volta2_decode_dosage(code, count_a1);
+    if (d < 0) return 0.0f;
+    if (!(s > 0.0f)) return 0.0f;
+    return ((float)d - m) / s;
+}
+
+#define V2_TILE_M 128
+#define V2_TILE_N 128
+#define V2_TILE_K 32
+#define V2_WMMA_M 16
+#define V2_WMMA_N 16
+#define V2_WMMA_K 16
+#define V2_NWARPS 8
+#define V2_NTHREADS (V2_NWARPS * 32)
+#define V2_WY 4
+#define V2_WX 2
+#define V2_ROWS_PER_WARP (V2_TILE_M / V2_WY)        /* 32 */
+#define V2_COLS_PER_WARP (V2_TILE_N / V2_WX)        /* 64 */
+#define V2_FRAGS_M (V2_ROWS_PER_WARP / V2_WMMA_M)   /*  2 */
+#define V2_FRAGS_N (V2_COLS_PER_WARP / V2_WMMA_N)   /*  4 */
+#define V2_KSUB (V2_TILE_K / V2_WMMA_K)             /*  2 */
+#define V2_SMEM_K_STRIDE (V2_TILE_K + 8)            /* 40 */
+#define V2_TILE_M_STRIDE (V2_TILE_M * V2_SMEM_K_STRIDE)
+
+extern "C" __global__ void bitpacked_gemm_gram_volta_mma_v2_kernel(
+    const unsigned char* __restrict__ packed,
+    int n_variants,
+    int n_samples,
+    int bytes_per_variant,
+    const float* __restrict__ mean,
+    const float* __restrict__ std_,
+    float* __restrict__ out,
+    int count_a1)
+{
+    const int bx = blockIdx.x;
+    const int by = blockIdx.y;
+    const int row0 = bx * V2_TILE_M;
+    const int col0 = by * V2_TILE_N;
+    if (row0 >= n_variants || col0 >= n_variants) return;
+    if (row0 > col0 + V2_TILE_N - 1) return;
+
+    const int tid = threadIdx.x;
+    const int warp_id = tid >> 5;
+    const int wy = warp_id / V2_WX;
+    const int wx = warp_id % V2_WX;
+    const int lane_id = tid & 31;
+
+    // Dynamic shared memory laid out as:
+    //   [0 .. 2*M_STRIDE)        : sA[2][...]
+    //   [2*M_STRIDE .. 4*M_STRIDE): sB[2][...]
+    extern __shared__ __half smem[];
+    __half* sA_buf[2] = {smem + 0, smem + V2_TILE_M_STRIDE};
+    __half* sB_buf[2] = {
+        smem + 2 * V2_TILE_M_STRIDE,
+        smem + 3 * V2_TILE_M_STRIDE,
+    };
+
+    // Per-warp scratch lives in static SMEM (only 8 KB total).
+    __shared__ float frag_scratch[V2_NWARPS][V2_WMMA_M * V2_WMMA_N];
+
+    wmma::fragment<wmma::accumulator, V2_WMMA_M, V2_WMMA_N, V2_WMMA_K, float>
+        acc[V2_FRAGS_M][V2_FRAGS_N];
+    #pragma unroll
+    for (int i = 0; i < V2_FRAGS_M; ++i) {
+        #pragma unroll
+        for (int j = 0; j < V2_FRAGS_N; ++j) {
+            wmma::fill_fragment(acc[i][j], 0.0f);
+        }
+    }
+
+    const int n_ktiles = (n_samples + V2_TILE_K - 1) / V2_TILE_K;
+    if (n_ktiles <= 0) return;
+
+    // ---- Prologue: load k-tile 0 into buffer 0 -------------------------------
+    {
+        int k0 = 0;
+        #pragma unroll
+        for (int idx = tid; idx < V2_TILE_M * V2_TILE_K; idx += V2_NTHREADS) {
+            int rr = idx / V2_TILE_K;
+            int kk = idx % V2_TILE_K;
+            int v = row0 + rr;
+            int s_idx = k0 + kk;
+            float val = 0.0f;
+            if (v < n_variants && s_idx < n_samples) {
+                const unsigned char* row = packed + (size_t)v * (size_t)bytes_per_variant;
+                val = volta2_z_of(row, s_idx, n_samples, mean[v], std_[v], count_a1);
+            }
+            sA_buf[0][rr * V2_SMEM_K_STRIDE + kk] = __float2half(val);
+        }
+        #pragma unroll
+        for (int idx = tid; idx < V2_TILE_N * V2_TILE_K; idx += V2_NTHREADS) {
+            int cc = idx / V2_TILE_K;
+            int kk = idx % V2_TILE_K;
+            int v = col0 + cc;
+            int s_idx = k0 + kk;
+            float val = 0.0f;
+            if (v < n_variants && s_idx < n_samples) {
+                const unsigned char* row = packed + (size_t)v * (size_t)bytes_per_variant;
+                val = volta2_z_of(row, s_idx, n_samples, mean[v], std_[v], count_a1);
+            }
+            sB_buf[0][cc * V2_SMEM_K_STRIDE + kk] = __float2half(val);
+        }
+    }
+    __syncthreads();
+
+    // ---- Steady-state loop --------------------------------------------------
+    for (int kidx = 0; kidx < n_ktiles; ++kidx) {
+        const int cur = kidx & 1;
+        const int nxt = (kidx + 1) & 1;
+        const bool have_next = (kidx + 1) < n_ktiles;
+
+        // Issue the next-tile loads BEFORE the FMAs of the current tile, so
+        // the LSU pipeline overlaps with WMMA execution.
+        if (have_next) {
+            int k0_n = (kidx + 1) * V2_TILE_K;
+            #pragma unroll
+            for (int idx = tid; idx < V2_TILE_M * V2_TILE_K; idx += V2_NTHREADS) {
+                int rr = idx / V2_TILE_K;
+                int kk = idx % V2_TILE_K;
+                int v = row0 + rr;
+                int s_idx = k0_n + kk;
+                float val = 0.0f;
+                if (v < n_variants && s_idx < n_samples) {
+                    const unsigned char* row =
+                        packed + (size_t)v * (size_t)bytes_per_variant;
+                    val = volta2_z_of(row, s_idx, n_samples, mean[v], std_[v], count_a1);
+                }
+                sA_buf[nxt][rr * V2_SMEM_K_STRIDE + kk] = __float2half(val);
+            }
+            #pragma unroll
+            for (int idx = tid; idx < V2_TILE_N * V2_TILE_K; idx += V2_NTHREADS) {
+                int cc = idx / V2_TILE_K;
+                int kk = idx % V2_TILE_K;
+                int v = col0 + cc;
+                int s_idx = k0_n + kk;
+                float val = 0.0f;
+                if (v < n_variants && s_idx < n_samples) {
+                    const unsigned char* row =
+                        packed + (size_t)v * (size_t)bytes_per_variant;
+                    val = volta2_z_of(row, s_idx, n_samples, mean[v], std_[v], count_a1);
+                }
+                sB_buf[nxt][cc * V2_SMEM_K_STRIDE + kk] = __float2half(val);
+            }
+        }
+
+        // ---- Compute on the CURRENT buffer ---------------------------------
+        wmma::fragment<wmma::matrix_a, V2_WMMA_M, V2_WMMA_N, V2_WMMA_K,
+                       __half, wmma::row_major> a_frag[V2_FRAGS_M];
+        wmma::fragment<wmma::matrix_b, V2_WMMA_M, V2_WMMA_N, V2_WMMA_K,
+                       __half, wmma::col_major> b_frag[V2_FRAGS_N];
+
+        #pragma unroll
+        for (int kp = 0; kp < V2_KSUB; ++kp) {
+            int kp_off = kp * V2_WMMA_K;
+            #pragma unroll
+            for (int i = 0; i < V2_FRAGS_M; ++i) {
+                const __half* a_ptr =
+                    sA_buf[cur]
+                    + (wy * V2_ROWS_PER_WARP + i * V2_WMMA_M) * V2_SMEM_K_STRIDE
+                    + kp_off;
+                wmma::load_matrix_sync(a_frag[i], a_ptr, V2_SMEM_K_STRIDE);
+            }
+            #pragma unroll
+            for (int j = 0; j < V2_FRAGS_N; ++j) {
+                const __half* b_ptr =
+                    sB_buf[cur]
+                    + (wx * V2_COLS_PER_WARP + j * V2_WMMA_N) * V2_SMEM_K_STRIDE
+                    + kp_off;
+                wmma::load_matrix_sync(b_frag[j], b_ptr, V2_SMEM_K_STRIDE);
+            }
+            #pragma unroll
+            for (int i = 0; i < V2_FRAGS_M; ++i) {
+                #pragma unroll
+                for (int j = 0; j < V2_FRAGS_N; ++j) {
+                    wmma::mma_sync(acc[i][j], a_frag[i], b_frag[j], acc[i][j]);
+                }
+            }
+        }
+
+        // Ensure all threads finished consuming sA_buf[cur] before any thread
+        // (during the NEXT iteration's prefetch) overwrites it. We also need
+        // the prefetched stores into sA_buf[nxt] to be visible.
+        __syncthreads();
+    }
+
+    // ---- Epilogue: store fragments to out with diagonal mirroring -----------
+    #pragma unroll
+    for (int i = 0; i < V2_FRAGS_M; ++i) {
+        #pragma unroll
+        for (int j = 0; j < V2_FRAGS_N; ++j) {
+            float* sptr = frag_scratch[warp_id];
+            wmma::store_matrix_sync(sptr, acc[i][j], V2_WMMA_N, wmma::mem_row_major);
+            #pragma unroll
+            for (int e = lane_id; e < V2_WMMA_M * V2_WMMA_N; e += 32) {
+                int rr_in = e / V2_WMMA_N;
+                int cc_in = e % V2_WMMA_N;
+                int rr = wy * V2_ROWS_PER_WARP + i * V2_WMMA_M + rr_in;
+                int cc = wx * V2_COLS_PER_WARP + j * V2_WMMA_N + cc_in;
+                int u = row0 + rr;
+                int w = col0 + cc;
+                if (u < n_variants && w < n_variants && rr < V2_TILE_M && cc < V2_TILE_N) {
+                    float val = sptr[e];
+                    if (u <= w) {
+                        atomicAdd(&out[(size_t)u * (size_t)n_variants + w], val);
+                        if (u != w) {
+                            atomicAdd(&out[(size_t)w * (size_t)n_variants + u], val);
+                        }
+                    }
+                }
+            }
+            __syncthreads();
+        }
+    }
+}
+"""
+
+# Dynamic shmem size required by the v2 kernel. Computed once at module load
+# so the wrapper can both (a) opt the kernel into the 96 KB carveout via
+# cudaFuncSetAttribute and (b) pass the correct ``shared_mem=`` byte count.
+_V2_DYN_SHMEM_BYTES = 4 * 128 * 40 * 2  # 4 tiles * tile_m * (tile_k+8) * sizeof(half)
 
 
 # ---------------------------------------------------------------------------
@@ -546,6 +818,8 @@ def _compiled_module_for(name: str) -> Any:
     cp = _cupy()
     if name == _VOLTA_KERNEL_NAME:
         source = _GEMM_GRAM_VOLTA_SRC
+    elif name == _VOLTA_V2_KERNEL_NAME:
+        source = _GEMM_GRAM_VOLTA_V2_SRC
     elif name in _KERNEL_TAILS:
         source = _GEMM_GRAM_PRELUDE + _KERNEL_TAILS[name]
     else:
@@ -560,7 +834,28 @@ def _compiled_module_for(name: str) -> Any:
 
 @lru_cache(maxsize=4)
 def _get_kernel(name: str) -> Any:
-    return _compiled_module_for(name).get_function(name)
+    kernel = _compiled_module_for(name).get_function(name)
+    if name == _VOLTA_V2_KERNEL_NAME:
+        # Opt the kernel into Volta's 96 KB dynamic-shmem carveout. Without
+        # this attribute the launch will fail with "too much shared data" since
+        # the default per-block dynamic-shmem ceiling is 48 KB on sm_70.
+        try:
+            attr = 8  # cudaFuncAttributeMaxDynamicSharedMemorySize
+            kernel.max_dynamic_shared_size_bytes = _V2_DYN_SHMEM_BYTES  # type: ignore[attr-defined]
+        except Exception:  # noqa: BLE001 — fall back to attribute API
+            try:
+                cp = _cupy()
+                cp.cuda.runtime.funcSetAttribute(
+                    kernel.kernel.ptr, attr, _V2_DYN_SHMEM_BYTES
+                )
+            except Exception:  # noqa: BLE001 — caller will fall back to v1
+                pass
+    return kernel
+
+
+def _volta_v2_enabled() -> bool:
+    val = os.environ.get("SV_PGS_GEMM_GRAM_VOLTA_V2", "1").strip().lower()
+    return val not in ("0", "false", "no", "off")
 
 
 def _kernel_for_arch(arch: Any) -> tuple[str, int, int]:
@@ -575,6 +870,8 @@ def _kernel_for_arch(arch: Any) -> tuple[str, int, int]:
     if arch == "t4" or arch == "turing":
         return "bitpacked_gemm_gram_dp4a_kernel", 64, 64
     if arch == "volta":
+        if _volta_v2_enabled():
+            return _VOLTA_V2_KERNEL_NAME, 128, 128
         return _VOLTA_KERNEL_NAME, 128, 128
     return "bitpacked_gemm_gram_fp32_kernel", 64, 64
 
@@ -662,12 +959,31 @@ def gemm_gram(
     grid = cfg["grid"]
     block = cfg["block"]
     shmem = int(cfg.get("shmem_bytes", 0))
+    if kernel_name == _VOLTA_V2_KERNEL_NAME:
+        # v2 needs the 40 KB dynamic-shmem buffer for the double-buffered
+        # SMEM tile pair (sA[2] + sB[2]); the per-warp fragment scratch is
+        # still static.
+        shmem = _V2_DYN_SHMEM_BYTES
 
-    if stream is None:
-        kernel(grid, block, args, shared_mem=shmem)
-    else:
-        with stream:
+    try:
+        if stream is None:
             kernel(grid, block, args, shared_mem=shmem)
+        else:
+            with stream:
+                kernel(grid, block, args, shared_mem=shmem)
+    except Exception:  # noqa: BLE001 - v2 launch failure -> fall back to v1
+        if kernel_name == _VOLTA_V2_KERNEL_NAME:
+            kernel_name = _VOLTA_KERNEL_NAME
+            kernel = _get_kernel(kernel_name)
+            cfg = _launch.gemm_gram_config(n_samples, n_variants, "volta")
+            shmem = int(cfg.get("shmem_bytes", 0))
+            if stream is None:
+                kernel(grid, block, args, shared_mem=shmem)
+            else:
+                with stream:
+                    kernel(grid, block, args, shared_mem=shmem)
+        else:
+            raise
 
 
 __all__ = ["gemm_gram"]

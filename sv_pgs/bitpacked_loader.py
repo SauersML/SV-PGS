@@ -813,6 +813,22 @@ def load_bed_to_bitpacked_device_cached(
                 f"bitpacked active-matrix cache load complete in {elapsed:.2f}s "
                 f"(n_samples={matrix._n_samples}, n_variants={matrix._n_variants})"
             )
+            try:
+                resident_bytes = (
+                    int(matrix._packed.nbytes)
+                    + int(matrix._mean.nbytes)
+                    + int(matrix._std.nbytes)
+                )
+                resident_gb = resident_bytes / 1e9
+                _log(
+                    f"BitpackedDeviceMatrix: loaded from cache {cache_subdir} "
+                    f"({resident_gb:.1f} GB resident, {elapsed:.1f} sec)"
+                )
+            except Exception as _exc:  # noqa: BLE001 - logging never blocks
+                _log(
+                    f"BitpackedDeviceMatrix: loaded from cache {cache_subdir} "
+                    f"({elapsed:.1f} sec; size log skipped: {_exc!r})"
+                )
         return matrix
 
     if _log is not None:

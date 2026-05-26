@@ -62,17 +62,35 @@ def _maybe_upgrade_to_bitpacked(dataset: LoadedDataset, config: ModelConfig) -> 
         )
         return dataset
     try:
-        from sv_pgs.bitpacked_loader import load_bed_to_bitpacked_device
-        log(
-            f"bitpacked upgrade: loading BED {bed_path} -> device "
-            f"(n_samples={int(sample_indices.shape[0])}, n_variants={n_variants_axis})"
+        from sv_pgs.bitpacked_loader import (
+            load_bed_to_bitpacked_device,
+            load_bed_to_bitpacked_device_cached,
         )
-        bp_matrix = load_bed_to_bitpacked_device(
-            bed_path=bed_path,
-            n_samples=int(iid_count),
-            n_variants=int(sid_count),
-            sample_indices=np.asarray(sample_indices, dtype=np.int64),
-        )
+        cache_dir_env = os.environ.get("SV_PGS_BITPACKED_ACTIVE_CACHE_DIR", "").strip()
+        if cache_dir_env:
+            log(
+                f"bitpacked upgrade: loading BED {bed_path} -> device via active-matrix cache "
+                f"(cache_dir={cache_dir_env}, n_samples={int(sample_indices.shape[0])}, "
+                f"n_variants={n_variants_axis})"
+            )
+            bp_matrix = load_bed_to_bitpacked_device_cached(
+                bed_path=bed_path,
+                n_samples=int(iid_count),
+                n_variants=int(sid_count),
+                sample_indices=np.asarray(sample_indices, dtype=np.int64),
+                cache_dir=cache_dir_env,
+            )
+        else:
+            log(
+                f"bitpacked upgrade: loading BED {bed_path} -> device "
+                f"(n_samples={int(sample_indices.shape[0])}, n_variants={n_variants_axis})"
+            )
+            bp_matrix = load_bed_to_bitpacked_device(
+                bed_path=bed_path,
+                n_samples=int(iid_count),
+                n_variants=int(sid_count),
+                sample_indices=np.asarray(sample_indices, dtype=np.int64),
+            )
     except Exception as exc:
         log(
             "bitpacked upgrade: SKIPPED (reason: loader failed: "
