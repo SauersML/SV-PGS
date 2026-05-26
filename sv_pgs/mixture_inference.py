@@ -155,6 +155,46 @@ _GPU_INVERSE_DIAGONAL_WORKSPACE_FRACTION = 0.01
 _GPU_INVERSE_DIAGONAL_MAX_BLOCK = 4_096
 
 
+def _em_profile_sync_if_bitpacked(matrix: Any) -> None:
+    """Synchronize the CUDA device when the genotype matrix is GPU-resident.
+
+    The bitpacked hot path enqueues kernels asynchronously, so an unsynced
+    ``time.perf_counter()`` snapshot would only see dispatch latency. We
+    detect the GPU path by structural attribute (``_packed``) or class name
+    rather than importing the type, so the helper stays usable from any
+    code path. cupy may be absent (CPU-only tests) — that's a silent no-op.
+    """
+    is_bitpacked = (
+        hasattr(matrix, "_packed")
+        or type(matrix).__name__ == "BitpackedDeviceMatrix"
+    )
+    if not is_bitpacked:
+        return
+    try:
+        import cupy as _cp  # type: ignore[import-not-found]
+        _cp.cuda.runtime.deviceSynchronize()
+    except Exception:  # pragma: no cover - sync failures must not abort EM
+        pass
+
+
+def _em_profile_format_line(
+    *,
+    prefix: str,
+    matvec: float,
+    rmatvec: float,
+    gram: float,
+    posterior: float,
+    loss: float,
+    total: float,
+) -> str:
+    """Render the single-line profile log with 2-decimal precision."""
+    return (
+        f"{prefix} matvec={matvec:.2f}s rmatvec={rmatvec:.2f}s "
+        f"gram={gram:.2f}s posterior={posterior:.2f}s "
+        f"loss={loss:.2f}s total={total:.2f}s"
+    )
+
+
 def _gpu_exact_variant_tile_max_variants(
     cupy: Any,
     sample_count: int,
@@ -3015,8 +3055,32 @@ def fit_variational_em(
                 reduced_second_moment_carry = np.asarray(
                     saved_reduced_second_moment, dtype=np.float64
                 ).copy()
+        # Per-iteration phase timings (heartbeat profiling). Cumulative totals
+        # are folded across iterations so the trainer can emit a single
+        # summary line once the loop completes.
+        em_profile_totals: dict[str, float] = {
+            "matvec": 0.0,
+            "rmatvec": 0.0,
+            "gram": 0.0,
+            "posterior": 0.0,
+            "loss": 0.0,
+            "total": 0.0,
+        }
+        em_profile_iters_run = 0
+        # Reset the bitpacked matvec/rmatvec/gram bucket once at loop entry so
+        # any timings carried over from screening do not leak into iter 1.
+        try:
+            from sv_pgs.bitpacked_profile import snapshot_and_reset as _bp_snap_reset
+            _bp_snap_reset()
+        except ImportError:  # pragma: no cover - module always available
+            pass
         for outer_iteration in range(start_iteration, config.max_outer_iterations):
             iter_wall_t0 = time.monotonic()
+            # Per-iteration phase accumulators. ``posterior`` covers the
+            # restricted posterior solve (gram block updates + final posterior
+            # update); ``loss`` covers ELBO compute. matvec/rmatvec/gram come
+            # from the bitpacked_profile bucket the bitpacked kernels populate.
+            em_phase_seconds: dict[str, float] = {"posterior": 0.0, "loss": 0.0}
             log(f"  variational EM iteration {outer_iteration + 1}/{config.max_outer_iterations} start  sigma_e2={sigma_error2:.6f}  global_scale={global_scale:.6f}  mem={mem()}")
             posterior_theta = _pack_theta(
                 global_scale=float(global_scale),
@@ -3093,6 +3157,8 @@ def fit_variational_em(
                     auxiliary_delta=auxiliary_delta,
                     config=config,
                 )
+            _em_profile_sync_if_bitpacked(genotype_matrix)
+            _phase_t0 = time.perf_counter()
             posterior_state = _fit_collapsed_posterior(
                 genotype_matrix=genotype_matrix,
                 covariate_matrix=covariate_matrix,
@@ -3112,6 +3178,8 @@ def fit_variational_em(
                 total_em_iterations=config.max_outer_iterations,
                 prior_precision_override=cavi_prior_precision_override,
             )
+            _em_profile_sync_if_bitpacked(genotype_matrix)
+            em_phase_seconds["posterior"] += time.perf_counter() - _phase_t0
             if config.trait_type == TraitType.BINARY:
                 posterior_state = _apply_binary_intercept_calibration(
                     posterior_state=posterior_state,
@@ -3134,6 +3202,8 @@ def fit_variational_em(
                 scale_penalty=scale_penalty,
             )
             objective_history.append(float(full_objective))
+            _em_profile_sync_if_bitpacked(genotype_matrix)
+            _phase_t0 = time.perf_counter()
             try:
                 _cavi_predictor_variance: NDArray | None = None
                 if config.trait_type == TraitType.BINARY:
@@ -3168,6 +3238,8 @@ def fit_variational_em(
             except (ValueError, RuntimeError, FloatingPointError, np.linalg.LinAlgError) as _elbo_err:
                 log(f"  ELBO computation skipped (CAVI): {_elbo_err}")
                 elbo_history.append(float("nan"))
+            _em_profile_sync_if_bitpacked(genotype_matrix)
+            em_phase_seconds["loss"] += time.perf_counter() - _phase_t0
             log(f"  variational EM iteration {outer_iteration + 1}: objective={full_objective:.6f} sigma_e2={sigma_error2:.6f}")
 
             validation_linear_predictor = None

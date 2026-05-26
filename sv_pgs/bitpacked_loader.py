@@ -50,6 +50,12 @@ _FULL_READ_CHUNK_BYTES: int = 256 * 1024 * 1024
 # ``bytes_per_variant`` chunked-variant integer-division path.
 _GCSFUSE_MIN_CHUNK_BYTES: int = 16 * 1024 * 1024
 
+# Below this total payload size, parallel range reads are not worth it. gcsfuse
+# small-file reads complete in well under a second on a single stream and the
+# thread-pool spin-up cost dominates. Tuned to 1 GB (≈ 5 s at 200 MB/s single-
+# stream — anything shorter doesn't justify multiplexing).
+_PARALLEL_GCSFUSE_THRESHOLD_BYTES: int = 1 * 1024 * 1024 * 1024
+
 
 def _fadvise_sequential(fd: int) -> None:
     """Hint POSIX_FADV_SEQUENTIAL on ``fd``. Best-effort; Linux-only."""
@@ -166,6 +172,8 @@ def _read_packed_parallel(
     serialization quirks (gcsfuse + multi-threaded readv specifically).
     """
     from concurrent.futures import ThreadPoolExecutor
+    import threading as _threading
+    import time as _time
 
     if total_bytes <= 0 or n_workers <= 0:
         return
@@ -176,9 +184,44 @@ def _read_packed_parallel(
 
     chunk = (total_bytes + n_workers - 1) // n_workers
 
+    try:
+        from sv_pgs.progress import log as _log
+    except ImportError:  # pragma: no cover
+        _log = None  # type: ignore[assignment]
+
+    # Aggregated progress counter shared across workers. itertools.count is a
+    # C-level atomic increment so workers can bump it without holding a lock;
+    # the emitter thread snapshots the value periodically.
+    bytes_done = [0]
+    bytes_done_lock = _threading.Lock()
+    stop_event = _threading.Event()
+    t_start = _time.monotonic()
+    total_gb = total_bytes / 1e9
+
+    def _emitter() -> None:
+        if _log is None:
+            return
+        last_emitted = 0
+        log_every_bytes = 256 * 1024 * 1024
+        while not stop_event.wait(0.5):
+            with bytes_done_lock:
+                cur = bytes_done[0]
+            if cur - last_emitted >= log_every_bytes:
+                elapsed = max(_time.monotonic() - t_start, 1e-6)
+                mb_per_sec = (cur / 1e6) / elapsed
+                remaining = max(total_bytes - cur, 0)
+                eta_sec = remaining / max(cur / elapsed, 1.0)
+                _log(
+                    f"BED stream: {cur / 1e9:.2f} / {total_gb:.2f} GB "
+                    f"({mb_per_sec:.1f} MB/s, ETA {eta_sec / 60.0:.1f} min) "
+                    f"[parallel x{n_workers}]"
+                )
+                last_emitted = cur
+
     # Open one fd per worker. Best-effort SEQUENTIAL hint per fd so gcsfuse can
     # issue large prefetches on each stream independently.
     fds: list[int] = []
+    emitter_thread = _threading.Thread(target=_emitter, name="bed-stream-progress", daemon=True)
     try:
         for _ in range(n_workers):
             fd = os.open(str(bed_path), os.O_RDONLY | getattr(os, "O_CLOEXEC", 0))
@@ -206,12 +249,33 @@ def _read_packed_parallel(
                     )
                 pinned_view[cursor : cursor + got] = np.frombuffer(buf, dtype=np.uint8)
                 cursor += got
+                with bytes_done_lock:
+                    bytes_done[0] += got
 
+        emitter_thread.start()
         with ThreadPoolExecutor(max_workers=n_workers) as pool:
             futures = [pool.submit(_worker, i) for i in range(n_workers)]
             for f in futures:
                 f.result()
+        # Final summary log so callers observing logs always see a terminal
+        # `BED stream: ... DONE` line for the parallel path.
+        if _log is not None:
+            with bytes_done_lock:
+                cur = bytes_done[0]
+            elapsed = max(_time.monotonic() - t_start, 1e-6)
+            mb_per_sec = (cur / 1e6) / elapsed
+            _log(
+                f"BED stream: {cur / 1e9:.2f} / {total_gb:.2f} GB "
+                f"DONE ({mb_per_sec:.1f} MB/s, elapsed {elapsed / 60.0:.1f} min) "
+                f"[parallel x{n_workers}]"
+            )
     finally:
+        stop_event.set()
+        if emitter_thread.is_alive():
+            try:
+                emitter_thread.join(timeout=2.0)
+            except RuntimeError:
+                pass
         for fd in fds:
             try:
                 os.close(fd)
@@ -487,11 +551,19 @@ def load_bed_to_bitpacked_device(
                 pinned_mem, pinned_view = _allocate_pinned(cp, raw_total_bytes)
                 # Parallel range-read path: N independent fds, ``os.pread`` on
                 # each. Used when SV_PGS_BITPACKED_READ_WORKERS resolves to >1
-                # AND ``bed_path`` is openable on this host. Falls back to the
-                # sequential _read_all_packed path on any error.
+                # AND the BED is gcsfuse-backed AND total payload exceeds the
+                # 1 GB threshold. On local NVMe multiple workers just thrash
+                # the page cache vs. a single sequential stream, so we skip.
+                # Falls back to the sequential ``_read_all_packed`` path on any
+                # error.
                 n_workers = _parallel_workers()
                 used_parallel = False
-                if n_workers > 1 and raw_total_bytes > 0:
+                parallel_eligible = (
+                    n_workers > 1
+                    and raw_total_bytes > _PARALLEL_GCSFUSE_THRESHOLD_BYTES
+                    and source_on_gcsfuse
+                )
+                if parallel_eligible:
                     from sv_pgs.plink import PLINK1_HEADER_SIZE
                     try:
                         _read_packed_parallel(
