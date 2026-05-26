@@ -56,8 +56,6 @@ if TYPE_CHECKING:  # pragma: no cover - import only for type hints
 #
 
 _GEMM_GRAM_SRC = r"""
-extern "C" {
-
 // ---------------------------------------------------------------------------
 // Shared device helpers.
 // ---------------------------------------------------------------------------
@@ -243,20 +241,40 @@ __global__ void NAME(                                                          \
         }                                                                      \
     }                                                                          \
 }
-
-// T4 / Turing (SM 7.5): tile 64x64, k-tile 32, 128 threads, MTH=16 -> NTH=8.
-DEFINE_GRAM_KERNEL(bitpacked_gemm_gram_dp4a_kernel,  64,  64, 32, 128, 16)
-// Also expose the explicit fp32 fallback name with identical params.
-DEFINE_GRAM_KERNEL(bitpacked_gemm_gram_fp32_kernel,  64,  64, 32, 128, 16)
-
-// Ampere (SM 8.x): tile 128x128, k-tile 64, 256 threads, MTH=16 -> NTH=16.
-DEFINE_GRAM_KERNEL(bitpacked_gemm_gram_tf32_kernel, 128, 128, 64, 256, 16)
-
-// Hopper (SM 9.x): tile 128x256, k-tile 64, 256 threads, MTH=16 -> NTH=16.
-DEFINE_GRAM_KERNEL(bitpacked_gemm_gram_fp16_kernel, 128, 256, 64, 256, 16)
-
-}  // extern "C"
 """
+
+# Per-kernel instantiation tails. Each is appended to ``_GEMM_GRAM_PRELUDE``
+# to form a complete translation unit that defines exactly ONE entry point.
+# This keeps Volta's compile from choking on the high-shmem Ampere/Hopper
+# kernels it would never launch.
+_KERNEL_TAILS: dict[str, str] = {
+    # T4 / Turing (SM 7.5): tile 64x64, k-tile 32, 128 threads, MTH=16 -> NTH=8.
+    "bitpacked_gemm_gram_dp4a_kernel": (
+        'extern "C" {\n'
+        "DEFINE_GRAM_KERNEL(bitpacked_gemm_gram_dp4a_kernel,  64,  64, 32, 128, 16)\n"
+        "}\n"
+    ),
+    # fp32 fallback (Volta / unknown): identical params to the dp4a tile.
+    "bitpacked_gemm_gram_fp32_kernel": (
+        'extern "C" {\n'
+        "DEFINE_GRAM_KERNEL(bitpacked_gemm_gram_fp32_kernel,  64,  64, 32, 128, 16)\n"
+        "}\n"
+    ),
+    # Ampere (SM 8.x): tile 128x128, k-tile 64, 256 threads, MTH=16 -> NTH=16.
+    "bitpacked_gemm_gram_tf32_kernel": (
+        'extern "C" {\n'
+        "DEFINE_GRAM_KERNEL(bitpacked_gemm_gram_tf32_kernel, 128, 128, 64, 256, 16)\n"
+        "}\n"
+    ),
+    # Hopper (SM 9.x): tile 128x256, k-tile 64, 256 threads, MTH=16 -> NTH=16.
+    "bitpacked_gemm_gram_fp16_kernel": (
+        'extern "C" {\n'
+        "DEFINE_GRAM_KERNEL(bitpacked_gemm_gram_fp16_kernel, 128, 256, 64, 256, 16)\n"
+        "}\n"
+    ),
+}
+
+_GEMM_GRAM_PRELUDE = _GEMM_GRAM_SRC
 
 
 # ---------------------------------------------------------------------------
@@ -270,25 +288,29 @@ def _cupy() -> Any:
     return cp
 
 
-@lru_cache(maxsize=1)
-def _compiled_module() -> Any:
+@lru_cache(maxsize=4)
+def _compiled_module_for(name: str) -> Any:
+    """Compile a RawModule containing exactly ONE kernel entry point.
+
+    This isolates per-arch shmem requirements: Volta (V100) need never compile
+    the Ampere/Hopper variants whose static shmem exceeds the 48 KB per-block
+    static limit. Only the arch-matched kernel is compiled at first use.
+    """
     cp = _cupy()
+    if name not in _KERNEL_TAILS:
+        raise KeyError(f"unknown gemm_gram kernel: {name}")
+    source = _GEMM_GRAM_PRELUDE + _KERNEL_TAILS[name]
     module = cp.RawModule(
-        code=_GEMM_GRAM_SRC,
+        code=source,
         options=("-std=c++14",),
-        name_expressions=(
-            "bitpacked_gemm_gram_dp4a_kernel",
-            "bitpacked_gemm_gram_fp32_kernel",
-            "bitpacked_gemm_gram_tf32_kernel",
-            "bitpacked_gemm_gram_fp16_kernel",
-        ),
+        name_expressions=(name,),
     )
     return module
 
 
 @lru_cache(maxsize=4)
 def _get_kernel(name: str) -> Any:
-    return _compiled_module().get_function(name)
+    return _compiled_module_for(name).get_function(name)
 
 
 def _kernel_for_arch(arch: str) -> tuple[str, int, int]:
