@@ -1137,50 +1137,25 @@ def load_multi_source_dataset_from_files(
                     for bim_record in _iter_plink_bim_records(path.with_suffix(".bim"))
                 ]
             else:
-                # Bitpacked-backend fast path: stream BED bytes straight to the
-                # GPU via run_screening_pass (one-pass count/sum/sumsq kernel)
-                # and skip the int8 .npy materialization entirely. The legacy
-                # int8 streaming pass below is the fallback when the backend
-                # is "int8" or when the bitpacked imports / GPU probe fail.
-                #
-                # Gate diagnostics: emit one unconditional log line so a
-                # production run always shows which path was selected and
-                # WHY. Three knobs control the gate (highest precedence
-                # first):
-                #   1. ``SV_PGS_BITPACKED_STATS=1`` forces the bitpacked
-                #      stats path regardless of the config / other env vars.
-                #   2. ``SV_PGS_GENOTYPE_BACKEND`` (env) overrides the
-                #      config field — same value space as the config
-                #      ("bitpacked" / "int8"). Default "bitpacked".
-                #   3. ``config.genotype_backend`` field (default
-                #      "bitpacked" per sv_pgs/config.py).
-                config_backend = getattr(config, "genotype_backend", None)
-                env_backend = os.environ.get("SV_PGS_GENOTYPE_BACKEND")
-                force_bitpacked_stats = os.environ.get("SV_PGS_BITPACKED_STATS", "").strip() in ("1", "true", "TRUE", "yes", "on")
-                effective_backend = (
-                    "bitpacked" if force_bitpacked_stats
-                    else (env_backend.strip().lower() if env_backend else (config_backend or "bitpacked"))
+                # Bitpacked-backend fast path: stream BED bytes straight to
+                # the GPU via run_screening_pass (one-pass count/sum/sumsq
+                # kernel) and skip the int8 .npy materialization entirely.
+                # Always attempted; the legacy int8 streaming pass below
+                # is the fallback when the bitpacked imports / GPU probe
+                # fail or the helper otherwise returns ``None``. No env
+                # vars, no config gating — fewer knobs to misconfigure.
+                # Diagnostic logs are retained so a fallback always says
+                # why.
+                log("  variant stats: attempting bitpacked GPU streaming path")
+                bitpacked_stats: VariantStatistics | None = _try_bitpacked_plink_variant_stats(
+                    bed_path=path,
+                    sample_indices=keep_indices,
+                    n_samples=int(raw.shape[0]),
+                    n_variants=int(raw.shape[1]),
+                    config=config,
                 )
-                log(
-                    f"  variant stats gate: config.genotype_backend={config_backend!r} "
-                    f"SV_PGS_GENOTYPE_BACKEND={env_backend!r} "
-                    f"SV_PGS_BITPACKED_STATS={force_bitpacked_stats} "
-                    f"-> effective={effective_backend!r}"
-                )
-                bitpacked_stats: VariantStatistics | None = None
-                if effective_backend == "bitpacked":
-                    log("  variant stats: attempting bitpacked GPU streaming path")
-                    bitpacked_stats = _try_bitpacked_plink_variant_stats(
-                        bed_path=path,
-                        sample_indices=keep_indices,
-                        n_samples=int(raw.shape[0]),
-                        n_variants=int(raw.shape[1]),
-                        config=config,
-                    )
-                    if bitpacked_stats is None:
-                        log("  variant stats: bitpacked path returned None (see prior log); falling back to legacy int8 streaming pass")
-                else:
-                    log(f"  variant stats: bitpacked path NOT attempted (effective_backend={effective_backend!r}); using legacy int8 streaming pass")
+                if bitpacked_stats is None:
+                    log("  variant stats: bitpacked path returned None (see prior log); falling back to legacy int8 streaming pass")
                 if bitpacked_stats is not None:
                     stats = bitpacked_stats
                     variants_list = _build_plink_variant_defaults_from_stats(path, stats)
