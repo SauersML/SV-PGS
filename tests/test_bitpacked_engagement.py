@@ -51,72 +51,25 @@ class _FakeBitpackedMatrix:
         self._std = SimpleNamespace(nbytes=n_variants * 4)
 
 
-def test_pipeline_maybe_upgrade_logs_engaged(
-    monkeypatch: pytest.MonkeyPatch,
+def test_pipeline_maybe_upgrade_is_a_noop(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
+    """The pre-fit hook is now a no-op; the bitpacked upgrade moved INSIDE
+    ``model.fit`` (see ``sv_pgs.model._try_upgrade_reduced_to_bitpacked``).
+
+    This test pins the new contract: ``_maybe_upgrade_to_bitpacked``
+    returns the dataset unchanged and logs a disabled-pre-fit-hook line.
+    """
     fake_genotypes = SimpleNamespace(shape=(3, 4))
     dataset = _make_loaded_dataset(fake_genotypes)
     config = _make_config_bitpacked()
 
-    fake_reader = SimpleNamespace(sid_count=4)
-    monkeypatch.setattr(
-        "sv_pgs.genotype._resolve_plink_pread_context",
-        lambda _raw: (fake_reader, np.arange(3, dtype=np.int64), 3, "/dev/null/fake.bed"),
-    )
-    # cupy import probe must succeed; install a dummy module if cupy isn't
-    # actually present in the CPU test env.
-    import sys
-    if "cupy" not in sys.modules:
-        monkeypatch.setitem(sys.modules, "cupy", SimpleNamespace())
-
-    bp_matrix = _FakeBitpackedMatrix(n_samples=3, n_variants=4)
-    import sv_pgs.bitpacked_loader as bp_loader_module
-    monkeypatch.setattr(
-        bp_loader_module,
-        "load_bed_to_bitpacked_device",
-        lambda **_kwargs: bp_matrix,
-    )
-
     out = pipeline_module._maybe_upgrade_to_bitpacked(dataset, config)
-    assert out.genotypes is bp_matrix
-
-    captured = capsys.readouterr().err
-    assert "bitpacked upgrade: ENGAGED" in captured
-    assert "active=4 variants" in captured
-
-
-def test_pipeline_maybe_upgrade_logs_skipped_with_reason(
-    monkeypatch: pytest.MonkeyPatch,
-    capsys: pytest.CaptureFixture[str],
-) -> None:
-    fake_genotypes = SimpleNamespace(shape=(3, 4))
-    dataset = _make_loaded_dataset(fake_genotypes)
-    config = _make_config_bitpacked()
-
-    fake_reader = SimpleNamespace(sid_count=4)
-    monkeypatch.setattr(
-        "sv_pgs.genotype._resolve_plink_pread_context",
-        lambda _raw: (fake_reader, np.arange(3, dtype=np.int64), 3, "/dev/null/fake.bed"),
-    )
-    import sys
-    if "cupy" not in sys.modules:
-        monkeypatch.setitem(sys.modules, "cupy", SimpleNamespace())
-
-    import sv_pgs.bitpacked_loader as bp_loader_module
-
-    def _explode(**_kwargs: Any) -> None:
-        raise RuntimeError("loader test failure")
-
-    monkeypatch.setattr(bp_loader_module, "load_bed_to_bitpacked_device", _explode)
-
-    out = pipeline_module._maybe_upgrade_to_bitpacked(dataset, config)
-    # On failure the dataset is returned unchanged (int8 fallback).
+    assert out is dataset
     assert out.genotypes is fake_genotypes
 
     captured = capsys.readouterr().err
-    assert "bitpacked upgrade: SKIPPED" in captured
-    assert "loader test failure" in captured
+    assert "pre-fit hook disabled" in captured
 
 
 def test_io_bitpacked_stats_fallback_logs_reason(

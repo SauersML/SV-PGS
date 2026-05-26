@@ -22,173 +22,23 @@ from sv_pgs.progress import log, mem
 
 
 def _maybe_upgrade_to_bitpacked(dataset: LoadedDataset, config: ModelConfig) -> LoadedDataset:
-    """Optionally swap dataset.genotypes for a device-resident BitpackedDeviceMatrix.
+    """Deprecated no-op pre-fit bitpacked upgrade.
 
-    Fast path that activates only when ``config.genotype_backend == "bitpacked"``,
-    CuPy is importable, and the loaded genotype matrix is backed by a single
-    PLINK BED whose on-disk variant count matches the dataset's variant axis
-    (i.e. no variant-subset wrapper). The int8 path is left in place as the
-    fallback for every other case.
+    The bitpacked GPU matrix upgrade moved INSIDE ``model.fit`` to run
+    AFTER active-variant selection (see
+    :func:`sv_pgs.model._try_upgrade_reduced_to_bitpacked`). Packing the
+    full ~1.7M-variant pre-fit matrix on AoU (319k x 1.7M ~= 139 GB
+    packed) does not fit a 40 GB A100, so the pre-fit hook always
+    skipped. The helper is kept as a no-op so existing imports/tests
+    continue to resolve; it returns the input dataset unchanged.
     """
-    backend = getattr(config, "genotype_backend", None)
-    if backend != "bitpacked":
-        log(
-            "bitpacked upgrade: SKIPPED (reason: "
-            f"config.genotype_backend={backend!r} is not 'bitpacked')"
-        )
-        return dataset
-    try:
-        import cupy as _cp  # noqa: F401 - import probe
-    except ImportError as exc:
-        log(
-            f"bitpacked upgrade: SKIPPED (reason: CuPy unavailable: {type(exc).__name__}: {exc})"
-        )
-        return dataset
-    from sv_pgs.genotype import _resolve_plink_pread_context  # lazy
-    ctx = _resolve_plink_pread_context(dataset.genotypes)
-    if ctx is None:
-        log(
-            "bitpacked upgrade: SKIPPED (reason: dataset.genotypes is not "
-            f"backed by a single PLINK BED; type={type(dataset.genotypes).__name__})"
-        )
-        return dataset
-    _reader, sample_indices, iid_count, bed_path = ctx
-    n_variants_axis = int(dataset.genotypes.shape[1])
-    sid_count = int(getattr(_reader, "sid_count", n_variants_axis) or n_variants_axis)
-    variant_indices: np.ndarray | None = None
-    if sid_count != n_variants_axis:
-        # The dataset has fewer columns than the source BED — typically because
-        # the IO layer dropped within-source duplicate variants (AoU's arrays.bim
-        # has a small number of true duplicates like chr1:146066338:C:A). Walk
-        # the wrapper tree for an IndexedRawGenotypeMatrix.selected_columns that
-        # records the surviving source-BED column indices, and pass that as
-        # variant_indices so the bitpacked loader only packs the kept variants.
-        from sv_pgs.genotype import IndexedRawGenotypeMatrix  # lazy
-        stack: list[object] = [dataset.genotypes]
-        seen: set[int] = set()
-        while stack:
-            node = stack.pop()
-            if node is None or id(node) in seen:
-                continue
-            seen.add(id(node))
-            if isinstance(node, IndexedRawGenotypeMatrix):
-                variant_indices = np.asarray(node.selected_columns, dtype=np.int64)
-                break
-            child = getattr(node, "child", None)
-            if child is not None:
-                stack.append(child)
-            children = getattr(node, "children", None)
-            if children is not None:
-                stack.extend(children)
-        if variant_indices is None or variant_indices.shape[0] != n_variants_axis:
-            log(
-                "bitpacked upgrade: SKIPPED (reason: variant count mismatch and no "
-                f"recoverable mapping; sid_count={sid_count}, dataset variants="
-                f"{n_variants_axis}, found_indices="
-                f"{None if variant_indices is None else int(variant_indices.shape[0])})"
-            )
-            return dataset
-        log(
-            f"bitpacked upgrade: variant-subset mapping recovered "
-            f"(kept {variant_indices.shape[0]}/{sid_count} source variants)"
-        )
-    # GPU-budget gate. Packing every dataset variant only makes sense if the
-    # resulting matrix fits in HBM with room for the rest of the fit. For AoU
-    # microarray (1.7M variants x 319k samples x 1/4 byte ~= 139 GB packed)
-    # we cannot fit a 40 GB A100, so the loader would either OOM the host on
-    # the intermediate staging buffer or the GPU on the final allocation —
-    # both wasted work. Active-variant selection happens later inside
-    # model.fit, after which the int8/GPU-resident path uploads a much
-    # smaller block. Skip the upgrade here when the projection won't fit.
-    n_samples_eff = int(sample_indices.shape[0])
-    src_bpv = (int(iid_count) + 3) // 4
-    dst_bpv = (n_samples_eff + 3) // 4
-    packed_device_bytes = n_variants_axis * dst_bpv
-    src_packed_bytes = n_variants_axis * src_bpv
-    try:
-        import cupy as _cp_for_budget  # noqa: F401
-        gpu_free_bytes, gpu_total_bytes = _cp_for_budget.cuda.Device().mem_info
-    except Exception:  # noqa: BLE001
-        gpu_free_bytes, gpu_total_bytes = 0, 0
-    # Reserve ~25% of free HBM for downstream allocations (EM scratch,
-    # standardization side buffers, prefetch). If packed_device_bytes doesn't
-    # leave that headroom, skip — the int8 fit-stage path will load the
-    # post-active subset which is much smaller.
-    headroom_bytes = max(int(gpu_free_bytes * 0.25), 4 * 1024**3)
-    if gpu_free_bytes > 0 and packed_device_bytes + headroom_bytes > gpu_free_bytes:
-        log(
-            "bitpacked upgrade: SKIPPED (reason: packed matrix would not fit HBM; "
-            f"packed={packed_device_bytes/1e9:.1f} GB, gpu_free={gpu_free_bytes/1e9:.1f} GB, "
-            f"reserved_headroom={headroom_bytes/1e9:.1f} GB). "
-            "Active-variant selection in model.fit will load a smaller subset."
-        )
-        return dataset
-    # Host-RAM gate: the indexed cold-load currently allocates one numpy buffer
-    # of size n_variants * src_bpv (=194 GB on AoU) before rebitpacking down
-    # to the requested sample subset. Until that path is chunked, gate on
-    # available host RAM with a 1.5x safety factor.
-    try:
-        import psutil  # type: ignore
-        host_free_bytes = int(psutil.virtual_memory().available)
-    except ImportError:
-        host_free_bytes = 0
-    if host_free_bytes > 0 and src_packed_bytes * 3 // 2 > host_free_bytes:
-        log(
-            "bitpacked upgrade: SKIPPED (reason: cold-load staging buffer would "
-            f"exceed host RAM; need~{src_packed_bytes * 3 // 2 / 1e9:.1f} GB, "
-            f"host_free={host_free_bytes/1e9:.1f} GB)."
-        )
-        return dataset
-    try:
-        from sv_pgs.bitpacked_loader import (
-            load_bed_to_bitpacked_device_cached,
-        )
-        # Active-matrix cache is always on. Default location is a sibling
-        # ``.sv_pgs_cache`` next to the BED file, so repeated runs against
-        # the same downloaded BED reuse the packed device matrix on disk.
-        cache_dir = Path(bed_path).parent / ".sv_pgs_cache"
-        log(
-            f"bitpacked upgrade: loading BED {bed_path} -> device via active-matrix cache "
-            f"(cache_dir={cache_dir}, n_samples={int(sample_indices.shape[0])}, "
-            f"n_variants={n_variants_axis})"
-        )
-        bp_matrix = load_bed_to_bitpacked_device_cached(
-            bed_path=bed_path,
-            n_samples=int(iid_count),
-            n_variants=int(sid_count),
-            sample_indices=np.asarray(sample_indices, dtype=np.int64),
-            variant_indices=variant_indices,
-            cache_dir=cache_dir,
-        )
-    except Exception as exc:
-        log(
-            "bitpacked upgrade: SKIPPED (reason: loader failed: "
-            f"{type(exc).__name__}: {exc}); falling back to int8 path"
-        )
-        return dataset
-    # Loud success log: report active variant count and HBM bytes consumed by
-    # the bitpacked matrix (packed bytes + mean/std side buffers) so production
-    # runs can confirm the fast path engaged from a `grep ENGAGED` over the log.
-    try:
-        packed_bytes = int(bp_matrix._packed.nbytes)
-        side_bytes = int(bp_matrix._mean.nbytes) + int(bp_matrix._std.nbytes)
-        hbm_gb = (packed_bytes + side_bytes) / 1e9
-        log(
-            f"bitpacked upgrade: ENGAGED (active={n_variants_axis} variants, "
-            f"packed_bytes={packed_bytes}, side_bytes={side_bytes}, "
-            f"HBM bytes={hbm_gb:.3f} GB)"
-        )
-    except Exception as _exc:  # noqa: BLE001 - logging never blocks the fast path
-        log(f"bitpacked upgrade: ENGAGED (active={n_variants_axis} variants; size log skipped: {_exc!r})")
-    return LoadedDataset(
-        sample_ids=dataset.sample_ids,
-        genotypes=bp_matrix,
-        covariates=dataset.covariates,
-        targets=dataset.targets,
-        variant_records=dataset.variant_records,
-        variant_stats=dataset.variant_stats,
-        variant_stats_minimum_scale=dataset.variant_stats_minimum_scale,
+    log(
+        "bitpacked upgrade: pre-fit hook disabled — "
+        "upgrade now runs post-active-selection inside model.fit "
+        f"(dataset variants={int(dataset.genotypes.shape[1]) if hasattr(dataset.genotypes, 'shape') else '?'}, "
+        f"backend={getattr(config, 'genotype_backend', None)!r})"
     )
+    return dataset
 
 
 @dataclass(slots=True)
@@ -211,13 +61,12 @@ def run_training_pipeline(
 
     if _log_file is None:
         set_log_file(destination / f"training.{time.strftime('%Y%m%d_%H%M%S')}.log")
-    # Optional fast path: swap the int8 RawGenotypeMatrix for a device-resident
-    # BitpackedDeviceMatrix when the config requests it and CuPy is available.
-    # Falls through to the int8 path on any failure (missing CuPy, non-PLINK
-    # source, variant subset, loader error).
-    dataset = _maybe_upgrade_to_bitpacked(dataset, config)
-    if test_dataset is not None:
-        test_dataset = _maybe_upgrade_to_bitpacked(test_dataset, config)
+    # NOTE: the previous pre-fit bitpacked upgrade hook was removed. The
+    # device-resident BitpackedDeviceMatrix upgrade now runs INSIDE
+    # ``model.fit`` after active-variant selection so it packs only the
+    # ~91k surviving variants (~7 GB on a 40 GB A100) instead of the full
+    # ~1.7M-variant dataset (~139 GB, would never fit). See
+    # ``sv_pgs.model._try_upgrade_reduced_to_bitpacked``.
     log(
         f"=== TRAINING PIPELINE START ===  samples={len(dataset.sample_ids)}  "
         + f"variants={dataset.genotypes.shape[1]}  trait={config.trait_type.value}  mem={mem()}"

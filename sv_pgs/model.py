@@ -866,6 +866,239 @@ def _compute_marginal_z_scores_bitpacked(
     return np.asarray(sum_xy / denom, dtype=np.float32)
 
 
+def _resolve_indexed_selected_columns(raw: Any) -> NDArray | None:
+    """Walk a RawGenotypeMatrix wrapper tree for ``IndexedRawGenotypeMatrix``.
+
+    Returns the surviving source-BED column indices when an
+    :class:`IndexedRawGenotypeMatrix` wrapper is present (e.g. AoU's IO
+    layer drops a small number of within-source duplicate variants). Returns
+    ``None`` when no such wrapper exists, in which case the caller should
+    treat dataset columns as source-BED columns directly.
+    """
+    stack: list[Any] = [raw]
+    seen: set[int] = set()
+    while stack:
+        node = stack.pop()
+        if node is None or id(node) in seen:
+            continue
+        seen.add(id(node))
+        if isinstance(node, IndexedRawGenotypeMatrix):
+            return np.asarray(node.selected_columns, dtype=np.int64)
+        child = getattr(node, "child", None)
+        if child is not None:
+            stack.append(child)
+        children = getattr(node, "children", None)
+        if children is not None:
+            stack.extend(children)
+    return None
+
+
+def _try_upgrade_reduced_to_bitpacked(
+    *,
+    reduced_genotypes: StandardizedGenotypeMatrix,
+    combined_indices: NDArray,
+    prepared_arrays: PreparedArrays,
+) -> StandardizedGenotypeMatrix | None:
+    """Attempt to swap ``reduced_genotypes`` for a bitpacked-backed view.
+
+    Builds a :class:`BitpackedDeviceMatrix` over the ACTIVE/REDUCED variant
+    set (~91k cols on AoU after MAF + marginal-z screen + tie collapse)
+    instead of the full ~1.7M-variant dataset. At this scale the packed
+    matrix fits HBM (~7 GB at 319k samples) and the EM iterations can run
+    as packed-GEMV (matvec/rmatvec/gram_block) instead of materializing an
+    int8 GPU resident matrix.
+
+    Returns a new ``StandardizedGenotypeMatrix`` whose ``raw`` is a
+    ``BitpackedDeviceMatrix`` and whose ``means/scales`` are aligned to the
+    matching reduced column subset, OR ``None`` when:
+
+    - CuPy is not importable
+    - the underlying raw is not a PLINK BED (no ``_resolve_plink_pread_context``)
+    - the packed matrix wouldn't fit HBM with reasonable headroom
+    - the host-side cold-load staging buffer wouldn't fit RAM
+    - the bitpacked loader raises
+
+    The caller MUST fall back to the existing int8 materialization path
+    on ``None``.
+    """
+    try:
+        import cupy as _cp  # noqa: F401 - import probe
+    except ImportError as exc:
+        log(
+            "bitpacked post-active upgrade: SKIPPED "
+            f"(reason: CuPy unavailable: {type(exc).__name__}: {exc})"
+        )
+        return None
+    from sv_pgs.genotype import _resolve_plink_pread_context  # lazy
+    ctx = _resolve_plink_pread_context(reduced_genotypes.raw)
+    if ctx is None:
+        log(
+            "bitpacked post-active upgrade: SKIPPED "
+            "(reason: reduced_genotypes.raw is not backed by a single PLINK BED; "
+            f"type={type(reduced_genotypes.raw).__name__})"
+        )
+        return None
+    _reader, sample_indices, iid_count, bed_path = ctx
+    sid_count = int(getattr(_reader, "sid_count", 0) or 0)
+    if sid_count <= 0:
+        log(
+            "bitpacked post-active upgrade: SKIPPED "
+            f"(reason: reader has invalid sid_count={sid_count})"
+        )
+        return None
+
+    # Map combined_indices (dataset-column space) → source-BED column space.
+    # When AoU's IO layer dropped within-source duplicates, an
+    # IndexedRawGenotypeMatrix wrapper records the surviving source columns;
+    # compose with combined_indices to get the actual BED columns to pack.
+    selected_columns = _resolve_indexed_selected_columns(reduced_genotypes.raw)
+    combined_indices_i64 = np.asarray(combined_indices, dtype=np.int64)
+    if selected_columns is not None:
+        if int(np.max(combined_indices_i64, initial=-1)) >= int(selected_columns.shape[0]):
+            log(
+                "bitpacked post-active upgrade: SKIPPED "
+                f"(reason: combined_indices max={int(np.max(combined_indices_i64))} "
+                f">= selected_columns len={int(selected_columns.shape[0])})"
+            )
+            return None
+        source_bed_columns = np.ascontiguousarray(
+            selected_columns[combined_indices_i64], dtype=np.int64
+        )
+    else:
+        source_bed_columns = np.ascontiguousarray(combined_indices_i64, dtype=np.int64)
+    if int(np.max(source_bed_columns, initial=-1)) >= sid_count or int(np.min(source_bed_columns, initial=0)) < 0:
+        log(
+            "bitpacked post-active upgrade: SKIPPED "
+            f"(reason: source-BED column index out of range "
+            f"[0, {sid_count}); got [{int(np.min(source_bed_columns))}, "
+            f"{int(np.max(source_bed_columns))}])"
+        )
+        return None
+    k_active = int(source_bed_columns.shape[0])
+    n_samples_eff = int(np.asarray(sample_indices).shape[0])
+    src_bpv = (int(iid_count) + 3) // 4
+    dst_bpv = (n_samples_eff + 3) // 4
+    packed_device_bytes = k_active * dst_bpv
+    src_packed_bytes = sid_count * src_bpv
+
+    # GPU HBM gate: reserve 25% (or 4 GiB, whichever larger) for downstream
+    # EM scratch, standardization side buffers, and prefetch.
+    try:
+        import cupy as _cp_for_budget  # noqa: F811
+        gpu_free_bytes, gpu_total_bytes = _cp_for_budget.cuda.Device().mem_info
+    except Exception:  # noqa: BLE001
+        gpu_free_bytes, gpu_total_bytes = 0, 0
+    headroom_bytes = max(int(gpu_free_bytes * 0.25), 4 * 1024**3)
+    if gpu_free_bytes > 0 and packed_device_bytes + headroom_bytes > gpu_free_bytes:
+        log(
+            "bitpacked post-active upgrade: SKIPPED "
+            f"(reason: packed matrix would not fit HBM; "
+            f"packed_bytes={packed_device_bytes} ({packed_device_bytes/1e9:.2f} GB), "
+            f"gpu_free_bytes={gpu_free_bytes} ({gpu_free_bytes/1e9:.2f} GB), "
+            f"reserved_headroom_bytes={headroom_bytes} ({headroom_bytes/1e9:.2f} GB), "
+            f"active_variants={k_active}, n_samples={n_samples_eff})"
+        )
+        return None
+    # Host-RAM gate: the indexed cold-load currently allocates one numpy
+    # buffer of size sid_count * src_bpv before rebitpacking to the requested
+    # sample subset. Gate on available host RAM with a 1.5x safety factor.
+    try:
+        import psutil  # type: ignore
+        host_free_bytes = int(psutil.virtual_memory().available)
+    except ImportError:
+        host_free_bytes = 0
+    if host_free_bytes > 0 and src_packed_bytes * 3 // 2 > host_free_bytes:
+        log(
+            "bitpacked post-active upgrade: SKIPPED "
+            f"(reason: cold-load staging buffer would exceed host RAM; "
+            f"src_packed_bytes={src_packed_bytes} "
+            f"(~{src_packed_bytes * 3 // 2 / 1e9:.2f} GB w/ 1.5x), "
+            f"host_free_bytes={host_free_bytes} ({host_free_bytes/1e9:.2f} GB))"
+        )
+        return None
+
+    # Carry the pre-computed standardization (PreparedArrays) through to the
+    # bitpacked matrix so its matvec/rmatvec/gram_block produce values
+    # identical to the int8/standardized path. Without this, the loader
+    # would compute its own mean/std from the active subset — almost
+    # certainly correct, but better to keep the contract explicit.
+    reduced_means = np.asarray(prepared_arrays.means[combined_indices_i64], dtype=np.float32)
+    reduced_scales = np.asarray(prepared_arrays.scales[combined_indices_i64], dtype=np.float32)
+    try:
+        from sv_pgs.bitpacked_loader import (
+            load_bed_to_bitpacked_device_cached,
+        )
+        cache_dir = Path(bed_path).parent / ".sv_pgs_cache"
+        log(
+            "bitpacked post-active upgrade: loading BED "
+            f"{bed_path} -> device via active-matrix cache "
+            f"(cache_dir={cache_dir}, n_samples={n_samples_eff}, "
+            f"active_variants={k_active}, "
+            f"packed_device_bytes={packed_device_bytes} ({packed_device_bytes/1e9:.3f} GB))"
+        )
+        bp_matrix = load_bed_to_bitpacked_device_cached(
+            bed_path=bed_path,
+            n_samples=int(iid_count),
+            n_variants=int(sid_count),
+            sample_indices=np.asarray(sample_indices, dtype=np.int64),
+            variant_indices=source_bed_columns,
+            cache_dir=cache_dir,
+            mean=reduced_means,
+            std=reduced_scales,
+        )
+    except Exception as exc:
+        log(
+            "bitpacked post-active upgrade: SKIPPED "
+            f"(reason: loader failed: {type(exc).__name__}: {exc}); "
+            "falling back to int8 materialization path"
+        )
+        return None
+
+    # Build a fresh StandardizedGenotypeMatrix backed by the bitpacked
+    # device matrix. ``variant_indices=arange(k_active)`` because the
+    # bitpacked matrix already holds only the active columns in order.
+    # ``_enable_hybrid_backend=False`` because the hybrid sparse/dense
+    # operator path assumes host int8 batches — incompatible with the
+    # device-resident bitpacked backing.
+    support_counts: NDArray | None = None
+    if prepared_arrays.support_counts is not None:
+        support_counts = np.asarray(
+            prepared_arrays.support_counts[combined_indices_i64], dtype=np.int32
+        )
+    new_reduced = StandardizedGenotypeMatrix(
+        raw=bp_matrix,
+        means=reduced_means,
+        scales=reduced_scales,
+        variant_indices=np.arange(k_active, dtype=np.int32),
+        support_counts=support_counts,
+        sample_count=n_samples_eff,
+        _enable_hybrid_backend=False,
+    )
+    # Carry forward LD-block partition + scheduler that may have been
+    # wired onto the old reduced matrix (see Phase 4 block in ``fit``).
+    old_partition = getattr(reduced_genotypes, "_ld_block_partition", None)
+    if old_partition is not None:
+        new_reduced._ld_block_partition = old_partition
+        new_reduced._ld_block_scheduler = getattr(
+            reduced_genotypes, "_ld_block_scheduler", None
+        )
+    try:
+        packed_bytes = int(bp_matrix._packed.nbytes)
+        side_bytes = int(bp_matrix._mean.nbytes) + int(bp_matrix._std.nbytes)
+        log(
+            "bitpacked post-active upgrade: ENGAGED "
+            f"(active_variants={k_active}, n_samples={n_samples_eff}, "
+            f"packed_bytes={packed_bytes}, side_bytes={side_bytes}, "
+            f"HBM_bytes={(packed_bytes + side_bytes) / 1e9:.3f} GB)"
+        )
+    except Exception as _exc:  # noqa: BLE001 - logging never blocks the fast path
+        log(
+            "bitpacked post-active upgrade: ENGAGED "
+            f"(active_variants={k_active}; size log skipped: {_exc!r})"
+        )
+    return new_reduced
+
+
 def _try_load_marginal_z_cache(
     cache_paths: _FitStageCachePaths,
     *,
@@ -1790,12 +2023,33 @@ class BayesianPGS:
         gc.collect()
         log(f"  freed. mem={mem()}")
 
-        allow_full_reduced_cache = not _skip_full_matrix_materialization_for_blocks(
-            reduced_genotypes,
-            self.config,
-            label="training",
+        # Post-active-selection bitpacked upgrade. At this point we have the
+        # ~k-variant reduced/active set (typically ~5% of the source matrix),
+        # which fits HBM where the full ~1.7M-variant pre-fit pack would not.
+        # When it engages we replace ``reduced_genotypes`` with a SGM backed
+        # by a ``BitpackedDeviceMatrix`` and skip the entire int8 GPU
+        # materialization / persistence / release block — the EM hot loop
+        # reaches into ``reduced_genotypes.raw`` and dispatches matvec /
+        # rmatvec / gram_block directly. On any failure (CuPy missing, non-
+        # PLINK source, budget gate, loader exception) we return the matrix
+        # unchanged and fall through to the existing int8 path verbatim.
+        _bitpacked_combined_indices = active_variant_indices[reduced_tie_map.kept_indices]
+        _bitpacked_upgraded = _try_upgrade_reduced_to_bitpacked(
+            reduced_genotypes=reduced_genotypes,
+            combined_indices=_bitpacked_combined_indices,
+            prepared_arrays=prepared_arrays,
         )
-        in_memory = False
+        if _bitpacked_upgraded is not None:
+            reduced_genotypes = _bitpacked_upgraded
+            allow_full_reduced_cache = False
+            in_memory = True
+        else:
+            allow_full_reduced_cache = not _skip_full_matrix_materialization_for_blocks(
+                reduced_genotypes,
+                self.config,
+                label="training",
+            )
+            in_memory = False
         if allow_full_reduced_cache:
             log(f"materializing reduced genotype matrix ({reduced_genotypes.shape})...")
             in_memory = reduced_genotypes.try_materialize_gpu()
@@ -1823,7 +2077,13 @@ class BayesianPGS:
                     has_reduced_raw_i8=True,
                 )
         if in_memory:
-            reduced_genotypes.release_raw_storage()
+            # Bitpacked-backed reduced matrices keep their raw (the device
+            # BitpackedDeviceMatrix IS the resident storage); calling
+            # release_raw_storage on a SGM with no dense/cupy cache would
+            # raise. The EM hot loop reads through reduced_genotypes.raw
+            # for matvec/rmatvec/gram_block, so we must keep raw alive.
+            if _bitpacked_upgraded is None:
+                reduced_genotypes.release_raw_storage()
         else:
             local_cache = local_cache or persistent_reduced_cache
             if not local_cache and allow_full_reduced_cache:
