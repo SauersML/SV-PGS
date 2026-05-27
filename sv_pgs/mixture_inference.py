@@ -1241,6 +1241,28 @@ def _stochastic_variant_blocks(
     ]
 
 
+def _genotype_has_device_resident_backend(
+    genotype_matrix: StandardizedGenotypeMatrix,
+) -> bool:
+    """True iff the standardized matrix has any GPU-resident backing.
+
+    Two equally-good representations of "the matrix is on device":
+      1. ``_cupy_cache`` populated (legacy int8/fp16 GPU cache)
+      2. ``raw`` is a ``BitpackedDeviceMatrix`` (post-active bitpacked
+         upgrade in ``model._try_upgrade_reduced_to_bitpacked``)
+
+    The previous router only recognized (1), so a bitpacked-engaged
+    matrix on the A100 was still classified as "streaming from mmap"
+    and dispatched to the stochastic block path. Treat both as resident.
+    """
+    if getattr(genotype_matrix, "_cupy_cache", None) is not None:
+        return True
+    raw = getattr(genotype_matrix, "raw", None)
+    if raw is not None and getattr(raw, "_packed", None) is not None:
+        return True
+    return False
+
+
 def _should_use_stochastic_variational_updates(
     genotype_matrix: StandardizedGenotypeMatrix,
     config: ModelConfig,
@@ -1254,8 +1276,9 @@ def _should_use_stochastic_variational_updates(
     # working-set path needs 3-6 per EM iteration.  Stochastic blocks need only 1
     # full matvec per epoch and each block solve runs on GPU.
     #
-    # Route: use working-set only if matrix is on GPU.  Otherwise stochastic blocks.
-    if genotype_matrix._cupy_cache is not None:
+    # Route: use working-set only if matrix is GPU-resident (either int8 cache
+    # OR bitpacked device matrix).  Otherwise stochastic blocks.
+    if _genotype_has_device_resident_backend(genotype_matrix):
         # Matrix fits on GPU — working-set path is optimal
         return False
     if variant_count < max(int(config.stochastic_min_variant_count), 1):
@@ -1794,10 +1817,18 @@ def fit_variational_em(
 
     log(f"  variational EM: {genotype_matrix.shape[1]} reduced variants, {covariate_matrix.shape[1]} covariates, {target_vector.shape[0]} samples, max_iter={config.max_outer_iterations}")
     use_stochastic_updates = _should_use_stochastic_variational_updates(genotype_matrix, config)
-    gpu_resident = genotype_matrix._cupy_cache is not None
+    gpu_resident = _genotype_has_device_resident_backend(genotype_matrix)
+    _residency_kind = (
+        "bitpacked-device"
+        if (
+            getattr(getattr(genotype_matrix, "raw", None), "_packed", None) is not None
+            and getattr(genotype_matrix, "_cupy_cache", None) is None
+        )
+        else ("cupy-cache" if getattr(genotype_matrix, "_cupy_cache", None) is not None else "host-streaming")
+    )
     matrix_bytes = int(genotype_matrix.shape[0]) * int(genotype_matrix.shape[1])
     log(
-        f"  solver routing: gpu_resident={gpu_resident}  "
+        f"  solver routing: gpu_resident={gpu_resident} ({_residency_kind})  "
         f"matrix={matrix_bytes/1e9:.1f} GB int8  "
         f"stochastic={'yes' if use_stochastic_updates else 'no'}  "
         f"reason={'matrix on GPU → working-set' if gpu_resident else 'streaming from mmap → stochastic blocks' if use_stochastic_updates else 'small variant count → collapsed'}"
@@ -4955,7 +4986,12 @@ def _binary_posterior_state(
             raise ValueError("prior_precision_override must match prior_variances shape.")
     else:
         prior_precision = np.asarray(1.0 / np.maximum(prior_variances, 1e-8), dtype=np.float64)
-    if resume_state is None:
+    # Honor the use_tr_newton_binary flag. The previous code ignored the
+    # flag and unconditionally attempted TR-Newton when resume_state was
+    # None, then fell back to PG-IRLS on timeout — wasting ~600s per outer
+    # EM iteration on AoU's binary fits. The config default is False; when
+    # it's True the caller explicitly opts in.
+    if resume_state is None and bool(use_tr_newton_binary):
         try:
             tr_result = _binary_posterior_state_tr_newton(
                 genotype_matrix=standardized_genotypes,
@@ -4996,6 +5032,8 @@ def _binary_posterior_state(
                 "      binary TR-Newton non-converged; falling back to PG-IRLS "
                 + f"(reason={exc})"
             )
+    elif resume_state is None:
+        log("      binary TR-Newton disabled (use_tr_newton_binary=False); using PG-IRLS")
     covariate_count = covariate_matrix.shape[1]
     parameters = np.concatenate([alpha_init, beta_init], axis=0).astype(np.float64, copy=True)
     predictor_offset_array = (
@@ -7158,6 +7196,36 @@ def _apply_sample_space_operator_gpu(
         del n_variants, n_devices  # local-only
         return result_gpu[:, 0] if vector_input else result_gpu
     result_gpu = diagonal_noise_gpu[:, None] * input_gpu
+    # Bitpacked-device fast path: when the SGM's raw is a BitpackedDeviceMatrix
+    # (post-active upgrade), apply the operator
+    #   (sigma^2 I + X diag(tau^2) X^T) v
+    # as two packed-GPU kernels per RHS column (rmatvec then matvec), avoiding
+    # the streaming standardize-per-batch loop. Only the SGM's *raw* matters
+    # here because matvec/rmatvec on BitpackedDeviceMatrix returns standardized
+    # values from the side-buffer mean/scale arrays. Requires identity
+    # variant_indices on the SGM (the post-active upgrade satisfies this).
+    _raw_for_packed = getattr(genotype_matrix, "raw", None)
+    _packed_resident = (
+        _raw_for_packed is not None
+        and getattr(_raw_for_packed, "_packed", None) is not None
+        and hasattr(_raw_for_packed, "matvec")
+        and hasattr(_raw_for_packed, "rmatvec")
+        and genotype_matrix._cupy_cache is None
+        and int(genotype_matrix.shape[1])
+        == int(getattr(_raw_for_packed, "n_variants", -1))
+    )
+    if _packed_resident:
+        # bitpacked matvec/rmatvec return float32 device arrays. Cast prior
+        # variances to match; result_gpu may be fp64 if caller demanded —
+        # accumulate at the requested dtype.
+        prior32 = cp.asarray(prior_variances_gpu, dtype=cp.float32)
+        for col in range(int(input_gpu.shape[1])):
+            input_col_f32 = cp.asarray(input_gpu[:, col], dtype=cp.float32)
+            projected = _raw_for_packed.rmatvec(input_col_f32)  # X.T @ v, (n_variants,)
+            projected = projected * prior32
+            contrib = _raw_for_packed.matvec(projected)  # X @ scaled, (n_samples,)
+            result_gpu[:, col] += cp.asarray(contrib, dtype=dtype)
+        return result_gpu[:, 0] if vector_input else result_gpu
     if genotype_matrix._cupy_cache is not None and not _cupy_cache_is_int8_standardized(genotype_matrix._cupy_cache):
         projected_gpu = genotype_matrix.gpu_transpose_matmat(
             input_gpu,
