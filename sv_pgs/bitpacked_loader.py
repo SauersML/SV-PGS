@@ -1028,9 +1028,14 @@ def _load_active_matrix_cache(
 ) -> "BitpackedDeviceMatrix":
     """Load a verified cache directory into a fresh BitpackedDeviceMatrix.
 
-    Uses ``np.memmap`` for the packed buffer so the host-resident copy is
-    page-cache-backed; the device upload then goes through a pinned-pageable
-    DMA staging buffer (same as the cold load path).
+    Reads ``packed.bin`` in 256 MiB chunks directly into a pinned host buffer
+    via ``fh.readinto``, issuing an async H2D copy after each chunk so the
+    next chunk's disk read overlaps the previous chunk's PCIe transfer. The
+    previous implementation used ``np.memmap`` + a single ``pinned_view[:] =
+    packed_host`` which (a) read the whole file before any H2D could start
+    and (b) gave no progress signal — a slow underlying disk looked like a
+    hung process. The new path logs throughput every few chunks so 2-3
+    minute loads are observable.
     """
     cp = _require_cupy()
     cache_dir = Path(cache_dir)
@@ -1041,19 +1046,52 @@ def _load_active_matrix_cache(
     n_variants = int(mean_host.shape[0])
     bpv = _bytes_per_variant(n_samples)
     packed_size = n_variants * bpv
-    packed_host = np.memmap(
-        cache_dir / "packed.bin",
-        dtype=np.uint8,
-        mode="r",
-        shape=(packed_size,),
-    )
-    # Stage into pinned memory for a fast async H2D upload.
     pinned_mem, pinned_view = _allocate_pinned(cp, packed_size)
-    pinned_view[:] = packed_host
-    del packed_host
     device_packed = cp.empty((n_variants, bpv), dtype=cp.uint8)
     cp_stream = _resolve_stream(cp, None)
-    _h2d_async(cp, device_packed, pinned_view, cp_stream)
+
+    # Async H2D and chunked disk read overlap on the same stream. Slicing the
+    # device buffer flat gives a contiguous (packed_size,) view; slicing
+    # ``pinned_view`` returns a memoryview-style view into the SAME pinned
+    # allocation so the async memcpy source is stable across iterations.
+    device_flat = device_packed.reshape(packed_size)
+    chunk_bytes = 256 * 1024 * 1024  # 256 MiB
+    n_chunks = max(1, (packed_size + chunk_bytes - 1) // chunk_bytes)
+    try:
+        from sv_pgs.progress import log as _progress_log  # type: ignore
+    except ImportError:  # pragma: no cover
+        _progress_log = None  # type: ignore[assignment]
+    _start_perf = time.perf_counter()
+    with open(cache_dir / "packed.bin", "rb") as fh:
+        for chunk_index in range(n_chunks):
+            start = chunk_index * chunk_bytes
+            stop = min(start + chunk_bytes, packed_size)
+            host_chunk = pinned_view[start:stop]
+            n_read = fh.readinto(host_chunk)
+            if n_read != host_chunk.nbytes:
+                raise IOError(
+                    f"short read on packed.bin chunk {chunk_index}: "
+                    f"{n_read} != {host_chunk.nbytes}"
+                )
+            cp.cuda.runtime.memcpyAsync(
+                int(device_flat[start:stop].data.ptr),
+                host_chunk.ctypes.data,
+                host_chunk.nbytes,
+                cp.cuda.runtime.memcpyHostToDevice,
+                cp_stream.ptr,
+            )
+            if _progress_log is not None and (
+                chunk_index == 0
+                or chunk_index == n_chunks - 1
+                or (chunk_index + 1) % 8 == 0
+            ):
+                elapsed = max(time.perf_counter() - _start_perf, 1e-6)
+                mib_done = stop / (1024 * 1024)
+                rate = mib_done / elapsed
+                _progress_log(
+                    f"      bitpacked cache load: chunk {chunk_index + 1}/{n_chunks} "
+                    f"({mib_done:.0f} MiB, {rate:.0f} MiB/s)"
+                )
     device_mean = cp.asarray(mean_host.astype(np.float32, copy=False))
     device_std = cp.asarray(std_host.astype(np.float32, copy=False))
     cp_stream.synchronize()
