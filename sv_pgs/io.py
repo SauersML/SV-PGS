@@ -1021,14 +1021,59 @@ def load_multi_source_dataset_from_files(
         available_sample_ids=common_ordered,
     )
     log(f"sample ID column: '{resolved_sample_id_column}'")
-    log("building filtered sample table on intersected samples...")
-    sample_table, total_sample_rows, unmatched_sample_rows = _build_sample_table(
-        table_spec=sample_table_spec,
+    # Try the on-disk filtered-sample-table cache before the (slow, ~20-30 s)
+    # rebuild. Cache key incorporates the TSV + first PLINK .fam fingerprints,
+    # the resolved sample-id / target / covariate columns, and the intersected
+    # sample ordering — i.e. every input that `_build_sample_table` consumes.
+    _covariate_columns_tuple = tuple(str(c) for c in covariate_columns)
+    _fam_path_for_cache: Path | None = None
+    for _kind, _src_path in source_specs:
+        if _kind == "plink1":
+            _candidate_fam = _src_path.with_suffix(".fam")
+            if _candidate_fam.exists():
+                _fam_path_for_cache = _candidate_fam
+                break
+    _st_cache_root = _sample_table_cache_root(Path(sample_table_path))
+    _st_cache_key = _sample_table_cache_key(
+        sample_table_path=Path(sample_table_path),
+        fam_path=_fam_path_for_cache,
         sample_id_column=resolved_sample_id_column,
         target_column=target_column,
-        covariate_columns=covariate_columns,
-        available_sample_ids=common_ordered,
+        covariate_columns=_covariate_columns_tuple,
+        intersected_samples=common_ordered,
     )
+    _st_cache_path = _sample_table_cache_path(_st_cache_root, _st_cache_key)
+    _cache_hit = (
+        _read_sample_table_cache(_st_cache_path, expected_n_samples=len(common_ordered))
+        if _st_cache_path.exists()
+        else None
+    )
+    if _cache_hit is not None:
+        sample_table, total_sample_rows, unmatched_sample_rows = _cache_hit
+        log(
+            f"sample table cache hit: {_st_cache_path} "
+            f"({len(sample_table.sample_ids):,} rows, "
+            f"{sample_table.covariates.shape[1]} cols)"
+        )
+    else:
+        log("sample table cache miss; rebuilding and persisting...")
+        log("building filtered sample table on intersected samples...")
+        sample_table, total_sample_rows, unmatched_sample_rows = _build_sample_table(
+            table_spec=sample_table_spec,
+            sample_id_column=resolved_sample_id_column,
+            target_column=target_column,
+            covariate_columns=covariate_columns,
+            available_sample_ids=common_ordered,
+        )
+        try:
+            _write_sample_table_cache(
+                _st_cache_path,
+                sample_table=sample_table,
+                total_sample_rows=total_sample_rows,
+                unmatched_sample_rows=unmatched_sample_rows,
+            )
+        except OSError as exc:
+            log(f"  warning: failed to persist sample-table cache to {_st_cache_path}: {exc!r}")
     n_cases = int(np.sum(np.asarray(sample_table.targets) == 1.0))
     n_controls = int(np.sum(np.asarray(sample_table.targets) == 0.0))
     log(
@@ -1409,6 +1454,161 @@ _VCF_CACHE_STATS_DTYPE = np.dtype(
     ]
 )
 _PLINK_INT8_PROGRESS_SCHEMA = 1
+
+# ---------------------------------------------------------------------------
+# Filtered sample table disk cache
+# ---------------------------------------------------------------------------
+#
+# The filtered-sample-table build (`_build_sample_table` against an
+# intersected sample-ID list) is fully deterministic given:
+#   * the sample-table TSV (path + size + mtime_ns)
+#   * the PLINK .fam (path + size + mtime_ns) — proxy for sample-source order
+#   * the resolved sample_id_column
+#   * the target_column
+#   * the covariate_columns tuple
+#   * the intersected-samples bytes (the unified sample order)
+#
+# but it costs ~20-30s on every AoU run because the TSV has 400k+ rows and
+# millions of cells. Cache the result keyed by sha256 of the inputs above.
+_SAMPLE_TABLE_CACHE_VERSION = 1
+_SAMPLE_TABLE_CACHE_SUBDIR = "sample_table_cache"
+
+
+def _sample_table_cache_root(sample_table_path: Path) -> Path:
+    """Cache root for the filtered sample table.
+
+    Mirrors `_vcf_cache_dir`: drop the cache beside the source file (typically
+    a writable cache directory) without resolving symlinks (read-only mounts).
+    """
+    return Path(os.path.abspath(sample_table_path)).parent / _CACHE_DIR_NAME / _SAMPLE_TABLE_CACHE_SUBDIR
+
+
+def _sample_table_cache_key(
+    *,
+    sample_table_path: Path,
+    fam_path: Path | None,
+    sample_id_column: str,
+    target_column: str,
+    covariate_columns: tuple[str, ...],
+    intersected_samples: Sequence[str],
+) -> str:
+    h = hashlib.sha256()
+    h.update(f"v{_SAMPLE_TABLE_CACHE_VERSION}:".encode())
+    try:
+        tsv_stat = sample_table_path.stat()
+        h.update(f"tsv_path={os.path.abspath(sample_table_path)}\n".encode())
+        h.update(f"tsv_size={tsv_stat.st_size}\n".encode())
+        h.update(f"tsv_mtime_ns={tsv_stat.st_mtime_ns}\n".encode())
+    except OSError:
+        # If we can't stat the TSV the build will fail anyway; emit a
+        # distinguishable marker so we don't collide with a real key.
+        h.update(b"tsv_unstattable\n")
+    if fam_path is not None:
+        try:
+            fam_stat = fam_path.stat()
+            h.update(f"fam_path={os.path.abspath(fam_path)}\n".encode())
+            h.update(f"fam_size={fam_stat.st_size}\n".encode())
+            h.update(f"fam_mtime_ns={fam_stat.st_mtime_ns}\n".encode())
+        except OSError:
+            h.update(b"fam_unstattable\n")
+    else:
+        h.update(b"fam_path=<none>\n")
+    h.update(f"sample_id_column={sample_id_column}\n".encode())
+    h.update(f"target_column={target_column}\n".encode())
+    h.update(("covariate_columns=" + "\x00".join(covariate_columns) + "\n").encode())
+    # Hash the intersected sample IDs as a single utf-8 blob: cheap and stable.
+    joined = "\x00".join(intersected_samples).encode("utf-8")
+    h.update(f"intersected_n={len(intersected_samples)}\n".encode())
+    h.update(joined)
+    return h.hexdigest()[:32]
+
+
+def _sample_table_cache_path(cache_root: Path, key: str) -> Path:
+    return cache_root / f"{key}.npz"
+
+
+def _read_sample_table_cache(
+    cache_path: Path,
+    *,
+    expected_n_samples: int,
+) -> tuple[_SampleTable, int, int] | None:
+    """Return the cached filtered sample table, or None on any failure.
+
+    Any IO / validation error is treated as a cache miss — the caller will
+    rebuild. We deliberately swallow exceptions to keep the run robust.
+    """
+    try:
+        with np.load(cache_path, allow_pickle=False) as bundle:
+            sample_ids_arr = bundle["sample_ids"]
+            covariates = np.asarray(bundle["covariates"], dtype=np.float32)
+            targets = np.asarray(bundle["targets"], dtype=np.float32)
+            total_sample_rows = int(bundle["total_sample_rows"])
+            unmatched_sample_rows = int(bundle["unmatched_sample_rows"])
+            version = int(bundle["version"])
+    except (OSError, KeyError, ValueError, EOFError):
+        return None
+    if version != _SAMPLE_TABLE_CACHE_VERSION:
+        return None
+    n_rows = int(sample_ids_arr.shape[0])
+    if n_rows > expected_n_samples:
+        return None
+    if covariates.ndim != 2 or covariates.shape[0] != n_rows:
+        return None
+    if targets.ndim != 1 or targets.shape[0] != n_rows:
+        return None
+    sample_ids = [
+        s.decode("utf-8") if isinstance(s, (bytes, bytearray)) else str(s)
+        for s in sample_ids_arr.tolist()
+    ]
+    return (
+        _SampleTable(sample_ids=sample_ids, covariates=covariates, targets=targets),
+        total_sample_rows,
+        unmatched_sample_rows,
+    )
+
+
+def _write_sample_table_cache(
+    cache_path: Path,
+    *,
+    sample_table: _SampleTable,
+    total_sample_rows: int,
+    unmatched_sample_rows: int,
+) -> None:
+    """Atomically persist the filtered sample table.
+
+    Pattern: `.partial.<pid>.<uuid4>` → fsync → os.replace → fsync_dir.
+    Mirrors `_write_plink_int8_progress`. On any IOError the caller logs
+    a warning and proceeds — cache writes are best-effort.
+    """
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = cache_path.with_name(
+        f"{cache_path.name}.partial.{os.getpid()}.{uuid.uuid4().hex}"
+    )
+    # Store sample IDs as a fixed-width UTF-8 byte array so that
+    # `np.load(..., allow_pickle=False)` can read them back without resorting
+    # to pickled object arrays.
+    sample_ids_arr = np.asarray(sample_table.sample_ids, dtype=np.bytes_)
+    try:
+        with tmp_path.open("wb") as handle:
+            np.savez(
+                handle,
+                version=np.int64(_SAMPLE_TABLE_CACHE_VERSION),
+                sample_ids=sample_ids_arr,
+                covariates=np.asarray(sample_table.covariates, dtype=np.float32),
+                targets=np.asarray(sample_table.targets, dtype=np.float32),
+                total_sample_rows=np.int64(total_sample_rows),
+                unmatched_sample_rows=np.int64(unmatched_sample_rows),
+            )
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp_path, cache_path)
+        _fsync_parent_dir(cache_path)
+    except OSError:
+        try:
+            tmp_path.unlink()
+        except OSError:
+            pass
+        raise
 
 
 @dataclass(slots=True)
