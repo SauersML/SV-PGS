@@ -4831,27 +4831,83 @@ def _binary_posterior_state_tr_newton(
             cp = _tr_newton_cupy
             _gpu_dtype = cp.float64
 
-            def _design_mv_gpu(v_gpu: Any) -> Any:
-                if n_variants == 0:
-                    return cp.zeros(n_samples, dtype=_gpu_dtype)
-                return genotype_matrix.gpu_matmat(
-                    v_gpu,
-                    batch_size=posterior_variance_batch_size,
-                    cupy=cp,
-                    dtype=_gpu_dtype,
-                )
+            # HVP backing contract (see tr_newton.py module docstring):
+            # ``matvec_design`` / ``matvec_design_transpose`` perform
+            # ``X @ v`` and ``X.T @ u`` against the standardized design
+            # and return CuPy arrays. Any backing object exposing
+            # ``matvec(x_dev) -> (n_samples,)`` and
+            # ``rmatvec(y_dev) -> (n_variants,)`` on device arrays in
+            # standardized space satisfies the contract uniformly: the
+            # bitpacked engine here, and a future hybrid sparse+dense
+            # matrix (BioHybridGenotypeMatrix from
+            # swarm/p2-hybrid-matrix) whose matvec/rmatvec sum dense
+            # (bitpacked) and sparse parts internally, both plug into
+            # the closures below without branching at this layer.
+            #
+            # ``gpu_matmat`` / ``gpu_transpose_matmat`` only fast-path
+            # the ``_cupy_cache`` representation; with a
+            # BitpackedDeviceMatrix raw they fall back to the streaming
+            # standardize-per-batch loop on every CG iteration. Route
+            # directly through ``raw.matvec`` / ``raw.rmatvec`` whenever
+            # the SGM exposes the full bitpacked matrix (identity
+            # variant_indices).
+            _raw_tr_packed = getattr(genotype_matrix, "raw", None)
+            _bitpacked_hvp_active = bool(
+                _raw_tr_packed is not None
+                and getattr(_raw_tr_packed, "_packed", None) is not None
+                and hasattr(_raw_tr_packed, "matvec")
+                and hasattr(_raw_tr_packed, "rmatvec")
+                and getattr(genotype_matrix, "_cupy_cache", None) is None
+                and int(genotype_matrix.shape[1])
+                == int(getattr(_raw_tr_packed, "n_variants", -1))
+                and _sgm_variant_indices_is_identity(genotype_matrix)
+            )
+            if _bitpacked_hvp_active:
+                # Bitpacked gemv kernels are fp32-only; cast at the HVP
+                # boundary so TR-Newton's fp64 inner state is preserved.
+                # CG tolerance still floors at ~sqrt(eps_fp32) ~ 3e-4 on
+                # this branch; _log_bitpacked_hvp_fp32_once() surfaces it.
+                _log_bitpacked_hvp_fp32_once()
 
-            def _design_mv_transpose_gpu(u_gpu: Any) -> Any:
-                if n_variants == 0:
-                    return cp.zeros(0, dtype=_gpu_dtype)
-                return genotype_matrix.gpu_transpose_matmat(
-                    u_gpu,
-                    batch_size=posterior_variance_batch_size,
-                    cupy=cp,
-                    dtype=_gpu_dtype,
-                )
+                def _design_mv_gpu(v_gpu: Any) -> Any:
+                    if n_variants == 0:
+                        return cp.zeros(n_samples, dtype=_gpu_dtype)
+                    v32 = cp.asarray(v_gpu, dtype=cp.float32)
+                    out32 = _raw_tr_packed.matvec(v32)
+                    return cp.asarray(out32, dtype=_gpu_dtype)
 
-            log(f"      TR-Newton dispatch: GPU-native (block GPU-resident)  mem={mem()}")
+                def _design_mv_transpose_gpu(u_gpu: Any) -> Any:
+                    if n_variants == 0:
+                        return cp.zeros(0, dtype=_gpu_dtype)
+                    u32 = cp.asarray(u_gpu, dtype=cp.float32)
+                    out32 = _raw_tr_packed.rmatvec(u32)
+                    return cp.asarray(out32, dtype=_gpu_dtype)
+            else:
+                def _design_mv_gpu(v_gpu: Any) -> Any:
+                    if n_variants == 0:
+                        return cp.zeros(n_samples, dtype=_gpu_dtype)
+                    return genotype_matrix.gpu_matmat(
+                        v_gpu,
+                        batch_size=posterior_variance_batch_size,
+                        cupy=cp,
+                        dtype=_gpu_dtype,
+                    )
+
+                def _design_mv_transpose_gpu(u_gpu: Any) -> Any:
+                    if n_variants == 0:
+                        return cp.zeros(0, dtype=_gpu_dtype)
+                    return genotype_matrix.gpu_transpose_matmat(
+                        u_gpu,
+                        batch_size=posterior_variance_batch_size,
+                        cupy=cp,
+                        dtype=_gpu_dtype,
+                    )
+
+            _tr_source_label = _sgm_gpu_source_label(genotype_matrix, style="long")
+            log(
+                f"      TR-Newton dispatch: GPU-native "
+                f"(block GPU-resident, source={_tr_source_label})  mem={mem()}"
+            )
             result = trust_region_newton_logistic_gpu(
                 cupy=cp,
                 matvec_design=_design_mv_gpu,
@@ -8374,8 +8430,12 @@ def _build_restricted_projector_gpu_bundle(
 ) -> tuple[Any, Any, Any, Any]:
     inverse_diagonal_noise_gpu = cp.asarray(inverse_diagonal_noise, dtype=dtype)
     covariate_matrix_gpu = cp.asarray(covariate_matrix, dtype=dtype)
-    # Cholesky factor stays fp64; tiny matrix (n_cov×n_cov).
-    covariate_precision_cholesky_gpu = cp.asarray(covariate_precision_cholesky, dtype=cp.float64)
+    # Factor dtype pinned by precision_policy.factor_dtype("covariate_precision")
+    # — fp64 by policy because cond(C^T W C) can hit 1e13 under the AoU
+    # categorical dummy trap. Tiny matrix (n_cov×n_cov); cost is negligible.
+    covariate_precision_cholesky_gpu = cp.asarray(
+        covariate_precision_cholesky, dtype=factor_dtype("covariate_precision")
+    )
     weighted_covariates_gpu = inverse_diagonal_noise_gpu[:, None] * covariate_matrix_gpu
     return (
         inverse_diagonal_noise_gpu,
@@ -9023,10 +9083,12 @@ def _restricted_precision_projector(
     # plus age/age² (corr ~0.99); cond(C^T W C) ≈ 10¹³. fp32 Cholesky on that
     # produces a garbage factor whose downstream Schur subtraction makes
     # variant_precision non-PSD with eigenvalues of order 10⁸.
-    ctwc = (covariate_matrix.T @ weighted_covariates).astype(np.float64, copy=False)
+    # Factor dtype pinned by precision_policy.factor_dtype("covariate_precision").
+    _covariate_factor_dtype = factor_dtype("covariate_precision")
+    ctwc = (covariate_matrix.T @ weighted_covariates).astype(_covariate_factor_dtype, copy=False)
     n_cov = int(covariate_matrix.shape[1])
     ridge_C = max(float(np.trace(ctwc)) / max(n_cov, 1) * 1e-6, 1e-8)
-    covariate_precision = ctwc + np.eye(n_cov, dtype=np.float64) * ridge_C
+    covariate_precision = ctwc + np.eye(n_cov, dtype=_covariate_factor_dtype) * ridge_C
     covariate_precision_cholesky = np.linalg.cholesky(covariate_precision)
     covariate_precision_logdet = 2.0 * float(np.sum(np.log(np.diag(covariate_precision_cholesky))))
 

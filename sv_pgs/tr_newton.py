@@ -456,8 +456,20 @@ _TR_NEWTON_GPU_IMPLEMENTED: bool = True
 # Contract:
 #   - ``matvec_design`` / ``matvec_design_transpose`` MUST accept a CuPy
 #     array and return a CuPy array.  The caller is responsible for choosing
-#     matvecs that stay on-device (e.g. via genotype_matrix.gpu_matmat /
-#     gpu_transpose_matmat against a GPU-resident block).
+#     matvecs that stay on-device.  Three uniform options the caller can
+#     pick from, all driven by the same closure shape:
+#       * ``genotype_matrix.gpu_matmat`` / ``gpu_transpose_matmat`` against
+#         a ``_cupy_cache``-resident block (legacy fp32 / int8 cache);
+#       * ``raw.matvec`` / ``raw.rmatvec`` against a
+#         ``BitpackedDeviceMatrix`` raw (post-active bitpacked upgrade); or
+#       * ``raw.matvec`` / ``raw.rmatvec`` against a future
+#         ``BioHybridGenotypeMatrix`` whose ``matvec`` / ``rmatvec`` sum a
+#         dense (bitpacked) and a sparse contribution internally.
+#     The hybrid case requires no change to this solver: as long as the
+#     closure satisfies ``matvec(v_gpu) -> (n_samples,)`` and
+#     ``rmatvec(u_gpu) -> (n_variants,)`` on CuPy device arrays in
+#     standardized space, the HVP factory below sees a single linear
+#     operator and the Steihaug-CG inner loop is identical.
 #   - ``covariate_matrix`` may be NumPy or CuPy; it is uploaded once.
 #   - The returned TrustRegionResult fields are NumPy arrays so downstream
 #     code (Laplace refit / posterior reporting) is unchanged.
