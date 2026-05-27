@@ -1802,9 +1802,10 @@ class BayesianPGS:
                                     )
                         marginal_z_scores = z_scores
                         _save_marginal_z_cache(fit_stage_cache_paths, marginal_z_scores)
+                        _mz_path = fit_stage_cache_paths.marginal_z_path
                         log(
                             f"  marginal-z cache: saved whole-array {pre_screen_count} "
-                            f"z-scores → {fit_stage_cache_paths.marginal_z_path.name}"
+                            f"z-scores → {_mz_path.name if _mz_path is not None else '<unset>'}"
                         )
                 z_pass_mask = np.abs(marginal_z_scores) >= self.config.marginal_screen_min_abs_z
                 kept_count = int(np.sum(z_pass_mask))
@@ -2934,6 +2935,7 @@ def _project_tie_map_to_original_space(
         for tie_group, representative_original in zip(
             reduced_tie_map.reduced_to_group,
             representative_originals,
+            strict=True,
         ):
             member_indices_local = np.asarray(tie_group.member_indices, dtype=np.int64)
             original_groups.append(

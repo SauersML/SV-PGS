@@ -2496,21 +2496,37 @@ def fit_variational_em(
                         # sub-block iteration.
                         _checkpoint_block_indices = block_indices
 
-                        def _save_partial_binary_block(binary_state: dict[str, object], _bi=_checkpoint_block_indices) -> None:
+                        # Snapshot every value the checkpoint needs into default args
+                        # so the closure is iteration-stable. Without this, if the
+                        # callback ever fires after the enclosing loop has advanced
+                        # (deferred dispatch, retry path, etc.), it would pickle the
+                        # CURRENT loop variables instead of the values from when this
+                        # block was solved. Today the call is synchronous but capturing
+                        # by reference is fragile in a checkpoint-correctness path.
+                        def _save_partial_binary_block(
+                            binary_state: dict[str, object],
+                            _bi=_checkpoint_block_indices,
+                            _outer=outer_iteration,
+                            _completed=block_count - 1,
+                            _bvs=beta_variance_state,
+                            _rsm=reduced_second_moment,
+                            _rpv=reduced_prior_variances,
+                            _bsize=block_size,
+                        ) -> None:
                             if checkpoint_callback is None:
                                 return
                             checkpoint_callback(
                                 _build_checkpoint(
-                                    outer_iteration,
-                                    completed_blocks_in_iteration=block_count - 1,
-                                    beta_variance_state_override=beta_variance_state,
-                                    reduced_second_moment_override=reduced_second_moment,
-                                    epoch_reduced_prior_variances_override=reduced_prior_variances,
+                                    _outer,
+                                    completed_blocks_in_iteration=_completed,
+                                    beta_variance_state_override=_bvs,
+                                    reduced_second_moment_override=_rsm,
+                                    epoch_reduced_prior_variances_override=_rpv,
                                     binary_block_resume_state_override={
                                         "block_indices": np.asarray(_bi, dtype=np.int32).copy(),
                                         "solver_state": binary_state,
                                     },
-                                    stochastic_block_size_override=block_size,
+                                    stochastic_block_size_override=_bsize,
                                 )
                             )
 
@@ -9374,6 +9390,22 @@ def _solve_restricted_exact_variant_space(
         variant_precision_gpu[diagonal_index, diagonal_index] += cp.asarray(prior_precision, dtype=compute_dtype)
         variant_precision_gpu[diagonal_index, diagonal_index] += gram_jitter
         log(f"    rhs/correction prepared in {_timed_region_seconds(rhs_setup_t0, cp):.1f}s  mem={mem()}")
+        # Pre-flight finite check on the inputs to Cholesky: if NaN/Inf
+        # snuck in via projected_targets (linear predictor explosion) or
+        # via the weighted Gram, we want to know NOW rather than after
+        # the silent NaN-fill of cp.linalg.cholesky on a non-finite input.
+        if not bool(cp.isfinite(variant_precision_gpu).all()):
+            n_bad = int(cp.size(variant_precision_gpu)) - int(cp.isfinite(variant_precision_gpu).sum())
+            raise RuntimeError(
+                f"variant_precision (X^T W X + ridge) has {n_bad} non-finite entries before "
+                "Cholesky — likely an upstream IRLS-weight or linear-predictor divergence."
+            )
+        if not bool(cp.isfinite(variant_rhs_gpu).all()):
+            n_bad = int(cp.size(variant_rhs_gpu)) - int(cp.isfinite(variant_rhs_gpu).sum())
+            raise RuntimeError(
+                f"variant_rhs (X^T W (z - X_c alpha)) has {n_bad} non-finite entries before "
+                "solve — likely an upstream IRLS-weight or linear-predictor divergence."
+            )
         _cholesky_t0 = _timed_region_start(cp)
         log(
             f"    Cholesky factorization ({variant_count}×{variant_count} "
