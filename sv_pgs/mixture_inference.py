@@ -95,6 +95,7 @@ from sv_pgs.genotype import (
     _iter_cupy_cache_standardized_batches,
     _iter_standardized_gpu_batches,
     _release_cupy_cached_memory,
+    _sgm_variant_indices_is_identity,
     _to_cupy_compute,
     _to_cupy_float64,
     _try_import_cupy,
@@ -6895,6 +6896,26 @@ def _get_cached_sample_space_cpu_preconditioner(
     ):
         assert cache_entry is not None
         return cache_entry.preconditioner, cache_entry
+    speculative_entry = _consume_speculative_sample_space_gpu_preconditioner(
+        genotype_matrix,
+        prior_variances=prior_variances,
+        diagonal_noise=diagonal_noise,
+        batch_size=batch_size,
+        rank=rank,
+    )
+    if speculative_entry is not None:
+        genotype_matrix._sample_space_gpu_preconditioner_cache = speculative_entry
+        # Spawn the NEXT speculative build using these freshly-used inputs as
+        # the predictor for the iteration after this one.
+        _spawn_speculative_sample_space_gpu_preconditioner(
+            genotype_matrix,
+            prior_variances=prior_variances,
+            diagonal_noise=diagonal_noise,
+            batch_size=batch_size,
+            rank=rank,
+            random_seed=random_seed,
+        )
+        return speculative_entry.preconditioner, speculative_entry
     background_entry = _background_sample_space_preconditioner_entry_for_subset(
         warm_start,
         genotype_matrix,
@@ -7123,6 +7144,170 @@ def _sample_space_gpu_preconditioner_with_factor(
     return apply_low_rank, low_rank_factor_gpu, basis_gpu
 
 
+@dataclass(slots=True)
+class _SpeculativePreconditionerSlot:
+    prior_hash: bytes
+    diagonal_hash: bytes
+    batch_size: int
+    rank: int
+    random_seed: int
+    stream: Any
+    entry: _SampleSpacePreconditionerCacheEntry | None
+    build_seconds: float
+    ready: bool
+    failed: bool
+
+
+_SAMPLE_SPACE_SPECULATIVE_SLOTS: dict[int, _SpeculativePreconditionerSlot] = {}
+
+
+def _hash_preconditioner_array(array: NDArray) -> bytes:
+    arr = np.ascontiguousarray(np.asarray(array, dtype=np.float64))
+    return hashlib.sha1(arr.tobytes()).digest()
+
+
+def _consume_speculative_sample_space_gpu_preconditioner(
+    genotype_matrix: StandardizedGenotypeMatrix,
+    *,
+    prior_variances: NDArray,
+    diagonal_noise: NDArray,
+    batch_size: int,
+    rank: int,
+) -> _SampleSpacePreconditionerCacheEntry | None:
+    """Return the speculative entry if its inputs hash-match, else None.
+
+    Wrong-prediction path: any mismatch (or build failure) discards the slot
+    and the caller falls back to a synchronous build. Releases speculative
+    GPU buffers via clear_gpu_arrays() before discard so we don't leak HBM.
+    """
+    key = id(genotype_matrix)
+    slot = _SAMPLE_SPACE_SPECULATIVE_SLOTS.pop(key, None)
+    if slot is None:
+        return None
+    if slot.failed:
+        log("      preconditioner: async miss, falling back to sync build")
+        return None
+    prior_hash = _hash_preconditioner_array(prior_variances)
+    diagonal_hash = _hash_preconditioner_array(diagonal_noise)
+    if (
+        slot.prior_hash != prior_hash
+        or slot.diagonal_hash != diagonal_hash
+        or slot.batch_size != int(batch_size)
+        or slot.rank != int(rank)
+    ):
+        log("      preconditioner: async miss, falling back to sync build")
+        if slot.entry is not None:
+            slot.entry.clear_gpu_arrays()
+        return None
+    try:
+        if slot.stream is not None:
+            slot.stream.synchronize()
+    except Exception:
+        log("      preconditioner: async miss, falling back to sync build")
+        if slot.entry is not None:
+            slot.entry.clear_gpu_arrays()
+        return None
+    if slot.entry is None:
+        log("      preconditioner: async miss, falling back to sync build")
+        return None
+    log(f"      preconditioner: async build hit (saved ~{slot.build_seconds * 1000.0:.0f}ms)")
+    return slot.entry
+
+
+def _spawn_speculative_sample_space_gpu_preconditioner(
+    genotype_matrix: StandardizedGenotypeMatrix,
+    *,
+    prior_variances: NDArray,
+    diagonal_noise: NDArray,
+    batch_size: int,
+    rank: int,
+    random_seed: int,
+) -> None:
+    """Build the next-iter preconditioner on a low-priority side stream.
+
+    Runs CONCURRENT with the caller's downstream work (current iteration's CG
+    solve completion + outer-EM hyperparameter update) so the ~100ms build is
+    latency-hidden. Any failure (OOM, missing cupy, etc.) is swallowed: the
+    slot is marked failed and the next call falls back to the synchronous path.
+    """
+    cp = _try_import_cupy()
+    if cp is None:
+        return
+    key = id(genotype_matrix)
+    # Discard any previous unconsumed slot — releases its HBM before we
+    # allocate a fresh speculative build.
+    prev = _SAMPLE_SPACE_SPECULATIVE_SLOTS.pop(key, None)
+    if prev is not None and prev.entry is not None:
+        prev.entry.clear_gpu_arrays()
+
+    try:
+        # Low-priority stream so speculative kernels yield HBM bandwidth to
+        # the default-stream compute. Fall back to a non-blocking stream if
+        # the cupy build lacks priority support.
+        try:
+            lo, _hi = cp.cuda.get_stream_priority_range()
+            side_stream = cp.cuda.Stream(non_blocking=True, priority=lo)
+        except Exception:
+            side_stream = cp.cuda.Stream(non_blocking=True)
+    except Exception:
+        return
+
+    prior_hash = _hash_preconditioner_array(prior_variances)
+    diagonal_hash = _hash_preconditioner_array(diagonal_noise)
+    prior_copy = np.asarray(prior_variances, dtype=np.float64).copy()
+    diagonal_copy = np.asarray(diagonal_noise, dtype=np.float64).copy()
+    slot = _SpeculativePreconditionerSlot(
+        prior_hash=prior_hash,
+        diagonal_hash=diagonal_hash,
+        batch_size=int(batch_size),
+        rank=int(rank),
+        random_seed=int(random_seed),
+        stream=side_stream,
+        entry=None,
+        build_seconds=0.0,
+        ready=False,
+        failed=False,
+    )
+    _SAMPLE_SPACE_SPECULATIVE_SLOTS[key] = slot
+
+    t0 = time.perf_counter()
+    try:
+        with side_stream:
+            diagonal_preconditioner = _sample_space_diagonal_preconditioner(
+                genotype_matrix=genotype_matrix,
+                prior_variances=prior_copy,
+                diagonal_noise=diagonal_copy,
+                batch_size=batch_size,
+            )
+            preconditioner, nystrom_factor_gpu, nystrom_basis_gpu = _sample_space_gpu_preconditioner_with_factor(
+                genotype_matrix=genotype_matrix,
+                prior_variances=prior_copy,
+                diagonal_noise=diagonal_copy,
+                batch_size=batch_size,
+                rank=rank,
+                random_seed=random_seed,
+                diagonal_preconditioner=diagonal_preconditioner,
+            )
+        entry = _SampleSpacePreconditionerCacheEntry(
+            batch_size=int(batch_size),
+            rank=int(rank),
+            random_seed=int(random_seed),
+            prior_variances=prior_copy,
+            diagonal_noise=diagonal_copy,
+            diagonal_preconditioner=np.asarray(diagonal_preconditioner, dtype=np.float64).copy(),
+            preconditioner=preconditioner,
+            nystrom_basis_gpu=nystrom_basis_gpu,
+            nystrom_factor_gpu=nystrom_factor_gpu,
+        )
+        slot.entry = entry
+        slot.build_seconds = time.perf_counter() - t0
+        slot.ready = True
+    except Exception:
+        # Swallow OOM / driver errors; next call falls back to sync build.
+        slot.failed = True
+        slot.entry = None
+
+
 def _get_cached_sample_space_gpu_preconditioner(
     genotype_matrix: StandardizedGenotypeMatrix,
     *,
@@ -7215,6 +7400,20 @@ def _get_cached_sample_space_gpu_preconditioner(
         nystrom_factor_gpu=nystrom_factor_gpu,
     )
     genotype_matrix._sample_space_gpu_preconditioner_cache = cache_entry
+    # Speculatively build the NEXT iteration's preconditioner on a side stream,
+    # latency-hiding it behind the current iteration's downstream work (CG solve
+    # finalization + outer-EM hyperparameter update). The just-used
+    # prior_variances / diagonal_noise are the predictor; if the next call's
+    # hashes don't match, the speculative entry is discarded and we fall back
+    # to a synchronous build.
+    _spawn_speculative_sample_space_gpu_preconditioner(
+        genotype_matrix,
+        prior_variances=prior_variances,
+        diagonal_noise=diagonal_noise,
+        batch_size=batch_size,
+        rank=rank,
+        random_seed=random_seed,
+    )
     return preconditioner, cache_entry
 
 
