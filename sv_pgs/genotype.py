@@ -4457,6 +4457,59 @@ def _build_sparse_backend(
     )
 
 
+# Module-level set of (label, exception-type-name) tuples that have already
+# triggered a bitpacked-dispatch fallback warning. Used to log once per unique
+# failure mode rather than on every HVP in the TR-Newton CG inner loop.
+_BITPACKED_DISPATCH_FALLBACK_WARNED: set[tuple[str, str]] = set()
+
+
+def _warn_bitpacked_dispatch_fallback(label: str, exc: BaseException) -> None:
+    """Emit a one-shot warning when the bitpacked SGM fast path falls back to streaming.
+
+    Without this guard, ``except Exception: pass`` in the bitpacked dispatch
+    can silently degrade the whole fit from sub-second HVPs to streaming
+    (~9 hours) with zero visibility. We log once per (label, exception-type)
+    pair so the user sees the failure but the inner loop stays quiet.
+    """
+    exc_type_name = type(exc).__name__
+    key = (label, exc_type_name)
+    if key in _BITPACKED_DISPATCH_FALLBACK_WARNED:
+        return
+    _BITPACKED_DISPATCH_FALLBACK_WARNED.add(key)
+    try:
+        log(
+            f"bitpacked SGM dispatch fell back to streaming ({label}, "
+            f"exc {exc_type_name}: {exc}). Subsequent identical failures will be silent."
+        )
+    except Exception:  # noqa: BLE001 - logging must never break the fast-path fallback
+        pass
+
+
+def _sgm_variant_indices_is_identity(sgm: StandardizedGenotypeMatrix) -> bool:
+    """Return whether ``sgm.variant_indices`` equals ``np.arange(sgm.shape[1])``.
+
+    Caches the result on the SGM instance keyed by ``id(variant_indices)`` so
+    a reused SGM whose ``variant_indices`` is reassigned (different array
+    object) transparently recomputes. The check is otherwise O(p) per call,
+    which is wasted work inside TR-Newton CG hot loops where the SGM and its
+    indices are immutable for thousands of HVPs.
+    """
+    variant_idx_arr = np.asarray(sgm.variant_indices)
+    key = id(sgm.variant_indices)
+    cached = getattr(sgm, "_variant_indices_is_identity_cache", None)
+    if cached is not None and cached[0] == key:
+        return cached[1]
+    is_identity = bool(
+        variant_idx_arr.shape[0] == sgm.shape[1]
+        and np.array_equal(variant_idx_arr, np.arange(sgm.shape[1]))
+    )
+    try:
+        sgm._variant_indices_is_identity_cache = (key, is_identity)
+    except AttributeError:  # slots SGM that hasn't declared the cache slot — be safe.
+        pass
+    return is_identity
+
+
 @dataclass(slots=True)
 class StandardizedGenotypeMatrix:
     """A genotype matrix that applies z-score standardization on the fly.
@@ -4505,6 +4558,10 @@ class StandardizedGenotypeMatrix:
     # ``ModelConfig.use_ld_blocks=True``.
     _ld_block_partition: Any | None = field(init=False, default=None, repr=False)
     _ld_block_scheduler: Any | None = field(init=False, default=None, repr=False)
+    # Cache for variant_indices identity check used by the bitpacked fast path
+    # in matvec_numpy / transpose_matvec_numpy. Tuple of (id(variant_indices),
+    # is_identity_bool) — recomputed lazily if variant_indices is reassigned.
+    _variant_indices_is_identity_cache: tuple[int, bool] | None = field(init=False, default=None, repr=False)
 
     def __post_init__(self) -> None:
         self.means = np.asarray(self.means, dtype=np.float32)
@@ -6017,17 +6074,12 @@ class StandardizedGenotypeMatrix:
             and getattr(raw, "_packed", None) is not None
             and self.shape[1] == int(getattr(raw, "n_variants", -1))
         ):
-            variant_idx_arr = np.asarray(self.variant_indices)
-            is_identity = (
-                variant_idx_arr.shape[0] == self.shape[1]
-                and bool(np.array_equal(variant_idx_arr, np.arange(self.shape[1])))
-            )
-            if is_identity:
+            if _sgm_variant_indices_is_identity(self):
                 try:
                     result = raw.matvec_numpy(coeff_np)
                     return np.asarray(result, dtype=coeff_np.dtype)
-                except Exception:  # noqa: BLE001 - fall back rather than abort fit
-                    pass
+                except Exception as _bp_exc:  # noqa: BLE001 - fall back rather than abort fit
+                    _warn_bitpacked_dispatch_fallback("matvec_numpy", _bp_exc)
         active_local_indices = _active_vector_local_indices(coeff_np)
         if active_local_indices.size == 0:
             return np.zeros(self.shape[0], dtype=coeff_np.dtype)
@@ -6217,17 +6269,12 @@ class StandardizedGenotypeMatrix:
             and getattr(raw, "_packed", None) is not None
             and self.shape[1] == int(getattr(raw, "n_variants", -1))
         ):
-            variant_idx_arr = np.asarray(self.variant_indices)
-            is_identity = (
-                variant_idx_arr.shape[0] == self.shape[1]
-                and bool(np.array_equal(variant_idx_arr, np.arange(self.shape[1])))
-            )
-            if is_identity:
+            if _sgm_variant_indices_is_identity(self):
                 try:
                     result = raw.rmatvec_numpy(v_np)
                     return np.asarray(result, dtype=v_np.dtype)
-                except Exception:  # noqa: BLE001 - fall back rather than abort fit
-                    pass
+                except Exception as _bp_exc:  # noqa: BLE001 - fall back rather than abort fit
+                    _warn_bitpacked_dispatch_fallback("transpose_matvec_numpy", _bp_exc)
         if self._cupy_cache is not None:
             cupy = _try_import_cupy()
             if cupy is None:
