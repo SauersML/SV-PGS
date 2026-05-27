@@ -1016,14 +1016,34 @@ def _gpu_cholesky_solve(right_hand_side: Any, cholesky_factor_gpu: Any, solve_tr
     if hasattr(cp, "asfortranarray"):
         factor_gpu = cp.asfortranarray(factor_gpu)
         rhs_gpu = cp.asfortranarray(rhs_gpu)
-    lower_solution = solve_triangular_gpu(factor_gpu, rhs_gpu, lower=True, check_finite=False)
-    solution = solve_triangular_gpu(
-        factor_gpu,
-        lower_solution,
-        lower=True,
-        trans="T",
-        check_finite=False,
-    )
+    try:
+        lower_solution = solve_triangular_gpu(factor_gpu, rhs_gpu, lower=True, check_finite=False)
+        solution = solve_triangular_gpu(
+            factor_gpu,
+            lower_solution,
+            lower=True,
+            trans="T",
+            check_finite=False,
+        )
+    except Exception as exc:  # noqa: BLE001 - cuBLAS edge cases
+        # CUBLAS_STATUS_INVALID_VALUE observed on certain cupy + A100
+        # combinations where dtrsm rejects LDA even on canonical fortran
+        # arrays. The GLS Cholesky here is tiny (≈n_covariates square,
+        # ~36×36 on AoU), so the CPU fallback is microseconds and avoids
+        # the brittle cuBLAS code path entirely.
+        try:
+            import scipy.linalg as _sla
+        except ImportError as _import_exc:  # pragma: no cover
+            raise exc from _import_exc
+        factor_host = cp.asnumpy(factor_gpu)
+        rhs_host = cp.asnumpy(rhs_gpu)
+        lower_host = _sla.solve_triangular(
+            factor_host, rhs_host, lower=True, check_finite=False,
+        )
+        solution_host = _sla.solve_triangular(
+            factor_host, lower_host, lower=True, trans="T", check_finite=False,
+        )
+        solution = cp.asarray(solution_host, dtype=factor_gpu.dtype)
     return solution[:, 0] if rhs_was_vector else solution
 
 
