@@ -4023,8 +4023,16 @@ def precache_vcfs_parallel(
                 tasks.append((str(vcf_path), region, str(region_prefix), 1))
             completed_regions_by_vcf[vcf_path] = completed_count
 
-    process_count = min(total_cpus, max(len(tasks), 1))
-    threads_per_worker = max(total_cpus // max(process_count, 1), 1)
+    # Reserve a couple of cores for the concurrent PLINK int8/stats warmup
+    # (Step 3.25 background pass). Without this, observed wall-time on the
+    # AoU run is dominated by the warmup starving — it stays at 0 bytes for
+    # several minutes while 12/12 cores parse VCFs. The two reserved cores
+    # let the warmup actually decode int8 batches in parallel, and the VCF
+    # precache loses very little (already oversplit 3x relative to CPUs).
+    _RESERVED_FOR_BG = 2 if total_cpus >= 6 else 0
+    effective_cpus = max(total_cpus - _RESERVED_FOR_BG, 1)
+    process_count = min(effective_cpus, max(len(tasks), 1))
+    threads_per_worker = max(effective_cpus // max(process_count, 1), 1)
     if threads_per_worker > 1:
         tasks = [
             (vcf_path_str, region, output_prefix, threads_per_worker)
