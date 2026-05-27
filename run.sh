@@ -77,12 +77,32 @@ export PATH="$HOME/.local/bin:$PATH"
 
 cd "$REPO_DIR"
 if [ -d .git ]; then
+  branch="$(git rev-parse --abbrev-ref HEAD)"
   if git diff --quiet && git diff --cached --quiet; then
-    branch="$(git rev-parse --abbrev-ref HEAD)"
     echo "updating code: git pull --ff-only origin ${branch}"
     git pull --ff-only origin "$branch" || echo "  (git pull failed — continuing with local code)"
   else
-    echo "skipping git pull: working tree has local changes"
+    # Auto-stash + pull + pop so a dirty working tree doesn't silently
+    # pin the VM to stale code. Previous behavior printed
+    # "skipping git pull: working tree has local changes" and exited
+    # the block, which meant remote bug fixes never reached the runner.
+    stash_tag="run.sh-autostash-$(date +%s)"
+    echo "local changes present; auto-stashing (${stash_tag}) to allow pull"
+    if git stash push --include-untracked -m "$stash_tag" >/dev/null; then
+      echo "updating code: git pull --ff-only origin ${branch}"
+      if git pull --ff-only origin "$branch"; then
+        echo "  pull OK — restoring stashed local changes"
+      else
+        echo "  pull failed — restoring stashed local changes anyway"
+      fi
+      if ! git stash pop >/dev/null 2>&1; then
+        echo "  WARNING: 'git stash pop' had conflicts; your local edits are still"
+        echo "  saved under stash '${stash_tag}'. Inspect with: git stash list"
+        echo "  and restore with: git stash apply stash@{0}  (then resolve conflicts)"
+      fi
+    else
+      echo "  stash failed — continuing with local (possibly stale) code"
+    fi
   fi
 fi
 uv sync --python 3.12 --extra gpu
