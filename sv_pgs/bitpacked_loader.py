@@ -104,15 +104,123 @@ def _resolve_stream(cp: Any, stream: Any) -> Any:
     return stream
 
 
+class _PinnedBufferPool:
+    """Process-wide pinned host buffer pool.
+
+    Pinning host memory via ``cudaHostAlloc`` (what CuPy's
+    ``alloc_pinned_memory`` wraps) is expensive: each call requires the
+    kernel to lock pages and update the IOMMU, which for a 7+ GB
+    bitpacked-cache staging buffer can cost a meaningful fraction of a
+    minute. Freeing the buffer unmaps it; the next call immediately
+    reallocates and re-pins from scratch. When the pipeline runs SNP-only
+    then SNP+SV in the same process, or iterates the disease loop with
+    bitpacked cache loads at the head of each disease, the 7 GB pin/unpin
+    churn becomes a real wall-time tax.
+
+    This pool keeps released allocations around (keyed by size) so the
+    next ``acquire(n)`` of a same-or-smaller request reuses an existing
+    pin instead of round-tripping through the kernel. Grows monotonically
+    — we never shrink — and is bounded only by the host-RAM budget the
+    caller already enforces upstream.
+
+    Thread-safe under a module-level ``threading.Lock``. The lock is
+    released across the (potentially multi-second) actual
+    ``alloc_pinned_memory`` call so concurrent acquires of pool-hit sizes
+    are not serialized behind a cold-allocate.
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._available: list[tuple[int, Any]] = []
+        self._in_flight: dict[int, tuple[int, Any]] = {}
+        self._n_allocs = 0
+        self._n_reuses = 0
+        self._peak_total_bytes = 0
+
+    def acquire(self, cp: Any, nbytes: int) -> tuple[Any, np.ndarray]:
+        """Return ``(pinned_mem, uint8 numpy view of length ``nbytes``)``.
+
+        Best-fit search: smallest available buffer ≥ ``nbytes``. Falls
+        back to a fresh ``alloc_pinned_memory`` if no candidate fits.
+        """
+        if nbytes <= 0:
+            return None, np.empty((0,), dtype=np.uint8)
+        nbytes = int(nbytes)
+        with self._lock:
+            best_idx = -1
+            best_size = -1
+            for idx, (sz, _mem) in enumerate(self._available):
+                if sz >= nbytes and (best_idx < 0 or sz < best_size):
+                    best_idx = idx
+                    best_size = sz
+            if best_idx >= 0:
+                sz, mem = self._available.pop(best_idx)
+                self._in_flight[id(mem)] = (sz, mem)
+                self._n_reuses += 1
+                view = np.frombuffer(mem, dtype=np.uint8, count=nbytes)
+                return mem, view
+        # Allocate outside the lock — pinning a multi-GB region can take
+        # seconds and we don't want every other thread blocked on it.
+        pinned_mem = cp.cuda.alloc_pinned_memory(nbytes)
+        with self._lock:
+            self._in_flight[id(pinned_mem)] = (nbytes, pinned_mem)
+            self._n_allocs += 1
+            total = sum(sz for sz, _ in self._available) + sum(
+                sz for sz, _ in self._in_flight.values()
+            )
+            if total > self._peak_total_bytes:
+                self._peak_total_bytes = total
+        view = np.frombuffer(pinned_mem, dtype=np.uint8, count=nbytes)
+        return pinned_mem, view
+
+    def release(self, mem: Any) -> None:
+        """Return ``mem`` to the pool so a later acquire can reuse it.
+
+        Safe with ``None`` (no-op) and on double-release (drops silently).
+        """
+        if mem is None:
+            return
+        with self._lock:
+            entry = self._in_flight.pop(id(mem), None)
+            if entry is None:
+                return
+            self._available.append(entry)
+
+    def stats(self) -> dict[str, int]:
+        with self._lock:
+            return {
+                "available_count": len(self._available),
+                "available_bytes": sum(sz for sz, _ in self._available),
+                "in_flight_count": len(self._in_flight),
+                "in_flight_bytes": sum(sz for sz, _ in self._in_flight.values()),
+                "allocs": self._n_allocs,
+                "reuses": self._n_reuses,
+                "peak_total_bytes": self._peak_total_bytes,
+            }
+
+
+_PINNED_POOL = _PinnedBufferPool()
+
+
+def _pinned_pool() -> _PinnedBufferPool:
+    """Return the process-wide pinned-buffer pool (shared with genotype.py)."""
+    return _PINNED_POOL
+
+
 def _allocate_pinned(cp: Any, nbytes: int) -> tuple[Any, np.ndarray]:
-    """Allocate a pinned-host uint8 staging buffer and return (mem, numpy_view)."""
-    if nbytes <= 0:
-        return None, np.empty((0,), dtype=np.uint8)
-    pinned_mem = cp.cuda.alloc_pinned_memory(nbytes)
-    # Wrap the pinned allocation in a numpy view so the caller can fill it
-    # with positional reads / rebitpacked bytes without an extra copy.
-    host_view = np.frombuffer(pinned_mem, dtype=np.uint8, count=nbytes)
-    return pinned_mem, host_view
+    """Acquire a pinned-host uint8 staging buffer from the process-wide pool.
+
+    Returns ``(pinned_mem, numpy_view)``. Pass ``pinned_mem`` to
+    ``_release_pinned`` when the buffer is no longer needed so a later
+    acquire can reuse it instead of re-pinning multi-GB regions from
+    scratch.
+    """
+    return _PINNED_POOL.acquire(cp, int(nbytes))
+
+
+def _release_pinned(mem: Any) -> None:
+    """Return a pinned buffer to the pool. Safe with ``None`` and on double-release."""
+    _PINNED_POOL.release(mem)
 
 
 def _h2d_async(
@@ -574,6 +682,14 @@ def load_bed_to_bitpacked_device(
 
     src_bpv = _bytes_per_variant(n_samples)
 
+    # Pinned acquisitions are released to the pool once the H2D copy has
+    # completed (after ``cp_stream.synchronize()`` at step 4). Track them
+    # here so every code path participates and we have a single release
+    # point. Releasing returns the buffer to ``_PinnedBufferPool`` rather
+    # than freeing the pin — the next bitpacked load reuses it instead of
+    # re-pinning multi-GB regions.
+    _pinned_to_release: list[Any] = []
+
     # 1. Read packed bytes (all variants or coalesced gather).
     if variant_indices is None:
         gathered_n_variants = n_variants
@@ -603,6 +719,7 @@ def load_bed_to_bitpacked_device(
             # to avoid an intermediate copy.
             if sample_indices is None:
                 pinned_mem, pinned_view = _allocate_pinned(cp, raw_total_bytes)
+                _pinned_to_release.append(pinned_mem)
                 # Parallel range-read path: N independent fds, ``os.pread`` on
                 # each. Used when the worker count resolves to >1 AND the BED
                 # is gcsfuse-backed AND total payload exceeds the 1 GB
@@ -748,6 +865,7 @@ def load_bed_to_bitpacked_device(
         if sample_indices is None:
             # Move the gather result into a pinned staging buffer.
             pinned_mem, pinned_view = _allocate_pinned(cp, payload.nbytes)
+            _pinned_to_release.append(pinned_mem)
             pinned_view[:] = payload
             packed_for_upload = pinned_view
             final_bpv = src_bpv
@@ -772,6 +890,7 @@ def load_bed_to_bitpacked_device(
         )
         effective_n_samples = int(s_idx.size)
         pinned_mem, pinned_view = _allocate_pinned(cp, rebitpacked.nbytes)
+        _pinned_to_release.append(pinned_mem)
         pinned_view[:] = rebitpacked
         packed_for_upload = pinned_view
     else:
@@ -811,6 +930,14 @@ def load_bed_to_bitpacked_device(
         )
     else:
         raise ValueError("mean and std must both be provided or both be None.")
+
+    # H2D copy has completed (both branches above synchronize). Return every
+    # pinned staging buffer to the process-wide pool so the next bitpacked
+    # load — SNP+SV after SNP-only, or a subsequent disease's cache load —
+    # reuses the same pin instead of re-pinning multi-GB regions.
+    for _pm in _pinned_to_release:
+        _release_pinned(_pm)
+    _pinned_to_release.clear()
 
     # 5. Wrap and return. Import lazily so this module imports cleanly even
     # when the matrix module is built later in the wave.
@@ -1095,6 +1222,12 @@ def _load_active_matrix_cache(
     device_mean = cp.asarray(mean_host.astype(np.float32, copy=False))
     device_std = cp.asarray(std_host.astype(np.float32, copy=False))
     cp_stream.synchronize()
+
+    # All async H2D copies on ``cp_stream`` have completed; the pinned
+    # staging buffer is no longer referenced by any in-flight DMA. Return
+    # it to the pool — for the AoU run this is the 7.3 GB allocation we
+    # specifically don't want to pin/unpin on every disease iteration.
+    _release_pinned(pinned_mem)
 
     from sv_pgs.bitpacked_matrix import BitpackedDeviceMatrix  # lazy
 
