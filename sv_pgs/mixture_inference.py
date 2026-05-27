@@ -9426,22 +9426,33 @@ def _solve_restricted_exact_variant_space(
                 "solve — likely an upstream IRLS-weight or linear-predictor divergence."
             )
         _cholesky_t0 = _timed_region_start(cp)
+        # Promote to fp64 for the factorization regardless of the GEMM
+        # compute_dtype. At p=8192 the matrix is only ~256 MB in fp64 (fits
+        # HBM trivially). The fp32 GEMM that built variant_precision_gpu
+        # can produce up to 12-orders-of-magnitude dynamic range when
+        # IRLS weights are near the minimum_weight floor; factorizing
+        # that in fp32 with cp.linalg.cholesky is what produced the
+        # silent NaN-fill on the AoU run. Doing the GEMM in fp32 (cheap)
+        # and the factor in fp64 (correct) is the standard mixed-precision
+        # pattern. Also symmetrize: the Gram should be SPD by construction
+        # but accumulation error in fp32 can introduce ~ULP-scale asymmetry
+        # that occasionally tips CuPy's cholesky into non-SPD behavior.
+        precision_for_factor = variant_precision_gpu.astype(cp.float64, copy=True)
+        precision_for_factor = 0.5 * (precision_for_factor + precision_for_factor.T)
+        rhs_for_solve = variant_rhs_gpu.astype(cp.float64, copy=True)
         log(
-            f"    Cholesky factorization ({variant_count}×{variant_count} "
-            + f"{'fp32' if is_mixed_precision else 'fp64'})...  mem={mem()}"
+            f"    Cholesky factorization ({variant_count}×{variant_count} fp64"
+            + (" promoted from fp32 GEMM" if is_mixed_precision else "")
+            + f")...  mem={mem()}"
         )
-        variant_precision_cholesky_gpu = cp.linalg.cholesky(variant_precision_gpu)
-        # CuPy's cholesky silently fills with NaN when the input is
-        # near-singular instead of raising — the same pathology already
-        # handled in _solve_restricted_full for the GLS factor. Without
-        # this guard the NaN factor produces NaN beta, which then
-        # crashes downstream finite-validation in transpose_matvec_numpy
-        # ("sample vector must contain only finite values").
-        # NB: if the *input* to Cholesky already contains NaN/Inf (caught
-        # by the pre-flight check above), no diagonal ridge can rescue
-        # it — NaN + finite = NaN. The ridge ladder here exists for the
-        # ill-conditioned-but-finite case.
+        # Ridge ladder for the ill-conditioned-but-finite case. NaN/Inf in
+        # the input is caught by the pre-flight check above and can't be
+        # rescued by adding to the diagonal (NaN + finite = NaN).
+        variant_precision_cholesky_gpu = cp.linalg.cholesky(precision_for_factor)
+        _diag_index_f64 = cp.asarray(diagonal_index)
         for _ridge_bump, _ridge_label in (
+            (1e-8, "1e-8"),
+            (1e-6, "1e-6"),
             (1e-4, "1e-4"),
             (1e-2, "1e-2"),
             (1e0, "1e0"),
@@ -9451,21 +9462,30 @@ def _solve_restricted_exact_variant_space(
                 break
             log(
                 f"    exact variant-space Cholesky non-finite; "
-                f"re-conditioning ridge {_ridge_label} and retrying."
+                f"re-conditioning ridge {_ridge_label} (fp64) and retrying."
             )
-            variant_precision_gpu[diagonal_index, diagonal_index] += cp.asarray(
-                _ridge_bump, dtype=compute_dtype
-            )
-            variant_precision_cholesky_gpu = cp.linalg.cholesky(variant_precision_gpu)
+            precision_for_factor[_diag_index_f64, _diag_index_f64] += cp.float64(_ridge_bump)
+            variant_precision_cholesky_gpu = cp.linalg.cholesky(precision_for_factor)
         if not bool(cp.isfinite(variant_precision_cholesky_gpu).all()):
-            raise RuntimeError(
+            # Final diagnostic: report the conditioning so the user can see
+            # whether this is genuine ill-conditioning or a contaminated input.
+            diag_min = float(cp.min(cp.diag(precision_for_factor)))
+            diag_max = float(cp.max(cp.diag(precision_for_factor)))
+            sym_err = float(cp.max(cp.abs(precision_for_factor - precision_for_factor.T)))
+            raise FloatingPointError(
                 "exact variant-space Cholesky factor remained non-finite after "
-                "ridge bumps to 1e2 — variant_precision matrix has NaN/Inf "
-                "entries (not just ill-conditioning). Check the pre-Cholesky "
-                "finite-check log lines above to see whether variant_precision "
-                "or variant_rhs is contaminated, then trace back to the "
-                "weighted Gram build or the prior_precision."
+                "fp64 promotion + ridge ladder up to 1e2. "
+                f"diag(min={diag_min:.3e}, max={diag_max:.3e}), "
+                f"symmetry_err={sym_err:.3e}. "
+                "Check the pre-Cholesky finite-check log lines and the PG-IRLS "
+                "iteration finite checks above to localize the contamination."
             )
+        # Keep the factor in fp64 — downstream consumers (solve, inverse
+        # diagonal, beta variance) re-promote their own RHS to match, and
+        # downcasting the factor would undo the whole reason for the
+        # promotion. The solve site below explicitly casts variant_rhs_gpu
+        # to fp64 to match.
+        variant_rhs_gpu = rhs_for_solve
         log(f"    Cholesky done in {_timed_region_seconds(_cholesky_t0, cp):.1f}s, solving...  mem={mem()}")
 
         def solve_variant_rhs_gpu(right_hand_side: Any) -> Any:
