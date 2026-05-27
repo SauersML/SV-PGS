@@ -384,6 +384,53 @@ class BitpackedDeviceMatrix(RawGenotypeMatrix):
             )
         return out
 
+    def decode_standardized_subset_to_device(
+        self,
+        col_indices: "NDArray | cp.ndarray",
+    ) -> "cp.ndarray":
+        """Decode standardized fp32 columns ``X[:, col_indices]`` to a
+        device-resident ``(n_samples, k)`` Fortran-order array.
+
+        Semantics match :func:`sv_pgs.bitpacked.cpu_reference.standardize_z`:
+        missing slots (-127) and zero-scale variants contribute 0. The output
+        is the same fp32 standardized block a streaming H2D upload would
+        produce, but built entirely on device from the bitpacked side buffer
+        (means + scales) — no host roundtrip and no fp32 transfer over PCIe.
+        """
+        cp = _cupy()
+        bp = _bitpacked()
+        idx_dev = cp.asarray(col_indices, dtype=cp.int64).ravel()
+        k = int(idx_dev.shape[0])
+        if k == 0:
+            return cp.empty((self._n_samples, 0), dtype=cp.float32, order="F")
+        if int(idx_dev.min()) < 0 or int(idx_dev.max()) >= self._n_variants:
+            raise ValueError("col_indices out of range for bitpacked subset.")
+        # Device-side gather of (k, bpv) packed bytes plus per-column stats.
+        sub_packed = cp.take(self._packed, idx_dev, axis=0)
+        sub_mean = cp.take(self._mean, idx_dev, axis=0)
+        sub_std = cp.take(self._std, idx_dev, axis=0)
+        # Decode LUT (256, 4) int8 — built host-side once then uploaded so the
+        # whole decode happens on the device.
+        lut_dev = cp.asarray(bp.make_decode_lut(count_a1=self._count_a1))
+        decoded = lut_dev[sub_packed]  # (k, bpv, 4) int8
+        decoded = decoded.reshape(k, -1)[:, : self._n_samples]  # (k, n_samples) int8
+        missing_mask = decoded == np.int8(-127)
+        # Standardize in fp32. Zero-scale columns get scale=1 to keep the
+        # division finite; their rows are then zeroed to honor the kernel
+        # contract that such variants contribute nothing.
+        zero_scale_mask = sub_std <= cp.float32(0.0)
+        safe_scale = cp.where(zero_scale_mask, cp.float32(1.0), sub_std)
+        z = (decoded.astype(cp.float32) - sub_mean[:, None]) / safe_scale[:, None]
+        z[missing_mask] = cp.float32(0.0)
+        if bool(cp.any(zero_scale_mask)):
+            z[zero_scale_mask, :] = cp.float32(0.0)
+        # Final NaN/Inf safety net — matches CPU reference behavior.
+        cp.nan_to_num(z, copy=False, nan=0.0, posinf=0.0, neginf=0.0)
+        # Transpose to (n_samples, k) Fortran-order so each variant column is
+        # contiguous in HBM — the layout the downstream cuBLAS syrk/Cholesky
+        # path expects when consuming ``_cupy_cache`` as a dense fp32 array.
+        return cp.asfortranarray(z.T)
+
     def matvec_numpy(self, x_np: NDArray) -> NDArray:
         cp = _cupy()
         x_dev = cp.asarray(x_np, dtype=cp.float32)
