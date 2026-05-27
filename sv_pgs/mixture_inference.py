@@ -7528,12 +7528,17 @@ def _solve_sample_space_rhs_gpu_inner(
     log(f"       GPU CG done: {iterations_used} iterations in {_timed_region_seconds(_cg_t0, cp):.1f}s  mem={mem()}")
     required_residual = residual_norm_sq[required_mask]
     required_threshold = convergence_threshold_sq[required_mask]
-    final_required_residual = float(np.max(required_residual)) if required_residual.size > 0 else 0.0
-    final_required_threshold = float(np.max(required_threshold)) if required_threshold.size > 0 else 0.0
-    if final_required_residual > final_required_threshold:
+    # Per-column convergence: max(res) > max(thr) can hide a failing
+    # small-norm column behind a different column with a huge threshold.
+    # Compare element-wise and report the worst-converged column.
+    failed_mask = required_residual > required_threshold
+    if bool(np.any(failed_mask)):
+        worst_idx = int(np.argmax(required_residual / np.maximum(required_threshold, 1e-300)))
         raise RuntimeError(
             "GPU conjugate-gradient solve failed to converge: "
-            + f"residual={final_required_residual:.2e} threshold={final_required_threshold:.2e} "
+            + f"{int(failed_mask.sum())}/{int(required_residual.size)} required RHS columns "
+            + f"did not converge; worst column residual={float(required_residual[worst_idx]):.2e} "
+            + f"threshold={float(required_threshold[worst_idx]):.2e} "
             + f"iterations={max_iterations}"
         )
     solution = cp.asarray(solution_gpu, dtype=cp.float64)
@@ -8236,12 +8241,14 @@ def _solve_sample_space_rhs_gpu_with_optional_workset_cache(
         final_threshold = float(np.max(convergence_threshold_sq))
         required_residual = residual_norm_sq[required_mask]
         required_threshold = convergence_threshold_sq[required_mask]
-        final_residual = float(np.max(required_residual)) if required_residual.size > 0 else 0.0
-        final_threshold = float(np.max(required_threshold)) if required_threshold.size > 0 else 0.0
-        if final_residual > final_threshold:
+        failed_mask = required_residual > required_threshold
+        if bool(np.any(failed_mask)):
+            worst_idx = int(np.argmax(required_residual / np.maximum(required_threshold, 1e-300)))
             raise RuntimeError(
                 "GPU conjugate-gradient solve failed to converge: "
-                + f"residual={final_residual:.2e} threshold={final_threshold:.2e} "
+                + f"{int(failed_mask.sum())}/{int(required_residual.size)} required RHS columns "
+                + f"did not converge; worst column residual={float(required_residual[worst_idx]):.2e} "
+                + f"threshold={float(required_threshold[worst_idx]):.2e} "
                 + f"iterations={max_iterations}"
             )
         solution = np.asarray(solution_gpu64.get() if hasattr(solution_gpu64, "get") else solution_gpu64, dtype=np.float64)
@@ -8328,9 +8335,11 @@ def _solve_sample_space_rhs_gpu_with_optional_workset_cache(
         _, residual_norm_sq = true_residual(solution_gpu64)
     required_residual = residual_norm_sq[required_mask]
     required_threshold = convergence_threshold_sq[required_mask]
-    final_residual = float(np.max(required_residual)) if required_residual.size > 0 else 0.0
-    final_threshold = float(np.max(required_threshold)) if required_threshold.size > 0 else 0.0
-    if final_residual > final_threshold:
+    failed_mask = required_residual > required_threshold
+    if bool(np.any(failed_mask)):
+        worst_idx = int(np.argmax(required_residual / np.maximum(required_threshold, 1e-300)))
+        final_residual = float(required_residual[worst_idx])
+        final_threshold = float(required_threshold[worst_idx])
         failure_suffix = (
             f" last_mixed_precision_error={mixed_precision_failure}"
             if mixed_precision_failure is not None
@@ -8550,12 +8559,14 @@ def _solve_sample_space_rhs_cpu(
     )
     required_residual = residual_norm_sq[required_mask]
     required_threshold = convergence_threshold_sq[required_mask]
-    final_residual = float(np.max(required_residual)) if required_residual.size > 0 else 0.0
-    final_threshold = float(np.max(required_threshold)) if required_threshold.size > 0 else 0.0
-    if final_residual > final_threshold:
+    failed_mask = required_residual > required_threshold
+    if bool(np.any(failed_mask)):
+        worst_idx = int(np.argmax(required_residual / np.maximum(required_threshold, 1e-300)))
         raise RuntimeError(
             "CPU conjugate-gradient solve failed to converge: "
-            + f"residual={final_residual:.2e} threshold={final_threshold:.2e} "
+            + f"{int(failed_mask.sum())}/{int(required_residual.size)} required RHS columns "
+            + f"did not converge; worst column residual={float(required_residual[worst_idx]):.2e} "
+            + f"threshold={float(required_threshold[worst_idx]):.2e} "
             + f"iterations={max_iterations}"
         )
     resolved_solution = solution[:, 0] if vector_input else solution
