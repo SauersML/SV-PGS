@@ -1002,17 +1002,6 @@ def _apply_binary_intercept_calibration(
 def _gpu_cholesky_solve(right_hand_side: Any, cholesky_factor_gpu: Any, solve_triangular_gpu: Callable[..., Any]) -> Any:
     import cupy as cp
 
-    # Force a fresh F-contiguous allocation rather than rely on
-    # ``cp.asfortranarray`` (which may return a view with degenerate
-    # strides on (n, 1) reshapes — that's the root cause of the
-    # cublasDtrsm "parameter 9 / LDA illegal" error: when rhs_gpu[:, None]
-    # is passed through asfortranarray, cupy keeps the C-stride (8, 8)
-    # because for a single-column matrix C and F layouts coincide in
-    # memory, but cublasDtrsm derives ldb from the *declared* F-stride
-    # — which is 1 element, less than max(1, m).
-    # ``arr.copy(order="F")`` always allocates fresh F-contig storage
-    # with strides = (elt_size, elt_size * m), giving ldb = m as cuBLAS
-    # expects.
     factor_gpu_in = cp.asarray(cholesky_factor_gpu)
     if factor_gpu_in.ndim != 2 or factor_gpu_in.shape[0] != factor_gpu_in.shape[1]:
         raise ValueError("GPU Cholesky solve requires a square factor.")
@@ -1024,7 +1013,18 @@ def _gpu_cholesky_solve(right_hand_side: Any, cholesky_factor_gpu: Any, solve_tr
         raise ValueError("GPU Cholesky solve expects a vector or matrix right-hand side.")
     if rhs_gpu_in.shape[0] != factor_gpu_in.shape[0]:
         raise ValueError("GPU Cholesky solve right-hand side has incompatible shape.")
-    # Fresh F-contig buffers with correct (m, m*elt_size) and (m, m*elt_size) strides.
+    # Empty-factor short-circuit: the stochastic binary block path in
+    # fit_variational_em deliberately passes covariate_matrix with
+    # shape (n, 0), producing a 0×0 GLS Cholesky and a (0, 1) rhs. cuBLAS
+    # dtrsm rejects this with "parameter 9 (LDA) illegal" because
+    # max(1, m=0) = 1 > lda=0. Return an empty solution that satisfies
+    # the caller's shape contract.
+    if factor_gpu_in.shape[0] == 0:
+        empty_solution = cp.empty((0, rhs_gpu_in.shape[1]), dtype=factor_gpu_in.dtype)
+        return empty_solution[:, 0] if rhs_was_vector else empty_solution
+    # Fresh F-contig buffers for cuBLAS dtrsm (asfortranarray may return
+    # a stride-degenerate view on (n, 1) shapes; .copy(order="F") always
+    # allocates a clean F layout).
     factor_gpu = factor_gpu_in.copy(order="F")
     rhs_gpu = rhs_gpu_in.copy(order="F")
     lower_solution = solve_triangular_gpu(factor_gpu, rhs_gpu, lower=True, check_finite=False)
@@ -9748,36 +9748,55 @@ def _solve_restricted_mean_only(
         covariate_matrix_gpu = cp.asarray(covariate_matrix, dtype=cp.float64)
         prior_variances_gpu = cp.asarray(prior_variances, dtype=cp.float64)
         inverse_covariance_targets_gpu = inverse_covariance_rhs_gpu[:, 0]
-        inverse_covariance_covariates_gpu = inverse_covariance_rhs_gpu[:, 1 : 1 + covariate_matrix.shape[1]]
-        gls_normal_matrix_gpu = covariate_matrix_gpu.T @ inverse_covariance_covariates_gpu
-        diagonal_index = np.arange(covariate_matrix.shape[1])
-        gls_normal_matrix_gpu[diagonal_index, diagonal_index] += 1e-8
-        gls_cholesky_gpu = cp.linalg.cholesky(gls_normal_matrix_gpu)
-        # Cupy's cholesky silently fills with NaN when the input is
-        # near-singular instead of raising. That NaN-factor then propagates
-        # into the downstream cublasDtrsm with degenerate strides. Guard
-        # by checking and re-conditioning with a stronger ridge once.
-        if not bool(cp.isfinite(gls_cholesky_gpu).all()):
-            log("GLS Cholesky non-finite; re-conditioning ridge 1e-4 and retrying.")
-            gls_normal_matrix_gpu[diagonal_index, diagonal_index] += 1e-4
+        covariate_count = int(covariate_matrix.shape[1])
+        # Zero-covariate guard: the stochastic binary block path in
+        # fit_variational_em passes covariate_matrix with shape (n, 0),
+        # so the GLS Cholesky would be 0x0 — dtrsm rejects that with
+        # "param 9 (LDA) illegal". Skip the GLS block entirely and use
+        # the unmodified CG residuals as the projected targets.
+        if covariate_count == 0:
+            alpha_gpu = cp.empty((0,), dtype=cp.float64)
+            projected_targets_gpu = inverse_covariance_targets_gpu
+            covariate_linear_predictor_gpu = cp.zeros_like(
+                inverse_covariance_targets_gpu, dtype=compute_cp_dtype
+            )
+        else:
+            inverse_covariance_covariates_gpu = inverse_covariance_rhs_gpu[
+                :, 1 : 1 + covariate_count
+            ]
+            gls_normal_matrix_gpu = (
+                covariate_matrix_gpu.T @ inverse_covariance_covariates_gpu
+            )
+            diagonal_index = np.arange(covariate_count)
+            gls_normal_matrix_gpu[diagonal_index, diagonal_index] += 1e-8
             gls_cholesky_gpu = cp.linalg.cholesky(gls_normal_matrix_gpu)
+            # Cupy's cholesky silently fills with NaN on near-singular input.
+            # Re-condition with progressively larger ridges if non-finite.
             if not bool(cp.isfinite(gls_cholesky_gpu).all()):
-                log("GLS Cholesky still non-finite after ridge 1e-4; trying 1e-2.")
-                gls_normal_matrix_gpu[diagonal_index, diagonal_index] += 1e-2
+                log("GLS Cholesky non-finite; re-conditioning ridge 1e-4 and retrying.")
+                gls_normal_matrix_gpu[diagonal_index, diagonal_index] += 1e-4
                 gls_cholesky_gpu = cp.linalg.cholesky(gls_normal_matrix_gpu)
-        alpha_gpu = _gpu_cholesky_solve(
-            covariate_matrix_gpu.T @ inverse_covariance_targets_gpu,
-            gls_cholesky_gpu,
-            cp_solve_triangular,
-        )
-        projected_targets_gpu = inverse_covariance_targets_gpu - inverse_covariance_covariates_gpu @ alpha_gpu
+                if not bool(cp.isfinite(gls_cholesky_gpu).all()):
+                    log("GLS Cholesky still non-finite after ridge 1e-4; trying 1e-2.")
+                    gls_normal_matrix_gpu[diagonal_index, diagonal_index] += 1e-2
+                    gls_cholesky_gpu = cp.linalg.cholesky(gls_normal_matrix_gpu)
+            alpha_gpu = _gpu_cholesky_solve(
+                covariate_matrix_gpu.T @ inverse_covariance_targets_gpu,
+                gls_cholesky_gpu,
+                cp_solve_triangular,
+            )
+            projected_targets_gpu = (
+                inverse_covariance_targets_gpu
+                - inverse_covariance_covariates_gpu @ alpha_gpu
+            )
+            covariate_linear_predictor_gpu = covariate_matrix_gpu @ alpha_gpu
         beta_gpu = prior_variances_gpu * genotype_matrix.gpu_transpose_matmat(
             projected_targets_gpu,
             batch_size=posterior_variance_batch_size,
             cupy=cp,
             dtype=compute_cp_dtype,
         )
-        linear_predictor_gpu = covariate_matrix_gpu @ alpha_gpu + genotype_matrix.gpu_matmat(
+        linear_predictor_gpu = covariate_linear_predictor_gpu + genotype_matrix.gpu_matmat(
             beta_gpu,
             batch_size=posterior_variance_batch_size,
             cupy=cp,
