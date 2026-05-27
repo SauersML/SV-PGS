@@ -3209,16 +3209,22 @@ def precache_vcfs_parallel(
         inc_stats_obj = VariantStatistics(means=means, scales=scales, allele_frequencies=afs, support_counts=support_arr)
 
         # Save as final .npy cache
-        _save_vcf_to_cache(vcf_path, inc_matrix, inc_variants, inc_stats_obj, config=config)
+        cache_save_ok = _save_vcf_to_cache(vcf_path, inc_matrix, inc_variants, inc_stats_obj, config=config)
         del inc_matrix
 
-        # Clean up incremental files
-        for p in (inc_geno, inc_stats, *region_variant_paths):
-            p.unlink(missing_ok=True)
-
-        # Clean up temp region files
-        shutil.rmtree(tmp_dir, ignore_errors=True)
-        log(f"  {vcf_path.name}: cached")
+        if cache_save_ok:
+            # Only clean up intermediates if the final bundle actually landed.
+            # If it failed (e.g. ENOSPC), keep region scratch so the next run
+            # can resume instead of starting over.
+            for p in (inc_geno, inc_stats, *region_variant_paths):
+                p.unlink(missing_ok=True)
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+            log(f"  {vcf_path.name}: cached")
+        else:
+            log(
+                f"  {vcf_path.name}: cache save FAILED — region scratch kept at "
+                f"{tmp_dir.name} so the next run can resume. Free disk and retry."
+            )
 def _load_vcf_with_cache(
     vcf_path: Path,
     config: ModelConfig,
@@ -3578,8 +3584,17 @@ def _save_vcf_to_cache(
     config: ModelConfig | None = None,
     *,
     cache_paths: _VcfCachePaths | None = None,
-) -> None:
-    """Persist parsed VCF results to disk cache."""
+) -> bool:
+    """Persist parsed VCF results to disk cache. Returns True on success, False on failure.
+
+    Returning False instead of swallowing silently is load-bearing for the
+    parallel precache path: the previous behavior masked an ENOSPC mid-run
+    so the caller logged "cached" for a file that never actually hit disk,
+    then the next chromosome's writable mmap turned the same disk-full
+    state into SIGBUS and killed the process before any chromosome bundle
+    finalized. With a real success signal the caller can fail loudly
+    instead of corrupting the cache state.
+    """
     if cache_paths is None:
         if config is None:
             raise ValueError("config is required when cache_paths is not provided.")
@@ -3645,9 +3660,11 @@ def _save_vcf_to_cache(
             + paths.manifest_path.stat().st_size
         ) / 1e6
         log(f"VCF cache saved ({total_mb:.1f} MB) → {paths.cache_dir.name}/{paths.key}.*")
+        return True
     except (OSError, ValueError) as exc:
         log(f"VCF cache save failed ({exc}), continuing without cache")
         _cleanup_stale_vcf_cache_temps(paths.cache_dir, paths.key)
+        return False
 
 
 _PLINK_METADATA_PROCESS_CACHE: dict[tuple[str, int, int, int, int, int, int], _PlinkMetadata] = {}
