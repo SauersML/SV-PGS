@@ -4756,7 +4756,9 @@ def _binary_posterior_state_tr_newton(
 
     # Dispatch: GPU-resident block -> GPU-native TR-Newton (no host round-trips
     # in the inner CG loop).  CPU-resident block -> NumPy solver.
-    _gpu_resident = genotype_matrix._cupy_cache is not None
+    # Recognize both the legacy _cupy_cache and the bitpacked post-active
+    # upgrade (raw._packed) as device-resident.
+    _gpu_resident = _genotype_has_device_resident_backend(genotype_matrix)
     _tr_newton_cupy = _try_import_cupy() if _gpu_resident else None
     try:
         if _gpu_resident and _tr_newton_cupy is not None:
@@ -6643,7 +6645,18 @@ def _sample_space_preconditioner(
         import cupy as cp
         cp_solve_triangular = _resolve_gpu_solve_triangular()
 
-        gpu_cache_source = "full" if genotype_matrix._cupy_cache is not None else "streaming"
+        gpu_cache_source = (
+            "full"
+            if getattr(genotype_matrix, "_cupy_cache", None) is not None
+            else (
+                "bitpacked"
+                if (
+                    getattr(genotype_matrix, "raw", None) is not None
+                    and getattr(genotype_matrix.raw, "_packed", None) is not None
+                )
+                else "streaming"
+            )
+        )
         effective_rank = int(low_rank_factor_gpu.shape[1])
         log(f"      sample-space preconditioner: GPU Nyström-Woodbury rank={effective_rank} source={gpu_cache_source}")
         compute_cp_dtype = _cupy_compute_dtype(cp)
@@ -6747,7 +6760,18 @@ def _sample_space_gpu_preconditioner(
     if low_rank_factor_gpu is None:
         return apply_diagonal
 
-    gpu_cache_source = "full" if genotype_matrix._cupy_cache is not None else "streaming"
+    gpu_cache_source = (
+        "full"
+        if getattr(genotype_matrix, "_cupy_cache", None) is not None
+        else (
+            "bitpacked"
+            if (
+                getattr(genotype_matrix, "raw", None) is not None
+                and getattr(genotype_matrix.raw, "_packed", None) is not None
+            )
+            else "streaming"
+        )
+    )
     effective_rank = int(low_rank_factor_gpu.shape[1])
     log(f"      sample-space preconditioner: GPU Nyström-Woodbury rank={effective_rank} source={gpu_cache_source}")
     compute_bundle = _build_sample_space_low_rank_bundle_gpu(
@@ -6882,7 +6906,18 @@ def _sample_space_gpu_preconditioner_from_factor(
     diagonal_preconditioner = np.asarray(diagonal_preconditioner, dtype=np.float64)
     diagonal_preconditioner_gpu = cp.asarray(diagonal_preconditioner, dtype=compute_cp_dtype)
 
-    gpu_cache_source = "full" if genotype_matrix._cupy_cache is not None else "streaming"
+    gpu_cache_source = (
+        "full"
+        if getattr(genotype_matrix, "_cupy_cache", None) is not None
+        else (
+            "bitpacked"
+            if (
+                getattr(genotype_matrix, "raw", None) is not None
+                and getattr(genotype_matrix.raw, "_packed", None) is not None
+            )
+            else "streaming"
+        )
+    )
     effective_rank = int(nystrom_factor_gpu.shape[1])
     log(f"      sample-space preconditioner: GPU Nyström-Woodbury rank={effective_rank} source={gpu_cache_source} (factor reused)")
     compute_bundle = _build_sample_space_low_rank_bundle_gpu(
@@ -6996,7 +7031,18 @@ def _sample_space_gpu_preconditioner_with_factor(
     if low_rank_factor_gpu is None:
         return apply_diagonal, None, basis_gpu
 
-    gpu_cache_source = "full" if genotype_matrix._cupy_cache is not None else "streaming"
+    gpu_cache_source = (
+        "full"
+        if getattr(genotype_matrix, "_cupy_cache", None) is not None
+        else (
+            "bitpacked"
+            if (
+                getattr(genotype_matrix, "raw", None) is not None
+                and getattr(genotype_matrix.raw, "_packed", None) is not None
+            )
+            else "streaming"
+        )
+    )
     effective_rank = int(low_rank_factor_gpu.shape[1])
     log(f"      sample-space preconditioner: GPU Nyström-Woodbury rank={effective_rank} source={gpu_cache_source}")
     compute_bundle = _build_sample_space_low_rank_bundle_gpu(
