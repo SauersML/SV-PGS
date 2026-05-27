@@ -6003,6 +6003,24 @@ class StandardizedGenotypeMatrix:
             shape_error="coefficient vector must match genotype column count.",
             finite_name="coefficient vector",
         )
+        # Bitpacked-device fast path: when the raw matrix is a packed device
+        # matrix (post-active bitpacked upgrade, see
+        # ``sv_pgs.model._try_upgrade_reduced_to_bitpacked``) the inner CG
+        # / TR-Newton / sample-space solvers dispatch every Hessian-vector
+        # product through here. Routing through the bitpacked matvec avoids
+        # the streaming int8 -> fp16 standardize-per-variant path and runs
+        # entirely on-device against the packed buffer. The bitpacked matvec
+        # already standardizes via the side-buffer mean/scale arrays, so the
+        # contract matches StandardizedGenotypeMatrix.matvec_numpy exactly.
+        # ``variant_indices`` on the wrapper SGM is arange(k_active), so the
+        # local-indices subset is identity — pass the full coeff vector.
+        raw = getattr(self, "raw", None)
+        if raw is not None and getattr(raw, "_packed", None) is not None:
+            try:
+                result = raw.matvec_numpy(coeff_np)
+                return np.asarray(result, dtype=coeff_np.dtype)
+            except Exception:  # noqa: BLE001 - fall back rather than abort fit
+                pass
         active_local_indices = _active_vector_local_indices(coeff_np)
         if active_local_indices.size == 0:
             return np.zeros(self.shape[0], dtype=coeff_np.dtype)
@@ -6182,6 +6200,15 @@ class StandardizedGenotypeMatrix:
         )
         if not np.any(v_np):
             return np.zeros(self.shape[1], dtype=v_np.dtype)
+        # Bitpacked-device fast path mirror of matvec_numpy: route through the
+        # packed device rmatvec when raw is BitpackedDeviceMatrix.
+        raw = getattr(self, "raw", None)
+        if raw is not None and getattr(raw, "_packed", None) is not None:
+            try:
+                result = raw.rmatvec_numpy(v_np)
+                return np.asarray(result, dtype=v_np.dtype)
+            except Exception:  # noqa: BLE001 - fall back rather than abort fit
+                pass
         if self._cupy_cache is not None:
             cupy = _try_import_cupy()
             if cupy is None:
