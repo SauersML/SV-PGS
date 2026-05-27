@@ -1067,10 +1067,27 @@ _OMOP_ONE_HOT_PREFIXES = (
 def _expand_one_hot_covariates(
     covariates: list[str], sample_table_path: Path
 ) -> list[str]:
+    """Expand one-hot OMOP prefixes against the sample table header.
+
+    For each prefix in `_OMOP_ONE_HOT_PREFIXES` that is not already a literal
+    column, all matching `<prefix>_<concept_id>` columns are collected. To
+    avoid the dummy-variable trap (sum of dummies == 1 per row, which makes
+    the covariate matrix rank-deficient against the implicit intercept),
+    we drop exactly one *reference* category per group: the one with the
+    LARGEST observed population frequency (the natural majority reference).
+
+    If the sample-table read fails for any reason, we fall back to a
+    deterministic stand-in: the median element by name-sort. The dropped
+    column is logged.
+    """
     with sample_table_path.open("r", encoding="utf-8") as handle:
         header = handle.readline().rstrip("\n").split("\t")
     header_set = set(header)
-    expanded: list[str] = []
+
+    # Identify which prefixes will need one-hot expansion (and thus a
+    # reference-category drop). We only read the relevant columns from the
+    # sample table once, to compute population frequencies cheaply.
+    prefix_to_matches: dict[str, list[str]] = {}
     for name in covariates:
         if name in _OMOP_ONE_HOT_PREFIXES and name not in header_set:
             matches = [
@@ -1082,7 +1099,57 @@ def _expand_one_hot_covariates(
                     f"covariate {name!r} is missing from {sample_table_path} "
                     "and no one-hot expansion columns were found"
                 )
-            expanded.extend(matches)
+            prefix_to_matches[name] = matches
+
+    # Determine the reference column to drop per prefix.
+    prefix_to_drop: dict[str, str] = {}
+    if prefix_to_matches:
+        all_one_hot_cols = sorted({c for cols in prefix_to_matches.values() for c in cols})
+        freq_by_col: dict[str, float] = {}
+        try:
+            df = pd.read_csv(
+                sample_table_path,
+                sep="\t",
+                usecols=all_one_hot_cols,
+                dtype="float64",
+            )
+            for col in all_one_hot_cols:
+                # Population frequency = mean of {0,1} indicator (NaN-safe).
+                freq_by_col[col] = float(np.nanmean(df[col].to_numpy()))
+        except Exception as exc:  # pragma: no cover - defensive fallback
+            log(
+                f"  dummy-trap fix: failed to read frequencies "
+                f"({type(exc).__name__}: {exc}); falling back to median-by-name"
+            )
+            freq_by_col = {}
+
+        for prefix, matches in prefix_to_matches.items():
+            if freq_by_col:
+                # Drop the largest-frequency (majority) reference. Tie-break
+                # deterministically on column name to keep output stable.
+                drop = max(matches, key=lambda c: (freq_by_col.get(c, 0.0), c))
+            else:
+                # Deterministic stand-in: median position in name-sorted order.
+                sorted_matches = sorted(matches)
+                drop = sorted_matches[len(sorted_matches) // 2]
+            prefix_to_drop[prefix] = drop
+
+        # Single combined log line as specified in the task.
+        drop_msgs = []
+        for prefix in ("gender_concept_id", "race_concept_id", "ethnicity_concept_id"):
+            if prefix in prefix_to_drop:
+                short = prefix.split("_concept_id", 1)[0]
+                drop_msgs.append(f"{short} -> dropped reference {prefix_to_drop[prefix]!r}")
+        if drop_msgs:
+            log("  dummy-trap fix: " + "; ".join(drop_msgs))
+
+    expanded: list[str] = []
+    for name in covariates:
+        if name in prefix_to_matches:
+            drop = prefix_to_drop.get(name)
+            for col in prefix_to_matches[name]:
+                if col != drop:
+                    expanded.append(col)
         else:
             expanded.append(name)
     return expanded
