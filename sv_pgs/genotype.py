@@ -1713,9 +1713,15 @@ def _pinned_int8_host_buffer(
 
     Returns ``(buffer_a, buffer_b, pinned_memory_owner)``; each buffer is shaped
     ``(sample_count, max_tile_variants)``. The two buffers share a single
-    ``cupy.cuda.alloc_pinned_memory`` allocation so they live as long as the
-    returned owner reference. Raises ``MemoryError``/``RuntimeError`` loudly if
-    the CUDA driver cannot pin host memory — there is no silent fallback.
+    pinned-memory allocation drawn from the process-wide pinned buffer pool
+    (see ``sv_pgs.bitpacked_loader._PinnedBufferPool``) so they live as long
+    as the returned owner reference. Pass the owner to
+    ``_release_pinned_int8_host_buffer`` once the upload streams have
+    synchronized to return it to the pool — the next upload pass will
+    reuse the pin instead of round-tripping cudaHostAlloc/cudaFreeHost.
+
+    Raises ``MemoryError``/``RuntimeError`` loudly if the CUDA driver cannot
+    pin host memory — there is no silent fallback.
     """
     if int(sample_count) <= 0 or int(max_tile_variants) <= 0:
         raise ValueError(
@@ -1725,11 +1731,29 @@ def _pinned_int8_host_buffer(
     slot_shape = (int(sample_count), int(max_tile_variants))
     slot_element_count = slot_shape[0] * slot_shape[1]
     total_nbytes = slot_element_count * 2 * np.dtype(np.int8).itemsize
-    pinned_memory = cupy.cuda.alloc_pinned_memory(total_nbytes)
+    # Acquire through the shared pool; reinterpret the uint8 backing buffer
+    # as int8 since the caller fills/uses the slots as int8.
+    from sv_pgs.bitpacked_loader import _allocate_pinned as _acquire_pinned
+
+    pinned_memory, _u8_view = _acquire_pinned(cupy, total_nbytes)
     flat_view = np.frombuffer(pinned_memory, dtype=np.int8, count=slot_element_count * 2)
     buffer_a = flat_view[:slot_element_count].reshape(slot_shape)
     buffer_b = flat_view[slot_element_count:].reshape(slot_shape)
     return buffer_a, buffer_b, pinned_memory
+
+
+def _release_pinned_int8_host_buffer(pinned_memory: Any) -> None:
+    """Return a pinned int8 host buffer to the process-wide pool.
+
+    Safe with ``None`` (no-op) and on double-release. Callers should invoke
+    after every in-flight upload event has synchronized so the host buffer
+    is not referenced by any pending DMA.
+    """
+    if pinned_memory is None:
+        return
+    from sv_pgs.bitpacked_loader import _release_pinned
+
+    _release_pinned(pinned_memory)
 
 
 def _upload_standardized_int8_tiles_overlapped(
@@ -1793,6 +1817,11 @@ def _upload_standardized_int8_tiles_overlapped(
     for in_flight_event in in_flight_events:
         if in_flight_event is not None:
             in_flight_event.synchronize()
+    # All H2D events have completed; return the pinned int8 host buffer
+    # to the process-wide pool so the next upload (SNP+SV path, or the
+    # next disease in the same process) reuses the pin instead of
+    # round-tripping cudaHostAlloc/cudaFreeHost.
+    _release_pinned_int8_host_buffer(_pinned_owner)
 
 
 def _try_upload_int8_parallel_memmap(
@@ -1844,7 +1873,13 @@ def _try_upload_int8_parallel_memmap(
 
     total_bytes = int(sample_count) * n_variants
     try:
-        pinned_owner = cupy.cuda.alloc_pinned_memory(total_bytes)
+        # Go through the process-wide pinned pool so the next call with
+        # a same-size request reuses this allocation rather than re-
+        # pinning. ``alloc_pinned_memory`` itself is what we want to
+        # avoid hammering on every disease iteration.
+        from sv_pgs.bitpacked_loader import _allocate_pinned as _acquire_pinned
+
+        pinned_owner, _u8_view = _acquire_pinned(cupy, total_bytes)
     except (MemoryError, RuntimeError) as exc:
         log(f"    parallel-pread upload: pinned alloc failed ({exc}); falling back")
         return False
@@ -1943,6 +1978,9 @@ def _try_upload_int8_parallel_memmap(
     for event in events:
         if event is not None:
             event.synchronize()
+    # All async H2D copies have landed — return the pinned staging buffer
+    # to the pool for reuse by the next parallel-pread upload pass.
+    _release_pinned_int8_host_buffer(pinned_owner)
     return True
 
 
@@ -1996,6 +2034,9 @@ def _upload_int8_tiles_overlapped(
     for in_flight_event in in_flight_events:
         if in_flight_event is not None:
             in_flight_event.synchronize()
+    # All H2D events have completed; return the pinned int8 host buffer
+    # to the process-wide pool for reuse by the next upload pass.
+    _release_pinned_int8_host_buffer(_pinned_owner)
 
 
 _gpu_verified = False
@@ -2052,6 +2093,34 @@ def require_gpu() -> Any:
             f"({held_bytes / 1e9:.1f} GB held by other processes). "
             f"Run `nvidia-smi` and kill stale GPU processes to avoid OOM / slow streaming fallbacks."
         )
+    # Report CuPy default mempool limit + the process-wide pinned buffer
+    # pool state at startup. The mempool limit governs HBM fragmentation
+    # behaviour for the bitpacked / dense paths; the pinned pool stat
+    # makes it observable whether subsequent loads are hitting reuse
+    # (n_reuses > 0) or paying the full pin cost each time.
+    try:
+        pool = cupy.get_default_memory_pool()
+        get_limit = getattr(pool, "get_limit", None)
+        limit_bytes = int(get_limit()) if get_limit is not None else 0
+        if limit_bytes <= 0:
+            limit_repr = "unbounded"
+        else:
+            limit_repr = f"{limit_bytes / 1e9:.2f} GB"
+        try:
+            from sv_pgs.bitpacked_loader import _pinned_pool
+
+            ps = _pinned_pool().stats()
+            pinned_repr = (
+                f"pinned-pool[allocs={ps['allocs']} reuses={ps['reuses']} "
+                f"avail={ps['available_count']}@{ps['available_bytes'] / 1e9:.2f}GB]"
+            )
+        except (ImportError, RuntimeError, AttributeError):
+            pinned_repr = "pinned-pool[unavailable]"
+        log(f"  GPU mempool limit={limit_repr}  {pinned_repr}")
+    except (AttributeError, RuntimeError, OSError):
+        # Logging is best-effort; never let a probe failure take down
+        # require_gpu().
+        pass
     _gpu_verified = True
     return cupy
 
