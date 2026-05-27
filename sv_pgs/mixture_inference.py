@@ -9683,13 +9683,24 @@ def _solve_restricted_mean_only(
         variant_count=variant_count,
         requested_rank=sample_space_preconditioner_rank,
     )
-    sample_space_gpu_enabled = genotype_matrix._cupy_cache is not None or (
-        genotype_matrix.raw is not None
-        and not genotype_matrix.supports_jax_dense_ops()
-        and _try_import_cupy() is not None
+    sample_space_gpu_enabled = (
+        _genotype_has_device_resident_backend(genotype_matrix)
+        or (
+            genotype_matrix.raw is not None
+            and not genotype_matrix.supports_jax_dense_ops()
+            and _try_import_cupy() is not None
+        )
     )
     if sample_space_gpu_enabled:
-        gpu_source = "full-cache" if genotype_matrix._cupy_cache is not None else "streaming"
+        if getattr(genotype_matrix, "_cupy_cache", None) is not None:
+            gpu_source = "full-cache"
+        elif (
+            getattr(genotype_matrix, "raw", None) is not None
+            and getattr(genotype_matrix.raw, "_packed", None) is not None
+        ):
+            gpu_source = "bitpacked-device"
+        else:
+            gpu_source = "streaming"
         timing_cupy = _try_import_cupy()
         log(
             "    restricted mean: GPU block-CG sample-space solve "
@@ -10577,13 +10588,24 @@ def _solve_restricted_full(
         variant_count=variant_count,
         requested_rank=sample_space_preconditioner_rank,
     )
-    sample_space_gpu_enabled = genotype_matrix._cupy_cache is not None or (
-        genotype_matrix.raw is not None
-        and not genotype_matrix.supports_jax_dense_ops()
-        and _try_import_cupy() is not None
+    sample_space_gpu_enabled = (
+        _genotype_has_device_resident_backend(genotype_matrix)
+        or (
+            genotype_matrix.raw is not None
+            and not genotype_matrix.supports_jax_dense_ops()
+            and _try_import_cupy() is not None
+        )
     )
     if sample_space_gpu_enabled:
-        gpu_source = "full-cache" if genotype_matrix._cupy_cache is not None else "streaming"
+        if getattr(genotype_matrix, "_cupy_cache", None) is not None:
+            gpu_source = "full-cache"
+        elif (
+            getattr(genotype_matrix, "raw", None) is not None
+            and getattr(genotype_matrix.raw, "_packed", None) is not None
+        ):
+            gpu_source = "bitpacked-device"
+        else:
+            gpu_source = "streaming"
         timing_cupy = _try_import_cupy()
         log(
             "    restricted posterior: GPU block-CG sample-space solve "
