@@ -1263,6 +1263,50 @@ def _genotype_has_device_resident_backend(
     return False
 
 
+_BITPACKED_HVP_FP32_LOGGED = False
+
+
+def _log_bitpacked_hvp_fp32_once() -> None:
+    """Log once per process that the bitpacked HVP branch is fp32.
+
+    The bitpacked sample-space operator uses the device gemv_nt / gemv_tn
+    kernels which are fp32-only. CG / TR-Newton residual norms cannot drop
+    below ~sqrt(eps_fp32) ≈ 3e-4 on this branch. We log once so the user can
+    set ``solver_tolerance`` appropriately and so a surprising tolerance floor
+    isn't misread as a convergence bug.
+    """
+    global _BITPACKED_HVP_FP32_LOGGED
+    if _BITPACKED_HVP_FP32_LOGGED:
+        return
+    _BITPACKED_HVP_FP32_LOGGED = True
+    try:
+        from sv_pgs.progress import log as _progress_log
+        _progress_log(
+            "      bitpacked HVP active: sample-space operator is fp32 "
+            "(CG noise floor ~3e-4; solver_tolerance below that won't converge)."
+        )
+    except Exception:  # noqa: BLE001 - logging is best-effort
+        pass
+
+
+def _sgm_gpu_source_label(genotype_matrix: StandardizedGenotypeMatrix, *, style: str = "long") -> str:
+    """Return the source label used in GPU-solver log lines.
+
+    Centralizes the duplicated 9-line ternary that was scattered across
+    six call sites (sample-space preconditioner build / restricted mean /
+    restricted posterior, in both pre-active and active solver paths).
+
+    ``style="long"``  → ``full-cache``  / ``bitpacked-device`` / ``streaming``
+    ``style="short"`` → ``full``        / ``bitpacked``        / ``streaming``
+    """
+    if getattr(genotype_matrix, "_cupy_cache", None) is not None:
+        return "full-cache" if style == "long" else "full"
+    raw = getattr(genotype_matrix, "raw", None)
+    if raw is not None and getattr(raw, "_packed", None) is not None:
+        return "bitpacked-device" if style == "long" else "bitpacked"
+    return "streaming"
+
+
 def _should_use_stochastic_variational_updates(
     genotype_matrix: StandardizedGenotypeMatrix,
     config: ModelConfig,
@@ -6645,18 +6689,7 @@ def _sample_space_preconditioner(
         import cupy as cp
         cp_solve_triangular = _resolve_gpu_solve_triangular()
 
-        gpu_cache_source = (
-            "full"
-            if getattr(genotype_matrix, "_cupy_cache", None) is not None
-            else (
-                "bitpacked"
-                if (
-                    getattr(genotype_matrix, "raw", None) is not None
-                    and getattr(genotype_matrix.raw, "_packed", None) is not None
-                )
-                else "streaming"
-            )
-        )
+        gpu_cache_source = _sgm_gpu_source_label(genotype_matrix, style="short")
         effective_rank = int(low_rank_factor_gpu.shape[1])
         log(f"      sample-space preconditioner: GPU Nyström-Woodbury rank={effective_rank} source={gpu_cache_source}")
         compute_cp_dtype = _cupy_compute_dtype(cp)
@@ -6760,18 +6793,7 @@ def _sample_space_gpu_preconditioner(
     if low_rank_factor_gpu is None:
         return apply_diagonal
 
-    gpu_cache_source = (
-        "full"
-        if getattr(genotype_matrix, "_cupy_cache", None) is not None
-        else (
-            "bitpacked"
-            if (
-                getattr(genotype_matrix, "raw", None) is not None
-                and getattr(genotype_matrix.raw, "_packed", None) is not None
-            )
-            else "streaming"
-        )
-    )
+    gpu_cache_source = _sgm_gpu_source_label(genotype_matrix, style="short")
     effective_rank = int(low_rank_factor_gpu.shape[1])
     log(f"      sample-space preconditioner: GPU Nyström-Woodbury rank={effective_rank} source={gpu_cache_source}")
     compute_bundle = _build_sample_space_low_rank_bundle_gpu(
@@ -6906,18 +6928,7 @@ def _sample_space_gpu_preconditioner_from_factor(
     diagonal_preconditioner = np.asarray(diagonal_preconditioner, dtype=np.float64)
     diagonal_preconditioner_gpu = cp.asarray(diagonal_preconditioner, dtype=compute_cp_dtype)
 
-    gpu_cache_source = (
-        "full"
-        if getattr(genotype_matrix, "_cupy_cache", None) is not None
-        else (
-            "bitpacked"
-            if (
-                getattr(genotype_matrix, "raw", None) is not None
-                and getattr(genotype_matrix.raw, "_packed", None) is not None
-            )
-            else "streaming"
-        )
-    )
+    gpu_cache_source = _sgm_gpu_source_label(genotype_matrix, style="short")
     effective_rank = int(nystrom_factor_gpu.shape[1])
     log(f"      sample-space preconditioner: GPU Nyström-Woodbury rank={effective_rank} source={gpu_cache_source} (factor reused)")
     compute_bundle = _build_sample_space_low_rank_bundle_gpu(
@@ -7031,18 +7042,7 @@ def _sample_space_gpu_preconditioner_with_factor(
     if low_rank_factor_gpu is None:
         return apply_diagonal, None, basis_gpu
 
-    gpu_cache_source = (
-        "full"
-        if getattr(genotype_matrix, "_cupy_cache", None) is not None
-        else (
-            "bitpacked"
-            if (
-                getattr(genotype_matrix, "raw", None) is not None
-                and getattr(genotype_matrix.raw, "_packed", None) is not None
-            )
-            else "streaming"
-        )
-    )
+    gpu_cache_source = _sgm_gpu_source_label(genotype_matrix, style="short")
     effective_rank = int(low_rank_factor_gpu.shape[1])
     log(f"      sample-space preconditioner: GPU Nyström-Woodbury rank={effective_rank} source={gpu_cache_source}")
     compute_bundle = _build_sample_space_low_rank_bundle_gpu(
@@ -7261,9 +7261,14 @@ def _apply_sample_space_operator_gpu(
         == int(getattr(_raw_for_packed, "n_variants", -1))
     )
     if _packed_resident:
-        # bitpacked matvec/rmatvec return float32 device arrays. Cast prior
-        # variances to match; result_gpu may be fp64 if caller demanded —
-        # accumulate at the requested dtype.
+        # bitpacked gemv kernels are fp32-only by construction (the device-side
+        # gemv_nt / gemv_tn cores in sv_pgs.bitpacked_matrix take float32 buffers).
+        # The host-roundtrip ``matmat`` is *also* fp32 and pays a device→host→device
+        # copy per call, so the per-column device loop here is the fastest
+        # available path even when the caller requested fp64. CG tolerance below
+        # sqrt(eps_fp32) ≈ 3e-4 cannot be reached on this branch — that's a
+        # solver-tolerance concern, not a correctness bug.
+        _log_bitpacked_hvp_fp32_once()
         prior32 = cp.asarray(prior_variances_gpu, dtype=cp.float32)
         for col in range(int(input_gpu.shape[1])):
             input_col_f32 = cp.asarray(input_gpu[:, col], dtype=cp.float32)
@@ -9738,15 +9743,7 @@ def _solve_restricted_mean_only(
         )
     )
     if sample_space_gpu_enabled:
-        if getattr(genotype_matrix, "_cupy_cache", None) is not None:
-            gpu_source = "full-cache"
-        elif (
-            getattr(genotype_matrix, "raw", None) is not None
-            and getattr(genotype_matrix.raw, "_packed", None) is not None
-        ):
-            gpu_source = "bitpacked-device"
-        else:
-            gpu_source = "streaming"
+        gpu_source = _sgm_gpu_source_label(genotype_matrix)
         timing_cupy = _try_import_cupy()
         log(
             "    restricted mean: GPU block-CG sample-space solve "
@@ -10643,15 +10640,7 @@ def _solve_restricted_full(
         )
     )
     if sample_space_gpu_enabled:
-        if getattr(genotype_matrix, "_cupy_cache", None) is not None:
-            gpu_source = "full-cache"
-        elif (
-            getattr(genotype_matrix, "raw", None) is not None
-            and getattr(genotype_matrix.raw, "_packed", None) is not None
-        ):
-            gpu_source = "bitpacked-device"
-        else:
-            gpu_source = "streaming"
+        gpu_source = _sgm_gpu_source_label(genotype_matrix)
         timing_cupy = _try_import_cupy()
         log(
             "    restricted posterior: GPU block-CG sample-space solve "
