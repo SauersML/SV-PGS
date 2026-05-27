@@ -1002,48 +1002,39 @@ def _apply_binary_intercept_calibration(
 def _gpu_cholesky_solve(right_hand_side: Any, cholesky_factor_gpu: Any, solve_triangular_gpu: Callable[..., Any]) -> Any:
     import cupy as cp
 
-    factor_gpu = cp.asarray(cholesky_factor_gpu)
-    if factor_gpu.ndim != 2 or factor_gpu.shape[0] != factor_gpu.shape[1]:
+    # Force a fresh F-contiguous allocation rather than rely on
+    # ``cp.asfortranarray`` (which may return a view with degenerate
+    # strides on (n, 1) reshapes — that's the root cause of the
+    # cublasDtrsm "parameter 9 / LDA illegal" error: when rhs_gpu[:, None]
+    # is passed through asfortranarray, cupy keeps the C-stride (8, 8)
+    # because for a single-column matrix C and F layouts coincide in
+    # memory, but cublasDtrsm derives ldb from the *declared* F-stride
+    # — which is 1 element, less than max(1, m).
+    # ``arr.copy(order="F")`` always allocates fresh F-contig storage
+    # with strides = (elt_size, elt_size * m), giving ldb = m as cuBLAS
+    # expects.
+    factor_gpu_in = cp.asarray(cholesky_factor_gpu)
+    if factor_gpu_in.ndim != 2 or factor_gpu_in.shape[0] != factor_gpu_in.shape[1]:
         raise ValueError("GPU Cholesky solve requires a square factor.")
-    rhs_gpu = cp.asarray(right_hand_side, dtype=factor_gpu.dtype)
-    rhs_was_vector = rhs_gpu.ndim == 1
+    rhs_gpu_in = cp.asarray(right_hand_side, dtype=factor_gpu_in.dtype)
+    rhs_was_vector = rhs_gpu_in.ndim == 1
     if rhs_was_vector:
-        rhs_gpu = rhs_gpu[:, None]
-    if rhs_gpu.ndim != 2:
+        rhs_gpu_in = rhs_gpu_in[:, None]
+    if rhs_gpu_in.ndim != 2:
         raise ValueError("GPU Cholesky solve expects a vector or matrix right-hand side.")
-    if rhs_gpu.shape[0] != factor_gpu.shape[0]:
+    if rhs_gpu_in.shape[0] != factor_gpu_in.shape[0]:
         raise ValueError("GPU Cholesky solve right-hand side has incompatible shape.")
-    if hasattr(cp, "asfortranarray"):
-        factor_gpu = cp.asfortranarray(factor_gpu)
-        rhs_gpu = cp.asfortranarray(rhs_gpu)
-    try:
-        lower_solution = solve_triangular_gpu(factor_gpu, rhs_gpu, lower=True, check_finite=False)
-        solution = solve_triangular_gpu(
-            factor_gpu,
-            lower_solution,
-            lower=True,
-            trans="T",
-            check_finite=False,
-        )
-    except Exception as exc:  # noqa: BLE001 - cuBLAS edge cases
-        # CUBLAS_STATUS_INVALID_VALUE observed on certain cupy + A100
-        # combinations where dtrsm rejects LDA even on canonical fortran
-        # arrays. The GLS Cholesky here is tiny (≈n_covariates square,
-        # ~36×36 on AoU), so the CPU fallback is microseconds and avoids
-        # the brittle cuBLAS code path entirely.
-        try:
-            import scipy.linalg as _sla
-        except ImportError as _import_exc:  # pragma: no cover
-            raise exc from _import_exc
-        factor_host = cp.asnumpy(factor_gpu)
-        rhs_host = cp.asnumpy(rhs_gpu)
-        lower_host = _sla.solve_triangular(
-            factor_host, rhs_host, lower=True, check_finite=False,
-        )
-        solution_host = _sla.solve_triangular(
-            factor_host, lower_host, lower=True, trans="T", check_finite=False,
-        )
-        solution = cp.asarray(solution_host, dtype=factor_gpu.dtype)
+    # Fresh F-contig buffers with correct (m, m*elt_size) and (m, m*elt_size) strides.
+    factor_gpu = factor_gpu_in.copy(order="F")
+    rhs_gpu = rhs_gpu_in.copy(order="F")
+    lower_solution = solve_triangular_gpu(factor_gpu, rhs_gpu, lower=True, check_finite=False)
+    solution = solve_triangular_gpu(
+        factor_gpu,
+        lower_solution,
+        lower=True,
+        trans="T",
+        check_finite=False,
+    )
     return solution[:, 0] if rhs_was_vector else solution
 
 
@@ -9762,6 +9753,18 @@ def _solve_restricted_mean_only(
         diagonal_index = np.arange(covariate_matrix.shape[1])
         gls_normal_matrix_gpu[diagonal_index, diagonal_index] += 1e-8
         gls_cholesky_gpu = cp.linalg.cholesky(gls_normal_matrix_gpu)
+        # Cupy's cholesky silently fills with NaN when the input is
+        # near-singular instead of raising. That NaN-factor then propagates
+        # into the downstream cublasDtrsm with degenerate strides. Guard
+        # by checking and re-conditioning with a stronger ridge once.
+        if not bool(cp.isfinite(gls_cholesky_gpu).all()):
+            log("GLS Cholesky non-finite; re-conditioning ridge 1e-4 and retrying.")
+            gls_normal_matrix_gpu[diagonal_index, diagonal_index] += 1e-4
+            gls_cholesky_gpu = cp.linalg.cholesky(gls_normal_matrix_gpu)
+            if not bool(cp.isfinite(gls_cholesky_gpu).all()):
+                log("GLS Cholesky still non-finite after ridge 1e-4; trying 1e-2.")
+                gls_normal_matrix_gpu[diagonal_index, diagonal_index] += 1e-2
+                gls_cholesky_gpu = cp.linalg.cholesky(gls_normal_matrix_gpu)
         alpha_gpu = _gpu_cholesky_solve(
             covariate_matrix_gpu.T @ inverse_covariance_targets_gpu,
             gls_cholesky_gpu,
@@ -10764,6 +10767,18 @@ def _solve_restricted_full(
         diagonal_index = np.arange(covariate_matrix.shape[1])
         gls_normal_matrix_gpu[diagonal_index, diagonal_index] += 1e-8
         gls_cholesky_gpu = cp.linalg.cholesky(gls_normal_matrix_gpu)
+        # Cupy's cholesky silently fills with NaN when the input is
+        # near-singular instead of raising. That NaN-factor then propagates
+        # into the downstream cublasDtrsm with degenerate strides. Guard
+        # by checking and re-conditioning with a stronger ridge once.
+        if not bool(cp.isfinite(gls_cholesky_gpu).all()):
+            log("GLS Cholesky non-finite; re-conditioning ridge 1e-4 and retrying.")
+            gls_normal_matrix_gpu[diagonal_index, diagonal_index] += 1e-4
+            gls_cholesky_gpu = cp.linalg.cholesky(gls_normal_matrix_gpu)
+            if not bool(cp.isfinite(gls_cholesky_gpu).all()):
+                log("GLS Cholesky still non-finite after ridge 1e-4; trying 1e-2.")
+                gls_normal_matrix_gpu[diagonal_index, diagonal_index] += 1e-2
+                gls_cholesky_gpu = cp.linalg.cholesky(gls_normal_matrix_gpu)
         alpha_gpu = _gpu_cholesky_solve(
             covariate_matrix_gpu.T @ inverse_covariance_targets_gpu,
             gls_cholesky_gpu,
