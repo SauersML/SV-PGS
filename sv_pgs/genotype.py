@@ -1583,7 +1583,7 @@ def _release_host_caches(
     if cupy is not None:
         try:
             pinned_pool = cupy.get_default_pinned_memory_pool()
-        except (AttributeError, _cupy_runtime_error_classes(cupy)):
+        except (AttributeError, *_cupy_runtime_error_classes(cupy)):
             pinned_pool = None
         if pinned_pool is not None:
             try:

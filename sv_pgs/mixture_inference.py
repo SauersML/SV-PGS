@@ -9380,6 +9380,28 @@ def _solve_restricted_exact_variant_space(
             + f"{'fp32' if is_mixed_precision else 'fp64'})...  mem={mem()}"
         )
         variant_precision_cholesky_gpu = cp.linalg.cholesky(variant_precision_gpu)
+        # CuPy's cholesky silently fills with NaN when the input is
+        # near-singular instead of raising — the same pathology already
+        # handled in _solve_restricted_full for the GLS factor. Without
+        # this guard the NaN factor produces NaN beta, which then
+        # crashes downstream finite-validation in transpose_matvec_numpy
+        # ("sample vector must contain only finite values").
+        for _ridge_bump, _ridge_label in ((1e-4, "1e-4"), (1e-2, "1e-2")):
+            if bool(cp.isfinite(variant_precision_cholesky_gpu).all()):
+                break
+            log(
+                f"    exact variant-space Cholesky non-finite; "
+                f"re-conditioning ridge {_ridge_label} and retrying."
+            )
+            variant_precision_gpu[diagonal_index, diagonal_index] += cp.asarray(
+                _ridge_bump, dtype=compute_dtype
+            )
+            variant_precision_cholesky_gpu = cp.linalg.cholesky(variant_precision_gpu)
+        if not bool(cp.isfinite(variant_precision_cholesky_gpu).all()):
+            raise RuntimeError(
+                "exact variant-space Cholesky factor remained non-finite after "
+                "ridge bumps to 1e-2 — variant_precision matrix is degenerate."
+            )
         log(f"    Cholesky done in {_timed_region_seconds(_cholesky_t0, cp):.1f}s, solving...  mem={mem()}")
 
         def solve_variant_rhs_gpu(right_hand_side: Any) -> Any:
@@ -9392,6 +9414,16 @@ def _solve_restricted_exact_variant_space(
         _solve_t0 = _timed_region_start(cp)
         beta_gpu = solve_variant_rhs_gpu(variant_rhs_gpu)
         log(f"    exact variant-space solve done in {_timed_region_seconds(_solve_t0, cp):.1f}s  mem={mem()}")
+        if not bool(cp.isfinite(beta_gpu).all()):
+            # Defensive: a finite Cholesky factor can still produce non-finite
+            # solutions if the RHS itself has non-finite entries (e.g. from a
+            # diverged IRLS weight). Raising here gives a clear error instead
+            # of crashing 3 frames downstream in finite-validation.
+            raise RuntimeError(
+                "exact variant-space solve produced non-finite beta despite "
+                "a finite Cholesky factor — RHS likely contains NaN/Inf "
+                "(check IRLS weights / linear predictor for divergence)."
+            )
         beta = _cupy_array_to_numpy(beta_gpu, dtype=np.float64)
         beta_variance = (
             np.maximum(
