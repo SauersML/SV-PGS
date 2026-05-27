@@ -209,15 +209,13 @@ matrix=BitpackedDeviceMatrix (single GPU matvec; ...)`. If scoring shows
 holdout / test predictions are being computed via host-streamed decode
 and will be slow at AoU scale.
 
-### "Out of memory" / "memory guardrail tripped"
+### "Out of memory" at AoU scale
 
-The legacy int8 path materializes a (samples × variants) int8 mmap, which
-at AoU scale (~78k × 700k) is ~55 GB. The memory guardrail
-(`_legacy_int8_memory_guardrail` in `sv_pgs/io.py`) refuses to start a fit
-that would OOM. Two remediations:
+The bitpacked path is now the default; the legacy host-side int8 .npy
+matrix is no longer built. If you still see OOM:
 
-- Engage the bitpacked path (preferred): set `config.genotype_backend =
-  "bitpacked"`. The bitpacked active matrix uses ~22 GB HBM at AoU scale
-  (packed bytes plus per-variant mean/std side buffers).
+- Confirm the bitpacked path engaged: log line `bitpacked post-active
+  upgrade: ENGAGED`. The bitpacked active matrix uses ~7 GB HBM at AoU
+  microarray scale (packed bytes plus per-variant mean/std side buffers).
 - Reduce the variant axis: pass `--variants sv` or `--variants snp` rather
   than `snp+sv`, or supply a `--variants-file` subset.
