@@ -6699,3 +6699,19 @@ def make_dense_raw_genotype_matrix(
             f"(active={n_variants} variants; size log skipped: {_exc!r})"
         )
     return result
+
+
+# ---------------------------------------------------------------------------
+# Hybrid dense + sparse matrix integration point.
+#
+# The hybrid matrix scaffolding lives in :mod:`sv_pgs.hybrid_matrix` so it can
+# be imported without dragging in the bitpacked CUDA kernels. Pipeline code
+# that wants to construct a hybrid matrix should import from there directly;
+# this re-export keeps the surface discoverable from ``sv_pgs.genotype`` for
+# callers that already work with ``RawGenotypeMatrix`` subclasses.
+# ---------------------------------------------------------------------------
+from sv_pgs.hybrid_matrix import (  # noqa: E402,F401  (re-export integration point)
+    BioHybridGenotypeMatrix,
+    GpuSparseCarrierMatrix,
+    default_carrier_threshold,
+)
