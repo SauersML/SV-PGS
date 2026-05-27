@@ -79,6 +79,7 @@ from sv_pgs.config import ModelConfig, TraitType, VariantClass
 from sv_pgs.data import NESTED_PATH_DELIMITER, TieMap, VariantRecord
 from sv_pgs.elbo import compute_elbo
 from sv_pgs.forcing_sequence import forcing_tolerance, relaxed_iteration_cap
+from sv_pgs.precision_policy import factor_dtype
 from sv_pgs.genotype import (
     DEFAULT_GENOTYPE_BATCH_SIZE,
     DenseRawGenotypeMatrix,
@@ -9957,9 +9958,14 @@ def _solve_restricted_exact_variant_space(
         # pattern. Also symmetrize: the Gram should be SPD by construction
         # but accumulation error in fp32 can introduce ~ULP-scale asymmetry
         # that occasionally tips CuPy's cholesky into non-SPD behavior.
-        precision_for_factor = variant_precision_gpu.astype(cp.float64, copy=True)
+        # Factor dtype pinned by precision_policy.factor_dtype("variant_precision_full")
+        # — fp64 by policy: the fp32 GEMM that built variant_precision_gpu can
+        # span 12 orders of magnitude when IRLS weights hit the floor; factoring
+        # that in fp32 silently NaN-fills via cp.linalg.cholesky.
+        _exact_variant_factor_dtype = factor_dtype("variant_precision_full")
+        precision_for_factor = variant_precision_gpu.astype(_exact_variant_factor_dtype, copy=True)
         precision_for_factor = 0.5 * (precision_for_factor + precision_for_factor.T)
-        rhs_for_solve = variant_rhs_gpu.astype(cp.float64, copy=True)
+        rhs_for_solve = variant_rhs_gpu.astype(_exact_variant_factor_dtype, copy=True)
         log(
             f"    Cholesky factorization ({variant_count}×{variant_count} fp64"
             + (" promoted from fp32 GEMM" if is_mixed_precision else "")
