@@ -9187,6 +9187,10 @@ def _reset_posterior_working_set_warm_start(
         warm_start.posterior_working_set_ever_active = None
         warm_start.posterior_working_set_screening_score = None
         warm_start.posterior_working_set_target_size = None
+        # Force a global KKT audit when the genotype matrix identity changes:
+        # the frontier definition depends on a stale beta + an LD partition
+        # that may not match the new matrix.
+        warm_start.posterior_working_set_outer_call_count = 0
 
 
 def _posterior_working_set_seed_score(
@@ -10416,30 +10420,125 @@ def _restricted_posterior_state_posterior_working_set(
                 0.0,
                 covariate_precision_logdet,
             )
-        # The first global pass now doubles as KKT certification. That removes
-        # the cold-start screening pass and lets later EM iterations reuse the
-        # last certified score ordering instead of rebuilding it from scratch.
+        # Local-frontier KKT certification. We restrict the gradient evaluation
+        # to (a) LD blocks whose beta changed since the prior pass and (b) the
+        # block_id +/- 1 neighbours of those blocks. The global O(n*p_active)
+        # gradient is reserved for the periodic audit. Correctness rests on
+        # that audit: any violator outside the frontier surfaces there and
+        # gets folded into the WS, so iterates still converge to the global
+        # optimum.
         kkt_timing_cupy = _try_import_cupy() if genotype_matrix._cupy_cache is not None else None
         _ws_kkt_t0 = _timed_region_start(kkt_timing_cupy)
-        log(f"    KKT check: computing gradient on all {variant_count:,} variants...  mem={mem()}")
-        candidate_gradient = _genotype_transpose_matvec_result_numpy(
-            genotype_matrix,
-            projected_targets,
-            batch_size=posterior_variance_batch_size,
-            dtype=np.float64,
-        ) - prior_precision * candidate_beta
-        _ws_kkt_seconds = _timed_region_seconds(_ws_kkt_t0, kkt_timing_cupy)
-        log(f"    KKT gradient computed in {_ws_kkt_seconds:.1f}s  mem={mem()}")
-        candidate_score = _working_set_screening_score(candidate_gradient, candidate_beta, prior_variances)
-        current_screening_score = candidate_score
-        candidate_update_score = _working_set_posterior_update_score(candidate_gradient, prior_variances)
+        _do_global_audit = (
+            _ld_block_ids is None
+            or _ld_block_partition_map is None
+            or (working_pass == 0 and _force_global_audit_outer)
+            or _kkt_no_violator_streak >= 2
+        )
+        _beta_changed_mask = (
+            np.abs(candidate_beta - _prev_beta_for_frontier)
+            > float(posterior_working_set_coefficient_tolerance)
+        )
+        if _ld_block_ids is not None and _ld_block_partition_map is not None:
+            _changed_block_ids = np.unique(_ld_block_ids[_beta_changed_mask])
+            if working_indices.size:
+                _changed_block_ids = np.unique(
+                    np.concatenate([_changed_block_ids, _ld_block_ids[working_indices]])
+                )
+            _frontier_block_set = set(int(b) for b in _changed_block_ids.tolist())
+            for _bid in list(_frontier_block_set):
+                if (_bid - 1) in _ld_block_partition_map:
+                    _frontier_block_set.add(_bid - 1)
+                if (_bid + 1) in _ld_block_partition_map:
+                    _frontier_block_set.add(_bid + 1)
+            _frontier_index_chunks = [
+                np.asarray(_ld_block_partition_map[_bid], dtype=np.int64)
+                for _bid in _frontier_block_set
+                if _bid in _ld_block_partition_map
+            ]
+            _frontier_indices = (
+                np.unique(np.concatenate(_frontier_index_chunks))
+                if _frontier_index_chunks
+                else np.zeros(0, dtype=np.int64)
+            )
+        else:
+            _frontier_indices = np.arange(variant_count, dtype=np.int64)
+
+        if current_screening_score is None or np.asarray(current_screening_score).shape != (variant_count,):
+            current_screening_score = np.zeros(variant_count, dtype=np.float64)
+        candidate_score = np.asarray(current_screening_score, dtype=np.float64).copy()
+        candidate_update_score = np.zeros(variant_count, dtype=np.float64)
         excluded_mask = np.ones(variant_count, dtype=bool)
         excluded_mask[working_indices] = False
-        max_excluded_update = (
-            float(np.max(candidate_update_score[excluded_mask]))
-            if np.any(excluded_mask)
-            else 0.0
-        )
+
+        if _do_global_audit:
+            log(f"    KKT check: computing gradient on all {variant_count:,} variants...  mem={mem()}")
+            candidate_gradient = _genotype_transpose_matvec_result_numpy(
+                genotype_matrix,
+                projected_targets,
+                batch_size=posterior_variance_batch_size,
+                dtype=np.float64,
+            ) - prior_precision * candidate_beta
+            _ws_kkt_seconds = _timed_region_seconds(_ws_kkt_t0, kkt_timing_cupy)
+            log(f"    KKT gradient computed in {_ws_kkt_seconds:.1f}s  mem={mem()}")
+            candidate_score = _working_set_screening_score(candidate_gradient, candidate_beta, prior_variances)
+            current_screening_score = candidate_score
+            candidate_update_score = _working_set_posterior_update_score(candidate_gradient, prior_variances)
+            max_excluded_update = (
+                float(np.max(candidate_update_score[excluded_mask]))
+                if np.any(excluded_mask)
+                else 0.0
+            )
+            _n_audit_violators = int(
+                np.sum(excluded_mask & (candidate_update_score > float(posterior_working_set_coefficient_tolerance)))
+            )
+            log(
+                f"    KKT global audit (outer={_outer_call_count}): "
+                + f"{_n_audit_violators} violators expanded"
+            )
+            _kkt_no_violator_streak = 0
+        else:
+            _frontier_subset = genotype_matrix.subset(_frontier_indices.astype(np.int32, copy=False))
+            _frontier_grad = _genotype_transpose_matvec_result_numpy(
+                _frontier_subset,
+                projected_targets,
+                batch_size=posterior_variance_batch_size,
+                dtype=np.float64,
+            ) - prior_precision[_frontier_indices] * candidate_beta[_frontier_indices]
+            try:
+                _frontier_subset._cupy_cache = None
+                del _frontier_subset
+            except AttributeError:
+                pass
+            _ws_kkt_seconds = _timed_region_seconds(_ws_kkt_t0, kkt_timing_cupy)
+            _frontier_score = _working_set_screening_score(
+                _frontier_grad, candidate_beta[_frontier_indices], prior_variances[_frontier_indices]
+            )
+            _frontier_update = _working_set_posterior_update_score(_frontier_grad, prior_variances[_frontier_indices])
+            candidate_score[_frontier_indices] = _frontier_score
+            candidate_update_score[_frontier_indices] = _frontier_update
+            current_screening_score = candidate_score
+            _frontier_excluded = np.zeros(variant_count, dtype=bool)
+            _frontier_excluded[_frontier_indices] = True
+            _frontier_excluded &= excluded_mask
+            max_excluded_update = (
+                float(np.max(candidate_update_score[_frontier_excluded]))
+                if np.any(_frontier_excluded)
+                else 0.0
+            )
+            _pct = 100.0 * _frontier_indices.shape[0] / max(int(variant_count), 1)
+            log(
+                f"    KKT local-frontier: checked p={_frontier_indices.shape[0]} of {variant_count} "
+                + f"({_pct:.1f}%)  kkt={_ws_kkt_seconds:.1f}s"
+            )
+            _n_local_violators = int(
+                np.sum(_frontier_excluded & (candidate_update_score > float(posterior_working_set_coefficient_tolerance)))
+            )
+            if _n_local_violators == 0:
+                _kkt_no_violator_streak += 1
+            else:
+                _kkt_no_violator_streak = 0
+        _prev_beta_for_frontier = candidate_beta.copy()
         if max_excluded_update <= float(posterior_working_set_coefficient_tolerance):
             alpha = np.asarray(
                 _cholesky_solve(
