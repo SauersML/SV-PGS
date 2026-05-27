@@ -539,6 +539,23 @@ def _run_doctor(*, cache_dir_arg: str | None) -> int:
     else:
         add("WARN", f"env: XLA_PYTHON_CLIENT_PREALLOCATE={prealloc or 'unset'} (recommend 'false')")
 
+    # --- cache dir (informational + writability check) ---
+    if cache_dir_arg:
+        cache_path = Path(cache_dir_arg).expanduser()
+        if cache_path.exists():
+            if os.access(cache_path, os.W_OK):
+                add("OK", f"cache_dir: {cache_path} (writable)")
+            else:
+                add("FAIL", f"cache_dir: {cache_path} exists but is not writable")
+        else:
+            try:
+                cache_path.mkdir(parents=True, exist_ok=True)
+                add("OK", f"cache_dir: {cache_path} (created)")
+            except OSError as exc:
+                add("FAIL", f"cache_dir: {cache_path} cannot be created ({exc})")
+    else:
+        add("WARN", "cache_dir: not specified (per-run caches will go to default)")
+
     # --- GPU probe ---
     try:
         from sv_pgs.bitpacked.launch import gpu_arch
