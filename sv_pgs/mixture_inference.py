@@ -7940,7 +7940,8 @@ def _build_restricted_projector_gpu_bundle(
 ) -> tuple[Any, Any, Any, Any]:
     inverse_diagonal_noise_gpu = cp.asarray(inverse_diagonal_noise, dtype=dtype)
     covariate_matrix_gpu = cp.asarray(covariate_matrix, dtype=dtype)
-    covariate_precision_cholesky_gpu = cp.asarray(covariate_precision_cholesky, dtype=dtype)
+    # Cholesky factor stays fp64; tiny matrix (n_cov×n_cov).
+    covariate_precision_cholesky_gpu = cp.asarray(covariate_precision_cholesky, dtype=cp.float64)
     weighted_covariates_gpu = inverse_diagonal_noise_gpu[:, None] * covariate_matrix_gpu
     return (
         inverse_diagonal_noise_gpu,
@@ -8583,7 +8584,15 @@ def _restricted_precision_projector(
     compute_np_dtype = gpu_compute_numpy_dtype()
     inverse_diagonal_noise = 1.0 / np.maximum(np.asarray(diagonal_noise, dtype=compute_np_dtype), 1e-12)
     weighted_covariates = inverse_diagonal_noise[:, None] * covariate_matrix
-    covariate_precision = covariate_matrix.T @ weighted_covariates + np.eye(covariate_matrix.shape[1], dtype=compute_np_dtype) * 1e-8
+    # Build + factor C^T W C in fp64. The AoU covariates have a dummy trap
+    # (all one-hot categories included → each set sums to 1 → rank deficient)
+    # plus age/age² (corr ~0.99); cond(C^T W C) ≈ 10¹³. fp32 Cholesky on that
+    # produces a garbage factor whose downstream Schur subtraction makes
+    # variant_precision non-PSD with eigenvalues of order 10⁸.
+    ctwc = (covariate_matrix.T @ weighted_covariates).astype(np.float64, copy=False)
+    n_cov = int(covariate_matrix.shape[1])
+    ridge_C = max(float(np.trace(ctwc)) / max(n_cov, 1) * 1e-6, 1e-8)
+    covariate_precision = ctwc + np.eye(n_cov, dtype=np.float64) * ridge_C
     covariate_precision_cholesky = np.linalg.cholesky(covariate_precision)
     covariate_precision_logdet = 2.0 * float(np.sum(np.log(np.diag(covariate_precision_cholesky))))
 
