@@ -7516,8 +7516,168 @@ def _solve_sample_space_rhs_gpu_inner(
     iterations_used = 0
     _cg_t0 = _timed_region_start(cp)
     _cg_log_interval = max(max_iterations // 10, 1)
+
+    # ------------------------------------------------------------------
+    # CUDA-graph capture of the steady-state CG iteration body.
+    #
+    # Eliminates per-iter Python launch-dispatch overhead (~50-100us per
+    # iter) by capturing one full CG iteration into a CuPy CUDA graph and
+    # replaying it instead of re-issuing every kernel from Python.
+    #
+    # The captured body processes ALL rhs columns uniformly (no
+    # ``active_columns`` gather) so its tensor shapes are stable. It is
+    # only valid while no rhs column has converged yet; as soon as
+    # ``np.any(done)`` becomes True we drop to the original masked
+    # legacy path (which handles per-column finalization, Lanczos record
+    # finalization, and residual refresh).
+    #
+    # Buffer addresses are baked into the graph; we keep persistent
+    # device buffers for search/solution/residual plus three reduction
+    # outputs (step_scale, residual_dot, residual_norm_sq). The captured
+    # ``apply_operator`` callable is fixed at capture time (host-side
+    # branching inside the operator would taint the graph), so we only
+    # attempt capture when the SGM has a non-int8, non-sharded resident
+    # cupy cache (the gpu_transpose_matmat + gpu_matmat path with no
+    # per-call Python loops). All other operator branches fall back to
+    # the unmodified legacy CG path.
+    # ------------------------------------------------------------------
+    _graph_inst: Any = None
+    _graph_stream: Any = None
+    _graph_buffers: dict[str, Any] = {}
+    _graph_disabled = False
+    _graph_ws_size = int(rhs_gpu.shape[0])
+    _graph_n_rhs = int(rhs_gpu.shape[1])
+
+    def _cg_graph_eligible() -> bool:
+        if lanczos_recorder is not None:
+            return False
+        if bool(np.any(done)):
+            return False
+        if not bool(required_mask.all()):
+            return False
+        if int(resolved_iteration_limits.min()) != int(resolved_iteration_limits.max()):
+            return False
+        cache = getattr(genotype_matrix, "_cupy_cache", None)
+        if cache is None:
+            return False
+        try:
+            if _cupy_cache_is_sharded(cache) or _cupy_cache_is_int8_standardized(cache):
+                return False
+        except Exception:  # noqa: BLE001
+            return False
+        if getattr(genotype_matrix, "_ld_block_partition", None) is not None:
+            return False
+        Stream = getattr(getattr(cp, "cuda", None), "Stream", None)
+        if Stream is None or not hasattr(Stream, "begin_capture"):
+            return False
+        return True
+
+    def _try_capture_cg_graph() -> bool:
+        nonlocal _graph_inst, _graph_stream
+        Stream = cp.cuda.Stream
+        try:
+            rd_gpu = cp.asarray(residual_dot, dtype=compute_cp_dtype)
+            ss_gpu = cp.zeros((_graph_n_rhs,), dtype=compute_cp_dtype)
+            rn_gpu = cp.zeros((_graph_n_rhs,), dtype=cp.float64)
+            search_buf = search_direction_gpu
+            solution_buf = solution_gpu
+            residual_buf = residual_gpu
+            tiny = compute_cp_dtype(1e-30)
+
+            def _body() -> None:
+                # All-active CG iteration: no host-side ops, no Lanczos.
+                op_search = apply_operator(search_buf)
+                step_denom = cp.sum(search_buf * op_search, axis=0, dtype=compute_cp_dtype)
+                cp.divide(rd_gpu, step_denom, out=ss_gpu)
+                solution_buf[...] = solution_buf + search_buf * ss_gpu[None, :]
+                residual_buf[...] = residual_buf - op_search * ss_gpu[None, :]
+                cp.sum(residual_buf * residual_buf, axis=0, dtype=cp.float64, out=rn_gpu)
+                pr = preconditioner(residual_buf)
+                new_rd = cp.sum(residual_buf * pr, axis=0, dtype=compute_cp_dtype)
+                cp.divide(new_rd, cp.maximum(rd_gpu, tiny), out=ss_gpu)
+                search_buf[...] = pr + search_buf * ss_gpu[None, :]
+                rd_gpu[...] = new_rd
+
+            stream = Stream(non_blocking=True)
+            with stream:
+                _body()  # warm-up so any one-time allocations have fired
+                stream.synchronize()
+                stream.begin_capture()
+                _body()
+                graph = stream.end_capture()
+                exec_inst = graph.instantiate() if hasattr(graph, "instantiate") else graph
+        except Exception as capture_error:  # noqa: BLE001
+            log(
+                "       CG inner-loop CUDA graph capture skipped "
+                + f"({type(capture_error).__name__}: {capture_error})"
+            )
+            return False
+
+        _graph_inst = exec_inst
+        _graph_stream = stream
+        _graph_buffers["step_scale"] = ss_gpu
+        _graph_buffers["residual_dot"] = rd_gpu
+        _graph_buffers["residual_norm_sq"] = rn_gpu
+        log(
+            "       CG inner-loop CUDA graph captured "
+            + f"(p={_graph_ws_size}, replaying)"
+        )
+        return True
+
+    def _replay_cg_graph() -> bool:
+        nonlocal _graph_inst, _graph_disabled
+        if _graph_inst is None or _graph_stream is None:
+            return False
+        try:
+            if hasattr(_graph_inst, "launch"):
+                _graph_inst.launch(stream=_graph_stream)
+            elif callable(_graph_inst):
+                _graph_inst(_graph_stream)
+            else:
+                return False
+            _graph_stream.synchronize()
+            return True
+        except Exception as launch_error:  # noqa: BLE001
+            log(
+                "       CG inner-loop CUDA graph replay failed "
+                + f"({type(launch_error).__name__}: {launch_error}); falling back"
+            )
+            _graph_inst = None
+            _graph_disabled = True
+            return False
+
     for iteration_index in range(max_iterations):
         iterations_used = iteration_index + 1
+        # CUDA-graph fast path: while no column has converged, no residual
+        # refresh is due, and the eligibility predicate is satisfied,
+        # replay the captured iteration body. Convergence check is a
+        # post-replay sync — copy residual_norm_sq to host and rebuild
+        # ``done`` exactly as the legacy path would.
+        _refresh_due = ((iteration_index + 1) % residual_refresh_interval) == 0
+        if (
+            not _graph_disabled
+            and not _refresh_due
+            and _cg_graph_eligible()
+        ):
+            if _graph_inst is None:
+                if not _try_capture_cg_graph():
+                    _graph_disabled = True
+            if _graph_inst is not None and _replay_cg_graph():
+                residual_norm_sq = _gpu_to_f64(_graph_buffers["residual_norm_sq"])
+                residual_dot = _gpu_to_f64(_graph_buffers["residual_dot"])
+                converged = residual_norm_sq <= convergence_threshold_sq
+                done = converged | ((iteration_index + 1) >= resolved_iteration_limits)
+                if iteration_index % _cg_log_interval == 0 or iteration_index == max_iterations - 1:
+                    pct_converged = int(100 * int(converged.sum()) / max(n_rhs, 1))
+                    max_residual = float(np.max(residual_norm_sq))
+                    log(
+                        f"       CG iter {iteration_index+1}/{max_iterations} [graph]: "
+                        + f"{pct_converged}% converged  residual={max_residual:.2e}  "
+                        + f"({_timed_region_seconds(_cg_t0, cp):.1f}s)"
+                    )
+                if np.all(done):
+                    break
+                continue
         active_columns = np.flatnonzero(~done).astype(np.int32, copy=False)
         if active_columns.size == 0:
             break
@@ -10110,9 +10270,12 @@ def _solve_restricted_mean_only(
             inverse_covariance_covariates_gpu = inverse_covariance_rhs_gpu[
                 :, 1 : 1 + covariate_count
             ]
+            # GLS normal matrix factor dtype pinned by
+            # precision_policy.factor_dtype("gls") — fp64 by policy, same dummy
+            # -trap risk as C^T W C.
             gls_normal_matrix_gpu = (
                 covariate_matrix_gpu.T @ inverse_covariance_covariates_gpu
-            )
+            ).astype(factor_dtype("gls"), copy=False)
             diagonal_index = np.arange(covariate_count)
             gls_normal_matrix_gpu[diagonal_index, diagonal_index] += 1e-8
             gls_cholesky_gpu = cp.linalg.cholesky(gls_normal_matrix_gpu)
@@ -10337,8 +10500,44 @@ def _restricted_posterior_state_posterior_working_set(
             + f"ever_active={ever_active_indices.shape[0]}  mem={mem()}"
         )
         working_set_genotypes = genotype_matrix.subset(working_indices)
-        # Upload working set to GPU for exact Cholesky solve (if it fits)
-        working_set_genotypes.try_materialize_gpu()
+        # Bitpacked fast path: when the underlying raw is a
+        # ``BitpackedDeviceMatrix`` the standardized fp32 columns can be
+        # built entirely on device from the bitpacked side buffer (means +
+        # scales). Skip ``try_materialize_gpu`` (which would re-stream
+        # ~10 GB of fp32 over PCIe) and install ``_cupy_cache`` directly
+        # as a dense fp32 (n_samples, k_ws) device array. The downstream
+        # exact GPU variant-space solve consumes ``_cupy_cache`` as a plain
+        # cupy ndarray, so the shape/dtype/order contract matches.
+        _ws_raw = getattr(working_set_genotypes, "raw", None)
+        _bitpacked_ws_path = (
+            _ws_raw is not None
+            and type(_ws_raw).__name__ == "BitpackedDeviceMatrix"
+            and working_set_genotypes._cupy_cache is None
+            and working_set_genotypes._dense_cache is None
+            and callable(getattr(_ws_raw, "decode_standardized_subset_to_device", None))
+        )
+        if _bitpacked_ws_path:
+            try:
+                import cupy as _cp_ws
+                _ws_cols = _cp_ws.asarray(
+                    working_set_genotypes.variant_indices, dtype=_cp_ws.int64
+                )
+                _ws_block = _ws_raw.decode_standardized_subset_to_device(_ws_cols)
+                working_set_genotypes._cupy_cache = _ws_block
+                log("    WS solve: device-resident bitpacked (skipped fp32 re-stream)")
+            except (ImportError, MemoryError, RuntimeError, OSError) as _exc:
+                # Any failure (e.g. OOM building the dense fp32 slab) falls
+                # back to the original streaming path so correctness is
+                # preserved.
+                working_set_genotypes._cupy_cache = None
+                log(
+                    f"    WS solve: bitpacked device-gather failed ({_exc!r}); "
+                    "falling back to fp32 stream"
+                )
+                working_set_genotypes.try_materialize_gpu()
+        else:
+            # Upload working set to GPU for exact Cholesky solve (if it fits)
+            working_set_genotypes.try_materialize_gpu()
         subset_alpha, subset_beta, _subset_projected_targets, subset_fitted, _subset_restricted_quadratic = _solve_restricted_mean_only(
             genotype_matrix=working_set_genotypes,
             covariate_matrix=covariate_matrix,
@@ -11352,7 +11551,11 @@ def _solve_restricted_full(
         prior_variances_gpu = cp.asarray(prior_variances, dtype=cp.float64)
         inverse_covariance_targets_gpu = inverse_covariance_rhs_gpu[:, 0]
         inverse_covariance_covariates_gpu = inverse_covariance_rhs_gpu[:, 1 : 1 + covariate_matrix.shape[1]]
-        gls_normal_matrix_gpu = covariate_matrix_gpu.T @ inverse_covariance_covariates_gpu
+        # GLS normal matrix factor dtype pinned by
+        # precision_policy.factor_dtype("gls") — fp64 by policy.
+        gls_normal_matrix_gpu = (
+            covariate_matrix_gpu.T @ inverse_covariance_covariates_gpu
+        ).astype(factor_dtype("gls"), copy=False)
         diagonal_index = np.arange(covariate_matrix.shape[1])
         gls_normal_matrix_gpu[diagonal_index, diagonal_index] += 1e-8
         gls_cholesky_gpu = cp.linalg.cholesky(gls_normal_matrix_gpu)
