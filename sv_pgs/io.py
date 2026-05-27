@@ -4568,9 +4568,43 @@ def _save_vcf_to_cache(
         _cleanup_stale_vcf_cache_temps(paths.cache_dir, paths.key)
 
 
+_PLINK_METADATA_PROCESS_CACHE: dict[tuple[str, int, int, int, int, int, int], _PlinkMetadata] = {}
+
+
 def _load_plink1_metadata(bed_path: Path) -> _PlinkMetadata:
     fam_path = bed_path.with_suffix(".fam")
     bim_path = bed_path.with_suffix(".bim")
+
+    # In-process memoization: the AoU runner reaches this function 4x per run
+    # (train load, test load, plus context resolves) for the same .bed file.
+    # Each call rescans the 30 MB .fam and counts lines on the 72 MB .bim —
+    # ~10s round-trip on the AoU workbench. Resolving the bed to a stable
+    # (path, st_dev, st_ino, st_size, st_mtime_ns) tuple lets us replay the
+    # parsed result and skip the work on every subsequent call in this
+    # process. The cache is process-local (no disk persistence needed because
+    # the on-disk .npy stats cache and the sample-table cache already cover
+    # cross-run reuse).
+    try:
+        fam_st = fam_path.stat()
+        bim_st = bim_path.stat()
+        cache_key: tuple[str, int, int, int, int, int, int] = (
+            str(bed_path.resolve()),
+            int(fam_st.st_size),
+            int(fam_st.st_mtime_ns),
+            int(fam_st.st_ino),
+            int(bim_st.st_size),
+            int(bim_st.st_mtime_ns),
+            int(bim_st.st_ino),
+        )
+    except OSError:
+        cache_key = None  # type: ignore[assignment]
+    if cache_key is not None and cache_key in _PLINK_METADATA_PROCESS_CACHE:
+        cached = _PLINK_METADATA_PROCESS_CACHE[cache_key]
+        log(
+            f"  PLINK metadata cache hit (in-process): {len(cached.sample_ids)} "
+            f"samples, {cached.variant_count} variants  mem={mem()}"
+        )
+        return cached
 
     log(f"parsing .fam file: {fam_path}")
     sample_ids = _read_plink_sample_ids(fam_path)
@@ -4585,10 +4619,13 @@ def _load_plink1_metadata(bed_path: Path) -> _PlinkMetadata:
 
     if variant_count == 0:
         raise ValueError("PLINK bed contains no variants: " + str(bed_path))
-    return _PlinkMetadata(
+    metadata = _PlinkMetadata(
         sample_ids=sample_ids,
         variant_count=variant_count,
     )
+    if cache_key is not None:
+        _PLINK_METADATA_PROCESS_CACHE[cache_key] = metadata
+    return metadata
 
 
 def _build_plink_variant_defaults_from_stats(
