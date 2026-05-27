@@ -1264,6 +1264,7 @@ def _genotype_has_device_resident_backend(
 
 
 _BITPACKED_HVP_FP32_LOGGED = False
+_BINARY_TR_NEWTON_DISABLED_LOGGED = False
 
 
 def _log_bitpacked_hvp_fp32_once() -> None:
@@ -5079,7 +5080,13 @@ def _binary_posterior_state(
                 + f"(reason={exc})"
             )
     elif resume_state is None:
-        log("      binary TR-Newton disabled (use_tr_newton_binary=False); using PG-IRLS")
+        # Log once per process: this fires per stochastic block on the
+        # binary path, so without the gate it spams the heartbeat with
+        # one line per block per outer iteration.
+        global _BINARY_TR_NEWTON_DISABLED_LOGGED
+        if not _BINARY_TR_NEWTON_DISABLED_LOGGED:
+            _BINARY_TR_NEWTON_DISABLED_LOGGED = True
+            log("      binary TR-Newton disabled (use_tr_newton_binary=False); using PG-IRLS")
     covariate_count = covariate_matrix.shape[1]
     parameters = np.concatenate([alpha_init, beta_init], axis=0).astype(np.float64, copy=True)
     predictor_offset_array = (
