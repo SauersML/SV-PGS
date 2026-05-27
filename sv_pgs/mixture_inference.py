@@ -10202,6 +10202,20 @@ def _restricted_posterior_state_posterior_working_set(
         ever_active_indices,
         working_size,
     )
+    # Patch 1: sort WS indices ascending in source-column space so the
+    # downstream bitpacked / int8 subset gather reads BED rows in monotone
+    # order (HBM coalescing — random gather costs ~30% bandwidth). The math
+    # is permutation-invariant: subset solve returns subset_beta in the same
+    # column order the caller supplied, and `candidate_beta[working_indices]
+    # = subset_beta` scatters each value back to its global index. KKT and
+    # ever_active logic use set semantics (boolean masks + ordered-unique).
+    _ws_sort_t0 = time.monotonic()
+    working_indices = np.sort(working_indices, kind="stable").astype(np.int32, copy=False)
+    _ws_sort_seconds = time.monotonic() - _ws_sort_t0
+    log(
+        "    working set source-sorted "
+        + f"(n={working_indices.shape[0]}, sort {_ws_sort_seconds * 1000.0:.1f}ms)"
+    )
 
     for working_pass in range(max(int(posterior_working_set_max_passes), 1)):
         _ws_pass_t0 = time.monotonic()
@@ -10386,6 +10400,16 @@ def _restricted_posterior_state_posterior_working_set(
             "    working set expanded "
             + f"(violations={all_violating.shape[0]}, included={violating_indices.shape[0]}, "
             + f"next_size={working_indices.shape[0]}/{variant_count})"
+        )
+        # Patch 1: re-sort the expanded WS in source-column space before the
+        # next pass's subset gather (same permutation-invariance argument as
+        # the seed selection above).
+        _ws_sort_t0 = time.monotonic()
+        working_indices = np.sort(working_indices, kind="stable").astype(np.int32, copy=False)
+        _ws_sort_seconds = time.monotonic() - _ws_sort_t0
+        log(
+            "    working set source-sorted "
+            + f"(n={working_indices.shape[0]}, sort {_ws_sort_seconds * 1000.0:.1f}ms)"
         )
 
     log(
