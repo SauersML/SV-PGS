@@ -7306,6 +7306,77 @@ def _apply_sample_space_operator_gpu(
         and int(genotype_matrix.shape[1])
         == int(getattr(_raw_for_packed, "n_variants", -1))
     )
+    # ------------------------------------------------------------------
+    # Phase 4 LD-block / N-GPU dispatch -- BITPACKED variant.
+    # When the SGM's raw is a BitpackedDeviceMatrix (post-active-upgrade)
+    # *and* an LdBlockPartition is attached *and* more than one CUDA device
+    # is visible, shard the per-block sample-space contributions
+    #     contrib_b = X_b @ (tau^2[idx_b] * (X_b.T @ v))
+    # across visible devices via :class:`GPUScheduler`. Each block uses the
+    # ``matvec_subset`` / ``rmatvec_subset`` primitives in
+    # :mod:`sv_pgs.bitpacked_matrix`, which gather subset rows of ``_packed``
+    # into a device-side scratch and invoke gemv_nt/gemv_tn against the
+    # subset. Single-GPU stays on the existing global-matvec branch below;
+    # the extra launch overhead does not pay for itself at N=1.
+    # ------------------------------------------------------------------
+    if _packed_resident and ld_block_partition is not None:
+        try:
+            from sv_pgs.gpu_scheduler import GPUScheduler as _GPUScheduler
+        except Exception:  # noqa: BLE001 - scheduler import failure -> global path
+            _GPUScheduler = None  # type: ignore[assignment]
+        scheduler = getattr(genotype_matrix, "_ld_block_scheduler", None)
+        if scheduler is None and _GPUScheduler is not None:
+            scheduler = _GPUScheduler.detect()
+            genotype_matrix._ld_block_scheduler = scheduler
+        if (
+            scheduler is not None
+            and not scheduler.is_cpu_fallback
+            and scheduler.device_count > 1
+            and hasattr(_raw_for_packed, "matvec_subset")
+            and hasattr(_raw_for_packed, "rmatvec_subset")
+        ):
+            try:
+                from sv_pgs.progress import log as _progress_log
+                _progress_log(
+                    f"bitpacked LD-block dispatch: "
+                    f"{sum(1 for _ in ld_block_partition.iter_blocks())} blocks "
+                    f"across {scheduler.device_count} GPUs"
+                )
+            except Exception:  # noqa: BLE001
+                pass
+            _log_bitpacked_hvp_fp32_once()
+            prior32 = cp.asarray(prior_variances_gpu, dtype=cp.float32)
+            n_dev = scheduler.device_count
+            n_cols = int(input_gpu.shape[1])
+            n_samples_local = int(input_gpu.shape[0])
+            partials: dict[int, Any] = {}
+            for block_id, idx in ld_block_partition.iter_blocks():
+                if idx.size == 0:
+                    continue
+                # Block-to-device affinity: round-robin by block_id, matching
+                # the fp16/fp32-cache LD-block branch above and the contract
+                # documented in :meth:`GPUScheduler.assign`.
+                assignment_device = scheduler.device_ids[int(block_id) % n_dev]
+                with scheduler.device_context(assignment_device):
+                    idx_dev = cp.asarray(idx, dtype=cp.int64)
+                    prior_block = prior32[idx_dev]
+                    block_accum = cp.zeros((n_samples_local, n_cols), dtype=cp.float32)
+                    for col in range(n_cols):
+                        v_col = cp.asarray(input_gpu[:, col], dtype=cp.float32)
+                        proj_block = _raw_for_packed.rmatvec_subset(idx_dev, v_col)
+                        proj_block = proj_block * prior_block
+                        contrib = _raw_for_packed.matvec_subset(idx_dev, proj_block)
+                        block_accum[:, col] = contrib
+                    if assignment_device in partials:
+                        partials[assignment_device] = (
+                            partials[assignment_device] + block_accum
+                        )
+                    else:
+                        partials[assignment_device] = block_accum
+            scheduler.synchronize()
+            for _dev_id, part in partials.items():
+                result_gpu = result_gpu + cp.asarray(part, dtype=dtype)
+            return result_gpu[:, 0] if vector_input else result_gpu
     if _packed_resident:
         # bitpacked gemv kernels are fp32-only by construction (the device-side
         # gemv_nt / gemv_tn cores in sv_pgs.bitpacked_matrix take float32 buffers).

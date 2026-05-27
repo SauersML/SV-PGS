@@ -299,6 +299,91 @@ class BitpackedDeviceMatrix(RawGenotypeMatrix):
             )
         return out
 
+    def matvec_subset(
+        self,
+        variant_indices: "NDArray | cp.ndarray",
+        x_subset_dev: "cp.ndarray",
+    ) -> "cp.ndarray":
+        """Compute ``X_S @ x_subset`` where ``S = variant_indices``.
+
+        ``x_subset_dev`` must have shape ``(len(variant_indices),)`` and be a
+        device float32 array (the gemv_nt kernel is fp32-only). The relevant
+        rows of ``_packed``/``_mean``/``_std`` are gathered into a per-call
+        device-side scratch buffer and the standard gemv_nt kernel is invoked
+        against that subset. This is the per-block primitive used by the
+        LD-block sample-space operator dispatcher when sharding across GPUs.
+        """
+        from sv_pgs.bitpacked_profile import record as _profile_record
+
+        cp = _cupy()
+        bp = _bitpacked()
+        idx_dev = cp.asarray(variant_indices, dtype=cp.int64)
+        k = int(idx_dev.shape[0])
+        if k == 0:
+            return cp.zeros((self._n_samples,), dtype=cp.float32)
+        x32 = cp.ascontiguousarray(x_subset_dev, dtype=cp.float32)
+        if x32.shape != (k,):
+            raise ValueError(
+                f"matvec_subset: x has shape {tuple(x32.shape)}, expected ({k},)."
+            )
+        sub_packed = cp.take(self._packed, idx_dev, axis=0)
+        sub_mean = cp.take(self._mean, idx_dev, axis=0)
+        sub_std = cp.take(self._std, idx_dev, axis=0)
+        out = cp.zeros((self._n_samples,), dtype=cp.float32)
+        with _profile_record("matvec_subset"):
+            bp.gemv_nt(
+                sub_packed,
+                self._n_samples,
+                x32,
+                sub_mean,
+                sub_std,
+                out,
+                count_a1=self._count_a1,
+            )
+        return out
+
+    def rmatvec_subset(
+        self,
+        variant_indices: "NDArray | cp.ndarray",
+        y_dev: "cp.ndarray",
+    ) -> "cp.ndarray":
+        """Compute ``X_S.T @ y`` where ``S = variant_indices``.
+
+        Returns a device float32 array of shape ``(len(variant_indices),)``.
+        Companion to :meth:`matvec_subset`; together they form the
+        ``X_S @ diag(tau^2_S) @ X_S.T @ v`` per-block primitive used by the
+        multi-GPU LD-block sample-space operator dispatch.
+        """
+        from sv_pgs.bitpacked_profile import record as _profile_record
+
+        cp = _cupy()
+        bp = _bitpacked()
+        idx_dev = cp.asarray(variant_indices, dtype=cp.int64)
+        k = int(idx_dev.shape[0])
+        if k == 0:
+            return cp.zeros((0,), dtype=cp.float32)
+        y32 = cp.ascontiguousarray(y_dev, dtype=cp.float32)
+        if y32.shape != (self._n_samples,):
+            raise ValueError(
+                f"rmatvec_subset: y has shape {tuple(y32.shape)}, "
+                f"expected ({self._n_samples},)."
+            )
+        sub_packed = cp.take(self._packed, idx_dev, axis=0)
+        sub_mean = cp.take(self._mean, idx_dev, axis=0)
+        sub_std = cp.take(self._std, idx_dev, axis=0)
+        out = cp.zeros((k,), dtype=cp.float32)
+        with _profile_record("rmatvec_subset"):
+            bp.gemv_tn(
+                sub_packed,
+                self._n_samples,
+                y32,
+                sub_mean,
+                sub_std,
+                out,
+                count_a1=self._count_a1,
+            )
+        return out
+
     def matvec_numpy(self, x_np: NDArray) -> NDArray:
         cp = _cupy()
         x_dev = cp.asarray(x_np, dtype=cp.float32)
