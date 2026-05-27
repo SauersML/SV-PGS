@@ -744,6 +744,10 @@ class _RestrictedPosteriorWarmStart:
     posterior_working_set_ever_active: NDArray | None = None
     posterior_working_set_screening_score: NDArray | None = None
     posterior_working_set_target_size: int | None = None
+    # Local-frontier KKT bookkeeping (see _restricted_posterior_state_posterior_working_set).
+    # outer_em_call_count increments once per call to that function (i.e. once per
+    # outer EM iteration on this restricted-posterior step).
+    posterior_working_set_outer_call_count: int = 0
     weighted_covariate_projection_matrix_token: int | None = None
     weighted_covariate_projection_signature: str | None = None
     weighted_covariate_projection: NDArray | None = None
@@ -10166,6 +10170,23 @@ def _restricted_posterior_state_posterior_working_set(
 ) -> tuple[NDArray, NDArray, NDArray, NDArray, NDArray, float, float, float]:
     variant_count = genotype_matrix.shape[1]
     _reset_posterior_working_set_warm_start(warm_start, genotype_matrix, variant_count)
+    # LD-block closure helper: when a KKT violator enters the WS, drag in the
+    # rest of its LD block so correlated variants update together instead of
+    # forcing N working-set passes.  block_ids is already an inverse map
+    # (variant index -> block id).  If the matrix has no LD partition
+    # attached, fall back to per-variant growth.
+    _ld_partition = getattr(genotype_matrix, "_ld_block_partition", None)
+    _ld_block_ids: NDArray | None = None
+    _ld_block_partition_map: Any = None
+    if _ld_partition is not None:
+        try:
+            _block_ids_arr = np.asarray(_ld_partition.block_ids, dtype=np.int64)
+            if _block_ids_arr.shape == (variant_count,):
+                _ld_block_ids = _block_ids_arr
+                _ld_block_partition_map = _ld_partition.partition
+        except (AttributeError, ValueError, TypeError):
+            _ld_block_ids = None
+            _ld_block_partition_map = None
     current_beta = (
         np.zeros(variant_count, dtype=np.float64)
         if initial_beta_guess is None
@@ -10216,6 +10237,21 @@ def _restricted_posterior_state_posterior_working_set(
         "    working set source-sorted "
         + f"(n={working_indices.shape[0]}, sort {_ws_sort_seconds * 1000.0:.1f}ms)"
     )
+
+    # Local-frontier KKT: instead of scanning the gradient on all p_active
+    # variants every WS pass, we restrict the KKT check to LD blocks whose
+    # beta changed plus their ld-block neighbours (block_id +/- 1).  A FULL
+    # global audit fires every K=4 outer EM calls or after 2 consecutive
+    # passes that found no violators.  The global audit is what preserves
+    # KKT correctness: any violator the local frontier missed is caught and
+    # appended to the WS, so iterates still converge to the global optimum.
+    _kkt_audit_period = 4
+    _kkt_no_violator_streak = 0
+    _outer_call_count = int(getattr(warm_start, "posterior_working_set_outer_call_count", 0)) if warm_start is not None else 0
+    _force_global_audit_outer = (_outer_call_count % _kkt_audit_period == 0)
+    if warm_start is not None:
+        warm_start.posterior_working_set_outer_call_count = _outer_call_count + 1
+    _prev_beta_for_frontier = current_beta.copy()
 
     for working_pass in range(max(int(posterior_working_set_max_passes), 1)):
         _ws_pass_t0 = time.monotonic()
@@ -10376,11 +10412,81 @@ def _restricted_posterior_state_posterior_working_set(
         # working set from 8K to 222K in one step, triggering a catastrophic
         # fallback to CPU CG on all variants.
         growth_budget = int(posterior_working_set_growth)
-        if all_violating.shape[0] > growth_budget:
-            top_violation_order = np.argsort(candidate_update_score[all_violating])[-growth_budget:]
-            violating_indices = all_violating[top_violation_order]
+        # Rank violators by KKT magnitude (descending) so the most-violating
+        # variants and their LD blocks are admitted first under the cap.
+        if all_violating.shape[0] > 0:
+            _viol_order_desc = np.argsort(candidate_update_score[all_violating])[::-1]
+            ranked_violating = all_violating[_viol_order_desc]
         else:
-            violating_indices = all_violating
+            ranked_violating = all_violating
+        if (
+            _ld_block_ids is not None
+            and _ld_block_partition_map is not None
+            and ranked_violating.shape[0] > 0
+        ):
+            # Expand by LD-block closure: each violator brings in its whole
+            # block.  Walk violators in KKT-magnitude order and admit whole
+            # blocks until the growth budget is exhausted; overflow violators
+            # wait for the next pass.
+            seen_blocks: set[int] = set()
+            expanded_chunks: list[NDArray] = []
+            expanded_total = 0
+            included_violator_count = 0
+            for v in ranked_violating:
+                bid = int(_ld_block_ids[int(v)])
+                if bid in seen_blocks:
+                    included_violator_count += 1
+                    continue
+                block_members = _ld_block_partition_map.get(bid)
+                if block_members is None:
+                    block_members = np.asarray([int(v)], dtype=np.int64)
+                else:
+                    block_members = np.asarray(block_members, dtype=np.int64)
+                # Restrict to currently-excluded members (already-in-WS
+                # members don't consume the growth budget).
+                if block_members.shape[0] > 0:
+                    new_members = block_members[excluded_mask[block_members]]
+                else:
+                    new_members = block_members
+                if (
+                    expanded_total + int(new_members.shape[0]) > growth_budget
+                    and expanded_total > 0
+                ):
+                    # Would overflow — leave this and remaining violators for
+                    # the next pass.  We always admit at least the first
+                    # block to guarantee forward progress even when one block
+                    # exceeds the budget.
+                    break
+                seen_blocks.add(bid)
+                expanded_chunks.append(new_members)
+                expanded_total += int(new_members.shape[0])
+                included_violator_count += 1
+                if expanded_total >= growth_budget:
+                    break
+            if expanded_chunks:
+                violating_indices = np.unique(
+                    np.concatenate(expanded_chunks)
+                ).astype(np.int32, copy=False)
+            else:
+                violating_indices = ranked_violating[:0].astype(np.int32, copy=False)
+            log(
+                f"    WS pass {working_pass + 1} growth: "
+                f"{int(ranked_violating.shape[0])} violators -> "
+                f"{int(violating_indices.shape[0])} variants via LD-block closure "
+                f"(blocks={len(seen_blocks)}, admitted_violators={included_violator_count}, "
+                f"budget={growth_budget})"
+            )
+        else:
+            if ranked_violating.shape[0] > growth_budget:
+                violating_indices = ranked_violating[:growth_budget]
+            else:
+                violating_indices = ranked_violating
+            log(
+                f"    WS pass {working_pass + 1} growth: "
+                f"{int(ranked_violating.shape[0])} violators -> "
+                f"{int(violating_indices.shape[0])} variants via LD-block closure "
+                f"(LD partition unavailable, per-variant fallback, budget={growth_budget})"
+            )
         next_size = min(
             max(
                 working_indices.shape[0] + growth_budget,
