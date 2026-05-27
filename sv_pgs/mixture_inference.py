@@ -7961,9 +7961,11 @@ def _try_install_cg_workset_resident_cache(
         return False
     if genotype_matrix.raw is None:
         return False
-    try_materialize_gpu_subset = getattr(genotype_matrix, "try_materialize_gpu_subset", None)
-    if try_materialize_gpu_subset is None:
-        # Defensive: if the API isn't present, fall back to streaming.
+    # Defensive existence check on the method we actually call. The previous
+    # implementation gated on ``try_materialize_gpu_subset`` here despite
+    # invoking the *full* ``try_materialize_gpu`` below — so the gate could
+    # pass while the call we make doesn't actually exist, or vice versa.
+    if not callable(getattr(genotype_matrix, "try_materialize_gpu", None)):
         return False
     n_rows = int(genotype_matrix.shape[0])
     n_cols = int(genotype_matrix.shape[1])
