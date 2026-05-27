@@ -5289,6 +5289,25 @@ def _binary_posterior_state(
         # Belt-and-suspenders: re-floor weights immediately before division in case a
         # GPU/CPU path returns a value at exactly the floor (or below it due to fp rounding).
         current_weights = np.maximum(current_weights, minimum_weight)
+        # Diagnostic finite check: if the IRLS state has diverged (predictor → ±Inf
+        # or NaN due to a bad beta update), the resulting weights/pseudo-response
+        # will be non-finite and X^T W X + ridge becomes NaN. We catch it HERE so
+        # the failure is attributed to the IRLS step that produced the bad state,
+        # not to the downstream Cholesky.
+        if not np.all(np.isfinite(current_weights)):
+            n_bad = int(np.size(current_weights)) - int(np.sum(np.isfinite(current_weights)))
+            raise RuntimeError(
+                f"binary PG-IRLS iter {iteration_index}: current_weights has {n_bad} "
+                "non-finite entries (linear predictor likely diverged). Check the "
+                "previous iteration's beta update for overflow."
+            )
+        if not np.all(np.isfinite(current_linear_predictor)):
+            n_bad = int(np.size(current_linear_predictor)) - int(np.sum(np.isfinite(current_linear_predictor)))
+            raise RuntimeError(
+                f"binary PG-IRLS iter {iteration_index}: current_linear_predictor "
+                f"has {n_bad} non-finite entries (X @ beta + offset diverged). "
+                "Beta state at the start of this iteration is contaminated."
+            )
         pseudo_response = kappa / current_weights - predictor_offset_array
         solve_start = _timed_region_start(timing_cupy)
         updated_alpha, updated_beta, _projected_targets, updated_fitted_response, _restricted_quadratic = (
@@ -9418,7 +9437,16 @@ def _solve_restricted_exact_variant_space(
         # this guard the NaN factor produces NaN beta, which then
         # crashes downstream finite-validation in transpose_matvec_numpy
         # ("sample vector must contain only finite values").
-        for _ridge_bump, _ridge_label in ((1e-4, "1e-4"), (1e-2, "1e-2")):
+        # NB: if the *input* to Cholesky already contains NaN/Inf (caught
+        # by the pre-flight check above), no diagonal ridge can rescue
+        # it — NaN + finite = NaN. The ridge ladder here exists for the
+        # ill-conditioned-but-finite case.
+        for _ridge_bump, _ridge_label in (
+            (1e-4, "1e-4"),
+            (1e-2, "1e-2"),
+            (1e0, "1e0"),
+            (1e2, "1e2"),
+        ):
             if bool(cp.isfinite(variant_precision_cholesky_gpu).all()):
                 break
             log(
@@ -9432,7 +9460,11 @@ def _solve_restricted_exact_variant_space(
         if not bool(cp.isfinite(variant_precision_cholesky_gpu).all()):
             raise RuntimeError(
                 "exact variant-space Cholesky factor remained non-finite after "
-                "ridge bumps to 1e-2 — variant_precision matrix is degenerate."
+                "ridge bumps to 1e2 — variant_precision matrix has NaN/Inf "
+                "entries (not just ill-conditioning). Check the pre-Cholesky "
+                "finite-check log lines above to see whether variant_precision "
+                "or variant_rhs is contaminated, then trace back to the "
+                "weighted Gram build or the prior_precision."
             )
         log(f"    Cholesky done in {_timed_region_seconds(_cholesky_t0, cp):.1f}s, solving...  mem={mem()}")
 
