@@ -2608,7 +2608,16 @@ def compute_plink_variant_statistics_cached(
     # Only tee the int8 cache for genuinely large PLINK sources. Small ones
     # (test fixtures, toy datasets) don't benefit from the cache and would
     # complicate the calling tests that monkeypatch compute_variant_statistics.
-    int8_eligible = n_samples * n_variants >= _PLINK_INT8_CACHE_MIN_CELLS
+    # Also honor _USE_INT8_NPY_CACHE — the bitpacked GPU stats path supersedes
+    # the legacy ~130 GB on-disk int8 matrix. Building it speculatively while
+    # snp+sv VCF caches are also writing exhausts disk and produces SIGBUS in
+    # the downstream mmap path. The flag check at the build site
+    # (_build_plink_int8_cache_only) was already correct; this is the parallel
+    # check at the stats-cache miss site that was missing.
+    int8_eligible = (
+        _USE_INT8_NPY_CACHE
+        and n_samples * n_variants >= _PLINK_INT8_CACHE_MIN_CELLS
+    )
     cached_stats = _load_plink_stats_from_cache(stats_path)
     if cached_stats is not None:
         log(
