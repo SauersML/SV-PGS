@@ -1012,61 +1012,98 @@ def _compute_marginal_z_scores_concat(
     variant_offsets = raw_matrix._variant_offsets  # noqa: SLF001 — internal layout
     t_start = time.monotonic()
 
-    for child_idx, (child, kind) in enumerate(zip(raw_matrix.children, child_kinds)):
-        child_start = int(variant_offsets[child_idx])
-        child_stop = int(variant_offsets[child_idx + 1])
-        in_child_mask = (active_idx >= child_start) & (active_idx < child_stop)
-        if not in_child_mask.any():
-            continue
-        output_positions = np.nonzero(in_child_mask)[0]
-        active_dataset_idx_in_child = active_idx[in_child_mask]
-        child_local_idx = active_dataset_idx_in_child - child_start
-        k_in_child = int(child_local_idx.shape[0])
-        means_subset = means_full[active_dataset_idx_in_child]
-        scales_subset = scales_full[active_dataset_idx_in_child]
-        t_child = time.monotonic()
+    # Bound int8-path peak HBM per chunk. The working set for a chunk of k
+    # variants × n samples is dominated by two fp32 intermediates plus the
+    # int8 upload, ~9*n*k bytes. Cap at 4 GiB so even worst-case (200K
+    # active per VCF × 75K train samples) decomposes into safe chunks.
+    _INT8_CHUNK_TARGET_BYTES = 4 * 1024 * 1024 * 1024
 
-        contrib: NDArray
-        if kind == "bitpacked":
-            idx_dev = cp.asarray(child_local_idx, dtype=cp.int64)
-            contrib_dev = child.rmatvec_subset(idx_dev, y_dev)
-            contrib = cp.asnumpy(contrib_dev).astype(np.float64, copy=False)
-            del idx_dev, contrib_dev
-        elif kind == "int8":
-            inner, composed = _unwrap_indexed(child)
-            local_inner_idx = (
-                composed[child_local_idx] if composed is not None else child_local_idx
-            )
-            local_inner_idx = np.ascontiguousarray(local_inner_idx, dtype=np.int64)
-            # Materialize the subset (n_samples × k_in_child int8) from the
-            # backing array. For a memmapped VCF cache this is a fancy-indexing
-            # copy; the working-set is k_in_child * n_samples bytes — well
-            # within HBM for AoU-scale per-chrom subsets.
-            int8_subset = np.ascontiguousarray(
-                inner.matrix[:, local_inner_idx], dtype=np.int8
-            )
-            int8_dev = cp.asarray(int8_subset)
-            del int8_subset
-            mean_dev = cp.asarray(means_subset)
-            scale_dev = cp.asarray(scales_subset)
-            # Standardize: cast to fp32, impute missing (PLINK_MISSING_INT8) to
-            # the column mean so the centered value is 0, divide by scale.
-            f32_subset = int8_dev.astype(cp.float32)
-            missing_mask = int8_dev == PLINK_MISSING_INT8
-            f32_subset = cp.where(missing_mask, mean_dev[None, :], f32_subset)
-            standardized = (f32_subset - mean_dev[None, :]) / scale_dev[None, :]
-            contrib_dev = standardized.T @ y_dev
-            contrib = cp.asnumpy(contrib_dev).astype(np.float64, copy=False)
-            del int8_dev, mean_dev, scale_dev, f32_subset, missing_mask, standardized, contrib_dev
-            cp.get_default_memory_pool().free_all_blocks()
-        elif kind == "plink":
-            # Bitpack-upgrade just this PLINK child's active subset. The
-            # underlying os.pread loop in plink._pread_indexed_variant_payload
-            # sustains gcsfuse-native throughput (~80 MB/s) — see 4b99448 — so
-            # the one-time gather here is bounded and the resulting cache key
-            # is content-addressed (bed mtime+size + sample/variant indices),
-            # which lets a re-run skip straight to the HBM upload.
-            try:
+    try:
+        for child_idx, (child, kind) in enumerate(zip(raw_matrix.children, child_kinds)):
+            child_start = int(variant_offsets[child_idx])
+            child_stop = int(variant_offsets[child_idx + 1])
+            in_child_mask = (active_idx >= child_start) & (active_idx < child_stop)
+            if not in_child_mask.any():
+                continue
+            output_positions = np.nonzero(in_child_mask)[0]
+            active_dataset_idx_in_child = active_idx[in_child_mask]
+            child_local_idx = active_dataset_idx_in_child - child_start
+            k_in_child = int(child_local_idx.shape[0])
+            means_subset = means_full[active_dataset_idx_in_child]
+            scales_subset = scales_full[active_dataset_idx_in_child]
+            t_child = time.monotonic()
+
+            contrib: NDArray
+            if kind == "bitpacked":
+                if int(child._n_samples) != n:  # noqa: SLF001
+                    log(
+                        f"marginal-z concat fast path: SKIPPED (bitpacked child[{child_idx}] "
+                        f"n_samples={int(child._n_samples)} != y n={n})"
+                    )
+                    return None
+                idx_dev = cp.asarray(child_local_idx, dtype=cp.int64)
+                contrib_dev = child.rmatvec_subset(idx_dev, y_dev)
+                contrib = cp.asnumpy(contrib_dev).astype(np.float64, copy=False)
+                del idx_dev, contrib_dev
+            elif kind == "int8":
+                inner, composed = _unwrap_indexed(child)
+                if int(inner.matrix.shape[0]) != n:
+                    log(
+                        f"marginal-z concat fast path: SKIPPED (int8 child[{child_idx}] "
+                        f"rows={int(inner.matrix.shape[0])} != y n={n})"
+                    )
+                    return None
+                local_inner_idx_full = (
+                    composed[child_local_idx] if composed is not None else child_local_idx
+                )
+                local_inner_idx_full = np.ascontiguousarray(local_inner_idx_full, dtype=np.int64)
+                # Chunk along the variant axis to keep peak HBM bounded.
+                bytes_per_variant_working_set = max(int(n) * 9, 1)
+                chunk_k = max(
+                    1,
+                    min(k_in_child, _INT8_CHUNK_TARGET_BYTES // bytes_per_variant_working_set),
+                )
+                contrib = np.empty(k_in_child, dtype=np.float64)
+                for c_start in range(0, k_in_child, chunk_k):
+                    c_stop = min(c_start + chunk_k, k_in_child)
+                    chunk_inner_idx = local_inner_idx_full[c_start:c_stop]
+                    chunk_means = means_subset[c_start:c_stop]
+                    chunk_scales = scales_subset[c_start:c_stop]
+                    int8_chunk = np.ascontiguousarray(
+                        inner.matrix[:, chunk_inner_idx], dtype=np.int8
+                    )
+                    int8_dev = cp.asarray(int8_chunk)
+                    del int8_chunk
+                    mean_dev = cp.asarray(chunk_means)
+                    scale_dev = cp.asarray(chunk_scales)
+                    # Standardize: cast to fp32, impute missing
+                    # (PLINK_MISSING_INT8) to the column mean so the centered
+                    # value is 0, divide by scale.
+                    f32_chunk = int8_dev.astype(cp.float32)
+                    missing_mask = int8_dev == PLINK_MISSING_INT8
+                    f32_chunk = cp.where(missing_mask, mean_dev[None, :], f32_chunk)
+                    standardized = (f32_chunk - mean_dev[None, :]) / scale_dev[None, :]
+                    contrib_chunk_dev = standardized.T @ y_dev
+                    contrib[c_start:c_stop] = cp.asnumpy(contrib_chunk_dev).astype(
+                        np.float64, copy=False
+                    )
+                    del int8_dev, mean_dev, scale_dev, f32_chunk, missing_mask, standardized, contrib_chunk_dev
+                    cp.get_default_memory_pool().free_all_blocks()
+            elif kind == "plink":
+                # Bitpack-upgrade just this PLINK child's active subset. The
+                # underlying os.pread loop in plink._pread_indexed_variant_payload
+                # sustains gcsfuse-native throughput (~80 MB/s) — see 4b99448 —
+                # so the one-time gather here is bounded and the resulting
+                # cache key is content-addressed (bed mtime+size + sample/
+                # variant indices), which lets a re-run skip straight to the
+                # HBM upload.
+                child_sample_count = int(np.asarray(child.sample_indices).shape[0])
+                if child_sample_count != n:
+                    log(
+                        f"marginal-z concat fast path: SKIPPED (PLINK child[{child_idx}] "
+                        f"sample_indices size={child_sample_count} != y n={n})"
+                    )
+                    return None
                 from sv_pgs.bitpacked_loader import load_bed_to_bitpacked_device_cached
                 bed_path = str(child.bed_path)
                 cache_dir = Path(bed_path).parent / ".sv_pgs_cache"
@@ -1092,20 +1129,20 @@ def _compute_marginal_z_scores_concat(
                 # will rebuild a (smaller, reduced-set) bitpacked matrix anyway.
                 del bp_matrix
                 cp.get_default_memory_pool().free_all_blocks()
-            except Exception as exc:  # noqa: BLE001
-                log(
-                    f"  marginal-z concat: PLINK bitpack-upgrade failed "
-                    f"({type(exc).__name__}: {exc}); falling back to slow path"
-                )
-                return None
-        else:
-            raise AssertionError(f"unreachable child kind: {kind}")
+            else:
+                raise AssertionError(f"unreachable child kind: {kind}")
 
-        sum_xy[output_positions] = contrib
+            sum_xy[output_positions] = contrib
+            log(
+                f"  marginal-z concat: child {child_idx + 1}/{len(raw_matrix.children)} "
+                f"({kind}, k={k_in_child:,}) in {time.monotonic() - t_child:.1f}s"
+            )
+    except Exception as exc:  # noqa: BLE001 — any failure → slow-path fallback
         log(
-            f"  marginal-z concat: child {child_idx + 1}/{len(raw_matrix.children)} "
-            f"({kind}, k={k_in_child:,}) in {time.monotonic() - t_child:.1f}s"
+            f"marginal-z concat fast path: aborted mid-loop "
+            f"({type(exc).__name__}: {exc}); falling back to slow path"
         )
+        return None
 
     xpx_diag = float(n)
     denom = float(np.sqrt(sigma2_resid * xpx_diag))
