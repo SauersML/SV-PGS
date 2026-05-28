@@ -1572,6 +1572,17 @@ def _read_sample_table_cache(
     )
 
 
+def _fsync_parent_dir(path: Path) -> None:
+    try:
+        dir_fd = os.open(path.parent, os.O_RDONLY)
+    except OSError:
+        return
+    try:
+        os.fsync(dir_fd)
+    finally:
+        os.close(dir_fd)
+
+
 def _write_sample_table_cache(
     cache_path: Path,
     *,
