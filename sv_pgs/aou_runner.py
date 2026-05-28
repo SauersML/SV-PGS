@@ -1194,7 +1194,17 @@ def _start_plink_cache_warmup(
     index vector up front, starts that cache pass in the background, and
     temporarily makes the loader wait on that future instead of launching a
     second cache writer for the same key.
+
+    Disabled: observed deadlocks on AoU. The background int8 prefetch reader
+    pipeline stalls after the initial read fills, leaving the warmup thread
+    blocked on a future that never resolves and the main thread blocked in
+    _finish_plink_cache_warmup -> executor.shutdown(wait=True) joining it.
+    Without the warmup, compute_plink_variant_statistics_cached runs inline
+    when the fit first needs PLINK stats and writes the same cache file —
+    we lose the precache/inline overlap, not correctness or cache state.
     """
+    return None
+    # legacy code below — retained for reference, never reached.
     if not any(kind == "vcf" for kind, _ in sources):
         return None
     plink_sources = [path for kind, path in sources if kind == "plink1"]
