@@ -21,7 +21,7 @@ import json
 import os
 import uuid
 from pathlib import Path
-from typing import Literal
+from typing import Literal, Sequence
 
 import numpy as np
 
@@ -188,7 +188,7 @@ def _score_column_priority(evaluation_purpose: EvaluationPurpose) -> tuple[str, 
 
 
 def _select_score_column(
-    columns: list[str],
+    columns: Sequence[str],
     evaluation_purpose: EvaluationPurpose,
     context: str,
 ) -> str:

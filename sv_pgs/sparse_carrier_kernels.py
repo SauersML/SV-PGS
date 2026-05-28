@@ -39,7 +39,7 @@ is exactly what we compare against the dense formulation.
 
 from __future__ import annotations
 
-from typing import Sequence
+from typing import Any, Sequence
 
 import numpy as np
 
@@ -59,14 +59,14 @@ def _xp_of(array: object):
 
 
 def sparse_matvec(
-    carriers: Sequence[object],
-    carrier_genotypes: Sequence[object],
-    means: object,
-    scales: object,
-    x: object,
+    carriers: Sequence[Any],
+    carrier_genotypes: Sequence[Any],
+    means: Any,
+    scales: Any,
+    x: Any,
     n_samples: int,
     n_variants: int,
-) -> object:
+) -> Any:
     """Compute ``y = X_std @ x`` for the sparse carrier representation.
 
     Parameters
@@ -138,14 +138,14 @@ def sparse_matvec(
 
 
 def sparse_rmatvec(
-    carriers: Sequence[object],
-    carrier_genotypes: Sequence[object],
-    means: object,
-    scales: object,
-    y: object,
+    carriers: Sequence[Any],
+    carrier_genotypes: Sequence[Any],
+    means: Any,
+    scales: Any,
+    y: Any,
     n_samples: int,
     n_variants: int,
-) -> object:
+) -> Any:
     """Compute ``z = X_std.T @ y`` for the sparse carrier representation."""
 
     if len(carriers) != n_variants or len(carrier_genotypes) != n_variants:

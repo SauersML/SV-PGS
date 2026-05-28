@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-import base64
-import binascii
 import csv
 import gzip
 import hashlib
@@ -36,7 +34,6 @@ from sv_pgs.preprocessing import (
     _allele_frequencies_from_means,
     _batch_all_stats_i8,
     _means_and_scales_with_floor,
-    _scales_from_centered_sum_squares,
     compute_variant_statistics,
 )
 import jax.numpy as jnp
@@ -3721,7 +3718,7 @@ def _load_plink1_metadata(bed_path: Path) -> _PlinkMetadata:
     try:
         fam_st = fam_path.stat()
         bim_st = bim_path.stat()
-        cache_key: tuple[str, int, int, int, int, int, int] = (
+        cache_key: tuple[str, int, int, int, int, int, int] | None = (
             str(bed_path.resolve()),
             int(fam_st.st_size),
             int(fam_st.st_mtime_ns),
@@ -3731,7 +3728,7 @@ def _load_plink1_metadata(bed_path: Path) -> _PlinkMetadata:
             int(bim_st.st_ino),
         )
     except OSError:
-        cache_key = None  # type: ignore[assignment]
+        cache_key = None
     if cache_key is not None and cache_key in _PLINK_METADATA_PROCESS_CACHE:
         cached = _PLINK_METADATA_PROCESS_CACHE[cache_key]
         log(

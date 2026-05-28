@@ -7579,7 +7579,7 @@ def _apply_sample_space_operator_gpu(
         try:
             from sv_pgs.gpu_scheduler import GPUScheduler as _GPUScheduler
         except Exception:  # noqa: BLE001 - scheduler import failure -> global path
-            _GPUScheduler = None  # type: ignore[assignment]
+            _GPUScheduler = None
         scheduler = getattr(genotype_matrix, "_ld_block_scheduler", None)
         if scheduler is None and _GPUScheduler is not None:
             scheduler = _GPUScheduler.detect()
@@ -7605,7 +7605,7 @@ def _apply_sample_space_operator_gpu(
             n_dev = scheduler.device_count
             n_cols = int(input_gpu.shape[1])
             n_samples_local = int(input_gpu.shape[0])
-            partials: dict[int, Any] = {}
+            partials = {}
             for block_id, idx in ld_block_partition.iter_blocks():
                 if idx.size == 0:
                     continue
@@ -7645,9 +7645,9 @@ def _apply_sample_space_operator_gpu(
         prior32 = cp.asarray(prior_variances_gpu, dtype=cp.float32)
         for col in range(int(input_gpu.shape[1])):
             input_col_f32 = cp.asarray(input_gpu[:, col], dtype=cp.float32)
-            projected = _raw_for_packed.rmatvec(input_col_f32)  # X.T @ v, (n_variants,)
+            projected = _raw_for_packed.rmatvec(input_col_f32)
             projected = projected * prior32
-            contrib = _raw_for_packed.matvec(projected)  # X @ scaled, (n_samples,)
+            contrib = _raw_for_packed.matvec(projected)
             result_gpu[:, col] += cp.asarray(contrib, dtype=dtype)
         return result_gpu[:, 0] if vector_input else result_gpu
     if genotype_matrix._cupy_cache is not None and not _cupy_cache_is_int8_standardized(genotype_matrix._cupy_cache):

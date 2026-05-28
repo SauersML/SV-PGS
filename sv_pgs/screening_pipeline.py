@@ -894,7 +894,8 @@ def run_screening_pass(
         )
 
     per_path_results: list[dict[str, Any]] = []
-    for path, n_s, n_v in zip(bed_paths, n_samples_per_path, n_variants_per_path):
+    bed_paths_seq: list[Path | str] = list(bed_paths)
+    for path, n_s, n_v in zip(bed_paths_seq, n_samples_per_path, n_variants_per_path):
         per_path_results.append(
             _screen_one_path(
                 Path(path),

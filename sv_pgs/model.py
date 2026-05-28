@@ -6,6 +6,7 @@ import os
 import pickle
 import time
 import uuid
+from typing import TYPE_CHECKING
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Sequence, cast
@@ -46,6 +47,9 @@ from sv_pgs.preprocessing import (
 )
 from sv_pgs.progress import log, mem
 from sv_pgs.runtime_policy import runtime_training_policy_for_fit, runtime_training_policy_summary
+
+if TYPE_CHECKING:
+    from sv_pgs.ld_block_partition import LdBlockPartition
 
 del _jax_side_effects
 

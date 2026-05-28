@@ -1092,6 +1092,7 @@ def _stage_via_gcloud_storage(
         cmd.extend([src_gs_uri, str(partial)])
         tool = "gcloud storage cp"
     else:
+        assert gsutil is not None  # gcloud and gsutil were both None → early return above
         cmd = [
             gsutil,
             "-m",
@@ -1323,6 +1324,7 @@ def stage_to_local_parallel(
                 os.environ.get("GOOGLE_PROJECT")
                 or os.environ.get("GOOGLE_CLOUD_PROJECT")
             )
+            src_size_hint: int | None
             try:
                 src_size_hint = resolved_source.stat().st_size
             except OSError:

@@ -419,7 +419,7 @@ def screen(
     has_rhs = rhs is not None
     k = 0
     rhs_dev: Any = None  # float64, (n_samples, k), C-contiguous
-    if has_rhs:
+    if rhs is not None:
         if out_dosage_rhs is None or out_observed_rhs is None:
             raise ValueError(
                 "out_dosage_rhs and out_observed_rhs are both required when rhs is provided"

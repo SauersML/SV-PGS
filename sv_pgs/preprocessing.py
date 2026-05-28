@@ -6,7 +6,7 @@ import uuid
 from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
-from typing import Hashable, Iterator, Sequence, TypeVar, cast
+from typing import Any, Hashable, Iterator, Sequence, TypeVar, cast
 
 import numpy as np
 
@@ -611,7 +611,7 @@ def _minor_allele_frequency(allele_frequency: float) -> float:
 
 
 def compute_variant_stats_bitpacked(
-    matrix: "object",
+    matrix: Any,
 ) -> tuple[I32Array, F32Array, F32Array]:
     """Return (non_missing_counts, means, scales) from a BitpackedDeviceMatrix.
 
@@ -660,7 +660,7 @@ def _bitpacked_maf_cache_key(
 
 
 def select_active_variant_indices_bitpacked(
-    matrix: "object",
+    matrix: Any,
     config: ModelConfig,
     *,
     cache_dir: Path | None = None,

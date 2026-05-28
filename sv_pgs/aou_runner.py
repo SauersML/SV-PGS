@@ -1123,15 +1123,16 @@ def _expand_one_hot_covariates(
             freq_by_col = {}
 
         for prefix, matches in prefix_to_matches.items():
+            chosen_drop: str
             if freq_by_col:
                 # Drop the largest-frequency (majority) reference. Tie-break
                 # deterministically on column name to keep output stable.
-                drop = max(matches, key=lambda c: (freq_by_col.get(c, 0.0), c))
+                chosen_drop = max(matches, key=lambda c: (freq_by_col.get(c, 0.0), c))
             else:
                 # Deterministic stand-in: median position in name-sorted order.
                 sorted_matches = sorted(matches)
-                drop = sorted_matches[len(sorted_matches) // 2]
-            prefix_to_drop[prefix] = drop
+                chosen_drop = sorted_matches[len(sorted_matches) // 2]
+            prefix_to_drop[prefix] = chosen_drop
 
         # Single combined log line as specified in the task.
         drop_msgs = []

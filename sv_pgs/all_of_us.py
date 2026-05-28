@@ -520,7 +520,7 @@ def _add_one_hot_omop_categorical_covariates(rows: list[dict[str, Any]]) -> tupl
 
 def _parse_phenotype_occurrence_count(row: dict[str, Any]) -> int:
     value = row.get("phenotype_occurrence_count")
-    if value in (None, ""):
+    if value is None or value == "":
         return 0
     try:
         return int(value)

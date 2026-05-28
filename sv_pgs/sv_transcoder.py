@@ -155,7 +155,7 @@ def _variant_int8_from_record(record: Any, gather: np.ndarray) -> np.ndarray:
 
 def _variant_record_from_cyvcf2(
     record: Any, positional_index: int
-) -> tuple[VariantRecord, str, str, str]:
+) -> tuple[VariantRecord, str, str, str, str]:
     """Return (VariantRecord, sid, ref_allele, alt_allele, svtype)."""
     chrom = str(record.CHROM)
     pos = int(record.POS)

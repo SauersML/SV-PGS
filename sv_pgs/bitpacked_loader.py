@@ -342,9 +342,10 @@ def _read_packed_parallel(
     chunk = (total_bytes + n_workers - 1) // n_workers
 
     try:
-        from sv_pgs.progress import log as _log
+        from sv_pgs.progress import log as _log_imported
+        _log: Any = _log_imported
     except ImportError:  # pragma: no cover
-        _log = None  # type: ignore[assignment]
+        _log = None
 
     # Aggregated progress counter shared across workers. itertools.count is a
     # C-level atomic increment so workers can bump it without holding a lock;
@@ -453,9 +454,10 @@ def _read_all_packed(
     from sv_pgs.plink import PLINK1_HEADER_SIZE
     import time as _time
     try:
-        from sv_pgs.progress import log as _log
+        from sv_pgs.progress import log as _log_imported
+        _log: Any = _log_imported
     except ImportError:  # pragma: no cover - tests with stubbed progress module
-        _log = None  # type: ignore[assignment]
+        _log = None
     from sv_pgs.diagnostics import region as _diag_region, update_bytes as _diag_update
 
     total_bytes = n_variants * bytes_per_variant
@@ -1203,9 +1205,10 @@ def _load_active_matrix_cache(
     chunk_bytes = 256 * 1024 * 1024  # 256 MiB
     n_chunks = max(1, (packed_size + chunk_bytes - 1) // chunk_bytes)
     try:
-        from sv_pgs.progress import log as _progress_log  # type: ignore
+        from sv_pgs.progress import log as _progress_log_imported
+        _progress_log: Any = _progress_log_imported
     except ImportError:  # pragma: no cover
-        _progress_log = None  # type: ignore[assignment]
+        _progress_log = None
     _start_perf = time.perf_counter()
     with open(cache_dir / "packed.bin", "rb") as fh:
         for chunk_index in range(n_chunks):
@@ -1283,9 +1286,10 @@ def _background_cache_write(
     which is handled by ``verify_active_matrix_cache``.
     """
     try:
-        from sv_pgs.progress import log as _log
+        from sv_pgs.progress import log as _log_imported
+        _log: Any = _log_imported
     except ImportError:  # pragma: no cover
-        _log = None  # type: ignore[assignment]
+        _log = None
     t0 = time.monotonic()
     try:
         try:
@@ -1349,9 +1353,10 @@ def load_bed_to_bitpacked_device_cached(
     )
     cache_subdir = _active_cache_dir(Path(cache_dir), content_hash)
     try:
-        from sv_pgs.progress import log as _log
+        from sv_pgs.progress import log as _log_imported
+        _log: Any = _log_imported
     except ImportError:  # pragma: no cover - progress should always exist
-        _log = None  # type: ignore[assignment]
+        _log = None
 
     if verify_active_matrix_cache(cache_subdir):
         if _log is not None:
