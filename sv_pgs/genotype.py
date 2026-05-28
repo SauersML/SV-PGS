@@ -1146,30 +1146,67 @@ class PlinkRawGenotypeMatrix(RawGenotypeMatrix):
         per_worker_threads = (
             max(1, cpu_budget // prefetch_depth) if num_threads is None else int(num_threads)
         )
-        with ThreadPoolExecutor(max_workers=prefetch_depth) as executor:
-            in_flight: deque[Future[NDArray]] = deque(
-                executor.submit(
-                    self._read_batch_i8,
-                    reader,
-                    batch_index_list[i],
-                    num_threads=per_worker_threads,
-                )
-                for i in range(prefetch_depth)
+
+        # Each prefetch worker gets its OWN bed_reader instance rather than
+        # sharing self._reader. Observed on AoU stats warmup: with 4 workers
+        # sharing one open_bed handle, the first batch of 4 reads completed,
+        # but the next 4 reads hung forever (warmup thread stuck on
+        # future.result(), main blocked in ThreadPoolExecutor.shutdown joining
+        # it). bed_reader's internal read state is not safe for repeated
+        # concurrent .read() calls on the same object; fresh instances are.
+        # We keep the original shared `reader` reference alive for any caller
+        # that wants it later (release_reader still works), but only use it
+        # for the single-batch fast path above — the prefetch path opens its
+        # own dedicated readers and closes them on exit.
+        from bed_reader import open_bed as _open_bed
+
+        per_worker_readers: list[Any] = []
+
+        def _make_reader() -> Any:
+            r = _open_bed(
+                self.bed_path,
+                iid_count=self.total_sample_count,
+                sid_count=self.variant_count,
+                properties={},
+                num_threads=None,
             )
-            next_to_submit = prefetch_depth
-            for i in range(len(batch_index_list)):
-                values = in_flight.popleft().result()
-                if next_to_submit < len(batch_index_list):
-                    in_flight.append(
-                        executor.submit(
-                            self._read_batch_i8,
-                            reader,
-                            batch_index_list[next_to_submit],
-                            num_threads=per_worker_threads,
-                        )
+            per_worker_readers.append(r)
+            return r
+
+        try:
+            worker_readers = [_make_reader() for _ in range(prefetch_depth)]
+            with ThreadPoolExecutor(max_workers=prefetch_depth) as executor:
+                in_flight: deque[Future[NDArray]] = deque(
+                    executor.submit(
+                        self._read_batch_i8,
+                        worker_readers[i],
+                        batch_index_list[i],
+                        num_threads=per_worker_threads,
                     )
-                    next_to_submit += 1
-                yield RawGenotypeBatch(variant_indices=batch_index_list[i], values=values)
+                    for i in range(prefetch_depth)
+                )
+                next_to_submit = prefetch_depth
+                for i in range(len(batch_index_list)):
+                    values = in_flight.popleft().result()
+                    if next_to_submit < len(batch_index_list):
+                        in_flight.append(
+                            executor.submit(
+                                self._read_batch_i8,
+                                worker_readers[next_to_submit % prefetch_depth],
+                                batch_index_list[next_to_submit],
+                                num_threads=per_worker_threads,
+                            )
+                        )
+                        next_to_submit += 1
+                    yield RawGenotypeBatch(variant_indices=batch_index_list[i], values=values)
+        finally:
+            for r in per_worker_readers:
+                close = getattr(r, "close", None)
+                if callable(close):
+                    try:
+                        close()
+                    except Exception:
+                        pass
 
     def iter_column_batches(
         self,
