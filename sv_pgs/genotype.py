@@ -2702,6 +2702,46 @@ def _resolve_plink_pread_context(raw: Any) -> tuple[Any, NDArray, int, str] | No
     return None
 
 
+def _raw_variants_are_pure_single_plink_source(node: Any) -> bool:
+    """Return True iff every column of ``node`` is served by ONE BED file.
+
+    The direct PLINK-pread fast path indexes
+    ``selected_variant_indices`` straight as file positions. That's
+    legitimate only when ``node`` is some wrapping (RowSubset / Indexed /
+    a single-child Concatenated) around exactly one
+    ``PlinkRawGenotypeMatrix``. As soon as a multi-child Concatenated is
+    present the per-source variant indices live in different coordinate
+    systems and the direct path silently mis-indexes — see the EOF crash
+    on AoU SNP+SV where dataset-space PLINK indices land past the actual
+    BED end. Callers that hold true must drop back to per-source
+    streaming (which already dispatches per child via
+    ``iter_column_batches_i8``).
+    """
+    seen: set[int] = set()
+    cur = node
+    while True:
+        if cur is None or id(cur) in seen:
+            return False
+        seen.add(id(cur))
+        if isinstance(cur, PlinkRawGenotypeMatrix):
+            return True
+        # Single-child wrappers pass through.
+        child = getattr(cur, "child", None)
+        if child is not None:
+            cur = child
+            continue
+        # A Concatenated is OK iff it has exactly one (PLINK-rooted)
+        # child — same coordinate system as a plain wrapper.
+        children = getattr(cur, "children", None)
+        if children is None:
+            return False
+        children_list = list(children)
+        if len(children_list) == 1:
+            cur = children_list[0]
+            continue
+        return False
+
+
 _plink_gpu_decode_kernel_cache: Any = None
 
 
@@ -2975,6 +3015,29 @@ def _gpu_int8_transpose_matmul(
         )
     # Single-GPU path: prefer GPU-decode when Plink-backed.
     ctx = _resolve_plink_pread_context(raw_int8)
+    if ctx is not None and not _raw_variants_are_pure_single_plink_source(raw_int8):
+        # The direct PLINK pread path indexes into a single BED file by
+        # passing ``selected_variant_indices`` straight to os.pread as
+        # file positions. That contract holds only when EVERY variant in
+        # ``raw_int8`` lives in that one BED — i.e. the wrapper tree is
+        # nothing but a single ``PlinkRawGenotypeMatrix`` underneath
+        # (possibly behind RowSubset/Indexed/single-child Concatenated
+        # wrappers). When ``raw_int8`` is a mixed-source
+        # ``Concatenated([VCF_int8..., PlinkRaw])``,
+        # ``selected_variant_indices`` are dataset-column indices: VCF
+        # entries point into VCF caches (small numbers) and PLINK entries
+        # are offset by ``len(VCF columns)``. Feeding those straight to a
+        # 194 GB .bed at byte offset ``HEADER + idx * bpv`` lands VCF
+        # indices on random PLINK rows (silent wrong z-scores) and lands
+        # PLINK entries at offsets ``>= file_size`` (the EOF crash
+        # observed on AoU after 4b99448 unblocked the gcsfuse hang). The
+        # per-source streaming fallback below dispatches per child and is
+        # what every other Concatenated-aware code path uses.
+        log(
+            "    GPU-decode skipped: raw is a mixed-source matrix; the "
+            "direct PLINK pread path would mis-interpret non-PLINK indices"
+        )
+        ctx = None
     if ctx is not None:
         reader, sample_indices, iid_count, bed_path = ctx
         return _gpu_plink_pread_transpose_matmul_direct(
