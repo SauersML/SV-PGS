@@ -1433,6 +1433,7 @@ _CACHE_DIR_NAME = ".sv_pgs_cache"
 # Bump this when _VariantDefaults, VariantClass, or the cache format changes
 # so stale caches are automatically invalidated.
 _CACHE_VERSION = 3
+_VCF_CACHE_MANIFEST_VERSION = 2
 _VCF_CACHE_STATS_DTYPE = np.dtype(
     [
         ("means", "<f4"),
@@ -1441,6 +1442,23 @@ _VCF_CACHE_STATS_DTYPE = np.dtype(
         ("support_counts", "<i4"),
     ]
 )
+_VCF_CACHE_VARIANT_NUMERIC_DTYPE = np.dtype(
+    [
+        ("variant_class_code", "<u2"),
+        ("position", "<i8"),
+        ("length", "<f4"),
+        ("allele_frequency", "<f4"),
+        ("quality", "<f4"),
+    ]
+)
+_VARIANT_CLASS_TO_CODE = {
+    variant_class: code
+    for code, variant_class in enumerate(VariantClass)
+}
+_VARIANT_CODE_TO_CLASS = {
+    code: variant_class
+    for variant_class, code in _VARIANT_CLASS_TO_CODE.items()
+}
 
 # ---------------------------------------------------------------------------
 # Filtered sample table disk cache
