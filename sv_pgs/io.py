@@ -1598,6 +1598,7 @@ def _write_sample_table_cache(
         raise
 
 
+@dataclass(slots=True)
 class _VcfCachePaths:
     key: str
     cache_dir: Path
