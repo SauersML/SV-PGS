@@ -1464,8 +1464,37 @@ def run_all_of_us(
     # Aborts loudly on any fatal_error so a misconfigured workbench fails fast
     # instead of half-staging into a broken cache. The shared cache dir lives
     # one level above per-disease work_dir, so that's what we preflight.
+    #
+    # Stage requirement is 100 GB by default — sized for a FROM-SCRATCH run
+    # that has to stage VCFs + bitpacked PLINK from gcsfuse. On repeat runs
+    # the heavy caches are already on disk (e.g. ``aou_sv_vcfs`` ~200 GB,
+    # ``staged_bitpacked`` ~180 GB), and demanding another 100 GB of free
+    # space on top blocks restart with no actual write-pressure to back it.
+    # Detect what's already cached on the SAME filesystem and discount the
+    # stage requirement by the existing footprint, bounded so we still keep
+    # ~20 GB headroom for fit-stage spill files.
     _preflight_cache_dir = work_dir.parent / _LOCAL_CACHE_DIRNAME
-    _preflight_report = check_aou_preflight(cache_dir=_preflight_cache_dir)
+    _cache_credit_bytes = 0
+    for _existing in ("aou_sv_vcfs", "staged_bitpacked"):
+        _existing_path = _preflight_cache_dir / _existing
+        if _existing_path.is_dir():
+            try:
+                _cache_credit_bytes += sum(
+                    p.stat().st_size for p in _existing_path.rglob("*") if p.is_file()
+                )
+            except OSError:
+                # Don't let a stat failure cause a phantom credit — leave the
+                # requirement at the conservative default for this cache.
+                pass
+    # 100 GB nominal − cache credit, floored at 20 GB so a fit spill never
+    # silently runs out of disk mid-run.
+    _stage_required = max(
+        100_000_000_000 - int(_cache_credit_bytes), 20_000_000_000
+    )
+    _preflight_report = check_aou_preflight(
+        cache_dir=_preflight_cache_dir,
+        required_stage_bytes=_stage_required,
+    )
     log_preflight(_preflight_report)
     assert_preflight_ok(_preflight_report)
 
