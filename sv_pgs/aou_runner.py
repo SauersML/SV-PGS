@@ -1465,68 +1465,66 @@ def run_all_of_us(
     # instead of half-staging into a broken cache. The shared cache dir lives
     # one level above per-disease work_dir, so that's what we preflight.
     #
-    # Disk requirement is what the run will actually WRITE this invocation,
-    # not the size of the final cache. If a cache already exists locally we
-    # don't need free space to recreate it. We size each chunk against what
-    # *this* run still has to stage:
+    # Disk requirement is what *this invocation* still has to write, not the
+    # final cache size:
     #
-    #   * VCF cache (aou_sv_vcfs): ~200 GB cold; if the bucket already has
-    #     bytes, charge only the deficit so a partial cache doesn't get
-    #     priced as full.
-    #   * Bitpacked staging (staged_bitpacked): ~180 GB cold, same deficit
-    #     logic. With the post-396ba8a concat fast path the marginal-z
-    #     screen doesn't actually populate this — the post-active upgrade
-    #     does — so on the SNP+SV path we can charge a fraction.
-    #   * Fit temp budget: 5 GiB for spill/checkpoint files regardless.
-    #
-    # The two cache targets and the temp budget can be overridden by env
-    # vars so workbenches with smaller disks (or different mount layouts)
-    # can dial them down explicitly: SV_PGS_PREFLIGHT_VCF_TARGET_BYTES,
-    # SV_PGS_PREFLIGHT_BITPACKED_TARGET_BYTES, SV_PGS_PREFLIGHT_TEMP_BYTES.
+    #   * VCF cache (aou_sv_vcfs): sum the remote .vcf.gz size of every
+    #     chromosome that isn't already in the local cache. Files already
+    #     in the cache contribute zero. Computed straight from gcsfuse
+    #     stat — no constant.
+    #   * Bitpacked staging (staged_bitpacked): zero, because the bitpacked
+    #     loader is content-addressed and overwrites in place; on this AoU
+    #     box it never grows beyond the existing footprint mid-run, and on
+    #     a fresh box the active-subset cache it produces is sized to the
+    #     active variant count which we don't know yet at preflight time.
+    #     Trust the runtime free-space check inside the loader for that.
+    #   * Temp / fit spill: 1 % of the cache filesystem capacity — scales
+    #     with the actual disk so a small workbench doesn't get the same
+    #     gate as a 1 TB one.
     _preflight_cache_dir = work_dir.parent / _LOCAL_CACHE_DIRNAME
 
-    def _dir_bytes(path: Path) -> int:
-        if not path.is_dir():
+    def _vcf_remote_size(chromosome: int) -> int:
+        cdr_storage_path = os.environ.get("CDR_STORAGE_PATH", "").rstrip("/")
+        if not cdr_storage_path:
             return 0
+        if cdr_storage_path.startswith("gs://"):
+            local_root = (
+                Path("/home/jupyter/workspace")
+                / cdr_storage_path[len("gs://") :].split("/", 1)[0]
+            )
+            rest = "/".join(cdr_storage_path[len("gs://") :].split("/")[1:])
+            local_remote = local_root / rest / "wgs/sv_vcfs" / sv_vcf_name(chromosome)
+        else:
+            local_remote = Path(cdr_storage_path) / "wgs/sv_vcfs" / sv_vcf_name(chromosome)
         try:
-            return int(sum(p.stat().st_size for p in path.rglob("*") if p.is_file()))
+            return int(local_remote.stat().st_size)
         except OSError:
             return 0
 
-    def _env_int(name: str, default: int) -> int:
-        raw = os.environ.get(name)
-        if raw is None or raw == "":
-            return default
-        try:
-            return max(0, int(raw))
-        except ValueError:
-            log(f"  preflight: ignoring non-integer {name}={raw!r}, using default {default}")
-            return default
+    _vcf_cache_dir = _preflight_cache_dir / "aou_sv_vcfs"
+    _vcf_stage_needed = 0
+    for _chrom in chromosomes:
+        _local_vcf = _vcf_cache_dir / sv_vcf_name(_chrom)
+        if _local_vcf.exists():
+            continue
+        _vcf_stage_needed += _vcf_remote_size(_chrom)
 
-    _vcf_target = _env_int("SV_PGS_PREFLIGHT_VCF_TARGET_BYTES", 200_000_000_000)
-    _bitpacked_target = _env_int(
-        "SV_PGS_PREFLIGHT_BITPACKED_TARGET_BYTES", 180_000_000_000
-    )
-    _temp_required = _env_int("SV_PGS_PREFLIGHT_TEMP_BYTES", 5_000_000_000)
-
-    _vcf_have = _dir_bytes(_preflight_cache_dir / "aou_sv_vcfs")
-    _bitpacked_have = _dir_bytes(_preflight_cache_dir / "staged_bitpacked")
-    _vcf_deficit = max(_vcf_target - _vcf_have, 0)
-    _bitpacked_deficit = max(_bitpacked_target - _bitpacked_have, 0)
-    _stage_required = int(_vcf_deficit + _bitpacked_deficit)
+    try:
+        _fs_total_bytes = int(shutil.disk_usage(_preflight_cache_dir.parent).total)
+    except OSError:
+        _fs_total_bytes = 0
+    _temp_required = max(_fs_total_bytes // 100, 1_000_000_000)
 
     log(
-        f"  preflight stage budget: vcf_target={_vcf_target / 1e9:.0f}GB "
-        f"have={_vcf_have / 1e9:.1f}GB deficit={_vcf_deficit / 1e9:.1f}GB, "
-        f"bitpacked_target={_bitpacked_target / 1e9:.0f}GB "
-        f"have={_bitpacked_have / 1e9:.1f}GB deficit={_bitpacked_deficit / 1e9:.1f}GB, "
-        f"temp={_temp_required / 1e9:.1f}GB"
+        f"  preflight: vcf_stage_needed={_vcf_stage_needed / 1e9:.1f}GB "
+        f"(missing chroms only), fit_temp={_temp_required / 1e9:.1f}GB "
+        f"(1% of {_fs_total_bytes / 1e9:.0f}GB cache fs)"
     )
 
     _preflight_report = check_aou_preflight(
         cache_dir=_preflight_cache_dir,
-        required_stage_bytes=_stage_required,
-        required_temp_bytes=_temp_required,
+        required_stage_bytes=int(_vcf_stage_needed),
+        required_temp_bytes=int(_temp_required),
     )
     log_preflight(_preflight_report)
     assert_preflight_ok(_preflight_report)
