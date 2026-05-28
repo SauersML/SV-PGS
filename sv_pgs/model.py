@@ -932,15 +932,49 @@ def _compute_marginal_z_scores_concat(
     # Classify every child up front. Bail (return None → slow-path fallback)
     # the moment we hit something we don't know how to handle, so we never
     # half-finish a per-child decode and produce wrong z-scores.
-    def _unwrap_indexed(node: Any) -> tuple[Any, NDArray | None]:
-        """Return (innermost child, composed index mapping or None)."""
-        composed: NDArray | None = None
-        while isinstance(node, IndexedRawGenotypeMatrix):
-            selected = np.asarray(node.selected_columns, dtype=np.int64)
-            composed = selected if composed is None else selected[composed]
-            node = node.child
-        return node, composed
+    #
+    # Walks through both ``IndexedRawGenotypeMatrix`` (column reindex; AoU
+    # uses this for cross-source duplicate dropping) and
+    # ``RowSubsetRawGenotypeMatrix`` (row/sample reindex; AoU uses this for
+    # the train/test split on the in-memory VCF mmaps) to find the underlying
+    # ``Int8RawGenotypeMatrix`` while composing both indices. The row-subset
+    # is the one that bit AoU runs pre-fix: VCF children are
+    # ``RowSubsetRowGenotypeMatrix(child=Int8RawGenotypeMatrix(matrix=mmap))``
+    # so the original classifier saw an unknown ``RowSubsetRawGenotypeMatrix``
+    # type, returned None, and dropped into the chunked slow path.
+    def _unwrap_int8_chain(
+        node: Any,
+    ) -> tuple[Int8RawGenotypeMatrix, NDArray | None, NDArray | None] | None:
+        """Walk Indexed/RowSubset wrappers around an Int8RawGenotypeMatrix.
 
+        Returns (inner_int8, composed_column_indices_or_None,
+        composed_row_indices_or_None) or None if the chain doesn't terminate
+        in an ``Int8RawGenotypeMatrix``. Indices compose so that
+        ``inner.matrix[composed_rows, :][:, composed_cols][i, j]`` equals
+        the original ``node[i, j]`` after both reindex layers.
+        """
+        composed_cols: NDArray | None = None
+        composed_rows: NDArray | None = None
+        cur = node
+        while True:
+            if isinstance(cur, Int8RawGenotypeMatrix):
+                return cur, composed_cols, composed_rows
+            if isinstance(cur, IndexedRawGenotypeMatrix):
+                selected = np.asarray(cur.selected_columns, dtype=np.int64)
+                composed_cols = selected if composed_cols is None else selected[composed_cols]
+                cur = cur.child
+                continue
+            if isinstance(cur, RowSubsetRawGenotypeMatrix):
+                rows = np.asarray(cur.row_indices, dtype=np.int64)
+                # If we already have an outer row mapping, the inner rows
+                # must be re-indexed by it: final_row[i] = rows[outer[i]].
+                composed_rows = rows if composed_rows is None else rows[composed_rows]
+                cur = cur.child
+                continue
+            return None
+
+    # (inner Int8, composed cols, composed rows) per child for int8 kinds.
+    int8_chain_cache: dict[int, tuple[Int8RawGenotypeMatrix, NDArray | None, NDArray | None]] = {}
     child_kinds: list[str] = []
     for child in raw_matrix.children:
         if isinstance(child, BitpackedDeviceMatrix):
@@ -949,14 +983,16 @@ def _compute_marginal_z_scores_concat(
         if isinstance(child, PlinkRawGenotypeMatrix):
             child_kinds.append("plink")
             continue
-        inner, _ = _unwrap_indexed(child)
-        if isinstance(inner, Int8RawGenotypeMatrix):
+        chain = _unwrap_int8_chain(child)
+        if chain is not None:
+            int8_chain_cache[len(child_kinds)] = chain
             child_kinds.append("int8")
             continue
         log(
             "marginal-z concat fast path: SKIPPED "
             f"(reason: unsupported child[{len(child_kinds)}] type "
-            f"{type(child).__name__} → inner {type(inner).__name__})"
+            f"{type(child).__name__}; chain did not terminate in "
+            "Int8RawGenotypeMatrix)"
         )
         return None
     log(
@@ -1046,15 +1082,25 @@ def _compute_marginal_z_scores_concat(
                 contrib = cp.asnumpy(contrib_dev).astype(np.float64, copy=False)
                 del idx_dev, contrib_dev
             elif kind == "int8":
-                inner, composed = _unwrap_indexed(child)
-                if int(inner.matrix.shape[0]) != n:
+                inner, composed_cols, composed_rows = int8_chain_cache[child_idx]
+                # After applying composed_rows the effective sample count is
+                # either ``len(composed_rows)`` (row-subset chain) or the
+                # bare ``inner.matrix.shape[0]`` (no row reindex).
+                eff_n_samples = (
+                    int(composed_rows.shape[0])
+                    if composed_rows is not None
+                    else int(inner.matrix.shape[0])
+                )
+                if eff_n_samples != n:
                     log(
                         f"marginal-z concat fast path: SKIPPED (int8 child[{child_idx}] "
-                        f"rows={int(inner.matrix.shape[0])} != y n={n})"
+                        f"effective rows={eff_n_samples} != y n={n})"
                     )
                     return None
                 local_inner_idx_full = (
-                    composed[child_local_idx] if composed is not None else child_local_idx
+                    composed_cols[child_local_idx]
+                    if composed_cols is not None
+                    else child_local_idx
                 )
                 local_inner_idx_full = np.ascontiguousarray(local_inner_idx_full, dtype=np.int64)
                 # Chunk along the variant axis to keep peak HBM bounded.
@@ -1069,9 +1115,20 @@ def _compute_marginal_z_scores_concat(
                     chunk_inner_idx = local_inner_idx_full[c_start:c_stop]
                     chunk_means = means_subset[c_start:c_stop]
                     chunk_scales = scales_subset[c_start:c_stop]
-                    int8_chunk = np.ascontiguousarray(
-                        inner.matrix[:, chunk_inner_idx], dtype=np.int8
-                    )
+                    # Materialize the chunk. Order matters for mmap-backed
+                    # inner: subset cols first (sequential stride through
+                    # the mmap), THEN apply row subset on the resulting in-
+                    # memory column block — that keeps the cold path to the
+                    # mmap to ``n_full_samples × chunk_k`` reads instead of
+                    # ``len(composed_rows) × chunk_k`` scattered fetches.
+                    col_block = inner.matrix[:, chunk_inner_idx]
+                    if composed_rows is not None:
+                        int8_chunk = np.ascontiguousarray(
+                            col_block[composed_rows, :], dtype=np.int8
+                        )
+                    else:
+                        int8_chunk = np.ascontiguousarray(col_block, dtype=np.int8)
+                    del col_block
                     int8_dev = cp.asarray(int8_chunk)
                     del int8_chunk
                     mean_dev = cp.asarray(chunk_means)
