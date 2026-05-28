@@ -1465,35 +1465,68 @@ def run_all_of_us(
     # instead of half-staging into a broken cache. The shared cache dir lives
     # one level above per-disease work_dir, so that's what we preflight.
     #
-    # Stage requirement is 100 GB by default — sized for a FROM-SCRATCH run
-    # that has to stage VCFs + bitpacked PLINK from gcsfuse. On repeat runs
-    # the heavy caches are already on disk (e.g. ``aou_sv_vcfs`` ~200 GB,
-    # ``staged_bitpacked`` ~180 GB), and demanding another 100 GB of free
-    # space on top blocks restart with no actual write-pressure to back it.
-    # Detect what's already cached on the SAME filesystem and discount the
-    # stage requirement by the existing footprint, bounded so we still keep
-    # ~20 GB headroom for fit-stage spill files.
+    # Disk requirement is what the run will actually WRITE this invocation,
+    # not the size of the final cache. If a cache already exists locally we
+    # don't need free space to recreate it. We size each chunk against what
+    # *this* run still has to stage:
+    #
+    #   * VCF cache (aou_sv_vcfs): ~200 GB cold; if the bucket already has
+    #     bytes, charge only the deficit so a partial cache doesn't get
+    #     priced as full.
+    #   * Bitpacked staging (staged_bitpacked): ~180 GB cold, same deficit
+    #     logic. With the post-396ba8a concat fast path the marginal-z
+    #     screen doesn't actually populate this — the post-active upgrade
+    #     does — so on the SNP+SV path we can charge a fraction.
+    #   * Fit temp budget: 5 GiB for spill/checkpoint files regardless.
+    #
+    # The two cache targets and the temp budget can be overridden by env
+    # vars so workbenches with smaller disks (or different mount layouts)
+    # can dial them down explicitly: SV_PGS_PREFLIGHT_VCF_TARGET_BYTES,
+    # SV_PGS_PREFLIGHT_BITPACKED_TARGET_BYTES, SV_PGS_PREFLIGHT_TEMP_BYTES.
     _preflight_cache_dir = work_dir.parent / _LOCAL_CACHE_DIRNAME
-    _cache_credit_bytes = 0
-    for _existing in ("aou_sv_vcfs", "staged_bitpacked"):
-        _existing_path = _preflight_cache_dir / _existing
-        if _existing_path.is_dir():
-            try:
-                _cache_credit_bytes += sum(
-                    p.stat().st_size for p in _existing_path.rglob("*") if p.is_file()
-                )
-            except OSError:
-                # Don't let a stat failure cause a phantom credit — leave the
-                # requirement at the conservative default for this cache.
-                pass
-    # 100 GB nominal − cache credit, floored at 20 GB so a fit spill never
-    # silently runs out of disk mid-run.
-    _stage_required = max(
-        100_000_000_000 - int(_cache_credit_bytes), 20_000_000_000
+
+    def _dir_bytes(path: Path) -> int:
+        if not path.is_dir():
+            return 0
+        try:
+            return int(sum(p.stat().st_size for p in path.rglob("*") if p.is_file()))
+        except OSError:
+            return 0
+
+    def _env_int(name: str, default: int) -> int:
+        raw = os.environ.get(name)
+        if raw is None or raw == "":
+            return default
+        try:
+            return max(0, int(raw))
+        except ValueError:
+            log(f"  preflight: ignoring non-integer {name}={raw!r}, using default {default}")
+            return default
+
+    _vcf_target = _env_int("SV_PGS_PREFLIGHT_VCF_TARGET_BYTES", 200_000_000_000)
+    _bitpacked_target = _env_int(
+        "SV_PGS_PREFLIGHT_BITPACKED_TARGET_BYTES", 180_000_000_000
     )
+    _temp_required = _env_int("SV_PGS_PREFLIGHT_TEMP_BYTES", 5_000_000_000)
+
+    _vcf_have = _dir_bytes(_preflight_cache_dir / "aou_sv_vcfs")
+    _bitpacked_have = _dir_bytes(_preflight_cache_dir / "staged_bitpacked")
+    _vcf_deficit = max(_vcf_target - _vcf_have, 0)
+    _bitpacked_deficit = max(_bitpacked_target - _bitpacked_have, 0)
+    _stage_required = int(_vcf_deficit + _bitpacked_deficit)
+
+    log(
+        f"  preflight stage budget: vcf_target={_vcf_target / 1e9:.0f}GB "
+        f"have={_vcf_have / 1e9:.1f}GB deficit={_vcf_deficit / 1e9:.1f}GB, "
+        f"bitpacked_target={_bitpacked_target / 1e9:.0f}GB "
+        f"have={_bitpacked_have / 1e9:.1f}GB deficit={_bitpacked_deficit / 1e9:.1f}GB, "
+        f"temp={_temp_required / 1e9:.1f}GB"
+    )
+
     _preflight_report = check_aou_preflight(
         cache_dir=_preflight_cache_dir,
         required_stage_bytes=_stage_required,
+        required_temp_bytes=_temp_required,
     )
     log_preflight(_preflight_report)
     assert_preflight_ok(_preflight_report)
