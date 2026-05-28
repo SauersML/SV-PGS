@@ -335,7 +335,19 @@ class open_bed:
         *,
         bytes_per_variant: int,
     ) -> U8Array:
-        """Read arbitrary variant records into one contiguous payload buffer."""
+        """Read arbitrary variant records into one contiguous payload buffer.
+
+        ``variant_indices`` MUST be PLINK-local (i.e. in
+        ``[0, self.sid_count)``). Passing dataset-space indices from a
+        multi-source matrix is a contract violation — the resulting
+        ``os.pread`` either returns wrong bytes (indices below sid_count
+        but pointing at the wrong row) or lands past EOF (indices >=
+        sid_count). Historically that surfaced as the AoU SNP+SV crash
+        ``OSError: Unexpected EOF reading PLINK .bed at offset
+        194485059583`` and, for indices that happened to fall below
+        sid_count, as silently wrong z-scores. Validate up front so the
+        contract violation is loud and attributable.
+        """
         indices = np.asarray(variant_indices, dtype=np.int64)
         if indices.ndim != 1:
             raise ValueError("PLINK variant indices must be 1D.")
@@ -343,6 +355,20 @@ class open_bed:
             return np.empty((0,), dtype=np.uint8)
         if bytes_per_variant <= 0:
             raise ValueError("bytes_per_variant must be positive.")
+        # Explicit bounds check — the contract is that ``indices`` are
+        # PLINK-local column positions for *this* BED file.
+        idx_max = int(indices.max())
+        idx_min = int(indices.min())
+        if idx_min < 0 or idx_max >= int(self.sid_count):
+            raise ValueError(
+                "PLINK variant indices out of bounds for "
+                f"{self.path!s} (sid_count={int(self.sid_count)}): "
+                f"got min={idx_min}, max={idx_max}. If the caller is "
+                "indexing into a ConcatenatedRawGenotypeMatrix, the "
+                "dataset-column indices must be filtered to this child's "
+                "range and translated to PLINK-local positions before "
+                "calling _pread_indexed_variant_payload."
+            )
 
         if (
             self._mmap_reader is not None
