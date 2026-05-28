@@ -8,7 +8,6 @@ import shutil
 import subprocess
 import time
 import uuid
-from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -1172,164 +1171,6 @@ AOU_SAMPLE_SPACE_PRECONDITIONER_RANK = 32
 AOU_VALIDATION_INTERVAL = 1
 
 
-@dataclass(slots=True)
-class _PlinkCacheWarmup:
-    executor: ThreadPoolExecutor
-    future: Future[tuple[Any, Path | None]]
-    original_compute: Any
-
-
-def _start_plink_cache_warmup(
-    *,
-    sources: list[tuple[str, Path]],
-    config: ModelConfig,
-    sample_table_path: Path,
-    covariates: list[str],
-) -> _PlinkCacheWarmup | None:
-    """Start the exact AoU PLINK stats/int8 cache pass the loader will need.
-
-    The unified loader processes sources in order. For SNP+SV runs that means
-    cached VCFs are opened first and PLINK stats/int8 construction begins only
-    after the VCF work is finished. This warmup computes the same PLINK sample
-    index vector up front, starts that cache pass in the background, and
-    temporarily makes the loader wait on that future instead of launching a
-    second cache writer for the same key.
-
-    Disabled: observed deadlocks on AoU. The background int8 prefetch reader
-    pipeline stalls after the initial read fills, leaving the warmup thread
-    blocked on a future that never resolves and the main thread blocked in
-    _finish_plink_cache_warmup -> executor.shutdown(wait=True) joining it.
-    Without the warmup, compute_plink_variant_statistics_cached runs inline
-    when the fit first needs PLINK stats and writes the same cache file —
-    we lose the precache/inline overlap, not correctness or cache state.
-    """
-    return None
-    # legacy code below — retained for reference, never reached.
-    if not any(kind == "vcf" for kind, _ in sources):
-        return None
-    plink_sources = [path for kind, path in sources if kind == "plink1"]
-    if len(plink_sources) != 1:
-        return None
-
-    import sv_pgs.io as _io
-    from sv_pgs.genotype import PlinkRawGenotypeMatrix
-    from sv_pgs.io import VariantStatistics
-
-    source_sample_ids: list[list[str]] = []
-    plink_metadata = None
-    for kind, path in sources:
-        if kind == "vcf":
-            ids = _io._read_vcf_sample_ids(path)
-        else:
-            plink_metadata = _io._load_plink1_metadata(path)
-            ids = list(plink_metadata.sample_ids)
-        source_sample_ids.append(ids)
-    if plink_metadata is None:
-        return None
-
-    common_set = set(source_sample_ids[0])
-    for ids in source_sample_ids[1:]:
-        common_set &= set(ids)
-    seen_common: set[str] = set()
-    common_ordered: list[str] = []
-    for sample_id in source_sample_ids[0]:
-        if sample_id in common_set and sample_id not in seen_common:
-            seen_common.add(sample_id)
-            common_ordered.append(sample_id)
-    if not common_ordered:
-        raise RuntimeError("No samples in common across genotype sources.")
-
-    sample_table_spec = _io._inspect_delimited_table(sample_table_path)
-    resolved_sample_id_column = _io._resolve_sample_id_column(
-        table_spec=sample_table_spec,
-        requested_sample_id_column="auto",
-        available_sample_ids=common_ordered,
-    )
-    sample_table, _, _ = _io._build_sample_table(
-        table_spec=sample_table_spec,
-        sample_id_column=resolved_sample_id_column,
-        target_column="target",
-        covariate_columns=covariates,
-        available_sample_ids=common_ordered,
-    )
-    plink_path = plink_sources[0]
-    plink_source_index = next(index for index, (kind, _) in enumerate(sources) if kind == "plink1")
-    plink_sample_indices = np.asarray(
-        _io._align_sample_ids(
-            expected_sample_ids=sample_table.sample_ids,
-            available_sample_ids=source_sample_ids[plink_source_index],
-            context=f"plink1 source {plink_path.name}",
-        ),
-        dtype=np.intp,
-    )
-    original_compute = _io.compute_plink_variant_statistics_cached
-
-    def _compute_plink_cache() -> tuple[VariantStatistics, Path | None]:
-        raw = PlinkRawGenotypeMatrix(
-            bed_path=plink_path,
-            sample_indices=plink_sample_indices,
-            variant_count=plink_metadata.variant_count,
-            total_sample_count=len(plink_metadata.sample_ids),
-        )
-        log(
-            "  PLINK stats/int8 cache warmup started in background "
-            + f"({plink_sample_indices.shape[0]:,} samples x {plink_metadata.variant_count:,} variants)"
-        )
-        return original_compute(
-            raw,
-            bed_path=plink_path,
-            sample_indices=plink_sample_indices,
-            config=config,
-        )
-
-    executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="aou-plink-cache")
-    try:
-        future = executor.submit(_compute_plink_cache)
-    except BaseException:
-        # If submission itself fails (e.g. interpreter shutting down), shut the
-        # pool down rather than leaking the worker thread.
-        executor.shutdown(wait=False, cancel_futures=True)
-        raise
-
-    warmup_config = config
-
-    def _compute_or_wait(
-        raw_genotypes: PlinkRawGenotypeMatrix,
-        bed_path: Path,
-        sample_indices: NDArray,
-        config: ModelConfig,
-    ) -> tuple[VariantStatistics, Path | None]:
-        if (
-            Path(bed_path).resolve() == plink_path.resolve()
-            and float(config.minimum_scale) == float(warmup_config.minimum_scale)
-            and np.array_equal(np.asarray(sample_indices, dtype=np.intp), plink_sample_indices)
-        ):
-            log("  unified loader reached PLINK source; waiting for background stats/int8 cache warmup")
-            return future.result()
-        return original_compute(
-            raw_genotypes,
-            bed_path=bed_path,
-            sample_indices=sample_indices,
-            config=config,
-        )
-
-    _io.compute_plink_variant_statistics_cached = _compute_or_wait
-    return _PlinkCacheWarmup(
-        executor=executor,
-        future=future,
-        original_compute=original_compute,
-    )
-
-
-def _finish_plink_cache_warmup(warmup: _PlinkCacheWarmup | None) -> None:
-    if warmup is None:
-        return
-    import sv_pgs.io as _io
-
-    _io.compute_plink_variant_statistics_cached = warmup.original_compute
-    warmup.executor.shutdown(wait=True, cancel_futures=True)
-
-
 # Process-level dedupe so `_log_cached_test_evals(...)` emits each cached
 # work_dir at most once per Python process. Without this, a sweep over 19
 # diseases would re-print every sibling's cached numbers 20 times (once in
@@ -1897,7 +1738,6 @@ def run_all_of_us(
     vcf_paths: list[Path] = []
     dataset = None
     test_dataset = None
-    plink_cache_warmup: _PlinkCacheWarmup | None = None
     # Wall-clock timing for the end-of-run TIMING SUMMARY. Each phase records
     # ``perf_counter()`` at its boundary; the summary prints the deltas at the
     # very end of run_all_of_us so a `grep "TIMING SUMMARY"` always finds it.
@@ -1940,17 +1780,6 @@ def run_all_of_us(
             random_seed=random_seed,
         )
 
-        if variants == "snp+sv":
-            log("=== STEP 3.25: Start PLINK cache warmup beside VCF work ===")
-            plink_cache_warmup = _start_plink_cache_warmup(
-                sources=sources,
-                config=config,
-                sample_table_path=train_table_path,
-                covariates=covariates,
-            )
-            if plink_cache_warmup is None:
-                log("  PLINK cache warmup not applicable")
-
         if vcf_paths:
             log("=== STEP 3.5: Parallel VCF precache ===")
             from sv_pgs.io import precache_vcfs_parallel
@@ -1963,19 +1792,15 @@ def run_all_of_us(
         _phase_times["download_done"] = time.perf_counter()
 
         log("=== STEP 4: Load unified genome-wide TRAIN dataset ===")
-        try:
-            dataset = load_multi_source_dataset_from_files(
-                sources=[(kind, str(path)) for kind, path in sources],
-                config=config,
-                sample_table_path=str(train_table_path),
-                sample_id_column="auto",
-                target_column="target",
-                covariate_columns=covariates,
-                variant_metadata_path=resolved_variant_metadata_path,
-            )
-        finally:
-            _finish_plink_cache_warmup(plink_cache_warmup)
-            plink_cache_warmup = None
+        dataset = load_multi_source_dataset_from_files(
+            sources=[(kind, str(path)) for kind, path in sources],
+            config=config,
+            sample_table_path=str(train_table_path),
+            sample_id_column="auto",
+            target_column="target",
+            covariate_columns=covariates,
+            variant_metadata_path=resolved_variant_metadata_path,
+        )
         if test_table_path is not None:
             log("=== STEP 4b: Load held-out TEST dataset ===")
             # Same sources, same variant order, different sample subset. The
@@ -2033,7 +1858,6 @@ def run_all_of_us(
                 pass
             raise
     finally:
-        _finish_plink_cache_warmup(plink_cache_warmup)
         if dataset is not None:
             del dataset
         if test_dataset is not None:
