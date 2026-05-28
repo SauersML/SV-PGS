@@ -36,6 +36,7 @@ from sv_pgs.genotype import (
     as_raw_genotype_matrix,
     auto_batch_size,
 )
+from sv_pgs.plink import PLINK_MISSING_INT8
 from sv_pgs.inference import VariationalFitCheckpoint, VariationalFitResult, fit_variational_em
 from sv_pgs.numeric import stable_sigmoid
 from sv_pgs.preprocessing import (
@@ -867,6 +868,253 @@ def _compute_marginal_z_scores_bitpacked(
     denom = float(np.sqrt(sigma2_resid * xpx_diag))
     if denom <= 0.0:
         return np.zeros(m_active, dtype=np.float32)
+    return np.asarray(sum_xy / denom, dtype=np.float32)
+
+
+def _compute_marginal_z_scores_concat(
+    standardized_genotypes: StandardizedGenotypeMatrix,
+    active_variant_indices: NDArray,
+    covariate_matrix: NDArray,
+    target_vector: NDArray,
+) -> F32Array | None:
+    """Per-child marginal-z fast path for ``ConcatenatedRawGenotypeMatrix``.
+
+    The single-source bitpacked fast path (:func:`_compute_marginal_z_scores_bitpacked`)
+    only engages when the raw genotype matrix is itself a
+    ``BitpackedDeviceMatrix``. SNP+SV runs concatenate 22 in-memory int8 VCF
+    caches with a lazy PLINK BED reader into a ``ConcatenatedRawGenotypeMatrix``,
+    so that check fails and we historically fell back to the chunked CPU/GPU
+    transpose-matmat path — which on AoU's gcsfuse-mounted .bed stalls for
+    30+ min per indexed-pread batch.
+
+    This function fills the gap by computing ``X_std^T @ y_resid`` per child:
+
+      * ``BitpackedDeviceMatrix`` child: ``child.rmatvec_subset`` — one GPU
+        kernel against the bitpacked-active subset.
+      * In-memory ``Int8RawGenotypeMatrix`` child (possibly wrapped by
+        ``IndexedRawGenotypeMatrix``): upload the active subset to HBM,
+        standardize against ``standardized_genotypes.means/scales``, then
+        ``standardized.T @ y_dev``.
+      * ``PlinkRawGenotypeMatrix`` child: bitpack-load just the active PLINK
+        column subset via :func:`load_bed_to_bitpacked_device_cached`. Subsequent
+        post-screen iterations re-hit that cache.
+
+    Returns ``None`` when the raw isn't a concatenated layout we know how to
+    handle, so callers fall back to :func:`compute_marginal_z_scores`. The
+    covariate-projection correction term is dropped to match
+    :func:`_compute_marginal_z_scores_bitpacked`'s contract (residualizing y
+    once on the host in fp64 is the bias-removal step).
+    """
+    try:
+        from sv_pgs.bitpacked_matrix import BitpackedDeviceMatrix
+    except ImportError as exc:
+        log(
+            "marginal-z concat fast path: SKIPPED "
+            f"(reason: BitpackedDeviceMatrix import failed: {exc})"
+        )
+        return None
+    raw_matrix = getattr(standardized_genotypes, "raw", None)
+    if not isinstance(raw_matrix, ConcatenatedRawGenotypeMatrix):
+        log(
+            "marginal-z concat fast path: SKIPPED "
+            f"(reason: raw is {type(raw_matrix).__name__}, not ConcatenatedRawGenotypeMatrix)"
+        )
+        return None
+    try:
+        import cupy as cp
+    except ImportError as exc:
+        log(
+            "marginal-z concat fast path: SKIPPED "
+            f"(reason: CuPy unavailable: {exc})"
+        )
+        return None
+
+    # Classify every child up front. Bail (return None → slow-path fallback)
+    # the moment we hit something we don't know how to handle, so we never
+    # half-finish a per-child decode and produce wrong z-scores.
+    def _unwrap_indexed(node: Any) -> tuple[Any, NDArray | None]:
+        """Return (innermost child, composed index mapping or None)."""
+        composed: NDArray | None = None
+        while isinstance(node, IndexedRawGenotypeMatrix):
+            selected = np.asarray(node.selected_columns, dtype=np.int64)
+            composed = selected if composed is None else selected[composed]
+            node = node.child
+        return node, composed
+
+    child_kinds: list[str] = []
+    for child in raw_matrix.children:
+        if isinstance(child, BitpackedDeviceMatrix):
+            child_kinds.append("bitpacked")
+            continue
+        if isinstance(child, PlinkRawGenotypeMatrix):
+            child_kinds.append("plink")
+            continue
+        inner, _ = _unwrap_indexed(child)
+        if isinstance(inner, Int8RawGenotypeMatrix):
+            child_kinds.append("int8")
+            continue
+        log(
+            "marginal-z concat fast path: SKIPPED "
+            f"(reason: unsupported child[{len(child_kinds)}] type "
+            f"{type(child).__name__} → inner {type(inner).__name__})"
+        )
+        return None
+    log(
+        f"marginal-z concat fast path: child layout = {child_kinds} "
+        f"(n_children={len(raw_matrix.children)})"
+    )
+
+    # Residualize y on covariates — identical to _compute_marginal_z_scores_bitpacked.
+    active_idx = np.asarray(active_variant_indices, dtype=np.int64).ravel()
+    m_active = int(active_idx.shape[0])
+    target_f64 = np.asarray(target_vector, dtype=np.float64).reshape(-1)
+    n = int(target_f64.shape[0])
+    if m_active == 0 or n == 0:
+        return np.zeros(m_active, dtype=np.float32)
+    covariate_f64 = np.asarray(covariate_matrix, dtype=np.float64)
+    if covariate_f64.ndim != 2 or covariate_f64.shape[0] != n:
+        raise ValueError(
+            f"covariate_matrix must have shape ({n}, _); got {covariate_f64.shape}"
+        )
+    if covariate_f64.shape[1] == 0:
+        y_resid = target_f64 - float(target_f64.mean())
+    else:
+        constant_column = np.ones((n, 1), dtype=np.float64)
+        has_constant = False
+        for k in range(covariate_f64.shape[1]):
+            col = covariate_f64[:, k]
+            if np.allclose(col, col[0], atol=1e-12) and abs(col[0]) > 1e-12:
+                has_constant = True
+                break
+        projection_cov = (
+            covariate_f64
+            if has_constant
+            else np.concatenate([constant_column, covariate_f64], axis=1)
+        )
+        alpha_cov, _, _, _ = np.linalg.lstsq(projection_cov, target_f64, rcond=None)
+        y_resid = target_f64 - projection_cov @ alpha_cov
+    sigma2_resid = float(np.dot(y_resid, y_resid) / max(n, 1))
+    if sigma2_resid <= 0.0:
+        return np.zeros(m_active, dtype=np.float32)
+
+    means_full = np.asarray(standardized_genotypes.means, dtype=np.float32)
+    scales_full = np.asarray(standardized_genotypes.scales, dtype=np.float32)
+    if means_full.shape[0] != raw_matrix.shape[1] or scales_full.shape[0] != raw_matrix.shape[1]:
+        log(
+            "marginal-z concat fast path: SKIPPED "
+            f"(reason: means/scales shape {means_full.shape}/{scales_full.shape} "
+            f"doesn't match raw variant count {raw_matrix.shape[1]})"
+        )
+        return None
+
+    sum_xy = np.zeros(m_active, dtype=np.float64)
+    y_dev = cp.asarray(y_resid, dtype=cp.float32)
+    variant_offsets = raw_matrix._variant_offsets  # noqa: SLF001 — internal layout
+    t_start = time.monotonic()
+
+    for child_idx, (child, kind) in enumerate(zip(raw_matrix.children, child_kinds)):
+        child_start = int(variant_offsets[child_idx])
+        child_stop = int(variant_offsets[child_idx + 1])
+        in_child_mask = (active_idx >= child_start) & (active_idx < child_stop)
+        if not in_child_mask.any():
+            continue
+        output_positions = np.nonzero(in_child_mask)[0]
+        active_dataset_idx_in_child = active_idx[in_child_mask]
+        child_local_idx = active_dataset_idx_in_child - child_start
+        k_in_child = int(child_local_idx.shape[0])
+        means_subset = means_full[active_dataset_idx_in_child]
+        scales_subset = scales_full[active_dataset_idx_in_child]
+        t_child = time.monotonic()
+
+        contrib: NDArray
+        if kind == "bitpacked":
+            idx_dev = cp.asarray(child_local_idx, dtype=cp.int64)
+            contrib_dev = child.rmatvec_subset(idx_dev, y_dev)
+            contrib = cp.asnumpy(contrib_dev).astype(np.float64, copy=False)
+            del idx_dev, contrib_dev
+        elif kind == "int8":
+            inner, composed = _unwrap_indexed(child)
+            local_inner_idx = (
+                composed[child_local_idx] if composed is not None else child_local_idx
+            )
+            local_inner_idx = np.ascontiguousarray(local_inner_idx, dtype=np.int64)
+            # Materialize the subset (n_samples × k_in_child int8) from the
+            # backing array. For a memmapped VCF cache this is a fancy-indexing
+            # copy; the working-set is k_in_child * n_samples bytes — well
+            # within HBM for AoU-scale per-chrom subsets.
+            int8_subset = np.ascontiguousarray(
+                inner.matrix[:, local_inner_idx], dtype=np.int8
+            )
+            int8_dev = cp.asarray(int8_subset)
+            del int8_subset
+            mean_dev = cp.asarray(means_subset)
+            scale_dev = cp.asarray(scales_subset)
+            # Standardize: cast to fp32, impute missing (PLINK_MISSING_INT8) to
+            # the column mean so the centered value is 0, divide by scale.
+            f32_subset = int8_dev.astype(cp.float32)
+            missing_mask = int8_dev == PLINK_MISSING_INT8
+            f32_subset = cp.where(missing_mask, mean_dev[None, :], f32_subset)
+            standardized = (f32_subset - mean_dev[None, :]) / scale_dev[None, :]
+            contrib_dev = standardized.T @ y_dev
+            contrib = cp.asnumpy(contrib_dev).astype(np.float64, copy=False)
+            del int8_dev, mean_dev, scale_dev, f32_subset, missing_mask, standardized, contrib_dev
+            cp.get_default_memory_pool().free_all_blocks()
+        elif kind == "plink":
+            # Bitpack-upgrade just this PLINK child's active subset. The
+            # underlying os.pread loop in plink._pread_indexed_variant_payload
+            # sustains gcsfuse-native throughput (~80 MB/s) — see 4b99448 — so
+            # the one-time gather here is bounded and the resulting cache key
+            # is content-addressed (bed mtime+size + sample/variant indices),
+            # which lets a re-run skip straight to the HBM upload.
+            try:
+                from sv_pgs.bitpacked_loader import load_bed_to_bitpacked_device_cached
+                bed_path = str(child.bed_path)
+                cache_dir = Path(bed_path).parent / ".sv_pgs_cache"
+                log(
+                    f"  marginal-z concat: upgrading PLINK child {child_idx} "
+                    f"to bitpacked (active={k_in_child:,}, "
+                    f"bed={Path(bed_path).name}, cache_dir={cache_dir})"
+                )
+                bp_matrix = load_bed_to_bitpacked_device_cached(
+                    bed_path=bed_path,
+                    n_samples=int(child.total_sample_count),
+                    n_variants=int(child.variant_count),
+                    sample_indices=np.asarray(child.sample_indices, dtype=np.int64),
+                    variant_indices=np.ascontiguousarray(child_local_idx, dtype=np.int64),
+                    cache_dir=cache_dir,
+                    mean=means_subset,
+                    std=scales_subset,
+                )
+                contrib_dev = bp_matrix.rmatvec(y_dev)
+                contrib = cp.asnumpy(contrib_dev).astype(np.float64, copy=False)
+                del contrib_dev
+                # Drop the bitpacked HBM allocation; the post-active upgrade
+                # will rebuild a (smaller, reduced-set) bitpacked matrix anyway.
+                del bp_matrix
+                cp.get_default_memory_pool().free_all_blocks()
+            except Exception as exc:  # noqa: BLE001
+                log(
+                    f"  marginal-z concat: PLINK bitpack-upgrade failed "
+                    f"({type(exc).__name__}: {exc}); falling back to slow path"
+                )
+                return None
+        else:
+            raise AssertionError(f"unreachable child kind: {kind}")
+
+        sum_xy[output_positions] = contrib
+        log(
+            f"  marginal-z concat: child {child_idx + 1}/{len(raw_matrix.children)} "
+            f"({kind}, k={k_in_child:,}) in {time.monotonic() - t_child:.1f}s"
+        )
+
+    xpx_diag = float(n)
+    denom = float(np.sqrt(sigma2_resid * xpx_diag))
+    if denom <= 0.0:
+        return np.zeros(m_active, dtype=np.float32)
+    log(
+        f"marginal-z concat fast path: total per-child wall = "
+        f"{time.monotonic() - t_start:.1f}s, k_active={m_active:,}"
+    )
     return np.asarray(sum_xy / denom, dtype=np.float32)
 
 
@@ -1752,6 +2000,28 @@ class BayesianPGS:
                             _save_marginal_z_cache(
                                 fit_stage_cache_paths, marginal_z_scores
                             )
+                    else:
+                        # Bitpacked single-source fast path didn't apply
+                        # (SNP+SV runs concat 22 in-memory VCFs + 1 lazy PLINK
+                        # into a ConcatenatedRawGenotypeMatrix). Try the
+                        # per-child fast path before falling back to the
+                        # chunked transpose-matmat loop, which on AoU's
+                        # gcsfuse-mounted .bed stalls per indexed-pread batch.
+                        marginal_z_scores = _compute_marginal_z_scores_concat(
+                            standardized_genotypes=standardized_genotypes,
+                            active_variant_indices=active_variant_indices,
+                            covariate_matrix=prepared_arrays.covariates,
+                            target_vector=prepared_arrays.targets,
+                        )
+                        if marginal_z_scores is not None:
+                            log(
+                                "marginal-z concat fast path: ENGAGED "
+                                f"(per-child rmatvec over {pre_screen_count} active variants)"
+                            )
+                            if fit_stage_cache_paths is not None:
+                                _save_marginal_z_cache(
+                                    fit_stage_cache_paths, marginal_z_scores
+                                )
                 # Chunked computation + per-chunk persistence. A crash /
                 # OOM mid-screen loses at most one chunk of work; rerun
                 # picks up at the next incomplete chunk.
