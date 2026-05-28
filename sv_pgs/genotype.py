@@ -2771,12 +2771,25 @@ def _gpu_plink_pread_transpose_matmul_direct(
     # per batch instead of disk + gpu. On AoU the disk is slow enough that
     # this nearly halves screen time even on one V100.
     def _pread_batch(idx: int, start: int, stop: int) -> tuple[float, NDArray]:
+        if progress_label is not None:
+            n_vars = int(stop - start)
+            log(
+                f"        {progress_label}: pread batch {idx + 1}/{n_batches_total} "
+                f"START variants=[{start}:{stop}] ({n_vars:,} vars, "
+                f"~{n_vars * bytes_per_variant / 1e9:.2f} GB raw)"
+            )
         t = _time.monotonic()
         payload_bytes = reader._pread_indexed_variant_payload(
             selected_variant_indices_int64[start:stop],
             bytes_per_variant=bytes_per_variant,
         )
-        return _time.monotonic() - t, payload_bytes
+        elapsed = _time.monotonic() - t
+        if progress_label is not None:
+            log(
+                f"        {progress_label}: pread batch {idx + 1}/{n_batches_total} "
+                f"DONE in {elapsed:.1f}s ({payload_bytes.nbytes / max(elapsed, 1e-6) / 1e6:.1f} MB/s)"
+            )
+        return elapsed, payload_bytes
 
     prefetch_executor = ThreadPoolExecutor(
         max_workers=1, thread_name_prefix="plink-pread-prefetch"
