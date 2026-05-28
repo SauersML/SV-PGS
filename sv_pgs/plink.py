@@ -269,12 +269,14 @@ class open_bed:
         view = memoryview(buffer).cast("B")
         bytes_read = 0
         while bytes_read < length:
-            chunk_len = os.preadv(fd, [view[bytes_read:]], offset + bytes_read)
-            if chunk_len == 0:
+            chunk = os.pread(fd, length - bytes_read, offset + bytes_read)
+            if not chunk:
                 raise OSError(
                     f"Unexpected EOF reading PLINK .bed at offset {offset + bytes_read}: "
                     f"requested {length - bytes_read} bytes, got 0"
                 )
+            chunk_len = len(chunk)
+            view[bytes_read : bytes_read + chunk_len] = chunk
             bytes_read += chunk_len
         return buffer
 
@@ -388,17 +390,22 @@ class open_bed:
                     input_offset = PLINK1_HEADER_SIZE + first_variant * bytes_per_variant
                     byte_count = selected_variant_count * bytes_per_variant
                     bytes_read = 0
+                    # os.pread (not preadv): the bitpacked screen path uses
+                    # os.pread against this same gcsfuse-mounted .bed and
+                    # sustains ~80 MB/s, while os.preadv on the same fd has
+                    # wedged AoU runs (a single-buffer preadv hung 30+ min
+                    # with no progress, no kernel return). os.pread is the
+                    # cross-FUSE common case; the extra bytes->buffer copy
+                    # is small (~85 ms / 256 MB at host memcpy throughput).
                     while bytes_read < byte_count:
-                        chunk_len = os.preadv(
-                            fd,
-                            [output[output_offset + bytes_read : output_offset + byte_count]],
-                            input_offset + bytes_read,
-                        )
-                        if chunk_len == 0:
+                        chunk = os.pread(fd, byte_count - bytes_read, input_offset + bytes_read)
+                        if not chunk:
                             raise OSError(
                                 f"Unexpected EOF reading PLINK .bed at offset {input_offset + bytes_read}: "
                                 f"requested {byte_count - bytes_read} bytes, got 0"
                             )
+                        chunk_len = len(chunk)
+                        output[output_offset + bytes_read : output_offset + bytes_read + chunk_len] = chunk
                         bytes_read += chunk_len
                 else:
                     input_offset = PLINK1_HEADER_SIZE + first_variant * bytes_per_variant
@@ -431,16 +438,14 @@ class open_bed:
             byte_count = run_length * bytes_per_variant
             bytes_read = 0
             while bytes_read < byte_count:
-                chunk_len = os.preadv(
-                    fd,
-                    [output[output_offset + bytes_read : output_offset + byte_count]],
-                    input_offset + bytes_read,
-                )
-                if chunk_len == 0:
+                chunk = os.pread(fd, byte_count - bytes_read, input_offset + bytes_read)
+                if not chunk:
                     raise OSError(
                         f"Unexpected EOF reading PLINK .bed at offset {input_offset + bytes_read}: "
                         f"requested {byte_count - bytes_read} bytes, got 0"
                     )
+                chunk_len = len(chunk)
+                output[output_offset + bytes_read : output_offset + bytes_read + chunk_len] = chunk
                 bytes_read += chunk_len
             cursor += run_length
         return payload

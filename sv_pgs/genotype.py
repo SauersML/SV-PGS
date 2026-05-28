@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from collections import deque
-from concurrent.futures import Future, ThreadPoolExecutor
+from concurrent.futures import Future, ThreadPoolExecutor, TimeoutError as _FutureTimeoutError
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 import io
@@ -2770,25 +2770,29 @@ def _gpu_plink_pread_transpose_matmul_direct(
     # Disk and GPU run concurrently — total wall-time ≈ max(disk, gpu)
     # per batch instead of disk + gpu. On AoU the disk is slow enough that
     # this nearly halves screen time even on one V100.
+    # Diagnostic label emitted unconditionally so the marginal-z screen path —
+    # which calls transpose_matmat_numpy without a progress_label — still
+    # surfaces per-batch START/DONE lines. Otherwise a multi-hour hang inside
+    # a single gcsfuse pread shows up only as a silent main-thread stack.
+    _diag_label = progress_label if progress_label is not None else "gpu-pread"
+
     def _pread_batch(idx: int, start: int, stop: int) -> tuple[float, NDArray]:
-        if progress_label is not None:
-            n_vars = int(stop - start)
-            log(
-                f"        {progress_label}: pread batch {idx + 1}/{n_batches_total} "
-                f"START variants=[{start}:{stop}] ({n_vars:,} vars, "
-                f"~{n_vars * bytes_per_variant / 1e9:.2f} GB raw)"
-            )
+        n_vars = int(stop - start)
+        log(
+            f"        {_diag_label}: pread batch {idx + 1}/{n_batches_total} "
+            f"START variants=[{start}:{stop}] ({n_vars:,} vars, "
+            f"~{n_vars * bytes_per_variant / 1e9:.2f} GB raw)"
+        )
         t = _time.monotonic()
         payload_bytes = reader._pread_indexed_variant_payload(
             selected_variant_indices_int64[start:stop],
             bytes_per_variant=bytes_per_variant,
         )
         elapsed = _time.monotonic() - t
-        if progress_label is not None:
-            log(
-                f"        {progress_label}: pread batch {idx + 1}/{n_batches_total} "
-                f"DONE in {elapsed:.1f}s ({payload_bytes.nbytes / max(elapsed, 1e-6) / 1e6:.1f} MB/s)"
-            )
+        log(
+            f"        {_diag_label}: pread batch {idx + 1}/{n_batches_total} "
+            f"DONE in {elapsed:.1f}s ({payload_bytes.nbytes / max(elapsed, 1e-6) / 1e6:.1f} MB/s)"
+        )
         return elapsed, payload_bytes
 
     prefetch_executor = ThreadPoolExecutor(
@@ -2807,7 +2811,20 @@ def _gpu_plink_pread_transpose_matmul_direct(
     try:
         for queue_pos, (batch_index, batch_start, batch_stop) in enumerate(batch_ranges):
             assert pending is not None
-            pread_seconds, payload = pending.result()
+            # Poll pending with a 60s timeout so a slow or stuck gcsfuse pread
+            # surfaces as periodic "still waiting" lines on the main thread
+            # instead of silently freezing the stack at .result().
+            _wait_started = _time.monotonic()
+            while True:
+                try:
+                    pread_seconds, payload = pending.result(timeout=60.0)
+                    break
+                except _FutureTimeoutError:
+                    waited = _time.monotonic() - _wait_started
+                    log(
+                        f"        {_diag_label}: still waiting on pread batch "
+                        f"{batch_index + 1}/{n_batches_total} after {waited:.0f}s"
+                    )
             # Immediately queue the NEXT batch's pread so the disk works
             # while we do the GPU work for this batch.
             if queue_pos + 1 < len(batch_ranges):
