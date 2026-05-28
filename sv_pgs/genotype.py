@@ -2617,14 +2617,29 @@ def _decode_packed_bytes_reference(
     return np.asfortranarray(decoded.T)
 
 
-def _resolve_plink_pread_context(raw: Any) -> tuple[Any, NDArray, int, str] | None:
-    """If ``raw`` is Plink-backed, return (reader, sample_indices, iid_count, bed_path).
+def _find_plink_leaf_context(raw: Any) -> tuple[Any, NDArray, int, str] | None:
+    """Return ``(reader, sample_indices, iid_count, bed_path)`` for SOME
+    PLINK leaf reachable from ``raw``, or ``None`` if no PLINK leaf exists.
+
+    IMPORTANT — this function is a LEAF FINDER, not a purity check. It will
+    happily return the PLINK leaf inside a multi-source
+    ``ConcatenatedRawGenotypeMatrix([VCF_int8..., PlinkRaw])`` even though
+    that matrix's variant indices live in dataset-column space (the union
+    of every child's variants) and CANNOT be passed straight to
+    ``_pread_indexed_variant_payload`` as PLINK-local positions. Callers
+    that intend to index the BED file directly with
+    ``selected_variant_indices`` MUST also call
+    :func:`_raw_variants_are_pure_single_plink_source` and bail when that
+    returns False. Callers that genuinely want to operate on just the
+    PLINK portion of a mixed tree (e.g. the post-active bitpacked upgrade
+    in ``model._try_upgrade_reduced_to_bitpacked``) should still treat
+    "mixed source" as a SKIPPED case unless they're willing to translate
+    dataset-column indices to PLINK-local indices themselves.
 
     Walks .child to find the leaf PlinkRawGenotypeMatrix. The first
     RowSubsetRawGenotypeMatrix encountered along the way contributes
     sample_indices; if none is present we use the leaf's own sample_indices
     (which for the streaming consumer always covers the kept sample set).
-    Returns None for any non-Plink path so the caller can fall back.
 
     Logs the specific failure mode whenever it returns None so we don't
     silently fall back to the slow CPU-decode path without telling the user
@@ -2700,6 +2715,28 @@ def _resolve_plink_pread_context(raw: Any) -> tuple[Any, NDArray, int, str] | No
         f"falling back to CPU-decode path"
     )
     return None
+
+
+def _resolve_pure_single_plink_pread_context(
+    raw: Any,
+) -> tuple[Any, NDArray, int, str] | None:
+    """Return PLINK pread context iff ``raw`` is genuinely single-source PLINK.
+
+    Combines :func:`_find_plink_leaf_context` with
+    :func:`_raw_variants_are_pure_single_plink_source` into the *correct*
+    primitive for callers that want to dispatch the direct PLINK pread
+    path. Returns ``None`` for mixed-source matrices so the caller can
+    drop back to per-source streaming, instead of silently mis-reading
+    or crashing on EOF when dataset-column indices get treated as
+    PLINK-local file positions.
+    """
+    if not _raw_variants_are_pure_single_plink_source(raw):
+        log(
+            "    GPU-decode skipped: raw is a mixed-source matrix; the "
+            "direct PLINK pread path would mis-interpret non-PLINK indices"
+        )
+        return None
+    return _find_plink_leaf_context(raw)
 
 
 def _raw_variants_are_pure_single_plink_source(node: Any) -> bool:
@@ -3013,31 +3050,13 @@ def _gpu_int8_transpose_matmul(
             progress_label=progress_label,
             device_ids=device_ids,
         )
-    # Single-GPU path: prefer GPU-decode when Plink-backed.
-    ctx = _resolve_plink_pread_context(raw_int8)
-    if ctx is not None and not _raw_variants_are_pure_single_plink_source(raw_int8):
-        # The direct PLINK pread path indexes into a single BED file by
-        # passing ``selected_variant_indices`` straight to os.pread as
-        # file positions. That contract holds only when EVERY variant in
-        # ``raw_int8`` lives in that one BED — i.e. the wrapper tree is
-        # nothing but a single ``PlinkRawGenotypeMatrix`` underneath
-        # (possibly behind RowSubset/Indexed/single-child Concatenated
-        # wrappers). When ``raw_int8`` is a mixed-source
-        # ``Concatenated([VCF_int8..., PlinkRaw])``,
-        # ``selected_variant_indices`` are dataset-column indices: VCF
-        # entries point into VCF caches (small numbers) and PLINK entries
-        # are offset by ``len(VCF columns)``. Feeding those straight to a
-        # 194 GB .bed at byte offset ``HEADER + idx * bpv`` lands VCF
-        # indices on random PLINK rows (silent wrong z-scores) and lands
-        # PLINK entries at offsets ``>= file_size`` (the EOF crash
-        # observed on AoU after 4b99448 unblocked the gcsfuse hang). The
-        # per-source streaming fallback below dispatches per child and is
-        # what every other Concatenated-aware code path uses.
-        log(
-            "    GPU-decode skipped: raw is a mixed-source matrix; the "
-            "direct PLINK pread path would mis-interpret non-PLINK indices"
-        )
-        ctx = None
+    # Single-GPU path: prefer GPU-decode when the matrix is genuinely
+    # single-source Plink. The new ``_resolve_pure_single_plink_pread_context``
+    # primitive combines leaf-finding with the purity check so we never
+    # dispatch the direct path against a mixed-source Concatenated tree
+    # (where dataset-column indices would land on the wrong PLINK row or
+    # past EOF).
+    ctx = _resolve_pure_single_plink_pread_context(raw_int8)
     if ctx is not None:
         reader, sample_indices, iid_count, bed_path = ctx
         return _gpu_plink_pread_transpose_matmul_direct(
@@ -3238,8 +3257,11 @@ def _gpu_int8_transpose_matmul_sharded(
     # the slow CPU-decode + standardize streaming path. Concurrent pread()
     # on the shared open_bed fd is safe (per-call offset, non-overlapping
     # variant slices), and each shard owns its own GPU staging + decode
-    # kernel invocation.
-    shard_ctx = _resolve_plink_pread_context(raw_int8)
+    # kernel invocation. The pure-source check inside
+    # ``_resolve_pure_single_plink_pread_context`` guards against the
+    # mixed-source bug — shards would otherwise receive dataset-column
+    # indices that land past the BED file's actual end (SNP+SV EOF crash).
+    shard_ctx = _resolve_pure_single_plink_pread_context(raw_int8)
 
     def _compute_shard(device_id: int, start: int, stop: int) -> tuple[int, int, NDArray]:
         shard_indices = selected_variant_indices[start:stop]

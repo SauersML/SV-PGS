@@ -1259,7 +1259,10 @@ def _try_upgrade_reduced_to_bitpacked(
     matching reduced column subset, OR ``None`` when:
 
     - CuPy is not importable
-    - the underlying raw is not a PLINK BED (no ``_resolve_plink_pread_context``)
+    - the underlying raw is not pure single-source PLINK (mixed-source
+      ``Concatenated([VCFs..., PLINK])`` declines here so the upgrade
+      doesn't silently discard the VCF children — the SNP+SV path keeps
+      the un-upgraded matrix and operates per-source)
     - the packed matrix wouldn't fit HBM with reasonable headroom
     - the host-side cold-load staging buffer wouldn't fit RAM
     - the bitpacked loader raises
@@ -1275,12 +1278,15 @@ def _try_upgrade_reduced_to_bitpacked(
             f"(reason: CuPy unavailable: {type(exc).__name__}: {exc})"
         )
         return None
-    from sv_pgs.genotype import _resolve_plink_pread_context  # lazy
-    ctx = _resolve_plink_pread_context(reduced_genotypes.raw)
+    from sv_pgs.genotype import _resolve_pure_single_plink_pread_context  # lazy
+    ctx = _resolve_pure_single_plink_pread_context(reduced_genotypes.raw)
     if ctx is None:
+        # ``_resolve_pure_single_plink_pread_context`` already logs the
+        # specific reason (mixed-source, no PLINK leaf, etc.). Add the
+        # upgrade-specific framing here so the operator can grep both.
         log(
             "bitpacked post-active upgrade: SKIPPED "
-            "(reason: reduced_genotypes.raw is not backed by a single PLINK BED; "
+            "(reason: reduced_genotypes.raw is not pure single-source PLINK; "
             f"type={type(reduced_genotypes.raw).__name__})"
         )
         return None
