@@ -3127,10 +3127,15 @@ def precache_vcfs_parallel(
             + f"  completed={completed_count}/{total_regions}"
         )
 
-    # Parse all regions in parallel
+    # Parse all regions in parallel.
+    # Must use "spawn" (not "fork"): JAX is already initialized in the parent
+    # (cupy/jax import happens at module load), and os.fork() on a multithreaded
+    # process deadlocks workers — they exit cleanly enough to drop their result
+    # but hang the pool's terminate/join on shutdown. Seen on AoU: 35+ minutes
+    # in pool.__exit__ → process.join() → popen_fork.poll() at 0% CPU after
+    # the chr19 worker emitted its last batch.
     if tasks:
-        start_method = "fork" if "fork" in multiprocessing.get_all_start_methods() else "spawn"
-        ctx = multiprocessing.get_context(start_method)
+        ctx = multiprocessing.get_context("spawn")
         with ctx.Pool(processes=process_count) as pool:
             for count, prefix in pool.imap_unordered(_region_parse_worker, tasks):
                 log(f"  region done: {Path(prefix).name} ({count} variants)")
