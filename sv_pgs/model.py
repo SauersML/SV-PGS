@@ -807,11 +807,22 @@ def _compute_marginal_z_scores_bitpacked(
         return None
     raw_matrix = getattr(standardized_genotypes, "raw", None)
     if not isinstance(raw_matrix, BitpackedDeviceMatrix):
-        log(
-            "marginal-z bitpacked fast path: SKIPPED "
-            f"(reason: standardized_genotypes.raw is {type(raw_matrix).__name__}, "
-            "not BitpackedDeviceMatrix)"
-        )
+        # A concat layout (SNP+SV: 22 int8 VCFs + 1 PLINK) is the EXPECTED
+        # input for the per-child concat fast path the caller tries next — this
+        # is a routing hand-off, not a missed fast path. Log it as such so the
+        # operator doesn't read "SKIPPED" as "fell back to the slow path".
+        if isinstance(raw_matrix, ConcatenatedRawGenotypeMatrix):
+            log(
+                "marginal-z: raw is ConcatenatedRawGenotypeMatrix "
+                "→ deferring to the concat fast path (single-source bitpacked "
+                "path is for pure-PLINK layouts only)"
+            )
+        else:
+            log(
+                "marginal-z bitpacked fast path: SKIPPED "
+                f"(reason: standardized_genotypes.raw is {type(raw_matrix).__name__}, "
+                "not BitpackedDeviceMatrix)"
+            )
         return None
     try:
         import cupy as cp  # noqa: WPS433 - lazy by design
