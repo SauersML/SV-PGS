@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import mmap
 import os
 import pickle
 import time
@@ -871,6 +872,55 @@ def _compute_marginal_z_scores_bitpacked(
     return marginal_z_from_numerator(sum_xy, proj_diag, n, sigma2_resid)
 
 
+def _standardized_int8_rmatvec(
+    cp: Any,
+    int8_chunk: NDArray,
+    means_chunk: NDArray,
+    scales_chunk: NDArray,
+    rhs_dev: Any,
+) -> NDArray:
+    """Standardize an int8 ``(n, k)`` chunk on the GPU and return ``X_std^T @ rhs``.
+
+    Shared by the concat fast path's int8-mmap and PLINK-streaming branches:
+    cast to fp32, impute ``PLINK_MISSING_INT8`` to the column mean (so the
+    centered value is 0), divide by the per-column scale, then one
+    ``standardized.T @ rhs_dev`` GEMM. Returns a host ``(k, rhs_width)`` float64
+    block. Frees its device scratch before returning so peak HBM stays at one
+    chunk's working set.
+    """
+    int8_dev = cp.asarray(int8_chunk)
+    mean_dev = cp.asarray(means_chunk)
+    scale_dev = cp.asarray(scales_chunk)
+    f32_chunk = int8_dev.astype(cp.float32)
+    missing_mask = int8_dev == PLINK_MISSING_INT8
+    f32_chunk = cp.where(missing_mask, mean_dev[None, :], f32_chunk)
+    standardized = (f32_chunk - mean_dev[None, :]) / scale_dev[None, :]
+    contrib_dev = standardized.T @ rhs_dev
+    contrib = cp.asnumpy(contrib_dev).astype(np.float64, copy=False)
+    del int8_dev, mean_dev, scale_dev, f32_chunk, missing_mask, standardized, contrib_dev
+    cp.get_default_memory_pool().free_all_blocks()
+    return contrib
+
+
+def _release_mmap_pages(array: Any) -> None:
+    """Best-effort ``MADV_DONTNEED`` on a numpy memmap's backing pages.
+
+    Column-fancy-indexing a row-major int8 mmap touches pages spread across the
+    whole file, so each concat child can leave several GB of clean page-cache
+    resident. Across 22 chromosome mmaps that accumulates to ~18 GB of RSS and
+    OOM-kills a 30 GB box before the PLINK child even starts. Dropping the pages
+    once a child is fully decoded keeps peak RSS at roughly one child's working
+    set; re-access (e.g. the later fit) simply re-faults from local SSD.
+    """
+    backing = getattr(array, "_mmap", None)
+    if backing is None:
+        return
+    try:
+        backing.madvise(mmap.MADV_DONTNEED)
+    except (OSError, ValueError, AttributeError):
+        pass
+
+
 def _compute_marginal_z_scores_concat(
     standardized_genotypes: StandardizedGenotypeMatrix,
     active_variant_indices: NDArray,
@@ -895,15 +945,19 @@ def _compute_marginal_z_scores_concat(
         ``IndexedRawGenotypeMatrix``): upload the active subset to HBM,
         standardize against ``standardized_genotypes.means/scales``, then
         ``standardized.T @ y_dev``.
-      * ``PlinkRawGenotypeMatrix`` child: bitpack-load just the active PLINK
-        column subset via :func:`load_bed_to_bitpacked_device_cached`. Subsequent
-        post-screen iterations re-hit that cache.
+      * ``PlinkRawGenotypeMatrix`` child (possibly wrapped by
+        ``IndexedRawGenotypeMatrix``): stream the active PLINK columns in
+        bounded ~1 GB int8 chunks via ``iter_column_batches_i8`` and run the
+        same standardize + ``standardized.T @ rhs`` per chunk. We do NOT
+        bitpack-upgrade the whole active subset here — at pre-screen scale that
+        packed matrix exceeds GPU HBM; the bitpacked upgrade is reserved for the
+        smaller post-screen reduced set.
 
     Returns ``None`` when the raw isn't a concatenated layout we know how to
     handle, so callers fall back to :func:`compute_marginal_z_scores`. The
-    covariate-projection correction term is dropped to match
-    :func:`_compute_marginal_z_scores_bitpacked`'s contract (residualizing y
-    once on the host in fp64 is the bias-removal step).
+    per-variant covariate-projection correction is computed (via
+    :func:`covariate_projection_diag`), so the result is numerically identical
+    to the canonical reference path.
     """
     try:
         from sv_pgs.bitpacked_matrix import BitpackedDeviceMatrix
@@ -1170,33 +1224,26 @@ def _compute_marginal_z_scores_concat(
                     else:
                         int8_chunk = np.ascontiguousarray(col_block, dtype=np.int8)
                     del col_block
-                    int8_dev = cp.asarray(int8_chunk)
-                    del int8_chunk
-                    mean_dev = cp.asarray(chunk_means)
-                    scale_dev = cp.asarray(chunk_scales)
-                    # Standardize: cast to fp32, impute missing
-                    # (PLINK_MISSING_INT8) to the column mean so the centered
-                    # value is 0, divide by scale.
-                    f32_chunk = int8_dev.astype(cp.float32)
-                    missing_mask = int8_dev == PLINK_MISSING_INT8
-                    f32_chunk = cp.where(missing_mask, mean_dev[None, :], f32_chunk)
-                    standardized = (f32_chunk - mean_dev[None, :]) / scale_dev[None, :]
-                    contrib_chunk_dev = standardized.T @ rhs_dev
-                    contrib[c_start:c_stop, :] = cp.asnumpy(contrib_chunk_dev).astype(
-                        np.float64, copy=False
+                    contrib[c_start:c_stop, :] = _standardized_int8_rmatvec(
+                        cp, int8_chunk, chunk_means, chunk_scales, rhs_dev
                     )
-                    del int8_dev, mean_dev, scale_dev, f32_chunk, missing_mask, standardized, contrib_chunk_dev
-                    cp.get_default_memory_pool().free_all_blocks()
+                    del int8_chunk
+                # Drop this chromosome mmap's resident pages so the 22 int8
+                # children don't accumulate ~18 GB of clean page-cache RSS.
+                _release_mmap_pages(getattr(inner, "matrix", None))
             elif kind == "plink":
-                # Bitpack-upgrade just this PLINK child's active subset. The
-                # underlying os.pread loop in plink._pread_indexed_variant_payload
-                # sustains gcsfuse-native throughput (~80 MB/s) — see 4b99448 —
-                # so the one-time gather here is bounded and the resulting
-                # cache key is content-addressed (bed mtime+size + sample/
-                # variant indices), which lets a re-run skip straight to the
-                # HBM upload.
-                # Resolve the (possibly Indexed/RowSubset-wrapped) PLINK leaf
-                # and compose the wrapper indices: ``child_local_idx`` is in the
+                # Stream the PLINK active subset in bounded int8 column chunks —
+                # the SAME standardize+rmatvec the int8 children use, just
+                # sourced from the BED reader instead of an mmap. We deliberately
+                # do NOT bitpack-upgrade the whole active subset here: at
+                # pre-screen scale (~984k active PLINK variants × 75k samples) the
+                # packed matrix is ~18 GB, which neither fits the 16 GB GPU nor
+                # leaves host headroom. The bitpacked upgrade is the right tool
+                # POST-screen, on the ~91k reduced set; during the screen we
+                # stream so peak HBM/host stays at one ~1 GB chunk.
+                #
+                # Resolve the (possibly Indexed/RowSubset-wrapped) PLINK leaf and
+                # compose the wrapper indices: ``child_local_idx`` is in the
                 # wrapper's column space, so map it onto leaf BED columns; a
                 # RowSubset above the leaf further restricts its sample set.
                 leaf, composed_cols, composed_rows = plink_chain_cache[child_idx]
@@ -1210,40 +1257,50 @@ def _compute_marginal_z_scores_concat(
                         f"sample_indices size={child_sample_count} != y n={n})"
                     )
                     return None
-                leaf_local_idx = (
+                leaf_local_idx = np.ascontiguousarray(
                     composed_cols[child_local_idx]
                     if composed_cols is not None
-                    else child_local_idx
+                    else child_local_idx,
+                    dtype=np.int64,
                 )
-                from sv_pgs.bitpacked_loader import load_bed_to_bitpacked_device_cached
-                bed_path = str(leaf.bed_path)
-                cache_dir = Path(bed_path).parent / ".sv_pgs_cache"
+                bytes_per_variant_working_set = max(int(n) * 9, 1)
+                chunk_k = max(
+                    1,
+                    min(k_in_child, _INT8_CHUNK_TARGET_BYTES // bytes_per_variant_working_set),
+                )
                 log(
-                    f"  marginal-z concat: upgrading PLINK child {child_idx} "
-                    f"to bitpacked (active={k_in_child:,}, "
-                    f"bed={Path(bed_path).name}, cache_dir={cache_dir})"
+                    f"  marginal-z concat: streaming PLINK child {child_idx} "
+                    f"(active={k_in_child:,}, bed={Path(str(leaf.bed_path)).name}, "
+                    f"chunk_k={chunk_k:,})"
                 )
-                bp_matrix = load_bed_to_bitpacked_device_cached(
-                    bed_path=bed_path,
-                    n_samples=int(leaf.total_sample_count),
-                    n_variants=int(leaf.variant_count),
-                    sample_indices=leaf_sample_indices,
-                    variant_indices=np.ascontiguousarray(leaf_local_idx, dtype=np.int64),
-                    cache_dir=cache_dir,
-                    mean=means_subset,
-                    std=scales_subset,
-                )
+                # iter_column_batches_i8 reads ``leaf_local_idx`` in order and
+                # batches to ~1 GB int8, so the b-th batch maps to the contiguous
+                # slice ``[c_start:c_start+kb]`` of means/scales/output positions.
                 contrib = np.empty((k_in_child, rhs_width), dtype=np.float64)
-                for rhs_column in range(rhs_width):
-                    contrib_dev = bp_matrix.rmatvec(rhs_dev[:, rhs_column])
-                    contrib[:, rhs_column] = cp.asnumpy(contrib_dev).astype(
-                        np.float64, copy=False
+                c_start = 0
+                for batch in leaf.iter_column_batches_i8(
+                    variant_indices=leaf_local_idx, batch_size=int(chunk_k)
+                ):
+                    int8_chunk = np.asarray(batch.values, dtype=np.int8)
+                    if composed_rows is not None:
+                        int8_chunk = np.ascontiguousarray(int8_chunk[composed_rows, :])
+                    kb = int(int8_chunk.shape[1])
+                    c_stop = c_start + kb
+                    contrib[c_start:c_stop, :] = _standardized_int8_rmatvec(
+                        cp,
+                        int8_chunk,
+                        means_subset[c_start:c_stop],
+                        scales_subset[c_start:c_stop],
+                        rhs_dev,
                     )
-                    del contrib_dev
-                # Drop the bitpacked HBM allocation; the post-active upgrade
-                # will rebuild a (smaller, reduced-set) bitpacked matrix anyway.
-                del bp_matrix
-                cp.get_default_memory_pool().free_all_blocks()
+                    del int8_chunk
+                    c_start = c_stop
+                if c_start != k_in_child:
+                    log(
+                        f"marginal-z concat fast path: SKIPPED (PLINK child[{child_idx}] "
+                        f"streamed {c_start} != active {k_in_child} variants)"
+                    )
+                    return None
             else:
                 raise AssertionError(f"unreachable child kind: {kind}")
 
