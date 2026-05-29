@@ -219,6 +219,141 @@ def compute_variant_statistics(
     )
 
 
+def residualize_target_on_covariates(
+    covariate_matrix: NDArray, target_vector: NDArray
+) -> tuple[F64Array, F64Array, float, F64Array | None]:
+    """Project the target onto the covariate span (intercept ensured).
+
+    Returns ``(y_resid, projection_cov, sigma2_resid, ctc_inv)`` where
+
+      * ``y_resid`` is ``y - C @ (C\\y)`` in float64,
+      * ``projection_cov`` is the (n, p_cov) covariate design actually used —
+        the caller's covariates with an explicit intercept column prepended
+        when none is already present,
+      * ``sigma2_resid`` is ``||y_resid||^2 / n``,
+      * ``ctc_inv`` is ``pinv(projection_cov.T @ projection_cov)`` (``None``
+        when there are no covariates).
+
+    Shared by the canonical marginal-z path and the bitpacked / concat GPU
+    fast paths so all three subtract the *same* covariate-projection
+    correction from each variant's norm. An intercept must be added even when
+    the caller passes only non-constant covariates: standardization centers
+    each variant, so the denominator has to subtract the mean-removal
+    projection or a near-collinear variant's z is inflated.
+    """
+    target_f64 = np.asarray(target_vector, dtype=np.float64).reshape(-1)
+    n = int(target_f64.shape[0])
+    covariate_f64 = np.asarray(covariate_matrix, dtype=np.float64)
+    if covariate_f64.ndim != 2 or covariate_f64.shape[0] != n:
+        raise ValueError(
+            f"covariate_matrix must have shape ({n}, _); got {covariate_f64.shape}"
+        )
+
+    if covariate_f64.shape[1] == 0:
+        y_resid = target_f64 - float(target_f64.mean())
+        projection_cov = np.zeros((n, 0), dtype=np.float64)
+        ctc_inv: F64Array | None = None
+    else:
+        has_constant = any(
+            np.allclose(covariate_f64[:, k], covariate_f64[0, k], atol=1e-12)
+            and abs(covariate_f64[0, k]) > 1e-12
+            for k in range(covariate_f64.shape[1])
+        )
+        projection_cov = (
+            covariate_f64
+            if has_constant
+            else np.concatenate(
+                [np.ones((n, 1), dtype=np.float64), covariate_f64], axis=1
+            )
+        )
+        # lstsq / pinv tolerate rank-deficient designs (e.g. a redundant
+        # intercept) gracefully.
+        alpha_cov, _, _, _ = np.linalg.lstsq(projection_cov, target_f64, rcond=None)
+        y_resid = target_f64 - projection_cov @ alpha_cov
+        ctc_inv = np.linalg.pinv(projection_cov.T @ projection_cov)
+
+    sigma2_resid = float(np.dot(y_resid, y_resid) / max(n, 1))
+    return y_resid, projection_cov, sigma2_resid, ctc_inv
+
+
+def covariate_projection_diag(
+    cprime_x: NDArray, ctc_inv: NDArray | None
+) -> F64Array:
+    """Per-variant covariate-projection correction ``x_j' C (C'C)^-1 C' x_j``.
+
+    ``cprime_x`` is ``projection_cov.T @ X_std`` (shape ``(p_cov, m)``) — each
+    column is one variant's projection onto the covariate columns; ``ctc_inv``
+    is ``pinv(C'C)`` (``None`` when there are no covariates). Returns the
+    ``(m,)`` vector whose entry ``j`` is the squared length of ``x_j``'s
+    projection onto ``span(C)``.
+
+    The quadratic form is per-variant independent, so this can be evaluated on
+    a *chunk* of variants at a time — the GPU fast paths call it per child to
+    reduce each child's ``(p_cov, k)`` projection block straight to a ``(k,)``
+    slice, keeping host memory at ``O(m)`` rather than materialising the full
+    ``(m, p_cov)`` projection matrix. ``optimize=False`` keeps ``einsum``
+    streaming (no ``(m, p_cov)`` intermediate).
+    """
+    cprime_x = np.asarray(cprime_x, dtype=np.float64)
+    m = int(cprime_x.shape[1]) if cprime_x.ndim == 2 else 0
+    if ctc_inv is None or cprime_x.ndim != 2 or cprime_x.shape[0] == 0:
+        return np.zeros(m, dtype=np.float64)
+    return np.einsum("ki,kl,li->i", cprime_x, ctc_inv, cprime_x, optimize=False)
+
+
+def marginal_z_from_numerator(
+    sum_xy: NDArray,
+    proj_diag: NDArray | None,
+    sample_count: int,
+    sigma2_resid: float,
+) -> F32Array:
+    """Assemble z from the per-variant numerator and projection correction.
+
+    ``sum_xy`` is ``X_std^T @ y_resid`` (shape ``(m_active,)``); ``proj_diag``
+    is the per-variant covariate-projection correction from
+    :func:`covariate_projection_diag` (shape ``(m_active,)``, or ``None`` when
+    there are no covariates).
+
+        z_j = sum_xy_j / sqrt(sigma2_resid * (n - x_j' C (C'C)^-1 C' x_j))
+
+    The per-variant norm ``||x_j||^2`` is ``n`` exactly under ddof=0
+    standardization (missing entries imputed to the mean contribute zero
+    after centering); floored-scale columns give ``< n``, which only deflates
+    z (conservative). A column exactly in the span of C has ``xpx == 0`` and
+    an undefined z, so it returns 0 (no signal beyond covariates).
+    """
+    sum_xy_f64 = np.asarray(sum_xy, dtype=np.float64)
+    m_active = int(sum_xy_f64.shape[0])
+    xpx_diag = np.full(m_active, float(sample_count), dtype=np.float64)
+    if proj_diag is not None:
+        xpx_diag = xpx_diag - np.asarray(proj_diag, dtype=np.float64)
+    xpx_diag = np.maximum(xpx_diag, 0.0)
+
+    denom = np.sqrt(sigma2_resid * xpx_diag)
+    z = np.zeros(m_active, dtype=np.float64)
+    safe = denom > 0.0
+    z[safe] = sum_xy_f64[safe] / denom[safe]
+    return np.asarray(z, dtype=np.float32)
+
+
+def build_marginal_z_rhs(
+    y_resid: NDArray, projection_cov: NDArray
+) -> F32Array:
+    """Stack ``[y_resid | projection_cov]`` into one (n, 1 + p_cov) fp32 RHS.
+
+    A single ``X_std^T @ rhs`` then yields both the numerator (column 0) and
+    the per-variant covariate projections (columns 1:) in one decode pass —
+    the matrix form of stacking ``1 + p_cov`` transpose-matvecs.
+    """
+    n = int(np.asarray(y_resid).shape[0])
+    p_cov = int(projection_cov.shape[1])
+    rhs = np.empty((n, p_cov + 1), dtype=np.float32)
+    rhs[:, 0] = np.asarray(y_resid, dtype=np.float32)
+    if p_cov > 0:
+        rhs[:, 1:] = np.asarray(projection_cov, dtype=np.float32)
+    return rhs
+
+
 def compute_marginal_z_scores(
     standardized_genotypes: StandardizedGenotypeMatrix,
     active_variant_indices: NDArray,
@@ -229,7 +364,7 @@ def compute_marginal_z_scores(
 
     For each active variant j:
         beta_marg_j = X_j_std^T y_resid / n
-        z_j = X_j_std^T y_resid / sqrt(n * sigma2_resid)
+        z_j = X_j_std^T y_resid / sqrt(sigma2_resid * (n - x_j'C(C'C)^-1 C'x_j))
     where y_resid is the residual of y after the OLS projection onto the
     covariate columns. Under the null hypothesis of no marginal association
     (after covariate adjustment) and well-behaved standardization, z_j is
@@ -245,69 +380,23 @@ def compute_marginal_z_scores(
     if active_variant_indices.size == 0 or n == 0:
         return np.zeros(active_variant_indices.shape[0], dtype=np.float32)
 
-    covariate_f64 = np.asarray(covariate_matrix, dtype=np.float64)
-    if covariate_f64.ndim != 2 or covariate_f64.shape[0] != n:
-        raise ValueError(
-            f"covariate_matrix must have shape ({n}, _); got {covariate_f64.shape}"
-        )
-
     active_indices_i32 = np.asarray(active_variant_indices, dtype=np.int32)
     active_subset = standardized_genotypes.subset(active_indices_i32)
     m_active = int(active_indices_i32.shape[0])
 
-    if covariate_f64.shape[1] == 0:
-        y_resid = target_f64 - float(target_f64.mean())
-        projection_cov = np.zeros((n, 0), dtype=np.float64)
-        ctc_inv = None
-    else:
-        # Augment the covariate matrix with an explicit intercept column when
-        # one isn't already present. Standardization centers each variant
-        # (x_j_std has mean 0), so a variant that lies entirely in the
-        # AFFINE span of C (e.g. C[:,0] itself with non-zero mean) still has
-        # a non-zero projection onto C only after we add a constant column.
-        # Without this augmentation, x_j_std for a perfectly collinear
-        # variant produces a non-zero numerator (signal) but the denominator
-        # forgets to subtract the mean-removal projection, inflating z.
-        constant_column = np.ones((n, 1), dtype=np.float64)
-        has_constant = False
-        for k in range(covariate_f64.shape[1]):
-            col = covariate_f64[:, k]
-            if np.allclose(col, col[0], atol=1e-12) and abs(col[0]) > 1e-12:
-                has_constant = True
-                break
-        if has_constant:
-            projection_cov = covariate_f64
-        else:
-            projection_cov = np.concatenate(
-                [constant_column, covariate_f64], axis=1
-            )
-
-        # Solve the small covariate OLS problem (n × p_cov, p_cov is typically
-        # < 30). lstsq handles rank-deficient designs (e.g., redundant
-        # intercept) gracefully.
-        alpha_cov, _, _, _ = np.linalg.lstsq(projection_cov, target_f64, rcond=None)
-        y_resid = target_f64 - projection_cov @ alpha_cov
-        # Use pinv to tolerate rank-deficient covariate designs (mirrors the
-        # rank-tolerant lstsq above).
-        ctc_inv = np.linalg.pinv(projection_cov.T @ projection_cov)
-
-    sigma2_resid = float(np.dot(y_resid, y_resid) / max(n, 1))
+    y_resid, projection_cov, sigma2_resid, ctc_inv = residualize_target_on_covariates(
+        covariate_matrix, target_vector
+    )
     if sigma2_resid <= 0.0:
         return np.zeros(m_active, dtype=np.float32)
 
     # ONE streaming pass: stack y_resid with the p_cov covariate columns into a
     # single (n, p_cov + 1) right-hand-side and compute X_std^T @ rhs in one
-    # shot via transpose_matmat_numpy. Previous implementation called
-    # transpose_matvec_numpy once per covariate column (16 passes) plus once
-    # for y_resid (1 pass) = 17 full-genome decodes for the marginal screen.
-    # The single matmat pass is mathematically identical (just the matrix
-    # form of stacking 17 matvecs) but the decode work happens exactly once
-    # — ~17x wall-time speedup on AoU where decode dominates.
+    # shot via transpose_matmat_numpy. The single matmat pass is the matrix
+    # form of stacking 1 + p_cov transpose-matvecs but the decode work happens
+    # exactly once — the marginal screen's dominant cost on AoU.
     p_cov = int(projection_cov.shape[1])
-    rhs = np.empty((n, p_cov + 1), dtype=np.float32)
-    rhs[:, 0] = y_resid.astype(np.float32, copy=False)
-    if p_cov > 0:
-        rhs[:, 1:] = projection_cov.astype(np.float32, copy=False)
+    rhs = build_marginal_z_rhs(y_resid, projection_cov)
     combined = np.asarray(
         active_subset.transpose_matmat_numpy(rhs),
         dtype=np.float64,
@@ -316,28 +405,8 @@ def compute_marginal_z_scores(
     cprime_x = (
         combined[:, 1:].T if p_cov > 0 else np.zeros((0, m_active), dtype=np.float64)
     )
-
-    # Per-variant ||x_j||^2. Standardization uses ddof=0 (scale = sqrt(css/n)),
-    # so for non-floored columns ||x_j||^2 == n exactly (missing entries are
-    # imputed to the mean and contribute zero after centering). For columns
-    # whose raw variance fell below `minimum_scale` the scale was floored to
-    # 1.0 and ||x_j||^2 may be < n; approximating it by n in that degenerate
-    # case only deflates z (conservative), and such variants are typically
-    # uninformative anyway.
-    xpx_diag = np.full(m_active, float(n), dtype=np.float64)
-    if ctc_inv is not None and cprime_x.shape[0] > 0:
-        # Subtract the C-projection: x_j' C (C'C)^{-1} C' x_j  per column.
-        proj_diag = np.einsum("ki,kl,li->i", cprime_x, ctc_inv, cprime_x)
-        xpx_diag = xpx_diag - proj_diag
-    # Numerical floor: a column that is exactly in the span of C has xpx == 0;
-    # its marginal z is undefined, so return 0 (no signal beyond covariates).
-    xpx_diag = np.maximum(xpx_diag, 0.0)
-
-    denom = np.sqrt(sigma2_resid * xpx_diag)
-    z = np.zeros(m_active, dtype=np.float64)
-    safe = denom > 0.0
-    z[safe] = sum_xy[safe] / denom[safe]
-    return np.asarray(z, dtype=np.float32)
+    proj_diag = covariate_projection_diag(cprime_x, ctc_inv)
+    return marginal_z_from_numerator(sum_xy, proj_diag, n, sigma2_resid)
 
 
 def _allele_frequencies_from_means(

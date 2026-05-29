@@ -41,10 +41,14 @@ from sv_pgs.inference import VariationalFitCheckpoint, VariationalFitResult, fit
 from sv_pgs.numeric import stable_sigmoid
 from sv_pgs.preprocessing import (
     Preprocessor,
+    build_marginal_z_rhs,
     build_tie_map,
     compute_marginal_z_scores,
     compute_variant_statistics,
+    covariate_projection_diag,
     fit_preprocessor_from_stats,
+    marginal_z_from_numerator,
+    residualize_target_on_covariates,
 )
 from sv_pgs.progress import log, mem
 from sv_pgs.runtime_policy import runtime_training_policy_for_fit, runtime_training_policy_summary
@@ -781,17 +785,17 @@ def _compute_marginal_z_scores_bitpacked(
     """Single-kernel marginal-z fast path for BitpackedDeviceMatrix backings.
 
     When the underlying raw genotype matrix is a ``BitpackedDeviceMatrix``,
-    the per-variant numerator X_std^T @ y_resid can be produced in one GPU
-    ``rmatvec`` call instead of the host-chunked transpose_matmat decode.
-    Returns ``None`` if the raw matrix isn't a bitpacked device matrix, so
-    the caller can fall back to :func:`compute_marginal_z_scores`.
+    the per-variant numerator and the per-variant covariate projections are
+    produced with device ``rmatvec`` calls instead of the host-chunked
+    transpose_matmat decode. Returns ``None`` if the raw matrix isn't a
+    bitpacked device matrix, so the caller can fall back to
+    :func:`compute_marginal_z_scores`.
 
-    The denominator uses the ddof=0 standardization invariant ``||x_j||^2 == n``
-    (modulo floored-scale columns, where this is the conservative deflation
-    documented in :func:`compute_marginal_z_scores`). The covariate-projection
-    correction term is dropped on the fast path — it would require ``p_cov``
-    additional rmatvec calls and the residualization of ``y`` on covariates
-    is still done in float64 on the host, so the numerator is unbiased.
+    The result is numerically identical to :func:`compute_marginal_z_scores`:
+    the denominator subtracts the same per-variant covariate-projection
+    correction ``x_j' C (C'C)^-1 C' x_j`` (computed as ``1 + p_cov`` rmatvec
+    passes over the active subset, ``p_cov`` typically < 30), not just the
+    ddof=0 ``||x_j||^2 == n`` invariant.
     """
     try:
         from sv_pgs.bitpacked_matrix import BitpackedDeviceMatrix
@@ -825,50 +829,35 @@ def _compute_marginal_z_scores_bitpacked(
     if m_active == 0 or n == 0:
         return np.zeros(m_active, dtype=np.float32)
 
-    covariate_f64 = np.asarray(covariate_matrix, dtype=np.float64)
-    if covariate_f64.ndim != 2 or covariate_f64.shape[0] != n:
-        raise ValueError(
-            f"covariate_matrix must have shape ({n}, _); got {covariate_f64.shape}"
-        )
-
-    # Residualize y on covariates (with augmented intercept) — mirrors the
+    # Residualize y on covariates (with augmented intercept) — shared with the
     # canonical path in :func:`compute_marginal_z_scores`.
-    if covariate_f64.shape[1] == 0:
-        y_resid = target_f64 - float(target_f64.mean())
-    else:
-        constant_column = np.ones((n, 1), dtype=np.float64)
-        has_constant = False
-        for k in range(covariate_f64.shape[1]):
-            col = covariate_f64[:, k]
-            if np.allclose(col, col[0], atol=1e-12) and abs(col[0]) > 1e-12:
-                has_constant = True
-                break
-        projection_cov = (
-            covariate_f64
-            if has_constant
-            else np.concatenate([constant_column, covariate_f64], axis=1)
-        )
-        alpha_cov, _, _, _ = np.linalg.lstsq(projection_cov, target_f64, rcond=None)
-        y_resid = target_f64 - projection_cov @ alpha_cov
-
-    sigma2_resid = float(np.dot(y_resid, y_resid) / max(n, 1))
+    y_resid, projection_cov, sigma2_resid, ctc_inv = residualize_target_on_covariates(
+        covariate_matrix, target_vector
+    )
     if sigma2_resid <= 0.0:
         return np.zeros(m_active, dtype=np.float32)
 
-    # Subset the bitpacked matrix to the active variants and run a single
-    # device-side rmatvec to get X_std^T @ y_resid in one kernel launch.
-    # ``BitpackedDeviceMatrix.subset`` carries through ``mean``/``std`` so the
-    # rmatvec output is exactly X_std^T @ y_resid over the active variants.
+    # Subset the bitpacked matrix to the active variants and decode
+    # X_std^T @ [y_resid | projection_cov] one device rmatvec per RHS column.
+    # ``BitpackedDeviceMatrix.subset`` carries through ``mean``/``std`` so each
+    # rmatvec output is exactly X_std^T @ column over the active variants.
     subset_matrix = raw_matrix.subset(active_idx)
-    y_dev = cp.asarray(y_resid, dtype=cp.float32)
-    sum_xy_dev = subset_matrix.rmatvec(y_dev)
-    sum_xy = cp.asnumpy(sum_xy_dev).astype(np.float64, copy=False)
-
-    xpx_diag = float(n)
-    denom = float(np.sqrt(sigma2_resid * xpx_diag))
-    if denom <= 0.0:
-        return np.zeros(m_active, dtype=np.float32)
-    return np.asarray(sum_xy / denom, dtype=np.float32)
+    rhs = build_marginal_z_rhs(y_resid, projection_cov)
+    p_cov = int(projection_cov.shape[1])
+    # Decode the numerator (column 0) up front; reduce the covariate columns to
+    # the per-variant projection correction as each is decoded so we never hold
+    # the full (m_active, p_cov) projection block on the host.
+    sum_xy = cp.asnumpy(
+        subset_matrix.rmatvec(cp.asarray(rhs[:, 0], dtype=cp.float32))
+    ).astype(np.float64, copy=False)
+    cprime_x = np.empty((p_cov, m_active), dtype=np.float64)
+    for cov_column in range(p_cov):
+        column_dev = cp.asarray(rhs[:, cov_column + 1], dtype=cp.float32)
+        cprime_x[cov_column, :] = cp.asnumpy(subset_matrix.rmatvec(column_dev)).astype(
+            np.float64, copy=False
+        )
+    proj_diag = covariate_projection_diag(cprime_x, ctc_inv)
+    return marginal_z_from_numerator(sum_xy, proj_diag, n, sigma2_resid)
 
 
 def _compute_marginal_z_scores_concat(
@@ -973,26 +962,66 @@ def _compute_marginal_z_scores_concat(
                 continue
             return None
 
+    def _unwrap_plink_chain(
+        node: Any,
+    ) -> tuple[PlinkRawGenotypeMatrix, NDArray | None, NDArray | None] | None:
+        """Walk Indexed/RowSubset wrappers around a ``PlinkRawGenotypeMatrix``.
+
+        Mirrors :func:`_unwrap_int8_chain` for the lazy PLINK leaf. Returns
+        (leaf_plink, composed_column_indices_or_None,
+        composed_row_indices_or_None) or None if the chain doesn't terminate
+        in a ``PlinkRawGenotypeMatrix``. AoU wraps the BED leaf in an
+        ``IndexedRawGenotypeMatrix`` to drop the handful of cross-source
+        duplicate columns, so without this unwrap a wrapped PLINK leaf
+        (``IndexedRawGenotypeMatrix(child=PlinkRawGenotypeMatrix)``) dropped the
+        whole screen into the host-streaming slow path — which OOMs the box.
+        ``composed_cols`` maps the wrapper's column space onto leaf BED columns
+        (``leaf_col = composed_cols[wrapper_col]``); ``composed_rows`` further
+        restricts the leaf's already-subset samples when a RowSubset sits above
+        the leaf.
+        """
+        composed_cols: NDArray | None = None
+        composed_rows: NDArray | None = None
+        cur = node
+        while True:
+            if isinstance(cur, PlinkRawGenotypeMatrix):
+                return cur, composed_cols, composed_rows
+            if isinstance(cur, IndexedRawGenotypeMatrix):
+                selected = np.asarray(cur.selected_columns, dtype=np.int64)
+                composed_cols = selected if composed_cols is None else selected[composed_cols]
+                cur = cur.child
+                continue
+            if isinstance(cur, RowSubsetRawGenotypeMatrix):
+                rows = np.asarray(cur.row_indices, dtype=np.int64)
+                composed_rows = rows if composed_rows is None else rows[composed_rows]
+                cur = cur.child
+                continue
+            return None
+
     # (inner Int8, composed cols, composed rows) per child for int8 kinds.
     int8_chain_cache: dict[int, tuple[Int8RawGenotypeMatrix, NDArray | None, NDArray | None]] = {}
+    # (leaf PLINK, composed cols, composed rows) per child for plink kinds.
+    plink_chain_cache: dict[int, tuple[PlinkRawGenotypeMatrix, NDArray | None, NDArray | None]] = {}
     child_kinds: list[str] = []
     for child in raw_matrix.children:
         if isinstance(child, BitpackedDeviceMatrix):
             child_kinds.append("bitpacked")
-            continue
-        if isinstance(child, PlinkRawGenotypeMatrix):
-            child_kinds.append("plink")
             continue
         chain = _unwrap_int8_chain(child)
         if chain is not None:
             int8_chain_cache[len(child_kinds)] = chain
             child_kinds.append("int8")
             continue
+        plink_chain = _unwrap_plink_chain(child)
+        if plink_chain is not None:
+            plink_chain_cache[len(child_kinds)] = plink_chain
+            child_kinds.append("plink")
+            continue
         log(
             "marginal-z concat fast path: SKIPPED "
             f"(reason: unsupported child[{len(child_kinds)}] type "
             f"{type(child).__name__}; chain did not terminate in "
-            "Int8RawGenotypeMatrix)"
+            "Int8RawGenotypeMatrix or PlinkRawGenotypeMatrix)"
         )
         return None
     log(
@@ -1000,38 +1029,25 @@ def _compute_marginal_z_scores_concat(
         f"(n_children={len(raw_matrix.children)})"
     )
 
-    # Residualize y on covariates — identical to _compute_marginal_z_scores_bitpacked.
+    # Residualize y on covariates — shared with _compute_marginal_z_scores_bitpacked
+    # and the canonical compute_marginal_z_scores reference.
     active_idx = np.asarray(active_variant_indices, dtype=np.int64).ravel()
     m_active = int(active_idx.shape[0])
     target_f64 = np.asarray(target_vector, dtype=np.float64).reshape(-1)
     n = int(target_f64.shape[0])
     if m_active == 0 or n == 0:
         return np.zeros(m_active, dtype=np.float32)
-    covariate_f64 = np.asarray(covariate_matrix, dtype=np.float64)
-    if covariate_f64.ndim != 2 or covariate_f64.shape[0] != n:
-        raise ValueError(
-            f"covariate_matrix must have shape ({n}, _); got {covariate_f64.shape}"
-        )
-    if covariate_f64.shape[1] == 0:
-        y_resid = target_f64 - float(target_f64.mean())
-    else:
-        constant_column = np.ones((n, 1), dtype=np.float64)
-        has_constant = False
-        for k in range(covariate_f64.shape[1]):
-            col = covariate_f64[:, k]
-            if np.allclose(col, col[0], atol=1e-12) and abs(col[0]) > 1e-12:
-                has_constant = True
-                break
-        projection_cov = (
-            covariate_f64
-            if has_constant
-            else np.concatenate([constant_column, covariate_f64], axis=1)
-        )
-        alpha_cov, _, _, _ = np.linalg.lstsq(projection_cov, target_f64, rcond=None)
-        y_resid = target_f64 - projection_cov @ alpha_cov
-    sigma2_resid = float(np.dot(y_resid, y_resid) / max(n, 1))
+    y_resid, projection_cov, sigma2_resid, ctc_inv = residualize_target_on_covariates(
+        covariate_matrix, target_vector
+    )
     if sigma2_resid <= 0.0:
         return np.zeros(m_active, dtype=np.float32)
+    # One (n, 1 + p_cov) device RHS: column 0 is the numerator's y_resid, the
+    # rest are the covariate columns whose per-variant projections feed the
+    # denominator's covariate correction.
+    marginal_rhs = build_marginal_z_rhs(y_resid, projection_cov)
+    rhs_width = int(marginal_rhs.shape[1])
+    p_cov = int(projection_cov.shape[1])
 
     means_full = np.asarray(standardized_genotypes.means, dtype=np.float32)
     scales_full = np.asarray(standardized_genotypes.scales, dtype=np.float32)
@@ -1043,8 +1059,17 @@ def _compute_marginal_z_scores_concat(
         )
         return None
 
+    # Two (m_active,) host accumulators: ``sum_xy`` is the numerator
+    # X_std^T @ y_resid; ``proj_diag`` is the per-variant covariate-projection
+    # correction x_j' C (C'C)^-1 C' x_j. Each child decodes a (k, 1 + p_cov)
+    # block (numerator column + p_cov projection columns) and is reduced to its
+    # disjoint slice of these two vectors immediately — we never hold the full
+    # (m_active, 1 + p_cov) projection matrix on the host, which on AoU sits on
+    # top of all 22 resident int8 chromosome caches. One device RHS is shared
+    # across every child kind.
     sum_xy = np.zeros(m_active, dtype=np.float64)
-    y_dev = cp.asarray(y_resid, dtype=cp.float32)
+    proj_diag = np.zeros(m_active, dtype=np.float64)
+    rhs_dev = cp.asarray(marginal_rhs, dtype=cp.float32)
     variant_offsets = raw_matrix._variant_offsets  # noqa: SLF001 — internal layout
     t_start = time.monotonic()
 
@@ -1078,9 +1103,14 @@ def _compute_marginal_z_scores_concat(
                     )
                     return None
                 idx_dev = cp.asarray(child_local_idx, dtype=cp.int64)
-                contrib_dev = child.rmatvec_subset(idx_dev, y_dev)
-                contrib = cp.asnumpy(contrib_dev).astype(np.float64, copy=False)
-                del idx_dev, contrib_dev
+                contrib = np.empty((k_in_child, rhs_width), dtype=np.float64)
+                for rhs_column in range(rhs_width):
+                    contrib_dev = child.rmatvec_subset(idx_dev, rhs_dev[:, rhs_column])
+                    contrib[:, rhs_column] = cp.asnumpy(contrib_dev).astype(
+                        np.float64, copy=False
+                    )
+                    del contrib_dev
+                del idx_dev
             elif kind == "int8":
                 inner, composed_cols, composed_rows = int8_chain_cache[child_idx]
                 # After applying composed_rows the effective sample count is
@@ -1109,7 +1139,7 @@ def _compute_marginal_z_scores_concat(
                     1,
                     min(k_in_child, _INT8_CHUNK_TARGET_BYTES // bytes_per_variant_working_set),
                 )
-                contrib = np.empty(k_in_child, dtype=np.float64)
+                contrib = np.empty((k_in_child, rhs_width), dtype=np.float64)
                 for c_start in range(0, k_in_child, chunk_k):
                     c_stop = min(c_start + chunk_k, k_in_child)
                     chunk_inner_idx = local_inner_idx_full[c_start:c_stop]
@@ -1140,8 +1170,8 @@ def _compute_marginal_z_scores_concat(
                     missing_mask = int8_dev == PLINK_MISSING_INT8
                     f32_chunk = cp.where(missing_mask, mean_dev[None, :], f32_chunk)
                     standardized = (f32_chunk - mean_dev[None, :]) / scale_dev[None, :]
-                    contrib_chunk_dev = standardized.T @ y_dev
-                    contrib[c_start:c_stop] = cp.asnumpy(contrib_chunk_dev).astype(
+                    contrib_chunk_dev = standardized.T @ rhs_dev
+                    contrib[c_start:c_stop, :] = cp.asnumpy(contrib_chunk_dev).astype(
                         np.float64, copy=False
                     )
                     del int8_dev, mean_dev, scale_dev, f32_chunk, missing_mask, standardized, contrib_chunk_dev
@@ -1154,15 +1184,28 @@ def _compute_marginal_z_scores_concat(
                 # cache key is content-addressed (bed mtime+size + sample/
                 # variant indices), which lets a re-run skip straight to the
                 # HBM upload.
-                child_sample_count = int(np.asarray(child.sample_indices).shape[0])
+                # Resolve the (possibly Indexed/RowSubset-wrapped) PLINK leaf
+                # and compose the wrapper indices: ``child_local_idx`` is in the
+                # wrapper's column space, so map it onto leaf BED columns; a
+                # RowSubset above the leaf further restricts its sample set.
+                leaf, composed_cols, composed_rows = plink_chain_cache[child_idx]
+                leaf_sample_indices = np.asarray(leaf.sample_indices, dtype=np.int64)
+                if composed_rows is not None:
+                    leaf_sample_indices = leaf_sample_indices[composed_rows]
+                child_sample_count = int(leaf_sample_indices.shape[0])
                 if child_sample_count != n:
                     log(
                         f"marginal-z concat fast path: SKIPPED (PLINK child[{child_idx}] "
                         f"sample_indices size={child_sample_count} != y n={n})"
                     )
                     return None
+                leaf_local_idx = (
+                    composed_cols[child_local_idx]
+                    if composed_cols is not None
+                    else child_local_idx
+                )
                 from sv_pgs.bitpacked_loader import load_bed_to_bitpacked_device_cached
-                bed_path = str(child.bed_path)
+                bed_path = str(leaf.bed_path)
                 cache_dir = Path(bed_path).parent / ".sv_pgs_cache"
                 log(
                     f"  marginal-z concat: upgrading PLINK child {child_idx} "
@@ -1171,17 +1214,21 @@ def _compute_marginal_z_scores_concat(
                 )
                 bp_matrix = load_bed_to_bitpacked_device_cached(
                     bed_path=bed_path,
-                    n_samples=int(child.total_sample_count),
-                    n_variants=int(child.variant_count),
-                    sample_indices=np.asarray(child.sample_indices, dtype=np.int64),
-                    variant_indices=np.ascontiguousarray(child_local_idx, dtype=np.int64),
+                    n_samples=int(leaf.total_sample_count),
+                    n_variants=int(leaf.variant_count),
+                    sample_indices=leaf_sample_indices,
+                    variant_indices=np.ascontiguousarray(leaf_local_idx, dtype=np.int64),
                     cache_dir=cache_dir,
                     mean=means_subset,
                     std=scales_subset,
                 )
-                contrib_dev = bp_matrix.rmatvec(y_dev)
-                contrib = cp.asnumpy(contrib_dev).astype(np.float64, copy=False)
-                del contrib_dev
+                contrib = np.empty((k_in_child, rhs_width), dtype=np.float64)
+                for rhs_column in range(rhs_width):
+                    contrib_dev = bp_matrix.rmatvec(rhs_dev[:, rhs_column])
+                    contrib[:, rhs_column] = cp.asnumpy(contrib_dev).astype(
+                        np.float64, copy=False
+                    )
+                    del contrib_dev
                 # Drop the bitpacked HBM allocation; the post-active upgrade
                 # will rebuild a (smaller, reduced-set) bitpacked matrix anyway.
                 del bp_matrix
@@ -1189,7 +1236,16 @@ def _compute_marginal_z_scores_concat(
             else:
                 raise AssertionError(f"unreachable child kind: {kind}")
 
-            sum_xy[output_positions] = contrib
+            # Reduce this child's (k, 1 + p_cov) block to its disjoint slice of
+            # the two full-width accumulators, then let ``contrib`` go out of
+            # scope on the next iteration. ``contrib[:, 1:].T`` is (p_cov, k) —
+            # the child-local projection block fed to the per-variant quadratic
+            # form — so the (m_active, p_cov) matrix is never materialised.
+            sum_xy[output_positions] = contrib[:, 0]
+            if p_cov > 0:
+                proj_diag[output_positions] = covariate_projection_diag(
+                    contrib[:, 1:].T, ctc_inv
+                )
             log(
                 f"  marginal-z concat: child {child_idx + 1}/{len(raw_matrix.children)} "
                 f"({kind}, k={k_in_child:,}) in {time.monotonic() - t_child:.1f}s"
@@ -1201,15 +1257,11 @@ def _compute_marginal_z_scores_concat(
         )
         return None
 
-    xpx_diag = float(n)
-    denom = float(np.sqrt(sigma2_resid * xpx_diag))
-    if denom <= 0.0:
-        return np.zeros(m_active, dtype=np.float32)
     log(
         f"marginal-z concat fast path: total per-child wall = "
         f"{time.monotonic() - t_start:.1f}s, k_active={m_active:,}"
     )
-    return np.asarray(sum_xy / denom, dtype=np.float32)
+    return marginal_z_from_numerator(sum_xy, proj_diag, n, sigma2_resid)
 
 
 def _resolve_indexed_selected_columns(raw: Any) -> NDArray | None:
