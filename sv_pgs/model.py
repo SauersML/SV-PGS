@@ -1273,34 +1273,35 @@ def _compute_marginal_z_scores_concat(
                     f"(active={k_in_child:,}, bed={Path(str(leaf.bed_path)).name}, "
                     f"chunk_k={chunk_k:,})"
                 )
-                # iter_column_batches_i8 reads ``leaf_local_idx`` in order and
-                # batches to ~1 GB int8, so the b-th batch maps to the contiguous
-                # slice ``[c_start:c_start+kb]`` of means/scales/output positions.
+                # Read sequentially through the leaf's own reader
+                # (``sv_pgs.plink.open_bed``, a pread-based shim) — NOT
+                # ``iter_column_batches_i8``, whose prefetch branch hard-imports
+                # the upstream ``bed_reader`` package (absent here) and would
+                # otherwise hold 4 decoded ~1 GB batches in flight. One reader,
+                # one ~chunk_k-wide int8 read at a time: anonymous memory stays
+                # at a single chunk and the pread page-cache is reclaimable. The
+                # reads happen in ``leaf_local_idx`` order, so chunk
+                # ``[c_start:c_stop]`` maps to the same slice of
+                # means/scales/output positions.
+                reader = leaf._bed_reader()  # noqa: SLF001 — internal reader reuse
                 contrib = np.empty((k_in_child, rhs_width), dtype=np.float64)
-                c_start = 0
-                for batch in leaf.iter_column_batches_i8(
-                    variant_indices=leaf_local_idx, batch_size=int(chunk_k)
-                ):
-                    int8_chunk = np.asarray(batch.values, dtype=np.int8)
+                for c_start in range(0, k_in_child, chunk_k):
+                    c_stop = min(c_start + chunk_k, k_in_child)
+                    int8_chunk = leaf._read_batch_i8(  # noqa: SLF001
+                        reader, leaf_local_idx[c_start:c_stop]
+                    )
                     if composed_rows is not None:
                         int8_chunk = np.ascontiguousarray(int8_chunk[composed_rows, :])
-                    kb = int(int8_chunk.shape[1])
-                    c_stop = c_start + kb
                     contrib[c_start:c_stop, :] = _standardized_int8_rmatvec(
                         cp,
-                        int8_chunk,
+                        np.ascontiguousarray(int8_chunk, dtype=np.int8),
                         means_subset[c_start:c_stop],
                         scales_subset[c_start:c_stop],
                         rhs_dev,
                     )
                     del int8_chunk
-                    c_start = c_stop
-                if c_start != k_in_child:
-                    log(
-                        f"marginal-z concat fast path: SKIPPED (PLINK child[{child_idx}] "
-                        f"streamed {c_start} != active {k_in_child} variants)"
-                    )
-                    return None
+                # Drop the reader fd + evict the bed pages we just paged in.
+                leaf.release_reader()
             else:
                 raise AssertionError(f"unreachable child kind: {kind}")
 
