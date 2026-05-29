@@ -1158,7 +1158,13 @@ class PlinkRawGenotypeMatrix(RawGenotypeMatrix):
         # that wants it later (release_reader still works), but only use it
         # for the single-batch fast path above — the prefetch path opens its
         # own dedicated readers and closes them on exit.
-        from bed_reader import open_bed as _open_bed
+        #
+        # Use the in-repo PLINK reader shim (sv_pgs.plink.open_bed), a drop-in
+        # for bed_reader.open_bed, rather than the upstream package: the AoU
+        # workbench has no bed_reader wheel and bitpacked_loader already reads
+        # every .bed through this shim, so there is no hard dependency on the
+        # upstream bed_reader package anywhere in the codebase.
+        from sv_pgs.plink import open_bed as _open_bed
 
         per_worker_readers: list[Any] = []
 
@@ -2209,8 +2215,23 @@ def _cupy_dtype_to_numpy_dtype(dtype: Any) -> np.dtype[Any]:
 
 
 def _standardize_int8_cupy(raw_values: Any, means: Any, scales: Any, cupy: Any, *, dtype: Any) -> Any:
-    """Standardize int8 genotypes on GPU without materializing a mask buffer."""
+    """Standardize int8 genotypes on GPU without materializing a mask buffer.
+
+    The custom kernel is NEVER instantiated with ``T=float16``. On some
+    CUDA/cupy builds (observed: CUDA 12.3 + cupy 13.6 on V100) nvrtc cannot
+    resolve *any* ``__half`` constructor inside a JIT ElementwiseKernel —
+    ``ptxas fatal: Unresolved extern function '_ZN6__halfC1E{i,f}'`` (i.e.
+    ``__half(int)`` and ``__half(float)``) — because the fp16 device library
+    isn't linked into the JIT module. So we compute in float32 and cast the
+    result to the requested dtype with cupy's native caster, which DOES handle
+    fp16 (it's a core dtype, not compiled from our source).
+    """
     resolved_dtype = cupy.float32 if dtype is None else dtype
+    half_dtype = getattr(cupy, "float16", None)
+    needs_half_cast = half_dtype is not None and resolved_dtype == half_dtype
+    kernel_dtype = cupy.float32 if needs_half_cast else resolved_dtype
+    means = means.astype(kernel_dtype, copy=False)
+    scales = scales.astype(kernel_dtype, copy=False)
     elementwise_kernel = getattr(cupy, "ElementwiseKernel", None)
     if elementwise_kernel is not None:
         kernel_cache = getattr(_standardize_int8_cupy, "_kernel_cache", None)
@@ -2223,34 +2244,41 @@ def _standardize_int8_cupy(raw_values: Any, means: Any, scales: Any, cupy: Any, 
             kernel = elementwise_kernel(
                 "int8 raw, T means, T scales, int8 missing",
                 "T out",
-                # Construct T from a *float*, never from an int. For T=__half
-                # (fp16) both ``(T)raw`` (raw is int8 → int) and ``(T)0`` (int
-                # literal) bind to ``__half::__half(int)`` (_ZN6__halfC1Ei),
-                # which nvrtc declares but ptxas can't resolve ("Unresolved
-                # extern function") on V100/A100/etc. ``(T)((float)raw)`` routes
-                # the cast through the well-defined ``__half(float)`` path (int8
-                # is < 2^24 so exact), and ``(T)0.0f`` does the same for zero.
-                # The subtraction/division stay in T, so float32/float64 keep
-                # full precision and fp16 uses half arithmetic (sm_>=53).
+                # T is float32/float64 here (never float16 — see docstring), so
+                # the int→T casts below are well defined. Kept as float casts
+                # defensively in case a future T narrows.
                 "T _val = ((T)((float)raw) - means) / scales; "
                 "out = (raw == missing) ? (T)0.0f : _val",
                 "sv_pgs_standardize_int8_missing_zero",
             )
             kernel_cache[cache_key] = kernel
-        return kernel(raw_values, means[None, :], scales[None, :], np.int8(PLINK_MISSING_INT8))
+        standardized = kernel(
+            raw_values, means[None, :], scales[None, :], np.int8(PLINK_MISSING_INT8)
+        )
+        return standardized.astype(resolved_dtype, copy=False) if needs_half_cast else standardized
 
-    standardized = raw_values.astype(resolved_dtype, copy=False)
+    standardized = raw_values.astype(kernel_dtype, copy=False)
     valid_mask = standardized != float(PLINK_MISSING_INT8)
     standardized -= means[None, :]
     standardized /= scales[None, :]
     multiply = getattr(cupy, "multiply", np.multiply)
     multiply(standardized, valid_mask, out=standardized)
-    return standardized
+    return standardized.astype(resolved_dtype, copy=False) if needs_half_cast else standardized
 
 
 def _standardize_int8_cupy_into(raw_values: Any, means: Any, scales: Any, output: Any, cupy: Any, *, dtype: Any) -> Any:
     """Standardize int8 genotypes into a caller-owned fp staging buffer."""
     resolved_dtype = cupy.float32 if dtype is None else dtype
+    half_dtype = getattr(cupy, "float16", None)
+    # A float16 ``output`` would force the custom kernel to instantiate
+    # T=__half, which nvrtc can't resolve on some builds (see
+    # ``_standardize_int8_cupy``). Compute into a float32 result and let cupy's
+    # native caster store it into the fp16 buffer.
+    if half_dtype is not None and output.dtype == half_dtype:
+        output[...] = _standardize_int8_cupy(
+            raw_values, means, scales, cupy, dtype=cupy.float32
+        )
+        return output
     elementwise_kernel = getattr(cupy, "ElementwiseKernel", None)
     if elementwise_kernel is not None:
         kernel_cache = getattr(_standardize_int8_cupy_into, "_kernel_cache", None)
@@ -2263,12 +2291,10 @@ def _standardize_int8_cupy_into(raw_values: Any, means: Any, scales: Any, output
             kernel = elementwise_kernel(
                 "int8 raw, T means, T scales, int8 missing",
                 "T out",
-                # Construct T from a *float*, never an int — see the matching
-                # kernel in ``_standardize_int8_cupy``. ``(T)raw``/``(T)0`` bind
-                # to ``__half::__half(int)`` for fp16, which ptxas can't resolve
-                # on V100/A100/etc.; ``(T)((float)raw)`` / ``(T)0.0f`` use the
-                # well-defined ``__half(float)`` path while keeping the
-                # arithmetic in T (full precision for float32/float64).
+                # T is float32/float64 here — a float16 output is handled above
+                # by computing in float32 and casting natively, because nvrtc
+                # can't resolve __half ctors in this JIT kernel. Float casts kept
+                # defensively (see ``_standardize_int8_cupy``).
                 "T _val = ((T)((float)raw) - means) / scales; "
                 "out = (raw == missing) ? (T)0.0f : _val",
                 "sv_pgs_standardize_int8_missing_zero_into",
@@ -5443,6 +5469,25 @@ class StandardizedGenotypeMatrix:
             log(f"    CuPy GPU upload failed ({exc})  mem={mem()}")
             if active_plan is not None:
                 _warn_gpu_materialization_unavailable(f"allocation failed: {exc}", active_plan)
+            return False
+        except Exception as exc:  # noqa: BLE001
+            # GPU materialization is an optimization; streaming always works.
+            # An nvrtc/ptxas kernel-compile failure (e.g. fp16 __half ctors that
+            # some CUDA/cupy builds can't resolve) must degrade to streaming
+            # rather than abort the whole fit. Scope strictly to compile errors —
+            # everything else still propagates.
+            if type(exc).__name__ not in ("CompileException", "NVRTCError"):
+                raise
+            self._cupy_cache = None
+            _release_cupy_cached_memory(cupy)
+            log(
+                f"    CuPy GPU materialization kernel failed to compile "
+                f"({type(exc).__name__}: {exc}); falling back to streaming  mem={mem()}"
+            )
+            if active_plan is not None:
+                _warn_gpu_materialization_unavailable(
+                    f"kernel compile failed: {type(exc).__name__}", active_plan
+                )
             return False
 
     def try_materialize_gpu_subset(
