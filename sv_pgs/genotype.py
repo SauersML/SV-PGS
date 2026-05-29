@@ -2223,11 +2223,17 @@ def _standardize_int8_cupy(raw_values: Any, means: Any, scales: Any, cupy: Any, 
             kernel = elementwise_kernel(
                 "int8 raw, T means, T scales, int8 missing",
                 "T out",
-                # NVRTC can't pick between (T)0 (float16) and the rhs of the
-                # ternary (also T) when T is __half because __half ↔ float
-                # both have implicit conversions. Compute both arms as T
-                # explicitly with an intermediate, then select.
-                "T _val = ((T)raw - means) / scales; out = (raw == missing) ? (T)0 : _val",
+                # Construct T from a *float*, never from an int. For T=__half
+                # (fp16) both ``(T)raw`` (raw is int8 → int) and ``(T)0`` (int
+                # literal) bind to ``__half::__half(int)`` (_ZN6__halfC1Ei),
+                # which nvrtc declares but ptxas can't resolve ("Unresolved
+                # extern function") on V100/A100/etc. ``(T)((float)raw)`` routes
+                # the cast through the well-defined ``__half(float)`` path (int8
+                # is < 2^24 so exact), and ``(T)0.0f`` does the same for zero.
+                # The subtraction/division stay in T, so float32/float64 keep
+                # full precision and fp16 uses half arithmetic (sm_>=53).
+                "T _val = ((T)((float)raw) - means) / scales; "
+                "out = (raw == missing) ? (T)0.0f : _val",
                 "sv_pgs_standardize_int8_missing_zero",
             )
             kernel_cache[cache_key] = kernel
@@ -2257,11 +2263,14 @@ def _standardize_int8_cupy_into(raw_values: Any, means: Any, scales: Any, output
             kernel = elementwise_kernel(
                 "int8 raw, T means, T scales, int8 missing",
                 "T out",
-                # NVRTC can't pick between (T)0 (float16) and the rhs of the
-                # ternary (also T) when T is __half because __half ↔ float
-                # both have implicit conversions. Compute both arms as T
-                # explicitly with an intermediate, then select.
-                "T _val = ((T)raw - means) / scales; out = (raw == missing) ? (T)0 : _val",
+                # Construct T from a *float*, never an int — see the matching
+                # kernel in ``_standardize_int8_cupy``. ``(T)raw``/``(T)0`` bind
+                # to ``__half::__half(int)`` for fp16, which ptxas can't resolve
+                # on V100/A100/etc.; ``(T)((float)raw)`` / ``(T)0.0f`` use the
+                # well-defined ``__half(float)`` path while keeping the
+                # arithmetic in T (full precision for float32/float64).
+                "T _val = ((T)((float)raw) - means) / scales; "
+                "out = (raw == missing) ? (T)0.0f : _val",
                 "sv_pgs_standardize_int8_missing_zero_into",
             )
             kernel_cache[cache_key] = kernel
@@ -5832,6 +5841,13 @@ class StandardizedGenotypeMatrix:
         self,
         batch_size: int = DEFAULT_GENOTYPE_BATCH_SIZE,
     ) -> Iterator[RawGenotypeBatch]:
+        if self._dense_cache is None and self._cupy_cache is not None:
+            # GPU-resident matrix whose raw backing has been freed (e.g. a
+            # small reduced matrix materialized to HBM for the exact
+            # sample-space Cholesky's host XX^T accumulation). Materialize the
+            # device cache to a host dense cache so column streaming works;
+            # ``materialize`` copies cupy -> numpy and populates ``_dense_cache``.
+            self.materialize(batch_size=batch_size)
         if self._dense_cache is not None:
             safe_batch_size = max(int(batch_size), 1)
             for start_index in range(0, self._dense_cache.shape[1], safe_batch_size):
