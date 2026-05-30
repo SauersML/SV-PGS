@@ -8,6 +8,7 @@ import shutil
 import subprocess
 import time
 import uuid
+from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -683,8 +684,9 @@ def download_ancestry_preds(work_dir: Path) -> Path:
     _download_gcs_object_if_missing(remote, local)
     return local
 
-def release_process_memory() -> None:
+def release_process_memory(fadvise_paths: Sequence[str | Path] = ()) -> None:
     gc.collect()
+    cp: Any = None
     try:
         import jax
 
@@ -694,12 +696,28 @@ def release_process_memory() -> None:
     except (ImportError, RuntimeError):
         pass
     try:
-        import cupy as cp
+        import cupy as _cp
 
+        cp = _cp
         cp.cuda.Device().synchronize()
         cp.get_default_memory_pool().free_all_blocks()
         cp.get_default_pinned_memory_pool().free_all_blocks()
     except (ImportError, OSError, RuntimeError):
+        cp = None
+    # Return freed host arena to the OS and evict the shared .bed page cache.
+    # Freeing the cupy pools alone leaves ~tens of GB resident between diseases:
+    # glibc's arena doesn't auto-trim large numpy frees, and the kernel
+    # page-caches every .bed byte the CG stream / variant screen reads (counted
+    # against the cgroup). The next disease then starts near the limit and OOMs
+    # on its uncached 194 GB bed screen. ``_release_host_caches`` issues
+    # ``malloc_trim(0)`` + ``POSIX_FADV_DONTNEED``. gc runs again AFTER the cupy
+    # pool free so JAX's gc callback walks a small device-buffer set.
+    gc.collect()
+    try:
+        from sv_pgs.genotype import _release_host_caches
+
+        _release_host_caches(cp, fadvise_paths=fadvise_paths)
+    except Exception:  # noqa: BLE001 — cleanup is best-effort
         pass
 
 
@@ -2147,6 +2165,18 @@ def run_all_of_us_all_diseases(
                     f"=== TOP-20 LOOP: {disease_definition.canonical_name} FAILED: {exc} ==="
                 )
                 failures.append((disease_definition.canonical_name, str(exc)))
+            finally:
+                # Sequential in-process sweep: reclaim this disease's host arena
+                # + evict the shared .bed page cache before the next disease, so
+                # RSS doesn't carry tens of GB into a later disease's uncached
+                # bed screen and OOM the box. (run_all_of_us already releases on
+                # its own finally, but without the .bed fadvise.)
+                try:
+                    release_process_memory(
+                        fadvise_paths=[local_array_plink_path(disease_output_dir)]
+                    )
+                except Exception as cleanup_exc:  # noqa: BLE001 — best-effort
+                    log(f"  TOP-20 LOOP: post-disease cleanup skipped ({cleanup_exc})")
         if failures:
             details = "; ".join(f"{name}: {msg}" for name, msg in failures)
             log(f"run_all_of_us_all_diseases: {len(failures)} disease(s) failed: {details}")
