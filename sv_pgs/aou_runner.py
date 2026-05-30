@@ -2160,9 +2160,16 @@ def run_all_of_us_all_diseases(
                     random_seed=random_seed,
                     variants=variants,
                 )
-            except (RuntimeError, ValueError, OSError) as exc:
+            except Exception as exc:  # noqa: BLE001
+                # Unattended 20-disease sweep: one disease's failure (incl. a
+                # GPU/host MemoryError or cupy OutOfMemoryError, which are not
+                # RuntimeError/OSError) must not abort the remaining diseases.
+                # KeyboardInterrupt/SystemExit are BaseException, so Ctrl-C still
+                # stops the sweep. The exception type is logged so genuine bugs
+                # stay visible.
                 log(
-                    f"=== TOP-20 LOOP: {disease_definition.canonical_name} FAILED: {exc} ==="
+                    f"=== TOP-20 LOOP: {disease_definition.canonical_name} "
+                    f"FAILED [{type(exc).__name__}]: {exc} ==="
                 )
                 failures.append((disease_definition.canonical_name, str(exc)))
             finally:

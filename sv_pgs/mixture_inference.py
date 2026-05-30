@@ -7690,6 +7690,51 @@ def _apply_sample_space_operator_gpu(
     return result_gpu[:, 0] if vector_input else result_gpu
 
 
+def _raise_or_warn_sample_space_nonconvergence(
+    *,
+    raise_on_nonconvergence: bool,
+    failed_count: int,
+    total_count: int,
+    worst_residual: float,
+    worst_threshold: float,
+    max_iterations: int,
+    refinement_steps: int | None = None,
+    failure_suffix: str = "",
+) -> None:
+    """Fail hard, or accept the best iterate, when sample-space CG stalls.
+
+    Precise solves (log-determinant / β-variance, ``raise_on_nonconvergence=True``)
+    must converge, so a stall is fatal. The restricted posterior *mean* solve is
+    an inexact-Newton step under a forcing sequence (Dembo-Eisenstat-Steihaug):
+    its inner tolerance is deliberately loose and the outer EM iteration refines
+    the mean across passes, so a stalled inner solve should be accepted (best
+    iterate returned) with a warning rather than aborting the whole fit — this
+    mirrors the TR-Newton path, which already warns-and-continues. An
+    ill-conditioned cohort where the Nyström preconditioner needs more than the
+    forcing-budgeted iterations then still yields a model instead of a hard
+    failure.
+    """
+    stage = (
+        f" after iterative refinement (refinement_steps={refinement_steps})"
+        if refinement_steps is not None
+        else ""
+    )
+    detail = (
+        f"{failed_count}/{total_count} required RHS columns did not converge; "
+        f"worst column residual={worst_residual:.2e} threshold={worst_threshold:.2e} "
+        f"iterations={max_iterations}{failure_suffix}"
+    )
+    if raise_on_nonconvergence:
+        raise RuntimeError(
+            f"GPU conjugate-gradient solve failed to converge{stage}: {detail}"
+        )
+    log(
+        f"      WARNING: sample-space CG did not reach tolerance{stage}; accepting "
+        f"the best (inexact-Newton) iterate — {detail}. The EM outer loop refines "
+        f"this mean; raise the preconditioner rank if it recurs late in EM."
+    )
+
+
 def _solve_sample_space_rhs_gpu_inner(
     genotype_matrix: StandardizedGenotypeMatrix,
     prior_variances: NDArray,
@@ -7705,6 +7750,7 @@ def _solve_sample_space_rhs_gpu_inner(
     column_iteration_limits: NDArray | None = None,
     required_columns: NDArray | None = None,
     lanczos_recorder: _SampleSpaceCGLanczosRecorder | None = None,
+    raise_on_nonconvergence: bool = True,
 ) -> tuple[Any, int]:
     rhs_gpu = cp.asarray(right_hand_side_gpu, dtype=compute_cp_dtype)
     vector_input = rhs_gpu.ndim == 1
@@ -8025,12 +8071,13 @@ def _solve_sample_space_rhs_gpu_inner(
     failed_mask = required_residual > required_threshold
     if bool(np.any(failed_mask)):
         worst_idx = int(np.argmax(required_residual / np.maximum(required_threshold, 1e-300)))
-        raise RuntimeError(
-            "GPU conjugate-gradient solve failed to converge: "
-            + f"{int(failed_mask.sum())}/{int(required_residual.size)} required RHS columns "
-            + f"did not converge; worst column residual={float(required_residual[worst_idx]):.2e} "
-            + f"threshold={float(required_threshold[worst_idx]):.2e} "
-            + f"iterations={max_iterations}"
+        _raise_or_warn_sample_space_nonconvergence(
+            raise_on_nonconvergence=raise_on_nonconvergence,
+            failed_count=int(failed_mask.sum()),
+            total_count=int(required_residual.size),
+            worst_residual=float(required_residual[worst_idx]),
+            worst_threshold=float(required_threshold[worst_idx]),
+            max_iterations=max_iterations,
         )
     solution = cp.asarray(solution_gpu, dtype=cp.float64)
     return (solution[:, 0] if vector_input else solution), iterations_used
@@ -8581,6 +8628,7 @@ def _solve_sample_space_rhs_gpu(
     column_iteration_limits: NDArray | None = None,
     required_columns: NDArray | None = None,
     lanczos_recorder: _SampleSpaceCGLanczosRecorder | None = None,
+    raise_on_nonconvergence: bool = True,
 ) -> NDArray | tuple[NDArray, int]:
     import cupy as cp
 
@@ -8616,6 +8664,7 @@ def _solve_sample_space_rhs_gpu(
             column_iteration_limits=column_iteration_limits,
             required_columns=required_columns,
             lanczos_recorder=lanczos_recorder,
+            raise_on_nonconvergence=raise_on_nonconvergence,
         )
     finally:
         if _owned_cg_workset_cache:
@@ -8639,6 +8688,7 @@ def _solve_sample_space_rhs_gpu_with_optional_workset_cache(
     column_iteration_limits: NDArray | None,
     required_columns: NDArray | None,
     lanczos_recorder: _SampleSpaceCGLanczosRecorder | None,
+    raise_on_nonconvergence: bool = True,
 ) -> NDArray | tuple[NDArray, int]:
     streaming_gpu_enabled = genotype_matrix._cupy_cache is None and genotype_matrix.raw is not None and not genotype_matrix.supports_jax_dense_ops()
     if genotype_matrix._cupy_cache is None and not streaming_gpu_enabled:
@@ -8724,6 +8774,7 @@ def _solve_sample_space_rhs_gpu_with_optional_workset_cache(
             column_iteration_limits=resolved_iteration_limits,
             required_columns=required_mask,
             lanczos_recorder=lanczos_recorder,
+            raise_on_nonconvergence=raise_on_nonconvergence,
         )
         solution_gpu64, iterations_used = _resolve_sample_space_solve_result(
             solution_gpu64_result,
@@ -8740,12 +8791,13 @@ def _solve_sample_space_rhs_gpu_with_optional_workset_cache(
         failed_mask = required_residual > required_threshold
         if bool(np.any(failed_mask)):
             worst_idx = int(np.argmax(required_residual / np.maximum(required_threshold, 1e-300)))
-            raise RuntimeError(
-                "GPU conjugate-gradient solve failed to converge: "
-                + f"{int(failed_mask.sum())}/{int(required_residual.size)} required RHS columns "
-                + f"did not converge; worst column residual={float(required_residual[worst_idx]):.2e} "
-                + f"threshold={float(required_threshold[worst_idx]):.2e} "
-                + f"iterations={max_iterations}"
+            _raise_or_warn_sample_space_nonconvergence(
+                raise_on_nonconvergence=raise_on_nonconvergence,
+                failed_count=int(failed_mask.sum()),
+                total_count=int(required_residual.size),
+                worst_residual=float(required_residual[worst_idx]),
+                worst_threshold=float(required_threshold[worst_idx]),
+                max_iterations=max_iterations,
             )
         solution = np.asarray(solution_gpu64.get() if hasattr(solution_gpu64, "get") else solution_gpu64, dtype=np.float64)
         resolved_solution = solution[:, 0] if vector_input else solution
@@ -8784,6 +8836,7 @@ def _solve_sample_space_rhs_gpu_with_optional_workset_cache(
                 column_iteration_limits=resolved_iteration_limits,
                 required_columns=required_mask,
                 lanczos_recorder=lanczos_recorder if _refinement_index == 0 else None,
+                raise_on_nonconvergence=raise_on_nonconvergence,
             )
             correction_gpu64, iterations_used = _resolve_sample_space_solve_result(
                 correction_gpu64_result,
@@ -8819,6 +8872,7 @@ def _solve_sample_space_rhs_gpu_with_optional_workset_cache(
             column_iteration_limits=resolved_iteration_limits,
             required_columns=required_mask,
             lanczos_recorder=None,
+            raise_on_nonconvergence=raise_on_nonconvergence,
         )
         correction_gpu64, iterations_used = _resolve_sample_space_solve_result(
             correction_gpu64_result,
@@ -8834,18 +8888,20 @@ def _solve_sample_space_rhs_gpu_with_optional_workset_cache(
     failed_mask = required_residual > required_threshold
     if bool(np.any(failed_mask)):
         worst_idx = int(np.argmax(required_residual / np.maximum(required_threshold, 1e-300)))
-        final_residual = float(required_residual[worst_idx])
-        final_threshold = float(required_threshold[worst_idx])
         failure_suffix = (
             f" last_mixed_precision_error={mixed_precision_failure}"
             if mixed_precision_failure is not None
             else ""
         )
-        raise RuntimeError(
-            "GPU conjugate-gradient solve failed to converge after iterative refinement: "
-            + f"residual={final_residual:.2e} threshold={final_threshold:.2e} "
-            + f"iterations={max_iterations} refinement_steps={max_refinement_steps}"
-            + failure_suffix
+        _raise_or_warn_sample_space_nonconvergence(
+            raise_on_nonconvergence=raise_on_nonconvergence,
+            failed_count=int(failed_mask.sum()),
+            total_count=int(required_residual.size),
+            worst_residual=float(required_residual[worst_idx]),
+            worst_threshold=float(required_threshold[worst_idx]),
+            max_iterations=max_iterations,
+            refinement_steps=max_refinement_steps,
+            failure_suffix=failure_suffix,
         )
     solution = np.asarray(solution_gpu64.get() if hasattr(solution_gpu64, "get") else solution_gpu64, dtype=np.float64)
     resolved_solution = solution[:, 0] if vector_input else solution
@@ -10431,6 +10487,12 @@ def _solve_restricted_mean_only(
                 preconditioner=sample_space_preconditioner_gpu,
                 batch_size=posterior_variance_batch_size,
                 return_iterations=True,
+                # Restricted-mean solve is an inexact-Newton step under a forcing
+                # sequence: accept the best iterate if an ill-conditioned cohort
+                # can't reach the (already-relaxed) tolerance within the forcing
+                # iteration budget, rather than aborting the whole fit. The EM
+                # outer loop refines this mean across passes.
+                raise_on_nonconvergence=False,
             )
             solved_rhs, iterations_used = _resolve_sample_space_solve_result(
                 solve_result,

@@ -3528,6 +3528,29 @@ def _adaptive_int8_staging_chunk_rows(
     return int(max(1, min(int(cap), fits)))
 
 
+def _int8_matmul_staging_rows(*, n_rows: int, n_cols: int, dtype: Any, cupy: Any) -> int:
+    """Row-chunk for an int8-resident matmul's fp32 staging slab.
+
+    Sized against *currently-free* VRAM minus the solver safety margin, so the
+    staging slab competes with neither the resident int8 matrix nor live solver
+    temporaries: it can only shrink under memory pressure, never overcommit. The
+    chunk size is a pure performance knob — the GEMM result is bit-identical for
+    any value — so adapting it is always safe. Falls back to the fixed
+    ``GPU_INT8_MATMUL_STAGING_ROWS`` default when free memory is unknown (mocked
+    CuPy in tests), preserving legacy behavior.
+    """
+    try:
+        free_bytes = _gpu_effective_free_bytes(cupy)
+    except (AttributeError, OSError, RuntimeError):
+        free_bytes = 0
+    rows_cap = max(int(n_rows), 1)
+    if free_bytes <= 0:
+        return max(1, min(GPU_INT8_MATMUL_STAGING_ROWS, rows_cap))
+    usable = max(int(free_bytes) - _GPU_RESERVED_OVERHEAD_BYTES, 0)
+    rows = _adaptive_int8_staging_chunk_rows(n_cols=n_cols, dtype=dtype, free_bytes=usable)
+    return int(max(1, min(int(rows), rows_cap)))
+
+
 def _gpu_solver_headroom_bytes(
     *,
     n_rows: int,
@@ -3634,13 +3657,32 @@ def _estimate_gpu_materialization_memory_plan(
     if "int8" in backend and effective_chunk_rows <= GPU_INT8_MATMUL_STAGING_ROWS:
         try:
             free_bytes_for_chunk = _gpu_effective_free_bytes(cupy)
+            total_bytes_for_chunk = _gpu_total_bytes(cupy)
         except (AttributeError, OSError, RuntimeError):
             free_bytes_for_chunk = 0
+            total_bytes_for_chunk = 0
         if free_bytes_for_chunk > 0:
+            # The fp32 staging slab coexists with the resident int8 matrix and
+            # the solver safety margin, so size it against the VRAM left AFTER
+            # those — not raw free. Sizing against raw free over-reserves staging
+            # (e.g. 8192 rows -> 5.5 GB) and pushes storage+staging+safety past
+            # the budget ceiling, forcing a resident-capable matrix into the
+            # ~100x slower streaming path. This is only the fit DECISION; the
+            # runtime matmul re-sizes its slab adaptively against live free VRAM
+            # (``_int8_matmul_staging_rows``), so a smaller plan estimate here
+            # never starves the actual GEMM.
+            capped_for_chunk = (
+                int(min(total_bytes_for_chunk * _GPU_BUDGET_TOTAL_FRACTION_CEILING, free_bytes_for_chunk))
+                if total_bytes_for_chunk > 0
+                else int(free_bytes_for_chunk)
+            )
+            staging_budget = max(
+                capped_for_chunk - int(storage_bytes) - int(safety_margin_bytes), 0
+            )
             effective_chunk_rows = _adaptive_int8_staging_chunk_rows(
                 n_cols=cols,
                 dtype=dtype,
-                free_bytes=free_bytes_for_chunk,
+                free_bytes=staging_budget,
             )
     staging_bytes, result_vector_bytes, safety_bytes = _gpu_solver_headroom_bytes(
         n_rows=rows,
@@ -4016,7 +4058,9 @@ def _gpu_int8_cache_variant_matmul(
         means = cache.means[selector].astype(dtype, copy=False)
         scales = cache.scales[selector].astype(dtype, copy=False)
     raw_selector = cache._resolve_raw_selector(selector)
-    chunk_rows = max(1, min(GPU_INT8_MATMUL_STAGING_ROWS, int(cache.shape[0])))
+    chunk_rows = _int8_matmul_staging_rows(
+        n_rows=int(cache.shape[0]), n_cols=selected_count, dtype=dtype, cupy=cupy
+    )
     empty_fn = getattr(cupy, "empty", np.empty)
     staging = empty_fn((chunk_rows, selected_count), dtype=dtype)
     result_gpu = empty_fn((cache.shape[0], matrix_gpu.shape[1]), dtype=dtype)
@@ -4044,7 +4088,9 @@ def _gpu_int8_cache_transpose_matmul(
     means = cache.means.astype(dtype, copy=False)
     scales = cache.scales.astype(dtype, copy=False)
     raw_selector = cache._resolve_raw_selector(slice(None))
-    chunk_rows = max(1, min(GPU_INT8_MATMUL_STAGING_ROWS, int(cache.shape[0])))
+    chunk_rows = _int8_matmul_staging_rows(
+        n_rows=int(cache.shape[0]), n_cols=variant_count, dtype=dtype, cupy=cupy
+    )
     empty_fn = getattr(cupy, "empty", np.empty)
     zeros_fn = getattr(cupy, "zeros", np.zeros)
     staging = empty_fn((chunk_rows, variant_count), dtype=dtype)
