@@ -134,17 +134,20 @@ def test_release_is_safe_when_cupy_is_none_and_no_cache() -> None:
 
 
 # ---------------------------------------------------------------------------
-# 2. Genotype matrix without ``try_materialize_gpu_subset`` → short-circuit
+# 2. Genotype matrix without ``try_materialize_gpu`` → short-circuit
 # ---------------------------------------------------------------------------
 
 
-def test_install_short_circuits_when_subset_method_missing() -> None:
-    gm = _StubGenotypeMatrix(provide_subset_method=False)
+def test_install_short_circuits_when_materialize_method_missing() -> None:
+    # The install helper gates on the method it actually invokes,
+    # ``try_materialize_gpu`` (not the never-called ``try_materialize_gpu_subset``);
+    # when it is absent the helper must short-circuit without materializing.
+    gm = _StubGenotypeMatrix()
+    delattr(gm, "try_materialize_gpu")
     fake_cupy = _make_fake_cupy()
     result = mi._try_install_cg_workset_resident_cache(gm, cupy=fake_cupy)
     assert result is False
     assert gm._cupy_cache is None
-    # Materialize must NOT be called when the subset API is absent.
     assert gm.materialize_calls == 0
 
 
@@ -153,49 +156,46 @@ def test_install_short_circuits_when_subset_method_missing() -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_install_refuses_when_budget_exceeded(monkeypatch: pytest.MonkeyPatch) -> None:
-    gm = _StubGenotypeMatrix(n_rows=1000, n_cols=1000)  # ≥1 MB required
+def test_install_refuses_when_materialize_declines(monkeypatch: pytest.MonkeyPatch) -> None:
+    # try_materialize_gpu is the SINGLE gate now (the premature budget pre-check
+    # was removed because it over-reserved fixed staging and rejected matrices
+    # the adaptive-staging plan accepts). When the matrix doesn't fit, the plan
+    # makes try_materialize_gpu return False (cheaply, no allocation) and the
+    # install refuses.
+    gm = _StubGenotypeMatrix(n_rows=1000, n_cols=1000, materialize_result=False)
     fake_cupy = _make_fake_cupy()
-
-    # Force budget to be tiny so required_bytes (1_000_000) > budget (1).
-    monkeypatch.setattr(
-        mi,
-        "_call_gpu_materialization_budget_bytes",
-        lambda cupy, **kwargs: 1,
-    )
 
     result = mi._try_install_cg_workset_resident_cache(gm, cupy=fake_cupy)
     assert result is False
     assert gm._cupy_cache is None
-    assert gm.materialize_calls == 0
+    # It DID consult the real gate (vs the old pre-check that refused first).
+    assert gm.materialize_calls == 1
 
 
-def test_install_refuses_when_budget_is_zero(monkeypatch: pytest.MonkeyPatch) -> None:
-    gm = _StubGenotypeMatrix(n_rows=100, n_cols=100)
+def test_install_refuses_when_matrix_empty(monkeypatch: pytest.MonkeyPatch) -> None:
+    # A degenerate (0-column) working set can't be materialized; the install
+    # bails before touching try_materialize_gpu.
+    gm = _StubGenotypeMatrix(n_rows=100, n_cols=0)
     fake_cupy = _make_fake_cupy()
-    monkeypatch.setattr(
-        mi,
-        "_call_gpu_materialization_budget_bytes",
-        lambda cupy, **kwargs: 0,
-    )
     result = mi._try_install_cg_workset_resident_cache(gm, cupy=fake_cupy)
     assert result is False
     assert gm.materialize_calls == 0
 
 
-def test_install_refuses_when_budget_helper_raises(monkeypatch: pytest.MonkeyPatch) -> None:
-    """The install must swallow AttributeError/RuntimeError/OSError from the
-    budget helper and quietly fall back to streaming."""
-    gm = _StubGenotypeMatrix()
+def test_install_does_not_consult_budget_helper(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The premature budget pre-check is gone — try_materialize_gpu (which runs
+    the adaptive-staging plan + cupy-pool release) is the single source of truth.
+    A broken budget helper must therefore NOT affect the install at all."""
+    gm = _StubGenotypeMatrix()  # materialize_result=True
     fake_cupy = _make_fake_cupy()
 
-    def _raises(*a, **kw):
-        raise RuntimeError("boom")
+    def _must_not_be_called(*a, **kw):
+        raise AssertionError("budget pre-check must no longer be consulted")
 
-    monkeypatch.setattr(mi, "_call_gpu_materialization_budget_bytes", _raises)
+    monkeypatch.setattr(mi, "_call_gpu_materialization_budget_bytes", _must_not_be_called)
     result = mi._try_install_cg_workset_resident_cache(gm, cupy=fake_cupy)
-    assert result is False
-    assert gm._cupy_cache is None
+    assert result is True
+    assert gm.materialize_calls == 1
 
 
 # ---------------------------------------------------------------------------

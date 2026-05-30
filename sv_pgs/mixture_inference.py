@@ -8555,18 +8555,14 @@ def _try_install_cg_workset_resident_cache(
     if n_rows <= 0 or n_cols <= 0:
         return False
     required_bytes = n_rows * n_cols  # int8 storage for the working-set columns
-    try:
-        budget_bytes = _call_gpu_materialization_budget_bytes(
-            cupy,
-            n_rows=n_rows,
-            n_cols=n_cols,
-            dtype=np.int8,
-            backend="int8-resident",
-        )
-    except (AttributeError, RuntimeError, OSError):
-        return False
-    if budget_bytes <= 0 or required_bytes > budget_bytes:
-        return False
+    # No standalone budget pre-check here: it used to call
+    # ``_gpu_materialization_budget_bytes`` with the DEFAULT fixed staging
+    # (GPU_INT8_MATMUL_STAGING_ROWS ≈ 2.8 GB), which over-reserved staging and
+    # rejected a near-full-GPU matrix that ``try_materialize_gpu`` — using the
+    # adaptive-staging plan (`_estimate_gpu_materialization_memory_plan`) +
+    # cupy-pool release — would actually accept. ``try_materialize_gpu`` is the
+    # single source of truth for plan-vs-budget gating and already returns False
+    # (cheaply, no allocation) when the matrix won't fit, so we delegate to it.
     try:
         materialized = genotype_matrix.try_materialize_gpu()
     except (MemoryError, OSError, RuntimeError) as exc:

@@ -3656,6 +3656,13 @@ def _estimate_gpu_materialization_memory_plan(
     effective_chunk_rows = int(chunk_rows)
     if "int8" in backend and effective_chunk_rows <= GPU_INT8_MATMUL_STAGING_ROWS:
         try:
+            # Release cupy's hoarded pool blocks back to the driver BEFORE
+            # measuring free, exactly as ``_gpu_materialization_budget_bytes``
+            # does — otherwise this reads the near-zero post-streaming driver
+            # free (e.g. 94 MB while the pool holds 15 GB), collapses the staging
+            # chunk to its floor, over-reserves, and the budget (which DOES free
+            # the pool first) then disagrees and rejects a matrix that fits.
+            _release_cupy_cached_memory(cupy)
             free_bytes_for_chunk = _gpu_effective_free_bytes(cupy)
             total_bytes_for_chunk = _gpu_total_bytes(cupy)
         except (AttributeError, OSError, RuntimeError):
