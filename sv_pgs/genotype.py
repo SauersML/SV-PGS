@@ -5245,33 +5245,44 @@ class StandardizedGenotypeMatrix:
             dtype = np.float32
             plans = self._sharded_gpu_plans(cupy=cupy, splits=splits, dtype=dtype, backend=backend)
         elif use_int8_gpu_cache:
-            fp16_dtype = getattr(cupy, "float16", None)
-            if (
-                GPU_FP16_RESIDENT_CACHE_ENABLED
-                and fp16_dtype is not None
-                and _cupy_compute_dtype(cupy) == cupy.float32
-            ):
-                plans = self._sharded_gpu_plans(
-                    cupy=cupy,
-                    splits=splits,
-                    dtype=fp16_dtype,
-                    backend="fp16-resident",
-                )
-                if plans is not None:
-                    backend = "fp16-resident"
-                    dtype = fp16_dtype
-            if plans is None:
-                metadata_bytes_per_column = np.dtype(np.float32).itemsize * 2
-                plans = self._sharded_gpu_plans(
-                    cupy=cupy,
-                    splits=splits,
-                    dtype=np.int8,
-                    backend="int8-resident",
-                    metadata_bytes_per_column=metadata_bytes_per_column,
-                )
-                if plans is not None:
-                    backend = "int8-resident"
-                    dtype = np.int8
+            # Prefer int8-resident on the multi-GPU sharded path. It is half the
+            # bytes of fp16 (1 vs 2 B/elem), so each shard leaves ample HBM for the
+            # CG operator scratch + Nyström basis — fp16 at ~12.6 GB/shard left
+            # almost nothing and thrashed into repeated GPU OOM — and it sidesteps
+            # the fp16 standardize upload kernel that nvrtc/ptxas cannot compile on
+            # this CUDA 12.3 / cupy 13.6 V100 build ("Unresolved extern function
+            # _ZN6__halfC1Ef" == __half(float)), which otherwise abandons the whole
+            # sharded materialization to slow host streaming. int8 standardize-on-
+            # read is cheap on-device. fp16-resident is used only if no int8 plan
+            # can be formed.
+            metadata_bytes_per_column = np.dtype(np.float32).itemsize * 2
+            plans = self._sharded_gpu_plans(
+                cupy=cupy,
+                splits=splits,
+                dtype=np.int8,
+                backend="int8-resident",
+                metadata_bytes_per_column=metadata_bytes_per_column,
+            )
+            if plans is not None:
+                backend = "int8-resident"
+                dtype = np.int8
+            else:
+                metadata_bytes_per_column = 0
+                fp16_dtype = getattr(cupy, "float16", None)
+                if (
+                    GPU_FP16_RESIDENT_CACHE_ENABLED
+                    and fp16_dtype is not None
+                    and _cupy_compute_dtype(cupy) == cupy.float32
+                ):
+                    plans = self._sharded_gpu_plans(
+                        cupy=cupy,
+                        splits=splits,
+                        dtype=fp16_dtype,
+                        backend="fp16-resident",
+                    )
+                    if plans is not None:
+                        backend = "fp16-resident"
+                        dtype = fp16_dtype
         else:
             backend = "fp32-resident"
             dtype = np.float32
