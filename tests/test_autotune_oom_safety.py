@@ -176,3 +176,19 @@ def test_per_batch_ceiling_caps_huge_box(monkeypatch: pytest.MonkeyPatch) -> Non
     bed_bytes = genotype.compute_bed_reader_target_batch_bytes()
     usable = genotype.compute_usable_prefetch_ram_bytes()
     assert bed_bytes <= usable * genotype._AUTO_TUNE_BED_BATCH_USABLE_FRACTION + 1
+
+
+def test_marginal_concat_plink_chunk_size_bounds_host_and_device() -> None:
+    """The concat PLINK marginal screen must not build multi-GB decode chunks."""
+    from sv_pgs.model import _marginal_int8_chunk_size
+
+    n_samples = 76_026
+    n_variants = 250_000
+    chunk_k = _marginal_int8_chunk_size(
+        n_samples=n_samples,
+        n_variants=n_variants,
+        host_available_bytes=29 * 1024**3,
+    )
+    assert chunk_k < 2_000
+    assert chunk_k * n_samples <= 512 * 1024**2
+    assert chunk_k * n_samples * 9 <= 1024**3

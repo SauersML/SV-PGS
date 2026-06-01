@@ -33,6 +33,8 @@ from sv_pgs.genotype import (
     RawGenotypeMatrix,
     RowSubsetRawGenotypeMatrix,
     StandardizedGenotypeMatrix,
+    _detect_available_host_ram_bytes,
+    _release_host_caches,
     _standardize_batch,
     as_raw_genotype_matrix,
     auto_batch_size,
@@ -893,13 +895,45 @@ def _standardized_int8_rmatvec(
     scale_dev = cp.asarray(scales_chunk)
     f32_chunk = int8_dev.astype(cp.float32)
     missing_mask = int8_dev == PLINK_MISSING_INT8
-    f32_chunk = cp.where(missing_mask, mean_dev[None, :], f32_chunk)
-    standardized = (f32_chunk - mean_dev[None, :]) / scale_dev[None, :]
-    contrib_dev = standardized.T @ rhs_dev
+    cp.copyto(f32_chunk, mean_dev[None, :], where=missing_mask)
+    f32_chunk -= mean_dev[None, :]
+    f32_chunk /= scale_dev[None, :]
+    contrib_dev = f32_chunk.T @ rhs_dev
     contrib = cp.asnumpy(contrib_dev).astype(np.float64, copy=False)
-    del int8_dev, mean_dev, scale_dev, f32_chunk, missing_mask, standardized, contrib_dev
+    del int8_dev, mean_dev, scale_dev, f32_chunk, missing_mask, contrib_dev
     cp.get_default_memory_pool().free_all_blocks()
     return contrib
+
+
+_MARGINAL_INT8_CHUNK_DEVICE_TARGET_BYTES = 1 * 1024 * 1024 * 1024
+_MARGINAL_INT8_CHUNK_HOST_TARGET_BYTES = 512 * 1024 * 1024
+_MARGINAL_INT8_CHUNK_HOST_FLOOR_BYTES = 64 * 1024 * 1024
+
+
+def _marginal_int8_chunk_size(
+    *,
+    n_samples: int,
+    n_variants: int,
+    host_available_bytes: int | None = None,
+) -> int:
+    """Return a marginal-screen int8 chunk size with host and HBM headroom."""
+    if n_samples < 1:
+        raise ValueError("n_samples must be positive.")
+    if n_variants < 1:
+        return 0
+    if host_available_bytes is None:
+        host_available_bytes = _detect_available_host_ram_bytes()
+    bytes_per_variant_device = max(int(n_samples) * 9, 1)
+    device_cap = max(
+        1,
+        _MARGINAL_INT8_CHUNK_DEVICE_TARGET_BYTES // bytes_per_variant_device,
+    )
+    dynamic_host_target = max(
+        _MARGINAL_INT8_CHUNK_HOST_FLOOR_BYTES,
+        min(_MARGINAL_INT8_CHUNK_HOST_TARGET_BYTES, int(host_available_bytes) // 8),
+    )
+    host_cap = max(1, dynamic_host_target // max(int(n_samples), 1))
+    return max(1, min(int(n_variants), int(device_cap), int(host_cap)))
 
 
 def _release_mmap_pages(array: Any) -> None:
@@ -1138,12 +1172,6 @@ def _compute_marginal_z_scores_concat(
     variant_offsets = raw_matrix._variant_offsets  # noqa: SLF001 — internal layout
     t_start = time.monotonic()
 
-    # Bound int8-path peak HBM per chunk. The working set for a chunk of k
-    # variants × n samples is dominated by two fp32 intermediates plus the
-    # int8 upload, ~9*n*k bytes. Cap at 4 GiB so even worst-case (200K
-    # active per VCF × 75K train samples) decomposes into safe chunks.
-    _INT8_CHUNK_TARGET_BYTES = 4 * 1024 * 1024 * 1024
-
     try:
         for child_idx, (child, kind) in enumerate(zip(raw_matrix.children, child_kinds)):
             child_start = int(variant_offsets[child_idx])
@@ -1198,11 +1226,11 @@ def _compute_marginal_z_scores_concat(
                     else child_local_idx
                 )
                 local_inner_idx_full = np.ascontiguousarray(local_inner_idx_full, dtype=np.int64)
-                # Chunk along the variant axis to keep peak HBM bounded.
-                bytes_per_variant_working_set = max(int(n) * 9, 1)
-                chunk_k = max(
-                    1,
-                    min(k_in_child, _INT8_CHUNK_TARGET_BYTES // bytes_per_variant_working_set),
+                # Chunk along the variant axis to keep both HBM scratch and
+                # host int8 decode buffers bounded under tight cgroups.
+                chunk_k = _marginal_int8_chunk_size(
+                    n_samples=n,
+                    n_variants=k_in_child,
                 )
                 contrib = np.empty((k_in_child, rhs_width), dtype=np.float64)
                 for c_start in range(0, k_in_child, chunk_k):
@@ -1263,10 +1291,9 @@ def _compute_marginal_z_scores_concat(
                     else child_local_idx,
                     dtype=np.int64,
                 )
-                bytes_per_variant_working_set = max(int(n) * 9, 1)
-                chunk_k = max(
-                    1,
-                    min(k_in_child, _INT8_CHUNK_TARGET_BYTES // bytes_per_variant_working_set),
+                chunk_k = _marginal_int8_chunk_size(
+                    n_samples=n,
+                    n_variants=k_in_child,
                 )
                 log(
                     f"  marginal-z concat: streaming PLINK child {child_idx} "
@@ -1277,19 +1304,24 @@ def _compute_marginal_z_scores_concat(
                 # (``sv_pgs.plink.open_bed``, a pread-based shim) — NOT
                 # ``iter_column_batches_i8``, whose prefetch branch hard-imports
                 # the upstream ``bed_reader`` package (absent here) and would
-                # otherwise hold 4 decoded ~1 GB batches in flight. One reader,
-                # one ~chunk_k-wide int8 read at a time: anonymous memory stays
-                # at a single chunk and the pread page-cache is reclaimable. The
-                # reads happen in ``leaf_local_idx`` order, so chunk
+                # otherwise hold 4 decoded ~1 GB batches in flight. Each chunk
+                # opens just long enough to read, then releases the mmap/fd
+                # before fadvise so the BED page cache is actually reclaimable.
+                # The reads happen in ``leaf_local_idx`` order, so chunk
                 # ``[c_start:c_stop]`` maps to the same slice of
                 # means/scales/output positions.
-                reader = leaf._bed_reader()  # noqa: SLF001 — internal reader reuse
                 contrib = np.empty((k_in_child, rhs_width), dtype=np.float64)
                 for c_start in range(0, k_in_child, chunk_k):
                     c_stop = min(c_start + chunk_k, k_in_child)
-                    int8_chunk = leaf._read_batch_i8(  # noqa: SLF001
-                        reader, leaf_local_idx[c_start:c_stop]
-                    )
+                    reader = leaf._bed_reader()  # noqa: SLF001 — short-lived chunk reader
+                    try:
+                        int8_chunk = leaf._read_batch_i8(  # noqa: SLF001
+                            reader, leaf_local_idx[c_start:c_stop]
+                        )
+                    finally:
+                        leaf.release_reader()
+                        del reader
+                    _release_host_caches(cp, fadvise_paths=(leaf.bed_path,))
                     if composed_rows is not None:
                         int8_chunk = np.ascontiguousarray(int8_chunk[composed_rows, :])
                     contrib[c_start:c_stop, :] = _standardized_int8_rmatvec(
@@ -1300,8 +1332,7 @@ def _compute_marginal_z_scores_concat(
                         rhs_dev,
                     )
                     del int8_chunk
-                # Drop the reader fd + evict the bed pages we just paged in.
-                leaf.release_reader()
+                    _release_host_caches(cp)
             else:
                 raise AssertionError(f"unreachable child kind: {kind}")
 
