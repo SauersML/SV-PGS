@@ -418,6 +418,40 @@ def test_try_cache_persistently_rebases_to_persistent_int8_cache(tmp_path):
     assert raw.i8_requests == []
 
 
+def test_try_cache_persistently_caps_large_write_tiles(tmp_path, monkeypatch: pytest.MonkeyPatch):
+    class _BatchSizeSpyRaw(_SpyInt8StreamingRawGenotypeMatrix):
+        def __init__(self, matrix: np.ndarray) -> None:
+            super().__init__(matrix)
+            self.batch_sizes: list[int] = []
+
+        def iter_column_batches_i8(
+            self,
+            variant_indices=None,
+            batch_size: int = 1024,
+            *,
+            num_threads: int | None = None,
+        ):
+            self.batch_sizes.append(int(batch_size))
+            yield from super().iter_column_batches_i8(
+                variant_indices,
+                batch_size=batch_size,
+                num_threads=num_threads,
+            )
+
+    raw_i8 = np.zeros((4, 10), dtype=np.int8)
+    raw = _BatchSizeSpyRaw(raw_i8)
+    standardized = raw.standardized(
+        means=np.zeros(raw_i8.shape[1], dtype=np.float32),
+        scales=np.ones(raw_i8.shape[1], dtype=np.float32),
+    )
+
+    monkeypatch.setattr(genotype_module, "auto_batch_size_i8", lambda sample_count: 10)
+    monkeypatch.setattr(genotype_module, "_INT8_CACHE_WRITE_TARGET_TILE_BYTES", 16)
+
+    assert standardized.try_cache_persistently(tmp_path / "reduced_raw_i8.npy") is True
+    assert raw.batch_sizes == [4]
+
+
 def test_try_cache_persistently_skips_when_disk_space_is_insufficient(tmp_path, monkeypatch: pytest.MonkeyPatch):
     raw_i8 = np.array(
         [
@@ -815,6 +849,186 @@ def test_try_materialize_gpu_prefers_int8_batches_when_available(monkeypatch: py
     assert raw.i8_requests == [[1, 3]]
     assert raw.float_requests == []
     np.testing.assert_allclose(np.asarray(cast(Any, standardized._cupy_cache)), expected)
+
+
+def test_try_materialize_gpu_keeps_fitting_matrix_single_gpu_on_multi_gpu_box(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """A block that fits one GPU stays single-GPU-resident even with 2 GPUs.
+
+    The CG working-set block is small and hammered every CG iteration; sharding
+    it forces a per-apply cross-device reduction and inter-shard pool
+    fragmentation. Routing must keep a fitting matrix on a single device.
+    """
+
+    class _FakeCudaRuntime:
+        @staticmethod
+        def memGetInfo():
+            return (16_000_000_000, 16_000_000_000)
+
+        @staticmethod
+        def getDeviceCount():
+            return 2
+
+    class _FakeDevice:
+        def synchronize(self) -> None:
+            return None
+
+    class _FakeCuda:
+        runtime = _FakeCudaRuntime()
+
+        @staticmethod
+        def Device():
+            return _FakeDevice()
+
+    class _FakeCupy:
+        float32 = np.float32
+        cuda = _FakeCuda()
+
+        @staticmethod
+        def asarray(array, dtype=None):
+            return np.asarray(array, dtype=dtype)
+
+        @staticmethod
+        def empty(shape, dtype=None, order=None):
+            return np.empty(shape, dtype=dtype, order="C" if order is None else order)
+
+        @staticmethod
+        def isnan(array):
+            return np.isnan(array)
+
+    raw_i8 = np.array([[0, 1, 2, 0], [1, 2, 0, 1], [2, 0, 1, 2]], dtype=np.int8)
+    raw = _SpyInt8StreamingRawGenotypeMatrix(raw_i8)
+    means = np.array([1.0, 1.0, 1.0, 1.0], dtype=np.float32)
+    scales = np.array([0.5, 2.0, 1.0, 0.5], dtype=np.float32)
+    standardized = raw.standardized(means, scales)
+
+    sharded_calls: list[dict[str, Any]] = []
+
+    def _spy_sharded(self, **kwargs):  # pragma: no cover - asserted not called
+        sharded_calls.append(kwargs)
+        return True
+
+    monkeypatch.setattr(
+        genotype_module.StandardizedGenotypeMatrix, "_try_materialize_gpu_sharded", _spy_sharded
+    )
+    _install_fake_pinned_and_streams(_FakeCupy)
+    monkeypatch.setattr(genotype_module, "_try_import_cupy", lambda: _FakeCupy())
+
+    assert standardized.try_materialize_gpu() is True
+    assert sharded_calls == []  # fit -> single GPU, never sharded
+    assert standardized._cupy_cache is not None
+    assert not isinstance(
+        standardized._cupy_cache, genotype_module._CupyShardedStandardizedCache
+    )
+
+
+def test_try_materialize_gpu_shards_when_matrix_exceeds_single_gpu(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """A matrix too large for one device still routes to the sharded path."""
+
+    class _FakeCudaRuntime:
+        @staticmethod
+        def memGetInfo():
+            return (16_000_000_000, 16_000_000_000)
+
+        @staticmethod
+        def getDeviceCount():
+            return 2
+
+    class _FakeDevice:
+        def synchronize(self) -> None:
+            return None
+
+    class _FakeCuda:
+        runtime = _FakeCudaRuntime()
+
+        @staticmethod
+        def Device():
+            return _FakeDevice()
+
+    class _FakeCupy:
+        float32 = np.float32
+        cuda = _FakeCuda()
+
+        @staticmethod
+        def asarray(array, dtype=None):
+            return np.asarray(array, dtype=dtype)
+
+        @staticmethod
+        def empty(shape, dtype=None, order=None):
+            return np.empty(shape, dtype=dtype, order="C" if order is None else order)
+
+        @staticmethod
+        def isnan(array):
+            return np.isnan(array)
+
+    raw_i8 = np.array([[0, 1, 2, 0], [1, 2, 0, 1], [2, 0, 1, 2]], dtype=np.int8)
+    raw = _SpyInt8StreamingRawGenotypeMatrix(raw_i8)
+    means = np.array([1.0, 1.0, 1.0, 1.0], dtype=np.float32)
+    scales = np.array([0.5, 2.0, 1.0, 0.5], dtype=np.float32)
+    standardized = raw.standardized(means, scales)
+
+    # Force the "does not fit one GPU" verdict so we exercise the shard route
+    # deterministically without depending on the budget arithmetic.
+    monkeypatch.setattr(
+        genotype_module.StandardizedGenotypeMatrix,
+        "_fits_single_gpu_resident",
+        lambda self, **kwargs: False,
+    )
+
+    sharded_calls: list[dict[str, Any]] = []
+
+    def _spy_sharded(self, **kwargs):
+        sharded_calls.append(kwargs)
+        return True
+
+    monkeypatch.setattr(
+        genotype_module.StandardizedGenotypeMatrix, "_try_materialize_gpu_sharded", _spy_sharded
+    )
+    monkeypatch.setattr(genotype_module, "_try_import_cupy", lambda: _FakeCupy())
+
+    assert standardized.try_materialize_gpu() is True
+    assert len(sharded_calls) == 1
+    assert sharded_calls[0]["use_int8_gpu_cache"] is True
+
+
+def test_fits_single_gpu_resident_rejects_when_block_exceeds_budget(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """The fit check returns False when the int8 floor footprint exceeds budget."""
+
+    class _FakeCupy:
+        float32 = np.float32
+
+    raw_i8 = np.zeros((8, 64), dtype=np.int8)
+    raw = _SpyInt8StreamingRawGenotypeMatrix(raw_i8)
+    means = np.ones(64, dtype=np.float32)
+    scales = np.ones(64, dtype=np.float32)
+    standardized = raw.standardized(means, scales)
+
+    fitting_plan = genotype_module._GpuMaterializationMemoryPlan(
+        n_rows=8, n_cols=64, dtype_name="int8", backend="int8-resident",
+        storage_bytes=512, metadata_bytes=512, staging_bytes=0, result_vector_bytes=0,
+        safety_margin_bytes=0, required_bytes=1024, solver_headroom_bytes=0,
+        budget_bytes=4096, free_bytes=16_000_000_000, total_bytes=16_000_000_000, chunk_rows=8,
+    )
+    oversized_plan = genotype_module._GpuMaterializationMemoryPlan(
+        n_rows=8, n_cols=64, dtype_name="int8", backend="int8-resident",
+        storage_bytes=512, metadata_bytes=512, staging_bytes=0, result_vector_bytes=0,
+        safety_margin_bytes=0, required_bytes=8192, solver_headroom_bytes=0,
+        budget_bytes=4096, free_bytes=16_000_000_000, total_bytes=16_000_000_000, chunk_rows=8,
+    )
+    monkeypatch.setattr(
+        genotype_module, "_estimate_gpu_materialization_memory_plan", lambda **kwargs: fitting_plan
+    )
+    assert standardized._fits_single_gpu_resident(cupy=_FakeCupy(), use_int8_gpu_cache=True) is True
+
+    monkeypatch.setattr(
+        genotype_module, "_estimate_gpu_materialization_memory_plan", lambda **kwargs: oversized_plan
+    )
+    assert standardized._fits_single_gpu_resident(cupy=_FakeCupy(), use_int8_gpu_cache=True) is False
 
 
 def test_streaming_gpu_context_uses_int8_budget_for_plink_like_backends(monkeypatch: pytest.MonkeyPatch):
@@ -1387,6 +1601,75 @@ def test_gpu_int8_upload_batch_size_caps_transient_tile_bytes(monkeypatch: pytes
         )
         == 5
     )
+
+
+def test_try_materialize_gpu_rebases_wrapped_int8_source_before_upload(monkeypatch: pytest.MonkeyPatch):
+    class _FakeCudaRuntime:
+        @staticmethod
+        def memGetInfo():
+            return (8_000_000_000, 16_000_000_000)
+
+    class _FakeDevice:
+        def synchronize(self) -> None:
+            return None
+
+    class _FakeCuda:
+        runtime = _FakeCudaRuntime()
+
+        @staticmethod
+        def Device():
+            return _FakeDevice()
+
+    class _FakeCupy:
+        float32 = np.float32
+        int8 = np.int8
+        cuda = _FakeCuda()
+
+        @staticmethod
+        def asarray(array, dtype=None):
+            return np.asarray(array, dtype=dtype)
+
+        @staticmethod
+        def asfortranarray(array):
+            return np.asfortranarray(array)
+
+        @staticmethod
+        def empty(shape, dtype=None, order=None):
+            return np.empty(shape, dtype=dtype, order="C" if order is None else order)
+
+        @staticmethod
+        def isnan(array):
+            return np.isnan(array)
+
+    left = Int8RawGenotypeMatrix(np.zeros((8, 3), dtype=np.int8, order="F"))
+    right = Int8RawGenotypeMatrix(np.ones((8, 3), dtype=np.int8, order="F"))
+    raw = ConcatenatedRawGenotypeMatrix((left, right))
+    standardized = raw.standardized(
+        np.zeros(6, dtype=np.float32),
+        np.ones(6, dtype=np.float32),
+    )
+    rebase_calls = 0
+
+    def _fake_try_cache_locally(self):
+        nonlocal rebase_calls
+        rebase_calls += 1
+        self.raw = Int8RawGenotypeMatrix(np.asfortranarray(np.zeros(self.shape, dtype=np.int8)))
+        self.means = np.asarray(self.means[self.variant_indices], dtype=np.float32)
+        self.scales = np.asarray(self.scales[self.variant_indices], dtype=np.float32)
+        self.variant_indices = np.arange(self.shape[1], dtype=np.int32)
+        return True
+
+    monkeypatch.setattr(genotype_module, "_try_import_cupy", lambda: _FakeCupy())
+    monkeypatch.setattr(genotype_module, "_GPU_INT8_REBASE_TO_LOCAL_CACHE_BYTES", 1)
+    monkeypatch.setattr(
+        genotype_module.StandardizedGenotypeMatrix,
+        "try_cache_locally",
+        _fake_try_cache_locally,
+    )
+
+    assert standardized.try_materialize_gpu() is True
+    assert rebase_calls == 1
+    assert isinstance(standardized.raw, Int8RawGenotypeMatrix)
 
 
 def test_try_materialize_gpu_uses_one_shot_int8_upload_for_contiguous_subset(monkeypatch: pytest.MonkeyPatch):

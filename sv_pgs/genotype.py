@@ -5418,6 +5418,47 @@ class StandardizedGenotypeMatrix:
                     _release_cupy_cached_memory(cupy)
             raise
 
+    def _fits_single_gpu_resident(self, *, cupy: Any, use_int8_gpu_cache: bool) -> bool:
+        """Whether the standardized matrix fits resident on a single GPU.
+
+        Drives materialization routing: a matrix that fits one device is kept
+        single-GPU-resident (no per-apply cross-device reduction, no inter-shard
+        pool fragmentation), and multi-GPU sharding is reserved for matrices too
+        large for one device. The CG working-set block — one LD block, hammered
+        ~100x per solve — is only a couple GB and fits comfortably, so this keeps
+        it on one GPU instead of splitting a block that never needed splitting.
+
+        Tests the *smallest* resident footprint (int8 when the source supports
+        it, else fp32): int8 is the floor, so if int8 does not fit one device
+        neither does fp16/fp32, and the single-GPU upload path then prefers fp16
+        with an int8 fallback exactly as before. Returns False on any estimation
+        failure so an uncertain case shards rather than risk a single-device OOM.
+        """
+        if self._dense_cache is not None:
+            dtype: Any = np.float32
+            backend = "fp32-resident"
+            metadata_bytes = 0
+        elif use_int8_gpu_cache:
+            dtype = np.int8
+            backend = "int8-resident"
+            metadata_bytes = int(self.shape[1]) * np.dtype(np.float32).itemsize * 2
+        else:
+            dtype = np.float32
+            backend = "fp32-resident"
+            metadata_bytes = 0
+        try:
+            plan = _estimate_gpu_materialization_memory_plan(
+                n_rows=self.shape[0],
+                n_cols=self.shape[1],
+                dtype=dtype,
+                backend=backend,
+                cupy=cupy,
+                metadata_bytes=metadata_bytes,
+            )
+        except (MemoryError, OSError, RuntimeError, ValueError, ArithmeticError):
+            return False
+        return bool(plan.fits)
+
     def try_materialize_gpu(self) -> bool:
         """Materialize the standardized matrix onto GPU memory when possible."""
         if self._cupy_cache is not None:
@@ -5446,7 +5487,18 @@ class StandardizedGenotypeMatrix:
                         and self.raw is not None
                         and _supports_int8_batches(self.raw)
                     )
-            if len(_cupy_device_ids(cupy)) >= 2:
+            # Shard across GPUs only when the matrix does not fit one device.
+            # A matrix that fits a single GPU is kept single-GPU-resident: the
+            # CG working-set block (one LD block, hammered ~100x per solve) is
+            # only a couple GB and fits comfortably, and keeping it on one device
+            # avoids both the per-apply cross-device reduction and the inter-shard
+            # pool fragmentation that drove the fp16 sharded upload into repeated
+            # GPU OOM -> slow host streaming. The full matrix that genuinely
+            # exceeds one device still shards.
+            if len(_cupy_device_ids(cupy)) >= 2 and not self._fits_single_gpu_resident(
+                cupy=cupy,
+                use_int8_gpu_cache=use_int8_gpu_cache,
+            ):
                 return self._try_materialize_gpu_sharded(
                     cupy=cupy,
                     use_int8_gpu_cache=use_int8_gpu_cache,
@@ -5539,6 +5591,16 @@ class StandardizedGenotypeMatrix:
                         + f"{requested_int8_upload_batch_size:,} -> {int8_upload_batch_size:,} variants "
                         + f"(host budget {_bytes_gb(host_budget_bytes)})  mem={mem()}"
                     )
+            # Defragment the CuPy pool immediately before the resident allocation
+            # below. The pool retains freed blocks as cached/fragmented chunks
+            # (e.g. small streaming-standardize tiles), so a feasible contiguous
+            # block can be rejected with aggregate free memory still looking
+            # ample ("Out of memory allocating ~1 GB; allocated so far: ~16 GB").
+            # Returning the cached blocks to the driver here guarantees the single
+            # resident allocation sees a defragmented heap. ``free_all_blocks``
+            # only reclaims *unreferenced* blocks, so live arrays (the RHS and the
+            # preconditioner already built for this solve) are untouched.
+            _release_cupy_cached_memory(cupy)
             if self._dense_cache is not None:
                 log(f"    uploading RAM-resident matrix to GPU ({nbytes / 1e9:.1f} GB)  mem={mem()}")
                 # Defer-and-restore on OOM: keep ``self._dense_cache`` populated
