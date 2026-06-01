@@ -3507,6 +3507,7 @@ _GPU_UPLOAD_HOST_SAFETY_BYTES = 2_000_000_000
 _GPU_UPLOAD_HOST_FRACTION_CEILING = 0.70
 _GPU_INT8_UPLOAD_TARGET_TILE_BYTES = 256_000_000
 _INT8_CACHE_WRITE_TARGET_TILE_BYTES = 256_000_000
+_GPU_INT8_REBASE_TO_LOCAL_CACHE_BYTES = 512_000_000
 
 
 @dataclass(frozen=True, slots=True)
@@ -3555,6 +3556,21 @@ def _gpu_int8_tiled_upload_host_bytes(sample_count: int, upload_batch_size: int)
     """Peak host staging for the two pinned tiles plus the decoded source tile."""
     tile_bytes = int(sample_count) * int(upload_batch_size)
     return max(0, tile_bytes * 3)
+
+
+def _should_rebase_int8_gpu_source_to_local_cache(raw: Any, total_int8_bytes: int) -> bool:
+    """Large wrapped/mixed int8 sources must be flattened before GPU upload.
+
+    Directly uploading a Concatenated/Indexed PLINK-backed source repeatedly
+    opens readers and grows cgroup-accounted page cache while a near-full GPU
+    cache is already resident. Flattening once into an F-order local int8 mmap
+    gives the upload path sequential local reads and bounded host staging.
+    """
+    return (
+        raw is not None
+        and not isinstance(raw, Int8RawGenotypeMatrix)
+        and int(total_int8_bytes) >= _GPU_INT8_REBASE_TO_LOCAL_CACHE_BYTES
+    )
 
 
 def _cap_int8_batch_size_by_tile_bytes(
@@ -5285,6 +5301,13 @@ class StandardizedGenotypeMatrix:
                 raw_int8 = cast(Int8BatchCapable, raw_matrix)
                 for device_id, start, stop in splits:
                     width = int(stop) - int(start)
+                    upload_batch_size = _gpu_int8_upload_batch_size_for_host(
+                        sample_count=int(self.shape[0]),
+                        requested_batch_size=auto_batch_size_i8(self.shape[0]),
+                        variant_count=width,
+                    )
+                    if upload_batch_size is None:
+                        return False
                     with _cupy_device_context(cupy, device_id):
                         shard_cache = cupy.empty((self.shape[0], width), dtype=cupy.float16, order="F")
                         _upload_standardized_int8_tiles_overlapped(
@@ -5295,7 +5318,7 @@ class StandardizedGenotypeMatrix:
                             scales=self.scales,
                             gpu_destination=shard_cache,
                             sample_count=int(self.shape[0]),
-                            upload_batch_size=auto_batch_size_i8(self.shape[0]),
+                            upload_batch_size=int(upload_batch_size),
                             standardized_dtype=cupy.float16,
                         )
                         _cupy_device_synchronize(cupy, device_id)
@@ -5313,7 +5336,10 @@ class StandardizedGenotypeMatrix:
                     with _cupy_device_context(cupy, device_id):
                         full_int8_block = None
                         int8_total_bytes = int(self.shape[0]) * width
-                        if int8_total_bytes <= int(plan.budget_bytes * INT8_ONE_SHOT_GPU_BUDGET_FRACTION):
+                        if (
+                            int8_total_bytes <= int(plan.budget_bytes * INT8_ONE_SHOT_GPU_BUDGET_FRACTION)
+                            and int8_total_bytes <= _host_upload_budget_bytes()
+                        ):
                             full_int8_block = _read_int8_columns_one_shot(raw_matrix, shard_variant_indices)
                         if full_int8_block is not None:
                             shard_raw = cupy.asarray(full_int8_block, dtype=gpu_int8_dtype)
@@ -5323,6 +5349,13 @@ class StandardizedGenotypeMatrix:
                                 else:
                                     shard_raw = np.asfortranarray(np.asarray(shard_raw, dtype=gpu_int8_dtype))
                         else:
+                            upload_batch_size = _gpu_int8_upload_batch_size_for_host(
+                                sample_count=int(self.shape[0]),
+                                requested_batch_size=auto_batch_size_i8(self.shape[0]),
+                                variant_count=width,
+                            )
+                            if upload_batch_size is None:
+                                return False
                             shard_raw = cupy.empty((self.shape[0], width), dtype=gpu_int8_dtype, order="F")
                             _upload_int8_tiles_overlapped(
                                 cupy=cupy,
@@ -5330,7 +5363,7 @@ class StandardizedGenotypeMatrix:
                                 variant_indices=shard_variant_indices,
                                 gpu_destination=shard_raw,
                                 sample_count=int(self.shape[0]),
-                                upload_batch_size=auto_batch_size_i8(self.shape[0]),
+                                upload_batch_size=int(upload_batch_size),
                                 gpu_int8_dtype=gpu_int8_dtype,
                             )
                         shard_cache = _CupyInt8StandardizedCache(
@@ -5384,6 +5417,24 @@ class StandardizedGenotypeMatrix:
         active_plan: _GpuMaterializationMemoryPlan | None = None
         try:
             use_int8_gpu_cache = self._dense_cache is None and self.raw is not None and _supports_int8_batches(self.raw)
+            if use_int8_gpu_cache and self.raw is not None:
+                int8_total_bytes = int(self.shape[0]) * int(self.shape[1])
+                if _should_rebase_int8_gpu_source_to_local_cache(self.raw, int8_total_bytes):
+                    log(
+                        "    rebasing wrapped int8 genotype source to local F-order cache before GPU upload "
+                        + f"({int8_total_bytes / 1e9:.1f} GB)  mem={mem()}"
+                    )
+                    if not self.try_cache_locally():
+                        log(
+                            "    local int8 cache rebase failed; skipping full GPU upload from wrapped source "
+                            + f"to avoid host OOM  mem={mem()}"
+                        )
+                        return False
+                    use_int8_gpu_cache = (
+                        self._dense_cache is None
+                        and self.raw is not None
+                        and _supports_int8_batches(self.raw)
+                    )
             if len(_cupy_device_ids(cupy)) >= 2:
                 return self._try_materialize_gpu_sharded(
                     cupy=cupy,
@@ -5847,7 +5898,7 @@ class StandardizedGenotypeMatrix:
         )
         if batch_size < min(int(requested_batch_size), max(selected_variant_count, 1)):
             log(
-                "    capping persistent int8 cache write tile: "
+                "    capping local int8 cache write tile: "
                 + f"{requested_batch_size:,} -> {batch_size:,} variants "
                 + f"(target {_bytes_gb(_INT8_CACHE_WRITE_TARGET_TILE_BYTES)})  mem={mem()}"
             )
@@ -5943,7 +5994,19 @@ class StandardizedGenotypeMatrix:
                     return True
             except (OSError, ValueError) as exc:
                 log(f"    existing persistent int8 cache unreadable ({exc}); rebuilding")
-        batch_size = auto_batch_size_i8(self.shape[0])
+        requested_batch_size = auto_batch_size_i8(self.shape[0])
+        batch_size = _cap_int8_batch_size_by_tile_bytes(
+            sample_count=int(self.shape[0]),
+            requested_batch_size=requested_batch_size,
+            variant_count=selected_variant_count,
+            target_tile_bytes=_INT8_CACHE_WRITE_TARGET_TILE_BYTES,
+        )
+        if batch_size < min(int(requested_batch_size), max(selected_variant_count, 1)):
+            log(
+                "    capping persistent int8 cache write tile: "
+                + f"{requested_batch_size:,} -> {batch_size:,} variants "
+                + f"(target {_bytes_gb(_INT8_CACHE_WRITE_TARGET_TILE_BYTES)})  mem={mem()}"
+            )
         # Resumable write: a fixed sibling .partial file (NOT a random temp
         # dir) so a kill mid-write is recoverable on next launch.
         # ``_stream_write_int8_npy`` writes a sidecar ``.progress`` after
@@ -5999,9 +6062,20 @@ class StandardizedGenotypeMatrix:
                 else self.variant_indices
             )
 
+            # Bound the .bed page cache during the persist pass. This streams the
+            # same pread-backed iterator as the GPU upload; without a per-batch
+            # POSIX_FADV_DONTNEED drain the cgroup-accounted bed cache grows by one
+            # batch per iteration and host-OOMs the 30 GB AoU container before the
+            # persist completes (same failure the upload path guards against).
+            persist_fadvise_paths = _collect_bed_paths(raw_int8)
+
             def _column_batches() -> Iterator[NDArray]:
                 for raw_batch in raw_int8.iter_column_batches_i8(variants_to_stream, batch_size=batch_size):
                     yield raw_batch.values
+                    # The batch has been written to the .npy; reclaim its bed
+                    # pages before the next read so host RAM stays bounded.
+                    _release_plink_readers(raw_int8)
+                    _release_host_caches(None, fadvise_paths=persist_fadvise_paths)
 
             _stream_write_int8_npy(
                 partial_path,
