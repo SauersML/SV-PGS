@@ -34,6 +34,7 @@ from sv_pgs.genotype import (
     RowSubsetRawGenotypeMatrix,
     StandardizedGenotypeMatrix,
     _detect_available_host_ram_bytes,
+    _gpu_free_bytes,
     _release_host_caches,
     _standardize_batch,
     as_raw_genotype_matrix,
@@ -905,9 +906,12 @@ def _standardized_int8_rmatvec(
     return contrib
 
 
-_MARGINAL_INT8_CHUNK_DEVICE_TARGET_BYTES = 1 * 1024 * 1024 * 1024
-_MARGINAL_INT8_CHUNK_HOST_TARGET_BYTES = 512 * 1024 * 1024
+_MARGINAL_INT8_CHUNK_DEVICE_FALLBACK_TARGET_BYTES = 1 * 1024 * 1024 * 1024
+_MARGINAL_INT8_CHUNK_DEVICE_MAX_TARGET_BYTES = 4 * 1024 * 1024 * 1024
+_MARGINAL_INT8_CHUNK_DEVICE_FREE_FRACTION = 0.25
+_MARGINAL_INT8_CHUNK_HOST_TARGET_BYTES = 1 * 1024 * 1024 * 1024
 _MARGINAL_INT8_CHUNK_HOST_FLOOR_BYTES = 64 * 1024 * 1024
+_MARGINAL_INT8_CHUNK_HOST_AVAILABLE_FRACTION = 1.0 / 6.0
 
 
 def _marginal_int8_chunk_size(
@@ -915,6 +919,8 @@ def _marginal_int8_chunk_size(
     n_samples: int,
     n_variants: int,
     host_available_bytes: int | None = None,
+    cupy: Any | None = None,
+    bed_total_sample_count: int | None = None,
 ) -> int:
     """Return a marginal-screen int8 chunk size with host and HBM headroom."""
     if n_samples < 1:
@@ -923,16 +929,33 @@ def _marginal_int8_chunk_size(
         return 0
     if host_available_bytes is None:
         host_available_bytes = _detect_available_host_ram_bytes()
+    gpu_free_bytes = _gpu_free_bytes(cupy) if cupy is not None else 0
+    if gpu_free_bytes > 0:
+        device_target_bytes = min(
+            _MARGINAL_INT8_CHUNK_DEVICE_MAX_TARGET_BYTES,
+            max(
+                _MARGINAL_INT8_CHUNK_DEVICE_FALLBACK_TARGET_BYTES,
+                int(gpu_free_bytes * _MARGINAL_INT8_CHUNK_DEVICE_FREE_FRACTION),
+            ),
+        )
+    else:
+        device_target_bytes = _MARGINAL_INT8_CHUNK_DEVICE_FALLBACK_TARGET_BYTES
     bytes_per_variant_device = max(int(n_samples) * 9, 1)
     device_cap = max(
         1,
-        _MARGINAL_INT8_CHUNK_DEVICE_TARGET_BYTES // bytes_per_variant_device,
+        int(device_target_bytes) // bytes_per_variant_device,
     )
+    host_bytes_per_variant = int(n_samples)
+    if bed_total_sample_count is not None:
+        host_bytes_per_variant += (int(bed_total_sample_count) + 3) // 4
     dynamic_host_target = max(
         _MARGINAL_INT8_CHUNK_HOST_FLOOR_BYTES,
-        min(_MARGINAL_INT8_CHUNK_HOST_TARGET_BYTES, int(host_available_bytes) // 8),
+        min(
+            _MARGINAL_INT8_CHUNK_HOST_TARGET_BYTES,
+            int(host_available_bytes * _MARGINAL_INT8_CHUNK_HOST_AVAILABLE_FRACTION),
+        ),
     )
-    host_cap = max(1, dynamic_host_target // max(int(n_samples), 1))
+    host_cap = max(1, dynamic_host_target // max(host_bytes_per_variant, 1))
     return max(1, min(int(n_variants), int(device_cap), int(host_cap)))
 
 
@@ -1231,6 +1254,7 @@ def _compute_marginal_z_scores_concat(
                 chunk_k = _marginal_int8_chunk_size(
                     n_samples=n,
                     n_variants=k_in_child,
+                    cupy=cp,
                 )
                 contrib = np.empty((k_in_child, rhs_width), dtype=np.float64)
                 for c_start in range(0, k_in_child, chunk_k):
@@ -1294,6 +1318,8 @@ def _compute_marginal_z_scores_concat(
                 chunk_k = _marginal_int8_chunk_size(
                     n_samples=n,
                     n_variants=k_in_child,
+                    cupy=cp,
+                    bed_total_sample_count=leaf.total_sample_count,
                 )
                 log(
                     f"  marginal-z concat: streaming PLINK child {child_idx} "
@@ -1310,7 +1336,6 @@ def _compute_marginal_z_scores_concat(
                 # The reads happen in ``leaf_local_idx`` order, so chunk
                 # ``[c_start:c_stop]`` maps to the same slice of
                 # means/scales/output positions.
-                contrib = np.empty((k_in_child, rhs_width), dtype=np.float64)
                 for c_start in range(0, k_in_child, chunk_k):
                     c_stop = min(c_start + chunk_k, k_in_child)
                     reader = leaf._bed_reader()  # noqa: SLF001 — short-lived chunk reader
@@ -1319,20 +1344,35 @@ def _compute_marginal_z_scores_concat(
                             reader, leaf_local_idx[c_start:c_stop]
                         )
                     finally:
+                        close = getattr(reader, "close", None)
+                        if callable(close):
+                            close()
                         leaf.release_reader()
                         del reader
                     _release_host_caches(cp, fadvise_paths=(leaf.bed_path,))
                     if composed_rows is not None:
                         int8_chunk = np.ascontiguousarray(int8_chunk[composed_rows, :])
-                    contrib[c_start:c_stop, :] = _standardized_int8_rmatvec(
+                    chunk_contrib = _standardized_int8_rmatvec(
                         cp,
-                        np.ascontiguousarray(int8_chunk, dtype=np.int8),
+                        np.asarray(int8_chunk, dtype=np.int8),
                         means_subset[c_start:c_stop],
                         scales_subset[c_start:c_stop],
                         rhs_dev,
                     )
+                    chunk_output_positions = output_positions[c_start:c_stop]
+                    sum_xy[chunk_output_positions] = chunk_contrib[:, 0]
+                    if p_cov > 0:
+                        proj_diag[chunk_output_positions] = covariate_projection_diag(
+                            chunk_contrib[:, 1:].T, ctc_inv
+                        )
+                    del chunk_contrib
                     del int8_chunk
                     _release_host_caches(cp)
+                log(
+                    f"  marginal-z concat: child {child_idx + 1}/{len(raw_matrix.children)} "
+                    f"({kind}, k={k_in_child:,}) in {time.monotonic() - t_child:.1f}s"
+                )
+                continue
             else:
                 raise AssertionError(f"unreachable child kind: {kind}")
 
@@ -1493,9 +1533,9 @@ def _try_upgrade_reduced_to_bitpacked(
     # EM scratch, standardization side buffers, and prefetch.
     try:
         import cupy as _cp_for_budget  # noqa: F811
-        gpu_free_bytes, gpu_total_bytes = _cp_for_budget.cuda.Device().mem_info
+        gpu_free_bytes, _ = _cp_for_budget.cuda.Device().mem_info
     except Exception:  # noqa: BLE001
-        gpu_free_bytes, gpu_total_bytes = 0, 0
+        gpu_free_bytes = 0
     headroom_bytes = max(int(gpu_free_bytes * 0.25), 4 * 1024**3)
     if gpu_free_bytes > 0 and packed_device_bytes + headroom_bytes > gpu_free_bytes:
         log(
@@ -2451,7 +2491,6 @@ class BayesianPGS:
         # ------------------------------------------------------------------
         if bool(getattr(self.config, "use_ld_blocks", False)):
             from sv_pgs.ld_block_partition import (
-                LdBlockPartition,
                 build_ld_block_partition,
             )
 

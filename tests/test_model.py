@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import pickle
+import sys
 from pathlib import Path
 from typing import cast
 
@@ -38,6 +39,7 @@ from sv_pgs.model import (
     _training_records_from_stats,
 )
 from sv_pgs.preprocessing import compute_variant_statistics
+from tests.conftest import make_fake_cupy
 
 
 def _synthetic_binary_dataset() -> tuple[np.ndarray, np.ndarray, np.ndarray, list[VariantRecord]]:
@@ -85,6 +87,113 @@ def _synthetic_binary_dataset() -> tuple[np.ndarray, np.ndarray, np.ndarray, lis
         ),
     ]
     return genotype_matrix, covariate_matrix, target_vector, variant_records
+
+
+def test_concat_marginal_z_plink_streams_chunks_without_child_contrib_buffer(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fake_cupy = make_fake_cupy()
+    monkeypatch.setitem(sys.modules, "cupy", fake_cupy)
+    monkeypatch.setattr(
+        model_module,
+        "_marginal_int8_chunk_size",
+        lambda **kwargs: 2,
+    )
+
+    genotype_i8 = np.array(
+        [
+            [0, 1, 2, 0, 1],
+            [1, 2, 0, 1, 2],
+            [2, 0, 1, 2, 0],
+            [0, 1, 2, 0, 1],
+            [1, 2, 0, 1, 2],
+            [2, 0, 1, 2, 0],
+        ],
+        dtype=np.int8,
+    )
+    means = genotype_i8.astype(np.float64).mean(axis=0).astype(np.float32)
+    scales = genotype_i8.astype(np.float64).std(axis=0, ddof=0).astype(np.float32)
+    raw = genotype_module.PlinkRawGenotypeMatrix(
+        bed_path=Path("synthetic.bed"),
+        sample_indices=np.arange(genotype_i8.shape[0], dtype=np.intp),
+        variant_count=genotype_i8.shape[1],
+        total_sample_count=genotype_i8.shape[0],
+    )
+    concat = genotype_module.ConcatenatedRawGenotypeMatrix(children=(raw,))
+    standardized = genotype_module.StandardizedGenotypeMatrix(
+        raw=concat,
+        means=means,
+        scales=scales,
+        variant_indices=np.arange(genotype_i8.shape[1], dtype=np.int32),
+        support_counts=np.full(genotype_i8.shape[1], genotype_i8.shape[0], dtype=np.int32),
+        sample_count=genotype_i8.shape[0],
+        _enable_hybrid_backend=False,
+    )
+
+    closed_readers: list[int] = []
+    read_batches: list[np.ndarray] = []
+    released_paths: list[tuple[str, ...]] = []
+
+    class FakeReader:
+        def __init__(self) -> None:
+            self.closed = False
+
+        def close(self) -> None:
+            if not self.closed:
+                closed_readers.append(id(self))
+                self.closed = True
+
+    def fake_bed_reader(self: genotype_module.PlinkRawGenotypeMatrix) -> FakeReader:
+        reader = FakeReader()
+        self._reader = reader
+        return reader
+
+    def fake_read_batch_i8(
+        self: genotype_module.PlinkRawGenotypeMatrix,
+        reader: FakeReader,
+        batch_indices: np.ndarray,
+        *,
+        num_threads: int | None = None,
+    ) -> np.ndarray:
+        assert not reader.closed
+        resolved = np.asarray(batch_indices, dtype=np.int64)
+        read_batches.append(resolved.copy())
+        return np.asfortranarray(genotype_i8[:, resolved])
+
+    def fake_release_host_caches(cupy: object, *, fadvise_paths=()) -> None:
+        released_paths.append(tuple(str(path) for path in fadvise_paths))
+
+    monkeypatch.setattr(genotype_module.PlinkRawGenotypeMatrix, "_bed_reader", fake_bed_reader)
+    monkeypatch.setattr(genotype_module.PlinkRawGenotypeMatrix, "_read_batch_i8", fake_read_batch_i8)
+    monkeypatch.setattr(model_module, "_release_host_caches", fake_release_host_caches)
+
+    target = np.array([0.25, 1.0, -0.5, 0.75, -1.25, 0.5], dtype=np.float64)
+    active = np.arange(genotype_i8.shape[1], dtype=np.int32)
+    observed = model_module._compute_marginal_z_scores_concat(
+        standardized_genotypes=standardized,
+        active_variant_indices=active,
+        covariate_matrix=np.zeros((genotype_i8.shape[0], 0), dtype=np.float64),
+        target_vector=target,
+    )
+
+    y_resid = target - target.mean()
+    sigma2_resid = float(np.dot(y_resid, y_resid) / genotype_i8.shape[0])
+    standardized_host = (genotype_i8.astype(np.float64) - means[None, :]) / scales[None, :]
+    expected_sum_xy = standardized_host.T @ y_resid
+    expected = expected_sum_xy / np.sqrt(sigma2_resid * genotype_i8.shape[0])
+
+    assert observed is not None
+    np.testing.assert_allclose(observed, expected.astype(np.float32), rtol=1e-5, atol=1e-6)
+    assert [batch.tolist() for batch in read_batches] == [[0, 1], [2, 3], [4]]
+    assert len(closed_readers) == 3
+    assert released_paths == [
+        ("synthetic.bed",),
+        (),
+        ("synthetic.bed",),
+        (),
+        ("synthetic.bed",),
+        (),
+    ]
 
 
 class ShapeOnlyRawGenotypeMatrix(RawGenotypeMatrix):

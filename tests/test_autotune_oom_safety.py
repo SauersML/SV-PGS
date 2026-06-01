@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import builtins
 import io
+import types
 from typing import Any
 
 import pytest
@@ -178,17 +179,28 @@ def test_per_batch_ceiling_caps_huge_box(monkeypatch: pytest.MonkeyPatch) -> Non
     assert bed_bytes <= usable * genotype._AUTO_TUNE_BED_BATCH_USABLE_FRACTION + 1
 
 
-def test_marginal_concat_plink_chunk_size_bounds_host_and_device() -> None:
-    """The concat PLINK marginal screen must not build multi-GB decode chunks."""
+def test_marginal_concat_plink_chunk_size_uses_v100_without_oom() -> None:
+    """V100 PLINK chunks should be large enough to be fast but stay bounded."""
     from sv_pgs.model import _marginal_int8_chunk_size
 
     n_samples = 76_026
     n_variants = 250_000
+    v100_free_bytes = 14 * 1024**3
+    fake_cupy = types.SimpleNamespace(
+        cuda=types.SimpleNamespace(
+            runtime=types.SimpleNamespace(memGetInfo=lambda: (v100_free_bytes, 16 * 1024**3))
+        )
+    )
     chunk_k = _marginal_int8_chunk_size(
         n_samples=n_samples,
         n_variants=n_variants,
         host_available_bytes=29 * 1024**3,
+        cupy=fake_cupy,
+        bed_total_sample_count=447_278,
     )
-    assert chunk_k < 2_000
-    assert chunk_k * n_samples <= 512 * 1024**2
-    assert chunk_k * n_samples * 9 <= 1024**3
+    full_bed_payload_bytes = chunk_k * ((447_278 + 3) // 4)
+    selected_i8_bytes = chunk_k * n_samples
+    device_work_bytes = chunk_k * n_samples * 9
+    assert 4_000 <= chunk_k <= 6_000
+    assert full_bed_payload_bytes + selected_i8_bytes <= 1024**3
+    assert device_work_bytes <= 4 * 1024**3
