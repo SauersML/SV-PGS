@@ -37,6 +37,7 @@ from sv_pgs.mixture_inference import (
     _stochastic_sample_space_preconditioner_rank,
     _stochastic_restricted_cross_leverage_diagonal,
     _gpu_cholesky_with_adaptive_ridge,
+    _stabilize_sample_space_solve_with_operator_ridge,
     _gpu_exact_variant_full_matrix_fits,
     _gpu_exact_variant_tile_size,
     _restricted_variant_space_operator,
@@ -5411,3 +5412,57 @@ def test_member_prior_variances_preserve_member_metadata_with_ties():
     assert member_prior_variances.shape == (2,)
     assert member_prior_variances[0] > member_prior_variances[1]
     assert not np.isclose(member_prior_variances[0], member_prior_variances[1])
+
+
+def test_operator_ridge_keeps_well_conditioned_solve_untouched():
+    """A finite first attempt is returned verbatim with no ridge applied."""
+    diagonal_noise = np.full(5, 0.7, dtype=np.float64)
+    seen: list[np.ndarray] = []
+
+    def attempt(diag: np.ndarray) -> np.ndarray:
+        seen.append(np.asarray(diag, dtype=np.float64))
+        return np.array([1.0, 2.0, 3.0], dtype=np.float64)
+
+    result = _stabilize_sample_space_solve_with_operator_ridge(
+        attempt, diagonal_noise=diagonal_noise, label="test"
+    )
+    np.testing.assert_array_equal(result, np.array([1.0, 2.0, 3.0]))
+    # Exactly one attempt, with the unridged diagonal (bit-for-bit unchanged).
+    assert len(seen) == 1
+    np.testing.assert_array_equal(seen[0], diagonal_noise)
+
+
+def test_operator_ridge_escalates_until_finite():
+    """A non-finite solve triggers an escalating ridge on the operator diagonal."""
+    diagonal_noise = np.full(4, 2.0, dtype=np.float64)
+    attempts: list[np.ndarray] = []
+
+    def attempt(diag: np.ndarray) -> np.ndarray:
+        attempts.append(np.asarray(diag, dtype=np.float64))
+        # First (unridged) call returns NaN; succeed only once a ridge is added.
+        if len(attempts) == 1:
+            return np.array([np.nan, 0.0], dtype=np.float64)
+        return np.array([0.5, 0.5], dtype=np.float64)
+
+    result = _stabilize_sample_space_solve_with_operator_ridge(
+        attempt, diagonal_noise=diagonal_noise, label="test"
+    )
+    np.testing.assert_array_equal(result, np.array([0.5, 0.5]))
+    assert len(attempts) == 2
+    # The retry adds a positive ridge scaled to the diagonal (median |diag| = 2.0).
+    added = attempts[1] - diagonal_noise
+    assert np.all(added > 0.0)
+    np.testing.assert_allclose(added, 1e-6 * 2.0)
+
+
+def test_operator_ridge_raises_when_never_finite():
+    """If every ridge still yields non-finite values, raise instead of returning garbage."""
+    diagonal_noise = np.ones(3, dtype=np.float64)
+
+    def attempt(diag: np.ndarray) -> np.ndarray:
+        return np.array([np.inf, 1.0, 1.0], dtype=np.float64)
+
+    with pytest.raises(FloatingPointError):
+        _stabilize_sample_space_solve_with_operator_ridge(
+            attempt, diagonal_noise=diagonal_noise, label="test"
+        )

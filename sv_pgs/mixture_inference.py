@@ -10184,6 +10184,48 @@ def _solve_restricted_exact_variant_space(
     return beta, genetic_linear_predictor, beta_variance, logdet_A
 
 
+def _stabilize_sample_space_solve_with_operator_ridge(
+    attempt: Any,
+    *,
+    diagonal_noise: NDArray,
+    label: str,
+) -> NDArray:
+    """Return a finite sample-space solve, escalating a Tikhonov ridge if needed.
+
+    ``attempt(diagonal_noise_array)`` runs one block-CG sample-space solve and
+    returns its (host) result. A severely ill-conditioned operator — e.g. a high
+    case-rate binary cohort whose PG-IRLS weights saturate, inflating
+    ``diagonal_noise`` — makes the CG return a non-finite "best iterate" under
+    ``raise_on_nonconvergence=False``; that garbage then makes the downstream GLS
+    Cholesky non-finite and aborts the whole fit. Re-solving against
+    ``diag(diagonal_noise + ridge)`` bounds the condition number so the solve is
+    usable again.
+
+    The ridge is scaled to the operator diagonal and engages ONLY after a
+    non-finite result is observed, so well-conditioned cohorts take the first
+    (unridged) solve and are bit-for-bit unchanged.
+    """
+    solved = attempt(diagonal_noise)
+    if np.all(np.isfinite(np.asarray(solved))):
+        return solved
+    base = np.asarray(diagonal_noise, dtype=np.float64)
+    diag_scale = float(np.median(np.abs(base)))
+    if not np.isfinite(diag_scale) or diag_scale <= 0.0:
+        diag_scale = 1.0
+    for ridge_factor in (1e-6, 1e-4, 1e-2, 1e-1, 1.0, 1e1):
+        log(
+            f"    {label}: sample-space solve non-finite; "
+            f"retrying with operator ridge {ridge_factor:g}×diag"
+        )
+        solved = attempt(base + (ridge_factor * diag_scale))
+        if np.all(np.isfinite(np.asarray(solved))):
+            log(f"    {label}: stabilized with operator ridge {ridge_factor:g}×diag")
+            return solved
+    raise FloatingPointError(
+        f"{label}: sample-space solve remained non-finite after operator ridge 10×diag."
+    )
+
+
 def _solve_restricted_mean_only(
     genotype_matrix: StandardizedGenotypeMatrix,
     covariate_matrix: NDArray,
@@ -10495,34 +10537,42 @@ def _solve_restricted_mean_only(
         ) -> NDArray:
             _solve_t0 = _timed_region_start(timing_cupy)
             log(f"      GPU CG solve starting: rhs_cols={right_hand_side.shape[1] if right_hand_side.ndim > 1 else 1}")
-            solve_result = _solve_sample_space_rhs_gpu(
-                genotype_matrix=genotype_matrix,
-                prior_variances=prior_variances,
+
+            def _attempt(diagonal_noise_arg: NDArray) -> NDArray:
+                solve_result = _solve_sample_space_rhs_gpu(
+                    genotype_matrix=genotype_matrix,
+                    prior_variances=prior_variances,
+                    diagonal_noise=diagonal_noise_arg,
+                    right_hand_side=right_hand_side,
+                    initial_guess=initial_guess,
+                    tolerance=solver_tolerance,
+                    max_iterations=maximum_linear_solver_iterations,
+                    preconditioner=sample_space_preconditioner_gpu,
+                    batch_size=posterior_variance_batch_size,
+                    return_iterations=True,
+                    # Restricted-mean solve is an inexact-Newton step under a forcing
+                    # sequence: accept the best iterate if an ill-conditioned cohort
+                    # can't reach the (already-relaxed) tolerance within the forcing
+                    # iteration budget, rather than aborting the whole fit. The EM
+                    # outer loop refines this mean across passes.
+                    raise_on_nonconvergence=False,
+                )
+                solved_rhs, iterations_used = _resolve_sample_space_solve_result(
+                    solve_result,
+                    fallback_iterations=maximum_linear_solver_iterations,
+                )
+                _update_sample_space_preconditioner_iterations(
+                    sample_space_preconditioner_cache_entry,
+                    iterations_used,
+                )
+                log(f"      GPU CG done: {iterations_used} iterations in {_timed_region_seconds(_solve_t0, timing_cupy):.1f}s  mem={mem()}")
+                return np.asarray(solved_rhs, dtype=np.float64)
+
+            return _stabilize_sample_space_solve_with_operator_ridge(
+                _attempt,
                 diagonal_noise=diagonal_noise,
-                right_hand_side=right_hand_side,
-                initial_guess=initial_guess,
-                tolerance=solver_tolerance,
-                max_iterations=maximum_linear_solver_iterations,
-                preconditioner=sample_space_preconditioner_gpu,
-                batch_size=posterior_variance_batch_size,
-                return_iterations=True,
-                # Restricted-mean solve is an inexact-Newton step under a forcing
-                # sequence: accept the best iterate if an ill-conditioned cohort
-                # can't reach the (already-relaxed) tolerance within the forcing
-                # iteration budget, rather than aborting the whole fit. The EM
-                # outer loop refines this mean across passes.
-                raise_on_nonconvergence=False,
+                label="GPU block-CG restricted-mean",
             )
-            solved_rhs, iterations_used = _resolve_sample_space_solve_result(
-                solve_result,
-                fallback_iterations=maximum_linear_solver_iterations,
-            )
-            _update_sample_space_preconditioner_iterations(
-                sample_space_preconditioner_cache_entry,
-                iterations_used,
-            )
-            log(f"      GPU CG done: {iterations_used} iterations in {_timed_region_seconds(_solve_t0, timing_cupy):.1f}s  mem={mem()}")
-            return np.asarray(solved_rhs, dtype=np.float64)
     else:
         log(
             "    restricted mean: CPU block-PCG sample-space solve "
@@ -10543,27 +10593,34 @@ def _solve_restricted_mean_only(
             *,
             initial_guess: NDArray | None = None,
         ) -> NDArray:
-            solve_result = _solve_sample_space_rhs_cpu(
-                genotype_matrix=genotype_matrix,
-                prior_variances=prior_variances,
+            def _attempt(diagonal_noise_arg: NDArray) -> NDArray:
+                solve_result = _solve_sample_space_rhs_cpu(
+                    genotype_matrix=genotype_matrix,
+                    prior_variances=prior_variances,
+                    diagonal_noise=diagonal_noise_arg,
+                    right_hand_side=right_hand_side,
+                    initial_guess=initial_guess,
+                    tolerance=solver_tolerance,
+                    max_iterations=maximum_linear_solver_iterations,
+                    preconditioner=sample_space_preconditioner,
+                    batch_size=posterior_variance_batch_size,
+                    return_iterations=True,
+                )
+                solved_rhs, iterations_used = _resolve_sample_space_solve_result(
+                    solve_result,
+                    fallback_iterations=maximum_linear_solver_iterations,
+                )
+                _update_sample_space_preconditioner_iterations(
+                    sample_space_preconditioner_cache_entry,
+                    iterations_used,
+                )
+                return np.asarray(solved_rhs, dtype=np.float64)
+
+            return _stabilize_sample_space_solve_with_operator_ridge(
+                _attempt,
                 diagonal_noise=diagonal_noise,
-                right_hand_side=right_hand_side,
-                initial_guess=initial_guess,
-                tolerance=solver_tolerance,
-                max_iterations=maximum_linear_solver_iterations,
-                preconditioner=sample_space_preconditioner,
-                batch_size=posterior_variance_batch_size,
-                return_iterations=True,
+                label="CPU block-PCG restricted-mean",
             )
-            solved_rhs, iterations_used = _resolve_sample_space_solve_result(
-                solve_result,
-                fallback_iterations=maximum_linear_solver_iterations,
-            )
-            _update_sample_space_preconditioner_iterations(
-                sample_space_preconditioner_cache_entry,
-                iterations_used,
-            )
-            return np.asarray(solved_rhs, dtype=np.float64)
 
     required_rhs_matrix = np.concatenate([targets[:, None], covariate_matrix], axis=1)
     initial_sample_space_guess = None
