@@ -56,7 +56,9 @@ def test_try_materialize_gpu_no_async_race_on_last_tile():
     # Read the cache immediately — no extra synchronize() here. If the last
     # tile's async H2D copy were still in flight, this would return stale
     # (zeroed) data and the assertion would fail.
-    materialized_from_cache = np.asarray(standardized._cupy_cache)
+    # ``_cupy_cache`` is a CuPy device array; copy it to host explicitly
+    # (CuPy 13 rejects the implicit ``np.asarray`` device→host conversion).
+    materialized_from_cache = standardized._cupy_cache.get()
     np.testing.assert_allclose(materialized_from_cache, expected, atol=1e-5)
 
 
@@ -97,5 +99,7 @@ def test_subset_gpu_cache_survives_parent_gc():
     del parent
     gc.collect()
 
-    materialized_from_subset = np.asarray(subset._cupy_cache)
+    # ``_cupy_cache`` is a CuPy device array; copy it to host explicitly
+    # (CuPy 13 rejects the implicit ``np.asarray`` device→host conversion).
+    materialized_from_subset = subset._cupy_cache.get()
     np.testing.assert_allclose(materialized_from_subset, expected, atol=1e-5)

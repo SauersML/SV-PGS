@@ -16,12 +16,33 @@ from __future__ import annotations
 from typing import Any
 
 import numpy as np
+import pytest
 
+import sv_pgs.mixture_inference as mixture_inference
 from sv_pgs.config import ModelConfig, TraitType
 from sv_pgs.inference import fit_variational_em
 from sv_pgs.preprocessing import build_tie_map
 
 from tests.conftest import make_variant_records
+
+
+@pytest.fixture(autouse=True)
+def force_configured_stochastic_block_size(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Pin the stochastic block size to the configured batch size.
+
+    The device-driven block-size auto-sizer collapses these tiny test
+    problems into a single block on a large GPU, which disables the
+    within-epoch block shuffle entirely (the ``len(epoch_blocks) > 1`` gate).
+    Returning the configured size keeps the multi-block shuffle path — the
+    feature under test — active regardless of GPU memory. The shuffle still
+    converges to the same fixed point (SPEC), so the seed only changes the
+    not-yet-converged intermediate iterates these tests compare.
+    """
+    monkeypatch.setattr(
+        mixture_inference,
+        "_adaptive_stochastic_variant_block_size",
+        lambda genotype_matrix, configured_block_size: int(configured_block_size),
+    )
 
 
 def _make_data(seed: int = 0):

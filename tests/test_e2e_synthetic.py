@@ -180,9 +180,14 @@ def test_e2e_synthetic_pipeline_and_active_cache(
         log_all_1 += "\n" + log_file.read_text(encoding="utf-8", errors="replace")
 
     # ---- Banners ----------------------------------------------------------
-    assert "bitpacked upgrade: ENGAGED" in log_all_1, (
-        "expected ENGAGED banner; got log tail:\n" + log_all_1[-2000:]
-    )
+    # The PLINK path loads a lazy PlinkRawGenotypeMatrix and upgrades it to a
+    # bitpacked device matrix in model.fit's post-active stage
+    # ("bitpacked post-active upgrade: ENGAGED"); the in-memory make_dense path
+    # logs the shorter "bitpacked upgrade: ENGAGED". Accept either.
+    assert (
+        "bitpacked post-active upgrade: ENGAGED" in log_all_1
+        or "bitpacked upgrade: ENGAGED" in log_all_1
+    ), ("expected ENGAGED banner; got log tail:\n" + log_all_1[-2000:])
     # The model.fit "materialize reduced genotype matrix" path always
     # standardizes the matrix before EM; downstream the hot-loop banner
     # reports the materialized wrapper. Accept either the bitpacked banner

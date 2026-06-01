@@ -443,6 +443,14 @@ def test_cli_run_builds_config(monkeypatch, tmp_path: Path):
 
 def test_resolve_ancestry_predictions_path_uses_documented_cdr_v8_location(monkeypatch):
     monkeypatch.setenv("CDR_STORAGE_PATH", "gs://bucket/cdr")
+    # The resolver probes known basenames via gsutil and returns the first that
+    # exists. Only the documented bare ``ancestry_preds.tsv`` is present here
+    # (the echo_v4_r2.* variant is not), so it must be the resolved path.
+    monkeypatch.setattr(
+        aou_runner,
+        "_gsutil_object_exists",
+        lambda path: path.endswith("/ancestry_preds.tsv"),
+    )
 
     assert aou_runner.resolve_ancestry_predictions_path() == (
         "gs://bucket/cdr/wgs/short_read/snpindel/aux/ancestry/ancestry_preds.tsv"
@@ -582,6 +590,12 @@ def test_download_sv_vcf_downloads_missing_index_for_existing_vcf(monkeypatch, t
     local_vcf = cache_dir / "AoU_srWGS_SV.v8.chr22.vcf.gz"
     cache_dir.mkdir(parents=True, exist_ok=True)
     local_vcf.write_text("data\n", encoding="utf-8")
+    # A valid cache entry now requires a manifest sibling; express the intended
+    # state directly — the VCF is cached, its index is not — so the downloader
+    # fetches only the missing ``.tbi``. Also pin the mounted-workspace probe
+    # off so it never short-circuits the download path.
+    monkeypatch.setattr(aou_runner, "verify_local_cache", lambda path: Path(path) == local_vcf)
+    monkeypatch.setattr(aou_runner, "_link_mounted_sv_vcf", lambda chromosome, work_dir: False)
 
     sized: list[str] = []
     copied: list[tuple[str, str]] = []

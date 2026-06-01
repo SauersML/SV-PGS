@@ -76,6 +76,16 @@ class _DeviceArray:
     def data(self) -> SimpleNamespace:
         return SimpleNamespace(ptr=int(self._np.ctypes.data))
 
+    def reshape(self, *shape: Any) -> "_DeviceArray":
+        # Mirror cupy.ndarray.reshape: the cold-load flattens the packed
+        # device buffer to a 1-D view before chunked H2D memcpy.
+        return _DeviceArray(self._np.reshape(*shape))
+
+    def __getitem__(self, item: Any) -> "_DeviceArray":
+        # Slicing the flat device buffer must yield an object that still
+        # exposes ``.data.ptr`` / ``.nbytes`` for the per-chunk memcpy.
+        return _DeviceArray(self._np[item])
+
 
 class _Stream:
     ptr = 0
@@ -311,6 +321,12 @@ def test_cached_wrapper_miss_then_hit(tmp_path: Path, cupy_shim: Any) -> None:
         )
         assert m1 is matrix
         assert call_counter["n"] == 1
+
+        # The cold-load path writes the cache on a background daemon thread so
+        # the matrix returns to the caller immediately; wait for that write to
+        # finish before asserting the second call hits the cache.
+        for writer_thread in list(bp_loader._ACTIVE_CACHE_WRITER_THREADS):
+            writer_thread.join(timeout=30)
 
         # Cache hit → cold loader NOT called again.
         m2 = mod.load_bed_to_bitpacked_device_cached(

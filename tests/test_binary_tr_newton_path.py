@@ -31,7 +31,7 @@ def _make_binary_problem(
     }
 
 
-def _fit_once(problem: dict) -> tuple[np.ndarray, int]:
+def _fit_once(problem: dict, *, use_tr_newton_binary: bool = True) -> tuple[np.ndarray, int]:
     config = ModelConfig(
         trait_type=TraitType.BINARY,
         max_outer_iterations=1,
@@ -55,6 +55,9 @@ def _fit_once(problem: dict) -> tuple[np.ndarray, int]:
         gradient_tolerance=config.newton_gradient_tolerance,
         compute_logdet=False,
         compute_beta_variance=False,
+        # TR-Newton is opt-in (default False) so AoU binary fits don't spend
+        # ~600s/epoch on it; these tests exercise the TR-Newton path itself.
+        use_tr_newton_binary=use_tr_newton_binary,
     )
     return np.asarray(beta, dtype=np.float64), int(iters)
 

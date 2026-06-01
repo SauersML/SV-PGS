@@ -30,6 +30,7 @@ from sv_pgs.model import (
     _FitStageCachePaths,
     _active_indices_cover_original,
     _fit_stage_cache_paths,
+    _fit_checkpoint_config_hash,
     _persistent_raw_signature,
     _raw_standardized_subset_matvec,
     _runtime_tuned_config_for_fit,
@@ -842,6 +843,16 @@ def test_fit_checkpoint_persists_basis_cache_during_interrupted_run(tmp_path, mo
     )
 
     monkeypatch.setattr(model_module, "_fit_stage_cache_paths", lambda **kwargs: cache_paths)
+    # Pin the configured rank/seed: the device-driven runtime tuner would
+    # otherwise auto-size sample_space_preconditioner_rank (3 -> 512 on a
+    # 16GB GPU), so the basis would be cached under key (512, seed) while the
+    # fake stores it under (3, 19) — and the asserted r3.seed19 path would
+    # never be written.
+    monkeypatch.setattr(
+        model_module,
+        "_runtime_tuned_config_for_fit",
+        lambda *, config, genotype_matrix: (config, None),
+    )
 
     def fake_fit_variational_em(
         genotypes,
@@ -1174,6 +1185,43 @@ def test_normalize_variant_records_reuses_already_normalized_list():
     normalized = _normalize_variant_records(records)
 
     assert normalized is records
+
+
+def test_fit_checkpoint_hash_avoids_per_variant_json_for_plain_records(monkeypatch):
+    records = [
+        VariantRecord("variant_0", VariantClass.SNV, "1", 100),
+        VariantRecord("variant_1", VariantClass.DELETION_SHORT, "1", 101),
+    ]
+    raw_genotypes = as_raw_genotype_matrix(np.zeros((3, 2), dtype=np.int8))
+    covariates = np.ones((3, 2), dtype=np.float32)
+    targets = np.array([0.0, 1.0, 0.0], dtype=np.float32)
+
+    real_json_dumps = model_module.json.dumps
+
+    def fail_variant_json_dumps(payload, *args, **kwargs):
+        if isinstance(payload, dict) and "prior_binary_features" in payload:
+            raise AssertionError("plain VariantRecord hashing should not JSON-dump per record")
+        return real_json_dumps(payload, *args, **kwargs)
+
+    monkeypatch.setattr(model_module.json, "dumps", fail_variant_json_dumps)
+
+    first = _fit_checkpoint_config_hash(
+        genotype_matrix=raw_genotypes,
+        covariates=covariates,
+        targets=targets,
+        variant_records=records,
+        config=ModelConfig(trait_type=TraitType.BINARY, max_outer_iterations=1),
+    )
+    second = _fit_checkpoint_config_hash(
+        genotype_matrix=raw_genotypes,
+        covariates=covariates,
+        targets=targets,
+        variant_records=records,
+        config=ModelConfig(trait_type=TraitType.BINARY, max_outer_iterations=1),
+    )
+
+    assert first == second
+    assert len(first) == 64
 
 
 def test_tie_map_keeps_all_active_variants_detects_identity_kept_indices():

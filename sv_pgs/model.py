@@ -5,6 +5,7 @@ import json
 import mmap
 import os
 import pickle
+import struct
 import time
 import uuid
 from typing import TYPE_CHECKING
@@ -699,7 +700,10 @@ def _try_load_fit_stage_cache(
             )
             log(f"fit-stage cache hit — loading from {cache_paths.cache_dir.name}/{cache_paths.key}.*")
             return active_variant_indices, reduced_tie_map, reduced_genotypes, True
-        log(f"fit-stage structure cache hit — loading from {cache_paths.cache_dir.name}/{cache_paths.key}.*")
+        log(
+            f"fit-stage structure cache hit — loading from {cache_paths.cache_dir.name}/{cache_paths.key}.* "
+            "(reduced int8 cache missing; will build before GPU materialization)"
+        )
         return active_variant_indices, reduced_tie_map, standardized_genotypes.subset(combined_indices), False
     except (OSError, ValueError, EOFError, KeyError) as exc:
         log(f"fit-stage cache load failed ({exc}), rebuilding")
@@ -1941,6 +1945,60 @@ def _fit_checkpoint_tmp_path(checkpoint_path: Path) -> Path:
     )
 
 
+_VARIANT_CHECKPOINT_NUMERIC_STRUCT = struct.Struct("<qdddi??")
+
+
+def _variant_record_has_custom_checkpoint_payload(record: VariantRecord) -> bool:
+    return bool(
+        record.prior_binary_features
+        or record.prior_continuous_features
+        or record.prior_categorical_features
+        or record.prior_membership_features
+        or record.prior_nested_features
+        or record.prior_nested_membership_features
+        or record.prior_class_members != (record.variant_class,)
+        or record.prior_class_membership != (1.0,)
+    )
+
+
+def _update_variant_records_checkpoint_hash(
+    hasher: "hashlib._Hash",
+    variant_records: Sequence[VariantRecord],
+) -> None:
+    hasher.update(f"records:{len(variant_records)}:".encode("utf-8"))
+    for record in variant_records:
+        hasher.update(str(record.variant_id).encode("utf-8"))
+        hasher.update(b"\0")
+        hasher.update(record.variant_class.value.encode("utf-8"))
+        hasher.update(b"\0")
+        hasher.update(str(record.chromosome).encode("utf-8"))
+        hasher.update(b"\0")
+        hasher.update(
+            _VARIANT_CHECKPOINT_NUMERIC_STRUCT.pack(
+                int(record.position),
+                float(record.length),
+                float(record.allele_frequency),
+                float(record.quality),
+                -1 if record.training_support is None else int(record.training_support),
+                bool(record.is_repeat),
+                bool(record.is_copy_number),
+            )
+        )
+        if _variant_record_has_custom_checkpoint_payload(record):
+            feature_payload = {
+                "prior_binary_features": record.prior_binary_features,
+                "prior_continuous_features": record.prior_continuous_features,
+                "prior_categorical_features": record.prior_categorical_features,
+                "prior_membership_features": record.prior_membership_features,
+                "prior_nested_features": record.prior_nested_features,
+                "prior_nested_membership_features": record.prior_nested_membership_features,
+                "prior_class_members": [member.value for member in record.prior_class_members],
+                "prior_class_membership": [float(weight) for weight in record.prior_class_membership],
+            }
+            hasher.update(json.dumps(feature_payload, sort_keys=True).encode("utf-8"))
+        hasher.update(b"\n")
+
+
 def _fit_checkpoint_config_hash(
     *,
     genotype_matrix: RawGenotypeMatrix,
@@ -1953,29 +2011,7 @@ def _fit_checkpoint_config_hash(
     hasher.update(f"fit-checkpoint-v{_FIT_CHECKPOINT_VERSION}".encode("utf-8"))
     hasher.update(np.asarray(genotype_matrix.shape, dtype=np.int64).tobytes())
     variant_hasher = hashlib.sha256()
-    for record in variant_records:
-        variant_payload = {
-            "id": record.variant_id,
-            "class": record.variant_class.value,
-            "chromosome": record.chromosome,
-            "position": int(record.position),
-            "length": float(record.length),
-            "allele_frequency": float(record.allele_frequency),
-            "quality": float(record.quality),
-            "training_support": None if record.training_support is None else int(record.training_support),
-            "is_repeat": bool(record.is_repeat),
-            "is_copy_number": bool(record.is_copy_number),
-            "prior_binary_features": record.prior_binary_features,
-            "prior_continuous_features": record.prior_continuous_features,
-            "prior_categorical_features": record.prior_categorical_features,
-            "prior_membership_features": record.prior_membership_features,
-            "prior_nested_features": record.prior_nested_features,
-            "prior_nested_membership_features": record.prior_nested_membership_features,
-            "prior_class_members": [member.value for member in record.prior_class_members],
-            "prior_class_membership": [float(weight) for weight in record.prior_class_membership],
-        }
-        variant_hasher.update(json.dumps(variant_payload, sort_keys=True).encode("utf-8"))
-        variant_hasher.update(b"\n")
+    _update_variant_records_checkpoint_hash(variant_hasher, variant_records)
     hasher.update(variant_hasher.hexdigest().encode("utf-8"))
     _update_hash_with_array_bytes(hasher, np.asarray(covariates, dtype=np.float32))
     _update_hash_with_array_bytes(hasher, np.asarray(targets, dtype=np.float32).reshape(-1))
@@ -2619,6 +2655,26 @@ class BayesianPGS:
                 label="training",
             )
             in_memory = False
+        persistent_reduced_cache = False
+        if fit_stage_cache_paths is not None and _bitpacked_upgraded is None:
+            if fit_stage_cache_paths.reduced_raw_i8_path.exists():
+                log(
+                    "  reduced int8 cohort cache hit — rebinding before materialization "
+                    + f"({fit_stage_cache_paths.reduced_raw_i8_path.name})  mem={mem()}"
+                )
+            else:
+                log("  persisting reduced int8 genotypes for cohort cache reuse before materialization...")
+            persistent_reduced_cache = reduced_genotypes.try_cache_persistently(
+                fit_stage_cache_paths.reduced_raw_i8_path,
+            )
+            if persistent_reduced_cache:
+                log(f"  persistent int8 cohort cache ready  mem={mem()}")
+                _write_fit_stage_cache_manifest(
+                    cache_paths=fit_stage_cache_paths,
+                    active_variant_count=int(active_variant_indices.shape[0]),
+                    reduced_variant_count=int(reduced_tie_map.kept_indices.shape[0]),
+                    has_reduced_raw_i8=True,
+                )
         if allow_full_reduced_cache:
             log(f"materializing reduced genotype matrix ({reduced_genotypes.shape})...")
             in_memory = reduced_genotypes.try_materialize_gpu()
@@ -2628,23 +2684,6 @@ class BayesianPGS:
                 in_memory = reduced_genotypes.try_materialize()
                 if in_memory:
                     log(f"  RAM materialization succeeded  mem={mem()}")
-        persistent_reduced_cache = (
-            fit_stage_cache_paths is not None
-            and fit_stage_cache_paths.reduced_raw_i8_path.exists()
-        )
-        if fit_stage_cache_paths is not None and not persistent_reduced_cache and allow_full_reduced_cache:
-            log("  persisting reduced int8 genotypes for cohort cache reuse...")
-            persistent_reduced_cache = reduced_genotypes.try_cache_persistently(
-                fit_stage_cache_paths.reduced_raw_i8_path,
-            )
-            if persistent_reduced_cache:
-                log(f"  persistent int8 cohort cache saved  mem={mem()}")
-                _write_fit_stage_cache_manifest(
-                    cache_paths=fit_stage_cache_paths,
-                    active_variant_count=int(active_variant_indices.shape[0]),
-                    reduced_variant_count=int(reduced_tie_map.kept_indices.shape[0]),
-                    has_reduced_raw_i8=True,
-                )
         if in_memory:
             # Bitpacked-backed reduced matrices keep their raw (the device
             # BitpackedDeviceMatrix IS the resident storage); calling

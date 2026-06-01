@@ -36,6 +36,7 @@ from sv_pgs.mixture_inference import (
     _stochastic_binary_newton_iterations,
     _stochastic_sample_space_preconditioner_rank,
     _stochastic_restricted_cross_leverage_diagonal,
+    _gpu_cholesky_with_adaptive_ridge,
     _gpu_exact_variant_full_matrix_fits,
     _gpu_exact_variant_tile_size,
     _restricted_variant_space_operator,
@@ -48,7 +49,7 @@ from sv_pgs.mixture_inference import (
 )
 import sv_pgs.mixture_inference as mixture_inference
 from sv_pgs.preprocessing import build_tie_map
-from tests.conftest import make_variant_records
+from tests.conftest import make_fake_cupy, make_variant_records
 def _binary_pg_fresh_resume_state(
     *,
     genotype_matrix,
@@ -1745,6 +1746,11 @@ def test_restricted_posterior_sample_space_reuses_matching_warm_start(monkeypatc
         initial_guess_shapes.append(None if initial_guess is None else tuple(np.asarray(initial_guess).shape))
         return (rhs, 3) if return_iterations else rhs
     monkeypatch.setattr(mixture_inference, "_solve_sample_space_rhs_cpu", fake_solve_sample_space_rhs_cpu)
+    # This test instruments the CPU sample-space solver; force the CPU path so
+    # it is exercised regardless of whether the test host has a GPU (otherwise
+    # _solve_restricted_full dispatches to the real GPU CG and bypasses the
+    # monkeypatched CPU solver).
+    monkeypatch.setattr(mixture_inference, "_try_import_cupy", lambda: None)
     mixture_inference._solve_restricted_full(
         genotype_matrix=standardized,
         covariate_matrix=covariate_matrix,
@@ -1891,6 +1897,9 @@ def test_restricted_posterior_sample_space_reuses_preconditioner_until_iteration
         return (rhs, iterations_used) if return_iterations else rhs
     monkeypatch.setattr(mixture_inference, "_sample_space_diagonal_preconditioner", fake_sample_space_diagonal_preconditioner)
     monkeypatch.setattr(mixture_inference, "_solve_sample_space_rhs_cpu", fake_solve_sample_space_rhs_cpu)
+    # Force the CPU sample-space path so the instrumented CPU solver runs even
+    # when the test host has a GPU.
+    monkeypatch.setattr(mixture_inference, "_try_import_cupy", lambda: None)
     for _ in range(3):
         mixture_inference._solve_restricted_mean_only(
             genotype_matrix=standardized,
@@ -1980,6 +1989,9 @@ def test_restricted_posterior_sample_space_fuses_beta_and_restricted_probe_trans
     )
     monkeypatch.setattr(mixture_inference, "_solve_sample_space_rhs_cpu", fake_solve_sample_space_rhs_cpu)
     monkeypatch.setattr(mixture_inference, "stochastic_logdet", lambda *args, **kwargs: 0.0)
+    # Force the CPU sample-space path so the instrumented CPU solver and the
+    # transpose-pass counters run even when the test host has a GPU.
+    monkeypatch.setattr(mixture_inference, "_try_import_cupy", lambda: None)
     alpha, beta, beta_variance, projected_targets, linear_predictor, *_ = mixture_inference._solve_restricted_full(
         genotype_matrix=cast(Any, counting_standardized),
         covariate_matrix=covariate_matrix,
@@ -2316,6 +2328,35 @@ def test_require_finite_fit_values_rejects_nan():
             "test context",
             ("beta", np.array([0.0, np.nan], dtype=np.float64)),
         )
+
+
+def test_gpu_cholesky_with_adaptive_ridge_retries_until_finite():
+    class _FakeLinalg:
+        @staticmethod
+        def cholesky(matrix):
+            if float(np.min(np.diag(matrix))) < 1.0:
+                return np.full_like(matrix, np.nan)
+            return np.linalg.cholesky(matrix)
+
+    class _FakeCupy:
+        linalg = _FakeLinalg()
+
+        @staticmethod
+        def isfinite(array):
+            return np.isfinite(array)
+
+    normal_matrix = np.zeros((2, 2), dtype=np.float64)
+    factor = _gpu_cholesky_with_adaptive_ridge(
+        _FakeCupy,
+        normal_matrix,
+        np.arange(2),
+        label="test GLS",
+    )
+
+    assert np.isfinite(factor).all()
+    assert np.all(np.diag(normal_matrix) >= 1.0)
+
+
 def test_stochastic_sample_space_preconditioner_rank_scales_with_blend_weight():
     assert _stochastic_sample_space_preconditioner_rank(requested_rank=384, step_size=0.27) == 384
     assert _stochastic_sample_space_preconditioner_rank(requested_rank=384, step_size=0.10) == 183
@@ -3014,7 +3055,11 @@ def test_sample_space_preconditioner_reuse_ignores_single_weight_outlier():
         prior_variances=np.ones(element_count, dtype=np.float64),
         diagonal_noise=diagonal_noise,
     )
-def test_sample_space_preconditioner_matches_exact_covariance_inverse_at_full_rank():
+def test_sample_space_preconditioner_matches_exact_covariance_inverse_at_full_rank(monkeypatch: pytest.MonkeyPatch):
+    # This test checks the CPU preconditioner against the exact inverse at
+    # fp64 tolerance; force the CPU path so it is not pulled onto the GPU
+    # (fp32) path on a GPU host.
+    monkeypatch.setattr(mixture_inference, "_try_import_cupy", lambda: None)
     genotype_matrix = np.array(
         [
             [1.0, 0.0],
@@ -3139,17 +3184,7 @@ def test_sample_space_preconditioner_gpu_path_matches_exact_covariance_inverse_a
     prior_variances = np.array([2.0, 0.5], dtype=np.float64)
     diagonal_noise = np.array([1.5, 1.0, 2.0], dtype=np.float64)
     right_hand_side = np.array([0.5, -1.0, 2.0], dtype=np.float64)
-    fake_cupy: Any = types.ModuleType("cupy")
-    fake_cupy.float32 = np.float32
-    fake_cupy.float64 = np.float64
-    fake_cupy.asarray = lambda array, dtype=None: np.asarray(array, dtype=dtype)
-    fake_cupy.sum = np.sum
-    fake_cupy.sqrt = np.sqrt
-    fake_cupy.abs = np.abs
-    fake_cupy.diag = np.diag
-    fake_cupy.maximum = np.maximum
-    fake_cupy.eye = np.eye
-    fake_cupy.linalg = types.SimpleNamespace(cholesky=np.linalg.cholesky, qr=np.linalg.qr)
+    fake_cupy = make_fake_cupy()
     fake_cupyx: Any = types.ModuleType("cupyx")
     fake_cupyx_scipy: Any = types.ModuleType("cupyx.scipy")
     fake_cupyx_scipy_linalg: Any = types.ModuleType("cupyx.scipy.linalg")
@@ -3159,6 +3194,11 @@ def test_sample_space_preconditioner_gpu_path_matches_exact_covariance_inverse_a
     monkeypatch.setitem(sys.modules, "cupyx", fake_cupyx)
     monkeypatch.setitem(sys.modules, "cupyx.scipy", fake_cupyx_scipy)
     monkeypatch.setitem(sys.modules, "cupyx.scipy.linalg", fake_cupyx_scipy_linalg)
+    # ``_try_import_cupy`` caches the real module globally, so patching
+    # sys.modules alone is not enough on a GPU host — point the cached lookup
+    # at the fake too, otherwise the operator runs on real device arrays and
+    # mixes them with the numpy-backed fake's host arrays.
+    monkeypatch.setattr(mixture_inference, "_try_import_cupy", lambda: fake_cupy)
     monkeypatch.setattr(
         mixture_inference,
         "_sample_space_diagonal_preconditioner",
@@ -3193,17 +3233,7 @@ def test_sample_space_preconditioner_uses_operator_sketch_without_subset_materia
     prior_variances = np.array([2.0, 0.5], dtype=np.float64)
     diagonal_noise = np.array([1.5, 1.0, 2.0], dtype=np.float64)
     right_hand_side = np.array([0.5, -1.0, 2.0], dtype=np.float64)
-    fake_cupy: Any = types.ModuleType("cupy")
-    fake_cupy.float32 = np.float32
-    fake_cupy.float64 = np.float64
-    fake_cupy.asarray = lambda array, dtype=None: np.asarray(array, dtype=dtype)
-    fake_cupy.sum = np.sum
-    fake_cupy.sqrt = np.sqrt
-    fake_cupy.abs = np.abs
-    fake_cupy.diag = np.diag
-    fake_cupy.maximum = np.maximum
-    fake_cupy.eye = np.eye
-    fake_cupy.linalg = types.SimpleNamespace(cholesky=np.linalg.cholesky, qr=np.linalg.qr)
+    fake_cupy = make_fake_cupy()
     fake_cupyx: Any = types.ModuleType("cupyx")
     fake_cupyx_scipy: Any = types.ModuleType("cupyx.scipy")
     fake_cupyx_scipy_linalg: Any = types.ModuleType("cupyx.scipy.linalg")
@@ -3213,6 +3243,9 @@ def test_sample_space_preconditioner_uses_operator_sketch_without_subset_materia
     monkeypatch.setitem(sys.modules, "cupyx", fake_cupyx)
     monkeypatch.setitem(sys.modules, "cupyx.scipy", fake_cupyx_scipy)
     monkeypatch.setitem(sys.modules, "cupyx.scipy.linalg", fake_cupyx_scipy_linalg)
+    # ``_try_import_cupy`` caches the real module globally; point it at the fake
+    # so the operator does not run on real device arrays on a GPU host.
+    monkeypatch.setattr(mixture_inference, "_try_import_cupy", lambda: fake_cupy)
     monkeypatch.setattr(
         type(standardized),
         "try_materialize_gpu_subset",
@@ -3236,7 +3269,9 @@ def test_sample_space_preconditioner_uses_operator_sketch_without_subset_materia
     expected = np.linalg.solve(covariance_matrix, right_hand_side)
     actual = np.asarray(cast(Any, apply_preconditioner)(right_hand_side), dtype=np.float64)
     np.testing.assert_allclose(actual, expected, rtol=1e-4, atol=2e-5)
-def test_sample_space_preconditioner_handles_semidefinite_sketch_exactly():
+def test_sample_space_preconditioner_handles_semidefinite_sketch_exactly(monkeypatch: pytest.MonkeyPatch):
+    # CPU preconditioner vs exact inverse at fp64 tolerance — force CPU path.
+    monkeypatch.setattr(mixture_inference, "_try_import_cupy", lambda: None)
     genotype_matrix = np.array(
         [
             [1.0, 1.0],
@@ -3293,6 +3328,9 @@ def test_sample_space_preconditioner_reuses_cached_genotype_sketch(monkeypatch: 
         return original_weighted_kernel(*args, **kwargs)
     monkeypatch.setattr(mixture_inference, "_sample_space_genotype_gram_matmat_cpu", counted_gram)
     monkeypatch.setattr(mixture_inference, "_sample_space_kernel_matmat_cpu", counted_weighted_kernel)
+    # This test counts the CPU gram/kernel reuse; force the CPU path so it is
+    # exercised on a GPU host instead of dispatching to the GPU sketch.
+    monkeypatch.setattr(mixture_inference, "_try_import_cupy", lambda: None)
     _sample_space_preconditioner(
         genotype_matrix=standardized,
         prior_variances=np.array([1.0, 0.5, 0.75], dtype=np.float64),
@@ -3329,17 +3367,7 @@ def test_sample_space_preconditioner_gpu_path_handles_semidefinite_sketch_exactl
     prior_variances = np.array([1.5, 0.5], dtype=np.float64)
     diagonal_noise = np.array([1.0, 1.25, 0.8], dtype=np.float64)
     right_hand_side = np.array([0.5, -1.0, 1.25], dtype=np.float64)
-    fake_cupy: Any = types.ModuleType("cupy")
-    fake_cupy.float32 = np.float32
-    fake_cupy.float64 = np.float64
-    fake_cupy.asarray = lambda array, dtype=None: np.asarray(array, dtype=dtype)
-    fake_cupy.sum = np.sum
-    fake_cupy.sqrt = np.sqrt
-    fake_cupy.abs = np.abs
-    fake_cupy.diag = np.diag
-    fake_cupy.maximum = np.maximum
-    fake_cupy.eye = np.eye
-    fake_cupy.linalg = types.SimpleNamespace(cholesky=np.linalg.cholesky, qr=np.linalg.qr)
+    fake_cupy = make_fake_cupy()
     fake_cupyx: Any = types.ModuleType("cupyx")
     fake_cupyx_scipy: Any = types.ModuleType("cupyx.scipy")
     fake_cupyx_scipy_linalg: Any = types.ModuleType("cupyx.scipy.linalg")
@@ -3349,6 +3377,11 @@ def test_sample_space_preconditioner_gpu_path_handles_semidefinite_sketch_exactl
     monkeypatch.setitem(sys.modules, "cupyx", fake_cupyx)
     monkeypatch.setitem(sys.modules, "cupyx.scipy", fake_cupyx_scipy)
     monkeypatch.setitem(sys.modules, "cupyx.scipy.linalg", fake_cupyx_scipy_linalg)
+    # ``_try_import_cupy`` caches the real module globally, so patching
+    # sys.modules alone is not enough on a GPU host — point the cached lookup
+    # at the fake too, otherwise the operator runs on real device arrays and
+    # mixes them with the numpy-backed fake's host arrays.
+    monkeypatch.setattr(mixture_inference, "_try_import_cupy", lambda: fake_cupy)
     monkeypatch.setattr(
         mixture_inference,
         "_sample_space_diagonal_preconditioner",
@@ -3366,7 +3399,10 @@ def test_sample_space_preconditioner_gpu_path_handles_semidefinite_sketch_exactl
     covariance_matrix = np.diag(diagonal_noise) + genotype_matrix @ np.diag(prior_variances) @ genotype_matrix.T
     expected = np.linalg.solve(covariance_matrix, right_hand_side)
     actual = np.asarray(cast(Any, apply_preconditioner)(right_hand_side), dtype=np.float64)
-    np.testing.assert_allclose(actual, expected, rtol=1e-7, atol=1e-7)
+    # The GPU sample-space path runs the sketch in float32 (the _cupy_cache is
+    # float32), so it matches the fp64 exact inverse only to fp32 precision —
+    # same tolerance as the sibling gpu_path_matches_exact test.
+    np.testing.assert_allclose(actual, expected, rtol=1e-4, atol=2e-5)
 def test_gpu_sample_space_block_cg_matches_dense_solution(monkeypatch: pytest.MonkeyPatch):
     genotype_matrix = np.array(
         [
@@ -3392,10 +3428,7 @@ def test_gpu_sample_space_block_cg_matches_dense_solution(monkeypatch: pytest.Mo
         ]
     )
     timing_sync_calls: list[None] = []
-    fake_cupy: Any = types.ModuleType("cupy")
-    fake_cupy.float32 = np.float32
-    fake_cupy.float64 = np.float64
-    fake_cupy.asarray = lambda array, dtype=None: np.asarray(array, dtype=dtype)
+    fake_cupy = make_fake_cupy()
     fake_cupy.sum = np.sum
     fake_cupy.sqrt = np.sqrt
     fake_cupy.abs = np.abs
@@ -3475,10 +3508,7 @@ def test_gpu_sample_space_block_cg_mixed_precision_refinement_matches_dense_solu
             np.array([-0.25, 0.75, 1.0, -0.5], dtype=np.float64),
         ]
     )
-    fake_cupy: Any = types.ModuleType("cupy")
-    fake_cupy.float32 = np.float32
-    fake_cupy.float64 = np.float64
-    fake_cupy.asarray = lambda array, dtype=None: np.asarray(array, dtype=dtype)
+    fake_cupy = make_fake_cupy()
     fake_cupy.sum = np.sum
     fake_cupy.sqrt = np.sqrt
     fake_cupy.abs = np.abs
@@ -3551,10 +3581,7 @@ def test_gpu_sample_space_solver_retries_in_float64_after_mixed_precision_stalls
     right_hand_side = np.array([0.5, -1.0, 0.2, 1.5], dtype=np.float64)
     covariance_matrix = np.diag(diagonal_noise) + genotype_matrix @ np.diag(prior_variances) @ genotype_matrix.T
     expected = np.linalg.solve(covariance_matrix, right_hand_side)
-    fake_cupy: Any = types.ModuleType("cupy")
-    fake_cupy.float32 = np.float32
-    fake_cupy.float64 = np.float64
-    fake_cupy.asarray = lambda array, dtype=None: np.asarray(array, dtype=dtype)
+    fake_cupy = make_fake_cupy()
     fake_cupy.sum = np.sum
     fake_cupy.zeros = np.zeros
     inner_call_dtypes: list[type[np.floating[Any]]] = []
@@ -4702,10 +4729,7 @@ def test_exact_variant_gpu_summary_path_matches_dense_reference(monkeypatch: pyt
     standardized._dense_cache = None
     empty_dtypes: list[object] = []
     timing_sync_calls: list[None] = []
-    fake_cupy: Any = types.ModuleType("cupy")
-    fake_cupy.float32 = np.float32
-    fake_cupy.float64 = np.float64
-    fake_cupy.asarray = lambda array, dtype=None: np.asarray(array, dtype=dtype)
+    fake_cupy = make_fake_cupy()
     fake_cupy.arange = np.arange
     def fake_empty(shape, dtype=None, order=None):
         empty_dtypes.append(dtype)
@@ -4820,10 +4844,7 @@ def test_exact_variant_gpu_beta_variance_stays_exact_above_cpu_limit(
     )
     standardized._cupy_cache = standardized.materialize().astype(np.float32, copy=False)
     standardized._dense_cache = None
-    fake_cupy: Any = types.ModuleType("cupy")
-    fake_cupy.float32 = np.float32
-    fake_cupy.float64 = np.float64
-    fake_cupy.asarray = lambda array, dtype=None: np.asarray(array, dtype=dtype)
+    fake_cupy = make_fake_cupy()
     fake_cupy.arange = np.arange
     fake_cupy.empty = lambda shape, dtype=None, order=None: np.empty(shape, dtype=dtype, order="C" if order is None else order)
     fake_cupy.zeros = np.zeros
@@ -4884,10 +4905,7 @@ def test_gpu_sample_space_solver_rejects_near_converged_residual(monkeypatch: py
     )
     standardized._cupy_cache = standardized.materialize().astype(np.float32, copy=False)
     standardized._dense_cache = None
-    fake_cupy: Any = types.ModuleType("cupy")
-    fake_cupy.float32 = np.float32
-    fake_cupy.float64 = np.float64
-    fake_cupy.asarray = lambda array, dtype=None: np.asarray(array, dtype=dtype)
+    fake_cupy = make_fake_cupy()
     fake_cupy.zeros = np.zeros
     fake_cupy.sum = np.sum
     monkeypatch.setitem(sys.modules, "cupy", fake_cupy)
@@ -4986,10 +5004,7 @@ def test_restricted_posterior_state_sample_space_gpu_beta_variance_uses_gpu_post
     diagonal_noise = np.ones(sample_count, dtype=np.float64)
     gpu_transpose_calls = {"count": 0}
     gpu_leverage_calls = {"count": 0}
-    fake_cupy: Any = types.ModuleType("cupy")
-    fake_cupy.float32 = np.float32
-    fake_cupy.float64 = np.float64
-    fake_cupy.asarray = lambda array, dtype=None: np.asarray(array, dtype=dtype)
+    fake_cupy = make_fake_cupy()
     fake_cupy.empty = lambda shape, dtype=None, order=None: np.empty(shape, dtype=dtype, order="C" if order is None else order)
     fake_cupy.zeros = lambda shape, dtype=None: np.zeros(shape, dtype=dtype)
     fake_cupy.zeros_like = np.zeros_like

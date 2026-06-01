@@ -1271,6 +1271,124 @@ def test_try_materialize_gpu_uses_int8_batch_size_for_plink_like_backends(monkey
     assert raw.i8_batch_sizes == [7]
 
 
+def test_try_materialize_gpu_skips_int8_upload_when_host_staging_budget_is_too_small(monkeypatch: pytest.MonkeyPatch):
+    class _FakeCudaRuntime:
+        @staticmethod
+        def memGetInfo():
+            return (8_000_000_000, 16_000_000_000)
+
+    class _FakeDevice:
+        def synchronize(self) -> None:
+            return None
+
+    class _FakeCuda:
+        runtime = _FakeCudaRuntime()
+
+        @staticmethod
+        def Device():
+            return _FakeDevice()
+
+    class _FakeCupy:
+        float32 = np.float32
+        int8 = np.int8
+        cuda = _FakeCuda()
+
+    raw = _SpyInt8StreamingRawGenotypeMatrix(np.zeros((100, 10), dtype=np.int8))
+    standardized = raw.standardized(
+        np.zeros(10, dtype=np.float32),
+        np.ones(10, dtype=np.float32),
+    )
+
+    monkeypatch.setattr(genotype_module, "_try_import_cupy", lambda: _FakeCupy())
+    monkeypatch.setattr(genotype_module, "auto_batch_size_i8", lambda sample_count: 10)
+    monkeypatch.setattr(genotype_module, "_host_upload_budget_bytes", lambda: 1)
+
+    assert standardized.try_materialize_gpu() is False
+    assert raw.i8_requests == []
+
+
+def test_try_materialize_gpu_adapts_int8_upload_batch_size_to_host_budget(monkeypatch: pytest.MonkeyPatch):
+    class _FakeCudaRuntime:
+        @staticmethod
+        def memGetInfo():
+            return (8_000_000_000, 16_000_000_000)
+
+    class _FakeDevice:
+        def synchronize(self) -> None:
+            return None
+
+    class _FakeCuda:
+        runtime = _FakeCudaRuntime()
+
+        @staticmethod
+        def Device():
+            return _FakeDevice()
+
+    class _FakeCupy:
+        float32 = np.float32
+        int8 = np.int8
+        cuda = _FakeCuda()
+
+        @staticmethod
+        def asarray(array, dtype=None):
+            return np.asarray(array, dtype=dtype)
+
+        @staticmethod
+        def empty(shape, dtype=None, order=None):
+            return np.empty(shape, dtype=dtype, order="C" if order is None else order)
+
+        @staticmethod
+        def isnan(array):
+            return np.isnan(array)
+
+    class _RecordingInt8Raw(_SpyInt8StreamingRawGenotypeMatrix):
+        def __init__(self, matrix: np.ndarray) -> None:
+            super().__init__(matrix)
+            self.i8_batch_sizes: list[int] = []
+
+        def iter_column_batches_i8(
+            self,
+            variant_indices=None,
+            batch_size: int = 1024,
+            *,
+            num_threads: int | None = None,
+        ):
+            self.i8_batch_sizes.append(int(batch_size))
+            yield from super().iter_column_batches_i8(
+                variant_indices=variant_indices,
+                batch_size=batch_size,
+                num_threads=num_threads,
+            )
+
+    raw = _RecordingInt8Raw(np.zeros((100, 10), dtype=np.int8))
+    standardized = raw.standardized(
+        np.zeros(10, dtype=np.float32),
+        np.ones(10, dtype=np.float32),
+    )
+
+    _install_fake_pinned_and_streams(_FakeCupy)
+    monkeypatch.setattr(genotype_module, "_try_import_cupy", lambda: _FakeCupy())
+    monkeypatch.setattr(genotype_module, "auto_batch_size_i8", lambda sample_count: 10)
+    monkeypatch.setattr(genotype_module, "_host_upload_budget_bytes", lambda: 900)
+
+    assert standardized.try_materialize_gpu() is True
+    assert raw.i8_batch_sizes == [3]
+
+
+def test_gpu_int8_upload_batch_size_caps_transient_tile_bytes(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setattr(genotype_module, "_GPU_INT8_UPLOAD_TARGET_TILE_BYTES", 500)
+
+    assert (
+        genotype_module._gpu_int8_upload_batch_size_for_host(
+            sample_count=100,
+            requested_batch_size=10,
+            variant_count=10,
+            host_budget_bytes=1_000_000,
+        )
+        == 5
+    )
+
+
 def test_try_materialize_gpu_uses_one_shot_int8_upload_for_contiguous_subset(monkeypatch: pytest.MonkeyPatch):
     class _FakeCudaRuntime:
         @staticmethod
@@ -1330,6 +1448,28 @@ def test_try_materialize_gpu_uses_one_shot_int8_upload_for_contiguous_subset(mon
     np.testing.assert_array_equal(
         np.asarray(cast(Any, standardized._cupy_cache.raw_values)),
         raw_i8[:, 2:6],
+    )
+
+
+def test_parallel_memmap_upload_skips_when_full_pinned_buffer_exceeds_host_budget(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    cache_path = tmp_path / "raw.npy"
+    np.save(cache_path, np.zeros((4, 8), dtype=np.int8, order="F"), allow_pickle=False)
+    raw = Int8RawGenotypeMatrix(np.load(cache_path, mmap_mode="r"))
+
+    monkeypatch.setattr(genotype_module, "_host_upload_budget_bytes", lambda: 1)
+
+    assert (
+        genotype_module._try_upload_int8_parallel_memmap(
+            cupy=object(),
+            raw=raw,
+            variant_indices=np.arange(8, dtype=np.int32),
+            gpu_destination=object(),
+            sample_count=4,
+        )
+        is False
     )
 
 

@@ -1827,6 +1827,16 @@ def _upload_standardized_int8_tiles_overlapped(
     in_flight_events: list[Any] = [None, None]
     selected_means_gpu = cupy.asarray(means[variant_indices], dtype=standardized_dtype)
     selected_scales_gpu = cupy.asarray(scales[variant_indices], dtype=standardized_dtype)
+    # Per-tile bed page-cache eviction — see ``_upload_int8_tiles_overlapped``.
+    # A streaming (Concatenated) PLINK leaf otherwise grows the cgroup-accounted
+    # .bed page cache by one tile per iteration and host-OOMs the container.
+    fadvise_paths = _collect_bed_paths(raw_int8)
+    if not fadvise_paths and _has_plink_backing(raw_int8):
+        log(
+            "    standardized GPU upload: WARNING — PLINK-backed matrix but no "
+            "bed_path resolved via wrapper walk; per-tile page-cache eviction "
+            "will be a no-op (host OOM risk)"
+        )
     local_start = 0
     for tile_index, raw_batch in enumerate(
         raw_int8.iter_column_batches_i8(variant_indices, batch_size=upload_batch_size)
@@ -1852,6 +1862,9 @@ def _upload_standardized_int8_tiles_overlapped(
             gpu_destination[:, local_start:local_stop] = standardized_tile
         in_flight_events[slot_index] = stream.record()
         local_start = local_stop
+        del raw_batch
+        _release_plink_readers(raw_int8)
+        _release_host_caches(cupy, fadvise_paths=fadvise_paths)
     # Synchronization invariant: after this function returns, the caller assigns
     # ``gpu_destination`` to ``self._cupy_cache`` and downstream consumers will
     # immediately read from it. We must therefore wait on every in-flight async
@@ -1915,6 +1928,13 @@ def _try_upload_int8_parallel_memmap(
         return False
 
     total_bytes = int(sample_count) * n_variants
+    host_budget = _host_upload_budget_bytes()
+    if total_bytes > host_budget:
+        log(
+            "    parallel-pread upload skipped: pinned host buffer would require "
+            + f"{total_bytes / 1e9:.1f} GB, host budget is {host_budget / 1e9:.1f} GB  mem={mem()}"
+        )
+        return False
     try:
         # Go through the process-wide pinned pool so the next call with
         # a same-size request reuses this allocation rather than re-
@@ -2051,6 +2071,19 @@ def _upload_int8_tiles_overlapped(
     )
     pinned_slots = (pinned_buffer_a, pinned_buffer_b)
     in_flight_events: list[Any] = [None, None]
+    # Per-tile bed page-cache eviction. The reduced matrix here can be a mixed-
+    # source (Concatenated) matrix that streams its PLINK leaf via pread; cgroup
+    # memory accounting includes that file cache, so without a per-tile
+    # POSIX_FADV_DONTNEED drain the .bed page cache grows by ~one tile's worth of
+    # bed bytes every iteration and SIGKILLs the 30 GB AoU container before the
+    # upload finishes. Same defense the transpose-matmul streaming path uses.
+    fadvise_paths = _collect_bed_paths(raw_int8)
+    if not fadvise_paths and _has_plink_backing(raw_int8):
+        log(
+            "    int8 GPU upload: WARNING — PLINK-backed matrix but no bed_path "
+            "resolved via wrapper walk; per-tile page-cache eviction will be a "
+            "no-op (host OOM risk)"
+        )
     local_start = 0
     for tile_index, raw_batch in enumerate(
         raw_int8.iter_column_batches_i8(variant_indices, batch_size=upload_batch_size)
@@ -2069,6 +2102,13 @@ def _upload_int8_tiles_overlapped(
             gpu_destination[:, local_start:local_stop] = staged_tile
         in_flight_events[slot_index] = stream.record()
         local_start = local_stop
+        # The raw batch's bytes are now copied into the pinned slot, so the
+        # just-paged bed bytes are reclaimable. Drop the leaf reader's cached
+        # mmap (if any) and fadvise(DONTNEED) the .bed so the page cache stays
+        # bounded at ~one tile rather than the full reduced matrix.
+        del raw_batch
+        _release_plink_readers(raw_int8)
+        _release_host_caches(cupy, fadvise_paths=fadvise_paths)
     # Synchronization invariant: after this function returns, the caller assigns
     # ``gpu_destination`` to ``self._cupy_cache`` and downstream consumers will
     # immediately read from it. We must therefore wait on every in-flight async
@@ -3463,6 +3503,10 @@ def _effective_gpu_standardized_streaming_batch_size(
 
 _GPU_RESERVED_OVERHEAD_BYTES = 1_500_000_000  # 1.5 GB
 _GPU_BUDGET_TOTAL_FRACTION_CEILING = 0.90
+_GPU_UPLOAD_HOST_SAFETY_BYTES = 2_000_000_000
+_GPU_UPLOAD_HOST_FRACTION_CEILING = 0.70
+_GPU_INT8_UPLOAD_TARGET_TILE_BYTES = 256_000_000
+_INT8_CACHE_WRITE_TARGET_TILE_BYTES = 256_000_000
 
 
 @dataclass(frozen=True, slots=True)
@@ -3490,6 +3534,77 @@ class _GpuMaterializationMemoryPlan:
 
 def _bytes_gb(value: int) -> str:
     return f"{int(value) / 1e9:.2f} GB"
+
+
+def _host_upload_budget_bytes(host_available_bytes: int | None = None) -> int:
+    """Host bytes usable for transient GPU-upload staging buffers."""
+    if host_available_bytes is None:
+        available = _detect_available_host_ram_bytes()
+        if available <= 0:
+            return 1 << 60
+    else:
+        available = int(host_available_bytes)
+    if available <= 0:
+        return 0
+    fractional_cap = int(available * _GPU_UPLOAD_HOST_FRACTION_CEILING)
+    safety_cap = max(available - _GPU_UPLOAD_HOST_SAFETY_BYTES, 0)
+    return max(min(fractional_cap, safety_cap), 0)
+
+
+def _gpu_int8_tiled_upload_host_bytes(sample_count: int, upload_batch_size: int) -> int:
+    """Peak host staging for the two pinned tiles plus the decoded source tile."""
+    tile_bytes = int(sample_count) * int(upload_batch_size)
+    return max(0, tile_bytes * 3)
+
+
+def _cap_int8_batch_size_by_tile_bytes(
+    *,
+    sample_count: int,
+    requested_batch_size: int,
+    variant_count: int,
+    target_tile_bytes: int,
+) -> int:
+    safe_variant_count = max(int(variant_count), 1)
+    requested = min(max(int(requested_batch_size), 1), safe_variant_count)
+    if int(sample_count) <= 0:
+        return requested
+    byte_cap = max(int(target_tile_bytes) // max(int(sample_count), 1), 1)
+    return max(1, min(requested, safe_variant_count, byte_cap))
+
+
+def _gpu_int8_upload_batch_size_for_host(
+    *,
+    sample_count: int,
+    requested_batch_size: int,
+    variant_count: int,
+    host_budget_bytes: int | None = None,
+) -> int | None:
+    """Pick an int8 upload tile width that fits current host RAM.
+
+    Returns ``None`` only when even a one-column tile cannot be staged.
+    """
+    safe_variant_count = max(int(variant_count), 1)
+    requested = min(max(int(requested_batch_size), 1), safe_variant_count)
+    requested = _cap_int8_batch_size_by_tile_bytes(
+        sample_count=sample_count,
+        requested_batch_size=requested,
+        variant_count=safe_variant_count,
+        target_tile_bytes=_GPU_INT8_UPLOAD_TARGET_TILE_BYTES,
+    )
+    budget = _host_upload_budget_bytes() if host_budget_bytes is None else int(host_budget_bytes)
+    if _gpu_int8_tiled_upload_host_bytes(int(sample_count), requested) <= budget:
+        return requested
+    bytes_per_variant = max(int(sample_count) * 3, 1)
+    capped = int(budget) // bytes_per_variant
+    if capped < 1:
+        return None
+    host_capped = max(1, min(requested, capped))
+    return _cap_int8_batch_size_by_tile_bytes(
+        sample_count=sample_count,
+        requested_batch_size=host_capped,
+        variant_count=safe_variant_count,
+        target_tile_bytes=_GPU_INT8_UPLOAD_TARGET_TILE_BYTES,
+    )
 
 
 def _adaptive_int8_staging_chunk_rows(
@@ -5337,6 +5452,31 @@ class StandardizedGenotypeMatrix:
                     return False
                 nbytes = active_plan.required_bytes
             budget_bytes = active_plan.budget_bytes
+            int8_upload_batch_size: int | None = None
+            if use_int8_gpu_cache:
+                requested_int8_upload_batch_size = auto_batch_size_i8(self.shape[0])
+                host_budget_bytes = _host_upload_budget_bytes()
+                int8_upload_batch_size = _gpu_int8_upload_batch_size_for_host(
+                    sample_count=int(self.shape[0]),
+                    requested_batch_size=requested_int8_upload_batch_size,
+                    variant_count=int(self.shape[1]),
+                    host_budget_bytes=host_budget_bytes,
+                )
+                if int8_upload_batch_size is None:
+                    min_host_bytes = _gpu_int8_tiled_upload_host_bytes(int(self.shape[0]), 1)
+                    _warn_gpu_materialization_unavailable(
+                        "host RAM too tight for int8 upload staging "
+                        + f"(need {_bytes_gb(min_host_bytes)} for one-column tile, "
+                        + f"budget {_bytes_gb(host_budget_bytes)})",
+                        active_plan,
+                    )
+                    return False
+                if int8_upload_batch_size < min(requested_int8_upload_batch_size, max(int(self.shape[1]), 1)):
+                    log(
+                        "    adapting int8 GPU upload tile size to host RAM: "
+                        + f"{requested_int8_upload_batch_size:,} -> {int8_upload_batch_size:,} variants "
+                        + f"(host budget {_bytes_gb(host_budget_bytes)})  mem={mem()}"
+                    )
             if self._dense_cache is not None:
                 log(f"    uploading RAM-resident matrix to GPU ({nbytes / 1e9:.1f} GB)  mem={mem()}")
                 # Defer-and-restore on OOM: keep ``self._dense_cache`` populated
@@ -5370,7 +5510,7 @@ class StandardizedGenotypeMatrix:
                     scales=self.scales,
                     gpu_destination=gpu_matrix,
                     sample_count=int(self.shape[0]),
-                    upload_batch_size=auto_batch_size_i8(self.shape[0]),
+                    upload_batch_size=int(int8_upload_batch_size or auto_batch_size_i8(self.shape[0])),
                     standardized_dtype=cupy.float16,
                 )
                 cupy.cuda.Device().synchronize()
@@ -5418,7 +5558,10 @@ class StandardizedGenotypeMatrix:
                 # int8 mmaps, so this turns a minutes-long tiled upload into one
                 # sequential mmap pass and one device allocation.
                 int8_total_bytes = int(self.shape[0]) * int(self.shape[1])
-                if int8_total_bytes <= int(budget_bytes * INT8_ONE_SHOT_GPU_BUDGET_FRACTION):
+                if (
+                    int8_total_bytes <= int(budget_bytes * INT8_ONE_SHOT_GPU_BUDGET_FRACTION)
+                    and int8_total_bytes <= _host_upload_budget_bytes()
+                ):
                     full_int8_block = _read_int8_columns_one_shot(raw_matrix, self.variant_indices)
                     if full_int8_block is not None:
                         log(
@@ -5439,7 +5582,7 @@ class StandardizedGenotypeMatrix:
                             variant_indices=self.variant_indices,
                             gpu_destination=gpu_matrix,
                             sample_count=int(self.shape[0]),
-                            upload_batch_size=auto_batch_size_i8(self.shape[0]),
+                            upload_batch_size=int(int8_upload_batch_size or auto_batch_size_i8(self.shape[0])),
                             gpu_int8_dtype=gpu_int8_dtype,
                         )
                 else:
@@ -5450,7 +5593,7 @@ class StandardizedGenotypeMatrix:
                         variant_indices=self.variant_indices,
                         gpu_destination=gpu_matrix,
                         sample_count=int(self.shape[0]),
-                        upload_batch_size=auto_batch_size_i8(self.shape[0]),
+                        upload_batch_size=int(int8_upload_batch_size or auto_batch_size_i8(self.shape[0])),
                         gpu_int8_dtype=gpu_int8_dtype,
                     )
                 # Synchronization invariant: callers may read ``self._cupy_cache``
@@ -5694,8 +5837,20 @@ class StandardizedGenotypeMatrix:
             # resident so per-block GPU uploads run at RAM speed.
             _madvise_willneed_array(self.raw.matrix)
             return True
-        batch_size = auto_batch_size_i8(self.shape[0])
         selected_variant_count = int(self.variant_indices.shape[0])
+        requested_batch_size = auto_batch_size_i8(self.shape[0])
+        batch_size = _cap_int8_batch_size_by_tile_bytes(
+            sample_count=int(self.shape[0]),
+            requested_batch_size=requested_batch_size,
+            variant_count=selected_variant_count,
+            target_tile_bytes=_INT8_CACHE_WRITE_TARGET_TILE_BYTES,
+        )
+        if batch_size < min(int(requested_batch_size), max(selected_variant_count, 1)):
+            log(
+                "    capping persistent int8 cache write tile: "
+                + f"{requested_batch_size:,} -> {batch_size:,} variants "
+                + f"(target {_bytes_gb(_INT8_CACHE_WRITE_TARGET_TILE_BYTES)})  mem={mem()}"
+            )
         log(
             "    caching reduced raw genotypes locally as int8 "
             + f"({selected_variant_count} variants x {self.shape[0]} samples)  mem={mem()}"

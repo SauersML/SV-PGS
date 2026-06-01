@@ -16,10 +16,12 @@ These tests verify:
      2D returns 2D).
   4. The fallback path is unchanged when raw is NOT bitpacked.
 
-Runs without a real GPU by stubbing the minimum cupy surface with
-numpy-backed equivalents — the operator's code only needs asarray,
-empty, zeros, and basic arithmetic. The test thereby validates the
-algebra and the dispatch, not cuBLAS performance.
+The fakes use whichever ``cupy`` namespace ``_ensure_cupy_stub`` returns —
+real CuPy when the runtime has a GPU (so the dispatch is exercised against
+genuine device arrays), or a numpy-backed stub otherwise. Either way the
+fake bitpacked operator does its arithmetic through that namespace and
+returns *its* array type, so the operator under test never mixes a host
+array with a device array (which CuPy 13 rejects).
 """
 from __future__ import annotations
 
@@ -33,10 +35,17 @@ import pytest
 
 
 def _ensure_cupy_stub() -> Any:
-    """Install a numpy-backed cupy namespace if CuPy isn't available."""
+    """Return real CuPy if importable, else install a numpy-backed namespace."""
     try:
         import cupy as real_cp  # type: ignore[import-not-found]
-        return real_cp
+        # ``import cupy`` is satisfied from ``sys.modules`` — an earlier test in
+        # the suite may have left an *incomplete* fake there (no numpy fallback
+        # for dtype scalars). That module makes the operator's ``cp.float32``
+        # raise ``AttributeError`` even though the import "succeeded". Only trust
+        # a module exposing the real device surface; otherwise fall through and
+        # return our own complete numpy-backed stub.
+        if hasattr(real_cp, "float32") and hasattr(real_cp, "cuda"):
+            return real_cp
     except ImportError:
         pass
 
@@ -54,6 +63,7 @@ def _ensure_cupy_stub() -> Any:
     stub.asarray = _asarray  # type: ignore[attr-defined]
     stub.zeros_like = _zeros_like  # type: ignore[attr-defined]
     stub.ascontiguousarray = _ascontiguousarray  # type: ignore[attr-defined]
+    stub.asnumpy = lambda x: np.asarray(x)  # type: ignore[attr-defined]
     stub.empty = lambda shape, dtype=None: np.empty(shape, dtype=dtype)  # type: ignore[attr-defined]
     stub.zeros = lambda shape, dtype=None: np.zeros(shape, dtype=dtype)  # type: ignore[attr-defined]
     stub.float32 = np.float32  # type: ignore[attr-defined]
@@ -63,40 +73,49 @@ def _ensure_cupy_stub() -> Any:
     return stub
 
 
+def _to_numpy(array: Any) -> np.ndarray:
+    """Host-copy an array regardless of whether it is CuPy- or numpy-backed."""
+    getter = getattr(array, "get", None)
+    return getter() if callable(getter) else np.asarray(array)
+
+
 class _FakeBitpacked:
     """Minimal bitpacked-like object exposing _packed + matvec + rmatvec.
 
-    The actual algebra is computed from a stored dense standardized matrix
-    so we can compare the operator's output to an explicit reference.
+    The algebra is computed from a device-resident standardized matrix (built
+    through the same ``cupy`` namespace the operator uses) so matvec/rmatvec
+    return device arrays — the operator multiplies the result by a device
+    prior vector, which CuPy 13 forbids against a host array.
     """
 
-    def __init__(self, dense_standardized: np.ndarray) -> None:
-        self._dense = np.asarray(dense_standardized, dtype=np.float32)
+    def __init__(self, dense_standardized: np.ndarray, cp: Any) -> None:
+        self._cp = cp
+        self._dense = cp.asarray(np.asarray(dense_standardized, dtype=np.float32))
         self.n_samples = int(self._dense.shape[0])
         self.n_variants = int(self._dense.shape[1])
         # Marker attribute the operator's branch detects.
         self._packed = object()
 
-    def matvec(self, x_dev: np.ndarray) -> np.ndarray:
-        x32 = np.asarray(x_dev, dtype=np.float32)
+    def matvec(self, x_dev: Any) -> Any:
+        x32 = self._cp.asarray(x_dev, dtype=self._cp.float32)
         if x32.shape != (self.n_variants,):
             raise ValueError(
                 f"matvec: x has shape {tuple(x32.shape)}, expected ({self.n_variants},)"
             )
-        return (self._dense @ x32).astype(np.float32, copy=False)
+        return (self._dense @ x32).astype(self._cp.float32, copy=False)
 
-    def rmatvec(self, y_dev: np.ndarray) -> np.ndarray:
-        y32 = np.asarray(y_dev, dtype=np.float32)
+    def rmatvec(self, y_dev: Any) -> Any:
+        y32 = self._cp.asarray(y_dev, dtype=self._cp.float32)
         if y32.shape != (self.n_samples,):
             raise ValueError(
                 f"rmatvec: y has shape {tuple(y32.shape)}, expected ({self.n_samples},)"
             )
-        return (self._dense.T @ y32).astype(np.float32, copy=False)
+        return (self._dense.T @ y32).astype(self._cp.float32, copy=False)
 
 
-def _make_sgm_with_bitpacked(dense_standardized: np.ndarray) -> Any:
+def _make_sgm_with_bitpacked(dense_standardized: np.ndarray, cp: Any) -> Any:
     """Build a minimal SGM-like object the operator code accepts."""
-    bp = _FakeBitpacked(dense_standardized)
+    bp = _FakeBitpacked(dense_standardized, cp)
     sgm = SimpleNamespace()
     sgm.raw = bp
     sgm._cupy_cache = None
@@ -113,7 +132,7 @@ def test_bitpacked_branch_matches_explicit_operator_vector_rhs():
     rng = np.random.default_rng(0)
     n, p = 23, 17
     dense = rng.standard_normal((n, p)).astype(np.float32)
-    sgm = _make_sgm_with_bitpacked(dense)
+    sgm = _make_sgm_with_bitpacked(dense, cp)
     prior_variances = rng.uniform(0.1, 1.0, size=p).astype(np.float32)
     diagonal_noise = rng.uniform(0.05, 0.5, size=n).astype(np.float32)
     v = rng.standard_normal(n).astype(np.float32)
@@ -134,7 +153,7 @@ def test_bitpacked_branch_matches_explicit_operator_vector_rhs():
     expected = diagonal_noise * v + dense @ scaled
 
     assert result.shape == (n,)
-    np.testing.assert_allclose(np.asarray(result), expected, rtol=1e-4, atol=1e-4)
+    np.testing.assert_allclose(_to_numpy(result), expected, rtol=1e-4, atol=1e-4)
 
 
 def test_bitpacked_branch_matches_explicit_operator_matrix_rhs():
@@ -144,7 +163,7 @@ def test_bitpacked_branch_matches_explicit_operator_matrix_rhs():
     rng = np.random.default_rng(1)
     n, p, k = 19, 13, 4
     dense = rng.standard_normal((n, p)).astype(np.float32)
-    sgm = _make_sgm_with_bitpacked(dense)
+    sgm = _make_sgm_with_bitpacked(dense, cp)
     prior_variances = rng.uniform(0.1, 1.0, size=p).astype(np.float32)
     diagonal_noise = rng.uniform(0.05, 0.5, size=n).astype(np.float32)
     M = rng.standard_normal((n, k)).astype(np.float32)
@@ -165,7 +184,7 @@ def test_bitpacked_branch_matches_explicit_operator_matrix_rhs():
     expected = diagonal_noise[:, None] * M + dense @ scaled
 
     assert result.shape == (n, k)
-    np.testing.assert_allclose(np.asarray(result), expected, rtol=1e-4, atol=1e-4)
+    np.testing.assert_allclose(_to_numpy(result), expected, rtol=1e-4, atol=1e-4)
 
 
 def test_bitpacked_branch_skipped_when_cupy_cache_present():
@@ -176,11 +195,11 @@ def test_bitpacked_branch_skipped_when_cupy_cache_present():
     rng = np.random.default_rng(2)
     n, p = 7, 5
     dense = rng.standard_normal((n, p)).astype(np.float32)
-    sgm = _make_sgm_with_bitpacked(dense)
+    sgm = _make_sgm_with_bitpacked(dense, cp)
 
     # Simulate the legacy cache being installed. The bitpacked branch's
     # gate requires _cupy_cache is None — present cache must skip the branch.
-    sgm._cupy_cache = np.ones((n, p), dtype=np.float32)  # placeholder
+    sgm._cupy_cache = cp.asarray(np.ones((n, p), dtype=np.float32))  # placeholder
     bp_called = {"matvec": 0, "rmatvec": 0}
 
     original_matvec = sgm.raw.matvec
@@ -199,12 +218,15 @@ def test_bitpacked_branch_skipped_when_cupy_cache_present():
 
     # Provide what the legacy branch needs: gpu_matmat / gpu_transpose_matmat.
     # The operator's legacy branch calls these; stub them to a fixed result
+    # (computed through ``cp`` so the return type matches the device inputs)
     # so the test doesn't depend on legacy code correctness.
+    dense_dev = cp.asarray(dense)
+
     def fake_gpu_transpose_matmat(matrix, *, batch_size, cupy, dtype):
-        return np.asarray(dense.T @ np.asarray(matrix), dtype=dtype)
+        return (dense_dev.T @ cupy.asarray(matrix)).astype(dtype, copy=False)
 
     def fake_gpu_matmat(matrix, *, batch_size, cupy, dtype):
-        return np.asarray(dense @ np.asarray(matrix), dtype=dtype)
+        return (dense_dev @ cupy.asarray(matrix)).astype(dtype, copy=False)
 
     sgm.gpu_transpose_matmat = fake_gpu_transpose_matmat
     sgm.gpu_matmat = fake_gpu_matmat
@@ -246,19 +268,21 @@ def test_bitpacked_branch_skipped_when_variant_indices_not_identity():
     rng = np.random.default_rng(3)
     n, p = 11, 9
     dense = rng.standard_normal((n, p)).astype(np.float32)
-    sgm = _make_sgm_with_bitpacked(dense)
+    sgm = _make_sgm_with_bitpacked(dense, cp)
     # Mark this SGM as exposing 5 of the 9 underlying columns.
     sgm.shape = (n, 5)
     sgm.variant_indices = np.array([0, 2, 3, 5, 7], dtype=np.int32)
 
+    dense_dev = cp.asarray(dense)
+
     # Need to provide fallback ops since the bitpacked branch shouldn't run.
     def fake_gpu_transpose_matmat(matrix, *, batch_size, cupy, dtype):
-        sub = dense[:, sgm.variant_indices]
-        return np.asarray(sub.T @ np.asarray(matrix), dtype=dtype)
+        sub = dense_dev[:, sgm.variant_indices]
+        return (sub.T @ cupy.asarray(matrix)).astype(dtype, copy=False)
 
     def fake_gpu_matmat(matrix, *, batch_size, cupy, dtype):
-        sub = dense[:, sgm.variant_indices]
-        return np.asarray(sub @ np.asarray(matrix), dtype=dtype)
+        sub = dense_dev[:, sgm.variant_indices]
+        return (sub @ cupy.asarray(matrix)).astype(dtype, copy=False)
 
     sgm.gpu_transpose_matmat = fake_gpu_transpose_matmat
     sgm.gpu_matmat = fake_gpu_matmat
@@ -278,8 +302,7 @@ def test_bitpacked_branch_skipped_when_variant_indices_not_identity():
 
     def fake_iter(*_args, **_kwargs):
         # one batch covering the subset columns
-        from sv_pgs.genotype import RawGenotypeBatch
-        sub = dense[:, sgm.variant_indices]
+        sub = dense_dev[:, sgm.variant_indices]
         yield slice(0, sgm.shape[1]), sub
     _mi._iter_standardized_gpu_batches = fake_iter
     try:

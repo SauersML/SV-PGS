@@ -69,7 +69,9 @@ def test_gpu_cholesky_solve_zero_covariate_factor_returns_empty_solution():
 
     result = _gpu_cholesky_solve(rhs_gpu, factor_gpu, must_not_be_called)
     assert sentinel_called["n"] == 0
-    assert isinstance(result, np.ndarray)
+    # The empty short-circuit returns a device array (``cp.empty``); on the
+    # numpy stub ``cp.ndarray is np.ndarray`` so this covers both runtimes.
+    assert isinstance(result, cp.ndarray)
     assert result.shape == (0,)
     assert result.dtype == np.float64
 
@@ -86,7 +88,7 @@ def test_gpu_cholesky_solve_zero_covariate_factor_matrix_rhs():
         raise AssertionError("dtrsm must not run on 0x0 input.")
 
     result = _gpu_cholesky_solve(rhs_gpu, factor_gpu, must_not_be_called)
-    assert isinstance(result, np.ndarray)
+    assert isinstance(result, cp.ndarray)
     assert result.shape == (0, 5)
     assert result.dtype == np.float64
 
@@ -114,13 +116,17 @@ def test_gpu_cholesky_solve_nonempty_path_still_dispatches():
     call_log: list[dict[str, Any]] = []
 
     def fake_solve_triangular(factor, rhs, *, lower, check_finite, trans=None):
+        # ``factor``/``rhs`` arrive as device arrays; copy to host explicitly
+        # (CuPy 13 rejects the implicit ``np.asarray`` device→host coercion).
+        factor_host_local = factor.get() if hasattr(factor, "get") else np.asarray(factor)
+        rhs_host_local = rhs.get() if hasattr(rhs, "get") else np.asarray(rhs)
         call_log.append(
-            {"factor_shape": np.asarray(factor).shape, "rhs_shape": np.asarray(rhs).shape, "trans": trans}
+            {"factor_shape": factor_host_local.shape, "rhs_shape": rhs_host_local.shape, "trans": trans}
         )
         from scipy.linalg import solve_triangular  # type: ignore[import-untyped]
         return solve_triangular(
-            np.asarray(factor),
-            np.asarray(rhs),
+            factor_host_local,
+            rhs_host_local,
             lower=lower,
             check_finite=check_finite,
             trans=("T" if trans == "T" else "N"),
@@ -131,12 +137,12 @@ def test_gpu_cholesky_solve_nonempty_path_still_dispatches():
     assert len(call_log) == 2
     assert call_log[0]["trans"] is None
     assert call_log[1]["trans"] == "T"
-    assert isinstance(result, np.ndarray)
     assert result.shape == (3,)
     # Verify the result matches scipy reference (L L.T x = b).
+    result_host = result.get() if hasattr(result, "get") else np.asarray(result)
     from scipy.linalg import cho_solve  # type: ignore[import-untyped]
     expected = cho_solve((factor_host, True), rhs_host)
-    np.testing.assert_allclose(result, expected, rtol=1e-10)
+    np.testing.assert_allclose(result_host, expected, rtol=1e-10)
 
 
 def test_gpu_cholesky_solve_rejects_nonsquare_factor():

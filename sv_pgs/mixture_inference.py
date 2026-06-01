@@ -9744,6 +9744,29 @@ def _restricted_posterior_result_without_diagnostics(
     )
 
 
+def _gpu_cholesky_with_adaptive_ridge(
+    cp: Any,
+    normal_matrix_gpu: Any,
+    diagonal_index: NDArray,
+    *,
+    label: str,
+) -> Any:
+    """Return a finite GPU Cholesky factor, increasing ridge until stable."""
+    from sv_pgs.progress import log
+
+    previous_ridge = 0.0
+    for ridge in (1e-8, 1e-4, 1e-2, 1.0, 100.0):
+        normal_matrix_gpu[diagonal_index, diagonal_index] += ridge - previous_ridge
+        previous_ridge = ridge
+        cholesky_gpu = cp.linalg.cholesky(normal_matrix_gpu)
+        if bool(cp.isfinite(cholesky_gpu).all()):
+            if ridge > 1e-8:
+                log(f"{label} Cholesky stabilized with ridge {ridge:g}.")
+            return cholesky_gpu
+        log(f"{label} Cholesky non-finite at ridge {ridge:g}; retrying.")
+    raise FloatingPointError(f"{label} Cholesky remained non-finite after ridge 100.")
+
+
 def _solve_restricted_exact_variant_space(
     *,
     genotype_matrix: StandardizedGenotypeMatrix,
@@ -10602,18 +10625,12 @@ def _solve_restricted_mean_only(
                 covariate_matrix_gpu.T @ inverse_covariance_covariates_gpu
             ).astype(factor_dtype("gls"), copy=False)
             diagonal_index = np.arange(covariate_count)
-            gls_normal_matrix_gpu[diagonal_index, diagonal_index] += 1e-8
-            gls_cholesky_gpu = cp.linalg.cholesky(gls_normal_matrix_gpu)
-            # Cupy's cholesky silently fills with NaN on near-singular input.
-            # Re-condition with progressively larger ridges if non-finite.
-            if not bool(cp.isfinite(gls_cholesky_gpu).all()):
-                log("GLS Cholesky non-finite; re-conditioning ridge 1e-4 and retrying.")
-                gls_normal_matrix_gpu[diagonal_index, diagonal_index] += 1e-4
-                gls_cholesky_gpu = cp.linalg.cholesky(gls_normal_matrix_gpu)
-                if not bool(cp.isfinite(gls_cholesky_gpu).all()):
-                    log("GLS Cholesky still non-finite after ridge 1e-4; trying 1e-2.")
-                    gls_normal_matrix_gpu[diagonal_index, diagonal_index] += 1e-2
-                    gls_cholesky_gpu = cp.linalg.cholesky(gls_normal_matrix_gpu)
+            gls_cholesky_gpu = _gpu_cholesky_with_adaptive_ridge(
+                cp,
+                gls_normal_matrix_gpu,
+                diagonal_index,
+                label="GLS",
+            )
             alpha_gpu = _gpu_cholesky_solve(
                 covariate_matrix_gpu.T @ inverse_covariance_targets_gpu,
                 gls_cholesky_gpu,
@@ -10636,6 +10653,16 @@ def _solve_restricted_mean_only(
             cupy=cp,
             dtype=compute_cp_dtype,
         )
+        for _name, _value in (
+            ("alpha", alpha_gpu),
+            ("projected_targets", projected_targets_gpu),
+            ("beta", beta_gpu),
+            ("linear_predictor", linear_predictor_gpu),
+        ):
+            if not bool(cp.isfinite(_value).all()):
+                raise FloatingPointError(
+                    f"GPU sample-space restricted mean produced non-finite {_name}."
+                )
         restricted_quadratic = float(_cupy_array_to_numpy(cp.dot(targets_gpu, projected_targets_gpu), dtype=np.float64))
         alpha = _cupy_array_to_numpy(alpha_gpu, dtype=np.float64)
         beta = _cupy_array_to_numpy(beta_gpu, dtype=np.float64)
@@ -11882,20 +11909,12 @@ def _solve_restricted_full(
             covariate_matrix_gpu.T @ inverse_covariance_covariates_gpu
         ).astype(factor_dtype("gls"), copy=False)
         diagonal_index = np.arange(covariate_matrix.shape[1])
-        gls_normal_matrix_gpu[diagonal_index, diagonal_index] += 1e-8
-        gls_cholesky_gpu = cp.linalg.cholesky(gls_normal_matrix_gpu)
-        # Cupy's cholesky silently fills with NaN when the input is
-        # near-singular instead of raising. That NaN-factor then propagates
-        # into the downstream cublasDtrsm with degenerate strides. Guard
-        # by checking and re-conditioning with a stronger ridge once.
-        if not bool(cp.isfinite(gls_cholesky_gpu).all()):
-            log("GLS Cholesky non-finite; re-conditioning ridge 1e-4 and retrying.")
-            gls_normal_matrix_gpu[diagonal_index, diagonal_index] += 1e-4
-            gls_cholesky_gpu = cp.linalg.cholesky(gls_normal_matrix_gpu)
-            if not bool(cp.isfinite(gls_cholesky_gpu).all()):
-                log("GLS Cholesky still non-finite after ridge 1e-4; trying 1e-2.")
-                gls_normal_matrix_gpu[diagonal_index, diagonal_index] += 1e-2
-                gls_cholesky_gpu = cp.linalg.cholesky(gls_normal_matrix_gpu)
+        gls_cholesky_gpu = _gpu_cholesky_with_adaptive_ridge(
+            cp,
+            gls_normal_matrix_gpu,
+            diagonal_index,
+            label="GLS",
+        )
         alpha_gpu = _gpu_cholesky_solve(
             covariate_matrix_gpu.T @ inverse_covariance_targets_gpu,
             gls_cholesky_gpu,
@@ -11908,6 +11927,15 @@ def _solve_restricted_full(
             cupy=cp,
             dtype=compute_cp_dtype,
         )
+        for _name, _value in (
+            ("alpha", alpha_gpu),
+            ("projected_targets", projected_targets_gpu),
+            ("beta", beta_gpu),
+        ):
+            if not bool(cp.isfinite(_value).all()):
+                raise FloatingPointError(
+                    f"GPU sample-space restricted posterior produced non-finite {_name}."
+                )
         if compute_beta_variance:
             probe_rhs_start = covariate_rhs_stop
             low_rank_probe_rhs_stop = probe_rhs_start + low_rank_variance_probe_count
