@@ -1417,6 +1417,182 @@ def _log_all_cached_test_evals(base_dir: Path, *, header: str = "PRE-FLIGHT") ->
     return len(candidates)
 
 
+def _log_variant_category_banner(variant_records: "Sequence[object]") -> None:
+    """Print the realized variant categories (class -> count) at run start.
+
+    "Variant category" here is each variant's :class:`~sv_pgs.config.VariantClass`
+    — the grouping the empirical-Bayes prior shares hyperparameters across
+    (one TPB shrinkage pair per class). Counts come straight from the loaded
+    records, so the banner reflects what *this* cohort actually contains after
+    MAF / screening filters, not the static enum. Emitted once per fit so the
+    operator can confirm e.g. that an ``--variants snp`` run really has zero
+    structural classes before the multi-hour fit begins.
+    """
+    from collections import Counter
+
+    counts: "Counter[str]" = Counter()
+    for record in variant_records:
+        variant_class = getattr(record, "variant_class", None)
+        name = getattr(variant_class, "value", None) or str(variant_class)
+        counts[name] += 1
+    total = sum(counts.values())
+    if total == 0:
+        log("  variant categories: (no variant records loaded)")
+        return
+    # Stable, count-descending order so the dominant class reads first.
+    ordered = sorted(counts.items(), key=lambda item: (-item[1], item[0]))
+    rendered = "  ".join(f"{name}={count:,}" for name, count in ordered)
+    log(f"  variant categories ({len(counts)} classes, {total:,} variants): {rendered}")
+
+
+_LOGGED_FIT_STATUS: set[str] = set()
+
+
+def _read_fit_status(work_dir: Path) -> dict[str, object]:
+    """Inspect one results dir and summarize what the previous run left behind.
+
+    Returns a dict with at least ``status`` in:
+      * ``"COMPLETE"``    — ``summary.json.gz`` present (written last, after the
+        artifact + predictions), so the fit finished. Carries converged flag,
+        iteration count, the four final_*_change deltas, and any test metric.
+      * ``"IN-PROGRESS"`` — no summary yet, but a durable ``fit_checkpoint.npz``
+        and/or per-epoch ``training_history.tsv`` shows the EM loop ran. Carries
+        the last completed iteration / epoch reached so the operator sees how
+        far it got before it was interrupted.
+      * ``"NOT-STARTED"`` — none of the above; nothing fit here yet.
+
+    Pure disk inspection (cheap, no GPU, no model import) so it is safe to call
+    for every sibling disease at startup.
+    """
+    info: dict[str, object] = {"status": "NOT-STARTED"}
+
+    summary_path = work_dir / "summary.json.gz"
+    if summary_path.exists():
+        info["status"] = "COMPLETE"
+        try:
+            from sv_pgs.io import _open_text_file
+
+            with _open_text_file(summary_path, "rt") as handle:
+                payload = json.loads(handle.read())
+        except (OSError, ValueError):
+            payload = {}
+        if isinstance(payload, dict):
+            for key in (
+                "fit_converged",
+                "selected_iteration_count",
+                "final_parameter_change",
+                "final_predictor_change",
+                "final_objective_change",
+                "final_hyperparameter_change",
+                "test_auc",
+                "test_r2",
+                "active_variant_count",
+                "variant_count",
+            ):
+                if key in payload:
+                    info[key] = payload[key]
+        return info
+
+    # No summary => either mid-fit or never started. Prefer the durable
+    # checkpoint's completed-iteration count (the resume anchor), then fall
+    # back to the last per-epoch history row.
+    checkpoint_path = work_dir / "fit_checkpoint.npz"
+    if checkpoint_path.exists():
+        info["status"] = "IN-PROGRESS"
+        try:
+            import numpy as _np
+
+            with _np.load(checkpoint_path, allow_pickle=False) as handle:
+                if "iter" in handle:
+                    info["checkpoint_iterations"] = int(_np.asarray(handle["iter"]).reshape(-1)[0])
+        except (OSError, ValueError, KeyError):
+            pass
+
+    history_path = work_dir / "training_history.tsv"
+    if history_path.exists():
+        last_epoch: str | None = None
+        try:
+            import csv as _csv
+
+            with history_path.open("r", encoding="utf-8", newline="") as handle:
+                for row in _csv.DictReader(handle, delimiter="\t"):
+                    last_epoch = row.get("epoch", last_epoch)
+        except OSError:
+            last_epoch = None
+        if last_epoch is not None and last_epoch != "":
+            info["status"] = "IN-PROGRESS"
+            info["last_epoch"] = last_epoch
+
+    return info
+
+
+def _render_fit_status(label: str, info: dict[str, object]) -> str:
+    status = str(info.get("status", "NOT-STARTED"))
+    parts = [f"[{status}]", label]
+    if status == "COMPLETE":
+        converged = info.get("fit_converged")
+        if converged is not None:
+            parts.append(f"converged={converged}")
+        if "selected_iteration_count" in info:
+            parts.append(f"iters={info['selected_iteration_count']}")
+        deltas = [
+            ("dparam", info.get("final_parameter_change")),
+            ("dpred", info.get("final_predictor_change")),
+            ("dobj", info.get("final_objective_change")),
+            ("dhyper", info.get("final_hyperparameter_change")),
+        ]
+        rendered_deltas = "  ".join(
+            f"{name}={_format_metric(value)}" for name, value in deltas if value is not None
+        )
+        if rendered_deltas:
+            parts.append(rendered_deltas)
+        if info.get("test_auc") is not None:
+            parts.append(f"test_auc={_format_metric(info['test_auc'])}")
+        elif info.get("test_r2") is not None:
+            parts.append(f"test_r2={_format_metric(info['test_r2'])}")
+    elif status == "IN-PROGRESS":
+        if "checkpoint_iterations" in info:
+            parts.append(f"checkpoint_iter={info['checkpoint_iterations']}")
+        if "last_epoch" in info:
+            parts.append(f"last_epoch={info['last_epoch']}")
+        parts.append("(will resume if compatible)")
+    return "  ".join(str(part) for part in parts)
+
+
+def _log_prior_fit_status(base_dir: Path, *, header: str) -> int:
+    """At startup, print which fits are complete / in-progress / not-started.
+
+    Scans ``base_dir`` for ``*_results`` dirs (the per-disease layout) and, if
+    ``base_dir`` is itself a single results dir, reports it directly. Each fit
+    is summarized once per process (deduped via ``_LOGGED_FIT_STATUS``) so the
+    single-disease and sweep entry points don't double-print. Returns the
+    number of fit dirs reported.
+    """
+    candidates: list[Path] = []
+    if base_dir.exists():
+        candidates = sorted(
+            candidate for candidate in base_dir.glob("*_results") if candidate.is_dir()
+        )
+        # A single-disease run points output_base straight at the results dir;
+        # if it has fit artifacts but didn't match the *_results glob, report it.
+        if not candidates and (
+            (base_dir / "summary.json.gz").exists()
+            or (base_dir / "fit_checkpoint.npz").exists()
+            or (base_dir / "training_history.tsv").exists()
+        ):
+            candidates = [base_dir]
+    fresh = [c for c in candidates if str(_safe_resolve(c)) not in _LOGGED_FIT_STATUS]
+    if not fresh:
+        return 0
+    log(f"=== {header}: PRIOR FIT STATUS ({len(fresh)} fit dir(s) in {base_dir}) ===")
+    for candidate in fresh:
+        _LOGGED_FIT_STATUS.add(str(_safe_resolve(candidate)))
+        info = _read_fit_status(candidate)
+        log("  " + _render_fit_status(candidate.name, info))
+    log(f"=== {header}: end of prior fit status ===")
+    return len(fresh)
+
+
 def _safe_resolve(path: Path) -> Path:
     try:
         return path.resolve()
@@ -1555,6 +1731,9 @@ def run_all_of_us(
     # this one's. The dedupe set keeps the sweep entry point's earlier
     # upfront scan from being re-emitted here.
     base_for_scan = work_dir.parent if work_dir.parent != work_dir else work_dir
+    # Which sibling fits are done / mid-fit / untouched, and what each one's
+    # last run left behind (converged?, iters, final deltas, test metric).
+    _log_prior_fit_status(base_for_scan, header=f"JOB START [{disease_def.canonical_name}]")
     found = _log_all_cached_test_evals(base_for_scan, header=f"JOB START [{disease_def.canonical_name}]")
     if found == 0:
         # Nothing in parent — fall back to just this disease's work_dir on
@@ -1610,8 +1789,11 @@ def run_all_of_us(
     # Status summary: what's done vs what's left
     log("=== STATUS CHECK ===")
     try:
-        from sv_pgs.progress import log_autotune_banner
+        from sv_pgs.progress import device_summary, log_autotune_banner
 
+        # "What sort of thing it is running on": GPU model / arch / HBM and how
+        # many devices the fit will shard across (or CPU fallback).
+        log(f"  running on: {device_summary()}")
         log_autotune_banner()
     except (ImportError, RuntimeError) as _autotune_banner_error:
         log(f"  auto-tune banner unavailable: {_autotune_banner_error}")
@@ -1880,6 +2062,7 @@ def run_all_of_us(
             covariate_columns=covariates,
             variant_metadata_path=resolved_variant_metadata_path,
         )
+        _log_variant_category_banner(dataset.variant_records)
         if test_table_path is not None:
             log("=== STEP 4b: Load held-out TEST dataset ===")
             # Same sources, same variant order, different sample subset. The
@@ -2113,6 +2296,7 @@ def run_all_of_us_all_diseases(
     # Print every already-cached test set eval up front so operators see the
     # known numbers immediately even if the sweep is about to spend hours on
     # remaining diseases or cache re-validation.
+    _log_prior_fit_status(base_dir, header="SWEEP PRE-FLIGHT")
     _log_all_cached_test_evals(base_dir, header="SWEEP PRE-FLIGHT")
 
     diseases = list(DISEASE_DEFINITIONS)

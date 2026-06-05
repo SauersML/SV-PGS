@@ -245,6 +245,43 @@ def jax_runtime_snapshot() -> str:
         return f"jax_runtime_error={error} env=[{env_summary}]"
 
 
+def device_summary() -> str:
+    """One human-readable line describing *what the fit runs on*.
+
+    Combines three independently-robust probes so a single missing piece
+    (no CuPy, no GPU, CPU fallback) degrades to a clear note rather than an
+    exception:
+
+      * :func:`sv_pgs.bitpacked.launch.gpu_arch_summary` — the compute GPU's
+        model / arch / HBM (e.g. ``"A100 sm_80 family=ampere HBM=40.0 GB"``).
+      * :class:`sv_pgs.gpu_scheduler.GPUScheduler` — how many devices the fit
+        will actually shard across, or whether it is on a CPU fallback.
+
+    Emitted once at run start so the operator sees the hardware the run is
+    pinned to before the multi-hour pipeline begins.
+    """
+    try:
+        from sv_pgs.bitpacked.launch import gpu_arch_summary
+
+        arch = gpu_arch_summary()
+    except Exception as error:  # noqa: BLE001 — never let a probe abort startup
+        arch = f"gpu_arch_unavailable={type(error).__name__}: {error}"
+    try:
+        from sv_pgs.gpu_scheduler import GPUScheduler
+
+        scheduler = GPUScheduler.detect()
+        if scheduler.is_cpu_fallback:
+            topology = "device=CPU-fallback (no GPU visible)"
+        else:
+            topology = (
+                f"devices={scheduler.device_ids} "
+                f"multi_gpu={'enabled' if scheduler.device_count >= 2 else 'disabled'}"
+            )
+    except Exception as error:  # noqa: BLE001
+        topology = f"scheduler_unavailable={type(error).__name__}: {error}"
+    return f"{arch}  {topology}"
+
+
 # -- Heartbeat / stack sampler --------------------------------------------
 #
 # Background thread that emits a periodic "where am I now" snapshot so a stall

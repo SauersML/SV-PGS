@@ -5,14 +5,33 @@ import gzip
 import hashlib
 import json
 import os
+import pickle
 import tempfile
 import time
 import uuid
+import zipfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, BinaryIO, Iterator, Literal, Sequence, cast
 
 import numpy as np
+
+# Exceptions meaning "this cache file is corrupt / truncated / half-written" —
+# every cache READ treats these as a clean miss (recompute / re-parse) rather
+# than crashing a multi-hour run. BadZipFile (np.load on a truncated .npz),
+# UnpicklingError (partial .pkl), and gzip.BadGzipFile (truncated .gz) are not
+# OSError/ValueError subclasses, so they must be named explicitly.
+_CACHE_CORRUPTION_ERRORS: tuple[type[BaseException], ...] = (
+    OSError,
+    ValueError,
+    EOFError,
+    KeyError,
+    AttributeError,
+    zipfile.BadZipFile,
+    pickle.UnpicklingError,
+    gzip.BadGzipFile,
+    json.JSONDecodeError,
+)
 
 from sv_pgs._typing import F32Array, F64Array, I8Array, I32Array, NDArray
 from sv_pgs.config import ModelConfig, VariantClass
@@ -1547,7 +1566,7 @@ def _read_sample_table_cache(
             total_sample_rows = int(bundle["total_sample_rows"])
             unmatched_sample_rows = int(bundle["unmatched_sample_rows"])
             version = int(bundle["version"])
-    except (OSError, KeyError, ValueError, EOFError):
+    except _CACHE_CORRUPTION_ERRORS:
         return None
     if version != _SAMPLE_TABLE_CACHE_VERSION:
         return None
@@ -1886,7 +1905,7 @@ def _load_plink_stats_from_cache(stats_path: Path) -> VariantStatistics | None:
         return None
     try:
         return _load_vcf_cache_stats(stats_path)
-    except (OSError, ValueError, KeyError) as exc:
+    except _CACHE_CORRUPTION_ERRORS as exc:
         log(f"  PLINK stats cache at {stats_path.name} unreadable ({exc!r}); recomputing")
         return None
 
@@ -2070,7 +2089,7 @@ def _open_plink_int8_cache_for_read(int8_path: Path) -> I8Array | None:
         return None
     try:
         view: np.memmap[Any, np.dtype[np.int8]] = _open_int8_memmap(int8_path, mode="r")
-    except (OSError, ValueError, EOFError) as exc:
+    except _CACHE_CORRUPTION_ERRORS as exc:
         log(f"  PLINK int8 cache at {int8_path.name} unreadable ({exc!r}); will recompute")
         return None
     # Hint the kernel to pre-fault and retain pages: avoids per-block 3s
@@ -2333,7 +2352,7 @@ def _load_vcf_from_cache(
         genotype_matrix = _ensure_vcf_cache_matrix_fast(paths, genotype_matrix)
         log(f"  cached matrix {genotype_matrix.shape}, {len(variants)} variants")
         return genotype_matrix, variants, variant_stats
-    except (OSError, RuntimeError, ValueError, KeyError, EOFError) as exc:
+    except (*_CACHE_CORRUPTION_ERRORS, RuntimeError) as exc:
         log(f"VCF cache load failed ({exc}), will re-parse")
         return None
 
@@ -3328,7 +3347,7 @@ def _load_vcf_incremental(
             for chunk_path in chunk_paths[metadata_chunk_count:]:
                 chunk_path.unlink(missing_ok=True)
             log(f"  incremental cache: resuming from {n_cached} variants ({metadata_chunk_count} metadata chunks)")
-        except (OSError, ValueError, EOFError) as exc:
+        except _CACHE_CORRUPTION_ERRORS as exc:
             log(f"  incremental cache progress corrupt ({exc}), starting fresh")
             n_cached = 0
             metadata_chunk_count = 0

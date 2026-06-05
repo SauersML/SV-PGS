@@ -52,6 +52,7 @@ The algorithm iterates three steps until convergence:
 
 from __future__ import annotations
 
+import copy
 from dataclasses import MISSING, dataclass, field, fields as dataclass_fields, replace as dataclass_replace
 import gc
 import hashlib
@@ -59,7 +60,7 @@ import json
 import os
 from pathlib import Path
 import time
-from typing import Any, Callable, Iterable, Sequence, cast
+from typing import Any, Callable, Iterable, Mapping, Sequence, cast
 
 # NOTE: `sv_pgs._jax` must be imported BEFORE `jax.numpy` etc., because importing
 # it has the side effect of configuring JAX/XLA environment variables.  We import
@@ -684,6 +685,14 @@ class VariationalFitCheckpoint:
     anderson_map_values: list[NDArray] | None = None
     anderson_residuals: list[NDArray] | None = None
     anderson_memory_depth: int | None = None
+    # Variant-category identity, one name per column of the per-class TPB
+    # shape vectors, in column order. Recorded so a warm start survives a
+    # change to the *set* of variant categories: on resume we remap each
+    # per-category hyperparameter by NAME (keeping matching classes, seeding
+    # added classes from config defaults, dropping removed ones) instead of
+    # throwing the whole fit away. ``None`` on pre-category-aware pickles,
+    # which then fall back to the old "start from scratch" behavior.
+    prior_class_names: list[str] | None = None
 
     def __getstate__(self) -> dict[str, object]:
         return {
@@ -805,6 +814,92 @@ def _checkpoint_config_signature(config: ModelConfig) -> str:
         value = getattr(config, field.name)
         payload[field.name] = value.value if hasattr(value, "value") else value
     return hashlib.sha256(json.dumps(payload, sort_keys=True).encode("utf-8")).hexdigest()
+
+
+def _checkpoint_prior_class_names(prior_design: PriorDesign) -> list[str]:
+    """Ordered category names, one per column of the per-class TPB vectors.
+
+    Column ``c`` of ``class_membership_matrix`` (and therefore element ``c`` of
+    ``tpb_shape_a_vector`` / ``tpb_shape_b_vector``) corresponds to the variant
+    class ``inverse_class_lookup[c]``. Returning ``.value`` (the stable string
+    name) lets a resumed fit reconcile per-category hyperparameters by name
+    even if the category set changed shape between runs.
+    """
+    num_classes = prior_design.class_membership_matrix.shape[1]
+    return [prior_design.inverse_class_lookup[index].value for index in range(num_classes)]
+
+
+def _reconcile_checkpoint_categories(
+    checkpoint: "VariationalFitCheckpoint",
+    prior_design: PriorDesign,
+    config: ModelConfig,
+) -> tuple["VariationalFitCheckpoint", dict[str, int]] | None:
+    """Adapt a checkpoint whose variant-category *set* changed since it was saved.
+
+    The per-variant state (alpha/beta/local_scale/...) is keyed to variant
+    identity and is validated separately by the shape checks at the resume
+    site; this function only remaps the per-*category* TPB shape vectors so
+    they line up with the current category columns:
+
+      * a category present in both runs keeps its learned shape parameters,
+      * a newly-added category is seeded from the config default,
+      * a removed category is dropped.
+
+    Returns the adapted checkpoint plus a ``{"kept", "added", "dropped"}``
+    tally, or ``None`` when reconciliation is unsafe/impossible (an old pickle
+    that never recorded category names, or a corrupt name/vector length
+    mismatch) — in which case the caller falls back to a cold start.
+    """
+    old_names = checkpoint.prior_class_names
+    if not old_names:
+        return None
+    old_a = checkpoint.tpb_shape_a_vector
+    old_b = checkpoint.tpb_shape_b_vector
+    if old_a is None or old_b is None:
+        return None
+    if len(old_names) != old_a.shape[0] or len(old_names) != old_b.shape[0]:
+        # Name list out of sync with the vectors it is supposed to label —
+        # don't risk a misaligned remap.
+        return None
+
+    new_names = _checkpoint_prior_class_names(prior_design)
+    num_new = len(new_names)
+    old_index = {name: position for position, name in enumerate(old_names)}
+    default_a = config.class_tpb_shape_a()
+    default_b = config.class_tpb_shape_b()
+    inverse_lookup = prior_design.inverse_class_lookup
+
+    def _remap(vector: NDArray | None, defaults: "Mapping[VariantClass, float]") -> NDArray | None:
+        if vector is None:
+            return None
+        remapped = np.empty(num_new, dtype=np.float64)
+        for column in range(num_new):
+            name = new_names[column]
+            if name in old_index:
+                remapped[column] = float(vector[old_index[name]])
+            else:
+                remapped[column] = float(defaults.get(inverse_lookup[column], 1.0))
+        return remapped
+
+    reconciled = copy.copy(checkpoint)
+    reconciled.tpb_shape_a_vector = _remap(old_a, default_a)
+    reconciled.tpb_shape_b_vector = _remap(old_b, default_b)
+    reconciled.previous_tpb_shape_a_vector = _remap(checkpoint.previous_tpb_shape_a_vector, default_a)
+    reconciled.previous_tpb_shape_b_vector = _remap(checkpoint.previous_tpb_shape_b_vector, default_b)
+    reconciled.best_tpb_shape_a_vector = _remap(checkpoint.best_tpb_shape_a_vector, default_a)
+    reconciled.best_tpb_shape_b_vector = _remap(checkpoint.best_tpb_shape_b_vector, default_b)
+    reconciled.prior_class_names = list(new_names)
+    # Accept the checkpoint under the *current* prior design so it passes the
+    # downstream signature gate and is re-saved with a consistent signature.
+    reconciled.prior_design_signature = _checkpoint_prior_design_signature(prior_design)
+
+    new_name_set = set(new_names)
+    tally = {
+        "kept": sum(1 for name in new_names if name in old_index),
+        "added": sum(1 for name in new_names if name not in old_index),
+        "dropped": sum(1 for name in old_names if name not in new_name_set),
+    }
+    return reconciled, tally
 
 
 def _checkpoint_prior_design_signature(prior_design: PriorDesign) -> str:
@@ -960,6 +1055,7 @@ def checkpoint_from_result(
         anderson_map_values=None,
         anderson_residuals=None,
         anderson_memory_depth=None,
+        prior_class_names=_checkpoint_prior_class_names(prior_design),
     )
 
 
@@ -1660,6 +1756,7 @@ def fit_variational_em(
             anderson_memory_depth=(
                 int(anderson_state.memory_depth) if anderson_state is not None else None
             ),
+            prior_class_names=_checkpoint_prior_class_names(prior_design),
         )
 
     def _initialize_em_state() -> None:
@@ -1722,15 +1819,40 @@ def fit_variational_em(
     if resume_checkpoint is None:
         _initialize_em_state()
     else:
-        if (
+        # A mismatch in config or validation mode is a genuinely different
+        # problem and always forces a cold start. A mismatch in ONLY the
+        # prior-design signature is most often a change to the variant-category
+        # set (a class added/removed/reordered); rather than discard the whole
+        # warm start we remap the per-category hyperparameters by name and keep
+        # the per-variant state, which the shape checks below still validate.
+        config_or_validation_changed = (
             resume_checkpoint.config_signature != config_signature
-            or resume_checkpoint.prior_design_signature != prior_design_signature
             or bool(resume_checkpoint.validation_enabled) != bool(validation_payload is not None)
-        ):
-            log("  variational EM: checkpoint incompatible with current fit inputs; starting from scratch")
+        )
+        prior_design_changed = resume_checkpoint.prior_design_signature != prior_design_signature
+        reconciliation: tuple[VariationalFitCheckpoint, dict[str, int]] | None = None
+        discard_reason: str | None = None
+        if config_or_validation_changed:
+            discard_reason = "checkpoint incompatible with current fit inputs"
+        elif prior_design_changed:
+            reconciliation = _reconcile_checkpoint_categories(resume_checkpoint, prior_design, config)
+            if reconciliation is None:
+                discard_reason = (
+                    "variant categories changed and the checkpoint predates "
+                    "category-aware warm starts"
+                )
+        if discard_reason is not None:
+            log(f"  variational EM: {discard_reason}; starting from scratch")
             resume_checkpoint = None
             _initialize_em_state()
         else:
+            if reconciliation is not None:
+                resume_checkpoint, _category_tally = reconciliation
+                log(
+                    "  variational EM: variant categories changed; reconciled warm start "
+                    f"(kept {_category_tally['kept']}, added {_category_tally['added']}, "
+                    f"dropped {_category_tally['dropped']})"
+                )
             if resume_checkpoint.alpha_state.shape != (covariate_matrix.shape[1],):
                 raise ValueError("resume checkpoint alpha_state shape does not match covariates.")
             if resume_checkpoint.beta_state.shape != (genotype_matrix.shape[1],):

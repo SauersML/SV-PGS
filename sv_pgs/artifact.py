@@ -4,11 +4,23 @@ import json
 import logging
 import os
 import uuid
+import zipfile
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
 
 import numpy as np
+
+# A truncated/half-written arrays.npz raises zipfile.BadZipFile, which is NOT an
+# OSError/ValueError subclass; without it a corrupt artifact crashes the reuse
+# check instead of degrading to a clean refit. (json.JSONDecodeError IS a
+# ValueError subclass, so a corrupt metadata.json is already covered.)
+_ARTIFACT_CORRUPTION_ERRORS: tuple[type[BaseException], ...] = (
+    OSError,
+    ValueError,
+    KeyError,
+    zipfile.BadZipFile,
+)
 
 
 def _fsync_parent_dir(path: Path) -> None:
@@ -325,7 +337,7 @@ def try_load_artifact_if_fingerprint_matches(
         return None
     try:
         artifact = load_artifact(root)
-    except (OSError, ValueError, KeyError):
+    except _ARTIFACT_CORRUPTION_ERRORS:
         return None
     if not artifact.fit_fingerprint or artifact.fit_fingerprint != expected_fingerprint:
         return None

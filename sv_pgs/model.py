@@ -8,6 +8,7 @@ import pickle
 import struct
 import time
 import uuid
+import zipfile
 from typing import TYPE_CHECKING
 from dataclasses import dataclass
 from pathlib import Path
@@ -176,6 +177,22 @@ _FIT_STAGE_CACHE_DIRNAME = ".sv_pgs_cache"
 _FIT_STAGE_CACHE_SUBDIR = "fit_stage"
 _FIT_STAGE_CACHE_VERSION = 5
 _FIT_CHECKPOINT_VERSION = 1
+
+# Exceptions that mean "this cache file is corrupt / truncated / half-written"
+# (e.g. a crash mid-save, an interrupted np.savez, a partial pickle). Every
+# cache READ must treat these as a clean miss — rebuild rather than crash a
+# multi-hour run. zipfile.BadZipFile (raised by np.load on a truncated .npz)
+# and pickle.UnpicklingError are NOT subclasses of OSError/ValueError, so they
+# must be named explicitly or a corrupt cache aborts the whole job.
+_CACHE_CORRUPTION_ERRORS: tuple[type[BaseException], ...] = (
+    OSError,
+    ValueError,
+    EOFError,
+    KeyError,
+    AttributeError,
+    zipfile.BadZipFile,
+    pickle.UnpicklingError,
+)
 # Strict-mode guard for binary TR-Newton fits that would otherwise fall back to
 # the mmap-streaming path when no GPU/RAM/local int8 cache is available. Default
 # is False because the PG-IRLS solver handles the streaming path safely and
@@ -485,7 +502,7 @@ def _try_load_fit_stage_variant_stats_cache(
             allele_frequencies=allele_frequencies,
             support_counts=support_counts,
         )
-    except (OSError, ValueError, EOFError, KeyError) as exc:
+    except _CACHE_CORRUPTION_ERRORS as exc:
         log(f"fit-stage variant stats cache load failed ({exc}); recomputing cohort stats")
         cache_path.unlink(missing_ok=True)
         return None
@@ -594,7 +611,7 @@ def _try_restore_sample_space_basis_cache(
             + f"(rank={basis_array.shape[1]})"
         )
         return True
-    except (OSError, ValueError, EOFError) as exc:
+    except _CACHE_CORRUPTION_ERRORS as exc:
         log(f"sample-space basis cache load failed ({exc}); rebuilding")
         basis_path.unlink(missing_ok=True)
         return False
@@ -705,7 +722,7 @@ def _try_load_fit_stage_cache(
             "(reduced int8 cache missing; will build before GPU materialization)"
         )
         return active_variant_indices, reduced_tie_map, standardized_genotypes.subset(combined_indices), False
-    except (OSError, ValueError, EOFError, KeyError) as exc:
+    except _CACHE_CORRUPTION_ERRORS as exc:
         log(f"fit-stage cache load failed ({exc}), rebuilding")
         _invalidate_fit_stage_cache(cache_paths)
         return None
@@ -775,7 +792,7 @@ def _try_load_ld_block_partition_cache(
             population=population,
             build=build,
         )
-    except (OSError, ValueError, EOFError, KeyError) as exc:
+    except _CACHE_CORRUPTION_ERRORS as exc:
         log(f"ld-block partition cache load failed ({exc}); rebuilding")
         try:
             cache_paths.ld_block_partition_path.unlink(missing_ok=True)
@@ -1668,7 +1685,7 @@ def _try_load_marginal_z_cache(
         return None
     try:
         z = np.load(path, mmap_mode=None)
-    except (OSError, ValueError) as exc:
+    except _CACHE_CORRUPTION_ERRORS as exc:
         log(f"  marginal-z cache: load failed ({exc}), recomputing")
         try:
             path.unlink(missing_ok=True)
@@ -1759,7 +1776,7 @@ def _try_load_marginal_chunks(
             continue
         try:
             data = np.load(chunk_file)
-        except (OSError, ValueError):
+        except _CACHE_CORRUPTION_ERRORS:
             try:
                 chunk_file.unlink(missing_ok=True)
             except OSError:
@@ -1923,7 +1940,7 @@ def _try_load_variational_checkpoint(
             + f"(completed_iterations={checkpoint.completed_iterations})"
         )
         return checkpoint
-    except (OSError, pickle.UnpicklingError, ValueError, EOFError, AttributeError) as exc:
+    except _CACHE_CORRUPTION_ERRORS as exc:
         log(f"variational checkpoint load failed ({exc}); discarding stale checkpoint")
         _clear_variational_checkpoint(cache_paths)
         return None
@@ -2134,7 +2151,7 @@ def _try_load_fit_checkpoint(
             + f"{checkpoint_path} (completed_iterations={checkpoint.completed_iterations})"
         )
         return checkpoint
-    except (OSError, pickle.UnpicklingError, ValueError, EOFError, AttributeError, KeyError) as exc:
+    except _CACHE_CORRUPTION_ERRORS as exc:
         log(f"fit checkpoint load failed ({exc}); discarding stale checkpoint")
         try:
             checkpoint_path.unlink(missing_ok=True)
