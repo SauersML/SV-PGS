@@ -1004,6 +1004,7 @@ def _compute_marginal_z_scores_concat(
     active_variant_indices: NDArray,
     covariate_matrix: NDArray,
     target_vector: NDArray,
+    marginal_chunk_dir: Path | None = None,
 ) -> F32Array | None:
     """Per-child marginal-z fast path for ``ConcatenatedRawGenotypeMatrix``.
 
@@ -1212,6 +1213,28 @@ def _compute_marginal_z_scores_concat(
     # across every child kind.
     sum_xy = np.zeros(m_active, dtype=np.float64)
     proj_diag = np.zeros(m_active, dtype=np.float64)
+    # Optional per-chunk resume for the expensive PLINK child. A crash/OOM
+    # mid-screen otherwise re-streams the entire BED from the top on the next
+    # run; with a chunk dir we skip PLINK chunks a prior run already persisted.
+    # The chunk cache stores FINAL z-scores keyed by global active position —
+    # the same format/keying the chunked slow path uses, so the two are
+    # interoperable. The in-RAM int8/bitpacked children are cheap to recompute
+    # and are deliberately not checkpointed.
+    resume_z = np.zeros(m_active, dtype=np.float64)
+    resume_completed = np.zeros(m_active, dtype=bool)
+    if marginal_chunk_dir is not None:
+        try:
+            _loaded_z, _loaded_done = _try_load_marginal_chunks(marginal_chunk_dir, m_active)
+            resume_z[:] = _loaded_z
+            resume_completed[:] = _loaded_done
+            if bool(_loaded_done.any()):
+                log(
+                    "  marginal-z concat: resuming from chunk cache "
+                    f"({int(_loaded_done.sum()):,}/{m_active:,} positions already persisted)"
+                )
+        except Exception as _resume_exc:  # noqa: BLE001 - resume is best-effort
+            log(f"  marginal-z concat: chunk-resume load failed ({_resume_exc!r}); recomputing")
+            resume_completed[:] = False
     rhs_dev = cp.asarray(marginal_rhs, dtype=cp.float32)
     variant_offsets = raw_matrix._variant_offsets  # noqa: SLF001 — internal layout
     t_start = time.monotonic()
@@ -1359,6 +1382,17 @@ def _compute_marginal_z_scores_concat(
                 # means/scales/output positions.
                 for c_start in range(0, k_in_child, chunk_k):
                     c_stop = min(c_start + chunk_k, k_in_child)
+                    chunk_output_positions = output_positions[c_start:c_stop]
+                    # Per-chunk resume: if a prior run already persisted this
+                    # PLINK chunk's z-scores, skip the BED read+decode entirely.
+                    # The merge after the loop restores the persisted values;
+                    # leaving sum_xy/proj_diag at 0 here is harmless.
+                    if (
+                        marginal_chunk_dir is not None
+                        and chunk_output_positions.shape[0] > 0
+                        and resume_completed[chunk_output_positions].all()
+                    ):
+                        continue
                     reader = leaf._bed_reader()  # noqa: SLF001 — short-lived chunk reader
                     try:
                         int8_chunk = leaf._read_batch_i8(  # noqa: SLF001
@@ -1380,7 +1414,6 @@ def _compute_marginal_z_scores_concat(
                         scales_subset[c_start:c_stop],
                         rhs_dev,
                     )
-                    chunk_output_positions = output_positions[c_start:c_stop]
                     sum_xy[chunk_output_positions] = chunk_contrib[:, 0]
                     if p_cov > 0:
                         proj_diag[chunk_output_positions] = covariate_projection_diag(
@@ -1389,6 +1422,26 @@ def _compute_marginal_z_scores_concat(
                     del chunk_contrib
                     del int8_chunk
                     _release_host_caches(cp)
+                    # Persist this chunk's final z-scores so a crash/OOM later in
+                    # the screen doesn't re-stream the BED from the top on rerun.
+                    # A child's output_positions is contiguous (sorted active
+                    # indices ∩ a contiguous child column range), so the slice
+                    # maps to a single [a:b) key compatible with the slow path's
+                    # chunk files; the guard below re-checks that invariant and
+                    # silently skips persistence (never corrupts) if it ever fails.
+                    if marginal_chunk_dir is not None and chunk_output_positions.shape[0] > 0:
+                        a = int(chunk_output_positions[0])
+                        b = int(chunk_output_positions[-1]) + 1
+                        if b - a == chunk_output_positions.shape[0]:
+                            z_chunk = np.asarray(
+                                marginal_z_from_numerator(
+                                    sum_xy[a:b], proj_diag[a:b], n, sigma2_resid
+                                ),
+                                dtype=np.float32,
+                            )
+                            resume_z[a:b] = z_chunk
+                            resume_completed[a:b] = True
+                            _save_marginal_chunk(marginal_chunk_dir, a, b, z_chunk)
                 log(
                     f"  marginal-z concat: child {child_idx + 1}/{len(raw_matrix.children)} "
                     f"({kind}, k={k_in_child:,}) in {time.monotonic() - t_child:.1f}s"
@@ -1422,7 +1475,17 @@ def _compute_marginal_z_scores_concat(
         f"marginal-z concat fast path: total per-child wall = "
         f"{time.monotonic() - t_start:.1f}s, k_active={m_active:,}"
     )
-    return marginal_z_from_numerator(sum_xy, proj_diag, n, sigma2_resid)
+    z_final = marginal_z_from_numerator(sum_xy, proj_diag, n, sigma2_resid)
+    if marginal_chunk_dir is not None and bool(resume_completed.any()):
+        # PLINK positions covered by a persisted chunk take their value from
+        # resume_z: for chunks computed this run the override is an exact no-op
+        # (resume_z holds the identical z); for chunks skipped on resume it
+        # restores the prior run's z (sum_xy/proj_diag were left at 0 there).
+        z_final = np.array(z_final, copy=True)
+        z_final[resume_completed] = np.asarray(
+            resume_z[resume_completed], dtype=z_final.dtype
+        )
+    return z_final
 
 
 def _resolve_indexed_selected_columns(raw: Any) -> NDArray | None:
@@ -2357,6 +2420,11 @@ class BayesianPGS:
                             active_variant_indices=active_variant_indices,
                             covariate_matrix=prepared_arrays.covariates,
                             target_vector=prepared_arrays.targets,
+                            marginal_chunk_dir=(
+                                None
+                                if fit_stage_cache_paths is None
+                                else _marginal_chunk_dir(fit_stage_cache_paths)
+                            ),
                         )
                         if marginal_z_scores is not None:
                             log(

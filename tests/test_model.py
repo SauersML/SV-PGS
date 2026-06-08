@@ -197,6 +197,127 @@ def test_concat_marginal_z_plink_streams_chunks_without_child_contrib_buffer(
     ]
 
 
+def test_concat_marginal_z_checkpoints_and_resumes_plink_chunks(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The PLINK child's per-chunk z-scores are persisted, and a rerun with the
+    same chunk dir skips the BED reads it already completed — returning an
+    identical result. This is the mid-screen crash-resume path: a job that dies
+    partway through the marginal screen no longer re-streams the whole BED."""
+    fake_cupy = make_fake_cupy()
+    monkeypatch.setitem(sys.modules, "cupy", fake_cupy)
+    monkeypatch.setattr(model_module, "_marginal_int8_chunk_size", lambda **kwargs: 2)
+
+    genotype_i8 = np.array(
+        [
+            [0, 1, 2, 0, 1],
+            [1, 2, 0, 1, 2],
+            [2, 0, 1, 2, 0],
+            [0, 1, 2, 0, 1],
+            [1, 2, 0, 1, 2],
+            [2, 0, 1, 2, 0],
+        ],
+        dtype=np.int8,
+    )
+    means = genotype_i8.astype(np.float64).mean(axis=0).astype(np.float32)
+    scales = genotype_i8.astype(np.float64).std(axis=0, ddof=0).astype(np.float32)
+    raw = genotype_module.PlinkRawGenotypeMatrix(
+        bed_path=Path("synthetic.bed"),
+        sample_indices=np.arange(genotype_i8.shape[0], dtype=np.intp),
+        variant_count=genotype_i8.shape[1],
+        total_sample_count=genotype_i8.shape[0],
+    )
+    concat = genotype_module.ConcatenatedRawGenotypeMatrix(children=(raw,))
+    standardized = genotype_module.StandardizedGenotypeMatrix(
+        raw=concat,
+        means=means,
+        scales=scales,
+        variant_indices=np.arange(genotype_i8.shape[1], dtype=np.int32),
+        support_counts=np.full(genotype_i8.shape[1], genotype_i8.shape[0], dtype=np.int32),
+        sample_count=genotype_i8.shape[0],
+        _enable_hybrid_backend=False,
+    )
+
+    read_batches: list[list[int]] = []
+
+    class FakeReader:
+        def __init__(self) -> None:
+            self.closed = False
+
+        def close(self) -> None:
+            self.closed = True
+
+    def fake_bed_reader(self: genotype_module.PlinkRawGenotypeMatrix) -> FakeReader:
+        reader = FakeReader()
+        self._reader = reader
+        return reader
+
+    def fake_read_batch_i8(
+        self: genotype_module.PlinkRawGenotypeMatrix,
+        reader: FakeReader,
+        batch_indices: np.ndarray,
+        *,
+        num_threads: int | None = None,
+    ) -> np.ndarray:
+        assert not reader.closed
+        resolved = np.asarray(batch_indices, dtype=np.int64)
+        read_batches.append(resolved.tolist())
+        return np.asfortranarray(genotype_i8[:, resolved])
+
+    monkeypatch.setattr(genotype_module.PlinkRawGenotypeMatrix, "_bed_reader", fake_bed_reader)
+    monkeypatch.setattr(genotype_module.PlinkRawGenotypeMatrix, "_read_batch_i8", fake_read_batch_i8)
+    monkeypatch.setattr(model_module, "_release_host_caches", lambda *args, **kwargs: None)
+
+    target = np.array([0.25, 1.0, -0.5, 0.75, -1.25, 0.5], dtype=np.float64)
+    active = np.arange(genotype_i8.shape[1], dtype=np.int32)
+    covariates = np.zeros((genotype_i8.shape[0], 0), dtype=np.float64)
+    chunk_dir = tmp_path / "mz_chunks"
+
+    y_resid = target - target.mean()
+    sigma2_resid = float(np.dot(y_resid, y_resid) / genotype_i8.shape[0])
+    standardized_host = (genotype_i8.astype(np.float64) - means[None, :]) / scales[None, :]
+    expected = (
+        (standardized_host.T @ y_resid) / np.sqrt(sigma2_resid * genotype_i8.shape[0])
+    ).astype(np.float32)
+
+    def run() -> np.ndarray | None:
+        return model_module._compute_marginal_z_scores_concat(
+            standardized_genotypes=standardized,
+            active_variant_indices=active,
+            covariate_matrix=covariates,
+            target_vector=target,
+            marginal_chunk_dir=chunk_dir,
+        )
+
+    # First pass: every chunk computed + persisted; result matches the reference.
+    first = run()
+    assert first is not None
+    np.testing.assert_allclose(first, expected, rtol=1e-5, atol=1e-6)
+    assert read_batches == [[0, 1], [2, 3], [4]]
+    persisted = sorted(p.name for p in chunk_dir.glob("chunk_*.npy"))
+    assert persisted == [
+        "chunk_000000000_000000002.npy",
+        "chunk_000000002_000000004.npy",
+        "chunk_000000004_000000005.npy",
+    ]
+
+    # Second pass, same chunk dir: every PLINK chunk is already persisted, so NO
+    # BED reads happen and the result is byte-identical.
+    read_batches.clear()
+    second = run()
+    assert second is not None
+    assert read_batches == []  # full resume — no BED re-reads
+    np.testing.assert_allclose(second, expected, rtol=1e-5, atol=1e-6)
+
+    # Partial resume: drop the middle chunk; only that chunk is re-read.
+    (chunk_dir / "chunk_000000002_000000004.npy").unlink()
+    read_batches.clear()
+    third = run()
+    assert third is not None
+    assert read_batches == [[2, 3]]  # only the missing chunk re-read
+    np.testing.assert_allclose(third, expected, rtol=1e-5, atol=1e-6)
+
+
 class ShapeOnlyRawGenotypeMatrix(RawGenotypeMatrix):
     def __init__(self, sample_count: int, variant_count: int) -> None:
         self._shape = (int(sample_count), int(variant_count))
