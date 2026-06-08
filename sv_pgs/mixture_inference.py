@@ -10145,8 +10145,10 @@ def _solve_restricted_exact_variant_space(
             )
         _cholesky_t0 = _timed_region_start(cp)
         # Promote to fp64 for the factorization regardless of the GEMM
-        # compute_dtype. At p=8192 the matrix is only ~256 MB in fp64 (fits
-        # HBM trivially). The fp32 GEMM that built variant_precision_gpu
+        # compute_dtype. At p=8192 the fp64 matrix is 512 MB, and the
+        # promotion + symmetrization + factor need several such buffers live
+        # at once — budget for that, not just one copy. The fp32 GEMM that
+        # built variant_precision_gpu
         # can produce up to 12-orders-of-magnitude dynamic range when
         # IRLS weights are near the minimum_weight floor; factorizing
         # that in fp32 with cp.linalg.cholesky is what produced the
@@ -10161,8 +10163,27 @@ def _solve_restricted_exact_variant_space(
         # that in fp32 silently NaN-fills via cp.linalg.cholesky.
         _exact_variant_factor_dtype = factor_dtype("variant_precision_full")
         precision_for_factor = variant_precision_gpu.astype(_exact_variant_factor_dtype, copy=True)
-        precision_for_factor = 0.5 * (precision_for_factor + precision_for_factor.T)
+        # Release the fp32 Gram immediately: the fp64 promotion, the
+        # symmetrization transient, and the Cholesky factor are each p²·8B and
+        # must not have to coexist with the p²·4B fp32 Gram. On a 16 GB V100
+        # already holding the resident int8 training cache, that coexistence is
+        # what tips the first working-set solve into OutOfMemoryError.
+        variant_precision_gpu = None
+        # Symmetrize in place against a single transient transpose copy. The
+        # `.T` view aliases the same buffer, so `pf += pf.T` would be a
+        # read/write hazard; copying the transpose, adding in place, then
+        # scaling in place keeps the peak at two fp64 buffers instead of three.
+        _pf_transpose = precision_for_factor.T.copy()
+        precision_for_factor += _pf_transpose
+        _pf_transpose = None
+        precision_for_factor *= 0.5
         rhs_for_solve = variant_rhs_gpu.astype(_exact_variant_factor_dtype, copy=True)
+        # Return the now-unreferenced fp32 Gram and symmetrization transient to
+        # the device before the Cholesky factor allocates its own p²·8B buffer.
+        try:
+            cp.get_default_memory_pool().free_all_blocks()
+        except Exception:
+            pass
         log(
             f"    Cholesky factorization ({variant_count}×{variant_count} fp64"
             + (" promoted from fp32 GEMM" if is_mixed_precision else "")
@@ -10171,7 +10192,41 @@ def _solve_restricted_exact_variant_space(
         # Ridge ladder for the ill-conditioned-but-finite case. NaN/Inf in
         # the input is caught by the pre-flight check above and can't be
         # rescued by adding to the diagonal (NaN + finite = NaN).
-        variant_precision_cholesky_gpu = cp.linalg.cholesky(precision_for_factor)
+        try:
+            variant_precision_cholesky_gpu = cp.linalg.cholesky(precision_for_factor)
+        except cp.cuda.memory.OutOfMemoryError:
+            # The factor needs one more p²·8B buffer than the symmetrized
+            # input already resident. Defragment the pool and retry once; if it
+            # still cannot fit, raise an actionable error rather than letting a
+            # raw OutOfMemoryError abort the whole disease run. The caller can
+            # shrink `posterior_working_set_initial_size`/`_growth` (each step
+            # is variant_count²·8B in fp64) or free HBM (e.g. keep holdout
+            # validation host-resident) to make room.
+            try:
+                cp.get_default_memory_pool().free_all_blocks()
+            except Exception:
+                pass
+            try:
+                variant_precision_cholesky_gpu = cp.linalg.cholesky(precision_for_factor)
+            except cp.cuda.memory.OutOfMemoryError as exc:
+                free_b, total_b = (None, None)
+                try:
+                    free_b, total_b = cp.cuda.runtime.memGetInfo()
+                except Exception:
+                    pass
+                budget = (
+                    f" GPU free/total={free_b / 1e9:.2f}/{total_b / 1e9:.2f} GB."
+                    if free_b is not None
+                    else ""
+                )
+                raise RuntimeError(
+                    "Out of GPU memory building the exact variant-space Cholesky "
+                    f"factor for a {variant_count}×{variant_count} fp64 working set "
+                    f"(~{variant_count * variant_count * 8 / 1e9:.2f} GB per buffer)."
+                    + budget
+                    + " Reduce posterior_working_set_initial_size/_growth or free "
+                    "HBM (hold validation host-resident) and retry."
+                ) from exc
         _diag_index_f64 = cp.asarray(diagonal_index)
         for _ridge_bump, _ridge_label in (
             (1e-8, "1e-8"),

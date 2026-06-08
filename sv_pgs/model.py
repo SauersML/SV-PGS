@@ -2780,17 +2780,28 @@ class BayesianPGS:
                 )
                 if materialize_validation and allow_validation_full_cache:
                     log(f"materializing validation genotype matrix ({validation_genotype_matrix.shape})...")
-                    # Try the same post-active bitpacked upgrade as training.
-                    # Validation is 79k × 91k = ~1.8 GB packed on device, fits
-                    # alongside the training matrix in HBM. Caches separately
-                    # (different sample_indices => different content_hash) so
-                    # subsequent runs on the same disease hit a cache.
-                    _val_bitpacked = _try_upgrade_reduced_to_bitpacked(
-                        reduced_genotypes=validation_genotype_matrix,
-                        combined_indices=np.asarray(
-                            validation_genotype_matrix.variant_indices, dtype=np.int64
-                        ),
-                        prepared_arrays=prepared_arrays,
+                    # Holdout-only validation is monitoring (training_history
+                    # rows / early signal), never model selection, so it must
+                    # NOT compete with the training solver for HBM. On a 16 GB
+                    # V100 the resident training int8 cache (~11 GB) plus a
+                    # GPU-resident validation cache (~3 GB) leaves no room for
+                    # the exact working-set Cholesky scratch (fp32 Gram + fp64
+                    # promotion + factor), which is exactly the first-iteration
+                    # OutOfMemoryError. Keep holdout validation host-resident;
+                    # per-epoch eval streams it block-wise from RAM cheaply.
+                    # When validation feeds selection (not holdout-only) keep
+                    # the fast device-resident path.
+                    prefer_gpu_validation = not validation_is_holdout_only
+                    _val_bitpacked = (
+                        _try_upgrade_reduced_to_bitpacked(
+                            reduced_genotypes=validation_genotype_matrix,
+                            combined_indices=np.asarray(
+                                validation_genotype_matrix.variant_indices, dtype=np.int64
+                            ),
+                            prepared_arrays=prepared_arrays,
+                        )
+                        if prefer_gpu_validation
+                        else None
                     )
                     if _val_bitpacked is not None:
                         validation_genotype_matrix = _val_bitpacked
@@ -2803,13 +2814,19 @@ class BayesianPGS:
                         validation_in_memory = True
                         log(f"  validation bitpacked upgrade ENGAGED  mem={mem()}")
                     else:
-                        validation_in_memory = validation_genotype_matrix.try_materialize_gpu()
-                        if validation_in_memory:
-                            log(f"  validation GPU materialization succeeded  mem={mem()}")
+                        validation_in_memory = False
+                        if prefer_gpu_validation:
+                            validation_in_memory = validation_genotype_matrix.try_materialize_gpu()
+                            if validation_in_memory:
+                                log(f"  validation GPU materialization succeeded  mem={mem()}")
                         if not validation_in_memory:
                             validation_in_memory = validation_genotype_matrix.try_materialize()
                             if validation_in_memory:
-                                log(f"  validation RAM materialization succeeded  mem={mem()}")
+                                log(
+                                    "  validation RAM materialization succeeded "
+                                    "(host-resident; held out of HBM so the training "
+                                    f"solver keeps its budget)  mem={mem()}"
+                                )
                     if validation_in_memory:
                         # Bitpacked-backed validation keeps its raw (the device
                         # BitpackedDeviceMatrix IS the storage); release_raw_storage
