@@ -2877,24 +2877,36 @@ class BayesianPGS:
         # matrix=BitpackedDeviceMatrix".
         # ------------------------------------------------------------------
         try:
-            _raw_for_banner = getattr(reduced_genotypes, "raw", None) or reduced_genotypes
-            _matrix_type = type(_raw_for_banner).__name__
+            # ``release_raw_storage`` sets ``reduced_genotypes.raw = None`` once
+            # the SGM holds its own device (``_cupy_cache``) or host
+            # (``_dense_cache``) int8 cache — the GPU-resident-int8 path the AoU
+            # mixed-source run takes. Inspect those caches FIRST so an
+            # HBM-resident matrix is reported as such instead of falling through
+            # to the SGM type and being mislabeled "streaming" (which is exactly
+            # the banner that made a GPU-resident run look stuck on I/O). Only
+            # consult ``raw`` for its concrete type when it is still present
+            # (bitpacked, or a not-yet-released int8/streaming matrix).
+            _raw_for_banner = getattr(reduced_genotypes, "raw", None)
+            _sgm_cupy = getattr(reduced_genotypes, "_cupy_cache", None)
+            _sgm_dense = getattr(reduced_genotypes, "_dense_cache", None)
+            _inspect = _raw_for_banner if _raw_for_banner is not None else reduced_genotypes
+            _matrix_type = type(_inspect).__name__
             _backing = "unknown"
             _resident = ""
             if _matrix_type == "BitpackedDeviceMatrix":
                 _backing = "cupy"
-                _packed = getattr(_raw_for_banner, "_packed", None)
-                _mean = getattr(_raw_for_banner, "_mean", None)
-                _std = getattr(_raw_for_banner, "_std", None)
+                _packed = getattr(_inspect, "_packed", None)
+                _mean = getattr(_inspect, "_mean", None)
+                _std = getattr(_inspect, "_std", None)
                 if _packed is not None and _mean is not None and _std is not None:
                     _hbm_gb = (int(_packed.nbytes) + int(_mean.nbytes) + int(_std.nbytes)) / 1e9
                     _resident = f"  HBM={_hbm_gb:.2f} GB resident"
             elif _matrix_type == "Int8RawGenotypeMatrix":
-                if getattr(_raw_for_banner, "_cupy_cache", None) is not None:
+                if getattr(_inspect, "_cupy_cache", None) is not None:
                     _backing = "cupy"
                     _resident = "  int8 HBM resident"
                 else:
-                    _matrix_obj = getattr(_raw_for_banner, "matrix", None)
+                    _matrix_obj = getattr(_inspect, "matrix", None)
                     if _matrix_obj is not None and hasattr(_matrix_obj, "nbytes"):
                         _host_gb = int(_matrix_obj.nbytes) / 1e9
                         _backing = "numpy"
@@ -2902,6 +2914,21 @@ class BayesianPGS:
                     else:
                         _backing = "streaming"
                         _resident = "  streaming via PLINK reader"
+            elif _sgm_cupy is not None:
+                # raw released; the SGM's own int8 cache lives in HBM.
+                _backing = "cupy"
+                _resident = "  int8 HBM resident"
+                try:
+                    from sv_pgs.genotype import _cupy_cache_nbytes as _ccn
+                    _resident = f"  int8 HBM resident ({_ccn(_sgm_cupy) / 1e9:.2f} GB)"
+                except Exception:  # noqa: BLE001 - size annotation is best-effort
+                    pass
+            elif _sgm_dense is not None:
+                # raw released; the SGM's own int8 cache lives in host RAM.
+                _backing = "numpy"
+                _resident = "  int8 host resident"
+                if hasattr(_sgm_dense, "nbytes"):
+                    _resident = f"  int8 host resident ({int(_sgm_dense.nbytes) / 1e9:.2f} GB)"
             else:
                 _backing = "streaming"
             log(
@@ -2909,13 +2936,7 @@ class BayesianPGS:
                 f"shape=({reduced_genotypes.shape[0]}, {reduced_genotypes.shape[1]})  "
                 f"backing={_backing}{_resident}"
             )
-            if _matrix_type != "BitpackedDeviceMatrix":
-                log(
-                    "model fit hot loop: bitpacked path NOT engaged "
-                    f"(reduced matrix is {_matrix_type}). "
-                    "Iter_column_batches will be the dominant cost."
-                )
-            else:
+            if _matrix_type == "BitpackedDeviceMatrix":
                 # When the bitpacked path engages, opt the per-iteration
                 # profiler into cupy deviceSynchronize() so the recorded
                 # timings reflect actual kernel runtime rather than just
@@ -2925,6 +2946,23 @@ class BayesianPGS:
                     _enable_sync(True)
                 except ImportError:  # pragma: no cover - module always present
                     pass
+            elif _backing == "cupy":
+                log(
+                    "model fit hot loop: bitpacked path not engaged, but the reduced "
+                    "matrix is GPU-resident int8 (standardize-on-the-fly kernel runs in "
+                    "HBM) — NOT streaming; iter_column_batches is not on the hot path."
+                )
+            elif _backing == "numpy":
+                log(
+                    "model fit hot loop: reduced matrix is host-resident int8; block "
+                    "worksets upload from RAM (no per-iteration PLINK re-reads)."
+                )
+            else:
+                log(
+                    "model fit hot loop: bitpacked path NOT engaged and the reduced "
+                    f"matrix is streaming ({_matrix_type}). iter_column_batches will be "
+                    "the dominant cost."
+                )
         except Exception as _banner_exc:  # noqa: BLE001 - banner is best-effort
             log(f"model fit hot loop: banner failed: {_banner_exc!r}")
         em_validation_data = reduced_validation
