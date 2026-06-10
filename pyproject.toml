@@ -6,6 +6,8 @@ build-backend = "setuptools.build_meta"
 name = "sv-pgs"
 version = "0.1.0"
 description = "Multi-GPU joint empirical-Bayes GLM for polygenic scoring with structural variants"
+license = "AGPL-3.0-or-later"
+license-files = ["LICENSE"]
 requires-python = ">=3.10"
 dependencies = [
     "jax>=0.4.20,<0.5",
