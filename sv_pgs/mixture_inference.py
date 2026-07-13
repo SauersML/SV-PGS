@@ -72,6 +72,7 @@ from jax.scipy.linalg import solve_triangular as jax_solve_triangular
 from jax.scipy.special import digamma as jax_digamma
 from jax.scipy.special import gammaln as jax_gammaln
 from scipy.linalg import solve_triangular
+from scipy.linalg.blas import dsyrk
 from scipy.optimize import minimize
 from scipy.special import kve as scipy_bessel_kve
 
@@ -767,6 +768,7 @@ class _RestrictedPosteriorWarmStart:
     exact_variant_full_matrix_token: int | None = None
     exact_variant_full_matrix_shape: tuple[int, int] | None = None
     exact_variant_full_matrix_dtype: Any = None
+    exact_variant_full_matrix_cpu: NDArray | None = None
     exact_variant_full_matrix_gpu: Any = None
 
 
@@ -2025,7 +2027,7 @@ def fit_variational_em(
     genetic_linear_predictor: NDArray | None = None
     best_genetic_linear_predictor: NDArray | None = None
     restricted_posterior_warm_start = _RestrictedPosteriorWarmStart()
-    # Keep the exact-variant full GPU matrix cache enabled for the entire
+    # Keep the exact-variant full matrix cache enabled for the entire
     # outer EM loop so it can be reused across blocks and across iterations
     # whenever the genotype matrix object identity matches. The cache is
     # token-keyed on id(genotype_matrix), so it self-invalidates for block
@@ -3590,7 +3592,7 @@ def fit_variational_em(
                         ),
                         reduced_prior_variances=candidate_reduced_prior_variances,
                         sigma_error2=float(sigma_error2),
-                        predictor_variance=None,
+                        predictor_variance=_cavi_predictor_variance,
                         local_scale_prior_objective=_local_scale_prior_objective(
                             local_scale=updated_local_scale,
                             auxiliary_delta=updated_auxiliary_delta,
@@ -3934,7 +3936,7 @@ def fit_variational_em(
                                     ),
                                     reduced_prior_variances=_candidate_reduced_prior_variances,
                                     sigma_error2=float(sigma_error2),
-                                    predictor_variance=None,
+                                    predictor_variance=_cavi_predictor_variance,
                                     local_scale_prior_objective=_local_scale_prior_objective(
                                         local_scale=local_scale,
                                         auxiliary_delta=_candidate_auxiliary_delta,
@@ -4113,6 +4115,7 @@ def fit_variational_em(
         compute_beta_variance=bool(config.final_posterior_diagnostics),
         predictor_offset=predictor_offset_array,
         prior_precision_override=final_prior_precision_override,
+        restricted_posterior_warm_start=restricted_posterior_warm_start,
     )
     if config.trait_type == TraitType.BINARY:
         final_state = _apply_binary_intercept_calibration(
@@ -4138,7 +4141,7 @@ def fit_variational_em(
     if restricted_posterior_warm_start is not None:
         if restricted_posterior_warm_start.sample_space_background_gpu_preconditioner is not None:
             restricted_posterior_warm_start.sample_space_background_gpu_preconditioner.clear_gpu_arrays()
-        restricted_posterior_warm_start.exact_variant_full_matrix_gpu = None
+        _clear_exact_variant_full_matrix_cache(restricted_posterior_warm_start)
         restricted_posterior_warm_start.weighted_covariate_projection_gpu = None
     # Drop cached Nyström bases and probe projections held directly on the
     # genotype matrix; ``clear_gpu_arrays`` above only clears the warm-start
@@ -8425,14 +8428,55 @@ def _weighted_covariate_projection_signature(
     return hasher.hexdigest()
 
 
-def _clear_exact_variant_full_matrix_gpu_cache(warm_start: _RestrictedPosteriorWarmStart | None) -> None:
-    if warm_start is None:
-        return
-    warm_start.exact_variant_full_matrix_cache_enabled = False
+def _invalidate_exact_variant_full_matrix_cache(warm_start: _RestrictedPosteriorWarmStart) -> None:
     warm_start.exact_variant_full_matrix_token = None
     warm_start.exact_variant_full_matrix_shape = None
     warm_start.exact_variant_full_matrix_dtype = None
+    warm_start.exact_variant_full_matrix_cpu = None
     warm_start.exact_variant_full_matrix_gpu = None
+
+
+def _clear_exact_variant_full_matrix_cache(warm_start: _RestrictedPosteriorWarmStart | None) -> None:
+    if warm_start is None:
+        return
+    warm_start.exact_variant_full_matrix_cache_enabled = False
+    _invalidate_exact_variant_full_matrix_cache(warm_start)
+
+
+def _cached_exact_variant_full_matrix_cpu(
+    *,
+    genotype_matrix: StandardizedGenotypeMatrix,
+    warm_start: _RestrictedPosteriorWarmStart | None,
+    batch_size: int,
+    dtype: Any,
+) -> NDArray:
+    matrix_token = id(genotype_matrix)
+    matrix_shape = (int(genotype_matrix.shape[0]), int(genotype_matrix.shape[1]))
+    cache_enabled = warm_start is not None and warm_start.exact_variant_full_matrix_cache_enabled
+    if (
+        cache_enabled
+        and warm_start is not None
+        and warm_start.exact_variant_full_matrix_token == matrix_token
+        and warm_start.exact_variant_full_matrix_shape == matrix_shape
+        and warm_start.exact_variant_full_matrix_dtype == dtype
+        and warm_start.exact_variant_full_matrix_cpu is not None
+    ):
+        return warm_start.exact_variant_full_matrix_cpu
+    if cache_enabled and warm_start is not None and (
+        warm_start.exact_variant_full_matrix_cpu is not None
+        or warm_start.exact_variant_full_matrix_gpu is not None
+    ):
+        _invalidate_exact_variant_full_matrix_cache(warm_start)
+    full_matrix_cpu = np.asarray(
+        genotype_matrix.materialize(batch_size=batch_size),
+        dtype=dtype,
+    )
+    if cache_enabled and warm_start is not None:
+        warm_start.exact_variant_full_matrix_token = matrix_token
+        warm_start.exact_variant_full_matrix_shape = matrix_shape
+        warm_start.exact_variant_full_matrix_dtype = dtype
+        warm_start.exact_variant_full_matrix_cpu = full_matrix_cpu
+    return full_matrix_cpu
 
 
 def _cached_exact_variant_full_matrix_gpu(
@@ -8458,11 +8502,11 @@ def _cached_exact_variant_full_matrix_gpu(
     # the replacement, so we don't double-buffer ~n_samples*block_size*4 bytes
     # of GPU memory during the overlap. On T4 with AoU-sized blocks each
     # full-X is ~8GB, so holding both would OOM.
-    if cache_enabled and warm_start is not None and warm_start.exact_variant_full_matrix_gpu is not None:
-        warm_start.exact_variant_full_matrix_gpu = None
-        warm_start.exact_variant_full_matrix_token = None
-        warm_start.exact_variant_full_matrix_shape = None
-        warm_start.exact_variant_full_matrix_dtype = None
+    if cache_enabled and warm_start is not None and (
+        warm_start.exact_variant_full_matrix_cpu is not None
+        or warm_start.exact_variant_full_matrix_gpu is not None
+    ):
+        _invalidate_exact_variant_full_matrix_cache(warm_start)
     cached_standardized_gpu = _cupy_cache_standardized_columns(
         genotype_matrix._cupy_cache,
         slice(None),
@@ -10335,29 +10379,84 @@ def _solve_restricted_exact_variant_space(
         genetic_linear_predictor = _cupy_array_to_numpy(genetic_linear_predictor_gpu, dtype=np.float64)
         return beta, genetic_linear_predictor, beta_variance, logdet_A
 
-    dense_genotypes = np.asarray(genotype_matrix.materialize(batch_size=posterior_variance_batch_size), dtype=np.float64)
-    projected_genotypes = apply_projector(dense_genotypes)
-    variant_rhs = dense_genotypes.T @ apply_projector(targets)
-    variant_precision_matrix = np.diag(prior_precision) + dense_genotypes.T @ projected_genotypes
-    variant_precision_matrix += np.eye(variant_count, dtype=np.float64) * 1e-8
+    dense_genotypes = _cached_exact_variant_full_matrix_cpu(
+        genotype_matrix=genotype_matrix,
+        warm_start=warm_start,
+        batch_size=posterior_variance_batch_size,
+        dtype=np.float64,
+    )
+    # Form X^T P X through the covariate Schur complement instead of explicitly
+    # materializing P X.  The leading X^T W X term is symmetric, so DSYRK computes
+    # only one triangle; this is substantially faster than a full GEMM on CPU.
+    #
+    #   P = W - W C (C^T W C + ridge I)^-1 C^T W
+    #
+    # The same algebra is already used by the tiled GPU exact path.  Keeping it
+    # here also avoids an n x p projected-genotype allocation on every solve.
+    inverse_noise_f64 = np.asarray(inverse_diagonal_noise, dtype=np.float64)
+    weighted_genotypes = np.empty_like(dense_genotypes, dtype=np.float64, order="F")
+    np.multiply(
+        dense_genotypes,
+        np.sqrt(inverse_noise_f64)[:, None],
+        out=weighted_genotypes,
+    )
+    raw_gram_lower = dsyrk(
+        1.0,
+        weighted_genotypes,
+        trans=1,
+        lower=1,
+        overwrite_c=0,
+    )
+    variant_precision_matrix = np.tril(raw_gram_lower)
+    variant_precision_matrix += np.tril(raw_gram_lower, k=-1).T
+
+    weighted_targets = inverse_noise_f64 * np.asarray(targets, dtype=np.float64)
+    variant_rhs = dense_genotypes.T @ weighted_targets
+    if covariate_matrix.shape[1] > 0:
+        weighted_covariates = inverse_noise_f64[:, None] * covariate_matrix
+        covariate_variant_crossproduct = weighted_covariates.T @ dense_genotypes
+        solved_covariate_variant_crossproduct = _cholesky_solve(
+            covariate_precision_cholesky,
+            covariate_variant_crossproduct,
+        )
+        covariate_correction = (
+            covariate_variant_crossproduct.T
+            @ solved_covariate_variant_crossproduct
+        )
+        # Roundoff in the two triangular solves can make the correction differ
+        # by a few ulps across triangles; explicitly restore symmetry before the
+        # Cholesky factorization.
+        variant_precision_matrix -= 0.5 * (
+            covariate_correction + covariate_correction.T
+        )
+        covariate_target_crossproduct = covariate_matrix.T @ weighted_targets
+        variant_rhs -= covariate_variant_crossproduct.T @ _cholesky_solve(
+            covariate_precision_cholesky,
+            covariate_target_crossproduct,
+        )
+    diagonal_index = np.diag_indices(variant_count)
+    variant_precision_matrix[diagonal_index] += prior_precision + 1e-8
     variant_precision_cholesky = np.linalg.cholesky(variant_precision_matrix)
 
     def solve_variant_rhs(right_hand_side: NDArray) -> NDArray:
         return _cholesky_solve(variant_precision_cholesky, np.asarray(right_hand_side, dtype=np.float64))
 
     beta = np.asarray(solve_variant_rhs(variant_rhs), dtype=np.float64)
-    beta_variance = (
-        np.maximum(np.diag(solve_variant_rhs(np.eye(variant_count, dtype=np.float64))), 1e-8)
-        if compute_beta_variance
-        else np.zeros(variant_count, dtype=np.float64)
-    )
+    if compute_beta_variance:
+        inverse_cholesky = solve_triangular(
+            variant_precision_cholesky,
+            np.eye(variant_count, dtype=np.float64),
+            lower=True,
+            check_finite=False,
+        )
+        beta_variance = np.maximum(
+            np.einsum("ij,ij->j", inverse_cholesky, inverse_cholesky),
+            1e-8,
+        )
+    else:
+        beta_variance = np.zeros(variant_count, dtype=np.float64)
     logdet_A = 2.0 * float(np.sum(np.log(np.diag(variant_precision_cholesky)))) if compute_logdet else 0.0
-    genetic_linear_predictor = _genotype_matvec_result_numpy(
-        genotype_matrix,
-        beta,
-        batch_size=posterior_variance_batch_size,
-        dtype=np.float64,
-    )
+    genetic_linear_predictor = dense_genotypes @ beta
     return beta, genetic_linear_predictor, beta_variance, logdet_A
 
 

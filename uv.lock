@@ -2224,6 +2224,8 @@ dependencies = [
     { name = "psutil" },
     { name = "scikit-learn", version = "1.7.2", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11'" },
     { name = "scikit-learn", version = "1.8.0", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.11'" },
+    { name = "scipy", version = "1.15.3", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11'" },
+    { name = "scipy", version = "1.17.1", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.11'" },
     { name = "tensorflow-probability" },
 ]
 
@@ -2259,6 +2261,7 @@ requires-dist = [
     { name = "psutil", specifier = ">=5.9" },
     { name = "pytest", marker = "extra == 'dev'", specifier = ">=7.4" },
     { name = "scikit-learn", specifier = ">=1.3" },
+    { name = "scipy", specifier = ">=1.15,<2" },
     { name = "tensorflow-probability", specifier = ">=0.25,<0.26" },
 ]
 provides-extras = ["dev", "gpu"]

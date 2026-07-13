@@ -169,7 +169,7 @@ def test_quantitative_inference_runs(random_generator):
     assert result.alpha.shape == (covariate_matrix.shape[1],)
     assert result.objective_history
     assert result.prior_scales.shape[0] == variant_count
-def test_binary_inference_runs(random_generator):
+def test_binary_inference_runs(random_generator, monkeypatch: pytest.MonkeyPatch):
     sample_count, variant_count = 100, 8
     genotype_matrix = random_generator.standard_normal((sample_count, variant_count)).astype(np.float32)
     covariate_matrix = np.ones((sample_count, 1), dtype=np.float32)
@@ -179,6 +179,8 @@ def test_binary_inference_runs(random_generator):
     target_vector = (random_generator.random(sample_count) < 1.0 / (1.0 + np.exp(-linear_predictor))).astype(np.float32)
     records = make_variant_records(variant_count)
     config = ModelConfig(trait_type=TraitType.BINARY, max_outer_iterations=5)
+    messages: list[str] = []
+    monkeypatch.setattr(mixture_inference, "log", messages.append)
     result = fit_variational_em(
         genotypes=genotype_matrix,
         covariates=covariate_matrix,
@@ -191,6 +193,8 @@ def test_binary_inference_runs(random_generator):
     assert result.sigma_error2 == 1.0
     assert len(result.class_tpb_shape_a) == 1
     assert len(result.class_tpb_shape_b) == 1
+    assert np.all(np.isfinite(result.elbo_history))
+    assert not any("ELBO safeguard skipped" in message for message in messages)
 def test_tie_map_is_identity_rejects_collapsed_groups():
     identity_tie_map = TieMap(
         kept_indices=np.array([0, 1], dtype=np.int32),
@@ -4788,6 +4792,139 @@ def test_exact_variant_gpu_summary_path_matches_dense_reference(monkeypatch: pyt
             rtol=1e-5,
             atol=1e-5,
         )
+def test_exact_variant_full_matrix_cpu_cache_reuses_materialization_across_solves(
+    monkeypatch: pytest.MonkeyPatch,
+    random_generator,
+):
+    sample_count, variant_count = 12, 5
+    genotype_values = random_generator.normal(size=(sample_count, variant_count)).astype(np.float32)
+    standardized = as_raw_genotype_matrix(genotype_values).standardized(
+        means=np.zeros(variant_count, dtype=np.float32),
+        scales=np.ones(variant_count, dtype=np.float32),
+    )
+    covariate_matrix = np.column_stack(
+        [np.ones(sample_count), random_generator.normal(size=sample_count)]
+    ).astype(np.float64)
+    targets = random_generator.normal(size=sample_count).astype(np.float64)
+    diagonal_noise = np.ones(sample_count, dtype=np.float64)
+    inverse_diagonal_noise, covariate_precision_cholesky, _, apply_projector = (
+        _restricted_precision_projector(covariate_matrix, diagonal_noise)
+    )
+    warm_start = mixture_inference._RestrictedPosteriorWarmStart()
+    warm_start.exact_variant_full_matrix_cache_enabled = True
+    materialize_calls = 0
+    original_materialize = StandardizedGenotypeMatrix.materialize
+
+    def counted_materialize(self, batch_size):
+        nonlocal materialize_calls
+        materialize_calls += 1
+        return original_materialize(self, batch_size=batch_size)
+
+    monkeypatch.setattr(StandardizedGenotypeMatrix, "materialize", counted_materialize)
+
+    def solve():
+        return mixture_inference._solve_restricted_exact_variant_space(
+            genotype_matrix=standardized,
+            covariate_matrix=covariate_matrix,
+            targets=targets,
+            prior_precision=np.ones(variant_count, dtype=np.float64),
+            inverse_diagonal_noise=inverse_diagonal_noise,
+            covariate_precision_cholesky=covariate_precision_cholesky,
+            apply_projector=apply_projector,
+            posterior_variance_batch_size=3,
+            compute_beta_variance=False,
+            compute_logdet=False,
+            warm_start=warm_start,
+        )
+
+    first_result = solve()
+    cached_matrix = warm_start.exact_variant_full_matrix_cpu
+    second_result = solve()
+    assert materialize_calls == 1
+    assert warm_start.exact_variant_full_matrix_cpu is cached_matrix
+    for first_value, second_value in zip(first_result, second_result):
+        np.testing.assert_allclose(first_value, second_value, rtol=0.0, atol=0.0)
+
+    mixture_inference._clear_exact_variant_full_matrix_cache(warm_start)
+    assert warm_start.exact_variant_full_matrix_cpu is None
+    assert warm_start.exact_variant_full_matrix_gpu is None
+    assert warm_start.exact_variant_full_matrix_token is None
+    assert not warm_start.exact_variant_full_matrix_cache_enabled
+
+    warm_start.exact_variant_full_matrix_cache_enabled = True
+    solve()
+    assert materialize_calls == 2
+    assert warm_start.exact_variant_full_matrix_cpu is not cached_matrix
+
+
+def test_exact_variant_cpu_schur_solver_matches_explicit_projector(random_generator):
+    sample_count, variant_count = 17, 7
+    genotype_values = random_generator.normal(
+        size=(sample_count, variant_count)
+    ).astype(np.float32)
+    standardized = as_raw_genotype_matrix(genotype_values).standardized(
+        means=np.zeros(variant_count, dtype=np.float32),
+        scales=np.ones(variant_count, dtype=np.float32),
+    )
+    dense_genotypes = np.asarray(
+        standardized.materialize(batch_size=4),
+        dtype=np.float64,
+    )
+    covariate_matrix = np.column_stack(
+        [
+            np.ones(sample_count),
+            random_generator.normal(size=sample_count),
+            random_generator.normal(size=sample_count),
+        ]
+    ).astype(np.float64)
+    targets = random_generator.normal(size=sample_count).astype(np.float64)
+    diagonal_noise = random_generator.uniform(0.3, 2.0, size=sample_count)
+    prior_precision = random_generator.uniform(0.2, 1.8, size=variant_count)
+    inverse_diagonal_noise, covariate_precision_cholesky, _, apply_projector = (
+        _restricted_precision_projector(covariate_matrix, diagonal_noise)
+    )
+
+    explicit_precision = (
+        np.diag(prior_precision)
+        + dense_genotypes.T @ apply_projector(dense_genotypes)
+        + np.eye(variant_count, dtype=np.float64) * 1e-8
+    )
+    explicit_rhs = dense_genotypes.T @ apply_projector(targets)
+    expected_beta = np.linalg.solve(explicit_precision, explicit_rhs)
+    expected_predictor = dense_genotypes @ expected_beta
+    expected_variance = np.maximum(
+        np.diag(np.linalg.inv(explicit_precision)),
+        1e-8,
+    )
+    expected_logdet = float(np.linalg.slogdet(explicit_precision)[1])
+
+    beta, predictor, beta_variance, logdet = (
+        mixture_inference._solve_restricted_exact_variant_space(
+            genotype_matrix=standardized,
+            covariate_matrix=covariate_matrix,
+            targets=targets,
+            prior_precision=prior_precision,
+            inverse_diagonal_noise=inverse_diagonal_noise,
+            covariate_precision_cholesky=covariate_precision_cholesky,
+            apply_projector=apply_projector,
+            posterior_variance_batch_size=4,
+            compute_beta_variance=True,
+            compute_logdet=True,
+            warm_start=None,
+        )
+    )
+
+    np.testing.assert_allclose(beta, expected_beta, rtol=1e-10, atol=1e-11)
+    np.testing.assert_allclose(predictor, expected_predictor, rtol=1e-10, atol=1e-11)
+    np.testing.assert_allclose(
+        beta_variance,
+        expected_variance,
+        rtol=1e-10,
+        atol=1e-11,
+    )
+    assert logdet == pytest.approx(expected_logdet, rel=1e-10, abs=1e-11)
+
+
 def test_exact_variant_full_matrix_gpu_cache_reuses_expanded_block(monkeypatch: pytest.MonkeyPatch, random_generator):
     sample_count, variant_count = 6, 4
     genotype_values = random_generator.normal(size=(sample_count, variant_count)).astype(np.float32)
@@ -4822,7 +4959,8 @@ def test_exact_variant_full_matrix_gpu_cache_reuses_expanded_block(monkeypatch: 
     )
     assert first is second
     assert expansion_calls == 1
-    mixture_inference._clear_exact_variant_full_matrix_gpu_cache(warm_start)
+    mixture_inference._clear_exact_variant_full_matrix_cache(warm_start)
+    assert warm_start.exact_variant_full_matrix_cpu is None
     assert warm_start.exact_variant_full_matrix_gpu is None
     assert not warm_start.exact_variant_full_matrix_cache_enabled
 def test_timed_gpu_region_allows_fake_cupy_without_device_synchronization():
