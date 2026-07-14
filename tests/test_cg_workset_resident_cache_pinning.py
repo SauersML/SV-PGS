@@ -184,14 +184,13 @@ def test_install_refuses_when_matrix_empty(monkeypatch: pytest.MonkeyPatch) -> N
 def test_install_does_not_consult_budget_helper(monkeypatch: pytest.MonkeyPatch) -> None:
     """The premature budget pre-check is gone — try_materialize_gpu (which runs
     the adaptive-staging plan + cupy-pool release) is the single source of truth.
-    A broken budget helper must therefore NOT affect the install at all."""
+    The install path must not even reach for the budget helper, so the module no
+    longer carries a reference to it."""
     gm = _StubGenotypeMatrix()  # materialize_result=True
     fake_cupy = _make_fake_cupy()
 
-    def _must_not_be_called(*a, **kw):
-        raise AssertionError("budget pre-check must no longer be consulted")
+    assert not hasattr(mi, "_call_gpu_materialization_budget_bytes")
 
-    monkeypatch.setattr(mi, "_call_gpu_materialization_budget_bytes", _must_not_be_called)
     result = mi._try_install_cg_workset_resident_cache(gm, cupy=fake_cupy)
     assert result is True
     assert gm.materialize_calls == 1
@@ -209,11 +208,6 @@ def test_install_swallows_oom_from_try_materialize_gpu(
         materialize_side_effect=MemoryError("simulated GPU OOM"),
     )
     fake_cupy = _make_fake_cupy()
-    monkeypatch.setattr(
-        mi,
-        "_call_gpu_materialization_budget_bytes",
-        lambda cupy, **kwargs: 10 * 10**9,  # generous; install should proceed
-    )
     # Spy on _release_cupy_cached_memory so we can verify it gets called on
     # the OOM rollback path (best-effort pool drain).
     release_calls: list[Any] = []
@@ -239,11 +233,6 @@ def test_install_swallows_runtimeerror_from_try_materialize_gpu(
         materialize_side_effect=RuntimeError("cudaErrorMemoryAllocation"),
     )
     fake_cupy = _make_fake_cupy()
-    monkeypatch.setattr(
-        mi,
-        "_call_gpu_materialization_budget_bytes",
-        lambda cupy, **kwargs: 10 * 10**9,
-    )
     monkeypatch.setattr(mi, "_release_cupy_cached_memory", lambda cupy: None)
 
     result = mi._try_install_cg_workset_resident_cache(gm, cupy=fake_cupy)
@@ -258,11 +247,6 @@ def test_install_swallows_runtimeerror_from_try_materialize_gpu(
 def test_install_succeeds_when_budget_fits(monkeypatch: pytest.MonkeyPatch) -> None:
     gm = _StubGenotypeMatrix(n_rows=32, n_cols=16)
     fake_cupy = _make_fake_cupy()
-    monkeypatch.setattr(
-        mi,
-        "_call_gpu_materialization_budget_bytes",
-        lambda cupy, **kwargs: 10 * 10**9,
-    )
     result = mi._try_install_cg_workset_resident_cache(gm, cupy=fake_cupy)
     assert result is True
     assert gm._cupy_cache is not None
@@ -286,11 +270,6 @@ def test_solve_releases_cache_when_solve_body_raises(
     # the solve path to proceed past the guard).
     monkeypatch.setattr(mi, "_try_import_cupy", lambda: fake_cupy)
 
-    monkeypatch.setattr(
-        mi,
-        "_call_gpu_materialization_budget_bytes",
-        lambda cupy, **kwargs: 10 * 10**9,
-    )
     monkeypatch.setattr(mi, "_release_cupy_cached_memory", lambda cupy: None)
 
     # Force the solve body to blow up so we can verify the finally block
@@ -386,11 +365,6 @@ def test_solve_does_not_release_outer_owned_cache(
 
     monkeypatch.setitem(sys.modules, "cupy", fake_cupy)
     monkeypatch.setattr(mi, "_try_import_cupy", lambda: fake_cupy)
-    monkeypatch.setattr(
-        mi,
-        "_call_gpu_materialization_budget_bytes",
-        lambda cupy, **kwargs: 10 * 10**9,
-    )
     monkeypatch.setattr(mi, "_release_cupy_cached_memory", lambda cupy: None)
 
     sentinel_return = np.zeros((32, 1))
@@ -440,11 +414,6 @@ def test_back_to_back_solves_release_cache_between_calls(
 
     monkeypatch.setitem(sys.modules, "cupy", fake_cupy)
     monkeypatch.setattr(mi, "_try_import_cupy", lambda: fake_cupy)
-    monkeypatch.setattr(
-        mi,
-        "_call_gpu_materialization_budget_bytes",
-        lambda cupy, **kwargs: 10 * 10**9,
-    )
     monkeypatch.setattr(mi, "_release_cupy_cached_memory", lambda cupy: None)
 
     entry_cache_states: list[Any] = []
