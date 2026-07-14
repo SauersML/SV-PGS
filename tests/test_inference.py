@@ -2252,48 +2252,136 @@ def test_stochastic_binary_newton_iterations_scale_with_blend_weight():
 def test_default_stochastic_step_size_uses_full_sweeps():
     assert mixture_inference._stochastic_step_size(ModelConfig(), 1) == 1.0
     assert mixture_inference._stochastic_step_size(ModelConfig(), 4) == 1.0
-def test_fit_convergence_change_uses_predictive_state_not_auxiliary_shrinkage():
+def test_fit_convergence_ignores_alternating_objective_when_identifiable_state_is_stationary():
     beta = np.array([0.1, -0.2, 0.05], dtype=np.float64)
     alpha = np.array([0.3], dtype=np.float64)
     predictor = np.array([-0.2, 0.1, 0.4], dtype=np.float64)
-    fit_change, predictor_change, objective_change, coefficient_change = (
-        mixture_inference._fit_state_convergence_change(
-            current_beta=beta + np.array([1e-5, -2e-5, 1e-5], dtype=np.float64),
-            previous_beta=beta,
-            current_alpha=alpha + 1e-5,
-            previous_alpha=alpha,
-            current_linear_predictor=predictor + 2e-5,
-            previous_linear_predictor=predictor,
-            current_objective=-10.0004,
-            previous_objective=-10.0,
+    for alternating_objective in (-15.0, -5.0):
+        fit_change, predictor_change, objective_change, coefficient_change = (
+            mixture_inference._fit_state_convergence_change(
+                current_beta=beta,
+                previous_beta=beta,
+                current_alpha=alpha,
+                previous_alpha=alpha,
+                current_linear_predictor=predictor,
+                previous_linear_predictor=predictor,
+                current_objective=alternating_objective,
+                previous_objective=-10.0,
+            )
         )
+        assert fit_change == pytest.approx(0.0)
+        assert predictor_change == pytest.approx(0.0)
+        assert coefficient_change == pytest.approx(0.0)
+        assert objective_change == pytest.approx(0.5)
+
+    previous_prior_variances = mixture_inference._scale_state_reduced_prior_variances(
+        global_scale=0.4,
+        scale_model_coefficients=np.zeros(0, dtype=np.float64),
+        local_scale=np.array([1.0, 2.0, 3.0], dtype=np.float64),
+        design_matrix=np.zeros((3, 0), dtype=np.float64),
+        config=ModelConfig(),
+    )
+    rescaled_prior_variances = mixture_inference._scale_state_reduced_prior_variances(
+        global_scale=0.2,
+        scale_model_coefficients=np.zeros(0, dtype=np.float64),
+        local_scale=np.array([4.0, 8.0, 12.0], dtype=np.float64),
+        design_matrix=np.zeros((3, 0), dtype=np.float64),
+        config=ModelConfig(),
     )
     hyper_change = mixture_inference._hyperparameter_relative_change(
-        current_beta=beta,
-        previous_beta=beta,
-        current_alpha=alpha,
-        previous_alpha=alpha,
-        current_local_scale=np.array([10.0, 20.0, 30.0], dtype=np.float64),
-        previous_local_scale=np.array([1.0, 2.0, 3.0], dtype=np.float64),
-        current_theta=np.array([0.1], dtype=np.float64),
-        previous_theta=np.array([0.1], dtype=np.float64),
+        current_reduced_prior_variances=rescaled_prior_variances,
+        previous_reduced_prior_variances=previous_prior_variances,
         current_tpb_shape_a_vector=np.array([1.0], dtype=np.float64),
         previous_tpb_shape_a_vector=np.array([1.0], dtype=np.float64),
         current_tpb_shape_b_vector=np.array([1.0], dtype=np.float64),
         previous_tpb_shape_b_vector=np.array([1.0], dtype=np.float64),
     )
-    assert fit_change < 1e-4
-    assert predictor_change < 1e-4
-    assert objective_change < 1e-4
-    assert coefficient_change < 1e-4
-    assert hyper_change > 1.0
+    assert hyper_change == pytest.approx(0.0)
+
+
+def test_genuine_predictor_coefficient_or_effective_prior_movement_blocks_convergence():
+    beta = np.array([0.1, -0.2, 0.05], dtype=np.float64)
+    alpha = np.array([0.3], dtype=np.float64)
+    predictor = np.array([-0.2, 0.1, 0.4], dtype=np.float64)
+    tolerance = 1e-4
+
+    predictor_fit_change, _, _, _ = mixture_inference._fit_state_convergence_change(
+        current_beta=beta,
+        previous_beta=beta,
+        current_alpha=alpha,
+        previous_alpha=alpha,
+        current_linear_predictor=predictor + 1e-2,
+        previous_linear_predictor=predictor,
+        current_objective=-10.0,
+        previous_objective=-10.0,
+    )
+    coefficient_fit_change, _, _, _ = mixture_inference._fit_state_convergence_change(
+        current_beta=beta + np.array([1e-2, 0.0, 0.0], dtype=np.float64),
+        previous_beta=beta,
+        current_alpha=alpha,
+        previous_alpha=alpha,
+        current_linear_predictor=predictor,
+        previous_linear_predictor=predictor,
+        current_objective=-10.0,
+        previous_objective=-10.0,
+    )
+    prior_variances = np.array([1.0, 2.0, 4.0], dtype=np.float64)
+    prior_change = mixture_inference._hyperparameter_relative_change(
+        current_reduced_prior_variances=prior_variances * 1.1,
+        previous_reduced_prior_variances=prior_variances,
+        current_tpb_shape_a_vector=np.array([1.0], dtype=np.float64),
+        previous_tpb_shape_a_vector=np.array([1.0], dtype=np.float64),
+        current_tpb_shape_b_vector=np.array([0.5], dtype=np.float64),
+        previous_tpb_shape_b_vector=np.array([0.5], dtype=np.float64),
+    )
+
+    assert predictor_fit_change > tolerance
+    assert coefficient_fit_change > tolerance
+    assert prior_change > tolerance
+
+
+def test_hyperparameter_change_detects_effective_prior_and_shape_movement():
+    previous_prior_variances = np.array([1.0, 2.0, 4.0], dtype=np.float64)
+
+    prior_movement = mixture_inference._hyperparameter_relative_change(
+        current_reduced_prior_variances=previous_prior_variances * 1.1,
+        previous_reduced_prior_variances=previous_prior_variances,
+        current_tpb_shape_a_vector=np.array([1.0], dtype=np.float64),
+        previous_tpb_shape_a_vector=np.array([1.0], dtype=np.float64),
+        current_tpb_shape_b_vector=np.array([0.5], dtype=np.float64),
+        previous_tpb_shape_b_vector=np.array([0.5], dtype=np.float64),
+    )
+    shape_movement = mixture_inference._hyperparameter_relative_change(
+        current_reduced_prior_variances=previous_prior_variances,
+        previous_reduced_prior_variances=previous_prior_variances,
+        current_tpb_shape_a_vector=np.array([1.2], dtype=np.float64),
+        previous_tpb_shape_a_vector=np.array([1.0], dtype=np.float64),
+        current_tpb_shape_b_vector=np.array([0.5], dtype=np.float64),
+        previous_tpb_shape_b_vector=np.array([0.5], dtype=np.float64),
+    )
+
+    assert prior_movement == pytest.approx(0.1)
+    assert shape_movement == pytest.approx(0.2)
+
+
+def test_hyperparameter_change_uses_an_absolute_floor_for_negligible_prior_operators():
+    previous_prior_variances = np.array([1e-5, 2e-5, 3e-5], dtype=np.float64)
+    hyper_change = mixture_inference._hyperparameter_relative_change(
+        current_reduced_prior_variances=previous_prior_variances * 0.9,
+        previous_reduced_prior_variances=previous_prior_variances,
+        current_tpb_shape_a_vector=np.array([1.0], dtype=np.float64),
+        previous_tpb_shape_a_vector=np.array([1.0], dtype=np.float64),
+        current_tpb_shape_b_vector=np.array([0.5], dtype=np.float64),
+        previous_tpb_shape_b_vector=np.array([0.5], dtype=np.float64),
+    )
+
+    assert hyper_change == pytest.approx(np.sqrt(np.mean((0.1 * previous_prior_variances) ** 2)))
+    assert hyper_change < 1e-4
 def test_hyperparameter_updates_are_horizon_independent():
-    config = ModelConfig(max_outer_iterations=8)
-    assert mixture_inference._should_update_hyperparameters_this_iteration(2, config)
-    assert not mixture_inference._should_update_hyperparameters_this_iteration(3, config)
-    assert mixture_inference._should_update_hyperparameters_this_iteration(8, config)
-    assert not mixture_inference._should_update_hyperparameters_this_iteration(5, ModelConfig(max_outer_iterations=5))
-    assert mixture_inference._should_update_hyperparameters_this_iteration(4, ModelConfig(max_outer_iterations=4))
+    assert not mixture_inference._should_update_hyperparameters_this_iteration(1)
+    assert mixture_inference._should_update_hyperparameters_this_iteration(2)
+    assert mixture_inference._should_update_hyperparameters_this_iteration(3)
+    assert mixture_inference._should_update_hyperparameters_this_iteration(8)
 def test_checkpoint_signature_ignores_solver_and_resume_policy_controls():
     base = ModelConfig(
         max_outer_iterations=20,
@@ -5523,33 +5611,129 @@ def test_member_prior_variances_preserve_member_metadata_with_ties():
     member_records = [
         VariantRecord("variant_0", VariantClass.SNV, "1", 100),
         VariantRecord("variant_1", VariantClass.DELETION_SHORT, "1", 101, is_copy_number=True),
+        VariantRecord("variant_2", VariantClass.SNV, "1", 102),
     ]
     tie_map = TieMap(
-        kept_indices=np.array([0], dtype=np.int32),
-        original_to_reduced=np.array([0, 0], dtype=np.int32),
+        kept_indices=np.array([0, 2], dtype=np.int32),
+        original_to_reduced=np.array([0, 0, 1], dtype=np.int32),
         reduced_to_group=[
             TieGroup(
                 representative_index=0,
                 member_indices=np.array([0, 1], dtype=np.int32),
                 signs=np.array([1.0, 1.0], dtype=np.float32),
-            )
+            ),
+            TieGroup(
+                representative_index=2,
+                member_indices=np.array([2], dtype=np.int32),
+                signs=np.array([1.0], dtype=np.float32),
+            ),
         ],
     )
     member_prior_variances = _member_prior_variances_from_reduced_state(
         member_records=member_records,
         tie_map=tie_map,
-        scale_model_coefficients=np.array([1.0, -1.0], dtype=np.float64),
+        scale_model_coefficients=np.array([1.0], dtype=np.float64),
         scale_model_feature_specs=(
-            ScaleModelFeatureSpec(kind="type_offset", variant_class=VariantClass.SNV),
-            ScaleModelFeatureSpec(kind="type_offset", variant_class=VariantClass.DELETION_SHORT),
+            ScaleModelFeatureSpec(
+                kind="type_offset",
+                center_value=0.25,
+                rms_scale=0.25,
+                variant_class=VariantClass.DELETION_SHORT,
+            ),
         ),
+        reduced_design_matrix=np.array([[1.0], [-1.0]], dtype=np.float64),
         global_scale=1.0,
-        local_scale=np.array([2.0], dtype=np.float64),
+        local_scale=np.array([2.0, 3.0], dtype=np.float64),
         config=ModelConfig(),
     )
-    assert member_prior_variances.shape == (2,)
-    assert member_prior_variances[0] > member_prior_variances[1]
+    assert member_prior_variances.shape == (3,)
+    assert member_prior_variances[1] > member_prior_variances[0]
     assert not np.isclose(member_prior_variances[0], member_prior_variances[1])
+    np.testing.assert_allclose(
+        np.sum(member_prior_variances[:2]),
+        2.0 * np.exp(2.0),
+    )
+    np.testing.assert_allclose(member_prior_variances[2], 3.0 * np.exp(-2.0))
+
+
+def test_member_prior_variances_bound_mixed_tie_extrapolation_to_reduced_support():
+    member_records = [
+        VariantRecord("snv_tie", VariantClass.SNV, "1", 100),
+        VariantRecord("deletion_tie", VariantClass.DELETION_SHORT, "1", 101),
+        VariantRecord("duplication_tie", VariantClass.DUPLICATION_SHORT, "1", 102),
+        VariantRecord("snv_singleton", VariantClass.SNV, "1", 103),
+    ]
+    tie_map = TieMap(
+        kept_indices=np.array([0, 3], dtype=np.int32),
+        original_to_reduced=np.array([0, 0, 0, 1], dtype=np.int32),
+        reduced_to_group=[
+            TieGroup(
+                representative_index=0,
+                member_indices=np.array([0, 1, 2], dtype=np.int32),
+                signs=np.array([1.0, 1.0, -1.0], dtype=np.float32),
+            ),
+            TieGroup(
+                representative_index=3,
+                member_indices=np.array([3], dtype=np.int32),
+                signs=np.array([1.0], dtype=np.float32),
+            ),
+        ],
+    )
+
+    member_prior_variances = _member_prior_variances_from_reduced_state(
+        member_records=member_records,
+        tie_map=tie_map,
+        scale_model_coefficients=np.array([0.5], dtype=np.float64),
+        scale_model_feature_specs=(
+            ScaleModelFeatureSpec(
+                kind="type_offset",
+                center_value=1.0 / 6.0,
+                rms_scale=1.0 / 6.0,
+                variant_class=VariantClass.DELETION_SHORT,
+            ),
+        ),
+        reduced_design_matrix=np.array([[1.0], [-1.0]], dtype=np.float64),
+        global_scale=1.0,
+        local_scale=np.ones(2, dtype=np.float64),
+        config=ModelConfig(),
+    )
+
+    np.testing.assert_allclose(member_prior_variances[0], member_prior_variances[2])
+    np.testing.assert_allclose(
+        member_prior_variances[1] / member_prior_variances[0],
+        np.exp(2.0),
+    )
+    np.testing.assert_allclose(np.sum(member_prior_variances[:3]), np.exp(1.0))
+    np.testing.assert_allclose(member_prior_variances[3], np.exp(-1.0))
+
+
+def test_member_log_scale_support_bound_is_invariant_to_full_rank_recoding():
+    reduced_design = np.array(
+        [[-1.0, 0.5], [0.2, -1.5], [1.3, 0.7]],
+        dtype=np.float64,
+    )
+    member_design = np.array(
+        [[-3.0, 2.0], [0.4, -0.8], [2.5, 1.1]],
+        dtype=np.float64,
+    )
+    coefficients = np.array([0.6, -0.35], dtype=np.float64)
+    recoding = np.array([[1.7, -0.4], [0.3, 1.2]], dtype=np.float64)
+
+    original_predictions = mixture_inference._support_bounded_member_log_scale_predictions(
+        member_design_matrix=member_design,
+        reduced_design_matrix=reduced_design,
+        scale_model_coefficients=coefficients,
+    )
+    recoded_predictions = mixture_inference._support_bounded_member_log_scale_predictions(
+        member_design_matrix=member_design @ recoding,
+        reduced_design_matrix=reduced_design @ recoding,
+        scale_model_coefficients=np.linalg.solve(recoding, coefficients),
+    )
+
+    np.testing.assert_allclose(recoded_predictions, original_predictions, atol=1e-12)
+    reduced_predictions = reduced_design @ coefficients
+    assert np.min(original_predictions) >= np.min(reduced_predictions)
+    assert np.max(original_predictions) <= np.max(reduced_predictions)
 
 
 def test_operator_ridge_keeps_well_conditioned_solve_untouched():

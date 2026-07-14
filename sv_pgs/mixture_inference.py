@@ -87,7 +87,6 @@ from sv_pgs.genotype import (
     DenseRawGenotypeMatrix,
     RawGenotypeMatrix,
     StandardizedGenotypeMatrix,
-    _call_gpu_materialization_budget_bytes,
     _cupy_cache_is_int8_standardized,
     _cupy_cache_is_sharded,
     _cupy_cache_standardized_columns,
@@ -586,6 +585,8 @@ class _SampleSpacePreconditionerCacheEntry:
 @dataclass(slots=True)
 class ScaleModelFeatureSpec:
     kind: str
+    center_value: float | None = None
+    rms_scale: float | None = None
     variant_class: VariantClass | None = None
     source_name: str | None = None
     level_name: str | None = None
@@ -697,8 +698,8 @@ class VariationalFitCheckpoint:
 
     def __getstate__(self) -> dict[str, object]:
         return {
-            field.name: getattr(self, field.name)
-            for field in dataclass_fields(type(self))
+            dataclass_field.name: getattr(self, dataclass_field.name)
+            for dataclass_field in dataclass_fields(type(self))
         }
 
     def __setstate__(self, state: object) -> None:
@@ -711,16 +712,16 @@ class VariationalFitCheckpoint:
             state_dict = dict(state)
         else:
             raise TypeError(f"Unsupported VariationalFitCheckpoint pickle state: {type(state)!r}")
-        for field in dataclass_fields(type(self)):
-            if field.name in state_dict:
-                value = state_dict[field.name]
-            elif field.default is not MISSING:
-                value = field.default
-            elif field.default_factory is not MISSING:
-                value = field.default_factory()
+        for dataclass_field in dataclass_fields(type(self)):
+            if dataclass_field.name in state_dict:
+                value = state_dict[dataclass_field.name]
+            elif dataclass_field.default is not MISSING:
+                value = dataclass_field.default
+            elif dataclass_field.default_factory is not MISSING:
+                value = dataclass_field.default_factory()
             else:
-                raise TypeError(f"Missing required checkpoint field: {field.name}")
-            object.__setattr__(self, field.name, value)
+                raise TypeError(f"Missing required checkpoint field: {dataclass_field.name}")
+            object.__setattr__(self, dataclass_field.name, value)
 
 
 @dataclass(slots=True)
@@ -810,11 +811,11 @@ _CHECKPOINT_EXCLUDED_CONFIG_FIELDS = frozenset({
 
 def _checkpoint_config_signature(config: ModelConfig) -> str:
     payload: dict[str, object] = {}
-    for field in dataclass_fields(config):
-        if field.name in _CHECKPOINT_EXCLUDED_CONFIG_FIELDS:
+    for dataclass_field in dataclass_fields(config):
+        if dataclass_field.name in _CHECKPOINT_EXCLUDED_CONFIG_FIELDS:
             continue
-        value = getattr(config, field.name)
-        payload[field.name] = value.value if hasattr(value, "value") else value
+        value = getattr(config, dataclass_field.name)
+        payload[dataclass_field.name] = value.value if hasattr(value, "value") else value
     return hashlib.sha256(json.dumps(payload, sort_keys=True).encode("utf-8")).hexdigest()
 
 
@@ -1296,12 +1297,8 @@ def _stochastic_binary_newton_iterations(
 
 def _should_update_hyperparameters_this_iteration(
     iteration_number: int,
-    config: ModelConfig,
 ) -> bool:
-    return (
-        int(iteration_number) >= 2
-        and int(iteration_number) % 2 == 0
-    )
+    return int(iteration_number) >= 2
 
 
 def _stochastic_sample_space_preconditioner_rank(
@@ -1633,6 +1630,7 @@ def fit_variational_em(
     previous_theta: NDArray | None = None
     previous_tpb_shape_a_vector: NDArray | None = None
     previous_tpb_shape_b_vector: NDArray | None = None
+    previous_reduced_prior_variances: NDArray | None = None
     previous_linear_predictor: NDArray | None = None
     previous_objective: float | None = None
     best_validation_metric: float | None = None
@@ -1767,6 +1765,7 @@ def fit_variational_em(
         nonlocal alpha_state, beta_state, objective_history, elbo_history, validation_history
         nonlocal previous_alpha, previous_beta, previous_local_scale, previous_theta
         nonlocal previous_tpb_shape_a_vector, previous_tpb_shape_b_vector
+        nonlocal previous_reduced_prior_variances
         nonlocal previous_linear_predictor, previous_objective
         nonlocal best_validation_metric, best_alpha, best_beta, best_beta_variance, best_local_scale, best_theta
         nonlocal best_sigma_error2, best_tpb_shape_a_vector, best_tpb_shape_b_vector, best_validation_iteration, start_iteration
@@ -1804,6 +1803,7 @@ def fit_variational_em(
         previous_theta = None
         previous_tpb_shape_a_vector = None
         previous_tpb_shape_b_vector = None
+        previous_reduced_prior_variances = None
         previous_linear_predictor = None
         previous_objective = None
         best_validation_metric = None
@@ -1871,10 +1871,6 @@ def fit_variational_em(
                 raise ValueError("resume checkpoint TPB shape-b size does not match prior classes.")
             if resume_checkpoint.completed_iterations < 0 or resume_checkpoint.completed_iterations > config.max_outer_iterations:
                 raise ValueError("resume checkpoint completed_iterations is out of range.")
-            checkpoint_has_partial_epoch = (
-                int(resume_checkpoint.completed_blocks_in_iteration) > 0
-                or resume_checkpoint.binary_block_resume_state is not None
-            )
             expected_objective_history_length = int(resume_checkpoint.completed_iterations)
             if (
                 expected_objective_history_length < 0
@@ -1900,6 +1896,17 @@ def fit_variational_em(
             previous_theta = _copy_optional(resume_checkpoint.previous_theta)
             previous_tpb_shape_a_vector = _copy_optional(resume_checkpoint.previous_tpb_shape_a_vector)
             previous_tpb_shape_b_vector = _copy_optional(resume_checkpoint.previous_tpb_shape_b_vector)
+            if previous_theta is None or previous_local_scale is None:
+                previous_reduced_prior_variances = None
+            else:
+                previous_global_scale, previous_scale_model_coefficients = _unpack_theta(previous_theta)
+                previous_reduced_prior_variances = _scale_state_reduced_prior_variances(
+                    global_scale=previous_global_scale,
+                    scale_model_coefficients=previous_scale_model_coefficients,
+                    local_scale=previous_local_scale,
+                    design_matrix=prior_design.design_matrix,
+                    config=config,
+                )
             previous_linear_predictor = None
             previous_objective = objective_history[-1] if objective_history else None
             best_validation_metric = None if resume_checkpoint.best_validation_metric is None else float(resume_checkpoint.best_validation_metric)
@@ -2907,7 +2914,6 @@ def fit_variational_em(
                     )
             should_update_hyperparameters = _should_update_hyperparameters_this_iteration(
                 outer_iteration + 1,
-                config,
             )
             if should_update_hyperparameters:
                 global_scale, scale_model_coefficients = _update_scale_model(
@@ -3071,14 +3077,8 @@ def fit_variational_em(
                 previous_objective=previous_objective,
             )
             hyperparameter_change = _hyperparameter_relative_change(
-                current_beta=beta_state,
-                previous_beta=previous_beta,
-                current_alpha=alpha_state,
-                previous_alpha=previous_alpha,
-                current_local_scale=local_scale,
-                previous_local_scale=previous_local_scale,
-                current_theta=current_theta,
-                previous_theta=previous_theta,
+                current_reduced_prior_variances=reduced_prior_variances,
+                previous_reduced_prior_variances=previous_reduced_prior_variances,
                 current_tpb_shape_a_vector=tpb_shape_a_vector,
                 previous_tpb_shape_a_vector=previous_tpb_shape_a_vector,
                 current_tpb_shape_b_vector=tpb_shape_b_vector,
@@ -3104,6 +3104,7 @@ def fit_variational_em(
             previous_theta = current_theta
             previous_tpb_shape_a_vector = tpb_shape_a_vector.copy()
             previous_tpb_shape_b_vector = tpb_shape_b_vector.copy()
+            previous_reduced_prior_variances = reduced_prior_variances.copy()
             previous_linear_predictor = np.asarray(linear_predictor, dtype=np.float64).copy()
             previous_objective = current_objective
             iter_num = outer_iteration + 1
@@ -3288,18 +3289,6 @@ def fit_variational_em(
                 reduced_second_moment_carry = np.asarray(
                     saved_reduced_second_moment, dtype=np.float64
                 ).copy()
-        # Per-iteration phase timings (heartbeat profiling). Cumulative totals
-        # are folded across iterations so the trainer can emit a single
-        # summary line once the loop completes.
-        em_profile_totals: dict[str, float] = {
-            "matvec": 0.0,
-            "rmatvec": 0.0,
-            "gram": 0.0,
-            "posterior": 0.0,
-            "loss": 0.0,
-            "total": 0.0,
-        }
-        em_profile_iters_run = 0
         # Reset the bitpacked matvec/rmatvec/gram bucket once at loop entry so
         # any timings carried over from screening do not leak into iter 1.
         try:
@@ -3522,7 +3511,6 @@ def fit_variational_em(
             )
             should_update_hyperparameters = _should_update_hyperparameters_this_iteration(
                 outer_iteration + 1,
-                config,
             )
             if should_update_hyperparameters:
                 # Save current hyperparameters so we can revert if the
@@ -3651,19 +3639,23 @@ def fit_variational_em(
                 current_objective=current_objective,
                 previous_objective=previous_objective,
             )
+            previous_reduced_prior_variances_for_change = previous_reduced_prior_variances
+            previous_tpb_shape_a_for_change = previous_tpb_shape_a_vector
+            previous_tpb_shape_b_for_change = previous_tpb_shape_b_vector
+            convergence_reduced_prior_variances = _scale_state_reduced_prior_variances(
+                global_scale=global_scale,
+                scale_model_coefficients=scale_model_coefficients,
+                local_scale=local_scale,
+                design_matrix=prior_design.design_matrix,
+                config=config,
+            )
             hyperparameter_change = _hyperparameter_relative_change(
-                current_beta=beta_state,
-                previous_beta=previous_beta,
-                current_alpha=alpha_state,
-                previous_alpha=previous_alpha,
-                current_local_scale=local_scale,
-                previous_local_scale=previous_local_scale,
-                current_theta=current_theta,
-                previous_theta=previous_theta,
+                current_reduced_prior_variances=convergence_reduced_prior_variances,
+                previous_reduced_prior_variances=previous_reduced_prior_variances_for_change,
                 current_tpb_shape_a_vector=tpb_shape_a_vector,
-                previous_tpb_shape_a_vector=previous_tpb_shape_a_vector,
+                previous_tpb_shape_a_vector=previous_tpb_shape_a_for_change,
                 current_tpb_shape_b_vector=tpb_shape_b_vector,
-                previous_tpb_shape_b_vector=previous_tpb_shape_b_vector,
+                previous_tpb_shape_b_vector=previous_tpb_shape_b_for_change,
             )
             final_parameter_change = parameter_change
             final_predictor_change = predictor_change
@@ -3985,6 +3977,27 @@ def fit_variational_em(
                 except Exception as exc:
                     log(f"  Anderson acceleration skipped: {exc}")
                     anderson_state.reset()
+            # Anderson may have changed the hyperparameter state after the
+            # iteration log was assembled. Recompute the identifiable prior
+            # operator from the final accepted state before checkpointing or
+            # declaring convergence.
+            convergence_reduced_prior_variances = _scale_state_reduced_prior_variances(
+                global_scale=global_scale,
+                scale_model_coefficients=scale_model_coefficients,
+                local_scale=local_scale,
+                design_matrix=prior_design.design_matrix,
+                config=config,
+            )
+            hyperparameter_change = _hyperparameter_relative_change(
+                current_reduced_prior_variances=convergence_reduced_prior_variances,
+                previous_reduced_prior_variances=previous_reduced_prior_variances_for_change,
+                current_tpb_shape_a_vector=tpb_shape_a_vector,
+                previous_tpb_shape_a_vector=previous_tpb_shape_a_for_change,
+                current_tpb_shape_b_vector=tpb_shape_b_vector,
+                previous_tpb_shape_b_vector=previous_tpb_shape_b_for_change,
+            )
+            final_hyperparameter_change = hyperparameter_change
+            previous_reduced_prior_variances = convergence_reduced_prior_variances.copy()
             if checkpoint_callback is not None:
                 # Persist the CAVI-path inter-iteration carries (current
                 # beta variance + reduced second moment) so a resume re-enters
@@ -4131,6 +4144,7 @@ def fit_variational_em(
             tie_map=tie_map,
             scale_model_coefficients=scale_model_coefficients,
             scale_model_feature_specs=prior_design.feature_specs,
+            reduced_design_matrix=prior_design.design_matrix,
             global_scale=float(global_scale),
             local_scale=local_scale,
             config=config,
@@ -8946,8 +8960,6 @@ def _solve_sample_space_rhs_gpu_with_optional_workset_cache(
         if solution_gpu64.ndim == 1:
             solution_gpu64 = solution_gpu64[:, None]
         _, residual_norm_sq = true_residual(solution_gpu64)
-        final_residual = float(np.max(residual_norm_sq))
-        final_threshold = float(np.max(convergence_threshold_sq))
         required_residual = residual_norm_sq[required_mask]
         required_threshold = convergence_threshold_sq[required_mask]
         failed_mask = required_residual > required_threshold
@@ -12799,38 +12811,76 @@ def _compile_prior_feature_specs(
     class_membership_by_class: dict[VariantClass, NDArray],
 ) -> tuple[ScaleModelFeatureSpec, ...]:
     feature_specs: list[ScaleModelFeatureSpec] = []
+    orthonormal_columns: list[NDArray] = []
+    main_effect_specs: list[ScaleModelFeatureSpec] = []
+    interaction_specs: list[ScaleModelFeatureSpec] = []
     class_totals = {
         variant_class: float(np.sum(class_membership))
         for variant_class, class_membership in class_membership_by_class.items()
     }
 
-    def append_if_nonzero(feature_spec: ScaleModelFeatureSpec) -> None:
+    def append_if_independent(feature_spec: ScaleModelFeatureSpec) -> None:
         feature_column = _column_for_feature_spec(
             feature_spec=feature_spec,
             annotation_tables=annotation_tables,
             class_membership_by_class=class_membership_by_class,
         )
-        if np.max(np.abs(_center_design_column(feature_column))) < 1e-10:
+        center_value = float(np.mean(feature_column))
+        centered_column = np.asarray(feature_column, dtype=np.float64) - center_value
+        rms_scale = float(np.sqrt(np.mean(centered_column * centered_column)))
+        if not np.isfinite(rms_scale) or rms_scale < 1e-10:
             return
-        feature_specs.append(feature_spec)
+        standardized_column = centered_column / rms_scale
+        residual_column = standardized_column.copy()
+        # Re-orthogonalize once. This is only a deterministic rank-revealing
+        # screen: the emitted columns retain their interpretable reference-coded
+        # values rather than becoming order-dependent orthogonal contrasts.
+        for _reorthogonalization_pass in range(2):
+            for orthonormal_column in orthonormal_columns:
+                residual_column -= orthonormal_column * float(orthonormal_column @ residual_column)
+        standardized_norm = float(np.linalg.norm(standardized_column))
+        residual_norm = float(np.linalg.norm(residual_column))
+        if residual_norm <= 1e-8 * standardized_norm:
+            return
+        feature_specs.append(
+            dataclass_replace(
+                feature_spec,
+                center_value=center_value,
+                rms_scale=rms_scale,
+            )
+        )
+        orthonormal_columns.append(np.asarray(residual_column / residual_norm, dtype=np.float64))
 
-    for variant_class in sorted(class_membership_by_class, key=lambda class_value: class_value.value):
-        append_if_nonzero(ScaleModelFeatureSpec(kind="type_offset", variant_class=variant_class))
+    encoded_variant_classes = _levels_to_encode(
+        {
+            variant_class: class_membership_by_class[variant_class]
+            for variant_class in sorted(class_membership_by_class, key=lambda class_value: class_value.value)
+        },
+        parent_weights=np.ones_like(next(iter(class_membership_by_class.values()))),
+    ) if class_membership_by_class else ()
+    for variant_class in encoded_variant_classes:
+        main_effect_specs.append(ScaleModelFeatureSpec(kind="type_offset", variant_class=variant_class))
 
     for source_name in sorted(annotation_tables.factor_weights_by_source):
         level_weights_by_name = annotation_tables.factor_weights_by_source[source_name]
-        for level_name in _factor_levels_to_encode(level_weights_by_name):
-            append_if_nonzero(
+        if not level_weights_by_name:
+            continue
+        for level_name in _levels_to_encode(
+            level_weights_by_name,
+            parent_weights=np.ones_like(next(iter(level_weights_by_name.values()))),
+        ):
+            main_effect_specs.append(
                 ScaleModelFeatureSpec(
                     kind="factor_level",
                     source_name=source_name,
                     level_name=level_name,
                 )
             )
-            for variant_class, class_membership in class_membership_by_class.items():
+            for variant_class in encoded_variant_classes:
+                class_membership = class_membership_by_class[variant_class]
                 if class_totals[variant_class] < 3.0 or np.max(class_membership) <= 0.0:
                     continue
-                append_if_nonzero(
+                interaction_specs.append(
                     ScaleModelFeatureSpec(
                         kind="factor_interaction",
                         variant_class=variant_class,
@@ -12840,9 +12890,10 @@ def _compile_prior_feature_specs(
                 )
 
     for source_name in sorted(annotation_tables.nested_weights_by_source):
-        for nested_depth in sorted(annotation_tables.nested_weights_by_source[source_name]):
-            for level_name in sorted(annotation_tables.nested_weights_by_source[source_name][nested_depth]):
-                append_if_nonzero(
+        nested_weights_by_depth = annotation_tables.nested_weights_by_source[source_name]
+        for nested_depth in sorted(nested_weights_by_depth):
+            for level_name in _nested_levels_to_encode(nested_weights_by_depth, nested_depth):
+                main_effect_specs.append(
                     ScaleModelFeatureSpec(
                         kind="nested_level",
                         source_name=source_name,
@@ -12850,10 +12901,11 @@ def _compile_prior_feature_specs(
                         nested_depth=nested_depth,
                     )
                 )
-                for variant_class, class_membership in class_membership_by_class.items():
+                for variant_class in encoded_variant_classes:
+                    class_membership = class_membership_by_class[variant_class]
                     if class_totals[variant_class] < 3.0 or np.max(class_membership) <= 0.0:
                         continue
-                    append_if_nonzero(
+                    interaction_specs.append(
                         ScaleModelFeatureSpec(
                             kind="nested_interaction",
                             variant_class=variant_class,
@@ -12866,11 +12918,12 @@ def _compile_prior_feature_specs(
     for source_name in sorted(annotation_tables.continuous_values_by_source):
         continuous_values = annotation_tables.continuous_values_by_source[source_name]
         for base_feature_spec in _continuous_spline_feature_specs(source_name, continuous_values):
-            append_if_nonzero(base_feature_spec)
-            for variant_class, class_membership in class_membership_by_class.items():
+            main_effect_specs.append(base_feature_spec)
+            for variant_class in encoded_variant_classes:
+                class_membership = class_membership_by_class[variant_class]
                 if class_totals[variant_class] < 3.0 or np.max(class_membership) <= 0.0:
                     continue
-                append_if_nonzero(
+                interaction_specs.append(
                     ScaleModelFeatureSpec(
                         kind="continuous_spline_interaction",
                         variant_class=variant_class,
@@ -12882,6 +12935,13 @@ def _compile_prior_feature_specs(
                         knot_values=base_feature_spec.knot_values,
                     )
                 )
+
+    # Compile every main effect before any interaction. When annotations are
+    # confounded on a particular dataset, the rank screen therefore preserves
+    # the hierarchy instead of retaining an interaction at the expense of its
+    # marginal annotation effect.
+    for feature_spec in (*main_effect_specs, *interaction_specs):
+        append_if_independent(feature_spec)
 
     return tuple(feature_specs)
 
@@ -12895,12 +12955,13 @@ def _design_matrix_for_feature_specs(
     if len(feature_specs) == 0:
         return np.zeros((len(records), 0), dtype=np.float64)
     design_columns = [
-        _center_design_column(
+        _standardize_design_column(
             _column_for_feature_spec(
                 feature_spec=feature_spec,
                 annotation_tables=annotation_tables,
                 class_membership_by_class=class_membership_by_class,
-            )
+            ),
+            feature_spec=feature_spec,
         )
         for feature_spec in feature_specs
     ]
@@ -13177,14 +13238,67 @@ def _nested_prior_annotation_weights(
     return nested_weights_by_source
 
 
-def _factor_levels_to_encode(level_weights_by_name: dict[str, NDArray]) -> tuple[str, ...]:
-    if len(level_weights_by_name) <= 1:
+def _levels_to_encode(
+    level_weights_by_name: Mapping[Any, NDArray],
+    *,
+    parent_weights: NDArray,
+) -> tuple[Any, ...]:
+    """Return a full-rank reference coding for one sibling group.
+
+    When the supplied levels exhaust their parent, the most prevalent level
+    is the deterministic reference and is omitted. If some parent membership
+    is unassigned (missing annotations or a terminal node), that unassigned
+    mass is already an implicit reference, so every explicit level is kept.
+    """
+    if not level_weights_by_name:
         return ()
+    sorted_levels = tuple(
+        sorted(
+            level_weights_by_name,
+            key=lambda level_name: (
+                level_name.value if isinstance(level_name, VariantClass) else str(level_name)
+            ),
+        )
+    )
+    represented_weights = np.sum(
+        np.row_stack([np.asarray(level_weights_by_name[level_name], dtype=np.float64) for level_name in sorted_levels]),
+        axis=0,
+    )
+    implicit_reference = np.asarray(parent_weights, dtype=np.float64) - represented_weights
+    centered_implicit_reference = implicit_reference - float(np.mean(implicit_reference))
+    if np.max(np.abs(centered_implicit_reference)) >= 1e-10:
+        return sorted_levels
     reference_level = max(
-        sorted(level_weights_by_name),
+        sorted_levels,
         key=lambda level_name: float(np.sum(level_weights_by_name[level_name])),
     )
-    return tuple(level_name for level_name in sorted(level_weights_by_name) if level_name != reference_level)
+    return tuple(level_name for level_name in sorted_levels if level_name != reference_level)
+
+
+def _nested_levels_to_encode(
+    nested_weights_by_depth: dict[int, dict[str, NDArray]],
+    nested_depth: int,
+) -> tuple[str, ...]:
+    level_weights_by_name = nested_weights_by_depth[nested_depth]
+    levels_by_parent: dict[str | None, dict[str, NDArray]] = {}
+    for level_name in sorted(level_weights_by_name):
+        parent_name = None if nested_depth == 0 else level_name.rsplit(NESTED_PATH_DELIMITER, maxsplit=1)[0]
+        levels_by_parent.setdefault(parent_name, {})[level_name] = level_weights_by_name[level_name]
+
+    encoded_levels: list[str] = []
+    for parent_name in sorted(levels_by_parent, key=lambda value: "" if value is None else value):
+        sibling_weights = levels_by_parent[parent_name]
+        if parent_name is None:
+            parent_weights = np.ones_like(next(iter(sibling_weights.values())))
+        else:
+            parent_weights = nested_weights_by_depth[nested_depth - 1][parent_name]
+        encoded_levels.extend(
+            _levels_to_encode(
+                sibling_weights,
+                parent_weights=parent_weights,
+            )
+        )
+    return tuple(encoded_levels)
 
 
 def _continuous_spline_feature_specs(
@@ -13275,11 +13389,21 @@ def _cholesky_solve(cholesky_factor: NDArray, right_hand_side: NDArray) -> NDArr
     )
 
 
-def _center_design_column(values: NDArray) -> NDArray:
-    centered = np.asarray(values, dtype=np.float64) - float(np.mean(values))
-    if np.max(np.abs(centered)) < 1e-10:
-        return np.zeros_like(centered)
-    return centered
+def _standardize_design_column(
+    values: NDArray,
+    *,
+    feature_spec: ScaleModelFeatureSpec,
+) -> NDArray:
+    if feature_spec.center_value is None or feature_spec.rms_scale is None:
+        raise ValueError("Scale-model feature spec is missing its fitted centering or RMS scale.")
+    if not np.isfinite(feature_spec.center_value):
+        raise ValueError("Scale-model feature centering value must be finite.")
+    if not np.isfinite(feature_spec.rms_scale) or feature_spec.rms_scale <= 0.0:
+        raise ValueError("Scale-model feature RMS scale must be finite and positive.")
+    return np.asarray(
+        (np.asarray(values, dtype=np.float64) - feature_spec.center_value) / feature_spec.rms_scale,
+        dtype=np.float64,
+    )
 
 
 def _initialize_scale_model(
@@ -13639,12 +13763,51 @@ def _metadata_baseline_scales_from_coefficients(
     if design_matrix.shape[1] == 0:
         return np.ones(design_matrix.shape[0], dtype=np.float64)
     linear_prediction = design_matrix @ scale_model_coefficients
+    return _metadata_baseline_scales_from_log_predictions(
+        log_predictions=linear_prediction,
+        config=config,
+    )
+
+
+def _metadata_baseline_scales_from_log_predictions(
+    *,
+    log_predictions: NDArray,
+    config: ModelConfig,
+) -> NDArray:
     bounded_log_scales = np.clip(
-        linear_prediction,
+        np.asarray(log_predictions, dtype=np.float64),
         np.log(config.prior_scale_floor),
         np.log(config.prior_scale_ceiling),
     )
     return np.exp(bounded_log_scales).astype(np.float64)
+
+
+def _support_bounded_member_log_scale_predictions(
+    *,
+    member_design_matrix: NDArray,
+    reduced_design_matrix: NDArray,
+    scale_model_coefficients: NDArray,
+) -> NDArray:
+    member_design = np.asarray(member_design_matrix, dtype=np.float64)
+    reduced_design = np.asarray(reduced_design_matrix, dtype=np.float64)
+    coefficients = np.asarray(scale_model_coefficients, dtype=np.float64)
+    if member_design.ndim != 2 or reduced_design.ndim != 2:
+        raise ValueError("Member and reduced scale-model designs must be two-dimensional.")
+    if reduced_design.shape[0] == 0:
+        raise ValueError("The reduced scale-model design must contain at least one fitted row.")
+    if member_design.shape[1] != reduced_design.shape[1] or coefficients.shape != (reduced_design.shape[1],):
+        raise ValueError("Scale-model designs and coefficients must share one feature dimension.")
+
+    member_predictions = member_design @ coefficients
+    reduced_predictions = reduced_design @ coefficients
+    return np.asarray(
+        np.clip(
+            member_predictions,
+            float(np.min(reduced_predictions)),
+            float(np.max(reduced_predictions)),
+        ),
+        dtype=np.float64,
+    )
 
 
 def _effective_prior_variances(
@@ -13658,6 +13821,33 @@ def _effective_prior_variances(
             1e-8,
         ),
         dtype=np.float64,
+    )
+
+
+def _scale_state_reduced_prior_variances(
+    *,
+    global_scale: float,
+    scale_model_coefficients: NDArray,
+    local_scale: NDArray,
+    design_matrix: NDArray,
+    config: ModelConfig,
+) -> NDArray:
+    """Return the identifiable prior operator induced by the scale state.
+
+    ``global_scale`` and ``local_scale`` can move in opposite directions
+    without changing the Gaussian prior seen by the posterior solve. Outer
+    convergence therefore tracks their effective product instead of treating
+    that harmless reparameterization as hyperparameter movement.
+    """
+    metadata_baseline_scales = _metadata_baseline_scales_from_coefficients(
+        scale_model_coefficients,
+        design_matrix,
+        config,
+    )
+    return _effective_prior_variances(
+        baseline_prior_variances=(float(global_scale) * metadata_baseline_scales) ** 2,
+        local_scale=local_scale,
+        config=config,
     )
 
 
@@ -13865,10 +14055,18 @@ def _member_prior_variances_from_reduced_state(
     tie_map: TieMap,
     scale_model_coefficients: NDArray,
     scale_model_feature_specs: Sequence[ScaleModelFeatureSpec],
+    reduced_design_matrix: NDArray,
     global_scale: float,
     local_scale: NDArray,
     config: ModelConfig,
 ) -> NDArray:
+    reduced_design = np.asarray(reduced_design_matrix, dtype=np.float64)
+    reduced_local_scale = np.asarray(local_scale, dtype=np.float64)
+    expected_reduced_shape = (reduced_local_scale.shape[0], len(scale_model_feature_specs))
+    if reduced_design.shape != expected_reduced_shape:
+        raise ValueError(
+            "reduced_design_matrix must align with the reduced local-scale state and feature specs."
+        )
     feature_variant_classes = {
         feature_spec.variant_class
         for feature_spec in scale_model_feature_specs
@@ -13880,21 +14078,79 @@ def _member_prior_variances_from_reduced_state(
         annotation_tables=_prior_annotation_tables(member_records),
         class_membership_by_class=_class_membership_by_class(member_records, feature_variant_classes),
     )
-    member_baseline_scales = _metadata_baseline_scales_from_coefficients(
-        scale_model_coefficients=np.asarray(scale_model_coefficients, dtype=np.float64),
-        design_matrix=member_design_matrix,
+    coefficients = np.asarray(scale_model_coefficients, dtype=np.float64)
+    # A mixed exact-tie record can carry fractional memberships even though its
+    # individual members are pure levels. Reapplying a standardized contrast to
+    # those members can extrapolate the fitted scalar log scale far outside the
+    # support seen by the reduced model (for example, fitted predictions in
+    # [-0.43, +0.43] becoming +2.14 for one pure member). Neither the genotype
+    # likelihood nor the reduced prior fit identifies that extrapolation. Bound
+    # the allocation coordinate to the convex hull of fitted reduced log-scale
+    # predictions. Unlike per-feature clipping, this is invariant to any
+    # invertible recoding of the full-rank prior design.
+    supported_member_log_scales = _support_bounded_member_log_scale_predictions(
+        member_design_matrix=member_design_matrix,
+        reduced_design_matrix=reduced_design,
+        scale_model_coefficients=coefficients,
+    )
+    member_baseline_scales = _metadata_baseline_scales_from_log_predictions(
+        log_predictions=supported_member_log_scales,
         config=config,
     )
     member_baseline_prior_variances = (float(global_scale) * member_baseline_scales) ** 2
     member_local_scale = _expand_group_values_to_members(
-        reduced_values=np.asarray(local_scale, dtype=np.float64),
+        reduced_values=reduced_local_scale,
         tie_map=tie_map,
     )
-    return _effective_prior_variances(
+    provisional_member_variances = _effective_prior_variances(
         baseline_prior_variances=member_baseline_prior_variances,
         local_scale=member_local_scale,
         config=config,
     )
+    reduced_prior_variances = _scale_state_reduced_prior_variances(
+        global_scale=global_scale,
+        scale_model_coefficients=coefficients,
+        local_scale=reduced_local_scale,
+        design_matrix=reduced_design,
+        config=config,
+    )
+    return _normalize_member_variances_to_reduced_groups(
+        provisional_member_variances=provisional_member_variances,
+        reduced_prior_variances=reduced_prior_variances,
+        tie_map=tie_map,
+    )
+
+
+def _normalize_member_variances_to_reduced_groups(
+    *,
+    provisional_member_variances: NDArray,
+    reduced_prior_variances: NDArray,
+    tie_map: TieMap,
+) -> NDArray:
+    member_variances = np.asarray(provisional_member_variances, dtype=np.float64)
+    reduced_variances = np.asarray(reduced_prior_variances, dtype=np.float64)
+    if member_variances.shape != tie_map.original_to_reduced.shape:
+        raise ValueError("provisional_member_variances must align with the tie-map member space.")
+    if reduced_variances.shape != (tie_map.kept_indices.shape[0],):
+        raise ValueError("reduced_prior_variances must align with the tie-map reduced space.")
+
+    normalized_variances = np.zeros_like(member_variances)
+    if not tie_map.reduced_to_group:
+        normalized_variances[tie_map.kept_indices] = reduced_variances
+        return normalized_variances
+    if len(tie_map.reduced_to_group) != reduced_variances.shape[0]:
+        raise ValueError("tie-map groups must align with reduced_prior_variances.")
+
+    for reduced_index, tie_group in enumerate(tie_map.reduced_to_group):
+        group_member_indices = np.asarray(tie_group.member_indices, dtype=np.int32)
+        group_variances = member_variances[group_member_indices]
+        group_total = float(np.sum(group_variances))
+        if not np.isfinite(group_total) or group_total <= 0.0:
+            raise FloatingPointError("Exact-tie member prior variances must have a finite positive sum.")
+        normalized_variances[group_member_indices] = (
+            group_variances * (float(reduced_variances[reduced_index]) / group_total)
+        )
+    return normalized_variances
 
 
 def _tie_map_is_identity(tie_map: TieMap, *, member_count: int) -> bool:
@@ -13928,26 +14184,17 @@ def _expand_group_values_to_members(
 
 
 def _hyperparameter_relative_change(
-    current_beta: NDArray,
-    previous_beta: NDArray | None,
-    current_alpha: NDArray,
-    previous_alpha: NDArray | None,
-    current_local_scale: NDArray,
-    previous_local_scale: NDArray | None,
-    current_theta: NDArray,
-    previous_theta: NDArray | None,
+    current_reduced_prior_variances: NDArray,
+    previous_reduced_prior_variances: NDArray | None,
     current_tpb_shape_a_vector: NDArray,
     previous_tpb_shape_a_vector: NDArray | None,
     current_tpb_shape_b_vector: NDArray,
     previous_tpb_shape_b_vector: NDArray | None,
 ) -> float:
-    if previous_beta is None:
+    if previous_reduced_prior_variances is None:
         return float("inf")
     changes = [
-        _relative_change(current_beta, previous_beta),
-        _relative_change(current_alpha, previous_alpha),
-        _relative_change(current_local_scale, previous_local_scale),
-        _relative_change(current_theta, previous_theta),
+        _scaled_rms_change(current_reduced_prior_variances, previous_reduced_prior_variances),
         _relative_change(current_tpb_shape_a_vector, previous_tpb_shape_a_vector),
         _relative_change(current_tpb_shape_b_vector, previous_tpb_shape_b_vector),
     ]
@@ -13965,13 +14212,22 @@ def _fit_state_convergence_change(
     current_objective: float,
     previous_objective: float | None,
 ) -> tuple[float, float, float, float]:
+    """Measure movement in the identifiable fitted state.
+
+    The ELBO remains a useful diagnostic, but it is not a valid stopping
+    coordinate here.  Its value can alternate when the beta-variance estimate
+    is refreshed versus reused, and it includes constants that move under
+    harmless scale reparameterizations.  Stopping therefore depends only on
+    coefficients and their induced linear predictor; the effective prior
+    operator is checked separately by ``_hyperparameter_relative_change``.
+    """
     coefficient_change = max(
         _scaled_rms_change(current_beta, previous_beta),
         _scaled_rms_change(current_alpha, previous_alpha),
     )
     predictor_change = _scaled_rms_change(current_linear_predictor, previous_linear_predictor)
     objective_change = _relative_objective_change(current_objective, previous_objective)
-    fit_change = max(coefficient_change, predictor_change, objective_change)
+    fit_change = max(coefficient_change, predictor_change)
     return (
         float(fit_change),
         float(predictor_change),

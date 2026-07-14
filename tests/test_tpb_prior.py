@@ -150,12 +150,11 @@ class TestMetadataScaleModel:
         prior_design = _build_prior_design(records)
 
         assert "factor_level::coding_annotation::true" in prior_design.feature_names
-        assert "factor_interaction::coding_annotation::true::deletion_short" in prior_design.feature_names
+        assert not any("factor_interaction::" in name for name in prior_design.feature_names)
         assert "continuous_spline::constraint_score::basis_0" in prior_design.feature_names
 
         coefficients = np.zeros(len(prior_design.feature_names), dtype=np.float64)
         coefficients[prior_design.feature_names.index("factor_level::coding_annotation::true")] = 0.3
-        coefficients[prior_design.feature_names.index("factor_interaction::coding_annotation::true::deletion_short")] = 0.5
         coefficients[prior_design.feature_names.index("continuous_spline::constraint_score::basis_0")] = 0.4
         baseline_scales = _metadata_baseline_scales_from_coefficients(
             coefficients,
@@ -257,57 +256,191 @@ class TestMetadataScaleModel:
         ]
         prior_design = _build_prior_design(records)
         coefficients = np.zeros(len(prior_design.feature_names), dtype=np.float64)
-        coefficients[prior_design.feature_names.index("continuous_spline_interaction::sv_length_score::deletion_short::basis_0")] = 0.5
-        coefficients[prior_design.feature_names.index("continuous_spline_interaction::sv_length_score::deletion_short::basis_1")] = -0.25
+        coefficients[prior_design.feature_names.index("continuous_spline::sv_length_score::basis_0")] = 0.5
+        coefficients[prior_design.feature_names.index("continuous_spline::sv_length_score::basis_1")] = -0.25
         baseline_scales = _metadata_baseline_scales_from_coefficients(coefficients, prior_design.design_matrix, ModelConfig())
-        assert "continuous_spline_interaction::sv_length_score::deletion_short::basis_0" in prior_design.feature_names
-        assert "continuous_spline_interaction::sv_length_score::deletion_short::basis_1" in prior_design.feature_names
+        assert "continuous_spline::sv_length_score::basis_0" in prior_design.feature_names
+        assert "continuous_spline::sv_length_score::basis_1" in prior_design.feature_names
         assert np.unique(np.round(baseline_scales, 6)).shape[0] > 1
 
     def test_schema_driven_annotations_compile_categorical_nested_and_membership_terms(self):
-        records = [
-            VariantRecord(
-                "sv_a",
-                VariantClass.DELETION_SHORT,
-                "chr1",
-                100,
-                prior_categorical_features={"functional_state": "lof"},
-                prior_membership_features={"regulatory_mix": {"enhancer": 0.8, "promoter": 0.2}},
-                prior_nested_features={"gene_context": ("protein_coding", "exon")},
-            ),
-            VariantRecord(
-                "sv_b",
-                VariantClass.DELETION_SHORT,
-                "chr1",
-                101,
-                prior_categorical_features={"functional_state": "missense"},
-                prior_membership_features={"regulatory_mix": {"enhancer": 0.2, "promoter": 0.8}},
-                prior_nested_features={"gene_context": ("protein_coding", "intron")},
-            ),
-            VariantRecord(
-                "sv_c",
-                VariantClass.DELETION_SHORT,
-                "chr1",
-                102,
-                prior_categorical_features={"functional_state": "lof"},
-                prior_membership_features={"regulatory_mix": {"enhancer": 0.5, "promoter": 0.5}},
-                prior_nested_features={"gene_context": ("lncRNA", "exon")},
-            ),
+        nested_paths = [
+            ("protein_coding", "exon"),
+            ("protein_coding", "intron"),
+            ("lncRNA", "enhancer"),
+            ("lncRNA", "promoter"),
         ]
+        records = []
+        for record_index, (nested_path, functional_state, promoter_weight) in enumerate(
+            (
+                (nested_path, functional_state, promoter_weight)
+                for nested_path in nested_paths
+                for functional_state in ("lof", "missense")
+                for promoter_weight in (0.1, 0.35, 0.65, 0.9)
+            )
+        ):
+            records.append(
+                VariantRecord(
+                    f"sv_{record_index}",
+                    VariantClass.DELETION_SHORT,
+                    "chr1",
+                    100 + record_index,
+                    prior_categorical_features={"functional_state": functional_state},
+                    prior_membership_features={
+                        "regulatory_mix": {
+                            "enhancer": 1.0 - promoter_weight,
+                            "promoter": promoter_weight,
+                        }
+                    },
+                    prior_nested_features={"gene_context": nested_path},
+                )
+            )
         prior_design = _build_prior_design(records)
 
         assert "factor_level::functional_state::missense" in prior_design.feature_names
         assert "factor_level::regulatory_mix::promoter" in prior_design.feature_names
+        assert "nested_level::gene_context::0::lncRNA" not in prior_design.feature_names
         assert "nested_level::gene_context::0::protein_coding" in prior_design.feature_names
-        assert "nested_level::gene_context::1::protein_coding>exon" in prior_design.feature_names
+        assert "nested_level::gene_context::1::protein_coding>intron" in prior_design.feature_names
 
         coefficients = np.zeros(len(prior_design.feature_names), dtype=np.float64)
         coefficients[prior_design.feature_names.index("factor_level::functional_state::missense")] = 0.4
         coefficients[prior_design.feature_names.index("factor_level::regulatory_mix::promoter")] = 0.5
-        coefficients[prior_design.feature_names.index("nested_level::gene_context::1::protein_coding>exon")] = 0.6
+        coefficients[prior_design.feature_names.index("nested_level::gene_context::1::protein_coding>intron")] = 0.6
         baseline_scales = _metadata_baseline_scales_from_coefficients(coefficients, prior_design.design_matrix, ModelConfig())
 
         assert np.unique(np.round(baseline_scales, 6)).shape[0] > 1
+
+    def test_prior_design_is_full_rank_centered_and_unit_rms(self):
+        random_generator = np.random.default_rng(8)
+        variant_classes = [VariantClass.SNV, VariantClass.DELETION_SHORT, VariantClass.DUPLICATION_SHORT]
+        functional_states = ["lof", "missense", "neutral"]
+        nested_paths = [
+            ("coding", "exon"),
+            ("coding", "intron"),
+            ("noncoding", "enhancer"),
+            ("noncoding", "promoter"),
+        ]
+        records = [
+            VariantRecord(
+                f"variant_{record_index}",
+                variant_classes[int(random_generator.integers(len(variant_classes)))],
+                "chr1",
+                record_index,
+                prior_categorical_features={
+                    "functional_state": functional_states[int(random_generator.integers(len(functional_states)))]
+                },
+                prior_nested_features={
+                    "gene_context": nested_paths[int(random_generator.integers(len(nested_paths)))]
+                },
+                prior_continuous_features={"constraint_score": float(random_generator.normal())},
+            )
+            for record_index in range(160)
+        ]
+
+        design_matrix = _build_prior_design(records).design_matrix
+        singular_values = np.linalg.svd(design_matrix, compute_uv=False)
+
+        assert np.linalg.matrix_rank(design_matrix, tol=1e-10) == design_matrix.shape[1]
+        np.testing.assert_allclose(np.mean(design_matrix, axis=0), 0.0, atol=1e-12)
+        np.testing.assert_allclose(np.sqrt(np.mean(design_matrix * design_matrix, axis=0)), 1.0, atol=1e-12)
+        assert singular_values[0] / singular_values[-1] < 500.0
+
+    def test_reference_coding_preserves_saturated_class_varying_factor_predictors(self):
+        variant_classes = [VariantClass.SNV, VariantClass.DELETION_SHORT, VariantClass.DUPLICATION_SHORT]
+        records = [
+            VariantRecord(
+                f"variant_{record_index}",
+                variant_classes[record_index % len(variant_classes)],
+                "chr1",
+                record_index,
+                prior_binary_features={"coding": (record_index * 5 + record_index // 3) % 7 < 3},
+            )
+            for record_index in range(84)
+        ]
+        prior_design = _build_prior_design(records)
+        class_membership = np.column_stack(
+            [
+                np.asarray([record.variant_class == variant_class for record in records], dtype=np.float64)
+                for variant_class in variant_classes
+            ]
+        )
+        coding = np.asarray([record.prior_binary_features["coding"] for record in records], dtype=np.float64)
+
+        def centered(values: np.ndarray) -> np.ndarray:
+            return values - np.mean(values)
+
+        redundant_design = np.column_stack(
+            [
+                np.ones(len(records), dtype=np.float64),
+                *(centered(class_membership[:, class_index]) for class_index in range(len(variant_classes))),
+                centered(coding),
+                *(centered(coding * class_membership[:, class_index]) for class_index in range(len(variant_classes))),
+            ]
+        )
+        reference_coded_design = np.column_stack(
+            [np.ones(len(records), dtype=np.float64), prior_design.design_matrix]
+        )
+        redundant_coefficients = np.linspace(-0.7, 0.9, redundant_design.shape[1])
+        redundant_predictor = redundant_design @ redundant_coefficients
+        reference_coefficients, *_ = np.linalg.lstsq(reference_coded_design, redundant_predictor, rcond=None)
+
+        np.testing.assert_allclose(reference_coded_design @ reference_coefficients, redundant_predictor, atol=1e-12)
+
+    def test_rank_screen_prefers_first_main_effect_over_duplicate_annotation(self):
+        records = [
+            VariantRecord(
+                f"variant_{record_index}",
+                VariantClass.SNV,
+                "chr1",
+                record_index,
+                prior_binary_features={
+                    "canonical_annotation": record_index % 2 == 0,
+                    "duplicate_annotation": record_index % 2 == 0,
+                },
+            )
+            for record_index in range(12)
+        ]
+
+        prior_design = _build_prior_design(records)
+
+        assert prior_design.feature_names == ["factor_level::canonical_annotation::true"]
+        assert np.linalg.matrix_rank(prior_design.design_matrix) == 1
+
+    def test_compiled_scaling_is_reused_for_a_shifted_member_distribution(self):
+        training_records = [
+            VariantRecord("deletion", VariantClass.DELETION_SHORT, "chr1", 1),
+            VariantRecord("snv_1", VariantClass.SNV, "chr1", 2),
+            VariantRecord("snv_2", VariantClass.SNV, "chr1", 3),
+            VariantRecord("snv_3", VariantClass.SNV, "chr1", 4),
+        ]
+        prior_design = _build_prior_design(training_records)
+        member_records = [
+            VariantRecord("member_deletion", VariantClass.DELETION_SHORT, "chr1", 5),
+            VariantRecord("member_snv", VariantClass.SNV, "chr1", 6),
+        ]
+
+        member_design = _design_matrix_for_feature_specs(
+            records=member_records,
+            feature_specs=prior_design.feature_specs,
+            annotation_tables=_prior_annotation_tables(member_records),
+            class_membership_by_class=_class_membership_by_class(
+                member_records,
+                {
+                    feature_spec.variant_class
+                    for feature_spec in prior_design.feature_specs
+                    if feature_spec.variant_class is not None
+                },
+            ),
+        )
+
+        assert prior_design.feature_names == ["type_offset::deletion_short"]
+        training_rms = np.sqrt(3.0) / 4.0
+        np.testing.assert_allclose(
+            member_design[:, 0],
+            np.asarray([(1.0 - 0.25) / training_rms, (0.0 - 0.25) / training_rms]),
+        )
+        assert not np.isclose(np.mean(member_design[:, 0]), 0.0)
 
     def test_user_annotation_names_are_not_reserved_by_old_built_ins(self):
         record = VariantRecord(
