@@ -11,6 +11,36 @@ from sv_pgs.config import VariantClass
 
 NESTED_PATH_DELIMITER = ">"
 
+_TRUE_BOOLEAN_TOKENS = frozenset({"true", "t", "yes", "1"})
+_FALSE_BOOLEAN_TOKENS = frozenset({"false", "f", "no", "0"})
+
+
+def _parse_boolean(value: Any, field_name: str) -> bool:
+    """Parse a strict boolean.
+
+    Accepts real booleans, the integers/floats 0 and 1, and the case-insensitive
+    tokens "true"/"t"/"yes"/"1" and "false"/"f"/"no"/"0". Anything else raises.
+    Generic truthiness is never used: the strings "false" and "0" are False, not
+    True, so binary annotations ingested from TSV/CSV cannot silently invert.
+    """
+    if isinstance(value, (bool, np.bool_)):
+        return bool(value)
+    if isinstance(value, (int, float, np.integer, np.floating)):
+        numeric_value = float(value)
+        if numeric_value == 0.0:
+            return False
+        if numeric_value == 1.0:
+            return True
+        raise ValueError(field_name + " must be a boolean, 0, or 1; got " + repr(value) + ".")
+    if isinstance(value, str):
+        token = value.strip().lower()
+        if token in _TRUE_BOOLEAN_TOKENS:
+            return True
+        if token in _FALSE_BOOLEAN_TOKENS:
+            return False
+        raise ValueError(field_name + " could not be parsed as a boolean: " + repr(value) + ".")
+    raise ValueError(field_name + " could not be parsed as a boolean: " + repr(value) + ".")
+
 
 def _validate_prior_feature_name(feature_name: str, field_name: str) -> None:
     if not feature_name:
@@ -50,6 +80,9 @@ class VariantRecord:
     Carries all the non-genotype information about a variant that the model
     uses to set its prior: what type of variant it is, how long it is,
     how common it is, whether it overlaps a repeat region, etc.
+
+    Boolean fields (``is_repeat``, ``is_copy_number``, ``prior_binary_features``
+    values) are parsed strictly by :func:`_parse_boolean`, not by truthiness.
     """
     variant_id: str
     variant_class: VariantClass
@@ -89,10 +122,14 @@ class VariantRecord:
                 self.prior_class_membership = (1.0,)
             elif len(self.prior_class_members) != len(self.prior_class_membership):
                 raise ValueError("prior_class_members and prior_class_membership must have the same length.")
+            self.is_repeat = _parse_boolean(self.is_repeat, "is_repeat")
+            self.is_copy_number = _parse_boolean(self.is_copy_number, "is_copy_number")
             return
 
+        self.is_repeat = _parse_boolean(self.is_repeat, "is_repeat")
+        self.is_copy_number = _parse_boolean(self.is_copy_number, "is_copy_number")
         self.prior_binary_features = {
-            str(feature_name): bool(feature_value)
+            str(feature_name): _parse_boolean(feature_value, "prior_binary_features")
             for feature_name, feature_value in self.prior_binary_features.items()
         }
         for feature_name in self.prior_binary_features:
@@ -281,10 +318,10 @@ def normalize_variant_record(record: VariantRecord | dict[str, Any]) -> VariantR
             if record.get("training_support") is None
             else int(record["training_support"])
         ),
-        is_repeat=bool(record.get("is_repeat", False)),
-        is_copy_number=bool(record.get("is_copy_number", False)),
+        is_repeat=_parse_boolean(record.get("is_repeat", False), "is_repeat"),
+        is_copy_number=_parse_boolean(record.get("is_copy_number", False), "is_copy_number"),
         prior_binary_features={
-            str(feature_name): bool(feature_value)
+            str(feature_name): _parse_boolean(feature_value, "prior_binary_features")
             for feature_name, feature_value in record.get("prior_binary_features", {}).items()
         },
         prior_continuous_features={
