@@ -12765,7 +12765,9 @@ def _build_prior_design(records: Sequence[VariantRecord]) -> PriorDesign:
     class_membership_matrix = np.zeros((len(records), len(unique_classes)), dtype=np.float64)
     for record_index, record in enumerate(records):
         for prior_class, prior_weight in zip(record.prior_class_members, record.prior_class_membership, strict=True):
-            class_membership_matrix[record_index, class_lookup[prior_class]] = prior_weight
+            # VariantRecord rejects duplicate members; accumulate anyway so that a
+            # record built around validation cannot silently lose mixture mass.
+            class_membership_matrix[record_index, class_lookup[prior_class]] += prior_weight
 
     annotation_tables = _prior_annotation_tables(records)
     class_membership_by_class = {
