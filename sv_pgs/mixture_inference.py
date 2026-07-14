@@ -13269,7 +13269,7 @@ def _levels_to_encode(
         )
     )
     represented_weights = np.sum(
-        np.row_stack([np.asarray(level_weights_by_name[level_name], dtype=np.float64) for level_name in sorted_levels]),
+        np.vstack([np.asarray(level_weights_by_name[level_name], dtype=np.float64) for level_name in sorted_levels]),
         axis=0,
     )
     implicit_reference = np.asarray(parent_weights, dtype=np.float64) - represented_weights
