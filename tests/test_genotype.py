@@ -11,6 +11,23 @@ import sv_pgs.genotype as genotype_module
 from sv_pgs.genotype import ConcatenatedRawGenotypeMatrix, Int8RawGenotypeMatrix, RawGenotypeBatch, RawGenotypeMatrix, as_raw_genotype_matrix
 
 
+@pytest.fixture(autouse=True)
+def _ample_host_ram(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Pin the host-RAM reading the upload-staging plan consults.
+
+    The GPU tests fake the CUDA runtime but the staging plan still measures the
+    REAL host, so on a loaded machine the budget floors to zero, materialization
+    declines, and the tests fail for reasons that have nothing to do with the
+    code under test. Tests that exercise a tight budget monkeypatch
+    ``_host_upload_budget_bytes`` downstream of this and are unaffected.
+    """
+    monkeypatch.setattr(
+        genotype_module,
+        "_detect_available_host_ram_bytes",
+        lambda: 64 * 10**9,
+    )
+
+
 class _FakeCupyEvent:
     def __init__(self) -> None:
         self.synchronized = False
