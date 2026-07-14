@@ -117,7 +117,11 @@ class ModelConfig:
     maximum_tpb_shape: float = 10.0
 
     max_inner_newton_iterations: int = 20
-    newton_gradient_tolerance: float = 1e-6
+    # Shared gradient stopping tolerance for binary PG-IRLS and TR-Newton.
+    # Its default deliberately matches the outer variational tolerance: solving
+    # the binary subproblem more tightly than the state that consumes it wastes
+    # exact posterior factorizations below the fit's practical resolution.
+    binary_inner_tolerance: float = 1e-4
 
     linear_solver_tolerance: float = 1e-6
     maximum_linear_solver_iterations: int = 1024
@@ -243,8 +247,8 @@ class ModelConfig:
             raise ValueError("maximum_tpb_shape_iterations must be positive.")
         if self.max_inner_newton_iterations < 1:
             raise ValueError("max_inner_newton_iterations must be positive.")
-        if self.newton_gradient_tolerance <= 0.0:
-            raise ValueError("newton_gradient_tolerance must be positive.")
+        if self.binary_inner_tolerance <= 0.0:
+            raise ValueError("binary_inner_tolerance must be positive.")
         if self.linear_solver_tolerance <= 0.0:
             raise ValueError("linear_solver_tolerance must be positive.")
         if self.maximum_linear_solver_iterations < 1:

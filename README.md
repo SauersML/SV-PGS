@@ -94,6 +94,11 @@ sv1	1	0.82	lof	enhancer=0.7,promoter=0.3	protein_coding>exon
 sv2	0	0.15	missense	enhancer=0.2,promoter=0.8	protein_coding>intron
 ```
 
+Programmatic binary fits use `ModelConfig.binary_inner_tolerance` as the
+PG-IRLS/TR-Newton gradient stopping tolerance. Its `1e-4` default matches
+`convergence_tolerance`; tighter inner solves repeat expensive posterior
+factorizations below the resolution of the outer variational fit.
+
 ## Verify GPU runtime
 
 ```bash

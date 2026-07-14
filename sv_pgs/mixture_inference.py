@@ -71,6 +71,7 @@ import numpy as np
 from jax.scipy.linalg import solve_triangular as jax_solve_triangular
 from jax.scipy.special import digamma as jax_digamma
 from jax.scipy.special import gammaln as jax_gammaln
+from scipy.linalg import cholesky as scipy_cholesky
 from scipy.linalg import solve_triangular
 from scipy.linalg.blas import dsyrk
 from scipy.optimize import minimize
@@ -794,7 +795,7 @@ _CHECKPOINT_EXCLUDED_CONFIG_FIELDS = frozenset({
     "max_inner_newton_iterations",
     "max_outer_iterations",
     "maximum_linear_solver_iterations",
-    "newton_gradient_tolerance",
+    "binary_inner_tolerance",
     "posterior_variance_batch_size",
     "posterior_variance_probe_count",
     "posterior_working_set_coefficient_tolerance",
@@ -1172,7 +1173,7 @@ def _covariates_only_fit_result(
             predictor_offset=offset,
             minimum_weight=config.polya_gamma_minimum_weight,
             max_iterations=config.max_inner_newton_iterations,
-            gradient_tolerance=config.newton_gradient_tolerance,
+            gradient_tolerance=config.binary_inner_tolerance,
         )
         if trait_type == TraitType.BINARY
         else _initialize_alpha_state(
@@ -2311,7 +2312,7 @@ def fit_variational_em(
                         predictor_offset=predictor_offset_array + genetic_linear_predictor,
                         minimum_weight=config.polya_gamma_minimum_weight,
                         max_iterations=config.max_inner_newton_iterations,
-                        gradient_tolerance=config.newton_gradient_tolerance,
+                        gradient_tolerance=config.binary_inner_tolerance,
                         alpha_init=alpha_state,
                     )
                     sigma_error2 = 1.0
@@ -2478,7 +2479,7 @@ def fit_variational_em(
                 # never builds HVPs — so it only gets a warning.
                 _block_is_tr_newton = (
                     config.trait_type == TraitType.BINARY
-                    and bool(getattr(config, "use_tr_newton_binary", False))
+                    and config.use_tr_newton_binary
                 )
                 _original_block_size = int(len(block_indices))
 
@@ -2683,7 +2684,7 @@ def fit_variational_em(
                                 step_size=step_size,
                                 compute_beta_variance=refresh_beta_variance,
                             ),
-                            gradient_tolerance=config.newton_gradient_tolerance,
+                            gradient_tolerance=config.binary_inner_tolerance,
                             solver_tolerance=config.linear_solver_tolerance,
                             maximum_linear_solver_iterations=config.maximum_linear_solver_iterations,
                             logdet_probe_count=config.logdet_probe_count,
@@ -2699,13 +2700,10 @@ def fit_variational_em(
                             update_blend_weight=step_size,
                             resume_state=active_binary_resume_state,
                             progress_callback=_save_partial_binary_block if checkpoint_callback is not None else None,
-                            progress_checkpoint_seconds=float(
-                                getattr(config, "binary_inner_checkpoint_minutes", 15.0)
-                            )
-                            * 60.0,
+                            progress_checkpoint_seconds=15.0 * 60.0,
                             restricted_posterior_warm_start=restricted_posterior_warm_start,
                             allow_gpu_exact_variant=allow_gpu_exact_variant_for_block,
-                            use_tr_newton_binary=bool(getattr(config, "use_tr_newton_binary", False)),
+                            use_tr_newton_binary=config.use_tr_newton_binary,
                         )
                         block_beta_candidate = np.asarray(block_state[1], dtype=np.float64)
                         block_beta_variance = (
@@ -2902,7 +2900,7 @@ def fit_variational_em(
                         predictor_offset=predictor_offset_array + genetic_linear_predictor,
                     minimum_weight=config.polya_gamma_minimum_weight,
                     max_iterations=config.max_inner_newton_iterations,
-                    gradient_tolerance=config.newton_gradient_tolerance,
+                    gradient_tolerance=config.binary_inner_tolerance,
                     alpha_init=alpha_state,
                 )
                 sigma_error2 = 1.0
@@ -4378,7 +4376,7 @@ def _fit_collapsed_posterior(
             beta_init=np.asarray(beta_init, dtype=np.float64),
             minimum_weight=config.polya_gamma_minimum_weight,
             max_iterations=config.max_inner_newton_iterations,
-            gradient_tolerance=config.newton_gradient_tolerance,
+            gradient_tolerance=config.binary_inner_tolerance,
             solver_tolerance=posterior_solver_tolerance,
             maximum_linear_solver_iterations=posterior_maximum_linear_solver_iterations,
             logdet_probe_count=config.logdet_probe_count,
@@ -4399,7 +4397,7 @@ def _fit_collapsed_posterior(
             restricted_posterior_warm_start=restricted_posterior_warm_start,
             allow_gpu_exact_variant=allow_gpu_exact_variant,
             prior_precision_override=prior_precision_override_array,
-            use_tr_newton_binary=bool(getattr(config, "use_tr_newton_binary", False)),
+            use_tr_newton_binary=config.use_tr_newton_binary,
         )
         beta_variance = _effective_beta_variance_state(
             compute_beta_variance=compute_beta_variance,
@@ -9953,7 +9951,6 @@ def _solve_restricted_exact_variant_space(
     prior_precision: NDArray,
     inverse_diagonal_noise: NDArray,
     covariate_precision_cholesky: NDArray,
-    apply_projector: Callable[[NDArray], NDArray],
     posterior_variance_batch_size: int,
     compute_beta_variance: bool,
     compute_logdet: bool,
@@ -10412,43 +10409,60 @@ def _solve_restricted_exact_variant_space(
         np.sqrt(inverse_noise_f64)[:, None],
         out=weighted_genotypes,
     )
-    raw_gram_lower = dsyrk(
+    # DSYRK leaves the unused upper triangle unspecified.  The downstream
+    # SciPy Cholesky consumes the lower triangle directly, so keep this buffer
+    # triangular instead of allocating and filling a mirrored copy.
+    variant_precision_matrix = dsyrk(
         1.0,
         weighted_genotypes,
         trans=1,
         lower=1,
         overwrite_c=0,
     )
-    variant_precision_matrix = np.tril(raw_gram_lower)
-    variant_precision_matrix += np.tril(raw_gram_lower, k=-1).T
 
     weighted_targets = inverse_noise_f64 * np.asarray(targets, dtype=np.float64)
     variant_rhs = dense_genotypes.T @ weighted_targets
     if covariate_matrix.shape[1] > 0:
         weighted_covariates = inverse_noise_f64[:, None] * covariate_matrix
         covariate_variant_crossproduct = weighted_covariates.T @ dense_genotypes
-        solved_covariate_variant_crossproduct = _cholesky_solve(
+        whitened_covariate_variant_crossproduct = solve_triangular(
             covariate_precision_cholesky,
             covariate_variant_crossproduct,
+            lower=True,
+            check_finite=False,
         )
-        covariate_correction = (
-            covariate_variant_crossproduct.T
-            @ solved_covariate_variant_crossproduct
-        )
-        # Roundoff in the two triangular solves can make the correction differ
-        # by a few ulps across triangles; explicitly restore symmetry before the
-        # Cholesky factorization.
-        variant_precision_matrix -= 0.5 * (
-            covariate_correction + covariate_correction.T
+        # If A = L L^T is the covariate precision and B = C^T W X, then
+        # B^T A^-1 B = (L^-1 B)^T (L^-1 B).  Accumulate its lower triangle
+        # straight into the raw Gram buffer: no p-by-p correction or mirrored
+        # precision temporary is needed.
+        variant_precision_matrix = dsyrk(
+            -1.0,
+            whitened_covariate_variant_crossproduct,
+            beta=1.0,
+            c=variant_precision_matrix,
+            trans=1,
+            lower=1,
+            overwrite_c=1,
         )
         covariate_target_crossproduct = covariate_matrix.T @ weighted_targets
-        variant_rhs -= covariate_variant_crossproduct.T @ _cholesky_solve(
+        whitened_covariate_target = solve_triangular(
             covariate_precision_cholesky,
             covariate_target_crossproduct,
+            lower=True,
+            check_finite=False,
+        )
+        variant_rhs -= (
+            whitened_covariate_variant_crossproduct.T
+            @ whitened_covariate_target
         )
     diagonal_index = np.diag_indices(variant_count)
     variant_precision_matrix[diagonal_index] += prior_precision + 1e-8
-    variant_precision_cholesky = np.linalg.cholesky(variant_precision_matrix)
+    variant_precision_cholesky = scipy_cholesky(
+        variant_precision_matrix,
+        lower=True,
+        overwrite_a=True,
+        check_finite=False,
+    )
 
     def solve_variant_rhs(right_hand_side: NDArray) -> NDArray:
         return _cholesky_solve(variant_precision_cholesky, np.asarray(right_hand_side, dtype=np.float64))
@@ -10539,7 +10553,6 @@ def _solve_restricted_mean_only(
 ) -> tuple[NDArray, NDArray, NDArray, NDArray, float]:
     from sv_pgs.progress import log, mem
 
-    compute_jax_dtype = gpu_compute_jax_dtype()
     compute_np_dtype = gpu_compute_numpy_dtype()
     sample_count = genotype_matrix.shape[0]
     diagonal_noise = np.asarray(diagonal_noise, dtype=np.float64)
@@ -10638,12 +10651,6 @@ def _solve_restricted_mean_only(
     inverse_diagonal_noise, covariate_precision_cholesky, covariate_precision_logdet, apply_projector = (
         _restricted_precision_projector(covariate_matrix, diagonal_noise)
     )
-    apply_projector_jax = _build_restricted_projector_jax(
-        inverse_diagonal_noise=inverse_diagonal_noise,
-        covariate_matrix=covariate_matrix,
-        covariate_precision_cholesky=covariate_precision_cholesky,
-        compute_dtype=compute_jax_dtype,
-    )
     if _should_use_posterior_working_set(
         genotype_matrix=genotype_matrix,
         variant_count=variant_count,
@@ -10704,7 +10711,6 @@ def _solve_restricted_mean_only(
                 prior_precision=prior_precision,
                 inverse_diagonal_noise=inverse_diagonal_noise,
                 covariate_precision_cholesky=covariate_precision_cholesky,
-                apply_projector=apply_projector,
                 posterior_variance_batch_size=posterior_variance_batch_size,
                 compute_beta_variance=False,
                 compute_logdet=False,
@@ -10735,7 +10741,10 @@ def _solve_restricted_mean_only(
             )
             log(f"      preconditioner: {_timed_region_seconds(_t0, variant_space_timing_cupy):.1f}s  mem={mem()}")
             _t0 = _timed_region_start(variant_space_timing_cupy)
-            restricted_targets = apply_projector_jax(targets)
+            # The RHS is projected once. Reuse the already-built NumPy
+            # projector; the iterative operator owns the single JAX projector
+            # used on every PCG application.
+            restricted_targets = apply_projector(targets)
             variant_rhs = _genotype_transpose_matvec_result_numpy(
                 genotype_matrix,
                 restricted_targets,
@@ -11667,7 +11676,6 @@ def _solve_restricted_full(
             "_solve_restricted_full requires compute_logdet or compute_beta_variance. "
             "Use _solve_restricted_mean_only for point-estimate solves."
         )
-    compute_jax_dtype = gpu_compute_jax_dtype()
     compute_np_dtype = gpu_compute_numpy_dtype()
     sample_count = genotype_matrix.shape[0]
     diagonal_noise = np.asarray(diagonal_noise, dtype=np.float64)
@@ -11794,12 +11802,6 @@ def _solve_restricted_full(
     inverse_diagonal_noise, covariate_precision_cholesky, covariate_precision_logdet, apply_projector = (
         _restricted_precision_projector(covariate_matrix, diagonal_noise)
     )
-    apply_projector_jax = _build_restricted_projector_jax(
-        inverse_diagonal_noise=inverse_diagonal_noise,
-        covariate_matrix=covariate_matrix,
-        covariate_precision_cholesky=covariate_precision_cholesky,
-        compute_dtype=compute_jax_dtype,
-    )
     if _should_use_posterior_working_set(
         genotype_matrix=genotype_matrix,
         variant_count=variant_count,
@@ -11851,7 +11853,6 @@ def _solve_restricted_full(
                 prior_precision=prior_precision,
                 inverse_diagonal_noise=inverse_diagonal_noise,
                 covariate_precision_cholesky=covariate_precision_cholesky,
-                apply_projector=apply_projector,
                 posterior_variance_batch_size=posterior_variance_batch_size,
                 compute_beta_variance=compute_beta_variance,
                 compute_logdet=compute_logdet,
@@ -11882,7 +11883,10 @@ def _solve_restricted_full(
             )
             log(f"      preconditioner: {_timed_region_seconds(_t0, variant_space_timing_cupy):.1f}s  mem={mem()}")
             _t0 = _timed_region_start(variant_space_timing_cupy)
-            restricted_targets = apply_projector_jax(targets)
+            # The RHS is projected once. Reuse the already-built NumPy
+            # projector; the iterative operator owns the single JAX projector
+            # used on every PCG application.
+            restricted_targets = apply_projector(targets)
             variant_rhs = _genotype_transpose_matvec_result_numpy(
                 genotype_matrix,
                 restricted_targets,

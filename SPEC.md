@@ -11,7 +11,8 @@
 - Never silently swallow errors with bare `except Exception: pass`. If something fails, let it fail loud.
 - Only use UV, never pip.
 - Multi-GPU support is required. All visible CUDA devices must share resident genotype matmul work by column sharding.
-- Fully and unconditionally use JAX.
+- Use JAX for iterative accelerator routes. Direct CPU posterior solves use
+  NumPy/SciPy and must not initialize JAX dtypes or projectors.
 - Do not restrict or cap the number of variants included arbitrarily.
 - Do not restrict or cap the number of samples included.
 - The variant-class-specific prior structure is the core differentiator of this tool. Every inference path must use metadata-driven prior variances (variant type, length, repeat status) and per-variant local shrinkage (TPB). A generic LASSO/elastic net that applies the same penalty to all variants is not acceptable as a primary inference backend.

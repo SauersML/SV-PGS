@@ -2100,7 +2100,7 @@ def _fit_checkpoint_config_hash(
         "max_outer_iterations": int(config.max_outer_iterations),
         "convergence_tolerance": float(config.convergence_tolerance),
         "max_inner_newton_iterations": int(config.max_inner_newton_iterations),
-        "newton_gradient_tolerance": float(config.newton_gradient_tolerance),
+        "binary_inner_tolerance": float(config.binary_inner_tolerance),
         "linear_solver_tolerance": float(config.linear_solver_tolerance),
         "maximum_linear_solver_iterations": int(config.maximum_linear_solver_iterations),
         "beta_variance_update_interval": int(config.beta_variance_update_interval),

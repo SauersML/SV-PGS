@@ -499,7 +499,16 @@ class TestConfigValidation:
         with pytest.raises(ValueError):
             ModelConfig(max_inner_newton_iterations=0)
         with pytest.raises(ValueError):
-            ModelConfig(newton_gradient_tolerance=0.0)
+            ModelConfig(binary_inner_tolerance=0.0)
+
+    def test_binary_inner_tolerance_default_matches_outer_tolerance(self):
+        config = ModelConfig()
+        assert config.binary_inner_tolerance == 1e-4
+        assert config.binary_inner_tolerance == config.convergence_tolerance
+
+    def test_removed_newton_gradient_tolerance_is_not_accepted(self):
+        with pytest.raises(TypeError, match="newton_gradient_tolerance"):
+            ModelConfig(**{"newton_gradient_tolerance": 1e-6})
 
     def test_linear_solver_config_validated(self):
         with pytest.raises(ValueError):

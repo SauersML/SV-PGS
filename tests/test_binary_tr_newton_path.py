@@ -36,7 +36,7 @@ def _fit_once(problem: dict, *, use_tr_newton_binary: bool = True) -> tuple[np.n
         trait_type=TraitType.BINARY,
         max_outer_iterations=1,
         max_inner_newton_iterations=30,
-        newton_gradient_tolerance=1e-6,
+        binary_inner_tolerance=1e-6,
     )
     genotype_matrix = problem["raw"]
     p = int(genotype_matrix.shape[1])
@@ -52,7 +52,7 @@ def _fit_once(problem: dict, *, use_tr_newton_binary: bool = True) -> tuple[np.n
         beta_init=beta_init,
         minimum_weight=config.polya_gamma_minimum_weight,
         max_iterations=config.max_inner_newton_iterations,
-        gradient_tolerance=config.newton_gradient_tolerance,
+        gradient_tolerance=config.binary_inner_tolerance,
         compute_logdet=False,
         compute_beta_variance=False,
         # TR-Newton is opt-in (default False) so AoU binary fits don't spend

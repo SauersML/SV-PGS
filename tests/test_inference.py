@@ -4895,7 +4895,7 @@ def test_exact_variant_full_matrix_cpu_cache_reuses_materialization_across_solve
     ).astype(np.float64)
     targets = random_generator.normal(size=sample_count).astype(np.float64)
     diagonal_noise = np.ones(sample_count, dtype=np.float64)
-    inverse_diagonal_noise, covariate_precision_cholesky, _, apply_projector = (
+    inverse_diagonal_noise, covariate_precision_cholesky, _, _ = (
         _restricted_precision_projector(covariate_matrix, diagonal_noise)
     )
     warm_start = mixture_inference._RestrictedPosteriorWarmStart()
@@ -4918,7 +4918,6 @@ def test_exact_variant_full_matrix_cpu_cache_reuses_materialization_across_solve
             prior_precision=np.ones(variant_count, dtype=np.float64),
             inverse_diagonal_noise=inverse_diagonal_noise,
             covariate_precision_cholesky=covariate_precision_cholesky,
-            apply_projector=apply_projector,
             posterior_variance_batch_size=3,
             compute_beta_variance=False,
             compute_logdet=False,
@@ -4994,7 +4993,6 @@ def test_exact_variant_cpu_schur_solver_matches_explicit_projector(random_genera
             prior_precision=prior_precision,
             inverse_diagonal_noise=inverse_diagonal_noise,
             covariate_precision_cholesky=covariate_precision_cholesky,
-            apply_projector=apply_projector,
             posterior_variance_batch_size=4,
             compute_beta_variance=True,
             compute_logdet=True,
@@ -5011,6 +5009,227 @@ def test_exact_variant_cpu_schur_solver_matches_explicit_projector(random_genera
         atol=1e-11,
     )
     assert logdet == pytest.approx(expected_logdet, rel=1e-10, abs=1e-11)
+
+
+def test_exact_variant_cpu_factors_dsyrk_lower_triangle_in_place(
+    monkeypatch: pytest.MonkeyPatch,
+    random_generator,
+):
+    sample_count, variant_count = 13, 6
+    genotype_values = random_generator.normal(
+        size=(sample_count, variant_count)
+    ).astype(np.float32)
+    standardized = as_raw_genotype_matrix(genotype_values).standardized(
+        means=np.zeros(variant_count, dtype=np.float32),
+        scales=np.ones(variant_count, dtype=np.float32),
+    )
+    covariate_matrix = np.column_stack(
+        [np.ones(sample_count), random_generator.normal(size=sample_count)]
+    ).astype(np.float64)
+    targets = random_generator.normal(size=sample_count).astype(np.float64)
+    diagonal_noise = random_generator.uniform(0.4, 1.8, size=sample_count)
+    inverse_diagonal_noise, covariate_precision_cholesky, _, _ = (
+        _restricted_precision_projector(covariate_matrix, diagonal_noise)
+    )
+    original_dsyrk = mixture_inference.dsyrk
+    original_cholesky = mixture_inference.scipy_cholesky
+    dsyrk_options: list[dict[str, object]] = []
+    dsyrk_results: list[np.ndarray] = []
+    cholesky_options: dict[str, object] = {}
+    last_dsyrk_result: np.ndarray | None = None
+
+    def tracking_dsyrk(*args, **kwargs):
+        nonlocal last_dsyrk_result
+        dsyrk_options.append(dict(kwargs))
+        result = original_dsyrk(*args, **kwargs)
+        # A poisoned upper triangle proves both the update and factorization
+        # consume only the requested lower triangle.
+        result[np.triu_indices(variant_count, k=1)] = np.nan
+        dsyrk_results.append(result)
+        last_dsyrk_result = result
+        return result
+
+    def tracking_cholesky(matrix, **kwargs):
+        cholesky_options.update(kwargs)
+        assert matrix is last_dsyrk_result
+        upper_indices = np.triu_indices(variant_count, k=1)
+        assert np.all(np.isnan(np.asarray(matrix)[upper_indices]))
+        return original_cholesky(matrix, **kwargs)
+
+    monkeypatch.setattr(mixture_inference, "dsyrk", tracking_dsyrk)
+    monkeypatch.setattr(mixture_inference, "scipy_cholesky", tracking_cholesky)
+
+    mixture_inference._solve_restricted_exact_variant_space(
+        genotype_matrix=standardized,
+        covariate_matrix=covariate_matrix,
+        targets=targets,
+        prior_precision=np.ones(variant_count, dtype=np.float64),
+        inverse_diagonal_noise=inverse_diagonal_noise,
+        covariate_precision_cholesky=covariate_precision_cholesky,
+        posterior_variance_batch_size=3,
+        compute_beta_variance=False,
+        compute_logdet=False,
+        warm_start=None,
+    )
+
+    assert len(dsyrk_options) == 2
+    assert all(options["lower"] == 1 for options in dsyrk_options)
+    assert all(options["trans"] == 1 for options in dsyrk_options)
+    assert dsyrk_options[1]["beta"] == 1.0
+    assert dsyrk_options[1]["overwrite_c"] == 1
+    assert np.shares_memory(
+        np.asarray(dsyrk_options[1]["c"]),
+        dsyrk_results[0],
+    )
+    assert np.shares_memory(dsyrk_results[1], dsyrk_results[0])
+    assert cholesky_options == {
+        "lower": True,
+        "overwrite_a": True,
+        "check_finite": False,
+    }
+
+
+@pytest.mark.parametrize("full_posterior", [False, True])
+@pytest.mark.parametrize(
+    ("sample_count", "variant_count", "exact_solver_matrix_limit"),
+    [(14, 5, 5), (5, 14, 5)],
+    ids=["variant-space", "sample-space"],
+)
+def test_exact_numpy_routes_do_not_initialize_jax_solver_state(
+    monkeypatch: pytest.MonkeyPatch,
+    random_generator,
+    full_posterior: bool,
+    sample_count: int,
+    variant_count: int,
+    exact_solver_matrix_limit: int,
+):
+    genotype_values = random_generator.normal(
+        size=(sample_count, variant_count)
+    ).astype(np.float32)
+    standardized = as_raw_genotype_matrix(genotype_values).standardized(
+        means=np.zeros(variant_count, dtype=np.float32),
+        scales=np.ones(variant_count, dtype=np.float32),
+    )
+    covariate_matrix = np.column_stack(
+        [np.ones(sample_count), random_generator.normal(size=sample_count)]
+    ).astype(np.float64)
+    targets = random_generator.normal(size=sample_count).astype(np.float64)
+
+    def reject_jax_initialization(*_args, **_kwargs):
+        raise AssertionError("exact NumPy posterior route initialized JAX solver state")
+
+    monkeypatch.setattr(
+        mixture_inference,
+        "gpu_compute_jax_dtype",
+        reject_jax_initialization,
+    )
+    monkeypatch.setattr(
+        mixture_inference,
+        "_build_restricted_projector_jax",
+        reject_jax_initialization,
+    )
+    common_arguments = {
+        "genotype_matrix": standardized,
+        "covariate_matrix": covariate_matrix,
+        "targets": targets,
+        "prior_variances": np.ones(variant_count, dtype=np.float64),
+        "diagonal_noise": np.ones(sample_count, dtype=np.float64),
+        "solver_tolerance": 1e-6,
+        "maximum_linear_solver_iterations": 32,
+        "exact_solver_matrix_limit": exact_solver_matrix_limit,
+        "posterior_variance_batch_size": 3,
+        "random_seed": 7,
+        "allow_gpu_exact_variant": False,
+    }
+    if full_posterior:
+        result = mixture_inference._solve_restricted_full(
+            **common_arguments,
+            logdet_probe_count=2,
+            logdet_lanczos_steps=3,
+            posterior_variance_probe_count=2,
+            compute_logdet=True,
+            compute_beta_variance=True,
+        )
+    else:
+        result = mixture_inference._solve_restricted_mean_only(**common_arguments)
+
+    assert all(np.all(np.isfinite(np.asarray(value))) for value in result)
+
+
+@pytest.mark.parametrize("full_posterior", [False, True])
+def test_iterative_variant_routes_build_only_operator_jax_projector(
+    monkeypatch: pytest.MonkeyPatch,
+    random_generator,
+    full_posterior: bool,
+):
+    sample_count, variant_count = 8, 6
+    genotype_values = random_generator.normal(
+        size=(sample_count, variant_count)
+    ).astype(np.float32)
+    standardized = as_raw_genotype_matrix(genotype_values).standardized(
+        means=np.zeros(variant_count, dtype=np.float32),
+        scales=np.ones(variant_count, dtype=np.float32),
+    )
+    covariate_matrix = np.column_stack(
+        [np.ones(sample_count), random_generator.normal(size=sample_count)]
+    ).astype(np.float64)
+    targets = random_generator.normal(size=sample_count).astype(np.float64)
+    original_builder = mixture_inference._build_restricted_projector_jax
+    projector_builds = 0
+
+    def tracking_builder(*args, **kwargs):
+        nonlocal projector_builds
+        projector_builds += 1
+        return original_builder(*args, **kwargs)
+
+    monkeypatch.setattr(
+        mixture_inference,
+        "_build_restricted_projector_jax",
+        tracking_builder,
+    )
+    monkeypatch.setattr(
+        mixture_inference,
+        "_streaming_cupy_backend_available",
+        lambda _genotype_matrix: False,
+    )
+    monkeypatch.setattr(
+        mixture_inference,
+        "solve_spd_system",
+        lambda _operator, right_hand_side, **_kwargs: np.asarray(
+            right_hand_side,
+            dtype=np.float64,
+        ),
+    )
+    common_arguments = {
+        "genotype_matrix": standardized,
+        "covariate_matrix": covariate_matrix,
+        "targets": targets,
+        "prior_variances": np.ones(variant_count, dtype=np.float64),
+        "diagonal_noise": np.ones(sample_count, dtype=np.float64),
+        "solver_tolerance": 1e-6,
+        "maximum_linear_solver_iterations": 32,
+        "exact_solver_matrix_limit": 4,
+        "posterior_variance_batch_size": 3,
+        "random_seed": 7,
+        "allow_gpu_exact_variant": False,
+    }
+    if full_posterior:
+        result = mixture_inference._solve_restricted_full(
+            **common_arguments,
+            logdet_probe_count=2,
+            logdet_lanczos_steps=3,
+            posterior_variance_probe_count=2,
+            compute_logdet=False,
+            compute_beta_variance=True,
+        )
+    else:
+        result = mixture_inference._solve_restricted_mean_only(**common_arguments)
+
+    # The one-time RHS uses the numerically equivalent NumPy projector. Only
+    # the iterative operator captures a JAX projector; exact routes are covered
+    # by the sibling rejection test above and build neither.
+    assert projector_builds == 1
+    assert all(np.all(np.isfinite(np.asarray(value))) for value in result)
 
 
 def test_exact_variant_full_matrix_gpu_cache_reuses_expanded_block(monkeypatch: pytest.MonkeyPatch, random_generator):
