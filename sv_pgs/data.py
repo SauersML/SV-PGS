@@ -11,6 +11,10 @@ from sv_pgs.config import VariantClass
 
 NESTED_PATH_DELIMITER = ">"
 
+# Class-membership weights are mixture proportions: they must sum to one, up to
+# floating-point slack from the collapse/normalization paths that produce them.
+CLASS_MEMBERSHIP_SUM_TOLERANCE = 1e-6
+
 _TRUE_BOOLEAN_TOKENS = frozenset({"true", "t", "yes", "1"})
 _FALSE_BOOLEAN_TOKENS = frozenset({"false", "f", "no", "0"})
 
@@ -40,6 +44,44 @@ def _parse_boolean(value: Any, field_name: str) -> bool:
             return False
         raise ValueError(field_name + " could not be parsed as a boolean: " + repr(value) + ".")
     raise ValueError(field_name + " could not be parsed as a boolean: " + repr(value) + ".")
+
+
+def _validate_class_membership(
+    prior_class_members: Sequence[VariantClass],
+    prior_class_membership: Sequence[float],
+) -> None:
+    if len(prior_class_members) != len(prior_class_membership):
+        raise ValueError("prior_class_members and prior_class_membership must have the same length.")
+    if not prior_class_members:
+        raise ValueError("prior_class_members cannot be empty when prior_class_membership is provided.")
+    duplicate_members = sorted(
+        {
+            _class_key(member_class)
+            for member_index, member_class in enumerate(prior_class_members)
+            if _class_key(member_class) in {_class_key(other) for other in prior_class_members[:member_index]}
+        }
+    )
+    if duplicate_members:
+        raise ValueError("prior_class_members cannot contain duplicates: " + ", ".join(duplicate_members))
+    membership_sum = 0.0
+    for member_weight in prior_class_membership:
+        weight_value = float(member_weight)
+        if not np.isfinite(weight_value):
+            raise ValueError("prior_class_membership weights must be finite.")
+        if weight_value < 0.0:
+            raise ValueError("prior_class_membership weights must be non-negative.")
+        membership_sum += weight_value
+    if membership_sum <= 0.0:
+        raise ValueError("prior_class_membership weights must sum to a positive value.")
+    if abs(membership_sum - 1.0) > CLASS_MEMBERSHIP_SUM_TOLERANCE:
+        raise ValueError(
+            "prior_class_membership weights are mixture proportions and must sum to 1.0"
+            f" (within {CLASS_MEMBERSHIP_SUM_TOLERANCE:g}); got {membership_sum!r}."
+        )
+
+
+def _class_key(member_class: Any) -> str:
+    return member_class.value if isinstance(member_class, VariantClass) else str(member_class)
 
 
 def _validate_prior_feature_name(feature_name: str, field_name: str) -> None:
@@ -81,6 +123,13 @@ class VariantRecord:
     uses to set its prior: what type of variant it is, how long it is,
     how common it is, whether it overlaps a repeat region, etc.
 
+    ``prior_class_members`` / ``prior_class_membership`` are a soft assignment of
+    the variant to variant classes. The weights are mixture proportions: they must
+    be finite, non-negative, and sum to 1.0 (within ``CLASS_MEMBERSHIP_SUM_TOLERANCE``).
+    They are validated, never auto-normalized, and a class may appear at most once.
+    When both are omitted the variant is assigned to its own ``variant_class`` with
+    weight 1.0.
+
     Boolean fields (``is_repeat``, ``is_copy_number``, ``prior_binary_features``
     values) are parsed strictly by :func:`_parse_boolean`, not by truthiness.
     """
@@ -120,8 +169,8 @@ class VariantRecord:
             if not self.prior_class_members and not self.prior_class_membership:
                 self.prior_class_members = (self.variant_class,)
                 self.prior_class_membership = (1.0,)
-            elif len(self.prior_class_members) != len(self.prior_class_membership):
-                raise ValueError("prior_class_members and prior_class_membership must have the same length.")
+            else:
+                _validate_class_membership(self.prior_class_members, self.prior_class_membership)
             self.is_repeat = _parse_boolean(self.is_repeat, "is_repeat")
             self.is_copy_number = _parse_boolean(self.is_copy_number, "is_copy_number")
             return
@@ -213,10 +262,7 @@ class VariantRecord:
             self.prior_class_members = (self.variant_class,)
             self.prior_class_membership = (1.0,)
             return
-        if len(self.prior_class_members) != len(self.prior_class_membership):
-            raise ValueError("prior_class_members and prior_class_membership must have the same length.")
-        if not self.prior_class_members:
-            raise ValueError("prior_class_members cannot be empty when prior_class_membership is provided.")
+        _validate_class_membership(self.prior_class_members, self.prior_class_membership)
 
 
 @dataclass(slots=True)
