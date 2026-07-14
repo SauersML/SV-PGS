@@ -8170,7 +8170,11 @@ def _solve_sample_space_rhs_gpu_inner(
         if np.all(done):
             break
         refreshed_residual_gpu = residual_gpu[:, active_columns]
-        refreshed_preconditioned_gpu = preconditioner(refreshed_residual_gpu)
+        # A callable preconditioner may assign different semantics to each
+        # right-hand-side column (the mixed solve does this for required and
+        # log-determinant columns). Preserve those global column positions
+        # after earlier columns converge, then select the still-active result.
+        refreshed_preconditioned_gpu = preconditioner(residual_gpu)[:, active_columns]
         updated_residual_dot_active = _gpu_to_f64(
             cp.sum(
                 refreshed_residual_gpu * refreshed_preconditioned_gpu,
@@ -9224,7 +9228,7 @@ def _solve_sample_space_rhs_cpu(
             refreshed_residual
             if apply_preconditioner is None and preconditioner is None
             else (
-                np.asarray(apply_preconditioner(refreshed_residual), dtype=np.float64)
+                np.asarray(apply_preconditioner(residual), dtype=np.float64)[:, active_columns]
                 if apply_preconditioner is not None
                 else refreshed_residual / np.maximum(np.asarray(preconditioner, dtype=np.float64)[:, None], 1e-12)
             )

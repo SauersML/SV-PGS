@@ -4003,6 +4003,59 @@ def test_cpu_sample_space_block_cg_matches_dense_solution(monkeypatch: pytest.Mo
     covariance_matrix = np.diag(diagonal_noise) + genotype_matrix @ np.diag(prior_variances) @ genotype_matrix.T
     expected = np.linalg.solve(covariance_matrix, right_hand_side)
     np.testing.assert_allclose(actual, expected, rtol=1e-4, atol=2e-5)
+
+
+def test_cpu_sample_space_block_cg_preserves_callable_preconditioner_columns():
+    genotype_matrix = np.array(
+        [
+            [1.0, 0.0, 1.0],
+            [0.0, 1.0, 1.0],
+            [1.0, 1.0, 0.0],
+            [0.0, 1.0, 0.0],
+        ],
+        dtype=np.float32,
+    )
+    standardized = as_raw_genotype_matrix(genotype_matrix).standardized(
+        means=np.zeros(genotype_matrix.shape[1], dtype=np.float32),
+        scales=np.ones(genotype_matrix.shape[1], dtype=np.float32),
+    )
+    prior_variances = np.array([1.5, 0.75, 0.5], dtype=np.float64)
+    diagonal_noise = np.array([1.0, 1.25, 0.8, 1.1], dtype=np.float64)
+    right_hand_side = np.column_stack(
+        [
+            np.array([0.5, -1.0, 0.2, 1.5], dtype=np.float64),
+            np.array([-0.25, 0.75, 1.0, -0.5], dtype=np.float64),
+            np.array([1.0, -0.5, 0.75, 0.25], dtype=np.float64),
+        ]
+    )
+    covariance_matrix = np.diag(diagonal_noise) + genotype_matrix @ np.diag(prior_variances) @ genotype_matrix.T
+    preconditioner_call_shapes: list[tuple[int, ...]] = []
+
+    def column_aware_preconditioner(matrix: np.ndarray) -> np.ndarray:
+        preconditioner_call_shapes.append(matrix.shape)
+        assert matrix.shape == right_hand_side.shape
+        return matrix / np.diag(covariance_matrix)[:, None]
+
+    actual = mixture_inference._solve_sample_space_rhs_cpu(
+        genotype_matrix=standardized,
+        prior_variances=prior_variances,
+        diagonal_noise=diagonal_noise,
+        right_hand_side=right_hand_side,
+        initial_guess=np.zeros_like(right_hand_side),
+        tolerance=1e-7,
+        max_iterations=64,
+        preconditioner=column_aware_preconditioner,
+        batch_size=2,
+        column_iteration_limits=np.array([1, 64, 64], dtype=np.int32),
+        required_columns=np.array([False, True, True]),
+    )
+
+    expected = np.linalg.solve(covariance_matrix, right_hand_side)
+    assert len(preconditioner_call_shapes) > 2
+    assert set(preconditioner_call_shapes) == {right_hand_side.shape}
+    np.testing.assert_allclose(actual[:, 1:], expected[:, 1:], rtol=1e-4, atol=2e-5)
+
+
 def test_orthogonal_probe_matrix_has_expected_column_norms_and_shape():
     probes = _orthogonal_probe_matrix(
         dimension=8,
