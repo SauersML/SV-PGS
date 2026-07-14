@@ -15,7 +15,7 @@ import pytest
 from sv_pgs.genotype import DenseRawGenotypeMatrix, StandardizedGenotypeMatrix
 from sv_pgs.gpu_scheduler import GPUScheduler
 from sv_pgs.ld_block_partition import LdBlockPartition, build_ld_block_partition
-from sv_pgs.ld_blocks import load_ld_blocks, block_partition
+from sv_pgs.ld_blocks import load_ld_blocks
 
 
 # ---------------------------------------------------------------------------

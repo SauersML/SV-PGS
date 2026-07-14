@@ -17,12 +17,10 @@ What we pin:
 """
 from __future__ import annotations
 
-import logging
 import types
 from pathlib import Path
 
 import numpy as np
-import pytest
 
 from sv_pgs import pipeline as pipeline_module
 from sv_pgs.artifact import save_artifact

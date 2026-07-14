@@ -18,11 +18,6 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
-cupy = pytest.importorskip(
-    "cupy",
-    reason="_compute_marginal_z_scores_concat dispatches int8/PLINK math through CuPy",
-)
-
 from sv_pgs.genotype import (
     ConcatenatedRawGenotypeMatrix,
     Int8RawGenotypeMatrix,
@@ -30,6 +25,11 @@ from sv_pgs.genotype import (
 )
 from sv_pgs.model import _compute_marginal_z_scores_concat
 from sv_pgs.preprocessing import compute_marginal_z_scores
+
+cupy = pytest.importorskip(
+    "cupy",
+    reason="_compute_marginal_z_scores_concat dispatches int8/PLINK math through CuPy",
+)
 
 
 def _build_int8_concat(

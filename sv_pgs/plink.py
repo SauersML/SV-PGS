@@ -9,12 +9,12 @@ from typing import TYPE_CHECKING, Any, Literal
 
 import numpy as np
 
+from sv_pgs._typing import I8Array, NDArray, U8Array
+
 if TYPE_CHECKING:
     from sv_pgs.mmap_reader import BedMmapReader
 
 _LOG = logging.getLogger(__name__)
-
-from sv_pgs._typing import I8Array, NDArray, U8Array
 
 PLINK1_MAGIC = b"\x6c\x1b\x01"
 PLINK1_HEADER_SIZE = 3

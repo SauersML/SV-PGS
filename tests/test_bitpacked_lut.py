@@ -1,10 +1,8 @@
 from __future__ import annotations
 
 import numpy as np
-import pytest
 
-lut_mod = pytest.importorskip("sv_pgs.bitpacked.lut")
-
+from sv_pgs.bitpacked import lut as lut_mod
 from sv_pgs.plink import _BYTE_DECODE_LUT_A1, _BYTE_DECODE_LUT_A2, PLINK_MISSING_INT8
 
 

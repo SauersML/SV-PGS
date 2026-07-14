@@ -5,6 +5,7 @@ from collections import deque
 from concurrent.futures import Future, ThreadPoolExecutor, TimeoutError as _FutureTimeoutError
 from contextlib import contextmanager
 from dataclasses import dataclass, field
+import importlib
 import io
 import os
 from pathlib import Path
@@ -14,17 +15,21 @@ import threading
 import time as _time_module
 from typing import Any, Iterator, Protocol, Sequence, TypeGuard, cast
 
-import sv_pgs._jax as _jax_side_effects  # side-effect: configures JAX/XLA env
-del _jax_side_effects
-import jax
-from jax import core as jax_core
-import jax.numpy as jnp
-from jax import dlpack as jax_dlpack
 import numpy as np
-from sv_pgs._jax import gpu_compute_jax_dtype, gpu_compute_numpy_dtype, jax_dense_linear_algebra_preferred
+from sv_pgs._jax import (
+    gpu_compute_jax_dtype,
+    gpu_compute_numpy_dtype,
+    jax_dense_linear_algebra_preferred,
+    jnp,
+)
 from sv_pgs._typing import JaxArray, NDArray
 from sv_pgs.plink import PLINK_MISSING_INT8, open_bed
 from sv_pgs.progress import log, mem
+
+# Importing sv_pgs._jax above configures JAX before these modules are loaded.
+jax = importlib.import_module("jax")
+jax_core = importlib.import_module("jax.core")
+jax_dlpack = importlib.import_module("jax.dlpack")
 
 DEFAULT_GENOTYPE_BATCH_SIZE = 1024  # fallback when sample count is unknown
 
@@ -2306,9 +2311,14 @@ def _standardize_int8_cupy(raw_values: Any, means: Any, scales: Any, cupy: Any, 
     return standardized.astype(resolved_dtype, copy=False) if needs_half_cast else standardized
 
 
-def _standardize_int8_cupy_into(raw_values: Any, means: Any, scales: Any, output: Any, cupy: Any, *, dtype: Any) -> Any:
+def _standardize_int8_cupy_into(
+    raw_values: Any,
+    means: Any,
+    scales: Any,
+    output: Any,
+    cupy: Any,
+) -> Any:
     """Standardize int8 genotypes into a caller-owned fp staging buffer."""
-    resolved_dtype = cupy.float32 if dtype is None else dtype
     half_dtype = getattr(cupy, "float16", None)
     # A float16 ``output`` would force the custom kernel to instantiate
     # T=__half, which nvrtc can't resolve on some builds (see
@@ -2912,8 +2922,6 @@ def _gpu_plink_pread_transpose_matmul_direct(
         )
 
     t_start = _time.monotonic()
-    last_log_time = t_start
-
     block_dim = 128
     n_batches_total = (n_variants_total + batch_size - 1) // batch_size
 
@@ -3038,7 +3046,6 @@ def _gpu_plink_pread_transpose_matmul_direct(
                     f"pread={pread_seconds:.1f}s upload={upload_seconds:.2f}s gpu={gpu_seconds:.2f}s "
                     f"elapsed={elapsed:.0f}s rate={rate:,.0f}v/s eta={eta:.0f}s  mem={mem()}"
                 )
-                last_log_time = now
     finally:
         # Cancel any pending prefetch (if we exited the loop via exception)
         # and shut down the executor so its worker thread joins cleanly.
@@ -4208,7 +4215,7 @@ def _gpu_int8_cache_variant_matmul(
         active_rows = row_stop - row_start
         staging_chunk = staging[:active_rows, :]
         raw_chunk = cache.raw_values[row_slice, raw_selector]
-        _standardize_int8_cupy_into(raw_chunk, means, scales, staging_chunk, cupy, dtype=dtype)
+        _standardize_int8_cupy_into(raw_chunk, means, scales, staging_chunk, cupy)
         result_gpu[row_slice, :] = staging_chunk @ matrix_gpu
     return result_gpu
 
@@ -4239,7 +4246,7 @@ def _gpu_int8_cache_transpose_matmul(
         active_rows = row_stop - row_start
         staging_chunk = staging[:active_rows, :]
         raw_chunk = cache.raw_values[row_slice, raw_selector]
-        _standardize_int8_cupy_into(raw_chunk, means, scales, staging_chunk, cupy, dtype=dtype)
+        _standardize_int8_cupy_into(raw_chunk, means, scales, staging_chunk, cupy)
         result_gpu += staging_chunk.T @ matrix_gpu[row_slice, :]
     return result_gpu
 

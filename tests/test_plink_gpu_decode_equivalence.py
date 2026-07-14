@@ -79,8 +79,6 @@ def test_gpu_decode_reference_matches_cpu_production(
 
 def test_all_byte_values_decode_correctly() -> None:
     """For each of 256 byte values, decode at every sample offset 0..3."""
-    rng = np.random.default_rng(0)
-    n_total_samples = 4
     bytes_per_variant = 1
     # 256 variants, each with a single byte cycling through all values.
     packed = np.arange(256, dtype=np.uint8).reshape(256, 1)

@@ -30,7 +30,6 @@ blocks above the diagonal mirror their results into out[v, u] as well.
 
 from __future__ import annotations
 
-import os
 from functools import lru_cache
 from typing import TYPE_CHECKING, Any
 

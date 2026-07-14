@@ -934,10 +934,6 @@ def _gcs_uri_for_gcsfuse_path(path: Path) -> str | None:
     if not _is_linux():
         return None
     resolved = _resolve_safely(Path(path))
-    try:
-        resolved_str = str(resolved)
-    except Exception:  # noqa: BLE001
-        return None
 
     # Scan /proc/mounts for gcsfuse entries; longest matching mount_point wins.
     best: tuple[Path, str] | None = None

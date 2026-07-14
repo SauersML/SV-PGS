@@ -31,7 +31,6 @@ from types import SimpleNamespace
 from typing import Any
 
 import numpy as np
-import pytest
 
 
 def _ensure_cupy_stub() -> Any:

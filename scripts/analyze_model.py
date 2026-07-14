@@ -599,10 +599,14 @@ def plot_length_distribution(rows: list[dict], out: Path):
     axes[-1].set_xlabel("Structural Variant Length", fontsize=12)
     tick_values = [0, 1, 2, 3, 4, 5, 6, 7]  # 1bp, 10bp, ..., 10Mb
     tick_labels_text = ["1 bp", "10 bp", "100 bp", "1 kb", "10 kb", "100 kb", "1 Mb", "10 Mb"]
-    valid = [(v, l) for v, l in zip(tick_values, tick_labels_text) if v >= axes[-1].get_xlim()[0] and v <= axes[-1].get_xlim()[1]]
+    valid = [
+        (value, label)
+        for value, label in zip(tick_values, tick_labels_text)
+        if axes[-1].get_xlim()[0] <= value <= axes[-1].get_xlim()[1]
+    ]
     if valid:
         axes[-1].set_xticks([v for v, _ in valid])
-        axes[-1].set_xticklabels([l for _, l in valid], fontsize=10)
+        axes[-1].set_xticklabels([label for _, label in valid], fontsize=10)
 
     fig.suptitle(
         "Length Distribution by Structural Variant Type",
@@ -766,7 +770,7 @@ def plot_summary_dashboard(rows: list[dict], summary: dict, out: Path):
     for t in autotexts:
         t.set_fontsize(8)
     ax.legend(
-        wedges, [f"{l} ({s:,})" for l, s in zip(labels, sizes)],
+        wedges, [f"{label} ({size:,})" for label, size in zip(labels, sizes)],
         fontsize=7, loc="center left", bbox_to_anchor=(-0.3, 0.5),
     )
     ax.set_title("Active Variants by\nStructural Variant Type", fontsize=11, fontweight="bold")

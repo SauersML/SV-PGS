@@ -17,13 +17,12 @@ cleanly when CuPy / CUDA isn't available.
 from __future__ import annotations
 
 import json
-import os
 from pathlib import Path
 
 import numpy as np
 import pytest
 
-cupy = pytest.importorskip("cupy")  # noqa: F841 - imported for skip side effect
+pytest.importorskip("cupy")
 
 
 def _write_synthetic_cohort(

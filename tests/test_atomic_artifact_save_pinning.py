@@ -15,8 +15,6 @@ preceded by tmp-file writes with fsync. We pin three properties:
 """
 from __future__ import annotations
 
-import json
-import os
 from pathlib import Path
 
 import numpy as np

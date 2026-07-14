@@ -8,8 +8,6 @@ gap instead of crashing the whole run.
 """
 from __future__ import annotations
 
-import types
-
 import numpy as np
 import pytest
 

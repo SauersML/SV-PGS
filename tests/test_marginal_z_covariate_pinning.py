@@ -85,7 +85,6 @@ def test_empty_active_returns_empty_array():
     """Zero active variants → empty z array (no crash)."""
     n = 16
     cov = np.ones((n, 1), dtype=np.float32)
-    raw = np.zeros((n, 0), dtype=np.float32)
     standardized = _build_standardized(np.ones((n, 1), dtype=np.float32))
     z = compute_marginal_z_scores(
         standardized_genotypes=standardized,

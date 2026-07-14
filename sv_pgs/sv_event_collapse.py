@@ -22,7 +22,6 @@ with a small local window. The asymptotic complexity is therefore
 from __future__ import annotations
 
 from collections import defaultdict
-from typing import Sequence
 
 from sv_pgs.config import STRUCTURAL_VARIANT_CLASSES, VariantClass
 from sv_pgs.data import VariantRecord

@@ -16,7 +16,8 @@ import argparse
 import json
 import sys
 import time
-from dataclasses import dataclass, asdict
+from dataclasses import asdict, dataclass
+from functools import partial
 from typing import Any
 
 
@@ -99,20 +100,20 @@ def _bench_scale(cp: Any, n_samples: int, n_variants: int) -> list[BenchRow]:
     # ---- gemv_nt: y[n_samples] += Z @ x[n_variants]
     x = cp.ones((n_variants,), dtype=cp.float32)
     y = cp.zeros((n_samples,), dtype=cp.float32)
-    t_ms = _bench_op(lambda: gemv_nt(packed, n_samples, x, mean, std, y))
+    t_ms = _bench_op(partial(gemv_nt, packed, n_samples, x, mean, std, y))
     gbps = (packed.nbytes) / (t_ms * 1e-3) / 1e9
     rows.append(BenchRow("gemv_nt", n_samples, n_variants, bytes_gb, t_ms, gbps, None))
 
     # ---- gemv_tn: g[n_variants] += Z.T @ y[n_samples]
     yv = cp.ones((n_samples,), dtype=cp.float32)
     g = cp.zeros((n_variants,), dtype=cp.float32)
-    t_ms = _bench_op(lambda: gemv_tn(packed, n_samples, yv, mean, std, g))
+    t_ms = _bench_op(partial(gemv_tn, packed, n_samples, yv, mean, std, g))
     gbps = (packed.nbytes) / (t_ms * 1e-3) / 1e9
     rows.append(BenchRow("gemv_tn", n_samples, n_variants, bytes_gb, t_ms, gbps, None))
 
     # ---- gemm_gram: B[n_variants, n_variants] += Z.T @ Z. FLOPS = 2 * n_samples * n_variants * (n_variants + 1) / 2.
     out = cp.zeros((n_variants, n_variants), dtype=cp.float32)
-    t_ms = _bench_op(lambda: gemm_gram(packed, n_samples, mean, std, out))
+    t_ms = _bench_op(partial(gemm_gram, packed, n_samples, mean, std, out))
     flops = 2.0 * float(n_samples) * float(n_variants) * float(n_variants + 1) / 2.0
     tflops = flops / (t_ms * 1e-3) / 1e12
     rows.append(BenchRow("gemm_gram", n_samples, n_variants, bytes_gb, t_ms, None, tflops))
@@ -125,7 +126,8 @@ def _bench_scale(cp: Any, n_samples: int, n_variants: int) -> list[BenchRow]:
     out_drhs = cp.zeros((n_variants,), dtype=cp.float64)
     out_orhs = cp.zeros((n_variants,), dtype=cp.float64)
     t_ms = _bench_op(
-        lambda: screen(
+        partial(
+            screen,
             packed,
             n_samples,
             out_count,

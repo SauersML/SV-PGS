@@ -23,7 +23,7 @@ from __future__ import annotations
 import contextlib
 import threading
 import time
-from typing import Any, Iterator
+from typing import Iterator
 
 
 _TLS = threading.local()

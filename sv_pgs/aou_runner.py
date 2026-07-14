@@ -4,12 +4,12 @@ from __future__ import annotations
 import gc
 import json
 import os
+import re
 import shutil
 import subprocess
 import time
 import uuid
 from collections.abc import Sequence
-from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -35,7 +35,6 @@ from sv_pgs.io import load_multi_source_dataset_from_files
 from sv_pgs.model import register_fit_checkpoint_path
 from sv_pgs.pipeline import run_training_pipeline
 from sv_pgs.progress import log, mem
-from sv_pgs._typing import NDArray
 
 # Local on-workbench mirror of remote AoU buckets. We download each VCF once
 # into work_dir.parent/.sv_pgs_cache/<subdir>/ and reuse it across runs; the
@@ -143,10 +142,8 @@ def _warn_if_work_dir_on_gcsfuse(work_dir: Path) -> None:
 # would be parsed by gsutil itself as an option flag (argument injection).
 # Reject anything that looks suspicious so a typo or hostile env never turns
 # into a command-line option.
-import re as _re
-
-_GSUTIL_PROJECT_RE = _re.compile(r"^[A-Za-z0-9][A-Za-z0-9_\-.:]*$")
-_GSUTIL_GS_URI_RE = _re.compile(r"^gs://[A-Za-z0-9_\-][A-Za-z0-9_\-./]*$")
+_GSUTIL_PROJECT_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_\-.:]*$")
+_GSUTIL_GS_URI_RE = re.compile(r"^gs://[A-Za-z0-9_\-][A-Za-z0-9_\-./]*$")
 
 
 def _cdr_storage_path() -> str:

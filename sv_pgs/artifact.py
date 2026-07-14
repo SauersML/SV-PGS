@@ -11,6 +11,10 @@ from typing import Any
 
 import numpy as np
 
+from sv_pgs._typing import F32Array
+from sv_pgs.config import ModelConfig, TraitType, VariantClass
+from sv_pgs.data import TieGroup, TieMap, VariantRecord, normalize_variant_records
+
 # A truncated/half-written arrays.npz raises zipfile.BadZipFile, which is NOT an
 # OSError/ValueError subclass; without it a corrupt artifact crashes the reuse
 # check instead of degrading to a clean refit. (json.JSONDecodeError IS a
@@ -47,10 +51,6 @@ def _fsync_parent_dir(path: Path) -> None:
 
 _LEGACY_DIAGNOSTICS_LOGGED = False
 _logger = logging.getLogger(__name__)
-
-from sv_pgs._typing import F32Array
-from sv_pgs.config import ModelConfig, TraitType, VariantClass
-from sv_pgs.data import VariantRecord, TieGroup, TieMap, normalize_variant_records
 
 
 @dataclass(slots=True)

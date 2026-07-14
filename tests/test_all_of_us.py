@@ -21,10 +21,35 @@ from sv_pgs.all_of_us import (
 from sv_pgs.cli import main
 from sv_pgs.config import ModelConfig
 from sv_pgs.io import load_multi_vcf_dataset_from_files
+from sv_pgs.preflight import AouPreflightReport
 
 
 @pytest.fixture(autouse=True)
-def _disable_aou_gpu_gate_for_unit_tests(monkeypatch: pytest.MonkeyPatch) -> None:
+def _isolate_aou_runtime_guards(monkeypatch: pytest.MonkeyPatch) -> None:
+    def successful_preflight(
+        cache_dir: Path,
+        *,
+        required_stage_bytes: int,
+        required_temp_bytes: int,
+    ) -> AouPreflightReport:
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        return AouPreflightReport(
+            cdr_storage_path=None,
+            workspace_bucket=None,
+            google_project=None,
+            cache_dir=cache_dir,
+            cache_storage_class="local_hot",
+            free_bytes=required_stage_bytes + required_temp_bytes,
+            required_stage_bytes=required_stage_bytes,
+            required_temp_bytes=required_temp_bytes,
+            cuda_visible_devices=["GPU 0: unit-test device"],
+            cupy_available=True,
+            cupy_devices=1,
+            jax_preallocate="false",
+            jax_mem_fraction=None,
+        )
+
+    monkeypatch.setattr(aou_runner, "check_aou_preflight", successful_preflight)
     monkeypatch.setattr("sv_pgs.genotype.require_gpu", lambda: None)
 
 

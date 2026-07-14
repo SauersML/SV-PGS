@@ -8,18 +8,14 @@ variant, all-missing column, constant y, singleton active set, zero variants).
 from __future__ import annotations
 
 import numpy as np
-import pytest
 
-pytest.importorskip("sv_pgs.bitpacked.cpu_reference")
-
-from sv_pgs.bitpacked.cpu_reference import (  # noqa: E402
+from sv_pgs.bitpacked.cpu_reference import (
     compute_mean_scale,
     cpu_gemm_gram,
     cpu_gemv_nt,
     cpu_gemv_tn,
     cpu_screen,
 )
-from sv_pgs.bitpacked.lut import make_decode_lut  # noqa: E402,F401
 
 
 # PLINK 1.9 packed-byte codes under count_a1=True: 0->2, 1->missing, 2->1, 3->0.
@@ -80,7 +76,7 @@ def test_n_samples_32():
 
 
 def test_n_variants_1():
-    n_s, n_v = 50, 1
+    n_s = 50
     rng = np.random.default_rng(3)
     dosages = [list(rng.integers(0, 3, size=n_s).tolist())]
     packed = _encode(dosages, n_s)

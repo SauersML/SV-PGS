@@ -16,6 +16,25 @@ from typing import Any, BinaryIO, Iterator, Literal, Sequence, cast
 
 import numpy as np
 
+from sv_pgs._typing import F32Array, I8Array, I32Array, NDArray
+from sv_pgs.config import ModelConfig, VariantClass
+from sv_pgs.data import NESTED_PATH_DELIMITER, VariantRecord, VariantStatistics
+from sv_pgs.genotype import (
+    ConcatenatedRawGenotypeMatrix,
+    IndexedRawGenotypeMatrix,
+    PlinkRawGenotypeMatrix,
+    RawGenotypeMatrix,
+    RowSubsetRawGenotypeMatrix,
+    as_raw_genotype_matrix,
+)
+from sv_pgs.plink import PLINK_MISSING_INT8
+from sv_pgs.preprocessing import (
+    _allele_frequencies_from_means,
+    _means_and_scales_with_floor,
+    compute_variant_statistics,
+)
+from sv_pgs.progress import log, mem
+
 # Exceptions meaning "this cache file is corrupt / truncated / half-written" —
 # every cache READ treats these as a clean miss (recompute / re-parse) rather
 # than crashing a multi-hour run. BadZipFile (np.load on a truncated .npz),
@@ -32,31 +51,6 @@ _CACHE_CORRUPTION_ERRORS: tuple[type[BaseException], ...] = (
     gzip.BadGzipFile,
     json.JSONDecodeError,
 )
-
-from sv_pgs._typing import F32Array, F64Array, I8Array, I32Array, NDArray
-from sv_pgs.config import ModelConfig, VariantClass
-from sv_pgs.data import NESTED_PATH_DELIMITER, VariantRecord, VariantStatistics
-from sv_pgs.plink import PLINK_MISSING_INT8
-from sv_pgs.genotype import (
-    ConcatenatedRawGenotypeMatrix,
-    IndexedRawGenotypeMatrix,
-    PlinkRawGenotypeMatrix,
-    RawGenotypeBatch,
-    RawGenotypeMatrix,
-    RowSubsetRawGenotypeMatrix,
-    _has_sufficient_free_space_for_int8_npy,
-    _int8_npy_header_bytes,
-    as_raw_genotype_matrix,
-    auto_batch_size_i8,
-)
-from sv_pgs.preprocessing import (
-    _allele_frequencies_from_means,
-    _batch_all_stats_i8,
-    _means_and_scales_with_floor,
-    compute_variant_statistics,
-)
-import jax.numpy as jnp
-from sv_pgs.progress import log, mem
 
 SV_LENGTH_THRESHOLD = 1_000.0
 DEFAULT_SAMPLE_ID_COLUMNS = ("sample_id", "research_id", "person_id")

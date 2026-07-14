@@ -20,13 +20,12 @@ from __future__ import annotations
 
 import gzip
 import json
-import os
 from pathlib import Path
 
 import numpy as np
 import pytest
 
-cupy = pytest.importorskip("cupy")  # noqa: F841
+pytest.importorskip("cupy")
 
 
 def _write_synthetic_cohort(

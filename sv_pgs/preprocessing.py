@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import importlib
 import os
 import uuid
 from dataclasses import dataclass
@@ -10,11 +11,7 @@ from typing import Any, Hashable, Iterator, Sequence, TypeVar, cast
 
 import numpy as np
 
-import sv_pgs._jax as _jax_side_effects  # side-effect: configures JAX/XLA env
-del _jax_side_effects
-import jax
-import jax.numpy as jnp
-
+from sv_pgs._jax import jnp
 from sv_pgs._typing import (
     BoolArray,
     F32Array,
@@ -40,6 +37,9 @@ from sv_pgs.genotype import (
 )
 from sv_pgs.plink import PLINK_MISSING_INT8
 from sv_pgs.progress import log, mem
+
+# Importing sv_pgs._jax above configures JAX before the runtime module is loaded.
+jax = importlib.import_module("jax")
 
 HARD_CALL_TIE_SIGNATURE_TARGET_BYTES = 256_000_000
 _HARD_CALL_EXACT_SIGNATURE_LUT = np.asarray(
