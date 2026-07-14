@@ -7,8 +7,8 @@ inside ``_solve_sample_space_rhs_gpu`` against silent regressions.
 
 The tests avoid real CuPy, BigQuery, network, GPU, or PLINK BED entirely:
 the genotype matrix is a duck-typed stub exposing only the fields the
-helpers touch (``_cupy_cache``, ``raw``, ``shape``,
-``try_materialize_gpu_subset``, ``try_materialize_gpu``), and ``cupy`` is
+helpers touch (``_cupy_cache``, ``raw``, ``shape``, and
+``try_materialize_gpu``), and ``cupy`` is
 either ``None`` or a minimal ``SimpleNamespace`` shim modeled on
 ``tests/test_gpu_materialization_budget_bugfixes.py`` /
 ``tests/test_gpu_memory_hygiene.py``.
@@ -33,8 +33,8 @@ import sv_pgs.mixture_inference as mi
 class _StubGenotypeMatrix:
     """Duck-typed stand-in for ``StandardizedGenotypeMatrix``.
 
-    The helpers only read ``_cupy_cache``, ``raw``, ``shape``, and the two
-    materialization methods; they never inspect anything else, so this is
+    The helpers only read ``_cupy_cache``, ``raw``, ``shape``, and
+    ``try_materialize_gpu``; they never inspect anything else, so this is
     sufficient to exercise install/release paths.
     """
 
@@ -47,7 +47,6 @@ class _StubGenotypeMatrix:
         cupy_cache: Any = None,
         materialize_result: bool = True,
         materialize_side_effect: BaseException | None = None,
-        provide_subset_method: bool = True,
     ) -> None:
         self._cupy_cache: Any = cupy_cache
         self.raw = raw
@@ -66,13 +65,6 @@ class _StubGenotypeMatrix:
             return self._materialize_result
 
         self.try_materialize_gpu = _try_materialize_gpu
-
-        if provide_subset_method:
-            # The install helper only checks the attribute exists; it never
-            # actually calls this. A noop returning None is enough.
-            self.try_materialize_gpu_subset = lambda *a, **kw: None
-        # When provide_subset_method is False, no attribute is set →
-        # ``getattr(..., "try_materialize_gpu_subset", None)`` returns None.
 
 
 class _FakeDevice:
@@ -138,9 +130,8 @@ def test_release_is_safe_when_cupy_is_none_and_no_cache() -> None:
 
 
 def test_install_short_circuits_when_materialize_method_missing() -> None:
-    # The install helper gates on the method it actually invokes,
-    # ``try_materialize_gpu`` (not the never-called ``try_materialize_gpu_subset``);
-    # when it is absent the helper must short-circuit without materializing.
+    # The install helper must short-circuit when its materialization operation
+    # is unavailable.
     gm = _StubGenotypeMatrix()
     delattr(gm, "try_materialize_gpu")
     fake_cupy = _make_fake_cupy()
@@ -151,27 +142,24 @@ def test_install_short_circuits_when_materialize_method_missing() -> None:
 
 
 # ---------------------------------------------------------------------------
-# 3. Budget exceeded → install refuses
+# 3. Materialization declined → install refuses
 # ---------------------------------------------------------------------------
 
 
-def test_install_refuses_when_materialize_declines(monkeypatch: pytest.MonkeyPatch) -> None:
-    # try_materialize_gpu is the SINGLE gate now (the premature budget pre-check
-    # was removed because it over-reserved fixed staging and rejected matrices
-    # the adaptive-staging plan accepts). When the matrix doesn't fit, the plan
-    # makes try_materialize_gpu return False (cheaply, no allocation) and the
-    # install refuses.
+def test_install_refuses_when_materialize_declines() -> None:
+    # The matrix owns the live plan-vs-budget decision. A declined
+    # materialization must leave the cache unowned and empty.
     gm = _StubGenotypeMatrix(n_rows=1000, n_cols=1000, materialize_result=False)
     fake_cupy = _make_fake_cupy()
 
     result = mi._try_install_cg_workset_resident_cache(gm, cupy=fake_cupy)
     assert result is False
     assert gm._cupy_cache is None
-    # It DID consult the real gate (vs the old pre-check that refused first).
+    # The live materialization gate was consulted exactly once.
     assert gm.materialize_calls == 1
 
 
-def test_install_refuses_when_matrix_empty(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_install_refuses_when_matrix_empty() -> None:
     # A degenerate (0-column) working set can't be materialized; the install
     # bails before touching try_materialize_gpu.
     gm = _StubGenotypeMatrix(n_rows=100, n_cols=0)
@@ -179,21 +167,6 @@ def test_install_refuses_when_matrix_empty(monkeypatch: pytest.MonkeyPatch) -> N
     result = mi._try_install_cg_workset_resident_cache(gm, cupy=fake_cupy)
     assert result is False
     assert gm.materialize_calls == 0
-
-
-def test_install_does_not_consult_budget_helper(monkeypatch: pytest.MonkeyPatch) -> None:
-    """The premature budget pre-check is gone — try_materialize_gpu (which runs
-    the adaptive-staging plan + cupy-pool release) is the single source of truth.
-    The install path must not even reach for the budget helper, so the module no
-    longer carries a reference to it."""
-    gm = _StubGenotypeMatrix()  # materialize_result=True
-    fake_cupy = _make_fake_cupy()
-
-    assert not hasattr(mi, "_call_gpu_materialization_budget_bytes")
-
-    result = mi._try_install_cg_workset_resident_cache(gm, cupy=fake_cupy)
-    assert result is True
-    assert gm.materialize_calls == 1
 
 
 # ---------------------------------------------------------------------------
@@ -244,7 +217,7 @@ def test_install_swallows_runtimeerror_from_try_materialize_gpu(
 # ---------------------------------------------------------------------------
 
 
-def test_install_succeeds_when_budget_fits(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_install_succeeds_when_materialization_succeeds() -> None:
     gm = _StubGenotypeMatrix(n_rows=32, n_cols=16)
     fake_cupy = _make_fake_cupy()
     result = mi._try_install_cg_workset_resident_cache(gm, cupy=fake_cupy)
