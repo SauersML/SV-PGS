@@ -141,6 +141,9 @@ class FittedState:
     nonzero_coefficients: F32Array
     nonzero_means: F32Array
     nonzero_scales: F32Array
+    # Per-variant posterior variance, aligned with ``full_variant_records``. Prediction
+    # needs it to integrate over the posterior rather than plug in its mean.
+    full_beta_variance: F32Array | None = None
     training_genetic_score: F32Array | None = None
     training_covariate_score: F32Array | None = None
     training_linear_predictor: F32Array | None = None
@@ -3182,6 +3185,23 @@ class BayesianPGS:
         )
         full_coefficients = np.zeros(total_variant_count, dtype=np.float32)
         full_coefficients[active_variant_indices] = active_coefficients
+        # Var(beta_member) = w_member^2 * Var(beta_group). expand() is linear and applies
+        # w_member * sign_member, so expand(ones) * expand(var) recovers exactly that and
+        # the signs square out -- no tie-map internals required.
+        expanded_unit = reduced_tie_map.expand_coefficients(
+            np.ones_like(fit_result.beta_reduced, dtype=np.float32),
+            group_weights=tie_group_weights,
+        )
+        expanded_variance = reduced_tie_map.expand_coefficients(
+            np.asarray(fit_result.beta_variance, dtype=np.float32),
+            group_weights=tie_group_weights,
+        )
+        active_variance = np.abs(
+            np.asarray(expanded_unit, dtype=np.float64)
+            * np.asarray(expanded_variance, dtype=np.float64)
+        )
+        full_beta_variance = np.zeros(total_variant_count, dtype=np.float32)
+        full_beta_variance[active_variant_indices] = active_variance.astype(np.float32)
         nonzero_coefficient_indices, nonzero_coefficients = _nonzero_coefficient_cache(full_coefficients)
         nonzero_means = np.asarray(prepared_arrays.means[nonzero_coefficient_indices], dtype=np.float32)
         nonzero_scales = np.asarray(prepared_arrays.scales[nonzero_coefficient_indices], dtype=np.float32)
@@ -3207,6 +3227,7 @@ class BayesianPGS:
             nonzero_coefficients=nonzero_coefficients,
             nonzero_means=nonzero_means,
             nonzero_scales=nonzero_scales,
+            full_beta_variance=full_beta_variance,
             training_genetic_score=training_genetic_score,
             training_covariate_score=training_covariate_score,
             training_linear_predictor=training_linear_predictor,
@@ -3281,10 +3302,65 @@ class BayesianPGS:
         log(f"  decision_function done  mem={mem()}")
         return np.asarray(genotype_component, dtype=np.float32), covariate_component
 
+    def predictor_variance(self, genotypes: RawGenotypeMatrix | NDArray) -> F32Array:
+        """Posterior variance of the linear predictor, per sample.
+
+        s2_i = sum_j x~_ij^2 Var(beta_j) under the fitted mean-field posterior. Variants
+        the model shrank hard carry almost no variance, so they barely widen it.
+        """
+        fitted_state = self._require_state()
+        raw_genotypes = as_raw_genotype_matrix(genotypes)
+        sample_count = raw_genotypes.shape[0]
+        variance = fitted_state.full_beta_variance
+        if variance is None:
+            return np.zeros(sample_count, dtype=np.float32)
+
+        variant_indices = np.flatnonzero(np.asarray(variance) > 0.0).astype(np.int32)
+        if variant_indices.shape[0] == 0:
+            return np.zeros(sample_count, dtype=np.float32)
+
+        means = np.asarray(fitted_state.preprocessor.means[variant_indices], dtype=np.float32)
+        scales = np.asarray(fitted_state.preprocessor.scales[variant_indices], dtype=np.float32)
+        variances = np.asarray(variance[variant_indices], dtype=np.float32)
+
+        result = np.zeros(sample_count, dtype=np.float32)
+        offset = 0
+        for batch in raw_genotypes.iter_column_batches(
+            variant_indices, batch_size=auto_batch_size(sample_count)
+        ):
+            width = batch.variant_indices.shape[0]
+            window = slice(offset, offset + width)
+            standardized = (
+                np.asarray(batch.values, dtype=np.float32) - means[window]
+            ) / scales[window]
+            result += (standardized ** 2) @ variances[window]
+            offset += width
+        return np.asarray(result, dtype=np.float32)
+
+    def posterior_predictive_logit(
+        self, genotypes: RawGenotypeMatrix | NDArray, covariates: NDArray
+    ) -> F32Array:
+        """The linear predictor damped by its own posterior uncertainty.
+
+        sigmoid(E[z]) is not E[sigmoid(z)]: the plug-in score is overconfident wherever the
+        posterior is wide. The probit approximation to the logistic-normal integral damps
+        the score by sqrt(1 + (pi/8) s2), which leaves a confident prediction alone and
+        pulls an uncertain one toward the prior.
+        """
+        mean_predictor = np.asarray(
+            self.decision_function(genotypes, covariates), dtype=np.float64
+        )
+        if self.config.trait_type != TraitType.BINARY:
+            return np.asarray(mean_predictor, dtype=np.float32)
+        predictor_variance = np.asarray(self.predictor_variance(genotypes), dtype=np.float64)
+        damping = np.sqrt(1.0 + (np.pi / 8.0) * np.maximum(predictor_variance, 0.0))
+        return np.asarray(mean_predictor / damping, dtype=np.float32)
+
     def predict_proba(self, genotypes: RawGenotypeMatrix | NDArray, covariates: NDArray) -> F32Array:
         if self.config.trait_type != TraitType.BINARY:
             raise ValueError("predict_proba is only available for binary traits.")
-        linear_predictor = self.decision_function(genotypes, covariates)
+        # Integrate over the posterior instead of plugging in its mean.
+        linear_predictor = self.posterior_predictive_logit(genotypes, covariates)
         positive_probability = np.asarray(stable_sigmoid(linear_predictor), dtype=np.float32)
         return np.column_stack([1.0 - positive_probability, positive_probability])
 
