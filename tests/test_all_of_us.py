@@ -99,6 +99,9 @@ def test_build_all_of_us_disease_sql_uses_workspace_cdr_and_snomed_concept_ances
     assert "JOIN `aou_workspace.cdr_dataset.observation` AS observation" in sql
     assert "concept_code = @snomed_code" in sql
     assert "primary_consent_date" in sql
+    # A case needs MIN_DISEASE_OCCURRENCES distinct diagnosis dates, not rows.
+    assert "COUNT(DISTINCT condition_start_date) AS phenotype_occurrence_count" in sql
+    assert "COUNT(*) AS phenotype_occurrence_count" not in sql
     # The snomed code must NOT be string-interpolated into the SQL itself.
     assert disease_definition.snomed_code not in sql
     parameter_values = {parameter.name: parameter for parameter in query_config.query_parameters}

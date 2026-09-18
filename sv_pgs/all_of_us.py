@@ -266,9 +266,11 @@ matched_conditions AS (
   )
 ),
 aggregated_conditions AS (
+  -- Occurrences are distinct diagnosis dates: several condition rows on one
+  -- day (one visit coded twice) are one occurrence, not a confirmation.
   SELECT
     person_id,
-    COUNT(*) AS phenotype_occurrence_count,
+    COUNT(DISTINCT condition_start_date) AS phenotype_occurrence_count,
     MIN(condition_start_date) AS first_condition_date
   FROM matched_conditions
   GROUP BY person_id
