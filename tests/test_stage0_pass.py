@@ -87,7 +87,8 @@ def test_correlation_matches_a_float64_reference() -> None:
         values = dosage[block.start : block.stop, members].T
         mean = values.mean(axis=0)
         deviation = values.std(axis=0)
-        varying = deviation > 0
+        varying = np.ptp(values, axis=0) > 0
+        deviation[~varying] = 0.0
         standardized = np.zeros_like(values)
         standardized[:, varying] = (values[:, varying] - mean[varying]) / deviation[varying]
         count, correlation, constant = block_correlation(block, [0, 2])
