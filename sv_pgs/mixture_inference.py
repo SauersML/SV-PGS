@@ -2976,6 +2976,7 @@ def fit_variational_em(
                 local_shape_a = prior_design.class_membership_matrix @ tpb_shape_a_vector
                 local_shape_b = prior_design.class_membership_matrix @ tpb_shape_b_vector
             auxiliary_delta = (local_shape_a + local_shape_b) / np.maximum(1.0 + local_scale, config.local_scale_floor)
+            epoch_solve_prior_variances = reduced_prior_variances
             reduced_prior_variances = _effective_prior_variances(
                 baseline_prior_variances=(float(global_scale) * _metadata_baseline_scales_from_coefficients(
                     scale_model_coefficients,
@@ -3000,7 +3001,15 @@ def fit_variational_em(
                     1e-8,
                 )
             if config.trait_type == TraitType.QUANTITATIVE:
-                leverage_weight = np.maximum(reduced_prior_variances - beta_variance_state, 0.0) / np.maximum(reduced_prior_variances, 1e-12)
+                # Leverage 1 - Sigma_jj / tau_j^2 is exact only against the prior
+                # the block solves used this epoch, not the one re-estimated
+                # above. Epochs without a variance refresh carry no posterior
+                # variance, so they contribute no leverage.
+                leverage_weight = (
+                    np.clip(1.0 - beta_variance_state / np.maximum(epoch_solve_prior_variances, 1e-12), 0.0, 1.0)
+                    if refresh_beta_variance
+                    else np.zeros_like(epoch_solve_prior_variances)
+                )
                 residual_vector = np.asarray(target_vector - linear_predictor, dtype=np.float64)
                 # Retain a meaningful residual dof floor: never let it collapse to 1, which
                 # would make sigma_e^2 blow up if total leverage approaches n. Use max(2, 1% of n).
@@ -3302,11 +3311,7 @@ def fit_variational_em(
         _cavi_cached_baseline_reduced_prior_variances: NDArray | None = None
         _cavi_cached_reduced_prior_variances: NDArray | None = None
         _cavi_cache_signature: tuple[object, ...] = ()
-        # Carries the most recent E_q[beta^2] across outer iterations so the
-        # E[1/lambda] precision override (opt-in) can be built from a prior
-        # iteration's posterior state at the top of the next outer step.
-        reduced_second_moment_carry: NDArray | None = None
-        # Restore CAVI-path inter-iteration carries from checkpoint so a
+        # Restore the CAVI-path inter-iteration carry from checkpoint so a
         # resumed run re-enters the same EM trajectory bit-identically. The
         # SVI path has an equivalent restore via ``resume_beta_variance_state``
         # (see line ~1530); this is the CAVI analog. Without this, the first
@@ -3321,14 +3326,6 @@ def fit_variational_em(
                 and np.asarray(saved_beta_variance).shape == (genotype_matrix.shape[1],)
             ):
                 beta_variance_state = np.asarray(saved_beta_variance, dtype=np.float64).copy()
-            saved_reduced_second_moment = resume_checkpoint.reduced_second_moment
-            if (
-                saved_reduced_second_moment is not None
-                and np.asarray(saved_reduced_second_moment).shape == (genotype_matrix.shape[1],)
-            ):
-                reduced_second_moment_carry = np.asarray(
-                    saved_reduced_second_moment, dtype=np.float64
-                ).copy()
         # Reset the bitpacked matvec/rmatvec/gram bucket once at loop entry so
         # any timings carried over from screening do not leak into iter 1.
         try:
@@ -3406,19 +3403,6 @@ def fit_variational_em(
                 variant_count=genotype_matrix.shape[1],
                 exact_solver_matrix_limit=config.exact_solver_matrix_limit,
             )
-
-            cavi_prior_precision_override: NDArray | None = None
-            if (
-                reduced_second_moment_carry is not None
-                and reduced_second_moment_carry.shape == reduced_prior_variances.shape
-            ):
-                cavi_prior_precision_override = _build_cavi_correct_prior_precision(
-                    reduced_second_moment=reduced_second_moment_carry,
-                    baseline_prior_variances=baseline_reduced_prior_variances,
-                    local_shape_a=local_shape_a,
-                    auxiliary_delta=auxiliary_delta,
-                    config=config,
-                )
             _em_profile_sync_if_bitpacked(genotype_matrix)
             _phase_t0 = time.perf_counter()
             posterior_state = _fit_collapsed_posterior(
@@ -3438,7 +3422,6 @@ def fit_variational_em(
                 restricted_posterior_warm_start=restricted_posterior_warm_start,
                 em_iteration_index=outer_iteration,
                 total_em_iterations=config.max_outer_iterations,
-                prior_precision_override=cavi_prior_precision_override,
             )
             _em_profile_sync_if_bitpacked(genotype_matrix)
             em_phase_seconds["posterior"] += time.perf_counter() - _phase_t0
@@ -3453,7 +3436,6 @@ def fit_variational_em(
             beta_variance_state = np.asarray(posterior_state.beta_variance, dtype=np.float64)
 
             reduced_second_moment = np.asarray(beta_state * beta_state + beta_variance_state, dtype=np.float64)
-            reduced_second_moment_carry = reduced_second_moment
             full_objective = posterior_state.collapsed_objective + _local_scale_prior_objective(
                 local_scale=local_scale,
                 auxiliary_delta=auxiliary_delta,
@@ -4039,15 +4021,12 @@ def fit_variational_em(
             final_hyperparameter_change = hyperparameter_change
             previous_reduced_prior_variances = convergence_reduced_prior_variances.copy()
             if checkpoint_callback is not None:
-                # Persist the CAVI-path inter-iteration carries (current
-                # beta variance + reduced second moment) so a resume re-enters
-                # the same EM trajectory bit-identically. Without these, the
-                # resumed iteration would re-initialise ``beta_variance_state``
-                # from the prior variances (line ~2452) and reset
-                # ``reduced_second_moment_carry`` to None — both feed back
-                # into the next iteration (the former drives the sigma_e^2
-                # ELBO update via ``stale_beta_variance``; the latter drives
-                # the GIG first-moment prior-precision override).
+                # Persist the CAVI-path inter-iteration carry (current beta
+                # variance) so a resume re-enters the same EM trajectory
+                # bit-identically. Without it, the resumed iteration would
+                # re-initialise ``beta_variance_state`` from the prior
+                # variances, which drives the sigma_e^2 update via
+                # ``stale_beta_variance``.
                 # When the hyperparameter update at this iteration was
                 # triggered only because this is the final iteration of the
                 # *current* fit (not because the iteration number is on the
@@ -4061,7 +4040,6 @@ def fit_variational_em(
                     _build_checkpoint(
                         iter_num,
                         beta_variance_state_override=beta_variance_state,
-                        reduced_second_moment_override=reduced_second_moment_carry,
                     )
                 )
 
@@ -4141,19 +4119,6 @@ def fit_variational_em(
         log(f"  EM loop done after {len(objective_history)} iterations, computing final posterior diagnostics...  mem={mem()}")
     else:
         log(f"  EM loop done after {len(objective_history)} iterations, computing final point estimates only...  mem={mem()}")
-    final_prior_precision_override: NDArray | None = None
-    if config.final_posterior_diagnostics and beta_variance_state is not None:
-        final_second_moment = np.asarray(
-            beta_state * beta_state + np.asarray(beta_variance_state, dtype=np.float64),
-            dtype=np.float64,
-        )
-        final_prior_precision_override = _build_cavi_correct_prior_precision(
-            reduced_second_moment=final_second_moment,
-            baseline_prior_variances=final_baseline_reduced_prior_variances,
-            local_shape_a=local_shape_a,
-            auxiliary_delta=auxiliary_delta,
-            config=config,
-        )
     final_state = _fit_collapsed_posterior(
         genotype_matrix=genotype_matrix,
         covariate_matrix=covariate_matrix,
@@ -4167,7 +4132,6 @@ def fit_variational_em(
         compute_logdet=bool(config.final_posterior_diagnostics),
         compute_beta_variance=bool(config.final_posterior_diagnostics),
         predictor_offset=predictor_offset_array,
-        prior_precision_override=final_prior_precision_override,
         restricted_posterior_warm_start=restricted_posterior_warm_start,
     )
     if config.trait_type == TraitType.BINARY:
@@ -4358,17 +4322,9 @@ def _fit_collapsed_posterior(
     total_em_iterations: int | None = None,
     update_blend_weight: float | None = None,
     allow_gpu_exact_variant: bool = True,
-    prior_precision_override: NDArray | None = None,
 ) -> PosteriorState:
     log(f"    collapsed posterior: trait={trait_type.value}  n_variants={genotype_matrix.shape[1]}  n_samples={genotype_matrix.shape[0]}  sigma_e2={sigma_error2:.6f}  mem={mem()}")
     prior_variances = np.maximum(np.asarray(reduced_prior_variances, dtype=np.float64), 1e-8)
-    prior_precision_override_array = (
-        np.asarray(prior_precision_override, dtype=np.float64)
-        if prior_precision_override is not None
-        else None
-    )
-    if prior_precision_override_array is not None and prior_precision_override_array.shape != prior_variances.shape:
-        raise ValueError("prior_precision_override must match reduced_prior_variances shape.")
     # Mirror the gpu_available check in _solve_restricted_full so the
     # solver-controls function knows whether GPU CG (cheap ~30ms/iter) will be used.
     _collapsed_gpu_available = (
@@ -4421,7 +4377,6 @@ def _fit_collapsed_posterior(
             restricted_posterior_warm_start=restricted_posterior_warm_start,
             update_blend_weight=update_blend_weight,
             allow_gpu_exact_variant=allow_gpu_exact_variant,
-            prior_precision_override=prior_precision_override_array,
         )
         beta_variance = _effective_beta_variance_state(
             compute_beta_variance=compute_beta_variance,
@@ -4460,7 +4415,6 @@ def _fit_collapsed_posterior(
             posterior_working_set_coefficient_tolerance=config.posterior_working_set_coefficient_tolerance,
             restricted_posterior_warm_start=restricted_posterior_warm_start,
             allow_gpu_exact_variant=allow_gpu_exact_variant,
-            prior_precision_override=prior_precision_override_array,
             use_tr_newton_binary=config.use_tr_newton_binary,
         )
         beta_variance = _effective_beta_variance_state(
@@ -4516,7 +4470,6 @@ def _quantitative_posterior_state(
     restricted_posterior_warm_start: _RestrictedPosteriorWarmStart | None = None,
     update_blend_weight: float | None = None,
     allow_gpu_exact_variant: bool = True,
-    prior_precision_override: NDArray | None = None,
 ) -> tuple[NDArray, NDArray, NDArray, NDArray, float, float]:
     standardized_genotypes = _as_standardized_genotype_matrix(genotype_matrix)
     # Quantitative block updates only use blend weight to relax upstream solver
@@ -4543,7 +4496,6 @@ def _quantitative_posterior_state(
             posterior_working_set_coefficient_tolerance=posterior_working_set_coefficient_tolerance,
             warm_start=restricted_posterior_warm_start,
             allow_gpu_exact_variant=allow_gpu_exact_variant,
-            prior_precision_override=prior_precision_override,
         )
         beta_variance = np.zeros_like(np.asarray(prior_variances, dtype=np.float64), dtype=np.float64)
         logdet_covariance = 0.0
@@ -4574,7 +4526,6 @@ def _quantitative_posterior_state(
                 posterior_working_set_coefficient_tolerance=posterior_working_set_coefficient_tolerance,
                 warm_start=restricted_posterior_warm_start,
                 allow_gpu_exact_variant=allow_gpu_exact_variant,
-                prior_precision_override=prior_precision_override,
             )
         )
     # Re-estimate noise variance.  Naive approach (just use residuals) would
@@ -4589,8 +4540,25 @@ def _quantitative_posterior_state(
     )
     residual_vector = targets - linear_predictor
     residual_sum_squares = float(np.dot(residual_vector, residual_vector))
-    # Exact ELBO stationary point; leverage proxy was only correct at convergence.
-    trace_term = float(sample_count) * float(np.sum(np.maximum(effective_beta_variance, 0.0)))
+    # Exact CAVI stationary point sigma_e^2 = (RSS + tr(Z'Z Cov)) / n with
+    # Z = [W | X] and Cov the joint posterior covariance of (alpha, beta) under
+    # the flat covariate prior. Cov = (Z'Z / sigma_e^2 + diag(0, 1/tau^2))^{-1}
+    # gives Z'Z Cov = sigma_e^2 (I - diag(0, 1/tau^2) Cov), so the trace needs
+    # only the diagonal: tr(Z'Z Cov) = sigma_e^2 (k + sum_j (1 - Cov_jj / tau_j^2)).
+    # n * sum_j Cov_jj equals it only for orthogonal genotype columns and
+    # overstates it several-fold under LD.
+    leverage_beta_variance = _effective_beta_variance_state(
+        compute_beta_variance=compute_beta_variance,
+        beta_variance=np.asarray(beta_variance, dtype=np.float64),
+        stale_beta_variance=stale_beta_variance,
+        prior_variances=np.asarray(prior_variances, dtype=np.float64),
+    )
+    variant_leverage = np.clip(
+        1.0 - leverage_beta_variance / np.asarray(prior_variances, dtype=np.float64),
+        0.0,
+        1.0,
+    )
+    trace_term = float(sigma_error2) * (float(covariate_matrix.shape[1]) + float(np.sum(variant_leverage)))
     sigma_error2_new = max((residual_sum_squares + trace_term) / sample_count, sigma_error_floor)
     # Restricted log-likelihood: measures how well the model explains the data
     # after accounting for model complexity (via log-determinant terms).
@@ -4965,30 +4933,12 @@ def _binary_posterior_state_tr_newton(
     posterior_working_set_coefficient_tolerance: float,
     restricted_posterior_warm_start: _RestrictedPosteriorWarmStart | None,
     allow_gpu_exact_variant: bool,
-    prior_precision_override: NDArray | None = None,
 ) -> tuple[NDArray, NDArray, NDArray, NDArray, float, int]:
     n_samples = int(genotype_matrix.shape[0])
     n_variants = int(genotype_matrix.shape[1])
     covariate_matrix_f64 = np.asarray(covariate_matrix, dtype=np.float64)
     target_array = np.asarray(targets, dtype=np.float64).reshape(-1)
     prior_variances_f64 = np.asarray(prior_variances, dtype=np.float64).reshape(-1)
-    # F3 verdict: the codex audit suggested feeding a CAVI-corrected prior
-    # precision (E[1/tau^2]) into the binary TR-Newton path, but the
-    # un-collapsed binary kernel parameterization expects variances
-    # E[tau^2] directly. Plumbing E[1/tau^2] through as 1/precision is
-    # NOT bitwise-equivalent (Jensen) and empirically drops AUC for the
-    # VCF end-to-end test. We accept the override for shape validation
-    # but feed prior_variances_f64 = E[tau^2] to TR-Newton.
-    if prior_precision_override is not None:
-        prior_precision_override_array: NDArray | None = np.maximum(
-            np.asarray(prior_precision_override, dtype=np.float64).reshape(-1), 0.0
-        )
-        assert prior_precision_override_array is not None
-        if prior_precision_override_array.shape != prior_variances_f64.shape:
-            raise ValueError("prior_precision_override must match prior_variances shape.")
-    else:
-        prior_precision_override_array = None
-    effective_prior_variances_for_tr_newton = prior_variances_f64
     alpha_init_f64 = np.asarray(alpha_init, dtype=np.float64).reshape(-1)
     beta_init_f64 = np.asarray(beta_init, dtype=np.float64).reshape(-1)
     predictor_offset_array = (
@@ -5116,7 +5066,7 @@ def _binary_posterior_state_tr_newton(
                 matvec_design_transpose=_design_mv_transpose_gpu,
                 covariate_matrix=covariate_matrix_f64,
                 targets=target_array,
-                prior_variances=effective_prior_variances_for_tr_newton,
+                prior_variances=prior_variances_f64,
                 predictor_offset=predictor_offset_array,
                 beta_init=beta_init_f64,
                 alpha_init=alpha_init_f64,
@@ -5132,7 +5082,7 @@ def _binary_posterior_state_tr_newton(
                 matvec_design_transpose=_design_mv_transpose,
                 covariate_matrix=covariate_matrix_f64,
                 targets=target_array,
-                prior_variances=effective_prior_variances_for_tr_newton,
+                prior_variances=prior_variances_f64,
                 predictor_offset=predictor_offset_array,
                 beta_init=beta_init_f64,
                 alpha_init=alpha_init_f64,
@@ -5218,16 +5168,12 @@ def _binary_posterior_state_tr_newton(
                 posterior_working_set_coefficient_tolerance=posterior_working_set_coefficient_tolerance,
                 warm_start=warm_start,
                 allow_gpu_exact_variant=allow_gpu_exact_variant,
-                prior_precision_override=prior_precision_override_array,
             )
             if compute_beta_variance:
                 beta_variance = np.asarray(beta_variance_refit, dtype=np.float64)
         except RuntimeError as exc:
             raise RuntimeError("TR-Newton variance/logdet refit failed.") from exc
 
-    # F3 verdict: keep the objective evaluation consistent with the
-    # variances actually fed into TR-Newton (E[tau^2]) — the
-    # prior_precision_override is rejected upstream for the binary path.
     prior_precision = np.asarray(
         1.0 / np.maximum(prior_variances_f64, 1e-8), dtype=np.float64
     )
@@ -5300,18 +5246,10 @@ def _binary_posterior_state(
     progress_callback: Callable[[dict[str, object]], None] | None = None,
     progress_checkpoint_seconds: float = _BINARY_INNER_CHECKPOINT_DEFAULT_SECONDS,
     allow_gpu_exact_variant: bool = True,
-    prior_precision_override: NDArray | None = None,
     use_tr_newton_binary: bool = False,
 ) -> tuple[NDArray, NDArray, NDArray, NDArray, float, int]:
     standardized_genotypes = _as_standardized_genotype_matrix(genotype_matrix)
-    if prior_precision_override is not None:
-        prior_precision = np.maximum(
-            np.asarray(prior_precision_override, dtype=np.float64), 0.0
-        )
-        if prior_precision.shape != np.asarray(prior_variances).shape:
-            raise ValueError("prior_precision_override must match prior_variances shape.")
-    else:
-        prior_precision = np.asarray(1.0 / np.maximum(prior_variances, 1e-8), dtype=np.float64)
+    prior_precision = np.asarray(1.0 / np.maximum(prior_variances, 1e-8), dtype=np.float64)
     # Honor the use_tr_newton_binary flag. The previous code ignored the
     # flag and unconditionally attempted TR-Newton when resume_state was
     # None, then fell back to PG-IRLS on timeout — wasting ~600s per outer
@@ -5348,7 +5286,6 @@ def _binary_posterior_state(
                 restricted_posterior_warm_start=restricted_posterior_warm_start,
                 minimum_weight=minimum_weight,
                 allow_gpu_exact_variant=allow_gpu_exact_variant,
-                prior_precision_override=prior_precision_override,
             )
             if tr_result is None:
                 raise RuntimeError("TR-Newton returned no posterior state.")
@@ -5594,7 +5531,6 @@ def _binary_posterior_state(
                 posterior_working_set_coefficient_tolerance=posterior_working_set_coefficient_tolerance,
                 warm_start=warm_start,
                 allow_gpu_exact_variant=allow_gpu_exact_variant,
-                prior_precision_override=prior_precision_override,
             )
         )
         solve_seconds = _timed_region_seconds(solve_start, timing_cupy)
@@ -5798,7 +5734,6 @@ def _binary_posterior_state(
                     posterior_working_set_coefficient_tolerance=posterior_working_set_coefficient_tolerance,
                     warm_start=warm_start,
                     allow_gpu_exact_variant=allow_gpu_exact_variant,
-                    prior_precision_override=prior_precision_override,
                 )
             )
         except RuntimeError as exc:
@@ -10564,30 +10499,6 @@ def _solve_restricted_exact_variant_space(
     return beta, genetic_linear_predictor, beta_variance, logdet_A
 
 
-def _resolved_prior_moments(
-    prior_variances: NDArray,
-    prior_precision_override: NDArray | None,
-) -> tuple[NDArray, NDArray]:
-    """Return the (variance, precision) pair every restricted-solve route shares.
-
-    Variant-space routes add ``prior_precision`` to X^T W X, sample-space
-    routes build D + X diag(prior_variances) X^T and set
-    beta = diag(prior_variances) X^T P r, and working sets screen with the
-    variances but certify KKT with the precision. An override therefore has
-    to define BOTH moments; otherwise the posterior depends on which route
-    the problem size selects.
-    """
-    floored_variances = np.maximum(np.asarray(prior_variances, dtype=np.float64), 1e-8)
-    if prior_precision_override is None:
-        return floored_variances, 1.0 / floored_variances
-    prior_precision = np.asarray(prior_precision_override, dtype=np.float64)
-    if prior_precision.shape != floored_variances.shape:
-        raise ValueError("prior_precision_override must match prior_variances shape.")
-    if not np.all(np.isfinite(prior_precision)) or np.any(prior_precision <= 0.0):
-        raise ValueError("prior_precision_override must be finite and strictly positive.")
-    return 1.0 / prior_precision, prior_precision
-
-
 def _stabilize_sample_space_solve_with_operator_ridge(
     attempt: Any,
     *,
@@ -10651,7 +10562,6 @@ def _solve_restricted_mean_only(
     posterior_working_set_coefficient_tolerance: float = 1e-4,
     allow_working_set: bool = True,
     allow_gpu_exact_variant: bool = True,
-    prior_precision_override: NDArray | None = None,
 ) -> tuple[NDArray, NDArray, NDArray, NDArray, float]:
     from sv_pgs.progress import log, mem
 
@@ -10661,7 +10571,8 @@ def _solve_restricted_mean_only(
     if diagonal_noise.shape != (sample_count,):
         raise ValueError("diagonal_noise must have one entry per sample.")
 
-    prior_variances, prior_precision = _resolved_prior_moments(prior_variances, prior_precision_override)
+    prior_variances = np.maximum(np.asarray(prior_variances, dtype=np.float64), 1e-8)
+    prior_precision = 1.0 / prior_variances
     variant_count = genotype_matrix.shape[1]
     use_exact_variant = variant_count <= exact_solver_matrix_limit
     use_gpu_exact_variant = allow_gpu_exact_variant and _use_gpu_exact_variant_solve(
@@ -11763,7 +11674,6 @@ def _solve_restricted_full(
     posterior_working_set_coefficient_tolerance: float = 1e-4,
     allow_working_set: bool = True,
     allow_gpu_exact_variant: bool = True,
-    prior_precision_override: NDArray | None = None,
 ) -> tuple[NDArray, NDArray, NDArray, NDArray, NDArray, float, float, float]:
     from sv_pgs.progress import log, mem
     if not compute_logdet and not compute_beta_variance:
@@ -11777,7 +11687,8 @@ def _solve_restricted_full(
     if diagonal_noise.shape != (sample_count,):
         raise ValueError("diagonal_noise must have one entry per sample.")
 
-    prior_variances, prior_precision = _resolved_prior_moments(prior_variances, prior_precision_override)
+    prior_variances = np.maximum(np.asarray(prior_variances, dtype=np.float64), 1e-8)
+    prior_precision = 1.0 / prior_variances
     variant_count = genotype_matrix.shape[1]
     use_exact_variant = variant_count <= exact_solver_matrix_limit
     use_gpu_exact_variant = allow_gpu_exact_variant and _use_gpu_exact_variant_solve(
@@ -14070,44 +13981,6 @@ def _update_local_scales(
         config.local_scale_floor,
     )
     return updated_local_scale, updated_auxiliary_delta
-
-
-def _build_cavi_correct_prior_precision(
-    *,
-    reduced_second_moment: NDArray,
-    baseline_prior_variances: NDArray,
-    local_shape_a: NDArray,
-    auxiliary_delta: NDArray,
-    config: ModelConfig,
-) -> NDArray:
-    """Build E[1/lambda] / (sigma_g^2 * s_j^2) precision array for variant beta.
-
-    ``baseline_prior_variances`` already encodes sigma_g^2 * s_j^2. The
-    inverse-first-moment of the GIG variational posterior is computed from the
-    current (chi, psi) parameters.
-    """
-    from sv_pgs.optimizer_helpers import gig_inverse_first_moment as _gig_inv_first_moment
-
-    baseline = np.maximum(np.asarray(baseline_prior_variances, dtype=np.float64), 1e-12)
-    chi = np.maximum(
-        np.asarray(reduced_second_moment, dtype=np.float64) / baseline,
-        1e-12,
-    )
-    p_parameter = np.asarray(local_shape_a, dtype=np.float64) - 0.5
-    current_auxiliary_delta = np.maximum(
-        np.asarray(auxiliary_delta, dtype=np.float64), config.local_scale_floor
-    )
-    psi = np.maximum(2.0 * current_auxiliary_delta, 1e-12)
-    inv_local_scale = np.asarray(
-        _gig_inv_first_moment(p_parameter=p_parameter, chi=chi, psi=psi),
-        dtype=np.float64,
-    )
-    precision = inv_local_scale / baseline
-    if precision.shape != np.asarray(reduced_second_moment).shape:
-        raise ValueError("precision shape must match reduced_second_moment shape.")
-    if not np.all(np.isfinite(precision)) or np.any(precision <= 0.0):
-        raise FloatingPointError("CAVI inverse local-scale precision produced invalid values.")
-    return np.asarray(precision, dtype=np.float64)
 
 
 # Compute the expected value of X^r where X ~ GIG(p, chi, psi).
