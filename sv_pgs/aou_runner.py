@@ -341,9 +341,13 @@ def _link_mounted_array_plink(work_dir: Path) -> bool:
     return True
 
 
+def _mounted_sv_vcf_relative_path(chromosome: int) -> str:
+    return f"wgs/short_read/structural_variants/vcf/full/{sv_vcf_name(chromosome)}"
+
+
 def _link_mounted_sv_vcf(chromosome: int, work_dir: Path) -> bool:
     name = sv_vcf_name(chromosome)
-    relative_vcf = f"wgs/short_read/structural_variants/vcf/full/{name}"
+    relative_vcf = _mounted_sv_vcf_relative_path(chromosome)
     mounted_vcf = _mounted_cdr_file(relative_vcf)
     mounted_tbi = _mounted_cdr_file(f"{relative_vcf}.tbi")
     if mounted_vcf is None or mounted_tbi is None:
@@ -1675,22 +1679,10 @@ def run_all_of_us(
     _preflight_cache_dir = work_dir.parent / _LOCAL_CACHE_DIRNAME
 
     def _vcf_remote_size(chromosome: int) -> int:
-        cdr_storage_path = os.environ.get("CDR_STORAGE_PATH", "").rstrip("/")
-        if not cdr_storage_path:
-            return 0
-        if cdr_storage_path.startswith("gs://"):
-            local_root = (
-                Path("/home/jupyter/workspace")
-                / cdr_storage_path[len("gs://") :].split("/", 1)[0]
-            )
-            rest = "/".join(cdr_storage_path[len("gs://") :].split("/")[1:])
-            local_remote = local_root / rest / "wgs/sv_vcfs" / sv_vcf_name(chromosome)
-        else:
-            local_remote = Path(cdr_storage_path) / "wgs/sv_vcfs" / sv_vcf_name(chromosome)
-        try:
-            return int(local_remote.stat().st_size)
-        except OSError:
-            return 0
+        # Same mounted file download_sv_vcf stages from. A gsutil download
+        # (no mount) is sized by download_sv_vcf's own free-space check.
+        mounted_vcf = _mounted_cdr_file(_mounted_sv_vcf_relative_path(chromosome))
+        return 0 if mounted_vcf is None else int(mounted_vcf.stat().st_size)
 
     _vcf_cache_dir = _preflight_cache_dir / "aou_sv_vcfs"
     _vcf_stage_needed = 0

@@ -1079,6 +1079,40 @@ def test_run_all_of_us_raises_when_parallel_precache_fails(monkeypatch, tmp_path
             variants="sv",
         )
 
+
+def test_run_all_of_us_preflight_counts_mounted_sv_vcf_bytes(monkeypatch, tmp_path: Path):
+    home = tmp_path / "home"
+    mounted_vcf = (
+        home
+        / "workspace"
+        / "vwb-aou-datasets-controlled"
+        / "v8"
+        / "wgs/short_read/structural_variants/vcf/full/AoU_srWGS_SV.v8.chr1.vcf.gz"
+    )
+    mounted_vcf.parent.mkdir(parents=True)
+    mounted_vcf.write_bytes(b"x" * 4321)
+    monkeypatch.setattr(Path, "home", lambda: home)
+    monkeypatch.setenv("CDR_STORAGE_PATH", "gs://fc-aou-datasets-controlled/v8")
+    requested: dict[str, int] = {}
+
+    def capturing_preflight(cache_dir: Path, *, required_stage_bytes: int, required_temp_bytes: int):
+        requested["stage"] = required_stage_bytes
+        raise RuntimeError("preflight captured")
+
+    monkeypatch.setattr(aou_runner, "check_aou_preflight", capturing_preflight)
+
+    with pytest.raises(RuntimeError, match="preflight captured"):
+        aou_runner.run_all_of_us(
+            disease="heart_failure",
+            chromosomes=[1],
+            output_base=str(tmp_path / "heart_failure_results"),
+            n_pcs=2,
+            variants="sv",
+        )
+
+    assert requested["stage"] == 4321
+
+
 def _read_tsv_rows(path: Path) -> list[dict[str, str]]:
     opener = gzip.open if path.suffix == ".gz" else Path.open
     with opener(path, "rt", encoding="utf-8", newline="") as handle:
