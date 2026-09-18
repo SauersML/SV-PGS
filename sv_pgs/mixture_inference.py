@@ -1179,17 +1179,23 @@ def _gpu_cholesky_solve(right_hand_side: Any, cholesky_factor_gpu: Any, solve_tr
     if factor_gpu_in.shape[0] == 0:
         empty_solution = cp.empty((0, rhs_gpu_in.shape[1]), dtype=factor_gpu_in.dtype)
         return empty_solution[:, 0] if rhs_was_vector else empty_solution
-    # Fresh F-contig buffers for cuBLAS dtrsm (asfortranarray may return
-    # a stride-degenerate view on (n, 1) shapes; .copy(order="F") always
+    # Solve against the factor's own memory. cp.linalg.cholesky returns a
+    # C-contiguous lower factor L whose transpose view U = L^T is
+    # F-contiguous, so L y = b and L^T x = y are the upper-triangular solves
+    # U^T y = b and U x = y, and solve_triangular's F-order conversion is a
+    # no-op. Passing L itself (or copying it to F order) duplicates the
+    # p x p factor on every call: 13.4 GB at p = 40960 in fp64, which ran a
+    # 40 GB A100 out of memory in the working-set solve.
+    upper_factor_gpu = factor_gpu_in.T
+    # Fresh F-contig buffer for cuBLAS dtrsm (asfortranarray may return a
+    # stride-degenerate view on (n, 1) shapes; .copy(order="F") always
     # allocates a clean F layout).
-    factor_gpu = factor_gpu_in.copy(order="F")
     rhs_gpu = rhs_gpu_in.copy(order="F")
-    lower_solution = solve_triangular_gpu(factor_gpu, rhs_gpu, lower=True, check_finite=False)
+    lower_solution = solve_triangular_gpu(upper_factor_gpu, rhs_gpu, lower=False, trans="T", check_finite=False)
     solution = solve_triangular_gpu(
-        factor_gpu,
+        upper_factor_gpu,
         lower_solution,
-        lower=True,
-        trans="T",
+        lower=False,
         check_finite=False,
     )
     return solution[:, 0] if rhs_was_vector else solution

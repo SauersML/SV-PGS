@@ -137,14 +137,17 @@ def test_gpu_cholesky_solve_uses_transpose_flag_not_transposed_factor(monkeypatc
     )
     np.testing.assert_allclose(actual, expected, rtol=1e-12, atol=1e-12)
     assert actual.shape == right_hand_side.shape
+    # Both solves run on the F-contiguous upper view U = L^T of the factor's
+    # own memory (U^T y = b, then U x = y): no p x p copy of the factor.
     assert len(calls) == 2
-    assert calls[0]["lower"] is True
-    assert calls[0]["trans"] is None
-    assert calls[1]["lower"] is True
-    assert calls[1]["trans"] == "T"
+    assert calls[0]["lower"] is False
+    assert calls[0]["trans"] == "T"
+    assert calls[1]["lower"] is False
+    assert calls[1]["trans"] is None
     assert calls[0]["matrix"] is calls[1]["matrix"]
     assert calls[0]["fortran"] is True
     assert calls[1]["fortran"] is True
+    assert np.shares_memory(calls[0]["matrix"], factor)
     assert calls[0]["rhs_shape"] == (3, 1)
 def test_quantitative_inference_runs(random_generator):
     sample_count, variant_count = 80, 10

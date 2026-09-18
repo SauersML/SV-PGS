@@ -133,11 +133,13 @@ def test_gpu_cholesky_solve_nonempty_path_still_dispatches():
         )
 
     result = _gpu_cholesky_solve(rhs_gpu, factor_gpu, fake_solve_triangular)
-    # Two dispatches: L @ y = b, then L.T @ x = y.
+    # Two dispatches on the upper view U = L^T: U^T y = b, then U x = y.
     assert len(call_log) == 2
-    assert call_log[0]["trans"] is None
-    assert call_log[1]["trans"] == "T"
+    assert call_log[0]["trans"] == "T"
+    assert call_log[1]["trans"] is None
     assert result.shape == (3,)
+    result_host = result.get() if hasattr(result, "get") else np.asarray(result)
+    np.testing.assert_allclose(result_host, np.linalg.solve(factor_host @ factor_host.T, rhs_host), rtol=1e-12)
     # Verify the result matches scipy reference (L L.T x = b).
     result_host = result.get() if hasattr(result, "get") else np.asarray(result)
     from scipy.linalg import cho_solve  # type: ignore[import-untyped]
