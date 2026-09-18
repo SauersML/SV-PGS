@@ -2551,13 +2551,18 @@ def _variant_defaults_from_bcftools_fields(
     alt_is_sv = _alt_is_symbolic_or_bnd(alt)
     ref_atcgn = _is_atcgn_only(ref)
     alt_atcgn = (not alt_is_sv) and _is_atcgn_only(alt)
+    svtype_text = svtype_field.decode("utf-8") if svtype_field else ""
+    has_svtype = bool(svtype_text) and svtype_text != "."
     is_snp = len(ref) == 1 and len(alt) == 1 and ref_atcgn and alt_atcgn
+    # cyvcf2's is_indel: any non-SNP sequence allele pair without an SVTYPE,
+    # including equal-length multi-base substitutions. A sequence-resolved
+    # allele that carries SVTYPE is an SV.
     is_indel = (
         not is_snp
         and not alt_is_sv
+        and not has_svtype
         and ref_atcgn
         and alt_atcgn
-        and len(ref) != len(alt)
     )
 
     svlen_value = _parse_optional_bcftools_float(svlen_field)
@@ -2577,12 +2582,7 @@ def _variant_defaults_from_bcftools_fields(
     elif is_indel:
         variant_class = VariantClass.SMALL_INDEL
     else:
-        svtype_text = svtype_field.decode("utf-8") if svtype_field else ""
-        variant_token = (
-            _normalize_variant_token(svtype_text)
-            if svtype_text and svtype_text != "."
-            else None
-        )
+        variant_token = _normalize_variant_token(svtype_text) if has_svtype else None
         if variant_token is None:
             variant_token = _normalize_variant_token(alt)
         if variant_token is None:
