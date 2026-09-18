@@ -1,12 +1,12 @@
-"""Regression test: SVI beta_variance_state must NOT carry a stale EMA of
-block-local solves on no-refresh epochs.
+"""Regression test: on no-refresh epochs the SVI beta_variance_state is a
+posterior variance diagonal, neither a stale EMA of block-local solves nor the
+prior variance.
 
-When ``refresh_beta_variance=False`` the per-block solve only sees its own
-block's prior, so blending ``(1-step)*stale + step*fresh`` produces a biased
-estimate that over-shrinks sigma_e^2 through the leverage correction. The
-fix snaps ``beta_variance_state`` to the current ``reduced_prior_variances``
-on no-refresh epochs (i.e. variance equals the prior in expectation under
-the variational prior) and only blends on real refresh epochs.
+Before any refresh the carried diagonal is the factorized-posterior variance
+1 / (n / sigma_e^2 + 1 / tau_j^2) at the epoch's prior. Snapping it to the
+prior variance tau_j^2 made E[beta^2] = m^2 + tau^2 exceed anything the prior
+can produce, so the global-scale and local-scale updates inflated the prior
+every epoch.
 """
 
 from __future__ import annotations
@@ -30,7 +30,7 @@ def random_generator() -> np.random.Generator:
     return np.random.default_rng(0xBEEF)
 
 
-def test_beta_variance_state_snaps_to_prior_on_no_refresh_epoch(
+def test_no_refresh_epoch_carries_a_posterior_diagonal_not_the_prior(
     random_generator: np.random.Generator,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -110,11 +110,11 @@ def test_beta_variance_state_snaps_to_prior_on_no_refresh_epoch(
         last_epoch0.beta_variance_state, dtype=np.float64
     )
 
-    # The fix: on a no-refresh epoch, beta_variance_state must equal the
-    # current reduced_prior_variances (floored at 1e-8), NOT a stale EMA
-    # of block-local solves.
-    expected = np.maximum(prior_variances, 1e-8)
-    np.testing.assert_allclose(observed_variance, expected, rtol=1e-10, atol=1e-12)
+    # Epoch 0 runs before any refresh at the initial sigma_e^2 = 1, so the
+    # carried diagonal is the factorized-posterior variance at the epoch prior.
+    expected = 1.0 / (sample_count / 1.0 + 1.0 / prior_variances)
+    np.testing.assert_allclose(observed_variance, expected, rtol=1e-10, atol=1e-14)
+    assert np.all(observed_variance < prior_variances)
 
     # And sigma_e^2 must stay in a reasonable range — not collapsed to
     # near-zero by a fake leverage correction driven by biased variances.

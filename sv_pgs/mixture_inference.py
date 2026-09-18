@@ -2189,16 +2189,19 @@ def fit_variational_em(
             local_scale=local_scale,
             config=config,
         )
-        beta_variance_state = (
-            np.maximum(reduced_prior_variances.copy(), 1e-8)
-            if resume_beta_variance_state is None
-            else resume_beta_variance_state
-        )
-        reduced_second_moment = (
-            np.maximum(
-                np.asarray(beta_state * beta_state, dtype=np.float64),
-                np.asarray(reduced_prior_variances, dtype=np.float64),
+        if resume_beta_variance_state is not None:
+            beta_variance_state = resume_beta_variance_state
+        elif beta_variance_state is None:
+            beta_variance_state = _mean_field_beta_variance(
+                sample_count=int(target_vector.shape[0]),
+                trait_type=config.trait_type,
+                linear_predictor=predictor_offset_array + covariate_matrix @ alpha_state,
+                prior_variances=reduced_prior_variances,
+                sigma_error2=sigma_error2,
+                minimum_weight=config.polya_gamma_minimum_weight,
             )
+        reduced_second_moment = (
+            np.asarray(beta_state * beta_state + beta_variance_state, dtype=np.float64)
             if resume_reduced_second_moment is None
             else resume_reduced_second_moment
         )
@@ -2819,21 +2822,12 @@ def fit_variational_em(
                         block_beta_candidate * block_beta_candidate + block_beta_variance,
                         dtype=np.float64,
                     )
+                    # Epochs without a refresh keep the carried diagonal, which
+                    # the epoch start re-aligned to this epoch's prior.
                     if refresh_beta_variance:
                         beta_variance_state[block_indices] = (
                             (1.0 - step_size) * beta_variance_state[block_indices]
                             + step_size * block_beta_variance
-                        )
-                    else:
-                        # Variance snaps to prior on no-refresh epochs to prevent
-                        # block-local bias: the per-block solve only sees its own
-                        # block's prior, so an EMA of those values is biased and
-                        # over-shrinks sigma_e^2 through the leverage correction.
-                        # Under the variational prior, variance equals the current
-                        # prior in expectation until a real refresh.
-                        beta_variance_state[block_indices] = np.maximum(
-                            np.asarray(reduced_prior_variances[block_indices], dtype=np.float64),
-                            1e-8,
                         )
                     reduced_second_moment[block_indices] = (
                         (1.0 - step_size) * reduced_second_moment[block_indices]
@@ -2997,26 +2991,14 @@ def fit_variational_em(
             covariate_linear_predictor = np.asarray(covariate_matrix @ alpha_state, dtype=np.float64)
             linear_predictor = predictor_offset_array + covariate_linear_predictor + genetic_linear_predictor
             beta_variance_state = np.maximum(reduced_second_moment - beta_state * beta_state, 1e-8)
-            if not refresh_beta_variance:
-                # Preserve the per-block no-refresh policy (variance snaps to
-                # the prior) at the epoch level. ``reduced_second_moment`` was
-                # accumulated using actual block_beta_variance regardless of
-                # refresh, so reconstructing variance from it here would defeat
-                # the policy that prevents block-local bias in the leverage
-                # correction. Mirror the per-block assignment used above.
-                beta_variance_state = np.maximum(
-                    np.asarray(reduced_prior_variances, dtype=np.float64),
-                    1e-8,
-                )
+            epoch_solve_sigma_error2 = float(sigma_error2)
             if config.trait_type == TraitType.QUANTITATIVE:
                 # Leverage 1 - Sigma_jj / tau_j^2 is exact only against the prior
-                # the block solves used this epoch, not the one re-estimated
-                # above. Epochs without a variance refresh carry no posterior
-                # variance, so they contribute no leverage.
-                leverage_weight = (
-                    np.clip(1.0 - beta_variance_state / np.maximum(epoch_solve_prior_variances, 1e-12), 0.0, 1.0)
-                    if refresh_beta_variance
-                    else np.zeros_like(epoch_solve_prior_variances)
+                # the block solves used this epoch, not the one re-estimated above.
+                leverage_weight = np.clip(
+                    1.0 - beta_variance_state / np.maximum(epoch_solve_prior_variances, 1e-12),
+                    0.0,
+                    1.0,
                 )
                 residual_vector = np.asarray(target_vector - linear_predictor, dtype=np.float64)
                 # Retain a meaningful residual dof floor: never let it collapse to 1, which
@@ -3024,6 +3006,13 @@ def fit_variational_em(
                 _sample_count_dof = float(target_vector.shape[0])
                 effective_dof = max(_sample_count_dof - float(np.sum(leverage_weight)), max(2.0, _sample_count_dof * 0.01))
                 sigma_error2 = max(float(np.dot(residual_vector, residual_vector)) / effective_dof, config.sigma_error_floor)
+            beta_variance_state = _realigned_beta_variance(
+                beta_variance=beta_variance_state,
+                solve_prior_variances=epoch_solve_prior_variances,
+                solve_sigma_error2=epoch_solve_sigma_error2,
+                prior_variances=reduced_prior_variances,
+                sigma_error2=sigma_error2,
+            )
             objective_history.append(
                 _stochastic_epoch_objective(
                     trait_type=config.trait_type,
@@ -3279,7 +3268,7 @@ def fit_variational_em(
                         _epoch_snapshot["validation_targets"] = np.asarray(_val_targets, dtype=np.float64)
                 per_epoch_eval_callback(_epoch_snapshot)
             if checkpoint_callback is not None:
-                checkpoint_callback(_build_checkpoint(iter_num))
+                checkpoint_callback(_build_checkpoint(iter_num, beta_variance_state_override=beta_variance_state))
             # Early-stop criterion:
             #   - parameter_change must be below tolerance (always required), AND
             #   - if validation_data drives model selection (NOT holdout-only),
@@ -3400,7 +3389,16 @@ def fit_variational_em(
                 _cavi_cached_reduced_prior_variances = reduced_prior_variances.copy()
                 _cavi_cache_signature = _cavi_new_signature
             if beta_variance_state is None:
-                beta_variance_state = np.maximum(reduced_prior_variances.copy(), 1e-8)
+                beta_variance_state = _mean_field_beta_variance(
+                    sample_count=int(target_vector.shape[0]),
+                    trait_type=config.trait_type,
+                    linear_predictor=predictor_offset_array + covariate_matrix @ alpha_state,
+                    prior_variances=reduced_prior_variances,
+                    sigma_error2=sigma_error2,
+                    minimum_weight=config.polya_gamma_minimum_weight,
+                )
+            solve_prior_variances = reduced_prior_variances
+            solve_sigma_error2 = float(sigma_error2)
             refresh_beta_variance = _should_refresh_beta_variance(
                 outer_iteration,
                 refresh_interval=config.beta_variance_update_interval,
@@ -4028,6 +4026,13 @@ def fit_variational_em(
             )
             final_hyperparameter_change = hyperparameter_change
             previous_reduced_prior_variances = convergence_reduced_prior_variances.copy()
+            beta_variance_state = _realigned_beta_variance(
+                beta_variance=beta_variance_state,
+                solve_prior_variances=solve_prior_variances,
+                solve_sigma_error2=solve_sigma_error2,
+                prior_variances=convergence_reduced_prior_variances,
+                sigma_error2=sigma_error2,
+            )
             if checkpoint_callback is not None:
                 # Persist the CAVI-path inter-iteration carry (current beta
                 # variance) so a resume re-enters the same EM trajectory
@@ -4290,6 +4295,85 @@ def _as_standardized_genotype_matrix(
     return dense_raw.standardized(
         means=np.zeros(dense_raw.shape[1], dtype=np.float32),
         scales=np.ones(dense_raw.shape[1], dtype=np.float32),
+    )
+
+
+def _diagonal_beta_variance(
+    *,
+    data_information: NDArray,
+    prior_variances: NDArray,
+    sigma_error2: float,
+) -> NDArray:
+    """Posterior variance diagonal 1 / (I_j / sigma_e^2 + 1 / tau_j^2).
+
+    I_j is the likelihood information for beta_j with the noise level factored
+    out. With the orthogonal-column information this is the exact CAVI variance
+    of a fully factorized q(beta_j).
+    """
+    return np.asarray(
+        1.0
+        / (
+            np.maximum(np.asarray(data_information, dtype=np.float64), 0.0) / float(sigma_error2)
+            + 1.0 / np.maximum(np.asarray(prior_variances, dtype=np.float64), 1e-8)
+        ),
+        dtype=np.float64,
+    )
+
+
+def _mean_field_beta_variance(
+    *,
+    sample_count: int,
+    trait_type: TraitType,
+    linear_predictor: NDArray,
+    prior_variances: NDArray,
+    sigma_error2: float,
+    minimum_weight: float,
+) -> NDArray:
+    """Diagonal posterior variance before any posterior solve has computed one.
+
+    Standardized columns have ||x_j||^2 = n, so a homoscedastic likelihood
+    carries information n for every variant. The binary likelihood weights
+    samples by their Polya-Gamma weights; sum_i w_i x_ij^2 is taken as
+    n * mean(w), exact when the weights are unrelated to x_ij^2.
+    """
+    information = float(sample_count)
+    if trait_type == TraitType.BINARY:
+        information *= float(
+            np.mean(_binary_expected_polya_gamma_weights(linear_predictor, minimum_weight))
+        )
+    return _diagonal_beta_variance(
+        data_information=np.full(np.asarray(prior_variances).shape, information, dtype=np.float64),
+        prior_variances=prior_variances,
+        sigma_error2=sigma_error2,
+    )
+
+
+def _realigned_beta_variance(
+    *,
+    beta_variance: NDArray,
+    solve_prior_variances: NDArray,
+    solve_sigma_error2: float,
+    prior_variances: NDArray,
+    sigma_error2: float,
+) -> NDArray:
+    """Carry a posterior variance diagonal to a new prior and noise level.
+
+    Sigma_jj = 1 / (I_j / sigma_e^2 + 1 / tau_j^2) under the prior and noise
+    level of the solve that produced it. Keeping its data information
+    I_j = sigma_e^2 (1 / Sigma_jj - 1 / tau_j^2) and swapping in the new prior
+    is exact for orthogonal columns. Reusing the old Sigma_jj unchanged, or the
+    prior variance in its place, would give E[beta^2] a variance the current
+    prior cannot produce.
+    """
+    data_information = float(solve_sigma_error2) * np.maximum(
+        1.0 / np.maximum(np.asarray(beta_variance, dtype=np.float64), 1e-300)
+        - 1.0 / np.maximum(np.asarray(solve_prior_variances, dtype=np.float64), 1e-8),
+        0.0,
+    )
+    return _diagonal_beta_variance(
+        data_information=data_information,
+        prior_variances=prior_variances,
+        sigma_error2=sigma_error2,
     )
 
 

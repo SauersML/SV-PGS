@@ -259,6 +259,17 @@ def test_full_workflow_binary() -> None:
         resume_checkpoint=warm_ckpt,
     )
     assert extended.beta_reduced.shape == full_result.beta_reduced.shape
+    # Six iterations do not converge this problem, so compare the warm-started
+    # seventh iteration with a fresh seven-iteration fit rather than with the
+    # six-iteration result it started from.
+    fresh_extended = fit_variational_em(
+        genotypes=genotype_matrix,
+        covariates=covariate_matrix,
+        targets=target_vector,
+        records=records,
+        config=extended_config,
+        tie_map=tie_map,
+    )
     np.testing.assert_allclose(
-        extended.beta_reduced, full_result.beta_reduced, atol=5e-2
+        extended.beta_reduced, fresh_extended.beta_reduced, atol=5e-2
     )
