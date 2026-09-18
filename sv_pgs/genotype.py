@@ -2702,54 +2702,63 @@ def _decode_packed_bytes_reference(
     return np.asfortranarray(decoded.T)
 
 
-def _find_plink_leaf_context(raw: Any) -> tuple[Any, NDArray, int, str] | None:
-    """Return ``(reader, sample_indices, iid_count, bed_path)`` for SOME
-    PLINK leaf reachable from ``raw``, or ``None`` if no PLINK leaf exists.
+@dataclass(frozen=True, slots=True)
+class _PlinkPreadContext:
+    """Everything the direct PLINK pread path needs, in BED-file coordinates.
 
-    IMPORTANT — this function is a LEAF FINDER, not a purity check. It will
-    happily return the PLINK leaf inside a multi-source
-    ``ConcatenatedRawGenotypeMatrix([VCF_int8..., PlinkRaw])`` even though
-    that matrix's variant indices live in dataset-column space (the union
-    of every child's variants) and CANNOT be passed straight to
-    ``_pread_indexed_variant_payload`` as PLINK-local positions. Callers
-    that intend to index the BED file directly with
-    ``selected_variant_indices`` MUST also call
-    :func:`_raw_variants_are_pure_single_plink_source` and bail when that
-    returns False. Callers that genuinely want to operate on just the
-    PLINK portion of a mixed tree (e.g. the post-active bitpacked upgrade
-    in ``model._try_upgrade_reduced_to_bitpacked``) should still treat
-    "mixed source" as a SKIPPED case unless they're willing to translate
-    dataset-column indices to PLINK-local indices themselves.
-
-    Walks .child to find the leaf PlinkRawGenotypeMatrix. The first
-    RowSubsetRawGenotypeMatrix encountered along the way contributes
-    sample_indices; if none is present we use the leaf's own sample_indices
-    (which for the streaming consumer always covers the kept sample set).
-
-    Logs the specific failure mode whenever it returns None so we don't
-    silently fall back to the slow CPU-decode path without telling the user
-    why — historically this was a debugging black hole (the previous run
-    spent 38 min in the CPU path because no log told us the fast path was
-    being declined).
+    ``bed_sample_indices`` are sample positions inside the BED file and
+    ``bed_columns`` maps the wrapper's column space onto BED variant
+    positions (``None`` when the wrapper columns already are BED columns).
+    Both compose every ``IndexedRawGenotypeMatrix`` / ``RowSubsetRawGenotypeMatrix``
+    between the caller's matrix and the PLINK leaf, so a dataset column ``j``
+    is read from BED variant ``bed_columns[j]`` for sample
+    ``bed_sample_indices[i]``.
     """
-    sample_indices: NDArray | None = None
-    seen: set[int] = set()
+
+    reader: Any
+    bed_sample_indices: NDArray
+    iid_count: int
+    bed_path: str
+    bed_columns: NDArray | None
+
+    def bed_variant_positions(self, variant_indices: NDArray) -> NDArray:
+        resolved = np.asarray(variant_indices, dtype=np.int64)
+        if self.bed_columns is None:
+            return resolved
+        return np.asarray(self.bed_columns[resolved], dtype=np.int64)
+
+
+def _resolve_pure_single_plink_pread_context(raw: Any) -> _PlinkPreadContext | None:
+    """Return the BED-coordinate pread context iff ``raw`` is single-source PLINK.
+
+    The direct PLINK pread path indexes the BED file with the caller's
+    variant indices, which is legitimate only when every column of ``raw``
+    is served by ONE BED file: a chain of single-child wrappers
+    (``IndexedRawGenotypeMatrix``, ``RowSubsetRawGenotypeMatrix`` or a
+    one-child ``ConcatenatedRawGenotypeMatrix``) ending in a
+    ``PlinkRawGenotypeMatrix``. A multi-child Concatenated puts per-source
+    indices in different coordinate systems, so it returns ``None`` and the
+    caller drops back to per-source streaming (the AoU SNP+SV EOF crash).
+
+    Column and row selections are composed down the chain the same way the
+    wrappers themselves route reads: an outer selection indexes the inner
+    one (``inner[outer]``). The AoU loader wraps a PLINK source in an
+    ``IndexedRawGenotypeMatrix`` whenever it drops within-source duplicate
+    variants, so reading dataset column ``j`` as BED variant ``j`` would
+    silently decode a neighbouring variant.
+
+    Logs the specific failure mode whenever it returns None so a declined
+    fast path is visible in the run log.
+    """
+    composed_columns: NDArray | None = None
+    composed_rows: NDArray | None = None
     visited_kinds: list[str] = []
-    # DFS so we descend through both single-child wrappers (.child) AND
-    # multi-child concatenators (.children). On AoU the runtime wrapper tree
-    # is RowSubset(child=Concatenated(children=[Plink])) — the previous
-    # version followed only .child and stopped at the concatenator, silently
-    # falling back to the slow CPU path. Walk both.
-    stack: list[Any] = [raw]
-    while stack:
-        node = stack.pop()
-        if node is None or id(node) in seen:
-            continue
+    seen: set[int] = set()
+    node = raw
+    while node is not None and id(node) not in seen:
         seen.add(id(node))
         visited_kinds.append(type(node).__name__)
-        if sample_indices is None and getattr(node, "row_indices", None) is not None:
-            sample_indices = np.asarray(node.row_indices, dtype=np.int64)
-        if getattr(node, "bed_path", None) is not None:
+        if isinstance(node, PlinkRawGenotypeMatrix):
             try:
                 reader = node._bed_reader()
             except (OSError, AttributeError, RuntimeError) as exc:
@@ -2761,107 +2770,43 @@ def _find_plink_leaf_context(raw: Any) -> tuple[Any, NDArray, int, str] | None:
                     f"_pread_indexed_variant_payload (need sv_pgs.plink.open_bed)"
                 )
                 return None
-            if sample_indices is None:
-                leaf_samples = getattr(node, "sample_indices", None)
-                if leaf_samples is None:
-                    log(f"    GPU-decode skipped: leaf {type(node).__name__} has no sample_indices")
-                    return None
-                sample_indices = np.asarray(leaf_samples, dtype=np.int64)
-            iid_count = int(getattr(node, "total_sample_count", 0))
+            iid_count = int(node.total_sample_count)
             if iid_count <= 0:
                 log(f"    GPU-decode skipped: total_sample_count={iid_count} on {type(node).__name__}")
                 return None
-            return reader, sample_indices, iid_count, str(node.bed_path)
-        child = getattr(node, "child", None)
-        if child is not None:
-            stack.append(child)
-        children = getattr(node, "children", None)
-        if children is not None:
-            # If concatenator has multiple Plink leaves, the GPU-direct path
-            # can only handle ONE bed_path per call — bail out to the CPU
-            # path which already handles concatenation. Single-child
-            # concatenators (the common AoU shape) flow through normally.
-            children_list = list(children)
-            plink_children = [
-                c for c in children_list
-                if c is not None and getattr(c, "bed_path", None) is not None
-            ]
-            if len(plink_children) > 1:
-                log(
-                    f"    GPU-decode skipped: concatenator has {len(plink_children)} "
-                    f"Plink leaves; multi-source not yet supported in GPU-decode path"
-                )
-                return None
-            for sub in children_list:
-                stack.append(sub)
-    log(
-        f"    GPU-decode skipped: no bed_path in wrapper chain "
-        f"[{' -> '.join(visited_kinds) if visited_kinds else '<empty>'}]; "
-        f"falling back to CPU-decode path"
-    )
-    return None
-
-
-def _resolve_pure_single_plink_pread_context(
-    raw: Any,
-) -> tuple[Any, NDArray, int, str] | None:
-    """Return PLINK pread context iff ``raw`` is genuinely single-source PLINK.
-
-    Combines :func:`_find_plink_leaf_context` with
-    :func:`_raw_variants_are_pure_single_plink_source` into the *correct*
-    primitive for callers that want to dispatch the direct PLINK pread
-    path. Returns ``None`` for mixed-source matrices so the caller can
-    drop back to per-source streaming, instead of silently mis-reading
-    or crashing on EOF when dataset-column indices get treated as
-    PLINK-local file positions.
-    """
-    if not _raw_variants_are_pure_single_plink_source(raw):
+            leaf_samples = np.asarray(node.sample_indices, dtype=np.int64)
+            bed_sample_indices = leaf_samples if composed_rows is None else leaf_samples[composed_rows]
+            return _PlinkPreadContext(
+                reader=reader,
+                bed_sample_indices=bed_sample_indices,
+                iid_count=iid_count,
+                bed_path=str(node.bed_path),
+                bed_columns=composed_columns,
+            )
+        if isinstance(node, IndexedRawGenotypeMatrix):
+            selected = np.asarray(node.selected_columns, dtype=np.int64)
+            composed_columns = selected if composed_columns is None else selected[composed_columns]
+            node = node.child
+            continue
+        if isinstance(node, RowSubsetRawGenotypeMatrix):
+            rows = np.asarray(node.row_indices, dtype=np.int64)
+            composed_rows = rows if composed_rows is None else rows[composed_rows]
+            node = node.child
+            continue
+        if isinstance(node, ConcatenatedRawGenotypeMatrix) and len(node.children) == 1:
+            node = node.children[0]
+            continue
         log(
-            "    GPU-decode skipped: raw is a mixed-source matrix; the "
-            "direct PLINK pread path would mis-interpret non-PLINK indices"
+            "    GPU-decode skipped: raw is not a single-source PLINK wrapper chain "
+            f"[{' -> '.join(visited_kinds)}]; the direct PLINK pread path would "
+            "mis-interpret its variant indices"
         )
         return None
-    return _find_plink_leaf_context(raw)
-
-
-def _raw_variants_are_pure_single_plink_source(node: Any) -> bool:
-    """Return True iff every column of ``node`` is served by ONE BED file.
-
-    The direct PLINK-pread fast path indexes
-    ``selected_variant_indices`` straight as file positions. That's
-    legitimate only when ``node`` is some wrapping (RowSubset / Indexed /
-    a single-child Concatenated) around exactly one
-    ``PlinkRawGenotypeMatrix``. As soon as a multi-child Concatenated is
-    present the per-source variant indices live in different coordinate
-    systems and the direct path silently mis-indexes — see the EOF crash
-    on AoU SNP+SV where dataset-space PLINK indices land past the actual
-    BED end. Callers that hold true must drop back to per-source
-    streaming (which already dispatches per child via
-    ``iter_column_batches_i8``).
-    """
-    seen: set[int] = set()
-    cur = node
-    while True:
-        if cur is None or id(cur) in seen:
-            return False
-        seen.add(id(cur))
-        if isinstance(cur, PlinkRawGenotypeMatrix):
-            return True
-        # Single-child wrappers pass through.
-        child = getattr(cur, "child", None)
-        if child is not None:
-            cur = child
-            continue
-        # A Concatenated is OK iff it has exactly one (PLINK-rooted)
-        # child — same coordinate system as a plain wrapper.
-        children = getattr(cur, "children", None)
-        if children is None:
-            return False
-        children_list = list(children)
-        if len(children_list) == 1:
-            cur = children_list[0]
-            continue
-        return False
+    log(
+        f"    GPU-decode skipped: no PLINK leaf in wrapper chain "
+        f"[{' -> '.join(visited_kinds) if visited_kinds else '<empty>'}]"
+    )
+    return None
 
 
 _plink_gpu_decode_kernel_cache: Any = None
@@ -2879,10 +2824,7 @@ def _get_plink_gpu_decode_kernel(cupy: Any) -> Any:
 
 def _gpu_plink_pread_transpose_matmul_direct(
     *,
-    reader: Any,
-    sample_indices: NDArray,
-    iid_count: int,
-    bed_path: str,
+    context: _PlinkPreadContext,
     selected_variant_indices: NDArray,
     means: NDArray,
     scales: NDArray,
@@ -2900,11 +2842,15 @@ def _gpu_plink_pread_transpose_matmul_direct(
     """
     import time as _time
 
+    reader = context.reader
+    bed_path = context.bed_path
     n_variants_total = int(selected_variant_indices.shape[0])
-    n_kept_samples = int(sample_indices.shape[0])
-    bytes_per_variant = (int(iid_count) + 3) // 4
-    sample_indices_int64 = np.asarray(sample_indices, dtype=np.int64)
-    selected_variant_indices_int64 = np.asarray(selected_variant_indices, dtype=np.int64)
+    n_kept_samples = int(context.bed_sample_indices.shape[0])
+    bytes_per_variant = (int(context.iid_count) + 3) // 4
+    sample_indices_int64 = np.asarray(context.bed_sample_indices, dtype=np.int64)
+    # Means/scales stay in the caller's column space; only the BED read is
+    # translated through the wrapper chain's column selection.
+    bed_variant_positions = context.bed_variant_positions(selected_variant_indices)
 
     sample_indices_gpu = cupy.asarray(sample_indices_int64)
     selected_means_gpu = cupy.asarray(means[selected_variant_indices], dtype=dtype)
@@ -2945,7 +2891,7 @@ def _gpu_plink_pread_transpose_matmul_direct(
         )
         t = _time.monotonic()
         payload_bytes = reader._pread_indexed_variant_payload(
-            selected_variant_indices_int64[start:stop],
+            bed_variant_positions[start:stop],
             bytes_per_variant=bytes_per_variant,
         )
         elapsed = _time.monotonic() - t
@@ -3140,12 +3086,8 @@ def _gpu_int8_transpose_matmul(
     # past EOF).
     ctx = _resolve_pure_single_plink_pread_context(raw_int8)
     if ctx is not None:
-        reader, sample_indices, iid_count, bed_path = ctx
         return _gpu_plink_pread_transpose_matmul_direct(
-            reader=reader,
-            sample_indices=sample_indices,
-            iid_count=iid_count,
-            bed_path=bed_path,
+            context=ctx,
             selected_variant_indices=selected_variant_indices,
             means=means,
             scales=scales,
@@ -3351,12 +3293,8 @@ def _gpu_int8_transpose_matmul_sharded(
         with _cupy_device_context(cupy, device_id):
             shard_matrix_gpu = cupy.asarray(matrix_host, dtype=dtype)
             if shard_ctx is not None:
-                reader, sample_indices, iid_count, bed_path = shard_ctx
                 shard_result_gpu = _gpu_plink_pread_transpose_matmul_direct(
-                    reader=reader,
-                    sample_indices=sample_indices,
-                    iid_count=iid_count,
-                    bed_path=bed_path,
+                    context=shard_ctx,
                     selected_variant_indices=shard_indices,
                     means=means,
                     scales=scales,

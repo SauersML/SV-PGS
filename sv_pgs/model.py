@@ -1492,33 +1492,6 @@ def _compute_marginal_z_scores_concat(
     return z_final
 
 
-def _resolve_indexed_selected_columns(raw: Any) -> NDArray | None:
-    """Walk a RawGenotypeMatrix wrapper tree for ``IndexedRawGenotypeMatrix``.
-
-    Returns the surviving source-BED column indices when an
-    :class:`IndexedRawGenotypeMatrix` wrapper is present (e.g. AoU's IO
-    layer drops a small number of within-source duplicate variants). Returns
-    ``None`` when no such wrapper exists, in which case the caller should
-    treat dataset columns as source-BED columns directly.
-    """
-    stack: list[Any] = [raw]
-    seen: set[int] = set()
-    while stack:
-        node = stack.pop()
-        if node is None or id(node) in seen:
-            continue
-        seen.add(id(node))
-        if isinstance(node, IndexedRawGenotypeMatrix):
-            return np.asarray(node.selected_columns, dtype=np.int64)
-        child = getattr(node, "child", None)
-        if child is not None:
-            stack.append(child)
-        children = getattr(node, "children", None)
-        if children is not None:
-            stack.extend(children)
-    return None
-
-
 def _try_upgrade_reduced_to_bitpacked(
     *,
     reduced_genotypes: StandardizedGenotypeMatrix,
@@ -1570,8 +1543,10 @@ def _try_upgrade_reduced_to_bitpacked(
             f"type={type(reduced_genotypes.raw).__name__})"
         )
         return None
-    _reader, sample_indices, iid_count, bed_path = ctx
-    sid_count = int(getattr(_reader, "sid_count", 0) or 0)
+    sample_indices = ctx.bed_sample_indices
+    iid_count = ctx.iid_count
+    bed_path = ctx.bed_path
+    sid_count = int(getattr(ctx.reader, "sid_count", 0) or 0)
     if sid_count <= 0:
         log(
             "bitpacked post-active upgrade: SKIPPED "
@@ -1582,22 +1557,18 @@ def _try_upgrade_reduced_to_bitpacked(
     # Map combined_indices (dataset-column space) → source-BED column space.
     # When AoU's IO layer dropped within-source duplicates, an
     # IndexedRawGenotypeMatrix wrapper records the surviving source columns;
-    # compose with combined_indices to get the actual BED columns to pack.
-    selected_columns = _resolve_indexed_selected_columns(reduced_genotypes.raw)
+    # the pread context composes every such wrapper down to BED columns.
     combined_indices_i64 = np.asarray(combined_indices, dtype=np.int64)
-    if selected_columns is not None:
-        if int(np.max(combined_indices_i64, initial=-1)) >= int(selected_columns.shape[0]):
-            log(
-                "bitpacked post-active upgrade: SKIPPED "
-                f"(reason: combined_indices max={int(np.max(combined_indices_i64))} "
-                f">= selected_columns len={int(selected_columns.shape[0])})"
-            )
-            return None
-        source_bed_columns = np.ascontiguousarray(
-            selected_columns[combined_indices_i64], dtype=np.int64
+    if ctx.bed_columns is not None and int(np.max(combined_indices_i64, initial=-1)) >= int(ctx.bed_columns.shape[0]):
+        log(
+            "bitpacked post-active upgrade: SKIPPED "
+            f"(reason: combined_indices max={int(np.max(combined_indices_i64))} "
+            f">= selected_columns len={int(ctx.bed_columns.shape[0])})"
         )
-    else:
-        source_bed_columns = np.ascontiguousarray(combined_indices_i64, dtype=np.int64)
+        return None
+    source_bed_columns = np.ascontiguousarray(
+        ctx.bed_variant_positions(combined_indices_i64), dtype=np.int64
+    )
     if int(np.max(source_bed_columns, initial=-1)) >= sid_count or int(np.min(source_bed_columns, initial=0)) < 0:
         log(
             "bitpacked post-active upgrade: SKIPPED "
