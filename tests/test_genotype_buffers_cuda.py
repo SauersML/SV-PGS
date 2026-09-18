@@ -5,11 +5,12 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
-from sv_pgs.stage0 import CpuStage0Backend, build_sample_layout, plan_genotype_pass, run_genotype_pass
+from sv_pgs import genotype_buffers
+from sv_pgs.genotype_buffers import CudaGenotypeBuffer, HostGenotypeBuffer, build_sample_layout
+from sv_pgs.genotype_statistics import plan_genotype_pass, run_genotype_pass
 from tests.stage0_support import InMemoryTileSource, bubble_groups, mosaic_codes
 
 cp = pytest.importorskip("cupy")
-cuda_backend = pytest.importorskip("sv_pgs.stage0.cuda_backend")
 
 SAMPLES = 700
 BLOCK_CAP = 128
@@ -27,15 +28,15 @@ def _run(source, sample_groups, backend_kind, columns, devices=1):
     layout = build_sample_layout(sample_groups, profile_target=300)
     plan = plan_genotype_pass(BLOCK_CAP)
     if backend_kind == "cpu":
-        backends = [CpuStage0Backend(layout, plan.capacity_rows, columns, worker_count=2)]
+        buffers = [HostGenotypeBuffer(layout, plan.capacity_rows, columns, worker_count=2)]
     else:
-        backends = [
-            cuda_backend.CudaStage0Backend(index % cp.cuda.runtime.getDeviceCount(), layout, plan.capacity_rows,
-                                           plan.tile_rows, columns)
+        buffers = [
+            CudaGenotypeBuffer(cp, index % cp.cuda.runtime.getDeviceCount(), layout, plan.capacity_rows,
+                               plan.tile_rows, columns)
             for index in range(devices)
         ]
     blocks = []
-    summary = run_genotype_pass(source, layout, backends, plan, blocks.append)
+    summary = run_genotype_pass(source, layout, buffers, plan, lambda block: blocks.append(block.on_host()))
     return summary, sorted(blocks, key=lambda block: (block.chromosome, block.start))
 
 
@@ -71,7 +72,7 @@ def test_cuda_blocks_equal_cpu_blocks(dataset) -> None:
 
 def test_long_sample_ranges_accumulate_exactly_in_int64(dataset, monkeypatch) -> None:
     source, labels, columns = dataset
-    monkeypatch.setattr(cuda_backend, "_SAMPLE_CHUNK", 128)
+    monkeypatch.setattr(genotype_buffers, "_CUDA_SAMPLE_CHUNK", 128)
     _, cuda_blocks = _run(source, labels, "cuda", None)
     signed = {name: codes.astype(np.int64) - 127 for name, codes in source.codes.items()}
     members = np.flatnonzero(labels == 0)

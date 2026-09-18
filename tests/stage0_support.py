@@ -7,8 +7,8 @@ from dataclasses import dataclass
 import numpy as np
 from numpy.typing import NDArray
 
-from sv_pgs.stage0.layout import SampleLayout
-from sv_pgs.stage0.partition import fixed_point_pair_weights
+from sv_pgs.genotype_buffers import SampleLayout
+from sv_pgs.ld_partition import fixed_point_pair_weights
 
 
 def mosaic_codes(
@@ -88,9 +88,7 @@ def reference_cut_costs(codes: NDArray[np.uint8], layout: SampleLayout, block_ca
     sums = signed.sum(axis=1)
     squares = (signed * signed).sum(axis=1)
     variants = codes.shape[0]
-    weights = fixed_point_pair_weights(
-        band, sums, squares, sums, squares, layout.profile_count, np.arange(variants, dtype=np.int64), block_cap - 1
-    )
+    weights = fixed_point_pair_weights(np, band, sums, squares, sums, squares, layout.profile_count, 0, block_cap - 1)
     costs = np.zeros(variants + 1, dtype=np.int64)
     for cut in range(1, variants):
         costs[cut] = weights[:cut, cut:].sum()

@@ -5,7 +5,7 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
-from sv_pgs.stage0.partition import (
+from sv_pgs.ld_partition import (
     OnlineBlockPartitioner,
     cut_allowed_from_groups,
     fixed_point_pair_weights,
@@ -94,7 +94,7 @@ def test_pair_weights_are_bias_corrected_squared_correlations() -> None:
     band = signed @ signed.T
     sums = signed.sum(axis=1)
     squares = (signed * signed).sum(axis=1)
-    weights = fixed_point_pair_weights(band, sums, squares, sums, squares, 300, np.arange(6), 3)
+    weights = fixed_point_pair_weights(np, band, sums, squares, sums, squares, 300, 0, 3)
     correlation = np.corrcoef(signed[:5].astype(np.float64))
     for row in range(6):
         for column in range(6):

@@ -5,18 +5,17 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
-from sv_pgs.stage0 import (
-    CpuStage0Backend,
+from sv_pgs.genotype_buffers import HostGenotypeBuffer, build_sample_layout
+from sv_pgs.genotype_statistics import (
+    assign_chromosomes,
     block_correlation,
-    build_sample_layout,
     centered_cross_products,
     column_moments,
-    cut_allowed_from_groups,
     plan_genotype_pass,
     run_cross_product_pass,
     run_genotype_pass,
 )
-from sv_pgs.stage0.genotype_pass import assign_chromosomes
+from sv_pgs.ld_partition import cut_allowed_from_groups
 from tests.stage0_support import (
     InMemoryTileSource,
     bubble_groups,
@@ -50,7 +49,7 @@ def _run(source: InMemoryTileSource, sample_groups: np.ndarray, devices: int, co
          profile_target: int = 16384):
     layout = build_sample_layout(sample_groups, profile_target=profile_target)
     plan = plan_genotype_pass(BLOCK_CAP)
-    backends = [CpuStage0Backend(layout, plan.capacity_rows, columns, worker_count=3) for _ in range(devices)]
+    backends = [HostGenotypeBuffer(layout, plan.capacity_rows, columns, worker_count=3) for _ in range(devices)]
     blocks = []
     summary = run_genotype_pass(source, layout, backends, plan, blocks.append)
     for backend in backends:
@@ -175,9 +174,9 @@ def test_a_later_cross_product_pass_matches_the_fused_one() -> None:
     sample_groups = _sample_groups(14)
     columns = np.random.default_rng(15).normal(size=(SAMPLES, 4))
     layout = build_sample_layout(sample_groups)
-    backends = [CpuStage0Backend(layout, 100, columns, worker_count=2) for _ in range(2)]
+    buffers = [HostGenotypeBuffer(layout, 100, columns, worker_count=2) for _ in range(2)]
     tiles = {}
-    run_cross_product_pass(source, layout, backends, 100, lambda name, start, stop, products: tiles.update(
+    run_cross_product_pass(source, buffers, 100, lambda name, start, stop, products: tiles.update(
         {(name, start): (stop, products)}))
     signed = {name: codes.astype(np.int64) - 127 for name, codes in source.codes.items()}
     for (name, start), (stop, products) in tiles.items():

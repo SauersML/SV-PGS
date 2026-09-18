@@ -28,6 +28,8 @@ on every backend.
 
 from __future__ import annotations
 
+from types import ModuleType
+
 import numpy as np
 from numpy.typing import NDArray
 
@@ -38,34 +40,37 @@ _UNREACHABLE = np.int64(2**61)
 
 
 def fixed_point_pair_weights(
-    band: NDArray[np.int64],
+    array_module: ModuleType,
+    band: NDArray[np.integer],
     row_sums: NDArray[np.int64],
     row_squares: NDArray[np.int64],
     column_sums: NDArray[np.int64],
     column_squares: NDArray[np.int64],
     profile_count: int,
-    column_offset: NDArray[np.int64],
+    first_distance: int,
     maximum_distance: int,
 ) -> NDArray[np.int64]:
     """Fixed-point pair weights ``round((r_ij^2 - 1/(n-1)) * 2^20)`` of a band of profile products.
 
-    ``band[a, b] = sum_profile s_i s_j`` for row variant ``i`` and column variant ``j``,
-    whose index difference is ``j - i = column_offset[b] - a``; pairs with ``j - i`` outside
-    ``[1, maximum_distance]`` weigh zero, as do pairs with a constant variant. Every
-    operation is a single correctly rounded fp64 step on exact integers, so the CUDA
-    kernel reproduces it bit for bit.
+    ``band[a, b] = sum_profile s_i s_j`` for row variant ``i`` and column variant ``j`` with
+    ``j - i = first_distance + b - a``; pairs with ``j - i`` outside ``[1, maximum_distance]``
+    weigh zero, as do pairs with a constant variant. Every step is one correctly rounded fp64
+    operation on exact integers, and ``array_module`` (NumPy or CuPy) runs each as its own
+    kernel, so both give the same bits.
     """
-    numerator = profile_count * band - np.outer(row_sums, column_sums)
-    row_variance = (profile_count * row_squares - row_sums * row_sums).astype(np.float64)
-    column_variance = (profile_count * column_squares - column_sums * column_sums).astype(np.float64)
-    numerator_float = numerator.astype(np.float64)
-    with np.errstate(divide="ignore", invalid="ignore"):
-        squared = (numerator_float * numerator_float) / (row_variance[:, None] * column_variance[None, :])
-        weight = np.rint((squared - 1.0 / (profile_count - 1)) * PAIR_WEIGHT_SCALE).astype(np.int64)
-    distance = column_offset[None, :] - np.arange(band.shape[0], dtype=np.int64)[:, None]
-    keep = (distance >= 1) & (distance <= maximum_distance)
-    keep &= (row_variance[:, None] > 0) & (column_variance[None, :] > 0)
-    return np.where(keep, weight, 0)
+    xp = array_module
+    numerator = profile_count * band.astype(xp.int64) - xp.outer(row_sums, column_sums)
+    row_variance = (profile_count * row_squares - row_sums * row_sums).astype(xp.float64)
+    column_variance = (profile_count * column_squares - column_sums * column_sums).astype(xp.float64)
+    row_varies = row_variance > 0
+    column_varies = column_variance > 0
+    denominator = xp.where(row_varies, row_variance, 1.0)[:, None] * xp.where(column_varies, column_variance, 1.0)[None, :]
+    numerator_float = numerator.astype(xp.float64)
+    squared = (numerator_float * numerator_float) / denominator
+    weight = xp.rint((squared - 1.0 / (profile_count - 1)) * PAIR_WEIGHT_SCALE).astype(xp.int64)
+    distance = first_distance + xp.arange(band.shape[1], dtype=xp.int64)[None, :] - xp.arange(band.shape[0], dtype=xp.int64)[:, None]
+    keep = (distance >= 1) & (distance <= maximum_distance) & row_varies[:, None] & column_varies[None, :]
+    return xp.where(keep, weight, 0)
 
 
 def validate_cut_allowed(cut_allowed: NDArray[np.bool_], block_cap: int) -> None:
