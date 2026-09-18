@@ -2983,7 +2983,12 @@ def fit_variational_em(
                 )
                 local_shape_a = prior_design.class_membership_matrix @ tpb_shape_a_vector
                 local_shape_b = prior_design.class_membership_matrix @ tpb_shape_b_vector
-            auxiliary_delta = (local_shape_a + local_shape_b) / np.maximum(1.0 + local_scale, config.local_scale_floor)
+            auxiliary_delta = _cavi_auxiliary_delta(
+                local_shape_a=local_shape_a,
+                local_shape_b=local_shape_b,
+                local_scale=local_scale,
+                config=config,
+            )
             epoch_solve_prior_variances = reduced_prior_variances
             reduced_prior_variances = _effective_prior_variances(
                 baseline_prior_variances=(float(global_scale) * _metadata_baseline_scales_from_coefficients(
@@ -3531,17 +3536,26 @@ def fit_variational_em(
                         best_tpb_shape_b_vector = posterior_tpb_shape_b_vector.copy()
                     log(f"  variational EM iteration {outer_iteration + 1}: validation_metric={validation_metric:.6f}")
 
-            updated_local_scale, updated_auxiliary_delta = _update_local_scales(
-                coefficient_second_moment=reduced_second_moment,
-                baseline_prior_variances=baseline_reduced_prior_variances,
-                local_shape_a=local_shape_a,
-                local_shape_b=local_shape_b,
-                auxiliary_delta=auxiliary_delta,
-                config=config,
-            )
             should_update_hyperparameters = _should_update_hyperparameters_this_iteration(
                 outer_iteration + 1,
             )
+            hyperparameter_proposal = _propose_cavi_hyperparameters(
+                reduced_second_moment=reduced_second_moment,
+                baseline_reduced_prior_variances=baseline_reduced_prior_variances,
+                local_shape_a=local_shape_a,
+                local_shape_b=local_shape_b,
+                auxiliary_delta=auxiliary_delta,
+                global_scale=float(global_scale),
+                scale_model_coefficients=scale_model_coefficients,
+                tpb_shape_a_vector=tpb_shape_a_vector,
+                tpb_shape_b_vector=tpb_shape_b_vector,
+                update_scale_and_shapes=should_update_hyperparameters,
+                prior_design=prior_design,
+                scale_penalty=scale_penalty,
+                config=config,
+            )
+            updated_local_scale = hyperparameter_proposal.local_scale
+            updated_auxiliary_delta = hyperparameter_proposal.auxiliary_delta
             if should_update_hyperparameters:
                 # Save current hyperparameters so we can revert if the
                 # proposed update would decrease the ELBO. The Newton-based
@@ -3560,23 +3574,10 @@ def fit_variational_em(
                 saved_local_shape_a = np.asarray(local_shape_a, dtype=np.float64).copy()
                 saved_local_shape_b = np.asarray(local_shape_b, dtype=np.float64).copy()
 
-                global_scale, scale_model_coefficients = _update_scale_model(
-                    reduced_second_moment=reduced_second_moment,
-                    local_scale=updated_local_scale,
-                    prior_design=prior_design,
-                    scale_penalty=scale_penalty,
-                    current_global_scale=float(global_scale),
-                    current_scale_model_coefficients=scale_model_coefficients,
-                    config=config,
-                )
-                tpb_shape_a_vector, tpb_shape_b_vector = _update_tpb_shape_vectors(
-                    class_membership_matrix=prior_design.class_membership_matrix,
-                    current_shape_a_vector=tpb_shape_a_vector,
-                    current_shape_b_vector=tpb_shape_b_vector,
-                    local_scale=updated_local_scale,
-                    auxiliary_delta=updated_auxiliary_delta,
-                    config=config,
-                )
+                global_scale = hyperparameter_proposal.global_scale
+                scale_model_coefficients = hyperparameter_proposal.scale_model_coefficients
+                tpb_shape_a_vector = hyperparameter_proposal.tpb_shape_a_vector
+                tpb_shape_b_vector = hyperparameter_proposal.tpb_shape_b_vector
                 local_shape_a = prior_design.class_membership_matrix @ tpb_shape_a_vector
                 local_shape_b = prior_design.class_membership_matrix @ tpb_shape_b_vector
 
@@ -3646,7 +3647,12 @@ def fit_variational_em(
                         f"  hyperparameter ELBO safeguard skipped: {_safeguard_err}"
                     )
             local_scale = updated_local_scale
-            auxiliary_delta = (local_shape_a + local_shape_b) / np.maximum(1.0 + local_scale, config.local_scale_floor)
+            auxiliary_delta = _cavi_auxiliary_delta(
+                local_shape_a=local_shape_a,
+                local_shape_b=local_shape_b,
+                local_scale=local_scale,
+                config=config,
+            )
 
             current_theta = _pack_theta(global_scale, scale_model_coefficients)
             current_objective = float(objective_history[-1])
@@ -3936,9 +3942,12 @@ def fit_variational_em(
                                     local_scale=local_scale,
                                     config=config,
                                 )
-                                _candidate_auxiliary_delta = (
-                                    local_shape_a + local_shape_b
-                                ) / np.maximum(1.0 + local_scale, config.local_scale_floor)
+                                _candidate_auxiliary_delta = _cavi_auxiliary_delta(
+                                    local_shape_a=local_shape_a,
+                                    local_shape_b=local_shape_b,
+                                    local_scale=local_scale,
+                                    config=config,
+                                )
                                 # Commit the recomputed auxiliary_delta synchronously with the
                                 # accepted shapes so downstream consumers (CAVI precision
                                 # override, next iter's TPB update) see a consistent (a, b, delta)
@@ -4555,19 +4564,20 @@ def _quantitative_posterior_state(
     # only the diagonal: tr(Z'Z Cov) = sigma_e^2 (k + sum_j (1 - Cov_jj / tau_j^2)).
     # n * sum_j Cov_jj equals it only for orthogonal genotype columns and
     # overstates it several-fold under LD.
-    leverage_beta_variance = _effective_beta_variance_state(
-        compute_beta_variance=compute_beta_variance,
-        beta_variance=np.asarray(beta_variance, dtype=np.float64),
-        stale_beta_variance=stale_beta_variance,
+    sigma_error2_new = _quantitative_sigma_error2_update(
+        residual_sum_squares=residual_sum_squares,
+        sample_count=sample_count,
+        covariate_count=covariate_matrix.shape[1],
+        beta_variance=_effective_beta_variance_state(
+            compute_beta_variance=compute_beta_variance,
+            beta_variance=np.asarray(beta_variance, dtype=np.float64),
+            stale_beta_variance=stale_beta_variance,
+            prior_variances=np.asarray(prior_variances, dtype=np.float64),
+        ),
         prior_variances=np.asarray(prior_variances, dtype=np.float64),
+        sigma_error2=sigma_error2,
+        sigma_error_floor=sigma_error_floor,
     )
-    variant_leverage = np.clip(
-        1.0 - leverage_beta_variance / np.asarray(prior_variances, dtype=np.float64),
-        0.0,
-        1.0,
-    )
-    trace_term = float(sigma_error2) * (float(covariate_matrix.shape[1]) + float(np.sum(variant_leverage)))
-    sigma_error2_new = max((residual_sum_squares + trace_term) / sample_count, sigma_error_floor)
     # Restricted log-likelihood: measures how well the model explains the data
     # after accounting for model complexity (via log-determinant terms).
     # Higher (less negative) = better fit with appropriate complexity.
@@ -4577,6 +4587,35 @@ def _quantitative_posterior_state(
         + (sample_count - covariate_matrix.shape[1]) * np.log(2.0 * np.pi)
     )
     return alpha, beta, effective_beta_variance, linear_predictor, collapsed_objective, sigma_error2_new
+
+
+def _quantitative_sigma_error2_update(
+    *,
+    residual_sum_squares: float,
+    sample_count: int,
+    covariate_count: int,
+    beta_variance: NDArray,
+    prior_variances: NDArray,
+    sigma_error2: float,
+    sigma_error_floor: float,
+) -> float:
+    """CAVI update of sigma_e^2 from the E-step moments, shared by every E-step.
+
+    Exact stationary point sigma_e^2 = (RSS + tr(Z'Z Cov)) / n with Z = [W | X]
+    and Cov the joint posterior covariance of (alpha, beta) under the flat
+    covariate prior, at the sigma_e^2 the E-step used. Cov = (Z'Z / sigma_e^2 +
+    diag(0, 1/tau^2))^{-1} gives Z'Z Cov = sigma_e^2 (I - diag(0, 1/tau^2) Cov),
+    so the trace needs only the diagonal: tr(Z'Z Cov) = sigma_e^2 (k + sum_j
+    (1 - Cov_jj / tau_j^2)). n * sum_j Cov_jj equals it only for orthogonal
+    genotype columns and overstates it several-fold under LD.
+    """
+    variant_leverage = np.clip(
+        1.0 - np.asarray(beta_variance, dtype=np.float64) / np.asarray(prior_variances, dtype=np.float64),
+        0.0,
+        1.0,
+    )
+    trace_term = float(sigma_error2) * (float(covariate_count) + float(np.sum(variant_leverage)))
+    return max((float(residual_sum_squares) + trace_term) / float(sample_count), sigma_error_floor)
 
 
 def _binary_newton_solver_controls(
@@ -13988,6 +14027,95 @@ def _update_local_scales(
         config.local_scale_floor,
     )
     return updated_local_scale, updated_auxiliary_delta
+
+
+@dataclass(frozen=True)
+class _CaviHyperparameterProposal:
+    """One CAVI M-step computed from the posterior second moments E[beta^2].
+
+    Every fit that iterates the CAVI map (the individual-level EM loop and the
+    exact block polish) takes its hyperparameter step from here, so all of
+    them share one fixed point. ``auxiliary_delta`` is the delta paired with
+    the new local scales inside the TPB shape update; the delta carried into
+    the next E-step is ``_cavi_auxiliary_delta`` of the accepted shapes.
+    """
+
+    local_scale: NDArray
+    auxiliary_delta: NDArray
+    global_scale: float
+    scale_model_coefficients: NDArray
+    tpb_shape_a_vector: NDArray
+    tpb_shape_b_vector: NDArray
+
+
+def _propose_cavi_hyperparameters(
+    *,
+    reduced_second_moment: NDArray,
+    baseline_reduced_prior_variances: NDArray,
+    local_shape_a: NDArray,
+    local_shape_b: NDArray,
+    auxiliary_delta: NDArray,
+    global_scale: float,
+    scale_model_coefficients: NDArray,
+    tpb_shape_a_vector: NDArray,
+    tpb_shape_b_vector: NDArray,
+    update_scale_and_shapes: bool,
+    prior_design: PriorDesign,
+    scale_penalty: NDArray,
+    config: ModelConfig,
+) -> _CaviHyperparameterProposal:
+    updated_local_scale, updated_auxiliary_delta = _update_local_scales(
+        coefficient_second_moment=reduced_second_moment,
+        baseline_prior_variances=baseline_reduced_prior_variances,
+        local_shape_a=local_shape_a,
+        local_shape_b=local_shape_b,
+        auxiliary_delta=auxiliary_delta,
+        config=config,
+    )
+    if not update_scale_and_shapes:
+        return _CaviHyperparameterProposal(
+            local_scale=updated_local_scale,
+            auxiliary_delta=updated_auxiliary_delta,
+            global_scale=float(global_scale),
+            scale_model_coefficients=np.asarray(scale_model_coefficients, dtype=np.float64).copy(),
+            tpb_shape_a_vector=np.asarray(tpb_shape_a_vector, dtype=np.float64).copy(),
+            tpb_shape_b_vector=np.asarray(tpb_shape_b_vector, dtype=np.float64).copy(),
+        )
+    updated_global_scale, updated_scale_model_coefficients = _update_scale_model(
+        reduced_second_moment=reduced_second_moment,
+        local_scale=updated_local_scale,
+        prior_design=prior_design,
+        scale_penalty=scale_penalty,
+        current_global_scale=float(global_scale),
+        current_scale_model_coefficients=scale_model_coefficients,
+        config=config,
+    )
+    updated_tpb_shape_a_vector, updated_tpb_shape_b_vector = _update_tpb_shape_vectors(
+        class_membership_matrix=prior_design.class_membership_matrix,
+        current_shape_a_vector=tpb_shape_a_vector,
+        current_shape_b_vector=tpb_shape_b_vector,
+        local_scale=updated_local_scale,
+        auxiliary_delta=updated_auxiliary_delta,
+        config=config,
+    )
+    return _CaviHyperparameterProposal(
+        local_scale=updated_local_scale,
+        auxiliary_delta=updated_auxiliary_delta,
+        global_scale=float(updated_global_scale),
+        scale_model_coefficients=np.asarray(updated_scale_model_coefficients, dtype=np.float64),
+        tpb_shape_a_vector=np.asarray(updated_tpb_shape_a_vector, dtype=np.float64),
+        tpb_shape_b_vector=np.asarray(updated_tpb_shape_b_vector, dtype=np.float64),
+    )
+
+
+def _cavi_auxiliary_delta(
+    *,
+    local_shape_a: NDArray,
+    local_shape_b: NDArray,
+    local_scale: NDArray,
+    config: ModelConfig,
+) -> NDArray:
+    return (local_shape_a + local_shape_b) / np.maximum(1.0 + local_scale, config.local_scale_floor)
 
 
 # Compute the expected value of X^r where X ~ GIG(p, chi, psi).

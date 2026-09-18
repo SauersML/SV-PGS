@@ -47,14 +47,21 @@ def anderson_step(
     x_current: F64Array,
     map_value: F64Array,
     regularization: float = 1e-10,
+    residual_weights: F64Array | None = None,
 ) -> F64Array:
     """Return the proposed accelerated iterate; update state in place.
 
     On the first call (empty history) returns ``map_value`` (plain step).
+    ``residual_weights`` scales each coordinate's residual in the mixing
+    least-squares problem; the proposal still mixes every coordinate, so a
+    zero weight carries a coordinate along (e.g. a linear image of the others)
+    without letting it steer the mixing.
     """
     x_flat = np.asarray(x_current, dtype=np.float64).ravel()
     t_flat = np.asarray(map_value, dtype=np.float64).ravel()
     residual = t_flat - x_flat
+    if residual_weights is not None:
+        residual = residual * np.asarray(residual_weights, dtype=np.float64).ravel()
 
     if not state.residuals:
         _push(state.iterates, x_flat, state.memory_depth)
