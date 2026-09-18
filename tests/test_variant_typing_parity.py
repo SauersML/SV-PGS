@@ -1,4 +1,4 @@
-"""The bcftools precache path must type variants like the cyvcf2 path.
+"""Both VCF parsers must type and size variants identically and correctly.
 
 `_variant_defaults_from_bcftools_fields` documents that it mirrors
 `_variant_defaults_from_vcf_record`; the AoU run uses the former and
@@ -25,13 +25,24 @@ _HEADER = (
     "#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\tS0\n"
 )
 _SEQUENCE_DELETION = "A" + "CGT" * 40
-# (id, pos, ref, alt, INFO fields)
+# Two unrelated 80 bp alleles sharing only the anchor base: a complex SV.
+_COMPLEX_REF = "T" + "ACGGT" * 15 + "ACGT"
+_COMPLEX_ALT = "T" + "GTTCA" * 15 + "GTTC"
+# (id, pos, ref, alt, INFO fields, expected class, expected length)
 _RECORDS = (
-    ("snv", 100, "A", "G", {"AF": "0.1"}),
-    ("small_deletion", 200, "ACG", "A", {"AF": "0.1"}),
-    ("substitution", 300, "AC", "GT", {"AF": "0.1"}),
-    ("sequence_deletion", 400, _SEQUENCE_DELETION, "A", {"SVTYPE": "DEL", "SVLEN": "-120", "AF": "0.1"}),
-    ("symbolic_deletion", 900, "A", "<DEL>", {"SVTYPE": "DEL", "SVLEN": "-2000", "END": "2900", "AF": "0.1"}),
+    ("snv", 100, "A", "G", {"AF": "0.1"}, VariantClass.SNV, 1.0),
+    ("small_deletion", 200, "ACG", "A", {"AF": "0.1"}, VariantClass.SMALL_INDEL, 2.0),
+    ("substitution", 300, "AC", "GT", {"AF": "0.1"}, VariantClass.SMALL_INDEL, 2.0),
+    ("sequence_deletion", 400, _SEQUENCE_DELETION, "A", {"SVTYPE": "DEL", "SVLEN": "-120", "AF": "0.1"}, VariantClass.DELETION_SHORT, 120.0),
+    ("symbolic_deletion", 900, "A", "<DEL>", {"SVTYPE": "DEL", "SVLEN": "-2000", "END": "2900", "AF": "0.1"}, VariantClass.DELETION_LONG, 2000.0),
+    # Sequence-resolved SVs without SVTYPE/SVLEN, as long-read and imputed
+    # panels write them: typed and sized from the alleles.
+    ("untyped_deletion", 3000, _SEQUENCE_DELETION, "A", {}, VariantClass.DELETION_SHORT, 120.0),
+    ("untyped_long_deletion", 4000, "C" + "AGT" * 500, "C", {}, VariantClass.DELETION_LONG, 1500.0),
+    ("untyped_insertion", 6000, "G", "G" + "ACGT" * 100, {}, VariantClass.INSERTION_MEI, 400.0),
+    ("indel_49", 7000, "A" + "C" * 49, "A", {}, VariantClass.SMALL_INDEL, 49.0),
+    ("deletion_50", 8000, "A" + "C" * 50, "A", {}, VariantClass.DELETION_SHORT, 50.0),
+    ("complex_80", 9000, _COMPLEX_REF, _COMPLEX_ALT, {}, VariantClass.OTHER_COMPLEX_SV, 79.0),
 )
 
 
@@ -43,9 +54,9 @@ def test_bcftools_and_cyvcf2_paths_assign_the_same_variant_class(tmp_path: Path)
     vcf_path = tmp_path / "typing.vcf"
     lines = [
         f"chr1\t{pos}\t{variant_id}\t{ref}\t{alt}\t50\t.\t"
-        + ";".join(f"{key}={value}" for key, value in info.items())
+        + (";".join(f"{key}={value}" for key, value in info.items()) or ".")
         + "\tGT\t0/1\n"
-        for variant_id, pos, ref, alt, info in _RECORDS
+        for variant_id, pos, ref, alt, info, _, _ in _RECORDS
     ]
     vcf_path.write_text(_HEADER + "".join(lines), encoding="utf-8")
 
@@ -65,17 +76,13 @@ def test_bcftools_and_cyvcf2_paths_assign_the_same_variant_class(tmp_path: Path)
             af_field=_bcftools_field(info, "AF"),
             end_field=_bcftools_field(info, "END"),
         )
-        for variant_id, pos, ref, alt, info in _RECORDS
+        for variant_id, pos, ref, alt, info, _, _ in _RECORDS
     ]
 
     assert [defaults.variant_class for defaults in bcftools_defaults] == [
         defaults.variant_class for defaults in cyvcf2_defaults
     ]
     assert [defaults.length for defaults in bcftools_defaults] == [defaults.length for defaults in cyvcf2_defaults]
-    assert [defaults.variant_class for defaults in bcftools_defaults] == [
-        VariantClass.SNV,
-        VariantClass.SMALL_INDEL,
-        VariantClass.SMALL_INDEL,
-        VariantClass.DELETION_SHORT,
-        VariantClass.DELETION_LONG,
+    assert [(defaults.variant_class, defaults.length) for defaults in bcftools_defaults] == [
+        (expected_class, expected_length) for *_, expected_class, expected_length in _RECORDS
     ]

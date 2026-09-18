@@ -53,6 +53,9 @@ _CACHE_CORRUPTION_ERRORS: tuple[type[BaseException], ...] = (
 )
 
 SV_LENGTH_THRESHOLD = 1_000.0
+# SV size cutoff for sequence-resolved alleles: the imputation strata's rule
+# (lrma-strata scripts/finalqc/strata_build.py var_class / classify).
+SEQUENCE_RESOLVED_SV_MINIMUM_LENGTH = 50
 DEFAULT_SAMPLE_ID_COLUMNS = ("sample_id", "research_id", "person_id")
 VARIANT_METADATA_BASE_COLUMNS = frozenset(
     {
@@ -128,25 +131,6 @@ class _TextVcfRecord:
     QUAL: float | None
     INFO: dict[str, Any]
     gt_types: I8Array
-    end: int | None
-
-    @property
-    def is_snp(self) -> bool:
-        return len(self.ALT) == 1 and len(self.REF) == 1 and len(self.ALT[0]) == 1 and not self.ALT[0].startswith("<")
-
-    @property
-    def is_indel(self) -> bool:
-        return len(self.ALT) == 1 and not self.ALT[0].startswith("<") and len(self.REF) != len(self.ALT[0])
-
-    @property
-    def is_sv(self) -> bool:
-        alt = self.ALT[0] if self.ALT else ""
-        if alt.startswith("<") and alt.endswith(">"):
-            return True
-        svtype = self.INFO.get("SVTYPE")
-        if isinstance(svtype, (tuple, list)):
-            return len(svtype) > 0
-        return svtype is not None
 
 
 class _TextVcfReader:
@@ -295,7 +279,6 @@ def _parse_text_vcf_record(line: str, *, sample_names: tuple[str, ...]) -> _Text
         if sample_names
         else np.empty(0, dtype=np.int8)
     )
-    end = info.get("END")
     return _TextVcfRecord(
         CHROM=chrom,
         POS=pos,
@@ -305,7 +288,6 @@ def _parse_text_vcf_record(line: str, *, sample_names: tuple[str, ...]) -> _Text
         QUAL=qual,
         INFO=info,
         gt_types=gt_types,
-        end=int(end) if end is not None else None,
     )
 
 
@@ -2524,6 +2506,92 @@ def _is_atcgn_only(value: str) -> bool:
     return bool(value) and all(ch in _BCFTOOLS_VALID_BASES for ch in value)
 
 
+def _trimmed_allele_core_lengths(ref: str, alt: str) -> tuple[int, int]:
+    """Lengths of REF and ALT after removing their shared prefix, then suffix."""
+    shortest = min(len(ref), len(alt))
+    prefix = 0
+    while prefix < shortest and ref[prefix] == alt[prefix]:
+        prefix += 1
+    suffix = 0
+    while suffix < shortest - prefix and ref[len(ref) - 1 - suffix] == alt[len(alt) - 1 - suffix]:
+        suffix += 1
+    return len(ref) - prefix - suffix, len(alt) - prefix - suffix
+
+
+def _sequence_resolved_class_and_length(ref: str, alt: str) -> tuple[VariantClass, float]:
+    """Type a sequence-resolved allele pair the way the imputation strata do.
+
+    SV when max(len(REF), len(ALT)) - 1 >= SEQUENCE_RESOLVED_SV_MINIMUM_LENGTH;
+    then, on the trimmed allele cores, a deletion when REF loses >= that many
+    bases and the ALT core is at most max(10, 10% of the REF core), an
+    insertion in the mirror case, otherwise a complex SV. (Telling a DUP or
+    an INV apart needs the reference sequence; supply it as variant_class in
+    the variant metadata.) Length is the inserted/deleted core length, or the
+    longer core for complex and equal-length alleles.
+    """
+    if len(ref) == 1 and len(alt) == 1:
+        return VariantClass.SNV, 1.0
+    ref_core, alt_core = _trimmed_allele_core_lengths(ref, alt)
+    deletion = ref_core - alt_core >= SEQUENCE_RESOLVED_SV_MINIMUM_LENGTH and alt_core <= max(10.0, 0.1 * ref_core)
+    insertion = alt_core - ref_core >= SEQUENCE_RESOLVED_SV_MINIMUM_LENGTH and ref_core <= max(10.0, 0.1 * alt_core)
+    if deletion or alt_core == 0:
+        length = float(ref_core - alt_core)
+    elif insertion or ref_core == 0:
+        length = float(alt_core - ref_core)
+    else:
+        length = float(max(ref_core, alt_core))
+    if max(len(ref), len(alt)) - 1 < SEQUENCE_RESOLVED_SV_MINIMUM_LENGTH:
+        return VariantClass.SMALL_INDEL, length
+    if deletion:
+        return _structural_variant_class_from_token("DEL", length), length
+    if insertion:
+        return _structural_variant_class_from_token("INS", length), length
+    return VariantClass.OTHER_COMPLEX_SV, length
+
+
+def _variant_class_and_length(
+    *,
+    pos: int,
+    ref: str,
+    alt: str,
+    svtype: str | None,
+    svlen: float | None,
+    info_end: int | None,
+) -> tuple[VariantClass, float]:
+    """Variant class and length of one bi-allelic record (both VCF parsers).
+
+    A sequence-resolved allele pair (ACGTN REF and ALT) without SVTYPE is
+    typed from its alleles by _sequence_resolved_class_and_length. Records
+    with SVTYPE, and symbolic/breakend ALTs, are typed from the SVTYPE (else
+    the symbolic ALT) token; the token scan never runs on raw sequence.
+    Length is |SVLEN| when present; symbolic alleles otherwise fall back to
+    END - POS + 1, then the longest allele.
+    """
+    sequence_resolved = (
+        not _alt_is_symbolic_or_bnd(alt) and _is_atcgn_only(ref) and _is_atcgn_only(alt)
+    )
+    if sequence_resolved:
+        sequence_class, sequence_length = _sequence_resolved_class_and_length(ref, alt)
+        length = float(abs(svlen)) if svlen is not None else sequence_length
+        if svtype is None or sequence_class == VariantClass.SNV:
+            return sequence_class, length
+    elif svlen is not None:
+        length = float(abs(svlen))
+    elif info_end is not None and info_end >= pos:
+        length = float(info_end - pos + 1)
+    else:
+        length = float(max(len(ref), len(alt)))
+    if svtype is not None:
+        variant_token = _normalize_variant_token(svtype)
+    elif _alt_is_symbolic_or_bnd(alt):
+        variant_token = _normalize_variant_token(alt)
+    else:
+        variant_token = None
+    if variant_token is None:
+        return VariantClass.OTHER_COMPLEX_SV, length
+    return _structural_variant_class_from_token(variant_token, length), length
+
+
 def _variant_defaults_from_bcftools_fields(
     chrom: str,
     pos: int,
@@ -2538,8 +2606,8 @@ def _variant_defaults_from_bcftools_fields(
 ) -> _VariantDefaults:
     """Build _VariantDefaults from one bcftools query line.
 
-    Mirrors _variant_defaults_from_vcf_record exactly: same classification
-    branches, same length-derivation fallback chain, same AF/quality defaults.
+    Types and sizes the record with _variant_class_and_length, like
+    _variant_defaults_from_vcf_record, and uses the same AF/quality defaults.
     """
     record_id_text = record_id_field.decode("utf-8") if record_id_field else ""
     variant_id = (
@@ -2547,48 +2615,15 @@ def _variant_defaults_from_bcftools_fields(
         if not record_id_text or record_id_text == "."
         else record_id_text
     )
-
-    alt_is_sv = _alt_is_symbolic_or_bnd(alt)
-    ref_atcgn = _is_atcgn_only(ref)
-    alt_atcgn = (not alt_is_sv) and _is_atcgn_only(alt)
     svtype_text = svtype_field.decode("utf-8") if svtype_field else ""
-    has_svtype = bool(svtype_text) and svtype_text != "."
-    is_snp = len(ref) == 1 and len(alt) == 1 and ref_atcgn and alt_atcgn
-    # cyvcf2's is_indel: any non-SNP sequence allele pair without an SVTYPE,
-    # including equal-length multi-base substitutions. A sequence-resolved
-    # allele that carries SVTYPE is an SV.
-    is_indel = (
-        not is_snp
-        and not alt_is_sv
-        and not has_svtype
-        and ref_atcgn
-        and alt_atcgn
+    variant_class, length = _variant_class_and_length(
+        pos=pos,
+        ref=ref,
+        alt=alt,
+        svtype=svtype_text if svtype_text and svtype_text != "." else None,
+        svlen=_parse_optional_bcftools_float(svlen_field),
+        info_end=_parse_optional_bcftools_int(end_field),
     )
-
-    svlen_value = _parse_optional_bcftools_float(svlen_field)
-    if svlen_value is not None:
-        length = float(abs(svlen_value))
-    elif is_snp:
-        length = 1.0
-    else:
-        end_value = _parse_optional_bcftools_int(end_field)
-        if end_value is not None and end_value >= pos:
-            length = float(end_value - pos + 1)
-        else:
-            length = float(max(len(ref), len(alt)))
-
-    if is_snp:
-        variant_class = VariantClass.SNV
-    elif is_indel:
-        variant_class = VariantClass.SMALL_INDEL
-    else:
-        variant_token = _normalize_variant_token(svtype_text) if has_svtype else None
-        if variant_token is None:
-            variant_token = _normalize_variant_token(alt)
-        if variant_token is None:
-            variant_class = VariantClass.OTHER_COMPLEX_SV
-        else:
-            variant_class = _structural_variant_class_from_token(variant_token, length)
 
     allele_frequency = _parse_optional_bcftools_float(af_field)
     if allele_frequency is None:
@@ -4116,39 +4151,24 @@ def _variant_defaults_from_vcf_record(record: Any) -> _VariantDefaults:
     alt = str(record.ALT[0])
     info = record.INFO
     record_id = record.ID
-    is_snp = record.is_snp
     variant_id = (
         f"{chrom}:{pos}:{ref}:{alt}"
         if record_id is None or str(record_id) == "."
         else str(record_id)
     )
+    svtype_value = info.get("SVTYPE")
     svlen_value = info.get("SVLEN")
-    if svlen_value is not None:
-        if isinstance(svlen_value, (tuple, list)):
-            length = float(abs(float(svlen_value[0])))
-        else:
-            length = float(abs(float(svlen_value)))
-    elif is_snp:
-        length = 1.0
-    else:
-        record_end = record.end
-        if record_end is not None and int(record_end) >= pos:
-            length = float(int(record_end) - pos + 1)
-        else:
-            length = float(max(len(ref), len(alt)))
-
-    if is_snp:
-        variant_class = VariantClass.SNV
-    elif record.is_indel and not record.is_sv:
-        variant_class = VariantClass.SMALL_INDEL
-    else:
-        variant_token = _normalize_variant_token(info.get("SVTYPE"))
-        if variant_token is None:
-            variant_token = _normalize_variant_token(alt)
-        if variant_token is None:
-            variant_class = VariantClass.OTHER_COMPLEX_SV
-        else:
-            variant_class = _structural_variant_class_from_token(variant_token, length)
+    if isinstance(svlen_value, (tuple, list)):
+        svlen_value = svlen_value[0]
+    end_value = info.get("END")
+    variant_class, length = _variant_class_and_length(
+        pos=pos,
+        ref=ref,
+        alt=alt,
+        svtype=None if svtype_value is None else str(svtype_value),
+        svlen=None if svlen_value is None else float(svlen_value),
+        info_end=None if end_value is None else int(end_value),
+    )
 
     af_value = info.get("AF")
     if isinstance(af_value, (tuple, list)):
