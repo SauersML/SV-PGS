@@ -19,6 +19,7 @@ from typing import Any
 import numpy as np
 import pytest
 
+from sv_pgs import mixture_inference
 from sv_pgs.config import ModelConfig, TraitType
 from sv_pgs.inference import fit_variational_em
 from sv_pgs.mixture_inference import (
@@ -194,16 +195,14 @@ def test_resume_from_old_checkpoint_with_anderson_lbfgs_collapse_des():
     )
 
 
-def test_resumed_fit_uses_new_math_immediately():
-    """The FIRST sigma_e^2 update after resume must apply the exact ELBO
-    formula
+def test_resumed_fit_uses_new_math_immediately(monkeypatch: pytest.MonkeyPatch):
+    """The sigma_e^2 returned after resume must be the exact CAVI update
 
-        sigma_e^2 = (||y - X*alpha - G*beta||^2 + n * sum(Sigma_beta_jj)) / n
+        sigma_e^2 = (RSS + tr(Z'Z Cov)) / n,   Z = [W | X],
 
-    not the old leverage-weighted proxy. We probe this by saving an
-    old-format checkpoint, resuming for exactly one extra epoch, and
-    checking that the returned sigma_e^2 satisfies the ELBO identity on the
-    posterior state we get back.
+    for the inputs of the final posterior solve. We save a checkpoint, resume
+    for one extra epoch, capture the final solve's inputs, and compare with a
+    dense joint-posterior reference.
     """
     genotype_matrix, covariate_matrix, target_vector, records = _make_quantitative_problem(seed=23)
     config_two = _default_new_features_config(max_outer_iterations=2)
@@ -222,6 +221,19 @@ def test_resumed_fit_uses_new_math_immediately():
     )
     saved = pickle.loads(pickle.dumps(snapshots[-1]))
 
+    captured_solve_inputs: list[dict[str, Any]] = []
+    quantitative_posterior_state = mixture_inference._quantitative_posterior_state
+
+    def capturing_quantitative_posterior_state(**kwargs: Any):
+        captured_solve_inputs.append(kwargs)
+        return quantitative_posterior_state(**kwargs)
+
+    monkeypatch.setattr(
+        mixture_inference,
+        "_quantitative_posterior_state",
+        capturing_quantitative_posterior_state,
+    )
+
     # Resume for one more epoch.
     config_three = _default_new_features_config(max_outer_iterations=3)
     resumed = fit_variational_em(
@@ -234,30 +246,32 @@ def test_resumed_fit_uses_new_math_immediately():
         resume_checkpoint=saved,
     )
 
-    # ELBO identity: with the EXACT formula, sigma_e^2 = (RSS + n*tr(Sigma_b))/n.
-    # If the legacy leverage proxy were used we'd see RSS / (n - leverage)
-    # instead, which is strictly smaller because trace term > 0 but the
-    # divisor also shrinks unequally.
-    sample_count = float(target_vector.shape[0])
-    alpha = np.asarray(resumed.alpha, dtype=np.float64)
-    beta = np.asarray(resumed.beta_reduced, dtype=np.float64)
-    linear_predictor = (
-        np.asarray(covariate_matrix, dtype=np.float64) @ alpha
-        + np.asarray(genotype_matrix, dtype=np.float64) @ beta
+    final_solve = captured_solve_inputs[-1]
+    assert final_solve["compute_beta_variance"]
+    design = np.hstack(
+        [
+            np.asarray(covariate_matrix, dtype=np.float64),
+            np.asarray(genotype_matrix, dtype=np.float64),
+        ]
     )
-    residual = np.asarray(target_vector, dtype=np.float64) - linear_predictor
-    rss = float(residual @ residual)
-    beta_variance = np.asarray(resumed.beta_variance, dtype=np.float64)
-    trace_term = sample_count * float(np.sum(np.maximum(beta_variance, 0.0)))
-    expected_exact = max((rss + trace_term) / sample_count, config_three.sigma_error_floor)
-    # The leverage proxy would give a different (typically smaller) value;
-    # this assertion will fail loudly if the resumed run silently used the
-    # old proxy. Allow a small numerical tolerance for solver noise.
-    assert resumed.sigma_error2 == pytest.approx(expected_exact, rel=5e-4, abs=1e-7), (
-        f"sigma_e2={resumed.sigma_error2} does not match the exact ELBO formula "
-        f"value={expected_exact} (RSS={rss}, trace_term={trace_term}, n={sample_count}). "
-        "This indicates the resumed fit used the legacy leverage proxy instead of the new math."
+    prior_precision = (
+        np.asarray(final_solve["prior_precision_override"], dtype=np.float64)
+        if final_solve["prior_precision_override"] is not None
+        else 1.0 / np.asarray(final_solve["prior_variances"], dtype=np.float64)
     )
+    sigma_error2 = float(final_solve["sigma_error2"])
+    covariance = np.linalg.inv(
+        design.T @ design / sigma_error2
+        + np.diag(np.concatenate([np.zeros(covariate_matrix.shape[1]), prior_precision]))
+    )
+    targets64 = np.asarray(final_solve["targets"], dtype=np.float64)
+    posterior_mean = covariance @ design.T @ targets64 / sigma_error2
+    residual = targets64 - design @ posterior_mean
+    expected_exact = max(
+        (float(residual @ residual) + float(np.sum((design.T @ design) * covariance))) / design.shape[0],
+        config_three.sigma_error_floor,
+    )
+    assert resumed.sigma_error2 == pytest.approx(expected_exact, rel=1e-5, abs=1e-8)
 
 
 def test_per_epoch_eval_callback_fires_with_correct_iter_num_after_resume():

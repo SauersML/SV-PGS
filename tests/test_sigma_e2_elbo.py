@@ -1,12 +1,14 @@
-"""Tests for the exact ELBO stationary-point σ_e² update in
-`_quantitative_posterior_state`.
+"""Tests for the exact CAVI stationary-point sigma_e^2 update.
 
-The previous implementation used a leverage proxy
-    posterior_fit_uncertainty = σ_e² · Σ_j (τ²_j − Σ_β_jj) / τ²_j
-which is only correct at the true posterior.  The new implementation uses the
-closed-form ELBO stationary point
-    σ_e²_new = (RSS + tr(X Σ_β Xᵀ)) / n
-            = (RSS + n · Σ_j Σ_β_jj) / n         (standardized columns).
+With Z = [W | X] and Cov the joint posterior covariance of (alpha, beta) under
+the flat covariate prior,
+
+    sigma_e^2_new = (RSS + tr(Z'Z Cov)) / n,
+    tr(Z'Z Cov) = sigma_e^2 * (k + sum_j (1 - P_j Cov_jj)),
+
+because Cov = (Z'Z / sigma_e^2 + P)^{-1}. The identity needs only the diagonal.
+The former n * sum_j Cov_jj equals it only for orthogonal genotype columns, so
+these tests use strongly correlated (LD-like) columns and a dense exact reference.
 """
 
 from __future__ import annotations
@@ -14,143 +16,224 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
+from sv_pgs import mixture_inference
+from sv_pgs.config import ModelConfig, TraitType
 from sv_pgs.genotype import as_raw_genotype_matrix
-from sv_pgs.mixture_inference import _quantitative_posterior_state
+from sv_pgs.inference import fit_variational_em
+from sv_pgs.mixture_inference import (
+    _build_prior_design,
+    _quantitative_posterior_state,
+    _scale_state_reduced_prior_variances,
+)
+from sv_pgs.preprocessing import build_tie_map
+
+from tests.conftest import make_variant_records
 
 
-def _make_standardized(genotype_values: np.ndarray):
-    raw = as_raw_genotype_matrix(genotype_values.astype(np.float32))
+def _correlated_standardized_genotypes(
+    random_generator: np.random.Generator,
+    sample_count: int,
+    variant_count: int,
+    correlation: float = 0.95,
+    block_size: int = 10,
+) -> np.ndarray:
+    latent = np.empty((sample_count, variant_count), dtype=np.float64)
+    for block_start in range(0, variant_count, block_size):
+        block_stop = min(block_start + block_size, variant_count)
+        block = random_generator.standard_normal((sample_count, block_stop - block_start))
+        for column_index in range(1, block_stop - block_start):
+            block[:, column_index] = (
+                correlation * block[:, column_index - 1]
+                + np.sqrt(1.0 - correlation**2) * block[:, column_index]
+            )
+        latent[:, block_start:block_stop] = block
+    latent -= latent.mean(axis=0, keepdims=True)
+    latent /= latent.std(axis=0, keepdims=True)
+    return latent.astype(np.float32)
+
+
+def _standardized_matrix(genotype_values: np.ndarray):
     variant_count = genotype_values.shape[1]
-    standardized = raw.standardized(
+    standardized = as_raw_genotype_matrix(genotype_values).standardized(
         means=np.zeros(variant_count, dtype=np.float32),
         scales=np.ones(variant_count, dtype=np.float32),
     )
+    standardized._dense_cache = standardized.materialize()
     return standardized
 
 
-def test_sigma_e2_matches_exact_elbo_stationary_point():
-    """σ_e²_new = (RSS + n · Σ_j Σ_β_jj) / n on a small standardized problem."""
-    rng = np.random.default_rng(0)
-    sample_count, variant_count = 200, 10
-    sigma_e_true = 2.0
+def _exact_sigma_error2_update(
+    genotype_values: np.ndarray,
+    covariate_matrix: np.ndarray,
+    targets: np.ndarray,
+    prior_precision: np.ndarray,
+    sigma_error2: float,
+) -> tuple[float, float]:
+    design = np.hstack([covariate_matrix.astype(np.float64), genotype_values.astype(np.float64)])
+    precision = np.concatenate([np.zeros(covariate_matrix.shape[1]), prior_precision])
+    posterior_precision = design.T @ design / sigma_error2 + np.diag(precision)
+    covariance = np.linalg.inv(posterior_precision)
+    mean = covariance @ design.T @ targets.astype(np.float64) / sigma_error2
+    residual = targets.astype(np.float64) - design @ mean
+    residual_sum_squares = float(residual @ residual)
+    trace = float(np.sum((design.T @ design) * covariance))
+    sample_count = targets.shape[0]
+    diagonal_only_trace = sample_count * float(np.sum(np.diag(covariance)[covariate_matrix.shape[1]:]))
+    return (residual_sum_squares + trace) / sample_count, (residual_sum_squares + diagonal_only_trace) / sample_count
 
-    # Generate already-standardized genotypes (zero mean, unit variance per column).
-    raw_genotypes = rng.standard_normal((sample_count, variant_count)).astype(np.float64)
-    raw_genotypes -= raw_genotypes.mean(axis=0, keepdims=True)
-    column_norms = np.linalg.norm(raw_genotypes, axis=0)
-    raw_genotypes *= np.sqrt(sample_count) / column_norms  # ‖X[:,j]‖² == n exactly
-    genotype_matrix = raw_genotypes.astype(np.float32)
 
-    standardized = _make_standardized(genotype_matrix)
-    standardized._dense_cache = standardized.materialize()
-
-    true_beta = rng.standard_normal(variant_count) * 0.3
-    targets = (
-        genotype_matrix.astype(np.float64) @ true_beta
-        + rng.standard_normal(sample_count) * sigma_e_true
+@pytest.mark.parametrize(
+    ("sample_count", "variant_count"),
+    [(300, 120), (120, 300)],
+    ids=["variant_space", "sample_space"],
+)
+def test_sigma_e2_matches_exact_cavi_update_under_ld(sample_count: int, variant_count: int):
+    random_generator = np.random.default_rng(7)
+    genotype_values = _correlated_standardized_genotypes(random_generator, sample_count, variant_count)
+    covariate_matrix = np.column_stack(
+        [np.ones(sample_count), random_generator.standard_normal(sample_count)]
     ).astype(np.float32)
+    true_beta = np.zeros(variant_count)
+    true_beta[random_generator.choice(variant_count, 6, replace=False)] = 0.4
+    targets = (
+        genotype_values.astype(np.float64) @ true_beta + random_generator.standard_normal(sample_count)
+    ).astype(np.float32)
+    prior_variances = random_generator.uniform(0.005, 0.05, size=variant_count)
+    sigma_error2 = 0.9
 
-    # Intercept-only "covariates" so the GLS problem is well-conditioned.
-    covariate_matrix = np.ones((sample_count, 1), dtype=np.float32)
-    prior_variances = np.full(variant_count, 0.5, dtype=np.float64)
-    sigma_error2 = float(sigma_e_true ** 2)
-
-    (
-        _alpha,
-        beta,
-        beta_variance,
-        linear_predictor,
-        _objective,
-        sigma_error2_new,
-    ) = _quantitative_posterior_state(
-        genotype_matrix=standardized,
+    *_unused, sigma_error2_new = _quantitative_posterior_state(
+        genotype_matrix=_standardized_matrix(genotype_values),
         covariate_matrix=covariate_matrix,
         targets=targets,
         prior_variances=prior_variances,
         sigma_error2=sigma_error2,
         sigma_error_floor=1e-8,
+        solver_tolerance=1e-12,
+        compute_logdet=False,
+        compute_beta_variance=True,
     )
 
-    residual = np.asarray(targets, dtype=np.float64) - np.asarray(linear_predictor, dtype=np.float64)
-    rss = float(np.dot(residual, residual))
-    # tr(X Σ_β Xᵀ) = Σ_j (Σ_β)_jj · ‖X[:,j]‖² = n · Σ_j Σ_β_jj  for standardized X.
-    trace_term = float(sample_count) * float(np.sum(np.maximum(beta_variance, 0.0)))
-    expected = (rss + trace_term) / sample_count
+    expected, diagonal_only = _exact_sigma_error2_update(
+        genotype_values, covariate_matrix, targets, 1.0 / prior_variances, sigma_error2
+    )
+    # The correlated design must make the orthogonal-column shortcut wrong.
+    assert diagonal_only > 1.2 * expected
+    assert sigma_error2_new == pytest.approx(expected, rel=1e-6)
 
-    assert sigma_error2_new == pytest.approx(expected, rel=1e-10, abs=1e-12)
 
-
-def test_sigma_e2_increases_when_beta_perturbed_away_from_posterior_mean():
-    """Perturbing the linear predictor away from the posterior mean increases RSS,
-    so a recomputation of σ_e² from the formula must be non-decreasing in residual
-    magnitude.  We exercise this by computing the formula directly with a
-    perturbed predictor (the function itself doesn't accept an external β,
-    so we verify the formula behavior, which is what the implementation uses).
-    """
-    rng = np.random.default_rng(1)
-    sample_count, variant_count = 200, 10
-
-    raw_genotypes = rng.standard_normal((sample_count, variant_count)).astype(np.float64)
-    raw_genotypes -= raw_genotypes.mean(axis=0, keepdims=True)
-    column_norms = np.linalg.norm(raw_genotypes, axis=0)
-    raw_genotypes *= np.sqrt(sample_count) / column_norms
-    genotype_matrix = raw_genotypes.astype(np.float32)
-
-    standardized = _make_standardized(genotype_matrix)
-    standardized._dense_cache = standardized.materialize()
-
-    true_beta = rng.standard_normal(variant_count) * 0.3
-    targets = (
-        genotype_matrix.astype(np.float64) @ true_beta
-        + rng.standard_normal(sample_count) * 2.0
-    ).astype(np.float32)
+def test_sigma_e2_uses_the_prior_precision_override():
+    random_generator = np.random.default_rng(11)
+    sample_count, variant_count = 300, 80
+    genotype_values = _correlated_standardized_genotypes(random_generator, sample_count, variant_count)
     covariate_matrix = np.ones((sample_count, 1), dtype=np.float32)
-    prior_variances = np.full(variant_count, 0.5, dtype=np.float64)
-    sigma_error2 = 4.0
+    targets = (
+        genotype_values[:, :3].astype(np.float64) @ np.array([0.5, -0.3, 0.2])
+        + random_generator.standard_normal(sample_count)
+    ).astype(np.float32)
+    prior_variances = np.full(variant_count, 0.02)
+    prior_precision_override = random_generator.uniform(60.0, 400.0, size=variant_count)
+    sigma_error2 = 1.1
 
-    (
-        _alpha,
-        beta,
-        beta_variance,
-        linear_predictor,
-        _objective,
-        sigma_error2_new,
-    ) = _quantitative_posterior_state(
-        genotype_matrix=standardized,
+    *_unused, sigma_error2_new = _quantitative_posterior_state(
+        genotype_matrix=_standardized_matrix(genotype_values),
         covariate_matrix=covariate_matrix,
         targets=targets,
         prior_variances=prior_variances,
         sigma_error2=sigma_error2,
         sigma_error_floor=1e-8,
+        solver_tolerance=1e-12,
+        compute_logdet=False,
+        compute_beta_variance=True,
+        prior_precision_override=prior_precision_override,
     )
 
-    targets64 = np.asarray(targets, dtype=np.float64)
-    predictor_base = np.asarray(linear_predictor, dtype=np.float64)
-    trace_term = float(sample_count) * float(np.sum(np.maximum(beta_variance, 0.0)))
+    expected, _diagonal_only = _exact_sigma_error2_update(
+        genotype_values, covariate_matrix, targets, prior_precision_override, sigma_error2
+    )
+    assert sigma_error2_new == pytest.approx(expected, rel=1e-6)
 
-    rss_base = float(np.dot(targets64 - predictor_base, targets64 - predictor_base))
-    sigma_base = (rss_base + trace_term) / sample_count
 
-    # The function's returned σ_e²_new should match the base formula exactly.
-    assert sigma_error2_new == pytest.approx(sigma_base, rel=1e-10, abs=1e-12)
+def test_stochastic_epoch_sigma_e2_uses_the_prior_the_block_solves_used(monkeypatch: pytest.MonkeyPatch):
+    """Epoch-end sigma_e^2 = RSS / (n - sum_j (1 - Sigma_jj / tau_j^2)) with the
+    tau^2 the blocks were solved under, not the tau^2 re-estimated after the epoch."""
+    # Pin the block partition the reference below reproduces.
+    monkeypatch.setattr(
+        mixture_inference,
+        "_adaptive_stochastic_variant_block_size",
+        lambda _genotype_matrix, configured_block_size: configured_block_size,
+    )
+    random_generator = np.random.default_rng(3)
+    sample_count, variant_count, block_size = 200, 40, 20
+    genotype_values = _correlated_standardized_genotypes(random_generator, sample_count, variant_count)
+    covariate_matrix = np.ones((sample_count, 1), dtype=np.float32)
+    true_beta = np.zeros(variant_count)
+    true_beta[[2, 17, 31]] = [0.6, -0.5, 0.4]
+    targets = (
+        genotype_values.astype(np.float64) @ true_beta + random_generator.standard_normal(sample_count)
+    ).astype(np.float32)
+    records = make_variant_records(variant_count)
+    config = ModelConfig(
+        trait_type=TraitType.QUANTITATIVE,
+        max_outer_iterations=2,
+        beta_variance_update_interval=1,
+        stochastic_variational_updates=True,
+        stochastic_min_variant_count=0,
+        stochastic_variant_batch_size=block_size,
+        final_posterior_diagnostics=False,
+        linear_solver_tolerance=1e-12,
+    )
+    epoch_end_checkpoints = []
+    epoch_snapshots = []
+    fit_variational_em(
+        genotypes=genotype_values,
+        covariates=covariate_matrix,
+        targets=targets,
+        records=records,
+        config=config,
+        tie_map=build_tie_map(genotype_values, records, config),
+        checkpoint_callback=lambda checkpoint: (
+            epoch_end_checkpoints.append(checkpoint)
+            if checkpoint.completed_blocks_in_iteration == 0
+            else None
+        ),
+        per_epoch_eval_callback=epoch_snapshots.append,
+    )
+    assert [checkpoint.completed_iterations for checkpoint in epoch_end_checkpoints] == [1, 2]
 
-    # Perturb the linear predictor along the residual direction (moving the
-    # predictor *away* from the targets).  This monotonically increases RSS,
-    # so the σ_e² formula must be monotonically non-decreasing in the
-    # perturbation scale.  This verifies "non-decreasing in fit quality
-    # degradation" -- i.e., worse fit → larger σ_e².
-    residual_base = targets64 - predictor_base
-    previous_sigma = sigma_base
-    for scale in (0.0, 0.1, 0.25, 0.5, 1.0):
-        # predictor_base - scale · residual_base moves the predictor further
-        # from the targets along the same direction; ‖residual‖² scales as
-        # (1 + scale)².
-        predictor_perturbed = predictor_base - scale * residual_base
-        rss_perturbed = float(
-            np.dot(targets64 - predictor_perturbed, targets64 - predictor_perturbed)
+    first_epoch = epoch_end_checkpoints[0]
+    solve_prior_variances = _scale_state_reduced_prior_variances(
+        global_scale=first_epoch.global_scale,
+        scale_model_coefficients=first_epoch.scale_model_coefficients,
+        local_scale=first_epoch.local_scale,
+        design_matrix=_build_prior_design(records).design_matrix,
+        config=config,
+    )
+    second_epoch_prior_variances = _scale_state_reduced_prior_variances(
+        global_scale=epoch_end_checkpoints[1].global_scale,
+        scale_model_coefficients=epoch_end_checkpoints[1].scale_model_coefficients,
+        local_scale=epoch_end_checkpoints[1].local_scale,
+        design_matrix=_build_prior_design(records).design_matrix,
+        config=config,
+    )
+    # The hyperparameter update inside epoch 2 must move the prior, otherwise
+    # the two leverage definitions coincide and the test cannot tell them apart.
+    assert np.max(np.abs(np.log(second_epoch_prior_variances / solve_prior_variances))) > 0.05
+
+    genotypes64 = genotype_values.astype(np.float64)
+    leverage = 0.0
+    for block_start in range(0, variant_count, block_size):
+        block = slice(block_start, block_start + block_size)
+        block_genotypes = genotypes64[:, block]
+        block_covariance = np.linalg.inv(
+            block_genotypes.T @ block_genotypes / first_epoch.sigma_error2
+            + np.diag(1.0 / solve_prior_variances[block])
         )
-        sigma_perturbed = (rss_perturbed + trace_term) / sample_count
-        assert sigma_perturbed >= previous_sigma - 1e-12
-        previous_sigma = sigma_perturbed
-    # Final perturbation must be strictly larger than baseline.
-    assert previous_sigma > sigma_base
+        leverage += float(np.sum(1.0 - np.diag(block_covariance) / solve_prior_variances[block]))
+    second_epoch = epoch_snapshots[1]
+    residual = (
+        targets.astype(np.float64)
+        - covariate_matrix.astype(np.float64) @ second_epoch["alpha_reduced"]
+        - genotypes64 @ second_epoch["beta_reduced"]
+    )
+    expected = float(residual @ residual) / (sample_count - leverage)
+    assert second_epoch["sigma_error2"] == pytest.approx(expected, rel=1e-5)
