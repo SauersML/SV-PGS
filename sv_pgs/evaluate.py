@@ -26,6 +26,8 @@ from typing import Literal, Sequence
 import numpy as np
 
 from sv_pgs._typing import NDArray
+from sv_pgs.all_of_us import resolve_disease_definition
+from sv_pgs.aou_runner import local_ancestry_predictions_path
 from sv_pgs.progress import log
 
 EvaluationPurpose = Literal["genetic_only", "full_model"]
@@ -261,32 +263,18 @@ def evaluate_all_of_us(
         raise ValueError(f"Unknown evaluation_purpose: {evaluation_purpose!r}")
     quasi_holdout_purpose: EvaluationPurpose = "genetic_only"
 
-    # Find predictions
-    predictions_path = None
-    for candidate in [work_dir / "predictions.tsv.gz", work_dir.parent / "hypertension_result" / "predictions.tsv.gz"]:
-        if candidate.exists():
-            predictions_path = candidate
-            break
-    if predictions_path is None:
+    # Read exactly the files run_all_of_us wrote for this disease: predictions and
+    # the sample table (named by the canonical disease, so aliases resolve) in
+    # work_dir, and ancestry predictions in the shared cache beside work_dir.
+    disease = resolve_disease_definition(disease).canonical_name
+    predictions_path = work_dir / "predictions.tsv.gz"
+    if not predictions_path.exists():
         raise FileNotFoundError(f"No predictions.tsv.gz found in {work_dir}")
-
-    # Find sample table
-    sample_table_path = None
-    for parent in [work_dir, work_dir.parent / "hypertension_results"]:
-        candidate = parent / f"{disease}.samples.tsv"
-        if candidate.exists():
-            sample_table_path = candidate
-            break
-    if sample_table_path is None:
-        raise FileNotFoundError(f"No {disease}.samples.tsv found")
-
-    # Find ancestry file
-    ancestry_path = None
-    for parent in [work_dir, work_dir.parent / "hypertension_results"]:
-        candidate = parent / "ancestry_preds.tsv"
-        if candidate.exists():
-            ancestry_path = candidate
-            break
+    sample_table_path = work_dir / f"{disease}.samples.tsv"
+    if not sample_table_path.exists():
+        raise FileNotFoundError(f"No {disease}.samples.tsv found in {work_dir}")
+    shared_ancestry_path = local_ancestry_predictions_path(work_dir)
+    ancestry_path = shared_ancestry_path if shared_ancestry_path.exists() else None
 
     log("=== QUASI-HOLDOUT EVALUATION ===")
     log(f"  disease: {disease}")
