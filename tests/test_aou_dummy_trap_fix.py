@@ -6,12 +6,15 @@ against the implicit intercept (i.e. no `sum(dummies) == 1` per row).
 """
 from __future__ import annotations
 
+import csv
 from pathlib import Path
 
 import numpy as np
 import pytest
 
+from sv_pgs.all_of_us import AllOfUsDiseaseRequest, prepare_all_of_us_disease_sample_table
 from sv_pgs.aou_runner import _expand_one_hot_covariates
+from tests.test_all_of_us import _FakeBigQueryClient
 
 
 def _write_sample_table(path: Path, columns: dict) -> None:
@@ -135,6 +138,58 @@ def test_explicit_column_name_passthrough(tmp_path: Path) -> None:
         ["gender_concept_id_8507", "PC1"], path
     )
     assert expanded == ["gender_concept_id_8507", "PC1"]
+
+
+def test_prepared_phenotype_table_drops_exactly_one_reference_per_group(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The phenotype writer and the expander together drop ONE level per group.
+
+    Each stage used to drop its own reference (the writer the lowest concept
+    id, the expander the majority), merging two levels into the reference.
+    """
+    monkeypatch.setenv("GOOGLE_PROJECT", "billing-project")
+    monkeypatch.setenv("WORKSPACE_CDR", "aou_workspace.cdr_dataset")
+    genders = [8532] * 5 + [8507] * 3 + [0] * 2
+    races = [8527] * 6 + [8516] * 3 + [8515]
+    ethnicities = [38003564] * 7 + [38003563] * 3
+    rows: list[dict[str, object]] = [
+        {
+            "person_id": str(100 + index),
+            "sample_id": str(100 + index),
+            "phenotype_occurrence_count": 2 * (index % 2),
+            "age_at_observation_start": 40 + index,
+            "gender_concept_id": genders[index],
+            "race_concept_id": races[index],
+            "ethnicity_concept_id": ethnicities[index],
+        }
+        for index in range(10)
+    ]
+    path = tmp_path / "heart_failure.samples.tsv"
+    prepare_all_of_us_disease_sample_table(
+        request=AllOfUsDiseaseRequest(disease="heart_failure"),
+        output_path=path,
+        client=_FakeBigQueryClient(rows=rows),
+    )
+
+    expanded = _expand_one_hot_covariates(
+        ["gender_concept_id", "race_concept_id", "ethnicity_concept_id"], path
+    )
+
+    assert sorted(expanded) == [
+        "ethnicity_concept_id_38003563",
+        "gender_concept_id_0",
+        "gender_concept_id_8507",
+        "race_concept_id_8515",
+        "race_concept_id_8516",
+    ]
+    with path.open(newline="", encoding="utf-8") as handle:
+        table_rows = list(csv.DictReader(handle, delimiter="\t"))
+    covariate_matrix = np.column_stack(
+        [np.ones(len(table_rows))]
+        + [np.asarray([float(row[column]) for row in table_rows]) for column in expanded]
+    )
+    assert np.linalg.matrix_rank(covariate_matrix) == covariate_matrix.shape[1]
 
 
 if __name__ == "__main__":

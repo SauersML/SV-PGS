@@ -492,14 +492,17 @@ def _prepare_training_rows(
 def _add_one_hot_omop_categorical_covariates(rows: list[dict[str, Any]]) -> tuple[str, ...]:
     encoded_column_names: list[str] = []
     for categorical_column in OMOP_CATEGORICAL_COVARIATES:
-        sorted_concept_ids = sorted(
+        # Every observed level gets a column. The reference level is chosen
+        # once, downstream, by aou_runner._expand_one_hot_covariates (it drops
+        # the majority level); dropping one here as well merged two levels
+        # into the reference.
+        encoded_concept_ids = sorted(
             {
                 _parse_concept_id(categorical_column, row.get(categorical_column))
                 for row in rows
                 if row.get(categorical_column) not in (None, "")
             }
         )
-        encoded_concept_ids = sorted_concept_ids[1:]
         column_names = tuple(
             f"{categorical_column}_{concept_id}"
             for concept_id in encoded_concept_ids
