@@ -47,12 +47,17 @@ DEFAULT_CLASS_LOG_BASELINE_SCALE = {
     VariantClass.INVERSION: -3.1,
 }
 
-# TPB shape parameters control the "tail weight" of the shrinkage prior.
-# Shape_a (below) and shape_b control how tolerant the prior is of large effects:
-#   - shape_a=1.0 (SNVs): moderate tails — most effects shrunk to near zero
-#   - shape_a=0.55 (inversions): heavy tails — more tolerance for large effects
-# SVs get heavier tails because they disrupt more DNA and are more likely
-# to have individually detectable phenotypic effects.
+# TPB shapes of the local-scale prior lambda | delta ~ Gamma(shape_a, rate delta),
+# delta ~ Gamma(shape_b, rate 1) (_local_scale_prior_objective). Marginally
+# lambda ~ BetaPrime(shape_a, shape_b), density proportional to
+# lambda^(shape_a - 1) (1 + lambda)^-(shape_a + shape_b), so:
+#   - shape_a sets the mass near zero: smaller a puts more variants at a
+#     near-zero effect, and a <= 1/2 gives the marginal effect density a pole
+#     at zero (horseshoe: a = b = 1/2);
+#   - shape_b sets the tail: p(beta) ~ |beta|^(-2 b - 1), so smaller b
+#     tolerates more large effects.
+# SVs start with smaller a and b than SNVs: more of them are null, and the
+# ones that act can have large effects. The model updates both during fitting.
 DEFAULT_CLASS_TPB_SHAPE_A: dict[VariantClass, float] = {
     VariantClass.SNV: 1.0,
     VariantClass.SMALL_INDEL: 0.9,
@@ -68,9 +73,8 @@ DEFAULT_CLASS_TPB_SHAPE_A: dict[VariantClass, float] = {
     VariantClass.INVERSION: 0.55,
 }
 
-# Shape_b controls the auxiliary rate distribution.  Together with shape_a,
-# it determines the marginal distribution of the local shrinkage factor.
-# Smaller values = heavier tails = more large effects allowed.
+# Shape_b is the shape of the auxiliary rate delta and sets the tail of the
+# local-scale prior (see above): smaller values allow more large effects.
 DEFAULT_CLASS_TPB_SHAPE_B: dict[VariantClass, float] = {
     VariantClass.SNV: 0.5,
     VariantClass.SMALL_INDEL: 0.5,
