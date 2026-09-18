@@ -1,0 +1,97 @@
+"""The CUDA Stage 0 backend reproduces the CPU backend bit for bit."""
+
+from __future__ import annotations
+
+import numpy as np
+import pytest
+
+from sv_pgs.stage0 import CpuStage0Backend, build_sample_layout, plan_genotype_pass, run_genotype_pass
+from tests.stage0_support import InMemoryTileSource, bubble_groups, mosaic_codes
+
+cp = pytest.importorskip("cupy")
+cuda_backend = pytest.importorskip("sv_pgs.stage0.cuda_backend")
+
+SAMPLES = 700
+BLOCK_CAP = 128
+
+
+def _source(seed: int, variant_counts: dict[str, int]) -> InMemoryTileSource:
+    rng = np.random.default_rng(seed)
+    return InMemoryTileSource(
+        codes={name: mosaic_codes(rng, SAMPLES, count) for name, count in variant_counts.items()},
+        groups={name: bubble_groups(rng, count) for name, count in variant_counts.items()},
+    )
+
+
+def _run(source, sample_groups, backend_kind, columns, devices=1):
+    layout = build_sample_layout(sample_groups, profile_target=300)
+    plan = plan_genotype_pass(BLOCK_CAP)
+    if backend_kind == "cpu":
+        backends = [CpuStage0Backend(layout, plan.capacity_rows, columns, worker_count=2)]
+    else:
+        backends = [
+            cuda_backend.CudaStage0Backend(index % cp.cuda.runtime.getDeviceCount(), layout, plan.capacity_rows,
+                                           plan.tile_rows, columns)
+            for index in range(devices)
+        ]
+    blocks = []
+    summary = run_genotype_pass(source, layout, backends, plan, blocks.append)
+    return summary, sorted(blocks, key=lambda block: (block.chromosome, block.start))
+
+
+@pytest.fixture(scope="module")
+def dataset():
+    source = _source(21, {"chr4": 900, "chr9": 333})
+    labels = np.random.default_rng(22).integers(0, 2, size=SAMPLES)
+    labels[::13] = -1
+    columns = np.random.default_rng(23).normal(size=(SAMPLES, 3))
+    return source, labels, columns
+
+
+def test_cuda_blocks_equal_cpu_blocks(dataset) -> None:
+    source, labels, columns = dataset
+    cpu_summary, cpu_blocks = _run(source, labels, "cpu", columns)
+    cuda_summary, cuda_blocks = _run(source, labels, "cuda", columns)
+    for name in ("chr4", "chr9"):
+        np.testing.assert_array_equal(cpu_summary.chromosomes[name].cut_costs, cuda_summary.chromosomes[name].cut_costs)
+        np.testing.assert_array_equal(cpu_summary.chromosomes[name].boundaries, cuda_summary.chromosomes[name].boundaries)
+    assert len(cpu_blocks) == len(cuda_blocks)
+    signed = {name: codes.astype(np.int64) - 127 for name, codes in source.codes.items()}
+    for cpu_block, cuda_block in zip(cpu_blocks, cuda_blocks):
+        assert (cpu_block.chromosome, cpu_block.start, cpu_block.stop) == (
+            cuda_block.chromosome, cuda_block.start, cuda_block.stop)
+        assert cuda_block.grams.dtype == np.int32
+        np.testing.assert_array_equal(cpu_block.grams, cuda_block.grams)
+        np.testing.assert_array_equal(cpu_block.sums, cuda_block.sums)
+        np.testing.assert_allclose(cpu_block.cross_products, cuda_block.cross_products, rtol=1e-12, atol=1e-9)
+        members = np.flatnonzero(labels == 1)
+        values = signed[cuda_block.chromosome][cuda_block.start : cuda_block.stop, members]
+        np.testing.assert_array_equal(cuda_block.grams[1], values @ values.T)
+
+
+def test_long_sample_ranges_accumulate_exactly_in_int64(dataset, monkeypatch) -> None:
+    source, labels, columns = dataset
+    monkeypatch.setattr(cuda_backend, "_SAMPLE_CHUNK", 128)
+    _, cuda_blocks = _run(source, labels, "cuda", None)
+    signed = {name: codes.astype(np.int64) - 127 for name, codes in source.codes.items()}
+    members = np.flatnonzero(labels == 0)
+    for block in cuda_blocks:
+        values = signed[block.chromosome][block.start : block.stop, members]
+        np.testing.assert_array_equal(block.grams[0], values @ values.T)
+
+
+def test_two_device_workers_equal_one(dataset) -> None:
+    source, labels, _ = dataset
+    _, single = _run(source, labels, "cuda", None, devices=1)
+    _, double = _run(source, labels, "cuda", None, devices=2)
+    assert [(block.chromosome, block.start) for block in single] == [(block.chromosome, block.start) for block in double]
+    for left, right in zip(single, double):
+        np.testing.assert_array_equal(left.grams, right.grams)
+
+
+def test_cuda_rejects_missing_codes() -> None:
+    source = _source(24, {"chr7": 200})
+    source.codes["chr7"][50, 1] = 255
+    labels = np.zeros(SAMPLES, dtype=np.int64)
+    with pytest.raises(ValueError, match="missing"):
+        _run(source, labels, "cuda", None)
