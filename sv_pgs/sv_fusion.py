@@ -275,3 +275,29 @@ def fused_dosage(
         + calibration.second_weight * (np.asarray(second_values, dtype=np.float64)[observed] - calibration.second_mean)
     )
     return fused
+
+
+def resolve_one_to_one(pairs: SvCandidatePairs, calibrations: list[TwoSourceCalibration]) -> I64Array:
+    """Indices of the candidate pairs to fuse, each record used at most once.
+
+    Several popped alleles of one locus can match one GATK-SV record, and one
+    allele several records. Accepted pairs are taken in order of decreasing
+    pairing evidence (Fisher z); a pair is skipped once either record is
+    taken. Records left unpaired stay separate columns.
+    """
+    if len(calibrations) != pairs.first_rows.shape[0]:
+        raise ValueError("resolve_one_to_one needs one calibration per candidate pair.")
+    accepted = [index for index, calibration in enumerate(calibrations) if calibration.accepted]
+    accepted.sort(key=lambda index: -calibrations[index].pairing_z)
+    taken_first: set[int] = set()
+    taken_second: set[int] = set()
+    chosen: list[int] = []
+    for index in accepted:
+        first_row = int(pairs.first_rows[index])
+        second_row = int(pairs.second_rows[index])
+        if first_row in taken_first or second_row in taken_second:
+            continue
+        taken_first.add(first_row)
+        taken_second.add(second_row)
+        chosen.append(index)
+    return np.asarray(sorted(chosen), dtype=np.int64)

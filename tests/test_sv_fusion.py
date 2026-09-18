@@ -4,7 +4,15 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
-from sv_pgs.sv_fusion import SvSites, calibrate_two_sources, candidate_pairs, fused_dosage
+from sv_pgs.sv_fusion import (
+    SvCandidatePairs,
+    SvSites,
+    TwoSourceCalibration,
+    calibrate_two_sources,
+    candidate_pairs,
+    fused_dosage,
+    resolve_one_to_one,
+)
 
 
 def _sites(rows: list[tuple[str, int, int, int, str]], duplications_are_insertions: bool) -> SvSites:
@@ -150,3 +158,43 @@ def test_group_labels_correct_the_genotype_variance_of_an_admixed_sample() -> No
 
     assert abs(grouped.first_reliability - true_first_reliability) < 0.03
     assert abs(pooled.first_reliability - true_first_reliability) > 3 * abs(grouped.first_reliability - true_first_reliability)
+
+
+def _calibration(pairing_z: float, accepted: bool) -> TwoSourceCalibration:
+    reliability = 0.8 if accepted else 1.5
+    return TwoSourceCalibration(
+        sample_count=1000,
+        first_mean=0.1,
+        second_mean=0.1,
+        genotype_variance=0.1,
+        second_slope=0.9,
+        first_reliability=reliability,
+        second_reliability=0.7,
+        fused_reliability=0.9,
+        first_weight=0.5,
+        second_weight=0.5,
+        pairing_z=pairing_z,
+    )
+
+
+def test_one_to_one_resolution_keeps_the_strongest_accepted_pairs() -> None:
+    # Candidates (first, second): two panel alleles compete for GATK-SV record
+    # 0; panel allele 2 matches two GATK-SV records; one pair fails the check.
+    pairs = SvCandidatePairs(
+        first_rows=np.array([0, 1, 2, 2, 3], dtype=np.int64),
+        second_rows=np.array([0, 0, 1, 2, 3], dtype=np.int64),
+        size_ratios=np.ones(5),
+        reciprocal_overlaps=np.ones(5),
+        breakpoint_distances=np.full(5, -1, dtype=np.int64),
+    )
+    calibrations = [
+        _calibration(pairing_z=12.0, accepted=True),
+        _calibration(pairing_z=30.0, accepted=True),
+        _calibration(pairing_z=8.0, accepted=True),
+        _calibration(pairing_z=20.0, accepted=True),
+        _calibration(pairing_z=40.0, accepted=False),
+    ]
+
+    chosen = resolve_one_to_one(pairs, calibrations)
+
+    assert chosen.tolist() == [1, 3]
