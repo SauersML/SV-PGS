@@ -2703,10 +2703,15 @@ def _region_parse_worker(args: tuple[str, str | None, str, int]) -> tuple[int, s
     comes first) we flush the genotype/stats binary streams, write the
     pending variant metadata to its own chunk file, and atomically rewrite
     a small progress.json. If the worker is killed and re-launched, we
-    truncate any partial trailing writes and restart bcftools from the
-    record after the last checkpointed position via `-r chr:N+1-end`, so
-    we only ever lose the records written since the last checkpoint
-    (seconds of work, not the entire region).
+    truncate any partial trailing writes and restart bcftools at the last
+    checkpointed position via `-r chr:N-end`, skipping the records at N
+    that were already written, so we only ever lose the records written
+    since the last checkpoint (seconds of work, not the entire region).
+
+    `-r` returns every record that OVERLAPS the region, including records
+    that start before it (deletions, symbolic SVs with END). Each record is
+    emitted only by the region that contains its POS, so records starting
+    before the region (or before the resume position) are skipped here.
     """
     import json
     import struct
@@ -2736,12 +2741,14 @@ def _region_parse_worker(args: tuple[str, str | None, str, int]) -> tuple[int, s
     # Attempt to resume from a previous checkpoint. Resume requires a region
     # string (so we can rewind bcftools via -r) and a progress.json whose
     # metadata matches this task.
+    region_bounds = _parse_region_string(region) if region is not None else None
     resume_count = 0
     resume_chunks = 0
     resume_chrom: str | None = None
     resume_pos: int | None = None
+    resume_pos_lines = 0
     resumed = False
-    if progress_path.exists() and region is not None:
+    if progress_path.exists() and region_bounds is not None:
         try:
             state = json.loads(progress_path.read_text(encoding="utf-8"))
             if (
@@ -2781,6 +2788,7 @@ def _region_parse_worker(args: tuple[str, str | None, str, int]) -> tuple[int, s
                 resume_chunks = candidate_chunks
                 resume_chrom = state.get("last_chrom")
                 resume_pos = state.get("last_pos")
+                resume_pos_lines = int(state["last_pos_lines"])
                 resumed = True
         except (OSError, ValueError, KeyError, json.JSONDecodeError) as exc:
             print(
@@ -2801,15 +2809,18 @@ def _region_parse_worker(args: tuple[str, str | None, str, int]) -> tuple[int, s
         for chunk in _region_variant_chunk_paths(output_prefix):
             chunk.unlink(missing_ok=True)
 
-    # Compute the bcftools region for this invocation. If we're resuming,
-    # narrow the start to (last checkpointed pos + 1).
+    # Compute the bcftools region for this invocation. Records starting
+    # before ``first_owned_pos`` belong to an earlier region (or were written
+    # before the checkpoint). If we're resuming, restart AT the checkpointed
+    # position: several records can share a POS, and the first
+    # ``skip_at_first_owned_pos`` lines there were consumed before the crash.
     effective_region = region
-    if region is not None and resume_pos is not None and resume_chrom is not None:
-        parsed = _parse_region_string(region)
-        if parsed is not None:
-            chrom_part, _, end_part = parsed
-            if chrom_part == resume_chrom:
-                effective_region = f"{chrom_part}:{int(resume_pos) + 1}-{end_part}"
+    first_owned_pos = region_bounds[1] if region_bounds is not None else None
+    skip_at_first_owned_pos = 0
+    if region_bounds is not None and resume_pos is not None and resume_chrom == region_bounds[0]:
+        effective_region = f"{region_bounds[0]}:{int(resume_pos)}-{region_bounds[2]}"
+        first_owned_pos = int(resume_pos)
+        skip_at_first_owned_pos = resume_pos_lines
 
     bcftools = _bcftools_executable()
     view_threads = max(int(threads_per_reader), 1)
@@ -2831,6 +2842,12 @@ def _region_parse_worker(args: tuple[str, str | None, str, int]) -> tuple[int, s
     chunk_index = resume_chunks
     last_chrom: str | None = resume_chrom
     last_pos: int | None = resume_pos
+    # Lines consumed at the POS of the last written record, up to and
+    # including that record: the resume skip count.
+    last_pos_lines = resume_pos_lines
+    current_line_pos: int | None = resume_pos
+    lines_at_current_pos = resume_pos_lines
+    skipped_multiallelic = 0
     last_checkpoint_time = time.monotonic()
     bytes_since_checkpoint = 0
     t_start = time.monotonic()
@@ -2847,6 +2864,7 @@ def _region_parse_worker(args: tuple[str, str | None, str, int]) -> tuple[int, s
                     "region": region,
                     "last_chrom": last_chrom,
                     "last_pos": last_pos,
+                    "last_pos_lines": last_pos_lines,
                 }
             ),
             encoding="utf-8",
@@ -2913,9 +2931,24 @@ def _region_parse_worker(args: tuple[str, str | None, str, int]) -> tuple[int, s
             line = raw_line[:-1] if raw_line.endswith(b"\n") else raw_line
             fields = line.split(b"\t", 10)
             if len(fields) != 11:
+                raise ValueError(
+                    f"bcftools query emitted a line with {len(fields)} of 11 fields "
+                    f"for {vcf_name}: {line[:200]!r}"
+                )
+            pos = int(fields[1])
+            if first_owned_pos is not None and pos < first_owned_pos:
                 continue
+            if pos == first_owned_pos and skip_at_first_owned_pos > 0:
+                skip_at_first_owned_pos -= 1
+                continue
+            if pos == current_line_pos:
+                lines_at_current_pos += 1
+            else:
+                current_line_pos = pos
+                lines_at_current_pos = 1
             alt_field = fields[4]
             if b"," in alt_field:
+                skipped_multiallelic += 1
                 continue
 
             col = _parse_gt_block_to_int8(fields[10], sample_count)
@@ -2925,7 +2958,6 @@ def _region_parse_worker(args: tuple[str, str | None, str, int]) -> tuple[int, s
             stats_buffer.extend(stats_pack.pack(dosage_sum, dosage_sum_sq, n_observed, n_nonzero))
 
             chrom = fields[0].decode("utf-8")
-            pos = int(fields[1])
             ref = fields[3].decode("utf-8")
             alt = alt_field.decode("utf-8")
             buffered_variants.append(
@@ -2946,6 +2978,7 @@ def _region_parse_worker(args: tuple[str, str | None, str, int]) -> tuple[int, s
             count += 1
             last_chrom = chrom
             last_pos = pos
+            last_pos_lines = lines_at_current_pos
             bytes_since_checkpoint += len(geno_bytes) + 24
             _checkpoint(force=False)
 
@@ -3020,7 +3053,12 @@ def _region_parse_worker(args: tuple[str, str | None, str, int]) -> tuple[int, s
     progress_path.unlink(missing_ok=True)
 
     elapsed = time.monotonic() - t_start
-    print(f"  [worker] {vcf_name}: DONE {count} variants in {elapsed:.0f}s", file=sys.stderr, flush=True)
+    print(
+        f"  [worker] {vcf_name}: DONE {count} variants in {elapsed:.0f}s; "
+        f"skipped {skipped_multiallelic} multi-allelic records (bi-allelic records only)",
+        file=sys.stderr,
+        flush=True,
+    )
     return count, output_prefix
 
 
