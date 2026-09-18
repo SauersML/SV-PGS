@@ -1,9 +1,10 @@
-"""Cross-source SV matching: size, reciprocal-overlap and breakpoint rules."""
+"""Cross-source SV fusion: matching rules, two-source calibration, fused column."""
 from __future__ import annotations
 
 import numpy as np
+import pytest
 
-from sv_pgs.sv_fusion import SvSites, candidate_pairs
+from sv_pgs.sv_fusion import SvSites, calibrate_two_sources, candidate_pairs, fused_dosage
 
 
 def _sites(rows: list[tuple[str, int, int, int, str]], duplications_are_insertions: bool) -> SvSites:
@@ -66,3 +67,86 @@ def test_duplication_geometry_depends_on_the_source_representation() -> None:
 
     np.testing.assert_allclose(pairs.reciprocal_overlaps, [0.75])
     assert pairs.breakpoint_distances.tolist() == [-1]
+
+
+# ---------------------------------------------------------------------------
+# Two-source calibration, on simulations with a known genotype
+# ---------------------------------------------------------------------------
+
+
+def _squared_correlation(first: np.ndarray, second: np.ndarray) -> float:
+    first = first - first.mean()
+    second = second - second.mean()
+    return float((first @ second) ** 2 / ((first @ first) * (second @ second)))
+
+
+def _two_sources(
+    generator: np.random.Generator,
+    allele_frequencies: np.ndarray,
+    separation: float,
+    miss_rate: float,
+    false_rate: float,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Genotype g, a calibrated imputed DS, and hard calls with missed and false alleles."""
+    frequency = allele_frequencies[:, None]
+    haplotypes = generator.random((allele_frequencies.shape[0], 2)) < frequency
+    evidence = generator.standard_normal(haplotypes.shape) + separation * haplotypes
+    log_odds = separation * evidence - separation**2 / 2 + np.log(frequency / (1 - frequency))
+    dosage = (1 / (1 + np.exp(-log_odds))).sum(axis=1)
+    called = np.where(
+        haplotypes,
+        generator.random(haplotypes.shape) > miss_rate,
+        generator.random(haplotypes.shape) < false_rate,
+    )
+    return haplotypes.sum(axis=1).astype(np.float64), dosage, called.sum(axis=1).astype(np.float64)
+
+
+def test_calibration_recovers_both_reliabilities_and_fusion_beats_each_source() -> None:
+    generator = np.random.default_rng(3)
+    sample_count = 80_000
+    genotype, dosage, hard_calls = _two_sources(generator, np.full(sample_count, 0.05), 2.0, 0.2, 0.002)
+    observed = generator.random(sample_count) > 0.1
+    groups = np.zeros(sample_count, dtype=np.int64)
+
+    calibration = calibrate_two_sources(dosage, hard_calls, observed, groups)
+    fused = fused_dosage(calibration, dosage, hard_calls, observed)
+
+    assert calibration.accepted
+    assert abs(calibration.first_reliability - _squared_correlation(dosage[observed], genotype[observed])) < 0.03
+    assert abs(calibration.second_reliability - _squared_correlation(hard_calls[observed], genotype[observed])) < 0.03
+    fused_truth = _squared_correlation(fused[observed], genotype[observed])
+    assert fused_truth > _squared_correlation(dosage[observed], genotype[observed]) + 0.3
+    assert fused_truth > _squared_correlation(hard_calls[observed], genotype[observed])
+    assert abs(calibration.fused_reliability - fused_truth) < 0.03
+    # A no-call in the second source keeps the imputed dosage.
+    np.testing.assert_array_equal(fused[~observed], dosage[~observed])
+
+
+def test_unrelated_records_fail_the_calibration_check() -> None:
+    generator = np.random.default_rng(5)
+    sample_count = 50_000
+    _, dosage, _ = _two_sources(generator, np.full(sample_count, 0.1), 2.5, 0.1, 0.001)
+    _, _, unrelated_calls = _two_sources(generator, np.full(sample_count, 0.1), 2.5, 0.1, 0.001)
+    observed = np.ones(sample_count, dtype=bool)
+
+    calibration = calibrate_two_sources(dosage, unrelated_calls, observed, np.zeros(sample_count, dtype=np.int64))
+
+    assert not calibration.accepted
+    with pytest.raises(ValueError, match="keep them as separate columns"):
+        fused_dosage(calibration, dosage, unrelated_calls, observed)
+
+
+def test_group_labels_correct_the_genotype_variance_of_an_admixed_sample() -> None:
+    generator = np.random.default_rng(11)
+    sample_count = 80_000
+    groups = (generator.random(sample_count) < 0.5).astype(np.int64)
+    frequencies = np.where(groups == 1, 0.35, 0.02)
+    genotype, dosage, hard_calls = _two_sources(generator, frequencies, 2.5, 0.2, 0.002)
+    observed = np.ones(sample_count, dtype=bool)
+    true_first_reliability = _squared_correlation(dosage, genotype)
+
+    grouped = calibrate_two_sources(dosage, hard_calls, observed, groups)
+    pooled = calibrate_two_sources(dosage, hard_calls, observed, np.zeros(sample_count, dtype=np.int64))
+
+    assert abs(grouped.first_reliability - true_first_reliability) < 0.03
+    assert abs(pooled.first_reliability - true_first_reliability) > 3 * abs(grouped.first_reliability - true_first_reliability)
