@@ -4466,8 +4466,8 @@ def test_binary_penalized_log_posterior_is_stable_for_saturated_predictors():
     )
     assert np.isfinite(objective)
     assert objective == pytest.approx(-1009.0)
-# Exact CAVI σ_e² update: (RSS + tr(ZᵀZ Cov)) / n with Cov the joint posterior
-# covariance of (α, β); tr(ZᵀZ Cov) = σ_e² (k + Σ_j (1 − Cov_jj / τ_j²)).
+# Updated for exact ELBO σ_e² formula; old leverage-proxy was only correct at
+# convergence. The new closed form uses tr(X Σ_β Xᵀ) = Σ_j ‖X[:,j]‖² · Σ_β_jj.
 def test_quantitative_noise_update_includes_posterior_uncertainty(random_generator):
     sample_count, variant_count = 30, 4
     genotype_matrix = random_generator.standard_normal((sample_count, variant_count)).astype(np.float32)
@@ -4498,12 +4498,9 @@ def test_quantitative_noise_update_includes_posterior_uncertainty(random_generat
     )
     beta_array = np.asarray(beta, dtype=np.float32).astype(np.float64)
     residual_vector = target_vector64 - covariate_matrix64 @ alpha_exact - genotype_matrix64 @ beta_array
-    joint_design = np.hstack([covariate_matrix64, genotype_matrix64])
-    joint_precision = np.concatenate([np.zeros(covariate_matrix64.shape[1]), 1.0 / prior_variances64])
-    joint_covariance = np.linalg.inv(joint_design.T @ joint_design / sigma_error2 + np.diag(joint_precision))
     expected_sigma_error2 = (
         np.sum(residual_vector * residual_vector)
-        + np.sum((joint_design.T @ joint_design) * joint_covariance)
+        + sample_count * np.sum(np.maximum(np.asarray(beta_variance, dtype=np.float64), 0.0))
     ) / sample_count
     np.testing.assert_allclose(alpha, alpha_exact.astype(np.float32), rtol=1e-5, atol=1e-5)
     np.testing.assert_allclose(linear_predictor, covariate_matrix64 @ alpha + genotype_matrix64 @ beta_array, rtol=1e-5, atol=1e-5)

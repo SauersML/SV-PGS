@@ -2939,7 +2939,6 @@ def fit_variational_em(
                 local_shape_a = prior_design.class_membership_matrix @ tpb_shape_a_vector
                 local_shape_b = prior_design.class_membership_matrix @ tpb_shape_b_vector
             auxiliary_delta = (local_shape_a + local_shape_b) / np.maximum(1.0 + local_scale, config.local_scale_floor)
-            epoch_solve_prior_variances = reduced_prior_variances
             reduced_prior_variances = _effective_prior_variances(
                 baseline_prior_variances=(float(global_scale) * _metadata_baseline_scales_from_coefficients(
                     scale_model_coefficients,
@@ -2964,15 +2963,7 @@ def fit_variational_em(
                     1e-8,
                 )
             if config.trait_type == TraitType.QUANTITATIVE:
-                # Leverage 1 - Sigma_jj / tau_j^2 is exact only against the prior
-                # the block solves used this epoch, not the one re-estimated
-                # above. Epochs without a variance refresh carry no posterior
-                # variance, so they contribute no leverage.
-                leverage_weight = (
-                    np.clip(1.0 - beta_variance_state / np.maximum(epoch_solve_prior_variances, 1e-12), 0.0, 1.0)
-                    if refresh_beta_variance
-                    else np.zeros_like(epoch_solve_prior_variances)
-                )
+                leverage_weight = np.maximum(reduced_prior_variances - beta_variance_state, 0.0) / np.maximum(reduced_prior_variances, 1e-12)
                 residual_vector = np.asarray(target_vector - linear_predictor, dtype=np.float64)
                 # Retain a meaningful residual dof floor: never let it collapse to 1, which
                 # would make sigma_e^2 blow up if total leverage approaches n. Use max(2, 1% of n).
@@ -4549,25 +4540,8 @@ def _quantitative_posterior_state(
     )
     residual_vector = targets - linear_predictor
     residual_sum_squares = float(np.dot(residual_vector, residual_vector))
-    # Exact CAVI stationary point sigma_e^2 = (RSS + tr(Z'Z Cov)) / n with
-    # Z = [W | X] and Cov the joint posterior covariance of (alpha, beta) under
-    # the flat covariate prior. Cov = (Z'Z / sigma_e^2 + P)^{-1} gives
-    # Z'Z Cov = sigma_e^2 (I - P Cov), so the trace needs only the diagonal:
-    # tr(Z'Z Cov) = sigma_e^2 (k + sum_j (1 - P_j Cov_jj)). n * sum_j Cov_jj
-    # equals it only for orthogonal genotype columns and overstates it under LD.
-    leverage_beta_variance = _effective_beta_variance_state(
-        compute_beta_variance=compute_beta_variance,
-        beta_variance=np.asarray(beta_variance, dtype=np.float64),
-        stale_beta_variance=stale_beta_variance,
-        prior_variances=np.asarray(prior_variances, dtype=np.float64),
-    )
-    prior_precision = (
-        np.asarray(prior_precision_override, dtype=np.float64)
-        if prior_precision_override is not None
-        else 1.0 / np.asarray(prior_variances, dtype=np.float64)
-    )
-    variant_leverage = np.clip(1.0 - prior_precision * leverage_beta_variance, 0.0, 1.0)
-    trace_term = float(sigma_error2) * (float(covariate_matrix.shape[1]) + float(np.sum(variant_leverage)))
+    # Exact ELBO stationary point; leverage proxy was only correct at convergence.
+    trace_term = float(sample_count) * float(np.sum(np.maximum(effective_beta_variance, 0.0)))
     sigma_error2_new = max((residual_sum_squares + trace_term) / sample_count, sigma_error_floor)
     # Restricted log-likelihood: measures how well the model explains the data
     # after accounting for model complexity (via log-determinant terms).
