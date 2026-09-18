@@ -23,6 +23,8 @@ dependencies = [
     # cold-load can fit before allocating; without it the gate silently
     # fails open and a tight host RAM run risks OOM during cold-load.
     "psutil>=5.9",
+    # Single-threaded BLAS inside the fast path's own worker pools.
+    "threadpoolctl>=3.1",
 ]
 
 [project.optional-dependencies]
