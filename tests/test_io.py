@@ -1049,6 +1049,7 @@ def test_precache_vcfs_parallel_reuses_completed_region_outputs(monkeypatch: pyt
         ],
     )
     Path(f"{region0_prefix}.stats").write_bytes(struct.pack("<qqii", 1, 1, 2, 1))
+    io_module._region_multiallelic_count_path(region0_prefix).write_text("0", encoding="utf-8")
 
     scheduled_tasks: list[tuple] = []
 
@@ -1083,7 +1084,8 @@ def test_precache_vcfs_parallel_reuses_completed_region_outputs(monkeypatch: pyt
                     ],
                 )
                 Path(f"{output_prefix}.stats").write_bytes(struct.pack("<qqii", 2, 4, 2, 1))
-                yield 1, str(output_prefix)
+                io_module._region_multiallelic_count_path(output_prefix).write_text("1", encoding="utf-8")
+                yield 1, str(output_prefix), 1
 
     class _FakeContext:
         def Pool(self, processes: int):
@@ -2570,16 +2572,22 @@ def test_plink_end_to_end_recovers_quantitative_signal_with_sv_style_alleles(tmp
     np.testing.assert_allclose(file_prediction, loaded_prediction, atol=1e-5)
 
 
-def test_multiallelic_vcf_raises_clear_error(tmp_path: Path):
-    sample_ids = ["sample_0", "sample_1", "sample_2"]
+def _write_mixed_allelic_vcf(tmp_path: Path) -> Path:
     vcf_path = tmp_path / "multiallelic.vcf"
     _write_vcf(
         vcf_path,
-        sample_ids=sample_ids,
+        sample_ids=["sample_0", "sample_1", "sample_2"],
         records=(
+            _vcf_record_payload("1", 50, "before", "T", ("C",), 55.0, "AF=0.3", np.array([0.0, 1.0, 2.0], dtype=np.float32)),
             _vcf_record_payload("1", 100, "multiallelic", "A", ("C", "G"), 55.0, "AF=0.2,0.1", np.array([1.0, 0.0, 2.0], dtype=np.float32)),
+            _vcf_record_payload("1", 150, "after", "G", ("A",), 55.0, "AF=0.5", np.array([2.0, 1.0, 1.0], dtype=np.float32)),
+            _vcf_record_payload("1", 200, "last", "C", ("T",), 55.0, "AF=0.2", np.array([1.0, 0.0, 0.0], dtype=np.float32)),
         ),
     )
+    return vcf_path
+
+
+def _load_mixed_allelic_vcf(tmp_path: Path, vcf_path: Path):
     sample_table_path = tmp_path / "samples.tsv"
     _write_table(
         sample_table_path,
@@ -2590,17 +2598,53 @@ def test_multiallelic_vcf_raises_clear_error(tmp_path: Path):
             ("sample_2", "0"),
         ),
     )
+    return load_dataset_from_files(
+        genotype_path=vcf_path,
+        config=ModelConfig(),
+        genotype_format="vcf",
+        sample_table_path=sample_table_path,
+        sample_id_column="sample_id",
+        target_column="target",
+        covariate_columns=(),
+    )
 
-    with pytest.raises(ValueError, match="Only biallelic VCF records are supported"):
-        load_dataset_from_files(
-            genotype_path=vcf_path,
-            config=ModelConfig(),
-            genotype_format="vcf",
-            sample_table_path=sample_table_path,
-            sample_id_column="sample_id",
-            target_column="target",
-            covariate_columns=(),
-        )
+
+_BIALLELIC_EXPECTED_DOSAGE = np.array([[0.0, 2.0, 1.0], [1.0, 1.0, 0.0], [2.0, 1.0, 0.0]], dtype=np.float32)
+
+
+def test_multiallelic_vcf_records_are_skipped_and_counted(tmp_path: Path, capsys: pytest.CaptureFixture[str]):
+    # Same contract as the bcftools precache worker: only bi-allelic records
+    # are cached, and the number skipped is logged.
+    dataset = _load_mixed_allelic_vcf(tmp_path, _write_mixed_allelic_vcf(tmp_path))
+
+    assert [record.variant_id for record in dataset.variant_records] == ["before", "after", "last"]
+    np.testing.assert_array_equal(dataset.genotypes.materialize(), _BIALLELIC_EXPECTED_DOSAGE)
+    assert "skipped 1 multi-allelic records" in capsys.readouterr().err
+
+
+def test_incremental_vcf_resume_after_a_skipped_multiallelic_record(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    vcf_path = _write_mixed_allelic_vcf(tmp_path)
+    monkeypatch.setattr(io_module, "_INCREMENTAL_CHECKPOINT_BYTE_INTERVAL", 0)
+    build_defaults = io_module._variant_defaults_from_vcf_record
+    calls = {"count": 0}
+
+    def crash_on_third_cached_record(record: object) -> object:
+        calls["count"] += 1
+        if calls["count"] == 3:
+            raise RuntimeError("loader killed")
+        return build_defaults(record)
+
+    # "before" and "after" are checkpointed with the multi-allelic record
+    # between them consumed; the crash lands on "last".
+    monkeypatch.setattr(io_module, "_variant_defaults_from_vcf_record", crash_on_third_cached_record)
+    with pytest.raises(RuntimeError, match="loader killed"):
+        _load_mixed_allelic_vcf(tmp_path, vcf_path)
+    monkeypatch.setattr(io_module, "_variant_defaults_from_vcf_record", build_defaults)
+
+    dataset = _load_mixed_allelic_vcf(tmp_path, vcf_path)
+
+    assert [record.variant_id for record in dataset.variant_records] == ["before", "after", "last"]
+    np.testing.assert_array_equal(dataset.genotypes.materialize(), _BIALLELIC_EXPECTED_DOSAGE)
 
 
 def test_cli_handles_single_class_binary_targets_without_metric_crash(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):

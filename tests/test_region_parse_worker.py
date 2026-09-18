@@ -69,14 +69,22 @@ def test_adjacent_regions_emit_a_spanning_record_once(tmp_path: Path, capsys: py
     first_prefix = tmp_path / "region_0"
     second_prefix = tmp_path / "region_1"
 
-    io_module._region_parse_worker((str(vcf_path), "chr1:1-99", str(first_prefix), 1))
-    io_module._region_parse_worker((str(vcf_path), "chr1:100-1000", str(second_prefix), 1))
+    first_result = io_module._region_parse_worker((str(vcf_path), "chr1:1-99", str(first_prefix), 1))
+    second_result = io_module._region_parse_worker((str(vcf_path), "chr1:100-1000", str(second_prefix), 1))
 
     first_ids, first_dosages = _region_output(first_prefix)
     second_ids, second_dosages = _region_output(second_prefix)
     assert first_ids + second_ids == _EXPECTED_IDS
     np.testing.assert_array_equal(np.vstack([first_dosages, second_dosages]), _EXPECTED_DOSAGES)
     assert "skipped 1 multi-allelic records" in capsys.readouterr().err
+    assert first_result == (2, str(first_prefix), 0)
+    assert second_result == (5, str(second_prefix), 1)
+    # A finished region reports its stored counts without re-parsing.
+    assert io_module._region_parse_worker((str(vcf_path), "chr1:100-1000", str(second_prefix), 1)) == (
+        0,
+        str(second_prefix),
+        1,
+    )
 
 
 def test_resume_keeps_records_sharing_the_checkpointed_position(
@@ -100,8 +108,10 @@ def test_resume_keeps_records_sharing_the_checkpointed_position(
         io_module._region_parse_worker((str(vcf_path), "chr1:1-1000", str(prefix), 1))
     monkeypatch.setattr(io_module, "_variant_defaults_from_bcftools_fields", build_defaults)
 
-    io_module._region_parse_worker((str(vcf_path), "chr1:1-1000", str(prefix), 1))
+    result = io_module._region_parse_worker((str(vcf_path), "chr1:1-1000", str(prefix), 1))
 
+    # The multi-allelic v6 follows the checkpoint, so it is counted once.
+    assert result == (7, str(prefix), 1)
     variant_ids, dosages = _region_output(prefix)
     assert variant_ids == _EXPECTED_IDS
     np.testing.assert_array_equal(dosages, _EXPECTED_DOSAGES)
