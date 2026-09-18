@@ -261,7 +261,8 @@ def test_full_workflow_binary() -> None:
     assert extended.beta_reduced.shape == full_result.beta_reduced.shape
     # Six iterations do not converge this problem, so compare the warm-started
     # seventh iteration with a fresh seven-iteration fit rather than with the
-    # six-iteration result it started from.
+    # six-iteration result it started from. The warm start carries no Anderson
+    # history, so the two agree only to about a tenth of the largest effect.
     fresh_extended = fit_variational_em(
         genotypes=genotype_matrix,
         covariates=covariate_matrix,
@@ -271,5 +272,7 @@ def test_full_workflow_binary() -> None:
         tie_map=tie_map,
     )
     np.testing.assert_allclose(
-        extended.beta_reduced, fresh_extended.beta_reduced, atol=5e-2
+        extended.beta_reduced,
+        fresh_extended.beta_reduced,
+        atol=0.1 * float(np.max(np.abs(fresh_extended.beta_reduced))),
     )

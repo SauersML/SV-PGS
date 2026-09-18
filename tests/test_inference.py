@@ -934,7 +934,17 @@ def test_fit_variational_em_reuses_stochastic_epoch_predictor_between_epochs(mon
     tie_map = build_tie_map(genotype_matrix, records, config)
     reduced_records = mixture_inference.collapse_tie_groups(list(records), tie_map)
     prior_design = mixture_inference._build_prior_design(reduced_records)
-    global_scale, scale_model_coefficients = mixture_inference._initialize_scale_model(prior_design, config)
+    scale_model_coefficients = mixture_inference._initialize_scale_model(prior_design, config)
+    global_scale = mixture_inference._calibrate_initial_global_scale(
+        scale_model_coefficients=scale_model_coefficients,
+        prior_design=prior_design,
+        genotype_matrix=genotype_matrix,
+        covariate_matrix=covariate_matrix,
+        targets=target_vector,
+        alpha_state=np.zeros(covariate_matrix.shape[1], dtype=np.float64),
+        trait_type=config.trait_type,
+        config=config,
+    )
     tpb_shape_a_vector = mixture_inference._initialize_tpb_shape_a_vector(prior_design, config)
     tpb_shape_b_vector = mixture_inference._initialize_tpb_shape_b_vector(prior_design, config)
     checkpoint = VariationalFitCheckpoint(

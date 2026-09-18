@@ -156,6 +156,9 @@ _STOCHASTIC_BLOCK_GC_INTERVAL = 20
 _TR_NEWTON_REQUIRES_GPU = True
 _TR_NEWTON_RAISE_ON_NONCONVERGENCE = True
 _ANDERSON_MEMORY_DEPTH = 5
+# Share of the residual phenotypic variance the prior genetic variance starts
+# from (see _calibrate_initial_global_scale); the fit moves the level from it.
+_INITIAL_PRIOR_HERITABILITY = 0.1
 _GPU_INVERSE_DIAGONAL_WORKSPACE_FRACTION = 0.01
 _GPU_INVERSE_DIAGONAL_MAX_BLOCK = 4_096
 
@@ -1818,7 +1821,7 @@ def fit_variational_em(
         nonlocal previous_linear_predictor, previous_objective
         nonlocal best_validation_metric, best_alpha, best_beta, best_beta_variance, best_local_scale, best_theta
         nonlocal best_sigma_error2, best_tpb_shape_a_vector, best_tpb_shape_b_vector, best_validation_iteration, start_iteration
-        global_scale, scale_model_coefficients = _initialize_scale_model(prior_design, config)
+        scale_model_coefficients = _initialize_scale_model(prior_design, config)
         tpb_shape_a_vector = _initialize_tpb_shape_a_vector(prior_design, config)
         tpb_shape_b_vector = _initialize_tpb_shape_b_vector(prior_design, config)
         local_scale = np.ones(len(reduced_records), dtype=np.float64)
@@ -1832,7 +1835,6 @@ def fit_variational_em(
             trait_type=config.trait_type,
         )
         global_scale = _calibrate_initial_global_scale(
-            current_global_scale=float(global_scale),
             scale_model_coefficients=scale_model_coefficients,
             prior_design=prior_design,
             genotype_matrix=genotype_matrix,
@@ -13359,7 +13361,12 @@ def _standardize_design_column(
 def _initialize_scale_model(
     prior_design: PriorDesign,
     config: ModelConfig,
-) -> tuple[float, NDArray]:
+) -> NDArray:
+    """Scale-model coefficients reproducing the default per-class offsets.
+
+    Only the offsets between classes are set here; the overall level is set by
+    _calibrate_initial_global_scale.
+    """
     default_log_scales = config.class_log_baseline_scales()
     class_log_scale_vector = np.asarray(
         [
@@ -13370,27 +13377,19 @@ def _initialize_scale_model(
     )
     default_log_scale_by_variant = prior_design.class_membership_matrix @ class_log_scale_vector
     mean_log_scale = float(np.mean(default_log_scale_by_variant))
-    initialized_global_scale = float(
-        np.clip(
-            np.exp(mean_log_scale),
-            config.global_scale_floor,
-            config.global_scale_ceiling,
-        )
-    )
     if prior_design.design_matrix.shape[1] == 0:
-        return initialized_global_scale, np.zeros(0, dtype=np.float64)
+        return np.zeros(0, dtype=np.float64)
 
     target_offsets = default_log_scale_by_variant - mean_log_scale
     penalty = _scale_model_penalty(prior_design.feature_names, config)
     normal_matrix = prior_design.design_matrix.T @ prior_design.design_matrix + np.diag(np.maximum(penalty, 1e-8))
     right_hand_side = prior_design.design_matrix.T @ target_offsets
     coefficients = np.linalg.solve(normal_matrix, right_hand_side)
-    return initialized_global_scale, coefficients.astype(np.float64)
+    return coefficients.astype(np.float64)
 
 
 def _calibrate_initial_global_scale(
     *,
-    current_global_scale: float,
     scale_model_coefficients: NDArray,
     prior_design: PriorDesign,
     genotype_matrix: StandardizedGenotypeMatrix | NDArray,
@@ -13400,71 +13399,78 @@ def _calibrate_initial_global_scale(
     trait_type: TraitType,
     config: ModelConfig,
 ) -> float:
+    """Start the global scale from a prior genetic variance, not a per-variant scale.
+
+    At lambda = 1 the prior genetic variance of standardized genotypes is
+    sigma_g^2 sum_j s_j^2. A fixed per-variant starting scale makes that grow
+    linearly with the number of variants (about 1.6e-4 per variant), so at
+    biobank p the fit starts with a prior thousands of times too wide, and the
+    capped downward steps of the scale model cannot undo it in the iterations
+    available. The start solves for a total instead: h0 / (1 - h0) times the
+    residual variance (Var(y - W alpha) for a quantitative trait, the logistic
+    residual variance pi^2 / 3 for a binary one), raised to the variance a
+    strong marginal signal implies when one stands above the null
+    max-correlation level. The empirical-Bayes updates move it from there.
+    """
     variant_count = int(prior_design.design_matrix.shape[0])
     if variant_count == 0:
-        return float(np.clip(current_global_scale, config.global_scale_floor, config.global_scale_ceiling))
+        return float(np.clip(1.0, config.global_scale_floor, config.global_scale_ceiling))
     residual = np.asarray(targets, dtype=np.float64) - np.asarray(covariate_matrix, dtype=np.float64) @ np.asarray(
         alpha_state,
         dtype=np.float64,
     )
+    residual_variance = (
+        float(np.pi**2 / 3.0)
+        if trait_type == TraitType.BINARY
+        else max(float(np.mean(residual * residual)), config.sigma_error_floor)
+    )
+    target_genetic_variance = (
+        _INITIAL_PRIOR_HERITABILITY / (1.0 - _INITIAL_PRIOR_HERITABILITY) * residual_variance
+    )
     residual_norm = float(np.linalg.norm(residual))
-    if residual_norm <= 0.0:
-        return float(np.clip(current_global_scale, config.global_scale_floor, config.global_scale_ceiling))
-    if isinstance(genotype_matrix, StandardizedGenotypeMatrix):
-        # Note: the previous version of this function wrapped the call below
-        # in ``_try_install_resident_int8_cache`` to promote the full variant
-        # working set to a GPU-resident int8 cache. In practice, on real AoU
-        # runs the full-matrix install almost always failed the budget check
-        # (the matrix doesn't fit in VRAM) and the wrap became dead overhead.
-        # The CG working-set (a much smaller subset) still uses the resident
-        # cache elsewhere; this calibration path now just streams once.
-        genotype_residual_dot = _genotype_transpose_matvec_result_numpy(
-            genotype_matrix,
-            residual,
-            batch_size=DEFAULT_GENOTYPE_BATCH_SIZE,
-            dtype=np.float64,
+    if residual_norm > 0.0:
+        if isinstance(genotype_matrix, StandardizedGenotypeMatrix):
+            genotype_residual_dot = _genotype_transpose_matvec_result_numpy(
+                genotype_matrix,
+                residual,
+                batch_size=DEFAULT_GENOTYPE_BATCH_SIZE,
+                dtype=np.float64,
+            )
+            column_norms = np.full(variant_count, np.sqrt(float(genotype_matrix.shape[0])), dtype=np.float64)
+        else:
+            genotype_array = np.asarray(genotype_matrix, dtype=np.float64)
+            genotype_residual_dot = genotype_array.T @ residual
+            column_norms = np.linalg.norm(genotype_array, axis=0)
+        marginal_correlations = np.abs(np.asarray(genotype_residual_dot, dtype=np.float64)) / np.maximum(
+            column_norms * residual_norm,
+            1e-12,
         )
-        column_norms = np.full(variant_count, np.sqrt(float(genotype_matrix.shape[0])), dtype=np.float64)
-    else:
-        genotype_array = np.asarray(genotype_matrix, dtype=np.float64)
-        genotype_residual_dot = genotype_array.T @ residual
-        column_norms = np.linalg.norm(genotype_array, axis=0)
-    marginal_correlations = np.abs(np.asarray(genotype_residual_dot, dtype=np.float64)) / np.maximum(
-        column_norms * residual_norm,
-        1e-12,
-    )
-    null_screening_level = float(np.sqrt(2.0 * np.log(max(float(variant_count), 2.0)) / max(float(len(residual)), 1.0)))
-    screening_strength = float(
-        np.clip(
-            (float(np.max(marginal_correlations)) - null_screening_level) / max(1.0 - null_screening_level, 1e-12),
-            0.0,
-            1.0,
+        null_screening_level = float(np.sqrt(2.0 * np.log(max(float(variant_count), 2.0)) / max(float(len(residual)), 1.0)))
+        screening_strength = float(
+            np.clip(
+                (float(np.max(marginal_correlations)) - null_screening_level) / max(1.0 - null_screening_level, 1e-12),
+                0.0,
+                1.0,
+            )
         )
-    )
-    if screening_strength <= 0.0:
-        return float(np.clip(current_global_scale, config.global_scale_floor, config.global_scale_ceiling))
+        # Logistic likelihoods can become nearly separable in tiny variant
+        # sets, so a binary marginal signal only raises a conservative
+        # logit-scale variance.
+        screening_genetic_variance = (
+            0.04 * screening_strength * screening_strength
+            if trait_type == TraitType.BINARY
+            else float(np.mean(residual * residual)) * screening_strength * screening_strength
+        )
+        target_genetic_variance = max(target_genetic_variance, screening_genetic_variance)
     metadata_baseline_scales = _metadata_baseline_scales_from_coefficients(
         scale_model_coefficients=np.asarray(scale_model_coefficients, dtype=np.float64),
         design_matrix=prior_design.design_matrix,
         config=config,
     )
-    mean_baseline_second_moment = float(np.mean(np.maximum(metadata_baseline_scales, config.prior_scale_floor) ** 2))
-    if trait_type == TraitType.BINARY:
-        # Logistic likelihoods can become nearly separable in tiny variant sets.
-        # Start with a conservative logit-scale signal variance and let the TPB
-        # updates expand only when the posterior second moments justify it.
-        target_predictor_variance = 0.04 * screening_strength * screening_strength
-    else:
-        target_predictor_variance = max(
-            float(np.mean(residual * residual)) * screening_strength * screening_strength,
-            config.sigma_error_floor,
-        )
-    calibrated_global_scale = np.sqrt(
-        target_predictor_variance / max(float(variant_count) * mean_baseline_second_moment, 1e-12)
-    )
+    total_baseline_variance = float(np.sum(np.maximum(metadata_baseline_scales, config.prior_scale_floor) ** 2))
     return float(
         np.clip(
-            max(float(current_global_scale), calibrated_global_scale),
+            np.sqrt(target_genetic_variance / total_baseline_variance),
             config.global_scale_floor,
             config.global_scale_ceiling,
         )
