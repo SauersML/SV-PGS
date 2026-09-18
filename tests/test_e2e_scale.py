@@ -11,10 +11,11 @@ from sv_pgs.artifact import (
     save_artifact,
     try_load_artifact_if_fingerprint_matches,
 )
-from sv_pgs.benchmark import run_benchmark_suite
+from sv_pgs.benchmark import _top_tail_enrichment, run_benchmark_suite
 from sv_pgs.config import BenchmarkConfig, ModelConfig, TraitType, VariantClass
 from sv_pgs.data import TieGroup, TieMap, VariantRecord
 from sv_pgs.model import BayesianPGS
+from tests.test_prediction_accuracy import _covariate_only_holdout_prediction, _covariate_only_holdout_probability
 
 
 VARIANT_CLASS_CYCLE = (
@@ -212,7 +213,11 @@ def test_large_scale_binary_end_to_end_roundtrip(tmp_path: Path):
 
     test_probability = model.predict_proba(genotype_matrix[train_stop:], covariate_matrix[train_stop:])[:, 1]
     assert np.all(np.isfinite(test_probability))
-    assert roc_auc_score(target_vector[train_stop:], test_probability) > 0.52
+    covariate_only_auc = roc_auc_score(
+        target_vector[train_stop:],
+        _covariate_only_holdout_probability(covariate_matrix, target_vector, train_stop),
+    )
+    assert roc_auc_score(target_vector[train_stop:], test_probability) > covariate_only_auc + 0.2
 
     artifact_path = tmp_path / "large_binary_artifact"
     model.export(artifact_path)
@@ -227,6 +232,12 @@ def test_large_scale_binary_end_to_end_roundtrip(tmp_path: Path):
 def test_large_scale_benchmark_and_quantitative_fit():
     binary_genotypes, binary_covariates, binary_targets, binary_records = _binary_dataset()
     train_stop = 480
+    binary_benchmark_config = BenchmarkConfig(
+        shared_config=ModelConfig(
+            trait_type=TraitType.BINARY,
+            max_outer_iterations=10,
+        )
+    )
     benchmark_metrics = run_benchmark_suite(
         train_genotypes=binary_genotypes[:train_stop],
         train_covariates=binary_covariates[:train_stop],
@@ -235,20 +246,31 @@ def test_large_scale_benchmark_and_quantitative_fit():
         test_covariates=binary_covariates[train_stop:],
         test_targets=binary_targets[train_stop:],
         records=binary_records,
-        benchmark_config=BenchmarkConfig(
-                shared_config=ModelConfig(
-                    trait_type=TraitType.BINARY,
-                    max_outer_iterations=10,
-                )
-        ),
+        benchmark_config=binary_benchmark_config,
     )
 
     assert benchmark_metrics["joint_snv_sv_continuous"].auc is not None
     assert benchmark_metrics["snv_only_continuous"].auc is not None
     assert benchmark_metrics["joint_snv_sv_continuous"].log_loss is not None
-    assert benchmark_metrics["joint_snv_sv_continuous"].top_tail_enrichment > 0.9
+    covariate_only_probability = _covariate_only_holdout_probability(binary_covariates, binary_targets, train_stop)
+    assert benchmark_metrics["joint_snv_sv_continuous"].auc > roc_auc_score(
+        binary_targets[train_stop:], covariate_only_probability
+    ) + 0.2
+    # A random score has expected enrichment 1.0, and the covariates alone reach about 0.9 here.
+    assert benchmark_metrics["joint_snv_sv_continuous"].top_tail_enrichment > _top_tail_enrichment(
+        covariate_only_probability,
+        binary_targets[train_stop:],
+        binary_benchmark_config.top_tail_fraction,
+        trait_type=TraitType.BINARY,
+    ) + 0.5
 
     quantitative_genotypes, quantitative_covariates, quantitative_targets, quantitative_records = _quantitative_dataset()
+    quantitative_benchmark_config = BenchmarkConfig(
+        shared_config=ModelConfig(
+            trait_type=TraitType.QUANTITATIVE,
+            max_outer_iterations=7,
+        )
+    )
     quantitative_benchmark = run_benchmark_suite(
         train_genotypes=quantitative_genotypes[:390],
         train_covariates=quantitative_covariates[:390],
@@ -257,17 +279,19 @@ def test_large_scale_benchmark_and_quantitative_fit():
         test_covariates=quantitative_covariates[390:],
         test_targets=quantitative_targets[390:],
         records=quantitative_records,
-        benchmark_config=BenchmarkConfig(
-            shared_config=ModelConfig(
-                trait_type=TraitType.QUANTITATIVE,
-                max_outer_iterations=7,
-            )
-        ),
+        benchmark_config=quantitative_benchmark_config,
     )
     assert quantitative_benchmark["joint_snv_sv_continuous"].r2 is not None
     assert quantitative_benchmark["snv_only_continuous"].r2 is not None
-    assert quantitative_benchmark["joint_snv_sv_continuous"].top_tail_enrichment > 0.8
-    assert quantitative_benchmark["joint_snv_sv_continuous"].r2 > 0.03
+    covariate_only_prediction = _covariate_only_holdout_prediction(quantitative_covariates, quantitative_targets, 390)
+    covariate_only_r2 = r2_score(quantitative_targets[390:], covariate_only_prediction)
+    assert quantitative_benchmark["joint_snv_sv_continuous"].top_tail_enrichment > _top_tail_enrichment(
+        covariate_only_prediction,
+        quantitative_targets[390:],
+        quantitative_benchmark_config.top_tail_fraction,
+        trait_type=TraitType.QUANTITATIVE,
+    ) + 0.5
+    assert quantitative_benchmark["joint_snv_sv_continuous"].r2 > covariate_only_r2 + 0.5
 
     quantitative_model = BayesianPGS(
         ModelConfig(
@@ -290,7 +314,7 @@ def test_large_scale_benchmark_and_quantitative_fit():
         quantitative_covariates[390:],
     )
     assert np.all(np.isfinite(quantitative_prediction))
-    assert r2_score(quantitative_targets[390:], quantitative_prediction) > 0.03
+    assert r2_score(quantitative_targets[390:], quantitative_prediction) > covariate_only_r2 + 0.5
 
 
 def test_artifact_roundtrip_preserves_full_variant_metadata(tmp_path: Path):

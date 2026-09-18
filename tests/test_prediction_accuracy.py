@@ -8,12 +8,14 @@ Each test simulates a realistic genetic architecture with:
   - Missing genotype data
   - Held-out prediction evaluated by R² or AUC
 
-The thresholds are deliberately conservative: the model must beat chance
-by a meaningful margin on held-out data, not just on training data.
+Every held-out threshold is relative to a covariates-only baseline fitted on
+the same training rows. The covariates carry real signal in these simulations,
+so beating chance alone would not show that the genetic part learned anything.
 """
 from __future__ import annotations
 
 import numpy as np
+from sklearn.linear_model import LinearRegression, LogisticRegression
 from sklearn.metrics import r2_score, roc_auc_score
 
 from sv_pgs.config import ModelConfig, TraitType, VariantClass
@@ -101,8 +103,28 @@ def _build_sparse_dataset(
     return genotype_matrix, covariate_matrix, target_vector, variant_records
 
 
+def _covariate_only_holdout_prediction(
+    covariate_matrix: np.ndarray,
+    target_vector: np.ndarray,
+    train_stop: int,
+) -> np.ndarray:
+    """Held-out predictions of an OLS fit of the target on the training covariates alone."""
+    baseline = LinearRegression().fit(covariate_matrix[:train_stop], target_vector[:train_stop])
+    return baseline.predict(covariate_matrix[train_stop:])
+
+
+def _covariate_only_holdout_probability(
+    covariate_matrix: np.ndarray,
+    target_vector: np.ndarray,
+    train_stop: int,
+) -> np.ndarray:
+    """Held-out probabilities of a logistic fit of the target on the training covariates alone."""
+    baseline = LogisticRegression().fit(covariate_matrix[:train_stop], target_vector[:train_stop])
+    return baseline.predict_proba(covariate_matrix[train_stop:])[:, 1]
+
+
 class TestQuantitativePrediction:
-    """Quantitative trait with sparse architecture: model must beat R²=0 on held-out data."""
+    """Quantitative trait with sparse architecture: held-out R² must clear the covariate-only baseline."""
 
     def test_sparse_quantitative_recovers_signal(self):
         sample_count = 500
@@ -141,7 +163,13 @@ class TestQuantitativePrediction:
         )
         assert np.all(np.isfinite(test_predictions))
         test_r2 = r2_score(target_vector[train_stop:], test_predictions)
-        assert test_r2 > 0.05, f"Held-out R²={test_r2:.4f} too low for this architecture"
+        covariate_only_r2 = r2_score(
+            target_vector[train_stop:],
+            _covariate_only_holdout_prediction(covariate_matrix, target_vector, train_stop),
+        )
+        assert test_r2 > covariate_only_r2 + 0.5, (
+            f"Held-out R²={test_r2:.4f} does not beat the covariate-only R²={covariate_only_r2:.4f} by 0.5"
+        )
 
     def test_causal_snp_gets_nonzero_coefficient(self):
         genotype_matrix, covariate_matrix, target_vector, variant_records = _build_sparse_dataset(
@@ -177,9 +205,9 @@ class TestQuantitativePrediction:
 
 
 class TestBinaryPrediction:
-    """Binary trait: model must achieve AUC > 0.55 on held-out data."""
+    """Binary trait: held-out AUC must clear the covariate-only baseline."""
 
-    def test_sparse_binary_beats_chance(self):
+    def test_sparse_binary_beats_covariate_only_baseline(self):
         sample_count = 600
         variant_count = 60
         train_stop = 450
@@ -218,7 +246,13 @@ class TestBinaryPrediction:
         assert np.all(test_proba >= 0.0)
         assert np.all(test_proba <= 1.0)
         test_auc = roc_auc_score(target_vector[train_stop:], test_proba)
-        assert test_auc > 0.55, f"Held-out AUC={test_auc:.4f} too close to chance"
+        covariate_only_auc = roc_auc_score(
+            target_vector[train_stop:],
+            _covariate_only_holdout_probability(covariate_matrix, target_vector, train_stop),
+        )
+        assert test_auc > covariate_only_auc + 0.05, (
+            f"Held-out AUC={test_auc:.4f} does not beat the covariate-only AUC={covariate_only_auc:.4f} by 0.05"
+        )
 
 
 class TestJointSNVSVBenefit:
