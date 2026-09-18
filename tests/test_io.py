@@ -35,6 +35,7 @@ import sv_pgs.io as io_module
 import sv_pgs.model as model_module
 import sv_pgs.pipeline as pipeline_module
 import sv_pgs.plink as plink_module
+from sv_pgs.numeric import stable_sigmoid
 from sv_pgs.plink import open_bed, to_bed
 from sv_pgs.pipeline import run_training_pipeline
 
@@ -2436,7 +2437,13 @@ def test_vcf_cli_end_to_end_recovers_binary_signal_with_symbolic_svs(tmp_path: P
         variant_metadata_path=metadata_path,
     )
     loaded_model = BayesianPGS.load(output_dir / "artifact")
-    loaded_probability = loaded_model.predict_proba(dataset.genotypes, dataset.covariates)[:, 1]
+    # predictions.tsv.gz holds the plug-in sigmoid of the linear predictor, so the
+    # reloaded model is checked on that quantity; predict_proba integrates over the
+    # posterior, and its export/load round trip is pinned in test_model.py.
+    loaded_probability = np.asarray(
+        stable_sigmoid(loaded_model.decision_function(dataset.genotypes, dataset.covariates)),
+        dtype=np.float32,
+    )
     assert roc_auc_score(dataset.targets, loaded_probability) == pytest.approx(summary_payload["training_auc"])
 
     prediction_rows = _read_tsv_rows(output_dir / "predictions.tsv.gz")
