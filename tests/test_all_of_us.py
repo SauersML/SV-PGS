@@ -21,6 +21,7 @@ from sv_pgs.all_of_us import (
 from sv_pgs.cli import main
 from sv_pgs.config import ModelConfig
 from sv_pgs.io import load_multi_vcf_dataset_from_files
+from sv_pgs.mixture_inference import _should_refresh_beta_variance
 from sv_pgs.preflight import AouPreflightReport
 
 
@@ -1138,3 +1139,17 @@ def _write_table(path: Path, header: tuple[str, ...], rows: tuple[tuple[str, ...
         writer = csv.writer(handle, delimiter="\t")
         writer.writerow(header)
         writer.writerows(rows)
+
+
+def test_aou_fit_refreshes_the_posterior_variance_every_other_iteration() -> None:
+    refreshed_iterations = [
+        iteration_index
+        for iteration_index in range(aou_runner.AOU_MAX_OUTER_ITERATIONS)
+        if _should_refresh_beta_variance(
+            iteration_index,
+            refresh_interval=aou_runner.AOU_BETA_VARIANCE_UPDATE_INTERVAL,
+            total_iterations=aou_runner.AOU_MAX_OUTER_ITERATIONS,
+            force_final_refresh=False,
+        )
+    ]
+    assert len(refreshed_iterations) >= aou_runner.AOU_MAX_OUTER_ITERATIONS // 2
