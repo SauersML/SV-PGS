@@ -378,3 +378,43 @@ def test_finalize_standardized_rhs_matches_numpy():
         scale=cp.asarray(scale.astype(np.float32)),
     )
     np.testing.assert_allclose(cp.asnumpy(out_dev), final_ref, rtol=1e-5, atol=1e-5)
+
+
+@pytest.mark.parametrize("arch_family", ["hopper", "ampere"])
+def test_screen_reductions_cover_every_thread_for_each_launch_width(arch_family, monkeypatch):
+    """Hopper launches 384 threads per block; the tree reductions must still sum every partial.
+
+    A halving reduction that starts from ``blockDim.x >> 1`` drops one of the
+    last three partials when blockDim.x = 384, i.e. a third of the samples'
+    counts, sums and right-hand-side dot products. The launch shape is forced
+    through ``gpu_arch`` so any CUDA device exercises the Hopper width.
+    """
+    monkeypatch.setattr(screening, "gpu_arch", lambda: arch_family)
+    rng = np.random.default_rng(9)
+    n_samples, n_variants = 6001, 7
+    packed, _ = _rand_packed(rng, n_variants, n_samples)
+    rhs = rng.standard_normal((n_samples, 2)).astype(np.float64)
+    ref = cpu_screen(packed, n_samples, rhs=rhs, count_a1=True)
+    out_count = cp.zeros(n_variants, dtype=cp.int32)
+    out_sum = cp.zeros(n_variants, dtype=cp.float64)
+    out_sumsq = cp.zeros(n_variants, dtype=cp.float64)
+    out_dosage_rhs = cp.zeros((n_variants, 2), dtype=cp.float64)
+    out_observed_rhs = cp.zeros((n_variants, 2), dtype=cp.float64)
+
+    screening.screen(
+        cp.asarray(packed),
+        n_samples,
+        out_count,
+        out_sum,
+        out_sumsq,
+        rhs=cp.asarray(rhs),
+        out_dosage_rhs=out_dosage_rhs,
+        out_observed_rhs=out_observed_rhs,
+        count_a1=True,
+    )
+
+    np.testing.assert_array_equal(cp.asnumpy(out_count), ref["count"])
+    np.testing.assert_allclose(cp.asnumpy(out_sum), ref["sum"], rtol=1e-12, atol=1e-9)
+    np.testing.assert_allclose(cp.asnumpy(out_sumsq), ref["sumsq"], rtol=1e-12, atol=1e-9)
+    np.testing.assert_allclose(cp.asnumpy(out_dosage_rhs), ref["dosage_rhs"], rtol=1e-9, atol=1e-9)
+    np.testing.assert_allclose(cp.asnumpy(out_observed_rhs), ref["observed_rhs"], rtol=1e-9, atol=1e-9)

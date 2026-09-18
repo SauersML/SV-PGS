@@ -44,6 +44,32 @@ extern "C" {
 #define SCREEN_MAX_K 8
 #endif
 
+// The tree reductions below halve their stride each step, which only visits
+// every partial when they start from a power-of-two width. Hopper launches
+// 384 threads (bitpacked/launch.py screening_config), so each reduction first
+// folds the tail above the largest power of two <= blockDim.x onto the head;
+// otherwise a third of the samples' partial sums would be dropped.
+__device__ __forceinline__ int power_of_two_floor(int value) {
+    int width = 1;
+    while ((width << 1) <= value) width <<= 1;
+    return width;
+}
+
+// Sum s_values[0 .. bdim) into s_values[0]. Every thread of the block calls it.
+__device__ void block_sum_double(double* s_values, int tid, int bdim) {
+    const int width = power_of_two_floor(bdim);
+    if (tid >= width) {
+        s_values[tid - width] += s_values[tid];
+    }
+    __syncthreads();
+    for (int offset = width >> 1; offset > 0; offset >>= 1) {
+        if (tid < offset) {
+            s_values[tid] += s_values[tid + offset];
+        }
+        __syncthreads();
+    }
+}
+
 // Decode LUT is passed as a device pointer (1024 signed bytes, laid out as
 // lut[byte * 4 + sample]). The wrapper picks the count_a1 vs count_a2 variant
 // before launch and caches it per (device, count_a1). Missing slot is -127.
@@ -149,7 +175,14 @@ __global__ void bitpacked_screening_kernel(
     s_sumsq[tid] = local_sumsq;
     __syncthreads();
 
-    for (int offset = bdim >> 1; offset > 0; offset >>= 1) {
+    const int width = power_of_two_floor(bdim);
+    if (tid >= width) {
+        s_count[tid - width] += s_count[tid];
+        s_sum[tid - width]   += s_sum[tid];
+        s_sumsq[tid - width] += s_sumsq[tid];
+    }
+    __syncthreads();
+    for (int offset = width >> 1; offset > 0; offset >>= 1) {
         if (tid < offset) {
             s_count[tid] += s_count[tid + offset];
             s_sum[tid]   += s_sum[tid + offset];
@@ -170,12 +203,7 @@ __global__ void bitpacked_screening_kernel(
             __syncthreads();
             s_scratch[tid] = local_drhs[j];
             __syncthreads();
-            for (int offset = bdim >> 1; offset > 0; offset >>= 1) {
-                if (tid < offset) {
-                    s_scratch[tid] += s_scratch[tid + offset];
-                }
-                __syncthreads();
-            }
+            block_sum_double(s_scratch, tid, bdim);
             if (tid == 0) {
                 out_dosage_rhs[(size_t)v * (size_t)k + (size_t)j] += s_scratch[0];
             }
@@ -184,12 +212,7 @@ __global__ void bitpacked_screening_kernel(
             __syncthreads();
             s_scratch[tid] = local_orhs[j];
             __syncthreads();
-            for (int offset = bdim >> 1; offset > 0; offset >>= 1) {
-                if (tid < offset) {
-                    s_scratch[tid] += s_scratch[tid + offset];
-                }
-                __syncthreads();
-            }
+            block_sum_double(s_scratch, tid, bdim);
             if (tid == 0) {
                 out_observed_rhs[(size_t)v * (size_t)k + (size_t)j] += s_scratch[0];
             }
