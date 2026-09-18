@@ -8041,31 +8041,33 @@ def _solve_sample_space_rhs_gpu_inner(
             rd_gpu = cp.asarray(residual_dot, dtype=compute_cp_dtype)
             ss_gpu = cp.zeros((_graph_n_rhs,), dtype=compute_cp_dtype)
             rn_gpu = cp.zeros((_graph_n_rhs,), dtype=cp.float64)
-            search_buf = search_direction_gpu
-            solution_buf = solution_gpu
-            residual_buf = residual_gpu
             tiny = compute_cp_dtype(1e-30)
 
-            def _body() -> None:
+            def _body(search_buf: Any, solution_buf: Any, residual_buf: Any, residual_dot_buf: Any) -> None:
                 # All-active CG iteration: no host-side ops, no Lanczos.
                 op_search = apply_operator(search_buf)
                 step_denom = cp.sum(search_buf * op_search, axis=0, dtype=compute_cp_dtype)
-                cp.divide(rd_gpu, step_denom, out=ss_gpu)
+                cp.divide(residual_dot_buf, step_denom, out=ss_gpu)
                 solution_buf[...] = solution_buf + search_buf * ss_gpu[None, :]
                 residual_buf[...] = residual_buf - op_search * ss_gpu[None, :]
                 cp.sum(residual_buf * residual_buf, axis=0, dtype=cp.float64, out=rn_gpu)
                 pr = preconditioner(residual_buf)
                 new_rd = cp.sum(residual_buf * pr, axis=0, dtype=compute_cp_dtype)
-                cp.divide(new_rd, cp.maximum(rd_gpu, tiny), out=ss_gpu)
+                cp.divide(new_rd, cp.maximum(residual_dot_buf, tiny), out=ss_gpu)
                 search_buf[...] = pr + search_buf * ss_gpu[None, :]
-                rd_gpu[...] = new_rd
+                residual_dot_buf[...] = new_rd
 
             stream = Stream(non_blocking=True)
             with stream:
-                _body()  # warm-up so any one-time allocations have fired
+                # Warm up on scratch copies so one-time allocations fire
+                # without advancing the solve: a capture that fails after an
+                # in-place warm-up step would leave solution/residual/search
+                # one CG step ahead of the host residual_dot the legacy loop
+                # continues from, breaking the recurrence.
+                _body(search_direction_gpu.copy(), solution_gpu.copy(), residual_gpu.copy(), rd_gpu.copy())
                 stream.synchronize()
                 stream.begin_capture()
-                _body()
+                _body(search_direction_gpu, solution_gpu, residual_gpu, rd_gpu)
                 graph = stream.end_capture()
                 exec_inst = graph.instantiate() if hasattr(graph, "instantiate") else graph
         except Exception as capture_error:  # noqa: BLE001
