@@ -200,9 +200,12 @@ class ScoringPlan:
 
 
 def _block_rows(sample_count: int, budget: ComputeBudget, plan_rows: int) -> int:
-    """Rows per read, so the read-ahead ring and the conversion panels fit half the host budget."""
+    """Rows per read: the read-ahead ring and the conversion panels fit half the host budget,
+    and on CUDA an uploaded block of codes fits its share of the smallest device."""
     bytes_per_row = _HOST_BYTES_PER_BLOCK_CELL * max(sample_count, 1)
     rows = max(1, int(budget.host_bytes) // (_HOST_MEMORY_SHARES * bytes_per_row))
+    if budget.device_kind == "cuda":
+        rows = min(rows, max(1, min(budget.device_bytes) // (_DEVICE_MEMORY_SHARES * max(sample_count, 1))))
     return min(rows, max(plan_rows, 1))
 
 
