@@ -2085,14 +2085,16 @@ def fit_variational_em(
                 + f"{block_size}; new block size {configured_block_size} will apply after this epoch"
             )
         block_count = max((int(genotype_matrix.shape[1]) + block_size - 1) // block_size, 1)
-        if resume_completed_blocks_in_iteration < 0 or resume_completed_blocks_in_iteration >= block_count:
-            if not (resume_completed_blocks_in_iteration == 0 and block_count == 1):
-                log(
-                    "  variational EM: checkpoint block progress is incompatible with current block policy; "
-                    "restarting the current stochastic epoch from block 1"
-                )
-                resume_completed_blocks_in_iteration = 0
-                resume_binary_block_state = None
+        # completed == block_count is the checkpoint written after an epoch's last
+        # block: every block is done and the resume goes straight to the epoch-end
+        # updates. Only progress beyond the block count is incompatible.
+        if resume_completed_blocks_in_iteration < 0 or resume_completed_blocks_in_iteration > block_count:
+            log(
+                "  variational EM: checkpoint block progress is incompatible with current block policy; "
+                "restarting the current stochastic epoch from block 1"
+            )
+            resume_completed_blocks_in_iteration = 0
+            resume_binary_block_state = None
         resume_beta_variance_state = None
         resume_reduced_second_moment = None
         resume_epoch_reduced_prior_variances = None

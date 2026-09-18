@@ -1265,10 +1265,14 @@ def test_fit_variational_em_resumes_mid_stochastic_epoch(monkeypatch):
     # scheme produced. The final refinement then overwrites beta with the
     # fake posterior, whose value is first_variant + 1 = 1 for the full block.
     np.testing.assert_allclose(result.beta_reduced, np.array([1.0, 1.0, 1.0, 1.0], dtype=np.float32))
-def test_mid_epoch_resume_continues_the_shuffled_block_order(monkeypatch):
-    # An uninterrupted epoch visits the blocks in the seeded shuffled order and a
-    # checkpoint after k blocks means "the first k blocks of that order are done".
-    # The resumed epoch must visit exactly the remaining blocks of the same order.
+def _single_variant_block_svi_fit(monkeypatch, *, stop_at_completed_blocks: int):
+    """Run a four-block quantitative SVI epoch that stops at a chosen checkpoint.
+
+    Every variant is its own stochastic block and the collapsed-posterior solve
+    is faked, so the order of solves is the order of block visits. Returns the
+    resume callable, the checkpoint the first run stopped at, the blocks solved
+    before stopping, the list the resumed run appends to, and the seeded order.
+    """
     sample_count, variant_count = 12, 4
     genotype_matrix = np.random.default_rng(3).normal(size=(sample_count, variant_count)).astype(np.float32)
     covariate_matrix = np.ones((sample_count, 1), dtype=np.float32)
@@ -1291,7 +1295,7 @@ def test_mid_epoch_resume_continues_the_shuffled_block_order(monkeypatch):
     )
     tie_map = build_tie_map(genotype_matrix, records, config)
     block_sequence = [np.array([variant_index], dtype=np.int32) for variant_index in range(variant_count)]
-    processed_blocks: list[int] = []
+    solved_blocks: list[tuple[int, int]] = []
     monkeypatch.setattr(
         mixture_inference,
         "_stochastic_variant_blocks",
@@ -1318,7 +1322,7 @@ def test_mid_epoch_resume_continues_the_shuffled_block_order(monkeypatch):
         restricted_posterior_warm_start=None,
         **kwargs,
     ):
-        processed_blocks.append(int(genotype_matrix.variant_indices[0]))
+        solved_blocks.append((int(genotype_matrix.variant_indices[0]), int(genotype_matrix.shape[1])))
         return PosteriorState(
             alpha=np.zeros(0, dtype=np.float64),
             beta=np.full(genotype_matrix.shape[1], 0.5, dtype=np.float64),
@@ -1329,32 +1333,52 @@ def test_mid_epoch_resume_continues_the_shuffled_block_order(monkeypatch):
         )
     monkeypatch.setattr(mixture_inference, "_fit_collapsed_posterior", fake_fit_collapsed_posterior)
     saved_checkpoints: list[VariationalFitCheckpoint] = []
-    def stop_after_first_block(checkpoint: VariationalFitCheckpoint) -> None:
+    def stop_at_checkpoint(checkpoint: VariationalFitCheckpoint) -> None:
         saved_checkpoints.append(checkpoint)
-        raise RuntimeError("stop-after-first-block")
-    with pytest.raises(RuntimeError, match="stop-after-first-block"):
-        fit_variational_em(
-            genotypes=genotype_matrix,
-            covariates=covariate_matrix,
-            targets=target_vector,
-            records=records,
-            config=config,
-            tie_map=tie_map,
-            checkpoint_callback=stop_after_first_block,
-        )
-    assert processed_blocks == shuffled_order[:1]
-    assert saved_checkpoints[0].completed_blocks_in_iteration == 1
-    processed_blocks.clear()
-    fit_variational_em(
+        if checkpoint.completed_blocks_in_iteration == stop_at_completed_blocks:
+            raise RuntimeError("stop-at-checkpoint")
+    fit_arguments = dict(
         genotypes=genotype_matrix,
         covariates=covariate_matrix,
         targets=target_vector,
         records=records,
         config=config,
         tie_map=tie_map,
-        resume_checkpoint=saved_checkpoints[0],
     )
-    assert processed_blocks[: variant_count - 1] == shuffled_order[1:]
+    with pytest.raises(RuntimeError, match="stop-at-checkpoint"):
+        fit_variational_em(**fit_arguments, checkpoint_callback=stop_at_checkpoint)
+    blocks_before_stop = [variant_index for variant_index, width in solved_blocks if width == 1]
+    solved_blocks.clear()
+    def resume() -> None:
+        fit_variational_em(**fit_arguments, resume_checkpoint=saved_checkpoints[-1])
+    return resume, saved_checkpoints[-1], blocks_before_stop, solved_blocks, shuffled_order
+
+
+def test_mid_epoch_resume_continues_the_shuffled_block_order(monkeypatch):
+    # An uninterrupted epoch visits the blocks in the seeded shuffled order and a
+    # checkpoint after k blocks means "the first k blocks of that order are done".
+    # The resumed epoch must visit exactly the remaining blocks of the same order.
+    resume, checkpoint, blocks_before_stop, solved_blocks, shuffled_order = _single_variant_block_svi_fit(
+        monkeypatch,
+        stop_at_completed_blocks=1,
+    )
+    assert blocks_before_stop == shuffled_order[:1]
+    assert checkpoint.completed_blocks_in_iteration == 1
+    resume()
+    assert [variant_index for variant_index, width in solved_blocks if width == 1] == shuffled_order[1:]
+
+
+def test_resume_after_an_epochs_last_block_does_not_repeat_the_epoch(monkeypatch):
+    # The checkpoint written after the last block of an epoch records every block
+    # as done; resuming from it must go straight to the epoch-end updates.
+    resume, checkpoint, blocks_before_stop, solved_blocks, shuffled_order = _single_variant_block_svi_fit(
+        monkeypatch,
+        stop_at_completed_blocks=4,
+    )
+    assert blocks_before_stop == shuffled_order
+    assert checkpoint.completed_blocks_in_iteration == len(shuffled_order)
+    resume()
+    assert [variant_index for variant_index, width in solved_blocks if width == 1] == []
 def test_fit_variational_em_resumes_mid_binary_stochastic_block(monkeypatch):
     sample_count, variant_count = 12, 4
     genotype_matrix = np.array(
