@@ -4765,6 +4765,33 @@ def _binary_expected_polya_gamma_weights(
     return np.maximum(weights, float(minimum_weight))
 
 
+def _binary_laplace_weights(
+    linear_predictor: NDArray,
+    minimum_weight: float,
+) -> NDArray:
+    # Curvature of the logistic log-likelihood, mu (1 - mu): at the mode it is
+    # the Laplace posterior precision's data term. The Polya-Gamma weights
+    # tanh(|eta|/2) / (2 |eta|) only majorize it (the Jaakkola-Jordan bound), and
+    # at low prevalence they overstate the data precision (3.3x at eta = -3).
+    probabilities = np.asarray(stable_sigmoid(np.asarray(linear_predictor, dtype=np.float64)), dtype=np.float64)
+    return np.maximum(probabilities * (1.0 - probabilities), float(minimum_weight))
+
+
+def _binary_laplace_working_response(
+    linear_predictor: NDArray,
+    targets: NDArray,
+    predictor_offset: NDArray,
+    laplace_weights: NDArray,
+) -> NDArray:
+    # Newton working response: weighted least squares on it with the Laplace
+    # weights reproduces the mode and yields the Laplace covariance.
+    return (
+        linear_predictor
+        - predictor_offset
+        + (targets - np.asarray(stable_sigmoid(linear_predictor), dtype=np.float64)) / laplace_weights
+    )
+
+
 def _binary_penalized_log_posterior(
     linear_predictor: NDArray,
     targets: NDArray,
@@ -5216,10 +5243,14 @@ def _binary_posterior_state_tr_newton(
     beta_variance = np.zeros(n_variants, dtype=np.float64)
     logdet_covariance = 0.0
     logdet_gls = 0.0
+    laplace_weights = _binary_laplace_weights(linear_predictor, minimum_weight)
     if compute_logdet or compute_beta_variance:
-        final_weights_pg = _binary_expected_polya_gamma_weights(linear_predictor, minimum_weight)
-        kappa = target_array - 0.5
-        final_pseudo_response = kappa / final_weights_pg - predictor_offset_array
+        final_pseudo_response = _binary_laplace_working_response(
+            linear_predictor,
+            target_array,
+            predictor_offset_array,
+            laplace_weights,
+        )
         warm_start = (
             _RestrictedPosteriorWarmStart()
             if restricted_posterior_warm_start is None
@@ -5240,7 +5271,7 @@ def _binary_posterior_state_tr_newton(
                 covariate_matrix=covariate_matrix_f64,
                 targets=final_pseudo_response,
                 prior_variances=prior_variances_f64,
-                diagonal_noise=1.0 / final_weights_pg,
+                diagonal_noise=1.0 / laplace_weights,
                 solver_tolerance=solver_tolerance,
                 maximum_linear_solver_iterations=maximum_linear_solver_iterations,
                 logdet_probe_count=logdet_probe_count,
@@ -5275,10 +5306,9 @@ def _binary_posterior_state_tr_newton(
         prior_precision=prior_precision,
         beta=beta,
     )
-    final_weights = _binary_expected_polya_gamma_weights(linear_predictor, minimum_weight)
     logdet_hessian = (
         float(np.sum(np.log(np.maximum(prior_precision, 1e-12))))
-        + float(np.sum(np.log(np.maximum(final_weights, 1e-12))))
+        + float(np.sum(np.log(laplace_weights)))
         + (logdet_covariance + logdet_gls if compute_logdet else 0.0)
     )
     laplace_objective = float(final_objective) - 0.5 * float(logdet_hessian)
@@ -5559,8 +5589,6 @@ def _binary_posterior_state(
         f"      binary PG updates: {standardized_genotypes.shape[1]} variants, "
         + f"max_iter={max_iterations}  mem={mem()}"
     )
-    final_weights = _binary_expected_polya_gamma_weights(current_linear_predictor, minimum_weight)
-    best_weights = _binary_expected_polya_gamma_weights(best_linear_predictor, minimum_weight)
     _binary_newton_iters_used = resume_completed_iterations
     timing_cupy = cupy if cupy is not None else (_try_import_cupy() if _newton_gpu_available else None)
     last_progress_checkpoint_time = time.monotonic()
@@ -5726,14 +5754,12 @@ def _binary_posterior_state(
         if gpu_binary_backend:
             current_linear_predictor_gpu = updated_linear_predictor_gpu
         current_objective = updated_objective
-        final_weights = _binary_expected_polya_gamma_weights(current_linear_predictor, minimum_weight)
         # Stall detection: track whether the objective has improved.
         if updated_objective > best_objective:
             best_objective = updated_objective
             best_parameters = parameters.copy()
             best_linear_predictor = current_linear_predictor.copy()
             best_linear_predictor_gpu = current_linear_predictor_gpu if gpu_binary_backend else None
-            best_weights = final_weights.copy()
             stall_count = 0
         else:
             stall_count += 1
@@ -5749,7 +5775,6 @@ def _binary_posterior_state(
                 if gpu_binary_backend:
                     current_linear_predictor_gpu = best_linear_predictor_gpu
                 current_objective = best_objective
-                final_weights = best_weights
                 break
         should_save_progress = False
         if progress_callback is not None:
@@ -5790,6 +5815,7 @@ def _binary_posterior_state(
     # needed. The Newton loop already converged to the same beta — the final solve
     # only adds tighter tolerance. For stochastic blocks (compute_logdet=False,
     # compute_beta_variance=False), this saves ~10s per block.
+    laplace_weights = _binary_laplace_weights(current_linear_predictor, minimum_weight)
     if not compute_logdet and not compute_beta_variance:
         final_alpha = parameters[:covariate_count]
         final_beta = parameters[covariate_count:]
@@ -5798,7 +5824,12 @@ def _binary_posterior_state(
         logdet_covariance = 0.0
         logdet_gls = 0.0
     else:
-        final_pseudo_response = kappa / final_weights - predictor_offset_array
+        final_pseudo_response = _binary_laplace_working_response(
+            current_linear_predictor,
+            target_array,
+            predictor_offset_array,
+            laplace_weights,
+        )
         try:
             final_alpha, final_beta, beta_variance, _projected_targets, _fitted_response, _restricted_quadratic, logdet_covariance, logdet_gls = (
                 _solve_restricted_full(
@@ -5806,7 +5837,7 @@ def _binary_posterior_state(
                     covariate_matrix=covariate_matrix,
                     targets=final_pseudo_response,
                     prior_variances=prior_variances,
-                    diagonal_noise=1.0 / final_weights,
+                    diagonal_noise=1.0 / laplace_weights,
                     solver_tolerance=solver_tolerance,
                     maximum_linear_solver_iterations=maximum_linear_solver_iterations,
                     logdet_probe_count=logdet_probe_count,
@@ -5849,26 +5880,12 @@ def _binary_posterior_state(
             logdet_covariance = 0.0
             logdet_gls = 0.0
     final_linear_predictor = predictor_offset_array + np.asarray(_fitted_response, dtype=np.float64)
-    if gpu_binary_backend:
-        assert cupy is not None
-        final_linear_predictor_gpu = cupy.asarray(final_linear_predictor, dtype=compute_cp_dtype)
-        final_weights = _cupy_array_to_numpy(
-            _binary_expected_polya_gamma_weights_cupy(
-                cupy,
-                final_linear_predictor_gpu,
-                minimum_weight,
-                dtype=compute_cp_dtype,
-            ),
-            dtype=np.float64,
-        )
-    else:
-        final_weights = _binary_expected_polya_gamma_weights(final_linear_predictor, minimum_weight)
     final_parameters = np.concatenate([final_alpha, final_beta], axis=0).astype(np.float64, copy=False)
     if gpu_binary_backend:
         assert cupy is not None
         final_objective = _binary_penalized_log_posterior_cupy(
             cupy,
-            final_linear_predictor_gpu,
+            cupy.asarray(final_linear_predictor, dtype=compute_cp_dtype),
             target_array_gpu,
             prior_precision_gpu,
             cupy.asarray(final_beta, dtype=compute_cp_dtype),
@@ -5883,7 +5900,7 @@ def _binary_posterior_state(
         )
     logdet_hessian = (
         float(np.sum(np.log(np.maximum(prior_precision, 1e-12))))
-        + float(np.sum(np.log(np.maximum(final_weights, 1e-12))))
+        + float(np.sum(np.log(laplace_weights)))
         + (logdet_covariance + logdet_gls if compute_logdet else 0.0)
     )
     laplace_objective = final_objective - 0.5 * logdet_hessian
