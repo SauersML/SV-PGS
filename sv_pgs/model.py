@@ -141,8 +141,9 @@ class FittedState:
     nonzero_coefficients: F32Array
     nonzero_means: F32Array
     nonzero_scales: F32Array
-    # Per-variant posterior variance, aligned with ``full_variant_records``. Prediction
-    # needs it to integrate over the posterior rather than plug in its mean.
+    # Posterior variance of each reduced (tie-collapsed) coefficient, placed on its
+    # representative variant and zero elsewhere, aligned with ``full_variant_records``.
+    # Prediction needs it to integrate over the posterior rather than plug in its mean.
     full_beta_variance: F32Array | None = None
     training_genetic_score: F32Array | None = None
     training_covariate_score: F32Array | None = None
@@ -3185,23 +3186,11 @@ class BayesianPGS:
         )
         full_coefficients = np.zeros(total_variant_count, dtype=np.float32)
         full_coefficients[active_variant_indices] = active_coefficients
-        # Var(beta_member) = w_member^2 * Var(beta_group). expand() is linear and applies
-        # w_member * sign_member, so expand(ones) * expand(var) recovers exactly that and
-        # the signs square out -- no tie-map internals required.
-        expanded_unit = reduced_tie_map.expand_coefficients(
-            np.ones_like(fit_result.beta_reduced, dtype=np.float32),
-            group_weights=tie_group_weights,
+        full_beta_variance = _representative_beta_variance(
+            original_space_tie_map,
+            fit_result.beta_variance,
+            total_variant_count,
         )
-        expanded_variance = reduced_tie_map.expand_coefficients(
-            np.asarray(fit_result.beta_variance, dtype=np.float32),
-            group_weights=tie_group_weights,
-        )
-        active_variance = np.abs(
-            np.asarray(expanded_unit, dtype=np.float64)
-            * np.asarray(expanded_variance, dtype=np.float64)
-        )
-        full_beta_variance = np.zeros(total_variant_count, dtype=np.float32)
-        full_beta_variance[active_variant_indices] = active_variance.astype(np.float32)
         nonzero_coefficient_indices, nonzero_coefficients = _nonzero_coefficient_cache(full_coefficients)
         nonzero_means = np.asarray(prepared_arrays.means[nonzero_coefficient_indices], dtype=np.float32)
         nonzero_scales = np.asarray(prepared_arrays.scales[nonzero_coefficient_indices], dtype=np.float32)
@@ -3305,8 +3294,12 @@ class BayesianPGS:
     def predictor_variance(self, genotypes: RawGenotypeMatrix | NDArray) -> F32Array:
         """Posterior variance of the linear predictor, per sample.
 
-        s2_i = sum_j x~_ij^2 Var(beta_j) under the fitted mean-field posterior. Variants
-        the model shrank hard carry almost no variance, so they barely widen it.
+        s2_i = sum_j x~_ij^2 Var(beta_j) under the fitted mean-field posterior, summed
+        over the reduced coefficients. A tie group is one reduced coefficient: its
+        members' columns are identical up to sign, so their contributions are perfectly
+        correlated and the group adds x~_rep^2 Var(beta_group), the representative's
+        term. Missing genotypes are mean-imputed exactly as in ``decision_components``.
+        Variants the model shrank hard carry almost no variance, so they barely widen it.
         """
         fitted_state = self._require_state()
         raw_genotypes = as_raw_genotype_matrix(genotypes)
@@ -3330,9 +3323,7 @@ class BayesianPGS:
         ):
             width = batch.variant_indices.shape[0]
             window = slice(offset, offset + width)
-            standardized = (
-                np.asarray(batch.values, dtype=np.float32) - means[window]
-            ) / scales[window]
+            standardized = _standardize_batch(batch.values, means[window], scales[window])
             result += (standardized ** 2) @ variances[window]
             offset += width
         return np.asarray(result, dtype=np.float32)
@@ -3487,6 +3478,11 @@ class BayesianPGS:
             nonzero_coefficients=nonzero_coefficients,
             nonzero_means=nonzero_means,
             nonzero_scales=nonzero_scales,
+            full_beta_variance=_representative_beta_variance(
+                artifact.tie_map,
+                artifact.beta_variance,
+                len(artifact.records),
+            ),
         )
         return loaded_model
 
@@ -3798,6 +3794,26 @@ def _tie_group_export_weights(
         normalized_weights = member_variances / np.maximum(np.sum(member_variances), 1e-12)
         group_weights.append(normalized_weights.astype(np.float32))
     return group_weights
+
+
+def _representative_beta_variance(
+    tie_map: TieMap,
+    reduced_beta_variance: NDArray,
+    variant_count: int,
+) -> F32Array:
+    """Place each reduced coefficient's posterior variance on its representative.
+
+    ``tie_map`` is in original variant space, so ``kept_indices[r]`` is the column of
+    reduced coefficient ``r``. Spreading Var(beta_group) over members as
+    w_member^2 * Var(beta_group) would treat perfectly correlated members as
+    independent and shrink the group's predictor variance by sum_m w_m^2.
+    """
+    full_beta_variance = np.zeros(int(variant_count), dtype=np.float32)
+    full_beta_variance[np.asarray(tie_map.kept_indices, dtype=np.int64)] = np.asarray(
+        reduced_beta_variance,
+        dtype=np.float32,
+    )
+    return full_beta_variance
 
 
 def _training_records_from_stats(

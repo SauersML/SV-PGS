@@ -1999,3 +1999,76 @@ def test_raw_standardized_subset_matvec_reads_only_requested_columns():
 
     assert raw_genotypes.requested_variant_indices == [[1, 3]]
     np.testing.assert_allclose(scores, expected_scores.astype(np.float32))
+
+
+def _fit_binary_model_with_tie_group_and_missing_genotypes() -> tuple[BayesianPGS, np.ndarray, np.ndarray]:
+    # Columns 0, 1, 2 form one tie group (x, x, -x); column 4 has missing calls.
+    genotype_matrix, covariate_matrix, target_vector, variant_records = _synthetic_binary_dataset()
+    model = BayesianPGS(
+        ModelConfig(
+            trait_type=TraitType.BINARY,
+            max_outer_iterations=10,
+            minimum_minor_allele_frequency=0.0,
+        )
+    ).fit(genotype_matrix, covariate_matrix, target_vector, variant_records)
+    return model, genotype_matrix, covariate_matrix
+
+
+def test_predictor_variance_mean_imputes_missing_genotypes():
+    model, genotype_matrix, covariate_matrix = _fit_binary_model_with_tie_group_and_missing_genotypes()
+    assert model.state is not None
+    assert np.isnan(genotype_matrix).any()
+    training_means = model.state.preprocessor.means
+    imputed_genotypes = np.where(np.isnan(genotype_matrix), training_means[None, :], genotype_matrix)
+
+    np.testing.assert_allclose(
+        model.predictor_variance(genotype_matrix),
+        model.predictor_variance(imputed_genotypes),
+        rtol=1e-6,
+    )
+    assert np.all(np.isfinite(model.predict_proba(genotype_matrix, covariate_matrix)))
+
+
+def test_predictor_variance_counts_each_tie_group_once():
+    # The fitted posterior is over the reduced coefficients: the training linear
+    # predictor is Z_kept @ beta_reduced, so under q(beta_reduced) = prod_r N(m_r, v_r)
+    # its variance is sum_r z_ir^2 v_r. Spreading a group's variance over its members
+    # as w_m^2 v_r (independent members) under-counts the group by sum_m w_m^2.
+    model, genotype_matrix, _ = _fit_binary_model_with_tie_group_and_missing_genotypes()
+    assert model.state is not None
+    state = model.state
+    assert state.tie_map.kept_indices.tolist() == [0, 3, 4]
+    training_means = state.preprocessor.means
+    imputed_genotypes = np.where(np.isnan(genotype_matrix), training_means[None, :], genotype_matrix)
+    kept_indices = state.tie_map.kept_indices
+    kept_standardized = (
+        imputed_genotypes[:, kept_indices] - training_means[kept_indices]
+    ) / state.preprocessor.scales[kept_indices]
+    reduced_variance = np.asarray(state.fit_result.beta_variance, dtype=np.float64)
+    assert reduced_variance[0] > 0.0
+
+    np.testing.assert_allclose(
+        model.predictor_variance(imputed_genotypes),
+        (kept_standardized.astype(np.float64) ** 2) @ reduced_variance,
+        rtol=1e-5,
+    )
+
+
+def test_loaded_model_reproduces_posterior_predictive_probabilities(tmp_path):
+    model, genotype_matrix, covariate_matrix = _fit_binary_model_with_tie_group_and_missing_genotypes()
+    assert model.state is not None
+    assert np.any(np.asarray(model.state.full_beta_variance) > 0.0)
+    artifact_directory = tmp_path / "posterior_predictive_artifact"
+    model.export(artifact_directory)
+    loaded_model = BayesianPGS.load(artifact_directory)
+
+    np.testing.assert_allclose(
+        loaded_model.predictor_variance(genotype_matrix),
+        model.predictor_variance(genotype_matrix),
+        rtol=1e-6,
+    )
+    np.testing.assert_allclose(
+        loaded_model.predict_proba(genotype_matrix, covariate_matrix),
+        model.predict_proba(genotype_matrix, covariate_matrix),
+        rtol=1e-6,
+    )
