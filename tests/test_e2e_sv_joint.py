@@ -1,40 +1,25 @@
 """End-to-end integration test for the ``--variants snp+sv`` joint mode.
 
 Combines a synthetic microarray BED with two synthetic SV VCFs (chr21 +
-chr22) transcoded via :func:`sv_pgs.sv_transcoder.transcode_sv_vcf_to_bed`
+chr22), passed as ``("vcf", path)`` sources exactly as run-all-of-us does,
 and asserts that ``load_multi_source_dataset_from_files`` unifies them
 into a single :class:`LoadedDataset` (intersected samples, concatenated
-variants, preserved provenance).
-
-Skips cleanly when ``cyvcf2`` is unavailable or ``bgzip``/``tabix`` are
-missing from ``PATH``.
+variants, preserved provenance, ALT-count SV dosages).
 """
 
 from __future__ import annotations
 
-import shutil
-import subprocess
 import tempfile
 from pathlib import Path
 
 import numpy as np
-import pytest
 
-pytest.importorskip("cyvcf2")
-pytest.importorskip("sv_pgs.sv_transcoder")
+from sv_pgs.config import ModelConfig
+from sv_pgs.genotype import RawGenotypeMatrix
+from sv_pgs.io import load_multi_source_dataset_from_files
+from sv_pgs.plink import to_bed
 
-from sv_pgs.config import ModelConfig  # noqa: E402
-from sv_pgs.genotype import RawGenotypeMatrix  # noqa: E402
-from sv_pgs.io import load_multi_source_dataset_from_files  # noqa: E402
-from sv_pgs.plink import to_bed  # noqa: E402
-from sv_pgs.sv_transcoder import transcode_sv_vcf_to_bed  # noqa: E402
-
-
-_HAS_BGZIP_TABIX = shutil.which("bgzip") is not None and shutil.which("tabix") is not None
-pytestmark = pytest.mark.skipif(
-    not _HAS_BGZIP_TABIX,
-    reason="bgzip / tabix required to index synthetic SV VCFs for cyvcf2",
-)
+_GT_TO_ALT_DOSAGE = {"0/0": 0.0, "0/1": 1.0, "1/1": 2.0, "./.": np.nan}
 
 
 def _write_microarray_bed(
@@ -75,14 +60,17 @@ def _write_microarray_bed(
     return bed_path, sample_ids, variant_ids
 
 
-def _build_sv_vcf_bytes(
+def _build_sv_vcf_text(
     sample_ids: list[str],
     contig: str,
     sv_ids: list[str],
     positions: list[int],
     seed: int,
-) -> bytes:
-    """Build a minimal SV VCF (one contig, many DEL/DUP/INS variants)."""
+) -> tuple[str, np.ndarray]:
+    """Build a minimal SV VCF (one contig, many DEL/DUP/INS variants).
+
+    Returns the VCF text and the expected (sample, variant) ALT dosages.
+    """
     rng = np.random.default_rng(seed)
     header_lines = [
         "##fileformat=VCFv4.2",
@@ -96,6 +84,7 @@ def _build_sv_vcf_bytes(
     svtypes = ["DEL", "DUP", "INS"]
     alt_for = {"DEL": "<DEL>", "DUP": "<DUP>", "INS": "<INS>"}
     body: list[str] = []
+    expected_dosage = np.empty((len(sample_ids), len(sv_ids)), dtype=np.float32)
     for k, (vid, pos) in enumerate(zip(sv_ids, positions, strict=True)):
         svtype = svtypes[k % 3]
         length = int(rng.integers(50, 3000))
@@ -106,13 +95,13 @@ def _build_sv_vcf_bytes(
             size=len(sample_ids),
             p=[0.6, 0.25, 0.10, 0.05],
         )
+        expected_dosage[:, k] = [_GT_TO_ALT_DOSAGE[code] for code in gt_codes]
         info = f"SVTYPE={svtype};END={end}"
         body.append(
             f"{contig}\t{pos}\t{vid}\tN\t{alt_for[svtype]}\t.\tPASS\t{info}\tGT\t"
             + "\t".join(gt_codes)
         )
-    text = "\n".join(header_lines + body) + "\n"
-    return text.encode("utf-8")
+    return "\n".join(header_lines + body) + "\n", expected_dosage
 
 
 def _write_sv_vcf(
@@ -123,18 +112,11 @@ def _write_sv_vcf(
     sv_ids: list[str],
     positions: list[int],
     seed: int,
-) -> Path:
-    payload = _build_sv_vcf_bytes(sample_ids, contig, sv_ids, positions, seed)
-    plain = work_dir / f"{name}.vcf"
-    plain.write_bytes(payload)
-    bgz = work_dir / f"{name}.vcf.gz"
-    subprocess.run(
-        ["bgzip", "-c", str(plain)],
-        check=True,
-        stdout=bgz.open("wb"),
-    )
-    subprocess.run(["tabix", "-p", "vcf", str(bgz)], check=True)
-    return bgz
+) -> tuple[Path, np.ndarray]:
+    text, expected_dosage = _build_sv_vcf_text(sample_ids, contig, sv_ids, positions, seed)
+    vcf_path = work_dir / f"{name}.vcf"
+    vcf_path.write_text(text, encoding="utf-8")
+    return vcf_path, expected_dosage
 
 
 def _write_sample_table(
@@ -180,22 +162,14 @@ def test_e2e_sv_joint_loader() -> None:
         chr22_sv_ids = [f"sv22_{k:03d}" for k in range(n_svs_per_chr)]
         chr22_positions = [20_000 + 1500 * k for k in range(n_svs_per_chr)]
 
-        chr21_vcf = _write_sv_vcf(
+        chr21_vcf, chr21_dosage = _write_sv_vcf(
             work, "chr21_svs", chr21_samples, "chr21",
             chr21_sv_ids, chr21_positions, seed=123,
         )
-        chr22_vcf = _write_sv_vcf(
+        chr22_vcf, chr22_dosage = _write_sv_vcf(
             work, "chr22_svs", chr22_samples, "chr22",
             chr22_sv_ids, chr22_positions, seed=456,
         )
-
-        # 4. Transcode each SV VCF to a PLINK BED trio.
-        chr21_bed = work / "chr21_svs.bed"
-        chr22_bed = work / "chr22_svs.bed"
-        meta21 = transcode_sv_vcf_to_bed([chr21_vcf], chr21_bed)
-        meta22 = transcode_sv_vcf_to_bed([chr22_vcf], chr22_bed)
-        assert meta21["n_variants"] == n_svs_per_chr
-        assert meta22["n_variants"] == n_svs_per_chr
 
         # Expected sample intersection (preserves microarray order).
         expected_common = [
@@ -207,13 +181,13 @@ def test_e2e_sv_joint_loader() -> None:
         sample_table_path = work / "samples.tsv"
         _write_sample_table(sample_table_path, micro_sample_ids, seed=7)
 
-        # 5. Joint load.
+        # 4. Joint load.
         config = ModelConfig()
         dataset = load_multi_source_dataset_from_files(
             sources=[
                 ("plink1", micro_bed),
-                ("plink1", chr21_bed),
-                ("plink1", chr22_bed),
+                ("vcf", chr21_vcf),
+                ("vcf", chr22_vcf),
             ],
             config=config,
             sample_table_path=sample_table_path,
@@ -222,7 +196,7 @@ def test_e2e_sv_joint_loader() -> None:
             sample_id_column="sample_id",
         )
 
-        # 6. Assertions.
+        # 5. Assertions.
         # Row dimension == intersection.
         assert dataset.sample_ids == expected_common
         assert dataset.genotypes.shape[0] == len(expected_common)
@@ -262,6 +236,19 @@ def test_e2e_sv_joint_loader() -> None:
 
         # Genotype matrix is a RawGenotypeMatrix subclass.
         assert isinstance(dataset.genotypes, RawGenotypeMatrix)
+
+        # SV columns are ALT-allele dosages of the intersected samples.
+        sv_block = dataset.genotypes.materialize(
+            np.arange(n_variants_micro, expected_total_variants)
+        )
+        np.testing.assert_array_equal(
+            sv_block[:, :n_svs_per_chr],
+            chr21_dosage[[chr21_samples.index(sid) for sid in expected_common]],
+        )
+        np.testing.assert_array_equal(
+            sv_block[:, n_svs_per_chr:],
+            chr22_dosage[[chr22_samples.index(sid) for sid in expected_common]],
+        )
 
         # Covariates / targets dimensions.
         assert dataset.covariates.shape == (len(expected_common), 2)
