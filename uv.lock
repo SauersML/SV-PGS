@@ -2187,7 +2187,7 @@ requires-dist = [
     { name = "jax", extras = ["cuda12"], marker = "extra == 'gpu'", specifier = ">=0.4.20,<0.5" },
     { name = "jaxlib", specifier = ">=0.4.20,<0.5" },
     { name = "matplotlib", specifier = ">=3.7" },
-    { name = "numpy", specifier = ">=1.24,<2" },
+    { name = "numpy", specifier = ">=1.24" },
     { name = "nvidia-cuda-nvrtc-cu12", marker = "extra == 'gpu'" },
     { name = "pandas", specifier = ">=1.5" },
     { name = "psutil", specifier = ">=5.9" },
