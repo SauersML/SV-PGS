@@ -104,7 +104,7 @@ from sv_pgs.genotype import (
     _try_import_cupy,
 )
 from sv_pgs.linear_solvers import build_linear_operator, solve_spd_system, stochastic_logdet
-from sv_pgs.numeric import stable_sigmoid
+from sv_pgs.numeric import logistic_normal_probit_scale, stable_sigmoid
 from sv_pgs.preprocessing import collapse_tie_groups
 from sv_pgs._typing import (
     JaxArray,
@@ -639,6 +639,9 @@ class VariationalFitResult:
     final_objective_change: float | None = None
     final_hyperparameter_change: float | None = None
     elbo_history: list[float] = field(default_factory=list)
+    # Intercept shift for the damped posterior predictive (predict_proba); 0.0
+    # when posterior variances were not computed and predict_proba is the plug-in.
+    predictive_intercept_shift: float = 0.0
 
 
 @dataclass(slots=True)
@@ -1085,6 +1088,40 @@ def _initialize_alpha_state(
     normal_matrix = covariates.T @ covariates + np.eye(covariates.shape[1], dtype=np.float64) * 1e-8
     right_hand_side = covariates.T @ target_array
     return np.linalg.solve(normal_matrix, right_hand_side).astype(np.float64, copy=False)
+
+
+def _posterior_predictive_intercept_shift(
+    *,
+    genotype_matrix: StandardizedGenotypeMatrix,
+    linear_predictor: NDArray,
+    beta_variance: NDArray,
+    targets: NDArray,
+    batch_size: int,
+) -> float:
+    """Intercept shift that calibrates the damped posterior predictive in the large.
+
+    _apply_binary_intercept_calibration makes the training mean of sigmoid(eta_i)
+    equal the prevalence, but predict_proba scores sigmoid(eta_i / kappa_i), and
+    dividing the calibrated logit, intercept included, by kappa_i moves that mean
+    off the prevalence (low-prevalence predictions drift up). Solve
+    mean sigmoid((eta_i + shift) / kappa_i) = prevalence on the training predictor
+    variances instead. As in predict_proba only variances > 0 count, so NaN (not
+    computed) variances leave the plug-in, which needs no shift.
+    """
+    beta_variance_array = np.asarray(beta_variance, dtype=np.float64)
+    counted_variance = np.where(beta_variance_array > 0.0, beta_variance_array, 0.0)
+    if not np.any(counted_variance > 0.0):
+        return 0.0
+    training_predictor_variance = _binary_elbo_predictor_variance(
+        genotype_matrix,
+        counted_variance,
+        batch_size=batch_size,
+    )
+    return _calibrate_binary_intercept(
+        linear_predictor=linear_predictor,
+        targets=targets,
+        predictor_scale=logistic_normal_probit_scale(training_predictor_variance),
+    )
 
 
 def _apply_binary_intercept_calibration(
@@ -4179,6 +4216,17 @@ def fit_variational_em(
         if config.final_posterior_diagnostics
         else np.full(np.asarray(final_state.beta).shape, np.nan, dtype=np.float64)
     )
+    predictive_intercept_shift = (
+        _posterior_predictive_intercept_shift(
+            genotype_matrix=genotype_matrix,
+            linear_predictor=final_state.linear_predictor,
+            beta_variance=final_beta_variance,
+            targets=target_vector,
+            batch_size=config.posterior_variance_batch_size,
+        )
+        if config.trait_type == TraitType.BINARY
+        else 0.0
+    )
     log(f"  variational EM returning results  mem={mem()}")
     return VariationalFitResult(
         alpha=np.asarray(final_state.alpha, dtype=np.float32),
@@ -4212,6 +4260,7 @@ def fit_variational_em(
         final_objective_change=final_objective_change,
         final_hyperparameter_change=final_hyperparameter_change,
         elbo_history=elbo_history,
+        predictive_intercept_shift=float(predictive_intercept_shift),
     )
 
 
@@ -14578,19 +14627,29 @@ def _validation_evaluation(
 # matches the observed prevalence in the training data.  Uses a few
 # Newton-Raphson steps on the logistic likelihood with respect to the
 # intercept only — fast because it's a 1D optimization.
+#
+# With ``predictor_scale`` kappa_i the probability is sigmoid((eta_i + shift) /
+# kappa_i), the damped posterior predictive, and the same Newton steps solve
+# mean probability = prevalence for it.
 def _calibrate_binary_intercept(
     linear_predictor: NDArray,
     targets: NDArray,
+    predictor_scale: NDArray | None = None,
 ) -> float:
     target_array = np.asarray(targets, dtype=np.float64)
     base_linear_predictor = np.asarray(linear_predictor, dtype=np.float64)
+    scale_array = (
+        np.ones_like(base_linear_predictor)
+        if predictor_scale is None
+        else np.asarray(predictor_scale, dtype=np.float64)
+    )
     target_prevalence = float(np.clip(np.mean(target_array), 1e-6, 1.0 - 1e-6))
     intercept_shift = float(np.log(target_prevalence / (1.0 - target_prevalence)) - np.mean(base_linear_predictor))
     for _iteration_index in range(25):
-        shifted_predictor = base_linear_predictor + intercept_shift
+        shifted_predictor = (base_linear_predictor + intercept_shift) / scale_array
         probabilities = np.asarray(stable_sigmoid(shifted_predictor), dtype=np.float64)
         gradient = float(np.sum(probabilities - target_array))
-        hessian = float(np.sum(probabilities * (1.0 - probabilities)))
+        hessian = float(np.sum(probabilities * (1.0 - probabilities) / scale_array))
         if hessian <= 1e-8:
             break
         step = gradient / hessian

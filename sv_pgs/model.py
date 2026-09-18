@@ -44,7 +44,7 @@ from sv_pgs.genotype import (
 )
 from sv_pgs.plink import PLINK_MISSING_INT8
 from sv_pgs.inference import VariationalFitCheckpoint, VariationalFitResult, fit_variational_em
-from sv_pgs.numeric import stable_sigmoid
+from sv_pgs.numeric import logistic_normal_probit_scale, stable_sigmoid
 from sv_pgs.preprocessing import (
     Preprocessor,
     build_marginal_z_rhs,
@@ -3311,16 +3311,21 @@ class BayesianPGS:
         sigmoid(E[z]) is not E[sigmoid(z)]: the plug-in score is overconfident wherever the
         posterior is wide. The probit approximation to the logistic-normal integral damps
         the score by sqrt(1 + (pi/8) s2), which leaves a confident prediction alone and
-        pulls an uncertain one toward the prior.
+        pulls an uncertain one toward the prior. The fitted intercept is calibrated for
+        the plug-in score, so the damped score carries its own intercept shift, fitted
+        so that its training mean probability equals the prevalence.
         """
         mean_predictor = np.asarray(
             self.decision_function(genotypes, covariates), dtype=np.float64
         )
         if self.config.trait_type != TraitType.BINARY:
             return np.asarray(mean_predictor, dtype=np.float32)
-        predictor_variance = np.asarray(self.predictor_variance(genotypes), dtype=np.float64)
-        damping = np.sqrt(1.0 + (np.pi / 8.0) * np.maximum(predictor_variance, 0.0))
-        return np.asarray(mean_predictor / damping, dtype=np.float32)
+        fit_result = self._require_state().fit_result
+        damping = logistic_normal_probit_scale(self.predictor_variance(genotypes))
+        return np.asarray(
+            (mean_predictor + float(fit_result.predictive_intercept_shift)) / damping,
+            dtype=np.float32,
+        )
 
     def predict_proba(self, genotypes: RawGenotypeMatrix | NDArray, covariates: NDArray) -> F32Array:
         if self.config.trait_type != TraitType.BINARY:
@@ -3402,6 +3407,7 @@ class BayesianPGS:
             final_predictor_change=fit_result.final_predictor_change,
             final_objective_change=fit_result.final_objective_change,
             final_hyperparameter_change=fit_result.final_hyperparameter_change,
+            predictive_intercept_shift=float(fit_result.predictive_intercept_shift),
         )
         save_artifact(path, artifact)
 
@@ -3447,6 +3453,7 @@ class BayesianPGS:
                 final_hyperparameter_change=getattr(
                     artifact, "final_hyperparameter_change", None
                 ),
+                predictive_intercept_shift=artifact.predictive_intercept_shift,
             ),
             full_coefficients=artifact.beta_full,
             nonzero_coefficient_indices=nonzero_coefficient_indices,

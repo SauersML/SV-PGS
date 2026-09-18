@@ -4,7 +4,9 @@ from __future__ import annotations
 import importlib
 from typing import Any
 
-from sv_pgs._typing import JaxArray
+import numpy as np
+
+from sv_pgs._typing import JaxArray, NDArray
 
 # Importing sv_pgs._jax configures XLA env vars before any direct jax import.
 # Use importlib so static-analysis tools don't reorder it past the jax import.
@@ -37,3 +39,13 @@ def stable_sigmoid(values: Any) -> JaxArray:
         1.0 / (1.0 + negative_exponential),
         negative_exponential / (1.0 + negative_exponential),
     )
+
+
+def logistic_normal_probit_scale(predictor_variance: Any) -> NDArray:
+    """kappa = sqrt(1 + (pi / 8) s2), so that E[sigmoid(z)] ~= sigmoid(mu / kappa).
+
+    The probit approximation to the logistic-normal integral for z ~ N(mu, s2)
+    (MacKay 1992). Prediction and intercept calibration must share it.
+    """
+    variance = np.maximum(np.asarray(predictor_variance, dtype=np.float64), 0.0)
+    return np.sqrt(1.0 + (np.pi / 8.0) * variance)

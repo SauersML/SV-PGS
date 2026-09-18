@@ -2120,8 +2120,49 @@ def test_predict_proba_damps_by_the_computed_posterior_variance():
     assert np.all(predictor_variance > 0.0)
     linear_predictor = np.asarray(model.decision_function(genotype_matrix, covariate_matrix), dtype=np.float64)
 
+    assert model.state is not None
+    intercept_shift = float(model.state.fit_result.predictive_intercept_shift)
+
     np.testing.assert_allclose(
         model.predict_proba(genotype_matrix, covariate_matrix)[:, 1],
-        stable_sigmoid(linear_predictor / np.sqrt(1.0 + (np.pi / 8.0) * predictor_variance)),
+        stable_sigmoid(
+            (linear_predictor + intercept_shift) / np.sqrt(1.0 + (np.pi / 8.0) * predictor_variance)
+        ),
         rtol=1e-5,
     )
+
+
+def test_posterior_predictive_is_calibrated_in_the_large_on_the_training_set(tmp_path):
+    # The fitted intercept makes the training mean of sigmoid(eta) equal the
+    # prevalence. predict_proba divides the logit by kappa_i = sqrt(1 + (pi/8) s2_i);
+    # it must carry its own intercept so the damped mean still equals the prevalence.
+    # Many weakly identified variants give the damping a visible predictor variance.
+    random_generator = np.random.default_rng(5)
+    sample_count, variant_count = 80, 1000
+    genotype_matrix = random_generator.normal(size=(sample_count, variant_count)).astype(np.float32)
+    covariate_matrix = random_generator.normal(size=(sample_count, 1)).astype(np.float32)
+    true_logit = -1.0 + 1.2 * genotype_matrix[:, 0] - 0.9 * genotype_matrix[:, 1] + 0.3 * covariate_matrix[:, 0]
+    target_vector = random_generator.binomial(1, 1.0 / (1.0 + np.exp(-true_logit))).astype(np.float32)
+    variant_records = [
+        VariantRecord(f"variant_{variant_index}", VariantClass.SNV, "1", 100 + variant_index, allele_frequency=0.3)
+        for variant_index in range(variant_count)
+    ]
+    model = BayesianPGS(
+        ModelConfig(
+            trait_type=TraitType.BINARY,
+            max_outer_iterations=10,
+            minimum_minor_allele_frequency=0.0,
+        )
+    ).fit(genotype_matrix, covariate_matrix, target_vector, variant_records)
+    prevalence = float(np.mean(target_vector))
+    assert float(np.max(model.predictor_variance(genotype_matrix))) > 0.02
+
+    plug_in_probability = stable_sigmoid(model.decision_function(genotype_matrix, covariate_matrix))
+    assert float(np.mean(plug_in_probability)) == pytest.approx(prevalence, abs=1e-5)
+    damped_probability = model.predict_proba(genotype_matrix, covariate_matrix)[:, 1]
+    assert float(np.mean(damped_probability)) == pytest.approx(prevalence, abs=1e-5)
+
+    artifact_directory = tmp_path / "calibrated_predictive_artifact"
+    model.export(artifact_directory)
+    loaded_probability = BayesianPGS.load(artifact_directory).predict_proba(genotype_matrix, covariate_matrix)[:, 1]
+    np.testing.assert_allclose(loaded_probability, damped_probability, rtol=1e-6)

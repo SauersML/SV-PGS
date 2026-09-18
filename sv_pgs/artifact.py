@@ -87,6 +87,9 @@ class ModelArtifact:
     final_predictor_change: float | None = None
     final_objective_change: float | None = None
     final_hyperparameter_change: float | None = None
+    # Intercept shift of the damped posterior predictive (predict_proba). Artifacts
+    # written before it existed load with 0.0, their earlier predict_proba.
+    predictive_intercept_shift: float = 0.0
 
     def __post_init__(self) -> None:
         self.records = normalize_variant_records(self.records)
@@ -214,6 +217,7 @@ def save_artifact(path: str | Path, artifact: ModelArtifact) -> None:
             if artifact.final_hyperparameter_change is None
             else float(artifact.final_hyperparameter_change)
         ),
+        "predictive_intercept_shift": float(artifact.predictive_intercept_shift),
     }
     metadata_bytes = json.dumps(payload, indent=2).encode("utf-8")
     try:
@@ -293,6 +297,7 @@ def load_artifact(path: str | Path) -> ModelArtifact:
             objective_history=[float(value) for value in payload["objective_history"]],
             validation_history=[float(value) for value in payload["validation_history"]],
             fit_fingerprint=str(payload.get("fit_fingerprint", "")),
+            predictive_intercept_shift=float(payload.get("predictive_intercept_shift", 0.0)),
             **_load_diagnostics(payload),
         )
 
