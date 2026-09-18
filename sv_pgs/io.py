@@ -2380,11 +2380,27 @@ def _split_into_regions(chrom: str, chrom_length: int, n_regions: int) -> list[s
     return regions
 
 
-_BCFTOOLS_QUERY_FORMAT = (
-    r"%CHROM" "\t" r"%POS" "\t" r"%ID" "\t" r"%REF" "\t" r"%ALT" "\t"
-    r"%QUAL" "\t" r"%INFO/SVTYPE" "\t" r"%INFO/SVLEN" "\t" r"%INFO/AF" "\t"
-    r"%INFO/END" "\t" r"[%GT,]" "\n"
-)
+_BCFTOOLS_OPTIONAL_INFO_TAGS = ("SVTYPE", "SVLEN", "AF", "END")
+
+
+def _bcftools_query_format(header_text: str) -> str:
+    """The region worker's bcftools query format for a VCF with this header.
+
+    bcftools query exits 255 on an INFO tag the header does not declare, and
+    long-read / imputed VCFs often declare none of SVTYPE, SVLEN or END. A tag
+    the header lacks is emitted as a literal ".", which is what bcftools
+    prints for a declared tag that a record leaves unset.
+    """
+    declared_info_tags = {
+        line[len("##INFO=<ID="):].split(",", 1)[0]
+        for line in header_text.splitlines()
+        if line.startswith("##INFO=<ID=")
+    }
+    optional_fields = "\t".join(
+        f"%INFO/{tag}" if tag in declared_info_tags else "."
+        for tag in _BCFTOOLS_OPTIONAL_INFO_TAGS
+    )
+    return "%CHROM\t%POS\t%ID\t%REF\t%ALT\t%QUAL\t" + optional_fields + "\t[%GT,]\n"
 
 
 def _bcftools_executable() -> str:
@@ -2799,7 +2815,13 @@ def _region_parse_worker(args: tuple[str, str | None, str, int]) -> tuple[int, s
     if effective_region:
         view_cmd += ["-r", effective_region]
     view_cmd += [str(vcf_path)]
-    query_cmd = [bcftools, "query", "-f", _BCFTOOLS_QUERY_FORMAT, "-"]
+    header_text = subprocess.run(
+        [bcftools, "view", "-h", str(vcf_path)],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout
+    query_cmd = [bcftools, "query", "-f", _bcftools_query_format(header_text), "-"]
 
     stats_pack = struct.Struct("<qqii")
     geno_fh = open(geno_path, "ab")

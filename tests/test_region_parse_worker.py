@@ -2,7 +2,9 @@
 
 `bcftools view -r` returns records that overlap a region, not only records
 whose POS lies in it, and several records can share a POS. Both matter at
-region boundaries and when a killed worker resumes from its checkpoint.
+region boundaries and when a killed worker resumes from its checkpoint. The
+worker must also parse VCFs whose header declares none of its optional INFO
+tags.
 """
 from __future__ import annotations
 
@@ -14,6 +16,7 @@ import numpy as np
 import pytest
 
 import sv_pgs.io as io_module
+from sv_pgs.config import VariantClass
 
 pytestmark = pytest.mark.skipif(shutil.which("bcftools") is None, reason="bcftools is not on PATH")
 
@@ -115,3 +118,32 @@ def test_resume_keeps_records_sharing_the_checkpointed_position(
     variant_ids, dosages = _region_output(prefix)
     assert variant_ids == _EXPECTED_IDS
     np.testing.assert_array_equal(dosages, _EXPECTED_DOSAGES)
+
+
+def test_header_without_optional_info_tags_is_parsed(tmp_path: Path) -> None:
+    # Imputed / long-read VCFs such as the aou2_50k popped BCFs declare no
+    # SVTYPE, SVLEN, AF or END; bcftools query rejects undeclared tags.
+    text_path = tmp_path / "popped.vcf"
+    text_path.write_text(
+        "##fileformat=VCFv4.2\n"
+        "##contig=<ID=chr1,length=1000>\n"
+        '##INFO=<ID=ID,Number=1,Type=String,Description="atomic id">\n'
+        '##FORMAT=<ID=GT,Number=1,Type=String,Description="genotype">\n'
+        "#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\tS0\tS1\n"
+        "chr1\t50\ta1\tA\tC\t.\t.\tID=a1\tGT\t0|1\t0|0\n"
+        f"chr1\t95\ta2\tA{'CGT' * 40}\tA\t.\t.\tID=a2\tGT\t1|1\t0|1\n",
+        encoding="utf-8",
+    )
+    vcf_path = tmp_path / "popped.vcf.gz"
+    subprocess.run(["bcftools", "view", "-Oz", "-o", str(vcf_path), "--write-index", str(text_path)], check=True)
+    prefix = tmp_path / "region_0"
+
+    result = io_module._region_parse_worker((str(vcf_path), "chr1:1-1000", str(prefix), 1))
+
+    assert result == (2, str(prefix), 0)
+    variants = io_module._load_variant_metadata(Path(f"{prefix}.variants.npz"))
+    assert [(variant.variant_id, variant.variant_class, variant.length) for variant in variants] == [
+        ("a1", VariantClass.SNV, 1.0),
+        ("a2", VariantClass.DELETION_SHORT, 120.0),
+    ]
+    assert [variant.allele_frequency for variant in variants] == [-1.0, -1.0]
