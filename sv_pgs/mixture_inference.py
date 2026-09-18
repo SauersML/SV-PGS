@@ -14130,16 +14130,17 @@ def _gig_moment(
     chi_array = np.asarray(chi, dtype=np.float64)
     psi_array = np.asarray(psi, dtype=np.float64)
     p_array = np.asarray(p_parameter, dtype=np.float64)
-    z_value = np.sqrt(np.maximum(chi_array * psi_array, 1e-12))
-    # Floor BOTH Bessel evaluations BEFORE taking their ratio so that simultaneous
-    # underflow yields a finite quotient instead of 0/0=NaN.
-    numerator = np.maximum(scipy_bessel_kve(np.abs(p_array + moment_power), z_value), 1e-300)
-    denominator = np.maximum(scipy_bessel_kve(np.abs(p_array), z_value), 1e-300)
-    moment_ratio = numerator / denominator
-    return np.asarray(
-        np.power(np.maximum(chi_array / psi_array, 1e-12), 0.5 * moment_power) * moment_ratio,
-        dtype=np.float64,
-    )
+    # E[X^r] = (chi/psi)^(r/2) K_{p+r}(z) / K_p(z) with z = sqrt(chi * psi). The
+    # Bessel ratio and the prefactor must see the same (chi, psi): flooring z or
+    # chi/psi alone biases the moment (up to 2x at the caller's chi floor).
+    # sqrt(chi) * sqrt(psi) cannot overflow, and kve never underflows for finite
+    # z, so the exponentially scaled ratio is exact without floors.
+    z_value = np.sqrt(chi_array) * np.sqrt(psi_array)
+    moment_ratio = scipy_bessel_kve(np.abs(p_array + moment_power), z_value) / scipy_bessel_kve(np.abs(p_array), z_value)
+    moment = np.exp(0.5 * moment_power * (np.log(chi_array) - np.log(psi_array))) * moment_ratio
+    if not np.all(np.isfinite(moment)):
+        raise FloatingPointError("GIG moment is non-finite; chi and psi must be positive and finite.")
+    return np.asarray(moment, dtype=np.float64)
 
 
 def _member_prior_variances_from_reduced_state(
