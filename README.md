@@ -65,6 +65,32 @@ uv run sv-pgs run-all-of-us --disease heart_failure --chromosomes 1,6,22 --outpu
 uv run sv-pgs run-all-of-us --disease depression --n-pcs 20 --output-dir depression_results
 ```
 
+**Quantitative traits** (EHR labs and physical measurements from the OMOP `measurement` table):
+
+```bash
+uv run sv-pgs list-all-of-us-traits
+uv run sv-pgs run-all-of-us --trait mean_corpuscular_volume --output-dir mcv_results
+uv run sv-pgs prepare-all-of-us-trait --trait haptoglobin --output haptoglobin.samples.tsv
+```
+
+Each trait (`sv_pgs/all_of_us.py`, `MEASUREMENT_DEFINITIONS`) is a set of standard LOINC
+codes, a UCUM unit table converting every accepted unit to one canonical unit, a
+plausible range, an analysis scale (linear or log), an optional medication rule, and
+the SV/TR biology that motivates it. Rows that are censored (`<`, `>`), in an
+unrecognized unit, implausible, self-reported, taken before age 18, taken in an
+inpatient or emergency visit, or inside a pregnancy window are dropped; same-day
+repeats are one occasion. A person's untreated occasions are used when there are any,
+otherwise treated occasions corrected by the trait's convention (lipid-lowering: LDL /
+0.7, total cholesterol / 0.8; antihypertensive: SBP + 15, DBP + 10 mmHg) or, where no
+validated correction exists (HbA1c, glucose, TSH, urate, BMI, ...), not at all. The
+`target` column is the empirical BLUP of the person's long-run mean under a
+random-intercept model (closed-form moment estimates of the between- and within-person
+variances); `target_inverse_normal` is its rank inverse normal transform (train on it
+with `sv-pgs run --target-column target_inverse_normal`). eGFR uses the race-free
+CKD-EPI 2021 equation. Covariates: mean age and mean squared age at measurement, sex at
+birth, race, ethnicity, PCs. The `.metadata.json` sidecar records the query parameters,
+row exclusion counts, unrecognized units, variance components and repeatability.
+
 ## Generic usage (non-AoU)
 
 ```bash

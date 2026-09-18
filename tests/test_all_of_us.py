@@ -395,7 +395,7 @@ def test_cli_run_all_of_us_forwards_core_settings(monkeypatch, tmp_path: Path):
 
     assert exit_code == 0
     assert calls == {
-        "disease": "heart_failure",
+        "phenotype": "heart_failure",
         "chromosomes": [1, 2],
         "output_base": str(tmp_path),
         "variant_metadata_path": None,
@@ -772,7 +772,7 @@ def test_run_all_of_us_runs_single_unified_fit_and_reuses_cached_downloads(monke
     monkeypatch.setattr(aou_runner, "run_training_pipeline", fake_run_training_pipeline)
 
     aou_runner.run_all_of_us(
-        disease="heart_failure",
+        phenotype="heart_failure",
         chromosomes=[1, 2],
         output_base=str(tmp_path),
         variants="sv",
@@ -797,14 +797,14 @@ def test_run_all_of_us_runs_single_unified_fit_and_reuses_cached_downloads(monke
 def test_run_all_of_us_rejects_duplicate_or_invalid_chromosomes(tmp_path: Path):
     with pytest.raises(ValueError, match="chromosomes must be unique"):
         aou_runner.run_all_of_us(
-            disease="heart_failure",
+            phenotype="heart_failure",
             chromosomes=[1, 1],
             output_base=str(tmp_path),
         )
 
     with pytest.raises(ValueError, match="chromosomes must be autosomes 1-22"):
         aou_runner.run_all_of_us(
-            disease="heart_failure",
+            phenotype="heart_failure",
             chromosomes=[0, 23],
             output_base=str(tmp_path),
         )
@@ -874,7 +874,7 @@ def test_run_all_of_us_skips_existing_fit_only_when_run_metadata_matches(monkeyp
     aou_runner._aou_run_metadata_path(tmp_path).write_text(
         json.dumps(
             aou_runner._build_aou_run_metadata(
-                disease=disease,
+                phenotype=disease,
                 chromosomes=[1, 2],
                 n_pcs=2,
                 pc_cols=pc_cols,
@@ -922,7 +922,7 @@ def test_run_all_of_us_skips_existing_fit_only_when_run_metadata_matches(monkeyp
     )
 
     aou_runner.run_all_of_us(
-        disease=disease,
+        phenotype=disease,
         chromosomes=[1, 2],
         output_base=str(tmp_path),
         n_pcs=2,
@@ -952,7 +952,7 @@ def test_run_all_of_us_reruns_when_existing_fit_metadata_differs(monkeypatch, tm
     aou_runner._aou_run_metadata_path(tmp_path).write_text(
         json.dumps(
             aou_runner._build_aou_run_metadata(
-                disease=disease,
+                phenotype=disease,
                 chromosomes=[1, 2],
                 n_pcs=2,
                 pc_cols=["PC1", "PC2"],
@@ -1011,7 +1011,7 @@ def test_run_all_of_us_reruns_when_existing_fit_metadata_differs(monkeypatch, tm
     monkeypatch.setattr(aou_runner, "run_training_pipeline", fake_run_training_pipeline)
 
     aou_runner.run_all_of_us(
-        disease=disease,
+        phenotype=disease,
         chromosomes=[1, 2],
         output_base=str(tmp_path),
         n_pcs=3,
@@ -1072,7 +1072,7 @@ def test_run_all_of_us_raises_when_parallel_precache_fails(monkeypatch, tmp_path
 
     with pytest.raises(RuntimeError, match="parallel VCF precache failed"):
         aou_runner.run_all_of_us(
-            disease=disease,
+            phenotype=disease,
             chromosomes=[1],
             output_base=str(tmp_path),
             n_pcs=2,
@@ -1103,7 +1103,7 @@ def test_run_all_of_us_preflight_counts_mounted_sv_vcf_bytes(monkeypatch, tmp_pa
 
     with pytest.raises(RuntimeError, match="preflight captured"):
         aou_runner.run_all_of_us(
-            disease="heart_failure",
+            phenotype="heart_failure",
             chromosomes=[1],
             output_base=str(tmp_path / "heart_failure_results"),
             n_pcs=2,

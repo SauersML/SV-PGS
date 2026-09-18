@@ -163,8 +163,8 @@ def test_pool_size_derivation(
         # happens. Track the call count to confirm we used the in-process path.
         calls: list[str] = []
 
-        def _fake_run(disease: str, **_kwargs: Any) -> None:
-            calls.append(disease)
+        def _fake_run(phenotype: str, **_kwargs: Any) -> None:
+            calls.append(phenotype)
 
         monkeypatch.setattr(aou_runner, "run_all_of_us", _fake_run)
         rc = aou_runner.run_all_of_us_all_diseases(
@@ -209,8 +209,8 @@ def test_default_sweep_runs_in_process_with_all_gpus_visible(
     monkeypatch.setattr(aou_runner, "_detect_gpu_count", lambda: 2)
     calls: list[str] = []
 
-    def _fake_run(disease: str, **_kwargs: Any) -> None:
-        calls.append(disease)
+    def _fake_run(phenotype: str, **_kwargs: Any) -> None:
+        calls.append(phenotype)
 
     monkeypatch.setattr(aou_runner, "run_all_of_us", _fake_run)
     monkeypatch.setattr(aou_runner, "log", lambda _msg: None)
@@ -305,8 +305,8 @@ def test_sequential_path_failure_returns_nonzero(
     _patch_pre_flight_noop(monkeypatch)
     monkeypatch.setattr(aou_runner, "_detect_gpu_count", lambda: 0)
 
-    def _fake_run(disease: str, **_kwargs: Any) -> None:
-        if disease == "alpha":
+    def _fake_run(phenotype: str, **_kwargs: Any) -> None:
+        if phenotype == "alpha":
             raise RuntimeError("simulated failure")
 
     monkeypatch.setattr(aou_runner, "run_all_of_us", _fake_run)
