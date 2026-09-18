@@ -108,6 +108,11 @@ class OnlineBlockPartitioner:
         self.committed = 0
         """The last released cut: every retained chain passes through it."""
 
+    @property
+    def cut_costs(self) -> NDArray[np.int64]:
+        """``C(k)`` for every cut position solved so far (fixed point, clipped at zero)."""
+        return self._cost[: self._solved + 1]
+
     def add_pair_weights(
         self,
         row_start: int,

@@ -17,17 +17,22 @@ def mosaic_codes(
     variants: int,
     founders: int = 10,
     hotspot_spacing: int = 60,
+    regular_hotspots: bool = False,
 ) -> NDArray[np.uint8]:
     """Variant-major 8-bit dosage codes with block-structured LD.
 
     Each haplotype copies one of ``founders`` founder haplotypes and switches founder
-    rarely inside LD blocks and often at hotspots, every ``hotspot_spacing`` variants on
-    average. Dosages get imputation-like noise; a few variants are monomorphic.
+    rarely inside LD blocks and often at hotspots, every ``hotspot_spacing`` variants
+    (exactly, or on average). Dosages get imputation-like noise; a few variants are
+    monomorphic.
     """
     frequency = rng.uniform(0.02, 0.5, size=variants)
     founder_alleles = rng.random((founders, variants)) < frequency
     switch_rate = np.full(variants, 0.004)
-    switch_rate[rng.random(variants) < 1.0 / hotspot_spacing] = 0.6
+    if regular_hotspots:
+        switch_rate[hotspot_spacing::hotspot_spacing] = 0.9
+    else:
+        switch_rate[rng.random(variants) < 1.0 / hotspot_spacing] = 0.6
     haplotypes = 2 * samples
     switches = rng.random((haplotypes, variants)) < switch_rate
     switches[:, 0] = True

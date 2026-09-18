@@ -107,6 +107,7 @@ def plan_genotype_pass(block_cap: int) -> GenotypePassPlan:
 class ChromosomeSummary:
     chromosome: str
     boundaries: NDArray[np.int64]
+    cut_costs: NDArray[np.int64]
     forced_cuts: int
     seconds: float
 
@@ -271,11 +272,11 @@ def _run_chromosome(
             backend.stage_tile(upcoming[2][: upcoming[1] - upcoming[0]], 1 - staging)
         window_start = max(0, start - maximum_distance)
         row_weights, column_weights = backend.pair_weights(window_start - base, start - base, rows, maximum_distance)
+        backend.check_codes()
         partitioner.add_pair_weights(window_start, row_weights, start, column_weights)
         emit(partitioner.advance(stop - maximum_distance))
         current = upcoming
         staging = 1 - staging
-    backend.check_codes()
     emit(partitioner.finish())
     reader.join()
     seconds = time.monotonic() - started
@@ -286,6 +287,7 @@ def _run_chromosome(
     return ChromosomeSummary(
         chromosome=chromosome,
         boundaries=np.asarray(boundaries, dtype=np.int64),
+        cut_costs=partitioner.cut_costs.copy(),
         forced_cuts=forced,
         seconds=seconds,
     )

@@ -28,9 +28,13 @@ SAMPLES = 540
 BLOCK_CAP = 128
 
 
-def _dataset(seed: int, variant_counts: dict[str, int]) -> InMemoryTileSource:
+def _dataset(seed: int, variant_counts: dict[str, int], regular_hotspots: bool = False) -> InMemoryTileSource:
     rng = np.random.default_rng(seed)
-    codes = {name: mosaic_codes(rng, SAMPLES, count) for name, count in variant_counts.items()}
+    spacing = 100 if regular_hotspots else 60
+    codes = {
+        name: mosaic_codes(rng, SAMPLES, count, hotspot_spacing=spacing, regular_hotspots=regular_hotspots)
+        for name, count in variant_counts.items()
+    }
     groups = {name: bubble_groups(rng, count) for name, count in variant_counts.items()}
     return InMemoryTileSource(codes=codes, groups=groups)
 
@@ -107,15 +111,32 @@ def test_correlation_matches_a_float64_reference() -> None:
 
 @pytest.mark.parametrize("profile_target", [16384, 200])
 def test_partition_is_the_exact_optimum_of_the_cut_costs(profile_target: int) -> None:
-    source = _dataset(7, {"chr20": 900})
+    source = _dataset(7, {"chr20": 900}, regular_hotspots=True)
     sample_groups = _sample_groups(8)
     layout, summary, _ = _run(source, sample_groups, devices=1, columns=None, profile_target=profile_target)
     assert layout.profile_count <= profile_target
     result = summary.chromosomes["chr20"]
-    assert result.forced_cuts == 0
     costs = reference_cut_costs(source.codes["chr20"], layout, BLOCK_CAP)
+    np.testing.assert_array_equal(result.cut_costs, costs)
+    assert result.forced_cuts == 0
     expected = reference_cuts(costs, cut_allowed_from_groups(source.groups["chr20"]), BLOCK_CAP)
     assert result.boundaries.tolist() == expected
+
+
+def test_a_full_buffer_forces_valid_cuts_on_ambiguous_ld() -> None:
+    source = _dataset(7, {"chr20": 900})
+    sample_groups = _sample_groups(8)
+    layout, summary, blocks = _run(source, sample_groups, devices=1, columns=None)
+    result = summary.chromosomes["chr20"]
+    np.testing.assert_array_equal(result.cut_costs, reference_cut_costs(source.codes["chr20"], layout, BLOCK_CAP))
+    assert result.forced_cuts > 0
+    assert np.all(np.diff(result.boundaries) <= BLOCK_CAP)
+    assert np.all(cut_allowed_from_groups(source.groups["chr20"])[result.boundaries])
+    signed = source.codes["chr20"].astype(np.int64) - 127
+    members = np.flatnonzero(sample_groups == 1)
+    for block in blocks:
+        values = signed[block.start : block.stop, members]
+        np.testing.assert_array_equal(block.grams[1], values @ values.T)
 
 
 def test_several_devices_give_the_single_device_blocks() -> None:
