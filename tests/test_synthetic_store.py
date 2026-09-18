@@ -3,7 +3,9 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-from sv_pgs.dosage_store import DosageStore, dosage_array_directory, signed_code_moments
+from sv_pgs.compute_budget import ComputeBudget
+from sv_pgs.config import VariantClass
+from sv_pgs.dosage_store import VARIANT_CLASSES, DosageStore, dosage_array_directory, signed_code_moments
 from sv_pgs.synthetic_store import (
     ANCESTRIES,
     CLASS_LEGEND,
@@ -33,7 +35,8 @@ def _source(
     seed: int = 4,
     rare_fraction: float = 0.6,
 ) -> HaplotypeSource:
-    """Founder haplotypes with blocky LD: runs of variants copy their run's first variant half the time."""
+    """Two source chromosomes of founder haplotypes with blocky LD: runs of variants copy their
+    run's first variant half the time."""
     rng = np.random.default_rng(seed)
     haplotype_count = 2 * founders_per_ancestry * len(ANCESTRIES)
     frequencies = np.where(
@@ -46,11 +49,19 @@ def _source(
         haplotypes[start + 1 : start + 4] = np.where(rng.random((3, 1)) < 0.5, haplotypes[start], haplotypes[start + 1 : start + 4])
     ancestry = np.repeat(np.arange(len(ANCESTRIES)), 2 * founders_per_ancestry).astype(np.int8)
     classes = rng.choice(len(CLASS_LEGEND), size=variant_count, p=[0.8, 0.15, 0.05]).astype(np.uint8)
+    split = variant_count // 2
+    positions = np.concatenate(
+        [np.sort(rng.choice(np.arange(1, 4_000_000), size=count, replace=False)) for count in (split, variant_count - split)]
+    )
     return HaplotypeSource(
-        positions=np.sort(rng.choice(np.arange(1, 4_000_000), size=variant_count, replace=False)).astype(np.int64),
+        positions=positions.astype(np.int64),
+        genetic_map_cm=positions / 1e6,
         reference_lengths=np.ones(variant_count, dtype=np.int64),
         alternate_lengths=np.ones(variant_count, dtype=np.int64),
         class_codes=classes,
+        variant_classes=np.minimum(classes, 1).astype(np.uint8),
+        tandem_repeat=rng.random(variant_count) < 0.5,
+        chromosome_starts=np.array([0, split, variant_count]),
         haplotypes=haplotypes,
         haplotype_ancestry=ancestry,
         ancestry_frequencies=np.stack(
@@ -69,6 +80,7 @@ def _plan(root: Path, source: HaplotypeSource, records: int = 1500, samples: tup
         chromosome_count=2,
         seed=17,
         block_records=96,
+        codec="raw",
         shard_rows=256,
         inner_rows=32,
     )
@@ -88,33 +100,45 @@ def test_generated_store_is_deterministic_across_worker_counts_and_matches_its_s
             for serial_file in serial_files:
                 parallel_file = tmp_path / "parallel" / serial_file.relative_to(tmp_path / "serial")
                 assert serial_file.read_bytes() == parallel_file.read_bytes()
-    with DosageStore(tmp_path / "parallel") as store:
-        assert (store.variant_count, store.sample_count) == (1500, 100)
-        moments = signed_code_moments(store, 0, store.variant_count, np.arange(store.sample_count), block_rows=128)
-        assert moments.row_count == 100
+    budget = ComputeBudget(
+        device_kind="cpu", device_ids=(), device_names=(), device_bytes=(), device_compute_capabilities=(),
+        host_bytes=1 << 26, cpu_threads=2,
+    )
+    with DosageStore.open(tmp_path / "parallel") as store:
+        assert (store.n_variants, store.n_samples) == (1500, 100)
+        moments = signed_code_moments(store, 0, store.n_variants, np.arange(store.n_samples), budget)
+        assert moments.sample_count == 100
         for name in ("sum_code", "sum_ds", "n_off_mode_code", "ds_mode_milli"):
             assert store.statistic(name).shape == (1500,)
         kinds = np.concatenate([layout.record_kind for layout in parallel.layouts])
         assert {RECORD_SINGLE, RECORD_PATH, RECORD_NESTED} <= set(kinds.tolist())
-        assert np.array_equal(store.variants.columns["n_paths_total"] > 1, kinds != RECORD_SINGLE)
+        table = store.variant_table
+        assert np.array_equal(table.annotations["n_paths_total"] > 1, kinds != RECORD_SINGLE)
+        assert np.all(np.diff(table.position[table.chromosome == 1]) >= 0)
+        assert np.all(np.diff(table.genetic_position_cm[table.chromosome == 1]) >= 0)
+        offsets = np.cumsum([0] + [layout.record_count for layout in parallel.layouts[:-1]])
+        bubble_starts = np.concatenate([layout.bubble_start + offset for layout, offset in zip(parallel.layouts, offsets)])
+        assert np.array_equal(table.group_first, bubble_starts)
 
 
 def test_err_imp_floor_and_pop_normalization_set_the_background_code(tmp_path: Path) -> None:
     source = _source(variant_count=800, rare_fraction=0.97)
     plan = _plan(tmp_path / "store", source, records=4000, samples=(400,))
     generate_store(plan, workers=1)
-    with DosageStore(tmp_path / "store") as store:
+    with DosageStore.open(tmp_path / "store") as store:
         mode = store.statistic("ds_mode_milli")
-        has_pl = store.variants.columns["has_pl"].astype(bool)
-        frequency = store.variants.columns["panel_af"]
-        total_paths = store.variants.columns["n_paths_total"].astype(int)
-        carried = store.variants.columns["n_paths"].astype(int)
+        annotations = store.variant_table.annotations
+        has_pl = annotations["has_pl"].astype(bool)
+        frequency = annotations["panel_af"]
+        total_paths = annotations["n_paths_total"].astype(int)
+        carried = annotations["n_paths"].astype(int)
     kinds = np.concatenate([layout.record_kind for layout in plan.layouts])
     snv = np.concatenate([layout.noise_class for layout in plan.layouts]) == NOISE_CLASSES.index("SNV")
     rare = frequency < 0.03
     single = (kinds == RECORD_SINGLE) & rare & snv
     assert np.all(mode[single & ~has_pl] == 2)
     assert np.all(mode[single & has_pl] == 0)
+    assert np.any(single & has_pl) and np.any(single & ~has_pl)
     odds = ERR_IMP / (1 - ERR_IMP)
     bubble_starts = np.concatenate([layout.bubble_start + offset for layout, offset in zip(plan.layouts, (0, plan.layouts[0].record_count))])
     rare_snv_paths = np.array(
@@ -171,10 +195,10 @@ def test_mixture_r2_formula_and_solver_match_simulated_posteriors() -> None:
 
 
 def test_single_path_dosage_r2_tracks_the_per_class_target(tmp_path: Path) -> None:
-    source = _source(variant_count=1500, founders_per_ancestry=60)
+    source = _source(variant_count=3000, founders_per_ancestry=60)
     plan = _plan(tmp_path / "store", source, records=2500, samples=(3000,))
     layout = plan.layouts[0]
-    mosaic = draw_tile_mosaic(plan.source, plan.cohort, np.random.default_rng(2))
+    mosaic = draw_tile_mosaic(plan.source, int(layout.tile[0]), plan.cohort, np.random.default_rng(2))
     block_start, block_stop = block_boundaries(layout, 0, layout.record_count, 1500)[0]
     truth, popped = generate_block(plan, 0, block_start, block_stop, mosaic)
     dosage = popped[0][:, 0::2] + popped[0][:, 1::2]
@@ -202,3 +226,40 @@ def test_blocks_never_split_bubbles_or_tiles(tmp_path: Path, block_records: int)
         assert layout.bubble_start[start] == start
         assert np.all(layout.bubble_start[start:stop] >= start)
         assert len(set(layout.tile[start:stop].tolist())) == 1
+
+
+def test_source_loader_reads_design_credit_archives_and_maps_classes(tmp_path: Path) -> None:
+    rng = np.random.default_rng(3)
+    founders = 12
+    superpopulation = np.array(ANCESTRIES * 3)[:founders]
+    kinds = np.array(["SNV", "INDEL", "DEL", "DEL_SEQ", "DUP", "INS:ME:ALU", "INS_SEQ", "INV", "DEL"])
+    sv_length = np.array([0, 3, 2000, 60, 300, 280, 90, 5000, 400])
+    in_tr = np.array([False, True, False, False, False, False, False, False, True])
+    paths = []
+    for chromosome in (21, 22):
+        haplotypes = (rng.random((kinds.size, 2 * founders)) < 0.3).astype(np.uint8)
+        path = tmp_path / f"src_chr{chromosome}.npz"
+        np.savez(
+            path,
+            positions=np.arange(kinds.size) * 100 + 5,
+            cm=np.arange(kinds.size) * 0.01,
+            ref_len=np.ones(kinds.size, dtype=np.int64),
+            alt_len=np.ones(kinds.size, dtype=np.int64),
+            sv_length=sv_length,
+            kinds=kinds,
+            in_tr=in_tr,
+            superpop=superpopulation,
+            n_samples=np.int64(founders),
+            packed_haps=np.packbits(haplotypes, axis=1),
+        )
+        paths.append(path)
+    source = HaplotypeSource.load(paths)
+    assert source.haplotypes.shape == (2 * kinds.size, 2 * founders)
+    assert source.tile_range(0) == (0, kinds.size) and source.tile_range(3) == (kinds.size, 2 * kinds.size)
+    expected = [
+        VariantClass.SNV, VariantClass.SMALL_INDEL, VariantClass.DELETION_LONG, VariantClass.DELETION_SHORT,
+        VariantClass.DUPLICATION_SHORT, VariantClass.INSERTION_MEI, VariantClass.OTHER_COMPLEX_SV,
+        VariantClass.INVERSION_BND_COMPLEX, VariantClass.STR_VNTR_REPEAT,
+    ]
+    assert [VARIANT_CLASSES[code] for code in source.variant_classes[: kinds.size]] == expected
+    assert source.class_codes[: kinds.size].tolist() == [0, 1, 2, 2, 2, 2, 2, 2, 2]

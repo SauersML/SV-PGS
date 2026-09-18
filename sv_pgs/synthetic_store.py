@@ -1,12 +1,13 @@
 """Synthetic svpgs-store v1 generator: 1kGP haplotype mosaics with imputation-realistic DS noise.
 
 Genotypes (validation-bench REPORT P1, Tier 1).  Each sample's two haplotypes are mosaics of public
-1kGP founder haplotypes: HAPGEN-style copying with donor segments of mean 2 Mb and local-ancestry
-tracts from an 8-generation admixture clock.  The cohort mix is EUR 52%, African American 22%
-(0.8 AFR / 0.2 EUR), Hispanic 18% (0.5 AMR / 0.35 EUR / 0.15 AFR), EAS 5% and SAS 3%, with
-per-person proportions drawn from Dirichlet(15 q).  The source region is tiled, with fresh
-mosaics per tile, to reach any record count, spread over 22 chromosomes in proportion to their
-hg38 lengths.
+1kGP founder haplotypes (design-credit's ``src_chr*.npz``: NYGC 3202 panel, founders, MAF >= 1%):
+HAPGEN-style copying with donor segments of mean 2 cM and local-ancestry tracts from an
+8-generation admixture clock.  The cohort mix is EUR 52%, African American 22% (0.8 AFR / 0.2
+EUR), Hispanic 18% (0.5 AMR / 0.35 EUR / 0.15 AFR), EAS 5% and SAS 3%, with per-person
+proportions drawn from Dirichlet(15 q).  Each tile is one source chromosome with a fresh mosaic;
+tiles cycle through the source chromosomes to reach any record count, spread over 22 synthetic
+chromosomes in proportion to their hg38 lengths.
 
 Records (target-format REPORT §1.2).  Source variants become single-path records, or the paths of
 multi-path bubbles.  Each bubble's complexity is drawn from the strata class x MAF x N_PATHS_TOTAL
@@ -48,10 +49,13 @@ from typing import Any, Mapping, Sequence
 import numpy as np
 
 from sv_pgs._typing import F32Array, F64Array, I64Array, NDArray, U8Array
+from sv_pgs.config import VariantClass
 from sv_pgs.dosage_store import (
     DEFAULT_INNER_CHUNK_ROWS,
     DEFAULT_SHARD_ROWS,
     MAXIMUM_DOSAGE_MILLI,
+    VARIANT_CLASSES,
+    Codec,
     CodeArrayLayout,
     CodeShardWriter,
     create_code_array,
@@ -59,6 +63,7 @@ from sv_pgs.dosage_store import (
     dosage_array_directory,
     encode_dosage_milli,
     open_column,
+    sites_md5,
     statistic_column_directory,
     variant_column_directory,
     write_column,
@@ -79,16 +84,16 @@ COHORT_GROUPS: tuple[tuple[float, Mapping[str, float]], ...] = (
     (0.03, {"SAS": 1.0}),
 )
 ANCESTRY_DIRICHLET_CONCENTRATION = 15.0
-DONOR_SEGMENT_MEAN_BP = 2_000_000
+DONOR_SEGMENT_MEAN_CM = 2.0
 ADMIXTURE_GENERATIONS = 8
-RECOMBINATION_RATE_PER_BP = 1e-8
 TILE_GAP_BP = 1_000_000
+TILE_GAP_CM = 50.0
 ERR_IMP = 1e-3
 POP_CLAMP = 1e-5
 POP_KEPT_PATHS = 10
 CLASS_LEGEND = ("SNV", "INDEL", "SV")
 SV_CONTEXT_LEGEND = ("not_sv", "tandem_repeat", "outside_tandem_repeat")
-SV_TANDEM_REPEAT_FRACTION = 0.84
+LONG_SV_BP = 1000
 READ_EVIDENCE_FRACTION = {"SNV": 0.18, "INDEL": 0.10, "SV": 0.0}
 NESTED_RECORD_PROBABILITY = 0.3
 MAXIMUM_NESTED_PATHS = 5
@@ -158,48 +163,60 @@ STATISTIC_DTYPES = {
 
 @dataclass(frozen=True)
 class HaplotypeSource:
-    """Phased founder haplotypes of a public reference region (validation-bench build_source.py).
+    """Phased founder haplotypes of public reference chromosomes, concatenated.
 
-    ``haplotypes`` is [variants, founder haplotypes] of ALT indicators; ``class_codes`` index
-    ``CLASS_LEGEND``.
+    ``haplotypes`` is [variants, founder haplotypes] of ALT indicators; ``chromosome_starts``
+    bounds each source chromosome; ``class_codes`` index ``CLASS_LEGEND`` and ``variant_classes``
+    ``tuple(VariantClass)`` (target-format REPORT §2.5 mapping).
     """
 
     positions: I64Array
+    genetic_map_cm: F64Array
     reference_lengths: I64Array
     alternate_lengths: I64Array
     class_codes: NDArray
+    variant_classes: NDArray
+    tandem_repeat: NDArray
+    chromosome_starts: I64Array
     haplotypes: U8Array
     haplotype_ancestry: NDArray
     ancestry_frequencies: F32Array
 
     @classmethod
-    def load(cls, path: Path) -> HaplotypeSource:
-        archive = np.load(path)
-        founder = archive["founder"].astype(bool)
-        superpopulation = archive["superpop"].astype(str)
-        keep_haplotypes = np.repeat(founder & np.isin(superpopulation, ANCESTRIES), 2)
-        haplotypes = np.ascontiguousarray(archive["haps"][:, keep_haplotypes])
-        ancestry = np.repeat(np.array([ANCESTRIES.index(name) if name in ANCESTRIES else -1 for name in superpopulation]), 2)
-        ancestry = ancestry[keep_haplotypes]
+    def load(cls, paths: Sequence[Path]) -> HaplotypeSource:
+        archives = [np.load(path) for path in paths]
+        superpopulation = archives[0]["superpop"].astype(str)
+        founder_count = int(archives[0]["n_samples"])
+        for path, archive in zip(paths, archives):
+            if int(archive["n_samples"]) != founder_count or not np.array_equal(archive["superpop"].astype(str), superpopulation):
+                raise ValueError(f"{path} lists different founders from {paths[0]}.")
+        unknown = sorted(set(superpopulation.tolist()) - set(ANCESTRIES))
+        if unknown:
+            raise ValueError(f"founders from superpopulations {unknown} are outside {ANCESTRIES}.")
+        haplotypes = np.concatenate(
+            [np.unpackbits(archive["packed_haps"], axis=1)[:, : 2 * founder_count] for archive in archives]
+        )
+        ancestry = np.repeat(np.array([ANCESTRIES.index(name) for name in superpopulation], dtype=np.int8), 2)
         missing = [name for index, name in enumerate(ANCESTRIES) if not np.any(ancestry == index)]
         if missing:
-            raise ValueError(f"{path} has no founder haplotypes for {missing}.")
-        frequencies = np.stack(
-            [haplotypes[:, ancestry == index].mean(axis=1) for index in range(len(ANCESTRIES))], axis=1
-        ).astype(np.float32)
-        classes = archive["cls"].astype(str)
-        unknown = sorted(set(classes.tolist()) - set(CLASS_LEGEND))
-        if unknown:
-            raise ValueError(f"{path} has variant classes {unknown} outside {CLASS_LEGEND}.")
-        alternate_lengths = archive["alt_len"].astype(np.int64)
+            raise ValueError(f"the source has no founder haplotypes for {missing}.")
+        kinds = np.concatenate([archive["kinds"].astype(str) for archive in archives])
+        tandem_repeat = np.concatenate([archive["in_tr"].astype(bool) for archive in archives])
+        sv_length = np.abs(np.concatenate([archive["sv_length"].astype(np.int64) for archive in archives]))
         return cls(
-            positions=archive["positions"].astype(np.int64),
-            reference_lengths=archive["ref_len"].astype(np.int64),
-            alternate_lengths=np.where(alternate_lengths < 0, 1, alternate_lengths),
-            class_codes=np.array([CLASS_LEGEND.index(name) for name in classes], dtype=np.uint8),
+            positions=np.concatenate([archive["positions"].astype(np.int64) for archive in archives]),
+            genetic_map_cm=np.concatenate([archive["cm"].astype(np.float64) for archive in archives]),
+            reference_lengths=np.concatenate([archive["ref_len"].astype(np.int64) for archive in archives]),
+            alternate_lengths=np.concatenate([archive["alt_len"].astype(np.int64) for archive in archives]),
+            class_codes=np.select([kinds == "SNV", kinds == "INDEL"], [0, 1], default=2).astype(np.uint8),
+            variant_classes=_variant_classes(kinds, sv_length, tandem_repeat),
+            tandem_repeat=tandem_repeat,
+            chromosome_starts=np.concatenate([[0], np.cumsum([archive["positions"].shape[0] for archive in archives])]),
             haplotypes=haplotypes,
-            haplotype_ancestry=ancestry.astype(np.int8),
-            ancestry_frequencies=frequencies,
+            haplotype_ancestry=ancestry,
+            ancestry_frequencies=np.stack(
+                [haplotypes[:, ancestry == index].mean(axis=1) for index in range(len(ANCESTRIES))], axis=1
+            ).astype(np.float32),
         )
 
     @property
@@ -207,8 +224,56 @@ class HaplotypeSource:
         return int(self.positions.shape[0])
 
     @property
+    def chromosome_count(self) -> int:
+        return int(self.chromosome_starts.shape[0]) - 1
+
+    @property
     def pooled_frequencies(self) -> F64Array:
         return self.haplotypes.mean(axis=1, dtype=np.float64)
+
+    def tile_range(self, tile: int) -> tuple[int, int]:
+        """Source variants of a tile: tiles cycle through the source chromosomes."""
+        chromosome = tile % self.chromosome_count
+        return int(self.chromosome_starts[chromosome]), int(self.chromosome_starts[chromosome + 1])
+
+
+def _variant_classes(kinds: NDArray, sv_length: I64Array, tandem_repeat: NDArray) -> NDArray:
+    """SV-PGS classes from 1kGP kinds (target-format §2.5): TR SVs are str_vntr_repeat, DEL/DUP split
+    at 1 kb, mobile-element insertions insertion_mei, inversions inversion_bnd_complex, other
+    insertions and anything else other_complex_sv."""
+    long_event = sv_length >= LONG_SV_BP
+    structural = ~np.isin(kinds, ["SNV", "INDEL"])
+    deletion = np.char.startswith(kinds, "DEL")
+    duplication = np.char.startswith(kinds, "DUP") | np.char.startswith(kinds, "CNV")
+    mobile_insertion = np.char.startswith(kinds, "INS:ME")
+    inversion = np.char.startswith(kinds, "INV")
+    order = {variant_class: index for index, variant_class in enumerate(VariantClass)}
+    classes = np.select(
+        [
+            kinds == "SNV",
+            kinds == "INDEL",
+            structural & tandem_repeat,
+            deletion & long_event,
+            deletion,
+            duplication & long_event,
+            duplication,
+            mobile_insertion,
+            inversion,
+        ],
+        [
+            order[VariantClass.SNV],
+            order[VariantClass.SMALL_INDEL],
+            order[VariantClass.STR_VNTR_REPEAT],
+            order[VariantClass.DELETION_LONG],
+            order[VariantClass.DELETION_SHORT],
+            order[VariantClass.DUPLICATION_LONG],
+            order[VariantClass.DUPLICATION_SHORT],
+            order[VariantClass.INSERTION_MEI],
+            order[VariantClass.INVERSION_BND_COMPLEX],
+        ],
+        default=order[VariantClass.OTHER_COMPLEX_SV],
+    )
+    return classes.astype(np.uint8)
 
 
 # ---------------------------------------------------------------------------
@@ -258,22 +323,28 @@ class ChromosomeLayout:
         return int(self.record_kind.shape[0])
 
 
-def _tile_units(source: HaplotypeSource, rng: np.random.Generator) -> tuple[I64Array, I64Array, NDArray, NDArray]:
+def _tile_units(
+    source: HaplotypeSource, tile: int, rng: np.random.Generator
+) -> tuple[I64Array, I64Array, NDArray, NDArray]:
     """Partition one tile's source variants into units: (start, paths, nested mask, has nested)."""
-    cumulative = _bubble_start_cumulative()[source.class_codes, _maf_bins(source.pooled_frequencies)]
-    complexity_bin = (rng.random(source.variant_count)[:, None] > cumulative).sum(axis=1)
+    first, last = source.tile_range(tile)
+    count = last - first
+    frequencies = source.pooled_frequencies[first:last]
+    cumulative = _bubble_start_cumulative()[source.class_codes[first:last], _maf_bins(frequencies)]
+    complexity_bin = (rng.random(count)[:, None] > cumulative).sum(axis=1)
     complexity_bin = np.minimum(complexity_bin, len(COMPLEXITY_BIN_PATHS) - 1)
     lows = np.array([low for low, _ in COMPLEXITY_BIN_PATHS])[complexity_bin]
     highs = np.array([high for _, high in COMPLEXITY_BIN_PATHS])[complexity_bin]
-    sizes = np.minimum(rng.integers(lows, highs + 1), source.variant_count - np.arange(source.variant_count))
+    sizes = np.minimum(rng.integers(lows, highs + 1), count - np.arange(count))
     starts = []
     cursor = 0
     size_list = sizes.tolist()
-    while cursor < source.variant_count:
+    while cursor < count:
         starts.append(cursor)
         cursor += size_list[cursor]
-    unit_starts = np.array(starts, dtype=np.int64)
-    unit_paths = sizes[unit_starts].astype(np.int64)
+    unit_offsets = np.array(starts, dtype=np.int64)
+    unit_starts = first + unit_offsets
+    unit_paths = sizes[unit_offsets].astype(np.int64)
     has_nested = (unit_paths >= 3) & (rng.random(unit_starts.size) < NESTED_RECORD_PROBABILITY)
     nested_masks = np.zeros(unit_starts.size, dtype=np.uint64)
     nested_units = np.flatnonzero(has_nested)
@@ -314,7 +385,7 @@ def lay_out_chromosome(
     produced = 0
     tile = 0
     while produced < record_count:
-        unit_starts, unit_paths, nested_masks, has_nested = _tile_units(source, rng)
+        unit_starts, unit_paths, nested_masks, has_nested = _tile_units(source, tile, rng)
         records_per_unit = unit_paths + has_nested
         unit_first_record = produced + np.concatenate([[0], np.cumsum(records_per_unit)[:-1]])
         unit_of_record = np.repeat(np.arange(unit_starts.size), records_per_unit)
@@ -350,10 +421,9 @@ def lay_out_chromosome(
     merged["mask"][rows] = 0
     classes = source.class_codes[merged["source"]]
     sv_code = CLASS_LEGEND.index("SV")
-    tandem_repeat = rng.random(record_count) < SV_TANDEM_REPEAT_FRACTION
     noise_class = np.where(
         classes == sv_code,
-        np.where(tandem_repeat, NOISE_CLASSES.index("SV_TR"), NOISE_CLASSES.index("SV_outTR")),
+        np.where(source.tandem_repeat[merged["source"]], NOISE_CLASSES.index("SV_TR"), NOISE_CLASSES.index("SV_outTR")),
         classes,
     ).astype(np.uint8)
     evidence_rate = np.array([READ_EVIDENCE_FRACTION[name] for name in CLASS_LEGEND])[classes]
@@ -508,8 +578,8 @@ class TileMosaic:
     """Donor segments of every cohort haplotype over one tile, in source-variant coordinates.
 
     ``segment_starts[h, k]`` is the first source variant of haplotype h's k-th segment (column 0 is
-    0; padding is past the tile), ``donors`` the source haplotype copied and ``ancestries`` its
-    ancestry index.
+    the tile's first variant; padding is past the tile), ``donors`` the source haplotype copied and
+    ``ancestries`` its ancestry index.
     """
 
     segment_starts: NDArray
@@ -517,26 +587,29 @@ class TileMosaic:
     ancestries: NDArray
 
 
-def draw_tile_mosaic(source: HaplotypeSource, cohort: Cohort, rng: np.random.Generator) -> TileMosaic:
-    """Superpose donor switches (rate 1/L) and ancestry switches (rate T r); redraw ancestry at the latter."""
-    span = float(source.positions[-1] - source.positions[0] + 1)
-    ancestry_rate = ADMIXTURE_GENERATIONS * RECOMBINATION_RATE_PER_BP
-    total_rate = 1.0 / DONOR_SEGMENT_MEAN_BP + ancestry_rate
+def draw_tile_mosaic(source: HaplotypeSource, tile: int, cohort: Cohort, rng: np.random.Generator) -> TileMosaic:
+    """Superpose donor switches (1 per 2 cM) and ancestry switches (T per Morgan); redraw ancestry at the latter."""
+    first, last = source.tile_range(tile)
+    genetic_map = source.genetic_map_cm[first:last]
+    span = float(genetic_map[-1] - genetic_map[0]) + 1e-9
+    ancestry_rate = ADMIXTURE_GENERATIONS / 100.0
+    total_rate = 1.0 / DONOR_SEGMENT_MEAN_CM + ancestry_rate
     expected = span * total_rate
     breakpoint_columns = int(expected + 8 * np.sqrt(expected) + 16)
     haplotype_count = cohort.haplotype_count
-    gaps = rng.exponential(1.0 / total_rate, size=(haplotype_count, breakpoint_columns))
-    breakpoints = np.cumsum(gaps, axis=1)
+    breakpoints = np.cumsum(rng.exponential(1.0 / total_rate, size=(haplotype_count, breakpoint_columns)), axis=1)
     if np.any(breakpoints[:, -1] < span):
         raise RuntimeError("mosaic breakpoint draw did not cover the tile; widen breakpoint_columns.")
     cumulative = np.cumsum(cohort.haplotype_proportions, axis=1)
     columns = breakpoint_columns + 1
-    candidate = (rng.random((haplotype_count, columns))[:, :, None] > cumulative[:, None, :]).sum(axis=2)
-    candidate = np.minimum(candidate, len(ANCESTRIES) - 1)
+    candidate = np.zeros((haplotype_count, columns), dtype=np.int8)
+    uniforms = rng.random((haplotype_count, columns))
+    for ancestry in range(len(ANCESTRIES) - 1):
+        candidate += uniforms > cumulative[:, ancestry : ancestry + 1]
     switches = np.ones((haplotype_count, columns), dtype=bool)
     switches[:, 1:] = rng.random((haplotype_count, breakpoint_columns)) < ancestry_rate / total_rate
     last_switch = np.maximum.accumulate(np.where(switches, np.arange(columns)[None, :], 0), axis=1)
-    ancestries = np.take_along_axis(candidate, last_switch, axis=1).astype(np.int8)
+    ancestries = np.take_along_axis(candidate, last_switch, axis=1)
     pool_members = [np.flatnonzero(source.haplotype_ancestry == index) for index in range(len(ANCESTRIES))]
     pool_sizes = np.array([members.size for members in pool_members])
     pool_offsets = np.concatenate([[0], np.cumsum(pool_sizes)[:-1]])
@@ -544,9 +617,9 @@ def draw_tile_mosaic(source: HaplotypeSource, cohort: Cohort, rng: np.random.Gen
     picks = (rng.random((haplotype_count, columns)) * pool_sizes[ancestries]).astype(np.int64)
     donors = pooled[pool_offsets[ancestries] + picks].astype(np.int32)
     starts = np.empty((haplotype_count, columns + 1), dtype=np.int64)
-    starts[:, 0] = 0
-    starts[:, 1:-1] = np.searchsorted(source.positions, source.positions[0] + breakpoints)
-    starts[:, -1] = source.variant_count + 1
+    starts[:, 0] = first
+    starts[:, 1:-1] = first + np.searchsorted(genetic_map, genetic_map[0] + breakpoints)
+    starts[:, -1] = last + 1
     return TileMosaic(segment_starts=starts, donors=donors, ancestries=ancestries)
 
 
@@ -811,7 +884,7 @@ def _generate_shard(plan: GenerationPlan, chromosome_index: int, shard_index: in
     for block_start, block_stop in block_boundaries(layout, record_start, record_stop, plan.block_records):
         tile = int(layout.tile[block_start])
         if tile != mosaic_tile:
-            mosaic = draw_tile_mosaic(plan.source, plan.cohort, _generator(plan.seed, 1, chromosome_index, tile))
+            mosaic = draw_tile_mosaic(plan.source, tile, plan.cohort, _generator(plan.seed, 1, chromosome_index, tile))
             mosaic_tile = tile
         _, popped_by_half = generate_block(plan, chromosome_index, block_start, block_stop, mosaic)
         for writer, columns, probabilities in zip(writers, statistic_columns, popped_by_half):
@@ -852,6 +925,7 @@ def plan_store(
     chromosome_count: int,
     seed: int,
     block_records: int,
+    codec: Codec,
     shard_rows: int = DEFAULT_SHARD_ROWS,
     inner_rows: int = DEFAULT_INNER_CHUNK_ROWS,
 ) -> GenerationPlan:
@@ -863,12 +937,13 @@ def plan_store(
     cohort = draw_cohort(int(sum(half_sample_counts)), _generator(seed, 0))
     layouts = []
     noise = []
+    digests = []
     for chromosome_index, (chromosome, record_count) in enumerate(zip(chromosomes, record_counts)):
         layout_rng = _generator(seed, 3, chromosome_index)
         layout = lay_out_chromosome(source, record_count, shard_rows, layout_rng)
         layouts.append(layout)
         noise.append({pipeline: noise_parameters(layout, source, pipeline, layout_rng) for pipeline in sorted(set(half_pipelines))})
-        _write_variant_table(root, chromosome, layout, source)
+        digests.append(_write_variant_table(root, chromosome, layout, source))
         for half_index in range(len(half_sample_counts)):
             for name, dtype in STATISTIC_DTYPES.items():
                 create_column(statistic_column_directory(root, half_index, chromosome, name), dtype, record_count).flush()
@@ -878,6 +953,7 @@ def plan_store(
                 dosage_array_directory(root, half_index, chromosome),
                 record_count,
                 sample_count,
+                codec=codec,
                 shard_rows=shard_rows,
                 inner_rows=inner_rows,
             )
@@ -890,11 +966,13 @@ def plan_store(
         chromosomes=chromosomes,
         record_counts=record_counts,
         half_sample_counts=half_sample_counts,
+        chromosome_sites_md5=digests,
         attributes={
             "synthetic": {
                 "generator": "sv_pgs.synthetic_store",
                 "seed": seed,
                 "half_pipelines": list(half_pipelines),
+                "codec": codec,
                 "source_variants": source.variant_count,
                 "source_haplotypes": int(source.haplotypes.shape[1]),
             }
@@ -916,29 +994,44 @@ def plan_store(
     )
 
 
-def _write_variant_table(root: Path, chromosome: str, layout: ChromosomeLayout, source: HaplotypeSource) -> None:
+def _write_variant_table(root: Path, chromosome: str, layout: ChromosomeLayout, source: HaplotypeSource) -> str:
+    """Write the chromosome's variant columns and ids; returns its sites md5.
+
+    Tiles are laid end to end, each shifted past the previous one by its span plus a gap, in
+    both bp and cM.
+    """
+    tile_count = int(layout.tile[-1]) + 1
+    first_rows = np.array([source.tile_range(tile)[0] for tile in range(tile_count)])
+    last_rows = np.array([source.tile_range(tile)[1] - 1 for tile in range(tile_count)])
+    span_bp = source.positions[last_rows] - source.positions[first_rows] + TILE_GAP_BP
+    span_cm = source.genetic_map_cm[last_rows] - source.genetic_map_cm[first_rows] + TILE_GAP_CM
+    offset_bp = np.concatenate([[0], np.cumsum(span_bp)[:-1]])
+    offset_cm = np.concatenate([[0.0], np.cumsum(span_cm)[:-1]])
     source_index = layout.source_index
-    span = int(source.positions[-1] - source.positions[0]) + TILE_GAP_BP
-    positions = layout.tile * span + (source.positions[source_index] - source.positions[0]) + 1
+    tile_first = first_rows[layout.tile]
+    positions = offset_bp[layout.tile] + source.positions[source_index] - source.positions[tile_first] + 1
     if int(positions.max()) >= 2**31:
         raise ValueError(f"{chromosome} spans {int(positions.max())} bp, past int32 positions; use more chromosomes.")
+    genetic_map = offset_cm[layout.tile] + source.genetic_map_cm[source_index] - source.genetic_map_cm[tile_first]
     context = np.zeros(layout.record_count, dtype=np.uint8)
     context[layout.noise_class == NOISE_CLASSES.index("SV_TR")] = SV_CONTEXT_LEGEND.index("tandem_repeat")
     context[layout.noise_class == NOISE_CLASSES.index("SV_outTR")] = SV_CONTEXT_LEGEND.index("outside_tandem_repeat")
     carried_paths = np.where(layout.record_kind == RECORD_NESTED, _popcount(layout.nested_path_mask), 1)
-    alternate_lengths = source.alternate_lengths[source_index]
+    reference_lengths = source.reference_lengths[source_index].astype(np.int32)
+    alternate_lengths = source.alternate_lengths[source_index].astype(np.int32)
     columns: dict[str, tuple[NDArray, dict[str, Any]]] = {
         "pos": (positions.astype(np.int32), {}),
-        "ref_len": (source.reference_lengths[source_index].astype(np.int32), {}),
-        "alt_len": (alternate_lengths.astype(np.int32), {}),
+        "ref_len": (reference_lengths, {}),
+        "alt_len": (alternate_lengths, {}),
+        "cm": (genetic_map, {}),
+        "variant_class": (source.variant_classes[source_index], {"legend": [member.value for member in VARIANT_CLASSES]}),
+        "group_first": (layout.bubble_start, {}),
         "class": (source.class_codes[source_index], {"legend": list(CLASS_LEGEND)}),
         "sv_ctx": (context, {"legend": list(SV_CONTEXT_LEGEND)}),
         "n_paths": (carried_paths.astype(np.uint16), {}),
         "n_paths_total": (layout.bubble_paths.astype(np.uint16), {}),
         "topk_truncated": (layout.bubble_paths > POP_KEPT_PATHS, {}),
-        "bubble_idx": (layout.bubble_start, {}),
         "has_pl": (layout.has_read_evidence, {}),
-        "cm": ((positions / 1e6).astype(np.float32), {}),
         "panel_af": (source.pooled_frequencies[source_index].astype(np.float32), {}),
     }
     for name, (values, attributes) in columns.items():
@@ -951,6 +1044,7 @@ def _write_variant_table(root: Path, chromosome: str, layout: ChromosomeLayout, 
             for record, (position, length) in enumerate(zip(positions.tolist(), alternate_lengths.tolist()))
         ],
     )
+    return sites_md5(positions, reference_lengths, alternate_lengths)
 
 
 def generate_store(plan: GenerationPlan, *, workers: int) -> list[tuple[int, int, float]]:
@@ -972,7 +1066,7 @@ def generate_store(plan: GenerationPlan, *, workers: int) -> list[tuple[int, int
 
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Generate a synthetic svpgs-store v1 from 1kGP haplotype mosaics.")
-    parser.add_argument("--source", type=Path, required=True, help="haplotype source npz (validation-bench build_source.py)")
+    parser.add_argument("--source", type=Path, nargs="+", required=True, help="design-credit src_chr*.npz haplotype sources")
     parser.add_argument("--out", type=Path, required=True)
     parser.add_argument("--half-samples", type=int, nargs="+", required=True)
     parser.add_argument("--half-pipelines", nargs="+", required=True, choices=sorted(PIPELINE_R2_LOSS))
@@ -980,6 +1074,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--chromosomes", type=int, default=len(HG38_AUTOSOME_MEGABASES))
     parser.add_argument("--seed", type=int, required=True)
     parser.add_argument("--block-records", type=int, required=True)
+    parser.add_argument("--codec", choices=("raw", "zstd"), required=True)
     parser.add_argument("--workers", type=int, default=len(os.sched_getaffinity(0)))
     arguments = parser.parse_args(argv)
     started = time.perf_counter()
@@ -993,6 +1088,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         chromosome_count=arguments.chromosomes,
         seed=arguments.seed,
         block_records=arguments.block_records,
+        codec=arguments.codec,
     )
     planned = time.perf_counter()
     timings = generate_store(plan, workers=arguments.workers)

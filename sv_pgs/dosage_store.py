@@ -2,7 +2,8 @@
 
 Layout ("svpgs-store v1", target-format REPORT §2 with addenda A1/A2)::
 
-    MANIFEST.json                        format, chromosomes, records per chromosome, samples per half
+    MANIFEST.json                        format, chromosomes, records per chromosome, samples per
+                                         half, md5 of each chromosome's (pos, ref_len, alt_len)
     dosage/half{h}/{chrom}/              Zarr v3 uint8 [records, samples_h], sharded by record rows
     variants/{chrom}/{column}/           Zarr v3 1-D columns, one row per record
     stats/half{h}/{chrom}/{column}/      exact integer per-record sums over the half's samples
@@ -15,12 +16,18 @@ Kernels work on the signed code ``s = code - 127`` in [-127, 127].  Every |s_i s
 so a sum of cross-products over ``INT32_EXACT_ROWS`` rows fits an int32 accumulator and one over
 ``FLOAT32_EXACT_ROWS`` rows stays an exactly representable fp32 integer.  Standardization is
 affine in s, x = (DS - mean_DS) / sd_DS = (s - mu_s) / sigma_s, with mu_s and sigma_s taken from
-exact integer sums over the training rows only.
+exact integer sums over the training samples only.
 
-Shards hold their inner chunks raw and in row order, so the rows of one shard are one contiguous
-byte range: a range inside a shard is a zero-copy view of the page cache, and any range can be
-read with ``preadv`` straight into a caller buffer (pinned host memory for GPU staging).  Variant
-metadata is columnar; no Python object is built per variant.
+Two inner-chunk codec chains exist, and each array's ``zarr.json`` says which one it uses:
+
+- ``[bytes, zstd(3), crc32c]``, the bucket store.  Each 64-record chunk is an independent zstd
+  frame whose crc32c is verified whenever it is decoded.
+- ``[bytes]``, the local NVMe/RAM cache.  A shard's records are one contiguous byte range, so a
+  range inside a shard is a zero-copy view of the page cache.  Any range can also be read with
+  ``preadv`` straight into a caller buffer, such as pinned host memory for GPU staging.
+
+The shard index is crc32c-checked in both chains.  Variant metadata is columnar; no Python
+object is built per variant.
 """
 
 from __future__ import annotations
@@ -28,18 +35,24 @@ from __future__ import annotations
 from collections import deque
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
+import hashlib
 import json
 import mmap
 import os
 from pathlib import Path
 import resource
 import threading
-from typing import Any, Iterator, Mapping, Sequence
+from typing import Any, Iterable, Iterator, Literal, Mapping, Sequence
 
 import google_crc32c
 import numpy as np
+import zstandard
 
 from sv_pgs._typing import F64Array, I64Array, NDArray, U8Array
+from sv_pgs.bitpacked_loader import _allocate_pinned, _release_pinned
+from sv_pgs.compute_budget import ComputeBudget
+from sv_pgs.config import VariantClass
+from sv_pgs.genotype import _try_import_cupy
 
 STORE_FORMAT = "svpgs-store-v1"
 MANIFEST_FILE = "MANIFEST.json"
@@ -53,7 +66,11 @@ INT32_EXACT_ROWS = (2**31 - 1) // _MAXIMUM_SIGNED_PRODUCT
 FLOAT32_EXACT_ROWS = 2**24 // _MAXIMUM_SIGNED_PRODUCT
 DEFAULT_SHARD_ROWS = 65536
 DEFAULT_INNER_CHUNK_ROWS = 64
-REQUIRED_VARIANT_COLUMNS = ("pos", "ref_len", "alt_len")
+ZSTD_LEVEL = 3
+VARIANT_CLASSES = tuple(VariantClass)
+# On-disk variant columns every store carries; any other column is a prior annotation.
+REQUIRED_VARIANT_COLUMNS = ("pos", "ref_len", "alt_len", "cm", "variant_class", "group_first")
+Codec = Literal["raw", "zstd"]
 
 _ZARR_METADATA_FILE = "zarr.json"
 _UNWRITTEN_CHUNK = np.uint64(2**64 - 1)
@@ -76,6 +93,13 @@ _ZARR_DATA_TYPES = {
     np.dtype(np.float64): "float64",
 }
 _NUMPY_DATA_TYPES = {name: dtype for dtype, name in _ZARR_DATA_TYPES.items()}
+_BYTES_CODEC = {"name": "bytes"}
+_LITTLE_ENDIAN_BYTES_CODEC = {"name": "bytes", "configuration": {"endian": "little"}}
+_CRC32C_CODEC = {"name": "crc32c"}
+_INNER_CODECS: dict[str, list[dict[str, Any]]] = {
+    "raw": [_BYTES_CODEC],
+    "zstd": [_BYTES_CODEC, {"name": "zstd", "configuration": {"level": ZSTD_LEVEL, "checksum": False}}, _CRC32C_CODEC],
+}
 
 
 def encode_dosage_milli(dosage_milli: NDArray) -> U8Array:
@@ -111,6 +135,11 @@ def signed_codes(codes: U8Array, out: NDArray) -> NDArray:
     return out
 
 
+def _reject_missing_codes(codes: U8Array) -> None:
+    if codes.size and int(codes.max()) > MAXIMUM_CODE:
+        raise ValueError(f"code {MISSING_CODE} is the missing-dosage fill value and is never stored.")
+
+
 # ---------------------------------------------------------------------------
 # Zarr v3 containers
 # ---------------------------------------------------------------------------
@@ -118,18 +147,21 @@ def signed_codes(codes: U8Array, out: NDArray) -> NDArray:
 
 @dataclass(frozen=True, slots=True)
 class CodeArrayLayout:
-    """Geometry of one sharded uint8 code array [row_count, sample_count]."""
+    """Geometry and inner-chunk codec of one sharded uint8 code array [row_count, sample_count]."""
 
     row_count: int
     sample_count: int
     shard_rows: int
     inner_rows: int
+    codec: Codec
 
     def __post_init__(self) -> None:
         if self.row_count < 1 or self.sample_count < 1:
             raise ValueError("a code array needs at least one row and one sample.")
         if self.inner_rows < 1 or self.shard_rows % self.inner_rows != 0:
             raise ValueError("shard_rows must be a positive multiple of inner_rows.")
+        if self.codec not in _INNER_CODECS:
+            raise ValueError(f"codec must be one of {sorted(_INNER_CODECS)}.")
 
     @property
     def shard_count(self) -> int:
@@ -153,13 +185,6 @@ class CodeArrayLayout:
     def shard_written_chunks(self, shard_index: int) -> int:
         return -(-self.shard_row_count(shard_index) // self.inner_rows)
 
-    def shard_data_bytes(self, shard_index: int) -> int:
-        return self.shard_written_chunks(shard_index) * self.inner_chunk_bytes
-
-
-def _shard_index_codecs() -> list[dict[str, Any]]:
-    return [{"name": "bytes", "configuration": {"endian": "little"}}, {"name": "crc32c"}]
-
 
 def _code_array_metadata(layout: CodeArrayLayout) -> dict[str, Any]:
     return {
@@ -175,8 +200,8 @@ def _code_array_metadata(layout: CodeArrayLayout) -> dict[str, Any]:
                 "name": "sharding_indexed",
                 "configuration": {
                     "chunk_shape": [layout.inner_rows, layout.sample_count],
-                    "codecs": [{"name": "bytes"}],
-                    "index_codecs": _shard_index_codecs(),
+                    "codecs": _INNER_CODECS[layout.codec],
+                    "index_codecs": [_LITTLE_ENDIAN_BYTES_CODEC, _CRC32C_CODEC],
                     "index_location": "end",
                 },
             }
@@ -215,15 +240,20 @@ def _layout_from_metadata(metadata: Mapping[str, Any], directory: Path) -> CodeA
     sharding = codecs[0]["configuration"]
     inner_shape = sharding["chunk_shape"]
     _require(inner_shape[1] == shape[1], directory, "an inner chunk must span every sample")
-    inner_codecs = sharding["codecs"]
-    _require(len(inner_codecs) == 1 and inner_codecs[0]["name"] == "bytes", directory, "inner chunks must be raw bytes")
-    _require(sharding["index_codecs"] == _shard_index_codecs(), directory, "shard index must be little-endian bytes + crc32c")
+    matching = [name for name, chain in _INNER_CODECS.items() if sharding["codecs"] == chain]
+    _require(len(matching) == 1, directory, f"inner codecs must be one of {list(_INNER_CODECS.values())}")
+    _require(
+        sharding["index_codecs"] == [_LITTLE_ENDIAN_BYTES_CODEC, _CRC32C_CODEC],
+        directory,
+        "shard index must be little-endian bytes + crc32c",
+    )
     _require(sharding["index_location"] == "end", directory, "shard index must sit at the end of the shard")
     return CodeArrayLayout(
         row_count=int(shape[0]),
         sample_count=int(shape[1]),
         shard_rows=int(shard_shape[0]),
         inner_rows=int(inner_shape[0]),
+        codec="raw" if matching[0] == "raw" else "zstd",
     )
 
 
@@ -232,11 +262,14 @@ def create_code_array(
     row_count: int,
     sample_count: int,
     *,
+    codec: Codec,
     shard_rows: int = DEFAULT_SHARD_ROWS,
     inner_rows: int = DEFAULT_INNER_CHUNK_ROWS,
 ) -> CodeArrayLayout:
     """Write the Zarr v3 metadata of an empty code array and return its layout."""
-    layout = CodeArrayLayout(row_count=row_count, sample_count=sample_count, shard_rows=shard_rows, inner_rows=inner_rows)
+    layout = CodeArrayLayout(
+        row_count=row_count, sample_count=sample_count, shard_rows=shard_rows, inner_rows=inner_rows, codec=codec
+    )
     directory.mkdir(parents=True, exist_ok=True)
     (directory / _ZARR_METADATA_FILE).write_text(json.dumps(_code_array_metadata(layout), indent=1))
     return layout
@@ -249,10 +282,10 @@ def _shard_path(directory: Path, shard_index: int) -> Path:
 class CodeShardWriter:
     """Stream the rows of one shard of a code array into its shard file.
 
-    Rows arrive in order; the file is written under a temporary name and renamed into place by
-    ``close`` only after every row, the fill padding of the last inner chunk and the checksummed
-    index are on disk.  Shards are independent files, so separate processes may write separate
-    shards of one array concurrently.
+    Rows arrive in order and are cut into inner chunks; the last one is padded with the fill
+    value.  The file is written under a temporary name and renamed into place by ``close`` only
+    after every chunk and the checksummed index are on disk.  Shards are independent files, so
+    separate processes may write separate shards of one array concurrently.
     """
 
     def __init__(self, directory: Path, layout: CodeArrayLayout, shard_index: int) -> None:
@@ -266,15 +299,39 @@ class CodeShardWriter:
         self._handle = open(self._partial_path, "wb")
         self._rows_expected = layout.shard_row_count(shard_index)
         self._rows_written = 0
+        self._chunk = np.full((layout.inner_rows, layout.sample_count), MISSING_CODE, dtype=np.uint8)
+        self._chunk_rows = 0
+        self._index = np.full((layout.inner_chunks_per_shard, 2), _UNWRITTEN_CHUNK, dtype="<u8")
+        self._chunks_written = 0
+        self._bytes_written = 0
+        self._compressor = zstandard.ZstdCompressor(level=ZSTD_LEVEL)
+
+    def _emit_chunk(self) -> None:
+        payload = self._chunk.tobytes()
+        if self._layout.codec == "zstd":
+            frame = self._compressor.compress(payload)
+            payload = frame + google_crc32c.value(frame).to_bytes(_CRC32C_BYTES, "little")
+        self._handle.write(payload)
+        self._index[self._chunks_written] = (self._bytes_written, len(payload))
+        self._bytes_written += len(payload)
+        self._chunks_written += 1
+        self._chunk.fill(MISSING_CODE)
+        self._chunk_rows = 0
 
     def write_rows(self, codes: U8Array) -> None:
         if codes.dtype != np.uint8 or codes.ndim != 2 or codes.shape[1] != self._layout.sample_count:
             raise ValueError(f"rows must be uint8 [rows, {self._layout.sample_count}]; got {codes.dtype} {codes.shape}.")
         if self._rows_written + codes.shape[0] > self._rows_expected:
             raise ValueError(f"shard {self._shard_index} holds {self._rows_expected} rows; too many written.")
-        if codes.size and int(codes.max()) > MAXIMUM_CODE:
-            raise ValueError(f"code {MISSING_CODE} is the missing-dosage fill value and is never stored.")
-        self._handle.write(np.ascontiguousarray(codes).reshape(-1).data)
+        _reject_missing_codes(codes)
+        cursor = 0
+        while cursor < codes.shape[0]:
+            take = min(self._layout.inner_rows - self._chunk_rows, codes.shape[0] - cursor)
+            self._chunk[self._chunk_rows : self._chunk_rows + take] = codes[cursor : cursor + take]
+            self._chunk_rows += take
+            cursor += take
+            if self._chunk_rows == self._layout.inner_rows:
+                self._emit_chunk()
         self._rows_written += codes.shape[0]
 
     def close(self) -> None:
@@ -282,14 +339,9 @@ class CodeShardWriter:
             raise ValueError(
                 f"shard {self._shard_index} received {self._rows_written} of its {self._rows_expected} rows."
             )
-        layout = self._layout
-        padding_rows = -self._rows_written % layout.inner_rows
-        self._handle.write(bytes([MISSING_CODE]) * (padding_rows * layout.sample_count))
-        written_chunks = layout.shard_written_chunks(self._shard_index)
-        index = np.full((layout.inner_chunks_per_shard, 2), _UNWRITTEN_CHUNK, dtype="<u8")
-        index[:written_chunks, 0] = np.arange(written_chunks, dtype=np.uint64) * np.uint64(layout.inner_chunk_bytes)
-        index[:written_chunks, 1] = layout.inner_chunk_bytes
-        index_bytes = index.tobytes()
+        if self._chunk_rows:
+            self._emit_chunk()
+        index_bytes = self._index.tobytes()
         self._handle.write(index_bytes)
         self._handle.write(google_crc32c.value(index_bytes).to_bytes(_CRC32C_BYTES, "little"))
         self._handle.flush()
@@ -311,17 +363,15 @@ class CodeShardWriter:
 @dataclass(slots=True)
 class _OpenShard:
     descriptor: int
+    chunk_offsets: NDArray
+    chunk_sizes: NDArray
     data_bytes: int
     mapping: mmap.mmap | None = None
 
 
-def _io_vector_limit() -> int:
-    return int(os.sysconf("SC_IOV_MAX"))
-
-
 def _pread_exact(descriptor: int, buffers: list[memoryview], offset: int) -> None:
     """Fill every buffer from ``descriptor`` starting at ``offset``; short reads are resumed."""
-    vector_limit = _io_vector_limit()
+    vector_limit = int(os.sysconf("SC_IOV_MAX"))
     pending = deque(buffer for buffer in buffers if len(buffer))
     while pending:
         batch = [pending[position] for position in range(min(vector_limit, len(pending)))]
@@ -339,6 +389,19 @@ def _pread_exact(descriptor: int, buffers: list[memoryview], offset: int) -> Non
                 read_bytes = 0
 
 
+def _row_buffers(target: U8Array) -> list[memoryview]:
+    return [memoryview(target.reshape(-1))] if target.flags.c_contiguous else [memoryview(row) for row in target]
+
+
+_DECOMPRESSORS = threading.local()
+
+
+def _decompressor() -> zstandard.ZstdDecompressor:
+    if not hasattr(_DECOMPRESSORS, "context"):
+        _DECOMPRESSORS.context = zstandard.ZstdDecompressor()
+    return _DECOMPRESSORS.context
+
+
 class CodeArray:
     """Read access to one sharded uint8 code array written by :class:`CodeShardWriter`."""
 
@@ -353,29 +416,29 @@ class CodeArray:
         path = _shard_path(self.directory, shard_index)
         descriptor = os.open(path, os.O_RDONLY)
         try:
-            data_bytes = layout.shard_data_bytes(shard_index)
-            expected_bytes = data_bytes + layout.shard_index_bytes
-            actual_bytes = os.fstat(descriptor).st_size
-            if actual_bytes != expected_bytes:
-                raise ValueError(f"{path} holds {actual_bytes} bytes; its layout needs {expected_bytes}.")
+            file_bytes = os.fstat(descriptor).st_size
+            data_bytes = file_bytes - layout.shard_index_bytes
             index_bytes = os.pread(descriptor, layout.shard_index_bytes, data_bytes)
             index_body = index_bytes[:-_CRC32C_BYTES]
-            if google_crc32c.value(index_body) != int.from_bytes(index_bytes[-_CRC32C_BYTES:], "little"):
+            if data_bytes < 0 or google_crc32c.value(index_body) != int.from_bytes(index_bytes[-_CRC32C_BYTES:], "little"):
                 raise ValueError(f"{path}: shard index fails its crc32c check.")
             index = np.frombuffer(index_body, dtype="<u8").reshape(layout.inner_chunks_per_shard, 2)
-            written_chunks = layout.shard_written_chunks(shard_index)
-            expected_offsets = np.arange(written_chunks, dtype=np.uint64) * np.uint64(layout.inner_chunk_bytes)
-            contiguous = (
-                np.array_equal(index[:written_chunks, 0], expected_offsets)
-                and bool(np.all(index[:written_chunks, 1] == layout.inner_chunk_bytes))
-                and bool(np.all(index[written_chunks:] == _UNWRITTEN_CHUNK))
-            )
-            if not contiguous:
-                raise ValueError(f"{path}: inner chunks are not stored raw, whole and in row order.")
+            written = layout.shard_written_chunks(shard_index)
+            offsets, sizes = index[:written, 0].astype(np.int64), index[:written, 1].astype(np.int64)
+            if np.any(index[:written] == _UNWRITTEN_CHUNK) or not np.all(index[written:] == _UNWRITTEN_CHUNK):
+                raise ValueError(f"{path}: shard index does not list exactly its {written} written chunks.")
+            if np.any(offsets + sizes > data_bytes):
+                raise ValueError(f"{path}: a shard index entry points past the chunk data.")
+            if layout.codec == "raw" and not (
+                np.array_equal(offsets, np.arange(written) * layout.inner_chunk_bytes)
+                and bool(np.all(sizes == layout.inner_chunk_bytes))
+                and data_bytes == written * layout.inner_chunk_bytes
+            ):
+                raise ValueError(f"{path}: raw inner chunks are not whole and in row order.")
         except BaseException:
             os.close(descriptor)
             raise
-        return _OpenShard(descriptor=descriptor, data_bytes=data_bytes)
+        return _OpenShard(descriptor=descriptor, chunk_offsets=offsets, chunk_sizes=sizes, data_bytes=data_bytes)
 
     def _shard(self, shard_index: int) -> _OpenShard:
         with self._lock:
@@ -397,6 +460,10 @@ class CodeArray:
             yield shard_index, cursor - shard_index * shard_rows, shard_stop - shard_index * shard_rows
             cursor = shard_stop
 
+    def viewable(self, row_start: int, row_stop: int) -> bool:
+        """Whether rows can be returned as a zero-copy view (raw codec, one shard)."""
+        return self.layout.codec == "raw" and len(list(self.shard_pieces(row_start, row_stop))) == 1
+
     def _mapping(self, shard_index: int) -> mmap.mmap:
         shard = self._shard(shard_index)
         with self._lock:
@@ -405,42 +472,61 @@ class CodeArray:
             return shard.mapping
 
     def advise_rows(self, row_start: int, row_stop: int) -> None:
-        """Ask the kernel to start reading rows into the page cache (``MADV_WILLNEED``)."""
+        """Ask the kernel to start reading raw rows into the page cache (``MADV_WILLNEED``)."""
         sample_count = self.layout.sample_count
         for shard_index, local_start, local_stop in self.shard_pieces(row_start, row_stop):
             byte_start = local_start * sample_count // mmap.PAGESIZE * mmap.PAGESIZE
             self._mapping(shard_index).madvise(mmap.MADV_WILLNEED, byte_start, local_stop * sample_count - byte_start)
 
     def view_rows(self, row_start: int, row_stop: int) -> U8Array:
-        """Zero-copy read-only view of rows that lie in a single shard."""
-        pieces = list(self.shard_pieces(row_start, row_stop))
-        if len(pieces) != 1:
-            raise ValueError(f"rows [{row_start}, {row_stop}) span {len(pieces)} shards; a view needs one.")
-        shard_index, local_start, local_stop = pieces[0]
-        mapping = self._mapping(shard_index)
+        """Zero-copy read-only view of raw rows that lie in a single shard."""
+        if not self.viewable(row_start, row_stop):
+            raise ValueError(f"rows [{row_start}, {row_stop}) of {self.directory} cannot be viewed without a copy.")
+        shard_index, local_start, local_stop = next(self.shard_pieces(row_start, row_stop))
         sample_count = self.layout.sample_count
         flat = np.frombuffer(
-            mapping,
+            self._mapping(shard_index),
             dtype=np.uint8,
             count=(local_stop - local_start) * sample_count,
             offset=local_start * sample_count,
         )
         return flat.reshape(local_stop - local_start, sample_count)
 
+    def _decode_chunk(self, shard: _OpenShard, chunk: int) -> U8Array:
+        encoded = bytearray(int(shard.chunk_sizes[chunk]))
+        _pread_exact(shard.descriptor, [memoryview(encoded)], int(shard.chunk_offsets[chunk]))
+        frame = bytes(encoded[:-_CRC32C_BYTES])
+        if google_crc32c.value(frame) != int.from_bytes(encoded[-_CRC32C_BYTES:], "little"):
+            raise ValueError(f"{self.directory}: inner chunk {chunk} fails its crc32c check.")
+        decoded = _decompressor().decompress(frame, max_output_size=self.layout.inner_chunk_bytes)
+        if len(decoded) != self.layout.inner_chunk_bytes:
+            raise ValueError(f"{self.directory}: inner chunk {chunk} decodes to {len(decoded)} bytes.")
+        return np.frombuffer(decoded, dtype=np.uint8).reshape(self.layout.inner_rows, self.layout.sample_count)
+
     def read_rows_into(self, row_start: int, row_stop: int, out: U8Array) -> None:
-        """Fill ``out`` [rows, samples] (each row contiguous, e.g. a column slice) with ``preadv``."""
-        sample_count = self.layout.sample_count
-        if out.shape != (row_stop - row_start, sample_count) or out.dtype != np.uint8 or out.strides[1] != 1:
-            raise ValueError(f"out must be uint8 [{row_stop - row_start}, {sample_count}] with contiguous rows.")
+        """Fill ``out`` [rows, samples] (each row contiguous, e.g. a column slice of a wider array)."""
+        layout = self.layout
+        if out.shape != (row_stop - row_start, layout.sample_count) or out.dtype != np.uint8 or out.strides[1] != 1:
+            raise ValueError(f"out must be uint8 [{row_stop - row_start}, {layout.sample_count}] with contiguous rows.")
         out_row = 0
         for shard_index, local_start, local_stop in self.shard_pieces(row_start, row_stop):
-            target = out[out_row : out_row + local_stop - local_start]
-            if target.flags.c_contiguous:
-                buffers = [memoryview(target.reshape(-1))]
+            shard = self._shard(shard_index)
+            if layout.codec == "raw":
+                target = out[out_row : out_row + local_stop - local_start]
+                _pread_exact(shard.descriptor, _row_buffers(target), local_start * layout.sample_count)
             else:
-                buffers = [memoryview(row) for row in target]
-            _pread_exact(self._shard(shard_index).descriptor, buffers, local_start * sample_count)
+                for chunk in range(local_start // layout.inner_rows, -(-local_stop // layout.inner_rows)):
+                    chunk_start = chunk * layout.inner_rows
+                    first, last = max(local_start, chunk_start), min(local_stop, chunk_start + layout.inner_rows)
+                    decoded = self._decode_chunk(shard, chunk)
+                    out[out_row + first - local_start : out_row + last - local_start] = decoded[
+                        first - chunk_start : last - chunk_start
+                    ]
             out_row += local_stop - local_start
+
+    @property
+    def shard_count(self) -> int:
+        return self.layout.shard_count
 
     def close(self) -> None:
         """Close the shard descriptors; a mapping lives on until its last view is released."""
@@ -459,7 +545,7 @@ def _column_metadata(dtype: np.dtype[Any], length: int, attributes: Mapping[str,
         "chunk_grid": {"name": "regular", "configuration": {"chunk_shape": [length]}},
         "chunk_key_encoding": {"name": "default", "configuration": {"separator": "/"}},
         "fill_value": False if dtype == np.bool_ else 0,
-        "codecs": [{"name": "bytes", "configuration": {"endian": "little"}}],
+        "codecs": [_LITTLE_ENDIAN_BYTES_CODEC],
         "attributes": dict(attributes),
     }
 
@@ -471,15 +557,14 @@ def create_column(
     attributes: Mapping[str, Any] | None = None,
 ) -> np.memmap[Any, Any]:
     """Create a 1-D single-chunk Zarr v3 column and return a writable memmap of its values."""
-    column_dtype = np.dtype(dtype).newbyteorder("<")
-    if column_dtype.newbyteorder("=") not in _ZARR_DATA_TYPES or length < 1:
+    column_dtype = np.dtype(dtype)
+    if column_dtype not in _ZARR_DATA_TYPES or length < 1:
         raise ValueError(f"unsupported column dtype {column_dtype} or length {length}.")
     directory.mkdir(parents=True, exist_ok=True)
-    metadata = _column_metadata(column_dtype.newbyteorder("="), length, attributes or {})
-    (directory / _ZARR_METADATA_FILE).write_text(json.dumps(metadata, indent=1))
+    (directory / _ZARR_METADATA_FILE).write_text(json.dumps(_column_metadata(column_dtype, length, attributes or {}), indent=1))
     chunk_path = directory / "c" / "0"
     chunk_path.parent.mkdir(parents=True, exist_ok=True)
-    return np.memmap(chunk_path, dtype=column_dtype, mode="w+", shape=(length,))
+    return np.memmap(chunk_path, dtype=column_dtype.newbyteorder("<"), mode="w+", shape=(length,))
 
 
 def write_column(directory: Path, values: NDArray, attributes: Mapping[str, Any] | None = None) -> None:
@@ -492,7 +577,7 @@ def open_column(directory: Path, *, writable: bool = False) -> tuple[np.memmap[A
     """Memory-map a column written by :func:`create_column`; return (values, attributes)."""
     metadata = _read_metadata(directory)
     _require(metadata.get("zarr_format") == 3 and len(metadata["shape"]) == 1, directory, "not a 1-D Zarr v3 column")
-    _require(metadata["codecs"] == [{"name": "bytes", "configuration": {"endian": "little"}}], directory, "column must be raw little-endian")
+    _require(metadata["codecs"] == [_LITTLE_ENDIAN_BYTES_CODEC], directory, "column must be raw little-endian")
     length = int(metadata["shape"][0])
     _require(metadata["chunk_grid"]["configuration"]["chunk_shape"] == [length], directory, "column must be one chunk")
     dtype = _NUMPY_DATA_TYPES[metadata["data_type"]].newbyteorder("<")
@@ -501,38 +586,8 @@ def open_column(directory: Path, *, writable: bool = False) -> tuple[np.memmap[A
 
 
 # ---------------------------------------------------------------------------
-# Store: manifest, variant table, statistics sidecar and code reads
+# Manifest, variant table and statistics sidecar
 # ---------------------------------------------------------------------------
-
-
-def write_manifest(
-    root: Path,
-    *,
-    chromosomes: Sequence[str],
-    record_counts: Sequence[int],
-    half_sample_counts: Sequence[int],
-    attributes: Mapping[str, Any] | None = None,
-) -> None:
-    if len(chromosomes) != len(record_counts) or not chromosomes or not half_sample_counts:
-        raise ValueError("a store needs matching chromosome/record lists and at least one half.")
-    if min(record_counts) < 1 or min(half_sample_counts) < 1:
-        raise ValueError("every chromosome needs records and every half needs samples.")
-    manifest = {
-        "format": STORE_FORMAT,
-        "chromosomes": list(chromosomes),
-        "record_counts": [int(count) for count in record_counts],
-        "half_sample_counts": [int(count) for count in half_sample_counts],
-        "attributes": dict(attributes or {}),
-    }
-    root.mkdir(parents=True, exist_ok=True)
-    (root / MANIFEST_FILE).write_text(json.dumps(manifest, indent=1))
-
-
-def read_manifest(root: Path) -> dict[str, Any]:
-    manifest = json.loads((root / MANIFEST_FILE).read_text())
-    if manifest.get("format") != STORE_FORMAT:
-        raise ValueError(f"{root} is not an {STORE_FORMAT} store (format={manifest.get('format')!r}).")
-    return manifest
 
 
 def dosage_array_directory(root: Path, half_index: int, chromosome: str) -> Path:
@@ -547,6 +602,53 @@ def statistic_column_directory(root: Path, half_index: int, chromosome: str, col
     return root / "stats" / f"half{half_index}" / chromosome / column
 
 
+def chromosome_number(chromosome: str) -> int:
+    """Autosome number of a 'chrK' store chromosome."""
+    if not chromosome.startswith("chr") or not chromosome[3:].isdigit() or not 1 <= int(chromosome[3:]) <= 22:
+        raise ValueError(f"store chromosomes are chr1..chr22; got {chromosome!r}.")
+    return int(chromosome[3:])
+
+
+def sites_md5(positions: NDArray, reference_lengths: NDArray, alternate_lengths: NDArray) -> str:
+    """md5 of the little-endian int64 (pos, ref_len, alt_len) triples of one chromosome."""
+    triples = np.stack([np.asarray(values, dtype="<i8") for values in (positions, reference_lengths, alternate_lengths)], axis=1)
+    return hashlib.md5(triples.tobytes()).hexdigest()
+
+
+def write_manifest(
+    root: Path,
+    *,
+    chromosomes: Sequence[str],
+    record_counts: Sequence[int],
+    half_sample_counts: Sequence[int],
+    chromosome_sites_md5: Sequence[str],
+    attributes: Mapping[str, Any] | None = None,
+) -> None:
+    if not chromosomes or not half_sample_counts or not len(chromosomes) == len(record_counts) == len(chromosome_sites_md5):
+        raise ValueError("a store needs matching chromosome, record-count and md5 lists and at least one half.")
+    if min(record_counts) < 1 or min(half_sample_counts) < 1:
+        raise ValueError("every chromosome needs records and every half needs samples.")
+    for chromosome in chromosomes:
+        chromosome_number(chromosome)
+    manifest = {
+        "format": STORE_FORMAT,
+        "chromosomes": list(chromosomes),
+        "record_counts": [int(count) for count in record_counts],
+        "half_sample_counts": [int(count) for count in half_sample_counts],
+        "sites_md5": dict(zip(chromosomes, chromosome_sites_md5)),
+        "attributes": dict(attributes or {}),
+    }
+    root.mkdir(parents=True, exist_ok=True)
+    (root / MANIFEST_FILE).write_text(json.dumps(manifest, indent=1))
+
+
+def read_manifest(root: Path) -> dict[str, Any]:
+    manifest = json.loads((root / MANIFEST_FILE).read_text())
+    if manifest.get("format") != STORE_FORMAT:
+        raise ValueError(f"{root} is not an {STORE_FORMAT} store (format={manifest.get('format')!r}).")
+    return manifest
+
+
 def write_variant_ids(root: Path, chromosome: str, variant_ids: Sequence[str]) -> None:
     encoded = [variant_id.encode() for variant_id in variant_ids]
     offsets = np.zeros(len(encoded) + 1, dtype=np.uint64)
@@ -555,88 +657,136 @@ def write_variant_ids(root: Path, chromosome: str, variant_ids: Sequence[str]) -
     write_column(variant_column_directory(root, chromosome, _ID_OFFSETS_COLUMN), offsets)
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class VariantTable:
-    """Columnar per-record metadata, concatenated over chromosomes in store order.
+    """One row per store record, in store order over all chromosomes; no per-variant objects.
 
-    ``columns`` holds every sidecar column (at least ``REQUIRED_VARIANT_COLUMNS``); categorical
-    columns carry their category names in ``legends``.  Variant IDs stay as one byte buffer plus
-    offsets and are decoded only for the indices asked for.
+    ``variant_class`` indexes ``VARIANT_CLASSES`` (``tuple(VariantClass)``).  ``group_first`` is
+    the first row of the record's unbreakable group (its bubble, same-POS set, duplicate group
+    or TR locus; its own row if none).  ``sum_code``/``sum_code2`` are the sidecar's all-sample
+    code sums over the store's halves, for pre-filtering only.  ``annotations`` holds every
+    other sidecar column: categorical and boolean ones as int32 codes whose names are in
+    ``annotation_legends``, the rest as float64.
     """
 
-    chromosomes: tuple[str, ...]
-    chromosome_starts: I64Array
-    columns: Mapping[str, NDArray]
-    legends: Mapping[str, tuple[str, ...]]
+    chromosome: NDArray
+    position: I64Array
+    genetic_position_cm: F64Array
+    ref_length: NDArray
+    alt_length: NDArray
+    variant_class: U8Array
+    group_first: I64Array
+    sum_code: NDArray
+    sum_code2: NDArray
+    annotations: dict[str, NDArray]
+    annotation_legends: dict[str, tuple[str, ...]]
     id_bytes: U8Array
     id_offsets: I64Array
 
     @property
     def variant_count(self) -> int:
-        return int(self.chromosome_starts[-1])
+        return int(self.position.shape[0])
 
-    def chromosome_indices(self, variant_indices: NDArray) -> I64Array:
-        return np.searchsorted(self.chromosome_starts, np.asarray(variant_indices), side="right").astype(np.int64) - 1
-
-    def variant_ids(self, variant_indices: NDArray) -> list[str]:
+    def variant_ids(self, rows: NDArray) -> list[str]:
         buffer = self.id_bytes.tobytes()
         return [
-            buffer[int(self.id_offsets[index]) : int(self.id_offsets[index + 1])].decode()
-            for index in np.asarray(variant_indices, dtype=np.int64)
+            buffer[int(self.id_offsets[row]) : int(self.id_offsets[row + 1])].decode()
+            for row in np.asarray(rows, dtype=np.int64)
         ]
 
-    @classmethod
-    def read(cls, root: Path, chromosomes: Sequence[str], record_counts: Sequence[int]) -> VariantTable:
-        column_names: list[str] | None = None
-        per_column: dict[str, list[NDArray]] = {}
-        legends: dict[str, tuple[str, ...]] = {}
-        id_bytes: list[NDArray] = []
-        id_offsets: list[NDArray] = []
-        byte_cursor = 0
-        for chromosome, record_count in zip(chromosomes, record_counts):
-            names = sorted(
-                path.name
-                for path in (root / "variants" / chromosome).iterdir()
-                if path.name not in (_ID_BYTES_COLUMN, _ID_OFFSETS_COLUMN)
-            )
-            if column_names is None:
-                missing = sorted(set(REQUIRED_VARIANT_COLUMNS) - set(names))
-                if missing:
-                    raise ValueError(f"variant table for {chromosome} lacks required columns {missing}.")
-                column_names = names
-            elif names != column_names:
-                raise ValueError(f"variant columns of {chromosome} differ from those of {chromosomes[0]}.")
-            for name in names:
-                values, attributes = open_column(variant_column_directory(root, chromosome, name))
+
+def _read_variant_table(root: Path, manifest: Mapping[str, Any], half_indices: Sequence[int]) -> VariantTable:
+    chromosomes = manifest["chromosomes"]
+    record_counts = manifest["record_counts"]
+    reserved = set(REQUIRED_VARIANT_COLUMNS) | {_ID_BYTES_COLUMN, _ID_OFFSETS_COLUMN}
+    annotation_names: list[str] | None = None
+    parts: dict[str, list[NDArray]] = {}
+    legends: dict[str, tuple[str, ...]] = {}
+    chromosome_start = 0
+    byte_start = 0
+    for chromosome, record_count in zip(chromosomes, record_counts):
+        present = sorted(path.name for path in (root / "variants" / chromosome).iterdir())
+        missing = sorted(reserved - set(present))
+        if missing:
+            raise ValueError(f"variant table of {chromosome} lacks required columns {missing}.")
+        names = [name for name in present if name not in reserved]
+        if annotation_names is None:
+            annotation_names = names
+        elif names != annotation_names:
+            raise ValueError(f"annotation columns of {chromosome} differ from those of {chromosomes[0]}.")
+        columns: dict[str, NDArray] = {}
+        for name in [*REQUIRED_VARIANT_COLUMNS, *names]:
+            values, attributes = open_column(variant_column_directory(root, chromosome, name))
+            if values.shape[0] != record_count:
+                raise ValueError(f"variant column {chromosome}/{name} has {values.shape[0]} rows, not {record_count}.")
+            columns[name] = values
+            if name in names and (values.dtype == np.bool_ or "legend" in attributes):
+                legend = tuple(attributes["legend"]) if "legend" in attributes else ("false", "true")
+                if legends.setdefault(name, legend) != legend:
+                    raise ValueError(f"annotation {name} changes its legend at {chromosome}.")
+        if sites_md5(columns["pos"], columns["ref_len"], columns["alt_len"]) != manifest["sites_md5"][chromosome]:
+            raise ValueError(f"{chromosome} sites (pos, ref_len, alt_len) do not match the manifest md5.")
+        if int(columns["variant_class"].max()) >= len(VARIANT_CLASSES):
+            raise ValueError(f"{chromosome} has variant_class codes outside tuple(VariantClass).")
+        group_first = columns["group_first"].astype(np.int64)
+        if np.any(group_first > np.arange(record_count)) or np.any(group_first < 0):
+            raise ValueError(f"{chromosome} group_first must point at or before each row.")
+        ids, _ = open_column(variant_column_directory(root, chromosome, _ID_BYTES_COLUMN))
+        offsets, _ = open_column(variant_column_directory(root, chromosome, _ID_OFFSETS_COLUMN))
+        if offsets.shape[0] != record_count + 1 or int(offsets[-1]) != ids.shape[0]:
+            raise ValueError(f"variant ids of {chromosome} do not match its {record_count} records.")
+        code_sums = []
+        for statistic in ("sum_code", "sum_code2"):
+            total = np.zeros(record_count, dtype=np.uint64)
+            for half in half_indices:
+                values, _ = open_column(statistic_column_directory(root, half, chromosome, statistic))
                 if values.shape[0] != record_count:
-                    raise ValueError(f"variant column {chromosome}/{name} has {values.shape[0]} rows, not {record_count}.")
-                per_column.setdefault(name, []).append(values)
-                if "legend" in attributes:
-                    legend = tuple(attributes["legend"])
-                    if legends.setdefault(name, legend) != legend:
-                        raise ValueError(f"variant column {name} changes its legend at {chromosome}.")
-            chromosome_bytes, _ = open_column(variant_column_directory(root, chromosome, _ID_BYTES_COLUMN))
-            chromosome_offsets, _ = open_column(variant_column_directory(root, chromosome, _ID_OFFSETS_COLUMN))
-            if chromosome_offsets.shape[0] != record_count + 1 or int(chromosome_offsets[-1]) != chromosome_bytes.shape[0]:
-                raise ValueError(f"variant ids of {chromosome} do not match its {record_count} records.")
-            id_bytes.append(chromosome_bytes)
-            id_offsets.append(chromosome_offsets[:-1].astype(np.int64) + byte_cursor)
-            byte_cursor += int(chromosome_bytes.shape[0])
-        id_offsets.append(np.array([byte_cursor], dtype=np.int64))
-        chromosome_starts = np.zeros(len(record_counts) + 1, dtype=np.int64)
-        chromosome_starts[1:] = np.cumsum(record_counts)
-        return cls(
-            chromosomes=tuple(chromosomes),
-            chromosome_starts=chromosome_starts,
-            columns={name: np.concatenate(parts) for name, parts in per_column.items()},
-            legends=legends,
-            id_bytes=np.concatenate(id_bytes),
-            id_offsets=np.concatenate(id_offsets),
-        )
+                    raise ValueError(f"statistic {statistic} of half{half}/{chromosome} has {values.shape[0]} rows.")
+                total += values.astype(np.uint64)
+            code_sums.append(total)
+        chromosome_parts = {
+            "chromosome": np.full(record_count, chromosome_number(chromosome), dtype=np.int8),
+            "position": columns["pos"].astype(np.int64),
+            "genetic_position_cm": columns["cm"].astype(np.float64),
+            "ref_length": columns["ref_len"].astype(np.int32),
+            "alt_length": columns["alt_len"].astype(np.int32),
+            "variant_class": columns["variant_class"].astype(np.uint8),
+            "group_first": group_first + chromosome_start,
+            "sum_code": code_sums[0],
+            "sum_code2": code_sums[1],
+            "id_bytes": np.asarray(ids),
+            "id_offsets": offsets[:-1].astype(np.int64) + byte_start,
+        }
+        for name in names:
+            chromosome_parts["annotation:" + name] = (
+                columns[name].astype(np.int32) if name in legends else columns[name].astype(np.float64)
+            )
+        for name, values in chromosome_parts.items():
+            parts.setdefault(name, []).append(values)
+        chromosome_start += record_count
+        byte_start += int(ids.shape[0])
+    parts["id_offsets"].append(np.array([byte_start], dtype=np.int64))
+    merged = {name: np.concatenate(values) for name, values in parts.items()}
+    return VariantTable(
+        chromosome=merged["chromosome"],
+        position=merged["position"],
+        genetic_position_cm=merged["genetic_position_cm"],
+        ref_length=merged["ref_length"],
+        alt_length=merged["alt_length"],
+        variant_class=merged["variant_class"],
+        group_first=merged["group_first"],
+        sum_code=merged["sum_code"],
+        sum_code2=merged["sum_code2"],
+        annotations={name.split(":", 1)[1]: values for name, values in merged.items() if name.startswith("annotation:")},
+        annotation_legends=legends,
+        id_bytes=merged["id_bytes"],
+        id_offsets=merged["id_offsets"],
+    )
 
 
-def _reader_thread_count() -> int:
-    return len(os.sched_getaffinity(0))
+# ---------------------------------------------------------------------------
+# The store
+# ---------------------------------------------------------------------------
 
 
 def _ensure_open_file_capacity(required_descriptors: int) -> None:
@@ -644,17 +794,34 @@ def _ensure_open_file_capacity(required_descriptors: int) -> None:
     soft_limit, hard_limit = resource.getrlimit(resource.RLIMIT_NOFILE)
     if soft_limit != resource.RLIM_INFINITY and soft_limit < required_descriptors:
         if hard_limit != resource.RLIM_INFINITY and hard_limit < required_descriptors:
-            raise RuntimeError(
-                f"the store needs {required_descriptors} open files but the hard limit is {hard_limit}."
-            )
+            raise RuntimeError(f"the store needs {required_descriptors} open files but the hard limit is {hard_limit}.")
         resource.setrlimit(resource.RLIMIT_NOFILE, (required_descriptors, hard_limit))
+
+
+@dataclass(frozen=True, slots=True)
+class _SampleSelection:
+    """Store columns a read returns: all of them, one contiguous range, or a sorted gather."""
+
+    indices: I64Array
+    contiguous: bool
+    complete: bool
+
+    @classmethod
+    def build(cls, sample_indices: NDArray | None, sample_count: int) -> _SampleSelection:
+        if sample_indices is None:
+            return cls(indices=np.arange(sample_count, dtype=np.int64), contiguous=True, complete=True)
+        indices = np.asarray(sample_indices, dtype=np.int64)
+        if indices.ndim != 1 or indices.size == 0 or np.any(np.diff(indices) <= 0) or indices[0] < 0 or indices[-1] >= sample_count:
+            raise ValueError("sample_indices must be sorted, distinct store columns.")
+        contiguous = bool(indices[-1] - indices[0] + 1 == indices.size)
+        return cls(indices=indices, contiguous=contiguous, complete=contiguous and indices.size == sample_count)
 
 
 class DosageStore:
     """An svpgs-store v1 opened for reading.
 
-    The variant axis concatenates the chromosomes in manifest order; the sample axis concatenates
-    the selected halves (all halves unless ``half_indices`` names a subset).
+    The variant axis concatenates the chromosomes in manifest order and the sample axis the
+    selected halves (all halves unless ``half_indices`` names a subset).
     """
 
     def __init__(self, root: Path, half_indices: Sequence[int] | None = None) -> None:
@@ -668,11 +835,9 @@ class DosageStore:
             raise ValueError(f"half_indices {half_indices} must be distinct indices below {len(all_half_counts)}.")
         self.half_indices = selected
         self.manifest_attributes: dict[str, Any] = manifest["attributes"]
-        self.chromosome_starts = np.zeros(len(self.chromosomes) + 1, dtype=np.int64)
-        self.chromosome_starts[1:] = np.cumsum(self.record_counts)
+        self.chromosome_starts = np.concatenate([[0], np.cumsum(self.record_counts)]).astype(np.int64)
         half_counts = [all_half_counts[half] for half in selected]
-        self.half_sample_starts = np.zeros(len(selected) + 1, dtype=np.int64)
-        self.half_sample_starts[1:] = np.cumsum(half_counts)
+        self.half_sample_starts = np.concatenate([[0], np.cumsum(half_counts)]).astype(np.int64)
         self._arrays: list[list[CodeArray]] = []
         for half, sample_count in zip(selected, half_counts):
             arrays = [CodeArray(dosage_array_directory(self.root, half, chromosome)) for chromosome in self.chromosomes]
@@ -680,135 +845,203 @@ class DosageStore:
                 if (array.layout.row_count, array.layout.sample_count) != (record_count, sample_count):
                     raise ValueError(f"{array.directory} does not match the manifest's {record_count} x {sample_count}.")
             self._arrays.append(arrays)
-        shard_total = sum(array.layout.shard_count for arrays in self._arrays for array in arrays)
-        _ensure_open_file_capacity(2 * shard_total + 256)
-        self.variants = VariantTable.read(self.root, self.chromosomes, self.record_counts)
-        self._pool = ThreadPoolExecutor(max_workers=_reader_thread_count(), thread_name_prefix="dosage-store")
+        _ensure_open_file_capacity(2 * sum(array.shard_count for arrays in self._arrays for array in arrays) + 256)
+        self.variant_table = _read_variant_table(self.root, manifest, selected)
+        self.reader_threads = len(os.sched_getaffinity(0))
+        self._pool = ThreadPoolExecutor(max_workers=self.reader_threads, thread_name_prefix="dosage-store")
+
+    @classmethod
+    def open(cls, path: str | Path, half_indices: Sequence[int] | None = None) -> DosageStore:
+        return cls(Path(path), half_indices)
 
     @property
-    def variant_count(self) -> int:
+    def n_variants(self) -> int:
         return int(self.chromosome_starts[-1])
 
     @property
-    def sample_count(self) -> int:
+    def n_samples(self) -> int:
         return int(self.half_sample_starts[-1])
 
-    def statistic(self, name: str) -> NDArray:
-        """Per-record sidecar statistic summed over the selected halves, in store variant order."""
+    def statistic(self, name: str) -> I64Array:
+        """A per-record integer sidecar statistic summed over the store's halves, in store order."""
         per_chromosome = []
         for chromosome, record_count in zip(self.chromosomes, self.record_counts):
-            total: NDArray | None = None
+            total = np.zeros(record_count, dtype=np.int64)
             for half in self.half_indices:
                 values, _ = open_column(statistic_column_directory(self.root, half, chromosome, name))
-                if values.shape[0] != record_count:
-                    raise ValueError(f"statistic {name} of half{half}/{chromosome} has {values.shape[0]} rows.")
-                total = values.astype(np.int64) if total is None else total + values.astype(np.int64)
+                total += values.astype(np.int64)
             per_chromosome.append(total)
         return np.concatenate(per_chromosome)
 
-    def _chromosome_pieces(self, variant_start: int, variant_stop: int) -> Iterator[tuple[int, int, int, int]]:
-        """Yield (chromosome_index, local_start, local_stop, out_row) covering a global variant range."""
-        if not 0 <= variant_start <= variant_stop <= self.variant_count:
-            raise IndexError(f"variants [{variant_start}, {variant_stop}) fall outside [0, {self.variant_count}).")
-        cursor = variant_start
-        while cursor < variant_stop:
+    def _chromosome_pieces(self, start: int, stop: int) -> Iterator[tuple[int, int, int, int]]:
+        """Yield (chromosome_index, local_start, local_stop, out_row) covering a global row range."""
+        if not 0 <= start <= stop <= self.n_variants:
+            raise IndexError(f"rows [{start}, {stop}) fall outside [0, {self.n_variants}).")
+        cursor = start
+        while cursor < stop:
             chromosome = int(np.searchsorted(self.chromosome_starts, cursor, side="right")) - 1
             chromosome_start = int(self.chromosome_starts[chromosome])
-            piece_stop = min(variant_stop, int(self.chromosome_starts[chromosome + 1]))
-            yield chromosome, cursor - chromosome_start, piece_stop - chromosome_start, cursor - variant_start
+            piece_stop = min(stop, int(self.chromosome_starts[chromosome + 1]))
+            yield chromosome, cursor - chromosome_start, piece_stop - chromosome_start, cursor - start
             cursor = piece_stop
 
-    def codes(self, variant_start: int, variant_stop: int, out: U8Array) -> U8Array:
-        """Codes [variants, samples] for a variant range.
+    def _viewable(self, start: int, stop: int, selection: _SampleSelection) -> bool:
+        if not selection.complete or len(self._arrays) != 1:
+            return False
+        pieces = list(self._chromosome_pieces(start, stop))
+        return len(pieces) == 1 and self._arrays[0][pieces[0][0]].viewable(pieces[0][1], pieces[0][2])
 
-        The result is a zero-copy view of the shard's page cache when the store has one half and
-        the range sits in one shard; otherwise ``out`` (at least that many rows) is filled and its
-        leading rows are returned.  Both hold identical bytes.
-        """
-        if len(self._arrays) == 1:
-            pieces = list(self._chromosome_pieces(variant_start, variant_stop))
-            if len(pieces) == 1:
-                chromosome, local_start, local_stop, _ = pieces[0]
-                array = self._arrays[0][chromosome]
-                if len(list(array.shard_pieces(local_start, local_stop))) == 1:
-                    return array.view_rows(local_start, local_stop)
-        return self.read_codes_into(variant_start, variant_stop, out)
-
-    def advise_codes(self, variant_start: int, variant_stop: int) -> None:
-        """Start asynchronous page-cache read-ahead of a variant range in every selected half."""
-        for chromosome, local_start, local_stop, _ in self._chromosome_pieces(variant_start, variant_stop):
-            for arrays in self._arrays:
-                arrays[chromosome].advise_rows(local_start, local_stop)
-
-    def iter_code_views(
+    def _fill_piece(
         self,
-        variant_ranges: Sequence[tuple[int, int]],
-        spare: U8Array,
-    ) -> Iterator[tuple[int, int, U8Array]]:
-        """Yield :meth:`codes` for each range, advising the kernel to read the next range ahead.
+        array: CodeArray,
+        local_start: int,
+        local_stop: int,
+        half_columns: I64Array,
+        destination: U8Array,
+    ) -> None:
+        """Read rows of one half into ``destination``, taking ``half_columns`` of that half."""
+        if half_columns.size == array.layout.sample_count:
+            array.read_rows_into(local_start, local_stop, destination)
+            return
+        full = np.empty((local_stop - local_start, array.layout.sample_count), dtype=np.uint8)
+        array.read_rows_into(local_start, local_stop, full)
+        if half_columns[-1] - half_columns[0] + 1 == half_columns.size:
+            destination[...] = full[:, half_columns[0] : half_columns[-1] + 1]
+        else:
+            # The columns were validated by _SampleSelection, so "clip" never clips; it only
+            # lets take write straight into the strided destination without buffering.
+            np.take(full, half_columns, axis=1, out=destination, mode="clip")
 
-        This is the large-RAM path: blocks are page-cache views wherever :meth:`codes` can give one,
-        and ``spare`` receives only the ranges that cannot be viewed.
-        """
-        for position, (start, stop) in enumerate(variant_ranges):
-            if position + 1 < len(variant_ranges):
-                self.advise_codes(*variant_ranges[position + 1])
-            yield start, stop, self.codes(start, stop, spare)
-
-    def read_codes_into(self, variant_start: int, variant_stop: int, out: U8Array) -> U8Array:
-        """Fill ``out[:rows]`` with the codes of a variant range using parallel ``preadv`` reads."""
-        rows = variant_stop - variant_start
-        if out.dtype != np.uint8 or out.ndim != 2 or out.shape[0] < rows or out.shape[1] != self.sample_count:
-            raise ValueError(f"out must be uint8 [>= {rows}, {self.sample_count}].")
-        target = out[:rows]
+    def _read_into(self, start: int, stop: int, selection: _SampleSelection, out: U8Array) -> None:
         tasks = []
-        for chromosome, local_start, local_stop, out_row in self._chromosome_pieces(variant_start, variant_stop):
-            for half_position, arrays in enumerate(self._arrays):
-                column_start = int(self.half_sample_starts[half_position])
-                column_stop = int(self.half_sample_starts[half_position + 1])
+        output_column = 0
+        for half_position, arrays in enumerate(self._arrays):
+            half_start = int(self.half_sample_starts[half_position])
+            half_stop = int(self.half_sample_starts[half_position + 1])
+            lower, upper = np.searchsorted(selection.indices, [half_start, half_stop])
+            if lower == upper:
+                continue
+            half_columns = selection.indices[lower:upper] - half_start
+            output_columns = slice(output_column, output_column + int(upper - lower))
+            output_column += int(upper - lower)
+            for chromosome, local_start, local_stop, out_row in self._chromosome_pieces(start, stop):
                 array = arrays[chromosome]
-                step = max(array.layout.inner_rows, -(-(local_stop - local_start) // _reader_thread_count()))
-                for piece_start in range(local_start, local_stop, step):
-                    piece_stop = min(local_stop, piece_start + step)
-                    destination = target[
-                        out_row + piece_start - local_start : out_row + piece_stop - local_start,
-                        column_start:column_stop,
-                    ]
-                    tasks.append(self._pool.submit(array.read_rows_into, piece_start, piece_stop, destination))
+                inner_rows = array.layout.inner_rows
+                step = -(-max(inner_rows, -(-(local_stop - local_start) // self.reader_threads)) // inner_rows) * inner_rows
+                cuts = [local_start, *range((local_start // step + 1) * step, local_stop, step), local_stop]
+                for piece_start, piece_stop in zip(cuts[:-1], cuts[1:]):
+                    rows = slice(out_row + piece_start - local_start, out_row + piece_stop - local_start)
+                    tasks.append(
+                        self._pool.submit(self._fill_piece, array, piece_start, piece_stop, half_columns, out[rows, output_columns])
+                    )
         for task in tasks:
             task.result()
-        return target
 
-    def iter_code_blocks(
+    def read_codes(
         self,
-        variant_ranges: Sequence[tuple[int, int]],
-        buffers: Sequence[U8Array],
-    ) -> Iterator[tuple[int, int, U8Array]]:
-        """Stream variant ranges through a ring of caller buffers, reading ahead in the background.
+        start: int,
+        stop: int,
+        sample_indices: NDArray | None = None,
+        out: U8Array | None = None,
+    ) -> U8Array:
+        """Codes [stop - start, selected samples], C-contiguous.
 
-        With k buffers, up to k - 1 ranges are read while the caller works on the current one.  A
-        yielded block stays valid until the caller asks for the next block.
+        With every sample selected, no ``out``, one half and a raw range inside one shard, the
+        result is a zero-copy view of the page cache.  Otherwise the codes are read (in parallel)
+        into ``out``, or into a new array.
         """
-        if len(buffers) < 2:
-            raise ValueError("read-ahead needs at least two buffers.")
+        selection = _SampleSelection.build(sample_indices, self.n_samples)
+        rows = stop - start
+        if out is None:
+            if self._viewable(start, stop, selection):
+                pieces = next(self._chromosome_pieces(start, stop))
+                return self._arrays[0][pieces[0]].view_rows(pieces[1], pieces[2])
+            out = np.empty((rows, selection.indices.size), dtype=np.uint8)
+        if out.dtype != np.uint8 or out.shape != (rows, selection.indices.size) or not out.flags.c_contiguous:
+            raise ValueError(f"out must be C-contiguous uint8 [{rows}, {selection.indices.size}].")
+        self._read_into(start, stop, selection, out)
+        return out
+
+    def advise(self, start: int, stop: int) -> None:
+        """Start asynchronous page-cache read-ahead of a raw row range in every selected half."""
+        for chromosome, local_start, local_stop, _ in self._chromosome_pieces(start, stop):
+            for arrays in self._arrays:
+                if arrays[chromosome].layout.codec == "raw":
+                    arrays[chromosome].advise_rows(local_start, local_stop)
+
+    def iter_codes(
+        self,
+        row_ranges: Sequence[tuple[int, int]],
+        sample_indices: NDArray | None,
+        budget: ComputeBudget,
+    ) -> Iterator[tuple[int, int, U8Array]]:
+        """Yield (start, stop, codes) for each range in order, reading ahead in the background.
+
+        On a CPU budget with every sample of a one-half raw store selected, this is the large-RAM
+        path: each range is a zero-copy page-cache view where it sits inside one shard (else it
+        is read into one spare buffer), and the next range is advised for read-ahead.  Every other
+        case streams through a ring of buffers filled by a background reader.  The ring is
+        pinned host memory on a CUDA budget, and 2 to 3 buffers deep, as ``budget.host_bytes``
+        allows.  A yielded block stays valid until the caller asks for the next one.
+        """
+        selection = _SampleSelection.build(sample_indices, self.n_samples)
+        ranges = [(int(start), int(stop)) for start, stop in row_ranges]
+        if not ranges:
+            return
+        raw_arrays = all(array.layout.codec == "raw" for arrays in self._arrays for array in arrays)
+        if budget.device_kind == "cpu" and selection.complete and len(self._arrays) == 1 and raw_arrays:
+            spare = np.empty(0, dtype=np.uint8)
+            for position, (start, stop) in enumerate(ranges):
+                if position + 1 < len(ranges):
+                    self.advise(*ranges[position + 1])
+                if self._viewable(start, stop, selection):
+                    yield start, stop, self.read_codes(start, stop)
+                    continue
+                if spare.size < (stop - start) * self.n_samples:
+                    spare = np.empty((stop - start) * self.n_samples, dtype=np.uint8)
+                yield start, stop, self.read_codes(start, stop, None, spare[: (stop - start) * self.n_samples].reshape(stop - start, -1))
+            return
+        widest = max(stop - start for start, stop in ranges)
+        buffer_bytes = widest * selection.indices.size
+        depth = min(3, budget.host_bytes // max(buffer_bytes, 1))
+        if depth < 2:
+            raise MemoryError(f"double-buffering {widest}-row blocks needs {2 * buffer_bytes} host bytes.")
+        ring, pinned = self._ring(depth, buffer_bytes, budget)
         prefetch = ThreadPoolExecutor(max_workers=1, thread_name_prefix="dosage-store-prefetch")
-        in_flight: deque[Future[U8Array]] = deque()
+        in_flight: deque[Future[None]] = deque()
+
+        def submit(position: int) -> None:
+            start, stop = ranges[position]
+            target = ring[position % depth][: (stop - start) * selection.indices.size].reshape(stop - start, -1)
+            in_flight.append(prefetch.submit(self._read_into, start, stop, selection, target))
+
         try:
-            for position, (start, stop) in enumerate(variant_ranges[: len(buffers) - 1]):
-                in_flight.append(prefetch.submit(self.read_codes_into, start, stop, buffers[position]))
-            for position, (start, stop) in enumerate(variant_ranges):
-                block = in_flight.popleft().result()
-                yield start, stop, block
-                upcoming = position + len(buffers) - 1
-                if upcoming < len(variant_ranges):
-                    next_start, next_stop = variant_ranges[upcoming]
-                    in_flight.append(
-                        prefetch.submit(self.read_codes_into, next_start, next_stop, buffers[upcoming % len(buffers)])
-                    )
+            for position in range(min(depth - 1, len(ranges))):
+                submit(position)
+            for position, (start, stop) in enumerate(ranges):
+                in_flight.popleft().result()
+                if position + depth - 1 < len(ranges):
+                    submit(position + depth - 1)
+                yield start, stop, ring[position % depth][: (stop - start) * selection.indices.size].reshape(stop - start, -1)
         finally:
             for pending in in_flight:
                 pending.cancel()
             prefetch.shutdown(wait=True)
+            for owner in pinned:
+                _release_pinned(owner)
+
+    def _ring(self, depth: int, buffer_bytes: int, budget: ComputeBudget) -> tuple[list[U8Array], list[Any]]:
+        if budget.device_kind == "cpu":
+            return [np.empty(buffer_bytes, dtype=np.uint8) for _ in range(depth)], []
+        cupy = _try_import_cupy()
+        if cupy is None:
+            raise RuntimeError("a CUDA budget needs CuPy to pin the dosage staging buffers.")
+        owners, buffers = [], []
+        for _ in range(depth):
+            owner, view = _allocate_pinned(cupy, buffer_bytes)
+            owners.append(owner)
+            buffers.append(view[:buffer_bytes])
+        return buffers, owners
 
     def close(self) -> None:
         self._pool.shutdown(wait=True)
@@ -823,31 +1056,116 @@ class DosageStore:
         self.close()
 
 
+def write_dosage_store(
+    path: str | Path,
+    n_samples: int,
+    variant_table: VariantTable,
+    code_blocks: Iterable[U8Array],
+    *,
+    codec: Codec,
+    shard_rows: int = DEFAULT_SHARD_ROWS,
+    inner_rows: int = DEFAULT_INNER_CHUNK_ROWS,
+) -> None:
+    """Write a one-half store from code blocks [rows, n_samples] that arrive in store order.
+
+    The sidecar code sums are computed from the blocks and must equal the table's
+    ``sum_code``/``sum_code2``.
+    """
+    root = Path(path)
+    table = variant_table
+    boundaries = np.flatnonzero(np.diff(table.chromosome.astype(np.int64))) + 1
+    starts = np.concatenate([[0], boundaries]).astype(np.int64)
+    stops = np.concatenate([boundaries, [table.variant_count]]).astype(np.int64)
+    if np.any(np.diff(table.chromosome[starts].astype(np.int64)) <= 0):
+        raise ValueError("variant_table rows must be grouped by ascending chromosome.")
+    chromosomes = [f"chr{int(table.chromosome[start])}" for start in starts]
+    code_sums = np.zeros(table.variant_count, dtype=np.uint64)
+    square_sums = np.zeros(table.variant_count, dtype=np.uint64)
+    blocks = iter(code_blocks)
+    pending = np.empty((0, n_samples), dtype=np.uint8)
+    for chromosome, chromosome_start, chromosome_stop in zip(chromosomes, starts.tolist(), stops.tolist()):
+        record_count = chromosome_stop - chromosome_start
+        rows = slice(chromosome_start, chromosome_stop)
+        for name, values, attributes in (
+            ("pos", table.position[rows], {}),
+            ("ref_len", table.ref_length[rows].astype(np.int32), {}),
+            ("alt_len", table.alt_length[rows].astype(np.int32), {}),
+            ("cm", table.genetic_position_cm[rows], {}),
+            ("variant_class", table.variant_class[rows], {"legend": [variant_class.value for variant_class in VARIANT_CLASSES]}),
+            ("group_first", table.group_first[rows] - chromosome_start, {}),
+        ):
+            write_column(variant_column_directory(root, chromosome, name), values, attributes)
+        for name, values in table.annotations.items():
+            legend = table.annotation_legends.get(name)
+            write_column(
+                variant_column_directory(root, chromosome, name),
+                values[rows],
+                {} if legend is None else {"legend": list(legend)},
+            )
+        write_variant_ids(root, chromosome, table.variant_ids(np.arange(chromosome_start, chromosome_stop)))
+        directory = dosage_array_directory(root, 0, chromosome)
+        layout = create_code_array(directory, record_count, n_samples, codec=codec, shard_rows=shard_rows, inner_rows=inner_rows)
+        written = 0
+        for shard_index in range(layout.shard_count):
+            with CodeShardWriter(directory, layout, shard_index) as writer:
+                remaining = layout.shard_row_count(shard_index)
+                while remaining:
+                    if pending.shape[0] == 0:
+                        block = next(blocks, None)
+                        if block is None:
+                            raise ValueError("code_blocks hold fewer rows than the variant table.")
+                        pending = block
+                    take = min(remaining, pending.shape[0])
+                    writer.write_rows(pending[:take])
+                    wide = pending[:take].astype(np.uint64)
+                    code_sums[chromosome_start + written : chromosome_start + written + take] = wide.sum(axis=1)
+                    square_sums[chromosome_start + written : chromosome_start + written + take] = (wide * wide).sum(axis=1)
+                    pending = pending[take:]
+                    written += take
+                    remaining -= take
+        write_column(statistic_column_directory(root, 0, chromosome, "sum_code"), code_sums[rows])
+        write_column(statistic_column_directory(root, 0, chromosome, "sum_code2"), square_sums[rows])
+    if pending.shape[0] or next(blocks, None) is not None:
+        raise ValueError("code_blocks hold more rows than the variant table.")
+    if not (np.array_equal(code_sums, table.sum_code) and np.array_equal(square_sums, table.sum_code2)):
+        raise ValueError("the variant table's sum_code/sum_code2 disagree with the code blocks.")
+    write_manifest(
+        root,
+        chromosomes=chromosomes,
+        record_counts=(stops - starts).tolist(),
+        half_sample_counts=[n_samples],
+        chromosome_sites_md5=[
+            sites_md5(table.position[start:stop], table.ref_length[start:stop], table.alt_length[start:stop])
+            for start, stop in zip(starts.tolist(), stops.tolist())
+        ],
+    )
+
+
 # ---------------------------------------------------------------------------
-# Exact training-row moments and the standardized design they define
+# Exact training-sample moments and the standardized design they define
 # ---------------------------------------------------------------------------
 
 
 @dataclass(frozen=True, slots=True)
 class SignedCodeMoments:
-    """Exact per-variant sums of s and s**2 (s = code - 127) over a row set."""
+    """Exact per-variant sums of s and s**2 (s = code - 127) over a sample set."""
 
-    row_count: int
+    sample_count: int
     signed_sums: I64Array
     signed_square_sums: I64Array
 
     @property
     def scaled_variances(self) -> I64Array:
-        """row_count**2 times the population variance of s, an exact integer."""
-        return self.row_count * self.signed_square_sums - self.signed_sums * self.signed_sums
+        """sample_count**2 times the population variance of s, an exact integer."""
+        return self.sample_count * self.signed_square_sums - self.signed_sums * self.signed_sums
 
     @property
     def means(self) -> F64Array:
-        return self.signed_sums / self.row_count
+        return self.signed_sums / self.sample_count
 
     @property
     def scales(self) -> F64Array:
-        return np.sqrt(self.scaled_variances.astype(np.float64)) / self.row_count
+        return np.sqrt(self.scaled_variances.astype(np.float64)) / self.sample_count
 
     @property
     def dosage_means(self) -> F64Array:
@@ -865,70 +1183,67 @@ def _code_sums(codes: U8Array) -> tuple[I64Array, I64Array]:
     return np.add.reduce(codes, axis=1, dtype=np.int64), np.add.reduce(squares, axis=1, dtype=np.int64)
 
 
-def _validated_rows(rows: NDArray, sample_count: int) -> I64Array:
-    values = np.asarray(rows, dtype=np.int64)
-    if values.ndim != 1 or values.size == 0 or np.any(np.diff(values) <= 0) or values[0] < 0 or values[-1] >= sample_count:
-        raise ValueError("rows must be sorted, distinct sample indices of the store.")
-    return values
+def _block_ranges(start: int, stop: int, bytes_per_row: int, budget_bytes: int) -> list[tuple[int, int]]:
+    """Contiguous row ranges whose working set, at ``bytes_per_row``, fits ``budget_bytes``."""
+    rows = max(1, budget_bytes // max(bytes_per_row, 1))
+    return [(block_start, min(stop, block_start + rows)) for block_start in range(start, stop, rows)]
 
 
 def signed_code_moments(
     store: DosageStore,
-    variant_start: int,
-    variant_stop: int,
-    training_rows: I64Array,
-    *,
-    block_rows: int,
+    start: int,
+    stop: int,
+    sample_indices: NDArray,
+    budget: ComputeBudget,
 ) -> SignedCodeMoments:
-    """Exact moments of s over ``training_rows`` (sorted, distinct sample indices) in one pass.
+    """Exact moments of s over ``sample_indices`` (sorted store columns), in one pass.
 
-    The same pass sums every sample's codes and compares them with the sidecar's ``sum_code`` and
-    ``sum_code2``; any difference means the dosage bytes do not match the converter's record and
-    raises.
+    The same pass sums every sample's codes and compares them with the sidecar's ``sum_code``
+    and ``sum_code2``; any difference means the dosage bytes do not match the converter's
+    record, and raises.  The smaller of the selected and unselected sets is gathered, the other
+    obtained by subtraction.
     """
-    rows = _validated_rows(training_rows, store.sample_count)
-    use_complement = rows.size > store.sample_count // 2
-    gathered = np.setdiff1d(np.arange(store.sample_count), rows) if use_complement else rows
-    expected_sums = store.statistic("sum_code")[variant_start:variant_stop]
-    expected_squares = store.statistic("sum_code2")[variant_start:variant_stop]
-    variant_count = variant_stop - variant_start
-    code_sums = np.empty(variant_count, dtype=np.int64)
-    square_sums = np.empty(variant_count, dtype=np.int64)
-    ranges = [(start, min(variant_stop, start + block_rows)) for start in range(variant_start, variant_stop, block_rows)]
-    buffers = [np.empty((block_rows, store.sample_count), dtype=np.uint8) for _ in range(2)]
-    for start, stop, block in store.iter_code_blocks(ranges, buffers):
-        local = slice(start - variant_start, stop - variant_start)
+    selection = _SampleSelection.build(sample_indices, store.n_samples)
+    use_complement = selection.indices.size > store.n_samples // 2
+    gathered = np.setdiff1d(np.arange(store.n_samples), selection.indices) if use_complement else selection.indices
+    expected_sums = store.variant_table.sum_code[start:stop].astype(np.int64)
+    expected_squares = store.variant_table.sum_code2[start:stop].astype(np.int64)
+    code_sums = np.empty(stop - start, dtype=np.int64)
+    square_sums = np.empty(stop - start, dtype=np.int64)
+    ranges = _block_ranges(start, stop, 8 * store.n_samples, budget.host_bytes // 8)
+    for block_start, block_stop, block in store.iter_codes(ranges, None, budget):
+        local = slice(block_start - start, block_stop - start)
         all_sums, all_squares = _code_sums(block)
         mismatched = np.flatnonzero((all_sums != expected_sums[local]) | (all_squares != expected_squares[local]))
         if mismatched.size:
             raise ValueError(
-                f"{mismatched.size} variants starting at {start + int(mismatched[0])} disagree with the sidecar code sums."
+                f"{mismatched.size} variants from row {block_start + int(mismatched[0])} disagree with the sidecar code sums."
             )
         gathered_sums, gathered_squares = _code_sums(block[:, gathered])
         code_sums[local] = all_sums - gathered_sums if use_complement else gathered_sums
         square_sums[local] = all_squares - gathered_squares if use_complement else gathered_squares
-    row_count = int(rows.size)
+    count = int(selection.indices.size)
     return SignedCodeMoments(
-        row_count=row_count,
-        signed_sums=code_sums - SIGNED_CODE_OFFSET * row_count,
-        signed_square_sums=square_sums - 2 * SIGNED_CODE_OFFSET * code_sums + _MAXIMUM_SIGNED_PRODUCT * row_count,
+        sample_count=count,
+        signed_sums=code_sums - SIGNED_CODE_OFFSET * count,
+        signed_square_sums=square_sums - 2 * SIGNED_CODE_OFFSET * code_sums + _MAXIMUM_SIGNED_PRODUCT * count,
     )
 
 
 def exact_signed_gram(signed: NDArray) -> I64Array:
-    """Exact S S^T for signed codes S [variants, rows] via fp32 GEMMs over ``FLOAT32_EXACT_ROWS`` rows.
+    """Exact S S^T for signed codes S [variants, samples] via fp32 GEMMs over ``FLOAT32_EXACT_ROWS`` samples.
 
     Each chunk's partial sums are integers of magnitude <= FLOAT32_EXACT_ROWS * 127**2 < 2**24, so
     every fp32 product-sum is exact whatever order BLAS adds in; chunks accumulate in float64,
     exact below 2**53.
     """
-    variant_count, row_count = signed.shape
+    variant_count, sample_count = signed.shape
     total = np.zeros((variant_count, variant_count), dtype=np.float64)
     chunk = np.empty((variant_count, FLOAT32_EXACT_ROWS), dtype=np.float32)
-    for row_start in range(0, row_count, FLOAT32_EXACT_ROWS):
-        width = min(FLOAT32_EXACT_ROWS, row_count - row_start)
+    for sample_start in range(0, sample_count, FLOAT32_EXACT_ROWS):
+        width = min(FLOAT32_EXACT_ROWS, sample_count - sample_start)
         view = chunk[:, :width]
-        view[...] = signed[:, row_start : row_start + width]
+        view[...] = signed[:, sample_start : sample_start + width]
         total += view @ view.T
     return total.astype(np.int64)
 
@@ -936,108 +1251,98 @@ def exact_signed_gram(signed: NDArray) -> I64Array:
 class QuantizedDosageMatrix:
     """Standardized design over a store: rows are samples, columns a contiguous variant range.
 
-    Column j is x_j = (s_j - mu_j) / sigma_j with training-row moments, evaluated on ``rows``
-    (the training rows themselves, or held-out rows scored with training moments).  Every
-    operation folds the standardization into integer-valued products of the signed codes.
+    Column j is x_j = (s_j - mu_j) / sigma_j with training-sample moments, evaluated on
+    ``sample_indices`` (the training samples themselves, or held-out samples scored with the
+    training moments).  Every operation folds the standardization into integer-valued products
+    of the signed codes; these are the exact CPU reference for the device kernels.
     """
 
     def __init__(
         self,
         store: DosageStore,
-        variant_start: int,
-        variant_stop: int,
-        rows: I64Array,
+        start: int,
+        stop: int,
+        sample_indices: NDArray,
         moments: SignedCodeMoments,
+        budget: ComputeBudget,
     ) -> None:
-        if moments.signed_sums.shape[0] != variant_stop - variant_start:
+        if moments.signed_sums.shape[0] != stop - start:
             raise ValueError("moments must cover exactly the matrix's variant range.")
         monomorphic = np.flatnonzero(moments.scaled_variances <= 0)
         if monomorphic.size:
             raise ValueError(
-                f"{monomorphic.size} variants (first {variant_start + int(monomorphic[0])}) have zero training "
+                f"{monomorphic.size} variants (first row {start + int(monomorphic[0])}) have zero training "
                 "variance; drop them before standardizing."
             )
         self.store = store
-        self.variant_start = variant_start
-        self.variant_stop = variant_stop
-        self.rows = _validated_rows(rows, store.sample_count)
-        self._all_rows = self.rows.size == store.sample_count
+        self.start = start
+        self.stop = stop
+        self.selection = _SampleSelection.build(sample_indices, store.n_samples)
         self.moments = moments
+        self.budget = budget
 
     @classmethod
-    def from_training_rows(
+    def from_training_samples(
         cls,
         store: DosageStore,
-        variant_start: int,
-        variant_stop: int,
-        training_rows: I64Array,
-        *,
-        block_rows: int,
+        start: int,
+        stop: int,
+        training_indices: NDArray,
+        budget: ComputeBudget,
     ) -> QuantizedDosageMatrix:
-        """The training design: moments and rows are both the training rows."""
-        moments = signed_code_moments(store, variant_start, variant_stop, training_rows, block_rows=block_rows)
-        return cls(store, variant_start, variant_stop, training_rows, moments)
+        """The training design: moments and rows both come from the training samples."""
+        moments = signed_code_moments(store, start, stop, training_indices, budget)
+        return cls(store, start, stop, training_indices, moments, budget)
 
     @property
     def shape(self) -> tuple[int, int]:
-        return int(self.rows.size), self.variant_stop - self.variant_start
+        return int(self.selection.indices.size), self.stop - self.start
 
-    def _row_codes(self, codes: U8Array) -> U8Array:
-        return codes if self._all_rows else codes[:, self.rows]
+    def _local(self, start: int, stop: int) -> slice:
+        if not self.start <= start <= stop <= self.stop:
+            raise IndexError(f"rows [{start}, {stop}) fall outside the matrix's range.")
+        return slice(start - self.start, stop - self.start)
 
-    def _local(self, variant_start: int, variant_stop: int) -> slice:
-        if not self.variant_start <= variant_start <= variant_stop <= self.variant_stop:
-            raise IndexError(f"variants [{variant_start}, {variant_stop}) fall outside the matrix's range.")
-        return slice(variant_start - self.variant_start, variant_stop - self.variant_start)
+    def _float_blocks(self) -> Iterator[tuple[slice, F64Array]]:
+        """Signed codes as float64 [block variants, samples], blocks sized to 1/8 of host memory."""
+        ranges = _block_ranges(self.start, self.stop, 9 * self.shape[0], self.budget.host_bytes // 8)
+        for block_start, block_stop, codes in self.store.iter_codes(ranges, self.selection.indices, self.budget):
+            yield self._local(block_start, block_stop), signed_codes(codes, np.empty(codes.shape, dtype=np.float64))
 
-    def _sub_range_codes(self, variant_start: int, variant_stop: int) -> tuple[slice, U8Array]:
-        local = self._local(variant_start, variant_stop)
-        buffer = np.empty((variant_stop - variant_start, self.store.sample_count), dtype=np.uint8)
-        return local, self._row_codes(self.store.codes(variant_start, variant_stop, buffer))
-
-    def _blocks(self, block_rows: int) -> Iterator[tuple[slice, U8Array]]:
-        ranges = [
-            (start, min(self.variant_stop, start + block_rows))
-            for start in range(self.variant_start, self.variant_stop, block_rows)
-        ]
-        spare = np.empty((block_rows, self.store.sample_count), dtype=np.uint8)
-        for start, stop, block in self.store.iter_code_views(ranges, spare):
-            yield self._local(start, stop), self._row_codes(block)
-
-    def standardized_block(self, variant_start: int, variant_stop: int) -> F64Array:
-        """Dense x [variants, rows] for a sub-range (tests and small blocks)."""
-        local, codes = self._sub_range_codes(variant_start, variant_stop)
+    def standardized_block(self, start: int, stop: int) -> F64Array:
+        """Dense x [variants, samples] for a sub-range (tests and small blocks)."""
+        local = self._local(start, stop)
+        codes = self.store.read_codes(start, stop, self.selection.indices)
         signed = signed_codes(codes, np.empty(codes.shape, dtype=np.float64))
         return (signed - self.moments.means[local, None]) / self.moments.scales[local, None]
 
-    def matvec(self, coefficients: F64Array, *, block_rows: int) -> F64Array:
-        """X beta = sum_j s_j (beta_j / sigma_j) - sum_j mu_j beta_j / sigma_j."""
+    def matvec(self, coefficients: F64Array) -> F64Array:
+        """X beta = S^T (beta / sigma) - mu . (beta / sigma)."""
         scaled = np.asarray(coefficients, dtype=np.float64) / self.moments.scales
         result = np.zeros(self.shape[0], dtype=np.float64)
-        for local, codes in self._blocks(block_rows):
-            signed = signed_codes(codes, np.empty(codes.shape, dtype=np.float64))
+        for local, signed in self._float_blocks():
             result += scaled[local] @ signed
         return result - float(self.moments.means @ scaled)
 
-    def transpose_matvec(self, vector: F64Array, *, block_rows: int) -> F64Array:
-        """X^T v = (S^T v - mu * sum(v)) / sigma."""
+    def transpose_matvec(self, vector: F64Array) -> F64Array:
+        """X^T v = (S v - mu * sum(v)) / sigma."""
         weights = np.asarray(vector, dtype=np.float64)
         signed_products = np.empty(self.shape[1], dtype=np.float64)
-        for local, codes in self._blocks(block_rows):
-            signed = signed_codes(codes, np.empty(codes.shape, dtype=np.float64))
+        for local, signed in self._float_blocks():
             signed_products[local] = signed @ weights
         return (signed_products - self.moments.means * float(weights.sum())) / self.moments.scales
 
-    def gram(self, variant_start: int, variant_stop: int) -> F64Array:
-        """X_b^T X_b over the matrix rows for a variant sub-range, from the exact signed Gram."""
-        local, codes = self._sub_range_codes(variant_start, variant_stop)
+    def gram(self, start: int, stop: int) -> F64Array:
+        """X_b^T X_b over the matrix samples for a variant sub-range, from the exact signed Gram."""
+        local = self._local(start, stop)
+        codes = self.store.read_codes(start, stop, self.selection.indices)
         signed_gram = exact_signed_gram(signed_codes(codes, np.empty(codes.shape, dtype=np.int16))).astype(np.float64)
-        row_sums = np.add.reduce(codes, axis=1, dtype=np.int64) - SIGNED_CODE_OFFSET * codes.shape[1]
+        sample_sums = np.add.reduce(codes, axis=1, dtype=np.int64) - SIGNED_CODE_OFFSET * codes.shape[1]
         means = self.moments.means[local]
         centered = (
             signed_gram
-            - np.outer(means, row_sums)
-            - np.outer(row_sums, means)
+            - np.outer(means, sample_sums)
+            - np.outer(sample_sums, means)
             + codes.shape[1] * np.outer(means, means)
         )
         scales = self.moments.scales[local]
