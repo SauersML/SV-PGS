@@ -10505,6 +10505,30 @@ def _solve_restricted_exact_variant_space(
     return beta, genetic_linear_predictor, beta_variance, logdet_A
 
 
+def _resolved_prior_moments(
+    prior_variances: NDArray,
+    prior_precision_override: NDArray | None,
+) -> tuple[NDArray, NDArray]:
+    """Return the (variance, precision) pair every restricted-solve route shares.
+
+    Variant-space routes add ``prior_precision`` to X^T W X, sample-space
+    routes build D + X diag(prior_variances) X^T and set
+    beta = diag(prior_variances) X^T P r, and working sets screen with the
+    variances but certify KKT with the precision. An override therefore has
+    to define BOTH moments; otherwise the posterior depends on which route
+    the problem size selects.
+    """
+    floored_variances = np.maximum(np.asarray(prior_variances, dtype=np.float64), 1e-8)
+    if prior_precision_override is None:
+        return floored_variances, 1.0 / floored_variances
+    prior_precision = np.asarray(prior_precision_override, dtype=np.float64)
+    if prior_precision.shape != floored_variances.shape:
+        raise ValueError("prior_precision_override must match prior_variances shape.")
+    if not np.all(np.isfinite(prior_precision)) or np.any(prior_precision <= 0.0):
+        raise ValueError("prior_precision_override must be finite and strictly positive.")
+    return 1.0 / prior_precision, prior_precision
+
+
 def _stabilize_sample_space_solve_with_operator_ridge(
     attempt: Any,
     *,
@@ -10578,14 +10602,7 @@ def _solve_restricted_mean_only(
     if diagonal_noise.shape != (sample_count,):
         raise ValueError("diagonal_noise must have one entry per sample.")
 
-    prior_variances = np.maximum(np.asarray(prior_variances, dtype=np.float64), 1e-8)
-    if prior_precision_override is not None:
-        prior_precision = np.asarray(prior_precision_override, dtype=np.float64)
-        if prior_precision.shape != prior_variances.shape:
-            raise ValueError("prior_precision_override must match prior_variances shape.")
-        prior_precision = np.maximum(prior_precision, 0.0)
-    else:
-        prior_precision = 1.0 / prior_variances
+    prior_variances, prior_precision = _resolved_prior_moments(prior_variances, prior_precision_override)
     variant_count = genotype_matrix.shape[1]
     use_exact_variant = variant_count <= exact_solver_matrix_limit
     use_gpu_exact_variant = allow_gpu_exact_variant and _use_gpu_exact_variant_solve(
@@ -11701,14 +11718,7 @@ def _solve_restricted_full(
     if diagonal_noise.shape != (sample_count,):
         raise ValueError("diagonal_noise must have one entry per sample.")
 
-    prior_variances = np.maximum(np.asarray(prior_variances, dtype=np.float64), 1e-8)
-    if prior_precision_override is not None:
-        prior_precision = np.asarray(prior_precision_override, dtype=np.float64)
-        if prior_precision.shape != prior_variances.shape:
-            raise ValueError("prior_precision_override must match prior_variances shape.")
-        prior_precision = np.maximum(prior_precision, 0.0)
-    else:
-        prior_precision = 1.0 / prior_variances
+    prior_variances, prior_precision = _resolved_prior_moments(prior_variances, prior_precision_override)
     variant_count = genotype_matrix.shape[1]
     use_exact_variant = variant_count <= exact_solver_matrix_limit
     use_gpu_exact_variant = allow_gpu_exact_variant and _use_gpu_exact_variant_solve(
