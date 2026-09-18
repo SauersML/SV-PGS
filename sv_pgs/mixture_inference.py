@@ -7658,9 +7658,17 @@ def _apply_sample_space_operator_gpu(
     # :class:`GPUScheduler`. Each block re-uses the existing single-block
     # matmul path (gpu_matmat / gpu_transpose_matmat), so the streaming
     # int8 cache and resident fp16/fp32 cache code remain the engine.
+    # A column-sharded cache has no single device array to slice per block;
+    # it already spreads the matmuls across devices through
+    # gpu_transpose_matmat / gpu_matmat below, so it skips this branch.
     # ------------------------------------------------------------------
     ld_block_partition = getattr(genotype_matrix, "_ld_block_partition", None)
-    if ld_block_partition is not None and genotype_matrix._cupy_cache is not None and not _cupy_cache_is_int8_standardized(genotype_matrix._cupy_cache):
+    if (
+        ld_block_partition is not None
+        and genotype_matrix._cupy_cache is not None
+        and not _cupy_cache_is_int8_standardized(genotype_matrix._cupy_cache)
+        and not _cupy_cache_is_sharded(genotype_matrix._cupy_cache)
+    ):
         scheduler = getattr(genotype_matrix, "_ld_block_scheduler", None)
         if scheduler is None:
             from sv_pgs.gpu_scheduler import GPUScheduler
