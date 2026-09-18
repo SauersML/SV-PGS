@@ -2072,3 +2072,17 @@ def test_loaded_model_reproduces_posterior_predictive_probabilities(tmp_path):
         model.predict_proba(genotype_matrix, covariate_matrix),
         rtol=1e-6,
     )
+
+
+def test_scoring_rejects_a_genotype_matrix_with_a_different_variant_axis():
+    model, genotype_matrix, covariate_matrix = _fit_binary_model_with_tie_group_and_missing_genotypes()
+    extra_columns = np.column_stack(
+        [genotype_matrix, np.zeros((genotype_matrix.shape[0], 3), dtype=np.float32)]
+    )
+
+    with pytest.raises(ValueError, match="variant columns"):
+        model.decision_function(extra_columns, covariate_matrix)
+    with pytest.raises(ValueError, match="variant columns"):
+        model.predictor_variance(extra_columns)
+    with pytest.raises(ValueError, match="variant columns"):
+        model.decision_function(genotype_matrix[:, :-1], covariate_matrix)

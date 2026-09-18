@@ -3219,6 +3219,7 @@ class BayesianPGS:
     ) -> tuple[F32Array, F32Array]:
         """Return the separate genetic and covariate contributions to the predictor."""
         fitted_state = self._require_state()
+        _require_trained_variant_axis(genotypes, fitted_state)
         covariate_matrix = self._with_intercept(np.asarray(covariates, dtype=np.float32))
         covariate_component = np.asarray(covariate_matrix @ fitted_state.fit_result.alpha, dtype=np.float32)
 
@@ -3273,6 +3274,7 @@ class BayesianPGS:
         Variants the model shrank hard carry almost no variance, so they barely widen it.
         """
         fitted_state = self._require_state()
+        _require_trained_variant_axis(genotypes, fitted_state)
         raw_genotypes = as_raw_genotype_matrix(genotypes)
         sample_count = raw_genotypes.shape[0]
         variance = fitted_state.full_beta_variance
@@ -3528,6 +3530,24 @@ def _runtime_tuned_config_for_fit(
         genotype_matrix=genotype_matrix,
     )
     return policy.tuned_config, runtime_training_policy_summary(policy, config)
+
+
+def _require_trained_variant_axis(
+    genotypes: RawGenotypeMatrix | NDArray,
+    fitted_state: FittedState,
+) -> None:
+    """Scoring indexes genotype columns by training position, so the axes must agree.
+
+    Coefficients, means and scales are looked up by column index; a matrix with
+    extra or missing columns would silently score the wrong variants.
+    """
+    trained_variant_count = int(fitted_state.full_coefficients.shape[0])
+    genotype_variant_count = int(genotypes.shape[1])
+    if genotype_variant_count != trained_variant_count:
+        raise ValueError(
+            f"genotypes have {genotype_variant_count} variant columns but the model was "
+            + f"trained on {trained_variant_count}; score with the training variant axis."
+        )
 
 
 def _nonzero_coefficient_cache(coefficients: NDArray) -> tuple[I32Array, F32Array]:
