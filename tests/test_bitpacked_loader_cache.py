@@ -171,23 +171,48 @@ def test_content_hash_changes_with_inputs(tmp_path: Path) -> None:
     bed = tmp_path / "x.bed"
     bed.write_bytes(b"x" * 32)
     h0 = bp_loader._active_cache_content_hash(
-        bed_path=bed, sample_indices=None, variant_indices=None, count_a1=True
+        bed_path=bed, sample_indices=None, variant_indices=None, count_a1=True, mean=None, std=None
     )
     h1 = bp_loader._active_cache_content_hash(
         bed_path=bed,
         sample_indices=np.arange(4, dtype=np.int64),
         variant_indices=None,
         count_a1=True,
+        mean=None,
+        std=None,
     )
     h2 = bp_loader._active_cache_content_hash(
-        bed_path=bed, sample_indices=None, variant_indices=None, count_a1=False
+        bed_path=bed, sample_indices=None, variant_indices=None, count_a1=False, mean=None, std=None
     )
     assert h0 != h1
     assert h0 != h2
     # Stable under no input change.
     assert h0 == bp_loader._active_cache_content_hash(
-        bed_path=bed, sample_indices=None, variant_indices=None, count_a1=True
+        bed_path=bed, sample_indices=None, variant_indices=None, count_a1=True, mean=None, std=None
     )
+
+
+def test_content_hash_changes_with_standardization(tmp_path: Path) -> None:
+    bed = tmp_path / "x.bed"
+    bed.write_bytes(b"x" * 32)
+    mean = np.array([0.5, 1.0, 1.5], dtype=np.float32)
+    std = np.array([0.7, 0.8, 0.9], dtype=np.float32)
+
+    def content_hash(mean_value: Any, std_value: Any) -> str:
+        return bp_loader._active_cache_content_hash(
+            bed_path=bed,
+            sample_indices=None,
+            variant_indices=None,
+            count_a1=True,
+            mean=mean_value,
+            std=std_value,
+        )
+
+    baseline = content_hash(mean, std)
+    assert baseline == content_hash(mean.copy(), std.copy())
+    assert baseline != content_hash(mean + np.float32(0.25), std)
+    assert baseline != content_hash(mean, std * np.float32(2.0))
+    assert baseline != content_hash(None, None)
 
 
 def test_verify_rejects_missing_or_incomplete(tmp_path: Path) -> None:
@@ -226,6 +251,8 @@ def test_cache_round_trip(tmp_path: Path, cupy_shim: Any) -> None:
         sample_indices=None,
         variant_indices=None,
         count_a1=True,
+        mean=None,
+        std=None,
     )
     cache_subdir = bp_loader._active_cache_dir(cache_root, content_hash)
     assert bp_loader.verify_active_matrix_cache(cache_subdir) is False
@@ -345,13 +372,87 @@ def test_cached_wrapper_miss_then_hit(tmp_path: Path, cupy_shim: Any) -> None:
         mod.load_bed_to_bitpacked_device = orig_loader  # type: ignore[assignment]
 
 
+def test_cached_wrapper_never_serves_another_callers_standardization(
+    tmp_path: Path, cupy_shim: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A hit must not hand back mean/std cached by a caller with other stats.
+
+    The hot kernels standardize with the matrix's own ``_mean``/``_std``, so a
+    hit that returned a previous run's cached stats would silently
+    re-standardize every column while the host paths used the new ones.
+    """
+    import sys
+
+    n_samples, n_variants = 9, 5
+    packed = np.random.default_rng(3).integers(0, 256, size=(n_variants, (n_samples + 3) // 4), dtype=np.uint8)
+    bed_path = tmp_path / "x.bed"
+    bed_path.write_bytes(b"x" * 128)
+    cache_root = tmp_path / "cache"
+
+    class _StubMatrix:
+        def __init__(self, *, packed, mean, std, n_samples, count_a1):
+            self._packed = packed
+            self._mean = mean
+            self._std = std
+            self._n_samples = n_samples
+            self._n_variants = int(mean.shape[0])
+            self._count_a1 = count_a1
+
+    stub_module = type(sys)("sv_pgs.bitpacked_matrix")
+    stub_module.BitpackedDeviceMatrix = _StubMatrix  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "sv_pgs.bitpacked_matrix", stub_module)
+    cold_loads: list[np.ndarray] = []
+
+    def _fake_loader(**kwargs: Any) -> Any:
+        cold_loads.append(np.asarray(kwargs["mean"], dtype=np.float32))
+        return _StubMatrix(
+            packed=_DeviceArray(packed),
+            mean=_DeviceArray(np.asarray(kwargs["mean"], dtype=np.float32)),
+            std=_DeviceArray(np.asarray(kwargs["std"], dtype=np.float32)),
+            n_samples=n_samples,
+            count_a1=True,
+        )
+
+    monkeypatch.setattr(bp_loader, "load_bed_to_bitpacked_device", _fake_loader)
+
+    def load(mean: np.ndarray, std: np.ndarray) -> Any:
+        matrix = bp_loader.load_bed_to_bitpacked_device_cached(
+            bed_path=bed_path,
+            n_samples=n_samples,
+            n_variants=n_variants,
+            cache_dir=cache_root,
+            mean=mean,
+            std=std,
+            count_a1=True,
+        )
+        for writer_thread in list(bp_loader._ACTIVE_CACHE_WRITER_THREADS):
+            writer_thread.join(timeout=30)
+        return matrix
+
+    first_mean = np.linspace(0.2, 1.8, n_variants).astype(np.float32)
+    first_std = np.full(n_variants, 0.6, dtype=np.float32)
+    second_mean = first_mean + np.float32(0.1)
+    second_std = first_std * np.float32(1.5)
+
+    load(first_mean, first_std)
+    second = load(second_mean, second_std)
+    np.testing.assert_array_equal(cupy_shim.asnumpy(second._mean), second_mean)
+    np.testing.assert_array_equal(cupy_shim.asnumpy(second._std), second_std)
+    assert len(cold_loads) == 2
+
+    first_again = load(first_mean, first_std)
+    assert len(cold_loads) == 2  # identical standardization still hits
+    np.testing.assert_array_equal(cupy_shim.asnumpy(first_again._mean), first_mean)
+    np.testing.assert_array_equal(cupy_shim.asnumpy(first_again._std), first_std)
+
+
 def test_cached_wrapper_partial_write_rejected(tmp_path: Path, cupy_shim: Any) -> None:
     """An incomplete manifest (e.g. crash mid-write) must NOT serve a cache hit."""
     matrix = _make_fake_matrix(n_samples=9, n_variants=5)
     bed_path = tmp_path / "x.bed"
     bed_path.write_bytes(b"x" * 32)
     content_hash = bp_loader._active_cache_content_hash(
-        bed_path=bed_path, sample_indices=None, variant_indices=None, count_a1=True
+        bed_path=bed_path, sample_indices=None, variant_indices=None, count_a1=True, mean=None, std=None
     )
     cache_subdir = bp_loader._active_cache_dir(tmp_path / "cache", content_hash)
     bp_loader._write_active_matrix_cache(

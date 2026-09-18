@@ -985,11 +985,17 @@ def _active_cache_content_hash(
     sample_indices: np.ndarray | None,
     variant_indices: np.ndarray | None,
     count_a1: bool,
+    mean: np.ndarray | None,
+    std: np.ndarray | None,
 ) -> str:
     """Stable sha256 over the inputs that uniquely determine the cached matrix.
 
-    Includes bed_path stat (size + mtime), sample/variant index bytes, and the
-    count_a1 flag. We deliberately stat the BED rather than CRC the contents —
+    Includes bed_path stat (size + mtime), sample/variant index bytes, the
+    count_a1 flag, and the caller's standardization (mean/std bytes). The
+    cache stores mean.npy/scale.npy next to the packed bytes and a hit serves
+    those, so the standardization is part of the cached content: two callers
+    with the same BED/indices but different means/scales must not share an
+    entry. We deliberately stat the BED rather than CRC the contents —
     194 GB of CRC at cache-key time would defeat the purpose.
     """
     h = hashlib.sha256()
@@ -1016,6 +1022,13 @@ def _active_cache_content_hash(
         h.update(b"variant_indices=")
         h.update(v.tobytes())
         h.update(b"\n")
+    for label, statistic in (("mean", mean), ("std", std)):
+        if statistic is None:
+            h.update(f"{label}=None\n".encode("utf-8"))
+        else:
+            h.update(f"{label}=".encode("utf-8"))
+            h.update(np.ascontiguousarray(np.asarray(statistic, dtype=np.float32)).tobytes())
+            h.update(b"\n")
     return h.hexdigest()
 
 
@@ -1342,7 +1355,8 @@ def load_bed_to_bitpacked_device_cached(
     streams the BED and writes the cache atomically after the matrix is built.
 
     The cache is keyed by the sha256 of (bed_path stat, sample_indices bytes,
-    variant_indices bytes, count_a1). Bumping any of those forces a re-load.
+    variant_indices bytes, count_a1, mean/std bytes). Bumping any of those
+    forces a re-load.
     """
     bed_path = Path(bed_path)
     content_hash = _active_cache_content_hash(
@@ -1350,6 +1364,8 @@ def load_bed_to_bitpacked_device_cached(
         sample_indices=sample_indices,
         variant_indices=variant_indices,
         count_a1=count_a1,
+        mean=mean,
+        std=std,
     )
     cache_subdir = _active_cache_dir(Path(cache_dir), content_hash)
     try:
