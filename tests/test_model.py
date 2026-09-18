@@ -39,6 +39,7 @@ from sv_pgs.model import (
     _tie_map_keeps_all_active_variants,
     _training_records_from_stats,
 )
+from sv_pgs.numeric import stable_sigmoid
 from sv_pgs.preprocessing import compute_variant_statistics
 from tests.conftest import make_fake_cupy
 
@@ -2001,7 +2002,10 @@ def test_raw_standardized_subset_matvec_reads_only_requested_columns():
     np.testing.assert_allclose(scores, expected_scores.astype(np.float32))
 
 
-def _fit_binary_model_with_tie_group_and_missing_genotypes() -> tuple[BayesianPGS, np.ndarray, np.ndarray]:
+def _fit_binary_model_with_tie_group_and_missing_genotypes(
+    *,
+    final_posterior_diagnostics: bool = True,
+) -> tuple[BayesianPGS, np.ndarray, np.ndarray]:
     # Columns 0, 1, 2 form one tie group (x, x, -x); column 4 has missing calls.
     genotype_matrix, covariate_matrix, target_vector, variant_records = _synthetic_binary_dataset()
     model = BayesianPGS(
@@ -2009,6 +2013,7 @@ def _fit_binary_model_with_tie_group_and_missing_genotypes() -> tuple[BayesianPG
             trait_type=TraitType.BINARY,
             max_outer_iterations=10,
             minimum_minor_allele_frequency=0.0,
+            final_posterior_diagnostics=final_posterior_diagnostics,
         )
     ).fit(genotype_matrix, covariate_matrix, target_vector, variant_records)
     return model, genotype_matrix, covariate_matrix
@@ -2086,3 +2091,37 @@ def test_scoring_rejects_a_genotype_matrix_with_a_different_variant_axis():
         model.predictor_variance(extra_columns)
     with pytest.raises(ValueError, match="variant columns"):
         model.decision_function(genotype_matrix[:, :-1], covariate_matrix)
+
+
+def test_predict_proba_is_the_plug_in_when_posterior_variance_was_not_computed():
+    # final_posterior_diagnostics=False (the AoU policy) skips the final posterior
+    # variance. Damping by the prior variances it used to export would pull every
+    # probability toward 0.5; with the variance marked not computed, predict_proba
+    # must be the plug-in sigmoid of the linear predictor.
+    model, genotype_matrix, covariate_matrix = _fit_binary_model_with_tie_group_and_missing_genotypes(
+        final_posterior_diagnostics=False,
+    )
+    assert model.state is not None
+    assert np.all(np.isnan(model.state.fit_result.beta_variance))
+
+    np.testing.assert_array_equal(model.predictor_variance(genotype_matrix), 0.0)
+    np.testing.assert_allclose(
+        model.predict_proba(genotype_matrix, covariate_matrix)[:, 1],
+        stable_sigmoid(model.decision_function(genotype_matrix, covariate_matrix)),
+        rtol=1e-6,
+    )
+
+
+def test_predict_proba_damps_by_the_computed_posterior_variance():
+    # With posterior variances computed, predict_proba is the probit approximation
+    # sigmoid(eta / sqrt(1 + (pi / 8) s2)) with s2 the predictor variance.
+    model, genotype_matrix, covariate_matrix = _fit_binary_model_with_tie_group_and_missing_genotypes()
+    predictor_variance = np.asarray(model.predictor_variance(genotype_matrix), dtype=np.float64)
+    assert np.all(predictor_variance > 0.0)
+    linear_predictor = np.asarray(model.decision_function(genotype_matrix, covariate_matrix), dtype=np.float64)
+
+    np.testing.assert_allclose(
+        model.predict_proba(genotype_matrix, covariate_matrix)[:, 1],
+        stable_sigmoid(linear_predictor / np.sqrt(1.0 + (np.pi / 8.0) * predictor_variance)),
+        rtol=1e-5,
+    )

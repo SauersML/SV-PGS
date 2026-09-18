@@ -3272,6 +3272,8 @@ class BayesianPGS:
         correlated and the group adds x~_rep^2 Var(beta_group), the representative's
         term. Missing genotypes are mean-imputed exactly as in ``decision_components``.
         Variants the model shrank hard carry almost no variance, so they barely widen it.
+        A NaN variance (the fit did not compute posterior variances) contributes nothing,
+        so predict_proba falls back to the plug-in probability.
         """
         fitted_state = self._require_state()
         _require_trained_variant_axis(genotypes, fitted_state)

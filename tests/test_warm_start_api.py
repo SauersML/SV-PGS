@@ -176,3 +176,29 @@ def test_warm_start_helper_round_trip_signatures():
     assert ckpt.prior_design_signature == _checkpoint_prior_design_signature(prior_design)
     assert ckpt.alpha_state.shape == (W.shape[1],)
     assert ckpt.beta_state.shape == (prior_design.class_membership_matrix.shape[0],)
+
+
+def test_warm_start_ignores_a_posterior_variance_that_was_not_computed():
+    # final_posterior_diagnostics=False skips the final posterior variance; the
+    # result marks it NaN, and the warm start must not seed second moments from it.
+    random_generator = np.random.default_rng(2)
+    genotype_matrix, covariate_matrix, target_vector = _make_problem(random_generator)
+    records = _records(genotype_matrix.shape[1])
+    config = ModelConfig(
+        trait_type=TraitType.QUANTITATIVE,
+        max_outer_iterations=3,
+        final_posterior_diagnostics=False,
+    )
+    result = _fit(genotype_matrix, covariate_matrix, target_vector, records, config)
+    assert np.all(np.isnan(result.beta_variance))
+
+    resume_config = ModelConfig(
+        trait_type=TraitType.QUANTITATIVE,
+        max_outer_iterations=5,
+        final_posterior_diagnostics=False,
+    )
+    _, prior_design = _make_prior_design(genotype_matrix, records, resume_config)
+    checkpoint = checkpoint_from_result(result, config=resume_config, prior_design=prior_design)
+    assert checkpoint.beta_variance_state is None
+    resumed = _fit(genotype_matrix, covariate_matrix, target_vector, records, resume_config, resume=checkpoint)
+    assert np.all(np.isfinite(resumed.beta_reduced))

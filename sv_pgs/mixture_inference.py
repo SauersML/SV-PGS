@@ -1045,9 +1045,12 @@ def checkpoint_from_result(
         best_tpb_shape_b_vector=None,
         best_validation_iteration=None,
         completed_blocks_in_iteration=0,
+        # A NaN (not computed) variance must not seed the warm start's second
+        # moments; without one the resumed fit starts from the prior variances.
         beta_variance_state=(
             np.asarray(result.beta_variance, dtype=np.float64).copy()
             if np.asarray(result.beta_variance).shape == (num_reduced,)
+            and bool(np.all(np.isfinite(result.beta_variance)))
             else None
         ),
         reduced_second_moment=None,
@@ -4175,11 +4178,21 @@ def fit_variational_em(
     except AttributeError:
         pass
     _release_gpu_memory()  # final pool free
+    # Without final posterior diagnostics the final solve skips the posterior
+    # variance and _effective_beta_variance_state hands back the prior variances.
+    # Exporting those as posterior variances would make the posterior-predictive
+    # damping and warm starts treat the prior as the posterior; NaN marks them as
+    # not computed, as a failed final binary solve already does.
+    final_beta_variance = (
+        np.asarray(final_state.beta_variance, dtype=np.float64)
+        if config.final_posterior_diagnostics
+        else np.full(np.asarray(final_state.beta).shape, np.nan, dtype=np.float64)
+    )
     log(f"  variational EM returning results  mem={mem()}")
     return VariationalFitResult(
         alpha=np.asarray(final_state.alpha, dtype=np.float32),
         beta_reduced=np.asarray(final_state.beta, dtype=np.float32),
-        beta_variance=np.asarray(final_state.beta_variance, dtype=np.float64),
+        beta_variance=final_beta_variance,
         prior_scales=final_member_prior_variances.astype(np.float64),
         global_scale=float(global_scale),
         class_tpb_shape_a={
