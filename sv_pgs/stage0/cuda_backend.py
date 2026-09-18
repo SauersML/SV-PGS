@@ -280,7 +280,6 @@ class CudaStage0Backend:
         sums = np.zeros((groups, rows), dtype=np.int64)
         long_group = int(self.layout.group_widths.max()) > _SAMPLE_CHUNK
         grams = np.zeros((groups, rows, rows), dtype=np.int64 if long_group else np.int32)
-        cross = None if self._cross is None else np.zeros((groups, rows, self._cross.shape[1]), dtype=np.float64)
         with self._device, self._compute:
             block = self._buffer[slot : slot + rows]
             output = cp.empty((padded, padded), dtype=cp.int32)
@@ -299,19 +298,25 @@ class CudaStage0Backend:
                 lower = output if total is None else total
                 symmetric = cp.tril(lower[:rows, :rows]) + cp.tril(lower[:rows, :rows], -1).T
                 grams[group] = symmetric.get(stream=self._compute)
-                if cross is not None:
-                    cross[group] = self._cross_products(block, low, high).get(stream=self._compute)
             self._compute.synchronize()
-        return sums, grams, cross
+        return sums, grams, None if self._cross is None else self.cross_products(slot, rows)
 
-    def _cross_products(self, block: cp.ndarray, low: int, high: int) -> cp.ndarray:
-        rows = block.shape[0]
-        chunk = _CROSS_SAMPLE_CHUNK
-        total = cp.zeros((rows, self._cross.shape[1]), dtype=cp.float64)
-        for chunk_low in range(low, high, chunk):
-            chunk_high = min(chunk_low + chunk, high)
-            total += block[:, chunk_low:chunk_high].astype(cp.float64) @ self._cross[chunk_low:chunk_high]
-        return total
+    def cross_products(self, slot: int, rows: int) -> NDArray[np.float64]:
+        """Per-group ``sum_i s_i y_i^T`` ``(G, rows, columns)`` in fp64 cuBLAS GEMMs."""
+        if self._cross is None:
+            raise ValueError("the backend was built without cross-product columns")
+        result = np.zeros((self.layout.group_count, rows, self._cross.shape[1]), dtype=np.float64)
+        with self._device, self._compute:
+            block = self._buffer[slot : slot + rows]
+            for group in range(self.layout.group_count):
+                low, high = self.layout.group_range(group)
+                total = cp.zeros((rows, self._cross.shape[1]), dtype=cp.float64)
+                for chunk_low in range(low, high, _CROSS_SAMPLE_CHUNK):
+                    chunk_high = min(chunk_low + _CROSS_SAMPLE_CHUNK, high)
+                    total += block[:, chunk_low:chunk_high].astype(cp.float64) @ self._cross[chunk_low:chunk_high]
+                result[group] = total.get(stream=self._compute)
+            self._compute.synchronize()
+        return result
 
     def move_rows(self, source_slot: int, target_slot: int, rows: int) -> None:
         """Copy rows to a lower slot, front to back in pieces that never overlap."""

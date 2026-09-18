@@ -79,6 +79,8 @@ class Stage0Backend(Protocol):
         self, slot: int, rows: int
     ) -> tuple[NDArray[np.int64], NDArray[np.integer], NDArray[np.float64] | None]: ...
 
+    def cross_products(self, slot: int, rows: int) -> NDArray[np.float64]: ...
+
     def move_rows(self, source_slot: int, target_slot: int, rows: int) -> None: ...
 
 
@@ -143,28 +145,42 @@ def run_genotype_pass(
     if layout.store_width != source.sample_count:
         raise ValueError("the sample layout does not match the store's sample count")
     started = time.monotonic()
-    counts = {chromosome: source.variant_count(chromosome) for chromosome in source.chromosomes()}
-    assignment = assign_chromosomes(counts, len(backends))
     summary = GenotypePassSummary()
     sink_lock = threading.Lock()
-    failures: list[BaseException] = []
 
     def locked_sink(block: BlockStatistics) -> None:
         with sink_lock:
             sink(block)
 
+    def chromosome_work(backend: Stage0Backend, chromosome: str) -> None:
+        result = _run_chromosome(source, layout, backend, plan, chromosome, locked_sink)
+        with sink_lock:
+            summary.chromosomes[chromosome] = result
+
+    _run_on_devices(source, backends, chromosome_work)
+    summary.seconds = time.monotonic() - started
+    return summary
+
+
+def _run_on_devices(
+    source: GenotypeTileSource,
+    backends: Sequence[Stage0Backend],
+    work: Callable[[Stage0Backend, str], None],
+) -> None:
+    """Run ``work(backend, chromosome)`` for every chromosome, one thread per backend."""
+    counts = {chromosome: source.variant_count(chromosome) for chromosome in source.chromosomes()}
+    failures: list[BaseException] = []
+
     def device_worker(backend: Stage0Backend, chromosomes: list[str]) -> None:
         try:
             for chromosome in chromosomes:
-                result = _run_chromosome(source, layout, backend, plan, chromosome, locked_sink)
-                with sink_lock:
-                    summary.chromosomes[chromosome] = result
+                work(backend, chromosome)
         except BaseException as error:
             failures.append(error)
 
     workers = [
         threading.Thread(target=device_worker, args=(backend, chromosomes), name=f"stage0-device-{index}")
-        for index, (backend, chromosomes) in enumerate(zip(backends, assignment))
+        for index, (backend, chromosomes) in enumerate(zip(backends, assign_chromosomes(counts, len(backends))))
     ]
     for worker in workers:
         worker.start()
@@ -172,34 +188,64 @@ def run_genotype_pass(
         worker.join()
     if failures:
         raise failures[0]
-    summary.seconds = time.monotonic() - started
-    return summary
 
 
-def _read_ahead(
-    source: GenotypeTileSource,
-    chromosome: str,
-    variant_count: int,
-    tile_rows: int,
-    free: queue.Queue,
-    filled: queue.Queue,
-) -> None:
-    try:
-        for start in range(0, variant_count, tile_rows):
-            stop = min(start + tile_rows, variant_count)
-            buffer = free.get()
-            source.read_rows(chromosome, start, stop, buffer[: stop - start])
-            filled.put((start, stop, buffer))
-        filled.put(None)
-    except BaseException as error:
-        filled.put(error)
+class _TileStream:
+    """Tiles of one chromosome, read ahead on a thread and uploaded one tile ahead.
 
+    ``current`` is the staged tile ``(start, stop, staging_index)``; after loading it,
+    ``advance`` frees its host buffer and stages the next tile, so the upload of tile
+    ``i + 1`` and the read of tile ``i + 2`` overlap the computation on tile ``i``.
+    """
 
-def _next_tile(filled: queue.Queue) -> tuple[int, int, NDArray[np.uint8]] | None:
-    item = filled.get()
-    if isinstance(item, BaseException):
-        raise item
-    return item
+    def __init__(self, source: GenotypeTileSource, chromosome: str, backend: Stage0Backend, tile_rows: int) -> None:
+        self._backend = backend
+        self._free: queue.Queue = queue.Queue()
+        for _ in range(_HOST_TILES):
+            self._free.put(backend.host_tile(tile_rows))
+        self._filled: queue.Queue = queue.Queue()
+        self._reader = threading.Thread(
+            target=self._read_ahead,
+            args=(source, chromosome, source.variant_count(chromosome), tile_rows),
+            name=f"stage0-read-{chromosome}",
+            daemon=True,
+        )
+        self._reader.start()
+        self._staging = 0
+        self._host: NDArray[np.uint8] | None = None
+        self.current: tuple[int, int, int] | None = None
+        self._stage_next()
+
+    def _read_ahead(self, source: GenotypeTileSource, chromosome: str, variant_count: int, tile_rows: int) -> None:
+        try:
+            for start in range(0, variant_count, tile_rows):
+                stop = min(start + tile_rows, variant_count)
+                buffer = self._free.get()
+                source.read_rows(chromosome, start, stop, buffer[: stop - start])
+                self._filled.put((start, stop, buffer))
+            self._filled.put(None)
+        except BaseException as error:
+            self._filled.put(error)
+
+    def _stage_next(self) -> None:
+        item = self._filled.get()
+        if isinstance(item, BaseException):
+            raise item
+        if item is None:
+            self.current = None
+            self._reader.join()
+            return
+        start, stop, host = item
+        self._backend.stage_tile(host[: stop - start], self._staging)
+        self._host = host
+        self.current = (start, stop, self._staging)
+
+    def advance(self) -> None:
+        """Call once the current tile is loaded."""
+        self._backend.release_staged_tile(self._staging)
+        self._free.put(self._host)
+        self._staging = 1 - self._staging
+        self._stage_next()
 
 
 def _run_chromosome(
@@ -218,17 +264,7 @@ def _run_chromosome(
     partitioner = OnlineBlockPartitioner(cut_allowed_from_groups(groups), plan.block_cap)
     maximum_distance = plan.block_cap - 1
     int32_grams = int(layout.group_counts.max()) <= INT32_EXACT_ROWS
-    free: queue.Queue = queue.Queue()
-    for _ in range(_HOST_TILES):
-        free.put(backend.host_tile(plan.tile_rows))
-    filled: queue.Queue = queue.Queue()
-    reader = threading.Thread(
-        target=_read_ahead,
-        args=(source, chromosome, variant_count, plan.tile_rows, free, filled),
-        name=f"stage0-read-{chromosome}",
-        daemon=True,
-    )
-    reader.start()
+    stream = _TileStream(source, chromosome, backend, plan.tile_rows)
     boundaries = [0]
     forced = 0
     base = 0
@@ -250,12 +286,8 @@ def _run_chromosome(
             )
             boundaries.append(cut)
 
-    current = _next_tile(filled)
-    staging = 0
-    if current is not None:
-        backend.stage_tile(current[2][: current[1] - current[0]], staging)
-    while current is not None:
-        start, stop, host = current
+    while stream.current is not None:
+        start, stop, staging = stream.current
         rows = stop - start
         while stop - base > plan.capacity_rows:
             if partitioner.committed > base:
@@ -265,20 +297,13 @@ def _run_chromosome(
                 emit(partitioner.force_cut())
                 forced += 1
         backend.load_staged_tile(staging, rows, start - base)
-        backend.release_staged_tile(staging)
-        free.put(host)
-        upcoming = _next_tile(filled)
-        if upcoming is not None:
-            backend.stage_tile(upcoming[2][: upcoming[1] - upcoming[0]], 1 - staging)
+        stream.advance()
         window_start = max(0, start - maximum_distance)
         row_weights, column_weights = backend.pair_weights(window_start - base, start - base, rows, maximum_distance)
         backend.check_codes()
         partitioner.add_pair_weights(window_start, row_weights, start, column_weights)
         emit(partitioner.advance(stop - maximum_distance))
-        current = upcoming
-        staging = 1 - staging
     emit(partitioner.finish())
-    reader.join()
     seconds = time.monotonic() - started
     log(
         f"stage0 {chromosome}: {variant_count:,} variants in {len(boundaries) - 1:,} LD blocks "
@@ -291,3 +316,34 @@ def _run_chromosome(
         forced_cuts=forced,
         seconds=seconds,
     )
+
+
+def run_cross_product_pass(
+    source: GenotypeTileSource,
+    layout: SampleLayout,
+    backends: Sequence[Stage0Backend],
+    tile_rows: int,
+    sink: Callable[[str, int, int, NDArray[np.float64]], None],
+) -> float:
+    """Stream the store once more for cross-product columns that arrive after Stage 0.
+
+    Each backend must be built with the columns and a buffer of at least ``tile_rows``
+    rows. ``sink(chromosome, start, stop, products)`` receives ``(G, stop - start, columns)``
+    ``sum_{i in g} s_i y_i^T`` per tile, one call at a time. Returns the wall time in seconds.
+    """
+    started = time.monotonic()
+    sink_lock = threading.Lock()
+
+    def chromosome_work(backend: Stage0Backend, chromosome: str) -> None:
+        stream = _TileStream(source, chromosome, backend, tile_rows)
+        while stream.current is not None:
+            start, stop, staging = stream.current
+            backend.load_staged_tile(staging, stop - start, 0)
+            stream.advance()
+            products = backend.cross_products(0, stop - start)
+            backend.check_codes()
+            with sink_lock:
+                sink(chromosome, start, stop, products)
+
+    _run_on_devices(source, backends, chromosome_work)
+    return time.monotonic() - started

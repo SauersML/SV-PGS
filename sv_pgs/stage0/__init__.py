@@ -14,6 +14,7 @@ from sv_pgs.stage0.genotype_pass import (
     Stage0Backend,
     assign_chromosomes,
     plan_genotype_pass,
+    run_cross_product_pass,
     run_genotype_pass,
 )
 from sv_pgs.stage0.layout import SampleLayout, build_sample_layout
@@ -43,5 +44,6 @@ __all__ = [
     "cut_allowed_from_groups",
     "plan_genotype_pass",
     "pooled_integer_statistics",
+    "run_cross_product_pass",
     "run_genotype_pass",
 ]

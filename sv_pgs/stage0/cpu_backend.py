@@ -25,6 +25,8 @@ from sv_pgs.stage0.statistics import FLOAT32_EXACT_ROWS, MAXIMUM_STORED_CODE, SI
 
 _SAMPLE_CHUNK = FLOAT32_EXACT_ROWS // 16 * 16
 _OUTPUT_PANEL = 512
+_CROSS_ROW_PANEL = 64
+_CROSS_SAMPLE_CHUNK = 8192
 
 
 class CpuStage0Backend:
@@ -142,7 +144,6 @@ class CpuStage0Backend:
         groups = self.layout.group_count
         sums = np.zeros((groups, rows), dtype=np.int64)
         grams = np.zeros((groups, rows, rows), dtype=np.int64)
-        cross = None if self._cross is None else np.zeros((groups, rows, self._cross.shape[1]), dtype=np.float64)
         block = self._buffer[slot : slot + rows]
         for group in range(groups):
             low, high = self.layout.group_range(group)
@@ -155,9 +156,27 @@ class CpuStage0Backend:
 
             self._map(convert, rows, max(1, -(-rows // self._worker_count)))
             grams[group] = _exact_products(values, values, self._map, symmetric=True)
-            if cross is not None:
-                cross[group] = _cross_products(values, self._cross[low:high], self._map)
-        return sums, grams, cross
+        return sums, grams, None if self._cross is None else self.cross_products(slot, rows)
+
+    def cross_products(self, slot: int, rows: int) -> NDArray[np.float64]:
+        """Per-group ``sum_i s_i y_i^T`` ``(G, rows, columns)`` in fp64, in a fixed summation order."""
+        if self._cross is None:
+            raise ValueError("the backend was built without cross-product columns")
+        block = self._buffer[slot : slot + rows]
+        result = np.zeros((self.layout.group_count, rows, self._cross.shape[1]), dtype=np.float64)
+        for group in range(self.layout.group_count):
+            low, high = self.layout.group_range(group)
+
+            def panel(row_range: tuple[int, int]) -> None:
+                start, stop = row_range
+                total = np.zeros((stop - start, self._cross.shape[1]), dtype=np.float64)
+                for sample_low in range(low, high, _CROSS_SAMPLE_CHUNK):
+                    sample_high = min(sample_low + _CROSS_SAMPLE_CHUNK, high)
+                    total += block[start:stop, sample_low:sample_high].astype(np.float64) @ self._cross[sample_low:sample_high]
+                result[group, start:stop] = total
+
+            self._map(panel, rows, _CROSS_ROW_PANEL)
+        return result
 
     def move_rows(self, source_slot: int, target_slot: int, rows: int) -> None:
         """Copy rows to a lower slot (numpy resolves the overlap)."""
@@ -209,18 +228,3 @@ def _exact_products(
         result = np.triu(result) + upper.T
     return result
 
-
-def _cross_products(
-    values: NDArray[np.float32],
-    columns: NDArray[np.float64],
-    parallel_map: Callable[[Callable[[tuple[int, int]], None], int, int], None],
-) -> NDArray[np.float64]:
-    """``values @ columns`` in fp64, split over row panels."""
-    result = np.zeros((values.shape[0], columns.shape[1]), dtype=np.float64)
-
-    def panel(row_range: tuple[int, int]) -> None:
-        start, stop = row_range
-        result[start:stop] = values[start:stop].astype(np.float64) @ columns
-
-    parallel_map(panel, values.shape[0], _OUTPUT_PANEL)
-    return result

@@ -13,6 +13,7 @@ from sv_pgs.stage0 import (
     column_moments,
     cut_allowed_from_groups,
     plan_genotype_pass,
+    run_cross_product_pass,
     run_genotype_pass,
 )
 from sv_pgs.stage0.genotype_pass import assign_chromosomes
@@ -167,3 +168,22 @@ def test_missing_codes_are_rejected() -> None:
 def test_chromosomes_go_longest_first_to_the_least_loaded_device() -> None:
     assignment = assign_chromosomes({"a": 5, "b": 9, "c": 4, "d": 3}, 2)
     assert assignment == [["b", "d"], ["a", "c"]]
+
+
+def test_a_later_cross_product_pass_matches_the_fused_one() -> None:
+    source = _dataset(13, {"chr6": 350, "chr8": 200})
+    sample_groups = _sample_groups(14)
+    columns = np.random.default_rng(15).normal(size=(SAMPLES, 4))
+    layout = build_sample_layout(sample_groups)
+    backends = [CpuStage0Backend(layout, 100, columns, worker_count=2) for _ in range(2)]
+    tiles = {}
+    run_cross_product_pass(source, layout, backends, 100, lambda name, start, stop, products: tiles.update(
+        {(name, start): (stop, products)}))
+    signed = {name: codes.astype(np.int64) - 127 for name, codes in source.codes.items()}
+    for (name, start), (stop, products) in tiles.items():
+        for group in range(3):
+            members = np.flatnonzero(sample_groups == group)
+            np.testing.assert_allclose(
+                products[group], signed[name][start:stop, members] @ columns[members], rtol=1e-12, atol=1e-9
+            )
+    assert sorted(tiles) == [("chr6", 0), ("chr6", 100), ("chr6", 200), ("chr6", 300), ("chr8", 0), ("chr8", 100)]
