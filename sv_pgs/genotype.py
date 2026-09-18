@@ -6177,7 +6177,9 @@ class StandardizedGenotypeMatrix:
             subset._parent_genotype_matrix = self
         if self._jax_cache is not None:
             subset._jax_cache = self._jax_cache[:, resolved_local_indices]
-        elif self._dense_cache is not None:
+        # The dense cache rides along with the JAX one: once raw storage is released it is the
+        # only source iter_column_batches can stream (the JAX cache is compute-only).
+        if self._dense_cache is not None:
             subset._dense_cache = np.asarray(self._dense_cache[:, resolved_local_indices], dtype=np.float32)
         subset._local_cache_directory = self._local_cache_directory
         return subset

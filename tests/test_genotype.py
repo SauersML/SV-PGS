@@ -550,6 +550,22 @@ def test_subset_after_releasing_raw_storage_keeps_materialized_shape():
     np.testing.assert_allclose(subset.materialize(), raw_matrix[:, [1, 3]])
 
 
+def test_subset_streams_columns_when_parent_holds_dense_and_jax_caches():
+    raw_matrix = np.arange(12, dtype=np.float32).reshape(3, 4)
+    standardized = as_raw_genotype_matrix(raw_matrix).standardized(
+        means=np.zeros(raw_matrix.shape[1], dtype=np.float32),
+        scales=np.ones(raw_matrix.shape[1], dtype=np.float32),
+    )
+    standardized._dense_cache = standardized.materialize()
+    standardized._ensure_jax_cache()
+    standardized.release_raw_storage()
+
+    subset = standardized.subset(np.array([1, 3], dtype=np.int32))
+
+    streamed = np.concatenate([batch.values for batch in subset.iter_column_batches(batch_size=1)], axis=1)
+    np.testing.assert_array_equal(streamed, raw_matrix[:, [1, 3]])
+
+
 def test_concatenated_raw_genotype_matrix_preserves_column_order_and_values():
     left = _StreamingRawGenotypeMatrix(
         np.array(
