@@ -15,8 +15,11 @@ from typing import Iterable
 from sv_pgs.all_of_us import (
     AllOfUsDiseaseRequest,
     available_disease_names,
+    available_measurement_names,
     prepare_all_of_us_disease_sample_table,
+    prepare_all_of_us_measurement_sample_table,
     resolve_disease_definition,
+    resolve_measurement_definition,
 )
 from sv_pgs.aou_runner import _normalize_variants_choice, run_all_of_us, run_all_of_us_all_diseases
 from sv_pgs.config import ModelConfig, TraitType
@@ -48,6 +51,27 @@ def build_parser() -> argparse.ArgumentParser:
     )
     aou_parser.add_argument("--output", required=True, help="Output TSV path for the prepared sample table.")
 
+    trait_list_parser = subparsers.add_parser(
+        "list-all-of-us-traits",
+        help="List built-in All of Us quantitative traits (EHR labs and physical measurements).",
+    )
+    trait_list_parser.set_defaults(command="list-all-of-us-traits")
+
+    aou_trait_parser = subparsers.add_parser(
+        "prepare-all-of-us-trait",
+        help=(
+            "Query the All of Us measurement table for a built-in quantitative trait and write a pre-fit "
+            "sample table (target = per-person empirical BLUP; target_inverse_normal = its rank inverse normal)."
+        ),
+    )
+    aou_trait_parser.add_argument(
+        "--trait",
+        required=True,
+        metavar="TRAIT",
+        help="Built-in trait or alias. See list-all-of-us-traits for canonical names.",
+    )
+    aou_trait_parser.add_argument("--output", required=True, help="Output TSV path for the prepared sample table.")
+
     aou_run_parser = subparsers.add_parser(
         "run-all-of-us",
         help="Full AoU pipeline: download VCFs, prepare phenotype, merge PCs, and fit one unified genome-wide Bayesian model.",
@@ -58,7 +82,15 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             "Disease name (e.g. hypertension, type2_diabetes). Pass 'all' or "
             "'top20' to loop over every built-in disease. Mutually exclusive "
-            "with --all-diseases."
+            "with --all-diseases and --trait."
+        ),
+    )
+    aou_run_parser.add_argument(
+        "--trait",
+        default=None,
+        help=(
+            "Quantitative trait name (e.g. mean_corpuscular_volume, haptoglobin); see "
+            "list-all-of-us-traits. Mutually exclusive with --disease and --all-diseases."
         ),
     )
     aou_run_parser.add_argument(
@@ -297,6 +329,21 @@ def _main_impl(argv: list[str] | None = None) -> int:
             print(disease_name)
         return 0
 
+    if args.command == "list-all-of-us-traits":
+        for trait_name in available_measurement_names():
+            print(trait_name)
+        return 0
+
+    if args.command == "prepare-all-of-us-trait":
+        prepared_outputs = prepare_all_of_us_measurement_sample_table(
+            trait=args.trait,
+            output_path=Path(args.output),
+        )
+        print("sample_table\t" + str(prepared_outputs.sample_table_path))
+        print("sql\t" + str(prepared_outputs.sql_path))
+        print("metadata\t" + str(prepared_outputs.metadata_path))
+        return 0
+
     if args.command == "prepare-all-of-us-disease":
         prepared_outputs = prepare_all_of_us_disease_sample_table(
             request=AllOfUsDiseaseRequest(disease=args.disease),
@@ -322,11 +369,20 @@ def _main_impl(argv: list[str] | None = None) -> int:
         wants_all = bool(args.all_diseases) or normalized_disease in {"all", "top20"}
         if wants_all and args.all_diseases and disease_value is not None and normalized_disease not in {"all", "top20"}:
             raise ValueError("--all-diseases is mutually exclusive with --disease")
-        if disease_value is None and not wants_all:
-            raise ValueError("Either --disease or --all-diseases is required.")
+        if args.trait is not None and (wants_all or disease_value is not None):
+            raise ValueError("--trait is mutually exclusive with --disease and --all-diseases")
+        if disease_value is None and args.trait is None and not wants_all:
+            raise ValueError("One of --disease, --trait or --all-diseases is required.")
+        phenotype_value: str | None
+        if wants_all:
+            phenotype_value = None
+        elif args.trait is not None:
+            phenotype_value = resolve_measurement_definition(args.trait).canonical_name
+        else:
+            phenotype_value = resolve_disease_definition(disease_value).canonical_name
         if getattr(args, "dry_run", False):
             return _run_dry_run(
-                disease=disease_value,
+                phenotype=phenotype_value,
                 wants_all=wants_all,
                 chromosomes=chromosomes,
                 output_dir=args.output_dir,
@@ -346,9 +402,9 @@ def _main_impl(argv: list[str] | None = None) -> int:
                 variants=args.variants,
                 max_parallel_gpus=args.max_parallel_gpus,
             ) or 0)
-        assert disease_value is not None
+        assert phenotype_value is not None
         run_all_of_us(
-            disease=disease_value,
+            phenotype=phenotype_value,
             chromosomes=chromosomes,
             output_base=args.output_dir,
             variant_metadata_path=args.variant_metadata,
@@ -445,7 +501,7 @@ def main(argv: list[str] | None = None) -> int:
 
 def _run_dry_run(
     *,
-    disease: str | None,
+    phenotype: str | None,
     wants_all: bool,
     chromosomes: list[int],
     output_dir: str,
@@ -475,12 +531,11 @@ def _run_dry_run(
 
     out_base = Path(output_dir)
     if wants_all:
-        disease_label = "ALL (sweep)"
+        phenotype_label = "ALL diseases (sweep)"
         resolved_output_dir = str(out_base / "<canonical_name>_results")
     else:
-        assert disease is not None
-        disease_def = resolve_disease_definition(disease)
-        disease_label = disease_def.canonical_name
+        assert phenotype is not None
+        phenotype_label = phenotype
         resolved_output_dir = str(out_base)
     cache_dir_path = out_base.parent / ".sv_pgs_cache" if not wants_all else out_base / ".sv_pgs_cache"
 
@@ -496,7 +551,7 @@ def _run_dry_run(
 
     print()
     print("=== dry run ===")
-    print(f"disease:        {disease_label}")
+    print(f"phenotype:      {phenotype_label}")
     print(f"variants:       {canonical_variants}")
     print(f"chromosomes:    {chromosomes[0]}-{chromosomes[-1]}" if len(chromosomes) > 1 else f"chromosomes:    {chromosomes[0]}")
     print(f"cohort source:  {cohort_source}")

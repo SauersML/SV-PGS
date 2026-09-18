@@ -19,8 +19,11 @@ import pandas as pd
 from sv_pgs.all_of_us import (
     DISEASE_DEFINITIONS,
     AllOfUsDiseaseRequest,
+    DiseaseDefinition,
+    MeasurementDefinition,
     prepare_all_of_us_disease_sample_table,
-    resolve_disease_definition,
+    prepare_all_of_us_measurement_sample_table,
+    resolve_all_of_us_phenotype,
 )
 from sv_pgs.aou_storage import stage_gcs_object, verify_local_cache
 from sv_pgs.path_policy import assert_hot_local_path, assert_safe_for_purpose, is_gcsfuse_path
@@ -905,7 +908,7 @@ def _validate_aou_chromosomes(chromosomes: list[int]) -> list[int]:
 
 def _build_aou_run_metadata(
     *,
-    disease: str,
+    phenotype: str,
     chromosomes: list[int],
     n_pcs: int,
     pc_cols: list[str],
@@ -923,7 +926,10 @@ def _build_aou_run_metadata(
     marginal_screen_min_abs_z: float = 0.0,
 ) -> dict[str, object]:
     return {
-        "disease": disease,
+        # Canonical disease or trait name (the two name sets are disjoint);
+        # the key predates quantitative traits and is kept so existing fits
+        # still match their metadata.
+        "disease": phenotype,
         "chromosomes": chromosomes,
         "requested_n_pcs": n_pcs,
         "effective_pc_columns": pc_cols,
@@ -1067,6 +1073,16 @@ DEFAULT_COVARIATES = [
     "race_concept_id",
     "ethnicity_concept_id",
 ]
+# Quantitative traits: mean age and mean squared age over the person's
+# measurement occasions (all_of_us.build_all_of_us_measurement_targets) and
+# sex at birth instead of gender identity.
+MEASUREMENT_COVARIATES = [
+    "age_at_measurement",
+    "age_at_measurement_squared",
+    "sex_at_birth_concept_id",
+    "race_concept_id",
+    "ethnicity_concept_id",
+]
 
 # Categorical OMOP fields that are one-hot expanded during phenotype
 # preparation (see all_of_us._add_one_hot_omop_categorical_covariates).
@@ -1076,6 +1092,7 @@ DEFAULT_COVARIATES = [
 # into the set of one-hot columns by reading the sample table header.
 _OMOP_ONE_HOT_PREFIXES = (
     "gender_concept_id",
+    "sex_at_birth_concept_id",
     "race_concept_id",
     "ethnicity_concept_id",
 )
@@ -1154,7 +1171,7 @@ def _expand_one_hot_covariates(
 
         # Single combined log line as specified in the task.
         drop_msgs = []
-        for prefix in ("gender_concept_id", "race_concept_id", "ethnicity_concept_id"):
+        for prefix in _OMOP_ONE_HOT_PREFIXES:
             if prefix in prefix_to_drop:
                 short = prefix.split("_concept_id", 1)[0]
                 drop_msgs.append(f"{short} -> dropped reference {prefix_to_drop[prefix]!r}")
@@ -1601,8 +1618,33 @@ def _safe_resolve(path: Path) -> Path:
         return path
 
 
+def _describe_phenotype_source(phenotype_definition: DiseaseDefinition | MeasurementDefinition) -> str:
+    if isinstance(phenotype_definition, MeasurementDefinition):
+        return (
+            f"measurement LOINC {', '.join(phenotype_definition.loinc_codes)} "
+            f"({phenotype_definition.description})"
+        )
+    return f"condition SNOMED root {phenotype_definition.snomed_code} ({phenotype_definition.snomed_concept_name})"
+
+
+def _prepare_phenotype_sample_table(
+    phenotype_definition: DiseaseDefinition | MeasurementDefinition,
+    sample_table_path: Path,
+) -> None:
+    if isinstance(phenotype_definition, MeasurementDefinition):
+        prepare_all_of_us_measurement_sample_table(
+            trait=phenotype_definition.canonical_name,
+            output_path=sample_table_path,
+        )
+    else:
+        prepare_all_of_us_disease_sample_table(
+            request=AllOfUsDiseaseRequest(disease=phenotype_definition.canonical_name),
+            output_path=sample_table_path,
+        )
+
+
 def run_all_of_us(
-    disease: str,
+    phenotype: str,
     chromosomes: list[int],
     output_base: str,
     variant_metadata_path: str | Path | None = None,
@@ -1611,6 +1653,9 @@ def run_all_of_us(
     variants: str = "snp+sv",
 ) -> None:
     """Full AoU pipeline: download requested chromosomes, merge them, and run one fit.
+
+    `phenotype` names a built-in disease (binary, from condition_occurrence)
+    or quantitative trait (from measurement); see all_of_us.
 
     `variants` selects the genotype sources fed into the joint model:
       "snp+sv"  — joint (default): AoU srWGS SV VCFs + AoU microarray PLINK,
@@ -1646,13 +1691,12 @@ def run_all_of_us(
 
     import os
 
-    # Validate disease
-    disease_def = resolve_disease_definition(disease)
+    phenotype_definition = resolve_all_of_us_phenotype(phenotype)
     work_dir = Path(output_base)
     work_dir.mkdir(parents=True, exist_ok=True)
 
     from sv_pgs.progress import set_log_file, start_heartbeat
-    log_path = work_dir / f"{disease_def.canonical_name}.{time.strftime('%Y%m%d_%H%M%S')}.log"
+    log_path = work_dir / f"{phenotype_definition.canonical_name}.{time.strftime('%Y%m%d_%H%M%S')}.log"
     set_log_file(log_path)
 
     # Preflight: validate disk, gcsfuse layout, JAX/CuPy memory policy, GPU.
@@ -1722,13 +1766,13 @@ def run_all_of_us(
     base_for_scan = work_dir.parent if work_dir.parent != work_dir else work_dir
     # Which sibling fits are done / mid-fit / untouched, and what each one's
     # last run left behind (converged?, iters, final deltas, test metric).
-    _log_prior_fit_status(base_for_scan, header=f"JOB START [{disease_def.canonical_name}]")
-    found = _log_all_cached_test_evals(base_for_scan, header=f"JOB START [{disease_def.canonical_name}]")
+    _log_prior_fit_status(base_for_scan, header=f"JOB START [{phenotype_definition.canonical_name}]")
+    found = _log_all_cached_test_evals(base_for_scan, header=f"JOB START [{phenotype_definition.canonical_name}]")
     if found == 0:
         # Nothing in parent — fall back to just this disease's work_dir on
         # the off-chance it exists and parent didn't match the *_results
         # glob (e.g. an output dir whose name doesn't end in _results).
-        _log_cached_test_evals(work_dir, label=disease_def.canonical_name)
+        _log_cached_test_evals(work_dir, label=phenotype_definition.canonical_name)
 
     # Background sampler: emits a periodic main-thread stack + CPU/GPU/mem
     # snapshot so a stall in the main thread is no longer silent.
@@ -1739,9 +1783,9 @@ def run_all_of_us(
 
     log(
         "=== ALL OF US PIPELINE ===  "
-        + f"disease={disease_def.canonical_name}  chromosomes={chromosomes}  n_pcs={n_pcs}  cpus={os.cpu_count()}"
+        + f"phenotype={phenotype_definition.canonical_name}  chromosomes={chromosomes}  n_pcs={n_pcs}  cpus={os.cpu_count()}"
     )
-    log(f"  SNOMED root: {disease_def.snomed_code} ({disease_def.snomed_concept_name})")
+    log(f"  phenotype source: {_describe_phenotype_source(phenotype_definition)}")
     log(f"  output: {work_dir}")
     fit_checkpoint_path = work_dir / "fit_checkpoint.npz"
     if fit_checkpoint_path.exists():
@@ -1786,8 +1830,8 @@ def run_all_of_us(
         log_autotune_banner()
     except (ImportError, RuntimeError) as _autotune_banner_error:
         log(f"  auto-tune banner unavailable: {_autotune_banner_error}")
-    sample_table_path = work_dir / f"{disease_def.canonical_name}.samples.tsv"
-    merged_path = work_dir / f"{disease_def.canonical_name}.samples.with_pcs.tsv"
+    sample_table_path = work_dir / f"{phenotype_definition.canonical_name}.samples.tsv"
+    merged_path = work_dir / f"{phenotype_definition.canonical_name}.samples.with_pcs.tsv"
     _sample_metadata_path = sample_table_path.with_suffix(sample_table_path.suffix + ".metadata.json")
     log(
         "  phenotype table: "
@@ -1904,7 +1948,7 @@ def run_all_of_us(
 
     # Step 1: Prepare phenotype
     log("=== STEP 1: Prepare phenotype ===")
-    sample_table_path = work_dir / f"{disease_def.canonical_name}.samples.tsv"
+    sample_table_path = work_dir / f"{phenotype_definition.canonical_name}.samples.tsv"
     # The writer in prepare_all_of_us_disease_sample_table emits the TSV
     # first and the .sql / .metadata.json sidecars second. An interrupted
     # run therefore leaves a partial TSV without sidecars on disk. Treat
@@ -1922,17 +1966,14 @@ def run_all_of_us(
                 sample_table_path.unlink()
             except OSError:
                 pass
-        prepare_all_of_us_disease_sample_table(
-            request=AllOfUsDiseaseRequest(disease=disease),
-            output_path=sample_table_path,
-        )
+        _prepare_phenotype_sample_table(phenotype_definition, sample_table_path)
     else:
         log(f"  sample table already exists: {sample_table_path}")
 
     # Step 2: Download and merge PCs
     log("=== STEP 2: Merge genomic PCs ===")
     ancestry_path = download_ancestry_preds(work_dir)
-    merged_path = work_dir / f"{disease_def.canonical_name}.samples.with_pcs.tsv"
+    merged_path = work_dir / f"{phenotype_definition.canonical_name}.samples.with_pcs.tsv"
     merged_path, pc_cols = merge_pcs_into_sample_table(
         sample_table_path=sample_table_path,
         ancestry_path=ancestry_path,
@@ -1944,15 +1985,16 @@ def run_all_of_us(
     # gender/race/ethnicity concept_ids into `<name>_<id>` columns and drops
     # the raw column, so expand those entries against the merged table's
     # header before passing the list to the loader.
-    covariates = _expand_one_hot_covariates(
-        DEFAULT_COVARIATES + pc_cols, merged_path
+    base_covariates = (
+        MEASUREMENT_COVARIATES if isinstance(phenotype_definition, MeasurementDefinition) else DEFAULT_COVARIATES
     )
+    covariates = _expand_one_hot_covariates(base_covariates + pc_cols, merged_path)
     log(f"  covariates ({len(covariates)}): {covariates}")
 
     summary_path = work_dir / "summary.json.gz"
     run_metadata_path = _aou_run_metadata_path(work_dir)
     run_metadata = _build_aou_run_metadata(
-        disease=disease_def.canonical_name,
+        phenotype=phenotype_definition.canonical_name,
         chromosomes=chromosomes,
         n_pcs=n_pcs,
         pc_cols=pc_cols,
@@ -2325,7 +2367,7 @@ def run_all_of_us_all_diseases(
             )
             try:
                 run_all_of_us(
-                    disease=disease_definition.canonical_name,
+                    phenotype=disease_definition.canonical_name,
                     chromosomes=chromosomes,
                     output_base=str(disease_output_dir),
                     variant_metadata_path=variant_metadata_path,
