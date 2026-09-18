@@ -79,14 +79,14 @@ def test_adjacent_regions_emit_a_spanning_record_once(tmp_path: Path, capsys: py
     second_ids, second_dosages = _region_output(second_prefix)
     assert first_ids + second_ids == _EXPECTED_IDS
     np.testing.assert_array_equal(np.vstack([first_dosages, second_dosages]), _EXPECTED_DOSAGES)
-    assert "skipped 1 multi-allelic records" in capsys.readouterr().err
-    assert first_result == (2, str(first_prefix), 0)
-    assert second_result == (5, str(second_prefix), 1)
+    assert "skipped 1 records (multi-allelic sequence: 1)" in capsys.readouterr().err
+    assert first_result == (2, str(first_prefix), {})
+    assert second_result == (5, str(second_prefix), {"multi-allelic sequence": 1})
     # A finished region reports its stored counts without re-parsing.
     assert io_module._region_parse_worker((str(vcf_path), "chr1:100-1000", str(second_prefix), 1)) == (
         0,
         str(second_prefix),
-        1,
+        {"multi-allelic sequence": 1},
     )
 
 
@@ -114,7 +114,7 @@ def test_resume_keeps_records_sharing_the_checkpointed_position(
     result = io_module._region_parse_worker((str(vcf_path), "chr1:1-1000", str(prefix), 1))
 
     # The multi-allelic v6 follows the checkpoint, so it is counted once.
-    assert result == (7, str(prefix), 1)
+    assert result == (7, str(prefix), {"multi-allelic sequence": 1})
     variant_ids, dosages = _region_output(prefix)
     assert variant_ids == _EXPECTED_IDS
     np.testing.assert_array_equal(dosages, _EXPECTED_DOSAGES)
@@ -140,7 +140,7 @@ def test_header_without_optional_info_tags_is_parsed(tmp_path: Path) -> None:
 
     result = io_module._region_parse_worker((str(vcf_path), "chr1:1-1000", str(prefix), 1))
 
-    assert result == (2, str(prefix), 0)
+    assert result == (2, str(prefix), {})
     variants = io_module._load_variant_metadata(Path(f"{prefix}.variants.npz"))
     assert [(variant.variant_id, variant.variant_class, variant.length) for variant in variants] == [
         ("a1", VariantClass.SNV, 1.0),

@@ -10,9 +10,10 @@ import tempfile
 import time
 import uuid
 import zipfile
+from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, BinaryIO, Iterator, Literal, Sequence, cast
+from typing import Any, BinaryIO, Iterator, Literal, Mapping, Sequence, cast
 
 import numpy as np
 
@@ -129,6 +130,8 @@ class _TextVcfRecord:
     REF: str
     ALT: tuple[str, ...]
     QUAL: float | None
+    # None for PASS and ".", like cyvcf2's Variant.FILTER.
+    FILTER: str | None
     INFO: dict[str, Any]
     gt_types: I8Array
 
@@ -286,6 +289,7 @@ def _parse_text_vcf_record(line: str, *, sample_names: tuple[str, ...]) -> _Text
         REF=ref,
         ALT=alt,
         QUAL=qual,
+        FILTER=None if fields[6] in _PASSING_FILTER_VALUES else fields[6],
         INFO=info,
         gt_types=gt_types,
     )
@@ -2333,13 +2337,45 @@ def _region_output_complete(output_prefix: str | Path) -> bool:
         Path(f"{prefix}.geno").exists()
         and Path(f"{prefix}.variants.npz").exists()
         and Path(f"{prefix}.stats").exists()
-        and _region_multiallelic_count_path(prefix).exists()
+        and _region_skipped_records_path(prefix).exists()
     )
 
 
-def _region_multiallelic_count_path(output_prefix: str | Path) -> Path:
-    """Count of multi-allelic records a finished region worker skipped."""
-    return Path(f"{output_prefix}.multiallelic_skipped")
+def _region_skipped_records_path(output_prefix: str | Path) -> Path:
+    """Records a finished region worker skipped, counted by reason (JSON)."""
+    return Path(f"{output_prefix}.skipped.json")
+
+
+# FILTER values a record may carry and still be loaded: PASS, or "." when the
+# caller applied no filters (imputed and most long-read VCFs).
+_PASSING_FILTER_VALUES = frozenset({"PASS", "."})
+
+
+def _skipped_record_reason(*, alt_alleles: Sequence[str], svtype: str | None, filter_value: str) -> str | None:
+    """Why a VCF record is not loaded, or None when it is.
+
+    Only bi-allelic records that pass FILTER are loaded. A multi-allelic record
+    is labelled by its SVTYPE (GATK-SV multi-allelic CNVs are CNV and carry copy
+    number in FORMAT/CN, not GT), else by its allele kind; a failing record by
+    its FILTER value (e.g. UNRESOLVED, HIGH_NCR).
+    """
+    if len(alt_alleles) != 1:
+        if svtype is not None:
+            return "multi-allelic " + svtype
+        if any(_alt_is_symbolic_or_bnd(alt) for alt in alt_alleles):
+            return "multi-allelic symbolic"
+        return "multi-allelic sequence"
+    if filter_value not in _PASSING_FILTER_VALUES:
+        return "FILTER " + filter_value
+    return None
+
+
+def _format_skipped_records(skipped_records: Mapping[str, int]) -> str:
+    details = ", ".join(f"{reason}: {count}" for reason, count in sorted(skipped_records.items()))
+    return (
+        f"skipped {sum(skipped_records.values())} records ({details or 'none'}); "
+        "only bi-allelic records that pass FILTER are cached"
+    )
 
 
 def _vcf_contig_info(vcf_path: Path) -> tuple[str, int] | None:
@@ -2400,7 +2436,7 @@ def _bcftools_query_format(header_text: str) -> str:
         f"%INFO/{tag}" if tag in declared_info_tags else "."
         for tag in _BCFTOOLS_OPTIONAL_INFO_TAGS
     )
-    return "%CHROM\t%POS\t%ID\t%REF\t%ALT\t%QUAL\t" + optional_fields + "\t[%GT,]\n"
+    return "%CHROM\t%POS\t%ID\t%REF\t%ALT\t%QUAL\t%FILTER\t" + optional_fields + "\t[%GT,]\n"
 
 
 def _bcftools_executable() -> str:
@@ -2676,11 +2712,12 @@ def _parse_region_string(region: str) -> tuple[str, int, int] | None:
         return None
 
 
-def _region_parse_worker(args: tuple[str, str | None, str, int]) -> tuple[int, str, int]:
+def _region_parse_worker(args: tuple[str, str | None, str, int]) -> tuple[int, str, dict[str, int]]:
     """Worker: stream one region of one VCF through bcftools query, write
     raw binary output files. Runs in a separate process. Returns
-    (variant_count, output_prefix, skipped_multiallelic_count): only
-    bi-allelic records are cached, like the cyvcf2 loader.
+    (variant_count, output_prefix, skipped_records): only bi-allelic records
+    that pass FILTER are cached, like the cyvcf2 loader, and skipped_records
+    counts the rest by _skipped_record_reason.
 
     Resumable: every ~64 MB of genotype output (or every 20 s, whichever
     comes first) we flush the genotype/stats binary streams, write the
@@ -2715,12 +2752,12 @@ def _region_parse_worker(args: tuple[str, str | None, str, int]) -> tuple[int, s
     stats_path = Path(f"{output_prefix}.stats")
     progress_path = Path(f"{output_prefix}.progress.json")
     final_variants_path = Path(f"{output_prefix}.variants.npz")
-    multiallelic_count_path = _region_multiallelic_count_path(output_prefix)
+    skipped_records_path = _region_skipped_records_path(output_prefix)
 
     # If a prior run completed this region cleanly, the final .variants.npz
-    # and the skip count exist and progress.json is gone — nothing to do.
-    if final_variants_path.exists() and multiallelic_count_path.exists() and not progress_path.exists():
-        return 0, output_prefix, int(multiallelic_count_path.read_text(encoding="utf-8"))
+    # and the skip counts exist and progress.json is gone — nothing to do.
+    if final_variants_path.exists() and skipped_records_path.exists() and not progress_path.exists():
+        return 0, output_prefix, json.loads(skipped_records_path.read_text(encoding="utf-8"))
 
     # Attempt to resume from a previous checkpoint. Resume requires a region
     # string (so we can rewind bcftools via -r) and a progress.json whose
@@ -2731,7 +2768,7 @@ def _region_parse_worker(args: tuple[str, str | None, str, int]) -> tuple[int, s
     resume_chrom: str | None = None
     resume_pos: int | None = None
     resume_pos_lines = 0
-    resume_skipped_multiallelic = 0
+    resume_skipped_records: dict[str, int] = {}
     resumed = False
     if progress_path.exists() and region_bounds is not None:
         try:
@@ -2774,7 +2811,9 @@ def _region_parse_worker(args: tuple[str, str | None, str, int]) -> tuple[int, s
                 resume_chrom = state.get("last_chrom")
                 resume_pos = state.get("last_pos")
                 resume_pos_lines = int(state["last_pos_lines"])
-                resume_skipped_multiallelic = int(state["skipped_multiallelic"])
+                resume_skipped_records = {
+                    str(reason): int(skipped) for reason, skipped in state["skipped_records"].items()
+                }
                 resumed = True
         except (OSError, ValueError, KeyError, json.JSONDecodeError) as exc:
             print(
@@ -2792,7 +2831,7 @@ def _region_parse_worker(args: tuple[str, str | None, str, int]) -> tuple[int, s
         geno_path.unlink(missing_ok=True)
         stats_path.unlink(missing_ok=True)
         progress_path.unlink(missing_ok=True)
-        multiallelic_count_path.unlink(missing_ok=True)
+        skipped_records_path.unlink(missing_ok=True)
         for chunk in _region_variant_chunk_paths(output_prefix):
             chunk.unlink(missing_ok=True)
 
@@ -2840,10 +2879,11 @@ def _region_parse_worker(args: tuple[str, str | None, str, int]) -> tuple[int, s
     last_pos_lines = resume_pos_lines
     current_line_pos: int | None = resume_pos
     lines_at_current_pos = resume_pos_lines
-    # Multi-allelic lines skipped so far, and the count as of the last written
+    # Lines skipped so far by reason, and the counts as of the last written
     # record (the checkpointed state: lines after it are re-read on resume).
-    skipped_multiallelic = resume_skipped_multiallelic
-    skipped_multiallelic_at_last_write = resume_skipped_multiallelic
+    skipped_records: Counter[str] = Counter(resume_skipped_records)
+    skipped_records_at_last_write = dict(resume_skipped_records)
+    skipped_since_last_write = False
     last_checkpoint_time = time.monotonic()
     bytes_since_checkpoint = 0
     t_start = time.monotonic()
@@ -2861,7 +2901,7 @@ def _region_parse_worker(args: tuple[str, str | None, str, int]) -> tuple[int, s
                     "last_chrom": last_chrom,
                     "last_pos": last_pos,
                     "last_pos_lines": last_pos_lines,
-                    "skipped_multiallelic": skipped_multiallelic_at_last_write,
+                    "skipped_records": skipped_records_at_last_write,
                 }
             ),
             encoding="utf-8",
@@ -2926,10 +2966,10 @@ def _region_parse_worker(args: tuple[str, str | None, str, int]) -> tuple[int, s
     try:
         for raw_line in proc.stdout:
             line = raw_line[:-1] if raw_line.endswith(b"\n") else raw_line
-            fields = line.split(b"\t", 10)
-            if len(fields) != 11:
+            fields = line.split(b"\t", 11)
+            if len(fields) != 12:
                 raise ValueError(
-                    f"bcftools query emitted a line with {len(fields)} of 11 fields "
+                    f"bcftools query emitted a line with {len(fields)} of 12 fields "
                     f"for {vcf_name}: {line[:200]!r}"
                 )
             pos = int(fields[1])
@@ -2943,12 +2983,19 @@ def _region_parse_worker(args: tuple[str, str | None, str, int]) -> tuple[int, s
             else:
                 current_line_pos = pos
                 lines_at_current_pos = 1
-            alt_field = fields[4]
-            if b"," in alt_field:
-                skipped_multiallelic += 1
+            alt = fields[4].decode("utf-8")
+            svtype_field = fields[7]
+            skip_reason = _skipped_record_reason(
+                alt_alleles=alt.split(","),
+                svtype=None if svtype_field in (b"", b".") else svtype_field.decode("utf-8"),
+                filter_value=fields[6].decode("utf-8"),
+            )
+            if skip_reason is not None:
+                skipped_records[skip_reason] += 1
+                skipped_since_last_write = True
                 continue
 
-            col = _parse_gt_block_to_int8(fields[10], sample_count)
+            col = _parse_gt_block_to_int8(fields[11], sample_count)
             geno_bytes = col.tobytes()
             geno_buffer.extend(geno_bytes)
             dosage_sum, dosage_sum_sq, n_observed, n_nonzero = _fast_int8_dosage_stats(col)
@@ -2956,7 +3003,6 @@ def _region_parse_worker(args: tuple[str, str | None, str, int]) -> tuple[int, s
 
             chrom = fields[0].decode("utf-8")
             ref = fields[3].decode("utf-8")
-            alt = alt_field.decode("utf-8")
             buffered_variants.append(
                 _variant_defaults_from_bcftools_fields(
                     chrom=chrom,
@@ -2965,10 +3011,10 @@ def _region_parse_worker(args: tuple[str, str | None, str, int]) -> tuple[int, s
                     ref=ref,
                     alt=alt,
                     qual_field=fields[5],
-                    svtype_field=fields[6],
-                    svlen_field=fields[7],
-                    af_field=fields[8],
-                    end_field=fields[9],
+                    svtype_field=svtype_field,
+                    svlen_field=fields[8],
+                    af_field=fields[9],
+                    end_field=fields[10],
                 )
             )
 
@@ -2976,7 +3022,9 @@ def _region_parse_worker(args: tuple[str, str | None, str, int]) -> tuple[int, s
             last_chrom = chrom
             last_pos = pos
             last_pos_lines = lines_at_current_pos
-            skipped_multiallelic_at_last_write = skipped_multiallelic
+            if skipped_since_last_write:
+                skipped_records_at_last_write = dict(skipped_records)
+                skipped_since_last_write = False
             bytes_since_checkpoint += len(geno_bytes) + 24
             _checkpoint(force=False)
 
@@ -3046,7 +3094,7 @@ def _region_parse_worker(args: tuple[str, str | None, str, int]) -> tuple[int, s
     tmp_final = final_variants_path.with_name(final_variants_path.name + ".tmp")
     _write_variant_metadata(tmp_final, all_variants)
     tmp_final.replace(final_variants_path)
-    _atomic_write_text(multiallelic_count_path, str(skipped_multiallelic))
+    _atomic_write_text(skipped_records_path, json.dumps(dict(skipped_records), sort_keys=True))
     for chunk_path in chunk_paths:
         chunk_path.unlink(missing_ok=True)
     progress_path.unlink(missing_ok=True)
@@ -3054,11 +3102,11 @@ def _region_parse_worker(args: tuple[str, str | None, str, int]) -> tuple[int, s
     elapsed = time.monotonic() - t_start
     print(
         f"  [worker] {vcf_name}: DONE {count} variants in {elapsed:.0f}s; "
-        f"skipped {skipped_multiallelic} multi-allelic records (bi-allelic records only)",
+        + _format_skipped_records(skipped_records),
         file=sys.stderr,
         flush=True,
     )
-    return count, output_prefix, skipped_multiallelic
+    return count, output_prefix, dict(skipped_records)
 
 
 def precache_vcfs_parallel(
@@ -3213,10 +3261,10 @@ def precache_vcfs_parallel(
     if tasks:
         ctx = multiprocessing.get_context("spawn")
         with ctx.Pool(processes=process_count) as pool:
-            for count, prefix, skipped_multiallelic in pool.imap_unordered(_region_parse_worker, tasks):
+            for count, prefix, skipped_records in pool.imap_unordered(_region_parse_worker, tasks):
                 log(
-                    f"  region done: {Path(prefix).name} ({count} variants, "
-                    f"{skipped_multiallelic} multi-allelic records skipped)"
+                    f"  region done: {Path(prefix).name} ({count} variants; "
+                    f"{_format_skipped_records(skipped_records)})"
                 )
     else:
         log("  no region parsing needed; resuming from completed temporary region cache")
@@ -3243,7 +3291,7 @@ def precache_vcfs_parallel(
             for geno_file in geno_files
         ]
         n_total = 0
-        skipped_multiallelic_total = 0
+        skipped_records: Counter[str] = Counter()
         with open(inc_geno, "wb") as gout, open(inc_stats, "wb") as sout:
             for geno_file in geno_files:
                 prefix = str(geno_file).removesuffix(".geno")
@@ -3253,13 +3301,10 @@ def precache_vcfs_parallel(
                     data = f.read()
                     sout.write(data)
                     n_total += len(data) // 24
-                skipped_multiallelic_total += int(
-                    _region_multiallelic_count_path(prefix).read_text(encoding="utf-8")
+                skipped_records.update(
+                    json.loads(_region_skipped_records_path(prefix).read_text(encoding="utf-8"))
                 )
-        log(
-            f"  {vcf_path.name}: skipped {skipped_multiallelic_total} multi-allelic records "
-            "(only bi-allelic records are cached)"
-        )
+        log(f"  {vcf_path.name}: {_format_skipped_records(skipped_records)}")
 
         # Finalize: convert incremental binary directly to .npy cache.
         # Do NOT call _load_vcf_with_cache — that would re-open the VCF and
@@ -3367,18 +3412,21 @@ def _load_vcf_incremental(
     stats_bin = cache_dir / f"{key}.inc.stats.bin"  # 4 int32/int64 values per variant
     progress_file = cache_dir / f"{key}.inc.progress.json"
 
-    # Check for existing progress. Only bi-allelic records are cached, so the
-    # number of reader records consumed can exceed the cached variant count.
+    # Check for existing progress. Only bi-allelic records that pass FILTER are
+    # cached, so the number of reader records consumed can exceed the cached
+    # variant count.
     n_cached = 0
     records_consumed = 0
-    skipped_multiallelic = 0
+    skipped_records: Counter[str] = Counter()
     metadata_chunk_count = 0
     if progress_file.exists():
         try:
             prog = json.loads(progress_file.read_text(encoding="utf-8"))
             n_cached = int(prog["n_variants"])
             records_consumed = int(prog["records_consumed"])
-            skipped_multiallelic = int(prog["skipped_multiallelic"])
+            skipped_records = Counter(
+                {str(reason): int(skipped) for reason, skipped in prog["skipped_records"].items()}
+            )
             metadata_chunk_count = int(prog.get("metadata_chunk_count", 0))
             expected_geno_bytes = n_cached * n_keep
             expected_stats_bytes = n_cached * 24  # struct "<qqii" = 24 bytes
@@ -3398,7 +3446,7 @@ def _load_vcf_incremental(
             log(f"  incremental cache progress corrupt ({exc}), starting fresh")
             n_cached = 0
             records_consumed = 0
-            skipped_multiallelic = 0
+            skipped_records = Counter()
             metadata_chunk_count = 0
             for p in (geno_bin, stats_bin, progress_file, *_iter_incremental_variant_chunk_paths(cache_dir, key)):
                 try:
@@ -3491,7 +3539,7 @@ def _load_vcf_incremental(
                 {
                     "n_variants": variant_index,
                     "records_consumed": records_consumed,
-                    "skipped_multiallelic": skipped_multiallelic,
+                    "skipped_records": dict(skipped_records),
                     "n_samples": n_keep,
                     "resume_chrom": resume_chrom,
                     "resume_pos": resume_pos,
@@ -3510,10 +3558,18 @@ def _load_vcf_incremental(
     try:
         for record in reader:
             # Checkpoints are taken right after a cached record, so a resume
-            # re-reads any multi-allelic records that followed it.
+            # re-reads any skipped records that followed it.
             records_consumed += 1
-            if len(record.ALT) != 1:
-                skipped_multiallelic += 1
+            svtype_value = record.INFO.get("SVTYPE")
+            filter_value = record.FILTER
+            skip_reason = _skipped_record_reason(
+                alt_alleles=[str(alt) for alt in record.ALT],
+                svtype=None if svtype_value is None else str(svtype_value),
+                # cyvcf2 reports both PASS and "." as None.
+                filter_value="PASS" if filter_value is None else str(filter_value),
+            )
+            if skip_reason is not None:
+                skipped_records[skip_reason] += 1
                 continue
 
             int8_col = _record_gt_types_to_int8(record.gt_types, _gt_to_i8, keep_selector)
@@ -3582,7 +3638,7 @@ def _load_vcf_incremental(
     elapsed = time.monotonic() - t_start
     new_variants = n_total - n_cached
     log(f"  parsed {new_variants} new variants in {elapsed:.1f}s ({n_total} total)")
-    log(f"  skipped {skipped_multiallelic} multi-allelic records (only bi-allelic records are cached)")
+    log(f"  {_format_skipped_records(skipped_records)}")
 
     variants: list[_VariantDefaults] = []
     metadata_chunk_paths = _iter_incremental_variant_chunk_paths(cache_dir, key)

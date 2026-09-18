@@ -1049,7 +1049,7 @@ def test_precache_vcfs_parallel_reuses_completed_region_outputs(monkeypatch: pyt
         ],
     )
     Path(f"{region0_prefix}.stats").write_bytes(struct.pack("<qqii", 1, 1, 2, 1))
-    io_module._region_multiallelic_count_path(region0_prefix).write_text("0", encoding="utf-8")
+    io_module._region_skipped_records_path(region0_prefix).write_text("{}", encoding="utf-8")
 
     scheduled_tasks: list[tuple] = []
 
@@ -1084,8 +1084,10 @@ def test_precache_vcfs_parallel_reuses_completed_region_outputs(monkeypatch: pyt
                     ],
                 )
                 Path(f"{output_prefix}.stats").write_bytes(struct.pack("<qqii", 2, 4, 2, 1))
-                io_module._region_multiallelic_count_path(output_prefix).write_text("1", encoding="utf-8")
-                yield 1, str(output_prefix), 1
+                io_module._region_skipped_records_path(output_prefix).write_text(
+                    '{"multi-allelic CNV": 1}', encoding="utf-8"
+                )
+                yield 1, str(output_prefix), {"multi-allelic CNV": 1}
 
     class _FakeContext:
         def Pool(self, processes: int):
@@ -2619,7 +2621,7 @@ def test_multiallelic_vcf_records_are_skipped_and_counted(tmp_path: Path, capsys
 
     assert [record.variant_id for record in dataset.variant_records] == ["before", "after", "last"]
     np.testing.assert_array_equal(dataset.genotypes.materialize(), _BIALLELIC_EXPECTED_DOSAGE)
-    assert "skipped 1 multi-allelic records" in capsys.readouterr().err
+    assert "skipped 1 records (multi-allelic sequence: 1)" in capsys.readouterr().err
 
 
 def test_incremental_vcf_resume_after_a_skipped_multiallelic_record(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
