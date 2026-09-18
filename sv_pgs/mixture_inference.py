@@ -2422,13 +2422,13 @@ def fit_variational_em(
             epoch_blocks = _stochastic_variant_blocks(genotype_matrix.shape[1], block_size)
             # Randomized cyclic block coordinate descent (Wright 2015): shuffle
             # the within-epoch block order using a deterministic per-epoch RNG
-            # seeded by ``random_seed + outer_iteration``. Only applied at the
-            # start of a fresh epoch — when resuming mid-epoch we keep the
-            # deterministic original order so the checkpoint's
-            # ``completed_blocks_in_iteration`` index continues to refer to the
-            # same blocks. Cross-epoch convergence is unchanged; this only
-            # changes within-epoch update order.
-            if not resuming_mid_epoch and len(epoch_blocks) > 1:
+            # seeded by ``random_seed + outer_iteration``. A mid-epoch resume
+            # must rebuild the same shuffled order: the checkpoint's
+            # ``completed_blocks_in_iteration`` counts blocks of that order, so
+            # skipping the shuffle would repeat some blocks and never visit
+            # others in the resumed epoch. Cross-epoch convergence is
+            # unchanged; this only changes within-epoch update order.
+            if len(epoch_blocks) > 1:
                 epoch_rng = np.random.default_rng(int(config.random_seed) + int(outer_iteration))
                 permutation = epoch_rng.permutation(len(epoch_blocks))
                 epoch_blocks = [epoch_blocks[i] for i in permutation]
