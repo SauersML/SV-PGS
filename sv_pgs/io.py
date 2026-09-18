@@ -35,6 +35,12 @@ from sv_pgs.preprocessing import (
     compute_variant_statistics,
 )
 from sv_pgs.progress import log, mem
+from sv_pgs.variant_typing import (
+    alt_is_symbolic_or_breakend,
+    normalize_variant_token,
+    structural_variant_class_from_token,
+    variant_class_and_length,
+)
 
 # Exceptions meaning "this cache file is corrupt / truncated / half-written" —
 # every cache READ treats these as a clean miss (recompute / re-parse) rather
@@ -53,10 +59,6 @@ _CACHE_CORRUPTION_ERRORS: tuple[type[BaseException], ...] = (
     json.JSONDecodeError,
 )
 
-SV_LENGTH_THRESHOLD = 1_000.0
-# SV size cutoff for sequence-resolved alleles: the imputation strata's rule
-# (lrma-strata scripts/finalqc/strata_build.py var_class / classify).
-SEQUENCE_RESOLVED_SV_MINIMUM_LENGTH = 50
 DEFAULT_SAMPLE_ID_COLUMNS = ("sample_id", "research_id", "person_id")
 VARIANT_METADATA_BASE_COLUMNS = frozenset(
     {
@@ -1351,9 +1353,11 @@ def _resolve_sample_id_column(
 # ---------------------------------------------------------------------------
 
 _CACHE_DIR_NAME = ".sv_pgs_cache"
-# Bump this when _VariantDefaults, VariantClass, or the cache format changes
-# so stale caches are automatically invalidated.
-_CACHE_VERSION = 3
+# Bump this when _VariantDefaults, VariantClass, the variant typing, the record
+# filter policy or the cache format changes, so stale caches are invalidated.
+# 4: FILTER/multi-allelic skips (e89974f, d35b173), sequence-resolved typing
+# (4cdb641), COPY_NUMBER and INVERSION classes.
+_CACHE_VERSION = 4
 _VCF_CACHE_MANIFEST_VERSION = 2
 _VCF_CACHE_STATS_DTYPE = np.dtype(
     [
@@ -2362,7 +2366,7 @@ def _skipped_record_reason(*, alt_alleles: Sequence[str], svtype: str | None, fi
     if len(alt_alleles) != 1:
         if svtype is not None:
             return "multi-allelic " + svtype
-        if any(_alt_is_symbolic_or_bnd(alt) for alt in alt_alleles):
+        if any(alt_is_symbolic_or_breakend(alt) for alt in alt_alleles):
             return "multi-allelic symbolic"
         return "multi-allelic sequence"
     if filter_value not in _PASSING_FILTER_VALUES:
@@ -2478,103 +2482,6 @@ def _parse_optional_bcftools_int(field: bytes) -> int | None:
     return int(field)
 
 
-_BCFTOOLS_VALID_BASES = frozenset("ACGTNacgtn")
-
-
-def _alt_is_symbolic_or_bnd(alt: str) -> bool:
-    return bool(alt) and (alt[0] == "<" or "[" in alt or "]" in alt)
-
-
-def _is_atcgn_only(value: str) -> bool:
-    return bool(value) and all(ch in _BCFTOOLS_VALID_BASES for ch in value)
-
-
-def _trimmed_allele_core_lengths(ref: str, alt: str) -> tuple[int, int]:
-    """Lengths of REF and ALT after removing their shared prefix, then suffix."""
-    shortest = min(len(ref), len(alt))
-    prefix = 0
-    while prefix < shortest and ref[prefix] == alt[prefix]:
-        prefix += 1
-    suffix = 0
-    while suffix < shortest - prefix and ref[len(ref) - 1 - suffix] == alt[len(alt) - 1 - suffix]:
-        suffix += 1
-    return len(ref) - prefix - suffix, len(alt) - prefix - suffix
-
-
-def _sequence_resolved_class_and_length(ref: str, alt: str) -> tuple[VariantClass, float]:
-    """Type a sequence-resolved allele pair the way the imputation strata do.
-
-    SV when max(len(REF), len(ALT)) - 1 >= SEQUENCE_RESOLVED_SV_MINIMUM_LENGTH;
-    then, on the trimmed allele cores, a deletion when REF loses >= that many
-    bases and the ALT core is at most max(10, 10% of the REF core), an
-    insertion in the mirror case, otherwise a complex SV. (Telling a DUP or
-    an INV apart needs the reference sequence; supply it as variant_class in
-    the variant metadata.) Length is the inserted/deleted core length, or the
-    longer core for complex and equal-length alleles.
-    """
-    if len(ref) == 1 and len(alt) == 1:
-        return VariantClass.SNV, 1.0
-    ref_core, alt_core = _trimmed_allele_core_lengths(ref, alt)
-    deletion = ref_core - alt_core >= SEQUENCE_RESOLVED_SV_MINIMUM_LENGTH and alt_core <= max(10.0, 0.1 * ref_core)
-    insertion = alt_core - ref_core >= SEQUENCE_RESOLVED_SV_MINIMUM_LENGTH and ref_core <= max(10.0, 0.1 * alt_core)
-    if deletion or alt_core == 0:
-        length = float(ref_core - alt_core)
-    elif insertion or ref_core == 0:
-        length = float(alt_core - ref_core)
-    else:
-        length = float(max(ref_core, alt_core))
-    if max(len(ref), len(alt)) - 1 < SEQUENCE_RESOLVED_SV_MINIMUM_LENGTH:
-        return VariantClass.SMALL_INDEL, length
-    if deletion:
-        return _structural_variant_class_from_token("DEL", length), length
-    if insertion:
-        return _structural_variant_class_from_token("INS", length), length
-    return VariantClass.OTHER_COMPLEX_SV, length
-
-
-def _variant_class_and_length(
-    *,
-    pos: int,
-    ref: str,
-    alt: str,
-    svtype: str | None,
-    svlen: float | None,
-    info_end: int | None,
-) -> tuple[VariantClass, float]:
-    """Variant class and length of one bi-allelic record (both VCF parsers).
-
-    A sequence-resolved allele pair (ACGTN REF and ALT) without SVTYPE is
-    typed from its alleles by _sequence_resolved_class_and_length. Records
-    with SVTYPE, and symbolic/breakend ALTs, are typed from the SVTYPE (else
-    the symbolic ALT) token; the token scan never runs on raw sequence.
-    Length is |SVLEN| when present; symbolic alleles otherwise fall back to
-    END - POS + 1, then the longest allele.
-    """
-    sequence_resolved = (
-        not _alt_is_symbolic_or_bnd(alt) and _is_atcgn_only(ref) and _is_atcgn_only(alt)
-    )
-    if sequence_resolved:
-        sequence_class, sequence_length = _sequence_resolved_class_and_length(ref, alt)
-        length = float(abs(svlen)) if svlen is not None else sequence_length
-        if svtype is None or sequence_class == VariantClass.SNV:
-            return sequence_class, length
-    elif svlen is not None:
-        length = float(abs(svlen))
-    elif info_end is not None and info_end >= pos:
-        length = float(info_end - pos + 1)
-    else:
-        length = float(max(len(ref), len(alt)))
-    if svtype is not None:
-        variant_token = _normalize_variant_token(svtype)
-    elif _alt_is_symbolic_or_bnd(alt):
-        variant_token = _normalize_variant_token(alt)
-    else:
-        variant_token = None
-    if variant_token is None:
-        return VariantClass.OTHER_COMPLEX_SV, length
-    return _structural_variant_class_from_token(variant_token, length), length
-
-
 def _variant_defaults_from_bcftools_fields(
     chrom: str,
     pos: int,
@@ -2589,7 +2496,7 @@ def _variant_defaults_from_bcftools_fields(
 ) -> _VariantDefaults:
     """Build _VariantDefaults from one bcftools query line.
 
-    Types and sizes the record with _variant_class_and_length, like
+    Types and sizes the record with variant_typing.variant_class_and_length, like
     _variant_defaults_from_vcf_record, and uses the same AF/quality defaults.
     """
     record_id_text = record_id_field.decode("utf-8") if record_id_field else ""
@@ -2599,7 +2506,7 @@ def _variant_defaults_from_bcftools_fields(
         else record_id_text
     )
     svtype_text = svtype_field.decode("utf-8") if svtype_field else ""
-    variant_class, length = _variant_class_and_length(
+    variant_class, length = variant_class_and_length(
         pos=pos,
         ref=ref,
         alt=alt,
@@ -4190,7 +4097,7 @@ def _variant_defaults_from_vcf_record(record: Any) -> _VariantDefaults:
     if isinstance(svlen_value, (tuple, list)):
         svlen_value = svlen_value[0]
     end_value = info.get("END")
-    variant_class, length = _variant_class_and_length(
+    variant_class, length = variant_class_and_length(
         pos=pos,
         ref=ref,
         alt=alt,
@@ -4221,7 +4128,7 @@ def _variant_defaults_from_vcf_record(record: Any) -> _VariantDefaults:
 def _infer_plink_variant_class(allele_1: str, allele_2: str) -> VariantClass:
     structural_token = _symbolic_variant_token(allele_1, allele_2)
     if structural_token is not None:
-        return _structural_variant_class_from_token(structural_token, length=1.0)
+        return structural_variant_class_from_token(structural_token, length=1.0)
     if len(allele_1) == 1 and len(allele_2) == 1:
         return VariantClass.SNV
     return VariantClass.SMALL_INDEL
@@ -4450,36 +4357,11 @@ def _coerce_float(value: object) -> float:
     return float(str(value))
 
 
-def _normalize_variant_token(value: Any) -> str | None:
-    if value is None:
-        return None
-    normalized_value = str(value).strip().upper()
-    if not normalized_value:
-        return None
-    if normalized_value.startswith("<") and normalized_value.endswith(">"):
-        normalized_value = normalized_value[1:-1]
-    return normalized_value
-
-
 def _symbolic_variant_token(allele_1: str, allele_2: str) -> str | None:
     for allele in (allele_1, allele_2):
-        normalized_allele = _normalize_variant_token(allele)
+        normalized_allele = normalize_variant_token(allele)
         if normalized_allele is None:
             continue
         if any(token in normalized_allele for token in ("DEL", "DUP", "INS", "INV", "BND", "STR", "VNTR", "ME")):
             return normalized_allele
     return None
-
-
-def _structural_variant_class_from_token(token: str, length: float) -> VariantClass:
-    if "DEL" in token:
-        return VariantClass.DELETION_LONG if length >= SV_LENGTH_THRESHOLD else VariantClass.DELETION_SHORT
-    if "DUP" in token or "CNV" in token:
-        return VariantClass.DUPLICATION_LONG if length >= SV_LENGTH_THRESHOLD else VariantClass.DUPLICATION_SHORT
-    if "INS" in token or "ME" in token:
-        return VariantClass.INSERTION_MEI
-    if "INV" in token or "BND" in token:
-        return VariantClass.INVERSION_BND_COMPLEX
-    if "STR" in token or "VNTR" in token or "REPEAT" in token:
-        return VariantClass.STR_VNTR_REPEAT
-    return VariantClass.OTHER_COMPLEX_SV

@@ -514,6 +514,44 @@ def test_vcf_cache_save_uses_real_temp_file_and_roundtrips(tmp_path: Path):
     assert not list((tmp_path / ".sv_pgs_cache").glob("*.tmp.npy"))
 
 
+def test_vcf_cache_written_before_the_filter_and_typing_changes_is_not_reused(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    # Version-3 caches were built without the FILTER / multi-allelic skips and
+    # with the old CNV / INV classes, so they must be re-parsed, not reused.
+    vcf_path = tmp_path / "cohort.vcf"
+    vcf_path.write_text("##fileformat=VCFv4.2\n", encoding="utf-8")
+    config = ModelConfig()
+    variants = [
+        _VariantDefaults(
+            variant_id="sv_cnv",
+            variant_class=VariantClass.DUPLICATION_SHORT,
+            chromosome="1",
+            position=100,
+            length=500.0,
+            allele_frequency=0.25,
+            quality=50.0,
+        )
+    ]
+    variant_stats = VariantStatistics(
+        means=np.array([0.5], dtype=np.float32),
+        scales=np.array([0.5], dtype=np.float32),
+        allele_frequencies=np.array([0.25], dtype=np.float32),
+        support_counts=np.array([1], dtype=np.int32),
+    )
+    with monkeypatch.context() as version_three:
+        version_three.setattr(io_module, "_CACHE_VERSION", 3)
+        _save_vcf_to_cache(
+            vcf_path=vcf_path,
+            genotype_matrix=np.array([[0], [1]], dtype=np.int8, order="F"),
+            variants=variants,
+            variant_stats=variant_stats,
+            config=config,
+        )
+
+    assert _load_vcf_from_cache(vcf_path=vcf_path, config=config) is None
+
+
 def test_vcf_cache_load_upgrades_legacy_row_major_matrix(tmp_path: Path):
     vcf_path = tmp_path / "cohort.vcf"
     vcf_path.write_text("##fileformat=VCFv4.2\n", encoding="utf-8")
@@ -2730,7 +2768,7 @@ def test_vcf_symbolic_sv_type_is_inferred_without_metadata(tmp_path: Path):
         VariantClass.DELETION_SHORT,
         VariantClass.DUPLICATION_SHORT,
         VariantClass.INSERTION_MEI,
-        VariantClass.INVERSION_BND_COMPLEX,
+        VariantClass.INVERSION,
     ]
 
 
@@ -2784,7 +2822,7 @@ def test_plink_symbolic_sv_type_is_inferred_without_metadata(tmp_path: Path):
         VariantClass.DELETION_SHORT,
         VariantClass.DUPLICATION_SHORT,
         VariantClass.INSERTION_MEI,
-        VariantClass.INVERSION_BND_COMPLEX,
+        VariantClass.INVERSION,
     ]
 
 

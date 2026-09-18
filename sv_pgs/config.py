@@ -21,6 +21,10 @@ class VariantClass(str, Enum):
     INVERSION_BND_COMPLEX = "inversion_bnd_complex"
     STR_VNTR_REPEAT = "str_vntr_repeat"
     OTHER_COMPLEX_SV = "other_complex_sv"
+    # Appended, so the stored index of every earlier class is unchanged.
+    # Integer copy number from FORMAT/CN (multi-allelic CNVs), not a GT dosage.
+    COPY_NUMBER = "copy_number"
+    INVERSION = "inversion"
 
 
 # Default log-scale for each variant class's prior effect size.
@@ -39,6 +43,8 @@ DEFAULT_CLASS_LOG_BASELINE_SCALE = {
     VariantClass.INVERSION_BND_COMPLEX: -3.1,
     VariantClass.STR_VNTR_REPEAT: -3.5,
     VariantClass.OTHER_COMPLEX_SV: -3.3,
+    VariantClass.COPY_NUMBER: -3.3,
+    VariantClass.INVERSION: -3.1,
 }
 
 # TPB shape parameters control the "tail weight" of the shrinkage prior.
@@ -58,6 +64,8 @@ DEFAULT_CLASS_TPB_SHAPE_A: dict[VariantClass, float] = {
     VariantClass.INVERSION_BND_COMPLEX: 0.55,
     VariantClass.STR_VNTR_REPEAT: 0.6,
     VariantClass.OTHER_COMPLEX_SV: 0.6,
+    VariantClass.COPY_NUMBER: 0.6,
+    VariantClass.INVERSION: 0.55,
 }
 
 # Shape_b controls the auxiliary rate distribution.  Together with shape_a,
@@ -74,6 +82,8 @@ DEFAULT_CLASS_TPB_SHAPE_B: dict[VariantClass, float] = {
     VariantClass.INVERSION_BND_COMPLEX: 0.38,
     VariantClass.STR_VNTR_REPEAT: 0.4,
     VariantClass.OTHER_COMPLEX_SV: 0.4,
+    VariantClass.COPY_NUMBER: 0.4,
+    VariantClass.INVERSION: 0.38,
 }
 
 STRUCTURAL_VARIANT_CLASSES = (
@@ -85,6 +95,8 @@ STRUCTURAL_VARIANT_CLASSES = (
     VariantClass.INVERSION_BND_COMPLEX,
     VariantClass.STR_VNTR_REPEAT,
     VariantClass.OTHER_COMPLEX_SV,
+    VariantClass.COPY_NUMBER,
+    VariantClass.INVERSION,
 )
 
 

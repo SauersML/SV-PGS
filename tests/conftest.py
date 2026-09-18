@@ -171,6 +171,8 @@ def make_variant_records(
         VariantClass.INVERSION_BND_COMPLEX,
         VariantClass.STR_VNTR_REPEAT,
         VariantClass.OTHER_COMPLEX_SV,
+        VariantClass.COPY_NUMBER,
+        VariantClass.INVERSION,
     }
     return [
         VariantRecord(

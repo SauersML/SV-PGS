@@ -21,6 +21,8 @@ _HEADER = (
     '##INFO=<ID=AF,Number=A,Type=Float,Description="frequency">\n'
     '##INFO=<ID=END,Number=1,Type=Integer,Description="end">\n'
     '##ALT=<ID=DEL,Description="deletion">\n'
+    '##ALT=<ID=CNV,Description="copy number variant">\n'
+    '##ALT=<ID=INV,Description="inversion">\n'
     '##FORMAT=<ID=GT,Number=1,Type=String,Description="genotype">\n'
     "#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\tS0\n"
 )
@@ -35,6 +37,10 @@ _RECORDS = (
     ("substitution", 300, "AC", "GT", {"AF": "0.1"}, VariantClass.SMALL_INDEL, 2.0),
     ("sequence_deletion", 400, _SEQUENCE_DELETION, "A", {"SVTYPE": "DEL", "SVLEN": "-120", "AF": "0.1"}, VariantClass.DELETION_SHORT, 120.0),
     ("symbolic_deletion", 900, "A", "<DEL>", {"SVTYPE": "DEL", "SVLEN": "-2000", "END": "2900", "AF": "0.1"}, VariantClass.DELETION_LONG, 2000.0),
+    # GATK-SV multi-allelic CNVs are copy-number variation, not duplications,
+    # and inversions have their own class.
+    ("copy_number_variant", 1000, "N", "<CNV>", {"SVTYPE": "CNV", "SVLEN": "1064", "END": "2064", "AF": "0.3"}, VariantClass.COPY_NUMBER, 1064.0),
+    ("inversion", 2500, "N", "<INV>", {"SVTYPE": "INV", "SVLEN": "400", "END": "2900", "AF": "0.1"}, VariantClass.INVERSION, 400.0),
     # Sequence-resolved SVs without SVTYPE/SVLEN, as long-read and imputed
     # panels write them: typed and sized from the alleles.
     ("untyped_deletion", 3000, _SEQUENCE_DELETION, "A", {}, VariantClass.DELETION_SHORT, 120.0),
