@@ -74,6 +74,7 @@ from jax.scipy.special import gammaln as jax_gammaln
 from scipy.linalg import cholesky as scipy_cholesky
 from scipy.linalg import solve_triangular
 from scipy.linalg.blas import dsyrk
+from scipy.linalg.lapack import dtrtri
 from scipy.optimize import minimize
 from scipy.special import kve as scipy_bessel_kve
 
@@ -490,9 +491,16 @@ def _gpu_exact_variant_inverse_diagonal(
     for start in range(0, dimension, block_size):
         stop = min(start + block_size, dimension)
         block_width = stop - start
-        rhs_gpu = cupy.zeros((dimension, block_width), dtype=dtype)
-        rhs_gpu[start:stop, :] = cupy.eye(block_width, dtype=dtype)
-        inverse_cholesky_block_gpu = solve_triangular_gpu(cholesky_factor_gpu, rhs_gpu, lower=True)
+        # Columns start:stop of L^-1 vanish above row start, and the trailing
+        # block of L^-1 is the inverse of the trailing block of L. Solving only
+        # L[start:, start:] gives the same diagonal for p^3/3 flops instead of p^3.
+        rhs_gpu = cupy.zeros((dimension - start, block_width), dtype=dtype)
+        rhs_gpu[:block_width, :] = cupy.eye(block_width, dtype=dtype)
+        inverse_cholesky_block_gpu = solve_triangular_gpu(
+            cholesky_factor_gpu[start:, start:],
+            rhs_gpu,
+            lower=True,
+        )
         inverse_diagonal_gpu[start:stop] = (inverse_cholesky_block_gpu * inverse_cholesky_block_gpu).sum(
             axis=0,
             dtype=dtype,
@@ -10482,12 +10490,11 @@ def _solve_restricted_exact_variant_space(
 
     beta = np.asarray(solve_variant_rhs(variant_rhs), dtype=np.float64)
     if compute_beta_variance:
-        inverse_cholesky = solve_triangular(
-            variant_precision_cholesky,
-            np.eye(variant_count, dtype=np.float64),
-            lower=True,
-            check_finite=False,
-        )
+        # LAPACK dtrtri inverts the triangular factor in p^3/3 flops; a triangular
+        # solve against the identity costs p^3 for the same L^-1.
+        inverse_cholesky, inverse_info = dtrtri(variant_precision_cholesky, lower=1)
+        if inverse_info != 0:
+            raise np.linalg.LinAlgError(f"dtrtri failed on the exact variant-space Cholesky factor (info={inverse_info}).")
         beta_variance = np.maximum(
             np.einsum("ij,ij->j", inverse_cholesky, inverse_cholesky),
             1e-8,
