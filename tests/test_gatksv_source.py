@@ -8,6 +8,7 @@ import pytest
 
 from sv_pgs.config import VariantClass
 from sv_pgs.gatksv_source import GatksvSource
+from sv_pgs.sample_crosswalk import SampleCrosswalk, source_columns_for_store_samples
 
 _HEADER_START = (
     "##fileformat=VCFv4.2\n"
@@ -119,3 +120,16 @@ def test_copy_number_above_the_stored_range_raises(tmp_path: Path) -> None:
 
     with pytest.raises(ValueError, match="exceeds the stored maximum"):
         list(GatksvSource(vcf_path).blocks(10))
+
+
+def test_blocks_align_to_store_samples_through_the_crosswalk(tmp_path: Path) -> None:
+    source, blocks = _read_all(tmp_path, _KGP_LIKE_VCF, block_records=10)
+    crosswalk = SampleCrosswalk(research_ids=("R1", "R2", "R4"), sequencing_ids=("D1", "D2", "D4"))
+    # Store order D4, D3, D1, D2: D3 has no crosswalk row, R3 no store sample.
+    columns = source_columns_for_store_samples(["D4", "D3", "D1", "D2"], source.sample_ids, crosswalk)
+
+    aligned = blocks[0].aligned_to_store_samples(columns)
+
+    np.testing.assert_array_equal(aligned.values, [[0, 0, 2, 5], [0, 0, 1, 0]])
+    np.testing.assert_array_equal(aligned.no_call, [[False, True, False, False], [False, True, False, False]])
+    assert aligned.variant_ids == blocks[0].variant_ids

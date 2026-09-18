@@ -67,6 +67,29 @@ class GatksvBlock:
     def record_count(self) -> int:
         return int(self.positions.shape[0])
 
+    def aligned_to_store_samples(self, source_columns: I64Array) -> GatksvBlock:
+        """This block with one column per store sample, in store order.
+
+        ``source_columns`` comes from ``sample_crosswalk.source_columns_for_store_samples``;
+        a store sample the call set does not carry (column -1) is a no-call.
+        """
+        present = source_columns >= 0
+        values = np.zeros((self.record_count, source_columns.shape[0]), dtype=np.uint8)
+        no_call = np.ones((self.record_count, source_columns.shape[0]), dtype=bool)
+        values[:, present] = self.values[:, source_columns[present]]
+        no_call[:, present] = self.no_call[:, source_columns[present]]
+        return GatksvBlock(
+            chromosomes=self.chromosomes,
+            positions=self.positions,
+            ends=self.ends,
+            lengths=self.lengths,
+            variant_ids=self.variant_ids,
+            variant_classes=self.variant_classes,
+            is_copy_number=self.is_copy_number,
+            values=values,
+            no_call=no_call,
+        )
+
 
 def _filter_values(record: Any) -> tuple[str, ...]:
     # cyvcf2 reports both PASS and "." as None.
