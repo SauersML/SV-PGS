@@ -168,6 +168,8 @@ def candidate_pairs(first: SvSites, second: SvSites) -> SvCandidatePairs:
 # reliabilities of both sources.)
 
 MINIMUM_PAIRING_Z = 5.0
+# Fisher's z needs n > 3 for its standard error 1 / sqrt(n - 3).
+MINIMUM_CALIBRATION_SAMPLES = 4
 
 
 @dataclass(frozen=True, slots=True)
@@ -212,6 +214,25 @@ def _genotype_variance(first_dosage: F64Array, group_labels: NDArray) -> float:
     return variance
 
 
+def _without_pairing_evidence(sample_count: int) -> TwoSourceCalibration:
+    # A source constant on the shared samples, or fewer than four of them,
+    # leaves the correlation undefined: no evidence that the records pair.
+    undefined = float("nan")
+    return TwoSourceCalibration(
+        sample_count=sample_count,
+        first_mean=undefined,
+        second_mean=undefined,
+        genotype_variance=undefined,
+        second_slope=undefined,
+        first_reliability=undefined,
+        second_reliability=undefined,
+        fused_reliability=undefined,
+        first_weight=undefined,
+        second_weight=undefined,
+        pairing_z=0.0,
+    )
+
+
 def calibrate_two_sources(
     first_dosage: F64Array,
     second_values: NDArray,
@@ -228,6 +249,8 @@ def calibrate_two_sources(
     first = np.asarray(first_dosage, dtype=np.float64)[observed]
     second = np.asarray(second_values, dtype=np.float64)[observed]
     sample_count = int(observed.sum())
+    if sample_count < MINIMUM_CALIBRATION_SAMPLES or np.ptp(first) == 0.0 or np.ptp(second) == 0.0:
+        return _without_pairing_evidence(sample_count)
     first_mean = float(first.mean())
     second_mean = float(second.mean())
     first_variance = float(first.var())
@@ -238,7 +261,8 @@ def calibrate_two_sources(
     correlation = covariance / np.sqrt(first_variance * second_variance)
     sigma = np.array([[first_variance, covariance], [covariance, second_variance]])
     cross = np.array([first_variance, second_slope * genotype_variance])
-    first_weight, second_weight = np.linalg.solve(sigma, cross)
+    # Least squares keeps a perfectly correlated pair (singular Sigma) finite.
+    first_weight, second_weight = np.linalg.lstsq(sigma, cross, rcond=None)[0]
     return TwoSourceCalibration(
         sample_count=sample_count,
         first_mean=first_mean,

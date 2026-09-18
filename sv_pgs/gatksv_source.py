@@ -18,9 +18,10 @@ VARIABLE_ACROSS_BATCHES record is dropped. Breakends are dropped even when they
 pass, and so is any other multi-ALT record. Every drop is counted by reason.
 
 No-calls are kept as a mask, never filled here. AoU's genotype filter turns
-uncertain carriers into no-calls, so missingness depends on the genotype and
-any fill statistic must come from the training samples, which only the fit
-knows. The per-sample no-call counts over the kept records become a covariate.
+uncertain carriers into no-calls, so missingness depends on the genotype; the
+store rows fill them from the imputed DS where it has the same SV
+(``gatksv_store_rows``). The per-sample no-call counts over the kept records
+become a covariate.
 Samples keep this call set's own IDs (research IDs in AoU); joining them to
 the store's samples is the crosswalk's job, never a join by name.
 """
@@ -50,7 +51,8 @@ class GatksvBlock:
 
     ``values[r, i]`` is the ALT allele count (0..2) or, where
     ``is_copy_number[r]``, the integer copy number (0..254) of sample ``i``;
-    it is 0 wherever ``no_call[r, i]``.
+    it is 0 wherever ``no_call[r, i]``. ``svtypes`` is the token each record
+    was typed with: its SVTYPE, ``CNV`` for every copy-number record.
     """
 
     chromosomes: tuple[str, ...]
@@ -58,6 +60,7 @@ class GatksvBlock:
     ends: I64Array
     lengths: F64Array
     variant_ids: tuple[str, ...]
+    svtypes: tuple[str, ...]
     variant_classes: tuple[VariantClass, ...]
     is_copy_number: BoolArray
     values: U8Array
@@ -84,6 +87,7 @@ class GatksvBlock:
             ends=self.ends,
             lengths=self.lengths,
             variant_ids=self.variant_ids,
+            svtypes=self.svtypes,
             variant_classes=self.variant_classes,
             is_copy_number=self.is_copy_number,
             values=values,
@@ -181,7 +185,7 @@ class GatksvSource:
             raise ValueError("block_records must be positive.")
         reader = VCF(str(self.vcf_path))
         records = reader(self.region) if self.region is not None else reader
-        pending: list[tuple[str, int, int, float, str, VariantClass, bool, U8Array, BoolArray]] = []
+        pending: list[tuple[str, int, int, float, str, str, VariantClass, bool, U8Array, BoolArray]] = []
         try:
             for record in records:
                 svtype_value = record.INFO.get("SVTYPE")
@@ -197,11 +201,12 @@ class GatksvSource:
                 end = _info_integer(record, "END")
                 # A copy-number record is typed as a CNV whatever its SVTYPE, so it
                 # lands in COPY_NUMBER with the usual |SVLEN| / END length.
+                typed_svtype = "CNV" if copy_number else svtype
                 variant_class, length = variant_class_and_length(
                     pos=position,
                     ref=str(record.REF),
                     alt=str(record.ALT[0]),
-                    svtype="CNV" if copy_number else svtype,
+                    svtype=typed_svtype,
                     svlen=None if svlen is None else float(svlen),
                     info_end=end,
                 )
@@ -213,6 +218,7 @@ class GatksvSource:
                         int(record.end) if end is None else end,
                         length,
                         str(record.ID),
+                        "" if typed_svtype is None else typed_svtype,
                         variant_class,
                         copy_number,
                         values,
@@ -237,15 +243,16 @@ class GatksvSource:
 
 
 def _block_from_records(
-    pending: list[tuple[str, int, int, float, str, VariantClass, bool, U8Array, BoolArray]],
+    pending: list[tuple[str, int, int, float, str, str, VariantClass, bool, U8Array, BoolArray]],
 ) -> GatksvBlock:
-    chromosomes, positions, ends, lengths, variant_ids, variant_classes, copy_numbers, values, no_calls = zip(*pending)
+    chromosomes, positions, ends, lengths, variant_ids, svtypes, variant_classes, copy_numbers, values, no_calls = zip(*pending)
     return GatksvBlock(
         chromosomes=tuple(chromosomes),
         positions=np.asarray(positions, dtype=np.int64),
         ends=np.asarray(ends, dtype=np.int64),
         lengths=np.asarray(lengths, dtype=np.float64),
         variant_ids=tuple(variant_ids),
+        svtypes=tuple(svtypes),
         variant_classes=tuple(variant_classes),
         is_copy_number=np.asarray(copy_numbers, dtype=bool),
         values=np.stack(values),

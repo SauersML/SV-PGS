@@ -198,3 +198,20 @@ def test_one_to_one_resolution_keeps_the_strongest_accepted_pairs() -> None:
     chosen = resolve_one_to_one(pairs, calibrations)
 
     assert chosen.tolist() == [1, 3]
+
+
+def test_degenerate_loci_carry_no_pairing_evidence() -> None:
+    dosage = np.array([0.1, 0.9, 1.2, 0.0, 0.4, 1.8])
+    constant_calls = np.ones(6)
+    few_observed = np.array([True, True, True, False, False, False])
+    groups = np.zeros(6, dtype=np.int64)
+
+    constant = calibrate_two_sources(dosage, constant_calls, np.ones(6, dtype=bool), groups)
+    too_few = calibrate_two_sources(dosage, np.array([0, 1, 1, 0, 0, 2]), few_observed, groups)
+    # A second source that is an exact affine map of the first has a singular
+    # covariance; the calibration stays finite.
+    perfect = calibrate_two_sources(dosage, 2 * dosage + 1, np.ones(6, dtype=bool), groups)
+
+    assert constant.pairing_z == 0.0 and not constant.accepted
+    assert too_few.sample_count == 3 and too_few.pairing_z == 0.0 and not too_few.accepted
+    assert np.isfinite(perfect.first_weight) and np.isfinite(perfect.second_weight)

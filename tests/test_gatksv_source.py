@@ -78,6 +78,7 @@ def test_aou_layout_filter_policy_classes_and_copy_number(tmp_path: Path) -> Non
         VariantClass.OTHER_COMPLEX_SV,
         VariantClass.DUPLICATION_LONG,
     ]
+    assert [svtype for block in blocks for svtype in block.svtypes] == ["DEL", "INS", "CNV", "INV", "CPX", "DUP"]
     assert np.concatenate([block.is_copy_number for block in blocks]).tolist() == [False, False, True, False, False, False]
     assert np.concatenate([block.lengths for block in blocks]).tolist() == [500.0, 300.0, 9000.0, 400.0, 2500.0, 5000.0]
     values = np.vstack([block.values for block in blocks])
@@ -104,6 +105,7 @@ def test_kgp_layout_reads_copy_number_not_the_placeholder_genotype(tmp_path: Pat
 
     (block,) = blocks
     assert block.variant_classes == (VariantClass.COPY_NUMBER, VariantClass.DELETION_LONG)
+    assert block.svtypes == ("CNV", "DEL")
     assert block.is_copy_number.tolist() == [True, False]
     # CN, falling back to RD_CN where CN is "." (sample R3); the GT is ignored.
     np.testing.assert_array_equal(block.values[0], [2, 5, 3, 0])
