@@ -1,13 +1,14 @@
-"""A failed CUDA-graph capture must leave the sample-space CG solve untouched.
+"""The GPU sample-space CG must never attempt a CUDA-graph stream capture.
 
-``_solve_sample_space_rhs_gpu_inner`` tries to capture one CG iteration into a
-CUDA graph. With real CuPy the capture fails on every eligible (fp16/fp32
-resident) cache because the genotype matmul does a host sync
-(``bool(cupy.any(...))``). The warm-up iteration that precedes the capture
-used to run in place, so a failed capture left solution/residual/search one
-CG step ahead of the host ``residual_dot`` the legacy loop continued from:
-the next step size and direction update mixed two iterations. A failed
-capture must now be indistinguishable from a device without graph support.
+``_solve_sample_space_rhs_gpu_inner`` used to capture one CG iteration into a
+CUDA graph for fp16/fp32-resident caches. The captured body applies the
+genotype operator, which is cuBLAS, and CuPy refuses cuBLAS during capture
+("calling cuBLAS API during stream capture is currently unsupported"), so the
+capture failed on every eligible solve. Measured on A100, V100 and H100, the
+solve that attempted it then diverged: the residual grew from 6.7e4 to 1e30
+in 60 iterations and the run aborted, while the same system without the
+capture attempt converged in 13 iterations. The loop now runs the plain
+masked PCG recurrence only.
 """
 from __future__ import annotations
 
@@ -20,11 +21,15 @@ from sv_pgs.genotype import as_raw_genotype_matrix
 from sv_pgs.mixture_inference import _solve_sample_space_rhs_gpu_inner
 
 
-class _CaptureFailsStream:
+class _RecordingCaptureStream:
+    """A capture-capable stream that records every capture attempt."""
+
+    capture_attempts = 0
+
     def __init__(self, non_blocking: bool = False) -> None:
         self.non_blocking = non_blocking
 
-    def __enter__(self) -> "_CaptureFailsStream":
+    def __enter__(self) -> "_RecordingCaptureStream":
         return self
 
     def __exit__(self, *exc_info: Any) -> None:
@@ -34,11 +39,12 @@ class _CaptureFailsStream:
         return None
 
     def begin_capture(self) -> None:
-        raise RuntimeError("operation not permitted when stream is capturing")
+        type(self).capture_attempts += 1
+        raise NotImplementedError("calling cuBLAS API during stream capture is currently unsupported")
 
 
 class _NoGraphStream:
-    """A stream type without capture support: the graph path is never tried."""
+    """A stream type without capture support."""
 
     def __init__(self, non_blocking: bool = False) -> None:
         self.non_blocking = non_blocking
@@ -82,10 +88,11 @@ def _solve(stream_class: type) -> tuple[np.ndarray, int, np.ndarray]:
     return np.asarray(solution), int(iterations), np.linalg.solve(operator, right_hand_side)
 
 
-def test_failed_graph_capture_does_not_advance_the_cg_recurrence() -> None:
-    failed_solution, failed_iterations, reference = _solve(_CaptureFailsStream)
+def test_gpu_cg_never_attempts_stream_capture() -> None:
+    capture_solution, capture_iterations, reference = _solve(_RecordingCaptureStream)
     plain_solution, plain_iterations, _ = _solve(_NoGraphStream)
 
-    assert failed_iterations == plain_iterations
-    np.testing.assert_array_equal(failed_solution, plain_solution)
-    np.testing.assert_allclose(failed_solution, reference, rtol=1e-7, atol=1e-9)
+    assert _RecordingCaptureStream.capture_attempts == 0
+    assert capture_iterations == plain_iterations
+    np.testing.assert_array_equal(capture_solution, plain_solution)
+    np.testing.assert_allclose(capture_solution, reference, rtol=1e-7, atol=1e-9)
