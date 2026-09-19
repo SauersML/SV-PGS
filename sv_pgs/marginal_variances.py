@@ -60,7 +60,8 @@ from scipy.stats import norm
 class BulkSolve:
     """One model's refresh: every quantity is sample-side, except the p x |L| cross products.
 
-    ``resolved_cross`` is C = Xt' K_S^-1 Xt_L, formed in the refresh's final pass. ``bulk_trace`` and
+    ``resolved_cross`` is C = Xt' K_S^-1 Xt_L, formed in the refresh's final pass: dense (p x |L|), or only
+    on each block's LD window as a ``WindowCross`` (what production stores). ``bulk_trace`` and
     ``bulk_square_trace`` are tr(K_S^-1)/n and tr(K_S^-2)/n, from the bulk solve's probe columns.
     ``kernel_square_trace`` is tr(Q^2)/n for Q = K_S^-1 - Z_L core^-1 Z_L' (Z_L = K_S^-1 Xt_L), the
     sample-side operator that couples any two bulk variants once the resolved sites are eliminated. Its
@@ -70,11 +71,25 @@ class BulkSolve:
     site_precision: NDArray[np.float64]
     resolved: NDArray[np.int64]
     resolved_core: NDArray[np.float64]
-    resolved_cross: NDArray[np.float64]
+    resolved_cross: "NDArray[np.float64] | WindowCross"
     bulk_trace: float
     bulk_square_trace: float
     kernel_square_trace: float
     sample_count: int
+
+
+@dataclass(frozen=True)
+class WindowCross:
+    """C = Xt' K_S^-1 Xt_L kept only where it is not a chance coupling: block b's rows against the resolved
+    sites inside b's window (the blocks b-1, b, b+1 when cross-Grams are supplied, else b alone).
+
+    ``positions[b]`` indexes ``BulkSolve.resolved``, and ``values[b]`` is (|b|, len(positions[b])).
+    Beyond the window, xt_j' K_S^-1 xt_l has mean zero, and it enters the maps through its expected square
+    (``marginal_variances``, ``variance_jvp``). Memory is p x (resolved sites per window), not p x |L|.
+    """
+
+    positions: tuple[NDArray[np.int64], ...]
+    values: tuple[NDArray[np.float64], ...]
 
 
 @dataclass(frozen=True)
@@ -199,7 +214,7 @@ def marginals_from_quadratics(
     resolved_cross: NDArray[np.float64],
     bulk_quadratic: NDArray[np.float64],
 ) -> NDArray[np.float64]:
-    """Identity 1: diag(A^-1) from q_j = xt_j' K_S^-1 xt_j (bulk j) and the resolved core and cross products."""
+    """Identity 1 with a dense C: diag(A^-1) from q_j = xt_j' K_S^-1 xt_j (bulk j) and the resolved core."""
     is_resolved = np.zeros(site_precision.shape[0], dtype=bool)
     is_resolved[resolved] = True
     bulk_variance = np.where(is_resolved, 0.0, 1.0 / np.where(is_resolved, 1.0, site_precision))
@@ -209,21 +224,123 @@ def marginals_from_quadratics(
     return variances
 
 
-def marginal_variances(solve: BulkSolve, grams: BlockGrams) -> NDArray[np.float64]:
-    """(p,) diag(A^-1) for one model, by identities 1 and 2 (module docstring)."""
+def _block_index(grams: BlockGrams) -> NDArray[np.int64]:
+    index = np.empty(sum(members.shape[0] for members in grams.blocks), dtype=np.int64)
+    for block, members in enumerate(grams.blocks):
+        index[members] = block
+    return index
+
+
+def _window_blocks(grams: BlockGrams, block: int) -> list[int]:
+    if grams.next_cross:
+        return [neighbour for neighbour in (block - 1, block, block + 1) if 0 <= neighbour < len(grams.blocks)]
+    return [block]
+
+
+def window_cross(solve: BulkSolve, grams: BlockGrams) -> WindowCross:
+    """C restricted to each block's window (``WindowCross``), from a dense C or as given."""
+    if isinstance(solve.resolved_cross, WindowCross):
+        return solve.resolved_cross
+    block_of_resolved = _block_index(grams)[solve.resolved]
+    positions = []
+    values = []
+    for block, members in enumerate(grams.blocks):
+        inside = np.nonzero(np.isin(block_of_resolved, _window_blocks(grams, block)))[0].astype(np.int64)
+        positions.append(inside)
+        values.append(solve.resolved_cross[np.ix_(members, inside)] if inside.shape[0] else np.zeros((members.shape[0], 0)))
+    return WindowCross(positions=tuple(positions), values=tuple(values))
+
+
+def _cross_rows(cross: WindowCross, block: int, positions: NDArray[np.int64]) -> NDArray[np.float64]:
+    """C on block's rows against ``positions`` (indices into L); zero where the pair is beyond the window."""
+    stored = {int(position): column for column, position in enumerate(cross.positions[block].tolist())}
+    out = np.zeros((cross.values[block].shape[0], positions.shape[0]))
+    for column, position in enumerate(positions.tolist()):
+        if position in stored:
+            out[:, column] = cross.values[block][:, stored[position]]
+    return out
+
+
+@dataclass(frozen=True)
+class _BlockTerms:
+    """One block's window algebra: Sigma on (own rows) x (window columns) for bulk pairs (identity 2 plus the
+    window's resolved spikes), the own bulk quadratics q, Sigma_bb in full, and the window's resolved positions."""
+
+    columns: NDArray[np.int64]
+    rows: NDArray[np.float64]
+    quadratic: NDArray[np.float64]
+    near: NDArray[np.int64]
+    loadings: NDArray[np.float64]
+    covariance: NDArray[np.float64]
+
+
+def _block_terms(
+    solve: BulkSolve, grams: BlockGrams, cross: WindowCross, bulk_variance: NDArray[np.float64], core_inverse: NDArray[np.float64], block: int
+) -> _BlockTerms:
+    gram, columns, own = _window(grams, block)
+    members = grams.blocks[block]
+    window_variance = bulk_variance[columns]
+    eigenvalues, eigenvectors = _whitened_spectrum(gram, window_variance)
+    far_trace = far_field_trace(solve.bulk_trace, solve.bulk_square_trace, solve.sample_count, eigenvalues)
+    projected = (gram * np.sqrt(window_variance)[None, :]) @ eigenvectors
+    quadratic = far_trace * gram[own] - far_trace**2 * (projected[own] / (1.0 + far_trace * eigenvalues)[None, :]) @ projected.T
+    near = cross.positions[block]
+    near_inverse = core_inverse[np.ix_(near, near)]
+    window_cross_rows = np.concatenate([_cross_rows(cross, member, near) for member in _window_blocks(grams, block)], axis=0)
+    spikes = cross.values[block] @ near_inverse @ window_cross_rows.T
+    own_variance = bulk_variance[members]
+    diagonal = (np.arange(members.shape[0]), np.arange(own.start, own.stop))
+    rows = -own_variance[:, None] * (quadratic - spikes) * window_variance[None, :]
+    rows[diagonal] += own_variance
+    # Sigma_jL = -D_j (C core^-1)_jL, with C_j known on the window's resolved sites.
+    loadings = cross.values[block] @ core_inverse[near, :]
+    covariance = rows[:, own].copy()
+    local = np.nonzero(np.isin(solve.resolved, members))[0]
+    if local.shape[0]:
+        member_positions = np.array([int(np.nonzero(members == variant)[0][0]) for variant in solve.resolved[local].tolist()])
+        bulk_to_resolved = -own_variance[:, None] * loadings[:, local]
+        covariance[:, member_positions] = bulk_to_resolved
+        covariance[member_positions, :] = bulk_to_resolved.T
+        covariance[np.ix_(member_positions, member_positions)] = core_inverse[np.ix_(local, local)]
+    return _BlockTerms(columns=columns, rows=rows, quadratic=quadratic[diagonal], near=near, loadings=loadings, covariance=covariance)
+
+
+def _prepare(solve: BulkSolve, grams: BlockGrams) -> tuple[WindowCross, NDArray[np.float64], NDArray[np.float64], NDArray[np.bool_]]:
     variant_count = solve.site_precision.shape[0]
     is_resolved = np.zeros(variant_count, dtype=bool)
     is_resolved[solve.resolved] = True
     bulk_variance = np.where(is_resolved, 0.0, 1.0 / np.where(is_resolved, 1.0, solve.site_precision))
-    bulk_quadratic = np.empty(variant_count)
+    core_inverse = np.linalg.inv(solve.resolved_core) if solve.resolved.shape[0] else np.zeros((0, 0))
+    return window_cross(solve, grams), bulk_variance, core_inverse, is_resolved
+
+
+def marginal_variances(solve: BulkSolve, grams: BlockGrams) -> NDArray[np.float64]:
+    """(p,) diag(A^-1) for one model, by identities 1 and 2 (module docstring).
+
+    With C kept on LD windows only, a bulk j's coupling to resolved sites beyond its window, D_j^2 c_j,far
+    core^-1 c_j,far', enters by its expectation. For far pairs Sigma_jl ~ -D_j c_jl (core^-1)_ll and
+    E[Sigma_jl^2] = u_j u_l tr(Q^2) / n^2 (the far-field model of ``variance_jvp``), so the term is
+    u_j tr(Q^2) / n^2 sum_{l far} u_l / Sigma_ll, with u = diag(Sigma_bb R_b Sigma_bb).
+    """
+    cross, bulk_variance, core_inverse, is_resolved = _prepare(solve, grams)
+    variant_count = solve.site_precision.shape[0]
+    near_variance = np.empty(variant_count)
+    sandwich = np.zeros(variant_count)
+    near_totals = np.zeros(len(grams.blocks))
+    resolved_variance = np.diag(core_inverse)
+    for block, members in enumerate(grams.blocks):
+        terms = _block_terms(solve, grams, cross, bulk_variance, core_inverse, block)
+        near_variance[members] = np.diag(terms.covariance)
+        sandwich[members] = np.einsum("ij,jk,ki->i", terms.covariance, grams.within[block], terms.covariance)
+    resolved_weight = sandwich[solve.resolved] / resolved_variance if solve.resolved.shape[0] else np.zeros(0)
     for block in range(len(grams.blocks)):
-        gram, columns, own = _window(grams, block)
-        window_variance = bulk_variance[columns]
-        eigenvalues, eigenvectors = _whitened_spectrum(gram, window_variance)
-        far_trace = far_field_trace(solve.bulk_trace, solve.bulk_square_trace, solve.sample_count, eigenvalues)
-        quadratic = _quadratic_from_spectrum(gram, window_variance, far_trace, eigenvalues, eigenvectors)
-        bulk_quadratic[grams.blocks[block]] = quadratic[own]
-    return marginals_from_quadratics(solve.site_precision, solve.resolved, solve.resolved_core, solve.resolved_cross, bulk_quadratic)
+        near_totals[block] = float(np.sum(resolved_weight[cross.positions[block]]))
+    far_scale = solve.kernel_square_trace / solve.sample_count
+    block_of = _block_index(grams)
+    far = sandwich * far_scale * (float(np.sum(resolved_weight)) - near_totals[block_of])
+    variances = np.where(is_resolved, near_variance, near_variance + far)
+    variances[solve.resolved] = resolved_variance
+    return variances
 
 
 def approximation_scale(solve: BulkSolve) -> float:
@@ -270,114 +387,93 @@ def certificate_tolerance(solve: BulkSolve, bulk_probe_count: int) -> float:
     return approximation_scale(solve) * float(np.sqrt(1.0 + 2.0 / bulk_probe_count))
 
 
-def covariance_products(solve: BulkSolve, probes: NDArray[np.float64], back_products: NDArray[np.float64]) -> NDArray[np.float64]:
-    """Sigma v for variant-side vectors v (p x k), from the solver's back products Xt' K_S^-1 Xt (D_S v).
+def covariance_products(
+    solve: BulkSolve, probes: NDArray[np.float64], back_products: NDArray[np.float64], resolved_coupling: NDArray[np.float64]
+) -> NDArray[np.float64]:
+    """Sigma v for variant-side vectors v (p x k), exactly, from two solver products.
 
-    Block elimination (module docstring, identity 1), with C = Xt' K_S^-1 Xt_L and t = C' D v:
-        (Sigma v)_S = D v - D (Xt' K_S^-1 Xt D v) + D C core^-1 (t - v_L),
-        (Sigma v)_L = core^-1 (v_L - t).
-    The solver pushes D_S v forward in one pass, solves K_S in the next refresh's passes, and forms the back
-    product in that refresh's final pass, so the certificate costs no pass of its own.
+    With u = Xt (D_S v) (forward pass), t = Z_L' u (sample-side, |L| x k) and
+    w = K_S^-1 u - Z_L core^-1 (t - v_L), the solver returns ``back_products`` = Xt' w and
+    ``resolved_coupling`` = t. Block elimination (identity 1) gives
+        (Sigma v)_S = D v - D (Xt' w),   (Sigma v)_L = core^-1 (v_L - t).
+    The forward product, the K_S solve and the back product ride existing passes (the certificate is lagged
+    one refresh). No p x |L| array is needed.
     """
     is_resolved = np.zeros(solve.site_precision.shape[0], dtype=bool)
     is_resolved[solve.resolved] = True
     bulk_variance = np.where(is_resolved, 0.0, 1.0 / np.where(is_resolved, 1.0, solve.site_precision))
-    scaled = bulk_variance[:, None] * probes
-    coupling = solve.resolved_cross.T @ scaled
-    resolved_part = np.linalg.solve(solve.resolved_core, coupling - probes[solve.resolved])
-    products = scaled - bulk_variance[:, None] * back_products + bulk_variance[:, None] * (solve.resolved_cross @ resolved_part)
-    products[solve.resolved] = -resolved_part
+    products = bulk_variance[:, None] * (probes - back_products)
+    products[solve.resolved] = np.linalg.solve(solve.resolved_core, probes[solve.resolved] - resolved_coupling)
     return products
-
-
-def _window_rows(
-    solve: BulkSolve, grams: BlockGrams, bulk_variance: NDArray[np.float64], block: int
-) -> tuple[NDArray[np.float64], NDArray[np.int64], NDArray[np.float64]]:
-    """Sigma restricted to (block b's rows) x (its window's columns), bulk parts only, by identity 2,
-    and the own block's bulk quadratics q_j = xt_j' K_S^-1 xt_j."""
-    gram, columns, own = _window(grams, block)
-    window_variance = bulk_variance[columns]
-    eigenvalues, eigenvectors = _whitened_spectrum(gram, window_variance)
-    far_trace = far_field_trace(solve.bulk_trace, solve.bulk_square_trace, solve.sample_count, eigenvalues)
-    projected = (gram * np.sqrt(window_variance)[None, :]) @ eigenvectors
-    quadratic = far_trace * gram[own] - far_trace**2 * (projected[own] / (1.0 + far_trace * eigenvalues)[None, :]) @ projected.T
-    spikes = solve.resolved_cross[grams.blocks[block]] @ np.linalg.solve(solve.resolved_core, solve.resolved_cross[columns].T)
-    own_variance = bulk_variance[grams.blocks[block]]
-    rows = -own_variance[:, None] * (quadratic - spikes) * window_variance[None, :]
-    rows[np.arange(own_variance.shape[0]), np.arange(own.start, own.stop)] += own_variance
-    return rows, columns, quadratic[np.arange(own_variance.shape[0]), np.arange(own.start, own.stop)]
-
-
-def _own_block_covariance(solve: BulkSolve, grams: BlockGrams, block: int, rows: NDArray[np.float64], columns: NDArray[np.int64],
-                          bulk_variance: NDArray[np.float64], loadings: NDArray[np.float64], core_inverse: NDArray[np.float64]) -> NDArray[np.float64]:
-    """Sigma_bb in full: bulk-bulk from the window rows, bulk-resolved and resolved-resolved exactly."""
-    members = grams.blocks[block]
-    own = np.isin(columns, members)
-    covariance = rows[:, own].copy()
-    resolved_position = {variant: position for position, variant in enumerate(solve.resolved.tolist())}
-    local = [(position, resolved_position[variant]) for position, variant in enumerate(members.tolist()) if variant in resolved_position]
-    if local:
-        member_positions = np.array([position for position, _ in local])
-        resolved_positions = np.array([index for _, index in local])
-        bulk_to_resolved = -bulk_variance[members][:, None] * loadings[members][:, resolved_positions]
-        covariance[:, member_positions] = bulk_to_resolved
-        covariance[member_positions, :] = bulk_to_resolved.T
-        covariance[np.ix_(member_positions, member_positions)] = core_inverse[np.ix_(resolved_positions, resolved_positions)]
-    return covariance
 
 
 def variance_jvp(solve: BulkSolve, grams: BlockGrams, direction: NDArray[np.float64]) -> JacobianProduct:
     """d diag(Sigma) / d Pi applied to w (p x r): -diag(Sigma diag(w) Sigma), i.e. -sum_k Sigma_jk^2 w_k.
 
-    Exact for every pair involving a resolved site: Sigma_LL = core^-1, and Sigma_Lk = -D_k (core^-1 C_k')
-    for bulk k. Exact up to the far-field equivalent for bulk pairs inside a window (identity 2).
-
-    Bulk pairs beyond the window. For blocks b and c beyond each other's windows, integrating the rest
-    of the model out leaves a two-block precision whose off-diagonal block is the chance coupling
-    X_b' Q X_c, with Q the operator in ``kernel_square_trace``. To first order in that coupling,
-    Sigma_bc = -Sigma_bb (X_b' Q X_c) Sigma_cc. With exchangeable rows and unlinked blocks, the entries
-    of X_b' Q X_c have covariance R_b (x) R_c tr(Q^2) / n^2, so
-
-        E[Sigma_jk^2] = u_j u_k tr(Q^2) / n^2,   u = diag(Sigma_bb R_b Sigma_bb) (the block sandwich).
-
-    Here, not |xt_j|^2 Sigma_jj^2: a variant's LD partners absorb most of its chance coupling, and
-    only the sandwich carries that. Treating the entries as Gaussian, the variance of the weighted sum
-    is 2 u_j^2 (tr(Q^2)/n^2)^2 sum_k u_k^2 w_k^2. Resolved k are excluded, since they are exact.
+    - **Resolved pairs:** Sigma_LL = core^-1 exactly. Sigma_Lk = -D_k (C_k core^-1)_L for bulk k whose window
+      holds the resolved site, with C_k taken on k's window.
+    - **Bulk pairs inside a window:** through identity 2 and the window's resolved spikes.
+    - **Every pair beyond the window (bulk or resolved):** by its expected square. For blocks b and c
+      beyond each other's windows, the two-block precision's off-diagonal block is the chance coupling
+      X_b' Q X_c, with Q the operator in ``kernel_square_trace``. To first order,
+      Sigma_bc = -Sigma_bb (X_b' Q X_c) Sigma_cc. With exchangeable rows and unlinked blocks,
+          E[Sigma_jk^2] = u_j u_k tr(Q^2) / n^2,   u = diag(Sigma_bb R_b Sigma_bb) (the block sandwich),
+      with resolved sites as members of their blocks. Treating the entries as Gaussian, the variance of the
+      weighted sum is 2 u_j^2 (tr(Q^2)/n^2)^2 sum_k u_k^2 w_k^2.
+    - **The block sandwich, not |xt_j|^2 Sigma_jj^2:** a variant's LD partners absorb most of its chance
+      coupling with distant blocks.
     """
+    cross, bulk_variance, core_inverse, is_resolved = _prepare(solve, grams)
     variant_count = solve.site_precision.shape[0]
-    is_resolved = np.zeros(variant_count, dtype=bool)
-    is_resolved[solve.resolved] = True
-    bulk_variance = np.where(is_resolved, 0.0, 1.0 / np.where(is_resolved, 1.0, solve.site_precision))
-    core_inverse = np.linalg.inv(solve.resolved_core)
-    loadings = solve.resolved_cross @ core_inverse  # (p, |L|): Sigma_jL = -D_j loadings_jL (bulk j)
     squared_variance = np.square(bulk_variance)
-    window_rows = []
     sandwich = np.zeros(variant_count)
-    for block in range(len(grams.blocks)):
-        rows, columns, _own_quadratic = _window_rows(solve, grams, bulk_variance, block)
-        window_rows.append((rows, columns))
-        covariance = _own_block_covariance(solve, grams, block, rows, columns, bulk_variance, loadings, core_inverse)
-        sandwich[grams.blocks[block]] = np.einsum("ij,jk,ki->i", covariance, grams.within[block], covariance)
-    pair_scale = solve.kernel_square_trace / solve.sample_count  # tr(Q^2) / n^2
-    bulk_sandwich = np.where(is_resolved, 0.0, sandwich)
-    chance_weight = bulk_sandwich[:, None] * direction
-    chance_square = np.square(chance_weight)
+    for block, members in enumerate(grams.blocks):
+        terms = _block_terms(solve, grams, cross, bulk_variance, core_inverse, block)
+        sandwich[members] = np.einsum("ij,jk,ki->i", terms.covariance, grams.within[block], terms.covariance)
+    pair_scale = solve.kernel_square_trace / solve.sample_count
+    chance_weight = sandwich[:, None] * direction
+    chance_total = chance_weight.sum(axis=0)
+    chance_square_total = np.square(chance_weight).sum(axis=0)
+    # Resolved rows take their resolved partners exactly from core^-1, so their chance sums run over bulk partners only.
+    bulk_chance_weight = np.where(is_resolved[:, None], 0.0, chance_weight)
+    block_of = _block_index(grams)
     values = np.zeros_like(direction)
     variance = np.zeros_like(direction)
     window_part = np.zeros_like(direction)
-    for block, (rows, columns) in enumerate(window_rows):
-        members = grams.blocks[block]
-        window_sum = np.square(rows) @ direction[columns]
-        resolved_sum = squared_variance[members][:, None] * (np.square(loadings[members]) @ direction[solve.resolved])
-        row_scale = bulk_sandwich[members] * pair_scale
-        chance_far = row_scale[:, None] * (chance_weight.sum(axis=0) - chance_weight[columns].sum(axis=0))[None, :]
+    resolved_bulk_near = np.zeros((solve.resolved.shape[0], direction.shape[1]))
+    window_chance = np.zeros((len(grams.blocks), direction.shape[1]))
+    window_chance_square = np.zeros((len(grams.blocks), direction.shape[1]))
+    window_bulk_chance = np.zeros((len(grams.blocks), direction.shape[1]))
+    window_bulk_chance_square = np.zeros((len(grams.blocks), direction.shape[1]))
+    for block, members in enumerate(grams.blocks):
+        window_members = np.concatenate([grams.blocks[member] for member in _window_blocks(grams, block)])
+        window_chance[block] = chance_weight[window_members].sum(axis=0)
+        window_chance_square[block] = np.square(chance_weight[window_members]).sum(axis=0)
+        window_bulk_chance[block] = bulk_chance_weight[window_members].sum(axis=0)
+        window_bulk_chance_square[block] = np.square(bulk_chance_weight[window_members]).sum(axis=0)
+    for block, members in enumerate(grams.blocks):
+        terms = _block_terms(solve, grams, cross, bulk_variance, core_inverse, block)
+        window_sum = np.square(terms.rows) @ direction[terms.columns]
+        loadings = terms.loadings  # (|b|, |L|)
+        near = terms.near
+        resolved_sum = squared_variance[members][:, None] * (np.square(loadings[:, near]) @ direction[solve.resolved[near]])
+        row_scale = sandwich[members] * pair_scale
+        chance_far = row_scale[:, None] * (chance_total - window_chance[block])[None, :]
         values[members] = -(window_sum + resolved_sum + chance_far)
         window_part[members] = window_sum
-        variance[members] = 2.0 * np.square(row_scale)[:, None] * (chance_square.sum(axis=0) - chance_square[columns].sum(axis=0))[None, :]
+        variance[members] = 2.0 * np.square(row_scale)[:, None] * (chance_square_total - window_chance_square[block])[None, :]
+        # Resolved rows: bulk partners whose window holds the resolved site, exactly.
+        weighted = squared_variance[members][:, None, None] * np.square(loadings)[:, :, None] * direction[members][:, None, :]
+        resolved_bulk_near[near] += weighted.sum(axis=0)[near]
     if solve.resolved.shape[0]:
+        resolved_blocks = block_of[solve.resolved]
+        resolved_scale = sandwich[solve.resolved] * pair_scale
         resolved_rows = np.square(core_inverse) @ direction[solve.resolved]
-        bulk_columns = np.square(loadings).T @ (squared_variance[:, None] * direction)
-        values[solve.resolved] = -(resolved_rows + bulk_columns)
-        variance[solve.resolved] = 0.0
-        window_part[solve.resolved] = 0.0
+        bulk_total = bulk_chance_weight.sum(axis=0)
+        bulk_square_total = np.square(bulk_chance_weight).sum(axis=0)
+        chance_resolved = resolved_scale[:, None] * (bulk_total[None, :] - window_bulk_chance[resolved_blocks])
+        values[solve.resolved] = -(resolved_rows + resolved_bulk_near + chance_resolved)
+        variance[solve.resolved] = 2.0 * np.square(resolved_scale)[:, None] * (bulk_square_total[None, :] - window_bulk_chance_square[resolved_blocks])
+        window_part[solve.resolved] = resolved_bulk_near
     return JacobianProduct(values=values, standard_error=np.sqrt(variance), window_part=window_part)
+

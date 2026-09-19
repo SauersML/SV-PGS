@@ -22,6 +22,7 @@ from sv_pgs.marginal_variances import (
     marginals_from_quadratics,
     variance_jvp,
     window_bulk_quadratic,
+    window_cross,
 )
 
 
@@ -163,15 +164,18 @@ def _strong_case(seed: int):
     return generator, columns, precision, blocks, _solve(columns, precision, _resolved(variance, sample_count))
 
 
-def test_covariance_products_are_exact_given_the_back_products():
+def test_covariance_products_are_exact_given_the_solver_products():
     generator, columns, precision, _blocks, solve = _strong_case(6)
     bulk = 1.0 / precision
     bulk[solve.resolved] = 0.0
     kernel_inverse = np.linalg.inv(np.eye(columns.shape[0]) + (columns * bulk) @ columns.T)
+    z_resolved = kernel_inverse @ columns[:, solve.resolved]
     probes = generator.choice([-1.0, 1.0], size=(columns.shape[1], 5))
-    back = columns.T @ (kernel_inverse @ (columns @ (bulk[:, None] * probes)))
+    forward = columns @ (bulk[:, None] * probes)
+    coupling = z_resolved.T @ forward
+    back = columns.T @ (kernel_inverse @ forward - z_resolved @ np.linalg.solve(solve.resolved_core, coupling - probes[solve.resolved]))
     covariance = np.linalg.inv(columns.T @ columns + np.diag(precision))
-    assert np.allclose(covariance_products(solve, probes, back), covariance @ probes, rtol=1e-8, atol=1e-12)
+    assert np.allclose(covariance_products(solve, probes, back, coupling), covariance @ probes, rtol=1e-8, atol=1e-12)
 
 
 def test_variance_jvp_tracks_the_dense_derivative():
@@ -180,13 +184,21 @@ def test_variance_jvp_tracks_the_dense_derivative():
     direction = generator.uniform(0.0, 1.0, size=(columns.shape[1], 3)) * precision[:, None]
     exact = -np.einsum("jk,kr,jk->jr", covariance, direction, covariance)
     product = variance_jvp(solve, _grams(columns, blocks), direction)
-    error = np.abs(product.values - exact)
-    assert np.all(error[solve.resolved] <= 1e-8 * np.abs(exact[solve.resolved]))
     # Sums of squared entries carry at most twice the entries' relative error (d x^2 / x^2 = 2 dx / x),
     # and the B-products consume block sums.
     scale = approximation_scale(solve)
     for block in blocks:
         assert np.all(np.abs(product.values[block].sum(axis=0) - exact[block].sum(axis=0)) <= 2 * scale * np.abs(exact[block].sum(axis=0)))
+    resolved = solve.resolved
+    assert np.all(np.abs(product.values[resolved].sum(axis=0) - exact[resolved].sum(axis=0)) <= 2 * scale * np.abs(exact[resolved].sum(axis=0)))
+
+
+def test_window_cross_matches_the_dense_maps():
+    _generator, columns, precision, blocks, solve = _strong_case(12)
+    grams = _grams(columns, blocks)
+    dense = marginal_variances(solve, grams)
+    windowed = BulkSolve(**{**solve.__dict__, "resolved_cross": window_cross(solve, grams)})
+    assert np.array_equal(marginal_variances(windowed, grams), dense)
 
 
 def test_certificate_tolerance_adds_the_probe_error_in_quadrature():
@@ -194,3 +206,4 @@ def test_certificate_tolerance_adds_the_probe_error_in_quadrature():
     scale = approximation_scale(solve)
     assert np.isclose(certificate_tolerance(solve, 2), scale * np.sqrt(2.0))
     assert certificate_tolerance(solve, 10**9) < scale * (1 + 1e-8)
+
