@@ -12,10 +12,14 @@ candidate. The hypotheses differ, so the tests are not interchangeable:
   even when the two scores are equally accurate, so it never supports
   "predicts better" and is not implemented here.
 
-Scores pooled over cross-fitted folds form a degenerate U-statistic: every
-cross-fold pair of samples enters twice, because each sample's outcome trains
-the other folds' predictors. The naive sandwich variance then understates the
-null variance by about half. `cross_fit_pair_variance` gives the closed-form
+Cross-fitting yields K different predictors, one per held-out fold, each with
+its own fitted scale. Pooling their scores into one correlation adds a
+between-fold component that no per-sample variance sees. With empirical-Bayes
+and sparse fits under an equal-accuracy null it inflated the z SD to about 10.
+`cross_fit_delta_r2` therefore evaluates each fold's predictor on its own fold
+and averages with weights n_f / n. The fold statistics still share training
+samples: every cross-fold pair of samples enters twice, because each sample's
+outcome trains the other folds' predictors. Its variance adds the closed-form
 pair term for linear (Gaussian empirical-Bayes posterior-mean) predictors.
 Clusters (family ids, coded 0..C-1) make every variance family-block robust;
 folds must keep each family inside one fold.
@@ -90,70 +94,79 @@ def paired_delta_r2(
     baseline: NDArray,
     candidate: NDArray,
     clusters: NDArray | None = None,
-    pair_variance: float = 0.0,
 ) -> PairedComparison:
-    """Paired delta R^2 with a family-block influence-function standard error.
-
-    `pair_variance` is the cross-fit pair term from `cross_fit_pair_variance`,
-    in the same summed-influence units. Pass 0 only for a held-out set whose
-    samples never trained either score.
-    """
+    """Paired delta R^2 on one held-out set that never trained either score,
+    with a family-block influence-function standard error."""
     delta, influence = delta_r2_influence(outcome, baseline, candidate)
     totals = cluster_totals(influence, clusters)
-    sample_count = outcome.shape[0]
-    variance = (float(totals @ totals) + pair_variance) / sample_count**2
-    standard_error = math.sqrt(variance)
+    standard_error = math.sqrt(float(totals @ totals)) / outcome.shape[0]
     return PairedComparison(delta, standard_error, delta / standard_error)
 
 
-def cross_fit_pair_variance(
+def cross_fit_delta_r2(
     outcome: NDArray,
     baseline: NDArray,
     candidate: NDArray,
     fold_of_sample: NDArray,
     baseline_arm: CrossFitArm,
     candidate_arm: CrossFitArm,
-) -> float:
-    """Closed-form pair term of the pooled cross-fitted paired delta R^2.
+    clusters: NDArray | None = None,
+) -> PairedComparison:
+    """Fold-stratified paired delta R^2 of cross-fitted scores with the pair-corrected variance.
 
-    With a_{il} = sum_arm w_{arm,i} H^{arm}_{il} (y_l - mean y), where H is the
-    arm's cross-fold smoother x_i' M_fold(i) x_l and w the derivative of sample
-    i's delta-R^2 influence with respect to its own score, the pair term is
-    sum over cross-fold pairs of a_{il} a_{li}. It equals
-    sum_{f != g} sum_{arm, other} tr(M_{arm,f} C^{arm,other}_g M_{other,g} C^{other,arm}_f),
+    The estimate is sum_f (n_f / n) * DeltaR^2_f, each fold's own predictor
+    evaluated on its own fold. As a per-sample sum it is (1/n) sum_i psi_i,
+    with psi_i the fold-standardized delta-R^2 influence. Its variance is
+    (sum over family blocks of psi^2 + P) / n^2. The pair term
+    P = sum over cross-fold pairs a_{il} a_{li} uses
+    a_{il} = sum_arm w_{arm,i} H^{arm}_{il} (y_l - mean y), where
+    H_{il} = x_i' M_fold(i) x_l is the arm's cross-fold smoother and w the
+    derivative of psi_i with respect to sample i's own score. In closed form,
+    P = sum_{f != g} sum_{arm, other} tr(M_{arm,f} C^{arm,other}_g M_{other,g} C^{other,arm}_f),
     with C^{arm,other}_g = X_{arm,g}' diag(w_{other,g} * e_g) X_{other,g}.
     Fold labels are 0..K-1, and each arm's `fold_designs[fold]` holds the rows
     of the samples with that label, in increasing sample index.
     """
-    standardized_outcome = _standardized(outcome)
-    deviation = np.asarray(outcome, dtype=np.float64) - float(np.mean(outcome))
+    outcome = np.asarray(outcome, dtype=np.float64)
+    sample_count = outcome.shape[0]
+    fold_count = int(np.max(fold_of_sample)) + 1
+    rows_by_fold = [np.flatnonzero(fold_of_sample == fold) for fold in range(fold_count)]
+    influence = np.zeros(sample_count)
+    weights = [np.zeros(sample_count), np.zeros(sample_count)]
+    estimate = 0.0
+    for rows in rows_by_fold:
+        fold_outcome = outcome[rows]
+        delta, fold_influence = delta_r2_influence(fold_outcome, baseline[rows], candidate[rows])
+        estimate += rows.shape[0] / sample_count * delta
+        influence[rows] = fold_influence
+        standardized_outcome = _standardized(fold_outcome)
+        for arm_index, (sign, score) in enumerate(((-1.0, baseline[rows]), (1.0, candidate[rows]))):
+            correlation, _ = _correlation_influence(fold_outcome, score)
+            weights[arm_index][rows] = (
+                sign * 2.0 * correlation * (standardized_outcome - correlation * _standardized(score))
+                / float(np.std(score))
+            )
+    deviation = outcome - float(np.mean(outcome))
     arms = (baseline_arm, candidate_arm)
-    weights = []
-    for sign, score in ((-1.0, baseline), (1.0, candidate)):
-        correlation, _ = _correlation_influence(outcome, score)
-        standardized_score = _standardized(score)
-        weights.append(
-            sign * 2.0 * correlation * (standardized_outcome - correlation * standardized_score) / float(np.std(score))
-        )
-    folds = np.unique(fold_of_sample)
-    rows_by_fold = [np.flatnonzero(fold_of_sample == fold) for fold in folds]
     coupling = {}
-    for fold_index, rows in enumerate(rows_by_fold):
+    for fold, rows in enumerate(rows_by_fold):
         for arm_index, arm in enumerate(arms):
             for other_index, other in enumerate(arms):
-                scaled = other.fold_designs[fold_index] * (weights[other_index][rows] * deviation[rows])[:, None]
-                coupling[(fold_index, arm_index, other_index)] = arm.fold_designs[fold_index].T @ scaled
+                scaled = other.fold_designs[fold] * (weights[other_index][rows] * deviation[rows])[:, None]
+                coupling[(fold, arm_index, other_index)] = arm.fold_designs[fold].T @ scaled
     pair = 0.0
-    for fold_index in range(len(rows_by_fold)):
-        for other_fold in range(len(rows_by_fold)):
-            if other_fold == fold_index:
+    for fold in range(fold_count):
+        for other_fold in range(fold_count):
+            if other_fold == fold:
                 continue
             for arm_index, arm in enumerate(arms):
                 for other_index, other in enumerate(arms):
-                    left = arm.training_inverses[fold_index] @ coupling[(other_fold, arm_index, other_index)]
-                    right = other.training_inverses[other_fold] @ coupling[(fold_index, other_index, arm_index)]
+                    left = arm.training_inverses[fold] @ coupling[(other_fold, arm_index, other_index)]
+                    right = other.training_inverses[other_fold] @ coupling[(fold, other_index, arm_index)]
                     pair += float(np.sum(left * right.T))
-    return pair
+    totals = cluster_totals(influence, clusters)
+    standard_error = math.sqrt(float(totals @ totals) + pair) / sample_count
+    return PairedComparison(estimate, standard_error, estimate / standard_error)
 
 
 def _logistic_recalibration(score: NDArray, labels: NDArray, iterations: int = 50) -> NDArray:

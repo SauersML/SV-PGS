@@ -1,8 +1,9 @@
 """Held-out comparison tests and evaluation gates (sv_pgs.held_out_comparison).
 
 The null-calibration checks simulate the two situations the primary SV-PGS
-claim meets: frozen scores on a held-out set, and scores pooled over
-cross-fitted folds, where the naive sandwich variance is too small.
+claim meets: frozen scores on a held-out set, and cross-fitted scores. There,
+each fold's separately tuned predictor makes pooled scores miscalibrated, and
+shared training samples make the naive fold-stratified variance too small.
 """
 from __future__ import annotations
 
@@ -13,7 +14,7 @@ from sklearn.metrics import roc_auc_score
 
 from sv_pgs.held_out_comparison import (
     CrossFitArm,
-    cross_fit_pair_variance,
+    cross_fit_delta_r2,
     delta_r2_influence,
     hommel_adjusted,
     influence_correlation,
@@ -65,7 +66,7 @@ def test_family_clusters_widen_the_standard_error_when_scores_share_family_noise
     assert clustered.standard_error > unclustered.standard_error
 
 
-def _cross_fitted_ridge(designs, outcome, folds, penalty):
+def _cross_fitted_ridge(designs, outcome, folds, penalties):
     fold_count = int(folds.max()) + 1
     scores = np.zeros(outcome.shape[0])
     fold_designs, inverses = [], []
@@ -73,7 +74,7 @@ def _cross_fitted_ridge(designs, outcome, folds, penalty):
     cross = [designs[folds == fold].T @ outcome[folds == fold] for fold in range(fold_count)]
     total_gram, total_cross = sum(grams), sum(cross)
     for fold in range(fold_count):
-        inverse = np.linalg.inv(total_gram - grams[fold] + penalty * np.eye(designs.shape[1]))
+        inverse = np.linalg.inv(total_gram - grams[fold] + penalties[fold] * np.eye(designs.shape[1]))
         rows = folds == fold
         scores[rows] = designs[rows] @ (inverse @ (total_cross - cross[fold]))
         fold_designs.append(designs[rows])
@@ -81,25 +82,29 @@ def _cross_fitted_ridge(designs, outcome, folds, penalty):
     return scores, CrossFitArm(fold_designs=fold_designs, training_inverses=inverses)
 
 
-def test_cross_fit_pair_term_restores_null_calibration_of_pooled_delta_r2():
+def test_cross_fit_delta_r2_is_calibrated_where_pooling_is_not():
     rng = np.random.default_rng(3)
     sample_count, feature_count, fold_count = 1000, 30, 5
     folds = np.arange(sample_count) % fold_count
-    naive, corrected = [], []
+    pooled, stratified = [], []
     for _ in range(300):
         baseline_features = rng.standard_normal((sample_count, feature_count))
         candidate_features = rng.standard_normal((sample_count, feature_count))
         effects = rng.standard_normal(feature_count) * np.sqrt(0.05 / feature_count)
         outcome = baseline_features @ effects + candidate_features @ effects + rng.standard_normal(sample_count)
-        baseline, baseline_arm = _cross_fitted_ridge(baseline_features, outcome, folds, 300.0)
-        candidate, candidate_arm = _cross_fitted_ridge(candidate_features, outcome, folds, 300.0)
-        pair = cross_fit_pair_variance(outcome, baseline, candidate, folds, baseline_arm, candidate_arm)
-        naive.append(paired_delta_r2(outcome, baseline, candidate).z_score)
-        corrected.append(paired_delta_r2(outcome, baseline, candidate, pair_variance=pair).z_score)
-    naive, corrected = np.asarray(naive), np.asarray(corrected)
-    assert 0.85 < float(np.std(corrected)) < 1.15
-    assert float(np.std(naive)) > float(np.std(corrected))
-    assert size_gate(corrected)
+        penalties = np.full(fold_count, 300.0)
+        baseline, baseline_arm = _cross_fitted_ridge(baseline_features, outcome, folds, penalties)
+        candidate, candidate_arm = _cross_fitted_ridge(candidate_features, outcome, folds, penalties)
+        pooled.append(paired_delta_r2(outcome, baseline, candidate).z_score)
+        stratified.append(
+            cross_fit_delta_r2(outcome, baseline, candidate, folds, baseline_arm, candidate_arm).z_score
+        )
+    pooled, stratified = np.asarray(pooled), np.asarray(stratified)
+    assert 0.85 < float(np.std(stratified)) < 1.15
+    # 300 replicates leave a binomial SE of ~1.3% on the size; the G13 gate itself
+    # (7%, >= 200 null traits) is applied to the fitted-model simulations
+    assert size_gate(stratified, maximum_rate=0.08)
+    assert float(np.std(pooled)) > float(np.std(stratified))
 
 
 def test_paired_delta_log_loss_favours_the_more_informative_score_and_holds_size():
