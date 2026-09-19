@@ -75,6 +75,12 @@ Untagged numbers are derivations, definitions or targets.
   - EP is unclipped, Newton on the moment equations with the Opper–Winther double loop as the fallback (the dense reference, `tests/ep_eb_reference.py`);
   - a warm-up before the first hyper step.
   - Plain EM converges at rate ≥ 1 − edf/p, about 0.99 at production scale. From the defaults its reported SV/SNV enrichment was 1.65 whatever the truth [sim-only: gam-eval reproducer].
+- **The production engine** (`sv_pgs/scale_mixture_ep.py`, shared by Stage 1 and Stage 2) holds everything that involves the prior, for a stage that supplies q's means and marginal variances:
+  - g on a uniform lattice in t (nodal log g, roughness λh⁻⁵‖Δ³η‖² from square-root factors); the lattice's floor (flat-kernel bound), top (largest kernel mode), spacing (complex-strip trapezoid bound) and tails come from the data and a tolerance (math-density's rules);
+  - the ruled layout: η shared, δ_c per class with its own roughness weight, one Gaussian pooling precision on the deviations' location and width, no class level; η's null space profiled;
+  - exact tilted moments, unclipped mean-matched sites, cavities, the MacKay/REML noise update;
+  - the fixed-cavity objective with its exact gradient and Hessian, a spectrum-shifted Newton M-step, and the Laplace evidence with the observed curvature and its exact gradient (third derivatives of log Z).
+  - Pending: the EP-re-solved curvature B from speed-ep's closed form in place of the fixed-cavity Hessian, and the exact λ = ∞ and width → 0 edges; until then the λ step is not certified and its tests are xfail.
 - **Certificate:** the Newton decrement of the hyper objective (in nats) together with the relative prediction change ‖XΔμ‖/‖Xμ‖. Parallel EP leaves a few sites in limit cycles, so the per-site maximum is not a certificate. The certificate is recorded in the artifact, and a fit without it is not accepted.
 - **Binary traits:** logistic EP with a Gauss–Hermite predictive refined until converged to fp64 rounding. Probit was rejected: VB-probit lost 0.012–0.020 AUC, and EP-probit only tied logistic [sim-only: theory-inference].
 - **Predictive variance:** K = 64 exact posterior draws by perturb-and-solve, riding Stage 2's passes and scored in the same single read.

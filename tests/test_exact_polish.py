@@ -87,7 +87,7 @@ def test_one_iteration_gives_every_quantitative_model_its_exact_mean_on_its_mask
     precision, shift = _sites(90, 3, seed=3)
     noise_variance = np.array([0.8, 1.0, 1.3])
     gaussian = FullDataGaussian(
-        source=source, models=models, covariates=covariates, sample_masks=masks, initial_mean=np.zeros((90, 3)), probe_count=3, seed=2
+        source=source, models=models, covariates=covariates, sample_masks=masks, initial_mean=np.zeros((90, 3)), seed=2
     )
     gaussian.iterate(
         site_precision=precision, site_shift=shift, noise_variance=noise_variance, tolerance=1e-13, refactor=True, exact_curvature=_exact(gaussian)
@@ -109,7 +109,7 @@ def test_one_quantitative_iteration_gives_the_exact_restricted_posterior_mean():
     precision, shift = _sites(120, 1, seed=5)
     noise_variance = np.array([0.7])
     gaussian = FullDataGaussian(
-        source=source, models=models, covariates=covariates, sample_masks=masks, initial_mean=np.zeros((120, 1)), probe_count=4, seed=6
+        source=source, models=models, covariates=covariates, sample_masks=masks, initial_mean=np.zeros((120, 1)), seed=6
     )
     gaussian.iterate(site_precision=precision, site_shift=shift, noise_variance=noise_variance, tolerance=1e-13, refactor=True, exact_curvature=_exact(gaussian))
     weights = masks[1] / noise_variance[0]
@@ -122,7 +122,6 @@ def test_one_quantitative_iteration_gives_the_exact_restricted_posterior_mean():
     certificate = gaussian.iterate(site_precision=precision, site_shift=shift, noise_variance=noise_variance, tolerance=1e-13, refactor=False, exact_curvature=_exact(gaussian))
     assert certificate.gradient_relative_norm[0] <= 1e-10
     assert certificate.covariate_gradient_relative_norm[0] <= 1e-10
-    assert certificate.probe_residual[0] <= 1e-10
 
 
 def _dense_penalized_logistic_mode(genotypes, covariates, targets, mask, precision, shift, offset):
@@ -149,7 +148,7 @@ def test_binary_newton_iterations_reach_the_dense_penalized_logistic_mode():
     precision, shift = _sites(60, 1, seed=8)
     precision[precision == 0.0] = 0.5
     gaussian = FullDataGaussian(
-        source=source, models=models, covariates=covariates, sample_masks=masks, initial_mean=np.zeros((60, 1)), probe_count=4, seed=9
+        source=source, models=models, covariates=covariates, sample_masks=masks, initial_mean=np.zeros((60, 1)), seed=9
     )
     for _iteration in range(30):
         certificate = gaussian.iterate(
@@ -166,34 +165,37 @@ def test_binary_newton_iterations_reach_the_dense_penalized_logistic_mode():
 
 
 @pytest.mark.parametrize("block_size", [80, 16])
-def test_marginal_variances_are_exact_with_one_block_and_unbiased_with_many(block_size):
+def test_block_variances_are_the_diagonal_of_the_block_jacobi_inverse(block_size):
     genotypes, covariates, quantitative, binary, masks = _simulate(sample_count=300, variant_count=80, seed=10)
     models = [GaussianModel(TraitType.QUANTITATIVE, quantitative, 0, np.zeros(300)), GaussianModel(TraitType.BINARY, binary, 1, np.zeros(300))]
     source = DenseGenotypeBlockSource(genotypes, _blocks(80, block_size))
     precision, shift = _sites(80, 2, seed=11)
-    probe_count = 400
-    gaussian = FullDataGaussian(
-        source=source, models=models, covariates=covariates, sample_masks=masks, initial_mean=np.zeros((80, 2)), probe_count=probe_count, seed=12
-    )
+    gaussian = FullDataGaussian(source=source, models=models, covariates=covariates, sample_masks=masks, initial_mean=np.zeros((80, 2)), seed=12)
     noise_variance = np.array([0.9, 1.0])
+    curvature_before = [masks[0] / noise_variance[0], None]
+    probability = expit(gaussian.linear_predictor[:, 1])
+    curvature_before[1] = masks[1] * probability * (1.0 - probability)
     gaussian.iterate(site_precision=precision, site_shift=shift, noise_variance=noise_variance, tolerance=1e-13, refactor=True, exact_curvature=_exact(gaussian))
-    # The probes are solved at the curvature of the iteration's start state.
-    variances = gaussian.marginal_variances(precision)
+    variances = gaussian.block_variances()
     for model_index in range(2):
-        start_curvature = gaussian.probe_curvature[:, model_index]
-        exact = np.diag(np.linalg.inv(_dense_precision(genotypes, covariates, start_curvature, precision[:, model_index])))
-        estimate = variances.variance[:, model_index]
+        dense = _dense_precision(genotypes, covariates, curvature_before[model_index], precision[:, model_index])
+        expected = np.empty(80)
+        for block in _blocks(80, block_size):
+            expected[block] = np.diag(np.linalg.inv(dense[np.ix_(block, block)]))
+        np.testing.assert_allclose(variances[:, model_index], expected, rtol=1e-8)
         if block_size == 80:
-            np.testing.assert_allclose(estimate, exact, rtol=1e-9)
-            assert variances.relative_standard_error[model_index] <= 1e-9
-        else:
-            assert np.abs(np.sum(estimate * precision[:, model_index]) - np.sum(exact * precision[:, model_index])) <= 4.0 * (
-                variances.relative_standard_error[model_index] * np.sum(exact * precision[:, model_index])
-            ) + 1e-12
-            assert np.median(np.abs(estimate / exact - 1.0)) <= 0.05
-        upper = np.where(precision[:, model_index] > 0.0, 1.0 / np.maximum(precision[:, model_index], 1e-300), np.inf)
-        assert np.all(estimate <= upper * (1.0 + 1e-12))
-        assert np.all(estimate > 0.0)
+            np.testing.assert_allclose(variances[:, model_index], np.diag(np.linalg.inv(dense)), rtol=1e-8)
+
+
+def test_residual_sum_of_squares_is_over_each_models_training_samples():
+    genotypes, covariates, quantitative, binary, masks = _simulate(sample_count=200, variant_count=30, seed=19)
+    models = [GaussianModel(TraitType.QUANTITATIVE, quantitative, 1, np.full(200, 0.3))]
+    source = DenseGenotypeBlockSource(genotypes, _blocks(30, 10))
+    precision, shift = _sites(30, 1, seed=20)
+    gaussian = FullDataGaussian(source=source, models=models, covariates=covariates, sample_masks=masks, initial_mean=np.zeros((30, 1)), seed=21)
+    gaussian.iterate(site_precision=precision, site_shift=shift, noise_variance=np.array([0.8]), tolerance=1e-13, refactor=True, exact_curvature=_exact(gaussian))
+    residual = quantitative - 0.3 - covariates @ gaussian.alpha[:, 0] - genotypes @ gaussian.mean[:, 0]
+    np.testing.assert_allclose(gaussian.residual_sum_of_squares()[0], np.sum(masks[1] * residual * residual), rtol=1e-10)
 
 
 def test_draws_have_the_posterior_mean_and_covariance():
@@ -203,7 +205,7 @@ def test_draws_have_the_posterior_mean_and_covariance():
     precision, shift = _sites(24, 1, seed=14)
     precision[precision == 0.0] = 2.0
     gaussian = FullDataGaussian(
-        source=source, models=models, covariates=covariates, sample_masks=masks, initial_mean=np.zeros((24, 1)), probe_count=2, seed=15
+        source=source, models=models, covariates=covariates, sample_masks=masks, initial_mean=np.zeros((24, 1)), seed=15
     )
     noise_variance = np.array([1.2])
     gaussian.iterate(site_precision=precision, site_shift=shift, noise_variance=noise_variance, tolerance=1e-13, refactor=True, exact_curvature=_exact(gaussian))
@@ -222,7 +224,7 @@ def test_an_iteration_reads_the_blocks_once_plus_once_per_conjugate_gradient_ite
     source = DenseGenotypeBlockSource(genotypes, _blocks(30, 10))
     precision, shift = _sites(30, 2, seed=17)
     gaussian = FullDataGaussian(
-        source=source, models=models, covariates=covariates, sample_masks=masks, initial_mean=np.zeros((30, 2)), probe_count=2, seed=18
+        source=source, models=models, covariates=covariates, sample_masks=masks, initial_mean=np.zeros((30, 2)), seed=18
     )
     assert gaussian.reads.count == 1
     for refactor in (True, False, True):
