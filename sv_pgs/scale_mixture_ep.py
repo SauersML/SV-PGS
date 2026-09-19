@@ -1717,9 +1717,11 @@ def _stationarity_check(
     posterior_at: PosteriorAt,
     working_bytes: int,
     tolerance: float,
-) -> tuple[F64Array, F64Array, F64Array, F64Array]:
+) -> tuple[F64Array, F64Array, F64Array, F64Array, tuple[F64Array, _Evidence] | None]:
     """The B-evidence's own gradient in each interior weight by one central difference: (gradient, curvature scale,
-    step, error bound).
+    step, error bound, better). ``better`` is a side whose certified V is above the base's by more than the
+    tolerance, both taken at their certified bounds (its weights and evidence), found at once: the base is then not the maximum, only a point where its
+    own inner maximum is ending (a fold), and the search resumes from the better side instead of certifying.
 
     Per eigen-direction of its block, V depends on rho_i through terms log(1 + e^(rho + a)) / 2 and
     b sigma(rho + a) / 2; the first derivatives are sigma / 2 and b sigma' / 2, and every higher derivative of the
@@ -1769,6 +1771,11 @@ def _stationarity_check(
                     )
                     for side in (-1.0, 1.0)
                 ]
+                for side, candidate in zip((-1.0, 1.0), both):
+                    # Certified above: the side's lower bound beats the base's upper bound by the tolerance, so rounding
+                    # cannot send the search back and forth between two basins.
+                    if candidate is not None and candidate.value - candidate.error > evidence.value + evidence.error + tolerance:
+                        return gradient, scale, steps, errors, (weights + side * length * unit, candidate)
                 if any(side is None for side in both):
                     break
                 quotients.append((both[1].value - both[0].value) / (2.0 * length))
@@ -1779,7 +1786,7 @@ def _stationarity_check(
         gradient[position] = quotients[0]
         steps[position] = step
         errors[position] = bounds[0]
-    return gradient, scale, steps, errors
+    return gradient, scale, steps, errors, None
 
 
 def hyper_step(
@@ -1817,15 +1824,15 @@ def hyper_step(
     evidence = replace(evidence, coefficients=final_allowed.T @ coefficients)
     while True:
         interior = (weights > lower) & (weights < upper)
-        check, curvature, check_steps, check_errors = _stationarity_check(
+        check, curvature, check_steps, check_errors, better = _stationarity_check(
             final_view, weights, evidence, interior, cavity, posterior_at, working_bytes, tolerance
         )
         gain_bound = 0.5 * float(np.sum(np.square(np.abs(check) + check_errors) / curvature))
-        if gain_bound <= tolerance:
+        if better is None and gain_bound <= tolerance:
             break
         direction = check / curvature
-        step_length, moved = 1.0, None
-        while step_length * float(np.max(np.abs(direction))) > _HALF_PRECISION * (1.0 + float(np.max(np.abs(weights)))):
+        step_length, moved = 1.0, better
+        while moved is None and step_length * float(np.max(np.abs(direction))) > _HALF_PRECISION * (1.0 + float(np.max(np.abs(weights)))):
             trial_weights = np.clip(weights + step_length * direction, lower, upper)
             trial = _certified_evidence(
                 final_view, trial_weights, evidence.coefficients, cavity, posterior_at, working_bytes,
