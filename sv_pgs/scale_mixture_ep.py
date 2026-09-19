@@ -1151,9 +1151,11 @@ def _laplace_corrections(
 
     The integrated directions are the eigenvectors of -H's Schur complement on the complement of the profiled null
     space, each moved with the null coordinates' first-order response and scaled to unit curvature. Along a
-    standardized direction the Tierney-Kadane O(1) term is k4/8 + 5 k3^2/24; where its magnitude exceeds
-    ``tolerance`` the Laplace term is replaced by an exact quadrature of the integrand along that line, and the
-    correction is the log of their ratio (its limit covers a density collapsing to a point). Elsewhere it is 0.
+    standardized direction the Tierney-Kadane O(1) term is k4/8 + 5 k3^2/24. V is certified to ``tolerance`` in
+    total: half of it bounds the directions left to the Laplace term (the largest terms are replaced until the
+    remaining ones sum to at most tolerance / 2), and half bounds the quadratures of the replaced ones (each to
+    tolerance / (2 m) in its log, m of them). A replaced direction's correction is the log of the exact line
+    integral's ratio to the Laplace term (its limit covers a density collapsing to a point); elsewhere it is 0.
     """
     penalty = _penalty_matrix(prior, log_smoothing)
     objective = _data_objective(prior, evidence.coefficients, cavity, working_bytes)
@@ -1175,7 +1177,13 @@ def _laplace_corrections(
     third, fourth = _directional_derivatives(prior, evidence.coefficients, cavity, directions, working_bytes)
     terms = fourth / 8.0 + 5.0 * third**2 / 24.0
     corrections = np.zeros(directions.shape[1])
-    for index in np.flatnonzero(np.abs(terms) > tolerance):
+    order = np.argsort(-np.abs(terms))
+    # Remaining sums from the smallest term up: the replaced set is the shortest prefix of ``order`` whose
+    # complement sums to at most tolerance / 2.
+    remaining = np.concatenate([np.cumsum(np.abs(terms[order])[::-1])[::-1], [0.0]])
+    replaced = order[: int(np.argmax(remaining <= 0.5 * tolerance))]
+    share = 0.5 * tolerance / max(replaced.shape[0], 1)
+    for index in replaced:
         direction = directions[:, index]
 
         def integrand(step: float) -> float:
@@ -1185,11 +1193,11 @@ def _laplace_corrections(
             ))
 
         integral, error, _information, *message = quad(
-            integrand, -np.inf, np.inf, epsabs=0.0, epsrel=max(tolerance, _QUADPACK_RELATIVE_FLOOR), full_output=True
+            integrand, -np.inf, np.inf, epsabs=0.0, epsrel=max(share, _QUADPACK_RELATIVE_FLOOR), full_output=True
         )
         # The log of the integral is what enters V: accept QUADPACK's answer when its own error estimate resolves that
-        # log to the tolerance, or to half of double precision when rounding is what stopped it.
-        if message and error > max(tolerance, _HALF_PRECISION) * abs(integral):
+        # log to its share, or to half of double precision when rounding is what stopped it.
+        if message and error > max(share, _HALF_PRECISION) * abs(integral):
             raise FloatingPointError(f"the exact integral along a direction did not converge: {message[0]}")
         corrections[index] = float(np.log(integral) - 0.5 * np.log(2.0 * np.pi))
     return corrections, terms, directions
@@ -1243,8 +1251,10 @@ class _Profiled:
     G give W = Q G'G Q': the N block cancels by structure, never by subtracting two inverses. So a direction of N
     that the data barely curve (the profiled location and width where the density's mass has no kernel to see it)
     costs nothing: rounding reaches the complement only through M_CN M_NN^-1 M_NC, at second order.
-    A factor exact for M + E with ||E|| <= (n + 1) eps ||M||_F (Demmel) moves the Schur log-determinant by at most
-    ||E|| tr(W): that is ``rounding``.
+    The computed factor is exact for M + E with |E_ij| <= (n + 1) eps sqrt(M_ii M_jj) in the basis it is computed in
+    (Demmel 1989, componentwise, since each row of L has norm sqrt(M_ii)), which moves the Schur log-determinant by
+    |tr(W E)| <= (n + 1) eps sum_ij |W_ij| sqrt(M_ii M_jj): that is ``rounding``. It follows the scaled condition
+    number, so penalties of disparate scale on different coordinates cost nothing.
     """
 
     schur_log_determinant: float
@@ -1254,9 +1264,18 @@ class _Profiled:
 
 
 def _null_complement(null_basis: F64Array) -> F64Array:
-    """An orthonormal basis of the complement of the orthonormal ``null_basis``."""
+    """An orthonormal basis of the complement of the orthonormal ``null_basis`` that keeps every coordinate N does
+    not touch as its own unit vector, so the rotation mixes only N's support and the Cholesky factor keeps the
+    coordinates' own scales (what the componentwise rounding bound needs)."""
     size = null_basis.shape[0]
-    return np.linalg.svd(np.eye(size) - null_basis @ null_basis.T)[0][:, : size - null_basis.shape[1]]
+    support = np.flatnonzero(np.any(null_basis != 0.0, axis=1))
+    inside = null_basis[support]
+    local = np.linalg.svd(np.eye(support.shape[0]) - inside @ inside.T)[0][:, : support.shape[0] - null_basis.shape[1]]
+    outside = np.setdiff1d(np.arange(size), support)
+    complement = np.zeros((size, size - null_basis.shape[1]))
+    complement[support, : local.shape[1]] = local
+    complement[outside, local.shape[1] + np.arange(outside.shape[0])] = 1.0
+    return complement
 
 
 def _profiled_factor(matrix: F64Array, null_basis: F64Array, complement: F64Array) -> _Profiled:
@@ -1267,12 +1286,14 @@ def _profiled_factor(matrix: F64Array, null_basis: F64Array, complement: F64Arra
     inverse_factor = solve_triangular(factor, np.eye(factor.shape[0]), lower=True)
     profiled = null_basis.shape[1]
     trailing = inverse_factor[profiled:]
-    weight = basis @ (trailing.T @ trailing) @ basis.T
+    rotated_weight = trailing.T @ trailing
+    weight = basis @ rotated_weight @ basis.T
+    root = np.sqrt(np.diag(rotated))
     return _Profiled(
         schur_log_determinant=2.0 * float(np.sum(np.log(np.diag(factor)[profiled:]))),
         weight=weight,
         inverse=basis @ (inverse_factor.T @ inverse_factor) @ basis.T,
-        rounding=_EPSILON * (matrix.shape[0] + 1) * float(np.linalg.norm(matrix)) * float(np.sum(trailing * trailing)),
+        rounding=_EPSILON * (matrix.shape[0] + 1) * float(np.sum(np.abs(rotated_weight) * np.outer(root, root))),
     )
 
 
@@ -1695,7 +1716,7 @@ def _stationarity_check(
     scale = np.maximum(0.5 * (evidence.effective_degrees + evidence.penalty_sizes), rounding)
     steps = np.zeros(weights.shape[0])
     errors = np.zeros(weights.shape[0])
-    limit = _HALF_PRECISION * (1.0 + float(np.max(np.abs(weights))))
+    limit = _HALF_PRECISION * (1.0 + float(np.max(np.abs(weights), initial=0.0)))
     count = max(int(np.count_nonzero(interior)), 1)
     for position in np.flatnonzero(interior):
         unit = np.zeros(weights.shape[0])
