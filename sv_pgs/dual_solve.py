@@ -975,11 +975,12 @@ class DualGaussian:
         column_models = array_module.asarray(np.concatenate([np.arange(self.model_count)] + resolved_models))
         left = models.sample_to_design(duals, column_models)
         mean = bulk_mean.copy()
-        cross = array_module.empty((source.variant_count, int(duals.shape[1]) - self.model_count))
+        # C = Xt'Z_L goes to the host block by block: it is p x |L|, which the device need not hold.
+        cross = np.empty((source.variant_count, int(duals.shape[1]) - self.model_count))
         for start, stop, tile in source.blocks():
             products = tile.rmatmat(left)
             mean[start:stop] += bulk_variances[start:stop] * products[:, : self.model_count]
-            cross[start:stop] = products[:, self.model_count :]
+            cross[start:stop] = _host(products[:, self.model_count :])
         for model in order:
             mean[array_module.asarray(resolved[model]), model] = state["resolved_mean"][model]
         image = array_module.zeros((source.sample_count, self.model_count))
@@ -1003,7 +1004,7 @@ class DualGaussian:
             count = float(self.training_counts[model])
             kernel = solved
             core = array_module.zeros((0, 0))
-            model_cross = array_module.zeros((source.variant_count, 0))
+            model_cross = np.zeros((source.variant_count, 0))
             if model in order:
                 block = state["blocks"][model]
                 design = block.design

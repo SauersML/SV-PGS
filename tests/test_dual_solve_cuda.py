@@ -80,3 +80,27 @@ def test_cuda_dual_gaussian_matches_the_host() -> None:
         difference = means[0][:, model] - means[1][:, model]
         # Both are within sqrt(eps) of the exact mean in the A-norm.
         assert np.sqrt(float(difference @ posterior_precision @ difference)) <= 2.0 * np.sqrt(EPS) * (1.0 + np.linalg.cond(posterior_precision) * genotypes.shape[1] * EPS)
+
+
+def test_cuda_posterior_and_information_solves_match_the_host() -> None:
+    from tests.test_dual_solve import _gaussian_problem
+
+    genotypes, bounds, covariates, training, noise, precision, shift, response, offsets, _negative = _gaussian_problem(61)
+    rng = np.random.default_rng(62)
+    right = rng.standard_normal((genotypes.shape[1], 3))
+    outputs = []
+    for array_module in (np, cupy):
+        source = dual_solve.DenseDualSource(array_module.asarray(genotypes), bounds, array_module)
+        gaussian = dual_solve.DualGaussian(
+            source=source, training=array_module.asarray(training), targets=array_module.asarray(response), offsets=array_module.asarray(offsets),
+            covariates=array_module.asarray(covariates), probe_count=2, seed=9,
+        )
+        gaussian.iterate(site_precision=array_module.asarray(precision), site_shift=array_module.asarray(shift), noise_variance=noise,
+                         error_bound=np.full(MODEL_COUNT, np.sqrt(EPS)), probe_residual_ratio=np.sqrt(EPS))
+        solved = gaussian.posterior_solve(array_module.asarray(right), 0, np.sqrt(EPS))
+        back, coupling, _norms = gaussian.information_solve(array_module.asarray(right), 0, np.sqrt(EPS))
+        outputs.append([np.asarray(item.get() if hasattr(item, "get") else item) for item in (solved, back, coupling)])
+    for host, device in zip(*outputs):
+        scale = max(float(np.abs(host).max()), np.finfo(np.float64).tiny)
+        # Both runs are certified to sqrt(eps); their difference is at most twice that, times the conditioning seen.
+        assert float(np.abs(host - device).max()) <= np.sqrt(EPS) * scale * genotypes.shape[0]
