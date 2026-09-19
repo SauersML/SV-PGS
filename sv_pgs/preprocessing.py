@@ -7,7 +7,7 @@ import uuid
 from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
-from typing import Any, Hashable, Iterator, Sequence, TypeVar, cast
+from typing import Any, Hashable, Iterator, Mapping, Sequence, TypeVar, cast
 
 import numpy as np
 
@@ -976,10 +976,25 @@ def _build_tie_map_windowed(
         root, sign = find(i)
         group_map[root].append((i, sign))
 
+    tie_map = tie_map_from_groups(n_total, group_map)
+    log(
+        f"  tie map done: {n_total} -> {len(tie_map.kept_indices)} unique  "
+        f"({ties_found} ties collapsed)  mem={mem()}"
+    )
+    return tie_map
+
+
+def tie_map_from_groups(variant_count: int, groups: Mapping[int, Sequence[tuple[int, float]]]) -> TieMap:
+    """The TieMap of ``variant_count`` variants whose every variant sits in one group.
+
+    ``groups`` maps each representative to its ``(member, sign)`` pairs (the representative
+    included, sign +1 for a copy and -1 for a negated copy); reduced order follows the
+    representatives.
+    """
     kept_indices: list[int] = []
-    original_to_reduced = np.full(n_total, -1, dtype=np.int32)
+    original_to_reduced = np.full(variant_count, -1, dtype=np.int32)
     reduced_to_group: list[TieGroup] = []
-    for reduced_idx, (root, members) in enumerate(sorted(group_map.items())):
+    for reduced_idx, (root, members) in enumerate(sorted(groups.items())):
         kept_indices.append(root)
         member_indices = np.array([m[0] for m in members], dtype=np.int32)
         signs = np.array([m[1] for m in members], dtype=np.float32)
@@ -990,11 +1005,6 @@ def _build_tie_map_windowed(
             member_indices=member_indices,
             signs=signs,
         ))
-
-    log(
-        f"  tie map done: {n_total} -> {len(kept_indices)} unique  "
-        f"({ties_found} ties collapsed)  mem={mem()}"
-    )
     return TieMap(
         kept_indices=np.asarray(kept_indices, dtype=np.int32),
         original_to_reduced=original_to_reduced,
