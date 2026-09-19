@@ -147,3 +147,8 @@ Section 2 is replaced so that the measurement process follows the aou2 imputatio
   - The arm has no statistical phasing error, so it is mildly optimistic.
 - **Every result records its arm label.** Headline claims about draw-like columns wait for a GLIMPSE2 cohort if GLIMPSE2 DS proves draw-like (κ ≈ √r²).
 - **Donor/panel disjointness is verified:** 1,554 donor and 1,036 panel founders, with an intersection of 0. Cryptic relatedness between founders is not removed; that is a known limitation.
+
+## Amendment 5 (2026-09-19, before any submission): the measured record set
+GLIMPSE2 drops records that are monomorphic in its reference panel: 32,285 chr22 records, all monomorphic among the 1,036 panel founders. In aou2 the imputed callset's records are exactly the panel's records with allele count ≥ 2 (imputation-4c, process fact). So:
+- **The measured records** are those with panel minor allele count ≥ 2, in both arms. Every method, the harness's variant table, the kernels, oracle_observed and the calibration see only these.
+- **Truths are unchanged.** Causal variants outside the measured set still contribute to the genetic value and to oracle_true, but no method can see them. That is the realistic cost of variants missing from the imputation panel.

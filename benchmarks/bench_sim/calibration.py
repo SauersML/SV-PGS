@@ -17,6 +17,8 @@ from pathlib import Path
 
 import numpy as np
 
+from benchmarks.bench_sim.measurement import measured_records
+
 CODES_PER_DOSAGE = 127
 CLASS_NAMES = ("SNV", "INDEL", "TR", "SV")
 MAF_EDGES = (0.0, 0.001, 0.01, 0.05, 0.5)
@@ -52,6 +54,7 @@ def main() -> None:
     args = parser.parse_args()
     root = Path(args.dir)
     cls = np.load(root / "variants.npz")["cls"]
+    measured = measured_records(root)
     samples = np.load(root / "samples.npz")
     group = samples["group"][:args.samples]
     group_names = [str(name) for name in samples["group_names"]]
@@ -75,7 +78,7 @@ def main() -> None:
         table: dict = {}
         for class_index, class_name in enumerate(CLASS_NAMES):
             for low, high in zip(MAF_EDGES[:-1], MAF_EDGES[1:]):
-                rows = np.flatnonzero((cls == class_index) & (minor > low) & (minor <= high))
+                rows = np.flatnonzero(measured & (cls == class_index) & (minor > low) & (minor <= high))
                 if rows.size == 0:
                     continue
                 cell = f"{class_name}|maf({low},{high}]"

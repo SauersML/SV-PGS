@@ -35,6 +35,25 @@ ERR_IMP = "1e-3"
 # Records simulated and written per vectorized step.
 ROW_BLOCK = 256
 STREAM_ROWS = 20_000
+# aou2's reference panel keeps records with allele count >= 2 (imputation-4c, process fact), so only those
+# records exist in the imputed callset. Records below it stay in the truth (they can be causal) but are unmeasured.
+PANEL_MINIMUM_ALLELE_COUNT = 2
+
+
+def measured_records(root: Path) -> np.ndarray:
+    """Records the imputed callset contains: panel allele count in [PANEL_MINIMUM_ALLELE_COUNT, AN - that].
+    Cached as measured.npy next to the cohort."""
+    cached = root / "measured.npy"
+    if cached.exists():
+        return np.load(cached)
+    panel = np.load(root / "panel_haps.npy", mmap_mode="r")
+    allele_count = np.zeros(panel.shape[0], dtype=np.int64)
+    for first in range(0, panel.shape[0], STREAM_ROWS):
+        allele_count[first:first + STREAM_ROWS] = np.asarray(panel[first:first + STREAM_ROWS]).sum(axis=1, dtype=np.int64)
+    minor = np.minimum(allele_count, panel.shape[1] - allele_count)
+    measured = minor >= PANEL_MINIMUM_ALLELE_COUNT
+    np.save(cached, measured)
+    return measured
 
 
 def batch_block(matrix: np.ndarray, rows: np.ndarray, first: int, last: int) -> np.ndarray:
@@ -169,6 +188,7 @@ def main() -> None:
     cls, pos, refs, alts = variants["cls"], variants["pos"], variants["refs"], variants["alts"]
     n_var = cls.size
     simple_rows = np.flatnonzero(cls <= 1)
+    measured = measured_records(root)
     length = int(pos.max()) + 1
     sites = [f"{args.chrom}\t{pos[row]}\tv{row}\t{refs[row]}\t{alts[row]}\t.\tPASS\t" for row in range(n_var)]
     prefix = [(site + ".\t").encode() for site in sites]
@@ -244,24 +264,28 @@ def main() -> None:
                      "--output", str(output), "--threads", str(args.threads), "--err-imp", ERR_IMP])
                 output_done.touch()
             outputs.append(output)
-        listing = work / f"ligate{batch_index}{suffix}.txt"
-        listing.write_text("\n".join(str(path) for path in outputs) + "\n")
-        ligated = work / f"imputed{batch_index}{suffix}.bcf"
-        run([str(tools / "GLIMPSE2_ligate_static"), "--input", str(listing), "--output", str(ligated), "--threads", str(args.threads)])
+        # Dosages are per-site and phase-free, so no ligation is needed: each record is read from the one chunk
+        # whose output region (chunks.txt column 4, a tiling of the chromosome) contains it. GLIMPSE2_ligate also
+        # refuses chunk layouts where three input regions overlap one position.
         batch_codes = np.zeros((n_var, last - first), dtype=np.uint8)
         batch_info = np.zeros(n_var)
         seen = np.zeros(n_var, dtype=bool)
-        reader = VCF(str(ligated))
-        for record in reader:
-            row = int(record.ID[1:])
-            dosage = record.format("DS")[:, 0]
-            milli = np.clip(np.rint(dosage * 1000.0), 0, 2000).astype(np.int64)
-            batch_codes[row] = encode_milli(milli)
-            seen[row] = True
-            batch_info[row] = float(record.INFO["INFO"])
-        reader.close()
-        if not seen.all():
-            raise SystemExit(f"batch {batch_index}: {int((~seen).sum())} records missing from the GLIMPSE2 output")
+        for chunk, output in zip(chunks, outputs):
+            region_start, region_end = (int(value) for value in chunk[3].split(":")[1].split("-"))
+            reader = VCF(str(output))
+            for record in reader:
+                if not region_start <= record.POS <= region_end:
+                    continue
+                row = int(record.ID[1:])
+                dosage = record.format("DS")[:, 0]
+                milli = np.clip(np.rint(dosage * 1000.0), 0, 2000).astype(np.int64)
+                batch_codes[row] = encode_milli(milli)
+                seen[row] = True
+                batch_info[row] = float(record.INFO["INFO"])
+            reader.close()
+        missing = measured & ~seen
+        if missing.any():
+            raise SystemExit(f"batch {batch_index}: {int(missing.sum())} measured records missing from the GLIMPSE2 output")
         np.save(work / f"codes{batch_index}{suffix}.npy", batch_codes)
         np.save(work / f"info{batch_index}{suffix}.npy", batch_info)
         for path in outputs:

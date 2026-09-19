@@ -26,6 +26,8 @@ from pathlib import Path
 import numpy as np
 from scipy.stats import norm
 
+from benchmarks.bench_sim.measurement import measured_records
+
 CODES_PER_DOSAGE = 127
 # Measurement arms: observed codes and their per-record quality, plus the label every result carries.
 ARMS = {
@@ -48,17 +50,18 @@ class TrainData:
     cores: int
     _observed: np.ndarray = field(repr=False)
     _columns: np.ndarray = field(repr=False)
+    _records: np.ndarray = field(repr=False)
 
     @property
     def n_variants(self) -> int:
-        return int(self._observed.shape[0])
+        return int(self._records.size)
 
     @property
     def n_samples(self) -> int:
         return int(self._columns.size)
 
     def codes(self, rows) -> np.ndarray:
-        return np.asarray(self._observed[rows])[..., self._columns]
+        return np.asarray(self._observed[self._records[rows]])[..., self._columns]
 
 
 @dataclass
@@ -68,26 +71,28 @@ class ScoreData:
     covariate_names: tuple
     _observed: np.ndarray = field(repr=False)
     _columns: np.ndarray = field(repr=False)
+    _records: np.ndarray = field(repr=False)
 
     @property
     def n_variants(self) -> int:
-        return int(self._observed.shape[0])
+        return int(self._records.size)
 
     @property
     def n_samples(self) -> int:
         return int(self._columns.size)
 
     def codes(self, rows) -> np.ndarray:
-        return np.asarray(self._observed[rows])[..., self._columns]
+        return np.asarray(self._observed[self._records[rows]])[..., self._columns]
 
 
 def public_variant_table(cohort: Path, arm: str) -> dict:
     variants = np.load(cohort / "variants.npz")
     annotations = np.load(cohort / "annotations.npz")
     imputation = np.load(cohort / ARMS[arm][1])
-    table = {name: variants[name] for name in VARIANT_FIELDS}
-    table.update({name: annotations[name] for name in ANNOTATION_FIELDS})
-    table["imputation_info"] = imputation["info"]
+    records = np.flatnonzero(measured_records(cohort))
+    table = {name: variants[name][records] for name in VARIANT_FIELDS}
+    table.update({name: annotations[name][records] for name in ANNOTATION_FIELDS})
+    table["imputation_info"] = imputation["info"][records]
     table["class_names"] = np.array(["SNV", "INDEL", "TR", "SV"])
     return table
 
@@ -113,6 +118,7 @@ def run(method: Path, cohort: Path, scenario: Path, out: Path, cores: int, arm: 
     is_test = samples["is_test"]
     train_columns, test_columns = np.flatnonzero(~is_test), np.flatnonzero(is_test)
     observed = np.load(cohort / ARMS[arm][0], mmap_mode="r")
+    records = np.flatnonzero(measured_records(cohort))
     table = public_variant_table(cohort, arm)
     covariates, names = covariate_matrix(cohort, arm)
     params = json.loads((scenario / "scenario.json").read_text())["params"]
@@ -121,10 +127,10 @@ def run(method: Path, cohort: Path, scenario: Path, out: Path, cores: int, arm: 
         variants=table, covariates=covariates[train_columns], covariate_names=names, phenotype=phenotype[train_columns].copy(),
         trait_type="binary" if params["binary"] else "quantitative",
         prevalence=params["prevalence"] if params["binary"] else None, cores=cores,
-        _observed=observed, _columns=train_columns,
+        _observed=observed, _columns=train_columns, _records=records,
     )
     test = ScoreData(variants=table, covariates=covariates[test_columns], covariate_names=names,
-                     _observed=observed, _columns=test_columns)
+                     _observed=observed, _columns=test_columns, _records=records)
     del phenotype
     module = load_method(method)
     started = time.time()

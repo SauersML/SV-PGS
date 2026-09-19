@@ -18,6 +18,7 @@ import cupy as cp
 import numpy as np
 
 from benchmarks.bench_sim.harness import ARMS
+from benchmarks.bench_sim.measurement import measured_records
 
 CODES_PER_DOSAGE = 127
 PC_COUNT = 10
@@ -29,6 +30,7 @@ def prepare(cohort: Path, block_rows: int, arm: str) -> None:
     samples = np.load(cohort / "samples.npz")
     is_test = samples["is_test"]
     train, test = np.flatnonzero(~is_test), np.flatnonzero(is_test)
+    measured = measured_records(cohort)
     cls = np.load(cohort / "variants.npz")["cls"]
     observed = np.load(cohort / ARMS[arm][0], mmap_mode="r")
     n_var, size = observed.shape
@@ -39,7 +41,7 @@ def prepare(cohort: Path, block_rows: int, arm: str) -> None:
         block = cp.asarray(np.asarray(observed[first:first + block_rows]), dtype=cp.float32) / CODES_PER_DOSAGE
         mean = block[:, train_gpu].mean(axis=1, keepdims=True)
         sd = block[:, train_gpu].std(axis=1, keepdims=True)
-        keep = sd[:, 0] > 0
+        keep = (sd[:, 0] > 0) & cp.asarray(measured[first:first + block_rows])
         standardized = (block[keep] - mean[keep]) / sd[keep]
         block_cls = cp.asarray(cls[first:first + block_rows])[keep]
         for name, members in (("simple", block_cls <= 1), ("structural", block_cls >= 2)):

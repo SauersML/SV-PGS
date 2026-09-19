@@ -16,6 +16,7 @@ from pathlib import Path
 import numpy as np
 
 from benchmarks.bench_sim.harness import ARMS, covariate_matrix
+from benchmarks.bench_sim.measurement import measured_records
 
 CODES_PER_DOSAGE = 127
 
@@ -36,7 +37,8 @@ def load_shared(cohort: Path, arm: str) -> dict:
     counts = json.loads((cohort / f"kernel_counts_{arm}.json").read_text())
     weight_structural = counts["structural"] / (counts["simple"] + counts["structural"])
     shared = {"train": train, "test": test, "covariates": covariates, "weight_structural": weight_structural,
-              "observed": np.load(cohort / ARMS[arm][0], mmap_mode="r"), "cls": np.load(cohort / "variants.npz")["cls"]}
+              "observed": np.load(cohort / ARMS[arm][0], mmap_mode="r"), "cls": np.load(cohort / "variants.npz")["cls"],
+              "measured": measured_records(cohort)}
     diagonals, crosses = {}, {}
     for name in ("simple", "structural"):
         kernel = np.load(cohort / f"kernel_{name}_{arm}.npy", mmap_mode="r")
@@ -55,10 +57,13 @@ def baselines(shared: dict, scenario: Path, results: Path, arm: str) -> None:
     train, test, covariates = shared["train"], shared["test"], shared["covariates"]
     truth = np.load(scenario / "truth.npz")
 
-    # oracle_observed: the true additive effects applied to observed dosages.
+    # oracle_observed: the true additive effects of the measured causal records, applied to their observed
+    # dosages. Causal records the imputed callset lacks are invisible to every method.
     causal = truth["causal"]
     order = np.argsort(causal)
     rows, effects = causal[order], truth["per_allele"][order]
+    visible = shared["measured"][rows]
+    rows, effects = rows[visible], effects[visible]
     dosage = np.asarray(shared["observed"][rows], dtype=np.float64)[:, test] / CODES_PER_DOSAGE
     dosage -= dosage.mean(axis=1, keepdims=True)
     structural = shared["cls"][rows] >= 2

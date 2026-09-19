@@ -235,6 +235,7 @@ def test_ridge_inf_baseline_matches_a_direct_solve(tmp_path) -> None:
     np.savez(tmp_path / "samples.npz", is_test=is_test, sex=rng.integers(0, 2, size), age=rng.uniform(18, 80, size),
              batch=rng.integers(0, 2, size))
     np.savez(tmp_path / "variants.npz", cls=cls)
+    np.save(tmp_path / "measured.npy", np.ones(n_var, dtype=bool))
     dosage = observed.astype(np.float64) / measurement.CODES_PER_DOSAGE
     standardized = (dosage - dosage[:, train].mean(axis=1, keepdims=True)) / dosage[:, train].std(axis=1, keepdims=True)
     counts = {}
@@ -279,3 +280,16 @@ def test_ridge_inf_baseline_matches_a_direct_solve(tmp_path) -> None:
         expected = scale * matrix[np.ix_(test, train)] @ np.linalg.solve(system, residual)
         # A relative perturbation delta of the kernel moves the solve by at most cond(system) * delta.
         assert np.max(np.abs(prediction - expected)) <= float32_tolerance * np.linalg.cond(system) * np.max(np.abs(expected))
+
+
+def test_measured_records_follow_the_panel_allele_count_rule(tmp_path) -> None:
+    panel = np.zeros((6, 10), dtype=np.uint8)
+    panel[1, :1] = 1
+    panel[2, :2] = 1
+    panel[3, :9] = 1
+    panel[4, :8] = 1
+    panel[5, :5] = 1
+    np.save(tmp_path / "panel_haps.npy", panel)
+    measured = measurement.measured_records(tmp_path)
+    assert measured.tolist() == [False, False, True, False, True, True]
+    assert np.array_equal(np.load(tmp_path / "measured.npy"), measured)
