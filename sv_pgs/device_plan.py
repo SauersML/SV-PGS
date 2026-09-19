@@ -15,9 +15,9 @@ scoring spreads its blocks over the devices (``fast_scoring``). This module shar
   :func:`log_device_plan` records the decision when a fit starts.
 
 Integer products are computed wholly on one device, so they are the same bits whichever device ran
-them. A fp64 sample-side image summed over blocks in another association differs from the
-single-device sum by at most ``gamma_(B-1) * sum_b |image_b|`` elementwise for ``B`` blocks
-(Higham, *Accuracy and Stability of Numerical Algorithms*, 2nd ed., eq. 4.4), which
+them. Any association of a fp64 sum over ``B`` block images is within ``gamma_(B-1) * sum_b |image_b|``
+of the exact sum elementwise (Higham, *Accuracy and Stability of Numerical Algorithms*, 2nd ed.,
+eq. 4.4), so the devices' sum and the single-device sum differ by at most twice that, which
 :func:`reassociation_bound` returns.
 """
 from __future__ import annotations
@@ -104,12 +104,20 @@ def log_device_plan(budget: ComputeBudget, plan: DevicePlan) -> None:
 
 
 def reassociation_bound(block_images: Sequence[Any], array_module: Any) -> Any:
-    """Elementwise bound on how far two summation orders of ``block_images`` can differ in fp64."""
+    """Elementwise bound on how far two summation orders of ``block_images`` can differ in fp64.
+
+    Each order is within ``gamma_(B-1) M`` of the exact sum, ``M = sum_b |image_b|``. The bound is
+    evaluated in fp64 as ``2 gamma_(B+1) M~``: the computed M~ is at least ``(1 - gamma_(B-1)) M``
+    and the bound's own arithmetic rounds by a relative ``4u`` or less, while
+    ``gamma_(B+1) / gamma_(B-1) >= 1 + 2 / (B - 1)`` covers both for any ``B`` below ``u^-1/2``.
+    """
     count = len(block_images)
     if count <= 1:
         return array_module.zeros_like(block_images[0]) if count else 0.0
     unit = np.finfo(np.float64).eps / 2.0
-    gamma = (count - 1) * unit / (1.0 - (count - 1) * unit)
+    if count * count * unit >= 1.0:
+        raise ValueError(f"{count} blocks are too many for the fp64 reassociation bound")
+    gamma = (count + 1) * unit / (1.0 - (count + 1) * unit)
     magnitude = array_module.zeros_like(block_images[0])
     for image in block_images:
         magnitude += array_module.abs(image)
