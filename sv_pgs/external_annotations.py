@@ -18,17 +18,26 @@ Record tiers, strongest first (the codes ``rec_map`` stores):
 Assignment is greedy over (tier, quality, breakpoint distance, ids): each external record and
 each store record is used at most once. VNTR loci match when their intervals overlap and their
 motif lengths agree up to TRF's doubled or tripled periods.
+
+The payload side is symmetric by construction, each source with its own
+EB-learned weight: SNV records take the z^2 of an external SNV GWAS (Pan-UKB
+EUR, lifted from GRCh37 by ``lift_positions``), SV records the z^2 of Bai et
+al. 2026's SV GWAS and tandem-repeat length columns the z^2 of its VNTR GWAS.
+``annotate_records`` joins one source's payload by key; a record without a row
+stays absent (present flag 0).
 """
 
 from __future__ import annotations
 
 import collections
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Sequence
 
 import numpy as np
+import pandas as pd
 
-from sv_pgs._typing import I64Array, NDArray
+from sv_pgs._typing import BoolArray, F64Array, I64Array, NDArray
 from sv_pgs.variant_typing import sequence_resolved_kind_and_length, trimmed_allele_cores
 
 TIER_EXACT = 1
@@ -303,3 +312,115 @@ def squared_z(effects: NDArray, standard_errors: NDArray) -> NDArray:
     if beta.shape != error.shape or np.any(error <= 0.0) or not np.all(np.isfinite(beta)):
         raise ValueError("squared_z needs finite effects and positive standard errors, one each.")
     return (beta / error) ** 2
+
+
+# Positions are below 2^32, so chromosome * stride + position is a unique site key.
+_SITE_STRIDE = np.int64(1 << 32)
+
+
+@dataclass(frozen=True)
+class ExternalAssociations:
+    """One external release: a unique key per tested variant and its squared z statistic."""
+
+    keys: NDArray
+    squared_z: F64Array
+
+
+def _unique(keys: NDArray, values: NDArray, source: str) -> ExternalAssociations:
+    keys = np.asarray(keys, dtype=object)
+    if pd.Index(keys).has_duplicates:
+        raise ValueError(f"{source} lists a variant more than once.")
+    return ExternalAssociations(keys=keys, squared_z=np.asarray(values, dtype=np.float64))
+
+
+def read_bai_structural(path: Path) -> ExternalAssociations:
+    """A Bai 2026 SV release (columns CHR SNP POS A1 A2 N AF1 BETA SE P MAF), keyed by its SV id."""
+    table = pd.read_csv(path, sep="\t", usecols=["SNP", "BETA", "SE"], dtype={"SNP": str})
+    return _unique(table["SNP"].to_numpy(), squared_z(table["BETA"].to_numpy(), table["SE"].to_numpy()), str(path))
+
+
+def read_bai_tandem_repeat(path: Path) -> ExternalAssociations:
+    """A Bai 2026 VNTR release (effect per repeat unit), keyed by its locus id."""
+    table = pd.read_csv(path, sep="\t", usecols=["ID", "BETA", "SE"], dtype={"ID": str})
+    return _unique(table["ID"].to_numpy(), squared_z(table["BETA"].to_numpy(), table["SE"].to_numpy()), str(path))
+
+
+@dataclass(frozen=True)
+class SnvAssociations:
+    """An SNV release before keying: its sites and their squared z."""
+
+    chromosome: I64Array
+    position: I64Array
+    reference: NDArray
+    alternate: NDArray
+    squared_z: F64Array
+
+
+def read_panukb_eur(path: Path) -> SnvAssociations:
+    """A slim Pan-UKB EUR file (chr pos ref alt beta_EUR se_EUR ... low_confidence_EUR), autosomes only.
+
+    Pan-UKB flags variants whose EUR statistics fail its QC as low confidence;
+    those carry no usable evidence and are left out, so they become absent.
+    """
+    table = pd.read_csv(path, sep="\t", usecols=["chr", "pos", "ref", "alt", "beta_EUR", "se_EUR", "low_confidence_EUR"],
+                        dtype={"chr": str, "ref": str, "alt": str})
+    confident = ~table["low_confidence_EUR"].astype(str).str.lower().isin(["true", "1"])
+    autosomal = table["chr"].str.fullmatch(r"\d+")
+    table = table[confident & autosomal]
+    return SnvAssociations(
+        chromosome=table["chr"].astype(np.int64).to_numpy(),
+        position=table["pos"].to_numpy(dtype=np.int64),
+        reference=table["ref"].to_numpy(dtype=object),
+        alternate=table["alt"].to_numpy(dtype=object),
+        squared_z=squared_z(table["beta_EUR"].to_numpy(), table["se_EUR"].to_numpy()),
+    )
+
+
+def lift_positions(
+    chromosome: NDArray, position: NDArray, map_chromosome: NDArray, map_from: NDArray, map_to: NDArray
+) -> tuple[I64Array, BoolArray]:
+    """Positions after a site map on the same chromosome; ``mapped`` is False (position -1) where the map has no entry."""
+    map_key = np.asarray(map_chromosome, dtype=np.int64) * _SITE_STRIDE + np.asarray(map_from, dtype=np.int64)
+    if map_key.shape[0] == 0:
+        raise ValueError("the site map is empty.")
+    order = np.argsort(map_key, kind="stable")
+    sorted_key = map_key[order]
+    if np.any(np.diff(sorted_key) == 0):
+        raise ValueError("the site map lists a source position more than once.")
+    query = np.asarray(chromosome, dtype=np.int64) * _SITE_STRIDE + np.asarray(position, dtype=np.int64)
+    slot = np.minimum(np.searchsorted(sorted_key, query), sorted_key.shape[0] - 1)
+    mapped = sorted_key[slot] == query
+    lifted = np.full(query.shape[0], -1, dtype=np.int64)
+    lifted[mapped] = np.asarray(map_to, dtype=np.int64)[order][slot[mapped]]
+    return lifted, mapped
+
+
+def snv_keys(chromosome: NDArray, position: NDArray, reference: NDArray, alternate: NDArray) -> NDArray:
+    """chromosome:position:ref:alt keys, the join key between an SNV release and store records."""
+    return np.array([f"{int(code)}:{int(site)}:{ref}:{alt}" for code, site, ref, alt in
+                     zip(chromosome, position, reference, alternate)], dtype=object)
+
+
+def keyed_snv_associations(associations: SnvAssociations, position: NDArray, mapped: NDArray) -> ExternalAssociations:
+    """Key an SNV release at its (lifted) positions, keeping only the sites the lift mapped."""
+    kept = np.asarray(mapped, dtype=bool)
+    keys = snv_keys(associations.chromosome[kept], np.asarray(position)[kept],
+                    associations.reference[kept], associations.alternate[kept])
+    return _unique(keys, associations.squared_z[kept], "the lifted SNV release")
+
+
+@dataclass(frozen=True)
+class RecordAnnotation:
+    """One external source, per record: log(1 + z^2) where present, and the present flag."""
+
+    log_squared_z: F64Array
+    present: BoolArray
+
+
+def annotate_records(record_keys: NDArray, associations: ExternalAssociations) -> RecordAnnotation:
+    """Exact key join of records to one source's payload; records without a row are absent."""
+    positions = pd.Index(associations.keys).get_indexer(pd.Index(np.asarray(record_keys, dtype=object)))
+    present = positions >= 0
+    values = np.zeros(positions.shape[0])
+    values[present] = np.log1p(associations.squared_z[positions[present]])
+    return RecordAnnotation(log_squared_z=values, present=present)
