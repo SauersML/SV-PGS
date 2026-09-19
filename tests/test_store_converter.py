@@ -246,7 +246,7 @@ def _write_batch(path, dosages) -> None:
         '##FORMAT=<ID=DS,Number=1,Type=Float,Description="dosage">',
         '##FORMAT=<ID=GP,Number=G,Type=Float,Description="genotype probabilities">',
         "##contig=<ID=chr22,length=50818468>",
-        "\t".join(["#CHROM", "POS", "ID", "REF", "ALT", "QUAL", "FILTER", "INFO", "FORMAT"] + [f"s{index}" for index in range(samples)]),
+        "\t".join(["#CHROM", "POS", "ID", "REF", "ALT", "QUAL", "FILTER", "INFO", "FORMAT"] + [f"{path.stem}_s{index}" for index in range(samples)]),
     ]
     for (position, ref, alt, identifier, _, _), row in zip(_SITES, dosages):
         fields = []
@@ -375,7 +375,7 @@ def _write_called_batch(path, genotypes) -> None:
         '##INFO=<ID=ID,Number=1,Type=String,Description="atomic id">',
         '##FORMAT=<ID=GT,Number=1,Type=String,Description="genotype">',
         "##contig=<ID=chr22,length=50818468>",
-        "\t".join(["#CHROM", "POS", "ID", "REF", "ALT", "QUAL", "FILTER", "INFO", "FORMAT"] + [f"lr{index}" for index in range(samples)]),
+        "\t".join(["#CHROM", "POS", "ID", "REF", "ALT", "QUAL", "FILTER", "INFO", "FORMAT"] + [f"{path.stem}_lr{index}" for index in range(samples)]),
     ]
     for (position, ref, alt, identifier, _, _), row in zip(_SITES, genotypes):
         lines.append("\t".join(["chr22", str(position), ".", ref, alt, ".", "PASS", f"ID={identifier}", "GT", *row]))
@@ -422,18 +422,36 @@ def test_a_long_read_half_joins_the_imputed_halves_on_the_same_sites(tmp_path) -
         record_counts=[3],
         chromosome_sites_md5=[sites_md5(positions, ref_lengths, alt_lengths)],
         half_sample_counts=[5, 2],
+        half_sample_ids=[[name for batch in imputed for name in batch.sample_ids], long_read.sample_ids],
         half_measurements=["imputed_dosage", "long_read_calls"],
         gates={"S0": "PASS"},
         recalibrated=False,
     )
 
     store = DosageStore.open(root)
+    assert store.sample_ids == (*imputed[0].sample_ids, *imputed[1].sample_ids, *long_read.sample_ids)
     codes = store.read_codes(0, 3)
     assert codes.shape == (3, 7)
     np.testing.assert_array_equal(codes[:, 5:], [[127, 254], [0, 127], [254, 0]])
     assert long_read.zeroed.tolist() == [0, 0, 0]
     assert store.statistic("no_calls").tolist() == [0, 0, 0]
     assert read_manifest(root)["attributes"]["half_measurements"] == ["imputed_dosage", "long_read_calls"]
+
+
+def test_the_store_manifest_refuses_a_sample_listed_twice_in_a_half(tmp_path) -> None:
+    manifest = dict(
+        chromosomes=["chr22"],
+        record_counts=[3],
+        chromosome_sites_md5=["0" * 32],
+        half_sample_counts=[2],
+        half_measurements=["imputed_dosage"],
+        gates={},
+        recalibrated=False,
+    )
+    with pytest.raises(ValueError, match="more than once"):
+        write_store_manifest(tmp_path / "twice", half_sample_ids=[["s1", "s1"]], **manifest)
+    with pytest.raises(ValueError, match="one sample name per sample"):
+        write_store_manifest(tmp_path / "short", half_sample_ids=[["s1"]], **manifest)
 
 
 def test_a_long_read_no_call_takes_its_groups_measured_mean(tmp_path) -> None:

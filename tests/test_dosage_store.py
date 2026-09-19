@@ -329,6 +329,13 @@ def test_transcoding_copies_the_whole_store_with_zero_copy_raw_halves(two_half_s
         assert np.array_equal(view, expected_codes[3:90, : first_half.n_samples])
 
 
+def test_a_store_without_a_sample_manifest_says_so(two_half_store: tuple[Path, list[dict[str, np.ndarray]]]) -> None:
+    root, _ = two_half_store
+    with DosageStore.open(root) as store:
+        with pytest.raises(ValueError, match="no sample manifest"):
+            store.sample_ids
+
+
 def test_a_forked_child_compresses_with_its_own_threads(tmp_path: Path) -> None:
     layout = create_code_array(tmp_path / "parent", 40, 9, codec="zstd", shard_rows=SHARD_ROWS, inner_rows=INNER_ROWS)
     codes = encode_dosage_milli(_random_dosage_milli(np.random.default_rng(4), 40, 9))

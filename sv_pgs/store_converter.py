@@ -50,6 +50,7 @@ from sv_pgs.dosage_store import (
     statistic_column_directory,
     write_column,
     write_half_codes,
+    write_half_samples,
     write_manifest,
 )
 from sv_pgs.variant_typing import trimmed_allele_cores
@@ -457,6 +458,7 @@ class DecodedBatch:
     zeroed: I64Array
     unmatched_low: I64Array
     no_calls: I64Array
+    sample_ids: tuple[str, ...]
 
 
 def _gate(condition: bool, path: Path, record: int, detail: str) -> None:
@@ -510,7 +512,8 @@ def _decode_records(
     groups = np.asarray(sample_groups, dtype=np.int64)
     reader = VCF(str(path))
     try:
-        sample_count = len(reader.samples)
+        sample_ids = tuple(str(sample) for sample in reader.samples)
+        sample_count = len(sample_ids)
         if groups.shape != (sample_count,) or (groups.size and (int(groups.min()) < 0 or int(groups.max()) >= group_count)):
             raise ValueError(f"{path}: need a group in 0..{group_count - 1} for each of its {sample_count} samples.")
         record_count = expected.positions.shape[0]
@@ -562,6 +565,7 @@ def _decode_records(
         zeroed=zeroed,
         unmatched_low=unmatched_low,
         no_calls=no_calls,
+        sample_ids=sample_ids,
     )
 
 
@@ -701,17 +705,23 @@ def write_store_manifest(
     record_counts: Sequence[int],
     chromosome_sites_md5: Sequence[str],
     half_sample_counts: Sequence[int],
+    half_sample_ids: Sequence[Sequence[str]],
     half_measurements: Sequence[str],
     gates: dict[str, str],
     recalibrated: bool,
 ) -> None:
-    """The store MANIFEST: halves with their measurement kind, gate results, whether D* was applied.
+    """The store MANIFEST: halves with their measurement kind, gate results, whether D* was applied,
+    and each half's sample manifest (its batches' sample names in batch order, each once).
 
     A long-read half shares the imputed halves' verified site list; the fit gives every half its
     own covariate.
     """
     if len(half_measurements) != len(half_sample_counts) or any(kind not in HALF_MEASUREMENTS for kind in half_measurements):
         raise ValueError(f"every half needs a measurement in {HALF_MEASUREMENTS}.")
+    if [len(names) for names in half_sample_ids] != [int(count) for count in half_sample_counts]:
+        raise ValueError("every half needs one sample name per sample.")
+    for half_index, names in enumerate(half_sample_ids):
+        write_half_samples(Path(root), half_index, list(names))
     write_manifest(
         Path(root),
         chromosomes=chromosomes,

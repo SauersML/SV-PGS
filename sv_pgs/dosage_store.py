@@ -768,6 +768,10 @@ def variant_column_directory(root: Path, chromosome: str, column: str) -> Path:
     return root / "variants" / chromosome / column
 
 
+def sample_directory(root: Path, half_index: int) -> Path:
+    return root / "samples" / f"half{half_index}"
+
+
 def statistic_column_directory(root: Path, half_index: int, chromosome: str, column: str) -> Path:
     return root / "stats" / f"half{half_index}" / chromosome / column
 
@@ -832,6 +836,18 @@ def read_identifier_columns(bytes_directory: Path, offsets_directory: Path) -> t
     buffer = np.asarray(open_column(bytes_directory)[0]).tobytes()
     offsets = np.asarray(open_column(offsets_directory)[0], dtype=np.int64)
     return tuple(buffer[int(offsets[row]) : int(offsets[row + 1])].decode() for row in range(offsets.shape[0] - 1))
+
+
+def write_half_samples(root: Path, half_index: int, sample_ids: Sequence[str]) -> None:
+    """A half's sample manifest: its samples' names in store column order, each once.
+
+    The names are those of the source files (sequencing IDs in AoU), so the manifest stays in
+    the workspace with the store; the crosswalk maps them to research IDs.
+    """
+    if len(set(sample_ids)) != len(sample_ids) or not all(sample_ids):
+        raise ValueError(f"half{half_index} lists a sample more than once or a blank sample name.")
+    directory = sample_directory(root, half_index)
+    write_identifier_columns(directory / _ID_BYTES_COLUMN, directory / _ID_OFFSETS_COLUMN, sample_ids)
 
 
 def write_variant_ids(root: Path, chromosome: str, variant_ids: Sequence[str]) -> None:
@@ -1050,6 +1066,21 @@ class DosageStore:
     @property
     def n_variants(self) -> int:
         return int(self.chromosome_starts[-1])
+
+    @property
+    def sample_ids(self) -> tuple[str, ...]:
+        """The selected halves' sample names in store column order, from each half's manifest."""
+        names: list[str] = []
+        for position, half in enumerate(self.half_indices):
+            directory = sample_directory(self.root, half)
+            if not (directory / _ID_BYTES_COLUMN).exists():
+                raise ValueError(f"{self.root} has no sample manifest for half{half}; convert the store again.")
+            half_names = read_identifier_columns(directory / _ID_BYTES_COLUMN, directory / _ID_OFFSETS_COLUMN)
+            expected = int(self.half_sample_starts[position + 1] - self.half_sample_starts[position])
+            if len(half_names) != expected:
+                raise ValueError(f"half{half}'s sample manifest lists {len(half_names)} samples, not {expected}.")
+            names.extend(half_names)
+        return tuple(names)
 
     @property
     def n_samples(self) -> int:

@@ -7,7 +7,8 @@ One consolidated spec. It replaces the numbered addenda A4 through A4.15. Code: 
 ## Dosage arrays
 - **Layout:** `dosage/half{h}/chrK` is a Zarr v3 uint8 array `[n_records, n_samples_h]`.
   - Rows are in popped-BCF file order, all records.
-  - Columns are (batch, header position) only; no sample names are stored.
+  - Columns are the half's batches side by side, each in header order.
+  - `samples/half{h}` is the half's sample manifest: the header names (sequencing IDs in AoU) in column order, each once. `DosageStore.sample_ids` reads it, and the crosswalk maps it to research IDs. A name repeated within a half fails conversion.
 - **Code:** `(DS_milli·127 + 500) // 1000`, where DS_milli is the corrected dosage below. 255 is never written.
 - **Encoding:**
   - shards of 65,536 rows with 64-row inner chunks;
