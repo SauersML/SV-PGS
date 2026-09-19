@@ -498,10 +498,11 @@ def tilted_moments(
         shift = cavity.shift[rows]
         conditional = terms.conditional_variance
         first_moment = np.sum(terms.responsibility * conditional, axis=1)
-        second_moment = np.sum(terms.responsibility * (conditional + np.square(shift)[:, None] * np.square(conditional)), axis=1)
+        # Var = E_w[c] + h^2 Var_w(c): both terms are non-negative, so nothing cancels.
+        spread = np.sum(terms.responsibility * np.square(conditional - first_moment[:, None]), axis=1)
         log_normalizer[rows] = terms.log_normalizer
         mean[rows] = shift * first_moment
-        variance[rows] = second_moment - np.square(shift * first_moment)
+        variance[rows] = first_moment + np.square(shift) * spread
     return TiltedMoments(log_normalizer=log_normalizer, mean=mean, variance=variance)
 
 

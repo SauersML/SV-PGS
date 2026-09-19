@@ -214,6 +214,38 @@ def marginal_variances(gaussian: FullDataGaussian) -> F64Array:
     return gaussian.block_variances()
 
 
+def _damped_site_update(
+    gaussian: FullDataGaussian,
+    site_precision: F64Array,
+    site_shift: F64Array,
+    target_precision: F64Array,
+    target_shift: F64Array,
+    noise: F64Array,
+    tolerance: float,
+    exact_curvature: NDArray,
+) -> tuple[Any, F64Array, F64Array]:
+    """Move the sites to their targets and re-solve the mean; halve the move while the full-data precision is
+    not positive definite (a negative site can make it indefinite, and block CG then breaks down).
+
+    Only the site step is damped: every accepted state is an exact mean for its sites, and the EP fixed point
+    does not depend on the steps taken to reach it.
+    """
+    fraction = 1.0
+    while True:
+        precision = site_precision + fraction * (target_precision - site_precision)
+        shift = site_shift + fraction * (target_shift - site_shift)
+        try:
+            certificate = gaussian.iterate(
+                site_precision=precision, site_shift=shift, noise_variance=noise, tolerance=tolerance, refactor=False, exact_curvature=exact_curvature
+            )
+        except (FloatingPointError, np.linalg.LinAlgError):
+            fraction *= 0.5
+            if fraction < float(np.finfo(np.float64).eps):
+                raise
+            continue
+        return certificate, precision, shift
+
+
 def _solve_tolerance(gaussian: FullDataGaussian, effective_effects: F64Array, draw_count: int, site_precision: F64Array) -> float:
     """CG relative tolerance whose mean error, in the posterior metric, is below p_eff / K for every model.
 
@@ -265,24 +297,34 @@ def fit_full_data(
             site_precision=site_precision, site_shift=site_shift, noise_variance=noise, tolerance=tolerance, refactor=True, exact_curvature=exact_curvature
         )
         frozen_precision = 1.0 / marginal_variances(gaussian) - site_precision
+        converged, previous_move = False, np.full(model_count, np.inf)
         while True:
             marginal_variance = 1.0 / (frozen_precision + site_precision)
             previous_mean = gaussian.mean.copy()
+            target_precision, target_shift = site_precision.copy(), site_shift.copy()
             for model_index in range(model_count):
                 cavity = Cavity(
                     precision=frozen_precision[:, model_index],
                     shift=gaussian.mean[:, model_index] / marginal_variance[:, model_index] - site_shift[:, model_index],
                 )
                 moments = tilted_moments(prior, hyperparameters[model_index], cavity, working_bytes)
-                site_precision[:, model_index], site_shift[:, model_index] = site_targets(moments, cavity)
-            certificate = gaussian.iterate(
-                site_precision=site_precision, site_shift=site_shift, noise_variance=noise, tolerance=tolerance, refactor=False, exact_curvature=exact_curvature
+                target_precision[:, model_index], target_shift[:, model_index] = site_targets(moments, cavity)
+            certificate, site_precision, site_shift = _damped_site_update(
+                gaussian, site_precision, site_shift, target_precision, target_shift, noise, tolerance, exact_curvature
             )
             marginal_variance = 1.0 / (frozen_precision + site_precision)
             mean_move = np.sum(np.square(gaussian.mean - previous_mean) / marginal_variance, axis=0)
             effective = prior.variant_count - np.sum(site_precision * marginal_variance, axis=0)
             if np.all(mean_move <= effective / draw_count):
+                converged = True
                 break
+            # The mean-only iteration contracts only while the frozen variances are close to q's (math-epeb);
+            # once a pass stops shrinking the move, refresh them.
+            if np.any(mean_move >= previous_move):
+                break
+            previous_move = mean_move
+        if not converged:
+            continue
         residual_sum_of_squares = gaussian.residual_sum_of_squares()
         noise = np.array([
             noise_variance(
