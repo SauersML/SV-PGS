@@ -869,6 +869,28 @@ def core_bounds(array_module: Any, block: ResolvedBlock) -> tuple[float, float, 
     return lowest, residual_norm, delta
 
 
+def resolved_correction_error(array_module: Any, block: ResolvedBlock, correction: Any, shifted: Any, image_norms: Any) -> Any:
+    """Per column, a bound on ||Z_hat c - Z_L c*|| for c = core_hat^-1 s_hat and c* = core^-1 s, s = Z_L'u - v_L.
+
+    `correction` is c, `shifted` is s_hat = Z_hat'u - v_L and `image_norms` is ||u||. With E = Z_L - Z_hat =
+    S_S^-1 R_L (||E|| <= ||R_L||, S_S >= I), s_hat - s = -E'u and L'core^-1 L within kappa = delta / (1 - delta)
+    of I (core_bounds):
+        ||Z_hat c - Z_L c*|| <= ||R_L|| ||c|| + (||Z_hat|| + ||R_L||) ||c - c*||,
+        ||c - c*|| <= ||R_L|| ||u|| / lambda_min + kappa (||L^-1 s_hat|| + ||R_L|| ||u|| / sqrt(lambda_min)) / sqrt(lambda_min).
+    Infinite when delta is not below 1. All norms spectral.
+    """
+    lowest, residual_norm, delta = core_bounds(array_module, block)
+    if not delta < 1.0:
+        return array_module.full(image_norms.shape, np.inf)
+    kappa = delta / (1.0 - delta)
+    root = float(np.sqrt(lowest))
+    gram = block.duals.T @ block.duals
+    duals_norm = float(np.sqrt(max(float(array_module.linalg.eigvalsh(0.5 * (gram + gram.T))[-1]), 0.0)))
+    whitened = array_module.linalg.norm(array_module.linalg.solve(block.factor, shifted), axis=0)
+    offset = residual_norm * image_norms / lowest + kappa * (whitened + residual_norm * image_norms / root) / root
+    return residual_norm * array_module.linalg.norm(correction, axis=0) + (duals_norm + residual_norm) * offset
+
+
 def split_columns(array_module: Any, block: ResolvedBlock, shift: Any, duals: Any, residual: Any) -> tuple[Any, Any, Any]:
     """Columns sharing one model's split: their resolved block, their mean duals and their A-norm certificate.
 
@@ -1251,13 +1273,16 @@ class DualGaussian:
         """The products the cavity certificate needs for variant-side probes v (p x k), at the last iterate's sites.
 
         With u = Xt D_S v, t = Z_L'u and w = K_S^-1 u - Z_L core^-1 (t - v_L) (K_S = S_S, the bulk
-        operator), returns (Xt'w (p x k), t (|L| x k), the exact relative residuals ||u - K_S y|| / ||u||
-        of the bulk solve (k,)). The solve runs to `residual_tolerance`, a relative bound on that
-        residual (marginal_variances' information_solve_tolerance), applied to each column's own u.
-        w is minus the dual posterior_solve forms for the shift v, before D_S v_S is added. Two reads
-        plus the CG passes.
+        operator), returns (Xt'w (p x k), t (|L| x k), bounds on ||w_hat - w|| / ||u|| (k,)). Each bound is
+        at most `residual_tolerance` (marginal_variances' information_solve_tolerance), whose
+        |a'(w_hat - w)| <= |a| ||w_hat - w|| is what the certificate needs. The bound adds, to the K_S
+        solve's exact residual, the resolved correction's error from the refresh's Z_hat and core_hat
+        (resolved_correction_error). A column that misses tightens its solve and Z_L by the measured
+        shortfall, as posterior_solve does. w is minus the dual posterior_solve forms for the shift v,
+        before D_S v_S is added. Two reads plus the CG passes.
         """
         array_module = self.array_module
+        source = self.source
         state = self._state
         models = state["models"]
         values, _bulk_values, resolved, column_models, image = self._bulk_image(probes, model)
@@ -1265,21 +1290,43 @@ class DualGaussian:
         image_norms = array_module.linalg.norm(image, axis=0)
         # A column with no image is solved by the zero start, so its bound is 0 (never inf * 0).
         tolerance = array_module.broadcast_to(array_module.asarray(residual_tolerance, dtype=array_module.float64), (columns,))
-        bound = array_module.where(image_norms > 0.0, tolerance, 0.0) * image_norms
+        target = array_module.where(image_norms > 0.0, tolerance, 0.0) * image_norms
+        bound = target.copy()
         spike_free = Deflation({}, {}, {}, self._resolved)
-        result = certified_block_cg(self.source, models, image, array_module.zeros_like(image), column_models, bound, self.count, deflation=spike_free, label="information")
-        block = state["blocks"].get(model)
-        duals = result.solution
-        coupling = array_module.zeros((0, columns))
-        if block is not None:
-            coupling = block.duals.T @ image
-            duals = duals - block.duals @ _cholesky_solve(array_module, block.factor, coupling - values[resolved])
+        start = array_module.zeros_like(image)
+        while True:
+            result = certified_block_cg(source, models, image, start, column_models, bound, self.count, deflation=spike_free, label="information")
+            block = state["blocks"].get(model)
+            duals = result.solution
+            coupling = array_module.zeros((0, columns))
+            error = result.residual_norm
+            if block is not None:
+                coupling = block.duals.T @ image
+                shifted = coupling - values[resolved]
+                correction = _cholesky_solve(array_module, block.factor, shifted)
+                duals = duals - block.duals @ correction
+                error = error + resolved_correction_error(array_module, block, correction, shifted, image_norms)
+            # the certificate's bound scales with ||u||, so a column with no bulk image asks nothing of it
+            open_mask = _host((error > target) & (image_norms > 0.0))
+            if not open_mask.any():
+                break
+            finite = array_module.isfinite(error)
+            shortfall = array_module.where(finite, target / array_module.where(finite & (error > 0.0), error, 1.0), tolerance)
+            open_columns = array_module.asarray(np.flatnonzero(open_mask))
+            bound[open_columns] *= shortfall[open_columns]
+            if block is not None:
+                tightening = float(array_module.min(shortfall[open_columns]))
+                resolved_columns = array_module.full(int(block.design.shape[1]), model)
+                resolved_bound = tightening * array_module.linalg.norm(block.residual, axis=0)
+                refined = certified_block_cg(source, models, block.design, block.duals, resolved_columns, resolved_bound, self.count, deflation=spike_free, label="information-resolved")
+                state["blocks"][model] = resolved_block(array_module, block.design, block.precision, refined.solution, refined.residual)
+            start = result.solution
         left = models.sample_to_design(duals, column_models)
         back_products = array_module.empty((self.source.variant_count, columns))
-        for start, stop, tile in self.source.blocks():
-            back_products[start:stop] = tile.rmatmat(left)
+        for start_row, stop_row, tile in self.source.blocks():
+            back_products[start_row:stop_row] = tile.rmatmat(left)
         self.count.note(columns, 0.0, "information-products")
-        return back_products, coupling, result.residual_norm / array_module.maximum(image_norms, np.finfo(np.float64).tiny)
+        return back_products, coupling, error / array_module.maximum(image_norms, np.finfo(np.float64).tiny)
 
     def posterior_solve(self, right: Any, model: int, error_bound: Any) -> Any:
         """A_m^-1 right (p x r) at the last iterate's sites, each column certified to ||x_hat - x||_A <= error_bound.

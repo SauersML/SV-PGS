@@ -861,3 +861,34 @@ def test_an_infinite_information_tolerance_needs_no_solve() -> None:
     expected = np.linalg.solve(posterior_precision, probes)
     covariance = covariance_products(gaussian.bulk_solves[0], probes, back_products, coupling)
     np.testing.assert_allclose(covariance, expected, rtol=0.0, atol=np.linalg.cond(posterior_precision) * genotypes.shape[1] * EPS * np.abs(expected).max())
+
+
+def test_information_products_stay_within_their_bound_after_a_loose_refresh() -> None:
+    # A refresh at a quarter of float64's digits leaves Z_L that far off, and model 0's negative sites make its
+    # core nearly singular; the returned bound on ||w_hat - w|| / ||u|| must cover the resolved correction too.
+    # Xt'(w_hat - w) is then at most ||Xt||_2 times that bound times ||u|| per column.
+    genotypes, bounds, covariates, training, noise, precision, shift, response, offsets, _negative = _gaussian_problem(59)
+    source = dual_solve.DenseDualSource(genotypes, bounds)
+    gaussian = dual_solve.DualGaussian(source=source, training=training, targets=response, offsets=offsets, covariates=covariates, grams=_grams(bounds, True), probe_count=2, seed=8)
+    gaussian.iterate(site_precision=precision, site_shift=shift, noise_variance=noise, error_bound=np.full(MODEL_COUNT, EPS**0.25), probe_residual_ratio=EPS**0.25)
+    model = 0
+    resolved = gaussian.bulk_solves[model].resolved
+    assert np.any(precision[resolved, model] < 0.0)
+    probes = np.random.default_rng(60).choice(np.array([-1.0, 1.0]), size=(genotypes.shape[1], 3))
+    _posterior, _mean, _alpha, _rss, design = _dense_gaussian(genotypes, covariates, training, noise, precision, shift, response, offsets, model)
+    bulk = np.setdiff1d(np.arange(genotypes.shape[1]), resolved)
+    variances = np.zeros(genotypes.shape[1])
+    variances[bulk] = 1.0 / precision[bulk, model]
+    kernel = np.eye(genotypes.shape[0]) + (design * variances[None, :]) @ design.T
+    image = design @ (variances[:, None] * probes)
+    resolved_duals = np.linalg.solve(kernel, design[:, resolved])
+    core = np.diag(precision[resolved, model]) + design[:, resolved].T @ resolved_duals
+    w = np.linalg.solve(kernel, image) - resolved_duals @ np.linalg.solve(core, resolved_duals.T @ image - probes[resolved])
+    expected = design.T @ w
+    tolerance = np.sqrt(EPS)
+    back_products, _coupling, relative = gaussian.information_solve(probes, model, tolerance)
+    assert np.all(relative <= tolerance)
+    conditioning = np.linalg.cond(kernel) * np.linalg.cond(core)
+    rounding = genotypes.shape[0] * conditioning * EPS * np.abs(expected).max()
+    allowed = np.linalg.norm(design, 2) * relative * np.linalg.norm(image, axis=0) + rounding
+    assert np.all(np.linalg.norm(back_products - expected, axis=0) <= allowed)
