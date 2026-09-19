@@ -262,3 +262,55 @@ def test_projected_ld_matches_a_dense_float64_reference(tmp_path) -> None:
     boundaries = statistics.boundaries
     assert boundaries.block_count == statistics.ld.block_count
     assert len(boundaries.signature_sha256()) == 64
+
+
+class _ArrayStore:
+    """The DosageCodeStore protocol over in-memory codes."""
+
+    def __init__(self, codes_by_chromosome: dict, group_first) -> None:
+        self.chromosomes = tuple(codes_by_chromosome)
+        counts = [codes.shape[0] for codes in codes_by_chromosome.values()]
+        self.chromosome_starts = np.concatenate(([0], np.cumsum(counts))).astype(np.int64)
+        self._codes = np.concatenate(list(codes_by_chromosome.values()))
+        self.variant_table = type("VariantTable", (), {"group_first": group_first})()
+        self.reads = 0
+
+    @property
+    def n_samples(self) -> int:
+        return self._codes.shape[1]
+
+    @property
+    def n_variants(self) -> int:
+        return self._codes.shape[0]
+
+    def read_codes(self, start, stop, sample_indices=None, out=None):
+        self.reads += 1
+        out[...] = self._codes[start:stop]
+        return out
+
+
+def test_the_dosage_store_source_streams_the_candidate_rows() -> None:
+    from sv_pgs.genotype_statistics import DosageStoreTileSource
+
+    source = _dataset(17, {"chr1": 400, "chr2": 300})
+    all_codes = np.concatenate([source.codes["chr1"], source.codes["chr2"]])
+    group_first = np.concatenate([source.groups["chr1"], 400 + source.groups["chr2"]])
+    group_first = np.maximum.accumulate(np.searchsorted(group_first, group_first))
+    store = _ArrayStore(dict(source.codes), group_first)
+    rng = np.random.default_rng(18)
+    candidates = np.sort(rng.choice(700, size=520, replace=False))
+    tile_source = DosageStoreTileSource(store, candidates)
+    assert tile_source.chromosomes() == ["chr1", "chr2"]
+    rows = tile_source.store_rows("chr2")
+    np.testing.assert_array_equal(rows, candidates[candidates >= 400])
+    out = np.empty((rows.shape[0], SAMPLES), dtype=np.uint8)
+    tile_source.read_rows("chr2", 0, rows.shape[0], out)
+    np.testing.assert_array_equal(out, all_codes[rows])
+    np.testing.assert_array_equal(tile_source.unsplittable_groups("chr2"), group_first[rows])
+    layout, summary, blocks = _run(tile_source, _sample_groups(19), devices=1, columns=None)
+    signed = all_codes.astype(np.int64) - 127
+    members = np.flatnonzero(_sample_groups(19) == 0)
+    for block in blocks:
+        store_rows = tile_source.store_rows(block.chromosome)[block.start : block.stop]
+        values = signed[store_rows][:, members]
+        np.testing.assert_array_equal(block.grams[0], values @ values.T)
