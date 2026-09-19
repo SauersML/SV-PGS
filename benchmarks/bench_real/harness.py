@@ -61,7 +61,9 @@ class Dataset:
         self._chromosomes = {}
 
     def chromosome(self, chrom: str):
+        """The variant table and memory-mapped dosages of one chromosome; only the latest one stays cached."""
         if chrom not in self._chromosomes:
+            self._chromosomes.clear()
             number = chrom.removeprefix("chr")
             table = pd.read_csv(self.directory / f"chr{number}.variants.tsv", sep="\t")
             if "source" not in table:
