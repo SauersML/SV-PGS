@@ -20,7 +20,9 @@ sit at either of its ends.
 
 from __future__ import annotations
 
+import dataclasses
 from dataclasses import dataclass
+from typing import Sequence
 
 import numpy as np
 
@@ -180,123 +182,181 @@ def candidate_pairs(first: SvSites, second: SvSites) -> SvCandidatePairs:
 # Two-source calibration and the fused column
 # ---------------------------------------------------------------------------
 #
-# Model, per matched locus with latent ALT count g (mean 2p, variance G):
-#   first source  A = the imputed DS, a calibrated posterior mean: E[g | A] = A,
-#                 so E[A] = 2p and Cov(A, g) = Var(A) = V_A (Berkson error);
-#   second source B = kappa g + a + e with e independent of (g, A) (classical
-#                 error; the intercept a absorbs false-positive calls).
-# Then Cov(A, B) = kappa V_A identifies kappa without truth, and the law of
-# total variance gives G from the same posterior: G = Var(E[g | data]) +
-# E[Var(g | data)] = V_A + the mean posterior variance. That needs neither
-# Hardy-Weinberg nor ancestry groups. (Within-group HWE is exact only with
-# correct group labels: with 20% of a two-group sample mislabelled it read
-# r2_A 0.847 for a true 0.763 and lost 0.022 of fused r2, where this closure
-# read 0.765.) Since G >= V_A, r2_A <= 1 by construction, and r2_B =
-# corr(A, B)^2 / r2_A. The implied covariance of (g, A, B),
-#   [[G, V_A, kappa G], [V_A, V_A, kappa V_A], [kappa G, kappa V_A, V_B]],
-# is a valid covariance exactly when r2_A = V_A / G <= 1 and
-# r2_B = kappa^2 G / V_B <= 1; the fused column is the best linear predictor
-#   g_hat = 2p + w_A (A - m_A) + w_B (B - m_B),
-#   w = [V_A, kappa G] Sigma^-1,  Sigma = [[V_A, kappa V_A], [kappa V_A, V_B]],
-# with reliability r2_fused = w . [V_A, kappa G] / G. Where B is a no-call the
-# predictor from A alone is A itself. (A classical error model for A as well,
-# m_s = 2p kappa_s, does not hold for a posterior mean: it misreads the
-# reliabilities of both sources.)
+# Model, per matched locus with latent ALT count g (variance V_G), for the
+# imputed dosage A and the other source's call B:
+#   E[A | g] = alpha_A + rho_A g,   E[B | g] = alpha_B + rho_B g,
+# with the two errors uncorrelated given g, and A's error independent of B's
+# no-calls given g. Both lines are exact for any per-haplotype error model
+# because a haplotype is 0 or 1. A is mean-calibrated (E[A] = E[g] after the
+# background correction); that holds whether A is a calibrated posterior mean
+# (Berkson, rho_A = r2_A) or a confident posterior draw (rho_A = r_A), and in
+# general rho_A = sqrt(r2_A V_A / V_G). The moments of (A, B) leave exactly one
+# number unidentified: A's reliability r2_A = corr^2(A, g). It is an input, from
+# ``shrunk_imputed_reliabilities``. Given it, tau_A^2 = V_A (1 - r2_A),
+# alpha_A = (1 - rho_A) m_A and, per group (B called / B a no-call),
+# mu_G|group = (m_A|group - alpha_A) / rho_A. Where B is called the fused
+# column is the best linear predictor from both sources,
+#   F = mu_G|obs + w . (A - m_A|obs, B - m_B|obs),
+#   w = Sigma_obs^-1 [rho_A V_G|obs, C_AB / rho_A],  V_G|obs = (V_A|obs - tau_A^2) / rho_A^2,
+# and where B is a no-call it is the recalibrated imputed dosage
+#   F = mu_G|miss + kappa_A (A - m_A|miss),  kappa_A = r2_A / rho_A.
+# The group means absorb a no-call rate that depends on the genotype (GATK-SV
+# sets uncertain carrier calls to no-call). V_G = 2p(1 - p), p = m_A / 2, only
+# fixes the allele scale: the fused direction and its reliability
+# r2_F = Var(F) / V_G do not depend on it. r2_B = corr^2(A, B) / r2_A.
+# (theory-genouncertainty's sim F: with the locus's true r2_A the fused r2 is
+# within 4e-4 of the truth-fitted oracle in Berkson, draw, tempered and
+# deflated strata. Treating a draw-like A as a calibrated posterior mean, the
+# closure this replaces, read r2_A = 1 and lost 0.31 of fused r2 in VNTRs.)
 
 MINIMUM_PAIRING_Z = 5.0
 # Fisher's z needs n > 3 for its standard error 1 / sqrt(n - 3).
 MINIMUM_CALIBRATION_SAMPLES = 4
+# The other source's implied reliability may pass 1 by sampling slack; past
+# this a pair is not one event measured with independent errors (the
+# cross-truth rejection distribution design-svcontent measured).
+MAXIMUM_SECOND_RELIABILITY = 1.25
+# Blocks for the delete-a-block jackknife of a truth locus's triad reliability.
+JACKKNIFE_BLOCKS = 20
 
 
 @dataclass(frozen=True, slots=True)
 class TwoSourceCalibration:
-    """Truth-free calibration of one matched locus from its two sources."""
+    """One matched locus, calibrated from its two sources given A's reliability."""
 
     sample_count: int
-    first_mean: float
-    second_mean: float
-    genotype_variance: float
-    second_slope: float
     first_reliability: float
-    second_reliability: float
-    fused_reliability: float
+    first_slope: float
+    genotype_variance: float
+    observed_first_mean: float
+    observed_second_mean: float
+    missing_first_mean: float
+    observed_genotype_mean: float
+    missing_genotype_mean: float
     first_weight: float
     second_weight: float
+    missing_slope: float
+    # Least-squares slope of B on A where both are called: the prediction of
+    # a no-call of B from A, for a record that stays a column of its own.
+    second_slope: float
+    second_reliability: float
+    fused_reliability: float
     pairing_z: float
 
     @property
     def accepted(self) -> bool:
-        """The two records are one event, and the model's covariance is valid."""
+        """The records are one event and the model's covariance is valid."""
         return (
             self.pairing_z >= MINIMUM_PAIRING_Z
             and 0.0 < self.first_reliability <= 1.0
-            and 0.0 < self.second_reliability <= 1.0
+            and 0.0 < self.second_reliability <= MAXIMUM_SECOND_RELIABILITY
         )
 
+    @property
+    def second_reliability_flagged(self) -> bool:
+        """Accepted with B's implied reliability past 1 (within the sampling slack)."""
+        return self.accepted and self.second_reliability > 1.0
 
-def _without_pairing_evidence(sample_count: int) -> TwoSourceCalibration:
-    # A source constant on the shared samples, or fewer than four of them,
-    # leaves the correlation undefined: no evidence that the records pair.
+
+def _without_pairing_evidence(sample_count: int, first_reliability: float) -> TwoSourceCalibration:
+    # A source constant on the shared samples, a monomorphic A, or fewer than
+    # four shared samples leave the correlation undefined: no evidence that
+    # the records pair.
     undefined = float("nan")
     return TwoSourceCalibration(
         sample_count=sample_count,
-        first_mean=undefined,
-        second_mean=undefined,
+        first_reliability=first_reliability,
+        first_slope=undefined,
         genotype_variance=undefined,
-        second_slope=undefined,
-        first_reliability=undefined,
-        second_reliability=undefined,
-        fused_reliability=undefined,
+        observed_first_mean=undefined,
+        observed_second_mean=undefined,
+        missing_first_mean=undefined,
+        observed_genotype_mean=undefined,
+        missing_genotype_mean=undefined,
         first_weight=undefined,
         second_weight=undefined,
+        missing_slope=undefined,
+        second_slope=undefined,
+        second_reliability=undefined,
+        fused_reliability=undefined,
         pairing_z=0.0,
     )
 
 
+def _fused_values(calibration: TwoSourceCalibration, first: F64Array, second: F64Array, observed: NDArray) -> F64Array:
+    fused = np.empty_like(first)
+    fused[observed] = (
+        calibration.observed_genotype_mean
+        + calibration.first_weight * (first[observed] - calibration.observed_first_mean)
+        + calibration.second_weight * (second[observed] - calibration.observed_second_mean)
+    )
+    missing = ~observed
+    fused[missing] = calibration.missing_genotype_mean + calibration.missing_slope * (
+        first[missing] - calibration.missing_first_mean
+    )
+    return fused
+
+
 def calibrate_two_sources(
     first_dosage: F64Array,
-    first_posterior_variance: F64Array,
     second_values: NDArray,
     second_observed: NDArray,
+    first_reliability: float,
 ) -> TwoSourceCalibration:
-    """Calibrate a matched locus on the samples where both sources are observed.
+    """Calibrate a matched locus: the imputed dosage (all samples), the other source where called.
 
-    ``first_dosage`` is the imputed DS (calibrated) and
-    ``first_posterior_variance`` its per-sample Var(g | data), from the
-    genotype posterior (DS + 2 GP2 - DS^2 for a 0/1/2 genotype);
-    ``second_values`` is the other source's allele count.
+    ``first_reliability`` is the imputed dosage's r2_A at this locus.
     """
+    first = np.asarray(first_dosage, dtype=np.float64)
+    second = np.asarray(second_values, dtype=np.float64)
     observed = np.asarray(second_observed, dtype=bool)
-    first = np.asarray(first_dosage, dtype=np.float64)[observed]
-    second = np.asarray(second_values, dtype=np.float64)[observed]
     sample_count = int(observed.sum())
-    if sample_count < MINIMUM_CALIBRATION_SAMPLES or np.ptp(first) == 0.0 or np.ptp(second) == 0.0:
-        return _without_pairing_evidence(sample_count)
     first_mean = float(first.mean())
-    second_mean = float(second.mean())
+    genotype_variance = first_mean - first_mean**2 / 2
+    first_called = first[observed]
+    second_called = second[observed]
+    if (
+        sample_count < MINIMUM_CALIBRATION_SAMPLES
+        or genotype_variance <= 0.0
+        or np.ptp(first_called) == 0.0
+        or np.ptp(second_called) == 0.0
+    ):
+        return _without_pairing_evidence(sample_count, first_reliability)
     first_variance = float(first.var())
-    second_variance = float(second.var())
-    covariance = float(np.mean((first - first_mean) * (second - second_mean)))
-    genotype_variance = first_variance + float(np.mean(np.asarray(first_posterior_variance, dtype=np.float64)[observed]))
-    second_slope = covariance / first_variance
-    correlation = covariance / np.sqrt(first_variance * second_variance)
-    sigma = np.array([[first_variance, covariance], [covariance, second_variance]])
-    cross = np.array([first_variance, second_slope * genotype_variance])
+    first_slope = float(np.sqrt(first_reliability * first_variance / genotype_variance))
+    first_noise = first_variance * (1.0 - first_reliability)
+    first_intercept = (1.0 - first_slope) * first_mean
+
+    observed_first_mean = float(first_called.mean())
+    observed_second_mean = float(second_called.mean())
+    sigma = np.cov(np.vstack([first_called, second_called]), bias=True)
+    observed_genotype_variance = max(float(sigma[0, 0]) - first_noise, 0.0) / first_slope**2
+    cross = np.array([first_slope * observed_genotype_variance, float(sigma[0, 1]) / first_slope])
     # Least squares keeps a perfectly correlated pair (singular Sigma) finite.
     first_weight, second_weight = np.linalg.lstsq(sigma, cross, rcond=None)[0]
-    return TwoSourceCalibration(
+    missing = ~observed
+    missing_first_mean = float(first[missing].mean()) if missing.any() else observed_first_mean
+    correlation = float(sigma[0, 1] / np.sqrt(sigma[0, 0] * sigma[1, 1]))
+    calibration = TwoSourceCalibration(
         sample_count=sample_count,
-        first_mean=first_mean,
-        second_mean=second_mean,
+        first_reliability=first_reliability,
+        first_slope=first_slope,
         genotype_variance=genotype_variance,
-        second_slope=second_slope,
-        first_reliability=first_variance / genotype_variance,
-        second_reliability=second_slope**2 * genotype_variance / second_variance,
-        fused_reliability=float(first_weight * cross[0] + second_weight * cross[1]) / genotype_variance,
+        observed_first_mean=observed_first_mean,
+        observed_second_mean=observed_second_mean,
+        missing_first_mean=missing_first_mean,
+        observed_genotype_mean=(observed_first_mean - first_intercept) / first_slope,
+        missing_genotype_mean=(missing_first_mean - first_intercept) / first_slope,
         first_weight=float(first_weight),
         second_weight=float(second_weight),
+        missing_slope=first_reliability / first_slope,
+        second_slope=float(sigma[0, 1] / sigma[0, 0]),
+        second_reliability=correlation**2 / first_reliability,
+        fused_reliability=float("nan"),
         pairing_z=float(np.arctanh(np.clip(correlation, -1.0 + 1e-15, 1.0 - 1e-15)) * np.sqrt(sample_count - 3)),
     )
+    fused = _fused_values(calibration, first, second, observed)
+    return dataclasses.replace(calibration, fused_reliability=float(fused.var() / genotype_variance))
 
 
 def fused_dosage(
@@ -305,24 +365,18 @@ def fused_dosage(
     second_values: NDArray,
     second_observed: NDArray,
 ) -> F64Array:
-    """The fused column: the linear posterior mean of g given both sources.
-
-    Samples where the second source is a no-call keep the imputed DS.
-    """
+    """The fused column on the allele-count scale: both sources where the other calls, else recalibrated A."""
     if not calibration.accepted:
         raise ValueError("the two records failed the calibration check; keep them as separate columns.")
-    first = np.asarray(first_dosage, dtype=np.float64)
-    observed = np.asarray(second_observed, dtype=bool)
-    fused = first.copy()
-    fused[observed] = (
-        calibration.first_mean
-        + calibration.first_weight * (first[observed] - calibration.first_mean)
-        + calibration.second_weight * (np.asarray(second_values, dtype=np.float64)[observed] - calibration.second_mean)
+    return _fused_values(
+        calibration,
+        np.asarray(first_dosage, dtype=np.float64),
+        np.asarray(second_values, dtype=np.float64),
+        np.asarray(second_observed, dtype=bool),
     )
-    return fused
 
 
-def resolve_one_to_one(pairs: SvCandidatePairs, calibrations: list[TwoSourceCalibration]) -> I64Array:
+def resolve_one_to_one(pairs: SvCandidatePairs, calibrations: Sequence[TwoSourceCalibration]) -> I64Array:
     """Indices of the candidate pairs to fuse, each record used at most once.
 
     Several popped alleles of one locus can match one GATK-SV record, and one
@@ -346,3 +400,182 @@ def resolve_one_to_one(pairs: SvCandidatePairs, calibrations: list[TwoSourceCali
         taken_second.add(second_row)
         chosen.append(index)
     return np.asarray(sorted(chosen), dtype=np.int64)
+
+
+# ---------------------------------------------------------------------------
+# The imputed source's reliability at each locus
+# ---------------------------------------------------------------------------
+#
+# r2_A comes from three places (theory-genouncertainty's spec):
+#   (a) a stratum verified to be Berkson (truth slope kappa within 5% of 1):
+#       per locus r2_A = V_A / V_G, exact and free of B's false positives;
+#   (b) the per-locus mean anchor: with A mean-calibrated and B = alpha_B +
+#       rho_B g + e_B, rho_B = (m_B - alpha_B) / m_A, rho_A = C_AB / (rho_B V_G)
+#       and r2_A = rho_A^2 V_G / V_A, i.e.
+#         log r2_A = 2 log C + 2 log m_A - 2 log(m_B - alpha_B) - log V_G - log V_A,
+#       where alpha_B = 2 f (1 - p) from B's per-haplotype false-positive rate f;
+#   (c) the truth-calibrated reliability model's prediction mu (the store's
+#       r2_truth), unbiased but blind to per-locus spread.
+# The anchor's error is mostly systematic (a false-positive intercept that
+# differs by locus, B's no-call selection); only truth loci measure it. On
+# truth loci where B is also called on the long-read samples, e_t = x_t - y_t
+# (y_t the log triad r2_A) gives a stratum bias b and an excess variance
+# omega^2 = max(0, var e - mean sampling variances of x and y). The locus
+# value is the normal-normal posterior mean on the log scale,
+#   log r2_A = mu + B (x - b - mu),  B = s^2 / (s^2 + v + omega^2),
+# with s^2 = max(0, var(x - b - mu) - mean v - omega^2) the true between-locus
+# spread and v the anchor's sampling plus intercept variance; capped at 1.
+# (sim F: fused-r2 gap to the oracle -0.001 to -0.0075 with random no-calls,
+# against -0.011 to -0.087 for the stratum value alone; the weight falls to
+# about 0 by itself when B's false-positive rate is large.)
+
+
+@dataclass(frozen=True, slots=True)
+class AnchorEstimate:
+    """The mean anchor's log r2_A at one locus and its variance (sampling plus intercept)."""
+
+    log_reliability: float
+    variance: float
+
+
+@dataclass(frozen=True, slots=True)
+class AnchorErrorModel:
+    """The mean anchor's error in one stratum, measured on truth loci.
+
+    ``berkson`` marks a stratum whose truth slope showed the imputed dosage is
+    a calibrated posterior mean; there r2_A = V_A / V_G per locus.
+    """
+
+    bias: float
+    excess_variance: float
+    berkson: bool
+
+
+def berkson_reliability(first_dosage: F64Array) -> float:
+    """r2_A = V_A / V_G of a calibrated posterior-mean dosage, V_G = 2p(1 - p)."""
+    first = np.asarray(first_dosage, dtype=np.float64)
+    first_mean = float(first.mean())
+    genotype_variance = first_mean - first_mean**2 / 2
+    if genotype_variance <= 0.0:
+        return float("nan")
+    return min(float(first.var()) / genotype_variance, 1.0)
+
+
+def mean_anchor(
+    first_dosage: F64Array,
+    second_values: NDArray,
+    second_observed: NDArray,
+    false_positive_rate: float,
+    false_positive_rate_variance: float,
+) -> AnchorEstimate:
+    """The per-locus mean anchor on the samples where both sources are called.
+
+    ``false_positive_rate`` is the other source's per-haplotype false-positive
+    rate for this record's class, and ``false_positive_rate_variance`` its
+    uncertainty across the class's records.
+    """
+    observed = np.asarray(second_observed, dtype=bool)
+    first = np.asarray(first_dosage, dtype=np.float64)[observed]
+    second = np.asarray(second_values, dtype=np.float64)[observed]
+    undefined = AnchorEstimate(log_reliability=float("nan"), variance=float("inf"))
+    if first.shape[0] < MINIMUM_CALIBRATION_SAMPLES:
+        return undefined
+    first_mean = float(first.mean())
+    second_mean = float(second.mean())
+    frequency = first_mean / 2
+    intercept = 2.0 * false_positive_rate * (1.0 - frequency)
+    signal = second_mean - intercept
+    first_centred = first - first_mean
+    second_centred = second - second_mean
+    covariance = float(np.mean(first_centred * second_centred))
+    first_variance = float(np.mean(first_centred**2))
+    genotype_variance = first_mean - first_mean**2 / 2
+    if min(covariance, signal, genotype_variance, first_variance, first_mean) <= 0.0:
+        return undefined
+    log_reliability = (
+        2.0 * np.log(covariance)
+        + 2.0 * np.log(first_mean)
+        - 2.0 * np.log(signal)
+        - np.log(genotype_variance)
+        - np.log(first_variance)
+    )
+    influence = (
+        2.0 * (first_centred * second_centred - covariance) / covariance
+        + 2.0 * first_centred / first_mean
+        - 2.0 * second_centred / signal
+        - (1.0 - first_mean) * first_centred / genotype_variance
+        - (first_centred**2 - first_variance) / first_variance
+    )
+    intercept_variance = 4.0 * (4.0 * (1.0 - frequency) ** 2 * false_positive_rate_variance) / signal**2
+    return AnchorEstimate(
+        log_reliability=float(log_reliability),
+        variance=float(np.mean(influence**2) / first.shape[0]) + intercept_variance,
+    )
+
+
+def triad_log_reliability(first_dosage: F64Array, first_truth: F64Array, second_truth: F64Array) -> tuple[float, float]:
+    """log r2_A against two independent noisy truths, r(A,T1) r(A,T2) / r(T1,T2), and its jackknife variance."""
+    first = np.asarray(first_dosage, dtype=np.float64)
+    truths = (np.asarray(first_truth, dtype=np.float64), np.asarray(second_truth, dtype=np.float64))
+
+    def log_triad(rows: NDArray) -> float:
+        centred = [values[rows] - values[rows].mean() for values in (first, *truths)]
+        dosage, truth_one, truth_two = centred
+        numerator = float(dosage @ truth_one) * float(dosage @ truth_two)
+        denominator = float(dosage @ dosage) * float(truth_one @ truth_two)
+        if numerator <= 0.0 or denominator <= 0.0:
+            return float("nan")
+        return float(np.log(min(numerator / denominator, 1.0)))
+
+    every_row = np.arange(first.shape[0])
+    estimate = log_triad(every_row)
+    blocks = np.array_split(every_row, JACKKNIFE_BLOCKS)
+    leave_one_out = np.array([log_triad(np.setdiff1d(every_row, block, assume_unique=True)) for block in blocks])
+    variance = (JACKKNIFE_BLOCKS - 1) / JACKKNIFE_BLOCKS * float(np.sum((leave_one_out - leave_one_out.mean()) ** 2))
+    return estimate, variance
+
+
+def fit_anchor_error_model(
+    anchors: Sequence[AnchorEstimate],
+    truth_log_reliabilities: F64Array,
+    truth_variances: F64Array,
+    berkson: bool,
+) -> AnchorErrorModel:
+    """The stratum's anchor bias and excess error variance, from its truth loci."""
+    anchor_values = np.array([anchor.log_reliability for anchor in anchors], dtype=np.float64)
+    anchor_variances = np.array([anchor.variance for anchor in anchors], dtype=np.float64)
+    truth_values = np.asarray(truth_log_reliabilities, dtype=np.float64)
+    truth_spread = np.asarray(truth_variances, dtype=np.float64)
+    usable = np.isfinite(anchor_values) & np.isfinite(anchor_variances) & np.isfinite(truth_values) & np.isfinite(truth_spread)
+    if usable.sum() < 2:
+        raise ValueError("an anchor error model needs at least two truth loci with finite anchors and triads.")
+    errors = anchor_values[usable] - truth_values[usable]
+    excess = float(errors.var() - anchor_variances[usable].mean() - truth_spread[usable].mean())
+    return AnchorErrorModel(bias=float(errors.mean()), excess_variance=max(excess, 0.0), berkson=berkson)
+
+
+def shrunk_imputed_reliabilities(
+    anchors: Sequence[AnchorEstimate],
+    prior_log_reliabilities: F64Array,
+    error_model: AnchorErrorModel,
+) -> F64Array:
+    """Per-locus r2_A in one stratum: the anchors shrunk toward the reliability model's prediction.
+
+    A locus whose anchor is undefined keeps the prediction.
+    """
+    anchor_values = np.array([anchor.log_reliability for anchor in anchors], dtype=np.float64)
+    anchor_variances = np.array([anchor.variance for anchor in anchors], dtype=np.float64)
+    prior = np.asarray(prior_log_reliabilities, dtype=np.float64)
+    if prior.shape != anchor_values.shape:
+        raise ValueError("shrunk_imputed_reliabilities needs one prior per anchor.")
+    usable = np.isfinite(anchor_values) & np.isfinite(anchor_variances)
+    deviation = np.where(usable, anchor_values - error_model.bias - prior, 0.0)
+    spread = 0.0
+    if usable.sum() >= 2:
+        spread = max(
+            float(deviation[usable].var() - anchor_variances[usable].mean() - error_model.excess_variance),
+            0.0,
+        )
+    weight = np.zeros_like(prior)
+    weight[usable] = spread / (spread + anchor_variances[usable] + error_model.excess_variance) if spread > 0.0 else 0.0
+    return np.minimum(np.exp(prior + weight * deviation), 1.0)

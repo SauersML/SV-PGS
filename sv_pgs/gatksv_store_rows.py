@@ -10,9 +10,14 @@ with their store codes:
    the imputed allele, so the two-source model does not describe the pair
    (design-svcontent measured implied reliabilities of 1.0-9.6 at GBA,
    CYP2D6, CYP21A2 and RHD).
-2. Every candidate is calibrated (``sv_fusion.calibrate_two_sources``) and the
-   accepted ones are resolved one to one. An accepted pair becomes one fused
-   row that replaces its imputed record, so the locus is one column.
+2. Every candidate is calibrated (``sv_fusion.calibrate_two_sources``) given
+   the imputed record's reliability r2_A at that locus: in a stratum verified
+   Berkson, V_A / V_G; otherwise the pair's mean anchor, shrunk toward the
+   record's reliability-model prediction with the stratum's truth-measured
+   anchor error model (``sv_fusion.shrunk_imputed_reliabilities``). The
+   accepted pairs are resolved one to one. An accepted pair becomes one fused
+   row that replaces its imputed record, so the locus is one column; where
+   GATK-SV is a no-call the row is the recalibrated imputed dosage.
 3. Every other GATK-SV record is a row of its own, with each no-call filled by
    the best linear prediction of the call. When the record's strongest
    candidate pairing is significant (Fisher z >= ``MINIMUM_PAIRING_Z``), the
@@ -32,6 +37,7 @@ whose code the clip changed is counted.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Sequence
 
 import numpy as np
 
@@ -39,16 +45,19 @@ from sv_pgs._typing import BoolArray, F64Array, I64Array, U8Array
 from sv_pgs.gatksv_source import MAXIMUM_STORED_VALUE, GatksvBlock
 from sv_pgs.sv_fusion import (
     MINIMUM_PAIRING_Z,
+    AnchorErrorModel,
     SvSites,
     TwoSourceCalibration,
+    berkson_reliability,
     calibrate_two_sources,
     candidate_pairs,
     fused_dosage,
+    mean_anchor,
     resolve_one_to_one,
+    shrunk_imputed_reliabilities,
 )
 
 CODES_PER_ALLELE = 127
-GP2_CODES_PER_UNIT = 254
 MAXIMUM_ALLELE_COUNT = 2
 
 
@@ -56,22 +65,33 @@ MAXIMUM_ALLELE_COUNT = 2
 class ImputedSvRecords:
     """The imputed source's SV records of one chromosome with their store codes [records, samples].
 
-    ``codes`` are the DS codes (DS = code / 127) and ``gp2_codes`` the store's
-    GP2 codes for the same rows (GP2 = code / 254).
+    ``codes`` are the DS codes (DS = code / 127). Per record,
+    ``prior_log_reliabilities`` is the log of the reliability model's r2_A
+    prediction (the store's r2_truth) and ``strata`` indexes the anchor error
+    model of its stratum.
     """
 
     sites: SvSites
     codes: U8Array
-    gp2_codes: U8Array
+    prior_log_reliabilities: F64Array
+    strata: I64Array
 
     def __post_init__(self) -> None:
         if not self.sites.duplications_are_insertions:
             raise ValueError("the imputed source is sequence-resolved: its DUP records are inserted copies.")
-        for name, codes in (("codes", self.codes), ("gp2_codes", self.gp2_codes)):
-            if codes.dtype != np.uint8 or codes.ndim != 2 or codes.shape[0] != self.sites.starts.shape[0]:
-                raise ValueError(f"ImputedSvRecords.{name} must be uint8 [records, samples], one row per site.")
-        if self.gp2_codes.shape != self.codes.shape:
-            raise ValueError("ImputedSvRecords.gp2_codes must match codes.")
+        record_count = self.sites.starts.shape[0]
+        if self.codes.dtype != np.uint8 or self.codes.ndim != 2 or self.codes.shape[0] != record_count:
+            raise ValueError("ImputedSvRecords.codes must be uint8 [records, samples], one row per site.")
+        if self.prior_log_reliabilities.shape != (record_count,) or self.strata.shape != (record_count,):
+            raise ValueError("ImputedSvRecords needs one prior log reliability and one stratum per site.")
+
+
+@dataclass(frozen=True, slots=True)
+class FalsePositiveRates:
+    """Per GATK-SV record: its class's per-haplotype false-positive rate and that rate's variance."""
+
+    means: F64Array
+    variances: F64Array
 
 
 @dataclass(frozen=True, slots=True)
@@ -138,31 +158,60 @@ def _copy_number_codes(values: F64Array) -> tuple[U8Array, int]:
     return _clipped_codes(values, float(MAXIMUM_STORED_VALUE), 1)
 
 
-def gatksv_store_rows(gatksv: GatksvBlock, imputed: ImputedSvRecords) -> tuple[FusedRows, GatksvRows]:
+def gatksv_store_rows(
+    gatksv: GatksvBlock,
+    imputed: ImputedSvRecords,
+    error_models: Sequence[AnchorErrorModel],
+    false_positives: FalsePositiveRates,
+) -> tuple[FusedRows, GatksvRows]:
     """Fuse the GATK-SV records that pair with an imputed record and fill the rest.
 
     ``gatksv`` holds one chromosome's kept records aligned to the store's
-    samples and ``imputed`` the same chromosome's imputed SV records.
+    samples and ``imputed`` the same chromosome's imputed SV records;
+    ``error_models[s]`` is stratum s's anchor error model and
+    ``false_positives`` gives each GATK-SV record's false-positive rate.
     """
     sample_count = gatksv.values.shape[1]
     if imputed.codes.shape[1] != sample_count:
         raise ValueError("the GATK-SV block and the imputed codes need the store's samples.")
+    if false_positives.means.shape != (gatksv.record_count,) or false_positives.variances.shape != (gatksv.record_count,):
+        raise ValueError("gatksv_store_rows needs one false-positive rate per GATK-SV record.")
     observed = ~gatksv.no_call
 
     def imputed_dosage(record: int) -> F64Array:
         return imputed.codes[record] / float(CODES_PER_ALLELE)
 
-    def imputed_posterior_variance(record: int) -> F64Array:
-        # E[g^2 | data] = DS + 2 GP2 for a 0/1/2 genotype.
-        dosage = imputed_dosage(record)
-        return dosage + 2.0 * imputed.gp2_codes[record] / float(GP2_CODES_PER_UNIT) - dosage**2
-
     pairs = candidate_pairs(imputed.sites, gatksv_sites(gatksv))
-    calibrations = [
-        calibrate_two_sources(
-            imputed_dosage(first_row), imputed_posterior_variance(first_row), gatksv.values[second_row], observed[second_row]
+    first_rows = pairs.first_rows.tolist()
+    second_rows = pairs.second_rows.tolist()
+    if not np.all(np.isfinite(imputed.prior_log_reliabilities[pairs.first_rows])):
+        raise ValueError("every paired imputed record needs its reliability-model prediction.")
+    anchors = [
+        mean_anchor(
+            imputed_dosage(first_row),
+            gatksv.values[second_row],
+            observed[second_row],
+            float(false_positives.means[second_row]),
+            float(false_positives.variances[second_row]),
         )
-        for first_row, second_row in zip(pairs.first_rows.tolist(), pairs.second_rows.tolist())
+        for first_row, second_row in zip(first_rows, second_rows)
+    ]
+    reliabilities = np.empty(len(first_rows), dtype=np.float64)
+    pair_strata = imputed.strata[pairs.first_rows]
+    for stratum in np.unique(pair_strata).tolist():
+        in_stratum = np.flatnonzero(pair_strata == stratum)
+        model = error_models[stratum]
+        if model.berkson:
+            reliabilities[in_stratum] = [berkson_reliability(imputed_dosage(first_rows[pair])) for pair in in_stratum.tolist()]
+        else:
+            reliabilities[in_stratum] = shrunk_imputed_reliabilities(
+                [anchors[pair] for pair in in_stratum.tolist()],
+                imputed.prior_log_reliabilities[pairs.first_rows[in_stratum]],
+                model,
+            )
+    calibrations = [
+        calibrate_two_sources(imputed_dosage(first_row), gatksv.values[second_row], observed[second_row], float(reliability))
+        for first_row, second_row, reliability in zip(first_rows, second_rows, reliabilities.tolist())
     ]
     chosen = resolve_one_to_one(pairs, calibrations)
 
@@ -208,8 +257,8 @@ def gatksv_store_rows(gatksv: GatksvBlock, imputed: ImputedSvRecords) -> tuple[F
         pair = int(strongest_pair[record])
         if pair >= 0:
             calibration = calibrations[pair]
-            prediction = calibration.second_mean + calibration.second_slope * (
-                imputed_dosage(int(pairs.first_rows[pair])) - calibration.first_mean
+            prediction = calibration.observed_second_mean + calibration.second_slope * (
+                imputed_dosage(int(pairs.first_rows[pair])) - calibration.observed_first_mean
             )
             filled_from_imputed[row] = True
         else:
