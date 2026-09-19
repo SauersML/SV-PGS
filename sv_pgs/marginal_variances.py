@@ -126,7 +126,7 @@ class BlockCertificate:
     standard_error: NDArray[np.float64]
     lower_bound: NDArray[np.float64]
     upper_bound: NDArray[np.float64]
-    tolerance: float
+    tolerance: "float | NDArray[np.float64]"
     level: float
     certified: NDArray[np.bool_]
     violated: NDArray[np.bool_]
@@ -368,7 +368,7 @@ def certificate_level(draw_count: int) -> float:
 
 
 def _certificate(
-    estimate: NDArray[np.float64], per_probe: list[NDArray[np.float64]], tolerance: float, level: float
+    estimate: NDArray[np.float64], per_probe: list[NDArray[np.float64]], tolerance: "float | NDArray[np.float64]", level: float
 ) -> BlockCertificate:
     """Intervals from k probe values per block, at family-wise ``level`` over the B blocks (Bonferroni, two-sided).
 
@@ -393,8 +393,9 @@ def _certificate(
         standard[position] = spread / abs(computed)
     lower = relative - quantile * standard
     upper = relative + quantile * standard
-    certified = (lower >= -tolerance) & (upper <= tolerance)
-    violated = (lower > tolerance) | (upper < -tolerance)
+    bound = np.broadcast_to(np.asarray(tolerance, dtype=np.float64), relative.shape)
+    certified = (lower >= -bound) & (upper <= bound)
+    violated = (lower > bound) | (upper < -bound)
     return BlockCertificate(
         relative_error=relative, standard_error=standard, lower_bound=lower, upper_bound=upper,
         tolerance=tolerance, level=level, certified=certified, violated=violated,
@@ -406,7 +407,7 @@ def block_trace_certificate(
     blocks: tuple[NDArray[np.int64], ...],
     probes: NDArray[np.float64],
     covariance_probes: NDArray[np.float64],
-    tolerance: float,
+    tolerance: "float | NDArray[np.float64]",
     level: float,
 ) -> BlockCertificate:
     """Test each block's tr(Sigma_bb) against Rademacher probes z (p x k) and Sigma z (from the solver).
@@ -491,7 +492,7 @@ def block_information_certificate(
     blocks: tuple[NDArray[np.int64], ...],
     probes: NDArray[np.float64],
     removed_products: NDArray[np.float64],
-    tolerance: float,
+    tolerance: "float | NDArray[np.float64]",
     level: float,
     control: ControlVariate,
 ) -> BlockCertificate:
@@ -557,6 +558,56 @@ def control_variate(solve: BulkSolve, grams: BlockGrams, probes: NDArray[np.floa
         removed[members] = np.where(bulk_rows[:, None], own_variance[:, None] * probes[members] - products, 0.0)
         information[block] = float(np.sum(np.where(bulk_rows, own_variance - np.diag(terms.covariance), 0.0)))
     return ControlVariate(removed_products=removed, window_information=information)
+
+
+def cavity_tolerance(
+    site_precision: NDArray[np.float64],
+    variances: NDArray[np.float64],
+    tilted_response: NDArray[np.float64],
+    tilted_skewness: NDArray[np.float64],
+    blocks: tuple[NDArray[np.int64], ...],
+    draw_count: int,
+    effective_parameters: float,
+) -> NDArray[np.float64]:
+    """Per block: the relative error of tr(D - Sigma)_b that the EP fixed point cannot see through K draws.
+
+    **What an information error does.** A relative error eps_j in site j's information I_j = D_j - Sigma_jj
+    is a relative variance error e_j = -eps_j w_j / (1 - w_j), where w_j = P_j Sigma_jj is the data share and
+    I_j / Sigma_jj = P_j / tau_j = w_j / (1 - w_j). The decoupled EP freezes the variances in the cavities,
+    so its cavity moves by -e_j / Sigma_jj, amplified by 1/w_j. But the site responds only through the tilted
+    law's non-Gaussianity, and at the fixed point Sigma_jj (P_j + tau_j) = 1 cancels the 1/w_j. To first order:
+
+        delta Sigma_jj / Sigma_jj = r_j e_j,   |delta mu|^2_{Sigma^-1} = sum_j (gamma_j e_j / 2)^2,
+
+    with r_j = d tau_j / d P_j = (kappa4 / 2 + m kappa3) / V^2 (``tilted_response``) and gamma_j = kappa3 / V^1.5
+    (``tilted_skewness``), the tilted cumulants at the cavity. Measured against exact perturbed fixed points
+    [sim-only: AR(1) LD, mixture priors, n = 400-600]: correlation 0.93-0.998 with the variance prediction,
+    slope 0.59-0.98 (the prediction is the larger), the mean prediction within 5%, and improper cavities
+    exactly where predicted.
+
+    **The tolerance** is the smallest of three:
+    - variance channel: sqrt(2/K) posterior sds of a variance is invisible to K draws (ep_eb.md §3.3). With a
+      uniform eps over the block, that is eps_b <= sqrt(2/K) / rms_{j in b}(|r_j| w_j / (1 - w_j));
+    - mean channel: |delta mu|^2 <= p_eff / K, split evenly over the model, is
+      eps <= sqrt(p_eff / K) / sqrt(sum_j (gamma_j w_j / (2 (1 - w_j)))^2), for every block;
+    - properness: the cavity stays proper iff the estimated information stays positive, eps_j < 1.
+    Resolved sites are exact in core and are excluded.
+    """
+    data_share = 1.0 - site_precision * variances
+    ratio = data_share / (1.0 - data_share)
+    is_bulk = (site_precision > 0.0) & np.isfinite(ratio)
+    variance_weight = np.where(is_bulk, np.abs(tilted_response) * ratio, 0.0)
+    mean_weight = np.where(is_bulk, 0.5 * tilted_skewness * ratio, 0.0)
+    mean_total = float(np.sqrt(np.sum(np.square(mean_weight))))
+    mean_bound = float(np.sqrt(effective_parameters / draw_count)) / mean_total if mean_total > 0.0 else np.inf
+    variance_limit = float(np.sqrt(2.0 / draw_count))
+    tolerance = np.empty(len(blocks))
+    for position, members in enumerate(blocks):
+        weights = variance_weight[members][is_bulk[members]]
+        spread = float(np.sqrt(np.mean(np.square(weights)))) if weights.shape[0] else 0.0
+        variance_bound = variance_limit / spread if spread > 0.0 else np.inf
+        tolerance[position] = min(variance_bound, mean_bound, 1.0)
+    return tolerance
 
 
 def certificate_tolerance(solve: BulkSolve, bulk_probe_count: int) -> float:

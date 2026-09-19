@@ -21,6 +21,7 @@ from sv_pgs.marginal_variances import (
     information_products,
     information_solve_tolerance,
     block_trace_certificate,
+    cavity_tolerance,
     certificate_level,
     probes_to_decide,
     certificate_tolerance,
@@ -342,3 +343,29 @@ def test_control_variate_leaves_the_information_estimate_unbiased_and_shrinks_it
 def test_stage_levels_spend_at_most_the_level():
     level = certificate_level(64)
     assert sum(stage_level(level, stage) for stage in range(60)) <= level
+
+
+def test_cavity_tolerance_follows_its_three_bounds():
+    generator = np.random.default_rng(17)
+    variant_count = 300
+    blocks = tuple(np.arange(start, start + 100) for start in range(0, variant_count, 100))
+    site_precision = generator.uniform(10.0, 100.0, variant_count)
+    data_share = generator.uniform(0.01, 0.5, variant_count)
+    variances = (1.0 - data_share) / site_precision  # w = 1 - tau Sigma
+    # An information error eps is the relative variance error -eps w / (1 - w).
+    information = 1.0 / site_precision - variances
+    eps = 0.1
+    perturbed = 1.0 / site_precision - information * (1.0 + eps)
+    assert np.allclose(perturbed / variances - 1.0, -eps * data_share / (1.0 - data_share), rtol=1e-12)
+    draws, effective = 64, 50.0
+    # A Gaussian tilted law (no response, no skewness) leaves only properness.
+    zero = np.zeros(variant_count)
+    assert np.all(cavity_tolerance(site_precision, variances, zero, zero, blocks, draws, effective) == 1.0)
+    response = generator.uniform(0.5, 20.0, variant_count)
+    skewness = generator.normal(0.0, 1.0, variant_count)
+    tolerance = cavity_tolerance(site_precision, variances, response, skewness, blocks, draws, effective)
+    ratio = data_share / (1.0 - data_share)
+    mean_bound = np.sqrt(effective / draws) / np.sqrt(np.sum(np.square(0.5 * skewness * ratio)))
+    for position, members in enumerate(blocks):
+        variance_bound = np.sqrt(2.0 / draws) / np.sqrt(np.mean(np.square(response[members] * ratio[members])))
+        assert np.isclose(tolerance[position], min(variance_bound, mean_bound, 1.0), rtol=1e-12)
