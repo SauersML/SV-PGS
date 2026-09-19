@@ -3,6 +3,9 @@
 Two designs:
   random5  five folds; whole 1kGP families stay in one fold, and every superpopulation is spread evenly over the folds.
   loso     leave one superpopulation out: train on four superpopulations, test on the fifth.
+It also writes gene_order.tsv, a seeded permutation of all genes: any prefix of it is a random gene sample, so
+methods too costly for every gene run on the same leading prefix.
+
 The random5 fold count is the conventional five (Hastie, Tibshirani & Friedman 2009, §7.10); it only sets the
 precision of the out-of-fold estimate, not which method wins. The seed is derived from the split name, so the file
 is reproducible, and its sha256 is recorded in the data card.
@@ -55,6 +58,9 @@ def main(dataset_dir: str):
     text = json.dumps(splits, indent=0)
     (directory / "splits.json").write_text(text)
     digest = hashlib.sha256(text.encode()).hexdigest()
+    genes = pd.read_csv(directory / "genes.tsv", sep="\t")
+    order = np.random.default_rng(seed_from_name("bench-real/gene_order")).permutation(len(genes))
+    genes.iloc[order][["gene_id"]].to_csv(directory / "gene_order.tsv", sep="\t", index=False)
     (directory / "splits.sha256").write_text(digest + "\n")
     for split in splits:
         test = samples[samples["sample"].isin(split["test"])]

@@ -70,8 +70,13 @@ class Dataset:
             self._chromosomes[chrom] = (table, dosage)
         return self._chromosomes[chrom]
 
-    def gene_rows(self, chromosomes):
-        return [int(index) for index in self.genes.index[self.genes["chrom"].isin(chromosomes)]]
+    def gene_rows(self, chromosomes, gene_prefix=None):
+        """Genes on the chromosomes; with gene_prefix, only those among the first gene_prefix of gene_order.tsv."""
+        on_chromosomes = self.genes["chrom"].isin(chromosomes)
+        if gene_prefix is not None:
+            leading = set(pd.read_csv(self.directory / "gene_order.tsv", sep="\t")["gene_id"].head(gene_prefix))
+            on_chromosomes &= self.genes["gene_id"].isin(leading)
+        return [int(index) for index in self.genes.index[on_chromosomes]]
 
     def cis_rows(self, chrom: str, tss: int):
         table, _ = self.chromosome(chrom)
@@ -86,29 +91,44 @@ def residualize(phenotype, covariates, train_index, test_index):
     return phenotype[train_index] - fitted[train_index], phenotype[test_index] - fitted[test_index]
 
 
-def build_gene_task(dataset: Dataset, gene_row: int, split: dict):
+@dataclasses.dataclass(frozen=True)
+class GeneWindow:
+    """A gene's cis-window genotypes for all samples, read once and sliced per split."""
+    gene_row: int
+    gene_id: str
+    chrom: str
+    tss: int
+    genotypes: np.ndarray
+    table: pd.DataFrame
+
+
+def load_gene_window(dataset: Dataset, gene_row: int):
     gene = dataset.genes.iloc[gene_row]
     chrom, tss = gene["chrom"], int(gene["tss"])
-    train_index = np.array([dataset.sample_index[sample] for sample in split["train"]])
-    test_index = np.array([dataset.sample_index[sample] for sample in split["test"]])
     rows = dataset.cis_rows(chrom, tss)
     table, dosage = dataset.chromosome(chrom)
-    genotypes = np.asarray(dosage[rows], dtype=np.float32).T
-    train_genotypes, test_genotypes = genotypes[train_index], genotypes[test_index]
+    return GeneWindow(gene_row=gene_row, gene_id=gene["gene_id"], chrom=chrom, tss=tss,
+                      genotypes=np.asarray(dosage[rows], dtype=np.float32).T, table=table.iloc[rows].reset_index(drop=True))
+
+
+def build_gene_task(dataset: Dataset, window: GeneWindow, split: dict):
+    train_index = np.array([dataset.sample_index[sample] for sample in split["train"]])
+    test_index = np.array([dataset.sample_index[sample] for sample in split["test"]])
+    train_genotypes, test_genotypes = window.genotypes[train_index], window.genotypes[test_index]
     allele_count = train_genotypes.sum(axis=0)
     polymorphic = (allele_count > 0) & (allele_count < 2 * len(train_index))
-    rows, train_genotypes, test_genotypes = rows[polymorphic], train_genotypes[:, polymorphic], test_genotypes[:, polymorphic]
-    selected = table.iloc[rows]
+    train_genotypes, test_genotypes = train_genotypes[:, polymorphic], test_genotypes[:, polymorphic]
+    selected = window.table[polymorphic]
     position, end = selected["pos"].to_numpy(), selected["end"].to_numpy()
-    distance = np.where(position > tss, position - tss, np.where(end < tss, end - tss, 0))
+    distance = np.where(position > window.tss, position - window.tss, np.where(end < window.tss, end - window.tss, 0))
     alternate_length = selected["alt_len"].to_numpy()
     variants = Variants(position=position, end=end, distance_to_tss=distance, is_sv=selected["is_sv"].to_numpy(dtype=bool),
                         sv_type=selected["sv_type"].to_numpy(dtype=str), sv_length=selected["sv_length"].to_numpy(),
                         allele_length_change=np.where(alternate_length < 0, 0, alternate_length - selected["ref_len"].to_numpy()),
                         train_allele_frequency=allele_count[polymorphic] / (2 * len(train_index)), source=selected["source"].to_numpy(dtype=str))
-    train_phenotype, test_phenotype = residualize(dataset.expression[gene_row], dataset.covariates, train_index, test_index)
+    train_phenotype, test_phenotype = residualize(dataset.expression[window.gene_row], dataset.covariates, train_index, test_index)
     samples = dataset.samples
-    train = TrainData(gene_id=gene["gene_id"], chrom=chrom, tss=tss, genotypes=train_genotypes, phenotype=train_phenotype, variants=variants,
+    train = TrainData(gene_id=window.gene_id, chrom=window.chrom, tss=window.tss, genotypes=train_genotypes, phenotype=train_phenotype, variants=variants,
                       superpopulation=samples["Superpopulation"].to_numpy()[train_index], population=samples["Population"].to_numpy()[train_index])
     return train, test_genotypes, test_phenotype, test_index
 
@@ -147,9 +167,10 @@ def _init_worker(dataset_dir, method_spec, feature_sets):
 def _run_gene(arguments):
     gene_row, split_names = arguments
     dataset, fit = _WORKER["dataset"], _WORKER["fit"]
+    window = load_gene_window(dataset, gene_row)
     results = []
     for split_name in split_names:
-        train_all, test_all, test_phenotype, test_index = build_gene_task(dataset, gene_row, dataset.splits[split_name])
+        train_all, test_all, test_phenotype, test_index = build_gene_task(dataset, window, dataset.splits[split_name])
         for feature_set in _WORKER["feature_sets"]:
             train, test_genotypes = subset(train_all, test_all, feature_set)
             started = time.process_time()
@@ -159,13 +180,13 @@ def _run_gene(arguments):
     return results
 
 
-def run(dataset_dir, method_spec, method_name, design, chromosomes, out_dir, workers, feature_sets=FEATURE_SETS):
+def run(dataset_dir, method_spec, method_name, design, chromosomes, out_dir, workers, feature_sets=FEATURE_SETS, gene_prefix=None):
     """Out-of-fold predictions of one method for every gene on the chromosomes, under one split design."""
     from multiprocessing import get_context
 
     dataset = Dataset(dataset_dir)
     split_names = [name for name in dataset.splits if name.startswith(design + "/")]
-    gene_rows = dataset.gene_rows(chromosomes)
+    gene_rows = dataset.gene_rows(chromosomes, gene_prefix)
     sample_count = len(dataset.samples)
     predictions = {feature_set: np.full((len(gene_rows), sample_count), np.nan, dtype=np.float32) for feature_set in feature_sets}
     truth = np.full((len(gene_rows), sample_count), np.nan, dtype=np.float32)
@@ -200,5 +221,7 @@ if __name__ == "__main__":
     parser.add_argument("--out", required=True)
     parser.add_argument("--workers", type=int, default=int(os.environ.get("RUNQ_CORES", "1")))
     parser.add_argument("--feature-sets", nargs="+", default=list(FEATURE_SETS), choices=FEATURE_SETS)
+    parser.add_argument("--gene-prefix", type=int, help="run only genes among the first N of the sealed gene_order.tsv")
     arguments = parser.parse_args()
-    run(arguments.dataset, arguments.method, arguments.name, arguments.design, arguments.chromosomes, arguments.out, arguments.workers, tuple(arguments.feature_sets))
+    run(arguments.dataset, arguments.method, arguments.name, arguments.design, arguments.chromosomes, arguments.out, arguments.workers,
+        tuple(arguments.feature_sets), arguments.gene_prefix)
