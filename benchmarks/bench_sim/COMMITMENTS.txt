@@ -1,0 +1,7 @@
+bench-sim commitments (published before any submission)
+2026-09-19T04:46Z  sha256(sealed/master_seed.txt)  eaa4e4635c8454a53c0f649922e2105c4ccf0080c0fee0f650c3704ff2fdb69a
+  Test scenario i uses seed = little-endian uint32 of sha256("<master_hex>:<i>")[:4] (truth.sealed_seeds), i = 0..63.
+  sha256 of the sealed test-scenario parameter file will be appended here once generated, before any submission runs.
+e937142a730560774e559363861b9c76df9ee97a5b02f840847e7cf6682e558f  PREREG.md (v1, before amendments)
+2a7aa5f246410216c4a3d9b1550d460af6f2054f5c8c64a69c6972c5553f220a  truth.py (as first committed)
+5f44b85653ce7a263efece4f73dc4e3582cd5566676849f6bd7abc5407e9c912  PREREG.md (with amendments 1-3)

@@ -39,7 +39,7 @@ gpu = ["jax[cuda12]>=0.4.20,<0.5", "cupy-cuda12x>=13.0", "nvidia-cuda-nvrtc-cu12
 sv-pgs = "sv_pgs.cli:main"
 
 [tool.setuptools.packages.find]
-include = ["sv_pgs*"]
+include = ["sv_pgs*", "benchmarks*"]
 
 [tool.setuptools.package-data]
 sv_pgs = ["_data/*.tsv"]

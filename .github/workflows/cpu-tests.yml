@@ -54,6 +54,7 @@ jobs:
             tests/test_dosage_store.py \
             tests/test_exact_polish.py \
             tests/test_imputation_reliability.py \
+            tests/test_bench_sim.py \
             -v 2>&1 | tee pytest_output.txt
 
       - name: Upload pytest output on failure
