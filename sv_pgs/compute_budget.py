@@ -235,10 +235,24 @@ def _memory_stat_bytes(stat_file: Path, key: str) -> int:
     raise RuntimeError(f"{stat_file} has no {key} entry")
 
 
+RUNQ_MEMORY_VARIABLE = "RUNQ_MEM_BYTES"
+"""The per-task memory allotment the team's task runner (runq) exports. Its tasks share one Slurm job,
+so the job cgroup's headroom is every task's at once; the allotment is this task's share of it."""
+
+
 def _usable_host_bytes() -> int:
-    available_bytes = _detect_available_host_ram_bytes()
+    """MemAvailable, capped by every limited memory cgroup the process sits in (its own included) and by
+    the runner's per-task allotment when it sets one."""
+    limits = [_detect_available_host_ram_bytes()]
     cgroup_headroom = _cgroup_memory_headroom_bytes()
-    return available_bytes if cgroup_headroom is None else min(available_bytes, cgroup_headroom)
+    if cgroup_headroom is not None:
+        limits.append(cgroup_headroom)
+    allotment = os.environ.get(RUNQ_MEMORY_VARIABLE)
+    if allotment is not None:
+        if not allotment.strip().isdigit() or int(allotment) <= 0:
+            raise ValueError(f"{RUNQ_MEMORY_VARIABLE} must be a positive integer byte count, not {allotment!r}")
+        limits.append(int(allotment))
+    return min(limits)
 
 
 def _initialize_device_libraries(cupy: Any) -> None:

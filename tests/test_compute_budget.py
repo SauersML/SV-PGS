@@ -113,6 +113,23 @@ def test_cgroup_v2_tightest_ancestor_binds(tmp_path: Path) -> None:
     assert compute_budget._cgroup_memory_headroom_bytes(proc_file, root) == 200
 
 
+def test_the_runner_allotment_and_the_cgroup_both_cap_host_bytes(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(compute_budget, "_detect_available_host_ram_bytes", lambda: 100 * 2**30)
+    monkeypatch.setattr(compute_budget, "_cgroup_memory_headroom_bytes", lambda: 60 * 2**30)
+    monkeypatch.delenv(compute_budget.RUNQ_MEMORY_VARIABLE, raising=False)
+    assert compute_budget._usable_host_bytes() == 60 * 2**30
+    monkeypatch.setenv(compute_budget.RUNQ_MEMORY_VARIABLE, str(24 * 2**30))
+    assert compute_budget._usable_host_bytes() == 24 * 2**30
+    monkeypatch.setenv(compute_budget.RUNQ_MEMORY_VARIABLE, str(80 * 2**30))
+    assert compute_budget._usable_host_bytes() == 60 * 2**30
+    monkeypatch.setattr(compute_budget, "_cgroup_memory_headroom_bytes", lambda: None)
+    assert compute_budget._usable_host_bytes() == 80 * 2**30
+    for invalid in ("", "0", "-5", "12GB", "1.5e9"):
+        monkeypatch.setenv(compute_budget.RUNQ_MEMORY_VARIABLE, invalid)
+        with pytest.raises(ValueError, match="RUNQ_MEM_BYTES"):
+            compute_budget._usable_host_bytes()
+
+
 def test_cpu_budget_when_no_device_is_exposed(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(compute_budget, "_try_import_cupy", lambda: None)
     monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "")
