@@ -129,8 +129,8 @@ def resolve_cohort_rows(
     )
     LOGGER.info(
         "cohort rows: imputed rows replaced by a truth row: %s sharing a research ID, %s duplicating a truth genome",
-        _reportable_count(len(shared_research_ids)),
-        _reportable_count(len(duplicated_genomes)),
+        reportable_count(len(shared_research_ids)),
+        reportable_count(len(duplicated_genomes)),
     )
     return CohortRows(
         research_ids=tuple(research_id for _half, _column, research_id, _source in kept),
@@ -150,7 +150,7 @@ def _research_id_values(research_ids: Sequence[ResearchId]) -> list[str]:
     return [research_id.value for research_id in research_ids]
 
 
-def _reportable_count(count: int) -> str:
+def reportable_count(count: int) -> str:
     """The All of Us dissemination rule: a count of 1 to 20 participants is never written out."""
     return str(count) if count == 0 or count >= MINIMUM_REPORTED_PARTICIPANTS else "1-20 (suppressed)"
 
@@ -183,6 +183,49 @@ class AncestryPcs:
         if missing:
             raise ValueError(f"{len(missing)} samples have no genetic PCs.")
         return self.components[[row_of[research_id] for research_id in values]]
+
+
+def read_predicted_ancestry(path: str | Path) -> dict[str, str]:
+    """Each research_id's predicted continental ancestry (``ancestry_pred``), from the table AncestryPcs reads."""
+    with Path(path).open(newline="", encoding="utf-8") as handle:
+        rows = list(csv.DictReader(handle, delimiter="\t"))
+    labels = {row["research_id"]: row["ancestry_pred"] for row in rows}
+    if len(labels) != len(rows):
+        raise ValueError("the ancestry table repeats a research_id.")
+    if not all(labels.values()):
+        raise ValueError("the ancestry table has a blank ancestry_pred.")
+    return labels
+
+
+def read_kinship_pairs(
+    path: str | Path, first_column: str, second_column: str, kinship_column: str
+) -> tuple[tuple[ResearchId, ResearchId, float], ...]:
+    """KING pairs from the CDR relatedness table, whose samples are research IDs (the srWGS call set's names)."""
+    with Path(path).open(newline="", encoding="utf-8") as handle:
+        rows = list(csv.DictReader(handle, delimiter="\t"))
+    pairs = tuple(
+        (ResearchId(row[first_column]), ResearchId(row[second_column]), float(row[kinship_column])) for row in rows
+    )
+    if not all(np.isfinite(coefficient) for _first, _second, coefficient in pairs):
+        raise ValueError("the relatedness table has a non-finite kinship coefficient.")
+    return pairs
+
+
+def pipeline_half_levels(half_labels: Sequence[str], genotype_source: Sequence[str]) -> tuple[str, ...]:
+    """Each row's ``pipeline_half`` level for build_cohort: its imputation half, and the reference level for a long-read row.
+
+    A long-read row went through no imputation run. Giving it a label of its own would make
+    ``pipeline_half`` and ``genotype_source`` the same column; giving it the reference level (the
+    first imputed label, which indicator_columns drops) leaves C one mean per measurement group:
+    ``pipeline_half=h`` marks the imputed rows of half h and ``genotype_source=long_read`` the
+    long-read rows.
+    """
+    if len(half_labels) != len(genotype_source):
+        raise ValueError("pipeline_half_levels needs one genotype source per row.")
+    imputed = sorted({label for label, source in zip(half_labels, genotype_source) if source == IMPUTED_SOURCE})
+    if not imputed:
+        raise ValueError("the cohort has no imputed row, so the pipeline half has no reference level.")
+    return tuple(label if source == IMPUTED_SOURCE else imputed[0] for label, source in zip(half_labels, genotype_source))
 
 
 def indicator_columns(levels: Sequence[str]) -> tuple[tuple[str, ...], F64Array]:
@@ -292,7 +335,7 @@ def build_cohort(
     """Assemble C and the target matrix for ``research_ids``.
 
     ``person_covariates`` are trait-agnostic numeric columns (one value per sample);
-    ``categorical_covariates``, ``pipeline_half`` (the imputation half) and
+    ``categorical_covariates``, ``pipeline_half`` (the imputation half, from pipeline_half_levels) and
     ``genotype_source`` (imputed or long-read-called rows) become indicators. Each
     trait's targets are keyed by research ID. C must have full column rank.
     """
