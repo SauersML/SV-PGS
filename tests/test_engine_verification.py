@@ -619,7 +619,8 @@ def test_the_evidence_gradient_in_the_weights_matches_differences_of_v(seed, kin
 
 def _profile(prior, log_smoothing, cavity, point, null_basis):
     """Maximize the penalized objective over the null directions from ``point``: Newton on the null block with
-    backtracking (a step is kept only when it raises the objective), to double precision."""
+    backtracking (a step is kept only when it raises the objective), until the Newton step's predicted gain is
+    within the objective's rounding."""
     mapping = prior.coefficient_map
     penalty = _penalty_matrix(prior, log_smoothing)
 
@@ -637,6 +638,8 @@ def _profile(prior, log_smoothing, cavity, point, null_basis):
         eigenvalues, eigenvectors = np.linalg.eigh(0.5 * (null_hessian + null_hessian.T))
         # Newton on the magnitudes of the curvature: an ascent direction wherever the block is not concave.
         step = eigenvectors @ ((eigenvectors.T @ null_gradient) / np.maximum(np.abs(eigenvalues), _EPSILON * float(np.max(np.abs(eigenvalues)))))
+        if 0.5 * float(null_gradient @ step) <= _objective_rounding(prior, current, cavity):
+            return current, value
         length = 1.0
         while length * float(np.max(np.abs(step))) > _EPSILON * (1.0 + float(np.max(np.abs(current)))):
             trial = current + length * (null_basis @ step)
