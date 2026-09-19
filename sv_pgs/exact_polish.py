@@ -447,16 +447,17 @@ def _block_conjugate_gradient(
     preconditioned: NDArray,
     preconditioned_image: Any,
     column_models: NDArray,
-    tolerance: float,
+    residual_target: NDArray,
 ) -> tuple[NDArray, Any, NDArray, int]:
-    """Solve A x = r0 from x = 0 by block CG per model, one read per iteration.
+    """Solve A x = r0 from x = 0 by block CG per model, one read per iteration, until ||r|| <= residual_target per column.
 
     Every model's columns (its mean step, probes or draws) share one Krylov
     space: each iteration's direction block is an orthonormal basis of the
     model's preconditioned residuals plus the conjugated previous block. The
     read forms A P = X' P_W (X P) + diag(tau) P, M^-1 A P and X M^-1 A P, so
     X of the next block follows by linearity. Given r0, z0 = M^-1 r0 and X z0;
-    returns (x, X x, final relative residual per column, iterations).
+    returns (x, X x, final residual norm per column, iterations). The targets
+    are absolute, so an exact start costs no iteration.
     """
     device = system.device
     array_module = device.array_module
@@ -466,10 +467,8 @@ def _block_conjugate_gradient(
     preconditioned_image = preconditioned_image.copy()
     solution = np.zeros_like(residual)
     solution_image = array_module.zeros_like(preconditioned_image)
-    right_hand_side_norm = np.linalg.norm(residual, axis=0)
-    safe_norm = np.where(right_hand_side_norm > 0.0, right_hand_side_norm, 1.0)
-    relative_residual = np.where(right_hand_side_norm > 0.0, 1.0, 0.0)
-    active_models = np.unique(column_models[relative_residual > tolerance])
+    residual_norm = np.linalg.norm(residual, axis=0)
+    active_models = np.unique(column_models[residual_norm > residual_target])
     # Block CG explores at most p directions per model; past that its space is complete.
     capacity = np.full(model_count, residual.shape[0])
     direction, direction_image, direction_models = _orthonormal_directions(
@@ -513,8 +512,8 @@ def _block_conjugate_gradient(
             residual[:, model_columns] -= applied @ step
             preconditioned[:, model_columns] -= preconditioned_operator[:, block_columns] @ step
             preconditioned_image[:, device_model_columns] -= preconditioned_operator_image[:, device_block_columns] @ device_step
-            relative_residual[model_columns] = np.linalg.norm(residual[:, model_columns], axis=0) / safe_norm[model_columns]
-            if float(np.max(relative_residual[model_columns])) <= tolerance:
+            residual_norm[model_columns] = np.linalg.norm(residual[:, model_columns], axis=0)
+            if bool(np.all(residual_norm[model_columns] <= residual_target[model_columns])):
                 continue
             conjugate = -np.linalg.solve(curvature_matrix, applied.T @ preconditioned[:, model_columns])
             next_candidates.append(preconditioned[:, model_columns] + block @ conjugate)
@@ -533,7 +532,7 @@ def _block_conjugate_gradient(
             capacity,
         )
         capacity -= np.bincount(direction_models, minlength=model_count)
-    return solution, solution_image, relative_residual, iterations
+    return solution, solution_image, residual_norm, iterations
 
 
 class FullDataGaussian:
@@ -618,8 +617,12 @@ class FullDataGaussian:
     ) -> StartCertificate:
         """One certifying read at the start state, then one Newton step and the probe corrections.
 
-        ``refactor`` rebuilds the block-Jacobi inverse at this state within the
-        first read, with the exact curvature for the models in ``exact_curvature``.
+        The corrections are solved until the gradient and every probe residual
+        are at most ``tolerance`` on the certificate's scale (the gradient's
+        ||X' u~|| + ||tau beta - nu||, a probe's ||z||), so a start that already
+        meets it costs no CG read. ``refactor`` rebuilds the block-Jacobi
+        inverse at this state within the first read, with the exact curvature
+        for the models in ``exact_curvature``.
         """
         device = self.device
         array_module = device.array_module
@@ -692,6 +695,8 @@ class FullDataGaussian:
             ),
             probe_residual=np.max(probe_norm.reshape(model_count, self.probe_count), axis=1),
         )
+        gradient_scale = np.maximum(np.sqrt(score_square_sum) + np.sqrt(penalty_square_sum), np.finfo(np.float64).tiny)
+        residual_target = tolerance * np.concatenate([gradient_scale, np.full(probe_column_count, np.sqrt(self.variant_count))])
         correction, correction_image, _residual, self.conjugate_gradient_iterations = _block_conjugate_gradient(
             reads=self.reads,
             system=system,
@@ -703,7 +708,7 @@ class FullDataGaussian:
             preconditioned=preconditioned,
             preconditioned_image=preconditioned_image,
             column_models=columns,
-            tolerance=tolerance,
+            residual_target=residual_target,
         )
         self.probe_solution += correction[:, model_count:]
         self.probe_image += correction_image[:, model_count:]
@@ -796,6 +801,6 @@ class FullDataGaussian:
             preconditioned=preconditioned,
             preconditioned_image=preconditioned_image,
             column_models=draw_models,
-            tolerance=tolerance,
+            residual_target=tolerance * np.linalg.norm(residual, axis=0),
         )
         return (self.mean[:, draw_models] + perturbation).reshape(self.variant_count, self.model_count, draw_count)
