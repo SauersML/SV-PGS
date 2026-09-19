@@ -19,6 +19,7 @@ Measurements carry the evidence tags defined in MODEL.md: `[sim-only]`, `[semi-r
 ## Model
 - **One model, one path; approximate stages are warm starts, certified on full data (SPEC).** Block mean field shifted β by 16% on a toy [sim-only]. Block-diagonal LD alone over-predicted 2.7× at p/n = 20 [semi-real: design-credit, 1kGP-based genotypes].
 - **Inference is EP-EB,** with a MacKay/EFS + Anderson hyper step, a trust region, warm-up, and a Newton-decrement + prediction-change certificate. Plain EM is never used.
+- **No joint multi-trait effect model.** The user: "we dont need multi-trait tbh". The unwired `pleiotropy_layer.py` (shared per-variant multiplier across traits) is deleted; it is recoverable from tag `archive/2026-09-19/old-path-final`. Cross-trait pooling of the prior's hyperparameters (level_c, θ) stays.
 - **Binary traits use a logistic link.** VB-probit lost 0.012–0.020 AUC, and EP-probit only tied logistic [sim-only: theory-inference].
 - **No hand-chosen priors; the effect prior's mixing density is learned (SPEC 9c57144).**
   - The trigger: design-reliability's fifteen Gibbs scenarios had BayesR beating fixed-shape TPB by 0.025–0.10 R² [sim-only: founder mosaics]. The E6 scenarios showed the opposite [sim-only: design-trlocus]. A learned continuous mixing density nests both.

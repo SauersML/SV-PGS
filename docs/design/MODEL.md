@@ -94,10 +94,7 @@ Untagged numbers are derivations, definitions or targets.
   - This stage carries the real weight: a block-diagonal Stage 1 alone was 2.7× off at p/n = 20 [semi-real: design-credit].
 - **Scoring** (`fast_scoring.py`): every trait × fold model and its posterior draws in one read of the store. It is exact to 1e-13; an H100 does 100k × 17.3M in about 100 s [sim-only: synthetic store; timing].
 
-## 6. Built but not wired
-- `pleiotropy_layer.py`, the joint multi-trait EP-EB layer: continuous learned multiplier density, class rates by type-II ML. It gets wired in when Stage 1 lands, then its gain is re-measured. It measured +1.4% on a weaker base, and +7.3% under high trait overlap [sim-only: design-multitrait].
-
-## 7. Measured and rejected (do not re-propose without new evidence)
+## 6. Measured and rejected (do not re-propose without new evidence)
 A rejection resting only on a lane's own simulation (`[sim-only]`) is provisional. It stands until it is re-measured on the neutral benchmarks: bench-real (real held-out data) or bench-sim (real haplotypes, a misspecified truth family, sealed seeds). A `[sim-only]` rejection is not grounds to refuse a new measurement there.
 - A multi-ancestry deviation prior β_{j,a} = β_j + δ_{j,a}: −7 to −46% non-EUR accuracy [sim-only: idea-ancestry msprime].
 - Refining SV dosages from information already in the imputed files (locus kernels, tag-SNV shrinkage, boosted trees, monotone recalibration for SVs): no PGS gain [real r² on pilot50; sim-only PGS impact: design-genorefine].

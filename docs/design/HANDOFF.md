@@ -11,7 +11,6 @@
   - `prior_design.py` and annotation-coefficient pooling across traits;
   - `external_annotations.py` (Bai 2026 SV/VNTR, Pan-UKB SNV, record and locus maps);
   - `gatksv_source.py`, `gatksv_store_rows.py`, `sv_fusion.py` (the general two-source measurement model) and `sample_crosswalk.py`;
-  - `pleiotropy_layer.py` (not yet wired);
   - `held_out_comparison.py` (the evaluation tests and gates);
   - `compute_budget.py`, `tie_map.py`, `sample_table.py`;
   - `cohort.py` (the shared covariates, multi-trait targets and kinship-grouped folds);
