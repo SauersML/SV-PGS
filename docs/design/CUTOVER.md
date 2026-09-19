@@ -44,7 +44,7 @@ The pre-cutover tree is tagged `archive/2026-09-19/old-path-final` (`f025cce`).
   - Repoint all three in C2, or these tests die with `genotype` in C6.
 - **B3 — no kept entry point.**
   - The only fit drivers are `model.BayesianPGS.fit` and `pipeline.run_training_pipeline`, reached from `cli run` and `aou_runner.run_all_of_us`.
-  - Nothing yet takes the store → Stage 0 → Stage 1/2 → scoring path. That is the engine's Stage 2 driver (next section).
+  - Nothing yet takes the store → Stage 0 → Stage 2 → scoring path. That is the engine's Stage 2 driver, `full_data_fit.py` (next section).
 - **B4 — no kept cohort builder.** The model needs:
   - covariates C: sex, age terms, PCs, a pipeline-half indicator and a cohort indicator;
   - kinship-grouped folds over both store halves;

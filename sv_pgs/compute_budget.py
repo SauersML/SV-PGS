@@ -1,8 +1,8 @@
 """The one place the fast path learns what hardware it runs on.
 
 Every block size, batch size, prefetch depth and chunk length in the fast
-path (dosage store reader, Stage 0 genotype pass, Stage 1 LD-space fit,
-Stage 2 exact polish) is derived from a :class:`ComputeBudget`, never from a
+path (dosage store reader, Stage 0 genotype pass, Stage 2 full-data fit,
+scoring) is derived from a :class:`ComputeBudget`, never from a
 hardcoded constant.
 
 The CPU is a first-class device: CUDA is used iff CuPy sees at least one

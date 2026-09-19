@@ -572,9 +572,9 @@ _LD_ARRAYS = {
 
 
 class LdGramStore:
-    """The projected LD blocks of one fit on disk (memory-mapped, read by Stage 1 and 2).
+    """The projected LD blocks of one fit on disk (memory-mapped, read by Stage 2).
 
-    It is ``ld_space_fit.LDBlockSource``: ``correlation_block(b) = X~_b^T X~_b / n``, with
+    ``correlation_block(b) = X~_b^T X~_b / n``, with
     the per-column diagonal and within-block LD scores computed once in Stage 0.
     """
 

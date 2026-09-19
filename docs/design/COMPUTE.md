@@ -46,7 +46,7 @@
 | Block-variance refreshes | a dense fp64 factor per model per refresh (1,030 s per A100 for 105 models) | on demand, TF32 with refinement, resolved-set factors | 8–50× [est] |
 | Exact path around the int8 GEMM (A40, measured) | matmat and rmatmat 4–10× over their raw GEMM | ≈ the raw GEMM | partly closed by speed-io, bit-identical |
 
-End to end: about 1,000× today, and 10–40× once Stage 1 is removed.
+End to end: about 1,000× with the old Stage 1, and 10–40× without it.
 
 **Stage 1 is dropped, provisionally (lead's decision, 2026-09-19), on the cost argument alone.** One Stage 1 sweep's variance refresh costs 75–600 Stage 2 pass-equivalents (compute_floor.md §3).
 - The outer-convergence measurement first cited for this decision ("no slow direction", 1–3 outer steps) was withdrawn: it linearized at the true prior, which is a saddle of the genome-scaled penalized evidence (compute_floor.md §10.1–10.3).

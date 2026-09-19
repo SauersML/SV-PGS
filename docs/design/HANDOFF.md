@@ -19,15 +19,10 @@
 - **The old path is deleted** (cutover C0–C8, CUTOVER.md); it is recoverable from tag `archive/2026-09-19/old-path-final`.
 
 ## What remains, in order
-1. **Stage 1 (EP-EB LD-space warm start) is not on main.**
-   - **The dense EP-EB reference is on main:** `tests/ep_eb_reference.py`, checked by `tests/test_ep_eb_reference.py` (see MODEL.md §3–4). It is the exactness oracle; its gates for Stage 1 are in the oracle lane's STAGE1_GATES.md.
-   - **Its full fit is not yet tested.** On the sparse test problem (6 causal of 60) the coefficient maximization finds no interior optimum: the shared density's unpenalized quadratic part lets mass escape toward zero variance or pile at the range ends. That is the EB optimum sitting at a model boundary; it needs a ruling from the lead with math-density.
-   - Land Stage 1 gated against the reference.
-   - Gates: rel ≤ 1e-6 to the dense reference; within ~2% of Gibbs; calibration slope ≥ 0.85; stable across sweeps 20–150.
-   - Fix the implementation overhead: it needs batched block Cholesky and site updates across blocks and models (see COMPUTE.md).
-   - Fold in the fp64/fp32 Cholesky policy and multi-GPU dispatch from e2854ca (tags `archive/2026-09-19/build-stage1` and `archive/2026-09-19/wip-wt-build-store`).
+1. **Stage 1 is dropped, provisionally** (lead ruling, 2026-09-19; MODEL.md §5, COMPUTE.md), on cost. The outer-contraction measurement first cited for it was withdrawn; speed-floor is re-measuring at the pooled fixed point. The pipeline is Stage 0, then Stage 2, then scoring.
+   - **The dense EP-EB reference is on main:** `tests/ep_eb_reference.py`, checked by `tests/test_ep_eb_reference.py` (see MODEL.md §3–4). It remains the exactness oracle for the engine.
    - Settle the prior family: the learned mixing density vs TPB and BayesR on the reliability, TR-locus and multi-trait scenarios.
-2. **Wire the full path end to end:** store → Stage 0 → Stage 1 → Stage 2 → score. Run it on synthetic data first; the harness is tag `archive/2026-09-19/lane-e2e` (and `lane-e2e-nodamp`).
+2. **Wire the full path end to end:** store → Stage 0 → Stage 2 (`full_data_fit.py`) → score. It runs from the prior, with the engine's Newton-B outer loop and certified marginals, on synthetic data first (`tests/test_full_data_fit.py`).
 3. **Cutover: done** (C0–C8, `21cdec3`…`3d63745`). The step-by-step record, and the old tests whose intent the engine's tests carry, are in [CUTOVER.md](CUTOVER.md); the CDR input locations the old runner documented are in [CDR_LAYOUT.md](CDR_LAYOUT.md). The pre-cutover tree is tag `archive/2026-09-19/old-path-final`.
 4. **Reliability inputs are computed only inside the AoU workspace, by the pipeline itself.** Nothing AoU-derived is delivered to SV-PGS outside the workspace, and no AoU-derived number is requested from the imputation team (user rule, 2026-09-19; the imputation team confirmed). The pipeline fits and uses, in-workspace, from the long-read truth rows:
    - the r̂ model: target corr²(stored D, G), triad-corrected, with smooth terms in AF, log N_PATHS_TOTAL, log size and rsq_ds;

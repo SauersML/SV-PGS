@@ -71,12 +71,12 @@ Untagged numbers are derivations, definitions or targets.
 
 - **Method:** type-II maximum likelihood under an expectation-propagation approximation, with exact one-dimensional tilted moments. It matched exact Gibbs within ±1.5%. The old GIG mean-field fit was 23–36% worse, and its plug-in fixed point 28–42% worse [sim-only: theory-inference E6 on design-trlocus scenarios].
 - **Hyper step:**
-  - the coefficients maximize log Z_EP − ½xᵀS_λx by Newton with the total curvature B = −∇² log Z_EP, with EP re-solved (docs/design/math/ep_eb.md §1.4);
+  - the coefficients maximize log Z_EP − ½xᵀS_λx by Newton with the total curvature B = −∇² log Z_EP, with EP re-solved (docs/design/math/ep_eb.md §1.4). The outer loop (`fit_hyperparameters`) sets the weights at each certified EP fixed point, then moves x by (B + S)⁻¹g, globalized by Deuflhard's natural monotonicity test (g'(B + S)⁻¹g at the trial's fixed point must fall, else the step halves), and by a trust region where B + S is indefinite; it certifies only where B + S is positive definite, and only when the certifying step also moves q's mean by at most p_eff/K in q's posterior metric. It is never plain EP-EM (x to the fixed-cavity maximizer): that step solves with A + S, maps the error by I − (A + S)⁻¹(B + S), diverges where the pencil exceeds 2, and has no maximum to move to where A + S is indefinite (lead ruling, 2026-09-19). At the true prior on real LD scaled to genome size, B + S has negative eigenvalues [semi-real: speed-floor], so the trust region is the production case. (speed-floor's earlier pencil [0.89, 5.4] and 7-of-16 divergence were withdrawn: they dropped the directions where A + S ≤ 0.);
   - the penalty weights maximize the Laplace evidence with B directly: an exact gradient, and each weight compared at λ = ∞ (exactly, in its penalty's null space) and inside. The λ = ∞ score test is ½(q − d + c), with c = −tr(H_KK⁻¹KᵀD_xB[v]K) the curvature change that the Gaussian (Tipping–Faul) form omits. Fellner–Schall is not used: it creeps toward infinite optima and is not the Laplace maximizer for a non-Gaussian likelihood;
   - EP is unclipped, Newton on the moment equations with the Opper–Winther double loop as the fallback (the dense reference, `tests/ep_eb_reference.py`);
   - a warm-up before the first hyper step.
   - Plain EM converges at rate ≥ 1 − edf/p, about 0.99 at production scale. From the defaults its reported SV/SNV enrichment was 1.65 whatever the truth [sim-only: gam-eval reproducer].
-- **The production engine** (`sv_pgs/scale_mixture_ep.py`, shared by Stage 1 and Stage 2) holds everything that involves the prior, for a stage that supplies q's means and marginal variances:
+- **The production engine** (`sv_pgs/scale_mixture_ep.py`) holds everything that involves the prior, for Stage 2, which supplies q's means, marginal variances and linear responses:
   - g on a uniform lattice in t (nodal log g, roughness λh⁻⁵‖Δ³η‖² from square-root factors); the lattice's floor (flat-kernel bound), top (largest kernel mode), spacing (complex-strip trapezoid bound) and tails come from the data and a tolerance (math-density's rules);
   - the ruled layout: η shared, δ_c per class with its own roughness weight, one Gaussian pooling precision on the deviations' location and width, no class level; η's null space profiled;
   - exact tilted moments, unclipped mean-matched sites, cavities, the MacKay/REML noise update;
@@ -100,10 +100,12 @@ Untagged numbers are derivations, definitions or targets.
   - The TR length columns as an exact sparse map of stored codes.
   - The tagging and ρ² features.
   - The candidate set by the information rule N·Var(D_j)·r̂²_j·τ²_c ≥ c. It is variance-based, so copy-number rows are kept, and in exact Bayes it is a compute knob only.
-- **Stage 1: the LD-space EP-EB warm start**, one per trait × fold. It is not on main yet; it is gated against the dense EP-EB reference in `tests/ep_eb_reference.py` (see HANDOFF.md).
-  - **The slot Stage 2 consumes (the interface Stage 1 fills), per model (a trait on one training set):** the site precisions and shifts (τ, ν) over Stage 0's reduced columns, unclipped; the posterior mean; the prior's hyperparameters in the engine's layout (the coefficients x and the log penalty weights, with +∞ and −∞ at the edges); and the noise variance. Stage 2 reaches the same fixed point from any slot contents; the slot only shortens the path.
-  - **Until Stage 1 lands, Stage 2 starts from the prior itself:** moment-matched sites τ_j = 1/E_prior[β_j²], ν = 0, a zero mean, the start density, and the covariate-only residual variance as the noise.
-- **Stage 2: full-data certification** (`exact_polish.py`).
+- **No Stage 1, provisionally** (lead ruling, 2026-09-19), on cost: the measured Stage 1 costs ~800 GPU-h (COMPUTE.md). The outer-contraction measurement first cited for it ("no slow direction, 1–3 outer steps") was withdrawn; speed-floor is re-measuring at the pooled fixed point.
+- **Stage 2: full-data EP-EB** (`full_data_fit.py` over `dual_solve.py` and `marginal_variances.py`), one per trait × fold, from the prior itself: moment-matched sites τ_j = 1/E_prior[β_j²], ν = 0, the start density, and the covariate-only residual variance as the noise.
+  - Every cavity comes from the certified marginals (`marginal_variances.py`), refreshed at the sites it is used with. Block-Jacobi variances may appear only as a preconditioner: their cavity-precision errors were median 2.6–4.9% and p99 28–58% at production, and the second-order series diverges at denser signal [semi-real: speed-floor, bench-sim chr22 real-haplotype LD, simulated effects].
+  - The EP fixed point is certified at a refresh: the undamped update's move of the mean, Σ(δν − δτ∘μ), is at most p_eff/K in the posterior metric, and the noise update's evidence gain is at most 1/(2K). Between refreshes, mean-only EP runs with the cavity precisions frozen.
+  - The outer loop is the engine's Newton-B loop (§4); the full fit is certified when every model's Newton-B decrement plus its weights' remaining gain is at most 1/(2K).
+- **The previous Stage 2 E-step** (`exact_polish.py`).
   - Block-Jacobi PCG on the FWL-projected system, which needed 17–28 passes where block Gauss–Seidel needed over 40 [sim-only: synthetic store].
   - Control-variate Hutchinson estimates of diag(Σ), using the block inverse as the control variate. These are being replaced by `marginal_variances.py`, the leave-block-out marginals:
     - Block-Jacobi inverses are variances conditional on the other blocks' effects, which biases the EP fixed point.
@@ -115,7 +117,7 @@ Untagged numbers are derivations, definitions or targets.
       - block sums are within 0.7% [machinery: dense derivative].
       - Distant pairs enter through the block sandwich diag(Σ_bb R_b Σ_bb). Per-variant norms overstated them 3–10×, because LD partners absorb the chance coupling.
   - Posterior draws.
-  - This stage carries the real weight: a block-diagonal Stage 1 alone was 2.7× off at p/n = 20 [semi-real: design-credit].
+  - A block-diagonal fit alone was 2.7× off at p/n = 20 [semi-real: design-credit]; the full-data stage carries the real weight.
 - **Scoring** (`fast_scoring.py`): every trait × fold model and its posterior draws in one read of the store. It is exact to 1e-13; an H100 does 100k × 17.3M in about 100 s [sim-only: synthetic store; timing].
 
 ## 6. Measured and rejected (do not re-propose without new evidence)
