@@ -24,10 +24,13 @@ Measurements carry the evidence tags defined in MODEL.md: `[sim-only]`, `[semi-r
   - The trigger: design-reliability's fifteen Gibbs scenarios had BayesR beating fixed-shape TPB by 0.025–0.10 R² [sim-only: founder mosaics]. The E6 scenarios showed the opposite [sim-only: design-trlocus]. A learned continuous mixing density nests both.
   - Hand-set constants were removed: TPB shapes, slab width, class-offset scale.
   - Continuous quantities get continuous priors, with no point mass at zero.
-- **The mixing density's roughness penalty must be proper, and its value computed as an exact square** ([math/prior_sweep_a.md](math/prior_sweep_a.md)).
-  - A D2 or D3 penalty alone leaves a null space containing a collapse ray to a point mass at zero effect. The likelihood stays positive along that ray, so the flat-prior integral over it diverges and the Laplace evidence goes to +∞ on weak classes. D1 + D2 has no null space.
-  - xᵀSx can go negative in floating point along null directions; |R x|² cannot.
-  - D1 + D2 and D2 kept their Laplace-chosen λ under grid refinement, while D3 flipped to a λ → 0 mode at the finest spacing [sim-only: prior sweep A smoke, exact normal means].
+- **The mixing density's roughness penalty is D1 + D2 in sum-to-zero coordinates; D3 is dropped** (lead ruling; [math/prior_sweep_a.md](math/prior_sweep_a.md)). These are numerical-property checks, not accuracy claims.
+  - **Setup:** exact normal means (orthogonal design, exact posteriors); one class of 1,000 variants, n = 20k, h² = 0.2; BayesR-like and t3 truths. The penalty weights maximize the integrated Laplace evidence. One replicate per cell [sim-only: prior sweep A smoke].
+  - **The null space is improper.** D3 (or D2) alone leaves a null space containing a collapse ray to a point mass at zero effect. The likelihood stays positive along it, so the flat-prior integral diverges. On a weak 100-variant class (r² 0.2–0.6, t3 truth) the evidence reached 3e302, with all of the density on the grid's bottom node.
+  - **D3 is not grid-invariant.** Its chosen log λ went 3.33 / 1.35 / −18.4 at spacings 0.5 / 0.25 / 0.125 on the BayesR truth, and 1.93 / 1.91 / −7.2 on t3.
+  - **Profiling D3's null space costs accuracy.** Maximizing over it instead of integrating drove λ to ∞ (the log-normal limit): ΔLPD −4.06 nats per 1,000 variants vs −0.71 for integrated D3 on the BayesR truth.
+  - **D1 + D2 is stable.** Its log λ went −1.04/3.08 → −1.03/3.12 → −1.01/3.15 across the three spacings (t3: −3.64/0.17 → −3.61/0.14). The held-out log predictive moved ≤ 0.05 nats per 1,000 variants under refinement, and ≤ 0.5 at a ×100 wider range (BayesR: log λ −1.32/2.49, +0.48 nats per 1,000).
+  - **Penalty values are computed as |R x|² from square-root factors.** xᵀSx went negative in floating point along null directions (penalized objective 5687 against a log-likelihood of 173).
 - **The r² prior offset has coefficient 1 by derivation.** Free EB could not identify it (range −0.29 to +0.69). With the offset, the full reliability prior gained +0.002–0.019 R² [sim-only: design-reliability].
 - **Every variant's prior depends on SV context (SPEC 8a5a936).**
   - Why: a SNV's prior used to ignore whether it sits in an SV locus. Poorly imputed SVs (VNTR allele r² ≈ 0.3) reach the phenotype mostly through tag SNVs, which a generic prior over-shrinks.
