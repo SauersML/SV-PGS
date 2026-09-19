@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "sv-pgs"
 version = "0.1.0"
-description = "Multi-GPU joint empirical-Bayes GLM for polygenic scoring with structural variants"
+description = "Bayesian polygenic scores with structural variants, tandem repeats and SNVs in one model"
 license = "AGPL-3.0-or-later"
 license-files = ["LICENSE"]
 requires-python = ">=3.10"
@@ -14,7 +14,6 @@ dependencies = [
     "jaxlib>=0.4.20,<0.5",
     "numpy>=1.24",
     "scipy>=1.15,<2",
-    "scikit-learn>=1.3",
     "cyvcf2>=0.31.4",
     "google-cloud-bigquery>=3.40.1",
     # crc32c checksums guard the dosage store's Zarr v3 shard indexes and zstd chunks.
@@ -22,17 +21,11 @@ dependencies = [
     # zstd is the dosage store's bucket codec (target-format REPORT §2.3).
     "zstandard>=0.23",
     "pandas>=1.5",
-    "matplotlib>=3.7",
-    # psutil powers the host-RAM gate that decides whether the bitpacked
-    # cold-load can fit before allocating; without it the gate silently
-    # fails open and a tight host RAM run risks OOM during cold-load.
-    "psutil>=5.9",
     # Stage 0's CPU backend runs single-threaded BLAS inside its own worker pool.
     "threadpoolctl>=3.1",
 ]
 
 [project.optional-dependencies]
-dev = ["pytest>=7.4"]
 gpu = ["jax[cuda12]>=0.4.20,<0.5", "cupy-cuda12x>=13.0", "nvidia-cuda-nvrtc-cu12"]
 
 [project.scripts]
@@ -83,6 +76,8 @@ dev = [
     "mypy>=1.20.0",
     "vulture>=2.16",
     "pytest>=8",
+    # Reference metrics (roc_auc_score, r2_score) in the tests; nothing in sv_pgs imports it.
+    "scikit-learn>=1.3",
     # tests/test_all_of_us_sql.py runs the BigQuery phenotype SQL
     # on synthetic OMOP tables: sqlglot transpiles it to DuckDB.
     "duckdb>=1.1",
