@@ -74,7 +74,7 @@ SV-PGS fits one Bayesian model to every variant. Speed comes from exact computat
   - The TR length columns as an exact sparse map of stored codes.
   - The tagging and ρ² features.
   - The candidate set by the information rule N·Var(D_j)·r̂²_j·τ²_c ≥ c. It is variance-based, so copy-number rows are kept, and in exact Bayes it is a compute knob only.
-- **Stage 1: the LD-space EP-EB warm start**, one per trait × fold. It is not on main yet; the newest work is branch `build/ep-oracle`.
+- **Stage 1: the LD-space EP-EB warm start**, one per trait × fold. It is not on main yet. The newest work, the dense EP-EB reference, is tag `archive/2026-09-19/build-ep-oracle` (see HANDOFF.md).
 - **Stage 2: full-data certification** (`exact_polish.py`).
   - Block-Jacobi PCG on the FWL-projected system, which needed 17–28 passes where block Gauss–Seidel needed over 40.
   - Control-variate Hutchinson estimates of diag(Σ), using the block inverse as the control variate.

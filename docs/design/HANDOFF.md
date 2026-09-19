@@ -20,12 +20,16 @@
 
 ## What remains, in order
 1. **Stage 1 (EP-EB LD-space warm start) is not on main.**
-   - The newest work is branch `build/ep-oracle`: a dense EP-EB reference, the nonparametric scale-mixture oracle, learned difference penalties, log-space mixing weights and an analytic Hessian. Finish it, land the oracle in `tests/`, then land Stage 1 gated against it.
+   - The newest work is tag `archive/2026-09-19/build-ep-oracle`. It holds a dense EP-EB reference (`tests/ep_eb_reference.py`), the nonparametric scale-mixture oracle, learned difference penalties, log-space mixing weights and an analytic Hessian.
+   - Its landing attempt, PR #6 (closed), failed two tests in CI:
+     - `test_fit_is_a_joint_fixed_point_and_deterministic` does not converge in 300 outer iterations (about 14 min);
+     - `test_orthogonal_ep_is_the_exact_posterior` trips the reference's own design rank check.
+   - Fix both, land the oracle in `tests/`, then land Stage 1 gated against it.
    - Gates: rel ≤ 1e-6 to the dense reference; within ~2% of Gibbs; calibration slope ≥ 0.85; stable across sweeps 20–150.
    - Fix the implementation overhead: it needs batched block Cholesky and site updates across blocks and models (see COMPUTE.md).
-   - Fold in the fp64/fp32 Cholesky policy and multi-GPU dispatch from e2854ca.
+   - Fold in the fp64/fp32 Cholesky policy and multi-GPU dispatch from e2854ca (tags `archive/2026-09-19/build-stage1` and `archive/2026-09-19/wip-wt-build-store`).
    - Settle the prior family: the learned mixing density vs TPB and BayesR on the reliability, TR-locus and multi-trait scenarios.
-2. **Wire the full path end to end:** store → Stage 0 → Stage 1 → Stage 2 → score. Run it on synthetic data first; the harness is branch `lane/e2e`.
+2. **Wire the full path end to end:** store → Stage 0 → Stage 1 → Stage 2 → score. Run it on synthetic data first; the harness is tag `archive/2026-09-19/lane-e2e` (and `lane-e2e-nodamp`).
 3. **Cutover:**
    - C2 flips the default entry point;
    - C3 deletes the marginal screen;
@@ -62,12 +66,20 @@
    - Agents never move data between workspaces without this approval.
 
 ## Branches
-- The `wip/*` branches preserve unpushed worktree snapshots from MSI. All were reviewed against main: their valuable content is already there, or obsolete by ruling.
-- Branches with commits not yet on main, to review before deleting:
-  - `build/ep-oracle`: the live Stage 1 work.
-  - `lane/e2e` and `lane/e2e-nodamp`: the end-to-end synthetic harness.
-  - `build/stage2`, `build/store*`, `build/stage0`, `build/stage1`, `fast-arch`, `build/fast-scoring`, `build/phenotypes`, `lane/r2prior`: mostly superseded by main. Check each with `git cherry origin/main <branch>`.
+- GitHub has only `main`. Every other branch, local-only branch and dirty worktree state was checked against main and then deleted. Each one is kept as an `archive/2026-09-19/*` tag (33 tags), so any of them can be recovered with `git checkout -b <name> archive/2026-09-19/<tag>`.
+- Tags worth reviving:
+  - `build-ep-oracle`: the Stage 1 reference;
+  - `build-stage1` and `wip-wt-build-store`: e2854ca;
+  - `lane-e2e` and `lane-e2e-nodamp`: the end-to-end harness;
+  - `local-lane-cutover-sim`: the unfinished msprime dependency group;
+  - `dirty-*`: uncommitted worktree state.
+- The rest hold only obsolete or superseded work, for example the old Stage 1 files `ld_space_fit.py` and `fast_fit.py`.
 
 ## MSI at pause
-- All SV-PGS jobs and processes are stopped. No MSI files were deleted: stores, simulation outputs, worktrees and venvs remain.
-- The account's Slurm submit counter had underflowed (see COMPUTE.md). Check `scontrol show assoc_mgr users=<user> flags=assoc` before submitting.
+- All SV-PGS jobs and processes are stopped; nothing is queued.
+- **Scratch cleanup, about 345 GB freed:**
+  - kept: the main clone and its `.venv`; the stores `s1M_100k` (94 GB) and `mini`; `build-lead/synth` (127 GB); `lit-review`; the Descent olean cache; public-data caches; result dirs;
+  - deleted by an interrupted cleanup: the agent script and log dirs, `venv-cpu-fast`, `venv-fast`, the Descent clone and `runq_bin`;
+  - `venv-gpu` is broken.
+  - Rebuild the venvs with uv before running anything, and re-clone Descent from d86c2669 if it's needed.
+- **Slurm:** the account's submit counter is still wrapped at −260 (see COMPUTE.md for the root cause). Check `scontrol show assoc_mgr users=<user> flags=assoc` before submitting. Until an admin reset, only the `interactive` partitions work.

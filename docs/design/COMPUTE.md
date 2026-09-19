@@ -65,8 +65,13 @@
   - At most 2 concurrent jobs per agent.
   - Keep account-wide pending jobs under 90: backfill considers only the top 100 pending per user, so more starves every session's new jobs.
   - **Never mass-hold or mass-cancel array tasks.**
-- **Status at handoff:** the account's default Slurm association submit counter underflowed (reported as MaxSubmitJobs=5000(≈4.29e9)), so every normal `sbatch` fails with AssocMaxSubmitJobLimit.
-  - It needs an administrator reset, and a support request was filed.
+- **Status at handoff:** the account's default Slurm association submit counter underflowed. It reads MaxSubmitJobs=5000(4294967036), that is −260 wrapped to uint32, so every normal `sbatch` fails with AssocMaxSubmitJobLimit.
+  - **Root cause, from Slurm source:** a bug in Slurm 25.05.9 (MSI agate).
+    - In `src/slurmctld/acct_policy.c` `_adjust_limit_usage()`, the association `ACCT_POLICY_REM_SUBMIT` branch checks only `if (used_submit_jobs)`, not `>= job_cnt`. For a pending array job_cnt is the whole task count, so one over-removal wraps the counter. The QOS branch clamps correctly.
+    - Upstream fix: SchedMD commit c9f89343b143 (ticket 24379), first released in 25.11.3 and not backported to 25.05.
+  - **Why it stays stuck:** new submits are refused while every finishing job decrements further. It went −201 → −260 over the session.
+  - **Our trigger:** mass hold and cancel of about 1,000 pending array tasks, plus about 40 `scontrol update partition=` calls on pending arrays. The single over-removing call needs root-only slurmctld debug2 logs to identify.
+  - **Reset:** only an administrator can do it. A slurmctld restart or reconfigure runs `_restore_job_accounting()` in read_config.c, which clears and recounts usage. The permanent fix is Slurm ≥ 25.11.3. A support request was filed; any follow-up is sent by the user, never by an agent.
   - Until the reset, the `interactive` and `interactive-gpu` partitions still accept jobs, at most one running job per user each, shared across all sessions of the account.
 - **Imports:** script runs must set PYTHONPATH to their worktree and log `sv_pgs.__file__` and the commit. The shared clone's editable install otherwise imports whatever commit that clone has checked out.
 - **Environment:** simulation studies need the uv `sim` dependency group (msprime).
