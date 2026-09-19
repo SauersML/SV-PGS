@@ -190,6 +190,13 @@ def _cgroup_memory_headroom_bytes(
     step and task cgroups below it are unlimited), so the headroom is the
     smallest ``limit - usage`` over the process's cgroup and every ancestor up
     to the controller root, in cgroup v2 (unified) and v1 (memory controller).
+
+    The usage counts the page cache the cgroup's reads were charged, which the kernel
+    reclaims before it lets the cgroup exceed its limit; after a pass over the dosage
+    store it fills the limit. So, like ``MemAvailable`` for the node, the headroom adds
+    back the cgroup's inactive file pages (``memory.stat``: ``inactive_file`` in v2,
+    the hierarchical ``total_inactive_file`` in v1), the cache reclaimed first and never
+    part of the working set.
     """
     if not proc_cgroup_file.exists():
         return None
@@ -198,10 +205,10 @@ def _cgroup_memory_headroom_bytes(
         hierarchy_id, controllers, relative_path = line.split(":", 2)
         if hierarchy_id == "0" and controllers == "":
             controller_root = cgroup_root
-            limit_name, usage_name = "memory.max", "memory.current"
+            limit_name, usage_name, reclaimable_key = "memory.max", "memory.current", "inactive_file"
         elif "memory" in controllers.split(","):
             controller_root = cgroup_root / "memory"
-            limit_name, usage_name = "memory.limit_in_bytes", "memory.usage_in_bytes"
+            limit_name, usage_name, reclaimable_key = "memory.limit_in_bytes", "memory.usage_in_bytes", "total_inactive_file"
         else:
             continue
         group = controller_root / relative_path.strip().lstrip("/")
@@ -211,11 +218,21 @@ def _cgroup_memory_headroom_bytes(
                 limit_text = limit_file.read_text(encoding="utf-8").strip()
                 if limit_text != "max" and int(limit_text) != _CGROUP_V1_UNLIMITED:
                     usage_bytes = int(usage_file.read_text(encoding="utf-8").strip())
-                    level_headroom = max(int(limit_text) - usage_bytes, 0)
+                    reclaimable_bytes = _memory_stat_bytes(level / "memory.stat", reclaimable_key)
+                    level_headroom = max(int(limit_text) - (usage_bytes - reclaimable_bytes), 0)
                     headroom = level_headroom if headroom is None else min(headroom, level_headroom)
             if level == controller_root:
                 break
     return headroom
+
+
+def _memory_stat_bytes(stat_file: Path, key: str) -> int:
+    """One entry of a cgroup's ``memory.stat`` (every limited memory cgroup has the file and the key)."""
+    for line in stat_file.read_text(encoding="utf-8").splitlines():
+        name, value = line.split()
+        if name == key:
+            return int(value)
+    raise RuntimeError(f"{stat_file} has no {key} entry")
 
 
 def _usable_host_bytes() -> int:

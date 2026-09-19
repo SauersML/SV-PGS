@@ -10,12 +10,18 @@ def _write(path: Path, text: str) -> None:
     path.write_text(text, encoding="utf-8")
 
 
+def _write_stat(level: Path, key: str, inactive_file: int) -> None:
+    """A memory.stat with the reclaimable page-cache entry next to its neighbours."""
+    _write(level / "memory.stat", f"anon 4096\nfile {inactive_file + 8192}\n{key} {inactive_file}\nactive_file 8192\n")
+
+
 def test_cgroup_v1_headroom_is_limit_minus_usage(tmp_path: Path) -> None:
     proc_file = tmp_path / "proc_cgroup"
     _write(proc_file, "12:pids:/slurm/job_1\n11:memory:/slurm/uid_7/job_1\n10:freezer:/\n")
     group = tmp_path / "root" / "memory" / "slurm" / "uid_7" / "job_1"
     _write(group / "memory.limit_in_bytes", "17179869184\n")
     _write(group / "memory.usage_in_bytes", "4294967296\n")
+    _write_stat(group, "total_inactive_file", 0)
     headroom = compute_budget._cgroup_memory_headroom_bytes(proc_file, tmp_path / "root")
     assert headroom == 17179869184 - 4294967296
 
@@ -41,7 +47,37 @@ def test_cgroup_v2_limit_binds(tmp_path: Path) -> None:
     _write(proc_file, "0::/job\n")
     _write(tmp_path / "root" / "job" / "memory.max", "1000\n")
     _write(tmp_path / "root" / "job" / "memory.current", "250\n")
+    _write_stat(tmp_path / "root" / "job", "inactive_file", 0)
     assert compute_budget._cgroup_memory_headroom_bytes(proc_file, tmp_path / "root") == 750
+
+
+def test_cgroup_page_cache_the_kernel_reclaims_counts_as_headroom(tmp_path: Path) -> None:
+    # After a pass over the store the job's charged page cache fills its limit: usage is at the
+    # limit, but the inactive file pages are reclaimed before the cgroup could run out.
+    proc_v2 = tmp_path / "proc_v2"
+    _write(proc_v2, "0::/job\n")
+    _write(tmp_path / "root_v2" / "job" / "memory.max", "1000\n")
+    _write(tmp_path / "root_v2" / "job" / "memory.current", "990\n")
+    _write_stat(tmp_path / "root_v2" / "job", "inactive_file", 600)
+    assert compute_budget._cgroup_memory_headroom_bytes(proc_v2, tmp_path / "root_v2") == 610
+
+    proc_v1 = tmp_path / "proc_v1"
+    _write(proc_v1, "11:memory:/slurm/job_3\n")
+    job = tmp_path / "root_v1" / "memory" / "slurm" / "job_3"
+    _write(job / "memory.limit_in_bytes", "4096\n")
+    _write(job / "memory.usage_in_bytes", "4000\n")
+    _write(job / "memory.stat", "cache 3500\ninactive_file 100\ntotal_inactive_file 3000\n")
+    assert compute_budget._cgroup_memory_headroom_bytes(proc_v1, tmp_path / "root_v1") == 3096
+
+
+def test_a_limited_cgroup_without_its_memory_stat_entry_raises(tmp_path: Path) -> None:
+    proc_file = tmp_path / "proc"
+    _write(proc_file, "0::/job\n")
+    _write(tmp_path / "root" / "job" / "memory.max", "1000\n")
+    _write(tmp_path / "root" / "job" / "memory.current", "250\n")
+    _write(tmp_path / "root" / "job" / "memory.stat", "anon 250\n")
+    with pytest.raises(RuntimeError, match="inactive_file"):
+        compute_budget._cgroup_memory_headroom_bytes(proc_file, tmp_path / "root")
 
 
 def test_cgroup_v1_limit_on_the_slurm_job_binds_under_unlimited_step_and_task(tmp_path: Path) -> None:
@@ -57,6 +93,7 @@ def test_cgroup_v1_limit_on_the_slurm_job_binds_under_unlimited_step_and_task(tm
     ):
         _write(level / "memory.limit_in_bytes", f"{limit}\n")
         _write(level / "memory.usage_in_bytes", f"{usage}\n")
+        _write_stat(level, "total_inactive_file", 0)
     headroom = compute_budget._cgroup_memory_headroom_bytes(proc_file, tmp_path / "root")
     assert headroom == 38 * 2**30
 
@@ -72,6 +109,7 @@ def test_cgroup_v2_tightest_ancestor_binds(tmp_path: Path) -> None:
     ):
         _write(level / "memory.max", limit + "\n")
         _write(level / "memory.current", usage + "\n")
+        _write_stat(level, "inactive_file", 0)
     assert compute_budget._cgroup_memory_headroom_bytes(proc_file, root) == 200
 
 
