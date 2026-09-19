@@ -28,18 +28,14 @@ from typing import Any, Callable
 import numpy as np
 
 from sv_pgs._typing import F64Array
-from sv_pgs.numeric import stable_sigmoid as _jax_stable_sigmoid
+from sv_pgs.numeric import stable_sigmoid
 
 _LOG = logging.getLogger(__name__)
 
 
 def _sigmoid(values: F64Array) -> F64Array:
-    """Numerically stable σ(x) returning a numpy array.
-
-    We reuse the project's stable_sigmoid (JAX-backed) for consistency, then
-    cast back to numpy so the rest of the solver stays in numpy.
-    """
-    result: F64Array = np.asarray(_jax_stable_sigmoid(values), dtype=np.float64)
+    """Numerically stable σ(x) as a float64 numpy array."""
+    result: F64Array = np.asarray(stable_sigmoid(values), dtype=np.float64)
     return result
 
 

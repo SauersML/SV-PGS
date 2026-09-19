@@ -1,20 +1,14 @@
 """Shared numerical utilities."""
 from __future__ import annotations
 
-import importlib
 from typing import Any
 
 import numpy as np
 
-from sv_pgs._typing import JaxArray, NDArray
-
-# Importing sv_pgs._jax configures XLA env vars before any direct jax import.
-# Use importlib so static-analysis tools don't reorder it past the jax import.
-importlib.import_module("sv_pgs._jax")
-jnp = importlib.import_module("jax.numpy")
+from sv_pgs._typing import NDArray
 
 
-def stable_sigmoid(values: Any) -> JaxArray:
+def stable_sigmoid(values: Any) -> NDArray:
     """Convert a real-valued score to a probability between 0 and 1.
 
     sigmoid(x) = 1 / (1 + exp(-x))
@@ -28,13 +22,14 @@ def stable_sigmoid(values: Any) -> JaxArray:
       - x <  0: compute exp(x) and rearrange to avoid overflow
     Both branches give the same mathematical result, just different
     floating-point paths for numerical safety.
+    The result is float64 for float64 input and float32 otherwise.
     """
-    value_array = jnp.asarray(values)
-    compute_dtype = jnp.result_type(value_array.dtype, jnp.float32)
-    value_array = value_array.astype(compute_dtype)
+    value_array = np.asarray(values)
+    compute_dtype = np.result_type(value_array.dtype, np.float32)
+    value_array = value_array.astype(compute_dtype, copy=False)
     positive_branch = value_array >= 0.0
-    negative_exponential = jnp.exp(jnp.where(positive_branch, -value_array, value_array))
-    return jnp.where(
+    negative_exponential = np.exp(np.where(positive_branch, -value_array, value_array))
+    return np.where(
         positive_branch,
         1.0 / (1.0 + negative_exponential),
         negative_exponential / (1.0 + negative_exponential),
