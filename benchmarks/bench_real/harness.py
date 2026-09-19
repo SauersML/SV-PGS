@@ -126,7 +126,10 @@ def build_gene_task(dataset: Dataset, window: GeneWindow, split: dict):
     test_index = np.array([dataset.sample_index[sample] for sample in split["test"]])
     train_genotypes, test_genotypes = window.genotypes[train_index], window.genotypes[test_index]
     allele_count = train_genotypes.sum(axis=0)
-    polymorphic = (allele_count > 0) & (allele_count < 2 * len(train_index))
+    # A column that is constant in the training samples carries no information and has zero variance, which
+    # breaks standardization: that is every sample 0 or 2, but also every sample heterozygous (seen in PanGenie
+    # calls), so the test is the training variance, not the allele count.
+    polymorphic = train_genotypes.var(axis=0) > 0
     train_genotypes, test_genotypes = train_genotypes[:, polymorphic], test_genotypes[:, polymorphic]
     selected = window.table[polymorphic]
     position, end = selected["pos"].to_numpy(), selected["end"].to_numpy()

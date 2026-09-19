@@ -76,3 +76,23 @@ def test_merged_intervals_are_the_disjoint_union():
     from benchmarks.bench_real import build_dataset
 
     assert build_dataset.merged([(10, 20), (5, 12), (22, 30), (21, 21), (40, 41)]) == [[5, 30], [40, 41]]
+
+
+def test_training_constant_columns_are_dropped_even_when_heterozygous():
+    samples = pd.DataFrame({"sample": ["a", "b", "c", "d"], "Superpopulation": ["EUR"] * 4, "Population": ["CEU"] * 4})
+    table = pd.DataFrame({"pos": [1, 2, 3], "end": [1, 2, 3], "is_sv": [False, True, False], "sv_type": ["."] * 3, "sv_length": [0, 60, 0],
+                          "alt_len": [1, 61, 1], "ref_len": [1, 1, 1], "source": ["panel", "pangenie", "panel"]})
+    # Column 0 varies; column 1 is heterozygous in every training sample; column 2 is homozygous in every one.
+    genotypes = np.array([[0, 1, 2], [1, 1, 2], [2, 1, 2], [1, 0, 1]], dtype=np.float32)
+    window = harness.GeneWindow(gene_row=0, gene_id="g", chrom="chr1", tss=2, genotypes=genotypes, table=table)
+
+    class FakeDataset:
+        sample_index = {"a": 0, "b": 1, "c": 2, "d": 3}
+        expression = np.array([[0.1, 0.4, -0.2, 0.3]])
+        covariates = np.zeros((4, 0))
+        gene_annotation = {"g": {"start": 1, "end": 3, "strand": "+", "exons": [], "coding_exons": []}}
+
+    FakeDataset.samples = samples
+    train, test, _, _ = harness.build_gene_task(FakeDataset, window, {"train": ["a", "b", "c"], "test": ["d"]})
+    assert train.genotypes.shape == (3, 1) and test.shape == (1, 1)
+    assert list(train.variants.position) == [1]

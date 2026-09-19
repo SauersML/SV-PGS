@@ -45,7 +45,10 @@ def top_variant(train):
         return ZeroPredictor(phenotype.mean())
     centered = genotypes - genotypes.mean(axis=0)
     centered_phenotype = phenotype - phenotype.mean()
-    correlation = (centered.T @ centered_phenotype) / np.sqrt((centered ** 2).sum(axis=0) * (centered_phenotype ** 2).sum())
+    squared_norms = (centered ** 2).sum(axis=0)
+    if not np.all(squared_norms > 0):
+        raise ValueError("top_variant needs every column to vary in the training samples")
+    correlation = (centered.T @ centered_phenotype) / np.sqrt(squared_norms * (centered_phenotype ** 2).sum())
     best = int(np.argmax(np.abs(correlation)))
     slope = (centered[:, best] @ centered_phenotype) / (centered[:, best] @ centered[:, best])
     coefficients = np.zeros(genotypes.shape[1])
@@ -75,6 +78,8 @@ def gblup_reml(train):
         return ZeroPredictor(phenotype.mean())
     center = genotypes.mean(axis=0)
     scale = genotypes.std(axis=0)
+    if not np.all(scale > 0):
+        raise ValueError("gblup_reml needs every column to vary in the training samples")
     standardized = (genotypes - center) / scale / np.sqrt(variant_count)
     kernel = standardized @ standardized.T
     # REML with the intercept as the only fixed effect: work in an orthonormal basis of the complement of 1.
