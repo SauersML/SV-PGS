@@ -323,9 +323,11 @@ def test_the_mean_anchor_removes_a_known_false_positive_intercept() -> None:
     ignored = mean_anchor(first, second, observed, 0.0, 0.0)
     corrected = mean_anchor(first, second, observed, false_rate, 1e-6)
 
+    # A draw-like dosage right with probability a per haplotype has population r2_A = a^2.
     target = np.log(accuracy**2)
     assert abs(corrected.log_reliability - target) < abs(ignored.log_reliability - target)
-    assert abs(corrected.log_reliability - target) < 0.1
+    # Within four of the anchor's own delta-method standard errors of the population value.
+    assert abs(corrected.log_reliability - target) < 4 * np.sqrt(corrected.variance)
     assert corrected.variance > mean_anchor(first, second, observed, false_rate, 0.0).variance
 
 
