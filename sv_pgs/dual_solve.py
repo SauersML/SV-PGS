@@ -1023,6 +1023,53 @@ class DualGaussian:
                 sample_count=int(count),
             ))
 
+    def _bulk_image(self, right: Any, model: int) -> tuple[Any, Any, Any, Any, Any]:
+        """(v, v with its resolved rows zeroed, the resolved rows, the column models, u = Xt D_S v), one read."""
+        array_module = self.array_module
+        state = self._state
+        bulk_variances = state["bulk_variances"][:, model]
+        values = array_module.asarray(right, dtype=array_module.float64)
+        columns = int(values.shape[1])
+        resolved = array_module.asarray(self._resolved[model])
+        bulk_values = values.copy()
+        bulk_values[resolved] = 0.0
+        column_models = array_module.full(columns, model)
+        image = array_module.zeros((self.source.sample_count, columns))
+        for start, stop, tile in self.source.blocks():
+            image += tile.matmat(bulk_variances[start:stop, None] * bulk_values[start:stop])
+        self.count.note(columns, 0.0, "bulk-image")
+        return values, bulk_values, resolved, column_models, state["models"].design_to_sample(image, column_models)
+
+    def information_solve(self, probes: Any, model: int, residual_tolerance: Any) -> tuple[Any, Any, Any]:
+        """The products the cavity certificate needs for variant-side probes v (p x k), at the last iterate's sites.
+
+        With u = Xt D_S v, t = Z_L'u and w = K_S^-1 u - Z_L core^-1 (t - v_L) (K_S = S_S, the bulk
+        operator), returns (Xt'w (p x k), t (|L| x k), the exact residual norms ||u - K_S y|| of the
+        bulk solve (k,)); the solve runs to `residual_tolerance`, a sample-side residual bound
+        (marginal_variances' information_solve_tolerance). w is minus the dual posterior_solve forms
+        for the shift v, before D_S v_S is added. Two reads plus the CG passes.
+        """
+        array_module = self.array_module
+        state = self._state
+        models = state["models"]
+        values, _bulk_values, resolved, column_models, image = self._bulk_image(probes, model)
+        columns = int(values.shape[1])
+        bound = array_module.broadcast_to(array_module.asarray(residual_tolerance, dtype=array_module.float64), (columns,)).copy()
+        spike_free = Deflation({}, {}, {}, self._resolved)
+        result = certified_block_cg(self.source, models, image, array_module.zeros_like(image), column_models, bound, self.count, deflation=spike_free, label="information")
+        block = state["blocks"].get(model)
+        duals = result.solution
+        coupling = array_module.zeros((0, columns))
+        if block is not None:
+            coupling = block.duals.T @ image
+            duals = duals - block.duals @ _cholesky_solve(array_module, block.factor, coupling - values[resolved])
+        left = models.sample_to_design(duals, column_models)
+        back_products = array_module.empty((self.source.variant_count, columns))
+        for start, stop, tile in self.source.blocks():
+            back_products[start:stop] = tile.rmatmat(left)
+        self.count.note(columns, 0.0, "information-products")
+        return back_products, coupling, result.residual_norm
+
     def posterior_solve(self, right: Any, model: int, error_bound: Any) -> Any:
         """A_m^-1 right (p x r) at the last iterate's sites, each column certified to ||x_hat - x||_A <= error_bound.
 
@@ -1037,17 +1084,9 @@ class DualGaussian:
         state = self._state
         models = state["models"]
         bulk_variances = state["bulk_variances"][:, model]
-        values = array_module.asarray(right, dtype=array_module.float64)
+        values, bulk_values, resolved, column_models, image = self._bulk_image(right, model)
         columns = int(values.shape[1])
-        resolved = array_module.asarray(self._resolved[model])
-        bulk_values = values.copy()
-        bulk_values[resolved] = 0.0
-        column_models = array_module.full(columns, model)
-        image = array_module.zeros((source.sample_count, columns))
-        for start, stop, tile in source.blocks():
-            image += tile.matmat(bulk_variances[start:stop, None] * bulk_values[start:stop])
-        self.count.note(columns, 0.0, "posterior-rhs")
-        rhs = -models.design_to_sample(image, column_models)
+        rhs = -image
         target = array_module.broadcast_to(array_module.asarray(error_bound, dtype=array_module.float64), (columns,)).copy()
         bound = target.copy()
         spike_free = Deflation({}, {}, {}, self._resolved)

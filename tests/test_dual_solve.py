@@ -503,3 +503,34 @@ def test_the_recursive_share_minimizes_the_cycles_digit_passes() -> None:
         best = grid[np.argmin([cost(value) for value in grid])]
         # The stationary point is the grid's minimizer to within the grid's spacing.
         assert abs(best - share) <= grid[1] - grid[0]
+
+
+def test_information_solve_gives_the_bulk_back_products_and_coupling() -> None:
+    genotypes, bounds, covariates, training, noise, precision, shift, response, offsets, _negative = _gaussian_problem(59)
+    source = dual_solve.DenseDualSource(genotypes, bounds)
+    gaussian = dual_solve.DualGaussian(source=source, training=training, targets=response, offsets=offsets, covariates=covariates, probe_count=2, seed=8)
+    gaussian.iterate(site_precision=precision, site_shift=shift, noise_variance=noise, error_bound=np.full(MODEL_COUNT, np.sqrt(EPS)), probe_residual_ratio=np.sqrt(EPS))
+    rng = np.random.default_rng(60)
+    probes = rng.choice(np.array([-1.0, 1.0]), size=(genotypes.shape[1], 3))
+    for model in (0, 2):
+        resolved = gaussian.bulk_solves[model].resolved
+        _posterior, _mean, _alpha, _rss, design = _dense_gaussian(genotypes, covariates, training, noise, precision, shift, response, offsets, model)
+        bulk = np.setdiff1d(np.arange(genotypes.shape[1]), resolved)
+        variances = np.zeros(genotypes.shape[1])
+        variances[bulk] = 1.0 / precision[bulk, model]
+        kernel = np.eye(genotypes.shape[0]) + (design * variances[None, :]) @ design.T
+        image = design @ (variances[:, None] * probes)
+        inverse_image = np.linalg.solve(kernel, image)
+        design_resolved = design[:, resolved]
+        resolved_duals = np.linalg.solve(kernel, design_resolved)
+        core = np.diag(precision[resolved, model]) + design_resolved.T @ resolved_duals
+        coupling = resolved_duals.T @ image
+        w = inverse_image - resolved_duals @ np.linalg.solve(core, coupling - probes[resolved]) if resolved.size else inverse_image
+        expected = design.T @ w
+        tolerance = np.sqrt(EPS) * np.linalg.norm(image, axis=0)
+        back_products, resolved_coupling, residual_norm = gaussian.information_solve(probes, model, tolerance)
+        assert np.all(residual_norm <= tolerance)
+        conditioning = np.linalg.cond(kernel) * (np.linalg.cond(core) if resolved.size else 1.0)
+        np.testing.assert_allclose(back_products, expected, rtol=0.0, atol=conditioning * np.sqrt(EPS) * np.abs(expected).max() * genotypes.shape[0])
+        if resolved.size:
+            np.testing.assert_allclose(resolved_coupling, coupling, rtol=0.0, atol=conditioning * np.sqrt(EPS) * np.abs(coupling).max() * genotypes.shape[0])
