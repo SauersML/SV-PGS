@@ -502,7 +502,8 @@ def recursive_share(log_ratio: float, rate: float, operator_scale: float, sample
     def excess(share: float) -> float:
         iterations = (log_ratio + np.log(1.0 / share)) / rate
         inverse_error = 2 * operator_scale * iterations * np.sqrt(np.exp(log_ratio) * share) / (1.0 - share)
-        scaled_digits = max(0.0, float(np.log(np.sqrt(sample_count) * inverse_error)))
+        # an identity operator (rate = inf, no iterations) needs no operand digits
+        scaled_digits = max(0.0, float(np.log(np.sqrt(sample_count) * inverse_error))) if inverse_error > 0.0 else 0.0
         return (1.0 + share) * (log_ratio + np.log(1.0 / share)) - 2 * (1.0 - share) * (scaled_digits + 1.0)
 
     low, high = np.finfo(np.float64).tiny, 1.0 - np.finfo(np.float64).epsneg
@@ -659,8 +660,9 @@ def certified_block_cg(
                     share = recursive_share(float(np.log(cycle_start_worst)), rate, operator_scale, source.sample_count)
                     drift_budget = (1.0 - share) * bound
             worst = float(array_module.max(array_module.linalg.norm(residual[:, open_columns], axis=0) / bound[open_columns]))
-            if worst < cycle_start_worst:
+            if 0.0 < worst < cycle_start_worst:
                 # The measured average contraction replaces the worst-case one once the cycle has made progress.
+                # A cycle that solved every open column exactly (an identity bulk operator) has none to measure.
                 rate = float(np.log(cycle_start_worst / worst)) / cycle_iterations
             directions = next_directions
 
@@ -852,20 +854,19 @@ def resolved_block(array_module: Any, design: Any, precision: Any, duals: Any, r
     return ResolvedBlock(design, precision, duals, residual, core, factor)
 
 
-def _core_error(array_module: Any, block: ResolvedBlock) -> tuple[float, float, float]:
-    """(lambda_min(core_hat), ||R_L||_2, delta): the computed core's error relative to itself.
+def core_bounds(array_module: Any, block: ResolvedBlock) -> tuple[float, float, float]:
+    """(lambda_min(core_hat), ||R_L||_2, delta) for a resolved block, delta bounding ||L^-1 (core - core_hat) L^-T||_2.
 
-    With E = Z_L - Z_hat = S_S^-1 R_L, the exact core is core_hat + Delta, Delta = sym(Z_hat'R_L) +
-    R_L'S_S^-1 R_L, so -delta core_hat <= Delta <= delta core_hat with
-    delta = ||L^-1 sym(Z_hat'R_L) L^-T||_2 + ||R_L||_2^2 / lambda_min(core_hat) (core_hat = L L').
+    With E = Z_L - Z_hat = S_S^-1 R_L, core - core_hat = sym(Z_hat'R_L) + R_L'S_S^-1 R_L, so
+    delta = ||L^-1 sym(Z_hat'R_L) L^-T|| + ||R_L||^2 / lambda_min(core_hat) (S_S >= I); all norms spectral.
     """
     lowest = float(array_module.linalg.eigvalsh(block.core)[0])
     residual_gram = block.residual.T @ block.residual
     residual_norm = float(np.sqrt(max(float(array_module.linalg.eigvalsh(0.5 * (residual_gram + residual_gram.T))[-1]), 0.0)))
     coupling = block.duals.T @ block.residual
     whitened = array_module.linalg.solve(block.factor, array_module.linalg.solve(block.factor, 0.5 * (coupling + coupling.T)).T)
-    core_error = float(array_module.max(array_module.abs(array_module.linalg.eigvalsh(0.5 * (whitened + whitened.T))))) + residual_norm**2 / lowest
-    return lowest, residual_norm, core_error
+    delta = float(array_module.max(array_module.abs(array_module.linalg.eigvalsh(0.5 * (whitened + whitened.T))))) + residual_norm**2 / lowest
+    return lowest, residual_norm, delta
 
 
 def split_columns(array_module: Any, block: ResolvedBlock, shift: Any, duals: Any, residual: Any) -> tuple[Any, Any, Any]:
@@ -887,7 +888,7 @@ def split_columns(array_module: Any, block: ResolvedBlock, shift: Any, duals: An
     mean_duals = duals - block.duals @ resolved_mean
     bulk_residual = residual - block.residual @ resolved_mean
     stationarity = shift + block.design.T @ mean_duals - block.precision[:, None] * resolved_mean
-    lowest, residual_norm, core_error = _core_error(array_module, block)
+    lowest, residual_norm, core_error = core_bounds(array_module, block)
     # ||L^-1||_2^2 = 1 / lambda_min(core_hat).
     inverse_factor_norm = float(np.sqrt(1.0 / lowest))
     bulk_norms = array_module.linalg.norm(bulk_residual, axis=0)
@@ -918,7 +919,7 @@ class SampleDiagonal:
     and E = S_S^-1 R_L the error of Z_L (R_L its exact residuals), row i of E is e_i' S_S^-1 R_L, so
     ||E_i|| <= ||S_S^-1 e_i|| ||R_L||_2 <= ||R_L||_2 (S_S >= I), and ||L^-1 E_i|| <= b = ||R_L||_2 /
     sqrt(lambda_min(core_hat)). The core satisfies (1 - delta) core_hat <= core <= (1 + delta) core_hat
-    (_core_error), so resolved_i lies in [max(a_i - b, 0)^2 / (1 + delta), (a_i + b)^2 / (1 - delta)];
+    (core_bounds), so resolved_i lies in [max(a_i - b, 0)^2 / (1 + delta), (a_i + b)^2 / (1 - delta)];
     the bounds are infinite when delta is not below 1.
     """
 
@@ -1262,7 +1263,9 @@ class DualGaussian:
         values, _bulk_values, resolved, column_models, image = self._bulk_image(probes, model)
         columns = int(values.shape[1])
         image_norms = array_module.linalg.norm(image, axis=0)
-        bound = array_module.broadcast_to(array_module.asarray(residual_tolerance, dtype=array_module.float64), (columns,)) * image_norms
+        # A column with no image is solved by the zero start, so its bound is 0 (never inf * 0).
+        tolerance = array_module.broadcast_to(array_module.asarray(residual_tolerance, dtype=array_module.float64), (columns,))
+        bound = array_module.where(image_norms > 0.0, tolerance, 0.0) * image_norms
         spike_free = Deflation({}, {}, {}, self._resolved)
         result = certified_block_cg(self.source, models, image, array_module.zeros_like(image), column_models, bound, self.count, deflation=spike_free, label="information")
         block = state["blocks"].get(model)
@@ -1346,7 +1349,7 @@ class DualGaussian:
             return SampleDiagonal(weights, covariate_leverage, zeros, zeros, zeros)
         whitened = array_module.linalg.solve(block.factor, block.duals.T)
         resolved_term = array_module.sum(whitened * whitened, axis=0)
-        lowest, residual_norm, core_error = _core_error(array_module, block)
+        lowest, residual_norm, core_error = core_bounds(array_module, block)
         if core_error >= 1.0:
             return SampleDiagonal(weights, covariate_leverage, resolved_term, array_module.zeros_like(resolved_term), array_module.full_like(resolved_term, np.inf))
         root = array_module.sqrt(resolved_term)
@@ -1364,20 +1367,74 @@ class DualGaussian:
         """Posterior draws for given noise: the bulk by Matheron on S_S, L from its marginal (split_draw_duals).
 
         prior_noise (p, K) and sample_noise (n, K) are e1 and e2 of each draw column, resolved_noise[m]
-        is eps_L (|L_m| x the model's draws); each draw's dual is certified to error_bound (K,).
-        Returns (draws (p, K), exact bulk dual residual norms (K,)).
+        is eps_L (|L_m| x the model's draws). Each draw's perturbation, the draw minus the mean, is certified
+        to error_bound (K,) in A-norm against an exact draw from the same noise.
+
+        The exact draw may take beta_L* - mu_L = F eps_L for any F with F F' = core^-1 (each gives the joint
+        posterior), so take F = core^-1/2 U, with U the orthogonal factor nearest core^1/2 L^-T for the
+        computed core_hat = L L'. By Schur's complement of A's bulk block, the error e has
+        ||e||_A^2 = ||e_S + A_SS^-1 A_SL e_L||_A_SS^2 + ||e_L||_core^2.
+        - The first part is D_S Xt_S' S_S^-1 (R_L d_L - r), for the draw's resolved offset d_L = L^-T eps_L,
+          the Z_L residuals R_L and the draw dual's exact residual r, so it is at most ||R_L d_L - r||
+          (DualCertificate's identity).
+        - e_L = (core^1/2 L^-T - U) eps_L in the core norm. The singular values of core^1/2 L^-T are
+          sqrt(1 + lambda) over the eigenvalues lambda of L^-1 (core - core_hat) L^-T, which lie in
+          [-delta, delta] (core_bounds), so ||e_L||_core <= (1 - sqrt(1 - delta)) ||eps_L||.
+        A draw that misses its bound tightens its dual and its model's Z_L by the measured shortfall, as
+        posterior_solve does. Returns (draws (p, K), the certificates (K,)).
         """
         array_module = self.array_module
         source = self.source
         state = self._state
         models = state["models"]
+        host_models = np.asarray(draw_models)
         device_models = array_module.asarray(draw_models)
         rhs = draw_right_hand_side(source, models, device_models, prior_noise, sample_noise, self.count)
-        result = certified_block_cg(source, models, rhs, array_module.zeros_like(rhs), device_models, array_module.asarray(error_bound), self.count, label="draws")
-        draw_duals, resolved_draws = split_draw_duals(
-            {model: block.factor for model, block in state["blocks"].items()}, state["resolved_mean"],
-            {model: block.duals for model, block in state["blocks"].items()}, draw_models, result.solution, resolved_noise, array_module,
-        )
+        target = array_module.broadcast_to(array_module.asarray(error_bound, dtype=array_module.float64), (int(rhs.shape[1]),)).copy()
+        bound = target.copy()
+        spike_free = Deflation({}, {}, {}, self._resolved)
+        start = array_module.zeros_like(rhs)
+        while True:
+            # the split made S_S spike-free, so the relaxed operand error applies (an empty deflation says so)
+            result = certified_block_cg(source, models, rhs, start, device_models, bound, self.count, deflation=spike_free, label="draws")
+            draw_duals, resolved_draws = split_draw_duals(
+                {model: block.factor for model, block in state["blocks"].items()}, state["resolved_mean"],
+                {model: block.duals for model, block in state["blocks"].items()}, draw_models, result.solution, resolved_noise, array_module,
+            )
+            certificate = result.residual_norm.copy()
+            for model, block in state["blocks"].items():
+                columns = np.flatnonzero(host_models == model)
+                if columns.size == 0:
+                    continue
+                device_columns = array_module.asarray(columns)
+                _lowest, _residual_norm, delta = core_bounds(array_module, block)
+                if not delta < 1.0:
+                    certificate[device_columns] = np.inf
+                    continue
+                offset = resolved_draws[model] - state["resolved_mean"][model][:, None]
+                bulk = array_module.linalg.norm(block.residual @ offset - result.residual[:, device_columns], axis=0)
+                # 1 - sqrt(1 - delta), written without the cancellation
+                spread = delta / (1.0 + np.sqrt(1.0 - delta)) * array_module.linalg.norm(array_module.asarray(resolved_noise[model]), axis=0)
+                certificate[device_columns] = array_module.sqrt(bulk * bulk + spread * spread)
+            open_mask = _host(certificate > target)
+            if not open_mask.any():
+                break
+            finite = array_module.isfinite(certificate)
+            fallback = target / array_module.maximum(array_module.linalg.norm(rhs, axis=0), np.finfo(np.float64).tiny)
+            # an open column's certificate exceeds its positive target, so it is positive
+            shortfall = array_module.where(finite, target / array_module.where(finite & (certificate > 0.0), certificate, 1.0), fallback)
+            open_columns = array_module.asarray(np.flatnonzero(open_mask))
+            bound[open_columns] *= shortfall[open_columns]
+            for model in np.unique(host_models[open_mask]):
+                block = state["blocks"].get(int(model))
+                if block is None:
+                    continue
+                tightening = float(array_module.min(shortfall[array_module.asarray(np.flatnonzero(open_mask & (host_models == model)))]))
+                resolved_columns = array_module.full(int(block.design.shape[1]), int(model))
+                resolved_bound = tightening * array_module.linalg.norm(block.residual, axis=0)
+                refined = certified_block_cg(source, models, block.design, block.duals, resolved_columns, resolved_bound, self.count, deflation=spike_free, label="draws-resolved")
+                state["blocks"][int(model)] = resolved_block(array_module, block.design, block.precision, refined.solution, refined.residual)
+            start = result.solution
         left = models.sample_to_design(draw_duals, device_models)
         bulk_variances = state["bulk_variances"][:, device_models]
         draws = self.mean[:, device_models] + array_module.sqrt(bulk_variances) * prior_noise
@@ -1385,9 +1442,9 @@ class DualGaussian:
             draws[start:stop] += bulk_variances[start:stop] * tile.rmatmat(left)
         self.count.note(int(draw_duals.shape[1]), 0.0, "draws")
         for model, values in resolved_draws.items():
-            columns = np.flatnonzero(draw_models == model)
+            columns = np.flatnonzero(host_models == model)
             draws[array_module.asarray(self._resolved[model])[:, None], array_module.asarray(columns)[None, :]] = values
-        return draws, result.residual_norm
+        return draws, certificate
 
     def draws(self, *, draw_count: int, error_bound: Any, seed: int) -> Any:
         """(p, M, draw_count) exact posterior draws of every model, each certified to its model's error_bound."""
