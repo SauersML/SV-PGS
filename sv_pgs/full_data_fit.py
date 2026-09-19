@@ -43,7 +43,7 @@ import numpy as np
 
 from sv_pgs._typing import F64Array, I64Array
 from sv_pgs.config import TraitType
-from sv_pgs.dual_solve import DualGaussian
+from sv_pgs.dual_solve import DualGaussian, _host
 from sv_pgs.fast_scoring import ScoringModel
 from sv_pgs.genotype_statistics import GenotypeSufficientStatistics
 from sv_pgs.marginal_variances import (
@@ -195,7 +195,7 @@ def _posterior(gaussian: DualGaussian, model: int, grams: BlockGrams, variances:
         bound = relative_tolerance * np.sqrt(np.square(values[:, live]).T @ variances)
         ensure()
         while live.size:
-            solved = np.asarray(gaussian.posterior_solve(values[:, live], model, bound), dtype=np.float64)
+            solved = np.asarray(_host(gaussian.posterior_solve(values[:, live], model, bound)), dtype=np.float64)
             lower, _upper = _norm_bounds(np.sum(values[:, live] * solved, axis=0), bound)
             done = bound <= relative_tolerance * lower
             solution[:, live[done]] = solved[:, done]
@@ -210,8 +210,8 @@ def _precision_norm(gaussian: DualGaussian, model: int, site_precision: F64Array
     """d -> d' A d for q's posterior precision A = X' P_W X + diag tau at the model's sites, one read of the store:
     u = X d, and P_W = W - W C (C'WC)^-1 C' W with W the model's training rows over its noise variance."""
     array_module = gaussian.array_module
-    weights = np.asarray(gaussian.training, dtype=np.float64)[:, model] / float(gaussian.noise_variance[model])
-    covariates = np.asarray(gaussian.covariates, dtype=np.float64)
+    weights = np.asarray(_host(gaussian.training), dtype=np.float64)[:, model] / float(gaussian.noise_variance[model])
+    covariates = np.asarray(_host(gaussian.covariates), dtype=np.float64)
     normal = covariates.T @ (weights[:, None] * covariates)
     precision = np.array(site_precision, dtype=np.float64, copy=True)
 
@@ -220,7 +220,7 @@ def _precision_norm(gaussian: DualGaussian, model: int, site_precision: F64Array
         image = array_module.zeros((gaussian.source.sample_count, 1))
         for start, stop, tile in gaussian.source.blocks():
             image += tile.matmat(values[start:stop])
-        sample = np.asarray(image, dtype=np.float64)[:, 0]
+        sample = np.asarray(_host(image), dtype=np.float64)[:, 0]
         weighted = weights * sample
         projected = weighted - weights * (covariates @ np.linalg.solve(normal, covariates.T @ weighted))
         return float(sample @ projected + np.sum(precision * np.square(np.asarray(direction, dtype=np.float64))))
@@ -250,7 +250,7 @@ class _FullDataFixedPoints:
         precision, shift = moment_matched_prior_sites(prior, initial_hyperparameters(prior))
         self.site_precision = np.repeat(precision[:, None], model_count, axis=1)
         self.site_shift = np.repeat(shift[:, None], model_count, axis=1)
-        self.noise = covariate_residual_variance(np.asarray(gaussian.targets), np.asarray(gaussian.training), np.asarray(gaussian.covariates))
+        self.noise = covariate_residual_variance(_host(gaussian.targets), _host(gaussian.training), _host(gaussian.covariates))
         self.effective = np.full(model_count, float(prior.variant_count))
         self.probe_ratio = _HALF_PRECISION
         self.mean_move = np.full(model_count, np.inf)
@@ -268,7 +268,7 @@ class _FullDataFixedPoints:
             site_precision=site_precision, site_shift=site_shift, noise_variance=self.noise,
             error_bound=np.sqrt(self.effective / self.draw_count), probe_residual_ratio=self.probe_ratio,
         )
-        self.mean_error = np.asarray(certificate.error_bound, dtype=np.float64)
+        self.mean_error = np.asarray(_host(certificate.error_bound), dtype=np.float64)
         self.passes += 1
         self.version += 1
 
@@ -330,11 +330,11 @@ class _FullDataFixedPoints:
         gaussian = self.gaussian
         solve = gaussian.bulk_solves[model]
         tolerance = certificate_tolerance(solve, gaussian.probe_count)
-        column_square_norms = np.asarray(gaussian.unit_squares, dtype=np.float64)[:, model] / float(self.noise[model])
+        column_square_norms = np.asarray(_host(gaussian.unit_squares), dtype=np.float64)[:, model] / float(self.noise[model])
         residual = information_solve_tolerance(solve, variances, grams.blocks, column_square_norms, tolerance)
         probes = self.generator.choice(np.array([-1.0, 1.0]), size=(solve.site_precision.shape[0], gaussian.probe_count))
         back_products, _coupling, _residual_norm = gaussian.information_solve(probes, model, residual)
-        removed = information_products(solve, np.asarray(back_products, dtype=np.float64))
+        removed = information_products(solve, np.asarray(_host(back_products), dtype=np.float64))
         return block_information_certificate(solve, variances, grams.blocks, probes, removed, tolerance, certificate_level(self.draw_count))
 
     def _noise(self, variances: F64Array) -> F64Array:
@@ -361,7 +361,7 @@ class _FullDataFixedPoints:
         the two-sided bounds from r'x_hat fall on one side."""
         bound = np.array([0.5 * np.sqrt(threshold)])
         while True:
-            solved = np.asarray(self.gaussian.posterior_solve(right[:, None], model, bound), dtype=np.float64)
+            solved = np.asarray(_host(self.gaussian.posterior_solve(right[:, None], model, bound)), dtype=np.float64)
             lower, upper = _norm_bounds(np.array([float(right @ solved[:, 0])]), bound)
             if upper[0] * upper[0] <= threshold or lower[0] * lower[0] > threshold:
                 return float(upper[0] * upper[0])
@@ -385,7 +385,7 @@ class _FullDataFixedPoints:
         while True:
             variances, grams = self._refresh()
             frozen = 1.0 / variances - self.site_precision
-            mean = np.asarray(gaussian.mean, dtype=np.float64).copy()
+            mean = np.asarray(_host(gaussian.mean), dtype=np.float64).copy()
             cavities = [Cavity(precision=frozen[:, model], shift=mean[:, model] / variances[:, model] - self.site_shift[:, model]) for model in range(model_count)]
             target_precision, target_shift = self._targets(hyperparameters, cavities)
             # The undamped update moves the mean by Sigma (delta nu - delta tau o mu), to first order in the site change.
@@ -420,7 +420,7 @@ class _FullDataFixedPoints:
         model_count = gaussian.model_count
         previous_move, damping = np.full(model_count, np.inf), 1.0
         while True:
-            mean = np.asarray(gaussian.mean, dtype=np.float64).copy()
+            mean = np.asarray(_host(gaussian.mean), dtype=np.float64).copy()
             fraction = damping
             move = max(float(np.max(np.abs(target_precision - self.site_precision))), float(np.max(np.abs(target_shift - self.site_shift))))
             scale = 1.0 + max(float(np.max(np.abs(self.site_precision))), float(np.max(np.abs(self.site_shift))))
@@ -439,14 +439,14 @@ class _FullDataFixedPoints:
             self.site_precision, self.site_shift = trial_precision, trial_shift
             marginal = 1.0 / (frozen + self.site_precision)
             # A damped pass moves fraction^2 of the full step's squared size: converge on the full step.
-            mean_move = np.sum(np.square(np.asarray(gaussian.mean) - mean) / marginal, axis=0) / (fraction * fraction)
+            mean_move = np.sum(np.square(_host(gaussian.mean) - mean) / marginal, axis=0) / (fraction * fraction)
             if np.all(mean_move <= self.effective / self.draw_count):
                 return
             ratio = float(np.max(mean_move / previous_move))
             if ratio >= 1.0:
                 damping = min(damping, 1.0 / (1.0 + np.sqrt(ratio)))
             previous_move = mean_move
-            new_mean = np.asarray(gaussian.mean, dtype=np.float64)
+            new_mean = np.asarray(_host(gaussian.mean), dtype=np.float64)
             cavities = [
                 Cavity(precision=frozen[:, model], shift=new_mean[:, model] / marginal[:, model] - self.site_shift[:, model]) for model in range(model_count)
             ]
@@ -505,10 +505,10 @@ def scoring_models(
     representative's prior, so its effect splits in proportion to their prior variances."""
     gaussian = fit.gaussian
     error_bound = np.sqrt(fit.certificate.effective_effects / draw_count)
-    draws = np.asarray(gaussian.draws(draw_count=draw_count, error_bound=error_bound, seed=seed), dtype=np.float64)
+    draws = np.asarray(_host(gaussian.draws(draw_count=draw_count, error_bound=error_bound, seed=seed)), dtype=np.float64)
     active_to_reduced = np.asarray(statistics.tie_map.original_to_reduced, dtype=np.int64)
-    alpha = np.asarray(gaussian.alpha, dtype=np.float64)
-    mean = np.asarray(gaussian.mean, dtype=np.float64)
+    alpha = np.asarray(_host(gaussian.alpha), dtype=np.float64)
+    mean = np.asarray(_host(gaussian.mean), dtype=np.float64)
     return [
         ScoringModel.from_reduced_fit(
             active_rows=np.asarray(statistics.active_rows, dtype=np.int64),
