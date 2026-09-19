@@ -392,27 +392,30 @@ def level_posterior(
     weights = np.exp(log_integrand - log_sum[:, None])
     responsibility = np.exp(log_components - per_occasion[..., None])
     weighted = weights[:, :, None, None] * responsibility
-    inverse_variances = 1.0 / variances
-    counts = weighted.sum(axis=(0, 1, 2))
     grid_size = variances.shape[0]
+    # The sums over persons, nodes and occasions are matrix products over their flattened entries (BLAS).
+    flat_weighted = weighted.reshape(-1, grid_size)
+    counts = flat_weighted.sum(axis=0)
     missing = np.zeros((grid_size, grid_size))
     if louis:
         # Var(C_i | z_i) = E_T[sum_j (diag rho_j - rho_j rho_j')] + Var_T(sum_j rho_j(T)).
         node_sums = responsibility.sum(axis=2)
-        mean_sums = np.einsum("pn,pnk->pk", weights, node_sums)
+        mean_sums = np.matmul(weights[:, None, :], node_sums)[:, 0, :]
+        flat_sums = node_sums.reshape(-1, grid_size)
         missing = (
             np.diag(counts)
-            - np.einsum("pnjk,pnjl->kl", weighted, responsibility)
-            + np.einsum("pn,pnk,pnl->kl", weights, node_sums, node_sums)
+            - flat_weighted.T @ responsibility.reshape(-1, grid_size)
+            + (flat_sums * weights.reshape(-1, 1)).T @ flat_sums
             - mean_sums.T @ mean_sums
         )
+    node_precision = weighted @ (1.0 / variances)
     return LevelPosterior(
         log_likelihood=log_totals[:, 0],
         level_mean=np.sum(weights * levels, axis=1),
         level_second_moment=np.sum(weights * np.square(levels), axis=1),
         counts=counts,
-        occasion_precision=np.einsum("pnjk,k->pj", weighted, inverse_variances),
-        occasion_shift=np.einsum("pnjk,k,pn->pj", weighted, inverse_variances, levels),
+        occasion_precision=node_precision.sum(axis=1),
+        occasion_shift=np.sum(node_precision * levels[:, :, None], axis=1),
         missing_information=missing,
         admissible_step=admissible,
     )
@@ -560,7 +563,7 @@ class _Model:
     def start(self) -> _State:
         """Least-squares fixed effects, a robust level variance, and the engine's start density on the lattice
         from the resolution variance to the largest squared within-person deviation (past it by its width), with
-        at least the ROUGHNESS_ORDER + 1 nodes whose differences the roughness penalty needs."""
+        at least the engine's minimum of ROUGHNESS_ORDER + 2 nodes (``scale_mixture_prior``)."""
         occasions = self.occasions
         fixed_effects = np.linalg.lstsq(occasions.design, self.transformed, rcond=None)[0]
         residuals = self.transformed - occasions.design @ fixed_effects
@@ -577,7 +580,7 @@ class _Model:
         floor = float(np.log(self.resolution_variance))
         top = float(np.log(max(largest, self.resolution_variance)))
         spacing = spacing_bound(float(occasions.values.shape[0]), EVIDENCE_TOLERANCE)
-        extent = max(top + (top - floor), floor + ROUGHNESS_ORDER * spacing)
+        extent = max(top + (top - floor), floor + (ROUGHNESS_ORDER + 1) * spacing)
         prior = _density_prior(np.arange(floor, extent + spacing, spacing), top, occasions.values.shape[0])
         return _State(fixed_effects, level_variance, prior, initial_hyperparameters(prior))
 
