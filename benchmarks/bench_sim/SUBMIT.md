@@ -14,13 +14,18 @@ class Model:
 ```
 
 - **`train`:**
-  - `train.codes(rows)`: uint8 observed codes, shape [len(rows), n_train_samples]; dosage = code / 127, every record's GLIMPSE2 DS;
-  - `train.variants`: a dict of public per-record arrays: pos, cm, cls (0 SNV, 1 INDEL, 2 TR, 3 SV), len_change (signed), ref_len, alt_len, in_gene, in_exon, log_tss_distance, in_repeat, log_sv_length, and imputation_info (the mean GLIMPSE2 INFO);
+  - `train.codes(rows)`: uint8 observed codes, shape [len(rows), n_train_samples]; dosage = code / 127, the arm's observed value per record;
+  - `train.variants`: a dict of public per-record arrays: pos, cm, cls (0 SNV, 1 INDEL, 2 TR, 3 SV), len_change (signed), ref_len, alt_len, in_gene, in_exon, log_tss_distance, in_repeat, log_sv_length, and imputation_info (GLIMPSE2 INFO or Beagle DR2 for imputed records, per arm);
   - `train.covariates` [n_train, 13], with names in `train.covariate_names`: sex, age (standardized), batch, pc1–pc10;
   - `train.phenotype`, `train.trait_type` ("quantitative" or "binary"), `train.prevalence` (binary only), and `train.cores`.
 - **`test`:** the same `codes(rows)`, `variants` and `covariates`, for test samples, with no phenotype.
 - **`structural`:** optional. It's the part of your prediction carried by TR+SV records, used for SV credit.
 - **Records:** chr22 only for v1, 590,623 records at donor MAC ≥ 3 (487,545 SNV, 70,482 INDEL, 30,585 TR, 2,011 SV), with 50,000 samples (40,000 train and 10,000 test).
+
+## Measurement arms
+Every result carries its arm's label.
+- **`beagle`** (Beagle-imputed): all 50,000 samples; simple sites are read-model calls, and TR and SV records are Beagle DS. This is the arm submissions run on first.
+- **`glimpse2`** (GLIMPSE2-imputed): every record is GLIMPSE2 DS, mirroring aou2. For now it covers only the 2,500-sample calibration subset; the full cohort comes later.
 
 ## Rules
 - **Matched compute:** one runq task per scenario, with 16 cores and at most 1 GPU (declare it), and a 4-hour wall limit per scenario. Wall time and peak RSS are recorded.
