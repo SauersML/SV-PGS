@@ -3,15 +3,17 @@
 Genotypes (validation-bench REPORT P1, Tier 1).  Each sample's two haplotypes are mosaics of public
 1kGP founder haplotypes (design-credit's ``src_chr*.npz``: NYGC 3202 panel, founders, MAF >= 1%):
 HAPGEN-style copying with donor segments of mean 2 cM and local-ancestry tracts from an
-8-generation admixture clock.  The cohort mix is EUR 52%, African American 22% (0.8 AFR / 0.2
-EUR), Hispanic 18% (0.5 AMR / 0.35 EUR / 0.15 AFR), EAS 5% and SAS 3%, with per-person
-proportions drawn from Dirichlet(15 q).  Each tile is one source chromosome with a fresh mosaic;
+8-generation admixture clock.  The cohort's groups are EUR, African American (0.8 AFR / 0.2 EUR),
+Hispanic (0.5 AMR / 0.35 EUR / 0.15 AFR), EAS and SAS, weighted by the source panel's founder
+count in each group's anchor ancestry (EUR, AFR, AMR, EAS, SAS), with per-person proportions drawn
+from Dirichlet(15 q).  Each tile is one source chromosome with a fresh mosaic;
 tiles cycle through the source chromosomes to reach any record count, spread over 22 synthetic
 chromosomes in proportion to their hg38 lengths.
 
 Records (target-format REPORT §1.2).  Source variants become single-path records, or the paths of
-multi-path bubbles.  Each bubble's complexity is drawn from the strata class x MAF x N_PATHS_TOTAL
-counts, so that each class's share of records per complexity bin matches production.  A haplotype
+multi-path bubbles.  Every N_PATHS_TOTAL complexity bin holds an equal share of records, for every
+class and frequency (a design input chosen so that every bin is exercised; no production counts are
+used).  A haplotype
 carries at most one path of a bubble: the first source variant in the run that it carries.  Some
 bubbles also carry a nested atomic record, spread over several of their paths.
 
@@ -21,9 +23,14 @@ Dosage noise (tx-glimpse-math REPORT §1).
   - uninformed: the donor ancestry's allele frequency;
   - a confident error;
   - softened by delta ~ 10**U(-5, -2).
-- The per-path r2 target is the single-path pilot50 / long-read value for the record's class and
-  frequency; the confident-error rate is solved per record to hit it.  At read-evidence sites the
-  reads inform every haplotype, so none is uninformed and the error is all confident.
+- The per-path r2 target is the median single-record dosage r2 that bench-sim measured for the
+  record's class and frequency on public data (1kGP haplotypes re-imputed with GLIMPSE2 v2.0.0
+  against a disjoint public panel; results_calibration_2000.json).  The confident-error rate is
+  solved per record to hit it.  Read evidence sits at single-path SNVs and at single-path INDELs
+  outside tandem repeats (the production pipeline's configuration: read likelihoods only at simple
+  sites).  There the reads inform every haplotype, so none is uninformed and the error is all
+  confident; elsewhere half of the error mass is uninformed (a design midpoint between mean-like and
+  draw-like dosages).
 - GLIMPSE2's err-imp then mixes in the floor: h = eps + (1 - 2 eps) pi, with eps = 1e-3.  At
   read-evidence sites pop's clamp sets eps to 1e-5.
 - pop keeps each sample's top 10 paths of a bubble and odds-normalizes them.  This deflates split
@@ -78,12 +85,14 @@ HG38_AUTOSOME_MEGABASES = (
     133.28, 114.36, 107.04, 101.99, 90.34, 83.26, 80.37, 58.62, 64.44, 46.71, 50.82,
 )
 ANCESTRIES = ("EUR", "AFR", "AMR", "EAS", "SAS")
-COHORT_GROUPS: tuple[tuple[float, Mapping[str, float]], ...] = (
-    (0.52, {"EUR": 1.0}),
-    (0.22, {"AFR": 0.8, "EUR": 0.2}),
-    (0.18, {"AMR": 0.5, "EUR": 0.35, "AFR": 0.15}),
-    (0.05, {"EAS": 1.0}),
-    (0.03, {"SAS": 1.0}),
+# (anchor ancestry, mean ancestry proportions); a group's weight is the source panel's founder
+# count in its anchor ancestry.
+COHORT_GROUPS: tuple[tuple[str, Mapping[str, float]], ...] = (
+    ("EUR", {"EUR": 1.0}),
+    ("AFR", {"AFR": 0.8, "EUR": 0.2}),
+    ("AMR", {"AMR": 0.5, "EUR": 0.35, "AFR": 0.15}),
+    ("EAS", {"EAS": 1.0}),
+    ("SAS", {"SAS": 1.0}),
 )
 ANCESTRY_DIRICHLET_CONCENTRATION = 15.0
 DONOR_SEGMENT_MEAN_CM = 2.0
@@ -95,52 +104,24 @@ POP_CLAMP = 1e-5
 POP_KEPT_PATHS = 10
 CLASS_LEGEND = ("SNV", "INDEL", "SV")
 SV_CONTEXT_LEGEND = ("not_sv", "tandem_repeat", "outside_tandem_repeat")
-READ_EVIDENCE_FRACTION = {"SNV": 0.18, "INDEL": 0.10, "SV": 0.0}
 NESTED_RECORD_PROBABILITY = 0.3
 MAXIMUM_NESTED_PATHS = 5
 SOFT_POSTERIOR_FRACTION = 0.1
 SOFT_DELTA_LOG10_RANGE = (-5.0, -2.0)
 NOISE_CLASSES = ("SNV", "INDEL", "SV_outTR", "SV_TR")
-UNINFORMED_SHARE = {"SNV": 1.0, "INDEL": 0.9, "SV_outTR": 0.4, "SV_TR": 0.45}
-SINGLE_PATH_R2 = {"SNV": 0.988, "INDEL": 0.973, "SV_outTR": 0.89, "SV_TR": 0.51}
-MAF_BIN_EDGES = (0.001, 0.005, 0.01, 0.05, 0.10)
-MAF_R2_MULTIPLIER = {
-    "SNV": (0.47, 0.77, 0.85, 0.905, 0.95, 1.0),
-    "INDEL": (0.47, 0.77, 0.85, 0.905, 0.95, 1.0),
-    "SV_outTR": (0.52, 0.52, 0.52, 0.95, 1.0, 1.0),
-    "SV_TR": (0.3, 0.3, 0.3, 0.6, 1.0, 1.0),
+# Median single-record dosage r2 per noise class over the MAF bins (0, 0.001], (0.001, 0.01],
+# (0.01, 0.05], (0.05, 0.5]: bench-sim's GLIMPSE2 arm on public 1kGP haplotypes, all groups
+# (results_calibration_2000.json; SV_outTR is its SV class, SV_TR its TR class).
+MAF_BIN_EDGES = (0.001, 0.01, 0.05)
+SINGLE_PATH_R2 = {
+    "SNV": (0.9993807168084469, 0.9995432413348173, 0.9995579609235608, 0.9999271445811645),
+    "INDEL": (0.9964503289666373, 0.9904424356321783, 0.9841285595217206, 0.9935772481102674),
+    "SV_outTR": (0.0016979617415352956, 0.23722189293162207, 0.7358563137729425, 0.8934057700263954),
+    "SV_TR": (0.15209710871018542, 0.38899596478651394, 0.7046636717650798, 0.9180855987022858),
 }
 PIPELINE_R2_LOSS = {"A": {"SNV": 0.0, "INDEL": 0.0, "SV": 0.0}, "B": {"SNV": 0.005, "INDEL": 0.02, "SV": 0.03}}
 R2_BETA_CONCENTRATION = 20.0
 COMPLEXITY_BIN_PATHS = ((1, 1), (2, 5), (6, 10), (11, 20), (21, 60))
-# Production popped records by class x panel-MAF bin over N_PATHS_TOTAL bins 1, 2-5, 6-10, 11-20, >20
-# (imputation strata counts, validation-bench strata_class_maf_cx.csv).  MAF bins follow MAF_BIN_EDGES.
-STRATA_COMPLEXITY_COUNTS = {
-    "SNV": (
-        (70223727, 2813198, 91126, 113683, 4193612),
-        (10331238, 453103, 16931, 19895, 707675),
-        (3151800, 139705, 5674, 6140, 219047),
-        (4857251, 225752, 9407, 9894, 343874),
-        (1462958, 71967, 2951, 2906, 103652),
-        (4747491, 237151, 8809, 8855, 301276),
-    ),
-    "INDEL": (
-        (5291687, 3702265, 731046, 652663, 1746407),
-        (820764, 1022386, 327397, 304396, 696724),
-        (252242, 348353, 149748, 136520, 255632),
-        (386030, 588687, 316783, 294037, 425493),
-        (114374, 190850, 109184, 99322, 109204),
-        (355057, 607497, 236426, 142282, 170373),
-    ),
-    "SV": (
-        (84392, 67889, 40355, 46958, 667344),
-        (12614, 13069, 8268, 11159, 135069),
-        (3860, 3972, 2606, 3715, 41639),
-        (6119, 6195, 4001, 5834, 56882),
-        (1623, 1387, 878, 1249, 8797),
-        (5602, 4619, 2611, 3187, 20822),
-    ),
-}
 RECORD_SINGLE = 0
 RECORD_PATH = 1
 RECORD_NESTED = 2
@@ -268,22 +249,18 @@ def _variant_classes(kinds: NDArray, reference_lengths: NDArray, alternate_lengt
 
 def _maf_bins(frequencies: F64Array) -> I64Array:
     minor = np.minimum(frequencies, 1.0 - frequencies)
-    return np.minimum(np.searchsorted(MAF_BIN_EDGES, minor, side="right"), len(MAF_BIN_EDGES)).astype(np.int64)
+    # Right-closed bins (a, b], as the cited measurement bins them.
+    return np.minimum(np.searchsorted(MAF_BIN_EDGES, minor, side="left"), len(MAF_BIN_EDGES)).astype(np.int64)
 
 
 def _bubble_start_cumulative() -> NDArray:
-    """Cumulative P(unit complexity bin) per [class code, MAF bin] for the unit starting at a variant.
+    """Cumulative P(unit complexity bin) for the unit starting at a variant.
 
-    A bubble of mean size K_b consumes K_b records, so starting it with probability proportional
-    to share_b / K_b reproduces each bin's share of records.
+    Every bin holds an equal share of records.  A bubble of mean size K_b consumes K_b records,
+    so starting it with probability proportional to 1 / K_b gives each bin the same share.
     """
-    mean_paths = np.array([(low + high) / 2 for low, high in COMPLEXITY_BIN_PATHS])
-    table = np.empty((len(CLASS_LEGEND), len(MAF_BIN_EDGES) + 1, len(COMPLEXITY_BIN_PATHS)))
-    for class_code, class_name in enumerate(CLASS_LEGEND):
-        shares = np.array(STRATA_COMPLEXITY_COUNTS[class_name], dtype=np.float64)
-        weights = shares / shares.sum(axis=1, keepdims=True) / mean_paths
-        table[class_code] = np.cumsum(weights / weights.sum(axis=1, keepdims=True), axis=1)
-    return table
+    weights = 1.0 / np.array([(low + high) / 2 for low, high in COMPLEXITY_BIN_PATHS])
+    return np.cumsum(weights / weights.sum())
 
 
 @dataclass(frozen=True)
@@ -314,9 +291,8 @@ def _tile_units(
     """Partition one tile's source variants into units: (start, paths, nested mask, has nested)."""
     first, last = source.tile_range(tile)
     count = last - first
-    frequencies = source.pooled_frequencies[first:last]
-    cumulative = _bubble_start_cumulative()[source.class_codes[first:last], _maf_bins(frequencies)]
-    complexity_bin = (rng.random(count)[:, None] > cumulative).sum(axis=1)
+    cumulative = _bubble_start_cumulative()
+    complexity_bin = (rng.random(count)[:, None] > cumulative[None, :]).sum(axis=1)
     complexity_bin = np.minimum(complexity_bin, len(COMPLEXITY_BIN_PATHS) - 1)
     lows = np.array([low for low, _ in COMPLEXITY_BIN_PATHS])[complexity_bin]
     highs = np.array([high for _, high in COMPLEXITY_BIN_PATHS])[complexity_bin]
@@ -405,8 +381,10 @@ def lay_out_chromosome(
         np.where(source.tandem_repeat[merged["source"]], NOISE_CLASSES.index("SV_TR"), NOISE_CLASSES.index("SV_outTR")),
         classes,
     ).astype(np.uint8)
-    evidence_rate = np.array([READ_EVIDENCE_FRACTION[name] for name in CLASS_LEGEND])[classes]
-    has_read_evidence = (merged["kind"] == RECORD_SINGLE) & (rng.random(record_count) < evidence_rate)
+    simple_site = (classes == CLASS_LEGEND.index("SNV")) | (
+        (classes == CLASS_LEGEND.index("INDEL")) & ~source.tandem_repeat[merged["source"]]
+    )
+    has_read_evidence = (merged["kind"] == RECORD_SINGLE) & simple_site
     return ChromosomeLayout(
         record_kind=merged["kind"],
         tile=merged["tile"],
@@ -505,14 +483,12 @@ def noise_parameters(
     frequency = np.clip(source.pooled_frequencies[layout.source_index], resolution, 1 - resolution)
     maf_bin = _maf_bins(frequency)
     noise_class = layout.noise_class
-    multiplier_table = np.array([MAF_R2_MULTIPLIER[name] for name in NOISE_CLASSES])
-    target_mean = np.array([SINGLE_PATH_R2[name] for name in NOISE_CLASSES])[noise_class] * multiplier_table[noise_class, maf_bin]
+    target_mean = np.array([SINGLE_PATH_R2[name] for name in NOISE_CLASSES])[noise_class, maf_bin]
     target = rng.beta(target_mean * R2_BETA_CONCENTRATION, (1 - target_mean) * R2_BETA_CONCENTRATION)
     loss_table = np.array([PIPELINE_R2_LOSS[pipeline]["SV" if name.startswith("SV") else name] for name in NOISE_CLASSES])
     # r2 is a squared correlation: the pipeline loss can only take it down to 0.
     target = np.clip(target - loss_table[noise_class], 0.0, 1.0)
-    uninformed_share = np.array([UNINFORMED_SHARE[name] for name in NOISE_CLASSES])[noise_class]
-    uninformed = np.where(layout.has_read_evidence, 0.0, uninformed_share * (1 - target))
+    uninformed = np.where(layout.has_read_evidence, 0.0, 0.5 * (1 - target))
     soft = np.minimum(SOFT_POSTERIOR_FRACTION * np.minimum(1.0, 10 * np.minimum(frequency, 1 - frequency)), 1 - uninformed)
     error_rate = solve_error_rate(target, uninformed, soft, frequency)
     carrier_flip, noncarrier_flip = _flip_rates(error_rate, frequency, 1 - uninformed - soft)
@@ -542,8 +518,9 @@ class Cohort:
         return int(self.haplotype_proportions.shape[0])
 
 
-def draw_cohort(sample_count: int, rng: np.random.Generator) -> Cohort:
-    group_weights = np.array([weight for weight, _ in COHORT_GROUPS])
+def draw_cohort(sample_count: int, source: HaplotypeSource, rng: np.random.Generator) -> Cohort:
+    founder_haplotypes = np.bincount(source.haplotype_ancestry, minlength=len(ANCESTRIES))
+    group_weights = np.array([founder_haplotypes[ANCESTRIES.index(anchor)] for anchor, _ in COHORT_GROUPS], dtype=np.float64)
     groups = rng.choice(len(COHORT_GROUPS), size=sample_count, p=group_weights / group_weights.sum())
     proportions = np.zeros((sample_count, len(ANCESTRIES)))
     for group_index, (_, base) in enumerate(COHORT_GROUPS):
@@ -928,7 +905,7 @@ def plan_store(
         raise ValueError(f"each half needs a pipeline in {sorted(PIPELINE_R2_LOSS)}.")
     chromosomes = tuple(f"chr{index + 1}" for index in range(chromosome_count))
     record_counts = _record_counts(total_records, chromosome_count)
-    cohort = draw_cohort(int(sum(half_sample_counts)), _generator(seed, 0))
+    cohort = draw_cohort(int(sum(half_sample_counts)), source, _generator(seed, 0))
     layouts = []
     noise = []
     digests = []
