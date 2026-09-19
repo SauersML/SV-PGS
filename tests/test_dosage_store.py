@@ -157,7 +157,9 @@ def test_store_round_trip_matches_quantized_float_dosage(two_half_store: tuple[P
         read_back = store.read_codes(0, store.n_variants)
         assert read_back.flags.c_contiguous
         assert np.array_equal(read_back, expected_codes)
-        assert np.max(np.abs(read_back / 127 - float_dosage)) <= 1 / 254 + 1e-12
+        # Quantization error 1/254, plus one rounding each of milli / 1000 and code / 127 (values
+        # at most 2, so at most eps each) and of their difference.
+        assert np.max(np.abs(read_back / 127 - float_dosage)) <= 1 / 254 + 3 * np.finfo(np.float64).eps
         gathered = np.sort(rng.choice(store.n_samples, size=25, replace=False))
         contiguous = np.arange(30, 50)
         for _ in range(40):
@@ -361,7 +363,13 @@ def test_standardizing_signed_codes_equals_standardizing_the_decoded_dosage(
     standardized = (count * signed - sums[:, None]) / np.sqrt(scaled_variance.astype(np.float64))[:, None]
     dosage = codes / 127.0
     reference = (dosage - dosage.mean(axis=1, keepdims=True)) / dosage.std(axis=1, keepdims=True)
-    assert np.max(np.abs(standardized - reference)) < 1e-12
+    # The integer route rounds only in its square root and division. The reference's mean and
+    # standard deviation are float sums of count terms of size at most 2, each off by at most
+    # count * eps * 2 (Higham's gamma_n), which moves z by that much times (1 + |z|) / sd.
+    sums_error = (2 * count + 4) * np.finfo(np.float64).eps * 2.0
+    spread = dosage.std(axis=1, keepdims=True)
+    bound = sums_error * (1.0 + np.abs(reference).max(axis=1, keepdims=True)) / spread
+    assert np.all(np.abs(standardized - reference) <= bound)
 
 
 def test_transcoding_rejects_a_sidecar_that_disagrees_with_the_codes(
