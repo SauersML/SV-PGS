@@ -79,6 +79,40 @@ def test_the_dual_mean_is_the_posterior_mean_of_every_model() -> None:
         assert np.sqrt(float(error @ precision @ error)) <= float(result.residual_norm[model]) * (1.0 + np.linalg.cond(precision) * EPS * genotypes.shape[1])
 
 
+class _TwoPartSource(dual_solve.DenseDualSource):
+    """A source whose map_reduce runs its blocks as two parts with their own images, summed in order."""
+
+    def __init__(self, genotypes, bounds):
+        super().__init__(genotypes, bounds)
+        self.map_reduce_calls = 0
+
+    def map_reduce(self, work, shared, rows, image_shape):
+        self.map_reduce_calls += 1
+        blocks = list(self.blocks())
+        images = []
+        for part in (blocks[: len(blocks) // 2], blocks[len(blocks) // 2 :]):
+            image = np.zeros(image_shape)
+            part_shared = dict(shared)
+            for start, stop, tile in part:
+                work(start, stop, tile, part_shared, {name: values[start:stop] for name, values in rows.items()}, image)
+            images.append(image)
+        return images[0] + images[1]
+
+
+def test_the_operator_runs_through_the_sources_map_reduce() -> None:
+    genotypes, bounds, covariates, weights, variances, prior_mean, response = _problem(19)
+    models = dual_solve.DualModels(weights, variances, covariates)
+    right = dual_solve.mean_right_hand_side(models, response, genotypes @ prior_mean)
+    split_source = _TwoPartSource(genotypes, bounds)
+    count = dual_solve.PassCount()
+    split = dual_solve.certified_block_cg(split_source, models, right, np.zeros_like(right), np.arange(MODEL_COUNT), _solve_bound(right), count)
+    assert split_source.map_reduce_calls == count.passes
+    single = dual_solve.certified_block_cg(dual_solve.DenseDualSource(genotypes, bounds), models, right, np.zeros_like(right), np.arange(MODEL_COUNT), _solve_bound(right), dual_solve.PassCount())
+    assert np.all(split.residual_norm <= _solve_bound(right))
+    # Both solutions are certified to the bound, so they agree within twice it.
+    assert np.all(np.linalg.norm(split.solution - single.solution, axis=0) <= 2.0 * _solve_bound(right) * (1.0 + genotypes.shape[0] * EPS))
+
+
 def test_the_energy_error_equals_the_dual_residual_identity() -> None:
     genotypes, _source, _models, covariates, weights, variances, prior_mean, response = _setup(2)
     rng = np.random.default_rng(7)
