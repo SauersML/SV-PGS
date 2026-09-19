@@ -92,6 +92,7 @@ from typing import Callable, Iterator, Sequence
 import numpy as np
 from scipy.integrate import quad
 from scipy.interpolate import CubicSpline
+from scipy.linalg import solve_triangular
 from scipy.sparse.linalg import LinearOperator, gmres
 from scipy.special import erfcx, logsumexp
 
@@ -1212,15 +1213,47 @@ def _pseudo_inverse_trace(total: F64Array, part: F64Array) -> float:
     return float(np.sum((eigenvectors.T @ part @ eigenvectors).diagonal() / eigenvalues))
 
 
-def _cholesky_log_determinant_and_inverse(matrix: F64Array) -> tuple[float, F64Array]:
-    factor = np.linalg.cholesky(matrix)
-    inverse = np.linalg.solve(factor.T, np.linalg.solve(factor, np.eye(factor.shape[0])))
-    return 2.0 * float(np.sum(np.log(np.diag(factor)))), inverse
+@dataclass(frozen=True)
+class _Profiled:
+    """A positive definite M with the null space N profiled, from one Cholesky factor in the basis [N, C]:
+    ``schur_log_determinant`` = log|M| - log|N'MN|, ``weight`` W = M^-1 - N (N'MN)^-1 N', ``inverse`` M^-1, and
+    ``rounding``, a bound on the Schur log-determinant's rounding error.
+
+    With Q'MQ = L L' (Q = [N, C]), the Schur complement's factor is L's trailing block, and L^-1's trailing rows
+    G give W = Q G'G Q': the N block cancels by structure, never by subtracting two inverses. So a direction of N
+    that the data barely curve (the profiled location and width where the density's mass has no kernel to see it)
+    costs nothing: rounding reaches the complement only through M_CN M_NN^-1 M_NC, at second order.
+    A factor exact for M + E with ||E|| <= (n + 1) eps ||M||_F (Demmel) moves the Schur log-determinant by at most
+    ||E|| tr(W): that is ``rounding``.
+    """
+
+    schur_log_determinant: float
+    weight: F64Array
+    inverse: F64Array
+    rounding: float
 
 
-def _determinant_rounding(matrix: F64Array, inverse: F64Array) -> float:
-    """A bound on the rounding error of log|M| from its Cholesky factor: (n + 1) eps ||M||_F tr(M^-1)."""
-    return _EPSILON * (matrix.shape[0] + 1) * float(np.linalg.norm(matrix)) * float(np.trace(inverse))
+def _null_complement(null_basis: F64Array) -> F64Array:
+    """An orthonormal basis of the complement of the orthonormal ``null_basis``."""
+    size = null_basis.shape[0]
+    return np.linalg.svd(np.eye(size) - null_basis @ null_basis.T)[0][:, : size - null_basis.shape[1]]
+
+
+def _profiled_factor(matrix: F64Array, null_basis: F64Array, complement: F64Array) -> _Profiled:
+    """``_Profiled`` for M; raises LinAlgError when M is not positive definite."""
+    basis = np.hstack([null_basis, complement])
+    rotated = basis.T @ matrix @ basis
+    factor = np.linalg.cholesky(0.5 * (rotated + rotated.T))
+    inverse_factor = solve_triangular(factor, np.eye(factor.shape[0]), lower=True)
+    profiled = null_basis.shape[1]
+    trailing = inverse_factor[profiled:]
+    weight = basis @ (trailing.T @ trailing) @ basis.T
+    return _Profiled(
+        schur_log_determinant=2.0 * float(np.sum(np.log(np.diag(factor)[profiled:]))),
+        weight=weight,
+        inverse=basis @ (inverse_factor.T @ inverse_factor) @ basis.T,
+        rounding=_EPSILON * (matrix.shape[0] + 1) * float(np.linalg.norm(matrix)) * float(np.sum(trailing * trailing)),
+    )
 
 
 def _penalty_groups(prior: ScaleMixturePrior) -> list[I64Array]:
@@ -1251,6 +1284,7 @@ def _evidence(
     """
     penalty = _penalty_matrix(prior, log_smoothing)
     null_basis = prior.null_basis
+    complement = _null_complement(null_basis)
     # V's determinant terms move with x at first order: an inexact x-hat with decrement d moves V by up to
     # sqrt(c'(-H)^-1 c) sqrt(2 d) / 2, c their x-gradient. The inner tolerance tightens until that is below ``tolerance``.
     inner_tolerance = tolerance
@@ -1260,12 +1294,11 @@ def _evidence(
         coefficients, objective = _maximize_coefficients(prior, log_smoothing, coefficients, cavity, working_bytes, inner_tolerance)
         value, gradient, hessian = _penalized(prior, objective, log_smoothing, penalty, coefficients)
         try:
-            log_determinant, covariance = _cholesky_log_determinant_and_inverse(-hessian)
-            null_log_determinant, null_inverse = _cholesky_log_determinant_and_inverse(null_basis.T @ -hessian @ null_basis)
+            fixed = _profiled_factor(-hessian, null_basis, complement)
         except np.linalg.LinAlgError:
             return None
+        covariance, weight = fixed.inverse, fixed.weight
         newton_decrement = 0.5 * float(gradient @ covariance @ gradient)
-        weight = covariance - null_basis @ null_inverse @ null_basis.T
         curvature_gradient = _curvature_trace_gradient(prior, coefficients, cavity, weight, working_bytes)
         sensitivity = max(float(curvature_gradient @ covariance @ curvature_gradient), np.finfo(np.float64).tiny)
         rounding = _EPSILON * (objective.magnitude + abs(value))
@@ -1282,18 +1315,16 @@ def _evidence(
     total = _total_curvature(
         prior, coefficients, cavity, posterior_at(prior, coefficients), working_bytes, max(tolerance / coefficients.shape[0], _EPSILON)
     ) + penalty
-    total_null = null_basis.T @ total @ null_basis
     try:
-        total_log_determinant, total_covariance = _cholesky_log_determinant_and_inverse(total)
-        total_null_log_determinant, total_null_inverse = _cholesky_log_determinant_and_inverse(total_null)
+        profiled_total = _profiled_factor(total, null_basis, complement)
     except np.linalg.LinAlgError:
         return None
-    # V is certified to ``tolerance`` only where its determinants are resolved: a Cholesky factor of M is exact for
-    # M + E with ||E||_2 <= (n + 1) eps ||M||_2 (Demmel), which moves log|M| by at most ||E||_2 tr(M^-1). Where that
-    # exceeds the tolerance (B + S near-singular against its own scale), the point is not a certified maximum.
-    if tolerance > 0.0 and 0.5 * (_determinant_rounding(total, total_covariance) + _determinant_rounding(total_null, total_null_inverse)) > tolerance:
+    # V is certified to ``tolerance`` only where its determinant is resolved (``_Profiled.rounding``); where that
+    # bound exceeds the tolerance (B + S near-singular off the profiled space), the point is not a certified maximum.
+    if tolerance > 0.0 and 0.5 * profiled_total.rounding > tolerance:
         return None
-    evidence_value = value + 0.5 * penalty_log_determinant - 0.5 * total_log_determinant + 0.5 * total_null_log_determinant
+    total_covariance = profiled_total.inverse
+    evidence_value = value + 0.5 * penalty_log_determinant - 0.5 * profiled_total.schur_log_determinant
     # W = (-H)^-1 - N (N'(-H)N)^-1 N' carries both determinants' dependence on x (computed above).
     evidence_gradient = np.empty(len(prior.smoothing_blocks))
     effective_degrees = np.empty(len(prior.smoothing_blocks))
@@ -1312,7 +1343,8 @@ def _evidence(
         pull[coordinates] = lambda_weight * (block.factor.T @ residual)
         # dx/drho_i = -(-H)^-1 pull, so -1/2 d tr through x is +1/2 grad . (-H)^-1 pull; N' S_i N = 0.
         responses[:, position] = -(covariance @ pull)
-        effective_degrees[position] = lambda_weight * float(np.sum(total_covariance[np.ix_(coordinates, coordinates)] * block.matrix))
+        # N' S_i = 0, so tr((B + S)^-1 S_i) = tr(W_B S_i), which the profiled factor resolves.
+        effective_degrees[position] = lambda_weight * float(np.sum(profiled_total.weight[np.ix_(coordinates, coordinates)] * block.matrix))
         penalty_sizes[position] = lambda_weight * float(residual @ residual)
         evidence_gradient[position] = (
             -0.5 * lambda_weight * float(residual @ residual)
@@ -1628,10 +1660,11 @@ def _stationarity_check(
     alone takes a quarter of it over the n interior weights, 1/2 E^2 / s = tolerance / (4 n):
     e = (2 tolerance / (n 3^(4/3)))^(3/4) s^(1/4).
 
-    The inner maxima of the penalized objective are not unique, so each side continues the base's own: it starts
-    from the first-order predictor x + (dx/drho) (+-h). The difference at h/2 must agree with the one at h within
-    their two error bounds; otherwise a side reached another inner maximum (V there is a different function of
-    rho), and the step halves, as it does while a side has no certified maximum.
+    The inner maxima of the penalized objective are not unique, so each side restarts from the base's x (not from
+    the first-order predictor, which along a direction the data barely curve extrapolates far past the basin). The
+    difference at h/2 must agree with the one at h within their two error bounds; otherwise a side reached another
+    inner maximum (V there is a different function of rho), and the step halves, as it does while a side has no
+    certified maximum.
     """
     gradient = np.zeros(weights.shape[0])
     rounding = _EPSILON * evidence.magnitude
@@ -1656,8 +1689,7 @@ def _stationarity_check(
             for length in (step, 0.5 * step):
                 both = [
                     _evidence(
-                        view, weights + side * length * unit, evidence.coefficients + side * length * evidence.responses[:, position], cavity,
-                        posterior_at, working_bytes, accuracy,
+                        view, weights + side * length * unit, evidence.coefficients, cavity, posterior_at, working_bytes, accuracy,
                     )
                     for side in (-1.0, 1.0)
                 ]
@@ -1718,7 +1750,7 @@ def hyper_step(
         while step_length * float(np.max(np.abs(direction))) > _HALF_PRECISION * (1.0 + float(np.max(np.abs(weights)))):
             trial_weights = np.clip(weights + step_length * direction, lower, upper)
             trial = _certified_evidence(
-                final_view, trial_weights, evidence.coefficients + evidence.responses @ (trial_weights - weights), cavity, posterior_at, working_bytes,
+                final_view, trial_weights, evidence.coefficients, cavity, posterior_at, working_bytes,
                 tolerance, final_allowed.T @ initial_hyperparameters(prior).coefficients,
             )
             if trial is not None and trial.value > evidence.value:
