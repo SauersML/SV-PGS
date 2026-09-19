@@ -60,7 +60,7 @@ def build_parser() -> argparse.ArgumentParser:
         "census-all-of-us-traits",
         help=(
             "Count participants and rows per trait, matched concept and unit label across every built-in "
-            "trait (cells under 20 participants suppressed): the first query to run on a new CDR."
+            "trait (counts of 1-20 participants suppressed): the first query to run on a new CDR."
         ),
     )
     census_parser.add_argument("--output", required=True, help="Output TSV path for the census.")

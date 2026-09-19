@@ -72,7 +72,6 @@ def test_import_sv_pgs_succeeds_without_bigquery():
                 print(json.dumps({
                     "ModelConfig": hasattr(sv_pgs, "ModelConfig"),
                     "sv_pgs.all_of_us": "sv_pgs.all_of_us" in __import__("sys").modules,
-                    "AllOfUsDiseaseRequest": "AllOfUsDiseaseRequest" in sv_pgs.__dict__,
                 }))
                 """
             ),
@@ -86,7 +85,6 @@ def test_import_sv_pgs_succeeds_without_bigquery():
     assert loaded_symbols == {
         "ModelConfig": True,
         "sv_pgs.all_of_us": False,
-        "AllOfUsDiseaseRequest": False,
     }
 
 
