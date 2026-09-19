@@ -199,9 +199,6 @@ def _log_occasion_density(residuals: F64Array, points: F64Array, log_masses: F64
 
 
 # The level integrals certified: of F, |T| F and T^2 F (L_i and the two moments' absolute integrals).
-_MOMENT_POWERS = np.arange(3)
-
-
 def _log_prior_tail_moments(distance: F64Array, level_variance: float) -> F64Array:
     """log of the integral of |T|^m N(T; 0, tau^2) over |T| > distance, one side, for m = 0, 1, 2 (persons x 3):
     Phi(-a), tau phi(a) and tau^2 (a phi(a) + Phi(-a)) with a = distance / tau >= 0."""
@@ -233,8 +230,10 @@ class PieceTooLarge(MemoryError):
 
 def _log_moment_sums(log_integrand: F64Array, levels: F64Array, steps: F64Array, offset: float) -> F64Array:
     """log of h sum_n (|T_n| + offset)^m exp(log_integrand) for m = 0, 1, 2 (persons x 3)."""
-    log_magnitude = np.log(np.abs(levels) + offset)
-    return logsumexp(log_integrand[:, :, None] + _MOMENT_POWERS[None, None, :] * log_magnitude[:, :, None], axis=1) + np.log(steps)[:, None]
+    with np.errstate(divide="ignore"):  # the node at T = 0 has |T|^m = 0 for m > 0
+        log_magnitude = np.log(np.abs(levels) + offset)
+    log_powers = np.stack([np.zeros_like(log_magnitude), log_magnitude, 2.0 * log_magnitude], axis=2)
+    return logsumexp(log_integrand[:, :, None] + log_powers, axis=1) + np.log(steps)[:, None]
 
 
 def _level_grid(
@@ -244,10 +243,12 @@ def _level_grid(
     """Trapezoid nodes on each person's grid n h_p (persons x nodes, a validity mask) and the log integrals of
     |T|^m F, m = 0, 1, 2 (persons x 3).
 
-    Each side starts one prior standard deviation past 0 and doubles until every one of its tail bounds
-    (``_log_tail``) is at most a quarter of relative_tolerance times its integral so far.
+    Each side starts sqrt(2) tau past 0, the mode of T^2 N(T; 0, tau^2), so that every |T|^m N(T; 0, tau^2)
+    decreases past either edge and the trapezoid terms beyond it sum to at most its tail integral; it doubles
+    until every one of its tail bounds (``_log_tail``) is at most a quarter of relative_tolerance times its
+    integral so far.
     """
-    reach = np.ceil(np.sqrt(level_variance) / steps)
+    reach = np.ceil(np.sqrt(2.0 * level_variance) / steps)
     lower, upper = -reach, reach.copy()
     while True:
         counts = (upper - lower).astype(np.int64) + 1

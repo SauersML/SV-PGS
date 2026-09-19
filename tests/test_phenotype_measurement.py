@@ -1,26 +1,23 @@
-"""phenotype_measurement: the per-occasion EP-EB model's exact limits, its evidence and its gross errors.
-
-The limits are exact: with one occasion a person's EP site is the exact tilted moment, so q(T_i) is the
-exact posterior; with a one-point noise density every site is exact, so q(T_i) is the dense Henderson
-solution and the evidence is the Gaussian marginal likelihood. The simulations check the algebra (sim-only).
-"""
+"""phenotype_measurement: the exact level quadrature against brute force and closed forms, Louis' information,
+the evidence, and gross errors. The simulations check the algebra ([sim-only])."""
 from __future__ import annotations
 
 import numpy as np
 import pytest
 from scipy import integrate
+from scipy.special import logsumexp
 from scipy.stats import multivariate_normal, norm
 
 from sv_pgs.phenotype_measurement import (
-    LEVEL_MOVE_TOLERANCE,
     Occasions,
-    _prior_on,
+    _density_prior,
     box_cox,
-    ep_fixed_point,
     fit_at_exponent,
-    fit_occasion_model,
+    level_posterior,
+    level_posterior_at,
+    person_tolerance,
 )
-from sv_pgs.scale_mixture_ep import MixtureHyperparameters, ScaleMixturePrior, class_log_density, derived_lattice
+from sv_pgs.scale_mixture_ep import MixtureHyperparameters, ScaleMixturePrior, class_log_density
 from tests.phenotype_bounds import rounding_gamma, sampling_bound, variance_component_standard_errors
 
 WORKING_BYTES = 1 << 28
@@ -28,10 +25,9 @@ WORKING_BYTES = 1 << 28
 _ABSENT = -2.0 * np.log(1.0 / np.finfo(np.float64).eps)
 
 
-def _lattice(residuals: np.ndarray, level_variance: float) -> ScaleMixturePrior:
-    precision = np.full(residuals.shape[0], 1.0 / level_variance)
-    nodes, floor, top = derived_lattice(precision, residuals * precision, np.zeros(residuals.shape[0]), 0.5)
-    return _prior_on(nodes, floor, top, residuals.shape[0])
+def _lattice(floor_variance: float, top_variance: float, count: int, occasions: int) -> ScaleMixturePrior:
+    nodes = np.linspace(np.log(floor_variance), np.log(top_variance), count)
+    return _density_prior(nodes, float(nodes[-1]), occasions)
 
 
 def _density(prior: ScaleMixturePrior, masses: dict[int, float]) -> MixtureHyperparameters:
@@ -39,26 +35,44 @@ def _density(prior: ScaleMixturePrior, masses: dict[int, float]) -> MixtureHyper
     log_density = np.full(prior.grid_size, _ABSENT)
     for node, mass in masses.items():
         log_density[node] = np.log(mass)
-    coefficients = np.linalg.lstsq(prior.coefficient_map, log_density - log_density.mean(), rcond=None)[0]
+    mapping = prior.coefficient_map[: prior.grid_size]
+    coefficients = np.linalg.lstsq(mapping, log_density - log_density.mean(), rcond=None)[0]
     return MixtureHyperparameters(coefficients=coefficients, log_smoothing=np.zeros(len(prior.smoothing_blocks)))
 
 
-def _kernel_node(prior: ScaleMixturePrior, log_variance: float) -> int:
-    nodes = prior.log_variance_grid
-    kernel = np.flatnonzero(nodes >= prior.kernel_floor)
-    return int(kernel[np.argmin(np.abs(nodes[kernel] - log_variance))])
+def _node(prior: ScaleMixturePrior, variance: float) -> int:
+    return int(np.argmin(np.abs(prior.log_variance_grid - np.log(variance))))
 
 
-def _simulated(persons: int, level_variance: float, noise: float, seed: int, gross_share: float = 0.0):
-    generator = np.random.default_rng(seed)
-    counts = generator.integers(1, 6, persons)
-    person_index = np.repeat(np.arange(persons), counts)
-    ages = generator.uniform(20.0, 80.0, person_index.shape[0])
-    levels = generator.normal(0.0, np.sqrt(level_variance), persons)
-    values = 50.0 + 0.05 * (ages - 50.0) + levels[person_index] + generator.normal(0.0, np.sqrt(noise), person_index.shape[0])
-    gross = generator.random(values.shape[0]) < gross_share
-    design = np.column_stack([np.ones_like(ages), ages - ages.mean()])
-    return person_index, values, np.where(gross, 10.0 * values, values), design, gross, levels
+def _brute(residuals: np.ndarray, level_variance: float, masses: np.ndarray, variances: np.ndarray):
+    """(log L, E[T], E[T^2]) by adaptive quadrature, and its own estimate of each moment's error."""
+
+    def integrand(level: float, power: int) -> float:
+        log_occasions = [logsumexp(np.log(masses) + norm.logpdf(residual - level, scale=np.sqrt(variances))) for residual in residuals]
+        return level**power * float(np.exp(norm.logpdf(level, scale=np.sqrt(level_variance)) + np.sum(log_occasions)))
+
+    span = 12.0 * np.sqrt(level_variance + variances.max())
+    results = [
+        integrate.quad(integrand, residuals.min() - span, residuals.max() + span, args=(power,), points=list(residuals), limit=1000,
+                       epsabs=0.0, epsrel=1e-13)
+        for power in (0, 1, 2)
+    ]
+    (total, first, second), (total_error, first_error, second_error) = zip(*results)
+    mean = first / total
+    return (
+        np.log(total), mean, second / total,
+        np.array([total_error / total, (first_error + abs(mean) * total_error) / total, (second_error + second / total * total_error) / total]),
+    )
+
+
+def _moment_errors(tolerance: float, mean, second):
+    """Bounds on the errors of E[T], E[T^2] and Var(T) when L, the integral of |T| F and that of T^2 F each have
+    relative error at most ``tolerance``: E|T| <= |E T| + sd, and a ratio (I + d) / (L + e) moves by at most
+    tolerance (|I| / L + |I| / L) / (1 - tolerance)."""
+    scale = abs(mean) + np.sqrt(second - mean * mean)
+    first_error = 2.0 * tolerance / (1.0 - tolerance) * scale
+    second_error = 2.0 * tolerance / (1.0 - tolerance) * second
+    return first_error, second_error, second_error + (2.0 * abs(mean) + first_error) * first_error
 
 
 def test_box_cox_is_increasing_with_an_exact_log_jacobian():
@@ -72,86 +86,135 @@ def test_box_cox_is_increasing_with_an_exact_log_jacobian():
     np.testing.assert_array_equal(box_cox(values, 0.0)[0], np.log(values))
 
 
-def test_one_occasion_people_get_the_exact_posterior_of_their_level():
-    generator = np.random.default_rng(1)
-    persons, level_variance = 200, 4.0
-    values = 50.0 + generator.normal(0.0, 2.0, persons) + generator.standard_t(3, persons)
-    design = np.ones((persons, 1))
-    occasions = Occasions(person_index=np.arange(persons), values=values, design=design)
-    fixed_effects = np.array([np.mean(values) - 1.0])
-    residuals = values - 1.0 - fixed_effects[0]
-    prior = _lattice(residuals, level_variance)
-    small, large = _kernel_node(prior, 0.0), _kernel_node(prior, np.log(100.0))
-    hyperparameters = _density(prior, {small: 0.9, large: 0.1})
-    fit = ep_fixed_point(occasions, 1.0, fixed_effects, level_variance, prior, hyperparameters, WORKING_BYTES)
-
+@pytest.mark.parametrize(
+    "residuals",
+    [
+        [1.3, 48.0],  # one gross reading
+        [3.0, 3.0],  # a duplicated pair: the integrand spikes at the shared value
+        [0.4, -1.1, 2.0, 3.0, 3.0, 55.0],  # six occasions with a duplicate and a gross reading
+    ],
+)
+def test_the_certified_quadrature_matches_brute_force(residuals):
+    prior = _lattice(1.0 / 12.0, 5000.0, 40, 2)
+    hyperparameters = _density(prior, {_node(prior, 1.0): 0.9, _node(prior, 1.0 / 12.0): 0.05, _node(prior, 2500.0): 0.05})
     masses = np.exp(class_log_density(prior, hyperparameters.coefficients)[0])
     variances = np.exp(prior.log_variance_grid)
-    # T | r is the mixture over nodes k of N(r tau^2 / (tau^2 + s_k), tau^2 s_k / (tau^2 + s_k)) with weights
-    # proportional to pi_k N(r; 0, tau^2 + s_k).
-    log_weights = np.log(masses)[None, :] + norm.logpdf(residuals[:, None], scale=np.sqrt(level_variance + variances)[None, :])
-    weights = np.exp(log_weights - log_weights.max(axis=1, keepdims=True))
-    weights /= weights.sum(axis=1, keepdims=True)
-    component_mean = residuals[:, None] * level_variance / (level_variance + variances)[None, :]
-    component_variance = (level_variance * variances / (level_variance + variances))[None, :]
-    mean = np.sum(weights * component_mean, axis=1)
-    variance = np.sum(weights * (component_variance + np.square(component_mean)), axis=1) - np.square(mean)
-    # Both sides sum K weighted terms after exponentials; the engine's tilted moment then subtracts from r.
-    operations = 4 * prior.grid_size + 16
-    np.testing.assert_allclose(fit.level_mean, mean, rtol=0.0, atol=2.0 * rounding_gamma(operations) * (np.abs(residuals) + np.abs(mean)))
-    np.testing.assert_allclose(fit.level_posterior_variance, variance, rtol=0.0,
-                               atol=2.0 * rounding_gamma(operations) * (np.square(residuals) + level_variance))
+    level_variance, tolerance = 4.0, person_tolerance(50_000)
+    residual_array = np.array([residuals])
+    posterior = level_posterior(residual_array, level_variance, np.log(masses), variances, tolerance, None, True, WORKING_BYTES)
+    log_likelihood, mean, second, brute_error = _brute(residual_array[0], level_variance, masses, variances)
+    first_error, second_error, _variance_error = _moment_errors(tolerance, mean, second)
+    # The certificate bounds L's relative error by the tolerance; the brute force adds its own error estimate.
+    assert abs(posterior.log_likelihood[0] - log_likelihood) <= -np.log1p(-tolerance) + brute_error[0]
+    assert abs(posterior.level_mean[0] - mean) <= first_error + brute_error[1]
+    assert abs(posterior.level_second_moment[0] - second) <= second_error + brute_error[2]
 
 
 def test_a_one_point_noise_density_gives_the_dense_henderson_solution_and_evidence():
-    person_index, values, _gross_values, design, _gross, _levels = _simulated(40, 4.0, 1.0, seed=2)
+    generator = np.random.default_rng(2)
+    counts = generator.integers(1, 6, 40)
+    person_index = np.repeat(np.arange(40), counts)
+    values = np.round(50.0 + generator.normal(0.0, 2.0, 40)[person_index] + generator.normal(0.0, 1.0, person_index.shape[0]), 1)
+    design = np.ones((values.shape[0], 1))
     occasions = Occasions(person_index=person_index, values=values, design=design)
     level_variance = 4.0
-    fixed_effects = np.linalg.lstsq(design, values - 1.0, rcond=None)[0]
-    residuals = values - 1.0 - design @ fixed_effects
-    prior = _lattice(residuals, level_variance)
-    node = _kernel_node(prior, 0.0)
+    fixed_effects = np.array([np.mean(values) - 1.0])
+    prior = _lattice(0.1**2 / 12.0, 100.0, 50, values.shape[0])
+    node = _node(prior, 1.0)
     noise = float(np.exp(prior.log_variance_grid[node]))
-    fit = ep_fixed_point(occasions, 1.0, fixed_effects, level_variance, prior, _density(prior, {node: 1.0}), WORKING_BYTES)
+    fit = level_posterior_at(occasions, 1.0, fixed_effects, level_variance, prior, _density(prior, {node: 1.0}), WORKING_BYTES)
 
-    counts = np.bincount(person_index).astype(np.float64)
+    residuals = values - 1.0 - fixed_effects[0]
     precision = 1.0 / level_variance + counts / noise
     mean = np.bincount(person_index, weights=residuals) / noise / precision
-    # Exact Gaussian sites after one pass; each person's mean is a sum over its k occasions.
-    operations = 4 * prior.grid_size + 8 * int(counts.max()) + 16
-    np.testing.assert_allclose(fit.level_mean, mean, rtol=0.0, atol=2.0 * rounding_gamma(operations) * (np.max(np.abs(residuals)) + np.abs(mean)))
-    np.testing.assert_allclose(fit.level_posterior_variance, 1.0 / precision, rtol=2.0 * rounding_gamma(operations))
+    first_error, _second_error, variance_error = _moment_errors(person_tolerance(40), mean, np.square(mean) + 1.0 / precision)
+    np.testing.assert_array_less(np.abs(fit.level_mean - mean), first_error)
+    np.testing.assert_array_less(np.abs(fit.level_posterior_variance - 1.0 / precision), variance_error)
     evidence = sum(
         multivariate_normal(mean=np.zeros(int(count)), cov=noise * np.eye(int(count)) + level_variance).logpdf(residuals[person_index == person])
         for person, count in enumerate(counts)
     )
-    assert fit.log_evidence == pytest.approx(evidence, rel=2.0 * rounding_gamma(operations) * values.shape[0])
+    # Each person's L to relative error 1 - e^(-1/(2n)), so the sum to 1/2 nat.
+    assert abs(fit.log_likelihood - evidence) <= 0.5 + 2.0 * rounding_gamma(8) * abs(evidence)
 
 
-def test_the_evidence_is_a_density_over_the_reading_at_the_log_transform():
-    level_variance, fixed_effects = 0.25, np.array([np.log(80.0)])
-    design = np.ones((1, 1))
-    lattice_residuals = np.linspace(-1.5, 1.5, 7)
-    prior = _lattice(lattice_residuals, level_variance)
-    hyperparameters = _density(prior, {_kernel_node(prior, np.log(0.04)): 0.8, _kernel_node(prior, np.log(1.0)): 0.2})
-    one_prior = _prior_on(prior.log_variance_grid, prior.kernel_floor, prior.kernel_top, 1)
+def test_the_likelihood_is_a_density_over_the_reading_at_the_log_transform():
+    prior = _lattice(0.001, 4.0, 40, 1)
+    hyperparameters = _density(prior, {_node(prior, 0.04): 0.8, _node(prior, 1.0): 0.2})
+    masses = np.exp(class_log_density(prior, hyperparameters.coefficients)[0])
+    variances = np.exp(prior.log_variance_grid)
+    level_variance, centre, tolerance = 0.25, float(np.log(80.0)), person_tolerance(1)
 
     def density(log_reading: float) -> float:
-        occasion = Occasions(person_index=np.zeros(1, dtype=np.int64), values=np.array([np.exp(log_reading)]), design=design)
-        fit = ep_fixed_point(occasion, 0.0, fixed_effects, level_variance, one_prior, hyperparameters, WORKING_BYTES)
-        return float(np.exp(fit.log_evidence + log_reading))  # dy = y d(log y)
+        posterior = level_posterior(np.array([[log_reading - centre]]), level_variance, np.log(masses), variances, tolerance, None, False, WORKING_BYTES)
+        return float(np.exp(posterior.log_likelihood[0]))  # the density of log y; its Jacobian dy = y d(log y) cancels
 
     total, error = integrate.quad(density, -np.inf, np.inf)
-    assert abs(total - 1.0) <= error + 2.0 * rounding_gamma(4 * prior.grid_size + 16)
+    assert abs(total - 1.0) <= tolerance + error
 
 
-def test_the_fit_is_an_ep_fixed_point_and_recovers_gaussian_data_within_sampling_error():
+def test_louis_information_is_the_curvature_of_the_exact_log_likelihood():
+    generator = np.random.default_rng(6)
+    residuals = np.column_stack([generator.normal(0.0, 2.0, 30)] * 3) + generator.standard_t(3, (30, 3))
+    prior = _lattice(0.05, 400.0, 12, 90)
+    base = _density(prior, {node: 1.0 / prior.grid_size for node in range(prior.grid_size)}).coefficients
+    variances = np.exp(prior.log_variance_grid)
+    tolerance = person_tolerance(30)
+    mapping = prior.coefficient_map[: prior.grid_size]
+
+    def log_likelihood(coefficients: np.ndarray) -> float:
+        log_masses = class_log_density(prior, coefficients)[0]
+        return float(level_posterior(residuals, 4.0, log_masses, variances, tolerance, steps, False, WORKING_BYTES).log_likelihood.sum())
+
+    log_masses = class_log_density(prior, base)[0]
+    # Half the admissible steps stay certified at the nearby densities of the differences, so every likelihood
+    # below is one trapezoid rule, a finite mixture over the nodes, for which Louis' identity is exact.
+    steps = 0.5 * level_posterior(residuals, 4.0, log_masses, variances, tolerance, None, False, WORKING_BYTES).admissible_step
+    posterior = level_posterior(residuals, 4.0, log_masses, variances, tolerance, steps, True, WORKING_BYTES)
+    masses = np.exp(log_masses)
+    louis = mapping.T @ (posterior.counts.sum() * (np.diag(masses) - np.outer(masses, masses)) - posterior.missing_information) @ mapping
+
+    def central(step: float) -> np.ndarray:
+        size = base.shape[0]
+        hessian = np.empty((size, size))
+        for row in range(size):
+            for column in range(size):
+                shift_row, shift_column = np.eye(size)[row] * step, np.eye(size)[column] * step
+                hessian[row, column] = (
+                    log_likelihood(base + shift_row + shift_column) - log_likelihood(base + shift_row - shift_column)
+                    - log_likelihood(base - shift_row + shift_column) + log_likelihood(base - shift_row - shift_column)
+                ) / (4.0 * step * step)
+        return hessian
+
+    # Richardson: a central difference's error is O(h^2), so |D(h) - D(h/2)| 4/3 estimates D(h/2)'s; each of its
+    # four log-likelihoods rounds by at most gamma_n sum_i |l_i|, with the 4 (K + J) operations of a node's sum
+    # (an exp, a log, an add and a product per term), and the difference divides that by h^2.
+    step = float(np.finfo(np.float64).eps ** 0.25)
+    coarse, fine = central(step), central(0.5 * step)
+    rounding = rounding_gamma(4 * (prior.grid_size + residuals.shape[1])) * float(np.abs(posterior.log_likelihood).sum())
+    estimate = 4.0 / 3.0 * np.abs(coarse - fine) + 4.0 * rounding / (4.0 * (0.5 * step) ** 2)
+    np.testing.assert_array_less(np.abs(-louis - fine), estimate + 2.0 * rounding_gamma(16) * np.abs(louis))
+
+
+def _simulated(persons: int, level_variance: float, noise: float, seed: int, gross_share: float = 0.0):
+    """Readings at 0.1 resolution around an age trend, and a copy with a share of them grossly wrong: half with
+    an extra digit (x 10), half in mmol/L recorded as mg/dL (/ 18.016, glucose's molar mass over 10)."""
+    generator = np.random.default_rng(seed)
+    counts = generator.integers(1, 6, persons)
+    person_index = np.repeat(np.arange(persons), counts)
+    ages = generator.uniform(20.0, 80.0, person_index.shape[0])
+    levels = generator.normal(0.0, np.sqrt(level_variance), persons)
+    values = np.round(50.0 + 0.05 * (ages - 50.0) + levels[person_index] + generator.normal(0.0, np.sqrt(noise), person_index.shape[0]), 1)
+    gross = generator.random(values.shape[0]) < gross_share
+    factor = np.where(generator.random(values.shape[0]) < 0.5, 10.0, 1.0 / 18.016)
+    design = np.column_stack([np.ones_like(ages), ages - ages.mean()])
+    return person_index, values, np.where(gross, np.round(values * factor, 1), values), design, gross
+
+
+def test_the_fit_recovers_gaussian_data_within_sampling_error():
     level_variance, noise = 4.0, 1.0
-    person_index, values, _gross_values, design, _gross, levels = _simulated(400, level_variance, noise, seed=3)
-    occasions = Occasions(person_index=person_index, values=values, design=design)
-    fit = fit_at_exponent(occasions, 1.0, WORKING_BYTES)
-    again = ep_fixed_point(occasions, 1.0, fit.fixed_effects, fit.level_variance, fit.prior, fit.hyperparameters, WORKING_BYTES)
-    assert float(np.sum(np.square(again.level_mean - fit.level_mean) / again.level_posterior_variance)) < LEVEL_MOVE_TOLERANCE
+    person_index, values, _gross_values, design, _gross = _simulated(300, level_variance, noise, seed=3)
+    fit = fit_at_exponent(Occasions(person_index=person_index, values=values, design=design), 1.0, WORKING_BYTES)
     # Maximum likelihood is efficient, so the Henderson III moment estimators' standard errors bound its own.
     between_error, within_error = variance_component_standard_errors(np.bincount(person_index), level_variance, noise)
     assert abs(fit.level_variance - level_variance) < sampling_bound(between_error)
@@ -159,20 +222,28 @@ def test_the_fit_is_an_ep_fixed_point_and_recovers_gaussian_data_within_sampling
 
 
 def test_gross_errors_are_downweighted_by_the_learned_density():
-    # At one transform, so the levels of the two fits share a scale.
-    person_index, values, gross_values, design, gross, _levels = _simulated(400, 4.0, 1.0, seed=4, gross_share=0.03)
+    # At one transform, so every fit's levels share a scale.
+    person_index, values, gross_values, design, gross = _simulated(300, 4.0, 1.0, seed=4, gross_share=0.04)
     clean = fit_at_exponent(Occasions(person_index=person_index, values=values, design=design), 1.0, WORKING_BYTES)
-    contaminated_occasions = Occasions(person_index=person_index, values=gross_values, design=design)
-    contaminated = fit_at_exponent(contaminated_occasions, 1.0, WORKING_BYTES)
+    occasions = Occasions(person_index=person_index, values=gross_values, design=design)
+    contaminated = fit_at_exponent(occasions, 1.0, WORKING_BYTES)
     affected = np.unique(person_index[gross])
     assert affected.shape[0] > 0
-    sd = np.sqrt(contaminated.level_posterior_variance[affected])
-    # The learned density moves an affected person's level by less than that person's posterior sd ...
-    assert np.all(np.abs(contaminated.level_mean[affected] - clean.level_mean[affected]) < sd)
-    # ... where Gaussian noise of the same second moment moves every one of them by more.
-    prior = contaminated.prior
-    gaussian = ep_fixed_point(
-        contaminated_occasions, 1.0, contaminated.fixed_effects, contaminated.level_variance, prior,
-        _density(prior, {_kernel_node(prior, np.log(contaminated.noise_second_moment)): 1.0}), WORKING_BYTES,
+
+    # The oracle drops the gross readings and keeps the clean fit: a person left with none is at the prior.
+    kept = ~gross
+    remaining = np.unique(person_index[kept])
+    oracle_mean, oracle_sd = np.zeros(person_index.max() + 1), np.full(person_index.max() + 1, np.sqrt(clean.level_variance))
+    oracle = level_posterior_at(
+        Occasions(person_index=np.searchsorted(remaining, person_index[kept]), values=values[kept], design=design[kept]),
+        1.0, clean.fixed_effects, clean.level_variance, clean.prior, clean.hyperparameters, WORKING_BYTES,
     )
-    assert np.all(np.abs(gaussian.level_mean[affected] - clean.level_mean[affected]) > sd)
+    oracle_mean[remaining], oracle_sd[remaining] = oracle.level_mean, np.sqrt(oracle.level_posterior_variance)
+    # Each gross reading moves its person's level by less than one posterior sd from the oracle's ...
+    np.testing.assert_array_less(np.abs(contaminated.level_mean[affected] - oracle_mean[affected]), oracle_sd[affected])
+    # ... where Gaussian noise at the clean noise variance moves every one of them by more.
+    gaussian = level_posterior_at(
+        occasions, 1.0, clean.fixed_effects, clean.level_variance, contaminated.prior,
+        _density(contaminated.prior, {_node(contaminated.prior, clean.noise_second_moment): 1.0}), WORKING_BYTES,
+    )
+    np.testing.assert_array_less(oracle_sd[affected], np.abs(gaussian.level_mean[affected] - oracle_mean[affected]))
