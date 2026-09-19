@@ -17,7 +17,7 @@ def test_a_split_locus_carries_its_summed_frequency_on_every_rare_record():
 
 
 def test_ewens_theta_is_the_float_root_of_the_expected_allele_count():
-    haplotypes = 25_108
+    haplotypes = 2_072  # the public bench-sim panel's haplotype count
 
     def expected(theta):
         return 1.0 + theta * (digamma(theta + haplotypes) - digamma(theta + 1.0))
