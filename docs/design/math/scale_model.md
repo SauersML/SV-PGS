@@ -213,7 +213,7 @@ $$\sum_j\Big[q_j^\top\eta-\tfrac{\kappa}{2}H_j\,\mathbb E[a_j^2]-A_{H_j}(\eta,\k
   $A_H$ is a log-partition function, hence convex, so the objective is jointly concave in $(\eta,\kappa)$.
   - Numerically: over 50 random points, the largest non-null Hessian eigenvalue divided by the most negative is −3.2·10⁻⁵, so every non-null eigenvalue is negative.
   - The κ stationarity is moment matching: $\sum_jH_j\mathbb E_{\rm post}[a_j^2]=\sum_jH_j\mathbb E_{\rm prior}[a^2\mid H_j]$.
-  - It is **not** concave in the variance-map coordinates, so the engine should update in these ones.
+  - Concavity is established in these coordinates only (nothing was checked in the variance-map coordinates), so the engine should do its update in them.
 
 **Identification against the r̂² offset.** The offset is fixed at 1 and $H^{\rm loc}$ is fixed at 1, so κ, $n$ and $w$ are identified from the within-class variation of $H^{\rm sel}$ and from the ceiling's shape signature.
 - An AF-dependent miscalibration of r̂², $\log\hat r^2=\log r^2+\delta(p)$, is still absorbed by the frequency term. The reliability model's AF calibration on truth is what separates them.
