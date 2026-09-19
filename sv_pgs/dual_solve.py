@@ -1118,17 +1118,19 @@ class DualGaussian:
         """The products the cavity certificate needs for variant-side probes v (p x k), at the last iterate's sites.
 
         With u = Xt D_S v, t = Z_L'u and w = K_S^-1 u - Z_L core^-1 (t - v_L) (K_S = S_S, the bulk
-        operator), returns (Xt'w (p x k), t (|L| x k), the exact residual norms ||u - K_S y|| of the
-        bulk solve (k,)); the solve runs to `residual_tolerance`, a sample-side residual bound
-        (marginal_variances' information_solve_tolerance). w is minus the dual posterior_solve forms
-        for the shift v, before D_S v_S is added. Two reads plus the CG passes.
+        operator), returns (Xt'w (p x k), t (|L| x k), the exact relative residuals ||u - K_S y|| / ||u||
+        of the bulk solve (k,)). The solve runs to `residual_tolerance`, a relative bound on that
+        residual (marginal_variances' information_solve_tolerance), applied to each column's own u.
+        w is minus the dual posterior_solve forms for the shift v, before D_S v_S is added. Two reads
+        plus the CG passes.
         """
         array_module = self.array_module
         state = self._state
         models = state["models"]
         values, _bulk_values, resolved, column_models, image = self._bulk_image(probes, model)
         columns = int(values.shape[1])
-        bound = array_module.broadcast_to(array_module.asarray(residual_tolerance, dtype=array_module.float64), (columns,)).copy()
+        image_norms = array_module.linalg.norm(image, axis=0)
+        bound = array_module.broadcast_to(array_module.asarray(residual_tolerance, dtype=array_module.float64), (columns,)) * image_norms
         spike_free = Deflation({}, {}, {}, self._resolved)
         result = certified_block_cg(self.source, models, image, array_module.zeros_like(image), column_models, bound, self.count, deflation=spike_free, label="information")
         block = state["blocks"].get(model)
@@ -1142,7 +1144,7 @@ class DualGaussian:
         for start, stop, tile in self.source.blocks():
             back_products[start:stop] = tile.rmatmat(left)
         self.count.note(columns, 0.0, "information-products")
-        return back_products, coupling, result.residual_norm
+        return back_products, coupling, result.residual_norm / array_module.maximum(image_norms, np.finfo(np.float64).tiny)
 
     def posterior_solve(self, right: Any, model: int, error_bound: Any) -> Any:
         """A_m^-1 right (p x r) at the last iterate's sites, each column certified to ||x_hat - x||_A <= error_bound.

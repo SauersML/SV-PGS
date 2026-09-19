@@ -551,7 +551,7 @@ def test_information_solve_gives_the_bulk_back_products_and_coupling() -> None:
         coupling = resolved_duals.T @ image
         w = inverse_image - resolved_duals @ np.linalg.solve(core, coupling - probes[resolved]) if resolved.size else inverse_image
         expected = design.T @ w
-        tolerance = np.sqrt(EPS) * np.linalg.norm(image, axis=0)
+        tolerance = np.sqrt(EPS)
         back_products, resolved_coupling, residual_norm = gaussian.information_solve(probes, model, tolerance)
         assert np.all(residual_norm <= tolerance)
         conditioning = np.linalg.cond(kernel) * (np.linalg.cond(core) if resolved.size else 1.0)
