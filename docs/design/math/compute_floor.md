@@ -237,13 +237,14 @@ The counting model predicts the raw kernels; the gap is in the path around them.
 
 ### 9.4 What the gap depends on (verify before closing)
 1. **The production outer contraction ρ,** rows 1 and 3: **not yet measured.** The first measurement (§10.1–10.3) was withdrawn: it linearized at the true prior, which is not the fixed point.
-2. **Cut coupling of the real partition,** row 8: **measured, §10.4.** γ = 0.40–0.76, and block-variance cavities are p99 28–58% off, so the variances need cross-block correction.
+2. **Cut coupling of the real partition,** row 8: **measured, §10.4** (v7 cohort). γ = 0.36–0.63, and block-variance cavities are p99 25–54% off, so the variances need cross-block correction.
 3. **The variance reduction of the draw control variate,** row 6.
 4. **GCS staging throughput** on a2-highgpu-8g and a3, row 14.
 
 ## 10. Measured: the outer contraction and the cut coupling [semi-real]
 
-**Data.** bench-sim's chr22 real-haplotype mosaic cohort: 50,000 people assembled from 1kGP haplotypes, 590,623 variants including SVs. The true genotypes are used, so there is no imputation error.
+**Data.** bench-sim's **v7** chr22 real-haplotype mosaic cohort (`bench-sim/v7/cohort/chr22`; group weights from the public 1kGP founder composition, PREREG amendment 7; generator lane/bench-sim-weights 3fa9577, built 2026-09-19T15:58Z). It has 50,000 people assembled from 1kGP haplotypes and 590,623 variants including SVs. The true genotypes are used, so there is no imputation error.
+- The first versions of §10.1–10.5 used bench-sim's first cohort, whose group weights were withdrawn (`bench-sim/WITHDRAWN_WEIGHTS.txt`). Every chr22-cohort number below is re-measured on v7. The withdrawn §10.1–10.3 table is kept only as the record of what was withdrawn.
 - Effects are drawn from a known continuous scale mixture (a log-normal bulk plus 3% at 100× the variance), in the reference's own parametrization.
 - So the LD and frequencies are real and the effects simulated: **[semi-real]**.
 - Scripts and raw output are in `/scratch.global/sauer354/svpgs-team/speed-floor/` (`rho_measure.py`, `rho_analyze.py`, `cut_coupling3.py`, and the `*.json` / `curvatures_*.npz` files).
@@ -278,35 +279,48 @@ An earlier version of this section reported, at production signal:
 - **Plain EP-EM is ill-posed** wherever cA + S is indefinite: the fixed-cavity M-step is then not a maximization. Here that holds in every configuration, so the outer loop must be Newton with B and a trust region (or |λ| modified Newton). Never plain EP-EM.
 - **Nothing here** establishes the outer rate at the production fixed point.
 
-**The correct measurement (in progress):** maximize the pooled penalized EP evidence c·Σ_windows log Z_EP(x) − ½xᵀSx over one shared x by Newton-B with a trust region. Then take the full-space spectrum of (cA + S)⁻¹(cB + S) at that point, its negative-eigenvalue count, and the implied outer steps for the certified loop and for plain EP-EM, plus the distance from the pooled fixed point to the true prior (the EP-EB bias).
+**A scaled-evidence fixed point is not the genome fixed point either.** The next attempt (`v7_pooled_fixed_point2.py`, `v7_pooled_*.json`) maximized c·Σ_r log Z_EP,r(x) − ½xᵀSx over one shared x, with R = 12 v7 windows of 150 variants, c = 1.7·10⁷/1,800 = 9,444, at production signal and fixed weights 1.
+- **Why that doesn't give the genome fixed point:**
+  - Multiplying R windows' log evidence by c multiplies its sampling noise by c.
+  - A genome with c times the data has noise that grows only as √c relative to its signal.
+  - So the maximizer of the scaled objective is the 12-window estimate with its noise amplified about √c ≈ 97×.
+  - At production signal a window carries only ~10⁻³ nats about x, so that noise dominates.
+- **What it found** therefore describes one real, weak-data 12-window model, restated at c = 1 with penalty weights w/c (1.06·10⁻⁴). Here E(x) = Σ_r log Z_EP,r(x) − ½xᵀS_{w/c}x, with log Z_EP the reference's `SiteState.log_evidence`:
+  - The true prior is a saddle, E = −0.229, with A + S and B + S each having 2 negative directions.
+  - Plain EP-EM from the truth reaches the null model in one outer step: E = −1.2·10⁻⁵ ≈ 0, a stationary point (gradient 7.7·10⁻⁷) where A + S and B + S each have 1 negative direction. Its M-step is non-concave there.
+  - A trust-region Newton-B run from the truth stopped on trust-region collapse at E = −1.9·10⁻³, with gradient 5.3 and 1 negative direction of B + S. It is not converged and not certified.
+  - At production signal, then, this model's evidence peaks at or near the null-model boundary. It has no certified interior maximum at fixed weights, and it does not rank the two algorithms.
+  - As e2e's regression fixture (`v7_pooled_fixture_w150_r12_m1_w1_complete.npz`, provenance in its `_complete.json`) it supports structural assertions only: no certificate at indefinite B + S, and a non-concave plain M-step.
+- **How the production outer rate will be measured:**
+  - on the engine, at chr22 scale (590k variants × 50k people), with λ learned, once the engine fits there;
+  - meanwhile as a trend preview on 12-window models at c = 1 with ×100–×1000 signal, where windows are informative, labelled a trend, not the production rate.
+- **Stage 1** stays dropped provisionally, on the cost argument alone, pending the engine measurement.
 
 ### 10.4 Cut coupling of the real partition
-**Setup.** 12,000 consecutive polymorphic chr22 variants × 50,000 people.
-- The partition is the production one: `ld_partition`'s exact minimum-cost cuts on the fixed-point pair weights, at caps 512–4096. It is compared with equal blocks of the same count.
+**Setup.** 12,000 consecutive polymorphic chr22 variants (v7 cohort variants 236,249–248,248) × 50,000 people (`v7_cut_coupling.py`, `v7_cut_coupling.json`).
+- The partition is the production one: `ld_partition`'s exact minimum-cost cuts on the fixed-point pair weights, at caps 1024 and 4096. It is compared with equal blocks of the same count.
 - A = nR + T, with T the site precisions of a heavy-tailed prior at mean signal s.
 - D is A's block diagonal and E the rest; γ = ‖D^{-1/2}ED^{-1/2}‖.
 
 | signal | cap | γ (LD cuts / equal cuts) | block variance error p99 / max | cavity-precision error from block variances, median / p99 / max | with the 2nd-order term, median / p99 / max |
 |---|---|---|---|---|---|
-| ×1 | 512 | 0.76 / 0.81 | 0.21% / 3.9% | — | — |
-| ×1 | 1024 | 0.69 / 0.72 | 0.20% / 3.5% | 4.6% / 58% / 71% | 0.37% / 27% / 44% |
-| ×1 | 2048 | 0.55 / 0.60 | 0.16% / 2.8% | — | — |
-| ×1 | 4096 | 0.40 / 0.52 | 0.11% / 2.5% | 2.6% / 28% / 53% | 0.05% / 2.1% / 9.0% |
-| ×10 | 1024 | 3.2 / 3.5 | 5.4% / 35% | 28% / 275% / 353% | series diverges: 935 improper cavities |
-| ×10 | 4096 | 1.2 / 1.7 | 2.5% / 22% | 11% / 94% / 265% | 4 improper cavities |
+| ×1 | 1024 | 0.63 / 0.67 | 0.18% / 3.2% | 4.6% / 54% / 67% | 0.39% / 24% / 37% |
+| ×1 | 4096 | 0.36 / 0.47 | 0.10% / 2.2% | 2.6% / 25% / 51% | 0.05% / 1.5% / 9.1% |
+| ×10 | 1024 | 3.0 / 3.2 | 5.1% / 34% | 28% / 268% / 329% | series diverges: 697 improper cavities |
+| ×10 | 4096 | 1.15 / 1.6 | 2.5% / 22% | 10% / 92% / 274% | 3 improper cavities |
 
 What it says:
-- **The partition is cap-bound:** the median block sits at the cap, and LD-optimal cuts lower γ by only 5–20% against equal cuts. Coupling falls with the cap, from 0.76 at 512 to 0.40 at 4096.
+- **The partition is cap-bound:** the median block sits at the cap, and LD-optimal cuts lower γ by 5% (cap 1024) to 23% (cap 4096) against equal cuts. Coupling falls with the cap, from 0.63 at 1024 to 0.36 at 4096.
 - **Block variances never exceed the exact ones [proved; checked in every row].** (A⁻¹)_bb = (A_bb − A_br A_rr⁻¹ A_rb)⁻¹ ⪰ A_bb⁻¹. So frozen block variances always give proper cavities (0 improper in every row). They are biased low, though.
-- **The cavity precision P_j = 1/Ṽ_j − τ_j is where that bias bites.** At production, P_j/τ_j has median 2.9·10⁻⁴, so a 0.2% variance error becomes a ~50% cavity error. The EP sites of the top ~1% of variants are then computed from cavities 28–58% off (p99), which moves the EP fixed point.
-- **The second-order term** diag(D⁻¹ED⁻¹ED⁻¹) fixes most of it at cap 4096 (p99 2%). It is valid only where γ < 1, and it overshoots into improper cavities where γ ≥ 1 (denser signal).
+- **The cavity precision P_j = 1/Ṽ_j − τ_j is where that bias bites.** At production, P_j/τ_j has median 2.9·10⁻⁴, so a 0.2% variance error becomes a ~50% cavity error. The EP sites of the top ~1% of variants are then computed from cavities 25–54% off (p99), which moves the EP fixed point.
+- **The second-order term** diag(D⁻¹ED⁻¹ED⁻¹) fixes most of it at cap 4096 (p99 1.5%). It is valid only where γ < 1, and it overshoots into improper cavities where γ ≥ 1 (denser signal).
 - **So Stage 2's certified marginals need cross-block variances for the resolved variants.** Candidates: the exact resolved set, leave-block-out (novel-inference), overlapping blocks, or the certified second-order term. Use the largest cap device memory allows.
 
 ### 10.5 The strongest-LD regions (production signal)
 **Setup.**
 - **Windows:** 1,600 contiguous polymorphic variants, one LD block each. They are chosen as the three disjoint windows with the largest within-window LD score in each source:
   - the chr6 MHC (29.6–33.4 Mb) and the chr17 17q21.31 inversion region (45.4–46.7 Mb), from the public 1kGP high-coverage phased panel (3,202 people);
-  - the chr22 real-haplotype cohort, restricted to where its LD-score annotation is highest (20,000 people).
+  - bench-sim's v7 chr22 cohort, restricted to where its LD-score annotation is highest (20,000 people; `v7_highld_cavity.py`).
 - **Replicates:** four effect draws per window.
 - **Pencil:** each source's pooled A and B are scaled to p = 1.7·10⁷ as if the whole genome had that region's LD, a worst case, since these regions are well under 1% of the genome.
 - **Script:** `rho_highld3.py` / `rho_highld2.py`, output `rho_highld_*.json`.
@@ -316,7 +330,7 @@ The outer-spectrum columns of this table were computed like §10.1–10.3 (at th
 | region | within-window LD score | cavity-precision error of a 2-block split, median / p99 |
 |---|---|---|
 | MHC | 405, 291, 256 | 7–11% / 53–75% |
-| chr22 top-LD | 86, 71, 60 | 0.3–0.9% / 6–52% |
+| chr22 top-LD (v7) | 83, 68, 55 | 0.2–0.7% / 4–27% |
 | 17q21.31 inversion | 234, 94, 87 | 0.05–0.5% / 38–49% |
 
 What it says:
