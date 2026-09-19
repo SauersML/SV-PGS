@@ -30,9 +30,9 @@ def test_residualization_never_reads_test_phenotypes():
 
 def test_feature_sets_select_the_documented_columns():
     variants = synthetic_variants([False, True, False, True], ["panel", "panel", "pangenie", "pangenie"])
-    assert list(harness.feature_mask(variants, "snv")) == [True, False, False, False]
-    assert list(harness.feature_mask(variants, "snv_sv")) == [True, True, False, False]
-    assert list(harness.feature_mask(variants, "snv_pgsv")) == [True, False, False, True]
+    assert list(harness.feature_mask(variants, "snv", "g/s")) == [True, False, False, False]
+    assert list(harness.feature_mask(variants, "snv_sv", "g/s")) == [True, True, False, False]
+    assert list(harness.feature_mask(variants, "snv_pgsv", "g/s")) == [True, False, False, True]
 
 
 def test_sv_masking_removes_exactly_the_sv_part_of_a_linear_prediction():
@@ -150,3 +150,38 @@ def test_pooled_paired_difference_averages_each_gene_over_the_held_out_groups():
     expected = (wide["a"] - wide["b"]).groupby(level="gene_id").mean().mean()
     assert pooled["genes"] == 12 and np.isclose(pooled["difference"], expected, rtol=0, atol=16 * EPSILON)
     assert set(table["superpopulation"]) == {report.POOLED, *report.SUPERPOPULATIONS}
+
+
+def matched_fixture(seed):
+    generator = np.random.default_rng(seed)
+    count = 400
+    is_sv = np.zeros(count, dtype=bool)
+    is_sv[generator.choice(count, 12, replace=False)] = True
+    source = np.where(np.arange(count) % 7 == 0, "pangenie", "panel")
+    return harness.Variants(position=np.arange(count), end=np.arange(count), distance_to_tss=generator.integers(-10**6, 10**6, count),
+                            is_sv=is_sv, sv_type=np.array(["."] * count), sv_length=np.zeros(count), allele_length_change=np.zeros(count),
+                            train_allele_frequency=generator.uniform(0.01, 0.99, count), source=source)
+
+
+def test_matched_small_variants_draw_one_panel_small_variant_per_panel_sv_reproducibly():
+    variants = matched_fixture(5)
+    mask = harness.feature_mask(variants, "snv_matched", "g/loso/AFR")
+    panel_sv = (variants.source == "panel") & variants.is_sv
+    assert mask.sum() == panel_sv.sum()
+    assert not (mask & variants.is_sv).any() and (variants.source[mask] == "panel").all()
+    assert np.array_equal(mask, harness.feature_mask(variants, "snv_matched", "g/loso/AFR"))
+
+
+def test_matched_small_variant_is_the_nearest_on_frequency_and_distance():
+    count = 6
+    variants = harness.Variants(position=np.arange(count), end=np.arange(count), distance_to_tss=np.array([100, 100, 100_000, 5_000, 100, 90]),
+                                is_sv=np.array([True, False, False, False, False, False]), sv_type=np.array(["."] * count),
+                                sv_length=np.zeros(count), allele_length_change=np.zeros(count),
+                                train_allele_frequency=np.array([0.2, 0.45, 0.2, 0.2, 0.05, 0.21]), source=np.array(["panel"] * count))
+    assert list(np.flatnonzero(harness.feature_mask(variants, "snv_matched", "g/s"))) == [5]
+
+
+def test_sv_only_feature_sets_select_the_documented_columns():
+    variants = synthetic_variants([False, True, False, True], ["panel", "panel", "pangenie", "pangenie"])
+    assert list(harness.feature_mask(variants, "sv", "g/s")) == [False, True, False, False]
+    assert list(harness.feature_mask(variants, "pgsv", "g/s")) == [False, False, False, True]

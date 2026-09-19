@@ -24,6 +24,9 @@ import pandas as pd
 
 SUPERPOPULATIONS = ("AFR", "AMR", "EAS", "EUR", "SAS")
 POOLED = "pooled"
+FEATURE_SETS = ("snv", "snv_sv", "snv_pgsv", "sv", "pgsv", "snv_matched")
+# Within a method: adding SVs to SNVs, and SVs alone against an equal number of matched SNVs (and against each other).
+WITHIN_METHOD_COMPARISONS = (("snv_sv", "snv"), ("snv_pgsv", "snv"), ("sv", "snv_matched"), ("pgsv", "snv_matched"), ("sv", "pgsv"))
 
 
 def squared_correlation(prediction, truth):
@@ -40,7 +43,7 @@ def per_gene_scores(results_dir: pathlib.Path, dataset_dir: pathlib.Path, method
         tag = genes_file.name.removesuffix(".genes.tsv")
         genes = pd.read_csv(genes_file, sep="\t")
         truth = np.load(results_dir / method / design / f"{tag}.truth.npy")
-        for feature_set in ("snv", "snv_sv", "snv_pgsv"):
+        for feature_set in FEATURE_SETS:
             path = results_dir / method / design / f"{tag}.{feature_set}.predictions.npy"
             if not path.exists():
                 continue
@@ -144,12 +147,12 @@ def main():
                         if (results_dir / method / design).exists()], ignore_index=True)
     scores.to_csv(pathlib.Path(arguments.out) / "per_gene_r2.tsv.gz", sep="\t", index=False)
     present = set(zip(scores["method"], scores["feature_set"]))
-    arms = [(method, feature_set) for method in arguments.methods for feature_set in ("snv", "snv_sv", "snv_pgsv") if (method, feature_set) in present]
+    arms = [(method, feature_set) for method in arguments.methods for feature_set in FEATURE_SETS if (method, feature_set) in present]
     comparisons = []
     for method in arguments.methods:
-        for feature_set in ("snv_sv", "snv_pgsv"):
-            if (method, feature_set) in present and (method, "snv") in present:
-                comparisons += paired(scores, (method, feature_set), (method, "snv"))
+        for feature_set, baseline in WITHIN_METHOD_COMPARISONS:
+            if (method, feature_set) in present and (method, baseline) in present:
+                comparisons += paired(scores, (method, feature_set), (method, baseline))
     for arm_a, arm_b in itertools.combinations(arms, 2):
         if arm_a[1] == arm_b[1] and arm_a[0] != arm_b[0]:
             comparisons += paired(scores, arm_a, arm_b)

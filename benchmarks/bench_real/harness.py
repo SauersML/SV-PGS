@@ -25,7 +25,8 @@ import numpy as np
 import pandas as pd
 
 CIS_RADIUS_BP = 1_000_000
-FEATURE_SETS = ("snv", "snv_sv", "snv_pgsv")
+FEATURE_SETS = ("snv", "snv_sv", "snv_pgsv", "sv", "pgsv", "snv_matched")
+MATCHED_SEED = hashlib.sha256(b"bench-real/snv_matched").digest()
 
 
 @dataclasses.dataclass(frozen=True)
@@ -151,15 +152,50 @@ def build_gene_task(dataset: Dataset, window: GeneWindow, split: dict):
     return train, test_genotypes, test_phenotype, test_index
 
 
-def feature_mask(variants: Variants, feature_set: str):
-    """snv: panel SNVs/indels; snv_sv: all panel rows; snv_pgsv: panel SNVs/indels plus PanGenie SVs."""
+def matched_small_variants(variants: Variants, draw_key: str):
+    """Panel SNVs/indels matched one-to-one to the panel SVs of the window, on training allele frequency and distance.
+
+    Each SV, taken in a seeded random order, gets the nearest unused small variant in (logit MAF, log(1 + |distance
+    to TSS| in bp)), measured by the Mahalanobis distance of the small variants' own covariance of those two
+    coordinates, so neither unit dominates. The seed (sha256 of the sealed key sha256("bench-real/snv_matched") and
+    the gene/split draw key) fixes the order in which SVs claim neighbours and breaks exact ties; with continuous
+    coordinates most draws are the plain nearest neighbours. Each fold's draw is reproducible and method-independent.
+    """
+    small = np.flatnonzero((variants.source == "panel") & ~variants.is_sv)
+    structural = np.flatnonzero((variants.source == "panel") & variants.is_sv)
+    frequency = np.minimum(variants.train_allele_frequency, 1 - variants.train_allele_frequency)
+    coordinates = np.column_stack([np.log(frequency / (1 - frequency)), np.log1p(np.abs(variants.distance_to_tss))])
+    generator = np.random.default_rng(int.from_bytes(hashlib.sha256(MATCHED_SEED + draw_key.encode()).digest()[:8], "little"))
+    candidates = small[generator.permutation(len(small))]
+    whitening = np.linalg.cholesky(np.linalg.inv(np.cov(coordinates[candidates], rowvar=False)))
+    candidate_points = coordinates[candidates] @ whitening
+    available = np.ones(len(candidates), dtype=bool)
+    chosen = []
+    for target in structural[generator.permutation(len(structural))]:
+        if not available.any():
+            break
+        distances = np.where(available, ((candidate_points - coordinates[target] @ whitening) ** 2).sum(axis=1), np.inf)
+        best = int(np.argmin(distances))
+        available[best] = False
+        chosen.append(candidates[best])
+    mask = np.zeros(len(variants.is_sv), dtype=bool)
+    mask[chosen] = True
+    return mask
+
+
+def feature_mask(variants: Variants, feature_set: str, draw_key: str):
+    """snv: panel SNVs/indels; snv_sv: all panel rows; snv_pgsv: panel SNVs/indels plus PanGenie SVs; sv: panel SVs;
+    pgsv: PanGenie SVs; snv_matched: as many panel SNVs/indels as panel SVs, matched to them (matched_small_variants)."""
     panel = variants.source == "panel"
     small = panel & ~variants.is_sv
-    return {"snv": small, "snv_sv": panel, "snv_pgsv": small | ((variants.source == "pangenie") & variants.is_sv)}[feature_set]
+    pangenie_sv = (variants.source == "pangenie") & variants.is_sv
+    if feature_set == "snv_matched":
+        return matched_small_variants(variants, draw_key)
+    return {"snv": small, "snv_sv": panel, "snv_pgsv": small | pangenie_sv, "sv": panel & variants.is_sv, "pgsv": pangenie_sv}[feature_set]
 
 
-def subset(train: TrainData, test_genotypes: np.ndarray, feature_set: str):
-    keep = feature_mask(train.variants, feature_set)
+def subset(train: TrainData, test_genotypes: np.ndarray, feature_set: str, split_name: str):
+    keep = feature_mask(train.variants, feature_set, f"{train.gene_id}/{split_name}")
     variants = Variants(**{field.name: getattr(train.variants, field.name)[keep] for field in dataclasses.fields(Variants)})
     return dataclasses.replace(train, genotypes=train.genotypes[:, keep], variants=variants), test_genotypes[:, keep]
 
@@ -197,7 +233,7 @@ def _run_gene(arguments):
     for split_name in split_names:
         train_all, test_all, test_phenotype, test_index = build_gene_task(dataset, window, dataset.splits[split_name])
         for feature_set in _WORKER["feature_sets"]:
-            train, test_genotypes = subset(train_all, test_all, feature_set)
+            train, test_genotypes = subset(train_all, test_all, feature_set, split_name)
             started = time.process_time()
             predictor = fit(train)
             prediction = np.asarray(predictor.predict(test_genotypes), dtype=np.float64)
