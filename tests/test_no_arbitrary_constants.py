@@ -182,7 +182,6 @@ PENDING: dict[tuple[str, str], tuple[str, frozenset[object], str]] = {
     ('data.py', 'normalize_variant_record.allele_frequency'): ('deslop-constants', frozenset({0.01}), 'require allele_frequency instead of a silent 0.01 default'),
     ('dosage_store.py', 'DEFAULT_SHARD_ROWS'): ('deslop-store', frozenset({65536}), 'store layout sizes: justify by a measured I/O sweep (STORE.md) or derive from the read path'),
     ('dosage_store.py', 'DEFAULT_INNER_CHUNK_ROWS'): ('deslop-store', frozenset({64}), 'store layout sizes: justify by a measured I/O sweep (STORE.md) or derive from the read path'),
-    ('dual_solve.py', 'certified_block_cg'): ('speed-krylov', frozenset({4.0}), 'cite or derive the factor 4 in the certified relative-error bound'),
     ('exact_polish.py', '_MAXIMUM_CONJUGATE_GRADIENT_ITERATIONS'): ('deslop-fit', frozenset({400}), 'stop on the CG A-norm error estimate or the fp64 floor (math-epeb); the dimension bound is exact'),
     ('exact_polish.py', '_DIRECTION_DROP'): ('deslop-fit', frozenset({1e-20}), 'block-CG deflation at eps x block norm'),
     ('exact_polish.py', '_DRAW_BLOCK_COLUMNS'): ('deslop-fit', frozenset({64}), 'measure from the device budget'),

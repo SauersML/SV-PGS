@@ -406,7 +406,7 @@ def certified_block_cg(
     Iterations run with a relaxed operand error: iteration k's product error F_k moves the true
     residual by at most ||F_k|| ||r_k|| (S >= I, orthonormal directions), and ||F_k|| <=
     lambda_max(S) (eps_left + eps_right); keeping the drift left over a residual contracting by rho
-    below half the bound gives each operand eps = bound (1 - rho) / (4 lambda_max ||r_k||). The
+    below half the bound gives each of the two operands eps = (bound / 2) (1 - rho) / (2 lambda_max ||r_k||). The
     recursive residual takes the other half. lambda_max is the largest Ritz value seen; with none
     known (operator_scale 1) the first iteration runs exact to find it. The error is relaxed only on a
     deflated operator: with its spikes still in S, relaxed products delayed CG by 3-22 iterations
@@ -466,7 +466,8 @@ def certified_block_cg(
             residual_norms = array_module.linalg.norm(residual[:, open_columns], axis=0)
             relative_error = 0.0
             if scale_known and deflation is not None:
-                relative_error = float(array_module.min(bound[open_columns] * (1.0 - contraction) / (4.0 * operator_scale * residual_norms)))
+                # Half the bound is the drift budget, and the drift gathers both operands' rounding.
+                relative_error = float(array_module.min(0.5 * bound[open_columns] * (1.0 - contraction) / (2 * operator_scale * residual_norms)))
             image = apply_operator(source, models, stacked, block_models, relative_error, count, f"{label}:{iterations}")
             iterations += 1
             relative_errors.append(relative_error)
