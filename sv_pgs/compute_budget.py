@@ -74,36 +74,41 @@ def _cgroup_memory_headroom_bytes(
     proc_cgroup_file: Path = Path("/proc/self/cgroup"),
     cgroup_root: Path = Path("/sys/fs/cgroup"),
 ) -> int | None:
-    """Bytes the process's memory cgroup still allows, or None when unlimited.
+    """Bytes the process's memory cgroups still allow, or None when none is limited.
 
     Slurm jobs and containers cap memory through a cgroup while
-    ``/proc/meminfo`` keeps reporting the whole node, so the cgroup limit is
-    the binding one whenever it exists (cgroup v2 unified or v1 memory).
+    ``/proc/meminfo`` keeps reporting the whole node. The limit can sit on any
+    ancestor of the process's own cgroup (Slurm sets it on the job, while the
+    step and task cgroups below it are unlimited), so the headroom is the
+    smallest ``limit - usage`` over the process's cgroup and every ancestor up
+    to the controller root, in cgroup v2 (unified) and v1 (memory controller).
     """
     if not proc_cgroup_file.exists():
         return None
+    headroom: int | None = None
     for line in proc_cgroup_file.read_text(encoding="utf-8").splitlines():
         hierarchy_id, controllers, relative_path = line.split(":", 2)
         if hierarchy_id == "0" and controllers == "":
-            group = cgroup_root / relative_path.lstrip("/")
-            limit_file, usage_file = group / "memory.max", group / "memory.current"
+            controller_root = cgroup_root
+            limit_name, usage_name = "memory.max", "memory.current"
         elif "memory" in controllers.split(","):
-            group = cgroup_root / "memory" / relative_path.lstrip("/")
-            limit_file, usage_file = group / "memory.limit_in_bytes", group / "memory.usage_in_bytes"
+            controller_root = cgroup_root / "memory"
+            limit_name, usage_name = "memory.limit_in_bytes", "memory.usage_in_bytes"
         else:
             continue
-        if not limit_file.exists() or not usage_file.exists():
-            continue
-        limit_text = limit_file.read_text(encoding="utf-8").strip()
-        if limit_text == "max":
-            return None
-        limit_bytes = int(limit_text)
-        # cgroup v1 reports "unlimited" as a huge page-aligned sentinel.
-        if limit_bytes >= 1 << 60:
-            return None
-        usage_bytes = int(usage_file.read_text(encoding="utf-8").strip())
-        return max(limit_bytes - usage_bytes, 0)
-    return None
+        group = controller_root / relative_path.strip().lstrip("/")
+        for level in (group, *group.parents):
+            limit_file, usage_file = level / limit_name, level / usage_name
+            if limit_file.exists() and usage_file.exists():
+                limit_text = limit_file.read_text(encoding="utf-8").strip()
+                # cgroup v2 writes "max" and v1 a huge page-aligned sentinel for "unlimited".
+                if limit_text != "max" and int(limit_text) < 1 << 60:
+                    usage_bytes = int(usage_file.read_text(encoding="utf-8").strip())
+                    level_headroom = max(int(limit_text) - usage_bytes, 0)
+                    headroom = level_headroom if headroom is None else min(headroom, level_headroom)
+            if level == controller_root:
+                break
+    return headroom
 
 
 def _usable_host_bytes() -> int:
