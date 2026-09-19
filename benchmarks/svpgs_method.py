@@ -307,9 +307,25 @@ class BenchRealPredictor:
         return standardized @ self.scoring.coefficients + self.scoring.alpha[0]
 
 
+def one_core_budget() -> ComputeBudget:
+    """One core's share of the machine: bench-real fits one gene per forked worker, one worker per core (its
+    ``--workers`` defaults to the task's cores), so each fit gets one thread and its share of host memory, on the CPU
+    (a device can't be split between the workers)."""
+    machine = detect_compute_budget()
+    return ComputeBudget(
+        device_kind="cpu",
+        device_ids=(),
+        device_names=(),
+        device_bytes=(),
+        device_compute_capabilities=(),
+        host_bytes=machine.host_bytes // machine.cpu_threads,
+        cpu_threads=1,
+    )
+
+
 def fit_expression(train: Any) -> BenchRealPredictor:
     """bench-real: fit SV-PGS on one gene's cis window (harness.py)."""
-    budget = detect_compute_budget()
+    budget = one_core_budget()
     genotypes = np.asarray(train.genotypes)
     if not np.all(np.isin(genotypes, (0, 1, 2))):
         raise ValueError("bench-real training genotypes must be allele counts 0, 1 or 2.")

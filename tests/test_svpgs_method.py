@@ -12,6 +12,7 @@ from benchmarks import svpgs_method
 from benchmarks.bench_real import harness as bench_real
 from benchmarks.bench_sim import harness as bench_sim
 from sv_pgs import fit_model
+from sv_pgs.compute_budget import ComputeBudget
 from sv_pgs.config import VariantClass
 from sv_pgs.dosage_store import CODES_PER_DOSAGE, DosageStore
 from sv_pgs.fast_scoring import SIGNED_CODE_OFFSET, ScoringModel
@@ -208,3 +209,13 @@ def test_bench_real_refuses_training_genotypes_that_are_not_allele_counts(driver
     with pytest.raises(ValueError, match="allele counts"):
         svpgs_method.fit_expression(train)
     assert driver.calls == []
+
+
+def test_each_bench_real_fit_gets_one_cores_share(monkeypatch: pytest.MonkeyPatch) -> None:
+    machine = ComputeBudget(
+        device_kind="cuda", device_ids=(0,), device_names=("gpu",), device_bytes=(1 << 34,), device_compute_capabilities=((8, 6),),
+        host_bytes=(1 << 36) + 5, cpu_threads=16,
+    )
+    monkeypatch.setattr(svpgs_method, "detect_compute_budget", lambda: machine)
+    budget = svpgs_method.one_core_budget()
+    assert (budget.device_kind, budget.cpu_threads, budget.host_bytes) == ("cpu", 1, machine.host_bytes // machine.cpu_threads)
