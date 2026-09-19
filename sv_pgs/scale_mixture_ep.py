@@ -34,8 +34,12 @@ with no point mass at zero.
   profiled (the Schur-complement form of the evidence below): integrating it
   under a flat prior diverges where the likelihood tends to a positive
   constant, and makes the evidence grid-dependent.
-- Every weight lives in [0, infinity] with exact edges: at infinity the
-  block's penalized directions are zero, at zero the block is absent.
+- Every weight lives in (0, infinity], with one exact edge: at infinity the
+  block's penalized directions are zero. There is no lambda = 0 edge (lead
+  ruling): dropping a block profiles its directions under a flat prior, a
+  different and improper model whose value bounds every proper-prior V from
+  above, while V itself falls without bound as lambda -> 0 (slope r_i / 2 in
+  log lambda). The low end of a weight's range is its resolvable bound.
 - The lattice is a quadrature rule: its floor, top, spacing and extent are
   derived from the data and a tolerance (``kernel_floor``, ``kernel_top``,
   ``spacing_bound``, ``tail_mass``). Below the floor every kernel is flat to
@@ -69,7 +73,7 @@ Laplace marginal likelihood of x,
 
 with rho = log lambda, x_rho the penalized maximizer, H its observed Hessian
 and N a basis of any directions no block penalizes (an annotation smooth's
-linear part, or a direction left bare by a weight at zero), which are
+linear part), which are
 profiled as fixed effects: integrating them under a flat prior diverges
 where the likelihood tends to a positive constant. Its gradient is exact:
 dx/drho through the observed Hessian, and the change of H with x through the
@@ -1439,8 +1443,9 @@ def _smoothing_bounds(prior: ScaleMixturePrior, objective: _Objective) -> list[t
     With D the data curvature of the weight's block and s_min, s_max the extreme nonzero eigenvalues of S_i:
     below lambda s_min = sqrt(eps) ||D|| the weakest penalized direction of -H has a condition number past
     1/sqrt(eps), and above lambda s_max = ||D|| / sqrt(eps) the penalty swamps the data's curvature past
-    1/sqrt(eps), so a fit there loses half of double precision. The edges beyond (lambda = 0 and infinity) are
-    evaluated exactly instead.
+    1/sqrt(eps), so a fit there loses half of double precision. Beyond the upper end the lambda = infinity edge is
+    evaluated exactly; below the lower end V only falls (with slope r_i / 2 in rho), so the lower end is the range's
+    end, and there is no lambda = 0 edge.
     """
     data = -(prior.coefficient_map.T @ objective.hessian @ prior.coefficient_map)
     bounds = []
@@ -1455,12 +1460,11 @@ def _smoothing_bounds(prior: ScaleMixturePrior, objective: _Objective) -> list[t
     return bounds
 
 
-def _restricted_prior(prior: ScaleMixturePrior, infinite: frozenset[int], zero: frozenset[int]) -> tuple[ScaleMixturePrior, F64Array]:
-    """The prior with the weights in ``infinite`` at lambda = infinity and those in ``zero`` at lambda = 0, and the
-    basis K of the allowed x.
+def _restricted_prior(prior: ScaleMixturePrior, infinite: frozenset[int]) -> tuple[ScaleMixturePrior, F64Array]:
+    """The prior with the weights in ``infinite`` at lambda = infinity, and the basis K of the allowed x.
 
     At lambda_i = infinity block i's penalized directions are exactly zero, so x = K z with K an orthonormal
-    basis of every such block's null space; at lambda_i = 0 block i is absent. The other blocks act on z
+    basis of every such block's null space. The other blocks act on z
     through their factors times K, and any direction none of them penalizes is profiled.
     """
     constraints = [np.zeros((0, prior.coefficient_size))]
@@ -1478,7 +1482,7 @@ def _restricted_prior(prior: ScaleMixturePrior, infinite: frozenset[int], zero: 
         allowed = np.eye(prior.coefficient_size)
     blocks = []
     for position, block in enumerate(prior.smoothing_blocks):
-        if position in infinite or position in zero:
+        if position in infinite:
             continue
         embedded = np.zeros((block.factor.shape[0], prior.coefficient_size))
         embedded[:, block.coordinates] = block.factor
@@ -1611,16 +1615,15 @@ def _edge_evidence(
     prior: ScaleMixturePrior,
     weights: F64Array,
     infinite: frozenset[int],
-    zero: frozenset[int],
     starts: Sequence[F64Array],
     cavity: Cavity, posterior_at: PosteriorAt,
     working_bytes: int,
     tolerance: float,
 ) -> tuple[F64Array, _Evidence] | None:
-    """The best certified evidence of the model with ``infinite`` at lambda = infinity and ``zero`` at lambda = 0,
-    the other weights at ``weights``; with its restriction basis."""
-    view, allowed = _restricted_prior(prior, infinite, zero)
-    finite = [position for position in range(weights.shape[0]) if position not in infinite | zero]
+    """The best certified evidence of the model with ``infinite`` at lambda = infinity, the other weights at
+    ``weights``; with its restriction basis."""
+    view, allowed = _restricted_prior(prior, infinite)
+    finite = [position for position in range(weights.shape[0]) if position not in infinite]
     evidence = _best_certified(view, weights[finite], [allowed.T @ start for start in starts], cavity, posterior_at, working_bytes, tolerance)
     return None if evidence is None else (allowed, evidence)
 
@@ -1634,32 +1637,32 @@ def _maximize_evidence(
     bounds: list[tuple[float, float]],
     tolerance: float,
 ) -> tuple[F64Array, F64Array, _Evidence, _Evidence]:
-    """Maximize V over every weight in [0, infinity]: the interior by the trust-region ascent inside the resolvable
-    range, and each edge evaluated exactly (lambda = infinity by confining x to the block's null space, lambda = 0 by
-    dropping the block), never by fitting at an extreme weight. Once the interior ascent converges, every finite
-    weight is compared with both of its edges (lead ruling: each weight compared at lambda = infinity and inside),
-    and the best edge that raises V past the tolerance is taken; an edge weight moves back to the end of its range
-    when V is higher there. Every V is the best certified maximum over the warm, flat and global log-normal starts.
-    Returns the log weights (+inf and -inf at the edges), x in full coordinates, V there, and V at the start.
+    """Maximize V over every weight in (0, infinity]: the interior by the trust-region ascent inside the resolvable
+    range, and the lambda = infinity edge evaluated exactly (x confined to the block's null space), never by fitting
+    at an extreme weight. Once the interior ascent converges, every finite weight is compared with its infinity edge
+    (lead ruling), and the best edge that raises V past the tolerance is taken; an edge weight moves back to the
+    upper end of its range when V is higher there. There is no lambda = 0 edge (see the module docstring), so a
+    start weight of -inf means its range's lower end. Every V is the best certified maximum over the warm, flat and
+    global log-normal starts. Returns the log weights (+inf at an edge), x in full coordinates, V there, and V at
+    the start.
     """
     lower = np.array([bound[0] for bound in bounds])
     upper = np.array([bound[1] for bound in bounds])
     infinite = frozenset(int(position) for position in np.flatnonzero(start_weights == np.inf))
-    zero = frozenset(int(position) for position in np.flatnonzero(start_weights == -np.inf))
-    weights = np.where(start_weights == np.inf, upper, np.where(start_weights == -np.inf, lower, np.clip(start_weights, lower, upper)))
+    weights = np.where(start_weights == np.inf, upper, np.clip(start_weights, lower, upper))
     flat = initial_hyperparameters(prior).coefficients
     log_normal = _log_normal_start(prior, start_coefficients, cavity, working_bytes)
     coefficients = np.array(start_coefficients, dtype=np.float64, copy=True)
-    first = _edge_evidence(prior, weights, infinite, zero, [coefficients, flat, log_normal], cavity, posterior_at, working_bytes, tolerance)
+    first = _edge_evidence(prior, weights, infinite, [coefficients, flat, log_normal], cavity, posterior_at, working_bytes, tolerance)
     if first is None:
         raise FloatingPointError("no structural start reaches a certified maximum at the starting penalty weights")
     start = first[1]
     best_corrected = -np.inf
     while True:
-        edges = infinite | zero
+        edges = infinite
         finite = np.array([position for position in range(len(bounds)) if position not in edges], dtype=np.int64)
-        view, allowed = _restricted_prior(prior, infinite, zero)
-        entry = _edge_evidence(prior, weights, infinite, zero, [coefficients, flat, log_normal], cavity, posterior_at, working_bytes, tolerance)
+        view, allowed = _restricted_prior(prior, infinite)
+        entry = _edge_evidence(prior, weights, infinite, [coefficients, flat, log_normal], cavity, posterior_at, working_bytes, tolerance)
         if entry is None:
             raise FloatingPointError("no structural start reaches a certified maximum at the current penalty weights")
         finite_weights, evidence = _ascend_evidence(
@@ -1680,31 +1683,30 @@ def _maximize_evidence(
         coefficients = allowed @ evidence.coefficients
         current_value = evidence.value
         moved = False
-        # Every finite weight is compared with both of its edges, not only one the gradient points to: the certified V
+        # Every finite weight is compared with its infinity edge, not only one the gradient points to: the certified V
         # can prefer an edge the Laplace gradient does not see. The best edge that raises V past the tolerance is taken.
         best_edge = None
         for position in (int(index) for index in finite):
-            for trial_infinite, trial_zero in ((infinite | {position}, zero), (infinite, zero | {position})):
-                trial = _edge_evidence(prior, weights, trial_infinite, trial_zero, [coefficients, flat, log_normal], cavity, posterior_at, working_bytes, tolerance)
-                if trial is not None and trial[1].value > current_value + tolerance and (best_edge is None or trial[1].value > best_edge[2][1].value):
-                    best_edge = (trial_infinite, trial_zero, trial)
+            trial_infinite = infinite | {position}
+            trial = _edge_evidence(prior, weights, trial_infinite, [coefficients, flat, log_normal], cavity, posterior_at, working_bytes, tolerance)
+            if trial is not None and trial[1].value > current_value + tolerance and (best_edge is None or trial[1].value > best_edge[1][1].value):
+                best_edge = (trial_infinite, trial)
         if best_edge is not None:
-            infinite, zero, moved = frozenset(best_edge[0]), frozenset(best_edge[1]), True
-            coefficients = best_edge[2][0] @ best_edge[2][1].coefficients
+            infinite, moved = frozenset(best_edge[0]), True
+            coefficients = best_edge[1][0] @ best_edge[1][1].coefficients
         if not moved:
             for position in sorted(edges):
-                trial_infinite, trial_zero = infinite - {position}, zero - {position}
+                trial_infinite = infinite - {position}
                 trial_weights = weights.copy()
-                trial_weights[position] = upper[position] if position in infinite else lower[position]
-                trial = _edge_evidence(prior, trial_weights, trial_infinite, trial_zero, [coefficients, flat, log_normal], cavity, posterior_at, working_bytes, tolerance)
+                trial_weights[position] = upper[position]
+                trial = _edge_evidence(prior, trial_weights, trial_infinite, [coefficients, flat, log_normal], cavity, posterior_at, working_bytes, tolerance)
                 if trial is not None and trial[1].value > current_value + tolerance:
-                    infinite, zero, weights, moved = frozenset(trial_infinite), frozenset(trial_zero), trial_weights, True
+                    infinite, weights, moved = frozenset(trial_infinite), trial_weights, True
                     coefficients = trial[0] @ trial[1].coefficients
                     break
         if not moved:
             log_smoothing = weights.copy()
             log_smoothing[sorted(infinite)] = np.inf
-            log_smoothing[sorted(zero)] = -np.inf
             return log_smoothing, coefficients, evidence, start
 
 
@@ -1800,9 +1802,14 @@ def hyper_step(
     on that difference predicts exceeds ``tolerance``, the search continues along it, accepting only steps that raise V.
     """
     start_objective = _data_objective(prior, hyperparameters.coefficients, cavity, working_bytes)
+    bounds = _smoothing_bounds(prior, start_objective)
+    # There is no lambda = 0 edge: a -inf start weight means its range's lower end.
+    lowest = np.array([bound[0] for bound in bounds])
+    hyperparameters = replace(
+        hyperparameters, log_smoothing=np.where(hyperparameters.log_smoothing == -np.inf, lowest, hyperparameters.log_smoothing)
+    )
     infinite = frozenset(int(position) for position in np.flatnonzero(hyperparameters.log_smoothing == np.inf))
-    zero = frozenset(int(position) for position in np.flatnonzero(hyperparameters.log_smoothing == -np.inf))
-    view, allowed = _restricted_prior(prior, infinite, zero)
+    view, allowed = _restricted_prior(prior, infinite)
     finite = np.isfinite(hyperparameters.log_smoothing)
     start_coefficients = allowed.T @ hyperparameters.coefficients
     _value, start_gradient, start_hessian = _penalized(
@@ -1810,13 +1817,11 @@ def hyper_step(
         _penalty_matrix(view, hyperparameters.log_smoothing[finite]), start_coefficients,
     )
     start_decrement = 0.5 * float(start_gradient @ _ascent_direction(-start_hessian, start_gradient))
-    bounds = _smoothing_bounds(prior, start_objective)
     log_smoothing, coefficients, evidence, start_evidence = _maximize_evidence(
         prior, hyperparameters.log_smoothing, hyperparameters.coefficients, cavity, posterior_at, working_bytes, bounds, tolerance
     )
     final_infinite = frozenset(int(position) for position in np.flatnonzero(log_smoothing == np.inf))
-    final_zero = frozenset(int(position) for position in np.flatnonzero(log_smoothing == -np.inf))
-    final_view, final_allowed = _restricted_prior(prior, final_infinite, final_zero)
+    final_view, final_allowed = _restricted_prior(prior, final_infinite)
     finite_final = np.isfinite(log_smoothing)
     weights = log_smoothing[finite_final]
     lower = np.array([bound[0] for bound in bounds])[finite_final]
@@ -1853,8 +1858,7 @@ def hyper_step(
         if resumed[2].value > evidence.value:
             log_smoothing, coefficients, evidence = resumed[0], resumed[1], resumed[2]
             final_infinite = frozenset(int(position) for position in np.flatnonzero(log_smoothing == np.inf))
-            final_zero = frozenset(int(position) for position in np.flatnonzero(log_smoothing == -np.inf))
-            final_view, final_allowed = _restricted_prior(prior, final_infinite, final_zero)
+            final_view, final_allowed = _restricted_prior(prior, final_infinite)
             finite_final = np.isfinite(log_smoothing)
             weights = log_smoothing[finite_final]
             lower = np.array([bound[0] for bound in bounds])[finite_final]
