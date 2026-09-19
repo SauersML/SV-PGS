@@ -233,8 +233,9 @@ def _log_prior_sum_bound(distance: F64Array, level_variance: float, steps: F64Ar
     powers = np.arange(3.0)
     pieces = np.where(powers > 0.0, 4.0, 2.0)
     peak = np.maximum(distance[:, None], np.sqrt(powers * level_variance)[None, :])
-    with np.errstate(divide="ignore"):  # the m = 0 peak at T = 0 has |T|^0 = 1
-        log_peak = np.where(powers > 0.0, powers * np.log(np.abs(peak)), 0.0) - 0.5 * (_LOG_TWO_PI + np.log(level_variance) + np.square(peak) / level_variance)
+    # |T|^0 = 1, also at the m = 0 peak T = 0.
+    log_power = powers * np.log(np.where(powers > 0.0, np.abs(peak), 1.0))
+    log_peak = log_power - 0.5 * (_LOG_TWO_PI + np.log(level_variance) + np.square(peak) / level_variance)
     return np.logaddexp(_log_prior_tail_moments(distance, level_variance), np.log(pieces * steps[:, None]) + log_peak)
 
 
