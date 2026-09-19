@@ -33,6 +33,7 @@ from sv_pgs.scale_mixture_ep import (
     _penalty_matrix,
     _penalty_value,
     _restricted_prior,
+    _smoothing_bounds,
     cavities,
     class_log_density,
     derived_lattice,
@@ -343,8 +344,7 @@ def test_hyper_step_reaches_a_maximum_of_the_evidence():
     step = hyper_step(prior, initial_hyperparameters(prior), cavity, normal_means_posterior(cavity, _WORKING_BYTES), _WORKING_BYTES, _EVIDENCE_TOLERANCE)
     fitted = step.hyperparameters
     infinite = frozenset(int(position) for position in np.flatnonzero(fitted.log_smoothing == np.inf))
-    zero = frozenset(int(position) for position in np.flatnonzero(fitted.log_smoothing == -np.inf))
-    view, allowed = _restricted_prior(prior, infinite, zero)
+    view, allowed = _restricted_prior(prior, infinite)
     weights = fitted.log_smoothing[np.isfinite(fitted.log_smoothing)]
     posterior = normal_means_posterior(cavity, _WORKING_BYTES)
     laplace = _evidence(view, weights, allowed.T @ fitted.coefficients, cavity, posterior, _WORKING_BYTES, 0.0)
@@ -527,7 +527,7 @@ def _log_normal_problem(seed: int):
 
 def test_the_global_log_normal_start_reaches_the_null_models_maximum():
     prior, cavity = _log_normal_problem(31)
-    view, allowed = _restricted_prior(prior, frozenset({0}), frozenset())
+    view, allowed = _restricted_prior(prior, frozenset({0}))
     start = _log_normal_start(prior, initial_hyperparameters(prior).coefficients, cavity, _WORKING_BYTES)
     coefficients, objective = _maximize_coefficients(view, np.zeros(0), allowed.T @ start, cavity, _WORKING_BYTES, 0.0)
     nodes = prior.log_variance_grid
@@ -545,7 +545,7 @@ def test_the_global_log_normal_start_reaches_the_null_models_maximum():
 def test_the_hyper_steps_evidence_is_at_least_the_exact_infinity_edges():
     prior, cavity = _log_normal_problem(33)
     step = hyper_step(prior, initial_hyperparameters(prior), cavity, normal_means_posterior(cavity, _WORKING_BYTES), _WORKING_BYTES, _EVIDENCE_TOLERANCE)
-    view, allowed = _restricted_prior(prior, frozenset({0}), frozenset())
+    view, allowed = _restricted_prior(prior, frozenset({0}))
     start = _log_normal_start(prior, initial_hyperparameters(prior).coefficients, cavity, _WORKING_BYTES)
     posterior = normal_means_posterior(cavity, _WORKING_BYTES)
     edge = _corrected(
@@ -555,6 +555,37 @@ def test_the_hyper_steps_evidence_is_at_least_the_exact_infinity_edges():
     assert edge is not None
     # Both are certified V, each to the tolerance.
     assert step.evidence >= edge.value - _EVIDENCE_TOLERANCE
+
+
+def _null_annotation_problem(seed: int):
+    """verify-engine's edge problem: one class, ten nodes, and one annotation column with no effect on the variances."""
+    generator = np.random.default_rng(seed)
+    variant_count = 80
+    nodes = np.linspace(np.log(1e-5), np.log(1.0), 10)
+    position = generator.uniform(-1.0, 1.0, variant_count)
+    offset = np.log(generator.uniform(0.2, 1.0, variant_count))
+    prior = scale_mixture_prior(
+        class_index=np.zeros(variant_count, np.int64), log_variance_offset=offset, annotation_design=position[:, None],
+        annotation_groups=(AnnotationGroup(columns=np.array([0]), penalty=np.eye(1)),), nodes=nodes, floor=nodes[0] - 1.0, top=nodes[-1],
+    )
+    precision = generator.uniform(50.0, 400.0, variant_count)
+    effect = np.where(generator.random(variant_count) < 0.4, generator.normal(0.0, 0.25, variant_count), 0.0)
+    shift = precision * (effect + generator.standard_normal(variant_count) / np.sqrt(precision))
+    return prior, Cavity(precision=precision, shift=shift)
+
+
+@pytest.mark.parametrize("seed", (101, 202, 303))
+def test_a_null_annotation_is_penalized_at_an_interior_optimum_or_the_infinity_edge(seed):
+    # The lambda = 0 "edge" profiled a block under a flat prior, whose value bounds every proper-prior V; the search
+    # took it and left a null annotation unpenalized (verify-engine). With the edge gone, every weight is either at
+    # the infinity edge or inside its resolvable range, never below it.
+    prior, cavity = _null_annotation_problem(seed)
+    step = hyper_step(prior, initial_hyperparameters(prior), cavity, normal_means_posterior(cavity, _WORKING_BYTES), _WORKING_BYTES, _EVIDENCE_TOLERANCE)
+    weights = step.hyperparameters.log_smoothing
+    assert not np.any(weights == -np.inf), weights
+    bounds = _smoothing_bounds(prior, _data_objective(prior, initial_hyperparameters(prior).coefficients, cavity, _WORKING_BYTES))
+    for weight, (lower, _upper) in zip(weights, bounds):
+        assert weight == np.inf or weight >= lower, (weights, bounds)
 
 
 def test_directional_third_and_fourth_derivatives_match_finite_differences():
