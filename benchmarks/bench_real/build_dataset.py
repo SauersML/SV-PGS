@@ -119,14 +119,7 @@ def build_chromosome(root: pathlib.Path, samples: list, out_dir: pathlib.Path, c
     return len(dosages), int(table["is_sv"].sum()), int((table["source"] == "pangenie").sum()), missing_records
 
 
-def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--root", required=True)
-    parser.add_argument("--chromosomes", nargs="+", required=True)
-    arguments = parser.parse_args()
-    root = pathlib.Path(arguments.root)
-    out_dir = root / "dataset"
-    out_dir.mkdir(exist_ok=True)
+def write_shared(root: pathlib.Path, out_dir: pathlib.Path):
     expression, covariates, metadata = read_expression(root / "data/mage")
     if metadata["sample_kgpID"].duplicated().any():
         raise ValueError("duplicate individuals in the 731-library metadata")
@@ -144,6 +137,19 @@ def main():
         raise ValueError("a MAGE sample is missing from the 1kGP pedigree table")
     sample_table[["sample", "FamilyID", "FatherID", "MotherID", "Sex", "Population", "Superpopulation"]].to_csv(out_dir / "samples.tsv", sep="\t", index=False)
     (out_dir / "BUILD_NOTES.txt").write_text(f"{swap_note}\nexcluded chrX (haploid in XY samples)\n")
+    return samples
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--root", required=True)
+    parser.add_argument("--chromosomes", nargs="*", default=[])
+    parser.add_argument("--shared", action="store_true", help="also write the chromosome-independent arrays (samples, expression, covariates, genes)")
+    arguments = parser.parse_args()
+    root = pathlib.Path(arguments.root)
+    out_dir = root / "dataset"
+    out_dir.mkdir(exist_ok=True)
+    samples = write_shared(root, out_dir) if arguments.shared else pd.read_csv(out_dir / "samples.tsv", sep="\t")["sample"].tolist()
     for chrom in arguments.chromosomes:
         count, sv_count, pangenie_count, missing = build_chromosome(root, samples, out_dir, chrom)
         print(f"chr{chrom}: {count} dosage rows, {sv_count} SV rows ({pangenie_count} PanGenie), {missing} records with missing genotypes skipped", flush=True)

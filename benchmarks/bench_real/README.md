@@ -14,6 +14,7 @@ On MSI the benchmark root is `/scratch.global/sauer354/svpgs-team/bench-real/`, 
 
 ## Samples
 - **Individuals:** 730 of the 731 MAGE lymphoblastoid-line individuals, one library each: AFR 196, AMR 113, EAS 141, EUR 141, SAS 139, across 26 populations.
+- **PanGenie records** with a missing genotype in any of the 730 are skipped (199 on chr22); `build_dataset.py` prints the count.
 - **Library swap:** MAGE v1.0 carries a swap, per the mccoy-lab README of 2026-03-27. SRR19762530 is labelled HG00237 but is NA11919, and SRR19762653 is the reverse.
   - Only SRR19762653 is in the 731-library analysis set, and HG00237's own library SRR19762247 is in it too. So the column labelled NA11919 holds HG00237's expression, and NA11919 has none.
   - `build_dataset.py` drops NA11919 and records this in `dataset/BUILD_NOTES.txt`. (If both swapped libraries were present, it would swap their expression and PEER columns instead.)
@@ -70,12 +71,36 @@ The baselines' math checks are in `tests/test_baselines.py`: REML optimality aga
 - **Tandem repeats aren't annotated** in the panel, so the TR signed-length term isn't tested.
 - **Lymphoblastoid-line expression** is a molecular phenotype. Its architecture (strong cis, larger SV enrichment) differs from complex traits.
 
+## Which open design questions it can answer
+**Can answer, on real biology:**
+- **Do SVs add held-out accuracy?** Compare `snv_sv` with `snv` per method. It also shows whether a method that gives SVs their own prior class extracts more of that value than GBLUP or mr.ash.
+- **Does the SV gain transfer to an unseen ancestry?** Compare the gain under loso with the gain under random5, per superpopulation.
+- **Prior shape:** a learned continuous mixing density against GBLUP (Gaussian), mr.ash (a discrete scale-mixture grid) and the lead variant (the sparse extreme), where cis effects are large and few.
+- **Annotation-driven scale:** distance to TSS, SV type and length, and training allele frequency (the frequency term), all learned from real effects.
+- **SV measurement:** short-read panel SVs against PanGenie long-read-panel SVs, on the same people.
+
+**Cannot answer:**
+- the imputation-reliability channel (the r² offset, D* and GATK-SV fusion), because genotypes here are direct calls;
+- the polygenic tail and genome-wide architecture;
+- tandem-repeat length terms (no TR annotation);
+- binary traits;
+- behaviour at n in the tens of thousands.
+
+## Tier 2 (not built): complex traits from public summary statistics
+- **Design:**
+  - train on Pan-UKB EUR summary statistics, with the Bai et al. 2026 UK Biobank SV/VNTR releases as the SV arm;
+  - evaluate in an independent cohort's summary statistics (FinnGen, or BBJ for cross-ancestry) with the summary-statistic R² estimate (wᵀẑ_t/√N_t)² / (wᵀR_t w);
+  - use target-ancestry reference LD from 1kGP/HGSVC.
+- **What stops it for SVs:** no public independent cohort has SV association statistics. SV weights would need target SV z-scores imputed from SNP z-scores through reference LD, which makes the result depend on the reference panel. Tier 2 would therefore test the SNV-level prior structure (learned density, frequency term) on real complex traits, not SV credit.
+- **Other caveats:** reference-LD mismatch, and the estimator's bias under that mismatch.
+
 ## Running it
 The baselines need numba, which isn't a repository dependency. Run in a venv with numpy, scipy, pandas, cyvcf2 and numba, and bcftools on PATH. From the repository root:
 
     python benchmarks/bench_real/fetch_mage.py <root>/data/mage
     benchmarks/bench_real/fetch_genotypes.sh <root> <public-dir> <threads>
-    python benchmarks/bench_real/build_dataset.py --root <root> --chromosomes 1 2 ... 22
+    python benchmarks/bench_real/build_dataset.py --root <root> --shared
+    python benchmarks/bench_real/build_dataset.py --root <root> --chromosomes <c>   # one per autosome, in parallel
     python benchmarks/bench_real/splits.py <root>/dataset
     python benchmarks/bench_real/harness.py --dataset <root>/dataset --method benchmarks/bench_real/baselines.py:gblup_reml         --name gblup_reml --design loso --chromosomes chr22 --out <root>/results --workers <n>
     python benchmarks/bench_real/report.py --results <root>/results --dataset <root>/dataset --methods gblup_reml mr_ash --out <report dir>
