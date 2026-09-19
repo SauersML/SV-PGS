@@ -742,7 +742,7 @@ class GenotypeSufficientStatistics:
 class _Projection:
     covariate_count: int
     column_sums: NDArray[np.float64]
-    covariate_gram_inverse: NDArray[np.float64]
+    covariate_gram_pseudo_inverse: NDArray[np.float64]
     covariate_target: NDArray[np.float64]
     minimum_minor_allele_frequency: float
     minimum_scale: float
@@ -862,7 +862,7 @@ def _project_block(
     centered = raw_cross - xp.outer(sums[kept_device], xp.asarray(projection.column_sums)) / count
     standardized = centered * (count * inverse_root[kept_device])[:, None]
     covariate_cross = standardized[:, : projection.covariate_count]
-    loading = covariate_cross @ xp.asarray(projection.covariate_gram_inverse)
+    loading = covariate_cross @ xp.asarray(projection.covariate_gram_pseudo_inverse)
     projected_score = standardized[:, projection.covariate_count :] - loading @ xp.asarray(projection.covariate_target)
     gram = xp.empty((kept.shape[0], kept.shape[0]), dtype=xp.float32)
     every_column = kept.shape[0] == width
@@ -922,6 +922,22 @@ def _project_block(
     }
     state = _AdjacentState(chromosome=block.chromosome, start=block.start, kept=kept_device, sums=sums, inverse_root=inverse_root, loading=loading)
     return summary, {name: buffer.to_host(values) for name, values in arrays.items()}, state
+
+
+def _covariate_gram_pseudo_inverse(covariates: NDArray[np.float64]) -> NDArray[np.float64]:
+    """``(C^T C)^+`` on the numerical column space of ``C``, so ``C (C^T C)^+ C^T = H_C`` even when ``C`` has
+    lost rank on the training set.
+
+    The covariates are shared by every trait, so a sex-restricted disease's training set (prostate
+    cancer: men only) makes the sex indicator equal the intercept and age x female zero. Singular values
+    of ``C`` at or below the numerical-rank tolerance ``max(n, k) eps s_max`` (Golub and Van Loan 5.4.1)
+    span no direction of its column space; the others give the pseudo-inverse from ``C``'s own SVD, so the
+    Gram's squared condition number never enters.
+    """
+    _, singular_values, right_vectors = np.linalg.svd(covariates, full_matrices=False)
+    kept = singular_values > max(covariates.shape) * np.finfo(np.float64).eps * singular_values[0]
+    basis = right_vectors[kept]
+    return (basis.T / singular_values[kept] ** 2) @ basis
 
 
 def build_genotype_buffers(
@@ -993,7 +1009,7 @@ def compute_genotype_statistics(
     projection = _Projection(
         covariate_count=covariate_matrix.shape[1],
         column_sums=sample_side.sum(axis=0),
-        covariate_gram_inverse=np.linalg.inv(covariate_gram),
+        covariate_gram_pseudo_inverse=_covariate_gram_pseudo_inverse(covariate_matrix),
         covariate_target=covariate_target,
         minimum_minor_allele_frequency=config.minimum_minor_allele_frequency,
         minimum_scale=config.minimum_scale,

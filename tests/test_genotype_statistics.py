@@ -291,6 +291,37 @@ def test_projected_ld_matches_a_dense_float64_reference(tmp_path) -> None:
     assert len(boundaries.signature_sha256()) == 64
 
 
+def test_covariates_that_lose_rank_on_the_training_set_project_onto_their_column_space(tmp_path) -> None:
+    # The covariates are shared by every trait, so a sex-restricted disease's training set (prostate
+    # cancer: men only) makes the sex indicator equal the intercept and age x female zero. Its
+    # projection is onto the same column space as any basis of it; inverting C'C raised instead.
+    from sv_pgs.config import ModelConfig
+    from sv_pgs.genotype_statistics import compute_genotype_statistics
+
+    source, training, covariates, targets = _statistics_dataset(21)
+    sample_count = training.shape[0]
+    restricted = np.column_stack([covariates, np.ones(sample_count), np.zeros(sample_count)])
+    config = ModelConfig(minimum_minor_allele_frequency=0.01)
+    basis = compute_genotype_statistics(source, training, covariates, targets, config, _cpu_budget(), BLOCK_CAP, tmp_path / "basis")
+    found = compute_genotype_statistics(source, training, restricted, targets, config, _cpu_budget(), BLOCK_CAP, tmp_path / "restricted")
+    assert found.ld.block_count == basis.ld.block_count
+    fp32_unit = float(np.finfo(np.float32).eps) / 2.0
+    fp64_unit = float(np.finfo(np.float64).eps) / 2.0
+    singular_values = np.linalg.svd(covariates, compute_uv=False)
+    # Each fp64 dot product over n samples errs by at most gamma_n |x||y| <= gamma_n sqrt(n) ||y|| for a
+    # standardized column, and the covariate part by gamma_{n+k} times C's condition number as much.
+    gamma = (sample_count + covariates.shape[1]) * fp64_unit / (1.0 - (sample_count + covariates.shape[1]) * fp64_unit)
+    score_bound = 2.0 * gamma * (1.0 + singular_values[0] / singular_values[-1]) * np.sqrt(sample_count) * np.linalg.norm(targets, axis=0)
+    for block_index in range(basis.ld.block_count):
+        expected, block = basis.ld.block(block_index), found.ld.block(block_index)
+        np.testing.assert_array_equal(block.reduced_columns, expected.reduced_columns)
+        # Each stored fp32 entry is one rounding of the same projected Gram, |G_jk| <= sqrt(G_jj G_kk).
+        diagonal = np.diagonal(expected.projected_gram).astype(np.float64)
+        gram_bound = 2.0 * fp32_unit * np.sqrt(np.outer(diagonal, diagonal))
+        assert np.all(np.abs(block.projected_gram.astype(np.float64) - expected.projected_gram) <= gram_bound)
+        assert np.all(np.abs(block.projected_score - expected.projected_score) <= score_bound[None, :])
+
+
 class _ArrayStore:
     """The DosageCodeStore protocol over in-memory codes."""
 
