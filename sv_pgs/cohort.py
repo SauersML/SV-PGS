@@ -13,16 +13,130 @@ from __future__ import annotations
 import csv
 from dataclasses import dataclass
 import json
+import logging
 from pathlib import Path
 from typing import Mapping, Sequence
 
 import numpy as np
 
 from sv_pgs._typing import BoolArray, F64Array, I64Array
+from sv_pgs.all_of_us import MINIMUM_REPORTED_PARTICIPANTS
+from sv_pgs.sample_crosswalk import SampleCrosswalk
+from sv_pgs.sample_ids import ResearchId, SequencingId
+
+LOGGER = logging.getLogger(__name__)
 
 SECOND_DEGREE_KINSHIP = 2.0 ** -3.5
 """KING's lower kinship bound for second-degree relatives (Manichaikul et al. 2010,
 Bioinformatics 26:2867, Table 1). Pairs above it, duplicates included, share a fold."""
+
+DUPLICATE_KINSHIP = 2.0 ** -1.5
+"""KING's lower kinship bound for duplicate samples and monozygotic twins (Manichaikul et
+al. 2010, Table 1). Such a pair across the two halves is one genome measured twice."""
+
+LONG_READ_SOURCE = "long_read"
+IMPUTED_SOURCE = "imputed"
+
+
+@dataclass(frozen=True, slots=True)
+class CohortRows:
+    """One genotype row per person over the union of the long-read truth half and the imputed half.
+
+    A person with a truth row and an imputed row (the crosswalk maps the imputed
+    sample to a truth research ID, or a KING pair across the halves is at
+    duplicate/MZ level) keeps the truth row: the imputed row is a leave-in imputation
+    of a panel genome. Everyone else keeps the one row they have. ``kinship_pairs``
+    are the input pairs with every sample in the research-ID namespace, for
+    kinship_components.
+    """
+
+    research_ids: tuple[ResearchId, ...]
+    genotype_source: tuple[str, ...]
+    kinship_pairs: tuple[tuple[ResearchId, ResearchId, float], ...]
+    imputed_rows_sharing_a_research_id: int
+    imputed_rows_duplicating_a_truth_genome: int
+
+
+def resolve_cohort_rows(
+    truth_research_ids: Sequence[ResearchId],
+    imputed_sequencing_ids: Sequence[SequencingId],
+    crosswalk: SampleCrosswalk,
+    kinship_pairs: Sequence[tuple[ResearchId | SequencingId, ResearchId | SequencingId, float]],
+) -> CohortRows:
+    """Resolve the two halves into one row per person.
+
+    The truth half is named by research ID and the imputed half by sequencing ID;
+    the two are matched only through the crosswalk, never by name.
+    ``kinship_pairs`` are KING pairs over the union of both halves, each sample
+    typed by the half that named it. A repeat within either half, or an imputed
+    sample (in the half or in a pair) without a crosswalk row, is an error. The
+    number of imputed rows given up is logged, with counts of 1 to 20 suppressed.
+    """
+    if not all(isinstance(research_id, ResearchId) for research_id in truth_research_ids):
+        raise TypeError("the long-read truth half is named by ResearchId.")
+    if not all(isinstance(sequencing_id, SequencingId) for sequencing_id in imputed_sequencing_ids):
+        raise TypeError("the imputed half is named by SequencingId.")
+    if len(set(truth_research_ids)) != len(truth_research_ids):
+        raise ValueError("the long-read truth half repeats a research ID.")
+    if len(set(imputed_sequencing_ids)) != len(imputed_sequencing_ids):
+        raise ValueError("the imputed half repeats a sequencing ID.")
+    research_of_sequencing = {
+        SequencingId(sequencing_id): ResearchId(research_id)
+        for sequencing_id, research_id in zip(crosswalk.sequencing_ids, crosswalk.research_ids, strict=True)
+    }
+
+    def as_research_id(sample: ResearchId | SequencingId) -> ResearchId:
+        if isinstance(sample, ResearchId):
+            return sample
+        if not isinstance(sample, SequencingId):
+            raise TypeError(f"a kinship pair names a {type(sample).__name__}, not a typed sample ID.")
+        if sample not in research_of_sequencing:
+            raise ValueError("a kinship pair names an imputed sample with no crosswalk row.")
+        return research_of_sequencing[sample]
+
+    unmapped = [sequencing_id for sequencing_id in imputed_sequencing_ids if sequencing_id not in research_of_sequencing]
+    if unmapped:
+        raise ValueError(f"{len(unmapped)} imputed samples have no crosswalk row.")
+    imputed_research_ids = [research_of_sequencing[sequencing_id] for sequencing_id in imputed_sequencing_ids]
+    truth = set(truth_research_ids)
+    shared_research_ids = truth & set(imputed_research_ids)
+    imputed_only = set(imputed_research_ids) - truth
+    research_pairs = tuple(
+        (as_research_id(first), as_research_id(second), float(coefficient))
+        for first, second, coefficient in kinship_pairs
+    )
+    duplicated_genomes = {
+        imputed_side
+        for first, second, coefficient in research_pairs
+        if coefficient > DUPLICATE_KINSHIP
+        for truth_side, imputed_side in ((first, second), (second, first))
+        if truth_side in truth and imputed_side in imputed_only
+    }
+    kept_imputed = [research_id for research_id in imputed_research_ids if research_id in imputed_only - duplicated_genomes]
+    LOGGER.info(
+        "cohort rows: imputed rows replaced by a truth row: %s sharing a research ID, %s duplicating a truth genome",
+        _reportable_count(len(shared_research_ids)),
+        _reportable_count(len(duplicated_genomes)),
+    )
+    return CohortRows(
+        research_ids=(*truth_research_ids, *kept_imputed),
+        genotype_source=(LONG_READ_SOURCE,) * len(truth_research_ids) + (IMPUTED_SOURCE,) * len(kept_imputed),
+        kinship_pairs=research_pairs,
+        imputed_rows_sharing_a_research_id=len(shared_research_ids),
+        imputed_rows_duplicating_a_truth_genome=len(duplicated_genomes),
+    )
+
+
+def _research_id_values(research_ids: Sequence[ResearchId]) -> list[str]:
+    """The strings of research IDs, refusing any ID of another namespace."""
+    if not all(isinstance(research_id, ResearchId) for research_id in research_ids):
+        raise TypeError("the cohort is keyed by ResearchId; map imputed samples through the crosswalk first.")
+    return [research_id.value for research_id in research_ids]
+
+
+def _reportable_count(count: int) -> str:
+    """The All of Us dissemination rule: a count of 1 to 20 participants is never written out."""
+    return str(count) if count == 0 or count >= MINIMUM_REPORTED_PARTICIPANTS else "1-20 (suppressed)"
 
 
 @dataclass(frozen=True, slots=True)
@@ -45,13 +159,14 @@ class AncestryPcs:
             raise ValueError("every pca_features entry must be a finite list of the same length.")
         return cls(research_ids=research_ids, components=components)
 
-    def for_samples(self, research_ids: Sequence[str]) -> F64Array:
+    def for_samples(self, research_ids: Sequence[ResearchId]) -> F64Array:
         """The PC rows of ``research_ids``, in that order; every sample must have PCs."""
+        values = _research_id_values(research_ids)
         row_of = {research_id: row for row, research_id in enumerate(self.research_ids)}
-        missing = [research_id for research_id in research_ids if research_id not in row_of]
+        missing = [research_id for research_id in values if research_id not in row_of]
         if missing:
             raise ValueError(f"{len(missing)} samples have no genetic PCs.")
-        return self.components[[row_of[research_id] for research_id in research_ids]]
+        return self.components[[row_of[research_id] for research_id in values]]
 
 
 def indicator_columns(levels: Sequence[str]) -> tuple[tuple[str, ...], F64Array]:
@@ -137,7 +252,7 @@ def kinship_folds(components: I64Array, strata: Sequence[str], fold_count: int, 
 class Cohort:
     """The shared design: C with its column names, and one target column per trait."""
 
-    research_ids: tuple[str, ...]
+    research_ids: tuple[ResearchId, ...]
     covariate_names: tuple[str, ...]
     covariates: F64Array
     trait_names: tuple[str, ...]
@@ -150,7 +265,7 @@ class Cohort:
 
 
 def build_cohort(
-    research_ids: Sequence[str],
+    research_ids: Sequence[ResearchId],
     person_covariates: Mapping[str, Sequence[float]],
     categorical_covariates: Mapping[str, Sequence[str]],
     ancestry: AncestryPcs,
@@ -165,7 +280,10 @@ def build_cohort(
     ``genotype_source`` (imputed or long-read-called rows) become indicators. Each
     trait's targets are keyed by research ID. C must have full column rank.
     """
+    research_id_values = _research_id_values(research_ids)
     sample_count = len(research_ids)
+    if len(set(research_id_values)) != sample_count:
+        raise ValueError("research_ids repeats a participant; resolve the two halves with resolve_cohort_rows first.")
     names = ["intercept"]
     columns = [np.ones((sample_count, 1))]
     for name, values in person_covariates.items():
@@ -193,7 +311,7 @@ def build_cohort(
     for trait_index, (trait, values_by_id) in enumerate(trait_targets.items()):
         if not all(np.isfinite(value) for value in values_by_id.values()):
             raise ValueError(f"trait {trait!r} has a non-finite target; leave a missing participant out instead.")
-        for row, research_id in enumerate(research_ids):
+        for row, research_id in enumerate(research_id_values):
             if research_id in values_by_id:
                 targets[row, trait_index] = values_by_id[research_id]
         if not np.any(np.isfinite(targets[:, trait_index])):

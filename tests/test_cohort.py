@@ -8,13 +8,17 @@ import numpy as np
 import pytest
 
 from sv_pgs.cohort import (
+    DUPLICATE_KINSHIP,
     SECOND_DEGREE_KINSHIP,
     AncestryPcs,
     build_cohort,
     indicator_columns,
     kinship_components,
     kinship_folds,
+    resolve_cohort_rows,
 )
+from sv_pgs.sample_crosswalk import SampleCrosswalk
+from sv_pgs.sample_ids import ResearchId, SequencingId
 
 
 def _write_ancestry(path: Path, rows: list[tuple[str, list[float]]]) -> Path:
@@ -29,9 +33,13 @@ def test_ancestry_pcs_keep_every_component_and_follow_the_requested_order(tmp_pa
 
     ancestry = AncestryPcs.read(table)
 
-    np.testing.assert_array_equal(ancestry.for_samples(["R2", "R1"]), [[0.4, 0.5, -0.6], [0.1, -0.2, 0.3]])
+    np.testing.assert_array_equal(
+        ancestry.for_samples([ResearchId("R2"), ResearchId("R1")]), [[0.4, 0.5, -0.6], [0.1, -0.2, 0.3]]
+    )
     with pytest.raises(ValueError, match="1 samples have no genetic PCs"):
-        ancestry.for_samples(["R1", "R3"])
+        ancestry.for_samples([ResearchId("R1"), ResearchId("R3")])
+    with pytest.raises(TypeError, match="keyed by ResearchId"):
+        ancestry.for_samples([SequencingId("R1")])
 
 
 def test_ragged_or_non_finite_pcs_fail_loudly(tmp_path: Path) -> None:
@@ -129,13 +137,16 @@ def test_fold_assignment_is_reproducible_from_its_seed() -> None:
         kinship_folds(components, strata, fold_count=1, seed=3)
 
 
-def _ancestry(research_ids: list[str], rng: np.random.Generator) -> AncestryPcs:
-    return AncestryPcs(research_ids=tuple(research_ids), components=rng.standard_normal((len(research_ids), 2)))
+def _ancestry(research_ids: list[ResearchId], rng: np.random.Generator) -> AncestryPcs:
+    return AncestryPcs(
+        research_ids=tuple(research_id.value for research_id in research_ids),
+        components=rng.standard_normal((len(research_ids), 2)),
+    )
 
 
 def test_build_cohort_assembles_full_rank_covariates_and_masked_targets() -> None:
     rng = np.random.default_rng(5)
-    research_ids = [f"R{index}" for index in range(8)]
+    research_ids = [ResearchId(f"R{index}") for index in range(8)]
     ages = rng.uniform(20, 80, 8)
 
     cohort = build_cohort(
@@ -145,7 +156,7 @@ def test_build_cohort_assembles_full_rank_covariates_and_masked_targets() -> Non
         ancestry=_ancestry(research_ids[::-1], rng),
         pipeline_half=["h0", "h0", "h1", "h1", "h0", "h1", "h0", "h1"],
         genotype_source=["imputed"] * 6 + ["long_read"] * 2,
-        trait_targets={"ldl": {"R0": 1.5, "R3": -0.5}, "t2d": {research_id: 1.0 for research_id in research_ids}},
+        trait_targets={"ldl": {"R0": 1.5, "R3": -0.5}, "t2d": {research_id.value: 1.0 for research_id in research_ids}},
     )
 
     assert cohort.covariate_names == (
@@ -161,7 +172,7 @@ def test_build_cohort_assembles_full_rank_covariates_and_masked_targets() -> Non
 
 def test_build_cohort_rejects_collinear_covariates_and_missing_values() -> None:
     rng = np.random.default_rng(9)
-    research_ids = [f"R{index}" for index in range(6)]
+    research_ids = [ResearchId(f"R{index}") for index in range(6)]
     ages = rng.uniform(20, 80, 6)
     common = dict(
         categorical_covariates={},
@@ -183,7 +194,7 @@ def test_build_cohort_rejects_collinear_covariates_and_missing_values() -> None:
 
 def test_build_cohort_rejects_a_trait_keyed_by_ids_outside_the_cohort() -> None:
     rng = np.random.default_rng(3)
-    research_ids = [str(1000 + index) for index in range(6)]
+    research_ids = [ResearchId(str(1000 + index)) for index in range(6)]
 
     with pytest.raises(ValueError, match="'ldl' has no target for any cohort sample"):
         build_cohort(
@@ -195,3 +206,161 @@ def test_build_cohort_rejects_a_trait_keyed_by_ids_outside_the_cohort() -> None:
             genotype_source=["imputed"] * 6,
             trait_targets={"ldl": {1000 + index: 1.0 for index in range(6)}},
         )
+
+
+
+def _crosswalk(pairs: dict[str, str]) -> SampleCrosswalk:
+    """Sequencing name -> research ID."""
+    return SampleCrosswalk(research_ids=tuple(pairs.values()), sequencing_ids=tuple(pairs))
+
+
+def _research(*values: str) -> list[ResearchId]:
+    return [ResearchId(value) for value in values]
+
+
+def _sequencing(*values: str) -> list[SequencingId]:
+    return [SequencingId(value) for value in values]
+
+
+def test_a_participant_in_both_halves_keeps_only_the_truth_row() -> None:
+    rows = resolve_cohort_rows(
+        truth_research_ids=_research("R1", "R2"),
+        imputed_sequencing_ids=_sequencing("D1", "D3"),
+        crosswalk=_crosswalk({"D1": "R1", "D3": "R3"}),
+        kinship_pairs=[],
+    )
+
+    assert rows.research_ids == tuple(_research("R1", "R2", "R3"))
+    assert rows.genotype_source == ("long_read", "long_read", "imputed")
+    assert rows.imputed_rows_sharing_a_research_id == 1
+
+
+def test_names_that_collide_across_the_halves_are_different_people() -> None:
+    # The DRAGEN name "1001" is spelled like the truth participant 1001, but the crosswalk
+    # maps it to participant 2002, and the KING pair links 2002 (not 1001) to 3003.
+    rows = resolve_cohort_rows(
+        truth_research_ids=_research("1001", "3003"),
+        imputed_sequencing_ids=_sequencing("1001"),
+        crosswalk=_crosswalk({"1001": "2002"}),
+        kinship_pairs=[(SequencingId("1001"), ResearchId("3003"), 0.25)],
+    )
+
+    assert rows.research_ids == tuple(_research("1001", "3003", "2002"))
+    assert rows.imputed_rows_sharing_a_research_id == 0
+    assert rows.kinship_pairs == ((ResearchId("2002"), ResearchId("3003"), 0.25),)
+
+
+def test_ids_of_different_namespaces_never_compare() -> None:
+    with pytest.raises(TypeError, match="compared a ResearchId with a SequencingId"):
+        _ = ResearchId("1001") == SequencingId("1001")
+    with pytest.raises(TypeError):
+        _ = {ResearchId("1001"), SequencingId("1001")}
+    with pytest.raises(TypeError):
+        _ = ResearchId("1001") == "1001"
+    assert ResearchId("1001") == ResearchId("1001") and ResearchId("1001") != ResearchId("1002")
+
+
+def test_the_halves_must_arrive_typed_by_namespace() -> None:
+    with pytest.raises(TypeError, match="truth half is named by ResearchId"):
+        resolve_cohort_rows(["R1"], _sequencing("D1"), _crosswalk({"D1": "R2"}), [])
+    with pytest.raises(TypeError, match="imputed half is named by SequencingId"):
+        resolve_cohort_rows(_research("R1"), _research("D1"), _crosswalk({"D1": "R2"}), [])
+    with pytest.raises(TypeError, match="not a typed sample ID"):
+        resolve_cohort_rows(_research("R1"), _sequencing("D1"), _crosswalk({"D1": "R2"}), [("R1", "D1", 0.25)])
+
+
+def test_a_duplicate_genome_across_halves_keeps_the_truth_row_but_twins_within_a_half_stay() -> None:
+    duplicate = DUPLICATE_KINSHIP * 1.4
+    rows = resolve_cohort_rows(
+        truth_research_ids=_research("R1", "R2"),
+        imputed_sequencing_ids=_sequencing("D4", "D5", "D6", "D7"),
+        crosswalk=_crosswalk({"D4": "R4", "D5": "R5", "D6": "R6", "D7": "R7"}),
+        # D4 is R1's genome under another research ID; D5/D6 and R1/R2 are twins within one
+        # half; D7 is R2's first-degree relative.
+        kinship_pairs=[
+            (SequencingId("D4"), ResearchId("R1"), duplicate),
+            (SequencingId("D5"), SequencingId("D6"), duplicate),
+            (ResearchId("R1"), ResearchId("R2"), duplicate),
+            (ResearchId("R2"), SequencingId("D7"), 0.25),
+        ],
+    )
+
+    assert rows.research_ids == tuple(_research("R1", "R2", "R5", "R6", "R7"))
+    assert rows.imputed_rows_duplicating_a_truth_genome == 1
+    assert rows.imputed_rows_sharing_a_research_id == 0
+
+
+@pytest.mark.parametrize(
+    ("truth", "imputed", "crosswalk", "pairs", "message"),
+    [
+        (["R1", "R1"], ["D2"], {"D2": "R2"}, [], "truth half repeats a research ID"),
+        (["R1"], ["D2", "D2"], {"D2": "R2"}, [], "imputed half repeats a sequencing ID"),
+        (["R1"], ["D2", "D3"], {"D2": "R2"}, [], "1 imputed samples have no crosswalk row"),
+        (["R1"], ["D2"], {"D2": "R2"}, [("D9", "R1")], "kinship pair names an imputed sample with no crosswalk row"),
+    ],
+)
+def test_repeats_within_a_half_and_unmapped_samples_are_errors(truth, imputed, crosswalk, pairs, message) -> None:
+    typed_pairs = [(SequencingId(first), ResearchId(second), 0.25) for first, second in pairs]
+    with pytest.raises(ValueError, match=message):
+        resolve_cohort_rows(_research(*truth), _sequencing(*imputed), _crosswalk(crosswalk), typed_pairs)
+
+
+def test_replaced_row_counts_of_one_to_twenty_are_suppressed_in_the_log(caplog: pytest.LogCaptureFixture) -> None:
+    def resolve(overlap: int) -> None:
+        crosswalk = _crosswalk({f"D{index}": f"R{index}" for index in range(overlap)})
+        resolve_cohort_rows(
+            _research(*crosswalk.research_ids), _sequencing(*crosswalk.sequencing_ids), crosswalk, []
+        )
+
+    with caplog.at_level("INFO", logger="sv_pgs.cohort"):
+        resolve(3)
+        resolve(25)
+
+    first, second = (record.getMessage() for record in caplog.records)
+    assert "1-20 (suppressed) sharing a research ID" in first and "3" not in first
+    assert "25 sharing a research ID" in second
+
+
+def test_relatives_across_the_two_halves_share_a_fold() -> None:
+    rng = np.random.default_rng(21)
+    names = [f"{index:03d}" for index in range(150)]
+    # The truth participants and the imputed samples use the same strings on purpose:
+    # the crosswalk maps each imputed name to another participant.
+    rows = resolve_cohort_rows(
+        _research(*names),
+        _sequencing(*names),
+        _crosswalk({name: f"P{name}" for name in names}),
+        [(ResearchId(names[index]), SequencingId(names[index + 1]), 0.25) for index in range(0, 148, 2)],
+    )
+    ancestry = dict(zip(rows.research_ids, np.array(["eur", "afr"])[rng.integers(0, 2, len(rows.research_ids))], strict=True))
+    for first, second, _coefficient in rows.kinship_pairs:
+        ancestry[second] = ancestry[first]
+    components = kinship_components(
+        rows.research_ids,
+        [first for first, _second, _coefficient in rows.kinship_pairs],
+        [second for _first, second, _coefficient in rows.kinship_pairs],
+        [coefficient for _first, _second, coefficient in rows.kinship_pairs],
+    )
+    strata = [f"{source}|{ancestry[research_id]}" for research_id, source in zip(rows.research_ids, rows.genotype_source, strict=True)]
+
+    folds = dict(zip(rows.research_ids, kinship_folds(components, strata, fold_count=5, seed=2).tolist(), strict=True))
+
+    assert len(rows.research_ids) == 300
+    assert all(folds[first] == folds[second] for first, second, _coefficient in rows.kinship_pairs)
+
+
+def test_build_cohort_rejects_a_participant_listed_twice_or_an_untyped_id() -> None:
+    rng = np.random.default_rng(4)
+    common = dict(
+        person_covariates={"age": rng.uniform(20, 80, 4)},
+        categorical_covariates={},
+        ancestry=_ancestry(_research("R0", "R1", "R2"), rng),
+        pipeline_half=["h0"] * 4,
+        genotype_source=["long_read", "long_read", "imputed", "imputed"],
+        trait_targets={"ldl": {"R0": 1.0}},
+    )
+
+    with pytest.raises(ValueError, match="repeats a participant"):
+        build_cohort(_research("R0", "R1", "R1", "R2"), **common)
+    with pytest.raises(TypeError, match="keyed by ResearchId"):
+        build_cohort(["R0", "R1", "R2", "R3"], **common)
