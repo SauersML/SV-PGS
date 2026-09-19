@@ -19,7 +19,7 @@ from scipy.special import ndtri
 from scipy.stats import norm
 
 from sv_pgs.compute_budget import detect_compute_budget
-from sv_pgs.phenotype_measurement import Occasions, fit_occasion_model
+from sv_pgs.phenotype_measurement import Occasions, fit_occasion_model, marginal_transform
 
 if TYPE_CHECKING:
     from google.cloud import bigquery
@@ -1570,7 +1570,11 @@ def build_all_of_us_measurement_targets(
     the treated ones corrected to their untreated equivalent (DIVIDE/ADD), or
     none (EXCLUDE). Persons with no occasion left are dropped. The target is
     E[T_i | occasions] under phenotype_measurement's per-occasion model, with
-    its reliability.
+    its reliability, when some person has repeated occasions and the fit
+    certifies the level/noise split (OccasionModelFit.split_identified).
+    Otherwise it is the mean of the person's Box-Cox-transformed readings
+    (marginal_transform) with reliability 1, logged, and the summary's
+    measurement_model says which (the lead's ruling on replicates).
     """
     people = person_occasions(rows)
     kept: list[tuple[PersonOccasions, np.ndarray, np.ndarray, str]] = []
@@ -1601,14 +1605,24 @@ def build_all_of_us_measurement_targets(
         ["missing" if person.sex_at_birth_concept_id in (None, "") else str(person.sex_at_birth_concept_id) for person, *_rest in kept],
         counts,
     )
-    fit = fit_occasion_model(
-        Occasions(
-            person_index=person_index,
-            values=np.concatenate([values for _person, _ages, values, _source in kept]),
-            design=_occasion_design(ages, female.astype(np.float64), list(sex_levels)),
-        ),
-        working_bytes,
+    occasions = Occasions(
+        person_index=person_index,
+        values=np.concatenate([values for _person, _ages, values, _source in kept]),
+        design=_occasion_design(ages, female.astype(np.float64), list(sex_levels)),
     )
+    # The lead's ruling on replicates: the level and the noise are separable only through within-person replicates
+    # and only when the data certify it; otherwise the target is the transformed reading, with reliability 1.
+    fit = fit_occasion_model(occasions, working_bytes) if np.any(counts > 1) else None
+    if fit is not None and fit.split_identified:
+        measurement_model, exponent = "per-occasion model", fit.exponent
+        targets, reliabilities = fit.level_mean, fit.reliability
+    else:
+        reason = "no person has a repeated occasion" if fit is None else "the data do not certify the level/noise split"
+        measurement_model = f"transformed reading: {reason}"
+        LOGGER.info("All of Us trait %s: %s, so the target is the Box-Cox-transformed reading with reliability 1", definition.canonical_name, reason)
+        exponent, transformed = marginal_transform(occasions.values, occasions.design)
+        targets = np.bincount(person_index, weights=transformed) / counts
+        reliabilities = np.ones(len(kept))
     training_rows = []
     for position, (person, occasion_ages, _values, source) in enumerate(kept):
         is_female = person.sex_at_birth_name == "female"
@@ -1616,9 +1630,9 @@ def build_all_of_us_measurement_targets(
         training_rows.append({
             "sample_id": person.sample_id,
             "person_id": person.person_id,
-            "target": float(fit.level_mean[position]),
+            "target": float(targets[position]),
             "occasion_count": int(occasion_ages.shape[0]),
-            "target_reliability": float(fit.reliability[position]),
+            "target_reliability": float(reliabilities[position]),
             "measurement_source": source,
             "age_at_measurement": mean_age,
             "age_at_measurement_squared": float(np.mean(np.square(occasion_ages))),
@@ -1629,7 +1643,8 @@ def build_all_of_us_measurement_targets(
     unrecognized_unit_persons: Counter[str] = Counter()
     for person in people:
         unrecognized_unit_persons.update(person.unrecognized_unit_labels)
-    noise = fit.noise_second_moment
+    noise = None if fit is None or not fit.split_identified else fit.noise_second_moment
+    separated = noise is not None
     summary = {
         "n_persons_with_analyte_rows": len(people),
         "n_persons": len(training_rows),
@@ -1643,14 +1658,15 @@ def build_all_of_us_measurement_targets(
         "unrecognized_unit_person_counts": dict(unrecognized_unit_persons.most_common()),
         "n_occasions": int(counts.sum()),
         "occasions_per_person_quartiles": [float(value) for value in np.quantile(counts, (0.25, 0.5, 0.75))],
-        "box_cox_exponent": fit.exponent,
-        "level_variance": fit.level_variance,
+        "measurement_model": measurement_model,
+        "box_cox_exponent": exponent,
+        "level_variance": fit.level_variance if separated else None,
         "noise_second_moment": noise,
-        "repeatability": fit.level_variance / (fit.level_variance + noise),
-        "log_evidence": fit.log_evidence,
-        "mean_target_reliability": float(fit.reliability.mean()),
-        "target_mean": float(fit.level_mean.mean()),
-        "target_sd": float(fit.level_mean.std()),
+        "repeatability": fit.level_variance / (fit.level_variance + noise) if separated else None,
+        "log_evidence": fit.log_evidence if separated else None,
+        "mean_target_reliability": float(np.mean(reliabilities)),
+        "target_mean": float(np.mean(targets)),
+        "target_sd": float(np.std(targets)),
     }
     return training_rows, encoded_categorical_columns, summary
 
@@ -1722,9 +1738,10 @@ def prepare_all_of_us_measurement_sample_table(
         definition, rows, detect_compute_budget().host_bytes
     )
     LOGGER.info(
-        "Prepared All of Us trait %s: n_persons=%d repeatability=%.3f mean_reliability=%.3f",
+        "Prepared All of Us trait %s: n_persons=%d measurement model: %s; repeatability=%s mean_reliability=%.3f",
         definition.canonical_name,
         summary["n_persons"],
+        summary["measurement_model"],
         summary["repeatability"],
         summary["mean_target_reliability"],
     )
@@ -1792,6 +1809,10 @@ def prepare_all_of_us_measurement_sample_table(
                     "z_ij = h(y_ij) = d_ij'gamma + T_i + e_ij (phenotype_measurement): h a learned Box-Cox "
                     "transform, T_i ~ N(0, tau^2), e_ij a Gaussian scale mixture with a learned continuous "
                     "mixing density; d_ij: intercept, age, age squared, sex at birth, age x female"
+                    if summary["level_variance"] is not None else
+                    "the mean of each person's Box-Cox-transformed readings, the exponent learned from their marginal "
+                    "(phenotype_measurement.marginal_transform), with reliability 1: the level and the noise are not "
+                    "separable here, so the noise stays in the genetic model's residual"
                 ),
                 "billing_project_env": "GOOGLE_PROJECT",
                 "cdr_dataset_env": "WORKSPACE_CDR",
