@@ -25,6 +25,7 @@ from dataclasses import dataclass
 import numpy as np
 
 from sv_pgs._typing import F64Array, I64Array, NDArray
+from sv_pgs.variant_typing import sequence_resolved_kind_and_length, trimmed_allele_cores
 
 MINIMUM_SIZE_RATIO = 0.5
 MINIMUM_RECIPROCAL_OVERLAP = 0.5
@@ -59,6 +60,35 @@ class SvSites:
             raise ValueError("every SvSites column needs one row per record.")
         if np.any(self.ends <= self.starts) or np.any(self.sizes < 1):
             raise ValueError("SvSites need end > start and size >= 1.")
+
+
+def sequence_resolved_sites(chromosomes: NDArray, positions: I64Array, refs: list[str], alts: list[str]) -> SvSites:
+    """Sites of sequence-resolved SV alleles (an imputed panel) on the common coordinates.
+
+    The kind (DEL, INS or CPX) and size come from the allele shape by the
+    strata rule; the first affected base is POS plus the shared prefix, so a
+    deletion spans its deleted core and an insertion is the point where its
+    core goes in. A tandem duplication written this way is an insertion.
+    """
+    starts = np.empty(len(refs), dtype=np.int64)
+    ends = np.empty(len(refs), dtype=np.int64)
+    sizes = np.empty(len(refs), dtype=np.int64)
+    kinds = []
+    for row, (position, ref, alt) in enumerate(zip(np.asarray(positions).tolist(), refs, alts)):
+        prefix, ref_core, _ = trimmed_allele_cores(ref, alt)
+        kind, length = sequence_resolved_kind_and_length(ref, alt)
+        starts[row] = position + prefix
+        ends[row] = starts[row] + (1 if kind == "INS" else max(ref_core, 1))
+        sizes[row] = max(int(round(length)), 1)
+        kinds.append(kind)
+    return SvSites(
+        chromosomes=np.asarray(chromosomes),
+        starts=starts,
+        ends=ends,
+        sizes=sizes,
+        kinds=np.asarray(kinds),
+        duplications_are_insertions=True,
+    )
 
 
 @dataclass(frozen=True, slots=True)

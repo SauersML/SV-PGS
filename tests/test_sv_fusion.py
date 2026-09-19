@@ -12,6 +12,7 @@ from sv_pgs.sv_fusion import (
     candidate_pairs,
     fused_dosage,
     resolve_one_to_one,
+    sequence_resolved_sites,
 )
 
 
@@ -215,3 +216,24 @@ def test_degenerate_loci_carry_no_pairing_evidence() -> None:
     assert constant.pairing_z == 0.0 and not constant.accepted
     assert too_few.sample_count == 3 and too_few.pairing_z == 0.0 and not too_few.accepted
     assert np.isfinite(perfect.first_weight) and np.isfinite(perfect.second_weight)
+
+
+def test_sequence_resolved_sites_start_after_the_shared_prefix() -> None:
+    deleted = "ACGTTGCA" * 25
+    inserted = "TTAGGC" * 20
+    sites = sequence_resolved_sites(
+        np.array(["chr1", "chr1", "chr1"]),
+        np.array([1_000, 5_000, 9_000], dtype=np.int64),
+        ["G" + deleted, "C", "T" + "A" * 120 + "G"],
+        ["G", "C" + inserted, "T" + "C" * 90 + "G"],
+    )
+
+    assert sites.kinds.tolist() == ["DEL", "INS", "CPX"]
+    assert sites.starts.tolist() == [1_001, 5_001, 9_001]
+    assert sites.ends.tolist() == [1_201, 5_002, 9_121]
+    assert sites.sizes.tolist() == [200, 120, 120]
+    assert sites.duplications_are_insertions
+    # The deletion lines up with the same event as GATK-SV writes it (POS 1000,
+    # the padding base; END 1200, the last deleted base).
+    gatksv = _sites([("chr1", 1_001, 1_201, 200, "DEL")], duplications_are_insertions=False)
+    assert candidate_pairs(sites, gatksv).first_rows.tolist() == [0]

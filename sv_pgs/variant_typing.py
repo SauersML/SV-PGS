@@ -61,8 +61,8 @@ def structural_variant_class_from_token(token: str, length: float) -> VariantCla
     return VariantClass.OTHER_COMPLEX_SV
 
 
-def trimmed_allele_core_lengths(ref: str, alt: str) -> tuple[int, int]:
-    """Lengths of REF and ALT after removing their shared prefix, then suffix."""
+def trimmed_allele_cores(ref: str, alt: str) -> tuple[int, int, int]:
+    """Shared-prefix length, then the REF and ALT lengths left after removing that prefix and the shared suffix."""
     shortest = min(len(ref), len(alt))
     prefix = 0
     while prefix < shortest and ref[prefix] == alt[prefix]:
@@ -70,23 +70,19 @@ def trimmed_allele_core_lengths(ref: str, alt: str) -> tuple[int, int]:
     suffix = 0
     while suffix < shortest - prefix and ref[len(ref) - 1 - suffix] == alt[len(alt) - 1 - suffix]:
         suffix += 1
-    return len(ref) - prefix - suffix, len(alt) - prefix - suffix
+    return prefix, len(ref) - prefix - suffix, len(alt) - prefix - suffix
 
 
-def sequence_resolved_class_and_length(ref: str, alt: str) -> tuple[VariantClass, float]:
-    """Type a sequence-resolved allele pair the way the imputation strata do.
+def sequence_resolved_kind_and_length(ref: str, alt: str) -> tuple[str, float]:
+    """``DEL``, ``INS`` or ``CPX`` for a sequence-resolved allele pair, and its length.
 
-    SV when max(len(REF), len(ALT)) - 1 >= SEQUENCE_RESOLVED_SV_MINIMUM_LENGTH;
-    then, on the trimmed allele cores, a deletion when REF loses >= that many
-    bases and the ALT core is at most max(10, 10% of the REF core), an
-    insertion in the mirror case, otherwise a complex SV. (Telling a DUP or
-    an INV apart needs the reference sequence; supply it as variant_class in
-    the variant metadata.) Length is the inserted/deleted core length, or the
-    longer core for complex and equal-length alleles.
+    On the trimmed allele cores: a deletion when REF loses at least
+    SEQUENCE_RESOLVED_SV_MINIMUM_LENGTH bases and the ALT core is at most
+    max(10, 10% of the REF core), an insertion in the mirror case, otherwise
+    complex. Length is the inserted/deleted core length, or the longer core
+    for complex and equal-length alleles.
     """
-    if len(ref) == 1 and len(alt) == 1:
-        return VariantClass.SNV, 1.0
-    ref_core, alt_core = trimmed_allele_core_lengths(ref, alt)
+    _, ref_core, alt_core = trimmed_allele_cores(ref, alt)
     deletion = ref_core - alt_core >= SEQUENCE_RESOLVED_SV_MINIMUM_LENGTH and alt_core <= max(10.0, 0.1 * ref_core)
     insertion = alt_core - ref_core >= SEQUENCE_RESOLVED_SV_MINIMUM_LENGTH and ref_core <= max(10.0, 0.1 * alt_core)
     if deletion or alt_core == 0:
@@ -95,13 +91,25 @@ def sequence_resolved_class_and_length(ref: str, alt: str) -> tuple[VariantClass
         length = float(alt_core - ref_core)
     else:
         length = float(max(ref_core, alt_core))
+    return ("DEL" if deletion else "INS" if insertion else "CPX"), length
+
+
+def sequence_resolved_class_and_length(ref: str, alt: str) -> tuple[VariantClass, float]:
+    """Type a sequence-resolved allele pair the way the imputation strata do.
+
+    SV when max(len(REF), len(ALT)) - 1 >= SEQUENCE_RESOLVED_SV_MINIMUM_LENGTH,
+    then typed by ``sequence_resolved_kind_and_length``. (Telling a DUP or an
+    INV apart needs the reference sequence; supply it as variant_class in
+    the variant metadata.)
+    """
+    if len(ref) == 1 and len(alt) == 1:
+        return VariantClass.SNV, 1.0
+    kind, length = sequence_resolved_kind_and_length(ref, alt)
     if max(len(ref), len(alt)) - 1 < SEQUENCE_RESOLVED_SV_MINIMUM_LENGTH:
         return VariantClass.SMALL_INDEL, length
-    if deletion:
-        return structural_variant_class_from_token("DEL", length), length
-    if insertion:
-        return structural_variant_class_from_token("INS", length), length
-    return VariantClass.OTHER_COMPLEX_SV, length
+    if kind == "CPX":
+        return VariantClass.OTHER_COMPLEX_SV, length
+    return structural_variant_class_from_token(kind, length), length
 
 
 def variant_class_and_length(
