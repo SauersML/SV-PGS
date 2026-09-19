@@ -512,14 +512,16 @@ def _kernel_terms(
     """(v r = v/(1 + vP), r = 1/(1 + vP), qr = vP/(1 + vP), log pi_k + log Z_jk, h^2 v r) at every node; v = 0 below
     ``floor``. Written so that an overflowing v (a node far past every effect's scale) gives its limits
     v r = 1/P, r = 0, qr = 1 and a component of weight zero, not inf * 0."""
-    variance = np.where(grid[None, :] >= floor, np.exp(log_scale_rows[:, None] + grid[None, :]), 0.0)
-    column_precision = precision[:, None]
-    ratio = variance * column_precision
-    if np.any(ratio <= -1.0):
-        raise FloatingPointError("a cavity is improper on the lattice: 1 + v P <= 0")
-    retained = 1.0 / (1.0 + ratio)
-    ratio_retained = np.where(np.isfinite(ratio), ratio * retained, 1.0)
-    conditional = np.where(np.isfinite(variance), variance * retained, 1.0 / column_precision)
+    # An overflowing v and a flat node's v = 0 are both meant: the reciprocal forms below take their limits exactly.
+    with np.errstate(over="ignore", divide="ignore"):
+        variance = np.where(grid[None, :] >= floor, np.exp(log_scale_rows[:, None] + grid[None, :]), 0.0)
+        column_precision = precision[:, None]
+        ratio = variance * column_precision
+        if np.any(ratio <= -1.0):
+            raise FloatingPointError("a cavity is improper on the lattice: 1 + v P <= 0")
+        retained = 1.0 / (1.0 + ratio)
+        ratio_retained = 1.0 / (1.0 + 1.0 / ratio)
+        conditional = 1.0 / (1.0 / variance + column_precision)
     signal = np.square(shift)[:, None] * conditional
     log_component = log_density - 0.5 * np.log1p(ratio) + 0.5 * signal
     return conditional, retained, ratio_retained, log_component, signal
@@ -1320,6 +1322,7 @@ def _maximize_evidence(
     if first is None:
         raise FloatingPointError("no structural start reaches a certified maximum at the starting penalty weights")
     start = first[1]
+    best_corrected = -np.inf
     while True:
         edges = infinite | zero
         finite = np.array([position for position in range(len(bounds)) if position not in edges], dtype=np.int64)
@@ -1330,7 +1333,18 @@ def _maximize_evidence(
         finite_weights, evidence = _ascend_evidence(
             view, weights[finite], entry[1], cavity, working_bytes, lower[finite], upper[finite], tolerance, allowed.T @ flat
         )
-        evidence = _best_certified(view, finite_weights, [evidence.coefficients, allowed.T @ flat, allowed.T @ log_normal], cavity, working_bytes, tolerance) or evidence
+        refit = _best_certified(view, finite_weights, [evidence.coefficients, allowed.T @ flat, allowed.T @ log_normal], cavity, working_bytes, tolerance)
+        if refit is not None and float(np.max(np.abs(refit.coefficients - evidence.coefficients))) > _HALF_PRECISION * (
+            1.0 + float(np.max(np.abs(evidence.coefficients)))
+        ):
+            # Another basin wins at these weights: its weights are not optimized yet, so ascend again from it, as long
+            # as each switch raises the best corrected V seen (so switches cannot cycle).
+            refit_value = _corrected_value(view, finite_weights, refit, cavity, working_bytes, tolerance)
+            if refit_value > best_corrected + tolerance:
+                best_corrected = refit_value
+                weights[finite] = finite_weights
+                coefficients = allowed @ refit.coefficients
+                continue
         weights[finite] = finite_weights
         coefficients = allowed @ evidence.coefficients
         current_value = evidence.value
