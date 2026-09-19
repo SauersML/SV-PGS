@@ -13,12 +13,12 @@ import numpy as np
 import pytest
 from sklearn.metrics import r2_score, roc_auc_score
 
-from sv_pgs import BayesianPGS
 from sv_pgs.artifact import _config_from_json
 from sv_pgs.config import ModelConfig, TraitType, VariantClass
 from sv_pgs.cli import main
 from sv_pgs.data import VariantRecord, VariantStatistics
 from sv_pgs.genotype import Int8RawGenotypeMatrix
+from sv_pgs.model import BayesianPGS
 from sv_pgs.io import (
     load_dataset_from_files,
     load_multi_source_dataset_from_files,

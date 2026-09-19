@@ -13,8 +13,8 @@ import pytest
 from scipy.integrate import quad
 from scipy.special import expit
 
-from sv_pgs import TraitType
-from sv_pgs.compute_budget import ComputeBudget, detect_compute_budget
+from sv_pgs.compute_budget import ComputeBudget, _try_import_cupy, detect_compute_budget
+from sv_pgs.config import TraitType
 from sv_pgs.data import TieGroup, TieMap
 from sv_pgs.fast_scoring import (
     ScoringModel,
@@ -24,7 +24,6 @@ from sv_pgs.fast_scoring import (
     score_genetic,
     score_linear_predictor,
 )
-from sv_pgs.genotype import _try_import_cupy
 
 
 class InMemoryCodes:

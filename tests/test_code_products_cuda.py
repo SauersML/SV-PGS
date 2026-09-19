@@ -5,8 +5,7 @@ import numpy as np
 import pytest
 
 from sv_pgs.code_products import CodeBlockTile, operand_digits, recombine_digit_products
-from sv_pgs.compute_budget import ComputeBudget
-from sv_pgs.genotype import _try_import_cupy
+from sv_pgs.compute_budget import ComputeBudget, _try_import_cupy
 from tests.test_code_products import _cpu_budget, _signed_codes
 
 cupy = _try_import_cupy()

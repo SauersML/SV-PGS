@@ -14,15 +14,10 @@ import sv_pgs.genotype as genotype_module
 import sv_pgs.mixture_inference as mixture_module
 import sv_pgs.model as model_module
 import sv_pgs.runtime_policy as runtime_policy_module
-from sv_pgs import (
-    BayesianPGS,
-    BenchmarkConfig,
-    ModelConfig,
-    TraitType,
-    VariantClass,
-    VariantRecord,
-    run_benchmark_suite,
-)
+from sv_pgs.benchmark import run_benchmark_suite
+from sv_pgs.config import BenchmarkConfig, ModelConfig, TraitType, VariantClass
+from sv_pgs.data import VariantRecord
+from sv_pgs.model import BayesianPGS
 from sv_pgs.data import TieGroup, TieMap, VariantStatistics
 from sv_pgs.genotype import RawGenotypeBatch, RawGenotypeMatrix, as_raw_genotype_matrix
 from sv_pgs.inference import VariationalFitResult

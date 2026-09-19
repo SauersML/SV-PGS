@@ -19,7 +19,9 @@ import numpy as np
 import sv_pgs.genotype as genotype_module
 import sv_pgs.mixture_inference as mixture_module
 import sv_pgs.pipeline as pipeline_module
-from sv_pgs import BayesianPGS, ModelConfig, TraitType, VariantClass, VariantRecord
+from sv_pgs.config import ModelConfig, TraitType, VariantClass
+from sv_pgs.data import VariantRecord
+from sv_pgs.model import BayesianPGS
 from sv_pgs.genotype import as_raw_genotype_matrix
 from sv_pgs.io import LoadedDataset
 

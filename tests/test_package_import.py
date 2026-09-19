@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 import subprocess
 import sys
@@ -9,39 +10,59 @@ import textwrap
 import pytest
 
 
-def test_import_sv_pgs_exports_symbols_directly():
+KEPT_MODULES = (
+    "sv_pgs.code_products",
+    "sv_pgs.compute_budget",
+    "sv_pgs.dosage_store",
+    "sv_pgs.exact_polish",
+    "sv_pgs.fast_scoring",
+    "sv_pgs.genotype_buffers",
+    "sv_pgs.genotype_statistics",
+    "sv_pgs.store_converter",
+    "sv_pgs.synthetic_store",
+)
+
+
+def test_kept_modules_load_neither_jax_nor_the_old_path():
+    """Importing the package or any kept module must not import JAX or change the CUDA math mode.
+
+    The old path's ``_jax`` shim imported JAX, enabled x64 and set ``CUPY_TF32`` for the whole
+    process as an import side effect.
+    """
     completed = subprocess.run(
         [
             sys.executable,
             "-c",
-            (
-                "import json, sys; "
-                "import sv_pgs; "
-                "print(json.dumps({"
-                "'sv_pgs.all_of_us': 'sv_pgs.all_of_us' in sys.modules, "
-                "'sv_pgs.benchmark': 'sv_pgs.benchmark' in sys.modules, "
-                "'sv_pgs.io': 'sv_pgs.io' in sys.modules, "
-                "'sv_pgs.model': 'sv_pgs.model' in sys.modules, "
-                "'BayesianPGS': hasattr(sv_pgs, 'BayesianPGS'), "
-                "'run_training_pipeline': hasattr(sv_pgs, 'run_training_pipeline'), "
-                "'AllOfUsDiseaseRequest': 'AllOfUsDiseaseRequest' in sv_pgs.__dict__"
-                "}))"
+            textwrap.dedent(
+                f"""
+                import importlib, json, os, sys
+                import sv_pgs
+                for name in {KEPT_MODULES!r}:
+                    importlib.import_module(name)
+                print(json.dumps({{
+                    "jax": sorted(name for name in sys.modules if name.split(".")[0] in ("jax", "jaxlib")),
+                    "old": sorted(
+                        name for name in sys.modules
+                        if name in ("sv_pgs._jax", "sv_pgs.genotype", "sv_pgs.io", "sv_pgs.model", "sv_pgs.pipeline")
+                    ),
+                    "CUPY_TF32": os.environ.get("CUPY_TF32"),
+                    "exports": sorted(sv_pgs.__all__),
+                }}))
+                """
             ),
         ],
         capture_output=True,
         check=True,
+        env={key: value for key, value in os.environ.items() if key != "CUPY_TF32"},
         text=True,
     )
 
-    loaded_modules = json.loads(completed.stdout.strip())
-    assert loaded_modules == {
-        "sv_pgs.all_of_us": False,
-        "sv_pgs.benchmark": True,
-        "sv_pgs.io": True,
-        "sv_pgs.model": True,
-        "BayesianPGS": True,
-        "run_training_pipeline": True,
-        "AllOfUsDiseaseRequest": False,
+    loaded = json.loads(completed.stdout.strip())
+    assert loaded == {
+        "jax": [],
+        "old": [],
+        "CUPY_TF32": None,
+        "exports": ["ModelConfig", "TraitType", "VariantClass", "VariantRecord"],
     }
 
 
@@ -67,7 +88,7 @@ def test_import_sv_pgs_succeeds_without_bigquery():
                 import sv_pgs
 
                 print(json.dumps({
-                    "BayesianPGS": hasattr(sv_pgs, "BayesianPGS"),
+                    "ModelConfig": hasattr(sv_pgs, "ModelConfig"),
                     "sv_pgs.all_of_us": "sv_pgs.all_of_us" in __import__("sys").modules,
                     "AllOfUsDiseaseRequest": "AllOfUsDiseaseRequest" in sv_pgs.__dict__,
                 }))
@@ -81,7 +102,7 @@ def test_import_sv_pgs_succeeds_without_bigquery():
 
     loaded_symbols = json.loads(completed.stdout.strip())
     assert loaded_symbols == {
-        "BayesianPGS": True,
+        "ModelConfig": True,
         "sv_pgs.all_of_us": False,
         "AllOfUsDiseaseRequest": False,
     }
