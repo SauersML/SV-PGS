@@ -198,32 +198,54 @@ def _log_occasion_density(residuals: F64Array, points: F64Array, log_masses: F64
     return logsumexp(_log_components(residuals, points[:, None], log_masses, variances)[:, 0], axis=2)
 
 
-def _log_tail(residuals: F64Array, edge: F64Array, level_variance: float, log_masses: F64Array, variances: F64Array, upper: bool) -> F64Array:
-    """log of a bound on the integrand's mass beyond ``edge`` (above it when ``upper``).
+# The level integrals certified: of F, |T| F and T^2 F (L_i and the two moments' absolute integrals).
+_MOMENT_POWERS = np.arange(3)
 
-    Past the edge each f(r_j - T) is at most f(r_j - edge) when r_j lies on the edge's inner side (it decreases
-    away from r_j) and at most f(0) otherwise, so the mass is at most their product times the prior's tail. The
-    trapezoid terms past the edge sum to no more, the prior decreasing there.
+
+def _log_prior_tail_moments(distance: F64Array, level_variance: float) -> F64Array:
+    """log of the integral of |T|^m N(T; 0, tau^2) over |T| > distance, one side, for m = 0, 1, 2 (persons x 3):
+    Phi(-a), tau phi(a) and tau^2 (a phi(a) + Phi(-a)) with a = distance / tau >= 0."""
+    scale = np.sqrt(level_variance)
+    standardized = distance / scale
+    log_survival = log_ndtr(-standardized)
+    log_density = -0.5 * (_LOG_TWO_PI + np.square(standardized))
+    second = np.logaddexp(np.log(standardized) + log_density, log_survival)
+    return np.stack([log_survival, np.log(scale) + log_density, 2.0 * np.log(scale) + second], axis=1)
+
+
+def _log_tail(residuals: F64Array, edge: F64Array, level_variance: float, log_masses: F64Array, variances: F64Array, upper: bool) -> F64Array:
+    """log of a bound on the integral of |T|^m F(T) beyond ``edge`` (above it when ``upper``), m = 0, 1, 2.
+
+    The edge lies on the far side of 0 from the bulk, so past it each f(r_j - T) is at most f(r_j - edge) when
+    r_j lies on the edge's inner side (it decreases away from r_j) and at most f(0) otherwise, and the rest is
+    the prior's tail moment (``_log_prior_tail_moments``). The trapezoid terms past the edge sum to no more.
     """
     inner = residuals <= edge[:, None] if upper else residuals >= edge[:, None]
     at_edge = _log_occasion_density(residuals, edge, log_masses, variances)
     at_peak = float(logsumexp(log_masses - 0.5 * (_LOG_TWO_PI + np.log(variances))))
-    standardized = edge / np.sqrt(level_variance)
-    return np.sum(np.where(inner, at_edge, at_peak), axis=1) + log_ndtr(-standardized if upper else standardized)
+    occasions = np.sum(np.where(inner, at_edge, at_peak), axis=1)
+    return occasions[:, None] + _log_prior_tail_moments(np.abs(edge), level_variance)
 
 
 class PieceTooLarge(MemoryError):
     """An E-step piece whose persons x nodes x J x K working arrays exceed the memory budget."""
 
 
+def _log_moment_sums(log_integrand: F64Array, levels: F64Array, steps: F64Array, offset: float) -> F64Array:
+    """log of h sum_n (|T_n| + offset)^m exp(log_integrand) for m = 0, 1, 2 (persons x 3)."""
+    log_magnitude = np.log(np.abs(levels) + offset)
+    return logsumexp(log_integrand[:, :, None] + _MOMENT_POWERS[None, None, :] * log_magnitude[:, :, None], axis=1) + np.log(steps)[:, None]
+
+
 def _level_grid(
     residuals: F64Array, level_variance: float, log_masses: F64Array, variances: F64Array, steps: F64Array, relative_tolerance: float,
     working_bytes: int,
 ) -> tuple[F64Array, np.ndarray, F64Array]:
-    """Trapezoid nodes on each person's grid n h_p (persons x nodes, a validity mask) and log L-hat.
+    """Trapezoid nodes on each person's grid n h_p (persons x nodes, a validity mask) and the log integrals of
+    |T|^m F, m = 0, 1, 2 (persons x 3).
 
-    Each side starts one prior standard deviation out and doubles until its tail bound (``_log_tail``) is at most a
-    quarter of relative_tolerance times the integral so far.
+    Each side starts one prior standard deviation past 0 and doubles until every one of its tail bounds
+    (``_log_tail``) is at most a quarter of relative_tolerance times its integral so far.
     """
     reach = np.ceil(np.sqrt(level_variance) / steps)
     lower, upper = -reach, reach.copy()
@@ -236,14 +258,14 @@ def _level_grid(
             raise PieceTooLarge(f"{levels.shape[0]} persons need {levels.shape[1]} level nodes each")
         per_occasion = logsumexp(_log_components(residuals, levels, log_masses, variances), axis=3)
         log_integrand = np.where(valid, _log_prior(levels, level_variance) + per_occasion.sum(axis=2), -np.inf)
-        log_total = logsumexp(log_integrand, axis=1) + np.log(steps)
-        if not np.all(np.isfinite(log_total)):
+        log_totals = _log_moment_sums(log_integrand, levels, steps, 0.0)
+        if not np.all(np.isfinite(log_totals[:, 0])):
             raise FloatingPointError("a person's level integral is not finite")
-        bound = np.log(0.25 * relative_tolerance) + log_total
-        grow_lower = _log_tail(residuals, lower * steps, level_variance, log_masses, variances, upper=False) > bound
-        grow_upper = _log_tail(residuals, upper * steps, level_variance, log_masses, variances, upper=True) > bound
+        bound = np.log(0.25 * relative_tolerance) + log_totals
+        grow_lower = np.any(_log_tail(residuals, lower * steps, level_variance, log_masses, variances, upper=False) > bound, axis=1)
+        grow_upper = np.any(_log_tail(residuals, upper * steps, level_variance, log_masses, variances, upper=True) > bound, axis=1)
         if not (np.any(grow_lower) or np.any(grow_upper)):
-            return levels, valid, log_total
+            return levels, valid, log_totals
         lower = np.where(grow_lower, 2.0 * lower, lower)
         upper = np.where(grow_upper, 2.0 * upper, upper)
 
@@ -252,14 +274,16 @@ def level_posterior(
     residuals: F64Array, level_variance: float, log_masses: F64Array, variances: F64Array, relative_tolerance: float,
     steps: F64Array | None, louis: bool, working_bytes: int,
 ) -> LevelPosterior:
-    """The exact E-step for persons with J occasions each (``residuals`` is persons x J), with relative error at
-    most ``relative_tolerance`` in each L_i: half from the trapezoid rule, a quarter from each truncated tail.
+    """The exact E-step for persons with J occasions each (``residuals`` is persons x J).
 
-    The trapezoid's error bound uses the mass-weighted modulus (math-density, mixing_density.md §11): on the strip
-    |Im T| < b, |N(e + i y; 0, s)| = N(e; 0, s) e^(y^2 / (2 s)) exactly, so
-    M(b) <= integral N(x; 0, tau^2) e^(b^2 / (2 tau^2)) prod_j sum_k pi_k N(r_j - x; 0, s_k) e^(b^2 / (2 s_k)) dx,
-    a sum on the same nodes. Each person's step h is certified when h <= 2 pi b / ln(1 + 2 M(b) / (eps L));
-    ``steps`` (None or NaN: the worst-case step) are shrunk to that bound until every person is certified.
+    L_i and the absolute moment integrals of |T| F and T^2 F each have relative error at most
+    ``relative_tolerance``: half from the trapezoid rule, a quarter from each truncated tail. The trapezoid's
+    bound uses the mass-weighted modulus (math-density, mixing_density.md §11): on the strip |Im T| < b,
+    |N(e + i y; 0, s)| = N(e; 0, s) e^(y^2 / (2 s)) exactly and |T^m| <= (|x| + b)^m, so
+    M_m(b) <= integral (|x| + b)^m N(x; 0, tau^2) e^(b^2 / (2 tau^2)) prod_j sum_k pi_k N(r_j - x; 0, s_k)
+    e^(b^2 / (2 s_k)) dx, a sum on the same nodes. A person's step h is certified when
+    h <= 2 pi b / ln(1 + 2 M_m(b) / (eps I_m)) for every m; ``steps`` (None or NaN: the worst-case step) shrink
+    to that bound until every person is certified.
     """
     persons, occasion_count = residuals.shape
     trapezoid_share = 0.5 * relative_tolerance
@@ -268,14 +292,14 @@ def level_posterior(
     steps = np.full(persons, worst) if steps is None else np.where(np.isnan(steps), worst, steps)
     widened = log_masses + 0.5 * half_width * half_width / variances
     while True:
-        levels, valid, log_total = _level_grid(residuals, level_variance, log_masses, variances, steps, relative_tolerance, working_bytes)
+        levels, valid, log_totals = _level_grid(residuals, level_variance, log_masses, variances, steps, relative_tolerance, working_bytes)
         log_components = _log_components(residuals, levels, log_masses, variances)
         widened_occasion = logsumexp(log_components - log_masses + widened, axis=3)
-        log_modulus = logsumexp(
-            np.where(valid, _log_prior(levels, level_variance) + 0.5 * half_width * half_width / level_variance + widened_occasion.sum(axis=2), -np.inf),
-            axis=1,
-        ) + np.log(steps)
-        admissible = 2.0 * np.pi * half_width / np.logaddexp(0.0, np.log(2.0) + log_modulus - log_total - np.log(trapezoid_share))
+        log_widened = np.where(valid, _log_prior(levels, level_variance) + 0.5 * half_width * half_width / level_variance + widened_occasion.sum(axis=2), -np.inf)
+        log_modulus = _log_moment_sums(log_widened, levels, steps, half_width)
+        admissible = np.min(
+            2.0 * np.pi * half_width / np.logaddexp(0.0, np.log(2.0) + log_modulus - log_totals - np.log(trapezoid_share)), axis=1
+        )
         uncertified = steps > admissible
         if not np.any(uncertified):
             break
@@ -301,7 +325,7 @@ def level_posterior(
             - mean_sums.T @ mean_sums
         )
     return LevelPosterior(
-        log_likelihood=log_total,
+        log_likelihood=log_totals[:, 0],
         level_mean=np.sum(weights * levels, axis=1),
         level_second_moment=np.sum(weights * np.square(levels), axis=1),
         counts=counts,
@@ -385,7 +409,8 @@ def laplace_evidence(
     null = prior.null_basis
     null_sign, null_log_determinant = np.linalg.slogdet(null.T @ negative_hessian @ null)
     if sign <= 0.0 or null_sign <= 0.0:
-        raise FloatingPointError("the penalized maximum is not strict: -H is not positive definite")
+        # Not a strict maximum: the Laplace evidence is undefined, and the search counts it as the lowest value.
+        return -np.inf
     return (
         log_likelihood
         - 0.5 * float(coefficients @ penalty @ coefficients)
@@ -590,8 +615,9 @@ class _Model:
         return float(np.log(_HALF_PRECISION * data_norm / smallest)), float(np.log(data_norm / (_HALF_PRECISION * smallest)))
 
     def fit(self, start: _State) -> tuple[_State, _Expectation, float]:
-        """The penalty weight maximizing the evidence, by golden-section search over its resolvable range with
-        warm-started EM, moving to 0 or infinity exactly when the maximum sits at an end of the range."""
+        """The penalty weight maximizing the evidence (``bracketed_maximum`` over its resolvable range, each EM
+        warm-started from the nearest weight fitted), moved to 0 or infinity exactly when the maximum sits at an
+        end of that range (the engine's edge rule)."""
         if len(start.prior.smoothing_blocks) != 1:
             raise ValueError("the occasion noise density has one class and one roughness penalty")
         fits: dict[float, tuple[_State, _Expectation, float]] = {}
@@ -604,33 +630,60 @@ class _Model:
                 fits[log_weight] = (state, expectation, self.evidence(state, expectation))
             return fits[log_weight][2]
 
-        initial = start.hyperparameters.log_smoothing[0]
+        initial = float(start.hyperparameters.log_smoothing[0])
         at(initial)
         lower, upper = self.smoothing_range(*fits[initial][:2])
-        best = _golden_maximum(at, lower, upper)
+        best = bracketed_maximum(at, float(np.clip(initial, lower, upper)), lower, upper)
         if best in (lower, upper):
-            at(np.inf if best == upper else -np.inf)
-            best = np.inf if best == upper else -np.inf
+            edge = np.inf if best == upper else -np.inf
+            at(edge)
+            if fits[edge][2] >= fits[best][2]:
+                best = edge
         return fits[best]
 
 
-def _golden_maximum(function: Callable[[float], float], lower: float, upper: float) -> float:
-    """The argmax of ``function`` over [lower, upper] by golden-section search, down to a bracket whose values
-    span less than EVIDENCE_TOLERANCE; an end of the range is returned when the maximum sits there."""
-    left = lower + _GOLDEN * (upper - lower)
-    right = upper - _GOLDEN * (upper - lower)
-    while True:
-        values = {point: function(point) for point in (lower, left, right, upper)}
-        if max(values.values()) - min(values.values()) < EVIDENCE_TOLERANCE:
-            return max(values, key=values.__getitem__)
-        if values[left] >= values[right]:
-            upper, right = right, left
-            left = lower + _GOLDEN * (upper - lower)
+def bracketed_maximum(function: Callable[[float], float], start: float, lower: float, upper: float) -> float:
+    """A maximizer of ``function`` over [lower, upper]: a bracket grown from ``start`` by golden-ratio steps,
+    starting one unit out (the step sets only the search's cost), then golden-section search until the bracket's
+    values span less than EVIDENCE_TOLERANCE, or it is half of double precision wide. An end of the range is
+    returned when the function still rises there. Values of -inf (uncertified maxima) count as the lowest."""
+    growth = 1.0 / _GOLDEN - 1.0
+    forward, backward = float(min(start + 1.0, upper)), float(max(start - 1.0, lower))
+    centre = function(start)
+    if forward > start and function(forward) >= centre:
+        previous, middle = start, forward
+    elif backward < start and function(backward) > centre:
+        previous, middle = start, backward
+    else:
+        previous = middle = None
+        low, high = backward, forward
+    if middle is not None:
+        while True:
+            beyond = float(np.clip(middle + growth * (middle - previous), lower, upper))
+            if beyond == middle:
+                return middle
+            if function(beyond) < function(middle):
+                low, high = min(previous, beyond), max(previous, beyond)
+                break
+            previous, middle = middle, beyond
+    else:
+        middle = start
+    while high - low > _HALF_PRECISION * (1.0 + abs(high) + abs(low)):
+        if max(function(low), function(middle), function(high)) - min(function(low), function(high)) < EVIDENCE_TOLERANCE:
+            break
+        if high - middle > middle - low:
+            trial = middle + _GOLDEN * (high - middle)
+            if function(trial) > function(middle):
+                low, middle = middle, trial
+            else:
+                high = trial
         else:
-            lower, left = left, right
-            right = upper - _GOLDEN * (upper - lower)
-        if upper - lower <= _HALF_PRECISION * (1.0 + abs(upper) + abs(lower)):
-            return max(values, key=values.__getitem__)
+            trial = middle - _GOLDEN * (middle - low)
+            if function(trial) > function(middle):
+                high, middle = middle, trial
+            else:
+                low = trial
+    return middle
 
 
 def _result(model: _Model, state: _State, expectation: _Expectation, evidence: float) -> OccasionModelFit:
@@ -665,9 +718,8 @@ def fit_at_exponent(occasions: Occasions, exponent: float, working_bytes: int) -
 
 
 def fit_occasion_model(occasions: Occasions, working_bytes: int) -> OccasionModelFit:
-    """The fit at the Box-Cox exponent maximizing the profile evidence, by golden-section search from the log (0)
-    and the identity (1): the bracket grows until its middle point is the best of three, then narrows until its
-    evidence spans less than EVIDENCE_TOLERANCE. Each exponent's EM starts from the nearest one already fitted."""
+    """The fit at the Box-Cox exponent maximizing the profile evidence (``bracketed_maximum`` from the identity,
+    one unit to the log), each exponent's EM starting from the nearest one already fitted."""
     fits: dict[float, tuple[_Model, tuple[_State, _Expectation, float]]] = {}
 
     def evidence(exponent: float) -> float:
@@ -682,25 +734,7 @@ def fit_occasion_model(occasions: Occasions, working_bytes: int) -> OccasionMode
             fits[exponent] = (model, model.fit(start))
         return fits[exponent][1][2]
 
-    low, middle = 0.0, 1.0
-    if evidence(middle) < evidence(low):
-        low, middle = middle, low
-    high = middle + (middle - low) * (1.0 - _GOLDEN) / _GOLDEN
-    while evidence(high) > evidence(middle):
-        low, middle, high = middle, high, high + (high - middle) * (1.0 - _GOLDEN) / _GOLDEN
-    while max(evidence(low), evidence(middle), evidence(high)) - min(evidence(low), evidence(high)) >= EVIDENCE_TOLERANCE:
-        if abs(high - middle) > abs(middle - low):
-            trial = middle + _GOLDEN * (high - middle)
-            if evidence(trial) > evidence(middle):
-                low, middle = middle, trial
-            else:
-                high = trial
-        else:
-            trial = middle - _GOLDEN * (middle - low)
-            if evidence(trial) > evidence(middle):
-                high, middle = middle, trial
-            else:
-                low = trial
+    middle = bracketed_maximum(evidence, 1.0, -np.inf, np.inf)
     model, (state, expectation, evidence_value) = fits[middle]
     return _result(model, state, expectation, evidence_value)
 
