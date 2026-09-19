@@ -4,6 +4,7 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
+from sv_pgs.compute_budget import ComputeBudget
 from sv_pgs.dosage_store import (
     MISSING_CODE,
     CodeArray,
@@ -36,6 +37,23 @@ from sv_pgs.store_converter import (
     value_matched_background,
     write_store_manifest,
 )
+
+
+def _budget(host_bytes: int) -> ComputeBudget:
+    return ComputeBudget(
+        device_kind="cpu",
+        device_ids=(),
+        device_names=(),
+        device_bytes=(),
+        device_compute_capabilities=(),
+        host_bytes=host_bytes,
+        cpu_threads=1,
+    )
+
+
+_BUDGET = _budget(1 << 30)
+# One byte of budget leaves room for one row per step.
+_ONE_ROW_BUDGET = _budget(1)
 
 
 def test_core_spans_cover_the_changed_reference_bases() -> None:
@@ -246,10 +264,10 @@ def test_decode_and_assemble_write_background_corrected_codes(tmp_path) -> None:
         path = tmp_path / f"batch{index}.vcf"
         _write_batch(path, dosages)
         groups = np.zeros(len(dosages[0]), dtype=np.int64)
-        batches.append(decode_batch(path, expected, groups, 1, tmp_path / f"batch{index}.npy"))
+        batches.append(decode_batch(path, expected, groups, 1, tmp_path / f"batch{index}.npy", _BUDGET))
 
     root = tmp_path / "store"
-    sums, squares = assemble_half(root, 0, "chr22", [batch.codes for batch in batches], np.zeros(5, dtype=np.int64), None, _fill_of(batches), codec="raw")
+    sums, squares = assemble_half(root, 0, "chr22", [batch.codes for batch in batches], np.zeros(5, dtype=np.int64), None, _fill_of(batches), codec="raw", budget=_BUDGET)
 
     dosage_milli = np.rint(np.hstack([np.asarray(dosages) for dosages in _BATCH_DOSAGES]) * 1000).astype(np.uint16)
     corrected = value_matched_background(dosage_milli, expected.kept_paths, expected.carrying_paths).dosage_milli
@@ -283,6 +301,19 @@ def test_decode_and_assemble_write_background_corrected_codes(tmp_path) -> None:
     store = DosageStore.open(root)
     np.testing.assert_array_equal(store.read_codes(0, 3), expected_codes)
     assert batches[0].zeroed.tolist() == [2, 2, 0] and batches[1].zeroed.tolist() == [1, 1, 0]
+    # Budget-sized steps change how many rows each step handles, never the result.
+    for index, dosages in enumerate(_BATCH_DOSAGES):
+        one_row = decode_batch(
+            tmp_path / f"batch{index}.vcf", expected, np.zeros(len(dosages[0]), dtype=np.int64), 1, tmp_path / f"row{index}.npy", _ONE_ROW_BUDGET
+        )
+        np.testing.assert_array_equal(one_row.codes, batches[index].codes)
+        np.testing.assert_array_equal(one_row.group_sums, batches[index].group_sums)
+    one_row_sums, one_row_squares = assemble_half(
+        tmp_path / "one_row_store", 0, "chr22", [batch.codes for batch in batches], np.zeros(5, dtype=np.int64), None,
+        _fill_of(batches), codec="raw", budget=_ONE_ROW_BUDGET,
+    )
+    np.testing.assert_array_equal(one_row_sums, sums)
+    np.testing.assert_array_equal(one_row_squares, squares)
     assert batches[0].group_sums[:, 0].tolist() == [1000, 1500, 2001]
 
 
@@ -292,17 +323,17 @@ def test_decode_batch_fails_closed_on_a_sidecar_mismatch(tmp_path) -> None:
     shifted = _expected_sites(np.array([1_000, 2_001, 3_000], dtype=np.int64))
 
     with pytest.raises(ValueError, match="record 1: POS differs"):
-        decode_batch(path, shifted, np.zeros(2, dtype=np.int64), 1, tmp_path / "codes.npy")
+        decode_batch(path, shifted, np.zeros(2, dtype=np.int64), 1, tmp_path / "codes.npy", _BUDGET)
 
 
 def test_assemble_half_applies_the_linear_recalibration(tmp_path) -> None:
     expected = _expected_sites()
     path = tmp_path / "batch.vcf"
     _write_batch(path, _BATCH_DOSAGES[0])
-    batch = decode_batch(path, expected, np.array([0, 0, 1]), 2, tmp_path / "codes.npy")
+    batch = decode_batch(path, expected, np.array([0, 0, 1]), 2, tmp_path / "codes.npy", _BUDGET)
     scales = np.array([[0.5, 1.0], [0.5, 1.0], [0.5, 1.0]])
 
-    assemble_half(tmp_path / "store", 0, "chr22", [batch.codes], np.array([0, 0, 1]), scales, _fill_of([batch]), codec="raw")
+    assemble_half(tmp_path / "store", 0, "chr22", [batch.codes], np.array([0, 0, 1]), scales, _fill_of([batch]), codec="raw", budget=_BUDGET)
 
     dosage_milli = ((batch.codes.astype(np.int64) * 2000 + 127) // 254).astype(np.uint16)
     recalibrated = encode_dosage_milli(linear_recalibration(dosage_milli, np.array([0, 0, 1]), scales).dosage_milli)
@@ -337,15 +368,15 @@ def test_a_long_read_half_joins_the_imputed_halves_on_the_same_sites(tmp_path) -
     for index, dosages in enumerate(_BATCH_DOSAGES):
         path = tmp_path / f"batch{index}.vcf"
         _write_batch(path, dosages)
-        imputed.append(decode_batch(path, expected, np.zeros(len(dosages[0]), dtype=np.int64), 1, tmp_path / f"imputed{index}.npy"))
+        imputed.append(decode_batch(path, expected, np.zeros(len(dosages[0]), dtype=np.int64), 1, tmp_path / f"imputed{index}.npy", _BUDGET))
     called_path = tmp_path / "long_read.vcf"
     _write_called_batch(called_path, [["0|1", "1|1"], ["0|0", "1|0"], ["1|1", "0|0"]])
-    long_read = decode_called_batch(called_path, expected, np.zeros(2, dtype=np.int64), 1, tmp_path / "long_read.npy")
+    long_read = decode_called_batch(called_path, expected, np.zeros(2, dtype=np.int64), 1, tmp_path / "long_read.npy", _BUDGET)
 
     root = tmp_path / "store"
     fill = _fill_of([*imputed, long_read])
-    imputed_sums, imputed_squares = assemble_half(root, 0, "chr22", [batch.codes for batch in imputed], np.zeros(5, dtype=np.int64), None, fill, codec="raw")
-    long_read_sums, long_read_squares = assemble_half(root, 1, "chr22", [long_read.codes], np.zeros(2, dtype=np.int64), None, fill, codec="zstd")
+    imputed_sums, imputed_squares = assemble_half(root, 0, "chr22", [batch.codes for batch in imputed], np.zeros(5, dtype=np.int64), None, fill, codec="raw", budget=_BUDGET)
+    long_read_sums, long_read_squares = assemble_half(root, 1, "chr22", [long_read.codes], np.zeros(2, dtype=np.int64), None, fill, codec="zstd", budget=_BUDGET)
     positions = expected.positions
     ref_lengths = np.array([len(site[1]) for site in _SITES], dtype=np.int32)
     alt_lengths = np.array([len(site[2]) for site in _SITES], dtype=np.int32)
@@ -391,14 +422,14 @@ def test_a_long_read_no_call_takes_its_groups_measured_mean(tmp_path) -> None:
     _write_called_batch(first, [["0|1", "./."], ["0|0", "1|1"], ["1|1", "0|0"]])
     _write_called_batch(second, [["1|1", "./."], ["./.", "0|1"], ["1|1", "0|1"]])
     batches = [
-        decode_called_batch(path, expected, np.array([0, 1]), 2, tmp_path / f"{path.stem}.npy")
+        decode_called_batch(path, expected, np.array([0, 1]), 2, tmp_path / f"{path.stem}.npy", _BUDGET)
         for path in (first, second)
     ]
     assert batches[0].codes[0].tolist() == [127, MISSING_CODE]
     assert batches[0].no_calls.tolist() == [1, 0, 0]
 
     root = tmp_path / "store"
-    assemble_half(root, 0, "chr22", [batch.codes for batch in batches], np.array([0, 1, 0, 1]), None, _fill_of(batches), codec="raw")
+    assemble_half(root, 0, "chr22", [batch.codes for batch in batches], np.array([0, 1, 0, 1]), None, _fill_of(batches), codec="raw", budget=_BUDGET)
 
     # Record 0: group 1 has no measurement, so both take the pooled mean (1000 + 2000) / 2.
     # Record 1: sample 2's group 0 measured 0|0 in the other batch, so 0.
@@ -411,7 +442,7 @@ def test_a_long_read_no_call_takes_its_groups_measured_mean(tmp_path) -> None:
 def test_a_record_no_sample_measured_fails(tmp_path) -> None:
     path = tmp_path / "long_read.vcf"
     _write_called_batch(path, [["0|1", "1|1"], ["./.", "./."], ["1|1", "0|0"]])
-    batch = decode_called_batch(path, _expected_sites(), np.zeros(2, dtype=np.int64), 1, tmp_path / "codes.npy")
+    batch = decode_called_batch(path, _expected_sites(), np.zeros(2, dtype=np.int64), 1, tmp_path / "codes.npy", _BUDGET)
 
     with pytest.raises(ValueError, match="record 1: no sample has a measurement"):
         _fill_of([batch])

@@ -38,6 +38,7 @@ from cyvcf2 import VCF
 import numpy as np
 
 from sv_pgs._typing import BoolArray, I64Array, NDArray, U8Array
+from sv_pgs.compute_budget import ComputeBudget
 from sv_pgs.dosage_store import (
     CODES_PER_DOSAGE,
     MAXIMUM_CODE,
@@ -60,14 +61,31 @@ NO_LOCUS = np.uint32(0xFFFFFFFF)
 NO_RECORD = np.uint32(0xFFFFFFFF)
 NO_DISTANCE = np.uint32(0xFFFFFFFF)
 SV_CONTEXT_WINDOW = 50_000
-# Records decoded, corrected and encoded per step of a batch's pass.
-DECODE_BLOCK_ROWS = 4_096
+_UINT8, _UINT16, _UINT32, _INT64, _FLOAT64, _BOOL = (
+    np.dtype(kind).itemsize for kind in (np.uint8, np.uint16, np.uint32, np.int64, np.float64, np.bool_)
+)
+# Bytes per (record, sample) of every array one decode step allocates, an upper bound on its
+# working set: the block, the dosages with no-calls zeroed and the background result (two
+# copies each), the background test's int64 widening and its masks, the encoding's four
+# uint32 passes and uint8 result, the codes merged with no-calls, and the per-group slices.
+DECODE_STEP_BYTES_PER_ENTRY = 5 * _UINT16 + _INT64 + 4 * _UINT32 + 2 * _UINT8 + _UINT16 + 10 * _BOOL
+# The same bound for one assembly step with the D* recalibration: the batches side by side,
+# the no-call mask and its int64 indices, the code-to-thousandths int64 passes, the
+# recalibration's float64 copies and masks, and the re-encoding.
+ASSEMBLY_STEP_BYTES_PER_ENTRY = (
+    _UINT8 + _BOOL + 2 * _INT64 + 4 * _INT64 + _UINT16 + 10 * _FLOAT64 + 3 * _BOOL + _UINT16 + 4 * _UINT32 + _UINT8
+)
 # GP is written to 3 decimals, so its thousandths sum to 1000 within one unit of rounding.
 GENOTYPE_PROBABILITY_SUM_SLACK_MILLI = 1
 # DS and GP are rounded from one unrounded GP. With a, b in [0, 1) the fractional thousandths
 # of GP1 and GP2, DS rounds a + 2b while GP1 + 2 GP2 rounds a and b separately; every case
 # away from exact halves puts the two within one thousandth.
 DOSAGE_FROM_PROBABILITY_SLACK_MILLI = 1
+
+
+def _block_rows(budget: ComputeBudget, sample_count: int, bytes_per_entry: int, row_count: int) -> int:
+    """Rows per step whose working set, at ``bytes_per_entry`` per sample, fits the host budget."""
+    return max(1, min(row_count, int(budget.host_bytes) // (bytes_per_entry * max(sample_count, 1))))
 
 
 def core_spans(positions: NDArray, refs: Sequence[str], alts: Sequence[str]) -> tuple[I64Array, I64Array]:
@@ -116,7 +134,7 @@ def value_matched_background(
     single-path record (1 and 2 milli), a PL-bearing record (per-sample floors 0 and 2 eps) and
     a record none of whose paths was kept (m = 0, nothing changes). ``dosage_milli`` is
     [records, samples] integer; ``zeroed`` counts the changed entries per record and
-    ``unmatched_low`` the entries left in 1..9 milli (few, and on carriers).
+    ``unmatched_low`` the entries left nonzero below one stored code step (few, and on carriers).
     """
     milli = np.asarray(dosage_milli)
     if milli.dtype.kind not in "iu" or milli.ndim != 2:
@@ -134,7 +152,8 @@ def value_matched_background(
     values = milli.astype(np.int64)
     matched = (values != 0) & ((values == single) | (values == double))
     corrected = np.where(matched, 0, milli).astype(milli.dtype)
-    low = (corrected > 0) & (corrected < 10)
+    # A residual below one stored code step (1/127 of a dosage) is smaller than the store resolves.
+    low = (corrected > 0) & (corrected.astype(np.int64) * CODES_PER_DOSAGE < MAXIMUM_DOSAGE_MILLI // 2)
     return BackgroundCorrection(
         dosage_milli=corrected,
         zeroed=matched.sum(axis=1).astype(np.int64),
@@ -485,6 +504,7 @@ def _decode_records(
     codes_path: str | Path,
     record_dosage_milli: Callable[[Any, Path, int], NDArray],
     remove_background: bool,
+    budget: ComputeBudget,
 ) -> DecodedBatch:
     path = Path(vcf_path)
     groups = np.asarray(sample_groups, dtype=np.int64)
@@ -500,11 +520,12 @@ def _decode_records(
         zeroed = np.zeros(record_count, dtype=np.int64)
         unmatched_low = np.zeros(record_count, dtype=np.int64)
         no_calls = np.zeros(record_count, dtype=np.int64)
-        block = np.empty((DECODE_BLOCK_ROWS, sample_count), dtype=np.uint16)
+        block_rows = _block_rows(budget, sample_count, DECODE_STEP_BYTES_PER_ENTRY, record_count)
+        block = np.empty((block_rows, sample_count), dtype=np.uint16)
         members = [groups == group for group in range(group_count)]
 
         def flush(stop: int) -> None:
-            start = (stop - 1) // DECODE_BLOCK_ROWS * DECODE_BLOCK_ROWS
+            start = (stop - 1) // block_rows * block_rows
             called = block[: stop - start] != NO_CALL_MILLI
             dosage_milli = np.where(called, block[: stop - start], 0).astype(np.uint16)
             if remove_background:
@@ -524,12 +545,12 @@ def _decode_records(
             _gate(record.POS == int(expected.positions[row]), path, row, "POS differs from the sidecar")
             _gate(refalt_digest(record.REF, ",".join(record.ALT)) == int(expected.refalt_digests[row]), path, row, "REF/ALT differ")
             _gate(str(record.INFO.get("ID")) == expected.identifiers[row], path, row, "INFO/ID differs")
-            block[row % DECODE_BLOCK_ROWS] = record_dosage_milli(record, path, row).astype(np.uint16)
+            block[row % block_rows] = record_dosage_milli(record, path, row).astype(np.uint16)
             row += 1
-            if row % DECODE_BLOCK_ROWS == 0:
+            if row % block_rows == 0:
                 flush(row)
         _gate(row == record_count, path, row, f"fewer records than the sidecar's {record_count}")
-        if row % DECODE_BLOCK_ROWS:
+        if row % block_rows:
             flush(row)
         codes.flush()
     finally:
@@ -550,6 +571,7 @@ def decode_batch(
     sample_groups: NDArray,
     group_count: int,
     codes_path: str | Path,
+    budget: ComputeBudget,
 ) -> DecodedBatch:
     """Decode one popped imputed batch file of one chromosome into corrected store codes.
 
@@ -557,9 +579,10 @@ def decode_batch(
     every sample needs DS and GP with GP summing to 1 and DS = GP1 + 2 GP2 to within a
     thousandth (G4). The value-matched background is removed before encoding. ``codes_path``
     receives the codes as an .npy; ``sample_groups`` gives each of the file's samples, in header
-    order, its ancestry group in 0..group_count-1.
+    order, its ancestry group in 0..group_count-1. Records are decoded in steps whose working
+    set fits ``budget``'s host memory.
     """
-    return _decode_records(vcf_path, expected, sample_groups, group_count, codes_path, _imputed_dosage_milli, True)
+    return _decode_records(vcf_path, expected, sample_groups, group_count, codes_path, _imputed_dosage_milli, True, budget)
 
 
 def decode_called_batch(
@@ -568,13 +591,14 @@ def decode_called_batch(
     sample_groups: NDArray,
     group_count: int,
     codes_path: str | Path,
+    budget: ComputeBudget,
 ) -> DecodedBatch:
     """Decode hard genotype calls (the long-read panel members' half) on the same site list.
 
     The same lockstep gate as ``decode_batch``; each sample's dosage is its called ALT count, with
     no imputation background to remove. A no-call stays MISSING_CODE until ``assemble_half``.
     """
-    return _decode_records(vcf_path, expected, sample_groups, group_count, codes_path, _called_dosage_milli, False)
+    return _decode_records(vcf_path, expected, sample_groups, group_count, codes_path, _called_dosage_milli, False, budget)
 
 
 def no_call_fill(group_sums: I64Array, group_counts: I64Array) -> NDArray:
@@ -627,7 +651,7 @@ def assemble_half(
     no_call_milli: NDArray,
     *,
     codec: Codec,
-    block_rows: int = DECODE_BLOCK_ROWS,
+    budget: ComputeBudget,
 ) -> tuple[I64Array, I64Array]:
     """Write one half of one chromosome from its batches' codes, columns in batch order.
 
@@ -636,7 +660,8 @@ def assemble_half(
     ``scales`` is the per-record, per-group kappa of the D* recalibration where
     design-reliability supplies one, or None before it exists (the stored codes are then the
     background-corrected DS, and the MANIFEST says so). Writes the half's per-record ``no_calls``
-    statistic beside its code sums and returns the sums.
+    statistic beside its code sums and returns the sums; each step's working set fits
+    ``budget``'s host memory.
     """
     if not batch_codes:
         raise ValueError("assemble_half needs at least one batch.")
@@ -657,7 +682,9 @@ def assemble_half(
         chromosome,
         record_count,
         sample_count,
-        _half_code_blocks(batch_codes, groups, scales, fill, block_rows, no_calls),
+        _half_code_blocks(
+            batch_codes, groups, scales, fill, _block_rows(budget, sample_count, ASSEMBLY_STEP_BYTES_PER_ENTRY, record_count), no_calls
+        ),
         codec=codec,
     )
     write_column(statistic_column_directory(Path(root), half_index, chromosome, "no_calls"), no_calls)
