@@ -35,8 +35,22 @@ from sv_pgs.all_of_us import (
     resolve_lab_criterion_measurement,
     resolve_measurement_definition,
 )
+from tests.phenotype_bounds import (
+    sampling_bound,
+    variance_component_standard_errors,
+    variance_condition,
+    within_rounding,
+)
 
 DATASET = "aou_workspace.cdr_dataset"
+
+
+def _identity_mean_operations(occasion_count: int) -> int:
+    """A plain trait's occasion mean: the unit conversion (2) and the same-day
+    mean (2) per value, then the mean over the occasions."""
+    return 4 + occasion_count
+
+
 OMOP_TABLES = {
     "person": (
         "person_id BIGINT, gender_concept_id BIGINT, year_of_birth BIGINT, race_concept_id BIGINT, "
@@ -361,10 +375,13 @@ def test_row_rules_units_and_same_day_collapse(cdr: _Cdr):
     second_age = _age("2016-05-10", 1960)
     second_occasion = math.log(_ckd_epi_2021(1.0, second_age, female=True))
     assert first["untreated_occasion_count"] == 2
-    assert first["untreated_mean"] == pytest.approx(np.mean([first_occasion, second_occasion]), rel=1e-12)
-    assert first["untreated_variance"] == pytest.approx(np.var([first_occasion, second_occasion]), rel=1e-9)
-    assert first["untreated_mean_age"] == pytest.approx((first_age + second_age) / 2, rel=1e-12)
-    assert first["untreated_mean_age_squared"] == pytest.approx((first_age**2 + second_age**2) / 2, rel=1e-12)
+    # An occasion value takes 20 rounded operations: the unit conversion, the
+    # CKD-EPI terms, the log, the same-day mean and the occasion mean.
+    occasions = [first_occasion, second_occasion]
+    assert first["untreated_mean"] == within_rounding(np.mean(occasions), 20)
+    assert first["untreated_variance"] == within_rounding(np.var(occasions), 26, variance_condition(occasions))
+    assert first["untreated_mean_age"] == within_rounding((first_age + second_age) / 2, 3)
+    assert first["untreated_mean_age_squared"] == within_rounding((first_age**2 + second_age**2) / 2, 4)
     assert first["treated_occasion_count"] == 0
     assert first["sex_at_birth_name"] == "female"
 
@@ -375,7 +392,7 @@ def test_row_rules_units_and_same_day_collapse(cdr: _Cdr):
         for date, value in (("2020-06-01", 1.1), ("2021-06-01", 0.9))
     ]
     assert second["untreated_occasion_count"] == 2
-    assert second["untreated_mean"] == pytest.approx(np.mean(male_occasions), rel=1e-12)
+    assert second["untreated_mean"] == within_rounding(np.mean(male_occasions), 20)
 
     # eGFR needs sex at birth; a skipped answer is not guessed.
     third = rows["3"]
@@ -403,7 +420,7 @@ def test_acute_care_windows_span_thirty_days_around_each_stay(cdr: _Cdr):
     row = cdr.measurement_rows(mcv)["1"]
     assert _excluded(row) == {"acute_care": 4}
     assert row["untreated_occasion_count"] == 3
-    assert row["untreated_mean"] == pytest.approx(np.mean([80.0, 84.0, 86.0]))
+    assert row["untreated_mean"] == within_rounding(np.mean([80.0, 84.0, 86.0]), _identity_mean_operations(3))
 
 
 def test_pregnancy_windows_come_from_conditions_and_antenatal_observations(cdr: _Cdr):
@@ -424,7 +441,7 @@ def test_pregnancy_windows_come_from_conditions_and_antenatal_observations(cdr: 
     row = cdr.measurement_rows(mcv)["1"]
     assert _excluded(row) == {"pregnancy": 3}
     assert row["untreated_occasion_count"] == 3
-    assert row["untreated_mean"] == pytest.approx(np.mean([81.0, 83.0, 84.0]))
+    assert row["untreated_mean"] == within_rounding(np.mean([81.0, 83.0, 84.0]), _identity_mean_operations(3))
 
 
 def test_clinical_windows_cover_conditions_procedures_and_drugs(cdr: _Cdr):
@@ -448,7 +465,7 @@ def test_clinical_windows_cover_conditions_procedures_and_drugs(cdr: _Cdr):
         cdr.measurement(1, date, value, concept_id=3023599, unit_concept_id=8583)
     row = cdr.measurement_rows(mcv)["1"]
     assert _excluded(row) == {"clinical_exclusion": 5}
-    assert row["untreated_mean"] == pytest.approx(np.mean([90.0, 92.0, 95.0, 97.0]))
+    assert row["untreated_mean"] == within_rounding(np.mean([90.0, 92.0, 95.0, 97.0]), _identity_mean_operations(4))
 
 
 def test_diabetes_removes_every_hba1c_value_of_the_person(cdr: _Cdr):
@@ -465,7 +482,7 @@ def test_diabetes_removes_every_hba1c_value_of_the_person(cdr: _Cdr):
     assert _excluded(rows["1"]) == {"clinical_exclusion": 2}
     assert _excluded(rows["2"]) == {"clinical_exclusion": 2}
     assert _excluded(rows["3"]) == {}
-    assert rows["3"]["untreated_mean"] == pytest.approx(5.7)
+    assert rows["3"]["untreated_mean"] == within_rounding(np.mean([5.6, 5.8]), _identity_mean_operations(2))
 
 
 def test_physical_measurements_use_protocol_means_and_convert_inches(cdr: _Cdr):
@@ -482,10 +499,10 @@ def test_physical_measurements_use_protocol_means_and_convert_inches(cdr: _Cdr):
     cdr.measurement(1, "2019-05-01", 125.0, concept_id=3004249, unit_concept_id=None)
     heights = cdr.measurement_rows(height)["1"]
     assert heights["untreated_occasion_count"] == 3
-    assert heights["untreated_mean"] == pytest.approx(np.mean([180.0, 71.0 * 2.54000508, 70.0 * 2.54]))
+    assert heights["untreated_mean"] == within_rounding(np.mean([180.0, 71.0 * 2.54000508, 70.0 * 2.54]), _identity_mean_operations(3))
     pressures = cdr.measurement_rows(systolic)["1"]
     assert pressures["measurement_row_count"] == 2
-    assert pressures["untreated_mean"] == pytest.approx(np.mean([131.0, 125.0]))
+    assert pressures["untreated_mean"] == within_rounding(np.mean([131.0, 125.0]), _identity_mean_operations(2))
 
 
 def test_occasions_on_or_after_the_first_exposure_are_treated(cdr: _Cdr):
@@ -501,11 +518,14 @@ def test_occasions_on_or_after_the_first_exposure_are_treated(cdr: _Cdr):
     rows = cdr.measurement_rows(ldl)
     treated_person = rows["1"]
     assert treated_person["untreated_occasion_count"] == 1
-    assert treated_person["untreated_mean"] == pytest.approx(160.0)
+    assert treated_person["untreated_mean"] == within_rounding(160.0, _identity_mean_operations(1))
     assert treated_person["treated_occasion_count"] == 2
-    assert treated_person["treated_mean"] == pytest.approx(100.0)
-    assert treated_person["treated_variance"] == pytest.approx(100.0)
-    assert rows["2"]["untreated_mean"] == pytest.approx(104.0)
+    assert treated_person["treated_mean"] == within_rounding(100.0, _identity_mean_operations(2))
+    # The population variance adds a mean, two deviations, two squares and their mean.
+    assert treated_person["treated_variance"] == within_rounding(
+        100.0, _identity_mean_operations(2) + 6, variance_condition([110.0, 90.0])
+    )
+    assert rows["2"]["untreated_mean"] == within_rounding(104.0, _identity_mean_operations(1))
     assert rows["2"]["treated_occasion_count"] == 0
 
 
@@ -527,11 +547,19 @@ def test_query_rows_feed_the_target_builder_end_to_end(cdr: _Cdr):
     rows = list(cdr.measurement_rows(mcv).values())
     training_rows, _columns, summary = build_all_of_us_measurement_targets(mcv, rows)
     assert summary["n_persons"] == 300
-    assert summary["between_person_variance"] == pytest.approx(25.0, rel=0.3)
-    assert summary["within_person_variance"] == pytest.approx(9.0, rel=0.2)
+    between_variance, within_variance = 25.0, 9.0
+    counts = np.array([row["untreated_occasion_count"] for row in rows], dtype=np.float64)
+    between_standard_error, within_standard_error = variance_component_standard_errors(
+        counts, between_variance, within_variance
+    )
+    assert abs(summary["within_person_variance"] - within_variance) < sampling_bound(within_standard_error)
+    assert abs(summary["between_person_variance"] - between_variance) < sampling_bound(between_standard_error)
+    # The BLUP of each long-run mean correlates with the true effect by sqrt(mean reliability).
     targets = np.array([row["target"] for row in training_rows])
     effects = np.array([person_effects[row["person_id"]] for row in training_rows])
-    assert np.corrcoef(targets, effects)[0, 1] > 0.85
+    expected_correlation = np.sqrt(np.mean(between_variance / (between_variance + within_variance / counts)))
+    correlation_standard_error = (1.0 - expected_correlation**2) / np.sqrt(len(counts))
+    assert np.corrcoef(targets, effects)[0, 1] > expected_correlation - sampling_bound(correlation_standard_error)
 
 
 # ---------------------------------------------------------------------------
@@ -565,7 +593,7 @@ def test_type2_diabetes_cases_need_two_dates_or_non_metformin_support(cdr: _Cdr)
 
     rows = cdr.disease_rows(type2_diabetes)
     assert rows["1"]["phenotype_occurrence_count"] == 2
-    assert rows["1"]["age_at_first_condition"] == pytest.approx(_age("2015-01-01", 1951))
+    assert rows["1"]["age_at_first_condition"] == within_rounding(_age("2015-01-01", 1951), 1)
     assert rows["1"]["year_of_birth"] == 1951
     assert rows["2"]["case_medication_dates"] == 1
     assert rows["3"]["case_medication_dates"] == 0
@@ -603,7 +631,7 @@ def test_diagnosis_roots_distinct_drug_dates_and_case_procedures(cdr: _Cdr):
     cataract_definition = resolve_disease_definition("cataract")
     cataract = cdr.disease_rows(cataract_definition)
     assert cataract["3"]["case_procedure_dates"] == 1
-    assert cataract["3"]["age_at_first_case_procedure"] == pytest.approx(_age("2019-04-01", 1950))
+    assert cataract["3"]["age_at_first_case_procedure"] == within_rounding(_age("2019-04-01", 1950), 1)
     assert cataract["4"]["has_ambiguous_code"] is True
 
     training_rows, _columns, counts = _prepare_training_rows(cataract_definition, list(cataract.values()), [])

@@ -64,6 +64,12 @@ from sv_pgs.all_of_us import (
     resolve_measurement_definition,
 )
 from sv_pgs.cli import main
+from tests.phenotype_bounds import (
+    rounding_gamma,
+    sampling_bound,
+    variance_component_standard_errors,
+    within_rounding,
+)
 
 # Columns of the OMOP CDM v5.4 tables the query reads, from the official
 # BigQuery DDL (github.com/OHDSI/CommonDataModel, inst/ddl/5.4/bigquery/
@@ -405,6 +411,29 @@ def test_prepare_all_of_us_disease_sample_table_writes_outputs(tmp_path: Path, m
     assert metadata_payload["cdr_dataset"] == "aou_workspace.cdr_dataset"
 
 
+def _case_liability_within_rounding(probability: float):
+    """ndtri(probability), a case's liability, to its float64 forward error bound.
+
+    Either side reaches it in at most 10 rounded operations: two Kaplan-Meier
+    steps (3 each), the survival mid-point (2) and ndtri (2). The relative
+    condition number of z = ndtri(p) is p / (phi(z) |z|).
+    """
+    liability = norm.ppf(probability)
+    return within_rounding(liability, 10, probability / (norm.pdf(liability) * abs(liability)))
+
+
+def _control_liability_within_rounding(survival: float):
+    """-phi(z) / S with z = ndtri(S), a control's liability, to its float64 forward error bound.
+
+    Either side reaches it in at most 15 rounded operations: two Kaplan-Meier
+    steps (3 each), ndtri (2), the normal density (6) and the quotient (1). The
+    relative condition number with respect to S is |1 + z S / phi(z)|.
+    """
+    threshold = norm.ppf(survival)
+    liability = truncnorm(-np.inf, threshold).mean()
+    return within_rounding(liability, 15, abs(1.0 + threshold * survival / norm.pdf(threshold)))
+
+
 def test_liability_target_matches_the_age_of_onset_threshold_model():
     # One stratum: cases diagnosed at 50 and 60, controls censored at 55, 65, 70.
     # Kaplan-Meier: S(50) = 4/5, S(60) = 4/5 * 2/3.
@@ -412,14 +441,10 @@ def test_liability_target_matches_the_age_of_onset_threshold_model():
     ages = np.array([50.0, 55.0, 60.0, 65.0, 70.0])
     liabilities = _liability_targets(targets, ages, ["female"] * 5)
     survival_50, survival_60 = 0.8, 0.8 * 2.0 / 3.0
-    expected = [
-        norm.ppf((1.0 + survival_50) / 2.0),
-        truncnorm(-np.inf, norm.ppf(survival_50)).mean(),
-        norm.ppf((survival_50 + survival_60) / 2.0),
-        truncnorm(-np.inf, norm.ppf(survival_60)).mean(),
-        truncnorm(-np.inf, norm.ppf(survival_60)).mean(),
-    ]
-    np.testing.assert_allclose(liabilities, expected, rtol=1e-12)
+    assert liabilities[0] == _case_liability_within_rounding((1.0 + survival_50) / 2.0)
+    assert liabilities[1] == _control_liability_within_rounding(survival_50)
+    assert liabilities[2] == _case_liability_within_rounding((survival_50 + survival_60) / 2.0)
+    assert liabilities[3] == liabilities[4] == _control_liability_within_rounding(survival_60)
     # Earlier onset means higher liability; every control sits below zero.
     assert liabilities[0] > liabilities[2] > 0.0 > liabilities[1] > liabilities[3]
 
@@ -430,12 +455,12 @@ def test_liability_target_uses_sex_specific_incidence_and_pools_unknown_sex():
     sexes = ["female", "female", "male", "male", "male", None]
     liabilities = _liability_targets(targets, ages, sexes)
     # Female curve: S(50) = 1/2, so the female case sits at norm.ppf(3/4).
-    assert liabilities[0] == pytest.approx(norm.ppf(0.75))
+    assert liabilities[0] == _case_liability_within_rounding(0.75)
     # No male event by 60: the male controls' threshold is +inf and their mean 0.
     assert liabilities[2] == liabilities[3] == 0.0
     # The unknown-sex control uses the pooled curve: S(60) = 5/6 after the
     # event at 50 among six people.
-    assert liabilities[5] == pytest.approx(truncnorm(-np.inf, norm.ppf(5.0 / 6.0)).mean())
+    assert liabilities[5] == _control_liability_within_rounding(5.0 / 6.0)
 
 
 def test_the_disease_panel_is_the_ten_mixed_panel_diseases():
@@ -492,9 +517,7 @@ def test_kidney_disease_cases_come_from_repeated_labs_or_staged_codes():
     by_person = {row["person_id"]: row for row in training_rows}
     assert {person: row["target"] for person, row in by_person.items()} == {"201": 1, "203": 1, "204": 1, "205": 0}
     # A lab case's onset is its first qualifying occasion (mid-year 1975 birthday).
-    assert by_person["201"]["age_at_onset"] == pytest.approx(
-        (datetime.date(2019, 1, 1) - datetime.date(1975, 7, 1)).days / 365.25
-    )
+    assert by_person["201"]["age_at_onset"] == (datetime.date(2019, 1, 1) - datetime.date(1975, 7, 1)).days / 365.25
     assert counts["n_cases_by_lab"] == 2 and counts["n_cases_by_diagnosis"] == 1
     assert counts["n_excluded_lab_evidence"] == 1 and counts["n_excluded_control_exclusion"] == 1
 
@@ -959,8 +982,12 @@ def test_hba1c_ifcc_units_convert_by_the_ngsp_master_equation():
     conversion = {
         unit.unit_label: unit for unit in resolve_measurement_definition("hemoglobin_a1c").unit_conversions
     }["millimole per mole"]
-    # IFCC = 10.93 * NGSP - 23.50, so 53 mmol/mol is NGSP 7.0%.
-    assert conversion.scale * 53.0 + conversion.offset == pytest.approx((53.0 + 23.50) / 10.93, abs=0.002)
+    # IFCC = 10.93 * NGSP - 23.50, so 53 mmol/mol is NGSP 7.0%. The two published
+    # equations are rounded forms of one line, so they agree to half a unit in the
+    # last digit of each of their four coefficients.
+    ifcc = 53.0
+    coefficient_rounding = 0.000005 * ifcc + 0.0005 + 0.005 / 10.93 + 0.005 * (ifcc + 23.50) / 10.93**2
+    assert abs(conversion.scale * ifcc + conversion.offset - (ifcc + 23.50) / 10.93) <= coefficient_rounding
 
 
 # ---------------------------------------------------------------------------
@@ -1007,8 +1034,11 @@ def test_treatment_corrections_map_the_occasion_statistics_exactly(
         _person_row(3, untreated=(2, 0.0, 1.0, 50.0)),
     ]
     captured = _captured_person_statistics(monkeypatch, resolve_measurement_definition(trait), rows)
-    assert captured["means"][0] == pytest.approx(expected_mean)
-    assert captured["within"][0] == pytest.approx(2 * expected_variance)
+    # One division or addition for the mean; the variance's division by the
+    # squared amount (2) and its product with the count (1), against the
+    # expected literals' own rounding (1).
+    assert captured["means"][0] == within_rounding(expected_mean, 2)
+    assert captured["within"][0] == within_rounding(2 * expected_variance, 4)
 
 
 def test_ratio_correction_on_the_log_scale_shifts_the_mean_by_log_amount(monkeypatch):
@@ -1022,8 +1052,9 @@ def test_ratio_correction_on_the_log_scale_shifts_the_mean_by_log_amount(monkeyp
         _person_row(3, untreated=(2, 4.5, 0.1, 50.0)),
     ]
     captured = _captured_person_statistics(monkeypatch, definition, rows)
-    assert captured["means"][0] == pytest.approx(math.log(100.0))
-    assert captured["within"][0] == pytest.approx(3 * 0.04)
+    # log(70) - log(0.7) against log(100): three libm logs and a subtraction.
+    assert captured["means"][0] == within_rounding(math.log(100.0), 7)
+    assert captured["within"][0] == within_rounding(3 * 0.04, 2)
 
 
 def test_treated_only_persons_are_dropped_when_no_correction_exists():
@@ -1071,10 +1102,19 @@ def test_person_blup_equals_the_dense_henderson_mixed_model_solution():
     targets, reliabilities = _person_blup(
         occasion_counts.astype(float), person_means, design, between_variance, within_variance
     )
-    np.testing.assert_allclose(targets, expected, rtol=1e-10, atol=1e-10)
+    # Normwise forward error of the dense path's LU solves: gamma_{3n} times the
+    # condition numbers of V and of X'V^-1 X (Higham 2002, Theorem 9.4); the
+    # collapsed path's error is of the same order.
+    solve_bound = (
+        2.0 * rounding_gamma(3 * len(occasion_values)) * np.linalg.cond(covariance)
+        * np.linalg.cond(occasion_design.T @ precision @ occasion_design)
+    )
+    np.testing.assert_allclose(targets, expected, rtol=0.0, atol=solve_bound * np.max(np.abs(expected)))
     repeatability = between_variance / (between_variance + within_variance)
     np.testing.assert_allclose(
-        reliabilities, occasion_counts * repeatability / (1.0 + (occasion_counts - 1.0) * repeatability)
+        reliabilities,
+        occasion_counts * repeatability / (1.0 + (occasion_counts - 1.0) * repeatability),
+        rtol=2.0 * rounding_gamma(7),
     )
 
 
@@ -1102,8 +1142,8 @@ def test_variance_component_estimators_are_unbiased():
         )
     mean_estimates = estimates.mean(axis=0)
     standard_errors = estimates.std(axis=0) / math.sqrt(replicate_count)
-    assert abs(mean_estimates[0] - between_variance) < 4 * standard_errors[0]
-    assert abs(mean_estimates[1] - within_variance) < 4 * standard_errors[1]
+    assert abs(mean_estimates[0] - between_variance) < sampling_bound(standard_errors[0])
+    assert abs(mean_estimates[1] - within_variance) < sampling_bound(standard_errors[1])
 
 
 def test_variance_components_raise_without_repeats_or_between_person_signal():
@@ -1120,7 +1160,7 @@ def test_person_design_models_age_by_sex_and_drops_empty_columns():
     female = np.array([1.0, 0.0, 1.0, 0.0])
     design = _person_design(ages, ages**2 + 4.0, female, [45878463, 45880669, 45878463, 45880669])
     centered = ages - ages.mean()
-    np.testing.assert_allclose(design[:, -1], centered * female)
+    np.testing.assert_array_equal(design[:, -1], centered * female)
     assert design.shape == (4, 5)
     # One sex only: no sex indicator and no interaction column.
     single_sex = _person_design(ages, ages**2 + 4.0, np.zeros(4), [45880669] * 4)
@@ -1134,9 +1174,21 @@ def test_blup_target_tracks_the_true_long_run_mean_better_than_the_raw_mean():
     targets = np.array([row["target"] for row in training_rows])
     raw_means = np.array([row["untreated_mean"] for row in rows])
     assert np.mean((targets - true_means) ** 2) < np.mean((raw_means - true_means) ** 2)
-    assert summary["between_person_variance"] == pytest.approx(1.0, rel=0.15)
-    assert summary["within_person_variance"] == pytest.approx(2.0, rel=0.1)
-    assert summary["repeatability"] == pytest.approx(1.0 / 3.0, rel=0.15)
+    between_variance, within_variance = 1.0, 2.0
+    counts = np.array([row["untreated_occasion_count"] for row in rows])
+    between_standard_error, within_standard_error = variance_component_standard_errors(
+        counts, between_variance, within_variance
+    )
+    assert abs(summary["between_person_variance"] - between_variance) < sampling_bound(between_standard_error)
+    assert abs(summary["within_person_variance"] - within_variance) < sampling_bound(within_standard_error)
+    # The delta method, the two estimators being independent.
+    total_variance = between_variance + within_variance
+    repeatability_standard_error = np.hypot(
+        within_variance * between_standard_error, between_variance * within_standard_error
+    ) / total_variance**2
+    assert abs(summary["repeatability"] - between_variance / total_variance) < sampling_bound(
+        repeatability_standard_error
+    )
 
 
 def test_training_rows_carry_targets_covariates_and_one_hot_sex():
@@ -1151,7 +1203,7 @@ def test_training_rows_carry_targets_covariates_and_one_hot_sex():
     assert female_row["age_at_measurement_squared"] == rows[0]["untreated_mean_age_squared"]
     assert female_row["age_at_measurement_x_female"] == rows[0]["untreated_mean_age"]
     assert male_row["age_at_measurement_x_female"] == 0.0
-    assert female_row["log_occasion_count"] == pytest.approx(math.log(rows[0]["untreated_occasion_count"]))
+    assert female_row["log_occasion_count"] == math.log(rows[0]["untreated_occasion_count"])
     assert female_row["sex_at_birth_concept_id_45878463"] == 1
     assert "sex_at_birth_concept_id" not in female_row
     assert 0.0 < female_row["target_reliability"] < 1.0
