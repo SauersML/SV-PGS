@@ -16,12 +16,14 @@ from scipy.optimize import minimize_scalar
 from sv_pgs.scale_mixture_ep import (
     AnnotationGroup,
     Cavity,
+    GaussianPosterior,
     MixtureHyperparameters,
     _components,
     _data_objective,
     _evidence,
     _curvature_trace_gradient,
     _data_value,
+    _total_curvature,
     _directional_derivatives,
     _laplace_corrections,
     _log_normal_start,
@@ -33,6 +35,7 @@ from sv_pgs.scale_mixture_ep import (
     cavities,
     class_log_density,
     derived_lattice,
+    diagonal_posterior,
     halved_lattice,
     relattice,
     hyper_step,
@@ -593,3 +596,69 @@ def test_an_orthogonal_reparametrization_of_every_block_leaves_the_evidence_and_
         for model, evidence in ((prior, original), (rotated, transformed))
     ]
     np.testing.assert_allclose(means[1], means[0], rtol=1e-8, atol=1e-12)
+
+
+def _dense_ep(prior, coefficients, likelihood_precision, linear_term, sites):
+    """Damped parallel EP on the dense Gaussian likelihood exp(-b' Lambda b / 2 + l' b), run to machine precision."""
+    site_precision, site_shift = (np.array(part, copy=True) for part in sites)
+    hyperparameters = MixtureHyperparameters(coefficients, np.zeros(len(prior.smoothing_blocks)))
+    for _sweep in range(20000):
+        covariance = np.linalg.inv(likelihood_precision + np.diag(site_precision))
+        mean = covariance @ (linear_term + site_shift)
+        cavity = cavities(mean, np.diag(covariance).copy(), site_precision, site_shift)
+        target_precision, target_shift = site_targets(tilted_moments(prior, hyperparameters, cavity, _WORKING_BYTES), cavity)
+        change = max(np.max(np.abs(target_precision - site_precision) / (1.0 + np.abs(site_precision))), np.max(np.abs(target_shift - site_shift) / (1.0 + np.abs(site_shift))))
+        site_precision += 0.5 * (target_precision - site_precision)
+        site_shift += 0.5 * (target_shift - site_shift)
+        if change < 1e-14:
+            return (site_precision, site_shift), covariance, cavity
+    raise AssertionError("dense EP did not converge")
+
+
+def test_total_curvature_matches_ep_resolved_differences_of_the_evidence_gradient():
+    generator = np.random.default_rng(45)
+    variant_count, sample_count = 30, 400
+    latent = generator.standard_normal((sample_count, variant_count))
+    for column in range(1, variant_count):
+        latent[:, column] = 0.6 * latent[:, column - 1] + 0.8 * latent[:, column]
+    genotypes = (latent - latent.mean(axis=0)) / latent.std(axis=0)
+    effects = np.where(generator.random(variant_count) < 0.3, generator.normal(0.0, 0.15, variant_count), 0.0)
+    targets = genotypes @ effects + generator.standard_normal(sample_count)
+    likelihood_precision, linear_term = genotypes.T @ genotypes, genotypes.T @ targets
+    class_index, offset, design, groups, _cavity = _data(variant_count, 46)
+    nodes = np.linspace(np.log(1e-4), np.log(0.2), 8)
+    prior = scale_mixture_prior(
+        class_index=class_index, log_variance_offset=offset, annotation_design=design, annotation_groups=groups, nodes=nodes, floor=nodes[0] - 1.0, top=nodes[-1],
+    )
+    coefficients = _hyperparameters(prior, 47).coefficients * 0.3 + initial_hyperparameters(prior).coefficients
+    start = moment_matched_prior_sites(prior, MixtureHyperparameters(coefficients, np.zeros(len(prior.smoothing_blocks))))
+    sites, covariance, cavity = _dense_ep(prior, coefficients, likelihood_precision, linear_term, start)
+    posterior = GaussianPosterior(
+        solve=lambda right: covariance @ right, variance_jvp=lambda weights: -np.einsum("jk,kr,kj->jr", covariance, weights, covariance)
+    )
+    analytic = _total_curvature(prior, coefficients, cavity, posterior, _WORKING_BYTES, 1e-13)
+    mapping = prior.coefficient_map
+
+    def evidence_gradient(point):
+        _sites, _covariance, point_cavity = _dense_ep(prior, point, likelihood_precision, linear_term, sites)
+        return mapping.T @ _data_objective(prior, point, point_cavity, _WORKING_BYTES).gradient
+
+    step = 1e-5
+    numerical = np.column_stack([
+        -(evidence_gradient(coefficients + step * unit) - evidence_gradient(coefficients - step * unit)) / (2.0 * step)
+        for unit in np.eye(coefficients.shape[0])
+    ])
+    numerical = 0.5 * (numerical + numerical.T)
+    np.testing.assert_allclose(analytic, numerical, rtol=1e-5, atol=1e-5 * float(np.max(np.abs(numerical))))
+    fixed_cavity = -(mapping.T @ _data_objective(prior, coefficients, cavity, _WORKING_BYTES).hessian @ mapping)
+    assert np.max(np.abs(analytic - fixed_cavity)) > 1e-3 * float(np.max(np.abs(fixed_cavity)))
+
+
+def test_total_curvature_is_the_fixed_cavity_curvature_for_independent_effects():
+    prior, cavity = _problem(variant_count=40, seed=48, node_count=10)
+    coefficients = _hyperparameters(prior, 49).coefficients
+    moments = tilted_moments(prior, MixtureHyperparameters(coefficients, np.zeros(len(prior.smoothing_blocks))), cavity, _WORKING_BYTES)
+    analytic = _total_curvature(prior, coefficients, cavity, diagonal_posterior(moments.variance), _WORKING_BYTES, 1e-13)
+    mapping = prior.coefficient_map
+    fixed_cavity = -(mapping.T @ _data_objective(prior, coefficients, cavity, _WORKING_BYTES).hessian @ mapping)
+    np.testing.assert_allclose(analytic, fixed_cavity, rtol=1e-9, atol=1e-9 * float(np.max(np.abs(fixed_cavity))))

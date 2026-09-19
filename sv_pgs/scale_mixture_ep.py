@@ -87,11 +87,12 @@ gamma = p - sum_j tau_j Sigma_jj, the covariates' flat prior removing k.
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
-from typing import Iterator, Sequence
+from typing import Callable, Iterator, Sequence
 
 import numpy as np
 from scipy.integrate import quad
 from scipy.interpolate import CubicSpline
+from scipy.sparse.linalg import LinearOperator, gmres
 from scipy.special import erfcx, logsumexp
 
 from sv_pgs._typing import F64Array, I64Array
@@ -822,6 +823,156 @@ def _maximize_coefficients(
             objective = _data_objective(prior, coefficients, cavity, working_bytes)
             value, gradient, hessian = _penalized(prior, objective, log_smoothing, penalty, coefficients)
 
+
+
+@dataclass(frozen=True)
+class GaussianPosterior:
+    """q's linear responses at the EP fixed point, for the total curvature B: ``solve(R)`` is Sigma R and
+    ``variance_jvp(W)`` is -(Sigma o Sigma) W, both (p x r). Stage 2 answers them with extra right-hand sides of its
+    solve and with ``marginal_variances.variance_jvp``."""
+
+    solve: Callable[[F64Array], F64Array]
+    variance_jvp: Callable[[F64Array], F64Array]
+
+
+def diagonal_posterior(variance: F64Array) -> GaussianPosterior:
+    """The posterior of independent effects (orthogonal design, normal means): Sigma = diag(variance). There the
+    cavities do not move with the prior, so B equals the fixed-cavity curvature."""
+    column = np.asarray(variance, dtype=np.float64)[:, None]
+    return GaussianPosterior(solve=lambda right: column * right, variance_jvp=lambda weights: -np.square(column) * weights)
+
+
+@dataclass(frozen=True)
+class _VariantDerivatives:
+    """Per variant at its cavity: the tilted mean m, variance v and second moment s2, their derivatives in the
+    cavity shift (v_h) and precision (m_P, v_P), and in z: per node of the class density (m_eta, s2_eta, p x K)
+    and in log u (m_logu, s2_logu), which the scale-design row carries to the scale coefficients."""
+
+    mean: F64Array
+    variance: F64Array
+    second: F64Array
+    variance_by_shift: F64Array
+    mean_by_precision: F64Array
+    variance_by_precision: F64Array
+    mean_by_density: F64Array
+    second_by_density: F64Array
+    mean_by_log_scale: F64Array
+    second_by_log_scale: F64Array
+
+
+def _variant_derivatives(prior: ScaleMixturePrior, coefficients: F64Array, cavity: Cavity, working_bytes: int) -> _VariantDerivatives:
+    """Given node k the tilted law is N(mu_k, c_k) with mu_k = h c_k; with weights w and ell_k = -(c_k + mu_k^2)/2
+    (d log Z_k / dP), f_k = d log Z_k / d eta and dc_k / d eta = c_k r_k (r_k = 1/(1 + v_k P)):
+        v_h = E[(mu - m)^3] + 3 E[c (mu - m)],   m_P = Cov(ell, mu) - E[mu c],   s2_P = Cov(ell, c + mu^2) - E[c^2 + 2 mu^2 c],
+        m_eta = w (mu - m),   s2_eta = w (c + mu^2 - s2),
+        m_logu = Cov(f, mu) + E[mu r],   s2_logu = Cov(f, c + mu^2) + E[(c + 2 mu^2) r]
+    (the eta derivatives are the same in normalized and unnormalized coordinates, since sum_k w_k (mu_k - m) = 0)."""
+    variant_count, grid_size = prior.variant_count, prior.grid_size
+    fields = {name: np.empty(variant_count) for name in (
+        "mean", "variance", "second", "variance_by_shift", "mean_by_precision", "variance_by_precision", "mean_by_log_scale", "second_by_log_scale",
+    )}
+    mean_by_density = np.empty((variant_count, grid_size))
+    second_by_density = np.empty((variant_count, grid_size))
+    scales = log_scale(prior, coefficients)
+    for _class, rows, terms in _class_terms(prior, coefficients, cavity, working_bytes):
+        weights = terms.responsibility
+        conditional = terms.conditional_variance
+        retained = _kernel_terms(
+            class_log_density(prior, coefficients)[_class], scales[rows], prior.log_variance_grid, prior.kernel_floor, cavity.precision[rows], cavity.shift[rows]
+        )[1]
+        centre = cavity.shift[rows][:, None] * conditional
+
+        def expectation(values: F64Array) -> F64Array:
+            return np.sum(weights * values, axis=1)
+
+        def covariance(left: F64Array, right: F64Array) -> F64Array:
+            return expectation(left * right) - expectation(left) * expectation(right)
+
+        mean = expectation(centre)
+        raw_second = conditional + centre * centre
+        second = expectation(raw_second)
+        deviation = centre - mean[:, None]
+        slope = -0.5 * raw_second
+        mean_by_precision = covariance(slope, centre) - expectation(centre * conditional)
+        second_by_precision = covariance(slope, raw_second) - expectation(conditional * conditional + 2.0 * centre * centre * conditional)
+        fields["mean"][rows] = mean
+        fields["second"][rows] = second
+        fields["variance"][rows] = second - mean * mean
+        fields["variance_by_shift"][rows] = expectation(deviation**3) + 3.0 * expectation(conditional * deviation)
+        fields["mean_by_precision"][rows] = mean_by_precision
+        fields["variance_by_precision"][rows] = second_by_precision - 2.0 * mean * mean_by_precision
+        fields["mean_by_log_scale"][rows] = covariance(terms.first, centre) + expectation(centre * retained)
+        fields["second_by_log_scale"][rows] = covariance(terms.first, raw_second) + expectation((conditional + 2.0 * centre * centre) * retained)
+        mean_by_density[rows] = weights * deviation
+        second_by_density[rows] = weights * (raw_second - second[:, None])
+    return _VariantDerivatives(mean_by_density=mean_by_density, second_by_density=second_by_density, **fields)
+
+
+def _through_z(prior: ScaleMixturePrior, by_density: F64Array, by_log_scale: F64Array, directions_z: F64Array) -> F64Array:
+    """(p x r): each variant's derivative in z applied to the directions (C K + L) x r."""
+    grid_size = prior.grid_size
+    density_part = directions_z[: prior.density_size].reshape(prior.class_count, grid_size, -1)
+    return np.einsum("jk,jkr->jr", by_density, density_part[prior.class_index]) + by_log_scale[:, None] * (
+        prior.scale_design @ directions_z[prior.density_size :]
+    )
+
+
+def _through_z_transposed(prior: ScaleMixturePrior, by_density: F64Array, by_log_scale: F64Array, values: F64Array) -> F64Array:
+    """(C K + L) x r: the transpose of ``_through_z`` applied to (p x r) values."""
+    grid_size = prior.grid_size
+    result = np.zeros((prior.density_size + prior.scale_size, values.shape[1]))
+    for class_position, rows in enumerate(prior.class_rows):
+        result[class_position * grid_size : (class_position + 1) * grid_size] = by_density[rows].T @ values[rows]
+    result[prior.density_size :] = prior.scale_design.T @ (by_log_scale[:, None] * values)
+    return result
+
+
+def _total_curvature(
+    prior: ScaleMixturePrior, coefficients: F64Array, cavity: Cavity, posterior: GaussianPosterior, working_bytes: int, relative_tolerance: float
+) -> F64Array:
+    """B = -d2 log Z_EP / dx2 with EP re-solved, in x: M' B_z M (speed-ep, B_PRODUCTS.md), without re-solving EP.
+
+    B_z E = A E + m_x' dh - s2_x' dP / 2, where the cavity response (dh, dP) to a direction E solves the linear
+    response of the EP fixed point:
+        (Q + diag tau) dm = (m + m_P / v) dP + m_x E / v          (``posterior.solve``)
+        dh = (dm - m_P dP - m_x E) / v
+        v^2 dP = -(Sigma o Sigma)_off (dv / v^2 + dP),  dv = v_h dh + v_P dP + v_x E   (``posterior.variance_jvp``)
+    dP is the fixed point of that affine map, found by GMRES on all directions at once to ``relative_tolerance``;
+    Krylov is exact within its dimension, which bounds the work.
+    """
+    derivatives = _variant_derivatives(prior, coefficients, cavity, working_bytes)
+    directions = prior.coefficient_map
+    mean_by_z = _through_z(prior, derivatives.mean_by_density, derivatives.mean_by_log_scale, directions)
+    variance_by_z = _through_z(prior, derivatives.second_by_density, derivatives.second_by_log_scale, directions) - 2.0 * derivatives.mean[:, None] * mean_by_z
+    variance = derivatives.variance[:, None]
+
+    def through(precision_step: F64Array) -> tuple[F64Array, F64Array]:
+        mean_step = posterior.solve((derivatives.mean + derivatives.mean_by_precision / derivatives.variance)[:, None] * precision_step + mean_by_z / variance)
+        shift_step = (mean_step - derivatives.mean_by_precision[:, None] * precision_step - mean_by_z) / variance
+        variance_step = derivatives.variance_by_shift[:, None] * shift_step + derivatives.variance_by_precision[:, None] * precision_step + variance_by_z
+        response = variance_step / variance**2 + precision_step
+        return shift_step, response + posterior.variance_jvp(response) / variance**2
+
+    shape = mean_by_z.shape
+    _shift, offset = through(np.zeros(shape))
+
+    def linear_part(vector: F64Array) -> F64Array:
+        precision_step = vector.reshape(shape)
+        return (precision_step - (through(precision_step)[1] - offset)).ravel()
+
+    size = int(np.prod(shape))
+    operator = LinearOperator((size, size), matvec=linear_part, dtype=np.float64)
+    solution, information = gmres(operator, offset.ravel(), rtol=relative_tolerance, atol=0.0, restart=size, maxiter=size)
+    if information != 0:
+        raise FloatingPointError(f"the EP fixed point's linear response did not converge (gmres information {information})")
+    precision_step = solution.reshape(shape)
+    shift_step, _next = through(precision_step)
+    fixed_cavity = -_data_objective(prior, coefficients, cavity, working_bytes).hessian
+    total_z = fixed_cavity @ directions + _through_z_transposed(prior, derivatives.mean_by_density, derivatives.mean_by_log_scale, shift_step) - 0.5 * (
+        _through_z_transposed(prior, derivatives.second_by_density, derivatives.second_by_log_scale, precision_step)
+    )
+    total = directions.T @ total_z
+    return 0.5 * (total + total.T)
 
 
 # ------------------------------------------------------- the Laplace evidence for the weights
