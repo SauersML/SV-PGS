@@ -214,6 +214,27 @@ def marginal_variances(gaussian: FullDataGaussian) -> F64Array:
     return gaussian.block_variances()
 
 
+def _positive_definite_refactor(
+    gaussian: FullDataGaussian, site_precision: F64Array, site_shift: F64Array, noise: F64Array, tolerance: float, exact_curvature: NDArray
+) -> tuple[Any, F64Array]:
+    """Refactor the blocks at the sites and re-solve the mean, halving every negative site precision while a block
+    is not positive definite. Non-negative sites always give a positive-definite precision, so this ends; it only
+    shortens the path to the EP fixed point, which does not depend on it."""
+    precision = np.array(site_precision, dtype=np.float64, copy=True)
+    while True:
+        try:
+            certificate = gaussian.iterate(
+                site_precision=precision, site_shift=site_shift, noise_variance=noise, tolerance=tolerance, refactor=True, exact_curvature=exact_curvature
+            )
+        except (FloatingPointError, np.linalg.LinAlgError):
+            negative = precision < 0.0
+            if not np.any(negative):
+                raise
+            precision[negative] *= 0.5
+            continue
+        return certificate, precision
+
+
 def _damped_site_update(
     gaussian: FullDataGaussian,
     site_precision: F64Array,
@@ -293,9 +314,7 @@ def fit_full_data(
     while True:
         outer += 1
         tolerance = _solve_tolerance(gaussian, effective, draw_count, site_precision)
-        certificate = gaussian.iterate(
-            site_precision=site_precision, site_shift=site_shift, noise_variance=noise, tolerance=tolerance, refactor=True, exact_curvature=exact_curvature
-        )
+        certificate, site_precision = _positive_definite_refactor(gaussian, site_precision, site_shift, noise, tolerance, exact_curvature)
         frozen_precision = 1.0 / marginal_variances(gaussian) - site_precision
         converged, previous_move = False, np.full(model_count, np.inf)
         while True:
