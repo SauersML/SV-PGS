@@ -958,9 +958,9 @@ def _directional_derivatives(
 
 def _laplace_corrections(
     prior: ScaleMixturePrior, log_smoothing: F64Array, evidence: _Evidence, cavity: Cavity, working_bytes: int, tolerance: float
-) -> tuple[F64Array, F64Array]:
-    """Per integrated direction, the correction from the Laplace term to the exact one-dimensional integral, and
-    the Tierney-Kadane term that decided it.
+) -> tuple[F64Array, F64Array, F64Array]:
+    """Per integrated direction, the correction from the Laplace term to the exact one-dimensional integral, the
+    Tierney-Kadane term that decided it, and the standardized directions themselves (columns, in x).
 
     The integrated directions are the eigenvectors of -H's Schur complement on the complement of the profiled null
     space, each moved with the null coordinates' first-order response and scaled to unit curvature. Along a
@@ -1001,7 +1001,7 @@ def _laplace_corrections(
         if message and error > max(tolerance, _HALF_PRECISION) * abs(integral):
             raise FloatingPointError(f"the exact integral along a direction did not converge: {message[0]}")
         corrections[index] = float(np.log(integral) - 0.5 * np.log(2.0 * np.pi))
-    return corrections, terms
+    return corrections, terms, directions
 
 
 def _corrected_value(
@@ -1009,7 +1009,7 @@ def _corrected_value(
 ) -> float:
     """V with its per-direction Laplace terms replaced by exact one-dimensional integrals where they fail: the value
     basins and edges are compared by (lead ruling)."""
-    corrections, _terms = _laplace_corrections(prior, log_smoothing, evidence, cavity, working_bytes, tolerance)
+    corrections, _terms, _directions = _laplace_corrections(prior, log_smoothing, evidence, cavity, working_bytes, tolerance)
     return evidence.value + float(np.sum(corrections))
 
 

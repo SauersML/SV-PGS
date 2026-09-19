@@ -26,6 +26,7 @@ from sv_pgs.scale_mixture_ep import (
     _maximize_coefficients,
     _penalized,
     _penalty_matrix,
+    _penalty_value,
     _restricted_prior,
     cavities,
     class_log_density,
@@ -536,12 +537,22 @@ def test_directional_third_and_fourth_derivatives_match_finite_differences():
         np.testing.assert_allclose(fourth[column], numerical_fourth, rtol=2e-2, atol=1e-2)
 
 
-def test_quadrature_corrections_agree_with_the_tierney_kadane_term_where_it_is_small():
+def test_quadrature_corrections_are_the_exact_integrals_along_the_standardized_directions():
     prior, cavity = _problem(variant_count=60, seed=39, node_count=12)
     hyperparameters = _hyperparameters(prior, 40, log_smoothing=2.0)
     evidence = _evidence(prior, hyperparameters.log_smoothing, hyperparameters.coefficients, cavity, _WORKING_BYTES, 0.0)
     assert evidence is not None
-    corrections, terms = _laplace_corrections(prior, hyperparameters.log_smoothing, evidence, cavity, _WORKING_BYTES, 0.0)
-    small = np.abs(terms) < 1e-2
-    assert np.any(small)
-    np.testing.assert_allclose(corrections[small], terms[small], atol=float(np.max(np.abs(terms[small]))) ** 1.5 + 1e-7)
+    corrections, terms, directions = _laplace_corrections(prior, hyperparameters.log_smoothing, evidence, cavity, _WORKING_BYTES, 0.0)
+    value = _data_value(prior, evidence.coefficients, cavity, _WORKING_BYTES) - _penalty_value(prior, hyperparameters.log_smoothing, evidence.coefficients)[0]
+    steps = np.linspace(-12.0, 12.0, 4801)
+    for index in np.argsort(-np.abs(terms))[:3]:
+        line = np.array([
+            _data_value(prior, evidence.coefficients + step * directions[:, index], cavity, _WORKING_BYTES)
+            - _penalty_value(prior, hyperparameters.log_smoothing, evidence.coefficients + step * directions[:, index])[0]
+            for step in steps
+        ])
+        reference = np.log(np.trapezoid(np.exp(line - value), steps)) - 0.5 * np.log(2.0 * np.pi)
+        np.testing.assert_allclose(corrections[index], reference, atol=1e-6)
+    # Where the Tierney-Kadane term is tiny, the exact correction is of its size.
+    tiny = np.abs(terms) < 1e-5
+    assert np.all(np.abs(corrections[tiny]) <= 2.0 * np.abs(terms[tiny]) + 1e-7)
