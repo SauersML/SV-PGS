@@ -24,14 +24,16 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-# CuPy loads the CUDA 12 runtime, cuBLAS, cuSOLVER (with its cuSPARSE and nvJitLink) and NVRTC from these
-# wheels at run time; JAX's CUDA extra used to bring them in.
+# CuPy loads the CUDA 12 runtime, cuBLAS, cuSOLVER (with its cuSPARSE and nvJitLink), cuRAND (cupy.random)
+# and NVRTC from these wheels at run time; JAX's CUDA extra used to bring them in. Nothing calls cupy.fft, so
+# cuFFT is left out. tests/test_gpu_extra_cuda.py exercises each one.
 gpu = [
     "cupy-cuda12x>=13.0",
     "nvidia-cuda-runtime-cu12",
     "nvidia-cublas-cu12",
     "nvidia-cusolver-cu12",
     "nvidia-cusparse-cu12",
+    "nvidia-curand-cu12",
     "nvidia-nvjitlink-cu12",
     "nvidia-cuda-nvrtc-cu12",
 ]
