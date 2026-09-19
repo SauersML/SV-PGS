@@ -128,10 +128,8 @@ def _hyperparameters(prior, seed: int, log_smoothing: float | None = None) -> Mi
     return MixtureHyperparameters(coefficients=coefficients, log_smoothing=weights)
 
 
-def test_tilted_moments_match_quadrature_of_the_mixture_times_the_cavity():
-    prior, cavity = _problem(variant_count=12, seed=1, node_count=9)
-    hyperparameters = _hyperparameters(prior, 2)
-    moments = tilted_moments(prior, hyperparameters, cavity, _WORKING_BYTES)
+def assert_tilted_moments_match_quadrature(prior, hyperparameters, cavity, moments) -> None:
+    """Every effect's log Z, tilted mean and tilted variance against quadrature of the mixture times the cavity."""
     weights = np.exp(class_log_density(prior, hyperparameters.coefficients))
     scales = np.exp(log_scale(prior, hyperparameters.coefficients))
     for variant in range(prior.variant_count):
@@ -154,6 +152,12 @@ def test_tilted_moments_match_quadrature_of_the_mixture_times_the_cavity():
         np.testing.assert_allclose(moments.log_normalizer[variant], log_normalizer, rtol=1e-10, atol=1e-10)
         np.testing.assert_allclose(moments.mean[variant], mean, rtol=1e-8, atol=1e-12)
         np.testing.assert_allclose(moments.variance[variant], integrals[2] / integrals[0] - mean * mean, rtol=1e-8)
+
+
+def test_tilted_moments_match_quadrature_of_the_mixture_times_the_cavity():
+    prior, cavity = _problem(variant_count=12, seed=1, node_count=9)
+    hyperparameters = _hyperparameters(prior, 2)
+    assert_tilted_moments_match_quadrature(prior, hyperparameters, cavity, tilted_moments(prior, hyperparameters, cavity, _WORKING_BYTES))
 
 
 def test_a_site_update_gives_a_one_variant_posterior_the_exact_tilted_moments():
