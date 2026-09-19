@@ -17,10 +17,13 @@ Both devices return fp64-accurate products.
   int32 cuBLAS GEMM per sample chunk (IMMA tensor cores on sm_75+, DP4A on sm_70) computes every
   digit product exactly (``INT32_EXACT_DIGIT_ROWS`` rows per chunk keep int32 exact), and
   recombining the digits in fp64 leaves only the operand's quantization: at most
-  ``2^-(7 OPERAND_DIGITS - 3)`` of its column maximum per entry.
+  ``2^-(7 OPERAND_DIGITS - 2)`` of its column maximum per entry.
 * CPU: the codes are converted to float64 per sample chunk (exact) and multiplied by DGEMM.
 
-CuPy is passed in by the caller as the array module; this module never imports it.
+Memory: the caller's plan hands each tile ``workspace_bytes`` for the transients of one product.
+Every product counts its fixed buffers (padded operand, output, integer products) and its
+per-sample ones from the expressions that allocate them, and its sample chunk is the most that
+fits. CuPy is passed in by the caller as the array module; this module never imports it.
 """
 
 from __future__ import annotations
@@ -30,7 +33,6 @@ from typing import Any
 
 import numpy as np
 
-from sv_pgs.compute_budget import ComputeBudget
 from sv_pgs.genotype_buffers import (
     SIGNED_CODE_OFFSET,
     _CUBLAS_COMPUTE_32I,
@@ -42,9 +44,9 @@ from sv_pgs.genotype_buffers import (
 DIGIT_BITS = 7
 """Each operand digit covers 7 bits: balanced digits lie in [-64, 63], safely inside int8."""
 
-OPERAND_DIGITS = 6
-"""Digits per operand entry: quantization at most 2^-39 (1.8e-12) of the column maximum, so a
-dot product over 1e5 samples keeps a relative error far below Stage 2's 1e-7 gradient tolerance."""
+OPERAND_DIGITS = 8
+"""Digits per operand entry: 7 * 8 - 2 = 54 bits hold the 53-bit fp64 mantissa of the column
+maximum, so quantization is at most 2^-54 of it and the products carry fp64 GEMM accuracy."""
 
 _DIGIT_HALF = 1 << (DIGIT_BITS - 1)
 _DIGIT_MASK = (1 << DIGIT_BITS) - 1
@@ -52,11 +54,12 @@ _DIGIT_MASK = (1 << DIGIT_BITS) - 1
 INT32_EXACT_DIGIT_ROWS = (2**31 - 1) // (SIGNED_CODE_OFFSET * _DIGIT_HALF)
 """Largest sample count whose int32 sum of ``s_i d_i`` (|d| <= 64) cannot overflow (264,208)."""
 
-_CPU_CONVERSION_SHARE = 0.25
-"""Share of the host budget one float64 conversion chunk of the codes may use."""
-
-_CUDA_OPERAND_SHARE = 0.25
-"""Share of the device budget the digit operand and integer products of one chunk may use."""
+_FLOAT64_BYTES = 8
+_INT32_BYTES = 4
+_DIGIT_WORKING_BYTES = OPERAND_DIGITS + 4 * _FLOAT64_BYTES
+"""Peak bytes ``operand_digits`` holds per operand entry: the int8 digits plus four live 8-byte
+temporaries while one digit is split off (the remaining integers, the digit, and two
+intermediate expressions)."""
 
 
 def operand_digits(dense: Any, array_module: ModuleType) -> tuple[Any, Any]:
@@ -109,7 +112,7 @@ class CodeBlockTile:
     ``INT8_GEMM_ALIGNMENT`` on both axes; every product returns the unpadded shape.
     """
 
-    def __init__(self, signed_codes: Any, means: Any, scales: Any, array_module: ModuleType, budget: ComputeBudget) -> None:
+    def __init__(self, signed_codes: Any, means: Any, scales: Any, array_module: ModuleType, workspace_bytes: int) -> None:
         self._array_module = array_module
         codes = array_module.asarray(signed_codes)
         if codes.dtype != array_module.int8 or codes.ndim != 2:
@@ -121,7 +124,7 @@ class CodeBlockTile:
         self._scales = array_module.asarray(scales, dtype=array_module.float64)
         if self._means.shape != (self._variant_count,) or self._scales.shape != (self._variant_count,):
             raise ValueError("means and scales need one entry per variant")
-        self._budget = budget
+        self._workspace_bytes = int(workspace_bytes)
 
     @property
     def variant_count(self) -> int:
@@ -164,12 +167,17 @@ class CodeBlockTile:
         weighted = xp.asarray(weights, dtype=xp.float64)[:, None] * xp.asarray(covariates, dtype=xp.float64)
         return self.rmatmat(weighted)
 
-    def _sample_chunk(self, bytes_per_sample: int, exact_rows: int, share: float) -> int:
-        """Samples per chunk: a multiple of ``INT8_GEMM_ALIGNMENT`` that fits ``share`` of the budget."""
+    def _sample_chunk(self, fixed_bytes: int, bytes_per_sample: int, exact_rows: int) -> int:
+        """Samples per chunk: the largest multiple of ``INT8_GEMM_ALIGNMENT`` whose buffers fit the workspace."""
         padded_samples = int(self._codes.shape[1])
-        fitting = int(self._budget.working_bytes * share) // max(bytes_per_sample, 1)
+        fitting = (self._workspace_bytes - fixed_bytes) // bytes_per_sample
         chunk = min(exact_rows, padded_samples, fitting) // INT8_GEMM_ALIGNMENT * INT8_GEMM_ALIGNMENT
-        return max(INT8_GEMM_ALIGNMENT, chunk)
+        if chunk < INT8_GEMM_ALIGNMENT:
+            raise MemoryError(
+                f"a workspace of {self._workspace_bytes} bytes cannot hold a product's fixed buffers "
+                f"({fixed_bytes} bytes) and a {INT8_GEMM_ALIGNMENT}-sample chunk ({bytes_per_sample} bytes per sample)"
+            )
+        return chunk
 
     def _padded_rows(self, operand: Any, rows: int) -> Any:
         """``operand`` [r, K] float64 with zero rows appended up to ``rows``."""
@@ -185,13 +193,19 @@ class CodeBlockTile:
         columns = int(operand.shape[1])
         padded = self._padded_rows(operand, samples)
         total = xp.zeros((variants, columns), dtype=xp.float64)
+        operand_bytes = _FLOAT64_BYTES * columns * samples
         if xp is np:
-            chunk = self._sample_chunk(8 * variants, samples, _CPU_CONVERSION_SHARE)
+            # fixed: the operand, the total and one GEMM result; per sample: its fp64 codes
+            fixed = operand_bytes + 2 * _FLOAT64_BYTES * variants * columns
+            chunk = self._sample_chunk(fixed, _FLOAT64_BYTES * variants, samples)
             for start in range(0, samples, chunk):
                 stop = min(start + chunk, samples)
                 total += self._codes[:, start:stop].astype(np.float64) @ padded[start:stop]
             return total[: self._variant_count]
-        chunk = self._sample_chunk(OPERAND_DIGITS * columns * 9 + 8 * columns, INT32_EXACT_DIGIT_ROWS, _CUDA_OPERAND_SHARE)
+        # fixed: the operand, the total, the integer products and two fp64 recombination terms;
+        # per sample: the digit split of its operand row
+        fixed = operand_bytes + variants * columns * (3 * _FLOAT64_BYTES + OPERAND_DIGITS * _INT32_BYTES)
+        chunk = self._sample_chunk(fixed, _DIGIT_WORKING_BYTES * columns, INT32_EXACT_DIGIT_ROWS)
         products = xp.empty((variants, OPERAND_DIGITS * columns), dtype=xp.int32, order="F")
         for start in range(0, samples, chunk):
             stop = min(start + chunk, samples)
@@ -210,8 +224,11 @@ class CodeBlockTile:
         variants, samples = (int(extent) for extent in self._codes.shape)
         columns = int(operand.shape[1])
         padded = self._padded_rows(operand, variants)
+        output_bytes = _FLOAT64_BYTES * samples * columns
         if xp is np:
-            chunk = self._sample_chunk(8 * variants, samples, _CPU_CONVERSION_SHARE)
+            # fixed: the operand and the output; per sample: its fp64 codes and GEMM result row
+            fixed = _FLOAT64_BYTES * variants * columns + output_bytes
+            chunk = self._sample_chunk(fixed, _FLOAT64_BYTES * (variants + columns), samples)
             out = np.empty((samples, columns), dtype=np.float64)
             for start in range(0, samples, chunk):
                 stop = min(start + chunk, samples)
@@ -223,7 +240,11 @@ class CodeBlockTile:
         # so each sample chunk is transposed to variant-contiguous order for the TN GEMM.
         digits, scale = operand_digits(padded, xp)
         digit_columns = OPERAND_DIGITS * columns
-        chunk = self._sample_chunk(variants + 4 * digit_columns + 8 * columns, samples, _CUDA_OPERAND_SHARE)
+        # fixed: the operand, its digits and the output; per sample: its variant-contiguous codes,
+        # its integer products and two fp64 recombination terms
+        fixed = _FLOAT64_BYTES * variants * columns + digit_columns * variants + output_bytes
+        per_sample = variants + _INT32_BYTES * digit_columns + 2 * _FLOAT64_BYTES * columns
+        chunk = self._sample_chunk(fixed, per_sample, samples)
         products = xp.empty((chunk, digit_columns), dtype=xp.int32, order="F")
         out = xp.empty((samples, columns), dtype=xp.float64)
         for start in range(0, samples, chunk):
@@ -243,7 +264,9 @@ class CodeBlockTile:
         variants, samples = (int(extent) for extent in self._codes.shape)
         padded_weights = self._padded_rows(weights[:, None], samples)[:, 0]
         if xp is np:
-            chunk = self._sample_chunk(16 * variants, samples, _CPU_CONVERSION_SHARE)
+            # fixed: the total and one GEMM result; per sample: its fp64 codes and their weighted copy
+            fixed = 2 * _FLOAT64_BYTES * variants * variants
+            chunk = self._sample_chunk(fixed, 2 * _FLOAT64_BYTES * variants, samples)
             total = np.zeros((variants, variants), dtype=np.float64)
             for start in range(0, samples, chunk):
                 stop = min(start + chunk, samples)
@@ -252,7 +275,10 @@ class CodeBlockTile:
             return total[: self._variant_count, : self._variant_count]
         total = xp.zeros((variants, variants), dtype=xp.float64)
         products = xp.empty((variants, OPERAND_DIGITS * variants), dtype=xp.int32, order="F")
-        chunk = self._sample_chunk(OPERAND_DIGITS * variants * 9 + 8 * variants, INT32_EXACT_DIGIT_ROWS, _CUDA_OPERAND_SHARE)
+        # fixed: the weights, the total, the integer products and two fp64 recombination terms;
+        # per sample: its weighted fp64 codes and their digit split
+        fixed = _FLOAT64_BYTES * samples + variants * variants * (3 * _FLOAT64_BYTES + OPERAND_DIGITS * _INT32_BYTES)
+        chunk = self._sample_chunk(fixed, (_FLOAT64_BYTES + _DIGIT_WORKING_BYTES) * variants, INT32_EXACT_DIGIT_ROWS)
         for start in range(0, samples, chunk):
             stop = min(start + chunk, samples)
             weighted_codes = padded_weights[start:stop, None] * self._codes[:, start:stop].T.astype(xp.float64)

@@ -11,19 +11,12 @@ from sv_pgs.code_products import (
     operand_digits,
     recombine_digit_products,
 )
-from sv_pgs.compute_budget import ComputeBudget
 
 
-def _cpu_budget(host_bytes: int) -> ComputeBudget:
-    return ComputeBudget(
-        device_kind="cpu",
-        device_ids=(),
-        device_names=(),
-        device_bytes=(),
-        device_compute_capabilities=(),
-        host_bytes=host_bytes,
-        cpu_threads=1,
-    )
+def _gamma(term_count: int) -> float:
+    """Higham's gamma_n = n u / (1 - n u), the relative error bound of an fp64 sum of n terms."""
+    unit_roundoff = np.finfo(np.float64).eps / 2.0
+    return term_count * unit_roundoff / (1.0 - term_count * unit_roundoff)
 
 
 def _signed_codes(rng: np.random.Generator, variants: int, samples: int) -> np.ndarray:
@@ -54,7 +47,7 @@ def test_operand_digits_are_exact_balanced_base128_expansions() -> None:
         rebuilt = rebuilt * (1 << DIGIT_BITS) + digits[:, digit_index * 7 : (digit_index + 1) * 7].astype(np.int64)
     np.testing.assert_array_equal(rebuilt, np.rint(dense * scale[None, :]).astype(np.int64))
     quantization = np.abs(rebuilt / scale[None, :] - dense).max(axis=0)
-    bound = np.abs(dense).max(axis=0) * 2.0 ** -(DIGIT_BITS * OPERAND_DIGITS - 3)
+    bound = np.abs(dense).max(axis=0) * 2.0 ** -(DIGIT_BITS * OPERAND_DIGITS - 2)
     assert np.all(quantization <= bound)
 
 
@@ -69,16 +62,18 @@ def test_recombined_exact_integer_digit_products_equal_the_quantized_operand_pro
 
     quantized = np.rint(dense * scale[None, :]) / scale[None, :]
     reference = codes.astype(np.float64) @ quantized
-    np.testing.assert_allclose(recombined, reference, rtol=1e-14, atol=1e-14 * np.abs(reference).max())
+    # the recombination rounds once per digit, the reference GEMM once per sample
+    bound = (_gamma(OPERAND_DIGITS) + _gamma(codes.shape[1])) * (np.abs(codes.astype(np.float64)) @ np.abs(quantized))
+    assert np.all(np.abs(recombined - reference) <= bound)
 
 
-@pytest.mark.parametrize("host_bytes", [1 << 34, 40_000])
-def test_cpu_tile_products_match_the_dense_standardized_reference(host_bytes: int) -> None:
+@pytest.mark.parametrize("workspace_bytes", [1 << 34, 40_000])
+def test_cpu_tile_products_match_the_dense_standardized_reference(workspace_bytes: int) -> None:
     rng = np.random.default_rng(5)
     variants, samples = 37, 1001
     codes = _signed_codes(rng, variants, samples)
     standardized, means, scales = _standardized(codes)
-    tile = CodeBlockTile(codes, means, scales, np, _cpu_budget(host_bytes))
+    tile = CodeBlockTile(codes, means, scales, np, workspace_bytes)
     right = rng.standard_normal((variants, 4))
     left = rng.standard_normal((samples, 3))
     weights = rng.uniform(0.05, 0.25, samples)
@@ -96,4 +91,13 @@ def test_cpu_tile_products_match_the_dense_standardized_reference(host_bytes: in
 
 def test_tile_rejects_codes_that_are_not_int8() -> None:
     with pytest.raises(ValueError, match="int8"):
-        CodeBlockTile(np.zeros((3, 4), dtype=np.int16), np.zeros(3), np.ones(3), np, _cpu_budget(1 << 30))
+        CodeBlockTile(np.zeros((3, 4), dtype=np.int16), np.zeros(3), np.ones(3), np, 1 << 30)
+
+
+def test_a_workspace_too_small_for_one_chunk_is_refused() -> None:
+    rng = np.random.default_rng(9)
+    codes = _signed_codes(rng, 37, 1001)
+    _standardized_codes, means, scales = _standardized(codes)
+    tile = CodeBlockTile(codes, means, scales, np, 1000)
+    with pytest.raises(MemoryError, match="workspace"):
+        tile.rmatmat(rng.standard_normal((1001, 3)))

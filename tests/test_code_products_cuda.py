@@ -5,45 +5,33 @@ import numpy as np
 import pytest
 
 from sv_pgs.code_products import CodeBlockTile, operand_digits, recombine_digit_products
-from sv_pgs.compute_budget import ComputeBudget, _try_import_cupy
-from tests.test_code_products import _cpu_budget, _signed_codes
+from sv_pgs.compute_budget import _try_import_cupy
+from tests.test_code_products import _signed_codes
 
 cupy = _try_import_cupy()
 pytestmark = pytest.mark.skipif(cupy is None, reason="needs a CUDA device")
-
-
-def _budget(device_bytes: int, host_bytes: int = 1 << 34) -> ComputeBudget:
-    return ComputeBudget(
-        device_kind="cuda",
-        device_ids=(0,),
-        device_names=("test",),
-        device_bytes=(device_bytes,),
-        device_compute_capabilities=((8, 0),),
-        host_bytes=host_bytes,
-        cpu_threads=1,
-    )
 
 
 def test_cuda_digit_gemm_is_exact_on_integers() -> None:
     rng = np.random.default_rng(6)
     codes = _signed_codes(rng, 48, 4000)
     operand = rng.integers(-5000, 5000, size=(4000, 6)).astype(np.float64)
-    tile = CodeBlockTile(cupy.asarray(codes), np.zeros(48), np.ones(48), cupy, _budget(1 << 33))
+    tile = CodeBlockTile(cupy.asarray(codes), np.zeros(48), np.ones(48), cupy, 1 << 33)
 
     produced = cupy.asnumpy(tile.rmatmat(cupy.asarray(operand)))
 
     np.testing.assert_array_equal(produced, (codes.astype(np.int64) @ operand.astype(np.int64)).astype(np.float64))
 
 
-@pytest.mark.parametrize("device_bytes", [1 << 33, 3_000_000])
-def test_cuda_tile_products_match_the_cpu_tile(device_bytes: int) -> None:
+@pytest.mark.parametrize("workspace_bytes", [1 << 33, 3_000_000])
+def test_cuda_tile_products_match_the_cpu_tile(workspace_bytes: int) -> None:
     rng = np.random.default_rng(7)
     variants, samples = 61, 5003
     codes = _signed_codes(rng, variants, samples)
     values = codes.astype(np.float64)
     means, scales = values.mean(axis=1), values.std(axis=1)
-    cpu_tile = CodeBlockTile(codes, means, scales, np, _cpu_budget(1 << 34))
-    cuda_tile = CodeBlockTile(cupy.asarray(codes), cupy.asarray(means), cupy.asarray(scales), cupy, _budget(device_bytes))
+    cpu_tile = CodeBlockTile(codes, means, scales, np, 1 << 34)
+    cuda_tile = CodeBlockTile(cupy.asarray(codes), cupy.asarray(means), cupy.asarray(scales), cupy, workspace_bytes)
     right = rng.standard_normal((variants, 5)) * np.exp(rng.uniform(-6, 6, 5))[None, :]
     left = rng.standard_normal((samples, 3))
     weights = rng.uniform(0.05, 0.25, samples)
