@@ -267,24 +267,6 @@ class VariantRecord:
 
 
 @dataclass(slots=True)
-class VariantStatistics:
-    """Pre-computed per-variant statistics from a single streaming pass."""
-    means: F32Array
-    scales: F32Array
-    allele_frequencies: F32Array
-    support_counts: I32Array  # non-zero dosage count per variant
-
-
-@dataclass(slots=True)
-class PreparedArrays:
-    covariates: F32Array
-    targets: F32Array
-    means: F32Array
-    scales: F32Array
-    support_counts: I32Array
-
-
-@dataclass(slots=True)
 class TieGroup:
     """A group of variants with identical (or exactly negated) genotype columns.
 
