@@ -15,7 +15,12 @@ from sklearn.metrics import log_loss, r2_score, roc_auc_score
 from sv_pgs.artifact import try_load_artifact_if_fingerprint_matches
 from sv_pgs.config import ModelConfig, TraitType
 from sv_pgs.genotype import as_raw_genotype_matrix
-from sv_pgs.io import LoadedDataset, _coerce_float, _format_float, _open_text_file
+from sv_pgs.io import LoadedDataset
+from sv_pgs.sample_table import (
+    _coerce_float,
+    _format_float,
+    _open_text_file,
+)
 from sv_pgs.model import BayesianPGS, _fit_checkpoint_config_hash
 from sv_pgs.numeric import stable_sigmoid
 from sv_pgs.progress import log, mem

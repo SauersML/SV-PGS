@@ -1237,7 +1237,7 @@ def _log_cached_test_evals_from_summary(work_dir: Path, *, label: str) -> bool:
     summary_path = work_dir / "summary.json.gz"
     if not summary_path.exists():
         return False
-    from sv_pgs.io import _open_text_file
+    from sv_pgs.sample_table import _open_text_file
 
     try:
         with _open_text_file(summary_path, "rt") as handle:
@@ -1471,7 +1471,7 @@ def _read_fit_status(work_dir: Path) -> dict[str, object]:
     if summary_path.exists():
         info["status"] = "COMPLETE"
         try:
-            from sv_pgs.io import _open_text_file
+            from sv_pgs.sample_table import _open_text_file
 
             with _open_text_file(summary_path, "rt") as handle:
                 payload = json.loads(handle.read())

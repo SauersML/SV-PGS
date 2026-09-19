@@ -20,16 +20,16 @@ from sv_pgs.cli import main
 from sv_pgs.data import VariantRecord, VariantStatistics
 from sv_pgs.genotype import Int8RawGenotypeMatrix
 from sv_pgs.io import (
-    _VariantDefaults,
-    _inspect_delimited_table,
-    _load_vcf_from_cache,
-    _resolve_sample_id_column,
-    _save_vcf_to_cache,
-    _vcf_cache_key,
     load_dataset_from_files,
     load_multi_source_dataset_from_files,
     load_multi_vcf_dataset_from_files,
+    _load_vcf_from_cache,
+    _resolve_sample_id_column,
+    _save_vcf_to_cache,
+    _VariantDefaults,
+    _vcf_cache_key,
 )
+from sv_pgs.sample_table import _inspect_delimited_table
 import sv_pgs.genotype as genotype_module
 import sv_pgs.io as io_module
 import sv_pgs.model as model_module
