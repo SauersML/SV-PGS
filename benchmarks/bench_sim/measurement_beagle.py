@@ -48,6 +48,12 @@ def batch_block(truth: np.ndarray, rows: np.ndarray, first: int, last: int) -> n
 _BLOCK_INPUTS: dict = {}
 
 
+def beagle_allele(alt: str, row: int) -> str:
+    """Beagle rejects two records with the same CHROM, POS, REF and ALT, which symbolic SVs at one position
+    (two <INS> of different lengths) share. Symbolic alleles get the record's ID inside the brackets."""
+    return f"{alt[:-1]}:v{row}>" if alt.startswith("<") else alt
+
+
 def _simulate_calls(block_start: int) -> tuple[int, np.ndarray, list[bytes]]:
     """One block of records: read-model calls and their target VCF lines. Runs in a forked worker."""
     truth_block, errors, sites, simple_rows, seed = (_BLOCK_INPUTS[key] for key in ("truth", "errors", "sites", "rows", "seed"))
@@ -82,7 +88,7 @@ def main() -> None:
     simple_rows = np.flatnonzero(cls <= 1)
     masked_rows = np.flatnonzero(cls >= 2)
     length = int(pos.max()) + 1
-    sites = [f"{args.chrom}\t{pos[row]}\tv{row}\t{refs[row]}\t{alts[row]}\t.\tPASS\t.\tGT\t" for row in range(n_var)]
+    sites = [f"{args.chrom}\t{pos[row]}\tv{row}\t{refs[row]}\t{beagle_allele(alts[row], row)}\t.\tPASS\t.\tGT\t" for row in range(n_var)]
 
     reference = work / "reference.vcf.gz"
     if not reference.exists():

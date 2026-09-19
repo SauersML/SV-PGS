@@ -11,7 +11,7 @@ import gzip
 import numpy as np
 from scipy.stats import norm
 
-from benchmarks.bench_sim import cohort, harness, measurement, truth
+from benchmarks.bench_sim import cohort, harness, measurement, measurement_beagle, truth
 from benchmarks.bench_sim.annotations import merged_intervals, overlaps
 from sv_pgs.dosage_store import encode_dosage_milli
 
@@ -183,3 +183,9 @@ def test_auc_matches_pairwise_counting() -> None:
     positives, negatives = score[outcome > 0.5], score[outcome < 0.5]
     expected = float((positives[:, None] > negatives[None, :]).mean())
     assert abs(harness.auc(outcome, score) - expected) <= positives.size * negatives.size * EPSILON
+
+
+def test_beagle_alleles_are_unique_per_record() -> None:
+    assert measurement_beagle.beagle_allele("<INS>", 7) == "<INS:v7>"
+    assert measurement_beagle.beagle_allele("<INS>", 7) != measurement_beagle.beagle_allele("<INS>", 8)
+    assert measurement_beagle.beagle_allele("ACGT", 7) == "ACGT"
