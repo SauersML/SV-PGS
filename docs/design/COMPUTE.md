@@ -37,7 +37,7 @@
 
 | Item | Current or planned | Floor | Factor |
 |---|---|---|---|
-| Stage 1 | 39–55 µs per variant·model·sweep (H100), ~800 GPU-h | not a separate stage | ~10³× |
+| Stage 1 | 39–55 µs per variant·model·sweep (H100), ~800 GPU-h | dropped: no slow outer direction (compute_floor.md §10) | removed |
 | Columns per fit pass | 1,785 (16 probes per model) | 105 | 17× |
 | Solver state | ~6 variant-side fp64 host arrays, 1.46 TB at R = 1,785 (exceeds a 680 GB host) | sample-side n×R, 1.4 GB | infeasible → feasible |
 | Posterior draws | separate from-zero block-CG, R = 6,720 × ~25 passes | recycled through the last outer steps, with a block control variate | ~40× |
@@ -48,11 +48,11 @@
 
 End to end: about 1,000× today, and 10–40× once Stage 1 is removed.
 
-**Stage 1 (lead ruling, 2026-09-19).**
-- Build and optimize the Stage-2-only path first. Stage 1 is optional until the production outer contraction ρ and the real partition's cut coupling are measured.
-- ρ decides whether Stage 1's pass-free outer steps are worth keeping: at ρ = 0.99 the fit needs ~160 outer steps, at ρ = 0.5 about 3.
-- If Stage 1 stays, it needs batched block factors across blocks and models on the GPU, with no per-block Python.
-- An earlier branch (e2854ca, in archive tags `build-stage1` and `wip-wt-build-store`) has a measured fp64-vs-fp32 Cholesky policy (Jacobi-scaled fp32 factors with fp64 refinement) and multi-GPU block dispatch. The variance refreshes need that policy in either case.
+**Stage 1 is dropped (lead's decision, 2026-09-19, on the measurements in compute_floor.md §10).**
+- At production signal the EP-EM outer map has no slow direction: λ(A⁻¹B) lies in [0.89, 5.4]. An accelerated or Newton-B outer loop certifies in 1–3 steps, so Stage 1's pass-free outer steps would save at most a few Stage 2 passes.
+- The outer step is Newton with the total curvature B, or safeguarded relaxation/Anderson. Plain EP-EM diverges in 7 of 16 measured configurations (3 of the 10 at production signal).
+- Stage 2 uses only certified marginals. Block-Jacobi variances put the top ~1% of cavity precisions 28–58% off, so they need cross-block correction (compute_floor.md §10.4).
+- The variance refreshes still need e2854ca's fp64-vs-fp32 Cholesky policy (Jacobi-scaled fp32 factors with fp64 refinement; archive tags `build-stage1` and `wip-wt-build-store`) and its multi-GPU block dispatch.
 
 ## Cloud: the dedicated SV-PGS workspace
 - **Platform:** a Verily Workbench (AoU Researcher Workbench 2.0) workspace in us-central1.

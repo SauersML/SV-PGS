@@ -73,9 +73,10 @@ Lane speed-floor, 2026-09-19. It covers the whole pipeline for 21 traits × 5 fo
   - Even with TF32 factors (128 s per sweep on an A100, about 75 passes), 40 Stage 1 sweeps cost ~3,000 pass-equivalents, which is more than every Stage 2 pass of the floor (47) put together.
   - The warm start was measured to be in the right basin, but not faster (ep_eb.md §5.2: 7/15/7, 10/13/10, 10/8/17 outer steps).
   - Floor: **0**. Start Stage 2 from the prior, with loose forcing terms in the early outer steps (inexact Newton).
+  - **Measured (§10):** at production signal the outer map has no slow direction, so Stage 1's pass-free outer steps would save at most 1–3 Stage 2 outer steps. Stage 1 is dropped (lead's decision, 2026-09-19).
 - **Stage 2 fit.** The first solve costs I₁ = ½√κ ln(‖μ‖/tol) passes.
   - Each later outer step warm-starts from the previous μ and solves only to a forcing tolerance η_o ~ ρ (Eisenstat–Walker; novel-inference §8c), in about ½√κ ln(1/ρ) passes.
-  - With block-Jacobi κ (17–28 iterations measured for a full solve) and N_o = 5 outer steps at ρ ≈ 0.5, P_fit ≈ 26 + 4·4 = **42** [est; ρ at production scale is unmeasured, and this term scales as log(δ₀/δ\*)/log(1/ρ)].
+  - With block-Jacobi κ (17–28 iterations measured for a full solve) and N_o = 5 outer steps at ρ ≈ 0.5, P_fit ≈ 26 + 4·4 = **42** [est]. The term scales as log(δ₀/δ\*)/log(1/ρ). The measured accelerated rate at production is 0.03–0.40 (§10), i.e. 1–3 outer steps, so 42 is conservative.
 - **Draws.** The draws' right-hand sides need the final sites, but they warm-start through the last outer steps like the mean does (Krylov recycling). So they add about one forcing-level solve, **~5 passes**, instead of a from-zero block-CG.
   - K_d itself should come from the needed accuracy of the predictive variance, and a control variate (below) cuts it.
 - **Scoring.** In-cohort held-out scoring rides the final pass (§1): **0 passes**. Only a new target cohort needs one scoring pass.
@@ -197,6 +198,7 @@ Factors are in the dominant resource on 8×A100-40, the primary AoU configuratio
 | 12 | Code layout in matmat | transposes p_b × chunk of codes on every call (TN-only int8) | a variant-contiguous copy held once, or a layout-aware GEMM | ~34% of matmat (speed-io: 1.6 of 4.7 ms per p_b = 2,048 block at K = 105; 83 GB/s via cupy, 252 GB/s with a tiled kernel) | TN-only cuBLAS int8 | speed-io |
 | 13 | Folds | 105 models started from the prior together | full-data model per trait first, then folds warm-started from its μ and x | outer steps per fold model ~5 → ~1–2 [est] | no cross-fold warm start | speed-krylov, e2e |
 | 14 | Staging read (cold) | not in the plan's cost model | 0.32 TB at the GCS rate (3–5 min at 1–2 GB/s [est]); **the floor's dominant term on 8-GPU VMs** | — | — | speed-io |
+| 15 | Per-pass decode of a compressed store | zstd bucket store decoded on the host: 4.96 GB/s on 8 threads (speed-io, measured), i.e. ~2,600 core-s per 1.7·10¹² codes, 27 s/pass on 96 vCPUs; a raw 1.7 TB local cache is NVMe-bound (~180 s/pass) | a GPU-decodable codec streamed over PCIe (13 s/pass on one A40, 1.7 s on 8×A100) | **16–100×** per pass | zstd decodes only on the host (nvCOMP zstd, 2–11 GB/s per GPU, also loses to PCIe) | speed-io |
 
 ### 9.2 End to end, 8×A100-40 (all 105 models)
 
@@ -234,7 +236,85 @@ The counting model predicts the raw kernels; the gap is in the path around them.
 - So the per-pass gap on the A40 is **~165×** = 17× (R) × 2× (L) × ~5× (the exact path's overhead over raw GEMM), capped by the codec I/O at the floor.
 
 ### 9.4 What the gap depends on (verify before closing)
-1. **The production outer contraction ρ,** which sets rows 1 and 3. At ρ = 0.99 the floor needs ~160 outer steps. Then Stage 1's pass-free steps could be worth keeping, but reimplemented at the row-7 floor.
-2. **Cut coupling of the real partition,** row 8. Measure ‖A_blk^{-1/2}EA_blk^{-1/2}‖ on 1kGP chr22 with the online partitioner's cuts.
+1. **The production outer contraction ρ,** rows 1 and 3: **measured, §10.1–10.3.** There is no slow direction (λ_min ≥ 0.89), the accelerated rate is 0.03–0.40, and Stage 1 is dropped.
+2. **Cut coupling of the real partition,** row 8: **measured, §10.4.** γ = 0.40–0.76, and block-variance cavities are p99 28–58% off, so the variances need cross-block correction.
 3. **The variance reduction of the draw control variate,** row 6.
 4. **GCS staging throughput** on a2-highgpu-8g and a3, row 14.
+
+## 10. Measured: the outer contraction and the cut coupling [semi-real]
+
+**Data.** bench-sim's chr22 real-haplotype mosaic cohort: 50,000 people assembled from 1kGP haplotypes, 590,623 variants including SVs. The true genotypes are used, so there is no imputation error.
+- Effects are drawn from a known continuous scale mixture (a log-normal bulk plus 3% at 100× the variance), in the reference's own parametrization.
+- So the LD and frequencies are real and the effects simulated: **[semi-real]**.
+- Scripts and raw output are in `/scratch.global/sauer354/svpgs-team/speed-floor/` (`rho_measure.py`, `rho_analyze.py`, `cut_coupling3.py`, and the `*.json` / `curvatures_*.npz` files).
+
+### 10.1 Method for ρ
+- **The map.** The EP-EM outer map has Jacobian J = I − (A + S)⁻¹(B + S) (ep_eb.md §2.2), with A the fixed-cavity curvature and B the total curvature (EP re-solved), both from `tests/ep_eb_reference.py`, at the true prior with EP solved there.
+  - At genome scale x̂ sits at the truth, so this is the production fixed point.
+- **The data.** Four far-apart windows of w contiguous polymorphic variants, in 4–12 independent replicates.
+  - A and B are summed over replicates and scaled by c = 1.7·10⁷/p_pooled.
+  - S is the reference penalty at weights 0.01, 1 and 100 (results below at 1; the others agree within the bootstrap).
+  - Directions where cA + S is not positive (3–9 of 16–51, the data-undetermined mixing directions) are left out; the learned penalty puts them in its null space.
+- **The rates.**
+  - ρ_plain = max|1 − λ| is plain EP-EM (> 1 diverges).
+  - ρ_Krylov = (√κ − 1)/(√κ + 1), with κ = λ_max/λ_min, is Anderson/GMRES acceleration.
+  - Steps to the certificate take log(2K)/(2 log(1/ρ)) at K = 64 (1 nat → 1/(2K) nats).
+- **The signal.** Per-variant signal s = n E[β²]/σ² = h²n/p: production (n = 10⁵, h² = 0.3, p = 1.7·10⁷) is s = 1.8·10⁻³, written "×1". ×10, ×100 and ×1000 correspond to p/n ≈ 17, 1.7 and 0.17.
+- **The control.** With the LD removed (Λ diagonal), A = B to 10⁻¹⁵ in every row (ep_eb.md Theorem 2). So every departure from 1 is LD-driven cavity response.
+
+### 10.2 Results (weights 1; point estimate, 95% bootstrap over replicates)
+| hyperparameters | window w (within-window LD score) | n | signal | λ_min | λ_max | ρ_plain | ρ_Krylov | outer steps (accelerated) |
+|---|---|---|---|---|---|---|---|---|
+| 16 | 100 (4.1) | 4k | ×1 | 1.00 | 1.11 | 0.11 [0.09, 1.3] | 0.03 [0.02, 0.22] | 0.7 |
+| 16 | 100 (4.7) | 50k | ×1 | 1.00 | 1.18 | 0.18 [0.07, 6.0] | 0.04 [0.02, 0.49] | 0.8 |
+| 16 | 200 (6.7) | 4k | ×1 | 1.00 | 1.75 | 0.75 [0.10, 3.2] | 0.14 [0.02, 0.38] | 1.2 |
+| 16 | 400 (8.8) | 50k | ×1 | 0.89 | 2.82 | 1.82 [0.08, 7.5] | 0.28 [0.02, 0.49] | 1.9 |
+| 16 | 800 (13.9) | 50k | ×1 | 1.00 | 1.64 | 0.64 [0.37, 11] | 0.12 [0.08, 0.59] | 1.2 |
+| 16 | 1600 (19.1) | 50k | ×1 | 1.00 | 2.21 | 1.21 [0.30, 77] | 0.20 [0.07, 0.82] | 1.5 |
+| 27 | 100 (5.3) | 50k | ×1 | 0.99 | 1.54 | 0.54 [0.01, 0.54] | 0.11 [0.003, 0.11] | 1.1 |
+| 27 | 200 (6.6) | 50k | ×1 | 0.98 | 1.84 | 0.84 [0.03, 4.1] | 0.16 [0.01, 0.39] | 1.3 |
+| 51 | 100 (5.3) | 50k | ×1 | 0.98 | 1.21 | 0.21 [0.05, 5.0] | 0.05 [0.01, 0.42] | 0.8 |
+| 51 | 200 (6.6) | 50k | ×1 | 1.00 | 5.41 | 4.41 [0.05, 5.3] | 0.40 [0.01, 0.43] | 2.6 |
+| 16 | 100 (4.7) | 50k | ×10 | 0.89 | 5.47 | 4.47 [0.35, 33] | 0.43 [0.11, 0.72] | 2.8 |
+| 16 | 100 (4.8) | 50k | ×100 | 0.86 | 3.61 | 2.61 [0.75, 5.5] | 0.34 [0.16, 0.48] | 2.3 |
+| 16 | 100 (5.4) | 50k | ×1000 | 0.85 | 1.50 | 0.50 [0.27, 3.3] | 0.14 [0.09, 0.44] | 1.2 |
+
+(Rows at n = 4k with ×10–×1000 agree with the n = 50k rows within the bootstrap.)
+
+### 10.3 What the spectrum says
+1. **No slow direction.** λ_min ≥ 0.77 in every configuration, and 0.89–1.00 at production signal. The EM-type regime (λ_min → 0, ρ = 1 − λ_min ≈ 0.99, ~160 outer steps) that motivated a pass-free Stage 1 does not occur.
+2. **The cavity response adds curvature.** Mostly B ⪰ A, so the fixed-cavity step overshoots. Plain EP-EM is unsafe: λ_max > 2 (divergence) in 7 of the 16 configurations, 3 of the 10 at production signal, and bootstrap draws reach λ_max ≈ 78.
+3. **The outer step must be Newton with B** (quadratic; the reference and speed-ep's closed-form B products), or safeguarded relaxation/Anderson with ω = 2/(λ_min + λ_max). Never plain EP-EM.
+4. **Accelerated,** production certifies in 0.7–2.6 outer steps (point), ≤ 12 at the worst bootstrap upper bound. Each warm-started outer step costs ~4 passes (§3), which a pass-free Stage 1 could at most save. One Stage 1 sweep's variance refresh alone costs 75–600 pass-equivalents (§3).
+5. **Dependence:**
+   - on n at fixed signal (p/n at fixed h²): none within noise;
+   - on signal: rising to ×10–×100, then falling;
+   - on LD extent: ρ_Krylov rises from 0.04 to 0.12–0.28 between LD scores 5 and 9–19, noisily;
+   - on the hyperparameter count (16/27/51): no systematic trend at w = 100, and 0.14/0.16/0.40 at w = 200.
+6. **Limits:**
+   - The windows reach a within-window LD score of 19; the chromosome mean is 42–49. High-LD windows are being measured next.
+   - A few replicates holding a large effect in strong LD dominate B − A, hence the wide intervals.
+   - An EP-EM run at genome-equivalent weights on one window problem could not be done: that window-scale evidence has no maximizer.
+
+### 10.4 Cut coupling of the real partition
+**Setup.** 12,000 consecutive polymorphic chr22 variants × 50,000 people.
+- The partition is the production one: `ld_partition`'s exact minimum-cost cuts on the fixed-point pair weights, at caps 512–4096. It is compared with equal blocks of the same count.
+- A = nR + T, with T the site precisions of a heavy-tailed prior at mean signal s.
+- D is A's block diagonal and E the rest; γ = ‖D^{-1/2}ED^{-1/2}‖.
+
+| signal | cap | γ (LD cuts / equal cuts) | block variance error p99 / max | cavity-precision error from block variances, median / p99 / max | with the 2nd-order term, median / p99 / max |
+|---|---|---|---|---|---|
+| ×1 | 512 | 0.76 / 0.81 | 0.21% / 3.9% | — | — |
+| ×1 | 1024 | 0.69 / 0.72 | 0.20% / 3.5% | 4.6% / 58% / 71% | 0.37% / 27% / 44% |
+| ×1 | 2048 | 0.55 / 0.60 | 0.16% / 2.8% | — | — |
+| ×1 | 4096 | 0.40 / 0.52 | 0.11% / 2.5% | 2.6% / 28% / 53% | 0.05% / 2.1% / 9.0% |
+| ×10 | 1024 | 3.2 / 3.5 | 5.4% / 35% | 28% / 275% / 353% | series diverges: 935 improper cavities |
+| ×10 | 4096 | 1.2 / 1.7 | 2.5% / 22% | 11% / 94% / 265% | 4 improper cavities |
+
+What it says:
+- **The partition is cap-bound:** the median block sits at the cap, and LD-optimal cuts lower γ by only 5–20% against equal cuts. Coupling falls with the cap, from 0.76 at 512 to 0.40 at 4096.
+- **Block variances never exceed the exact ones [proved; checked in every row].** (A⁻¹)_bb = (A_bb − A_br A_rr⁻¹ A_rb)⁻¹ ⪰ A_bb⁻¹. So frozen block variances always give proper cavities (0 improper in every row). They are biased low, though.
+- **The cavity precision P_j = 1/Ṽ_j − τ_j is where that bias bites.** At production, P_j/τ_j has median 2.9·10⁻⁴, so a 0.2% variance error becomes a ~50% cavity error. The EP sites of the top ~1% of variants are then computed from cavities 28–58% off (p99), which moves the EP fixed point.
+- **The second-order term** diag(D⁻¹ED⁻¹ED⁻¹) fixes most of it at cap 4096 (p99 2%). It is valid only where γ < 1, and it overshoots into improper cavities where γ ≥ 1 (denser signal).
+- **So Stage 2's certified marginals need cross-block variances for the resolved variants.** Candidates: the exact resolved set, leave-block-out (novel-inference), overlapping blocks, or the certified second-order term. Use the largest cap device memory allows.
+
