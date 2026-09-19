@@ -175,7 +175,11 @@ def logistic_recalibration_coefficients(score: NDArray, labels: NDArray) -> NDAr
     The maximum is finite and unique unless the score separates the labels (Albert and Anderson 1984),
     which is refused. Damped Newton ascends the strictly concave log-likelihood and stops once the
     Newton decrement, half of which estimates the remaining gain, is below the fp64 resolution of the
-    log-likelihood.
+    log-likelihood. The maximum is equivariant under an affine map of the score, and the Newton decrement
+    is invariant under it, so the fit runs on the standardized score, where the linear predictor carries
+    no cancellation, and is mapped back. A step is taken only if it strictly raises the evaluated
+    log-likelihood; when every trial length down to the coefficients' own resolution fails to, the
+    remaining gain is below the rounding of the log-likelihood sum and the coefficients are returned.
     """
     score = np.asarray(score, dtype=np.float64)
     positive = labels == 1.0
@@ -184,7 +188,9 @@ def logistic_recalibration_coefficients(score: NDArray, labels: NDArray) -> NDAr
     positive_scores, negative_scores = score[positive], score[~positive]
     if positive_scores.min() >= negative_scores.max() or positive_scores.max() <= negative_scores.min():
         raise ValueError("the score separates the labels, so its logistic recalibration has no finite maximum")
-    design = np.column_stack([np.ones_like(score), score])
+    location = float(np.mean(score))
+    spread = float(np.std(score))
+    design = np.column_stack([np.ones_like(score), (score - location) / spread])
 
     def log_likelihood(coefficients: NDArray) -> float:
         linear = design @ coefficients
@@ -193,7 +199,8 @@ def logistic_recalibration_coefficients(score: NDArray, labels: NDArray) -> NDAr
     prevalence = float(np.mean(positive))
     coefficients = np.array([math.log(prevalence / (1.0 - prevalence)), 0.0])
     current = log_likelihood(coefficients)
-    while True:
+    ascending = True
+    while ascending:
         fitted = special.expit(design @ coefficients)
         gradient = design.T @ (labels - fitted)
         step = np.linalg.solve(design.T @ (design * (fitted * (1.0 - fitted))[:, None]), gradient)
@@ -202,12 +209,15 @@ def logistic_recalibration_coefficients(score: NDArray, labels: NDArray) -> NDAr
         length = 1.0
         while True:
             candidate = coefficients + length * step
+            if np.array_equal(candidate, coefficients):
+                ascending = False
+                break
             candidate_value = log_likelihood(candidate)
-            if candidate_value >= current:
+            if candidate_value > current:
+                coefficients, current = candidate, candidate_value
                 break
             length *= 0.5
-        coefficients, current = candidate, candidate_value
-    return coefficients
+    return np.array([coefficients[0] - coefficients[1] * location / spread, coefficients[1] / spread])
 
 
 def _logistic_recalibration(score: NDArray, labels: NDArray) -> NDArray:

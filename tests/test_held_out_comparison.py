@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import numpy as np
 import pytest
-from scipy import stats
+from scipy import special, stats
 from sklearn.metrics import roc_auc_score
 
 from sv_pgs.held_out_comparison import (
@@ -122,23 +122,39 @@ def test_paired_delta_log_loss_favours_the_more_informative_score_and_holds_size
     assert better.z_score > 3.0
 
 
+def _within_the_stopping_rule(score, labels, intercept, slope):
+    """Half the Newton decrement at (intercept, slope) is within fp64 resolution of the log-likelihood."""
+    design = np.column_stack([np.ones_like(score), score])
+    linear = intercept + slope * score
+    fitted = special.expit(linear)
+    gradient = design.T @ (labels - fitted)
+    information = design.T @ (design * (fitted * (1.0 - fitted))[:, None])
+    log_likelihood = float(np.sum(labels * linear - np.logaddexp(0.0, linear)))
+    return 0.5 * float(gradient @ np.linalg.solve(information, gradient)) <= np.finfo(np.float64).eps * abs(log_likelihood)
+
+
 def test_logistic_recalibration_reaches_the_maximum_and_refuses_separation():
     rng = np.random.default_rng(10)
     score = rng.standard_normal(4000)
     labels = (rng.random(4000) < 1.0 / (1.0 + np.exp(-(0.3 + 1.2 * score)))).astype(float)
-    coefficients = logistic_recalibration_coefficients(score, labels)
-    design = np.column_stack([np.ones_like(score), score])
-    linear = design @ coefficients
-    fitted = 1.0 / (1.0 + np.exp(-linear))
-    gradient = design.T @ (labels - fitted)
-    information = design.T @ (design * (fitted * (1.0 - fitted))[:, None])
-    log_likelihood = float(np.sum(labels * linear - np.logaddexp(0.0, linear)))
-    # the stopping rule: half the Newton decrement is within fp64 resolution of the log-likelihood
-    assert 0.5 * float(gradient @ np.linalg.solve(information, gradient)) <= np.finfo(np.float64).eps * abs(log_likelihood)
+    intercept, slope = logistic_recalibration_coefficients(score, labels)
+    assert _within_the_stopping_rule(score, labels, intercept, slope)
     with pytest.raises(ValueError, match="separates"):
         logistic_recalibration_coefficients(score, (score > 0.0).astype(float))
     with pytest.raises(ValueError, match="both cases and controls"):
         logistic_recalibration_coefficients(score, np.zeros_like(score))
+
+
+def test_logistic_recalibration_returns_the_maximum_of_a_score_far_from_zero():
+    # A raw score 10^6 from zero: fitted in its own coordinates the linear predictor cancelled, the
+    # evaluated log-likelihood stopped rising while the Newton decrement stayed above its resolution,
+    # and the line search accepted a zero step forever. Moving the fit to the centred score's
+    # coordinates costs the intercept |a| eps of cancellation, far below the stopping rule's resolution.
+    rng = np.random.default_rng([2000, 40, 300, 1, 1000000])
+    centered = rng.standard_normal(2000)
+    labels = (rng.random(2000) < special.expit(-4.0 + 3.0 * centered)).astype(float)
+    intercept, slope = logistic_recalibration_coefficients(1e6 + centered, labels)
+    assert _within_the_stopping_rule(centered, labels, intercept + slope * 1e6, slope)
 
 
 def test_size_gate_is_the_exact_binomial_test_at_alpha():
