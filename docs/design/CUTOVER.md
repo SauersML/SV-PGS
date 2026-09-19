@@ -14,7 +14,13 @@ The pre-cutover tree is tagged `archive/2026-09-19/old-path-final` (`f025cce`).
 | B3 | ruled: until the engine's Stage 2 driver lands, the CLI keeps only commands backed by kept modules; old fit commands are removed, not stubbed |
 | B5, B6 | ruled: the engine owns the certificate artifact and logistic EP; the old binary code goes with C5 |
 | B7 | ruled: owned by the deslop-fit lane |
-| C2–C8 | pending |
+| C2 | landed: the CLI keeps the phenotype commands and `version`; `run`, `run-all-of-us`, `evaluate-all-of-us`, `doctor` and `run.sh` are gone (with `test_io`, `test_cli_doctor`) |
+| C3 | pending |
+| C4 | pending |
+| C5 | pending |
+| C6 | pending |
+| C7 | pending |
+| C8 | pending |
 
 ## Size
 - **`sv_pgs/`:** 65,304 lines.
@@ -163,7 +169,7 @@ The engine lane is building a production variant-side inference module in `sv_pg
     - `test_convergence_export_contract_pinning`: move to the engine (E).
     - `test_no_caps`: keep its source scans ("no caps on variants or samples") over the kept module list.
 - **Verify:**
-  - `git grep -n -E 'sv_pgs\.(aou_runner|aou_storage|evaluate|pipeline|benchmark)\b|from sv_pgs import .*\b(aou_runner|aou_storage|evaluate|pipeline|benchmark)\b' -- sv_pgs tests scripts .github` prints nothing.
+  - `git grep -n -P 'sv_pgs\.(aou_runner|aou_storage|evaluate|pipeline|benchmark)\b|from sv_pgs import .*\b(aou_runner|aou_storage|evaluate|pipeline|benchmark)\b' -- sv_pgs tests scripts .github` prints nothing.
   - Then the full suite, vulture and CI.
 
 ### C4 — `model.py`: the old fit orchestration and the old scorer
@@ -176,7 +182,7 @@ The engine lane is building a production variant-side inference module in `sv_pg
 - **Tests:**
   - Delete: `test_adversarial_high_dimensional`, `test_adversarial_limits`, `test_autotune_oom_safety`, `test_cache_corruption_safety` (keep its artifact case if `artifact.py` stays), `test_marginal_z_concat_fast_path`, `test_model`, `test_prediction_accuracy`, `test_scoring_bitpacked_fast_path`.
   - The scorer cases the history inventory marked for moving are already in `test_fast_scoring`: `predictive_intercept_shift` and `posterior_predictive_probability`.
-- **Verify:** `git grep -n -E 'sv_pgs\.(model|runtime_policy)\b|from sv_pgs import .*\b(model|runtime_policy)\b' -- sv_pgs tests` prints nothing; then the full suite, vulture and CI.
+- **Verify:** `git grep -n -P 'sv_pgs\.(model|runtime_policy)\b|from sv_pgs import .*\b(model|runtime_policy)\b' -- sv_pgs tests` prints nothing; then the full suite, vulture and CI.
 
 ### C5 — the old inference core (GIG/δ mean field, SVI, PG-IRLS / TR-Newton, solvers)
 - **Prerequisites:**
@@ -193,7 +199,7 @@ The engine lane is building a production variant-side inference module in `sv_pg
   - Delete: `test_anderson_actually_accelerates`, `test_binary_laplace_variance`, `test_binary_tr_newton_path`, `test_block_shuffle`, `test_cg_workset_resident_cache_pinning`, `test_checkpoint_compat`, `test_elbo`, `test_elbo_zero_variance_boundaries_pinning`, `test_end_to_end_smoke`, `test_exact_inverse_diagonal_cost`, `test_forcing_sequence`, `test_forcing_sequence_zero_grad_boundaries_pinning`, `test_gig_mean_small_argument`, `test_gpu_cg_no_stream_capture`, `test_gpu_cholesky_solve_no_factor_copy`, `test_gpu_cholesky_solve_zero_covariates`, `test_gpu_memory_hygiene`, `test_gpu_scheduler`, `test_inference` (5,657), `test_lanczos_one_by_one_boundaries_pinning`, `test_ld_block_smoke`, `test_linear_solvers`, `test_linear_solvers_bugfixes`, `test_local_scales_collapsed`, `test_numerical_guards`, `test_one_prior_all_routes`, `test_optimizer_invariants`, `test_output_dtype`, `test_prior_level_without_variance_refresh`, `test_resume_continuity`, `test_resume_with_new_features`, `test_sample_space_operator_bitpacked`, `test_sample_space_operator_ld_sharded`, `test_sigma_e2_elbo`, `test_solve_spd_zero_rhs_boundaries_pinning`, `test_solver_controls_des`, `test_tpb_lbfgs`, `test_tr_newton`, `test_tr_newton_nonconvergence_bugfixes`, `test_tr_newton_zero_iter_boundaries_pinning`, `test_variance_state_no_stale_ema`, `test_warm_start_api`, `test_warm_start_category_reconciliation`.
   - `test_stable_sigmoid_log1p_boundaries_pinning`: keep its `numeric` cases if `numeric.py` stays.
   - The intent carried by the engine's tests is listed above.
-- **Verify:** `git grep -n -E 'sv_pgs\.(mixture_inference|linear_solvers|tr_newton|elbo|forcing_sequence|precision_policy|inference|gpu_scheduler)\b|from sv_pgs import .*\b(mixture_inference|inference|elbo|tr_newton)\b' -- sv_pgs tests` prints nothing; then the full suite, vulture and CI.
+- **Verify:** `git grep -n -P 'sv_pgs\.(mixture_inference|linear_solvers|tr_newton|elbo|forcing_sequence|precision_policy|inference|gpu_scheduler)\b|from sv_pgs import .*\b(mixture_inference|inference|elbo|tr_newton)\b' -- sv_pgs tests` prints nothing; then the full suite, vulture and CI.
 
 ### C6 — genotype backends and the marginal |z| screen
 - **Prerequisite:** C5 (a).
@@ -219,7 +225,7 @@ The engine lane is building a production variant-side inference module in `sv_pg
   - Rewrite:
     - `test_preprocessing`: move its `collapse_tie_groups` cases next to `prior_design`.
     - `test_tie_map_all_missing_boundaries_pinning` and `test_hardcall_tie_sign_flip_pinning`: port the all-missing and sign-flip tie cases to `test_genotype_statistics`, if not already covered.
-- **Verify:** `git grep -n -E 'sv_pgs\.(genotype|io|preprocessing|screening_pipeline|plink|mmap_reader|gcsfuse_staging|gds|bitpacked|bitpacked_loader|bitpacked_matrix|bitpacked_profile|ld_blocks|ld_block_partition|sample_table)\b' -- sv_pgs tests .github pyproject.toml` prints nothing; then the full suite, vulture and CI.
+- **Verify:** `git grep -n -P 'sv_pgs\.(genotype|io|preprocessing|screening_pipeline|plink|mmap_reader|gcsfuse_staging|gds|bitpacked|bitpacked_loader|bitpacked_matrix|bitpacked_profile|ld_blocks|ld_block_partition|sample_table)\b' -- sv_pgs tests .github pyproject.toml` prints nothing; then the full suite, vulture and CI.
 
 ### C7 — JAX and old-only dependencies
 - **Prerequisite:** C6. After it, `_jax` has no importers.
@@ -234,7 +240,7 @@ The engine lane is building a production variant-side inference module in `sv_pg
   - uv.lock: regenerated by env.
   - CI: drop `JAX_PLATFORMS: cpu`.
 - **Tests:** delete `test_jax_gpu_detection` and `test_jax_runtime`.
-- **Verify:** `git grep -n -E '\bjax\b|jaxlib|_jax\b' -- sv_pgs tests pyproject.toml .github` prints nothing; then `uv lock --check` and the full suite on MSI in a venv rebuilt without JAX, then CI.
+- **Verify:** `git grep -n -P '\bjax\b|jaxlib|_jax\b' -- sv_pgs tests pyproject.toml .github` prints nothing; then `uv lock --check` and the full suite on MSI in a venv rebuilt without JAX, then CI.
 
 ### C8 — config, CLI, docs
 - **Prerequisite:** C7.

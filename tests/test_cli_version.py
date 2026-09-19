@@ -8,11 +8,7 @@ from sv_pgs import cli
 
 
 def test_version_runs():
-    # The timeout only guards against a hang; importing the package under
-    # load can take well over five seconds.
-    completed = subprocess.run(
-        [sys.executable, "-m", "sv_pgs.cli", "version"], capture_output=True, text=True, timeout=300
-    )
+    completed = subprocess.run([sys.executable, "-m", "sv_pgs.cli", "version"], capture_output=True, text=True)
     assert completed.returncode == 0, completed.stderr
     assert "sv-pgs" in completed.stdout
 

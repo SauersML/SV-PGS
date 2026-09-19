@@ -131,24 +131,3 @@ def test_decision_components_falls_back_when_fast_path_returns_none(monkeypatch)
     genetic, _ = model_instance.decision_components(raw, covariates)
     assert legacy_calls == [2]
     assert genetic.shape == (n_samples,)
-
-
-def test_signal_handler_includes_sigtstp():
-    """``_install_graceful_shutdown_handlers`` must wire SIGTSTP alongside
-    SIGTERM/SIGHUP, so AoU workbench Ctrl-Z + parent-exit unwinds gracefully
-    instead of dying with rc=148 mid-iteration."""
-    import signal
-    from pathlib import Path
-
-    if not hasattr(signal, "SIGTSTP"):
-        pytest.skip("SIGTSTP not available on this platform")
-
-    # Read the file directly: importing sv_pgs.cli pulls in aou_runner +
-    # pandas which is an optional dependency. The wiring is a literal tuple
-    # in the source, so a text-level check is the right granularity here.
-    cli_path = Path(__file__).resolve().parent.parent / "sv_pgs" / "cli.py"
-    source = cli_path.read_text(encoding="utf-8")
-    assert '"SIGTSTP"' in source, (
-        "Expected SIGTSTP in the signal-handler wiring tuple — without it, "
-        "Ctrl-Z + parent-exit on the AoU workbench bypasses atexit/finally."
-    )

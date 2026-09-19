@@ -29,13 +29,7 @@
    - Fold in the fp64/fp32 Cholesky policy and multi-GPU dispatch from e2854ca (tags `archive/2026-09-19/build-stage1` and `archive/2026-09-19/wip-wt-build-store`).
    - Settle the prior family: the learned mixing density vs TPB and BayesR on the reliability, TR-locus and multi-trait scenarios.
 2. **Wire the full path end to end:** store → Stage 0 → Stage 1 → Stage 2 → score. Run it on synthetic data first; the harness is tag `archive/2026-09-19/lane-e2e` (and `lane-e2e-nodamp`).
-3. **Cutover:** the exact inventory, measured on main, is [CUTOVER.md](CUTOVER.md). It gives every step's files, tests, prerequisites and verification.
-   - C2 flips the default entry point, after the engine and the end-to-end synthetic test land;
-   - C3 deletes the old orchestration and AoU runner;
-   - C4 deletes `model.py` (the old fit and the old scorer);
-   - C5 deletes the old inference core (GIG mean field, SVI, PG-IRLS/TR-Newton, solvers, elbo);
-   - C6 deletes the genotype backends and the marginal screen, C7 JAX, and C8 config, CLI and docs.
-   - Blockers B1–B7 in CUTOVER.md come first, notably the eager old-path imports in `sv_pgs/__init__.py`, the cohort builder, and binary traits.
+3. **Cutover:** under way; the step table and each step's files, tests and verification are in [CUTOVER.md](CUTOVER.md) ("Progress"). The pre-cutover tree is tag `archive/2026-09-19/old-path-final`.
 4. **Data-side inputs from the imputation team (aggregates only):**
    - the r̂ model coefficients: target corr²(stored D, G), triad-corrected, with smooth terms in AF, log N_PATHS_TOTAL, log size and rsq_ds;
    - the E[G|DS] table, which gives the per-stratum κ for D*;

@@ -9,7 +9,7 @@ def test_main_reports_keyboard_interrupt_without_traceback(monkeypatch, capsys):
 
     monkeypatch.setattr(cli, "_main_impl", raise_interrupt)
 
-    assert cli.main(["run-all-of-us", "--disease", "hypertension", "--output-dir", "out"]) == 130
+    assert cli.main(["list-all-of-us-diseases"]) == 130
 
     captured = capsys.readouterr()
     assert captured.out == ""
