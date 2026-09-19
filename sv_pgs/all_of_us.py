@@ -16,7 +16,7 @@ from typing import TYPE_CHECKING, Any, Sequence, TypeVar
 
 import numpy as np
 from scipy.special import ndtri
-from scipy.stats import rankdata
+from scipy.stats import norm
 
 if TYPE_CHECKING:
     from google.cloud import bigquery
@@ -175,8 +175,10 @@ DISEASE_DEFINITIONS: tuple[DiseaseDefinition, ...] = (
         ambiguous_snomed_codes=("46635009",),
         case_medication=NON_METFORMIN_GLUCOSE_LOWERING,
         control_exclusion_medication=GLUCOSE_LOWERING,
-        # HbA1c >= 6.5% on two dates (ADA): only people without a diabetes code
-        # or drug reach it, since the HbA1c trait drops everyone else's values.
+        # HbA1c >= 6.5% confirmed by a second test on another date, the ADA
+        # diagnostic criterion (Standards of Care in Diabetes, section 2). Only
+        # people without a diabetes code or drug reach it, since the HbA1c trait
+        # drops everyone else's values.
         lab_criteria=(LabCriterion("hemoglobin_a1c", True, 6.5, 1),),
     ),
     DiseaseDefinition(
@@ -207,6 +209,7 @@ DISEASE_DEFINITIONS: tuple[DiseaseDefinition, ...] = (
         # Controls exclude asthma too: no obstructive lung disease code.
         control_exclusion_snomed_codes=("195967001",),
         case_medication=LONG_ACTING_ANTIMUSCARINIC,
+        # The GOLD report considers a COPD diagnosis from age 40.
         minimum_case_age_years=40.0,
         minimum_control_age_years=40.0,
     ),
@@ -253,6 +256,8 @@ DISEASE_DEFINITIONS: tuple[DiseaseDefinition, ...] = (
         # eGFR and albuminuria values of an inpatient or emergency stay (acute
         # kidney injury) never count, since the measurements drop them.
         control_exclusion_snomed_codes=("709044004",),
+        # KDIGO 2012 (Kidney Int Suppl 3:1): GFR < 60 mL/min/1.73m2 or ACR >= 30
+        # mg/g, present for more than 3 months.
         lab_criteria=(
             LabCriterion("egfr_ckd_epi_2021", False, 60.0, 90),
             LabCriterion("urine_albumin_creatinine_ratio", True, 30.0, 90),
@@ -316,9 +321,10 @@ ADULT_AGE_YEARS = 18
 # it, reflect acute illness (infection, AKI, bleeding, transfusion, stress).
 ACUTE_CARE_WINDOW_DAYS = 30
 # A pregnancy record dated d can fall anywhere between conception and term, so
-# the pregnancy spans at most 42 weeks (294 days) before or after d; 12 more
-# weeks cover postpartum recovery of weight, lipids, hemoglobin and blood
-# pressure.
+# the pregnancy spans at most 42 weeks (294 days, where post-term begins) before
+# or after d; 12 more weeks cover the postpartum period as ACOG defines it
+# (Committee Opinion 736, 2018), the recovery of weight, lipids, hemoglobin and
+# blood pressure.
 PREGNANCY_WINDOW_DAYS_BEFORE = 294
 PREGNANCY_WINDOW_DAYS_AFTER = 294 + 84
 # Condition/observation evidence of a current or recent pregnancy: every
@@ -499,9 +505,6 @@ _PELOSO_2014 = (
 _CUI_TOBIN = "Cui, Hopper & Harrap 2003 Hypertension; Tobin et al. 2005 Stat Med 24:2911"
 _NO_CORRECTION = "no validated constant correction; treated values are not used"
 
-# Statins and statin combinations, ezetimibe, PCSK9 inhibitors (evolocumab,
-# alirocumab), bempedoic acid and inclisiran: the drugs the LDL/0.7 convention
-# is about. Fibrates, niacin and omega-3 (elsewhere in C10) barely move LDL.
 # Clinical exclusion windows (SNOMED codes checked against the OMOP vocabulary).
 # Leukemia, malignant lymphoma, multiple myeloma, myelodysplastic syndrome and
 # myeloproliferative disorders, from 180 days before the first record on.
@@ -595,6 +598,7 @@ MEASUREMENT_DEFINITIONS: tuple[MeasurementDefinition, ...] = (
         ),
         plausible_range=(120.0, 230.0),
         log_scale=False,
+        # Growth is complete by 20, where the CDC growth charts end.
         minimum_age_years=20.0,
     ),
     MeasurementDefinition(
@@ -1602,8 +1606,7 @@ def build_all_of_us_measurement_targets(
     untreated equivalent (DIVIDE/ADD) or dropped (EXCLUDE). Persons with no
     occasion left are dropped. The target is the empirical BLUP of the person's long-run mean
     (_person_blup, with variance components from
-    _estimate_person_variance_components); target_inverse_normal is its
-    rank-based inverse normal transform.
+    _estimate_person_variance_components).
     """
     selected_rows: list[dict[str, Any]] = []
     summaries: list[_OccasionSummary] = []
@@ -1646,14 +1649,12 @@ def build_all_of_us_measurement_targets(
         occasion_counts, person_means, within_sum_squares, design
     )
     targets, reliabilities = _person_blup(occasion_counts, person_means, design, between_variance, within_variance)
-    inverse_normal_targets = _rank_inverse_normal(targets)
 
     training_rows = [
         {
             "sample_id": row["sample_id"],
             "person_id": row["person_id"],
             "target": float(target),
-            "target_inverse_normal": float(inverse_normal_target),
             "occasion_count": occasion_summary.count,
             "target_reliability": float(reliability),
             "measurement_source": source,
@@ -1663,17 +1664,8 @@ def build_all_of_us_measurement_targets(
             "log_occasion_count": math.log(occasion_summary.count),
             "sex_at_birth_concept_id": row.get("sex_at_birth_concept_id"),
         }
-        for row, occasion_summary, source, is_female, target, inverse_normal_target, reliability
-        in zip(
-            selected_rows,
-            summaries,
-            sources,
-            female,
-            targets,
-            inverse_normal_targets,
-            reliabilities,
-            strict=True,
-        )
+        for row, occasion_summary, source, is_female, target, reliability
+        in zip(selected_rows, summaries, sources, female, targets, reliabilities, strict=True)
     ]
     encoded_categorical_columns = _add_one_hot_omop_categorical_covariates(training_rows, PHENOTYPE_CATEGORICAL_COVARIATES)
     unrecognized_unit_persons: Counter[str] = Counter()
@@ -1738,7 +1730,6 @@ def prepare_all_of_us_measurement_sample_table(
         "sample_id",
         "person_id",
         "target",
-        "target_inverse_normal",
         "occasion_count",
         "target_reliability",
         "measurement_source",
@@ -1799,7 +1790,7 @@ def prepare_all_of_us_measurement_sample_table(
                 "target_definition": (
                     "empirical BLUP of the person's long-run mean on the analysis scale (random-intercept "
                     "model, mean model: intercept, mean age, mean squared age, sex at birth, mean age x "
-                    "female); target_inverse_normal is its Blom rank inverse normal transform"
+                    "female)"
                 ),
                 "billing_project_env": "GOOGLE_PROJECT",
                 "cdr_dataset_env": "WORKSPACE_CDR",
@@ -1819,8 +1810,8 @@ def prepare_all_of_us_measurement_sample_table(
     )
 
 
-# All of Us releases no count of 1 to 20 participants: a reported cell needs
-# at least 21.
+# The All of Us Data and Statistics Dissemination Policy releases no count of
+# 1 to 20 participants: a reported cell needs at least 21.
 MINIMUM_REPORTED_PARTICIPANTS = 21
 
 
@@ -2136,7 +2127,7 @@ def _liability_targets(targets: np.ndarray, event_ages: np.ndarray, sex_names: l
         liabilities[cases] = ndtri(0.5 * (after + before))
         control_survival = _survival_at(event_times, survival, event_ages[controls], strictly_before=False)
         thresholds = ndtri(control_survival)
-        liabilities[controls] = -np.exp(-0.5 * thresholds**2) / math.sqrt(2.0 * math.pi) / control_survival
+        liabilities[controls] = -norm.pdf(thresholds) / control_survival
     return liabilities
 
 
@@ -2203,16 +2194,9 @@ def _write_tsv(path: Path, header: tuple[str, ...], rows: list[dict[str, Any]]) 
             writer.writerow([_format_value(row.get(column_name)) for column_name in header])
 
 
-# BigQuery project IDs and dataset IDs must match a restrictive identifier
-# grammar (letters, digits, underscores, hyphens; dataset IDs additionally
-# allow a single dot for project.dataset qualification). Validating the
-# WORKSPACE_CDR env var here closes a SQL-injection vector: the value is
-# interpolated unescaped into the GoogleSQL inside backticks (e.g.
-# `{dataset}.concept`), so a hostile WORKSPACE_CDR like
-# `proj.dset`.foo`; DROP TABLE x; --` could otherwise break out of the
-# identifier. AoU workbenches set this to something like
-# `fc-aou-cdr-prod.R2024Q3R3`, which matches the regex; anything that
-# doesn't match is rejected loudly.
+# WORKSPACE_CDR is interpolated into the SQL inside backticks, so it must be a
+# plain BigQuery project[.dataset] identifier; anything else could break out of
+# the quoting.
 _BQ_QUALIFIED_NAME_RE = re.compile(r"^[A-Za-z0-9_\-]+(?:\.[A-Za-z0-9_\-]+)*$")
 
 
@@ -2433,8 +2417,3 @@ def _person_blup(
     reliabilities = between_variance / mean_variances
     return fitted_means + reliabilities * (person_means - fitted_means), reliabilities
 
-
-def _rank_inverse_normal(values: np.ndarray) -> np.ndarray:
-    """Blom rank inverse normal transform, ties at their average rank."""
-    ranks = rankdata(values, method="average")
-    return ndtri((ranks - 0.375) / (len(values) + 0.25))

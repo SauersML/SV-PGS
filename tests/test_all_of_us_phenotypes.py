@@ -21,7 +21,6 @@ from typing import cast
 import numpy as np
 import pytest
 from google.cloud import bigquery
-from scipy.special import ndtri
 from scipy.stats import norm, truncnorm
 
 from sv_pgs.all_of_us import (
@@ -44,7 +43,6 @@ from sv_pgs.all_of_us import (
     _person_blup,
     _person_design,
     _prepare_training_rows,
-    _rank_inverse_normal,
     available_disease_names,
     available_measurement_names,
     build_all_of_us_disease_query_config,
@@ -1141,12 +1139,6 @@ def test_blup_target_tracks_the_true_long_run_mean_better_than_the_raw_mean():
     assert summary["repeatability"] == pytest.approx(1.0 / 3.0, rel=0.15)
 
 
-def test_rank_inverse_normal_uses_blom_scores_with_average_ties():
-    transformed = _rank_inverse_normal(np.array([3.0, 1.0, 2.0, 2.0]))
-    ranks = np.array([4.0, 1.0, 2.5, 2.5])
-    np.testing.assert_allclose(transformed, ndtri((ranks - 0.375) / 4.25))
-
-
 def test_training_rows_carry_targets_covariates_and_one_hot_sex():
     rows, _true_means = _synthetic_person_rows(200, between_variance=1.0, within_variance=1.0, seed=1)
     rows[0]["unrecognized_unit_labels"] = ["millimole per liter", "millimole per liter"]
@@ -1163,8 +1155,7 @@ def test_training_rows_carry_targets_covariates_and_one_hot_sex():
     assert female_row["sex_at_birth_concept_id_45878463"] == 1
     assert "sex_at_birth_concept_id" not in female_row
     assert 0.0 < female_row["target_reliability"] < 1.0
-    inverse_normal = np.array([row["target_inverse_normal"] for row in training_rows])
-    assert inverse_normal.mean() == pytest.approx(0.0, abs=1e-9)
+    assert "target_inverse_normal" not in female_row
     # Persons, not days, per unrecognized unit label.
     assert summary["unrecognized_unit_person_counts"] == {"millimole per liter": 2, "unit_concept_id=9999": 1}
 
@@ -1189,10 +1180,9 @@ def test_prepare_measurement_sample_table_writes_table_sql_and_metadata(tmp_path
     with outputs.sample_table_path.open(encoding="utf-8") as handle:
         table = list(csv.DictReader(handle, delimiter="\t"))
     assert len(table) == 120
-    assert list(table[0])[:11] == [
-        "sample_id", "person_id", "target", "target_inverse_normal", "occasion_count",
-        "target_reliability", "measurement_source", "age_at_measurement", "age_at_measurement_squared",
-        "age_at_measurement_x_female", "log_occasion_count",
+    assert list(table[0])[:10] == [
+        "sample_id", "person_id", "target", "occasion_count", "target_reliability", "measurement_source",
+        "age_at_measurement", "age_at_measurement_squared", "age_at_measurement_x_female", "log_occasion_count",
     ]
     assert outputs.sql_path.read_text(encoding="utf-8").strip() == build_all_of_us_measurement_sql()
     metadata = json.loads(outputs.metadata_path.read_text(encoding="utf-8"))

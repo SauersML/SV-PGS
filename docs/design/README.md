@@ -8,6 +8,7 @@ These documents describe the new SV-PGS path: the one model, its dosage store, i
 | [MODEL.md](MODEL.md) | The one generative model, its prior, its inference, and the Stage 0/1/2 pipeline |
 | [STORE.md](STORE.md) | The 8-bit dosage store: arrays, halves, sidecar, loci, external annotations, gates |
 | [EVALUATION.md](EVALUATION.md) | How an SV gain is claimed: arms, tests, the trait panel, simulation gates, red-team checks |
+| [PHENOTYPES.md](PHENOTYPES.md) | The 21-trait All of Us panel as built: disease and trait rules, targets, which values are standards, and the rules still to be replaced |
 | [COMPUTE.md](COMPUTE.md) | Cost model, cloud launch path, MSI notes |
 | [CUTOVER.md](CUTOVER.md) | The ordered deletion of the old path (C2–C8): files, tests, blockers, verification |
 | [DECISIONS.md](DECISIONS.md) | Dated log of the design rulings and the measurements behind them |
