@@ -9,15 +9,19 @@ from __future__ import annotations
 
 import numpy as np
 from scipy.stats import norm
+from scipy.stats import t as student_t
 
 from sv_pgs.marginal_variances import (
     BlockGrams,
     BulkSolve,
     approximation_scale,
     block_information_certificate,
+    control_variate,
+    stage_level,
     information_products,
     information_solve_tolerance,
     block_trace_certificate,
+    cavity_tolerance,
     certificate_level,
     probes_to_decide,
     certificate_tolerance,
@@ -245,7 +249,8 @@ def test_information_certificate_flags_a_cavity_error_the_trace_certificate_miss
     assert np.allclose(removed[is_bulk], (prior[:, None] * probes - covariance @ probes)[is_bulk], rtol=1e-6, atol=1e-12 * np.abs(removed).max())
     level = certificate_level(64)
     trace = block_trace_certificate(variances, blocks, probes, covariance @ probes, scale, level)
-    information = block_information_certificate(solve, variances, blocks, probes, removed, scale, level)
+    grams = _grams(columns, blocks)
+    information = block_information_certificate(solve, variances, blocks, probes, removed, scale, level, control_variate(solve, grams, probes))
     assert not trace.violated.any()
     assert information.violated.tolist() == [False, False, False, True, False, False]
 
@@ -308,3 +313,110 @@ def test_certificate_intervals_cover_at_their_level_and_probes_to_decide_decides
     probes = generator.choice([-1.0, 1.0], size=(variant_count, needed))
     decided = block_trace_certificate(exact, blocks, probes, covariance @ probes, tolerance, level)
     assert decided.certified.all()
+
+
+def test_control_variate_leaves_the_information_estimate_unbiased_and_shrinks_its_spread():
+    generator = np.random.default_rng(16)
+    sample_count, variant_count = 1500, 600
+    columns = _genotypes(generator, sample_count, variant_count, 0.97)
+    precision = variant_count / 1e-2 * np.exp(generator.normal(0.0, 1.0, variant_count))
+    blocks = tuple(np.arange(start, start + 100) for start in range(0, variant_count, 100))
+    solve = _solve(columns, precision, _resolved(1.0 / precision, sample_count))
+    grams = _grams(columns, blocks)
+    covariance = np.linalg.inv(columns.T @ columns + np.diag(precision))
+    prior = 1.0 / precision
+    probes = generator.choice([-1.0, 1.0], size=(variant_count, 64))
+    removed_exact = prior[:, None] * probes - covariance @ probes
+    control = control_variate(solve, grams, probes)
+    # A two-sided family-wise interval at the certificate's own level (Student t, k - 1 degrees of freedom).
+    quantile = student_t.isf(0.5 * certificate_level(64) / len(blocks), probes.shape[1] - 1)
+    for position, members in enumerate(blocks):
+        plain = np.sum(probes[members] * removed_exact[members], axis=0)
+        controlled = control.window_information[position] + np.sum(probes[members] * (removed_exact - control.removed_products)[members], axis=0)
+        exact_information = float(np.sum(prior[members] - np.diag(covariance)[members]))
+        # Unbiased: the controlled mean sits within its own standard error scale of the exact information.
+        spread = np.std(controlled, ddof=1) / np.sqrt(probes.shape[1])
+        assert abs(np.mean(controlled) - exact_information) <= quantile * spread
+        assert np.std(controlled) < np.std(plain)
+
+
+def test_stage_levels_spend_at_most_the_level():
+    level = certificate_level(64)
+    assert sum(stage_level(level, stage) for stage in range(60)) <= level
+
+
+def test_cavity_tolerance_follows_its_three_bounds():
+    generator = np.random.default_rng(17)
+    variant_count = 300
+    blocks = tuple(np.arange(start, start + 100) for start in range(0, variant_count, 100))
+    site_precision = generator.uniform(10.0, 100.0, variant_count)
+    data_share = generator.uniform(0.01, 0.5, variant_count)
+    variances = (1.0 - data_share) / site_precision  # w = 1 - tau Sigma
+    # An information error eps is the relative variance error -eps w / (1 - w).
+    information = 1.0 / site_precision - variances
+    eps = 0.1
+    perturbed = 1.0 / site_precision - information * (1.0 + eps)
+    assert np.allclose(perturbed / variances - 1.0, -eps * data_share / (1.0 - data_share), rtol=1e-12)
+    draws, effective = 64, 50.0
+    # A Gaussian tilted law (no response, no skewness) leaves only properness.
+    zero = np.zeros(variant_count)
+    assert np.all(cavity_tolerance(site_precision, variances, zero, zero, blocks, draws, effective) == 1.0)
+    response = generator.uniform(0.5, 20.0, variant_count)
+    skewness = generator.normal(0.0, 1.0, variant_count)
+    tolerance = cavity_tolerance(site_precision, variances, response, skewness, blocks, draws, effective)
+    ratio = data_share / (1.0 - data_share)
+    mean_bound = np.sqrt(effective / draws) / np.sqrt(np.sum(np.square(0.5 * skewness * ratio)))
+    for position, members in enumerate(blocks):
+        variance_bound = np.sqrt(2.0 / draws) / np.sqrt(np.mean(np.square(response[members] * ratio[members])))
+        assert np.isclose(tolerance[position], min(variance_bound, mean_bound, 1.0), rtol=1e-12)
+
+
+def test_information_solve_tolerance_is_infinite_when_every_site_is_resolved():
+    generator = np.random.default_rng(18)
+    columns = generator.standard_normal((80, 120))
+    precision = generator.uniform(1.0, 30.0, 120)
+    # The case the Stage 2 sweep hit: a solver that resolved every site (e.g. all improper, or all spikes).
+    solve = _solve(columns, precision, np.arange(120))
+    blocks = tuple(np.arange(start, start + 40) for start in range(0, 120, 40))
+    variances = np.diag(np.linalg.inv(columns.T @ columns + np.diag(precision)))
+    assert information_solve_tolerance(solve, variances, blocks, np.sum(columns**2, axis=0), 0.01) == np.inf
+
+
+def test_marginals_respect_the_exact_bounds():
+    _generator, columns, precision, blocks, solve = _strong_case(19)
+    variances = marginal_variances(solve, _grams(columns, blocks))
+    upper = 1.0 / precision
+    lower = 1.0 / (np.sum(columns**2, axis=0) + precision)
+    bulk = ~np.isin(np.arange(precision.shape[0]), solve.resolved)
+    assert np.all(variances[bulk] <= upper[bulk]) and np.all(variances[bulk] >= lower[bulk])
+
+
+def test_no_upper_clamp_when_a_resolved_site_is_non_positive():
+    # verify-stage2's counterexample: with Pi = (2, -1/2) the bulk site's exact marginal exceeds 1/Pi_1.
+    columns = np.array([[1.0, 1.0]])
+    precision = np.array([2.0, -0.5])
+    exact = np.linalg.inv(columns.T @ columns + np.diag(precision))
+    assert exact[0, 0] > 1.0 / precision[0]
+    solve = _solve(columns, precision, np.array([1]))
+    grams = BlockGrams(blocks=(np.array([0, 1]),), within=(columns.T @ columns,), next_cross=())
+    variances = marginal_variances(solve, grams)
+    assert variances[0] > 1.0 / precision[0]
+    assert np.isclose(variances[1], exact[1, 1], rtol=1e-12)
+
+
+def test_a_zero_estimate_with_probe_signal_is_violated_not_an_error():
+    generator = np.random.default_rng(20)
+    sample_count, variant_count = 1500, 600
+    columns = _genotypes(generator, sample_count, variant_count, 0.97)
+    precision = variant_count / 1e-2 * np.exp(generator.normal(0.0, 1.0, variant_count))
+    blocks = tuple(np.arange(start, start + 100) for start in range(0, variant_count, 100))
+    covariance = np.linalg.inv(columns.T @ columns + np.diag(precision))
+    variances = np.diag(covariance).copy()
+    variances[blocks[2]] = 1.0 / precision[blocks[2]]  # pinned to the prior: zero information estimated
+    probes = generator.choice([-1.0, 1.0], size=(variant_count, 64))
+    removed = probes / precision[:, None] - covariance @ probes
+    solve = _solve(columns, precision, _resolved(1.0 / precision, sample_count))
+    removed_estimate = np.where(np.isin(np.arange(variant_count), solve.resolved), 0.0, 1.0 / precision - variances)
+    certificate = block_trace_certificate(removed_estimate, blocks, probes, removed, 0.5, certificate_level(64))
+    assert certificate.violated[2] and not certificate.certified[2]
+    assert np.isinf(certificate.relative_error[2])

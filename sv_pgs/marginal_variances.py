@@ -126,7 +126,7 @@ class BlockCertificate:
     standard_error: NDArray[np.float64]
     lower_bound: NDArray[np.float64]
     upper_bound: NDArray[np.float64]
-    tolerance: float
+    tolerance: "float | NDArray[np.float64]"
     level: float
     certified: NDArray[np.bool_]
     violated: NDArray[np.bool_]
@@ -348,6 +348,18 @@ def marginal_variances(solve: BulkSolve, grams: BlockGrams) -> NDArray[np.float6
     block_of = _block_index(grams)
     far = sandwich * far_scale * (float(np.sum(resolved_weight)) - near_totals[block_of])
     variances = np.where(is_resolved, near_variance, near_variance + far)
+    # Every marginal obeys 1 / A_jj <= Sigma_jj (Cauchy-Schwarz, for any positive-definite A). The upper bound
+    # Sigma_jj <= 1 / Pi_j holds only when every site precision is positive: A >= diag(Pi) gives
+    # A^-1 <= diag(Pi)^-1 only for diag(Pi) > 0, and a non-positive resolved site breaks it, since the bulk block
+    # of Sigma^-1 is then Pi_S + Xt_S' (I + Xt_L Pi_L^-1 Xt_L')^-1 Xt_S with an indefinite middle factor
+    # (verify-stage2's counterexample: Xt'Xt = [[1, 1], [1, 1]], Pi = (2, -1/2) gives Sigma_11 = 1 > 1/2). The
+    # approximation can cross the bounds, e.g. when a window's resolved spikes over-subtract, so project onto
+    # the ones that hold, as exact_polish does for its estimates. The certificate still sees the error.
+    column_square_norms = np.concatenate([np.diag(within) for within in grams.within])[np.argsort(np.concatenate(grams.blocks))]
+    lower = 1.0 / (column_square_norms + solve.site_precision)
+    every_site_positive = bool(np.all(solve.site_precision > 0.0))
+    upper = bulk_variance if every_site_positive else np.full(variant_count, np.inf)
+    variances = np.where(is_resolved, variances, np.clip(variances, lower, upper))
     variances[solve.resolved] = resolved_variance
     return variances
 
@@ -368,33 +380,46 @@ def certificate_level(draw_count: int) -> float:
 
 
 def _certificate(
-    estimate: NDArray[np.float64], per_probe: list[NDArray[np.float64]], tolerance: float, level: float
+    estimate: NDArray[np.float64], per_probe: list[NDArray[np.float64]], tolerance: "float | NDArray[np.float64]", level: float
 ) -> BlockCertificate:
     """Intervals from k probe values per block, at family-wise ``level`` over the B blocks (Bonferroni, two-sided).
 
     (mean - estimate) / (sd / sqrt k) is referred to Student's t with k - 1 degrees of freedom. That is exact for
     Gaussian probe values. A block's probe value is a Rademacher quadratic form over many pairs, which is close to
-    Gaussian, so the level is approximate, and conservative in the tail compared with the normal quantile. A
-    block with zero estimate and zero spread (every site resolved, so exact) is certified.
+    Gaussian, so the level is approximate, and conservative in the tail compared with the normal quantile.
+
+    A block whose estimate is zero has no finite relative error. With zero probe spread too (every site resolved,
+    so the block is exact), it is certified. Otherwise the probes see information the estimate says is absent
+    (e.g. a marginal clamped to its bound), so the relative error is infinite: the block is violated when the
+    probes' own interval for the absolute value excludes zero, and undecided when it does not.
     """
     block_count = len(per_probe)
     probe_count = per_probe[0].shape[0]
     quantile = float(student_t.isf(0.5 * level / block_count, probe_count - 1))
     relative = np.zeros(block_count)
     standard = np.zeros(block_count)
+    unresolved_zero = np.zeros(block_count, dtype=bool)
+    excludes_zero = np.zeros(block_count, dtype=bool)
     for position, values in enumerate(per_probe):
         computed = float(estimate[position])
         spread = float(np.std(values, ddof=1)) / np.sqrt(probe_count)
         if computed == 0.0:
-            if spread != 0.0:
-                raise ValueError(f"block {position}: zero estimate with nonzero probe spread; a zero estimate must mean an exact block")
+            if spread == 0.0:
+                continue
+            centre = float(np.mean(values))
+            unresolved_zero[position] = True
+            excludes_zero[position] = abs(centre) > quantile * spread
+            relative[position] = np.copysign(np.inf, centre)
+            standard[position] = np.inf
             continue
         relative[position] = (float(np.mean(values)) - computed) / computed
         standard[position] = spread / abs(computed)
-    lower = relative - quantile * standard
-    upper = relative + quantile * standard
-    certified = (lower >= -tolerance) & (upper <= tolerance)
-    violated = (lower > tolerance) | (upper < -tolerance)
+    with np.errstate(invalid="ignore"):
+        lower = np.where(unresolved_zero, np.where(excludes_zero, relative, -np.inf), relative - quantile * standard)
+        upper = np.where(unresolved_zero, np.where(excludes_zero, relative, np.inf), relative + quantile * standard)
+    bound = np.broadcast_to(np.asarray(tolerance, dtype=np.float64), relative.shape)
+    certified = (lower >= -bound) & (upper <= bound)
+    violated = (lower > bound) | (upper < -bound)
     return BlockCertificate(
         relative_error=relative, standard_error=standard, lower_bound=lower, upper_bound=upper,
         tolerance=tolerance, level=level, certified=certified, violated=violated,
@@ -406,7 +431,7 @@ def block_trace_certificate(
     blocks: tuple[NDArray[np.int64], ...],
     probes: NDArray[np.float64],
     covariance_probes: NDArray[np.float64],
-    tolerance: float,
+    tolerance: "float | NDArray[np.float64]",
     level: float,
 ) -> BlockCertificate:
     """Test each block's tr(Sigma_bb) against Rademacher probes z (p x k) and Sigma z (from the solver).
@@ -418,6 +443,16 @@ def block_trace_certificate(
     per_probe = [np.sum(probes[members] * covariance_probes[members], axis=0) for members in blocks]
     estimate = np.array([float(np.sum(variances[members])) for members in blocks])
     return _certificate(estimate, per_probe, tolerance, level)
+
+
+def stage_level(level: float, stage: int) -> float:
+    """The level for stage s = 0, 1, ... of a sequential certificate with fresh probes at each stage.
+
+    Stage s spends level * 2^-(s+1), so the stages together never exceed ``level`` (Bonferroni over stages). A
+    stage re-tests only the blocks the last one left undecided. A violation at any stage is decisive, so the
+    probability of refusing a fixed point whose blocks are all within tolerance is at most ``level`` overall.
+    """
+    return level * 2.0 ** -(stage + 1)
 
 
 def probes_to_decide(certificate: BlockCertificate, probe_count: int) -> int:
@@ -452,7 +487,7 @@ def information_solve_tolerance(
     variances: NDArray[np.float64],
     blocks: tuple[NDArray[np.int64], ...],
     column_square_norms: NDArray[np.float64],
-    tolerance: float,
+    tolerance: "float | NDArray[np.float64]",
 ) -> float:
     """The relative residual |r| / |u| that the certificate's K_S solves need.
 
@@ -463,7 +498,8 @@ def information_solve_tolerance(
     residual r leaves the error a_b' K_S^-1 r, and |a_b' K_S^-1 r| <= |a_b| |r|, since K_S >= I. For Rademacher
     z, exactly, E|a_b|^2 = M_b = sum_{j in b, bulk} D_j^2 |xt_j|^2 and E|u|^2 = M, the same sum over every bulk
     site. So E[|a_b| |u|] <= sqrt(M_b M) (Cauchy-Schwarz). With T_b = tr(D - Sigma)_b the block's information
-    from ``variances``, a relative residual of (tolerance / 2) min_b T_b / sqrt(M_b M) suffices.
+    from ``variances``, a relative residual of min_b (tolerance_b / 2) T_b / sqrt(M_b M) suffices. It is +infinity
+    when no block has bulk mass and information (every site resolved): then no solve is needed at all.
     """
     is_bulk = np.ones(solve.site_precision.shape[0], dtype=bool)
     is_bulk[solve.resolved] = False
@@ -471,8 +507,15 @@ def information_solve_tolerance(
     mass = np.square(bulk_variance) * column_square_norms
     removed = np.where(is_bulk, bulk_variance - variances, 0.0)
     total = float(np.sum(mass))
-    ratios = [float(np.sum(removed[members])) / np.sqrt(float(np.sum(mass[members])) * total) for members in blocks if float(np.sum(mass[members])) > 0.0]
-    return 0.5 * tolerance * min(ratios)
+    bound = np.broadcast_to(np.asarray(tolerance, dtype=np.float64), (len(blocks),))
+    # A block with no bulk mass is exact (every site resolved), and one with no information has nothing to
+    # resolve: neither constrains the solve. With none left, the minimum over the empty set is +infinity.
+    ratios = [
+        float(bound[position]) * float(np.sum(removed[members])) / np.sqrt(float(np.sum(mass[members])) * total)
+        for position, members in enumerate(blocks)
+        if float(np.sum(mass[members])) > 0.0 and float(np.sum(removed[members])) > 0.0
+    ]
+    return 0.5 * min(ratios) if ratios else np.inf
 
 
 def block_information_certificate(
@@ -481,8 +524,9 @@ def block_information_certificate(
     blocks: tuple[NDArray[np.int64], ...],
     probes: NDArray[np.float64],
     removed_products: NDArray[np.float64],
-    tolerance: float,
+    tolerance: "float | NDArray[np.float64]",
     level: float,
+    control: ControlVariate,
 ) -> BlockCertificate:
     """Test each block's data information tr(D_b - Sigma_bb), over its bulk sites, against probes.
 
@@ -492,15 +536,110 @@ def block_information_certificate(
     a variance correct to 1e-3 can leave a cavity tens of percent off. ``block_trace_certificate`` cannot see
     that, and this certificate can.
 
-    ``removed_products`` is (D - Sigma) z on bulk sites, from ``information_products``. For Rademacher z,
-    z_b' ((D - Sigma) z)_b is an unbiased estimate of the block's information, tested as in
-    ``block_trace_certificate``: relative error, the probes' standard error, family-wise level 1/B.
+    ``removed_products`` is (D - Sigma) z on bulk sites, from ``information_products``. The estimator is the
+    control-variate Hutchinson identity,
+
+        T_b = tr(D - Sigma_hat)_b + E_z[ z_b' ((D - Sigma) z - (D - Sigma_hat) z)_b ],
+
+    with Sigma_hat the window approximation (``control_variate``). Without the control variate, the probe
+    values' spread is set by Sigma's off-diagonal LD mass, which dwarfs the small diagonal D - Sigma: on a
+    synthetic LD store (engine's test), 16 probes gave standard errors of 2-6% on errors below 3.3%. With it,
+    the spread comes from Sigma_hat - Sigma only, which is small exactly when the approximation is right.
+    The test is ``_certificate``'s.
     """
+    if control.window_information.shape[0] != len(blocks):
+        raise ValueError("the control variate was built on different blocks")
     is_bulk = np.ones(solve.site_precision.shape[0], dtype=bool)
     is_bulk[solve.resolved] = False
     bulk_variance = np.where(is_bulk, 1.0 / np.where(is_bulk, solve.site_precision, 1.0), 0.0)
     removed = np.where(is_bulk, bulk_variance - variances, 0.0)
-    return block_trace_certificate(removed, blocks, np.where(is_bulk[:, None], probes, 0.0), np.where(is_bulk[:, None], removed_products, 0.0), tolerance, level)
+    difference = np.where(is_bulk[:, None], removed_products - control.removed_products, 0.0)
+    per_probe = [control.window_information[position] + np.sum(probes[members] * difference[members], axis=0) for position, members in enumerate(blocks)]
+    estimate = np.array([float(np.sum(removed[members])) for members in blocks])
+    return _certificate(estimate, per_probe, tolerance, level)
+
+
+@dataclass(frozen=True)
+class ControlVariate:
+    """The window approximation's own (D - Sigma_hat) z on bulk rows, and each block's window information.
+
+    Subtracting it from the solver's exact (D - Sigma) z leaves an estimator of the approximation's error whose
+    spread comes only from (Sigma_hat - Sigma), not from Sigma's off-diagonal LD mass.
+    """
+
+    removed_products: NDArray[np.float64]
+    window_information: NDArray[np.float64]
+
+
+def control_variate(solve: BulkSolve, grams: BlockGrams, probes: NDArray[np.float64]) -> ControlVariate:
+    """(D - Sigma_hat) z on bulk rows, with Sigma_hat the window approximation, and each block's tr(D - Sigma_hat).
+
+    For bulk j in block b, Sigma_hat_{j,:} z = sum over window columns (identity 2 plus the window's resolved
+    spikes) + Sigma_hat_{j,L} z_L, with Sigma_hat_{jL} = -D_j (C core^-1)_jL from the window's cross products.
+    The window information is taken on those window diagonals, so the certificate's estimator has the expectation
+    of the exact information.
+    """
+    cross, bulk_variance, core_inverse, is_resolved = _prepare(solve, grams)
+    removed = np.zeros_like(probes)
+    information = np.zeros(len(grams.blocks))
+    for block, members in enumerate(grams.blocks):
+        terms = _block_terms(solve, grams, cross, bulk_variance, core_inverse, block)
+        own_variance = bulk_variance[members]
+        products = terms.rows @ probes[terms.columns] - own_variance[:, None] * (terms.loadings @ probes[solve.resolved])
+        bulk_rows = ~is_resolved[members]
+        removed[members] = np.where(bulk_rows[:, None], own_variance[:, None] * probes[members] - products, 0.0)
+        information[block] = float(np.sum(np.where(bulk_rows, own_variance - np.diag(terms.covariance), 0.0)))
+    return ControlVariate(removed_products=removed, window_information=information)
+
+
+def cavity_tolerance(
+    site_precision: NDArray[np.float64],
+    variances: NDArray[np.float64],
+    tilted_response: NDArray[np.float64],
+    tilted_skewness: NDArray[np.float64],
+    blocks: tuple[NDArray[np.int64], ...],
+    draw_count: int,
+    effective_parameters: float,
+) -> NDArray[np.float64]:
+    """Per block: the relative error of tr(D - Sigma)_b that the EP fixed point cannot see through K draws.
+
+    **What an information error does.** A relative error eps_j in site j's information I_j = D_j - Sigma_jj
+    is a relative variance error e_j = -eps_j w_j / (1 - w_j), where w_j = P_j Sigma_jj is the data share and
+    I_j / Sigma_jj = P_j / tau_j = w_j / (1 - w_j). The decoupled EP freezes the variances in the cavities,
+    so its cavity moves by -e_j / Sigma_jj, amplified by 1/w_j. But the site responds only through the tilted
+    law's non-Gaussianity, and at the fixed point Sigma_jj (P_j + tau_j) = 1 cancels the 1/w_j. To first order:
+
+        delta Sigma_jj / Sigma_jj = r_j e_j,   |delta mu|^2_{Sigma^-1} = sum_j (gamma_j e_j / 2)^2,
+
+    with r_j = d tau_j / d P_j = (kappa4 / 2 + m kappa3) / V^2 (``tilted_response``) and gamma_j = kappa3 / V^1.5
+    (``tilted_skewness``), the tilted cumulants at the cavity. Measured against exact perturbed fixed points
+    [sim-only: AR(1) LD, mixture priors, n = 400-600]: correlation 0.93-0.998 with the variance prediction,
+    slope 0.59-0.98 (the prediction is the larger), the mean prediction within 5%, and improper cavities
+    exactly where predicted.
+
+    **The tolerance** is the smallest of three:
+    - variance channel: sqrt(2/K) posterior sds of a variance is invisible to K draws (ep_eb.md §3.3). With a
+      uniform eps over the block, that is eps_b <= sqrt(2/K) / rms_{j in b}(|r_j| w_j / (1 - w_j));
+    - mean channel: |delta mu|^2 <= p_eff / K, split evenly over the model, is
+      eps <= sqrt(p_eff / K) / sqrt(sum_j (gamma_j w_j / (2 (1 - w_j)))^2), for every block;
+    - properness: the cavity stays proper iff the estimated information stays positive, eps_j < 1.
+    Resolved sites are exact in core and are excluded.
+    """
+    data_share = 1.0 - site_precision * variances
+    ratio = data_share / (1.0 - data_share)
+    is_bulk = (site_precision > 0.0) & np.isfinite(ratio)
+    variance_weight = np.where(is_bulk, np.abs(tilted_response) * ratio, 0.0)
+    mean_weight = np.where(is_bulk, 0.5 * tilted_skewness * ratio, 0.0)
+    mean_total = float(np.sqrt(np.sum(np.square(mean_weight))))
+    mean_bound = float(np.sqrt(effective_parameters / draw_count)) / mean_total if mean_total > 0.0 else np.inf
+    variance_limit = float(np.sqrt(2.0 / draw_count))
+    tolerance = np.empty(len(blocks))
+    for position, members in enumerate(blocks):
+        weights = variance_weight[members][is_bulk[members]]
+        spread = float(np.sqrt(np.mean(np.square(weights)))) if weights.shape[0] else 0.0
+        variance_bound = variance_limit / spread if spread > 0.0 else np.inf
+        tolerance[position] = min(variance_bound, mean_bound, 1.0)
+    return tolerance
 
 
 def certificate_tolerance(solve: BulkSolve, bulk_probe_count: int) -> float:
