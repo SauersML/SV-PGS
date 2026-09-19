@@ -7,7 +7,7 @@ import uuid
 from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
-from typing import Any, Hashable, Iterator, Mapping, Sequence, TypeVar, cast
+from typing import Any, Hashable, Iterator, Sequence, TypeVar, cast
 
 import numpy as np
 
@@ -37,6 +37,7 @@ from sv_pgs.genotype import (
 )
 from sv_pgs.plink import PLINK_MISSING_INT8
 from sv_pgs.progress import log, mem
+from sv_pgs.tie_map import _compact_identity_tie_map, _empty_tie_map, tie_map_from_groups
 
 # Importing sv_pgs._jax above configures JAX before the runtime module is loaded.
 jax = importlib.import_module("jax")
@@ -789,24 +790,6 @@ def select_active_variant_indices_bitpacked(
 _TIE_MAP_POSITION_WINDOW = 100_000  # 100 KB — duplicate SV calls are always nearby
 
 
-def _empty_tie_map(original_variant_count: int) -> TieMap:
-    original_to_reduced = np.full(original_variant_count, -1, dtype=np.int32)
-    return TieMap(
-        kept_indices=np.zeros(0, dtype=np.int32),
-        original_to_reduced=original_to_reduced,
-        reduced_to_group=[],
-    )
-
-
-def _compact_identity_tie_map(variant_count: int) -> TieMap:
-    identity_indices = np.arange(int(variant_count), dtype=np.int32)
-    return TieMap(
-        kept_indices=identity_indices,
-        original_to_reduced=identity_indices.copy(),
-        reduced_to_group=[],
-    )
-
-
 def _build_tie_map_windowed(
     standardized_genotypes: StandardizedGenotypeMatrix,
     records: Sequence[VariantRecord],
@@ -982,34 +965,6 @@ def _build_tie_map_windowed(
         f"({ties_found} ties collapsed)  mem={mem()}"
     )
     return tie_map
-
-
-def tie_map_from_groups(variant_count: int, groups: Mapping[int, Sequence[tuple[int, float]]]) -> TieMap:
-    """The TieMap of ``variant_count`` variants whose every variant sits in one group.
-
-    ``groups`` maps each representative to its ``(member, sign)`` pairs (the representative
-    included, sign +1 for a copy and -1 for a negated copy); reduced order follows the
-    representatives.
-    """
-    kept_indices: list[int] = []
-    original_to_reduced = np.full(variant_count, -1, dtype=np.int32)
-    reduced_to_group: list[TieGroup] = []
-    for reduced_idx, (root, members) in enumerate(sorted(groups.items())):
-        kept_indices.append(root)
-        member_indices = np.array([m[0] for m in members], dtype=np.int32)
-        signs = np.array([m[1] for m in members], dtype=np.float32)
-        for m_idx, _sign in members:
-            original_to_reduced[m_idx] = reduced_idx
-        reduced_to_group.append(TieGroup(
-            representative_index=root,
-            member_indices=member_indices,
-            signs=signs,
-        ))
-    return TieMap(
-        kept_indices=np.asarray(kept_indices, dtype=np.int32),
-        original_to_reduced=original_to_reduced,
-        reduced_to_group=reduced_to_group,
-    )
 
 
 def _hash_standardized_genotypes_for_tie_map(

@@ -58,6 +58,7 @@ from sv_pgs.preprocessing import (
 )
 from sv_pgs.progress import log, mem
 from sv_pgs.runtime_policy import runtime_training_policy_for_fit, runtime_training_policy_summary
+from sv_pgs.tie_map import _empty_tie_map
 
 if TYPE_CHECKING:
     from sv_pgs.ld_block_partition import LdBlockPartition
@@ -3579,14 +3580,6 @@ def _training_linear_predictor_cache(
             genetic_score = np.asarray(reduced_genotypes, dtype=np.float32) @ fit_result.beta_reduced
         training_linear_predictor = training_linear_predictor + np.asarray(genetic_score, dtype=np.float32)
     return np.asarray(training_linear_predictor, dtype=np.float32)
-
-
-def _empty_tie_map(original_variant_count: int) -> TieMap:
-    return TieMap(
-        kept_indices=np.zeros(0, dtype=np.int32),
-        original_to_reduced=np.full(original_variant_count, -1, dtype=np.int32),
-        reduced_to_group=[],
-    )
 
 
 def _fit_without_active_variants(

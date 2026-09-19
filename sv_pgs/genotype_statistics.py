@@ -52,8 +52,8 @@ from sv_pgs.genotype_buffers import (
     host_buffer_bytes,
 )
 from sv_pgs.ld_partition import LdBlockBoundaries, OnlineBlockPartitioner, cut_allowed_from_groups
-from sv_pgs.preprocessing import _compact_identity_tie_map, tie_map_from_groups
 from sv_pgs.progress import log
+from sv_pgs.tie_map import _compact_identity_tie_map, tie_map_from_groups
 
 LAG_BLOCKS = 2
 """Blocks a boundary decision may trail the stream before ``force_cut`` commits one. It sets the
