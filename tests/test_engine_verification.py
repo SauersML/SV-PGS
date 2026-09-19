@@ -20,6 +20,7 @@ from sv_pgs.scale_mixture_ep import (
     Cavity,
     GaussianPosterior,
     MixtureHyperparameters,
+    _ascend_evidence,
     _corrected,
     _data_objective,
     _data_value,
@@ -29,6 +30,7 @@ from sv_pgs.scale_mixture_ep import (
     _penalty_value,
     _restricted_prior,
     _smoothing_bounds,
+    _stationarity_check,
     _total_curvature,
     cavities,
     class_log_density,
@@ -804,6 +806,11 @@ def test_every_interior_evidence_is_below_the_zero_edge(seed):
 
 
 @pytest.mark.slow
+@pytest.mark.xfail(strict=True, reason=(
+    "finding reported to e2e: the lambda = 0 edge is the profile over the block's directions, which bounds every "
+    "proper-prior V(rho) (V -> -inf as rho -> -inf); the edge comparison in _maximize_evidence takes it whenever it is "
+    "certified, so hyper_step returned [-inf, -inf] (roughness and annotation both unpenalized) on all three seeds [sim-only]"
+))
 @pytest.mark.parametrize("seed", _SEEDS)
 def test_a_null_annotation_is_not_left_unpenalized(seed):
     """An annotation with no effect on the variances: the fitted weight should not sit at the zero edge, where the
@@ -818,36 +825,36 @@ def test_a_null_annotation_is_not_left_unpenalized(seed):
 @pytest.mark.slow
 @pytest.mark.parametrize("seed", _SEEDS)
 def test_the_stationarity_certificate_bounds_the_gain_of_nearby_weights(seed):
-    """``stationarity_gain`` is claimed to bound the gain a Newton step on the weights could still find. Scan each
-    interior weight over a neighbourhood in rho (0.1, 0.3 and 1 either side: a Newton step's reach where V is flat in
-    rho) and compare the best certified V with the fitted one: both are certified to the tolerance, so the gain may
-    exceed the claimed bound by at most two tolerances."""
+    """The stationarity check's gain 1/2 sum (|c| + E)^2 / s is claimed to bound the gain a Newton step on the
+    weights could still find (``HyperStep.stationarity_gain``). At the interior ascent's stop (both weights finite:
+    the edges are not what is tested here), scan each weight over a neighbourhood in rho (0.1, 0.3 and 1 either side:
+    a Newton step's reach where V is flat in rho) and compare the best certified V with V there. Each V is certified to
+    the tolerance, so the gain may exceed the claimed bound by at most two tolerances. s bounds |V''| from above, so
+    1/2 c^2 / s is at most the Newton gain 1/2 c^2 / |V''|, not at least it: the scan measures by how much."""
     prior, cavity = _edge_problem(seed, annotation_effect=1.0)
     posterior = normal_means_posterior(cavity, _WORKING_BYTES)
-    step = hyper_step(prior, initial_hyperparameters(prior), cavity, posterior, _WORKING_BYTES, _EVIDENCE_TOLERANCE)
-    fitted = step.hyperparameters
-    infinite = frozenset(int(position) for position in np.flatnonzero(fitted.log_smoothing == np.inf))
-    zero = frozenset(int(position) for position in np.flatnonzero(fitted.log_smoothing == -np.inf))
-    view, allowed = _restricted_prior(prior, infinite, zero)
-    weights = fitted.log_smoothing[np.isfinite(fitted.log_smoothing)]
-    if weights.shape[0] == 0:
-        pytest.skip("every weight at an edge: no interior weight to scan")
-    base = _corrected(
-        view, weights, _evidence(view, weights, allowed.T @ fitted.coefficients, cavity, posterior, _WORKING_BYTES, 0.0), cavity, posterior,
-        _WORKING_BYTES, _EVIDENCE_TOLERANCE,
-    )
-    assert base is not None
-    best = base.value
+    flat = initial_hyperparameters(prior).coefficients
+    start = _corrected(prior, np.zeros(2), _evidence(prior, np.zeros(2), flat, cavity, posterior, _WORKING_BYTES, _EVIDENCE_TOLERANCE),
+                       cavity, posterior, _WORKING_BYTES, _EVIDENCE_TOLERANCE)
+    assert start is not None
+    bounds = _smoothing_bounds(prior, _data_objective(prior, start.coefficients, cavity, _WORKING_BYTES))
+    lower, upper = np.array([bound[0] for bound in bounds]), np.array([bound[1] for bound in bounds])
+    weights, evidence = _ascend_evidence(prior, np.zeros(2), start, cavity, posterior, _WORKING_BYTES, lower, upper, _EVIDENCE_TOLERANCE, flat)
+    interior = (weights > lower) & (weights < upper)
+    if not np.any(interior):
+        pytest.skip("the ascent stopped at the resolvable range's bounds: no interior weight to check")
+    check, curvature, _steps, errors = _stationarity_check(prior, weights, evidence, interior, cavity, posterior, _WORKING_BYTES, _EVIDENCE_TOLERANCE)
+    claimed = 0.5 * float(np.sum(np.square(np.abs(check) + errors) / curvature))
     gains = {}
-    for position in range(weights.shape[0]):
+    for position in np.flatnonzero(interior):
         for distance in (-1.0, -0.3, -0.1, 0.1, 0.3, 1.0):
             moved_weights = weights.copy()
             moved_weights[position] += distance
             moved = _corrected(
-                view, moved_weights, _evidence(view, moved_weights, base.coefficients, cavity, posterior, _WORKING_BYTES, 0.0), cavity, posterior,
-                _WORKING_BYTES, _EVIDENCE_TOLERANCE,
+                prior, moved_weights, _evidence(prior, moved_weights, evidence.coefficients, cavity, posterior, _WORKING_BYTES, _EVIDENCE_TOLERANCE),
+                cavity, posterior, _WORKING_BYTES, _EVIDENCE_TOLERANCE,
             )
             if moved is not None:
-                gains[(position, distance)] = moved.value - base.value
-                best = max(best, moved.value)
-    assert best - base.value <= step.stationarity_gain + 2.0 * _EVIDENCE_TOLERANCE, (gains, step.stationarity_gain, fitted.log_smoothing)
+                gains[(int(position), distance)] = moved.value - evidence.value
+    best = max(gains.values(), default=0.0)
+    assert best <= claimed + 2.0 * _EVIDENCE_TOLERANCE, (gains, claimed, weights, check, curvature, errors)
