@@ -89,6 +89,70 @@ class GenotypeTileSource(Protocol):
         ...
 
 
+class _VariantGroups(Protocol):
+    group_first: NDArray[np.int64]
+
+
+class DosageCodeStore(Protocol):
+    """What Stage 0 reads from ``dosage_store.DosageStore``."""
+
+    chromosomes: tuple[str, ...]
+    chromosome_starts: NDArray[np.int64]
+    variant_table: _VariantGroups
+
+    @property
+    def n_samples(self) -> int: ...
+
+    @property
+    def n_variants(self) -> int: ...
+
+    def read_codes(self, start: int, stop: int, sample_indices: NDArray | None = None, out: NDArray[np.uint8] | None = None) -> NDArray[np.uint8]: ...
+
+
+class DosageStoreTileSource:
+    """The candidate rows of a dosage store, one chromosome at a time, as Stage 0 streams them.
+
+    Every sample is read (the sample layout selects and groups the training columns on the
+    device). Adjacent candidates with the same ``group_first`` (bubble, same-POS set,
+    duplicate group or repeat locus) are never cut apart. Each contiguous run of candidates
+    is one ``read_codes`` into its rows of the tile.
+    """
+
+    def __init__(self, store: DosageCodeStore, candidate_rows: NDArray[np.int64]) -> None:
+        rows = np.asarray(candidate_rows, dtype=np.int64)
+        if rows.ndim != 1 or rows.shape[0] == 0 or np.any(np.diff(rows) <= 0) or rows[0] < 0 or rows[-1] >= store.n_variants:
+            raise ValueError("candidate_rows must be sorted, distinct store rows")
+        chromosome_of_row = np.searchsorted(store.chromosome_starts, rows, side="right") - 1
+        self._store = store
+        self._rows = {
+            name: rows[chromosome_of_row == index]
+            for index, name in enumerate(store.chromosomes)
+            if np.any(chromosome_of_row == index)
+        }
+
+    @property
+    def sample_count(self) -> int:
+        return self._store.n_samples
+
+    def chromosomes(self) -> list[str]:
+        return list(self._rows)
+
+    def variant_count(self, chromosome: str) -> int:
+        return int(self._rows[chromosome].shape[0])
+
+    def unsplittable_groups(self, chromosome: str) -> NDArray[np.int64]:
+        return np.asarray(self._store.variant_table.group_first, dtype=np.int64)[self._rows[chromosome]]
+
+    def store_rows(self, chromosome: str) -> NDArray[np.int64]:
+        return self._rows[chromosome]
+
+    def read_rows(self, chromosome: str, start: int, stop: int, out: NDArray[np.uint8]) -> None:
+        rows = self._rows[chromosome][start:stop]
+        breaks = np.flatnonzero(np.diff(rows) > 1) + 1
+        for run_start, run_stop in zip(np.concatenate(([0], breaks)).tolist(), np.concatenate((breaks, [rows.shape[0]])).tolist()):
+            self._store.read_codes(int(rows[run_start]), int(rows[run_stop - 1]) + 1, None, out=out[run_start:run_stop])
+
+
 class GenotypeBuffer(Protocol):
     """One device's genotype buffer (``genotype_buffers.HostGenotypeBuffer`` or ``CudaGenotypeBuffer``)."""
 
