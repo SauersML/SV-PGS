@@ -31,6 +31,12 @@ def test_bai_releases_give_squared_z_keyed_by_their_ids(tmp_path):
     ])
     structural = read_bai_structural(sv)
     np.testing.assert_array_equal(structural.keys, ["chr1_HQA241SV_7", "chr2_HQA241SV_9"])
+    untested = _write(tmp_path / "untested.SV.gz", [
+        "CHR\tSNP\tPOS\tA1\tA2\tN\tAF1\tBETA\tSE\tP\tMAF",
+        "1\tchr1_HQA241SV_7\t20851\tAGTC\tA\t400000\t0.2\t0.03\t0.01\t0.003\t0.2",
+        "3\tchr3_HQA241SV_2\t900\tA\tATT\t400000\t0.1\tNA\tNA\tNA\t0.1",
+    ])
+    np.testing.assert_array_equal(read_bai_structural(untested).keys, ["chr1_HQA241SV_7"])
     np.testing.assert_allclose(structural.squared_z, [9.0, 16.0])
     repeat = read_bai_tandem_repeat(vntr)
     np.testing.assert_allclose(repeat.squared_z, [4.0])
@@ -54,6 +60,8 @@ def test_panukb_lift_and_join_keep_only_confident_mapped_sites(tmp_path):
         "1\t2000\tC\tT\t0.3\t0.1\t2.0\t0.2\ttrue",
         "1\t3000\tG\tA\t-0.1\t0.05\t1.3\t0.1\tfalse",
         "X\t4000\tG\tA\t0.5\t0.1\t5.0\t0.4\tfalse",
+        # EUR was not tested here: NA statistics are absent evidence, not an error.
+        "1\t5000\tT\tC\tNA\tNA\tNA\t0.2\tfalse",
     ])
     associations = read_panukb_eur(release)
     np.testing.assert_array_equal(associations.position, [1000, 3000])

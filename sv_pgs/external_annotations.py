@@ -338,15 +338,22 @@ def _unique(keys: NDArray, values: NDArray, source: str) -> ExternalAssociations
     return ExternalAssociations(keys=keys, squared_z=np.asarray(values, dtype=np.float64))
 
 
+def _tested(table: pd.DataFrame, effect: str, error: str) -> pd.DataFrame:
+    """The rows a release reports statistics for. A row with an NA effect or standard error
+    (the variant was not tested) carries no evidence, so it stays absent like any variant the
+    release lacks; a reported non-positive standard error still fails in ``squared_z``."""
+    return table[table[effect].notna() & table[error].notna()]
+
+
 def read_bai_structural(path: Path) -> ExternalAssociations:
     """A Bai 2026 SV release (columns CHR SNP POS A1 A2 N AF1 BETA SE P MAF), keyed by its SV id."""
-    table = pd.read_csv(path, sep="\t", usecols=["SNP", "BETA", "SE"], dtype={"SNP": str})
+    table = _tested(pd.read_csv(path, sep="\t", usecols=["SNP", "BETA", "SE"], dtype={"SNP": str}), "BETA", "SE")
     return _unique(table["SNP"].to_numpy(), squared_z(table["BETA"].to_numpy(), table["SE"].to_numpy()), str(path))
 
 
 def read_bai_tandem_repeat(path: Path) -> ExternalAssociations:
     """A Bai 2026 VNTR release (effect per repeat unit), keyed by its locus id."""
-    table = pd.read_csv(path, sep="\t", usecols=["ID", "BETA", "SE"], dtype={"ID": str})
+    table = _tested(pd.read_csv(path, sep="\t", usecols=["ID", "BETA", "SE"], dtype={"ID": str}), "BETA", "SE")
     return _unique(table["ID"].to_numpy(), squared_z(table["BETA"].to_numpy(), table["SE"].to_numpy()), str(path))
 
 
@@ -364,14 +371,15 @@ class SnvAssociations:
 def read_panukb_eur(path: Path) -> SnvAssociations:
     """A slim Pan-UKB EUR file (chr pos ref alt beta_EUR se_EUR ... low_confidence_EUR), autosomes only.
 
-    Pan-UKB flags variants whose EUR statistics fail its QC as low confidence;
-    those carry no usable evidence and are left out, so they become absent.
+    Pan-UKB flags variants whose EUR statistics fail its QC as low confidence, and leaves
+    beta_EUR/se_EUR NA where EUR was not tested; neither carries usable evidence, so both are
+    left out and become absent, as for the SV releases.
     """
     table = pd.read_csv(path, sep="\t", usecols=["chr", "pos", "ref", "alt", "beta_EUR", "se_EUR", "low_confidence_EUR"],
                         dtype={"chr": str, "ref": str, "alt": str})
     confident = ~table["low_confidence_EUR"].astype(str).str.lower().isin(["true", "1"])
     autosomal = table["chr"].str.fullmatch(r"\d+")
-    table = table[confident & autosomal]
+    table = _tested(table[confident & autosomal], "beta_EUR", "se_EUR")
     return SnvAssociations(
         chromosome=table["chr"].astype(np.int64).to_numpy(),
         position=table["pos"].to_numpy(dtype=np.int64),
