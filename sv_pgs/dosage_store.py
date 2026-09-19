@@ -54,103 +54,36 @@ class _PinnedBufferPool:
     """Process-wide pool of pinned host buffers for the store's CUDA staging ring.
 
     Pinning (``cudaHostAlloc``) locks pages and updates the IOMMU, which is slow for large
-    buffers, so released buffers are kept by size and the smallest one that fits is reused.
-    The pool only grows; its size is bounded by the host budget its callers already enforce.
-    The lock is not held across a fresh allocation, so pool hits never wait behind one.
+    buffers, so released buffers are kept and the smallest one that fits is reused. The pool
+    only grows; its size is bounded by the host budget its callers already enforce. The lock is
+    not held across a fresh allocation, so pool hits never wait behind one.
     """
 
     def __init__(self) -> None:
         self._lock = threading.Lock()
         self._available: list[tuple[int, Any]] = []
         self._in_flight: dict[int, tuple[int, Any]] = {}
-        self._n_allocs = 0
-        self._n_reuses = 0
-        self._peak_total_bytes = 0
 
-    def acquire(self, cp: Any, nbytes: int) -> tuple[Any, np.ndarray]:
-        """Return ``(pinned_mem, uint8 numpy view of length ``nbytes``)``.
-
-        Best-fit search: smallest available buffer ≥ ``nbytes``. Falls
-        back to a fresh ``alloc_pinned_memory`` if no candidate fits.
-        """
-        if nbytes <= 0:
-            return None, np.empty((0,), dtype=np.uint8)
-        nbytes = int(nbytes)
+    def acquire(self, cupy: Any, byte_count: int) -> tuple[Any, U8Array]:
+        """A pinned buffer of at least ``byte_count`` bytes and a uint8 view of its first ``byte_count``."""
         with self._lock:
-            best_idx = -1
-            best_size = -1
-            for idx, (sz, _mem) in enumerate(self._available):
-                if sz >= nbytes and (best_idx < 0 or sz < best_size):
-                    best_idx = idx
-                    best_size = sz
-            if best_idx >= 0:
-                sz, mem = self._available.pop(best_idx)
-                self._in_flight[id(mem)] = (sz, mem)
-                self._n_reuses += 1
-                view = np.frombuffer(mem, dtype=np.uint8, count=nbytes)
-                return mem, view
-        # Allocate outside the lock — pinning a multi-GB region can take
-        # seconds and we don't want every other thread blocked on it.
-        pinned_mem = cp.cuda.alloc_pinned_memory(nbytes)
+            fitting = [position for position, (size, _) in enumerate(self._available) if size >= byte_count]
+            if fitting:
+                size, memory = self._available.pop(min(fitting, key=lambda position: self._available[position][0]))
+                self._in_flight[id(memory)] = (size, memory)
+                return memory, np.frombuffer(memory, dtype=np.uint8, count=byte_count)
+        memory = cupy.cuda.alloc_pinned_memory(byte_count)
         with self._lock:
-            self._in_flight[id(pinned_mem)] = (nbytes, pinned_mem)
-            self._n_allocs += 1
-            total = sum(sz for sz, _ in self._available) + sum(
-                sz for sz, _ in self._in_flight.values()
-            )
-            if total > self._peak_total_bytes:
-                self._peak_total_bytes = total
-        view = np.frombuffer(pinned_mem, dtype=np.uint8, count=nbytes)
-        return pinned_mem, view
+            self._in_flight[id(memory)] = (byte_count, memory)
+        return memory, np.frombuffer(memory, dtype=np.uint8, count=byte_count)
 
-    def release(self, mem: Any) -> None:
-        """Return ``mem`` to the pool so a later acquire can reuse it.
-
-        Safe with ``None`` (no-op) and on double-release (drops silently).
-        """
-        if mem is None:
-            return
+    def release(self, memory: Any) -> None:
+        """Return a buffer from ``acquire`` to the pool."""
         with self._lock:
-            entry = self._in_flight.pop(id(mem), None)
-            if entry is None:
-                return
-            self._available.append(entry)
-
-    def stats(self) -> dict[str, int]:
-        with self._lock:
-            return {
-                "available_count": len(self._available),
-                "available_bytes": sum(sz for sz, _ in self._available),
-                "in_flight_count": len(self._in_flight),
-                "in_flight_bytes": sum(sz for sz, _ in self._in_flight.values()),
-                "allocs": self._n_allocs,
-                "reuses": self._n_reuses,
-                "peak_total_bytes": self._peak_total_bytes,
-            }
+            self._available.append(self._in_flight.pop(id(memory)))
 
 
 _PINNED_POOL = _PinnedBufferPool()
-
-
-def _pinned_pool() -> _PinnedBufferPool:
-    """Return the process-wide pinned-buffer pool."""
-    return _PINNED_POOL
-
-
-def _allocate_pinned(cp: Any, nbytes: int) -> tuple[Any, np.ndarray]:
-    """Acquire a pinned-host uint8 staging buffer from the process-wide pool.
-
-    Returns ``(pinned_mem, numpy_view)``. Pass ``pinned_mem`` to
-    ``_release_pinned`` when the buffer is no longer needed so a later
-    acquire can reuse it instead of re-pinning multi-GB regions from
-    scratch.
-    """
-    return _PINNED_POOL.acquire(cp, int(nbytes))
-
-
-def _release_pinned(mem: Any) -> None:
-    """Return a pinned buffer to the pool. Safe with ``None`` and on double-release."""
-    _PINNED_POOL.release(mem)
 
 
 STORE_FORMAT = "svpgs-store-v1"
@@ -1293,7 +1226,7 @@ class DosageStore:
                 pending.cancel()
             prefetch.shutdown(wait=True)
             for owner in pinned:
-                _release_pinned(owner)
+                _PINNED_POOL.release(owner)
 
     def _ring_depth(self, rows: int) -> int:
         """Ring slots for blocks of ``rows``: the consumer's, plus blocks read concurrently.
@@ -1314,7 +1247,7 @@ class DosageStore:
             raise RuntimeError("a CUDA budget needs CuPy to pin the dosage staging buffers.")
         owners, buffers = [], []
         for _ in range(depth):
-            owner, view = _allocate_pinned(cupy, buffer_bytes)
+            owner, view = _PINNED_POOL.acquire(cupy, buffer_bytes)
             owners.append(owner)
             buffers.append(view[:buffer_bytes])
         return buffers, owners

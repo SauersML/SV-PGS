@@ -8,15 +8,6 @@ import numpy as np
 from sv_pgs.data import TieGroup, TieMap
 
 
-def _empty_tie_map(original_variant_count: int) -> TieMap:
-    original_to_reduced = np.full(original_variant_count, -1, dtype=np.int32)
-    return TieMap(
-        kept_indices=np.zeros(0, dtype=np.int32),
-        original_to_reduced=original_to_reduced,
-        reduced_to_group=[],
-    )
-
-
 def _compact_identity_tie_map(variant_count: int) -> TieMap:
     identity_indices = np.arange(int(variant_count), dtype=np.int32)
     return TieMap(
