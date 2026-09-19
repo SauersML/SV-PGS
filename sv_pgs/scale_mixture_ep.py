@@ -191,9 +191,13 @@ class TiltedMoments:
 class HyperStep:
     """The result of one empirical-Bayes step at fixed cavities.
 
-    ``newton_decrement`` is 1/2 g'(-H)^-1 g of the penalized objective in x at
-    the returned hyperparameters, in nats. ``smoothing_gradient`` is the
-    largest |dV/drho| over weights not held at a bound of their range.
+    ``start_decrement`` is 1/2 g'|H|^-1 g of the penalized objective at the
+    hyperparameters the step started from (what these cavities still ask of
+    them), and ``evidence_gain`` is V at the returned weights minus V at the
+    starting ones, both in nats: the outer loop's certificate.
+    ``newton_decrement`` is the same decrement at the returned
+    hyperparameters, and ``smoothing_gradient`` the largest |dV/drho| over
+    weights not held at a bound of their range.
     """
 
     hyperparameters: MixtureHyperparameters
@@ -201,6 +205,8 @@ class HyperStep:
     evidence: float
     newton_decrement: float
     smoothing_gradient: float
+    start_decrement: float
+    evidence_gain: float
 
 
 # ------------------------------------------------------------------ the lattice
@@ -891,8 +897,9 @@ def _maximize_evidence(
     cavity: Cavity,
     working_bytes: int,
     bounds: list[tuple[float, float]],
-) -> tuple[F64Array, _Evidence]:
-    """Projected quasi-Newton ascent of V(rho) inside its bounds, backtracking on every trial point.
+) -> tuple[F64Array, _Evidence, _Evidence]:
+    """Projected quasi-Newton ascent of V(rho) inside its bounds, backtracking on every trial point; returns the
+    weights, their evidence, and the evidence at the start.
 
     A trial is kept only when it has a positive-definite penalized maximum and
     raises V; otherwise the step halves. The BFGS inverse Hessian of -V is
@@ -906,6 +913,7 @@ def _maximize_evidence(
     current = _evidence(prior, weights, start_coefficients, cavity, working_bytes)
     if current is None:
         raise FloatingPointError("the penalized objective has no positive-definite maximum at the starting penalty weights")
+    start = current
     inverse_hessian = np.eye(weights.shape[0])
     while True:
         gradient = current.gradient
@@ -916,7 +924,7 @@ def _maximize_evidence(
             inverse_hessian = np.eye(weights.shape[0])
             direction[free] = gradient[free]
         if 0.5 * float(gradient[free] @ direction[free]) <= _EPSILON * current.magnitude:
-            return weights, current
+            return weights, current, start
         step_length = 1.0
         accepted = None
         while step_length * float(np.max(np.abs(direction))) > _HALF_PRECISION * (1.0 + float(np.max(np.abs(weights)))):
@@ -927,7 +935,7 @@ def _maximize_evidence(
                 break
             step_length *= 0.5
         if accepted is None:
-            return weights, current
+            return weights, current, start
         trial_weights, trial = accepted
         displacement = trial_weights - weights
         gradient_change = gradient - trial.gradient
@@ -943,8 +951,13 @@ def hyper_step(
     prior: ScaleMixturePrior, hyperparameters: MixtureHyperparameters, cavity: Cavity, working_bytes: int
 ) -> HyperStep:
     """Maximize V(rho) over the resolvable range, with x at the penalized maximum for each rho."""
-    bounds = _smoothing_bounds(prior, _data_objective(prior, hyperparameters.coefficients, cavity, working_bytes))
-    log_smoothing, evidence = _maximize_evidence(
+    start_objective = _data_objective(prior, hyperparameters.coefficients, cavity, working_bytes)
+    _value, start_gradient, start_hessian = _penalized(
+        prior, start_objective, hyperparameters.log_smoothing, _penalty_matrix(prior, hyperparameters.log_smoothing), hyperparameters.coefficients
+    )
+    start_decrement = 0.5 * float(start_gradient @ _ascent_direction(-start_hessian, start_gradient))
+    bounds = _smoothing_bounds(prior, start_objective)
+    log_smoothing, evidence, start_evidence = _maximize_evidence(
         prior, hyperparameters.log_smoothing, hyperparameters.coefficients, cavity, working_bytes, bounds
     )
     interior = np.array([bound[0] < weight < bound[1] for weight, bound in zip(log_smoothing, bounds)])
@@ -954,4 +967,6 @@ def hyper_step(
         evidence=evidence.value,
         newton_decrement=evidence.newton_decrement,
         smoothing_gradient=float(np.max(np.abs(evidence.gradient[interior]))) if np.any(interior) else 0.0,
+        start_decrement=start_decrement,
+        evidence_gain=evidence.value - start_evidence.value,
     )
