@@ -560,15 +560,19 @@ def test_information_solve_gives_the_bulk_back_products_and_coupling() -> None:
             np.testing.assert_allclose(resolved_coupling, coupling, rtol=0.0, atol=conditioning * np.sqrt(EPS) * np.abs(coupling).max() * genotypes.shape[0])
 
 
-def test_a_warm_iterate_after_small_site_moves_reuses_the_previous_solution() -> None:
+def test_a_warm_iterate_reuses_the_previous_z_l_and_probe_solutions() -> None:
     genotypes, bounds, covariates, training, noise, precision, shift, response, offsets, _negative = _gaussian_problem(63)
     source = dual_solve.DenseDualSource(genotypes, bounds)
     gaussian = dual_solve.DualGaussian(source=source, training=training, targets=response, offsets=offsets, covariates=covariates, grams=_grams(bounds, True), probe_count=2, seed=10)
     bound = np.full(MODEL_COUNT, np.sqrt(EPS))
-    cold = gaussian.iterate(site_precision=precision, site_shift=shift, noise_variance=noise, error_bound=bound, probe_residual_ratio=np.sqrt(EPS))
+    before = gaussian.count.column_passes
+    gaussian.iterate(site_precision=precision, site_shift=shift, noise_variance=noise, error_bound=bound, probe_residual_ratio=np.sqrt(EPS))
+    cold_columns = gaussian.count.column_passes - before
     moved = precision * np.exp(np.random.default_rng(64).normal(0.0, 0.01, precision.shape) * (precision > 0))
+    before = gaussian.count.column_passes
     warm = gaussian.iterate(site_precision=moved, site_shift=shift, noise_variance=noise, error_bound=bound, probe_residual_ratio=np.sqrt(EPS))
-    assert warm.iterations < cold.iterations
+    # The Z_L and probe columns start from their previous solutions and finish early.
+    assert gaussian.count.column_passes - before < cold_columns
     for model in range(MODEL_COUNT):
         posterior_precision, mean, _alpha, _rss, _design = _dense_gaussian(genotypes, covariates, training, noise, moved, shift, response, offsets, model)
         error = gaussian.mean[:, model] - mean
