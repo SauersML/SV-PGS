@@ -686,29 +686,45 @@ def test_the_corrected_evidence_matches_the_exact_integral_over_the_penalized_di
     schur = moved.T @ negative @ moved
     eigenvalues, eigenvectors = np.linalg.eigh(0.5 * (schur + schur.T))
     directions = range_basis @ eigenvectors / np.sqrt(eigenvalues)[None, :]
-    # The exact 2-D integral of exp(profile - peak) in the standardized coordinates: the trapezoid rule on a square
-    # grid (geometrically convergent for a smooth decaying integrand), each point's null coordinates re-profiled from
-    # its neighbour's. The square reaches sqrt(2 ln(1/eps)) standard units, where a Gaussian integrand is at eps of
-    # its peak; the integrand must be below that on the square's boundary, and spacings 1/2 and 1/4 must agree to
-    # the tolerance's share.
+    # The exact 2-D integral of exp(profile - peak) in the standardized coordinates: the trapezoid rule on a
+    # rectangular grid (geometrically convergent for a smooth decaying integrand), each point's null coordinates
+    # re-profiled from its neighbour's. Each side starts sqrt(2 ln(1/eps)) standard units out, where a Gaussian
+    # integrand is at eps of its peak, and doubles while the integrand on it is not (the non-Gaussian tails the
+    # corrections are for); spacings 1/2 and 1/4 must agree to the tolerance's share. The harness's own time budget
+    # caps the grid at sixteen times its starting area.
     null_centre = null_basis.T @ centre
-    reach = np.sqrt(2.0 * np.log(1.0 / _EPSILON))
-    fine_spacing = 0.25
-    axis = np.arange(-reach, reach + 0.5 * fine_spacing, fine_spacing)
-    values = np.empty((axis.shape[0], axis.shape[0]))
+    spacing = 0.25
+    start_reach = int(np.ceil(np.sqrt(2.0 * np.log(1.0 / _EPSILON)) / spacing))
+    extent = np.full((2, 2), start_reach)  # grid indices reached on (axis, side): side 0 negative, side 1 positive
+    values: dict[tuple[int, int], float] = {}
     null_part = null_centre
-    for row, first in enumerate(axis):
-        columns = range(axis.shape[0]) if row % 2 == 0 else range(axis.shape[0] - 1, -1, -1)
-        for column in columns:
-            start = centre + first * directions[:, 0] + axis[column] * directions[:, 1] + null_basis @ (null_part - null_centre)
-            point, value = _profile(prior, log_smoothing, cavity, start, null_basis)
-            null_part = null_basis.T @ point
-            values[row, column] = value - peak
-    boundary = max(float(np.max(values[[0, -1], :])), float(np.max(values[:, [0, -1]])))
-    if boundary > np.log(_EPSILON):
-        pytest.fail(f"the profiled integrand is {boundary:.3g} (log, of its peak) on the reference's boundary: the harness cannot judge this case")
-    fine = float(logsumexp(values)) + 2.0 * np.log(fine_spacing)
-    coarse = float(logsumexp(values[::2, ::2])) + 2.0 * np.log(2.0 * fine_spacing)
+    while True:
+        firsts = range(-int(extent[0, 0]), int(extent[0, 1]) + 1)
+        seconds = list(range(-int(extent[1, 0]), int(extent[1, 1]) + 1))
+        if len(firsts) * len(seconds) > 16 * (2 * start_reach + 1) ** 2:
+            pytest.fail("the profiled integrand's tails outgrow the reference's budget: the harness cannot judge this case")
+        for row, first in enumerate(firsts):
+            for second in (seconds if row % 2 == 0 else seconds[::-1]):
+                if (first, second) in values:
+                    continue
+                start = centre + spacing * (first * directions[:, 0] + second * directions[:, 1]) + null_basis @ (null_part - null_centre)
+                point, value = _profile(prior, log_smoothing, cavity, start, null_basis)
+                null_part = null_basis.T @ point
+                values[(first, second)] = value - peak
+        grown = False
+        for axis in range(2):
+            for side, edge in ((0, -int(extent[axis, 0])), (1, int(extent[axis, 1]))):
+                on_edge = [value for key, value in values.items() if key[axis] == edge]
+                if max(on_edge) > np.log(_EPSILON):
+                    extent[axis, side] *= 2
+                    grown = True
+        if not grown:
+            break
+    firsts = np.arange(-int(extent[0, 0]), int(extent[0, 1]) + 1)
+    seconds = np.arange(-int(extent[1, 0]), int(extent[1, 1]) + 1)
+    grid = np.array([[values[(int(first), int(second))] for second in seconds] for first in firsts])
+    fine = float(logsumexp(grid)) + 2.0 * np.log(spacing)
+    coarse = float(logsumexp(grid[(firsts % 2) == 0][:, (seconds % 2) == 0])) + 2.0 * np.log(2.0 * spacing)
     assert abs(fine - coarse) <= 0.25 * _EVIDENCE_TOLERANCE, ("the reference quadrature did not converge", fine, coarse)
     log_integral = fine
     # The exact profiled evidence: F + 1/2 log|S|_+ + log of the integral over the range - (r/2) log(2 pi), where the
