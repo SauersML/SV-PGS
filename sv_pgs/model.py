@@ -1608,12 +1608,8 @@ def _try_upgrade_reduced_to_bitpacked(
         return None
     # Host-RAM gate based on the actual cold-load peak (payload + rebitpacked
     # + pinned) for the gather subset, with a 1.5x safety margin.
-    try:
-        import psutil  # type: ignore
-        host_free_bytes = int(psutil.virtual_memory().available)
-    except ImportError:
-        host_free_bytes = 0
-    if host_free_bytes > 0 and cold_load_peak_bytes * 3 // 2 > host_free_bytes:
+    host_free_bytes = int(_detect_available_host_ram_bytes())
+    if cold_load_peak_bytes * 3 // 2 > host_free_bytes:
         log(
             "bitpacked post-active upgrade: SKIPPED "
             f"(reason: cold-load peak would exceed host RAM; "

@@ -1,4 +1,4 @@
-"""Tests for `sv_pgs.genotype._detect_available_host_ram_bytes`.
+"""Tests for `sv_pgs.compute_budget._detect_available_host_ram_bytes`.
 
 Regression: previously this function preferred `os.sysconf("SC_AVPHYS_PAGES")`,
 which is `MemFree`-equivalent on Linux. On a box with hundreds of GB of
@@ -10,12 +10,11 @@ from __future__ import annotations
 
 import builtins
 import io
-import sys
 from typing import Any
 
 import pytest
 
-from sv_pgs import genotype
+from sv_pgs import compute_budget
 
 
 def _patch_proc_meminfo(monkeypatch: pytest.MonkeyPatch, contents: str | None) -> None:
@@ -47,7 +46,7 @@ def test_memavailable_primary(monkeypatch: pytest.MonkeyPatch) -> None:
         "Cached:         200000000 kB\n"
         "SReclaimable:    10000000 kB\n",
     )
-    result = genotype._detect_available_host_ram_bytes()
+    result = compute_budget._detect_available_host_ram_bytes()
     assert result == 250_000_000 * 1024  # ≈ 256 GB
     # Sanity: vastly larger than the historical 128 MB floor.
     assert result > 100 * 1024 * 1024 * 1024
@@ -62,52 +61,19 @@ def test_memfree_plus_cached_fallback(monkeypatch: pytest.MonkeyPatch) -> None:
         "Cached:         200000000 kB\n"
         "SReclaimable:    10000000 kB\n",
     )
-    result = genotype._detect_available_host_ram_bytes()
+    result = compute_budget._detect_available_host_ram_bytes()
     expected = (500_000 + 200_000_000 + 10_000_000) * 1024
     assert result == expected
 
 
-def test_psutil_fallback(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Fallback 2: no /proc/meminfo -> psutil.virtual_memory().available."""
-    _patch_proc_meminfo(monkeypatch, None)
-
-    class _FakeVM:
-        available = 123_456_789_000
-
-    class _FakePsutil:
-        @staticmethod
-        def virtual_memory() -> _FakeVM:
-            return _FakeVM()
-
-    monkeypatch.setitem(sys.modules, "psutil", _FakePsutil)
-    # Disable sysconf so we don't fall through to it on Linux test hosts.
-    monkeypatch.setattr(
-        genotype.os,
-        "sysconf",
-        lambda _name: (_ for _ in ()).throw(OSError("disabled for test")),
-    )
-    result = genotype._detect_available_host_ram_bytes()
-    assert result == 123_456_789_000
-
-
 def test_hardcoded_4gb_floor(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Fallback 4: nothing works -> 4 GB hardcoded."""
+    """Last resort: no /proc/meminfo and no sysconf -> 4 GB hardcoded."""
     _patch_proc_meminfo(monkeypatch, None)
-
-    real_import = builtins.__import__
-
-    def fake_import(name: str, *args: Any, **kwargs: Any):  # type: ignore[no-untyped-def]
-        if name == "psutil":
-            raise ImportError("simulated: psutil missing")
-        return real_import(name, *args, **kwargs)
-
-    monkeypatch.setattr(builtins, "__import__", fake_import)
-    monkeypatch.delitem(sys.modules, "psutil", raising=False)
     monkeypatch.setattr(
-        genotype.os,
+        compute_budget.os,
         "sysconf",
         lambda _name: (_ for _ in ()).throw(OSError("disabled for test")),
     )
-    result = genotype._detect_available_host_ram_bytes()
-    assert result == genotype._AUTO_TUNE_HOST_RAM_FALLBACK_BYTES
+    result = compute_budget._detect_available_host_ram_bytes()
+    assert result == compute_budget._AUTO_TUNE_HOST_RAM_FALLBACK_BYTES
     assert result == 4 * 1024 * 1024 * 1024

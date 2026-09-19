@@ -38,10 +38,9 @@ from typing import Any, Callable, Protocol, Sequence
 import numpy as np
 from numpy.typing import NDArray
 
-from sv_pgs.compute_budget import ComputeBudget
+from sv_pgs.compute_budget import ComputeBudget, _try_import_cupy
 from sv_pgs.config import ModelConfig
 from sv_pgs.data import TieMap
-from sv_pgs.genotype import _try_import_cupy
 from sv_pgs.genotype_buffers import (
     INT32_EXACT_ROWS,
     SIGNED_CODE_OFFSET,

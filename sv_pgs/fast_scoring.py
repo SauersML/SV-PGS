@@ -58,10 +58,9 @@ from scipy.special import expit
 from threadpoolctl import threadpool_limits
 
 from sv_pgs._typing import F64Array, I64Array, NDArray, U8Array
-from sv_pgs.compute_budget import ComputeBudget
+from sv_pgs.compute_budget import ComputeBudget, _cupy_device_context, _try_import_cupy
 from sv_pgs.config import TraitType
 from sv_pgs.data import TieMap
-from sv_pgs.genotype import _cupy_device_context, _try_import_cupy
 from sv_pgs.progress import log
 
 SIGNED_CODE_OFFSET = 127.0

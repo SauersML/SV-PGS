@@ -320,7 +320,7 @@ def _process_cpu_seconds() -> float:
 
 def _cupy_mempool_snapshot() -> str:
     try:
-        from sv_pgs.genotype import _cupy_runtime_error_classes, _try_import_cupy
+        from sv_pgs.compute_budget import _cupy_runtime_error_classes, _try_import_cupy
     except ImportError:
         return "cupy=unavailable"
     cupy = _try_import_cupy()

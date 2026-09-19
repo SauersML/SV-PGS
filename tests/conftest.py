@@ -56,7 +56,7 @@ def random_generator() -> np.random.Generator:
 
 @pytest.fixture(autouse=True)
 def reset_cupy_import_cache():
-    """Reset ``genotype._try_import_cupy``'s process-global module cache.
+    """Reset ``compute_budget._try_import_cupy``'s process-global module cache.
 
     ``_try_import_cupy`` memoizes the imported module in module globals
     (``_cupy_checked`` / ``_cupy_module``). On a GPU host the first test that
@@ -67,13 +67,13 @@ def reset_cupy_import_cache():
     after each test makes ``_try_import_cupy`` honor each test's own
     ``sys.modules`` patch and removes the cross-test pollution.
     """
-    import sv_pgs.genotype as genotype_module
+    import sv_pgs.compute_budget as compute_budget_module
 
-    genotype_module._cupy_checked = False
-    genotype_module._cupy_module = None
+    compute_budget_module._cupy_checked = False
+    compute_budget_module._cupy_module = None
     yield
-    genotype_module._cupy_checked = False
-    genotype_module._cupy_module = None
+    compute_budget_module._cupy_checked = False
+    compute_budget_module._cupy_module = None
 
 
 @pytest.fixture(autouse=True)

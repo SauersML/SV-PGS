@@ -45,9 +45,8 @@ import numpy as np
 import zstandard
 
 from sv_pgs._typing import F64Array, I64Array, NDArray, U8Array
-from sv_pgs.compute_budget import ComputeBudget
+from sv_pgs.compute_budget import ComputeBudget, _try_import_cupy
 from sv_pgs.config import VariantClass
-from sv_pgs.genotype import _try_import_cupy
 
 
 class _PinnedBufferPool:
