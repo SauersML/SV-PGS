@@ -378,6 +378,74 @@ def block_trace_certificate(
     return BlockCertificate(relative_error=relative, standard_error=standard, upper_bound=upper, tolerance=tolerance, violated=violated)
 
 
+def information_products(solve: BulkSolve, back_products: NDArray[np.float64]) -> NDArray[np.float64]:
+    """(D - Sigma) v on bulk sites, formed directly as D_S (Xt' w) from ``covariance_products``' back product.
+
+    Forming D v - Sigma v by subtraction loses about log10(tr Sigma_b / tr(D - Sigma)_b) digits to
+    cancellation, which is large when there is little data per variant. The back product gives the difference
+    itself, so its accuracy is the dual solve's. Resolved rows are zero: the resolved sites are exact in core.
+    """
+    is_bulk = np.ones(solve.site_precision.shape[0], dtype=bool)
+    is_bulk[solve.resolved] = False
+    bulk_variance = np.where(is_bulk, 1.0 / np.where(is_bulk, solve.site_precision, 1.0), 0.0)
+    return bulk_variance[:, None] * back_products
+
+
+def information_solve_tolerance(
+    solve: BulkSolve,
+    variances: NDArray[np.float64],
+    blocks: tuple[NDArray[np.int64], ...],
+    column_square_norms: NDArray[np.float64],
+    tolerance: float,
+) -> float:
+    """The relative residual |r| / |u| that the certificate's K_S solves need.
+
+    Below it, the solve moves no block's information estimate, averaged over the probes, by more than half the
+    certificate tolerance (in expectation over Rademacher z).
+
+    For a probe z, block b's estimate is a_b' w with a_b = Xt_b D_b z_b, w = K_S^-1 u and u = Xt D_S z. A
+    residual r leaves the error a_b' K_S^-1 r, and |a_b' K_S^-1 r| <= |a_b| |r|, since K_S >= I. For Rademacher
+    z, exactly, E|a_b|^2 = M_b = sum_{j in b, bulk} D_j^2 |xt_j|^2 and E|u|^2 = M, the same sum over every bulk
+    site. So E[|a_b| |u|] <= sqrt(M_b M) (Cauchy-Schwarz). With T_b = tr(D - Sigma)_b the block's information
+    from ``variances``, a relative residual of (tolerance / 2) min_b T_b / sqrt(M_b M) suffices.
+    """
+    is_bulk = np.ones(solve.site_precision.shape[0], dtype=bool)
+    is_bulk[solve.resolved] = False
+    bulk_variance = np.where(is_bulk, 1.0 / np.where(is_bulk, solve.site_precision, 1.0), 0.0)
+    mass = np.square(bulk_variance) * column_square_norms
+    removed = np.where(is_bulk, bulk_variance - variances, 0.0)
+    total = float(np.sum(mass))
+    ratios = [float(np.sum(removed[members])) / np.sqrt(float(np.sum(mass[members])) * total) for members in blocks if float(np.sum(mass[members])) > 0.0]
+    return 0.5 * tolerance * min(ratios)
+
+
+def block_information_certificate(
+    solve: BulkSolve,
+    variances: NDArray[np.float64],
+    blocks: tuple[NDArray[np.int64], ...],
+    probes: NDArray[np.float64],
+    removed_products: NDArray[np.float64],
+    tolerance: float,
+) -> BlockCertificate:
+    """Test each block's data information tr(D_b - Sigma_bb), over its bulk sites, against probes.
+
+    EP matches sites to the cavity P_j = 1/Sigma_jj - Pi_j. For a bulk site, Sigma_jj = D_j - D_j^2 q_j, so
+    P_j = q_j / (1 - D_j q_j): what P needs is the relative accuracy of D_j - Sigma_jj, the variance the data
+    removed, not of Sigma_jj itself. When D_j q_j is small (little data per variant, the production regime),
+    a variance correct to 1e-3 can leave a cavity tens of percent off. ``block_trace_certificate`` cannot see
+    that, and this certificate can.
+
+    ``removed_products`` is (D - Sigma) z on bulk sites, from ``information_products``. For Rademacher z,
+    z_b' ((D - Sigma) z)_b is an unbiased estimate of the block's information, tested as in
+    ``block_trace_certificate``: relative error, the probes' standard error, family-wise level 1/B.
+    """
+    is_bulk = np.ones(solve.site_precision.shape[0], dtype=bool)
+    is_bulk[solve.resolved] = False
+    bulk_variance = np.where(is_bulk, 1.0 / np.where(is_bulk, solve.site_precision, 1.0), 0.0)
+    removed = np.where(is_bulk, bulk_variance - variances, 0.0)
+    return block_trace_certificate(removed, blocks, np.where(is_bulk[:, None], probes, 0.0), np.where(is_bulk[:, None], removed_products, 0.0), tolerance)
+
+
 def certificate_tolerance(solve: BulkSolve, bulk_probe_count: int) -> float:
     """The certificate's tolerance when omega_S comes from k sample-side Rademacher probes.
 

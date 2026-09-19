@@ -14,6 +14,9 @@ from sv_pgs.marginal_variances import (
     BlockGrams,
     BulkSolve,
     approximation_scale,
+    block_information_certificate,
+    information_products,
+    information_solve_tolerance,
     block_trace_certificate,
     certificate_tolerance,
     covariance_products,
@@ -207,3 +210,70 @@ def test_certificate_tolerance_adds_the_probe_error_in_quadrature():
     assert np.isclose(certificate_tolerance(solve, 2), scale * np.sqrt(2.0))
     assert certificate_tolerance(solve, 10**9) < scale * (1 + 1e-8)
 
+
+
+def test_information_certificate_flags_a_cavity_error_the_trace_certificate_misses():
+    generator = np.random.default_rng(13)
+    sample_count, variant_count = 1500, 600
+    columns = _genotypes(generator, sample_count, variant_count, 0.97)
+    # Little data per variant (D_j |xt_j|^2 << 1): the variances sit next to the prior's, and a cavity
+    # P_j = q_j / (1 - D_j q_j) error hides inside a tiny variance error.
+    precision = variant_count / 1e-3 * np.exp(generator.normal(0.0, 1.0, variant_count))
+    blocks = tuple(np.arange(start, start + 100) for start in range(0, variant_count, 100))
+    solve = _solve(columns, precision, _resolved(1.0 / precision, sample_count))
+    covariance = np.linalg.inv(columns.T @ columns + np.diag(precision))
+    variances = np.diag(covariance).copy()
+    prior = 1.0 / precision
+    scale = approximation_scale(solve)
+    # The premise: the injected information error moves block 3's variance trace by under half the tolerance.
+    information_share = np.sum(prior[blocks[3]] - variances[blocks[3]]) / np.sum(variances[blocks[3]])
+    assert 20 * scale * information_share <= 0.5 * scale
+    variances[blocks[3]] = prior[blocks[3]] - (prior[blocks[3]] - variances[blocks[3]]) * (1.0 + 20 * scale)
+    probes = generator.choice([-1.0, 1.0], size=(variant_count, 256))
+    bulk = prior.copy()
+    bulk[solve.resolved] = 0.0
+    kernel_inverse = np.linalg.inv(np.eye(sample_count) + (columns * bulk) @ columns.T)
+    z_resolved = kernel_inverse @ columns[:, solve.resolved]
+    forward = columns @ (bulk[:, None] * probes)
+    coupling = z_resolved.T @ forward
+    back = columns.T @ (kernel_inverse @ forward - z_resolved @ np.linalg.solve(solve.resolved_core, coupling - probes[solve.resolved]))
+    removed = information_products(solve, back)
+    is_bulk = ~np.isin(np.arange(variant_count), solve.resolved)
+    assert np.allclose(removed[is_bulk], (prior[:, None] * probes - covariance @ probes)[is_bulk], rtol=1e-6, atol=1e-12 * np.abs(removed).max())
+    trace = block_trace_certificate(variances, blocks, probes, covariance @ probes, scale)
+    information = block_information_certificate(solve, variances, blocks, probes, removed, scale)
+    assert not trace.violated.any()
+    assert information.violated.tolist() == [False, False, False, True, False, False]
+
+
+def test_information_solve_tolerance_bounds_the_worst_residual():
+    generator = np.random.default_rng(14)
+    sample_count, variant_count = 1500, 600
+    columns = _genotypes(generator, sample_count, variant_count, 0.97)
+    precision = variant_count / 1e-2 * np.exp(generator.normal(0.0, 1.0, variant_count))
+    blocks = tuple(np.arange(start, start + 100) for start in range(0, variant_count, 100))
+    solve = _solve(columns, precision, _resolved(1.0 / precision, sample_count))
+    covariance = np.linalg.inv(columns.T @ columns + np.diag(precision))
+    variances = np.diag(covariance)
+    scale = approximation_scale(solve)
+    norms = np.sum(columns**2, axis=0)
+    relative_residual = information_solve_tolerance(solve, variances, blocks, norms, scale)
+    bulk = 1.0 / precision
+    bulk[solve.resolved] = 0.0
+    kernel = np.eye(sample_count) + (columns * bulk) @ columns.T
+    # The two expectations the bound uses hold exactly: E|Xt D z|^2 = sum D^2 |xt|^2 for Rademacher z.
+    gram = columns.T @ columns
+    assert np.isclose(np.trace(bulk[:, None] * gram * bulk[None, :]), np.sum(bulk**2 * norms), rtol=1e-12)
+    # For every block, the worst residual of the allowed size moves the probe-averaged estimate by at most
+    # half the tolerance, with the probes' realized norms in place of their expectations.
+    probes = generator.choice([-1.0, 1.0], size=(variant_count, 64))
+    forward = columns @ (bulk[:, None] * probes)
+    for members in blocks:
+        information = float(np.sum(bulk[members] - variances[members]))
+        direction = columns[:, members] @ (bulk[members, None] * probes[members])  # a_b per probe
+        worst = np.linalg.solve(kernel, direction)
+        worst *= relative_residual * np.linalg.norm(forward, axis=0) / np.linalg.norm(worst, axis=0)
+        moved = np.sum(direction * np.linalg.solve(kernel, worst), axis=0)
+        realized = np.mean(np.linalg.norm(direction, axis=0) * np.linalg.norm(forward, axis=0))
+        expected = np.sqrt(np.sum(bulk[members] ** 2 * norms[members]) * np.sum(bulk**2 * norms))
+        assert np.mean(np.abs(moved)) <= 0.5 * scale * information * realized / expected
