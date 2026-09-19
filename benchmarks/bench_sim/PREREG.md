@@ -152,3 +152,10 @@ Section 2 is replaced so that the measurement process follows the aou2 imputatio
 GLIMPSE2 drops records that are monomorphic in its reference panel: 32,285 chr22 records, all monomorphic among the 1,036 panel founders. In aou2 the imputed callset's records are exactly the panel's records with allele count ≥ 2 (imputation-4c, process fact). So:
 - **The measured records** are those with panel minor allele count ≥ 2, in both arms. Every method, the harness's variant table, the kernels, oracle_observed and the calibration see only these.
 - **Truths are unchanged.** Causal variants outside the measured set still contribute to the genetic value and to oracle_true, but no method can see them. That is the realistic cost of variants missing from the imputation panel.
+
+## Amendment 7 (2026-09-19, before any submission): group weights from the public 1kGP founder composition
+The cohort's group weights no longer come from any All of Us source. They are derived at build time (cohort.group_weights) as each group's superpopulation share of the 2,590 1kGP founders in the public 3,202-sample ped table: EUR 525, AFR 686, AMR 353, EAS 512, SAS 514, so the EUR, AFR-admixed, AMR-admixed, EAS and SAS groups get weights 525/2590, 686/2590, 353/2590, 512/2590 and 514/2590.
+- The admixed groups keep their non-AoU mean ancestry and admixture times (Bryc et al. 2015; Baharian et al. 2016).
+- The group-weight table in section 1 is superseded.
+- The cohort, annotations, dev and sealed truths, Beagle arm and kernels are rebuilt under these weights in `bench-sim/v7/`, with new commitments in COMMITMENTS.txt. The sealed master seed is unchanged.
+- Results from the earlier cohort, including the GLIMPSE2 calibration tables, are labelled "built under withdrawn weights".

@@ -20,10 +20,6 @@ from sv_pgs.dosage_store import encode_dosage_milli
 FALSE_FAILURE_PROBABILITY = 1e-9
 Z_BOUND = float(norm.isf(FALSE_FAILURE_PROBABILITY / 2))
 EPSILON = float(np.finfo(np.float64).eps)
-# Sharma et al. 2025 (Nat Commun, doi:10.1038/s41467-025-59351-8): mean continental ancestry in All of Us,
-# West Asian folded into EUR and Oceanian dropped, renormalized. Order: AFR, AMR, EAS, EUR, SAS.
-PUBLISHED_MEANS = np.array([19.51, 6.33, 2.57, 66.37 + 1.95, 3.05])
-PUBLISHED_MEANS = PUBLISHED_MEANS / PUBLISHED_MEANS.sum()
 
 
 def test_dosage_codes_match_the_store_encoder() -> None:
@@ -31,18 +27,18 @@ def test_dosage_codes_match_the_store_encoder() -> None:
     assert np.array_equal(measurement.encode_milli(milli), encode_dosage_milli(milli))
 
 
-def test_group_weights_reproduce_the_published_ancestry_means() -> None:
-    weights = np.array([spec[0] for spec in cohort.GROUPS.values()])
-    means = np.array([spec[1] for spec in cohort.GROUPS.values()])
-    implied = weights @ means / weights.sum()
-    # The weights are published to 4 decimals: each rounding moves a mean by at most 0.5e-4 per group.
-    assert np.all(np.abs(implied - PUBLISHED_MEANS) <= 0.5e-4 * len(cohort.GROUPS) + EPSILON)
+def test_group_weights_are_the_founder_composition() -> None:
+    founders = [(f"s{index}", superpop) for index, superpop in enumerate(["AFR"] * 7 + ["AMR"] * 3 + ["EAS"] * 5 + ["EUR"] * 4 + ["SAS"] * 1)]
+    weights = cohort.group_weights(founders)
+    expected = {"EUR": 4, "AFR_admixed": 7, "AMR_admixed": 3, "EAS": 5, "SAS": 1}
+    assert np.allclose(weights, [expected[name] / 20 for name in cohort.GROUPS], rtol=0, atol=len(cohort.GROUPS) * EPSILON)
 
 
 def test_cohort_proportions_average_to_the_group_means() -> None:
     rng = np.random.default_rng(1)
     size = 200_000
-    group, proportions, generations = cohort.draw_cohort(size, rng)
+    weights = np.full(len(cohort.GROUPS), 1.0 / len(cohort.GROUPS))
+    group, proportions, generations = cohort.draw_cohort(size, rng, weights)
     for index, (name, (_, mean, admixture)) in enumerate(cohort.GROUPS.items()):
         members = proportions[group == index]
         assert np.allclose(members.sum(axis=1), 1.0, atol=len(cohort.SUPERPOPS) * EPSILON)

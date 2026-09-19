@@ -23,13 +23,16 @@ from cyvcf2 import VCF
 
 PUBLIC_SEED = 20260919
 SUPERPOPS = ("AFR", "AMR", "EAS", "EUR", "SAS")
+# name: (1kGP superpopulation whose founder share sets the group's weight, mean ancestry over SUPERPOPS,
+# admixture generations or 0). The weights are derived at build time from the public 1kGP founder composition
+# (group_weights). The admixed groups' mean ancestry and admixture time follow Bryc et al. 2015 (AJHG) and
+# Baharian et al. 2016 (PLoS Genet), coarsened.
 GROUPS = {
-    # name: (weight, mean ancestry over SUPERPOPS, admixture generations or 0)
-    "EUR": (0.5935, (0.0, 0.0, 0.0, 1.0, 0.0), 0),
-    "AFR_admixed": (0.2326, (0.80, 0.02, 0.0, 0.18, 0.0), 7),
-    "AMR_admixed": (0.1175, (0.08, 0.50, 0.0, 0.42, 0.0), 13),
-    "EAS": (0.0258, (0.0, 0.0, 1.0, 0.0, 0.0), 0),
-    "SAS": (0.0306, (0.0, 0.0, 0.0, 0.0, 1.0), 0),
+    "EUR": ("EUR", (0.0, 0.0, 0.0, 1.0, 0.0), 0),
+    "AFR_admixed": ("AFR", (0.80, 0.02, 0.0, 0.18, 0.0), 7),
+    "AMR_admixed": ("AMR", (0.08, 0.50, 0.0, 0.42, 0.0), 13),
+    "EAS": ("EAS", (0.0, 0.0, 1.0, 0.0, 0.0), 0),
+    "SAS": ("SAS", (0.0, 0.0, 0.0, 0.0, 1.0), 0),
 }
 DIRICHLET_CONCENTRATION = 20.0
 EFFECTIVE_POPULATION_SIZE = 20_000.0
@@ -133,10 +136,15 @@ def read_region(args: tuple[str, str, int, int, list[str]]) -> dict[str, np.ndar
     }
 
 
-def draw_cohort(size: int, rng: np.random.Generator) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+def group_weights(founders: list[tuple[str, str]]) -> np.ndarray:
+    """Each group's weight: its superpopulation's share of the 1kGP founders (PREREG amendment 7)."""
+    counts = np.array([sum(1 for _, superpop in founders if superpop == GROUPS[name][0]) for name in GROUPS], dtype=np.float64)
+    return counts / counts.sum()
+
+
+def draw_cohort(size: int, rng: np.random.Generator, weights: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     names = list(GROUPS)
-    weights = np.array([GROUPS[name][0] for name in names])
-    group = rng.choice(len(names), size=size, p=weights / weights.sum())
+    group = rng.choice(len(names), size=size, p=weights)
     proportions = np.zeros((size, len(SUPERPOPS)))
     generations = np.zeros(size)
     for index, name in enumerate(names):
@@ -285,7 +293,8 @@ def main() -> None:
     # Cohort draws (public seed): groups, proportions, covariates, split.
     rng = np.random.default_rng(PUBLIC_SEED + int(args.chrom.lstrip("chr")))
     cohort_rng = np.random.default_rng(PUBLIC_SEED)
-    group, proportions, generations = draw_cohort(args.size, cohort_rng)
+    weights = group_weights(founders)
+    group, proportions, generations = draw_cohort(args.size, cohort_rng, weights)
     sex = cohort_rng.integers(0, 2, size=args.size).astype(np.int8)
     age = cohort_rng.uniform(18.0, 80.0, size=args.size)
     batch = cohort_rng.integers(0, 2, size=args.size).astype(np.int8)
@@ -329,7 +338,7 @@ def main() -> None:
     del truth, first_haplotype
     realized /= realized.sum(axis=1, keepdims=True)
     np.savez(
-        out / "samples.npz", group=group, group_names=np.asarray(list(GROUPS)), proportions=proportions,
+        out / "samples.npz", group=group, group_names=np.asarray(list(GROUPS)), group_weights=weights, proportions=proportions,
         realized_proportions=realized, sex=sex, age=age, batch=batch, is_test=is_test,
     )
     print("done", flush=True)
