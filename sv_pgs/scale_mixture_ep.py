@@ -697,10 +697,11 @@ def _maximize_coefficients(
 
     The objective is not concave in log g, so each step maximizes the quadratic model inside a radius
     (More-Sorensen); a trial costs one value-only pass, and the radius follows the ratio of actual to
-    predicted gain (Nocedal and Wright, Algorithm 4.1). It stops when the predicted gain of the step on
-    the Hessian's spectrum magnitudes falls to ``tolerance`` nats (the resolution the caller certifies,
-    and at least the objective's rounding level), or when no step longer than half of double precision
-    raises the objective.
+    predicted gain (Nocedal and Wright, Algorithm 4.1). It stops at a strict maximum, where -H is positive
+    definite and the Newton step's predicted gain is below ``tolerance`` nats (the resolution the caller
+    certifies, and at least the objective's rounding level); a saddle's negative curvature is followed by
+    the trust-region step instead. It also stops when no step longer than half of double precision raises
+    the objective.
     """
     penalty = _penalty_matrix(prior, log_smoothing)
     coefficients = np.array(start, dtype=np.float64, copy=True)
@@ -709,7 +710,8 @@ def _maximize_coefficients(
     radius = float(np.linalg.norm(_ascent_direction(-hessian, gradient)))
     while True:
         rounding = _EPSILON * (objective.magnitude + abs(value))
-        if 0.5 * float(gradient @ _ascent_direction(-hessian, gradient)) <= max(tolerance, rounding):
+        definite = float(np.linalg.eigvalsh(0.5 * (hessian + hessian.T))[-1]) < 0.0
+        if definite and 0.5 * float(gradient @ _ascent_direction(-hessian, gradient)) <= max(tolerance, rounding):
             return coefficients, objective
         if radius <= _HALF_PRECISION * (1.0 + float(np.linalg.norm(coefficients))):
             return coefficients, objective
