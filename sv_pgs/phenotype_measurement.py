@@ -193,6 +193,7 @@ class LevelPosterior:
     occasion_shift: F64Array
     missing_information: F64Array
     admissible_step: F64Array
+    node_count: I64Array
 
 
 def _log_components(residuals: F64Array, levels: F64Array, log_masses: F64Array, variances: F64Array) -> F64Array:
@@ -391,6 +392,7 @@ def level_posterior(
     log_likelihood, level_mean, level_second = np.empty(persons), np.empty(persons), np.empty(persons)
     occasion_precision, occasion_shift = np.empty((persons, occasion_count)), np.empty((persons, occasion_count))
     admissible = np.empty(persons)
+    node_count = np.empty(persons, dtype=np.int64)
     counts, missing = np.zeros(grid_size), np.zeros((grid_size, grid_size))
     # Only the persons whose step is not yet certified are integrated again.
     pending = np.arange(persons)
@@ -408,6 +410,7 @@ def level_posterior(
         done = steps[pending] <= certified
         rows, finished = pending[done], np.flatnonzero(done)
         log_likelihood[rows] = log_totals[finished, 0]
+        node_count[rows] = valid[finished].sum(axis=1)
         weights = np.exp(log_integrand[finished] - _logsumexp(log_integrand[finished], axis=1)[:, None])
         node_levels = levels[finished]
         level_mean[rows] = np.sum(weights * node_levels, axis=1)
@@ -446,6 +449,7 @@ def level_posterior(
         occasion_shift=occasion_shift,
         missing_information=missing,
         admissible_step=admissible,
+        node_count=node_count,
     )
 
 
@@ -588,6 +592,7 @@ class _Model:
         # start of their next E-step (NaN: none yet).
         self.steps = np.full(occasions.person_count, np.nan)
         self.centres = np.full(occasions.person_count, np.nan)
+        self.node_counts = np.zeros(occasions.person_count, dtype=np.int64)
 
     def start(self) -> _State:
         """Least-squares fixed effects, a robust level variance, and the engine's start density on the lattice
@@ -627,7 +632,12 @@ class _Model:
         counts = np.zeros(variances.shape[0])
         missing = np.zeros((variances.shape[0], variances.shape[0]))
         log_likelihood = self.log_jacobian
-        pending = [rows for rows in self.groups]
+        # A piece's arrays are as wide as its widest grid, so persons are pieced by their last node count to within
+        # a factor of 2 (none yet: one piece per occasion count).
+        pending = []
+        for rows in self.groups:
+            size_class = np.floor(np.log2(np.maximum(self.node_counts[occasions.person_index[rows[:, 0]]], 1)))
+            pending += [rows[size_class == value] for value in np.unique(size_class)]
         while pending:
             piece = pending.pop()
             persons = occasions.person_index[piece[:, 0]]
@@ -650,6 +660,7 @@ class _Model:
             missing += posterior.missing_information
             self.steps[persons] = posterior.admissible_step / (1.0 + self.relative_tolerance)
             self.centres[persons] = posterior.level_mean
+            self.node_counts[persons] = posterior.node_count
         return _Expectation(log_likelihood, level_mean, level_second, counts, precision, shift, missing)
 
     def level_step(self, state: _State, expectation: _Expectation) -> _State:
