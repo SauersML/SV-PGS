@@ -73,10 +73,10 @@ Lane speed-floor, 2026-09-19. It covers the whole pipeline for 21 traits × 5 fo
   - Even with TF32 factors (128 s per sweep on an A100, about 75 passes), 40 Stage 1 sweeps cost ~3,000 pass-equivalents, which is more than every Stage 2 pass of the floor (47) put together.
   - The warm start was measured to be in the right basin, but not faster (ep_eb.md §5.2: 7/15/7, 10/13/10, 10/8/17 outer steps).
   - Floor: **0**. Start Stage 2 from the prior, with loose forcing terms in the early outer steps (inexact Newton).
-  - **Measured (§10):** at production signal the outer map has no slow direction, so Stage 1's pass-free outer steps would save at most 1–3 Stage 2 outer steps. Stage 1 is dropped (lead's decision, 2026-09-19).
+  - Stage 1 is dropped (lead's decision, 2026-09-19), provisionally, on this cost argument alone. The outer-convergence measurement first cited for it was withdrawn (§10.1–10.3). The decision is revisited only if the corrected measurement shows production needs more outer steps × passes per step than a Stage 1 sweep costs.
 - **Stage 2 fit.** The first solve costs I₁ = ½√κ ln(‖μ‖/tol) passes.
   - Each later outer step warm-starts from the previous μ and solves only to a forcing tolerance η_o ~ ρ (Eisenstat–Walker; novel-inference §8c), in about ½√κ ln(1/ρ) passes.
-  - With block-Jacobi κ (17–28 iterations measured for a full solve) and N_o = 5 outer steps at ρ ≈ 0.5, P_fit ≈ 26 + 4·4 = **42** [est]. The term scales as log(δ₀/δ\*)/log(1/ρ). The measured accelerated rate at production is 0.03–0.40 (§10), i.e. 1–3 outer steps, so 42 is conservative.
+  - With block-Jacobi κ (17–28 iterations measured for a full solve) and N_o = 5 outer steps at ρ ≈ 0.5, P_fit ≈ 26 + 4·4 = **42** [est]. The term scales as log(δ₀/δ\*)/log(1/ρ). The production outer rate is not yet measured (§10.1–10.3).
 - **Draws.** The draws' right-hand sides need the final sites, but they warm-start through the last outer steps like the mean does (Krylov recycling). So they add about one forcing-level solve, **~5 passes**, instead of a from-zero block-CG.
   - K_d itself should come from the needed accuracy of the predictive variance, and a control variate (below) cuts it.
 - **Scoring.** In-cohort held-out scoring rides the final pass (§1): **0 passes**. Only a new target cohort needs one scoring pass.
@@ -236,7 +236,7 @@ The counting model predicts the raw kernels; the gap is in the path around them.
 - So the per-pass gap on the A40 is **~165×** = 17× (R) × 2× (L) × ~5× (the exact path's overhead over raw GEMM), capped by the codec I/O at the floor.
 
 ### 9.4 What the gap depends on (verify before closing)
-1. **The production outer contraction ρ,** rows 1 and 3: **measured, §10.1–10.3.** There is no slow direction (λ_min ≥ 0.89), the accelerated rate is 0.03–0.40, and Stage 1 is dropped.
+1. **The production outer contraction ρ,** rows 1 and 3: **not yet measured.** The first measurement (§10.1–10.3) was withdrawn: it linearized at the true prior, which is not the fixed point.
 2. **Cut coupling of the real partition,** row 8: **measured, §10.4.** γ = 0.40–0.76, and block-variance cavities are p99 28–58% off, so the variances need cross-block correction.
 3. **The variance reduction of the draw control variate,** row 6.
 4. **GCS staging throughput** on a2-highgpu-8g and a3, row 14.
@@ -248,53 +248,37 @@ The counting model predicts the raw kernels; the gap is in the path around them.
 - So the LD and frequencies are real and the effects simulated: **[semi-real]**.
 - Scripts and raw output are in `/scratch.global/sauer354/svpgs-team/speed-floor/` (`rho_measure.py`, `rho_analyze.py`, `cut_coupling3.py`, and the `*.json` / `curvatures_*.npz` files).
 
-### 10.1 Method for ρ
-- **The map.** The EP-EM outer map has Jacobian J = I − (A + S)⁻¹(B + S) (ep_eb.md §2.2), with A the fixed-cavity curvature and B the total curvature (EP re-solved), both from `tests/ep_eb_reference.py`, at the true prior with EP solved there.
-  - At genome scale x̂ sits at the truth, so this is the production fixed point.
-- **The data.** Four far-apart windows of w contiguous polymorphic variants, in 4–12 independent replicates.
-  - A and B are summed over replicates and scaled by c = 1.7·10⁷/p_pooled.
-  - S is the reference penalty at weights 0.01, 1 and 100 (results below at 1; the others agree within the bootstrap).
-  - Directions where cA + S is not positive (3–9 of 16–51, the data-undetermined mixing directions) are left out; the learned penalty puts them in its null space.
-- **The rates.**
-  - ρ_plain = max|1 − λ| is plain EP-EM (> 1 diverges).
-  - ρ_Krylov = (√κ − 1)/(√κ + 1), with κ = λ_max/λ_min, is Anderson/GMRES acceleration.
-  - Steps to the certificate take log(2K)/(2 log(1/ρ)) at K = 64 (1 nat → 1/(2K) nats).
-- **The signal.** Per-variant signal s = n E[β²]/σ² = h²n/p: production (n = 10⁵, h² = 0.3, p = 1.7·10⁷) is s = 1.8·10⁻³, written "×1". ×10, ×100 and ×1000 correspond to p/n ≈ 17, 1.7 and 0.17.
-- **The control.** With the LD removed (Λ diagonal), A = B to 10⁻¹⁵ in every row (ep_eb.md Theorem 2). So every departure from 1 is LD-driven cavity response.
+### 10.1–10.3 The outer contraction: first measurement WITHDRAWN (2026-09-19)
+An earlier version of this section reported, at production signal:
+- λ(A⁻¹B) in [0.89, 5.4] and "no slow direction";
+- 1–3 accelerated outer steps;
+- plain EP-EM diverging in 7 of 16 configurations.
 
-### 10.2 Results (weights 1; point estimate, 95% bootstrap over replicates)
-| hyperparameters | window w (within-window LD score) | n | signal | λ_min | λ_max | ρ_plain | ρ_Krylov | outer steps (accelerated) |
-|---|---|---|---|---|---|---|---|---|
-| 16 | 100 (4.1) | 4k | ×1 | 1.00 | 1.11 | 0.11 [0.09, 1.3] | 0.03 [0.02, 0.22] | 0.7 |
-| 16 | 100 (4.7) | 50k | ×1 | 1.00 | 1.18 | 0.18 [0.07, 6.0] | 0.04 [0.02, 0.49] | 0.8 |
-| 16 | 200 (6.7) | 4k | ×1 | 1.00 | 1.75 | 0.75 [0.10, 3.2] | 0.14 [0.02, 0.38] | 1.2 |
-| 16 | 400 (8.8) | 50k | ×1 | 0.89 | 2.82 | 1.82 [0.08, 7.5] | 0.28 [0.02, 0.49] | 1.9 |
-| 16 | 800 (13.9) | 50k | ×1 | 1.00 | 1.64 | 0.64 [0.37, 11] | 0.12 [0.08, 0.59] | 1.2 |
-| 16 | 1600 (19.1) | 50k | ×1 | 1.00 | 2.21 | 1.21 [0.30, 77] | 0.20 [0.07, 0.82] | 1.5 |
-| 27 | 100 (5.3) | 50k | ×1 | 0.99 | 1.54 | 0.54 [0.01, 0.54] | 0.11 [0.003, 0.11] | 1.1 |
-| 27 | 200 (6.6) | 50k | ×1 | 0.98 | 1.84 | 0.84 [0.03, 4.1] | 0.16 [0.01, 0.39] | 1.3 |
-| 51 | 100 (5.3) | 50k | ×1 | 0.98 | 1.21 | 0.21 [0.05, 5.0] | 0.05 [0.01, 0.42] | 0.8 |
-| 51 | 200 (6.6) | 50k | ×1 | 1.00 | 5.41 | 4.41 [0.05, 5.3] | 0.40 [0.01, 0.43] | 2.6 |
-| 16 | 100 (4.7) | 50k | ×10 | 0.89 | 5.47 | 4.47 [0.35, 33] | 0.43 [0.11, 0.72] | 2.8 |
-| 16 | 100 (4.8) | 50k | ×100 | 0.86 | 3.61 | 2.61 [0.75, 5.5] | 0.34 [0.16, 0.48] | 2.3 |
-| 16 | 100 (5.4) | 50k | ×1000 | 0.85 | 1.50 | 0.50 [0.27, 3.3] | 0.14 [0.09, 0.44] | 1.2 |
+**Those claims are withdrawn.**
+- **The method.** A (fixed-cavity) and B (total) curvature came from `tests/ep_eb_reference.py` at the true prior, summed over real-LD windows and scaled to p = 1.7·10⁷.
+- **Two errors:**
+  1. **The point was not a fixed point.** It assumed the genome-scale fixed point sits at the true prior. It doesn't. At the true prior the genome-scaled cB + S has **2–9 negative eigenvalues in all 16 configurations** (table below), so the true prior is a saddle of the penalized EP evidence, not its maximizer.
+     - Likely reasons: the maximizer is the pseudo-true point within degree-8 Chebyshev log-densities, not the Chebyshev projection of the truth; and EP-EB is biased.
+  2. **The spectrum was taken on a non-invariant subspace.** It whitened by cA + S and silently dropped the 3–9 directions where cA + S ≤ 0, calling them data-undetermined. They are directions of negative fixed-cavity curvature.
 
-(Rows at n = 4k with ×10–×1000 agree with the n = 50k rows within the bootstrap.)
+**What the full-space computation at the true prior shows** (no directions dropped; weights 1; `rho_full.py`, `rho_full.json`):
 
-### 10.3 What the spectrum says
-1. **No slow direction.** λ_min ≥ 0.77 in every configuration, and 0.89–1.00 at production signal. The EM-type regime (λ_min → 0, ρ = 1 − λ_min ≈ 0.99, ~160 outer steps) that motivated a pass-free Stage 1 does not occur.
-2. **The cavity response adds curvature.** Mostly B ⪰ A, so the fixed-cavity step overshoots. Plain EP-EM is unsafe: λ_max > 2 (divergence) in 7 of the 16 configurations, 3 of the 10 at production signal, and bootstrap draws reach λ_max ≈ 78.
-3. **The outer step must be Newton with B** (quadratic; the reference and speed-ep's closed-form B products), or safeguarded relaxation/Anderson with ω = 2/(λ_min + λ_max). Never plain EP-EM.
-4. **Accelerated,** production certifies in 0.7–2.6 outer steps (point), ≤ 12 at the worst bootstrap upper bound. Each warm-started outer step costs ~4 passes (§3), which a pass-free Stage 1 could at most save. One Stage 1 sweep's variance refresh alone costs 75–600 pass-equivalents (§3).
-5. **Dependence:**
-   - on n at fixed signal (p/n at fixed h²): none within noise;
-   - on signal: rising to ×10–×100, then falling;
-   - on LD extent: ρ_Krylov rises from 0.04 to 0.12–0.28 between LD scores 5 and 9–19, noisily;
-   - on the hyperparameter count (16/27/51): no systematic trend at w = 100, and 0.14/0.16/0.40 at w = 200.
-6. **Limits:**
-   - The windows above reach a within-window LD score of 19; the chromosome mean is 42–49. §10.5 measures the strongest-LD regions.
-   - A few replicates holding a large effect in strong LD dominate B − A, hence the wide intervals.
-   - An EP-EM run at genome-equivalent weights on one window problem could not be done: that window-scale evidence has no maximizer.
+| hyperparameters | window w | n | signal | cA + S negative eigenvalues | cB + S negative eigenvalues | min/max eigenvalue of cB + S | max \|eig J\|, J = I − (cA+S)⁻¹(cB+S) |
+|---|---|---|---|---|---|---|---|
+| 16 | 100 | 4k / 50k | ×1 | 3 / 3 | 3 / 3 | −6.3 / −5.8 | 0.06 / 0.12 |
+| 16 | 100 | 4k / 50k | ×10 | 4 / 4 | 3 / 4 | −0.033 / −0.064 | 1.38 / 1.04 |
+| 16 | 100 | 4k / 50k | ×100 | 4 / 3 | 4 / 3 | −0.018 / −0.023 | 0.98 / 0.51 |
+| 16 | 100 | 4k / 50k | ×1000 | 4 / 2 | 3 / 2 | −0.004 / −0.008 | 1.03 / 0.49 |
+| 16 | 200 / 400 / 800 / 1600 | 4k / 50k | ×1 | 3 | 3 | −0.57 / −0.024 / −2.1 / −1.0 | 0.77 / 0.18 / 0.42 / 0.84 |
+| 27 | 100 / 200 | 50k | ×1 | 5 / 5 | 5 / 5 | −5.5 / −1.2 | 0.53 / 0.12 |
+| 51 | 100 / 200 | 50k | ×1 | 8 / 9 | 8 / 8 | −0.007 / −0.009 | 0.14 / 3.41 |
+
+**What survives:**
+- **The no-LD control:** with Λ diagonal, A = B to 10⁻¹⁵ (ep_eb.md Theorem 2). Under LD, B ≠ A.
+- **Plain EP-EM is ill-posed** wherever cA + S is indefinite: the fixed-cavity M-step is then not a maximization. Here that holds in every configuration, so the outer loop must be Newton with B and a trust region (or |λ| modified Newton). Never plain EP-EM.
+- **Nothing here** establishes the outer rate at the production fixed point.
+
+**The correct measurement (in progress):** maximize the pooled penalized EP evidence c·Σ_windows log Z_EP(x) − ½xᵀSx over one shared x by Newton-B with a trust region. Then take the full-space spectrum of (cA + S)⁻¹(cB + S) at that point, its negative-eigenvalue count, and the implied outer steps for the certified loop and for plain EP-EM, plus the distance from the pooled fixed point to the true prior (the EP-EB bias).
 
 ### 10.4 Cut coupling of the real partition
 **Setup.** 12,000 consecutive polymorphic chr22 variants × 50,000 people.
@@ -327,19 +311,14 @@ What it says:
 - **Pencil:** each source's pooled A and B are scaled to p = 1.7·10⁷ as if the whole genome had that region's LD, a worst case, since these regions are well under 1% of the genome.
 - **Script:** `rho_highld3.py` / `rho_highld2.py`, output `rho_highld_*.json`.
 
-| region | within-window LD score | λ_min [95%] | λ_max [95%] | ρ_Krylov [95%] | cavity-precision error of a 2-block split, median / p99 |
-|---|---|---|---|---|---|
-| MHC | 405, 291, 256 | 1.00 [0.997, 1.00] | 1.83 [1.6, 14] | 0.15 [0.12, 0.59] | 7–11% / 53–75% |
-| chr22 top-LD | 86, 71, 60 | 0.98 [0.50, 1.00] | 2.63 [1.0, 42] | 0.24 [0.01, 0.76] | 0.3–0.9% / 6–52% |
-| 17q21.31 inversion | 234, 94, 87 | −1.52 [−3.9, 0.995] | 1.34 [1.0, 15] | — (indefinite) | 0.05–0.5% / 38–49% |
+The outer-spectrum columns of this table were computed like §10.1–10.3 (at the true prior, on the cA + S > 0 subspace) and are withdrawn. Only the cavity column stands.
+
+| region | within-window LD score | cavity-precision error of a 2-block split, median / p99 |
+|---|---|---|
+| MHC | 405, 291, 256 | 7–11% / 53–75% |
+| chr22 top-LD | 86, 71, 60 | 0.3–0.9% / 6–52% |
+| 17q21.31 inversion | 234, 94, 87 | 0.05–0.5% / 38–49% |
 
 What it says:
-- **At the MHC and the chr22 top-LD windows,** LD scores 5–20× the chromosome mean still leave no slow direction (λ_min 0.98–1.00). The accelerated rate stays at 0.15–0.24.
-- **At 17q21.31 the total curvature is indefinite for one effect draw of twelve.**
-  - Per-draw λ_min runs from −5.4 (one draw, in the second window) through 0.27–0.64 (the highest-LD window, score 234) to 0.97–1.00 elsewhere.
-  - It is not a numerical artifact: the site Jacobian's condition number is 6·10⁶–1.2·10⁸ and the EP residual 10⁻¹³, so B is accurate to ~10⁻⁸.
-  - In near-perfect LD a large effect cannot be localized among its tags, and at the true prior the EP evidence is then locally non-concave.
-  - At genome scale this is a small-region contribution to the pooled curvature, not a genome-wide slow mode.
-  - It confirms that the outer step must handle negative curvature: Newton-B with a trust region, taking |λ| as the reference's modified Newton does. It doesn't favor a Stage 1, which sees the same local curvature.
 - **Block-variance cavities are off by p99 38–75% in these regions,** worse than on typical chr22 LD (§10.4). The cross-block marginals are needed most where LD is strongest.
 
