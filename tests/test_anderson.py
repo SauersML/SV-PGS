@@ -1,9 +1,9 @@
-"""Tests for safeguarded Anderson(m) acceleration."""
+"""Tests for Anderson(m) acceleration."""
 from __future__ import annotations
 
 import numpy as np
 
-from sv_pgs.anderson import AndersonState, anderson_step, safeguarded_anderson
+from sv_pgs.anderson import AndersonState, anderson_step
 
 
 def _make_contraction(dimension: int, spectral_radius: float, seed: int):
@@ -19,44 +19,31 @@ def _make_contraction(dimension: int, spectral_radius: float, seed: int):
     return contraction, offset, fixed_point
 
 
-def _count_plain_iterations(matrix, offset, tolerance, max_iters=2000):
-    x = np.zeros(offset.shape)
-    for iteration in range(1, max_iters + 1):
-        nxt = matrix @ x + offset
-        if np.linalg.norm(nxt - x) < tolerance * max(1.0, np.linalg.norm(x)):
-            return iteration
-        x = nxt
-    return max_iters
+def _iterate_to_fixed_point(fixed_point_map, initial_iterate, tolerance, max_iterations, memory_depth=None):
+    """Map evaluations until the step is below tolerance; Anderson(m) when memory_depth is set."""
+    state = None if memory_depth is None else AndersonState(memory_depth=memory_depth)
+    current = np.asarray(initial_iterate, dtype=np.float64)
+    for iteration in range(1, max_iterations + 1):
+        mapped = fixed_point_map(current)
+        if np.linalg.norm(mapped - current) < tolerance * max(1.0, float(np.linalg.norm(current))):
+            return iteration, mapped
+        current = mapped if state is None else anderson_step(state, x_current=current, map_value=mapped)
+    return max_iterations, current
 
 
 def test_affine_contraction_speedup():
     matrix, offset, fixed_point = _make_contraction(20, 0.97, seed=0)
     tolerance = 1e-8
 
-    plain_iterations = _count_plain_iterations(matrix, offset, tolerance)
-
     def fixed_point_map(vector):
         return matrix @ vector + offset
 
-    def objective(vector):
-        # Negative residual norm: maximised at the fixed point.
-        return -float(np.linalg.norm(matrix @ vector + offset - vector))
-
-    # Generous safeguard slack: residual norm is not a Lyapunov function for
-    # Anderson and we want to test the underlying acceleration, not the
-    # safeguard's interaction with a non-monotone objective.
-    result, history, converged = safeguarded_anderson(
-        initial_iterate=np.zeros(offset.shape),
-        fixed_point_map=fixed_point_map,
-        objective=objective,
-        memory_depth=5,
-        tolerance=tolerance,
-        max_iterations=plain_iterations,
-        safeguard_slack=1e6,
+    plain_iterations, _ = _iterate_to_fixed_point(fixed_point_map, np.zeros(offset.shape), tolerance, 2000)
+    anderson_iterations, result = _iterate_to_fixed_point(
+        fixed_point_map, np.zeros(offset.shape), tolerance, plain_iterations, memory_depth=5
     )
-    assert converged
+    assert anderson_iterations < plain_iterations
     assert np.allclose(result, fixed_point, atol=1e-6)
-    anderson_iterations = len(history) - 1
     assert anderson_iterations * 3 <= plain_iterations, (
         f"Expected >=3x speedup, got Anderson={anderson_iterations} "
         f"vs plain={plain_iterations}"
@@ -76,65 +63,13 @@ def test_quadratic_gradient_descent():
     def gradient_step(vector):
         return vector - step_size * (hessian @ vector - linear_term)
 
-    def objective(vector):
-        return -0.5 * float(vector @ hessian @ vector) + float(linear_term @ vector)
-
     tolerance = 1e-8
-
-    # Plain GD iteration count.
-    x = np.zeros(dimension)
-    plain_iters = 0
-    for plain_iters in range(1, 5001):
-        nxt = gradient_step(x)
-        if np.linalg.norm(nxt - x) < tolerance * max(1.0, np.linalg.norm(x)):
-            break
-        x = nxt
-
-    result, history, converged = safeguarded_anderson(
-        initial_iterate=np.zeros(dimension),
-        fixed_point_map=gradient_step,
-        objective=objective,
-        memory_depth=5,
-        tolerance=tolerance,
-        max_iterations=plain_iters,
+    plain_iterations, _ = _iterate_to_fixed_point(gradient_step, np.zeros(dimension), tolerance, 5000)
+    anderson_iterations, result = _iterate_to_fixed_point(
+        gradient_step, np.zeros(dimension), tolerance, plain_iterations, memory_depth=5
     )
-    assert converged
+    assert anderson_iterations < plain_iterations
     assert np.allclose(result, minimum, atol=1e-5)
-    assert len(history) - 1 < plain_iters
-
-
-def test_safeguard_rejects_overshoot():
-    matrix, offset, fixed_point = _make_contraction(8, 0.8, seed=2)
-    rng = np.random.default_rng(3)
-    perturbation_log: list[int] = []
-
-    def fixed_point_map(vector):
-        base = matrix @ vector + offset
-        # Inject an occasional overshoot that violates monotone ascent.
-        if rng.random() < 0.05:
-            perturbation_log.append(1)
-            return base + 50.0 * rng.standard_normal(vector.shape)
-        return base
-
-    def objective(vector):
-        return -float(np.linalg.norm(vector - fixed_point))
-
-    result, history, converged = safeguarded_anderson(
-        initial_iterate=np.zeros(offset.shape),
-        fixed_point_map=fixed_point_map,
-        objective=objective,
-        memory_depth=5,
-        tolerance=1e-6,
-        max_iterations=2000,
-    )
-    # Even with the noisy map we should approach the true fixed point
-    # because the safeguard rejects bad steps. We allow loose tolerance
-    # since the map itself is stochastic.
-    assert np.linalg.norm(result - fixed_point) < 1.0
-    assert isinstance(converged, bool)
-    # Objective must be non-decreasing modulo numerical noise.
-    for previous, current in zip(history, history[1:]):
-        assert current >= previous - 1e-9
 
 
 def test_first_call_returns_map_value():

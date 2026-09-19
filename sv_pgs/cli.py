@@ -5,7 +5,10 @@ import faulthandler
 import io
 import os
 import platform
+import subprocess
 import sys
+from importlib.metadata import PackageNotFoundError
+from importlib.metadata import version as package_version
 from pathlib import Path
 from typing import Iterable
 
@@ -201,15 +204,17 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def _resolve_version_info() -> tuple[str, str]:
-    try:
-        from importlib.metadata import version as _pkg_version
+    """The installed package version and the source checkout's commit.
 
-        pkg_ver = _pkg_version("sv-pgs")
-    except Exception:
+    Either is "unknown" when it does not exist: a source tree that was never
+    installed has no package metadata, and an installed wheel has no git
+    checkout (or no git on PATH) beside it.
+    """
+    try:
+        pkg_ver = package_version("sv-pgs")
+    except PackageNotFoundError:
         pkg_ver = "unknown"
     try:
-        import subprocess
-
         result = subprocess.run(
             ["git", "rev-parse", "--short", "HEAD"],
             cwd=Path(__file__).parent.parent,
@@ -217,9 +222,9 @@ def _resolve_version_info() -> tuple[str, str]:
             text=True,
             timeout=2.0,
         )
-        git_sha = result.stdout.strip() if result.returncode == 0 and result.stdout.strip() else "unknown"
-    except Exception:
-        git_sha = "unknown"
+    except (OSError, subprocess.TimeoutExpired):
+        return pkg_ver, "unknown"
+    git_sha = result.stdout.strip() if result.returncode == 0 and result.stdout.strip() else "unknown"
     return pkg_ver, git_sha
 
 
