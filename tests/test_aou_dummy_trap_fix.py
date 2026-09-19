@@ -14,7 +14,7 @@ import pytest
 
 from sv_pgs.all_of_us import AllOfUsDiseaseRequest, prepare_all_of_us_disease_sample_table
 from sv_pgs.aou_runner import _expand_one_hot_covariates
-from tests.test_all_of_us import _FakeBigQueryClient, _disease_row
+from tests.test_all_of_us_phenotypes import _FakeBigQueryClient, _disease_row
 
 FEMALE = 45878463
 MALE = 45880669

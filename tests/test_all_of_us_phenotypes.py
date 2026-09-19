@@ -1,26 +1,29 @@
-"""All of Us quantitative traits from the OMOP measurement table.
+"""All of Us phenotypes: the disease panel and the quantitative traits.
 
-Covers the trait catalogue, the BigQuery SQL against the OMOP CDM v5.4 schema,
-the query parameters, the per-person target construction (treatment
-precedence, corrections and indicator pooling, variance components,
-empirical BLUP against the dense Henderson mixed-model solution, inverse
-normal transform), the sample table writer and the runner/CLI wiring.
+Covers the disease and trait catalogues, the BigQuery SQL against the OMOP CDM
+v5.4 schema and its parameters, the disease case and control rules with the
+age-of-onset liability target, the per-person quantitative target
+(treatment precedence and corrections, variance components, the empirical
+BLUP against the dense Henderson mixed-model solution), the sample-table and
+census writers, and the CLI commands that prepare them.
 """
 from __future__ import annotations
 
 import csv
 import dataclasses
+import datetime
 import json
 import math
 import re
 from pathlib import Path
+from typing import cast
 
 import numpy as np
 import pytest
 from google.cloud import bigquery
 from scipy.special import ndtri
+from scipy.stats import norm, truncnorm
 
-import sv_pgs.aou_runner as aou_runner
 from sv_pgs.all_of_us import (
     DIABETES,
     DISEASE_DEFINITIONS,
@@ -28,6 +31,7 @@ from sv_pgs.all_of_us import (
     MEASUREMENT_DEFINITIONS,
     MEASUREMENT_EXCLUSION_REASONS,
     UNBOUNDED_WINDOW_DAYS,
+    AllOfUsDiseaseRequest,
     ClinicalWindow,
     DiseaseDefinition,
     MeasurementDefinition,
@@ -36,19 +40,29 @@ from sv_pgs.all_of_us import (
     UnitConversion,
     WindowConcept,
     _estimate_person_variance_components,
+    _liability_targets,
     _person_blup,
     _person_design,
+    _prepare_training_rows,
     _rank_inverse_normal,
+    available_disease_names,
     available_measurement_names,
+    build_all_of_us_disease_query_config,
+    build_all_of_us_disease_query_parameters,
+    build_all_of_us_disease_sql,
     build_all_of_us_measurement_query_config,
     build_all_of_us_measurement_query_parameters,
     build_all_of_us_measurement_sql,
     build_all_of_us_measurement_targets,
+    disease_covariate_columns,
     measurement_covariate_columns,
     phenotype_fingerprint,
+    prepare_all_of_us_disease_sample_table,
     prepare_all_of_us_measurement_census,
     prepare_all_of_us_measurement_sample_table,
     resolve_all_of_us_phenotype,
+    resolve_disease_definition,
+    resolve_lab_criterion_measurement,
     resolve_measurement_definition,
 )
 from sv_pgs.cli import main
@@ -124,6 +138,11 @@ OMOP_CDM_V54_COLUMNS: dict[str, set[str]] = {
 DATASET = "aou_workspace.cdr_dataset"
 
 
+@pytest.fixture(autouse=True)
+def _workspace_cdr(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("WORKSPACE_CDR", DATASET)
+
+
 class _FakeQueryJob:
     def __init__(self, rows: list[dict[str, object]]) -> None:
         self._rows = rows
@@ -151,6 +170,51 @@ class _FakeBigQueryClient:
         self.sql = sql
         self.job_config = job_config
         return _FakeQueryJob(self.rows)
+
+
+def _read_tsv_rows(path: Path) -> list[dict[str, str]]:
+    with path.open(encoding="utf-8", newline="") as handle:
+        return list(csv.DictReader(handle, delimiter="\t"))
+
+
+def _disease_row(
+    person_id: int,
+    *,
+    occurrence_count: int,
+    sex_at_birth_concept_id: int = 45878463,
+    pre_landmark_condition_dates: int = 12,
+    control_exclusion: bool = False,
+    ambiguous: bool = False,
+    case_medication_dates: int = 0,
+    control_exclusion_medication: bool = False,
+    case_procedure_dates: int = 0,
+) -> dict[str, object]:
+    """One row shaped like the disease query output."""
+    return {
+        "sample_id": str(person_id),
+        "person_id": str(person_id),
+        "phenotype_occurrence_count": occurrence_count,
+        "first_condition_date": "2020-01-01" if occurrence_count else None,
+        "observation_start_date": "2015-01-01",
+        "observation_end_date": "2024-01-01",
+        "primary_consent_date": "2018-06-01",
+        "year_of_birth": 1975,
+        "age_at_first_condition": 40.0 + person_id % 30 if occurrence_count else None,
+        "age_at_first_case_procedure": 50.0 if case_procedure_dates else None,
+        "age_at_observation_end": 45.0 + person_id % 30,
+        "pre_landmark_condition_dates": pre_landmark_condition_dates,
+        "has_control_exclusion_code": control_exclusion,
+        "has_ambiguous_code": ambiguous,
+        "case_medication_dates": case_medication_dates,
+        "has_control_exclusion_medication": control_exclusion_medication,
+        "case_procedure_dates": case_procedure_dates,
+        "sex_at_birth_concept_id": sex_at_birth_concept_id,
+        "sex_at_birth_name": {45878463: "female", 45880669: "male"}.get(sex_at_birth_concept_id),
+    }
+
+
+def _lab_row(count: int, first: str, last: str) -> dict[str, object]:
+    return {"qualifying_occasion_count": count, "first_qualifying_date": first, "last_qualifying_date": last}
 
 
 def _person_row(
@@ -260,7 +324,399 @@ def _captured_person_statistics(monkeypatch, definition: MeasurementDefinition, 
 
 
 # ---------------------------------------------------------------------------
-# Catalogue
+# Diseases
+# ---------------------------------------------------------------------------
+
+
+def test_build_all_of_us_disease_sql_uses_workspace_cdr_and_snomed_concept_ancestor(monkeypatch):
+    monkeypatch.setenv("WORKSPACE_CDR", "aou_workspace.cdr_dataset")
+    disease_definition = resolve_disease_definition("atrial_fibrillation")
+    sql = build_all_of_us_disease_sql(disease_definition)
+    query_config = build_all_of_us_disease_query_config(disease_definition)
+
+    assert "`aou_workspace.cdr_dataset.condition_occurrence`" in sql
+    assert "`aou_workspace.cdr_dataset.observation_period`" in sql
+    assert "`aou_workspace.cdr_dataset.person`" in sql
+    assert "condition_concept_id" in sql
+    assert "vocabulary_id = 'SNOMED'" in sql
+    assert "standard_concept = 'S'" in sql
+    assert "FROM `aou_workspace.cdr_dataset.concept`" in sql
+    assert "`aou_workspace.cdr_dataset.concept_ancestor`" in sql
+    assert "JOIN `aou_workspace.cdr_dataset.observation` AS observation" in sql
+    assert "concept_code IN UNNEST(@case_snomed_codes)" in sql
+    assert "primary_consent_date" in sql
+    # A case needs MIN_DISEASE_OCCURRENCES distinct diagnosis dates, not rows.
+    assert (
+        "DISTINCT IF(disease_concepts.concept_id IS NOT NULL, condition_occurrence.condition_start_date, NULL)"
+    ) in sql
+    assert "COUNT(*) AS phenotype_occurrence_count" not in sql
+    # The SNOMED codes must NOT be string-interpolated into the SQL itself.
+    assert all(code not in sql for code in disease_definition.case_snomed_codes)
+    parameter_values = {parameter.name: parameter for parameter in query_config.query_parameters}
+    assert parameter_values["case_snomed_codes"].values == ["49436004", "5370000"]
+
+
+def test_prepare_all_of_us_disease_sample_table_writes_outputs(tmp_path: Path, monkeypatch):
+    monkeypatch.setenv("GOOGLE_PROJECT", "billing-project")
+    monkeypatch.setenv("WORKSPACE_CDR", "aou_workspace.cdr_dataset")
+    fake_client = _FakeBigQueryClient(
+        rows=[
+            _disease_row(101, occurrence_count=3, sex_at_birth_concept_id=45880669),
+            _disease_row(102, occurrence_count=0, sex_at_birth_concept_id=45880669),
+            _disease_row(103, occurrence_count=1, sex_at_birth_concept_id=45878463),
+        ]
+    )
+
+    output_path = tmp_path / "atrial_fibrillation.tsv"
+    outputs = prepare_all_of_us_disease_sample_table(
+        request=AllOfUsDiseaseRequest(
+            disease="atrial_fibrillation",
+        ),
+        output_path=output_path,
+        client=fake_client,
+    )
+
+    assert outputs.sample_table_path.is_file()
+    assert outputs.sql_path.is_file()
+    assert outputs.metadata_path.is_file()
+    assert fake_client.sql is not None
+    assert "atrial_fibrillation" not in fake_client.sql
+    assert fake_client.job_config is not None
+    parameter_values = {parameter.name: parameter for parameter in fake_client.job_config.query_parameters}
+    assert parameter_values["case_snomed_codes"].values == ["49436004", "5370000"]
+
+    rows = _read_tsv_rows(output_path)
+    assert rows[0]["sample_id"] == "101"
+    assert rows[0]["person_id"] == "101"
+    assert rows[0]["target"] == "1"
+    assert rows[1]["sample_id"] == "102"
+    assert float(rows[0]["liability_target"]) > 0.0 > float(rows[1]["liability_target"])
+    assert rows[0]["sex_at_birth_concept_id_45880669"] == "1"
+    metadata_payload = json.loads(outputs.metadata_path.read_text(encoding="utf-8"))
+    assert metadata_payload["row_count"] == 2
+    assert metadata_payload["n_excluded_one_date"] == 1
+    assert metadata_payload["covariate_columns"] == list(disease_covariate_columns())
+    assert metadata_payload["phenotype_fingerprint"] == phenotype_fingerprint(resolve_disease_definition("afib"))
+    assert metadata_payload["disease"] == "atrial_fibrillation"
+    assert metadata_payload["case_snomed_codes"] == ["49436004", "5370000"]
+    assert metadata_payload["case_medication"]["atc_codes"] == ["C01B", "C01AA"]
+    assert metadata_payload["lab_criteria"] == []
+    assert "icd10_prefixes" not in metadata_payload
+    assert "icd9_prefixes" not in metadata_payload
+    assert metadata_payload["min_occurrences"] == 2
+    assert metadata_payload["cdr_dataset"] == "aou_workspace.cdr_dataset"
+
+
+def test_liability_target_matches_the_age_of_onset_threshold_model():
+    # One stratum: cases diagnosed at 50 and 60, controls censored at 55, 65, 70.
+    # Kaplan-Meier: S(50) = 4/5, S(60) = 4/5 * 2/3.
+    targets = np.array([1.0, 0.0, 1.0, 0.0, 0.0])
+    ages = np.array([50.0, 55.0, 60.0, 65.0, 70.0])
+    liabilities = _liability_targets(targets, ages, ["female"] * 5)
+    survival_50, survival_60 = 0.8, 0.8 * 2.0 / 3.0
+    expected = [
+        norm.ppf((1.0 + survival_50) / 2.0),
+        truncnorm(-np.inf, norm.ppf(survival_50)).mean(),
+        norm.ppf((survival_50 + survival_60) / 2.0),
+        truncnorm(-np.inf, norm.ppf(survival_60)).mean(),
+        truncnorm(-np.inf, norm.ppf(survival_60)).mean(),
+    ]
+    np.testing.assert_allclose(liabilities, expected, rtol=1e-12)
+    # Earlier onset means higher liability; every control sits below zero.
+    assert liabilities[0] > liabilities[2] > 0.0 > liabilities[1] > liabilities[3]
+
+
+def test_liability_target_uses_sex_specific_incidence_and_pools_unknown_sex():
+    targets = np.array([1.0, 0.0, 0.0, 0.0, 1.0, 0.0])
+    ages = np.array([50.0, 60.0, 60.0, 60.0, 70.0, 60.0])
+    sexes = ["female", "female", "male", "male", "male", None]
+    liabilities = _liability_targets(targets, ages, sexes)
+    # Female curve: S(50) = 1/2, so the female case sits at norm.ppf(3/4).
+    assert liabilities[0] == pytest.approx(norm.ppf(0.75))
+    # No male event by 60: the male controls' threshold is +inf and their mean 0.
+    assert liabilities[2] == liabilities[3] == 0.0
+    # The unknown-sex control uses the pooled curve: S(60) = 5/6 after the
+    # event at 50 among six people.
+    assert liabilities[5] == pytest.approx(truncnorm(-np.inf, norm.ppf(5.0 / 6.0)).mean())
+
+
+def test_the_disease_panel_is_the_ten_mixed_panel_diseases():
+    assert available_disease_names() == sorted([
+        "type2_diabetes", "atrial_fibrillation", "hypothyroidism", "copd", "depression", "gout", "cataract",
+        "chronic_kidney_disease", "psoriasis", "prostate_cancer",
+    ])
+
+
+def test_panel_diseases_parameterize_their_case_and_control_rules():
+    type2_diabetes = build_all_of_us_disease_query_parameters(resolve_disease_definition("t2d"))
+    assert type2_diabetes["ambiguous_snomed_codes"] == ("STRING", ["46635009"])
+    assert type2_diabetes["control_exclusion_snomed_codes"] == ("STRING", ["73211009", "11687002"])
+    # Case support leaves metformin (A10BA) out; control exclusion takes all of A10.
+    assert "A10BA" not in type2_diabetes["case_medication_atc_codes"][1]
+    assert type2_diabetes["control_exclusion_medication_atc_codes"] == ("STRING", ["A10"])
+    hypothyroidism = resolve_disease_definition("hypothyroidism")
+    assert hypothyroidism.case_medication_minimum_dates == 2
+    cataract = build_all_of_us_disease_query_parameters(resolve_disease_definition("cataract"))
+    assert cataract["case_procedure_snomed_codes"] == ("STRING", ["54885007"])
+    kidney = resolve_disease_definition("ckd")
+    assert [(criterion.measurement, criterion.qualifies_at_or_above, criterion.threshold, criterion.minimum_span_days)
+            for criterion in kidney.lab_criteria] == [
+        ("egfr_ckd_epi_2021", False, 60.0, 90),
+        ("urine_albumin_creatinine_ratio", True, 30.0, 90),
+    ]
+    prostate = resolve_disease_definition("prostate_cancer")
+    assert prostate.required_sex == "male" and prostate.minimum_control_age_years == 50.0
+    assert resolve_disease_definition("copd").minimum_case_age_years == 40.0
+
+
+def test_every_lab_criterion_reads_a_known_measurement():
+    for definition in (resolve_disease_definition(name) for name in available_disease_names()):
+        for criterion in definition.lab_criteria:
+            assert resolve_lab_criterion_measurement(criterion).canonical_name == criterion.measurement
+
+
+
+def test_kidney_disease_cases_come_from_repeated_labs_or_staged_codes():
+    kidney = resolve_disease_definition("chronic_kidney_disease")
+    rows = [
+        _disease_row(201, occurrence_count=0),  # eGFR < 60 twice, 120 days apart: case
+        _disease_row(202, occurrence_count=0),  # eGFR < 60 twice, 30 days apart: neither
+        _disease_row(203, occurrence_count=0),  # albuminuria twice, 200 days apart: case
+        _disease_row(204, occurrence_count=2),  # two stage 3-5 diagnosis dates: case
+        _disease_row(205, occurrence_count=0),  # nothing: control
+        _disease_row(206, occurrence_count=0, control_exclusion=True),  # unstaged CKD code: neither
+    ]
+    egfr = {"201": _lab_row(3, "2019-01-01", "2019-05-01"), "202": _lab_row(2, "2019-01-01", "2019-01-31")}
+    albuminuria = {"203": _lab_row(2, "2021-03-01", "2021-09-17")}
+
+    training_rows, _columns, counts = _prepare_training_rows(kidney, rows, [egfr, albuminuria])
+
+    by_person = {row["person_id"]: row for row in training_rows}
+    assert {person: row["target"] for person, row in by_person.items()} == {"201": 1, "203": 1, "204": 1, "205": 0}
+    # A lab case's onset is its first qualifying occasion (mid-year 1975 birthday).
+    assert by_person["201"]["age_at_onset"] == pytest.approx(
+        (datetime.date(2019, 1, 1) - datetime.date(1975, 7, 1)).days / 365.25
+    )
+    assert counts["n_cases_by_lab"] == 2 and counts["n_cases_by_diagnosis"] == 1
+    assert counts["n_excluded_lab_evidence"] == 1 and counts["n_excluded_control_exclusion"] == 1
+
+
+def test_case_support_medication_procedures_sex_and_age_rules():
+    hypothyroidism = resolve_disease_definition("hypothyroidism")
+    rows = [
+        _disease_row(301, occurrence_count=1, case_medication_dates=2),  # one code + two levothyroxine dates
+        _disease_row(302, occurrence_count=1, case_medication_dates=1),  # one levothyroxine date: neither
+        _disease_row(303, occurrence_count=0, control_exclusion_medication=True),  # thyroid drug, no code
+        _disease_row(304, occurrence_count=0),
+    ]
+    training_rows, _columns, counts = _prepare_training_rows(hypothyroidism, rows, [])
+    assert [(row["person_id"], row["target"]) for row in training_rows] == [("301", 1), ("304", 0)]
+    assert counts["n_excluded_one_date"] == 1 and counts["n_excluded_control_exclusion"] == 1
+
+    cataract = resolve_disease_definition("cataract")
+    procedure_only = [_disease_row(401, occurrence_count=0, case_procedure_dates=1), _disease_row(402, occurrence_count=0)]
+    training_rows, _columns, counts = _prepare_training_rows(cataract, procedure_only, [])
+    assert [(row["person_id"], row["target"], row["age_at_onset"]) for row in training_rows] == [
+        ("401", 1, 50.0), ("402", 0, None)
+    ]
+    assert counts["n_cases_by_procedure"] == 1
+
+    prostate = resolve_disease_definition("prostate_cancer")
+    men_and_women = [
+        _disease_row(501, occurrence_count=2, sex_at_birth_concept_id=45880669),
+        _disease_row(502, occurrence_count=2, sex_at_birth_concept_id=45878463),
+        # Controls must be men aged 50 or more: 45 + 503 % 30 = 58, 45 + 480 % 30 = 45.
+        _disease_row(503, occurrence_count=0, sex_at_birth_concept_id=45880669),
+        _disease_row(480, occurrence_count=0, sex_at_birth_concept_id=45880669),
+    ]
+    training_rows, _columns, counts = _prepare_training_rows(prostate, men_and_women, [])
+    assert [(row["person_id"], row["target"]) for row in training_rows] == [("501", 1), ("503", 0)]
+    assert counts["n_excluded_sex"] == 1 and counts["n_excluded_age"] == 1
+
+    copd = resolve_disease_definition("copd")
+    # First COPD diagnosis at 40 + 481 % 30 = 41 counts; one at 39 does not.
+    early_onset = dict(_disease_row(482, occurrence_count=2), age_at_first_condition=39.0)
+    training_rows, _columns, counts = _prepare_training_rows(copd, [_disease_row(481, occurrence_count=2), early_onset], [])
+    assert [row["person_id"] for row in training_rows] == ["481"]
+    assert counts["n_excluded_age"] == 1
+
+
+def test_lab_evidence_must_cover_every_criterion():
+    with pytest.raises(ValueError, match="one person table per lab criterion"):
+        _prepare_training_rows(resolve_disease_definition("ckd"), [_disease_row(1, occurrence_count=0)], [])
+
+
+def test_sparse_early_ehr_excludes_cases_and_controls_alike(monkeypatch, tmp_path: Path):
+    monkeypatch.setenv("GOOGLE_PROJECT", "billing-project")
+    rows = [
+        _disease_row(101, occurrence_count=3),
+        _disease_row(102, occurrence_count=3, pre_landmark_condition_dates=4),
+        _disease_row(103, occurrence_count=0),
+        _disease_row(104, occurrence_count=0, pre_landmark_condition_dates=4),
+    ]
+    outputs = prepare_all_of_us_disease_sample_table(
+        request=AllOfUsDiseaseRequest(disease="gout"),
+        output_path=tmp_path / "gout.tsv",
+        client=_FakeBigQueryClient(rows),
+    )
+    assert [row["person_id"] for row in _read_tsv_rows(outputs.sample_table_path)] == ["101", "103"]
+    metadata = json.loads(outputs.metadata_path.read_text(encoding="utf-8"))
+    assert metadata["n_excluded_sparse_ehr"] == 2
+    assert metadata["min_pre_landmark_condition_dates"] == 5
+
+
+def test_prepare_all_of_us_disease_requires_all_of_us_env(monkeypatch, tmp_path: Path):
+    monkeypatch.delenv("GOOGLE_PROJECT", raising=False)
+    monkeypatch.delenv("WORKSPACE_CDR", raising=False)
+
+    with pytest.raises(ValueError, match="GOOGLE_PROJECT"):
+        prepare_all_of_us_disease_sample_table(
+            request=AllOfUsDiseaseRequest(disease="gout"),
+            output_path=tmp_path / "out.tsv",
+        )
+
+
+def test_prepare_all_of_us_disease_requires_workspace_cdr_env(monkeypatch, tmp_path: Path):
+    monkeypatch.setenv("GOOGLE_PROJECT", "billing-project")
+    monkeypatch.delenv("WORKSPACE_CDR", raising=False)
+    fake_client = _FakeBigQueryClient(
+        rows=[_disease_row(101, occurrence_count=2), _disease_row(102, occurrence_count=0)]
+    )
+
+    with pytest.raises(ValueError, match="WORKSPACE_CDR"):
+        prepare_all_of_us_disease_sample_table(
+            request=AllOfUsDiseaseRequest(disease="atrial fibrillation"),
+            output_path=tmp_path / "atrial_fibrillation.tsv",
+            client=fake_client,
+        )
+
+
+def test_prepare_all_of_us_disease_uses_client_project_without_google_project_env(monkeypatch, tmp_path: Path):
+    monkeypatch.delenv("GOOGLE_PROJECT", raising=False)
+    monkeypatch.setenv("WORKSPACE_CDR", "aou_workspace.cdr_dataset")
+    fake_client = _FakeBigQueryClient(
+        rows=[_disease_row(101, occurrence_count=2), _disease_row(102, occurrence_count=0)],
+        project="client-project",
+    )
+
+    outputs = prepare_all_of_us_disease_sample_table(
+        request=AllOfUsDiseaseRequest(disease="atrial_fibrillation"),
+        output_path=tmp_path / "atrial_fibrillation.tsv",
+        client=fake_client,
+    )
+
+    metadata_payload = json.loads(outputs.metadata_path.read_text(encoding="utf-8"))
+    assert metadata_payload["billing_project"] == "client-project"
+
+
+def test_prepare_all_of_us_disease_uses_workspace_cdr_from_env_in_query_and_metadata(monkeypatch, tmp_path: Path):
+    monkeypatch.setenv("GOOGLE_PROJECT", "billing-project")
+    monkeypatch.setenv("WORKSPACE_CDR", "fc-aou-cdr-prod-ct.C2024Q3R9")
+    fake_client = _FakeBigQueryClient(
+        rows=[_disease_row(101, occurrence_count=2), _disease_row(102, occurrence_count=0)]
+    )
+
+    outputs = prepare_all_of_us_disease_sample_table(
+        request=AllOfUsDiseaseRequest(disease="atrial_fibrillation"),
+        output_path=tmp_path / "atrial_fibrillation.tsv",
+        client=fake_client,
+    )
+
+    assert fake_client.sql is not None
+    assert "fc-aou-cdr-prod-ct.C2024Q3R9" in fake_client.sql
+    metadata_payload = json.loads(outputs.metadata_path.read_text(encoding="utf-8"))
+    assert metadata_payload["cdr_dataset"] == "fc-aou-cdr-prod-ct.C2024Q3R9"
+
+
+def test_cli_prepare_all_of_us_disease_wires_request_and_outputs(monkeypatch, tmp_path: Path):
+    calls: dict[str, object] = {}
+
+    def fake_prepare(request, output_path, **kwargs):
+        calls["request"] = request
+        calls["output_path"] = output_path
+        calls["kwargs"] = kwargs
+        output_file = Path(output_path)
+        output_file.write_text("sample_id\tperson_id\ttarget\n", encoding="utf-8")
+        sql_path = output_file.with_suffix(output_file.suffix + ".sql")
+        sql_path.write_text("SELECT 1\n", encoding="utf-8")
+        metadata_path = output_file.with_suffix(output_file.suffix + ".metadata.json")
+        metadata_path.write_text("{}", encoding="utf-8")
+        return type(
+            "Prepared",
+            (),
+            {
+                "sample_table_path": output_file,
+                "sql_path": sql_path,
+                "metadata_path": metadata_path,
+            },
+        )()
+
+    monkeypatch.setattr("sv_pgs.cli.prepare_all_of_us_disease_sample_table", fake_prepare)
+    output_path = tmp_path / "prepared.tsv"
+    exit_code = main(
+        [
+            "prepare-all-of-us-disease",
+            "--disease",
+            "copd",
+            "--output",
+            str(output_path),
+        ]
+    )
+
+    assert exit_code == 0
+    assert calls["output_path"] == output_path
+    request = cast(AllOfUsDiseaseRequest, calls["request"])
+    assert request.disease == "copd"
+
+
+def test_cli_prepare_all_of_us_disease_accepts_aliases(monkeypatch, tmp_path: Path):
+    calls: dict[str, object] = {}
+
+    def fake_prepare(request, output_path, **kwargs):
+        calls["request"] = request
+        output_file = Path(output_path)
+        output_file.write_text("sample_id\tperson_id\ttarget\n", encoding="utf-8")
+        sql_path = output_file.with_suffix(output_file.suffix + ".sql")
+        sql_path.write_text("SELECT 1\n", encoding="utf-8")
+        metadata_path = output_file.with_suffix(output_file.suffix + ".metadata.json")
+        metadata_path.write_text("{}", encoding="utf-8")
+        return type(
+            "Prepared",
+            (),
+            {
+                "sample_table_path": output_file,
+                "sql_path": sql_path,
+                "metadata_path": metadata_path,
+            },
+        )()
+
+    monkeypatch.setattr("sv_pgs.cli.prepare_all_of_us_disease_sample_table", fake_prepare)
+    exit_code = main(
+        [
+            "prepare-all-of-us-disease",
+            "--disease",
+            "atrial fibrillation",
+            "--output",
+            str(tmp_path / "prepared.tsv"),
+        ]
+    )
+
+    assert exit_code == 0
+    request = cast(AllOfUsDiseaseRequest, calls["request"])
+    assert request.disease == "atrial fibrillation"
+
+
+def test_cli_lists_available_all_of_us_diseases(capsys):
+    exit_code = main(["list-all-of-us-diseases"])
+    assert exit_code == 0
+    printed = capsys.readouterr().out.strip().splitlines()
+    assert "atrial_fibrillation" in printed
+    assert "type2_diabetes" in printed
+    assert printed == sorted(available_disease_names())
+
+
+# ---------------------------------------------------------------------------
+# Quantitative traits: catalogue
 # ---------------------------------------------------------------------------
 
 
@@ -714,7 +1170,7 @@ def test_training_rows_carry_targets_covariates_and_one_hot_sex():
 
 
 # ---------------------------------------------------------------------------
-# Sample table, runner and CLI
+# Sample tables, census and CLI
 # ---------------------------------------------------------------------------
 
 
@@ -772,162 +1228,6 @@ def test_phenotype_fingerprint_changes_with_the_definition_and_the_cdr(monkeypat
     assert fingerprint != phenotype_fingerprint(height)
 
 
-def test_expand_one_hot_covariates_handles_a_trait_covariate_list(tmp_path: Path):
-    table = tmp_path / "trait.samples.with_pcs.tsv"
-    table.write_text(
-        "sample_id\ttarget\tage_at_measurement\tage_at_measurement_squared\tage_at_measurement_x_female"
-        "\tlog_occasion_count\tsex_at_birth_concept_id_1\tsex_at_birth_concept_id_2\n"
-        "a\t1.0\t50\t2504\t50\t0.7\t1\t0\n"
-        "b\t2.0\t60\t3604\t60\t1.1\t1\t0\n"
-        "c\t3.0\t40\t1604\t0\t0\t0\t1\n",
-        encoding="utf-8",
-    )
-    covariates = list(measurement_covariate_columns())
-    expanded = aou_runner._expand_one_hot_covariates(covariates, table)
-    assert expanded == [
-        "age_at_measurement",
-        "age_at_measurement_squared",
-        "age_at_measurement_x_female",
-        "sex_at_birth_concept_id_2",
-        "log_occasion_count",
-    ]
-
-
-def test_run_all_of_us_prepares_a_trait_table_and_uses_its_covariates(monkeypatch, tmp_path: Path):
-    class _Dataset:
-        def __init__(self) -> None:
-            self.targets = np.array([0.1, 1.3, 2.2], dtype=np.float32)
-            self.variant_stats = None
-            self.variant_records: list = []
-            self.variant_stats_minimum_scale: float | None = None
-
-    monkeypatch.setenv("WORKSPACE_CDR", DATASET)
-    monkeypatch.setattr(aou_runner, "check_aou_preflight", _successful_preflight)
-    monkeypatch.setattr("sv_pgs.genotype.require_gpu", lambda: None)
-    mcv = resolve_measurement_definition("mcv")
-    prepared: list[tuple[str, Path]] = []
-    loaded_covariates: list[list[str]] = []
-    trait_types: list[object] = []
-
-    def fake_prepare_measurement(trait, output_path, **kwargs):
-        prepared.append((trait, Path(output_path)))
-        Path(output_path).write_text("sample_id\n", encoding="utf-8")
-        Path(str(output_path) + ".metadata.json").write_text(
-            json.dumps(
-                {
-                    "phenotype_fingerprint": phenotype_fingerprint(mcv),
-                    "covariate_columns": list(measurement_covariate_columns()),
-                }
-            ),
-            encoding="utf-8",
-        )
-
-    def fake_merge(sample_table_path, ancestry_path, output_path, n_pcs):
-        Path(output_path).write_text(
-            "sample_id\tperson_id\ttarget\tage_at_measurement\tage_at_measurement_squared"
-            "\tage_at_measurement_x_female\tlog_occasion_count\tsex_at_birth_concept_id_1"
-            "\tsex_at_birth_concept_id_2\tPC1\n"
-            "1\t1\t0.1\t50\t2504\t50\t0\t1\t0\t0.1\n"
-            "2\t2\t1.3\t60\t3604\t60\t0.7\t1\t0\t0.2\n"
-            "3\t3\t2.2\t40\t1604\t0\t1.1\t0\t1\t0.3\n",
-            encoding="utf-8",
-        )
-        return output_path, ["PC1"]
-
-    def fake_load(**kwargs):
-        loaded_covariates.append(list(kwargs["covariate_columns"]))
-        return _Dataset()
-
-    def fake_pipeline(**kwargs):
-        trait_types.append(kwargs["config"].trait_type)
-
-    monkeypatch.setattr(aou_runner, "prepare_all_of_us_measurement_sample_table", fake_prepare_measurement)
-    monkeypatch.setattr(
-        aou_runner,
-        "prepare_all_of_us_disease_sample_table",
-        lambda **kwargs: (_ for _ in ()).throw(AssertionError("disease preparation must not run")),
-    )
-    monkeypatch.setattr(aou_runner, "download_ancestry_preds", lambda work_dir: tmp_path / "ancestry.tsv")
-    monkeypatch.setattr(aou_runner, "merge_pcs_into_sample_table", fake_merge)
-    monkeypatch.setattr(aou_runner, "download_array_plink", lambda work_dir: tmp_path / "arrays.bed")
-    monkeypatch.setattr(aou_runner, "load_multi_source_dataset_from_files", fake_load)
-    monkeypatch.setattr(aou_runner, "run_training_pipeline", fake_pipeline)
-    monkeypatch.setattr(aou_runner, "release_process_memory", lambda: None)
-
-    aou_runner.run_all_of_us(
-        phenotype="mean_corpuscular_volume",
-        chromosomes=[22],
-        output_base=str(tmp_path / "mcv_results"),
-        variants="snp",
-    )
-    # A second run reuses the current table instead of preparing it again.
-    aou_runner.run_all_of_us(
-        phenotype="mean_corpuscular_volume",
-        chromosomes=[22],
-        output_base=str(tmp_path / "mcv_results"),
-        variants="snp",
-    )
-
-    assert prepared == [
-        ("mean_corpuscular_volume", tmp_path / "mcv_results" / "mean_corpuscular_volume.samples.tsv")
-    ]
-    expected_covariates = [
-        "age_at_measurement", "age_at_measurement_squared", "age_at_measurement_x_female",
-        "sex_at_birth_concept_id_2", "log_occasion_count", "PC1",
-    ]
-    assert loaded_covariates[:2] == [expected_covariates, expected_covariates]
-    assert trait_types[0] == aou_runner.TraitType.QUANTITATIVE
-    run_metadata = json.loads(aou_runner._aou_run_metadata_path(tmp_path / "mcv_results").read_text())
-    assert run_metadata["disease"] == "mean_corpuscular_volume"
-    assert run_metadata["phenotype_fingerprint"] == phenotype_fingerprint(mcv)
-
-
-def test_run_all_of_us_rebuilds_a_table_prepared_from_another_definition(monkeypatch, tmp_path: Path):
-    monkeypatch.setenv("WORKSPACE_CDR", DATASET)
-    monkeypatch.setattr(aou_runner, "check_aou_preflight", _successful_preflight)
-    monkeypatch.setattr("sv_pgs.genotype.require_gpu", lambda: None)
-    work_dir = tmp_path / "mcv_results"
-    work_dir.mkdir()
-    stale_table = work_dir / "mean_corpuscular_volume.samples.tsv"
-    stale_table.write_text("sample_id\n", encoding="utf-8")
-    Path(str(stale_table) + ".metadata.json").write_text(
-        json.dumps({"phenotype_fingerprint": "an earlier definition", "covariate_columns": []}),
-        encoding="utf-8",
-    )
-    prepared: list[str] = []
-
-    def stop_after_prepare(trait, output_path, **kwargs):
-        prepared.append(trait)
-        raise RuntimeError("prepared")
-
-    monkeypatch.setattr(aou_runner, "prepare_all_of_us_measurement_sample_table", stop_after_prepare)
-    with pytest.raises(RuntimeError, match="prepared"):
-        aou_runner.run_all_of_us(
-            phenotype="mean_corpuscular_volume", chromosomes=[22], output_base=str(work_dir), variants="snp"
-        )
-    assert prepared == ["mean_corpuscular_volume"]
-
-
-def _successful_preflight(cache_dir: Path, *, required_stage_bytes: int, required_temp_bytes: int):
-    from sv_pgs.preflight import AouPreflightReport
-
-    cache_dir.mkdir(parents=True, exist_ok=True)
-    return AouPreflightReport(
-        cdr_storage_path=None,
-        workspace_bucket=None,
-        google_project=None,
-        cache_dir=cache_dir,
-        cache_storage_class="local_hot",
-        free_bytes=required_stage_bytes + required_temp_bytes,
-        required_stage_bytes=required_stage_bytes,
-        required_temp_bytes=required_temp_bytes,
-        cuda_visible_devices=["GPU 0: unit-test device"],
-        cupy_available=True,
-        cupy_devices=1,
-        jax_preallocate="false",
-        jax_mem_fraction=None,
-    )
-
 
 def test_cli_lists_traits_and_prepares_a_trait_table(monkeypatch, tmp_path: Path, capsys):
     assert main(["list-all-of-us-traits"]) == 0
@@ -948,26 +1248,6 @@ def test_cli_lists_traits_and_prepares_a_trait_table(monkeypatch, tmp_path: Path
     assert main(["prepare-all-of-us-trait", "--trait", "mcv", "--output", str(tmp_path / "mcv.tsv")]) == 0
     assert calls == {"trait": "mcv", "output_path": tmp_path / "mcv.tsv"}
 
-
-def test_cli_run_all_of_us_forwards_a_trait_as_its_canonical_phenotype(monkeypatch, tmp_path: Path):
-    calls: dict[str, object] = {}
-    monkeypatch.setattr("sv_pgs.cli.run_all_of_us", lambda **kwargs: calls.update(kwargs))
-    assert main(["run-all-of-us", "--trait", "sbp", "--chromosomes", "22", "--output-dir", str(tmp_path)]) == 0
-    assert calls["phenotype"] == "systolic_blood_pressure"
-
-
-@pytest.mark.parametrize(
-    "arguments",
-    [
-        ["--trait", "sbp", "--disease", "gout"],
-        ["--trait", "sbp", "--all-diseases"],
-        ["--trait", "gout"],
-        ["--disease", "sbp"],
-    ],
-)
-def test_cli_run_all_of_us_rejects_mixed_or_wrong_kind_phenotypes(tmp_path: Path, arguments):
-    with pytest.raises(ValueError):
-        main(["run-all-of-us", *arguments, "--output-dir", str(tmp_path)])
 
 
 def test_census_suppresses_cells_of_twenty_or_fewer_participants(monkeypatch, tmp_path: Path):
