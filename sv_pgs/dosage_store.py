@@ -14,10 +14,15 @@ written.  Dosages count the ALT allele.  The Stage 0 kernels (``genotype_buffers
 ``s = code - 127`` in [-127, 127]; standardization is affine in s, so (DS - mean_DS) / sd_DS =
 (s - mean_s) / sd_s exactly.
 
-Two inner-chunk codec chains exist, and each array's ``zarr.json`` says which one it uses:
+Three inner-chunk codec chains exist, and each array's ``zarr.json`` says which one it uses:
 
 - ``[bytes, zstd(3), crc32c]``, the bucket store.  Each 64-record chunk is an independent zstd
   frame whose crc32c is verified whenever it is decoded.
+- ``[bytes, svpgs_rowdict, crc32c]``, the GPU-decoded cache (``rowdict_codec``).  An inner chunk
+  holds one frame per record (a dictionary of the record's most frequent codes, bit-packed slots
+  and exceptions), which a GPU decodes at memory speed; the host reads the bytes and checks the
+  chunk's crc32c.  ``CodeArray.read_rows_to_device`` is that path; the CPU decoder is the
+  reference.
 - ``[bytes]``, the local NVMe/RAM cache.  A shard's records are one contiguous byte range, so a
   range inside a shard is a zero-copy view of the page cache.  Any range can also be read with
   ``preadv`` straight into a caller buffer, such as pinned host memory for GPU staging.
@@ -39,12 +44,13 @@ from pathlib import Path
 import resource
 import shutil
 import threading
-from typing import Any, Iterable, Iterator, Literal, Mapping, Sequence
+from typing import Any, Iterable, Iterator, Literal, Mapping, Sequence, get_args
 
 import google_crc32c
 import numpy as np
 import zstandard
 
+from sv_pgs import rowdict_codec
 from sv_pgs._typing import F64Array, I64Array, NDArray, U8Array
 from sv_pgs.compute_budget import ComputeBudget, _try_import_cupy
 from sv_pgs.config import VariantClass
@@ -102,7 +108,7 @@ VARIANT_CLASSES = tuple(VariantClass)
 VARIANT_CLASS_LEGEND = [variant_class.value for variant_class in VARIANT_CLASSES]
 # On-disk variant columns every store carries; any other column is a prior annotation.
 REQUIRED_VARIANT_COLUMNS = ("pos", "ref_len", "alt_len", "cm", "variant_class", "group_first")
-Codec = Literal["raw", "zstd"]
+Codec = Literal["raw", "zstd", "rowdict"]
 
 _ZARR_METADATA_FILE = "zarr.json"
 _UNWRITTEN_CHUNK = np.uint64(2**64 - 1)
@@ -131,7 +137,10 @@ _CRC32C_CODEC = {"name": "crc32c"}
 _INNER_CODECS: dict[str, list[dict[str, Any]]] = {
     "raw": [_BYTES_CODEC],
     "zstd": [_BYTES_CODEC, {"name": "zstd", "configuration": {"level": ZSTD_LEVEL, "checksum": False}}, _CRC32C_CODEC],
+    "rowdict": [_BYTES_CODEC, {"name": "svpgs_rowdict"}, _CRC32C_CODEC],
 }
+# Chains whose inner chunks are variable-size frames stored back to back, each crc32c-checked.
+_FRAMED_CODECS = frozenset({"zstd", "rowdict"})
 
 
 def encode_dosage_milli(dosage_milli: NDArray) -> U8Array:
@@ -272,7 +281,7 @@ def _layout_from_metadata(metadata: Mapping[str, Any], directory: Path) -> CodeA
         sample_count=int(shape[1]),
         shard_rows=int(shard_shape[0]),
         inner_rows=int(inner_shape[0]),
-        codec="raw" if matching[0] == "raw" else "zstd",
+        codec=next(codec for codec in get_args(Codec) if codec == matching[0]),
     )
 
 
@@ -314,17 +323,24 @@ def _compression_pool() -> ThreadPoolExecutor:
         return _COMPRESSION_POOL[0]
 
 
-def _compressed_chunk(payload: bytes) -> bytes:
-    frame = zstandard.ZstdCompressor(level=ZSTD_LEVEL).compress(payload)
+def _checksummed(frame: bytes) -> bytes:
     return frame + google_crc32c.value(frame).to_bytes(_CRC32C_BYTES, "little")
+
+
+def _compressed_chunk(payload: bytes) -> bytes:
+    return _checksummed(zstandard.ZstdCompressor(level=ZSTD_LEVEL).compress(payload))
+
+
+def _rowdict_chunk(codes: U8Array) -> bytes:
+    return _checksummed(rowdict_codec.encode_chunk(codes))
 
 
 class CodeShardWriter:
     """Stream the rows of one shard of a code array into its shard file.
 
     Rows arrive in order and are cut into inner chunks; the last one is padded with the fill
-    value.  zstd chunks are compressed on the process's worker threads, a bounded number in
-    flight, and written in order.  The file is written under a temporary name and renamed into
+    value.  zstd and rowdict chunks are encoded on the process's worker threads, a bounded number
+    in flight, and written in order.  The file is written under a temporary name and renamed into
     place by ``close`` only after every chunk and the checksummed index are on disk.  Shards are
     independent files, so separate processes may write separate shards of one array concurrently.
     """
@@ -356,11 +372,14 @@ class CodeShardWriter:
         self._chunks_written += 1
 
     def _emit_chunk(self) -> None:
-        payload = self._chunk.tobytes()
         if self._layout.codec == "raw":
-            self._write_payload(payload)
+            self._write_payload(self._chunk.tobytes())
         else:
-            self._compressing.append(_compression_pool().submit(_compressed_chunk, payload))
+            if self._layout.codec == "zstd":
+                encoded = _compression_pool().submit(_compressed_chunk, self._chunk.tobytes())
+            else:
+                encoded = _compression_pool().submit(_rowdict_chunk, self._chunk.copy())
+            self._compressing.append(encoded)
             while len(self._compressing) > self._compressing_limit:
                 self._write_payload(self._compressing.popleft().result())
         self._chunk.fill(MISSING_CODE)
@@ -494,12 +513,13 @@ class CodeArray:
                 and data_bytes == written * layout.inner_chunk_bytes
             ):
                 raise ValueError(f"{path}: raw inner chunks are not whole and in row order.")
-            if layout.codec == "zstd" and not (
+            if layout.codec in _FRAMED_CODECS and not (
                 int(offsets[0]) == 0
                 and np.array_equal(offsets[1:], offsets[:-1] + sizes[:-1])
                 and data_bytes == int(offsets[-1] + sizes[-1])
+                and bool(np.all(sizes > _CRC32C_BYTES))
             ):
-                raise ValueError(f"{path}: zstd inner chunks are not stored back to back in row order.")
+                raise ValueError(f"{path}: {layout.codec} inner chunks are not stored back to back in row order.")
         except BaseException:
             os.close(descriptor)
             raise
@@ -602,6 +622,36 @@ class CodeArray:
             self._decode_frame(frame, memoryview(decoded), chunk)
             rows[...] = decoded.reshape(layout.inner_rows, layout.sample_count)[first - chunk_start : last - chunk_start]
 
+    def _rowdict_frames(
+        self, shard: _OpenShard, local_start: int, local_stop: int, encoded: U8Array
+    ) -> rowdict_codec.RowFrames:
+        """Read the rowdict chunks covering rows [local_start, local_stop) of one shard into
+        ``encoded`` with one preadv, check each chunk's crc32c, and locate the rows' frames."""
+        layout = self.layout
+        first_chunk, stop_chunk = self._chunk_range(local_start, local_stop)
+        begin = int(shard.chunk_offsets[first_chunk])
+        _pread_exact(shard.descriptor, [memoryview(encoded)], begin)
+        offsets = shard.chunk_offsets[first_chunk:stop_chunk] - begin
+        payload_sizes = shard.chunk_sizes[first_chunk:stop_chunk] - _CRC32C_BYTES
+        for chunk, (offset, size) in enumerate(zip(offsets.tolist(), payload_sizes.tolist()), start=first_chunk):
+            # google_crc32c takes read-only bytes only, so the chunk is copied once.
+            stored = int.from_bytes(encoded[offset + size : offset + size + _CRC32C_BYTES].tobytes(), "little")
+            if google_crc32c.value(encoded[offset : offset + size].tobytes()) != stored:
+                raise ValueError(f"{self.directory}: inner chunk {chunk} fails its crc32c check.")
+        rows = np.arange(local_start, local_stop, dtype=np.int64) - first_chunk * layout.inner_rows
+        try:
+            return rowdict_codec.row_frames(encoded, offsets, payload_sizes, layout.inner_rows, layout.sample_count, rows)
+        except ValueError as error:
+            raise ValueError(f"{self.directory}: {error}") from error
+
+    def _chunk_range(self, local_start: int, local_stop: int) -> tuple[int, int]:
+        return local_start // self.layout.inner_rows, -(-local_stop // self.layout.inner_rows)
+
+    def _encoded_bytes(self, shard: _OpenShard, local_start: int, local_stop: int) -> int:
+        first_chunk, stop_chunk = self._chunk_range(local_start, local_stop)
+        end = int(shard.chunk_offsets[stop_chunk - 1] + shard.chunk_sizes[stop_chunk - 1])
+        return end - int(shard.chunk_offsets[first_chunk])
+
     def read_rows_into(self, row_start: int, row_stop: int, out: U8Array) -> None:
         """Fill ``out`` [rows, samples] (each row contiguous, e.g. a column slice of a wider array)."""
         layout = self.layout
@@ -610,11 +660,48 @@ class CodeArray:
         out_row = 0
         for shard_index, local_start, local_stop in self.shard_pieces(row_start, row_stop):
             shard = self._shard(shard_index)
+            target = out[out_row : out_row + local_stop - local_start]
             if layout.codec == "raw":
-                target = out[out_row : out_row + local_stop - local_start]
                 _pread_exact(shard.descriptor, _row_buffers(target), local_start * layout.sample_count)
+            elif layout.codec == "zstd":
+                self._decode_rows_into(shard, local_start, local_stop, target)
             else:
-                self._decode_rows_into(shard, local_start, local_stop, out[out_row : out_row + local_stop - local_start])
+                encoded = _scratch("encoded_frames", self._encoded_bytes(shard, local_start, local_stop))
+                frames = self._rowdict_frames(shard, local_start, local_stop, encoded)
+                rowdict_codec.decode_rows(encoded, frames, layout.sample_count, target)
+            out_row += local_stop - local_start
+
+    def read_rows_to_device(self, row_start: int, row_stop: int, out: Any, decoder: rowdict_codec.GpuRowDecoder) -> None:
+        """Fill the CuPy array ``out`` [rows, samples] (contiguous rows) from a rowdict array.
+
+        The chunks move host -> device still encoded, through a pinned buffer, and ``decoder``
+        decodes them on the device; the host reads the bytes, checks each chunk's crc32c and
+        locates the rows' frames.  The call returns once the device has the encoded bytes, with
+        the decode queued on the current stream.
+        """
+        layout = self.layout
+        if layout.codec != "rowdict":
+            raise ValueError(f"{self.directory}: only a rowdict array decodes on the device; this one is {layout.codec}.")
+        cupy = decoder.cupy
+        if out.shape != (row_stop - row_start, layout.sample_count) or out.dtype != cupy.uint8 or out.strides[1] != 1:
+            raise ValueError(f"out must be uint8 [{row_stop - row_start}, {layout.sample_count}] with contiguous rows.")
+        out_row = 0
+        for shard_index, local_start, local_stop in self.shard_pieces(row_start, row_stop):
+            shard = self._shard(shard_index)
+            byte_count = self._encoded_bytes(shard, local_start, local_stop)
+            owner, pinned = _PINNED_POOL.acquire(cupy, byte_count)
+            copied = cupy.cuda.Event()
+            try:
+                frames = self._rowdict_frames(shard, local_start, local_stop, pinned)
+                stream = cupy.cuda.get_current_stream()
+                device_bytes = cupy.empty(byte_count, dtype=cupy.uint8)
+                device_bytes.set(pinned, stream=stream)
+                copied.record(stream)
+                decoder.decode(device_bytes, frames, layout.sample_count, out[out_row : out_row + local_stop - local_start])
+            finally:
+                # The next acquire may hand the pinned buffer out again, so its copy must be done.
+                copied.synchronize()
+                _PINNED_POOL.release(owner)
             out_row += local_stop - local_start
 
     @property
@@ -1161,6 +1248,21 @@ class DosageStore:
         if out.dtype != np.uint8 or out.shape != (rows, selection.indices.size) or not out.flags.c_contiguous:
             raise ValueError(f"out must be C-contiguous uint8 [{rows}, {selection.indices.size}].")
         self._read_into(start, stop, selection, out)
+        return out
+
+    def read_codes_to_device(self, start: int, stop: int, out: Any, decoder: rowdict_codec.GpuRowDecoder) -> Any:
+        """Codes [stop - start, all samples] decoded on the device into the CuPy array ``out``.
+
+        Every half must be rowdict-encoded; each half's rows land in its columns of ``out``.
+        """
+        cupy = decoder.cupy
+        if out.dtype != cupy.uint8 or out.shape != (stop - start, self.n_samples) or not out.flags.c_contiguous:
+            raise ValueError(f"out must be C-contiguous uint8 [{stop - start}, {self.n_samples}].")
+        for half_position, arrays in enumerate(self._arrays):
+            columns = slice(int(self.half_sample_starts[half_position]), int(self.half_sample_starts[half_position + 1]))
+            for chromosome, local_start, local_stop, out_row in self._chromosome_pieces(start, stop):
+                rows = slice(out_row, out_row + local_stop - local_start)
+                arrays[chromosome].read_rows_to_device(local_start, local_stop, out[rows, columns], decoder)
         return out
 
     def advise(self, start: int, stop: int) -> None:

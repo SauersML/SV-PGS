@@ -118,7 +118,7 @@ def _two_half_dosage() -> list[dict[str, np.ndarray]]:
     ]
 
 
-@pytest.fixture(params=["raw", "zstd"])
+@pytest.fixture(params=["raw", "zstd", "rowdict"])
 def two_half_store(request: pytest.FixtureRequest, tmp_path: Path) -> tuple[Path, list[dict[str, np.ndarray]]]:
     milli_by_half = _two_half_dosage()
     _write_store(tmp_path / "store", milli_by_half, request.param)
@@ -209,7 +209,7 @@ def test_raw_single_half_ranges_inside_a_shard_are_zero_copy_views(tmp_path: Pat
 
 def test_corrupted_shards_and_missing_codes_fail_loudly(tmp_path: Path) -> None:
     milli_by_half = _two_half_dosage()
-    for codec, flipped_byte in (("raw", -6), ("zstd", 40)):
+    for codec, flipped_byte in (("raw", -6), ("zstd", 40), ("rowdict", 40)):
         root = tmp_path / codec
         _write_store(root, milli_by_half, codec)
         shard_path = dosage_array_directory(root, 0, "chr21") / "c" / "0" / "0"
@@ -253,7 +253,7 @@ def test_code_array_metadata_is_zarr_v3_sharded(two_half_store: tuple[Path, list
     assert sharding["name"] == "sharding_indexed"
     assert sharding["configuration"]["chunk_shape"] == [INNER_ROWS, 37]
     inner_codecs = [codec["name"] for codec in sharding["configuration"]["codecs"]]
-    assert inner_codecs in (["bytes"], ["bytes", "zstd", "crc32c"])
+    assert inner_codecs in (["bytes"], ["bytes", "zstd", "crc32c"], ["bytes", "svpgs_rowdict", "crc32c"])
     shard_bytes = (dosage_array_directory(root, 0, "chr22") / "c" / "1" / "0").read_bytes()
     index_entries = SHARD_ROWS // INNER_ROWS
     index = np.frombuffer(shard_bytes[-(16 * index_entries + 4) : -4], dtype="<u8").reshape(index_entries, 2)
@@ -262,7 +262,7 @@ def test_code_array_metadata_is_zarr_v3_sharded(two_half_store: tuple[Path, list
     assert np.all(index[written:] == np.uint64(2**64 - 1))
 
 
-@pytest.mark.parametrize("codec", ["raw", "zstd"])
+@pytest.mark.parametrize("codec", ["raw", "zstd", "rowdict"])
 def test_write_dosage_store_round_trips_table_and_codes(tmp_path: Path, codec: str) -> None:
     rng = np.random.default_rng(7)
     counts = (90, 41)

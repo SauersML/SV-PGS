@@ -52,7 +52,7 @@ import multiprocessing
 import os
 from pathlib import Path
 import time
-from typing import Any, Mapping, Sequence
+from typing import Any, Mapping, Sequence, get_args
 
 import numpy as np
 
@@ -1048,7 +1048,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--chromosomes", type=int, default=len(HG38_AUTOSOME_MEGABASES))
     parser.add_argument("--seed", type=int, required=True)
     parser.add_argument("--block-records", type=int, required=True)
-    parser.add_argument("--codec", choices=("raw", "zstd"), required=True)
+    parser.add_argument("--codec", choices=get_args(Codec), required=True)
     parser.add_argument("--workers", type=int, default=len(os.sched_getaffinity(0)))
     arguments = parser.parse_args(argv)
     started = time.perf_counter()
