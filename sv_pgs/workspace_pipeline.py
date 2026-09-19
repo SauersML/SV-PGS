@@ -107,7 +107,6 @@ from sv_pgs.dosage_store import (
     read_manifest,
     sites_md5,
     statistic_column_directory,
-    open_column,
     write_column,
     write_variant_columns,
 )
@@ -313,6 +312,7 @@ class WorkspaceBindings:
 
     bigquery_client: Callable[[], Any]
     calibration_moments: Callable[..., Any]
+    concatenate_calibration_moments: Callable[..., Any]
     calibration_pairs: Callable[..., Any]
     fit_measurement_model: Callable[..., Any]
     pooled_log_reliability: Callable[..., Any]
@@ -339,6 +339,7 @@ def workspace_bindings() -> WorkspaceBindings:
     return WorkspaceBindings(
         bigquery_client=lambda: None,
         calibration_moments=measurement_model.calibration_moments,
+        concatenate_calibration_moments=measurement_model.concatenate_calibration_moments,
         calibration_pairs=measurement_model.CalibrationPairs,
         fit_measurement_model=measurement_model.fit_measurement_model,
         pooled_log_reliability=measurement_model.pooled_log_reliability,
@@ -1019,10 +1020,31 @@ def _start_decoder(expected: ExpectedSites, group_count: int, budget: ComputeBud
     _DECODER.update(expected=expected, group_count=group_count, budget=budget)
 
 
+def read_reported_info(path: Path, record_count: int) -> F64Array:
+    """Each record's INFO/INFO, the imputation's own r^2 over the batch's samples, which must lie in [0, 1]."""
+    values = np.empty(record_count, dtype=np.float64)
+    reader = VCF(str(path))
+    try:
+        for row, record in enumerate(reader):
+            if row >= record_count:
+                raise ValueError(f"{path}: more records than the strata sidecar's {record_count}.")
+            info = record.INFO.get("INFO")
+            if info is None or not 0.0 <= float(info) <= 1.0:
+                raise ValueError(f"{path} record {row}: INFO/INFO is missing or outside [0, 1].")
+            values[row] = float(info)
+    finally:
+        reader.close()
+    return values
+
+
 def _decode(task: _DecodeTask) -> None:
-    """Decode one batch file and write its codes, then its statistics, whose presence marks the batch done."""
+    """Decode one batch file and write its codes, then its statistics, whose presence marks the batch done.
+
+    An imputed batch's INFO/INFO takes a second read of the file; store_converter.decode_batch does not return it.
+    """
     decode = decode_called_batch if task.called else decode_batch
-    decoded = decode(task.path, _DECODER["expected"], task.groups, _DECODER["group_count"], task.codes_path, _DECODER["budget"])
+    expected = _DECODER["expected"]
+    decoded = decode(task.path, expected, task.groups, _DECODER["group_count"], task.codes_path, _DECODER["budget"])
     temporary = task.statistics_path.with_name(task.statistics_path.stem + ".partial.npz")
     np.savez(
         temporary,
@@ -1032,6 +1054,7 @@ def _decode(task: _DecodeTask) -> None:
         unmatched_low=decoded.unmatched_low,
         no_calls=decoded.no_calls,
         sample_ids=np.array(decoded.sample_ids),
+        reported_info=np.empty(0) if task.called else read_reported_info(task.path, expected.positions.shape[0]),
     )
     os.replace(temporary, task.statistics_path)
 
@@ -1161,6 +1184,9 @@ def _convert_chromosome(run: _Run, directory: Path, root: Path, chromosome: str,
             raise ValueError(f"{chromosome}: half {half_index}'s batches list other samples than its manifest.")
     fill = no_call_fill(sum(values["group_sums"] for values in statistics), sum(values["group_counts"] for values in statistics))
     np.save(directory / "fill" / f"{chromosome}.npy", fill)
+    # The imputation's reported r^2 over every imputed sample: the batches' INFO weighted by their sample counts.
+    imputed = [(len(values["sample_ids"]), values["reported_info"]) for task, values in zip(tasks, statistics) if not task.called]
+    np.save(directory / "reported" / f"{chromosome}.npy", sum(width * info for width, info in imputed) / sum(width for width, _info in imputed))
     record_count = strata.positions.shape[0]
     sums = np.zeros(record_count, dtype=np.int64)
     squares = np.zeros(record_count, dtype=np.int64)
@@ -1224,7 +1250,7 @@ def _store_step(run: _Run, directory: Path) -> dict[str, Any]:
     config = run.config
     samples = _read_samples(run)
     root = directory / "store"
-    for subdirectory in ("chromosomes", "fill", "calibration"):
+    for subdirectory in ("chromosomes", "fill", "calibration", "reported"):
         (directory / subdirectory).mkdir(exist_ok=True)
     repeats = read_tandem_repeats(config.tandem_repeats)
     facts = []
@@ -1286,27 +1312,6 @@ def _group_code_moments(store: DosageStore, columns: I64Array, column_groups: I6
     return counts, sums, squares
 
 
-def reported_reliability(store_root: Path, chromosomes: Sequence[str], imputed_halves: Sequence[int], sample_count: int) -> F64Array:
-    """Each record's dosage r^2 over every imputed sample, Var(D) / (2p(1 - p)) with p = E[D] / 2 (0 where
-    monomorphic, and at most 1), from the imputed halves' exact code sums."""
-    per_chromosome = []
-    for chromosome in chromosomes:
-        sums = sum(open_column(statistic_column_directory(store_root, half, chromosome, "sum_code"))[0].astype(np.float64) for half in imputed_halves)
-        squares = sum(open_column(statistic_column_directory(store_root, half, chromosome, "sum_code2"))[0].astype(np.float64) for half in imputed_halves)
-        mean = np.asarray(sums) / sample_count / CODES_PER_DOSAGE
-        variance = np.maximum(np.asarray(squares) / sample_count / CODES_PER_DOSAGE**2 - mean * mean, 0.0)
-        heterozygosity = 2.0 * (mean / 2.0) * (1.0 - mean / 2.0)
-        with np.errstate(divide="ignore", invalid="ignore"):
-            per_chromosome.append(np.where(heterozygosity > 0.0, np.minimum(variance / heterozygosity, 1.0), 0.0))
-    return np.concatenate(per_chromosome)
-
-
-def _concatenate_records(parts: Sequence[Any]) -> Any:
-    """Record-chunk calibration moments joined along records (each field is one value per record)."""
-    first = parts[0]
-    return type(first)(**{field.name: np.concatenate([getattr(part, field.name) for part in parts]) for field in dataclasses.fields(first)})
-
-
 def _group_calibration(run: _Run, directory: Path, chromosomes: Sequence[str], pair_positions: Sequence[int]) -> Any:
     """The calibration moments of one group's pairs over every record, in record chunks that fit the host budget.
 
@@ -1322,7 +1327,7 @@ def _group_calibration(run: _Run, directory: Path, chromosomes: Sequence[str], p
             truth_block = truth_codes[start : start + rows][:, pair_positions]
             truth = np.where(truth_block == MISSING_CODE, np.nan, truth_block.astype(np.float64) / CODES_PER_DOSAGE)
             parts.append(run.bindings.calibration_moments(dosage, truth))
-    return _concatenate_records(parts)
+    return run.bindings.concatenate_calibration_moments(parts)
 
 
 class _StoredHalfCodes:
@@ -1390,16 +1395,18 @@ def _measurement_step(run: _Run, directory: Path) -> dict[str, Any]:
         strata = np.asarray(VARIANT_CLASS_LEGEND)[store.variant_table.variant_class]
         chromosomes = store.chromosomes
     pooled = sums.sum(axis=1) / fit_columns.shape[0], squares.sum(axis=1) / fit_columns.shape[0]
-    imputed = [index for index, half in enumerate(samples.halves) if half.namespace == "dragen_sample"]
-    reported = reported_reliability(source_root, chromosomes, imputed, sum(len(samples.halves[index].names) for index in imputed))
+    reported = np.concatenate([np.load(store_directory / "reported" / f"{chromosome}.npy") for chromosome in chromosomes])
     pair_groups = [int(samples.groups[pair[1]][pair[2]]) for pair in samples.pairs]
     results = []
     certificates = {}
     calibrated = []
+    group_means, group_variances = [], []
     for group, label in enumerate(samples.legend):
-        # A group with no fitted rows takes the pooled variance; its scales then serve only its unfitted store samples.
+        # A group with no fitted rows takes the pooled moments; its scales then serve only its unfitted store samples.
         mean, second = (sums[:, group] / counts[group], squares[:, group] / counts[group]) if counts[group] else pooled
         variance = np.maximum(second - mean * mean, 0.0) / CODES_PER_DOSAGE**2
+        group_means.append(mean / CODES_PER_DOSAGE)
+        group_variances.append(variance)
         members = [position for position, pair_group in enumerate(pair_groups) if pair_group == group]
         calibration = None
         if members:
@@ -1412,16 +1419,21 @@ def _measurement_step(run: _Run, directory: Path) -> dict[str, Any]:
         results.append(result)
         certificates[label] = {"pairs_supplied": len(members), **dict(result.certificate)}
     scales = np.column_stack([np.asarray(result.scales, dtype=np.float64) for result in results])
-    log_reliability = np.column_stack([np.asarray(result.log_reliability, dtype=np.float64) for result in results])
+    residual_variance = np.column_stack([np.asarray(result.residual_variance, dtype=np.float64) for result in results])
     np.savez(
         directory / "measurement.npz",
         groups=np.array(samples.legend),
         fit_row_counts=counts,
         scales=scales,
-        residual_variance=np.column_stack([np.asarray(result.residual_variance, dtype=np.float64) for result in results]),
-        log_reliability=log_reliability,
-        # The fit's prior offset until it takes one per ancestry group: pooled over the fit rows' groups.
-        log_variance_offset=np.asarray(run.bindings.pooled_log_reliability(log_reliability, counts), dtype=np.float64),
+        residual_variance=residual_variance,
+        log_reliability=np.column_stack([np.asarray(result.log_reliability, dtype=np.float64) for result in results]),
+        # The fit's prior offset until it takes one per ancestry group: log r^2 of the stacked D* over the fit rows.
+        log_variance_offset=np.asarray(
+            run.bindings.pooled_log_reliability(
+                scales, residual_variance, np.column_stack(group_means), np.column_stack(group_variances), counts
+            ),
+            dtype=np.float64,
+        ),
     )
     _write_json(directory / "certificate.json", certificates)
     if calibrated:
@@ -1582,7 +1594,8 @@ _STEPS = (
         _store_inputs,
         (
             store_converter, dosage_store, variant_typing, _store_step, _convert_chromosome, read_strata_sites, read_popped_sites,
-            read_bubble_paths, path_counts, read_tandem_repeats, store_variant_classes, _decode, _decode_tasks, _gather_calibration,
+            read_bubble_paths, path_counts, read_tandem_repeats, store_variant_classes, read_reported_info, _decode, _decode_tasks,
+            _gather_calibration,
         ),
         _store_step,
     ),
@@ -1590,7 +1603,7 @@ _STEPS = (
         "measurement",
         ("samples", "cohort", "store"),
         lambda config: None,
-        (store_converter, dosage_store, _measurement_step, _group_code_moments, reported_reliability, _group_calibration, rewrite_recalibrated_store),
+        (store_converter, dosage_store, _measurement_step, _group_code_moments, _group_calibration, rewrite_recalibrated_store),
         _measurement_step,
     ),
     _Step("fit", ("cohort", "measurement"), lambda config: config.seed, (_fit_step,), _fit_step),

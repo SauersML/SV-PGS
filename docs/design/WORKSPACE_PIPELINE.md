@@ -15,7 +15,7 @@ These are formats; the paths come from a run config supplied inside the workspac
 
 | Input | Format the reader expects | Checked |
 |---|---|---|
-| Popped imputed batches | One BCF/VCF per chromosome per batch, GT:DS:GP, INFO/ID (atomic ID), INFO/CM, INFO/SVLEN. Batches of a half in batch order; the same samples on every chromosome | G2: POS, md5(REF\tALT) and INFO/ID of every record against the sidecar. G4: DS/GP consistency |
+| Popped imputed batches | One BCF/VCF per chromosome per batch, GT:DS:GP, INFO/ID (atomic ID), INFO/CM, INFO/SVLEN, INFO/INFO (the imputation's r², read as the measurement model's fallback, sample-weighted over batches). Batches of a half in batch order; the same samples on every chromosome | G2: POS, md5(REF\tALT) and INFO/ID of every record against the sidecar. G4: DS/GP consistency. INFO/INFO present and in [0, 1] |
 | Strata sidecar v2 | `chrK.strata.tsv.gz` (header line starting `#`) with idx, pos, id, refalt_md5, ref_len, alt_len, n_paths, n_paths_total, cx; `_done/chrK.json` with `sites_md5` and `ids_md5` | The contig is used only once `_done` exists. The popped records' md5 over `CHROM\tPOS\tREF\tALT\n` and over `INFO/ID\n` must equal the sidecar's |
 | bubble.split | One biallelic record per path, a bubble's paths consecutive at its POS; INFO/ID lists the path's atomic IDs split on `:` (`,` read as `:`) | For every multi-path record: one bubble carries it, with the sidecar's n_paths_total paths, n_paths of which carry its ID |
 | Tandem repeats | GIAB v3.6 AllTandemRepeatsandHomopolymers_slop5 BED | Sorted, non-overlapping (`tr_loci`) |
@@ -73,7 +73,8 @@ The derivation starts from COMPUTE.md's floor at its design workload (n = 10⁵,
 ## Open items, stated in the step summaries
 
 1. **The disease target is `target`.** pheno-disease's latent-onset model replaces the 0/1 rule path with a reliability-weighted target, and its tables will list every EHR participant.
-2. **The fit's prior offset is pooled** over the fit rows' ancestry groups, log Σ_g n_g r²_jg / n, until the fit takes one per group. The per-group residual variances are persisted but not yet used, and no LD-block pairs are passed, so the A-map is not built.
+2. **The fit's prior offset is pooled** over the fit rows' ancestry groups until the fit takes one per group. It is measure-path's `pooled_log_reliability`, log r² of the stacked D*: Var(D*) = Σ_g w_g (κ_g² V_g + (μ_g − μ)²) over Var(D*) + Σ_g w_g v_g. The per-group residual variances also feed scoring later. No LD-block pairs are passed, so the A-map is not built.
+   - **Gap:** reading INFO/INFO takes a second pass over each imputed batch file, because `decode_batch` doesn't return it.
 3. **The fit needs `covariate_columns`** (fit-api), and the engine a per-model F on each model's own columns. A run whose `fit_model.fit` lacks any keyword in `FIT_KEYWORDS` is refused before its first step.
 4. **The store lacks** the SV-context features (STORE.md: the storage plan is not yet written by the converter), and `tr_motif_len` and `r2_locus` in the loci table. A non-SNV record whose core overlaps a GIAB repeat interval is `str_vntr_repeat`.
 5. **Batch `SECURED.ok` files are not read.** The lockstep gate checks every record of every batch.

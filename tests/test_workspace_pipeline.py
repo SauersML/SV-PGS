@@ -100,6 +100,7 @@ def _vcf_header(samples: list[str], formats: tuple[str, ...]) -> list[str]:
         "##fileformat=VCFv4.2",
         '##INFO=<ID=ID,Number=A,Type=String,Description="atomic ids">',
         '##INFO=<ID=CM,Number=1,Type=Float,Description="genetic position">',
+        '##INFO=<ID=INFO,Number=1,Type=Float,Description="imputation r2">',
         '##INFO=<ID=SVLEN,Number=A,Type=Integer,Description="SV length">',
         *(f'##FORMAT=<ID={name},Number={"G" if name == "GP" else 1},Type={"String" if name == "GT" else "Float"},Description="{name}">' for name in formats),
         *(f"##contig=<ID={chromosome},length=50000000>" for chromosome in CHROMOSOMES),
@@ -107,8 +108,13 @@ def _vcf_header(samples: list[str], formats: tuple[str, ...]) -> list[str]:
     return lines + ["\t".join(["#CHROM", "POS", "ID", "REF", "ALT", "QUAL", "FILTER", "INFO", *(["FORMAT"] if formats else []), *samples])]
 
 
+def _reported_info(record: int) -> float:
+    """The synthetic INFO/INFO of a record, the same in every batch."""
+    return 0.5 + 0.05 * record
+
+
 def _info(chromosome: str, record: int) -> str:
-    fields = [f"ID={_identifier(chromosome, record)}", f"CM={0.001 * RECORDS[record][0]:.4f}"]
+    fields = [f"ID={_identifier(chromosome, record)}", f"CM={0.001 * RECORDS[record][0]:.4f}", f"INFO={_reported_info(record):.3f}"]
     if RECORDS[record][5] is not None:
         fields.append(f"SVLEN={RECORDS[record][5]}")
     return ";".join(fields)
@@ -307,6 +313,16 @@ def _fit_measurement_model(calibration, cohort_dosage_variance, strata, design=N
     return SimpleNamespace(scales=scales, residual_variance=np.zeros_like(scales), log_reliability=np.zeros_like(scales), certificate=certificate)
 
 
+def _pooled_log_reliability(scales, residual_variance, cohort_dosage_mean, cohort_dosage_variance, group_counts):
+    """A stand-in with the production signature: log Var(D*) / (Var(D*) + v) of the stacked groups, -inf without variance."""
+    weights = group_counts / group_counts.sum()
+    mean = cohort_dosage_mean @ weights
+    variance = (scales**2 * cohort_dosage_variance + (cohort_dosage_mean - mean[:, None]) ** 2) @ weights
+    total = variance + residual_variance @ weights
+    with np.errstate(divide="ignore", invalid="ignore"):
+        return np.where(total > 0.0, np.log(variance / total), -np.inf)
+
+
 @dataclasses.dataclass
 class _Fitted:
     model_names: tuple[str, ...]
@@ -384,9 +400,12 @@ def _bindings(recorder: _Recorder, client: _FakeBigQuery) -> WorkspaceBindings:
     return WorkspaceBindings(
         bigquery_client=lambda: client,
         calibration_moments=_calibration_moments,
+        concatenate_calibration_moments=lambda parts: _Moments(
+            *(np.concatenate([getattr(part, field.name) for part in parts]) for field in dataclasses.fields(_Moments))
+        ),
         calibration_pairs=lambda sample_ids, moments, blocks=(): SimpleNamespace(sample_ids=sample_ids, moments=moments, blocks=blocks),
         fit_measurement_model=_fit_measurement_model,
-        pooled_log_reliability=lambda log_reliability, group_counts: np.log(np.exp(log_reliability) @ group_counts / group_counts.sum()),
+        pooled_log_reliability=_pooled_log_reliability,
         fit=recorder.fit,
         save_model=_save_model,
         load_model=_load_model,
@@ -445,6 +464,8 @@ def test_a_dry_run_builds_every_step_from_synthetic_inputs(workspace) -> None:
         assert table.group_first[: len(RECORDS)].tolist() == [0, 1, 1, 3, 3, 3, 6, 7, 8]
         assert table.annotations["n_paths_total"][: len(RECORDS)].tolist() == [record[4] for record in RECORDS]
     assert summaries["store"]["background_zeroed"] > 0 and summaries["store"]["no_calls"] == 1
+    # The reported r^2 the measurement model falls back on is the batches' INFO/INFO, not a dosage-variance ratio.
+    np.testing.assert_allclose(np.load(run / "store" / "reported" / "chr21.npy"), [_reported_info(record) for record in range(len(RECORDS))])
 
     # D*: the imputed halves were rewritten with the measurement's scales; the MANIFEST says so.
     measurement = np.load(run / "measurement" / "measurement.npz")
