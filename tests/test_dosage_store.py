@@ -386,10 +386,14 @@ def test_a_forked_child_compresses_with_its_own_threads(tmp_path: Path) -> None:
         writer.write_rows(codes)
     child = os.fork()
     if child == 0:
-        child_layout = create_code_array(tmp_path / "child", 40, 9, codec="zstd", shard_rows=SHARD_ROWS, inner_rows=INNER_ROWS)
-        with CodeShardWriter(tmp_path / "child", child_layout, 0) as writer:
-            writer.write_rows(codes)
-        os._exit(0)
+        exit_code = 1
+        try:
+            child_layout = create_code_array(tmp_path / "child", 40, 9, codec="zstd", shard_rows=SHARD_ROWS, inner_rows=INNER_ROWS)
+            with CodeShardWriter(tmp_path / "child", child_layout, 0) as writer:
+                writer.write_rows(codes)
+            exit_code = 0
+        finally:
+            os._exit(exit_code)
     deadline = time.monotonic() + 60
     while time.monotonic() < deadline:
         finished, status = os.waitpid(child, os.WNOHANG)
