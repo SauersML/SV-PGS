@@ -33,9 +33,11 @@ truth samples, and on public benchmarks from their truth.
    the whole LD block,
        Xtilde_k = D*_k + sum_j C_jk (D*_j - mu_j),
    removes it. C_k is the Bayesian ridge fit of the calibrated residual
-   T_k - D*_k on the block's standardized columns. One ridge ratio per block is
-   chosen by marginal likelihood, and each target has its own noise variance.
-   A ratio of 0 means the data show no leakage and gives back D*.
+   T_k - D*_k on the block's standardized columns, from the pairs'
+   cross-covariances and the cohort's block covariance (A = Sigma_D^-1 Sigma_DG
+   with Sigma_D from the cohort and Sigma_DG from the truth). One ridge ratio per
+   block is chosen by marginal likelihood, and each target has its own noise
+   variance. A ratio of 0 means the data show no leakage and gives back D*.
 4. The engine's products for the mapped columns. Xtilde = X A with
    A = I + E, where E holds C in the target columns, so a block's centred Gram
    becomes A' G A and its cross-products A' X'y.
@@ -359,65 +361,78 @@ class LeakageMap:
     ridge_ratio: float
 
 
-def fit_leakage_map(calibrated_block: NDArray, target_truth: NDArray, targets: NDArray) -> LeakageMap:
-    """Fit the A-map of one LD block from its calibration pairs.
+def fit_leakage_map(cohort_covariance: NDArray, calibrated_pairs: NDArray, target_truth: NDArray, targets: NDArray) -> LeakageMap:
+    """Fit the A-map of one LD block: A = Sigma_D^-1 Sigma_DG (scale_model.md section 2).
 
-    ``calibrated_block`` is [pairs, columns]: the calibration samples' calibrated
-    stored columns D* for every column of the block, complete (no missing values).
-    ``target_truth`` is [pairs, targets]: the truth of the columns being mapped,
-    whose indices in the block are ``targets``. The ridge prior is exchangeable in
-    standardized units, c ~ N(0, rho sigma_k^2 I). Its ratio rho is shared by the
-    block's targets and maximizes the marginal likelihood of the centred residuals,
-    which live in the n - 1 directions orthogonal to the mean, with each target's
-    sigma_k^2 profiled out in closed form. When the likelihood still rises as rho
-    grows without bound, the map is its limit, the minimum-norm least-squares fit.
-    A column with no calibration variation predicts nothing and gets coefficient 0,
-    as does a target whose calibrated column already equals its truth on every pair.
+    ``cohort_covariance`` is [columns, columns], the covariance of the block's
+    calibrated columns D* in the fitted cohort: Sigma_D, which the cohort knows
+    precisely. ``calibrated_pairs`` is [pairs, columns], the calibration samples'
+    D* for every column of the block, complete, and ``target_truth`` is
+    [pairs, targets], the truth of the columns being mapped, whose indices in the
+    block are ``targets``. The pairs supply only the cross-covariances
+    s_k = X' R_k / n of the standardized columns with the calibrated residual
+    R_k = T_k - D*_k, so Sigma_DG comes from the truth and Sigma_D from the
+    cohort. With R_k = X c_k + e_k, e_k of variance sigma_k^2, s_k is
+    N(C c_k, sigma_k^2 C / n) for the cohort correlation C, and the ridge prior
+    c_k ~ N(0, (t / n) sigma_k^2 I), exchangeable in standardized units, gives the
+    posterior mean c_k = (C + I / t)^-1 s_k. The ratio t is shared by the block's
+    targets and maximizes the marginal likelihood of s, with each sigma_k^2
+    profiled out: t = 0 when the pairs show no leakage, and the least-squares
+    limit C^-1 s_k when the likelihood still rises as t grows without bound. A
+    column with no cohort variation gets coefficient 0, as does a target whose
+    calibrated column already equals its truth on every pair. The likelihood
+    takes the pairs' own correlation to be the cohort's.
     """
-    block = np.asarray(calibrated_block, dtype=np.float64)
+    covariance = np.asarray(cohort_covariance, dtype=np.float64)
+    block = np.asarray(calibrated_pairs, dtype=np.float64)
     truth = np.asarray(target_truth, dtype=np.float64)
     target_index = np.asarray(targets, dtype=np.int64)
-    if block.ndim != 2 or truth.ndim != 2 or truth.shape != (block.shape[0], target_index.shape[0]):
-        raise ValueError("fit_leakage_map needs a block [pairs, columns] and one truth column per target.")
-    if not (np.all(np.isfinite(block)) and np.all(np.isfinite(truth))):
-        raise ValueError("fit_leakage_map needs complete calibration pairs.")
-    if np.any((target_index < 0) | (target_index >= block.shape[1])) or np.unique(target_index).size != target_index.size:
+    columns = block.shape[1] if block.ndim == 2 else -1
+    if covariance.shape != (columns, columns) or truth.ndim != 2 or truth.shape != (block.shape[0], target_index.shape[0]):
+        raise ValueError("fit_leakage_map needs the cohort covariance [columns, columns], pairs [pairs, columns] and one truth column per target.")
+    if not (np.all(np.isfinite(covariance)) and np.all(np.isfinite(block)) and np.all(np.isfinite(truth))):
+        raise ValueError("fit_leakage_map needs a finite cohort covariance and complete calibration pairs.")
+    if np.any((target_index < 0) | (target_index >= columns)) or np.unique(target_index).size != target_index.size:
         raise ValueError("fit_leakage_map needs distinct target columns inside the block.")
     column_means = block.mean(axis=0)
-    coefficients = np.zeros((block.shape[1], target_index.shape[0]))
+    coefficients = np.zeros((columns, target_index.shape[0]))
     centred = block - column_means
-    deviations = centred.std(axis=0)
-    varying = deviations > 0.0
     residuals = (truth - truth.mean(axis=0)) - centred[:, target_index]
+    deviations = np.sqrt(np.maximum(np.diag(covariance), 0.0))
+    varying = deviations > 0.0
     leaking = np.any(residuals != 0.0, axis=0)
     if not (np.any(varying) and np.any(leaking)):
         return LeakageMap(target_index, column_means, coefficients, 0.0)
-    standardized = centred[:, varying] / deviations[varying]
-    left, singular, right_transposed = np.linalg.svd(standardized, full_matrices=False)
-    retained = singular > singular[0] * np.finfo(np.float64).eps * max(standardized.shape)
-    left, singular, right_transposed = left[:, retained], singular[retained], right_transposed[retained]
-    eigenvalues = singular**2
-    directions = block.shape[0] - 1
-    target_count = int(leaking.sum())
-    projected = left.T @ residuals[:, leaking]
-    outside = np.sum((residuals[:, leaking] - left @ projected) ** 2, axis=0)
+    scale = deviations[varying]
+    correlation = covariance[np.ix_(varying, varying)] / np.outer(scale, scale)
+    eigenvalues, vectors = np.linalg.eigh(correlation)
+    retained = eigenvalues > eigenvalues[-1] * np.finfo(np.float64).eps * correlation.shape[0]
+    eigenvalues, vectors = eigenvalues[retained], vectors[:, retained]
+    cross = (centred[:, varying] / scale).T @ residuals[:, leaking] / block.shape[0]
+    projected = vectors.T @ cross
+    weights = projected**2 / eigenvalues[:, None]
+    # A residual orthogonal to every retained direction carries no evidence of leakage.
+    evident = np.any(weights > 0.0, axis=0)
+    if not np.any(evident):
+        return LeakageMap(target_index, column_means, coefficients, 0.0)
+    leaking[np.flatnonzero(leaking)[~evident]] = False
+    projected, weights = projected[:, evident], weights[:, evident]
+    components = eigenvalues.shape[0]
 
     def score(ratio: float) -> float:
         shrink = 1.0 + ratio * eigenvalues
-        energy = np.sum(projected**2 / shrink[:, None], axis=0) + outside
-        energy_slope = -np.sum(projected**2 * (eigenvalues / shrink**2)[:, None], axis=0)
-        return float(-(directions * np.sum(energy_slope / energy) + target_count * np.sum(eigenvalues / shrink)) / 2)
+        slope = np.sum(weights * (eigenvalues / shrink**2)[:, None], axis=0) / np.sum(weights / shrink[:, None], axis=0)
+        return float(np.sum(components * slope - np.sum(eigenvalues / shrink)) / 2)
 
     if not score(0.0) > 0.0:
         return LeakageMap(target_index, column_means, coefficients, 0.0)
-    high = 1.0 / eigenvalues[0]
+    high = 1.0 / eigenvalues[-1]
     while np.isfinite(high) and score(high) > 0.0:
         high *= 2
     ratio = _bisect_to_exhaustion(score, 0.0, high) if np.isfinite(high) else np.inf
-    # rho s / (1 + rho s^2) written as s / (1 / rho + s^2), which is 1 / s at rho = infinity.
-    gains = singular / (1.0 / ratio + eigenvalues)
-    standardized_coefficients = right_transposed.T @ (gains[:, None] * projected)
-    coefficients[np.ix_(varying, leaking)] = standardized_coefficients / deviations[varying][:, None]
+    # t / (1 + t lambda) written as 1 / (1 / t + lambda), which is 1 / lambda at t = infinity.
+    standardized = vectors @ (projected / (1.0 / ratio + eigenvalues)[:, None])
+    coefficients[np.ix_(varying, leaking)] = standardized / scale[:, None]
     return LeakageMap(target_index, column_means, coefficients, ratio)
 
 
@@ -462,11 +477,14 @@ class BlockPairs:
     ``dosage`` is [pairs, block records]: the stored (uncalibrated) columns of every
     record in the block, and ``truth`` is [pairs, targets] for the block's targets.
     Only pairs complete across the block and its targets are kept.
+    ``cohort_covariance`` is [block records, block records], the stored columns'
+    covariance in the fitted cohort (Stage 0's block Gram over the sample count).
     """
 
     block: LdBlock
     dosage: F64Array
     truth: F64Array
+    cohort_covariance: F64Array
 
     def __post_init__(self) -> None:
         records = np.asarray(self.block.records)
@@ -476,6 +494,8 @@ class BlockPairs:
             raise ValueError("BlockPairs needs dosage [pairs, block records] and truth [pairs, targets].")
         if not (np.all(np.isfinite(dosage)) and np.all(np.isfinite(truth))):
             raise ValueError("BlockPairs needs pairs complete across the block and its targets.")
+        if np.asarray(self.cohort_covariance).shape != (records.shape[0], records.shape[0]):
+            raise ValueError("BlockPairs needs the cohort covariance of the block's records.")
 
 
 @dataclass(frozen=True)
@@ -510,28 +530,40 @@ class CalibrationPairs:
 
 
 def calibration_pairs(
-    sample_ids: Sequence[ResearchId], dosage: NDArray, truth: NDArray, blocks: Sequence[LdBlock] = ()
+    sample_ids: Sequence[ResearchId],
+    dosage: NDArray,
+    truth: NDArray,
+    blocks: Sequence[LdBlock] = (),
+    block_covariances: Sequence[NDArray] = (),
 ) -> CalibrationPairs:
-    """Calibration pairs from dense [records, samples] arrays, NaN where missing (a benchmark's scale)."""
+    """Calibration pairs from dense [records, samples] arrays, NaN where missing (a benchmark's scale).
+
+    ``block_covariances`` holds each block's cohort covariance of its stored columns.
+    """
     dosage_values = np.asarray(dosage, dtype=np.float64)
     truth_values = np.asarray(truth, dtype=np.float64)
     if dosage_values.ndim != 2 or dosage_values.shape[1] != len(sample_ids):
         raise ValueError("calibration_pairs needs dosage and truth of shape [records, samples], one column per sample ID.")
+    if len(block_covariances) != len(blocks):
+        raise ValueError("calibration_pairs needs one cohort covariance per block.")
     block_pairs = []
-    for block in blocks:
+    for block, block_covariance in zip(blocks, block_covariances):
         records = np.asarray(block.records, dtype=np.int64)
         target_records = records[np.asarray(block.targets, dtype=np.int64)]
         complete = np.all(np.isfinite(dosage_values[records]), axis=0) & np.all(np.isfinite(truth_values[target_records]), axis=0)
-        block_pairs.append(BlockPairs(block, dosage_values[records][:, complete].T, truth_values[target_records][:, complete].T))
+        block_pairs.append(
+            BlockPairs(block, dosage_values[records][:, complete].T, truth_values[target_records][:, complete].T, np.asarray(block_covariance, dtype=np.float64))
+        )
     return CalibrationPairs(tuple(sample_ids), calibration_moments(dosage_values, truth_values), tuple(block_pairs))
 
 
 def fit_block_map(pairs: BlockPairs, scales: NDArray) -> LeakageMap:
-    """One block's leakage map, from its pairs with each column recalibrated by its record's scale."""
+    """One block's leakage map, with each column recalibrated by its record's scale, pairs and cohort alike."""
     block_scales = np.asarray(scales, dtype=np.float64)[np.asarray(pairs.block.records, dtype=np.int64)]
     dosage = np.asarray(pairs.dosage, dtype=np.float64)
     means = dosage.mean(axis=0)
-    return fit_leakage_map(means + block_scales * (dosage - means), pairs.truth, pairs.block.targets)
+    calibrated_covariance = block_scales[:, None] * np.asarray(pairs.cohort_covariance, dtype=np.float64) * block_scales[None, :]
+    return fit_leakage_map(calibrated_covariance, means + block_scales * (dosage - means), pairs.truth, pairs.block.targets)
 
 
 @dataclass(frozen=True)

@@ -167,6 +167,13 @@ def _regression(outcome: np.ndarray, columns: np.ndarray) -> tuple[np.ndarray, n
     return coefficients[1:], np.sqrt(np.diag(covariance))[1:]
 
 
+def _shrinkage_gap(covariance: np.ndarray, ratio: float) -> float:
+    """max_i 1 / (1 + t lambda_i): the largest relative shrinkage of the ridge posterior mean."""
+    deviations = np.sqrt(np.diag(covariance))
+    eigenvalues = np.linalg.eigvalsh(covariance / np.outer(deviations, deviations))
+    return float(np.max(1.0 / (1.0 + ratio * eigenvalues)))
+
+
 def test_the_leakage_map_moves_an_sv_effect_back_off_its_tag_snp() -> None:
     rng = np.random.default_rng(20260919)
     frequency, effect, keep = 0.3, 1.0, 0.5
@@ -175,21 +182,25 @@ def test_the_leakage_map_moves_an_sv_effect_back_off_its_tag_snp() -> None:
     moments = calibration_moments(calibration_draw[None], calibration_sv[None])
     scale = pooled_calibration(moments, moments.dosage_variance, np.zeros(1, dtype=int)).scales[0]
     calibrated = moments.dosage_mean[0] + scale * (calibration_draw - moments.dosage_mean[0])
-    leakage = fit_leakage_map(np.column_stack([calibrated, calibration_snp]), calibration_sv[:, None], np.array([0]))
-    assert leakage.ridge_ratio > 0.0
 
     cohort_sv, cohort_snp = _two_locus(rng, 40000, frequency, 0.9)
     cohort_draw = _draw_type_column(cohort_sv[None], np.array([frequency]), keep, rng)[0]
     cohort_calibrated = moments.dosage_mean[0] + scale * (cohort_draw - moments.dosage_mean[0])
+    cohort_block = np.column_stack([cohort_calibrated, cohort_snp])
+    covariance = np.cov(cohort_block.T, bias=True)
+    leakage = fit_leakage_map(covariance, np.column_stack([calibrated, calibration_snp]), calibration_sv[:, None], np.array([0]))
+    assert leakage.ridge_ratio > 0.0
+
     outcome = effect * cohort_sv + rng.normal(0.0, 1.0, cohort_sv.size)
-    plain, plain_error = _regression(outcome, np.column_stack([cohort_calibrated, cohort_snp]))
-    mapped_block = apply_leakage_map(np.column_stack([cohort_calibrated, cohort_snp]), leakage)
-    mapped, mapped_error = _regression(outcome, mapped_block)
-    # The map is estimated from the calibration pairs, so what leak remains is the
-    # effect times the map's own estimation error on the SNP column.
+    plain, plain_error = _regression(outcome, cohort_block)
+    mapped, mapped_error = _regression(outcome, apply_leakage_map(cohort_block, leakage))
+    # What leak remains is the effect times the map's own error on the SNP column:
+    # its sampling error (that of the pairs' regression) and its ridge shrinkage.
     _, map_error = _regression(calibration_sv - calibrated, np.column_stack([calibrated, calibration_snp]))
+    gap = _shrinkage_gap(covariance, leakage.ridge_ratio)
+    shrinkage = gap / (1 - gap) * abs(leakage.coefficients[1, 0])
     assert plain[1] > sampling_bound(float(plain_error[1]))
-    assert abs(mapped[1]) <= sampling_bound(float(np.hypot(mapped_error[1], effect * map_error[1])))
+    assert abs(mapped[1]) <= sampling_bound(float(np.hypot(mapped_error[1], effect * map_error[1]))) + effect * shrinkage
     assert abs(mapped[0] - effect) < abs(plain[0] - effect)
 
 
@@ -201,7 +212,8 @@ def test_a_joint_posterior_mean_column_gets_no_leakage_correction() -> None:
     carrier_given_snp = agree
     carrier_given_no_snp = (1.0 - linkage) * frequency
     posterior_mean = snp * carrier_given_snp + (2.0 - snp) * carrier_given_no_snp
-    leakage = fit_leakage_map(np.column_stack([posterior_mean, snp]), sv[:, None], np.array([0]))
+    block = np.column_stack([posterior_mean, snp])
+    leakage = fit_leakage_map(np.cov(block.T, bias=True), block, sv[:, None], np.array([0]))
     residual = sv - posterior_mean
     bound = sampling_bound(float(np.std(residual) / (np.std(snp) * np.sqrt(sv.size))))
     assert np.all(np.abs(leakage.coefficients) <= bound)
@@ -211,7 +223,7 @@ def test_the_mapped_gram_is_the_gram_of_the_mapped_columns() -> None:
     rng = np.random.default_rng(9)
     block = rng.normal(size=(500, 6))
     truth = block[:, [1, 4]] + 0.3 * block[:, [0, 5]] + rng.normal(0.0, 0.5, (500, 2))
-    leakage = fit_leakage_map(block, truth, np.array([1, 4]))
+    leakage = fit_leakage_map(np.cov(block.T, bias=True), block, truth, np.array([1, 4]))
     centred = block - leakage.column_means
     mapped_centred = apply_leakage_map(block, leakage) - leakage.column_means
     transform = leakage_transform(leakage)
@@ -221,23 +233,27 @@ def test_the_mapped_gram_is_the_gram_of_the_mapped_columns() -> None:
     assert np.all(np.abs(mapped_gram(centred.T @ centred, leakage) - mapped_centred.T @ mapped_centred) <= gram_bound)
 
 
-def test_noise_free_leakage_is_recovered_exactly() -> None:
+def test_the_map_recovers_a_known_leak_from_the_cohort_covariance() -> None:
     rng = np.random.default_rng(31)
-    block = rng.normal(size=(400, 5))
+    pairs, noise = 4000, 0.3
     leak = np.array([0.0, 0.4, -0.3, 0.2, 0.1])
-    centred = block - block.mean(axis=0)
-    truth = block[:, [0]] + (centred @ leak)[:, None]
-    leakage = fit_leakage_map(block, truth, np.array([0]))
-    # The residual lies in the columns' span, so the fit is the least-squares solution
-    # up to rounding, amplified at most by the block's condition number.
-    bound = rounding_gamma(block.size) * np.linalg.cond(centred / centred.std(axis=0)) * np.abs(leak).max()
+    covariance = np.cov(rng.normal(size=(200000, 5)).T, bias=True)
+    block = rng.normal(size=(pairs, 5))
+    truth = block[:, [0]] + ((block - block.mean(axis=0)) @ leak)[:, None] + rng.normal(0.0, noise, (pairs, 1))
+    leakage = fit_leakage_map(covariance, block, truth, np.array([0]))
+    # Independent unit columns: s_j - c_j has variance (|c|^2 + c_j^2 + noise^2) / n from
+    # the pairs' own correlation and noise, and the ridge shrinks by at most the gap.
+    standard_errors = np.sqrt((leak @ leak + leak**2 + noise**2) / pairs)
+    gap = _shrinkage_gap(covariance, leakage.ridge_ratio)
+    bound = sampling_bound(1.0) * standard_errors + gap / (1 - gap) * np.abs(leakage.coefficients[:, 0])
     assert np.all(np.abs(leakage.coefficients[:, 0] - leak) <= bound)
 
 
 def test_a_block_wider_than_its_pairs_still_gets_a_finite_map() -> None:
     rng = np.random.default_rng(13)
+    covariance = np.cov(rng.normal(size=(2000, 40)).T, bias=True)
     block = rng.normal(size=(20, 40))
-    leakage = fit_leakage_map(block, block[:, [3]] + rng.normal(size=(20, 1)), np.array([3]))
+    leakage = fit_leakage_map(covariance, block, block[:, [3]] + rng.normal(size=(20, 1)), np.array([3]))
     assert leakage.ridge_ratio >= 0.0
     assert np.all(np.isfinite(leakage.coefficients))
 
@@ -274,6 +290,7 @@ def test_with_truth_the_model_recalibrates_and_maps_each_block() -> None:
         np.vstack([draw, snp]),
         np.vstack([sv, snp]),
         blocks=(LdBlock(np.array([0, 1]), np.array([0])),),
+        block_covariances=(np.cov(np.vstack([draw, snp]), bias=True),),
     )
     model = fit_measurement_model(pairs, np.array([np.var(draw), np.var(snp)]), np.array([0, 1]))
     assert model.certificate["calibrated_records"] == 2 and model.certificate["uncalibrated_records"] == 0
