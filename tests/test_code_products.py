@@ -101,3 +101,67 @@ def test_a_workspace_too_small_for_one_chunk_is_refused() -> None:
     tile = CodeBlockTile(codes, means, scales, np, 1000)
     with pytest.raises(MemoryError, match="workspace"):
         tile.rmatmat(rng.standard_normal((1001, 3)))
+
+
+def _standard_tile_inputs(rng: np.random.Generator, variants: int, samples: int) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    codes = _signed_codes(rng, variants, samples)
+    standardized, means, scales = _standardized(codes)
+    return codes, standardized, means, scales
+
+
+def test_cpu_sample_operand_gives_the_array_rmatmat_bit_for_bit() -> None:
+    rng = np.random.default_rng(11)
+    codes, _standardized_codes, means, scales = _standard_tile_inputs(rng, 37, 1001)
+    tiles = [CodeBlockTile(codes[rows], means[rows], scales[rows], np, 1 << 34) for rows in (slice(0, 20), slice(20, 37))]
+    left = rng.standard_normal((1001, 5)) * np.exp(rng.uniform(-20, 20, 5))[None, :]
+    operand = tiles[0].sample_operand(left)
+    for tile in tiles:
+        np.testing.assert_array_equal(tile.rmatmat(operand).view(np.uint64), tile.rmatmat(left).view(np.uint64))
+
+
+@pytest.mark.parametrize("workspace_bytes", [1 << 34, 40_000])
+def test_cpu_accumulate_matmat_adds_matmat_bit_for_bit(workspace_bytes: int) -> None:
+    rng = np.random.default_rng(12)
+    codes, _standardized_codes, means, scales = _standard_tile_inputs(rng, 37, 1001)
+    tile = CodeBlockTile(codes, means, scales, np, workspace_bytes)
+    right = rng.standard_normal((37, 4))
+    expected = rng.standard_normal((1001, 4))
+    fused = expected.copy()
+    expected += tile.matmat(right)
+    tile.accumulate_matmat(right, fused)
+    np.testing.assert_array_equal(fused.view(np.uint64), expected.view(np.uint64))
+
+
+def test_cpu_weighted_column_squares_match_the_dense_reference() -> None:
+    rng = np.random.default_rng(13)
+    variants, samples = 37, 1001
+    codes, standardized, means, scales = _standard_tile_inputs(rng, variants, samples)
+    tile = CodeBlockTile(codes, means, scales, np, 1 << 34)
+    weights = rng.uniform(0.05, 0.25, (samples, 3))
+    produced = tile.weighted_column_squares(weights)
+    reference = np.square(standardized) @ weights
+    values = codes.astype(np.float64)
+    # both sides round each of their n-term sums (gamma_n) and the few terms around them (gamma_4)
+    magnitude = (
+        np.square(values) @ weights + 2.0 * np.abs(means)[:, None] * (np.abs(values) @ weights) + np.square(means)[:, None] * weights.sum(axis=0)[None, :]
+    ) / np.square(scales)[:, None]
+    bound = (_gamma(samples) + _gamma(4)) * magnitude + _gamma(samples + 2) * reference
+    assert np.all(np.abs(produced - reference) <= bound)
+
+
+def test_from_aligned_wraps_the_callers_codes_without_copying() -> None:
+    rng = np.random.default_rng(14)
+    codes, _standardized_codes, means, scales = _standard_tile_inputs(rng, 37, 1001)
+    aligned = np.zeros((40, 1004), dtype=np.int8)
+    aligned[:37, :1001] = codes
+    wrapped = CodeBlockTile.from_aligned(aligned, 37, 1001, means, scales, np, 1 << 34)
+    copied = CodeBlockTile(codes, means, scales, np, 1 << 34)
+    left = rng.standard_normal((1001, 3))
+    assert np.shares_memory(wrapped._codes, aligned)
+    np.testing.assert_array_equal(wrapped.rmatmat(left).view(np.uint64), copied.rmatmat(left).view(np.uint64))
+    aligned[38, 5] = 1
+    aligned[3, 1002] = -4
+    cleared = CodeBlockTile.from_aligned(aligned, 37, 1001, means, scales, np, 1 << 34)
+    np.testing.assert_array_equal(cleared.rmatmat(left).view(np.uint64), copied.rmatmat(left).view(np.uint64))
+    with pytest.raises(ValueError, match="aligned_codes"):
+        CodeBlockTile.from_aligned(aligned[:, :1002], 37, 1001, means, scales, np, 1 << 34)

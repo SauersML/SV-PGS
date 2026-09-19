@@ -20,10 +20,17 @@ Both devices return fp64-accurate products.
   ``2^-(7 OPERAND_DIGITS - 2)`` of its column maximum per entry.
 * CPU: the codes are converted to float64 per sample chunk (exact) and multiplied by DGEMM.
 
+One Stage 2 read multiplies every block by the same sample-side operand ``L``, so
+``CodeBlockTile.sample_operand(L)`` prepares it once (its digits on CUDA, its padded copy on the
+CPU, and its column sums) and every block's ``rmatmat`` reuses it. ``accumulate_matmat(R, image)``
+adds ``X_b R`` into the read's image in place, with the recombination, centering and sum fused
+on CUDA. Both give exactly the values of ``rmatmat(L)`` and ``image += matmat(R)``.
+
 Memory: the caller's plan hands each tile ``workspace_bytes`` for the transients of one product.
 Every product counts its fixed buffers (padded operand, output, integer products) and its
 per-sample ones from the expressions that allocate them, and its sample chunk is the most that
-fits. CuPy is passed in by the caller as the array module; this module never imports it.
+fits. A ``SampleOperand`` lives for a whole read, so the plan counts its ``nbytes`` separately.
+CuPy is passed in by the caller as the array module; this module never imports it.
 """
 
 from __future__ import annotations
@@ -103,6 +110,121 @@ def _aligned(count: int) -> int:
     return -(-count // INT8_GEMM_ALIGNMENT) * INT8_GEMM_ALIGNMENT
 
 
+_TRANSPOSE_SOURCE = r"""
+extern "C" __global__
+void transpose_codes(const signed char* __restrict__ source, signed char* __restrict__ target,
+                     long long rows, long long lead, long long column_start, long long columns) {
+    // target [columns, rows] = source[:, column_start:column_start + columns].T, source row-major [rows, lead]
+    __shared__ int tile[WARP][WARP + 1];
+    long long column = column_start + (long long)blockIdx.x * WARP + threadIdx.x;
+    long long row0 = (long long)blockIdx.y * WARP;
+    for (int step = threadIdx.y; step < WARP; step += blockDim.y) {
+        long long row = row0 + step;
+        tile[step][threadIdx.x] = (row < rows && column < column_start + columns) ? (int)source[row * lead + column] : 0;
+    }
+    __syncthreads();
+    long long target_row0 = (long long)blockIdx.x * WARP;
+    long long target_column = row0 + threadIdx.x;
+    for (int step = threadIdx.y; step < WARP; step += blockDim.y) {
+        long long target_row = target_row0 + step;
+        if (target_row < columns && target_column < rows) {
+            target[target_row * rows + target_column] = (signed char)tile[threadIdx.x][step];
+        }
+    }
+}
+"""
+
+_ACCUMULATE_SOURCE = r"""
+extern "C" __global__
+void accumulate_recombined(const int* __restrict__ products, long long lead, int digits, long long columns,
+                           const double* __restrict__ scale, const double* __restrict__ offset,
+                           double* __restrict__ image, long long row_start, long long rows) {
+    // image[row_start + i, k] += recombined(products[i, :, k]) / scale[k] - offset[k], image row-major,
+    // products column-major [lead, digits * columns]: recombine_digit_products' operations in its order,
+    // with explicit roundings so that no multiply-add is contracted.
+    __shared__ double tile[WARP][WARP + 1];
+    long long row0 = (long long)blockIdx.x * WARP;
+    long long column0 = (long long)blockIdx.y * WARP;
+    for (int step = threadIdx.y; step < WARP; step += blockDim.y) {
+        long long column = column0 + step;
+        long long row = row0 + threadIdx.x;
+        double total = 0.0;
+        if (column < columns && row < rows) {
+            total = (double)products[((long long)(digits - 1) * columns + column) * lead + row];
+            for (int digit = digits - 2; digit >= 0; --digit) {
+                total = __dadd_rn(__dmul_rn(total, (double)(1 << DIGIT_BITS)), (double)products[((long long)digit * columns + column) * lead + row]);
+            }
+            total = __dsub_rn(__ddiv_rn(total, scale[column]), offset[column]);
+        }
+        tile[step][threadIdx.x] = total;
+    }
+    __syncthreads();
+    for (int step = threadIdx.y; step < WARP; step += blockDim.y) {
+        long long row = row0 + step;
+        long long column = column0 + threadIdx.x;
+        if (column < columns && row < rows) {
+            long long at = (row_start + row) * columns + column;
+            image[at] = __dadd_rn(image[at], tile[threadIdx.x][step]);
+        }
+    }
+}
+"""
+
+_KERNELS: dict[tuple[int, int, str], Any] = {}
+
+
+def _cuda_kernel(cupy: ModuleType, name: str) -> tuple[Any, int]:
+    """The named kernel for the current device, compiled once, with its warp-wide tile edge.
+
+    The tile edge is the device's warp size, so each warp moves one contiguous tile row; a block
+    holds as many warp rows as the device allows, up to one per tile row.
+    """
+    device = cupy.cuda.Device()
+    key = (id(cupy), int(device.id), name)
+    if key not in _KERNELS:
+        warp = int(device.attributes["WarpSize"])
+        source = _TRANSPOSE_SOURCE if name == "transpose_codes" else _ACCUMULATE_SOURCE
+        options = (f"-DWARP={warp}", f"-DDIGIT_BITS={DIGIT_BITS}")
+        _KERNELS[key] = (cupy.RawKernel(source, name, options=options), warp)
+    return _KERNELS[key]
+
+
+def _launch_shape(cupy: ModuleType, warp: int, rows: int, columns: int) -> tuple[tuple[int, int], tuple[int, int]]:
+    """Grid and block of a warp-tiled kernel over [rows, columns] (rows along grid x)."""
+    warp_rows = min(warp, int(cupy.cuda.Device().attributes["MaxThreadsPerBlock"]) // warp)
+    return (-(-rows // warp), -(-columns // warp)), (warp, warp_rows)
+
+
+def _transpose_codes(cupy: ModuleType, codes: Any, column_start: int, column_stop: int) -> Any:
+    """``cupy.ascontiguousarray(codes[:, column_start:column_stop].T)`` for C-contiguous int8 codes."""
+    kernel, warp = _cuda_kernel(cupy, "transpose_codes")
+    rows, lead = (int(extent) for extent in codes.shape)
+    columns = column_stop - column_start
+    target = cupy.empty((columns, rows), dtype=cupy.int8)
+    grid, block = _launch_shape(cupy, warp, columns, rows)
+    kernel(grid, block, (codes, target, np.int64(rows), np.int64(lead), np.int64(column_start), np.int64(columns)))
+    return target
+
+
+class SampleOperand:
+    """The sample-side operand ``L`` [n, K] of one read, prepared once for every block's ``X_b' L``.
+
+    Built by ``CodeBlockTile.sample_operand``. On CUDA it holds the balanced digits of ``L`` (one
+    set per int32-exact span of samples, which the read's memory plan holds whole) and on the CPU
+    the zero-padded ``L``; both hold the column sums ``1' L``. ``nbytes`` counts what it holds.
+    """
+
+    def __init__(self, column_sums: Any, padded: Any, chunks: list[tuple[int, int, Any, Any]], padded_samples: int) -> None:
+        self.column_sums = column_sums
+        self.columns = int(column_sums.shape[0])
+        self.padded = padded
+        self.chunks = chunks
+        self.padded_samples = padded_samples
+        self.nbytes = int(column_sums.nbytes) + (0 if padded is None else int(padded.nbytes)) + sum(
+            int(digits.nbytes) + int(scale.nbytes) for _, _, digits, scale in chunks
+        )
+
+
 class CodeBlockTile:
     """Standardized genotypes ``X_b = (S - mean) / scale`` of one LD block, from its signed codes.
 
@@ -113,16 +235,41 @@ class CodeBlockTile:
     """
 
     def __init__(self, signed_codes: Any, means: Any, scales: Any, array_module: ModuleType, workspace_bytes: int) -> None:
-        self._array_module = array_module
         codes = array_module.asarray(signed_codes)
         if codes.dtype != array_module.int8 or codes.ndim != 2:
             raise ValueError("signed_codes must be a 2-D int8 [variants, samples] array")
-        self._variant_count, self._sample_count = (int(extent) for extent in codes.shape)
-        self._codes = array_module.zeros((_aligned(self._variant_count), _aligned(self._sample_count)), dtype=array_module.int8)
-        self._codes[: self._variant_count, : self._sample_count] = codes
+        variant_count, sample_count = (int(extent) for extent in codes.shape)
+        aligned = array_module.zeros((_aligned(variant_count), _aligned(sample_count)), dtype=array_module.int8)
+        aligned[:variant_count, :sample_count] = codes
+        self._hold(aligned, variant_count, sample_count, means, scales, array_module, workspace_bytes)
+
+    @classmethod
+    def from_aligned(
+        cls, aligned_codes: Any, variant_count: int, sample_count: int, means: Any, scales: Any,
+        array_module: ModuleType, workspace_bytes: int,
+    ) -> CodeBlockTile:
+        """A tile over codes the caller already holds in an ``INT8_GEMM_ALIGNMENT``-aligned buffer (a
+        streamed block's device buffer, say), without copying them. The alignment padding, at most
+        three rows and three columns, is cleared in place."""
+        codes = array_module.asarray(aligned_codes)
+        if codes.dtype != array_module.int8 or codes.shape != (_aligned(variant_count), _aligned(sample_count)):
+            raise ValueError(f"aligned_codes must be int8 [{_aligned(variant_count)}, {_aligned(sample_count)}]")
+        codes[variant_count:] = 0
+        codes[:, sample_count:] = 0
+        tile = cls.__new__(cls)
+        tile._hold(codes, int(variant_count), int(sample_count), means, scales, array_module, workspace_bytes)
+        return tile
+
+    def _hold(
+        self, aligned_codes: Any, variant_count: int, sample_count: int, means: Any, scales: Any,
+        array_module: ModuleType, workspace_bytes: int,
+    ) -> None:
+        self._array_module = array_module
+        self._variant_count, self._sample_count = variant_count, sample_count
+        self._codes = aligned_codes
         self._means = array_module.asarray(means, dtype=array_module.float64)
         self._scales = array_module.asarray(scales, dtype=array_module.float64)
-        if self._means.shape != (self._variant_count,) or self._scales.shape != (self._variant_count,):
+        if self._means.shape != (variant_count,) or self._scales.shape != (variant_count,):
             raise ValueError("means and scales need one entry per variant")
         self._workspace_bytes = int(workspace_bytes)
 
@@ -140,12 +287,99 @@ class CodeBlockTile:
         scaled = xp.asarray(right, dtype=xp.float64) / self._scales[:, None]
         return self._codes_transposed_times(scaled) - (self._means @ scaled)[None, :]
 
-    def rmatmat(self, left: Any) -> Any:
-        """X_b.T @ left for left of shape (n, K); returns (p_b, K)."""
+    def accumulate_matmat(self, right: Any, image: Any) -> None:
+        """``image += self.matmat(right)`` in place, with exactly its values.
+
+        ``image`` is the read's C-contiguous float64 (n, K) sum. No (n, K) temporary is formed: on
+        CUDA one kernel recombines each chunk's integer products, centers them and adds them in.
+        """
+        xp = self._array_module
+        scaled = xp.asarray(right, dtype=xp.float64) / self._scales[:, None]
+        offset = self._means @ scaled
+        variants, samples = (int(extent) for extent in self._codes.shape)
+        columns = int(scaled.shape[1])
+        if image.shape != (self._sample_count, columns) or image.dtype != xp.float64 or not image.flags.c_contiguous:
+            raise ValueError(f"image must be C-contiguous float64 [{self._sample_count}, {columns}]")
+        padded = self._padded_rows(scaled, variants)
+        if xp is np:
+            # the chunks of _codes_transposed_times, so every GEMM call and hence every value matches
+            fixed = _FLOAT64_BYTES * variants * columns + _FLOAT64_BYTES * samples * columns
+            chunk = self._sample_chunk(fixed, _FLOAT64_BYTES * (variants + columns), samples)
+            for start in range(0, min(samples, self._sample_count), chunk):
+                stop = min(start + chunk, samples)
+                rows = min(stop, self._sample_count) - start
+                image[start : start + rows] += (self._codes[:, start:stop].T.astype(np.float64) @ padded)[:rows] - offset[None, :]
+            return
+        if variants > INT32_EXACT_DIGIT_ROWS:
+            raise ValueError(f"an LD block of {variants} variants exceeds the int32-exact depth {INT32_EXACT_DIGIT_ROWS}")
+        digits, scale = operand_digits(padded, xp)
+        digit_columns = OPERAND_DIGITS * columns
+        # fixed: the operand and its digits; per sample: its variant-contiguous codes and integer products
+        fixed = _FLOAT64_BYTES * variants * columns + digit_columns * variants
+        chunk = self._sample_chunk(fixed, variants + _INT32_BYTES * digit_columns, samples)
+        products = xp.empty((chunk, digit_columns), dtype=xp.int32, order="F")
+        kernel, warp = _cuda_kernel(xp, "accumulate_recombined")
+        scale, offset = xp.ascontiguousarray(scale), xp.ascontiguousarray(offset)
+        for start in range(0, min(samples, self._sample_count), chunk):
+            stop = min(start + chunk, samples)
+            variant_contiguous = _transpose_codes(xp, self._codes, start, stop)
+            _cuda_int8_gemm(
+                xp, rows=stop - start, columns=digit_columns, depth=variants,
+                left=variant_contiguous, left_offset=0, left_lead=variants,
+                right=digits, right_lead=variants, output=products, output_lead=chunk,
+            )
+            rows = min(stop, self._sample_count) - start
+            grid, block = _launch_shape(xp, warp, rows, columns)
+            kernel(
+                grid, block,
+                (products, np.int64(chunk), np.int32(OPERAND_DIGITS), np.int64(columns), scale, offset, image, np.int64(start), np.int64(rows)),
+            )
+
+    def sample_operand(self, left: Any) -> SampleOperand:
+        """``left`` [n, K] prepared once for the ``rmatmat`` of every block of a read.
+
+        Every tile of the read shares this tile's sample count. ``rmatmat(operand)`` equals
+        ``rmatmat(left)`` bit for bit whenever ``left``'s product fits one chunk of its own (a
+        workspace that holds it and n within the int32-exact depth); otherwise the two group the
+        fp64 sum over samples differently.
+        """
         xp = self._array_module
         values = xp.asarray(left, dtype=xp.float64)
-        centered = self._codes_times(values) - self._means[:, None] * values.sum(axis=0)[None, :]
+        samples = int(self._codes.shape[1])
+        if values.ndim != 2 or values.shape[0] != self._sample_count:
+            raise ValueError(f"left must be [{self._sample_count}, K]")
+        padded = self._padded_rows(values, samples)
+        column_sums = values.sum(axis=0)
+        if xp is np:
+            return SampleOperand(column_sums, padded, [], samples)
+        span = INT32_EXACT_DIGIT_ROWS // INT8_GEMM_ALIGNMENT * INT8_GEMM_ALIGNMENT
+        chunks = [(start, min(start + span, samples), *operand_digits(padded[start : start + span], xp)) for start in range(0, samples, span)]
+        return SampleOperand(column_sums, None, chunks, samples)
+
+    def rmatmat(self, left: Any) -> Any:
+        """X_b.T @ left for left of shape (n, K), or for its read's ``SampleOperand``; returns (p_b, K)."""
+        xp = self._array_module
+        if isinstance(left, SampleOperand):
+            products, column_sums = self._codes_times_operand(left), left.column_sums
+        else:
+            values = xp.asarray(left, dtype=xp.float64)
+            products, column_sums = self._codes_times(values), values.sum(axis=0)
+        centered = products - self._means[:, None] * column_sums[None, :]
         return centered / self._scales[:, None]
+
+    def weighted_column_squares(self, weights: Any) -> Any:
+        """(X_b * X_b).T @ weights for weights of shape (n, c); returns (p_b, c).
+
+        With x = (s - mean) / scale, sum_i w_i x_i^2 = (S2 w - 2 mean (S w) + mean^2 (1' w)) / scale^2
+        for S2 = s * s. On CUDA, S2 = 128 A + B with A = S2 >> 7 and B = S2 & 127, both in [0, 127],
+        so each digit GEMM stays within the int32-exact bound of the codes themselves.
+        """
+        xp = self._array_module
+        operand = self.sample_operand(weights)
+        linear = self._codes_times_operand(operand)
+        squares = self._squared_codes_times_operand(operand)
+        centered = squares - 2.0 * self._means[:, None] * linear + (self._means * self._means)[:, None] * operand.column_sums[None, :]
+        return centered / (self._scales * self._scales)[:, None]
 
     def weighted_gram(self, weights: Any) -> Any:
         """X_b.T diag(weights) X_b; returns (p_b, p_b)."""
@@ -206,17 +440,74 @@ class CodeBlockTile:
         # per sample: the digit split of its operand row
         fixed = operand_bytes + variants * columns * (3 * _FLOAT64_BYTES + OPERAND_DIGITS * _INT32_BYTES)
         chunk = self._sample_chunk(fixed, _DIGIT_WORKING_BYTES * columns, INT32_EXACT_DIGIT_ROWS)
+        chunks = ((start, min(start + chunk, samples), *operand_digits(padded[start : start + chunk], xp)) for start in range(0, samples, chunk))
+        return self._digit_products(self._codes, chunks, columns)[: self._variant_count]
+
+    def _digit_products(self, left_codes: Any, chunks: Any, columns: int) -> Any:
+        """sum over the operand's sample chunks of left_codes @ chunk, from its digits (CUDA); [p_b, K]."""
+        xp = self._array_module
+        variants, samples = (int(extent) for extent in left_codes.shape)
+        total = xp.zeros((variants, columns), dtype=xp.float64)
         products = xp.empty((variants, OPERAND_DIGITS * columns), dtype=xp.int32, order="F")
-        for start in range(0, samples, chunk):
-            stop = min(start + chunk, samples)
-            digits, scale = operand_digits(padded[start:stop], xp)
+        for start, stop, digits, scale in chunks:
             _cuda_int8_gemm(
                 xp, rows=variants, columns=OPERAND_DIGITS * columns, depth=stop - start,
-                left=self._codes, left_offset=start, left_lead=samples,
+                left=left_codes, left_offset=start, left_lead=samples,
                 right=digits, right_lead=stop - start, output=products, output_lead=variants,
             )
             total += recombine_digit_products(products, scale, xp)
-        return total[: self._variant_count]
+        return total
+
+    def _require_workspace(self, fixed_bytes: int) -> None:
+        if fixed_bytes > self._workspace_bytes:
+            raise MemoryError(f"a workspace of {self._workspace_bytes} bytes cannot hold a product's fixed buffers ({fixed_bytes} bytes)")
+
+    def _operand_codes_times(self, operand: SampleOperand, converted: Any) -> Any:
+        """sum over samples of converted(codes chunk) @ operand, on the CPU; [p_b, K]."""
+        variants, samples = (int(extent) for extent in self._codes.shape)
+        columns = operand.columns
+        # fixed: the total and one GEMM result; per sample: its converted fp64 codes
+        chunk = self._sample_chunk(2 * _FLOAT64_BYTES * variants * columns, _FLOAT64_BYTES * variants, samples)
+        total = np.zeros((variants, columns), dtype=np.float64)
+        for start in range(0, samples, chunk):
+            stop = min(start + chunk, samples)
+            total += converted(self._codes[:, start:stop]) @ operand.padded[start:stop]
+        return total
+
+    def _check_operand(self, operand: SampleOperand) -> None:
+        if operand.padded_samples != int(self._codes.shape[1]):
+            raise ValueError("the operand was prepared for tiles of another sample count")
+
+    def _codes_times_operand(self, operand: SampleOperand) -> Any:
+        """S @ L for the read's prepared L; returns [p_b, K] float64."""
+        self._check_operand(operand)
+        if self._array_module is np:
+            return self._operand_codes_times(operand, lambda codes: codes.astype(np.float64))[: self._variant_count]
+        variants = int(self._codes.shape[0])
+        # fixed: the total, the integer products and two fp64 recombination terms
+        self._require_workspace(variants * operand.columns * (3 * _FLOAT64_BYTES + OPERAND_DIGITS * _INT32_BYTES))
+        return self._digit_products(self._codes, operand.chunks, operand.columns)[: self._variant_count]
+
+    def _squared_codes_times_operand(self, operand: SampleOperand) -> Any:
+        """(S * S) @ L for the read's prepared L; returns [p_b, K] float64."""
+        self._check_operand(operand)
+        xp = self._array_module
+        if xp is np:
+            return self._operand_codes_times(operand, lambda codes: np.square(codes.astype(np.float64)))[: self._variant_count]
+        variants = int(self._codes.shape[0])
+        # fixed: the int16 squares, their two int8 halves, the total, the integer products and two
+        # fp64 recombination terms
+        code_bytes = int(self._codes.size)
+        self._require_workspace(4 * code_bytes + variants * operand.columns * (3 * _FLOAT64_BYTES + OPERAND_DIGITS * _INT32_BYTES))
+        squares = self._codes.astype(xp.int16)
+        squares *= squares
+        high = (squares >> DIGIT_BITS).astype(xp.int8)
+        low = (squares & _DIGIT_MASK).astype(xp.int8)
+        del squares
+        return (
+            self._digit_products(high, operand.chunks, operand.columns) * float(1 << DIGIT_BITS)
+            + self._digit_products(low, operand.chunks, operand.columns)
+        )[: self._variant_count]
 
     def _codes_transposed_times(self, operand: Any) -> Any:
         """S^T @ operand for operand [p_b, K] float64; returns [n, K] float64."""
@@ -236,7 +527,7 @@ class CodeBlockTile:
             return out[: self._sample_count]
         if variants > INT32_EXACT_DIGIT_ROWS:
             raise ValueError(f"an LD block of {variants} variants exceeds the int32-exact depth {INT32_EXACT_DIGIT_ROWS}")
-        # The reduction runs over variants, which the sample-major codes do not hold contiguously,
+        # The reduction runs over variants, which the variant-major codes do not hold contiguously,
         # so each sample chunk is transposed to variant-contiguous order for the TN GEMM.
         digits, scale = operand_digits(padded, xp)
         digit_columns = OPERAND_DIGITS * columns
@@ -249,7 +540,7 @@ class CodeBlockTile:
         out = xp.empty((samples, columns), dtype=xp.float64)
         for start in range(0, samples, chunk):
             stop = min(start + chunk, samples)
-            variant_contiguous = xp.ascontiguousarray(self._codes[:, start:stop].T)
+            variant_contiguous = _transpose_codes(xp, self._codes, start, stop)
             _cuda_int8_gemm(
                 xp, rows=stop - start, columns=digit_columns, depth=variants,
                 left=variant_contiguous, left_offset=0, left_lead=variants,
