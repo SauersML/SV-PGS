@@ -30,8 +30,6 @@ from scipy.special import expit, logit
 
 from sv_pgs._typing import F64Array, I64Array
 
-# kappa is searched on [1, MAXIMUM_SCALE_MULTIPLIER]; the bound only keeps the one-dimensional search finite.
-MAXIMUM_SCALE_MULTIPLIER = 1.0e4
 LOG_TWO_PI = float(np.log(2.0 * np.pi))
 
 
@@ -107,22 +105,30 @@ def prior_weights(inputs: PleiotropyInputs, state: PleiotropyState) -> F64Array:
     return expit(logit(column_rates)[None, :] + leave_one_out)
 
 
-def penalized_log_likelihood(inputs: PleiotropyInputs, state: PleiotropyState) -> float:
-    """The layer's objective: sum over columns of log[rate e^{E_j} + 1 - rate] plus the Beta(2, 2) log prior of
-    every class rate (up to state-free constants). update_state never decreases it."""
+def log_marginal_likelihood(inputs: PleiotropyInputs, state: PleiotropyState) -> float:
+    """The layer's type-II objective: sum over columns of log[rate e^{E_j} + 1 - rate] (up to a state-free
+    constant). update_state never decreases it."""
     joint_evidence, _leave_one_out = evidence(inputs, state.scale_multiplier)
     column_rates = state.rates[inputs.class_index]
-    likelihood = np.sum(np.logaddexp(np.log(column_rates) + joint_evidence, np.log1p(-column_rates)))
-    return float(likelihood + np.sum(np.log(state.rates) + np.log1p(-state.rates)))
+    return float(np.sum(np.logaddexp(np.log(column_rates) + joint_evidence, np.log1p(-column_rates))))
+
+
+def largest_useful_multiplier(inputs: PleiotropyInputs) -> float:
+    """Upper end of the kappa search, derived from the data.
+
+    Each column's density N(m_j; 0, kappa U_j + V_j) decreases in kappa once kappa u_jt exceeds m_jt^2 in every
+    coordinate, so no weighted sum of column evidences can increase past the largest m_jt^2 / u_jt.
+    """
+    return float(max(1.0, np.max(inputs.cavity_means ** 2 / inputs.prior_scale_moments)))
 
 
 def update_state(inputs: PleiotropyInputs, state: PleiotropyState) -> PleiotropyState:
-    """One EM step on the layer's hyperparameters.
+    """One EM step on the layer's hyperparameters, both learned by type-II maximum likelihood.
 
-    Responsibilities r_j = P(g_j = 1 | cavities); each class rate is its Beta(2, 2) posterior mode,
-    (sum of r_j + 1) / (count + 2); kappa maximizes the expected complete-data log likelihood
-    sum_j r_j log N(m_j; 0, kappa U_j + V_j) + (1 - r_j) log N(m_j; 0, U_j + V_j) over kappa in [1, bound].
-    penalized_log_likelihood never decreases.
+    Responsibilities r_j = P(g_j = 1 | cavities); each class rate becomes the mean responsibility of its columns;
+    kappa maximizes the expected complete-data log likelihood
+    sum_j r_j log N(m_j; 0, kappa U_j + V_j) + (1 - r_j) log N(m_j; 0, U_j + V_j) over [1, largest_useful_multiplier].
+    log_marginal_likelihood never decreases.
     """
     joint_evidence, _leave_one_out = evidence(inputs, state.scale_multiplier)
     column_rates = state.rates[inputs.class_index]
@@ -130,14 +136,14 @@ def update_state(inputs: PleiotropyInputs, state: PleiotropyState) -> Pleiotropy
     class_count = state.rates.size
     responsibility_sums = np.bincount(inputs.class_index, weights=responsibilities, minlength=class_count)
     column_counts = np.bincount(inputs.class_index, minlength=class_count)
-    rates = (responsibility_sums + 1.0) / (column_counts + 2.0)
+    rates = np.where(column_counts > 0, responsibility_sums / np.maximum(column_counts, 1), state.rates)
 
     def negative_expected(log_multiplier: float) -> float:
         multiplier_evidence, _unused = evidence(inputs, float(np.exp(log_multiplier)))
         return -float(np.dot(responsibilities, multiplier_evidence))
 
-    search = minimize_scalar(negative_expected, bounds=(0.0, float(np.log(MAXIMUM_SCALE_MULTIPLIER))), method="bounded",
-                             options={"xatol": 1.0e-6})
-    best_log_multiplier = float(search.x) if search.fun < negative_expected(np.log(state.scale_multiplier)) \
-        else float(np.log(state.scale_multiplier))
-    return PleiotropyState(rates=rates, scale_multiplier=float(np.exp(best_log_multiplier)))
+    upper = float(np.log(max(largest_useful_multiplier(inputs), state.scale_multiplier)))
+    current = float(np.log(state.scale_multiplier))
+    search = minimize_scalar(negative_expected, bounds=(0.0, upper), method="bounded", options={"xatol": 1.0e-6})
+    best = float(search.x) if search.fun < negative_expected(current) else current
+    return PleiotropyState(rates=rates, scale_multiplier=float(np.exp(best)))

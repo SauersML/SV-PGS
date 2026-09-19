@@ -9,7 +9,7 @@ from sv_pgs.pleiotropy_layer import (
     PleiotropyInputs,
     PleiotropyState,
     evidence,
-    penalized_log_likelihood,
+    log_marginal_likelihood,
     prior_weights,
     update_state,
 )
@@ -104,10 +104,10 @@ def test_em_recovers_rates_and_multiplier_and_never_decreases_objective():
     true_rates = np.array([0.05, 0.25])
     inputs = _simulated(4, 20000, true_rates, 6.0, 0.3, seed=11)
     state = PleiotropyState(rates=np.array([0.5, 0.5]), scale_multiplier=2.0)
-    objective = penalized_log_likelihood(inputs, state)
+    objective = log_marginal_likelihood(inputs, state)
     for _step in range(40):
         state = update_state(inputs, state)
-        new_objective = penalized_log_likelihood(inputs, state)
+        new_objective = log_marginal_likelihood(inputs, state)
         assert new_objective >= objective - 1e-6
         objective = new_objective
     np.testing.assert_allclose(state.rates, true_rates, atol=0.03)
