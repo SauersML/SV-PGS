@@ -1,5 +1,7 @@
 # Cutover: deleting the old path (C2–C8)
 
+**Status: done** (C2–C8 landed, `6a85d17`…`3d63745`). This is a historical record. Its process instructions (the flock-serialized MSI suite, the scratchpad briefs, GitHub CI as the gate) are superseded; the current landing gate is in COMPUTE.md.
+
 This inventory was measured on main at `c2a9443` with a static import graph: Python's `ast` over `sv_pgs/`, `tests/` and `scripts/`, text analysis only, with nothing imported or run.
 - Symbols are named, not line-numbered, because line numbers drift.
 - C0 (dead code, `21cdec3`) and C1 (moves into the new modules, e.g. `f6af37f`) are done.
