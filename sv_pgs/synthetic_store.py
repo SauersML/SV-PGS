@@ -121,7 +121,9 @@ SINGLE_PATH_R2 = {
     "SV_outTR": (0.0022485654501617743, 0.1738066716577618, 0.6865351451998423, 0.868419151645502),
     "SV_TR": (0.06496154204265829, 0.30317890563719757, 0.6548260520832868, 0.9006202645418034),
 }
-PIPELINE_R2_LOSS = {"A": {"SNV": 0.0, "INDEL": 0.0, "SV": 0.0}, "B": {"SNV": 0.005, "INDEL": 0.02, "SV": 0.03}}
+# Half B is a second imputation pipeline whose r2 target sits this far below half A's for every class: a
+# stated design input with no measured source, so the store carries two reliability classes.
+PIPELINE_R2_LOSS = {"A": 0.0, "B": 0.01}
 R2_BETA_CONCENTRATION = 20.0
 COMPLEXITY_BIN_PATHS = ((1, 1), (2, 5), (6, 10), (11, 20), (21, 60))
 RECORD_SINGLE = 0
@@ -487,9 +489,8 @@ def noise_parameters(
     noise_class = layout.noise_class
     target_mean = np.array([SINGLE_PATH_R2[name] for name in NOISE_CLASSES])[noise_class, maf_bin]
     target = rng.beta(target_mean * R2_BETA_CONCENTRATION, (1 - target_mean) * R2_BETA_CONCENTRATION)
-    loss_table = np.array([PIPELINE_R2_LOSS[pipeline]["SV" if name.startswith("SV") else name] for name in NOISE_CLASSES])
     # r2 is a squared correlation: the pipeline loss can only take it down to 0.
-    target = np.clip(target - loss_table[noise_class], 0.0, 1.0)
+    target = np.clip(target - PIPELINE_R2_LOSS[pipeline], 0.0, 1.0)
     uninformed = np.where(layout.has_read_evidence, 0.0, 0.5 * (1 - target))
     soft = np.minimum(SOFT_POSTERIOR_FRACTION * np.minimum(1.0, 10 * np.minimum(frequency, 1 - frequency)), 1 - uninformed)
     error_rate = solve_error_rate(target, uninformed, soft, frequency)
