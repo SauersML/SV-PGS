@@ -1,11 +1,10 @@
-"""The variant side of the one model's EP-EB fit, shared by Stage 1 and Stage 2.
+"""The variant side of the one model's EP-EB fit.
 
-Every stage approximates the posterior of the effects by a Gaussian q(beta)
+Stage 2 approximates the posterior of the effects by a Gaussian q(beta)
 with precision (data precision) + diag(tau) and one Gaussian site
-exp(-tau_j beta_j^2 / 2 + nu_j beta_j) per effect. The stages differ only in
-how they compute q's means and marginal variances (LD blocks in Stage 1, the
-exact full-data operator in Stage 2); everything that involves the prior is
-here.
+exp(-tau_j beta_j^2 / 2 + nu_j beta_j) per effect, and computes q's means and
+marginal variances on the exact full-data operator; everything that involves
+the prior is here.
 
 Prior. Each effect is a continuous Gaussian scale mixture,
 
@@ -73,8 +72,15 @@ linear part, or a direction left bare by a weight at zero), which are
 profiled as fixed effects: integrating them under a flat prior diverges
 where the likelihood tends to a positive constant. Its gradient is exact:
 dx/drho through the observed Hessian, and the change of H with x through the
-third derivatives of log Z. Across a stage's outer loop the curvature is the
+third derivatives of log Z. Across the outer loop the curvature is the
 EP-re-solved one; at fixed cavities it is H.
+
+Outer loop (``fit_hyperparameters``). At an EP fixed point the EP evidence's
+gradient in x is the fixed-cavity one, and its negative Hessian is the total
+curvature B + S, with the cavities re-solved (``_total_curvature``). So x moves
+by Newton on B + S, globalized by the natural monotonicity test. It never moves
+by the fixed-cavity maximizer: that EP-EM step solves with A + S, and it
+overshoots where (A + S)^-1 (B + S) exceeds 2.
 
 Every derivative is computed in z = (eta_1, ..., eta_C, theta), where each variant's log Z_j depends on its
 class's eta_c and its own log u_j, and carried to x by the linear map M.
@@ -831,11 +837,11 @@ def _maximize_coefficients(
 
 @dataclass(frozen=True)
 class GaussianPosterior:
-    """q's linear responses at the EP fixed point, for the total curvature B: ``solve(R)`` is Sigma R and
-    ``variance_jvp(W)`` is -(Sigma o Sigma) W, both (p x r). Stage 2 answers them with extra right-hand sides of its
-    solve and with ``marginal_variances.variance_jvp``."""
+    """q's linear responses at the EP fixed point, for the total curvature B: ``solve(R, e)`` is Sigma R, each column
+    to relative error e in the posterior metric, and ``variance_jvp(W)`` is -(Sigma o Sigma) W, both (p x r). Stage 2
+    answers them with extra right-hand sides of its solve and with ``marginal_variances.variance_jvp``."""
 
-    solve: Callable[[F64Array], F64Array]
+    solve: Callable[[F64Array, float], F64Array]
     variance_jvp: Callable[[F64Array], F64Array]
 
 
@@ -857,7 +863,7 @@ def diagonal_posterior(variance: F64Array) -> GaussianPosterior:
     """The posterior of independent effects (orthogonal design, normal means): Sigma = diag(variance). There the
     cavities do not move with the prior, so B equals the fixed-cavity curvature."""
     column = np.asarray(variance, dtype=np.float64)[:, None]
-    return GaussianPosterior(solve=lambda right: column * right, variance_jvp=lambda weights: -np.square(column) * weights)
+    return GaussianPosterior(solve=lambda right, _relative_tolerance: column * right, variance_jvp=lambda weights: -np.square(column) * weights)
 
 
 @dataclass(frozen=True)
@@ -966,7 +972,9 @@ def _total_curvature(
     variance = derivatives.variance[:, None]
 
     def through(precision_step: F64Array) -> tuple[F64Array, F64Array]:
-        mean_step = posterior.solve((derivatives.mean + derivatives.mean_by_precision / derivatives.variance)[:, None] * precision_step + mean_by_z / variance)
+        mean_step = posterior.solve(
+            (derivatives.mean + derivatives.mean_by_precision / derivatives.variance)[:, None] * precision_step + mean_by_z / variance, relative_tolerance
+        )
         shift_step = (mean_step - derivatives.mean_by_precision[:, None] * precision_step - mean_by_z) / variance
         variance_step = derivatives.variance_by_shift[:, None] * shift_step + derivatives.variance_by_precision[:, None] * precision_step + variance_by_z
         response = variance_step / variance**2 + precision_step
@@ -1745,3 +1753,156 @@ def hyper_step(
         stationarity_steps=check_steps,
         stationarity_errors=check_errors,
     )
+
+
+# ------------------------------------------------------------------ the outer loop
+
+
+@dataclass(frozen=True)
+class FixedPoint:
+    """A model's certified EP fixed point at a prior's hyperparameters: each variant's cavity, and q's linear
+    responses there (valid until the next fixed point is solved)."""
+
+    cavity: Cavity
+    posterior: GaussianPosterior
+
+
+FixedPoints = Callable[[Sequence[MixtureHyperparameters]], Sequence[FixedPoint]]
+"""Each model's certified EP fixed point at its hyperparameters, warm from the previous call."""
+
+
+@dataclass(frozen=True)
+class OuterFit:
+    """One model's certified empirical Bayes.
+
+    ``remaining_gain`` is what the last check still found, in nats: ``newton_decrement``, 1/2 g'|B + S|^-1 g at the
+    returned coefficients, plus the B-evidence gain the weights still had (``step.evidence_gain``); it is at most the
+    tolerance. ``iterations`` counts accepted Newton-B steps and ``halvings`` the trials the monotonicity test refused.
+    """
+
+    hyperparameters: MixtureHyperparameters
+    step: HyperStep
+    newton_decrement: float
+    remaining_gain: float
+    iterations: int
+    halvings: int
+
+
+@dataclass(frozen=True)
+class _NewtonB:
+    """The Newton-B step at fixed weights, in the weights' restricted coordinates, with |B + S|'s spectrum."""
+
+    view: ScaleMixturePrior
+    allowed: F64Array
+    log_smoothing: F64Array
+    origin: F64Array
+    direction: F64Array
+    eigenvectors: F64Array
+    magnitudes: F64Array
+    decrement: float
+
+
+def _penalized_gradient(prior: ScaleMixturePrior, weights: F64Array, coefficients: F64Array, cavity: Cavity, working_bytes: int) -> F64Array:
+    """The fixed-cavity gradient of the penalized objective in x: at an EP fixed point, the EP evidence's."""
+    objective = _data_objective(prior, coefficients, cavity, working_bytes)
+    return _penalized(prior, objective, weights, _penalty_matrix(prior, weights), coefficients)[1]
+
+
+def _metric_decrement(newton: _NewtonB, gradient: F64Array) -> float:
+    """1/2 g'|B + S|^-1 g in the step's own metric."""
+    components = newton.eigenvectors.T @ gradient
+    return 0.5 * float(np.sum(components * components / newton.magnitudes))
+
+
+def _newton_b(
+    prior: ScaleMixturePrior, log_smoothing: F64Array, coefficients: F64Array, point: FixedPoint, working_bytes: int, tolerance: float
+) -> _NewtonB:
+    """(B + S)^-1 g at x with the weights ``log_smoothing`` (edges included), on |B + S|'s spectrum where it is
+    indefinite: the EP evidence's own Newton step, never the fixed-cavity one."""
+    infinite = frozenset(int(position) for position in np.flatnonzero(log_smoothing == np.inf))
+    zero = frozenset(int(position) for position in np.flatnonzero(log_smoothing == -np.inf))
+    view, allowed = _restricted_prior(prior, infinite, zero)
+    weights = log_smoothing[np.isfinite(log_smoothing)]
+    origin = allowed.T @ coefficients
+    gradient = _penalized_gradient(view, weights, origin, point.cavity, working_bytes)
+    # As in ``_evidence``: B to the tolerance over the dimension, never past what double precision resolves.
+    total = _total_curvature(view, origin, point.cavity, point.posterior, working_bytes, max(tolerance / origin.shape[0], _EPSILON)) + _penalty_matrix(
+        view, weights
+    )
+    eigenvalues, eigenvectors = np.linalg.eigh(total)
+    magnitudes = np.maximum(np.abs(eigenvalues), _EPSILON * float(np.max(np.abs(eigenvalues))))
+    direction = eigenvectors @ ((eigenvectors.T @ gradient) / magnitudes)
+    return _NewtonB(
+        view=view, allowed=allowed, log_smoothing=log_smoothing, origin=origin, direction=direction, eigenvectors=eigenvectors,
+        magnitudes=magnitudes, decrement=0.5 * float(gradient @ direction),
+    )
+
+
+def _trial(newton: _NewtonB, length: float) -> MixtureHyperparameters:
+    return MixtureHyperparameters(coefficients=newton.allowed @ (newton.origin + length * newton.direction), log_smoothing=newton.log_smoothing)
+
+
+def fit_hyperparameters(
+    prior: ScaleMixturePrior, starts: Sequence[MixtureHyperparameters], fixed_points: FixedPoints, working_bytes: int, tolerance: float
+) -> list[OuterFit]:
+    """Every model's empirical Bayes at its EP fixed point, certified to ``tolerance`` nats (lead ruling: Newton-B,
+    never plain EP-EM).
+
+    At an EP fixed point the EP evidence's x-gradient is the fixed-cavity g, and its negative Hessian is the total
+    curvature B + S. Each outer step sets the weights by ``hyper_step`` at the current fixed point, then moves x by
+    (B + S)^-1 g. The fixed-cavity maximizer (the EM step) solves with A + S instead: to first order it maps the
+    error e to (I - (A + S)^-1 (B + S)) e, which diverges wherever that pencil has an eigenvalue above 2.
+    speed-floor measured [0.89, 5.4] at production [semi-real].
+
+    A trial is accepted by the natural monotonicity test (Deuflhard, Newton Methods for Nonlinear Problems, 2004,
+    Section 3.1.4): at the trial's fixed point, g'|B + S|^-1 g, taken with the step's own B + S, must fall, and
+    otherwise the step halves. The test needs no evidence value, which a full-data fixed point does not give, and it
+    is invariant to x's coordinates. The loop stops when, for every model, the decrement plus the weights' remaining
+    gain is at most ``tolerance``.
+
+    Each call of ``fixed_points`` passes every model's current hyperparameters, so on return its state is each
+    model's certified fixed point.
+    """
+    count = len(starts)
+    hyperparameters = list(starts)
+    points = list(fixed_points(hyperparameters))
+    fits: list[OuterFit | None] = [None] * count
+    pending: list[tuple[_NewtonB, HyperStep, float] | None] = [None] * count
+    iterations, halvings = [0] * count, [0] * count
+    while True:
+        for model in range(count):
+            if fits[model] is not None or pending[model] is not None:
+                continue
+            point = points[model]
+            step = hyper_step(prior, hyperparameters[model], point.cavity, lambda _view, _coefficients, fixed=point.posterior: fixed, working_bytes, tolerance)
+            newton = _newton_b(prior, step.hyperparameters.log_smoothing, hyperparameters[model].coefficients, point, working_bytes, tolerance)
+            remaining = newton.decrement + step.evidence_gain
+            if remaining <= tolerance:
+                fits[model] = OuterFit(
+                    hyperparameters=hyperparameters[model], step=step, newton_decrement=newton.decrement, remaining_gain=remaining,
+                    iterations=iterations[model], halvings=halvings[model],
+                )
+            else:
+                pending[model] = (newton, step, 1.0)
+        if all(fit is not None for fit in fits):
+            return [fit for fit in fits if fit is not None]
+        trials = [hyperparameters[model] if entry is None else _trial(entry[0], entry[2]) for model, entry in enumerate(pending)]
+        trial_points = list(fixed_points(trials))
+        for model, entry in enumerate(pending):
+            if entry is None:
+                points[model] = trial_points[model]
+                continue
+            newton, step, length = entry
+            gradient = _penalized_gradient(
+                newton.view, newton.log_smoothing[np.isfinite(newton.log_smoothing)], newton.allowed.T @ trials[model].coefficients,
+                trial_points[model].cavity, working_bytes,
+            )
+            if _metric_decrement(newton, gradient) < newton.decrement:
+                hyperparameters[model], points[model], pending[model] = trials[model], trial_points[model], None
+                iterations[model] += 1
+                continue
+            length *= 0.5
+            halvings[model] += 1
+            if length * float(np.max(np.abs(newton.direction))) <= _HALF_PRECISION * (1.0 + float(np.max(np.abs(newton.origin)))):
+                raise FloatingPointError("the Newton-B step makes no certified progress at the EP fixed point")
+            pending[model] = (newton, step, length)
