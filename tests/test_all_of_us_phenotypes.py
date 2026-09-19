@@ -262,8 +262,8 @@ def _synthetic_person_rows(
     noise_variance: float,
     seed: int,
 ) -> tuple[list[dict[str, object]], np.ndarray]:
-    """Person-day rows simulated from the per-occasion model on the linear scale; returns the rows and each
-    person's true long-run level net of the age and sex terms."""
+    """Person-day rows simulated from the per-occasion model on the linear scale, recorded to 0.1 unit as a lab
+    reports them; returns the rows and each person's true long-run level net of the age and sex terms."""
     generator = np.random.default_rng(seed)
     rows: list[dict[str, object]] = []
     levels = generator.normal(0.0, math.sqrt(level_variance), person_count)
@@ -271,7 +271,7 @@ def _synthetic_person_rows(
         female = person_index % 2 == 0
         ages = generator.uniform(25.0, 80.0, int(generator.integers(1, 7)))
         values = 90.0 + 0.03 * (ages - 50.0) + (0.5 if female else 0.0) + levels[person_index]
-        values = values + generator.normal(0.0, math.sqrt(noise_variance), ages.shape[0])
+        values = np.round(values + generator.normal(0.0, math.sqrt(noise_variance), ages.shape[0]), 1)
         rows += _person_days(
             person_index,
             [(float(age), float(value)) for age, value in zip(ages, values, strict=True)],

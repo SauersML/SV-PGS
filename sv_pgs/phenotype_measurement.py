@@ -47,9 +47,11 @@ from dataclasses import dataclass
 
 import numpy as np
 from scipy.special import log_ndtr, logsumexp
+from scipy.stats import chi2
 
 from sv_pgs._typing import F64Array, I64Array
 from sv_pgs.scale_mixture_ep import (
+    ROUGHNESS_ORDER,
     MixtureHyperparameters,
     ScaleMixturePrior,
     class_log_density,
@@ -556,8 +558,9 @@ class _Model:
         self.centres = np.full(occasions.person_count, np.nan)
 
     def start(self) -> _State:
-        """Least-squares fixed effects, the moment level variance, and the engine's start density on the lattice
-        from the resolution variance to the largest squared within-person deviation (past it by its width)."""
+        """Least-squares fixed effects, a robust level variance, and the engine's start density on the lattice
+        from the resolution variance to the largest squared within-person deviation (past it by its width), with
+        at least the ROUGHNESS_ORDER + 1 nodes whose differences the roughness penalty needs."""
         occasions = self.occasions
         fixed_effects = np.linalg.lstsq(occasions.design, self.transformed, rcond=None)[0]
         residuals = self.transformed - occasions.design @ fixed_effects
@@ -566,14 +569,15 @@ class _Model:
         deviations = residuals - person_mean[occasions.person_index]
         repeated = counts[occasions.person_index] > 1
         largest = float(np.max(np.square(deviations[repeated]))) if np.any(repeated) else float(np.max(np.square(residuals)))
-        within = float(np.sum(np.square(deviations))) / max(float(counts.sum() - counts.shape[0]), 1.0)
-        level_variance = float(np.var(person_mean)) - within * float(np.mean(1.0 / counts))
+        # The person means' variance by their median absolute deviation, which gross errors barely move: it
+        # overstates tau^2 by the noise of a mean, which the EM removes.
+        level_variance = float(np.median(np.square(person_mean - np.median(person_mean)))) / float(chi2.median(1))
         if not level_variance > 0.0:
-            raise ValueError("no between-person variance: person means carry no signal beyond occasion noise")
+            raise ValueError("no between-person variance: most persons' mean readings are equal")
         floor = float(np.log(self.resolution_variance))
         top = float(np.log(max(largest, self.resolution_variance)))
         spacing = spacing_bound(float(occasions.values.shape[0]), EVIDENCE_TOLERANCE)
-        extent = max(top + (top - floor), floor + 4.0 * spacing)
+        extent = max(top + (top - floor), floor + ROUGHNESS_ORDER * spacing)
         prior = _density_prior(np.arange(floor, extent + spacing, spacing), top, occasions.values.shape[0])
         return _State(fixed_effects, level_variance, prior, initial_hyperparameters(prior))
 

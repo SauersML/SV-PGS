@@ -524,6 +524,7 @@ def test_occasions_on_or_after_the_first_exposure_are_treated(cdr: _Cdr):
 
 
 def _mcv_cohort(cdr: _Cdr, generator: np.random.Generator, persons: int) -> dict[str, float]:
+    """MCV readings recorded to 0.1 fL, as analyzers report them; returns each person's true effect."""
     effects = {}
     for person_id in range(1, persons + 1):
         cdr.person(person_id, int(generator.integers(1940, 1990)), FEMALE if person_id % 2 else MALE)
@@ -532,7 +533,7 @@ def _mcv_cohort(cdr: _Cdr, generator: np.random.Generator, persons: int) -> dict
             cdr.measurement(
                 person_id,
                 f"{2010 + occasion}-0{1 + occasion}-15",
-                90.0 + effects[str(person_id)] + generator.normal(0.0, 3.0),
+                round(90.0 + effects[str(person_id)] + generator.normal(0.0, 3.0), 1),
                 concept_id=3023599,
                 unit_concept_id=8583,
             )
@@ -565,7 +566,7 @@ def test_gross_errors_reach_the_model_and_are_downweighted_by_its_learned_densit
     _mcv_cohort(clean, np.random.default_rng(5), 250)
     typo_people = [str(person_id) for person_id in range(1, 251, 25)]
     for position, person_id in enumerate(typo_people):
-        cdr.measurement(int(person_id), f"2019-0{1 + position % 9}-20", 10.0 * (90.0 + effects[person_id]), concept_id=3023599, unit_concept_id=8583)
+        cdr.measurement(int(person_id), f"2019-0{1 + position % 9}-20", round(10.0 * (90.0 + effects[person_id]), 1), concept_id=3023599, unit_concept_id=8583)
     contaminated_rows, _columns, contaminated_summary = build_all_of_us_measurement_targets(mcv, cdr.measurement_rows(mcv), WORKING_BYTES)
     clean_rows, _columns, clean_summary = build_all_of_us_measurement_targets(mcv, clean.measurement_rows(mcv), WORKING_BYTES)
     assert contaminated_summary["n_occasions"] == clean_summary["n_occasions"] + len(typo_people)
