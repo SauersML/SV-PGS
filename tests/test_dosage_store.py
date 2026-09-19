@@ -24,6 +24,7 @@ from sv_pgs.dosage_store import (
     dosage_array_directory,
     encode_dosage_milli,
     open_column,
+    read_manifest,
     sites_md5,
     statistic_column_directory,
     transcode_store,
@@ -303,19 +304,29 @@ def test_write_dosage_store_round_trips_table_and_codes(tmp_path: Path, codec: s
         write_dosage_store(tmp_path / "bad", 29, bad, blocks, codec=codec, shard_rows=32, inner_rows=8)
 
 
-def test_transcoding_merges_halves_into_one_zero_copy_raw_half(two_half_store: tuple[Path, list[dict[str, np.ndarray]]]) -> None:
+def test_transcoding_copies_the_whole_store_with_zero_copy_raw_halves(two_half_store: tuple[Path, list[dict[str, np.ndarray]]]) -> None:
     root, milli_by_half = two_half_store
     expected_codes = _all_codes(milli_by_half)
-    with DosageStore.open(root) as store:
-        transcode_store(store, root.parent / "cache", codec="raw", budget=_budget(8 * 64 * store.n_samples))
-        source_table = store.variant_table
-    with DosageStore.open(root.parent / "cache") as cache:
-        assert cache.half_indices == (0,) and cache.n_samples == expected_codes.shape[1]
-        view = cache.read_codes(3, 90)
-        assert not view.flags.owndata and np.array_equal(view, expected_codes[3:90])
+    cache_root = root.parent / "cache"
+    # A budget of 50 rows per read cuts every shard into several pieces.
+    transcode_store(root, cache_root, codec="raw", budget=_budget(50 * expected_codes.shape[1]))
+    with DosageStore.open(root) as store, DosageStore.open(cache_root) as cache:
+        assert cache.half_indices == store.half_indices and cache.n_samples == store.n_samples
         assert np.array_equal(cache.read_codes(0, cache.n_variants), expected_codes)
-        assert np.array_equal(cache.variant_table.sum_code, source_table.sum_code)
-        assert cache.variant_table.annotation_legends == source_table.annotation_legends
+        assert np.array_equal(cache.variant_table.sum_code, store.variant_table.sum_code)
+        assert cache.variant_table.annotation_legends == store.variant_table.annotation_legends
+        assert cache.manifest_attributes == store.manifest_attributes
+    assert read_manifest(cache_root) == read_manifest(root)
+    for half in range(len(milli_by_half)):
+        for chromosome in milli_by_half[half]:
+            for name in ("sum_code", "sum_code2"):
+                cached, _ = open_column(statistic_column_directory(cache_root, half, chromosome, name))
+                stored, _ = open_column(statistic_column_directory(root, half, chromosome, name))
+                assert np.array_equal(cached, stored)
+    with DosageStore.open(cache_root, half_indices=(0,)) as first_half:
+        view = first_half.read_codes(3, 90)
+        assert not view.flags.owndata
+        assert np.array_equal(view, expected_codes[3:90, : first_half.n_samples])
 
 
 def test_a_forked_child_compresses_with_its_own_threads(tmp_path: Path) -> None:
@@ -379,9 +390,8 @@ def test_transcoding_rejects_a_sidecar_that_disagrees_with_the_codes(
     sums, _ = open_column(statistic_column_directory(root, 1, "chr22", "sum_code"), writable=True)
     sums[7] += 1
     sums.flush()
-    with DosageStore.open(root) as store:
-        with pytest.raises(ValueError, match="sum_code"):
-            transcode_store(store, root.parent / "cache", codec="raw", budget=_budget())
+    with pytest.raises(ValueError, match="sum_code"):
+        transcode_store(root, root.parent / "cache", codec="raw", budget=_budget())
 
 
 def test_stage0_streams_a_store_exactly_like_the_in_memory_source(

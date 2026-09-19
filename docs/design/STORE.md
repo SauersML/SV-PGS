@@ -12,7 +12,7 @@ One consolidated spec. It replaces the numbered addenda A4 through A4.15. Code: 
 - **Encoding:**
   - shards of 65,536 rows with 64-row inner chunks;
   - zstd level 3, with a crc32c-checked shard index;
-  - a `transcode_store` step builds an uncompressed local cache.
+  - a `transcode_store` step builds an uncompressed local cache: the same store (halves, sidecar, statistics, external maps, loci, MANIFEST), with every code array re-encoded raw and its code sums re-checked.
 - **Kernels** read codes as signed `code − 127` and accumulate in int32, exactly.
 - **Background removal ("value matched"),** applied before quantization and before any sums:
   - Per record, K_v = min(10, N_PATHS_TOTAL); m_v = the number of kept paths carrying the record's ID; w = ε/(1−ε) with the imputation error ε = 0.001.

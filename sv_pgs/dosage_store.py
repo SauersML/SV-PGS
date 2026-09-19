@@ -37,6 +37,7 @@ import mmap
 import os
 from pathlib import Path
 import resource
+import shutil
 import threading
 from typing import Any, Iterable, Iterator, Literal, Mapping, Sequence
 
@@ -1242,13 +1243,6 @@ class DosageStore:
         pieces = sum(min(self.reader_threads, -(-rows // arrays[0].layout.inner_rows)) for arrays in self._arrays)
         return 1 + max(2, -(-self.reader_threads // max(pieces, 1)))
 
-    def block_rows_within(self, budget: ComputeBudget) -> int:
-        """The most rows per block whose read-ahead ring fits ``budget.host_bytes``."""
-        rows = max(1, budget.host_bytes // self.n_samples)
-        while rows > 1 and self._ring_depth(rows) * rows * self.n_samples > budget.host_bytes:
-            rows = max(1, budget.host_bytes // (self._ring_depth(rows) * self.n_samples))
-        return rows
-
     def _ring(self, depth: int, buffer_bytes: int, budget: ComputeBudget) -> tuple[list[U8Array], list[Any]]:
         if budget.device_kind == "cpu":
             return [np.empty(buffer_bytes, dtype=np.uint8) for _ in range(depth)], []
@@ -1419,15 +1413,51 @@ def write_dosage_store(
     )
 
 
-def transcode_store(store: DosageStore, destination: str | Path, *, codec: Codec, budget: ComputeBudget) -> None:
-    """Rewrite a store's selected halves as one half with ``codec``.
+def transcode_store(source: str | Path, destination: str | Path, *, codec: Codec, budget: ComputeBudget) -> None:
+    """Copy a store with every half's code arrays re-encoded with ``codec``.
 
-    This builds the local cache: bucket store (zstd, several halves) to one raw half on
-    NVMe or in RAM, whose ranges are zero-copy views.
+    This builds the local cache: the bucket store (zstd) as raw arrays on NVMe or in RAM, whose
+    ranges are zero-copy views. Everything else (the MANIFEST with its half measurements and
+    gates, the variant sidecar, every per-half statistic, the external maps and the loci) is
+    copied unchanged, so the cache is the same store. Each array's code sums are recomputed as
+    it is written and must equal its half's stored sums. Reads are sized to ``budget``.
     """
-    ranges = _block_ranges(0, store.n_variants, store.n_samples, store.block_rows_within(budget) * store.n_samples)
-    blocks = (block for _, _, block in store.iter_codes(ranges, None, budget))
-    write_dosage_store(destination, store.n_samples, store.variant_table, blocks, codec=codec)
+    source_root, target_root = Path(source), Path(destination)
+    manifest = read_manifest(source_root)
+    shutil.copytree(source_root, target_root, ignore=lambda directory, _names: ["dosage"] if Path(directory) == source_root else [])
+    for half in range(len(manifest["half_sample_counts"])):
+        for chromosome in manifest["chromosomes"]:
+            array = CodeArray(dosage_array_directory(source_root, half, chromosome))
+            try:
+                sums, squares = _transcode_array(array, dosage_array_directory(target_root, half, chromosome), codec, budget)
+            finally:
+                array.close()
+            for name, written in (("sum_code", sums), ("sum_code2", squares)):
+                stored, _ = open_column(statistic_column_directory(source_root, half, chromosome, name))
+                if not np.array_equal(np.asarray(stored, dtype=np.int64), written):
+                    raise ValueError(f"half{half}/{chromosome}: the stored {name} disagrees with the codes.")
+
+
+def _transcode_array(array: CodeArray, directory: Path, codec: Codec, budget: ComputeBudget) -> tuple[I64Array, I64Array]:
+    """Re-encode one code array shard by shard, returning the exact code sums it wrote."""
+    layout = array.layout
+    target = create_code_array(
+        directory, layout.row_count, layout.sample_count, codec=codec, shard_rows=layout.shard_rows, inner_rows=layout.inner_rows
+    )
+    sums = np.zeros(layout.row_count, dtype=np.int64)
+    squares = np.zeros(layout.row_count, dtype=np.int64)
+    buffer = np.empty(0, dtype=np.uint8)
+    for shard_index in range(layout.shard_count):
+        shard_start = shard_index * layout.shard_rows
+        with CodeShardWriter(directory, target, shard_index) as writer:
+            for start, stop in _block_ranges(shard_start, shard_start + layout.shard_row_count(shard_index), layout.sample_count, budget.host_bytes):
+                if buffer.size < (stop - start) * layout.sample_count:
+                    buffer = np.empty((stop - start) * layout.sample_count, dtype=np.uint8)
+                piece = buffer[: (stop - start) * layout.sample_count].reshape(stop - start, layout.sample_count)
+                array.read_rows_into(start, stop, piece)
+                writer.write_rows(piece)
+                sums[start:stop], squares[start:stop] = code_sums(piece)
+    return sums, squares
 
 
 def code_sums(codes: U8Array) -> tuple[I64Array, I64Array]:
