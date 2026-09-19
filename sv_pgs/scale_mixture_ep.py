@@ -215,7 +215,8 @@ class HyperStep:
     hyperparameters, and ``smoothing_gradient`` the largest |dV/drho| over
     weights not held at an edge or a bound of their range, by central
     differences of the B-evidence; ``stationarity_steps`` and
-    ``stationarity_errors`` are each difference's step and error bound.
+    ``stationarity_errors`` are each difference's step and error bound, and ``stationarity_gain`` the certified
+    upper bound 1/2 sum (|c| + E)^2 / s on the gain a Newton step on them could still find (at most the tolerance).
     """
 
     hyperparameters: MixtureHyperparameters
@@ -227,6 +228,7 @@ class HyperStep:
     evidence_gain: float
     stationarity_steps: F64Array
     stationarity_errors: F64Array
+    stationarity_gain: float
 
 
 # ------------------------------------------------------------------ the lattice
@@ -1062,9 +1064,14 @@ def _curvature_trace_gradient(
 
 @dataclass(frozen=True)
 class _Evidence:
-    """V and dV/drho at x_rho; ``responses`` is dx_rho/drho (coefficients x weights), the first-order predictor of x."""
+    """V and dV/drho at x_rho; ``responses`` is dx_rho/drho (coefficients x weights), the first-order predictor of x.
+
+    ``laplace_value`` is the Laplace form, whose exact rho-gradient ``gradient`` is; ``value`` is what every
+    comparison uses: the Laplace form from ``_evidence``, and after ``_corrected`` the Tierney-Kadane-certified V.
+    """
 
     value: float
+    laplace_value: float
     gradient: F64Array
     coefficients: F64Array
     responses: F64Array
@@ -1187,13 +1194,25 @@ def _laplace_corrections(
     return corrections, terms, directions
 
 
-def _corrected_value(
-    prior: ScaleMixturePrior, log_smoothing: F64Array, evidence: _Evidence, cavity: Cavity, posterior_at: PosteriorAt, working_bytes: int, tolerance: float
-) -> float:
-    """V with its per-direction Laplace terms replaced by exact one-dimensional integrals where they fail: the value
-    basins and edges are compared by (lead ruling)."""
-    corrections, _terms, _directions = _laplace_corrections(prior, log_smoothing, evidence, cavity, posterior_at, working_bytes, tolerance)
-    return evidence.value + float(np.sum(corrections))
+def _corrected(
+    prior: ScaleMixturePrior, log_smoothing: F64Array, evidence: _Evidence | None, cavity: Cavity, posterior_at: PosteriorAt, working_bytes: int, tolerance: float
+) -> _Evidence | None:
+    """``evidence`` with its value certified to ``tolerance``: the Laplace terms replaced by exact one-dimensional
+    integrals along every standardized direction whose Tierney-Kadane term exceeds the tolerance (lead ruling for
+    basins, and for every comparison of V: where that term is large the Laplace value is not V to the tolerance).
+
+    It matters most at a fold of the inner maximum, where the data's negative curvature nearly cancels the penalty:
+    there -1/2 log|B + S| rises without bound while the integral stays finite, so the Laplace value draws the search
+    to the fold [sim-only: 9e10 TK term and a 10-nat correction where the neighbouring basin was 3.6 nats better].
+    None when the evidence is None or a line integral cannot be certified.
+    """
+    if evidence is None:
+        return None
+    try:
+        corrections, _terms, _directions = _laplace_corrections(prior, log_smoothing, evidence, cavity, posterior_at, working_bytes, tolerance)
+    except FloatingPointError:
+        return None
+    return replace(evidence, value=evidence.laplace_value + float(np.sum(corrections)))
 
 
 def _range_projector(matrix: F64Array) -> tuple[F64Array, F64Array]:
@@ -1354,6 +1373,7 @@ def _evidence(
         )
     return _Evidence(
         value=evidence_value,
+        laplace_value=evidence_value,
         gradient=evidence_gradient,
         coefficients=coefficients,
         responses=responses,
@@ -1486,14 +1506,15 @@ def _certified_evidence(
     """V at the certified inner maximum from ``start``, or from the flat start when that is not a certified
     maximum (the two structural starts; lead ruling); None when neither is."""
     warm = _evidence(prior, log_smoothing, start, cavity, posterior_at, working_bytes, tolerance)
-    return warm if warm is not None else _evidence(prior, log_smoothing, flat_start, cavity, posterior_at, working_bytes, tolerance)
+    chosen = warm if warm is not None else _evidence(prior, log_smoothing, flat_start, cavity, posterior_at, working_bytes, tolerance)
+    return _corrected(prior, log_smoothing, chosen, cavity, posterior_at, working_bytes, tolerance)
 
 
 def _best_certified(
     prior: ScaleMixturePrior, log_smoothing: F64Array, starts: Sequence[F64Array], cavity: Cavity, posterior_at: PosteriorAt, working_bytes: int, tolerance: float
 ) -> _Evidence | None:
     """The certified inner maximum with the highest corrected V over the given starts; distinct basins are compared
-    by ``_corrected_value``, and a start that lands in an already-found basin adds nothing."""
+    by their certified V (``_corrected``), and a start that lands in an already-found basin adds nothing."""
     certified: list[_Evidence] = []
     for start in starts:
         candidate = _evidence(prior, log_smoothing, start, cavity, posterior_at, working_bytes, tolerance)
@@ -1502,9 +1523,12 @@ def _best_certified(
         scale = 1.0 + float(np.max(np.abs(candidate.coefficients)))
         if all(float(np.max(np.abs(candidate.coefficients - other.coefficients))) > _HALF_PRECISION * scale for other in certified):
             certified.append(candidate)
-    if len(certified) <= 1:
-        return certified[0] if certified else None
-    return max(certified, key=lambda candidate: _corrected_value(prior, log_smoothing, candidate, cavity, posterior_at, working_bytes, tolerance))
+    corrected = [
+        evidence
+        for evidence in (_corrected(prior, log_smoothing, candidate, cavity, posterior_at, working_bytes, tolerance) for candidate in certified)
+        if evidence is not None
+    ]
+    return max(corrected, key=lambda evidence: evidence.value) if corrected else None
 
 
 def _log_normal_start(prior: ScaleMixturePrior, coefficients: F64Array, cavity: Cavity, working_bytes: int) -> F64Array:
@@ -1598,9 +1622,8 @@ def _maximize_evidence(
         ):
             # Another basin wins at these weights: its weights are not optimized yet, so ascend again from it, as long
             # as each switch raises the best corrected V seen (so switches cannot cycle).
-            refit_value = _corrected_value(view, finite_weights, refit, cavity, posterior_at, working_bytes, tolerance)
-            if refit_value > best_corrected + tolerance:
-                best_corrected = refit_value
+            if refit.value > best_corrected + tolerance:
+                best_corrected = refit.value
                 weights[finite] = finite_weights
                 coefficients = allowed @ refit.coefficients
                 continue
@@ -1688,8 +1711,10 @@ def _stationarity_check(
             quotients = []
             for length in (step, 0.5 * step):
                 both = [
-                    _evidence(
-                        view, weights + side * length * unit, evidence.coefficients, cavity, posterior_at, working_bytes, accuracy,
+                    _corrected(
+                        view, weights + side * length * unit,
+                        _evidence(view, weights + side * length * unit, evidence.coefficients, cavity, posterior_at, working_bytes, accuracy),
+                        cavity, posterior_at, working_bytes, accuracy,
                     )
                     for side in (-1.0, 1.0)
                 ]
@@ -1743,7 +1768,8 @@ def hyper_step(
         check, curvature, check_steps, check_errors = _stationarity_check(
             final_view, weights, evidence, interior, cavity, posterior_at, working_bytes, tolerance
         )
-        if 0.5 * float(np.sum(np.square(np.abs(check) + check_errors) / curvature)) <= tolerance:
+        gain_bound = 0.5 * float(np.sum(np.square(np.abs(check) + check_errors) / curvature))
+        if gain_bound <= tolerance:
             break
         direction = check / curvature
         step_length, moved = 1.0, None
@@ -1787,4 +1813,5 @@ def hyper_step(
         evidence_gain=evidence.value - start_evidence.value,
         stationarity_steps=check_steps,
         stationarity_errors=check_errors,
+        stationarity_gain=gain_bound,
     )

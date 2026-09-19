@@ -25,6 +25,7 @@ from sv_pgs.scale_mixture_ep import (
     _data_value,
     _total_curvature,
     _directional_derivatives,
+    _corrected,
     _laplace_corrections,
     _log_normal_start,
     _maximize_coefficients,
@@ -337,15 +338,22 @@ def test_hyper_step_reaches_a_maximum_of_the_evidence():
     zero = frozenset(int(position) for position in np.flatnonzero(fitted.log_smoothing == -np.inf))
     view, allowed = _restricted_prior(prior, infinite, zero)
     weights = fitted.log_smoothing[np.isfinite(fitted.log_smoothing)]
-    base = _evidence(view, weights, allowed.T @ fitted.coefficients, cavity, normal_means_posterior(cavity, _WORKING_BYTES), _WORKING_BYTES, 0.0)
-    assert base is not None and base.newton_decrement < 1e-10
-    np.testing.assert_allclose(step.evidence, base.value, atol=1e-5)
+    posterior = normal_means_posterior(cavity, _WORKING_BYTES)
+    laplace = _evidence(view, weights, allowed.T @ fitted.coefficients, cavity, posterior, _WORKING_BYTES, 0.0)
+    assert laplace is not None and laplace.newton_decrement < 1e-10
+    # V is certified to the tolerance (its Tierney-Kadane corrections), so values computed apart agree to it.
+    base = _corrected(view, weights, laplace, cavity, posterior, _WORKING_BYTES, _EVIDENCE_TOLERANCE)
+    assert base is not None and abs(step.evidence - base.value) <= _EVIDENCE_TOLERANCE
     for unit in np.eye(weights.shape[0]):
         for direction in (-1.0, 1.0):
-            moved = _evidence(view, weights + direction * 0.05 * unit, base.coefficients, cavity, normal_means_posterior(cavity, _WORKING_BYTES), _WORKING_BYTES, 0.0)
-            assert moved is None or moved.value <= base.value + 1e-5
-    # Each edge weight is where V wants it: releasing it to the end of its range does not raise V.
-    assert step.smoothing_gradient < 1e-2
+            moved_weights = weights + direction * 0.05 * unit
+            moved = _corrected(
+                view, moved_weights, _evidence(view, moved_weights, base.coefficients, cavity, posterior, _WORKING_BYTES, 0.0), cavity, posterior,
+                _WORKING_BYTES, _EVIDENCE_TOLERANCE,
+            )
+            assert moved is None or moved.value <= base.value + _EVIDENCE_TOLERANCE
+    # The B-evidence's own stationarity is certified: a Newton step on its differences gains at most the tolerance.
+    assert step.stationarity_gain <= _EVIDENCE_TOLERANCE
 
 
 @pytest.mark.xfail(run=False, reason=_LAPLACE_NEAR_BOUNDARY)
@@ -524,9 +532,14 @@ def test_the_hyper_steps_evidence_is_at_least_the_exact_infinity_edges():
     step = hyper_step(prior, initial_hyperparameters(prior), cavity, normal_means_posterior(cavity, _WORKING_BYTES), _WORKING_BYTES, _EVIDENCE_TOLERANCE)
     view, allowed = _restricted_prior(prior, frozenset({0}), frozenset())
     start = _log_normal_start(prior, initial_hyperparameters(prior).coefficients, cavity, _WORKING_BYTES)
-    edge = _evidence(view, np.zeros(0), allowed.T @ start, cavity, normal_means_posterior(cavity, _WORKING_BYTES), _WORKING_BYTES, 0.0)
+    posterior = normal_means_posterior(cavity, _WORKING_BYTES)
+    edge = _corrected(
+        view, np.zeros(0), _evidence(view, np.zeros(0), allowed.T @ start, cavity, posterior, _WORKING_BYTES, _EVIDENCE_TOLERANCE), cavity, posterior,
+        _WORKING_BYTES, _EVIDENCE_TOLERANCE,
+    )
     assert edge is not None
-    assert step.evidence >= edge.value - 1e-6
+    # Both are certified V, each to the tolerance.
+    assert step.evidence >= edge.value - _EVIDENCE_TOLERANCE
 
 
 def test_directional_third_and_fourth_derivatives_match_finite_differences():
