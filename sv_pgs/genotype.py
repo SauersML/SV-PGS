@@ -1762,7 +1762,7 @@ def _pinned_int8_host_buffer(
     Returns ``(buffer_a, buffer_b, pinned_memory_owner)``; each buffer is shaped
     ``(sample_count, max_tile_variants)``. The two buffers share a single
     pinned-memory allocation drawn from the process-wide pinned buffer pool
-    (see ``sv_pgs.bitpacked_loader._PinnedBufferPool``) so they live as long
+    (see ``sv_pgs.dosage_store._PinnedBufferPool``) so they live as long
     as the returned owner reference. Pass the owner to
     ``_release_pinned_int8_host_buffer`` once the upload streams have
     synchronized to return it to the pool — the next upload pass will
@@ -1781,7 +1781,7 @@ def _pinned_int8_host_buffer(
     total_nbytes = slot_element_count * 2 * np.dtype(np.int8).itemsize
     # Acquire through the shared pool; reinterpret the uint8 backing buffer
     # as int8 since the caller fills/uses the slots as int8.
-    from sv_pgs.bitpacked_loader import _allocate_pinned as _acquire_pinned
+    from sv_pgs.dosage_store import _allocate_pinned as _acquire_pinned
 
     pinned_memory, _u8_view = _acquire_pinned(cupy, total_nbytes)
     flat_view = np.frombuffer(pinned_memory, dtype=np.int8, count=slot_element_count * 2)
@@ -1799,7 +1799,7 @@ def _release_pinned_int8_host_buffer(pinned_memory: Any) -> None:
     """
     if pinned_memory is None:
         return
-    from sv_pgs.bitpacked_loader import _release_pinned
+    from sv_pgs.dosage_store import _release_pinned
 
     _release_pinned(pinned_memory)
 
@@ -1945,7 +1945,7 @@ def _try_upload_int8_parallel_memmap(
         # a same-size request reuses this allocation rather than re-
         # pinning. ``alloc_pinned_memory`` itself is what we want to
         # avoid hammering on every disease iteration.
-        from sv_pgs.bitpacked_loader import _allocate_pinned as _acquire_pinned
+        from sv_pgs.dosage_store import _allocate_pinned as _acquire_pinned
 
         pinned_owner, _u8_view = _acquire_pinned(cupy, total_bytes)
     except (MemoryError, RuntimeError) as exc:
@@ -2195,7 +2195,7 @@ def require_gpu() -> Any:
         else:
             limit_repr = f"{limit_bytes / 1e9:.2f} GB"
         try:
-            from sv_pgs.bitpacked_loader import _pinned_pool
+            from sv_pgs.dosage_store import _pinned_pool
 
             ps = _pinned_pool().stats()
             pinned_repr = (

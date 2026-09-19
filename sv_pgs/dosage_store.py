@@ -45,10 +45,129 @@ import numpy as np
 import zstandard
 
 from sv_pgs._typing import F64Array, I64Array, NDArray, U8Array
-from sv_pgs.bitpacked_loader import _allocate_pinned, _release_pinned
 from sv_pgs.compute_budget import ComputeBudget
 from sv_pgs.config import VariantClass
 from sv_pgs.genotype import _try_import_cupy
+
+
+class _PinnedBufferPool:
+    """Process-wide pinned host buffer pool.
+
+    Pinning host memory via ``cudaHostAlloc`` (what CuPy's
+    ``alloc_pinned_memory`` wraps) is expensive: each call requires the
+    kernel to lock pages and update the IOMMU, which for a 7+ GB
+    bitpacked-cache staging buffer can cost a meaningful fraction of a
+    minute. Freeing the buffer unmaps it; the next call immediately
+    reallocates and re-pins from scratch. When the pipeline runs SNP-only
+    then SNP+SV in the same process, or iterates the disease loop with
+    bitpacked cache loads at the head of each disease, the 7 GB pin/unpin
+    churn becomes a real wall-time tax.
+
+    This pool keeps released allocations around (keyed by size) so the
+    next ``acquire(n)`` of a same-or-smaller request reuses an existing
+    pin instead of round-tripping through the kernel. Grows monotonically
+    — we never shrink — and is bounded only by the host-RAM budget the
+    caller already enforces upstream.
+
+    Thread-safe under a module-level ``threading.Lock``. The lock is
+    released across the (potentially multi-second) actual
+    ``alloc_pinned_memory`` call so concurrent acquires of pool-hit sizes
+    are not serialized behind a cold-allocate.
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._available: list[tuple[int, Any]] = []
+        self._in_flight: dict[int, tuple[int, Any]] = {}
+        self._n_allocs = 0
+        self._n_reuses = 0
+        self._peak_total_bytes = 0
+
+    def acquire(self, cp: Any, nbytes: int) -> tuple[Any, np.ndarray]:
+        """Return ``(pinned_mem, uint8 numpy view of length ``nbytes``)``.
+
+        Best-fit search: smallest available buffer ≥ ``nbytes``. Falls
+        back to a fresh ``alloc_pinned_memory`` if no candidate fits.
+        """
+        if nbytes <= 0:
+            return None, np.empty((0,), dtype=np.uint8)
+        nbytes = int(nbytes)
+        with self._lock:
+            best_idx = -1
+            best_size = -1
+            for idx, (sz, _mem) in enumerate(self._available):
+                if sz >= nbytes and (best_idx < 0 or sz < best_size):
+                    best_idx = idx
+                    best_size = sz
+            if best_idx >= 0:
+                sz, mem = self._available.pop(best_idx)
+                self._in_flight[id(mem)] = (sz, mem)
+                self._n_reuses += 1
+                view = np.frombuffer(mem, dtype=np.uint8, count=nbytes)
+                return mem, view
+        # Allocate outside the lock — pinning a multi-GB region can take
+        # seconds and we don't want every other thread blocked on it.
+        pinned_mem = cp.cuda.alloc_pinned_memory(nbytes)
+        with self._lock:
+            self._in_flight[id(pinned_mem)] = (nbytes, pinned_mem)
+            self._n_allocs += 1
+            total = sum(sz for sz, _ in self._available) + sum(
+                sz for sz, _ in self._in_flight.values()
+            )
+            if total > self._peak_total_bytes:
+                self._peak_total_bytes = total
+        view = np.frombuffer(pinned_mem, dtype=np.uint8, count=nbytes)
+        return pinned_mem, view
+
+    def release(self, mem: Any) -> None:
+        """Return ``mem`` to the pool so a later acquire can reuse it.
+
+        Safe with ``None`` (no-op) and on double-release (drops silently).
+        """
+        if mem is None:
+            return
+        with self._lock:
+            entry = self._in_flight.pop(id(mem), None)
+            if entry is None:
+                return
+            self._available.append(entry)
+
+    def stats(self) -> dict[str, int]:
+        with self._lock:
+            return {
+                "available_count": len(self._available),
+                "available_bytes": sum(sz for sz, _ in self._available),
+                "in_flight_count": len(self._in_flight),
+                "in_flight_bytes": sum(sz for sz, _ in self._in_flight.values()),
+                "allocs": self._n_allocs,
+                "reuses": self._n_reuses,
+                "peak_total_bytes": self._peak_total_bytes,
+            }
+
+
+_PINNED_POOL = _PinnedBufferPool()
+
+
+def _pinned_pool() -> _PinnedBufferPool:
+    """Return the process-wide pinned-buffer pool."""
+    return _PINNED_POOL
+
+
+def _allocate_pinned(cp: Any, nbytes: int) -> tuple[Any, np.ndarray]:
+    """Acquire a pinned-host uint8 staging buffer from the process-wide pool.
+
+    Returns ``(pinned_mem, numpy_view)``. Pass ``pinned_mem`` to
+    ``_release_pinned`` when the buffer is no longer needed so a later
+    acquire can reuse it instead of re-pinning multi-GB regions from
+    scratch.
+    """
+    return _PINNED_POOL.acquire(cp, int(nbytes))
+
+
+def _release_pinned(mem: Any) -> None:
+    """Return a pinned buffer to the pool. Safe with ``None`` and on double-release."""
+    _PINNED_POOL.release(mem)
+
 
 STORE_FORMAT = "svpgs-store-v1"
 MANIFEST_FILE = "MANIFEST.json"
