@@ -247,10 +247,6 @@ def test_ridge_inf_baseline_matches_a_direct_solve(tmp_path) -> None:
     (tmp_path / "kernel_counts_beagle.json").write_text(json.dumps(counts))
     weight = counts["structural"] / n_var
     combined = (1 - weight) * kernels["simple"] + weight * kernels["structural"]
-    for name, matrix in (("simple", kernels["simple"]), ("all", combined)):
-        values, vectors = np.linalg.eigh(matrix[np.ix_(train, train)])
-        np.save(tmp_path / f"eig_{name}_beagle_values.npy", values)
-        np.save(tmp_path / f"eig_{name}_beagle_vectors.npy", vectors)
     np.savez(tmp_path / "pcs_beagle.npz", pcs=rng.standard_normal((size, 10)))
     scenario = tmp_path / "scenario_000"
     scenario.mkdir()

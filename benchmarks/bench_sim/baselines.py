@@ -1,7 +1,7 @@
 """bench-sim neutral baselines, on the kernels prepared by gpu_kernels.
 
 oracle_observed applies the true additive effects to observed codes: the imputation-limited ceiling.
-ridge_inf is GBLUP with lambda = (1 - h2)/h2, h2 from Haseman-Elston on the training kernel, in two arms:
+ridge_inf is GBLUP with lambda = (1 - h2)/h2, h2 from Haseman-Elston on the training kernel, solved by Cholesky, in two arms:
 "simple" (SNV+INDEL records only) and "all". Predictions go to <results>/<method>/<scenario>/prediction.npz.
 
     python -m benchmarks.bench_sim.baselines --cohort <cohort/chr22> --scenarios <dirs...> --results <dir>
@@ -14,6 +14,7 @@ import json
 from pathlib import Path
 
 import numpy as np
+from scipy.linalg import cho_factor, cho_solve
 
 from benchmarks.bench_sim.harness import ARMS, covariate_matrix
 from benchmarks.bench_sim.measurement import measured_records
@@ -29,28 +30,28 @@ def residualized(outcome: np.ndarray, covariates: np.ndarray) -> tuple[np.ndarra
 
 
 def load_shared(cohort: Path, arm: str) -> dict:
-    """Scenario-independent inputs, read once: split, covariates, kernel blocks and eigendecompositions."""
+    """Scenario-independent inputs, read once: split, covariates, and the training and test-train kernel blocks."""
     samples = np.load(cohort / "samples.npz")
     train = np.flatnonzero(~samples["is_test"])
     test = np.flatnonzero(samples["is_test"])
     covariates, _ = covariate_matrix(cohort, arm)
     counts = json.loads((cohort / f"kernel_counts_{arm}.json").read_text())
     weight_structural = counts["structural"] / (counts["simple"] + counts["structural"])
-    shared = {"train": train, "test": test, "covariates": covariates, "weight_structural": weight_structural,
-              "observed": np.load(cohort / ARMS[arm][0], mmap_mode="r"), "cls": np.load(cohort / "variants.npz")["cls"],
-              "measured": measured_records(cohort)}
-    diagonals, crosses = {}, {}
+    blocks = {}
     for name in ("simple", "structural"):
         kernel = np.load(cohort / f"kernel_{name}_{arm}.npy", mmap_mode="r")
-        diagonals[name] = np.asarray(kernel[train, train], dtype=np.float64)
-        crosses[name] = np.asarray(kernel[test][:, train], dtype=np.float64)
-    shared["cross"] = crosses
-    shared["diagonal"] = {"simple": diagonals["simple"],
-                          "all": (1 - weight_structural) * diagonals["simple"] + weight_structural * diagonals["structural"]}
-    shared["eigen"] = {name: (np.load(cohort / f"eig_{name}_{arm}_values.npy").astype(np.float64),
-                              np.load(cohort / f"eig_{name}_{arm}_vectors.npy").astype(np.float64))
-                       for name in ("simple", "all")}
-    return shared
+        rows = np.asarray(kernel[train])
+        blocks[name] = (rows[:, train].astype(np.float64), np.asarray(kernel[test])[:, train].astype(np.float64))
+        del rows
+    train_kernels = {"simple": blocks["simple"][0],
+                     "all": (1 - weight_structural) * blocks["simple"][0] + weight_structural * blocks["structural"][0]}
+    return {
+        "train": train, "test": test, "covariates": covariates, "weight_structural": weight_structural,
+        "observed": np.load(cohort / ARMS[arm][0], mmap_mode="r"), "cls": np.load(cohort / "variants.npz")["cls"],
+        "measured": measured_records(cohort), "train_kernel": train_kernels,
+        "frobenius": {name: float(np.sum(matrix * matrix)) for name, matrix in train_kernels.items()},
+        "cross": {"simple": blocks["simple"][1], "structural": blocks["structural"][1]},
+    }
 
 
 def baselines(shared: dict, scenario: Path, results: Path, arm: str) -> None:
@@ -72,26 +73,25 @@ def baselines(shared: dict, scenario: Path, results: Path, arm: str) -> None:
     np.savez(out / "prediction.npz", total=effects @ dosage, structural=effects[structural] @ dosage[structural])
     (out / "meta.json").write_text(json.dumps({"measurement": ARMS[arm][2]}))
 
-    # ridge_inf, two kernel arms.
+    # ridge_inf, two kernel arms: Haseman-Elston h2, then (K + lambda I) alpha = y by Cholesky.
     standardized, phenotype_scale = residualized(truth["phenotype"][train], covariates[train])
     weight_structural = shared["weight_structural"]
     for kernel_arm in ("simple", "all"):
-        values, vectors = shared["eigen"][kernel_arm]
-        projected = vectors.T @ standardized
-        quadratic = float(projected @ (values * projected))
-        diagonal = shared["diagonal"][kernel_arm]
-        heritability = (quadratic - diagonal @ (standardized * standardized)) / (float(values @ values) - diagonal @ diagonal)
+        train_kernel = shared["train_kernel"][kernel_arm]
+        diagonal = np.diagonal(train_kernel)
+        quadratic = float(standardized @ (train_kernel @ standardized))
+        heritability = (quadratic - diagonal @ (standardized * standardized)) / (shared["frobenius"][kernel_arm] - diagonal @ diagonal)
         out = results / f"ridge_inf_{kernel_arm}" / scenario.name
         out.mkdir(parents=True, exist_ok=True)
-        # h2 is truncated to its parameter space [0, 1]; at h2 = 1 the solve is the pseudo-inverse.
+        # h2 is truncated to its parameter space [0, 1]. At h2 = 0 the prediction is zero; at h2 = 1 the ridge is
+        # zero and the training kernel itself is factored (positive definite: more measured records than samples).
         heritability_used = float(np.clip(heritability, 0.0, 1.0))
         if heritability_used == 0.0:
             np.savez(out / "prediction.npz", total=np.zeros(test.size), structural=np.zeros(test.size))
         else:
             ridge = (1.0 - heritability_used) / heritability_used
-            shifted = values + ridge
-            inverse = np.divide(1.0, shifted, out=np.zeros_like(shifted), where=shifted > 0)
-            alpha = vectors @ (projected * inverse)
+            factor = cho_factor(train_kernel + ridge * np.eye(train.size), lower=True)
+            alpha = cho_solve(factor, standardized)
             if kernel_arm == "simple":
                 total, structural_part = shared["cross"]["simple"] @ alpha, np.zeros(test.size)
             else:

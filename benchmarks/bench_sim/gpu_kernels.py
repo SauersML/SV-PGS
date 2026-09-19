@@ -1,9 +1,8 @@
 """bench-sim harness preparation on a GPU: genomic relationship kernels from observed codes, and the PCs.
 
-K_simple (SNV+INDEL records) and K_structural (TR+SV records) are each the mean over records of outer
-products of columns standardized with training-sample moments, over all N samples. The training blocks of
-K_simple and of the record-weighted combination are eigendecomposed for the ridge_inf baseline, and 10 PCs of
-K_simple (training eigenvectors, Nystrom-projected onto test samples) go to <cohort>/pcs.npz.
+K_simple (SNV+INDEL records) and K_structural (TR+SV records) are each the mean over measured records of outer
+products of columns standardized with training-sample moments, over all N samples. 10 PCs of K_simple (the
+training block's top eigenvectors, Nystrom-projected onto test samples) go to <cohort>/pcs_<arm>.npz.
 
     python -m benchmarks.bench_sim.gpu_kernels --cohort <cohort/chr22>
 """
@@ -16,6 +15,7 @@ from pathlib import Path
 
 import cupy as cp
 import numpy as np
+from cupyx.scipy.sparse.linalg import LinearOperator, eigsh
 
 from benchmarks.bench_sim.harness import ARMS
 from benchmarks.bench_sim.measurement import measured_records
@@ -25,8 +25,10 @@ PC_COUNT = 10
 
 
 def prepare(cohort: Path, block_rows: int, arm: str) -> None:
-    """Peak device memory: the two N x N accumulators (2 x 4 N^2 bytes, 20 GB at N = 50,000), then one
-    training block, its eigenvectors and the test-train cross block per kernel."""
+    """Peak device memory: the two N x N accumulators (2 x 4 N^2 bytes, 20 GB at N = 50,000), then the training
+    block of K_simple for the PCs. A dense eigendecomposition of a 40,000-sample block exceeds cuSOLVER's syevd
+    workspace limits, so the PCs come from Lanczos (the top PC_COUNT eigenpairs, residual-checked) and the
+    baselines solve their ridge systems by Cholesky instead of reusing a full eigenbasis."""
     samples = np.load(cohort / "samples.npz")
     is_test = samples["is_test"]
     train, test = np.flatnonzero(~is_test), np.flatnonzero(is_test)
@@ -52,31 +54,26 @@ def prepare(cohort: Path, block_rows: int, arm: str) -> None:
         if first % (block_rows * 20) == 0:
             print(f"kernel rows {first}/{n_var}", flush=True)
     (cohort / f"kernel_counts_{arm}.json").write_text(json.dumps(counts))
-    blocks = {}
-    for name in ("simple", "structural"):
+    for name in ("structural", "simple"):
         kernels[name] /= counts[name]
         np.save(cohort / f"kernel_{name}_{arm}.npy", cp.asnumpy(kernels[name]))
-        blocks[name] = (cp.asnumpy(kernels[name][train_gpu[:, None], train_gpu[None, :]]),
-                        cp.asnumpy(kernels[name][test_gpu[:, None], train_gpu[None, :]]))
-        del kernels[name]
-        cp.get_default_memory_pool().free_all_blocks()
-    total = counts["simple"] + counts["structural"]
-    combined = tuple((counts["simple"] * simple + counts["structural"] * structural) / total
-                     for simple, structural in zip(blocks["simple"], blocks["structural"]))
-    for name, (train_block, cross_block) in (("simple", blocks["simple"]), ("all", combined)):
-        values, vectors = cp.linalg.eigh(cp.asarray(train_block))
-        np.save(cohort / f"eig_{name}_{arm}_values.npy", cp.asnumpy(values))
-        np.save(cohort / f"eig_{name}_{arm}_vectors.npy", cp.asnumpy(vectors))
-        if name == "simple":
-            top = cp.argsort(values)[::-1][:PC_COUNT]
-            scale = np.sqrt(train.size)
-            pcs = np.zeros((size, PC_COUNT))
-            pcs[train] = cp.asnumpy(vectors[:, top]) * scale
-            pcs[test] = cp.asnumpy(cp.asarray(cross_block) @ vectors[:, top] / values[top]) * scale
-            np.savez(cohort / f"pcs_{arm}.npz", pcs=pcs, eigenvalues=cp.asnumpy(values[top]))
-        del values, vectors
-        cp.get_default_memory_pool().free_all_blocks()
-        print(f"eigendecomposition {name} done", flush=True)
+    del kernels["structural"]
+    cp.get_default_memory_pool().free_all_blocks()
+    train_block = kernels["simple"][train_gpu[:, None], train_gpu[None, :]]
+    cross_block = kernels["simple"][test_gpu[:, None], train_gpu[None, :]]
+    del kernels["simple"]
+    cp.get_default_memory_pool().free_all_blocks()
+    operator = LinearOperator(train_block.shape, matvec=lambda vector: train_block @ vector, dtype=cp.float32)
+    values, vectors = eigsh(operator, k=PC_COUNT, which="LA")
+    order = cp.argsort(values)[::-1]
+    values, vectors = values[order], vectors[:, order]
+    residual = cp.linalg.norm(train_block @ vectors - vectors * values, axis=0) / values
+    scale = np.sqrt(train.size)
+    pcs = np.zeros((size, PC_COUNT))
+    pcs[train] = cp.asnumpy(vectors) * scale
+    pcs[test] = cp.asnumpy(cross_block @ vectors / values) * scale
+    np.savez(cohort / f"pcs_{arm}.npz", pcs=pcs, eigenvalues=cp.asnumpy(values), relative_residual=cp.asnumpy(residual))
+    print(f"PCs done; eigenvalues {cp.asnumpy(values).round(3).tolist()}, max relative residual {float(residual.max()):.2e}", flush=True)
 
 
 def main() -> None:
