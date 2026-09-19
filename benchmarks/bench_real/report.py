@@ -137,14 +137,20 @@ def summarize_sv_credit(credit: pd.DataFrame):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--results", required=True)
+    parser.add_argument("--results", nargs="+", required=True, help="one or more results directories; each (method, design, feature set) must come from one")
     parser.add_argument("--dataset", required=True)
     parser.add_argument("--methods", nargs="+", required=True)
     parser.add_argument("--out", required=True)
     arguments = parser.parse_args()
-    results_dir, dataset_dir = pathlib.Path(arguments.results), pathlib.Path(arguments.dataset)
-    scores = pd.concat([per_gene_scores(results_dir, dataset_dir, method, design) for method in arguments.methods for design in ("random5", "loso")
-                        if (results_dir / method / design).exists()], ignore_index=True)
+    results_dirs, dataset_dir = [pathlib.Path(path) for path in arguments.results], pathlib.Path(arguments.dataset)
+    runs = [(results_dir, method, design) for results_dir in results_dirs for method in arguments.methods for design in ("random5", "loso")
+            if (results_dir / method / design).exists()]
+    scores = pd.concat([per_gene_scores(results_dir, dataset_dir, method, design).assign(results=str(results_dir)) for results_dir, method, design in runs],
+                       ignore_index=True)
+    sources = scores.groupby(["method", "design", "feature_set"])["results"].nunique()
+    if (sources > 1).any():
+        raise ValueError(f"an arm appears in more than one results directory: {list(sources[sources > 1].index)}")
+    scores = scores.drop(columns="results")
     scores.to_csv(pathlib.Path(arguments.out) / "per_gene_r2.tsv.gz", sep="\t", index=False)
     present = set(zip(scores["method"], scores["feature_set"]))
     arms = [(method, feature_set) for method in arguments.methods for feature_set in FEATURE_SETS if (method, feature_set) in present]
@@ -158,8 +164,7 @@ def main():
             comparisons += paired(scores, arm_a, arm_b)
     table = pd.DataFrame(comparisons)
     table.to_csv(pathlib.Path(arguments.out) / "paired_differences.tsv", sep="\t", index=False)
-    credit = pd.concat([sv_credit(results_dir, dataset_dir, method, design) for method in arguments.methods for design in ("random5", "loso")
-                        if (results_dir / method / design).exists()], ignore_index=True)
+    credit = pd.concat([sv_credit(results_dir, dataset_dir, method, design) for results_dir, method, design in runs], ignore_index=True)
     if len(credit):
         summarize_sv_credit(credit).to_csv(pathlib.Path(arguments.out) / "sv_credit.tsv", sep="\t", index=False)
     summary = scores.groupby(["design", "superpopulation", "method", "feature_set"])["r2"].agg(["mean", "count"]).reset_index()
