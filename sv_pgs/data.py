@@ -403,7 +403,3 @@ def normalize_variant_record(record: VariantRecord | dict[str, Any]) -> VariantR
         ),
         prior_class_membership=tuple(float(member_weight) for member_weight in record.get("prior_class_membership", ())),
     )
-
-
-def normalize_variant_records(records: Sequence[VariantRecord | dict[str, Any]]) -> list[VariantRecord]:
-    return [normalize_variant_record(record) for record in records]
