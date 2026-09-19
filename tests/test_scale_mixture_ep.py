@@ -264,8 +264,9 @@ def test_the_layout_is_a_shared_density_plus_class_deviations_and_the_annotation
         np.testing.assert_allclose(density[class_position], pooled + basis @ coefficients[start : start + prior.pooled_size], atol=1e-12)
     theta = coefficients[prior.pooled_size * (prior.class_count + 1) :]
     np.testing.assert_allclose(log_scale(prior, coefficients), prior.log_variance_offset + prior.scale_design @ theta, atol=1e-12)
-    # The first difference has no null space in sum-to-zero coordinates; only the smooth annotation's linear part is profiled.
-    assert prior.null_basis.shape[1] == 1
+    # The first difference has no null space in sum-to-zero coordinates; only the smooth annotation's
+    # second-difference null space (two directions of its three columns) is profiled.
+    assert prior.null_basis.shape[1] == 2
     np.testing.assert_allclose(prior.null_basis[: prior.pooled_size * (prior.class_count + 1)], 0.0, atol=1e-10)
     names = [block.name for block in prior.smoothing_blocks]
     assert names == [
