@@ -32,8 +32,8 @@ from sv_pgs import aou_runner
 @dataclass
 class _StubDisease:
     canonical_name: str
-    snomed_code: str = "0"
-    snomed_concept_name: str = ""
+    case_snomed_codes: tuple[str, ...] = ("0",)
+    description: str = ""
 
 
 def _patch_diseases(monkeypatch: pytest.MonkeyPatch, names: list[str]) -> None:

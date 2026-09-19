@@ -15,7 +15,7 @@ cd ~ && rm -rf SV-PGS && git clone https://github.com/SauersML/SV-PGS.git && cd 
 **Run a full analysis** (downloads VCFs, prepares phenotype, merges PCs, fits one unified genome-wide model):
 
 ```bash
-cd ~/SV-PGS && uv run sv-pgs run-all-of-us --disease hypertension --output-dir hypertension_results
+cd ~/SV-PGS && uv run sv-pgs run-all-of-us --disease type2_diabetes --output-dir t2d_results
 ```
 
 That single command defaults to `--variants snp+sv`, which fits one joint
@@ -33,7 +33,7 @@ That single command (with the default `--variants snp+sv`):
    controlled-tier buckets (skips existing files); `--variants sv` skips the
    PLINK trio and `--variants snp` skips the SV VCFs
 2. Downloads ancestry predictions and merges top 10 genomic PCs
-3. Queries BigQuery for the disease phenotype (ICD-9/10 codes built-in)
+3. Queries BigQuery for the phenotype (SNOMED, LOINC and ATC definitions built-in)
 4. Concatenates the requested chromosome data into one genome-wide training
    dataset, intersecting samples across the SNP and SV sources when both are
    loaded
@@ -42,7 +42,7 @@ That single command (with the default `--variants snp+sv`):
    annotations from VCF INFO
 7. Reuses an existing fit only when the full AoU run configuration (including
    the `--variants` choice) matches
-8. Covariates: age, age^2, sex at birth, race, ethnicity, PC1-PC10
+8. Covariates: age, age^2, age x female, sex at birth, pre-landmark EHR depth, PC1-PC10
 
 **Available diseases:**
 
@@ -50,7 +50,7 @@ That single command (with the default `--variants snp+sv`):
 uv run sv-pgs list-all-of-us-diseases
 ```
 
-asthma, atrial_fibrillation, chronic_kidney_disease, copd, coronary_artery_disease, depression, heart_failure, hypertension, stroke, type2_diabetes
+atrial_fibrillation, cataract, chronic_kidney_disease, copd, depression, gout, hypothyroidism, prostate_cancer, psoriasis, type2_diabetes
 
 **Options:**
 
@@ -59,7 +59,7 @@ asthma, atrial_fibrillation, chronic_kidney_disease, copd, coronary_artery_disea
 uv run sv-pgs run-all-of-us --disease type2_diabetes --chromosomes 22 --output-dir t2d_chr22
 
 # Specific chromosomes:
-uv run sv-pgs run-all-of-us --disease heart_failure --chromosomes 1,6,22 --output-dir hf_results
+uv run sv-pgs run-all-of-us --disease atrial_fibrillation --chromosomes 1,6,22 --output-dir af_results
 
 # More PCs:
 uv run sv-pgs run-all-of-us --disease depression --n-pcs 20 --output-dir depression_results
@@ -68,28 +68,54 @@ uv run sv-pgs run-all-of-us --disease depression --n-pcs 20 --output-dir depress
 **Quantitative traits** (EHR labs and physical measurements from the OMOP `measurement` table):
 
 ```bash
+uv run sv-pgs census-all-of-us-traits --output trait_census.tsv   # first query on a new CDR
 uv run sv-pgs list-all-of-us-traits
 uv run sv-pgs run-all-of-us --trait mean_corpuscular_volume --output-dir mcv_results
-uv run sv-pgs prepare-all-of-us-trait --trait haptoglobin --output haptoglobin.samples.tsv
+uv run sv-pgs prepare-all-of-us-trait --trait ldl_cholesterol --output ldl.samples.tsv
 ```
 
-Each trait (`sv_pgs/all_of_us.py`, `MEASUREMENT_DEFINITIONS`) is a set of standard LOINC
-codes, a UCUM unit table converting every accepted unit to one canonical unit, a
-plausible range, an analysis scale (linear or log), an optional medication rule, and
-the SV/TR biology that motivates it. Rows that are censored (`<`, `>`), in an
-unrecognized unit, implausible, self-reported, taken before age 18, taken in an
-inpatient or emergency visit, or inside a pregnancy window are dropped; same-day
-repeats are one occasion. A person's untreated occasions are used when there are any,
-otherwise treated occasions corrected by the trait's convention (lipid-lowering: LDL /
-0.7, total cholesterol / 0.8; antihypertensive: SBP + 15, DBP + 10 mmHg) or, where no
-validated correction exists (HbA1c, glucose, TSH, urate, BMI, ...), not at all. The
-`target` column is the empirical BLUP of the person's long-run mean under a
-random-intercept model (closed-form moment estimates of the between- and within-person
-variances); `target_inverse_normal` is its rank inverse normal transform (train on it
-with `sv-pgs run --target-column target_inverse_normal`). eGFR uses the race-free
-CKD-EPI 2021 equation. Covariates: mean age and mean squared age at measurement, sex at
-birth, race, ethnicity, PCs. The `.metadata.json` sidecar records the query parameters,
-row exclusion counts, unrecognized units, variance components and repeatability.
+The catalogue (`sv_pgs/all_of_us.py`, `MEASUREMENT_DEFINITIONS`) is the panel's 11
+quantitative traits: height, BMI, systolic blood pressure, heart rate, MCV, platelet count,
+WBC, total bilirubin, eGFR (race-free CKD-EPI 2021), LDL and non-diabetic HbA1c. Codes and
+unit labels come from the public All of Us Data Browser: each trait matches its LOINC concepts
+on either concept column (plus the enrollment physical-measurement protocol means, e.g. PPI
+903118 for SBP), and converts each unit as All of Us labels it, including the mislabeled ones
+whose values the Data Browser histograms show are in the canonical unit (e.g. counts in
+"Kelvin per microliter", unit-less blood pressure). Rows that are censored (`<`, `>`), in an
+unrecognized unit, implausible, self-reported, below the trait's minimum age (18; height 20),
+within 30 days of an inpatient or emergency stay, inside a pregnancy window, or inside a
+trait's clinical exclusion windows (hematologic malignancy, chemotherapy and transfusion for
+blood counts; antibacterial courses for WBC; cholestasis and cirrhosis for bilirubin; dialysis
+and transplant for eGFR; any diabetes for HbA1c) are dropped; same-day repeats are one
+occasion. A person's untreated occasions are used when there are any, otherwise treated
+occasions corrected by the trait's convention (LDL / 0.7 under statins, ezetimibe or PCSK9
+inhibitors; SBP + 15 mmHg under antihypertensives) or, where no correction exists (heart rate
+under rate control, BMI under GLP-1 drugs), not at all. The `target` column is the
+empirical BLUP of the person's long-run mean under a random-intercept model (closed-form moment
+estimates of the between- and within-person variances); `target_inverse_normal` is its rank
+inverse normal transform (train on it with `sv-pgs run --target-column target_inverse_normal`).
+Covariates: mean age and mean squared age at measurement, age x female, sex at birth, log
+occasion count and PCs.
+
+**Diseases** are defined by SNOMED concept roots expanded through `concept_ancestor`. A case
+has two distinct diagnosis dates, or one plus a disease-specific medication (e.g. a
+non-metformin glucose-lowering drug for type 2 diabetes, levothyroxine on two dates for
+hypothyroidism), or a case procedure (cataract extraction), or repeated qualifying labs, which
+make a case on their own (HbA1c >= 6.5% on two dates for type 2 diabetes; for chronic kidney
+disease two eGFR < 60 or two urine ACR >= 30 mg/g occasions at least 90 days apart). Controls
+with a related code, medication or any qualifying lab are dropped, phecode-style (e.g. any
+diabetes code or drug for type 2 diabetes, asthma for COPD, any depressive disorder or
+antidepressant for depression), as is everyone with an ambiguous code (e.g. bipolar disorder
+for depression, postprocedural hypothyroidism), fewer than 5 distinct condition dates in their
+first year of EHR, the wrong sex (prostate cancer) or an age below the minimum (COPD cases and
+controls 40; prostate cancer controls 50). The
+`liability_target` column is E[liability | status, age] under the age-of-onset threshold
+model with the cohort's sex-specific cumulative incidence, where the onset age is the earliest
+diagnosis, procedure or qualifying lab. Covariates: age at the end of observation, its square,
+age x female, sex at birth, log pre-landmark EHR depth and PCs.
+Each prepared table's metadata sidecar records the query parameters, exclusion counts,
+unrecognized units, variance components and a fingerprint of the phenotype definition; the
+runner re-queries when the fingerprint no longer matches.
 
 ## Generic usage (non-AoU)
 

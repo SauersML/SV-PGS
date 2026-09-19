@@ -2,9 +2,9 @@
 
 Covers the trait catalogue, the BigQuery SQL against the OMOP CDM v5.4 schema,
 the query parameters, the per-person target construction (treatment
-precedence and corrections, variance components, empirical BLUP against the
-dense Henderson mixed-model solution, inverse normal transform), the sample
-table writer and the runner/CLI wiring.
+precedence, corrections and indicator pooling, variance components,
+empirical BLUP against the dense Henderson mixed-model solution, inverse
+normal transform), the sample table writer and the runner/CLI wiring.
 """
 from __future__ import annotations
 
@@ -22,23 +22,31 @@ from scipy.special import ndtri
 
 import sv_pgs.aou_runner as aou_runner
 from sv_pgs.all_of_us import (
+    DIABETES,
     DISEASE_DEFINITIONS,
+    LDL_LOWERING,
     MEASUREMENT_DEFINITIONS,
     MEASUREMENT_EXCLUSION_REASONS,
+    UNBOUNDED_WINDOW_DAYS,
+    ClinicalWindow,
     DiseaseDefinition,
     MeasurementDefinition,
     TreatmentCorrection,
     TreatmentRule,
     UnitConversion,
-    LIPID_LOWERING,
+    WindowConcept,
     _estimate_person_variance_components,
     _person_blup,
+    _person_design,
     _rank_inverse_normal,
     available_measurement_names,
     build_all_of_us_measurement_query_config,
     build_all_of_us_measurement_query_parameters,
     build_all_of_us_measurement_sql,
     build_all_of_us_measurement_targets,
+    measurement_covariate_columns,
+    phenotype_fingerprint,
+    prepare_all_of_us_measurement_census,
     prepare_all_of_us_measurement_sample_table,
     resolve_all_of_us_phenotype,
     resolve_measurement_definition,
@@ -101,6 +109,13 @@ OMOP_CDM_V54_COLUMNS: dict[str, set[str]] = {
         "concept_id", "concept_name", "domain_id", "vocabulary_id", "concept_class_id",
         "standard_concept", "concept_code", "valid_start_date", "valid_end_date", "invalid_reason",
     },
+    "procedure_occurrence": {
+        "procedure_occurrence_id", "person_id", "procedure_concept_id", "procedure_date",
+        "procedure_datetime", "procedure_end_date", "procedure_end_datetime",
+        "procedure_type_concept_id", "modifier_concept_id", "quantity", "provider_id",
+        "visit_occurrence_id", "visit_detail_id", "procedure_source_value",
+        "procedure_source_concept_id", "modifier_source_value",
+    },
     "concept_ancestor": {
         "ancestor_concept_id", "descendant_concept_id", "min_levels_of_separation",
         "max_levels_of_separation",
@@ -158,8 +173,7 @@ def _person_row(
         "person_id": str(person_id),
         "unrecognized_unit_labels": unrecognized_unit_labels or [],
         "sex_at_birth_concept_id": sex_at_birth_concept_id,
-        "race_concept_id": 8527,
-        "ethnicity_concept_id": 38003564,
+        "sex_at_birth_name": {45878463: "female", 45880669: "male"}.get(sex_at_birth_concept_id),
     }
     for reason, count in excluded_counts.items():
         row[f"{reason}_row_count"] = count
@@ -218,16 +232,31 @@ _BASE_DEFINITION = MeasurementDefinition(
     aliases=(),
     description="test",
     loinc_codes=("1-1",),
-    canonical_unit="mg/dL",
-    unit_conversions=(UnitConversion("mg/dL", 1.0),),
+    canonical_unit="milligram per deciliter",
+    unit_conversions=(UnitConversion("milligram per deciliter", 1.0),),
     plausible_range=(1.0, 100.0),
     log_scale=False,
-    rationale="test",
 )
 
 
 def _definition(**overrides: object) -> MeasurementDefinition:
     return dataclasses.replace(_BASE_DEFINITION, **overrides)
+
+
+def _captured_person_statistics(monkeypatch, definition: MeasurementDefinition, rows) -> dict[str, np.ndarray]:
+    """Run the target builder with the variance components pinned and return
+    the per-person means and within-person sums of squares it formed."""
+    captured: dict[str, np.ndarray] = {}
+
+    def capture_components(occasion_counts, person_means, within_sum_squares, design):
+        captured["counts"] = occasion_counts.copy()
+        captured["means"] = person_means.copy()
+        captured["within"] = within_sum_squares.copy()
+        return 1.0, 1.0
+
+    monkeypatch.setattr("sv_pgs.all_of_us._estimate_person_variance_components", capture_components)
+    build_all_of_us_measurement_targets(definition, rows)
+    return captured
 
 
 # ---------------------------------------------------------------------------
@@ -251,68 +280,56 @@ def test_every_disease_and_trait_name_resolves_to_exactly_its_own_definition():
             assert resolve_all_of_us_phenotype(name) is definition
 
 
-def test_catalogue_covers_the_named_sv_traits_and_the_requested_panels():
-    names = set(available_measurement_names())
-    # Headline SV/TR traits: alpha-globin red-cell indices, HP deletion ->
-    # haptoglobin, ACE Alu -> serum ACE, UGT1A1 (TA)n -> bilirubin, GGT1 VNTR,
-    # MUC1 VNTR -> urea/urate, LPA KIV-2.
-    assert {
-        "mean_corpuscular_volume", "mean_corpuscular_hemoglobin", "haptoglobin",
-        "angiotensin_converting_enzyme", "total_bilirubin", "gamma_glutamyl_transferase",
-        "blood_urea_nitrogen", "urate", "lipoprotein_a_mass", "lipoprotein_a_molar",
-    } <= names
-    assert {
-        "ldl_cholesterol", "hdl_cholesterol", "total_cholesterol", "triglycerides", "hemoglobin_a1c",
-        "glucose", "egfr_ckd_epi_2021", "platelet_count", "white_blood_cell_count",
-        "neutrophil_count", "lymphocyte_count", "monocyte_count", "eosinophil_count",
-        "red_cell_distribution_width", "alanine_aminotransferase", "aspartate_aminotransferase",
-        "alkaline_phosphatase", "albumin", "thyrotropin", "c_reactive_protein", "ferritin",
-        "vitamin_d_25_hydroxy", "height", "body_mass_index", "systolic_blood_pressure",
-        "diastolic_blood_pressure", "waist_circumference", "hip_circumference", "heart_rate",
-    } <= names
-    assert len(MEASUREMENT_DEFINITIONS) == len(names)
+def test_catalogue_is_the_panels_eleven_quantitative_traits():
+    assert available_measurement_names() == sorted([
+        "height", "body_mass_index", "systolic_blood_pressure", "heart_rate", "mean_corpuscular_volume",
+        "platelet_count", "white_blood_cell_count", "total_bilirubin", "egfr_ckd_epi_2021",
+        "ldl_cholesterol", "hemoglobin_a1c",
+    ])
 
 
-def test_medication_conventions_follow_the_published_constants():
-    corrections = {
+def test_medication_rules_follow_the_published_conventions():
+    treatments = {
         definition.canonical_name: definition.treatment
         for definition in MEASUREMENT_DEFINITIONS
         if definition.treatment is not None
     }
-    assert corrections["ldl_cholesterol"].correction is TreatmentCorrection.DIVIDE
-    assert corrections["ldl_cholesterol"].amount == 0.7
-    assert corrections["total_cholesterol"].amount == 0.8
-    assert corrections["systolic_blood_pressure"].correction is TreatmentCorrection.ADD
-    assert corrections["systolic_blood_pressure"].amount == 15.0
-    assert corrections["diastolic_blood_pressure"].amount == 10.0
-    for trait in ("hemoglobin_a1c", "glucose", "thyrotropin", "urate", "body_mass_index", "heart_rate"):
-        assert corrections[trait].correction is TreatmentCorrection.EXCLUDE
-    # By convention HDL and triglycerides are not corrected for therapy.
-    assert "hdl_cholesterol" not in corrections
-    assert "triglycerides" not in corrections
+    assert treatments["ldl_cholesterol"] == TreatmentRule(
+        LDL_LOWERING, TreatmentCorrection.DIVIDE, 0.7, treatments["ldl_cholesterol"].citation
+    )
+    assert treatments["systolic_blood_pressure"].correction is TreatmentCorrection.ADD
+    assert treatments["systolic_blood_pressure"].amount == 15.0
+    for trait in ("heart_rate", "body_mass_index"):
+        assert treatments[trait].correction is TreatmentCorrection.EXCLUDE
+    # HbA1c is restricted to people without diabetes.
+    hba1c = resolve_measurement_definition("hba1c")
+    assert hba1c.treatment is None
+    assert hba1c.clinical_windows == (DIABETES,)
+    assert DIABETES.days_before == DIABETES.days_after == UNBOUNDED_WINDOW_DAYS
 
 
 @pytest.mark.parametrize(
     ("overrides", "message"),
     [
-        ({"canonical_unit": "mmol/L"}, "canonical unit"),
-        ({"unit_conversions": (UnitConversion("mg/dL", 1.0), UnitConversion("mg/dL", 2.0))}, "duplicate unit"),
+        ({"canonical_unit": "millimole per liter"}, "canonical unit"),
+        (
+            {"unit_conversions": (UnitConversion("milligram per deciliter", 1.0), UnitConversion("milligram per deciliter", 2.0))},
+            "unique and lower case",
+        ),
+        ({"unit_conversions": (UnitConversion("milligram per deciliter", 1.0), UnitConversion("mg/dL", 1.0))}, "lower case"),
         ({"plausible_range": (5.0, 5.0)}, "empty plausible range"),
         ({"log_scale": True, "plausible_range": (0.0, 5.0)}, "log scale needs"),
         ({"log_offset": 0.05}, "log_offset without log scale"),
         ({"value_formula": "mdrd"}, "unknown value formula"),
         (
-            {
-                "log_scale": True,
-                "treatment": TreatmentRule(LIPID_LOWERING, TreatmentCorrection.ADD, 1.0, "test"),
-            },
+            {"log_scale": True, "treatment": TreatmentRule(LDL_LOWERING, TreatmentCorrection.ADD, 1.0, "test")},
             "additive correction",
         ),
         (
             {
                 "log_scale": True,
                 "log_offset": 0.05,
-                "treatment": TreatmentRule(LIPID_LOWERING, TreatmentCorrection.DIVIDE, 0.7, "test"),
+                "treatment": TreatmentRule(LDL_LOWERING, TreatmentCorrection.DIVIDE, 0.7, "test"),
             },
             "ratio correction",
         ),
@@ -324,18 +341,24 @@ def test_measurement_definition_rejects_inconsistent_definitions(overrides, mess
         _definition(**overrides)
 
 
-def test_treatment_rule_needs_an_amount_exactly_when_it_corrects():
+def test_treatment_rules_and_windows_reject_inconsistent_arguments():
     with pytest.raises(ValueError, match="amount"):
-        TreatmentRule(LIPID_LOWERING, TreatmentCorrection.EXCLUDE, 0.7, "test")
+        TreatmentRule(LDL_LOWERING, TreatmentCorrection.EXCLUDE, 0.7, "test")
     with pytest.raises(ValueError, match="amount"):
-        TreatmentRule(LIPID_LOWERING, TreatmentCorrection.DIVIDE, None, "test")
+        TreatmentRule(LDL_LOWERING, TreatmentCorrection.DIVIDE, None, "test")
+    with pytest.raises(ValueError, match="domains"):
+        ClinicalWindow("test", (WindowConcept("visit", "SNOMED", "1"),), 0, 0)
+    with pytest.raises(ValueError, match="needs concepts"):
+        ClinicalWindow("test", (), 0, 0)
+    with pytest.raises(ValueError, match="window days"):
+        ClinicalWindow("test", (WindowConcept("drug", "ATC", "A10"),), -2, 0)
 
 
 def test_resolve_measurement_definition_accepts_aliases_and_rejects_diseases():
     assert resolve_measurement_definition("MCV").canonical_name == "mean_corpuscular_volume"
-    assert resolve_measurement_definition("hs-crp").canonical_name == "c_reactive_protein"
+    assert resolve_measurement_definition("creatinine").canonical_name == "egfr_ckd_epi_2021"
     with pytest.raises(ValueError, match="Unsupported trait"):
-        resolve_measurement_definition("hypertension")
+        resolve_measurement_definition("gout")
 
 
 # ---------------------------------------------------------------------------
@@ -369,9 +392,13 @@ def test_measurement_sql_references_only_omop_cdm_v54_columns(monkeypatch):
         ("condition_occurrence", "condition_concept_id"),
         ("observation", "observation_date"),
         ("observation", "observation_concept_id"),
+        ("procedure_occurrence", "procedure_date"),
+        ("procedure_occurrence", "procedure_concept_id"),
         ("drug_exposure", "drug_exposure_start_date"),
         ("drug_exposure", "drug_concept_id"),
-        ("concept", "standard_concept"),
+        ("visit_occurrence", "visit_start_date"),
+        ("visit_occurrence", "visit_end_date"),
+        ("visit_occurrence", "visit_concept_id"),
     ):
         assert re.search(rf"\b{column}\b", sql)
         assert column in OMOP_CDM_V54_COLUMNS[table]
@@ -391,8 +418,26 @@ def test_measurement_sql_is_one_parameterized_query_for_every_trait(monkeypatch)
         assert f"'{reason}'" in sql
         assert f"{reason}_row_count" in sql
     assert "vocabulary_id = 'LOINC'" in sql
-    assert "vocabulary_id = 'UCUM'" in sql
+    # Both concept columns are matched; units are matched by All of Us unit name.
+    assert "measurement.measurement_source_concept_id IN (SELECT concept_id FROM analyte_concepts)" in sql
+    assert "LOWER(unit.concept_name)" in sql
     assert "GROUP BY person_id, measurement_date, age_years, on_treatment" in sql
+    assert "race_concept_id" not in sql
+    assert "ethnicity_concept_id" not in sql
+
+
+def test_measurement_sql_scans_the_measurement_table_once(monkeypatch):
+    # BigQuery re-executes a non-recursive CTE at every reference, so each CTE
+    # downstream of the measurement scan must be referenced exactly once.
+    monkeypatch.setenv("WORKSPACE_CDR", DATASET)
+    sql = build_all_of_us_measurement_sql()
+    assert sql.count(f"`{DATASET}.measurement`") == 1
+    for common_table in (
+        "exclusion_windows", "measurement_rows", "analyte_rows", "classified_rows", "valued_rows",
+        "person_days", "person_summaries",
+    ):
+        assert f"{common_table} AS (" in sql
+        assert len(re.findall(rf"\b(?:FROM|JOIN) {common_table}\b", sql)) == 1, common_table
 
 
 def test_measurement_sql_uses_the_race_free_ckd_epi_2021_constants(monkeypatch):
@@ -406,45 +451,60 @@ def test_measurement_sql_uses_the_race_free_ckd_epi_2021_constants(monkeypatch):
         "WHEN 'male' THEN 142 * POW(LEAST(canonical_value / 0.9, 1), -0.302)"
         " * POW(GREATEST(canonical_value / 0.9, 1), -1.2) * POW(0.9938, age_years) * 1.0"
     ) in sql
-    assert "race_concept_id" not in sql.split("valued_rows AS", 1)[1].split("person_days AS", 1)[0]
-
-
-def test_measurement_sql_scans_the_measurement_table_once(monkeypatch):
-    # BigQuery re-executes a non-recursive CTE at every reference, so each CTE
-    # downstream of the measurement scan must be referenced exactly once.
-    monkeypatch.setenv("WORKSPACE_CDR", DATASET)
-    sql = build_all_of_us_measurement_sql()
-    assert sql.count(f"`{DATASET}.measurement`") == 1
-    for common_table in ("analyte_rows", "classified_rows", "valued_rows", "person_days", "person_summaries"):
-        assert f"{common_table} AS (" in sql
-        assert len(re.findall(rf"\b(?:FROM|JOIN) {common_table}\b", sql)) == 1, common_table
 
 
 def test_measurement_query_config_types_every_parameter():
-    definition = resolve_measurement_definition("ldl_cholesterol")
+    definition = resolve_measurement_definition("systolic_blood_pressure")
     config = build_all_of_us_measurement_query_config(definition)
     parameters = {parameter.name: parameter for parameter in config.query_parameters}
     assert isinstance(parameters["loinc_codes"], bigquery.ArrayQueryParameter)
-    assert parameters["loinc_codes"].values == ["13457-7", "18262-6", "2089-1", "96259-7"]
-    assert parameters["unit_codes"].values == ["mg/dL", "mmol/L"]
+    assert parameters["loinc_codes"].values == ["8480-6", "8459-0", "76534-7"]
+    assert parameters["physical_measurement_concept_ids"].array_type == "INT64"
+    assert parameters["physical_measurement_concept_ids"].values == [903118]
+    assert parameters["excluded_source_concept_ids"].values == [903109, 903114, 903130]
+    assert parameters["unit_labels"].values == ["millimeter mercury column", "no unit", "unit"]
     assert parameters["unit_scales"].array_type == "FLOAT64"
-    assert parameters["unit_scales"].values == [1.0, 38.67]
-    assert parameters["treatment_atc_codes"].values == ["C10"]
+    assert parameters["treatment_atc_codes"].values == ["C02", "C03", "C07", "C08", "C09"]
     assert isinstance(parameters["log_scale"], bigquery.ScalarQueryParameter)
     assert parameters["log_scale"].type_ == "BOOL"
     assert parameters["log_scale"].value is False
-    assert parameters["plausible_low"].value == 10.0
-    assert parameters["value_formula"].value == "identity"
-    untreated_trait = build_all_of_us_measurement_query_config(resolve_measurement_definition("haptoglobin"))
-    assert {parameter.name: parameter for parameter in untreated_trait.query_parameters}[
-        "treatment_atc_codes"
-    ].values == []
+    assert parameters["minimum_age_years"].value == 18
+    assert parameters["window_domains"].values == []
+    height = {
+        parameter.name: parameter
+        for parameter in build_all_of_us_measurement_query_config(resolve_measurement_definition("height")).query_parameters
+    }
+    assert height["treatment_atc_codes"].values == []
+    assert height["minimum_age_years"].value == 20.0
+
+
+def test_clinical_windows_flatten_to_one_parameter_entry_per_root_concept():
+    parameters = build_all_of_us_measurement_query_parameters(resolve_measurement_definition("mcv"))
+    roots = list(zip(
+        parameters["window_domains"][1],
+        parameters["window_vocabularies"][1],
+        parameters["window_concept_codes"][1],
+        parameters["window_days_before"][1],
+        parameters["window_days_after"][1],
+        strict=True,
+    ))
+    assert parameters["window_days_before"][0] == "INT64"
+    assert roots == [
+        ("condition", "SNOMED", "93143009", 180, UNBOUNDED_WINDOW_DAYS),
+        ("condition", "SNOMED", "118600007", 180, UNBOUNDED_WINDOW_DAYS),
+        ("condition", "SNOMED", "109989006", 180, UNBOUNDED_WINDOW_DAYS),
+        ("condition", "SNOMED", "109995007", 180, UNBOUNDED_WINDOW_DAYS),
+        ("condition", "SNOMED", "425333006", 180, UNBOUNDED_WINDOW_DAYS),
+        ("drug", "ATC", "L01", 0, 90),
+        ("procedure", "SNOMED", "116762002", 0, 120),
+        ("procedure", "CPT4", "36430", 0, 120),
+    ]
 
 
 def test_hba1c_ifcc_units_convert_by_the_ngsp_master_equation():
     conversion = {
-        unit.ucum_code: unit for unit in resolve_measurement_definition("hemoglobin_a1c").unit_conversions
-    }["mmol/mol"]
+        unit.unit_label: unit for unit in resolve_measurement_definition("hemoglobin_a1c").unit_conversions
+    }["millimole per mole"]
     # IFCC = 10.93 * NGSP - 23.50, so 53 mmol/mol is NGSP 7.0%.
     assert conversion.scale * 53.0 + conversion.offset == pytest.approx((53.0 + 23.50) / 10.93, abs=0.002)
 
@@ -470,8 +530,7 @@ def test_untreated_occasions_take_precedence_and_treated_ones_are_corrected():
     assert by_person["1001"]["occasion_count"] == 2
     assert by_person["1001"]["age_at_measurement"] == 50.0
     assert by_person["1002"]["measurement_source"] == "treated_corrected"
-    assert summary["n_persons_untreated"] == 31
-    assert summary["n_persons_treated_corrected"] == 1
+    assert summary["n_persons_by_source"] == {"untreated": 31, "treated_corrected": 1}
     assert summary["n_persons_without_retained_occasion"] == 1
     assert summary["excluded_row_counts"]["implausible"] == 2
 
@@ -488,21 +547,12 @@ def test_untreated_occasions_take_precedence_and_treated_ones_are_corrected():
 def test_treatment_corrections_map_the_occasion_statistics_exactly(
     monkeypatch, trait, treated_mean, treated_variance, expected_mean, expected_variance
 ):
-    definition = resolve_measurement_definition(trait)
-    captured: dict[str, np.ndarray] = {}
-
-    def capture_components(occasion_counts, person_means, within_sum_squares, design):
-        captured["means"] = person_means.copy()
-        captured["within"] = within_sum_squares.copy()
-        return 1.0, 1.0
-
-    monkeypatch.setattr("sv_pgs.all_of_us._estimate_person_variance_components", capture_components)
     rows = [
         _person_row(1, treated=(2, treated_mean, treated_variance, 60.0)),
         _person_row(2, untreated=(2, 0.0, 1.0, 40.0), sex_at_birth_concept_id=45880669),
         _person_row(3, untreated=(2, 0.0, 1.0, 50.0)),
     ]
-    build_all_of_us_measurement_targets(definition, rows)
+    captured = _captured_person_statistics(monkeypatch, resolve_measurement_definition(trait), rows)
     assert captured["means"][0] == pytest.approx(expected_mean)
     assert captured["within"][0] == pytest.approx(2 * expected_variance)
 
@@ -510,40 +560,32 @@ def test_treatment_corrections_map_the_occasion_statistics_exactly(
 def test_ratio_correction_on_the_log_scale_shifts_the_mean_by_log_amount(monkeypatch):
     definition = _definition(
         log_scale=True,
-        treatment=TreatmentRule(LIPID_LOWERING, TreatmentCorrection.DIVIDE, 0.7, "test"),
+        treatment=TreatmentRule(LDL_LOWERING, TreatmentCorrection.DIVIDE, 0.7, "test"),
     )
-    captured: dict[str, np.ndarray] = {}
-
-    def capture_components(occasion_counts, person_means, within_sum_squares, design):
-        captured["means"] = person_means.copy()
-        captured["within"] = within_sum_squares.copy()
-        return 1.0, 1.0
-
-    monkeypatch.setattr("sv_pgs.all_of_us._estimate_person_variance_components", capture_components)
     rows = [
         _person_row(1, treated=(3, math.log(70.0), 0.04, 60.0)),
         _person_row(2, untreated=(2, 4.0, 0.1, 40.0), sex_at_birth_concept_id=45880669),
         _person_row(3, untreated=(2, 4.5, 0.1, 50.0)),
     ]
-    build_all_of_us_measurement_targets(definition, rows)
+    captured = _captured_person_statistics(monkeypatch, definition, rows)
     assert captured["means"][0] == pytest.approx(math.log(100.0))
     assert captured["within"][0] == pytest.approx(3 * 0.04)
 
 
 def test_treated_only_persons_are_dropped_when_no_correction_exists():
-    hba1c = resolve_measurement_definition("hemoglobin_a1c")
-    rows, _true_means = _synthetic_person_rows(40, between_variance=0.5, within_variance=0.2, seed=3)
-    rows.append(_person_row(1000, treated=(4, 8.5, 0.3, 62.0)))
-    training_rows, _columns, summary = build_all_of_us_measurement_targets(hba1c, rows)
+    heart_rate = resolve_measurement_definition("heart_rate")
+    rows, _true_means = _synthetic_person_rows(40, between_variance=50.0, within_variance=20.0, seed=3)
+    rows.append(_person_row(1000, treated=(4, 62.0, 30.0, 62.0)))
+    training_rows, _columns, summary = build_all_of_us_measurement_targets(heart_rate, rows)
     assert "1000" not in {row["person_id"] for row in training_rows}
     assert summary["n_persons_treated_only_excluded"] == 1
     assert summary["n_persons"] == 40
 
 
 def test_treated_occasions_for_a_trait_without_a_medication_rule_raise():
-    haptoglobin = resolve_measurement_definition("haptoglobin")
+    height = resolve_measurement_definition("height")
     with pytest.raises(ValueError, match="without a medication rule"):
-        build_all_of_us_measurement_targets(haptoglobin, [_person_row(1, treated=(2, 4.0, 0.1, 50.0))])
+        build_all_of_us_measurement_targets(height, [_person_row(1, treated=(2, 170.0, 1.0, 50.0))])
 
 
 def test_person_blup_equals_the_dense_henderson_mixed_model_solution():
@@ -619,6 +661,18 @@ def test_variance_components_raise_without_repeats_or_between_person_signal():
         _estimate_person_variance_components(np.full(4, 5.0), np.full(4, 2.0), np.full(4, 40.0), design)
 
 
+def test_person_design_models_age_by_sex_and_drops_empty_columns():
+    ages = np.array([40.0, 50.0, 60.0, 70.0])
+    female = np.array([1.0, 0.0, 1.0, 0.0])
+    design = _person_design(ages, ages**2 + 4.0, female, [45878463, 45880669, 45878463, 45880669])
+    centered = ages - ages.mean()
+    np.testing.assert_allclose(design[:, -1], centered * female)
+    assert design.shape == (4, 5)
+    # One sex only: no sex indicator and no interaction column.
+    single_sex = _person_design(ages, ages**2 + 4.0, np.zeros(4), [45880669] * 4)
+    assert single_sex.shape == (4, 3)
+
+
 def test_blup_target_tracks_the_true_long_run_mean_better_than_the_raw_mean():
     rows, true_means = _synthetic_person_rows(3000, between_variance=1.0, within_variance=2.0, seed=7)
     definition = resolve_measurement_definition("mean_corpuscular_volume")
@@ -639,25 +693,24 @@ def test_rank_inverse_normal_uses_blom_scores_with_average_ties():
 
 def test_training_rows_carry_targets_covariates_and_one_hot_sex():
     rows, _true_means = _synthetic_person_rows(200, between_variance=1.0, within_variance=1.0, seed=1)
-    rows[0]["unrecognized_unit_labels"] = ["mmol/L"]
-    rows[1]["unrecognized_unit_labels"] = ["mmol/L", "unit_concept_id=0"]
+    rows[0]["unrecognized_unit_labels"] = ["millimole per liter", "millimole per liter"]
+    rows[1]["unrecognized_unit_labels"] = ["millimole per liter", "unit_concept_id=9999"]
     definition = resolve_measurement_definition("mean_corpuscular_volume")
     training_rows, columns, summary = build_all_of_us_measurement_targets(definition, rows)
-    assert columns == (
-        "sex_at_birth_concept_id_45878463",
-        "sex_at_birth_concept_id_45880669",
-        "race_concept_id_8527",
-        "ethnicity_concept_id_38003564",
-    )
-    first = training_rows[0]
-    assert first["age_at_measurement"] == rows[0]["untreated_mean_age"]
-    assert first["age_at_measurement_squared"] == rows[0]["untreated_mean_age_squared"]
-    assert first["sex_at_birth_concept_id_45878463"] == 1
-    assert "sex_at_birth_concept_id" not in first
-    assert 0.0 < first["target_reliability"] < 1.0
+    assert columns == ("sex_at_birth_concept_id_45878463", "sex_at_birth_concept_id_45880669")
+    female_row, male_row = training_rows[0], training_rows[1]
+    assert female_row["age_at_measurement"] == rows[0]["untreated_mean_age"]
+    assert female_row["age_at_measurement_squared"] == rows[0]["untreated_mean_age_squared"]
+    assert female_row["age_at_measurement_x_female"] == rows[0]["untreated_mean_age"]
+    assert male_row["age_at_measurement_x_female"] == 0.0
+    assert female_row["log_occasion_count"] == pytest.approx(math.log(rows[0]["untreated_occasion_count"]))
+    assert female_row["sex_at_birth_concept_id_45878463"] == 1
+    assert "sex_at_birth_concept_id" not in female_row
+    assert 0.0 < female_row["target_reliability"] < 1.0
     inverse_normal = np.array([row["target_inverse_normal"] for row in training_rows])
     assert inverse_normal.mean() == pytest.approx(0.0, abs=1e-9)
-    assert summary["unrecognized_unit_person_counts"] == {"mmol/L": 2, "unit_concept_id=0": 1}
+    # Persons, not days, per unrecognized unit label.
+    assert summary["unrecognized_unit_person_counts"] == {"millimole per liter": 2, "unit_concept_id=9999": 1}
 
 
 # ---------------------------------------------------------------------------
@@ -670,25 +723,30 @@ def test_prepare_measurement_sample_table_writes_table_sql_and_metadata(tmp_path
     monkeypatch.setenv("WORKSPACE_CDR", DATASET)
     rows, _true_means = _synthetic_person_rows(120, between_variance=1.0, within_variance=1.0, seed=2)
     fake_client = _FakeBigQueryClient(rows)
+    definition = resolve_measurement_definition("total_bilirubin")
     outputs = prepare_all_of_us_measurement_sample_table(
-        "haptoglobin", tmp_path / "haptoglobin.samples.tsv", client=fake_client
+        "total_bilirubin", tmp_path / "total_bilirubin.samples.tsv", client=fake_client
     )
     assert fake_client.sql == build_all_of_us_measurement_sql()
     parameters = {parameter.name: parameter for parameter in fake_client.job_config.query_parameters}
-    assert parameters["loinc_codes"].values == ["4542-7"]
+    assert parameters["loinc_codes"].values == ["1975-2"]
     with outputs.sample_table_path.open(encoding="utf-8") as handle:
         table = list(csv.DictReader(handle, delimiter="\t"))
     assert len(table) == 120
-    assert list(table[0])[:9] == [
+    assert list(table[0])[:11] == [
         "sample_id", "person_id", "target", "target_inverse_normal", "occasion_count",
         "target_reliability", "measurement_source", "age_at_measurement", "age_at_measurement_squared",
+        "age_at_measurement_x_female", "log_occasion_count",
     ]
     assert outputs.sql_path.read_text(encoding="utf-8").strip() == build_all_of_us_measurement_sql()
     metadata = json.loads(outputs.metadata_path.read_text(encoding="utf-8"))
-    assert metadata["trait"] == "haptoglobin"
+    assert metadata["trait"] == "total_bilirubin"
+    assert metadata["phenotype_fingerprint"] == phenotype_fingerprint(definition)
+    assert metadata["covariate_columns"] == list(measurement_covariate_columns())
     assert metadata["analysis_scale"] == "log(value + 0)"
     assert metadata["treatment"] is None
-    assert metadata["query_parameters"]["loinc_codes"] == ["4542-7"]
+    assert [window["name"] for window in metadata["clinical_windows"]] == ["acute_hepatobiliary", "cirrhosis"]
+    assert metadata["query_parameters"]["loinc_codes"] == ["1975-2"]
     assert metadata["cdr_dataset"] == DATASET
     assert metadata["n_persons"] == 120
     assert 0.0 < metadata["repeatability"] < 1.0
@@ -699,25 +757,43 @@ def test_prepare_measurement_sample_table_requires_workspace_cdr(tmp_path: Path,
     monkeypatch.delenv("WORKSPACE_CDR", raising=False)
     with pytest.raises(ValueError, match="WORKSPACE_CDR"):
         prepare_all_of_us_measurement_sample_table(
-            "haptoglobin", tmp_path / "out.tsv", client=_FakeBigQueryClient([])
+            "total_bilirubin", tmp_path / "out.tsv", client=_FakeBigQueryClient([])
         )
 
 
-def test_expand_one_hot_covariates_handles_sex_at_birth(tmp_path: Path):
+def test_phenotype_fingerprint_changes_with_the_definition_and_the_cdr(monkeypatch):
+    monkeypatch.setenv("WORKSPACE_CDR", DATASET)
+    height = resolve_measurement_definition("height")
+    fingerprint = phenotype_fingerprint(height)
+    assert fingerprint == phenotype_fingerprint(height)
+    assert fingerprint != phenotype_fingerprint(dataclasses.replace(height, minimum_age_years=21.0))
+    assert fingerprint != phenotype_fingerprint(resolve_all_of_us_phenotype("gout"))
+    monkeypatch.setenv("WORKSPACE_CDR", "fc-aou-cdr-prod-ct.C2025Q4R5")
+    assert fingerprint != phenotype_fingerprint(height)
+
+
+def test_expand_one_hot_covariates_handles_a_trait_covariate_list(tmp_path: Path):
     table = tmp_path / "trait.samples.with_pcs.tsv"
     table.write_text(
-        "sample_id\ttarget\tage_at_measurement\tage_at_measurement_squared\tsex_at_birth_concept_id_1"
-        "\tsex_at_birth_concept_id_2\trace_concept_id_3\tethnicity_concept_id_4\n"
-        "a\t1.0\t50\t2504\t1\t0\t1\t1\n"
-        "b\t2.0\t60\t3604\t1\t0\t1\t1\n"
-        "c\t3.0\t40\t1604\t0\t1\t1\t1\n",
+        "sample_id\ttarget\tage_at_measurement\tage_at_measurement_squared\tage_at_measurement_x_female"
+        "\tlog_occasion_count\tsex_at_birth_concept_id_1\tsex_at_birth_concept_id_2\n"
+        "a\t1.0\t50\t2504\t50\t0.7\t1\t0\n"
+        "b\t2.0\t60\t3604\t60\t1.1\t1\t0\n"
+        "c\t3.0\t40\t1604\t0\t0\t0\t1\n",
         encoding="utf-8",
     )
-    expanded = aou_runner._expand_one_hot_covariates(aou_runner.MEASUREMENT_COVARIATES, table)
-    assert expanded == ["age_at_measurement", "age_at_measurement_squared", "sex_at_birth_concept_id_2"]
+    covariates = list(measurement_covariate_columns())
+    expanded = aou_runner._expand_one_hot_covariates(covariates, table)
+    assert expanded == [
+        "age_at_measurement",
+        "age_at_measurement_squared",
+        "age_at_measurement_x_female",
+        "sex_at_birth_concept_id_2",
+        "log_occasion_count",
+    ]
 
 
-def test_run_all_of_us_prepares_a_trait_table_and_uses_measurement_covariates(monkeypatch, tmp_path: Path):
+def test_run_all_of_us_prepares_a_trait_table_and_uses_its_covariates(monkeypatch, tmp_path: Path):
     class _Dataset:
         def __init__(self) -> None:
             self.targets = np.array([0.1, 1.3, 2.2], dtype=np.float32)
@@ -725,8 +801,10 @@ def test_run_all_of_us_prepares_a_trait_table_and_uses_measurement_covariates(mo
             self.variant_records: list = []
             self.variant_stats_minimum_scale: float | None = None
 
+    monkeypatch.setenv("WORKSPACE_CDR", DATASET)
     monkeypatch.setattr(aou_runner, "check_aou_preflight", _successful_preflight)
     monkeypatch.setattr("sv_pgs.genotype.require_gpu", lambda: None)
+    mcv = resolve_measurement_definition("mcv")
     prepared: list[tuple[str, Path]] = []
     loaded_covariates: list[list[str]] = []
     trait_types: list[object] = []
@@ -734,15 +812,24 @@ def test_run_all_of_us_prepares_a_trait_table_and_uses_measurement_covariates(mo
     def fake_prepare_measurement(trait, output_path, **kwargs):
         prepared.append((trait, Path(output_path)))
         Path(output_path).write_text("sample_id\n", encoding="utf-8")
-        Path(str(output_path) + ".metadata.json").write_text("{}", encoding="utf-8")
+        Path(str(output_path) + ".metadata.json").write_text(
+            json.dumps(
+                {
+                    "phenotype_fingerprint": phenotype_fingerprint(mcv),
+                    "covariate_columns": list(measurement_covariate_columns()),
+                }
+            ),
+            encoding="utf-8",
+        )
 
     def fake_merge(sample_table_path, ancestry_path, output_path, n_pcs):
         Path(output_path).write_text(
             "sample_id\tperson_id\ttarget\tage_at_measurement\tage_at_measurement_squared"
-            "\tsex_at_birth_concept_id_1\tsex_at_birth_concept_id_2\trace_concept_id_3\tethnicity_concept_id_4\tPC1\n"
-            "1\t1\t0.1\t50\t2504\t1\t0\t1\t1\t0.1\n"
-            "2\t2\t1.3\t60\t3604\t1\t0\t1\t1\t0.2\n"
-            "3\t3\t2.2\t40\t1604\t0\t1\t1\t1\t0.3\n",
+            "\tage_at_measurement_x_female\tlog_occasion_count\tsex_at_birth_concept_id_1"
+            "\tsex_at_birth_concept_id_2\tPC1\n"
+            "1\t1\t0.1\t50\t2504\t50\t0\t1\t0\t0.1\n"
+            "2\t2\t1.3\t60\t3604\t60\t0.7\t1\t0\t0.2\n"
+            "3\t3\t2.2\t40\t1604\t0\t1.1\t0\t1\t0.3\n",
             encoding="utf-8",
         )
         return output_path, ["PC1"]
@@ -773,17 +860,52 @@ def test_run_all_of_us_prepares_a_trait_table_and_uses_measurement_covariates(mo
         output_base=str(tmp_path / "mcv_results"),
         variants="snp",
     )
+    # A second run reuses the current table instead of preparing it again.
+    aou_runner.run_all_of_us(
+        phenotype="mean_corpuscular_volume",
+        chromosomes=[22],
+        output_base=str(tmp_path / "mcv_results"),
+        variants="snp",
+    )
 
     assert prepared == [
         ("mean_corpuscular_volume", tmp_path / "mcv_results" / "mean_corpuscular_volume.samples.tsv")
     ]
     expected_covariates = [
-        "age_at_measurement", "age_at_measurement_squared", "sex_at_birth_concept_id_2", "PC1",
+        "age_at_measurement", "age_at_measurement_squared", "age_at_measurement_x_female",
+        "sex_at_birth_concept_id_2", "log_occasion_count", "PC1",
     ]
-    assert loaded_covariates == [expected_covariates, expected_covariates]
-    assert trait_types == [aou_runner.TraitType.QUANTITATIVE]
+    assert loaded_covariates[:2] == [expected_covariates, expected_covariates]
+    assert trait_types[0] == aou_runner.TraitType.QUANTITATIVE
     run_metadata = json.loads(aou_runner._aou_run_metadata_path(tmp_path / "mcv_results").read_text())
     assert run_metadata["disease"] == "mean_corpuscular_volume"
+    assert run_metadata["phenotype_fingerprint"] == phenotype_fingerprint(mcv)
+
+
+def test_run_all_of_us_rebuilds_a_table_prepared_from_another_definition(monkeypatch, tmp_path: Path):
+    monkeypatch.setenv("WORKSPACE_CDR", DATASET)
+    monkeypatch.setattr(aou_runner, "check_aou_preflight", _successful_preflight)
+    monkeypatch.setattr("sv_pgs.genotype.require_gpu", lambda: None)
+    work_dir = tmp_path / "mcv_results"
+    work_dir.mkdir()
+    stale_table = work_dir / "mean_corpuscular_volume.samples.tsv"
+    stale_table.write_text("sample_id\n", encoding="utf-8")
+    Path(str(stale_table) + ".metadata.json").write_text(
+        json.dumps({"phenotype_fingerprint": "an earlier definition", "covariate_columns": []}),
+        encoding="utf-8",
+    )
+    prepared: list[str] = []
+
+    def stop_after_prepare(trait, output_path, **kwargs):
+        prepared.append(trait)
+        raise RuntimeError("prepared")
+
+    monkeypatch.setattr(aou_runner, "prepare_all_of_us_measurement_sample_table", stop_after_prepare)
+    with pytest.raises(RuntimeError, match="prepared"):
+        aou_runner.run_all_of_us(
+            phenotype="mean_corpuscular_volume", chromosomes=[22], output_base=str(work_dir), variants="snp"
+        )
+    assert prepared == ["mean_corpuscular_volume"]
 
 
 def _successful_preflight(cache_dir: Path, *, required_stage_bytes: int, required_temp_bytes: int):
@@ -830,19 +952,51 @@ def test_cli_lists_traits_and_prepares_a_trait_table(monkeypatch, tmp_path: Path
 def test_cli_run_all_of_us_forwards_a_trait_as_its_canonical_phenotype(monkeypatch, tmp_path: Path):
     calls: dict[str, object] = {}
     monkeypatch.setattr("sv_pgs.cli.run_all_of_us", lambda **kwargs: calls.update(kwargs))
-    assert main(["run-all-of-us", "--trait", "ggt", "--chromosomes", "22", "--output-dir", str(tmp_path)]) == 0
-    assert calls["phenotype"] == "gamma_glutamyl_transferase"
+    assert main(["run-all-of-us", "--trait", "sbp", "--chromosomes", "22", "--output-dir", str(tmp_path)]) == 0
+    assert calls["phenotype"] == "systolic_blood_pressure"
 
 
 @pytest.mark.parametrize(
     "arguments",
     [
-        ["--trait", "ggt", "--disease", "asthma"],
-        ["--trait", "ggt", "--all-diseases"],
-        ["--trait", "hypertension"],
-        ["--disease", "ggt"],
+        ["--trait", "sbp", "--disease", "gout"],
+        ["--trait", "sbp", "--all-diseases"],
+        ["--trait", "gout"],
+        ["--disease", "sbp"],
     ],
 )
 def test_cli_run_all_of_us_rejects_mixed_or_wrong_kind_phenotypes(tmp_path: Path, arguments):
     with pytest.raises(ValueError):
         main(["run-all-of-us", *arguments, "--output-dir", str(tmp_path)])
+
+
+def test_census_suppresses_cells_of_twenty_or_fewer_participants(monkeypatch, tmp_path: Path):
+    monkeypatch.setenv("GOOGLE_PROJECT", "billing-project")
+    monkeypatch.setenv("WORKSPACE_CDR", DATASET)
+    fake_client = _FakeBigQueryClient([
+        {"trait_name": "height", "vocabulary_id": "LOINC", "concept_code": "8302-2",
+         "matched_on_standard_concept": True, "unit_label": "inch (us)", "participant_count": 246040, "row_count": 900000},
+        {"trait_name": "height", "vocabulary_id": "LOINC", "concept_code": "8302-2",
+         "matched_on_standard_concept": True, "unit_label": "kilogram", "participant_count": 20, "row_count": 25},
+        {"trait_name": "height", "vocabulary_id": "LOINC", "concept_code": "8302-2",
+         "matched_on_standard_concept": True, "unit_label": "meter", "participant_count": 21, "row_count": 30},
+    ])
+    census_path = prepare_all_of_us_measurement_census(tmp_path / "census.tsv", client=fake_client)
+    with census_path.open(encoding="utf-8") as handle:
+        rows = list(csv.DictReader(handle, delimiter="\t"))
+    assert [(row["unit_label"], row["participant_count"], row["row_count"], row["suppressed_below_minimum"]) for row in rows] == [
+        ("inch (us)", "246040", "900000", "False"),
+        ("kilogram", "", "", "True"),
+        ("meter", "21", "30", "False"),
+    ]
+    parameters = {parameter.name: parameter for parameter in fake_client.job_config.query_parameters}
+    assert parameters["census_loinc_traits"].values.count("height") == 2
+    assert parameters["census_physical_measurement_concept_ids"].values == [903133, 903118, 903126]
+
+
+def test_cli_census_all_of_us_traits_writes_the_census(monkeypatch, tmp_path: Path, capsys):
+    monkeypatch.setattr(
+        "sv_pgs.cli.prepare_all_of_us_measurement_census", lambda output_path: Path(output_path)
+    )
+    assert main(["census-all-of-us-traits", "--output", str(tmp_path / "census.tsv")]) == 0
+    assert capsys.readouterr().out.strip() == f"census\t{tmp_path / 'census.tsv'}"
