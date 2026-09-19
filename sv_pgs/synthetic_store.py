@@ -24,8 +24,9 @@ Dosage noise (tx-glimpse-math REPORT §1).
   - a confident error;
   - softened by delta ~ 10**U(-5, -2).
 - The per-path r2 target is the median single-record dosage r2 that bench-sim measured for the
-  record's class and frequency on public data (1kGP haplotypes re-imputed with GLIMPSE2 v2.0.0
-  against a disjoint public panel; results_calibration_2000.json).  The confident-error rate is
+  record's class and frequency on public data (its v7 cohort of 1kGP haplotypes, weighted by 1kGP
+  founder shares, re-imputed with Beagle 5.5 against a disjoint public panel, with read-model calls at
+  simple sites; v7/results_calibration_beagle_5000.json).  The confident-error rate is
   solved per record to hit it.  Read evidence sits at single-path SNVs and at single-path INDELs
   outside tandem repeats (the production pipeline's configuration: read likelihoods only at simple
   sites).  There the reads inform every haplotype, so none is uninformed and the error is all
@@ -110,14 +111,15 @@ SOFT_POSTERIOR_FRACTION = 0.1
 SOFT_DELTA_LOG10_RANGE = (-5.0, -2.0)
 NOISE_CLASSES = ("SNV", "INDEL", "SV_outTR", "SV_TR")
 # Median single-record dosage r2 per noise class over the MAF bins (0, 0.001], (0.001, 0.01],
-# (0.01, 0.05], (0.05, 0.5]: bench-sim's GLIMPSE2 arm on public 1kGP haplotypes, all groups
-# (results_calibration_2000.json; SV_outTR is its SV class, SV_TR its TR class).
+# (0.01, 0.05], (0.05, 0.5]: bench-sim's v7 cohort (1kGP founder-share weights), Beagle 5.5 arm, on
+# public 1kGP haplotypes, all groups (v7/results_calibration_beagle_5000.json; SV_outTR is its SV
+# class, SV_TR its TR class, and SNV and INDEL are its 30x read-model calls at simple sites).
 MAF_BIN_EDGES = (0.001, 0.01, 0.05)
 SINGLE_PATH_R2 = {
-    "SNV": (0.9993807168084469, 0.9995432413348173, 0.9995579609235608, 0.9999271445811645),
-    "INDEL": (0.9964503289666373, 0.9904424356321783, 0.9841285595217206, 0.9935772481102674),
-    "SV_outTR": (0.0016979617415352956, 0.23722189293162207, 0.7358563137729425, 0.8934057700263954),
-    "SV_TR": (0.15209710871018542, 0.38899596478651394, 0.7046636717650798, 0.9180855987022858),
+    "SNV": (0.8329993319973283, 0.9543537402545237, 0.9917454154040785, 0.9979868123448445),
+    "INDEL": (0.726935085825916, 0.9306600470124883, 0.9865243070521974, 0.9967590549910882),
+    "SV_outTR": (0.0022485654501617743, 0.1738066716577618, 0.6865351451998423, 0.868419151645502),
+    "SV_TR": (0.06496154204265829, 0.30317890563719757, 0.6548260520832868, 0.9006202645418034),
 }
 PIPELINE_R2_LOSS = {"A": {"SNV": 0.0, "INDEL": 0.0, "SV": 0.0}, "B": {"SNV": 0.005, "INDEL": 0.02, "SV": 0.03}}
 R2_BETA_CONCENTRATION = 20.0
