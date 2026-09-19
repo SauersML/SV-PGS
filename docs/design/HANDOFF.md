@@ -28,7 +28,7 @@
    - Fold in the fp64/fp32 Cholesky policy and multi-GPU dispatch from e2854ca (tags `archive/2026-09-19/build-stage1` and `archive/2026-09-19/wip-wt-build-store`).
    - Settle the prior family: the learned mixing density vs TPB and BayesR on the reliability, TR-locus and multi-trait scenarios.
 2. **Wire the full path end to end:** store → Stage 0 → Stage 1 → Stage 2 → score. Run it on synthetic data first; the harness is tag `archive/2026-09-19/lane-e2e` (and `lane-e2e-nodamp`).
-3. **Cutover:** under way; the step table and each step's files, tests and verification are in [CUTOVER.md](CUTOVER.md) ("Progress"). The pre-cutover tree is tag `archive/2026-09-19/old-path-final`.
+3. **Cutover: done** (C0–C8, `21cdec3`…`3d63745`). The step-by-step record, and the old tests whose intent the engine's tests carry, are in [CUTOVER.md](CUTOVER.md); the CDR input locations the old runner documented are in [CDR_LAYOUT.md](CDR_LAYOUT.md). The pre-cutover tree is tag `archive/2026-09-19/old-path-final`.
 4. **Data-side inputs from the imputation team (aggregates only):**
    - the r̂ model coefficients: target corr²(stored D, G), triad-corrected, with smooth terms in AF, log N_PATHS_TOTAL, log size and rsq_ds;
    - the E[G|DS] table, which gives the per-stratum κ for D*;
