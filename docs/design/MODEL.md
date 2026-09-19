@@ -67,7 +67,7 @@ Untagged numbers are derivations, definitions or targets.
     - the Pan-UKB SNV release as the SNV side;
     - a disease with no release uses its quantitative proxy's z²;
   - candidates pending measurement: TR mutation-rate features (Ewens θ̂, the σ_d² tagging ceiling) and symmetric functional annotations.
-- **No hand-chosen prior anywhere.** Numerical safeguards (trust region, warm-up, Anderson) are not priors.
+- **No hand-chosen prior anywhere.** Numerical safeguards (the trust regions) are not priors.
 
 ## 4. Inference: EP-EB
 

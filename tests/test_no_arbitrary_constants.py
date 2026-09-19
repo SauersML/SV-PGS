@@ -197,8 +197,6 @@ PENDING: dict[tuple[str, str], tuple[str, frozenset[object], str]] = {
     ('all_of_us.py', 'ACUTE_HEPATOBILIARY'): ('phenotypes', frozenset({30}), 'per-occasion measurement model with learned time-since-event smooths and a contamination component (PHENOTYPES.md)'),
     ('all_of_us.py', 'DISEASE_DEFINITIONS.lab_criteria.plausible_range'): ('phenotypes', frozenset({3.0, 20.0, 0.2, 0.1, 30000.0}), 'kept on the lab-criterion path only (lead ruling): the disease measurement model (PHENOTYPES.md item 1, part 2) replaces it with a learned unit-confusion component'),
     ('all_of_us.py', 'MEASUREMENT_DEFINITIONS.treatment'): ('phenotypes', frozenset({15.0, 0.7}), 'within-person learned treatment effect (PHENOTYPES.md item 3)'),
-    ('anderson.py', '_CONDITION_LIMIT'): ('e2e', frozenset({1000000000000.0}), 'if the engine adopts anderson: regularization eps x ||F||^2 and condition limit 1/eps; otherwise delete the module'),
-    ('anderson.py', 'anderson_step(regularization=)'): ('e2e', frozenset({1e-10}), 'if the engine adopts anderson: regularization eps x ||F||^2 and condition limit 1/eps; otherwise delete the module'),
     ('config.py', 'ModelConfig.minimum_scale'): ('e2e', frozenset({1e-06}), 'Stage 0 inclusion by the information rule and an exact zero-variance test, not a MAF or SD floor'),
     ('config.py', 'ModelConfig.minimum_minor_allele_frequency'): ('e2e', frozenset({0.01}), 'Stage 0 inclusion by the information rule and an exact zero-variance test, not a MAF or SD floor'),
     ('config.py', 'ModelConfig.prior_scale_floor'): ('e2e', frozenset({1e-06}), "B7: the engine's EB replaces the fixed prior-scale clamps"),
