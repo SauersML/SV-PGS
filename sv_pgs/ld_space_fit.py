@@ -94,8 +94,16 @@ from sv_pgs.genotype_statistics import GenotypeSufficientStatistics
 from sv_pgs.mixture_inference import PriorDesign, _gig_moment, _scale_model_penalty
 from sv_pgs.progress import log
 
-# EP damping of the site parameters, as in theory-inference's clipped EP.
+# EP damping of the site parameters. All sites of a block update in parallel
+# from one factorization, and a signal shared by k strongly correlated variants
+# makes the damped update stable only for damping below about 2/k: with AR(0.99)
+# LD (≈10 variants at r > 0.9) a fixed 0.5 left posterior means flipping between
+# neighbours every pass. So each site keeps its own damping, which halves (down
+# to the floor) whenever the site's update reverses direction and otherwise
+# recovers towards the start value; the EP fixed point is unchanged.
 _SITE_DAMPING = 0.5
+_MINIMUM_SITE_DAMPING = 1.0 / 64.0
+_SITE_DAMPING_RECOVERY = 1.2
 # Local (site or mean-field) iterations per block per pass over the LD store.
 # The hyperparameters stay fixed within a pass, so a resident block can be
 # iterated without re-reading it. theory-inference refit the hyperparameters
@@ -412,6 +420,9 @@ class ExpectationPropagationSites:
     site_shift: F64Array
     cavity_precision: F64Array
     cavity_shift: F64Array
+    site_damping: F64Array
+    previous_precision_step: F64Array
+    previous_shift_step: F64Array
 
 
 @dataclass(slots=True)
@@ -921,6 +932,9 @@ class _ExpectationPropagationScheme:
             site_shift=np.zeros_like(prior_variance),
             cavity_precision=np.zeros_like(prior_variance),
             cavity_shift=np.zeros_like(prior_variance),
+            site_damping=np.full_like(prior_variance, _SITE_DAMPING),
+            previous_precision_step=np.zeros_like(prior_variance),
+            previous_shift_step=np.zeros_like(prior_variance),
         )
 
     def reset_range(
@@ -936,21 +950,18 @@ class _ExpectationPropagationScheme:
         sites = _require_sites(state)
         sites.site_precision[variants] = fresh.site_precision
         sites.site_shift[variants] = fresh.site_shift
+        sites.site_damping[variants] = fresh.site_damping
+        sites.previous_precision_step[variants] = fresh.previous_precision_step
+        sites.previous_shift_step[variants] = fresh.previous_shift_step
 
     def load_block(self, backend: _ArrayBackend, state: LocalState, variants: slice) -> tuple[NDArrayLike, ...]:
         sites = _require_sites(state)
-        return (
-            backend.to_device(sites.site_precision[variants]),
-            backend.to_device(sites.site_shift[variants]),
-            backend.to_device(sites.cavity_precision[variants]),
-            backend.to_device(sites.cavity_shift[variants]),
-        )
+        return tuple(backend.to_device(values[variants]) for values in _site_arrays(sites))
 
     def solve_terms(
         self, backend: _ArrayBackend, block_state: tuple[NDArrayLike, ...], block_prior: _BlockPrior
     ) -> tuple[NDArrayLike, NDArrayLike]:
-        site_precision, site_shift, _cavity_precision, _cavity_shift = block_state
-        return site_precision, site_shift
+        return block_state[0], block_state[1]
 
     def update_block(
         self,
@@ -960,7 +971,9 @@ class _ExpectationPropagationScheme:
         posterior_variance: NDArrayLike,
         block_prior: _BlockPrior,
     ) -> tuple[NDArrayLike, ...]:
-        site_precision, site_shift, _cavity_precision, _cavity_shift = block_state
+        site_precision, site_shift, _cavity_precision, _cavity_shift, damping, previous_precision_step, previous_shift_step = (
+            block_state
+        )
         marginal_precision = 1.0 / posterior_variance
         cavity_precision = marginal_precision - site_precision
         if bool(np.any(cavity_precision < -_CAVITY_ROUNDING_TOLERANCE * marginal_precision)):
@@ -977,22 +990,30 @@ class _ExpectationPropagationScheme:
         # stays positive definite, and the mean is matched exactly through ν̃.
         target_precision = np.maximum(1.0 / tilted_variance - cavity_precision, 0.0)
         target_shift = tilted_mean * (cavity_precision + target_precision) - cavity_shift
+        precision_step = target_precision - site_precision
+        shift_step = target_shift - site_shift
+        reversed_step = (precision_step * previous_precision_step < 0.0) | (shift_step * previous_shift_step < 0.0)
+        damping = np.where(
+            reversed_step,
+            np.maximum(0.5 * damping, _MINIMUM_SITE_DAMPING),
+            np.minimum(_SITE_DAMPING_RECOVERY * damping, _SITE_DAMPING),
+        )
         return (
-            (1.0 - _SITE_DAMPING) * site_precision + _SITE_DAMPING * target_precision,
-            (1.0 - _SITE_DAMPING) * site_shift + _SITE_DAMPING * target_shift,
+            site_precision + damping * precision_step,
+            site_shift + damping * shift_step,
             cavity_precision,
             cavity_shift,
+            damping,
+            precision_step,
+            shift_step,
         )
 
     def store_block(
         self, backend: _ArrayBackend, state: LocalState, variants: slice, block_state: tuple[NDArrayLike, ...]
     ) -> None:
         sites = _require_sites(state)
-        site_precision, site_shift, cavity_precision, cavity_shift = block_state
-        sites.site_precision[variants] = backend.to_host(site_precision)
-        sites.site_shift[variants] = backend.to_host(site_shift)
-        sites.cavity_precision[variants] = backend.to_host(cavity_precision)
-        sites.cavity_shift[variants] = backend.to_host(cavity_shift)
+        for values, block_values in zip(_site_arrays(sites), block_state, strict=True):
+            values[variants] = backend.to_host(block_values)
 
     def scale_objective(
         self,
@@ -1254,6 +1275,19 @@ def _local_scheme(name: str) -> _LocalScheme:
 
 
 _DEFAULT_SCHEME = "expectation_propagation"
+
+
+def _site_arrays(sites: ExpectationPropagationSites) -> tuple[F64Array, ...]:
+    """Every per-variant EP array, in the order of a block's local state."""
+    return (
+        sites.site_precision,
+        sites.site_shift,
+        sites.cavity_precision,
+        sites.cavity_shift,
+        sites.site_damping,
+        sites.previous_precision_step,
+        sites.previous_shift_step,
+    )
 
 
 def _require_sites(state: LocalState) -> ExpectationPropagationSites:
@@ -1522,12 +1556,7 @@ def _warm_model_state(statistics: TraitStatistics, warm_start: LDSpaceFit) -> _M
     local = warm_start.local_state
     copied_local: LocalState
     if isinstance(local, ExpectationPropagationSites):
-        copied_local = ExpectationPropagationSites(
-            site_precision=local.site_precision.copy(),
-            site_shift=local.site_shift.copy(),
-            cavity_precision=local.cavity_precision.copy(),
-            cavity_shift=local.cavity_shift.copy(),
-        )
+        copied_local = ExpectationPropagationSites(*(values.copy() for values in _site_arrays(local)))
     else:
         copied_local = MeanFieldMoments(
             expected_local_scale=local.expected_local_scale.copy(),
