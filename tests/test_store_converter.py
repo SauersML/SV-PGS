@@ -5,12 +5,16 @@ import numpy as np
 import pytest
 
 from sv_pgs.dosage_store import (
+    MISSING_CODE,
     CodeArray,
     DosageStore,
     VariantTable,
     dosage_array_directory,
     encode_dosage_milli,
+    open_column,
+    read_manifest,
     sites_md5,
+    statistic_column_directory,
     write_manifest,
     write_variant_columns,
 )
@@ -22,12 +26,15 @@ from sv_pgs.store_converter import (
     assemble_half,
     core_spans,
     decode_batch,
+    decode_called_batch,
     linear_recalibration,
+    no_call_fill,
     refalt_digest,
     sv_context,
     tr_loci,
     unbreakable_group_first,
     value_matched_background,
+    write_store_manifest,
 )
 
 
@@ -242,7 +249,7 @@ def test_decode_and_assemble_write_background_corrected_codes(tmp_path) -> None:
         batches.append(decode_batch(path, expected, groups, 1, tmp_path / f"batch{index}.npy"))
 
     root = tmp_path / "store"
-    sums, squares = assemble_half(root, 0, "chr22", batches, np.zeros(5, dtype=np.int64), None, codec="raw")
+    sums, squares = assemble_half(root, 0, "chr22", [batch.codes for batch in batches], np.zeros(5, dtype=np.int64), None, _fill_of(batches), codec="raw")
 
     dosage_milli = np.rint(np.hstack([np.asarray(dosages) for dosages in _BATCH_DOSAGES]) * 1000).astype(np.uint16)
     corrected = value_matched_background(dosage_milli, expected.kept_paths, expected.carrying_paths).dosage_milli
@@ -295,7 +302,7 @@ def test_assemble_half_applies_the_linear_recalibration(tmp_path) -> None:
     batch = decode_batch(path, expected, np.array([0, 0, 1]), 2, tmp_path / "codes.npy")
     scales = np.array([[0.5, 1.0], [0.5, 1.0], [0.5, 1.0]])
 
-    assemble_half(tmp_path / "store", 0, "chr22", [batch], np.array([0, 0, 1]), scales, codec="raw")
+    assemble_half(tmp_path / "store", 0, "chr22", [batch.codes], np.array([0, 0, 1]), scales, _fill_of([batch]), codec="raw")
 
     dosage_milli = ((batch.codes.astype(np.int64) * 2000 + 127) // 254).astype(np.uint16)
     recalibrated = encode_dosage_milli(linear_recalibration(dosage_milli, np.array([0, 0, 1]), scales).dosage_milli)
@@ -303,3 +310,108 @@ def test_assemble_half_applies_the_linear_recalibration(tmp_path) -> None:
     target = np.empty((3, 3), dtype=np.uint8)
     array.read_rows_into(0, 3, target)
     np.testing.assert_array_equal(target, recalibrated)
+
+
+def _fill_of(batches):
+    return no_call_fill(sum(batch.group_sums for batch in batches), sum(batch.group_counts for batch in batches))
+
+
+def _write_called_batch(path, genotypes) -> None:
+    """Hard calls only (GT), as the long-read panel members' genotypes come; ``genotypes`` [records][samples]."""
+    samples = len(genotypes[0])
+    lines = [
+        "##fileformat=VCFv4.2",
+        '##INFO=<ID=ID,Number=1,Type=String,Description="atomic id">',
+        '##FORMAT=<ID=GT,Number=1,Type=String,Description="genotype">',
+        "##contig=<ID=chr22,length=50818468>",
+        "\t".join(["#CHROM", "POS", "ID", "REF", "ALT", "QUAL", "FILTER", "INFO", "FORMAT"] + [f"lr{index}" for index in range(samples)]),
+    ]
+    for (position, ref, alt, identifier, _, _), row in zip(_SITES, genotypes):
+        lines.append("\t".join(["chr22", str(position), ".", ref, alt, ".", "PASS", f"ID={identifier}", "GT", *row]))
+    path.write_text("\n".join(lines) + "\n")
+
+
+def test_a_long_read_half_joins_the_imputed_halves_on_the_same_sites(tmp_path) -> None:
+    expected = _expected_sites()
+    imputed = []
+    for index, dosages in enumerate(_BATCH_DOSAGES):
+        path = tmp_path / f"batch{index}.vcf"
+        _write_batch(path, dosages)
+        imputed.append(decode_batch(path, expected, np.zeros(len(dosages[0]), dtype=np.int64), 1, tmp_path / f"imputed{index}.npy"))
+    called_path = tmp_path / "long_read.vcf"
+    _write_called_batch(called_path, [["0|1", "1|1"], ["0|0", "1|0"], ["1|1", "0|0"]])
+    long_read = decode_called_batch(called_path, expected, np.zeros(2, dtype=np.int64), 1, tmp_path / "long_read.npy")
+
+    root = tmp_path / "store"
+    fill = _fill_of([*imputed, long_read])
+    imputed_sums, imputed_squares = assemble_half(root, 0, "chr22", [batch.codes for batch in imputed], np.zeros(5, dtype=np.int64), None, fill, codec="raw")
+    long_read_sums, long_read_squares = assemble_half(root, 1, "chr22", [long_read.codes], np.zeros(2, dtype=np.int64), None, fill, codec="zstd")
+    positions = expected.positions
+    ref_lengths = np.array([len(site[1]) for site in _SITES], dtype=np.int32)
+    alt_lengths = np.array([len(site[2]) for site in _SITES], dtype=np.int32)
+    table = VariantTable(
+        chromosome=np.full(3, 22, dtype=np.int8),
+        position=positions,
+        genetic_position_cm=np.zeros(3),
+        ref_length=ref_lengths,
+        alt_length=alt_lengths,
+        variant_class=np.zeros(3, dtype=np.uint8),
+        group_first=np.arange(3, dtype=np.int64),
+        sum_code=(imputed_sums + long_read_sums).astype(np.uint64),
+        sum_code2=(imputed_squares + long_read_squares).astype(np.uint64),
+        annotations={},
+        annotation_legends={},
+        id_bytes=np.frombuffer("".join(expected.identifiers).encode(), dtype=np.uint8),
+        id_offsets=np.concatenate([[0], np.cumsum([len(identifier) for identifier in expected.identifiers])]).astype(np.int64),
+    )
+    write_variant_columns(root, "chr22", table, slice(0, 3))
+    write_store_manifest(
+        root,
+        chromosomes=["chr22"],
+        record_counts=[3],
+        chromosome_sites_md5=[sites_md5(positions, ref_lengths, alt_lengths)],
+        half_sample_counts=[5, 2],
+        half_measurements=["imputed_dosage", "long_read_calls"],
+        gates={"S0": "PASS"},
+        recalibrated=False,
+    )
+
+    store = DosageStore.open(root)
+    codes = store.read_codes(0, 3)
+    assert codes.shape == (3, 7)
+    np.testing.assert_array_equal(codes[:, 5:], [[127, 254], [0, 127], [254, 0]])
+    assert long_read.zeroed.tolist() == [0, 0, 0]
+    assert store.statistic("no_calls").tolist() == [0, 0, 0]
+    assert read_manifest(root)["attributes"]["half_measurements"] == ["imputed_dosage", "long_read_calls"]
+
+
+def test_a_long_read_no_call_takes_its_groups_measured_mean(tmp_path) -> None:
+    expected = _expected_sites()
+    first, second = tmp_path / "first.vcf", tmp_path / "second.vcf"
+    _write_called_batch(first, [["0|1", "./."], ["0|0", "1|1"], ["1|1", "0|0"]])
+    _write_called_batch(second, [["1|1", "./."], ["./.", "0|1"], ["1|1", "0|1"]])
+    batches = [
+        decode_called_batch(path, expected, np.array([0, 1]), 2, tmp_path / f"{path.stem}.npy")
+        for path in (first, second)
+    ]
+    assert batches[0].codes[0].tolist() == [127, MISSING_CODE]
+    assert batches[0].no_calls.tolist() == [1, 0, 0]
+
+    root = tmp_path / "store"
+    assemble_half(root, 0, "chr22", [batch.codes for batch in batches], np.array([0, 1, 0, 1]), None, _fill_of(batches), codec="raw")
+
+    # Record 0: group 1 has no measurement, so both take the pooled mean (1000 + 2000) / 2.
+    # Record 1: sample 2's group 0 measured 0|0 in the other batch, so 0.
+    codes = np.empty((3, 4), dtype=np.uint8)
+    CodeArray(dosage_array_directory(root, 0, "chr22")).read_rows_into(0, 3, codes)
+    np.testing.assert_array_equal(codes, [[127, 191, 254, 191], [0, 254, 0, 127], [254, 0, 254, 127]])
+    assert open_column(statistic_column_directory(root, 0, "chr22", "no_calls"))[0].tolist() == [2, 1, 0]
+
+
+def test_a_record_no_sample_measured_fails(tmp_path) -> None:
+    path = tmp_path / "long_read.vcf"
+    _write_called_batch(path, [["0|1", "1|1"], ["./.", "./."], ["1|1", "0|0"]])
+    batch = decode_called_batch(path, _expected_sites(), np.zeros(2, dtype=np.int64), 1, tmp_path / "codes.npy")
+
+    with pytest.raises(ValueError, match="record 1: no sample has a measurement"):
+        _fill_of([batch])
