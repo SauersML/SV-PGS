@@ -14,7 +14,7 @@ import numpy as np
 import pytest
 
 from sv_pgs import fit_model
-from sv_pgs.artifact import cohort_digest, load_model, predict, sites_digest, store_digest
+from sv_pgs.artifact import cohort_digest, load_model, offset_digest, predict, sites_digest, store_digest
 from sv_pgs.cli import main
 from sv_pgs.compute_budget import ComputeBudget
 from sv_pgs.config import TraitType
@@ -122,7 +122,7 @@ class _Cohort:
     trait_types: tuple[TraitType, ...]
 
     def arguments(self) -> dict[str, Any]:
-        return {field.name: getattr(self, field.name) for field in dataclasses.fields(self)}
+        return {field.name: getattr(self, field.name) for field in dataclasses.fields(self)} | {"log_variance_offset": None}
 
 
 def _cohort(generator: np.random.Generator) -> _Cohort:
@@ -170,6 +170,16 @@ def test_the_driver_gets_the_intercept_the_training_targets_and_the_draw_count(t
     np.testing.assert_array_equal(call["store_columns"], cohort.store_columns)
     assert call["trait_types"] == cohort.trait_types
     assert (call["draw_count"], call["seed"], call["work_dir"]) == (fit_model.DRAW_COUNT, 11, tmp_path)
+    assert call["log_variance_offset"] is None
+
+
+def test_the_driver_gets_the_records_log_reliabilities(tmp_path: Path, store_root: Path, driver: _StubDriver) -> None:
+    offset = np.log(np.random.default_rng(12).uniform(size=_VARIANTS))
+    offset[4] = -np.inf
+    arguments = _cohort(np.random.default_rng(1)).arguments() | {"log_variance_offset": offset}
+    model = fit_model.fit(store=DosageStore.open(store_root), **arguments, budget=_budget(), work_dir=tmp_path, seed=11)
+    np.testing.assert_array_equal(driver.calls[0]["log_variance_offset"], offset)
+    assert model.provenance.offset_digest == offset_digest(offset) != offset_digest(None)
 
 
 def test_the_artifact_carries_the_whole_certificate_and_the_provenance(tmp_path: Path, store_root: Path, driver: _StubDriver) -> None:
@@ -194,6 +204,7 @@ def test_the_artifact_carries_the_whole_certificate_and_the_provenance(tmp_path:
     assert model.provenance.store_digest == store_digest(store_root)
     assert model.provenance.sites_digest == sites_digest(store_root)
     assert model.provenance.cohort_digest == cohort_digest(cohort.research_ids)
+    assert model.provenance.offset_digest == offset_digest(None)
 
 
 def test_the_cohort_digest_covers_only_the_training_rows(tmp_path: Path, store_root: Path, driver: _StubDriver) -> None:
@@ -217,6 +228,9 @@ def test_the_cohort_digest_covers_only_the_training_rows(tmp_path: Path, store_r
         (lambda cohort: {"targets": np.where(np.arange(_COHORT)[:, None] == 0, np.nan, cohort.targets)}, "finite"),
         (lambda cohort: {"targets": np.where(cohort.training & (np.arange(3) == 2), 0.5, cohort.targets)}, "other than 0 and 1"),
         (lambda cohort: {"trait_types": cohort.trait_types[:2]}, "one entry per model"),
+        (lambda cohort: {"log_variance_offset": np.zeros(_VARIANTS - 1)}, "log reliability"),
+        (lambda cohort: {"log_variance_offset": np.full(_VARIANTS, 0.1)}, "log reliability"),
+        (lambda cohort: {"log_variance_offset": np.full(_VARIANTS, np.nan)}, "log reliability"),
     ],
 )
 def test_fit_refuses_a_cohort_that_does_not_line_up(tmp_path: Path, store_root: Path, driver: _StubDriver, change: Any, message: str) -> None:

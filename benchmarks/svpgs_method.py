@@ -131,6 +131,7 @@ def _fit_one(store: DosageStore, covariates: np.ndarray, covariate_names: Sequen
         model_names=("trait",),
         trait_types=(trait_type,),
         research_ids=research_ids,
+        log_variance_offset=None,
         budget=budget,
         work_dir=work_dir,
         seed=fit_model.cohort_seed(store.root, research_ids),

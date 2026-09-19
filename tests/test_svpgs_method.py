@@ -175,7 +175,7 @@ def test_the_bench_real_store_holds_the_calls_in_position_order(driver: _StubDri
     assert [_CLASSES[code] for code in table.variant_class] == [expected[token] for token in train.variants.sv_type[order]]
     assert "train_allele_frequency" not in table.annotations
     assert sorted(table.annotations) == ["allele_length_change", "log1p_sv_length", "log1p_tss_distance", "source", "sv_type"]
-    assert table.annotation_legends["source"] == ("pangenie", "panel")
+    assert table.annotation_legends["source"] == tuple(sorted({"panel", "pangenie"}))
     assert driver.calls[0]["covariates"].shape == (_REAL_SAMPLES, 1)
 
 

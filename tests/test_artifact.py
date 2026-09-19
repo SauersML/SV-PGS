@@ -14,6 +14,7 @@ from sv_pgs.artifact import (
     cohort_digest,
     code_digest,
     load_model,
+    offset_digest,
     predict,
     save_model,
     sites_digest,
@@ -68,7 +69,11 @@ def _model(generator: np.random.Generator, store_root: Path) -> FittedModel:
         fit_counts={"refreshes": 3, "passes": 41},
         refusals=("model 1: no damped EP pass keeps the full-data precision positive definite",),
         provenance=Provenance(
-            code_digest=code_digest(), store_digest=store_digest(store_root), sites_digest=sites_digest(store_root), cohort_digest=cohort_digest(["b", "a"])
+            code_digest=code_digest(),
+            store_digest=store_digest(store_root),
+            sites_digest=sites_digest(store_root),
+            cohort_digest=cohort_digest(["b", "a"]),
+            offset_digest=offset_digest(np.log(generator.uniform(size=_VARIANTS))),
         ),
     )
 

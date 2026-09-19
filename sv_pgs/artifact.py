@@ -49,14 +49,17 @@ class Provenance:
 
     ``code_digest`` is the SHA-256 of the ``sv_pgs`` sources, ``store_digest`` that of the training store's
     ``MANIFEST.json``, ``sites_digest`` that of its chromosomes, record counts and site digests (the layout the
-    scoring models' store rows index; any store scored with the model must have the same one), and
-    ``cohort_digest`` that of the training research IDs. Digests only, no identifiers.
+    scoring models' store rows index; any store scored with the model must have the same one),
+    ``cohort_digest`` that of the training research IDs, and ``offset_digest`` that of the records' log reliabilities
+    the prior was given (``offset_digest(None)`` when it read the store's own ``quality`` column). Digests only, no
+    identifiers.
     """
 
     code_digest: str
     store_digest: str
     sites_digest: str
     cohort_digest: str
+    offset_digest: str
 
 
 def code_digest() -> str:
@@ -91,6 +94,12 @@ def cohort_digest(research_ids: Sequence[str]) -> str:
     if len(set(values)) != len(values):
         raise ValueError("research_ids repeats a participant.")
     return hashlib.sha256("\n".join(values).encode()).hexdigest()
+
+
+def offset_digest(log_variance_offset: np.ndarray | None) -> str:
+    """SHA-256 of the records' little-endian float64 log reliabilities; of no bytes when the store's own were used."""
+    values = b"" if log_variance_offset is None else np.asarray(log_variance_offset, dtype="<f8").tobytes()
+    return hashlib.sha256(values).hexdigest()
 
 
 @dataclass(frozen=True)
@@ -161,6 +170,7 @@ def save_model(path: str | Path, model: FittedModel) -> None:
             "store_digest": model.provenance.store_digest,
             "sites_digest": model.provenance.sites_digest,
             "cohort_digest": model.provenance.cohort_digest,
+            "offset_digest": model.provenance.offset_digest,
         },
         "arrays": sorted(arrays),
     }
@@ -239,6 +249,7 @@ def load_model(path: str | Path) -> FittedModel:
             store_digest=str(provenance["store_digest"]),
             sites_digest=str(provenance["sites_digest"]),
             cohort_digest=str(provenance["cohort_digest"]),
+            offset_digest=str(provenance["offset_digest"]),
         ),
     )
 

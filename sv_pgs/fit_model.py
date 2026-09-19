@@ -18,7 +18,16 @@ from typing import Sequence
 import numpy as np
 
 from sv_pgs._typing import BoolArray, F64Array, I64Array
-from sv_pgs.artifact import FittedModel, Provenance, code_digest, cohort_digest, save_model, sites_digest, store_digest
+from sv_pgs.artifact import (
+    FittedModel,
+    Provenance,
+    code_digest,
+    cohort_digest,
+    offset_digest,
+    save_model,
+    sites_digest,
+    store_digest,
+)
 from sv_pgs.compute_budget import ComputeBudget
 from sv_pgs.config import TraitType
 from sv_pgs.dosage_store import DosageStore
@@ -75,6 +84,7 @@ def fit(
     model_names: Sequence[str],
     trait_types: Sequence[TraitType],
     research_ids: Sequence[str],
+    log_variance_offset: F64Array | None,
     budget: ComputeBudget,
     work_dir: str | Path,
     seed: int,
@@ -83,7 +93,9 @@ def fit(
 
     Cohort row i is the store sample ``store_columns[i]`` with id ``research_ids[i]``; ``covariates`` [n, k] holds the
     named covariates without the intercept, as ``artifact.predict`` takes them; ``targets`` and ``training`` are
-    [n, models], and a model's non-training targets are never read. Stage 0 keeps its LD blocks under ``work_dir``.
+    [n, models], and a model's non-training targets are never read. ``log_variance_offset`` [store records] is each
+    record's log measurement reliability, log r^2 <= 0, the prior's variance offset (-inf: the record carries no
+    signal); None takes r^2 from the store's ``quality`` column. Stage 0 keeps its LD blocks under ``work_dir``.
     """
     columns = np.asarray(store_columns, dtype=np.int64)
     covariate_matrix = np.asarray(covariates, dtype=np.float64)
@@ -102,6 +114,10 @@ def fit(
         raise ValueError("trait_types needs one entry per model.")
     if not np.all(np.isfinite(target_matrix[training_mask])):
         raise ValueError("every training target must be finite.")
+    if log_variance_offset is not None:
+        offset = np.asarray(log_variance_offset, dtype=np.float64)
+        if offset.shape != (store.n_variants,) or np.any(np.isnan(offset)) or np.any(offset > 0.0):
+            raise ValueError("log_variance_offset must be a log reliability <= 0 for every store record.")
     for model, trait_type in enumerate(trait_types):
         if trait_type == TraitType.BINARY and not np.all(np.isin(target_matrix[training_mask[:, model], model], (0.0, 1.0))):
             raise ValueError(f"binary model {model_names[model]!r} has training targets other than 0 and 1.")
@@ -112,6 +128,7 @@ def fit(
         targets=np.where(training_mask, target_matrix, 0.0),
         training=training_mask,
         trait_types=tuple(trait_types),
+        log_variance_offset=None if log_variance_offset is None else np.asarray(log_variance_offset, dtype=np.float64),
         budget=budget,
         work_dir=Path(work_dir),
         seed=seed,
@@ -133,6 +150,7 @@ def fit(
             store_digest=store_digest(store.root),
             sites_digest=sites_digest(store.root),
             cohort_digest=cohort_digest([research_id for research_id, kept in zip(research_ids, trained) if kept]),
+            offset_digest=offset_digest(log_variance_offset),
         ),
     )
 
@@ -146,7 +164,8 @@ def write_model(store_path: str | Path, cohort_path: str | Path, model_path: str
     """``sv-pgs fit``: fit the cohort file's models on the store and save them to the new directory ``model_path``.
 
     The cohort NPZ holds research_ids [n], store_columns [n], covariates [n, k] without the intercept,
-    covariate_names [k], targets [n, m], training [n, m], model_names [m] and trait_types [m]; nothing else.
+    covariate_names [k], targets [n, m], training [n, m], model_names [m] and trait_types [m]; nothing else. Each
+    record's reliability is the store's ``quality`` column.
     """
     target = Path(model_path)
     if target.exists():
@@ -171,6 +190,7 @@ def write_model(store_path: str | Path, cohort_path: str | Path, model_path: str
             model_names=[str(name) for name in arrays["model_names"]],
             trait_types=[TraitType(str(value)) for value in arrays["trait_types"]],
             research_ids=research_ids,
+            log_variance_offset=None,
             budget=budget,
             work_dir=work_dir,
             seed=cohort_seed(store_path, research_ids),
