@@ -292,7 +292,7 @@ The counting model predicts the raw kernels; the gap is in the path around them.
    - on LD extent: ρ_Krylov rises from 0.04 to 0.12–0.28 between LD scores 5 and 9–19, noisily;
    - on the hyperparameter count (16/27/51): no systematic trend at w = 100, and 0.14/0.16/0.40 at w = 200.
 6. **Limits:**
-   - The windows reach a within-window LD score of 19; the chromosome mean is 42–49. High-LD windows are being measured next.
+   - The windows above reach a within-window LD score of 19; the chromosome mean is 42–49. §10.5 measures the strongest-LD regions.
    - A few replicates holding a large effect in strong LD dominate B − A, hence the wide intervals.
    - An EP-EM run at genome-equivalent weights on one window problem could not be done: that window-scale evidence has no maximizer.
 
@@ -317,4 +317,29 @@ What it says:
 - **The cavity precision P_j = 1/Ṽ_j − τ_j is where that bias bites.** At production, P_j/τ_j has median 2.9·10⁻⁴, so a 0.2% variance error becomes a ~50% cavity error. The EP sites of the top ~1% of variants are then computed from cavities 28–58% off (p99), which moves the EP fixed point.
 - **The second-order term** diag(D⁻¹ED⁻¹ED⁻¹) fixes most of it at cap 4096 (p99 2%). It is valid only where γ < 1, and it overshoots into improper cavities where γ ≥ 1 (denser signal).
 - **So Stage 2's certified marginals need cross-block variances for the resolved variants.** Candidates: the exact resolved set, leave-block-out (novel-inference), overlapping blocks, or the certified second-order term. Use the largest cap device memory allows.
+
+### 10.5 The strongest-LD regions (production signal)
+**Setup.**
+- **Windows:** 1,600 contiguous polymorphic variants, one LD block each. They are chosen as the three disjoint windows with the largest within-window LD score in each source:
+  - the chr6 MHC (29.6–33.4 Mb) and the chr17 17q21.31 inversion region (45.4–46.7 Mb), from the public 1kGP high-coverage phased panel (3,202 people);
+  - the chr22 real-haplotype cohort, restricted to where its LD-score annotation is highest (20,000 people).
+- **Replicates:** four effect draws per window.
+- **Pencil:** each source's pooled A and B are scaled to p = 1.7·10⁷ as if the whole genome had that region's LD, a worst case, since these regions are well under 1% of the genome.
+- **Script:** `rho_highld3.py` / `rho_highld2.py`, output `rho_highld_*.json`.
+
+| region | within-window LD score | λ_min [95%] | λ_max [95%] | ρ_Krylov [95%] | cavity-precision error of a 2-block split, median / p99 |
+|---|---|---|---|---|---|
+| MHC | 405, 291, 256 | 1.00 [0.997, 1.00] | 1.83 [1.6, 14] | 0.15 [0.12, 0.59] | 7–11% / 53–75% |
+| chr22 top-LD | 86, 71, 60 | 0.98 [0.50, 1.00] | 2.63 [1.0, 42] | 0.24 [0.01, 0.76] | 0.3–0.9% / 6–52% |
+| 17q21.31 inversion | 234, 94, 87 | −1.52 [−3.9, 0.995] | 1.34 [1.0, 15] | — (indefinite) | 0.05–0.5% / 38–49% |
+
+What it says:
+- **At the MHC and the chr22 top-LD windows,** LD scores 5–20× the chromosome mean still leave no slow direction (λ_min 0.98–1.00). The accelerated rate stays at 0.15–0.24.
+- **At 17q21.31 the total curvature is indefinite for one effect draw of twelve.**
+  - Per-draw λ_min runs from −5.4 (one draw, in the second window) through 0.27–0.64 (the highest-LD window, score 234) to 0.97–1.00 elsewhere.
+  - It is not a numerical artifact: the site Jacobian's condition number is 6·10⁶–1.2·10⁸ and the EP residual 10⁻¹³, so B is accurate to ~10⁻⁸.
+  - In near-perfect LD a large effect cannot be localized among its tags, and at the true prior the EP evidence is then locally non-concave.
+  - At genome scale this is a small-region contribution to the pooled curvature, not a genome-wide slow mode.
+  - It confirms that the outer step must handle negative curvature: Newton-B with a trust region, taking |λ| as the reference's modified Newton does. It doesn't favor a Stage 1, which sees the same local curvature.
+- **Block-variance cavities are off by p99 38–75% in these regions,** worse than on typical chr22 LD (§10.4). The cross-block marginals are needed most where LD is strongest.
 
