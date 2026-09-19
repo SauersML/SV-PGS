@@ -45,6 +45,9 @@ def run(command: list[str]) -> None:
 def header(chrom: str, length: int, samples: list[str], fmt: str) -> bytes:
     lines = ["##fileformat=VCFv4.2", f"##contig=<ID={chrom},length={length}>"]
     if fmt == "GT":
+        # GLIMPSE2 requires AC/AN on the reference panel.
+        lines.append('##INFO=<ID=AC,Number=A,Type=Integer,Description="Allele count in the panel">')
+        lines.append('##INFO=<ID=AN,Number=1,Type=Integer,Description="Allele number in the panel">')
         lines.append('##FORMAT=<ID=GT,Number=1,Type=String,Description="Genotype">')
     else:
         lines.append('##FORMAT=<ID=PL,Number=G,Type=Integer,Description="Phred-scaled genotype likelihoods">')
@@ -119,7 +122,8 @@ def main() -> None:
     n_var = cls.size
     simple_rows = np.flatnonzero(cls <= 1)
     length = int(pos.max()) + 1
-    prefix = [f"{args.chrom}\t{pos[row]}\tv{row}\t{refs[row]}\t{alts[row]}\t.\tPASS\t.\t".encode() for row in range(n_var)]
+    sites = [f"{args.chrom}\t{pos[row]}\tv{row}\t{refs[row]}\t{alts[row]}\t.\tPASS\t" for row in range(n_var)]
+    prefix = [(site + ".\t").encode() for site in sites]
 
     reference = work / "reference.vcf.gz"
     if not reference.exists():
@@ -127,11 +131,13 @@ def main() -> None:
         samples = (root / "panel_samples.txt").read_text().split()
         sink, process = bgzip_writer(reference, args.threads)
         process.stdin.write(header(args.chrom, length, samples, "GT"))
+        allele_number = panel.shape[1]
         for row in range(n_var):
             haplotypes = np.asarray(panel[row])
             body = PHASED[2 * haplotypes[0::2].astype(np.intp) + haplotypes[1::2]].reshape(-1).copy()
             body[-1] = ord("\n")
-            process.stdin.write(prefix[row] + b"GT\t" + body.tobytes())
+            info = f"AC={int(haplotypes.sum())};AN={allele_number}\t".encode()
+            process.stdin.write(sites[row].encode() + info + b"GT\t" + body.tobytes())
         finish(sink, process, reference)
 
     chunks_file = work / "chunks.txt"
