@@ -74,9 +74,11 @@ since ‖G^½S⁻¹r‖² = r'(S⁻¹ − S⁻²)r ≤ max_{λ≥1}(λ − 1)/λ
 
   with the exact Z_L and core.
 - **r_S costs no pass:** r_S = r_b − R_L μ̂_L, from the exact residuals of the solve's own columns.
-- **The inexact terms are bounded:**
-  - the computed Ẑ_L differs from Z_L by S_S⁻¹R_L, so Z_L'r_S moves by at most ‖R_L‖_F‖r_S‖;
-  - core differs from the computed one by Z_L'R_L, whose relative size δ = ‖ĉore⁻¹‖₂‖Xt_L‖_F‖R_L‖_F must be below 1, and then core⁻¹ ⪯ ĉore⁻¹/(1 − δ).
+- **The inexact terms are bounded, to second order in the Z_L residuals R_L** (`split_columns`):
+  - the computed Ẑ_L differs from Z_L by S_S⁻¹R_L, so Z_L'r_S moves by at most ‖R_L‖₂‖r_S‖;
+  - core differs from the computed one by exactly Δ = sym(Ẑ_L'R_L) + R_L'S_S⁻¹R_L. With ĉore = LL', its relative size δ ≤ ‖L⁻¹ sym(Ẑ_L'R_L) L⁻ᵀ‖₂ + ‖R_L‖₂²/λ_min(ĉore) must be below 1, and then core⁻¹ ⪯ ĉore⁻¹/(1 − δ);
+  - block CG keeps each residual orthogonal to the Krylov space Ẑ_L lies in, so the first term of δ is at rounding level;
+  - all norms are spectral. An earlier Frobenius bound, ‖ĉore⁻¹‖‖Xt_L‖_F‖R_L‖_F, exceeded 1 by orders of magnitude with hundreds of resolved sites, and forced an hour of needless tightening at n = 30,000.
 - `DualGaussian.iterate` tightens an open model's columns by its measured shortfall until every bound holds.
 
 **Draws exact for a positive-definite A [proved; checked].**
@@ -159,6 +161,22 @@ Models: 3 quantitative traits and 1 binary trait (logistic curvature weights at 
 | cold, relaxed + deflated | **7** | 11 | 15 |
 | warm refresh, deflated | **1** | 4 | 9 |
 | folds warm from the full-data dual | 3 | 7 | 11 |
+
+**Production n with the production code** (`DualGaussian` on `code_products` tiles through `StreamedDualSource`, A40, n = 30,000 × 483,944 variants, 2 quantitative traits × (full-data + 5 folds) = 12 models, 4 bulk probes per model):
+
+| run | relative bound 0.1 | relative bound 0.01 |
+|---|---|---|
+| cold iterate | 149 s, 6 reads, 3 CG iterations | 180 s, 9 reads, 6 CG iterations |
+| 192 draws (16 per model) | 16 s, 7 reads | 21 s, 9 reads |
+| resolved sites (all 12 models) | 3,618 | 3,618 |
+| certificate / bound | 0.60 | 0.61 |
+
+- **The resolved sites dominate the pass:** 3,678 columns ride each read, of which 12 are the models' means. So the cost of a read scales with the resolved set, about 300 sites per model at this n with these sites.
+- **Warm starts did not pay off here.** After a 10% random move of every site:
+  - starting every column from the previous solution (Z_L matched by variant) cost 9 reads and 5 CG iterations at bound 0.1, against 6 and 3 cold;
+  - starting only Z_L and the probes warm cost 32 reads, because the mean certificate restarted 5 times.
+  - So `iterate` warm-starts only when a model's resolved set is unchanged, the small-move regime near an EP fixed point, and the matched-by-variant start was not landed.
+- **Memory:** the dense C = Xt'Z_L (14 GB for these 12 models) ran the device out of memory. It is now kept only on the maps' LD windows (`WindowCross`).
 
 ## 7. What it replaces
 - **exact_polish's block-Jacobi factors and `exact_curvature` Grams:** not needed.
