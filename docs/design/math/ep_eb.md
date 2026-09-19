@@ -164,14 +164,25 @@ Two cases follow:
 
   λ_i^{new}/λ_i → ρ = [tr(S_i⁺Ã_{R|N}) − tr(S_i⁺(S_o)_{R|N})] / (g̃_Rᵀ S_i⁺ g̃_R),
 
-  and dV/dλ_i ≈ ½ λ_i^{−2} [numerator − g̃_Rᵀ S_i⁺ g̃_R].
-- **The exact test.** λ_i = ∞ is a local optimum of V iff ρ ≥ 1. This is the variance-component score test: the squared score in the penalized subspace does not exceed its information. When it holds, set x_R = 0 exactly rather than creeping.
+  This ratio describes Fellner–Schall's own step, which drops the dependence of log|H| on x̂.
+- **The exact test (corrected by the oracle lane).** Write τ = 1/λ_i. For a non-Gaussian likelihood the one-sided derivative at λ_i = ∞ has a third term that Fellner–Schall and the Gaussian Tipping–Faul form both lack:
+
+  dV/dτ|₀ = ½(q − d + c),
+
+  - q = GᵀE⁻¹G is the squared score in the released directions U;
+  - d = tr(E⁻¹B_{U|K}) is its information, with E = UᵀS_iU;
+  - c = −tr(H_KK⁻¹ Kᵀ D_xB[v] K) is how log|H_KK| moves at first order as x̂ moves with τ, where v = dx̂/dτ at τ = 0.
+
+  λ_i = ∞ is a local optimum iff q − d + c ≤ 0. The full statement and derivation are in the oracle's STAGE1_GATES.md §2; it was checked against Richardson-extrapolated −λ²dV/dλ for four term types.
+  - The q − d part is the variance-component score test (squared score against its information), and it equals ρ ≥ 1 above only when c = 0. That holds when B does not depend on x, i.e. for a Gaussian or locally quadratic model.
+  - Otherwise c can flip the sign: the oracle measured c = −1.75 against q − d = +1.04.
+  - When the test holds, set x_R = 0 exactly rather than creeping.
 - **The evidence at the boundary.** The λ-dependent log-determinants cancel, giving
 
   V(∞) = J_∞(x̂_∞) + ½ log|(S_o)_{N_bN_b}| − ½ log|Ã_{NN}|,
 
   where N_b is the null space inside the penalized block. Compare it with interior stationary points.
-- **The same test applies at the other boundaries:**
+- **The same test applies at the other boundaries** (for hyperprior_pooling the per-trait model is quadratic in θ_t, so c = 0 and the q − d form is exact within that approximation):
   - the λ → 0 end, where FS's numerator is ≤ 0, which the likelihood's indefinite Hessian allows (lit-ep);
   - hyperprior_pooling's ω² → 0 (full pooling): a squared score ≤ information at ω² = 0 means the coordinate is shared exactly. That replaces the 1e-6 per-step shrink floor, and the FS ratio there shrinks ω² geometrically without ever reaching 0.
 
@@ -179,6 +190,7 @@ Two cases follow:
 - **From λ₂ = e^8:** FS grows λ₂ by 1.40, 1.42, 1.62, 1.63, 1.62 per step. The formula gives ρ = 1.61 at the same iterates. The reference's absorbing rule then jumps λ₂ to its e^15 ceiling.
 - **From λ₂ = 1:** the same problem sends λ₂ to the e^−15 floor, with a non-positive numerator.
 - **The fixed point therefore depends on the start.** The evidence profile below decides which end is the optimum.
+- The ρ prediction concerns Fellner–Schall's dynamics. The profile below evaluates V_A directly, with x̂ re-maximized at each λ₂, so it includes the c term and its conclusion stands.
 
 *Measured: the fixed-cavity Laplace evidence V_A(λ₂)* (λ₁ = e^1.38; x̂ re-maximized at each λ₂; two cavity sets):
 
