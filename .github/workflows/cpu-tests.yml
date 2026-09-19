@@ -51,6 +51,7 @@ jobs:
             tests/test_aou_storage.py \
             tests/test_ld_partition.py \
             tests/test_genotype_statistics.py \
+            tests/test_dosage_store.py \
             -v 2>&1 | tee pytest_output.txt
 
       - name: Upload pytest output on failure
