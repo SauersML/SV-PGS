@@ -102,6 +102,11 @@ Untagged numbers are derivations, definitions or targets.
     - Block-Jacobi inverses are variances conditional on the other blocks' effects, which biases the EP fixed point.
     - The replacement is exact elimination of the resolved sites plus a neighbour-window Woodbury, with a deterministic equivalent only for the far field. Every block carries a probe certificate.
     - Measured against the dense inverse, with LD across cuts: max per-variant relative error 0.5–3.5%, below the equivalent's scale ‖K_S⁻¹‖_F/tr K_S⁻¹. Block-Jacobi was off by 16–58% [machinery: dense inverse].
+    - `variance_jvp` gives the variance map's derivative −diag(Σ diag(w) Σ) for the hyperparameter curvature products:
+      - resolved rows are exact (1e-13);
+      - bulk entries have mean relative error 0.2–0.6% (99th percentile 1–4%);
+      - block sums are within 0.7% [machinery: dense derivative].
+      - Distant pairs enter through the block sandwich diag(Σ_bb R_b Σ_bb). Per-variant norms overstated them 3–10×, because LD partners absorb the chance coupling.
   - Posterior draws.
   - This stage carries the real weight: a block-diagonal Stage 1 alone was 2.7× off at p/n = 20 [semi-real: design-credit].
 - **Scoring** (`fast_scoring.py`): every trait × fold model and its posterior draws in one read of the store. It is exact to 1e-13; an H100 does 100k × 17.3M in about 100 s [sim-only: synthetic store; timing].

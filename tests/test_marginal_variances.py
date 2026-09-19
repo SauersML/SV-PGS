@@ -15,9 +15,12 @@ from sv_pgs.marginal_variances import (
     BulkSolve,
     approximation_scale,
     block_trace_certificate,
+    certificate_tolerance,
+    covariance_products,
     far_field_trace,
     marginal_variances,
     marginals_from_quadratics,
+    variance_jvp,
     window_bulk_quadratic,
 )
 
@@ -48,13 +51,16 @@ def _solve(columns: np.ndarray, precision: np.ndarray, resolved: np.ndarray) -> 
     bulk[resolved] = 0.0
     kernel_inverse = np.linalg.inv(np.eye(sample_count) + (columns * bulk) @ columns.T)
     z_resolved = kernel_inverse @ columns[:, resolved]
+    core = np.diag(precision[resolved]) + columns[:, resolved].T @ z_resolved
+    coupling = kernel_inverse - z_resolved @ np.linalg.solve(core, z_resolved.T)
     return BulkSolve(
         site_precision=precision,
         resolved=resolved,
-        resolved_core=np.diag(precision[resolved]) + columns[:, resolved].T @ z_resolved,
+        resolved_core=core,
         resolved_cross=columns.T @ z_resolved,
         bulk_trace=float(np.trace(kernel_inverse)) / sample_count,
         bulk_square_trace=float(np.sum(kernel_inverse**2)) / sample_count,
+        kernel_square_trace=float(np.sum(coupling**2)) / sample_count,
         sample_count=sample_count,
     )
 
@@ -144,3 +150,47 @@ def test_certificate_flags_only_the_wrong_block():
     probes = generator.choice([-1.0, 1.0], size=(variant_count, 256))
     certificate = block_trace_certificate(variances, blocks, probes, covariance @ probes, approximation_scale(solve))
     assert certificate.violated.tolist() == [False, False, False, True, False, False]
+
+
+def _strong_case(seed: int):
+    generator = np.random.default_rng(seed)
+    sample_count, variant_count, heritability = 1500, 600, 0.5
+    columns = _genotypes(generator, sample_count, variant_count, 0.97) / np.sqrt(1.0 - heritability)
+    variance = heritability / variant_count * np.exp(generator.normal(0.0, 1.0, variant_count))
+    variance[generator.choice(variant_count, 4, replace=False)] *= 400.0
+    precision = 1.0 / variance
+    blocks = tuple(np.arange(start, start + 100) for start in range(0, variant_count, 100))
+    return generator, columns, precision, blocks, _solve(columns, precision, _resolved(variance, sample_count))
+
+
+def test_covariance_products_are_exact_given_the_back_products():
+    generator, columns, precision, _blocks, solve = _strong_case(6)
+    bulk = 1.0 / precision
+    bulk[solve.resolved] = 0.0
+    kernel_inverse = np.linalg.inv(np.eye(columns.shape[0]) + (columns * bulk) @ columns.T)
+    probes = generator.choice([-1.0, 1.0], size=(columns.shape[1], 5))
+    back = columns.T @ (kernel_inverse @ (columns @ (bulk[:, None] * probes)))
+    covariance = np.linalg.inv(columns.T @ columns + np.diag(precision))
+    assert np.allclose(covariance_products(solve, probes, back), covariance @ probes, rtol=1e-8, atol=1e-12)
+
+
+def test_variance_jvp_tracks_the_dense_derivative():
+    generator, columns, precision, blocks, solve = _strong_case(7)
+    covariance = np.linalg.inv(columns.T @ columns + np.diag(precision))
+    direction = generator.uniform(0.0, 1.0, size=(columns.shape[1], 3)) * precision[:, None]
+    exact = -np.einsum("jk,kr,jk->jr", covariance, direction, covariance)
+    product = variance_jvp(solve, _grams(columns, blocks), direction)
+    error = np.abs(product.values - exact)
+    assert np.all(error[solve.resolved] <= 1e-8 * np.abs(exact[solve.resolved]))
+    # Sums of squared entries carry at most twice the entries' relative error (d x^2 / x^2 = 2 dx / x),
+    # and the B-products consume block sums.
+    scale = approximation_scale(solve)
+    for block in blocks:
+        assert np.all(np.abs(product.values[block].sum(axis=0) - exact[block].sum(axis=0)) <= 2 * scale * np.abs(exact[block].sum(axis=0)))
+
+
+def test_certificate_tolerance_adds_the_probe_error_in_quadrature():
+    _generator, _columns, _precision, _blocks, solve = _strong_case(8)
+    scale = approximation_scale(solve)
+    assert np.isclose(certificate_tolerance(solve, 2), scale * np.sqrt(2.0))
+    assert certificate_tolerance(solve, 10**9) < scale * (1 + 1e-8)
