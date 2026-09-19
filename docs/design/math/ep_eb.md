@@ -182,6 +182,12 @@ Two cases follow:
   V(∞) = J_∞(x̂_∞) + ½ log|(S_o)_{N_bN_b}| − ½ log|Ã_{NN}|,
 
   where N_b is the null space inside the penalized block. Compare it with interior stationary points.
+- **Caution: the flat null-space integral can diverge.**
+  - This V(∞) integrates the null-space coordinates under a flat prior (the −½ log|Ã_NN| term).
+  - With a D3 penalty the null space {1, t, t²} contains a ray along which log g concentrates on the lower grid end. There the likelihood tends to the null model's, a positive constant, so Ã_NN → 0 and V(∞) → +∞. The prior lane observed 3e302 on a weak 100-variant class.
+  - The D2 null space {1, t} has the same kind of ray, from its tilt.
+  - **Proposed fix, not yet checked numerically:** maximize over the null-space coordinates instead of integrating them, i.e. ML rather than REML for the unpenalized part. Then V(∞) = max_{x_N} [J_∞ + ½ log|(S_o)_{N_b}| − ½ log|Ã over the integrated directions only|], which stays finite along the ray.
+  - The ray's endpoint, all of a class's mass below resolution, is then a legitimate candidate. Its evidence is compared, not excluded.
 - **The same test applies at the other boundaries** (for hyperprior_pooling the per-trait model is quadratic in θ_t, so c = 0 and the q − d form is exact within that approximation):
   - the λ → 0 end, where FS's numerator is ≤ 0, which the likelihood's indefinite Hessian allows (lit-ep);
   - hyperprior_pooling's ω² → 0 (full pooling): a squared score ≤ information at ω² = 0 means the coordinate is shared exactly. That replaces the 1e-6 per-step shrink floor, and the FS ratio there shrinks ω² geometrically without ever reaching 0.
