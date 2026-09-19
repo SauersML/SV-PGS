@@ -175,6 +175,7 @@ REGISTRY: dict[tuple[str, str], tuple[str, frozenset[object], str]] = {
 
 # (module path relative to sv_pgs/, symbol) -> (owner lane, values, what replaces them)
 PENDING: dict[tuple[str, str], tuple[str, frozenset[object], str]] = {
+    ('fit_model.py', 'DRAW_COUNT'): ('e2e', frozenset({64}), 'MODEL.md section 4 fixes K = 64 posterior draws, which also sets every certificate tolerance at 1/(2K): derive K from the Monte Carlo accuracy the scorer needs'),
     ('scale_mixture_ep.py', '_maximize_coefficients'): ('e2e', frozenset({0.25, 0.75}), 'the trust-region gain-ratio thresholds and radius factors are the illustrative defaults of Algorithm 4.1 (any eta in [0, 1/4) converges): set the radius from the accuracy of the model itself (the cubic-term bound) instead'),
     ('scale_mixture_ep.py', '_ascend_evidence'): ('e2e', frozenset({0.25, 0.75}), 'the trust-region gain-ratio thresholds and radius factors are the illustrative defaults of Algorithm 4.1 (any eta in [0, 1/4) converges): set the radius from the accuracy of the model itself (the cubic-term bound) instead'),
     ('all_of_us.py', 'MIN_PRE_LANDMARK_CONDITION_DATES'): ('phenotypes', frozenset({5}), 'latent-class EHR evidence model (PHENOTYPES.md item 1)'),
