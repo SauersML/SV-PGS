@@ -18,6 +18,9 @@ import numpy as np
 from scipy.special import ndtri
 from scipy.stats import norm
 
+from sv_pgs.compute_budget import detect_compute_budget
+from sv_pgs.phenotype_measurement import Occasions, fit_occasion_model
+
 if TYPE_CHECKING:
     from google.cloud import bigquery
 
@@ -73,16 +76,26 @@ class LabCriterion:
     occasion removes the person from the controls. Occasions are the
     measurement's own retained person-days (build_all_of_us_measurement_sql),
     on the linear scale of its canonical unit, treated or not.
+
+    ``plausible_range`` bounds the canonical value of a row the criterion may
+    count. It is a hand-set rule of the disease definitions, kept until their
+    measurement model replaces it with an explicit unit-confusion component
+    (docs/design/PHENOTYPES.md); the quantitative traits have no range, their
+    gross errors being downweighted by the learned noise density.
     """
 
     measurement: str
     qualifies_at_or_above: bool
     threshold: float
     minimum_span_days: int
+    plausible_range: tuple[float, float]
 
     def __post_init__(self) -> None:
         if self.minimum_span_days < 0:
             raise ValueError(f"{self.measurement}: minimum_span_days must be non-negative")
+        low, high = self.plausible_range
+        if not 0.0 < low < high:
+            raise ValueError(f"{self.measurement}: the plausible range must be positive and non-empty")
 
 
 @dataclass(frozen=True, slots=True)
@@ -179,7 +192,7 @@ DISEASE_DEFINITIONS: tuple[DiseaseDefinition, ...] = (
         # diagnostic criterion (Standards of Care in Diabetes, section 2). Only
         # people without a diabetes code or drug reach it, since the HbA1c trait
         # drops everyone else's values.
-        lab_criteria=(LabCriterion("hemoglobin_a1c", True, 6.5, 1),),
+        lab_criteria=(LabCriterion("hemoglobin_a1c", True, 6.5, 1, (3.0, 20.0)),),
     ),
     DiseaseDefinition(
         canonical_name="atrial_fibrillation",
@@ -259,8 +272,9 @@ DISEASE_DEFINITIONS: tuple[DiseaseDefinition, ...] = (
         # KDIGO 2012 (Kidney Int Suppl 3:1): GFR < 60 mL/min/1.73m2 or ACR >= 30
         # mg/g, present for more than 3 months.
         lab_criteria=(
-            LabCriterion("egfr_ckd_epi_2021", False, 60.0, 90),
-            LabCriterion("urine_albumin_creatinine_ratio", True, 30.0, 90),
+            # Serum creatinine in mg/dL for eGFR; the albumin/creatinine ratio in mg/g.
+            LabCriterion("egfr_ckd_epi_2021", False, 60.0, 90, (0.2, 20.0)),
+            LabCriterion("urine_albumin_creatinine_ratio", True, 30.0, 90, (0.1, 30000.0)),
         ),
     ),
     DiseaseDefinition(
@@ -294,22 +308,20 @@ DISEASE_DEFINITIONS: tuple[DiseaseDefinition, ...] = (
 #    standard or source concept is one of the analyte's LOINC concepts or All
 #    of Us physical-measurement (PPI) concepts; convert the row's unit, named
 #    as All of Us names it, to the canonical unit; drop censored results
-#    ("<5"), unrecognized units, physiologically implausible values,
-#    self-reported values, values taken below the trait's minimum age, values
-#    within 30 days of an inpatient or emergency stay, values inside a
-#    pregnancy window and values inside the trait's clinical exclusion windows;
-#    flag values taken on or after the person's first exposure to the trait's
-#    medication class. Rows are then collapsed to one value per person-day
-#    (same-day repeats are one occasion, as for disease codes) on the analysis
-#    scale, and each person is reduced to exact sufficient statistics (occasion
-#    count, mean, variance, mean age, mean squared age), separately for
-#    untreated and treated occasions.
-# 2. Python (build_all_of_us_measurement_targets), per person: combine the two
-#    groups by the trait's TreatmentRule, then the target is the empirical
-#    BLUP of the person's long-run mean under the random-intercept model
-#        y_ij = x_i'gamma + b_i + e_ij,  b_i ~ (0, sigma_b^2), e_ij ~ (0, sigma_e^2),
-#    with x_i = (1, mean age, mean squared age, sex, mean age x female); see
-#    _estimate_person_variance_components and _person_blup.
+#    ("<5"), unrecognized units, nonpositive values, self-reported values,
+#    values taken below the trait's minimum age, values within 30 days of an
+#    inpatient or emergency stay, values inside a pregnancy window and values
+#    inside the trait's clinical exclusion windows; flag values taken on or
+#    after the person's first exposure to the trait's medication class. Rows
+#    are then collapsed to one occasion per person-day (same-day repeats are
+#    one occasion, as for disease codes), averaged on the linear scale.
+# 2. Python (build_all_of_us_measurement_targets), per person: keep the
+#    untreated occasions when there are any, otherwise the treated ones by the
+#    trait's TreatmentRule; then the target is E[T_i | occasions] under the
+#    per-occasion measurement model of phenotype_measurement (a learned
+#    Box-Cox transform, a random person level T_i and a learned continuous
+#    noise density, which downweights gross errors instead of a hand-set
+#    plausible range).
 #
 # The catalogue is the panel's 11 quantitative traits (design-traits
 # mixed_panel_v1). Codes, units and counts were read off the public All of Us Data
@@ -353,6 +365,8 @@ UNBOUNDED_WINDOW_DAYS = -1
 MEASUREMENT_EXCLUSION_REASONS = (
     "censored",
     "unrecognized_unit",
+    # Every catalogued analyte is a positive quantity; zero or less is no reading.
+    "nonpositive",
     "implausible",
     "self_reported",
     "under_minimum_age",
@@ -439,11 +453,6 @@ class MeasurementDefinition:
     loinc_codes: tuple[str, ...]
     canonical_unit: str
     unit_conversions: tuple[UnitConversion, ...]
-    # Inclusive bounds on the measured value in the canonical unit; values
-    # outside are transcription errors or physiologically impossible.
-    plausible_range: tuple[float, float]
-    # Summarize and model log(value + log_offset) instead of the value.
-    log_scale: bool
     # All of Us physical-measurement (PPI) concepts matched on either concept
     # column, e.g. the enrollment protocol's computed blood-pressure mean ...
     physical_measurement_concept_ids: tuple[int, ...] = ()
@@ -453,7 +462,6 @@ class MeasurementDefinition:
     treatment: TreatmentRule | None = None
     clinical_windows: tuple[ClinicalWindow, ...] = ()
     minimum_age_years: float = ADULT_AGE_YEARS
-    log_offset: float = 0.0
     # "identity" models the measured analyte; "ckd_epi_2021" models the
     # race-free CKD-EPI 2021 eGFR computed per measurement from creatinine.
     value_formula: str = "identity"
@@ -466,20 +474,8 @@ class MeasurementDefinition:
             raise ValueError(f"{self.canonical_name}: unit labels must be unique and lower case")
         if UnitConversion(self.canonical_unit, 1.0) not in self.unit_conversions:
             raise ValueError(f"{self.canonical_name}: canonical unit must convert with scale 1, offset 0")
-        low, high = self.plausible_range
-        if not low < high:
-            raise ValueError(f"{self.canonical_name}: empty plausible range")
         if self.value_formula not in MEASUREMENT_VALUE_FORMULAS:
             raise ValueError(f"{self.canonical_name}: unknown value formula {self.value_formula!r}")
-        if self.log_scale and not low + self.log_offset > 0.0:
-            raise ValueError(f"{self.canonical_name}: log scale needs plausible_range[0] + log_offset > 0")
-        if not self.log_scale and self.log_offset != 0.0:
-            raise ValueError(f"{self.canonical_name}: log_offset without log scale")
-        if self.treatment is not None:
-            if self.treatment.correction is TreatmentCorrection.ADD and self.log_scale:
-                raise ValueError(f"{self.canonical_name}: an additive correction needs the linear scale")
-            if self.treatment.correction is TreatmentCorrection.DIVIDE and self.log_offset != 0.0:
-                raise ValueError(f"{self.canonical_name}: a ratio correction cannot pass through log(value + offset)")
 
 
 def _exclude_treated(medication: MedicationClass) -> TreatmentRule:
@@ -596,8 +592,6 @@ MEASUREMENT_DEFINITIONS: tuple[MeasurementDefinition, ...] = (
             ("foot (international)", 30.48),
             ("foot (us)", 30.4800610),
         ),
-        plausible_range=(120.0, 230.0),
-        log_scale=False,
         # Growth is complete by 20, where the CDC growth charts end.
         minimum_age_years=20.0,
     ),
@@ -618,8 +612,6 @@ MEASUREMENT_DEFINITIONS: tuple[MeasurementDefinition, ...] = (
             ("square meter", 1.0),
             ("unit", 1.0),
         ),
-        plausible_range=(12.0, 90.0),
-        log_scale=True,
         treatment=_exclude_treated(WEIGHT_LOWERING),
     ),
     MeasurementDefinition(
@@ -632,8 +624,6 @@ MEASUREMENT_DEFINITIONS: tuple[MeasurementDefinition, ...] = (
         excluded_source_concept_ids=(903109, 903114, 903130),
         canonical_unit="millimeter mercury column",
         unit_conversions=_MILLIMETERS_OF_MERCURY,
-        plausible_range=(60.0, 270.0),
-        log_scale=False,
         treatment=TreatmentRule(ANTIHYPERTENSIVE, TreatmentCorrection.ADD, 15.0, _CUI_TOBIN),
     ),
     MeasurementDefinition(
@@ -655,8 +645,6 @@ MEASUREMENT_DEFINITIONS: tuple[MeasurementDefinition, ...] = (
             ("unit", 1.0),
             ("heartbeat", 1.0),
         ),
-        plausible_range=(25.0, 220.0),
-        log_scale=False,
         treatment=_exclude_treated(HEART_RATE_LOWERING),
     ),
     # --- Blood counts.
@@ -668,8 +656,6 @@ MEASUREMENT_DEFINITIONS: tuple[MeasurementDefinition, ...] = (
         loinc_codes=("787-2", "30428-7"),
         canonical_unit="femtoliter",
         unit_conversions=_units(("femtoliter", 1.0), (NO_UNIT_LABEL, 1.0), ("u/m3", 1.0)),
-        plausible_range=(50.0, 150.0),
-        log_scale=False,
         clinical_windows=_BLOOD_COUNT_WINDOWS,
     ),
     MeasurementDefinition(
@@ -689,8 +675,6 @@ MEASUREMENT_DEFINITIONS: tuple[MeasurementDefinition, ...] = (
             ("billion per microliter", 1.0),
             ("cells per microliter", 1.0),
         ),
-        plausible_range=(10.0, 1500.0),
-        log_scale=True,
         clinical_windows=_BLOOD_COUNT_WINDOWS,
     ),
     MeasurementDefinition(
@@ -710,8 +694,6 @@ MEASUREMENT_DEFINITIONS: tuple[MeasurementDefinition, ...] = (
             ("ul", 1.0),
             ("billion per microliter", 1.0),
         ),
-        plausible_range=(0.5, 100.0),
-        log_scale=True,
         clinical_windows=_BLOOD_COUNT_WINDOWS + (ANTIBACTERIAL_COURSE,),
     ),
     # --- Liver.
@@ -723,8 +705,6 @@ MEASUREMENT_DEFINITIONS: tuple[MeasurementDefinition, ...] = (
         loinc_codes=("1975-2",),
         canonical_unit="milligram per deciliter",
         unit_conversions=_MILLIGRAMS_PER_DECILITER,
-        plausible_range=(0.05, 30.0),
-        log_scale=True,
         clinical_windows=_CHOLESTASIS_WINDOWS,
     ),
     # --- Kidney.
@@ -741,8 +721,6 @@ MEASUREMENT_DEFINITIONS: tuple[MeasurementDefinition, ...] = (
         loinc_codes=("2160-0", "14682-9"),
         canonical_unit="milligram per deciliter",
         unit_conversions=_MILLIGRAMS_PER_DECILITER + _units(("micromole per liter", 1.0)),
-        plausible_range=(0.2, 20.0),
-        log_scale=True,
         value_formula="ckd_epi_2021",
         clinical_windows=(KIDNEY_REPLACEMENT,),
     ),
@@ -756,8 +734,6 @@ MEASUREMENT_DEFINITIONS: tuple[MeasurementDefinition, ...] = (
         loinc_codes=("13457-7", "2089-1", "18262-6", "49132-4", "12773-8"),
         canonical_unit="milligram per deciliter",
         unit_conversions=_MILLIGRAMS_PER_DECILITER + _units(("milligram per deciliter calculated", 1.0)),
-        plausible_range=(10.0, 400.0),
-        log_scale=False,
         treatment=TreatmentRule(LDL_LOWERING, TreatmentCorrection.DIVIDE, 0.7, _PELOSO_2014),
     ),
     # --- Glycemia.
@@ -786,8 +762,6 @@ MEASUREMENT_DEFINITIONS: tuple[MeasurementDefinition, ...] = (
             ),
             ("millimole per mole", 0.09148, 2.152),
         ),
-        plausible_range=(3.0, 20.0),
-        log_scale=False,
         clinical_windows=(DIABETES,),
     ),
 )
@@ -808,8 +782,6 @@ LAB_ANALYTE_DEFINITIONS: tuple[MeasurementDefinition, ...] = (
             ("milligram per millimole", 8.84),
             ("gram per mole", 8.84),
         ),
-        plausible_range=(0.1, 30000.0),
-        log_scale=False,
     ),
 )
 
@@ -1045,17 +1017,23 @@ def fetch_all_of_us_lab_criterion_rows(
     client: bigquery.Client | None = None,
 ) -> dict[str, dict[str, Any]]:
     """Per person (by person_id) with a qualifying occasion: LAB_CRITERION_COLUMNS."""
-    definition = resolve_lab_criterion_measurement(criterion)
     rows = _query_rows(
         _active_bigquery_client(client),
         build_all_of_us_measurement_sql(),
-        _query_config(build_all_of_us_measurement_query_parameters(definition, criterion)),
+        _query_config(build_all_of_us_lab_criterion_query_parameters(criterion)),
     )
-    return {
-        str(row["person_id"]): {column: row[column] for column in LAB_CRITERION_COLUMNS}
-        for row in rows
-        if int(row["qualifying_occasion_count"]) > 0
-    }
+    return lab_criterion_evidence(criterion, person_occasions(rows))
+
+
+def lab_criterion_evidence(criterion: LabCriterion, people: Sequence[PersonOccasions]) -> dict[str, dict[str, Any]]:
+    """LAB_CRITERION_COLUMNS for every person with a retained occasion on the criterion's qualifying side."""
+    evidence: dict[str, dict[str, Any]] = {}
+    for person in people:
+        qualifying = person.values >= criterion.threshold if criterion.qualifies_at_or_above else person.values < criterion.threshold
+        dates = [date for date, qualifies in zip(person.dates, qualifying, strict=True) if qualifies]
+        if dates:
+            evidence[person.person_id] = dict(zip(LAB_CRITERION_COLUMNS, (len(dates), min(dates), max(dates)), strict=True))
+    return evidence
 
 
 def disease_covariate_columns() -> tuple[str, ...]:
@@ -1216,29 +1194,18 @@ CKD_EPI_2021_SEX_COEFFICIENTS: dict[str, tuple[float, float, float]] = {
     "female": (0.7, -0.241, 1.012),
     "male": (0.9, -0.302, 1.0),
 }
-_OCCASION_GROUPS = (
-    ("untreated", "retained_row_count > 0 AND NOT on_treatment"),
-    ("treated", "retained_row_count > 0 AND on_treatment"),
-)
-_OCCASION_STATISTICS = ("occasion_count", "mean", "variance", "mean_age", "mean_age_squared")
-# A retained occasion on the qualifying side of a LabCriterion's threshold (the
-# criterion side is 'none' for a plain trait query), on the linear scale.
-_QUALIFYING_OCCASION = (
-    "retained_row_count > 0 AND CASE @criterion_side"
-    " WHEN 'at_or_above' THEN occasion_linear_value >= @criterion_threshold"
-    " WHEN 'below' THEN occasion_linear_value < @criterion_threshold"
-    " ELSE FALSE END"
-)
 LAB_CRITERION_COLUMNS = ("qualifying_occasion_count", "first_qualifying_date", "last_qualifying_date")
 
 
 def build_all_of_us_measurement_sql() -> str:
     """One parameterized query for every trait; the trait enters only through
-    build_all_of_us_measurement_query_parameters. Returns one row per person
-    with at least one analyte row (see the module comment above
-    MEASUREMENT_DEFINITIONS for the per-row rules), with the person's
-    qualifying occasions for a LabCriterion (LAB_CRITERION_COLUMNS; none when
-    the query has no criterion).
+    build_all_of_us_measurement_query_parameters. Returns one row per
+    person-day with at least one analyte row (see the module comment above
+    MEASUREMENT_DEFINITIONS for the per-row rules): the day's row count and
+    per-reason exclusion counts, and when any row is retained, the occasion's
+    value on the linear scale of the canonical unit (same-day repeats
+    averaged), its age and whether it is on treatment. person_occasions
+    groups the rows by person.
 
     Each CTE downstream of the measurement scan is referenced once, so
     BigQuery scans `measurement` once (it re-executes a non-recursive CTE at
@@ -1251,26 +1218,7 @@ def build_all_of_us_measurement_sql() -> str:
         f"    COUNTIF(COALESCE(exclusion_reason = '{reason}', FALSE)) AS {reason}_row_count"
         for reason in MEASUREMENT_EXCLUSION_REASONS
     )
-    person_exclusion_counts = ",\n".join(
-        f"    SUM({reason}_row_count) AS {reason}_row_count" for reason in MEASUREMENT_EXCLUSION_REASONS
-    )
-    occasion_summary_columns = ",\n".join(
-        f"    COUNTIF({condition}) AS {group}_occasion_count,\n"
-        f"    AVG(IF({condition}, occasion_value, NULL)) AS {group}_mean,\n"
-        f"    VAR_POP(IF({condition}, occasion_value, NULL)) AS {group}_variance,\n"
-        f"    AVG(IF({condition}, age_years, NULL)) AS {group}_mean_age,\n"
-        f"    AVG(IF({condition}, age_years * age_years, NULL)) AS {group}_mean_age_squared"
-        for group, condition in _OCCASION_GROUPS
-    )
-    selected_columns = ",\n".join(
-        [f"  person_summaries.{reason}_row_count" for reason in MEASUREMENT_EXCLUSION_REASONS]
-        + [
-            f"  person_summaries.{group}_{statistic}"
-            for group, _condition in _OCCASION_GROUPS
-            for statistic in _OCCASION_STATISTICS
-        ]
-        + [f"  person_summaries.{column}" for column in LAB_CRITERION_COLUMNS]
-    )
+    selected_counts = ",\n".join(f"  person_days.{reason}_row_count" for reason in MEASUREMENT_EXCLUSION_REASONS)
     egfr_branches = "\n".join(
         f"          WHEN '{sex}' THEN 142 * POW(LEAST(canonical_value / {kappa}, 1), {alpha})"
         f" * POW(GREATEST(canonical_value / {kappa}, 1), -1.2) * POW(0.9938, age_years) * {sex_factor}"
@@ -1445,7 +1393,9 @@ classified_rows AS (
     CASE
       WHEN censored THEN 'censored'
       WHEN NOT unit_recognized THEN 'unrecognized_unit'
-      WHEN canonical_value < @plausible_low OR canonical_value > @plausible_high THEN 'implausible'
+      WHEN canonical_value <= 0 THEN 'nonpositive'
+      WHEN @plausible_low IS NOT NULL
+        AND (canonical_value < @plausible_low OR canonical_value > @plausible_high) THEN 'implausible'
       WHEN self_reported THEN 'self_reported'
       WHEN age_years < @minimum_age_years THEN 'under_minimum_age'
       WHEN exclusion_window = 1 THEN 'acute_care'
@@ -1456,8 +1406,8 @@ classified_rows AS (
   FROM analyte_rows
 ),
 valued_rows AS (
-  -- BigQuery never evaluates an untaken CASE branch, so POW and LN below
-  -- only ever see retained (plausible, positive) values.
+  -- BigQuery never evaluates an untaken CASE branch, so POW below only
+  -- ever sees retained (positive) values.
   SELECT
     *,
     CASE
@@ -1471,8 +1421,8 @@ valued_rows AS (
   FROM classified_rows
 ),
 person_days AS (
-  -- One occasion per person-day: same-day repeats are averaged on the
-  -- analysis scale. age_years and on_treatment are functions of the day.
+  -- One occasion per person-day: same-day repeats are averaged on the linear
+  -- scale. age_years and on_treatment are functions of the day.
   SELECT
     person_id,
     measurement_date,
@@ -1481,65 +1431,41 @@ person_days AS (
     COUNT(*) AS row_count,
 {day_exclusion_counts},
     COUNTIF(exclusion_reason IS NULL) AS retained_row_count,
-    AVG(
-      CASE
-        WHEN exclusion_reason IS NOT NULL THEN NULL
-        WHEN @log_scale THEN LN(linear_value + @log_offset)
-        ELSE linear_value
-      END
-    ) AS occasion_value,
-    AVG(IF(exclusion_reason IS NULL, linear_value, NULL)) AS occasion_linear_value,
+    AVG(IF(exclusion_reason IS NULL, linear_value, NULL)) AS occasion_value,
     ARRAY_AGG(
       DISTINCT IF(exclusion_reason = 'unrecognized_unit', unit_label, NULL) IGNORE NULLS
     ) AS unrecognized_unit_labels
   FROM valued_rows
   GROUP BY person_id, measurement_date, age_years, on_treatment
-),
-person_summaries AS (
-  SELECT
-    person_id,
-    SUM(row_count) AS measurement_row_count,
-{person_exclusion_counts},
-{occasion_summary_columns},
-    COUNTIF({_QUALIFYING_OCCASION}) AS qualifying_occasion_count,
-    MIN(IF({_QUALIFYING_OCCASION}, measurement_date, NULL)) AS first_qualifying_date,
-    MAX(IF({_QUALIFYING_OCCASION}, measurement_date, NULL)) AS last_qualifying_date,
-    ARRAY_CONCAT_AGG(unrecognized_unit_labels) AS unrecognized_unit_labels
-  FROM person_days
-  GROUP BY person_id
 )
 SELECT
-  CAST(person_summaries.person_id AS STRING) AS sample_id,
-  CAST(person_summaries.person_id AS STRING) AS person_id,
-  person_summaries.measurement_row_count,
-{selected_columns},
-  person_summaries.unrecognized_unit_labels,
+  CAST(person_days.person_id AS STRING) AS sample_id,
+  CAST(person_days.person_id AS STRING) AS person_id,
+  person_days.measurement_date,
+  person_days.age_years AS age_at_occasion,
+  person_days.on_treatment AS treated,
+  person_days.row_count,
+{selected_counts},
+  person_days.retained_row_count,
+  person_days.occasion_value,
+  person_days.unrecognized_unit_labels,
   person.sex_at_birth_concept_id,
   LOWER(sex_concept.concept_name) AS sex_at_birth_name
-FROM person_summaries
+FROM person_days
 JOIN `{dataset}.person` AS person
-  ON person.person_id = person_summaries.person_id
+  ON person.person_id = person_days.person_id
 LEFT JOIN `{dataset}.concept` AS sex_concept
   ON sex_concept.concept_id = person.sex_at_birth_concept_id
-ORDER BY person_summaries.person_id
+ORDER BY person_days.person_id, person_days.measurement_date
 """.strip()
 
 
-def build_all_of_us_measurement_query_parameters(
-    definition: MeasurementDefinition,
-    criterion: LabCriterion | None = None,
-) -> dict[str, tuple[str, Any]]:
+def build_all_of_us_measurement_query_parameters(definition: MeasurementDefinition) -> dict[str, tuple[str, Any]]:
     """Query parameter name -> (GoogleSQL type, value); list values are ARRAY<type>."""
-    if criterion is None:
-        criterion_side, criterion_threshold = "none", 0.0
-    else:
-        criterion_side = "at_or_above" if criterion.qualifies_at_or_above else "below"
-        criterion_threshold = float(criterion.threshold)
     treatment_atc_codes = () if definition.treatment is None else definition.treatment.medication.atc_codes
     window_roots = [
         (concept, window) for window in definition.clinical_windows for concept in window.concepts
     ]
-    plausible_low, plausible_high = definition.plausible_range
     return {
         "loinc_codes": ("STRING", list(definition.loinc_codes)),
         "physical_measurement_concept_ids": ("INT64", list(definition.physical_measurement_concept_ids)),
@@ -1547,11 +1473,10 @@ def build_all_of_us_measurement_query_parameters(
         "unit_labels": ("STRING", [conversion.unit_label for conversion in definition.unit_conversions]),
         "unit_scales": ("FLOAT64", [conversion.scale for conversion in definition.unit_conversions]),
         "unit_offsets": ("FLOAT64", [conversion.offset for conversion in definition.unit_conversions]),
-        "plausible_low": ("FLOAT64", plausible_low),
-        "plausible_high": ("FLOAT64", plausible_high),
+        # A trait keeps every positive reading; only a lab criterion bounds them.
+        "plausible_low": ("FLOAT64", None),
+        "plausible_high": ("FLOAT64", None),
         "minimum_age_years": ("FLOAT64", definition.minimum_age_years),
-        "log_scale": ("BOOL", definition.log_scale),
-        "log_offset": ("FLOAT64", definition.log_offset),
         "value_formula": ("STRING", definition.value_formula),
         "treatment_atc_codes": ("STRING", list(treatment_atc_codes)),
         "acute_care_visit_codes": ("STRING", list(ACUTE_CARE_VISIT_CODES)),
@@ -1562,8 +1487,15 @@ def build_all_of_us_measurement_query_parameters(
         "window_concept_codes": ("STRING", [concept.concept_code for concept, _window in window_roots]),
         "window_days_before": ("INT64", [window.days_before for _concept, window in window_roots]),
         "window_days_after": ("INT64", [window.days_after for _concept, window in window_roots]),
-        "criterion_side": ("STRING", criterion_side),
-        "criterion_threshold": ("FLOAT64", criterion_threshold),
+    }
+
+
+def build_all_of_us_lab_criterion_query_parameters(criterion: LabCriterion) -> dict[str, tuple[str, Any]]:
+    """The criterion's analyte query, with its rows bounded by the criterion's plausible range."""
+    low, high = criterion.plausible_range
+    return build_all_of_us_measurement_query_parameters(resolve_lab_criterion_measurement(criterion)) | {
+        "plausible_low": ("FLOAT64", low),
+        "plausible_high": ("FLOAT64", high),
     }
 
 
@@ -1583,104 +1515,176 @@ def fetch_all_of_us_measurement_rows(
     )
 
 
+@dataclass(frozen=True, slots=True)
+class PersonOccasions:
+    """One person's measurement query rows: the retained occasions (linear scale, by date) and the row counts."""
+
+    sample_id: str
+    person_id: str
+    sex_at_birth_concept_id: Any
+    sex_at_birth_name: str | None
+    dates: tuple[datetime.date, ...]
+    ages: np.ndarray
+    values: np.ndarray
+    treated: np.ndarray
+    row_count: int
+    excluded_row_counts: dict[str, int]
+    unrecognized_unit_labels: frozenset[str]
+
+
+def person_occasions(rows: Sequence[dict[str, Any]]) -> list[PersonOccasions]:
+    """Group the measurement query's person-day rows by person, keeping the days with a retained row."""
+    days_by_person: dict[str, list[dict[str, Any]]] = {}
+    for row in rows:
+        days_by_person.setdefault(str(row["person_id"]), []).append(row)
+    people = []
+    for person_id, days in days_by_person.items():
+        retained = sorted((day for day in days if int(day["retained_row_count"]) > 0), key=lambda day: _as_date(day["measurement_date"]))
+        people.append(PersonOccasions(
+            sample_id=str(days[0]["sample_id"]),
+            person_id=person_id,
+            sex_at_birth_concept_id=days[0].get("sex_at_birth_concept_id"),
+            sex_at_birth_name=days[0].get("sex_at_birth_name"),
+            dates=tuple(_as_date(day["measurement_date"]) for day in retained),
+            ages=np.array([float(day["age_at_occasion"]) for day in retained], dtype=np.float64),
+            values=np.array([float(day["occasion_value"]) for day in retained], dtype=np.float64),
+            treated=np.array([bool(day["treated"]) for day in retained], dtype=bool),
+            row_count=sum(int(day["row_count"]) for day in days),
+            excluded_row_counts={
+                reason: sum(int(day[f"{reason}_row_count"]) for day in days) for reason in MEASUREMENT_EXCLUSION_REASONS
+            },
+            unrecognized_unit_labels=frozenset(label for day in days for label in day.get("unrecognized_unit_labels") or ()),
+        ))
+    return people
+
+
 def build_all_of_us_measurement_targets(
     definition: MeasurementDefinition,
-    rows: list[dict[str, Any]],
+    rows: Sequence[dict[str, Any]],
+    working_bytes: int,
 ) -> tuple[list[dict[str, Any]], tuple[str, ...], dict[str, Any]]:
-    """Turn per-person query rows into one training row per person.
+    """Turn the measurement query's person-day rows into one training row per person.
 
     Returns (training rows, one-hot covariate columns, summary for the metadata).
-    A person's occasions are combined by the trait's TreatmentRule: untreated
-    ones when there are any, otherwise treated ones corrected to their
-    untreated equivalent (DIVIDE/ADD) or dropped (EXCLUDE). Persons with no
-    occasion left are dropped. The target is the empirical BLUP of the person's long-run mean
-    (_person_blup, with variance components from
-    _estimate_person_variance_components).
+    A person's occasions are the untreated ones when there are any, otherwise
+    the treated ones corrected to their untreated equivalent (DIVIDE/ADD), or
+    none (EXCLUDE). Persons with no occasion left are dropped. The target is
+    E[T_i | occasions] under phenotype_measurement's per-occasion model, with
+    its reliability.
     """
-    selected_rows: list[dict[str, Any]] = []
-    summaries: list[_OccasionSummary] = []
-    sources: list[str] = []
+    people = person_occasions(rows)
+    kept: list[tuple[PersonOccasions, np.ndarray, np.ndarray, str]] = []
     n_without_retained_occasion = 0
     n_treated_only_excluded = 0
-    for row in rows:
-        untreated = _occasion_summary(row, "untreated")
-        treated = _occasion_summary(row, "treated")
-        if treated is not None and definition.treatment is None:
+    for person in people:
+        if person.treated.any() and definition.treatment is None:
             raise ValueError(
                 f"{definition.canonical_name}: treated occasions returned for a trait without a medication rule"
             )
-        if untreated is None and treated is None:
+        if not person.values.size:
             n_without_retained_occasion += 1
-            continue
-        if untreated is not None:
-            summaries.append(untreated)
-            sources.append("untreated")
+        elif not person.treated.all():
+            untreated = ~person.treated
+            kept.append((person, person.ages[untreated], person.values[untreated], "untreated"))
         elif definition.treatment is None or definition.treatment.correction is TreatmentCorrection.EXCLUDE:
             n_treated_only_excluded += 1
-            continue
         else:
-            summaries.append(_untreated_equivalent(treated, definition))
-            sources.append("treated_corrected")
-        selected_rows.append(row)
-    if not summaries:
+            kept.append((person, person.ages, _untreated_equivalent(person.values, definition.treatment), "treated_corrected"))
+    if not kept:
         raise ValueError(f"{definition.canonical_name}: no person has a retained measurement occasion")
 
-    occasion_counts = np.array([summary.count for summary in summaries], dtype=np.float64)
-    person_means = np.array([summary.mean for summary in summaries], dtype=np.float64)
-    within_sum_squares = occasion_counts * np.array([summary.variance for summary in summaries], dtype=np.float64)
-    mean_ages = np.array([summary.mean_age for summary in summaries], dtype=np.float64)
-    mean_squared_ages = np.array([summary.mean_age_squared for summary in summaries], dtype=np.float64)
-    female = np.array([row.get("sex_at_birth_name") == "female" for row in selected_rows], dtype=np.float64)
-    design = _person_design(
-        mean_ages, mean_squared_ages, female, [row.get("sex_at_birth_concept_id") for row in selected_rows]
+    counts = np.array([values.shape[0] for _person, _ages, values, _source in kept])
+    person_index = np.repeat(np.arange(len(kept)), counts)
+    ages = np.concatenate([occasion_ages for _person, occasion_ages, _values, _source in kept])
+    female = np.repeat([person.sex_at_birth_name == "female" for person, _ages, _values, _source in kept], counts)
+    sex_levels = np.repeat(
+        ["missing" if person.sex_at_birth_concept_id in (None, "") else str(person.sex_at_birth_concept_id) for person, *_rest in kept],
+        counts,
     )
-    between_variance, within_variance = _estimate_person_variance_components(
-        occasion_counts, person_means, within_sum_squares, design
+    fit = fit_occasion_model(
+        Occasions(
+            person_index=person_index,
+            values=np.concatenate([values for _person, _ages, values, _source in kept]),
+            design=_occasion_design(ages, female.astype(np.float64), list(sex_levels)),
+        ),
+        working_bytes,
     )
-    targets, reliabilities = _person_blup(occasion_counts, person_means, design, between_variance, within_variance)
-
-    training_rows = [
-        {
-            "sample_id": row["sample_id"],
-            "person_id": row["person_id"],
-            "target": float(target),
-            "occasion_count": occasion_summary.count,
-            "target_reliability": float(reliability),
+    training_rows = []
+    for position, (person, occasion_ages, _values, source) in enumerate(kept):
+        is_female = person.sex_at_birth_name == "female"
+        mean_age = float(occasion_ages.mean())
+        training_rows.append({
+            "sample_id": person.sample_id,
+            "person_id": person.person_id,
+            "target": float(fit.level_mean[position]),
+            "occasion_count": int(occasion_ages.shape[0]),
+            "target_reliability": float(fit.reliability[position]),
             "measurement_source": source,
-            "age_at_measurement": occasion_summary.mean_age,
-            "age_at_measurement_squared": occasion_summary.mean_age_squared,
-            "age_at_measurement_x_female": occasion_summary.mean_age * is_female,
-            "sex_at_birth_concept_id": row.get("sex_at_birth_concept_id"),
-        }
-        for row, occasion_summary, source, is_female, target, reliability
-        in zip(selected_rows, summaries, sources, female, targets, reliabilities, strict=True)
-    ]
+            "age_at_measurement": mean_age,
+            "age_at_measurement_squared": float(np.mean(np.square(occasion_ages))),
+            "age_at_measurement_x_female": mean_age if is_female else 0.0,
+            "sex_at_birth_concept_id": person.sex_at_birth_concept_id,
+        })
     encoded_categorical_columns = _add_one_hot_omop_categorical_covariates(training_rows, PHENOTYPE_CATEGORICAL_COVARIATES)
     unrecognized_unit_persons: Counter[str] = Counter()
-    for row in rows:
-        unrecognized_unit_persons.update(set(row.get("unrecognized_unit_labels") or ()))
+    for person in people:
+        unrecognized_unit_persons.update(person.unrecognized_unit_labels)
+    noise = fit.noise_second_moment
     summary = {
-        "n_persons_with_analyte_rows": len(rows),
+        "n_persons_with_analyte_rows": len(people),
         "n_persons": len(training_rows),
-        "n_persons_by_source": dict(Counter(sources)),
+        "n_persons_by_source": dict(Counter(source for *_rest, source in kept)),
         "n_persons_without_retained_occasion": n_without_retained_occasion,
         "n_persons_treated_only_excluded": n_treated_only_excluded,
-        "n_measurement_rows": sum(int(row["measurement_row_count"]) for row in rows),
+        "n_measurement_rows": sum(person.row_count for person in people),
         "excluded_row_counts": {
-            reason: sum(int(row[f"{reason}_row_count"]) for row in rows)
-            for reason in MEASUREMENT_EXCLUSION_REASONS
+            reason: sum(person.excluded_row_counts[reason] for person in people) for reason in MEASUREMENT_EXCLUSION_REASONS
         },
         "unrecognized_unit_person_counts": dict(unrecognized_unit_persons.most_common()),
-        "n_occasions": int(occasion_counts.sum()),
-        "occasions_per_person_quartiles": [float(value) for value in np.quantile(occasion_counts, (0.25, 0.5, 0.75))],
-        "between_person_variance": between_variance,
-        "within_person_variance": within_variance,
-        "repeatability": between_variance / (between_variance + within_variance),
-        "mean_target_reliability": float(reliabilities.mean()),
-        "target_mean": float(targets.mean()),
-        "target_sd": float(targets.std()),
+        "n_occasions": int(counts.sum()),
+        "occasions_per_person_quartiles": [float(value) for value in np.quantile(counts, (0.25, 0.5, 0.75))],
+        "box_cox_exponent": fit.exponent,
+        "level_variance": fit.level_variance,
+        "noise_second_moment": noise,
+        "repeatability": fit.level_variance / (fit.level_variance + noise),
+        "log_evidence": fit.log_evidence,
+        "mean_target_reliability": float(fit.reliability.mean()),
+        "target_mean": float(fit.level_mean.mean()),
+        "target_sd": float(fit.level_mean.std()),
     }
     return training_rows, encoded_categorical_columns, summary
+
+
+def _untreated_equivalent(values: np.ndarray, treatment: TreatmentRule) -> np.ndarray:
+    """Each treated occasion's untreated equivalent on the linear scale: value / amount or value + amount."""
+    if treatment.amount is None:
+        raise ValueError(f"{treatment.medication.name}: no treatment correction to apply")
+    if treatment.correction is TreatmentCorrection.ADD:
+        return values + treatment.amount
+    return values / treatment.amount
+
+
+def _occasion_design(ages: np.ndarray, female: np.ndarray, sex_levels: list[str]) -> np.ndarray:
+    """Every occasion's fixed-effect row: intercept, centered age and squared age, one indicator per sex-at-birth
+    level other than the most common one (a missing value is its own level) and centered age x female. Columns
+    that are identically zero (one sex only) are left out."""
+    level_counts = Counter(sex_levels)
+    reference_level = max(level_counts, key=lambda level: (level_counts[level], level))
+    centered_ages = ages - ages.mean()
+    squared_ages = np.square(ages)
+    columns = [
+        np.ones_like(ages),
+        centered_ages,
+        squared_ages - squared_ages.mean(),
+        *(
+            np.array([1.0 if sex_level == level else 0.0 for sex_level in sex_levels])
+            for level in sorted(level_counts)
+            if level != reference_level
+        ),
+        centered_ages * female,
+    ]
+    design = np.column_stack(columns)
+    return design[:, np.any(design != 0.0, axis=0)]
 
 
 def measurement_covariate_columns() -> tuple[str, ...]:
@@ -1711,7 +1715,9 @@ def prepare_all_of_us_measurement_sample_table(
     billing_project = _resolve_billing_project(client)
     sample_table_path = Path(output_path)
     sample_table_path.parent.mkdir(parents=True, exist_ok=True)
-    training_rows, encoded_categorical_columns, summary = build_all_of_us_measurement_targets(definition, rows)
+    training_rows, encoded_categorical_columns, summary = build_all_of_us_measurement_targets(
+        definition, rows, detect_compute_budget().host_bytes
+    )
     LOGGER.info(
         "Prepared All of Us trait %s: n_persons=%d repeatability=%.3f mean_reliability=%.3f",
         definition.canonical_name,
@@ -1749,9 +1755,7 @@ def prepare_all_of_us_measurement_sample_table(
                 "loinc_codes": list(definition.loinc_codes),
                 "physical_measurement_concept_ids": list(definition.physical_measurement_concept_ids),
                 "canonical_unit": definition.canonical_unit,
-                "analysis_scale": (
-                    f"log(value + {definition.log_offset:g})" if definition.log_scale else "linear"
-                ),
+                "analysis_scale": f"Box-Cox exponent {summary['box_cox_exponent']:.6g}, learned",
                 "value_formula": definition.value_formula,
                 "treatment": None if treatment is None else {
                     "medication": treatment.medication.name,
@@ -1781,9 +1785,10 @@ def prepare_all_of_us_measurement_sample_table(
                 "pregnancy_window_days": [PREGNANCY_WINDOW_DAYS_BEFORE, PREGNANCY_WINDOW_DAYS_AFTER],
                 "self_report_type_concept_id": SELF_REPORT_TYPE_CONCEPT_ID,
                 "target_definition": (
-                    "empirical BLUP of the person's long-run mean on the analysis scale (random-intercept "
-                    "model, mean model: intercept, mean age, mean squared age, sex at birth, mean age x "
-                    "female)"
+                    "E[T_i | occasions] and 1 - Var(T_i | occasions) / tau^2 under the per-occasion model "
+                    "z_ij = h(y_ij) = d_ij'gamma + T_i + e_ij (phenotype_measurement): h a learned Box-Cox "
+                    "transform, T_i ~ N(0, tau^2), e_ij a Gaussian scale mixture with a learned continuous "
+                    "mixing density; d_ij: intercept, age, age squared, sex at birth, age x female"
                 ),
                 "billing_project_env": "GOOGLE_PROJECT",
                 "cdr_dataset_env": "WORKSPACE_CDR",
@@ -2271,142 +2276,3 @@ def _descendant_concepts_sql(dataset: str, vocabulary_id: str, codes_parameter: 
     ON concept_ancestor.ancestor_concept_id = concept.concept_id
   WHERE concept.vocabulary_id = '{vocabulary_id}'
     AND concept.concept_code IN UNNEST(@{codes_parameter})"""
-
-
-@dataclass(frozen=True, slots=True)
-class _OccasionSummary:
-    """Sufficient statistics of one person's occasions on the analysis scale."""
-
-    count: int
-    mean: float
-    # Population variance of the occasion values (0 for a single occasion).
-    variance: float
-    mean_age: float
-    mean_age_squared: float
-
-
-def _occasion_summary(row: dict[str, Any], group: str) -> _OccasionSummary | None:
-    count = row.get(f"{group}_occasion_count")
-    if count is None or int(count) == 0:
-        return None
-    return _OccasionSummary(
-        count=int(count),
-        mean=float(row[f"{group}_mean"]),
-        variance=float(row[f"{group}_variance"]),
-        mean_age=float(row[f"{group}_mean_age"]),
-        mean_age_squared=float(row[f"{group}_mean_age_squared"]),
-    )
-
-
-def _untreated_equivalent(summary: _OccasionSummary, definition: MeasurementDefinition) -> _OccasionSummary:
-    """Apply the trait's treatment correction to every treated occasion.
-
-    The correction is affine in the occasion value on the analysis scale, so it
-    maps the sufficient statistics exactly: y + a shifts the mean; y / a scales
-    the mean by 1/a and the variance by 1/a^2 on the linear scale, and shifts
-    the mean by -log(a) on the log scale (log_offset is 0 there).
-    """
-    treatment = definition.treatment
-    if treatment is None or treatment.amount is None:
-        raise ValueError(f"{definition.canonical_name}: no treatment correction to apply")
-    if treatment.correction is TreatmentCorrection.ADD:
-        mean, variance = summary.mean + treatment.amount, summary.variance
-    elif definition.log_scale:
-        mean, variance = summary.mean - math.log(treatment.amount), summary.variance
-    else:
-        mean, variance = summary.mean / treatment.amount, summary.variance / treatment.amount**2
-    return _OccasionSummary(summary.count, mean, variance, summary.mean_age, summary.mean_age_squared)
-
-
-def _person_design(
-    mean_ages: np.ndarray,
-    mean_squared_ages: np.ndarray,
-    female: np.ndarray,
-    sex_concept_ids: list[Any],
-) -> np.ndarray:
-    """Person-level mean model: intercept, centered mean age and mean squared
-    age (exact for a quadratic age trend at the measurement level), one
-    indicator per sex-at-birth level other than the most common one (a missing
-    value is its own level) and centered mean age x female. Columns that are
-    identically zero (one sex only) are left out."""
-    sex_levels = ["missing" if value in (None, "") else str(value) for value in sex_concept_ids]
-    level_counts = Counter(sex_levels)
-    reference_level = max(level_counts, key=lambda level: (level_counts[level], level))
-    centered_ages = mean_ages - mean_ages.mean()
-    columns = [
-        np.ones_like(mean_ages),
-        centered_ages,
-        mean_squared_ages - mean_squared_ages.mean(),
-        *(
-            np.array([1.0 if sex_level == level else 0.0 for sex_level in sex_levels])
-            for level in sorted(level_counts)
-            if level != reference_level
-        ),
-        centered_ages * female,
-    ]
-    design = np.column_stack(columns)
-    return design[:, np.any(design != 0.0, axis=0)]
-
-
-def _estimate_person_variance_components(
-    occasion_counts: np.ndarray,
-    person_means: np.ndarray,
-    within_sum_squares: np.ndarray,
-    design: np.ndarray,
-) -> tuple[float, float]:
-    """Closed-form, exactly unbiased moment estimators of (sigma_b^2, sigma_e^2).
-
-    Model for person i with k_i occasions and person-level covariates x_i:
-    ybar_i = x_i'gamma + b_i + ebar_i, so Var(ybar_i) = sigma_b^2 + sigma_e^2 / k_i.
-    Within persons, E[sum_i SSW_i] = sigma_e^2 (N - m) for N occasions and m
-    persons. Between persons, the OLS residuals r = (I - H) ybar of ybar on X
-    satisfy E[r'r] = tr((I - H) V) = sigma_b^2 (m - p) + sigma_e^2 sum_i (1 - h_ii) / k_i,
-    with h_ii the leverages and p = rank(X). Solving both moment equations gives
-    the estimators below (Henderson's method III for the one-way model).
-    """
-    person_count, parameter_count = design.shape
-    within_degrees_of_freedom = float(occasion_counts.sum()) - person_count
-    if within_degrees_of_freedom <= 0:
-        raise ValueError("within-person variance is not identifiable: no person has a repeated occasion")
-    if np.linalg.matrix_rank(design) < parameter_count or person_count <= parameter_count:
-        raise ValueError("person-level mean model is rank deficient or has no residual degrees of freedom")
-    within_variance = float(within_sum_squares.sum()) / within_degrees_of_freedom
-    orthonormal_basis, _ = np.linalg.qr(design)
-    leverages = np.sum(orthonormal_basis**2, axis=1)
-    residuals = person_means - orthonormal_basis @ (orthonormal_basis.T @ person_means)
-    between_variance = (
-        float(residuals @ residuals) - within_variance * float(np.sum((1.0 - leverages) / occasion_counts))
-    ) / (person_count - parameter_count)
-    if not between_variance > 0.0:
-        raise ValueError(
-            "no between-person variance: the moment estimate of sigma_b^2 is "
-            f"{between_variance:.6g}, so person means carry no signal beyond occasion noise"
-        )
-    return between_variance, within_variance
-
-
-def _person_blup(
-    occasion_counts: np.ndarray,
-    person_means: np.ndarray,
-    design: np.ndarray,
-    between_variance: float,
-    within_variance: float,
-) -> tuple[np.ndarray, np.ndarray]:
-    """BLUP of each person's long-run mean T_i = x_i'gamma + b_i and its reliability.
-
-    With V_i = sigma_b^2 + sigma_e^2 / k_i, gamma is the GLS estimate (weights
-    1/V_i) and the reliability w_i = sigma_b^2 / V_i, the shrinkage of
-    ybar_i - x_i'gamma, equals k_i rho / (1 + (k_i - 1) rho) with the
-    repeatability rho. This is Henderson's mixed-model-equation solution
-    collapsed to per-person means (exact: ybar_i is sufficient for b_i).
-    Regressing the BLUP on genotypes reproduces the numerator of the efficient
-    weighted regression of ybar_i with weights 1/V_i (w_i is proportional to
-    1/V_i), with effects scaled by about the mean reliability.
-    """
-    mean_variances = between_variance + within_variance / occasion_counts
-    root_weights = 1.0 / np.sqrt(mean_variances)
-    fixed_effects, *_ = np.linalg.lstsq(design * root_weights[:, None], person_means * root_weights, rcond=None)
-    fitted_means = design @ fixed_effects
-    reliabilities = between_variance / mean_variances
-    return fitted_means + reliabilities * (person_means - fitted_means), reliabilities
-
