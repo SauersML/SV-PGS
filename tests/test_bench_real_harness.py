@@ -131,3 +131,22 @@ def test_run_end_to_end_on_a_tiny_synthetic_dataset(tmp_path):
         predictions = np.load(out / f"chr1.{feature_set}.predictions.npy")
         assert np.isfinite(predictions).all() and np.isfinite(truth).all()
     assert np.array_equal(np.load(out / "chr1.snv.predictions.npy"), np.load(out / "chr1.snv.predictions_without_sv.npy"))
+
+
+def test_pooled_paired_difference_averages_each_gene_over_the_held_out_groups():
+    from benchmarks.bench_real import report
+
+    generator = np.random.default_rng(4)
+    rows = []
+    for gene in range(12):
+        for group in report.SUPERPOPULATIONS:
+            for method in ("a", "b"):
+                rows.append({"gene_id": f"g{gene}", "chrom": f"chr{gene % 3 + 1}", "design": "loso", "superpopulation": group,
+                             "method": method, "feature_set": "snv", "r2": generator.uniform()})
+    scores = pd.DataFrame(rows)
+    table = pd.DataFrame(report.paired(scores, ("a", "snv"), ("b", "snv")))
+    pooled = table[table["superpopulation"] == report.POOLED].iloc[0]
+    wide = scores.pivot_table(index=["gene_id", "superpopulation"], columns="method", values="r2")
+    expected = (wide["a"] - wide["b"]).groupby(level="gene_id").mean().mean()
+    assert pooled["genes"] == 12 and np.isclose(pooled["difference"], expected, rtol=0, atol=16 * EPSILON)
+    assert set(table["superpopulation"]) == {report.POOLED, *report.SUPERPOPULATIONS}
