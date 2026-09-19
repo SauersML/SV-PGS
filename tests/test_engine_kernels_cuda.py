@@ -191,7 +191,7 @@ def _assert_objective_matches(prior, coefficients, cavity, working_bytes) -> Non
     Welford mean of a non-monotone sequence x is within gamma_(8K + 4K^2) max |x| (each step's error, with the running
     total's, is a few units of a step no larger than 2 max |x|), and its M2 within gamma_(8K + 6) of itself plus four
     times that mean error times max |x|."""
-    host = _data_objective(prior, coefficients, cavity, working_bytes)
+    host = _data_objective(prior, coefficients, cavity, _WORKING_BYTES)
     device = _data_objective(prior, coefficients, cavity, working_bytes, cupy)
     u, t = _UNIT, _TRANSCENDENTAL
     node_count, variant_count = prior.grid_size, prior.variant_count
@@ -291,8 +291,10 @@ def test_cuda_chunking_leaves_every_row_unchanged():
 
 @pytest.mark.parametrize("rows_per_chunk", [None, 7])
 def test_cuda_objective_matches_the_host_to_rounding(rows_per_chunk):
+    """With a whole class per chunk (batches of several rows and zero padding) and with seven rows per chunk (a batch each)."""
     prior, cavity = _problem(variant_count=500, seed=11)
-    working_bytes = _WORKING_BYTES if rows_per_chunk is None else rows_per_chunk * engine_kernels._objective_row_bytes(prior.grid_size, prior.scale_size)
+    per_row = engine_kernels._objective_row_bytes(prior.grid_size, prior.scale_size) + engine_kernels._objective_batch_bytes(prior.grid_size, prior.scale_size)
+    working_bytes = prior.variant_count * per_row if rows_per_chunk is None else rows_per_chunk * per_row
     _assert_objective_matches(prior, _hyperparameters(prior, 12).coefficients, cavity, working_bytes)
 
 

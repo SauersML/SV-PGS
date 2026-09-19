@@ -9,19 +9,21 @@ and reduces over k. On the host that is chunks of (rows x K) float64 arrays; her
 effect and walks its nodes once, so nothing of size rows x K exists except the M-step's Gram operands.
 
 The arithmetic is float64 and follows the host's (``scale_mixture_ep._kernel_terms``) with fewer
-operations, each change bounded to a few units of rounding: v is e^(log u) e^t from precomputed factors
-while all three are normal numbers (else exp(log u + t), as on the host), and r = 1/(1 + q) is the node's
-only division, with v r and q r its products while r is normal (else the host's reciprocal forms, which
-take the limits of an overflowing v or q). A component is pi e^(a/2) sqrt(r), a = h^2 v r, so a node costs a
+operations, each change bounded to a few units of rounding. v is e^(log u) e^t from precomputed factors
+while all three are normal numbers (else exp(log u + t), as on the host); r = 1/(1 + q) is the node terms'
+one division, with v r and q r its products while r is normal (else the host's reciprocal forms, which take
+the limits of an overflowing v or q). A component is pi e^(a/2) sqrt(r), a = h^2 v r, so a node costs a
 sqrt and one exp where the host takes log1p and exp. A negative cavity precision is allowed while every
 1 + v P stays positive; 1 + v P <= 0 anywhere is an error, as on the host.
 
-The reductions are single passes: a running log-sum-exp over the exponents log pi + a/2, whose earlier weights
-are rescaled when the largest moves (one exp per node either way), with weighted Welford updates of the moments. The M-step's density
-block is written through the deviations D = r - pi: its gradient sum_j D_j and Hessian
-diag(sum D) - D'D - (sum D) pi' - pi (sum D)' equal the host's sum r - n pi and
-diag(sum r) - r'r - n (diag pi - pi pi') exactly, without their cancellation. Its Gram products (D'D and
-G'S over a long inner dimension of rows) are split into a batch of rows per multiprocessor, one GEMM each.
+The reductions are single passes: a running log-sum-exp over the exponents log pi + a/2, whose earlier
+weights are rescaled when the largest moves (one exp per node either way), with weighted Welford updates of
+the moments (one more division per node). The M-step's density block is written through the deviations
+D = r - pi: its gradient sum_j D_j and Hessian diag(sum D) - D'D - (sum D) pi' - pi (sum D)' equal the host's
+sum r - n pi and diag(sum r) - r'r - n (diag pi - pi pi') exactly, without their cancellation. D and G are
+written once, each with one extra row (ones under D, mean d1 under G), and their Gram products over the long
+inner dimension of rows (D [D 1]' and G S, which carry sum_j D_j and the scale gradient too) are split into a
+batch of rows per multiprocessor, one GEMM each.
 
 Nothing here imports the engine: callers pass arrays and get arrays.
 """
@@ -113,25 +115,33 @@ extern "C" __global__ void tilted_rows(
     if (bad) *improper = 1;
 }
 
-// The M-step's per-effect terms for rows of one class: deviations D = r - pi and centred derivatives G = r (d1 - mean d1)
-// in batches of ``width`` rows, node-major within a batch ([(batch * K + node) * width + row % width]) so a warp's stores
-// coalesce and each batch is one GEMM operand; and per row log Z, mean d1 and Var_r(d1) + E_r[d2]. The first pass
-// parks each node's exponent in D and d1 in G; the second recomputes sqrt(r) and finishes them.
+// The M-step's per-effect terms for rows of one class, in batches of ``width`` rows laid out node-major within a batch
+// ([(batch * (K + 1) + node) * width + row % width]) so a warp's stores coalesce and each batch is one GEMM operand.
+// Rows 0..K-1 hold D = r - pi and G = r (d1 - mean d1); row K holds a one under D and mean d1 under G, so the Grams
+// D [D 1]' and G S also give sum_j D_j and the scale gradient sum_j (mean d1)_j s_j. Per effect it writes log Z and
+// Var_r(d1) + E_r[d2]; a padding row (rows <= row < padded_rows) is zero throughout. The first pass accumulates and
+// the second recomputes each node's terms and writes them once, so D and G are never read back.
 extern "C" __global__ void objective_rows(
-    const long long rows, const long long width, const int node_count,
+    const long long rows, const long long padded_rows, const long long width, const int node_count,
     const double* __restrict__ class_log_density, const double* __restrict__ class_density,
     const double* __restrict__ nodes, const double* __restrict__ node_exp, const double floor,
     const double tiny, const double huge, const double log_zero,
     const double* __restrict__ log_scale, const double* __restrict__ precision, const double* __restrict__ shift,
     double* __restrict__ deviations, double* __restrict__ centred,
-    double* __restrict__ log_normalizer, double* __restrict__ mean_first, double* __restrict__ curvature,
-    int* __restrict__ improper)
+    double* __restrict__ log_normalizer, double* __restrict__ curvature, int* __restrict__ improper)
 {
     const long long row = (long long)blockDim.x * blockIdx.x + threadIdx.x;
-    if (row >= rows) return;
+    if (row >= padded_rows) return;
+    const long long base = (row / width) * (node_count + 1) * width + row % width;
+    if (row >= rows) {
+        for (int node = 0; node <= node_count; ++node) {
+            deviations[base + node * width] = 0.0;
+            centred[base + node * width] = 0.0;
+        }
+        return;
+    }
     const double scale_value = log_scale[row], scale_exp = exp(scale_value), cavity_precision = precision[row];
     const double shift_square = shift[row] * shift[row];
-    const long long base = (row / width) * node_count * width + row % width;
     int bad = 0;
     double retained, ratio_retained, conditional, signal;
     double peak = log_zero, total = 0.0, first_mean = 0.0, first_square = 0.0, second_mean = 0.0;
@@ -145,9 +155,6 @@ extern "C" __global__ void objective_rows(
             first = 0.5 * (retained * signal - ratio_retained);
             second = 0.5 * signal * retained * (2.0 * retained - 1.0) - 0.5 * ratio_retained * retained;
         }
-        const long long at = base + node * width;
-        deviations[at] = exponent;
-        centred[at] = first;
         if (exponent == log_zero || root == 0.0) continue;
         const double weight = running_weight(exponent, &peak, &total, &first_square) * root;
         const double updated = total + weight;
@@ -159,21 +166,25 @@ extern "C" __global__ void objective_rows(
         second_mean += (second - second_mean) * share;
         total = updated;
     }
-    const double log_total = peak + log(total);
+    // Every node that entered the sum has exponent <= peak, so its weight e^(exponent - peak) sqrt(r) is at most one.
+    const double inverse_total = 1.0 / total;
     for (int node = 0; node < node_count; ++node) {
-        const long long at = base + node * width;
-        double root = 1.0;
+        double exponent = class_log_density[node], root = 1.0, first = 0.0;
         if (nodes[node] >= floor) {
             node_terms(scale_value, scale_exp, nodes[node], node_exp[node], cavity_precision, shift_square, tiny, huge,
                        &retained, &ratio_retained, &conditional, &signal, &bad);
+            exponent += 0.5 * signal;
             root = sqrt(retained);
+            first = 0.5 * (retained * signal - ratio_retained);
         }
-        const double responsibility = root > 0.0 ? exp(deviations[at] - log_total) * root : 0.0;
+        const double responsibility = exponent == log_zero || root == 0.0 ? 0.0 : exp(exponent - peak) * root * inverse_total;
+        const long long at = base + node * width;
         deviations[at] = responsibility - class_density[node];
-        centred[at] = responsibility * (centred[at] - first_mean);
+        centred[at] = responsibility * (first - first_mean);
     }
-    log_normalizer[row] = log_total;
-    mean_first[row] = first_mean;
+    deviations[base + node_count * width] = 1.0;
+    centred[base + node_count * width] = first_mean;
+    log_normalizer[row] = peak + log(total);
     curvature[row] = first_square / total + second_mean;
     if (bad) *improper = 1;
 }
@@ -277,10 +288,24 @@ def tilted_moments(
 
 
 def _objective_row_bytes(node_count: int, scale_size: int) -> int:
-    """Device bytes one row of an objective chunk holds at once: its D and G columns, its design row and the
-    curvature-scaled copy of it, copies of its three inputs, its three outputs and the |log Z| of the magnitude.
-    A chunk's rows fill its batches, so no padding row exceeds the budget."""
-    return np.dtype(np.float64).itemsize * (2 * node_count + 2 * scale_size + 7)
+    """Device bytes one row of an objective chunk holds at once: its D and G columns (K + 1 each), its design row and
+    the curvature-scaled copy of it, copies of its three inputs, its two outputs and the |log Z| of the magnitude."""
+    return np.dtype(np.float64).itemsize * (2 * (node_count + 1) + 2 * scale_size + 6)
+
+
+def _objective_batch_bytes(node_count: int, scale_size: int) -> int:
+    """Device bytes one batch of a chunk adds: its (K + 1) x (K + 1) Gram and (K + 1) x L cross product."""
+    return np.dtype(np.float64).itemsize * (node_count + 1) * (node_count + 1 + scale_size)
+
+
+def _objective_chunk_rows(working_bytes: int, node_count: int, scale_size: int, multiprocessors: int) -> int:
+    """The most rows whose chunk fits ``working_bytes``, as whole batches (one per multiprocessor, or one per row when
+    the budget holds fewer rows than multiprocessors); at least one."""
+    row_bytes, batch_bytes = _objective_row_bytes(node_count, scale_size), _objective_batch_bytes(node_count, scale_size)
+    if working_bytes < multiprocessors * (row_bytes + batch_bytes):
+        return max(1, int(working_bytes) // (row_bytes + batch_bytes))
+    capacity = (int(working_bytes) - multiprocessors * batch_bytes) // row_bytes
+    return multiprocessors * (capacity // multiprocessors)
 
 
 def objective_statistics(
@@ -305,11 +330,8 @@ def objective_statistics(
     dimension = class_count * node_count + scale_size
     gradient = np.zeros(dimension)
     hessian = np.zeros((dimension, dimension))
-    # A full chunk is whole batches: one per multiprocessor, as wide as the budget allows. A class's last, shorter
-    # chunk spreads over as many of them, padded to at most the full chunk.
     multiprocessors = int(cupy.cuda.Device().attributes["MultiProcessorCount"])
-    capacity = max(1, int(working_bytes) // _objective_row_bytes(node_count, scale_size))
-    chunk = min(multiprocessors, capacity) * (capacity // min(multiprocessors, capacity))
+    chunk = _objective_chunk_rows(working_bytes, node_count, scale_size, multiprocessors)
     nodes = _column(cupy, grid, cupy.float64)
     node_exp = cupy.exp(nodes)
     scale_gradient = cupy.zeros(scale_size, dtype=cupy.float64)
@@ -329,28 +351,30 @@ def objective_statistics(
             count = int(rows.shape[0])
             batches = min(multiprocessors, count)
             width = -(-count // batches)
-            deviations = cupy.zeros((batches, node_count, width), dtype=cupy.float64)
-            centred = cupy.zeros((batches, node_count, width), dtype=cupy.float64)
+            padded_rows = batches * width
+            deviations = cupy.empty((batches, node_count + 1, width), dtype=cupy.float64)
+            centred = cupy.empty((batches, node_count + 1, width), dtype=cupy.float64)
             log_normalizer = cupy.empty(count, dtype=cupy.float64)
-            mean_first = cupy.empty(count, dtype=cupy.float64)
             curvature = cupy.empty(count, dtype=cupy.float64)
-            _launch(cupy, "objective_rows", count, (
-                np.int64(count), np.int64(width), np.int32(node_count), class_log_density, class_density, nodes, node_exp, np.float64(floor),
-                *_range_arguments(),
+            _launch(cupy, "objective_rows", padded_rows, (
+                np.int64(count), np.int64(padded_rows), np.int64(width), np.int32(node_count), class_log_density, class_density,
+                nodes, node_exp, np.float64(floor), *_range_arguments(),
                 _column(cupy, log_scale_rows[rows], cupy.float64),
                 _column(cupy, precision[rows], cupy.float64),
                 _column(cupy, shift[rows], cupy.float64),
-                deviations, centred, log_normalizer, mean_first, curvature, improper,
+                deviations, centred, log_normalizer, curvature, improper,
             ))
-            padded = cupy.zeros((batches * width, scale_size), dtype=cupy.float64)
+            padded = cupy.zeros((padded_rows, scale_size), dtype=cupy.float64)
             padded[:count] = cupy.asarray(scale_design[rows], dtype=cupy.float64)
             design = padded[:count]
             value += log_normalizer.sum()
             magnitude += cupy.abs(log_normalizer).sum()
-            deviation_sum += deviations.sum(axis=(0, 2))
-            deviation_outer += cupy.matmul(deviations, deviations.transpose(0, 2, 1)).sum(axis=0)
-            cross += cupy.matmul(centred, padded.reshape(batches, width, scale_size)).sum(axis=0)
-            scale_gradient += design.T @ mean_first
+            gram = cupy.matmul(deviations, deviations.transpose(0, 2, 1)).sum(axis=0)
+            deviation_outer += gram[:node_count, :node_count]
+            deviation_sum += gram[:node_count, node_count]
+            products = cupy.matmul(centred, padded.reshape(batches, width, scale_size)).sum(axis=0)
+            cross += products[:node_count]
+            scale_gradient += products[node_count]
             scale_hessian += design.T @ (curvature[:, None] * design)
         span = slice(class_position * node_count, (class_position + 1) * node_count)
         summed = cupy.asnumpy(deviation_sum)
