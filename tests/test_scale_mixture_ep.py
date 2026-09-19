@@ -50,6 +50,8 @@ from sv_pgs.scale_mixture_ep import (
 )
 
 _WORKING_BYTES = 1 << 20
+# The evidence resolution a fit certifies for a scorer with 64 posterior draws, 1/(2K) nats.
+_EVIDENCE_TOLERANCE = 1.0 / 128.0
 
 
 def _second_difference(size: int) -> np.ndarray:
@@ -322,7 +324,7 @@ def test_evidence_gradient_in_the_log_weights_matches_finite_differences():
 @pytest.mark.xfail(run=False, reason=_LAPLACE_NEAR_BOUNDARY)
 def test_hyper_step_reaches_a_maximum_of_the_evidence():
     prior, cavity = _problem(variant_count=150, seed=19)
-    step = hyper_step(prior, initial_hyperparameters(prior), cavity, _WORKING_BYTES, 1e-6)
+    step = hyper_step(prior, initial_hyperparameters(prior), cavity, _WORKING_BYTES, _EVIDENCE_TOLERANCE)
     fitted = step.hyperparameters
     infinite = frozenset(int(position) for position in np.flatnonzero(fitted.log_smoothing == np.inf))
     zero = frozenset(int(position) for position in np.flatnonzero(fitted.log_smoothing == -np.inf))
@@ -342,9 +344,9 @@ def test_hyper_step_reaches_a_maximum_of_the_evidence():
 @pytest.mark.xfail(run=False, reason=_LAPLACE_NEAR_BOUNDARY)
 def test_the_fit_does_not_depend_on_the_lattice_spacing():
     prior, cavity = _problem(variant_count=150, seed=19)
-    coarse = hyper_step(prior, initial_hyperparameters(prior), cavity, _WORKING_BYTES, 1e-6)
+    coarse = hyper_step(prior, initial_hyperparameters(prior), cavity, _WORKING_BYTES, _EVIDENCE_TOLERANCE)
     finer, start = halved_lattice(prior, coarse.hyperparameters)
-    fine = hyper_step(finer, start, cavity, _WORKING_BYTES, 1e-6)
+    fine = hyper_step(finer, start, cavity, _WORKING_BYTES, _EVIDENCE_TOLERANCE)
     np.testing.assert_allclose(fine.evidence, coarse.evidence, atol=1e-3)
     coarse_moments = tilted_moments(prior, coarse.hyperparameters, cavity, _WORKING_BYTES)
     fine_moments = tilted_moments(finer, fine.hyperparameters, cavity, _WORKING_BYTES)
@@ -512,7 +514,7 @@ def test_the_global_log_normal_start_reaches_the_null_models_maximum():
 
 def test_the_hyper_steps_evidence_is_at_least_the_exact_infinity_edges():
     prior, cavity = _log_normal_problem(33)
-    step = hyper_step(prior, initial_hyperparameters(prior), cavity, _WORKING_BYTES, 1e-6)
+    step = hyper_step(prior, initial_hyperparameters(prior), cavity, _WORKING_BYTES, _EVIDENCE_TOLERANCE)
     view, allowed = _restricted_prior(prior, frozenset({0}), frozenset())
     start = _log_normal_start(prior, initial_hyperparameters(prior).coefficients, cavity, _WORKING_BYTES)
     edge = _evidence(view, np.zeros(0), allowed.T @ start, cavity, _WORKING_BYTES, 0.0)

@@ -982,7 +982,8 @@ def _laplace_corrections(
                 _data_value(prior, point, cavity, working_bytes) - _penalty_value(prior, log_smoothing, point)[0] - value
             ))
 
-        integral = quad(integrand, -np.inf, np.inf, epsabs=0.0, epsrel=tolerance, limit=200)[0]
+        # QUADPACK's relative accuracy floor is 50 eps.
+        integral = quad(integrand, -np.inf, np.inf, epsabs=0.0, epsrel=max(tolerance, 50.0 * _EPSILON), limit=200)[0]
         corrections[index] = float(np.log(integral) - 0.5 * np.log(2.0 * np.pi))
     return corrections, terms
 

@@ -234,3 +234,15 @@ def test_an_iteration_reads_the_blocks_once_plus_once_per_conjugate_gradient_ite
         )
         assert gaussian.conjugate_gradient_iterations >= 1
         assert gaussian.reads.count - before == 1 + gaussian.conjugate_gradient_iterations
+
+
+def test_draws_refuse_negative_site_precisions():
+    genotypes, covariates, quantitative, binary, masks = _simulate(sample_count=120, variant_count=12, seed=22)
+    models = [GaussianModel(TraitType.QUANTITATIVE, quantitative, 1, np.zeros(120))]
+    source = DenseGenotypeBlockSource(genotypes, _blocks(12, 6))
+    precision = np.full((12, 1), 2.0)
+    precision[3, 0] = -0.5
+    gaussian = FullDataGaussian(source=source, models=models, covariates=covariates, sample_masks=masks, initial_mean=np.zeros((12, 1)), seed=23)
+    gaussian.iterate(site_precision=precision, site_shift=np.zeros((12, 1)), noise_variance=np.ones(1), tolerance=1e-12, refactor=True, exact_curvature=_exact(gaussian))
+    with pytest.raises(ValueError, match="non-negative site precisions"):
+        gaussian.draws(site_precision=precision, draw_count=4, tolerance=1e-10)
