@@ -1,6 +1,6 @@
 # SV-PGS design documents
 
-These documents describe the new SV-PGS path: the one model, its dosage store, its evaluation and its compute plan, plus the rulings behind each choice. The top-level README still describes the pre-cutover path; the new path replaces it (see HANDOFF.md, "Cutover").
+These documents describe SV-PGS: the one model, its dosage store, its phenotypes, its evaluation and its compute plan, plus the rulings behind each choice. The old fitting path is being deleted step by step (CUTOVER.md).
 
 | Document | What it holds |
 |---|---|

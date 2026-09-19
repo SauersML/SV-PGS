@@ -1,280 +1,62 @@
 # SV-PGS
 
-Bayesian polygenic scoring for structural variants. Fits a joint empirical-Bayes GLM on all visible GPUs via CuPy (cuBLAS) with JAX for element-wise ops.
+Bayesian polygenic scores in which structural variants, tandem repeats and SNVs enter one generative model. The target data are the All of Us imputed genomes with a long-read-called reference panel.
 
-The new path (8-bit dosage store, EP-EB with a learned mixing-density prior, certified Stage 0/1/2) is described in [docs/design/](docs/design/README.md); start with [HANDOFF.md](docs/design/HANDOFF.md). The quickstart below still describes the pre-cutover path.
+## The model
+The full model is in [docs/design/MODEL.md](docs/design/MODEL.md); the rulings behind it are in [DECISIONS.md](docs/design/DECISIONS.md).
+- **Likelihood.**
+  - A Gaussian likelihood for quantitative traits.
+  - A logistic likelihood for diseases, or a Gaussian working likelihood on a liability target where one exists.
+  - Covariates are projected out exactly before anything else is computed.
+- **Measurement.** A stored dosage is a measurement of the true genotype, with a truth-calibrated reliability r². GATK-SV short-read calls are a second measurement of the same genotype, and the two are fused.
+- **Prior.** Each effect is a continuous Gaussian scale mixture.
+  - Its mixing density is learned nonparametrically by empirical Bayes for each variant class, with no point mass.
+  - Each variant's scale depends on r² and on its annotations, including its structural-variant context, through smooth functions with learned smoothness.
+  - No prior is chosen by hand.
+- **Inference.** Expectation propagation with type-II maximum likelihood (EP-EB), accepted only with a convergence certificate.
+- **Pipeline:**
+  1. an 8-bit dosage store;
+  2. Stage 0, one phenotype-independent genotype pass;
+  3. Stage 1, an LD-space warm start;
+  4. Stage 2, exact full-data certification;
+  5. one-pass scoring with posterior draws.
 
-## All of Us Quickstart
+## Status
+[docs/design/HANDOFF.md](docs/design/HANDOFF.md) has the current state and the ordered next steps.
+- **On main:** the dosage store, Stage 0, the Stage 2 E-step, scoring, the reliability and fusion models, the prior design, the phenotypes and the evaluation tests.
+- **Not yet on main:** Stage 1 and the end-to-end fit.
+- **Being deleted:** the old fitting path, step by step ([CUTOVER.md](docs/design/CUTOVER.md)).
 
-**First-time setup** (installs uv + Python 3.12 + GPU dependencies):
-
+## Install
 ```bash
-cd ~ && rm -rf SV-PGS && git clone https://github.com/SauersML/SV-PGS.git && cd SV-PGS \
-  && curl -LsSf https://astral.sh/uv/install.sh | sh && export PATH="$HOME/.local/bin:$PATH" \
-  && uv sync --python 3.12 --extra gpu
+uv sync                 # CPU
+uv sync --extra gpu     # plus the CUDA 12 GPU libraries
 ```
 
-**Run a full analysis** (downloads VCFs, prepares phenotype, merges PCs, fits one unified genome-wide model):
+## All of Us phenotypes
+The 21-trait panel, 11 quantitative traits and 10 diseases, is built from the workspace's OMOP CDR by BigQuery. It runs inside the workspace, and only counts of at least 21 participants may leave it. [docs/design/PHENOTYPES.md](docs/design/PHENOTYPES.md) has the definitions.
 
 ```bash
-cd ~/SV-PGS && uv run sv-pgs run-all-of-us --disease type2_diabetes --output-dir t2d_results
-```
-
-That single command defaults to `--variants snp+sv`, which fits one joint
-model on BOTH genotype sources:
-- AoU microarray PLINK SNPs (447k samples, ~700k variants) from the
-  controlled-tier microarray PLINK trio (`.bed` / `.bim` / `.fam`)
-- AoU srWGS structural variant VCFs (97k samples, ~1.7M variants) from the
-  controlled-tier `structural_variants/vcf/full/` bucket
-
-To restrict to one source pass `--variants sv` (SV VCFs only) or
-`--variants snp` (microarray PLINK SNPs only).
-
-That single command (with the default `--variants snp+sv`):
-1. Downloads the microarray PLINK trio AND all 22 chromosome SV VCFs from the
-   controlled-tier buckets (skips existing files); `--variants sv` skips the
-   PLINK trio and `--variants snp` skips the SV VCFs
-2. Downloads ancestry predictions and merges top 10 genomic PCs
-3. Queries BigQuery for the phenotype (SNOMED, LOINC and ATC definitions built-in)
-4. Concatenates the requested chromosome data into one genome-wide training
-   dataset, intersecting samples across the SNP and SV sources when both are
-   loaded
-5. Fits one Bayesian PGS model across all visible GPUs and requested chromosomes
-6. Uses `--variant-metadata` annotations when supplied; it does not derive
-   annotations from VCF INFO
-7. Reuses an existing fit only when the full AoU run configuration (including
-   the `--variants` choice) matches
-8. Covariates: age, age^2, age x female, sex at birth, pre-landmark EHR depth, PC1-PC10
-
-**Available diseases:**
-
-```bash
-uv run sv-pgs list-all-of-us-diseases
-```
-
-atrial_fibrillation, cataract, chronic_kidney_disease, copd, depression, gout, hypothyroidism, prostate_cancer, psoriasis, type2_diabetes
-
-**Options:**
-
-```bash
-# Single chromosome:
-uv run sv-pgs run-all-of-us --disease type2_diabetes --chromosomes 22 --output-dir t2d_chr22
-
-# Specific chromosomes:
-uv run sv-pgs run-all-of-us --disease atrial_fibrillation --chromosomes 1,6,22 --output-dir af_results
-
-# More PCs:
-uv run sv-pgs run-all-of-us --disease depression --n-pcs 20 --output-dir depression_results
-```
-
-**Quantitative traits** (EHR labs and physical measurements from the OMOP `measurement` table):
-
-```bash
-uv run sv-pgs census-all-of-us-traits --output trait_census.tsv   # first query on a new CDR
+uv run sv-pgs census-all-of-us-traits --output trait_census.tsv
 uv run sv-pgs list-all-of-us-traits
-uv run sv-pgs run-all-of-us --trait mean_corpuscular_volume --output-dir mcv_results
 uv run sv-pgs prepare-all-of-us-trait --trait ldl_cholesterol --output ldl.samples.tsv
+uv run sv-pgs list-all-of-us-diseases
+uv run sv-pgs prepare-all-of-us-disease --disease type2_diabetes --output t2d.samples.tsv
 ```
 
-The catalogue (`sv_pgs/all_of_us.py`, `MEASUREMENT_DEFINITIONS`) is the panel's 11
-quantitative traits: height, BMI, systolic blood pressure, heart rate, MCV, platelet count,
-WBC, total bilirubin, eGFR (race-free CKD-EPI 2021), LDL and non-diabetic HbA1c. Codes and
-unit labels come from the public All of Us Data Browser: each trait matches its LOINC concepts
-on either concept column (plus the enrollment physical-measurement protocol means, e.g. PPI
-903118 for SBP), and converts each unit as All of Us labels it, including the mislabeled ones
-whose values the Data Browser histograms show are in the canonical unit (e.g. counts in
-"Kelvin per microliter", unit-less blood pressure). Rows that are censored (`<`, `>`), in an
-unrecognized unit, implausible, self-reported, below the trait's minimum age (18; height 20),
-within 30 days of an inpatient or emergency stay, inside a pregnancy window, or inside a
-trait's clinical exclusion windows (hematologic malignancy, chemotherapy and transfusion for
-blood counts; antibacterial courses for WBC; cholestasis and cirrhosis for bilirubin; dialysis
-and transplant for eGFR; any diabetes for HbA1c) are dropped; same-day repeats are one
-occasion. A person's untreated occasions are used when there are any, otherwise treated
-occasions corrected by the trait's convention (LDL / 0.7 under statins, ezetimibe or PCSK9
-inhibitors; SBP + 15 mmHg under antihypertensives) or, where no correction exists (heart rate
-under rate control, BMI under GLP-1 drugs), not at all. The `target` column is the
-empirical BLUP of the person's long-run mean under a random-intercept model (closed-form moment
-estimates of the between- and within-person variances); `target_inverse_normal` is its rank
-inverse normal transform (train on it with `sv-pgs run --target-column target_inverse_normal`).
-Covariates: mean age and mean squared age at measurement, age x female, sex at birth, log
-occasion count and PCs.
+Each prepared table has two sidecars:
+- the exact SQL it ran;
+- a metadata file with the query parameters, exclusion counts, variance components, and a fingerprint of the phenotype definition.
 
-**Diseases** are defined by SNOMED concept roots expanded through `concept_ancestor`. A case
-has two distinct diagnosis dates, or one plus a disease-specific medication (e.g. a
-non-metformin glucose-lowering drug for type 2 diabetes, levothyroxine on two dates for
-hypothyroidism), or a case procedure (cataract extraction), or repeated qualifying labs, which
-make a case on their own (HbA1c >= 6.5% on two dates for type 2 diabetes; for chronic kidney
-disease two eGFR < 60 or two urine ACR >= 30 mg/g occasions at least 90 days apart). Controls
-with a related code, medication or any qualifying lab are dropped, phecode-style (e.g. any
-diabetes code or drug for type 2 diabetes, asthma for COPD, any depressive disorder or
-antidepressant for depression), as is everyone with an ambiguous code (e.g. bipolar disorder
-for depression, postprocedural hypothyroidism), fewer than 5 distinct condition dates in their
-first year of EHR, the wrong sex (prostate cancer) or an age below the minimum (COPD cases and
-controls 40; prostate cancer controls 50). The
-`liability_target` column is E[liability | status, age] under the age-of-onset threshold
-model with the cohort's sex-specific cumulative incidence, where the onset age is the earliest
-diagnosis, procedure or qualifying lab. Covariates: age at the end of observation, its square,
-age x female, sex at birth, log pre-landmark EHR depth and PCs.
-Each prepared table's metadata sidecar records the query parameters, exclusion counts,
-unrecognized units, variance components and a fingerprint of the phenotype definition; the
-runner re-queries when the fingerprint no longer matches.
+## Synthetic data
+`python -m sv_pgs.synthetic_store` writes a synthetic dosage store from public 1000 Genomes haplotype mosaics, for tests and simulation studies.
 
-## Generic usage (non-AoU)
+## Rules
+[SPEC.md](SPEC.md) holds the binding rules:
+- one model and one path;
+- CPU and GPU both first-class;
+- every component a derived term of the model, backed by a measured gain or a proven identity;
+- no hand-chosen priors or constants.
 
-```bash
-uv run sv-pgs run \
-  --genotypes input.vcf.gz \
-  --sample-table phenotypes.tsv \
-  --target-column target \
-  --covariate-column age \
-  --covariate-column sex \
-  --variant-metadata variant_metadata.tsv \
-  --output-dir results
-```
-
-`--variant-metadata` is keyed by `variant_id` and drives the schema-based prior hypermodel. Apart from reserved model columns (`variant_id`, `variant_class`, `chromosome`, `position`, `length`, `allele_frequency`, `quality`, `training_support`, `is_repeat`, `is_copy_number`, `prior_class_members`, `prior_class_membership`), every column is treated as a user annotation. Column types are inferred from the values:
-
-- boolean values (`true`, `false`, `1`, `0`, `yes`, `no`) become binary annotations
-- numeric values become continuous annotations
-- `level=weight` lists become weighted membership annotations
-- `parent>child` values become nested annotations
-- other strings become categorical annotations
-
-Example:
-
-```tsv
-variant_id	coding	constraint	functional_state	regulatory_mix	gene_context
-sv1	1	0.82	lof	enhancer=0.7,promoter=0.3	protein_coding>exon
-sv2	0	0.15	missense	enhancer=0.2,promoter=0.8	protein_coding>intron
-```
-
-Programmatic binary fits use `ModelConfig.binary_inner_tolerance` as the
-PG-IRLS/TR-Newton gradient stopping tolerance. Its `1e-4` default matches
-`convergence_tolerance`; tighter inner solves repeat expensive posterior
-factorizations below the resolution of the outer variational fit.
-
-## Verify GPU runtime
-
-```bash
-uv run python -c "import jax; print('backend', jax.default_backend()); print('devices', jax.devices())"
-uv run python -c "import cupy as cp; print('cupy_devices', cp.cuda.runtime.getDeviceCount())"
-```
-
-When two or more CUDA devices are visible, SV-PGS shards the resident genotype
-cache by variant columns and runs CuPy matmul shards concurrently across the
-devices. With two comparable GPUs, genotype matmul-heavy phases should approach
-2x single-GPU throughput once the cache is resident.
-
-## Quickstart
-
-Once `uv sync --extra gpu` has finished, two short commands confirm that the
-GPU pipeline is wired end-to-end.
-
-```bash
-# 1) Smoke check: builds a tiny synthetic BED and exercises screening / matvec
-#    / rmatvec / gram_block against the CPU reference. Expects "BITPACKED
-#    PIPELINE OK" + exit 0. Takes <5s on V100/T4.
-uv run python -m sv_pgs.bitpacked.smoke
-
-# 2) Bench harness: detects the active GPU, prints HBM, runs gemv_nt /
-#    gemv_tn / gemm_gram / screen at three scales, emits a markdown table +
-#    optional JSON report. --quick runs two scales for sub-30s CI.
-uv run python -m sv_pgs.bitpacked.bench --output bench.json
-uv run python -m sv_pgs.bitpacked.bench --quick   # faster CI invocation
-```
-
-The bench output looks like::
-
-    === sv-pgs bitpacked benchmark on Tesla V100-SXM2-16GB sm_70 family=volta HBM=16.9 GB ===
-    HBM total: 16.9 GB, free at start: 16.6 GB
-
-    | Op        | n_samples | n_variants | bytes_GB | time_ms | GB/s   | TFLOPS |
-    |-----------|-----------|------------|----------|---------|--------|--------|
-    | gemv_nt   |     97000 |       4096 |    0.099 |    0.99 |  100.1 |      - |
-    | gemv_tn   |     97000 |       4096 |    0.099 |    0.75 |  132.4 |      - |
-    | gemm_gram |     97000 |       4096 |    0.099 |  344.25 |      - |   4.73 |
-    | screen    |     97000 |       4096 |    0.099 |    6.08 |   16.3 |      - |
-
-## Data
-
-SV VCFs are sharded by chromosome under `${CDR_STORAGE_PATH}/wgs/short_read/structural_variants/vcf/full/`. Ancestry predictions with PCs are at `${CDR_STORAGE_PATH}/wgs/short_read/snpindel/aux/ancestry/ancestry_preds.tsv`. The `run-all-of-us` command handles all downloads automatically.
-
-## Troubleshooting
-
-### "Bitpacked path SKIPPED in logs"
-
-The bitpacked GPU path is the fast path. If the training log shows
-`bitpacked upgrade: SKIPPED`, scan for the parenthetical reason:
-
-```
-bitpacked upgrade: SKIPPED (reason: ...)
-```
-
-Common reasons:
-- `config.genotype_backend=...` is not `'bitpacked'` — set it explicitly.
-- `CuPy unavailable` — run `uv sync --extra gpu` and retry.
-- `dataset.genotypes is not backed by a single PLINK BED` — only the AoU
-  PLINK SNP source is bitpacked-eligible today; SV VCFs still go through
-  the legacy int8 path.
-- `variant-subset wrapper present` — disable `--variants` filtering or
-  load the source without the wrapper.
-- `loader failed: ...` — the loader logged a Python exception; see the
-  lines immediately above the SKIPPED message for the traceback.
-
-### "CuPy failed to load libnvrtc.so.12"
-
-The NVIDIA `nvrtc` wheel is not on `LD_LIBRARY_PATH`. Fix:
-
-```bash
-uv sync --extra gpu
-```
-
-`run.sh` automatically prepends the `nvidia/*` wheel `lib` directories from
-the active `.venv` to `LD_LIBRARY_PATH` before launching the CLI, so a
-fresh `uv sync --extra gpu` followed by `bash run.sh ...` is enough.
-
-### "Cold load very slow (>20 min)"
-
-Cold PLINK loads can take 15-30 minutes on the AoU CDR trio. Watch for:
-
-- `BED stream:` progress lines in the log — these show streaming
-  throughput; a healthy load shows >100 MB/s sustained.
-- `bitpacked upgrade: loading BED ... -> device via active-matrix cache
-  (cache_dir=...)` — confirms the active-matrix cache is engaged. The
-  SECOND run with the same sample intersection and variant axis is
-  ~30 seconds (cache hit) instead of 20+ minutes.
-
-If `BED stream:` lines stall, the underlying file is most likely on
-gcsfuse and the workbench VM is IOPS-starved. Stage the BED to local
-disk before launching.
-
-### "EM iterations slow"
-
-Grep the log for `model fit: matrix=BitpackedDeviceMatrix`. If the banner
-shows a different type:
-
-```
-model fit: matrix=PlinkRawGenotypeMatrix ...
-```
-
-then the bitpacked upgrade was skipped — see the first troubleshooting
-section to find the reason. EM iterations on the legacy int8 path can be
-50-100x slower than the bitpacked GPU path at AoU scale (~10 minutes vs.
-~10 seconds per outer iteration).
-
-Same banner applies on the scoring path; iter 6 added `scoring:
-matrix=BitpackedDeviceMatrix (single GPU matvec; ...)`. If scoring shows
-`scoring: matrix=PlinkRawGenotypeMatrix (legacy iter_column_batches ...)`,
-holdout / test predictions are being computed via host-streamed decode
-and will be slow at AoU scale.
-
-### "Out of memory" at AoU scale
-
-The bitpacked path is now the default; the legacy host-side int8 .npy
-matrix is no longer built. If you still see OOM:
-
-- Confirm the bitpacked path engaged: log line `bitpacked post-active
-  upgrade: ENGAGED`. The bitpacked active matrix uses ~7 GB HBM at AoU
-  microarray scale (packed bytes plus per-variant mean/std side buffers).
-- Reduce the variant axis: pass `--variants sv` or `--variants snp` rather
-  than `snp+sv`, or supply a `--variants-file` subset.
+## License
+AGPL-3.0-or-later.
