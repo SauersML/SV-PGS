@@ -993,10 +993,12 @@ def _laplace_corrections(
                 _data_value(prior, point, cavity, working_bytes) - _penalty_value(prior, log_smoothing, point)[0] - value
             ))
 
-        integral, _error, information, *message = quad(
+        integral, error, _information, *message = quad(
             integrand, -np.inf, np.inf, epsabs=0.0, epsrel=max(tolerance, _QUADPACK_RELATIVE_FLOOR), full_output=True
         )
-        if message:
+        # The log of the integral is what enters V: accept QUADPACK's answer when its own error estimate resolves that
+        # log to the tolerance, or to half of double precision when rounding is what stopped it.
+        if message and error > max(tolerance, _HALF_PRECISION) * abs(integral):
             raise FloatingPointError(f"the exact integral along a direction did not converge: {message[0]}")
         corrections[index] = float(np.log(integral) - 0.5 * np.log(2.0 * np.pi))
     return corrections, terms
