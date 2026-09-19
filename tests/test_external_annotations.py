@@ -83,6 +83,25 @@ def test_match_records_tiers_and_one_to_one() -> None:
     assert matches.displaced_pairs == 1
 
 
+def test_match_records_ranks_sequence_agreement_before_size_and_position() -> None:
+    # Two sequence-tier insertions at the external record's position claim it. The shorter
+    # one shares more of its 11-mers (Jaccard 0.80, size ratio 0.81); the other has the
+    # external size but shares fewer (Jaccard 0.70, ratio 1). Sequence agreement is compared
+    # first, so the shorter one wins, where a weighted sum of the three would pick the other.
+    panel = _records(
+        [
+            ("p_same_size", "chr1", 3_000, "G", "G" + _INSERTED[:249] + _OTHER[:51]),
+            ("p_more_shared", "chr1", 3_000, "G", "G" + _INSERTED[:242]),
+        ]
+    )
+    external = _records([("e_insertion", "chr1", 3_000, "G", "G" + _INSERTED)])
+
+    matches = match_records(external, panel)
+
+    assert matches.store_rows.tolist() == [1]
+    assert matches.tiers.tolist() == [TIER_SEQUENCE]
+
+
 def test_majority_motif_length_weighs_overlapping_bases() -> None:
     motif = majority_motif_length(
         np.array([100, 500]),

@@ -11,15 +11,17 @@ external id; this module builds the trait-independent maps and keeps them in the
 Record tiers, strongest first (the codes ``rec_map`` stores):
 
 1. exact: same position, size and inserted/deleted sequence;
-2. sequence: compatible kind, size ratio >= 0.5, breakpoints within 100 bp (insertions) or
-   reciprocal overlap >= 0.5 (deletions), and k-mer Jaccard of the changed sequence >= 0.5;
+2. sequence: the same kind, GATK-SV's re-clustering rules (``sv_fusion``: sizes within a factor
+   of two, breakpoints within 100 bp for insertions or reciprocal overlap of at least half for
+   deletions), and k-mer Jaccard of the changed sequence >= 0.5;
 3. coordinate: the same coordinate test without sequence agreement. On public chr20-22 these
    are mostly insertions with size ratio ~0.74: a different allele of the same repeat, which is
    why the tier stays its own code for empirical Bayes to weigh.
 
-Assignment is greedy over (tier, quality, breakpoint distance, ids): each external record and
-each store record is used at most once. VNTR loci match when their intervals overlap and their
-motif lengths agree up to TRF's doubled or tripled periods.
+Assignment is greedy, strongest evidence first: by tier, then sequence similarity, size ratio,
+positional agreement, breakpoint distance and ids, each compared in that order with no weights.
+Each external record and each store record is used at most once. VNTR loci match when their
+intervals overlap and their motif lengths agree up to TRF's doubled or tripled periods.
 
 The payload side is symmetric by construction, each source with its own
 EB-learned weight: SNV records take the z^2 of an external SNV GWAS (Pan-UKB
@@ -41,17 +43,15 @@ import pandas as pd
 
 from sv_pgs._typing import BoolArray, F64Array, I64Array, NDArray
 from sv_pgs.dosage_store import open_column, read_identifier_columns, write_column, write_identifier_columns
+from sv_pgs.sv_fusion import MAXIMUM_BREAKPOINT_DISTANCE, MINIMUM_RECIPROCAL_OVERLAP, MINIMUM_SIZE_RATIO
 from sv_pgs.variant_typing import sequence_resolved_kind_and_length, trimmed_allele_cores
 
 TIER_EXACT = 1
 TIER_SEQUENCE = 2
 TIER_COORDINATE = 3
-BREAKPOINT_TOLERANCE = 100
-SIZE_RATIO_FLOOR = 0.5
-RECIPROCAL_OVERLAP_FLOOR = 0.5
 JACCARD_FLOOR = 0.5
 KMER_LENGTH = 11
-CANDIDATE_BIN = 1_000
+# TRF reports a repeat's period, or twice or three times it.
 MOTIF_MULTIPLES = (1, 2, 3)
 
 
@@ -124,8 +124,12 @@ def _jaccard(first: str, second: str) -> float:
     return len(left & right) / len(left | right)
 
 
-def _score(external: ChangedSequences, external_row: int, panel: ChangedSequences, panel_row: int) -> tuple[int, float] | None:
-    """(tier, quality in [0, 1]) of one candidate pair, or None when it fails the coordinate test."""
+def _score(
+    external: ChangedSequences, external_row: int, panel: ChangedSequences, panel_row: int
+) -> tuple[int, float, float, float] | None:
+    """(tier, sequence similarity, size ratio, positional agreement) of a candidate pair, or None
+    when it fails the coordinate test. Positional agreement is the reciprocal overlap of
+    deletions and 1 - distance / (tolerance + 1) of insertions, both in [0, 1]."""
     kind = str(external.kinds[external_row])
     if kind != str(panel.kinds[panel_row]):
         return None
@@ -136,18 +140,16 @@ def _score(external: ChangedSequences, external_row: int, panel: ChangedSequence
     if kind == "DEL":
         overlap = max(0, min(int(external.ends[external_row]), int(panel.ends[panel_row])) - max(int(external.starts[external_row]), int(panel.starts[panel_row])))
         proximity = overlap / max(external_size, panel_size)
-        passes = proximity >= RECIPROCAL_OVERLAP_FLOOR and ratio >= SIZE_RATIO_FLOOR
+        passes = proximity >= MINIMUM_RECIPROCAL_OVERLAP and ratio >= MINIMUM_SIZE_RATIO
     else:
-        proximity = max(0.0, 1.0 - distance / (BREAKPOINT_TOLERANCE + 1))
-        passes = distance <= BREAKPOINT_TOLERANCE and ratio >= SIZE_RATIO_FLOOR
+        proximity = max(0.0, 1.0 - distance / (MAXIMUM_BREAKPOINT_DISTANCE + 1))
+        passes = distance <= MAXIMUM_BREAKPOINT_DISTANCE and ratio >= MINIMUM_SIZE_RATIO
     if not passes:
         return None
     if distance == 0 and external_size == panel_size and external.sequences[external_row] == panel.sequences[panel_row]:
-        return TIER_EXACT, 1.0
+        return TIER_EXACT, 1.0, 1.0, 1.0
     similarity = _jaccard(external.sequences[external_row], panel.sequences[panel_row])
-    if similarity >= JACCARD_FLOOR:
-        return TIER_SEQUENCE, 0.5 * similarity + 0.3 * ratio + 0.2 * proximity
-    return TIER_COORDINATE, 0.6 * ratio + 0.4 * proximity
+    return (TIER_SEQUENCE if similarity >= JACCARD_FLOOR else TIER_COORDINATE), similarity, ratio, proximity
 
 
 @dataclass(frozen=True, slots=True)
@@ -161,44 +163,44 @@ class RecordMatches:
 
 
 def match_records(external: ChangedSequences, panel: ChangedSequences) -> RecordMatches:
-    """One-to-one matches of external records to store records, strongest tier first."""
-    bins: dict[tuple[str, int], list[int]] = collections.defaultdict(list)
-    for panel_row in range(panel.rows.shape[0]):
-        first_bin = (int(panel.starts[panel_row]) - BREAKPOINT_TOLERANCE) // CANDIDATE_BIN
-        last_bin = (int(panel.ends[panel_row]) + BREAKPOINT_TOLERANCE) // CANDIDATE_BIN
-        for bin_index in range(first_bin, last_bin + 1):
-            bins[(str(panel.chromosomes[panel_row]), bin_index)].append(panel_row)
-    candidates: list[tuple[int, float, int, str, str, int, int, int]] = []
-    for external_row in range(external.rows.shape[0]):
-        chromosome = str(external.chromosomes[external_row])
-        first_bin = (int(external.starts[external_row]) - BREAKPOINT_TOLERANCE) // CANDIDATE_BIN
-        last_bin = (int(external.ends[external_row]) + BREAKPOINT_TOLERANCE) // CANDIDATE_BIN
-        nearby = {panel_row for bin_index in range(first_bin, last_bin + 1) for panel_row in bins.get((chromosome, bin_index), ())}
-        for panel_row in sorted(nearby):
-            scored = _score(external, external_row, panel, panel_row)
-            if scored is None:
-                continue
-            tier, quality = scored
-            candidates.append(
-                (
-                    tier,
-                    -quality,
-                    abs(int(external.starts[external_row]) - int(panel.starts[panel_row])),
-                    external.identifiers[external_row],
-                    panel.identifiers[panel_row],
-                    external_row,
-                    panel_row,
-                    tier,
+    """One-to-one matches of external records to store records, strongest evidence first."""
+    candidates: list[tuple[int, float, float, float, int, str, str, int, int]] = []
+    for chromosome in np.intersect1d(np.unique(external.chromosomes), np.unique(panel.chromosomes)):
+        panel_on = np.flatnonzero(panel.chromosomes == chromosome)
+        order = panel_on[np.argsort(panel.starts[panel_on], kind="stable")]
+        sorted_starts = panel.starts[order]
+        # A panel record that can pair starts within its longest span (plus the breakpoint
+        # tolerance) before the external record, and at most the tolerance past its end.
+        reach = int((panel.ends[panel_on] - panel.starts[panel_on]).max()) + MAXIMUM_BREAKPOINT_DISTANCE
+        for external_row in np.flatnonzero(external.chromosomes == chromosome).tolist():
+            low = np.searchsorted(sorted_starts, external.starts[external_row] - reach, side="left")
+            high = np.searchsorted(sorted_starts, external.ends[external_row] + MAXIMUM_BREAKPOINT_DISTANCE, side="right")
+            for panel_row in order[low:high].tolist():
+                scored = _score(external, external_row, panel, panel_row)
+                if scored is None:
+                    continue
+                tier, similarity, ratio, proximity = scored
+                candidates.append(
+                    (
+                        tier,
+                        -similarity,
+                        -ratio,
+                        -proximity,
+                        abs(int(external.starts[external_row]) - int(panel.starts[panel_row])),
+                        external.identifiers[external_row],
+                        panel.identifiers[panel_row],
+                        external_row,
+                        panel_row,
+                    )
                 )
-            )
-    candidates.sort(key=lambda candidate: candidate[:5])
+    candidates.sort(key=lambda candidate: candidate[:7])
     used_external: set[int] = set()
     used_panel: set[int] = set()
     store_rows: list[int] = []
     identifiers: list[str] = []
     tiers: list[int] = []
     displaced = 0
-    for *_, external_row, panel_row, tier in candidates:
+    for tier, *_, external_row, panel_row in candidates:
         if external_row in used_external:
             continue
         if panel_row in used_panel:
