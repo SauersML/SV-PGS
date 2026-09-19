@@ -1585,23 +1585,31 @@ def _stationarity_check(
     """The B-evidence's own gradient in each interior weight, by one central difference, and its curvature.
 
     The step balances the difference's truncation against V's rounding: with V known to eps times its magnitude and
-    its log-weight curvature c (a three-point estimate at a unit step, the natural scale of a log weight, which the
-    difference then refines), the optimal central step is (3 eps |V| / c)^(1/3).
+    its log-weight curvature c, the optimal central step is (3 eps |V| / c)^(1/3). c comes from a three-point
+    difference starting at a unit step, the natural scale of a log weight; either step halves until both of its
+    sides have a certified maximum (the certified region can end close to a fitted weight), and the curvature
+    difference, a second difference, is divided by its step's square.
     """
     gradient = np.zeros(weights.shape[0])
     curvature = np.ones(weights.shape[0])
     rounding = _EPSILON * evidence.magnitude
-    for position in np.flatnonzero(interior):
+    limit = _HALF_PRECISION * (1.0 + float(np.max(np.abs(weights))))
+
+    def sides(position: int, step: float) -> tuple[float, list[_Evidence]]:
         unit = np.zeros(weights.shape[0])
         unit[position] = 1.0
-        wide = [_evidence(view, weights + side * unit, evidence.coefficients, cavity, posterior_at, working_bytes, tolerance) for side in (-1.0, 1.0)]
-        if all(side is not None for side in wide):
-            curvature[position] = max(abs(wide[0].value - 2.0 * evidence.value + wide[1].value), rounding)
-        step = (3.0 * rounding / curvature[position]) ** (1.0 / 3.0)
-        sides = [_evidence(view, weights + side * step * unit, evidence.coefficients, cavity, posterior_at, working_bytes, tolerance) for side in (-1.0, 1.0)]
-        if any(side is None for side in sides):
-            raise FloatingPointError("the B-evidence has no certified maximum next to the fitted penalty weights")
-        gradient[position] = (sides[1].value - sides[0].value) / (2.0 * step)
+        while step > limit:
+            both = [_evidence(view, weights + side * step * unit, evidence.coefficients, cavity, posterior_at, working_bytes, tolerance) for side in (-1.0, 1.0)]
+            if all(side is not None for side in both):
+                return step, both
+            step *= 0.5
+        raise FloatingPointError("the B-evidence has no certified maximum on both sides of a fitted penalty weight")
+
+    for position in np.flatnonzero(interior):
+        wide_step, wide = sides(position, 1.0)
+        curvature[position] = max(abs(wide[0].value - 2.0 * evidence.value + wide[1].value) / wide_step**2, rounding)
+        step, close = sides(position, (3.0 * rounding / curvature[position]) ** (1.0 / 3.0))
+        gradient[position] = (close[1].value - close[0].value) / (2.0 * step)
     return gradient, curvature
 
 
