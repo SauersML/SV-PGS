@@ -2001,7 +2001,9 @@ def fit_hyperparameters(
     curvature B + S. Each outer step sets the weights by ``hyper_step`` at the current fixed point, then moves x on
     the quadratic model (g, B + S). The fixed-cavity maximizer (the EM step) solves with A + S instead: to first
     order it maps the error e to (I - (A + S)^-1 (B + S)) e, which diverges wherever that pencil has an eigenvalue
-    above 2. speed-floor measured [0.89, 5.4] at production [semi-real].
+    above 2, and where A + S is indefinite the fixed-cavity objective has no maximum near x at all. On real LD at
+    genome scale B + S itself is indefinite at the true prior (speed-floor [semi-real]), so the trust region below
+    is the production case, not an edge case.
 
     - Where B + S is positive definite the step is Newton's, accepted by the natural monotonicity test (Deuflhard,
       Newton Methods for Nonlinear Problems, 2004, Section 3.1.4): at the trial's fixed point g'(B + S)^-1 g, taken

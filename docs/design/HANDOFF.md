@@ -19,7 +19,7 @@
 - **The old path is deleted** (cutover C0–C8, CUTOVER.md); it is recoverable from tag `archive/2026-09-19/old-path-final`.
 
 ## What remains, in order
-1. **Stage 1 is dropped** (lead ruling, 2026-09-19; MODEL.md §5, COMPUTE.md). The production outer map has no slow direction, and the certified Newton-B loop needs 0.7–2.6 outer steps [semi-real: speed-floor, bench-sim chr22 real-haplotype LD]. The pipeline is Stage 0, then Stage 2, then scoring.
+1. **Stage 1 is dropped, provisionally** (lead ruling, 2026-09-19; MODEL.md §5, COMPUTE.md), on cost. The outer-contraction measurement first cited for it was withdrawn; speed-floor is re-measuring at the pooled fixed point. The pipeline is Stage 0, then Stage 2, then scoring.
    - **The dense EP-EB reference is on main:** `tests/ep_eb_reference.py`, checked by `tests/test_ep_eb_reference.py` (see MODEL.md §3–4). It remains the exactness oracle for the engine.
    - Settle the prior family: the learned mixing density vs TPB and BayesR on the reliability, TR-locus and multi-trait scenarios.
 2. **Wire the full path end to end:** store → Stage 0 → Stage 2 (`full_data_fit.py`) → score. It runs from the prior, with the engine's Newton-B outer loop and certified marginals, on synthetic data first (`tests/test_full_data_fit.py`).

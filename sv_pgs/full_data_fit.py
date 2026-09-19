@@ -28,8 +28,9 @@ residual variance. ``scale_mixture_ep.fit_hyperparameters`` then alternates two 
       is below p_eff / K. Then comes the noise update sigma^2 = RSS / (n - k - gamma), with
       gamma = p - sum_j tau_j z_j (``noise_variance``), and the loop returns to (a).
 2. The outer step at that fixed point: the weights by the B-evidence (``hyper_step``), and x by Newton on the
-   total curvature B + S, accepted by the natural monotonicity test. It is never the plain EP-EM step, which
-   diverges where (A + S)^-1 (B + S) exceeds 2; speed-floor measured up to 5.4 at production [semi-real].
+   total curvature B + S, accepted by the natural monotonicity test, with a trust region where B + S is
+   indefinite. It is never the plain EP-EM step, which diverges where (A + S)^-1 (B + S) exceeds 2 and has no
+   maximum to move to where A + S is indefinite.
 The fit ends when every model's Newton-B decrement plus its weights' remaining gain is at most 1/(2K).
 """
 
