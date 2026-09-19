@@ -105,7 +105,7 @@ def test_a_model_is_never_overwritten(tmp_path: Path, store_root: Path) -> None:
     save_model(tmp_path / "model", model)
     with pytest.raises(FileExistsError):
         save_model(tmp_path / "model", model)
-    assert [path.name for path in tmp_path.iterdir()] == ["model"]
+    assert sorted(path.name for path in tmp_path.iterdir()) == ["model", "store"]
 
 
 def test_loading_refuses_a_model_that_is_not_exactly_what_was_written(tmp_path: Path, store_root: Path) -> None:
