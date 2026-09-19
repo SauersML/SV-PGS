@@ -38,7 +38,11 @@ a Cholesky factor of ``κ nR_b + diag(precision)``, with the diagonal of the
 inverse from the triangular inverse of that factor. The block loop is the outer
 loop, so one pass over the LD store serves every model (trait x fold). On a
 CUDA budget the blocks run in turn on the device, and so do the M-step
-objectives. On the host the blocks run concurrently on worker threads with
+objectives; with several devices each takes blocks from a shared queue. A
+device whose fp64 Cholesky is at least 3x slower than its fp32 one (T4, L4:
+1/32 rate) factors a Jacobi-scaled system in fp32 instead; see
+_CudaBackend._single_precision_posterior. On the host the blocks run
+concurrently on worker threads with
 single-threaded BLAS: OpenBLAS's own threading reaches 8-31 GFLOP/s on a
 4096-wide potrf at 16-32 threads (EPYC 7763), against 16 GFLOP/s per core
 single-threaded, so thousands of independent blocks scale by the core count.
@@ -71,6 +75,7 @@ Every scheme uses the exact block posterior diagonal, never the prior variance.
 from __future__ import annotations
 
 import contextlib
+import queue
 import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
@@ -156,6 +161,9 @@ _HOST_OBJECTIVE_MEMORY_FRACTION = 0.05
 _DEVICE_OBJECTIVE_MEMORY_FRACTION = 0.25
 # Float64 temporaries of one (variants x grid) objective evaluation.
 _OBJECTIVE_TEMPORARIES = 6
+# M-step chunks per worker, so that every worker thread gets work (memory alone
+# gave 7 chunks for 1M variants and 64 workers).
+_OBJECTIVE_CHUNKS_PER_WORKER = 4
 # Float64 (width x width) arrays one host block worker holds: the LD block, the
 # system and its factor, and the triangular inverse.
 _HOST_BLOCK_WORKER_MATRICES = 4
@@ -166,6 +174,11 @@ _HOST_INVERSE_PANEL_WIDTH = 256
 # many panels; the trailing-triangle solves then cost ≈ 0.37 p³ against the
 # 1/3 p³ of LAPACK trtri, which CuPy does not expose.
 _DIAGONAL_PANEL_COUNT = 16
+# A device factors in fp32 when its fp64 Cholesky is at least this much slower
+# (measured once per fit on a block-sized system): the fp32 path adds a few
+# p² passes and two fp64 refinement matrix-vector products per solve.
+_SINGLE_PRECISION_MINIMUM_SPEEDUP = 3.0
+_SINGLE_PRECISION_REFINEMENT_STEPS = 2
 # Half-width of the Richardson-extrapolated central difference in the Bessel
 # order for E[log λ]: truncation error O(1e-12), rounding about eps |log K| / 1e-3.
 _BESSEL_ORDER_DIFFERENCE_STEP = 1e-3
@@ -404,9 +417,11 @@ class _ModelState:
 class _ArrayBackend(Protocol):
     """Where the block posteriors and site updates run: host LAPACK or a CUDA device.
 
-    ``map`` runs independent work items (LD blocks, M-step variant chunks): on
-    worker threads on the host (NumPy and LAPACK release the GIL), in turn on a
-    device.
+    ``map_blocks`` runs independent LD blocks: on worker threads on the host
+    (NumPy's linalg releases the GIL), on one thread per device on CUDA.
+    ``map_chunks`` runs M-step variant chunks: on the worker threads on the host,
+    in turn on the primary device on CUDA. Work items create their own device
+    arrays; none is shared between items.
     """
 
     @property
@@ -415,8 +430,11 @@ class _ArrayBackend(Protocol):
         ...
 
     objective_bytes: int
+    chunk_workers: int
 
-    def map(self, function: Callable[[Any], Any], items: Sequence[Any]) -> list[Any]: ...
+    def map_blocks(self, function: Callable[[Any], Any], items: Sequence[Any]) -> list[Any]: ...
+
+    def map_chunks(self, function: Callable[[Any], Any], items: Sequence[Any]) -> list[Any]: ...
 
     def to_device(self, values: NDArrayLike) -> NDArrayLike: ...
 
@@ -438,9 +456,13 @@ class _HostBackend:
 
     def __init__(self, executor: ThreadPoolExecutor, worker_count: int, host_bytes: int) -> None:
         self._executor = executor
+        self.chunk_workers = worker_count
         self.objective_bytes = int(_HOST_OBJECTIVE_MEMORY_FRACTION * host_bytes / worker_count)
 
-    def map(self, function: Callable[[Any], Any], items: Sequence[Any]) -> list[Any]:
+    def map_blocks(self, function: Callable[[Any], Any], items: Sequence[Any]) -> list[Any]:
+        return list(self._executor.map(function, items))
+
+    def map_chunks(self, function: Callable[[Any], Any], items: Sequence[Any]) -> list[Any]:
         return list(self._executor.map(function, items))
 
     def to_device(self, values: NDArrayLike) -> F64Array:
@@ -482,20 +504,30 @@ def _lower_triangular_inverse(factor: F64Array) -> F64Array:
 
 
 class _CudaBackend:
-    def __init__(self, cupy: Any, device_bytes: int) -> None:
+    def __init__(
+        self, cupy: Any, primary_device: int, device_bytes: int, executor: ThreadPoolExecutor, single_precision: bool
+    ) -> None:
         # cupyx ships with CuPy, which _array_backend has already imported.
         from cupyx import errstate
         from cupyx.scipy.linalg import solve_triangular
 
         self.xp = cupy
         self.objective_bytes = int(_DEVICE_OBJECTIVE_MEMORY_FRACTION * device_bytes)
+        self.chunk_workers = 1
+        self.single_precision = single_precision
+        self._primary_device = primary_device
+        self._executor = executor
         # CuPy ignores cuSOLVER failures unless asked, which would hand back a
         # partial factor of an indefinite system.
         self._raise_on_linalg_error = errstate
         self._solve_triangular = solve_triangular
 
-    def map(self, function: Callable[[Any], Any], items: Sequence[Any]) -> list[Any]:
-        return [function(item) for item in items]
+    def map_blocks(self, function: Callable[[Any], Any], items: Sequence[Any]) -> list[Any]:
+        return list(self._executor.map(function, items))
+
+    def map_chunks(self, function: Callable[[Any], Any], items: Sequence[Any]) -> list[Any]:
+        with self.xp.cuda.Device(self._primary_device):
+            return [function(item) for item in items]
 
     def to_device(self, values: NDArrayLike) -> NDArrayLike:
         return self.xp.asarray(values).astype(self.xp.float64, copy=False)
@@ -510,8 +542,8 @@ class _CudaBackend:
         diagonal_precision: NDArrayLike,
         linear_term: NDArrayLike,
     ) -> tuple[NDArrayLike, NDArrayLike]:
-        # diag(A⁻¹)_j = ‖L⁻¹ e_j‖², and L⁻¹ e_j vanishes above row j, so each panel
-        # of columns needs only the trailing triangle of the factor.
+        if self.single_precision:
+            return self._single_precision_posterior(correlation_block, likelihood_scale, diagonal_precision, linear_term)
         cupy = self.xp
         width = int(correlation_block.shape[0])
         system = likelihood_scale * correlation_block
@@ -521,14 +553,80 @@ class _CudaBackend:
         mean = self._solve_triangular(factor, linear_term, lower=True)
         mean = self._solve_triangular(factor, mean, lower=True, trans="T")
         variance = cupy.empty(width, dtype=cupy.float64)
+        for start, stop, columns in self._inverse_factor_panels(factor):
+            variance[start:stop] = cupy.sum(columns * columns, axis=0)
+        return mean, variance
+
+    def _inverse_factor_panels(self, factor: NDArrayLike) -> Iterator[tuple[int, int, NDArrayLike]]:
+        """Column panels of L⁻¹ below the diagonal: L⁻¹ e_j vanishes above row j,
+        so each panel needs only the trailing triangle of the factor."""
+        cupy = self.xp
+        width = int(factor.shape[0])
         panel_width = -(-width // _DIAGONAL_PANEL_COUNT)
         for start in range(0, width, panel_width):
             stop = min(start + panel_width, width)
-            identity_panel = cupy.zeros((width - start, stop - start), dtype=cupy.float64)
+            identity_panel = cupy.zeros((width - start, stop - start), dtype=factor.dtype)
             identity_panel[cupy.arange(stop - start), cupy.arange(stop - start)] = 1.0
-            columns = self._solve_triangular(factor[start:, start:], identity_panel, lower=True)
-            variance[start:stop] = cupy.sum(columns * columns, axis=0)
-        return mean, variance
+            yield start, stop, self._solve_triangular(factor[start:, start:], identity_panel, lower=True)
+
+    def _single_precision_posterior(
+        self,
+        correlation_block: NDArrayLike,
+        likelihood_scale: float,
+        diagonal_precision: NDArrayLike,
+        linear_term: NDArrayLike,
+    ) -> tuple[NDArrayLike, NDArrayLike]:
+        """The block posterior from an fp32 factor of the Jacobi-scaled system Ã = SAS, S = diag(A)^(−1/2).
+
+        The EP cavity precision 1/Σ_jj − τ̃_j is a small difference for
+        prior-dominated variants, so Σ_jj must be accurate relative to its
+        excess over the prior. With a unit diagonal, [Ã⁻¹]_jj = 1 + e_j where
+        e_j = Σ_{k<j} L̃_jk² / L̃_jj² + Σ_{i>j} (L̃⁻¹)_ij² is a sum of squares, so
+        it keeps fp32 relative accuracy however small it is (against fp64: 9e-7
+        in Σ_jj and 7e-6 in the cavity precision on a 3000-wide block with
+        r = 0.9995 pairs; the plain 1/Σ_jj − τ̃_j in fp32 would lose a factor
+        τ̃_j / (data precision) ≈ 10²-10⁴). The mean gets fp64 residual refinement.
+        """
+        cupy = self.xp
+        width = int(correlation_block.shape[0])
+        diagonal_index = cupy.arange(width)
+        root = 1.0 / cupy.sqrt(likelihood_scale * cupy.diagonal(correlation_block) + diagonal_precision)
+        scaled = (likelihood_scale * correlation_block) * root[:, None] * root[None, :]
+        scaled[diagonal_index, diagonal_index] = 1.0
+        with self._raise_on_linalg_error(linalg="raise"):
+            factor = cupy.linalg.cholesky(scaled.astype(cupy.float32))
+        factor_diagonal = cupy.diagonal(factor).astype(cupy.float64)
+        below_diagonal = cupy.tril(factor, -1).astype(cupy.float64)
+        excess = cupy.sum(below_diagonal * below_diagonal, axis=1) / (factor_diagonal * factor_diagonal)
+        for start, stop, columns in self._inverse_factor_panels(factor):
+            below = cupy.tril(columns.astype(cupy.float64), -1)
+            excess[start:stop] += cupy.sum(below * below, axis=0)
+
+        def scaled_solve(right_hand_side: NDArrayLike) -> NDArrayLike:
+            half = self._solve_triangular(factor, (root * right_hand_side).astype(cupy.float32), lower=True)
+            return root * self._solve_triangular(factor, half, lower=True, trans="T").astype(cupy.float64)
+
+        mean = scaled_solve(linear_term)
+        for _refinement in range(_SINGLE_PRECISION_REFINEMENT_STEPS):
+            residual = linear_term - likelihood_scale * (correlation_block @ mean) - diagonal_precision * mean
+            mean = mean + scaled_solve(residual)
+        return mean, root * root * (1.0 + excess)
+
+
+def _measured_single_precision_speedup(cupy: Any, width: int) -> float:
+    """fp64 over fp32 Cholesky time for one width x width system on the current device."""
+    base = cupy.random.default_rng(0).standard_normal((width, width))
+    system = base @ base.T / width + cupy.eye(width)
+    seconds = []
+    for dtype in (cupy.float64, cupy.float32):
+        typed = system.astype(dtype)
+        cupy.linalg.cholesky(typed)
+        cupy.cuda.Device().synchronize()
+        start = time.perf_counter()
+        cupy.linalg.cholesky(typed)
+        cupy.cuda.Device().synchronize()
+        seconds.append(time.perf_counter() - start)
+    return seconds[0] / seconds[1]
 
 
 def _host_worker_count(budget: ComputeBudget, widest_block: int) -> int:
@@ -550,12 +648,32 @@ def _array_backend(budget: ComputeBudget, widest_block: int) -> Iterator[_ArrayB
     cupy = _try_import_cupy()
     if cupy is None:
         raise RuntimeError("The compute budget is CUDA but CuPy cannot be imported.")
-    yield _CudaBackend(cupy, budget.working_bytes)
+    primary_device = budget.device_ids[0]
+    with cupy.cuda.Device(primary_device):
+        speedup = _measured_single_precision_speedup(cupy, widest_block)
+    single_precision = speedup >= _SINGLE_PRECISION_MINIMUM_SPEEDUP
+    log(
+        f"  Stage 1 on {len(budget.device_ids)} CUDA device(s): fp32 Cholesky {speedup:.1f}x faster than fp64, "
+        f"factoring in {'fp32 with fp64 refinement' if single_precision else 'fp64'}"
+    )
+    unbound_devices: queue.SimpleQueue[int] = queue.SimpleQueue()
+    for device_id in budget.device_ids:
+        unbound_devices.put(device_id)
+
+    def bind_worker_to_device() -> None:
+        cupy.cuda.Device(unbound_devices.get()).use()
+
+    with ThreadPoolExecutor(max_workers=len(budget.device_ids), initializer=bind_worker_to_device) as executor:
+        yield _CudaBackend(cupy, primary_device, budget.working_bytes, executor, single_precision)
 
 
 def _variant_chunks(backend: _ArrayBackend, ranges: Sequence[slice], grid_size: int) -> list[slice]:
-    """Pieces of ``ranges`` whose (variants x grid) objective temporaries fit the backend's share."""
-    chunk_size = max(backend.objective_bytes // (8 * _OBJECTIVE_TEMPORARIES * grid_size), 1)
+    """Pieces of ``ranges`` whose (variants x grid) objective temporaries fit the backend's
+    share, and at least a few per worker."""
+    variant_count = sum(span.stop - span.start for span in ranges)
+    memory_chunk = backend.objective_bytes // (8 * _OBJECTIVE_TEMPORARIES * grid_size)
+    balanced_chunk = -(-variant_count // (_OBJECTIVE_CHUNKS_PER_WORKER * backend.chunk_workers))
+    chunk_size = max(min(memory_chunk, balanced_chunk), 1)
     return [
         slice(start, min(start + chunk_size, span.stop))
         for span in ranges
@@ -873,11 +991,11 @@ class _ExpectationPropagationScheme:
         grid = _log_local_scale_grid(shape_a, shape_b)
         class_count = shape_b.shape[0]
         xp = backend.xp
-        class_log_prior_mass = backend.to_device(grid.class_log_prior_mass)
-        local_scale = backend.to_device(grid.local_scale)
-        log_one_plus = backend.to_device(grid.log_one_plus_local_scale)
 
         def chunk_sums(variants: slice) -> tuple[float, F64Array, F64Array, F64Array]:
+            class_log_prior_mass = backend.to_device(grid.class_log_prior_mass)
+            local_scale = backend.to_device(grid.local_scale)
+            log_one_plus = backend.to_device(grid.log_one_plus_local_scale)
             chunk_class = xp.asarray(class_index[variants])
             log_normalizer, weight, _component_variance, _relative_precision = _tilted_weights(
                 backend.to_device(sites.cavity_precision[variants]),
@@ -896,7 +1014,7 @@ class _ExpectationPropagationScheme:
                 np.bincount(class_index[variants], minlength=class_count).astype(np.float64),
             )
 
-        sums = backend.map(chunk_sums, chunks)
+        sums = backend.map_chunks(chunk_sums, chunks)
         value = float(sum(chunk[0] for chunk in sums))
         posterior_mean_sum = np.sum([chunk[1] for chunk in sums], axis=0)
         posterior_spread_sum = np.sum([chunk[2] for chunk in sums], axis=0)
@@ -1192,11 +1310,12 @@ def _update_scale_model(
 ) -> None:
     """Maximize Σ_j f_j(level + o_j + d_jᵀθ) + log N(θ; θ₀, diag(1/P)) over (level, θ), j in ``ranges``."""
     feature_count = hypermodel.annotation_design.shape[1]
-    grid = _device_grid(backend, hypermodel, model)
-    chunks = _variant_chunks(backend, ranges, int(grid.local_scale.shape[0]))
+    grid_size = _log_local_scale_grid(hypermodel.shape_a, model.shape_b).local_scale.shape[0]
+    chunks = _variant_chunks(backend, ranges, grid_size)
     xp = backend.xp
 
     def chunk_terms(parameters: F64Array, variants: slice) -> tuple[float, F64Array, F64Array]:
+        grid = _device_grid(backend, hypermodel, model)
         log_prior_variance = backend.to_device(hypermodel.log_prior_variance(parameters[0], parameters[1:], variants))
         chunk_value, first, second = scheme.scale_objective(
             backend, model.local, variants, log_prior_variance, xp.asarray(hypermodel.variant_class_index[variants]), grid
@@ -1212,7 +1331,7 @@ def _update_scale_model(
         return chunk_value, backend.to_host(gradient), backend.to_host(hessian)
 
     def evaluate(parameters: F64Array) -> tuple[float, F64Array, F64Array]:
-        terms = backend.map(lambda variants: chunk_terms(parameters, variants), chunks)
+        terms = backend.map_chunks(lambda variants: chunk_terms(parameters, variants), chunks)
         value = float(sum(term[0] for term in terms))
         gradient = np.sum([term[1] for term in terms], axis=0)
         hessian = np.sum([term[2] for term in terms], axis=0)
@@ -1417,12 +1536,13 @@ def _update_model_block(
     correlation_block: NDArrayLike,
     variants: slice,
     until_converged: bool,
-) -> tuple[float, bool]:
+) -> tuple[float, bool, int]:
     """Run one model's local iterations on one block.
 
     Either exactly _LOCAL_ITERATIONS_PER_PASS of them (a pass of the EM map) or,
     with ``until_converged``, until the block posterior settles. Returns the
-    squared change of the posterior mean and whether the block settled.
+    squared change of the posterior mean, whether the block settled, and the
+    iterations run.
     """
     statistics = model.statistics
     block_prior = _block_prior(backend, model, hypermodel, grid, variants)
@@ -1433,7 +1553,9 @@ def _update_model_block(
     previous_variance = backend.to_device(model.posterior_variance[variants])
     settled = False
     iteration_limit = _MAXIMUM_LOCAL_ITERATIONS if until_converged else _LOCAL_ITERATIONS_PER_PASS
+    iterations = 0
     for _local_iteration in range(iteration_limit):
+        iterations += 1
         diagonal_precision, linear_shift = scheme.solve_terms(backend, block_state, block_prior)
         mean, variance = backend.block_posterior(
             correlation_block, likelihood_scale, diagonal_precision, base_linear_term + linear_shift
@@ -1452,7 +1574,7 @@ def _update_model_block(
     squared_mean_change = float(np.sum(np.square(host_mean - model.posterior_mean[variants])))
     model.posterior_mean[variants] = host_mean
     model.posterior_variance[variants] = backend.to_host(variance)
-    return squared_mean_change, settled
+    return squared_mean_change, settled, iterations
 
 
 def _hyperparameter_blocks(boundaries: I64Array, class_index: I64Array, class_count: int) -> I64Array:
@@ -1573,19 +1695,29 @@ def _fit_models(
     subset_ranges = _block_ranges(boundaries, subset_blocks)
     remaining_blocks = np.setdiff1d(np.arange(boundaries.shape[0] - 1), subset_blocks)
 
-    def run_blocks(block_indices: I64Array, fitted: list[_ModelState], until_converged: bool) -> list[list[tuple[float, bool]]]:
-        grids = [_device_grid(backend, hypermodel, model) for model in fitted]
-
-        def block_results(block_index: int) -> list[tuple[float, bool]]:
-            # Blocks write disjoint variant ranges of every model's state.
+    def run_blocks(
+        block_indices: I64Array, fitted: list[_ModelState], until_converged: bool
+    ) -> list[list[tuple[float, bool, int]]]:
+        def block_results(block_index: int) -> list[tuple[float, bool, int]]:
+            # Blocks write disjoint variant ranges of every model's state, and
+            # each creates its device arrays on the device it runs on.
             correlation_block = backend.to_device(ld_blocks.correlation_block(block_index))
             variants = slice(int(boundaries[block_index]), int(boundaries[block_index + 1]))
             return [
-                _update_model_block(scheme, backend, model, hypermodel, grid, correlation_block, variants, until_converged)
-                for model, grid in zip(fitted, grids, strict=True)
+                _update_model_block(
+                    scheme,
+                    backend,
+                    model,
+                    hypermodel,
+                    _device_grid(backend, hypermodel, model),
+                    correlation_block,
+                    variants,
+                    until_converged,
+                )
+                for model in fitted
             ]
 
-        return backend.map(block_results, [int(block_index) for block_index in block_indices])
+        return backend.map_blocks(block_results, [int(block_index) for block_index in block_indices])
 
     for pass_index in range(_MAXIMUM_PASSES):
         active = [model for model in models if not model.converged]
@@ -1632,9 +1764,10 @@ def _fit_models(
         results = run_blocks(remaining_blocks, models, until_converged=True)
         for position, model in enumerate(models):
             model.converged = model.converged and all(block[position][1] for block in results)
+        iterations = np.array([result[2] for block in results for result in block])
         log(
             f"  Stage 1 fixed-hyperparameter pass over {remaining_blocks.shape[0]} blocks: {len(models)} models, "
-            f"{time.perf_counter() - pass_start:.1f}s"
+            f"{time.perf_counter() - pass_start:.1f}s, local iterations median {np.median(iterations):.0f} max {iterations.max()}"
         )
     return [
         LDSpaceFit(
