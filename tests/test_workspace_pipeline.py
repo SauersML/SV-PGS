@@ -562,10 +562,11 @@ LAUNCHER = Path(__file__).resolve().parents[1] / "launcher" / "workspace"
 
 
 def _filled(text: str) -> str:
-    """A template with its numeric placeholders set to 1 and every other placeholder to a name."""
-    for name in ("FOLD_SEED", "MAX_RETRIES", "GPU_COUNT"):
-        text = text.replace("${" + name + "}", "1")
-    return re.sub(r"\$\{[A-Z_]+\}", "placeholder", text)
+    """A template with its numeric placeholders set to 1, the two half labels to A and B, and every other
+    placeholder to its own name in lower case."""
+    for name, value in (("FOLD_SEED", "1"), ("MAX_RETRIES", "1"), ("GPU_COUNT", "1"), ("HALF_A_LABEL", "A"), ("HALF_B_LABEL", "B")):
+        text = text.replace("${" + name + "}", value)
+    return re.sub(r"\$\{([A-Z_]+)\}", lambda match: match.group(1).lower(), text)
 
 
 def test_the_launcher_templates_parse_and_name_the_preregistered_panel() -> None:
@@ -579,4 +580,5 @@ def test_the_launcher_templates_parse_and_name_the_preregistered_panel() -> None
 
 def test_the_launcher_sends_nothing_outside_the_workspace() -> None:
     text = "\n".join(path.read_text().lower() for path in LAUNCHER.iterdir() if path.name != "README.md")
-    assert not re.search(r"https?://|curl|wget|webhook|notif|mail|slack|pubsub|scp |rsync", text)
+    # The service account's "email" key names an identity inside the workspace; it sends nothing.
+    assert not re.search(r"https?://|curl|wget|webhook|notif|sendmail|smtp|\bmail\b|slack|pubsub|scp |rsync", text)
