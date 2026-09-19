@@ -92,6 +92,31 @@ def test_folds_keep_components_whole_and_balance_each_stratum() -> None:
         assert counts.max() - counts.min() <= largest
 
 
+def test_folds_follow_sample_identities_not_the_order_they_are_listed_in() -> None:
+    rng = np.random.default_rng(13)
+    samples = [f"S{index:03d}" for index in range(200)]
+    strata = dict(zip(samples, np.array(["imputed|eur", "long_read|afr"])[rng.integers(0, 2, 200)], strict=True))
+    first_ids = [samples[index] for index in range(0, 60, 3)]
+    second_ids = [samples[index + 1] for index in range(0, 60, 3)]
+    for first, second in zip(first_ids, second_ids, strict=True):
+        strata[second] = strata[first]
+
+    def folds_by_id(order: list[str]) -> dict[str, int]:
+        pair_order = rng.permutation(len(first_ids))
+        components = kinship_components(
+            order,
+            [first_ids[index] for index in pair_order],
+            [second_ids[index] for index in pair_order],
+            [0.25] * len(first_ids),
+        )
+        folds = kinship_folds(components, [strata[sample] for sample in order], fold_count=5, seed=3)
+        return dict(zip(order, folds.tolist(), strict=True))
+
+    listed = folds_by_id(samples)
+    for _ in range(3):
+        assert folds_by_id(list(rng.permutation(samples))) == listed
+
+
 def test_fold_assignment_is_reproducible_from_its_seed() -> None:
     components = np.arange(50, dtype=np.int64)
     strata = ["one"] * 50
@@ -154,3 +179,4 @@ def test_build_cohort_rejects_collinear_covariates_and_missing_values() -> None:
         build_cohort(
             research_ids, person_covariates={"age": ages}, **{**common, "trait_targets": {"ldl": {"R0": np.nan}}}
         )
+

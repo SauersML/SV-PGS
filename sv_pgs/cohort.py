@@ -76,6 +76,9 @@ def kinship_components(
     """A component label per sample: connected components of the pairs above second degree.
 
     Pairs naming a sample outside ``sample_ids`` are ignored; they cannot link two samples.
+    Components are numbered in the order of their smallest sample ID, so the labels, and
+    the folds kinship_folds seeds from them, depend on who the samples are, not on the
+    order they are listed in.
     """
     index_of = {sample_id: index for index, sample_id in enumerate(sample_ids)}
     if len(index_of) != len(sample_ids):
@@ -93,7 +96,15 @@ def kinship_components(
             first_root, second_root = root(index_of[first]), root(index_of[second])
             parent[max(first_root, second_root)] = min(first_root, second_root)
     roots = np.array([root(index) for index in range(len(sample_ids))], dtype=np.int64)
-    return np.unique(roots, return_inverse=True)[1].astype(np.int64)
+    smallest_member: dict[int, str] = {}
+    for sample_id, component_root in zip(sample_ids, roots.tolist(), strict=True):
+        if component_root not in smallest_member or sample_id < smallest_member[component_root]:
+            smallest_member[component_root] = sample_id
+    label_of_root = {
+        component_root: label
+        for label, component_root in enumerate(sorted(smallest_member, key=smallest_member.__getitem__))
+    }
+    return np.array([label_of_root[component_root] for component_root in roots.tolist()], dtype=np.int64)
 
 
 def kinship_folds(components: I64Array, strata: Sequence[str], fold_count: int, seed: int) -> I64Array:
