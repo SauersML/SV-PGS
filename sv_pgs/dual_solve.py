@@ -1044,16 +1044,17 @@ class DualGaussian:
         return DualCertificate(certificate, target, np.array([resolved[model].size for model in range(self.model_count)]), iterations, restarts)
 
     def _warm_start(self, stacked: Any, order: list, designs: dict, resolved: dict) -> Any:
-        """The previous iterate's solution, column by column: every model's mean dual and probes, and each
-        Z_L column whose variant was resolved before too (sites move a little between iterates, and the
-        resolved sets with them, so matching by variant keeps most of the previous work)."""
+        """The previous iterate's solution for the columns whose right-hand side does not move: the probes,
+        and each Z_L column whose variant was resolved before too (matched by variant, since the resolved
+        sets move with the sites). The mean columns start from zero: their right-hand side moves with the
+        prior mean, and from the previous solution they took 5 CG iterations against 3 from zero after a
+        10% site move (n = 30,000 x 484k, 12 models), where the Z_L columns warm-started finished early."""
         array_module = self.array_module
         start = array_module.zeros_like(stacked)
         if self._duals is None:
             return start
         previous = self._duals
         previous_layout = self._layout
-        start[:, : self.model_count] = previous[:, : self.model_count]
         start[:, -int(self.probes.shape[1]) :] = previous[:, -int(self.probes.shape[1]) :]
         offset = self.model_count
         for model in order:
