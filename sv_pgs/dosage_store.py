@@ -996,12 +996,17 @@ def _read_variant_table(root: Path, manifest: Mapping[str, Any], half_indices: S
 
 
 def _ensure_open_file_capacity(required_descriptors: int) -> None:
-    """Raise the soft open-file limit to ``required_descriptors`` if it is lower."""
+    """Raise the soft open-file limit to the hard limit when it is below ``required_descriptors``.
+
+    The soft limit only guards against leaks. Raising it to exactly the store's count would
+    leave no descriptor for anything the process opens later (a CUDA context, another store,
+    a log file).
+    """
     soft_limit, hard_limit = resource.getrlimit(resource.RLIMIT_NOFILE)
     if soft_limit != resource.RLIM_INFINITY and soft_limit < required_descriptors:
         if hard_limit != resource.RLIM_INFINITY and hard_limit < required_descriptors:
             raise RuntimeError(f"the store needs {required_descriptors} open files but the hard limit is {hard_limit}.")
-        resource.setrlimit(resource.RLIMIT_NOFILE, (required_descriptors, hard_limit))
+        resource.setrlimit(resource.RLIMIT_NOFILE, (hard_limit, hard_limit))
 
 
 @dataclass(frozen=True, slots=True)

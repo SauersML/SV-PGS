@@ -1,6 +1,7 @@
 from fractions import Fraction
 import json
 import os
+import resource
 from pathlib import Path
 import signal
 import time
@@ -327,6 +328,20 @@ def test_transcoding_copies_the_whole_store_with_zero_copy_raw_halves(two_half_s
         view = first_half.read_codes(3, 90)
         assert not view.flags.owndata
         assert np.array_equal(view, expected_codes[3:90, : first_half.n_samples])
+
+
+def test_opening_a_store_raises_the_soft_file_limit_to_the_hard_limit(
+    two_half_store: tuple[Path, list[dict[str, np.ndarray]]], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # A soft limit below the store's descriptors is raised to the hard limit, never to the
+    # store's exact count, so later opens (a CUDA context, another store) still have room.
+    root, _ = two_half_store
+    requested: list[tuple[int, int]] = []
+    monkeypatch.setattr(resource, "getrlimit", lambda _kind: (8, 4096))
+    monkeypatch.setattr(resource, "setrlimit", lambda _kind, limits: requested.append(limits))
+    with DosageStore.open(root):
+        pass
+    assert requested == [(4096, 4096)]
 
 
 def test_a_store_without_a_sample_manifest_says_so(two_half_store: tuple[Path, list[dict[str, np.ndarray]]]) -> None:
