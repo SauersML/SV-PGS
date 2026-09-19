@@ -150,7 +150,8 @@ def main() -> None:
         input_region, output_region = chunk[2], chunk[3]
         stem = work / "refbin" / "ref"
         stem.parent.mkdir(exist_ok=True)
-        start, end = output_region.split(":")[1].split("-")
+        # GLIMPSE2_split_reference names each binary after the chunk's input (buffered) region.
+        start, end = input_region.split(":")[1].split("-")
         binary = Path(f"{stem}_{args.chrom}_{start}_{end}.bin")
         if not binary.exists():
             run([str(tools / "GLIMPSE2_split_reference_static"), "--reference", str(reference), "--map", str(gmap),
