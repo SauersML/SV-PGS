@@ -104,11 +104,11 @@ This note derives the mathematics of the continuous mixing density g in MODEL.md
 | log-normal (σ_t = 1.2) | −1.88 / −1.94 / −1.96 / −1.96; ≤ 2.1e-4 | (−5.38, −1.42) … (−5.41, −1.52); ≤ 2.3e-4 | see below |
 | bimodal (80% at 1e-7, 20% at 2e-3) | 0.03 / −0.04 / −0.05 / −0.05; ≤ 4.4e-4 | (−0.82, −7.97) … (−0.84, −7.97); ≤ 3.7e-4 | −0.47 / −0.47 / −0.47 / −0.46 (capped scan); ≤ 7.5e-5 |
 
-- **D3 on the log-normal truth** (the fitted log-normal has σ = 0.83 in t):
-  - Q3 rejects h ≥ 0.4 for this narrow density. At those spacings the capped scan's interior values exceed V(∞) by 0.45–2.2 nats, which is quadrature error.
+- **D3 on the log-normal truth** (the fitted log-normal has σ = 0.83 in t; capped scan):
+  - At h = 0.8 and 0.4 the interior V exceeds V(∞) by 2.2 and 0.45 nats, and the excess vanishes as h shrinks. That is consistent with quadrature error for this narrow density. The Q3 certificate was not evaluated in these runs.
   - At h = 0.2 the evidence selects λ = ∞: V(∞) = 217.710 against 217.709 in the interior.
-  - At h = 0.1 the uncapped scan finds λ̂ = e^{3.8} with V = 218.12, 0.41 nats above V(∞), and the prediction change is 0.6%.
-  - For a log-normal truth the evidence is therefore flat between e^{3.8} and ∞: λ is weakly identified there, and the choice moves predictions by ≤ 0.6%.
+  - **At h = 0.1 my harness is not reliable for this truth.** The uncapped and capped searches disagree: V = 218.12 at λ = e^{3.8}, and V = 226.36 at λ = e^{6.9}, against V(∞) = 217.71. Predictions still moved by only 9e-4 from h = 0.2.
+  - Reading: on a log-normal truth D3's λ is weakly identified between about e³ and ∞. Across h the choice moved predictions by ≤ 0.8%. The h = 0.1 evidence values need a better-conditioned implementation before they can be trusted.
 - **Numerical limit.** Direct fits at λ ≳ e¹⁵ lose all precision, because the condition number of λh⁻⁵P exceeds double precision. One scan at h = 0.1 returned V = 2842 against ≈ 317. So the λ scan is capped at λ‖P‖ ≤ 10¹², and λ = ∞ is evaluated in closed form (§5) instead.
 - **The one reported non-invariance was the evidence form.** prior's D3 on 1k BayesR variants had λ̂ collapse to e^−18.4 at h = 0.125. That came from the flat-prior integrated evidence, whose level grows with K (3449.8 → 3485.3). Under the profiled form, prior measured log λ̂ 3.55 / 2.04 / 1.03 / 0.70 at h = 0.5 / 0.25 / 0.125 / 0.1, with V converging (3448.96 → 3449.99) and predictions within 0.46%.
 
