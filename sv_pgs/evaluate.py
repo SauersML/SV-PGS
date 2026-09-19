@@ -26,19 +26,11 @@ from typing import Literal, Sequence
 import numpy as np
 
 from sv_pgs._typing import NDArray
-from sv_pgs.all_of_us import resolve_disease_definition
+from sv_pgs.all_of_us import _require_env, resolve_disease_definition
 from sv_pgs.aou_runner import local_ancestry_predictions_path
 from sv_pgs.progress import log
 
 EvaluationPurpose = Literal["genetic_only", "full_model"]
-
-
-def _get_cdr_dataset() -> str:
-    import os
-    dataset = os.environ.get("WORKSPACE_CDR", "")
-    if not dataset:
-        raise RuntimeError("WORKSPACE_CDR environment variable required for survey query")
-    return dataset
 
 
 def _build_survey_hypertension_sql(dataset: str) -> str:
@@ -77,51 +69,38 @@ LIMIT 30
 
 
 def _fetch_survey_self_report(disease: str) -> set[str]:
+    """Person ids who self-reported ``disease`` in the AoU survey.
+
+    Only hypertension has a survey mapping; every other disease returns an
+    empty set and Test 2 reports that it did not run. For hypertension a
+    missing or malformed WORKSPACE_CDR, a failed query, or a query that
+    matches nobody raises: a survey test that silently finds no one would
+    read as "no survey signal".
+    """
     if disease != "hypertension":
         log(f"  survey validation not yet implemented for disease: {disease}")
         return set()
-    try:
-        from google.cloud import bigquery
-    except ImportError:
-        log("  google-cloud-bigquery not available — skipping survey validation")
-        return set()
-    try:
-        dataset = _get_cdr_dataset()
-    except RuntimeError as exc:
-        log(f"  {exc}")
-        return set()
+    from google.cloud import bigquery
 
+    dataset = _require_env("WORKSPACE_CDR")
     client = bigquery.Client()
-
-    # First try the main query
-    sql = _build_survey_hypertension_sql(dataset)
     log("  querying BigQuery for survey self-reported hypertension...")
-    try:
-        rows = client.query(sql).result()
-        positive_ids = {str(row.person_id) for row in rows}
-        if positive_ids:
-            log(f"  {len(positive_ids):,} people self-reported hypertension in survey")
-            return positive_ids
-        log("  main query returned 0 — running diagnostic query to discover table schema...")
-    except Exception as exc:
-        log(f"  main query failed: {exc} — running diagnostic...")
-
-    # Diagnostic: show what blood-pressure-related data actually exists
-    try:
-        diag_sql = _build_survey_diagnostic_sql(dataset)
-        diag_rows = list(client.query(diag_sql).result())
-        if diag_rows:
-            log(f"  found {len(diag_rows)} blood-pressure-related row patterns in ds_survey:")
-            for row in diag_rows[:15]:
-                log(f"    survey={row.survey}  q_id={row.question_concept_id}  "
-                    f"q={row.question_prefix!r}  a_id={row.answer_concept_id}  "
-                    f"a={row.answer!r}  n={row.n_people:,}")
-        else:
-            log("  diagnostic also returned 0 — ds_survey may not contain blood pressure data")
-    except Exception as exc:
-        log(f"  diagnostic query failed: {exc}")
-
-    return set()
+    rows = client.query(_build_survey_hypertension_sql(dataset)).result()
+    positive_ids = {str(row.person_id) for row in rows}
+    if positive_ids:
+        log(f"  {len(positive_ids):,} people self-reported hypertension in survey")
+        return positive_ids
+    # Show which blood-pressure rows ds_survey does hold, then fail.
+    diagnostic_rows = list(client.query(_build_survey_diagnostic_sql(dataset)).result())
+    log(f"  found {len(diagnostic_rows)} blood-pressure-related row patterns in ds_survey:")
+    for row in diagnostic_rows[:15]:
+        log(f"    survey={row.survey}  q_id={row.question_concept_id}  "
+            f"q={row.question_prefix!r}  a_id={row.answer_concept_id}  "
+            f"a={row.answer!r}  n={row.n_people:,}")
+    raise RuntimeError(
+        "survey self-report query matched no participants in "
+        f"{dataset}.ds_survey; the row patterns it does hold are logged above"
+    )
 
 
 def _load_ancestry_labels(ancestry_path: Path) -> dict[str, str]:
