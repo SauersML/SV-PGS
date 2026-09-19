@@ -281,7 +281,7 @@ If condition 2 fails, the rule converges to where no ascent along ∇G exists. T
 | 3 | 2.81837e-11 | 2.80124e-11 | 2.81830e-11 |
 
 - δ_B equals the true gap to 4–6 digits, while δ_A is 1% off, inside the predicted interval.
-- In this well-conditioned case A ≈ B. At production rates, where λ_min(A⁻¹B) ≈ 0.01, the same bound allows δ_A to be off by 100×.
+- In this well-conditioned case A ≈ B. If production rates were as slow as λ_min(A⁻¹B) ≈ 0.01 (MODEL's exact-EM rate 1 − edf/p [sim-only]; the production outer rate is unmeasured), the same bound would allow δ_A to be off by 100×.
 
 ### 3.2 Gradient error at incomplete EP convergence
 - **The error.** Let s be the sites after the last sweep and s* the fixed point at x. Then s − s* ≈ −(I − J)⁻¹(T(s) − s), and the fixed-cavity gradient is off by

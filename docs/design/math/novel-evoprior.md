@@ -12,7 +12,7 @@
 - identifiability;
 - the forward-simulation checks.
 
-Prototype code: `scratchpad/team/novel-evoprior/proto/`.
+Prototype code: kept with the novel-evoprior lane, not in the repo; its fit/score entry point is submitted to the benchmarks.
 
 ## 1. Model
 
