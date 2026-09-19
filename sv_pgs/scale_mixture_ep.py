@@ -1169,7 +1169,8 @@ def _laplace_corrections(
     eigenvalues, eigenvectors = np.linalg.eigh(0.5 * (schur + schur.T))
     # -H passed its Cholesky test, so the Schur complement is positive definite; an eigenvalue below eps times the
     # largest is rounding, raised to that floor as in ``_ascent_direction``.
-    eigenvalues = np.maximum(eigenvalues, _EPSILON * float(np.max(np.abs(eigenvalues))))
+    if eigenvalues.size:
+        eigenvalues = np.maximum(eigenvalues, _EPSILON * float(np.max(np.abs(eigenvalues))))
     directions = moved @ eigenvectors / np.sqrt(eigenvalues)[None, :]
     third, fourth = _directional_derivatives(prior, evidence.coefficients, cavity, directions, working_bytes)
     terms = fourth / 8.0 + 5.0 * third**2 / 24.0
