@@ -49,6 +49,12 @@ One consolidated spec. It replaces the numbered addenda A4 through A4.15. Code: 
   - Nesting (the record's core inside the allele's) is its own feature per class: the sum of weights.
   - Every other allele adds weight × B_m(log(1 + gap)) per class, with the gap in bases between the cores and B_m cubic B-splines uniform in log(1 + gap) over [0, log(1 + the chromosome's extent)], once plain and once times log length.
   - The knot spacing starts at one per octave and is halved until the fit's evidence stops changing; the smoothness is learned, and the fit centres the raw sums (docs/design/math/scale_model.md).
+  - Storage plan (not yet written by the converter):
+    - features are kept at the finest spacing the fit will use, since coarser uniform B-splines on a dyadic grid are exact combinations of finer ones;
+    - each feature is quantized to the store's 1/254 step with its own scale, which is within the prior's tolerance because features enter log u linearly;
+    - near bases are sparse;
+    - a class-specific block is kept where n · Var(feature) · τ̂² clears the certificate tolerance (τ̂² from hyperprior_pooling), and the class-summed block otherwise.
+  - Pairs are exact, about 2e10 on chr1. The derived far-basis binning width b/d ≤ (8/3)·(1/254)·h is barely cheaper.
 - **Per-half sums:** sum_code, sum_code2 and no_calls. They give AF, variance and rsq_ds.
 
 ## Loci `loci/chrK`
