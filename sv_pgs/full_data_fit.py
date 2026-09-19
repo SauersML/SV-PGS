@@ -125,7 +125,8 @@ class FitCertificate:
       block's relative error in tr(D - Sigma), and the approximation scale it is tested against;
     - ``negative_sites``: sites with negative precision (allowed; EP is unclipped);
     - ``effective_effects``: p_eff = p - sum_j tau_j z_j;
-    - ``outer_iterations`` and ``halvings``: accepted Newton-B steps and the trials the monotonicity test refused;
+    - ``outer_iterations``, ``halvings`` and ``unresolved``: accepted outer steps, refused trials, and those refused for
+      having no EP fixed point;
       ``refreshes`` and ``passes``: certified variance refreshes and mean solves over the whole fit.
     """
 
@@ -144,6 +145,7 @@ class FitCertificate:
     effective_effects: F64Array
     outer_iterations: I64Array
     halvings: I64Array
+    unresolved: I64Array
     refreshes: int
     passes: int
 
@@ -387,6 +389,7 @@ def fit_full_data(
             effective_effects=fixed_points.effective,
             outer_iterations=np.array([fit.iterations for fit in fits], dtype=np.int64),
             halvings=np.array([fit.halvings for fit in fits], dtype=np.int64),
+            unresolved=np.array([fit.unresolved for fit in fits], dtype=np.int64),
             refreshes=fixed_points.refreshes,
             passes=fixed_points.passes,
         ),

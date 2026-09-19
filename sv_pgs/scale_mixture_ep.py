@@ -1903,7 +1903,9 @@ class OuterFit:
 
     ``remaining_gain`` is what the last check still found, in nats: ``newton_decrement``, 1/2 g'|B + S|^-1 g at the
     returned coefficients, plus the B-evidence gain the weights still had (``step.evidence_gain``); it is at most the
-    tolerance. ``iterations`` counts accepted Newton-B steps and ``halvings`` the trials the monotonicity test refused.
+    tolerance. ``iterations`` counts accepted steps, ``halvings`` the trials refused (by the test, or for having no EP
+    fixed point), and ``unresolved`` those of them that had no EP fixed point at all, so a loop that keeps refusing
+    near its answer is visible in the certificate.
     """
 
     hyperparameters: MixtureHyperparameters
@@ -1912,6 +1914,7 @@ class OuterFit:
     remaining_gain: float
     iterations: int
     halvings: int
+    unresolved: int
 
 
 @dataclass(frozen=True)
@@ -2018,7 +2021,7 @@ def fit_hyperparameters(
     fits: list[OuterFit | None] = [None] * count
     pending: list[tuple[_NewtonB, HyperStep | None, F64Array, float] | None] = [None] * count
     radii: list[float | None] = [None] * count
-    iterations, halvings = [0] * count, [0] * count
+    iterations, halvings, unresolved = [0] * count, [0] * count, [0] * count
     while True:
         for model in range(count):
             if fits[model] is not None or pending[model] is not None:
@@ -2036,7 +2039,7 @@ def fit_hyperparameters(
             if step is not None and remaining <= tolerance:
                 fits[model] = OuterFit(
                     hyperparameters=hyperparameters[model], step=step, newton_decrement=newton.decrement, remaining_gain=remaining,
-                    iterations=iterations[model], halvings=halvings[model],
+                    iterations=iterations[model], halvings=halvings[model], unresolved=unresolved[model],
                 )
                 continue
             radius = radii[model]
@@ -2057,8 +2060,9 @@ def fit_hyperparameters(
             newton, step, proposal, radius = entry
             trial_point = trial_points[model]
             if trial_point is None:
-                # No EP fixed point at the trial: refused, like a trial the test rejects.
+                # No EP fixed point at the trial: refused, like a trial the test rejects, and counted.
                 accepted = False
+                unresolved[model] += 1
             else:
                 gradient = _penalized_gradient(
                     newton.view, newton.log_smoothing[np.isfinite(newton.log_smoothing)], newton.origin + proposal, trial_point.cavity, working_bytes,
