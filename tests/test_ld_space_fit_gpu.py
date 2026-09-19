@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
+
 import numpy as np
 import pytest
 
@@ -13,6 +15,40 @@ cp = pytest.importorskip("cupy")
 if cp.cuda.runtime.getDeviceCount() == 0:
     pytest.skip("CUDA device not available", allow_module_level=True)
 
+EXECUTOR = ThreadPoolExecutor(max_workers=1)
+
+
+def _cuda_backend(single_precision: bool) -> ld_space_fit._CudaBackend:
+    return ld_space_fit._CudaBackend(cp, 0, detect_compute_budget().working_bytes, EXECUTOR, single_precision)
+
+
+def _hard_block(rng: np.random.Generator):
+    """AR(0.97) LD with r = 0.9995 pairs, biobank-scale data precision, prior-dominated and zero sites."""
+    width = 1500
+    lags = np.abs(np.arange(width)[:, None] - np.arange(width)[None, :])
+    correlation = 0.97**lags
+    for anchor in rng.choice(width - 1, 20, replace=False):
+        correlation[anchor, anchor + 1] = correlation[anchor + 1, anchor] = 0.9995
+    eigenvalues, vectors = np.linalg.eigh(correlation)
+    correlation = (vectors * np.maximum(eigenvalues, 1e-6)) @ vectors.T
+    correlation = 0.5 * (correlation + correlation.T)
+    precision = rng.uniform(3e6, 3e7, size=width)
+    precision[rng.choice(width, 20, replace=False)] = 0.0
+    return correlation, 1.0e5, precision, rng.standard_normal(width) * 300.0
+
+
+def test_single_precision_block_posterior_keeps_the_cavity_precision() -> None:
+    correlation, scale, precision, linear = _hard_block(np.random.default_rng(1))
+    host_mean, host_variance = HOST.block_posterior(correlation, scale, precision, linear)
+    cuda = _cuda_backend(single_precision=True)
+    device_mean, device_variance = cuda.block_posterior(
+        cuda.to_device(correlation), scale, cuda.to_device(precision), cuda.to_device(linear)
+    )
+    mean, variance = cuda.to_host(device_mean), cuda.to_host(device_variance)
+    np.testing.assert_allclose(mean, host_mean, rtol=1e-8, atol=1e-12 * np.max(np.abs(host_mean)))
+    np.testing.assert_allclose(variance, host_variance, rtol=1e-5)
+    np.testing.assert_allclose(1.0 / variance - precision, 1.0 / host_variance - precision, rtol=1e-4)
+
 
 def test_cuda_block_posterior_matches_lapack() -> None:
     rng = np.random.default_rng(0)
@@ -23,7 +59,7 @@ def test_cuda_block_posterior_matches_lapack() -> None:
     precision = rng.uniform(1.0, 1e5, size=width)
     linear = rng.standard_normal(width)
     host_mean, host_variance = HOST.block_posterior(correlation, 1500.0, precision, linear)
-    cuda = ld_space_fit._CudaBackend(cp, detect_compute_budget().working_bytes)
+    cuda = _cuda_backend(single_precision=False)
     device_mean, device_variance = cuda.block_posterior(
         cuda.to_device(correlation), 1500.0, cuda.to_device(precision), cuda.to_device(linear)
     )
@@ -32,7 +68,7 @@ def test_cuda_block_posterior_matches_lapack() -> None:
 
 
 def test_cuda_block_posterior_raises_on_an_indefinite_system() -> None:
-    cuda = ld_space_fit._CudaBackend(cp, detect_compute_budget().working_bytes)
+    cuda = _cuda_backend(single_precision=False)
     indefinite = np.array([[1.0, 2.0], [2.0, 1.0]])
     with pytest.raises(np.linalg.LinAlgError):
         cuda.block_posterior(cuda.to_device(indefinite), 1.0, cuda.to_device(np.zeros(2)), cuda.to_device(np.ones(2)))
