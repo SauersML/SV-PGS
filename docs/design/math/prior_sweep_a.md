@@ -37,6 +37,17 @@ This note checks the effect prior of MODEL.md §3 where every posterior is exact
   - even at moderate λ the integrated evidence prefers the collapsed fit, 293.8 vs 293.0 smooth.
   - Part of that blow-up was the rounding fault of §3. With it fixed, D3 still loses there: ΔLPD −11.8 nats per 1,000 variants, against −7.0 for D1+D2.
 - **The fix is to profile the null space in the Schur form** (ruling; ep_eb.md point 3): V = F + ½ log|S|₊ − ½ log|B + S| + ½ log|Nᵀ(B + S)N|. The collapse ray then stays finite: "the whole class below resolution" becomes an ordinary candidate that competes on evidence.
+- **Under the Schur form the collapse ray does not win on evidence.**
+  - Setup: the same 100-variant TR class, D3, h = 0.125 (K = 143); V traced along log λ from 20 down to −20, from a flat and a collapsed inner start [sim-only].
+  - In the maximum's basin (log λ ≤ 10), the log-likelihood is 286.58, B + S is positive definite (min eig ≈ 2e-5), and V is flat at 286.58 over log λ ∈ [2, 10].
+  - The collapsed and saddle basins (log λ ≥ 12) end at log-likelihood 180 (collapsed start) or 255 (flat start), against a null model of 173. There B + S is indefinite (min eig −1.6e-2 to −4.2e-2), so they are not maxima, and their evidence is −∞ or ≤ 256.
+- **The inner problem is not concave when a penalty has a null space.** Newton can stop at such saddles.
+  - A fit that refit at its chosen λ from the last search point landed there: ΔLPD −999 nats per 1,000 variants.
+  - **The rules:**
+    - verify that B + S is positive definite at every inner answer, and restart from the flat density when it isn't;
+    - refit at the chosen λ from the best inner solution seen, not the last one;
+    - score an unverified λ as evidence −∞.
+  - With these, the TR class gave ΔLPD −11.73 / −11.79 / −11.78 at the base grid, ×100 range and h/2.
 - **A conditional form is not that fix.** Integrating only the penalty's range at fixed null coordinates (−½ log|Qᵀ(B + S)Q|) drove λ to its bound on the BayesR truth: ΔLPD −4.06 vs −0.71 per 1,000 variants [sim-only]. An earlier version of this note wrongly called that result "profiling".
 
 ## 3. Penalty values must be exact squares
