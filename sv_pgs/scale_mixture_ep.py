@@ -1885,11 +1885,15 @@ def hyper_step(
 
 @dataclass(frozen=True)
 class FixedPoint:
-    """A model's certified EP fixed point at a prior's hyperparameters: each variant's cavity, and q's linear
-    responses there (valid until the next fixed point is solved)."""
+    """A model's certified EP fixed point at a prior's hyperparameters: each variant's cavity, q's linear responses
+    there (valid until the next fixed point is solved), q's mean, ``precision_norm(d)`` = d' Sigma^-1 d in q's
+    posterior metric, and the effective number of effects p_eff = p - sum_j tau_j Sigma_jj."""
 
     cavity: Cavity
     posterior: GaussianPosterior
+    mean: F64Array
+    precision_norm: Callable[[F64Array], float]
+    effective_effects: float
 
 
 FixedPoints = Callable[[Sequence[MixtureHyperparameters]], Sequence["FixedPoint | None"]]
@@ -1903,15 +1907,18 @@ class OuterFit:
 
     ``remaining_gain`` is what the last check still found, in nats: ``newton_decrement``, 1/2 g'|B + S|^-1 g at the
     returned coefficients, plus the B-evidence gain the weights still had (``step.evidence_gain``); it is at most the
-    tolerance. ``iterations`` counts accepted steps, ``halvings`` the trials refused (by the test, or for having no EP
-    fixed point), and ``unresolved`` those of them that had no EP fixed point at all, so a loop that keeps refusing
-    near its answer is visible in the certificate.
+    tolerance. ``prediction_move`` is the posterior-mean move of the certifying Newton step in q's posterior metric,
+    against ``prediction_tolerance`` = p_eff / K (K = 1 / (2 tolerance) draws). ``iterations`` counts accepted steps,
+    ``halvings`` the trials refused (by the test, or for having no EP fixed point), and ``unresolved`` those of them
+    that had no EP fixed point at all, so a loop that keeps refusing near its answer is visible in the certificate.
     """
 
     hyperparameters: MixtureHyperparameters
     step: HyperStep
     newton_decrement: float
     remaining_gain: float
+    prediction_move: float
+    prediction_tolerance: float
     iterations: int
     halvings: int
     unresolved: int
@@ -2005,8 +2012,13 @@ def fit_hyperparameters(
       value, the rise is the trapezoid rule of the path integral of the gradient, (g_x + g_trial)' s / 2, exact for
       a quadratic. A refused trial halves the radius; an accepted one that reached it doubles it. The radius starts
       at the length of the step on |B + S|.
-    The loop stops when, for every model, B + S is positive definite and the Newton decrement plus the weights'
-    remaining gain is at most ``tolerance``: a saddle is never certified. B's EP-response part is solved once per
+    The loop stops when, for every model, B + S is positive definite, the Newton decrement plus the weights'
+    remaining gain is at most ``tolerance`` (a saddle is never certified), and the Newton step then moves q's mean
+    by at most p_eff / K in q's posterior metric (MODEL.md: the certificate includes the prediction change), taken
+    at the step's own EP fixed point, not on the quadratic model. With K = 1 / (2 tolerance) posterior draws that is
+    the scorer's own Monte Carlo resolution, as for the EP fixed point. Where the data barely identify a direction
+    (the profiled null space at small n) the evidence can be flat to the tolerance while predictions still move; a
+    step that fails the check is taken as an ordinary Newton trial. B's EP-response part is solved once per
     outer iterate (``curvature_correction``) and serves both the weights' evidence and the x step; where B + S has
     no certified maximum the weights wait while x steps.
 
@@ -2019,9 +2031,10 @@ def fit_hyperparameters(
     if any(point is None for point in points):
         raise FloatingPointError("a starting point has no certified EP fixed point")
     fits: list[OuterFit | None] = [None] * count
-    pending: list[tuple[_NewtonB, HyperStep | None, F64Array, float] | None] = [None] * count
+    pending: list[tuple[_NewtonB, HyperStep | None, F64Array, float, bool] | None] = [None] * count
     radii: list[float | None] = [None] * count
     iterations, halvings, unresolved = [0] * count, [0] * count, [0] * count
+    steps_taken: list[tuple[HyperStep, float] | None] = [None] * count
     while True:
         for model in range(count):
             if fits[model] is not None or pending[model] is not None:
@@ -2036,17 +2049,14 @@ def fit_hyperparameters(
             log_smoothing = hyperparameters[model].log_smoothing if step is None else step.hyperparameters.log_smoothing
             newton = _newton_b(prior, log_smoothing, hyperparameters[model].coefficients, point, correction, working_bytes)
             remaining = newton.decrement + (np.inf if step is None else step.evidence_gain)
-            if step is not None and remaining <= tolerance:
-                fits[model] = OuterFit(
-                    hyperparameters=hyperparameters[model], step=step, newton_decrement=newton.decrement, remaining_gain=remaining,
-                    iterations=iterations[model], halvings=halvings[model], unresolved=unresolved[model],
-                )
-                continue
+            certifying = step is not None and remaining <= tolerance
+            if certifying:
+                steps_taken[model] = (step, remaining)
             radius = radii[model]
             if radius is None:
                 magnitudes = np.maximum(np.abs(newton.eigenvalues), _EPSILON * float(np.max(np.abs(newton.eigenvalues))))
                 radius = float(np.linalg.norm((newton.eigenvectors.T @ newton.gradient) / magnitudes))
-            pending[model] = (newton, step, _proposal(newton, radius), radius)
+            pending[model] = (newton, step, _proposal(newton, radius), radius, certifying)
         if all(fit is not None for fit in fits):
             return [fit for fit in fits if fit is not None]
         trials = [hyperparameters[model] if entry is None else _trial(entry[0], entry[2]) for model, entry in enumerate(pending)]
@@ -2057,8 +2067,21 @@ def fit_hyperparameters(
                     raise FloatingPointError("a certified model lost its EP fixed point")
                 points[model] = trial_points[model]
                 continue
-            newton, step, proposal, radius = entry
+            newton, step, proposal, radius, certifying = entry
             trial_point = trial_points[model]
+            if trial_point is not None and certifying:
+                current = points[model]
+                move = current.precision_norm(trial_point.mean - current.mean)
+                allowed_move = 2.0 * tolerance * current.effective_effects
+                if move <= allowed_move:
+                    certified_step, remaining = steps_taken[model]
+                    fits[model] = OuterFit(
+                        hyperparameters=hyperparameters[model], step=certified_step, newton_decrement=newton.decrement, remaining_gain=remaining,
+                        prediction_move=move, prediction_tolerance=allowed_move, iterations=iterations[model], halvings=halvings[model],
+                        unresolved=unresolved[model],
+                    )
+                    pending[model] = None
+                    continue
             if trial_point is None:
                 # No EP fixed point at the trial: refused, like a trial the test rejects, and counted.
                 accepted = False
@@ -2081,9 +2104,10 @@ def fit_hyperparameters(
             halvings[model] += 1
             if length <= _HALF_PRECISION * (1.0 + float(np.max(np.abs(newton.origin)))):
                 raise FloatingPointError("the Newton-B step makes no certified progress at the EP fixed point")
+            # A shorter step no longer tests the full Newton step: it is an ordinary trial.
             if newton.definite:
-                pending[model] = (newton, step, 0.5 * proposal, radius)
+                pending[model] = (newton, step, 0.5 * proposal, radius, False)
             else:
                 radius = 0.5 * length
                 radii[model] = radius
-                pending[model] = (newton, step, _proposal(newton, radius), radius)
+                pending[model] = (newton, step, _proposal(newton, radius), radius, False)

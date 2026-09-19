@@ -36,7 +36,7 @@ The fit ends when every model's Newton-B decrement plus its weights' remaining g
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Sequence
+from typing import Callable, Sequence
 
 import numpy as np
 
@@ -127,6 +127,8 @@ class FitCertificate:
     - ``effective_effects``: p_eff = p - sum_j tau_j z_j;
     - ``outer_iterations``, ``halvings`` and ``unresolved``: accepted outer steps, refused trials, and those refused for
       having no EP fixed point;
+    - ``prediction_move``: the certifying Newton step's move of q's mean in q's posterior metric, against
+      ``prediction_tolerance`` = p_eff / K (MODEL.md: the certificate includes the prediction change);
       ``refreshes`` and ``passes``: certified variance refreshes and mean solves over the whole fit.
     """
 
@@ -145,6 +147,8 @@ class FitCertificate:
     effective_effects: F64Array
     outer_iterations: I64Array
     halvings: I64Array
+    prediction_move: F64Array
+    prediction_tolerance: F64Array
     unresolved: I64Array
     refreshes: int
     passes: int
@@ -193,6 +197,28 @@ def _posterior(gaussian: DualGaussian, model: int, grams: BlockGrams, variances:
         return solution
 
     return GaussianPosterior(solve=relative_solve, variance_jvp=lambda weights: variance_jvp(solve, grams, weights).values)
+
+
+def _precision_norm(gaussian: DualGaussian, model: int, site_precision: F64Array) -> Callable[[F64Array], float]:
+    """d -> d' A d for q's posterior precision A = X' P_W X + diag tau at the model's sites, one read of the store:
+    u = X d, and P_W = W - W C (C'WC)^-1 C' W with W the model's training rows over its noise variance."""
+    array_module = gaussian.array_module
+    weights = np.asarray(gaussian.training, dtype=np.float64)[:, model] / float(gaussian.noise_variance[model])
+    covariates = np.asarray(gaussian.covariates, dtype=np.float64)
+    normal = covariates.T @ (weights[:, None] * covariates)
+    precision = np.array(site_precision, dtype=np.float64, copy=True)
+
+    def norm(direction: F64Array) -> float:
+        values = array_module.asarray(np.asarray(direction, dtype=np.float64)[:, None])
+        image = array_module.zeros((gaussian.source.sample_count, 1))
+        for start, stop, tile in gaussian.source.blocks():
+            image += tile.matmat(values[start:stop])
+        sample = np.asarray(image, dtype=np.float64)[:, 0]
+        weighted = weights * sample
+        projected = weighted - weights * (covariates @ np.linalg.solve(normal, covariates.T @ weighted))
+        return float(sample @ projected + np.sum(precision * np.square(np.asarray(direction, dtype=np.float64))))
+
+    return norm
 
 
 class _FullDataFixedPoints:
@@ -319,7 +345,13 @@ class _FullDataFixedPoints:
             self.noise_gain = 0.25 * degrees * np.square(np.log(noise / self.noise))
             if np.all(self.mean_move <= draw_tolerance) and np.all(self.noise_gain <= tolerance):
                 return [
-                    FixedPoint(cavity=cavities[model], posterior=_posterior(gaussian, model, grams[model], variances[:, model]))
+                    FixedPoint(
+                        cavity=cavities[model],
+                        posterior=_posterior(gaussian, model, grams[model], variances[:, model]),
+                        mean=mean[:, model].copy(),
+                        precision_norm=_precision_norm(gaussian, model, self.site_precision[:, model]),
+                        effective_effects=float(self.effective[model]),
+                    )
                     for model in range(model_count)
                 ]
             self._frozen_passes(hyperparameters, frozen, target_precision, target_shift)
@@ -389,6 +421,8 @@ def fit_full_data(
             effective_effects=fixed_points.effective,
             outer_iterations=np.array([fit.iterations for fit in fits], dtype=np.int64),
             halvings=np.array([fit.halvings for fit in fits], dtype=np.int64),
+            prediction_move=np.array([fit.prediction_move for fit in fits]),
+            prediction_tolerance=np.array([fit.prediction_tolerance for fit in fits]),
             unresolved=np.array([fit.unresolved for fit in fits], dtype=np.int64),
             refreshes=fixed_points.refreshes,
             passes=fixed_points.passes,
