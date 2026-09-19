@@ -78,3 +78,9 @@ For every arm and benchmark:
 - the main sha of F and the adapter sha.
 
 Results are written to `benchmarks/ablations/` with the benchmark's evidence label.
+
+## Amendment 1 (2026-09-19, before any ablation result exists): the arm that tests t7
+- **The arm:** t7 (the A-map and D* recalibration) is tested on bench-sim's `beagle_truthhalf` measurement arm, PREREG amendment 8, lane/bench-sim-truthhalf f235eda. Its flagged 20% of each group's training samples are observed at their true genotypes, and the harness exposes this as `train.truth_half`.
+- **The 20%** is bench-sim's stated design choice, not a production quantity.
+- **Only the ablation adapter reads `train.truth_half`,** to estimate the stored-to-true map Σ_DG. F − t7 ignores it and uses the uncorrected stored columns.
+- **The t7 decision rule** is unchanged from §6, and applies to bench-sim only.
