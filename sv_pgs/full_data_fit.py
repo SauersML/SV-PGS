@@ -216,23 +216,30 @@ def marginal_variances(gaussian: FullDataGaussian) -> F64Array:
 
 def _positive_definite_refactor(
     gaussian: FullDataGaussian, site_precision: F64Array, site_shift: F64Array, noise: F64Array, tolerance: float, exact_curvature: NDArray
-) -> tuple[Any, F64Array]:
-    """Refactor the blocks at the sites and re-solve the mean, halving every negative site precision while a block
-    is not positive definite. Non-negative sites always give a positive-definite precision, so this ends; it only
-    shortens the path to the EP fixed point, which does not depend on it."""
+) -> tuple[Any, F64Array, F64Array]:
+    """Refactor the blocks at the sites, re-solve the mean and freeze the cavity precisions P = 1/z - tau.
+
+    Every negative site precision is halved while a block is not positive definite or a cavity is not proper
+    (P <= 0: next to negative sites a block's Schur correction can exceed a variant's own data information).
+    Non-negative sites always give a positive-definite precision and proper cavities, so this ends; it only
+    shortens the path to the EP fixed point, which does not depend on it. Returns the certificate, the sites
+    and P.
+    """
     precision = np.array(site_precision, dtype=np.float64, copy=True)
     while True:
         try:
             certificate = gaussian.iterate(
                 site_precision=precision, site_shift=site_shift, noise_variance=noise, tolerance=tolerance, refactor=True, exact_curvature=exact_curvature
             )
+            frozen = 1.0 / marginal_variances(gaussian) - precision
+            if np.all(frozen > 0.0):
+                return certificate, precision, frozen
         except (FloatingPointError, np.linalg.LinAlgError):
-            negative = precision < 0.0
-            if not np.any(negative):
-                raise
-            precision[negative] *= 0.5
-            continue
-        return certificate, precision
+            pass
+        negative = precision < 0.0
+        if not np.any(negative):
+            raise FloatingPointError("the full-data precision is not positive definite with non-negative sites")
+        precision[negative] *= 0.5
 
 
 def _damped_site_update(
@@ -314,8 +321,9 @@ def fit_full_data(
     while True:
         outer += 1
         tolerance = _solve_tolerance(gaussian, effective, draw_count, site_precision)
-        certificate, site_precision = _positive_definite_refactor(gaussian, site_precision, site_shift, noise, tolerance, exact_curvature)
-        frozen_precision = 1.0 / marginal_variances(gaussian) - site_precision
+        certificate, site_precision, frozen_precision = _positive_definite_refactor(
+            gaussian, site_precision, site_shift, noise, tolerance, exact_curvature
+        )
         converged, previous_move = False, np.full(model_count, np.inf)
         while True:
             marginal_variance = 1.0 / (frozen_precision + site_precision)
