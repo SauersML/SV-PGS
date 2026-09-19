@@ -248,17 +248,19 @@ def _damped_site_update(
     site_shift: F64Array,
     target_precision: F64Array,
     target_shift: F64Array,
+    damping: float,
     noise: F64Array,
     tolerance: float,
     exact_curvature: NDArray,
 ) -> tuple[Any, F64Array, F64Array]:
-    """Move the sites to their targets and re-solve the mean; halve the move while the full-data precision is
-    not positive definite (a negative site can make it indefinite, and block CG then breaks down).
+    """Move the sites the ``damping`` fraction of the way to their targets and re-solve the mean; halve the move
+    while the full-data precision is not positive definite (a negative site can make it indefinite, and block CG
+    then breaks down).
 
     Only the site step is damped: every accepted state is an exact mean for its sites, and the EP fixed point
     does not depend on the steps taken to reach it.
     """
-    fraction = 1.0
+    fraction = damping
     while True:
         precision = site_precision + fraction * (target_precision - site_precision)
         shift = site_shift + fraction * (target_shift - site_shift)
@@ -324,7 +326,7 @@ def fit_full_data(
         certificate, site_precision, frozen_precision = _positive_definite_refactor(
             gaussian, site_precision, site_shift, noise, tolerance, exact_curvature
         )
-        converged, previous_move = False, np.full(model_count, np.inf)
+        previous_move, damping = np.full(model_count, np.inf), 1.0
         while True:
             marginal_variance = 1.0 / (frozen_precision + site_precision)
             previous_mean = gaussian.mean.copy()
@@ -337,21 +339,19 @@ def fit_full_data(
                 moments = tilted_moments(prior, hyperparameters[model_index], cavity, working_bytes)
                 target_precision[:, model_index], target_shift[:, model_index] = site_targets(moments, cavity)
             certificate, site_precision, site_shift = _damped_site_update(
-                gaussian, site_precision, site_shift, target_precision, target_shift, noise, tolerance, exact_curvature
+                gaussian, site_precision, site_shift, target_precision, target_shift, damping, noise, tolerance, exact_curvature
             )
             marginal_variance = 1.0 / (frozen_precision + site_precision)
             mean_move = np.sum(np.square(gaussian.mean - previous_mean) / marginal_variance, axis=0)
             effective = prior.variant_count - np.sum(site_precision * marginal_variance, axis=0)
             if np.all(mean_move <= effective / draw_count):
-                converged = True
                 break
-            # The mean-only iteration contracts only while the frozen variances are close to q's (math-epeb);
-            # once a pass stops shrinking the move, refresh them.
-            if np.any(mean_move >= previous_move):
-                break
+            # A pass that does not shrink the move means an eigenvalue of the site map at or past -1: with
+            # rho = sqrt(move ratio) its estimate, the damping 1 / (1 + rho) sends it to zero.
+            ratio = float(np.max(mean_move / previous_move))
+            if ratio >= 1.0:
+                damping = min(damping, 1.0 / (1.0 + np.sqrt(ratio)))
             previous_move = mean_move
-        if not converged:
-            continue
         residual_sum_of_squares = gaussian.residual_sum_of_squares()
         noise = np.array([
             noise_variance(
