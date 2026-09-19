@@ -9,12 +9,15 @@ from __future__ import annotations
 
 import numpy as np
 from scipy.stats import norm
+from scipy.stats import t as student_t
 
 from sv_pgs.marginal_variances import (
     BlockGrams,
     BulkSolve,
     approximation_scale,
     block_information_certificate,
+    control_variate,
+    stage_level,
     information_products,
     information_solve_tolerance,
     block_trace_certificate,
@@ -245,7 +248,8 @@ def test_information_certificate_flags_a_cavity_error_the_trace_certificate_miss
     assert np.allclose(removed[is_bulk], (prior[:, None] * probes - covariance @ probes)[is_bulk], rtol=1e-6, atol=1e-12 * np.abs(removed).max())
     level = certificate_level(64)
     trace = block_trace_certificate(variances, blocks, probes, covariance @ probes, scale, level)
-    information = block_information_certificate(solve, variances, blocks, probes, removed, scale, level)
+    grams = _grams(columns, blocks)
+    information = block_information_certificate(solve, variances, blocks, probes, removed, scale, level, control_variate(solve, grams, probes))
     assert not trace.violated.any()
     assert information.violated.tolist() == [False, False, False, True, False, False]
 
@@ -308,3 +312,33 @@ def test_certificate_intervals_cover_at_their_level_and_probes_to_decide_decides
     probes = generator.choice([-1.0, 1.0], size=(variant_count, needed))
     decided = block_trace_certificate(exact, blocks, probes, covariance @ probes, tolerance, level)
     assert decided.certified.all()
+
+
+def test_control_variate_leaves_the_information_estimate_unbiased_and_shrinks_its_spread():
+    generator = np.random.default_rng(16)
+    sample_count, variant_count = 1500, 600
+    columns = _genotypes(generator, sample_count, variant_count, 0.97)
+    precision = variant_count / 1e-2 * np.exp(generator.normal(0.0, 1.0, variant_count))
+    blocks = tuple(np.arange(start, start + 100) for start in range(0, variant_count, 100))
+    solve = _solve(columns, precision, _resolved(1.0 / precision, sample_count))
+    grams = _grams(columns, blocks)
+    covariance = np.linalg.inv(columns.T @ columns + np.diag(precision))
+    prior = 1.0 / precision
+    probes = generator.choice([-1.0, 1.0], size=(variant_count, 64))
+    removed_exact = prior[:, None] * probes - covariance @ probes
+    control = control_variate(solve, grams, probes)
+    # A two-sided family-wise interval at the certificate's own level (Student t, k - 1 degrees of freedom).
+    quantile = student_t.isf(0.5 * certificate_level(64) / len(blocks), probes.shape[1] - 1)
+    for position, members in enumerate(blocks):
+        plain = np.sum(probes[members] * removed_exact[members], axis=0)
+        controlled = control.window_information[position] + np.sum(probes[members] * (removed_exact - control.removed_products)[members], axis=0)
+        exact_information = float(np.sum(prior[members] - np.diag(covariance)[members]))
+        # Unbiased: the controlled mean sits within its own standard error scale of the exact information.
+        spread = np.std(controlled, ddof=1) / np.sqrt(probes.shape[1])
+        assert abs(np.mean(controlled) - exact_information) <= quantile * spread
+        assert np.std(controlled) < np.std(plain)
+
+
+def test_stage_levels_spend_at_most_the_level():
+    level = certificate_level(64)
+    assert sum(stage_level(level, stage) for stage in range(60)) <= level

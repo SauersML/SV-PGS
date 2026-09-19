@@ -420,6 +420,16 @@ def block_trace_certificate(
     return _certificate(estimate, per_probe, tolerance, level)
 
 
+def stage_level(level: float, stage: int) -> float:
+    """The level for stage s = 0, 1, ... of a sequential certificate with fresh probes at each stage.
+
+    Stage s spends level * 2^-(s+1), so the stages together never exceed ``level`` (Bonferroni over stages). A
+    stage re-tests only the blocks the last one left undecided. A violation at any stage is decisive, so the
+    probability of refusing a fixed point whose blocks are all within tolerance is at most ``level`` overall.
+    """
+    return level * 2.0 ** -(stage + 1)
+
+
 def probes_to_decide(certificate: BlockCertificate, probe_count: int) -> int:
     """The probe count that would decide every undecided block, if the standard errors fall as 1/sqrt(k).
 
@@ -483,6 +493,7 @@ def block_information_certificate(
     removed_products: NDArray[np.float64],
     tolerance: float,
     level: float,
+    control: ControlVariate,
 ) -> BlockCertificate:
     """Test each block's data information tr(D_b - Sigma_bb), over its bulk sites, against probes.
 
@@ -492,15 +503,60 @@ def block_information_certificate(
     a variance correct to 1e-3 can leave a cavity tens of percent off. ``block_trace_certificate`` cannot see
     that, and this certificate can.
 
-    ``removed_products`` is (D - Sigma) z on bulk sites, from ``information_products``. For Rademacher z,
-    z_b' ((D - Sigma) z)_b is an unbiased estimate of the block's information, tested as in
-    ``block_trace_certificate``: relative error, the probes' standard error, family-wise level 1/B.
+    ``removed_products`` is (D - Sigma) z on bulk sites, from ``information_products``. The estimator is the
+    control-variate Hutchinson identity,
+
+        T_b = tr(D - Sigma_hat)_b + E_z[ z_b' ((D - Sigma) z - (D - Sigma_hat) z)_b ],
+
+    with Sigma_hat the window approximation (``control_variate``). Without the control variate, the probe
+    values' spread is set by Sigma's off-diagonal LD mass, which dwarfs the small diagonal D - Sigma: on a
+    synthetic LD store (engine's test), 16 probes gave standard errors of 2-6% on errors below 3.3%. With it,
+    the spread comes from Sigma_hat - Sigma only, which is small exactly when the approximation is right.
+    The test is ``_certificate``'s.
     """
+    if control.window_information.shape[0] != len(blocks):
+        raise ValueError("the control variate was built on different blocks")
     is_bulk = np.ones(solve.site_precision.shape[0], dtype=bool)
     is_bulk[solve.resolved] = False
     bulk_variance = np.where(is_bulk, 1.0 / np.where(is_bulk, solve.site_precision, 1.0), 0.0)
     removed = np.where(is_bulk, bulk_variance - variances, 0.0)
-    return block_trace_certificate(removed, blocks, np.where(is_bulk[:, None], probes, 0.0), np.where(is_bulk[:, None], removed_products, 0.0), tolerance, level)
+    difference = np.where(is_bulk[:, None], removed_products - control.removed_products, 0.0)
+    per_probe = [control.window_information[position] + np.sum(probes[members] * difference[members], axis=0) for position, members in enumerate(blocks)]
+    estimate = np.array([float(np.sum(removed[members])) for members in blocks])
+    return _certificate(estimate, per_probe, tolerance, level)
+
+
+@dataclass(frozen=True)
+class ControlVariate:
+    """The window approximation's own (D - Sigma_hat) z on bulk rows, and each block's window information.
+
+    Subtracting it from the solver's exact (D - Sigma) z leaves an estimator of the approximation's error whose
+    spread comes only from (Sigma_hat - Sigma), not from Sigma's off-diagonal LD mass.
+    """
+
+    removed_products: NDArray[np.float64]
+    window_information: NDArray[np.float64]
+
+
+def control_variate(solve: BulkSolve, grams: BlockGrams, probes: NDArray[np.float64]) -> ControlVariate:
+    """(D - Sigma_hat) z on bulk rows, with Sigma_hat the window approximation, and each block's tr(D - Sigma_hat).
+
+    For bulk j in block b, Sigma_hat_{j,:} z = sum over window columns (identity 2 plus the window's resolved
+    spikes) + Sigma_hat_{j,L} z_L, with Sigma_hat_{jL} = -D_j (C core^-1)_jL from the window's cross products.
+    The window information is taken on those window diagonals, so the certificate's estimator has the expectation
+    of the exact information.
+    """
+    cross, bulk_variance, core_inverse, is_resolved = _prepare(solve, grams)
+    removed = np.zeros_like(probes)
+    information = np.zeros(len(grams.blocks))
+    for block, members in enumerate(grams.blocks):
+        terms = _block_terms(solve, grams, cross, bulk_variance, core_inverse, block)
+        own_variance = bulk_variance[members]
+        products = terms.rows @ probes[terms.columns] - own_variance[:, None] * (terms.loadings @ probes[solve.resolved])
+        bulk_rows = ~is_resolved[members]
+        removed[members] = np.where(bulk_rows[:, None], own_variance[:, None] * probes[members] - products, 0.0)
+        information[block] = float(np.sum(np.where(bulk_rows, own_variance - np.diag(terms.covariance), 0.0)))
+    return ControlVariate(removed_products=removed, window_information=information)
 
 
 def certificate_tolerance(solve: BulkSolve, bulk_probe_count: int) -> float:
