@@ -21,6 +21,7 @@ from sv_pgs.scale_mixture_ep import (
     derived_lattice,
     hyper_step,
     initial_hyperparameters,
+    normal_means_posterior,
     scale_mixture_prior,
 )
 
@@ -85,7 +86,7 @@ def _learned(estimate):
         floor=floor,
         top=top,
     )
-    step = hyper_step(prior, initial_hyperparameters(prior), cavity, _WORKING_BYTES, 1e-6)
+    step = hyper_step(prior, initial_hyperparameters(prior), cavity, normal_means_posterior(cavity, _WORKING_BYTES), _WORKING_BYTES, 1e-6)
     variances = np.where(nodes >= floor, np.exp(nodes), 0.0)
     return variances, class_log_density(prior, step.hyperparameters.coefficients)[0], nodes.shape[0]
 

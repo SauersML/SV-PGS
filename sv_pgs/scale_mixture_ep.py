@@ -87,10 +87,12 @@ gamma = p - sum_j tau_j Sigma_jj, the covariates' flat prior removing k.
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
-from typing import Iterator, Sequence
+from typing import Callable, Iterator, Sequence
 
 import numpy as np
+from scipy.integrate import quad
 from scipy.interpolate import CubicSpline
+from scipy.sparse.linalg import LinearOperator, gmres
 from scipy.special import erfcx, logsumexp
 
 from sv_pgs._typing import F64Array, I64Array
@@ -103,6 +105,11 @@ _HALF_PRECISION = _EPSILON**0.5
 # infinity limit that is proper on the real line and does not move with the range (<= 1e-4 nats when the range
 # doubles or quadruples; the first- and second-order limits move by 4-100 nats: math-density, lead ruling).
 ROUGHNESS_ORDER = 3
+# The (rows x K) float64 arrays alive at once in a chunk: the ten of ``_Components``, the seven directional-derivative
+# arrays of ``_directional_derivatives`` and three expression temporaries.
+_ROW_INTERMEDIATES = 20
+# QUADPACK's relative accuracy is bounded below by 50 eps (scipy.integrate.quad raises under it).
+_QUADPACK_RELATIVE_FLOOR = 50.0 * _EPSILON
 
 
 @dataclass(frozen=True)
@@ -205,7 +212,9 @@ class HyperStep:
     starting ones, both in nats: the outer loop's certificate.
     ``newton_decrement`` is the same decrement at the returned
     hyperparameters, and ``smoothing_gradient`` the largest |dV/drho| over
-    weights not held at a bound of their range.
+    weights not held at an edge or a bound of their range, by central
+    differences of the B-evidence; ``stationarity_steps`` and
+    ``stationarity_errors`` are each difference's step and error bound.
     """
 
     hyperparameters: MixtureHyperparameters
@@ -215,6 +224,8 @@ class HyperStep:
     smoothing_gradient: float
     start_decrement: float
     evidence_gain: float
+    stationarity_steps: F64Array
+    stationarity_errors: F64Array
 
 
 # ------------------------------------------------------------------ the lattice
@@ -349,8 +360,8 @@ def scale_mixture_prior(
             )
     lattice = np.asarray(nodes, dtype=np.float64)
     spacing = np.diff(lattice)
-    if lattice.shape[0] < 5 or spacing[0] <= 0.0 or not np.allclose(spacing, spacing[0], rtol=_HALF_PRECISION, atol=0.0):
-        raise ValueError("the lattice must be at least five evenly spaced increasing nodes")
+    if lattice.shape[0] <= ROUGHNESS_ORDER or spacing[0] <= 0.0 or not np.allclose(spacing, spacing[0], rtol=_HALF_PRECISION, atol=0.0):
+        raise ValueError("the lattice must be evenly spaced increasing nodes, more than the roughness order")
     grid_size = lattice.shape[0]
     basis = _sum_to_zero_basis(grid_size)
     roughness = roughness_factor(grid_size, float(spacing[0]), ROUGHNESS_ORDER) @ basis
@@ -481,10 +492,10 @@ def prior_second_moment(prior: ScaleMixturePrior, hyperparameters: MixtureHyperp
 
 
 def _row_chunks(rows: I64Array, grid_size: int, working_bytes: int) -> Iterator[I64Array]:
-    """Pieces of ``rows`` whose (rows x K) intermediates, about 16 of them, fit ``working_bytes``."""
+    """Pieces of ``rows`` whose (rows x K) float64 intermediates (``_ROW_INTERMEDIATES`` of them) fit ``working_bytes``."""
     if working_bytes <= 0:
         raise ValueError("working_bytes must be positive")
-    chunk = max(1, int(working_bytes) // (16 * 8 * max(grid_size, 1)))
+    chunk = max(1, int(working_bytes) // (_ROW_INTERMEDIATES * np.dtype(np.float64).itemsize * max(grid_size, 1)))
     for start in range(0, rows.shape[0], chunk):
         yield rows[start : start + chunk]
 
@@ -502,19 +513,28 @@ class _Components:
     first: F64Array
     second: F64Array
     third: F64Array
+    fourth: F64Array
 
 
 def _kernel_terms(
     log_density: F64Array, log_scale_rows: F64Array, grid: F64Array, floor: float, precision: F64Array, shift: F64Array
-) -> tuple[F64Array, F64Array, F64Array, F64Array]:
-    """(variance v, q = vP, r = 1/(1+q), log pi_k + log Z_jk) at every node; v = 0 below ``floor``."""
-    variance = np.where(grid[None, :] >= floor, np.exp(log_scale_rows[:, None] + grid[None, :]), 0.0)
-    ratio = variance * precision[:, None]
-    if np.any(ratio <= -1.0):
-        raise FloatingPointError("a cavity is improper on the lattice: 1 + v P <= 0")
-    retained = 1.0 / (1.0 + ratio)
-    log_component = log_density - 0.5 * np.log1p(ratio) + 0.5 * np.square(shift)[:, None] * variance * retained
-    return variance, ratio, retained, log_component
+) -> tuple[F64Array, F64Array, F64Array, F64Array, F64Array]:
+    """(v r = v/(1 + vP), r = 1/(1 + vP), qr = vP/(1 + vP), log pi_k + log Z_jk, h^2 v r) at every node; v = 0 below
+    ``floor``. Written so that an overflowing v (a node far past every effect's scale) gives its limits
+    v r = 1/P, r = 0, qr = 1 and a component of weight zero, not inf * 0."""
+    # An overflowing v and a flat node's v = 0 are both meant: the reciprocal forms below take their limits exactly.
+    with np.errstate(over="ignore", divide="ignore"):
+        variance = np.where(grid[None, :] >= floor, np.exp(log_scale_rows[:, None] + grid[None, :]), 0.0)
+        column_precision = precision[:, None]
+        ratio = variance * column_precision
+        if np.any(ratio <= -1.0):
+            raise FloatingPointError("a cavity is improper on the lattice: 1 + v P <= 0")
+        retained = 1.0 / (1.0 + ratio)
+        ratio_retained = 1.0 / (1.0 + 1.0 / ratio)
+        conditional = 1.0 / (1.0 / variance + column_precision)
+    signal = np.square(shift)[:, None] * conditional
+    log_component = log_density - 0.5 * np.log1p(ratio) + 0.5 * signal
+    return conditional, retained, ratio_retained, log_component, signal
 
 
 def _log_normalizers(
@@ -526,22 +546,27 @@ def _log_normalizers(
 def _components(
     log_density: F64Array, log_scale_rows: F64Array, grid: F64Array, floor: float, precision: F64Array, shift: F64Array
 ) -> _Components:
-    """With q = vP, r = 1/(1+q) and a = h^2 v r:  d log Z_k / d eta = (a - q) r / 2,
-    its eta-derivative a r (2r - 1)/2 - q r^2/2, and the next a r (6r^2 - 6r + 1)/2 - q r^2 (2r - 1)/2.
+    """With q = vP, r = 1/(1+q) and a = h^2 v r (so dr/deta = -r(1 - r) and da/deta = a r), each derivative of
+    log Z_k in eta = log u is a A_n(r) - B_n(r): d1 = (a - q) r / 2, then A_(n+1) = r A_n - r(1 - r) A_n' and
+    B_(n+1) = -r(1 - r) B_n', giving A_2 = r^2 - r/2, B_2 = r(1 - r)/2, A_3 = 3r^3 - 3r^2 + r/2,
+    B_3 = r(1 - r)(2r - 1)/2, and A_4 = r A_3 - r(1 - r)(9r^2 - 6r + 1/2), B_4 = -r(1 - r)(-3r^2 + 3r - 1/2).
     Nodes below ``floor`` have a flat kernel: v = 0 there."""
-    variance, ratio, retained, log_component = _kernel_terms(log_density, log_scale_rows, grid, floor, precision, shift)
-    signal = np.square(shift)[:, None] * variance * retained
+    conditional, retained, ratio_retained, log_component, signal = _kernel_terms(log_density, log_scale_rows, grid, floor, precision, shift)
     log_normalizer = logsumexp(log_component, axis=1)
     responsibility = np.exp(log_component - log_normalizer[:, None])
-    ratio_retained = ratio * retained
     return _Components(
         log_normalizer=log_normalizer,
         responsibility=responsibility,
-        conditional_variance=variance * retained,
-        first=0.5 * retained * (signal - ratio),
+        conditional_variance=conditional,
+        first=0.5 * (retained * signal - ratio_retained),
         second=0.5 * signal * retained * (2.0 * retained - 1.0) - 0.5 * ratio_retained * retained,
         third=0.5 * signal * retained * (6.0 * retained * retained - 6.0 * retained + 1.0)
         - 0.5 * ratio_retained * retained * (2.0 * retained - 1.0),
+        fourth=signal * (
+            retained * (3.0 * retained**3 - 3.0 * retained**2 + 0.5 * retained)
+            - retained * (1.0 - retained) * (9.0 * retained**2 - 6.0 * retained + 0.5)
+        )
+        + retained * (1.0 - retained) * (-3.0 * retained**2 + 3.0 * retained - 0.5),
     )
 
 
@@ -804,6 +829,174 @@ def _maximize_coefficients(
 
 
 
+@dataclass(frozen=True)
+class GaussianPosterior:
+    """q's linear responses at the EP fixed point, for the total curvature B: ``solve(R)`` is Sigma R and
+    ``variance_jvp(W)`` is -(Sigma o Sigma) W, both (p x r). Stage 2 answers them with extra right-hand sides of its
+    solve and with ``marginal_variances.variance_jvp``."""
+
+    solve: Callable[[F64Array], F64Array]
+    variance_jvp: Callable[[F64Array], F64Array]
+
+
+PosteriorAt = Callable[[ScaleMixturePrior, F64Array], GaussianPosterior]
+"""q's responses at the EP fixed point for a prior's coefficients: fixed at Stage 2's fixed point, exact for normal means."""
+
+
+def normal_means_posterior(cavity: Cavity, working_bytes: int) -> PosteriorAt:
+    """For independent effects q's marginal is the tilted law itself, so Sigma is the diagonal of tilted variances."""
+
+    def posterior_at(prior: ScaleMixturePrior, coefficients: F64Array) -> GaussianPosterior:
+        hyperparameters = MixtureHyperparameters(coefficients=coefficients, log_smoothing=np.zeros(len(prior.smoothing_blocks)))
+        return diagonal_posterior(tilted_moments(prior, hyperparameters, cavity, working_bytes).variance)
+
+    return posterior_at
+
+
+def diagonal_posterior(variance: F64Array) -> GaussianPosterior:
+    """The posterior of independent effects (orthogonal design, normal means): Sigma = diag(variance). There the
+    cavities do not move with the prior, so B equals the fixed-cavity curvature."""
+    column = np.asarray(variance, dtype=np.float64)[:, None]
+    return GaussianPosterior(solve=lambda right: column * right, variance_jvp=lambda weights: -np.square(column) * weights)
+
+
+@dataclass(frozen=True)
+class _VariantDerivatives:
+    """Per variant at its cavity: the tilted mean m, variance v and second moment s2, their derivatives in the
+    cavity shift (v_h) and precision (m_P, v_P), and in z: per node of the class density (m_eta, s2_eta, p x K)
+    and in log u (m_logu, s2_logu), which the scale-design row carries to the scale coefficients."""
+
+    mean: F64Array
+    variance: F64Array
+    second: F64Array
+    variance_by_shift: F64Array
+    mean_by_precision: F64Array
+    variance_by_precision: F64Array
+    mean_by_density: F64Array
+    second_by_density: F64Array
+    mean_by_log_scale: F64Array
+    second_by_log_scale: F64Array
+
+
+def _variant_derivatives(prior: ScaleMixturePrior, coefficients: F64Array, cavity: Cavity, working_bytes: int) -> _VariantDerivatives:
+    """Given node k the tilted law is N(mu_k, c_k) with mu_k = h c_k; with weights w and ell_k = -(c_k + mu_k^2)/2
+    (d log Z_k / dP), f_k = d log Z_k / d eta and dc_k / d eta = c_k r_k (r_k = 1/(1 + v_k P)):
+        v_h = E[(mu - m)^3] + 3 E[c (mu - m)],   m_P = Cov(ell, mu) - E[mu c],   s2_P = Cov(ell, c + mu^2) - E[c^2 + 2 mu^2 c],
+        m_eta = w (mu - m),   s2_eta = w (c + mu^2 - s2),
+        m_logu = Cov(f, mu) + E[mu r],   s2_logu = Cov(f, c + mu^2) + E[(c + 2 mu^2) r]
+    (the eta derivatives are the same in normalized and unnormalized coordinates, since sum_k w_k (mu_k - m) = 0)."""
+    variant_count, grid_size = prior.variant_count, prior.grid_size
+    fields = {name: np.empty(variant_count) for name in (
+        "mean", "variance", "second", "variance_by_shift", "mean_by_precision", "variance_by_precision", "mean_by_log_scale", "second_by_log_scale",
+    )}
+    mean_by_density = np.empty((variant_count, grid_size))
+    second_by_density = np.empty((variant_count, grid_size))
+    scales = log_scale(prior, coefficients)
+    for _class, rows, terms in _class_terms(prior, coefficients, cavity, working_bytes):
+        weights = terms.responsibility
+        conditional = terms.conditional_variance
+        retained = _kernel_terms(
+            class_log_density(prior, coefficients)[_class], scales[rows], prior.log_variance_grid, prior.kernel_floor, cavity.precision[rows], cavity.shift[rows]
+        )[1]
+        centre = cavity.shift[rows][:, None] * conditional
+
+        def expectation(values: F64Array) -> F64Array:
+            return np.sum(weights * values, axis=1)
+
+        def covariance(left: F64Array, right: F64Array) -> F64Array:
+            return expectation(left * right) - expectation(left) * expectation(right)
+
+        mean = expectation(centre)
+        raw_second = conditional + centre * centre
+        second = expectation(raw_second)
+        deviation = centre - mean[:, None]
+        slope = -0.5 * raw_second
+        mean_by_precision = covariance(slope, centre) - expectation(centre * conditional)
+        second_by_precision = covariance(slope, raw_second) - expectation(conditional * conditional + 2.0 * centre * centre * conditional)
+        fields["mean"][rows] = mean
+        fields["second"][rows] = second
+        fields["variance"][rows] = second - mean * mean
+        fields["variance_by_shift"][rows] = expectation(deviation**3) + 3.0 * expectation(conditional * deviation)
+        fields["mean_by_precision"][rows] = mean_by_precision
+        fields["variance_by_precision"][rows] = second_by_precision - 2.0 * mean * mean_by_precision
+        fields["mean_by_log_scale"][rows] = covariance(terms.first, centre) + expectation(centre * retained)
+        fields["second_by_log_scale"][rows] = covariance(terms.first, raw_second) + expectation((conditional + 2.0 * centre * centre) * retained)
+        mean_by_density[rows] = weights * deviation
+        second_by_density[rows] = weights * (raw_second - second[:, None])
+    return _VariantDerivatives(mean_by_density=mean_by_density, second_by_density=second_by_density, **fields)
+
+
+def _through_z(prior: ScaleMixturePrior, by_density: F64Array, by_log_scale: F64Array, directions_z: F64Array) -> F64Array:
+    """(p x r): each variant's derivative in z applied to the directions (C K + L) x r."""
+    grid_size = prior.grid_size
+    density_part = directions_z[: prior.density_size].reshape(prior.class_count, grid_size, -1)
+    return np.einsum("jk,jkr->jr", by_density, density_part[prior.class_index]) + by_log_scale[:, None] * (
+        prior.scale_design @ directions_z[prior.density_size :]
+    )
+
+
+def _through_z_transposed(prior: ScaleMixturePrior, by_density: F64Array, by_log_scale: F64Array, values: F64Array) -> F64Array:
+    """(C K + L) x r: the transpose of ``_through_z`` applied to (p x r) values."""
+    grid_size = prior.grid_size
+    result = np.zeros((prior.density_size + prior.scale_size, values.shape[1]))
+    for class_position, rows in enumerate(prior.class_rows):
+        result[class_position * grid_size : (class_position + 1) * grid_size] = by_density[rows].T @ values[rows]
+    result[prior.density_size :] = prior.scale_design.T @ (by_log_scale[:, None] * values)
+    return result
+
+
+def _total_curvature(
+    prior: ScaleMixturePrior, coefficients: F64Array, cavity: Cavity, posterior: GaussianPosterior, working_bytes: int, relative_tolerance: float
+) -> F64Array:
+    """B = -d2 log Z_EP / dx2 with EP re-solved, in x: M' B_z M (speed-ep, B_PRODUCTS.md), without re-solving EP.
+
+    B_z E = A E - m_x' dh + s2_x' dP / 2 (d grad_x log Z_j / dh_j = m_x and d grad_x log Z_j / dP_j = -s2_x / 2, with
+    B the negative derivative), where the cavity response (dh, dP) to a direction E solves the linear response of the
+    EP fixed point:
+        (Q + diag tau) dm = (m + m_P / v) dP + m_x E / v          (``posterior.solve``)
+        dh = (dm - m_P dP - m_x E) / v
+        v^2 dP = -(Sigma o Sigma)_off (dv / v^2 + dP),  dv = v_h dh + v_P dP + v_x E   (``posterior.variance_jvp``)
+    dP is the fixed point of that affine map, found by GMRES on all directions at once to ``relative_tolerance``;
+    Krylov is exact within its dimension, which bounds the work.
+    """
+    derivatives = _variant_derivatives(prior, coefficients, cavity, working_bytes)
+    directions = prior.coefficient_map
+    mean_by_z = _through_z(prior, derivatives.mean_by_density, derivatives.mean_by_log_scale, directions)
+    variance_by_z = _through_z(prior, derivatives.second_by_density, derivatives.second_by_log_scale, directions) - 2.0 * derivatives.mean[:, None] * mean_by_z
+    variance = derivatives.variance[:, None]
+
+    def through(precision_step: F64Array) -> tuple[F64Array, F64Array]:
+        mean_step = posterior.solve((derivatives.mean + derivatives.mean_by_precision / derivatives.variance)[:, None] * precision_step + mean_by_z / variance)
+        shift_step = (mean_step - derivatives.mean_by_precision[:, None] * precision_step - mean_by_z) / variance
+        variance_step = derivatives.variance_by_shift[:, None] * shift_step + derivatives.variance_by_precision[:, None] * precision_step + variance_by_z
+        response = variance_step / variance**2 + precision_step
+        return shift_step, response + posterior.variance_jvp(response) / variance**2, response
+
+    shape = mean_by_z.shape
+    _shift, offset, start_response = through(np.zeros(shape))
+    # The map's last step cancels the diagonal of Sigma o Sigma against v^2: its value is known only to eps times the
+    # terms that cancel, which is where GMRES's residual can stop.
+    rounding = _EPSILON * float(np.linalg.norm(start_response))
+
+    def linear_part(vector: F64Array) -> F64Array:
+        precision_step = vector.reshape(shape)
+        return (precision_step - (through(precision_step)[1] - offset)).ravel()
+
+    size = int(np.prod(shape))
+    operator = LinearOperator((size, size), matvec=linear_part, dtype=np.float64)
+    solution, information = gmres(operator, offset.ravel(), rtol=relative_tolerance, atol=rounding, restart=size, maxiter=size)
+    if information != 0:
+        raise FloatingPointError(f"the EP fixed point's linear response did not converge (gmres information {information})")
+    precision_step = solution.reshape(shape)
+    shift_step, _next, _response = through(precision_step)
+    fixed_cavity = -_data_objective(prior, coefficients, cavity, working_bytes).hessian
+    total_z = fixed_cavity @ directions - _through_z_transposed(prior, derivatives.mean_by_density, derivatives.mean_by_log_scale, shift_step) + 0.5 * (
+        _through_z_transposed(prior, derivatives.second_by_density, derivatives.second_by_log_scale, precision_step)
+    )
+    total = directions.T @ total_z
+    return 0.5 * (total + total.T)
+
+
 # ------------------------------------------------------- the Laplace evidence for the weights
 
 
@@ -877,6 +1070,129 @@ class _Evidence:
     penalized_value: float
     newton_decrement: float
     magnitude: float
+    # Per weight, the two rho-dependent parts of dV/drho_i: the effective degrees of freedom
+    # lambda_i tr((B + S)^-1 S_i) and the penalty's size lambda_i ||R_i x||^2.
+    effective_degrees: F64Array
+    penalty_sizes: F64Array
+    # newton_decrement is 1/2 g'(B + S)^-1 g: what the fit's certificate records (math-epeb: the fixed-cavity form
+    # understates the remaining gain by up to 100x).
+
+
+def _directional_derivatives(
+    prior: ScaleMixturePrior, coefficients: F64Array, cavity: Cavity, directions: F64Array, working_bytes: int
+) -> tuple[F64Array, F64Array]:
+    """The third and fourth derivatives of sum_j log Z_j along each column of ``directions`` (in x), exactly.
+
+    Along x + s b, variant j's natural parameters are theta_k(s) = eta_ck + s b_ck + L_jk(e_j + s b_e) with
+    b_e = d_j' b_theta, and log Z_j = LSE(theta) - LSE(eta_c). With the node distribution w and
+    theta' = b_c + L' b_e, theta'' = L'' b_e^2, theta''' = L''' b_e^3, theta'''' = L'''' b_e^4, the derivatives of a
+    log-sum-exp are joint cumulants under w:
+        d3 = k3(theta') + 3 cov(theta', theta'') + E theta''',
+        d4 = k4(theta') + 6 k(theta', theta', theta'') + 3 var(theta'') + 4 cov(theta', theta''') + E theta''''.
+    The -LSE(eta_c) term subtracts k3 and k4 of b_c under pi_c, once per variant of the class.
+    """
+    mapping = prior.coefficient_map
+    directions_z = mapping @ directions
+    grid_size = prior.grid_size
+    scale_span = slice(prior.density_size, prior.density_size + prior.scale_size)
+    third = np.zeros(directions.shape[1])
+    fourth = np.zeros(directions.shape[1])
+    density = np.exp(class_log_density(prior, coefficients))
+    for class_position, rows, terms in _class_terms(prior, coefficients, cavity, working_bytes):
+        weights = terms.responsibility
+        design = prior.scale_design[rows]
+        span = slice(class_position * grid_size, (class_position + 1) * grid_size)
+        for column in range(directions.shape[1]):
+            density_step = directions_z[span, column][None, :]
+            scale_step = (design @ directions_z[scale_span, column])[:, None]
+            first = density_step + terms.first * scale_step
+            second = terms.second * scale_step**2
+            third_term = terms.third * scale_step**3
+            fourth_term = terms.fourth * scale_step**4
+            centred = first - np.sum(weights * first, axis=1, keepdims=True)
+            centred_second = second - np.sum(weights * second, axis=1, keepdims=True)
+            centred_third = third_term - np.sum(weights * third_term, axis=1, keepdims=True)
+            variance = np.sum(weights * centred**2, axis=1)
+            third[column] += float(np.sum(
+                np.sum(weights * centred**3, axis=1) + 3.0 * np.sum(weights * centred * centred_second, axis=1) + np.sum(weights * third_term, axis=1)
+            ))
+            fourth[column] += float(np.sum(
+                np.sum(weights * centred**4, axis=1) - 3.0 * variance**2
+                + 6.0 * np.sum(weights * centred**2 * centred_second, axis=1)
+                + 3.0 * np.sum(weights * centred_second**2, axis=1)
+                + 4.0 * np.sum(weights * centred * centred_third, axis=1)
+                + np.sum(weights * fourth_term, axis=1)
+            ))
+    for class_position, class_rows in enumerate(prior.class_rows):
+        span = slice(class_position * grid_size, (class_position + 1) * grid_size)
+        class_density = density[class_position]
+        for column in range(directions.shape[1]):
+            step = directions_z[span, column]
+            centred = step - float(class_density @ step)
+            variance = float(class_density @ centred**2)
+            third[column] -= class_rows.shape[0] * float(class_density @ centred**3)
+            fourth[column] -= class_rows.shape[0] * (float(class_density @ centred**4) - 3.0 * variance**2)
+    return third, fourth
+
+
+def _laplace_corrections(
+    prior: ScaleMixturePrior, log_smoothing: F64Array, evidence: _Evidence, cavity: Cavity, posterior_at: PosteriorAt, working_bytes: int, tolerance: float
+) -> tuple[F64Array, F64Array, F64Array]:
+    """Per integrated direction, the correction from the Laplace term to the exact one-dimensional integral, the
+    Tierney-Kadane term that decided it, and the standardized directions themselves (columns, in x).
+
+    The integrated directions are the eigenvectors of -H's Schur complement on the complement of the profiled null
+    space, each moved with the null coordinates' first-order response and scaled to unit curvature. Along a
+    standardized direction the Tierney-Kadane O(1) term is k4/8 + 5 k3^2/24; where its magnitude exceeds
+    ``tolerance`` the Laplace term is replaced by an exact quadrature of the integrand along that line, and the
+    correction is the log of their ratio (its limit covers a density collapsing to a point). Elsewhere it is 0.
+    """
+    penalty = _penalty_matrix(prior, log_smoothing)
+    objective = _data_objective(prior, evidence.coefficients, cavity, working_bytes)
+    value, _gradient, hessian = _penalized(prior, objective, log_smoothing, penalty, evidence.coefficients)
+    negative = -hessian
+    null_basis = prior.null_basis
+    complement = np.linalg.svd(np.eye(negative.shape[0]) - null_basis @ null_basis.T)[0][:, : negative.shape[0] - null_basis.shape[1]]
+    response = np.eye(negative.shape[0])
+    if null_basis.shape[1]:
+        response = response - null_basis @ np.linalg.solve(null_basis.T @ negative @ null_basis, null_basis.T @ negative)
+    moved = response @ complement
+    schur = moved.T @ negative @ moved
+    eigenvalues, eigenvectors = np.linalg.eigh(0.5 * (schur + schur.T))
+    # -H passed its Cholesky test, so the Schur complement is positive definite; an eigenvalue below eps times the
+    # largest is rounding, raised to that floor as in ``_ascent_direction``.
+    eigenvalues = np.maximum(eigenvalues, _EPSILON * float(np.max(np.abs(eigenvalues))))
+    directions = moved @ eigenvectors / np.sqrt(eigenvalues)[None, :]
+    third, fourth = _directional_derivatives(prior, evidence.coefficients, cavity, directions, working_bytes)
+    terms = fourth / 8.0 + 5.0 * third**2 / 24.0
+    corrections = np.zeros(directions.shape[1])
+    for index in np.flatnonzero(np.abs(terms) > tolerance):
+        direction = directions[:, index]
+
+        def integrand(step: float) -> float:
+            point = evidence.coefficients + step * direction
+            return float(np.exp(
+                _data_value(prior, point, cavity, working_bytes) - _penalty_value(prior, log_smoothing, point)[0] - value
+            ))
+
+        integral, error, _information, *message = quad(
+            integrand, -np.inf, np.inf, epsabs=0.0, epsrel=max(tolerance, _QUADPACK_RELATIVE_FLOOR), full_output=True
+        )
+        # The log of the integral is what enters V: accept QUADPACK's answer when its own error estimate resolves that
+        # log to the tolerance, or to half of double precision when rounding is what stopped it.
+        if message and error > max(tolerance, _HALF_PRECISION) * abs(integral):
+            raise FloatingPointError(f"the exact integral along a direction did not converge: {message[0]}")
+        corrections[index] = float(np.log(integral) - 0.5 * np.log(2.0 * np.pi))
+    return corrections, terms, directions
+
+
+def _corrected_value(
+    prior: ScaleMixturePrior, log_smoothing: F64Array, evidence: _Evidence, cavity: Cavity, posterior_at: PosteriorAt, working_bytes: int, tolerance: float
+) -> float:
+    """V with its per-direction Laplace terms replaced by exact one-dimensional integrals where they fail: the value
+    basins and edges are compared by (lead ruling)."""
+    corrections, _terms, _directions = _laplace_corrections(prior, log_smoothing, evidence, cavity, posterior_at, working_bytes, tolerance)
+    return evidence.value + float(np.sum(corrections))
 
 
 def _range_projector(matrix: F64Array) -> tuple[F64Array, F64Array]:
@@ -916,31 +1232,61 @@ def _penalty_groups(prior: ScaleMixturePrior) -> list[I64Array]:
 
 
 def _evidence(
-    prior: ScaleMixturePrior, log_smoothing: F64Array, start: F64Array, cavity: Cavity, working_bytes: int, tolerance: float
+    prior: ScaleMixturePrior, log_smoothing: F64Array, start: F64Array, cavity: Cavity, posterior_at: PosteriorAt, working_bytes: int, tolerance: float
 ) -> _Evidence | None:
-    """V(rho) and its exact gradient, with x_rho re-maximized from ``start``; None when x_rho is not a strict maximum.
+    """V(rho) with the total curvature B, and the fixed-cavity gradient that steers the search; x_rho re-maximized
+    from ``start``. None when x_rho is not a strict maximum of the objective V integrates, i.e. B + S is not
+    positive definite there (lead ruling: such a point is never accepted, and its V never reported).
 
-    The Laplace curvature is the observed -H of the objective maximized. The null
-    space N is profiled: -1/2 log|-H| + 1/2 log|N'(-H)N| keeps only the integrated
-    directions. Both terms move with x_rho, through dx/drho_i = -(-H)^-1 lambda_i S_i x
-    and the third derivatives of log Z (``_curvature_trace_gradient``).
+    V = F + 1/2 log|S|_+ - 1/2 log|B + S| + 1/2 log|N'(B + S)N|: B = -d2 log Z_EP / dx2 with EP re-solved
+    (``_total_curvature``), the second-order approximation of the actual marginal likelihood; the null space N is
+    profiled. The gradient is that of the fixed-cavity form (-H in place of B), whose terms move with x_rho through
+    dx/drho_i = -(-H)^-1 lambda_i S_i x and the third derivatives of log Z (``_curvature_trace_gradient``); it only
+    chooses the search direction, and every step is accepted on V itself.
     """
     penalty = _penalty_matrix(prior, log_smoothing)
-    coefficients, objective = _maximize_coefficients(prior, log_smoothing, start, cavity, working_bytes, tolerance)
-    value, gradient, hessian = _penalized(prior, objective, log_smoothing, penalty, coefficients)
     null_basis = prior.null_basis
+    # V's determinant terms move with x at first order: an inexact x-hat with decrement d moves V by up to
+    # sqrt(c'(-H)^-1 c) sqrt(2 d) / 2, c their x-gradient. The inner tolerance tightens until that is below ``tolerance``.
+    inner_tolerance = tolerance
+    coefficients = np.array(start, dtype=np.float64, copy=True)
+    previous = None
+    while True:
+        coefficients, objective = _maximize_coefficients(prior, log_smoothing, coefficients, cavity, working_bytes, inner_tolerance)
+        value, gradient, hessian = _penalized(prior, objective, log_smoothing, penalty, coefficients)
+        try:
+            log_determinant, covariance = _cholesky_log_determinant_and_inverse(-hessian)
+            null_log_determinant, null_inverse = _cholesky_log_determinant_and_inverse(null_basis.T @ -hessian @ null_basis)
+        except np.linalg.LinAlgError:
+            return None
+        newton_decrement = 0.5 * float(gradient @ covariance @ gradient)
+        weight = covariance - null_basis @ null_inverse @ null_basis.T
+        curvature_gradient = _curvature_trace_gradient(prior, coefficients, cavity, weight, working_bytes)
+        sensitivity = max(float(curvature_gradient @ covariance @ curvature_gradient), np.finfo(np.float64).tiny)
+        rounding = _EPSILON * (objective.magnitude + abs(value))
+        if 0.5 * np.sqrt(sensitivity * 2.0 * newton_decrement) <= tolerance or newton_decrement <= rounding:
+            break
+        if previous is not None and np.array_equal(coefficients, previous):
+            # The maximizer resolves x no further (its own rounding stop): V is as accurate as double precision gives.
+            break
+        previous = coefficients
+        inner_tolerance = 2.0 * tolerance * tolerance / sensitivity
+    penalty_log_determinant = sum(_log_pseudo_determinant(penalty[np.ix_(group, group)]) for group in _penalty_groups(prior))
+    # A relative error e in B moves log|B + S| by at most D e for well-scaled B + S: the linear response is solved to
+    # the evidence tolerance over the dimension, and never past what double precision resolves.
+    total = _total_curvature(
+        prior, coefficients, cavity, posterior_at(prior, coefficients), working_bytes, max(tolerance / coefficients.shape[0], _EPSILON)
+    ) + penalty
     try:
-        log_determinant, covariance = _cholesky_log_determinant_and_inverse(-hessian)
-        null_log_determinant, null_inverse = _cholesky_log_determinant_and_inverse(null_basis.T @ -hessian @ null_basis)
+        total_log_determinant, total_covariance = _cholesky_log_determinant_and_inverse(total)
+        total_null_log_determinant, _total_null_inverse = _cholesky_log_determinant_and_inverse(null_basis.T @ total @ null_basis)
     except np.linalg.LinAlgError:
         return None
-    newton_decrement = 0.5 * float(gradient @ covariance @ gradient)
-    penalty_log_determinant = sum(_log_pseudo_determinant(penalty[np.ix_(group, group)]) for group in _penalty_groups(prior))
-    evidence_value = value + 0.5 * penalty_log_determinant - 0.5 * log_determinant + 0.5 * null_log_determinant
-    # W = (-H)^-1 - N (N'(-H)N)^-1 N' carries both determinants' dependence on x.
-    weight = covariance - null_basis @ null_inverse @ null_basis.T
-    curvature_gradient = _curvature_trace_gradient(prior, coefficients, cavity, weight, working_bytes)
+    evidence_value = value + 0.5 * penalty_log_determinant - 0.5 * total_log_determinant + 0.5 * total_null_log_determinant
+    # W = (-H)^-1 - N (N'(-H)N)^-1 N' carries both determinants' dependence on x (computed above).
     evidence_gradient = np.empty(len(prior.smoothing_blocks))
+    effective_degrees = np.empty(len(prior.smoothing_blocks))
+    penalty_sizes = np.empty(len(prior.smoothing_blocks))
     responses = np.empty((coefficients.shape[0], len(prior.smoothing_blocks)))
     group_of = {int(coordinate): group for group in _penalty_groups(prior) for coordinate in group}
     for position, (block, log_weight) in enumerate(zip(prior.smoothing_blocks, log_smoothing)):
@@ -955,6 +1301,8 @@ def _evidence(
         pull[coordinates] = lambda_weight * (block.factor.T @ residual)
         # dx/drho_i = -(-H)^-1 pull, so -1/2 d tr through x is +1/2 grad . (-H)^-1 pull; N' S_i N = 0.
         responses[:, position] = -(covariance @ pull)
+        effective_degrees[position] = lambda_weight * float(np.sum(total_covariance[np.ix_(coordinates, coordinates)] * block.matrix))
+        penalty_sizes[position] = lambda_weight * float(residual @ residual)
         evidence_gradient[position] = (
             -0.5 * lambda_weight * float(residual @ residual)
             + 0.5 * lambda_weight * _pseudo_inverse_trace(penalty[np.ix_(group, group)], embedded)
@@ -966,21 +1314,22 @@ def _evidence(
         gradient=evidence_gradient,
         coefficients=coefficients,
         responses=responses,
+        effective_degrees=effective_degrees,
+        penalty_sizes=penalty_sizes,
         penalized_value=value,
-        newton_decrement=newton_decrement,
+        newton_decrement=0.5 * float(gradient @ total_covariance @ gradient),
         magnitude=objective.magnitude + abs(evidence_value),
     )
 
 
 def _smoothing_bounds(prior: ScaleMixturePrior, objective: _Objective) -> list[tuple[float, float]]:
-    """The range of rho that double precision resolves, per weight.
+    """The range of rho over which a fit at that weight is resolved in double precision, per weight.
 
-    With D the data curvature of the weight's block and s the smallest nonzero
-    eigenvalue of S_i: below lambda s = sqrt(eps) ||D|| the weakest penalized
-    direction of -H has a condition number past 1/sqrt(eps), and above
-    lambda s = ||D|| / sqrt(eps) every penalized coefficient is below sqrt(eps)
-    of its unpenalized size, so the fit is the null-space fit to half of
-    double precision.
+    With D the data curvature of the weight's block and s_min, s_max the extreme nonzero eigenvalues of S_i:
+    below lambda s_min = sqrt(eps) ||D|| the weakest penalized direction of -H has a condition number past
+    1/sqrt(eps), and above lambda s_max = ||D|| / sqrt(eps) the penalty swamps the data's curvature past
+    1/sqrt(eps), so a fit there loses half of double precision. The edges beyond (lambda = 0 and infinity) are
+    evaluated exactly instead.
     """
     data = -(prior.coefficient_map.T @ objective.hessian @ prior.coefficient_map)
     bounds = []
@@ -990,7 +1339,7 @@ def _smoothing_bounds(prior: ScaleMixturePrior, objective: _Objective) -> list[t
         penalty_eigenvalues, _vectors = _range_projector(block.matrix)
         bounds.append((
             float(np.log(_HALF_PRECISION * data_norm / penalty_eigenvalues[0])),
-            float(np.log(data_norm / (_HALF_PRECISION * penalty_eigenvalues[0]))),
+            float(np.log(data_norm / (_HALF_PRECISION * penalty_eigenvalues[-1]))),
         ))
     return bounds
 
@@ -1035,7 +1384,7 @@ def _ascend_evidence(
     prior: ScaleMixturePrior,
     start_weights: F64Array,
     start: _Evidence,
-    cavity: Cavity,
+    cavity: Cavity, posterior_at: PosteriorAt,
     working_bytes: int,
     lower: F64Array,
     upper: F64Array,
@@ -1070,7 +1419,7 @@ def _ascend_evidence(
         trial_weights = np.clip(weights + step, lower, upper)
         step = trial_weights - weights
         predicted = float(gradient @ step) - 0.5 * float(step @ hessian @ step)
-        trial = _certified_evidence(prior, trial_weights, current.coefficients + current.responses @ step, cavity, working_bytes, tolerance, flat_start)
+        trial = _certified_evidence(prior, trial_weights, current.coefficients + current.responses @ step, cavity, posterior_at, working_bytes, tolerance, flat_start)
         actual = -np.inf if trial is None else trial.value - current.value
         ratio = actual / predicted if predicted > 0.0 else -np.inf
         step_norm = float(np.linalg.norm(step))
@@ -1089,98 +1438,240 @@ def _ascend_evidence(
 
 
 def _certified_evidence(
-    prior: ScaleMixturePrior, log_smoothing: F64Array, start: F64Array, cavity: Cavity, working_bytes: int, tolerance: float, flat_start: F64Array
+    prior: ScaleMixturePrior, log_smoothing: F64Array, start: F64Array, cavity: Cavity, posterior_at: PosteriorAt, working_bytes: int, tolerance: float, flat_start: F64Array
 ) -> _Evidence | None:
     """V at the certified inner maximum from ``start``, or from the flat start when that is not a certified
     maximum (the two structural starts; lead ruling); None when neither is."""
-    warm = _evidence(prior, log_smoothing, start, cavity, working_bytes, tolerance)
-    return warm if warm is not None else _evidence(prior, log_smoothing, flat_start, cavity, working_bytes, tolerance)
+    warm = _evidence(prior, log_smoothing, start, cavity, posterior_at, working_bytes, tolerance)
+    return warm if warm is not None else _evidence(prior, log_smoothing, flat_start, cavity, posterior_at, working_bytes, tolerance)
 
 
 def _best_certified(
-    prior: ScaleMixturePrior, log_smoothing: F64Array, starts: Sequence[F64Array], cavity: Cavity, working_bytes: int, tolerance: float
+    prior: ScaleMixturePrior, log_smoothing: F64Array, starts: Sequence[F64Array], cavity: Cavity, posterior_at: PosteriorAt, working_bytes: int, tolerance: float
 ) -> _Evidence | None:
-    """The certified inner maximum with the highest V over the given starts."""
-    candidates = [_evidence(prior, log_smoothing, start, cavity, working_bytes, tolerance) for start in starts]
-    certified = [candidate for candidate in candidates if candidate is not None]
-    return max(certified, key=lambda candidate: candidate.value) if certified else None
+    """The certified inner maximum with the highest corrected V over the given starts; distinct basins are compared
+    by ``_corrected_value``, and a start that lands in an already-found basin adds nothing."""
+    certified: list[_Evidence] = []
+    for start in starts:
+        candidate = _evidence(prior, log_smoothing, start, cavity, posterior_at, working_bytes, tolerance)
+        if candidate is None:
+            continue
+        scale = 1.0 + float(np.max(np.abs(candidate.coefficients)))
+        if all(float(np.max(np.abs(candidate.coefficients - other.coefficients))) > _HALF_PRECISION * scale for other in certified):
+            certified.append(candidate)
+    if len(certified) <= 1:
+        return certified[0] if certified else None
+    return max(certified, key=lambda candidate: _corrected_value(prior, log_smoothing, candidate, cavity, posterior_at, working_bytes, tolerance))
+
+
+def _log_normal_start(prior: ScaleMixturePrior, coefficients: F64Array, cavity: Cavity, working_bytes: int) -> F64Array:
+    """The best log-normal shared density over a grid, with no class deviation and theta kept: the global start for
+    the density's null model (lambda = infinity), whose objective is not concave in its location and log width.
+
+    Widths run from the spacing, doubling, up to the kernel range's width; a width's locations are spaced by that
+    width across the range, which a bump of that width resolves. The lattice mass of a quadratic eta carries no
+    roughness penalty, so the grid compares data values alone; the trust-region refit then polishes the winner.
+    """
+    nodes = prior.log_variance_grid
+    spacing = float(nodes[1] - nodes[0])
+    extent = max(prior.kernel_top - prior.kernel_floor, spacing)
+    basis = prior.coefficient_map[: prior.grid_size, : prior.pooled_size]
+    base = np.array(coefficients, dtype=np.float64, copy=True)
+    base[: prior.coefficient_size - prior.scale_size] = 0.0
+    best, best_value = base, -np.inf
+    width = spacing
+    while width <= extent * (1.0 + _HALF_PRECISION):
+        for centre in np.arange(prior.kernel_floor, prior.kernel_top + width, width):
+            log_density = -0.5 * np.square((nodes - centre) / width)
+            candidate = base.copy()
+            candidate[: prior.pooled_size] = basis.T @ (log_density - log_density.mean())
+            value = _data_value(prior, candidate, cavity, working_bytes)
+            if value > best_value:
+                best, best_value = candidate, value
+        width *= 2.0
+    return best
+
+
+def _edge_evidence(
+    prior: ScaleMixturePrior,
+    weights: F64Array,
+    infinite: frozenset[int],
+    zero: frozenset[int],
+    starts: Sequence[F64Array],
+    cavity: Cavity, posterior_at: PosteriorAt,
+    working_bytes: int,
+    tolerance: float,
+) -> tuple[F64Array, _Evidence] | None:
+    """The best certified evidence of the model with ``infinite`` at lambda = infinity and ``zero`` at lambda = 0,
+    the other weights at ``weights``; with its restriction basis."""
+    view, allowed = _restricted_prior(prior, infinite, zero)
+    finite = [position for position in range(weights.shape[0]) if position not in infinite | zero]
+    evidence = _best_certified(view, weights[finite], [allowed.T @ start for start in starts], cavity, posterior_at, working_bytes, tolerance)
+    return None if evidence is None else (allowed, evidence)
 
 
 def _maximize_evidence(
     prior: ScaleMixturePrior,
     start_weights: F64Array,
     start_coefficients: F64Array,
-    cavity: Cavity,
+    cavity: Cavity, posterior_at: PosteriorAt,
     working_bytes: int,
     bounds: list[tuple[float, float]],
     tolerance: float,
 ) -> tuple[F64Array, F64Array, _Evidence, _Evidence]:
-    """Maximize V over every weight in [0, infinity], with exact edges at both ends.
-
-    A weight whose ascent reaches the top of its resolvable range (where its penalized directions are
-    frozen to half of double precision) moves to lambda = infinity exactly: x is confined to that block's
-    null space. One that reaches the bottom (where its penalty is lost in the data curvature's rounding)
-    moves to lambda = 0 exactly: the block is dropped. An edge weight is released when V at the end of
-    its range falls toward the edge. Returns the log weights (+inf and -inf at the edges), x in full
-    coordinates, V there, and V at the start.
+    """Maximize V over every weight in [0, infinity]: the interior by the trust-region ascent inside the resolvable
+    range, and each edge evaluated exactly (lambda = infinity by confining x to the block's null space, lambda = 0 by
+    dropping the block), never by fitting at an extreme weight. A weight at the end of its range whose gradient
+    points past it moves to the edge when the edge's V is higher; an edge weight moves back to the end of its range
+    when V is higher there. Every V is the best certified maximum over the warm, flat and global log-normal starts.
+    Returns the log weights (+inf and -inf at the edges), x in full coordinates, V there, and V at the start.
     """
     lower = np.array([bound[0] for bound in bounds])
     upper = np.array([bound[1] for bound in bounds])
     infinite = frozenset(int(position) for position in np.flatnonzero(start_weights == np.inf))
     zero = frozenset(int(position) for position in np.flatnonzero(start_weights == -np.inf))
-    weights = np.where(start_weights == np.inf, upper, np.where(start_weights == -np.inf, lower, start_weights))
-    coefficients = np.array(start_coefficients, dtype=np.float64, copy=True)
+    weights = np.where(start_weights == np.inf, upper, np.where(start_weights == -np.inf, lower, np.clip(start_weights, lower, upper)))
     flat = initial_hyperparameters(prior).coefficients
-    start = None
+    log_normal = _log_normal_start(prior, start_coefficients, cavity, working_bytes)
+    coefficients = np.array(start_coefficients, dtype=np.float64, copy=True)
+    first = _edge_evidence(prior, weights, infinite, zero, [coefficients, flat, log_normal], cavity, posterior_at, working_bytes, tolerance)
+    if first is None:
+        raise FloatingPointError("no structural start reaches a certified maximum at the starting penalty weights")
+    start = first[1]
+    best_corrected = -np.inf
     while True:
         edges = infinite | zero
         finite = np.array([position for position in range(len(bounds)) if position not in edges], dtype=np.int64)
         view, allowed = _restricted_prior(prior, infinite, zero)
-        finite_start = np.clip(weights[finite], lower[finite], upper[finite])
-        evidence = _best_certified(view, finite_start, [allowed.T @ coefficients, allowed.T @ flat], cavity, working_bytes, tolerance)
-        if evidence is None:
-            raise FloatingPointError("neither structural start reaches a certified maximum at the starting penalty weights")
-        if start is None:
-            start = evidence
+        entry = _edge_evidence(prior, weights, infinite, zero, [coefficients, flat, log_normal], cavity, posterior_at, working_bytes, tolerance)
+        if entry is None:
+            raise FloatingPointError("no structural start reaches a certified maximum at the current penalty weights")
         finite_weights, evidence = _ascend_evidence(
-            view, finite_start, evidence, cavity, working_bytes, lower[finite], upper[finite], tolerance, allowed.T @ flat
+            view, weights[finite], entry[1], cavity, posterior_at, working_bytes, lower[finite], upper[finite], tolerance, allowed.T @ flat
         )
-        # Refit at the chosen weights from the best certified answer the search saw and from the flat start.
-        evidence = _best_certified(view, finite_weights, [evidence.coefficients, allowed.T @ flat], cavity, working_bytes, tolerance) or evidence
+        refit = _best_certified(view, finite_weights, [evidence.coefficients, allowed.T @ flat, allowed.T @ log_normal], cavity, posterior_at, working_bytes, tolerance)
+        if refit is not None and float(np.max(np.abs(refit.coefficients - evidence.coefficients))) > _HALF_PRECISION * (
+            1.0 + float(np.max(np.abs(evidence.coefficients)))
+        ):
+            # Another basin wins at these weights: its weights are not optimized yet, so ascend again from it, as long
+            # as each switch raises the best corrected V seen (so switches cannot cycle).
+            refit_value = _corrected_value(view, finite_weights, refit, cavity, posterior_at, working_bytes, tolerance)
+            if refit_value > best_corrected + tolerance:
+                best_corrected = refit_value
+                weights[finite] = finite_weights
+                coefficients = allowed @ refit.coefficients
+                continue
         weights[finite] = finite_weights
         coefficients = allowed @ evidence.coefficients
-        to_infinity = {int(finite[index]) for index in np.flatnonzero((finite_weights >= upper[finite]) & (evidence.gradient >= 0.0))}
-        to_zero = {int(finite[index]) for index in np.flatnonzero((finite_weights <= lower[finite]) & (evidence.gradient <= 0.0))}
-        released = set()
-        for position in sorted(edges):
-            loose_infinite, loose_zero = infinite - {position}, zero - {position}
-            loose_view, loose_allowed = _restricted_prior(prior, loose_infinite, loose_zero)
-            loose_finite = [index for index in range(len(bounds)) if index not in loose_infinite | loose_zero]
-            trial_weights = weights.copy()
-            at_infinity = position in infinite
-            trial_weights[position] = upper[position] if at_infinity else lower[position]
-            trial = _certified_evidence(
-                loose_view, trial_weights[loose_finite], loose_allowed.T @ coefficients, cavity, working_bytes, tolerance, loose_allowed.T @ flat
-            )
-            if trial is None:
-                continue
-            slope = trial.gradient[loose_finite.index(position)]
-            if (at_infinity and slope < 0.0) or (not at_infinity and slope > 0.0):
-                released.add(position)
-        if not to_infinity and not to_zero and not released:
+        current_value = evidence.value
+        moved = False
+        pushing = [
+            (int(finite[index]), "infinite")
+            for index in np.flatnonzero((finite_weights >= upper[finite]) & (evidence.gradient >= 0.0))
+        ] + [(int(finite[index]), "zero") for index in np.flatnonzero((finite_weights <= lower[finite]) & (evidence.gradient <= 0.0))]
+        for position, edge in pushing:
+            trial_infinite = infinite | {position} if edge == "infinite" else infinite
+            trial_zero = zero | {position} if edge == "zero" else zero
+            trial = _edge_evidence(prior, weights, trial_infinite, trial_zero, [coefficients, flat, log_normal], cavity, posterior_at, working_bytes, tolerance)
+            if trial is not None and trial[1].value > current_value + tolerance:
+                infinite, zero, moved = frozenset(trial_infinite), frozenset(trial_zero), True
+                coefficients = trial[0] @ trial[1].coefficients
+                break
+        if not moved:
+            for position in sorted(edges):
+                trial_infinite, trial_zero = infinite - {position}, zero - {position}
+                trial_weights = weights.copy()
+                trial_weights[position] = upper[position] if position in infinite else lower[position]
+                trial = _edge_evidence(prior, trial_weights, trial_infinite, trial_zero, [coefficients, flat, log_normal], cavity, posterior_at, working_bytes, tolerance)
+                if trial is not None and trial[1].value > current_value + tolerance:
+                    infinite, zero, weights, moved = frozenset(trial_infinite), frozenset(trial_zero), trial_weights, True
+                    coefficients = trial[0] @ trial[1].coefficients
+                    break
+        if not moved:
             log_smoothing = weights.copy()
             log_smoothing[sorted(infinite)] = np.inf
             log_smoothing[sorted(zero)] = -np.inf
             return log_smoothing, coefficients, evidence, start
-        infinite = frozenset((infinite | to_infinity) - released)
-        zero = frozenset((zero | to_zero) - released)
+
+
+def _stationarity_check(
+    view: ScaleMixturePrior,
+    weights: F64Array,
+    evidence: _Evidence,
+    interior: F64Array,
+    cavity: Cavity,
+    posterior_at: PosteriorAt,
+    working_bytes: int,
+    tolerance: float,
+) -> tuple[F64Array, F64Array, F64Array, F64Array]:
+    """The B-evidence's own gradient in each interior weight by one central difference: (gradient, curvature scale,
+    step, error bound).
+
+    Per eigen-direction of its block, V depends on rho_i through terms log(1 + e^(rho + a)) / 2 and
+    b sigma(rho + a) / 2; the first derivatives are sigma / 2 and b sigma' / 2, and every higher derivative of the
+    logistic is bounded by sigma itself. So s_i = (edf_i + lambda_i ||R_i x||^2) / 2 bounds |V''| and |V'''| in rho_i.
+
+    With each side's V certified to e (``_evidence``'s tolerance, never below V's rounding), the central difference
+    errs by at most E = h^2 s / 6 + e / h, least at h = (3 e / s)^(1/3), where E = (3^(2/3) / 2) s^(1/3) e^(2/3). The
+    caller certifies the gain's upper bound 1/2 sum (|c| + E)^2 / s against ``tolerance``; e is set so that the error
+    alone takes a quarter of it over the n interior weights, 1/2 E^2 / s = tolerance / (4 n):
+    e = (2 tolerance / (n 3^(4/3)))^(3/4) s^(1/4).
+
+    The inner maxima of the penalized objective are not unique, so each side continues the base's own: it starts
+    from the first-order predictor x + (dx/drho) (+-h). The difference at h/2 must agree with the one at h within
+    their two error bounds; otherwise a side reached another inner maximum (V there is a different function of
+    rho), and the step halves, as it does while a side has no certified maximum.
+    """
+    gradient = np.zeros(weights.shape[0])
+    rounding = _EPSILON * evidence.magnitude
+    scale = np.maximum(0.5 * (evidence.effective_degrees + evidence.penalty_sizes), rounding)
+    steps = np.zeros(weights.shape[0])
+    errors = np.zeros(weights.shape[0])
+    limit = _HALF_PRECISION * (1.0 + float(np.max(np.abs(weights))))
+    count = max(int(np.count_nonzero(interior)), 1)
+    for position in np.flatnonzero(interior):
+        unit = np.zeros(weights.shape[0])
+        unit[position] = 1.0
+        accuracy = max((2.0 * tolerance / (count * 3.0 ** (4.0 / 3.0))) ** 0.75 * scale[position] ** 0.25, rounding)
+        step = (3.0 * accuracy / scale[position]) ** (1.0 / 3.0)
+
+        def bound(length: float) -> float:
+            return length * length * scale[position] / 6.0 + accuracy / length
+
+        while True:
+            if step <= limit:
+                raise FloatingPointError("the B-evidence has no certified maximum in one basin on both sides of a fitted penalty weight")
+            quotients = []
+            for length in (step, 0.5 * step):
+                both = [
+                    _evidence(
+                        view, weights + side * length * unit, evidence.coefficients + side * length * evidence.responses[:, position], cavity,
+                        posterior_at, working_bytes, accuracy,
+                    )
+                    for side in (-1.0, 1.0)
+                ]
+                if any(side is None for side in both):
+                    break
+                quotients.append((both[1].value - both[0].value) / (2.0 * length))
+            if len(quotients) == 2 and abs(quotients[0] - quotients[1]) <= bound(step) + bound(0.5 * step):
+                break
+            step *= 0.5
+        gradient[position] = quotients[0]
+        steps[position] = step
+        errors[position] = bound(step)
+    return gradient, scale, steps, errors
 
 
 def hyper_step(
-    prior: ScaleMixturePrior, hyperparameters: MixtureHyperparameters, cavity: Cavity, working_bytes: int, tolerance: float
+    prior: ScaleMixturePrior, hyperparameters: MixtureHyperparameters, cavity: Cavity, posterior_at: PosteriorAt, working_bytes: int, tolerance: float
 ) -> HyperStep:
-    """Maximize V over every penalty weight in [0, infinity], with x at the penalized maximum for each, to ``tolerance``
-    nats: the resolution the fit certifies (1/(2K) for a scorer with K posterior draws)."""
+    """Maximize the B-evidence over every penalty weight in [0, infinity], with x at the penalized maximum for each, to
+    ``tolerance`` nats: the resolution the fit certifies (1/(2K) for a scorer with K posterior draws).
+
+    The search steers by the fixed-cavity gradient and accepts on V (with B). At the end, the B-evidence's own
+    stationarity is checked by one central difference per interior weight (lead ruling); while the gain a Newton step
+    on that difference predicts exceeds ``tolerance``, the search continues along it, accepting only steps that raise V.
+    """
     start_objective = _data_objective(prior, hyperparameters.coefficients, cavity, working_bytes)
     infinite = frozenset(int(position) for position in np.flatnonzero(hyperparameters.log_smoothing == np.inf))
     zero = frozenset(int(position) for position in np.flatnonzero(hyperparameters.log_smoothing == -np.inf))
@@ -1194,16 +1685,63 @@ def hyper_step(
     start_decrement = 0.5 * float(start_gradient @ _ascent_direction(-start_hessian, start_gradient))
     bounds = _smoothing_bounds(prior, start_objective)
     log_smoothing, coefficients, evidence, start_evidence = _maximize_evidence(
-        prior, hyperparameters.log_smoothing, hyperparameters.coefficients, cavity, working_bytes, bounds, tolerance
+        prior, hyperparameters.log_smoothing, hyperparameters.coefficients, cavity, posterior_at, working_bytes, bounds, tolerance
     )
-    interior = np.array([np.isfinite(weight) and bound[0] < weight < bound[1] for weight, bound in zip(log_smoothing, bounds)])
-    interior_gradient = evidence.gradient[interior[np.isfinite(log_smoothing)]]
+    final_infinite = frozenset(int(position) for position in np.flatnonzero(log_smoothing == np.inf))
+    final_zero = frozenset(int(position) for position in np.flatnonzero(log_smoothing == -np.inf))
+    final_view, final_allowed = _restricted_prior(prior, final_infinite, final_zero)
+    finite_final = np.isfinite(log_smoothing)
+    weights = log_smoothing[finite_final]
+    lower = np.array([bound[0] for bound in bounds])[finite_final]
+    upper = np.array([bound[1] for bound in bounds])[finite_final]
+    evidence = replace(evidence, coefficients=final_allowed.T @ coefficients)
+    while True:
+        interior = (weights > lower) & (weights < upper)
+        check, curvature, check_steps, check_errors = _stationarity_check(
+            final_view, weights, evidence, interior, cavity, posterior_at, working_bytes, tolerance
+        )
+        if 0.5 * float(np.sum(np.square(np.abs(check) + check_errors) / curvature)) <= tolerance:
+            break
+        direction = check / curvature
+        step_length, moved = 1.0, None
+        while step_length * float(np.max(np.abs(direction))) > _HALF_PRECISION * (1.0 + float(np.max(np.abs(weights)))):
+            trial_weights = np.clip(weights + step_length * direction, lower, upper)
+            trial = _certified_evidence(
+                final_view, trial_weights, evidence.coefficients + evidence.responses @ (trial_weights - weights), cavity, posterior_at, working_bytes,
+                tolerance, final_allowed.T @ initial_hyperparameters(prior).coefficients,
+            )
+            if trial is not None and trial.value > evidence.value:
+                moved = (trial_weights, trial)
+                break
+            step_length *= 0.5
+        if moved is None:
+            break
+        # The search resumes from the moved point, edges and structural starts included. It keeps the move when the
+        # resumed search ends lower (a basin chosen by its corrected V), so V rises at every pass and the loop ends.
+        weights, evidence = moved
+        resumed_smoothing = log_smoothing.copy()
+        resumed_smoothing[finite_final] = weights
+        resumed = _maximize_evidence(prior, resumed_smoothing, final_allowed @ evidence.coefficients, cavity, posterior_at, working_bytes, bounds, tolerance)
+        if resumed[2].value > evidence.value:
+            log_smoothing, coefficients, evidence = resumed[0], resumed[1], resumed[2]
+            final_infinite = frozenset(int(position) for position in np.flatnonzero(log_smoothing == np.inf))
+            final_zero = frozenset(int(position) for position in np.flatnonzero(log_smoothing == -np.inf))
+            final_view, final_allowed = _restricted_prior(prior, final_infinite, final_zero)
+            finite_final = np.isfinite(log_smoothing)
+            weights = log_smoothing[finite_final]
+            lower = np.array([bound[0] for bound in bounds])[finite_final]
+            upper = np.array([bound[1] for bound in bounds])[finite_final]
+            evidence = replace(evidence, coefficients=final_allowed.T @ coefficients)
+    log_smoothing = log_smoothing.copy()
+    log_smoothing[finite_final] = weights
     return HyperStep(
-        hyperparameters=MixtureHyperparameters(coefficients=coefficients, log_smoothing=log_smoothing),
+        hyperparameters=MixtureHyperparameters(coefficients=final_allowed @ evidence.coefficients, log_smoothing=log_smoothing),
         penalized_objective=evidence.penalized_value,
         evidence=evidence.value,
         newton_decrement=evidence.newton_decrement,
-        smoothing_gradient=float(np.max(np.abs(interior_gradient))) if interior_gradient.size else 0.0,
+        smoothing_gradient=float(np.max(np.abs(check))) if check.size else 0.0,
         start_decrement=start_decrement,
         evidence_gain=evidence.value - start_evidence.value,
+        stationarity_steps=check_steps,
+        stationarity_errors=check_errors,
     )
