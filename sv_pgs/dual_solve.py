@@ -559,17 +559,27 @@ class ResolvedSites:
 
 
 def resolved_design(source: DualTileSource, models: DualModels, resolved: ResolvedSites) -> dict:
-    """Xt_L (n x |L|) of every model with resolved sites, from its genotype columns."""
+    """Xt_L (n x |L|) of every model with resolved sites, its columns in the order of the model's indices.
+
+    The blocks yield the columns in variant order, so they are put back in the order the sites
+    (precision, shift) are given in; the core pairs column k with site k.
+    """
     array_module = source.array_module
     designs: dict[int, Any] = {}
     for model, indices in resolved.indices.items():
         indices = np.asarray(indices, dtype=np.int64)
         if indices.size == 0:
             continue
+        if np.unique(indices).size != indices.size:
+            raise ValueError("a model's resolved indices must be distinct.")
+        order = np.argsort(indices, kind="stable")
+        ascending = indices[order]
         columns = array_module.concatenate(
-            [tile.columns(indices[(indices >= start) & (indices < stop)] - start) for start, stop, tile in source.blocks()], axis=1
+            [tile.columns(ascending[(ascending >= start) & (ascending < stop)] - start) for start, stop, tile in source.blocks()], axis=1
         )
-        designs[model] = models.design_to_sample(columns, array_module.full(indices.size, model))
+        given_order = np.empty_like(order)
+        given_order[order] = np.arange(order.size)
+        designs[model] = models.design_to_sample(columns[:, array_module.asarray(given_order)], array_module.full(indices.size, model))
     return designs
 
 

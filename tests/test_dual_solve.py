@@ -305,13 +305,22 @@ def test_a_column_budget_keeps_the_largest_spikes() -> None:
 
 
 def test_the_split_eliminates_negative_sites_exactly_in_mean_and_draws() -> None:
+    for descending in (False, True):
+        _check_split(descending)
+
+
+def _check_split(descending: bool) -> None:
+    """The split with its resolved sites listed ascending or descending: column k must pair with site k."""
     genotypes, bounds, covariates, weights, variances, prior_mean, response = _problem(15)
     rng = np.random.default_rng(23)
     model = 0
     projector, design, _precision, _operator = _dense(genotypes, covariates, weights, variances, model)
     data = design.T @ design
     site_precision = 1.0 / variances[:, model]
-    negative = np.argsort(variances[:, model])[-2:]
+    # The two largest site variances, in a fixed order (argsort's order among ties varies by platform).
+    negative = np.sort(np.argsort(variances[:, model], kind="stable")[-2:])
+    if descending:
+        negative = negative[::-1]
     site_precision[negative] = 0.0
     block = np.linalg.inv(data + np.diag(site_precision))[np.ix_(negative, negative)]
     site_precision[negative] = -0.5 / np.linalg.eigvalsh(block)[-1]
