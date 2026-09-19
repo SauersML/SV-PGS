@@ -59,7 +59,7 @@ A variant is included if its interval overlaps TSS ± 1 Mb, the cis window of MA
 - **mr_ash:** a faithful port of mr.ash.alpha 8e257fd with its published defaults, cited in `baselines.py`.
 - **The engine's current design** is added when it lands on main.
 
-The baselines' math checks are in `tests/test_baselines.py`: REML optimality against direct REML, dual/primal BLUP identity, sparse recovery, and lead-variant choice.
+The baselines' math checks are in `tests/test_bench_real_baselines.py`: REML optimality against direct REML, dual/primal BLUP identity, sparse recovery, and lead-variant choice.
 
 ## Leakage rules
 - MAGE's published eQTL, fine-mapping and colocalization results were computed on all 731 samples, including every test fold. **They must never be used as features, priors or gene filters.**
@@ -95,7 +95,7 @@ The baselines' math checks are in `tests/test_baselines.py`: REML optimality aga
 - **Other caveats:** reference-LD mismatch, and the estimator's bias under that mismatch.
 
 ## Running it
-The baselines need numba, which isn't a repository dependency. Run in a venv with numpy, scipy, pandas, cyvcf2 and numba, and bcftools on PATH. From the repository root:
+The baselines need numba, which is in the repository's dev dependency group. bcftools must be on PATH. From the repository root:
 
     python benchmarks/bench_real/fetch_mage.py <root>/data/mage
     benchmarks/bench_real/fetch_genotypes.sh <root> <public-dir> <threads>
@@ -107,4 +107,4 @@ The baselines need numba, which isn't a repository dependency. Run in a venv wit
 
 Set OMP_NUM_THREADS=1 (and the OpenBLAS, MKL and numba equivalents) when running several workers.
 
-The math checks run with `python -m pytest benchmarks/bench_real/tests`. They sit outside the CI testpaths because of numba.
+The math checks are `tests/test_bench_real_baselines.py`, in the regular suite, on synthetic data only.
