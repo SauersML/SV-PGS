@@ -21,11 +21,9 @@
 
 ## What remains, in order
 1. **Stage 1 (EP-EB LD-space warm start) is not on main.**
-   - The newest work is tag `archive/2026-09-19/build-ep-oracle`. It holds a dense EP-EB reference (`tests/ep_eb_reference.py`), the nonparametric scale-mixture oracle, learned difference penalties, log-space mixing weights and an analytic Hessian.
-   - Its landing attempt, PR #6 (closed), failed two tests in CI:
-     - `test_fit_is_a_joint_fixed_point_and_deterministic` does not converge in 300 outer iterations (about 14 min);
-     - `test_orthogonal_ep_is_the_exact_posterior` trips the reference's own design rank check.
-   - Fix both, land the oracle in `tests/`, then land Stage 1 gated against it.
+   - **The dense EP-EB reference is on main:** `tests/ep_eb_reference.py`, checked by `tests/test_ep_eb_reference.py` (see MODEL.md §3–4). It is the exactness oracle; its gates for Stage 1 are in the oracle lane's STAGE1_GATES.md.
+   - **Its full fit is not yet tested.** On the sparse test problem (6 causal of 60) the coefficient maximization finds no interior optimum: the shared density's unpenalized quadratic part lets mass escape toward zero variance or pile at the range ends. That is the EB optimum sitting at a model boundary; it needs a ruling from the lead with math-density.
+   - Land Stage 1 gated against the reference.
    - Gates: rel ≤ 1e-6 to the dense reference; within ~2% of Gibbs; calibration slope ≥ 0.85; stable across sweeps 20–150.
    - Fix the implementation overhead: it needs batched block Cholesky and site updates across blocks and models (see COMPUTE.md).
    - Fold in the fp64/fp32 Cholesky policy and multi-GPU dispatch from e2854ca (tags `archive/2026-09-19/build-stage1` and `archive/2026-09-19/wip-wt-build-store`).

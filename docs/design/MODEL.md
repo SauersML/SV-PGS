@@ -44,7 +44,10 @@ Untagged numbers are derivations, definitions or targets.
 ## 3. Prior
 
 - **Effect prior:** β_j | class c ~ ∫ N(0, u_j · s) g_c(s) ds.
-  - The mixing density g_c is learned nonparametrically by empirical Bayes for each class: a dense log-scale grid with a learned smoothness penalty, over a data-driven scale range.
+  - The mixing density g_c is learned nonparametrically by empirical Bayes for each class. It is a continuous function of t = log s, log g_c = η + δ_c: a shared shape η plus a class deviation δ_c.
+    - Each carries a learned weight on its third-order roughness ∫(f‴)² dt. The deviations' location and width share one learned precision.
+    - The third order is derived: its null space, the normal density in log s, is the only proper λ = ∞ limit. The flat and power-law limits of lower orders are not normalizable, so they depend on where the range is cut.
+    - Grids are only quadrature (composite Gauss–Legendre, certified a posteriori), over a range extended until the tails are negligible. No grid constant is set by hand (SPEC 131b205).
   - There is no point mass at zero; effects are continuous, so the prior is continuous.
   - TPB and BayesR-like shapes are special cases. A learned mixing density exists because a fixed-shape TPB lost to BayesR by 0.025–0.10 R² in fifteen Gibbs scenarios [sim-only: design-reliability founder mosaics]. The E6 scenarios showed the opposite [sim-only: design-trlocus].
 - **Scale model:** log u_j = level_c + log r̂²_j + d_jᵀθ.
@@ -67,7 +70,9 @@ Untagged numbers are derivations, definitions or targets.
 
 - **Method:** type-II maximum likelihood under an expectation-propagation approximation, with exact one-dimensional tilted moments. It matched exact Gibbs within ±1.5%. The old GIG mean-field fit was 23–36% worse, and its plug-in fixed point 28–42% worse [sim-only: theory-inference E6 on design-trlocus scenarios].
 - **Hyper step:**
-  - a moment start, then the MacKay/Fellner–Schall fixed point with Anderson acceleration, inside a trust region;
+  - the coefficients maximize log Z_EP − ½xᵀS_λx by Newton with the total curvature B = −∇² log Z_EP, with EP re-solved (docs/design/math/ep_eb.md §1.4);
+  - the penalty weights maximize the Laplace evidence with B directly: an exact gradient, and each weight compared at λ = ∞ (exactly, in its penalty's null space) and inside. The λ = ∞ score test is ½(q − d + c), with c = −tr(H_KK⁻¹KᵀD_xB[v]K) the curvature change that the Gaussian (Tipping–Faul) form omits. Fellner–Schall is not used: it creeps toward infinite optima and is not the Laplace maximizer for a non-Gaussian likelihood;
+  - EP is unclipped, Newton on the moment equations with the Opper–Winther double loop as the fallback (the dense reference, `tests/ep_eb_reference.py`);
   - a warm-up before the first hyper step.
   - Plain EM converges at rate ≥ 1 − edf/p, about 0.99 at production scale. From the defaults its reported SV/SNV enrichment was 1.65 whatever the truth [sim-only: gam-eval reproducer].
 - **Certificate:** the Newton decrement of the hyper objective (in nats) together with the relative prediction change ‖XΔμ‖/‖Xμ‖. Parallel EP leaves a few sites in limit cycles, so the per-site maximum is not a certificate. The certificate is recorded in the artifact, and a fit without it is not accepted.
@@ -81,7 +86,7 @@ Untagged numbers are derivations, definitions or targets.
   - The TR length columns as an exact sparse map of stored codes.
   - The tagging and ρ² features.
   - The candidate set by the information rule N·Var(D_j)·r̂²_j·τ²_c ≥ c. It is variance-based, so copy-number rows are kept, and in exact Bayes it is a compute knob only.
-- **Stage 1: the LD-space EP-EB warm start**, one per trait × fold. It is not on main yet. The newest work, the dense EP-EB reference, is tag `archive/2026-09-19/build-ep-oracle` (see HANDOFF.md).
+- **Stage 1: the LD-space EP-EB warm start**, one per trait × fold. It is not on main yet; it is gated against the dense EP-EB reference in `tests/ep_eb_reference.py` (see HANDOFF.md).
 - **Stage 2: full-data certification** (`exact_polish.py`).
   - Block-Jacobi PCG on the FWL-projected system, which needed 17–28 passes where block Gauss–Seidel needed over 40 [sim-only: synthetic store].
   - Control-variate Hutchinson estimates of diag(Σ), using the block inverse as the control variate.
