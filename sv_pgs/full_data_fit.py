@@ -66,13 +66,15 @@ from sv_pgs.scale_mixture_ep import (
     fit_hyperparameters,
     initial_hyperparameters,
     moment_matched_prior_sites,
+    noise_gain,
     noise_variance,
     prior_second_moment,
     site_targets,
     tilted_moments,
 )
 
-_HALF_PRECISION = float(np.finfo(np.float64).eps) ** 0.5
+_EPSILON = float(np.finfo(np.float64).eps)
+_HALF_PRECISION = _EPSILON ** 0.5
 
 
 def stage0_lattice(
@@ -127,7 +129,7 @@ class FitCertificate:
     - ``negative_sites``: sites with negative precision (allowed; EP is unclipped);
     - ``effective_effects``: p_eff = p - sum_j tau_j z_j;
     - ``outer_iterations``, ``halvings`` and ``unresolved``: accepted outer steps, refused trials, and those refused for
-      having no EP fixed point;
+      having no EP fixed point, whose reasons ``refusals`` keeps;
     - ``prediction_move``: the certifying Newton step's move of q's mean in q's posterior metric, against
       ``prediction_tolerance`` = p_eff / K (MODEL.md: the certificate includes the prediction change);
       ``refreshes`` and ``passes``: certified variance refreshes and mean solves over the whole fit.
@@ -151,6 +153,7 @@ class FitCertificate:
     prediction_move: F64Array
     prediction_tolerance: F64Array
     unresolved: I64Array
+    refusals: tuple[str, ...]
     refreshes: int
     passes: int
 
@@ -176,9 +179,10 @@ def _norm_bounds(products: F64Array, bound: F64Array) -> tuple[F64Array, F64Arra
     return lower, upper
 
 
-def _posterior(gaussian: DualGaussian, model: int, grams: BlockGrams, variances: F64Array) -> GaussianPosterior:
-    """q's responses at the current refresh for the total curvature: Sigma R by the dual solver, each column to a
-    relative error in the posterior metric, and -(Sigma o Sigma) W by the leave-block-out map."""
+def _posterior(gaussian: DualGaussian, model: int, grams: BlockGrams, variances: F64Array, ensure: Callable[[], None]) -> GaussianPosterior:
+    """q's responses at this refresh for the total curvature: Sigma R by the dual solver, each column to a relative
+    error in the posterior metric, and -(Sigma o Sigma) W by the leave-block-out map. ``ensure`` puts the dual
+    solver back at this refresh's sites before it is asked (a later trial may have moved it)."""
     solve = gaussian.bulk_solves[model]
 
     def relative_solve(right: F64Array, relative_tolerance: float) -> F64Array:
@@ -188,6 +192,7 @@ def _posterior(gaussian: DualGaussian, model: int, grams: BlockGrams, variances:
         solution = np.zeros_like(values)
         live = np.flatnonzero(np.any(values != 0.0, axis=0))
         bound = relative_tolerance * np.sqrt(np.square(values[:, live]).T @ variances)
+        ensure()
         while live.size:
             solved = np.asarray(gaussian.posterior_solve(values[:, live], model, bound), dtype=np.float64)
             lower, _upper = _norm_bounds(np.sum(values[:, live] * solved, axis=0), bound)
@@ -222,6 +227,11 @@ def _precision_norm(gaussian: DualGaussian, model: int, site_precision: F64Array
     return norm
 
 
+class NoFixedPoint(FloatingPointError):
+    """EP has no certified fixed point at these hyperparameters (an improper cavity, a failed cavity information
+    certificate, or no positive definite precision): the outer loop refuses the trial. Any other error is a failure."""
+
+
 class _FullDataFixedPoints:
     """``scale_mixture_ep.FixedPoints`` on the full data: each model's certified EP fixed point at its
     hyperparameters, with its noise variance stationary, warm from the previous call (the module docstring's step 1)."""
@@ -248,6 +258,9 @@ class _FullDataFixedPoints:
         self.information: list[BlockCertificate] = []
         self.refreshes = 0
         self.passes = 0
+        # The dual solver's state changes with every solve; a FixedPoint records the version it was built at.
+        self.version = 0
+        self.refusals: list[str] = []
 
     def _iterate(self, site_precision: F64Array, site_shift: F64Array) -> None:
         certificate = self.gaussian.iterate(
@@ -256,6 +269,25 @@ class _FullDataFixedPoints:
         )
         self.mean_error = np.asarray(certificate.error_bound, dtype=np.float64)
         self.passes += 1
+        self.version += 1
+
+    def _snapshot(self) -> dict:
+        return {
+            "site_precision": self.site_precision.copy(), "site_shift": self.site_shift.copy(), "noise": self.noise.copy(),
+            "effective": self.effective.copy(), "probe_ratio": self.probe_ratio, "version": self.version,
+        }
+
+    def _restore(self, snapshot: dict) -> None:
+        """The oracle and the dual solver back at a snapshot's sites."""
+        self.site_precision, self.site_shift = snapshot["site_precision"].copy(), snapshot["site_shift"].copy()
+        self.noise, self.effective = snapshot["noise"].copy(), snapshot["effective"].copy()
+        self.probe_ratio = snapshot["probe_ratio"]
+        self._iterate(self.site_precision, self.site_shift)
+        snapshot["version"] = self.version
+
+    def _ensure(self, snapshot: dict) -> None:
+        if self.version != snapshot["version"]:
+            self._restore(snapshot)
 
     def _refresh(self) -> tuple[F64Array, list[BlockGrams]]:
         """Solve the mean and compute the certified marginal variances (p, M) at the current sites; negative sites
@@ -264,25 +296,31 @@ class _FullDataFixedPoints:
         while True:
             try:
                 self._iterate(self.site_precision, self.site_shift)
+            except np.linalg.LinAlgError:
+                failure = "the full-data precision is not positive definite with non-negative sites"
+            else:
                 grams = [block_grams(self.statistics, float(self.noise[model])) for model in range(gaussian.model_count)]
                 variances = np.column_stack([marginal_variances(solve, model_grams) for solve, model_grams in zip(gaussian.bulk_solves, grams)])
-                if np.all(1.0 / variances - self.site_precision > 0.0):
+                improper = 1.0 / variances - self.site_precision <= 0.0
+                if not np.any(improper):
                     self.refreshes += 1
                     self.information = [self._information(model, variances[:, model], grams[model]) for model in range(gaussian.model_count)]
                     for model, certificate in enumerate(self.information):
                         if np.any(certificate.violated):
-                            raise FloatingPointError(
+                            raise NoFixedPoint(
                                 f"model {model}: the marginal variances fail the cavity information certificate in "
                                 f"{int(np.count_nonzero(certificate.violated))} of {certificate.violated.shape[0]} blocks"
                             )
                     self.probe_ratio = min(certificate_tolerance(solve, gaussian.probe_count) for solve in gaussian.bulk_solves)
-                    self.effective = self.prior.variant_count - np.sum(self.site_precision * variances, axis=0)
+                    # p_eff is known to its rounding, p eps: floored there, so p_eff / K is never zero.
+                    count = self.prior.variant_count
+                    self.effective = np.maximum(count - np.sum(self.site_precision * variances, axis=0), _EPSILON * count)
                     return variances, grams
-            except np.linalg.LinAlgError:
-                pass
+                models = sorted(set(np.flatnonzero(np.any(improper, axis=0)).tolist()))
+                failure = f"models {models}: a cavity is improper (1/z - tau <= 0) with non-negative sites"
             negative = self.site_precision < 0.0
             if not np.any(negative):
-                raise FloatingPointError("the full-data precision is not positive definite with non-negative sites")
+                raise NoFixedPoint(failure)
             self.site_precision[negative] *= 0.5
 
     def _information(self, model: int, variances: F64Array, grams: BlockGrams) -> BlockCertificate:
@@ -308,6 +346,7 @@ class _FullDataFixedPoints:
                 covariate_count=int(gaussian.covariates.shape[1]),
                 site_precision=self.site_precision[:, model],
                 posterior_variance=variances[:, model],
+                noise=float(self.noise[model]),
             )
             for model in range(gaussian.model_count)
         ])
@@ -327,7 +366,18 @@ class _FullDataFixedPoints:
                 return float(upper[0] * upper[0])
             bound = 0.5 * bound
 
-    def __call__(self, hyperparameters: Sequence[MixtureHyperparameters]) -> list[FixedPoint]:
+    def __call__(self, hyperparameters: Sequence[MixtureHyperparameters]) -> list[FixedPoint | None]:
+        """Each model's certified EP fixed point, or None for every model when EP has none at these hyperparameters
+        (the dual solver's state is shared, so a refusal restores all of it); the reason is kept in ``refusals``."""
+        snapshot = self._snapshot()
+        try:
+            return list(self._solve(hyperparameters))
+        except NoFixedPoint as error:
+            self._restore(snapshot)
+            self.refusals.append(str(error))
+            return [None] * self.gaussian.model_count
+
+    def _solve(self, hyperparameters: Sequence[MixtureHyperparameters]) -> list[FixedPoint]:
         gaussian = self.gaussian
         model_count = gaussian.model_count
         tolerance = 0.5 / self.draw_count
@@ -342,13 +392,17 @@ class _FullDataFixedPoints:
             draw_tolerance = self.effective / self.draw_count
             self.mean_move = np.array([self._move_bounds(model, right[:, model], float(draw_tolerance[model])) for model in range(model_count)])
             noise = self._noise(variances)
-            degrees = gaussian.training_counts - int(gaussian.covariates.shape[1]) - self.effective
-            self.noise_gain = 0.25 * degrees * np.square(np.log(noise / self.noise))
+            covariate_count = int(gaussian.covariates.shape[1])
+            self.noise_gain = np.array([
+                noise_gain(float(noise[model]), float(self.noise[model]), int(gaussian.training_counts[model]), covariate_count)
+                for model in range(model_count)
+            ])
             if np.all(self.mean_move <= draw_tolerance) and np.all(self.noise_gain <= tolerance):
+                snapshot = self._snapshot()
                 return [
                     FixedPoint(
                         cavity=cavities[model],
-                        posterior=_posterior(gaussian, model, grams[model], variances[:, model]),
+                        posterior=_posterior(gaussian, model, grams[model], variances[:, model], lambda snapshot=snapshot: self._ensure(snapshot)),
                         mean=mean[:, model].copy(),
                         precision_norm=_precision_norm(gaussian, model, self.site_precision[:, model]),
                         effective_effects=float(self.effective[model]),
@@ -367,7 +421,13 @@ class _FullDataFixedPoints:
         while True:
             mean = np.asarray(gaussian.mean, dtype=np.float64).copy()
             fraction = damping
+            move = max(float(np.max(np.abs(target_precision - self.site_precision))), float(np.max(np.abs(target_shift - self.site_shift))))
+            scale = 1.0 + max(float(np.max(np.abs(self.site_precision))), float(np.max(np.abs(self.site_shift))))
             while True:
+                if fraction * move <= _EPSILON * scale:
+                    # The damped step no longer moves the sites past their rounding: no damped EP pass keeps the
+                    # precision positive definite from here.
+                    raise NoFixedPoint("no damped EP pass keeps the full-data precision positive definite")
                 trial_precision = self.site_precision + fraction * (target_precision - self.site_precision)
                 trial_shift = self.site_shift + fraction * (target_shift - self.site_shift)
                 try:
@@ -425,6 +485,7 @@ def fit_full_data(
             prediction_move=np.array([fit.prediction_move for fit in fits]),
             prediction_tolerance=np.array([fit.prediction_tolerance for fit in fits]),
             unresolved=np.array([fit.unresolved for fit in fits], dtype=np.int64),
+            refusals=tuple(fixed_points.refusals),
             refreshes=fixed_points.refreshes,
             passes=fixed_points.passes,
         ),

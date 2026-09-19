@@ -85,9 +85,9 @@ overshoots where (A + S)^-1 (B + S) exceeds 2.
 Every derivative is computed in z = (eta_1, ..., eta_C, theta), where each variant's log Z_j depends on its
 class's eta_c and its own log u_j, and carried to x by the linear map M.
 
-Noise. A quantitative trait's residual variance takes the MacKay form of its
-type-II ML stationarity, sigma^2 = RSS / (n - k - gamma) with
-gamma = p - sum_j tau_j Sigma_jj, the covariates' flat prior removing k.
+Noise. A quantitative trait's residual variance takes the stationarity form of its type-II ML with q held,
+sigma^2' = (RSS + sigma^2 gamma) / (n - k), with gamma = p - sum_j tau_j Sigma_jj and the covariates' flat prior
+removing k. Its fixed point is the MacKay form RSS / (n - k - gamma), which is undefined where gamma >= n - k.
 """
 
 from __future__ import annotations
@@ -659,11 +659,23 @@ def moment_matched_prior_sites(prior: ScaleMixturePrior, hyperparameters: Mixtur
 
 
 def noise_variance(
-    *, residual_sum_of_squares: float, sample_count: int, covariate_count: int, site_precision: F64Array, posterior_variance: F64Array
+    *, residual_sum_of_squares: float, sample_count: int, covariate_count: int, site_precision: F64Array, posterior_variance: F64Array, noise: float
 ) -> float:
-    """sigma^2 = RSS / (n - k - gamma), gamma = p - sum_j tau_j Sigma_jj (the effective number of effects)."""
+    """sigma^2' = (RSS + tr(Xt Sigma Xt')) / (n - k): the evidence's stationarity in sigma^2 with q held, always positive.
+
+    q's precision is Xt'Xt / sigma^2 + diag tau, so tr(Xt Sigma Xt') = sigma^2 gamma with gamma = p - sum_j tau_j
+    Sigma_jj, the effective number of effects. Its fixed point is the MacKay form RSS / (n - k - gamma), which has no
+    solution where gamma >= n - k (p far above n); this form is defined everywhere.
+    """
     effective_effects = float(site_precision.shape[0] - np.sum(site_precision * posterior_variance))
-    return float(residual_sum_of_squares) / (sample_count - covariate_count - effective_effects)
+    return (float(residual_sum_of_squares) + float(noise) * effective_effects) / (sample_count - covariate_count)
+
+
+def noise_gain(new_noise: float, old_noise: float, sample_count: int, covariate_count: int) -> float:
+    """The evidence gain of moving sigma^2 from ``old_noise`` to its stationary value ``new_noise`` with q held:
+    1/2 (n - k) (r - 1 - log r), r = new / old. It is never negative, since r - 1 >= log r."""
+    ratio = float(new_noise) / float(old_noise)
+    return 0.5 * (sample_count - covariate_count) * (ratio - 1.0 - float(np.log(ratio)))
 
 
 # ------------------------------------------------------------------ the hyper objective
@@ -2033,7 +2045,8 @@ def fit_hyperparameters(
     if any(point is None for point in points):
         raise FloatingPointError("a starting point has no certified EP fixed point")
     fits: list[OuterFit | None] = [None] * count
-    pending: list[tuple[_NewtonB, HyperStep | None, F64Array, float, bool] | None] = [None] * count
+    # (the model, its hyper step, the trial step, the radius, whether it certifies, the fraction of Newton's step)
+    pending: list[tuple[_NewtonB, HyperStep | None, F64Array, float, bool, float] | None] = [None] * count
     radii: list[float | None] = [None] * count
     iterations, halvings, unresolved = [0] * count, [0] * count, [0] * count
     steps_taken: list[tuple[HyperStep, float] | None] = [None] * count
@@ -2058,22 +2071,24 @@ def fit_hyperparameters(
             if radius is None:
                 magnitudes = np.maximum(np.abs(newton.eigenvalues), _EPSILON * float(np.max(np.abs(newton.eigenvalues))))
                 radius = float(np.linalg.norm((newton.eigenvectors.T @ newton.gradient) / magnitudes))
-            pending[model] = (newton, step, _proposal(newton, radius), radius, certifying)
+            pending[model] = (newton, step, _proposal(newton, radius), radius, certifying, 1.0)
         if all(fit is not None for fit in fits):
             return [fit for fit in fits if fit is not None]
         trials = [hyperparameters[model] if entry is None else _trial(entry[0], entry[2]) for model, entry in enumerate(pending)]
         trial_points = list(fixed_points(trials))
         for model, entry in enumerate(pending):
             if entry is None:
-                if trial_points[model] is None:
-                    raise FloatingPointError("a certified model lost its EP fixed point")
-                points[model] = trial_points[model]
+                # An oracle that refuses refuses every model at once; a model without a trial keeps its point.
+                if trial_points[model] is not None:
+                    points[model] = trial_points[model]
                 continue
-            newton, step, proposal, radius, certifying = entry
+            newton, step, proposal, radius, certifying, fraction = entry
             trial_point = trial_points[model]
             if trial_point is not None and certifying:
                 current = points[model]
-                move = current.precision_norm(trial_point.mean - current.mean)
+                # A shortened certifying step moves q's mean by its fraction, to first order: the full step's move is
+                # its own over fraction^2 in the squared metric.
+                move = current.precision_norm(trial_point.mean - current.mean) / (fraction * fraction)
                 allowed_move = 2.0 * tolerance * current.effective_effects
                 if move <= allowed_move:
                     certified_step, remaining = steps_taken[model]
@@ -2106,10 +2121,12 @@ def fit_hyperparameters(
             halvings[model] += 1
             if length <= _HALF_PRECISION * (1.0 + float(np.max(np.abs(newton.origin)))):
                 raise FloatingPointError("the Newton-B step makes no certified progress at the EP fixed point")
-            # A shorter step no longer tests the full Newton step: it is an ordinary trial.
+            # A certifying step refused for having no fixed point stays certifying at half the length; one whose
+            # move was too large, or an ordinary one, becomes an ordinary shorter trial.
+            keep = certifying and trial_point is None
             if newton.definite:
-                pending[model] = (newton, step, 0.5 * proposal, radius, False)
+                pending[model] = (newton, step, 0.5 * proposal, radius, keep, 0.5 * fraction)
             else:
                 radius = 0.5 * length
                 radii[model] = radius
-                pending[model] = (newton, step, _proposal(newton, radius), radius, False)
+                pending[model] = (newton, step, _proposal(newton, radius), radius, keep, 0.5 * fraction)

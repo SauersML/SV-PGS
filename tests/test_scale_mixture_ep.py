@@ -16,6 +16,7 @@ from sv_pgs.scale_mixture_ep import (
     INDEPENDENT_EFFECTS,
     CurvatureCorrection,
     FixedPoint,
+    fit_hyperparameters,
     AnnotationGroup,
     Cavity,
     GaussianPosterior,
@@ -49,6 +50,7 @@ from sv_pgs.scale_mixture_ep import (
     kernel_top,
     log_scale,
     moment_matched_prior_sites,
+    noise_gain,
     noise_variance,
     prior_second_moment,
     quadrature_majorant_ratio,
@@ -402,9 +404,23 @@ def test_noise_update_reaches_the_reml_variance_of_a_gaussian_prior_regression()
             covariate_count=covariates.shape[1],
             site_precision=site_precision,
             posterior_variance=np.diag(covariance),
+            noise=variance,
         )
     # The reference maximizer is located to half of double precision in log variance.
     np.testing.assert_allclose(variance, expected, rtol=1e-6)
+
+
+def test_the_noise_update_is_positive_and_its_gain_nonnegative_where_effects_outnumber_samples():
+    # gamma near p = 400 exceeds n - k = 290: the MacKay form has no solution there, the stationarity form does.
+    site_precision = np.full(400, 1e-8)
+    posterior_variance = np.full(400, 1e-3)
+    updated = noise_variance(
+        residual_sum_of_squares=100.0, sample_count=300, covariate_count=10, site_precision=site_precision,
+        posterior_variance=posterior_variance, noise=0.5,
+    )
+    assert updated > 0.0
+    for ratio in (1e-3, 0.5, 1.0, 2.0, 1e3):
+        assert noise_gain(0.5 * ratio, 0.5, 300, 10) >= 0.0
 
 
 def test_the_floor_bounds_the_flat_kernel_error_and_the_top_is_the_largest_mode():
@@ -697,6 +713,33 @@ def test_the_outer_step_never_certifies_where_the_total_curvature_is_indefinite(
     assert np.linalg.norm(step) <= radius * (1.0 + 1e-12)
     # The model rises along the step: g's - s'(B + S)s / 2 > 0.
     assert float(newton.gradient @ step) - 0.5 * float(step @ newton.total @ step) > 0.0
+
+
+def test_the_outer_loop_refuses_a_trial_without_a_fixed_point_and_still_certifies():
+    # Normal means: each effect's cavity is its own likelihood whatever the prior, so the exact fixed point is the
+    # tilted law itself. The oracle has no fixed point at its second call (the first trial): the loop must refuse that
+    # trial, count it, and go on to certify.
+    prior, cavity = _problem(variant_count=60, seed=17, node_count=12)
+    calls = []
+
+    def fixed_points(hyperparameters):
+        calls.append(len(calls))
+        if len(calls) == 2:
+            return [None] * len(hyperparameters)
+        points = []
+        for model in hyperparameters:
+            moments = tilted_moments(prior, model, cavity, _WORKING_BYTES)
+            points.append(FixedPoint(
+                cavity=cavity, posterior=diagonal_posterior(moments.variance), mean=moments.mean,
+                precision_norm=lambda direction, variance=moments.variance: float(np.sum(np.square(direction) / variance)),
+                effective_effects=float(np.sum(cavity.precision * moments.variance)),
+            ))
+        return points
+
+    (fit,) = fit_hyperparameters(prior, [initial_hyperparameters(prior)], fixed_points, _WORKING_BYTES, _EVIDENCE_TOLERANCE)
+    assert fit.unresolved >= 1 and len(calls) > 2
+    assert fit.remaining_gain <= _EVIDENCE_TOLERANCE
+    assert fit.prediction_move <= fit.prediction_tolerance
 
 
 def test_total_curvature_is_the_fixed_cavity_curvature_for_independent_effects():
