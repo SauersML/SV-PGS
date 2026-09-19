@@ -19,7 +19,7 @@ All arms share the same samples, folds, covariates and inference; only the colum
 - **Prior gain** = B − A. It can exist even when SNVs tag every SV perfectly.
 - **Column gain** = C − B. Pre-registered forecast: ≤ ~5e-4 R² per typical trait.
   - The forecast comes from the exact identity Δ_j = r²_j(1 − ρ²_j), where ρ² is how predictable an SV column is from local SNVs.
-  - Imputed SVs measured ρ² ≈ 0.95–0.98 on public data [real: pilot50 imputation vs long-read truth].
+  - Imputed SVs' ρ² [in-workspace: measured in-workspace; value not reproduced here].
 - **Total gain** = C − A.
 
 ## Claims and their tests
@@ -61,7 +61,7 @@ All arms share the same samples, folds, covariates and inference; only the colum
   - Stratified by imputation half × ancestry.
   - Every method uses the same folds. Baselines (LDpred2, SBayesRC, PRS-CS, BayesR, GBLUP) run on in-sample Stage 0 LD, so no external panel penalizes them, and they get their own SV-inclusive arms.
 - **Resampling unit:** the family.
-- **Reporting:** per trait × ancestry and per imputation half, in cells n ≥ 21.
+- **Reporting:** produced inside the AoU workspace for the user, per trait × ancestry and per imputation half, in cells n ≥ 21 as the Dissemination Policy requires. Agents never move results out of the workspace.
   - A, B, C and the three differences, each with a CI;
   - a half × increment interaction test;
   - negative controls and the α ledger.

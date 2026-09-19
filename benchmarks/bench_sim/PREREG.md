@@ -8,17 +8,17 @@ This is the neutral semi-synthetic benchmark (EVIDENCE_RULE.md 2b). It was writt
   - v1 uses chr22. The same scripts extend to chr19–21, then genome-wide.
   - Only founders are used: samples with neither parent in the 3,202 set, per `20130606_g1k_3202_samples_ped_population.txt`.
 - **Donor/panel split.** Within each superpopulation, founders are split 60/40 into donors and an imputation panel, using the public seed 20260919. Cohort haplotypes are copied only from donors, and imputation uses only the panel. That keeps imputation from being unrealistically perfect.
-- **Target cohort: N = 50,000,** with group weights that reproduce the published All of Us mean continental ancestry: EUR 66.4% (West Asian folded in), AFR 19.5%, AMR 6.3%, EAS 2.6%, SAS 3.1% (Sharma et al., Nat Commun 2025, doi:10.1038/s41467-025-59351-8). No AoU data is used.
+- **Target cohort: N = 50,000,** with group weights withdrawn by Amendment 6: they had been derived from a published All of Us statistic, which the user's rule of 2026-09-19 excludes. bench-sim re-specifies them from a non-AoU basis in a later amendment.
 
   | group | weight | mean ancestry | per-person proportions | admixture time T (generations) |
   |---|---|---|---|---|
-  | EUR | 0.5935 | EUR 1.0 | — | — |
-  | AFR-admixed | 0.2326 | AFR 0.80, EUR 0.18, AMR 0.02 | Dirichlet(20·mean) | 7 |
-  | AMR-admixed | 0.1175 | AMR 0.50, EUR 0.42, AFR 0.08 | Dirichlet(20·mean) | 13 |
-  | EAS | 0.0258 | EAS 1.0 | — | — |
-  | SAS | 0.0306 | SAS 1.0 | — | — |
+  | EUR | withdrawn (A6) | EUR 1.0 | — | — |
+  | AFR-admixed | withdrawn (A6) | AFR 0.80, EUR 0.18, AMR 0.02 | Dirichlet(20·mean) | 7 |
+  | AMR-admixed | withdrawn (A6) | AMR 0.50, EUR 0.42, AFR 0.08 | Dirichlet(20·mean) | 13 |
+  | EAS | withdrawn (A6) | EAS 1.0 | — | — |
+  | SAS | withdrawn (A6) | SAS 1.0 | — | — |
 
-  The weights solve the mean-ancestry equations exactly. The admixed-group means and T follow Bryc et al. 2015 (AJHG) and Baharian et al. 2016, coarsened.
+  The withdrawn weights had solved mean-ancestry equations exactly. The admixed-group means and T follow Bryc et al. 2015 (AJHG) and Baharian et al. 2016, coarsened.
 - **Mosaic haplotypes.**
   - Local ancestry switches as a Poisson process in genetic distance at rate T per Morgan. Each new tract's ancestry is drawn from the person's proportions.
   - Within a tract, Li–Stephens copying from that ancestry's donor haplotypes switches donor at rate ρ_a = 4·N_e/K_a per Morgan, with N_e = 20,000 (the IMPUTE2 recommended value) and K_a the donor haplotype count.
@@ -123,7 +123,7 @@ Section 2 is replaced so that the measurement process follows the aou2 imputatio
   - TR and SV records carry no PL, so they are imputed from haplotype matching alone.
 - **Observed values:** every record, SNVs included, is observed as its GLIMPSE2 DS, stored as the uint8 code. Nothing passes through exactly.
 - **Quality annotation:** methods receive GLIMPSE2's per-record INFO score, the sample-weighted mean over batches, in place of Beagle DR2.
-- **Known limitation:** the public panel has 2,072 haplotypes (40% of the 1kGP founders), against aou2's 25,108 long-read haplotypes. Benchmark imputation is therefore less accurate than aou2's, especially for rare variants. The public panel's SVs are short-read GATK-SV calls, not long-read calls.
+- **Known limitation:** the public panel has 2,072 haplotypes (40% of the 1kGP founders), which is smaller than the production long-read panel. Benchmark imputation is therefore less accurate than aou2's, especially for rare variants. The public panel's SVs are short-read GATK-SV calls, not long-read calls.
 
 ## Amendment 2 (2026-09-19, before any submission): implementation details
 - **Genetic positions:** mosaics use the panel's own INFO/CM per record, not the PLINK map. GLIMPSE2 uses its b38 maps.
@@ -152,3 +152,10 @@ Section 2 is replaced so that the measurement process follows the aou2 imputatio
 GLIMPSE2 drops records that are monomorphic in its reference panel: 32,285 chr22 records, all monomorphic among the 1,036 panel founders. In aou2 the imputed callset's records are exactly the panel's records with allele count ≥ 2 (imputation-4c, process fact). So:
 - **The measured records** are those with panel minor allele count ≥ 2, in both arms. Every method, the harness's variant table, the kernels, oracle_observed and the calibration see only these.
 - **Truths are unchanged.** Causal variants outside the measured set still contribute to the genetic value and to oracle_true, but no method can see them. That is the realistic cost of variants missing from the imputation panel.
+
+## Amendment 6 (2026-09-19, before any submission): AoU-related values withdrawn
+The user ruled on 2026-09-19: "never ever use any AoU related data outside of permit and don't download any data from Google or aou buckets ever and don't use real panel". So this document no longer reproduces any AoU-related value:
+- **Target-cohort group weights:** they were derived from a published All of Us mean-ancestry statistic, and are withdrawn. bench-sim re-specifies them from a non-AoU basis, such as the public 1kGP superpopulation composition or a stated design choice, and rebuilds the cohort in a later amendment. Until then, results from the existing cohort are labelled "built under withdrawn weights".
+- **The production panel's size** is no longer quoted.
+- **Kept:** pure process facts about the production imputation, because they are software configuration, not AoU data: tool versions and flags, the hom-ref PL block rule, PLs only at simple sites, and the panel's allele-count ≥ 2 record filter.
+

@@ -1,6 +1,6 @@
 # Design decisions, 2026-09-18/19
 
-Each entry gives the ruling and the measurement or identity behind it. Simulations ran on MSI with public 1kGP/HPRC data or synthetic data. No AoU data was used.
+Each entry gives the ruling and the measurement or identity behind it. Simulations ran on MSI with public 1kGP/HPRC data or synthetic data. No AoU participant data was used outside the AoU workspace. Results measured inside it are tagged [in-workspace], and their values are not reproduced here (user rule, 2026-09-19).
 
 Measurements carry the evidence tags defined in MODEL.md: `[sim-only]`, `[semi-real]`, `[real]` and `[provenance unknown]`. Under the evidence rule, a `[sim-only]` result checks the math and the code, but it is not evidence of an accuracy gain. Rulings resting on it stand until the neutral benchmarks (bench-real, bench-sim) re-measure them.
 
@@ -50,12 +50,12 @@ Measurements carry the evidence tags defined in MODEL.md: `[sim-only]`, `[semi-r
 ## Data
 - **Imputation is final; GLIMPSE2 is never re-run.** Genotype improvements must be post-hoc updates of the delivered output.
 - **Background removal is value-matched,** because the modal floor mis-corrects 20–26% of non-carriers at multi-path records [sim-only: a simulation of the pop algorithm].
-- **D* is a scale-only recalibration.** The isotonic shape added ≤ 0.012 r², and even that was optimistic [real: pilot50 imputation vs long-read truth].
+- **D* is a scale-only recalibration.** The isotonic shape was not supported [in-workspace: measured in-workspace; value not reproduced here].
 - **GATK-SV fusion uses a general measurement model.**
-  - Imputed SV dosages are draw-like, not Berkson [real: pilot50 truth slopes]. The calibrated-A estimator gave GATK-SV zero weight: VNTR fused r² 0.43 against an oracle of 0.76 [sim-only: sim F].
+  - Imputed SV dosages are draw-like, not Berkson [semi-real: bench-sim public 1kGP re-imputation with GLIMPSE2 and Beagle]. The calibrated-A estimator gave GATK-SV zero weight: VNTR fused r² 0.43 against an oracle of 0.76 [sim-only: sim F].
   - The rewrite meets its acceptance targets [sim-only: sim F].
   - Copy number is read from FORMAT/CN, and breakends are dropped.
-- **Stack the 12k long-read panel members.** +7–8% R² at 100k and +18–19% at 50k, a Daetwyler projection the simulation agreed with; truth rows performed like imputed rows [semi-real: 1kGP-based genotypes with emulated imputation]. A truth-scale hyperprior would count the same data twice.
+- **Stack the long-read panel members.** A Daetwyler projection, which the simulation agreed with, favours stacking (its projected gains depend on the in-workspace panel size and are not reproduced here); truth rows performed like imputed rows [semi-real: 1kGP-based genotypes with emulated imputation]. A truth-scale hyperprior would count the same data twice.
 - **External annotations enter as per-source z² with learned weights.**
   - The Bai 2026 SV/VNTR releases, with Pan-UKB as the SNV side (the fastGWA SNV release lacks biochemistry and downloads 57× slower [real]).
   - An RSS likelihood was rejected: there is no public SV–SNV LD, the panel representations differ, and the binary phenotypes are mismatched.
@@ -63,10 +63,10 @@ Measurements carry the evidence tags defined in MODEL.md: `[sim-only]`, `[semi-r
 - **The panel is 21 traits,** about half diseases, chosen by power and phenotype quality and never by SV biology. Near-duplicate traits are dropped, and CKD is defined from lab values.
 
 ## Where the SV gain can come from
-- **Imputed SV columns carry little beyond local SNVs.** ΔR²(column) = r²(1 − ρ²), with ρ² ≈ 0.95–0.98 on public data [real: pilot50 imputation vs long-read truth], so the column gain is ≤ ~5e-4 per trait. Imputing more samples does not raise the SV-specific ceiling.
+- **Imputed SV columns carry little beyond local SNVs.** ΔR²(column) = r²(1 − ρ²), with ρ² [in-workspace: measured in-workspace; value not reproduced here]; where ρ² is near 1, the column gain is small. Imputing more samples does not raise the SV-specific ceiling.
 - **The levers:**
   - SV-informed priors on nearby SNVs, the prior route;
-  - new read evidence at TR and SV alleles, via a post-hoc TR-specialized likelihood update. The measurement is pending; k-mer genotyping did worse than imputation inside TRs [real: the imputation team's SV_FINDINGS test C];
+  - new read evidence at TR and SV alleles, via a post-hoc TR-specialized likelihood update. The measurement is pending; k-mer genotyping inside TRs was evaluated in-workspace (result not reproduced here);
   - reading the GATK-SV calls correctly, which adds copy number and SVs over 10 kb.
 - **Portability is a headline dimension.** The SV gain was 2–4× larger in African-ancestry groups (e.g. +12% EUR, +39% AFR-ancestry, +20% AMR in the most polygenic scenario). A per-ancestry deviation prior lost 7–46%, so training stays pooled [sim-only: idea-ancestry msprime].
 

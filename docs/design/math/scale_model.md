@@ -76,14 +76,14 @@ The same result, in its general non-linear form, is novel-measure's Result 2 in 
 | 0.8 | draw, joint data, recalibrated | 0.53 | 0.35 | +0.59 |
 | 0.95 | draw, joint data, recalibrated | 0.84 | 0.12 | +0.85 |
 
-**Consequences for SV-PGS.** MODEL §2 measured imputed SV/TR dosages as confident draws with κ ≈ √r². So we are in the leaking rows.
+**Consequences for SV-PGS.** Imputed SV/TR dosages behave as confident draws with κ ≈ √r² (MODEL §2; bench-sim's public re-imputation). So we are in the leaking rows.
 - **Single-half prediction:** unaffected to first order. The column space is unchanged, and only the prior's parametrization differs. This is consistent with MODEL §7 ("tag-SNV shrinkage: no PGS gain").
 - **SV credit and enrichment:** biased. The class level $\ell_{SV}$ and every SV-specific θ are estimated from $b$, not $\gamma$, so they are attenuated by the leakage, and the SNP levels are inflated by the same amount. The goal "SVs must win" cannot be judged from D-space levels.
 - **Stacked halves:** mis-specified; see §3.
 
 ## 3. Stacked long-read half
 
-The ~12k long-read panel members enter as hard-call rows on the same sites, with a cohort covariate that is projected out. After the covariate is projected out, half h has weight $w_h$ (its row share), genotype variance $V_h$ and reliability $r_h^2$.
+The long-read panel members enter as hard-call rows on the same sites, with a cohort covariate that is projected out. After the covariate is projected out, half h has weight $w_h$ (its row share), genotype variance $V_h$ and reliability $r_h^2$.
 
 **Marginal.** If every half is calibrated,
 $$r^2_{\rm eff}=\frac{\sum_h w_h V_h r_h^2}{\sum_h w_h V_h},$$
@@ -117,10 +117,10 @@ So **D\* recalibration is required for stacking**, not optional. The HANDOFF ite
 - the independent prior with the $\log r^2$ offset becomes exact;
 - scoring an imputed person with $\tilde D A\gamma$ equals $\tilde D b$, the optimal D-space predictor.
 
-**Estimating A needs aggregates only.**
+**Estimating A needs only per-block covariances, computed inside the AoU workspace.**
 - For $j\neq k$, $\mathrm{Cov}(D_j,T_k)=\mathrm{Cov}(D_j,G_k)$ exactly for any truth $T_k=G_k+e_k$ whose error is independent of the imputed column. So one long-read truth suffices; no triad is needed off the diagonal.
 - The diagonal is $\mathrm{Var}(D^*_j)$ by calibration.
-- This is a per-LD-block covariance, an aggregate. Add it to HANDOFF item 4.
+- This is a per-LD-block covariance. The pipeline computes it inside the AoU workspace, and it never leaves the workspace (HANDOFF item 4).
 - It is not a re-proposal of the MODEL §7 item. That item measured prediction without stacking, where the A-map is a reparametrization. Here the A-map changes the stacked likelihood.
 - **The A-map is the linear projection of novel-measure's Rao-Blackwellised column $X=\mathbb E[G\mid M]$.** It is exact when $X$ is linear in the stored columns. The full $X$ goes further in two cases (novel-measure, sim-only):
   - haplotype-nonlinear tag information: imputed-row r² 0.195 → 0.358 under a single-draw imputer;
@@ -316,7 +316,7 @@ $$\log u_Z=\ell_{TR}+\log r_Z^2+(1+S_{TR})\log\mathrm{Var}(L)+f(d).$$
 $$r_Z^2=\frac{(\Delta^\top\Sigma_{DG}\Delta)^2}{(\Delta^\top\Sigma_D\Delta)(\Delta^\top\Sigma_G\Delta)}.$$
   - **Posterior-mean columns** (Berkson, $\Sigma_{DG}=\Sigma_D$) give $L=Z+\sum_a\Delta_a e_a$ with the error uncorrelated with $Z$, so this reduces to $r_Z^2=\Delta^\top\Sigma_D\Delta/\Delta^\top\Sigma_G\Delta$.
   - **Draw-type columns** have $\Sigma_{DG}=\Sigma_{\rm pm}$ and $\Sigma_D\approx\Sigma_G$, so $r^2_{Z,\rm draw}=(r^2_{Z,\rm pm})^2$. This is the locus analogue of κ = √r².
-  - All three covariances are aggregates. $\Sigma_{DG}$ needs one long-read truth per person, with no triad off the diagonal (§3).
+  - All three covariances are computed inside the AoU workspace and never leave it. $\Sigma_{DG}$ needs one long-read truth per person, with no triad off the diagonal (§3).
   - **Why the length column works:** imputation errors between alleles of similar length have opposite signs and nearly equal $\Delta$, so they cancel in $L$. That makes $r_Z^2$ far larger than the per-allele r², the mechanism behind the measured +4–12%.
 - **Calibrating Z for stacking.** Summing per-record D\* values with allele-specific κ_a does not give a calibrated Z. Z must be recalibrated at the locus: $Z^*=\mu+\kappa_Z(Z-\mu)$, with $\kappa_Z=\Delta^\top\Sigma_{DG}\Delta/\Delta^\top\Sigma_D\Delta$. It is affine, so $r_Z^2$ is unchanged, but it is required before the TR column shares a coefficient with the long-read half (§3).
 
@@ -426,7 +426,7 @@ Ordered by expected gain × confidence. Each is a derived model term plus the me
 3. **Remove the hand-set scale-model penalties** in `prior_design.py` and `config.py` in favour of learned ν and Ω (`hyperprior_pooling.py`). SPEC compliance.
 4. **The A-map for the stacked imputed half (§3),** and SV credit judged in γ-space.
    - Decided by: a stacked simulation with draw-type SV columns and tag SNPs, measuring imputed-half held-out R² and the ℓ_SV bias.
-   - Needs Σ_DG aggregates from one long-read truth (HANDOFF item 4). Consistent with novel-measure's THEORY.md Results 1–2.
+   - Needs Σ_DG, computed inside the workspace from one long-read truth (HANDOFF item 4). Consistent with novel-measure's THEORY.md Results 1–2.
 5. **Locus-level κ_Z for TR columns before stacking,** and the general $r_Z^2$ formula for the TR offset (§7).
 6. **The SV-context kernel (§8),** now implemented in the store: centring within class, self-exclusion, and a measured comparison against the tagging-strength features.
 7. **Shape vs scale (§6).** Nested deviations δ_k orthogonal to {1, t} with learned λ; SBayesRC's mixture-weight annotations give +14% over SBayesR (lit-pgs).

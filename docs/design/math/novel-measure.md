@@ -212,7 +212,7 @@ For those few loci, the principled term is the exact mixture likelihood, with th
 - An optional evidence-ridge recalibration with the imputer's GP is fitted on panel members' leave-one-out values. It is within-population only, because the map does not transfer across ancestries when the imputer is mis-specified.
 - The column is scaled by $\widehat{SD}(G)$ with no reliability offset (4‴), stored with a per-record code scale (8), and scored with the $\beta^\top V\beta$ predictive term (9-iii).
 
-**Decided by an in-workspace diagnostic, aggregates only.** On panel members, compare three leave-one-out reliabilities per stratum:
+**Decided by a diagnostic run inside the AoU workspace.** Its outcome is applied there, and no value leaves the workspace. On panel members, compare three leave-one-out reliabilities per stratum:
 - $r^2(DS, T)$;
 - $r^2(\text{cohort DS averaged by phased local haplotype}, T)$;
 - $r^2(\text{RB}, T)$.

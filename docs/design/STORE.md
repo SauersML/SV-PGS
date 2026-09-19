@@ -2,7 +2,7 @@
 
 One consolidated spec. It replaces the numbered addenda A4 through A4.15. Code: `dosage_store.py`, `store_converter.py`, `external_annotations.py`, `gatksv_source.py`, `gatksv_store_rows.py`, `synthetic_store.py`.
 
-**Data class:** every store built from AoU data is participant-derived and stays inside the AoU workspace where it was built. Only counts-only QC with n ≥ 21 per cell leaves a task.
+**Data class:** every store built from AoU data is participant-derived and stays inside the AoU workspace where it was built. No value computed from AoU data leaves the workspace, QC counts included; QC is read inside the workspace only (user rule, 2026-09-19).
 
 ## Dosage arrays
 - **Layout:** `dosage/half{h}/chrK` is a Zarr v3 uint8 array `[n_records, n_samples_h]`.
@@ -27,7 +27,7 @@ One consolidated spec. It replaces the numbered addenda A4 through A4.15. Code: 
 - Every half shares the chromosome's site list and its sites md5. The fit gives each half its own covariate.
 - MANIFEST `half_measurements[h]` names the measurement:
   - **imputed_dosage:** the two GLIMPSE2 imputation halves. Background is removed as above, and D* is applied where κ exists.
-  - **long_read_calls:** the ~12k long-read panel members, as hard-call ALT counts on the same records. There is no background to remove, and the half is its own reliability class.
+  - **long_read_calls:** the long-read panel members, as hard-call ALT counts on the same records. There is no background to remove, and the half is its own reliability class.
 - **No-calls** occur only in hard-call halves. A no-call is filled with the ancestry group's measured mean at that record over every half. Where the group has no measurement, the record's pooled mean is used. A record measured in no sample is an error.
 
 ## Sidecar `variants/chrK` (one row per record)
@@ -45,7 +45,7 @@ One consolidated spec. It replaces the numbered addenda A4 through A4.15. Code: 
   - Length is not a class; it enters the prior as a smooth of log length. A GATK-SV row's symbolic REF/ALT carry no length, so its sv_length annotation comes from |SVLEN| or the END span (`GatksvRows.lengths`).
 - **Grouping:** bubble_idx, same_pos_first.
 - **Reliability keys:** sv_ctx, cx, has_pl.
-- **r2_truth (f32):** corr²(stored D, G), triad-corrected, computed in-workspace from the r̂ model's coefficients. It stays NaN until they arrive.
+- **r2_truth (f32):** corr²(stored D, G), triad-corrected. The pipeline fits the r̂ model and fills this column inside the AoU workspace. The coefficients never leave it, and outside the workspace the column stays NaN.
 - **tr_locus (u32):**
   - the connected component of GIAB v3.6 "AllTandemRepeatsandHomopolymers_slop5" intervals that the record's trimmed core overlaps;
   - a record bridging intervals merges them;

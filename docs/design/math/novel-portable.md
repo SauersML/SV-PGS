@@ -165,7 +165,7 @@ This is Corollary 3a's monotone dependence.
   - the advantage removed when the SNP model trains on that ancestry;
   - but kept where training lacks the ancestry.
 - Per-ancestry calibration of the dosage, i.e. using E_a[G|D] as the target predictor, cuts imputation loss by 0.003–0.025.
-- The imputer here (r² ≈ 0.72–0.84) is far weaker than GLIMPSE2 with the 12k long-read panel, so the haplotype term is understated.
+- The imputer here (r² ≈ 0.72–0.84) is far weaker than GLIMPSE2 with the production long-read panel, so the haplotype term is understated.
 
 ## 8. An inference pitfall found on the way
 In LD space, a block-diagonal or banded fit ignores the cross-Gram between unlinked blocks. Chance correlation between them, O(1/√n) per pair and summed over many pairs, then double-counts signal. The LD-space residual yᵀy − 2βᵀXᵀy + Σ_b β_bᵀG_bbβ_b is biased low.

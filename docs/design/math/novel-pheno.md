@@ -47,7 +47,7 @@ $$\frac{\mathrm{SNR}(f)}{\mathrm{SNR}(f^*)} = \mathrm{corr}^2(f, f^*), \qquad \m
 
 **Consequences.**
 - Every hand rule is some $f(D)$, and its efficiency, as a fraction of the effective sample size, is $\mathrm{corr}^2(f,f^*)$.
-- That can be computed inside the workspace **without genotypes**, as an aggregate.
+- That can be computed inside the workspace **without genotypes**; the result is used there and never leaves it.
 - A rule that uses only $n_{\rm used}$ people has relative efficiency $n_{\rm used}\,\mathrm{corr}^2_{\rm used}(f,v)/(n\,\mathrm{corr}^2(f^*,v))$.
 
 **Theorem 2 (every target estimates the same direction).** Under A1–A3, the regression of any $f(D)$ on standardized genotypes has coefficients $c_f\beta + O(\beta^2)$, with $c_f = E[\partial_v E[f\mid v]]\,\sigma_g^2/\sigma_L^2$ (Stein's lemma; Brillinger 1982).
@@ -192,7 +192,7 @@ where $E_{im}$ is the product over channels of beta-binomial terms for the pre-o
 
 ## 8. Validation inside the workspace
 
-This is aggregate-only, with every reported cell n ≥ 21, and runs only with the user's authorization.
+It runs inside the AoU workspace only, with the user's authorization, and its results are used there; no value is reported outside the workspace.
 
 | Test | What it reports |
 |---|---|

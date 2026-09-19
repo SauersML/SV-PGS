@@ -29,11 +29,11 @@
    - Settle the prior family: the learned mixing density vs TPB and BayesR on the reliability, TR-locus and multi-trait scenarios.
 2. **Wire the full path end to end:** store → Stage 0 → Stage 1 → Stage 2 → score. Run it on synthetic data first; the harness is tag `archive/2026-09-19/lane-e2e` (and `lane-e2e-nodamp`).
 3. **Cutover: done** (C0–C8, `21cdec3`…`3d63745`). The step-by-step record, and the old tests whose intent the engine's tests carry, are in [CUTOVER.md](CUTOVER.md); the CDR input locations the old runner documented are in [CDR_LAYOUT.md](CDR_LAYOUT.md). The pre-cutover tree is tag `archive/2026-09-19/old-path-final`.
-4. **Data-side inputs from the imputation team (aggregates only):**
-   - the r̂ model coefficients: target corr²(stored D, G), triad-corrected, with smooth terms in AF, log N_PATHS_TOTAL, log size and rsq_ds;
-   - the E[G|DS] table, which gives the per-stratum κ for D*;
-   - the has_pl mapping;
-   - the TR-locus size histogram.
+4. **Reliability inputs are computed only inside the AoU workspace, by the pipeline itself.** Nothing AoU-derived is delivered to SV-PGS outside the workspace, and no AoU-derived number is requested from the imputation team (user rule, 2026-09-19; the imputation team confirmed). The pipeline fits and uses, in-workspace, from the long-read truth rows:
+   - the r̂ model: target corr²(stored D, G), triad-corrected, with smooth terms in AF, log N_PATHS_TOTAL, log size and rsq_ds;
+   - the per-stratum, per-ancestry E[G|DS] calibration, which gives κ for D*;
+   - the has_pl mapping and the TR-locus size distribution;
+   - the A-map's per-block Σ_DG (scale_model.md §3).
 5. **In-workspace pieces:**
    - the fusion's E[B | SL] no-call fill (it needs the GATK-SV SL field, checked in the VCF header inside the workspace);
    - service-half gates S1–S3 when that half arrives.
@@ -47,7 +47,7 @@
    - TR mutation-rate features;
    - the family-history liability targets for the diseases.
 7. **Pilot:**
-   - P1: the store converter on one chromosome of the real imputed data inside the imputation workspace, with counts-only QC.
+   - P1: the store converter on one chromosome of the real imputed data inside the imputation workspace, with QC read inside the workspace only; no value leaves it.
    - P2: chr22 with two quantitative traits, SNV vs SNV+SV, on one spot VM.
    - Both run through the in-perimeter launcher (COMPUTE.md). Validate on synthetic data first.
 
@@ -56,7 +56,7 @@
 2. **Confirm the ID-map source.** Imputed samples are keyed by sequencing IDs; the model needs research IDs.
 3. **Approve the data pull.**
    - The plan: build the 8-bit stores inside the imputation workspace, then pull only the stores into the SV-PGS workspace with an in-perimeter copy.
-   - The imputed store is about 0.45 TB for 50k samples, against about 13.6 TB of raw BCFs. The long-read half is about 0.1–0.2 TB.
+   - The imputed store is about 0.45 TB for 50k samples (8-bit codes); the long-read half is smaller.
    - The copy is same-region, so there is no egress. No permission changes are needed.
    - Agents never move data between workspaces without this approval.
 

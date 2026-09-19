@@ -15,7 +15,7 @@ Lane speed-floor, 2026-09-19. It covers the whole pipeline for 21 traits × 5 fo
 - [spec]: a vendor peak rate.
 - [est]: an estimate with its basis stated.
 
-**Workload W.** n = 10⁵ samples (the plan; today 50k + 12k), p = 1.7·10⁷ columns, M = 105, K_d posterior draws per model (64 today).
+**Workload W.** n = 10⁵ samples (the plan), p = 1.7·10⁷ columns, M = 105, K_d posterior draws per model (64 today).
 - The store holds b bits per code: 8-bit uint8 gives B = n·p = 1.70 TB, and the codec gives b = 1–2, i.e. B = 0.21–0.43 TB.
 - The unit of work is 2·n·p = 3.4·10¹² multiply-adds per right-hand-side column per pass.
 

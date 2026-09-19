@@ -312,9 +312,9 @@ DISEASE_DEFINITIONS: tuple[DiseaseDefinition, ...] = (
 #    _estimate_person_variance_components and _person_blup.
 #
 # The catalogue is the panel's 11 quantitative traits (design-traits
-# mixed_panel_v1). Codes, units and counts were read off the public All of Us Data
-# Browser (CDR 2025Q4R5, 747,040 participants, counts binned to 20); the
-# participant counts in the comments are that release's.
+# mixed_panel_v1). Codes and units were read off the public All of Us Data
+# Browser (CDR 2025Q4R5). No participant counts are reproduced here (user rule,
+# 2026-09-19: no AoU-related data outside the permitted environment).
 
 ADULT_AGE_YEARS = 18
 # Values from an inpatient or emergency stay, or up to 30 days either side of
@@ -578,7 +578,7 @@ MEASUREMENT_DEFINITIONS: tuple[MeasurementDefinition, ...] = (
         canonical_name="height",
         aliases=("body_height", "standing_height"),
         description="Measured adult body height (cm); stated (self-reported) height is excluded.",
-        # 8302-2 395,480 participants; 3137-7 10,260; PM 903133 600,520.
+        # 8302-2; 3137-7; PM 903133.
         loinc_codes=("8302-2", "3137-7"),
         physical_measurement_concept_ids=(903133,),
         canonical_unit="centimeter",
@@ -605,8 +605,8 @@ MEASUREMENT_DEFINITIONS: tuple[MeasurementDefinition, ...] = (
         canonical_name="body_mass_index",
         aliases=("bmi",),
         description="Body mass index (kg/m2).",
-        # 39156-5 337,440 participants; the enrollment BMI (PPI 903124) is not
-        # in the CDR (<20). Every unit label on 39156-5 carries kg/m2 values.
+        # 39156-5; the enrollment BMI (PPI 903124) is not
+        # in the CDR. Every unit label on 39156-5 carries kg/m2 values.
         loinc_codes=("39156-5",),
         canonical_unit="kilogram per square meter",
         unit_conversions=_units(
@@ -626,7 +626,7 @@ MEASUREMENT_DEFINITIONS: tuple[MeasurementDefinition, ...] = (
         canonical_name="systolic_blood_pressure",
         aliases=("sbp",),
         description="Systolic blood pressure (mmHg); the enrollment value is the mean of the 2nd and 3rd readings.",
-        # 8480-6 341,580; 8459-0 37,940; 76534-7 400; PM mean 903118 515,400.
+        # 8480-6; 8459-0; 76534-7; PM mean 903118.
         loinc_codes=("8480-6", "8459-0", "76534-7"),
         physical_measurement_concept_ids=(903118,),
         excluded_source_concept_ids=(903109, 903114, 903130),
@@ -640,7 +640,7 @@ MEASUREMENT_DEFINITIONS: tuple[MeasurementDefinition, ...] = (
         canonical_name="heart_rate",
         aliases=("pulse", "resting_heart_rate"),
         description="Heart rate (beats/min); the enrollment value is the mean of the 2nd and 3rd readings.",
-        # 8867-4 365,260; PM mean 903126 515,340. Pulse oximetry (8889-8) is
+        # 8867-4; PM mean 903126. Pulse oximetry (8889-8) is
         # mostly monitored care and is left out.
         loinc_codes=("8867-4",),
         physical_measurement_concept_ids=(903126,),
@@ -664,7 +664,7 @@ MEASUREMENT_DEFINITIONS: tuple[MeasurementDefinition, ...] = (
         canonical_name="mean_corpuscular_volume",
         aliases=("mcv",),
         description="Mean corpuscular volume of red cells (fL).",
-        # 787-2 345,360; 30428-7 48,380. "u/m3" is cubic micrometers (= fL).
+        # 787-2; 30428-7. "u/m3" is cubic micrometers (= fL).
         loinc_codes=("787-2", "30428-7"),
         canonical_unit="femtoliter",
         unit_conversions=_units(("femtoliter", 1.0), (NO_UNIT_LABEL, 1.0), ("u/m3", 1.0)),
@@ -676,7 +676,7 @@ MEASUREMENT_DEFINITIONS: tuple[MeasurementDefinition, ...] = (
         canonical_name="platelet_count",
         aliases=("platelets", "plt"),
         description="Platelet count (10^3/uL).",
-        # 777-3 341,900; 26515-7 68,400; 778-1 1,080 (manual).
+        # 777-3; 26515-7; 778-1 (manual).
         loinc_codes=("777-3", "26515-7", "778-1"),
         canonical_unit="thousand per microliter",
         unit_conversions=_BLOOD_COUNT_THOUSANDS_PER_MICROLITER
@@ -697,8 +697,8 @@ MEASUREMENT_DEFINITIONS: tuple[MeasurementDefinition, ...] = (
         canonical_name="white_blood_cell_count",
         aliases=("wbc", "leukocyte_count"),
         description="Leukocyte count (10^3/uL).",
-        # 6690-2 333,820; 26464-8 37,660; 33256-9 39,160 (corrected for
-        # nucleated red cells); 804-5 1,340 (manual).
+        # 6690-2; 26464-8; 33256-9 (corrected for
+        # nucleated red cells); 804-5 (manual).
         loinc_codes=("6690-2", "26464-8", "33256-9", "804-5"),
         canonical_unit="thousand per microliter",
         unit_conversions=_BLOOD_COUNT_THOUSANDS_PER_MICROLITER
@@ -719,7 +719,7 @@ MEASUREMENT_DEFINITIONS: tuple[MeasurementDefinition, ...] = (
         canonical_name="total_bilirubin",
         aliases=("bilirubin",),
         description="Serum/plasma total bilirubin (mg/dL).",
-        # 1975-2 336,120.
+        # 1975-2.
         loinc_codes=("1975-2",),
         canonical_unit="milligram per deciliter",
         unit_conversions=_MILLIGRAMS_PER_DECILITER,
@@ -735,7 +735,7 @@ MEASUREMENT_DEFINITIONS: tuple[MeasurementDefinition, ...] = (
             "Creatinine eGFR, race-free CKD-EPI 2021 (Inker 2021 NEJM 385:1737), mL/min/1.73m2, "
             "computed per measurement from serum creatinine, age and sex at birth."
         ),
-        # 2160-0 359,640; 14682-9 10,900. Whole-blood point-of-care creatinine
+        # 2160-0; 14682-9. Whole-blood point-of-care creatinine
         # (38483-4) is left out. The "micromole per liter" rows of 14682-9
         # carry mg/dL values (0.3-2.1); a true umol/L value is implausible here.
         loinc_codes=("2160-0", "14682-9"),
@@ -751,8 +751,8 @@ MEASUREMENT_DEFINITIONS: tuple[MeasurementDefinition, ...] = (
         canonical_name="ldl_cholesterol",
         aliases=("ldl", "ldl_c"),
         description="LDL cholesterol, calculated or measured (mg/dL); pre-treatment values preferred.",
-        # 13457-7 214,480; 2089-1 90,880; 18262-6 42,500; 49132-4 8,760;
-        # 12773-8 2,960.
+        # 13457-7; 2089-1; 18262-6; 49132-4;
+        # 12773-8.
         loinc_codes=("13457-7", "2089-1", "18262-6", "49132-4", "12773-8"),
         canonical_unit="milligram per deciliter",
         unit_conversions=_MILLIGRAMS_PER_DECILITER + _units(("milligram per deciliter calculated", 1.0)),
@@ -765,7 +765,7 @@ MEASUREMENT_DEFINITIONS: tuple[MeasurementDefinition, ...] = (
         canonical_name="hemoglobin_a1c",
         aliases=("hba1c", "a1c"),
         description="Hemoglobin A1c in people without diabetes (NGSP %); IFCC mmol/mol converted.",
-        # 4548-4 212,720; 17856-6 65,120; 17855-8 2,860; 4549-2 980; 59261-8 80.
+        # 4548-4; 17856-6; 17855-8; 4549-2; 59261-8.
         loinc_codes=("4548-4", "17856-6", "17855-8", "4549-2", "59261-8"),
         canonical_unit="percent",
         # All of Us percent labels (some mislabeled; all carry % values); NGSP
