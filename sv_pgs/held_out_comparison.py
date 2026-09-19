@@ -169,20 +169,51 @@ def cross_fit_delta_r2(
     return PairedComparison(estimate, standard_error, estimate / standard_error)
 
 
-def _logistic_recalibration(score: NDArray, labels: NDArray, iterations: int = 50) -> NDArray:
-    """Per-sample log-likelihood of labels under logit P(y=1) = a + b*score (Newton)."""
-    design = np.column_stack([np.ones_like(score, dtype=np.float64), np.asarray(score, dtype=np.float64)])
-    prevalence = min(max(float(np.mean(labels)), 1e-6), 1.0 - 1e-6)
-    coefficients = np.array([math.log(prevalence / (1.0 - prevalence)), 0.0])
-    for _ in range(iterations):
+def logistic_recalibration_coefficients(score: NDArray, labels: NDArray) -> NDArray:
+    """Maximum-likelihood (a, b) of logit P(y=1) = a + b*score.
+
+    The maximum is finite and unique unless the score separates the labels (Albert and Anderson 1984),
+    which is refused. Damped Newton ascends the strictly concave log-likelihood and stops once the
+    Newton decrement, half of which estimates the remaining gain, is below the fp64 resolution of the
+    log-likelihood.
+    """
+    score = np.asarray(score, dtype=np.float64)
+    positive = labels == 1.0
+    if not positive.any() or positive.all():
+        raise ValueError("recalibration needs both cases and controls")
+    positive_scores, negative_scores = score[positive], score[~positive]
+    if positive_scores.min() >= negative_scores.max() or positive_scores.max() <= negative_scores.min():
+        raise ValueError("the score separates the labels, so its logistic recalibration has no finite maximum")
+    design = np.column_stack([np.ones_like(score), score])
+
+    def log_likelihood(coefficients: NDArray) -> float:
         linear = design @ coefficients
-        fitted = special.expit(linear)
-        curvature = fitted * (1.0 - fitted)
-        step = np.linalg.solve(design.T @ (design * curvature[:, None]), design.T @ (labels - fitted))
-        coefficients = coefficients + step
-        if float(np.max(np.abs(step))) < 1e-10:
+        return float(np.sum(labels * linear - np.logaddexp(0.0, linear)))
+
+    prevalence = float(np.mean(positive))
+    coefficients = np.array([math.log(prevalence / (1.0 - prevalence)), 0.0])
+    current = log_likelihood(coefficients)
+    while True:
+        fitted = special.expit(design @ coefficients)
+        gradient = design.T @ (labels - fitted)
+        step = np.linalg.solve(design.T @ (design * (fitted * (1.0 - fitted))[:, None]), gradient)
+        if 0.5 * float(gradient @ step) <= np.finfo(np.float64).eps * abs(current):
             break
-    linear = design @ coefficients
+        length = 1.0
+        while True:
+            candidate = coefficients + length * step
+            candidate_value = log_likelihood(candidate)
+            if candidate_value >= current:
+                break
+            length *= 0.5
+        coefficients, current = candidate, candidate_value
+    return coefficients
+
+
+def _logistic_recalibration(score: NDArray, labels: NDArray) -> NDArray:
+    """Per-sample log-likelihood of labels under the maximum-likelihood recalibration of the score."""
+    coefficients = logistic_recalibration_coefficients(score, labels)
+    linear = coefficients[0] + coefficients[1] * np.asarray(score, dtype=np.float64)
     return labels * linear - np.logaddexp(0.0, linear)
 
 
@@ -296,10 +327,13 @@ def hommel_adjusted(p_values: NDArray) -> NDArray:
     return result
 
 
-def size_gate(null_z: NDArray, alpha: float = 0.05, maximum_rate: float = 0.07) -> bool:
-    """Gate G13: a one-sided test rejects at most `maximum_rate` of null replicates at `alpha`."""
-    critical = float(stats.norm.isf(alpha))
-    return float(np.mean(np.asarray(null_z) > critical)) <= maximum_rate
+def size_gate(null_z: NDArray, alpha: float = 0.05) -> bool:
+    """Gate G13: the one-sided test's rejections at `alpha` among the null replicates are not
+    significantly more than an `alpha` share of them, by the exact one-sided binomial test at the
+    same `alpha`."""
+    null_z = np.asarray(null_z)
+    rejections = int(np.sum(null_z > stats.norm.isf(alpha)))
+    return float(stats.binom.sf(rejections - 1, null_z.shape[0], alpha)) > alpha
 
 
 def null_cost_gate(r2_without: NDArray, r2_with: NDArray, maximum_relative_loss: float = 0.005) -> bool:
