@@ -11,7 +11,9 @@ import gzip
 import numpy as np
 from scipy.stats import norm
 
-from benchmarks.bench_sim import cohort, harness, measurement, measurement_beagle, truth
+import json
+
+from benchmarks.bench_sim import baselines, cohort, harness, measurement, measurement_beagle, truth
 from benchmarks.bench_sim.annotations import merged_intervals, overlaps
 from sv_pgs.dosage_store import encode_dosage_milli
 
@@ -216,3 +218,64 @@ def test_batch_block_and_realized_r2_match_direct_computation() -> None:
             expected = np.corrcoef(truth[row], observed[row])[0, 1] ** 2
             # r2 = cross^2 / (ss_truth * ss_observed): four length-n sums, each with relative error <= n * eps.
             assert abs(r2[row] - expected) <= 4 * truth.shape[1] * EPSILON * max(expected, 1.0)
+
+
+def test_ridge_inf_baseline_matches_a_direct_solve(tmp_path) -> None:
+    """Build a tiny cohort's kernel files the way gpu_kernels does, run the baseline, and check its prediction
+    against (K + lambda I)^-1 y solved directly, with lambda from the Haseman-Elston h2 computed directly."""
+    rng = np.random.default_rng(12)
+    size, n_var = 300, 400
+    is_test = np.zeros(size, dtype=bool)
+    is_test[rng.choice(size, size=60, replace=False)] = True
+    train, test = np.flatnonzero(~is_test), np.flatnonzero(is_test)
+    cls = rng.choice(4, size=n_var, p=[0.6, 0.2, 0.15, 0.05]).astype(np.int8)
+    genotype = rng.binomial(2, rng.uniform(0.05, 0.5, size=(n_var, 1)), size=(n_var, size)).astype(np.uint8)
+    observed = genotype * np.uint8(measurement.CODES_PER_DOSAGE)
+    np.save(tmp_path / "observed_beagle.npy", observed)
+    np.savez(tmp_path / "samples.npz", is_test=is_test, sex=rng.integers(0, 2, size), age=rng.uniform(18, 80, size),
+             batch=rng.integers(0, 2, size))
+    np.savez(tmp_path / "variants.npz", cls=cls)
+    dosage = observed.astype(np.float64) / measurement.CODES_PER_DOSAGE
+    standardized = (dosage - dosage[:, train].mean(axis=1, keepdims=True)) / dosage[:, train].std(axis=1, keepdims=True)
+    counts = {}
+    kernels = {}
+    for name, members in (("simple", cls <= 1), ("structural", cls >= 2)):
+        kernels[name] = standardized[members].T @ standardized[members] / members.sum()
+        counts[name] = int(members.sum())
+        np.save(tmp_path / f"kernel_{name}_beagle.npy", kernels[name].astype(np.float32))
+    (tmp_path / "kernel_counts_beagle.json").write_text(json.dumps(counts))
+    weight = counts["structural"] / n_var
+    combined = (1 - weight) * kernels["simple"] + weight * kernels["structural"]
+    for name, matrix in (("simple", kernels["simple"]), ("all", combined)):
+        values, vectors = np.linalg.eigh(matrix[np.ix_(train, train)])
+        np.save(tmp_path / f"eig_{name}_beagle_values.npy", values)
+        np.save(tmp_path / f"eig_{name}_beagle_vectors.npy", vectors)
+    np.savez(tmp_path / "pcs_beagle.npz", pcs=rng.standard_normal((size, 10)))
+    scenario = tmp_path / "scenario_000"
+    scenario.mkdir()
+    effects = rng.standard_normal(n_var) * 0.05
+    phenotype = effects @ standardized + rng.standard_normal(size)
+    np.savez(scenario / "truth.npz", phenotype=phenotype, causal=np.arange(n_var), per_allele=effects)
+    shared = baselines.load_shared(tmp_path, "beagle")
+    baselines.baselines(shared, scenario, tmp_path / "results", "beagle")
+
+    residual, scale = baselines.residualized(phenotype[train], shared["covariates"][train])
+    for name, matrix in (("simple", kernels["simple"]), ("all", combined)):
+        train_kernel = matrix[np.ix_(train, train)]
+        off_diagonal = ~np.eye(train.size, dtype=bool)
+        cross_products = np.outer(residual, residual)[off_diagonal]
+        heritability = float(np.clip((train_kernel[off_diagonal] @ cross_products) / (train_kernel[off_diagonal] @ train_kernel[off_diagonal]), 0.0, 1.0))
+        meta = json.loads((tmp_path / "results" / f"ridge_inf_{name}" / "scenario_000" / "meta.json").read_text())
+        # Kernels round-trip through float32 files: each entry carries relative error eps32 / 2, and every
+        # quantity here is a sum of at most n^2 such entries, so its relative error is at most n * eps32.
+        float32_tolerance = float(np.finfo(np.float32).eps) * train.size
+        assert abs(meta["h2_used"] - heritability) <= float32_tolerance
+        prediction = np.load(tmp_path / "results" / f"ridge_inf_{name}" / "scenario_000" / "prediction.npz")["total"]
+        if heritability == 0.0:
+            assert np.all(prediction == 0.0)
+            continue
+        ridge = (1 - heritability) / heritability
+        system = train_kernel + ridge * np.eye(train.size)
+        expected = scale * matrix[np.ix_(test, train)] @ np.linalg.solve(system, residual)
+        # A relative perturbation delta of the kernel moves the solve by at most cond(system) * delta.
+        assert np.max(np.abs(prediction - expected)) <= float32_tolerance * np.linalg.cond(system) * np.max(np.abs(expected))

@@ -24,19 +24,22 @@ PC_COUNT = 10
 
 
 def prepare(cohort: Path, block_rows: int, arm: str) -> None:
+    """Peak device memory: the two N x N accumulators (2 x 4 N^2 bytes, 20 GB at N = 50,000), then one
+    training block, its eigenvectors and the test-train cross block per kernel."""
     samples = np.load(cohort / "samples.npz")
-    train = np.flatnonzero(~samples["is_test"])
+    is_test = samples["is_test"]
+    train, test = np.flatnonzero(~is_test), np.flatnonzero(is_test)
     cls = np.load(cohort / "variants.npz")["cls"]
     observed = np.load(cohort / ARMS[arm][0], mmap_mode="r")
     n_var, size = observed.shape
-    train_gpu = cp.asarray(train)
+    train_gpu, test_gpu = cp.asarray(train), cp.asarray(test)
     kernels = {"simple": cp.zeros((size, size), dtype=cp.float32), "structural": cp.zeros((size, size), dtype=cp.float32)}
     counts = {"simple": 0, "structural": 0}
     for first in range(0, n_var, block_rows):
         block = cp.asarray(np.asarray(observed[first:first + block_rows]), dtype=cp.float32) / CODES_PER_DOSAGE
         mean = block[:, train_gpu].mean(axis=1, keepdims=True)
         sd = block[:, train_gpu].std(axis=1, keepdims=True)
-        keep = (sd[:, 0] > 0)
+        keep = sd[:, 0] > 0
         standardized = (block[keep] - mean[keep]) / sd[keep]
         block_cls = cp.asarray(cls[first:first + block_rows])[keep]
         for name, members in (("simple", block_cls <= 1), ("structural", block_cls >= 2)):
@@ -46,15 +49,20 @@ def prepare(cohort: Path, block_rows: int, arm: str) -> None:
                 counts[name] += int(members.sum())
         if first % (block_rows * 20) == 0:
             print(f"kernel rows {first}/{n_var}", flush=True)
-    for name in kernels:
-        kernels[name] /= max(counts[name], 1)
-        np.save(cohort / f"kernel_{name}_{arm}.npy", cp.asnumpy(kernels[name]))
     (cohort / f"kernel_counts_{arm}.json").write_text(json.dumps(counts))
-    combined = (counts["simple"] * kernels["simple"] + counts["structural"] * kernels["structural"]) / (counts["simple"] + counts["structural"])
-    del kernels["structural"]
-    for name, matrix in (("simple", kernels["simple"]), ("all", combined)):
-        train_block = matrix[train_gpu[:, None], train_gpu[None, :]]
-        values, vectors = cp.linalg.eigh(train_block)
+    blocks = {}
+    for name in ("simple", "structural"):
+        kernels[name] /= counts[name]
+        np.save(cohort / f"kernel_{name}_{arm}.npy", cp.asnumpy(kernels[name]))
+        blocks[name] = (cp.asnumpy(kernels[name][train_gpu[:, None], train_gpu[None, :]]),
+                        cp.asnumpy(kernels[name][test_gpu[:, None], train_gpu[None, :]]))
+        del kernels[name]
+        cp.get_default_memory_pool().free_all_blocks()
+    total = counts["simple"] + counts["structural"]
+    combined = tuple((counts["simple"] * simple + counts["structural"] * structural) / total
+                     for simple, structural in zip(blocks["simple"], blocks["structural"]))
+    for name, (train_block, cross_block) in (("simple", blocks["simple"]), ("all", combined)):
+        values, vectors = cp.linalg.eigh(cp.asarray(train_block))
         np.save(cohort / f"eig_{name}_{arm}_values.npy", cp.asnumpy(values))
         np.save(cohort / f"eig_{name}_{arm}_vectors.npy", cp.asnumpy(vectors))
         if name == "simple":
@@ -62,14 +70,11 @@ def prepare(cohort: Path, block_rows: int, arm: str) -> None:
             scale = np.sqrt(train.size)
             pcs = np.zeros((size, PC_COUNT))
             pcs[train] = cp.asnumpy(vectors[:, top]) * scale
-            test = np.flatnonzero(samples["is_test"])
-            test_gpu = cp.asarray(test)
-            cross = matrix[test_gpu[:, None], train_gpu[None, :]]
-            pcs[test] = cp.asnumpy(cross @ vectors[:, top] / values[top]) * scale
+            pcs[test] = cp.asnumpy(cp.asarray(cross_block) @ vectors[:, top] / values[top]) * scale
             np.savez(cohort / f"pcs_{arm}.npz", pcs=pcs, eigenvalues=cp.asnumpy(values[top]))
-        del train_block, vectors
+        del values, vectors
+        cp.get_default_memory_pool().free_all_blocks()
         print(f"eigendecomposition {name} done", flush=True)
-
 
 
 def main() -> None:
