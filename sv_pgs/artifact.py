@@ -97,8 +97,9 @@ def cohort_digest(research_ids: Sequence[str]) -> str:
 class FittedModel:
     """One fitted model per (trait, fold) training set, in ``model_names`` order.
 
-    ``certificate`` holds every term of the fit's certificate as an array with one entry per model;
-    ``noise_variance`` is each quantitative model's residual variance, used in its predictive variance.
+    ``certificate`` holds every term of the fit's certificate as an array with one entry per model, and
+    ``refusals`` the reasons the fit refused trial steps, across all models; ``noise_variance`` is each quantitative
+    model's residual variance, used in its predictive variance.
     """
 
     model_names: tuple[str, ...]
@@ -107,6 +108,7 @@ class FittedModel:
     noise_variance: F64Array
     hyperparameters: tuple[MixtureHyperparameters, ...]
     certificate: Mapping[str, F64Array]
+    refusals: tuple[str, ...]
     provenance: Provenance
 
     def __post_init__(self) -> None:
@@ -151,6 +153,7 @@ def save_model(path: str | Path, model: FittedModel) -> None:
         "covariate_names": list(model.covariate_names),
         "predictive_intercept_shifts": [scoring.predictive_intercept_shift for scoring in model.scoring],
         "certificate_terms": sorted(model.certificate),
+        "refusals": list(model.refusals),
         "provenance": {
             "code_digest": model.provenance.code_digest,
             "store_digest": model.provenance.store_digest,
@@ -195,6 +198,7 @@ def load_model(path: str | Path) -> FittedModel:
     covariate_names = tuple(_required(metadata, "covariate_names", list))
     shifts = _required(metadata, "predictive_intercept_shifts", list)
     terms = _required(metadata, "certificate_terms", list)
+    refusals = tuple(str(reason) for reason in _required(metadata, "refusals", list))
     provenance = _required(metadata, "provenance", dict)
     names = _required(metadata, "arrays", list)
     if not len(model_names) == len(trait_types) == len(shifts):
@@ -225,6 +229,7 @@ def load_model(path: str | Path) -> FittedModel:
         noise_variance=arrays["noise_variance"],
         hyperparameters=hyperparameters,
         certificate={name: arrays[f"certificate/{name}"] for name in terms},
+        refusals=refusals,
         provenance=Provenance(
             code_digest=str(provenance["code_digest"]),
             store_digest=str(provenance["store_digest"]),
