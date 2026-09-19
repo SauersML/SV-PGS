@@ -1007,58 +1007,76 @@ def _restricted_prior(prior: ScaleMixturePrior, infinite: frozenset[int], zero: 
 def _ascend_evidence(
     prior: ScaleMixturePrior,
     start_weights: F64Array,
-    start_coefficients: F64Array,
+    start: _Evidence,
     cavity: Cavity,
     working_bytes: int,
     lower: F64Array,
     upper: F64Array,
     tolerance: float,
+    flat_start: F64Array,
 ) -> tuple[F64Array, _Evidence]:
-    """Projected quasi-Newton ascent of V(rho) inside [lower, upper], backtracking on every trial point.
+    """Trust-region quasi-Newton ascent of V(rho) inside [lower, upper], from a certified evidence ``start``.
 
-    A trial is kept only when it has a positive-definite penalized maximum and
-    raises V; otherwise the step halves. Each trial's x starts from the
-    first-order predictor x_rho + (dx/drho) delta. The BFGS inverse Hessian of
-    -V is updated when the curvature condition holds. It stops when the
-    predicted gain falls to ``tolerance`` nats, or when no step longer than half
-    of double precision in rho raises V.
+    The model is V's gradient with a BFGS approximation of -V's Hessian; each trial maximizes it inside a
+    radius, projected onto the bounds, and the radius follows the ratio of actual to predicted gain
+    (Nocedal and Wright, Algorithm 4.1). A trial's x starts from the first-order predictor
+    x_rho + (dx/drho) delta; a trial whose inner answer is not a certified maximum counts as V = -infinity.
+    It stops when the model's predicted gain falls to ``tolerance`` nats, or the radius to half of double
+    precision.
     """
     weights = np.clip(start_weights, lower, upper)
-    current = _evidence(prior, weights, start_coefficients, cavity, working_bytes, tolerance)
-    if current is None:
-        raise FloatingPointError("the penalized objective has no positive-definite maximum at the starting penalty weights")
-    inverse_hessian = np.eye(weights.shape[0])
+    current = start
+    hessian = np.eye(weights.shape[0])
+    radius = float(np.linalg.norm(current.gradient))
     while True:
         gradient = current.gradient
         free = ~(((weights <= lower) & (gradient < 0.0)) | ((weights >= upper) & (gradient > 0.0)))
-        direction = np.zeros_like(weights)
-        direction[free] = inverse_hessian[np.ix_(free, free)] @ gradient[free]
-        if float(gradient[free] @ direction[free]) <= 0.0:
-            inverse_hessian = np.eye(weights.shape[0])
-            direction[free] = gradient[free]
-        if 0.5 * float(gradient[free] @ direction[free]) <= max(tolerance, _EPSILON * current.magnitude):
+        if not np.any(free):
             return weights, current
-        step_length = 1.0
-        accepted = None
-        while step_length * float(np.max(np.abs(direction))) > _HALF_PRECISION * (1.0 + float(np.max(np.abs(weights)))):
-            trial_weights = np.clip(weights + step_length * direction, lower, upper)
-            predicted = current.coefficients + current.responses @ (trial_weights - weights)
-            trial = _evidence(prior, trial_weights, predicted, cavity, working_bytes, tolerance)
-            if trial is not None and trial.value > current.value:
-                accepted = (trial_weights, trial)
-                break
-            step_length *= 0.5
-        if accepted is None:
+        free_hessian = hessian[np.ix_(free, free)]
+        if 0.5 * float(gradient[free] @ np.linalg.solve(free_hessian, gradient[free])) <= max(tolerance, _EPSILON * current.magnitude):
             return weights, current
-        trial_weights, trial = accepted
-        displacement = trial_weights - weights
+        if radius <= _HALF_PRECISION * (1.0 + float(np.max(np.abs(weights)))):
+            return weights, current
+        step = np.zeros_like(weights)
+        step[free] = _trust_region_step(free_hessian, gradient[free], radius)
+        trial_weights = np.clip(weights + step, lower, upper)
+        step = trial_weights - weights
+        predicted = float(gradient @ step) - 0.5 * float(step @ hessian @ step)
+        trial = _certified_evidence(prior, trial_weights, current.coefficients + current.responses @ step, cavity, working_bytes, tolerance, flat_start)
+        actual = -np.inf if trial is None else trial.value - current.value
+        ratio = actual / predicted if predicted > 0.0 else -np.inf
+        step_norm = float(np.linalg.norm(step))
+        if not np.isfinite(ratio) or ratio < 0.25:
+            radius = 0.25 * step_norm
+        elif ratio > 0.75 and step_norm >= radius * (1.0 - _HALF_PRECISION):
+            radius = 2.0 * radius
+        if trial is None or actual <= 0.0:
+            continue
         gradient_change = gradient - trial.gradient
-        curvature = float(displacement @ gradient_change)
+        curvature = float(step @ gradient_change)
         if curvature > 0.0:
-            identity = np.eye(weights.shape[0])
-            left = identity - np.outer(displacement, gradient_change) / curvature
-            inverse_hessian = left @ inverse_hessian @ left.T + np.outer(displacement, displacement) / curvature
+            image = hessian @ step
+            hessian = hessian - np.outer(image, image) / float(step @ image) + np.outer(gradient_change, gradient_change) / curvature
         weights, current = trial_weights, trial
+
+
+def _certified_evidence(
+    prior: ScaleMixturePrior, log_smoothing: F64Array, start: F64Array, cavity: Cavity, working_bytes: int, tolerance: float, flat_start: F64Array
+) -> _Evidence | None:
+    """V at the certified inner maximum from ``start``, or from the flat start when that is not a certified
+    maximum (the two structural starts; lead ruling); None when neither is."""
+    warm = _evidence(prior, log_smoothing, start, cavity, working_bytes, tolerance)
+    return warm if warm is not None else _evidence(prior, log_smoothing, flat_start, cavity, working_bytes, tolerance)
+
+
+def _best_certified(
+    prior: ScaleMixturePrior, log_smoothing: F64Array, starts: Sequence[F64Array], cavity: Cavity, working_bytes: int, tolerance: float
+) -> _Evidence | None:
+    """The certified inner maximum with the highest V over the given starts."""
+    candidates = [_evidence(prior, log_smoothing, start, cavity, working_bytes, tolerance) for start in starts]
+    certified = [candidate for candidate in candidates if candidate is not None]
+    return max(certified, key=lambda candidate: candidate.value) if certified else None
 
 
 def _maximize_evidence(
@@ -1085,16 +1103,23 @@ def _maximize_evidence(
     zero = frozenset(int(position) for position in np.flatnonzero(start_weights == -np.inf))
     weights = np.where(start_weights == np.inf, upper, np.where(start_weights == -np.inf, lower, start_weights))
     coefficients = np.array(start_coefficients, dtype=np.float64, copy=True)
+    flat = initial_hyperparameters(prior).coefficients
     start = None
     while True:
         edges = infinite | zero
         finite = np.array([position for position in range(len(bounds)) if position not in edges], dtype=np.int64)
         view, allowed = _restricted_prior(prior, infinite, zero)
+        finite_start = np.clip(weights[finite], lower[finite], upper[finite])
+        evidence = _best_certified(view, finite_start, [allowed.T @ coefficients, allowed.T @ flat], cavity, working_bytes, tolerance)
+        if evidence is None:
+            raise FloatingPointError("neither structural start reaches a certified maximum at the starting penalty weights")
         if start is None:
-            start = _evidence(view, np.clip(weights[finite], lower[finite], upper[finite]), allowed.T @ coefficients, cavity, working_bytes, tolerance)
+            start = evidence
         finite_weights, evidence = _ascend_evidence(
-            view, weights[finite], allowed.T @ coefficients, cavity, working_bytes, lower[finite], upper[finite], tolerance
+            view, finite_start, evidence, cavity, working_bytes, lower[finite], upper[finite], tolerance, allowed.T @ flat
         )
+        # Refit at the chosen weights from the best certified answer the search saw and from the flat start.
+        evidence = _best_certified(view, finite_weights, [evidence.coefficients, allowed.T @ flat], cavity, working_bytes, tolerance) or evidence
         weights[finite] = finite_weights
         coefficients = allowed @ evidence.coefficients
         to_infinity = {int(finite[index]) for index in np.flatnonzero((finite_weights >= upper[finite]) & (evidence.gradient >= 0.0))}
@@ -1107,7 +1132,9 @@ def _maximize_evidence(
             trial_weights = weights.copy()
             at_infinity = position in infinite
             trial_weights[position] = upper[position] if at_infinity else lower[position]
-            trial = _evidence(loose_view, trial_weights[loose_finite], loose_allowed.T @ coefficients, cavity, working_bytes, tolerance)
+            trial = _certified_evidence(
+                loose_view, trial_weights[loose_finite], loose_allowed.T @ coefficients, cavity, working_bytes, tolerance, loose_allowed.T @ flat
+            )
             if trial is None:
                 continue
             slope = trial.gradient[loose_finite.index(position)]
