@@ -1,8 +1,7 @@
 """Stage 2: the exact full-data Gaussian E-step of the one joint model.
 
-Stage 1 fits the model in LD space with the LD between blocks taken to be zero;
-that is a warm start only (SPEC). Stage 2 iterates the same expectation
-propagation fixed point with the exact full-covariance Gaussian of all variants
+Stage 2 iterates the expectation propagation fixed point with the exact
+full-covariance Gaussian of all variants
 on the individual-level data. This module holds that Gaussian: its mean, its
 marginal variances and exact draws, for every model (traits x folds) at once.
 

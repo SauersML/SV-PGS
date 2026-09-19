@@ -46,11 +46,12 @@
 | Block-variance refreshes | a dense fp64 factor per model per refresh (1,030 s per A100 for 105 models) | on demand, TF32 with refinement, resolved-set factors | 8–50× [est] |
 | Exact path around the int8 GEMM (A40, measured) | matmat and rmatmat 4–10× over their raw GEMM | ≈ the raw GEMM | partly closed by speed-io, bit-identical |
 
-End to end: about 1,000× today, and 10–40× once Stage 1 is removed.
+End to end: about 1,000× with the old Stage 1, and 10–40× without it.
 
 **Stage 1 is dropped (lead's decision, 2026-09-19, on the measurements in compute_floor.md §10).**
 - At production signal the EP-EM outer map has no slow direction: λ(A⁻¹B) lies in [0.89, 5.4]. An accelerated or Newton-B outer loop certifies in 1–3 steps, so Stage 1's pass-free outer steps would save at most a few Stage 2 passes.
 - The outer step is Newton with the total curvature B, or safeguarded relaxation/Anderson. Plain EP-EM diverges in 7 of 16 measured configurations (3 of the 10 at production signal).
+- Caveat: the measured windows reached LD score 19, against a chromosome mean of about 45; speed-floor is re-measuring in high-LD regions.
 - Stage 2 uses only certified marginals. Block-Jacobi variances put the top ~1% of cavity precisions 28–58% off, so they need cross-block correction (compute_floor.md §10.4).
 - The variance refreshes still need e2854ca's fp64-vs-fp32 Cholesky policy (Jacobi-scaled fp32 factors with fp64 refinement; archive tags `build-stage1` and `wip-wt-build-store`) and its multi-GPU block dispatch.
 
