@@ -474,6 +474,12 @@ class CodeArray:
                 and data_bytes == written * layout.inner_chunk_bytes
             ):
                 raise ValueError(f"{path}: raw inner chunks are not whole and in row order.")
+            if layout.codec == "zstd" and not (
+                int(offsets[0]) == 0
+                and np.array_equal(offsets[1:], offsets[:-1] + sizes[:-1])
+                and data_bytes == int(offsets[-1] + sizes[-1])
+            ):
+                raise ValueError(f"{path}: zstd inner chunks are not stored back to back in row order.")
         except BaseException:
             os.close(descriptor)
             raise
@@ -533,20 +539,48 @@ class CodeArray:
         )
         return flat.reshape(local_stop - local_start, sample_count)
 
-    def _decode_chunk(self, shard: _OpenShard, chunk: int) -> U8Array:
-        """One verified, decompressed inner chunk in a per-thread buffer (valid until the next decode)."""
-        size = int(shard.chunk_sizes[chunk])
-        encoded = os.pread(shard.descriptor, size, int(shard.chunk_offsets[chunk]))
-        if len(encoded) != size:
-            raise EOFError(f"{self.directory}: inner chunk {chunk} is truncated.")
-        frame = encoded[:-_CRC32C_BYTES]
-        if google_crc32c.value(frame) != int.from_bytes(encoded[-_CRC32C_BYTES:], "little"):
-            raise ValueError(f"{self.directory}: inner chunk {chunk} fails its crc32c check.")
-        decoded = _scratch("decoded_chunk", self.layout.inner_chunk_bytes)
-        written = _decompressor().stream_reader(frame).readinto(memoryview(decoded))
-        if written != self.layout.inner_chunk_bytes:
-            raise ValueError(f"{self.directory}: inner chunk {chunk} decodes to {written} bytes.")
-        return decoded.reshape(self.layout.inner_rows, self.layout.sample_count)
+    def _decode_frame(self, frame: memoryview, destination: memoryview, chunk: int) -> None:
+        """Decode one inner-chunk frame into ``destination``, which it must fill exactly."""
+        reader = _decompressor().stream_reader(frame)
+        filled = 0
+        while filled < destination.nbytes:
+            got = reader.readinto(destination[filled:])
+            if got == 0:
+                raise ValueError(f"{self.directory}: inner chunk {chunk} decodes to {filled} bytes.")
+            filled += got
+        if reader.read(1):
+            raise ValueError(f"{self.directory}: inner chunk {chunk} decodes to more than {filled} bytes.")
+
+    def _decode_rows_into(self, shard: _OpenShard, local_start: int, local_stop: int, target: U8Array) -> None:
+        """Decode zstd rows [local_start, local_stop) of one shard into ``target``.
+
+        The frames covering the rows sit back to back, so one preadv reads them all into this
+        thread's buffer; each frame's crc32c is checked, and a frame whose rows are all wanted
+        decodes straight into ``target``'s rows instead of through the chunk scratch.
+        """
+        layout = self.layout
+        first_chunk = local_start // layout.inner_rows
+        stop_chunk = -(-local_stop // layout.inner_rows)
+        begin = int(shard.chunk_offsets[first_chunk])
+        end = int(shard.chunk_offsets[stop_chunk - 1] + shard.chunk_sizes[stop_chunk - 1])
+        encoded = memoryview(_scratch("encoded_frames", end - begin))
+        _pread_exact(shard.descriptor, [encoded], begin)
+        for chunk in range(first_chunk, stop_chunk):
+            frame_start = int(shard.chunk_offsets[chunk]) - begin
+            frame_stop = frame_start + int(shard.chunk_sizes[chunk]) - _CRC32C_BYTES
+            frame = encoded[frame_start:frame_stop]
+            # google_crc32c takes read-only bytes only, so the compressed frame is copied once.
+            if google_crc32c.value(bytes(frame)) != int.from_bytes(encoded[frame_stop : frame_stop + _CRC32C_BYTES], "little"):
+                raise ValueError(f"{self.directory}: inner chunk {chunk} fails its crc32c check.")
+            chunk_start = chunk * layout.inner_rows
+            first, last = max(local_start, chunk_start), min(local_stop, chunk_start + layout.inner_rows)
+            rows = target[first - local_start : last - local_start]
+            if last - first == layout.inner_rows and rows.flags.c_contiguous:
+                self._decode_frame(frame, memoryview(rows.reshape(-1)), chunk)
+                continue
+            decoded = _scratch("decoded_chunk", layout.inner_chunk_bytes)
+            self._decode_frame(frame, memoryview(decoded), chunk)
+            rows[...] = decoded.reshape(layout.inner_rows, layout.sample_count)[first - chunk_start : last - chunk_start]
 
     def read_rows_into(self, row_start: int, row_stop: int, out: U8Array) -> None:
         """Fill ``out`` [rows, samples] (each row contiguous, e.g. a column slice of a wider array)."""
@@ -560,13 +594,7 @@ class CodeArray:
                 target = out[out_row : out_row + local_stop - local_start]
                 _pread_exact(shard.descriptor, _row_buffers(target), local_start * layout.sample_count)
             else:
-                for chunk in range(local_start // layout.inner_rows, -(-local_stop // layout.inner_rows)):
-                    chunk_start = chunk * layout.inner_rows
-                    first, last = max(local_start, chunk_start), min(local_stop, chunk_start + layout.inner_rows)
-                    decoded = self._decode_chunk(shard, chunk)
-                    out[out_row + first - local_start : out_row + last - local_start] = decoded[
-                        first - chunk_start : last - chunk_start
-                    ]
+                self._decode_rows_into(shard, local_start, local_stop, out[out_row : out_row + local_stop - local_start])
             out_row += local_stop - local_start
 
     @property
