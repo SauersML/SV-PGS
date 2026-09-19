@@ -818,15 +818,6 @@ _NamedDefinition = TypeVar("_NamedDefinition", DiseaseDefinition, MeasurementDef
 
 
 @dataclass(slots=True)
-class AllOfUsDiseaseRequest:
-    disease: str
-
-    def __post_init__(self) -> None:
-        if not self.disease.strip():
-            raise ValueError("disease cannot be blank.")
-
-
-@dataclass(slots=True)
 class AllOfUsPreparedPhenotype:
     sample_table_path: Path
     sql_path: Path
@@ -1031,13 +1022,11 @@ def build_all_of_us_disease_query_config(disease_definition: DiseaseDefinition) 
 
 
 def fetch_all_of_us_disease_rows(
-    request: AllOfUsDiseaseRequest,
+    disease_definition: DiseaseDefinition,
     client: bigquery.Client | None = None,
 ) -> list[dict[str, Any]]:
-    disease_definition = resolve_disease_definition(request.disease)
-    active_client = _active_bigquery_client(client)
     return _query_rows(
-        active_client,
+        _active_bigquery_client(client),
         build_all_of_us_disease_sql(disease_definition),
         build_all_of_us_disease_query_config(disease_definition),
     )
@@ -1081,13 +1070,13 @@ def disease_covariate_columns() -> tuple[str, ...]:
 
 
 def prepare_all_of_us_disease_sample_table(
-    request: AllOfUsDiseaseRequest,
+    disease: str,
     output_path: str | Path,
     *,
     client: bigquery.Client | None = None,
 ) -> AllOfUsPreparedPhenotype:
-    disease_definition = resolve_disease_definition(request.disease)
-    rows = fetch_all_of_us_disease_rows(request=request, client=client)
+    disease_definition = resolve_disease_definition(disease)
+    rows = fetch_all_of_us_disease_rows(disease_definition, client=client)
     lab_evidence = [
         fetch_all_of_us_lab_criterion_rows(criterion, client=client) for criterion in disease_definition.lab_criteria
     ]

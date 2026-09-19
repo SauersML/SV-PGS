@@ -16,7 +16,6 @@ import json
 import math
 import re
 from pathlib import Path
-from typing import cast
 
 import numpy as np
 import pytest
@@ -30,7 +29,6 @@ from sv_pgs.all_of_us import (
     MEASUREMENT_DEFINITIONS,
     MEASUREMENT_EXCLUSION_REASONS,
     UNBOUNDED_WINDOW_DAYS,
-    AllOfUsDiseaseRequest,
     ClinicalWindow,
     DiseaseDefinition,
     MeasurementDefinition,
@@ -373,9 +371,7 @@ def test_prepare_all_of_us_disease_sample_table_writes_outputs(tmp_path: Path, m
 
     output_path = tmp_path / "atrial_fibrillation.tsv"
     outputs = prepare_all_of_us_disease_sample_table(
-        request=AllOfUsDiseaseRequest(
-            disease="atrial_fibrillation",
-        ),
+        "atrial_fibrillation",
         output_path=output_path,
         client=fake_client,
     )
@@ -576,7 +572,7 @@ def test_sparse_early_ehr_excludes_cases_and_controls_alike(monkeypatch, tmp_pat
         _disease_row(104, occurrence_count=0, pre_landmark_condition_dates=4),
     ]
     outputs = prepare_all_of_us_disease_sample_table(
-        request=AllOfUsDiseaseRequest(disease="gout"),
+        "gout",
         output_path=tmp_path / "gout.tsv",
         client=_FakeBigQueryClient(rows),
     )
@@ -592,7 +588,7 @@ def test_prepare_all_of_us_disease_requires_all_of_us_env(monkeypatch, tmp_path:
 
     with pytest.raises(ValueError, match="GOOGLE_PROJECT"):
         prepare_all_of_us_disease_sample_table(
-            request=AllOfUsDiseaseRequest(disease="gout"),
+            "gout",
             output_path=tmp_path / "out.tsv",
         )
 
@@ -606,7 +602,7 @@ def test_prepare_all_of_us_disease_requires_workspace_cdr_env(monkeypatch, tmp_p
 
     with pytest.raises(ValueError, match="WORKSPACE_CDR"):
         prepare_all_of_us_disease_sample_table(
-            request=AllOfUsDiseaseRequest(disease="atrial fibrillation"),
+            "atrial fibrillation",
             output_path=tmp_path / "atrial_fibrillation.tsv",
             client=fake_client,
         )
@@ -621,7 +617,7 @@ def test_prepare_all_of_us_disease_uses_client_project_without_google_project_en
     )
 
     outputs = prepare_all_of_us_disease_sample_table(
-        request=AllOfUsDiseaseRequest(disease="atrial_fibrillation"),
+        "atrial_fibrillation",
         output_path=tmp_path / "atrial_fibrillation.tsv",
         client=fake_client,
     )
@@ -638,7 +634,7 @@ def test_prepare_all_of_us_disease_uses_workspace_cdr_from_env_in_query_and_meta
     )
 
     outputs = prepare_all_of_us_disease_sample_table(
-        request=AllOfUsDiseaseRequest(disease="atrial_fibrillation"),
+        "atrial_fibrillation",
         output_path=tmp_path / "atrial_fibrillation.tsv",
         client=fake_client,
     )
@@ -649,82 +645,18 @@ def test_prepare_all_of_us_disease_uses_workspace_cdr_from_env_in_query_and_meta
     assert metadata_payload["cdr_dataset"] == "fc-aou-cdr-prod-ct.C2024Q3R9"
 
 
-def test_cli_prepare_all_of_us_disease_wires_request_and_outputs(monkeypatch, tmp_path: Path):
+@pytest.mark.parametrize("disease", ["copd", "atrial fibrillation"])
+def test_cli_prepare_all_of_us_disease_forwards_the_name_and_output(monkeypatch, tmp_path: Path, disease):
     calls: dict[str, object] = {}
 
-    def fake_prepare(request, output_path, **kwargs):
-        calls["request"] = request
-        calls["output_path"] = output_path
-        calls["kwargs"] = kwargs
-        output_file = Path(output_path)
-        output_file.write_text("sample_id\tperson_id\ttarget\n", encoding="utf-8")
-        sql_path = output_file.with_suffix(output_file.suffix + ".sql")
-        sql_path.write_text("SELECT 1\n", encoding="utf-8")
-        metadata_path = output_file.with_suffix(output_file.suffix + ".metadata.json")
-        metadata_path.write_text("{}", encoding="utf-8")
-        return type(
-            "Prepared",
-            (),
-            {
-                "sample_table_path": output_file,
-                "sql_path": sql_path,
-                "metadata_path": metadata_path,
-            },
-        )()
+    def fake_prepare(disease, output_path, **kwargs):
+        calls.update(disease=disease, output_path=output_path)
+        return type("Prepared", (), {"sample_table_path": output_path, "sql_path": output_path, "metadata_path": output_path})()
 
     monkeypatch.setattr("sv_pgs.cli.prepare_all_of_us_disease_sample_table", fake_prepare)
     output_path = tmp_path / "prepared.tsv"
-    exit_code = main(
-        [
-            "prepare-all-of-us-disease",
-            "--disease",
-            "copd",
-            "--output",
-            str(output_path),
-        ]
-    )
-
-    assert exit_code == 0
-    assert calls["output_path"] == output_path
-    request = cast(AllOfUsDiseaseRequest, calls["request"])
-    assert request.disease == "copd"
-
-
-def test_cli_prepare_all_of_us_disease_accepts_aliases(monkeypatch, tmp_path: Path):
-    calls: dict[str, object] = {}
-
-    def fake_prepare(request, output_path, **kwargs):
-        calls["request"] = request
-        output_file = Path(output_path)
-        output_file.write_text("sample_id\tperson_id\ttarget\n", encoding="utf-8")
-        sql_path = output_file.with_suffix(output_file.suffix + ".sql")
-        sql_path.write_text("SELECT 1\n", encoding="utf-8")
-        metadata_path = output_file.with_suffix(output_file.suffix + ".metadata.json")
-        metadata_path.write_text("{}", encoding="utf-8")
-        return type(
-            "Prepared",
-            (),
-            {
-                "sample_table_path": output_file,
-                "sql_path": sql_path,
-                "metadata_path": metadata_path,
-            },
-        )()
-
-    monkeypatch.setattr("sv_pgs.cli.prepare_all_of_us_disease_sample_table", fake_prepare)
-    exit_code = main(
-        [
-            "prepare-all-of-us-disease",
-            "--disease",
-            "atrial fibrillation",
-            "--output",
-            str(tmp_path / "prepared.tsv"),
-        ]
-    )
-
-    assert exit_code == 0
-    request = cast(AllOfUsDiseaseRequest, calls["request"])
-    assert request.disease == "atrial fibrillation"
+    assert main(["prepare-all-of-us-disease", "--disease", disease, "--output", str(output_path)]) == 0
+    assert calls == {"disease": disease, "output_path": output_path}
 
 
 def test_cli_lists_available_all_of_us_diseases(capsys):

@@ -8,7 +8,6 @@ from importlib.metadata import version as package_version
 from pathlib import Path
 
 from sv_pgs.all_of_us import (
-    AllOfUsDiseaseRequest,
     available_disease_names,
     available_measurement_names,
     prepare_all_of_us_disease_sample_table,
@@ -132,7 +131,7 @@ def _main_impl(argv: list[str] | None = None) -> int:
 
     if args.command == "prepare-all-of-us-disease":
         prepared_outputs = prepare_all_of_us_disease_sample_table(
-            request=AllOfUsDiseaseRequest(disease=args.disease),
+            disease=args.disease,
             output_path=Path(args.output),
         )
         print("sample_table\t" + str(prepared_outputs.sample_table_path))
