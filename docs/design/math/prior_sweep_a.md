@@ -36,7 +36,8 @@ This note checks the effect prior of MODEL.md §3 where every posterior is exact
   - posterior-mean MSE +348% vs the true prior, calibration slope 4528;
   - even at moderate λ the integrated evidence prefers the collapsed fit, 293.8 vs 293.0 smooth.
   - Part of that blow-up was the rounding fault of §3. With it fixed, D3 still loses there: ΔLPD −11.8 nats per 1,000 variants, against −7.0 for D1+D2.
-- **Profiling the null space is not a fix.** Maximizing over the null-space coefficients instead of integrating them drives λ → ∞, the log-normal limit: ΔLPD −4.06 vs −0.71 per 1,000 variants on the BayesR truth [sim-only].
+- **The fix is to profile the null space in the Schur form** (ruling; ep_eb.md point 3): V = F + ½ log|S|₊ − ½ log|B + S| + ½ log|Nᵀ(B + S)N|. The collapse ray then stays finite: "the whole class below resolution" becomes an ordinary candidate that competes on evidence.
+- **A conditional form is not that fix.** Integrating only the penalty's range at fixed null coordinates (−½ log|Qᵀ(B + S)Q|) drove λ to its bound on the BayesR truth: ΔLPD −4.06 vs −0.71 per 1,000 variants [sim-only]. An earlier version of this note wrongly called that result "profiling".
 
 ## 3. Penalty values must be exact squares
 
@@ -45,23 +46,29 @@ This note checks the effect prior of MODEL.md §3 where every posterior is exact
 - **The rule:** carry each penalty as its square-root factor R, and compute the value as |R x|². The gradient and Hessian may use S.
 - The same rounding fault had produced a spurious λ → ∞ mode when the range was widened. With |R x|², t3 gives log λ = 1.93 at both ×1 and ×100 range.
 
-## 4. Grid and range invariance of the chosen λ
+## 4. Grid and range invariance: the evidence form decides it
 
-*Smoke measurements: one replicate, 1,000-variant class, integrated evidence* [sim-only]:
+**Setup:** BayesR-type truth, 1,000 variants, one replicate, D3. The evidence is profiled along log λ ∈ [−20, 5], and the density is refit at each form's optimum [sim-only; numerical-property check].
 
-| Truth | Penalty | log λ at spacing 0.5 | 0.25 | 0.125 | ×100 range |
-|---|---|---|---|---|---|
-| BayesR | D1+D2 | −1.04 / 3.08 | −1.03 / 3.12 | −1.01 / 3.15 | −1.32 / 2.49 |
-| BayesR | D2 | 3.21 | 3.23 | 3.26 | 2.97 |
-| BayesR | D3 | 3.33 | 1.35 | −18.4 | 3.58 |
-| t3 | D1+D2 | −3.64 / 0.17 | −3.63 / 0.15 | −3.61 / 0.14 | −4.13 / 0.27 |
-| t3 | D2 | 0.18 | 0.17 | 0.17 | 0.21 |
-| t3 | D3 | 1.93 | 1.91 | −7.17 | 1.93 |
+| Evidence form | h = 0.5 | 0.25 | 0.125 | 0.1 |
+|---|---|---|---|---|
+| Integrated (flat prior on the null space): optimum log λ | 3.33 | 1.35 | −18.1 | −19.7 |
+| Integrated: V at the optimum | 3449.8 | 3454.2 | 3470.0 | 3485.3 |
+| Schur (null space profiled): optimum log λ | 3.55 | 2.04 | 1.03 | 0.70 |
+| Schur: V at the optimum | 3448.96 | 3449.79 | 3449.95 | 3449.99 |
+| Schur: ΔLPD vs the true prior, nats per 1,000 variants | −0.80 | −0.35 | −0.19 | −0.14 |
+| Schur: ‖m_h − m_0.5‖ / ‖m_0.5‖ | — | 0.31% | 0.43% | 0.46% |
 
-- **D1+D2 and D2 are invariant under refinement.** Held-out log predictive moved ≤ 0.05 nats per 1,000 variants.
-- **Range sensitivity is small:** D1+D2 moved ≤ 0.5 nats per 1,000 variants at ×100 range, and D2 by 0.3.
-- **D3 flips to a λ → 0 mode at the finest spacing.** That happens once the NPMLE support has ≤ 3 points: the unpenalized quadratic then absorbs the Occam factor of the supported components.
-- The full sweep (5,000-variant classes, 10–20 replicates) replaces this table when it completes.
+- **The integrated form is grid-dependent.** Its level grows with the number of grid points, because a flat-prior integral over the null space has no limit under refinement. So its optimum runs to λ → 0 on fine grids. That form is banned.
+- **The Schur form converges.** Its optimum drifts along a flat ridge (within 0.8 nats over log λ ∈ [−3, 5] at h = 0.125), its value converges, and the predictions settle. min eig(B + S) falls to 1e-12–1e-13 only as λ → 0.
+- **D1 + D2 has no null space, so its evidence forms coincide.** Smoke measurements, one replicate:
+
+| Truth | log λ₁ / log λ₂ at h = 0.5 | 0.25 | 0.125 | ×100 range |
+|---|---|---|---|---|
+| BayesR | −1.04 / 3.08 | −1.03 / 3.12 | −1.01 / 3.15 | −1.32 / 2.49 |
+| t3 | −3.64 / 0.17 | −3.63 / 0.15 | −3.61 / 0.14 | −4.13 / 0.27 |
+
+  Its held-out log predictive moved ≤ 0.05 nats per 1,000 variants under refinement, and ≤ 0.5 at ×100 range.
 
 ## 5. Pooling: a level-only pool cannot carry a heavier tail
 
