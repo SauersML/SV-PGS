@@ -185,8 +185,14 @@ def candidate_pairs(first: SvSites, second: SvSites) -> SvCandidatePairs:
 #                 so E[A] = 2p and Cov(A, g) = Var(A) = V_A (Berkson error);
 #   second source B = kappa g + a + e with e independent of (g, A) (classical
 #                 error; the intercept a absorbs false-positive calls).
-# Then Cov(A, B) = kappa V_A identifies kappa without truth, and within-group
-# HWE gives G. The implied covariance of (g, A, B),
+# Then Cov(A, B) = kappa V_A identifies kappa without truth, and the law of
+# total variance gives G from the same posterior: G = Var(E[g | data]) +
+# E[Var(g | data)] = V_A + the mean posterior variance. That needs neither
+# Hardy-Weinberg nor ancestry groups. (Within-group HWE is exact only with
+# correct group labels: with 20% of a two-group sample mislabelled it read
+# r2_A 0.847 for a true 0.763 and lost 0.022 of fused r2, where this closure
+# read 0.765.) Since G >= V_A, r2_A <= 1 by construction, and r2_B =
+# corr(A, B)^2 / r2_A. The implied covariance of (g, A, B),
 #   [[G, V_A, kappa G], [V_A, V_A, kappa V_A], [kappa G, kappa V_A, V_B]],
 # is a valid covariance exactly when r2_A = V_A / G <= 1 and
 # r2_B = kappa^2 G / V_B <= 1; the fused column is the best linear predictor
@@ -228,22 +234,6 @@ class TwoSourceCalibration:
         )
 
 
-def _genotype_variance(first_dosage: F64Array, group_labels: NDArray) -> float:
-    """Var(g) under HWE within each group: the mixture of the groups' binomials.
-
-    Var(g) = sum_k w_k 2 p_k (1 - p_k) + sum_k w_k (2 p_k - 2 p)^2, with p_k from
-    the calibrated source's group means, E[A | group] = 2 p_k.
-    """
-    overall_mean = float(first_dosage.mean())
-    variance = 0.0
-    for label in np.unique(group_labels):
-        in_group = group_labels == label
-        weight = float(in_group.mean())
-        group_frequency = float(first_dosage[in_group].mean()) / 2.0
-        variance += weight * (2.0 * group_frequency * (1.0 - group_frequency) + (2.0 * group_frequency - overall_mean) ** 2)
-    return variance
-
-
 def _without_pairing_evidence(sample_count: int) -> TwoSourceCalibration:
     # A source constant on the shared samples, or fewer than four of them,
     # leaves the correlation undefined: no evidence that the records pair.
@@ -265,15 +255,16 @@ def _without_pairing_evidence(sample_count: int) -> TwoSourceCalibration:
 
 def calibrate_two_sources(
     first_dosage: F64Array,
+    first_posterior_variance: F64Array,
     second_values: NDArray,
     second_observed: NDArray,
-    group_labels: NDArray,
 ) -> TwoSourceCalibration:
     """Calibrate a matched locus on the samples where both sources are observed.
 
-    ``first_dosage`` is the imputed DS (calibrated), ``second_values`` the
-    other source's allele count, ``group_labels`` the genetic-similarity group
-    of each sample (one label everywhere for a single group).
+    ``first_dosage`` is the imputed DS (calibrated) and
+    ``first_posterior_variance`` its per-sample Var(g | data), from the
+    genotype posterior (DS + 2 GP2 - DS^2 for a 0/1/2 genotype);
+    ``second_values`` is the other source's allele count.
     """
     observed = np.asarray(second_observed, dtype=bool)
     first = np.asarray(first_dosage, dtype=np.float64)[observed]
@@ -286,7 +277,7 @@ def calibrate_two_sources(
     first_variance = float(first.var())
     second_variance = float(second.var())
     covariance = float(np.mean((first - first_mean) * (second - second_mean)))
-    genotype_variance = _genotype_variance(first, np.asarray(group_labels)[observed])
+    genotype_variance = first_variance + float(np.mean(np.asarray(first_posterior_variance, dtype=np.float64)[observed]))
     second_slope = covariance / first_variance
     correlation = covariance / np.sqrt(first_variance * second_variance)
     sigma = np.array([[first_variance, covariance], [covariance, second_variance]])

@@ -6,10 +6,10 @@ with their store codes:
 
 1. Candidate pairs come from ``sv_fusion.candidate_pairs`` on the records'
    SVTYPEs, so only bi-allelic DEL, DUP, INS and CPX records pair. A
-   copy-number record never does: a multi-allelic CNV is not a bi-allelic
-   Hardy-Weinberg locus, and the two-source closure fails there
-   (design-svcontent measured implied reliabilities of 1.0-9.6 at GBA, CYP2D6,
-   CYP21A2 and RHD).
+   copy-number record never does: its copy number is not the ALT count of
+   the imputed allele, so the two-source model does not describe the pair
+   (design-svcontent measured implied reliabilities of 1.0-9.6 at GBA,
+   CYP2D6, CYP21A2 and RHD).
 2. Every candidate is calibrated (``sv_fusion.calibrate_two_sources``) and the
    accepted ones are resolved one to one. An accepted pair becomes one fused
    row that replaces its imputed record, so the locus is one column.
@@ -35,7 +35,7 @@ from dataclasses import dataclass
 
 import numpy as np
 
-from sv_pgs._typing import BoolArray, F64Array, I64Array, NDArray, U8Array
+from sv_pgs._typing import BoolArray, F64Array, I64Array, U8Array
 from sv_pgs.gatksv_source import MAXIMUM_STORED_VALUE, GatksvBlock
 from sv_pgs.sv_fusion import (
     MINIMUM_PAIRING_Z,
@@ -48,21 +48,30 @@ from sv_pgs.sv_fusion import (
 )
 
 CODES_PER_ALLELE = 127
+GP2_CODES_PER_UNIT = 254
 MAXIMUM_ALLELE_COUNT = 2
 
 
 @dataclass(frozen=True, slots=True)
 class ImputedSvRecords:
-    """The imputed source's SV records of one chromosome, with their store codes [records, samples]."""
+    """The imputed source's SV records of one chromosome with their store codes [records, samples].
+
+    ``codes`` are the DS codes (DS = code / 127) and ``gp2_codes`` the store's
+    GP2 codes for the same rows (GP2 = code / 254).
+    """
 
     sites: SvSites
     codes: U8Array
+    gp2_codes: U8Array
 
     def __post_init__(self) -> None:
         if not self.sites.duplications_are_insertions:
             raise ValueError("the imputed source is sequence-resolved: its DUP records are inserted copies.")
-        if self.codes.dtype != np.uint8 or self.codes.ndim != 2 or self.codes.shape[0] != self.sites.starts.shape[0]:
-            raise ValueError("ImputedSvRecords.codes must be uint8 [records, samples], one row per site.")
+        for name, codes in (("codes", self.codes), ("gp2_codes", self.gp2_codes)):
+            if codes.dtype != np.uint8 or codes.ndim != 2 or codes.shape[0] != self.sites.starts.shape[0]:
+                raise ValueError(f"ImputedSvRecords.{name} must be uint8 [records, samples], one row per site.")
+        if self.gp2_codes.shape != self.codes.shape:
+            raise ValueError("ImputedSvRecords.gp2_codes must match codes.")
 
 
 @dataclass(frozen=True, slots=True)
@@ -127,28 +136,30 @@ def _copy_number_codes(values: F64Array) -> tuple[U8Array, int]:
     return _clipped_codes(values, float(MAXIMUM_STORED_VALUE), 1)
 
 
-def gatksv_store_rows(
-    gatksv: GatksvBlock,
-    imputed: ImputedSvRecords,
-    group_labels: NDArray,
-) -> tuple[FusedRows, GatksvRows]:
+def gatksv_store_rows(gatksv: GatksvBlock, imputed: ImputedSvRecords) -> tuple[FusedRows, GatksvRows]:
     """Fuse the GATK-SV records that pair with an imputed record and fill the rest.
 
     ``gatksv`` holds one chromosome's kept records aligned to the store's
-    samples, ``imputed`` the same chromosome's imputed SV records, and
-    ``group_labels`` each store sample's genetic-similarity group.
+    samples and ``imputed`` the same chromosome's imputed SV records.
     """
     sample_count = gatksv.values.shape[1]
-    if imputed.codes.shape[1] != sample_count or np.asarray(group_labels).shape != (sample_count,):
-        raise ValueError("the GATK-SV block, the imputed codes and the group labels need the store's samples.")
+    if imputed.codes.shape[1] != sample_count:
+        raise ValueError("the GATK-SV block and the imputed codes need the store's samples.")
     observed = ~gatksv.no_call
 
     def imputed_dosage(record: int) -> F64Array:
         return imputed.codes[record] / float(CODES_PER_ALLELE)
 
+    def imputed_posterior_variance(record: int) -> F64Array:
+        # E[g^2 | data] = DS + 2 GP2 for a 0/1/2 genotype.
+        dosage = imputed_dosage(record)
+        return dosage + 2.0 * imputed.gp2_codes[record] / float(GP2_CODES_PER_UNIT) - dosage**2
+
     pairs = candidate_pairs(imputed.sites, gatksv_sites(gatksv))
     calibrations = [
-        calibrate_two_sources(imputed_dosage(first_row), gatksv.values[second_row], observed[second_row], group_labels)
+        calibrate_two_sources(
+            imputed_dosage(first_row), imputed_posterior_variance(first_row), gatksv.values[second_row], observed[second_row]
+        )
         for first_row, second_row in zip(pairs.first_rows.tolist(), pairs.second_rows.tolist())
     ]
     chosen = resolve_one_to_one(pairs, calibrations)
