@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from dataclasses import replace
 from pathlib import Path
 
 import numpy as np
@@ -57,10 +58,15 @@ def _scoring(generator: np.random.Generator, trait_type: TraitType, rows: np.nda
 def _model(generator: np.random.Generator, store_root: Path) -> FittedModel:
     rows_quantitative = np.sort(generator.choice(_VARIANTS, size=20, replace=False)).astype(np.int64)
     rows_binary = np.sort(generator.choice(_VARIANTS, size=12, replace=False)).astype(np.int64)
+    binary = _scoring(generator, TraitType.BINARY, rows_binary)
     return FittedModel(
         model_names=("ldl/fold0", "t2d/fold0"),
-        covariate_names=("age", "sex=female"),
-        scoring=(_scoring(generator, TraitType.QUANTITATIVE, rows_quantitative), _scoring(generator, TraitType.BINARY, rows_binary)),
+        covariate_names=("age", "t2d:sex=female"),
+        covariate_columns=np.array([[True, False], [True, True]]),
+        scoring=(
+            replace(_scoring(generator, TraitType.QUANTITATIVE, rows_quantitative), alpha=np.array([0.3, -1.2, 0.0])),
+            binary,
+        ),
         noise_variance=np.array([0.7, 1.0]),
         hyperparameters=tuple(
             MixtureHyperparameters(coefficients=generator.normal(size=9), log_smoothing=generator.normal(size=3)) for _model in range(2)
@@ -92,6 +98,7 @@ def test_a_saved_model_loads_back_exactly(tmp_path: Path, store_root: Path) -> N
     loaded = load_model(tmp_path / "model")
     assert loaded.model_names == model.model_names
     assert loaded.covariate_names == model.covariate_names
+    np.testing.assert_array_equal(loaded.covariate_columns, model.covariate_columns)
     assert loaded.trait_types == model.trait_types
     assert loaded.provenance == model.provenance
     assert loaded.fit_counts == model.fit_counts
@@ -130,6 +137,15 @@ def test_loading_refuses_a_model_that_is_not_exactly_what_was_written(tmp_path: 
     metadata_path.write_text(json.dumps(metadata))
     with pytest.raises(ValueError, match="exactly the arrays"):
         load_model(tmp_path / "model")
+
+
+def test_a_model_has_no_effect_of_a_covariate_it_did_not_adjust_for(store_root: Path) -> None:
+    model = _model(np.random.default_rng(10), store_root)
+    leaking = replace(model.scoring[0], alpha=np.array([0.3, -1.2, 0.4]))
+    with pytest.raises(ValueError, match="did not adjust for"):
+        replace(model, scoring=(leaking, model.scoring[1]))
+    with pytest.raises(ValueError, match="covariate_columns"):
+        replace(model, covariate_columns=np.ones((2, 3), dtype=bool))
 
 
 def test_the_cohort_digest_ignores_order_and_refuses_repeats() -> None:

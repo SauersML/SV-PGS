@@ -126,6 +126,7 @@ def _fit_one(store: DosageStore, covariates: np.ndarray, covariate_names: Sequen
         store_columns=np.arange(sample_count, dtype=np.int64),
         covariates=covariates,
         covariate_names=covariate_names,
+        covariate_columns=np.ones((1, len(covariate_names)), dtype=bool),
         targets=np.asarray(phenotype, dtype=np.float64)[:, None],
         training=np.ones((sample_count, 1), dtype=bool),
         model_names=("trait",),

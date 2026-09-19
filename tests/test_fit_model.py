@@ -81,9 +81,12 @@ class _StubDriver:
             codes = signed[:, arguments["store_columns"][rows]]
             means, scales = codes.mean(axis=1), codes.std(axis=1)
             standardized = (codes - means[:, None]) / scales[:, None]
-            design = arguments["covariates"][rows]
-            alpha, *_ = np.linalg.lstsq(design, arguments["targets"][rows, model], rcond=None)
-            residual = arguments["targets"][rows, model] - design @ alpha
+            adjusted = arguments["covariate_columns"][model]
+            design = arguments["covariates"][rows][:, adjusted]
+            fitted, *_ = np.linalg.lstsq(design, arguments["targets"][rows, model], rcond=None)
+            residual = arguments["targets"][rows, model] - design @ fitted
+            alpha = np.zeros(adjusted.shape[0])
+            alpha[adjusted] = fitted
             coefficients = standardized @ residual / (rows.sum() * store.n_variants)
             scoring.append(
                 ScoringModel(
@@ -116,6 +119,7 @@ class _Cohort:
     store_columns: np.ndarray
     covariates: np.ndarray
     covariate_names: tuple[str, ...]
+    covariate_columns: np.ndarray
     targets: np.ndarray
     training: np.ndarray
     model_names: tuple[str, ...]
@@ -137,7 +141,8 @@ def _cohort(generator: np.random.Generator) -> _Cohort:
         research_ids=[f"person{column}" for column in store_columns],
         store_columns=store_columns,
         covariates=generator.normal(size=(_COHORT, 2)),
-        covariate_names=("age", "sex=female"),
+        covariate_names=("age", "t2d:sex=female"),
+        covariate_columns=np.array([[True, False], [True, False], [True, True]]),
         targets=targets,
         training=training,
         model_names=("ldl/fold0", "ldl/fold1", "t2d/fold0"),
@@ -164,6 +169,7 @@ def test_the_driver_gets_the_intercept_the_training_targets_and_the_draw_count(t
     fit_model.fit(store=DosageStore.open(store_root), **cohort.arguments(), budget=_budget(), work_dir=tmp_path, seed=11)
     (call,) = driver.calls
     np.testing.assert_array_equal(call["covariates"], np.column_stack([np.ones(_COHORT), cohort.covariates]))
+    np.testing.assert_array_equal(call["covariate_columns"], np.column_stack([np.ones(3, dtype=bool), cohort.covariate_columns]))
     np.testing.assert_array_equal(call["training"], cohort.training)
     np.testing.assert_array_equal(call["targets"][cohort.training], cohort.targets[cohort.training])
     assert np.all(call["targets"][~cohort.training] == 0.0)
@@ -187,6 +193,8 @@ def test_the_artifact_carries_the_whole_certificate_and_the_provenance(tmp_path:
     model = fit_model.fit(store=DosageStore.open(store_root), **cohort.arguments(), budget=_budget(), work_dir=tmp_path, seed=5)
     fitted = driver.results[0].certificate
     assert model.model_names == cohort.model_names and model.trait_types == cohort.trait_types
+    np.testing.assert_array_equal(model.covariate_columns, cohort.covariate_columns)
+    assert all(scoring.alpha[2] == 0.0 for scoring in model.scoring[:2]) and model.scoring[2].alpha[2] != 0.0
     for field in dataclasses.fields(FitCertificate):
         value = getattr(fitted, field.name)
         if str(field.type) == "tuple[str, ...]":
@@ -224,6 +232,8 @@ def test_the_cohort_digest_covers_only_the_training_rows(tmp_path: Path, store_r
         (lambda cohort: {"research_ids": cohort.research_ids[:-1]}, "one distinct id"),
         (lambda cohort: {"research_ids": [cohort.research_ids[1], *cohort.research_ids[1:]]}, "one distinct id"),
         (lambda cohort: {"covariates": np.column_stack([np.ones(_COHORT), cohort.covariates])}, "covariates"),
+        (lambda cohort: {"covariate_columns": cohort.covariate_columns[:2]}, "covariate_columns"),
+        (lambda cohort: {"covariate_columns": cohort.covariate_columns.astype(np.int64)}, "covariate_columns"),
         (lambda cohort: {"targets": np.where(cohort.training, cohort.targets, np.nan)[:, :2]}, "targets and training"),
         (lambda cohort: {"targets": np.where(np.arange(_COHORT)[:, None] == 0, np.nan, cohort.targets)}, "finite"),
         (lambda cohort: {"targets": np.where(cohort.training & (np.arange(3) == 2), 0.5, cohort.targets)}, "other than 0 and 1"),
@@ -253,6 +263,7 @@ def _save_cohort(path: Path, cohort: _Cohort) -> None:
         store_columns=cohort.store_columns,
         covariates=cohort.covariates,
         covariate_names=np.array(cohort.covariate_names),
+        covariate_columns=cohort.covariate_columns,
         targets=cohort.targets,
         training=cohort.training,
         model_names=np.array(cohort.model_names),

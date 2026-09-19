@@ -79,6 +79,7 @@ def fit(
     store_columns: I64Array,
     covariates: F64Array,
     covariate_names: Sequence[str],
+    covariate_columns: BoolArray,
     targets: F64Array,
     training: BoolArray,
     model_names: Sequence[str],
@@ -92,8 +93,9 @@ def fit(
     """Fit every model on its training rows and return the artifact.
 
     Cohort row i is the store sample ``store_columns[i]`` with id ``research_ids[i]``; ``covariates`` [n, k] holds the
-    named covariates without the intercept, as ``artifact.predict`` takes them; ``targets`` and ``training`` are
-    [n, models], and a model's non-training targets are never read. ``log_variance_offset`` [store records] is each
+    named covariates of every model without the intercept, as ``artifact.predict`` takes them, and
+    ``covariate_columns`` [models, k] the ones each model adjusts for besides the intercept; ``targets`` and
+    ``training`` are [n, models], and a model's non-training targets are never read. ``log_variance_offset`` [store records] is each
     record's log measurement reliability, log r^2 <= 0, the prior's variance offset (-inf: the record carries no
     signal); None takes r^2 from the store's ``quality`` column. Stage 0 keeps its LD blocks under ``work_dir``.
     """
@@ -108,6 +110,9 @@ def fit(
         raise ValueError("research_ids needs one distinct id per cohort row.")
     if covariate_matrix.shape != (row_count, len(covariate_names)) or not np.all(np.isfinite(covariate_matrix)):
         raise ValueError("covariates must be finite [cohort rows, named covariates].")
+    adjusted = np.asarray(covariate_columns)
+    if adjusted.shape != (model_count, len(covariate_names)) or adjusted.dtype != np.bool_:
+        raise ValueError("covariate_columns must be bool [models, named covariates].")
     if target_matrix.shape != (row_count, model_count) or training_mask.shape != target_matrix.shape:
         raise ValueError("targets and training must be [cohort rows, models].")
     if len(trait_types) != model_count:
@@ -125,6 +130,7 @@ def fit(
         store=store,
         store_columns=columns,
         covariates=np.column_stack([np.ones(row_count), covariate_matrix]),
+        covariate_columns=np.column_stack([np.ones(model_count, dtype=bool), adjusted]),
         targets=np.where(training_mask, target_matrix, 0.0),
         training=training_mask,
         trait_types=tuple(trait_types),
@@ -139,6 +145,7 @@ def fit(
     return FittedModel(
         model_names=tuple(model_names),
         covariate_names=tuple(covariate_names),
+        covariate_columns=adjusted,
         scoring=tuple(fitted.scoring),
         noise_variance=np.asarray(fitted.noise_variance, dtype=np.float64),
         hyperparameters=tuple(fitted.hyperparameters),
@@ -164,13 +171,23 @@ def write_model(store_path: str | Path, cohort_path: str | Path, model_path: str
     """``sv-pgs fit``: fit the cohort file's models on the store and save them to the new directory ``model_path``.
 
     The cohort NPZ holds research_ids [n], store_columns [n], covariates [n, k] without the intercept,
-    covariate_names [k], targets [n, m], training [n, m], model_names [m] and trait_types [m]; nothing else. Each
-    record's reliability is the store's ``quality`` column.
+    covariate_names [k], covariate_columns [m, k], targets [n, m], training [n, m], model_names [m] and
+    trait_types [m]; nothing else. Each record's reliability is the store's ``quality`` column.
     """
     target = Path(model_path)
     if target.exists():
         raise FileExistsError(f"{target} exists; a model is never overwritten.")
-    names = ("research_ids", "store_columns", "covariates", "covariate_names", "targets", "training", "model_names", "trait_types")
+    names = (
+        "research_ids",
+        "store_columns",
+        "covariates",
+        "covariate_names",
+        "covariate_columns",
+        "targets",
+        "training",
+        "model_names",
+        "trait_types",
+    )
     with np.load(cohort_path, allow_pickle=False) as cohort:
         if sorted(cohort.files) != sorted(names):
             raise ValueError(f"{cohort_path} must hold exactly {sorted(names)}.")
@@ -185,6 +202,7 @@ def write_model(store_path: str | Path, cohort_path: str | Path, model_path: str
             store_columns=arrays["store_columns"],
             covariates=arrays["covariates"],
             covariate_names=[str(name) for name in arrays["covariate_names"]],
+            covariate_columns=arrays["covariate_columns"],
             targets=arrays["targets"],
             training=arrays["training"],
             model_names=[str(name) for name in arrays["model_names"]],

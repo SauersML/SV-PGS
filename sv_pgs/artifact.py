@@ -23,7 +23,7 @@ from typing import Any, Mapping, Sequence
 
 import numpy as np
 
-from sv_pgs._typing import F64Array
+from sv_pgs._typing import BoolArray, F64Array
 from sv_pgs.compute_budget import ComputeBudget
 from sv_pgs.config import TraitType
 from sv_pgs.dosage_store import MANIFEST_FILE, DosageStore, read_manifest
@@ -106,6 +106,8 @@ def offset_digest(log_variance_offset: np.ndarray | None) -> str:
 class FittedModel:
     """One fitted model per (trait, fold) training set, in ``model_names`` order.
 
+    ``covariate_names`` are the union of every model's covariates, and ``covariate_columns`` [models, covariates] the
+    ones each model adjusted for (with the intercept, always); a model's alpha is exactly 0 on the others.
     ``certificate`` holds every per-model term of the fit's certificate as an array with one leading entry per model,
     ``fit_counts`` its whole-fit counts, and ``refusals`` the reasons the fit refused trial steps, across all models;
     ``noise_variance`` is each quantitative model's residual variance, used in its predictive variance.
@@ -113,6 +115,7 @@ class FittedModel:
 
     model_names: tuple[str, ...]
     covariate_names: tuple[str, ...]
+    covariate_columns: BoolArray
     scoring: tuple[ScoringModel, ...]
     noise_variance: F64Array
     hyperparameters: tuple[MixtureHyperparameters, ...]
@@ -130,9 +133,14 @@ class FittedModel:
         noise = np.asarray(self.noise_variance)
         if noise.shape != (model_count,) or noise.dtype != np.float64 or not np.all(np.isfinite(noise)) or np.any(noise <= 0.0):
             raise ValueError("noise_variance must be positive float64 with one entry per model.")
-        for model in self.scoring:
+        columns = np.asarray(self.covariate_columns)
+        if columns.shape != (model_count, len(self.covariate_names)) or columns.dtype != np.bool_:
+            raise ValueError("covariate_columns must be bool [models, covariates].")
+        for model, adjusted in zip(self.scoring, columns):
             if model.alpha.shape[0] != len(self.covariate_names) + 1:
                 raise ValueError("each model's alpha must hold the intercept and one entry per covariate.")
+            if np.any(model.alpha[1:][~adjusted] != 0.0):
+                raise ValueError("a model's alpha must be 0 on the covariates it did not adjust for.")
         for name, values in self.certificate.items():
             if np.asarray(values).shape[:1] != (model_count,):
                 raise ValueError(f"certificate term {name!r} needs one entry per model.")
@@ -147,7 +155,7 @@ def save_model(path: str | Path, model: FittedModel) -> None:
     target = Path(path)
     if target.exists():
         raise FileExistsError(f"{target} exists; a model is never overwritten.")
-    arrays: dict[str, np.ndarray] = {"noise_variance": model.noise_variance}
+    arrays: dict[str, np.ndarray] = {"noise_variance": model.noise_variance, "covariate_columns": np.asarray(model.covariate_columns)}
     for index, scoring in enumerate(model.scoring):
         for field_name in _SCORING_FIELDS:
             arrays[f"scoring/{index}/{field_name}"] = getattr(scoring, field_name)
@@ -238,6 +246,7 @@ def load_model(path: str | Path) -> FittedModel:
     return FittedModel(
         model_names=model_names,
         covariate_names=covariate_names,
+        covariate_columns=arrays["covariate_columns"],
         scoring=scoring,
         noise_variance=arrays["noise_variance"],
         hyperparameters=hyperparameters,

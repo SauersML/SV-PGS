@@ -77,7 +77,8 @@ def build_parser() -> argparse.ArgumentParser:
         "cohort",
         help=(
             "NPZ with research_ids [n], store_columns [n], covariates [n, k] without the intercept, covariate_names [k], "
-            "targets [n, m], training [n, m] (bool), model_names [m] and trait_types [m]."
+            "covariate_columns [m, k] (bool: each model's own covariates), targets [n, m], training [n, m] (bool), "
+            "model_names [m] and trait_types [m]."
         ),
     )
     fit_parser.add_argument("model", help="New fitted model directory; never overwritten.")
