@@ -1080,10 +1080,13 @@ class _Evidence:
 
     ``laplace_value`` is the Laplace form, whose exact rho-gradient ``gradient`` is; ``value`` is what every
     comparison uses: the Laplace form from ``_evidence``, and after ``_corrected`` the Tierney-Kadane-certified V.
+    ``error`` bounds |value - V| by the sum of its sources' certified bounds: the inner maximizer, the determinant's
+    rounding and B's linear response (``_evidence``), and after ``_corrected`` the Tierney-Kadane remainder too.
     """
 
     value: float
     laplace_value: float
+    error: float
     gradient: F64Array
     coefficients: F64Array
     responses: F64Array
@@ -1233,7 +1236,13 @@ def _corrected(
         corrections, _terms, _directions = _laplace_corrections(prior, log_smoothing, evidence, cavity, posterior_at, working_bytes, tolerance)
     except FloatingPointError:
         return None
-    return replace(evidence, value=evidence.laplace_value + float(np.sum(corrections)))
+    # The replaced set is _laplace_corrections' own: the largest terms until the rest sum to at most tolerance / 2.
+    order = np.argsort(-np.abs(_terms))
+    remaining = np.concatenate([np.cumsum(np.abs(_terms[order])[::-1])[::-1], [0.0]])
+    replaced = int(np.argmax(remaining <= 0.5 * tolerance))
+    share = 0.5 * tolerance / max(replaced, 1)
+    remainder = float(remaining[replaced]) + replaced * max(share, _HALF_PRECISION)
+    return replace(evidence, value=evidence.laplace_value + float(np.sum(corrections)), error=evidence.error + remainder)
 
 
 def _range_projector(matrix: F64Array) -> tuple[F64Array, F64Array]:
@@ -1355,6 +1364,9 @@ def _evidence(
         curvature_gradient = _curvature_trace_gradient(prior, coefficients, cavity, weight, working_bytes)
         sensitivity = max(float(curvature_gradient @ covariance @ curvature_gradient), np.finfo(np.float64).tiny)
         rounding = _EPSILON * (objective.magnitude + abs(value))
+        # x-hat's error moves the determinant terms by at most this at first order, and F itself by at most the
+        # decrement (the quadratic model's own gain); together, the inner maximizer's share of V's error.
+        inner_error = 0.5 * float(np.sqrt(sensitivity * 2.0 * newton_decrement)) + newton_decrement
         if 0.5 * np.sqrt(sensitivity * 2.0 * newton_decrement) <= tolerance or newton_decrement <= rounding:
             break
         if previous is not None and np.array_equal(coefficients, previous):
@@ -1365,9 +1377,8 @@ def _evidence(
     penalty_log_determinant = sum(_log_pseudo_determinant(penalty[np.ix_(group, group)]) for group in _penalty_groups(prior))
     # A relative error e in B moves log|B + S| by at most D e for well-scaled B + S: the linear response is solved to
     # the evidence tolerance over the dimension, and never past what double precision resolves.
-    total = _total_curvature(
-        prior, coefficients, cavity, posterior_at(prior, coefficients), working_bytes, max(tolerance / coefficients.shape[0], _EPSILON)
-    ) + penalty
+    response_tolerance = max(tolerance / coefficients.shape[0], _EPSILON)
+    total = _total_curvature(prior, coefficients, cavity, posterior_at(prior, coefficients), working_bytes, response_tolerance) + penalty
     try:
         profiled_total = _profiled_factor(total, null_basis, complement)
     except np.linalg.LinAlgError:
@@ -1408,6 +1419,9 @@ def _evidence(
     return _Evidence(
         value=evidence_value,
         laplace_value=evidence_value,
+        # The inner maximizer, the determinant's rounding, and B solved to a relative residual that moves
+        # 1/2 log|B + S| by at most D / 2 times it.
+        error=inner_error + 0.5 * profiled_total.rounding + 0.5 * coefficients.shape[0] * response_tolerance,
         gradient=evidence_gradient,
         coefficients=coefficients,
         responses=responses,
@@ -1715,7 +1729,9 @@ def _stationarity_check(
     errs by at most E = h^2 s / 6 + e / h, least at h = (3 e / s)^(1/3), where E = (3^(2/3) / 2) s^(1/3) e^(2/3). The
     caller certifies the gain's upper bound 1/2 sum (|c| + E)^2 / s against ``tolerance``; e is set so that the error
     alone takes a quarter of it over the n interior weights, 1/2 E^2 / s = tolerance / (4 n):
-    e = (2 tolerance / (n 3^(4/3)))^(3/4) s^(1/4).
+    e = (2 tolerance / (n 3^(4/3)))^(3/4) s^(1/4). That plans the step; the bound recorded, and the one the h/2
+    agreement below is tested against, use each side's own certified error (``_Evidence.error``: the inner maximizer,
+    the determinant's rounding, B's linear response and the Tierney-Kadane remainder, summed), which can exceed e.
 
     The inner maxima of the penalized objective are not unique, so each side restarts from the base's x (not from
     the first-order predictor, which along a direction the data barely curve extrapolates far past the basin). The
@@ -1736,13 +1752,14 @@ def _stationarity_check(
         accuracy = max((2.0 * tolerance / (count * 3.0 ** (4.0 / 3.0))) ** 0.75 * scale[position] ** 0.25, rounding)
         step = (3.0 * accuracy / scale[position]) ** (1.0 / 3.0)
 
-        def bound(length: float) -> float:
-            return length * length * scale[position] / 6.0 + accuracy / length
+        def bound(length: float, sides: list[_Evidence]) -> float:
+            # Truncation, and each side's own certified error over the difference's 2h.
+            return length * length * scale[position] / 6.0 + (sides[0].error + sides[1].error) / (2.0 * length)
 
         while True:
             if step <= limit:
                 raise FloatingPointError("the B-evidence has no certified maximum in one basin on both sides of a fitted penalty weight")
-            quotients = []
+            quotients, bounds = [], []
             for length in (step, 0.5 * step):
                 both = [
                     _corrected(
@@ -1755,12 +1772,13 @@ def _stationarity_check(
                 if any(side is None for side in both):
                     break
                 quotients.append((both[1].value - both[0].value) / (2.0 * length))
-            if len(quotients) == 2 and abs(quotients[0] - quotients[1]) <= bound(step) + bound(0.5 * step):
+                bounds.append(bound(length, both))
+            if len(quotients) == 2 and abs(quotients[0] - quotients[1]) <= bounds[0] + bounds[1]:
                 break
             step *= 0.5
         gradient[position] = quotients[0]
         steps[position] = step
-        errors[position] = bound(step)
+        errors[position] = bounds[0]
     return gradient, scale, steps, errors
 
 
