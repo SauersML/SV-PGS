@@ -212,7 +212,9 @@ class HyperStep:
     starting ones, both in nats: the outer loop's certificate.
     ``newton_decrement`` is the same decrement at the returned
     hyperparameters, and ``smoothing_gradient`` the largest |dV/drho| over
-    weights not held at a bound of their range.
+    weights not held at an edge or a bound of their range, by central
+    differences of the B-evidence; ``stationarity_steps`` and
+    ``stationarity_errors`` are each difference's step and error bound.
     """
 
     hyperparameters: MixtureHyperparameters
@@ -222,6 +224,8 @@ class HyperStep:
     smoothing_gradient: float
     start_decrement: float
     evidence_gain: float
+    stationarity_steps: F64Array
+    stationarity_errors: F64Array
 
 
 # ------------------------------------------------------------------ the lattice
@@ -1066,6 +1070,10 @@ class _Evidence:
     penalized_value: float
     newton_decrement: float
     magnitude: float
+    # Per weight, the two rho-dependent parts of dV/drho_i: the effective degrees of freedom
+    # lambda_i tr((B + S)^-1 S_i) and the penalty's size lambda_i ||R_i x||^2.
+    effective_degrees: F64Array
+    penalty_sizes: F64Array
     # newton_decrement is 1/2 g'(B + S)^-1 g: what the fit's certificate records (math-epeb: the fixed-cavity form
     # understates the remaining gain by up to 100x).
 
@@ -1269,6 +1277,8 @@ def _evidence(
     evidence_value = value + 0.5 * penalty_log_determinant - 0.5 * total_log_determinant + 0.5 * total_null_log_determinant
     # W = (-H)^-1 - N (N'(-H)N)^-1 N' carries both determinants' dependence on x (computed above).
     evidence_gradient = np.empty(len(prior.smoothing_blocks))
+    effective_degrees = np.empty(len(prior.smoothing_blocks))
+    penalty_sizes = np.empty(len(prior.smoothing_blocks))
     responses = np.empty((coefficients.shape[0], len(prior.smoothing_blocks)))
     group_of = {int(coordinate): group for group in _penalty_groups(prior) for coordinate in group}
     for position, (block, log_weight) in enumerate(zip(prior.smoothing_blocks, log_smoothing)):
@@ -1283,6 +1293,8 @@ def _evidence(
         pull[coordinates] = lambda_weight * (block.factor.T @ residual)
         # dx/drho_i = -(-H)^-1 pull, so -1/2 d tr through x is +1/2 grad . (-H)^-1 pull; N' S_i N = 0.
         responses[:, position] = -(covariance @ pull)
+        effective_degrees[position] = lambda_weight * float(np.sum(total_covariance[np.ix_(coordinates, coordinates)] * block.matrix))
+        penalty_sizes[position] = lambda_weight * float(residual @ residual)
         evidence_gradient[position] = (
             -0.5 * lambda_weight * float(residual @ residual)
             + 0.5 * lambda_weight * _pseudo_inverse_trace(penalty[np.ix_(group, group)], embedded)
@@ -1294,6 +1306,8 @@ def _evidence(
         gradient=evidence_gradient,
         coefficients=coefficients,
         responses=responses,
+        effective_degrees=effective_degrees,
+        penalty_sizes=penalty_sizes,
         penalized_value=value,
         newton_decrement=0.5 * float(gradient @ total_covariance @ gradient),
         magnitude=objective.magnitude + abs(evidence_value),
@@ -1581,36 +1595,37 @@ def _stationarity_check(
     posterior_at: PosteriorAt,
     working_bytes: int,
     tolerance: float,
-) -> tuple[F64Array, F64Array]:
-    """The B-evidence's own gradient in each interior weight, by one central difference, and its curvature.
+) -> tuple[F64Array, F64Array, F64Array, F64Array]:
+    """The B-evidence's own gradient in each interior weight by one central difference: (gradient, curvature scale,
+    step, error bound).
 
-    The step balances the difference's truncation against V's rounding: with V known to eps times its magnitude and
-    its log-weight curvature c, the optimal central step is (3 eps |V| / c)^(1/3). c comes from a three-point
-    difference starting at a unit step, the natural scale of a log weight; either step halves until both of its
-    sides have a certified maximum (the certified region can end close to a fitted weight), and the curvature
-    difference, a second difference, is divided by its step's square.
+    Per eigen-direction of its block, V depends on rho_i through terms log(1 + e^(rho + a)) / 2 and
+    b sigma(rho + a) / 2; the first derivatives are sigma / 2 and b sigma' / 2, and every higher derivative of the
+    logistic is bounded by sigma itself. So s_i = (edf_i + lambda_i ||R_i x||^2) / 2 bounds |V''| and |V'''| in rho_i.
+    With V known to eps_V = eps |V|, the central difference errs by at most h^2 s / 6 + eps_V / h, least at
+    h = (3 eps_V / s)^(1/3); a step halves only while one of its sides has no certified maximum.
     """
     gradient = np.zeros(weights.shape[0])
-    curvature = np.ones(weights.shape[0])
     rounding = _EPSILON * evidence.magnitude
+    scale = np.maximum(0.5 * (evidence.effective_degrees + evidence.penalty_sizes), rounding)
+    steps = np.zeros(weights.shape[0])
+    errors = np.zeros(weights.shape[0])
     limit = _HALF_PRECISION * (1.0 + float(np.max(np.abs(weights))))
-
-    def sides(position: int, step: float) -> tuple[float, list[_Evidence]]:
+    for position in np.flatnonzero(interior):
         unit = np.zeros(weights.shape[0])
         unit[position] = 1.0
-        while step > limit:
+        step = (3.0 * rounding / scale[position]) ** (1.0 / 3.0)
+        while True:
+            if step <= limit:
+                raise FloatingPointError("the B-evidence has no certified maximum on both sides of a fitted penalty weight")
             both = [_evidence(view, weights + side * step * unit, evidence.coefficients, cavity, posterior_at, working_bytes, tolerance) for side in (-1.0, 1.0)]
             if all(side is not None for side in both):
-                return step, both
+                break
             step *= 0.5
-        raise FloatingPointError("the B-evidence has no certified maximum on both sides of a fitted penalty weight")
-
-    for position in np.flatnonzero(interior):
-        wide_step, wide = sides(position, 1.0)
-        curvature[position] = max(abs(wide[0].value - 2.0 * evidence.value + wide[1].value) / wide_step**2, rounding)
-        step, close = sides(position, (3.0 * rounding / curvature[position]) ** (1.0 / 3.0))
-        gradient[position] = (close[1].value - close[0].value) / (2.0 * step)
-    return gradient, curvature
+        gradient[position] = (both[1].value - both[0].value) / (2.0 * step)
+        steps[position] = step
+        errors[position] = step * step * scale[position] / 6.0 + rounding / step
+    return gradient, scale, steps, errors
 
 
 def hyper_step(
@@ -1648,7 +1663,9 @@ def hyper_step(
     evidence = replace(evidence, coefficients=final_allowed.T @ coefficients)
     while True:
         interior = (weights > lower) & (weights < upper)
-        check, curvature = _stationarity_check(final_view, weights, evidence, interior, cavity, posterior_at, working_bytes, tolerance)
+        check, curvature, check_steps, check_errors = _stationarity_check(
+            final_view, weights, evidence, interior, cavity, posterior_at, working_bytes, tolerance
+        )
         if 0.5 * float(np.sum(check * check / curvature)) <= tolerance:
             break
         direction = check / curvature
@@ -1673,4 +1690,6 @@ def hyper_step(
         smoothing_gradient=float(np.max(np.abs(check))) if check.size else 0.0,
         start_decrement=start_decrement,
         evidence_gain=evidence.value - start_evidence.value,
+        stationarity_steps=check_steps,
+        stationarity_errors=check_errors,
     )
