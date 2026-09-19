@@ -567,6 +567,46 @@ def test_the_evidence_is_the_profiled_laplace_value_at_a_stationary_point(seed, 
         assert abs(certified.laplace_value - reference) <= _EVIDENCE_TOLERANCE
 
 
+@pytest.mark.parametrize("seed", _SEEDS)
+@pytest.mark.parametrize("kind", ("normal_means", "weak", "mixed"))
+def test_the_evidence_gradient_in_the_weights_matches_differences_of_v(seed, kind):
+    """dV/drho (exact for independent effects, where B is the fixed-cavity curvature) against central differences
+    of the Laplace V, each side re-maximized to its stationary point."""
+    generator = np.random.default_rng(seed)
+    variant_count = 60
+    nodes = np.linspace(np.log(1e-5), np.log(1.0), 10)
+    prior = _prior(generator, variant_count, nodes, nodes[0] - 1.0, nodes[-1], class_count=1 + seed % 2, annotated=True)
+    cavity = _cavity(generator, kind, variant_count)
+    log_smoothing = generator.uniform(-1.0, 2.0, len(prior.smoothing_blocks))
+    posterior = normal_means_posterior(cavity, _WORKING_BYTES)
+    evidence = _evidence(prior, log_smoothing, initial_hyperparameters(prior).coefficients, cavity, posterior, _WORKING_BYTES, 0.0)
+    if evidence is None:
+        pytest.skip("no certified maximum at these weights: the engine refuses V there, which is its contract")
+    objective = _data_objective(prior, evidence.coefficients, cavity, _WORKING_BYTES)
+    negative = -(prior.coefficient_map.T @ objective.hessian @ prior.coefficient_map) + _penalty_matrix(prior, log_smoothing)
+    # V's rounding: the objective's, and the log-determinants' (D eps cond(B + S), backward-stable factorizations);
+    # each side's maximizer stops within the objective's rounding of its maximum.
+    rounding = 2.0 * _objective_rounding(prior, evidence.coefficients, cavity) + negative.shape[0] * _EPSILON * float(np.linalg.cond(negative)) * (
+        1.0 + abs(evidence.laplace_value)
+    )
+
+    def value(weights):
+        moved = _evidence(prior, weights, evidence.coefficients, cavity, posterior, _WORKING_BYTES, 0.0)
+        assert moved is not None
+        return moved.laplace_value
+
+    for position in range(log_smoothing.shape[0]):
+        unit = np.zeros(log_smoothing.shape[0])
+        unit[position] = 1.0
+        # 64 times the balance of truncation and rounding (the third derivative in rho is of the order of the
+        # effective degrees plus the penalty's size, the logistic bound of ``_stationarity_check``).
+        curvature_scale = max(float(evidence.effective_degrees[position] + evidence.penalty_sizes[position]), 1.0)
+        step = (3.0 * rounding / curvature_scale) ** (1.0 / 3.0) * 64.0
+        coarse = _central_difference(value, log_smoothing, unit, step)
+        fine = _central_difference(value, log_smoothing, unit, 0.5 * step)
+        assert abs(float(evidence.gradient[position]) - fine) <= abs(coarse - fine) + 3.0 * rounding / step, (position, evidence.gradient, fine)
+
+
 # ---------------------------------------------------------------- 6. the corrected V against the exact integral
 
 
