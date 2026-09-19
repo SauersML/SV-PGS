@@ -5,15 +5,16 @@ import numpy as np
 import pytest
 
 from sv_pgs.measurement_model import (
-    CalibrationPairs,
     LdBlock,
     apply_leakage_map,
     calibration_moments,
+    calibration_pairs,
     fit_leakage_map,
     fit_measurement_model,
     leakage_transform,
     log_reliability_offsets,
     mapped_gram,
+    merge_calibration_moments,
     pool_normal,
     record_scale_estimates,
     recalibration_scales,
@@ -78,7 +79,7 @@ def test_reliability_of_a_calibrated_draw_is_the_square_of_its_scale() -> None:
     _, genotype, dosage = _records(200, 4000, keep, rng)
     moments = calibration_moments(dosage, genotype)
     scales = recalibration_scales(moments, np.zeros(200, dtype=int))
-    residual = residual_variances(dosage, genotype, scales)
+    residual = residual_variances(moments, scales)
     reliability = np.exp(log_reliability_offsets(moments.dosage_variance, scales, residual))
     # With Var(D) = Var(G) and Cov(G, D) = keep Var(G), a column scaled by kappa has
     # r^2 = kappa^2 / (kappa^2 + 1 + kappa^2 - 2 kappa keep), which is keep^2 at kappa = keep.
@@ -89,11 +90,33 @@ def test_reliability_of_a_calibrated_draw_is_the_square_of_its_scale() -> None:
 
 def test_the_residual_variance_is_the_mean_square_of_the_calibrated_residual() -> None:
     rng = np.random.default_rng(3)
-    _, genotype, dosage = _records(5, 200, 0.7, rng)
+    pairs = 200
+    _, genotype, dosage = _records(5, pairs, 0.7, rng)
     scales = np.array([0.7, 0.6, 0.8, 0.5, 0.9])
-    residual = residual_variances(dosage, genotype, scales)
-    direct = [np.mean(((genotype[j] - genotype[j].mean()) - scales[j] * (dosage[j] - dosage[j].mean())) ** 2) for j in range(5)]
-    np.testing.assert_allclose(residual, direct, rtol=2 * rounding_gamma(4 * 200))
+    residual = residual_variances(calibration_moments(dosage, genotype), scales)
+    truth_centred = genotype - genotype.mean(axis=1, keepdims=True)
+    dosage_centred = dosage - dosage.mean(axis=1, keepdims=True)
+    direct = np.mean((truth_centred - scales[:, None] * dosage_centred) ** 2, axis=1)
+    # The moment form sums three terms whose magnitudes bound its cancellation error.
+    magnitude = np.mean(truth_centred**2 + 2 * np.abs(scales[:, None] * dosage_centred * truth_centred) + (scales[:, None] * dosage_centred) ** 2, axis=1)
+    assert np.all(np.abs(residual - direct) <= 2 * rounding_gamma(4 * pairs) * magnitude)
+
+
+def test_moments_merged_across_chunks_are_the_moments_of_all_pairs() -> None:
+    rng = np.random.default_rng(23)
+    pairs = 900
+    _, genotype, dosage = _records(40, pairs, 0.6, rng)
+    dosage[rng.random(dosage.shape) < 0.1] = np.nan
+    dosage[3] = np.nan
+    whole = calibration_moments(dosage, genotype)
+    merged = calibration_moments(dosage[:, :0], genotype[:, :0])
+    for chunk in np.array_split(np.arange(pairs), 7):
+        merged = merge_calibration_moments(merged, calibration_moments(dosage[:, chunk], genotype[:, chunk]))
+    np.testing.assert_array_equal(merged.pair_counts, whole.pair_counts)
+    assert merged.pair_counts[3] == 0
+    bound = 2 * rounding_gamma(4 * pairs)
+    for name, scale in (("dosage_mean", 2.0), ("truth_mean", 2.0), ("dosage_variance", 4.0), ("truth_variance", 4.0), ("covariance", 4.0)):
+        assert np.all(np.abs(getattr(merged, name) - getattr(whole, name)) <= bound * scale), name
 
 
 def _two_locus(rng: np.random.Generator, samples: int, frequency: float, linkage: float) -> tuple[np.ndarray, np.ndarray]:
@@ -180,19 +203,22 @@ def test_without_truth_the_model_degrades_loudly_and_records_it() -> None:
     variance = np.array([0.4, 0.3])
     with pytest.raises(ValueError, match="reported r"):
         fit_measurement_model(None, variance, np.zeros(2, dtype=int))
-    model = fit_measurement_model(None, variance, np.zeros(2, dtype=int), reported_reliability=np.array([0.9, 0.5]))
+    reported = np.array([0.9, 0.5])
+    model = fit_measurement_model(None, variance, np.zeros(2, dtype=int), reported_reliability=reported)
     np.testing.assert_array_equal(model.scales, np.ones(2))
     assert model.leakage_maps == ()
-    assert "not applied" in str(model.certificate["recalibration"])
+    assert model.certificate["calibrated_records"] == 0 and model.certificate["uncalibrated_records"] == 2
+    assert "not applied to 2 records" in str(model.certificate["recalibration"])
     assert "not applied" in str(model.certificate["leakage_correction"])
-    np.testing.assert_allclose(model.log_reliability, np.log([0.9, 0.5]))
+    np.testing.assert_allclose(model.log_reliability, np.log(reported), rtol=rounding_gamma(2))
+    np.testing.assert_allclose(model.residual_variance, variance * (1 - reported) / reported, rtol=rounding_gamma(3))
 
 
 def test_calibration_pairs_need_typed_research_ids() -> None:
     with pytest.raises(TypeError):
-        CalibrationPairs(("1", "2"), np.zeros((1, 2)), np.zeros((1, 2)))
+        calibration_pairs(("1", "2"), np.zeros((1, 2)), np.zeros((1, 2)))
     with pytest.raises(ValueError):
-        CalibrationPairs((ResearchId("1"), ResearchId("1")), np.zeros((1, 2)), np.zeros((1, 2)))
+        calibration_pairs((ResearchId("1"), ResearchId("1")), np.zeros((1, 2)), np.zeros((1, 2)))
 
 
 def test_with_truth_the_model_recalibrates_and_maps_each_block() -> None:
@@ -200,13 +226,32 @@ def test_with_truth_the_model_recalibrates_and_maps_each_block() -> None:
     samples = 3000
     sv, snp = _two_locus(rng, samples, 0.3, 0.9)
     draw = _draw_type_column(sv[None], np.array([0.3]), 0.5, rng)[0]
-    pairs = CalibrationPairs(tuple(ResearchId(str(index)) for index in range(samples)), np.vstack([draw, snp]), np.vstack([sv, snp]))
-    model = fit_measurement_model(
-        pairs,
-        np.array([np.var(draw), np.var(snp)]),
-        np.array([0, 1]),
+    pairs = calibration_pairs(
+        tuple(ResearchId(str(index)) for index in range(samples)),
+        np.vstack([draw, snp]),
+        np.vstack([sv, snp]),
         blocks=(LdBlock(np.array([0, 1]), np.array([0])),),
     )
-    assert model.certificate["reliability_source"] == "calibration pairs"
+    model = fit_measurement_model(pairs, np.array([np.var(draw), np.var(snp)]), np.array([0, 1]))
+    assert model.certificate["calibrated_records"] == 2 and model.certificate["uncalibrated_records"] == 0
+    assert "applied to 1 LD blocks" in str(model.certificate["leakage_correction"])
     assert len(model.leakage_maps) == 1 and model.leakage_maps[0].ridge_ratio > 0.0
-    assert model.scales[1] == 1.0
+    # The SNP's truth is its own column: its slope is 1, kept exactly or pooled alone.
+    assert abs(model.scales[1] - 1.0) <= rounding_gamma(2)
+
+
+def test_records_without_pairs_fall_back_to_the_reported_reliability_and_are_counted() -> None:
+    rng = np.random.default_rng(29)
+    _, genotype, dosage = _records(6, 2000, 0.7, rng)
+    dosage[4:] = np.nan
+    pairs = calibration_pairs(tuple(ResearchId(str(index)) for index in range(2000)), dosage, genotype)
+    variance = np.nanvar(dosage, axis=1)
+    variance[4:] = 0.3
+    with pytest.raises(ValueError, match="2 records"):
+        fit_measurement_model(pairs, variance, np.zeros(6, dtype=int))
+    reported = np.full(6, 0.8)
+    model = fit_measurement_model(pairs, variance, np.zeros(6, dtype=int), reported_reliability=reported)
+    assert model.certificate["calibrated_records"] == 4 and model.certificate["uncalibrated_records"] == 2
+    np.testing.assert_array_equal(model.scales[4:], np.ones(2))
+    np.testing.assert_allclose(model.log_reliability[4:], np.log(reported[4:]), rtol=rounding_gamma(2))
+    assert np.all(model.scales[:4] < 1.0)

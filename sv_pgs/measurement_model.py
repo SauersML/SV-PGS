@@ -11,8 +11,9 @@ the pipeline from its own calibration pairs: inside the AoU workspace from its
 truth samples, and on public benchmarks from their truth.
 
 1. Recalibration scales. kappa_j = Cov(G, D_j) / Var(D_j), so that
-   D*_j = mu_j + kappa_j (D_j - mu_j) satisfies Cov(G, D*) = Var(D*). Since
-   Cov(T, D) = Cov(G, D), one truth suffices. Each record's estimate is noisy,
+   D*_j = mu_j + kappa_j (D_j - mu_j) satisfies Cov(G, D*) = Var(D*). For a
+   truth with E[T | G] = G and error independent of D given G,
+   Cov(T, D) = Cov(G, D), so one truth suffices. Each record's estimate is noisy,
    so records are pooled by a normal-normal empirical Bayes: the mean is a linear
    model in a caller-given design, and the between-record variance is chosen by
    marginal likelihood (0 when the records agree).
@@ -37,19 +38,23 @@ truth samples, and on public benchmarks from their truth.
    becomes A' G A and its cross-products A' X'y.
 
 The calibration pairs are an explicit input (``CalibrationPairs``, keyed by
-typed research IDs). In the AoU workspace they come from a truth source the user
-supplies: the long-read panel members' hard calls are not part of the imputation
-deliverables. Without calibration pairs, ``fit_measurement_model`` degrades
-loudly, never silently. It applies no recalibration and no leakage correction,
-takes the reliability offsets from the imputation's own reported r^2, which the
-caller must pass, and records each of these facts in the model's certificate,
-which the fit certificate carries. It also logs them.
+typed research IDs). They enter as per-record sufficient statistics, which the
+store step accumulates in its one pass, plus the pair-level data of the LD blocks
+to be mapped, so no [records, samples] array is ever needed. In the AoU workspace
+they come from a truth source the user supplies: the long-read panel members'
+hard calls are not part of the imputation deliverables. Where calibration pairs
+are missing, for a record or for everything, ``fit_measurement_model`` degrades
+loudly, never silently. Those records get no recalibration and no leakage
+correction, and their reliability offsets come from the imputation's own reported
+r^2, which the caller must then pass. The model's certificate, which the fit
+certificate carries, records each of these facts with its record count, and they
+are logged.
 """
 
 from __future__ import annotations
 
 from collections.abc import Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, fields
 
 import numpy as np
 
@@ -60,7 +65,12 @@ from sv_pgs.sample_ids import ResearchId
 
 @dataclass(frozen=True)
 class CalibrationMoments:
-    """Per-record moments over the calibration pairs observed in both D and T (1/n normalized)."""
+    """Per-record moments over the calibration pairs observed in both D and T (1/n normalized).
+
+    A record with no pairs has count 0 and zero moments. Moments of disjoint sets of
+    pairs combine exactly with ``merge_calibration_moments``, so they can be
+    accumulated in one pass over the store, chunk by chunk.
+    """
 
     pair_counts: I64Array
     dosage_mean: F64Array
@@ -68,6 +78,9 @@ class CalibrationMoments:
     dosage_variance: F64Array
     truth_variance: F64Array
     covariance: F64Array
+
+    def subset(self, records: NDArray) -> CalibrationMoments:
+        return CalibrationMoments(*(getattr(self, field.name)[records] for field in fields(self)))
 
 
 def calibration_moments(dosage: NDArray, truth: NDArray) -> CalibrationMoments:
@@ -78,21 +91,44 @@ def calibration_moments(dosage: NDArray, truth: NDArray) -> CalibrationMoments:
         raise ValueError("calibration_moments needs dosage and truth of the same shape [records, samples].")
     observed = np.isfinite(dosage_values) & np.isfinite(truth_values)
     counts = observed.sum(axis=1)
-    if np.any(counts == 0):
-        raise ValueError("every record needs at least one calibration pair observed in both D and T.")
-    dosage_zeroed = np.where(observed, dosage_values, 0.0)
-    truth_zeroed = np.where(observed, truth_values, 0.0)
-    dosage_mean = dosage_zeroed.sum(axis=1) / counts
-    truth_mean = truth_zeroed.sum(axis=1) / counts
+    divisor = np.maximum(counts, 1)
+    dosage_mean = np.where(observed, dosage_values, 0.0).sum(axis=1) / divisor
+    truth_mean = np.where(observed, truth_values, 0.0).sum(axis=1) / divisor
     dosage_centred = np.where(observed, dosage_values - dosage_mean[:, None], 0.0)
     truth_centred = np.where(observed, truth_values - truth_mean[:, None], 0.0)
     return CalibrationMoments(
         pair_counts=counts.astype(np.int64),
         dosage_mean=dosage_mean,
         truth_mean=truth_mean,
-        dosage_variance=(dosage_centred**2).sum(axis=1) / counts,
-        truth_variance=(truth_centred**2).sum(axis=1) / counts,
-        covariance=(dosage_centred * truth_centred).sum(axis=1) / counts,
+        dosage_variance=(dosage_centred**2).sum(axis=1) / divisor,
+        truth_variance=(truth_centred**2).sum(axis=1) / divisor,
+        covariance=(dosage_centred * truth_centred).sum(axis=1) / divisor,
+    )
+
+
+def merge_calibration_moments(first: CalibrationMoments, second: CalibrationMoments) -> CalibrationMoments:
+    """The moments of the union of two disjoint sets of pairs (Chan, Golub and LeVeque's pairwise update)."""
+    if first.pair_counts.shape != second.pair_counts.shape:
+        raise ValueError("merge_calibration_moments needs moments of the same records.")
+    first_count = first.pair_counts.astype(np.float64)
+    second_count = second.pair_counts.astype(np.float64)
+    count = first_count + second_count
+    second_share = np.divide(second_count, count, out=np.zeros_like(count), where=count > 0)
+    cross_weight = first_count * second_share
+    dosage_step = second.dosage_mean - first.dosage_mean
+    truth_step = second.truth_mean - first.truth_mean
+
+    def pooled(first_moment: F64Array, second_moment: F64Array, product: F64Array) -> F64Array:
+        total = first_count * first_moment + second_count * second_moment + cross_weight * product
+        return np.divide(total, count, out=np.zeros_like(count), where=count > 0)
+
+    return CalibrationMoments(
+        pair_counts=first.pair_counts + second.pair_counts,
+        dosage_mean=first.dosage_mean + second_share * dosage_step,
+        truth_mean=first.truth_mean + second_share * truth_step,
+        dosage_variance=pooled(first.dosage_variance, second.dosage_variance, dosage_step**2),
+        truth_variance=pooled(first.truth_variance, second.truth_variance, truth_step**2),
+        covariance=pooled(first.covariance, second.covariance, dosage_step * truth_step),
     )
 
 
@@ -102,14 +138,16 @@ def record_scale_estimates(moments: CalibrationMoments) -> tuple[F64Array, F64Ar
     The sampling variance is the ordinary least-squares one, RSS / (n - 2) / S_DD. A
     record with no dosage variation, or fewer than 3 pairs, carries no information
     about its slope: its variance is infinite, and pooling gives it the stratum's mean.
+    The residual sum of squares is nonnegative; a rounded negative value is projected
+    back to 0.
     """
     counts = moments.pair_counts.astype(np.float64)
     informative = (moments.dosage_variance > 0.0) & (moments.pair_counts > 2)
     slopes = np.zeros_like(moments.covariance)
     variances = np.full_like(moments.covariance, np.inf)
     slopes[informative] = moments.covariance[informative] / moments.dosage_variance[informative]
-    residual_sum_of_squares = counts * (
-        moments.truth_variance - moments.covariance**2 / np.where(informative, moments.dosage_variance, 1.0)
+    residual_sum_of_squares = np.maximum(
+        counts * (moments.truth_variance - moments.covariance**2 / np.where(informative, moments.dosage_variance, 1.0)), 0.0
     )
     variances[informative] = (
         residual_sum_of_squares[informative]
@@ -193,39 +231,36 @@ def recalibration_scales(moments: CalibrationMoments, strata: NDArray, design: N
 
     ``strata`` labels each record's pooling stratum, e.g. variant class x ancestry
     group. ``design`` is [records, features] for the stratum's prior mean, e.g. an
-    intercept with the record's logit frequency and imputation information. A
-    stratum whose informative records are fewer than its design's features is
-    refused rather than guessed.
+    intercept with the record's logit frequency and imputation information. A record
+    whose slope is exact (no residual) keeps it. A stratum with records to pool but
+    fewer informative ones than its design's features is refused rather than guessed.
     """
     slopes, variances = record_scale_estimates(moments)
     labels = np.asarray(strata)
     if labels.shape != slopes.shape:
         raise ValueError("recalibration_scales needs one stratum label per record.")
     features = np.ones((slopes.shape[0], 1)) if design is None else np.asarray(design, dtype=np.float64)
-    pooled = np.empty_like(slopes)
+    pooled = slopes.copy()
     for stratum in np.unique(labels):
-        members = labels == stratum
-        pooled[members] = pool_normal(slopes[members], variances[members], features[members]).shrunk
+        members = (labels == stratum) & (variances > 0.0)
+        if np.any(members):
+            pooled[members] = pool_normal(slopes[members], variances[members], features[members]).shrunk
     return pooled
 
 
-def residual_variances(dosage: NDArray, truth: NDArray, scales: NDArray) -> F64Array:
-    """v_j = mean over pairs of ((T - Tbar) - kappa_j (D - Dbar))^2, nonnegative by construction.
+def residual_variances(moments: CalibrationMoments, scales: NDArray) -> F64Array:
+    """v_j = mean over pairs of ((T - Tbar) - kappa_j (D - Dbar))^2 = Var(T) - 2 kappa Cov(T, D) + kappa^2 Var(D).
 
     This is Var(G - D*) plus the truth's own error variance, so it upper-bounds the
-    genotype's residual variance whenever the truth is not exact.
+    genotype's residual variance whenever the truth is not exact. It is nonnegative;
+    a rounded negative value is projected back to 0.
     """
-    dosage_values = np.asarray(dosage, dtype=np.float64)
-    truth_values = np.asarray(truth, dtype=np.float64)
     kappa = np.asarray(scales, dtype=np.float64)
-    observed = np.isfinite(dosage_values) & np.isfinite(truth_values)
-    counts = observed.sum(axis=1)
-    if kappa.shape != (dosage_values.shape[0],) or np.any(counts == 0):
-        raise ValueError("residual_variances needs one scale per record and a calibration pair in every record.")
-    dosage_mean = np.where(observed, dosage_values, 0.0).sum(axis=1) / counts
-    truth_mean = np.where(observed, truth_values, 0.0).sum(axis=1) / counts
-    residual = (truth_values - truth_mean[:, None]) - kappa[:, None] * (dosage_values - dosage_mean[:, None])
-    return (np.where(observed, residual, 0.0) ** 2).sum(axis=1) / counts
+    if kappa.shape != moments.pair_counts.shape:
+        raise ValueError("residual_variances needs one scale per record.")
+    return np.maximum(
+        moments.truth_variance - 2.0 * kappa * moments.covariance + kappa**2 * moments.dosage_variance, 0.0
+    )
 
 
 def log_reliability_offsets(dosage_variance: NDArray, scales: NDArray, residual_variance: NDArray) -> F64Array:
@@ -259,8 +294,10 @@ class LeakageMap:
     log_evidence_gain: float
 
 
-def _unmapped(targets: I64Array, column_means: F64Array) -> LeakageMap:
-    return LeakageMap(targets, column_means, np.zeros((column_means.shape[0], targets.shape[0])), 0.0, True, 0.0)
+def _unmapped(targets: I64Array, column_means: F64Array, identified: bool = True) -> LeakageMap:
+    """No correction: rho = 0 when the data show no leakage, infinite when rho is not identified."""
+    ratio = 0.0 if identified else np.inf
+    return LeakageMap(targets, column_means, np.zeros((column_means.shape[0], targets.shape[0])), ratio, identified, 0.0)
 
 
 def fit_leakage_map(calibrated_block: NDArray, target_truth: NDArray, targets: NDArray) -> LeakageMap:
@@ -273,7 +310,11 @@ def fit_leakage_map(calibrated_block: NDArray, target_truth: NDArray, targets: N
     standardized units, c ~ N(0, rho sigma_k^2 I). Its ratio rho is shared by the
     block's targets and is the maximizer of the profile marginal likelihood, with
     each target's sigma_k^2 profiled out in closed form. A column with no
-    calibration variation predicts nothing and gets coefficient 0.
+    calibration variation predicts nothing and gets coefficient 0, as does a target
+    whose calibrated column already equals its truth on every pair. When the block's
+    columns span all the pairs' centred directions they interpolate every residual,
+    the likelihood has no maximum in rho, and the block is returned unmapped and
+    flagged as not identified.
     """
     block = np.asarray(calibrated_block, dtype=np.float64)
     truth = np.asarray(target_truth, dtype=np.float64)
@@ -290,26 +331,32 @@ def fit_leakage_map(calibrated_block: NDArray, target_truth: NDArray, targets: N
     deviations = centred.std(axis=0)
     varying = deviations > 0.0
     residuals = (truth - truth.mean(axis=0)) - centred[:, target_index]
-    if not np.any(varying):
+    leaking = np.any(residuals != 0.0, axis=0)
+    if not (np.any(varying) and np.any(leaking)):
         return _unmapped(target_index, column_means)
     standardized = centred[:, varying] / deviations[varying]
     left, singular, right_transposed = np.linalg.svd(standardized, full_matrices=False)
     retained = singular > singular[0] * np.finfo(np.float64).eps * max(standardized.shape)
+    if retained.sum() >= pair_count - 1:
+        # The block's columns span every centred direction of the pairs, so every
+        # residual is interpolated and the likelihood grows without bound in rho.
+        return _unmapped(target_index, column_means, identified=False)
     left, singular, right_transposed = left[:, retained], singular[retained], right_transposed[retained]
     eigenvalues = singular**2
-    projected = left.T @ residuals
-    outside = np.sum((residuals - left @ projected) ** 2, axis=0)
+    target_count = int(leaking.sum())
+    projected = left.T @ residuals[:, leaking]
+    outside = np.sum((residuals[:, leaking] - left @ projected) ** 2, axis=0)
 
     def residual_energy(ratio: float) -> F64Array:
         return np.sum(projected**2 / (1.0 + ratio * eigenvalues)[:, None], axis=0) + outside
 
     def profile(ratio: float) -> float:
-        return float(-(pair_count * np.sum(np.log(residual_energy(ratio))) + truth.shape[1] * np.sum(np.log1p(ratio * eigenvalues))) / 2)
+        return float(-(pair_count * np.sum(np.log(residual_energy(ratio))) + target_count * np.sum(np.log1p(ratio * eigenvalues))) / 2)
 
     def score(ratio: float) -> float:
         shrink = 1.0 + ratio * eigenvalues
         energy_slope = -np.sum(projected**2 * (eigenvalues / shrink**2)[:, None], axis=0)
-        return float(-(pair_count * np.sum(energy_slope / residual_energy(ratio)) + truth.shape[1] * np.sum(eigenvalues / shrink)) / 2)
+        return float(-(pair_count * np.sum(energy_slope / residual_energy(ratio)) + target_count * np.sum(eigenvalues / shrink)) / 2)
 
     if not score(0.0) > 0.0:
         return _unmapped(target_index, column_means)
@@ -317,12 +364,11 @@ def fit_leakage_map(calibrated_block: NDArray, target_truth: NDArray, targets: N
     while score(high) > 0.0:
         high *= 2
         if not np.isfinite(high):
-            unmapped = _unmapped(target_index, column_means)
-            return LeakageMap(unmapped.targets, unmapped.column_means, unmapped.coefficients, np.inf, False, 0.0)
+            return _unmapped(target_index, column_means, identified=False)
     ratio = _bisect_to_exhaustion(score, 0.0, high)
     standardized_coefficients = right_transposed.T @ ((ratio * singular / (1.0 + ratio * eigenvalues))[:, None] * projected)
     coefficients = np.zeros((block.shape[1], target_index.shape[0]))
-    coefficients[varying] = standardized_coefficients / deviations[varying][:, None]
+    coefficients[np.ix_(varying, leaking)] = standardized_coefficients / deviations[varying][:, None]
     return LeakageMap(target_index, column_means, coefficients, ratio, True, profile(ratio) - profile(0.0))
 
 
@@ -353,30 +399,6 @@ def mapped_gram(gram: NDArray, leakage: LeakageMap) -> F64Array:
 
 
 @dataclass(frozen=True)
-class CalibrationPairs:
-    """Samples carrying both a stored column and a truth genotype, [records, samples] in store record order.
-
-    ``dosage`` is the samples' stored (uncalibrated) column and ``truth`` their truth
-    genotype for the same records, NaN where either is missing. The truth's error
-    must be independent of the stored column: a long-read or other orthogonal call,
-    never the imputation itself.
-    """
-
-    sample_ids: tuple[ResearchId, ...]
-    dosage: F64Array
-    truth: F64Array
-
-    def __post_init__(self) -> None:
-        if not all(isinstance(sample, ResearchId) for sample in self.sample_ids):
-            raise TypeError("CalibrationPairs needs typed ResearchIds for its samples.")
-        if len(set(self.sample_ids)) != len(self.sample_ids):
-            raise ValueError("CalibrationPairs has a repeated research ID.")
-        dosage = np.asarray(self.dosage)
-        if dosage.ndim != 2 or dosage.shape != np.asarray(self.truth).shape or dosage.shape[1] != len(self.sample_ids):
-            raise ValueError("CalibrationPairs needs dosage and truth of shape [records, samples], one column per sample ID.")
-
-
-@dataclass(frozen=True)
 class LdBlock:
     """One LD block's records (store row indices) and which of them are mapped targets (indices into ``records``)."""
 
@@ -385,11 +407,87 @@ class LdBlock:
 
 
 @dataclass(frozen=True)
+class BlockPairs:
+    """One LD block's calibration pairs for its leakage map.
+
+    ``dosage`` is [pairs, block records]: the stored (uncalibrated) columns of every
+    record in the block, and ``truth`` is [pairs, targets] for the block's targets.
+    Only pairs complete across the block and its targets are kept.
+    """
+
+    block: LdBlock
+    dosage: F64Array
+    truth: F64Array
+
+    def __post_init__(self) -> None:
+        records = np.asarray(self.block.records)
+        targets = np.asarray(self.block.targets)
+        dosage, truth = np.asarray(self.dosage), np.asarray(self.truth)
+        if dosage.ndim != 2 or dosage.shape[1] != records.shape[0] or truth.shape != (dosage.shape[0], targets.shape[0]):
+            raise ValueError("BlockPairs needs dosage [pairs, block records] and truth [pairs, targets].")
+        if not (np.all(np.isfinite(dosage)) and np.all(np.isfinite(truth))):
+            raise ValueError("BlockPairs needs pairs complete across the block and its targets.")
+
+
+@dataclass(frozen=True)
+class CalibrationPairs:
+    """What the measurement model uses from the samples carrying both a stored column and a truth genotype.
+
+    ``moments`` are the per-record moments over those samples (store record order),
+    which the store step accumulates in its one pass with ``calibration_moments``
+    and ``merge_calibration_moments``. ``blocks`` holds the pair-level data of the
+    LD blocks that get a leakage map. The truth must be an orthogonal call whose
+    error is independent of the stored column given the genotype, with E[T | G] = G:
+    a long-read or other independent genotyping, never the imputation itself. A
+    truth that misclassifies attenuates kappa by its own slope Cov(T, G) / Var(G),
+    which no second moment of such truths can identify, so the truth source is the
+    user's stated input.
+    """
+
+    sample_ids: tuple[ResearchId, ...]
+    moments: CalibrationMoments
+    blocks: tuple[BlockPairs, ...] = ()
+
+    def __post_init__(self) -> None:
+        if not all(isinstance(sample, ResearchId) for sample in self.sample_ids):
+            raise TypeError("CalibrationPairs needs typed ResearchIds for its samples.")
+        if len(set(self.sample_ids)) != len(self.sample_ids):
+            raise ValueError("CalibrationPairs has a repeated research ID.")
+        if np.any(self.moments.pair_counts > len(self.sample_ids)):
+            raise ValueError("CalibrationPairs has a record with more pairs than calibration samples.")
+        for pairs in self.blocks:
+            if pairs.dosage.shape[0] > len(self.sample_ids):
+                raise ValueError("CalibrationPairs has a block with more pairs than calibration samples.")
+
+
+def calibration_pairs(
+    sample_ids: Sequence[ResearchId], dosage: NDArray, truth: NDArray, blocks: Sequence[LdBlock] = ()
+) -> CalibrationPairs:
+    """Calibration pairs from dense [records, samples] arrays, NaN where missing (a benchmark's scale)."""
+    dosage_values = np.asarray(dosage, dtype=np.float64)
+    truth_values = np.asarray(truth, dtype=np.float64)
+    if dosage_values.ndim != 2 or dosage_values.shape[1] != len(sample_ids):
+        raise ValueError("calibration_pairs needs dosage and truth of shape [records, samples], one column per sample ID.")
+    block_pairs = []
+    for block in blocks:
+        records = np.asarray(block.records, dtype=np.int64)
+        target_records = records[np.asarray(block.targets, dtype=np.int64)]
+        complete = np.all(np.isfinite(dosage_values[records]), axis=0) & np.all(np.isfinite(truth_values[target_records]), axis=0)
+        block_pairs.append(BlockPairs(block, dosage_values[records][:, complete].T, truth_values[target_records][:, complete].T))
+    return CalibrationPairs(tuple(sample_ids), calibration_moments(dosage_values, truth_values), tuple(block_pairs))
+
+
+@dataclass(frozen=True)
 class MeasurementModel:
-    """What the fit uses for its columns, offsets and predictive variance, and what was and wasn't applied."""
+    """What the fit uses for its columns, offsets and predictive variance, and what was and wasn't applied.
+
+    ``residual_variance`` is v_j = E[(G - D*_j)^2], the predictive variance's
+    measurement term. For a record without calibration pairs it is the value the
+    reported r^2 implies for the unscaled column, Var(D) (1 - r^2) / r^2.
+    """
 
     scales: F64Array
-    residual_variance: F64Array | None
+    residual_variance: F64Array
     log_reliability: F64Array
     leakage_maps: tuple[LeakageMap, ...]
     certificate: dict[str, object]
@@ -400,59 +498,73 @@ def fit_measurement_model(
     cohort_dosage_variance: NDArray,
     strata: NDArray,
     design: NDArray | None = None,
-    blocks: Sequence[LdBlock] = (),
     reported_reliability: NDArray | None = None,
 ) -> MeasurementModel:
-    """The measurement model for every stored record, from calibration pairs when there are any.
+    """The measurement model for every stored record, from calibration pairs where there are any.
 
     ``cohort_dosage_variance`` is each stored column's variance in the fitted cohort.
     ``strata`` and ``design`` define the pooling of the recalibration scales (see
-    ``recalibration_scales``). ``blocks`` lists the LD blocks whose imperfect columns
-    get a leakage map. ``reported_reliability`` is the imputation's own r^2 per
-    record (INFO or DR2). It is used only when there are no calibration pairs, and
-    is then required.
+    ``recalibration_scales``). ``reported_reliability`` is the imputation's own r^2
+    per record (INFO or DR2). It is used only for records with fewer than 3
+    calibration pairs, and is then required. Those records get no recalibration and
+    their offsets come from the reported r^2; the certificate counts them and the
+    fact is logged, never silent.
     """
     variance = np.asarray(cohort_dosage_variance, dtype=np.float64)
-    if calibration is None:
+    labels = np.asarray(strata)
+    if variance.ndim != 1 or np.any(variance < 0.0) or labels.shape != variance.shape:
+        raise ValueError("fit_measurement_model needs one nonnegative cohort variance and one stratum per record.")
+    calibrated = np.zeros(variance.shape, dtype=bool)
+    if calibration is not None:
+        if calibration.moments.pair_counts.shape != variance.shape:
+            raise ValueError("the calibration pairs and the cohort variances need the same records.")
+        calibrated = calibration.moments.pair_counts > 2
+    scales = np.ones_like(variance)
+    residual = np.empty_like(variance)
+    offsets = np.empty_like(variance)
+    uncalibrated = ~calibrated
+    if np.any(uncalibrated):
         if reported_reliability is None:
-            raise ValueError("without calibration pairs the reliability offsets need the imputation's reported r^2.")
+            raise ValueError(
+                f"{int(uncalibrated.sum())} records have fewer than 3 calibration pairs; their reliability offsets "
+                "need the imputation's reported r^2."
+            )
         reported = np.asarray(reported_reliability, dtype=np.float64)
         if reported.shape != variance.shape or np.any((reported < 0.0) | (reported > 1.0)):
             raise ValueError("reported_reliability needs one r^2 in [0, 1] per record.")
-        certificate: dict[str, object] = {
-            "calibration_pairs": 0,
-            "recalibration": "not applied: no truth genotypes were supplied",
-            "leakage_correction": "not applied: no truth genotypes were supplied",
-            "reliability_source": "the imputation's reported r^2 (biased for draw-type columns)",
-        }
-        for key in ("recalibration", "leakage_correction", "reliability_source"):
-            log(f"measurement model: {key}: {certificate[key]}")
-        with np.errstate(divide="ignore"):
-            offsets = np.log(reported)
-        return MeasurementModel(np.ones_like(variance), None, offsets, (), certificate)
-    moments = calibration_moments(calibration.dosage, calibration.truth)
-    if moments.pair_counts.shape != variance.shape:
-        raise ValueError("the calibration pairs and the cohort variances need the same records.")
-    scales = recalibration_scales(moments, strata, design)
-    residual = residual_variances(calibration.dosage, calibration.truth, scales)
-    offsets = log_reliability_offsets(variance, scales, residual)
-    calibrated = moments.dosage_mean[:, None] + scales[:, None] * (np.asarray(calibration.dosage, dtype=np.float64) - moments.dosage_mean[:, None])
+        with np.errstate(divide="ignore", invalid="ignore"):
+            offsets[uncalibrated] = np.log(reported[uncalibrated])
+            residual[uncalibrated] = variance[uncalibrated] * (1.0 - reported[uncalibrated]) / reported[uncalibrated]
     maps: list[LeakageMap] = []
-    unidentified = 0
-    for block in blocks:
-        block_rows = np.asarray(block.records, dtype=np.int64)
-        target_rows = block_rows[np.asarray(block.targets, dtype=np.int64)]
-        complete = np.all(np.isfinite(calibrated[block_rows]), axis=0) & np.all(np.isfinite(np.asarray(calibration.truth)[target_rows]), axis=0)
-        leakage = fit_leakage_map(
-            calibrated[block_rows][:, complete].T, np.asarray(calibration.truth, dtype=np.float64)[target_rows][:, complete].T, block.targets
-        )
-        unidentified += int(not leakage.identified)
-        maps.append(leakage)
-    certificate = {
-        "calibration_pairs": len(calibration.sample_ids),
-        "recalibration": "applied: pooled per-record kappa from the calibration pairs",
-        "leakage_correction": f"applied to {len(maps)} LD blocks; not identified (left unmapped) in {unidentified}",
-        "reliability_source": "calibration pairs",
+    if calibration is not None and np.any(calibrated):
+        moments = calibration.moments.subset(calibrated)
+        feature_rows = None if design is None else np.asarray(design, dtype=np.float64)[calibrated]
+        scales[calibrated] = recalibration_scales(moments, labels[calibrated], feature_rows)
+        residual[calibrated] = residual_variances(moments, scales[calibrated])
+        offsets[calibrated] = log_reliability_offsets(variance[calibrated], scales[calibrated], residual[calibrated])
+        for pairs in calibration.blocks:
+            block_scales = scales[np.asarray(pairs.block.records, dtype=np.int64)]
+            block_means = pairs.dosage.mean(axis=0)
+            maps.append(fit_leakage_map(block_means + block_scales * (pairs.dosage - block_means), pairs.truth, pairs.block.targets))
+    unidentified = sum(not leakage.identified for leakage in maps)
+    certificate: dict[str, object] = {
+        "calibration_samples": 0 if calibration is None else len(calibration.sample_ids),
+        "calibrated_records": int(calibrated.sum()),
+        "uncalibrated_records": int(uncalibrated.sum()),
+        "recalibration": (
+            f"applied to {int(calibrated.sum())} records: pooled per-record kappa from the calibration pairs; "
+            f"not applied to {int(uncalibrated.sum())} records with fewer than 3 pairs"
+        ),
+        "leakage_correction": (
+            f"applied to {len(maps)} LD blocks; not identified (left unmapped) in {unidentified}"
+            if maps
+            else "not applied: no LD block has calibration pairs"
+        ),
+        "reliability_source": (
+            f"calibration pairs for {int(calibrated.sum())} records; the imputation's reported r^2 "
+            f"(biased for draw-type columns) for {int(uncalibrated.sum())} records"
+        ),
     }
-    log(f"measurement model: {certificate['calibration_pairs']} calibration pairs; {certificate['leakage_correction']}")
+    for key in ("recalibration", "leakage_correction", "reliability_source"):
+        log(f"measurement model: {key}: {certificate[key]}")
     return MeasurementModel(scales, residual, offsets, tuple(maps), certificate)
