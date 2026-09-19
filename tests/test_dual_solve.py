@@ -468,3 +468,38 @@ def test_the_dual_gaussian_draws_have_the_posterior_covariance() -> None:
     posterior_precision = _dense_gaussian(genotypes, covariates, training, noise, precision, shift, response, offsets, model)[0]
     target = np.linalg.inv(posterior_precision)
     assert np.linalg.norm(draw_map @ draw_map.T - target) <= np.linalg.cond(posterior_precision) * np.sqrt(EPS) * np.linalg.norm(target)
+
+
+def test_posterior_solve_is_the_dense_inverse_with_negative_sites() -> None:
+    genotypes, bounds, covariates, training, noise, precision, shift, response, offsets, negative = _gaussian_problem(57)
+    source = dual_solve.DenseDualSource(genotypes, bounds)
+    gaussian = dual_solve.DualGaussian(source=source, training=training, targets=response, offsets=offsets, covariates=covariates, probe_count=2, seed=7)
+    gaussian.iterate(site_precision=precision, site_shift=shift, noise_variance=noise, error_bound=np.full(MODEL_COUNT, np.sqrt(EPS)), probe_residual_ratio=np.sqrt(EPS))
+    rng = np.random.default_rng(58)
+    right = rng.standard_normal((genotypes.shape[1], 5))
+    for model in (0, 1):
+        posterior_precision = _dense_gaussian(genotypes, covariates, training, noise, precision, shift, response, offsets, model)[0]
+        exact = np.linalg.solve(posterior_precision, right)
+        scale = np.sqrt(np.einsum("pc,pq,qc->c", exact, posterior_precision, exact))
+        bound = np.sqrt(EPS) * scale
+        solved = gaussian.posterior_solve(right, model, bound)
+        error = solved - exact
+        energy = np.sqrt(np.einsum("pc,pq,qc->c", error, posterior_precision, error))
+        assert np.all(energy <= bound + np.linalg.cond(posterior_precision) * genotypes.shape[1] * EPS * scale)
+    assert set(negative) <= set(gaussian.bulk_solves[0].resolved)
+
+
+def test_the_recursive_share_minimizes_the_cycles_digit_passes() -> None:
+    for log_ratio, rate, scale, samples in ((np.log(1e6), 0.3, 50.0, 60000), (np.log(10.0), 1.2, 5.0, 3000), (0.5, 0.05, 400.0, 100000)):
+        share = dual_solve.recursive_share(log_ratio, rate, scale, samples)
+        assert 0.0 < share < 1.0
+
+        def cost(value):
+            iterations = (log_ratio + np.log(1.0 / value)) / rate
+            inverse_error = 2 * scale * iterations * np.sqrt(np.exp(log_ratio) * value) / (1.0 - value)
+            return iterations * max(0.0, np.log(np.sqrt(samples) * inverse_error))
+
+        grid = np.linspace(share / 2, (1.0 + share) / 2, 2001)
+        best = grid[np.argmin([cost(value) for value in grid])]
+        # The stationary point is the grid's minimizer to within the grid's spacing.
+        assert abs(best - share) <= grid[1] - grid[0]

@@ -85,20 +85,35 @@ since ‖G^½S⁻¹r‖² = r'(S⁻¹ − S⁻²)r ≤ max_{λ≥1}(λ − 1)/λ
 - The test extracts the draw map from unit noise and checks MM' = A⁻¹ against the dense posterior with negative sites.
 - D^½ is taken only on the bulk.
 
+**Solves with the posterior precision [proved; checked].**
+- A⁻¹v, which the engine's total curvature B needs, is the split mean with no data and shift v:
+  - the bulk dual solves S_S z_b = −Xt_S D_S v_S;
+  - x_L = core⁻¹(v_L + Xt_L'z_b);
+  - x_S = D_S v_S + D_S Xt_S'(z_b − Z_L x_L).
+- It carries the same Schur certificate and reuses the last iterate's Z_L, tightened only if the certificate needs it (`DualGaussian.posterior_solve`).
+- The test checks it against the dense A⁻¹ with negative sites.
+
 ## 4. Precision: the fewest exact int8 digits the residual allows [proved bound; measured]
 
 **Exactness.**
 - The codes are int8, and each read's float operand is written as m balanced base-128 digits (`code_products`).
 - Every digit GEMM is exact in int32, so the only error is the operand's rounding. The tile takes the least m meeting a normwise bound per column, ‖δ_k‖₂ ≤ ε‖L_k‖₂, with exact zeros kept.
 
-**The bound.**
-- Iteration k's product error F_k moves the true residual by at most ‖F_k‖‖r_k‖, since S ⪰ I and the directions are orthonormal.
-- ‖F_k‖ ≤ λ_max(S)(ε_left + ε_right).
-- Keeping the remaining drift below half the bound, over a residual contracting by ρ, gives each of the two operands
+**The drift budget [bound, following van den Eshof & Sleijpen 2004].**
+- Iteration k's product error F_k moves the true residual away from the recursive one by at most ‖F_k‖‖r_k‖, since S ⪰ I and orthonormal directions give ‖α_k‖ ≤ ‖r_k‖. For two operands of relative error ε_k, ‖F_k‖ ≤ 2λε_k (one ε per read, the tile's contract).
+- **The split.** Each restart cycle splits a column's bound B into sB for the recursive residual and (1 − s)B for the drift.
+- **The spending rule.** Each iteration spends at most the budget still left over the iterations still expected:
 
-      ε = (bound/2)(1 − ρ) / (2 λ_max ‖r_k‖).
+      ε_k = (budget left) / (2 λ ‖r_k‖ N_left),  N_left = max(1, ln(‖r_k‖/(sB)) / c),
 
-- λ_max is the largest Ritz value seen. With none known, the first iteration runs exact. The returned residual is always exact.
+  with c the cycle's measured average log-contraction (CG's worst case, −ln((√λ − 1)/(√λ + 1)), until the cycle has made progress). The spent drift can never exceed (1 − s)B, whatever N_left turns out to be.
+- **The stop.** A column stops when its recursive residual plus its spent drift is below B.
+- **The share s is derived** as the stationary point of the cycle's digit-passes N(s)·d(s).
+  - N(s) = (L + ln 1/s)/c, with L = ln(r₀/B).
+  - d(s) = log₁₂₈(√n/ε), with ε ~ (1 − s)B/(2λ r N) and r ~ √(r₀ s B) over the cycle (a continuous relaxation of the digit count).
+  - With D = d ln 128, the stationarity is (1 + s)(L + ln 1/s) = 2(1 − s)(D(s) + 1). A sign change guarantees a root, which bisection finds (`recursive_share`; its test checks it against a grid minimizer of N·d).
+- **λ is an estimate.** It is the largest Ritz value seen, a lower bound on λ_max, so the drift bound is an estimate. The certificate is the exact residual each restart begins with, and a column that misses it continues. With no λ known, the first iteration runs exact.
+- An earlier version re-budgeted the whole remaining tail at every iteration, ε_k = (B/2)(1 − ρ)/(2λ‖r_k‖). That spends (B/2)(1 − ρ) per iteration, about (B/2) ln(r₀/B) in total. bug-recent found the overspend; the rule above replaces it.
 
 **Only on spike-free operators [measured].**
 - On an operator that still has its spikes, finite-precision CG re-converges its outlying Ritz values, and relaxed products lengthened that by 3 iterations at n = 3,500 and by 22 at n = 30,000.
