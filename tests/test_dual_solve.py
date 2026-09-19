@@ -185,10 +185,13 @@ def test_relaxed_operand_error_keeps_the_exact_certificate() -> None:
     right = dual_solve.mean_right_hand_side(models, response, genotypes @ prior_mean)
     bound = _solve_bound(right)
     count = dual_solve.PassCount()
-    result = dual_solve.certified_block_cg(source, models, right, np.zeros_like(right), np.arange(MODEL_COUNT), bound, count)
+    deflation, _resolved = dual_solve.spike_deflation(source, models, count)
+    result = dual_solve.certified_block_cg(source, models, right, np.zeros_like(right), np.arange(MODEL_COUNT), bound, count, deflation=deflation)
     assert np.all(result.residual_norm <= bound)
     assert result.relative_errors[0] == 0.0
     assert any(relative_error > 0.0 for relative_error in result.relative_errors[1:])
+    undeflated = dual_solve.certified_block_cg(source, models, right, np.zeros_like(right), np.arange(MODEL_COUNT), bound, dual_solve.PassCount())
+    assert all(relative_error == 0.0 for relative_error in undeflated.relative_errors)
     operators = [_dense(genotypes, covariates, weights, variances, model)[3] for model in range(MODEL_COUNT)]
     exact = right - np.column_stack([operators[model] @ result.solution[:, model] for model in range(MODEL_COUNT)])
     # Two float64 evaluations of b - S z differ by the rounding of S z: n eps ||S|| ||z|| per column.
@@ -283,3 +286,88 @@ def test_a_bound_below_float64_resolution_is_refused() -> None:
         assert "below the accuracy" in str(error)
     else:
         raise AssertionError("a zero bound must be refused")
+
+
+def test_a_column_budget_keeps_the_largest_spikes() -> None:
+    genotypes, source, models, covariates, weights, variances, prior_mean, response = _setup(16)
+    _deflation, unlimited = dual_solve.spike_deflation(source, models, dual_solve.PassCount())
+    budget = sum(unlimited.values()) // 2
+    deflation, limited = dual_solve.spike_deflation(source, models, dual_solve.PassCount(), column_budget=budget)
+    assert sum(limited.values()) == budget
+    spikes = np.column_stack([
+        variances[:, model] * np.sum(_dense(genotypes, covariates, weights, variances, model)[1] ** 2, axis=0) for model in range(MODEL_COUNT)
+    ])
+    kept = np.concatenate([spikes[np.flatnonzero(np.isin(np.arange(spikes.shape[0]), _kept_indices(source, models, deflation, model))), model] for model in range(MODEL_COUNT)])
+    right = dual_solve.mean_right_hand_side(models, response, genotypes @ prior_mean)
+    result = _exact_solve(source, models, right, dual_solve.PassCount(), deflation)
+    assert np.all(result.residual_norm <= _solve_bound(right))
+    assert kept.min() >= np.sort(spikes[spikes > 1.0].ravel())[::-1][budget - 1] * (1.0 - genotypes.shape[0] * EPS)
+
+
+def _kept_indices(source, models, deflation, model):
+    """The variants a model's deflation basis holds, recovered from its columns."""
+    if model not in deflation.bases:
+        return np.zeros(0, dtype=np.int64)
+    full = np.concatenate([tile.columns(np.arange(stop - start)) for start, stop, tile in source.blocks()], axis=1)
+    design = models.design_to_sample(full, np.full(full.shape[1], model))
+    basis = deflation.bases[model]
+    matches = [int(np.argmin(np.linalg.norm(design - basis[:, [column]], axis=0))) for column in range(basis.shape[1])]
+    return np.asarray(matches, dtype=np.int64)
+
+
+def test_the_split_eliminates_negative_sites_exactly_in_mean_and_draws() -> None:
+    genotypes, bounds, covariates, weights, variances, prior_mean, response = _problem(15)
+    rng = np.random.default_rng(23)
+    model = 0
+    projector, design, _precision, _operator = _dense(genotypes, covariates, weights, variances, model)
+    data = design.T @ design
+    site_precision = 1.0 / variances[:, model]
+    negative = np.argsort(variances[:, model])[-2:]
+    site_precision[negative] = 0.0
+    block = np.linalg.inv(data + np.diag(site_precision))[np.ix_(negative, negative)]
+    site_precision[negative] = -0.5 / np.linalg.eigvalsh(block)[-1]
+    precision = data + np.diag(site_precision)
+    assert np.linalg.eigvalsh(precision)[0] > 0.0
+    bulk_mean = prior_mean[:, model].copy()
+    bulk_mean[negative] = 0.0
+    shift = site_precision * bulk_mean
+    shift[negative] = rng.standard_normal(negative.size)
+    root = np.sqrt(weights[:, model])
+    exact_mean = np.linalg.solve(precision, design.T @ (projector @ (root * response[:, model])) + shift)
+    bulk_variance = variances[:, [model]].copy()
+    bulk_variance[negative] = 0.0
+    source = dual_solve.DenseDualSource(genotypes, bounds)
+    bulk = dual_solve.DualModels(weights[:, [model]], bulk_variance, covariates)
+    resolved = dual_solve.ResolvedSites({0: negative}, {0: site_precision[negative]}, {0: shift[negative]})
+    designs = dual_solve.resolved_design(source, bulk, resolved)
+    right = dual_solve.mean_right_hand_side(bulk, response[:, [model]], genotypes @ bulk_mean[:, None])
+    count = dual_solve.PassCount()
+    split = dual_solve.split_mean(source, bulk, resolved, designs, right, float(np.sqrt(EPS)), count)
+    mean = dual_solve.mean_from_dual(source, bulk, bulk_mean[:, None], split.mean_duals, count)[:, 0]
+    mean[negative] = split.resolved_mean[0]
+    error = mean - exact_mean
+    scale = float(np.sqrt(exact_mean @ precision @ exact_mean))
+    assert np.sqrt(float(error @ precision @ error)) <= np.linalg.cond(precision) * np.sqrt(EPS) * scale
+    # The draw map, extracted with unit noise in (eps_L, e1, e2), must have covariance A^-1.
+    resolved_count, variant_count, sample_count = negative.size, genotypes.shape[1], genotypes.shape[0]
+    draw_count = resolved_count + variant_count + sample_count
+    resolved_noise = np.zeros((resolved_count, draw_count))
+    resolved_noise[:, :resolved_count] = np.eye(resolved_count)
+    prior_noise = np.zeros((variant_count, draw_count))
+    prior_noise[:, resolved_count : resolved_count + variant_count] = np.eye(variant_count)
+    sample_noise = np.zeros((sample_count, draw_count))
+    sample_noise[:, resolved_count + variant_count :] = np.eye(sample_count)
+    draw_models = np.zeros(draw_count, dtype=np.int64)
+    draw_right = dual_solve.draw_right_hand_side(source, bulk, draw_models, prior_noise, sample_noise, count)
+    perturbation = dual_solve.certified_block_cg(source, bulk, draw_right, np.zeros_like(draw_right), draw_models, _solve_bound(draw_right), count)
+    draw_duals, resolved_draws = dual_solve.split_draw_duals(split, draw_models, perturbation.solution, {0: resolved_noise}, np)
+    duals = np.column_stack([split.mean_duals, draw_duals])
+    column_models = np.concatenate([[0], draw_models])
+    fused_weights, _scores, _norms, _design = dual_solve.fused_final_pass(
+        source, bulk, bulk_mean[:, None], duals, column_models, np.zeros_like(duals), np.arange(1, draw_count + 1), prior_noise, np.zeros(0, dtype=np.int64), count,
+    )
+    fused_weights[negative, 0] = split.resolved_mean[0]
+    fused_weights[negative, 1:] = resolved_draws[0]
+    draw_map = fused_weights[:, 1:] - fused_weights[:, [0]]
+    target = np.linalg.inv(precision)
+    assert np.linalg.norm(draw_map @ draw_map.T - target) <= np.linalg.cond(precision) * np.sqrt(EPS) * np.linalg.norm(target)

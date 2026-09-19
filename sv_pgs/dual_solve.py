@@ -240,7 +240,9 @@ class Deflation:
         return values - self.bases[model] @ _cholesky_solve(array_module, self.factors[model], self.images[model].T @ values)
 
 
-def spike_deflation(source: DualTileSource, models: DualModels, count: PassCount, edges: dict | None = None) -> tuple[Deflation, dict]:
+def spike_deflation(
+    source: DualTileSource, models: DualModels, count: PassCount, edges: dict | None = None, column_budget: int | None = None
+) -> tuple[Deflation, dict]:
     """Each model's spikes and their deflation basis: one pass for ||xt_k||^2, one for S W.
 
     Variant k adds D_k ||xt_k||^2 to G = Xt D Xt' along Xt e_k. Without `edges`, k is resolved when
@@ -249,6 +251,8 @@ def spike_deflation(source: DualTileSource, models: DualModels, count: PassCount
     model's deflated operator in an earlier solve), only spikes above the bulk's measured edge are
     resolved: a spike below it does not raise the condition number.
     ||xt_k||^2 = x_k'W x_k - (x_k'WC)(C'WC)^-1(C'Wx_k) for every model comes from the first pass.
+    `column_budget` caps the basis columns over all models, from the memory the caller has for W,
+    S W and the S W pass: the largest spikes, which cost CG the most iterations, are kept.
     """
     array_module = source.array_module
     squares = array_module.zeros_like(models.variances)
@@ -276,6 +280,12 @@ def spike_deflation(source: DualTileSource, models: DualModels, count: PassCount
                 break
             chosen = updated
         resolved[model] = _host(array_module.flatnonzero(chosen))
+    if column_budget is not None and sum(indices.size for indices in resolved.values()) > column_budget:
+        ranked = sorted(
+            ((float(spikes[int(index), model]), model, int(index)) for model, indices in resolved.items() for index in indices),
+            reverse=True,
+        )[:column_budget]
+        resolved = {model: np.sort(np.asarray([index for _spike, owner, index in ranked if owner == model], dtype=np.int64)) for model in resolved}
     bases: dict[int, Any] = {}
     for model, indices in resolved.items():
         if indices.size == 0:
@@ -332,7 +342,10 @@ def certified_block_cg(
     lambda_max(S) (eps_left + eps_right); keeping the drift left over a residual contracting by rho
     below half the bound gives each operand eps = bound (1 - rho) / (4 lambda_max ||r_k||). The
     recursive residual takes the other half. lambda_max is the largest Ritz value seen; with none
-    known (operator_scale 1) the first iteration runs exact to find it. Every restart begins with
+    known (operator_scale 1) the first iteration runs exact to find it. The error is relaxed only on a
+    deflated operator: with its spikes still in S, relaxed products delayed CG by 3-22 iterations
+    (finite-precision CG re-converges its outlying Ritz values), and on the deflated operator they
+    cost none (measured on the s1M_100k real-haplotype subset). Every restart begins with
     an exact residual (none when the start is zero, since then r = b), so the returned residual is
     exact. `deflation` solves each model's spikes exactly and CG the rest.
 
@@ -386,7 +399,7 @@ def certified_block_cg(
             stacked = array_module.concatenate([directions[model][1] for model in order], axis=1)
             residual_norms = array_module.linalg.norm(residual[:, open_columns], axis=0)
             relative_error = 0.0
-            if scale_known:
+            if scale_known and deflation is not None:
                 relative_error = float(array_module.min(bound[open_columns] * (1.0 - contraction) / (4.0 * operator_scale * residual_norms)))
             image = apply_operator(source, models, stacked, block_models, relative_error, count, f"{label}:{iterations}")
             iterations += 1
@@ -522,3 +535,117 @@ def fused_final_pass(
     count.note(column_count, 0.0, "fused-final")
     residual = right_hand_side - (duals + models.design_to_sample(image, column_models))
     return weights, scores, array_module.linalg.norm(residual, axis=0), design_products
+
+
+@dataclass
+class ResolvedSites:
+    """Per model, the variants whose site precision is not positive, and their sites (Pi_L, h_L).
+
+    They cannot enter S (Sylvester), so they are eliminated exactly: with the bulk operator
+    S_S = I + Xt_S D_S Xt_S' (their D set to 0 in the bulk models) and Z = S_S^-1 [b, Xt_L],
+
+        core = Pi_L + Xt_L' Z_L      (the Schur complement of A's bulk block: PD exactly when A is)
+        mu_L = core^-1 (h_L + Xt_L' z_b),   mean dual z = z_b - Z_L mu_L,
+
+    so mu_S = m_S + D_S Xt_S' z. A joint draw exact for PD A takes beta_L* = mu_L + core^-1/2 eps_L
+    from the marginal of beta_L, then beta_S* from its conditional by Matheron on the bulk
+    operator: its dual is z_e - Z_L (beta_L* - mu_L), with z_e = S_S^-1 (e2 - Xt_S D_S^1/2 e1).
+    """
+
+    indices: dict
+    precision: dict
+    shift: dict
+
+
+def resolved_design(source: DualTileSource, models: DualModels, resolved: ResolvedSites) -> dict:
+    """Xt_L (n x |L|) of every model with resolved sites, from its genotype columns."""
+    array_module = source.array_module
+    designs: dict[int, Any] = {}
+    for model, indices in resolved.indices.items():
+        indices = np.asarray(indices, dtype=np.int64)
+        if indices.size == 0:
+            continue
+        columns = array_module.concatenate(
+            [tile.columns(indices[(indices >= start) & (indices < stop)] - start) for start, stop, tile in source.blocks()], axis=1
+        )
+        designs[model] = models.design_to_sample(columns, array_module.full(indices.size, model))
+    return designs
+
+
+@dataclass
+class SplitSolution:
+    mean_duals: Any
+    resolved_mean: dict
+    core_factors: dict
+    resolved_duals: dict
+    bulk_duals: Any
+    result: SolveResult
+
+
+def split_mean(
+    source: DualTileSource,
+    bulk_models: DualModels,
+    resolved: ResolvedSites,
+    designs: dict,
+    right_hand_side: Any,
+    relative_bound: float,
+    count: PassCount,
+    deflation: Deflation | None = None,
+) -> SplitSolution:
+    """The exact mean of every model with its non-positive sites eliminated (ResolvedSites).
+
+    One certified solve carries every model's b and its Xt_L columns on the bulk operator, each
+    column to `relative_bound` of its own norm. The core's Cholesky factor is the check that the
+    global precision is positive definite: it raises when A is not.
+    """
+    array_module = source.array_module
+    blocks = [right_hand_side]
+    block_models = [np.arange(bulk_models.model_count)]
+    offsets: dict[int, int] = {}
+    position = bulk_models.model_count
+    for model in sorted(designs):
+        offsets[model] = position
+        blocks.append(designs[model])
+        block_models.append(np.full(int(designs[model].shape[1]), model))
+        position += int(designs[model].shape[1])
+    stacked = array_module.concatenate(blocks, axis=1)
+    column_models = array_module.asarray(np.concatenate(block_models))
+    bound = relative_bound * array_module.linalg.norm(stacked, axis=0)
+    result = certified_block_cg(source, bulk_models, stacked, array_module.zeros_like(stacked), column_models, bound, count, deflation=deflation, label="split")
+    bulk_duals = result.solution[:, : bulk_models.model_count]
+    mean_duals = bulk_duals.copy()
+    resolved_mean: dict[int, Any] = {}
+    core_factors: dict[int, Any] = {}
+    resolved_duals: dict[int, Any] = {}
+    for model, offset in offsets.items():
+        width = int(designs[model].shape[1])
+        resolved_dual = result.solution[:, offset : offset + width]
+        core = array_module.diag(array_module.asarray(resolved.precision[model], dtype=array_module.float64)) + designs[model].T @ resolved_dual
+        factor = array_module.linalg.cholesky(0.5 * (core + core.T))
+        if not bool(array_module.all(array_module.isfinite(factor))):
+            raise np.linalg.LinAlgError("the resolved sites' core is not positive definite: the global precision is not.")
+        mean = _cholesky_solve(array_module, factor, array_module.asarray(resolved.shift[model], dtype=array_module.float64) + designs[model].T @ bulk_duals[:, model])
+        resolved_mean[model] = mean
+        core_factors[model] = factor
+        resolved_duals[model] = resolved_dual
+        mean_duals[:, model] = bulk_duals[:, model] - resolved_dual @ mean
+    return SplitSolution(mean_duals, resolved_mean, core_factors, resolved_duals, bulk_duals, result)
+
+
+def split_draw_duals(split: SplitSolution, draw_models: np.ndarray, perturbation_duals: Any, resolved_noise: dict, array_module: Any) -> tuple[Any, dict]:
+    """Each draw's dual and its resolved block, from the bulk Matheron duals z_e.
+
+    beta_L* - mu_L = core^-1/2 eps_L (L^-T eps_L with core = L L'), and the draw's dual relative to
+    the mean is z_e - Z_L (beta_L* - mu_L). `resolved_noise[model]` is eps_L (|L| x the model's
+    draws), in the order of that model's draw columns.
+    """
+    draw_duals = perturbation_duals.copy()
+    resolved_draws: dict[int, Any] = {}
+    for model, factor in split.core_factors.items():
+        columns = np.flatnonzero(np.asarray(draw_models) == model)
+        if columns.size == 0:
+            continue
+        offset = array_module.linalg.solve(factor.T, array_module.asarray(resolved_noise[model]))
+        resolved_draws[model] = split.resolved_mean[model][:, None] + offset
+        draw_duals[:, columns] -= split.resolved_duals[model] @ offset
+    return draw_duals, resolved_draws
