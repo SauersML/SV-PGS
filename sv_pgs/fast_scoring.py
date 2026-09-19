@@ -30,26 +30,33 @@ the draw scores g_i^(k). The posterior mean score g_i is known exactly, so
     v_i = (1 / K) sum_k (g_i^(k) - g_i)^2
 
 is an unbiased estimate of the posterior variance of the genetic score, with
-relative standard error sqrt(2 / K): 18% at Stage 2's K = 64. That moves a
-damped probability by at most |sigmoid''| / 2 * 0.18 * v_i <= 0.009 v_i.
-The covariate coefficients have a flat prior and an O(1/n) posterior
-variance, which the predictive ignores.
+relative standard error sqrt(2 / K). That moves a damped probability by at
+most |sigmoid''| / 2 * sqrt(2 / K) * v_i <= 0.068 v_i / sqrt(K). One draw
+already makes it unbiased. The covariate coefficients have a flat prior and
+an O(1/n) posterior variance, which the predictive ignores.
 
 Binary models. The posterior predictive is
 
     P(y_i = 1) = E[sigmoid(eta_i + c + sqrt(v_i) Z)],   Z ~ N(0, 1),
 
-evaluated by Gauss-Hermite quadrature with 64 nodes: exact to below 1e-10
-for v_i <= 4, far past any predictor variance a polygenic score reaches. The
+evaluated by Gauss-Hermite quadrature whose node count doubles until the
+result stops changing beyond the rounding of the quadrature sum itself. The
 shift c anchors the mean predictive on the training prevalence; the fitted
 intercept anchors the plug-in predictor, and the damped one needs its own
 anchor.
+
+Memory. Every block size is the exact solution of a memory plan: the fixed
+allocations (weights, accumulator) are subtracted from the budget and the
+block's own buffers take the rest; on CUDA the block rows and the sample tile
+width together minimize the kernel launches within the device memory.
 """
 
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
+from functools import lru_cache
+import math
 from typing import Any, Iterable, Iterator, Protocol, Sequence
 
 import numpy as np
@@ -64,21 +71,8 @@ from sv_pgs.data import TieMap
 from sv_pgs.progress import log
 
 SIGNED_CODE_OFFSET = 127.0
-# Each block row costs one byte per sample in every read-ahead buffer plus
-# eight in the fp64 conversion panels; a block uses half the host budget.
 _READ_AHEAD_BUFFERS = 3
-_HOST_BYTES_PER_BLOCK_CELL = _READ_AHEAD_BUFFERS + 8
-_HOST_MEMORY_SHARES = 2
-# Sample panels per CPU worker, so uneven panels still balance.
-_PANELS_PER_WORKER = 4
-# Device memory is split between the uploaded codes, their fp64 tile and the
-# accumulator.
-_DEVICE_MEMORY_SHARES = 4
-# Gauss-Hermite nodes for the logistic-normal predictive (see the module docstring).
-PREDICTIVE_QUADRATURE_NODES = 64
-_HERMITE_NODES, _HERMITE_WEIGHTS = np.polynomial.hermite.hermgauss(PREDICTIVE_QUADRATURE_NODES)
-# A binary model needs posterior draws for its damped predictive.
-MINIMUM_BINARY_POSTERIOR_DRAWS = 2
+_FLOAT64_BYTES = 8
 
 
 class CodeBlockSource(Protocol):
@@ -134,10 +128,8 @@ class ScoringModel:
             raise ValueError("posterior_draws must be float64 [store rows, draws].")
         if not np.all(np.isfinite(draws)):
             raise ValueError("posterior_draws must be finite.")
-        if self.trait_type == TraitType.BINARY and draws.shape[1] < MINIMUM_BINARY_POSTERIOR_DRAWS:
-            raise ValueError(
-                f"a binary model needs at least {MINIMUM_BINARY_POSTERIOR_DRAWS} posterior draws for its predictive."
-            )
+        if self.trait_type == TraitType.BINARY and draws.shape[1] == 0:
+            raise ValueError("a binary model needs posterior draws for its predictive.")
         alpha = np.asarray(self.alpha)
         if alpha.ndim != 1 or alpha.size < 1 or alpha.dtype != np.float64 or not np.all(np.isfinite(alpha)):
             raise ValueError("alpha must be a finite float64 vector with the intercept first.")
@@ -269,14 +261,55 @@ class GeneticScores:
     variances: F64Array
 
 
-def _block_rows(sample_count: int, budget: ComputeBudget, plan_rows: int) -> int:
-    """Rows per read: the read-ahead ring and the conversion panels fit half the host budget,
-    and on CUDA an uploaded block of codes fits its share of the smallest device."""
-    bytes_per_row = _HOST_BYTES_PER_BLOCK_CELL * max(sample_count, 1)
-    rows = max(1, int(budget.host_bytes) // (_HOST_MEMORY_SHARES * bytes_per_row))
+def _host_bytes(plan: ScoringPlan, store_samples: int, selected_samples: int, rows: int, device_kind: str) -> int:
+    """Host bytes of one scoring pass with reads of ``rows`` rows: the plan's weights, the
+    accumulator, the read-ahead ring, the selected-sample copy of a block, the transposed
+    block weights and, on the CPU, every panel's fp64 codes and product."""
+    columns = int(plan.weights.shape[1])
+    fixed = _FLOAT64_BYTES * (int(plan.weights.size) + columns * selected_samples)
+    per_row = _READ_AHEAD_BUFFERS * store_samples + _FLOAT64_BYTES * columns
+    if selected_samples != store_samples:
+        per_row += selected_samples
+    if device_kind == "cpu":
+        fixed += _FLOAT64_BYTES * columns * selected_samples
+        per_row += _FLOAT64_BYTES * selected_samples
+    return fixed + rows * per_row
+
+
+def _block_rows(plan: ScoringPlan, store_samples: int, selected_samples: int, budget: ComputeBudget) -> int:
+    """The most rows per read whose host plan fits the budget, and on CUDA the device plan."""
+    fixed = _host_bytes(plan, store_samples, selected_samples, 0, budget.device_kind)
+    per_row = _host_bytes(plan, store_samples, selected_samples, 1, budget.device_kind) - fixed
+    rows = (int(budget.host_bytes) - fixed) // per_row
+    if rows < 1:
+        raise MemoryError(
+            f"scoring {plan.weights.shape[1]} weight columns x {selected_samples} samples needs "
+            f"{(fixed + per_row) / 1e9:.2f} GB of host memory; the budget holds {budget.host_bytes / 1e9:.2f} GB"
+        )
     if budget.device_kind == "cuda":
-        rows = min(rows, max(1, min(budget.device_bytes) // (_DEVICE_MEMORY_SHARES * max(sample_count, 1))))
-    return min(rows, max(plan_rows, 1))
+        rows = min(rows, min(_device_tile(int(plan.weights.shape[1]), selected_samples, device_bytes)[0]
+                             for device_bytes in budget.device_bytes))
+    return min(rows, int(plan.store_rows.shape[0]))
+
+
+def _device_tile(columns: int, samples: int, device_bytes: int) -> tuple[int, int]:
+    """Block rows r and sample tile width t that minimize the kernel launches (R / r)(S / t).
+
+    The device holds the accumulator (8 C S bytes) and per block its codes (r S), its weights
+    (8 r C) and per tile the fp64 codes and product (8 t (r + C)). Maximizing r t under
+    r (S + 8 C) + 8 t (r + C) <= M gives r = sqrt(C^2 + M C / (S + 8 C)) - C, then the widest t.
+    """
+    memory = device_bytes - _FLOAT64_BYTES * columns * samples
+    per_block_row = samples + _FLOAT64_BYTES * columns
+    if memory < per_block_row + _FLOAT64_BYTES * (1 + columns):
+        raise MemoryError(
+            f"a device of {device_bytes / 1e9:.2f} GB cannot hold the {columns} x {samples} score accumulator "
+            "and one block row"
+        )
+    rows = max(1, int(math.sqrt(columns * columns + memory * columns / per_block_row) - columns))
+    rows = min(rows, (memory - _FLOAT64_BYTES * (1 + columns)) // per_block_row)
+    tile = (memory - rows * per_block_row) // (_FLOAT64_BYTES * (rows + columns))
+    return rows, min(tile, samples)
 
 
 def _selected_codes(codes: U8Array, sample_indices: I64Array | None) -> U8Array:
@@ -284,8 +317,9 @@ def _selected_codes(codes: U8Array, sample_indices: I64Array | None) -> U8Array:
 
 
 def _cpu_panels(sample_count: int, worker_count: int) -> list[tuple[int, int]]:
-    panel_width = max(1, -(-sample_count // (worker_count * _PANELS_PER_WORKER)))
-    return [(start, min(sample_count, start + panel_width)) for start in range(0, sample_count, panel_width)]
+    """One panel per worker, widths differing by at most one sample (equal work per sample)."""
+    edges = [index * sample_count // worker_count for index in range(worker_count + 1)]
+    return [(start, stop) for start, stop in zip(edges[:-1], edges[1:]) if stop > start]
 
 
 def _score_cpu(
@@ -328,11 +362,7 @@ def _score_cuda(
     for block_position, (plan_start, plan_stop, codes) in enumerate(_plan_blocks(blocks)):
         device_position = block_position % len(budget.device_ids)
         with _cupy_device_context(cupy, budget.device_ids[device_position]):
-            rows = plan_stop - plan_start
-            tile_columns = max(
-                1,
-                int(budget.device_bytes[device_position]) // (_DEVICE_MEMORY_SHARES * 8 * max(rows, 1)),
-            )
+            tile_columns = _device_tile(column_count, sample_count, int(budget.device_bytes[device_position]))[1]
             block_weights = cupy.asarray(np.ascontiguousarray(weights[plan_start:plan_stop].T))
             device_codes = cupy.asarray(codes)
             for start in range(0, sample_count, tile_columns):
@@ -402,7 +432,7 @@ def score_genetic(
     """
     selected = _validated_sample_indices(sample_indices, source.sample_count)
     sample_count = source.sample_count if selected is None else int(selected.shape[0])
-    block_rows = _block_rows(source.sample_count, budget, int(plan.store_rows.shape[0]))
+    block_rows = _block_rows(plan, source.sample_count, sample_count, budget)
     ranges = plan.read_ranges(block_rows)
     log(
         f"  fast scoring: {plan.model_count} models ({plan.weights.shape[1]} weight columns) x {sample_count} "
@@ -444,12 +474,23 @@ def score_linear_predictor(
     return linear_predictor
 
 
+@lru_cache
+def _hermite_rule(node_count: int) -> tuple[F64Array, F64Array]:
+    nodes, weights = np.polynomial.hermite.hermgauss(node_count)
+    return nodes, weights / np.sqrt(np.pi)
+
+
 def posterior_predictive_probability(
     linear_predictor: F64Array,
     predictor_variance: F64Array,
     intercept_shift: float,
 ) -> F64Array:
-    """P(y = 1) = E[sigmoid(eta + c + sqrt(v) Z)] by 64-point Gauss-Hermite quadrature."""
+    """P(y = 1) = E[sigmoid(eta + c + sqrt(v) Z)] by Gauss-Hermite quadrature.
+
+    The node count doubles until no probability moves by more than the rounding bound of the
+    quadrature sum, node count x eps (recursive summation of non-negative terms whose total is at
+    most 1), so the quadrature is converged to fp64 rounding.
+    """
     eta = np.asarray(linear_predictor, dtype=np.float64) + float(intercept_shift)
     variance = np.asarray(predictor_variance, dtype=np.float64)
     if eta.shape != variance.shape:
@@ -457,7 +498,19 @@ def posterior_predictive_probability(
     if not np.all(np.isfinite(variance)) or np.any(variance < 0.0):
         raise ValueError("predictor_variance must be finite and non-negative.")
     spread = np.sqrt(2.0 * variance)[..., None]
-    return (expit(eta[..., None] + spread * _HERMITE_NODES) @ _HERMITE_WEIGHTS) / np.sqrt(np.pi)
+
+    def quadrature(node_count: int) -> F64Array:
+        nodes, weights = _hermite_rule(node_count)
+        return expit(eta[..., None] + spread * nodes) @ weights
+
+    node_count = 1
+    previous = quadrature(node_count)
+    while True:
+        node_count *= 2
+        current = quadrature(node_count)
+        if eta.size == 0 or float(np.max(np.abs(current - previous))) <= node_count * np.finfo(np.float64).eps:
+            return current
+        previous = current
 
 
 def predictive_intercept_shift(
@@ -481,9 +534,12 @@ def predictive_intercept_shift(
     def excess(shift: float) -> float:
         return float(np.mean(posterior_predictive_probability(linear_predictor, predictor_variance, shift))) - prevalence
 
+    # sigmoid' <= 1/4, so a shift resolved to 4 eps min(p, 1 - p) leaves the mean predictive
+    # within fp64 resolution of the prevalence; rtol is the smallest brentq accepts.
+    eps = float(np.finfo(np.float64).eps)
     lower, upper = -1.0, 1.0
     while excess(lower) > 0.0:
         lower *= 2.0
     while excess(upper) < 0.0:
         upper *= 2.0
-    return float(brentq(excess, lower, upper, xtol=1e-14, rtol=8.9e-16))
+    return float(brentq(excess, lower, upper, xtol=4.0 * eps * min(prevalence, 1.0 - prevalence), rtol=4.0 * eps))
