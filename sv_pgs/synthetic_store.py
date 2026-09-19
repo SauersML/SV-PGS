@@ -204,13 +204,15 @@ class HaplotypeSource:
             raise ValueError(f"the source has no founder haplotypes for {missing}.")
         kinds = np.concatenate([archive["kinds"].astype(str) for archive in archives])
         tandem_repeat = np.concatenate([archive["in_tr"].astype(bool) for archive in archives])
+        reference_lengths = np.concatenate([archive["ref_len"].astype(np.int64) for archive in archives])
+        alternate_lengths = np.concatenate([archive["alt_len"].astype(np.int64) for archive in archives])
         return cls(
             positions=np.concatenate([archive["positions"].astype(np.int64) for archive in archives]),
             genetic_map_cm=np.concatenate([archive["cm"].astype(np.float64) for archive in archives]),
-            reference_lengths=np.concatenate([archive["ref_len"].astype(np.int64) for archive in archives]),
-            alternate_lengths=np.concatenate([archive["alt_len"].astype(np.int64) for archive in archives]),
+            reference_lengths=reference_lengths,
+            alternate_lengths=alternate_lengths,
             class_codes=np.select([kinds == "SNV", kinds == "INDEL"], [0, 1], default=2).astype(np.uint8),
-            variant_classes=_variant_classes(kinds, tandem_repeat),
+            variant_classes=_variant_classes(kinds, reference_lengths, alternate_lengths, tandem_repeat),
             tandem_repeat=tandem_repeat,
             chromosome_starts=np.concatenate([[0], np.cumsum([archive["positions"].shape[0] for archive in archives])]),
             haplotypes=haplotypes,
@@ -235,16 +237,24 @@ class HaplotypeSource:
         return int(self.chromosome_starts[chromosome]), int(self.chromosome_starts[chromosome + 1])
 
 
-def _variant_classes(kinds: NDArray, tandem_repeat: NDArray) -> NDArray:
-    """SV-PGS classes of 1kGP records: SNV and INDEL directly; SVs in tandem repeats are
-    str_vntr_repeat (target-format §2.5); every other SV is typed from its kind token by the
-    shared ``variant_typing`` rule."""
+def _variant_classes(kinds: NDArray, reference_lengths: NDArray, alternate_lengths: NDArray, tandem_repeat: NDArray) -> NDArray:
+    """SV-PGS classes of 1kGP records: SNVs directly; an INDEL is a deletion, an insertion or,
+    with equal allele lengths, a complex event, from its allele lengths, the class its SV
+    counterpart has; SVs in tandem repeats are str_vntr_repeat (target-format §2.5); every
+    other SV is typed from its kind token by the shared ``variant_typing`` rule."""
     order = {variant_class: index for index, variant_class in enumerate(VariantClass)}
     classes = np.empty(kinds.shape[0], dtype=np.uint8)
     for kind in np.unique(kinds).tolist():
         members = kinds == kind
-        if kind in ("SNV", "INDEL"):
-            classes[members] = order[VariantClass.SNV if kind == "SNV" else VariantClass.SMALL_INDEL]
+        if kind == "SNV":
+            classes[members] = order[VariantClass.SNV]
+            continue
+        if kind == "INDEL":
+            loss = reference_lengths > alternate_lengths
+            gain = reference_lengths < alternate_lengths
+            classes[members & loss] = order[VariantClass.DELETION]
+            classes[members & gain] = order[VariantClass.INSERTION]
+            classes[members & ~loss & ~gain] = order[VariantClass.OTHER_COMPLEX_SV]
             continue
         classes[members] = order[structural_variant_class_from_token(normalize_variant_token(kind))]
         classes[members & tandem_repeat] = order[VariantClass.STR_VNTR_REPEAT]

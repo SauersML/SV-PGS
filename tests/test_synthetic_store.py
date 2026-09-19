@@ -241,7 +241,7 @@ def test_source_loader_reads_design_credit_archives_and_maps_classes(tmp_path: P
             path,
             positions=np.arange(kinds.size) * 100 + 5,
             cm=np.arange(kinds.size) * 0.01,
-            ref_len=np.ones(kinds.size, dtype=np.int64),
+            ref_len=np.where(kinds == "INDEL", 4, 1).astype(np.int64),
             alt_len=np.ones(kinds.size, dtype=np.int64),
             sv_length=sv_length,
             kinds=kinds,
@@ -255,8 +255,8 @@ def test_source_loader_reads_design_credit_archives_and_maps_classes(tmp_path: P
     assert source.haplotypes.shape == (2 * kinds.size, 2 * founders)
     assert source.tile_range(0) == (0, kinds.size) and source.tile_range(3) == (kinds.size, 2 * kinds.size)
     expected = [
-        VariantClass.SNV, VariantClass.SMALL_INDEL, VariantClass.DELETION, VariantClass.DELETION,
-        VariantClass.DUPLICATION, VariantClass.INSERTION_MEI, VariantClass.INSERTION_MEI,
+        VariantClass.SNV, VariantClass.DELETION, VariantClass.DELETION, VariantClass.DELETION,
+        VariantClass.DUPLICATION, VariantClass.INSERTION_MEI, VariantClass.INSERTION,
         VariantClass.INVERSION, VariantClass.STR_VNTR_REPEAT,
     ]
     assert [VARIANT_CLASSES[code] for code in source.variant_classes[: kinds.size]] == expected

@@ -32,15 +32,17 @@ One consolidated spec. It replaces the numbered addenda A4 through A4.15. Code: 
 
 ## Sidecar `variants/chrK` (one row per record)
 - **Keys:** pos, ref_len, alt_len, refalt_md5, atomic IDs.
-- **variant_class:** SNV → snv; INDEL → small_indel. For SVs, the first match wins:
+- **variant_class:** SNV → snv. Every other record is typed by kind at any size, so a 1 bp indel and a 1 kb SV of the same kind share a class, and length is a continuous annotation. The first match wins:
   1. VNTR/STR context → str_vntr_repeat;
   2. INS/DUP with an MEI TE class → insertion_mei;
   3. DEL → deletion;
-  4. DUP → duplication;
-  5. otherwise other_complex_sv.
+  4. other INS → insertion;
+  5. DUP → duplication;
+  6. otherwise other_complex_sv.
+  - An INDEL is a deletion or an insertion by its allele shape, and complex when its allele lengths are equal. The 50 bp community SV definition only labels which records count as SVs in reported results; it never assigns a class.
+  - The class legend is stored with the column, and a store with another legend is refused. Stores written before the class merges (s1M_100k, mini and build-lead/synth on MSI) must be converted again; one conversion covers both merges.
   - GATK-SV adds copy_number (multiallelic CNVs, read from FORMAT/CN) and inversion. Breakends are dropped.
   - Length is not a class; it enters the prior as a smooth of log length. A GATK-SV row's symbolic REF/ALT carry no length, so its sv_length annotation comes from |SVLEN| or the END span (`GatksvRows.lengths`).
-  - Every variant_class column stores its legend, and a store whose legend differs from `VariantClass` is refused. Stores written before 2cc7aed, which merged the length-binned DEL/DUP classes (on MSI: s1M_100k, mini, build-lead/synth), must be converted again.
 - **Grouping:** bubble_idx, same_pos_first.
 - **Reliability keys:** sv_ctx, cx, has_pl.
 - **r2_truth (f32):** corr²(stored D, G), triad-corrected, computed in-workspace from the r̂ model's coefficients. It stays NaN until they arrive.

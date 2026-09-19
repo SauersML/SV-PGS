@@ -11,8 +11,8 @@ class TraitType(str, Enum):
 
 class VariantClass(str, Enum):
     SNV = "snv"
-    SMALL_INDEL = "small_indel"
     DELETION = "deletion"
+    INSERTION = "insertion"
     DUPLICATION = "duplication"
     INSERTION_MEI = "insertion_mei"
     INVERSION_BND_COMPLEX = "inversion_bnd_complex"

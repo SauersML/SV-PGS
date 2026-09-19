@@ -54,7 +54,7 @@ Untagged numbers are derivations, definitions or targets.
   - The r² coefficient is exactly 1 by derivation: the prior on the true-genotype effect maps to the observed column through r². Free EB could not identify it [sim-only: design-reliability].
   - level_c and θ get hierarchical EB priors whose mean and variance are learned across classes and across traits (`da928bd`). Cross-trait pooling matters: a single trait's EB recovered only 1–9% of the true-prior gain, against 25–115% for the true prior at n = 10–20k [sim-only: idea-svprior founder mosaics].
 - **d_j, the same design for every variant** (SNVs included, SPEC 8a5a936). Continuous entries are smooths with learned smoothness, never bins; discrete entries stay discrete.
-  - variant type, length and repeat status (SPEC). Classes carry no length bins: DEL and DUP are one class each, and length enters only here, as a learned smooth of log length;
+  - variant type, length and repeat status (SPEC). Classes carry no length bins: a deletion, an insertion or a duplication is one class at every size from 1 bp up, small indels included, and length enters only here, as a learned smooth of log length. The 50 bp SV definition only labels reported results;
   - SV context:
     - one learned distance kernel over every other SV allele of the chromosome, f_j = Σ_k H_k · w_c(log(1 + gap_jk)) per class, with w_c a smooth of learned smoothness (a cubic B-spline basis in log(1 + gap)) and a log-length term; nesting in an SV is its own per-class term. No window, K or frequency cutoff;
     - TR-locus membership and locus properties;
