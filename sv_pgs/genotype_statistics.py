@@ -18,10 +18,12 @@ Per block and sample group ``g`` the pass keeps exact integers,
 
     S_g = sum_{i in g} s_i s_i^T,    u_g = sum_{i in g} s_i,    n_g = |g|,
 
-which add across groups (every fold but one is an exact sum). Standardization happens once,
-in fp64, from ``N = n S - u u^T`` (exact int64; ``|N| <= 127^2 n^2``, so its fp64 value is
-exact below n = 747,000): ``X^T X = n R`` with ``R = N / sqrt(diag N diag N^T)`` for the
-model's population-sd standardized columns. The 1/127 of ``DS = (s + 127) / 127`` cancels.
+and, against the chromosome's previous block, A_g = sum_{i in g} s_i^(previous) s_i^T (the
+buffer keeps that block's rows one block longer for it), which add across groups (every fold
+but one is an exact sum). Standardization happens once, in fp64, from ``N = n S - u u^T``
+(exact int64; ``|N| <= 127^2 n^2``, so its fp64 value is exact below n = 747,000):
+``X^T X = n R`` with ``R = N / sqrt(diag N diag N^T)`` for the model's population-sd
+standardized columns. The 1/127 of ``DS = (s + 127) / 127`` cancels.
 """
 
 from __future__ import annotations
@@ -57,7 +59,8 @@ from sv_pgs.tie_map import _compact_identity_tie_map, tie_map_from_groups
 
 LAG_BLOCKS = 2
 """Blocks a boundary decision may trail the stream before ``force_cut`` commits one. It sets the
-retained buffer, ``(LAG_BLOCKS + 2) * cap + tile_rows`` rows, and never depends on the hardware."""
+retained buffer, ``(LAG_BLOCKS + 3) * cap + tile_rows`` rows (one of them the last emitted block,
+kept for the next block's adjacent Gram), and never depends on the hardware."""
 
 BLOCK_CAP_STEP = 256
 
@@ -177,6 +180,8 @@ class GenotypeBuffer(Protocol):
 
     def block_statistics(self, slot: int, rows: int) -> tuple[Any, Any, Any]: ...
 
+    def cross_block_grams(self, first_slot: int, first_rows: int, second_slot: int, second_rows: int) -> Any: ...
+
     def parallel_rows(self, function: Callable[[int, int], None], rows: int) -> None: ...
 
     def to_host(self, array: Any) -> NDArray: ...
@@ -194,6 +199,9 @@ class BlockStatistics:
     ``(G, width, width)`` int32 when every group has at most ``INT32_EXACT_ROWS`` samples,
     else int64; ``sums`` ``(G, width)`` int64; ``cross_products`` ``(G, width, columns)``
     float64 ``sum_{i in g} s_i y_i^T``, or ``None``. ``group_counts`` is NumPy.
+    ``previous_grams`` ``(G, previous width, width)``, of the grams' dtype, is the exact Gram
+    against the chromosome's previous block ``[previous_start, start)``; both are ``None`` for a
+    chromosome's first block.
     """
 
     chromosome: str
@@ -204,6 +212,8 @@ class BlockStatistics:
     grams: Any
     cross_products: Any
     array_module: ModuleType = np
+    previous_start: int | None = None
+    previous_grams: Any = None
 
     @property
     def width(self) -> int:
@@ -216,6 +226,7 @@ class BlockStatistics:
             sums=buffer.to_host(self.sums),
             grams=buffer.to_host(self.grams),
             cross_products=None if self.cross_products is None else buffer.to_host(self.cross_products),
+            previous_grams=None if self.previous_grams is None else buffer.to_host(self.previous_grams),
             array_module=np,
         )
 
@@ -239,7 +250,7 @@ def plan_genotype_pass(block_cap: int) -> GenotypePassPlan:
     if block_cap < 64:
         raise ValueError("the LD block cap must be at least 64 variants")
     tile_rows = max(64, block_cap // 2 // 64 * 64)
-    return GenotypePassPlan(block_cap=block_cap, tile_rows=tile_rows, capacity_rows=(LAG_BLOCKS + 2) * block_cap + tile_rows)
+    return GenotypePassPlan(block_cap=block_cap, tile_rows=tile_rows, capacity_rows=(LAG_BLOCKS + 3) * block_cap + tile_rows)
 
 
 def largest_block_cap(available_bytes: int, bytes_for_cap: Callable[[int], int]) -> int:
@@ -433,6 +444,12 @@ def _run_chromosome(
         for cut in cuts:
             start = boundaries[-1]
             sums, grams, cross = buffer.block_statistics(start - base, cut - start)
+            previous_start = boundaries[-2] if len(boundaries) > 1 else None
+            previous_grams = None
+            if previous_start is not None:
+                if previous_start < base:
+                    raise RuntimeError(f"{chromosome}: the rows of the block at {previous_start} left the buffer before its successor")
+                previous_grams = buffer.cross_block_grams(previous_start - base, start - previous_start, start - base, cut - start)
             with buffer.context():
                 sink(
                     BlockStatistics(
@@ -444,6 +461,8 @@ def _run_chromosome(
                         grams=grams.astype(gram_dtype, copy=False),
                         cross_products=cross,
                         array_module=buffer.array_module,
+                        previous_start=previous_start,
+                        previous_grams=None if previous_grams is None else previous_grams.astype(gram_dtype, copy=False),
                     ),
                     buffer,
                 )
@@ -453,9 +472,11 @@ def _run_chromosome(
         start, stop, staging = stream.current
         rows = stop - start
         while stop - base > plan.capacity_rows:
-            if partitioner.committed > base:
-                buffer.move_rows(partitioner.committed - base, 0, start - partitioner.committed)
-                base = partitioner.committed
+            # the last emitted block stays: the next block's adjacent Gram needs its rows
+            keep = boundaries[-2] if len(boundaries) > 1 else 0
+            if keep > base:
+                buffer.move_rows(keep - base, 0, start - keep)
+                base = keep
             else:
                 emit(partitioner.force_cut())
                 forced += 1
@@ -546,6 +567,7 @@ _LD_ARRAYS = {
     "cross": ("ld_covariate_cross.f64", np.float64),
     "diagonal": ("ld_diagonal.f64", np.float64),
     "ld_score": ("ld_score.f64", np.float64),
+    "adjacent": ("ld_adjacent.f32", np.float32),
 }
 
 
@@ -595,6 +617,19 @@ class LdGramStore:
             projected_score=view("score", self.target_count),
             covariate_cross=view("cross", self.covariate_count),
         )
+
+    def adjacent_block(self, block_index: int) -> NDArray[np.float32] | None:
+        """``X~_{b-1}^T X~_b`` (float32) between block ``b`` and its chromosome's previous block, in
+        the units of ``projected_gram``; None for a chromosome's first block."""
+        if block_index == 0 or self._blocks[block_index - 1]["chromosome"] != self._blocks[block_index]["chromosome"]:
+            return None
+        previous, entry = self._blocks[block_index - 1], self._blocks[block_index]
+        rows = int(previous["reduced_stop"]) - int(previous["reduced_start"])
+        columns = int(entry["reduced_stop"]) - int(entry["reduced_start"])
+        if rows * columns == 0:
+            return np.zeros((rows, columns), dtype=np.float32)
+        offset = int(entry["adjacent_offset"])
+        return np.asarray(self._arrays["adjacent"][offset : offset + rows * columns]).reshape(rows, columns)
 
     def correlation_block(self, block_index: int) -> NDArray[np.float32]:
         """``R_b = X~_b^T X~_b / n`` (exactly symmetric, float32)."""
@@ -765,11 +800,24 @@ def _exact_ties(
     return representative, sign
 
 
+@dataclass(frozen=True, slots=True)
+class _AdjacentState:
+    """What the next block's adjacent Gram needs of a projected block, on its device."""
+
+    chromosome: str
+    start: int
+    kept: Any
+    sums: Any
+    inverse_root: Any
+    loading: Any
+
+
 def _project_block(
-    block: BlockStatistics, projection: _Projection, buffer: GenotypeBuffer
-) -> tuple[_BlockSummary, dict[str, NDArray]]:
+    block: BlockStatistics, projection: _Projection, buffer: GenotypeBuffer, previous: _AdjacentState | None
+) -> tuple[_BlockSummary, dict[str, NDArray], _AdjacentState]:
     """Standardize, find exact ties, drop inactive and tied columns and project out the
-    covariates on the block's device; return the host summary and the projected arrays.
+    covariates on the block's device; return the host summary, the projected arrays and what
+    the chromosome's next block needs for its adjacent Gram (``previous`` is this block's).
 
     ``N = n S - u u^T`` is formed in fp64, where every term is an integer below 2^53 and so
     exact; the ``width^2`` work runs as row panels through ``buffer.parallel_rows``.
@@ -842,6 +890,19 @@ def _project_block(
 
     buffer.parallel_rows(mirror_lower, kept.shape[0])
     buffer.parallel_rows(score_rows, kept.shape[0])
+    adjacent = xp.zeros(0, dtype=xp.float32)
+    if block.previous_grams is not None:
+        if previous is None or (previous.chromosome, previous.start) != (block.chromosome, block.previous_start):
+            raise RuntimeError(f"{block.chromosome}: the block at {block.start} arrived without its predecessor's projection")
+        # the same steps as the block's own Gram: standardized correlations, times n, less the covariate part
+        coupling = block.previous_grams[0][previous.kept][:, kept_device].astype(xp.float64)
+        coupling *= count
+        coupling -= xp.outer(previous.sums[previous.kept], sums[kept_device])
+        coupling *= previous.inverse_root[previous.kept][:, None]
+        coupling *= inverse_root[kept_device][None, :]
+        coupling *= count
+        coupling -= previous.loading @ covariate_cross.T
+        adjacent = coupling.astype(xp.float32)
     summary = _BlockSummary(
         active=active_host,
         means=buffer.to_host(means),
@@ -857,8 +918,10 @@ def _project_block(
         "cross": covariate_cross,
         "diagonal": xp.diagonal(gram).astype(xp.float64) / count,
         "ld_score": ld_score,
+        "adjacent": adjacent,
     }
-    return summary, {name: buffer.to_host(values) for name, values in arrays.items()}
+    state = _AdjacentState(chromosome=block.chromosome, start=block.start, kept=kept_device, sums=sums, inverse_root=inverse_root, loading=loading)
+    return summary, {name: buffer.to_host(values) for name, values in arrays.items()}, state
 
 
 def build_genotype_buffers(
@@ -942,11 +1005,16 @@ def compute_genotype_statistics(
     buffers = build_genotype_buffers(budget, layout, plan, store_columns)
     log(f"stage0: {len(buffers)} {budget.device_kind} buffer(s), block cap {block_cap}, {layout.width:,} laid-out samples")
 
+    previous_states: dict[str, _AdjacentState] = {}
+
     def sink(block: BlockStatistics, buffer: GenotypeBuffer) -> None:
-        block_summary, arrays = _project_block(block, projection, buffer)
+        with summaries_lock:
+            previous = previous_states.get(block.chromosome)
+        block_summary, arrays, state = _project_block(block, projection, buffer, previous)
         writer.append(block.chromosome, block.start, arrays)
         with summaries_lock:
             summaries[(block.chromosome, block.start)] = (block.stop, block_summary)
+            previous_states[block.chromosome] = state
 
     summary = run_genotype_pass(source, layout, buffers, plan, sink)
     for buffer in buffers:

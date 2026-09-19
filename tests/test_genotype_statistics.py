@@ -67,12 +67,20 @@ def test_block_statistics_are_exact_and_blocks_tile_each_chromosome() -> None:
     assert np.all(cut_allowed_from_groups(source.groups["chr21"])[boundaries])
     assert [(block.start, block.stop) for block in blocks] == list(zip(boundaries[:-1], boundaries[1:]))
     signed = codes.astype(np.int64) - 127
-    for block in blocks:
+    for position, block in enumerate(blocks):
         assert block.grams.dtype == np.int32
+        if position == 0:
+            assert block.previous_start is None and block.previous_grams is None
+        else:
+            assert block.previous_start == blocks[position - 1].start
+            assert block.previous_grams.dtype == np.int32
         for group in range(3):
             members = np.flatnonzero(sample_groups == group)
             values = signed[block.start : block.stop, members]
             np.testing.assert_array_equal(block.grams[group], values @ values.T)
+            if position:
+                previous = signed[block.previous_start : block.start, members]
+                np.testing.assert_array_equal(block.previous_grams[group], previous @ values.T)
             np.testing.assert_array_equal(block.sums[group], values.sum(axis=1))
             assert block.group_counts[group] == members.shape[0]
             np.testing.assert_allclose(block.cross_products[group], values @ columns[members], rtol=1e-13, atol=1e-9)
@@ -260,6 +268,24 @@ def test_projected_ld_matches_a_dense_float64_reference(tmp_path) -> None:
         block_correlation = ld.correlation_block(block_index)
         assert block_correlation.dtype == np.float32
         np.testing.assert_array_equal(block_correlation, block_correlation.T)
+    # the adjacent blocks' coupling: every intermediate is a sum of at most n + k terms of
+    # standardized products, each at most n in magnitude, then one float32 rounding of the result
+    sample_count, covariate_count = standardized.shape[0], covariates.shape[1]
+    unit_roundoff = np.finfo(np.float64).eps / 2.0
+    fp64_bound = 4 * (sample_count + covariate_count) * unit_roundoff * sample_count
+    firsts = 0
+    for block_index in range(ld.block_count):
+        adjacent = ld.adjacent_block(block_index)
+        block = ld.block(block_index)
+        if block_index == 0 or ld.block(block_index - 1).chromosome != block.chromosome:
+            assert adjacent is None
+            firsts += 1
+            continue
+        reference = projected_x[:, ld.block(block_index - 1).reduced_columns].T @ projected_x[:, block.reduced_columns]
+        assert adjacent.dtype == np.float32
+        bound = np.finfo(np.float32).eps / 2.0 * np.abs(reference) + fp64_bound
+        assert np.all(np.abs(adjacent.astype(np.float64) - reference) <= bound)
+    assert firsts == 2
     boundaries = statistics.boundaries
     assert boundaries.block_count == statistics.ld.block_count
     assert len(boundaries.signature_sha256()) == 64

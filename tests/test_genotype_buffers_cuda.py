@@ -68,6 +68,13 @@ def test_cuda_blocks_equal_cpu_blocks(dataset) -> None:
         members = np.flatnonzero(labels == 1)
         values = signed[cuda_block.chromosome][cuda_block.start : cuda_block.stop, members]
         np.testing.assert_array_equal(cuda_block.grams[1], values @ values.T)
+        assert cpu_block.previous_start == cuda_block.previous_start
+        if cuda_block.previous_start is None:
+            assert cpu_block.previous_grams is None and cuda_block.previous_grams is None
+            continue
+        np.testing.assert_array_equal(cpu_block.previous_grams, cuda_block.previous_grams)
+        previous = signed[cuda_block.chromosome][cuda_block.previous_start : cuda_block.start, members]
+        np.testing.assert_array_equal(cuda_block.previous_grams[1], previous @ values.T)
 
 
 def test_long_sample_ranges_accumulate_exactly_in_int64(dataset, monkeypatch) -> None:
@@ -79,6 +86,9 @@ def test_long_sample_ranges_accumulate_exactly_in_int64(dataset, monkeypatch) ->
     for block in cuda_blocks:
         values = signed[block.chromosome][block.start : block.stop, members]
         np.testing.assert_array_equal(block.grams[0], values @ values.T)
+        if block.previous_start is not None:
+            previous = signed[block.chromosome][block.previous_start : block.start, members]
+            np.testing.assert_array_equal(block.previous_grams[0], previous @ values.T)
 
 
 def test_two_device_workers_equal_one(dataset) -> None:
@@ -133,3 +143,8 @@ def test_cuda_projected_ld_equals_cpu(tmp_path) -> None:
         np.testing.assert_allclose(left.projected_gram, right.projected_gram, rtol=1e-6, atol=1e-6 * SAMPLES)
         np.testing.assert_allclose(left.projected_score, right.projected_score, rtol=1e-10, atol=1e-8)
         np.testing.assert_allclose(left.covariate_cross, right.covariate_cross, rtol=1e-10, atol=1e-8)
+        left_adjacent, right_adjacent = cpu.ld.adjacent_block(block_index), cuda.ld.adjacent_block(block_index)
+        assert (left_adjacent is None) == (right_adjacent is None)
+        if left_adjacent is not None:
+            # both sides round the same exact integers through the same fp64 steps once to float32
+            np.testing.assert_allclose(left_adjacent, right_adjacent, rtol=np.finfo(np.float32).eps, atol=np.finfo(np.float32).eps * SAMPLES)

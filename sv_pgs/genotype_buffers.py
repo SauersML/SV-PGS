@@ -15,7 +15,7 @@ per row, with the samples in a ``SampleLayout``. Its products are exact integers
 
 The pair weights that choose LD-block boundaries are ``ld_partition.fixed_point_pair_weights``
 on the host and one CUDA kernel taking the same correctly rounded steps on the device, so both
-choose the same blocks. CuPy is passed in by the caller (``genotype._try_import_cupy``); this
+choose the same blocks. CuPy is passed in by the caller (``compute_budget._try_import_cupy``); this
 module never imports it.
 """
 
@@ -37,10 +37,10 @@ from sv_pgs.ld_partition import PAIR_WEIGHT_SCALE, fixed_point_pair_weights
 SIGNED_CODE_OFFSET = 127
 """``s = code - SIGNED_CODE_OFFSET`` lies in [-127, 127] for every stored code."""
 
-INT32_EXACT_ROWS = (2**31 - 1) // (SIGNED_CODE_OFFSET * SIGNED_CODE_OFFSET)
+INT32_EXACT_ROWS = int(np.iinfo(np.int32).max) // (SIGNED_CODE_OFFSET * SIGNED_CODE_OFFSET)
 """Largest sample count whose int32 sum of ``s_i s_j`` cannot overflow (133,144)."""
 
-FLOAT32_EXACT_ROWS = 2**24 // (SIGNED_CODE_OFFSET * SIGNED_CODE_OFFSET)
+FLOAT32_EXACT_ROWS = 2 ** (np.finfo(np.float32).nmant + 1) // (SIGNED_CODE_OFFSET * SIGNED_CODE_OFFSET)
 """Largest sample count whose float32 sum of ``s_i s_j`` stays an exact integer in any order (1,040)."""
 
 LAYOUT_ALIGNMENT = 64
@@ -180,8 +180,10 @@ def host_buffer_bytes(layout: SampleLayout, capacity_rows: int, block_cap: int, 
     buffer = rows * (layout.width + 4 * _chunks(layout.profile_width) * _HOST_SAMPLE_CHUNK + 16)
     staging = (_STAGING_BUFFERS + 1) * (block_cap // 2 + LAYOUT_ALIGNMENT) * layout.store_width
     block = block_cap * _chunks(int(layout.group_widths.max())) * _HOST_SAMPLE_CHUNK * 4 + 3 * block_cap * block_cap * 8
+    # the Gram against the previous block: its float32 rows and the int64 result per group
+    adjacent = block_cap * _chunks(int(layout.group_widths.max())) * _HOST_SAMPLE_CHUNK * 4 + (layout.group_count + 1) * block_cap * block_cap * 8
     workers_scratch = workers * (_HOST_PANEL * _HOST_PANEL * 8 + 2 * _HOST_PANEL * _HOST_SAMPLE_CHUNK * 4)
-    return buffer + staging + block + workers_scratch + layout.width * cross_columns * 8
+    return buffer + staging + block + adjacent + workers_scratch + layout.width * cross_columns * 8
 
 
 def cuda_buffer_bytes(layout: SampleLayout, capacity_rows: int, tile_rows: int, block_cap: int, cross_columns: int) -> int:
@@ -193,8 +195,10 @@ def cuda_buffer_bytes(layout: SampleLayout, capacity_rows: int, tile_rows: int, 
     gram_rows = _aligned_rows(block_cap)
     long_group = int(layout.group_widths.max()) > _CUDA_SAMPLE_CHUNK
     gram = layout.group_count * gram_rows * gram_rows * 8 + gram_rows * gram_rows * (4 + (8 if long_group else 0))
+    # the Gram against the previous block has the same shape bound as the block's own
+    adjacent = gram
     cross = layout.width * cross_columns * 8 + block_cap * _CROSS_SAMPLE_CHUNK * 8
-    return resident + max(band, gram + cross)
+    return resident + max(band, gram + adjacent + cross)
 
 
 class HostGenotypeBuffer:
@@ -318,6 +322,22 @@ class HostGenotypeBuffer:
         self._parallel(weigh, panels)
         return row_parts.sum(axis=0), column_parts.sum(axis=0)
 
+    def _group_values(self, slot: int, rows: int, group: int, sums: NDArray[np.int64] | None) -> NDArray[np.float32]:
+        """Rows ``[slot, slot + rows)`` of one group's samples as chunk-major float32; their sums
+        go into ``sums`` when it is given."""
+        low, high = self.layout.group_range(group)
+        block = self._buffer[slot : slot + rows]
+        values = np.empty((_chunks(high - low), rows, _HOST_SAMPLE_CHUNK), dtype=np.float32)
+
+        def convert(row_range: tuple[int, int]) -> None:
+            start, stop = row_range
+            _store_chunked(values, slice(start, stop), block[start:stop, low:high])
+            if sums is not None:
+                sums[start:stop] = block[start:stop, low:high].sum(axis=1, dtype=np.int64)
+
+        self._parallel(convert, self._row_ranges(rows, -(-rows // self._worker_count)))
+        return values
+
     def block_statistics(
         self, slot: int, rows: int
     ) -> tuple[NDArray[np.int64], NDArray[np.int64], NDArray[np.float64] | None]:
@@ -325,19 +345,20 @@ class HostGenotypeBuffer:
         groups = self.layout.group_count
         sums = np.zeros((groups, rows), dtype=np.int64)
         grams = np.zeros((groups, rows, rows), dtype=np.int64)
-        block = self._buffer[slot : slot + rows]
         for group in range(groups):
-            low, high = self.layout.group_range(group)
-            values = np.empty((_chunks(high - low), rows, _HOST_SAMPLE_CHUNK), dtype=np.float32)
-
-            def convert(row_range: tuple[int, int]) -> None:
-                start, stop = row_range
-                _store_chunked(values, slice(start, stop), block[start:stop, low:high])
-                sums[group, start:stop] = block[start:stop, low:high].sum(axis=1, dtype=np.int64)
-
-            self._parallel(convert, self._row_ranges(rows, -(-rows // self._worker_count)))
+            values = self._group_values(slot, rows, group, sums[group])
             grams[group] = _host_exact_products(values, values, self._parallel, self._worker_count, symmetric=True)
         return sums, grams, None if self._cross is None else self.cross_products(slot, rows)
+
+    def cross_block_grams(self, first_slot: int, first_rows: int, second_slot: int, second_rows: int) -> NDArray[np.int64]:
+        """Exact per-group Grams between two blocks' rows, ``sum_{i in g} s_i^(1) s_i^(2)T``
+        ``(G, first_rows, second_rows)``: adjacent LD blocks' coupling."""
+        grams = np.zeros((self.layout.group_count, first_rows, second_rows), dtype=np.int64)
+        for group in range(self.layout.group_count):
+            first = self._group_values(first_slot, first_rows, group, None)
+            second = self._group_values(second_slot, second_rows, group, None)
+            grams[group] = _host_exact_products(first, second, self._parallel, self._worker_count, symmetric=False)
+        return grams
 
     def cross_products(self, slot: int, rows: int) -> NDArray[np.float64]:
         """Per-group ``sum_i s_i y_i^T`` ``(G, rows, columns)`` in fp64, in a fixed summation order."""
@@ -653,6 +674,26 @@ class CudaGenotypeBuffer:
                 grams[group] = cupy.where(index[:, None] >= index[None, :], lower, lower.T)
             cross = None if self._cross is None else self.cross_products(slot, rows)
         return sums, grams, cross
+
+    def cross_block_grams(self, first_slot: int, first_rows: int, second_slot: int, second_rows: int) -> Any:
+        """Exact per-group Grams between two blocks' rows ``(G, first_rows, second_rows)``, on the device."""
+        cupy = self._cupy
+        first_padded, second_padded = _aligned_rows(first_rows), _aligned_rows(second_rows)
+        long_group = int(self.layout.group_widths.max()) > _CUDA_SAMPLE_CHUNK
+        with self.context():
+            grams = cupy.empty((self.layout.group_count, first_rows, second_rows), dtype=cupy.int64 if long_group else cupy.int32)
+            # column-major [first_padded, second_padded]: entry (r, c) at c * first_padded + r
+            output = cupy.empty((second_padded, first_padded), dtype=cupy.int32)
+            for group in range(self.layout.group_count):
+                low, high = self.layout.group_range(group)
+                total = None
+                for chunk_low in range(low, high, _CUDA_SAMPLE_CHUNK):
+                    self._gemm(first_slot, first_padded, second_slot, second_padded, chunk_low, min(_CUDA_SAMPLE_CHUNK, high - chunk_low),
+                               output, 0, first_padded, accumulate=False)
+                    if long_group:
+                        total = output.astype(cupy.int64) if total is None else total + output
+                grams[group] = (output if total is None else total)[:second_rows, :first_rows].T
+        return grams
 
     def cross_products(self, slot: int, rows: int) -> Any:
         """Per-group ``sum_i s_i y_i^T`` ``(G, rows, columns)`` in fp64 cuBLAS GEMMs, on the device."""
