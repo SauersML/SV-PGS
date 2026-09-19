@@ -1048,20 +1048,30 @@ def _evidence(
     and the third derivatives of log Z (``_curvature_trace_gradient``).
     """
     penalty = _penalty_matrix(prior, log_smoothing)
-    coefficients, objective = _maximize_coefficients(prior, log_smoothing, start, cavity, working_bytes, tolerance)
-    value, gradient, hessian = _penalized(prior, objective, log_smoothing, penalty, coefficients)
     null_basis = prior.null_basis
-    try:
-        log_determinant, covariance = _cholesky_log_determinant_and_inverse(-hessian)
-        null_log_determinant, null_inverse = _cholesky_log_determinant_and_inverse(null_basis.T @ -hessian @ null_basis)
-    except np.linalg.LinAlgError:
-        return None
-    newton_decrement = 0.5 * float(gradient @ covariance @ gradient)
+    # V's determinant terms move with x at first order: an inexact x-hat with decrement d moves V by up to
+    # sqrt(c'(-H)^-1 c) sqrt(2 d) / 2, c their x-gradient. The inner tolerance tightens until that is below ``tolerance``.
+    inner_tolerance = tolerance
+    coefficients = np.array(start, dtype=np.float64, copy=True)
+    while True:
+        coefficients, objective = _maximize_coefficients(prior, log_smoothing, coefficients, cavity, working_bytes, inner_tolerance)
+        value, gradient, hessian = _penalized(prior, objective, log_smoothing, penalty, coefficients)
+        try:
+            log_determinant, covariance = _cholesky_log_determinant_and_inverse(-hessian)
+            null_log_determinant, null_inverse = _cholesky_log_determinant_and_inverse(null_basis.T @ -hessian @ null_basis)
+        except np.linalg.LinAlgError:
+            return None
+        newton_decrement = 0.5 * float(gradient @ covariance @ gradient)
+        weight = covariance - null_basis @ null_inverse @ null_basis.T
+        curvature_gradient = _curvature_trace_gradient(prior, coefficients, cavity, weight, working_bytes)
+        sensitivity = max(float(curvature_gradient @ covariance @ curvature_gradient), np.finfo(np.float64).tiny)
+        rounding = _EPSILON * (objective.magnitude + abs(value))
+        if 0.5 * np.sqrt(sensitivity * 2.0 * newton_decrement) <= tolerance or newton_decrement <= rounding:
+            break
+        inner_tolerance = 2.0 * tolerance * tolerance / sensitivity
     penalty_log_determinant = sum(_log_pseudo_determinant(penalty[np.ix_(group, group)]) for group in _penalty_groups(prior))
     evidence_value = value + 0.5 * penalty_log_determinant - 0.5 * log_determinant + 0.5 * null_log_determinant
-    # W = (-H)^-1 - N (N'(-H)N)^-1 N' carries both determinants' dependence on x.
-    weight = covariance - null_basis @ null_inverse @ null_basis.T
-    curvature_gradient = _curvature_trace_gradient(prior, coefficients, cavity, weight, working_bytes)
+    # W = (-H)^-1 - N (N'(-H)N)^-1 N' carries both determinants' dependence on x (computed above).
     evidence_gradient = np.empty(len(prior.smoothing_blocks))
     responses = np.empty((coefficients.shape[0], len(prior.smoothing_blocks)))
     group_of = {int(coordinate): group for group in _penalty_groups(prior) for coordinate in group}
