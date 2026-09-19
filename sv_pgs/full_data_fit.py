@@ -460,7 +460,11 @@ def fit_full_data(
     variant-side probes."""
     fixed_points = _FullDataFixedPoints(gaussian, statistics, prior, draw_count, working_bytes, seed)
     starts = [initial_hyperparameters(prior) for _model in range(gaussian.model_count)]
-    fits = fit_hyperparameters(prior, starts, fixed_points, working_bytes, 0.5 / draw_count)
+    try:
+        fits = fit_hyperparameters(prior, starts, fixed_points, working_bytes, 0.5 / draw_count)
+    except FloatingPointError as error:
+        # The oracle's refusals say why EP had no fixed point; they belong with the failure.
+        raise FloatingPointError(f"{error}; EP refusals: {fixed_points.refusals}") from error
     return FullDataFit(
         gaussian=gaussian,
         site_precision=fixed_points.site_precision,
