@@ -84,3 +84,8 @@ dev = [
     "vulture>=2.16",
     "pytest>=8",
 ]
+# Coalescent simulation for the team's accuracy and power studies on public data.
+# Never imported by sv_pgs; install with `uv sync --group sim`.
+sim = [
+    "msprime>=1.3",
+]
