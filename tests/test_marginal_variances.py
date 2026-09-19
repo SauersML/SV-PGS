@@ -369,3 +369,36 @@ def test_cavity_tolerance_follows_its_three_bounds():
     for position, members in enumerate(blocks):
         variance_bound = np.sqrt(2.0 / draws) / np.sqrt(np.mean(np.square(response[members] * ratio[members])))
         assert np.isclose(tolerance[position], min(variance_bound, mean_bound, 1.0), rtol=1e-12)
+
+
+def test_information_solve_tolerance_is_infinite_when_every_site_is_resolved():
+    generator = np.random.default_rng(18)
+    columns = generator.standard_normal((80, 120))
+    precision = generator.uniform(1.0, 30.0, 120)
+    # The case the Stage 2 sweep hit: a solver that resolved every site (e.g. all improper, or all spikes).
+    solve = _solve(columns, precision, np.arange(120))
+    blocks = tuple(np.arange(start, start + 40) for start in range(0, 120, 40))
+    variances = np.diag(np.linalg.inv(columns.T @ columns + np.diag(precision)))
+    assert information_solve_tolerance(solve, variances, blocks, np.sum(columns**2, axis=0), 0.01) == np.inf
+
+
+def test_marginals_respect_the_exact_bounds():
+    _generator, columns, precision, blocks, solve = _strong_case(19)
+    variances = marginal_variances(solve, _grams(columns, blocks))
+    upper = 1.0 / precision
+    lower = 1.0 / (np.sum(columns**2, axis=0) + precision)
+    bulk = ~np.isin(np.arange(precision.shape[0]), solve.resolved)
+    assert np.all(variances[bulk] <= upper[bulk]) and np.all(variances[bulk] >= lower[bulk])
+
+
+def test_no_upper_clamp_when_a_resolved_site_is_non_positive():
+    # verify-stage2's counterexample: with Pi = (2, -1/2) the bulk site's exact marginal exceeds 1/Pi_1.
+    columns = np.array([[1.0, 1.0]])
+    precision = np.array([2.0, -0.5])
+    exact = np.linalg.inv(columns.T @ columns + np.diag(precision))
+    assert exact[0, 0] > 1.0 / precision[0]
+    solve = _solve(columns, precision, np.array([1]))
+    grams = BlockGrams(blocks=(np.array([0, 1]),), within=(columns.T @ columns,), next_cross=())
+    variances = marginal_variances(solve, grams)
+    assert variances[0] > 1.0 / precision[0]
+    assert np.isclose(variances[1], exact[1, 1], rtol=1e-12)
