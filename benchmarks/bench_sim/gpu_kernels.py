@@ -22,6 +22,7 @@ from benchmarks.bench_sim.measurement import measured_records
 
 CODES_PER_DOSAGE = 127
 PC_COUNT = 10
+PUBLIC_SEED = 20260919
 
 
 def prepare(cohort: Path, block_rows: int, arm: str) -> None:
@@ -37,6 +38,12 @@ def prepare(cohort: Path, block_rows: int, arm: str) -> None:
     observed = np.load(cohort / ARMS[arm][0], mmap_mode="r")
     n_var, size = observed.shape
     train_gpu, test_gpu = cp.asarray(train), cp.asarray(test)
+    counts_path = cohort / f"kernel_counts_{arm}.json"
+    if counts_path.exists():
+        # Resume: the kernels of an earlier run are complete once their counts file exists (it is written last).
+        simple = cp.asarray(np.load(cohort / f"kernel_simple_{arm}.npy"))
+        principal_components(cohort, arm, simple, train, test, train_gpu, test_gpu, size)
+        return
     kernels = {"simple": cp.zeros((size, size), dtype=cp.float32), "structural": cp.zeros((size, size), dtype=cp.float32)}
     counts = {"simple": 0, "structural": 0}
     for first in range(0, n_var, block_rows):
@@ -53,18 +60,24 @@ def prepare(cohort: Path, block_rows: int, arm: str) -> None:
                 counts[name] += int(members.sum())
         if first % (block_rows * 20) == 0:
             print(f"kernel rows {first}/{n_var}", flush=True)
-    (cohort / f"kernel_counts_{arm}.json").write_text(json.dumps(counts))
     for name in ("structural", "simple"):
         kernels[name] /= counts[name]
         np.save(cohort / f"kernel_{name}_{arm}.npy", cp.asnumpy(kernels[name]))
+    counts_path.write_text(json.dumps(counts))
     del kernels["structural"]
     cp.get_default_memory_pool().free_all_blocks()
-    train_block = kernels["simple"][train_gpu[:, None], train_gpu[None, :]]
-    cross_block = kernels["simple"][test_gpu[:, None], train_gpu[None, :]]
-    del kernels["simple"]
+    principal_components(cohort, arm, kernels.pop("simple"), train, test, train_gpu, test_gpu, size)
+
+
+def principal_components(cohort: Path, arm: str, simple, train, test, train_gpu, test_gpu, size: int) -> None:
+    train_block = simple[train_gpu[:, None], train_gpu[None, :]]
+    cross_block = simple[test_gpu[:, None], train_gpu[None, :]]
+    del simple
     cp.get_default_memory_pool().free_all_blocks()
     operator = LinearOperator(train_block.shape, matvec=lambda vector: train_block @ vector, dtype=cp.float32)
-    values, vectors = eigsh(operator, k=PC_COUNT, which="LA")
+    # A seeded host start vector: cupy's own random start needs libcurand, which venv-gpu lacks.
+    start = cp.asarray(np.random.default_rng(PUBLIC_SEED).standard_normal(train.size).astype(np.float32))
+    values, vectors = eigsh(operator, k=PC_COUNT, which="LA", v0=start)
     order = cp.argsort(values)[::-1]
     values, vectors = values[order], vectors[:, order]
     residual = cp.linalg.norm(train_block @ vectors - vectors * values, axis=0) / values
