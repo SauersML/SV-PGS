@@ -433,19 +433,33 @@ class _Components:
     third: F64Array
 
 
+def _kernel_terms(
+    log_density: F64Array, log_scale_rows: F64Array, grid: F64Array, floor: float, precision: F64Array, shift: F64Array
+) -> tuple[F64Array, F64Array, F64Array, F64Array]:
+    """(variance v, q = vP, r = 1/(1+q), log pi_k + log Z_jk) at every node; v = 0 below ``floor``."""
+    variance = np.where(grid[None, :] >= floor, np.exp(log_scale_rows[:, None] + grid[None, :]), 0.0)
+    ratio = variance * precision[:, None]
+    if np.any(ratio <= -1.0):
+        raise FloatingPointError("a cavity is improper on the lattice: 1 + v P <= 0")
+    retained = 1.0 / (1.0 + ratio)
+    log_component = log_density - 0.5 * np.log1p(ratio) + 0.5 * np.square(shift)[:, None] * variance * retained
+    return variance, ratio, retained, log_component
+
+
+def _log_normalizers(
+    log_density: F64Array, log_scale_rows: F64Array, grid: F64Array, floor: float, precision: F64Array, shift: F64Array
+) -> F64Array:
+    return logsumexp(_kernel_terms(log_density, log_scale_rows, grid, floor, precision, shift)[3], axis=1)
+
+
 def _components(
     log_density: F64Array, log_scale_rows: F64Array, grid: F64Array, floor: float, precision: F64Array, shift: F64Array
 ) -> _Components:
     """With q = vP, r = 1/(1+q) and a = h^2 v r:  d log Z_k / d eta = (a - q) r / 2,
     its eta-derivative a r (2r - 1)/2 - q r^2/2, and the next a r (6r^2 - 6r + 1)/2 - q r^2 (2r - 1)/2.
     Nodes below ``floor`` have a flat kernel: v = 0 there."""
-    variance = np.where(grid[None, :] >= floor, np.exp(log_scale_rows[:, None] + grid[None, :]), 0.0)
-    ratio = variance * precision[:, None]
-    if np.any(ratio <= -1.0):
-        raise FloatingPointError("a cavity is improper on the lattice: 1 + v P <= 0")
-    retained = 1.0 / (1.0 + ratio)
+    variance, ratio, retained, log_component = _kernel_terms(log_density, log_scale_rows, grid, floor, precision, shift)
     signal = np.square(shift)[:, None] * variance * retained
-    log_component = log_density - 0.5 * np.log1p(ratio) + 0.5 * signal
     log_normalizer = logsumexp(log_component, axis=1)
     responsibility = np.exp(log_component - log_normalizer[:, None])
     ratio_retained = ratio * retained
@@ -594,6 +608,19 @@ def _data_objective(prior: ScaleMixturePrior, coefficients: F64Array, cavity: Ca
     return _Objective(value=value, gradient=gradient, hessian=hessian, magnitude=magnitude)
 
 
+def _data_value(prior: ScaleMixturePrior, coefficients: F64Array, cavity: Cavity, working_bytes: int) -> float:
+    """sum_j log Z_j alone: a trial point's evaluation."""
+    log_density = class_log_density(prior, coefficients)
+    scales = log_scale(prior, coefficients)
+    total = 0.0
+    for class_position, class_rows in enumerate(prior.class_rows):
+        for rows in _row_chunks(class_rows, prior.grid_size, working_bytes):
+            total += float(np.sum(_log_normalizers(
+                log_density[class_position], scales[rows], prior.log_variance_grid, prior.kernel_floor, cavity.precision[rows], cavity.shift[rows]
+            )))
+    return total
+
+
 def _penalty_matrix(prior: ScaleMixturePrior, log_smoothing: F64Array) -> F64Array:
     """S_rho over x: each block's matrix times its weight."""
     penalty = np.zeros((prior.coefficient_size, prior.coefficient_size))
@@ -636,37 +663,71 @@ def _ascent_direction(negative_hessian: F64Array, gradient: F64Array) -> F64Arra
     return eigenvectors @ ((eigenvectors.T @ gradient) / magnitudes)
 
 
-def _maximize_coefficients(
-    prior: ScaleMixturePrior, log_smoothing: F64Array, start: F64Array, cavity: Cavity, working_bytes: int
-) -> tuple[F64Array, _Objective]:
-    """Safeguarded Newton ascent of the penalized objective at fixed penalty weights.
+def _trust_region_step(negative_hessian: F64Array, gradient: F64Array, radius: float) -> F64Array:
+    """The maximizer of g's - s'(-H)s/2 over ||s|| <= radius (More and Sorensen), from -H's eigendecomposition.
 
-    The step is Newton on the observed Hessian where it is negative definite and on
-    its spectrum's magnitudes elsewhere (the objective is not concave in log g),
-    halved until the objective rises. It stops when the step's predicted gain falls
-    to the objective's rounding level (eps times the sum of |log Z_j|), or when no
-    step raises the objective: the maximum to double precision.
+    s(mu) = (-H + mu I)^-1 g with mu >= max(0, -lambda_min) and ||s(mu)|| = radius unless the Newton
+    step of a positive definite -H already fits; ||s(mu)|| falls monotonically in mu, so mu is bisected
+    to double precision between its bounds.
+    """
+    eigenvalues, eigenvectors = np.linalg.eigh(0.5 * (negative_hessian + negative_hessian.T))
+    components = eigenvectors.T @ gradient
+    if eigenvalues[0] > 0.0:
+        newton = components / eigenvalues
+        if float(np.linalg.norm(newton)) <= radius:
+            return eigenvectors @ newton
+    lower = max(0.0, -float(eigenvalues[0]))
+    upper = lower + float(np.linalg.norm(gradient)) / radius
+    while upper - lower > _EPSILON * upper:
+        middle = 0.5 * (lower + upper)
+        if middle in (lower, upper):
+            break
+        if float(np.linalg.norm(components / (eigenvalues + middle))) > radius:
+            lower = middle
+        else:
+            upper = middle
+    return eigenvectors @ (components / (eigenvalues + upper))
+
+
+def _maximize_coefficients(
+    prior: ScaleMixturePrior, log_smoothing: F64Array, start: F64Array, cavity: Cavity, working_bytes: int, tolerance: float
+) -> tuple[F64Array, _Objective]:
+    """Trust-region Newton ascent of the penalized objective at fixed penalty weights.
+
+    The objective is not concave in log g, so each step maximizes the quadratic model inside a radius
+    (More-Sorensen); a trial costs one value-only pass, and the radius follows the ratio of actual to
+    predicted gain (Nocedal and Wright, Algorithm 4.1). It stops when the predicted gain of the step on
+    the Hessian's spectrum magnitudes falls to ``tolerance`` nats (the resolution the caller certifies,
+    and at least the objective's rounding level), or when no step longer than half of double precision
+    raises the objective.
     """
     penalty = _penalty_matrix(prior, log_smoothing)
     coefficients = np.array(start, dtype=np.float64, copy=True)
     objective = _data_objective(prior, coefficients, cavity, working_bytes)
     value, gradient, hessian = _penalized(prior, objective, log_smoothing, penalty, coefficients)
+    radius = float(np.linalg.norm(_ascent_direction(-hessian, gradient)))
     while True:
-        direction = _ascent_direction(-hessian, gradient)
-        if 0.5 * float(gradient @ direction) <= _EPSILON * (objective.magnitude + abs(value)):
+        rounding = _EPSILON * (objective.magnitude + abs(value))
+        if 0.5 * float(gradient @ _ascent_direction(-hessian, gradient)) <= max(tolerance, rounding):
             return coefficients, objective
-        step_length = 1.0
-        while True:
-            candidate = coefficients + step_length * direction
-            if np.array_equal(candidate, coefficients):
-                return coefficients, objective
-            candidate_objective = _data_objective(prior, candidate, cavity, working_bytes)
-            candidate_value, candidate_gradient, candidate_hessian = _penalized(prior, candidate_objective, log_smoothing, penalty, candidate)
-            if np.isfinite(candidate_value) and candidate_value > value:
-                break
-            step_length *= 0.5
-        coefficients, objective = candidate, candidate_objective
-        value, gradient, hessian = candidate_value, candidate_gradient, candidate_hessian
+        if radius <= _HALF_PRECISION * (1.0 + float(np.linalg.norm(coefficients))):
+            return coefficients, objective
+        step = _trust_region_step(-hessian, gradient, radius)
+        predicted = float(gradient @ step) + 0.5 * float(step @ hessian @ step)
+        candidate = coefficients + step
+        candidate_value = _data_value(prior, candidate, cavity, working_bytes) - _penalty_value(prior, log_smoothing, candidate)[0]
+        actual = candidate_value - value
+        ratio = actual / predicted if predicted > 0.0 else -np.inf
+        step_norm = float(np.linalg.norm(step))
+        if not np.isfinite(ratio) or ratio < 0.25:
+            radius = 0.25 * step_norm
+        elif ratio > 0.75 and step_norm >= radius * (1.0 - _HALF_PRECISION):
+            radius = 2.0 * radius
+        if np.isfinite(candidate_value) and actual > 0.0:
+            coefficients = candidate
+            objective = _data_objective(prior, coefficients, cavity, working_bytes)
+            value, gradient, hessian = _penalized(prior, objective, log_smoothing, penalty, coefficients)
+
 
 
 # ------------------------------------------------------- the Laplace evidence for the weights
@@ -733,9 +794,12 @@ def _curvature_trace_gradient(
 
 @dataclass(frozen=True)
 class _Evidence:
+    """V and dV/drho at x_rho; ``responses`` is dx_rho/drho (coefficients x weights), the first-order predictor of x."""
+
     value: float
     gradient: F64Array
     coefficients: F64Array
+    responses: F64Array
     penalized_value: float
     newton_decrement: float
     magnitude: float
@@ -777,7 +841,9 @@ def _penalty_groups(prior: ScaleMixturePrior) -> list[I64Array]:
     return [np.array(sorted(group), dtype=np.int64) for group in groups]
 
 
-def _evidence(prior: ScaleMixturePrior, log_smoothing: F64Array, start: F64Array, cavity: Cavity, working_bytes: int) -> _Evidence | None:
+def _evidence(
+    prior: ScaleMixturePrior, log_smoothing: F64Array, start: F64Array, cavity: Cavity, working_bytes: int, tolerance: float
+) -> _Evidence | None:
     """V(rho) and its exact gradient, with x_rho re-maximized from ``start``; None when x_rho is not a strict maximum.
 
     The Laplace curvature is the observed -H of the objective maximized. The null
@@ -786,7 +852,7 @@ def _evidence(prior: ScaleMixturePrior, log_smoothing: F64Array, start: F64Array
     and the third derivatives of log Z (``_curvature_trace_gradient``).
     """
     penalty = _penalty_matrix(prior, log_smoothing)
-    coefficients, objective = _maximize_coefficients(prior, log_smoothing, start, cavity, working_bytes)
+    coefficients, objective = _maximize_coefficients(prior, log_smoothing, start, cavity, working_bytes, tolerance)
     value, gradient, hessian = _penalized(prior, objective, log_smoothing, penalty, coefficients)
     null_basis = prior.null_basis
     try:
@@ -801,6 +867,7 @@ def _evidence(prior: ScaleMixturePrior, log_smoothing: F64Array, start: F64Array
     weight = covariance - null_basis @ null_inverse @ null_basis.T
     curvature_gradient = _curvature_trace_gradient(prior, coefficients, cavity, weight, working_bytes)
     evidence_gradient = np.empty(len(prior.smoothing_blocks))
+    responses = np.empty((coefficients.shape[0], len(prior.smoothing_blocks)))
     group_of = {int(coordinate): group for group in _penalty_groups(prior) for coordinate in group}
     for position, (block, log_weight) in enumerate(zip(prior.smoothing_blocks, log_smoothing)):
         lambda_weight = float(np.exp(log_weight))
@@ -813,6 +880,7 @@ def _evidence(prior: ScaleMixturePrior, log_smoothing: F64Array, start: F64Array
         pull = np.zeros_like(coefficients)
         pull[coordinates] = lambda_weight * (block.factor.T @ residual)
         # dx/drho_i = -(-H)^-1 pull, so -1/2 d tr through x is +1/2 grad . (-H)^-1 pull; N' S_i N = 0.
+        responses[:, position] = -(covariance @ pull)
         evidence_gradient[position] = (
             -0.5 * lambda_weight * float(residual @ residual)
             + 0.5 * lambda_weight * _pseudo_inverse_trace(penalty[np.ix_(group, group)], embedded)
@@ -823,6 +891,7 @@ def _evidence(prior: ScaleMixturePrior, log_smoothing: F64Array, start: F64Array
         value=evidence_value,
         gradient=evidence_gradient,
         coefficients=coefficients,
+        responses=responses,
         penalized_value=value,
         newton_decrement=newton_decrement,
         magnitude=objective.magnitude + abs(evidence_value),
@@ -896,17 +965,19 @@ def _ascend_evidence(
     working_bytes: int,
     lower: F64Array,
     upper: F64Array,
+    tolerance: float,
 ) -> tuple[F64Array, _Evidence]:
     """Projected quasi-Newton ascent of V(rho) inside [lower, upper], backtracking on every trial point.
 
     A trial is kept only when it has a positive-definite penalized maximum and
-    raises V; otherwise the step halves. The BFGS inverse Hessian of -V is
-    updated when the curvature condition holds. It stops when the predicted
-    gain falls to V's rounding level, or when no step longer than half of
-    double precision in rho raises V.
+    raises V; otherwise the step halves. Each trial's x starts from the
+    first-order predictor x_rho + (dx/drho) delta. The BFGS inverse Hessian of
+    -V is updated when the curvature condition holds. It stops when the
+    predicted gain falls to ``tolerance`` nats, or when no step longer than half
+    of double precision in rho raises V.
     """
     weights = np.clip(start_weights, lower, upper)
-    current = _evidence(prior, weights, start_coefficients, cavity, working_bytes)
+    current = _evidence(prior, weights, start_coefficients, cavity, working_bytes, tolerance)
     if current is None:
         raise FloatingPointError("the penalized objective has no positive-definite maximum at the starting penalty weights")
     inverse_hessian = np.eye(weights.shape[0])
@@ -918,13 +989,14 @@ def _ascend_evidence(
         if float(gradient[free] @ direction[free]) <= 0.0:
             inverse_hessian = np.eye(weights.shape[0])
             direction[free] = gradient[free]
-        if 0.5 * float(gradient[free] @ direction[free]) <= _EPSILON * current.magnitude:
+        if 0.5 * float(gradient[free] @ direction[free]) <= max(tolerance, _EPSILON * current.magnitude):
             return weights, current
         step_length = 1.0
         accepted = None
         while step_length * float(np.max(np.abs(direction))) > _HALF_PRECISION * (1.0 + float(np.max(np.abs(weights)))):
             trial_weights = np.clip(weights + step_length * direction, lower, upper)
-            trial = _evidence(prior, trial_weights, current.coefficients, cavity, working_bytes)
+            predicted = current.coefficients + current.responses @ (trial_weights - weights)
+            trial = _evidence(prior, trial_weights, predicted, cavity, working_bytes, tolerance)
             if trial is not None and trial.value > current.value:
                 accepted = (trial_weights, trial)
                 break
@@ -949,6 +1021,7 @@ def _maximize_evidence(
     cavity: Cavity,
     working_bytes: int,
     bounds: list[tuple[float, float]],
+    tolerance: float,
 ) -> tuple[F64Array, F64Array, _Evidence, _Evidence]:
     """Maximize V over every weight in [0, infinity], with exact edges at both ends.
 
@@ -970,11 +1043,11 @@ def _maximize_evidence(
         edges = infinite | zero
         finite = np.array([position for position in range(len(bounds)) if position not in edges], dtype=np.int64)
         view, allowed = _restricted_prior(prior, infinite, zero)
-        finite_weights, evidence = _ascend_evidence(
-            view, weights[finite], allowed.T @ coefficients, cavity, working_bytes, lower[finite], upper[finite]
-        )
         if start is None:
-            start = _evidence(view, np.clip(weights[finite], lower[finite], upper[finite]), allowed.T @ coefficients, cavity, working_bytes)
+            start = _evidence(view, np.clip(weights[finite], lower[finite], upper[finite]), allowed.T @ coefficients, cavity, working_bytes, tolerance)
+        finite_weights, evidence = _ascend_evidence(
+            view, weights[finite], allowed.T @ coefficients, cavity, working_bytes, lower[finite], upper[finite], tolerance
+        )
         weights[finite] = finite_weights
         coefficients = allowed @ evidence.coefficients
         to_infinity = {int(finite[index]) for index in np.flatnonzero((finite_weights >= upper[finite]) & (evidence.gradient >= 0.0))}
@@ -987,7 +1060,7 @@ def _maximize_evidence(
             trial_weights = weights.copy()
             at_infinity = position in infinite
             trial_weights[position] = upper[position] if at_infinity else lower[position]
-            trial = _evidence(loose_view, trial_weights[loose_finite], loose_allowed.T @ coefficients, cavity, working_bytes)
+            trial = _evidence(loose_view, trial_weights[loose_finite], loose_allowed.T @ coefficients, cavity, working_bytes, tolerance)
             if trial is None:
                 continue
             slope = trial.gradient[loose_finite.index(position)]
@@ -1003,9 +1076,10 @@ def _maximize_evidence(
 
 
 def hyper_step(
-    prior: ScaleMixturePrior, hyperparameters: MixtureHyperparameters, cavity: Cavity, working_bytes: int
+    prior: ScaleMixturePrior, hyperparameters: MixtureHyperparameters, cavity: Cavity, working_bytes: int, tolerance: float
 ) -> HyperStep:
-    """Maximize V over every penalty weight in (0, infinity], with x at the penalized maximum for each."""
+    """Maximize V over every penalty weight in [0, infinity], with x at the penalized maximum for each, to ``tolerance``
+    nats: the resolution the fit certifies (1/(2K) for a scorer with K posterior draws)."""
     start_objective = _data_objective(prior, hyperparameters.coefficients, cavity, working_bytes)
     infinite = frozenset(int(position) for position in np.flatnonzero(hyperparameters.log_smoothing == np.inf))
     zero = frozenset(int(position) for position in np.flatnonzero(hyperparameters.log_smoothing == -np.inf))
@@ -1019,7 +1093,7 @@ def hyper_step(
     start_decrement = 0.5 * float(start_gradient @ _ascent_direction(-start_hessian, start_gradient))
     bounds = _smoothing_bounds(prior, start_objective)
     log_smoothing, coefficients, evidence, start_evidence = _maximize_evidence(
-        prior, hyperparameters.log_smoothing, hyperparameters.coefficients, cavity, working_bytes, bounds
+        prior, hyperparameters.log_smoothing, hyperparameters.coefficients, cavity, working_bytes, bounds, tolerance
     )
     interior = np.array([np.isfinite(weight) and bound[0] < weight < bound[1] for weight, bound in zip(log_smoothing, bounds)])
     interior_gradient = evidence.gradient[interior[np.isfinite(log_smoothing)]]

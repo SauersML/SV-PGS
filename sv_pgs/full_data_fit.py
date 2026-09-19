@@ -300,7 +300,7 @@ def fit_full_data(
                 precision=frozen_precision[:, model_index],
                 shift=gaussian.mean[:, model_index] / marginal_variance[:, model_index] - site_shift[:, model_index],
             )
-            steps.append(hyper_step(prior, hyperparameters[model_index], cavity, working_bytes))
+            steps.append(hyper_step(prior, hyperparameters[model_index], cavity, working_bytes, hyper_tolerance))
             hyperparameters[model_index] = steps[-1].hyperparameters
         remaining = np.array([step.start_decrement + step.evidence_gain for step in steps])
         if np.all(remaining <= hyper_tolerance):

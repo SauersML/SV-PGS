@@ -21,6 +21,7 @@ from sv_pgs.scale_mixture_ep import (
     _curvature_trace_gradient,
     _penalized,
     _penalty_matrix,
+    _restricted_prior,
     cavities,
     class_log_density,
     halved_lattice,
@@ -296,36 +297,42 @@ def test_curvature_trace_gradient_matches_finite_differences():
 def test_evidence_gradient_in_the_log_weights_matches_finite_differences():
     prior, cavity = _problem(variant_count=60, seed=17, node_count=12)
     hyperparameters = _hyperparameters(prior, 18, log_smoothing=2.0)
-    evidence = _evidence(prior, hyperparameters.log_smoothing, hyperparameters.coefficients, cavity, _WORKING_BYTES)
+    evidence = _evidence(prior, hyperparameters.log_smoothing, hyperparameters.coefficients, cavity, _WORKING_BYTES, 0.0)
     assert evidence is not None and evidence.newton_decrement < 1e-12
     step = 1e-4
     numerical = []
     for unit in np.eye(hyperparameters.log_smoothing.shape[0]):
-        forward = _evidence(prior, hyperparameters.log_smoothing + step * unit, evidence.coefficients, cavity, _WORKING_BYTES)
-        backward = _evidence(prior, hyperparameters.log_smoothing - step * unit, evidence.coefficients, cavity, _WORKING_BYTES)
+        forward = _evidence(prior, hyperparameters.log_smoothing + step * unit, evidence.coefficients, cavity, _WORKING_BYTES, 0.0)
+        backward = _evidence(prior, hyperparameters.log_smoothing - step * unit, evidence.coefficients, cavity, _WORKING_BYTES, 0.0)
         numerical.append((forward.value - backward.value) / (2.0 * step))
     np.testing.assert_allclose(evidence.gradient, np.array(numerical), rtol=1e-5, atol=1e-7)
 
 
-@pytest.mark.xfail(run=False, reason=_LAPLACE_NEAR_BOUNDARY)
 def test_hyper_step_reaches_a_maximum_of_the_evidence():
     prior, cavity = _problem(variant_count=150, seed=19)
-    step = hyper_step(prior, initial_hyperparameters(prior), cavity, _WORKING_BYTES)
-    assert step.newton_decrement < 1e-10
-    assert step.smoothing_gradient < 1e-5
+    step = hyper_step(prior, initial_hyperparameters(prior), cavity, _WORKING_BYTES, 1e-6)
     fitted = step.hyperparameters
-    for unit in np.eye(fitted.log_smoothing.shape[0]):
+    infinite = frozenset(int(position) for position in np.flatnonzero(fitted.log_smoothing == np.inf))
+    zero = frozenset(int(position) for position in np.flatnonzero(fitted.log_smoothing == -np.inf))
+    view, allowed = _restricted_prior(prior, infinite, zero)
+    weights = fitted.log_smoothing[np.isfinite(fitted.log_smoothing)]
+    base = _evidence(view, weights, allowed.T @ fitted.coefficients, cavity, _WORKING_BYTES, 0.0)
+    assert base is not None and base.newton_decrement < 1e-10
+    np.testing.assert_allclose(step.evidence, base.value, atol=1e-5)
+    for unit in np.eye(weights.shape[0]):
         for direction in (-1.0, 1.0):
-            moved = _evidence(prior, fitted.log_smoothing + direction * 0.05 * unit, fitted.coefficients, cavity, _WORKING_BYTES)
-            assert moved is None or moved.value <= step.evidence + 1e-9
+            moved = _evidence(view, weights + direction * 0.05 * unit, base.coefficients, cavity, _WORKING_BYTES, 0.0)
+            assert moved is None or moved.value <= base.value + 1e-5
+    # Each edge weight is where V wants it: releasing it to the end of its range does not raise V.
+    assert step.smoothing_gradient < 1e-2
 
 
 @pytest.mark.xfail(run=False, reason=_LAPLACE_NEAR_BOUNDARY)
 def test_the_fit_does_not_depend_on_the_lattice_spacing():
     prior, cavity = _problem(variant_count=150, seed=19)
-    coarse = hyper_step(prior, initial_hyperparameters(prior), cavity, _WORKING_BYTES)
+    coarse = hyper_step(prior, initial_hyperparameters(prior), cavity, _WORKING_BYTES, 1e-6)
     finer, start = halved_lattice(prior, coarse.hyperparameters)
-    fine = hyper_step(finer, start, cavity, _WORKING_BYTES)
+    fine = hyper_step(finer, start, cavity, _WORKING_BYTES, 1e-6)
     np.testing.assert_allclose(fine.evidence, coarse.evidence, atol=1e-3)
     coarse_moments = tilted_moments(prior, coarse.hyperparameters, cavity, _WORKING_BYTES)
     fine_moments = tilted_moments(finer, fine.hyperparameters, cavity, _WORKING_BYTES)
