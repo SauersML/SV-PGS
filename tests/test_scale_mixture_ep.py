@@ -648,7 +648,7 @@ def test_total_curvature_matches_ep_resolved_differences_of_the_evidence_gradien
     start = moment_matched_prior_sites(prior, MixtureHyperparameters(coefficients, np.zeros(len(prior.smoothing_blocks))))
     sites, covariance, cavity = _dense_ep(prior, coefficients, likelihood_precision, linear_term, start)
     posterior = GaussianPosterior(
-        solve=lambda right: covariance @ right, variance_jvp=lambda weights: -np.einsum("jk,kr,kj->jr", covariance, weights, covariance)
+        solve=lambda right, _relative_tolerance: covariance @ right, variance_jvp=lambda weights: -np.einsum("jk,kr,kj->jr", covariance, weights, covariance)
     )
     analytic = _total_curvature(prior, coefficients, cavity, posterior, _WORKING_BYTES, 1e-13)
     mapping = prior.coefficient_map
