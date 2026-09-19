@@ -932,8 +932,9 @@ def _total_curvature(
 ) -> F64Array:
     """B = -d2 log Z_EP / dx2 with EP re-solved, in x: M' B_z M (speed-ep, B_PRODUCTS.md), without re-solving EP.
 
-    B_z E = A E + m_x' dh - s2_x' dP / 2, where the cavity response (dh, dP) to a direction E solves the linear
-    response of the EP fixed point:
+    B_z E = A E - m_x' dh + s2_x' dP / 2 (d grad_x log Z_j / dh_j = m_x and d grad_x log Z_j / dP_j = -s2_x / 2, with
+    B the negative derivative), where the cavity response (dh, dP) to a direction E solves the linear response of the
+    EP fixed point:
         (Q + diag tau) dm = (m + m_P / v) dP + m_x E / v          (``posterior.solve``)
         dh = (dm - m_P dP - m_x E) / v
         v^2 dP = -(Sigma o Sigma)_off (dv / v^2 + dP),  dv = v_h dh + v_P dP + v_x E   (``posterior.variance_jvp``)
@@ -968,7 +969,7 @@ def _total_curvature(
     precision_step = solution.reshape(shape)
     shift_step, _next = through(precision_step)
     fixed_cavity = -_data_objective(prior, coefficients, cavity, working_bytes).hessian
-    total_z = fixed_cavity @ directions + _through_z_transposed(prior, derivatives.mean_by_density, derivatives.mean_by_log_scale, shift_step) - 0.5 * (
+    total_z = fixed_cavity @ directions - _through_z_transposed(prior, derivatives.mean_by_density, derivatives.mean_by_log_scale, shift_step) + 0.5 * (
         _through_z_transposed(prior, derivatives.second_by_density, derivatives.second_by_log_scale, precision_step)
     )
     total = directions.T @ total_z
