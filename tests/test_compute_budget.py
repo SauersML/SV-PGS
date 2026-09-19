@@ -44,6 +44,37 @@ def test_cgroup_v2_limit_binds(tmp_path: Path) -> None:
     assert compute_budget._cgroup_memory_headroom_bytes(proc_file, tmp_path / "root") == 750
 
 
+def test_cgroup_v1_limit_on_the_slurm_job_binds_under_unlimited_step_and_task(tmp_path: Path) -> None:
+    # MSI Slurm: the task and step cgroups report the unlimited sentinel, the job holds --mem.
+    proc_file = tmp_path / "proc"
+    _write(proc_file, "3:memory:/slurm/uid_7/job_42/step_batch/task_0\n2:cpuset:/slurm/uid_7/job_42\n")
+    job = tmp_path / "root" / "memory" / "slurm" / "uid_7" / "job_42"
+    for level, limit, usage in (
+        (job / "step_batch" / "task_0", 9223372036854771712, 3 * 2**30),
+        (job / "step_batch", 9223372036854771712, 3 * 2**30),
+        (job, 48 * 2**30, 10 * 2**30),
+        (job.parent, 9223372036854771712, 500 * 2**30),
+    ):
+        _write(level / "memory.limit_in_bytes", f"{limit}\n")
+        _write(level / "memory.usage_in_bytes", f"{usage}\n")
+    headroom = compute_budget._cgroup_memory_headroom_bytes(proc_file, tmp_path / "root")
+    assert headroom == 38 * 2**30
+
+
+def test_cgroup_v2_tightest_ancestor_binds(tmp_path: Path) -> None:
+    proc_file = tmp_path / "proc"
+    _write(proc_file, "0::/machine.slice/job/step\n")
+    root = tmp_path / "root"
+    for level, limit, usage in (
+        (root / "machine.slice" / "job" / "step", "max", "300"),
+        (root / "machine.slice" / "job", "1000", "400"),
+        (root / "machine.slice", "5000", "4800"),
+    ):
+        _write(level / "memory.max", limit + "\n")
+        _write(level / "memory.current", usage + "\n")
+    assert compute_budget._cgroup_memory_headroom_bytes(proc_file, root) == 200
+
+
 def test_cpu_budget_when_no_device_is_exposed(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(compute_budget, "_try_import_cupy", lambda: None)
     monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "")
