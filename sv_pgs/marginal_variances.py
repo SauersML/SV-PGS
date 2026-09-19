@@ -348,6 +348,18 @@ def marginal_variances(solve: BulkSolve, grams: BlockGrams) -> NDArray[np.float6
     block_of = _block_index(grams)
     far = sandwich * far_scale * (float(np.sum(resolved_weight)) - near_totals[block_of])
     variances = np.where(is_resolved, near_variance, near_variance + far)
+    # Every marginal obeys 1 / A_jj <= Sigma_jj (Cauchy-Schwarz, for any positive-definite A). The upper bound
+    # Sigma_jj <= 1 / Pi_j holds only when every site precision is positive: A >= diag(Pi) gives
+    # A^-1 <= diag(Pi)^-1 only for diag(Pi) > 0, and a non-positive resolved site breaks it, since the bulk block
+    # of Sigma^-1 is then Pi_S + Xt_S' (I + Xt_L Pi_L^-1 Xt_L')^-1 Xt_S with an indefinite middle factor
+    # (verify-stage2's counterexample: Xt'Xt = [[1, 1], [1, 1]], Pi = (2, -1/2) gives Sigma_11 = 1 > 1/2). The
+    # approximation can cross the bounds, e.g. when a window's resolved spikes over-subtract, so project onto
+    # the ones that hold, as exact_polish does for its estimates. The certificate still sees the error.
+    column_square_norms = np.concatenate([np.diag(within) for within in grams.within])[np.argsort(np.concatenate(grams.blocks))]
+    lower = 1.0 / (column_square_norms + solve.site_precision)
+    every_site_positive = bool(np.all(solve.site_precision > 0.0))
+    upper = bulk_variance if every_site_positive else np.full(variant_count, np.inf)
+    variances = np.where(is_resolved, variances, np.clip(variances, lower, upper))
     variances[solve.resolved] = resolved_variance
     return variances
 
@@ -463,7 +475,7 @@ def information_solve_tolerance(
     variances: NDArray[np.float64],
     blocks: tuple[NDArray[np.int64], ...],
     column_square_norms: NDArray[np.float64],
-    tolerance: float,
+    tolerance: "float | NDArray[np.float64]",
 ) -> float:
     """The relative residual |r| / |u| that the certificate's K_S solves need.
 
@@ -474,7 +486,8 @@ def information_solve_tolerance(
     residual r leaves the error a_b' K_S^-1 r, and |a_b' K_S^-1 r| <= |a_b| |r|, since K_S >= I. For Rademacher
     z, exactly, E|a_b|^2 = M_b = sum_{j in b, bulk} D_j^2 |xt_j|^2 and E|u|^2 = M, the same sum over every bulk
     site. So E[|a_b| |u|] <= sqrt(M_b M) (Cauchy-Schwarz). With T_b = tr(D - Sigma)_b the block's information
-    from ``variances``, a relative residual of (tolerance / 2) min_b T_b / sqrt(M_b M) suffices.
+    from ``variances``, a relative residual of min_b (tolerance_b / 2) T_b / sqrt(M_b M) suffices. It is +infinity
+    when no block has bulk mass and information (every site resolved): then no solve is needed at all.
     """
     is_bulk = np.ones(solve.site_precision.shape[0], dtype=bool)
     is_bulk[solve.resolved] = False
@@ -482,8 +495,15 @@ def information_solve_tolerance(
     mass = np.square(bulk_variance) * column_square_norms
     removed = np.where(is_bulk, bulk_variance - variances, 0.0)
     total = float(np.sum(mass))
-    ratios = [float(np.sum(removed[members])) / np.sqrt(float(np.sum(mass[members])) * total) for members in blocks if float(np.sum(mass[members])) > 0.0]
-    return 0.5 * tolerance * min(ratios)
+    bound = np.broadcast_to(np.asarray(tolerance, dtype=np.float64), (len(blocks),))
+    # A block with no bulk mass is exact (every site resolved), and one with no information has nothing to
+    # resolve: neither constrains the solve. With none left, the minimum over the empty set is +infinity.
+    ratios = [
+        float(bound[position]) * float(np.sum(removed[members])) / np.sqrt(float(np.sum(mass[members])) * total)
+        for position, members in enumerate(blocks)
+        if float(np.sum(mass[members])) > 0.0 and float(np.sum(removed[members])) > 0.0
+    ]
+    return 0.5 * min(ratios) if ratios else np.inf
 
 
 def block_information_certificate(
