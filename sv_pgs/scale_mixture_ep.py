@@ -1894,15 +1894,18 @@ class OuterFit:
 
 @dataclass(frozen=True)
 class _NewtonB:
-    """The Newton-B step at fixed weights, in the weights' restricted coordinates, with |B + S|'s spectrum."""
+    """The EP evidence's quadratic model at x with fixed weights, in the weights' restricted coordinates: the
+    fixed-cavity gradient g (the EP evidence's own at a fixed point) and B + S's spectrum."""
 
     view: ScaleMixturePrior
     allowed: F64Array
     log_smoothing: F64Array
     origin: F64Array
-    direction: F64Array
+    gradient: F64Array
+    total: F64Array
     eigenvectors: F64Array
-    magnitudes: F64Array
+    eigenvalues: F64Array
+    definite: bool
     decrement: float
 
 
@@ -1913,16 +1916,18 @@ def _penalized_gradient(prior: ScaleMixturePrior, weights: F64Array, coefficient
 
 
 def _metric_decrement(newton: _NewtonB, gradient: F64Array) -> float:
-    """1/2 g'|B + S|^-1 g in the step's own metric."""
+    """1/2 g'(B + S)^-1 g in the step's own metric (B + S positive definite)."""
     components = newton.eigenvectors.T @ gradient
-    return 0.5 * float(np.sum(components * components / newton.magnitudes))
+    return 0.5 * float(np.sum(components * components / newton.eigenvalues))
 
 
 def _newton_b(
     prior: ScaleMixturePrior, log_smoothing: F64Array, coefficients: F64Array, point: FixedPoint, working_bytes: int, tolerance: float
 ) -> _NewtonB:
-    """(B + S)^-1 g at x with the weights ``log_smoothing`` (edges included), on |B + S|'s spectrum where it is
-    indefinite: the EP evidence's own Newton step, never the fixed-cavity one."""
+    """The quadratic model of the EP evidence at x with the weights ``log_smoothing`` (edges included): g, and the
+    total curvature B + S, never the fixed-cavity one. ``decrement`` is 1/2 g'(B + S)^-1 g where B + S is positive
+    definite (a strict maximum's certificate), and infinite elsewhere (a point that is not a maximum certifies
+    nothing, however small g is)."""
     infinite = frozenset(int(position) for position in np.flatnonzero(log_smoothing == np.inf))
     zero = frozenset(int(position) for position in np.flatnonzero(log_smoothing == -np.inf))
     view, allowed = _restricted_prior(prior, infinite, zero)
@@ -1933,17 +1938,26 @@ def _newton_b(
     total = _total_curvature(view, origin, point.cavity, point.posterior, working_bytes, max(tolerance / origin.shape[0], _EPSILON)) + _penalty_matrix(
         view, weights
     )
+    total = 0.5 * (total + total.T)
     eigenvalues, eigenvectors = np.linalg.eigh(total)
-    magnitudes = np.maximum(np.abs(eigenvalues), _EPSILON * float(np.max(np.abs(eigenvalues))))
-    direction = eigenvectors @ ((eigenvectors.T @ gradient) / magnitudes)
+    definite = bool(eigenvalues[0] > 0.0)
+    components = eigenvectors.T @ gradient
     return _NewtonB(
-        view=view, allowed=allowed, log_smoothing=log_smoothing, origin=origin, direction=direction, eigenvectors=eigenvectors,
-        magnitudes=magnitudes, decrement=0.5 * float(gradient @ direction),
+        view=view, allowed=allowed, log_smoothing=log_smoothing, origin=origin, gradient=gradient, total=total, eigenvectors=eigenvectors,
+        eigenvalues=eigenvalues, definite=definite, decrement=0.5 * float(np.sum(components * components / eigenvalues)) if definite else np.inf,
     )
 
 
-def _trial(newton: _NewtonB, length: float) -> MixtureHyperparameters:
-    return MixtureHyperparameters(coefficients=newton.allowed @ (newton.origin + length * newton.direction), log_smoothing=newton.log_smoothing)
+def _trial(newton: _NewtonB, step: F64Array) -> MixtureHyperparameters:
+    return MixtureHyperparameters(coefficients=newton.allowed @ (newton.origin + step), log_smoothing=newton.log_smoothing)
+
+
+def _proposal(newton: _NewtonB, radius: float) -> F64Array:
+    """The step: Newton's (B + S)^-1 g where B + S is positive definite, else the maximizer of the quadratic model
+    inside ``radius`` (More and Sorensen), which follows B + S's negative curvature out of a saddle."""
+    if newton.definite:
+        return newton.eigenvectors @ ((newton.eigenvectors.T @ newton.gradient) / newton.eigenvalues)
+    return _trust_region_step(newton.total, newton.gradient, radius)
 
 
 def fit_hyperparameters(
@@ -1953,16 +1967,22 @@ def fit_hyperparameters(
     never plain EP-EM).
 
     At an EP fixed point the EP evidence's x-gradient is the fixed-cavity g, and its negative Hessian is the total
-    curvature B + S. Each outer step sets the weights by ``hyper_step`` at the current fixed point, then moves x by
-    (B + S)^-1 g. The fixed-cavity maximizer (the EM step) solves with A + S instead: to first order it maps the
-    error e to (I - (A + S)^-1 (B + S)) e, which diverges wherever that pencil has an eigenvalue above 2.
-    speed-floor measured [0.89, 5.4] at production [semi-real].
+    curvature B + S. Each outer step sets the weights by ``hyper_step`` at the current fixed point, then moves x on
+    the quadratic model (g, B + S). The fixed-cavity maximizer (the EM step) solves with A + S instead: to first
+    order it maps the error e to (I - (A + S)^-1 (B + S)) e, which diverges wherever that pencil has an eigenvalue
+    above 2. speed-floor measured [0.89, 5.4] at production [semi-real].
 
-    A trial is accepted by the natural monotonicity test (Deuflhard, Newton Methods for Nonlinear Problems, 2004,
-    Section 3.1.4): at the trial's fixed point, g'|B + S|^-1 g, taken with the step's own B + S, must fall, and
-    otherwise the step halves. The test needs no evidence value, which a full-data fixed point does not give, and it
-    is invariant to x's coordinates. The loop stops when, for every model, the decrement plus the weights' remaining
-    gain is at most ``tolerance``.
+    - Where B + S is positive definite the step is Newton's, accepted by the natural monotonicity test (Deuflhard,
+      Newton Methods for Nonlinear Problems, 2004, Section 3.1.4): at the trial's fixed point g'(B + S)^-1 g, taken
+      with the step's own B + S, must fall, and otherwise the step halves. It needs no evidence value, which a
+      full-data fixed point does not give, and it is invariant to x's coordinates.
+    - Where B + S is indefinite (real LD can make it so: bug-recent, 17q21.31 [semi-real]) the step maximizes the
+      model inside a radius (More and Sorensen), and is accepted when the evidence rises along it. With no evidence
+      value, the rise is the trapezoid rule of the path integral of the gradient, (g_x + g_trial)' s / 2, exact for
+      a quadratic. A refused trial halves the radius; an accepted one that reached it doubles it. The radius starts
+      at the length of the step on |B + S|.
+    The loop stops when, for every model, B + S is positive definite and the Newton decrement plus the weights'
+    remaining gain is at most ``tolerance``: a saddle is never certified.
 
     Each call of ``fixed_points`` passes every model's current hyperparameters, so on return its state is each
     model's certified fixed point.
@@ -1971,7 +1991,8 @@ def fit_hyperparameters(
     hyperparameters = list(starts)
     points = list(fixed_points(hyperparameters))
     fits: list[OuterFit | None] = [None] * count
-    pending: list[tuple[_NewtonB, HyperStep, float] | None] = [None] * count
+    pending: list[tuple[_NewtonB, HyperStep, F64Array, float] | None] = [None] * count
+    radii: list[float | None] = [None] * count
     iterations, halvings = [0] * count, [0] * count
     while True:
         for model in range(count):
@@ -1986,8 +2007,12 @@ def fit_hyperparameters(
                     hyperparameters=hyperparameters[model], step=step, newton_decrement=newton.decrement, remaining_gain=remaining,
                     iterations=iterations[model], halvings=halvings[model],
                 )
-            else:
-                pending[model] = (newton, step, 1.0)
+                continue
+            radius = radii[model]
+            if radius is None:
+                magnitudes = np.maximum(np.abs(newton.eigenvalues), _EPSILON * float(np.max(np.abs(newton.eigenvalues))))
+                radius = float(np.linalg.norm((newton.eigenvectors.T @ newton.gradient) / magnitudes))
+            pending[model] = (newton, step, _proposal(newton, radius), radius)
         if all(fit is not None for fit in fits):
             return [fit for fit in fits if fit is not None]
         trials = [hyperparameters[model] if entry is None else _trial(entry[0], entry[2]) for model, entry in enumerate(pending)]
@@ -1996,17 +2021,27 @@ def fit_hyperparameters(
             if entry is None:
                 points[model] = trial_points[model]
                 continue
-            newton, step, length = entry
+            newton, step, proposal, radius = entry
             gradient = _penalized_gradient(
-                newton.view, newton.log_smoothing[np.isfinite(newton.log_smoothing)], newton.allowed.T @ trials[model].coefficients,
-                trial_points[model].cavity, working_bytes,
+                newton.view, newton.log_smoothing[np.isfinite(newton.log_smoothing)], newton.origin + proposal, trial_points[model].cavity, working_bytes,
             )
-            if _metric_decrement(newton, gradient) < newton.decrement:
+            if newton.definite:
+                accepted = _metric_decrement(newton, gradient) < newton.decrement
+            else:
+                accepted = 0.5 * float((newton.gradient + gradient) @ proposal) > 0.0
+            length = float(np.linalg.norm(proposal))
+            if accepted:
                 hyperparameters[model], points[model], pending[model] = trials[model], trial_points[model], None
                 iterations[model] += 1
+                if not newton.definite:
+                    radii[model] = 2.0 * radius if length >= radius * (1.0 - _HALF_PRECISION) else radius
                 continue
-            length *= 0.5
             halvings[model] += 1
-            if length * float(np.max(np.abs(newton.direction))) <= _HALF_PRECISION * (1.0 + float(np.max(np.abs(newton.origin)))):
+            if length <= _HALF_PRECISION * (1.0 + float(np.max(np.abs(newton.origin)))):
                 raise FloatingPointError("the Newton-B step makes no certified progress at the EP fixed point")
-            pending[model] = (newton, step, length)
+            if newton.definite:
+                pending[model] = (newton, step, 0.5 * proposal, radius)
+            else:
+                radius = 0.5 * length
+                radii[model] = radius
+                pending[model] = (newton, step, _proposal(newton, radius), radius)

@@ -15,7 +15,7 @@ from sv_pgs.config import ModelConfig, TraitType
 from sv_pgs.dosage_store import DosageStore
 from sv_pgs.dual_solve import DualGaussian, StreamedDualSource
 from sv_pgs.fast_scoring import ScoringPlan, score_genetic
-from sv_pgs.full_data_fit import covariate_residual_variance, fit_full_data, scoring_models, stage0_lattice
+from sv_pgs.full_data_fit import block_grams, covariate_residual_variance, fit_full_data, scoring_models, stage0_lattice
 from sv_pgs.genotype_statistics import DosageStoreTileSource, compute_genotype_statistics
 from sv_pgs.scale_mixture_ep import scale_mixture_prior
 from sv_pgs.store_block_source import StoreGenotypeBlockSource
@@ -98,7 +98,8 @@ def test_stage2_from_the_prior_is_certified_and_scores_the_held_out_samples(tmp_
     )
     source = StreamedDualSource(StoreGenotypeBlockSource.from_statistics(store, statistics, _budget(), _WORKSPACE_BYTES))
     gaussian = DualGaussian(
-        source=source, training=mask, targets=targets[:, None], offsets=np.zeros((_SAMPLES, 1)), covariates=store_covariates, probe_count=_DRAWS, seed=11
+        source=source, training=mask, targets=targets[:, None], offsets=np.zeros((_SAMPLES, 1)), covariates=store_covariates,
+        grams=block_grams(statistics, start_noise), probe_count=_DRAWS, seed=11,
     )
     fit = fit_full_data(gaussian=gaussian, statistics=statistics, prior=prior, draw_count=_DRAWS, working_bytes=1 << 22, seed=13)
     certificate = fit.certificate
