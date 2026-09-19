@@ -38,7 +38,7 @@ from typing import Any, Callable, Iterator, Sequence
 from cyvcf2 import VCF
 import numpy as np
 
-from sv_pgs._typing import BoolArray, I64Array, NDArray, U8Array
+from sv_pgs._typing import BoolArray, F64Array, I64Array, NDArray, U8Array
 from sv_pgs.compute_budget import ComputeBudget
 from sv_pgs.dosage_store import (
     CODES_PER_DOSAGE,
@@ -451,7 +451,9 @@ class ExpectedSites:
 class DecodedBatch:
     """One batch's codes [records, batch samples] and its exact per-record, per-group sums and
     counts of measured dosages [records, groups]. A hard-call half's no-call is MISSING_CODE here
-    until ``assemble_half`` fills it; ``no_calls`` counts them per record."""
+    until ``assemble_half`` fills it; ``no_calls`` counts them per record. ``reported_info`` is an
+    imputed batch's INFO/INFO per record (the imputation's own r^2 over the batch's samples), and
+    empty for a hard-call batch."""
 
     codes: U8Array
     group_sums: I64Array
@@ -460,6 +462,7 @@ class DecodedBatch:
     unmatched_low: I64Array
     no_calls: I64Array
     sample_ids: tuple[str, ...]
+    reported_info: F64Array
 
 
 def _gate(condition: bool, path: Path, record: int, detail: str) -> None:
@@ -524,6 +527,8 @@ def _decode_records(
         zeroed = np.zeros(record_count, dtype=np.int64)
         unmatched_low = np.zeros(record_count, dtype=np.int64)
         no_calls = np.zeros(record_count, dtype=np.int64)
+        # Only an imputed batch, the one with a background to remove, carries the imputation's INFO/INFO.
+        reported_info = np.empty(record_count if remove_background else 0, dtype=np.float64)
         block_rows = _block_rows(budget, sample_count, DECODE_STEP_BYTES_PER_ENTRY, record_count)
         block = np.empty((block_rows, sample_count), dtype=np.uint16)
         members = [groups == group for group in range(group_count)]
@@ -549,6 +554,10 @@ def _decode_records(
             _gate(record.POS == int(expected.positions[row]), path, row, "POS differs from the sidecar")
             _gate(refalt_digest(record.REF, ",".join(record.ALT)) == int(expected.refalt_digests[row]), path, row, "REF/ALT differ")
             _gate(str(record.INFO.get("ID")) == expected.identifiers[row], path, row, "INFO/ID differs")
+            if remove_background:
+                info = record.INFO.get("INFO")
+                _gate(info is not None and 0.0 <= float(info) <= 1.0, path, row, "INFO/INFO missing or outside [0, 1]")
+                reported_info[row] = float(info)
             block[row % block_rows] = record_dosage_milli(record, path, row).astype(np.uint16)
             row += 1
             if row % block_rows == 0:
@@ -567,6 +576,7 @@ def _decode_records(
         unmatched_low=unmatched_low,
         no_calls=no_calls,
         sample_ids=sample_ids,
+        reported_info=reported_info,
     )
 
 
@@ -582,7 +592,8 @@ def decode_batch(
 
     Records must match ``expected`` one for one (POS, md5 of REF/ALT, INFO/ID; gate G2), and
     every sample needs DS and GP with GP summing to 1 and DS = GP1 + 2 GP2 to within a
-    thousandth (G4). The value-matched background is removed before encoding. ``codes_path``
+    thousandth (G4). Every record needs INFO/INFO in [0, 1], which the same read returns. The
+    value-matched background is removed before encoding. ``codes_path``
     receives the codes as an .npy; ``sample_groups`` gives each of the file's samples, in header
     order, its ancestry group in 0..group_count-1. Records are decoded in steps whose working
     set fits ``budget``'s host memory.

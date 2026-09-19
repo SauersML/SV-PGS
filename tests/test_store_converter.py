@@ -237,12 +237,18 @@ _SITES = [
 ]
 
 
-def _write_batch(path, dosages) -> None:
-    """A popped batch: GT:DS:GP with GP consistent with DS; ``dosages`` is [records][samples]."""
+def _reported_info(identifier: str) -> float:
+    """The synthetic INFO/INFO of a site."""
+    return {"snv1": 0.98, "ins1": 0.61, "snv2": 0.3}[identifier]
+
+
+def _write_batch(path, dosages, omit_info=False) -> None:
+    """A popped batch: GT:DS:GP with GP consistent with DS, and INFO/INFO; ``dosages`` is [records][samples]."""
     samples = len(dosages[0])
     lines = [
         "##fileformat=VCFv4.2",
         '##INFO=<ID=ID,Number=1,Type=String,Description="atomic id">',
+        '##INFO=<ID=INFO,Number=1,Type=Float,Description="imputation r2">',
         '##FORMAT=<ID=GT,Number=1,Type=String,Description="genotype">',
         '##FORMAT=<ID=DS,Number=1,Type=Float,Description="dosage">',
         '##FORMAT=<ID=GP,Number=G,Type=Float,Description="genotype probabilities">',
@@ -255,7 +261,8 @@ def _write_batch(path, dosages) -> None:
             second = max(dosage - 1.0, 0.0)
             first = dosage - 2.0 * second
             fields.append(f"0|0:{dosage:.3f}:{1.0 - first - second:.3f},{first:.3f},{second:.3f}")
-        lines.append("\t".join(["chr22", str(position), ".", ref, alt, ".", "PASS", f"ID={identifier}", "GT:DS:GP", *fields]))
+        info = "" if omit_info else f";INFO={_reported_info(identifier):.3f}"
+        lines.append("\t".join(["chr22", str(position), ".", ref, alt, ".", "PASS", f"ID={identifier}{info}", "GT:DS:GP", *fields]))
     path.write_text("\n".join(lines) + "\n")
 
 
@@ -345,6 +352,18 @@ def test_decode_batch_fails_closed_on_a_sidecar_mismatch(tmp_path) -> None:
 
     with pytest.raises(ValueError, match="record 1: POS differs"):
         decode_batch(path, shifted, np.zeros(2, dtype=np.int64), 1, tmp_path / "codes.npy", _BUDGET)
+
+
+def test_decode_batch_returns_info_from_the_same_read_and_needs_it(tmp_path) -> None:
+    path = tmp_path / "batch.vcf"
+    _write_batch(path, _BATCH_DOSAGES[1])
+    decoded = decode_batch(path, _expected_sites(), np.zeros(2, dtype=np.int64), 1, tmp_path / "codes.npy", _BUDGET)
+    # htslib holds INFO floats as float32.
+    np.testing.assert_allclose(decoded.reported_info, [_reported_info(site[3]) for site in _SITES], rtol=np.finfo(np.float32).eps)
+
+    _write_batch(path, _BATCH_DOSAGES[1], omit_info=True)
+    with pytest.raises(ValueError, match="record 0: INFO/INFO missing"):
+        decode_batch(path, _expected_sites(), np.zeros(2, dtype=np.int64), 1, tmp_path / "codes.npy", _BUDGET)
 
 
 def test_assemble_half_applies_the_linear_recalibration(tmp_path) -> None:
@@ -440,7 +459,7 @@ def test_a_long_read_half_joins_the_imputed_halves_on_the_same_sites(tmp_path) -
     codes = store.read_codes(0, 3)
     assert codes.shape == (3, 7)
     np.testing.assert_array_equal(codes[:, 5:], [[127, 254], [0, 127], [254, 0]])
-    assert long_read.zeroed.tolist() == [0, 0, 0]
+    assert long_read.zeroed.tolist() == [0, 0, 0] and long_read.reported_info.size == 0
     assert store.statistic("no_calls").tolist() == [0, 0, 0]
     assert read_manifest(root)["attributes"]["half_measurements"] == ["imputed_dosage", "long_read_calls"]
 

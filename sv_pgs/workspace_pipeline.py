@@ -1020,31 +1020,10 @@ def _start_decoder(expected: ExpectedSites, group_count: int, budget: ComputeBud
     _DECODER.update(expected=expected, group_count=group_count, budget=budget)
 
 
-def read_reported_info(path: Path, record_count: int) -> F64Array:
-    """Each record's INFO/INFO, the imputation's own r^2 over the batch's samples, which must lie in [0, 1]."""
-    values = np.empty(record_count, dtype=np.float64)
-    reader = VCF(str(path))
-    try:
-        for row, record in enumerate(reader):
-            if row >= record_count:
-                raise ValueError(f"{path}: more records than the strata sidecar's {record_count}.")
-            info = record.INFO.get("INFO")
-            if info is None or not 0.0 <= float(info) <= 1.0:
-                raise ValueError(f"{path} record {row}: INFO/INFO is missing or outside [0, 1].")
-            values[row] = float(info)
-    finally:
-        reader.close()
-    return values
-
-
 def _decode(task: _DecodeTask) -> None:
-    """Decode one batch file and write its codes, then its statistics, whose presence marks the batch done.
-
-    An imputed batch's INFO/INFO takes a second read of the file; store_converter.decode_batch does not return it.
-    """
+    """Decode one batch file and write its codes, then its statistics, whose presence marks the batch done."""
     decode = decode_called_batch if task.called else decode_batch
-    expected = _DECODER["expected"]
-    decoded = decode(task.path, expected, task.groups, _DECODER["group_count"], task.codes_path, _DECODER["budget"])
+    decoded = decode(task.path, _DECODER["expected"], task.groups, _DECODER["group_count"], task.codes_path, _DECODER["budget"])
     temporary = task.statistics_path.with_name(task.statistics_path.stem + ".partial.npz")
     np.savez(
         temporary,
@@ -1054,7 +1033,7 @@ def _decode(task: _DecodeTask) -> None:
         unmatched_low=decoded.unmatched_low,
         no_calls=decoded.no_calls,
         sample_ids=np.array(decoded.sample_ids),
-        reported_info=np.empty(0) if task.called else read_reported_info(task.path, expected.positions.shape[0]),
+        reported_info=decoded.reported_info,
     )
     os.replace(temporary, task.statistics_path)
 
@@ -1594,8 +1573,7 @@ _STEPS = (
         _store_inputs,
         (
             store_converter, dosage_store, variant_typing, _store_step, _convert_chromosome, read_strata_sites, read_popped_sites,
-            read_bubble_paths, path_counts, read_tandem_repeats, store_variant_classes, read_reported_info, _decode, _decode_tasks,
-            _gather_calibration,
+            read_bubble_paths, path_counts, read_tandem_repeats, store_variant_classes, _decode, _decode_tasks, _gather_calibration,
         ),
         _store_step,
     ),
