@@ -11,17 +11,7 @@ import pytest
 from scipy.special import expit
 
 from sv_pgs.config import TraitType
-from sv_pgs.exact_polish import (
-    DenseGenotypeBlockSource,
-    FullDataGaussian,
-    GaussianModel,
-    _BlockJacobi,
-    _conjugate_gradient,
-    _Device,
-    _Operator,
-    _Reads,
-    _SampleSystem,
-)
+from sv_pgs.exact_polish import DenseGenotypeBlockSource, FullDataGaussian, GaussianModel
 
 
 def _simulate(*, sample_count: int, variant_count: int, seed: int):
@@ -85,44 +75,31 @@ def _models(quantitative, binary) -> list[GaussianModel]:
     ]
 
 
-def test_operator_and_conjugate_gradient_match_the_dense_restricted_precision():
+def test_one_iteration_gives_every_quantitative_model_its_exact_mean_on_its_mask():
     genotypes, covariates, quantitative, binary, masks = _simulate(sample_count=300, variant_count=90, seed=1)
-    models = _models(quantitative, binary)
+    second = quantitative[::-1].copy()
+    models = [
+        GaussianModel(TraitType.QUANTITATIVE, quantitative, 0, np.zeros(300)),
+        GaussianModel(TraitType.QUANTITATIVE, second, 1, np.full(300, 0.1)),
+        GaussianModel(TraitType.QUANTITATIVE, quantitative, 1, np.zeros(300)),
+    ]
     source = DenseGenotypeBlockSource(genotypes, _blocks(90, 20))
-    device = _Device(np)
-    system = _SampleSystem(device=device, models=models, covariates=covariates, sample_masks=masks)
-    generator = np.random.default_rng(2)
-    linear_predictor = generator.standard_normal((300, 3)) * 0.5
+    precision, shift = _sites(90, 3, seed=3)
     noise_variance = np.array([0.8, 1.0, 1.3])
-    curvature = system.curvature(linear_predictor, noise_variance)
-    inverses = system.covariate_inverses(curvature)
-    precision, _shift = _sites(90, 3, seed=3)
-    precision[precision == 0.0] = 1e-3
-    reads = _Reads(source)
-    operator = _Operator(reads=reads, system=system, curvature=curvature, covariate_inverses=inverses, site_precision=precision)
-    column_models = np.array([0, 1, 2, 1, 0, 2, 2])
-    directions = generator.standard_normal((90, column_models.size))
-    applied, image = operator.apply(directions, column_models)
-    assert reads.count == 2
-    dense = [_dense_precision(genotypes, covariates, curvature[:, model_index], precision[:, model_index]) for model_index in range(3)]
-    for column, model_index in enumerate(column_models):
-        np.testing.assert_allclose(applied[:, column], dense[model_index] @ directions[:, column], rtol=1e-10, atol=1e-10)
-        np.testing.assert_allclose(image[:, column], genotypes @ directions[:, column], rtol=1e-10, atol=1e-10)
-    preconditioner = _BlockJacobi(
-        reads=reads, system=system, curvature=curvature, site_precision=precision, exact_curvature=np.array([False, True, False])
+    gaussian = FullDataGaussian(
+        source=source, models=models, covariates=covariates, sample_masks=masks, initial_mean=np.zeros((90, 3)), probe_count=3, seed=2
     )
-    right_hand_side = generator.standard_normal((90, column_models.size))
-    solution, solution_image, residual = _conjugate_gradient(
-        operator=operator,
-        preconditioner=preconditioner,
-        right_hand_side=right_hand_side,
-        column_models=column_models,
-        tolerance=1e-13,
+    gaussian.iterate(
+        site_precision=precision, site_shift=shift, noise_variance=noise_variance, tolerance=1e-13, refactor=True, exact_curvature=_exact(gaussian)
     )
-    assert np.all(residual <= 1e-13)
-    for column, model_index in enumerate(column_models):
-        np.testing.assert_allclose(solution[:, column], np.linalg.solve(dense[model_index], right_hand_side[:, column]), rtol=1e-9, atol=1e-11)
-    np.testing.assert_allclose(solution_image, genotypes @ solution, rtol=1e-9, atol=1e-10)
+    for model_index, model in enumerate(models):
+        weights = masks[model.sample_mask_index] / noise_variance[model_index]
+        dense = _dense_precision(genotypes, covariates, weights, precision[:, model_index])
+        expected = np.linalg.solve(
+            dense, genotypes.T @ _projector(covariates, weights) @ (model.targets - model.predictor_offset) + shift[:, model_index]
+        )
+        np.testing.assert_allclose(gaussian.mean[:, model_index], expected, rtol=1e-8, atol=1e-10)
+    np.testing.assert_allclose(gaussian.genetic_image, genotypes @ gaussian.mean, rtol=1e-9, atol=1e-10)
 
 
 def test_one_quantitative_iteration_gives_the_exact_restricted_posterior_mean():
@@ -239,17 +216,19 @@ def test_draws_have_the_posterior_mean_and_covariance():
     np.testing.assert_allclose(sample_correlation, covariance / np.outer(standard_deviation, standard_deviation), atol=0.04)
 
 
-def test_reads_per_iteration():
+def test_an_iteration_reads_the_blocks_once_plus_once_per_conjugate_gradient_iteration():
     genotypes, covariates, quantitative, binary, masks = _simulate(sample_count=120, variant_count=30, seed=16)
-    models = [GaussianModel(TraitType.QUANTITATIVE, quantitative, 0, np.zeros(120))]
+    models = [GaussianModel(TraitType.QUANTITATIVE, quantitative, 0, np.zeros(120)), GaussianModel(TraitType.BINARY, binary, 1, np.zeros(120))]
     source = DenseGenotypeBlockSource(genotypes, _blocks(30, 10))
-    precision, shift = _sites(30, 1, seed=17)
+    precision, shift = _sites(30, 2, seed=17)
     gaussian = FullDataGaussian(
-        source=source, models=models, covariates=covariates, sample_masks=masks, initial_mean=np.zeros((30, 1)), probe_count=2, seed=18
+        source=source, models=models, covariates=covariates, sample_masks=masks, initial_mean=np.zeros((30, 2)), probe_count=2, seed=18
     )
     assert gaussian.reads.count == 1
-    gaussian.iterate(site_precision=precision, site_shift=shift, noise_variance=np.ones(1), tolerance=1e-10, refactor=True, exact_curvature=_exact(gaussian))
-    after_first = gaussian.reads.count
-    assert (after_first - 1 - 1 - 1) % 2 == 0
-    gaussian.iterate(site_precision=precision, site_shift=shift, noise_variance=np.ones(1), tolerance=1e-10, refactor=False, exact_curvature=_exact(gaussian))
-    assert (gaussian.reads.count - after_first - 1) % 2 == 0
+    for refactor in (True, False, True):
+        before = gaussian.reads.count
+        gaussian.iterate(
+            site_precision=precision, site_shift=shift, noise_variance=np.ones(2), tolerance=1e-10, refactor=refactor, exact_curvature=_exact(gaussian)
+        )
+        assert gaussian.conjugate_gradient_iterations >= 1
+        assert gaussian.reads.count - before == 1 + gaussian.conjugate_gradient_iterations

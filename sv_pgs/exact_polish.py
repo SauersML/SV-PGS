@@ -19,13 +19,18 @@ g the full-data gradient of the log-likelihood plus the log sites; for a
 quantitative trait one step gives the exact mean, and a binary step backtracks
 on the penalized log-likelihood (strictly concave, so Newton converges).
 
-Solve. A is applied by two reads of the genotype blocks (X d, then X' P_W X d);
-every model, probe and draw is a column of the same reads. Conjugate gradients
-is preconditioned by the block-Jacobi inverse: each LD block's restricted
-precision X_b' P_W X_b + diag(tau_b), at the model's exact curvature or, when
-asked, at its mean curvature on the mask (one Gram per mask serves every
-model on it). The answer depends only on the exact operator; the blocks set
-the rate.
+Solve. Conjugate gradients is preconditioned by the block-Jacobi inverse M^-1:
+each LD block's restricted precision X_b' P_W X_b + diag(tau_b), at the model's
+exact curvature or at its mean curvature on the mask (one Gram per mask serves
+every model on it). Every model, probe and draw is a column of the same reads,
+and every model's columns (its mean step and probes, or its draws) share one
+block-Krylov space, so the probes' directions also serve the mean. One read
+serves one block-CG iteration: with X P known, a read forms
+A P = X' P_W (X P) + diag(tau) P and M^-1 A P block by block and accumulates
+X M^-1 A P, so the next block's image follows by linearity. The
+iteration's first read also factors the blocks, evaluates the start residuals
+and starts CG, so an iteration costs 1 + (CG iterations) reads. The answer
+depends only on the exact operator; the blocks set the rate.
 
 Variances. diag(A^-1) is estimated by the control-variate Hutchinson identity
 
@@ -39,8 +44,8 @@ the variances are exact.
 
 Certificate. The first read of every iteration evaluates, at the state the
 iteration starts from, the exact gradient g, the covariate gradient and the
-residual z - A x of every probe system. The iteration then solves the
-corrections from zero.
+residual z - A x of every probe system, and diag(A) for the variance bounds.
+The iteration then solves the corrections from zero.
 
 Draws. beta + A^-1 (X' s + sqrt(tau) e) with s = W^1/2 e_n minus its weighted
 projection onto the covariates, e and e_n standard normal, is an exact draw of
@@ -53,7 +58,7 @@ variant-side arrays live on the host and move per block.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Iterator, Protocol, Sequence
+from typing import Any, Callable, Iterator, Protocol, Sequence
 
 import numpy as np
 from numpy.typing import NDArray
@@ -61,6 +66,9 @@ from numpy.typing import NDArray
 from sv_pgs.config import TraitType
 
 _MAXIMUM_CONJUGATE_GRADIENT_ITERATIONS = 400
+# SVQB drops a model's direction whose squared norm in its block falls below this
+# fraction of the largest (a converged or dependent column), so block CG cannot break down.
+_DIRECTION_DROP = 1e-20
 # Backtracking of a binary model's Newton step on its penalized log-likelihood.
 _MINIMUM_NEWTON_STEP = 2.0**-30
 # Newton iterations and relative step tolerance of the covariate-only fit at the start.
@@ -286,15 +294,28 @@ class _SampleSystem:
 
 
 class _Reads:
-    """The genotype block reads (all models together) an E-step has made."""
+    """One read of the genotype blocks, counted: X_b' left per block, then X_b right accumulated."""
 
-    def __init__(self, source: GenotypeBlockSource) -> None:
+    def __init__(self, source: GenotypeBlockSource, device: _Device) -> None:
         self.source = source
+        self.device = device
         self.count = 0
 
-    def tiles(self) -> Iterator[tuple[int, GenotypeBlockTile]]:
+    def sweep(self, left: Any, local: Callable[[int, NDArray, GenotypeBlockTile, Any], Any], image_columns: int) -> Any:
+        """For every block b: right_b = local(b, variants, tile, X_b' left); returns sum_b X_b right_b (n, image_columns).
+
+        ``left`` may be None (no transposed product); ``local`` may return None (no image).
+        """
+        array_module = self.device.array_module
         self.count += 1
-        return self.source.iter_tiles()
+        image = array_module.zeros((self.source.sample_count, image_columns), dtype=array_module.float64)
+        for block_index, tile in self.source.iter_tiles():
+            variants = self.source.block_variant_indices[block_index]
+            products = None if left is None else tile.rmatmat(left)
+            right = local(block_index, variants, tile, products)
+            if right is not None:
+                image += tile.matmat(right)
+        return image
 
 
 def _spd_inverse(array_module: Any, matrices: Any) -> tuple[Any, Any]:
@@ -308,156 +329,209 @@ def _spd_inverse(array_module: Any, matrices: Any) -> tuple[Any, Any]:
     return inverse, inverse_diagonal
 
 
+def _restricted_gram(array_module: Any, tile: GenotypeBlockTile, weights: Any, covariates: Any) -> Any:
+    """X_b' P_W X_b for an (n,) weight vector, with the module's covariate ridge."""
+    cross = tile.weighted_cross(weights, covariates)
+    covariate_gram = covariates.T @ (weights[:, None] * covariates)
+    covariate_count = int(covariates.shape[1])
+    ridge = _COVARIATE_RIDGE * array_module.trace(covariate_gram) / covariate_count
+    normal = covariate_gram + ridge * array_module.eye(covariate_count)
+    return tile.weighted_gram(weights) - cross @ array_module.linalg.solve(normal, cross.T)
+
+
 class _BlockJacobi:
-    """Per block and model, the inverse of the block's restricted precision, built in one read.
+    """Per block and model, the inverse of the block's restricted precision, factored block by block in a read.
 
     A model marked in ``exact_curvature`` uses X_b' P_W X_b at its own
     curvature; the others use mean(w_m) X_b' P_mask X_b, which is exact for a
     quantitative model (constant curvature on its mask).
     """
 
-    def __init__(
-        self, *, reads: _Reads, system: _SampleSystem, curvature: Any, site_precision: NDArray, exact_curvature: NDArray
-    ) -> None:
-        device = system.device
-        array_module = device.array_module
-        source = reads.source
-        used_masks = [int(mask_index) for mask_index in np.unique(system.mask_index)]
-        mean_curvature = curvature.sum(axis=0) / array_module.asarray(system.training_count)
-        self.block_variant_indices = source.block_variant_indices
+    def __init__(self, *, system: _SampleSystem, curvature: Any, site_precision: NDArray, exact_curvature: NDArray) -> None:
+        array_module = system.device.array_module
+        self.system = system
+        self.curvature = curvature
+        self.site_precision = site_precision
+        self.exact_curvature = np.asarray(exact_curvature, dtype=bool)
+        self.mean_curvature = curvature.sum(axis=0) / array_module.asarray(system.training_count)
         self.model_count = int(system.mask_index.shape[0])
-        self.inverse: list[Any] = []
+        self.inverse: dict[int, Any] = {}
         self.inverse_diagonal = np.empty_like(site_precision)
-        for block_index, tile in reads.tiles():
-            variants = source.block_variant_indices[block_index]
-            mask_grams = {}
-            for mask_index in used_masks:
-                weights = system.sample_masks[mask_index]
-                cross = tile.weighted_cross(weights, system.covariates)
-                covariate_gram = system.covariates.T @ (weights[:, None] * system.covariates)
-                ridge = _COVARIATE_RIDGE * array_module.trace(covariate_gram) / system.covariate_count
-                normal = covariate_gram + ridge * array_module.eye(system.covariate_count)
-                mask_grams[mask_index] = tile.weighted_gram(weights) - cross @ array_module.linalg.solve(normal, cross.T)
-            model_grams = []
-            for model_index, mask_index in enumerate(system.mask_index):
-                if exact_curvature[model_index]:
-                    weights = curvature[:, model_index]
-                    cross = tile.weighted_cross(weights, system.covariates)
-                    covariate_gram = system.covariates.T @ (weights[:, None] * system.covariates)
-                    ridge = _COVARIATE_RIDGE * array_module.trace(covariate_gram) / system.covariate_count
-                    normal = covariate_gram + ridge * array_module.eye(system.covariate_count)
-                    model_grams.append(tile.weighted_gram(weights) - cross @ array_module.linalg.solve(normal, cross.T))
-                else:
-                    model_grams.append(mean_curvature[model_index] * mask_grams[int(mask_index)])
-            matrices = array_module.stack(model_grams)
-            diagonal = array_module.arange(int(matrices.shape[1]))
-            matrices[:, diagonal, diagonal] += array_module.asarray(site_precision[variants]).T
-            inverse, inverse_diagonal = _spd_inverse(array_module, matrices)
-            self.inverse.append(inverse)
-            self.inverse_diagonal[variants] = device.to_host(inverse_diagonal).T
+        self.block_variant_indices: dict[int, NDArray] = {}
 
-    def apply(self, device: _Device, values: NDArray, column_models: NDArray) -> NDArray:
-        """B applied to every column of a (p, c) host array (one product per block and model)."""
-        array_module = device.array_module
+    def factor_block(self, block_index: int, variants: NDArray, tile: GenotypeBlockTile) -> None:
+        system = self.system
+        array_module = system.device.array_module
+        mask_grams = {
+            int(mask_index): _restricted_gram(array_module, tile, system.sample_masks[int(mask_index)], system.covariates)
+            for mask_index in np.unique(system.mask_index[~self.exact_curvature])
+        }
+        model_grams = [
+            _restricted_gram(array_module, tile, self.curvature[:, model_index], system.covariates)
+            if self.exact_curvature[model_index]
+            else self.mean_curvature[model_index] * mask_grams[int(mask_index)]
+            for model_index, mask_index in enumerate(system.mask_index)
+        ]
+        matrices = array_module.stack(model_grams)
+        diagonal = array_module.arange(int(matrices.shape[1]))
+        matrices[:, diagonal, diagonal] += array_module.asarray(self.site_precision[variants]).T
+        inverse, inverse_diagonal = _spd_inverse(array_module, matrices)
+        self.inverse[block_index] = inverse
+        self.inverse_diagonal[variants] = system.device.to_host(inverse_diagonal).T
+        self.block_variant_indices[block_index] = variants
+
+    def apply_block(self, block_index: int, block_values: Any, column_models: NDArray) -> Any:
+        """B_b applied to a (p_b, c) device block, one product per model."""
+        array_module = self.system.device.array_module
+        result = array_module.empty_like(block_values)
+        for model_index in range(self.model_count):
+            columns = np.flatnonzero(column_models == model_index)
+            if columns.size:
+                result[:, columns] = self.inverse[block_index][model_index] @ block_values[:, columns]
+        return result
+
+    def apply(self, values: NDArray, column_models: NDArray) -> NDArray:
+        """B applied to every column of a (p, c) host array (no read)."""
+        device = self.system.device
         result = np.empty_like(values)
-        model_columns = [np.flatnonzero(column_models == model_index) for model_index in range(self.model_count)]
-        for block_index, variants in enumerate(self.block_variant_indices):
-            block_values = array_module.asarray(values[variants])
-            block_result = array_module.empty_like(block_values)
-            for model_index, columns in enumerate(model_columns):
-                if columns.size:
-                    block_result[:, columns] = self.inverse[block_index][model_index] @ block_values[:, columns]
-            result[variants] = device.to_host(block_result)
+        for block_index, variants in self.block_variant_indices.items():
+            result[variants] = device.to_host(self.apply_block(block_index, device.array_module.asarray(values[variants]), column_models))
         return result
 
 
-def _genotype_image(reads: _Reads, device: _Device, values: NDArray) -> Any:
-    """X values for a (p, c) host array (one read)."""
-    array_module = device.array_module
-    image = array_module.zeros((reads.source.sample_count, int(values.shape[1])), dtype=array_module.float64)
-    for block_index, tile in reads.tiles():
-        image += tile.matmat(array_module.asarray(values[reads.source.block_variant_indices[block_index]]))
-    return image
+def _orthonormal_directions(
+    array_module: Any, values: NDArray, values_image: Any, column_models: NDArray, model_count: int
+) -> tuple[NDArray, Any, NDArray]:
+    """Per model, an orthonormal basis of its columns' span (SVQB), dropping dependent directions.
+
+    Returns (basis, X basis, model of every basis column). The drop keeps block
+    CG breakdown-free when some of a model's columns have converged.
+    """
+    bases = []
+    images = []
+    models = []
+    for model_index in range(model_count):
+        columns = np.flatnonzero(column_models == model_index)
+        if columns.size == 0:
+            continue
+        block = values[:, columns]
+        gram = block.T @ block
+        eigenvalues, eigenvectors = np.linalg.eigh(0.5 * (gram + gram.T))
+        kept = eigenvalues > max(_DIRECTION_DROP * float(eigenvalues[-1]), np.finfo(np.float64).tiny)
+        if not np.any(kept):
+            continue
+        transform = eigenvectors[:, kept] / np.sqrt(eigenvalues[kept])
+        bases.append(block @ transform)
+        images.append(values_image[:, array_module.asarray(columns)] @ array_module.asarray(transform))
+        models.append(np.full(int(kept.sum()), model_index))
+    if not bases:
+        return np.zeros((values.shape[0], 0)), array_module.zeros((values_image.shape[0], 0)), np.zeros(0, dtype=np.int64)
+    return np.concatenate(bases, axis=1), array_module.concatenate(images, axis=1), np.concatenate(models)
 
 
-def _genotype_transpose(reads: _Reads, device: _Device, sample_values: Any, variant_count: int) -> NDArray:
-    """X' sample_values for an (n, c) device array (one read), on the host."""
-    result = np.empty((variant_count, int(sample_values.shape[1])), dtype=np.float64)
-    for block_index, tile in reads.tiles():
-        result[reads.source.block_variant_indices[block_index]] = device.to_host(tile.rmatmat(sample_values))
-    return result
-
-
-@dataclass
-class _Operator:
-    """A = X' P_W X + diag(tau) of every column's model, at fixed curvature and sites."""
-
-    reads: _Reads
-    system: _SampleSystem
-    curvature: Any
-    covariate_inverses: Any
-    site_precision: NDArray
-
-    def apply(self, directions: NDArray, column_models: NDArray) -> tuple[NDArray, Any]:
-        """(A d, X d) for a (p, c) host array: two reads."""
-        device = self.system.device
-        image = _genotype_image(self.reads, device, directions)
-        projected = self.system.project(self.covariate_inverses, self.curvature, image, column_models)
-        applied = _genotype_transpose(self.reads, device, projected, int(directions.shape[0]))
-        return applied + self.site_precision[:, column_models] * directions, image
-
-
-def _conjugate_gradient(
+def _block_conjugate_gradient(
     *,
-    operator: _Operator,
+    reads: _Reads,
+    system: _SampleSystem,
+    curvature: Any,
+    inverses: Any,
     preconditioner: _BlockJacobi,
-    right_hand_side: NDArray,
+    site_precision: NDArray,
+    residual: NDArray,
+    preconditioned: NDArray,
+    preconditioned_image: Any,
     column_models: NDArray,
     tolerance: float,
-) -> tuple[NDArray, Any, NDArray]:
-    """Solve A x = rhs from x = 0 for every column: (x, X x, final relative residual per column)."""
-    device = operator.system.device
+) -> tuple[NDArray, Any, NDArray, int]:
+    """Solve A x = r0 from x = 0 by block CG per model, one read per iteration.
+
+    Every model's columns (its mean step, probes or draws) share one Krylov
+    space: each iteration's direction block is an orthonormal basis of the
+    model's preconditioned residuals plus the conjugated previous block. The
+    read forms A P = X' P_W (X P) + diag(tau) P, M^-1 A P and X M^-1 A P, so
+    X of the next block follows by linearity. Given r0, z0 = M^-1 r0 and X z0;
+    returns (x, X x, final relative residual per column, iterations).
+    """
+    device = system.device
     array_module = device.array_module
-    column_count = int(right_hand_side.shape[1])
-    solution = np.zeros_like(right_hand_side)
-    image = array_module.zeros((operator.reads.source.sample_count, column_count), dtype=array_module.float64)
-    residual = right_hand_side.copy()
-    right_hand_side_norm = np.linalg.norm(right_hand_side, axis=0)
+    model_count = int(system.mask_index.shape[0])
+    residual = residual.copy()
+    preconditioned = preconditioned.copy()
+    preconditioned_image = preconditioned_image.copy()
+    solution = np.zeros_like(residual)
+    solution_image = array_module.zeros_like(preconditioned_image)
+    right_hand_side_norm = np.linalg.norm(residual, axis=0)
+    safe_norm = np.where(right_hand_side_norm > 0.0, right_hand_side_norm, 1.0)
     relative_residual = np.where(right_hand_side_norm > 0.0, 1.0, 0.0)
-    active = relative_residual > tolerance
-    preconditioned = preconditioner.apply(device, residual, column_models)
-    direction = preconditioned.copy()
-    residual_inner = np.sum(residual * preconditioned, axis=0)
-    for _iteration in range(_MAXIMUM_CONJUGATE_GRADIENT_ITERATIONS):
-        if not bool(np.any(active)):
+    active_models = np.unique(column_models[relative_residual > tolerance])
+    direction, direction_image, direction_models = _orthonormal_directions(
+        array_module, preconditioned, preconditioned_image, np.where(np.isin(column_models, active_models), column_models, -1), model_count
+    )
+    iterations = 0
+    for iterations in range(_MAXIMUM_CONJUGATE_GRADIENT_ITERATIONS + 1):
+        if direction.shape[1] == 0 or iterations == _MAXIMUM_CONJUGATE_GRADIENT_ITERATIONS:
             break
-        applied_direction, direction_image = operator.apply(direction, column_models)
-        curvature_along = np.sum(direction * applied_direction, axis=0)
-        step = np.where(active, residual_inner / np.where(active, curvature_along, 1.0), 0.0)
-        solution += step[None, :] * direction
-        image += array_module.asarray(step)[None, :] * direction_image
-        residual -= step[None, :] * applied_direction
-        relative_residual = np.where(
-            active,
-            np.linalg.norm(residual, axis=0) / np.where(active, right_hand_side_norm, 1.0),
-            relative_residual,
+        operator_direction = np.empty_like(direction)
+        preconditioned_operator = np.empty_like(direction)
+
+        def local(block_index: int, variants: NDArray, tile: GenotypeBlockTile, products: Any) -> Any:
+            applied = device.to_host(products) + site_precision[variants][:, direction_models] * direction[variants]
+            operator_direction[variants] = applied
+            block_preconditioned = preconditioner.apply_block(block_index, array_module.asarray(applied), direction_models)
+            preconditioned_operator[variants] = device.to_host(block_preconditioned)
+            return block_preconditioned
+
+        projected = system.project(inverses, curvature, direction_image, direction_models)
+        preconditioned_operator_image = reads.sweep(projected, local, int(direction.shape[1]))
+        next_candidates = []
+        next_candidate_images = []
+        next_models = []
+        for model_index in np.unique(direction_models):
+            block_columns = np.flatnonzero(direction_models == model_index)
+            model_columns = np.flatnonzero(column_models == model_index)
+            block = direction[:, block_columns]
+            applied = operator_direction[:, block_columns]
+            curvature_matrix = block.T @ applied
+            curvature_matrix = 0.5 * (curvature_matrix + curvature_matrix.T)
+            step = np.linalg.solve(curvature_matrix, block.T @ residual[:, model_columns])
+            device_step = array_module.asarray(step)
+            device_block_columns = array_module.asarray(block_columns)
+            device_model_columns = array_module.asarray(model_columns)
+            solution[:, model_columns] += block @ step
+            solution_image[:, device_model_columns] += direction_image[:, device_block_columns] @ device_step
+            residual[:, model_columns] -= applied @ step
+            preconditioned[:, model_columns] -= preconditioned_operator[:, block_columns] @ step
+            preconditioned_image[:, device_model_columns] -= preconditioned_operator_image[:, device_block_columns] @ device_step
+            relative_residual[model_columns] = np.linalg.norm(residual[:, model_columns], axis=0) / safe_norm[model_columns]
+            if float(np.max(relative_residual[model_columns])) <= tolerance:
+                continue
+            conjugate = -np.linalg.solve(curvature_matrix, applied.T @ preconditioned[:, model_columns])
+            next_candidates.append(preconditioned[:, model_columns] + block @ conjugate)
+            next_candidate_images.append(
+                preconditioned_image[:, device_model_columns] + direction_image[:, device_block_columns] @ array_module.asarray(conjugate)
+            )
+            next_models.append(np.full(model_columns.size, model_index))
+        if not next_candidates:
+            direction = np.zeros((residual.shape[0], 0))
+            continue
+        direction, direction_image, direction_models = _orthonormal_directions(
+            array_module,
+            np.concatenate(next_candidates, axis=1),
+            array_module.concatenate(next_candidate_images, axis=1),
+            np.concatenate(next_models),
+            model_count,
         )
-        active &= relative_residual > tolerance
-        preconditioned = preconditioner.apply(device, residual, column_models)
-        updated_inner = np.sum(residual * preconditioned, axis=0)
-        conjugacy = np.where(active, updated_inner / np.where(active, residual_inner, 1.0), 0.0)
-        direction = np.where(active[None, :], preconditioned + conjugacy[None, :] * direction, 0.0)
-        residual_inner = updated_inner
-    return solution, image, relative_residual
+    return solution, solution_image, relative_residual, iterations
 
 
 class FullDataGaussian:
     """The mean, probes and draws of q(beta) for every model, updated one Newton step at a time.
 
-    ``iterate`` takes the sites (tau, nu) and noise variances of this iteration,
-    reads the blocks once to certify the state it starts from (exact gradient,
-    covariate gradient, probe residuals), then solves the Newton step and the
-    probe corrections by preconditioned conjugate gradients.
+    ``iterate`` takes the sites (tau, nu) and noise variances of this iteration.
+    Its first read certifies the state it starts from (exact gradient,
+    covariate gradient, probe residuals), refactors the blocks when asked and
+    starts CG; the Newton step and the probe corrections then take one read per
+    CG iteration.
     """
 
     def __init__(
@@ -472,7 +546,7 @@ class FullDataGaussian:
         seed: int,
     ) -> None:
         self.device = _Device(source.array_module)
-        self.reads = _Reads(source)
+        self.reads = _Reads(source, self.device)
         self.system = _SampleSystem(device=self.device, models=models, covariates=covariates, sample_masks=sample_masks)
         array_module = self.device.array_module
         self.variant_count = int(sum(indices.shape[0] for indices in source.block_variant_indices))
@@ -488,13 +562,14 @@ class FullDataGaussian:
         self.probe_solution = np.zeros((self.variant_count, model_count * self.probe_count))
         self.probe_image = array_module.zeros((source.sample_count, model_count * self.probe_count), dtype=array_module.float64)
         self.alpha = array_module.zeros((self.system.covariate_count, model_count), dtype=array_module.float64)
-        self.genetic_image = _genotype_image(self.reads, self.device, self.mean)
-        self.linear_predictor = self.system.offsets + self.genetic_image
+        self.genetic_image = self.reads.sweep(None, lambda _block, variants, _tile, _products: array_module.asarray(self.mean[variants]), model_count)
         self.preconditioner: _BlockJacobi | None = None
         self.noise_variance = np.ones(model_count)
         # diag(X' P_W X), and W, at the curvature the probes were last solved for.
         self.data_diagonal = np.zeros((self.variant_count, model_count))
         self.probe_curvature = np.zeros((source.sample_count, model_count))
+        # CG iterations (one read each) of the last iterate.
+        self.conjugate_gradient_iterations = 0
         self._fit_covariates()
 
     def _fit_covariates(self) -> None:
@@ -529,58 +604,73 @@ class FullDataGaussian:
         refactor: bool,
         exact_curvature: NDArray,
     ) -> StartCertificate:
-        """One certified read at the start state, then one Newton step and the probe corrections.
+        """One certifying read at the start state, then one Newton step and the probe corrections.
 
-        ``refactor`` rebuilds the block-Jacobi inverse at this state (one more
-        read), with the exact curvature for the models in ``exact_curvature``.
+        ``refactor`` rebuilds the block-Jacobi inverse at this state within the
+        first read, with the exact curvature for the models in ``exact_curvature``.
         """
         device = self.device
         array_module = device.array_module
         system = self.system
+        model_count = self.model_count
         self.noise_variance = np.asarray(noise_variance, dtype=np.float64).copy()
-        mean_models = np.arange(self.model_count)
+        mean_models = np.arange(model_count)
+        columns = np.concatenate([mean_models, self.probe_models])
         curvature = system.curvature(self.linear_predictor, self.noise_variance)
         inverses = system.covariate_inverses(curvature)
-        if refactor or self.preconditioner is None:
+        refactor = refactor or self.preconditioner is None
+        if refactor:
             self.preconditioner = _BlockJacobi(
-                reads=self.reads,
-                system=system,
-                curvature=curvature,
-                site_precision=site_precision,
-                exact_curvature=np.asarray(exact_curvature, dtype=bool),
+                system=system, curvature=curvature, site_precision=site_precision, exact_curvature=exact_curvature
             )
+        preconditioner = self.preconditioner
         score = system.score(self.linear_predictor, self.noise_variance)
-        projected_score = score - curvature * (system.covariates @ system.solve_covariates(inverses, system.covariates.T @ score, mean_models))
-        weighted_covariates = array_module.concatenate(
-            [curvature[:, model_index : model_index + 1] * system.covariates for model_index in range(self.model_count)], axis=1
+        projected_score = score - curvature * (
+            system.covariates @ system.solve_covariates(inverses, system.covariates.T @ score, mean_models)
         )
-        sample_columns = array_module.concatenate(
+        weighted_covariates = array_module.concatenate(
+            [curvature[:, model_index : model_index + 1] * system.covariates for model_index in range(model_count)], axis=1
+        )
+        left = array_module.concatenate(
             [projected_score, system.project(inverses, curvature, self.probe_image, self.probe_models), weighted_covariates],
             axis=1,
         )
-        probe_column_count = self.model_count * self.probe_count
-        products = np.empty((self.variant_count, int(sample_columns.shape[1])))
-        squares = np.empty((self.variant_count, self.model_count))
-        for block_index, tile in self.reads.tiles():
-            variants = self.reads.source.block_variant_indices[block_index]
-            products[variants] = device.to_host(tile.rmatmat(sample_columns))
-            squares[variants] = device.to_host(tile.weighted_column_squares(curvature))
-        # diag(X' P_W X) = diag(X' W X) - rowsum((X' W C) (C'WC)^-1 * (X' W C)).
-        cross = products[:, self.model_count + probe_column_count :].reshape(
-            self.variant_count, self.model_count, system.covariate_count
-        )
-        self.data_diagonal = squares - np.einsum("jma,mab,jmb->jm", cross, device.to_host(inverses), cross)
+        probe_column_count = model_count * self.probe_count
+        host_inverses = device.to_host(inverses)
+        residual = np.empty((self.variant_count, model_count + probe_column_count))
+        preconditioned = np.empty_like(residual)
+        score_square_sum = np.zeros(model_count)
+        penalty_square_sum = np.zeros(model_count)
+
+        def start(block_index: int, variants: NDArray, tile: GenotypeBlockTile, products: Any) -> Any:
+            if refactor:
+                preconditioner.factor_block(block_index, variants, tile)
+            host_products = device.to_host(products)
+            score_products = host_products[:, :model_count]
+            probe_products = host_products[:, model_count : model_count + probe_column_count]
+            cross = host_products[:, model_count + probe_column_count :].reshape(variants.shape[0], model_count, system.covariate_count)
+            squares = device.to_host(tile.weighted_column_squares(curvature))
+            self.data_diagonal[variants] = squares - np.einsum("jma,mab,jmb->jm", cross, host_inverses, cross)
+            penalty = site_precision[variants] * self.mean[variants] - site_shift[variants]
+            score_square_sum[:] += np.sum(score_products * score_products, axis=0)
+            penalty_square_sum[:] += np.sum(penalty * penalty, axis=0)
+            residual[variants, :model_count] = score_products - penalty
+            residual[variants, model_count:] = (
+                np.tile(self.probes[variants], (1, model_count))
+                - probe_products
+                - site_precision[variants][:, self.probe_models] * self.probe_solution[variants]
+            )
+            block_preconditioned = preconditioner.apply_block(block_index, array_module.asarray(residual[variants]), columns)
+            preconditioned[variants] = device.to_host(block_preconditioned)
+            return block_preconditioned
+
+        preconditioned_image = self.reads.sweep(left, start, int(columns.size))
         self.probe_curvature = device.to_host(curvature)
-        products = products[:, : self.model_count + probe_column_count]
-        score_products = products[:, : self.model_count]
-        penalty = site_precision * self.mean - site_shift
-        gradient = score_products - penalty
-        probe_residual = np.tile(self.probes, (1, self.model_count)) - products[:, self.model_count :] - site_precision[
-            :, self.probe_models
-        ] * self.probe_solution
+        gradient_norm = np.linalg.norm(residual[:, :model_count], axis=0)
+        probe_norm = np.linalg.norm(residual[:, model_count:], axis=0) / np.sqrt(self.variant_count)
         certificate = StartCertificate(
-            gradient_relative_norm=np.linalg.norm(gradient, axis=0)
-            / np.maximum(np.linalg.norm(score_products, axis=0) + np.linalg.norm(penalty, axis=0), np.finfo(np.float64).tiny),
+            gradient_relative_norm=gradient_norm
+            / np.maximum(np.sqrt(score_square_sum) + np.sqrt(penalty_square_sum), np.finfo(np.float64).tiny),
             covariate_gradient_relative_norm=device.to_host(
                 array_module.linalg.norm(system.covariates.T @ score, axis=0)
                 / array_module.maximum(
@@ -588,36 +678,29 @@ class FullDataGaussian:
                     np.finfo(np.float64).tiny,
                 )
             ),
-            probe_residual=np.max(
-                (np.linalg.norm(probe_residual, axis=0) / np.sqrt(self.variant_count)).reshape(self.model_count, self.probe_count),
-                axis=1,
-            ),
+            probe_residual=np.max(probe_norm.reshape(model_count, self.probe_count), axis=1),
         )
-        operator = _Operator(
+        correction, correction_image, _residual, self.conjugate_gradient_iterations = _block_conjugate_gradient(
             reads=self.reads,
             system=system,
             curvature=curvature,
-            covariate_inverses=inverses,
+            inverses=inverses,
+            preconditioner=preconditioner,
             site_precision=site_precision,
-        )
-        columns = np.concatenate([mean_models, self.probe_models])
-        correction, correction_image, _residual = _conjugate_gradient(
-            operator=operator,
-            preconditioner=self.preconditioner,
-            right_hand_side=np.concatenate([gradient, probe_residual], axis=1),
+            residual=residual,
+            preconditioned=preconditioned,
+            preconditioned_image=preconditioned_image,
             column_models=columns,
             tolerance=tolerance,
         )
-        self.probe_solution += correction[:, self.model_count :]
-        self.probe_image += correction_image[:, self.model_count :]
-        step = correction[:, : self.model_count]
-        step_image = correction_image[:, : self.model_count]
+        self.probe_solution += correction[:, model_count:]
+        self.probe_image += correction_image[:, model_count:]
+        step = correction[:, :model_count]
+        step_image = correction_image[:, :model_count]
         # The covariates move with beta along the profiled Newton direction.
-        alpha_step = system.solve_covariates(
-            inverses, system.covariates.T @ (score - curvature * step_image), mean_models
-        )
+        alpha_step = system.solve_covariates(inverses, system.covariates.T @ (score - curvature * step_image), mean_models)
         sample_step = step_image + system.covariates @ alpha_step
-        step_length = np.ones(self.model_count)
+        step_length = np.ones(model_count)
         binary = np.flatnonzero(system.is_binary)
         if binary.size:
             start_value = self._penalized_objective(self.linear_predictor, self.mean, site_precision, site_shift)
@@ -626,21 +709,21 @@ class FullDataGaussian:
                 trial_mean = self.mean + step_length[None, :] * step
                 trial_predictor = self.linear_predictor + array_module.asarray(step_length)[None, :] * sample_step
                 trial_value = self._penalized_objective(trial_predictor, trial_mean, site_precision, site_shift)
-                improved = trial_value >= start_value
-                pending = pending[~improved[pending]]
+                pending = pending[trial_value[pending] < start_value[pending]]
                 step_length[pending] *= 0.5
             step_length[pending] = 0.0
+        device_length = array_module.asarray(step_length)[None, :]
         self.mean += step_length[None, :] * step
-        self.alpha = self.alpha + array_module.asarray(step_length)[None, :] * alpha_step
-        self.genetic_image = self.genetic_image + array_module.asarray(step_length)[None, :] * step_image
-        self.linear_predictor = self.linear_predictor + array_module.asarray(step_length)[None, :] * sample_step
+        self.alpha = self.alpha + device_length * alpha_step
+        self.genetic_image = self.genetic_image + device_length * step_image
+        self.linear_predictor = self.linear_predictor + device_length * sample_step
         return certificate
 
     def marginal_variances(self, site_precision: NDArray) -> MarginalVariances:
         """diag(A^-1) of the operator the probes were last solved for, projected onto [1/A_jj, 1/tau_j]."""
         assert self.preconditioner is not None
         repeated = np.tile(self.probes, (1, self.model_count))
-        control_images = self.preconditioner.apply(self.device, repeated, self.probe_models)
+        control_images = self.preconditioner.apply(repeated, self.probe_models)
         correction = (repeated * (self.probe_solution - control_images)).reshape(
             self.variant_count, self.model_count, self.probe_count
         )
@@ -662,21 +745,33 @@ class FullDataGaussian:
         array_module = device.array_module
         system = self.system
         assert self.preconditioner is not None
+        preconditioner = self.preconditioner
         draw_models = np.repeat(np.arange(self.model_count), draw_count)
         curvature = system.curvature(self.linear_predictor, self.noise_variance)
         inverses = system.covariate_inverses(curvature)
         sample_noise = array_module.asarray(self.generator.standard_normal((self.reads.source.sample_count, draw_models.size)))
-        likelihood_part = _genotype_transpose(
-            self.reads, device, system.complement_noise(inverses, curvature, sample_noise, draw_models), self.variant_count
-        )
+        complement = system.complement_noise(inverses, curvature, sample_noise, draw_models)
         prior_part = np.sqrt(site_precision[:, draw_models]) * self.generator.standard_normal((self.variant_count, draw_models.size))
-        operator = _Operator(
-            reads=self.reads, system=system, curvature=curvature, covariate_inverses=inverses, site_precision=site_precision
-        )
-        perturbation, _image, _residual = _conjugate_gradient(
-            operator=operator,
-            preconditioner=self.preconditioner,
-            right_hand_side=likelihood_part + prior_part,
+        residual = np.empty((self.variant_count, draw_models.size))
+        preconditioned = np.empty_like(residual)
+
+        def start(block_index: int, variants: NDArray, tile: GenotypeBlockTile, products: Any) -> Any:
+            residual[variants] = device.to_host(products) + prior_part[variants]
+            block_preconditioned = preconditioner.apply_block(block_index, array_module.asarray(residual[variants]), draw_models)
+            preconditioned[variants] = device.to_host(block_preconditioned)
+            return block_preconditioned
+
+        preconditioned_image = self.reads.sweep(complement, start, int(draw_models.size))
+        perturbation, _image, _residual, _iterations = _block_conjugate_gradient(
+            reads=self.reads,
+            system=system,
+            curvature=curvature,
+            inverses=inverses,
+            preconditioner=preconditioner,
+            site_precision=site_precision,
+            residual=residual,
+            preconditioned=preconditioned,
+            preconditioned_image=preconditioned_image,
             column_models=draw_models,
             tolerance=tolerance,
         )
