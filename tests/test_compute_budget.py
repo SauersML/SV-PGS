@@ -31,7 +31,7 @@ def test_cgroup_v2_unlimited_and_v1_sentinel_are_none(tmp_path: Path) -> None:
     proc_v1 = tmp_path / "proc_v1"
     _write(proc_v1, "11:memory:/\n")
     group_v1 = tmp_path / "root_v1" / "memory"
-    _write(group_v1 / "memory.limit_in_bytes", str(9223372036854771712) + "\n")
+    _write(group_v1 / "memory.limit_in_bytes", str(compute_budget._CGROUP_V1_UNLIMITED) + "\n")
     _write(group_v1 / "memory.usage_in_bytes", "123\n")
     assert compute_budget._cgroup_memory_headroom_bytes(proc_v1, tmp_path / "root_v1") is None
 
@@ -50,10 +50,10 @@ def test_cgroup_v1_limit_on_the_slurm_job_binds_under_unlimited_step_and_task(tm
     _write(proc_file, "3:memory:/slurm/uid_7/job_42/step_batch/task_0\n2:cpuset:/slurm/uid_7/job_42\n")
     job = tmp_path / "root" / "memory" / "slurm" / "uid_7" / "job_42"
     for level, limit, usage in (
-        (job / "step_batch" / "task_0", 9223372036854771712, 3 * 2**30),
-        (job / "step_batch", 9223372036854771712, 3 * 2**30),
+        (job / "step_batch" / "task_0", compute_budget._CGROUP_V1_UNLIMITED, 3 * 2**30),
+        (job / "step_batch", compute_budget._CGROUP_V1_UNLIMITED, 3 * 2**30),
         (job, 48 * 2**30, 10 * 2**30),
-        (job.parent, 9223372036854771712, 500 * 2**30),
+        (job.parent, compute_budget._CGROUP_V1_UNLIMITED, 500 * 2**30),
     ):
         _write(level / "memory.limit_in_bytes", f"{limit}\n")
         _write(level / "memory.usage_in_bytes", f"{usage}\n")

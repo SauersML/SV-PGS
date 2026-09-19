@@ -8,6 +8,12 @@ hardcoded constant.
 The CPU is a first-class device: CUDA is used iff CuPy sees at least one
 device. A node that exposes NVIDIA devices but whose CuPy runtime cannot use
 them raises instead of silently running on the CPU.
+
+Memory is measured, never taken as a hand-set share: host bytes are the
+kernel's MemAvailable, capped by every memory cgroup the process sits in, and
+device bytes are what each device has free once the CUDA context and the
+cuBLAS and cuSOLVER workspaces exist. Every consumer plans its own buffers
+exactly against these numbers.
 """
 from __future__ import annotations
 
@@ -15,79 +21,25 @@ from contextlib import contextmanager
 import os
 from dataclasses import dataclass
 from pathlib import Path
-import shutil
-import subprocess
 from typing import Any, Iterator, Literal
 
 from sv_pgs.progress import log
 
-# Share of the currently free memory a single fast-path job may plan to use.
-# The remainder absorbs allocator fragmentation, library workspaces (cuSOLVER,
-# cuBLAS, OpenBLAS) and the interpreter itself.
-DEVICE_MEMORY_UTILIZATION = 0.85
-HOST_MEMORY_UTILIZATION = 0.80
-
-
-_AUTO_TUNE_HOST_RAM_FALLBACK_BYTES = 4 * 1024 * 1024 * 1024  # 4 GB
-
-
-def _parse_proc_meminfo() -> dict[str, int]:
-    """Parse ``/proc/meminfo`` into a {key: bytes} mapping.
-
-    Returns an empty dict on any error (e.g. non-Linux, unreadable file).
-    """
-    result: dict[str, int] = {}
-    try:
-        with open("/proc/meminfo", "r") as meminfo:
-            for line in meminfo:
-                parts = line.split()
-                if len(parts) < 2:
-                    continue
-                key = parts[0].rstrip(":")
-                try:
-                    value_kb = int(parts[1])
-                except ValueError:
-                    continue
-                # /proc/meminfo reports kB (i.e. KiB) for memory rows.
-                unit = parts[2].lower() if len(parts) >= 3 else "kb"
-                if unit == "kb":
-                    result[key] = value_kb * 1024
-                else:
-                    result[key] = value_kb
-    except OSError:
-        return {}
-    return result
+_CGROUP_V1_UNLIMITED = (2**63 - 1) // os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PAGE_SIZE")
+"""What cgroup v1 reports for "no limit": PAGE_COUNTER_MAX pages (LONG_MAX / PAGE_SIZE), in bytes
+(Linux mm/page_counter.c, include/linux/page_counter.h)."""
 
 
 def _detect_available_host_ram_bytes() -> int:
-    """Return available host RAM in bytes.
-
-    Precedence:
-        1. ``/proc/meminfo:MemAvailable`` (Linux 3.14+; authoritative)
-        2. ``MemFree + Cached + SReclaimable`` from ``/proc/meminfo``
-           (manual MemAvailable approximation for ancient kernels)
-        3. ``SC_AVPHYS_PAGES * SC_PAGE_SIZE`` (MemFree-equivalent; pessimistic)
-        4. 4 GB hardcoded floor
-    """
-    meminfo = _parse_proc_meminfo()
-    if "MemAvailable" in meminfo and meminfo["MemAvailable"] > 0:
-        return int(meminfo["MemAvailable"])
-    if meminfo:
-        approx = (
-            meminfo.get("MemFree", 0)
-            + meminfo.get("Cached", 0)
-            + meminfo.get("SReclaimable", 0)
-        )
-        if approx > 0:
-            return int(approx)
-    try:
-        page_size = os.sysconf("SC_PAGE_SIZE")
-        avail_pages = os.sysconf("SC_AVPHYS_PAGES")
-        if page_size > 0 and avail_pages > 0:
-            return int(page_size) * int(avail_pages)
-    except (AttributeError, ValueError, OSError):
-        pass
-    return _AUTO_TUNE_HOST_RAM_FALLBACK_BYTES
+    """The kernel's ``MemAvailable`` (``/proc/meminfo``, Linux 3.14+), in bytes."""
+    with open("/proc/meminfo", encoding="utf-8") as meminfo:
+        for line in meminfo:
+            key, value, *unit = line.split()
+            if key == "MemAvailable:":
+                if unit != ["kB"]:
+                    raise RuntimeError(f"/proc/meminfo reports MemAvailable in {unit}, not kB")
+                return int(value) * 1024
+    raise RuntimeError("/proc/meminfo has no MemAvailable line (Linux 3.14+ is required)")
 
 
 def _cupy_runtime_error_classes(cupy: Any) -> tuple[type[BaseException], ...]:
@@ -136,35 +88,12 @@ def _cupy_runtime_diagnostic() -> str:
 
 
 def _nvidia_driver_diagnostic() -> str:
-    command = shutil.which("nvidia-smi")
-    if command is None:
-        driver_version = Path("/proc/driver/nvidia/version")
-        if driver_version.exists():
-            try:
-                return "nvidia-smi=missing " + driver_version.read_text(encoding="utf-8").strip().replace("\n", " | ")
-            except OSError as exc:
-                return f"nvidia-smi=missing nvidia_proc_version_error={exc}"
-        device_files = sorted(str(path) for path in Path("/dev").glob("nvidia*"))
-        return "nvidia-smi=missing /dev=" + (",".join(device_files) if device_files else "<none>")
-    try:
-        result = subprocess.run(
-            [
-                command,
-                "--query-gpu=index,name,driver_version,memory.total,memory.free",
-                "--format=csv,noheader,nounits",
-            ],
-            capture_output=True,
-            text=True,
-            timeout=5.0,
-            check=False,
-        )
-    except (OSError, subprocess.SubprocessError) as exc:
-        return f"nvidia-smi_error={exc}"
-    if result.returncode != 0:
-        stderr = result.stderr.strip().replace("\n", " | ")
-        return f"nvidia-smi_rc={result.returncode} stderr={stderr}"
-    lines = " | ".join(line.strip() for line in result.stdout.splitlines() if line.strip())
-    return "nvidia-smi=" + (lines if lines else "no_visible_gpus")
+    """The loaded NVIDIA kernel driver and its device nodes, read from procfs and /dev."""
+    device_files = ",".join(sorted(str(path) for path in Path("/dev").glob("nvidia*"))) or "<none>"
+    driver_version = Path("/proc/driver/nvidia/version")
+    if not driver_version.exists():
+        return f"nvidia_driver=not_loaded /dev={device_files}"
+    return "nvidia_driver=" + driver_version.read_text(encoding="utf-8").strip().replace("\n", " | ") + f" /dev={device_files}"
 
 
 _cupy_module = None
@@ -172,7 +101,7 @@ _cupy_checked = False
 
 
 def _try_import_cupy() -> Any | None:
-    """Import CuPy, caching the result. Returns None only during tests."""
+    """CuPy, imported once, or None when it is missing or sees no CUDA device."""
     global _cupy_module, _cupy_checked
     if _cupy_checked:
         return _cupy_module
@@ -280,8 +209,7 @@ def _cgroup_memory_headroom_bytes(
             limit_file, usage_file = level / limit_name, level / usage_name
             if limit_file.exists() and usage_file.exists():
                 limit_text = limit_file.read_text(encoding="utf-8").strip()
-                # cgroup v2 writes "max" and v1 a huge page-aligned sentinel for "unlimited".
-                if limit_text != "max" and int(limit_text) < 1 << 60:
+                if limit_text != "max" and int(limit_text) != _CGROUP_V1_UNLIMITED:
                     usage_bytes = int(usage_file.read_text(encoding="utf-8").strip())
                     level_headroom = max(int(limit_text) - usage_bytes, 0)
                     headroom = level_headroom if headroom is None else min(headroom, level_headroom)
@@ -291,11 +219,18 @@ def _cgroup_memory_headroom_bytes(
 
 
 def _usable_host_bytes() -> int:
-    available_bytes = int(_detect_available_host_ram_bytes())
+    available_bytes = _detect_available_host_ram_bytes()
     cgroup_headroom = _cgroup_memory_headroom_bytes()
-    if cgroup_headroom is not None:
-        available_bytes = min(available_bytes, cgroup_headroom)
-    return int(available_bytes * HOST_MEMORY_UTILIZATION)
+    return available_bytes if cgroup_headroom is None else min(available_bytes, cgroup_headroom)
+
+
+def _initialize_device_libraries(cupy: Any) -> None:
+    """Create the cuBLAS and cuSOLVER handles and run one call of each, so their workspaces are
+    allocated before free memory is measured."""
+    square = cupy.eye(2, dtype=cupy.float64)
+    square @ square
+    cupy.linalg.cholesky(square)
+    cupy.cuda.get_current_stream().synchronize()
 
 
 def _nvidia_devices_exposed() -> bool:
@@ -334,12 +269,13 @@ def detect_compute_budget() -> ComputeBudget:
     capabilities: list[tuple[int, int]] = []
     for device_id in device_ids:
         with _cupy_device_context(cupy, device_id):
+            _initialize_device_libraries(cupy)
             cupy.get_default_memory_pool().free_all_blocks()
             free_bytes, _total_bytes = cupy.cuda.runtime.memGetInfo()
             properties = cupy.cuda.runtime.getDeviceProperties(device_id)
         name = properties["name"]
         names.append(name.decode("utf-8") if isinstance(name, bytes) else str(name))
-        usable.append(int(int(free_bytes) * DEVICE_MEMORY_UTILIZATION))
+        usable.append(int(free_bytes))
         capabilities.append((int(properties["major"]), int(properties["minor"])))
     budget = ComputeBudget(
         device_kind="cuda",

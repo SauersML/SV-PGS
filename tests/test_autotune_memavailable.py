@@ -1,10 +1,7 @@
 """Tests for `sv_pgs.compute_budget._detect_available_host_ram_bytes`.
 
-Regression: previously this function preferred `os.sysconf("SC_AVPHYS_PAGES")`,
-which is `MemFree`-equivalent on Linux. On a box with hundreds of GB of
-page cache reclaim headroom the kernel reports tiny MemFree, which would
-clamp `bed_batch_bytes` to the 128 MB floor and `prefetch_depth` to 1.
-The fix prefers `/proc/meminfo:MemAvailable`.
+The budget reads `/proc/meminfo:MemAvailable`, which counts reclaimable page
+cache (MemFree does not), and refuses to guess when it is missing.
 """
 from __future__ import annotations
 
@@ -47,33 +44,22 @@ def test_memavailable_primary(monkeypatch: pytest.MonkeyPatch) -> None:
         "SReclaimable:    10000000 kB\n",
     )
     result = compute_budget._detect_available_host_ram_bytes()
-    assert result == 250_000_000 * 1024  # ≈ 256 GB
-    # Sanity: vastly larger than the historical 128 MB floor.
-    assert result > 100 * 1024 * 1024 * 1024
+    assert result == 250_000_000 * 1024
 
 
-def test_memfree_plus_cached_fallback(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Fallback 1: MemAvailable absent (pre-3.14 kernel) -> MemFree+Cached+SReclaimable."""
+def test_missing_memavailable_raises(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A kernel without MemAvailable (pre-3.14) is refused instead of guessed."""
     _patch_proc_meminfo(
         monkeypatch,
         "MemTotal:       263000000 kB\n"
-        "MemFree:           500000 kB\n"
-        "Cached:         200000000 kB\n"
-        "SReclaimable:    10000000 kB\n",
+        "MemFree:           500000 kB\n",
     )
-    result = compute_budget._detect_available_host_ram_bytes()
-    expected = (500_000 + 200_000_000 + 10_000_000) * 1024
-    assert result == expected
+    with pytest.raises(RuntimeError, match="MemAvailable"):
+        compute_budget._detect_available_host_ram_bytes()
 
 
-def test_hardcoded_4gb_floor(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Last resort: no /proc/meminfo and no sysconf -> 4 GB hardcoded."""
+def test_unreadable_meminfo_raises(monkeypatch: pytest.MonkeyPatch) -> None:
+    """No /proc/meminfo: the error propagates; there is no hand-set fallback size."""
     _patch_proc_meminfo(monkeypatch, None)
-    monkeypatch.setattr(
-        compute_budget.os,
-        "sysconf",
-        lambda _name: (_ for _ in ()).throw(OSError("disabled for test")),
-    )
-    result = compute_budget._detect_available_host_ram_bytes()
-    assert result == compute_budget._AUTO_TUNE_HOST_RAM_FALLBACK_BYTES
-    assert result == 4 * 1024 * 1024 * 1024
+    with pytest.raises(OSError):
+        compute_budget._detect_available_host_ram_bytes()
