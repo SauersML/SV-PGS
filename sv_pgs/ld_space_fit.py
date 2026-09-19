@@ -90,6 +90,7 @@ from sv_pgs.anderson import AndersonState, anderson_step
 from sv_pgs.compute_budget import ComputeBudget
 from sv_pgs.config import ModelConfig
 from sv_pgs.genotype import _try_import_cupy
+from sv_pgs.genotype_statistics import GenotypeSufficientStatistics
 from sv_pgs.mixture_inference import PriorDesign, _gig_moment, _scale_model_penalty
 from sv_pgs.progress import log
 
@@ -276,6 +277,24 @@ class BinaryTraitStatistics:
 
 
 TraitStatistics = QuantitativeTraitStatistics | BinaryTraitStatistics
+
+
+def quantitative_trait_statistics(statistics: GenotypeSufficientStatistics, trait_index: int) -> QuantitativeTraitStatistics:
+    """One quantitative trait from Stage 0, whose target column ``trait_index`` is the phenotype.
+
+    The score is Stage 0's projected score X̃ᵀỹ; rᵀr = ỹᵀỹ = yᵀy − (Wᵀy)ᵀ(WᵀW)⁻¹Wᵀy.
+    """
+    ld = statistics.ld
+    covariate_target = statistics.covariate_target[:, trait_index]
+    return QuantitativeTraitStatistics(
+        sample_count=statistics.sample_count,
+        covariate_count=int(statistics.covariate_gram.shape[0]),
+        score=np.concatenate([ld.block(block_index).projected_score[:, trait_index] for block_index in range(ld.block_count)]),
+        residual_sum_of_squares=float(
+            statistics.target_gram[trait_index, trait_index]
+            - covariate_target @ np.linalg.solve(statistics.covariate_gram, covariate_target)
+        ),
+    )
 
 
 def binary_statistics_at(
