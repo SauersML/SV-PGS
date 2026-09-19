@@ -60,6 +60,8 @@ from numpy.typing import NDArray
 
 from sv_pgs.config import TraitType
 
+# The E-step's genotype products carry fp64 rounding only: the tiles' error budget for every read.
+_EXACT_PRODUCTS = float(np.finfo(np.float64).eps) / 2
 _MAXIMUM_CONJUGATE_GRADIENT_ITERATIONS = 400
 # SVQB drops a model's direction whose squared norm in its block falls below this
 # fraction of the largest (a converged or dependent column), so block CG cannot break down.
@@ -98,6 +100,16 @@ class GenotypeBlockTile(Protocol):
 
     def weighted_column_squares(self, weights: Any) -> Any:
         """(X_b * X_b)' weights for an (n, c) weight array: (p_b, c)."""
+        ...
+
+    def sample_operand(self, left: Any, relative_error: float) -> Any:
+        """``left`` (n, c) prepared once for the rmatmat of every tile of one read, within
+        ``relative_error`` of it columnwise in the 2-norm."""
+        ...
+
+    def accumulate_matmat(self, right: Any, image: Any, relative_error: float) -> None:
+        """image += X_b right in place, for right (p_b, c) within ``relative_error`` of it
+        columnwise in the 2-norm, and image (n, c)."""
         ...
 
 
@@ -140,6 +152,12 @@ class DenseGenotypeTile:
 
     def weighted_column_squares(self, weights: Any) -> Any:
         return (self.values * self.values).T @ weights
+
+    def sample_operand(self, left: Any, relative_error: float) -> Any:
+        return left
+
+    def accumulate_matmat(self, right: Any, image: Any, relative_error: float) -> None:
+        image += self.values @ right
 
 
 class DenseGenotypeBlockSource:
@@ -292,12 +310,16 @@ class _Reads:
         array_module = self.device.array_module
         self.count += 1
         image = array_module.zeros((self.source.sample_count, image_columns), dtype=array_module.float64)
+        operand = None
         for block_index, tile in self.source.iter_tiles():
             variants = self.source.block_variant_indices[block_index]
-            products = None if left is None else tile.rmatmat(left)
+            if left is not None and operand is None:
+                # every block multiplies the same left: prepare it once for the whole read
+                operand = tile.sample_operand(left, _EXACT_PRODUCTS)
+            products = None if left is None else tile.rmatmat(operand)
             right = local(block_index, variants, tile, products)
             if right is not None:
-                image += tile.matmat(right)
+                tile.accumulate_matmat(right, image, _EXACT_PRODUCTS)
         return image
 
 
