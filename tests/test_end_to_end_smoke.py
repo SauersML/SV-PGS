@@ -19,12 +19,8 @@ import pytest
 
 from sv_pgs.config import ModelConfig, TraitType
 from sv_pgs.mixture_inference import fit_variational_em
-from sv_pgs.mixture_inference import (
-    VariationalFitCheckpoint,
-    _build_prior_design,
-    checkpoint_from_result,
-    collapse_tie_groups,
-)
+from sv_pgs.mixture_inference import checkpoint_from_result, VariationalFitCheckpoint
+from sv_pgs.prior_design import _build_prior_design, collapse_tie_groups
 from sv_pgs.preprocessing import build_tie_map
 
 from tests.conftest import make_variant_records

@@ -18,7 +18,7 @@ from sv_pgs.config import (
     VariantClass,
 )
 from sv_pgs.data import VariantRecord
-from sv_pgs.mixture_inference import (
+from sv_pgs.prior_design import (
     _build_prior_design,
     _class_membership_by_class,
     _design_matrix_for_feature_specs,

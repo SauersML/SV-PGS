@@ -7,13 +7,13 @@ from sv_pgs.genotype import Int8RawGenotypeMatrix, as_raw_genotype_matrix
 from sv_pgs.plink import PLINK_MISSING_INT8
 import sv_pgs.preprocessing as preprocessing_module
 from sv_pgs.preprocessing import (
-    Preprocessor,
     build_tie_map,
-    collapse_tie_groups,
     compute_variant_statistics,
     fit_preprocessor,
+    Preprocessor,
     select_active_variant_indices,
 )
+from sv_pgs.prior_design import collapse_tie_groups
 
 
 def test_fold_preprocessing_and_exact_ties_ignore_variant_class():

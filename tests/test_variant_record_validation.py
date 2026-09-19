@@ -20,7 +20,7 @@ import pytest
 
 from sv_pgs.config import VariantClass
 from sv_pgs.data import VariantRecord, normalize_variant_record
-from sv_pgs.mixture_inference import _build_prior_design
+from sv_pgs.prior_design import _build_prior_design
 
 
 def _record(**overrides) -> VariantRecord:

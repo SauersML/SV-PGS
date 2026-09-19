@@ -13,39 +13,42 @@ from sv_pgs.genotype import StandardizedGenotypeMatrix, as_raw_genotype_matrix
 from sv_pgs.mixture_inference import fit_variational_em
 from sv_pgs.mixture_inference import (
     _binary_newton_solver_controls,
+    _binary_posterior_state,
     _build_restricted_projector_jax,
     _calibrate_binary_intercept,
     _collapsed_posterior_solver_controls,
+    _gpu_cholesky_with_adaptive_ridge,
+    _gpu_exact_variant_full_matrix_fits,
+    _gpu_exact_variant_tile_size,
+    _initialize_alpha_state,
+    _orthogonal_probe_matrix,
     _posterior_working_set_indices,
     PosteriorState,
-    VariationalFitCheckpoint,
-    _binary_posterior_state,
-    _initialize_alpha_state,
-    _member_prior_variances_from_reduced_state,
-    _orthogonal_probe_matrix,
     _quantitative_posterior_state,
+    _restricted_precision_projector,
+    _restricted_variant_space_operator,
     _should_checkpoint_stochastic_block,
     _should_log_stochastic_block,
     _should_use_posterior_working_set,
-    _restricted_precision_projector,
-    ScaleModelFeatureSpec,
-    _solve_sample_space_rhs_gpu,
     _solve_sample_space_rhs_cpu,
-    _stochastic_binary_newton_iterations,
-    _stochastic_sample_space_preconditioner_rank,
-    _stochastic_restricted_cross_leverage_diagonal,
-    _gpu_cholesky_with_adaptive_ridge,
+    _solve_sample_space_rhs_gpu,
     _stabilize_sample_space_solve_with_operator_ridge,
-    _gpu_exact_variant_full_matrix_fits,
-    _gpu_exact_variant_tile_size,
-    _restricted_variant_space_operator,
+    _stochastic_binary_newton_iterations,
+    _stochastic_restricted_cross_leverage_diagonal,
+    _stochastic_sample_space_preconditioner_rank,
     _update_local_scales,
+    _update_tpb_shape_vectors,
     _use_exact_sample_space_solve,
     _use_gpu_exact_variant_solve,
-    _update_tpb_shape_vectors,
+    VariationalFitCheckpoint,
+)
+from sv_pgs.prior_design import (
+    _member_prior_variances_from_reduced_state,
+    ScaleModelFeatureSpec,
     _tie_map_is_identity,
 )
 import sv_pgs.mixture_inference as mixture_inference
+import sv_pgs.prior_design as prior_design
 from sv_pgs.preprocessing import build_tie_map
 from tests.conftest import make_fake_cupy, make_variant_records
 def _binary_pg_fresh_resume_state(
@@ -5583,12 +5586,12 @@ def test_member_log_scale_support_bound_is_invariant_to_full_rank_recoding():
     coefficients = np.array([0.6, -0.35], dtype=np.float64)
     recoding = np.array([[1.7, -0.4], [0.3, 1.2]], dtype=np.float64)
 
-    original_predictions = mixture_inference._support_bounded_member_log_scale_predictions(
+    original_predictions = prior_design._support_bounded_member_log_scale_predictions(
         member_design_matrix=member_design,
         reduced_design_matrix=reduced_design,
         scale_model_coefficients=coefficients,
     )
-    recoded_predictions = mixture_inference._support_bounded_member_log_scale_predictions(
+    recoded_predictions = prior_design._support_bounded_member_log_scale_predictions(
         member_design_matrix=member_design @ recoding,
         reduced_design_matrix=reduced_design @ recoding,
         scale_model_coefficients=np.linalg.solve(recoding, coefficients),
