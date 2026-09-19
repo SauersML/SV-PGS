@@ -420,3 +420,19 @@ def test_a_zero_estimate_with_probe_signal_is_violated_not_an_error():
     certificate = block_trace_certificate(removed_estimate, blocks, probes, removed, 0.5, certificate_level(64))
     assert certificate.violated[2] and not certificate.certified[2]
     assert np.isinf(certificate.relative_error[2])
+
+
+def test_information_solve_tolerance_stays_finite_with_non_positive_estimates():
+    # verify-stage2's case: a model whose estimated block information is <= 0 everywhere still has bulk mass,
+    # so the probe solve must run (a +inf tolerance skipped it).
+    generator = np.random.default_rng(21)
+    columns = generator.standard_normal((200, 120))
+    precision = generator.uniform(1.0, 30.0, 120)
+    blocks = tuple(np.arange(start, start + 40) for start in range(0, 120, 40))
+    solve = _solve(columns, precision, np.array([5]))
+    norms = np.sum(columns**2, axis=0)
+    too_large = 1.0 / precision * 1.5  # every bulk marginal above D: negative estimates
+    zero = 1.0 / precision  # every bulk marginal at D: zero estimates
+    for variances in (too_large, zero):
+        tolerance = information_solve_tolerance(solve, variances, blocks, norms, 0.01)
+        assert np.isfinite(tolerance) and tolerance > 0.0

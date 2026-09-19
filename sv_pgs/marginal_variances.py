@@ -498,8 +498,9 @@ def information_solve_tolerance(
     residual r leaves the error a_b' K_S^-1 r, and |a_b' K_S^-1 r| <= |a_b| |r|, since K_S >= I. For Rademacher
     z, exactly, E|a_b|^2 = M_b = sum_{j in b, bulk} D_j^2 |xt_j|^2 and E|u|^2 = M, the same sum over every bulk
     site. So E[|a_b| |u|] <= sqrt(M_b M) (Cauchy-Schwarz). With T_b = tr(D - Sigma)_b the block's information
-    from ``variances``, a relative residual of min_b (tolerance_b / 2) T_b / sqrt(M_b M) suffices. It is +infinity
-    when no block has bulk mass and information (every site resolved): then no solve is needed at all.
+    from ``variances``, a relative residual of min_b (tolerance_b / 2) |T_b| / sqrt(M_b M) suffices (with the ceiling
+    U_b in place of a zero T_b). It is +infinity only when no block has bulk mass (every site resolved): then no
+    solve is needed at all.
     """
     is_bulk = np.ones(solve.site_precision.shape[0], dtype=bool)
     is_bulk[solve.resolved] = False
@@ -508,13 +509,21 @@ def information_solve_tolerance(
     removed = np.where(is_bulk, bulk_variance - variances, 0.0)
     total = float(np.sum(mass))
     bound = np.broadcast_to(np.asarray(tolerance, dtype=np.float64), (len(blocks),))
-    # A block with no bulk mass is exact (every site resolved), and one with no information has nothing to
-    # resolve: neither constrains the solve. With none left, the minimum over the empty set is +infinity.
-    ratios = [
-        float(bound[position]) * float(np.sum(removed[members])) / np.sqrt(float(np.sum(mass[members])) * total)
-        for position, members in enumerate(blocks)
-        if float(np.sum(mass[members])) > 0.0 and float(np.sum(removed[members])) > 0.0
-    ]
+    # The certificate tests (probe mean - T_b) / |T_b|, so the solve must hold its move below (tolerance / 2) |T_b|
+    # for the estimate T_b it is tested against, whatever its sign; a non-positive-site model can make it negative.
+    # A zero estimate is decided on the probes' absolute value (_certificate), so its scale is the largest
+    # information the block can hold, U_b = sum_{j in b, bulk} (D_j - 1/A_jj), since Sigma_jj >= 1/A_jj for any
+    # positive-definite A. U_b > 0 whenever the block has bulk mass. Only a block with no bulk mass (every site
+    # resolved, so exact) constrains nothing; with none left, the minimum over the empty set is +infinity.
+    ceiling = np.where(is_bulk, bulk_variance - 1.0 / (column_square_norms + np.where(is_bulk, solve.site_precision, 1.0)), 0.0)
+    ratios = []
+    for position, members in enumerate(blocks):
+        block_mass = float(np.sum(mass[members]))
+        if block_mass <= 0.0:
+            continue
+        estimate = abs(float(np.sum(removed[members])))
+        scale = estimate if estimate > 0.0 else float(np.sum(ceiling[members]))
+        ratios.append(float(bound[position]) * scale / np.sqrt(block_mass * total))
     return 0.5 * min(ratios) if ratios else np.inf
 
 
