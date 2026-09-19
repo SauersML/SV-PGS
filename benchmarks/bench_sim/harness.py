@@ -33,6 +33,9 @@ CODES_PER_DOSAGE = 127
 ARMS = {
     "glimpse2": ("observed.npy", "imputation.npz", "GLIMPSE2-imputed"),
     "beagle": ("observed_beagle.npy", "imputation_beagle.npz", "Beagle-imputed"),
+    # novel-measure's Rao-Blackwellised TR/SV columns built from the Beagle arm's phased simple-site input and
+    # the panel only; SNV/INDEL rows are the Beagle arm's. Assembled by bench-sim after an input audit.
+    "beagle_rb": ("observed_beagle_rb.npy", "imputation_beagle_rb.npz", "Beagle-imputed + RB structural columns (novel-measure)"),
 }
 VARIANT_FIELDS = ("pos", "cm", "cls", "len_change", "ref_len", "alt_len")
 ANNOTATION_FIELDS = ("in_gene", "in_exon", "log_tss_distance", "in_repeat", "log_sv_length")

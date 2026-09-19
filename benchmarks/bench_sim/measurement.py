@@ -288,9 +288,8 @@ def main() -> None:
             raise SystemExit(f"batch {batch_index}: {int(missing.sum())} measured records missing from the GLIMPSE2 output")
         np.save(work / f"codes{batch_index}{suffix}.npy", batch_codes)
         np.save(work / f"info{batch_index}{suffix}.npy", batch_info)
-        for path in outputs:
-            path.unlink()
-            path.with_name(path.name + ".complete").unlink()
+        # The chunk BCFs stay: their statistically phased genotypes are the realistic-phase input for column
+        # constructions evaluated on the calibration subset.
         target.unlink()
         target_done.unlink()
         flag.touch()
