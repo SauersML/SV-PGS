@@ -43,7 +43,7 @@ def test_kept_modules_load_neither_jax_nor_the_old_path():
                     "jax": sorted(name for name in sys.modules if name.split(".")[0] in ("jax", "jaxlib")),
                     "old": sorted(
                         name for name in sys.modules
-                        if name in ("sv_pgs._jax", "sv_pgs.genotype", "sv_pgs.io", "sv_pgs.model", "sv_pgs.pipeline")
+                        if name in ("sv_pgs._jax", "sv_pgs.genotype", "sv_pgs.io", "sv_pgs.model")
                     ),
                     "CUPY_TF32": os.environ.get("CUPY_TF32"),
                     "exports": sorted(sv_pgs.__all__),

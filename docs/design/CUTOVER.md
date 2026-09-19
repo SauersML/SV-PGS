@@ -15,7 +15,7 @@ The pre-cutover tree is tagged `archive/2026-09-19/old-path-final` (`f025cce`).
 | B5, B6 | ruled: the engine owns the certificate artifact and logistic EP; the old binary code goes with C5 |
 | B7 | ruled: owned by the deslop-fit lane |
 | C2 | landed: the CLI keeps the phenotype commands and `version`; `run`, `run-all-of-us`, `evaluate-all-of-us`, `doctor` and `run.sh` are gone (with `test_io`, `test_cli_doctor`) |
-| C3 | pending |
+| C3 | landed: `aou_runner`, `aou_storage`, `evaluate`, `pipeline`, `benchmark`, `preflight`, `__main__` and `scripts/analyze_model.py`; `progress.py` is `log`/`elapsed`/`mem`; CI keeps only the full-suite shards (no subset job, no timeout or retention constants) |
 | C4 | pending |
 | C5 | pending |
 | C6 | pending |

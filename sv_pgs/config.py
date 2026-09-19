@@ -322,10 +322,3 @@ class ModelConfig:
     @staticmethod
     def structural_variant_classes() -> tuple[VariantClass, ...]:
         return STRUCTURAL_VARIANT_CLASSES
-
-
-@dataclass(slots=True)
-class BenchmarkConfig:
-    shared_config: ModelConfig
-    snv_classes: tuple[VariantClass, ...] = (VariantClass.SNV,)
-    top_tail_fraction: float = 0.05

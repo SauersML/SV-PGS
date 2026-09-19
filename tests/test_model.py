@@ -14,8 +14,7 @@ import sv_pgs.genotype as genotype_module
 import sv_pgs.mixture_inference as mixture_module
 import sv_pgs.model as model_module
 import sv_pgs.runtime_policy as runtime_policy_module
-from sv_pgs.benchmark import run_benchmark_suite
-from sv_pgs.config import BenchmarkConfig, ModelConfig, TraitType, VariantClass
+from sv_pgs.config import ModelConfig, TraitType, VariantClass
 from sv_pgs.data import VariantRecord
 from sv_pgs.model import BayesianPGS
 from sv_pgs.data import TieGroup, TieMap, VariantStatistics
@@ -1177,34 +1176,6 @@ def test_corrupt_variational_checkpoint_is_ignored(tmp_path, monkeypatch):
     assert model.state is not None
     assert observed_resume_values == [None]
     assert not cache_paths.em_checkpoint_path.exists()
-
-
-def test_benchmark_suite_runs_from_shared_trainer():
-    genotype_matrix, covariate_matrix, target_vector, variant_records = _synthetic_binary_dataset()
-    train_stop = 120
-    benchmark_metrics = run_benchmark_suite(
-        train_genotypes=genotype_matrix[:train_stop],
-        train_covariates=covariate_matrix[:train_stop],
-        train_targets=target_vector[:train_stop],
-        test_genotypes=genotype_matrix[train_stop:],
-        test_covariates=covariate_matrix[train_stop:],
-        test_targets=target_vector[train_stop:],
-        records=variant_records,
-        benchmark_config=BenchmarkConfig(
-            shared_config=ModelConfig(
-                trait_type=TraitType.BINARY,
-                max_outer_iterations=8,
-                minimum_minor_allele_frequency=0.0,
-            )
-        ),
-    )
-
-    assert set(benchmark_metrics) == {
-        "snv_only_continuous",
-        "joint_snv_sv_continuous",
-    }
-    assert benchmark_metrics["joint_snv_sv_continuous"].auc is not None
-    assert benchmark_metrics["joint_snv_sv_continuous"].log_loss is not None
 
 
 def test_tie_group_export_weights_are_proportional_to_member_variances():
