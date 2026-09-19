@@ -78,6 +78,14 @@ _FLOAT64_BYTES = 8
 _ENTRY_BYTES = 4 * _FLOAT64_BYTES
 
 
+def _logsumexp(values: F64Array, axis: int) -> F64Array:
+    """log sum exp over ``axis``, shifted by the largest term (-inf where every term is -inf)."""
+    largest = np.max(values, axis=axis, keepdims=True)
+    shift = np.where(np.isfinite(largest), largest, 0.0)
+    with np.errstate(divide="ignore"):
+        return np.squeeze(shift, axis=axis) + np.log(np.sum(np.exp(values - shift), axis=axis))
+
+
 def box_cox(values: F64Array, exponent: float) -> tuple[F64Array, F64Array]:
     """(h(y), log h'(y)) for positive y."""
     log_values = np.log(values)
@@ -203,7 +211,7 @@ def _log_prior(levels: F64Array, level_variance: float) -> F64Array:
 
 def _log_occasion_density(residuals: F64Array, points: F64Array, log_masses: F64Array, variances: F64Array) -> F64Array:
     """log f(r_j - T_p) at one point T_p per person: persons x occasions."""
-    return logsumexp(_log_components(residuals, points[:, None], log_masses, variances)[:, 0], axis=2)
+    return _logsumexp(_log_components(residuals, points[:, None], log_masses, variances)[:, 0], axis=2)
 
 
 # The level integrals certified: of F, |T| F and T^2 F (L_i and the two moments' absolute integrals).
@@ -275,7 +283,7 @@ def _log_modulus_bound(
     occasion_count = residuals.shape[1]
     widening = 0.5 * np.square(half_width)
     log_weights = log_masses[None, :] + widening[:, None] / variances[None, :]
-    log_total = logsumexp(log_weights, axis=1)
+    log_total = _logsumexp(log_weights, axis=1)
     narrowed = variances / occasion_count
     marginal = level_variance + narrowed
     log_marginal = -0.5 * (_LOG_TWO_PI + np.log(marginal) + np.square(residuals[:, :, None]) / marginal)
@@ -294,7 +302,7 @@ def _log_modulus_bound(
         + log_marginal[..., None]
         + log_moments
     )
-    log_powers = (occasion_count - 1) * log_total[:, None, None] + logsumexp(log_power_terms, axis=2)
+    log_powers = (occasion_count - 1) * log_total[:, None, None] + _logsumexp(log_power_terms, axis=2)
     return (widening / level_variance)[:, None] + log_powers.sum(axis=1) / occasion_count
 
 
@@ -307,15 +315,16 @@ def _log_moment_sums(log_integrand: F64Array, levels: F64Array, steps: F64Array,
     with np.errstate(divide="ignore"):  # the node at T = 0 has |T|^m = 0 for m > 0
         log_magnitude = np.log(np.abs(levels) + np.reshape(offset, (-1, 1)))
     log_powers = np.stack([np.zeros_like(log_magnitude), log_magnitude, 2.0 * log_magnitude], axis=2)
-    return logsumexp(log_integrand[:, :, None] + log_powers, axis=1) + np.log(steps)[:, None]
+    return _logsumexp(log_integrand[:, :, None] + log_powers, axis=1) + np.log(steps)[:, None]
 
 
 def _level_grid(
     residuals: F64Array, level_variance: float, log_masses: F64Array, variances: F64Array, steps: F64Array,
     centres: F64Array, reach: F64Array, relative_tolerance: float, working_bytes: int,
-) -> tuple[F64Array, np.ndarray, F64Array, F64Array]:
+) -> tuple[F64Array, np.ndarray, F64Array, F64Array, F64Array, F64Array]:
     """Trapezoid nodes on each person's grid c_p + n h_p (persons x nodes, a validity mask), the log components
-    at them (``_log_components``) and the log integrals of |T|^m F, m = 0, 1, 2 (persons x 3).
+    at them (``_log_components``), each occasion's log density and the log integrand there, and the log
+    integrals of |T|^m F, m = 0, 1, 2 (persons x 3).
 
     Each side starts ``reach`` past the centre and doubles until every one of its tail bounds (``_log_tail``,
     which bounds the omitted nodes' terms) is at most a quarter of relative_tolerance times its integral so far.
@@ -331,7 +340,7 @@ def _level_grid(
         if levels.size * residuals.shape[1] * variances.shape[0] * _ENTRY_BYTES > working_bytes:
             raise PieceTooLarge(f"{levels.shape[0]} persons need {levels.shape[1]} level nodes each")
         log_components = _log_components(residuals, levels, log_masses, variances)
-        per_occasion = logsumexp(log_components, axis=3)
+        per_occasion = _logsumexp(log_components, axis=3)
         log_integrand = np.where(valid, _log_prior(levels, level_variance) + per_occasion.sum(axis=2), -np.inf)
         log_totals = _log_moment_sums(log_integrand, levels, steps, 0.0)
         if not np.all(np.isfinite(log_totals[:, 0])):
@@ -341,7 +350,7 @@ def _level_grid(
         grow_lower = np.any(_log_tail(residuals, low_edge, level_variance, log_masses, variances, steps, upper=False) > bound, axis=1)
         grow_upper = np.any(_log_tail(residuals, high_edge, level_variance, log_masses, variances, steps, upper=True) > bound, axis=1)
         if not (np.any(grow_lower) or np.any(grow_upper)):
-            return levels, valid, log_components, log_totals
+            return levels, valid, log_components, per_occasion, log_integrand, log_totals
         lower = np.where(grow_lower, 2.0 * lower, lower)
         upper = np.where(grow_upper, 2.0 * upper, upper)
 
@@ -369,7 +378,7 @@ def level_posterior(
     trapezoid_share = 0.5 * relative_tolerance
     narrowest = strip_half_width(level_variance, occasion_count, float(variances.min()), trapezoid_share)
     widest = strip_half_width(level_variance, occasion_count, float(variances.max()), trapezoid_share)
-    harmonic = 1.0 / float(np.exp(logsumexp(log_masses - np.log(variances))))
+    harmonic = 1.0 / float(np.exp(_logsumexp(log_masses - np.log(variances), axis=0)))
     start = gaussian_step(level_variance, occasion_count, harmonic, trapezoid_share)
     steps = np.full(persons, start) if steps is None else np.where(np.isnan(steps), start, steps)
     precision = 1.0 / level_variance + occasion_count / harmonic
@@ -378,49 +387,60 @@ def level_posterior(
     reach = np.full(persons, 1.0 / np.sqrt(precision))
     ladder = np.maximum(widest * np.exp2(-np.arange(int(np.ceil(np.log2(widest / narrowest))) + 1)), narrowest)
     log_moduli = [_log_modulus_bound(residuals, level_variance, log_masses, variances, np.full(persons, width)) for width in ladder]
-    while True:
-        levels, valid, log_components, log_totals = _level_grid(
-            residuals, level_variance, log_masses, variances, steps, centres, reach, relative_tolerance, working_bytes
+    grid_size = variances.shape[0]
+    log_likelihood, level_mean, level_second = np.empty(persons), np.empty(persons), np.empty(persons)
+    occasion_precision, occasion_shift = np.empty((persons, occasion_count)), np.empty((persons, occasion_count))
+    admissible = np.empty(persons)
+    counts, missing = np.zeros(grid_size), np.zeros((grid_size, grid_size))
+    # Only the persons whose step is not yet certified are integrated again.
+    pending = np.arange(persons)
+    while pending.size:
+        levels, valid, log_components, per_occasion, log_integrand, log_totals = _level_grid(
+            residuals[pending], level_variance, log_masses, variances, steps[pending], centres[pending], reach[pending],
+            relative_tolerance, working_bytes,
         )
         log_lower = log_totals - np.log1p(relative_tolerance)
-        admissible = np.max([
-            np.min(2.0 * np.pi * width / np.logaddexp(0.0, np.log(2.0) + log_modulus - log_lower - np.log(trapezoid_share)), axis=1)
+        certified = np.max([
+            np.min(2.0 * np.pi * width / np.logaddexp(0.0, np.log(2.0) + log_modulus[pending] - log_lower - np.log(trapezoid_share)), axis=1)
             for width, log_modulus in zip(ladder, log_moduli)
         ], axis=0)
-        uncertified = steps > admissible
-        if not np.any(uncertified):
-            break
-        steps = np.where(uncertified, admissible, steps)
-    per_occasion = logsumexp(log_components, axis=3)
-    log_integrand = np.where(valid, _log_prior(levels, level_variance) + per_occasion.sum(axis=2), -np.inf)
-    log_sum = logsumexp(log_integrand, axis=1)
-    weights = np.exp(log_integrand - log_sum[:, None])
-    responsibility = np.exp(log_components - per_occasion[..., None])
-    weighted = weights[:, :, None, None] * responsibility
-    grid_size = variances.shape[0]
-    # The sums over persons, nodes and occasions are matrix products over their flattened entries (BLAS).
-    flat_weighted = weighted.reshape(-1, grid_size)
-    counts = flat_weighted.sum(axis=0)
-    missing = np.zeros((grid_size, grid_size))
-    if louis:
-        # Var(C_i | z_i) = E_T[sum_j (diag rho_j - rho_j rho_j')] + Var_T(sum_j rho_j(T)).
-        node_sums = responsibility.sum(axis=2)
-        mean_sums = np.matmul(weights[:, None, :], node_sums)[:, 0, :]
-        flat_sums = node_sums.reshape(-1, grid_size)
-        missing = (
-            np.diag(counts)
-            - flat_weighted.T @ responsibility.reshape(-1, grid_size)
-            + (flat_sums * weights.reshape(-1, 1)).T @ flat_sums
-            - mean_sums.T @ mean_sums
-        )
-    node_precision = weighted @ (1.0 / variances)
+        admissible[pending] = certified
+        done = steps[pending] <= certified
+        rows, finished = pending[done], np.flatnonzero(done)
+        log_likelihood[rows] = log_totals[finished, 0]
+        weights = np.exp(log_integrand[finished] - _logsumexp(log_integrand[finished], axis=1)[:, None])
+        node_levels = levels[finished]
+        level_mean[rows] = np.sum(weights * node_levels, axis=1)
+        level_second[rows] = np.sum(weights * np.square(node_levels), axis=1)
+        responsibility = np.exp(log_components[finished] - per_occasion[finished][..., None])
+        weighted = weights[:, :, None, None] * responsibility
+        # The sums over persons, nodes and occasions are matrix products over their flattened entries (BLAS).
+        flat_weighted = weighted.reshape(-1, grid_size)
+        piece_counts = flat_weighted.sum(axis=0)
+        counts += piece_counts
+        if louis:
+            # Var(C_i | z_i) = E_T[sum_j (diag rho_j - rho_j rho_j')] + Var_T(sum_j rho_j(T)).
+            node_sums = responsibility.sum(axis=2)
+            mean_sums = np.matmul(weights[:, None, :], node_sums)[:, 0, :]
+            flat_sums = node_sums.reshape(-1, grid_size)
+            missing += (
+                np.diag(piece_counts)
+                - flat_weighted.T @ responsibility.reshape(-1, grid_size)
+                + (flat_sums * weights.reshape(-1, 1)).T @ flat_sums
+                - mean_sums.T @ mean_sums
+            )
+        node_precision = weighted @ (1.0 / variances)
+        occasion_precision[rows] = node_precision.sum(axis=1)
+        occasion_shift[rows] = np.sum(node_precision * node_levels[:, :, None], axis=1)
+        steps[pending[~done]] = certified[~done]
+        pending = pending[~done]
     return LevelPosterior(
-        log_likelihood=log_totals[:, 0],
-        level_mean=np.sum(weights * levels, axis=1),
-        level_second_moment=np.sum(weights * np.square(levels), axis=1),
+        log_likelihood=log_likelihood,
+        level_mean=level_mean,
+        level_second_moment=level_second,
         counts=counts,
-        occasion_precision=node_precision.sum(axis=1),
-        occasion_shift=np.sum(node_precision * levels[:, :, None], axis=1),
+        occasion_precision=occasion_precision,
+        occasion_shift=occasion_shift,
         missing_information=missing,
         admissible_step=admissible,
     )
