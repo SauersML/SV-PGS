@@ -386,25 +386,37 @@ def _certificate(
 
     (mean - estimate) / (sd / sqrt k) is referred to Student's t with k - 1 degrees of freedom. That is exact for
     Gaussian probe values. A block's probe value is a Rademacher quadratic form over many pairs, which is close to
-    Gaussian, so the level is approximate, and conservative in the tail compared with the normal quantile. A
-    block with zero estimate and zero spread (every site resolved, so exact) is certified.
+    Gaussian, so the level is approximate, and conservative in the tail compared with the normal quantile.
+
+    A block whose estimate is zero has no finite relative error. With zero probe spread too (every site resolved,
+    so the block is exact), it is certified. Otherwise the probes see information the estimate says is absent
+    (e.g. a marginal clamped to its bound), so the relative error is infinite: the block is violated when the
+    probes' own interval for the absolute value excludes zero, and undecided when it does not.
     """
     block_count = len(per_probe)
     probe_count = per_probe[0].shape[0]
     quantile = float(student_t.isf(0.5 * level / block_count, probe_count - 1))
     relative = np.zeros(block_count)
     standard = np.zeros(block_count)
+    unresolved_zero = np.zeros(block_count, dtype=bool)
+    excludes_zero = np.zeros(block_count, dtype=bool)
     for position, values in enumerate(per_probe):
         computed = float(estimate[position])
         spread = float(np.std(values, ddof=1)) / np.sqrt(probe_count)
         if computed == 0.0:
-            if spread != 0.0:
-                raise ValueError(f"block {position}: zero estimate with nonzero probe spread; a zero estimate must mean an exact block")
+            if spread == 0.0:
+                continue
+            centre = float(np.mean(values))
+            unresolved_zero[position] = True
+            excludes_zero[position] = abs(centre) > quantile * spread
+            relative[position] = np.copysign(np.inf, centre)
+            standard[position] = np.inf
             continue
         relative[position] = (float(np.mean(values)) - computed) / computed
         standard[position] = spread / abs(computed)
-    lower = relative - quantile * standard
-    upper = relative + quantile * standard
+    with np.errstate(invalid="ignore"):
+        lower = np.where(unresolved_zero, np.where(excludes_zero, relative, -np.inf), relative - quantile * standard)
+        upper = np.where(unresolved_zero, np.where(excludes_zero, relative, np.inf), relative + quantile * standard)
     bound = np.broadcast_to(np.asarray(tolerance, dtype=np.float64), relative.shape)
     certified = (lower >= -bound) & (upper <= bound)
     violated = (lower > bound) | (upper < -bound)
