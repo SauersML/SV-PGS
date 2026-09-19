@@ -24,6 +24,10 @@ Measurements carry the evidence tags defined in MODEL.md: `[sim-only]`, `[semi-r
   - The trigger: design-reliability's fifteen Gibbs scenarios had BayesR beating fixed-shape TPB by 0.025–0.10 R² [sim-only: founder mosaics]. The E6 scenarios showed the opposite [sim-only: design-trlocus]. A learned continuous mixing density nests both.
   - Hand-set constants were removed: TPB shapes, slab width, class-offset scale.
   - Continuous quantities get continuous priors, with no point mass at zero.
+- **The mixing density's roughness penalty must be proper, and its value computed as an exact square** ([math/prior_sweep_a.md](math/prior_sweep_a.md)).
+  - A D2 or D3 penalty alone leaves a null space containing a collapse ray to a point mass at zero effect. The likelihood stays positive along that ray, so the flat-prior integral over it diverges and the Laplace evidence goes to +∞ on weak classes. D1 + D2 has no null space.
+  - xᵀSx can go negative in floating point along null directions; |R x|² cannot.
+  - D1 + D2 and D2 kept their Laplace-chosen λ under grid refinement, while D3 flipped to a λ → 0 mode at the finest spacing [sim-only: prior sweep A smoke, exact normal means].
 - **The r² prior offset has coefficient 1 by derivation.** Free EB could not identify it (range −0.29 to +0.69). With the offset, the full reliability prior gained +0.002–0.019 R² [sim-only: design-reliability].
 - **Every variant's prior depends on SV context (SPEC 8a5a936).**
   - Why: a SNV's prior used to ignore whether it sits in an SV locus. Poorly imputed SVs (VNTR allele r² ≈ 0.3) reach the phenotype mostly through tag SNVs, which a generic prior over-shrinks.

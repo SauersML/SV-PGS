@@ -14,6 +14,7 @@ These documents describe SV-PGS: the one model, its dosage store, its phenotypes
 | [DECISIONS.md](DECISIONS.md) | Dated log of the design rulings and the measurements behind them |
 | [math/scale_model.md](math/scale_model.md) | Derivation of the prior scale: the r² offset, joint leakage and the A-map, stacking, the frequency term from stabilizing selection, shape vs scale, the TR column, the SV-context kernel, the pooling pin |
 | [math/novel-evoprior.md](math/novel-evoprior.md) | The effect prior derived from mutation–selection–drift: exact folded SFS, the frequency-conditioned scale mixture and its ceiling, the S exponent in closed form, SV length as a subordinator, the TR diversity-deficit tilt, trait pooling, the SFS channel, identifiability (sim-only checks; adoption pending bench) |
+| [math/prior_sweep_a.md](math/prior_sweep_a.md) | Exact normal-means checks of the learned mixing density: the order-m null space is improper under a flat prior (collapse to V ≈ 0), penalty values as exact squares, grid and range invariance of the chosen λ, and a level-only pool losing a heavier tail (sim-only; adoption on bench) |
 
 **Standing rules** (also in SPEC.md):
 - one model and one path;
