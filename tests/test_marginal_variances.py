@@ -402,3 +402,21 @@ def test_no_upper_clamp_when_a_resolved_site_is_non_positive():
     variances = marginal_variances(solve, grams)
     assert variances[0] > 1.0 / precision[0]
     assert np.isclose(variances[1], exact[1, 1], rtol=1e-12)
+
+
+def test_a_zero_estimate_with_probe_signal_is_violated_not_an_error():
+    generator = np.random.default_rng(20)
+    sample_count, variant_count = 1500, 600
+    columns = _genotypes(generator, sample_count, variant_count, 0.97)
+    precision = variant_count / 1e-2 * np.exp(generator.normal(0.0, 1.0, variant_count))
+    blocks = tuple(np.arange(start, start + 100) for start in range(0, variant_count, 100))
+    covariance = np.linalg.inv(columns.T @ columns + np.diag(precision))
+    variances = np.diag(covariance).copy()
+    variances[blocks[2]] = 1.0 / precision[blocks[2]]  # pinned to the prior: zero information estimated
+    probes = generator.choice([-1.0, 1.0], size=(variant_count, 64))
+    removed = probes / precision[:, None] - covariance @ probes
+    solve = _solve(columns, precision, _resolved(1.0 / precision, sample_count))
+    removed_estimate = np.where(np.isin(np.arange(variant_count), solve.resolved), 0.0, 1.0 / precision - variances)
+    certificate = block_trace_certificate(removed_estimate, blocks, probes, removed, 0.5, certificate_level(64))
+    assert certificate.violated[2] and not certificate.certified[2]
+    assert np.isinf(certificate.relative_error[2])
