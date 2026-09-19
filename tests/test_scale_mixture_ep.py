@@ -14,6 +14,8 @@ from scipy.optimize import minimize_scalar
 
 from sv_pgs.scale_mixture_ep import (
     INDEPENDENT_EFFECTS,
+    CurvatureCorrection,
+    FixedPoint,
     AnnotationGroup,
     Cavity,
     GaussianPosterior,
@@ -31,6 +33,8 @@ from sv_pgs.scale_mixture_ep import (
     _maximize_coefficients,
     _penalized,
     _penalty_matrix,
+    _proposal,
+    _newton_b,
     _penalty_value,
     _restricted_prior,
     cavities,
@@ -666,6 +670,33 @@ def test_total_curvature_matches_ep_resolved_differences_of_the_evidence_gradien
     np.testing.assert_allclose(analytic, numerical, rtol=1e-5, atol=1e-5 * float(np.max(np.abs(numerical))))
     fixed_cavity = -(mapping.T @ _data_objective(prior, coefficients, cavity, _WORKING_BYTES).hessian @ mapping)
     assert np.max(np.abs(analytic - fixed_cavity)) > 1e-3 * float(np.max(np.abs(fixed_cavity)))
+
+
+def test_the_outer_step_never_certifies_where_the_total_curvature_is_indefinite():
+    # A correction C = B - A of the form every real one has, M'(B_z - A_z)M, here with B_z = -A_z - I: then
+    # B + S = S - A - M'M, a saddle. The Newton-B model reports it as indefinite with an infinite decrement (so no
+    # certificate can be issued there), and its step is the trust-region maximizer of the model inside the radius.
+    prior, cavity = _problem(variant_count=60, seed=17, node_count=12)
+    hyperparameters = _hyperparameters(prior, 18, log_smoothing=2.0)
+    penalty = _penalty_matrix(prior, hyperparameters.log_smoothing)
+    objective = _data_objective(prior, hyperparameters.coefficients, cavity, _WORKING_BYTES)
+    _value, _gradient, hessian = _penalized(prior, objective, hyperparameters.log_smoothing, penalty, hyperparameters.coefficients)
+    mapping = prior.coefficient_map
+    saddle = CurvatureCorrection(coefficient_map=mapping, matrix=mapping.T @ (2.0 * objective.hessian - np.eye(mapping.shape[0])) @ mapping)
+    expected = -hessian + saddle.matrix
+    assert np.linalg.eigvalsh(0.5 * (expected + expected.T))[0] < 0.0
+    point = FixedPoint(
+        cavity=cavity, posterior=diagonal_posterior(np.ones(prior.variant_count)), mean=np.zeros(prior.variant_count),
+        precision_norm=lambda direction: float(direction @ direction), effective_effects=float(prior.variant_count),
+    )
+    newton = _newton_b(prior, hyperparameters.log_smoothing, hyperparameters.coefficients, point, saddle, _WORKING_BYTES)
+    assert not newton.definite and newton.decrement == np.inf
+    np.testing.assert_allclose(newton.total, 0.5 * (expected + expected.T), rtol=1e-10, atol=1e-10)
+    radius = 0.5
+    step = _proposal(newton, radius)
+    assert np.linalg.norm(step) <= radius * (1.0 + 1e-12)
+    # The model rises along the step: g's - s'(B + S)s / 2 > 0.
+    assert float(newton.gradient @ step) - 0.5 * float(step @ newton.total @ step) > 0.0
 
 
 def test_total_curvature_is_the_fixed_cavity_curvature_for_independent_effects():
