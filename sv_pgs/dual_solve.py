@@ -39,6 +39,8 @@ from typing import Any, Callable, Iterator, Protocol
 
 import numpy as np
 
+from sv_pgs.marginal_variances import BulkSolve
+
 DIGIT_BITS = 7
 """Bits per balanced base-128 operand digit of the int8 split."""
 
@@ -284,6 +286,34 @@ def _cholesky_solve(array_module: Any, factor: Any, right: Any) -> Any:
     return array_module.linalg.solve(factor.T, array_module.linalg.solve(factor, right))
 
 
+def column_squares(source: DualTileSource, models: DualModels, count: PassCount) -> Any:
+    """||xt_k||^2 for every variant and model, one read: x_k'W x_k - (x_k'WC)(C'WC)^-1(C'Wx_k)."""
+    array_module = source.array_module
+    squares = array_module.zeros((source.variant_count, models.model_count))
+    covariate_count = int(models.covariates.shape[1])
+    weighted_covariates = array_module.concatenate(
+        [models.weights[:, model : model + 1] * models.covariates for model in range(models.model_count)], axis=1
+    )
+    for start, stop, tile in source.blocks():
+        cross = tile.rmatmat(weighted_covariates).reshape(stop - start, models.model_count, covariate_count)
+        factor = array_module.broadcast_to(models.covariate_factor[None], (stop - start,) + tuple(models.covariate_factor.shape))
+        solved = array_module.linalg.solve(array_module.swapaxes(factor, 2, 3), array_module.linalg.solve(factor, cross[..., None]))[..., 0]
+        squares[start:stop] = tile.weighted_column_squares(models.weights) - array_module.sum(cross * solved, axis=2)
+    count.note(models.model_count * (1 + covariate_count), 0.0, "column-squares")
+    return squares
+
+
+def resolved_spikes(spikes: Any, sample_count: int, array_module: Any) -> np.ndarray:
+    """The variants whose spike D_k ||xt_k||^2 exceeds 1 plus the bulk's mean eigenvalue (a fixed point)."""
+    chosen = array_module.zeros(spikes.shape[0], dtype=bool)
+    while True:
+        level = float(array_module.sum(array_module.where(chosen, 0.0, spikes))) / sample_count
+        updated = spikes > 1.0 + level
+        if bool(array_module.all(updated == chosen)):
+            return _host(array_module.flatnonzero(chosen))
+        chosen = updated
+
+
 @dataclass
 class Deflation:
     """Per model, a basis W (n x k) of its spike directions, S W, the factor of W'SW, and the variants W holds.
@@ -321,31 +351,13 @@ def spike_deflation(
     S W and the S W pass: the largest spikes, which cost CG the most iterations, are kept.
     """
     array_module = source.array_module
-    squares = array_module.zeros_like(models.variances)
-    covariate_count = int(models.covariates.shape[1])
-    weighted_covariates = array_module.concatenate(
-        [models.weights[:, model : model + 1] * models.covariates for model in range(models.model_count)], axis=1
-    )
-    for start, stop, tile in source.blocks():
-        cross = tile.rmatmat(weighted_covariates).reshape(stop - start, models.model_count, covariate_count)
-        factor = array_module.broadcast_to(models.covariate_factor[None], (stop - start,) + tuple(models.covariate_factor.shape))
-        solved = array_module.linalg.solve(array_module.swapaxes(factor, 2, 3), array_module.linalg.solve(factor, cross[..., None]))[..., 0]
-        squares[start:stop] = tile.weighted_column_squares(models.weights) - array_module.sum(cross * solved, axis=2)
-    count.note(models.model_count * (1 + covariate_count), 0.0, "column-squares")
-    spikes = models.variances * squares
+    spikes = models.variances * column_squares(source, models, count)
     resolved: dict[int, np.ndarray] = {}
     for model in range(models.model_count):
         if edges is not None and model in edges:
             resolved[model] = _host(array_module.flatnonzero(1.0 + spikes[:, model] > edges[model]))
-            continue
-        chosen = array_module.zeros(spikes.shape[0], dtype=bool)
-        while True:
-            level = float(array_module.sum(array_module.where(chosen, 0.0, spikes[:, model]))) / source.sample_count
-            updated = spikes[:, model] > 1.0 + level
-            if bool(array_module.all(updated == chosen)):
-                break
-            chosen = updated
-        resolved[model] = _host(array_module.flatnonzero(chosen))
+        else:
+            resolved[model] = resolved_spikes(spikes[:, model], source.sample_count, array_module)
     if column_budget is not None and sum(indices.size for indices in resolved.values()) > column_budget:
         ranked = sorted(
             ((float(spikes[int(index), model]), model, int(index)) for model, indices in resolved.items() for index in indices),
@@ -649,67 +661,9 @@ def resolved_design(source: DualTileSource, models: DualModels, resolved: Resolv
     return designs
 
 
-@dataclass
-class SplitSolution:
-    mean_duals: Any
-    resolved_mean: dict
-    core_factors: dict
-    resolved_duals: dict
-    bulk_duals: Any
-    result: SolveResult
-
-
-def split_mean(
-    source: DualTileSource,
-    bulk_models: DualModels,
-    resolved: ResolvedSites,
-    designs: dict,
-    right_hand_side: Any,
-    relative_bound: float,
-    count: PassCount,
-    deflation: Deflation | None = None,
-) -> SplitSolution:
-    """The exact mean of every model with its non-positive sites eliminated (ResolvedSites).
-
-    One certified solve carries every model's b and its Xt_L columns on the bulk operator, each
-    column to `relative_bound` of its own norm. The core's Cholesky factor is the check that the
-    global precision is positive definite: it raises when A is not.
-    """
-    array_module = source.array_module
-    blocks = [right_hand_side]
-    block_models = [np.arange(bulk_models.model_count)]
-    offsets: dict[int, int] = {}
-    position = bulk_models.model_count
-    for model in sorted(designs):
-        offsets[model] = position
-        blocks.append(designs[model])
-        block_models.append(np.full(int(designs[model].shape[1]), model))
-        position += int(designs[model].shape[1])
-    stacked = array_module.concatenate(blocks, axis=1)
-    column_models = array_module.asarray(np.concatenate(block_models))
-    bound = relative_bound * array_module.linalg.norm(stacked, axis=0)
-    result = certified_block_cg(source, bulk_models, stacked, array_module.zeros_like(stacked), column_models, bound, count, deflation=deflation, label="split")
-    bulk_duals = result.solution[:, : bulk_models.model_count]
-    mean_duals = bulk_duals.copy()
-    resolved_mean: dict[int, Any] = {}
-    core_factors: dict[int, Any] = {}
-    resolved_duals: dict[int, Any] = {}
-    for model, offset in offsets.items():
-        width = int(designs[model].shape[1])
-        resolved_dual = result.solution[:, offset : offset + width]
-        core = array_module.diag(array_module.asarray(resolved.precision[model], dtype=array_module.float64)) + designs[model].T @ resolved_dual
-        factor = array_module.linalg.cholesky(0.5 * (core + core.T))
-        if not bool(array_module.all(array_module.isfinite(factor))):
-            raise np.linalg.LinAlgError("the resolved sites' core is not positive definite: the global precision is not.")
-        mean = _cholesky_solve(array_module, factor, array_module.asarray(resolved.shift[model], dtype=array_module.float64) + designs[model].T @ bulk_duals[:, model])
-        resolved_mean[model] = mean
-        core_factors[model] = factor
-        resolved_duals[model] = resolved_dual
-        mean_duals[:, model] = bulk_duals[:, model] - resolved_dual @ mean
-    return SplitSolution(mean_duals, resolved_mean, core_factors, resolved_duals, bulk_duals, result)
-
-
-def split_draw_duals(split: SplitSolution, draw_models: np.ndarray, perturbation_duals: Any, resolved_noise: dict, array_module: Any) -> tuple[Any, dict]:
+def split_draw_duals(
+    core_factors: dict, resolved_mean: dict, resolved_duals: dict, draw_models: np.ndarray, perturbation_duals: Any, resolved_noise: dict, array_module: Any
+) -> tuple[Any, dict]:
     """Each draw's dual and its resolved block, from the bulk Matheron duals z_e.
 
     beta_L* - mu_L = core^-1/2 eps_L (L^-T eps_L with core = L L'), and the draw's dual relative to
@@ -718,11 +672,293 @@ def split_draw_duals(split: SplitSolution, draw_models: np.ndarray, perturbation
     """
     draw_duals = perturbation_duals.copy()
     resolved_draws: dict[int, Any] = {}
-    for model, factor in split.core_factors.items():
+    for model, factor in core_factors.items():
         columns = np.flatnonzero(np.asarray(draw_models) == model)
         if columns.size == 0:
             continue
         offset = array_module.linalg.solve(factor.T, array_module.asarray(resolved_noise[model]))
-        resolved_draws[model] = split.resolved_mean[model][:, None] + offset
-        draw_duals[:, columns] -= split.resolved_duals[model] @ offset
+        resolved_draws[model] = resolved_mean[model][:, None] + offset
+        draw_duals[:, columns] -= resolved_duals[model] @ offset
     return draw_duals, resolved_draws
+
+
+@dataclass(frozen=True)
+class DualCertificate:
+    """Per model, the certified bound on the mean's error ||mu_hat - mu||_A, and the bound asked for.
+
+    With the resolved sites L eliminated (bulk dual residual r_S = r_b - R_L mu_L, from the exact
+    residuals of the solve; L stationarity residual r_L; Z_L = S_S^-1 Xt_L),
+
+        ||mu_hat - mu||_A^2 = r_S'(I - S_S^-1) r_S + (r_L + Z_L'r_S)' core^-1 (r_L + Z_L'r_S)
+
+    exactly (Schur's complement of A's bulk block). The solve's Z_L and core are inexact, so the
+    bound adds their error: with R_L the exact residuals of the Z_L columns, Z_L'r_S differs from
+    the computed one by at most ||R_L||_F ||r_S|| per column, and core from the computed one by
+    Z_L'R_L, whose relative size delta = ||core_hat^-1||_2 ||Xt_L||_F ||R_L||_F must be below 1.
+    """
+
+    error_bound: Any
+    residual_bound: Any
+    resolved_counts: np.ndarray
+    iterations: int
+    restarts: int
+
+
+class DualGaussian:
+    """Stage 2's Gaussian q(beta) for every model in dual form: the mean, its certificate, the refresh
+    quantities for the leave-block-out marginal variances, the covariates and posterior draws.
+
+    A model is a quantitative trait on a training set: `training` (n, M) is 1 on its training rows,
+    `targets` and `offsets` are (n, M), and the covariates are profiled out in its metric
+    W = training / sigma^2. The sites (tau, nu) of `iterate` give D = 1/tau and m = nu / tau on the
+    bulk; the resolved set L of each model, its non-positive sites and its spikes (resolved_spikes),
+    is eliminated exactly, and the bulk probes (Rademacher on the training rows) give
+    tr(S_S^-1)/n, tr(S_S^-2)/n and tr(Q^2)/n for marginal_variances.BulkSolve.
+    """
+
+    def __init__(self, *, source: DualTileSource, training: Any, targets: Any, offsets: Any, covariates: Any, probe_count: int, seed: int) -> None:
+        array_module = source.array_module
+        self.source = source
+        self.array_module = array_module
+        self.training = array_module.asarray(training, dtype=array_module.float64)
+        self.targets = array_module.asarray(targets, dtype=array_module.float64)
+        self.offsets = array_module.asarray(offsets, dtype=array_module.float64)
+        self.covariates = array_module.asarray(covariates, dtype=array_module.float64)
+        self.model_count = int(self.training.shape[1])
+        self.training_counts = _host(self.training.sum(axis=0))
+        self.count = PassCount()
+        self.unit_squares = column_squares(source, DualModels(self.training, array_module.zeros((source.variant_count, self.model_count)), self.covariates, array_module), self.count)
+        generator = np.random.default_rng(seed)
+        signs = generator.choice(np.array([-1.0, 1.0]), size=(source.sample_count, self.model_count * probe_count))
+        self.probe_models = np.repeat(np.arange(self.model_count), probe_count)
+        self.probes = array_module.asarray(signs) * self.training[:, array_module.asarray(self.probe_models)]
+        self.probe_count = int(probe_count)
+        self.mean = array_module.zeros((source.variant_count, self.model_count))
+        self.genetic_image = array_module.zeros((source.sample_count, self.model_count))
+        self.alpha = array_module.zeros((int(self.covariates.shape[1]), self.model_count))
+        self.noise_variance = np.ones(self.model_count)
+        self._duals: Any = None
+        self._resolved: dict = {}
+        self.bulk_solves: list = []
+        self._state: dict = {}
+
+    def _models(self, noise_variance: np.ndarray, variances: Any) -> DualModels:
+        weights = self.training / self.array_module.asarray(noise_variance)[None, :]
+        return DualModels(weights, variances, self.covariates, self.array_module)
+
+    def iterate(self, *, site_precision: Any, site_shift: Any, noise_variance: np.ndarray, error_bound: Any, probe_residual_ratio: float) -> DualCertificate:
+        """The exact mean at the sites, certified to ||mu_hat - mu||_A <= error_bound per model.
+
+        `probe_residual_ratio` is the accuracy the refresh quantities need (the probes and the Z_L
+        columns solved to that share of their norm), from marginal_variances' certificate tolerance.
+        """
+        array_module = self.array_module
+        source = self.source
+        precision = array_module.asarray(site_precision, dtype=array_module.float64)
+        shift = array_module.asarray(site_shift, dtype=array_module.float64)
+        self.noise_variance = np.asarray(noise_variance, dtype=np.float64).copy()
+        positive = precision > 0.0
+        variances = array_module.where(positive, 1.0 / array_module.where(positive, precision, 1.0), 0.0)
+        spikes = variances * self.unit_squares / array_module.asarray(self.noise_variance)[None, :]
+        resolved: dict[int, np.ndarray] = {}
+        for model in range(self.model_count):
+            nonpositive = _host(array_module.flatnonzero(~positive[:, model]))
+            candidate = array_module.where(positive[:, model], spikes[:, model], 0.0)
+            resolved[model] = np.union1d(nonpositive, resolved_spikes(candidate, int(self.training_counts[model]), array_module)).astype(np.int64)
+        bulk_variances = variances.copy()
+        for model, indices in resolved.items():
+            bulk_variances[array_module.asarray(indices), model] = 0.0
+        bulk_mean = bulk_variances * shift
+        models = self._models(self.noise_variance, bulk_variances)
+        resolved_sites = ResolvedSites(
+            {model: indices for model, indices in resolved.items() if indices.size},
+            {model: precision[array_module.asarray(indices), model] for model, indices in resolved.items() if indices.size},
+            {model: shift[array_module.asarray(indices), model] for model, indices in resolved.items() if indices.size},
+        )
+        designs = resolved_design(source, models, resolved_sites)
+        prior_image = array_module.zeros((source.sample_count, self.model_count))
+        for start, stop, tile in source.blocks():
+            prior_image += tile.matmat(bulk_mean[start:stop])
+        self.count.note(self.model_count, 0.0, "prior-image")
+        right = mean_right_hand_side(models, self.targets - self.offsets, prior_image)
+        order = sorted(designs)
+        blocks = [right] + [designs[model] for model in order] + [self.probes]
+        column_models = np.concatenate(
+            [np.arange(self.model_count)] + [np.full(int(designs[model].shape[1]), model) for model in order] + [self.probe_models]
+        )
+        stacked = array_module.concatenate(blocks, axis=1)
+        widths = [self.model_count] + [int(designs[model].shape[1]) for model in order] + [int(self.probes.shape[1])]
+        offsets = np.concatenate([[0], np.cumsum(widths)])
+        target = array_module.asarray(error_bound, dtype=array_module.float64)
+        column_norms = array_module.linalg.norm(stacked, axis=0)
+        bound = probe_residual_ratio * column_norms
+        bound[: self.model_count] = target
+        for position, model in enumerate(order):
+            relative = min(probe_residual_ratio, float(target[model]) / max(float(column_norms[model]), np.finfo(np.float64).tiny))
+            bound[offsets[position + 1] : offsets[position + 2]] = relative * column_norms[offsets[position + 1] : offsets[position + 2]]
+        start = array_module.zeros_like(stacked)
+        same_resolved = self._resolved.keys() == resolved.keys() and all(np.array_equal(self._resolved[model], resolved[model]) for model in resolved)
+        if self._duals is not None and self._duals.shape == stacked.shape and same_resolved:
+            start = self._duals
+        # The split removes every spike from the bulk operator, which is what the relaxed operand error
+        # needs (certified_block_cg): an empty deflation says so.
+        spike_free = Deflation({}, {}, {}, resolved)
+        iterations = 0
+        restarts = 0
+        while True:
+            result = certified_block_cg(source, models, stacked, start, array_module.asarray(column_models), bound, self.count, deflation=spike_free, label="gaussian")
+            iterations += result.iterations
+            restarts += result.restarts
+            residual = result.residual
+            mean_duals = result.solution[:, : self.model_count].copy()
+            certificate = array_module.linalg.norm(residual[:, : self.model_count], axis=0)
+            state: dict = {"designs": designs, "order": order, "offsets": offsets, "cores": {}, "resolved_mean": {}, "resolved_duals": {}}
+            for position, model in enumerate(order):
+                columns = slice(int(offsets[position + 1]), int(offsets[position + 2]))
+                resolved_duals = result.solution[:, columns]
+                resolved_residual = residual[:, columns]
+                core = array_module.diag(resolved_sites.precision[model]) + designs[model].T @ resolved_duals
+                core = 0.5 * (core + core.T)
+                factor = array_module.linalg.cholesky(core)
+                if not bool(array_module.all(array_module.isfinite(factor))):
+                    raise np.linalg.LinAlgError("the resolved sites' core is not positive definite: the global precision is not.")
+                resolved_mean = _cholesky_solve(array_module, factor, resolved_sites.shift[model] + designs[model].T @ result.solution[:, model])
+                mean_duals[:, model] = result.solution[:, model] - resolved_duals @ resolved_mean
+                bulk_residual = residual[:, model] - resolved_residual @ resolved_mean
+                stationarity = resolved_sites.shift[model] + designs[model].T @ mean_duals[:, model] - resolved_sites.precision[model] * resolved_mean
+                # ||L^-1||_2^2 = 1 / lambda_min(core_hat).
+                inverse_factor_norm = float(array_module.sqrt(1.0 / array_module.linalg.eigvalsh(core)[0]))
+                residual_size = float(array_module.linalg.norm(resolved_residual))
+                core_error = inverse_factor_norm**2 * float(array_module.linalg.norm(designs[model])) * residual_size
+                if core_error >= 1.0:
+                    certificate[model] = np.inf
+                else:
+                    projected = array_module.linalg.solve(factor, stationarity + resolved_duals.T @ bulk_residual)
+                    quadratic = (float(array_module.linalg.norm(projected)) + inverse_factor_norm * residual_size * float(array_module.linalg.norm(bulk_residual))) ** 2 / (1.0 - core_error)
+                    certificate[model] = float(np.sqrt(float(bulk_residual @ bulk_residual) + quadratic))
+                state["cores"][model] = factor
+                state["resolved_mean"][model] = resolved_mean
+                state["resolved_duals"][model] = resolved_duals
+            open_models = _host(certificate > target)
+            if not open_models.any():
+                break
+            # Tighten the open models' mean and Z_L columns by the measured shortfall and continue.
+            for model in np.flatnonzero(open_models):
+                shortfall = float(target[model] / certificate[model]) if bool(array_module.isfinite(certificate[model])) else float(target[model] / max(float(column_norms[model]), np.finfo(np.float64).tiny))
+                bound[model] *= shortfall
+                if model in order:
+                    position = order.index(model)
+                    bound[offsets[position + 1] : offsets[position + 2]] *= shortfall
+            start = result.solution
+        self._duals = result.solution
+        self._resolved = resolved
+        self._state = state | {"models": models, "bulk_mean": bulk_mean, "bulk_variances": bulk_variances, "precision": precision}
+        self._finish(result, mean_duals, bulk_mean, bulk_variances, precision, models, state, resolved)
+        return DualCertificate(certificate, target, np.array([resolved[model].size for model in range(self.model_count)]), iterations, restarts)
+
+    def _finish(self, result: SolveResult, mean_duals: Any, bulk_mean: Any, bulk_variances: Any, precision: Any, models: DualModels, state: dict, resolved: dict) -> None:
+        """One read: the bulk mean m + D Xt'z, its genetic image X mu, and C = Xt' Z_L for the variances."""
+        array_module = self.array_module
+        source = self.source
+        order = state["order"]
+        resolved_blocks = [state["resolved_duals"][model] for model in order]
+        resolved_models = [np.full(int(block.shape[1]), model) for model, block in zip(order, resolved_blocks)]
+        duals = array_module.concatenate([mean_duals] + resolved_blocks, axis=1)
+        column_models = array_module.asarray(np.concatenate([np.arange(self.model_count)] + resolved_models))
+        left = models.sample_to_design(duals, column_models)
+        mean = bulk_mean.copy()
+        cross = array_module.empty((source.variant_count, int(duals.shape[1]) - self.model_count))
+        for start, stop, tile in source.blocks():
+            products = tile.rmatmat(left)
+            mean[start:stop] += bulk_variances[start:stop] * products[:, : self.model_count]
+            cross[start:stop] = products[:, self.model_count :]
+        for model in order:
+            mean[array_module.asarray(resolved[model]), model] = state["resolved_mean"][model]
+        image = array_module.zeros((source.sample_count, self.model_count))
+        for start, stop, tile in source.blocks():
+            image += tile.matmat(mean[start:stop])
+        self.count.note(int(duals.shape[1]), 0.0, "finish")
+        self.mean = mean
+        self.genetic_image = image
+        weights = models.weights
+        remainder = self.targets - self.offsets - image
+        normal = array_module.einsum("na,nm,nb->mab", self.covariates, weights, self.covariates)
+        self.alpha = array_module.linalg.solve(normal, (self.covariates.T @ (weights * remainder)).T[:, :, None])[:, :, 0].T
+        self.linear_predictor = self.offsets + image + self.covariates @ self.alpha
+        probe_solutions = result.solution[:, int(state["offsets"][-2]) :]
+        self.bulk_solves = []
+        offset = 0
+        for model in range(self.model_count):
+            probe_columns = array_module.asarray(np.flatnonzero(self.probe_models == model))
+            probes = self.probes[:, probe_columns]
+            solved = probe_solutions[:, probe_columns]
+            count = float(self.training_counts[model])
+            kernel = solved
+            core = array_module.zeros((0, 0))
+            model_cross = array_module.zeros((source.variant_count, 0))
+            if model in order:
+                factor = state["cores"][model]
+                design = state["designs"][model]
+                kernel = solved - state["resolved_duals"][model] @ _cholesky_solve(array_module, factor, design.T @ solved)
+                core = factor @ factor.T
+                width = int(design.shape[1])
+                model_cross = cross[:, offset : offset + width]
+                offset += width
+            self.bulk_solves.append(BulkSolve(
+                site_precision=_host(precision[:, model]),
+                resolved=resolved[model],
+                resolved_core=_host(core),
+                resolved_cross=_host(model_cross),
+                bulk_trace=float(array_module.sum(probes * solved)) / (self.probe_count * count),
+                bulk_square_trace=float(array_module.sum(solved * solved)) / (self.probe_count * count),
+                kernel_square_trace=float(array_module.sum(kernel * kernel)) / (self.probe_count * count),
+                sample_count=int(count),
+            ))
+
+    def residual_sum_of_squares(self) -> np.ndarray:
+        """(M,): each model's training sum of (y - linear predictor)^2 at the current mean."""
+        residual = self.targets - self.linear_predictor
+        return _host(self.array_module.sum(self.training * residual * residual, axis=0))
+
+    def draws_from_noise(self, *, prior_noise: Any, sample_noise: Any, resolved_noise: dict, draw_models: np.ndarray, error_bound: Any) -> tuple[Any, Any]:
+        """Posterior draws for given noise: the bulk by Matheron on S_S, L from its marginal (split_draw_duals).
+
+        prior_noise (p, K) and sample_noise (n, K) are e1 and e2 of each draw column, resolved_noise[m]
+        is eps_L (|L_m| x the model's draws); each draw's dual is certified to error_bound (K,).
+        Returns (draws (p, K), exact bulk dual residual norms (K,)).
+        """
+        array_module = self.array_module
+        source = self.source
+        state = self._state
+        models = state["models"]
+        device_models = array_module.asarray(draw_models)
+        rhs = draw_right_hand_side(source, models, device_models, prior_noise, sample_noise, self.count)
+        result = certified_block_cg(source, models, rhs, array_module.zeros_like(rhs), device_models, array_module.asarray(error_bound), self.count, label="draws")
+        draw_duals, resolved_draws = split_draw_duals(
+            state["cores"], state["resolved_mean"], state["resolved_duals"], draw_models, result.solution, resolved_noise, array_module
+        )
+        left = models.sample_to_design(draw_duals, device_models)
+        bulk_variances = state["bulk_variances"][:, device_models]
+        draws = self.mean[:, device_models] + array_module.sqrt(bulk_variances) * prior_noise
+        for start, stop, tile in source.blocks():
+            draws[start:stop] += bulk_variances[start:stop] * tile.rmatmat(left)
+        self.count.note(int(draw_duals.shape[1]), 0.0, "draws")
+        for model, values in resolved_draws.items():
+            columns = np.flatnonzero(draw_models == model)
+            draws[array_module.asarray(self._resolved[model])[:, None], array_module.asarray(columns)[None, :]] = values
+        return draws, result.residual_norm
+
+    def draws(self, *, draw_count: int, error_bound: Any, seed: int) -> Any:
+        """(p, M, draw_count) exact posterior draws of every model, each certified to its model's error_bound."""
+        array_module = self.array_module
+        generator = np.random.default_rng(seed)
+        draw_models = np.repeat(np.arange(self.model_count), draw_count)
+        prior_noise = array_module.asarray(generator.standard_normal((self.source.variant_count, draw_models.size)))
+        sample_noise = array_module.asarray(generator.standard_normal((self.source.sample_count, draw_models.size)))
+        resolved_noise = {
+            model: array_module.asarray(generator.standard_normal((self._resolved[model].size, draw_count)))
+            for model in range(self.model_count) if self._resolved[model].size
+        }
+        bound = array_module.asarray(error_bound, dtype=array_module.float64)[array_module.asarray(draw_models)]
+        draws, _norms = self.draws_from_noise(prior_noise=prior_noise, sample_noise=sample_noise, resolved_noise=resolved_noise, draw_models=draw_models, error_bound=bound)
+        return draws.reshape(self.source.variant_count, self.model_count, draw_count)

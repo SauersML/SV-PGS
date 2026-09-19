@@ -54,3 +54,29 @@ def _dense_operator(genotypes, covariates, weights, variances, model):
     from tests.test_dual_solve import _dense
 
     return _dense(genotypes, covariates, weights, variances, model)[3]
+
+
+def test_cuda_dual_gaussian_matches_the_host() -> None:
+    from tests.test_dual_solve import _gaussian_problem
+
+    genotypes, bounds, covariates, training, noise, precision, shift, response, offsets, _negative = _gaussian_problem(55)
+    means = []
+    for array_module in (np, cupy):
+        source = dual_solve.DenseDualSource(array_module.asarray(genotypes), bounds, array_module)
+        gaussian = dual_solve.DualGaussian(
+            source=source, training=array_module.asarray(training), targets=array_module.asarray(response), offsets=array_module.asarray(offsets),
+            covariates=array_module.asarray(covariates), probe_count=2, seed=6,
+        )
+        certificate = gaussian.iterate(
+            site_precision=array_module.asarray(precision), site_shift=array_module.asarray(shift), noise_variance=noise,
+            error_bound=np.full(MODEL_COUNT, np.sqrt(EPS)), probe_residual_ratio=np.sqrt(EPS),
+        )
+        assert bool(np.all(np.asarray(certificate.error_bound.get() if hasattr(certificate.error_bound, "get") else certificate.error_bound) <= np.sqrt(EPS)))
+        means.append(np.asarray(gaussian.mean.get() if hasattr(gaussian.mean, "get") else gaussian.mean))
+    from tests.test_dual_solve import _dense_gaussian
+
+    for model in range(MODEL_COUNT):
+        posterior_precision = _dense_gaussian(genotypes, covariates, training, noise, precision, shift, response, offsets, model)[0]
+        difference = means[0][:, model] - means[1][:, model]
+        # Both are within sqrt(eps) of the exact mean in the A-norm.
+        assert np.sqrt(float(difference @ posterior_precision @ difference)) <= 2.0 * np.sqrt(EPS) * (1.0 + np.linalg.cond(posterior_precision) * genotypes.shape[1] * EPS)
