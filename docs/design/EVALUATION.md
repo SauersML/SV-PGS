@@ -2,7 +2,7 @@
 
 Code: `sv_pgs/held_out_comparison.py` (`cross_fit_delta_r2`, `panel_z`, `power_weights`, `influence_correlation`, `size_gate`, `null_cost_gate`), tested on synthetic data.
 
-Measurements carry the evidence tags defined in MODEL.md (`[sim-only]`, `[semi-real]`, `[real]`, `[provenance unknown]`). Accuracy claims are adopted only on the neutral benchmarks, bench-real and bench-sim (scratchpad EVIDENCE_RULE). A lane's own simulation calibrates the tests' size and checks the math.
+Measurements carry the evidence tags defined in MODEL.md. Accuracy claims are adopted only on the neutral benchmarks, bench-real (`benchmarks/bench_real/`, real public phenotypes) and bench-sim (`benchmarks/bench_sim/`, a sealed real-haplotype suite with a pre-registered, misspecified truth family), or on in-workspace held-out data. A lane's own simulation calibrates the tests' size and checks the math.
 
 ## Arms
 All arms share the same samples, folds, covariates and inference; only the columns and prior inputs differ.
@@ -57,7 +57,7 @@ All arms share the same samples, folds, covariates and inference; only the colum
 
 ## Folds, resampling, reporting
 - **Folds:** one trait-agnostic 5-fold assignment, frozen before any phenotype is built.
-  - Kinship components (KING > 0.0884) and duplicates stay within one fold. Folds are built over the union of the imputed and long-read halves.
+  - Kinship components (KING > 0.0884 = 2^−3.5, the lower bound of second-degree relatedness in Manichaikul et al. 2010) and duplicates stay within one fold. Folds are built over the union of the imputed and long-read halves.
   - Stratified by imputation half × ancestry.
   - Every method uses the same folds. Baselines (LDpred2, SBayesRC, PRS-CS, BayesR, GBLUP) run on in-sample Stage 0 LD, so no external panel penalizes them, and they get their own SV-inclusive arms.
 - **Resampling unit:** the family.
@@ -81,8 +81,15 @@ All arms share the same samples, folds, covariates and inference; only the colum
   - RT7: EB regularization differing between arms, i.e. a non-certified fit.
   - RT8: multiplicity across traits and arms.
 
+## Neutral benchmark results so far
+- **bench-real** [real: MAGE lymphoblastoid expression, 1kGP SNV/indel and SV genotypes, leave-one-superpopulation-out and random5 splits, chromosome-jackknife SEs; mr.ash on 2,000 random genes, the lead variant and GBLUP on 5,000]. These are baselines only; SV-PGS itself is scored once the engine fits end to end.
+  - Mean held-out r² (loso, SNV set): mr.ash 0.071–0.081 (AFR 0.023); lead variant 0.061–0.068 (AFR 0.022); GBLUP 0.047–0.053 (AFR 0.013). mr.ash − GBLUP is +0.025 to +0.029 (z 13–19); mr.ash − lead variant is +0.012–0.015 loso (z 10–19) and +0.006–0.008 random5 (z 5–7). A held-out AFR loses about 70% of r² under every method.
+  - Adding the 1kGP panel's SVs to mr.ash: +0.0004 to +0.0015 r² (about +1.5–2% relative; z 1.2–2.1 per superpopulation). PanGenie SVs add about 0 for every method.
+  - SV credit: SVs are 0.32% of columns but 1.9–3.9% of mr.ash's held-out predictive covariance (about 6–12× per column); GBLUP gives them 0.2–0.3%. A sparse EB prior extracts the SV signal; an infinitesimal one does not.
+- **bench-sim:** the v7 cohort (public 1kGP founder weights, PREREG amendment 7) and its Beagle 5.5 arm are being built; its sealed commitments are recorded before any submission runs. Results on the earlier cohort are labelled "withdrawn weights" and are not used.
+
 ## Pending
 - The binary pair term, as the IRLS-linearized form. Until then binary claims use the conservative variance.
 - The operator (Hutchinson) form of the pair term at p ≈ 17M.
 - The claim (b) and (c) machinery in the repo; prototypes exist in the simulation code.
-- The validity simulations and the red-team sweep. They were running on MSI and were stopped; resubmit them when compute is back.
+- The validity simulations and the red-team sweep, to be rerun on bench-sim's v7 cohort through the task runners.

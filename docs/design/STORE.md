@@ -12,8 +12,8 @@ One consolidated spec. It replaces the numbered addenda A4 through A4.15. Code: 
   - Names of the two namespaces collide by chance (different people), so they are never compared across namespaces. Only a `dragen_sample` half goes through the CDR crosswalk (`sample_crosswalk` refuses any other), and cross-half identity comes only from that map or from genotype (KING). A name repeated within a half fails conversion.
 - **Code:** `(DS_milli·127 + 500) // 1000`, where DS_milli is the corrected dosage below. 255 is never written.
 - **Encoding:**
-  - shards of 65,536 rows with 64-row inner chunks;
-  - zstd level 3, with a crc32c-checked shard index;
+  - shards of 65,536 rows with 64-row inner chunks (registered pending constants: to be derived from the measured read path, speed-io; the GPU-decodable codec may replace this layout);
+  - zstd at libzstd's default level (3), with a crc32c-checked shard index;
   - a `transcode_store` step builds an uncompressed local cache: the same store (halves, sidecar, statistics, external maps, loci, MANIFEST), with every code array re-encoded raw and its code sums re-checked.
 - **Kernels** read codes as signed `code − 127` and accumulate in int32, exactly.
 - **Background removal ("value matched"),** applied before quantization and before any sums:
@@ -21,7 +21,7 @@ One consolidated spec. It replaces the numbered addenda A4 through A4.15. Code: 
   - The background values are q_v = m_v·w/(1 + K_v·w) and 2q_v. DS is set to 0 wherever its 3-dp value equals 0, q_v or 2q_v; every other value is left untouched.
   - In simulation this leaves zero background residual in every record type, and the only error is ≤ 2q_v, on carriers.
   - It is exact where a per-variant modal floor or a global 2ε is not, since the latter mishandle multi-path and PL-bearing records.
-- **Recalibration:** where a validated per-stratum κ exists (from truth), the stored value is D* = μ + κ(DS − μ). It is linear only. Until the truth-derived κ table arrives, the field stays empty; there is no default.
+- **Recalibration:** where a validated per-stratum κ exists (from truth), the stored value is D* = μ + κ(DS − μ). It is linear only. κ is fitted by the pipeline inside the AoU workspace from the long-read truth rows; until then the field stays empty, and there is no default.
 
 ## Halves: one verified site list, several measurements
 - Every half shares the chromosome's site list and its sites md5. The fit gives each half its own covariate.
@@ -60,7 +60,7 @@ One consolidated spec. It replaces the numbered addenda A4 through A4.15. Code: 
     - each feature is quantized to the store's 1/254 step with its own scale, which is within the prior's tolerance because features enter log u linearly;
     - near bases are sparse;
     - a class-specific block is kept where n · Var(feature) · τ̂² clears the certificate tolerance (τ̂² from hyperprior_pooling), and the class-summed block otherwise.
-  - Pairs are exact, about 2e10 on chr1. The derived far-basis binning width b/d ≤ (8/3)·(1/254)·h is barely cheaper.
+  - Pairs are exact, about 2e10 on chr1 [est]. The derived far-basis binning width b/d ≤ (8/3)·(1/254)·h is barely cheaper.
 - **Per-half sums:** sum_code, sum_code2 and no_calls. They give AF, variance and rsq_ds.
 
 ## Loci `loci/chrK`
@@ -83,7 +83,7 @@ tr_start, tr_end, n_intervals, n_records, n_dlen_nonzero, tr_motif_len (the majo
 - **G8:** excess co-carriage over independence within a TR locus, tested only where the rarer record has ≥ 21 carrier haplotypes. It detects the same length change recorded twice.
 - **Floor QC:** zeroed fractions by class × cx × has_pl.
 - **Service-half gates, which must pass before its data is pooled:**
-  - **S0, image identity: PASS.** GLIMPSE2 1.2.0-8671138 vs 1.0.0-2cee597. At one thread all 433,383 records of a public 50-sample chr22 shard are identical. At four threads, genotype discordance is 1.01–1.02× the same-image replicate floor. So one r² curve serves both halves.
+  - **S0, image identity: PASS.** GLIMPSE2 1.2.0-8671138 vs 1.0.0-2cee597. At one thread all 433,383 records of a public 50-sample chr22 shard are identical [real: public shard]. At four threads, genotype discordance is 1.01–1.02× the same-image replicate floor. So one r² curve serves both halves.
   - **S1 sites, S2 FORMAT, S3 floor:** pending until that half's data arrives.
 
 ## MANIFEST
