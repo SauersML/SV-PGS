@@ -252,10 +252,10 @@ $$U_j=a_j\Big(\sum_k q_{jk}\phi_k-\sum_k w_k\phi_k\Big).$$
 The Rao statistic uses the observed information $\mathcal I$ of all parameters $(\epsilon,\eta,\theta)$ at the scale-only fit:
 $$T=S^\top\mathcal I^{-1}S,\qquad S=\Big(\textstyle\sum_jU_j,\ \nabla_\eta,\ \nabla_\theta\Big)\ \ (\nabla_\eta,\nabla_\theta\approx0\text{ at the fit}),\qquad T\sim\chi^2_{\dim\phi}\ \text{under }H_0.$$
 - The efficient information per annotated variant, $[(\mathcal I^{-1})_{\epsilon\epsilon}]^{-1}/\sum_ja_j$, is what sets the power. It is small, because one $\hat\beta_j$ says little about its own latent $t_j$: normal-means deconvolution is severely ill-posed.
-- **Calibration requires a well-identified global density.**
-  - With an unpenalized flexible density, the weakly identified tail directions of $g$ contaminate a fixed-df Rao test. The observed-information version was conservative (mean T 0.07 under $H_0$, where χ²₂ has mean 2), and the per-variant OPG-regression version was anti-conservative (rejection 0.5–0.67 under $H_0$).
-  - In production, $g$ is the penalized learned-smoothness density. There the test is the variance-component score test of $\lambda_\delta=\infty$ in the generalization below: a quadratic form in the same $U_j$, whose null distribution is a χ² mixture computed from the penalized information.
-  - The calibrated demonstration below uses a correctly specified low-dimensional $g$.
+- **Calibration needs the test restricted to identified directions.** The part of $g$ below the noise floor (variances ≪ the sampling variance) carries essentially no Fisher information, and a fixed-df score test that includes those nuisance directions is ill-conditioned. The practical test therefore:
+  - uses only the identified subspace: shape directions $\phi$ and nuisance directions whose information clears the certificate tolerance;
+  - or, equivalently in production, is the variance-component score test of $\lambda_\delta=\infty$ in the penalized model below, whose penalty removes the unidentified directions;
+  - is calibrated by a parametric bootstrap from the fitted scale-only model.
 - With LD, sum the score contributions within LD blocks before forming outer products (block jackknife), since EP responsibilities are dependent within blocks.
 
 **Principled generalization if the test fires.** Let
@@ -264,20 +264,29 @@ with each $\delta_k$ a second-difference-penalized deviation constrained orthogo
 - λ_k is learned; $\lambda_k\to\infty$ returns scale-only *exactly*, so the test and the model agree.
 - The orthogonality keeps $m(d)$ and the location pin (§9) identified.
 
-**Checks (`check_shape.py` and `check_shape_param.py`).**
-- Setup: normal means with unit noise and 30% annotated variants, where $t$ follows a two-component normal mixture on the log-variance scale.
+**Checks (`check_shape_known.py`, `check_shape.py`, `check_shape_param.py`).**
+- Setup: normal means with unit noise and 30% annotated variants, where $t$ follows a two-component normal mixture on the log-variance scale (0.9 at −3, 0.1 at +1, SD 0.7).
   - H0: a translation by +1;
   - H1a: tail weight 0.1 → 0.3;
-  - H1b: tail only, 0.1 → 0.05 + 0.05 at a larger scale.
-- **Test calibration with a flexible unpenalized $g$** (cubic log-spline, 36 knots, M = 3000):
-  - the per-variant OPG-regression form rejected 50–67% under H0, so it is anti-conservative;
-  - the observed-information Rao form had mean T 0.07 under H0 (χ²₂ has mean 2), so it is conservative, and it rejected 17% under H1a.
-  - Both failures come from the weakly identified tail directions of $g$, as stated above.
-- **Cost of the wrong shape model** (posterior-mean MSE excess over the oracle prior, 6 replicates, M = 3000):
+  - H1b: tail only, 0.1 → 0.05 + 0.05 at +3.
+- **Power in the simple case** (nuisance known except the translation, which is projected out; 4·10⁵ draws per group):
+
+| truth | best translation θ* | NCP per annotated variant | annotated variants for 80% power (α = 0.05, df 2) |
+|---|---|---|---|
+| H0 | 1.011 | 6.6·10⁻⁶ (≈ 0) | none, as it should be |
+| H1a | 1.139 | 9.0·10⁻³ | ≈ 1,070 |
+| H1b | 1.094 | 1.08·10⁻² | ≈ 900 |
+
+  A shape change of this size is detectable with about 10³ annotated variants when the null density is known. Real annotation classes have 10⁴–10⁶ variants.
+- **Fitted-nuisance forms fail without the identified-subspace restriction.** Even with the correctly specified two-component $g$:
+  - The observed-information Rao statistic gave values from −2.6 to 17.4 in 11 H0 replicates.
+  - The OPG (BHHH) form gave values from −1388 to 2728 in 27 H0 replicates.
+  - Negative values mean the information matrices are numerically singular: the lower component (variance 0.05, noise 1) is nearly unidentified. This is the same sub-noise tail that forces the $\mathbb E_g[s]=1$ pin (§9).
+  - With a flexible unpenalized spline $g$, the per-variant OPG-regression form rejected 50–67% under H0.
+- **Cost of the wrong shape model** (posterior-mean MSE excess over the oracle prior, flexible $g$, M = 3000, 6 replicates):
   - H0: scale-only 1.07%, separate densities 1.72%. Pooling wins when the truth is a translation.
-  - H1a: scale-only 1.23%, separate densities 0.73%. A shape change costs scale-only about 0.5% of MSE.
+  - H1a: scale-only 1.23%, separate 0.73%.
   - The nested deviation with learned λ is built to take the better of the two; prior sweep B measures it.
-- **Calibrated size and power with a correctly specified two-component $g$** (`check_shape_param.py`): see the next revision of this section.
 
 ## 7. The TR signed-length column
 
@@ -388,7 +397,8 @@ The lead ruled the form $f_j=\sum_kH_k\,w(\log\mathrm{dist}_{jk})$ over all SV l
 | Offset derived vs free; r̂² AF miscalibration | `check_frequency.py` | same bias, 1.8× SD when free |
 | Tilt ≡ shift for log-quadratic η | `check_pooling.py` (a) | Δloglik ≤ 2e-5 |
 | The pin must be $\mathbb E_g[s]=1$ | `check_pooling_profile.py` | only the mean-variance pin identifies the level |
-| Shape score test: size and power | `check_shape_param.py` | §6 |
+| Shape score test: simple-case power | `check_shape_known.py` | ≈ 900–1,070 annotated variants for 80% power; H0 NCP ≈ 0 |
+| Fitted-nuisance shape test | `check_shape_param.py` | ill-conditioned unless restricted to identified directions |
 
 ## 11. Ranked recommendations
 Ordered by expected gain × confidence. Each is a derived model term plus the measurement that decides it.
