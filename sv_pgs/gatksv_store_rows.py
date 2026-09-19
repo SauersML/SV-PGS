@@ -111,11 +111,14 @@ class GatksvRows:
     """The GATK-SV records that stay rows of their own, every no-call filled.
 
     ``filled_from_imputed[r]`` says the no-calls of row ``r`` were predicted
-    from a paired imputed DS. ``unobserved_records`` are the block records no
+    from a paired imputed DS. ``lengths`` are the records' SV lengths (|SVLEN|
+    or END span), which a symbolic record's REF/ALT do not carry, for the
+    store's length annotation. ``unobserved_records`` are the block records no
     store sample has a call for, dropped.
     """
 
     gatksv_records: I64Array
+    lengths: F64Array
     codes: U8Array
     observed_fractions: F64Array
     filled_from_imputed: BoolArray
@@ -270,6 +273,7 @@ def gatksv_store_rows(
     records = np.asarray(kept_records, dtype=np.int64)
     rows = GatksvRows(
         gatksv_records=records,
+        lengths=gatksv.lengths[records],
         codes=row_codes,
         observed_fractions=observed_counts[records] / float(sample_count),
         filled_from_imputed=filled_from_imputed,

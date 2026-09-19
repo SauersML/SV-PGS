@@ -50,28 +50,12 @@ from sv_pgs.config import VariantClass
 
 
 class _PinnedBufferPool:
-    """Process-wide pinned host buffer pool.
+    """Process-wide pool of pinned host buffers for the store's CUDA staging ring.
 
-    Pinning host memory via ``cudaHostAlloc`` (what CuPy's
-    ``alloc_pinned_memory`` wraps) is expensive: each call requires the
-    kernel to lock pages and update the IOMMU, which for a 7+ GB
-    bitpacked-cache staging buffer can cost a meaningful fraction of a
-    minute. Freeing the buffer unmaps it; the next call immediately
-    reallocates and re-pins from scratch. When the pipeline runs SNP-only
-    then SNP+SV in the same process, or iterates the disease loop with
-    bitpacked cache loads at the head of each disease, the 7 GB pin/unpin
-    churn becomes a real wall-time tax.
-
-    This pool keeps released allocations around (keyed by size) so the
-    next ``acquire(n)`` of a same-or-smaller request reuses an existing
-    pin instead of round-tripping through the kernel. Grows monotonically
-    — we never shrink — and is bounded only by the host-RAM budget the
-    caller already enforces upstream.
-
-    Thread-safe under a module-level ``threading.Lock``. The lock is
-    released across the (potentially multi-second) actual
-    ``alloc_pinned_memory`` call so concurrent acquires of pool-hit sizes
-    are not serialized behind a cold-allocate.
+    Pinning (``cudaHostAlloc``) locks pages and updates the IOMMU, which is slow for large
+    buffers, so released buffers are kept by size and the smallest one that fits is reused.
+    The pool only grows; its size is bounded by the host budget its callers already enforce.
+    The lock is not held across a fresh allocation, so pool hits never wait behind one.
     """
 
     def __init__(self) -> None:
@@ -176,6 +160,7 @@ MISSING_CODE = 255
 MAXIMUM_DOSAGE_MILLI = 2000
 DEFAULT_SHARD_ROWS = 65536
 DEFAULT_INNER_CHUNK_ROWS = 64
+# libzstd's ZSTD_CLEVEL_DEFAULT; decoding does not depend on the level.
 ZSTD_LEVEL = 3
 VARIANT_CLASSES = tuple(VariantClass)
 # Stored with every variant_class column; a store whose legend differs is refused, never decoded.
@@ -300,6 +285,16 @@ def _code_array_metadata(layout: CodeArrayLayout) -> dict[str, Any]:
     }
 
 
+def _without_zstd_level(chain: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """A codec chain with any zstd level dropped: a frame decodes the same at every level."""
+    return [
+        {**codec, "configuration": {key: value for key, value in codec["configuration"].items() if key != "level"}}
+        if codec["name"] == "zstd"
+        else codec
+        for codec in chain
+    ]
+
+
 def _require(condition: bool, directory: Path, detail: str) -> None:
     if not condition:
         raise ValueError(f"unsupported Zarr array at {directory}: {detail}")
@@ -329,7 +324,7 @@ def _layout_from_metadata(metadata: Mapping[str, Any], directory: Path) -> CodeA
     sharding = codecs[0]["configuration"]
     inner_shape = sharding["chunk_shape"]
     _require(inner_shape[1] == shape[1], directory, "an inner chunk must span every sample")
-    matching = [name for name, chain in _INNER_CODECS.items() if sharding["codecs"] == chain]
+    matching = [name for name, chain in _INNER_CODECS.items() if _without_zstd_level(sharding["codecs"]) == _without_zstd_level(chain)]
     _require(len(matching) == 1, directory, f"inner codecs must be one of {list(_INNER_CODECS.values())}")
     _require(
         sharding["index_codecs"] == [_LITTLE_ENDIAN_BYTES_CODEC, _CRC32C_CODEC],
@@ -416,7 +411,8 @@ class CodeShardWriter:
         self._chunks_written = 0
         self._bytes_written = 0
         self._compressing: deque[Future[bytes]] = deque()
-        self._compressing_limit = 2 * len(os.sched_getaffinity(0))
+        # One queued chunk per worker keeps every worker busy while the oldest is written.
+        self._compressing_limit = len(os.sched_getaffinity(0))
 
     def _write_payload(self, payload: bytes) -> None:
         self._handle.write(payload)
@@ -972,7 +968,7 @@ def _read_variant_table(root: Path, manifest: Mapping[str, Any], half_indices: S
 
 
 def _ensure_open_file_capacity(required_descriptors: int) -> None:
-    """Raise the soft open-file limit to cover one descriptor and one mapping per shard."""
+    """Raise the soft open-file limit to ``required_descriptors`` if it is lower."""
     soft_limit, hard_limit = resource.getrlimit(resource.RLIMIT_NOFILE)
     if soft_limit != resource.RLIM_INFINITY and soft_limit < required_descriptors:
         if hard_limit != resource.RLIM_INFINITY and hard_limit < required_descriptors:
@@ -1027,7 +1023,10 @@ class DosageStore:
                 if (array.layout.row_count, array.layout.sample_count) != (record_count, sample_count):
                     raise ValueError(f"{array.directory} does not match the manifest's {record_count} x {sample_count}.")
             self._arrays.append(arrays)
-        _ensure_open_file_capacity(2 * sum(array.shard_count for arrays in self._arrays for array in arrays) + 256)
+        # One descriptor and one mapping per shard, on top of the descriptors already open.
+        _ensure_open_file_capacity(
+            2 * sum(array.shard_count for arrays in self._arrays for array in arrays) + len(os.listdir("/proc/self/fd"))
+        )
         self.variant_table = _read_variant_table(self.root, manifest, selected)
         self.reader_threads = len(os.sched_getaffinity(0))
         self._pool = ThreadPoolExecutor(max_workers=self.reader_threads, thread_name_prefix="dosage-store")
@@ -1168,8 +1167,9 @@ class DosageStore:
         path: each range is a zero-copy page-cache view where it sits inside one shard (else it
         is read into one spare buffer), and the next range is advised for read-ahead.  Every other
         case streams through a ring of buffers filled by a background reader.  The ring is
-        pinned host memory on a CUDA budget, and 2 to 3 buffers deep, as ``budget.host_bytes``
-        allows.  A yielded block stays valid until the caller asks for the next one.
+        pinned host memory on a CUDA budget, one slot for the consumer plus as many blocks read at
+        once as keep every reader thread busy (``_ring_depth``), as ``budget.host_bytes`` allows.
+        A yielded block stays valid until the caller asks for the next one.
         """
         selection = _SampleSelection.build(sample_indices, self.n_samples)
         ranges = [(int(start), int(stop)) for start, stop in row_ranges]
@@ -1190,7 +1190,7 @@ class DosageStore:
             return
         widest = max(stop - start for start, stop in ranges)
         buffer_bytes = widest * selection.indices.size
-        depth = min(3, budget.host_bytes // max(buffer_bytes, 1))
+        depth = min(self._ring_depth(widest), budget.host_bytes // max(buffer_bytes, 1))
         if depth < 2:
             raise MemoryError(f"double-buffering {widest}-row blocks needs {2 * buffer_bytes} host bytes.")
         ring, pinned = self._ring(depth, buffer_bytes, budget)
@@ -1219,6 +1219,24 @@ class DosageStore:
             prefetch.shutdown(wait=True)
             for owner in pinned:
                 _release_pinned(owner)
+
+    def _ring_depth(self, rows: int) -> int:
+        """Ring slots for blocks of ``rows``: the consumer's, plus blocks read concurrently.
+
+        A block splits into at most one piece per inner chunk (``_read_into``) on the shared
+        reader pool. Two blocks in flight let the next block's pieces start while the last
+        pieces of the current one finish; more are needed when one block has fewer pieces than
+        there are reader threads.
+        """
+        pieces = sum(min(self.reader_threads, -(-rows // arrays[0].layout.inner_rows)) for arrays in self._arrays)
+        return 1 + max(2, -(-self.reader_threads // max(pieces, 1)))
+
+    def block_rows_within(self, budget: ComputeBudget) -> int:
+        """The most rows per block whose read-ahead ring fits ``budget.host_bytes``."""
+        rows = max(1, budget.host_bytes // self.n_samples)
+        while rows > 1 and self._ring_depth(rows) * rows * self.n_samples > budget.host_bytes:
+            rows = max(1, budget.host_bytes // (self._ring_depth(rows) * self.n_samples))
+        return rows
 
     def _ring(self, depth: int, buffer_bytes: int, budget: ComputeBudget) -> tuple[list[U8Array], list[Any]]:
         if budget.device_kind == "cpu":
@@ -1396,7 +1414,7 @@ def transcode_store(store: DosageStore, destination: str | Path, *, codec: Codec
     This builds the local cache: bucket store (zstd, several halves) to one raw half on
     NVMe or in RAM, whose ranges are zero-copy views.
     """
-    ranges = _block_ranges(0, store.n_variants, store.n_samples, budget.host_bytes // 8)
+    ranges = _block_ranges(0, store.n_variants, store.n_samples, store.block_rows_within(budget) * store.n_samples)
     blocks = (block for _, _, block in store.iter_codes(ranges, None, budget))
     write_dosage_store(destination, store.n_samples, store.variant_table, blocks, codec=codec)
 

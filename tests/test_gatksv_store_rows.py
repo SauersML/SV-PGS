@@ -130,6 +130,7 @@ def test_store_rows_fuse_the_accepted_pair_and_fill_every_other_no_call() -> Non
     # The rest stay rows; the all-no-call DUP is dropped.
     assert rows.gatksv_records.tolist() == [1, 2, 3]
     assert rows.unobserved_records.tolist() == [4]
+    np.testing.assert_array_equal(rows.lengths, gatksv.lengths[[1, 2, 3]])
     assert rows.filled_from_imputed.tolist() == [True, True, False]
     np.testing.assert_allclose(rows.observed_fractions, observed[[1, 2, 3]].mean(axis=1))
     # Observed calls are stored exactly: 127 per allele, a copy number as itself.

@@ -37,6 +37,8 @@ One consolidated spec. It replaces the numbered addenda A4 through A4.15. Code: 
   4. DUP → duplication;
   5. otherwise other_complex_sv.
   - GATK-SV adds copy_number (multiallelic CNVs, read from FORMAT/CN) and inversion. Breakends are dropped.
+  - Length is not a class; it enters the prior as a smooth of log length. A GATK-SV row's symbolic REF/ALT carry no length, so its sv_length annotation comes from |SVLEN| or the END span (`GatksvRows.lengths`).
+  - Every variant_class column stores its legend, and a store whose legend differs from `VariantClass` is refused. Stores written before 2cc7aed, which merged the length-binned DEL/DUP classes (on MSI: s1M_100k, mini, build-lead/synth), must be converted again.
 - **Grouping:** bubble_idx, same_pos_first.
 - **Reliability keys:** sv_ctx, cx, has_pl.
 - **r2_truth (f32):** corr²(stored D, G), triad-corrected, computed in-workspace from the r̂ model's coefficients. It stays NaN until they arrive.

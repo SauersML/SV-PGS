@@ -448,15 +448,20 @@ def haplotype_r2(
 
 
 def solve_error_rate(target: F64Array, uninformed: F64Array, soft: F64Array, frequency: F64Array) -> F64Array:
-    """Bisect the confident-error rate that brings haplotype_r2 down to ``target`` (0 if already below)."""
+    """Bisect, to float64 precision, the confident-error rate that brings haplotype_r2 down to
+    ``target`` (0 if already below)."""
     low = np.zeros_like(target)
     high = 2 * np.minimum(frequency, 1 - frequency) * (1 - uninformed - soft)
-    for _ in range(50):
+    high = np.where(haplotype_r2(uninformed, low, soft, frequency) > target, high, 0.0)
+    while True:
         middle = 0.5 * (low + high)
+        # Stop where the interval is within one rounding of its upper end or has no float inside.
+        open_interval = (middle > low) & (middle < high) & (high - low > np.finfo(np.float64).eps * high)
+        if not open_interval.any():
+            return middle
         too_accurate = haplotype_r2(uninformed, middle, soft, frequency) > target
         low = np.where(too_accurate, middle, low)
         high = np.where(too_accurate, high, middle)
-    return 0.5 * (low + high)
 
 
 @dataclass(frozen=True)
@@ -485,16 +490,17 @@ def noise_parameters(
     pipeline: str,
     rng: np.random.Generator,
 ) -> NoiseParameters:
-    frequency = np.clip(source.pooled_frequencies[layout.source_index], 1e-4, 1 - 1e-4)
+    # The founder panel resolves frequencies in steps of one haplotype.
+    resolution = 1.0 / source.haplotypes.shape[1]
+    frequency = np.clip(source.pooled_frequencies[layout.source_index], resolution, 1 - resolution)
     maf_bin = _maf_bins(frequency)
     noise_class = layout.noise_class
     multiplier_table = np.array([MAF_R2_MULTIPLIER[name] for name in NOISE_CLASSES])
     target_mean = np.array([SINGLE_PATH_R2[name] for name in NOISE_CLASSES])[noise_class] * multiplier_table[noise_class, maf_bin]
-    target = np.clip(
-        rng.beta(target_mean * R2_BETA_CONCENTRATION, (1 - target_mean) * R2_BETA_CONCENTRATION), 0.02, 0.999
-    )
+    target = rng.beta(target_mean * R2_BETA_CONCENTRATION, (1 - target_mean) * R2_BETA_CONCENTRATION)
     loss_table = np.array([PIPELINE_R2_LOSS[pipeline]["SV" if name.startswith("SV") else name] for name in NOISE_CLASSES])
-    target = np.clip(target - loss_table[noise_class], 0.02, 0.999)
+    # r2 is a squared correlation: the pipeline loss can only take it down to 0.
+    target = np.clip(target - loss_table[noise_class], 0.0, 1.0)
     uninformed_share = np.array([UNINFORMED_SHARE[name] for name in NOISE_CLASSES])[noise_class]
     uninformed = np.where(layout.has_read_evidence, 0.0, uninformed_share * (1 - target))
     soft = np.minimum(SOFT_POSTERIOR_FRACTION * np.minimum(1.0, 10 * np.minimum(frequency, 1 - frequency)), 1 - uninformed)
@@ -560,15 +566,17 @@ def draw_tile_mosaic(source: HaplotypeSource, tile: int, cohort: Cohort, rng: np
     """Superpose donor switches (1 per 2 cM) and ancestry switches (T per Morgan); redraw ancestry at the latter."""
     first, last = source.tile_range(tile)
     genetic_map = source.genetic_map_cm[first:last]
-    span = float(genetic_map[-1] - genetic_map[0]) + 1e-9
+    span = float(genetic_map[-1] - genetic_map[0])
     ancestry_rate = ADMIXTURE_GENERATIONS / 100.0
     total_rate = 1.0 / DONOR_SEGMENT_MEAN_CM + ancestry_rate
-    expected = span * total_rate
-    breakpoint_columns = int(expected + 8 * np.sqrt(expected) + 16)
     haplotype_count = cohort.haplotype_count
-    breakpoints = np.cumsum(rng.exponential(1.0 / total_rate, size=(haplotype_count, breakpoint_columns)), axis=1)
-    if np.any(breakpoints[:, -1] < span):
-        raise RuntimeError("mosaic breakpoint draw did not cover the tile; widen breakpoint_columns.")
+    # A Poisson process on [0, span): a Poisson count, then that many sorted uniform positions.
+    # Columns past a haplotype's count sit at infinity, past the tile.
+    counts = rng.poisson(span * total_rate, size=haplotype_count)
+    breakpoint_columns = int(counts.max(initial=0))
+    positions = rng.random((haplotype_count, breakpoint_columns)) * span
+    positions[np.arange(breakpoint_columns)[None, :] >= counts[:, None]] = np.inf
+    breakpoints = np.sort(positions, axis=1)
     cumulative = np.cumsum(cohort.haplotype_proportions, axis=1)
     columns = breakpoint_columns + 1
     candidate = np.zeros((haplotype_count, columns), dtype=np.int8)
