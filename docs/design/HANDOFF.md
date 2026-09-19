@@ -14,6 +14,7 @@
   - `pleiotropy_layer.py` (not yet wired);
   - `held_out_comparison.py` (the evaluation tests and gates);
   - `compute_budget.py`, `tie_map.py`, `sample_table.py`;
+  - `cohort.py` (the shared covariates, multi-trait targets and kinship-grouped folds);
   - phenotypes in `all_of_us.py`, trimmed to the 21-trait panel.
 - **SPEC.md** carries the rulings: one model; CPU/GPU first-class; certification of approximate stages; EP-EB with a certificate; the r² prior; the TR length column; SV context in every prior; the learned mixing density; no hand-chosen priors.
 - **The old path is still present** and is scheduled for deletion (below). Cutover step C0 (dead code) and most of C1 (module moves) are done.

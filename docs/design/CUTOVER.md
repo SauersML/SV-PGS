@@ -4,6 +4,18 @@ This inventory was measured on main at `c2a9443` with a static import graph: Pyt
 - Symbols are named, not line-numbered, because line numbers drift.
 - C0 (dead code, `21cdec3`) and C1 (moves into the new modules, e.g. `f6af37f`) are done.
 
+## Progress
+The pre-cutover tree is tagged `archive/2026-09-19/old-path-final` (`f025cce`).
+
+| Step | State |
+|---|---|
+| B1, B2 | landed `6a85d17`: the package root exports only `ModelConfig`, `TraitType`, `VariantClass`, `VariantRecord`; kept modules load no JAX and leave `CUPY_TF32` unset (`test_package_import`) |
+| B4 | landed `664dea7`: `sv_pgs/cohort.py` (ancestry PCs, indicators, KING-component folds stratified by half × ancestry, one full-rank C, NaN-masked multi-trait targets) |
+| B3 | ruled: until the engine's Stage 2 driver lands, the CLI keeps only commands backed by kept modules; old fit commands are removed, not stubbed |
+| B5, B6 | ruled: the engine owns the certificate artifact and logistic EP; the old binary code goes with C5 |
+| B7 | ruled: owned by the deslop-fit lane |
+| C2–C8 | pending |
+
 ## Size
 - **`sv_pgs/`:** 65,304 lines.
   - Old path: 41 modules, 48,616 lines (74%). `cli.py`, `__init__.py` and `__main__.py` survive in trimmed form.
