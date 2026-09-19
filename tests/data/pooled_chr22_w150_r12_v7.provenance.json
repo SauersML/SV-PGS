@@ -1,0 +1,58 @@
+{
+ "cohort_path": "/scratch.global/sauer354/svpgs-team/bench-sim/v7/cohort/chr22",
+ "cohort_version": "bench-sim v7 (PREREG amendment 7: group weights from the public 1kGP founder composition)",
+ "cohort_generator": "lane/bench-sim-weights 3fa9577",
+ "cohort_built": "2026-09-19T15:58Z (bench-sim STATUS)",
+ "reference_commit": "00ae5c3f0a245041fb50e1086182345f375d0252",
+ "script_sha256": {
+  "v7_pooled_fixed_point2.py": "382fd2440c25177c5384da815b543d0e1ad16aa9aab82b97b64ad9d12935e062",
+  "v7_fixture_plain.py": "33c166b2814046247bdea9c51f2e8ad6a153c2fe5cfd4f585660a15aa890fa8a",
+  "rho_core_v7.py": "ad8ed78121523bdfa63e564e6475d6bb72153146010591d5adb74e0a04b5a5cb",
+  "diverge_search4.py": "f2f34d2eeecc4654400c397d6745fd887cde926d8f8599e6f24d6fcc840a0a5b"
+ },
+ "fixture_built": "2026-09-19T21:12:12+00:00",
+ "label": "semi-real: real 1kGP-haplotype LD, simulated effects",
+ "file": "pooled_chr22_w150_r12_v7.npz",
+ "file_sha256": "c588b9ca59342826c584e081f20554ba0bc4aedbebbfde861f9c9e9ba93bd853",
+ "source_file": "/scratch.global/sauer354/svpgs-team/speed-floor/v7_pooled_fixture_w150_r12_m1_w1_complete.npz (MSI)",
+ "producer": "speed-floor lane",
+ "statement": "c = 1 (weights w / c = 1.0588e-4): the 12 windows' union is one block-diagonal model; the reference's prior (one class, no annotations)",
+ "summary_at_c1": {
+  "truth": {
+   "evidence_c1": -0.22869699252209813,
+   "evidence_genome": -2159.9160404864824,
+   "gradient_norm_genome": 5772.10359802851,
+   "fixed_negative": 2,
+   "total_negative": 2
+  },
+  "plain_stall": {
+   "evidence_c1": -1.2230946369056393e-05,
+   "evidence_genome": -0.11551449348553261,
+   "gradient_norm_genome": 7.74843709959399e-07,
+   "fixed_negative": 1,
+   "total_negative": 1
+  },
+  "newton_terminal": {
+   "evidence_c1": -0.0018707806100236287,
+   "evidence_genome": -17.66848353911205,
+   "gradient_norm_genome": 5.2859356109767885,
+   "fixed_negative": 1,
+   "total_negative": 1
+  },
+  "plain_history_genome": [
+   -2159.9160404864824,
+   -0.11551449348553261
+  ],
+  "genome_scale": 9444.444444444445,
+  "weights_genome": [
+   1.0,
+   1.0,
+   1.0
+  ],
+  "weights_c1": [
+   0.00010588235294117646,
+   0.00010588235294117646,
+   0.00010588235294117646
+  ]
+ }
+}
