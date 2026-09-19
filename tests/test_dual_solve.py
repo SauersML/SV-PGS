@@ -369,3 +369,49 @@ def _check_split(descending: bool) -> None:
     draw_map = fused_weights[:, 1:] - fused_weights[:, [0]]
     target = np.linalg.inv(precision)
     assert np.linalg.norm(draw_map @ draw_map.T - target) <= np.linalg.cond(precision) * np.sqrt(EPS) * np.linalg.norm(target)
+
+
+class _CodeTileSource:
+    """A GenotypeBlockSource over code_products.CodeBlockTile tiles, as the store source streams them."""
+
+    def __init__(self, codes, means, scales, bounds, array_module, workspace_bytes):
+        from sv_pgs.code_products import CodeBlockTile
+
+        self.array_module = array_module
+        self.sample_count = int(codes.shape[1])
+        self.block_variant_indices = [np.arange(start, stop) for start, stop in bounds]
+        self._tiles = [
+            CodeBlockTile(array_module.asarray(codes[start:stop]), means[start:stop], scales[start:stop], array_module, workspace_bytes)
+            for start, stop in bounds
+        ]
+
+    def iter_tiles(self):
+        yield from enumerate(self._tiles)
+
+
+def _coded_problem(seed: int):
+    genotypes, bounds, covariates, weights, variances, prior_mean, response = _problem(seed)
+    rng = np.random.default_rng(seed)
+    codes = np.clip(np.rint(rng.normal(0.0, 40.0, (genotypes.shape[1], genotypes.shape[0]))), -127, 127).astype(np.int8)
+    means = codes.astype(np.float64).mean(axis=1)
+    scales = codes.astype(np.float64).std(axis=1)
+    standardized = (codes.astype(np.float64).T - means[None, :]) / scales[None, :]
+    return standardized, codes, means, scales, bounds, covariates, weights, variances, prior_mean, response
+
+
+def test_code_block_tiles_stream_through_the_same_certified_solve() -> None:
+    standardized, codes, means, scales, bounds, covariates, weights, variances, prior_mean, response = _coded_problem(41)
+    dense = dual_solve.DenseDualSource(standardized, bounds)
+    streamed = dual_solve.StreamedDualSource(_CodeTileSource(codes, means, scales, bounds, np, 1 << 26))
+    solutions = []
+    for source in (dense, streamed):
+        models = dual_solve.DualModels(weights, variances, covariates)
+        right = dual_solve.mean_right_hand_side(models, response, standardized @ prior_mean)
+        count = dual_solve.PassCount()
+        deflation, _resolved = dual_solve.spike_deflation(source, models, count)
+        bound = _solve_bound(right)
+        result = dual_solve.certified_block_cg(source, models, right, np.zeros_like(right), np.arange(MODEL_COUNT), bound, count, deflation=deflation)
+        assert np.all(result.residual_norm <= bound)
+        solutions.append((result.solution, bound))
+    (dense_solution, bound), (streamed_solution, _bound) = solutions
+    assert np.all(np.linalg.norm(dense_solution - streamed_solution, axis=0) <= 2.0 * bound * (1.0 + standardized.shape[0] * EPS))

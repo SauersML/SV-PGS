@@ -27,8 +27,9 @@ fold is a mask, so neither needs a Gram or a factor. Site precisions that are no
 enter S (with q of them and A > 0, S has exactly q negative eigenvalues, by Sylvester's law of
 inertia); they are eliminated exactly by the caller's split.
 
-Tiles multiply with a normwise relative operand error per column (the int8 digit split of
-code_products): ||delta_k|| <= relative_error ||operand_k||, exact zeros kept, 0 meaning exact.
+Tiles are code_products.CodeBlockTile (or DenseDualTile): a read prepares its sample operand once,
+with a normwise relative error per column ||delta_k|| <= relative_error ||operand_k|| (the int8
+digit split, exact zeros kept); relative_error 0 means the exact products.
 """
 
 from __future__ import annotations
@@ -43,21 +44,34 @@ DIGIT_BITS = 7
 
 
 class DualTile(Protocol):
-    """One LD block's standardized genotype columns X_b (n x p_b)."""
+    """One LD block's standardized genotype columns X_b (n x p_b): code_products.CodeBlockTile's interface.
 
-    def rmatmat(self, left: Any, relative_error: float) -> Any:
-        """X_b' left for left (n, K): (p_b, K)."""
+    `sample_operand(left, relative_error)` prepares a read's sample-side operand once for every
+    block (relative_error > 0); `rmatmat` takes that operand or a plain array (exact);
+    `accumulate_matmat(right, image, relative_error)` adds X_b R~ into the read's image; `matmat` is
+    exact. The error budget is normwise per column: ||L~_k - L_k||_2 <= relative_error ||L_k||_2.
+    """
+
+    def sample_operand(self, left: Any, relative_error: float) -> Any:
         ...
 
-    def matmat(self, right: Any, relative_error: float) -> Any:
-        """X_b right for right (p_b, K): (n, K)."""
+    def rmatmat(self, left: Any) -> Any:
+        """X_b' left for left (n, K) or its prepared operand: (p_b, K)."""
         ...
 
-    def column_squares(self, weights: Any) -> Any:
+    def matmat(self, right: Any) -> Any:
+        """X_b right for right (p_b, K): (n, K), exact."""
+        ...
+
+    def accumulate_matmat(self, right: Any, image: Any, relative_error: float) -> None:
+        """image += X_b R~ with ||R~_k - right_k||_2 <= relative_error ||right_k||_2."""
+        ...
+
+    def weighted_column_squares(self, weights: Any) -> Any:
         """(X_b * X_b)' weights for weights (n, M): (p_b, M)."""
         ...
 
-    def columns(self, local: np.ndarray) -> Any:
+    def columns(self, local: Any) -> Any:
         """X_b[:, local] as dense float64: (n, len(local))."""
         ...
 
@@ -95,22 +109,28 @@ def rounded_operand(values: Any, relative_error: float, array_module: Any) -> An
 
 
 class DenseDualTile:
-    """A block held as dense standardized columns; products round the operand as the int8 split does."""
+    """A block held as dense standardized columns; its products round the operand as the int8 split does."""
 
     def __init__(self, values: Any, array_module: Any) -> None:
         self.values = values
         self.array_module = array_module
 
-    def rmatmat(self, left: Any, relative_error: float) -> Any:
-        return self.values.T @ rounded_operand(left, relative_error, self.array_module)
+    def sample_operand(self, left: Any, relative_error: float) -> Any:
+        return rounded_operand(left, relative_error, self.array_module)
 
-    def matmat(self, right: Any, relative_error: float) -> Any:
-        return self.values @ rounded_operand(right, relative_error, self.array_module)
+    def rmatmat(self, left: Any) -> Any:
+        return self.values.T @ left
 
-    def column_squares(self, weights: Any) -> Any:
+    def matmat(self, right: Any) -> Any:
+        return self.values @ right
+
+    def accumulate_matmat(self, right: Any, image: Any, relative_error: float) -> None:
+        image += self.values @ rounded_operand(right, relative_error, self.array_module)
+
+    def weighted_column_squares(self, weights: Any) -> Any:
         return (self.values * self.values).T @ weights
 
-    def columns(self, local: np.ndarray) -> Any:
+    def columns(self, local: Any) -> Any:
         return self.values[:, local]
 
 
@@ -121,15 +141,43 @@ class DenseDualSource:
         self.array_module = array_module
         self.genotypes = array_module.asarray(genotypes, dtype=array_module.float64)
         self.sample_count, self.variant_count = (int(extent) for extent in self.genotypes.shape)
-        self.block_bounds = list(block_bounds)
-        if not self.block_bounds or self.block_bounds[0][0] != 0 or self.block_bounds[-1][1] != self.variant_count or any(
-            previous[1] != following[0] for previous, following in zip(self.block_bounds, self.block_bounds[1:])
-        ):
-            raise ValueError("block_bounds must cover every variant once, in order.")
+        self.block_bounds = _checked_bounds(block_bounds, self.variant_count)
 
     def blocks(self) -> Iterator[tuple[int, int, DualTile]]:
         for start, stop in self.block_bounds:
             yield start, stop, DenseDualTile(self.genotypes[:, start:stop], self.array_module)
+
+
+def _checked_bounds(block_bounds: list[tuple[int, int]], variant_count: int) -> list[tuple[int, int]]:
+    bounds = [(int(start), int(stop)) for start, stop in block_bounds]
+    if not bounds or bounds[0][0] != 0 or bounds[-1][1] != variant_count or any(
+        previous[1] != following[0] or following[1] <= following[0] for previous, following in zip(bounds, bounds[1:])
+    ):
+        raise ValueError("blocks must cover every variant once, in order.")
+    return bounds
+
+
+class StreamedDualSource:
+    """A streamed block source (store_block_source.StoreGenotypeBlockSource) as a DualTileSource.
+
+    Its tiles are code_products.CodeBlockTile, which already has the DualTile interface; the blocks
+    must be contiguous runs of the model's variant axis, in order.
+    """
+
+    def __init__(self, source: Any) -> None:
+        self.source = source
+        self.array_module = source.array_module
+        self.sample_count = int(source.sample_count)
+        indices = [np.asarray(block, dtype=np.int64) for block in source.block_variant_indices]
+        if any(not np.array_equal(block, np.arange(block[0], block[-1] + 1)) for block in indices):
+            raise ValueError("every block must be a contiguous run of variants.")
+        self.variant_count = int(indices[-1][-1] + 1)
+        self.block_bounds = _checked_bounds([(int(block[0]), int(block[-1]) + 1) for block in indices], self.variant_count)
+
+    def blocks(self) -> Iterator[tuple[int, int, DualTile]]:
+        for block_index, tile in self.source.iter_tiles():
+            start, stop = self.block_bounds[block_index]
+            yield start, stop, tile
 
 
 def _host(values: Any) -> np.ndarray:
@@ -186,14 +234,31 @@ class PassCount:
         self.records.append((label, columns, relative_error))
 
 
+def _read_products(tile: DualTile, operand: Any, left: Any, relative_error: float) -> tuple[Any, Any]:
+    """X_b' L for one block of a read, preparing the read's operand at its first block."""
+    if relative_error <= 0.0:
+        return tile.rmatmat(left), operand
+    if operand is None:
+        operand = tile.sample_operand(left, relative_error)
+    return tile.rmatmat(operand), operand
+
+
+def _accumulate(tile: DualTile, right: Any, image: Any, relative_error: float) -> None:
+    if relative_error <= 0.0:
+        image += tile.matmat(right)
+    else:
+        tile.accumulate_matmat(right, image, relative_error)
+
+
 def apply_operator(source: DualTileSource, models: DualModels, values: Any, column_models: Any, relative_error: float, count: PassCount, label: str) -> Any:
-    """S V for every column, one read."""
+    """S V for every column, one read; the sample operand is prepared once for the read."""
     array_module = source.array_module
     left = models.sample_to_design(values, column_models)
     image = array_module.zeros_like(values)
+    operand = None
     for start, stop, tile in source.blocks():
-        products = tile.rmatmat(left, relative_error)
-        image += tile.matmat(models.variances[start:stop][:, column_models] * products, relative_error)
+        products, operand = _read_products(tile, operand, left, relative_error)
+        _accumulate(tile, array_module.ascontiguousarray(models.variances[start:stop][:, column_models] * products), image, relative_error)
     count.note(int(values.shape[1]), relative_error, label)
     return values + models.design_to_sample(image, column_models)
 
@@ -262,10 +327,10 @@ def spike_deflation(
         [models.weights[:, model : model + 1] * models.covariates for model in range(models.model_count)], axis=1
     )
     for start, stop, tile in source.blocks():
-        cross = tile.rmatmat(weighted_covariates, 0.0).reshape(stop - start, models.model_count, covariate_count)
+        cross = tile.rmatmat(weighted_covariates).reshape(stop - start, models.model_count, covariate_count)
         factor = array_module.broadcast_to(models.covariate_factor[None], (stop - start,) + tuple(models.covariate_factor.shape))
         solved = array_module.linalg.solve(array_module.swapaxes(factor, 2, 3), array_module.linalg.solve(factor, cross[..., None]))[..., 0]
-        squares[start:stop] = tile.column_squares(models.weights) - array_module.sum(cross * solved, axis=2)
+        squares[start:stop] = tile.weighted_column_squares(models.weights) - array_module.sum(cross * solved, axis=2)
     count.note(models.model_count * (1 + covariate_count), 0.0, "column-squares")
     spikes = models.variances * squares
     resolved: dict[int, np.ndarray] = {}
@@ -454,12 +519,12 @@ def refresh_pass(source: DualTileSource, models: DualModels, duals: Any, column_
     prior_image = array_module.zeros((source.sample_count, models.model_count))
     column_count = int(duals.shape[1])
     for start, stop, tile in source.blocks():
-        products = tile.rmatmat(left, 0.0)
+        products = tile.rmatmat(left)
         variances, means = block_update(start, stop, products)
         if bool(array_module.any(variances < 0.0)):
             raise ValueError("a block update returned a negative site variance; such sites need the exact split.")
         models.variances[start:stop] = variances
-        combined = tile.matmat(array_module.concatenate([variances[:, column_models] * products, means], axis=1), 0.0)
+        combined = tile.matmat(array_module.concatenate([variances[:, column_models] * products, means], axis=1))
         image += combined[:, :column_count]
         prior_image += combined[:, column_count:]
     count.note(column_count + models.model_count, 0.0, "refresh")
@@ -472,7 +537,7 @@ def mean_from_dual(source: DualTileSource, models: DualModels, prior_mean: Any, 
     left = models.sample_to_design(duals, array_module.arange(models.model_count))
     mean = prior_mean.copy()
     for start, stop, tile in source.blocks():
-        mean[start:stop] += models.variances[start:stop] * tile.rmatmat(left, 0.0)
+        mean[start:stop] += models.variances[start:stop] * tile.rmatmat(left)
     count.note(int(duals.shape[1]), 0.0, "mean")
     return mean
 
@@ -486,7 +551,7 @@ def draw_right_hand_side(source: DualTileSource, models: DualModels, draw_models
     array_module = source.array_module
     image = array_module.zeros((source.sample_count, int(draw_models.shape[0])))
     for start, stop, tile in source.blocks():
-        image += tile.matmat(array_module.sqrt(models.variances[start:stop][:, draw_models]) * prior_noise[start:stop], 0.0)
+        image += tile.matmat(array_module.sqrt(models.variances[start:stop][:, draw_models]) * prior_noise[start:stop])
     count.note(int(draw_models.shape[0]), 0.0, "draw-rhs")
     return sample_noise - models.design_to_sample(image, draw_models)
 
@@ -521,7 +586,7 @@ def fused_final_pass(
     model_columns = array_module.arange(models.model_count)
     design_products = None if design_columns is None else array_module.empty((source.variant_count, int(len(design_columns))))
     for start, stop, tile in source.blocks():
-        products = tile.rmatmat(left, 0.0)
+        products = tile.rmatmat(left)
         if design_products is not None:
             design_products[start:stop] = products[:, design_columns]
         variances = models.variances[start:stop][:, column_models]
@@ -530,7 +595,7 @@ def fused_final_pass(
         block_weights[:, model_columns] += prior_mean[start:stop]
         block_weights[:, draw_columns] += block_weights[:, column_models[draw_columns]] + array_module.sqrt(variances[:, draw_columns]) * prior_noise[start:stop]
         weights[start:stop] = block_weights
-        combined = tile.matmat(array_module.concatenate([shifted, block_weights], axis=1), 0.0)
+        combined = tile.matmat(array_module.concatenate([shifted, block_weights], axis=1))
         image += combined[:, :column_count]
         scores += combined[score_rows, column_count:]
     count.note(column_count, 0.0, "fused-final")
