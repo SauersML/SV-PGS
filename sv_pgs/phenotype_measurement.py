@@ -21,15 +21,18 @@ is resolvable. The lattice reaches the largest squared within-person deviation, 
 and its spacing is halved until its quadrature in t meets the evidence tolerance.
 
 Inference is exact in T_i, which is one-dimensional (the lead's ruling): EM over the complete data
-(T_i, each occasion's lattice component).
+(T_i, each occasion's lattice component), with the density's step on the exact likelihood.
 - E-step: p(T_i | z_i) by the trapezoid rule in T. Each person's step is certified by the Trefethen-Weideman
-  bound with the mass-weighted modulus on a strip where the integrand is analytic (its width searched per
-  person), and the ends by a tail bound (``level_posterior``; math-density, mixing_density.md §11). Duplicated readings, whose integrand spikes,
-  need no separate treatment: their modulus bound is large, so their step is small. At every node come each
-  occasion's component responsibilities.
-- M-step: gamma by weighted least squares (weights E[1/s]), tau^2 = mean E[T_i^2], and the density's
-  coefficients maximizing the expected counts' multinomial log-likelihood minus the roughness penalty
-  (concave, by Newton).
+  bound with the mass-weighted strip modulus, bounded in closed form (its strip width searched per person),
+  and the ends by a tail bound (``level_posterior``; math-density, mixing_density.md §11). Duplicated
+  readings, whose integrand spikes, need no separate treatment: their modulus bound is large, so their step
+  is small. At every node come each occasion's component responsibilities.
+- M-steps (ECME, Liu and Rubin 1994): gamma by weighted least squares (weights E[1/s]) and tau^2 = mean
+  E[T_i^2], then the density's coefficients by Newton on the exact penalized marginal likelihood, whose
+  curvature is the observed information by Louis' identity; EM's own M-step for the density (the expected
+  counts' multinomial log-likelihood minus the roughness penalty, concave) where that curvature is not
+  negative definite. EM alone converges slowly in the density, whose lattice components the data barely tell
+  apart.
 - The penalty weight maximizes the Laplace evidence of the exact marginal likelihood (the engine's B + S
   form: the penalty's log pseudo-determinant, the null space profiled), whose curvature is the observed
   information by Louis' identity. At the ends of its resolvable range it moves to 0 or infinity exactly
@@ -46,6 +49,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 
 import numpy as np
+import scipy.linalg
 from scipy.special import log_ndtr, logsumexp
 from scipy.stats import chi2
 
@@ -623,45 +627,85 @@ class _Model:
             self.centres[persons] = posterior.level_mean
         return _Expectation(log_likelihood, level_mean, level_second, counts, precision, shift, missing)
 
-    def maximization(self, state: _State, expectation: _Expectation, log_smoothing: F64Array) -> _State:
-        """gamma by weighted least squares (weights E[1/s]), tau^2 = mean E[T^2], and the density."""
+    def level_step(self, state: _State, expectation: _Expectation) -> _State:
+        """The EM step of gamma (weighted least squares with weights E[1/s] and shifts E[T/s]) and tau^2
+        (the mean of E[T_i^2]) at a fixed density."""
         design = self.occasions.design
         weighted = design * expectation.occasion_precision[:, None]
         fixed_effects = np.linalg.solve(design.T @ weighted, weighted.T @ self.transformed - design.T @ expectation.occasion_shift)
-        coefficients = maximize_count_density(state.prior, log_smoothing, expectation.counts, state.hyperparameters.coefficients)
-        return _State(
-            fixed_effects, float(np.mean(expectation.level_second_moment)), state.prior, MixtureHyperparameters(coefficients, log_smoothing.copy())
-        )
+        return _State(fixed_effects, float(np.mean(expectation.level_second_moment)), state.prior, state.hyperparameters)
+
+    def density_step(self, state: _State, expectation: _Expectation, log_smoothing: F64Array) -> tuple[_State, _Expectation]:
+        """The density's coefficients by a Newton step on the exact penalized marginal log-likelihood.
+
+        Its gradient is M'(C - N pi) - S x (Fisher's identity, C the expected counts) and its curvature
+        M' I M + S, with I Louis' observed information (``expectation`` carries both). The step is halved until
+        the penalized log-likelihood rises. Where that curvature is not positive definite, or no halving rises,
+        the EM step (``maximize_count_density`` on the expected counts) is taken instead, which always rises.
+        """
+        prior = state.prior
+        allowed = _allowed(prior, log_smoothing)
+        mapping = prior.coefficient_map[: prior.grid_size] @ allowed
+        penalty = allowed.T @ _penalty_matrix(prior, log_smoothing) @ allowed
+        reduced = allowed.T @ state.hyperparameters.coefficients
+        masses = np.exp(class_log_density(prior, state.hyperparameters.coefficients)[0])
+        total = float(expectation.counts.sum())
+        gradient = mapping.T @ (expectation.counts - total * masses) - penalty @ reduced
+        curvature = mapping.T @ (total * (np.diag(masses) - np.outer(masses, masses)) - expectation.missing_information) @ mapping + penalty
+        curvature = 0.5 * (curvature + curvature.T)
+        base = self.penalized(state, expectation)
+        try:
+            step = scipy.linalg.cho_solve(scipy.linalg.cho_factor(curvature), gradient)
+        except np.linalg.LinAlgError:
+            step = None
+        length = 1.0
+        while step is not None and length * float(np.linalg.norm(step)) > _HALF_PRECISION * (1.0 + float(np.linalg.norm(reduced))):
+            trial = self._with_density(state, allowed @ (reduced + length * step), log_smoothing)
+            trial_expectation = self.expectation(trial, louis=False)
+            if self.penalized(trial, trial_expectation) > base:
+                return trial, trial_expectation
+            length *= 0.5
+        coefficients = maximize_count_density(prior, log_smoothing, expectation.counts, state.hyperparameters.coefficients)
+        trial = self._with_density(state, coefficients, log_smoothing)
+        return trial, self.expectation(trial, louis=False)
+
+    @staticmethod
+    def _with_density(state: _State, coefficients: F64Array, log_smoothing: F64Array) -> _State:
+        return _State(state.fixed_effects, state.level_variance, state.prior, MixtureHyperparameters(coefficients, log_smoothing.copy()))
 
     def penalized(self, state: _State, expectation: _Expectation) -> float:
         coefficients = state.hyperparameters.coefficients
         return expectation.log_likelihood - 0.5 * float(coefficients @ _penalty_matrix(state.prior, state.hyperparameters.log_smoothing) @ coefficients)
 
     def converge(self, state: _State, log_smoothing: F64Array) -> tuple[_State, _Expectation]:
-        """EM to its fixed point at one penalty weight; returns the state and its E-step with Louis' information.
+        """ECME (Liu and Rubin 1994) to the penalized maximum at one penalty weight; returns the state and its
+        E-step with Louis' information.
 
-        Near its fixed point EM ascends at a linear rate r, so after an increment d the remaining gain is
-        d r / (1 - r). It stops when that bound, with r the ratio of the last two increments, and the increment
-        itself are below EVIDENCE_TOLERANCE, with the lattice's quadrature bound met.
+        Each iteration takes gamma and tau^2 by their EM step (``level_step``), then the density by a Newton step
+        on the exact marginal likelihood (``density_step``); both raise the penalized log-likelihood. Near the
+        maximum the ascent is linear at a rate r, so after an increment d the remaining gain is d r / (1 - r).
+        It stops when that bound, with r the ratio of the last two increments, and the increment itself are below
+        EVIDENCE_TOLERANCE, with the lattice's quadrature bound met, or when an increment is not positive.
         """
         allowed = _allowed(state.prior, log_smoothing)
-        state = _State(
-            state.fixed_effects, state.level_variance, state.prior,
-            MixtureHyperparameters(allowed @ (allowed.T @ state.hyperparameters.coefficients), log_smoothing.copy()),
-        )
+        state = self._with_density(state, allowed @ (allowed.T @ state.hyperparameters.coefficients), log_smoothing)
         expectation = self.expectation(state, louis=False)
         previous = np.inf
         while True:
             refined = self._refined(state, expectation)
             if refined.prior.grid_size != state.prior.grid_size:
                 state, expectation, previous = refined, self.expectation(refined, louis=False), np.inf
-            candidate = self.maximization(state, expectation, log_smoothing)
-            candidate_expectation = self.expectation(candidate, louis=False)
+            levels = self.level_step(state, expectation)
+            candidate, candidate_expectation = self.density_step(levels, self.expectation(levels, louis=True), log_smoothing)
             increment = self.penalized(candidate, candidate_expectation) - self.penalized(state, expectation)
             state, expectation = candidate, candidate_expectation
-            rate = increment / previous if 0.0 < previous < np.inf else 0.0
-            if increment < EVIDENCE_TOLERANCE and 0.0 <= rate < 1.0 and increment * rate / (1.0 - rate) < EVIDENCE_TOLERANCE:
+            if increment <= 0.0:
+                # Every step rises in exact arithmetic, so the quadrature no longer resolves the gain.
                 return state, self.expectation(state, louis=True)
+            if previous < np.inf:
+                rate = increment / previous
+                if increment < EVIDENCE_TOLERANCE and 0.0 <= rate < 1.0 and increment * rate / (1.0 - rate) < EVIDENCE_TOLERANCE:
+                    return state, self.expectation(state, louis=True)
             previous = increment
 
     def _refined(self, state: _State, expectation: _Expectation) -> _State:
