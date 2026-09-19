@@ -1615,7 +1615,12 @@ def _stationarity_check(
     errs by at most E = h^2 s / 6 + e / h, least at h = (3 e / s)^(1/3), where E = (3^(2/3) / 2) s^(1/3) e^(2/3). The
     caller certifies the gain's upper bound 1/2 sum (|c| + E)^2 / s against ``tolerance``; e is set so that the error
     alone takes a quarter of it over the n interior weights, 1/2 E^2 / s = tolerance / (4 n):
-    e = (2 tolerance / (n 3^(4/3)))^(3/4) s^(1/4). A step halves only while one of its sides has no certified maximum.
+    e = (2 tolerance / (n 3^(4/3)))^(3/4) s^(1/4).
+
+    The inner maxima of the penalized objective are not unique, so each side continues the base's own: it starts
+    from the first-order predictor x + (dx/drho) (+-h). The difference at h/2 must agree with the one at h within
+    their two error bounds; otherwise a side reached another inner maximum (V there is a different function of
+    rho), and the step halves, as it does while a side has no certified maximum.
     """
     gradient = np.zeros(weights.shape[0])
     rounding = _EPSILON * evidence.magnitude
@@ -1629,16 +1634,31 @@ def _stationarity_check(
         unit[position] = 1.0
         accuracy = max((2.0 * tolerance / (count * 3.0 ** (4.0 / 3.0))) ** 0.75 * scale[position] ** 0.25, rounding)
         step = (3.0 * accuracy / scale[position]) ** (1.0 / 3.0)
+
+        def bound(length: float) -> float:
+            return length * length * scale[position] / 6.0 + accuracy / length
+
         while True:
             if step <= limit:
-                raise FloatingPointError("the B-evidence has no certified maximum on both sides of a fitted penalty weight")
-            both = [_evidence(view, weights + side * step * unit, evidence.coefficients, cavity, posterior_at, working_bytes, accuracy) for side in (-1.0, 1.0)]
-            if all(side is not None for side in both):
+                raise FloatingPointError("the B-evidence has no certified maximum in one basin on both sides of a fitted penalty weight")
+            quotients = []
+            for length in (step, 0.5 * step):
+                both = [
+                    _evidence(
+                        view, weights + side * length * unit, evidence.coefficients + side * length * evidence.responses[:, position], cavity,
+                        posterior_at, working_bytes, accuracy,
+                    )
+                    for side in (-1.0, 1.0)
+                ]
+                if any(side is None for side in both):
+                    break
+                quotients.append((both[1].value - both[0].value) / (2.0 * length))
+            if len(quotients) == 2 and abs(quotients[0] - quotients[1]) <= bound(step) + bound(0.5 * step):
                 break
             step *= 0.5
-        gradient[position] = (both[1].value - both[0].value) / (2.0 * step)
+        gradient[position] = quotients[0]
         steps[position] = step
-        errors[position] = step * step * scale[position] / 6.0 + accuracy / step
+        errors[position] = bound(step)
     return gradient, scale, steps, errors
 
 
@@ -1686,7 +1706,10 @@ def hyper_step(
         step_length, moved = 1.0, None
         while step_length * float(np.max(np.abs(direction))) > _HALF_PRECISION * (1.0 + float(np.max(np.abs(weights)))):
             trial_weights = np.clip(weights + step_length * direction, lower, upper)
-            trial = _certified_evidence(final_view, trial_weights, evidence.coefficients, cavity, posterior_at, working_bytes, tolerance, final_allowed.T @ initial_hyperparameters(prior).coefficients)
+            trial = _certified_evidence(
+                final_view, trial_weights, evidence.coefficients + evidence.responses @ (trial_weights - weights), cavity, posterior_at, working_bytes,
+                tolerance, final_allowed.T @ initial_hyperparameters(prior).coefficients,
+            )
             if trial is not None and trial.value > evidence.value:
                 moved = (trial_weights, trial)
                 break
