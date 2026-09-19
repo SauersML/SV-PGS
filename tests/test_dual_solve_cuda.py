@@ -6,7 +6,7 @@ import pytest
 
 from sv_pgs import dual_solve
 from sv_pgs.compute_budget import _try_import_cupy
-from tests.test_dual_solve import EPS, MODEL_COUNT, _CodeTileSource, _coded_problem, _problem, _solve_bound
+from tests.test_dual_solve import EPS, MODEL_COUNT, _CodeTileSource, _coded_problem, _grams, _problem, _solve_bound
 
 cupy = _try_import_cupy()
 pytestmark = pytest.mark.skipif(cupy is None, reason="needs a CUDA device")
@@ -65,7 +65,7 @@ def test_cuda_dual_gaussian_matches_the_host() -> None:
         source = dual_solve.DenseDualSource(array_module.asarray(genotypes), bounds, array_module)
         gaussian = dual_solve.DualGaussian(
             source=source, training=array_module.asarray(training), targets=array_module.asarray(response), offsets=array_module.asarray(offsets),
-            covariates=array_module.asarray(covariates), probe_count=2, seed=6,
+            covariates=array_module.asarray(covariates), grams=_grams(bounds, True), probe_count=2, seed=6,
         )
         certificate = gaussian.iterate(
             site_precision=array_module.asarray(precision), site_shift=array_module.asarray(shift), noise_variance=noise,
@@ -93,7 +93,7 @@ def test_cuda_posterior_and_information_solves_match_the_host() -> None:
         source = dual_solve.DenseDualSource(array_module.asarray(genotypes), bounds, array_module)
         gaussian = dual_solve.DualGaussian(
             source=source, training=array_module.asarray(training), targets=array_module.asarray(response), offsets=array_module.asarray(offsets),
-            covariates=array_module.asarray(covariates), probe_count=2, seed=9,
+            covariates=array_module.asarray(covariates), grams=_grams(bounds, True), probe_count=2, seed=9,
         )
         gaussian.iterate(site_precision=array_module.asarray(precision), site_shift=array_module.asarray(shift), noise_variance=noise,
                          error_bound=np.full(MODEL_COUNT, np.sqrt(EPS)), probe_residual_ratio=np.sqrt(EPS))

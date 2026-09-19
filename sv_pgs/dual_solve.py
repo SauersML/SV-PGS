@@ -39,7 +39,7 @@ from typing import Any, Callable, Iterator, Protocol
 
 import numpy as np
 
-from sv_pgs.marginal_variances import BulkSolve
+from sv_pgs.marginal_variances import BlockGrams, BulkSolve, WindowCross
 
 DIGIT_BITS = 7
 """Bits per balanced base-128 operand digit of the int8 split."""
@@ -82,6 +82,7 @@ class DualTileSource(Protocol):
     array_module: Any
     sample_count: int
     variant_count: int
+    block_bounds: list[tuple[int, int]]
 
     def blocks(self) -> Iterator[tuple[int, int, DualTile]]:
         """(start, stop, tile) for every block, in variant order, covering 0..p-1."""
@@ -826,6 +827,74 @@ class DualCertificate:
     restarts: int
 
 
+class _WindowLayout:
+    """Which rows of C = Xt'Z_L the marginal-variance maps read: block b's variants against the resolved
+    sites whose block lies in W(b) = {b-1, b, b+1} (b alone without cross-Grams), as marginal_variances
+    does. The blocks partition the variants; each must lie inside one tile of the source."""
+
+    def __init__(self, grams: BlockGrams, source: DualTileSource) -> None:
+        self.blocks = [np.asarray(members, dtype=np.int64) for members in grams.blocks]
+        self.block_count = len(self.blocks)
+        self.adjacent = bool(grams.next_cross)
+        self.block_of_variant = np.empty(source.variant_count, dtype=np.int64)
+        self.block_of_variant[np.concatenate(self.blocks)] = np.repeat(np.arange(self.block_count), [members.size for members in self.blocks])
+        if np.concatenate(self.blocks).size != source.variant_count or np.unique(np.concatenate(self.blocks)).size != source.variant_count:
+            raise ValueError("the window blocks must partition the variants.")
+        starts = np.asarray([start for start, _stop in source.block_bounds], dtype=np.int64)
+        stops = np.asarray([stop for _start, stop in source.block_bounds], dtype=np.int64)
+        self.tile_blocks: dict[int, list[int]] = {}
+        for block, members in enumerate(self.blocks):
+            if members.size == 0:
+                continue
+            tile = int(np.searchsorted(starts, members.min(), side="right")) - 1
+            if members.max() >= stops[tile]:
+                raise ValueError("a window block must lie inside one tile of the source.")
+            self.tile_blocks.setdefault(int(starts[tile]), []).append(block)
+        self.empty_blocks = [block for block, members in enumerate(self.blocks) if members.size == 0]
+
+    def positions(self, resolved: np.ndarray) -> list[np.ndarray]:
+        """Per block, the indices into `resolved` of the sites in the block's window, ascending."""
+        blocks_of_resolved = self.block_of_variant[resolved]
+        order = np.argsort(blocks_of_resolved, kind="stable")
+        ordered = blocks_of_resolved[order]
+        reach = 1 if self.adjacent else 0
+        out = []
+        for block in range(self.block_count):
+            low = np.searchsorted(ordered, block - reach, side="left")
+            high = np.searchsorted(ordered, block + reach, side="right")
+            out.append(np.sort(order[low:high]).astype(np.int64))
+        return out
+
+    def gather(self, array_module: Any, products: Any, start: int, column_offsets: dict, positions: dict, values: dict) -> None:
+        """Copy each window's entries of one tile's products to the host, in one gather."""
+        total = int(products.shape[1])
+        pieces, shapes = [], []
+        for model, offset in column_offsets.items():
+            for block in self.tile_blocks.get(start, []):
+                rows = self.blocks[block] - start
+                columns = offset + positions[model][block]
+                shapes.append((model, block, rows.size, columns.size))
+                pieces.append((rows[:, None] * total + columns[None, :]).ravel())
+        if pieces:
+            flat = np.concatenate(pieces)
+            gathered = _host(products.ravel()[array_module.asarray(flat)])
+            cursor = 0
+            for model, block, row_count, column_count in shapes:
+                size = row_count * column_count
+                values[model][block] = gathered[cursor : cursor + size].reshape(row_count, column_count)
+                cursor += size
+        for model in column_offsets:
+            for block in self.empty_blocks:
+                values[model][block] = np.zeros((0, positions[model][block].size))
+
+    def empty(self) -> WindowCross:
+        """The window layout of a model with no resolved sites."""
+        return WindowCross(
+            positions=tuple(np.zeros(0, dtype=np.int64) for _block in self.blocks),
+            values=tuple(np.zeros((members.size, 0)) for members in self.blocks),
+        )
+
+
 class DualGaussian:
     """Stage 2's Gaussian q(beta) for every model in dual form: the mean, its certificate, the refresh
     quantities for the leave-block-out marginal variances, the covariates and posterior draws.
@@ -835,12 +904,17 @@ class DualGaussian:
     W = training / sigma^2. The sites (tau, nu) of `iterate` give D = 1/tau and m = nu / tau on the
     bulk; the resolved set L of each model, its non-positive sites and its spikes (resolved_spikes),
     is eliminated exactly, and the bulk probes (Rademacher on the training rows) give
-    tr(S_S^-1)/n, tr(S_S^-2)/n and tr(Q^2)/n for marginal_variances.BulkSolve.
+    tr(S_S^-1)/n, tr(S_S^-2)/n and tr(Q^2)/n for marginal_variances.BulkSolve. `grams` gives the LD
+    blocks and windows the marginal-variance maps use (only its blocks and whether it has cross-Grams
+    are read), so C = Xt'Z_L is kept only where the maps read it (marginal_variances.WindowCross).
     """
 
-    def __init__(self, *, source: DualTileSource, training: Any, targets: Any, offsets: Any, covariates: Any, probe_count: int, seed: int) -> None:
+    def __init__(
+        self, *, source: DualTileSource, training: Any, targets: Any, offsets: Any, covariates: Any, grams: BlockGrams, probe_count: int, seed: int
+    ) -> None:
         array_module = source.array_module
         self.source = source
+        self.windows = _WindowLayout(grams, source)
         self.array_module = array_module
         self.training = array_module.asarray(training, dtype=array_module.float64)
         self.targets = array_module.asarray(targets, dtype=array_module.float64)
@@ -965,7 +1039,7 @@ class DualGaussian:
         return DualCertificate(certificate, target, np.array([resolved[model].size for model in range(self.model_count)]), iterations, restarts)
 
     def _finish(self, result: SolveResult, mean_duals: Any, bulk_mean: Any, bulk_variances: Any, precision: Any, models: DualModels, state: dict, resolved: dict) -> None:
-        """One read: the bulk mean m + D Xt'z, its genetic image X mu, and C = Xt' Z_L for the variances."""
+        """One read: the bulk mean m + D Xt'z, its genetic image X mu, and C = Xt' Z_L on the LD windows."""
         array_module = self.array_module
         source = self.source
         order = state["order"]
@@ -975,12 +1049,14 @@ class DualGaussian:
         column_models = array_module.asarray(np.concatenate([np.arange(self.model_count)] + resolved_models))
         left = models.sample_to_design(duals, column_models)
         mean = bulk_mean.copy()
-        # C = Xt'Z_L goes to the host block by block: it is p x |L|, which the device need not hold.
-        cross = np.empty((source.variant_count, int(duals.shape[1]) - self.model_count))
+        widths = {model: int(block.shape[1]) for model, block in zip(order, resolved_blocks)}
+        column_offsets = dict(zip(order, (self.model_count + np.concatenate([[0], np.cumsum([widths[model] for model in order])]))[:-1].astype(np.int64)))
+        positions = {model: self.windows.positions(resolved[model]) for model in order}
+        window_values: dict = {model: [None] * self.windows.block_count for model in order}
         for start, stop, tile in source.blocks():
             products = tile.rmatmat(left)
             mean[start:stop] += bulk_variances[start:stop] * products[:, : self.model_count]
-            cross[start:stop] = _host(products[:, self.model_count :])
+            self.windows.gather(array_module, products, start, column_offsets, positions, window_values)
         for model in order:
             mean[array_module.asarray(resolved[model]), model] = state["resolved_mean"][model]
         image = array_module.zeros((source.sample_count, self.model_count))
@@ -996,7 +1072,6 @@ class DualGaussian:
         self.linear_predictor = self.offsets + image + self.covariates @ self.alpha
         probe_solutions = result.solution[:, int(state["offsets"][-2]) :]
         self.bulk_solves = []
-        offset = 0
         for model in range(self.model_count):
             probe_columns = array_module.asarray(np.flatnonzero(self.probe_models == model))
             probes = self.probes[:, probe_columns]
@@ -1004,20 +1079,18 @@ class DualGaussian:
             count = float(self.training_counts[model])
             kernel = solved
             core = array_module.zeros((0, 0))
-            model_cross = np.zeros((source.variant_count, 0))
+            model_cross = self.windows.empty()
             if model in order:
                 block = state["blocks"][model]
                 design = block.design
                 kernel = solved - block.duals @ _cholesky_solve(array_module, block.factor, design.T @ solved)
                 core = block.core
-                width = int(design.shape[1])
-                model_cross = cross[:, offset : offset + width]
-                offset += width
+                model_cross = WindowCross(positions=tuple(positions[model]), values=tuple(window_values[model]))
             self.bulk_solves.append(BulkSolve(
                 site_precision=_host(precision[:, model]),
                 resolved=resolved[model],
                 resolved_core=_host(core),
-                resolved_cross=_host(model_cross),
+                resolved_cross=model_cross,
                 bulk_trace=float(array_module.sum(probes * solved)) / (self.probe_count * count),
                 bulk_square_trace=float(array_module.sum(solved * solved)) / (self.probe_count * count),
                 kernel_square_trace=float(array_module.sum(kernel * kernel)) / (self.probe_count * count),

@@ -387,6 +387,16 @@ def _gaussian_problem(seed: int):
     return genotypes, bounds, covariates, training, noise, precision, shift, response, offsets, negative
 
 
+def _grams(bounds, adjacent):
+    """Window blocks equal to the source's blocks; the maps read only the blocks and whether cross-Grams exist."""
+    from sv_pgs.marginal_variances import BlockGrams
+
+    blocks = tuple(np.arange(start, stop) for start, stop in bounds)
+    within = tuple(np.zeros((block.size, block.size)) for block in blocks)
+    next_cross = tuple(np.zeros((blocks[index].size, blocks[index + 1].size)) for index in range(len(blocks) - 1)) if adjacent else ()
+    return BlockGrams(blocks=blocks, within=within, next_cross=next_cross)
+
+
 def _dense_gaussian(genotypes, covariates, training, noise, precision, shift, response, offsets, model):
     weights = training[:, model] / noise[model]
     root = np.sqrt(weights)
@@ -404,7 +414,7 @@ def _dense_gaussian(genotypes, covariates, training, noise, precision, shift, re
 def test_the_dual_gaussian_is_the_dense_posterior_with_strong_and_negative_sites() -> None:
     genotypes, bounds, covariates, training, noise, precision, shift, response, offsets, negative = _gaussian_problem(51)
     source = dual_solve.DenseDualSource(genotypes, bounds)
-    gaussian = dual_solve.DualGaussian(source=source, training=training, targets=response, offsets=offsets, covariates=covariates, probe_count=4, seed=3)
+    gaussian = dual_solve.DualGaussian(source=source, training=training, targets=response, offsets=offsets, covariates=covariates, grams=_grams(bounds, True), probe_count=4, seed=3)
     scales = np.array([np.sqrt(float(_dense_gaussian(genotypes, covariates, training, noise, precision, shift, response, offsets, model)[1]
                                      @ _dense_gaussian(genotypes, covariates, training, noise, precision, shift, response, offsets, model)[0]
                                      @ _dense_gaussian(genotypes, covariates, training, noise, precision, shift, response, offsets, model)[1]))
@@ -425,9 +435,16 @@ def test_the_dual_gaussian_is_the_dense_posterior_with_strong_and_negative_sites
 
 def test_the_dual_gaussian_refresh_quantities_match_the_dense_bulk_operator() -> None:
     genotypes, bounds, covariates, training, noise, precision, shift, response, offsets, _negative = _gaussian_problem(52)
+    halves = [piece for start, stop in bounds for piece in ((start, (start + stop) // 2), ((start + stop) // 2, stop))]
+    for window_bounds, adjacent in ((bounds, True), (halves, False), (halves, True)):
+        _check_refresh_quantities(genotypes, bounds, covariates, training, noise, precision, shift, response, offsets, window_bounds, adjacent)
+
+
+def _check_refresh_quantities(genotypes, bounds, covariates, training, noise, precision, shift, response, offsets, window_bounds, adjacent) -> None:
     source = dual_solve.DenseDualSource(genotypes, bounds)
     ratio = np.sqrt(EPS)
-    gaussian = dual_solve.DualGaussian(source=source, training=training, targets=response, offsets=offsets, covariates=covariates, probe_count=3, seed=4)
+    grams = _grams(window_bounds, adjacent)
+    gaussian = dual_solve.DualGaussian(source=source, training=training, targets=response, offsets=offsets, covariates=covariates, grams=grams, probe_count=3, seed=4)
     gaussian.iterate(site_precision=precision, site_shift=shift, noise_variance=noise, error_bound=np.full(MODEL_COUNT, np.sqrt(EPS)), probe_residual_ratio=ratio)
     for model, solve in enumerate(gaussian.bulk_solves):
         _precision, _mean, _alpha, _rss, design = _dense_gaussian(genotypes, covariates, training, noise, precision, shift, response, offsets, model)
@@ -440,7 +457,14 @@ def test_the_dual_gaussian_refresh_quantities_match_the_dense_bulk_operator() ->
             core = np.diag(precision[solve.resolved, model]) + design_resolved.T @ inverse @ design_resolved
             np.testing.assert_allclose(solve.resolved_core, core, rtol=0.0, atol=ratio * conditioning * np.abs(core).max() * genotypes.shape[0])
             cross = design.T @ inverse @ design_resolved
-            np.testing.assert_allclose(solve.resolved_cross, cross, rtol=0.0, atol=ratio * conditioning * np.abs(cross).max() * genotypes.shape[0])
+            from sv_pgs.marginal_variances import BulkSolve, window_cross
+
+            reference = window_cross(BulkSolve(solve.site_precision, solve.resolved, solve.resolved_core, cross, solve.bulk_trace,
+                                               solve.bulk_square_trace, solve.kernel_square_trace, solve.sample_count), grams)
+            for block in range(len(grams.blocks)):
+                np.testing.assert_array_equal(solve.resolved_cross.positions[block], reference.positions[block])
+                np.testing.assert_allclose(solve.resolved_cross.values[block], reference.values[block], rtol=0.0,
+                                           atol=ratio * conditioning * np.abs(cross).max() * genotypes.shape[0])
         probes = gaussian.probes[:, gaussian.probe_models == model]
         count = float(training[:, model].sum())
         exact_trace = float(np.sum(probes * (inverse @ probes))) / (probes.shape[1] * count)
@@ -451,7 +475,7 @@ def test_the_dual_gaussian_refresh_quantities_match_the_dense_bulk_operator() ->
 def test_the_dual_gaussian_draws_have_the_posterior_covariance() -> None:
     genotypes, bounds, covariates, training, noise, precision, shift, response, offsets, _negative = _gaussian_problem(53)
     source = dual_solve.DenseDualSource(genotypes, bounds)
-    gaussian = dual_solve.DualGaussian(source=source, training=training, targets=response, offsets=offsets, covariates=covariates, probe_count=2, seed=5)
+    gaussian = dual_solve.DualGaussian(source=source, training=training, targets=response, offsets=offsets, covariates=covariates, grams=_grams(bounds, True), probe_count=2, seed=5)
     gaussian.iterate(site_precision=precision, site_shift=shift, noise_variance=noise, error_bound=np.full(MODEL_COUNT, np.sqrt(EPS)), probe_residual_ratio=np.sqrt(EPS))
     model = 0
     resolved_count = gaussian.bulk_solves[model].resolved.size
@@ -473,7 +497,7 @@ def test_the_dual_gaussian_draws_have_the_posterior_covariance() -> None:
 def test_posterior_solve_is_the_dense_inverse_with_negative_sites() -> None:
     genotypes, bounds, covariates, training, noise, precision, shift, response, offsets, negative = _gaussian_problem(57)
     source = dual_solve.DenseDualSource(genotypes, bounds)
-    gaussian = dual_solve.DualGaussian(source=source, training=training, targets=response, offsets=offsets, covariates=covariates, probe_count=2, seed=7)
+    gaussian = dual_solve.DualGaussian(source=source, training=training, targets=response, offsets=offsets, covariates=covariates, grams=_grams(bounds, True), probe_count=2, seed=7)
     gaussian.iterate(site_precision=precision, site_shift=shift, noise_variance=noise, error_bound=np.full(MODEL_COUNT, np.sqrt(EPS)), probe_residual_ratio=np.sqrt(EPS))
     rng = np.random.default_rng(58)
     right = rng.standard_normal((genotypes.shape[1], 5))
@@ -508,7 +532,7 @@ def test_the_recursive_share_minimizes_the_cycles_digit_passes() -> None:
 def test_information_solve_gives_the_bulk_back_products_and_coupling() -> None:
     genotypes, bounds, covariates, training, noise, precision, shift, response, offsets, _negative = _gaussian_problem(59)
     source = dual_solve.DenseDualSource(genotypes, bounds)
-    gaussian = dual_solve.DualGaussian(source=source, training=training, targets=response, offsets=offsets, covariates=covariates, probe_count=2, seed=8)
+    gaussian = dual_solve.DualGaussian(source=source, training=training, targets=response, offsets=offsets, covariates=covariates, grams=_grams(bounds, True), probe_count=2, seed=8)
     gaussian.iterate(site_precision=precision, site_shift=shift, noise_variance=noise, error_bound=np.full(MODEL_COUNT, np.sqrt(EPS)), probe_residual_ratio=np.sqrt(EPS))
     rng = np.random.default_rng(60)
     probes = rng.choice(np.array([-1.0, 1.0]), size=(genotypes.shape[1], 3))
