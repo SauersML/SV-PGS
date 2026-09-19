@@ -9,7 +9,8 @@ outside the fit. Three pieces live here:
   other and of D identify it exactly: r^2 = r(D,T1) r(D,T2) / r(T1,T2).
 - The per-record reliability model. It predicts r^2 from sites-only features
   on the logit scale and is fitted once on truth; the fit supplies the prior
-  offset log r^2 (entering with an EB-learned coefficient centred at 1).
+  offset log r^2, whose coefficient is exactly 1 by derivation (the prior on the
+  true-genotype effect maps to the stored column through r^2).
 - The monotone calibration curve. Where the imputed dosage is not a calibrated
   posterior mean (confident-draw SV/TR dosages, deflated multi-path alleles),
   D* = centre + scale (h(D) - centre) restores E[G | D*] = D*. Its shape h is
@@ -139,19 +140,19 @@ class ReliabilityModel:
     feature_names: tuple[str, ...]
     intercept: float
     coefficients: F64Array
-    minimum_r2: float
 
-    def predict_r2(self, features: NDArray) -> F64Array:
+    def _linear_predictor(self, features: NDArray) -> F64Array:
         design = np.asarray(features, float)
         if design.ndim != 2 or design.shape[1] != len(self.feature_names):
             raise ValueError(f"expected features of shape (records, {len(self.feature_names)}), got {design.shape}")
-        linear_predictor = self.intercept + design @ self.coefficients
-        r2 = 1.0 / (1.0 + np.exp(-linear_predictor))
-        return np.maximum(r2, self.minimum_r2)
+        return self.intercept + design @ self.coefficients
+
+    def predict_r2(self, features: NDArray) -> F64Array:
+        return np.exp(self.log_reliability_offset(features))
 
     def log_reliability_offset(self, features: NDArray) -> F64Array:
-        """log r^2, the prior-variance offset that enters with an EB coefficient centred at 1."""
-        return np.log(self.predict_r2(features))
+        """log r^2 = -log(1 + exp(-eta)), the prior-variance offset; finite for every finite eta."""
+        return -np.logaddexp(0.0, -self._linear_predictor(features))
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -159,7 +160,6 @@ class ReliabilityModel:
             "feature_names": list(self.feature_names),
             "intercept": self.intercept,
             "coefficients": self.coefficients.tolist(),
-            "minimum_r2": self.minimum_r2,
         }
 
     @classmethod
@@ -173,5 +173,4 @@ class ReliabilityModel:
             feature_names=feature_names,
             intercept=float(record["intercept"]),
             coefficients=coefficients,
-            minimum_r2=float(record["minimum_r2"]),
         )

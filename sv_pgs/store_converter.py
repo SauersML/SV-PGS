@@ -39,6 +39,9 @@ import numpy as np
 
 from sv_pgs._typing import BoolArray, I64Array, NDArray, U8Array
 from sv_pgs.dosage_store import (
+    CODES_PER_DOSAGE,
+    MAXIMUM_CODE,
+    MAXIMUM_DOSAGE_MILLI,
     MISSING_CODE,
     Codec,
     encode_dosage_milli,
@@ -57,12 +60,14 @@ NO_LOCUS = np.uint32(0xFFFFFFFF)
 NO_RECORD = np.uint32(0xFFFFFFFF)
 NO_DISTANCE = np.uint32(0xFFFFFFFF)
 SV_CONTEXT_WINDOW = 50_000
-MAXIMUM_BUBBLE_COUNT = 65_535
 # Records decoded, corrected and encoded per step of a batch's pass.
 DECODE_BLOCK_ROWS = 4_096
 # GP is written to 3 decimals, so its thousandths sum to 1000 within one unit of rounding.
 GENOTYPE_PROBABILITY_SUM_SLACK_MILLI = 1
-MAXIMUM_DOSAGE_MILLI = 2_000
+# DS and GP are rounded from one unrounded GP. With a, b in [0, 1) the fractional thousandths
+# of GP1 and GP2, DS rounds a + 2b while GP1 + 2 GP2 rounds a and b separately; every case
+# away from exact halves puts the two within one thousandth.
+DOSAGE_FROM_PROBABILITY_SLACK_MILLI = 1
 
 
 def core_spans(positions: NDArray, refs: Sequence[str], alts: Sequence[str]) -> tuple[I64Array, I64Array]:
@@ -171,9 +176,9 @@ def linear_recalibration(dosage_milli: NDArray, sample_groups: NDArray, scales: 
         centre = values[:, members].mean(axis=1, keepdims=True)
         recalibrated[:, members] = centre + kappa[:, group : group + 1] * (values[:, members] - centre)
     rounded = np.floor(recalibrated + 0.5)
-    clipped = (rounded < 0) | (rounded > 2000)
+    clipped = (rounded < 0) | (rounded > MAXIMUM_DOSAGE_MILLI)
     return Recalibration(
-        dosage_milli=np.clip(rounded, 0, 2000).astype(milli.dtype),
+        dosage_milli=np.clip(rounded, 0, MAXIMUM_DOSAGE_MILLI).astype(milli.dtype),
         clipped=clipped.sum(axis=1).astype(np.int64),
     )
 
@@ -350,7 +355,7 @@ def sv_context(
         own_is_sv_bubble = (own_slot < sv_bubbles.shape[0]) & (sv_bubbles[np.minimum(own_slot, sv_bubbles.shape[0] - 1)] == bubbles)
         own_slot = np.minimum(own_slot, sv_bubbles.shape[0] - 1)
         own_overlaps = own_is_sv_bubble & (bubble_end[own_slot] > low) & (bubble_start[own_slot] < high)
-        nearby = np.minimum(overlapping - own_overlaps.astype(np.int64), MAXIMUM_BUBBLE_COUNT).astype(np.uint16)
+        nearby = np.minimum(overlapping - own_overlaps.astype(np.int64), np.iinfo(np.uint16).max).astype(np.uint16)
     return SvContext(
         nearest_common_sv_distance=distance,
         nearest_common_sv_record=nearest,
@@ -456,14 +461,14 @@ def _imputed_dosage_milli(record: Any, path: Path, row: int) -> NDArray:
         "GP does not sum to 1",
     )
     implied = probability_milli[:, 1] + 2.0 * probability_milli[:, 2]
-    _gate(bool(np.all(np.abs(dosage_milli - implied) <= 1.0)), path, row, "DS differs from GP1 + 2 GP2")
+    _gate(bool(np.all(np.abs(dosage_milli - implied) <= DOSAGE_FROM_PROBABILITY_SLACK_MILLI)), path, row, "DS differs from GP1 + 2 GP2")
     return dosage_milli
 
 
 # A hard-call half's no-call in the uint16 decode block.
-NO_CALL_MILLI = 65_535
+NO_CALL_MILLI = np.iinfo(np.uint16).max
 # cyvcf2 gt_types codes: HOM_REF, HET, UNKNOWN, HOM_ALT.
-_MILLI_OF_GT_TYPE = np.array([0, 1_000, NO_CALL_MILLI, 2_000])
+_MILLI_OF_GT_TYPE = np.array([0, MAXIMUM_DOSAGE_MILLI // 2, NO_CALL_MILLI, MAXIMUM_DOSAGE_MILLI])
 
 
 def _called_dosage_milli(record: Any, path: Path, row: int) -> NDArray:
@@ -606,8 +611,8 @@ def _half_code_blocks(
         codes[rows, columns] = encode_dosage_milli(no_call_milli[start:stop])[rows, sample_groups[columns]]
         no_calls[start:stop] = np.bincount(rows, minlength=stop - start)
         if scales is not None:
-            # D* from the codes: DS = code / 127 to the nearest thousandth, recalibrated, re-encoded.
-            dosage_milli = ((codes.astype(np.int64) * 2000 + 127) // 254).astype(np.uint16)
+            # D* from the codes: DS = code / 127 to the nearest thousandth (rounded half up), recalibrated, re-encoded.
+            dosage_milli = ((codes.astype(np.int64) * MAXIMUM_DOSAGE_MILLI + CODES_PER_DOSAGE) // MAXIMUM_CODE).astype(np.uint16)
             codes = encode_dosage_milli(linear_recalibration(dosage_milli, sample_groups, scales[start:stop]).dosage_milli)
         yield codes
 

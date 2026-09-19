@@ -83,22 +83,27 @@ def test_calibration_curve_round_trips_and_rejects_a_constant_dosage():
         calibrated_scale(1.2, 1.0, 1.0)
 
 
-def test_reliability_model_bounds_predictions_and_gives_the_log_offset():
+def test_reliability_model_gives_a_finite_log_offset_for_every_prediction():
     model = ReliabilityModel(
         version="v1",
         feature_names=("info", "is_vntr"),
         intercept=-1.0,
         coefficients=np.array([3.0, -2.0]),
-        minimum_r2=0.01,
     )
-    features = np.array([[0.9, 0.0], [0.9, 1.0], [-10.0, 1.0]])
+    # The last record's linear predictor, -1 - 3e3 - 2, underflows exp(eta) to 0 in float64.
+    features = np.array([[0.9, 0.0], [0.9, 1.0], [-1e3, 1.0]])
+    linear_predictor = -1.0 + features @ np.array([3.0, -2.0])
     r2 = model.predict_r2(features)
-    assert np.all((r2 >= 0.01) & (r2 < 1.0))
+    assert np.all((r2 >= 0.0) & (r2 < 1.0))
     assert r2[0] > r2[1]
-    assert r2[2] == 0.01
-    np.testing.assert_allclose(model.log_reliability_offset(features), np.log(r2))
+    offset = model.log_reliability_offset(features)
+    assert np.all(np.isfinite(offset))
+    # Both forms round at most four times (exp, add, divide or log1p, log), each by eps / 2 at most.
+    direct = np.log(1.0 / (1.0 + np.exp(-linear_predictor[:2])))
+    np.testing.assert_allclose(offset[:2], direct, rtol=0.0, atol=4 * np.finfo(float).eps)
+    assert offset[2] == linear_predictor[2]
     restored = ReliabilityModel.from_dict(model.to_dict())
-    np.testing.assert_allclose(restored.predict_r2(features), r2)
+    np.testing.assert_array_equal(restored.log_reliability_offset(features), offset)
     with pytest.raises(ValueError, match="expected features"):
         model.predict_r2(np.zeros((2, 3)))
     record = model.to_dict()

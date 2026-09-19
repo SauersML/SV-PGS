@@ -40,11 +40,11 @@ from cyvcf2 import VCF
 
 from sv_pgs._typing import BoolArray, F64Array, I64Array, NDArray, U8Array
 from sv_pgs.config import VariantClass
+from sv_pgs.dosage_store import MAXIMUM_CODE
 from sv_pgs.variant_typing import variant_class_and_length
 
 PASSING_FILTER = "PASS"
 COPY_NUMBER_FILTER = "MULTIALLELIC"
-MAXIMUM_STORED_VALUE = 254
 
 
 @dataclass(frozen=True, slots=True)
@@ -209,8 +209,8 @@ class GatksvSource:
                 )
                 if copy_number:
                     copy_numbers, no_call = self._copy_numbers(record)
-                    if int(copy_numbers.max(initial=0)) > MAXIMUM_STORED_VALUE:
-                        self.skipped_records[f"copy number above {MAXIMUM_STORED_VALUE}"] += 1
+                    if int(copy_numbers.max(initial=0)) > MAXIMUM_CODE:
+                        self.skipped_records[f"copy number above {MAXIMUM_CODE}"] += 1
                         continue
                     values = copy_numbers.astype(np.uint8)
                 else:
@@ -237,7 +237,6 @@ class GatksvSource:
                 yield _block_from_records(pending)
         finally:
             reader.close()
-
 
 
 def _block_from_records(

@@ -5,9 +5,9 @@ import numpy as np
 import pytest
 
 from sv_pgs.config import VariantClass
+from sv_pgs.dosage_store import CODES_PER_DOSAGE
 from sv_pgs.gatksv_source import GatksvBlock
 from sv_pgs.gatksv_store_rows import (
-    CODES_PER_ALLELE,
     FalsePositiveRates,
     ImputedSvRecords,
     gatksv_sites,
@@ -83,7 +83,7 @@ def _scenario() -> tuple[GatksvBlock, ImputedSvRecords, dict[str, np.ndarray]]:
             kinds=np.array(["DEL", "INS", "DEL"]),
             duplications_are_insertions=True,
         ),
-        codes=_codes(np.stack([dosage, unrelated_dosage, sharp_dosage]), CODES_PER_ALLELE),
+        codes=_codes(np.stack([dosage, unrelated_dosage, sharp_dosage]), CODES_PER_DOSAGE),
         prior_log_reliabilities=np.log(np.array([0.64, 0.64, _CONTRADICTED_RELIABILITY])),
         strata=np.array([0, 0, 1], dtype=np.int64),
     )
@@ -119,8 +119,8 @@ def test_store_rows_fuse_the_accepted_pair_and_fill_every_other_no_call() -> Non
     assert fused.gatksv_records.tolist() == [0]
     calibration = fused.calibrations[0]
     assert calibration.accepted
-    fused_dosage = fused.codes[0] / CODES_PER_ALLELE
-    imputed_dosage = imputed.codes[0] / CODES_PER_ALLELE
+    fused_dosage = fused.codes[0] / CODES_PER_DOSAGE
+    imputed_dosage = imputed.codes[0] / CODES_PER_DOSAGE
     assert _squared_correlation(fused_dosage, truth["genotype"]) > _squared_correlation(imputed_dosage, truth["genotype"]) + 0.05
     # A GATK-SV no-call takes the recalibrated imputed dosage.
     recalibrated = calibration.missing_genotype_mean + calibration.missing_slope * (imputed_dosage - calibration.missing_first_mean)
@@ -130,25 +130,31 @@ def test_store_rows_fuse_the_accepted_pair_and_fill_every_other_no_call() -> Non
     # The rest stay rows; the all-no-call DUP is dropped.
     assert rows.gatksv_records.tolist() == [1, 2, 3]
     assert rows.unobserved_records.tolist() == [4]
-    assert rows.filled_from_imputed.tolist() == [False, True, False]
+    assert rows.filled_from_imputed.tolist() == [True, True, False]
     np.testing.assert_allclose(rows.observed_fractions, observed[[1, 2, 3]].mean(axis=1))
     # Observed calls are stored exactly: 127 per allele, a copy number as itself.
     for row, record in enumerate([1, 2]):
         np.testing.assert_array_equal(rows.codes[row][observed[record]], gatksv.values[record][observed[record]] * 127)
     np.testing.assert_array_equal(rows.codes[2][observed[3]], gatksv.values[3][observed[3]])
 
-    # Unrelated INS: its no-calls take the mean of its observed calls.
-    unrelated_mean = gatksv.values[1][observed[1]].mean()
-    assert set(rows.codes[0][gatksv.no_call[1]].tolist()) == {int(np.floor(unrelated_mean * 127 + 0.5))}
-    # Contradicted DEL: significant pairing, rejected calibration, so its
-    # no-calls are E[B | DS] from the paired imputed record.
+    # Every other record with a candidate fills its no-calls with E[B | DS] from that
+    # candidate's imputed DS: the unrelated INS (a slope near 0, so near its observed mean)
+    # and the contradicted DEL (a rejected calibration, but a strong pairing).
+    def best_linear_prediction(record: int, imputed_record: int) -> np.ndarray:
+        dosage = imputed.codes[imputed_record] / CODES_PER_DOSAGE
+        called = observed[record]
+        covariance = np.cov(dosage[called], gatksv.values[record][called].astype(np.float64), bias=True)
+        slope = covariance[0, 1] / covariance[0, 0]
+        return gatksv.values[record][called].mean() + slope * (dosage - dosage[called].mean())
+
+    unrelated = best_linear_prediction(1, 1)
+    expected = np.floor(np.clip(unrelated, 0.0, 2.0) * 127 + 0.5).astype(np.uint8)
+    np.testing.assert_array_equal(rows.codes[0][gatksv.no_call[1]], expected[gatksv.no_call[1]])
     contradicted = calibrate_two_sources(
-        imputed.codes[2] / CODES_PER_ALLELE, gatksv.values[2], observed[2], _CONTRADICTED_RELIABILITY
+        imputed.codes[2] / CODES_PER_DOSAGE, gatksv.values[2], observed[2], _CONTRADICTED_RELIABILITY
     )
     assert not contradicted.accepted and contradicted.pairing_z >= 5
-    prediction = contradicted.observed_second_mean + contradicted.second_slope * (
-        imputed.codes[2] / CODES_PER_ALLELE - contradicted.observed_first_mean
-    )
+    prediction = best_linear_prediction(2, 2)
     expected = np.floor(np.clip(prediction, 0.0, 2.0) * 127 + 0.5).astype(np.uint8)
     np.testing.assert_array_equal(rows.codes[1][gatksv.no_call[2]], expected[gatksv.no_call[2]])
     # Copy numbers never pair; their no-calls take the rounded observed mean.

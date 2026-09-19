@@ -216,8 +216,6 @@ MINIMUM_CALIBRATION_SAMPLES = 4
 # this a pair is not one event measured with independent errors (the
 # cross-truth rejection distribution design-svcontent measured).
 MAXIMUM_SECOND_RELIABILITY = 1.25
-# Blocks for the delete-a-block jackknife of a truth locus's triad reliability.
-JACKKNIFE_BLOCKS = 20
 
 
 @dataclass(frozen=True, slots=True)
@@ -281,6 +279,12 @@ def _without_pairing_evidence(sample_count: int, first_reliability: float) -> Tw
         fused_reliability=undefined,
         pairing_z=0.0,
     )
+
+
+def _fisher_z(correlation: float, sample_count: int) -> float:
+    # Rounding can put a perfect correlation a hair past 1; |r| = 1 is infinite evidence.
+    with np.errstate(divide="ignore"):
+        return float(np.arctanh(np.clip(correlation, -1.0, 1.0)) * np.sqrt(sample_count - 3))
 
 
 def _fused_values(calibration: TwoSourceCalibration, first: F64Array, second: F64Array, observed: NDArray) -> F64Array:
@@ -353,7 +357,7 @@ def calibrate_two_sources(
         second_slope=float(sigma[0, 1] / sigma[0, 0]),
         second_reliability=correlation**2 / first_reliability,
         fused_reliability=float("nan"),
-        pairing_z=float(np.arctanh(np.clip(correlation, -1.0 + 1e-15, 1.0 - 1e-15)) * np.sqrt(sample_count - 3)),
+        pairing_z=_fisher_z(correlation, sample_count),
     )
     fused = _fused_values(calibration, first, second, observed)
     return dataclasses.replace(calibration, fused_reliability=float(fused.var() / genotype_variance))
@@ -513,26 +517,29 @@ def mean_anchor(
     )
 
 
+def _log_triad(cross: NDArray) -> NDArray:
+    """log r2_A from centred cross-products of (A, T1, T2), [..., 3, 3]; NaN where the triad is undefined."""
+    numerator = cross[..., 0, 1] * cross[..., 0, 2]
+    denominator = cross[..., 0, 0] * cross[..., 1, 2]
+    defined = (numerator > 0.0) & (denominator > 0.0)
+    ratio = np.divide(numerator, denominator, out=np.full(numerator.shape, np.nan), where=defined)
+    # r2_A is a squared correlation, so it cannot pass 1.
+    return np.log(np.minimum(ratio, 1.0))
+
+
 def triad_log_reliability(first_dosage: F64Array, first_truth: F64Array, second_truth: F64Array) -> tuple[float, float]:
-    """log r2_A against two independent noisy truths, r(A,T1) r(A,T2) / r(T1,T2), and its jackknife variance."""
-    first = np.asarray(first_dosage, dtype=np.float64)
-    truths = (np.asarray(first_truth, dtype=np.float64), np.asarray(second_truth, dtype=np.float64))
+    """log r2_A against two independent noisy truths, r(A,T1) r(A,T2) / r(T1,T2), and its jackknife variance.
 
-    def log_triad(rows: NDArray) -> float:
-        centred = [values[rows] - values[rows].mean() for values in (first, *truths)]
-        dosage, truth_one, truth_two = centred
-        numerator = float(dosage @ truth_one) * float(dosage @ truth_two)
-        denominator = float(dosage @ dosage) * float(truth_one @ truth_two)
-        if numerator <= 0.0 or denominator <= 0.0:
-            return float("nan")
-        return float(np.log(min(numerator / denominator, 1.0)))
-
-    every_row = np.arange(first.shape[0])
-    estimate = log_triad(every_row)
-    blocks = np.array_split(every_row, JACKKNIFE_BLOCKS)
-    leave_one_out = np.array([log_triad(np.setdiff1d(every_row, block, assume_unique=True)) for block in blocks])
-    variance = (JACKKNIFE_BLOCKS - 1) / JACKKNIFE_BLOCKS * float(np.sum((leave_one_out - leave_one_out.mean()) ** 2))
-    return estimate, variance
+    The delete-one jackknife is exact and needs no pass per sample: with z_i the samples centred
+    on the full mean and C their cross-products, leaving sample i out gives C - n/(n-1) z_i z_i'.
+    """
+    values = np.vstack([np.asarray(column, dtype=np.float64) for column in (first_dosage, first_truth, second_truth)])
+    sample_count = values.shape[1]
+    centred = (values - values.mean(axis=1, keepdims=True)).T
+    cross = centred.T @ centred
+    leave_one_out = _log_triad(cross - sample_count / (sample_count - 1) * centred[:, :, None] * centred[:, None, :])
+    variance = (sample_count - 1) / sample_count * float(np.sum((leave_one_out - leave_one_out.mean()) ** 2))
+    return float(_log_triad(cross)), variance
 
 
 def fit_anchor_error_model(
