@@ -10,6 +10,7 @@ from sv_pgs.sample_crosswalk import (
     ABSENT_COLUMN,
     SampleCrosswalk,
     source_columns_for_store_samples,
+    store_research_ids,
 )
 
 
@@ -62,3 +63,13 @@ def test_crosswalk_reads_a_delimited_table(tmp_path: Path) -> None:
 
     assert crosswalk == SampleCrosswalk(research_ids=("R1", "R2"), sequencing_ids=("D1", "D2"))
 
+
+
+def test_store_research_ids_map_a_half_and_refuse_gaps_and_repeats() -> None:
+    crosswalk = SampleCrosswalk(research_ids=("R1", "R2", "R3"), sequencing_ids=("D1", "D2", "D3"))
+
+    assert store_research_ids(["D3", "D1"], crosswalk) == ("R3", "R1")
+    with pytest.raises(ValueError, match="no crosswalk row"):
+        store_research_ids(["D1", "D9"], crosswalk)
+    with pytest.raises(ValueError, match="more than once"):
+        store_research_ids(["D2", "D2"], crosswalk)

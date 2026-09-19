@@ -74,3 +74,18 @@ def source_columns_for_store_samples(
             columns[store_index] = column_of_research.get(research_id, ABSENT_COLUMN)
     return columns
 
+
+
+def store_research_ids(half_sequencing_ids: Sequence[str], crosswalk: SampleCrosswalk) -> tuple[str, ...]:
+    """The research ID of each sample of one store half, in store column order.
+
+    Fails on a sample the crosswalk has no row for, and on a half that lists a person twice
+    (the crosswalk is one-to-one, so two columns with one research ID repeat a sequencing ID).
+    """
+    if len(set(half_sequencing_ids)) != len(half_sequencing_ids):
+        raise ValueError("the store half lists a sample more than once.")
+    research_of_sequencing = dict(zip(crosswalk.sequencing_ids, crosswalk.research_ids))
+    unmapped = [sequencing_id for sequencing_id in half_sequencing_ids if sequencing_id not in research_of_sequencing]
+    if unmapped:
+        raise ValueError(f"{len(unmapped)} store samples have no crosswalk row.")
+    return tuple(research_of_sequencing[sequencing_id] for sequencing_id in half_sequencing_ids)
