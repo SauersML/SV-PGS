@@ -53,7 +53,7 @@ from dataclasses import dataclass
 
 import numpy as np
 from numpy.typing import NDArray
-from scipy.stats import norm
+from scipy.stats import t as student_t
 
 
 @dataclass(frozen=True)
@@ -113,13 +113,22 @@ class BlockGrams:
 
 @dataclass(frozen=True)
 class BlockCertificate:
-    """Per block: the probe estimate of the relative error of tr(Sigma_bb), its standard error, the
-    family-wise upper bound on its size, and whether it provably exceeds the approximation's scale."""
+    """Per block: the probe estimate of a relative error, its standard error, a two-sided interval at the
+    certificate's family-wise level, and the decision.
+
+    ``certified`` means the whole interval lies within ``tolerance``: the block's error provably does not exceed
+    it. ``violated`` means the whole interval lies beyond it. A block that is neither is undecided, and more probes
+    decide it (``probes_to_decide``). ``level`` is the family-wise probability that any interval misses its
+    block's true error.
+    """
 
     relative_error: NDArray[np.float64]
     standard_error: NDArray[np.float64]
+    lower_bound: NDArray[np.float64]
     upper_bound: NDArray[np.float64]
     tolerance: float
+    level: float
+    certified: NDArray[np.bool_]
     violated: NDArray[np.bool_]
 
 
@@ -348,34 +357,81 @@ def approximation_scale(solve: BulkSolve) -> float:
     return float(np.sqrt(solve.bulk_square_trace / solve.sample_count) / solve.bulk_trace)
 
 
+def certificate_level(draw_count: int) -> float:
+    """The certificate's family-wise error probability: 1/K for a scorer of K posterior draws.
+
+    The scorer resolves posterior probabilities only to 1/K: an event rarer than that is, on average, absent from
+    its K draws. ep_eb.md §3.3 sets every numerical tolerance to what the K draws cannot see, and this is the same
+    rule applied to the certificate's chance of letting a bad block through.
+    """
+    return 1.0 / draw_count
+
+
+def _certificate(
+    estimate: NDArray[np.float64], per_probe: list[NDArray[np.float64]], tolerance: float, level: float
+) -> BlockCertificate:
+    """Intervals from k probe values per block, at family-wise ``level`` over the B blocks (Bonferroni, two-sided).
+
+    (mean - estimate) / (sd / sqrt k) is referred to Student's t with k - 1 degrees of freedom. That is exact for
+    Gaussian probe values. A block's probe value is a Rademacher quadratic form over many pairs, which is close to
+    Gaussian, so the level is approximate, and conservative in the tail compared with the normal quantile. A
+    block with zero estimate and zero spread (every site resolved, so exact) is certified.
+    """
+    block_count = len(per_probe)
+    probe_count = per_probe[0].shape[0]
+    quantile = float(student_t.isf(0.5 * level / block_count, probe_count - 1))
+    relative = np.zeros(block_count)
+    standard = np.zeros(block_count)
+    for position, values in enumerate(per_probe):
+        computed = float(estimate[position])
+        spread = float(np.std(values, ddof=1)) / np.sqrt(probe_count)
+        if computed == 0.0:
+            if spread != 0.0:
+                raise ValueError(f"block {position}: zero estimate with nonzero probe spread; a zero estimate must mean an exact block")
+            continue
+        relative[position] = (float(np.mean(values)) - computed) / computed
+        standard[position] = spread / abs(computed)
+    lower = relative - quantile * standard
+    upper = relative + quantile * standard
+    certified = (lower >= -tolerance) & (upper <= tolerance)
+    violated = (lower > tolerance) | (upper < -tolerance)
+    return BlockCertificate(
+        relative_error=relative, standard_error=standard, lower_bound=lower, upper_bound=upper,
+        tolerance=tolerance, level=level, certified=certified, violated=violated,
+    )
+
+
 def block_trace_certificate(
     variances: NDArray[np.float64],
     blocks: tuple[NDArray[np.int64], ...],
     probes: NDArray[np.float64],
     covariance_probes: NDArray[np.float64],
     tolerance: float,
+    level: float,
 ) -> BlockCertificate:
     """Test each block's tr(Sigma_bb) against Rademacher probes z (p x k) and Sigma z (from the solver).
 
-    For each probe, z_b' (Sigma z)_b is an unbiased estimate of tr(Sigma_bb). The block's relative error
-    is (mean - sum_b variances) / sum_b variances, and its standard error is the probes' own spread
-    over sqrt(k). The bound uses the normal quantile at family-wise level 1/B over the B blocks, so
-    across all blocks at most about one false flag is expected per model. A block is violated when
-    even its lower bound exceeds ``tolerance``, i.e. its error provably exceeds the approximation's
-    scale.
+    For each probe, z_b' (Sigma z)_b is an unbiased estimate of tr(Sigma_bb). The block's relative error is
+    (mean - sum_b variances) / sum_b variances, and its standard error is the probes' own spread over sqrt(k),
+    with intervals as in ``_certificate``.
     """
-    probe_count = probes.shape[1]
-    quantile = float(norm.isf(0.5 / len(blocks)))
-    relative = np.empty(len(blocks))
-    standard = np.empty(len(blocks))
-    for position, members in enumerate(blocks):
-        per_probe = np.sum(probes[members] * covariance_probes[members], axis=0)
-        computed = float(np.sum(variances[members]))
-        relative[position] = (float(np.mean(per_probe)) - computed) / computed
-        standard[position] = float(np.std(per_probe, ddof=1)) / np.sqrt(probe_count) / computed
-    upper = np.abs(relative) + quantile * standard
-    violated = np.abs(relative) - quantile * standard > tolerance
-    return BlockCertificate(relative_error=relative, standard_error=standard, upper_bound=upper, tolerance=tolerance, violated=violated)
+    per_probe = [np.sum(probes[members] * covariance_probes[members], axis=0) for members in blocks]
+    estimate = np.array([float(np.sum(variances[members])) for members in blocks])
+    return _certificate(estimate, per_probe, tolerance, level)
+
+
+def probes_to_decide(certificate: BlockCertificate, probe_count: int) -> int:
+    """The probe count that would decide every undecided block, if the standard errors fall as 1/sqrt(k).
+
+    The quantile is held at its k-probe value, which is larger than at more probes, so this is conservative.
+    """
+    undecided = ~(certificate.certified | certificate.violated)
+    if not np.any(undecided):
+        return probe_count
+    half_width = (certificate.upper_bound - certificate.lower_bound)[undecided] / 2.0
+    margin = np.abs(np.abs(certificate.relative_error[undecided]) - certificate.tolerance)
+    ratio = float(np.max(half_width / np.maximum(margin, np.finfo(np.float64).tiny)))
+    return int(np.ceil(probe_count * ratio * ratio))
 
 
 def information_products(solve: BulkSolve, back_products: NDArray[np.float64]) -> NDArray[np.float64]:
@@ -426,6 +482,7 @@ def block_information_certificate(
     probes: NDArray[np.float64],
     removed_products: NDArray[np.float64],
     tolerance: float,
+    level: float,
 ) -> BlockCertificate:
     """Test each block's data information tr(D_b - Sigma_bb), over its bulk sites, against probes.
 
@@ -443,7 +500,7 @@ def block_information_certificate(
     is_bulk[solve.resolved] = False
     bulk_variance = np.where(is_bulk, 1.0 / np.where(is_bulk, solve.site_precision, 1.0), 0.0)
     removed = np.where(is_bulk, bulk_variance - variances, 0.0)
-    return block_trace_certificate(removed, blocks, np.where(is_bulk[:, None], probes, 0.0), np.where(is_bulk[:, None], removed_products, 0.0), tolerance)
+    return block_trace_certificate(removed, blocks, np.where(is_bulk[:, None], probes, 0.0), np.where(is_bulk[:, None], removed_products, 0.0), tolerance, level)
 
 
 def certificate_tolerance(solve: BulkSolve, bulk_probe_count: int) -> float:

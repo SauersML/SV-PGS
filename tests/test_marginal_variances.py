@@ -18,6 +18,8 @@ from sv_pgs.marginal_variances import (
     information_products,
     information_solve_tolerance,
     block_trace_certificate,
+    certificate_level,
+    probes_to_decide,
     certificate_tolerance,
     covariance_products,
     far_field_trace,
@@ -152,8 +154,9 @@ def test_certificate_flags_only_the_wrong_block():
     variances = marginal_variances(solve, _grams(columns, blocks))
     variances[blocks[3]] *= 1.0 + 20 * approximation_scale(solve)
     probes = generator.choice([-1.0, 1.0], size=(variant_count, 256))
-    certificate = block_trace_certificate(variances, blocks, probes, covariance @ probes, approximation_scale(solve))
+    certificate = block_trace_certificate(variances, blocks, probes, covariance @ probes, approximation_scale(solve), certificate_level(64))
     assert certificate.violated.tolist() == [False, False, False, True, False, False]
+    assert not certificate.certified[3]
 
 
 def _strong_case(seed: int):
@@ -240,8 +243,9 @@ def test_information_certificate_flags_a_cavity_error_the_trace_certificate_miss
     removed = information_products(solve, back)
     is_bulk = ~np.isin(np.arange(variant_count), solve.resolved)
     assert np.allclose(removed[is_bulk], (prior[:, None] * probes - covariance @ probes)[is_bulk], rtol=1e-6, atol=1e-12 * np.abs(removed).max())
-    trace = block_trace_certificate(variances, blocks, probes, covariance @ probes, scale)
-    information = block_information_certificate(solve, variances, blocks, probes, removed, scale)
+    level = certificate_level(64)
+    trace = block_trace_certificate(variances, blocks, probes, covariance @ probes, scale, level)
+    information = block_information_certificate(solve, variances, blocks, probes, removed, scale, level)
     assert not trace.violated.any()
     assert information.violated.tolist() == [False, False, False, True, False, False]
 
@@ -277,3 +281,30 @@ def test_information_solve_tolerance_bounds_the_worst_residual():
         realized = np.mean(np.linalg.norm(direction, axis=0) * np.linalg.norm(forward, axis=0))
         expected = np.sqrt(np.sum(bulk[members] ** 2 * norms[members]) * np.sum(bulk**2 * norms))
         assert np.mean(np.abs(moved)) <= 0.5 * scale * information * realized / expected
+
+
+def test_certificate_intervals_cover_at_their_level_and_probes_to_decide_decides():
+    generator = np.random.default_rng(15)
+    sample_count, variant_count, heritability = 1500, 600, 0.5
+    columns = _genotypes(generator, sample_count, variant_count, 0.97) / np.sqrt(1.0 - heritability)
+    precision = variant_count / heritability * np.exp(generator.normal(0.0, 1.0, variant_count))
+    blocks = tuple(np.arange(start, start + 100) for start in range(0, variant_count, 100))
+    covariance = np.linalg.inv(columns.T @ columns + np.diag(precision))
+    exact = np.diag(covariance)
+    level = certificate_level(64)
+    # With the exact variances the true relative error is zero, so an interval misses only when it excludes 0.
+    misses = 0
+    trials = 200
+    for _trial in range(trials):
+        probes = generator.choice([-1.0, 1.0], size=(variant_count, 8))
+        certificate = block_trace_certificate(exact, blocks, probes, covariance @ probes, 1.0, level)
+        misses += int(np.any((certificate.lower_bound > 0.0) | (certificate.upper_bound < 0.0)))
+    # The family-wise miss rate is at most the level, up to the binomial spread of 200 trials.
+    assert misses <= level * trials + 3 * np.sqrt(level * trials)
+    probes = generator.choice([-1.0, 1.0], size=(variant_count, 8))
+    tolerance = 0.01
+    undecided = block_trace_certificate(exact, blocks, probes, covariance @ probes, tolerance, level)
+    needed = probes_to_decide(undecided, 8)
+    probes = generator.choice([-1.0, 1.0], size=(variant_count, needed))
+    decided = block_trace_certificate(exact, blocks, probes, covariance @ probes, tolerance, level)
+    assert decided.certified.all()
