@@ -1026,7 +1026,10 @@ class DosageStore:
         if depth < 2:
             raise MemoryError(f"double-buffering {widest}-row blocks needs {2 * buffer_bytes} host bytes.")
         ring, pinned = self._ring(depth, buffer_bytes, budget)
-        prefetch = ThreadPoolExecutor(max_workers=1, thread_name_prefix="dosage-store-prefetch")
+        # Every ring slot but the consumer's is read concurrently: one block has only as many
+        # independent pieces as it has inner chunks, so a lone reader leaves most of the pool idle
+        # while it decodes (zstd) or waits (network storage).
+        prefetch = ThreadPoolExecutor(max_workers=depth - 1, thread_name_prefix="dosage-store-prefetch")
         in_flight: deque[Future[None]] = deque()
 
         def submit(position: int) -> None:
