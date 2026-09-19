@@ -104,6 +104,11 @@ _HALF_PRECISION = _EPSILON**0.5
 # infinity limit that is proper on the real line and does not move with the range (<= 1e-4 nats when the range
 # doubles or quadruples; the first- and second-order limits move by 4-100 nats: math-density, lead ruling).
 ROUGHNESS_ORDER = 3
+# The (rows x K) float64 arrays alive at once in a chunk: the ten of ``_Components``, the seven directional-derivative
+# arrays of ``_directional_derivatives`` and three expression temporaries.
+_ROW_INTERMEDIATES = 20
+# QUADPACK's relative accuracy is bounded below by 50 eps (scipy.integrate.quad raises under it).
+_QUADPACK_RELATIVE_FLOOR = 50.0 * _EPSILON
 
 
 @dataclass(frozen=True)
@@ -350,8 +355,8 @@ def scale_mixture_prior(
             )
     lattice = np.asarray(nodes, dtype=np.float64)
     spacing = np.diff(lattice)
-    if lattice.shape[0] < 5 or spacing[0] <= 0.0 or not np.allclose(spacing, spacing[0], rtol=_HALF_PRECISION, atol=0.0):
-        raise ValueError("the lattice must be at least five evenly spaced increasing nodes")
+    if lattice.shape[0] <= ROUGHNESS_ORDER or spacing[0] <= 0.0 or not np.allclose(spacing, spacing[0], rtol=_HALF_PRECISION, atol=0.0):
+        raise ValueError("the lattice must be evenly spaced increasing nodes, more than the roughness order")
     grid_size = lattice.shape[0]
     basis = _sum_to_zero_basis(grid_size)
     roughness = roughness_factor(grid_size, float(spacing[0]), ROUGHNESS_ORDER) @ basis
@@ -482,10 +487,10 @@ def prior_second_moment(prior: ScaleMixturePrior, hyperparameters: MixtureHyperp
 
 
 def _row_chunks(rows: I64Array, grid_size: int, working_bytes: int) -> Iterator[I64Array]:
-    """Pieces of ``rows`` whose (rows x K) intermediates, about 16 of them, fit ``working_bytes``."""
+    """Pieces of ``rows`` whose (rows x K) float64 intermediates (``_ROW_INTERMEDIATES`` of them) fit ``working_bytes``."""
     if working_bytes <= 0:
         raise ValueError("working_bytes must be positive")
-    chunk = max(1, int(working_bytes) // (16 * 8 * max(grid_size, 1)))
+    chunk = max(1, int(working_bytes) // (_ROW_INTERMEDIATES * np.dtype(np.float64).itemsize * max(grid_size, 1)))
     for start in range(0, rows.shape[0], chunk):
         yield rows[start : start + chunk]
 
@@ -988,8 +993,11 @@ def _laplace_corrections(
                 _data_value(prior, point, cavity, working_bytes) - _penalty_value(prior, log_smoothing, point)[0] - value
             ))
 
-        # QUADPACK's relative accuracy floor is 50 eps.
-        integral = quad(integrand, -np.inf, np.inf, epsabs=0.0, epsrel=max(tolerance, 50.0 * _EPSILON), limit=200)[0]
+        integral, _error, information, *message = quad(
+            integrand, -np.inf, np.inf, epsabs=0.0, epsrel=max(tolerance, _QUADPACK_RELATIVE_FLOOR), full_output=True
+        )
+        if message:
+            raise FloatingPointError(f"the exact integral along a direction did not converge: {message[0]}")
         corrections[index] = float(np.log(integral) - 0.5 * np.log(2.0 * np.pi))
     return corrections, terms
 
