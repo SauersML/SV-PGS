@@ -83,7 +83,7 @@ So t_c/(τŝ) = 4.7, and R* = 17, 49 and 139 at L = 64, 512 and 4096.
 
 The sweep agrees. R = 64 has the fastest host share at L = 64 and is within 3% of the fastest at L = 512 and 4096. zstd is fastest at R = 64 for L = 64, and within 5% of its fastest for every L.
 
-**What this fixes.** It fixes `DEFAULT_INNER_CHUNK_ROWS = 64` for every chain as a derived value. It does not fix the shard rows: a reader pays a shard's fixed cost (open, index read, crc) once per process, so read time does not depend on the shard rows while the index stays negligible (16 B per 64 records). That constant stays pending with speed-io. What it trades is the file and descriptor count against how many writers can build one array's shards in parallel.
+**What this fixes.** It fixes `DEFAULT_INNER_CHUNK_ROWS = 64` for every chain as a derived value. It does not fix the shard rows: a reader pays a shard's fixed cost (open, index read, crc) once per process, so read time does not depend on the shard rows while the index stays negligible (16 B per 64 records). What it trades is the file and descriptor count against how many writers can build one array's shards in parallel; `dosage_store.shard_rows_for` takes the fewest shards within those two bounds, a multiple of R by construction (STORE.md).
 
 ## 4. Result
 - **Lossless:** exact round trips are tested at every depth 0..8, with n not a multiple of 4 or 8 and both sample widths. The GPU decode matches the CPU reference (`tests/test_rowdict_codec*.py`). Corruption fails the chunk crc32c or the size-table checks.

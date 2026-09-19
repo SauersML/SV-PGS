@@ -99,7 +99,6 @@ CODES_PER_DOSAGE = 127
 MAXIMUM_CODE = 254
 MISSING_CODE = 255
 MAXIMUM_DOSAGE_MILLI = 2000
-DEFAULT_SHARD_ROWS = 65536
 # Minimizes the worst relative read-time regret over request runs of at least one Stage 0 tile,
 # given the measured per-byte, per-chunk and per-request costs (docs/design/math/codec.md §3).
 DEFAULT_INNER_CHUNK_ROWS = 64
@@ -287,16 +286,73 @@ def _layout_from_metadata(metadata: Mapping[str, Any], directory: Path) -> CodeA
     )
 
 
+def shard_rows_for(record_counts: Sequence[int], *, inner_rows: int, parallel_writers: int, arrays_per_count: int) -> int:
+    """Rows per shard (a multiple of ``inner_rows``) for arrays of ``record_counts`` rows.
+
+    Nothing a read costs depends on the shard size: a range decodes by inner chunk and costs the
+    same across a shard boundary (docs/design/math/codec.md §3), except that a zero-copy view of
+    the page cache must lie inside one shard. A writer fills a shard sequentially and encodes its
+    inner chunks on the worker pool, so shards add parallelism only where whole shards are written
+    in parallel (the synthetic store's generator). Every shard costs the reader one descriptor
+    and one mapping. So the fewest shards serve best, within two bounds: at least
+    ``parallel_writers`` shards over ``record_counts`` (one writer per shard), and descriptors for
+    ``arrays_per_count`` arrays of each count within this process's hard limit. It is the largest
+    multiple of ``inner_rows`` that gives ``parallel_writers`` shards, raised if the limit needs it.
+    """
+    counts = [int(count) for count in record_counts]
+    if not counts or min(counts) < 0 or inner_rows < 1 or parallel_writers < 1 or arrays_per_count < 1:
+        raise ValueError("shard_rows_for needs record counts, positive inner rows, writers and arrays per count.")
+
+    def shards(rows: int) -> int:
+        return sum(max(1, -(-count // rows)) for count in counts)
+
+    def largest_chunks(enough: Any) -> int:
+        """The largest chunk count m in [1, whole] with enough(m * inner_rows); shards() only grows as m shrinks."""
+        low, high = 1, whole_chunks
+        while low < high:
+            middle = (low + high + 1) // 2
+            low, high = (middle, high) if enough(middle * inner_rows) else (low, middle - 1)
+        return low
+
+    def smallest_chunks(fits: Any) -> int:
+        """The smallest chunk count m in [1, whole] with fits(m * inner_rows)."""
+        low, high = 1, whole_chunks
+        while low < high:
+            middle = (low + high) // 2
+            low, high = (low, middle) if fits(middle * inner_rows) else (middle + 1, high)
+        return low
+
+    whole_chunks = max(1, -(-max(counts) // inner_rows))
+    rows = largest_chunks(lambda rows: shards(rows) >= parallel_writers) * inner_rows
+    _, hard_limit = resource.getrlimit(resource.RLIMIT_NOFILE)
+    if hard_limit != resource.RLIM_INFINITY:
+        # the store's reader holds a descriptor and a mapping per shard beside what is open now
+        open_now = len(os.listdir("/proc/self/fd")) if os.path.isdir("/proc/self/fd") else 0
+
+        def fits(rows: int) -> bool:
+            return 2 * arrays_per_count * shards(rows) + open_now <= hard_limit
+
+        if not fits(whole_chunks * inner_rows):
+            raise RuntimeError(f"{arrays_per_count * len(counts)} arrays need more descriptors than the hard limit {hard_limit} allows.")
+        rows = max(rows, smallest_chunks(fits) * inner_rows)
+    return rows
+
+
 def create_code_array(
     directory: Path,
     row_count: int,
     sample_count: int,
     *,
     codec: Codec,
-    shard_rows: int = DEFAULT_SHARD_ROWS,
+    shard_rows: int | None = None,
     inner_rows: int = DEFAULT_INNER_CHUNK_ROWS,
 ) -> CodeArrayLayout:
-    """Write the Zarr v3 metadata of an empty code array and return its layout."""
+    """Write the Zarr v3 metadata of an empty code array and return its layout.
+
+    ``shard_rows`` defaults to ``shard_rows_for`` with one writer: the whole array is one shard.
+    """
+    if shard_rows is None:
+        shard_rows = shard_rows_for([row_count], inner_rows=inner_rows, parallel_writers=1, arrays_per_count=1)
     layout = CodeArrayLayout(
         row_count=row_count, sample_count=sample_count, shard_rows=shard_rows, inner_rows=inner_rows, codec=codec
     )
@@ -1485,7 +1541,7 @@ def write_half_codes(
     code_blocks: Iterable[U8Array],
     *,
     codec: Codec,
-    shard_rows: int = DEFAULT_SHARD_ROWS,
+    shard_rows: int | None = None,
     inner_rows: int = DEFAULT_INNER_CHUNK_ROWS,
 ) -> tuple[I64Array, I64Array]:
     """Write one half's codes [records, samples] of one chromosome from row blocks in store order.
@@ -1558,7 +1614,7 @@ def write_dosage_store(
     code_blocks: Iterable[U8Array],
     *,
     codec: Codec,
-    shard_rows: int = DEFAULT_SHARD_ROWS,
+    shard_rows: int | None = None,
     inner_rows: int = DEFAULT_INNER_CHUNK_ROWS,
 ) -> None:
     """Write a one-half store from code blocks [rows, n_samples] that arrive in store order.
@@ -1708,16 +1764,14 @@ def _cache_is_complete(directory: Path, marker: Mapping[str, Any]) -> bool:
 def _transcode_array(array: CodeArray, directory: Path, codec: Codec, budget: ComputeBudget) -> tuple[I64Array, I64Array]:
     """Re-encode one code array shard by shard, returning the exact code sums it wrote."""
     layout = array.layout
-    target = create_code_array(
-        directory, layout.row_count, layout.sample_count, codec=codec, shard_rows=layout.shard_rows, inner_rows=layout.inner_rows
-    )
+    target = create_code_array(directory, layout.row_count, layout.sample_count, codec=codec, inner_rows=layout.inner_rows)
     sums = np.zeros(layout.row_count, dtype=np.int64)
     squares = np.zeros(layout.row_count, dtype=np.int64)
     buffer = np.empty(0, dtype=np.uint8)
-    for shard_index in range(layout.shard_count):
-        shard_start = shard_index * layout.shard_rows
+    for shard_index in range(target.shard_count):
+        shard_start = shard_index * target.shard_rows
         with CodeShardWriter(directory, target, shard_index) as writer:
-            for start, stop in _block_ranges(shard_start, shard_start + layout.shard_row_count(shard_index), layout.sample_count, budget.host_bytes):
+            for start, stop in _block_ranges(shard_start, shard_start + target.shard_row_count(shard_index), layout.sample_count, budget.host_bytes):
                 if buffer.size < (stop - start) * layout.sample_count:
                     buffer = np.empty((stop - start) * layout.sample_count, dtype=np.uint8)
                 piece = buffer[: (stop - start) * layout.sample_count].reshape(stop - start, layout.sample_count)

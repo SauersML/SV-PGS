@@ -60,7 +60,6 @@ from sv_pgs._typing import F32Array, F64Array, I64Array, NDArray, U8Array
 from sv_pgs.config import VariantClass
 from sv_pgs.dosage_store import (
     DEFAULT_INNER_CHUNK_ROWS,
-    DEFAULT_SHARD_ROWS,
     MAXIMUM_DOSAGE_MILLI,
     VARIANT_CLASS_LEGEND,
     Codec,
@@ -72,6 +71,7 @@ from sv_pgs.dosage_store import (
     dosage_array_directory,
     encode_dosage_milli,
     open_column,
+    shard_rows_for,
     sites_md5,
     statistic_column_directory,
     variant_column_directory,
@@ -900,14 +900,24 @@ def plan_store(
     seed: int,
     block_records: int,
     codec: Codec,
-    shard_rows: int = DEFAULT_SHARD_ROWS,
+    shard_rows: int | None = None,
     inner_rows: int = DEFAULT_INNER_CHUNK_ROWS,
+    parallel_writers: int = 1,
 ) -> GenerationPlan:
-    """Draw the cohort, lay out every chromosome, solve noise parameters and write all metadata."""
+    """Draw the cohort, lay out every chromosome, solve noise parameters and write all metadata.
+
+    Each (chromosome, shard) is one generation task, and a bubble a shard boundary cuts becomes
+    single-path records, so ``shard_rows`` defaults to ``dosage_store.shard_rows_for``: the fewest
+    shards that still give ``parallel_writers`` tasks.
+    """
     if len(half_sample_counts) != len(half_pipelines) or not set(half_pipelines) <= set(PIPELINE_R2_LOSS):
         raise ValueError(f"each half needs a pipeline in {sorted(PIPELINE_R2_LOSS)}.")
     chromosomes = tuple(f"chr{index + 1}" for index in range(chromosome_count))
     record_counts = _record_counts(total_records, chromosome_count)
+    if shard_rows is None:
+        shard_rows = shard_rows_for(
+            record_counts, inner_rows=inner_rows, parallel_writers=parallel_writers, arrays_per_count=len(half_sample_counts)
+        )
     cohort = draw_cohort(int(sum(half_sample_counts)), source, _generator(seed, 0))
     layouts = []
     noise = []
@@ -1063,6 +1073,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         seed=arguments.seed,
         block_records=arguments.block_records,
         codec=arguments.codec,
+        parallel_writers=arguments.workers,
     )
     planned = time.perf_counter()
     timings = generate_store(plan, workers=arguments.workers)

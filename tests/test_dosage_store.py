@@ -26,6 +26,7 @@ from sv_pgs.dosage_store import (
     encode_dosage_milli,
     open_column,
     read_manifest,
+    shard_rows_for,
     sites_md5,
     statistic_column_directory,
     local_cache,
@@ -498,3 +499,44 @@ def test_an_unfinished_cache_is_never_used(tmp_path: Path) -> None:
     assert built == stale
     with DosageStore.open(built) as cached:
         assert cached.n_variants == 450
+
+
+def test_shard_rows_are_the_fewest_shards_that_keep_every_writer_busy() -> None:
+    counts = [1000, 300, 17]
+    assert shard_rows_for(counts, inner_rows=16, parallel_writers=1, arrays_per_count=2) == 1008
+    for writers in (2, 3, 5, 9, 40):
+        rows = shard_rows_for(counts, inner_rows=16, parallel_writers=writers, arrays_per_count=2)
+        assert rows % 16 == 0
+
+        def shards(size: int) -> int:
+            return sum(-(-count // size) for count in counts)
+
+        # enough shards for every writer, and one more inner chunk per shard would leave a writer idle
+        # (unless the rows are already the smallest, one chunk, or the largest, the whole longest array)
+        assert shards(rows) >= writers or rows == 16
+        assert shards(rows + 16) < writers or rows == 1008
+
+
+def test_shard_rows_grow_to_fit_the_descriptor_limit(monkeypatch: pytest.MonkeyPatch) -> None:
+    import resource
+
+    monkeypatch.setattr(resource, "getrlimit", lambda _: (64, 64))
+    monkeypatch.setattr(os, "listdir", lambda _: [])
+    monkeypatch.setattr(os.path, "isdir", lambda _: True)
+    # 64 writers would need 64 shards of 16 rows, 2 descriptors each over 2 arrays per count: 256 > 64
+    rows = shard_rows_for([1024], inner_rows=16, parallel_writers=64, arrays_per_count=2)
+    assert rows == 64 and 2 * 2 * (1024 // rows) <= 64
+    with pytest.raises(RuntimeError, match="descriptors"):
+        shard_rows_for([10] * 17, inner_rows=16, parallel_writers=1, arrays_per_count=2)
+
+
+def test_an_array_is_one_shard_by_default_and_round_trips(tmp_path: Path) -> None:
+    rng = np.random.default_rng(12)
+    codes = encode_dosage_milli(_random_dosage_milli(rng, 203, 11))
+    layout = create_code_array(tmp_path / "array", 203, 11, codec="zstd", inner_rows=INNER_ROWS)
+    assert layout.shard_count == 1 and layout.shard_rows == 208
+    with CodeShardWriter(tmp_path / "array", layout, 0) as writer:
+        writer.write_rows(codes)
+    out = np.empty_like(codes)
+    CodeArray(tmp_path / "array").read_rows_into(0, 203, out)
+    np.testing.assert_array_equal(out, codes)
