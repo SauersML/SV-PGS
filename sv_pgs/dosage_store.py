@@ -1224,6 +1224,99 @@ class DosageStore:
         self.close()
 
 
+def write_variant_columns(root: Path, chromosome: str, table: VariantTable, rows: slice) -> None:
+    """Write one chromosome's sidecar columns and ids from ``table[rows]`` (its rows, in store order)."""
+    chromosome_start = rows.start
+    for name, values, attributes in (
+        ("pos", table.position[rows], {}),
+        ("ref_len", table.ref_length[rows].astype(np.int32), {}),
+        ("alt_len", table.alt_length[rows].astype(np.int32), {}),
+        ("cm", table.genetic_position_cm[rows], {}),
+        ("variant_class", table.variant_class[rows], {"legend": [variant_class.value for variant_class in VARIANT_CLASSES]}),
+        ("group_first", table.group_first[rows] - chromosome_start, {}),
+    ):
+        write_column(variant_column_directory(root, chromosome, name), values, attributes)
+    for name, values in table.annotations.items():
+        legend = table.annotation_legends.get(name)
+        write_column(variant_column_directory(root, chromosome, name), values[rows], {} if legend is None else {"legend": list(legend)})
+    write_variant_ids(root, chromosome, table.variant_ids(np.arange(rows.start, rows.stop)))
+
+
+def write_half_codes(
+    root: Path,
+    half_index: int,
+    chromosome: str,
+    record_count: int,
+    sample_count: int,
+    code_blocks: Iterable[U8Array],
+    *,
+    codec: Codec,
+    shard_rows: int = DEFAULT_SHARD_ROWS,
+    inner_rows: int = DEFAULT_INNER_CHUNK_ROWS,
+) -> tuple[I64Array, I64Array]:
+    """Write one half's codes [records, samples] of one chromosome from row blocks in store order.
+
+    ``code_blocks`` must hold exactly ``record_count`` rows, in blocks of any size. Returns the
+    exact per-record sums of code and code**2 it wrote, which are also stored as the half's
+    statistics.
+    """
+    directory = dosage_array_directory(root, half_index, chromosome)
+    layout = create_code_array(directory, record_count, sample_count, codec=codec, shard_rows=shard_rows, inner_rows=inner_rows)
+    feed = _RowFeed(code_blocks)
+    sums = np.zeros(record_count, dtype=np.int64)
+    squares = np.zeros(record_count, dtype=np.int64)
+    written = 0
+    for shard_index in range(layout.shard_count):
+        shard_record_count = layout.shard_row_count(shard_index)
+        with CodeShardWriter(directory, layout, shard_index) as writer:
+            for piece in feed.take(shard_record_count):
+                if piece.shape[1] != sample_count:
+                    raise ValueError(f"code blocks need {sample_count} samples; got {piece.shape[1]}.")
+                writer.write_rows(piece)
+                sums[written : written + piece.shape[0]], squares[written : written + piece.shape[0]] = code_sums(piece)
+                written += piece.shape[0]
+        if written != layout.shard_row_count(0) * shard_index + shard_record_count:
+            raise ValueError("code_blocks hold fewer rows than the variant table.")
+    if not feed.exhausted():
+        raise ValueError("code_blocks hold more rows than the variant table.")
+    write_column(statistic_column_directory(root, half_index, chromosome, "sum_code"), sums.astype(np.uint64))
+    write_column(statistic_column_directory(root, half_index, chromosome, "sum_code2"), squares.astype(np.uint64))
+    return sums, squares
+
+
+class _RowFeed:
+    """Re-cuts a stream of code blocks into pieces that never cross a requested row count."""
+
+    def __init__(self, code_blocks: Iterable[U8Array]) -> None:
+        self._blocks = iter(code_blocks)
+        self._pending: U8Array | None = None
+
+    def take(self, row_count: int) -> Iterator[U8Array]:
+        remaining = row_count
+        while remaining:
+            if self._pending is None or self._pending.shape[0] == 0:
+                self._pending = next(self._blocks, None)
+                if self._pending is None:
+                    return
+            piece = self._pending[:remaining]
+            self._pending = self._pending[piece.shape[0] :]
+            remaining -= piece.shape[0]
+            yield piece
+
+    def exhausted(self) -> bool:
+        return (self._pending is None or self._pending.shape[0] == 0) and next(self._blocks, None) is None
+
+
+def chromosome_row_ranges(table: VariantTable) -> list[tuple[str, int, int]]:
+    """(chromosome name, first row, stop row) of each chromosome, which must ascend in the table."""
+    boundaries = np.flatnonzero(np.diff(table.chromosome.astype(np.int64))) + 1
+    starts = np.concatenate([[0], boundaries]).astype(np.int64)
+    stops = np.concatenate([boundaries, [table.variant_count]]).astype(np.int64)
+    if np.any(np.diff(table.chromosome[starts].astype(np.int64)) <= 0):
+        raise ValueError("variant_table rows must be grouped by ascending chromosome.")
+    return [(f"chr{int(table.chromosome[start])}", int(start), int(stop)) for start, stop in zip(starts, stops)]
+
+
 def write_dosage_store(
     path: str | Path,
     n_samples: int,
@@ -1241,69 +1334,36 @@ def write_dosage_store(
     """
     root = Path(path)
     table = variant_table
-    boundaries = np.flatnonzero(np.diff(table.chromosome.astype(np.int64))) + 1
-    starts = np.concatenate([[0], boundaries]).astype(np.int64)
-    stops = np.concatenate([boundaries, [table.variant_count]]).astype(np.int64)
-    if np.any(np.diff(table.chromosome[starts].astype(np.int64)) <= 0):
-        raise ValueError("variant_table rows must be grouped by ascending chromosome.")
-    chromosomes = [f"chr{int(table.chromosome[start])}" for start in starts]
+    ranges = chromosome_row_ranges(table)
+    feed = _RowFeed(code_blocks)
     written_sums = np.zeros(table.variant_count, dtype=np.uint64)
     written_squares = np.zeros(table.variant_count, dtype=np.uint64)
-    blocks = iter(code_blocks)
-    pending = np.empty((0, n_samples), dtype=np.uint8)
-    for chromosome, chromosome_start, chromosome_stop in zip(chromosomes, starts.tolist(), stops.tolist()):
-        record_count = chromosome_stop - chromosome_start
+    for chromosome, chromosome_start, chromosome_stop in ranges:
         rows = slice(chromosome_start, chromosome_stop)
-        for name, values, attributes in (
-            ("pos", table.position[rows], {}),
-            ("ref_len", table.ref_length[rows].astype(np.int32), {}),
-            ("alt_len", table.alt_length[rows].astype(np.int32), {}),
-            ("cm", table.genetic_position_cm[rows], {}),
-            ("variant_class", table.variant_class[rows], {"legend": [variant_class.value for variant_class in VARIANT_CLASSES]}),
-            ("group_first", table.group_first[rows] - chromosome_start, {}),
-        ):
-            write_column(variant_column_directory(root, chromosome, name), values, attributes)
-        for name, values in table.annotations.items():
-            legend = table.annotation_legends.get(name)
-            write_column(
-                variant_column_directory(root, chromosome, name),
-                values[rows],
-                {} if legend is None else {"legend": list(legend)},
-            )
-        write_variant_ids(root, chromosome, table.variant_ids(np.arange(chromosome_start, chromosome_stop)))
-        directory = dosage_array_directory(root, 0, chromosome)
-        layout = create_code_array(directory, record_count, n_samples, codec=codec, shard_rows=shard_rows, inner_rows=inner_rows)
-        written = 0
-        for shard_index in range(layout.shard_count):
-            with CodeShardWriter(directory, layout, shard_index) as writer:
-                remaining = layout.shard_row_count(shard_index)
-                while remaining:
-                    if pending.shape[0] == 0:
-                        block = next(blocks, None)
-                        if block is None:
-                            raise ValueError("code_blocks hold fewer rows than the variant table.")
-                        pending = block
-                    take = min(remaining, pending.shape[0])
-                    writer.write_rows(pending[:take])
-                    block_rows = slice(chromosome_start + written, chromosome_start + written + take)
-                    written_sums[block_rows], written_squares[block_rows] = code_sums(pending[:take])
-                    pending = pending[take:]
-                    written += take
-                    remaining -= take
-        write_column(statistic_column_directory(root, 0, chromosome, "sum_code"), written_sums[rows])
-        write_column(statistic_column_directory(root, 0, chromosome, "sum_code2"), written_squares[rows])
-    if pending.shape[0] or next(blocks, None) is not None:
+        write_variant_columns(root, chromosome, table, rows)
+        sums, squares = write_half_codes(
+            root,
+            0,
+            chromosome,
+            chromosome_stop - chromosome_start,
+            n_samples,
+            feed.take(chromosome_stop - chromosome_start),
+            codec=codec,
+            shard_rows=shard_rows,
+            inner_rows=inner_rows,
+        )
+        written_sums[rows], written_squares[rows] = sums.astype(np.uint64), squares.astype(np.uint64)
+    if not feed.exhausted():
         raise ValueError("code_blocks hold more rows than the variant table.")
     if not (np.array_equal(written_sums, table.sum_code) and np.array_equal(written_squares, table.sum_code2)):
         raise ValueError("the variant table's sum_code/sum_code2 disagree with the code blocks.")
     write_manifest(
         root,
-        chromosomes=chromosomes,
-        record_counts=(stops - starts).tolist(),
+        chromosomes=[chromosome for chromosome, _, _ in ranges],
+        record_counts=[stop - start for _, start, stop in ranges],
         half_sample_counts=[n_samples],
         chromosome_sites_md5=[
-            sites_md5(table.position[start:stop], table.ref_length[start:stop], table.alt_length[start:stop])
-            for start, stop in zip(starts.tolist(), stops.tolist())
+            sites_md5(table.position[start:stop], table.ref_length[start:stop], table.alt_length[start:stop]) for _, start, stop in ranges
         ],
     )
 

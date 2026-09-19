@@ -14,6 +14,11 @@ pieces; each is a pure function of sites-only inputs or of one record block:
   repeat intervals that records bridge.
 - ``sv_context`` (A4.12): every record's distance to the nearest common SV and the number
   of distinct SV-bearing bubbles around it.
+- ``unbreakable_group_first``: the store's ``group_first``, merging bubbles, same-POS sets and
+  TR loci into contiguous row spans a Stage 0 block may never cut.
+- ``decode_batch`` / ``assemble_half``: one popped batch BCF, checked in lockstep against the
+  sidecar (gate G2) and its FORMAT (G4), background-corrected and encoded; then a half's
+  batches side by side in batch order, optionally recalibrated, written as the half's shards.
 
 Everything here is AoU panel-derived site structure or genotype-derived data once applied
 to the panel, so its outputs are workspace-only (A4.9).
@@ -22,11 +27,15 @@ to the panel, so its outputs are workspace-only (A4.9).
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Sequence
+import hashlib
+from pathlib import Path
+from typing import Iterator, Sequence
 
+from cyvcf2 import VCF
 import numpy as np
 
-from sv_pgs._typing import BoolArray, I64Array, NDArray
+from sv_pgs._typing import BoolArray, I64Array, NDArray, U8Array
+from sv_pgs.dosage_store import Codec, encode_dosage_milli, write_half_codes
 from sv_pgs.variant_typing import trimmed_allele_cores
 
 # GLIMPSE2 --err-imp of the aou2 imputation.
@@ -38,6 +47,11 @@ NO_RECORD = np.uint32(0xFFFFFFFF)
 NO_DISTANCE = np.uint32(0xFFFFFFFF)
 SV_CONTEXT_WINDOW = 50_000
 MAXIMUM_BUBBLE_COUNT = 65_535
+# Records decoded, corrected and encoded per step of a batch's pass.
+DECODE_BLOCK_ROWS = 4_096
+# GP is written to 3 decimals, so its thousandths sum to 1000 within one unit of rounding.
+GENOTYPE_PROBABILITY_SUM_SLACK_MILLI = 1
+MAXIMUM_DOSAGE_MILLI = 2_000
 
 
 def core_spans(positions: NDArray, refs: Sequence[str], alts: Sequence[str]) -> tuple[I64Array, I64Array]:
@@ -330,4 +344,218 @@ def sv_context(
         nearest_common_sv_distance=distance,
         nearest_common_sv_record=nearest,
         sv_bubbles_nearby=nearby,
+    )
+
+
+def unbreakable_group_first(*group_ids: NDArray) -> I64Array:
+    """Each row's ``group_first``: the first row of the contiguous span it must share a block with.
+
+    Each argument gives every row a group id (negative for no group) of one grouping (bubble,
+    same-POS set, TR locus) over rows in store order. A group spans its first to its last row;
+    overlapping spans merge, so a row between two members of a group is in the group's span.
+    """
+    row_count = np.asarray(group_ids[0]).shape[0]
+    span_starts: list[I64Array] = []
+    span_stops: list[I64Array] = []
+    rows = np.arange(row_count, dtype=np.int64)
+    for ids in group_ids:
+        ids = np.asarray(ids, dtype=np.int64)
+        if ids.shape != (row_count,):
+            raise ValueError("unbreakable_group_first needs one group id per row in every grouping.")
+        member = ids >= 0
+        labels, inverse = np.unique(ids[member], return_inverse=True)
+        first = np.full(labels.shape[0], row_count, dtype=np.int64)
+        last = np.full(labels.shape[0], -1, dtype=np.int64)
+        np.minimum.at(first, inverse, rows[member])
+        np.maximum.at(last, inverse, rows[member])
+        span_starts.append(first)
+        span_stops.append(last + 1)
+    starts = np.concatenate(span_starts)
+    stops = np.concatenate(span_stops)
+    group_first = rows.copy()
+    if starts.size == 0:
+        return group_first
+    # Merge overlapping spans: a span continues while the running stop passes the next start.
+    order = np.argsort(starts, kind="stable")
+    starts, stops = starts[order], stops[order]
+    running_stop = np.maximum.accumulate(stops)
+    opens = np.concatenate([[True], starts[1:] >= running_stop[:-1]])
+    merged_starts = starts[opens]
+    merged_stops = np.maximum.reduceat(stops, np.flatnonzero(opens))
+    covering = np.searchsorted(merged_starts, rows, side="right") - 1
+    inside = covering >= 0
+    inside[inside] = rows[inside] < merged_stops[covering[inside]]
+    group_first[inside] = merged_starts[covering[inside]]
+    return group_first
+
+
+def refalt_digest(ref: str, alt: str) -> int:
+    """The sidecar's refalt_md5: the first 16 hex digits of md5("REF\tALT"), as strata writes it."""
+    return int(hashlib.md5(f"{ref}\t{alt}".encode()).hexdigest()[:16], 16)
+
+
+@dataclass(frozen=True, slots=True)
+class ExpectedSites:
+    """One chromosome's sidecar keys, which every batch's records must match in order (gate G2)."""
+
+    positions: I64Array
+    refalt_digests: NDArray
+    identifiers: tuple[str, ...]
+    kept_paths: NDArray
+    carrying_paths: NDArray
+
+    def __post_init__(self) -> None:
+        count = self.positions.shape[0]
+        if not (self.refalt_digests.shape == self.kept_paths.shape == self.carrying_paths.shape == (count,)) or len(self.identifiers) != count:
+            raise ValueError("ExpectedSites needs one digest, id, kept-path and carrying-path count per position.")
+
+
+@dataclass(frozen=True, slots=True)
+class DecodedBatch:
+    """One batch's corrected codes [records, batch samples] and its exact per-group dosage sums."""
+
+    codes: U8Array
+    group_sums: I64Array
+    group_counts: I64Array
+    zeroed: I64Array
+    unmatched_low: I64Array
+
+
+def _gate(condition: bool, path: Path, record: int, detail: str) -> None:
+    if not condition:
+        raise ValueError(f"{path} record {record}: {detail}")
+
+
+def decode_batch(
+    vcf_path: str | Path,
+    expected: ExpectedSites,
+    sample_groups: NDArray,
+    group_count: int,
+    codes_path: str | Path,
+) -> DecodedBatch:
+    """Decode one popped batch file of one chromosome into corrected store codes.
+
+    Records must match ``expected`` one for one (POS, md5 of REF/ALT, INFO/ID; gate G2), and
+    every sample needs DS and GP with GP summing to 1 and DS = GP1 + 2 GP2 to within a
+    thousandth (G4). The value-matched background is removed before encoding. ``codes_path``
+    receives the codes as an .npy; ``sample_groups`` gives each of the file's samples, in header
+    order, its ancestry group in 0..group_count-1.
+    """
+    path = Path(vcf_path)
+    groups = np.asarray(sample_groups, dtype=np.int64)
+    reader = VCF(str(path))
+    try:
+        sample_count = len(reader.samples)
+        if groups.shape != (sample_count,) or (groups.size and (int(groups.min()) < 0 or int(groups.max()) >= group_count)):
+            raise ValueError(f"{path}: need a group in 0..{group_count - 1} for each of its {sample_count} samples.")
+        record_count = expected.positions.shape[0]
+        codes = np.lib.format.open_memmap(Path(codes_path), mode="w+", dtype=np.uint8, shape=(record_count, sample_count))
+        group_sums = np.zeros((record_count, group_count), dtype=np.int64)
+        zeroed = np.zeros(record_count, dtype=np.int64)
+        unmatched_low = np.zeros(record_count, dtype=np.int64)
+        block = np.empty((DECODE_BLOCK_ROWS, sample_count), dtype=np.uint16)
+        members = [groups == group for group in range(group_count)]
+
+        def flush(stop: int) -> None:
+            start = (stop - 1) // DECODE_BLOCK_ROWS * DECODE_BLOCK_ROWS
+            corrected = value_matched_background(
+                block[: stop - start], expected.kept_paths[start:stop], expected.carrying_paths[start:stop]
+            )
+            codes[start:stop] = encode_dosage_milli(corrected.dosage_milli)
+            for group, mask in enumerate(members):
+                group_sums[start:stop, group] = corrected.dosage_milli[:, mask].sum(axis=1, dtype=np.int64)
+            zeroed[start:stop] = corrected.zeroed
+            unmatched_low[start:stop] = corrected.unmatched_low
+
+        row = 0
+        for record in reader:
+            _gate(row < record_count, path, row, "more records than the sidecar")
+            _gate(record.POS == int(expected.positions[row]), path, row, "POS differs from the sidecar")
+            _gate(refalt_digest(record.REF, ",".join(record.ALT)) == int(expected.refalt_digests[row]), path, row, "REF/ALT differ")
+            _gate(str(record.INFO.get("ID")) == expected.identifiers[row], path, row, "INFO/ID differs")
+            dosage = record.format("DS")
+            probabilities = record.format("GP")
+            _gate(dosage is not None and probabilities is not None, path, row, "DS or GP missing")
+            dosage_milli = np.rint(np.asarray(dosage, dtype=np.float64)[:, 0] * 1000.0)
+            probability_milli = np.rint(np.asarray(probabilities, dtype=np.float64) * 1000.0)
+            _gate(bool(np.all(np.isfinite(dosage_milli)) and np.all(np.isfinite(probability_milli))), path, row, "a DS or GP is missing")
+            _gate(bool(np.all((dosage_milli >= 0) & (dosage_milli <= MAXIMUM_DOSAGE_MILLI))), path, row, "DS outside [0, 2]")
+            _gate(
+                bool(np.all(np.abs(probability_milli.sum(axis=1) - 1000.0) <= GENOTYPE_PROBABILITY_SUM_SLACK_MILLI)),
+                path,
+                row,
+                "GP does not sum to 1",
+            )
+            implied = probability_milli[:, 1] + 2.0 * probability_milli[:, 2]
+            _gate(bool(np.all(np.abs(dosage_milli - implied) <= 1.0)), path, row, "DS differs from GP1 + 2 GP2")
+            block[row % DECODE_BLOCK_ROWS] = dosage_milli.astype(np.uint16)
+            row += 1
+            if row % DECODE_BLOCK_ROWS == 0:
+                flush(row)
+        _gate(row == record_count, path, row, f"fewer records than the sidecar's {record_count}")
+        if row % DECODE_BLOCK_ROWS:
+            flush(row)
+        codes.flush()
+    finally:
+        reader.close()
+    return DecodedBatch(
+        codes=np.load(Path(codes_path), mmap_mode="r"),
+        group_sums=group_sums,
+        group_counts=np.array([int(mask.sum()) for mask in members], dtype=np.int64),
+        zeroed=zeroed,
+        unmatched_low=unmatched_low,
+    )
+
+
+def _half_code_blocks(
+    batches: Sequence[DecodedBatch],
+    sample_groups: NDArray,
+    scales: NDArray | None,
+    block_rows: int,
+) -> Iterator[U8Array]:
+    record_count = batches[0].codes.shape[0]
+    for start in range(0, record_count, block_rows):
+        stop = min(start + block_rows, record_count)
+        codes = np.hstack([batch.codes[start:stop] for batch in batches])
+        if scales is not None:
+            # D* from the codes: DS = code / 127 to the nearest thousandth, recalibrated, re-encoded.
+            dosage_milli = ((codes.astype(np.int64) * 2000 + 127) // 254).astype(np.uint16)
+            codes = encode_dosage_milli(linear_recalibration(dosage_milli, sample_groups, scales[start:stop]).dosage_milli)
+        yield codes
+
+
+def assemble_half(
+    root: str | Path,
+    half_index: int,
+    chromosome: str,
+    batches: Sequence[DecodedBatch],
+    sample_groups: NDArray,
+    scales: NDArray | None,
+    *,
+    codec: Codec,
+    block_rows: int = DECODE_BLOCK_ROWS,
+) -> tuple[I64Array, I64Array]:
+    """Write one half of one chromosome from its batches, columns in batch order.
+
+    ``sample_groups`` covers the half's samples in that order. ``scales`` is the per-record,
+    per-group kappa of the D* recalibration where design-reliability supplies one, or None
+    before it exists (the stored codes are then the background-corrected DS, and the MANIFEST
+    says so). Returns the written per-record code sums.
+    """
+    if not batches:
+        raise ValueError("assemble_half needs at least one batch.")
+    record_count = batches[0].codes.shape[0]
+    if any(batch.codes.shape[0] != record_count for batch in batches):
+        raise ValueError("every batch of a chromosome needs the same records.")
+    sample_count = sum(batch.codes.shape[1] for batch in batches)
+    if np.asarray(sample_groups).shape != (sample_count,):
+        raise ValueError("sample_groups must cover the half's samples in batch order.")
+    return write_half_codes(
+        Path(root),
+        half_index,
+        chromosome,
+        record_count,
+        sample_count,
+        _half_code_blocks(batches, sample_groups, scales, block_rows),
+        codec=codec,
     )
