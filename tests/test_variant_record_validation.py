@@ -43,6 +43,7 @@ def _record(**overrides) -> VariantRecord:
         ((VariantClass.SNV, VariantClass.DELETION), (0.0, 0.0), "positive value"),
         ((VariantClass.SNV, VariantClass.DELETION), (3.0, 4.0), "must sum to 1.0"),
         ((VariantClass.SNV, VariantClass.DELETION), (0.4, 0.4), "must sum to 1.0"),
+        ((VariantClass.SNV, VariantClass.DELETION), (0.25, 0.75 + 1e-9), "must sum to 1.0"),
         ((VariantClass.SNV, VariantClass.SNV), (0.4, 0.6), "duplicates"),
         ((VariantClass.SNV,), (), "same length"),
         ((), (1.0,), "same length"),
@@ -59,7 +60,7 @@ def test_invalid_class_membership_is_rejected(members, membership, message_fragm
         ((VariantClass.SNV,), (1.0,)),
         ((VariantClass.SNV, VariantClass.DELETION), (0.5, 0.5)),
         ((VariantClass.SNV, VariantClass.DELETION), (0.0, 1.0)),
-        ((VariantClass.SNV, VariantClass.DELETION), (0.25, 0.75 + 1e-9)),
+        ((VariantClass.SNV, VariantClass.DELETION), (0.25, float(np.nextafter(0.75, 1.0)))),
     ],
 )
 def test_valid_class_membership_is_accepted(members, membership):

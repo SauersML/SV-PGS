@@ -13,7 +13,6 @@ NESTED_PATH_DELIMITER = ">"
 
 # Class-membership weights are mixture proportions: they must sum to one, up to
 # floating-point slack from the collapse/normalization paths that produce them.
-CLASS_MEMBERSHIP_SUM_TOLERANCE = 1e-6
 
 _TRUE_BOOLEAN_TOKENS = frozenset({"true", "t", "yes", "1"})
 _FALSE_BOOLEAN_TOKENS = frozenset({"false", "f", "no", "0"})
@@ -73,10 +72,12 @@ def _validate_class_membership(
         membership_sum += weight_value
     if membership_sum <= 0.0:
         raise ValueError("prior_class_membership weights must sum to a positive value.")
-    if abs(membership_sum - 1.0) > CLASS_MEMBERSHIP_SUM_TOLERANCE:
+    # Rounding each proportion and summing k of them errs by less than k float64 epsilons.
+    rounding_bound = len(prior_class_membership) * float(np.finfo(np.float64).eps)
+    if abs(membership_sum - 1.0) > rounding_bound:
         raise ValueError(
             "prior_class_membership weights are mixture proportions and must sum to 1.0"
-            f" (within {CLASS_MEMBERSHIP_SUM_TOLERANCE:g}); got {membership_sum!r}."
+            f" (within {rounding_bound:g}, the rounding bound); got {membership_sum!r}."
         )
 
 
@@ -125,7 +126,7 @@ class VariantRecord:
 
     ``prior_class_members`` / ``prior_class_membership`` are a soft assignment of
     the variant to variant classes. The weights are mixture proportions: they must
-    be finite, non-negative, and sum to 1.0 (within ``CLASS_MEMBERSHIP_SUM_TOLERANCE``).
+    be finite, non-negative, and sum to 1.0 up to float64 rounding.
     They are validated, never auto-normalized, and a class may appear at most once.
     When both are omitted the variant is assigned to its own ``variant_class`` with
     weight 1.0.
@@ -324,7 +325,10 @@ class TieMap:
         group_weights: list[NDArray] = []
         for tie_group in self.reduced_to_group:
             member_variances = variances[tie_group.member_indices]
-            group_weights.append(member_variances / np.maximum(np.sum(member_variances), 1e-12))
+            total = np.sum(member_variances)
+            if not total > 0:
+                raise ValueError("a tie group's member prior variances must have a positive sum.")
+            group_weights.append(member_variances / total)
         return group_weights
 
     def expand_coefficients(

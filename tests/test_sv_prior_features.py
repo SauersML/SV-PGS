@@ -2,26 +2,32 @@ import numpy as np
 import pytest
 from scipy.special import digamma
 
-from sv_pgs.sv_prior_features import block_tagging, ewens_theta, locus_common_flags
+from sv_pgs.sv_prior_features import block_tagging, ewens_theta, locus_frequency
 
 
-def test_a_split_common_locus_is_common_although_every_record_is_rare():
+def test_a_split_locus_carries_its_summed_frequency_on_every_rare_record():
     bubbles = np.array([4, 4, 4, 9, 9, 2])
     is_sv = np.array([True, True, True, True, True, False])
-    frequency = np.array([0.004, 0.004, 0.004, 0.006, 0.7, 0.5])
-    flags = locus_common_flags(bubbles, is_sv, frequency, common_frequency=0.01)
-    np.testing.assert_array_equal(flags, [True, True, True, True, True, False])
-    rare = locus_common_flags(bubbles, is_sv, np.array([0.002, 0.002, 0.002, 0.006, 0.7, 0.5]), 0.01)
-    np.testing.assert_array_equal(rare, [False, False, False, True, True, False])
+    frequency = np.array([2.0**-5, 2.0**-5, 2.0**-5, 0.25, 0.875, 0.5])
+    locus = locus_frequency(bubbles, is_sv, frequency)
+    np.testing.assert_array_equal(locus[:5], [3 * 2.0**-5, 3 * 2.0**-5, 3 * 2.0**-5, 1.0, 1.0])
+    assert np.isnan(locus[5])
     with pytest.raises(ValueError, match="one bubble"):
-        locus_common_flags(bubbles[:2], is_sv, frequency, 0.01)
+        locus_frequency(bubbles[:2], is_sv, frequency)
 
 
-def test_ewens_theta_inverts_the_expected_allele_count():
+def test_ewens_theta_is_the_float_root_of_the_expected_allele_count():
     haplotypes = 25_108
-    theta = np.array([0.05, 0.5, 3.0, 40.0])
-    expected = 1.0 + theta * (digamma(theta + haplotypes) - digamma(theta + 1.0))
-    np.testing.assert_allclose(ewens_theta(expected, haplotypes), theta, rtol=1e-9)
+
+    def expected(theta):
+        return 1.0 + theta * (digamma(theta + haplotypes) - digamma(theta + 1.0))
+
+    alleles = expected(np.array([0.05, 0.5, 3.0, 40.0]))
+    estimate = ewens_theta(alleles, haplotypes)
+    below, above = np.nextafter(estimate, 0.0), np.nextafter(estimate, np.inf)
+    brackets_up = (expected(estimate) <= alleles) & (alleles < expected(above))
+    brackets_down = (expected(below) <= alleles) & (alleles < expected(estimate))
+    assert np.all(brackets_up | brackets_down)
     assert ewens_theta(np.array([1.0]), haplotypes)[0] == 0.0
     with pytest.raises(ValueError, match="allele counts"):
         ewens_theta(np.array([float(haplotypes)]), haplotypes)

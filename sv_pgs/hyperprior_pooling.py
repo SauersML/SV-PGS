@@ -58,11 +58,6 @@ class PooledHyperprior:
     shifted_estimates: tuple[F64Array, ...]
 
 
-def _penalty_rank(penalty: NDArray) -> int:
-    eigenvalues = np.linalg.eigvalsh(penalty)
-    return int(np.sum(eigenvalues > 1e-10 * max(float(eigenvalues[-1]), 0.0)))
-
-
 def pooled_hyperprior_step(
     estimates: Sequence[NDArray],
     informations: Sequence[NDArray],
@@ -116,7 +111,7 @@ def pooled_hyperprior_step(
     new_variance = np.maximum(numerator / denominator, _VARIANCE_SHRINK_LIMIT * variance)
     new_weights = np.empty_like(weights)
     for index, (weight, matrix) in enumerate(zip(weights, penalty_matrices)):
-        freedom = _penalty_rank(matrix) - weight * float(np.trace(combined_inverse @ matrix))
+        freedom = int(np.linalg.matrix_rank(matrix, hermitian=True)) - weight * float(np.trace(combined_inverse @ matrix))
         if freedom <= 0:
             raise ValueError("a penalty's effective rank is not positive; its weight is unidentified.")
         quadratic = float(new_mean @ matrix @ new_mean)
