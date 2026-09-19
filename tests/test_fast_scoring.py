@@ -11,6 +11,7 @@ from typing import Iterator, Sequence
 
 import numpy as np
 import pytest
+from scipy import stats
 from scipy.integrate import quad
 from scipy.special import expit
 
@@ -19,9 +20,11 @@ from sv_pgs.config import TraitType
 from sv_pgs.data import TieGroup, TieMap
 from sv_pgs.fast_scoring import (
     ScoringModel,
+    GeneticScores,
     ScoringPlan,
     _cpu_panels,
     _host_bytes,
+    _trapezoid_rule,
     posterior_predictive_probability,
     predictive_intercept_shift,
     score_genetic,
@@ -312,24 +315,71 @@ def test_a_one_draw_binary_model_carries_its_variance_into_the_damped_predictive
         posterior_predictive_probability(no_draws.means[:, 0], no_draws.variances[:, 0], 0.0)
 
 
-def test_the_predictive_is_the_logistic_normal_integral():
-    linear_predictor = np.array([-4.0, -1.3, 0.0, 0.7, 3.2, -2.5])
-    variance = np.array([0.0, 0.01, 0.5, 1.7, 4.0, 2.9])
-    shift = 0.25
+def exact_predictive(eta: float, variance: float) -> tuple[float, float]:
+    """E[sigmoid(eta + sqrt(v) Z)] by adaptive quadrature over |z| <= 40 (the mass beyond is below 1e-340),
+    split at the sigmoid's transition z = -eta / sqrt(v), with quad's error estimate."""
+    spread = float(np.sqrt(variance))
 
-    probability = posterior_predictive_probability(linear_predictor, variance, shift)
+    def integrand(standard_normal: float) -> float:
+        return expit(eta + spread * standard_normal) * np.exp(-0.5 * standard_normal**2) / np.sqrt(2.0 * np.pi)
 
-    for eta, spread, value in zip(linear_predictor + shift, np.sqrt(variance), probability, strict=True):
-        exact, _ = quad(
-            lambda standard_normal: expit(eta + spread * standard_normal)
-            * np.exp(-0.5 * standard_normal**2)
-            / np.sqrt(2.0 * np.pi),
-            -np.inf,
-            np.inf,
-            epsabs=1e-14,
-            epsrel=1e-13,
-        )
-        assert value == pytest.approx(exact, abs=1e-10)
+    breaks = [-40.0, 40.0] + ([float(np.clip(-eta / spread, -40.0, 40.0))] if spread > 0.0 else [])
+    breaks = sorted(set(breaks))
+    value = error = 0.0
+    for low, high in zip(breaks[:-1], breaks[1:]):
+        part, part_error = quad(integrand, low, high, epsabs=np.finfo(np.float64).eps, epsrel=0.0, limit=1000)
+        value, error = value + part, error + part_error
+    return value, error
+
+
+def predictive_error_bound(variance: np.ndarray) -> np.ndarray:
+    """2 eps of quadrature and truncation (see _trapezoid_rule), plus the rounding of a sum of 2K + 1
+    terms of a few roundings each, all of total mass at most 1."""
+    _step, half_width = _trapezoid_rule(np.asarray(variance, dtype=np.float64))
+    return 2.0 * np.finfo(np.float64).eps + np.array([gamma(2 * int(width) + 9) for width in np.atleast_1d(half_width)])
+
+
+def test_the_predictive_is_the_logistic_normal_integral_at_every_variance():
+    linear_predictor = np.array([-4.0, -1.3, 0.0, 0.7, 3.2, -2.5, -3.0, 0.3, 2.0, -0.7])
+    for variance_value in (0.0, 0.01, 0.5, 1.7, 4.0, 5.0, 30.0, 1e4):
+        variance = np.full(linear_predictor.shape, variance_value)
+        probability = posterior_predictive_probability(linear_predictor, variance, 0.25)
+        bound = predictive_error_bound(variance)
+        for eta, value, entry_bound in zip(linear_predictor + 0.25, probability, bound, strict=True):
+            exact, quadrature_error = exact_predictive(float(eta), variance_value)
+            assert abs(value - exact) <= entry_bound + quadrature_error
+
+
+def test_the_predictive_completes_for_single_draw_variances_and_refuses_nan():
+    random_generator = np.random.default_rng(12)
+    linear_predictor = random_generator.normal(-1.5, 1.0, size=100_000)
+    variance = 0.25 * random_generator.chisquare(1, size=100_000)
+    probability = posterior_predictive_probability(linear_predictor, variance, 0.0)
+    assert probability.shape == linear_predictor.shape
+    assert np.all(np.isfinite(probability)) and np.all((probability > 0.0) & (probability < 1.0))
+    with pytest.raises(ValueError, match="not finite"):
+        posterior_predictive_probability(np.array([0.0, np.nan]), np.array([1.0, 1.0]), 0.0)
+
+
+def test_credible_intervals_are_exact_student_t_for_any_draw_count():
+    random_generator = np.random.default_rng(13)
+    sample_count, coverage = 20_000, 0.9
+    for draw_count in (1, 5):
+        means = random_generator.normal(size=(sample_count, 1))
+        true_variance = random_generator.uniform(0.1, 2.0, size=(sample_count, 1))
+        genetic_value = means + np.sqrt(true_variance) * random_generator.standard_normal((sample_count, 1))
+        draws = means + np.sqrt(true_variance) * random_generator.standard_normal((sample_count, draw_count))
+        estimated = np.mean((draws - means) ** 2, axis=1, keepdims=True)
+        scores = GeneticScores(means=means, variances=estimated, draw_counts=(draw_count,))
+        lower, upper = scores.credible_interval(coverage)
+        covered = int(np.sum((lower <= genetic_value) & (genetic_value <= upper)))
+        assert stats.binomtest(covered, sample_count, coverage).pvalue > 0.05
+        if draw_count == 1:
+            normal_half_width = stats.norm.isf(0.5 * (1.0 - coverage)) * np.sqrt(estimated)
+            normal_covered = int(np.sum(np.abs(genetic_value - means) <= normal_half_width))
+            assert stats.binomtest(normal_covered, sample_count, coverage, alternative="less").pvalue < 0.05
+    with pytest.raises(ValueError, match="no credible interval"):
+        GeneticScores(means=means, variances=np.full_like(means, np.nan), draw_counts=(0,)).credible_interval(coverage)
 
 
 def test_predictive_intercept_shift_anchors_the_damped_mean_on_the_prevalence():
@@ -341,7 +391,12 @@ def test_predictive_intercept_shift_anchors_the_damped_mean_on_the_prevalence():
     shift = predictive_intercept_shift(linear_predictor, variance, targets)
     probability = posterior_predictive_probability(linear_predictor, variance, shift)
 
-    assert float(np.mean(probability)) == pytest.approx(float(np.mean(targets)), abs=1e-12)
+    # brentq resolves the shift to xtol + rtol |shift|, and sigmoid' <= 1/4 carries that to the mean
+    eps = np.finfo(np.float64).eps
+    prevalence = float(np.mean(targets))
+    resolution = 4.0 * eps * min(prevalence, 1.0 - prevalence) + 4.0 * eps * abs(shift)
+    bound = 0.25 * resolution + float(np.max(predictive_error_bound(variance))) + gamma(2000)
+    assert abs(float(np.mean(probability)) - prevalence) <= bound
 
 
 def test_predictive_intercept_shift_needs_cases_and_controls():

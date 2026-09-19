@@ -59,7 +59,7 @@ The pre-cutover tree is tagged `archive/2026-09-19/old-path-final` (`f025cce`).
   - `artifact.ModelArtifact` is written only by `BayesianPGS.export`.
   - MODEL.md §4 requires the certificate to be recorded in the artifact, so the engine either extends `artifact.py` or replaces it.
 - **B6 — binary traits have no owner on the new path.**
-  - MODEL.md §4 specifies logistic EP with a converged Gauss–Hermite predictive. `fast_scoring` already implements the predictive.
+  - MODEL.md §4 specifies logistic EP with an fp64-exact trapezoid-rule predictive. `fast_scoring` already implements the predictive.
   - The engine brief covers only the variant-side EP. The old binary machinery must not be deleted before logistic likelihood sites exist on the new path:
     - `tr_newton.py`;
     - the Pólya–Gamma, Laplace and `_fit_binary_alpha_with_offset` code in `mixture_inference`.

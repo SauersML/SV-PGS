@@ -32,15 +32,20 @@ the draw scores g_i^(k). The posterior mean score g_i is known exactly, so
 is an unbiased estimate of the posterior variance of the genetic score, with
 relative standard error sqrt(2 / K). That moves a damped probability by at
 most |sigmoid''| / 2 * sqrt(2 / K) * v_i <= 0.068 v_i / sqrt(K). One draw
-already makes it unbiased. The covariate coefficients have a flat prior and
-an O(1/n) posterior variance, which the predictive ignores.
+already makes it unbiased. An interval needs more care: K v_i is v times a
+chi-square with K degrees of freedom, independent of the genetic value, so
+(G_i - g_i) / sqrt(v_i) is exactly Student-t with K degrees of freedom and
+``GeneticScores.credible_interval`` uses t_K quantiles. Normal quantiles would
+under-cover at small K. The covariate coefficients have a flat prior and an
+O(1/n) posterior variance, which the predictive ignores.
 
 Binary models. The posterior predictive is
 
     P(y_i = 1) = E[sigmoid(eta_i + c + sqrt(v_i) Z)],   Z ~ N(0, 1),
 
-evaluated by Gauss-Hermite quadrature whose node count doubles until the
-result stops changing beyond the rounding of the quadrature sum itself. The
+evaluated by the trapezoid rule in z with a step and a truncation derived
+a priori from the integrand's strip of analyticity, so it is exact to fp64
+for every variance with no iteration (see ``_trapezoid_rule``). The
 shift c anchors the mean predictive on the training prevalence; the fitted
 intercept anchors the plug-in predictor, and the damped one needs its own
 anchor.
@@ -55,11 +60,11 @@ from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
-from functools import lru_cache
 import math
 from typing import Any, Iterable, Iterator, Protocol, Sequence
 
 import numpy as np
+from scipy import stats
 from scipy.optimize import brentq
 from scipy.special import expit
 from threadpoolctl import threadpool_limits
@@ -73,6 +78,8 @@ from sv_pgs.progress import log
 SIGNED_CODE_OFFSET = 127.0
 _READ_AHEAD_BUFFERS = 3
 _FLOAT64_BYTES = 8
+_EPSILON = float(np.finfo(np.float64).eps)
+_INVERSE_ROOT_TWO_PI = 1.0 / math.sqrt(2.0 * math.pi)
 
 
 class CodeBlockSource(Protocol):
@@ -254,11 +261,28 @@ class ScoringPlan:
 class GeneticScores:
     """Scores [samples, models]: posterior-mean genetic scores and their posterior variances.
 
-    ``variances`` is NaN for a model without posterior draws.
+    ``variances`` are the K-draw estimates v_i (NaN for a model without posterior draws) and
+    ``draw_counts`` holds each model's K.
     """
 
     means: F64Array
     variances: F64Array
+    draw_counts: tuple[int, ...]
+
+    def credible_interval(self, coverage: float) -> tuple[F64Array, F64Array]:
+        """Central ``coverage`` interval of every sample's genetic value, exact for any K.
+
+        The mean score is exact and the K draws are independent posterior draws, so K v_i / v is
+        chi-square with K degrees of freedom and independent of G ~ N(g, v); (G - g) / sqrt(v_i) is
+        then Student-t with K degrees of freedom, and the interval uses its quantiles.
+        """
+        if not 0.0 < coverage < 1.0:
+            raise ValueError("coverage must lie strictly between 0 and 1.")
+        counts = np.asarray(self.draw_counts, dtype=np.int64)
+        if np.any(counts == 0):
+            raise ValueError("a model without posterior draws has no credible interval.")
+        half_width = stats.t.isf(0.5 * (1.0 - coverage), counts)[None, :] * np.sqrt(self.variances)
+        return self.means - half_width, self.means + half_width
 
 
 def _host_bytes(plan: ScoringPlan, store_samples: int, selected_samples: int, rows: int, device_kind: str) -> int:
@@ -452,7 +476,8 @@ def score_genetic(
         if draw_stop > draw_start:
             deviations = accumulator[draw_start:draw_stop] - accumulator[plan.mean_columns[model_index]]
             variances[:, model_index] = np.mean(deviations * deviations, axis=0)
-    return GeneticScores(means=means, variances=variances)
+    draw_counts = tuple(draw_stop - draw_start for draw_start, draw_stop in plan.draw_columns)
+    return GeneticScores(means=means, variances=variances, draw_counts=draw_counts)
 
 
 def score_linear_predictor(
@@ -474,10 +499,28 @@ def score_linear_predictor(
     return linear_predictor
 
 
-@lru_cache
-def _hermite_rule(node_count: int) -> tuple[F64Array, F64Array]:
-    nodes, weights = np.polynomial.hermite.hermgauss(node_count)
-    return nodes, weights / np.sqrt(np.pi)
+_TRUNCATION = float(stats.norm.isf(0.5 * _EPSILON))
+"""|z| beyond which the standard normal holds eps of mass in its two tails."""
+_WIDEST_STRIP = math.sqrt(2.0 * math.log(2.0 / _EPSILON))
+"""The strip half-width a at which the step 2 pi a / ln(1 + 2 e^(a^2/2) / eps) is widest."""
+
+
+def _trapezoid_rule(variance: F64Array) -> tuple[F64Array, I64Array]:
+    """Step h and half-width K (nodes k h for |k| <= K) of the trapezoid rule for E[sigmoid(eta + sqrt(v) Z)].
+
+    In z the integrand f(z) = sigmoid(eta + sqrt(v) z) phi(z) is analytic in |Im z| < pi / sqrt(v), since
+    sigmoid's poles sit at Im w = +-pi. On |Im z| <= a with a <= pi / (2 sqrt(v)), Re e^-w >= 0 gives
+    |sigmoid| <= 1, and the integral of |phi(x + i y)| over x is e^(y^2/2), so M = e^(a^2/2). The infinite
+    trapezoid sum with step h then errs by at most 2 M / (e^(2 pi a / h) - 1) (Trefethen and Weideman 2014,
+    Theorem 5.1), which is eps at h = 2 pi a / ln(1 + 2 e^(a^2/2) / eps). The strip is
+    a = min(pi / (2 sqrt(v)), _WIDEST_STRIP). Every omitted node k > K has h phi(k h) below the integral
+    of phi over the step before it, and sigmoid <= 1, so the nodes beyond K h >= _TRUNCATION omit at most
+    eps. The result is within 2 eps plus the rounding of its sum of the exact predictive.
+    """
+    with np.errstate(divide="ignore"):
+        strip = np.minimum(np.pi / (2.0 * np.sqrt(variance)), _WIDEST_STRIP)
+    step = 2.0 * np.pi * strip / np.log1p(2.0 * np.exp(0.5 * strip * strip) / _EPSILON)
+    return step, np.ceil(_TRUNCATION / step).astype(np.int64)
 
 
 def posterior_predictive_probability(
@@ -485,11 +528,10 @@ def posterior_predictive_probability(
     predictor_variance: F64Array,
     intercept_shift: float,
 ) -> F64Array:
-    """P(y = 1) = E[sigmoid(eta + c + sqrt(v) Z)] by Gauss-Hermite quadrature.
+    """P(y = 1) = E[sigmoid(eta + c + sqrt(v) Z)] by the a-priori trapezoid rule of ``_trapezoid_rule``.
 
-    The node count doubles until no probability moves by more than the rounding bound of the
-    quadrature sum, node count x eps (recursive summation of non-negative terms whose total is at
-    most 1), so the quadrature is converged to fp64 rounding.
+    Entries are processed in order of their node count, so the work is the total node count and the
+    memory is linear in the entries whatever their variances.
     """
     eta = np.asarray(linear_predictor, dtype=np.float64) + float(intercept_shift)
     variance = np.asarray(predictor_variance, dtype=np.float64)
@@ -497,20 +539,25 @@ def posterior_predictive_probability(
         raise ValueError("linear_predictor and predictor_variance must have the same shape.")
     if not np.all(np.isfinite(variance)) or np.any(variance < 0.0):
         raise ValueError("predictor_variance must be finite and non-negative.")
-    spread = np.sqrt(2.0 * variance)[..., None]
-
-    def quadrature(node_count: int) -> F64Array:
-        nodes, weights = _hermite_rule(node_count)
-        return expit(eta[..., None] + spread * nodes) @ weights
-
-    node_count = 1
-    previous = quadrature(node_count)
-    while True:
-        node_count *= 2
-        current = quadrature(node_count)
-        if eta.size == 0 or float(np.max(np.abs(current - previous))) <= node_count * np.finfo(np.float64).eps:
-            return current
-        previous = current
+    step, half_width = _trapezoid_rule(variance.ravel())
+    order = np.argsort(half_width, kind="stable")
+    sorted_half_width = half_width[order]
+    sorted_eta = eta.ravel()[order]
+    sorted_spread = np.sqrt(variance.ravel())[order]
+    sorted_step = step[order]
+    total = sorted_step * _INVERSE_ROOT_TWO_PI * expit(sorted_eta)
+    node_count = int(sorted_half_width[-1]) if total.size else 0
+    for node in range(1, node_count + 1):
+        active = slice(int(np.searchsorted(sorted_half_width, node)), None)
+        offset = node * sorted_step[active]
+        weight = sorted_step[active] * _INVERSE_ROOT_TWO_PI * np.exp(-0.5 * offset * offset)
+        shift = sorted_spread[active] * offset
+        total[active] += weight * (expit(sorted_eta[active] + shift) + expit(sorted_eta[active] - shift))
+    if not np.all(np.isfinite(total)):
+        raise ValueError("the posterior predictive is not finite: the linear predictor holds NaN.")
+    probability = np.empty_like(total)
+    probability[order] = total
+    return probability.reshape(eta.shape)
 
 
 def predictive_intercept_shift(
