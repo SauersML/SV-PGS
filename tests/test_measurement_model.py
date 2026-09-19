@@ -9,6 +9,7 @@ from sv_pgs.measurement_model import (
     apply_leakage_map,
     calibration_moments,
     calibration_pairs,
+    concatenate_calibration_moments,
     fit_leakage_map,
     fit_measurement_model,
     leakage_transform,
@@ -16,8 +17,8 @@ from sv_pgs.measurement_model import (
     mapped_gram,
     merge_calibration_moments,
     pool_normal,
-    record_scale_estimates,
-    recalibration_scales,
+    pooled_calibration,
+    pooled_log_reliability,
     residual_variances,
 )
 from sv_pgs.sample_ids import ResearchId
@@ -41,11 +42,25 @@ def _records(count: int, pairs: int, keep: float, rng: np.random.Generator) -> t
 
 def test_the_pooled_scale_of_a_draw_type_column_is_its_keep_probability() -> None:
     rng = np.random.default_rng(20260919)
-    _, genotype, dosage = _records(300, 3000, 0.8, rng)
-    slopes, variances = record_scale_estimates(calibration_moments(dosage, genotype))
-    pooled = pool_normal(slopes, variances)
-    weights = 1.0 / (pooled.between_variance + variances)
-    assert abs(pooled.coefficients[0] - 0.8) <= sampling_bound(float(np.sqrt(1.0 / weights.sum())))
+    records, pairs, keep = 300, 3000, 0.8
+    _, genotype, dosage = _records(records, pairs, keep, rng)
+    pooled = pooled_calibration(calibration_moments(dosage, genotype), dosage.var(axis=1), np.zeros(records, dtype=int))
+    # Each record's slope has sampling variance Var(G - keep D) / S_DD = (1 - keep^2) / pairs.
+    standard_error = np.sqrt((1 - keep**2) / (pairs * records))
+    assert abs(float(np.mean(pooled.scales)) - keep) <= sampling_bound(float(standard_error))
+
+
+def test_a_rare_record_whose_few_pairs_fit_exactly_is_pooled_to_its_stratum() -> None:
+    rng = np.random.default_rng(37)
+    _, genotype, dosage = _records(200, 200, 0.7, rng)
+    rare_dosage = np.zeros((1, 200))
+    rare_truth = np.zeros((1, 200))
+    rare_dosage[0, 0], rare_truth[0, 0] = 1 / 127, 1.0
+    moments = calibration_moments(np.vstack([dosage, rare_dosage]), np.vstack([genotype, rare_truth]))
+    # The rare record's own least-squares slope is 127 with no residual.
+    cohort_variance = np.append(dosage.var(axis=1), 2 * 0.005 * 0.995)
+    pooled = pooled_calibration(moments, cohort_variance, np.zeros(201, dtype=int))
+    assert pooled.scales[-1] < 1.0
 
 
 def test_estimates_that_agree_within_their_error_are_pooled_with_no_between_variance() -> None:
@@ -75,31 +90,45 @@ def test_an_exact_estimate_is_kept_and_an_uninformative_one_gets_the_prior_mean(
 
 def test_reliability_of_a_calibrated_draw_is_the_square_of_its_scale() -> None:
     rng = np.random.default_rng(11)
-    keep = 0.6
-    _, genotype, dosage = _records(200, 4000, keep, rng)
+    records, keep = 200, 0.6
+    _, genotype, dosage = _records(records, 4000, keep, rng)
     moments = calibration_moments(dosage, genotype)
-    scales = recalibration_scales(moments, np.zeros(200, dtype=int))
-    residual = residual_variances(moments, scales)
-    reliability = np.exp(log_reliability_offsets(moments.dosage_variance, scales, residual))
-    # With Var(D) = Var(G) and Cov(G, D) = keep Var(G), a column scaled by kappa has
-    # r^2 = kappa^2 / (kappa^2 + 1 + kappa^2 - 2 kappa keep), which is keep^2 at kappa = keep.
-    kappa = float(np.mean(scales))
-    expected = kappa**2 / (kappa**2 + 1.0 + kappa**2 - 2.0 * kappa * keep)
-    assert abs(float(np.mean(reliability)) - expected) <= sampling_bound(float(np.std(reliability) / np.sqrt(reliability.size)))
+    variance = dosage.var(axis=1)
+    pooled = pooled_calibration(moments, variance, np.zeros(records, dtype=int))
+    residual = residual_variances(variance, pooled.scales, pooled.variance_ratios)
+    reliability = np.exp(log_reliability_offsets(variance, pooled.scales, residual))
+    # About 14 rounded operations separate the two sides (a log or exp counts two).
+    np.testing.assert_allclose(reliability, pooled.scales**2 / pooled.variance_ratios, rtol=rounding_gamma(16))
+    # A draw keeps the genotype's variance, so lambda = 1 and r^2 = kappa^2.
+    excess = moments.pair_counts * (moments.truth_variance - moments.dosage_variance)
+    energy = np.sum(moments.pair_counts * moments.dosage_variance)
+    assert abs(pooled.variance_ratios[0] - 1.0) <= sampling_bound(float(np.std(excess) * np.sqrt(records) / energy))
 
 
-def test_the_residual_variance_is_the_mean_square_of_the_calibrated_residual() -> None:
-    rng = np.random.default_rng(3)
-    pairs = 200
-    _, genotype, dosage = _records(5, pairs, 0.7, rng)
-    scales = np.array([0.7, 0.6, 0.8, 0.5, 0.9])
-    residual = residual_variances(calibration_moments(dosage, genotype), scales)
-    truth_centred = genotype - genotype.mean(axis=1, keepdims=True)
-    dosage_centred = dosage - dosage.mean(axis=1, keepdims=True)
-    direct = np.mean((truth_centred - scales[:, None] * dosage_centred) ** 2, axis=1)
-    # The moment form sums three terms whose magnitudes bound its cancellation error.
-    magnitude = np.mean(truth_centred**2 + 2 * np.abs(scales[:, None] * dosage_centred * truth_centred) + (scales[:, None] * dosage_centred) ** 2, axis=1)
-    assert np.all(np.abs(residual - direct) <= 2 * rounding_gamma(4 * pairs) * magnitude)
+def test_the_residual_variance_is_the_genotype_variance_the_calibrated_column_misses() -> None:
+    variance, scales, ratios = np.array([0.4, 0.3]), np.array([0.5, 1.2]), np.array([1.0, 1.0])
+    residual = residual_variances(variance, scales, ratios)
+    assert residual[0] == 0.4 * (1.0 - 0.5**2)
+    assert residual[1] == 0.0
+
+
+def test_the_cohort_reliability_pools_the_groups_models_exactly() -> None:
+    rng = np.random.default_rng(41)
+    sizes, scales, residuals = np.array([700, 300]), np.array([0.8, 0.6]), np.array([0.05, 0.2])
+    columns = [mean + rng.normal(0.0, 0.5, size) for mean, size in zip((0.4, 1.1), sizes)]
+    # The recalibration keeps each group's mean: D*_g = mu_g + kappa_g (D - mu_g).
+    calibrated = np.concatenate([column.mean() + scale * (column - column.mean()) for scale, column in zip(scales, columns)])
+    variances = np.array([column.var() for column in columns])
+    group_means = np.array([column.mean() for column in columns])
+    pooled = pooled_log_reliability(scales[None], residuals[None], group_means[None], variances[None], sizes)
+    direct_residual = np.sum(sizes * residuals) / sizes.sum()
+    direct = np.log(np.var(calibrated)) - np.log(np.var(calibrated) + direct_residual)
+    assert abs(pooled[0] - direct) <= 2 * rounding_gamma(4 * int(sizes.sum()))
+    unfitted = pooled_log_reliability(scales[None], np.array([[0.05, np.inf]]), group_means[None], variances[None], np.array([700, 0]))
+    one_group = np.log(scales[0] ** 2 * variances[0]) - np.log(scales[0] ** 2 * variances[0] + residuals[0])
+    assert abs(unfitted[0] - one_group) <= 2 * rounding_gamma(16)
+    silent = pooled_log_reliability(np.zeros((1, 2)), residuals[None], np.zeros((1, 2)), variances[None], sizes)
+    assert silent[0] == -np.inf
 
 
 def test_moments_merged_across_chunks_are_the_moments_of_all_pairs() -> None:
@@ -114,6 +143,8 @@ def test_moments_merged_across_chunks_are_the_moments_of_all_pairs() -> None:
         merged = merge_calibration_moments(merged, calibration_moments(dosage[:, chunk], genotype[:, chunk]))
     np.testing.assert_array_equal(merged.pair_counts, whole.pair_counts)
     assert merged.pair_counts[3] == 0
+    joined = concatenate_calibration_moments([calibration_moments(dosage[:17], genotype[:17]), calibration_moments(dosage[17:], genotype[17:])])
+    np.testing.assert_array_equal(joined.covariance, whole.covariance)
     bound = 2 * rounding_gamma(4 * pairs)
     for name, scale in (("dosage_mean", 2.0), ("truth_mean", 2.0), ("dosage_variance", 4.0), ("truth_variance", 4.0), ("covariance", 4.0)):
         assert np.all(np.abs(getattr(merged, name) - getattr(whole, name)) <= bound * scale), name
@@ -142,7 +173,7 @@ def test_the_leakage_map_moves_an_sv_effect_back_off_its_tag_snp() -> None:
     calibration_sv, calibration_snp = _two_locus(rng, 6000, frequency, 0.9)
     calibration_draw = _draw_type_column(calibration_sv[None], np.array([frequency]), keep, rng)[0]
     moments = calibration_moments(calibration_draw[None], calibration_sv[None])
-    scale = recalibration_scales(moments, np.zeros(1, dtype=int))[0]
+    scale = pooled_calibration(moments, moments.dosage_variance, np.zeros(1, dtype=int)).scales[0]
     calibrated = moments.dosage_mean[0] + scale * (calibration_draw - moments.dosage_mean[0])
     leakage = fit_leakage_map(np.column_stack([calibrated, calibration_snp]), calibration_sv[:, None], np.array([0]))
     assert leakage.ridge_ratio > 0.0

@@ -13,14 +13,19 @@ truth samples, and on public benchmarks from their truth.
 1. Recalibration scales. kappa_j = Cov(G, D_j) / Var(D_j), so that
    D*_j = mu_j + kappa_j (D_j - mu_j) satisfies Cov(G, D*) = Var(D*). For a
    truth with E[T | G] = G and error independent of D given G,
-   Cov(T, D) = Cov(G, D), so one truth suffices. Each record's estimate is noisy,
-   so records are pooled by a normal-normal empirical Bayes: the mean is a linear
-   model in a caller-given design, and the between-record variance is chosen by
-   marginal likelihood (0 when the records agree).
+   Cov(T, D) = Cov(G, D), so one truth suffices. Each record's estimate is noisy
+   (a rare record's few pairs can even fit exactly by chance), so records are
+   pooled within a stratum: kappa(x) is a least-squares fit, linear in a
+   caller-given design, over all the stratum's pairs, and each record's own
+   slope is shrunk toward it by a normal-normal empirical Bayes whose
+   between-record variance is chosen by marginal likelihood (0 when the records
+   agree).
 2. Conditional moments. With D* calibrated, the residual variance
-   v_j = E[(G - D*_j)^2] enters the predictive variance, and
-   r^2_j = Var(D*_j) / (Var(D*_j) + v_j) gives the prior offset log r^2_j
-   (coefficient 1, docs/design/math/scale_model.md section 1).
+   v_j = E[(G - D*_j)^2] = Var(G_j) - Var(D*_j) = V_j (lambda_j - kappa_j^2),
+   with lambda = Var(G) / Var(D) fitted like kappa(x), enters the predictive
+   variance, and r^2_j = Var(D*_j) / (Var(D*_j) + v_j) = kappa_j^2 / lambda_j
+   gives the prior offset log r^2_j (coefficient 1,
+   docs/design/math/scale_model.md section 1).
 3. The leakage map, the "A-map" (scale_model.md sections 2-3). A draw-type
    column leaves information about G_k in nearby columns, so in a joint fit part
    of an SV's effect moves onto its tag SNPs, and a stacked truth half no longer
@@ -130,29 +135,9 @@ def merge_calibration_moments(first: CalibrationMoments, second: CalibrationMome
     )
 
 
-def record_scale_estimates(moments: CalibrationMoments) -> tuple[F64Array, F64Array]:
-    """Least-squares slope kappa_hat = Cov(T, D) / Var(D) per record and its sampling variance.
-
-    The sampling variance is the ordinary least-squares one, RSS / (n - 2) / S_DD. A
-    record with no dosage variation, or fewer than 3 pairs, carries no information
-    about its slope: its variance is infinite, and pooling gives it the stratum's mean.
-    The residual sum of squares is nonnegative; a rounded negative value is projected
-    back to 0.
-    """
-    counts = moments.pair_counts.astype(np.float64)
-    informative = (moments.dosage_variance > 0.0) & (moments.pair_counts > 2)
-    slopes = np.zeros_like(moments.covariance)
-    variances = np.full_like(moments.covariance, np.inf)
-    slopes[informative] = moments.covariance[informative] / moments.dosage_variance[informative]
-    residual_sum_of_squares = np.maximum(
-        counts * (moments.truth_variance - moments.covariance**2 / np.where(informative, moments.dosage_variance, 1.0)), 0.0
-    )
-    variances[informative] = (
-        residual_sum_of_squares[informative]
-        / (counts[informative] - 2)
-        / (counts[informative] * moments.dosage_variance[informative])
-    )
-    return slopes, variances
+def concatenate_calibration_moments(parts: Sequence[CalibrationMoments]) -> CalibrationMoments:
+    """The moments of consecutive record chunks, joined in record order."""
+    return CalibrationMoments(*(np.concatenate([getattr(part, field.name) for part in parts]) for field in fields(CalibrationMoments)))
 
 
 @dataclass(frozen=True)
@@ -224,41 +209,79 @@ def pool_normal(estimates: NDArray, sampling_variances: NDArray, design: NDArray
     return NormalPooling(coefficients, between, shrunk)
 
 
-def recalibration_scales(moments: CalibrationMoments, strata: NDArray, design: NDArray | None = None) -> F64Array:
-    """Pooled kappa per record: the empirical-Bayes posterior mean of its slope within its stratum.
+@dataclass(frozen=True)
+class PooledCalibration:
+    """Per record: the pooled scale kappa_j and the variance ratio lambda_j = Var(G_j) / Var(D_j)."""
 
-    ``strata`` labels each record's pooling stratum, e.g. variant class x ancestry
-    group. ``design`` is [records, features] for the stratum's prior mean, e.g. an
-    intercept with the record's logit frequency and imputation information. A record
-    whose slope is exact (no residual) keeps it. A stratum with records to pool but
-    fewer informative ones than its design's features is refused rather than guessed.
+    scales: F64Array
+    variance_ratios: F64Array
+
+
+def pooled_calibration(
+    moments: CalibrationMoments, cohort_dosage_variance: NDArray, strata: NDArray, design: NDArray | None = None
+) -> PooledCalibration:
+    """Each record's kappa and lambda, pooled within its stratum.
+
+    Within a stratum both are linear in the record's design row x_j (default an
+    intercept), fitted by least squares over all the stratum's pairs:
+    kappa(x) from sum_j S_DT,j x_j = sum_j S_DD,j x_j x_j' beta, and lambda(x) from
+    sum_j S_TT,j x_j = sum_j S_DD,j x_j x_j' gamma, with S the per-record sums of
+    centred products. The pooled fits weigh each record by its dosage energy, so a
+    record whose few pairs happen to fit exactly carries no more weight than its
+    energy. Each record's own slope then enters a normal-normal empirical Bayes
+    around kappa(x_j), with the model's sampling variance
+    V_j (lambda(x_j) - kappa(x_j)^2) / S_DD,j, where V_j is the record's cohort
+    dosage variance: a sparse record's own residual collapses to 0 by chance, the
+    model's does not. The between-record variance is chosen by marginal likelihood.
+    A stratum whose pooled model leaves no residual keeps every informative slope,
+    which is then exact, and gives the others kappa(x_j).
     """
-    slopes, variances = record_scale_estimates(moments)
     labels = np.asarray(strata)
-    if labels.shape != slopes.shape:
-        raise ValueError("recalibration_scales needs one stratum label per record.")
-    features = np.ones((slopes.shape[0], 1)) if design is None else np.asarray(design, dtype=np.float64)
-    pooled = slopes.copy()
+    cohort_variance = np.asarray(cohort_dosage_variance, dtype=np.float64)
+    if labels.shape != moments.pair_counts.shape or cohort_variance.shape != labels.shape:
+        raise ValueError("pooled_calibration needs one stratum label and one cohort variance per record.")
+    features = np.ones((labels.shape[0], 1)) if design is None else np.asarray(design, dtype=np.float64)
+    if features.shape[0] != labels.shape[0] or not np.all(np.isfinite(features)):
+        raise ValueError("pooled_calibration needs one finite design row per record.")
+    counts = moments.pair_counts.astype(np.float64)
+    dosage_energy = counts * moments.dosage_variance
+    scales = np.empty_like(cohort_variance)
+    ratios = np.empty_like(cohort_variance)
     for stratum in np.unique(labels):
-        members = (labels == stratum) & (variances > 0.0)
-        if np.any(members):
-            pooled[members] = pool_normal(slopes[members], variances[members], features[members]).shrunk
-    return pooled
+        members = labels == stratum
+        rows, energy = features[members], dosage_energy[members]
+        gram = rows.T @ (energy[:, None] * rows)
+        if np.linalg.matrix_rank(gram) < rows.shape[1]:
+            raise ValueError(f"stratum {stratum!r} has too little dosage variation to fit its design.")
+        slope_prior = rows @ np.linalg.solve(gram, rows.T @ (counts[members] * moments.covariance[members]))
+        ratio = rows @ np.linalg.solve(gram, rows.T @ (counts[members] * moments.truth_variance[members]))
+        informative = energy > 0.0
+        slopes = np.divide(counts[members] * moments.covariance[members], energy, out=np.zeros_like(energy), where=informative)
+        residual_scale = cohort_variance[members] * np.maximum(ratio - slope_prior**2, 0.0)
+        sampling = np.divide(residual_scale, energy, out=np.full_like(energy, np.inf), where=informative)
+        uncertain = np.isfinite(sampling) & (sampling > 0.0)
+        if uncertain.sum() >= rows.shape[1]:
+            scales[members] = pool_normal(slopes, sampling, rows).shrunk
+        else:
+            # The pooled model leaves no residual: every informative slope is exact.
+            scales[members] = np.where(informative, slopes, slope_prior)
+        ratios[members] = ratio
+    return PooledCalibration(scales, ratios)
 
 
-def residual_variances(moments: CalibrationMoments, scales: NDArray) -> F64Array:
-    """v_j = mean over pairs of ((T - Tbar) - kappa_j (D - Dbar))^2 = Var(T) - 2 kappa Cov(T, D) + kappa^2 Var(D).
+def residual_variances(cohort_dosage_variance: NDArray, scales: NDArray, variance_ratios: NDArray) -> F64Array:
+    """v_j = E[(G - D*_j)^2] = Var(G_j) - Var(D*_j) = V_j (lambda_j - kappa_j^2) for a calibrated D*.
 
-    This is Var(G - D*) plus the truth's own error variance, so it upper-bounds the
-    genotype's residual variance whenever the truth is not exact. It is nonnegative;
-    a rounded negative value is projected back to 0.
+    The residual is nonnegative; a pooled lambda below kappa^2 is projected back to 0.
+    With a truth that is not exact, lambda includes the truth's error variance, so v
+    upper-bounds the genotype's residual variance.
     """
+    variance = np.asarray(cohort_dosage_variance, dtype=np.float64)
     kappa = np.asarray(scales, dtype=np.float64)
-    if kappa.shape != moments.pair_counts.shape:
-        raise ValueError("residual_variances needs one scale per record.")
-    return np.maximum(
-        moments.truth_variance - 2.0 * kappa * moments.covariance + kappa**2 * moments.dosage_variance, 0.0
-    )
+    ratios = np.asarray(variance_ratios, dtype=np.float64)
+    if kappa.shape != variance.shape or ratios.shape != variance.shape:
+        raise ValueError("residual_variances needs one variance, scale and ratio per record.")
+    return variance * np.maximum(ratios - kappa**2, 0.0)
 
 
 def log_reliability_offsets(dosage_variance: NDArray, scales: NDArray, residual_variance: NDArray) -> F64Array:
@@ -272,8 +295,52 @@ def log_reliability_offsets(dosage_variance: NDArray, scales: NDArray, residual_
     residual = np.asarray(residual_variance, dtype=np.float64)
     if np.any(calibrated_variance < 0.0) or np.any(residual < 0.0):
         raise ValueError("log_reliability_offsets needs nonnegative variances.")
-    with np.errstate(divide="ignore"):
-        return np.log(calibrated_variance) - np.log(calibrated_variance + residual)
+    return _log_signal_share(calibrated_variance, residual)
+
+
+def _log_signal_share(signal: F64Array, residual: F64Array) -> F64Array:
+    """log(signal / (signal + residual)), -inf where there is no signal."""
+    share = np.full(np.broadcast(signal, residual).shape, -np.inf)
+    present = signal > 0.0
+    share[present] = np.log(signal[present]) - np.log(signal[present] + residual[present])
+    return share
+
+
+def pooled_log_reliability(
+    scales: NDArray,
+    residual_variance: NDArray,
+    cohort_dosage_mean: NDArray,
+    cohort_dosage_variance: NDArray,
+    group_counts: NDArray,
+) -> F64Array:
+    """log r^2 of each record's recalibrated column over the whole fitted cohort, from its groups' models.
+
+    The arrays are [records, groups], one column per ancestry group's model, and
+    ``group_counts`` is the number of fitted samples in each group. With
+    w_g = n_g / n, each group's recalibration keeps that group's mean, so D*'s
+    cohort variance is sum_g w_g (kappa_g^2 V_g + (mu_g - mu)^2) and its residual
+    variance is sum_g w_g v_g, and r^2 = Var(D*) / (Var(D*) + v). A group with no
+    fitted samples contributes nothing. A record whose recalibrated column has no
+    cohort variance gets -inf.
+    """
+    kappa = np.asarray(scales, dtype=np.float64)
+    residual = np.asarray(residual_variance, dtype=np.float64)
+    means = np.asarray(cohort_dosage_mean, dtype=np.float64)
+    variance = np.asarray(cohort_dosage_variance, dtype=np.float64)
+    counts = np.asarray(group_counts, dtype=np.float64)
+    if kappa.ndim != 2 or any(array.shape != kappa.shape for array in (residual, means, variance)) or counts.shape != kappa.shape[1:]:
+        raise ValueError("pooled_log_reliability needs [records, groups] arrays and one count per group.")
+    if np.any(counts < 0.0) or not counts.sum() > 0.0:
+        raise ValueError("pooled_log_reliability needs nonnegative group counts with at least one fitted sample.")
+    weights = counts / counts.sum()
+    fitted = weights > 0.0
+
+    def weighted(values: F64Array) -> F64Array:
+        return (np.where(fitted, values, 0.0) * weights).sum(axis=1)
+
+    centre = weighted(means)
+    calibrated_variance = weighted(kappa**2 * variance + (means - centre[:, None]) ** 2)
+    return _log_signal_share(calibrated_variance, weighted(residual))
 
 
 @dataclass(frozen=True)
@@ -494,7 +561,7 @@ def fit_measurement_model(
 
     ``cohort_dosage_variance`` is each stored column's variance in the fitted cohort.
     ``strata`` and ``design`` define the pooling of the recalibration scales (see
-    ``recalibration_scales``). ``reported_reliability`` is the imputation's own r^2
+    ``pooled_calibration``). ``reported_reliability`` is the imputation's own r^2
     per record (INFO or DR2). It is used only for records with fewer than 3
     calibration pairs, and is then required. Those records get no recalibration and
     their offsets come from the reported r^2; the certificate counts them and the
@@ -529,8 +596,9 @@ def fit_measurement_model(
     if calibration is not None and np.any(calibrated):
         moments = calibration.moments.subset(calibrated)
         feature_rows = None if design is None else np.asarray(design, dtype=np.float64)[calibrated]
-        scales[calibrated] = recalibration_scales(moments, labels[calibrated], feature_rows)
-        residual[calibrated] = residual_variances(moments, scales[calibrated])
+        pooled = pooled_calibration(moments, variance[calibrated], labels[calibrated], feature_rows)
+        scales[calibrated] = pooled.scales
+        residual[calibrated] = residual_variances(variance[calibrated], pooled.scales, pooled.variance_ratios)
         offsets[calibrated] = log_reliability_offsets(variance[calibrated], scales[calibrated], residual[calibrated])
         maps = [fit_block_map(pairs, scales) for pairs in calibration.blocks]
     ratios = np.array([leakage.ridge_ratio for leakage in maps])
