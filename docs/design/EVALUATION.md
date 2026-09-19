@@ -2,6 +2,8 @@
 
 Code: `sv_pgs/held_out_comparison.py` (`cross_fit_delta_r2`, `panel_z`, `power_weights`, `influence_correlation`, `size_gate`, `null_cost_gate`), tested on synthetic data.
 
+Measurements carry the evidence tags defined in MODEL.md (`[sim-only]`, `[semi-real]`, `[real]`, `[provenance unknown]`). Accuracy claims are adopted only on the neutral benchmarks, bench-real and bench-sim (scratchpad EVIDENCE_RULE). A lane's own simulation calibrates the tests' size and checks the math.
+
 ## Arms
 All arms share the same samples, folds, covariates and inference; only the columns and prior inputs differ.
 
@@ -17,7 +19,7 @@ All arms share the same samples, folds, covariates and inference; only the colum
 - **Prior gain** = B − A. It can exist even when SNVs tag every SV perfectly.
 - **Column gain** = C − B. Pre-registered forecast: ≤ ~5e-4 R² per typical trait.
   - The forecast comes from the exact identity Δ_j = r²_j(1 − ρ²_j), where ρ² is how predictable an SV column is from local SNVs.
-  - Imputed SVs measured ρ² ≈ 0.95–0.98 on public data.
+  - Imputed SVs measured ρ² ≈ 0.95–0.98 on public data [real: pilot50 imputation vs long-read truth].
 - **Total gain** = C − A.
 
 ## Claims and their tests
@@ -27,7 +29,7 @@ All arms share the same samples, folds, covariates and inference; only the colum
   - each fold's predictor is scored on its own fold, then the folds are averaged;
   - the variance is the family-block influence variance plus the closed-form cross-fit pair term;
   - C must also beat C-null by the same test.
-  - Cross-fitted scores are never pooled into one correlation. With adaptive fits under an equal-accuracy null, the pooled z had SD ≈ 10 and rejected 29–57% of the time.
+  - Cross-fitted scores are never pooled into one correlation. With adaptive fits under an equal-accuracy null, the pooled z had SD ≈ 10 and rejected 29–57% of the time [sim-only: theory-evaluation].
   - The nested/encompassing test is never a primary. It rejects even when the arms are equally accurate, because z_nested = 2·z_equal at matched β.
 - **(b) SVs carry signal beyond SNVs.**
   - Model-X residual tests: a per-SV GCM scan combined by ACAT, plus a cross-fitted distilled CRT, the two combined by ACAT.
@@ -46,11 +48,11 @@ All arms share the same samples, folds, covariates and inference; only the colum
 - **11 quantitative:** height, BMI, SBP, heart rate, MCV, platelets, WBC, eGFR (CKD-EPI 2021), total bilirubin, LDL (pre-statin), HbA1c (non-diabetic).
 - **10 diseases:** T2D, atrial fibrillation, hypothyroidism, COPD, depression, gout, cataract, CKD (lab-defined), psoriasis, prostate cancer.
 - **Statistic:** z = wᵀz / √(wᵀRw).
-  - w ∝ E[z] from a power model. The weights are non-negative and use no SV biology, only h², n, K, misclassification and repeatability. Correlation-inverse weights would have made most diseases negative.
+  - w ∝ E[z] from a power model. The weights are non-negative and use no SV biology, only h², n, K, misclassification and repeatability. Correlation-inverse weights would have made most diseases negative [sim-only: power model].
   - R is the correlation of per-trait family-block influences.
 - **Frozen** before any test phenotype is touched: weights, trait list, case definitions, code hash and α plan.
-- **Power** (conservative: calibration slope 1, full pair term): panel z 5.2 at 50k and 9.9 at 100k.
-- **The diseases-only sub-panel** is secondary: 0.14 / 0.31 power. Family-history liability targets are the planned lift.
+- **Power** (conservative: calibration slope 1, full pair term): panel z 5.2 at 50k and 9.9 at 100k [sim-only: power model].
+- **The diseases-only sub-panel** is secondary: 0.14 / 0.31 power [sim-only: power model]. Family-history liability targets are the planned lift.
 - Trait choice uses power and phenotype quality only, never known SV biology.
 
 ## Folds, resampling, reporting
@@ -63,12 +65,12 @@ All arms share the same samples, folds, covariates and inference; only the colum
   - A, B, C and the three differences, each with a CI;
   - a half × increment interaction test;
   - negative controls and the α ledger.
-  - Per-ancestry results are a headline dimension. In simulation the SV gain was 2–4× larger in African-ancestry groups.
+  - Per-ancestry results are a headline dimension. In simulation the SV gain was 2–4× larger in African-ancestry groups [sim-only: idea-ancestry msprime].
 
 ## Simulation gates (must pass before any real claim)
 - **G13:** the primary test rejects ≤ 7% of ≥ 200 null traits at one-sided 0.05. That covers the SV null against both A and C-null, and the equal-accuracy twin null.
 - **G13b:** C-capacity against A passes the same size gate.
-- **G13c:** with SV effects switched off, C costs ≤ 0.5% relative R². Measured: −1e-4 to −2e-4.
+- **G13c:** with SV effects switched off, C costs ≤ 0.5% relative R². Measured: −1e-4 to −2e-4 [sim-only: theory-evaluation].
 - **Red-team gates RT1–RT8:** each attack must keep the null rejection rate within 2 SE of the clean null, and the fake ΔR² within 2 SE of 0.
   - RT1: imputation-half-specific quality with a phenotype shift by half.
   - RT2: fine-structure environment with ancestry-differentiated SVs as a proxy.

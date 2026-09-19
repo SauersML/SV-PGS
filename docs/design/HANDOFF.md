@@ -48,6 +48,7 @@
    - service-half gates S1–S3 when that half arrives.
    - the phenotype rules that are not standards (PHENOTYPES.md): the disease evidence rules, the measurement windows and plausible ranges, the treatment corrections, the analysis scale and the covariate forms. Each needs its learned model, validated on synthetic OMOP first, before the case definitions are frozen (EVALUATION.md).
 6. **Measurements to rerun when compute is back:**
+   - every `[sim-only]` result a ruling rests on (MODEL.md, DECISIONS.md, EVALUATION.md), re-measured on the neutral benchmarks bench-real and bench-sim. Until then those rulings are provisional;
    - the evaluation validity set (QT, Q0, Q3, QC1, QS_pop, B0) and the red-team sweep;
    - credit identifiability;
    - the post-hoc TR read-evidence update, on public HPRC v2 with 1kGP 30× CRAM slices, scored cross-truth;
