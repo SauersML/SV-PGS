@@ -1,6 +1,6 @@
 # Products with the total curvature B, without EP re-solves
 
-B is the Hessian of the EP evidence in the hyperparameters, with EP re-converged: the "observed" curvature the λ evidence and the certificate use (ep_eb.md §1.4, §3). It has a closed form, so no product with B needs an EP re-solve. This note gives the form, its production cost, the certified rule for how many directions the λ step needs, and the variance-refresh trigger. Sign convention: A and B are Hessians (negative definite); ep_eb.md's curvatures are their negatives.
+B is the total curvature of the EP evidence in the hyperparameters, with EP re-converged: the "observed" curvature the λ evidence and the certificate use (ep_eb.md §1.4, §3). It has a closed form, so no product with B needs an EP re-solve. This note gives the form, its production cost, the certified rule for how many directions the λ step needs, and the variance-refresh trigger. Sign convention, as in ep_eb.md and tests/ep_eb_reference.py `total_curvature`: A and B are curvatures, the negative Hessians. A = −∇²_x Σ_j log Z_j at fixed cavities, and B = −∇²_x log Z_EP with EP re-solved; both are positive definite at a maximum. (An earlier version of this note, and of the proto code, used the Hessian convention. Its formula had the opposite sign on the two correction terms, so passing a curvature into the Hessian-convention code gives a result off by exactly 2(B − A).)
 
 ## 1. The closed form
 At an unclipped EP fixed point, for each variant j, write:
@@ -17,17 +17,17 @@ For directions E (D × r) the fixed point moves by (δm, δP), which solve
 
 and
 
-    B E = A E + m_xᵀ δh − ½ s2_xᵀ δP.
+    B E = A E − m_xᵀ δh + ½ s2_xᵀ δP.
 
 **Derivation.**
 1. Differentiate the fixed-point conditions μ = m(h, P; x) and Σ_jj = v(h, P; x), with Σ = (Q + diag τ)⁻¹, τ = 1/v − P and ν = m/v − h.
 2. Substituting the local relations makes (i) collapse to the posterior-precision operator.
 3. In (ii) the diagonal of Σ∘Σ cancels δv_j, so a cavity precision responds only to other variants' site changes, through squared posterior correlations.
-4. B E is then the total derivative of the fixed-cavity gradient g = Σ_j ∂_x ζ_j, with ∂²ζ/∂x∂h = m_x and ∂²ζ/∂x∂P = −½ s2_x.
+4. −B E is then the total derivative of the fixed-cavity gradient g = Σ_j ∂_x ζ_j along E, with ∂²ζ/∂x∂h = m_x and ∂²ζ/∂x∂P = −½ s2_x; negating gives the curvature form above.
 
 **Special cases.**
 - For an orthogonal design Σ is diagonal and B = A (Theorem 2).
-- The mean channel alone gives B = A + Cᵀ(Σ − diag Σ)C with C = diag(1/v) m_x. Its Woodbury form, with A' = A − Cᵀdiag(v)C, needs a single solve with (Σ⁻¹ + C A'⁻¹Cᵀ).
+- The mean channel alone gives B = A − Cᵀ(Σ − diag Σ)C with C = diag(1/v) m_x. With the variant-local A' = A + Cᵀdiag(v)C this is B = A' − CᵀΣC, and B⁻¹ = A'⁻¹ + A'⁻¹Cᵀ(Σ⁻¹ − C A'⁻¹Cᵀ)⁻¹C A'⁻¹: a single solve with (Σ⁻¹ − C A'⁻¹Cᵀ).
 
 **The per-variant derivatives are closed forms over the lattice nodes.**
 - Per node: responsibilities r_k, σ_k = q_k/(1+q_k), μ_k = (h/P)σ_k and c_k = σ_k/P. Below, E and Cov are taken under r.
@@ -52,10 +52,10 @@ and
 - **Solve:** one stacked GMRES over δP for all r directions. Each iteration is one posterior solve and one JVP on r columns.
   - [measured, dense] 12–24 iterations for all 11 directions at a 1e-13 residual, with the product equal to the EP-re-solved B to 1.0e-10–4.6e-10.
   - The alternative, one warm EP re-solve per direction, needed 33–173 full EP sweeps (each a posterior refresh including the variances), and one case did not converge.
-- **Certificate and x step:** δ_B = ½gᵀ(−B)⁻¹g needs one extra right-hand side, via the Woodbury form, with the variance channel as a defect correction.
+- **Certificate and x step:** δ_B = ½gᵀB⁻¹g needs one extra right-hand side, via the Woodbury form, with the variance channel as a defect correction.
 
 ## 3. How many directions the λ step needs: a certified rule
-- **Setup.** Write E = B − A' = Φᵀ𝓛⁻¹Ψ, where 𝓛 is the linear-response operator of (i)–(ii) and Φ, Ψ are variant-local. Let H0 = −A' + S_λ (exact), H = −B + S_λ = H0 − E and Z = H0^{-1/2} E H0^{-1/2}.
+- **Setup.** Write E = A' − B = Φᵀ𝓛⁻¹Ψ, where 𝓛 is the linear-response operator of (i)–(ii) and Φ, Ψ are variant-local. Let H0 = A' + S_λ (exact), H = B + S_λ = H0 − E and Z = H0^{-1/2} E H0^{-1/2}.
 - **Directions and approximation.** Take directions V_r as the top right singular vectors of Ψ̂. Set Z_r = Z − (I−P)Z(I−P), with P = V_rV_rᵀ; it is exact except on the unexplored complement, and costs r products.
 - **Complement bound**, with Jacobi scaling T² = |diag 𝓛|:
 
@@ -75,7 +75,7 @@ and
 ## 4. Variance-refresh trigger
 Frozen marginals v_frz (the decoupled Stage 2 scheme) are refreshed only when one of these holds; none uses a chosen constant.
 1. **Properness.** With v predicted by the JVP from τ_frz to τ, a frozen cavity stays proper iff its relative error e_j satisfies e_j < P_j/τ_j for τ_j > 0, or e_j > −P_j/|τ_j| for τ_j < 0. The check runs inside every EP sweep.
-2. **Bias vs progress.** Staleness shifts the hyper-gradient by δg = Φᵀ𝓛⁻¹[0; −δ], with δ = v_frz − Σ_jj. That is (ii) with right-hand side −δ: one linear-response solve. Refresh when ½δgᵀ(−B)⁻¹δg ≥ δ_B.
-3. **Certification** requires δ_B + ½δgᵀ(−B)⁻¹δg ≤ 1/(2K).
+2. **Bias vs progress.** Staleness shifts the hyper-gradient by δg = Φᵀ𝓛⁻¹[0; −δ], with δ = v_frz − Σ_jj. That is (ii) with right-hand side −δ: one linear-response solve. Refresh when ½δgᵀB⁻¹δg ≥ δ_B.
+3. **Certification** requires δ_B + ½δgᵀB⁻¹δg ≤ 1/(2K).
 
 A dense comparison against always and never refreshing is not yet conclusive: the test EP itself hits improper cavities from the prior start.
